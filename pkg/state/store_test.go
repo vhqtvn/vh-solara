@@ -239,6 +239,86 @@ func TestSetActivityFromStatuses(t *testing.T) {
 	}
 }
 
+func TestGateFactsFinishAndUsage(t *testing.T) {
+	s := New(100)
+	s.Apply(ev("session.created", `{"info":{"id":"a"}}`))
+	// In-flight assistant turn: no finish, not completed → busy, not "completed".
+	s.Apply(ev("message.updated", `{"info":{"id":"m1","sessionID":"a","role":"assistant","time":{"created":1}}}`))
+	g := s.Snapshot(nil).Gate["a"]
+	if g.Activity != ActivityBusy {
+		t.Fatalf("in-flight turn: want busy, got %q", g.Activity)
+	}
+	if g.LastAssistantCompleted {
+		t.Fatal("in-flight turn must not report last_assistant_completed")
+	}
+	if g.FinishReason != "" {
+		t.Fatalf("in-flight turn has no finish reason, got %q", g.FinishReason)
+	}
+
+	// Turn completes with finish=length and token usage, then session.idle settles.
+	s.Apply(ev("message.updated", `{"info":{"id":"m1","sessionID":"a","role":"assistant","time":{"created":1,"completed":2},"finish":"length","tokens":{"input":10,"output":20,"total":30}}}`))
+	s.Apply(ev("session.idle", `{"sessionID":"a"}`))
+	g = s.Snapshot(nil).Gate["a"]
+	if g.Activity != ActivityIdle {
+		t.Fatalf("after idle: want idle, got %q", g.Activity)
+	}
+	if !g.LastAssistantCompleted {
+		t.Fatal("completed turn must report last_assistant_completed")
+	}
+	if g.FinishReason != "length" {
+		t.Fatalf("want raw finish reason 'length', got %q", g.FinishReason)
+	}
+	if g.SubtreeBusy {
+		t.Fatal("quiesced session must not report subtree_busy")
+	}
+	var tok struct{ Input, Output, Total int }
+	if json.Unmarshal(g.Tokens, &tok) != nil || tok.Total != 30 {
+		t.Fatalf("want raw token usage total=30, got %s", string(g.Tokens))
+	}
+
+	// finish_reason survives a session.updated (which replaces the session entry).
+	s.Apply(ev("session.updated", `{"info":{"id":"a","title":"renamed"}}`))
+	if got := s.Snapshot(nil).Gate["a"].FinishReason; got != "length" {
+		t.Fatalf("finish reason must survive session.updated, got %q", got)
+	}
+}
+
+func TestGateSubtreeBusyAndPendingFlags(t *testing.T) {
+	s := New(100)
+	s.Apply(ev("session.created", `{"info":{"id":"root"}}`))
+	s.Apply(ev("session.created", `{"info":{"id":"child","parentID":"root"}}`))
+	// A busy subagent makes the root's subtree busy even though the root is idle.
+	s.Apply(ev("session.idle", `{"sessionID":"root"}`))
+	s.Apply(ev("session.status", `{"sessionID":"child","status":{"type":"busy"}}`))
+	snap := s.Snapshot(nil)
+	if !snap.Gate["root"].SubtreeBusy {
+		t.Fatal("root with a busy child must report subtree_busy")
+	}
+	if snap.Gate["root"].Activity != ActivityIdle {
+		t.Fatalf("root itself is idle, got %q", snap.Gate["root"].Activity)
+	}
+	if !snap.Gate["child"].SubtreeBusy {
+		t.Fatal("busy child reports subtree_busy for itself")
+	}
+
+	// Child finishes → root subtree quiesces.
+	s.Apply(ev("session.idle", `{"sessionID":"child"}`))
+	if s.Snapshot(nil).Gate["root"].SubtreeBusy {
+		t.Fatal("root subtree must quiesce after child idles")
+	}
+
+	// Pending question/permission gates.
+	s.Apply(ev("question.asked", `{"id":"q1","sessionID":"root"}`))
+	s.Apply(ev("permission.asked", `{"id":"p1","sessionID":"child","permission":"bash"}`))
+	snap = s.Snapshot(nil)
+	if !snap.Gate["root"].PendingQuestion || snap.Gate["root"].PendingPermission {
+		t.Fatalf("root should have pending question, no permission: %+v", snap.Gate["root"])
+	}
+	if !snap.Gate["child"].PendingPermission || snap.Gate["child"].PendingQuestion {
+		t.Fatalf("child should have pending permission, no question: %+v", snap.Gate["child"])
+	}
+}
+
 func TestHydrateDiffEmitsOnlyChanges(t *testing.T) {
 	s := New(100)
 	s.Apply(ev("session.created", `{"info":{"id":"a","title":"v1"}}`))
