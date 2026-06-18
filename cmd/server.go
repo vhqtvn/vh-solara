@@ -13,6 +13,7 @@ var daemonAddr string
 var hostPattern string
 var serverAuth authFlags
 var serverWorkerSecret string
+var serverAPIToken string
 
 var serverCmd = &cobra.Command{
 	Use:   "server",
@@ -28,6 +29,10 @@ var serverCmd = &cobra.Command{
 		if v := os.Getenv("VH_WORKER_SECRET"); v != "" {
 			daemon.RegSecret = v
 		}
+		daemon.APIToken = serverAPIToken
+		if v := os.Getenv("VH_API_TOKEN"); v != "" {
+			daemon.APIToken = v
+		}
 		if err := daemon.Start(); err != nil {
 			log.Fatalf("Server failed: %v", err)
 		}
@@ -39,6 +44,7 @@ func init() {
 	serverCmd.Flags().StringVarP(&daemonAddr, "daemon-addr", "d", ":8081", "Server address to listen on for agent daemon connections")
 	serverCmd.Flags().StringVar(&hostPattern, "host-pattern", "", "Host template to extract/build worker URLs (e.g., '$ID.example.com')")
 	serverCmd.Flags().StringVar(&serverWorkerSecret, "worker-secret", "", "Shared secret required from workers on registration via X-VH-Worker-Secret (prefer the VH_WORKER_SECRET env var); empty = open registration")
+	serverCmd.Flags().StringVar(&serverAPIToken, "api-token", "", "Bearer token required on the cross-worker coordination API /api/workers/{id}/sessions|events (prefer the VH_API_TOKEN env var); empty = open")
 	registerAuthFlags(serverCmd, &serverAuth)
 	rootCmd.AddCommand(serverCmd)
 }

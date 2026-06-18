@@ -208,7 +208,25 @@ func (s *Server) Handler() http.Handler {
 	// Auth gates everything (login page + session); it sits inside securityHeaders
 	// so the login page still gets CSP, and outside cors/csrf so an unauthenticated
 	// request is challenged before reaching application logic. nil/ModeNone = no-op.
-	return securityHeaders(s.auth.Middleware(s.cors(csrfGuard(logRequests(mux)))))
+	return securityHeaders(s.auth.Middleware(s.cors(csrfGuard(logRequests(s.stampMeta(mux))))))
+}
+
+// stampMeta sets X-VH-Epoch and X-VH-Seq on /vh/* responses so a cross-worker
+// coordinator can key its resume cursor by (worker, epoch, seq) and detect a
+// worker restart (epoch change) from any response — not just a snapshot. The seq
+// is the head at request entry (a hint; the authoritative cursor is the snapshot/
+// stream's own seq). Headers are set before the handler writes, so they survive
+// streaming and hijacked (terminal/WebSocket) responses.
+func (s *Server) stampMeta(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/vh/") {
+			st := s.aggFor(reqDir(r)).Store()
+			h := w.Header()
+			h.Set("X-VH-Epoch", st.Epoch())
+			h.Set("X-VH-Seq", strconv.FormatUint(st.Head(), 10))
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // logRequests emits a debug line per /oc/* and mutating /vh/* request with the
