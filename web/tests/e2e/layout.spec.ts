@@ -101,6 +101,26 @@ test("terminal dock toggles from the header", async ({ page }) => {
   await expect(page.locator(".term-dock")).toHaveCount(0);
 });
 
+test("terminal header controls stay light on a light theme (dark island)", async ({ page }) => {
+  await page.goto("/");
+  await page.evaluate(() => {
+    const el = document.documentElement;
+    el.className = el.className.replace(/\btheme-\S+/g, "").trim();
+    el.classList.add("theme-light");
+    el.style.colorScheme = "light";
+  });
+  await page.getByRole("button", { name: "Terminal" }).click();
+  // The dock pins a dark palette, so its header button text/icon must be light
+  // (channels near white) — not the light theme's dark --fg, which would be
+  // invisible on the dock's dark background.
+  const btn = page.locator(".term-dock").getByLabel("Close terminal");
+  await expect(btn).toBeVisible();
+  const color = await btn.evaluate((el) => getComputedStyle(el).color);
+  const m = color.match(/\d+(\.\d+)?/g)!;
+  const channelSum = Number(m[0]) + Number(m[1]) + Number(m[2]);
+  expect(channelSum).toBeGreaterThan(450); // light foreground, not dark-on-dark
+});
+
 test("a new server version surfaces the update toast", async ({ page }) => {
   let version = "v-1";
   await page.route("**/vh/version", (route) => route.fulfill({ json: { version } }));

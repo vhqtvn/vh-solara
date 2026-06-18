@@ -561,6 +561,14 @@ body {
   display: flex; flex-direction: column; flex: none;
   min-height: 120px; border-top: 1px solid var(--border);
   background: #0b0f17; position: relative;
+  /* The dock is a fixed-dark island (its xterm bg is hardcoded dark too). Pin
+     the palette to dark values inside it so the header/controls stay legible on
+     light themes instead of inheriting dark-on-dark foreground. */
+  --fg: #c9d1d9;
+  --fg-dim: #8b949e;
+  --border: #30363d;
+  --bg-2: #161b22;
+  --accent: #58a6ff;
 }
 .term-dock.full { position: absolute; inset: 0; z-index: 100; height: auto !important; }
 .term-dock-resize { position: absolute; top: -3px; left: 0; right: 0; height: 7px; cursor: ns-resize; z-index: 2; }
