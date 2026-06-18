@@ -17,7 +17,7 @@ handoff thread; this doc tracks the implemented surface and decisions.
 | V3 / A3 | `/api/workers/{id}/*` cross-worker API through registry+tunnel; epoch+seq; bearer auth | ✅ done |
 | V4 / A4 | MCP facade over the read+write verbs | ✅ done |
 | V5 / B  | `Feature`/`Services` module mechanism; coordination verbs as the first module | ✅ done |
-| V6 / C  | two-layer kit provisioning (`controlplane-core` + `controlplane-policy`) | ⏳ |
+| V6 / C  | two-layer kit provisioning (`controlplane-core` + `controlplane-policy`) | ✅ done |
 
 ## V1 — gate facts (worker `/vh/*`)
 
@@ -162,6 +162,44 @@ packages/process; the module system is the worker server's route-composition
 mechanism, which is where "add a capability without editing core" actually
 applies. In-process modules call shared helpers directly; the `Services` surface
 is what an out-of-package module needs.
+
+## V6 — kit provisioning (`vh-solara kit`)
+
+vh-solara provisions a versioned template kit into a repo; it ships **zero kit
+content** (kits — e.g. the controlplane kit — are authored by the consumer).
+
+- `vh-solara kit install <kit-dir> --repo <path> --param k=v ...`
+- `vh-solara kit status --repo <path>`
+
+A kit = a directory with `manifest.json` + per-layer source dirs. Two layer types:
+
+| type | semantics on (re)install |
+|------|---------------------------|
+| `engine` (e.g. `controlplane-core`) | vh-managed: **overwritten** on update, unless the existing file carries a `vh:keep` marker |
+| `overlay` (e.g. `controlplane-policy`) | consumer-owned: **never clobbered** — an existing overlay file is preserved |
+
+- Parameters are declared in the manifest and injected into template files via
+  `{{vh:name}}` placeholders. Required params are enforced; an undeclared param or
+  an undeclared placeholder is an error. `"secret": true` params are used but not
+  recorded in the lockfile.
+- A `.vh-kit.json` lockfile in the repo records kit/version/installed-files/
+  non-secret params for idempotent re-install and `status`.
+
+Manifest:
+```jsonc
+{
+  "name": "controlplane", "version": "1.0.0",
+  "parameters": [
+    {"name": "controller_url", "required": true},
+    {"name": "worker_id", "default": "w1"},
+    {"name": "api_token", "secret": true}
+  ],
+  "layers": [
+    {"name": "controlplane-core",   "type": "engine",  "source": "core"},
+    {"name": "controlplane-policy", "type": "overlay", "source": "policy"}
+  ]
+}
+```
 
 ## Decisions (generic-mechanism-only)
 
