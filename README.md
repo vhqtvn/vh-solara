@@ -6,6 +6,30 @@ A single Go binary runs next to OpenCode on each machine: it aggregates OpenCode
 
 > Built because OpenCode's own web UI and OpenChamber were heavy and didn't hold up on mobile (esp. Galaxy Fold) — `vh-solara` is the lean, phone-friendly alternative, resilient to flaky networks and reconnects.
 
+## Screenshots
+
+Streaming chat — markdown, syntax-highlighted code, rendered math, tool calls with LSP diagnostics, and subagent sessions:
+
+![Chat](docs/screenshots/chat-desktop.png)
+
+<table>
+<tr>
+<td width="50%"><img src="docs/screenshots/diff-desktop.png" alt="Changes / git diff"><br><sub><b>Changes</b> — inline/split git diff, stage &amp; commit</sub></td>
+<td width="50%"><img src="docs/screenshots/command-palette.png" alt="Command palette"><br><sub><b>Command palette</b> (⌘/Ctrl-K) — jump anywhere, run actions</sub></td>
+</tr>
+</table>
+
+Mobile-first — the whole point. Installable as a PWA, resilient to reconnects:
+
+<table>
+<tr>
+<td width="50%"><img src="docs/screenshots/mobile-chat.png" alt="Mobile chat"><br><sub>Chat on a phone</sub></td>
+<td width="50%"><img src="docs/screenshots/mobile-sessions.png" alt="Mobile session tree"><br><sub>Session tree drawer + project switcher</sub></td>
+</tr>
+</table>
+
+<sub>Screenshots are captured headlessly against the built-in demo server (<code>tools/fixtureserver</code>) — real UI, fake OpenCode, no agent or credentials needed.</sub>
+
 ## Architecture
 
 The system has three parts:
