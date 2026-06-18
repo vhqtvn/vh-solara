@@ -1,26 +1,45 @@
 import { createEffect, createSignal, onCleanup, onMount, Show } from "solid-js";
-import { hoverCapable, inspectAt } from "../tooltip";
+import { hoverCapable, inspectAt, placeTooltip, type Rectish } from "../tooltip";
 
 // DOM-based tooltip (mounted once at the app root). We avoid the native `title`
 // attribute because some window managers (e.g. swaywm) spawn a new window for
 // it; elements opt in with `data-tip="…"`. Delegated hover/focus, fixed-position
 // bubble clamped to the viewport.
 export default function Tooltip() {
-  const [tip, setTip] = createSignal<{ text: string; x: number; y: number; above: boolean } | null>(null);
+  const [tip, setTip] = createSignal<{ text: string; rect: Rectish } | null>(null);
+  const [pos, setPos] = createSignal<{ x: number; y: number; above: boolean } | null>(null);
   let current: HTMLElement | null = null;
+  let bubble: HTMLDivElement | undefined;
 
   function show(target: HTMLElement) {
     const text = target.getAttribute("data-tip");
     if (!text) return;
     const r = target.getBoundingClientRect();
-    const above = r.bottom + 34 > window.innerHeight;
-    const x = Math.min(Math.max(8, r.left + r.width / 2), window.innerWidth - 8);
-    setTip({ text, x, y: above ? r.top - 6 : r.bottom + 6, above });
+    setTip({ text, rect: { left: r.left, top: r.top, bottom: r.bottom, width: r.width } });
   }
   const hide = () => {
     current = null;
     setTip(null);
   };
+
+  // Once the bubble is in the DOM we know its real (wrapped) size, so clamp the
+  // placement to the viewport. Runs after render — effects flush before paint,
+  // so there's no visible jump.
+  createEffect(() => {
+    const t = tip();
+    if (!t || !bubble) {
+      setPos(null);
+      return;
+    }
+    const b = bubble.getBoundingClientRect();
+    setPos(
+      placeTooltip(
+        t.rect,
+        { width: window.innerWidth, height: window.innerHeight },
+        { width: b.width, height: b.height },
+      ),
+    );
+  });
 
   const onOver = (e: Event) => {
     if (!hoverCapable) return; // touch: no auto-tooltips (use the ? inspector)
@@ -77,10 +96,15 @@ export default function Tooltip() {
   return (
     <Show when={tip()}>
       <div
+        ref={bubble}
         class="tooltip"
-        classList={{ above: tip()!.above }}
+        classList={{ above: !!pos()?.above }}
         role="tooltip"
-        style={{ left: `${tip()!.x}px`, top: `${tip()!.y}px` }}
+        style={
+          pos()
+            ? { left: `${pos()!.x}px`, top: `${pos()!.y}px` }
+            : { left: "0", top: "0", visibility: "hidden" }
+        }
       >
         {tip()!.text}
       </div>

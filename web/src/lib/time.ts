@@ -24,11 +24,14 @@ export function formatShort(ms: number | undefined, now: number): string {
   return `${Math.round(d / 30)}mo`;
 }
 
-// "5s ago" / "5m ago" / "2h ago" / "3d ago" — verbose, for message metadata.
+// "just now" / "5m ago" / "2h ago" / "3d ago" — verbose, for message metadata.
+// These labels refresh on the shared 15s tick (see below), not per-second, so a
+// "13s ago" would freeze mid-minute and read as stale; collapse sub-minute to
+// "just now" rather than show a seconds count we can't keep current.
 export function formatAgo(ms: number | undefined, now: number): string {
   if (!ms) return "";
   const s = Math.max(0, Math.round((now - ms) / 1000));
-  if (s < 60) return `${s}s ago`;
+  if (s < 60) return "just now";
   const m = Math.round(s / 60);
   if (m < 60) return `${m}m ago`;
   const h = Math.round(m / 60);

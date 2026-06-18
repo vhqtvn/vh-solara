@@ -2529,7 +2529,8 @@ code, pre, .vh-diff, .fv-code, .msg-cost, .tool-name, .gitfile-name, .kv, .msg-i
   box-shadow: var(--shadow-lg, 0 8px 24px rgba(0, 0, 0, 0.4));
   font-size: 12px;
   line-height: 1.35;
-  white-space: nowrap;
+  white-space: normal;
+  overflow-wrap: break-word;
   pointer-events: none;
   animation: tip-in 0.1s ease;
 }
