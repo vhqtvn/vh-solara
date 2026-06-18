@@ -175,6 +175,11 @@ type Store struct {
 	questions map[string]map[string]json.RawMessage // sessionID -> questionID -> request
 	statuses  map[string]json.RawMessage            // sessionID -> status payload
 	activity  map[string]string                     // sessionID -> idle|busy|retry|error
+	// activitySeq[sid] = the event seq at which the session's activity last
+	// changed. Backs the If-Idle-Seq compare-and-swap: a coordinator that observed
+	// a session sendable at seq N can ask to send "only if nothing changed since
+	// N", so a turn that started-and-finished in the gap can't be double-driven.
+	activitySeq map[string]uint64
 	// Finished-unread tracking. busyCount[root] = number of busy/retry sessions in
 	// the root's subtree; when it falls to 0 the root is marked unread (a finished
 	// task awaiting acknowledgement). suppressUnread guards the hydrate reconcile.
@@ -194,18 +199,19 @@ type Store struct {
 // New returns an empty store with an event ring of the given capacity.
 func New(ringCapacity int) *Store {
 	return &Store{
-		sessions:  map[string]*sessionEntry{},
-		messages:  map[string]*sessionMessages{},
-		todos:     map[string]json.RawMessage{},
-		perms:     map[string]map[string]json.RawMessage{},
-		questions: map[string]map[string]json.RawMessage{},
-		statuses:  map[string]json.RawMessage{},
-		activity:  map[string]string{},
-		unread:    map[string]bool{},
-		busyCount: map[string]int{},
-		msgLoaded: map[string]bool{},
-		ring:      newRingBuffer(ringCapacity),
-		subs:      map[int]chan ClientEvent{},
+		sessions:    map[string]*sessionEntry{},
+		messages:    map[string]*sessionMessages{},
+		todos:       map[string]json.RawMessage{},
+		perms:       map[string]map[string]json.RawMessage{},
+		questions:   map[string]map[string]json.RawMessage{},
+		statuses:    map[string]json.RawMessage{},
+		activity:    map[string]string{},
+		activitySeq: map[string]uint64{},
+		unread:      map[string]bool{},
+		busyCount:   map[string]int{},
+		msgLoaded:   map[string]bool{},
+		ring:        newRingBuffer(ringCapacity),
+		subs:        map[int]chan ClientEvent{},
 	}
 }
 
@@ -251,6 +257,7 @@ func (s *Store) setActivityLocked(sessionID, st string) {
 	}
 	s.activity[sessionID] = st
 	s.emit(KindActivity, rawObj(map[string]interface{}{"sessionID": sessionID, "state": st}))
+	s.activitySeq[sessionID] = s.seq // the seq of the activity event just emitted
 
 	// Track the root subtree's busy count to detect "finished" (busy -> idle).
 	wasBusy := prev == ActivityBusy || prev == ActivityRetry
@@ -539,6 +546,7 @@ func (s *Store) deleteSessionLocked(id string) {
 	delete(s.questions, id)
 	delete(s.statuses, id)
 	delete(s.activity, id)
+	delete(s.activitySeq, id)
 	delete(s.unread, id)
 	delete(s.busyCount, id)
 	s.emit(KindSessionDelete, rawObj(map[string]interface{}{"id": id}))
@@ -964,6 +972,34 @@ func (s *Store) computeSubtreeBusyLocked() map[string]bool {
 		visit(id)
 	}
 	return memo
+}
+
+// SendableNow reports whether a plain message is safe to send to a session right
+// now — the §1.1 gate as a single fact — plus the seq at which the session's
+// activity last changed (for If-Idle-Seq CAS). sendable means: activity idle, no
+// busy descendant, the latest assistant turn completed (or none yet), and no
+// pending question or permission (those need a typed reply, not a message).
+// exists is false for an unknown session. This is a raw mechanism check; the
+// decision to *use* it (i.e. whether to gate a send) belongs to the caller.
+func (s *Store) SendableNow(sid string) (sendable bool, activitySeq uint64, exists bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	se := s.sessions[sid]
+	if se == nil {
+		return false, 0, false
+	}
+	act := s.activity[sid]
+	if act == "" {
+		act = ActivityIdle
+	}
+	subtreeBusy := s.computeSubtreeBusyLocked()[sid]
+	inflight := se.hasAssistant && !se.lastAsstCompleted
+	sendable = act == ActivityIdle &&
+		!subtreeBusy &&
+		!inflight &&
+		len(s.questions[sid]) == 0 &&
+		len(s.perms[sid]) == 0
+	return sendable, s.activitySeq[sid], true
 }
 
 // Subscribe registers a new live-tail consumer. Returns the channel and an
