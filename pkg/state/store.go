@@ -7,6 +7,8 @@ package state
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"sync"
 
@@ -50,6 +52,11 @@ type ClientEvent struct {
 
 // Snapshot is the full current view plus the head seq a client resumes from.
 type Snapshot struct {
+	// Epoch identifies this store's lifetime. seq resets to 0 when the daemon
+	// restarts (the view is in-memory, not durable), so a resume cursor is only
+	// valid within one (epoch). A coordinator keys cursors by (worker, epoch, seq)
+	// and re-snapshots when the epoch it sees changes.
+	Epoch       string                        `json:"epoch"`
 	Seq         uint64                        `json:"seq"`
 	Sessions    []json.RawMessage             `json:"sessions"`
 	Messages    map[string][]MessageWithParts `json:"messages"`
@@ -167,6 +174,7 @@ type permissionEnvelope struct {
 type Store struct {
 	mu sync.RWMutex
 
+	epoch     string // stable for this store's lifetime; see Snapshot.Epoch
 	seq       uint64
 	sessions  map[string]*sessionEntry
 	messages  map[string]*sessionMessages           // sessionID -> messages
@@ -196,9 +204,20 @@ type Store struct {
 	next int
 }
 
+// newEpoch returns a random per-lifetime store id. crypto/rand is used so it's
+// distinct across restarts without needing a clock (and stays unguessable).
+func newEpoch() string {
+	var b [12]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "ep-fallback"
+	}
+	return "ep-" + hex.EncodeToString(b[:])
+}
+
 // New returns an empty store with an event ring of the given capacity.
 func New(ringCapacity int) *Store {
 	return &Store{
+		epoch:       newEpoch(),
 		sessions:    map[string]*sessionEntry{},
 		messages:    map[string]*sessionMessages{},
 		todos:       map[string]json.RawMessage{},
@@ -862,6 +881,7 @@ func (s *Store) Snapshot(messagesFor map[string]bool) Snapshot {
 	defer s.mu.RUnlock()
 
 	snap := Snapshot{
+		Epoch:       s.epoch,
 		Seq:         s.seq,
 		Messages:    map[string][]MessageWithParts{},
 		Todos:       map[string]json.RawMessage{},
@@ -1019,6 +1039,17 @@ func (s *Store) Subscribe(buffer int) (<-chan ClientEvent, func()) {
 			delete(s.subs, id)
 		}
 	}
+}
+
+// Epoch returns this store's lifetime id (see Snapshot.Epoch).
+func (s *Store) Epoch() string { return s.epoch }
+
+// Head returns the current head seq without building a full snapshot — for
+// cheaply stamping X-VH-Seq response headers.
+func (s *Store) Head() uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.seq
 }
 
 // Replay returns buffered events with seq > cursor. ok is false when the cursor

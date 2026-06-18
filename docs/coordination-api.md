@@ -14,7 +14,7 @@ handoff thread; this doc tracks the implemented surface and decisions.
 |------|------|-------|
 | V1 / A2 | `finish` reason + token usage materialized; per-session `gate{}` on every snapshot | ✅ done |
 | V2 / A1 | Typed write verbs (send/spawn/abort/answer-question/reply-permission) + idempotency + If-Idle-Seq CAS | ✅ done |
-| V3 / A3 | `/api/workers/{id}/*` cross-worker API through registry+tunnel; epoch+seq; bearer auth | ⏳ |
+| V3 / A3 | `/api/workers/{id}/*` cross-worker API through registry+tunnel; epoch+seq; bearer auth | ✅ done |
 | V4 / A4 | MCP facade over the read+write verbs | ⏳ |
 | V5 / B  | `Feature`/`Services` module mechanism; refactor V1–V4 into the first module | ⏳ |
 | V6 / C  | two-layer kit provisioning (`controlplane-core` + `controlplane-policy`) | ⏳ |
@@ -84,6 +84,32 @@ question/permission errors upstream), so they take no `If-Idle-Seq`.
   not send-after-abort synchronously (use CAS or wait for the idle transition).
 - **archive removes the session from the live view** — archive only a
   confirmed-done session.
+
+## V3 — cross-worker API (controller `/api/workers/{id}/*`)
+
+Path-addressed, proxied through the existing registry+tunnel to the worker's
+local `/vh/*` (V1/V2). Bearer-gated (`--api-token` / `VH_API_TOKEN`), **outside**
+the session-auth edge — the coordinator is headless.
+
+| Method | Route | → worker |
+|--------|-------|----------|
+| GET | `/api/workers/{id}/sessions` | `/vh/snapshot` (carry `?sessions=`) |
+| GET | `/api/workers/{id}/sessions/{sid}` | `/vh/snapshot?sessions={sid}` |
+| POST | `/api/workers/{id}/sessions` | `/vh/spawn` |
+| POST | `/api/workers/{id}/sessions/{sid}/message` | `/vh/send` (+`If-Idle-Seq` passthrough) |
+| DELETE | `/api/workers/{id}/sessions/{sid}` | `/vh/abort` |
+| POST | `/api/workers/{id}/sessions/{sid}/archive` | `/vh/archive` |
+| POST | `/api/workers/{id}/sessions/{sid}/questions/{qid}` | `/vh/answer-question` |
+| POST | `/api/workers/{id}/sessions/{sid}/permissions/{pid}` | `/vh/reply-permission` |
+| GET | `/api/workers/{id}/events` | `/vh/stream` (SSE; `?cursor=`/`Last-Event-ID`) |
+
+- **epoch + seq**: the worker stamps `X-VH-Epoch` / `X-VH-Seq` on every `/vh/*`
+  response (and `epoch` is in the snapshot JSON); the controller passes them
+  through. Cursor tuple = `(worker_id, epoch, seq)`; re-snapshot on epoch change.
+- `?dir=` selects a project on the worker (carried through).
+- Unknown worker → `404`; offline → `502` (fail fast).
+- Auth: `Authorization: Bearer <token>`; empty token = open (only safe on a
+  protected edge).
 
 ## Decisions (generic-mechanism-only)
 
