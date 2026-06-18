@@ -98,7 +98,14 @@ func (r *Renderer) HighlightCSS() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return dark + "\n" + scopeCSS(light, ".theme-light-scoped"), nil
+	scoped := scopeCSS(light, ".theme-light-scoped")
+	// chroma's light (github) sheet sets only background-color on .chroma, with no
+	// text color. The dark sheet above is emitted unscoped, so its near-white
+	// .chroma foreground would otherwise win in light themes and render plain code
+	// text invisible on the light surface (white-on-white). Carry the page's (dark)
+	// foreground onto the scoped light base so untokenized code stays readable.
+	scoped += "\n.theme-light-scoped .chroma { color: inherit; }\n"
+	return dark + "\n" + scoped, nil
 }
 
 func styleCSS(name string) (string, error) {

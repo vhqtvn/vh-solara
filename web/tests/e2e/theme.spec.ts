@@ -130,4 +130,12 @@ test("markdown code blocks use the light syntax sheet on every light theme (not 
   const token = block.locator(".k, .kd, .kr").first();
   await expect(token).toBeVisible();
   expect(channelSum(await token.evaluate((el) => getComputedStyle(el).color))).toBeLessThan(500);
+
+  // Regression guard for the light-theme whiteout: the code block's BASE text
+  // color (the .chroma element itself, not a token) must be dark/readable on the
+  // light surface. The chroma light sheet sets only background on .chroma, so
+  // without an explicit base color the unscoped dark sheet's near-white
+  // foreground (#e6edf3) leaks in and renders untokenized code invisible.
+  const baseColor = await block.evaluate((el) => getComputedStyle(el).color);
+  expect(channelSum(baseColor)).toBeLessThan(500);
 });

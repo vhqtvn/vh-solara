@@ -54,6 +54,12 @@ func TestHighlightCSS(t *testing.T) {
 	if !strings.Contains(css, ".theme-light-scoped .chroma") {
 		t.Fatalf("light syntax rules must be scoped under .theme-light-scoped, got: %.300s", css)
 	}
+	// The scoped light .chroma base must set a text color, not only a background.
+	// Without it the unscoped dark sheet's near-white .chroma foreground wins in
+	// light themes and plain code text goes white-on-white (invisible).
+	if !strings.Contains(css, ".theme-light-scoped .chroma { color: inherit; }") {
+		t.Fatalf("light .chroma base must carry color: inherit so dark fg doesn't leak, got: %.300s", css)
+	}
 }
 
 func TestDiffRender(t *testing.T) {
