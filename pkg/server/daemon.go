@@ -1,0 +1,596 @@
+package server
+
+import (
+	"crypto/subtle"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"regexp"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/gorilla/websocket"
+	"github.com/vhqtvn/vh-solara/pkg/auth"
+	"github.com/vhqtvn/vh-solara/pkg/tunnel"
+)
+
+// Daemon is the main controller server.
+type Daemon struct {
+	Addr        string
+	DaemonAddr  string
+	HostPattern string
+
+	// Auth, when set, gates the user-facing edge (the dashboard + every proxied
+	// worker subdomain). nil = no auth (only safe on a loopback bind).
+	Auth *auth.Authenticator
+
+	// RegSecret, when non-empty, is required (constant-time) on the worker
+	// registration handshake via the X-VH-Worker-Secret header. Empty = open
+	// registration (the historical behavior; only safe when the registration
+	// listener isn't reachable by untrusted parties).
+	RegSecret string
+
+	Registry   *Registry
+	Proxy      *Proxy
+	WSUpgrader websocket.Upgrader
+
+	updateMu  sync.Mutex
+	updateLog strings.Builder
+}
+
+// NewDaemon initialises a new server daemon.
+func NewDaemon(addr, daemonAddr, hostPattern string) *Daemon {
+	registry := NewRegistry()
+	proxy := NewProxy(registry)
+
+	return &Daemon{
+		Addr:        addr,
+		DaemonAddr:  daemonAddr,
+		HostPattern: hostPattern,
+
+		Registry: registry,
+		Proxy:    proxy,
+		WSUpgrader: websocket.Upgrader{
+			ReadBufferSize:  256 * 1024,
+			WriteBufferSize: 256 * 1024,
+			CheckOrigin: func(r *http.Request) bool {
+				return true // allow all for MVP since it's behind Nginx
+			},
+		},
+	}
+}
+
+// Start boots the HTTP server.
+func (d *Daemon) Start() error {
+	// 1. Worker tunnel endpoint (Daemon Mux)
+	daemonMux := http.NewServeMux()
+	daemonMux.HandleFunc("/vh-solara/ws", d.handleWorkerWS)
+
+	go func() {
+		log.Printf("Starting vh-solara daemon registration server on %s", d.DaemonAddr)
+		if err := http.ListenAndServe(d.DaemonAddr, daemonMux); err != nil {
+			log.Fatalf("Daemon registration server failed: %v", err)
+		}
+	}()
+
+	// 2. Main API & UI endpoints (User Mux)
+	userMux := http.NewServeMux()
+
+	// Machine management API
+	userMux.HandleFunc("GET /api/workers", d.handleListWorkers)
+	userMux.HandleFunc("DELETE /api/workers", d.handleCleanupWorkers)
+	userMux.HandleFunc("POST /api/workers/{id}/kill", d.handleKillWorker)
+	userMux.HandleFunc("GET /{$}", d.handleUIPage)
+
+	// Wrap the userMux in a middleware to intercept wildcard host patterns
+	var rootHandler http.Handler = userMux
+
+	if d.HostPattern != "" {
+		// Escape the pattern literal and replace \$ID back with a regex capture group
+		regexStr := regexp.QuoteMeta(d.HostPattern)
+		regexStr = strings.ReplaceAll(regexStr, "\\$ID", "(?P<id>[^.]+)")
+		regexStr = "^" + regexStr + "$"
+
+		hostRegex, err := regexp.Compile(regexStr)
+		if err == nil {
+			log.Printf("Enabled host-based OpenChamber provisioning for pattern: %s (regex: %s)", d.HostPattern, regexStr)
+			rootHandler = d.hostInterceptor(hostRegex, userMux)
+		} else {
+			log.Printf("Warning: failed to compile host-pattern regex: %v", err)
+		}
+	}
+
+	// Auth gates the entire user edge — the dashboard and every proxied worker
+	// subdomain — outside the host interceptor. The worker registration listener
+	// (DaemonAddr) is separate and intentionally not covered here. nil = no-op.
+	rootHandler = d.Auth.Middleware(rootHandler)
+
+	log.Printf("Starting vh-solara user UI server on %s", d.Addr)
+	return http.ListenAndServe(d.Addr, rootHandler)
+}
+
+func (d *Daemon) hostInterceptor(pattern *regexp.Regexp, next http.Handler) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		host := r.Host // e.g., "e8b1.mysite.com:8080"
+		// Strip port if present
+		if idx := strings.Index(host, ":"); idx != -1 {
+			host = host[:idx]
+		}
+
+		matches := pattern.FindStringSubmatch(host)
+		if len(matches) > 1 {
+			workerID := matches[1]
+			log.Printf("[HostInterceptor] Host %q matched pattern, extracted worker ID: %s", host, workerID)
+
+			// Exact match only. A prefix fallback (a subdomain that is a prefix of a
+			// worker ID) would route a request to an unintended worker and let a
+			// short guessed subdomain reach a real one — so the subdomain must equal
+			// the worker ID verbatim.
+			worker, ok := d.Registry.GetWorker(workerID)
+			if !ok || worker.Status == "offline" {
+				log.Printf("[HostInterceptor] Worker %s not found or offline", workerID)
+				http.Error(w, fmt.Sprintf("Worker %s not found or offline", workerID), http.StatusBadGateway)
+				return
+			}
+
+			log.Printf("[HostInterceptor] Proxying to worker %s (transport closed: %v)",
+				worker.ID, worker.Transport == nil || worker.Transport.IsClosed())
+			d.Proxy.HandleChamberDirect(worker.ID, worker, w, r)
+			return
+		}
+
+		log.Printf("[HostInterceptor] Host %q did not match pattern", host)
+
+		next.ServeHTTP(w, r)
+	}
+}
+
+// handleWorkerWS accepts connections from the agent and sets up a yamux session.
+func (d *Daemon) handleWorkerWS(w http.ResponseWriter, r *http.Request) {
+	// Registration secret check, before the upgrade. The header rides the WS dial
+	// handshake (the client forwards it like any --header). Constant-time compare
+	// so a wrong secret can't be timed. Empty RegSecret = open (historical).
+	if d.RegSecret != "" {
+		got := r.Header.Get("X-VH-Worker-Secret")
+		if subtle.ConstantTimeCompare([]byte(got), []byte(d.RegSecret)) != 1 {
+			log.Printf("Rejected worker registration: bad or missing X-VH-Worker-Secret")
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+	}
+
+	conn, err := d.WSUpgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("Failed to upgrade WS: %v", err)
+		return
+	}
+
+	// Create yamux server session over the WebSocket
+	mux, err := tunnel.NewMuxTransportServer(conn)
+	if err != nil {
+		log.Printf("Failed to init yamux session: %v", err)
+		conn.Close()
+		return
+	}
+	defer mux.Close()
+
+	// The first stream from the client carries the registration message
+	regStream, err := mux.AcceptStream()
+	if err != nil {
+		log.Printf("Failed to accept registration stream: %v", err)
+		return
+	}
+
+	var reg tunnel.RegisterMessage
+	if err := regStream.ReadJSON(&reg); err != nil {
+		log.Printf("Failed to read registration: %v", err)
+		regStream.Close()
+		return
+	}
+	regStream.Close()
+
+	if reg.Type != tunnel.TypeRegister {
+		log.Printf("Expected register, got %s", reg.Type)
+		return
+	}
+
+	// Use the client-provided worker ID directly.
+	// The client daemon already ensures uniqueness per instance.
+	// On reconnect, this will replace the existing offline entry via Registry.AddWorker.
+	workerID := reg.WorkerID
+
+	if worker, exists := d.Registry.GetWorker(workerID); exists && worker.Status == "online" && worker.Transport != nil && !worker.Transport.IsClosed() {
+		log.Printf("Worker ID %q is already online, rejecting duplicate connection", workerID)
+		errStream, err := mux.OpenStream()
+		if err == nil {
+			errStream.WriteJSON(tunnel.BaseMessage{
+				Type:     tunnel.TypeFatalDuplicate,
+				WorkerID: workerID,
+			})
+			time.Sleep(100 * time.Millisecond)
+			errStream.Close()
+		}
+		return
+	}
+
+	worker := &Worker{
+		ID:        workerID,
+		Name:      reg.WorkerName,
+		Version:   reg.Version,
+		Transport: mux,
+		LastSeen:  time.Now(),
+		Status:    "online",
+	}
+
+	d.Registry.AddWorker(worker)
+	log.Printf("Worker registered: %s (%s) [Original ID: %s]", worker.ID, worker.Name, reg.WorkerID)
+	defer d.Registry.MarkWorkerOffline(worker.ID)
+
+	// Accept streams from the client (heartbeats, responses, etc.)
+	// In the yamux model, responses come back on the stream they were sent on,
+	// so the server only needs to accept streams that the client initiates
+	// (e.g. heartbeats).
+	for {
+		stream, err := mux.AcceptStream()
+		if err != nil {
+			log.Printf("Worker %s disconnected: %v", worker.ID, err)
+			break
+		}
+
+		go func() {
+			defer stream.Close()
+
+			var base tunnel.BaseMessage
+			if err := stream.ReadJSON(&base); err != nil {
+				return
+			}
+
+			switch base.Type {
+			case tunnel.TypeHeartbeat:
+				d.Registry.UpdateHeartbeat(worker.ID)
+			default:
+				log.Printf("Unexpected client-initiated stream type: %s", base.Type)
+			}
+		}()
+	}
+}
+
+// placeholder handlers for API routes
+func (d *Daemon) handleListWorkers(w http.ResponseWriter, r *http.Request) {
+	workers := d.Registry.ListWorkers()
+	// Strip transport from serialization
+	type pubWorker struct {
+		ID       string    `json:"id"`
+		Name     string    `json:"name"`
+		Version  string    `json:"version"`
+		LastSeen time.Time `json:"last_seen"`
+		Status   string    `json:"status"`
+		URL      string    `json:"url,omitempty"`
+	}
+	out := []pubWorker{}
+	for _, wv := range workers {
+		wUrl := ""
+		if d.HostPattern != "" {
+			wUrl = "https://" + strings.ReplaceAll(d.HostPattern, "$ID", wv.ID)
+		}
+
+		out = append(out, pubWorker{
+			ID:       wv.ID,
+			Name:     wv.Name,
+			Version:  wv.Version,
+			LastSeen: wv.LastSeen,
+			Status:   wv.Status,
+			URL:      wUrl,
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(out)
+}
+
+func (d *Daemon) handleCleanupWorkers(w http.ResponseWriter, r *http.Request) {
+	d.Registry.CleanupOfflineWorkers()
+	w.WriteHeader(http.StatusOK)
+}
+
+func (d *Daemon) handleKillWorker(w http.ResponseWriter, r *http.Request) {
+	workerID := r.PathValue("id")
+	if workerID == "" {
+		http.Error(w, "missing worker id", http.StatusBadRequest)
+		return
+	}
+
+	worker, exists := d.Registry.GetWorker(workerID)
+	if !exists {
+		http.Error(w, "worker not found", http.StatusNotFound)
+		return
+	}
+	if worker.Status == "offline" || worker.Transport == nil {
+		http.Error(w, "worker is already offline", http.StatusConflict)
+		return
+	}
+
+	// Send kill via a yamux stream
+	stream, err := worker.Transport.OpenStream()
+	if err != nil {
+		http.Error(w, "failed to open stream to worker", http.StatusInternalServerError)
+		return
+	}
+	defer stream.Close()
+
+	killMsg := tunnel.BaseMessage{
+		Type:     tunnel.TypeKillInstance,
+		WorkerID: workerID,
+	}
+	if err := stream.WriteJSON(killMsg); err != nil {
+		http.Error(w, "failed to send kill message", http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+}
+
+func (d *Daemon) handleUIPage(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html")
+	fmt.Fprint(w, `<!DOCTYPE html>
+<html>
+<head>
+	<title>vh-solara Dashboard</title>
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<style>
+		:root {
+			--bg: #0b0f19;
+			--card-bg: #151b2b;
+			--border: #232d42;
+			--text-main: #f3f4f6;
+			--text-muted: #9ca3af;
+			--primary: #3b82f6;
+			--primary-hover: #2563eb;
+			--danger: #ef4444;
+			--danger-hover: #dc2626;
+			--success: #10b981;
+			--modal-bg: rgba(0,0,0,0.6);
+			--input-bg: rgba(0,0,0,0.2);
+		}
+
+		:root.light-theme {
+			--bg: #f8fafc;
+			--card-bg: #ffffff;
+			--border: #e2e8f0;
+			--text-main: #0f172a;
+			--text-muted: #64748b;
+			--primary: #2563eb;
+			--primary-hover: #1d4ed8;
+			--danger: #dc2626;
+			--danger-hover: #b91c1c;
+			--success: #059669;
+			--modal-bg: rgba(15,23,42,0.4);
+			--input-bg: #f8fafc;
+		}
+
+		* { box-sizing: border-box; }
+		body { 
+			font-family: 'Inter', system-ui, -apple-system, sans-serif; 
+			background: var(--bg); 
+			color: var(--text-main); 
+			margin: 0; padding: 2rem; 
+			display: flex; justify-content: center;
+			line-height: 1.5;
+			transition: background-color 0.3s ease, color 0.3s ease;
+		}
+		.container { width: 100%; max-width: 1000px; }
+		h1, h2 { margin-top: 0; font-weight: 600; letter-spacing: -0.025em; }
+		h1 { font-size: 1.5rem; }
+		h2 { font-size: 1.25rem; }
+		
+		.card { 
+			background: var(--card-bg); 
+			padding: 2rem; 
+			border-radius: 16px; 
+			border: 1px solid var(--border);
+			box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1), 0 2px 4px -1px rgba(0,0,0,0.06); 
+			margin-bottom: 2rem; 
+			transition: all 0.3s ease;
+		}
+		.card:hover {
+			box-shadow: 0 10px 15px -3px rgba(0,0,0,0.15), 0 4px 6px -2px rgba(0,0,0,0.08); 
+			border-color: #3b82f640;
+		}
+		
+		button { 
+			background: var(--primary); color: white; border: none; 
+			padding: 0.5rem 1rem; border-radius: 8px; cursor: pointer; 
+			font-weight: 500; font-size: 0.875rem; 
+			transition: all 0.2s ease; 
+			display: inline-flex; align-items: center; justify-content: center;
+			gap: 0.5rem;
+		}
+		button:hover { background: var(--primary-hover); transform: translateY(-1px); }
+		button:active { transform: translateY(0); }
+		button.danger { background: transparent; color: var(--danger); border: 1px solid var(--border); }
+		button.danger:hover { background: rgba(239, 68, 68, 0.1); border-color: var(--danger); }
+		button.secondary { background: transparent; color: var(--text-main); border: 1px solid var(--border); box-shadow: 0 1px 2px rgba(0,0,0,0.05); }
+		button.secondary:hover { background: var(--border); }
+		button.icon-btn { padding: 0.4rem; border-radius: 6px; }
+		button:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+		
+		table { width: 100%; border-collapse: separate; border-spacing: 0; margin-top: 0.5rem; }
+		th, td { padding: 1rem; text-align: left; border-bottom: 1px solid var(--border); transition: border-color 0.3s ease; }
+		th { color: var(--text-muted); font-size: 0.75rem; text-transform: uppercase; font-weight: 600; letter-spacing: 0.05em; border-bottom: 2px solid var(--border); }
+		tr { transition: background-color 0.2s ease; }
+		tr:hover td { background-color: rgba(148, 163, 184, 0.05); }
+		tr:last-child td { border-bottom: none; }
+		
+		.badge { 
+			padding: 0.25rem 0.75rem; border-radius: 9999px; font-size: 0.725rem; font-weight: 600; 
+			text-transform: uppercase; letter-spacing: 0.05em; display: inline-block;
+		}
+		.badge.online { background: rgba(16, 185, 129, 0.1); color: var(--success); border: 1px solid rgba(16, 185, 129, 0.2); }
+		.badge.offline { background: rgba(156, 163, 175, 0.1); color: var(--text-muted); border: 1px solid rgba(156, 163, 175, 0.2); }
+		
+		.header-actions { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.5rem;flex-wrap: wrap; gap: 1rem;}
+		.action-buttons { display: flex; gap: 0.5rem; flex-wrap: wrap;}
+		
+		.name-col { max-width: 250px; }
+		.name-text { font-weight: 600; color: var(--text-main); margin-bottom: 0.125rem;}
+		.text-gray { color: var(--text-muted); }
+		.text-sm { font-size: 0.85rem; }
+		.fade-in { animation: fadeIn 0.4s ease-out forwards; opacity: 0; }
+		
+		@keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+		
+		/* Scrollbar */
+		::-webkit-scrollbar { width: 8px; height: 8px; }
+		::-webkit-scrollbar-track { background: transparent; }
+		::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+		::-webkit-scrollbar-thumb:hover { background: #64748b; }
+
+		/* Theme Toggle Icons */
+		.theme-icon-light { display: none; }
+		.theme-icon-dark { display: block; }
+		:root.light-theme .theme-icon-light { display: block; }
+		:root.light-theme .theme-icon-dark { display: none; }
+	</style>
+	<script>
+		// Theme initialization before content loads to prevent flash
+		const savedTheme = localStorage.getItem('theme');
+		const prefersLight = window.matchMedia('(prefers-color-scheme: light)').matches;
+		if (savedTheme === 'light' || (!savedTheme && prefersLight)) {
+			document.documentElement.classList.add('light-theme');
+		}
+	</script>
+</head>
+<body>
+	<div class="container fade-in">
+		<div class="card">
+			<div class="header-actions">
+				<h1>Connected Machines</h1>
+				<div class="action-buttons">
+					<button class="secondary icon-btn" onclick="toggleTheme()" aria-label="Toggle Theme" title="Toggle Theme">
+						<svg class="theme-icon-dark" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line></svg>
+						<svg class="theme-icon-light" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
+					</button>
+					<button class="secondary" onclick="cleanupWorkers()">
+						<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
+						Clean Offline
+					</button>
+				</div>
+			</div>
+			
+			<div style="overflow-x: auto;">
+				<table id="workersTable">
+					<thead>
+						<tr>
+							<th>Name / ID</th>
+							<th>Status</th>
+							<th style="text-align: right;">Actions</th>
+						</tr>
+					</thead>
+					<tbody id="workersBody">
+						<tr><td colspan="3" style="text-align: center; color: var(--text-muted); padding: 3rem;">Loading workers...</td></tr>
+					</tbody>
+				</table>
+			</div>
+		</div>
+	</div>
+
+	<script>
+		let pollingTimeout;
+		
+		function toggleTheme() {
+			const isLight = document.documentElement.classList.toggle('light-theme');
+			localStorage.setItem('theme', isLight ? 'light' : 'dark');
+		}
+
+		async function killWorker(id) {
+			if(confirm("Terminate this OpenCode session?")) {
+				await fetch('/api/workers/' + encodeURIComponent(id) + '/kill', {method: 'POST'});
+				fetchWorkers();
+			}
+		}
+
+		async function cleanupWorkers() {
+			await fetch('/api/workers', {method: 'DELETE'});
+			fetchWorkers();
+		}
+
+		async function fetchWorkers() {
+			try {
+				const workersRes = await fetch('/api/workers');
+				const workers = await workersRes.json();
+
+				const tbody = document.getElementById('workersBody');
+				
+				if (!workers || workers.length === 0) {
+					tbody.innerHTML = '<tr><td colspan="3" style="text-align: center; color: var(--text-muted); padding: 3rem;">No workers connected</td></tr>';
+					return;
+				}
+
+				// Find existing rows
+				const existingRows = Array.from(tbody.querySelectorAll('tr[data-worker-id]'));
+				const existingMap = new Map(existingRows.map(tr => [tr.dataset.workerId, tr]));
+				
+				// Remove the "Loading workers..." or "No workers connected" row if needed
+				if (existingRows.length === 0) {
+					tbody.innerHTML = '';
+				}
+
+				const processedIds = new Set();
+
+				workers.forEach((w, idx) => {
+					processedIds.add(w.id);
+					let isNew = false;
+					let tr = existingMap.get(w.id);
+					
+					if (!tr) {
+						isNew = true;
+						tr = document.createElement('tr');
+						tr.dataset.workerId = w.id;
+						tr.style.animationDelay = (idx * 0.05) + 's';
+						tr.className = 'fade-in';
+						tr.style.opacity = '0'; // reset for animation
+						tbody.appendChild(tr);
+					}
+					
+					if (w.status === 'offline') {
+						tr.style.opacity = '0.5';
+					} else {
+						tr.style.opacity = '';
+					}
+
+					const shortId = w.id.length > 20 ? w.id.substring(0, 20) + '...' : w.id;
+					const urlLink = w.url ? '<a href="' + w.url + '" target="_blank" style="color: var(--primary); text-decoration: none; font-size: 0.8rem;">Open Web ↗</a>' : '';
+					
+					tr.innerHTML = 
+						'<td class="name-col"><div class="name-text">' + w.name + '</div><div class="text-gray text-sm">' + shortId + '</div>' + urlLink + '</td>' +
+						'<td><span class="badge ' + w.status + '">' + w.status + '</span></td>' +
+						'<td style="text-align: right;"><div class="action-buttons" style="justify-content: flex-end;">' +
+						(w.status !== 'offline' ? '<button class="danger" onclick="killWorker(\'' + w.id + '\')">Kill</button>' : '') +
+						'</div></td>';
+				});
+
+				// Remove rows for workers that no longer exist
+				existingRows.forEach(tr => {
+					if (!processedIds.has(tr.dataset.workerId)) {
+						tr.remove();
+					}
+				});
+			} catch(e) {
+				console.error('Failed to fetch workers:', e);
+			}
+		}
+
+
+
+		function pollWorkers() {
+			fetchWorkers();
+			pollingTimeout = setTimeout(pollWorkers, 3000);
+		}
+
+		pollWorkers();
+	</script>
+</body>
+</html>`)
+}

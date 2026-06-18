@@ -1,0 +1,107 @@
+// Small UI preferences (versioned localStorage signals), kept out of the sync store.
+import { createSignal } from "solid-js";
+import { loadVersioned, saveVersioned } from "./lib/store";
+
+// Live message streaming: when on (default), in-flight assistant text renders
+// token-by-token; when off ("block-by-block"), a part shows only once settled.
+const STREAM_KEY = "vh.prefs.streamLive.v1";
+const [streamLive, setStreamLiveSig] = createSignal<boolean>(
+  loadVersioned<boolean>(STREAM_KEY, 1, true, (old) => !(old === 0 || old === "0" || old === false)),
+);
+export function setStreamLive(on: boolean) {
+  setStreamLiveSig(on);
+  saveVersioned(STREAM_KEY, 1, on);
+}
+export { streamLive };
+
+// Session-list density: "compact" (single line per session, the original) or
+// "detailed" (two lines — title row + a secondary line with direct-children
+// running/idle counts, falling back to started-at when there are none).
+const DENSITY_KEY = "vh.prefs.treeDensity.v1";
+const [treeDensity, setTreeDensitySig] = createSignal<"compact" | "detailed">(
+  loadVersioned<"compact" | "detailed">(DENSITY_KEY, 1, "compact", (o) =>
+    o === "detailed" ? "detailed" : "compact",
+  ),
+);
+export function setTreeDensity(v: "compact" | "detailed") {
+  setTreeDensitySig(v);
+  saveVersioned(DENSITY_KEY, 1, v);
+}
+export { treeDensity };
+
+// Client UI zoom: the user's own scale control. On mobile we drive the actual
+// viewport scale (a real "virtual viewport" zoom the user sets deliberately,
+// replacing the disabled pinch-zoom); on desktop, where the viewport meta is
+// ignored, we use CSS `zoom`. Clamped 0.5–1.6.
+const SCALE_KEY = "vh.prefs.uiScale.v1";
+export const MIN_SCALE = 0.5;
+export const MAX_SCALE = 1.6;
+const [uiScale, setUiScaleSig] = createSignal<number>(loadVersioned<number>(SCALE_KEY, 1, 1));
+
+const VIEWPORT_BASE = "width=device-width, viewport-fit=cover, interactive-widget=resizes-content";
+function setViewportScale(scale: number) {
+  const meta = document.querySelector('meta[name="viewport"]');
+  // Lock the viewport at the user's scale (pinch stays disabled).
+  meta?.setAttribute(
+    "content",
+    `${VIEWPORT_BASE}, initial-scale=${scale}, minimum-scale=${scale}, maximum-scale=${scale}, user-scalable=no`,
+  );
+}
+
+export function applyScale() {
+  const scale = uiScale();
+  const root = document.documentElement;
+  const coarse = typeof matchMedia !== "undefined" && matchMedia("(pointer: coarse)").matches;
+  // ui-zoom always drives the viewport meta's initial/minimum/maximum-scale —
+  // the mechanism that actually scales on mobile (and webviews that honor it).
+  setViewportScale(scale);
+  if (coarse) {
+    // Mobile: the meta scale above does the work; CSS zoom reset so they don't
+    // compound, and --ui-zoom stays 1 (no app-height compensation needed).
+    (root.style as any).zoom = "";
+    root.style.setProperty("--ui-zoom", "1");
+  } else {
+    // Desktop: the viewport meta is ignored, so CSS `zoom` does the visible
+    // scaling. --ui-zoom lets the app height (a fixed px from the visual
+    // viewport, which zoom would otherwise render at <100%, leaving dead space)
+    // divide it back so it still fills the screen.
+    (root.style as any).zoom = String(scale);
+    root.style.setProperty("--ui-zoom", String(scale));
+  }
+}
+export function setUiScale(s: number) {
+  const clamped = Math.min(MAX_SCALE, Math.max(MIN_SCALE, Math.round(s * 100) / 100));
+  setUiScaleSig(clamped);
+  saveVersioned(SCALE_KEY, 1, clamped);
+  applyScale();
+}
+export { uiScale };
+
+// Screen orientation: "system" (default — respect the device/OS, including its
+// rotation lock) or "auto" (lock to "any" so the app rotates freely even when
+// the OS rotation-lock is on). Only effective in an installed PWA / fullscreen
+// on most browsers; calls are best-effort and ignored where unsupported.
+const ORIENT_KEY = "vh.prefs.orientation.v1";
+const [orientation, setOrientationSig] = createSignal<"system" | "auto">(
+  loadVersioned<"system" | "auto">(ORIENT_KEY, 1, "system", (o) => (o === "auto" ? "auto" : "system")),
+);
+export function applyOrientation() {
+  const so: any = typeof screen !== "undefined" ? (screen as any).orientation : null;
+  if (!so) return;
+  try {
+    if (orientation() === "auto") {
+      const p = so.lock?.("any");
+      if (p && typeof p.catch === "function") p.catch(() => {});
+    } else {
+      so.unlock?.();
+    }
+  } catch {
+    /* unsupported / requires fullscreen — ignore */
+  }
+}
+export function setOrientation(v: "system" | "auto") {
+  setOrientationSig(v);
+  saveVersioned(ORIENT_KEY, 1, v);
+  applyOrientation();
+}
+export { orientation };

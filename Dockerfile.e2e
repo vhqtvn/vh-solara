@@ -1,0 +1,45 @@
+# syntax=docker/dockerfile:1
+# End-to-end image: real `opencode` driven by a fake LLM, behind the real
+# vh-solara aggregator + web server. Used by tests/e2e-docker/run.sh.
+
+# 1) Build the SPA (embedded into the Go e2e server).
+FROM node:20-alpine AS webbuild
+WORKDIR /app
+COPY web/package.json web/package-lock.json ./web/
+RUN cd web && npm ci
+COPY web ./web
+RUN cd web && npm run build
+
+# 2) Build the Go binaries (e2e server + fake LLM).
+FROM golang:1.23-alpine AS gobuild
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+COPY --from=webbuild /app/pkg/web/dist ./pkg/web/dist
+ENV CGO_ENABLED=0 GOTOOLCHAIN=local
+RUN go build -trimpath -o /out/e2eserver ./tools/e2eserver \
+ && go build -trimpath -o /out/fakellm ./tools/fakellm
+
+# 3) Runtime with the real opencode binary (glibc/bun).
+FROM debian:bookworm-slim
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl git tar \
+ && rm -rf /var/lib/apt/lists/*
+# Install the real opencode CLI.
+RUN curl -fsSL https://opencode.ai/install | bash
+COPY --from=gobuild /out/e2eserver /usr/local/bin/e2eserver
+COPY --from=gobuild /out/fakellm /usr/local/bin/fakellm
+
+# Workspace opencode runs in, configured to use the fake LLM.
+RUN mkdir -p /work && git init -q /work \
+ && git -C /work config user.email e2e@example.com \
+ && git -C /work config user.name e2e \
+ && printf 'hello\n' > /work/README.md \
+ && git -C /work add -A && git -C /work commit -qm init
+COPY tests/e2e-docker/opencode.json /work/opencode.json
+COPY tests/e2e-docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+EXPOSE 8099
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

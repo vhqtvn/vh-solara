@@ -1,0 +1,19 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "fake": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Fake LLM",
+      "options": {
+        "baseURL": "http://127.0.0.1:11434/v1",
+        "apiKey": "dummy"
+      },
+      "models": {
+        "dummy": { "name": "Dummy Model" }
+      }
+    }
+  },
+  "model": "fake/dummy",
+  "small_model": "fake/dummy",
+  "permission": { "*": "allow", "bash": "ask" }
+}

@@ -1,0 +1,10 @@
+.git
+**/node_modules
+refs
+tmp
+dist
+*.log
+vh-solara
+# Regenerated fresh in the web build stage; don't ship a stale embed.
+pkg/web/dist
+web/.gitignore

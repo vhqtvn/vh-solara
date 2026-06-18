@@ -1,0 +1,238 @@
+import { expect, test } from "@playwright/test";
+
+// Sends a prompt containing the fixture trigger and returns once the assistant
+// turn settles. The fixture maps [[ask]] -> a question.asked event.
+async function openDemo(page: import("@playwright/test").Page) {
+  await page.goto("/");
+  await page.getByRole("button", { name: /Demo session/ }).click();
+}
+
+test("a question request renders an answerable card and replies", async ({ page }) => {
+  await openDemo(page);
+  await page.getByPlaceholder(/Message/).fill("[[ask]] pick one");
+  await page.keyboard.press("Enter");
+
+  const card = page.locator(".question-card");
+  await expect(card).toBeVisible({ timeout: 8000 });
+  await expect(card).toContainText("Which approach should I take?");
+  await expect(card).toContainText("Refactor");
+  await expect(card).toContainText("Rewrite");
+
+  // Display-only A:/B: keys are shown (separate DOM elements, not part of the value).
+  await expect(card.locator(".question-opt-key").first()).toHaveText("A:");
+  await expect(card.locator(".question-opt-key").nth(1)).toHaveText("B:");
+  await expect(card.locator(".question-opt-label").first()).toHaveText("Refactor");
+
+  // Free-text "type your own" is offered by default (the question doesn't set
+  // custom:false), so a custom reply is always possible.
+  await expect(card.locator(".question-custom")).toBeVisible();
+
+  // Reply is disabled until an option is chosen.
+  const reply = card.getByRole("button", { name: "Reply" });
+  await expect(reply).toBeDisabled();
+  await card.getByText("Refactor").click();
+  await expect(reply).toBeEnabled();
+  await reply.click();
+
+  // The card clears once the reply is acknowledged (question.replied event)…
+  await expect(card).toHaveCount(0, { timeout: 8000 });
+  // …and the assistant continues with a visible result referencing the choice.
+  await expect(page.locator(".msg.assistant").last()).toContainText("Refactor", { timeout: 8000 });
+});
+
+test("the notification bell surfaces a pending question as an action", async ({ page }) => {
+  await openDemo(page);
+  await page.getByPlaceholder(/Message/).fill("[[ask]] need a decision");
+  await page.keyboard.press("Enter");
+  await expect(page.locator(".question-card")).toBeVisible({ timeout: 8000 });
+
+  // Badge appears; opening the menu lists an "Action needed" item.
+  await expect(page.locator(".notif-badge")).toBeVisible();
+  await page.getByRole("button", { name: "Notifications" }).click();
+  const menu = page.getByRole("dialog", { name: "Notifications" });
+  await expect(menu.locator(".notif-section", { hasText: "Action needed" })).toBeVisible();
+  await expect(menu.locator(".notif-item.action").first()).toContainText("Which approach");
+});
+
+test("header usage pill shows context + quota and opens the inspector", async ({ page }) => {
+  await openDemo(page);
+  // OpenChamber-style Usage pill in the chat header.
+  const pill = page.getByRole("button", { name: "Usage", exact: true });
+  await expect(pill).toBeVisible();
+  await pill.click();
+
+  const menu = page.getByRole("dialog", { name: "Usage" });
+  await expect(menu).toContainText("Context window");
+  await expect(menu).toContainText("Provider quota");
+  // Provider quota is reachable right here from the chat screen (not just Settings).
+  await expect(menu.locator(".quota-name", { hasText: "Claude" })).toBeVisible();
+
+  // Drill into the full session inspector.
+  await menu.getByRole("button", { name: "Session details →" }).click();
+  const insp = page.getByRole("dialog", { name: "Session inspector" });
+  await expect(insp).toBeVisible();
+  await expect(insp).toContainText("Total cost");
+  await expect(insp).toContainText("Messages");
+});
+
+test("notes view persists a to-do and project notes to the server", async ({ page }) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "Notes", exact: true }).click();
+
+  // Add a to-do.
+  const todo = `ship it ${Date.now()}`;
+  await page.getByPlaceholder("Add a to-do…").fill(todo);
+  await page.getByRole("button", { name: "Add to-do" }).click();
+  await expect(page.locator(".todo-text", { hasText: todo })).toBeVisible();
+
+  // Write a note; it autosaves to the daemon.
+  const note = `note ${Date.now()}`;
+  await page.locator(".notes-text").fill(note);
+  await page.waitForTimeout(800);
+
+  // The server round-trips it: GET /vh/notes returns the saved content.
+  const saved = await page.evaluate(async () => (await fetch("/vh/notes")).json());
+  expect(saved.notes).toContain("note ");
+  expect(saved.todos.some((t: any) => t.text.startsWith("ship it"))).toBeTruthy();
+});
+
+test("archive removes a session from the tree and the Archived browser restores it", async ({ page }) => {
+  await page.goto("/");
+  // Create a fresh session so we don't disturb the seeded demo sessions.
+  await page.getByRole("button", { name: "Create session" }).click();
+  await page.getByPlaceholder("Message…").fill("archive me");
+  await page.keyboard.press("Enter");
+  // It now exists + is selected; wait for the assistant turn so it's settled.
+  const liveNew = page.locator(".tree-node", { hasText: "New session" });
+  await expect(liveNew.first()).toBeVisible({ timeout: 8000 });
+  const beforeLive = await liveNew.count();
+
+  // Archive via the session inspector (Usage pill → Session details → Archive).
+  await page.getByRole("button", { name: "Usage", exact: true }).click();
+  await page.getByRole("dialog", { name: "Usage" }).getByRole("button", { name: "Session details →" }).click();
+  const insp = page.getByRole("dialog", { name: "Session inspector" });
+  await insp.getByRole("button", { name: /Archive session/ }).click();
+
+  // Archiving requires confirmation (lists related sessions).
+  const confirm = page.getByRole("dialog", { name: "Confirm archive" });
+  await expect(confirm).toBeVisible();
+  await confirm.getByRole("button", { name: /Archive/ }).click();
+
+  // It leaves the live tree… (assert the count dropped — the shared fixture may
+  // hold stray "New session" nodes from other specs, so don't pin an exact N).
+  await expect.poll(() => liveNew.count(), { timeout: 8000 }).toBeLessThan(beforeLive);
+
+  // …and shows up in the Archived browser, where Restore brings it back.
+  await page.getByRole("button", { name: "Archived" }).click();
+  const arch = page.getByRole("dialog", { name: "Archived sessions" });
+  await expect(arch).toBeVisible();
+  await expect(arch.locator(".arch-row").first()).toBeVisible({ timeout: 8000 });
+  const beforeArch = await arch.locator(".arch-row").count();
+  await arch.locator(".arch-restore").first().click();
+  await expect.poll(() => arch.locator(".arch-row").count(), { timeout: 8000 }).toBeLessThan(beforeArch);
+});
+
+test("sidebar search filters sessions and pinning floats one to the top", async ({ page }) => {
+  await page.goto("/");
+  await expect(page.locator(".tree-node", { hasText: "Demo session" })).toBeVisible();
+
+  // Search narrows the tree to a flat match list.
+  const search = page.getByPlaceholder("Search sessions…");
+  await search.fill("zzzznomatch");
+  await expect(page.locator(".tree-empty")).toContainText("No matches");
+  await search.fill("Demo");
+  await expect(page.locator(".tree-node", { hasText: "Demo session" })).toBeVisible();
+  await page.locator(".session-search-clear").click();
+  await expect(search).toHaveValue("");
+
+  // Pin via the context menu → a pin dot appears.
+  await page.locator(".tree-node", { hasText: "Demo session" }).first().click({ button: "right" });
+  const menu = page.locator(".ctxm-menu");
+  await menu.getByText(/Pin to top/).click();
+  await expect(page.locator(".tree-node .dot.pin").first()).toBeVisible();
+});
+
+test("right-click session title opens a menu; Archive… confirms related sessions", async ({ page }) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "Create session" }).click();
+  await page.getByPlaceholder("Message…").fill("menu me");
+  await page.keyboard.press("Enter");
+  const liveNew = page.locator(".tree-node", { hasText: "New session" });
+  await expect(liveNew.first()).toBeVisible({ timeout: 8000 });
+  const beforeLive = await liveNew.count();
+
+  // Right-click the chat header title → positioned context menu.
+  await page.locator(".main-title.has-menu").click({ button: "right" });
+  const menu = page.locator(".ctxm-menu");
+  await expect(menu).toBeVisible();
+  await expect(menu).toContainText("Copy title");
+  await expect(menu).toContainText("Copy session id");
+  await expect(menu.getByText(/Copy .title \(id\)./)).toBeVisible();
+
+  // Archive… → confirmation lists the related sessions.
+  await menu.getByText("Archive…").click();
+  const confirm = page.getByRole("dialog", { name: "Confirm archive" });
+  await expect(confirm).toBeVisible();
+  await expect(confirm.locator(".confirm-list li")).toHaveCount(1);
+  await confirm.getByRole("button", { name: /Archive/ }).click();
+
+  // Confirmed → session leaves the live tree (count drops; see note above).
+  await expect.poll(() => liveNew.count(), { timeout: 8000 }).toBeLessThan(beforeLive);
+});
+
+test("right-click → Rename updates the session title", async ({ page }) => {
+  await page.goto("/");
+  // Use a fresh session so we don't rename the shared demo session.
+  await page.getByRole("button", { name: "Create session" }).click();
+  await page.getByPlaceholder("Message…").fill("rename me");
+  await page.keyboard.press("Enter");
+  await expect(page.locator(".tree-node", { hasText: "New session" }).first()).toBeVisible({ timeout: 8000 });
+
+  await page.locator(".main-title.has-menu").click({ button: "right" });
+  const menu = page.locator(".ctxm-menu");
+  await expect(menu).toBeVisible();
+  await expect(menu).toContainText("Regenerate name");
+
+  await menu.getByText("Rename…").click();
+  const input = page.locator(".vh-prompt-input");
+  await expect(input).toBeVisible();
+  await input.fill("Renamed via menu");
+  await page.locator(".vh-prompt .confirm-go").click();
+  await expect(page.locator(".main-title")).toContainText("Renamed via menu", { timeout: 8000 });
+});
+
+test("right-click → Regenerate name asks the model then confirms the new title", async ({ page }) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "Create session" }).click();
+  await page.getByPlaceholder("Message…").fill("name me");
+  await page.keyboard.press("Enter");
+  await expect(page.locator(".tree-node", { hasText: "New session" }).first()).toBeVisible({ timeout: 8000 });
+
+  await page.locator(".main-title.has-menu").click({ button: "right" });
+  const menu = page.locator(".ctxm-menu");
+  await expect(menu).toBeVisible();
+
+  // Regenerate calls the model (fixture generate-name → "fixture-generated-name")
+  // and pre-fills the confirm dialog with the de-slugified suggestion; confirming
+  // applies it. Asserts the LLM→deslugify→confirm→PATCH path.
+  await menu.getByText("Regenerate name").click();
+  const input = page.locator(".vh-prompt-input");
+  await expect(input).toHaveValue("Fixture generated name", { timeout: 8000 });
+  await page.locator(".vh-prompt .confirm-go").click();
+  await expect(page.locator(".main-title")).toContainText("Fixture generated name", { timeout: 8000 });
+});
+
+test("settings → usage shows multi-provider quota with pace", async ({ page }) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "Settings" }).click();
+  const dialog = page.getByRole("dialog", { name: "Settings" });
+  await dialog.getByRole("button", { name: "Usage" }).click();
+
+  // Fixture quota: Claude (two windows) + OpenRouter (credits).
+  await expect(dialog.locator(".quota-name", { hasText: "Claude" })).toBeVisible();
+  await expect(dialog.locator(".quota-name", { hasText: "OpenRouter" })).toBeVisible();
+  await expect(dialog.locator(".quota-win-label", { hasText: "5h" })).toBeVisible();
+  await expect(dialog).toContainText("$14.00 remaining");
+  // The 7d window is at 88% with a short reset → pace predicts exhaustion before reset.
+  await expect(dialog.locator(".quota-pace", { hasText: "exhausts" })).toBeVisible();
+});

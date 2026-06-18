@@ -1,0 +1,1009 @@
+// Package state holds the daemon's materialized view of OpenCode session state
+// and the monotonic, replayable event log that clients resume from.
+//
+// The store is schema-light: session/message/part payloads are kept as raw JSON
+// and only the envelope fields needed for structure (ids, parentID) are parsed.
+package state
+
+import (
+	"bytes"
+	"encoding/json"
+	"sync"
+
+	"github.com/vhqtvn/vh-solara/pkg/opencode"
+)
+
+// Client-facing event kinds. The payload is the raw OpenCode payload, untouched.
+const (
+	KindSessionUpsert   = "session.upsert"
+	KindSessionDelete   = "session.delete"
+	KindMessageUpsert   = "message.upsert"
+	KindMessageDelete   = "message.delete"
+	KindPartUpsert      = "part.upsert"
+	KindPartDelete      = "part.delete"
+	KindTodo            = "todo"
+	KindPermissionSet   = "permission.upsert"
+	KindPermissionClear = "permission.delete"
+	KindStatus          = "status"
+	KindActivity        = "activity"
+	KindQuestionSet     = "question.upsert"
+	KindQuestionClear   = "question.delete"
+	KindUnreadSet       = "unread.set"
+	KindUnreadClear     = "unread.clear"
+)
+
+// Per-session activity states surfaced to clients (sidebar status).
+const (
+	ActivityIdle  = "idle"
+	ActivityBusy  = "busy"
+	ActivityRetry = "retry"
+	ActivityError = "error"
+)
+
+// ClientEvent is one stamped, fan-out unit. Seq is the daemon's own monotonic
+// counter (OpenCode event ids are ignored for resumption).
+type ClientEvent struct {
+	Seq     uint64          `json:"seq"`
+	Kind    string          `json:"kind"`
+	Payload json.RawMessage `json:"payload"`
+}
+
+// Snapshot is the full current view plus the head seq a client resumes from.
+type Snapshot struct {
+	Seq         uint64                        `json:"seq"`
+	Sessions    []json.RawMessage             `json:"sessions"`
+	Messages    map[string][]MessageWithParts `json:"messages"`
+	Todos       map[string]json.RawMessage    `json:"todos,omitempty"`
+	Permissions map[string][]json.RawMessage  `json:"permissions,omitempty"`
+	Questions   map[string][]json.RawMessage  `json:"questions,omitempty"`
+	Statuses    map[string]json.RawMessage    `json:"statuses,omitempty"`
+	Activity    map[string]string             `json:"activity,omitempty"`
+	// Root sessions that finished (their subtree went busy -> idle) and haven't
+	// been acknowledged yet — surfaced as an "unread/finished" indicator. Cleared
+	// via Ack (the client scrolling that session to the bottom).
+	Unread []string `json:"unread,omitempty"`
+}
+
+// MessageWithParts mirrors OpenCode's GET /session/:id/message item shape.
+type MessageWithParts struct {
+	Info  json.RawMessage   `json:"info"`
+	Parts []json.RawMessage `json:"parts"`
+}
+
+// --- internal view structures ---
+
+type sessionEntry struct {
+	id       string
+	parentID string
+	info     json.RawMessage
+}
+
+type messageEntry struct {
+	id        string
+	info      json.RawMessage
+	partOrder []string
+	parts     map[string]json.RawMessage
+	// Cached from info so we can detect an in-flight assistant turn without
+	// re-parsing JSON: an assistant message with no completed time is generating.
+	role      string
+	completed bool
+}
+
+type sessionMessages struct {
+	order []string // message ids in creation order
+	byID  map[string]*messageEntry
+}
+
+// --- envelope parse helpers ---
+
+type sessionEnvelope struct {
+	ID       string `json:"id"`
+	ParentID string `json:"parentID"`
+	Time     struct {
+		Archived *float64 `json:"archived"`
+	} `json:"time"`
+}
+
+func (e sessionEnvelope) archivedAt() bool { return e.Time.Archived != nil && *e.Time.Archived != 0 }
+
+type messageInfoEnvelope struct {
+	ID        string `json:"id"`
+	SessionID string `json:"sessionID"`
+	Role      string `json:"role"`
+	Time      struct {
+		Completed *float64 `json:"completed"`
+	} `json:"time"`
+}
+
+type partEnvelope struct {
+	ID        string `json:"id"`
+	SessionID string `json:"sessionID"`
+	MessageID string `json:"messageID"`
+}
+
+type permissionEnvelope struct {
+	ID        string `json:"id"`
+	SessionID string `json:"sessionID"`
+}
+
+// Store is the materialized view + event log. Safe for concurrent use.
+type Store struct {
+	mu sync.RWMutex
+
+	seq       uint64
+	sessions  map[string]*sessionEntry
+	messages  map[string]*sessionMessages           // sessionID -> messages
+	todos     map[string]json.RawMessage            // sessionID -> todos payload
+	perms     map[string]map[string]json.RawMessage // sessionID -> permID -> permission
+	questions map[string]map[string]json.RawMessage // sessionID -> questionID -> request
+	statuses  map[string]json.RawMessage            // sessionID -> status payload
+	activity  map[string]string                     // sessionID -> idle|busy|retry|error
+	// Finished-unread tracking. busyCount[root] = number of busy/retry sessions in
+	// the root's subtree; when it falls to 0 the root is marked unread (a finished
+	// task awaiting acknowledgement). suppressUnread guards the hydrate reconcile.
+	unread         map[string]bool
+	busyCount      map[string]int
+	suppressUnread bool
+	// msgLoaded marks sessions whose message history has been fetched. Messages
+	// are hydrated lazily (on first open) so startup doesn't fetch every
+	// session's history — critical with thousands of sessions.
+	msgLoaded map[string]bool
+
+	ring *ringBuffer
+	subs map[int]chan ClientEvent
+	next int
+}
+
+// New returns an empty store with an event ring of the given capacity.
+func New(ringCapacity int) *Store {
+	return &Store{
+		sessions:  map[string]*sessionEntry{},
+		messages:  map[string]*sessionMessages{},
+		todos:     map[string]json.RawMessage{},
+		perms:     map[string]map[string]json.RawMessage{},
+		questions: map[string]map[string]json.RawMessage{},
+		statuses:  map[string]json.RawMessage{},
+		activity:  map[string]string{},
+		unread:    map[string]bool{},
+		busyCount: map[string]int{},
+		msgLoaded: map[string]bool{},
+		ring:      newRingBuffer(ringCapacity),
+		subs:      map[int]chan ClientEvent{},
+	}
+}
+
+// emit stamps, records, and fans out a client event. Caller must hold s.mu.
+func (s *Store) emit(kind string, payload json.RawMessage) {
+	s.seq++
+	ev := ClientEvent{Seq: s.seq, Kind: kind, Payload: payload}
+	s.ring.push(ev)
+	for id, ch := range s.subs {
+		select {
+		case ch <- ev:
+		default:
+			// Slow consumer: drop it. The client will reconnect and re-snapshot.
+			close(ch)
+			delete(s.subs, id)
+		}
+	}
+}
+
+func rawObj(kv map[string]interface{}) json.RawMessage {
+	b, _ := json.Marshal(kv)
+	return b
+}
+
+// normalizeActivity maps an OpenCode SessionStatus.type to a UI activity state.
+func normalizeActivity(statusType string) string {
+	switch statusType {
+	case "busy":
+		return ActivityBusy
+	case "retry":
+		return ActivityRetry
+	default:
+		return ActivityIdle
+	}
+}
+
+// setActivityLocked records a session's activity and emits a client event only
+// when it changes. Caller must hold s.mu.
+func (s *Store) setActivityLocked(sessionID, st string) {
+	prev := s.activity[sessionID]
+	if prev == st {
+		return
+	}
+	s.activity[sessionID] = st
+	s.emit(KindActivity, rawObj(map[string]interface{}{"sessionID": sessionID, "state": st}))
+
+	// Track the root subtree's busy count to detect "finished" (busy -> idle).
+	wasBusy := prev == ActivityBusy || prev == ActivityRetry
+	isBusy := st == ActivityBusy || st == ActivityRetry
+	if wasBusy == isBusy {
+		return
+	}
+	root := s.rootOfLocked(sessionID)
+	if isBusy {
+		if s.busyCount[root] == 0 {
+			s.clearUnreadLocked(root) // running again — no longer a stale "finished"
+		}
+		s.busyCount[root]++
+	} else {
+		if s.busyCount[root] > 0 {
+			s.busyCount[root]--
+		}
+		if s.busyCount[root] == 0 && !s.suppressUnread {
+			s.markUnreadLocked(root)
+		}
+	}
+}
+
+// rootOfLocked walks parentID up to the top session still in the store.
+func (s *Store) rootOfLocked(id string) string {
+	cur := id
+	for i := 0; i < 100000; i++ {
+		e := s.sessions[cur]
+		if e == nil || e.parentID == "" || s.sessions[e.parentID] == nil {
+			return cur
+		}
+		cur = e.parentID
+	}
+	return cur
+}
+
+func (s *Store) markUnreadLocked(id string) {
+	if s.sessions[id] == nil || s.unread[id] {
+		return
+	}
+	s.unread[id] = true
+	s.emit(KindUnreadSet, rawObj(map[string]interface{}{"sessionID": id}))
+}
+
+func (s *Store) clearUnreadLocked(id string) {
+	if !s.unread[id] {
+		return
+	}
+	delete(s.unread, id)
+	s.emit(KindUnreadClear, rawObj(map[string]interface{}{"sessionID": id}))
+}
+
+// AckUnread clears a root's finished-unread flag (the client scrolled it to the
+// bottom). The id may be any session in the subtree; its root is acked.
+func (s *Store) AckUnread(sessionID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.clearUnreadLocked(s.rootOfLocked(sessionID))
+}
+
+// SetActivityFromStatuses seeds activity from a GET /session/status snapshot
+// (sessionID -> SessionStatus). Used by the aggregator on (re)hydrate.
+// SetActivityFromStatuses makes /session/status the authoritative source of
+// per-session activity for ALL live sessions (matches opencode web). Sessions
+// reported busy/retry are marked so; every other known session is cleared to
+// idle. Clearing matters after a restart: a turn terminated mid-generation
+// leaves an incomplete last message, and without an explicit idle the UI's
+// fallback heuristic would spin that session forever.
+func (s *Store) SetActivityFromStatuses(statuses map[string]json.RawMessage) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// Reconciling activity on (re)hydrate must not spuriously flag sessions as
+	// finished-unread (busyCount still tracks correctly, just don't mark).
+	s.suppressUnread = true
+	defer func() { s.suppressUnread = false }()
+	busy := map[string]bool{}
+	for sid, raw := range statuses {
+		var st struct {
+			Type string `json:"type"`
+		}
+		_ = json.Unmarshal(raw, &st)
+		a := normalizeActivity(st.Type)
+		s.setActivityLocked(sid, a)
+		if a != ActivityIdle {
+			busy[sid] = true
+		}
+	}
+	// Clear everything else. Known sessions and loaded sessions are set idle;
+	// never-busy sessions with no entry already render idle, so they're skipped
+	// to avoid a churn of no-op events on large session lists.
+	clear := func(sid string) {
+		if !busy[sid] {
+			s.setActivityLocked(sid, ActivityIdle)
+		}
+	}
+	for sid := range s.sessions {
+		clear(sid)
+	}
+	for sid := range s.messages {
+		clear(sid)
+	}
+}
+
+// Apply reduces a single live OpenCode event into the view and emits the
+// corresponding client event(s).
+func (s *Store) Apply(ev opencode.Event) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	switch ev.Type {
+	case "session.created", "session.updated", "session.compacted":
+		s.upsertSessionLocked(ev.Properties) // properties.info is the Session
+	case "session.deleted":
+		var p struct {
+			Info sessionEnvelope `json:"info"`
+		}
+		if json.Unmarshal(ev.Properties, &p) == nil && p.Info.ID != "" {
+			s.deleteSessionLocked(p.Info.ID)
+		}
+	case "session.status", "session.idle", "session.error", "session.diff":
+		var p struct {
+			SessionID string `json:"sessionID"`
+			Status    struct {
+				Type string `json:"type"`
+			} `json:"status"`
+		}
+		if json.Unmarshal(ev.Properties, &p) == nil && p.SessionID != "" {
+			s.statuses[p.SessionID] = ev.Properties
+			s.emit(KindStatus, ev.Properties)
+			switch ev.Type {
+			case "session.idle":
+				s.setActivityLocked(p.SessionID, ActivityIdle)
+			case "session.error":
+				s.setActivityLocked(p.SessionID, ActivityError)
+			case "session.status":
+				s.setActivityLocked(p.SessionID, normalizeActivity(p.Status.Type))
+			}
+		}
+	case "message.updated":
+		var p struct {
+			Info json.RawMessage `json:"info"`
+		}
+		if json.Unmarshal(ev.Properties, &p) == nil && len(p.Info) > 0 {
+			s.upsertMessageLocked(p.Info)
+		}
+	case "message.removed":
+		var p struct {
+			SessionID string `json:"sessionID"`
+			MessageID string `json:"messageID"`
+		}
+		if json.Unmarshal(ev.Properties, &p) == nil {
+			s.deleteMessageLocked(p.SessionID, p.MessageID)
+		}
+	case "message.part.updated":
+		var p struct {
+			Part json.RawMessage `json:"part"`
+		}
+		if json.Unmarshal(ev.Properties, &p) == nil && len(p.Part) > 0 {
+			s.upsertPartLocked(p.Part)
+		}
+	case "message.part.delta":
+		// Token-level streaming: OpenCode publishes deltas ({field,delta})
+		// separately from the full message.part.updated snapshot. Accumulate them
+		// so streaming text appears live instead of only at the next snapshot.
+		var p struct {
+			SessionID string `json:"sessionID"`
+			MessageID string `json:"messageID"`
+			PartID    string `json:"partID"`
+			Field     string `json:"field"`
+			Delta     string `json:"delta"`
+		}
+		if json.Unmarshal(ev.Properties, &p) == nil && p.SessionID != "" && p.PartID != "" && p.Delta != "" {
+			s.appendPartDeltaLocked(p.SessionID, p.MessageID, p.PartID, p.Field, p.Delta)
+		}
+	case "message.part.removed":
+		var p struct {
+			SessionID string `json:"sessionID"`
+			MessageID string `json:"messageID"`
+			PartID    string `json:"partID"`
+		}
+		if json.Unmarshal(ev.Properties, &p) == nil {
+			s.deletePartLocked(p.SessionID, p.MessageID, p.PartID)
+		}
+	case "todo.updated":
+		var p struct {
+			SessionID string `json:"sessionID"`
+		}
+		if json.Unmarshal(ev.Properties, &p) == nil && p.SessionID != "" {
+			s.todos[p.SessionID] = ev.Properties
+			s.emit(KindTodo, ev.Properties)
+		}
+	case "permission.asked", "permission.updated":
+		// OpenCode emits "permission.asked"; "permission.updated" is kept for
+		// compatibility. Properties are the permission Request ({id, sessionID, …}).
+		var p permissionEnvelope
+		if json.Unmarshal(ev.Properties, &p) == nil && p.SessionID != "" && p.ID != "" {
+			if s.perms[p.SessionID] == nil {
+				s.perms[p.SessionID] = map[string]json.RawMessage{}
+			}
+			s.perms[p.SessionID][p.ID] = ev.Properties
+			s.emit(KindPermissionSet, ev.Properties)
+		}
+	case "permission.replied":
+		// OpenCode sends {sessionID, requestID, reply}; older/fixture payloads use
+		// permissionID. Normalize so the client's delete (keyed by permissionID)
+		// always clears the card.
+		var p struct {
+			SessionID    string `json:"sessionID"`
+			RequestID    string `json:"requestID"`
+			PermissionID string `json:"permissionID"`
+		}
+		if json.Unmarshal(ev.Properties, &p) == nil && p.SessionID != "" {
+			id := p.RequestID
+			if id == "" {
+				id = p.PermissionID
+			}
+			if m := s.perms[p.SessionID]; m != nil {
+				delete(m, id)
+			}
+			s.emit(KindPermissionClear, rawObj(map[string]interface{}{
+				"sessionID": p.SessionID, "permissionID": id,
+			}))
+		}
+	case "question.asked":
+		var p struct {
+			ID        string `json:"id"`
+			SessionID string `json:"sessionID"`
+		}
+		if json.Unmarshal(ev.Properties, &p) == nil && p.SessionID != "" && p.ID != "" {
+			if s.questions[p.SessionID] == nil {
+				s.questions[p.SessionID] = map[string]json.RawMessage{}
+			}
+			s.questions[p.SessionID][p.ID] = ev.Properties
+			s.emit(KindQuestionSet, ev.Properties)
+		}
+	case "question.replied", "question.rejected":
+		var p struct {
+			SessionID string `json:"sessionID"`
+			RequestID string `json:"requestID"`
+		}
+		if json.Unmarshal(ev.Properties, &p) == nil && p.SessionID != "" {
+			if m := s.questions[p.SessionID]; m != nil {
+				delete(m, p.RequestID)
+			}
+			s.emit(KindQuestionClear, rawObj(map[string]interface{}{
+				"sessionID": p.SessionID, "questionID": p.RequestID,
+			}))
+		}
+	default:
+		// server.connected / heartbeat / instance.disposed / file.* — ignored for the view.
+	}
+}
+
+func (s *Store) upsertSessionLocked(props json.RawMessage) {
+	var p struct {
+		Info json.RawMessage `json:"info"`
+	}
+	if json.Unmarshal(props, &p) != nil || len(p.Info) == 0 {
+		return
+	}
+	var env sessionEnvelope
+	if json.Unmarshal(p.Info, &env) != nil || env.ID == "" {
+		return
+	}
+	// A session archived in OpenCode (time.archived set) leaves the live tree —
+	// e.g. when archived from another client. Treat the update as a delete.
+	if env.archivedAt() {
+		if _, ok := s.sessions[env.ID]; ok {
+			s.deleteSessionLocked(env.ID)
+		}
+		return
+	}
+	s.sessions[env.ID] = &sessionEntry{id: env.ID, parentID: env.ParentID, info: p.Info}
+	s.emit(KindSessionUpsert, p.Info)
+}
+
+func (s *Store) deleteSessionLocked(id string) {
+	delete(s.sessions, id)
+	delete(s.messages, id)
+	delete(s.msgLoaded, id)
+	delete(s.todos, id)
+	delete(s.perms, id)
+	delete(s.questions, id)
+	delete(s.statuses, id)
+	delete(s.activity, id)
+	delete(s.unread, id)
+	delete(s.busyCount, id)
+	s.emit(KindSessionDelete, rawObj(map[string]interface{}{"id": id}))
+}
+
+// --- archive (OpenCode-native: time.archived is the source of truth) ---
+
+// descendantsLocked returns id plus every session transitively parented by it.
+func (s *Store) descendantsLocked(id string) []string {
+	children := map[string][]string{}
+	for _, se := range s.sessions {
+		if se.parentID != "" {
+			children[se.parentID] = append(children[se.parentID], se.id)
+		}
+	}
+	out := []string{}
+	stack := []string{id}
+	for len(stack) > 0 {
+		cur := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		out = append(out, cur)
+		stack = append(stack, children[cur]...)
+	}
+	return out
+}
+
+// Descendants returns id plus every live session transitively parented by it
+// (used to cascade an archive across a session's subsessions).
+func (s *Store) Descendants(id string) []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.sessions[id] == nil {
+		return nil
+	}
+	return s.descendantsLocked(id)
+}
+
+// RemoveSessions drops sessions from the live view and emits session.delete for
+// each, so connected clients prune them immediately (e.g. right after they were
+// archived in OpenCode). A subsequent re-hydrate keeps things consistent.
+func (s *Store) RemoveSessions(ids []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, id := range ids {
+		if _, ok := s.sessions[id]; ok {
+			s.deleteSessionLocked(id)
+		}
+	}
+}
+
+// SetPendingQuestions reconciles the pending-question set to exactly the given
+// requests (the GET /question response). Used on (re-)hydrate so a question that
+// arrived as a missed live event — e.g. across a daemon restart — is restored.
+// Emits upserts for present requests and clears for ones no longer pending.
+func (s *Store) SetPendingQuestions(requests []json.RawMessage) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	seen := map[string]bool{}
+	for _, raw := range requests {
+		var e struct {
+			ID        string `json:"id"`
+			SessionID string `json:"sessionID"`
+		}
+		if json.Unmarshal(raw, &e) != nil || e.ID == "" || e.SessionID == "" {
+			continue
+		}
+		seen[e.SessionID+"\x00"+e.ID] = true
+		if s.questions[e.SessionID] == nil {
+			s.questions[e.SessionID] = map[string]json.RawMessage{}
+		}
+		s.questions[e.SessionID][e.ID] = raw
+		s.emit(KindQuestionSet, raw)
+	}
+	for sid, m := range s.questions {
+		for id := range m {
+			if !seen[sid+"\x00"+id] {
+				delete(m, id)
+				s.emit(KindQuestionClear, rawObj(map[string]interface{}{"sessionID": sid, "questionID": id}))
+			}
+		}
+	}
+}
+
+// SetPendingPermissions reconciles the pending-permission set to exactly the
+// given requests (the GET /permission response) — the permission counterpart of
+// SetPendingQuestions.
+func (s *Store) SetPendingPermissions(requests []json.RawMessage) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	seen := map[string]bool{}
+	for _, raw := range requests {
+		var e permissionEnvelope
+		if json.Unmarshal(raw, &e) != nil || e.ID == "" || e.SessionID == "" {
+			continue
+		}
+		seen[e.SessionID+"\x00"+e.ID] = true
+		if s.perms[e.SessionID] == nil {
+			s.perms[e.SessionID] = map[string]json.RawMessage{}
+		}
+		s.perms[e.SessionID][e.ID] = raw
+		s.emit(KindPermissionSet, raw)
+	}
+	for sid, m := range s.perms {
+		for id := range m {
+			if !seen[sid+"\x00"+id] {
+				delete(m, id)
+				s.emit(KindPermissionClear, rawObj(map[string]interface{}{"sessionID": sid, "permissionID": id}))
+			}
+		}
+	}
+}
+
+func (s *Store) upsertMessageLocked(info json.RawMessage) {
+	var env messageInfoEnvelope
+	if json.Unmarshal(info, &env) != nil || env.ID == "" || env.SessionID == "" {
+		return
+	}
+	sm := s.messages[env.SessionID]
+	if sm == nil {
+		sm = &sessionMessages{byID: map[string]*messageEntry{}}
+		s.messages[env.SessionID] = sm
+	}
+	if me := sm.byID[env.ID]; me != nil {
+		me.info = info
+		me.role = env.Role
+		me.completed = env.Time.Completed != nil
+	} else {
+		sm.byID[env.ID] = &messageEntry{
+			id: env.ID, info: info, parts: map[string]json.RawMessage{},
+			role: env.Role, completed: env.Time.Completed != nil,
+		}
+		sm.order = append(sm.order, env.ID)
+	}
+	s.emit(KindMessageUpsert, info)
+
+	// Escalate to busy from the live message stream: OpenCode's session.status/idle
+	// events are not reliable for a streaming turn (a session can generate for
+	// minutes while still reporting idle), which left the sidebar showing no
+	// spinner for an actively-running session. An in-flight assistant message is
+	// the authoritative "generating" signal.
+	//
+	// We only SET busy here, never idle. A multi-step turn (text → tool → text)
+	// produces several assistant messages, and between two steps there's a gap
+	// where no assistant message is in-flight yet — inferring idle from that gap
+	// flipped the session idle→busy repeatedly within a single logical run, and
+	// each transient idle dip fired a spurious "finished" notification (one per
+	// tool call). Idle is owned by the authoritative session.idle event (which
+	// fires once when the turn truly ends) and by the rehydrate snapshot.
+	if env.Role == "assistant" && s.assistantInflightLocked(env.SessionID) {
+		s.setActivityLocked(env.SessionID, ActivityBusy)
+	}
+}
+
+// assistantInflightLocked reports whether a session has an assistant message
+// that hasn't completed yet (i.e. a turn is still generating). Caller holds s.mu.
+func (s *Store) assistantInflightLocked(sessionID string) bool {
+	sm := s.messages[sessionID]
+	if sm == nil {
+		return false
+	}
+	for _, me := range sm.byID {
+		if me.role == "assistant" && !me.completed {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Store) deleteMessageLocked(sessionID, messageID string) {
+	sm := s.messages[sessionID]
+	if sm != nil {
+		if _, ok := sm.byID[messageID]; ok {
+			delete(sm.byID, messageID)
+			sm.order = removeString(sm.order, messageID)
+		}
+	}
+	s.emit(KindMessageDelete, rawObj(map[string]interface{}{"sessionID": sessionID, "messageID": messageID}))
+}
+
+func (s *Store) upsertPartLocked(part json.RawMessage) {
+	var env partEnvelope
+	if json.Unmarshal(part, &env) != nil || env.ID == "" || env.MessageID == "" || env.SessionID == "" {
+		return
+	}
+	sm := s.messages[env.SessionID]
+	if sm == nil {
+		sm = &sessionMessages{byID: map[string]*messageEntry{}}
+		s.messages[env.SessionID] = sm
+	}
+	me := sm.byID[env.MessageID]
+	if me == nil {
+		// Part can arrive before its message.updated; create a placeholder.
+		me = &messageEntry{id: env.MessageID, parts: map[string]json.RawMessage{}}
+		sm.byID[env.MessageID] = me
+		sm.order = append(sm.order, env.MessageID)
+	}
+	if _, ok := me.parts[env.ID]; !ok {
+		me.partOrder = append(me.partOrder, env.ID)
+	}
+	me.parts[env.ID] = part
+	s.emit(KindPartUpsert, part)
+}
+
+// appendPartDeltaLocked applies a streaming text delta to a part (creating a
+// minimal text part if the delta precedes its part.updated), then re-emits the
+// part so clients render the accumulated text live. A later message.part.updated
+// snapshot overwrites it authoritatively.
+func (s *Store) appendPartDeltaLocked(sessionID, messageID, partID, field, delta string) {
+	if field == "" {
+		field = "text"
+	}
+	sm := s.messages[sessionID]
+	if sm == nil {
+		sm = &sessionMessages{byID: map[string]*messageEntry{}}
+		s.messages[sessionID] = sm
+	}
+	me := sm.byID[messageID]
+	if me == nil {
+		me = &messageEntry{id: messageID, parts: map[string]json.RawMessage{}}
+		sm.byID[messageID] = me
+		sm.order = append(sm.order, messageID)
+	}
+	existing, had := me.parts[partID]
+	var part map[string]any
+	if had {
+		_ = json.Unmarshal(existing, &part)
+	}
+	if part == nil {
+		part = map[string]any{"id": partID, "sessionID": sessionID, "messageID": messageID, "type": "text"}
+	}
+	if !had {
+		me.partOrder = append(me.partOrder, partID)
+	}
+	prev, _ := part[field].(string)
+	part[field] = prev + delta
+	updated, err := json.Marshal(part)
+	if err != nil {
+		return
+	}
+	me.parts[partID] = updated
+	s.emit(KindPartUpsert, updated)
+
+	// Streaming deltas mean the turn is actively generating right now — assert
+	// busy (cheap no-op once set). Cleared when the assistant message completes
+	// (upsertMessageLocked) or on session.idle. This makes the running indicator
+	// track real token flow even when OpenCode's session.status lags.
+	if me.role != "user" {
+		s.setActivityLocked(sessionID, ActivityBusy)
+	}
+}
+
+func (s *Store) deletePartLocked(sessionID, messageID, partID string) {
+	if sm := s.messages[sessionID]; sm != nil {
+		if me := sm.byID[messageID]; me != nil {
+			if _, ok := me.parts[partID]; ok {
+				delete(me.parts, partID)
+				me.partOrder = removeString(me.partOrder, partID)
+			}
+		}
+	}
+	s.emit(KindPartDelete, rawObj(map[string]interface{}{
+		"sessionID": sessionID, "messageID": messageID, "partID": partID,
+	}))
+}
+
+// Snapshot returns the current view and the head seq. The session tree, todos,
+// permissions, and statuses are always included (they are small); messages are
+// included only for sessions in messagesFor. A nil messagesFor includes all
+// sessions' messages; an empty (non-nil) map includes none — letting a phone
+// fetch a tree-only snapshot and pull message history per session on demand.
+func (s *Store) Snapshot(messagesFor map[string]bool) Snapshot {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	snap := Snapshot{
+		Seq:         s.seq,
+		Messages:    map[string][]MessageWithParts{},
+		Todos:       map[string]json.RawMessage{},
+		Permissions: map[string][]json.RawMessage{},
+		Questions:   map[string][]json.RawMessage{},
+		Statuses:    map[string]json.RawMessage{},
+		Activity:    map[string]string{},
+	}
+	for sid, m := range s.questions {
+		for _, q := range m {
+			snap.Questions[sid] = append(snap.Questions[sid], q)
+		}
+	}
+	for sid, st := range s.activity {
+		snap.Activity[sid] = st
+	}
+	for id := range s.unread {
+		snap.Unread = append(snap.Unread, id)
+	}
+	for _, se := range s.sessions {
+		snap.Sessions = append(snap.Sessions, se.info)
+	}
+	for sid, sm := range s.messages {
+		if messagesFor != nil && !messagesFor[sid] {
+			continue
+		}
+		list := make([]MessageWithParts, 0, len(sm.order))
+		for _, mid := range sm.order {
+			me := sm.byID[mid]
+			if me == nil {
+				continue
+			}
+			parts := make([]json.RawMessage, 0, len(me.partOrder))
+			for _, pid := range me.partOrder {
+				parts = append(parts, me.parts[pid])
+			}
+			list = append(list, MessageWithParts{Info: me.info, Parts: parts})
+		}
+		snap.Messages[sid] = list
+	}
+	for sid, t := range s.todos {
+		snap.Todos[sid] = t
+	}
+	for sid, m := range s.perms {
+		for _, perm := range m {
+			snap.Permissions[sid] = append(snap.Permissions[sid], perm)
+		}
+	}
+	for sid, st := range s.statuses {
+		snap.Statuses[sid] = st
+	}
+	return snap
+}
+
+// Subscribe registers a new live-tail consumer. Returns the channel and an
+// unsubscribe func. The channel is closed if the consumer falls too far behind.
+func (s *Store) Subscribe(buffer int) (<-chan ClientEvent, func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id := s.next
+	s.next++
+	ch := make(chan ClientEvent, buffer)
+	s.subs[id] = ch
+	return ch, func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if c, ok := s.subs[id]; ok {
+			close(c)
+			delete(s.subs, id)
+		}
+	}
+}
+
+// Replay returns buffered events with seq > cursor. ok is false when the cursor
+// is older than the buffer's oldest retained event (caller must send a snapshot).
+func (s *Store) Replay(cursor uint64) (events []ClientEvent, head uint64, ok bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.ring.since(cursor, s.seq)
+}
+
+// Hydrate replaces the view from a full fetch (sessions + messages per session),
+// emitting upsert/delete client events only for ids that are new, changed, or
+// gone — so connected clients reconcile incrementally without re-receiving
+// unchanged history. Used on the daemon's own (re)connect to OpenCode, whose
+// event stream has no replay. Byte comparison decides "changed".
+func (s *Store) Hydrate(sessions []json.RawMessage, messages map[string][]MessageWithParts) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// --- sessions ---
+	seen := make(map[string]bool, len(sessions))
+	for _, info := range sessions {
+		var env sessionEnvelope
+		if json.Unmarshal(info, &env) != nil || env.ID == "" {
+			continue
+		}
+		if env.archivedAt() {
+			continue // archived sessions are not part of the live tree
+		}
+		seen[env.ID] = true
+		if old := s.sessions[env.ID]; old == nil || !bytes.Equal(old.info, info) {
+			s.sessions[env.ID] = &sessionEntry{id: env.ID, parentID: env.ParentID, info: info}
+			s.emit(KindSessionUpsert, info)
+		}
+	}
+	for id := range s.sessions {
+		if !seen[id] {
+			s.deleteSessionLocked(id)
+		}
+	}
+
+	// --- messages + parts (only for the sessions provided; lazy hydration
+	// means this is empty on first connect and just the opened sessions on
+	// reconnect, instead of every session) ---
+	for sid, list := range messages {
+		s.reconcileMessagesLocked(sid, list)
+	}
+}
+
+// reconcileMessagesLocked diffs one session's full message list into the store,
+// emitting upsert/delete events for changes, and marks the session's messages
+// as loaded. Caller must hold s.mu.
+func (s *Store) reconcileMessagesLocked(sid string, list []MessageWithParts) {
+	s.msgLoaded[sid] = true
+	sm := s.messages[sid]
+	if sm == nil {
+		sm = &sessionMessages{byID: map[string]*messageEntry{}}
+		s.messages[sid] = sm
+	}
+	seenMsg := make(map[string]bool, len(list))
+	for _, mwp := range list {
+		var env messageInfoEnvelope
+		if json.Unmarshal(mwp.Info, &env) != nil || env.ID == "" {
+			continue
+		}
+		seenMsg[env.ID] = true
+		me := sm.byID[env.ID]
+		if me == nil {
+			me = &messageEntry{id: env.ID, info: mwp.Info, parts: map[string]json.RawMessage{}}
+			sm.byID[env.ID] = me
+			sm.order = append(sm.order, env.ID)
+			s.emit(KindMessageUpsert, mwp.Info)
+		} else if !bytes.Equal(me.info, mwp.Info) {
+			me.info = mwp.Info
+			s.emit(KindMessageUpsert, mwp.Info)
+		}
+		me.role = env.Role
+		me.completed = env.Time.Completed != nil
+
+		seenPart := make(map[string]bool, len(mwp.Parts))
+		for _, part := range mwp.Parts {
+			var pe partEnvelope
+			if json.Unmarshal(part, &pe) != nil || pe.ID == "" {
+				continue
+			}
+			seenPart[pe.ID] = true
+			if old, ok := me.parts[pe.ID]; !ok {
+				me.parts[pe.ID] = part
+				me.partOrder = append(me.partOrder, pe.ID)
+				s.emit(KindPartUpsert, part)
+			} else if !bytes.Equal(old, part) {
+				me.parts[pe.ID] = part
+				s.emit(KindPartUpsert, part)
+			}
+		}
+		for pid := range me.parts {
+			if !seenPart[pid] {
+				delete(me.parts, pid)
+				me.partOrder = removeString(me.partOrder, pid)
+				s.emit(KindPartDelete, rawObj(map[string]interface{}{
+					"sessionID": sid, "messageID": env.ID, "partID": pid,
+				}))
+			}
+		}
+	}
+	for mid := range sm.byID {
+		if !seenMsg[mid] {
+			delete(sm.byID, mid)
+			sm.order = removeString(sm.order, mid)
+			s.emit(KindMessageDelete, rawObj(map[string]interface{}{
+				"sessionID": sid, "messageID": mid,
+			}))
+		}
+	}
+}
+
+// IsMessagesLoaded reports whether a session's history has been fetched.
+func (s *Store) IsMessagesLoaded(sid string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.msgLoaded[sid]
+}
+
+// SessionIDs returns all known (incl. archived) session ids.
+func (s *Store) SessionIDs() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]string, 0, len(s.sessions))
+	for id := range s.sessions {
+		out = append(out, id)
+	}
+	return out
+}
+
+// LoadedSessions returns the ids whose messages have been hydrated — the set to
+// re-fetch on reconnect (instead of every session).
+func (s *Store) LoadedSessions() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]string, 0, len(s.msgLoaded))
+	for id := range s.msgLoaded {
+		out = append(out, id)
+	}
+	return out
+}
+
+// SetSessionMessages installs a freshly-fetched message list for one session
+// (used by lazy hydration when a client first opens it).
+func (s *Store) SetSessionMessages(sid string, list []MessageWithParts) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reconcileMessagesLocked(sid, list)
+}
+
+func removeString(xs []string, x string) []string {
+	for i, v := range xs {
+		if v == x {
+			return append(xs[:i], xs[i+1:]...)
+		}
+	}
+	return xs
+}

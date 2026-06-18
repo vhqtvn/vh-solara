@@ -1,0 +1,67 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build web UI (embedded into the binary)
+        run: |
+          cd web
+          npm ci
+          npm run build
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Build binaries
+        run: |
+          mkdir -p dist
+          TAG="${GITHUB_REF#refs/tags/}"
+          LDFLAGS="-s -w -X github.com/vhqtvn/vh-solara/cmd.Version=${TAG}"
+          build() { GOOS=$1 GOARCH=$2 go build -trimpath -ldflags "$LDFLAGS" -o "dist/$3" .; }
+
+          build linux   amd64 vh-solara-linux-amd64
+          build linux   arm64 vh-solara-linux-arm64
+          build linux   386   vh-solara-linux-386
+          build linux   arm   vh-solara-linux-arm
+          build windows amd64 vh-solara-windows-amd64.exe
+          build windows arm64 vh-solara-windows-arm64.exe
+          build windows 386   vh-solara-windows-386.exe
+          build windows arm   vh-solara-windows-arm.exe
+          build darwin  amd64 vh-solara-darwin-amd64
+          build darwin  arm64 vh-solara-darwin-arm64
+
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          body: |
+            VHSolara ${{ github.ref_name }} — single binary (controller + agent daemon + embedded web UI).
+            Assets: vh-solara-{linux,windows,darwin}-{amd64,arm64,386,arm}, verified by SHA256SUMS.

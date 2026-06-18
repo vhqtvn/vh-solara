@@ -1,0 +1,31 @@
+services:
+  # Central controller. Put nginx in front for TLS, auth, and wildcard host
+  # routing (see README / documents/01-initial-spec.md).
+  server:
+    build:
+      context: .
+    image: vh-solara:latest
+    command:
+      - server
+      - --addr=:8080
+      - --daemon-addr=:8081
+      # $$ escapes compose interpolation -> the server receives a literal $ID.
+      - --host-pattern=$$ID.${VH_HOST_DOMAIN:-localhost}
+    ports:
+      - "8080:8080" # dashboard + browser/UI reverse proxy
+      - "8081:8081" # client-daemon WebSocket tunnel ingestion
+    restart: unless-stopped
+
+  # Zero-dependency demo of the vh web UI: runs the real aggregator + web server
+  # against fake OpenCode fixtures (no `opencode` binary needed). Browse :8099.
+  #   docker compose --profile demo up ui-demo
+  ui-demo:
+    build:
+      context: .
+    image: vh-solara:latest
+    entrypoint: ["/usr/local/bin/fixtureserver"]
+    command: ["-addr=0.0.0.0:8099"]
+    ports:
+      - "8099:8099"
+    profiles: ["demo"]
+    restart: unless-stopped
