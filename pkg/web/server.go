@@ -69,6 +69,9 @@ type Server struct {
 	// auth, when set, gates the whole server (login + session). nil = no auth
 	// (only safe on a loopback bind; see auth.CheckBindSafety).
 	auth *auth.Authenticator
+
+	// idem dedups typed write verbs by their idempotency_key (A1).
+	idem *idemCache
 }
 
 // SetAuth installs the auth layer as the outermost wrapper of Handler(). nil or
@@ -125,6 +128,7 @@ func NewServer(agg *aggregator.Aggregator, opencodeURL string, ringCapacity int)
 		opencodeURL: opencodeURL,
 		ringCap:     ringCapacity,
 		aggs:        map[string]*aggregator.Aggregator{"": agg},
+		idem:        newIdemCache(10 * time.Minute),
 	}
 	return srv, nil
 }
@@ -177,6 +181,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/vh/quota", s.handleQuota)
 	mux.HandleFunc("/vh/archive", s.handleArchive)
 	mux.HandleFunc("/vh/unarchive", s.handleArchive)
+	// Typed, daemon-aware write verbs (A1) — the coordination action set.
+	mux.HandleFunc("/vh/send", s.handleSend)
+	mux.HandleFunc("/vh/spawn", s.handleSpawn)
+	mux.HandleFunc("/vh/abort", s.handleAbort)
+	mux.HandleFunc("/vh/answer-question", s.handleAnswerQuestion)
+	mux.HandleFunc("/vh/reply-permission", s.handleReplyPermission)
 	mux.HandleFunc("/vh/ack", s.handleAck)
 	mux.HandleFunc("/vh/archived", s.handleArchived)
 	mux.HandleFunc("/vh/reload", s.handleReload)
