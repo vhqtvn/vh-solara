@@ -53,3 +53,23 @@ test("light theme: a select control renders a light background, not dark", async
   // #0d1117, whose channel sum is ~37).
   expect(channelSum(bg)).toBeGreaterThan(600);
 });
+
+test("light theme: a destructive menu item uses a readable red, not faint pink", async ({ page }) => {
+  await page.goto("/");
+  await useLightTheme(page);
+  await page.getByRole("button", { name: /Demo session/ }).click();
+
+  // Right-click the chat header title → the context menu with the "Archive…"
+  // destructive item.
+  await page.locator(".main-title.has-menu").click({ button: "right" });
+  const danger = page.locator(".ctxm-item.danger");
+  await expect(danger).toBeVisible();
+
+  const color = await danger.evaluate((el) => getComputedStyle(el).color);
+  const [r, g, b] = color.match(/\d+(\.\d+)?/g)!.map(Number);
+  // A saturated dark red reads on white; the old light pink (#ffb4ba ≈ 255,180,186)
+  // would fail the green/blue ceilings.
+  expect(r).toBeGreaterThan(150);
+  expect(g).toBeLessThan(120);
+  expect(b).toBeLessThan(120);
+});

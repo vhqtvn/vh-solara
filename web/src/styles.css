@@ -20,6 +20,9 @@
   --bg-input: var(--bg);
   --bg-elev: var(--bg-2);
   --fg-strong: #fff;
+  /* Destructive-action text. A light pink reads on dark menus but washes out on
+     a light one, so light themes override it with a darker red. */
+  --danger-fg: #ffb4ba;
 
   /* Markdown + chat coloring tokens (openchamber's theme model, ported). Most
      derive from the base palette via color-mix so every theme stays coherent;
@@ -125,7 +128,7 @@
   --md-h1: #fabd2f; --md-h2: #b8bb26; --md-code: #b8bb26; --md-marker: #fe8019;
 }
 /* On light themes the most-prominent text must be dark, not white. */
-:root.theme-light, :root.theme-shire-light { --fg-strong: var(--fg); }
+:root.theme-light, :root.theme-shire-light { --fg-strong: var(--fg); --danger-fg: #cf222e; }
 :root.theme-light .vh-diff-add { background: #e6ffec; color: #1f2328; }
 :root.theme-light .vh-diff-del { background: #ffebe9; color: #1f2328; }
 :root.theme-light .vh-diff-hunk { background: #ddf4ff; color: #0969da; }
@@ -1344,7 +1347,7 @@ body {
 }
 .notif-item.action:hover, .notif-body.btn:hover { background: var(--bg); }
 .notif-ico { color: var(--accent); flex: none; margin-top: 1px; }
-.notif-item.err .notif-title { color: #ffb4ba; }
+.notif-item.err .notif-title { color: var(--danger-fg); }
 .notif-body {
   display: flex;
   flex-direction: column;
@@ -1663,7 +1666,7 @@ body {
   font-size: 13px;
 }
 .ctxm-item:hover { background: color-mix(in srgb, var(--fg) 8%, transparent); }
-.ctxm-item.danger { color: #ffb4ba; }
+.ctxm-item.danger { color: var(--danger-fg); }
 .ctxm-item.danger:hover { background: color-mix(in srgb, #f85149 14%, transparent); }
 .ctxm-sep { height: 1px; background: var(--border); margin: 5px 4px; }
 
