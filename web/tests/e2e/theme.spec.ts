@@ -16,6 +16,21 @@ async function useLightTheme(page: import("@playwright/test").Page) {
   });
 }
 
+test("every semantic theme variable is defined (no referenced-but-undefined vars)", async ({ page }) => {
+  await page.goto("/");
+  // The whole light-theme contrast saga came from vars referenced with hardcoded
+  // dark fallbacks but never defined. Guard that they all resolve to a value.
+  const VARS = [
+    "--bg-input", "--bg-elev", "--fg-strong",
+    "--accent-fg", "--danger-fg", "--danger", "--warn", "--ok", "--sel",
+  ];
+  const missing = await page.evaluate((vars: string[]) => {
+    const cs = getComputedStyle(document.documentElement);
+    return vars.filter((v) => cs.getPropertyValue(v).trim() === "");
+  }, VARS);
+  expect(missing).toEqual([]);
+});
+
 test("light theme defines the surface/emphasis vars that selects & session list use", async ({ page }) => {
   await page.goto("/");
   await useLightTheme(page);
@@ -52,6 +67,23 @@ test("light theme: a select control renders a light background, not dark", async
   // Light surface => channels near white (sum well above the dark-fallback
   // #0d1117, whose channel sum is ~37).
   expect(channelSum(bg)).toBeGreaterThan(600);
+});
+
+test("light theme: accent-filled controls (send button, active tab) use white text", async ({ page }) => {
+  await page.goto("/");
+  await useLightTheme(page);
+  await page.getByRole("button", { name: /Demo session/ }).click();
+
+  // The active view tab is filled with the (darker, on light) accent, so its
+  // text must be white — not the dark navy that suits the dark theme's accent.
+  const activeTab = page.locator(".seg button.on");
+  await expect(activeTab).toBeVisible();
+  expect(channelSum(await activeTab.evaluate((el) => getComputedStyle(el).color))).toBeGreaterThan(600);
+
+  // Same for the accent send button (its icon inherits currentColor).
+  const send = page.locator(".send-btn").first();
+  await expect(send).toBeVisible();
+  expect(channelSum(await send.evaluate((el) => getComputedStyle(el).color))).toBeGreaterThan(600);
 });
 
 test("light theme: a destructive menu item uses a readable red, not faint pink", async ({ page }) => {
