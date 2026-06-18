@@ -139,10 +139,12 @@
   --md-h1: #fabd2f; --md-h2: #b8bb26; --md-code: #b8bb26; --md-marker: #fe8019;
 }
 /* On light themes the most-prominent text must be dark, not white. */
-:root.theme-light, :root.theme-shire-light { --fg-strong: var(--fg); --danger-fg: #cf222e; --accent-fg: #fff; }
-:root.theme-light .vh-diff-add { background: #e6ffec; color: #1f2328; }
-:root.theme-light .vh-diff-del { background: #ffebe9; color: #1f2328; }
-:root.theme-light .vh-diff-hunk { background: #ddf4ff; color: #0969da; }
+/* Light-theme overrides apply to ALL light themes via the generic marker class
+   (set in theme.ts), so Shire (light) gets them too — not just `light`. */
+:root.theme-light-scoped { --fg-strong: var(--fg); --danger-fg: #cf222e; --accent-fg: #fff; }
+:root.theme-light-scoped .vh-diff-add { background: #e6ffec; color: #1f2328; }
+:root.theme-light-scoped .vh-diff-del { background: #ffebe9; color: #1f2328; }
+:root.theme-light-scoped .vh-diff-hunk { background: #ddf4ff; color: #0969da; }
 
 * { box-sizing: border-box; }
 
@@ -573,13 +575,15 @@ body {
   min-height: 120px; border-top: 1px solid var(--border);
   background: #0b0f17; position: relative;
   /* The dock is a fixed-dark island (its xterm bg is hardcoded dark too). Pin
-     the palette to dark values inside it so the header/controls stay legible on
-     light themes instead of inheriting dark-on-dark foreground. */
+     the palette to dark values inside it so the header/controls/overlay stay
+     legible on light themes instead of inheriting dark-on-dark foreground. */
+  --bg: #0b0f17;
   --fg: #c9d1d9;
   --fg-dim: #8b949e;
   --border: #30363d;
   --bg-2: #161b22;
   --accent: #58a6ff;
+  --accent-fg: #08111f;
 }
 .term-dock.full { position: absolute; inset: 0; z-index: 100; height: auto !important; }
 .term-dock-resize { position: absolute; top: -3px; left: 0; right: 0; height: 7px; cursor: ns-resize; z-index: 2; }
@@ -602,7 +606,25 @@ body {
 .term-status { flex: 0 0 auto; width: 8px; height: 8px; border-radius: 50%; align-self: center; margin-left: auto; }
 .term-status.open { background: var(--ok); }
 .term-status.connecting { background: var(--warn); }
-.term-status.closed { background: var(--danger); }
+.term-status.reconnecting { background: var(--warn); animation: pulse 1.1s ease-in-out infinite; }
+.term-status.disconnected { background: var(--danger); }
+
+/* Connection-state overlay: a dead/dropped PTY otherwise looks alive (the cursor
+   blinks locally) while silently eating keystrokes. */
+.term-overlay {
+  position: absolute; inset: 0; z-index: 3;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px;
+  background: color-mix(in srgb, var(--bg) 78%, transparent);
+  font-size: 13px; color: var(--fg-dim); text-align: center; padding: 12px;
+}
+.term-overlay.err .term-overlay-msg { color: var(--danger-fg); }
+.term-overlay-msg { font-weight: 500; }
+.term-reconnect {
+  padding: 5px 14px; font: inherit; font-size: 13px; font-weight: 600;
+  background: var(--accent); color: var(--accent-fg);
+  border: 0; border-radius: 6px; cursor: pointer;
+}
+.term-reconnect:hover { filter: brightness(1.08); }
 
 /* Settings → Terminals: session management. */
 .term-sess { border: 1px solid var(--border); border-radius: 8px; margin-bottom: 8px; overflow: hidden; }

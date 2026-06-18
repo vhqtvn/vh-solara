@@ -22,7 +22,7 @@ import (
 )
 
 // DefaultStyle is the chroma style for code (dark, the default). LightStyle is
-// emitted scoped under .theme-light for the light theme.
+// emitted scoped under .theme-light-scoped (set on <html> for every light theme).
 const (
 	DefaultStyle = "github-dark"
 	LightStyle   = "github"
@@ -86,8 +86,9 @@ func (r *Renderer) Markdown(src string) string {
 }
 
 // HighlightCSS returns the syntax stylesheet: the dark theme by default, plus
-// the light theme scoped under .theme-light so a single sheet covers both. The
-// client fetches this once (GET /vh/highlight.css) and caches it.
+// the light theme scoped under .theme-light-scoped so a single sheet covers both
+// (the marker class is set on <html> for every light theme). The client fetches
+// this once (GET /vh/highlight.css) and caches it.
 func (r *Renderer) HighlightCSS() (string, error) {
 	dark, err := styleCSS(DefaultStyle)
 	if err != nil {
@@ -97,7 +98,7 @@ func (r *Renderer) HighlightCSS() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return dark + "\n" + scopeCSS(light, ".theme-light"), nil
+	return dark + "\n" + scopeCSS(light, ".theme-light-scoped"), nil
 }
 
 func styleCSS(name string) (string, error) {

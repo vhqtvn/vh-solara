@@ -36,6 +36,10 @@ export function applyTheme() {
   for (const t of THEMES) el.classList.remove("theme-" + t.id);
   el.classList.add("theme-" + theme());
   const def = THEMES.find((t) => t.id === theme());
+  // Generic marker for ALL light themes (light, shire-light, …) so light-specific
+  // overrides — CSS diff colors AND the server's light syntax sheet scoped under
+  // it (GET /vh/highlight.css) — apply to every light theme, not just `light`.
+  el.classList.toggle("theme-light-scoped", !!def?.light);
   el.style.colorScheme = def?.light ? "light" : "dark";
 }
 

@@ -367,17 +367,46 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 	}
 	defer sess.detach(c)
 
-	// Writer: drain this client's queue to the socket (preserves order).
+	// Keepalive: without periodic traffic an idle connection gets silently
+	// dropped by intermediaries (reverse proxy / tunnel idle timeouts), leaving
+	// the client unable to type with no error. Ping on a timer; a missing pong
+	// within pongWait fails the read so the connection is torn down (the client
+	// then reconnects). The browser auto-replies to pings, so no client work.
+	const (
+		writeWait  = 10 * time.Second
+		pongWait   = 60 * time.Second
+		pingPeriod = (pongWait * 9) / 10
+	)
+	_ = conn.SetReadDeadline(time.Now().Add(pongWait))
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(pongWait))
+	})
+
+	// Writer: drain this client's queue to the socket (preserves order) and emit
+	// pings. Single goroutine so all writes are serialized (gorilla requires it).
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		for b := range c.send {
-			if conn.WriteMessage(websocket.BinaryMessage, b) != nil {
-				return
+		ticker := time.NewTicker(pingPeriod)
+		defer ticker.Stop()
+		for {
+			select {
+			case b, ok := <-c.send:
+				_ = conn.SetWriteDeadline(time.Now().Add(writeWait))
+				if !ok {
+					_ = conn.WriteControl(websocket.CloseMessage,
+						websocket.FormatCloseMessage(websocket.CloseNormalClosure, "exit"), time.Now().Add(writeWait))
+					return
+				}
+				if conn.WriteMessage(websocket.BinaryMessage, b) != nil {
+					return
+				}
+			case <-ticker.C:
+				if conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(writeWait)) != nil {
+					return
+				}
 			}
 		}
-		_ = conn.WriteControl(websocket.CloseMessage,
-			websocket.FormatCloseMessage(websocket.CloseNormalClosure, "exit"), time.Now().Add(time.Second))
 	}()
 
 	// Reader: input + resize control.
@@ -386,6 +415,7 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return
 		}
+		_ = conn.SetReadDeadline(time.Now().Add(pongWait)) // any client activity keeps it alive
 		switch mt {
 		case websocket.BinaryMessage:
 			if _, err := sess.ptmx.Write(data); err != nil {

@@ -11,7 +11,10 @@ async function useLightTheme(page: import("@playwright/test").Page) {
   await page.evaluate(() => {
     const el = document.documentElement;
     el.className = el.className.replace(/\btheme-\S+/g, "").trim();
+    // Mirror applyTheme(): a light theme sets both its own class and the generic
+    // theme-light-scoped marker that the light overrides key off.
     el.classList.add("theme-light");
+    el.classList.add("theme-light-scoped");
     el.style.colorScheme = "light";
   });
 }
@@ -104,4 +107,27 @@ test("light theme: a destructive menu item uses a readable red, not faint pink",
   expect(r).toBeGreaterThan(150);
   expect(g).toBeLessThan(120);
   expect(b).toBeLessThan(120);
+});
+
+test("markdown code blocks use the light syntax sheet on every light theme (not just `light`)", async ({ page }) => {
+  // Boot into Shire (light) — a light theme whose class is `theme-shire-light`,
+  // which the old `.theme-light`-only syntax scope missed (code rendered with
+  // faint dark-theme colors on the light surface).
+  await page.addInitScript(() => {
+    localStorage.setItem("vh.theme.v1", JSON.stringify({ v: 1, data: "shire-light" }));
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: /Demo session/ }).click();
+  const block = page.locator(".md pre.chroma").first();
+  await expect(block).toBeVisible();
+
+  // The generic light marker is applied, so the scoped light syntax sheet
+  // (.theme-light-scoped .chroma) takes effect even for shire-light.
+  await expect(page.locator("html")).toHaveClass(/theme-light-scoped/);
+
+  // A highlighted keyword is dark (readable) on the light code surface, not the
+  // faint light-on-light dark-theme color.
+  const token = block.locator(".k, .kd, .kr").first();
+  await expect(token).toBeVisible();
+  expect(channelSum(await token.evaluate((el) => getComputedStyle(el).color))).toBeLessThan(500);
 });

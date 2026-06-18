@@ -48,9 +48,11 @@ func TestHighlightCSS(t *testing.T) {
 	if !strings.Contains(css, ".chroma") {
 		t.Fatalf("css missing .chroma rules: %.200s", css)
 	}
-	// Light theme is scoped so it only applies under .theme-light.
-	if !strings.Contains(css, ".theme-light") {
-		t.Fatalf("css missing scoped light theme rules")
+	// The light theme is scoped under the generic .theme-light-scoped marker (set
+	// on <html> for EVERY light theme), so it must use that class — not the
+	// specific .theme-light id, which would miss shire-light & friends.
+	if !strings.Contains(css, ".theme-light-scoped .chroma") {
+		t.Fatalf("light syntax rules must be scoped under .theme-light-scoped, got: %.300s", css)
 	}
 }
 

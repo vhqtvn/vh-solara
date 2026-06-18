@@ -10,7 +10,7 @@
 // when offline. Hashed assets are immutable → cache-first. The live API
 // (/vh/, /oc/) is never intercepted.
 
-const BUILD_ID = "mqjg5ho9d0l2fe";
+const BUILD_ID = "mqjinoe4y57djn";
 const CACHE = "vh-" + BUILD_ID;
 
 self.addEventListener("install", (e) => {
