@@ -64,7 +64,8 @@ func New() *FakeOpenCode {
 			Parts: []map[string]any{textPart("m1", "demo", "p1", "Refactor the parser and explain the change.", now-4800)},
 		},
 		{
-			Info: map[string]any{"id": "m2", "sessionID": "demo", "role": "assistant", "time": map[string]any{"created": now - 4600, "completed": now - 4000}},
+			Info: map[string]any{"id": "m2", "sessionID": "demo", "role": "assistant", "time": map[string]any{"created": now - 4600, "completed": now - 4000},
+				"model": map[string]any{"providerID": "fake", "modelID": "dummy-think", "variant": "high"}},
 			Parts: []map[string]any{
 				textPart("m2", "demo", "p2", "Here's the plan:\n\n1. Extract the tokenizer\n2. Add tests\n\n```go\nfunc Parse(s string) (*AST, error) {\n\treturn parse(s)\n}\n```\n\nComplexity is $O(n \\log n)$; over the input:\n\n$$\\sum_{i=1}^{n} i = \\frac{n(n+1)}{2}$$\n\nEdited src/parser.go:2 accordingly.", now-4600),
 				{

@@ -734,6 +734,14 @@ body {
   color: var(--fg-dim);
 }
 .msg.user .msg-role { color: var(--accent); }
+.msg-model {
+  font-size: 11px;
+  color: var(--fg-dim);
+  max-width: 40ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .msg-time, .msg-cost { font-size: 11px; color: var(--fg-dim); }
 .msg-cost { font-family: ui-monospace, Menlo, monospace; }
 .msg-actions {

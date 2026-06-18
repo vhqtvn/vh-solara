@@ -108,6 +108,20 @@ function messageError(info: any): string | null {
   return e.data?.message || e.name || "error";
 }
 
+// The model that produced an assistant message, resolved to its display name
+// (falling back to the raw id). Empty for non-assistant messages or when the
+// message carries no model. message.model uses `modelID`; older/flat envelopes
+// put it directly on the info — accept either.
+function modelLabel(info: any): string {
+  if (info?.role !== "assistant") return "";
+  const providerID = info.providerID ?? info.model?.providerID;
+  const modelID = info.modelID ?? info.model?.modelID;
+  if (!modelID) return "";
+  const name = (providerID ? findModel(providerID, modelID)?.name : undefined) || modelID;
+  const variant = info.variant ?? info.model?.variant;
+  return variant && variant !== "default" ? `${name} · ${variant}` : name;
+}
+
 // Assistant cost/token summary, shown once the turn has completed.
 function costLabel(info: any): string {
   if (info?.role !== "assistant" || !info?.time?.completed) return "";
@@ -759,6 +773,9 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
               <div class="msg" classList={{ user: m.info.role === "user", assistant: m.info.role === "assistant" }}>
                 <div class="msg-head">
                   <span class="msg-role">{roleLabel(m.info.role)}</span>
+                  <Show when={modelLabel(m.info)}>
+                    <span class="msg-model" data-tip={modelLabel(m.info)}>{modelLabel(m.info)}</span>
+                  </Show>
                   <RelTime class="msg-time" mode="ago" ms={m.info.time?.created} />
                   <Show when={costLabel(m.info)}>
                     <span class="msg-cost">{costLabel(m.info)}</span>
