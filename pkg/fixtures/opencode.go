@@ -256,7 +256,7 @@ func (f *FakeOpenCode) Handler() http.Handler {
 	})
 	mux.HandleFunc("/config", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]any{
-			"plugin":        []string{"opencode-notify", "opencode-stats"},
+			"plugin":        []string{"opencode-notify", "github:acme/opencode-plugin-very-long-name@v1.2.3"},
 			"mcp":           map[string]any{"context7": map[string]any{"type": "remote"}},
 			"lsp":           map[string]any{"go": map[string]any{"command": []string{"gopls"}}},
 			"default_agent": "plan",

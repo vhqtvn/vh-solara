@@ -130,7 +130,7 @@ export default function ServersPanel() {
             {(p) => (
               <div class="m-row">
                 <span class="m-row-main">
-                  <span class="m-name">{p}</span>
+                  <span class="m-name m-name-full">{p}</span>
                 </span>
               </div>
             )}

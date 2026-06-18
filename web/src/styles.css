@@ -11,6 +11,16 @@
   --code-surface: #0b0f14;
   --sidebar-w: 280px;
 
+  /* Surfaces/emphasis derived from the palette so every theme (which only
+     overrides --bg/--bg-2/--fg) adapts automatically. --bg-input: form controls
+     (select buttons, text inputs); --bg-elev: elevated popups/sheets; --fg-strong:
+     the most prominent text (e.g. a running session). Previously these were
+     referenced only with hardcoded dark fallbacks, so selects rendered dark on
+     light themes. */
+  --bg-input: var(--bg);
+  --bg-elev: var(--bg-2);
+  --fg-strong: #fff;
+
   /* Markdown + chat coloring tokens (openchamber's theme model, ported). Most
      derive from the base palette via color-mix so every theme stays coherent;
      only --accent-2 is set per theme. Override any token in a theme block to
@@ -114,6 +124,8 @@
   --code-bg: #32302f; --code-surface: #1d2021;
   --md-h1: #fabd2f; --md-h2: #b8bb26; --md-code: #b8bb26; --md-marker: #fe8019;
 }
+/* On light themes the most-prominent text must be dark, not white. */
+:root.theme-light, :root.theme-shire-light { --fg-strong: var(--fg); }
 :root.theme-light .vh-diff-add { background: #e6ffec; color: #1f2328; }
 :root.theme-light .vh-diff-del { background: #ffebe9; color: #1f2328; }
 :root.theme-light .vh-diff-hunk { background: #ddf4ff; color: #0969da; }
@@ -339,7 +351,7 @@ body {
 .tree-sub-run { color: var(--accent); }
 /* A running session stands out: bold white title (placed after the selected
    rule so running wins when both apply). */
-.tree-node.running .tree-title { color: #fff; font-weight: 700; }
+.tree-node.running .tree-title { color: var(--fg-strong); font-weight: 700; }
 .dot {
   width: 7px;
   height: 7px;
@@ -768,7 +780,7 @@ body {
   position: absolute;
   top: 6px;
   right: 6px;
-  background: #21262dcc;
+  background: color-mix(in srgb, var(--bg-2) 80%, transparent);
   border: 1px solid var(--border);
   color: var(--fg-dim);
   border-radius: 5px;
@@ -969,7 +981,7 @@ body {
   cursor: pointer;
   font: inherit;
 }
-.perm-actions button:hover { background: #161c24; }
+.perm-actions button:hover { background: color-mix(in srgb, var(--fg) 9%, transparent); }
 .perm-actions button.reject { border-color: #f8514955; color: #ffb4ba; }
 
 /* --- question card (interactive "answer needed") --- */
@@ -2227,6 +2239,9 @@ body {
 .m-row.selected { background: #1f6feb22; }
 .m-row-main { display: flex; flex-direction: column; min-width: 0; flex: 1; }
 .m-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Plugin ids carry their meaning in the tail (version, repo, path), so show the
+   full string (wrapping) instead of truncating it to a useless trailing "…". */
+.m-name-full { overflow: visible; text-overflow: clip; white-space: normal; overflow-wrap: anywhere; }
 .m-prov { font-size: 11px; color: var(--fg-dim); }
 .m-badges { display: flex; gap: 4px; flex-wrap: wrap; justify-content: flex-end; }
 .badge {
