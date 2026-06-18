@@ -15,7 +15,7 @@ handoff thread; this doc tracks the implemented surface and decisions.
 | V1 / A2 | `finish` reason + token usage materialized; per-session `gate{}` on every snapshot | ✅ done |
 | V2 / A1 | Typed write verbs (send/spawn/abort/answer-question/reply-permission) + idempotency + If-Idle-Seq CAS | ✅ done |
 | V3 / A3 | `/api/workers/{id}/*` cross-worker API through registry+tunnel; epoch+seq; bearer auth | ✅ done |
-| V4 / A4 | MCP facade over the read+write verbs | ⏳ |
+| V4 / A4 | MCP facade over the read+write verbs | ✅ done |
 | V5 / B  | `Feature`/`Services` module mechanism; refactor V1–V4 into the first module | ⏳ |
 | V6 / C  | two-layer kit provisioning (`controlplane-core` + `controlplane-policy`) | ⏳ |
 
@@ -110,6 +110,33 @@ the session-auth edge — the coordinator is headless.
 - Unknown worker → `404`; offline → `502` (fail fast).
 - Auth: `Authorization: Bearer <token>`; empty token = open (only safe on a
   protected edge).
+
+## V4 — MCP facade (`vh-solara mcp`)
+
+A stdio MCP server (newline-delimited JSON-RPC 2.0) that an opencode agent can
+launch as a `type: local` MCP server. It is an **HTTP client of the coordination
+API** (`--base-url` / `VH_CONTROLLER_URL`, `--token` / `VH_API_TOKEN`,
+`--worker` default), so one MCP server drives any worker. Tools mirror the verbs:
+
+`list_workers`, `list_sessions`, `get_session`, `send_message` (with
+`if_idle_seq` CAS), `spawn_session`, `abort_session`, `answer_question`,
+`reply_permission`, `archive_session`.
+
+- Non-2xx upstream → an MCP tool error (`isError`) carrying the message, not a
+  transport failure.
+- Successful results attach `_meta.{epoch,seq}` from the worker's response
+  headers, so an agent can track the cursor.
+- Events stay on SSE (`/api/workers/{id}/events`); MCP is request/response, so
+  the reflex loop owns the stream.
+
+Example opencode `opencode.json`:
+```jsonc
+{ "mcp": { "vh-solara": {
+  "type": "local",
+  "command": ["vh-solara", "mcp", "--base-url", "https://ctrl.example", "--worker", "w1"],
+  "environment": { "VH_API_TOKEN": "..." }
+} } }
+```
 
 ## Decisions (generic-mechanism-only)
 

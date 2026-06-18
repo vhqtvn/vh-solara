@@ -36,6 +36,9 @@ const apiBearerHeader = "Authorization"
 // registerCoordRoutes installs the coordination API on its own mux (matched
 // before session auth in Start).
 func (d *Daemon) registerCoordRoutes(mux *http.ServeMux) {
+	// Bearer-gated worker discovery for headless clients (the dashboard's
+	// GET /api/workers is session-authed; this is its coordination-API peer).
+	mux.HandleFunc("GET /api/coord/workers", d.coordListWorkers)
 	mux.HandleFunc("GET /api/workers/{id}/sessions", d.coordSnapshot)
 	mux.HandleFunc("POST /api/workers/{id}/sessions", d.coordSpawn)
 	mux.HandleFunc("GET /api/workers/{id}/sessions/{sid}", d.coordSessionDetail)
@@ -142,6 +145,23 @@ func readJSONObj(r *http.Request) map[string]any {
 }
 
 // --- handlers ---
+
+// coordListWorkers returns the registered workers (id, name, status) for headless
+// discovery — the bearer-gated peer of the dashboard's GET /api/workers.
+func (d *Daemon) coordListWorkers(w http.ResponseWriter, r *http.Request) {
+	type pubWorker struct {
+		ID      string `json:"id"`
+		Name    string `json:"name"`
+		Version string `json:"version"`
+		Status  string `json:"status"`
+	}
+	out := []pubWorker{}
+	for _, wv := range d.Registry.ListWorkers() {
+		out = append(out, pubWorker{ID: wv.ID, Name: wv.Name, Version: wv.Version, Status: wv.Status})
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(out)
+}
 
 func (d *Daemon) coordSnapshot(w http.ResponseWriter, r *http.Request) {
 	worker, ok := d.coordWorker(w, r)
