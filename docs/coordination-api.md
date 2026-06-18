@@ -16,7 +16,7 @@ handoff thread; this doc tracks the implemented surface and decisions.
 | V2 / A1 | Typed write verbs (send/spawn/abort/answer-question/reply-permission) + idempotency + If-Idle-Seq CAS | ✅ done |
 | V3 / A3 | `/api/workers/{id}/*` cross-worker API through registry+tunnel; epoch+seq; bearer auth | ✅ done |
 | V4 / A4 | MCP facade over the read+write verbs | ✅ done |
-| V5 / B  | `Feature`/`Services` module mechanism; refactor V1–V4 into the first module | ⏳ |
+| V5 / B  | `Feature`/`Services` module mechanism; coordination verbs as the first module | ✅ done |
 | V6 / C  | two-layer kit provisioning (`controlplane-core` + `controlplane-policy`) | ⏳ |
 
 ## V1 — gate facts (worker `/vh/*`)
@@ -137,6 +137,31 @@ Example opencode `opencode.json`:
   "environment": { "VH_API_TOKEN": "..." }
 } } }
 ```
+
+## V5 — Feature/Services module mechanism
+
+A `Feature` registers HTTP routes on the worker server without core knowing about
+it; the server walks its registry at startup (`mountFeatures`). The coordination
+verbs (V2) are refactored into `coordinationFeature` — the first module (dogfood).
+
+```go
+type Feature interface {
+    Name() string
+    Routes(Services) map[string]http.HandlerFunc
+}
+```
+
+`Services` is the narrow boundary a module gets: `Agg(dir)` (→ store read +
+opencode write client), `ReqDir(r)`, and `WithIdempotency(...)`. **No** tunnel,
+auth internals, or other features' state. Add a module with
+`server.RegisterFeature(f)` before `Handler()`.
+
+**Scope decision:** V1 (gate facts) stays in core — it's the store's data model,
+not a route surface. V3 (controller proxy) and V4 (MCP) live in their own
+packages/process; the module system is the worker server's route-composition
+mechanism, which is where "add a capability without editing core" actually
+applies. In-process modules call shared helpers directly; the `Services` surface
+is what an out-of-package module needs.
 
 ## Decisions (generic-mechanism-only)
 

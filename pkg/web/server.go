@@ -72,6 +72,17 @@ type Server struct {
 
 	// idem dedups typed write verbs by their idempotency_key (A1).
 	idem *idemCache
+
+	// features are the capability modules mounted at startup (B). The
+	// coordination verbs are the first one (dogfood).
+	features []Feature
+}
+
+// RegisterFeature adds a capability module to be mounted by Handler(). Call
+// before Handler() is first invoked. Returns the server for chaining.
+func (s *Server) RegisterFeature(f Feature) *Server {
+	s.features = append(s.features, f)
+	return s
 }
 
 // SetAuth installs the auth layer as the outermost wrapper of Handler(). nil or
@@ -129,6 +140,7 @@ func NewServer(agg *aggregator.Aggregator, opencodeURL string, ringCapacity int)
 		ringCap:     ringCapacity,
 		aggs:        map[string]*aggregator.Aggregator{"": agg},
 		idem:        newIdemCache(10 * time.Minute),
+		features:    defaultFeatures(),
 	}
 	return srv, nil
 }
@@ -181,12 +193,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/vh/quota", s.handleQuota)
 	mux.HandleFunc("/vh/archive", s.handleArchive)
 	mux.HandleFunc("/vh/unarchive", s.handleArchive)
-	// Typed, daemon-aware write verbs (A1) — the coordination action set.
-	mux.HandleFunc("/vh/send", s.handleSend)
-	mux.HandleFunc("/vh/spawn", s.handleSpawn)
-	mux.HandleFunc("/vh/abort", s.handleAbort)
-	mux.HandleFunc("/vh/answer-question", s.handleAnswerQuestion)
-	mux.HandleFunc("/vh/reply-permission", s.handleReplyPermission)
+	// Feature modules (B) — the coordination write verbs (A1) are the first one.
+	s.mountFeatures(mux)
 	mux.HandleFunc("/vh/ack", s.handleAck)
 	mux.HandleFunc("/vh/archived", s.handleArchived)
 	mux.HandleFunc("/vh/reload", s.handleReload)
