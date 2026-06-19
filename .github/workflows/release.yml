@@ -28,6 +28,9 @@ jobs:
           node-version: 20
 
       - name: Build web UI (embedded into the binary)
+        # pkg/web/dist is NOT committed (only a placeholder index.html). This step
+        # produces the real SPA bundle that `go build` embeds via //go:embed dist,
+        # so it MUST run before "Build binaries".
         run: |
           cd web
           npm ci
