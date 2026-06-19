@@ -183,6 +183,11 @@ func objSchema(props map[string]any, required ...string) map[string]any {
 	return map[string]any{"type": "object", "properties": props, "required": required}
 }
 
+// ToolDefs exposes the MCP tool definitions (name, description, inputSchema) — the
+// source of truth for the verb surface, reused to generate the client skill so it
+// can't drift from the binary.
+func ToolDefs() []map[string]any { return toolDefs() }
+
 func toolDefs() []map[string]any {
 	worker := strProp("worker id (omit to use the server's default worker)")
 	dir := strProp("project directory on the worker (optional)")

@@ -273,6 +273,23 @@ Manifest:
 }
 ```
 
+## Client skill (`vh-solara skill`)
+
+vh-solara owns the agent-facing "how to drive vh-solara" surface and emits it as a
+**version-stamped, generated** skill so a consuming repo installs it rather than
+hand-maintaining a copy that drifts:
+
+- `vh-solara skill emit` — write the generated `SKILL.md` to stdout (diff / CI check)
+- `vh-solara skill install --repo <path> [--out .opencode/skills/vh-solara]`
+
+The verb reference is generated from the **live MCP tool defs** and the gate-field
+list is **reflected from `state.GateFacts`**, so neither can silently drift from
+the binary; the contract sections (CAS, status buckets, cursors, UDS) are curated
+and the header is stamped with the build `Version`. It's an engine-layer artifact
+(vh-managed): commit it and re-run `skill install` (or fail CI on `skill emit |
+diff`) on upgrade, or gitignore and regenerate. The consumer's policy overlay
+stays separate and consumer-owned.
+
 ## Testing
 
 Each feature has package unit tests (state/web/server/mcp/kit). The cross-machine
