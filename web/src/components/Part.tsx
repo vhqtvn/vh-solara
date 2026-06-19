@@ -1,4 +1,4 @@
-import { createEffect, createResource, createSignal, For, Match, onCleanup, Show, Switch } from "solid-js";
+import { createEffect, createMemo, createResource, createSignal, For, Match, onCleanup, Show, Switch } from "solid-js";
 import { renderMarkdown } from "../render";
 import { renderStreamMd } from "../lib/md";
 import { renderMermaid } from "../lib/mermaid";
@@ -87,6 +87,11 @@ function MarkdownHtml(props: { text: string }) {
     () => props.text,
     (t) => renderMarkdown(t),
   );
+  // Instant client-rendered fallback (same renderer as the live stream) so a
+  // settled block shows formatted prose immediately instead of flashing raw text
+  // during the /vh/render round-trip; the server HTML (chroma highlighting +
+  // sanitization) silently upgrades it once it arrives.
+  const fallback = createMemo(() => renderStreamMd(props.text));
   let ref: HTMLDivElement | undefined;
   createEffect(() => {
     if (html())
@@ -101,7 +106,7 @@ function MarkdownHtml(props: { text: string }) {
     if (t?.dataset.path) openFile(t.dataset.path, t.dataset.line ? Number(t.dataset.line) : undefined);
   };
   return (
-    <Show when={html()} fallback={<div class="md-raw">{props.text}</div>}>
+    <Show when={html()} fallback={<div class="md" innerHTML={fallback()} />}>
       <div class="md" ref={ref} innerHTML={html()!} onClick={onClick} />
     </Show>
   );
