@@ -22,15 +22,15 @@ import (
 // controller/proxy connection. It's the standalone counterpart to
 // `client-daemon --web=vh`: open the printed http://<addr> in a browser.
 var (
-	localAddr            string
-	localOpenCodeBin     string
-	localOpenCodeURL     string
+	localAddr             string
+	localOpenCodeBin      string
+	localOpenCodeURL      string
 	localOpenCodeDetached bool
-	localOpenCodeUpdate  string
-	localOpenCodeRestart string
-	localCORSOrigins     []string
-	localExternalManaged bool
-	localAuth            authFlags
+	localOpenCodeUpdate   string
+	localOpenCodeRestart  string
+	localCORSOrigins      []string
+	localExternalManaged  bool
+	localAuth             authFlags
 )
 
 var localServerCmd = &cobra.Command{
@@ -212,6 +212,9 @@ with --opencode-url, or spawn a survivable detached instance with
 
 		var vhCtx context.Context
 		vhCtx, vhCancel = context.WithCancel(context.Background())
+		// Ensure the aggregator's context is cancelled on every return path (the
+		// restart hook also calls vhCancel; CancelFunc is idempotent).
+		defer vhCancel()
 		go agg.Run(vhCtx)
 		vhHTTP = &http.Server{
 			Addr:    localAddr,
