@@ -35,10 +35,16 @@ refs
 # Repo-scoped agent/test artifacts (Playwright traces, reports, screenshots).
 tmp/
 
-# Node / web build deps (the built SPA in pkg/web/dist IS committed for embed).
+# Node / web build artifacts. The built SPA (pkg/web/dist) is NOT committed — it's
+# produced by `make web` locally and by the release workflow (GitHub Actions)
+# before `go build`. A placeholder pkg/web/dist/index.html is kept so `//go:embed
+# dist` and the Go tests compile without a frontend build. After `make web` the
+# placeholder index.html is overwritten by the real shell; don't commit it.
 node_modules/
 web/test-results/
 web/playwright-report/
+pkg/web/dist/*
+!pkg/web/dist/index.html
 
 # Agent-local tooling / config.
 .claude/
