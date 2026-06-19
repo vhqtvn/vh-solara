@@ -32,6 +32,7 @@ import (
 type Cluster struct {
 	Fake          *fixtures.FakeOpenCode
 	ControllerURL string // user edge, e.g. http://127.0.0.1:PORT
+	WorkerVHURL   string // the worker's own --web vh server (loopback) — the pure-local path
 	WorkerID      string
 	APIToken      string
 
@@ -62,6 +63,7 @@ func StartCluster() (*Cluster, error) {
 		return nil, err
 	}
 	c.workerSrv = httptest.NewServer(wsrv.Handler())
+	c.WorkerVHURL = c.workerSrv.URL
 	chamberPort, err := portOf(c.workerSrv.URL)
 	if err != nil {
 		return nil, err

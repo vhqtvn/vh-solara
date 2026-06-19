@@ -143,10 +143,22 @@ the session-auth edge — the coordinator is headless.
 
 ## V4 — MCP facade (`vh-solara mcp`)
 
-A stdio MCP server (newline-delimited JSON-RPC 2.0) that an opencode agent can
-launch as a `type: local` MCP server. It is an **HTTP client of the coordination
-API** (`--base-url` / `VH_CONTROLLER_URL`, `--token` / `VH_API_TOKEN`,
-`--worker` default), so one MCP server drives any worker. Tools mirror the verbs:
+A stdio MCP server (newline-delimited JSON-RPC 2.0) that an opencode agent
+launches as a `type: local` MCP server. **Two modes:**
+
+- **`--local` (recommended for an agent on the worker machine):** drive the local
+  `--web vh` server's `/vh/*` directly — loopback, no controller, no bearer, no
+  tunnel. This is the common case (an agent driving its *own* sessions) and works
+  identically in both deployments: `local-server` (vh at e.g. `:7700`) and
+  `client-daemon --web vh` (the worker's local chamber port). It is **immune to
+  the tunnel-proxy smuggling path** — there is no hijacking proxy in front of a
+  direct `/vh/*` server. Default base-url `http://127.0.0.1:7700`.
+- **controller (default):** HTTP client of the coordination API (`--base-url` /
+  `VH_CONTROLLER_URL`, `--token` / `VH_API_TOKEN`, `--worker`), so one MCP server
+  drives *any* machine's worker — the cross-machine coordinator case.
+
+Tools mirror the verbs (same names in both modes; in `--local`, `worker` is
+ignored and verbs are body-addressed to `/vh/*` with the CSRF header):
 
 `list_workers`, `list_sessions`, `get_session`, `send_message` (with
 `if_idle_seq` CAS), `spawn_session`, `abort_session`, `answer_question`,

@@ -12,6 +12,7 @@ var (
 	mcpBaseURL string
 	mcpToken   string
 	mcpWorker  string
+	mcpLocal   bool
 )
 
 var mcpCmd = &cobra.Command{
@@ -28,10 +29,17 @@ opencode (type: local).`,
 		if v := os.Getenv("VH_CONTROLLER_URL"); v != "" && mcpBaseURL == "" {
 			mcpBaseURL = v
 		}
+		// Default base URL per mode: local → a local --web vh server; controller →
+		// the controller edge.
 		if mcpBaseURL == "" {
-			mcpBaseURL = "http://127.0.0.1:8080"
+			if mcpLocal {
+				mcpBaseURL = "http://127.0.0.1:7700"
+			} else {
+				mcpBaseURL = "http://127.0.0.1:8080"
+			}
 		}
 		srv := mcp.New(mcpBaseURL, mcpToken, mcpWorker, Version)
+		srv.Local = mcpLocal
 		// stdout carries the JSON-RPC stream; logs must go to stderr only.
 		log.SetOutput(os.Stderr)
 		if err := srv.Serve(os.Stdin, os.Stdout); err != nil {
@@ -41,8 +49,9 @@ opencode (type: local).`,
 }
 
 func init() {
-	mcpCmd.Flags().StringVar(&mcpBaseURL, "base-url", "", "Controller base URL (or VH_CONTROLLER_URL; default http://127.0.0.1:8080)")
-	mcpCmd.Flags().StringVar(&mcpToken, "token", "", "Bearer token for the coordination API (or VH_API_TOKEN)")
-	mcpCmd.Flags().StringVar(&mcpWorker, "worker", "", "Default worker id used when a tool call omits 'worker'")
+	mcpCmd.Flags().BoolVar(&mcpLocal, "local", false, "Local mode: drive a local --web vh server's /vh/* directly (no controller, no bearer). Default base-url http://127.0.0.1:7700")
+	mcpCmd.Flags().StringVar(&mcpBaseURL, "base-url", "", "Base URL: a local vh server (--local) or a controller (or VH_CONTROLLER_URL)")
+	mcpCmd.Flags().StringVar(&mcpToken, "token", "", "Bearer token for the controller coordination API (or VH_API_TOKEN); unused in --local")
+	mcpCmd.Flags().StringVar(&mcpWorker, "worker", "", "Controller mode: default worker id when a tool call omits 'worker'")
 	rootCmd.AddCommand(mcpCmd)
 }

@@ -174,6 +174,39 @@ func TestE2E_MCPOverController(t *testing.T) {
 	}
 }
 
+// Pure-local: MCP in --local mode drives the worker's own /vh/* directly — no
+// controller, no tunnel, no bearer. This is the common agent-on-the-worker case
+// and is immune to the tunnel-proxy smuggling path.
+func TestE2E_MCPLocalModeDirectToWorker(t *testing.T) {
+	srv := mcp.New(cluster.WorkerVHURL, "", "", "test")
+	srv.Local = true
+	in := strings.Join([]string{
+		`{"jsonrpc":"2.0","id":1,"method":"initialize"}`,
+		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_sessions","arguments":{}}}`,
+		`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"send_message","arguments":{"session_id":"demo","text":"hi"}}}`,
+	}, "\n") + "\n"
+	var out strings.Builder
+	if err := srv.Serve(strings.NewReader(in), &out); err != nil {
+		t.Fatal(err)
+	}
+	byID := map[float64]map[string]any{}
+	for _, line := range strings.Split(strings.TrimSpace(out.String()), "\n") {
+		var m map[string]any
+		if json.Unmarshal([]byte(line), &m) == nil {
+			if id, ok := m["id"].(float64); ok {
+				byID[id] = m
+			}
+		}
+	}
+	if txt := toolText(t, byID[2]); !strings.Contains(txt, "demo") {
+		t.Fatalf("local MCP list_sessions should hit the worker /vh/snapshot, got: %s", txt)
+	}
+	res3, _ := byID[3]["result"].(map[string]any)
+	if res3 == nil || res3["isError"] == true {
+		t.Fatalf("local MCP send_message should succeed against the worker /vh/send, got: %v", byID[3])
+	}
+}
+
 func toolText(t *testing.T, resp map[string]any) string {
 	t.Helper()
 	res, _ := resp["result"].(map[string]any)
