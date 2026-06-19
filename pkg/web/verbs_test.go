@@ -144,6 +144,22 @@ func post(t *testing.T, url, body string, hdr map[string]string) (int, map[strin
 	return resp.StatusCode, out, resp.Header
 }
 
+func TestSnapshotStampsEpochSeqHeaders(t *testing.T) {
+	f := &fakeOC{}
+	web, agg := newVerbServer(t, f)
+	resp, err := http.Get(web.URL + "/vh/snapshot")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if got := resp.Header.Get("X-Vh-Epoch"); got == "" || got != agg.Store().Epoch() {
+		t.Fatalf("X-VH-Epoch header want %q, got %q", agg.Store().Epoch(), got)
+	}
+	if resp.Header.Get("X-Vh-Seq") == "" {
+		t.Fatal("X-VH-Seq header should be stamped on /vh/* responses")
+	}
+}
+
 func TestSendForwardsPrompt(t *testing.T) {
 	f := &fakeOC{}
 	web, _ := newVerbServer(t, f)
