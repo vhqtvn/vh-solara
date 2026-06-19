@@ -319,6 +319,41 @@ func TestGateSubtreeBusyAndPendingFlags(t *testing.T) {
 	}
 }
 
+func TestGateHydratedFlag(t *testing.T) {
+	s := New(100)
+	s.Apply(ev("session.created", `{"info":{"id":"a"}}`))
+	// No message state yet (cold/never-opened) → hydrated=false, so a consumer
+	// knows last_assistant_completed=false means "unknown", not "in-flight".
+	if s.Snapshot(nil).Gate["a"].Hydrated {
+		t.Fatal("session with no message state must report hydrated=false")
+	}
+	// Live message events give us authoritative state → hydrated=true.
+	s.Apply(ev("message.updated", `{"info":{"id":"m1","sessionID":"a","role":"assistant","time":{"created":1,"completed":2},"finish":"stop"}}`))
+	g := s.Snapshot(nil).Gate["a"]
+	if !g.Hydrated {
+		t.Fatal("session with live messages must report hydrated=true")
+	}
+	if g.FinishReason != "stop" || !g.LastAssistantCompleted {
+		t.Fatalf("hydrated session should carry authoritative finish/completed, got %+v", g)
+	}
+}
+
+func TestSnapshotEpochSetAndStable(t *testing.T) {
+	s := New(100)
+	e := s.Snapshot(nil).Epoch
+	if e == "" || s.Epoch() != e {
+		t.Fatalf("epoch must be set and match Epoch(), got snapshot=%q Epoch()=%q", e, s.Epoch())
+	}
+	s.Apply(ev("session.created", `{"info":{"id":"a"}}`))
+	if got := s.Snapshot(nil).Epoch; got != e {
+		t.Fatalf("epoch must be stable within a store lifetime, changed %q -> %q", e, got)
+	}
+	// A distinct store has a distinct epoch.
+	if New(100).Snapshot(nil).Epoch == e {
+		t.Fatal("two stores must have distinct epochs")
+	}
+}
+
 func TestHydrateDiffEmitsOnlyChanges(t *testing.T) {
 	s := New(100)
 	s.Apply(ev("session.created", `{"info":{"id":"a","title":"v1"}}`))
