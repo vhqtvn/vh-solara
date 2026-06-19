@@ -20,7 +20,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// Default upstream repo (Gitea API base). Overridable with --repo.
+// Default upstream repo (GitHub API base). Overridable with --repo.
 const defaultRepoAPI = "https://api.github.com/repos/vhqtvn/vh-solara"
 
 var (
@@ -32,7 +32,7 @@ var (
 var updateCmd = &cobra.Command{
 	Use:   "update",
 	Short: "Download and install the latest release binary (verified by SHA256)",
-	Long: "Checks the latest Gitea release, downloads the binary for this OS/arch,\n" +
+	Long: "Checks the latest GitHub release, downloads the binary for this OS/arch,\n" +
 		"verifies its SHA256 against the published checksums, and atomically replaces\n" +
 		"the running executable. Restart the daemon afterwards to run the new version.",
 	RunE: func(cmd *cobra.Command, args []string) error {
