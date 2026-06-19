@@ -319,6 +319,44 @@ func TestGateSubtreeBusyAndPendingFlags(t *testing.T) {
 	}
 }
 
+func TestGateLastAssistantEmpty(t *testing.T) {
+	s := New(100)
+	s.Apply(ev("session.created", `{"info":{"id":"a"}}`))
+	// A completed turn that ended with finish=stop but produced NO text (e.g. an
+	// empty stop / tool-only turn) — finish_reason can't distinguish this, the
+	// empty flag must.
+	s.Apply(ev("message.updated", `{"info":{"id":"m1","sessionID":"a","role":"assistant","time":{"created":1,"completed":2},"finish":"stop"}}`))
+	g := s.Snapshot(nil).Gate["a"]
+	if g.FinishReason != "stop" || !g.LastAssistantCompleted {
+		t.Fatalf("precondition: want completed stop, got %+v", g)
+	}
+	if !g.LastAssistantEmpty {
+		t.Fatal("a completed assistant message with no text part must be last_assistant_empty=true")
+	}
+
+	// Now give it a real text reply → not empty.
+	s.Apply(ev("message.part.updated", `{"part":{"id":"p1","sessionID":"a","messageID":"m1","type":"text","text":"hello there"}}`))
+	if s.Snapshot(nil).Gate["a"].LastAssistantEmpty {
+		t.Fatal("a message with a non-whitespace text part must be last_assistant_empty=false")
+	}
+
+	// Whitespace-only text still counts as empty.
+	s.Apply(ev("session.created", `{"info":{"id":"b"}}`))
+	s.Apply(ev("message.updated", `{"info":{"id":"m2","sessionID":"b","role":"assistant","time":{"created":1,"completed":2},"finish":"stop"}}`))
+	s.Apply(ev("message.part.updated", `{"part":{"id":"p2","sessionID":"b","messageID":"m2","type":"text","text":"   \n  "}}`))
+	if !s.Snapshot(nil).Gate["b"].LastAssistantEmpty {
+		t.Fatal("whitespace-only text must be treated as empty")
+	}
+
+	// A tool part (no text) is empty; text discriminates, not finish.
+	s.Apply(ev("session.created", `{"info":{"id":"c"}}`))
+	s.Apply(ev("message.updated", `{"info":{"id":"m3","sessionID":"c","role":"assistant","time":{"created":1,"completed":2},"finish":"tool-calls"}}`))
+	s.Apply(ev("message.part.updated", `{"part":{"id":"p3","sessionID":"c","messageID":"m3","type":"tool","tool":"bash"}}`))
+	if !s.Snapshot(nil).Gate["c"].LastAssistantEmpty {
+		t.Fatal("a tool-only turn (no text) must be last_assistant_empty=true")
+	}
+}
+
 func TestGateHydratedFlag(t *testing.T) {
 	s := New(100)
 	s.Apply(ev("session.created", `{"info":{"id":"a"}}`))

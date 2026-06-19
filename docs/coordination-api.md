@@ -41,6 +41,7 @@ per-session `gate` map (keyed by sessionID):
     "hydrated": true,                        // message state loaded (live OR history); see note
     "last_assistant_completed": true,        // latest assistant turn has time.completed (authoritative iff hydrated)
     "finish_reason": "stop|length|tool-calls", // raw opencode `finish` (authoritative iff hydrated); omitted if none/in-flight
+    "last_assistant_empty": false,           // latest assistant turn has no non-whitespace TEXT content (finish_reason can't tell empty from non-empty)
     "subtree_busy": false,                    // any session in this subtree (incl. self) busy/retry
     "pending_question": false,                // a question awaits a TYPED reply (a plain message won't satisfy it)
     "pending_permission": false,

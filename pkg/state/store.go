@@ -10,6 +10,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"strings"
 	"sync"
 
 	"github.com/vhqtvn/vh-solara/pkg/opencode"
@@ -90,13 +91,19 @@ type GateFacts struct {
 	// last_assistant_completed=false / empty finish_reason — that is "not yet
 	// known", NOT "in-flight". A coordinator should force-hydrate (open) the
 	// session, or trust `activity`, before relying on those fields (§1.7).
-	Hydrated               bool            `json:"hydrated"`
-	LastAssistantCompleted bool            `json:"last_assistant_completed"` // latest assistant turn has time.completed (meaningful iff hydrated)
-	FinishReason           string          `json:"finish_reason,omitempty"`  // raw opencode `finish` of the latest assistant msg (meaningful iff hydrated)
-	SubtreeBusy            bool            `json:"subtree_busy"`             // any session in this subtree (incl. self) is busy/retry
-	PendingQuestion        bool            `json:"pending_question"`         // a question awaits a typed reply (a plain message won't satisfy it)
-	PendingPermission      bool            `json:"pending_permission"`       // a permission awaits a typed reply
-	Tokens                 json.RawMessage `json:"tokens,omitempty"`         // raw token-usage object of the latest assistant turn (meaningful iff hydrated)
+	Hydrated               bool   `json:"hydrated"`
+	LastAssistantCompleted bool   `json:"last_assistant_completed"` // latest assistant turn has time.completed (meaningful iff hydrated)
+	FinishReason           string `json:"finish_reason,omitempty"`  // raw opencode `finish` of the latest assistant msg (meaningful iff hydrated)
+	// LastAssistantEmpty is true when the latest assistant message has no
+	// non-whitespace TEXT content (tool/file parts don't count). finish_reason is
+	// the completion REASON, not a content signal — it's present on every
+	// completed turn (incl. empty ones, e.g. stop with no text), so it can't
+	// discriminate empty from non-empty; this field does. Meaningful iff hydrated.
+	LastAssistantEmpty bool            `json:"last_assistant_empty"`
+	SubtreeBusy        bool            `json:"subtree_busy"`       // any session in this subtree (incl. self) is busy/retry
+	PendingQuestion    bool            `json:"pending_question"`   // a question awaits a typed reply (a plain message won't satisfy it)
+	PendingPermission  bool            `json:"pending_permission"` // a permission awaits a typed reply
+	Tokens             json.RawMessage `json:"tokens,omitempty"`   // raw token-usage object of the latest assistant turn (meaningful iff hydrated)
 }
 
 // MessageWithParts mirrors OpenCode's GET /session/:id/message item shape.
@@ -119,6 +126,7 @@ type sessionEntry struct {
 	lastFinish        string          // raw `finish` of the latest assistant msg ("" if none/in-flight)
 	lastTokens        json.RawMessage // raw `tokens` of the latest assistant msg
 	lastAsstCompleted bool            // the latest assistant msg has time.completed
+	lastAsstEmpty     bool            // the latest assistant msg has no non-whitespace text content
 }
 
 type messageEntry struct {
@@ -764,6 +772,7 @@ func (s *Store) recomputeLastAssistantLocked(sessionID string) {
 	se.lastFinish = ""
 	se.lastTokens = nil
 	se.lastAsstCompleted = false
+	se.lastAsstEmpty = false
 	sm := s.messages[sessionID]
 	if sm == nil {
 		return
@@ -777,8 +786,26 @@ func (s *Store) recomputeLastAssistantLocked(sessionID string) {
 		se.lastFinish = me.finish
 		se.lastTokens = me.tokens
 		se.lastAsstCompleted = me.completed
+		se.lastAsstEmpty = !messageHasText(me)
 		return
 	}
+}
+
+// messageHasText reports whether a message has any non-whitespace text part.
+// Tool/file/reasoning parts don't count — this is "did the assistant produce a
+// text reply", the signal a coordinator needs to tell an empty completed turn
+// (e.g. a stop with no text) from a real reply.
+func messageHasText(me *messageEntry) bool {
+	for _, raw := range me.parts {
+		var p struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		}
+		if json.Unmarshal(raw, &p) == nil && p.Type == "text" && strings.TrimSpace(p.Text) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Store) deleteMessageLocked(sessionID, messageID string) {
@@ -815,6 +842,11 @@ func (s *Store) upsertPartLocked(part json.RawMessage) {
 	}
 	me.parts[env.ID] = part
 	s.emit(KindPartUpsert, part)
+	// A part can finalize the latest assistant turn's text content (and parts may
+	// arrive after the completed message.updated), so refresh the empty/finish
+	// summary. Streaming deltas don't need this — the turn isn't completed yet, and
+	// a part.updated snapshot follows them.
+	s.recomputeLastAssistantLocked(env.SessionID)
 }
 
 // appendPartDeltaLocked applies a streaming text delta to a part (creating a
@@ -877,6 +909,7 @@ func (s *Store) deletePartLocked(sessionID, messageID, partID string) {
 	s.emit(KindPartDelete, rawObj(map[string]interface{}{
 		"sessionID": sessionID, "messageID": messageID, "partID": partID,
 	}))
+	s.recomputeLastAssistantLocked(sessionID)
 }
 
 // Snapshot returns the current view and the head seq. The session tree, todos,
@@ -915,6 +948,7 @@ func (s *Store) Snapshot(messagesFor map[string]bool) Snapshot {
 			// distinguished from in-flight without this.
 			Hydrated:               s.msgLoaded[sid] || s.messages[sid] != nil,
 			LastAssistantCompleted: se.hasAssistant && se.lastAsstCompleted,
+			LastAssistantEmpty:     se.lastAsstEmpty,
 			FinishReason:           se.lastFinish,
 			SubtreeBusy:            subtreeBusy[sid],
 			PendingQuestion:        len(s.questions[sid]) > 0,
