@@ -152,7 +152,7 @@ func (d *Daemon) hostInterceptor(pattern *regexp.Regexp, next http.Handler) http
 
 			log.Printf("[HostInterceptor] Proxying to worker %s (transport closed: %v)",
 				worker.ID, worker.Transport == nil || worker.Transport.IsClosed())
-			d.Proxy.HandleChamberDirect(worker.ID, worker, w, r)
+			d.Proxy.HandleWorkerDirect(worker.ID, worker, w, r)
 			return
 		}
 

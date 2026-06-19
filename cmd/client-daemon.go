@@ -40,7 +40,7 @@ var (
 	daemonControllerSecret string
 	daemonWeb              string
 	daemonChamber          string
-	daemonChamberPrt       int
+	daemonWebPort          int
 	daemonOpenCodeBin      string
 	daemonOpenCodeHost     string
 	daemonOpenCodePasswd   string
@@ -88,7 +88,7 @@ var clientDaemonCmd = &cobra.Command{
 			workerName = fmt.Sprintf("Local Devbox (%s)", cwd)
 		}
 
-		chamberPort := daemonChamberPrt
+		webPort := daemonWebPort
 
 		// Track the opencode web process (opencode web mode) so we can clean it up on shutdown.
 		var opencodeWebCmd *exec.Cmd
@@ -103,22 +103,22 @@ var clientDaemonCmd = &cobra.Command{
 		case WebOpenCode:
 			// OpenCode ships its own web UI via `opencode web`.
 			// Auto-assign a free port if none was provided.
-			if chamberPort == 0 {
-				chamberPort = freePort()
+			if webPort == 0 {
+				webPort = freePort()
 			}
-			log.Printf("Web mode: opencode web (bin=%s, port=%d, host=%s)", daemonOpenCodeBin, chamberPort, daemonOpenCodeHost)
+			log.Printf("Web mode: opencode web (bin=%s, port=%d, host=%s)", daemonOpenCodeBin, webPort, daemonOpenCodeHost)
 
-			c, err := startOpenCodeWeb(daemonOpenCodeBin, daemonOpenCodeHost, chamberPort, daemonOpenCodePasswd, cwd)
+			c, err := startOpenCodeWeb(daemonOpenCodeBin, daemonOpenCodeHost, webPort, daemonOpenCodePasswd, cwd)
 			if err != nil {
 				log.Fatalf("Failed to start opencode web: %v", err)
 			}
 			opencodeWebCmd = c
-			log.Printf("Started opencode web on port %d (pid=%d)", chamberPort, c.Process.Pid)
+			log.Printf("Started opencode web on port %d (pid=%d)", webPort, c.Process.Pid)
 
-			if err := waitForPort(chamberPort, 30*time.Second); err != nil {
-				log.Fatalf("opencode web failed to listen on port %d: %v", chamberPort, err)
+			if err := waitForPort(webPort, 30*time.Second); err != nil {
+				log.Fatalf("opencode web failed to listen on port %d: %v", webPort, err)
 			}
-			log.Printf("Verified opencode web is actively listening on port %d.", chamberPort)
+			log.Printf("Verified opencode web is actively listening on port %d.", webPort)
 
 		case WebOpenChamber:
 			if daemonChamber != "" {
@@ -126,33 +126,33 @@ var clientDaemonCmd = &cobra.Command{
 				port, err := getRunningOpenChamberPort(daemonChamber)
 				if err == nil && port > 0 {
 					log.Printf("Found existing OpenChamber running on port %d", port)
-					chamberPort = port
+					webPort = port
 				} else {
 					log.Printf("No existing OpenChamber found (%v). Starting a new one...", err)
-					if chamberPort == 0 {
-						chamberPort = freePort()
+					if webPort == 0 {
+						webPort = freePort()
 					}
 
-					err := startOpenChamber(daemonChamber, chamberPort, cwd)
+					err := startOpenChamber(daemonChamber, webPort, cwd)
 					if err != nil {
 						log.Fatalf("Failed to start OpenChamber: %v", err)
 					}
-					log.Printf("Started detached OpenChamber on port %d", chamberPort)
+					log.Printf("Started detached OpenChamber on port %d", webPort)
 				}
 
 				// Probe the port to ensure it's alive and listening
-				if err := waitForPort(chamberPort, 15*time.Second); err != nil {
-					log.Fatalf("OpenChamber failed to listen on port %d: %v", chamberPort, err)
+				if err := waitForPort(webPort, 15*time.Second); err != nil {
+					log.Fatalf("OpenChamber failed to listen on port %d: %v", webPort, err)
 				}
-				log.Printf("Verified OpenChamber is actively listening on port %d.", chamberPort)
+				log.Printf("Verified OpenChamber is actively listening on port %d.", webPort)
 			}
 
 		case WebVH:
 			// vh-solara's own UI: run `opencode serve` headless on an internal
 			// loopback port, aggregate its state, and serve our web UI on the
 			// controller-proxied port.
-			if chamberPort == 0 {
-				chamberPort = freePort()
+			if webPort == 0 {
+				webPort = freePort()
 			}
 			// OpenCode-external (attach, don't spawn) is enabled purely by URL.
 			external := daemonOpenCodeURL != ""
@@ -163,7 +163,7 @@ var clientDaemonCmd = &cobra.Command{
 				// External-managed: attach to an already-running OpenCode (e.g. its
 				// own systemd service) instead of spawning one.
 				opencodeURL = strings.TrimRight(daemonOpenCodeURL, "/")
-				log.Printf("Web mode: vh (external OpenCode at %s, web port=%d)", opencodeURL, chamberPort)
+				log.Printf("Web mode: vh (external OpenCode at %s, web port=%d)", opencodeURL, webPort)
 				if err := waitForURL(opencodeURL+"/session", 30*time.Second); err != nil {
 					log.Fatalf("external OpenCode not reachable at %s: %v", opencodeURL, err)
 				}
@@ -176,7 +176,7 @@ var clientDaemonCmd = &cobra.Command{
 				if st, ok := readOCState(); ok && ocInstanceOurs(st) {
 					opencodePort = st.Port
 					opencodeURL = fmt.Sprintf("http://127.0.0.1:%d", st.Port)
-					log.Printf("Web mode: vh (reconnected to our detached OpenCode pid=%d port=%d, web port=%d)", st.PID, st.Port, chamberPort)
+					log.Printf("Web mode: vh (reconnected to our detached OpenCode pid=%d port=%d, web port=%d)", st.PID, st.Port, webPort)
 				} else {
 					opencodePort = freePort()
 					if st, ok := readOCState(); ok && portFree(st.Port) {
@@ -192,12 +192,12 @@ var clientDaemonCmd = &cobra.Command{
 					}
 					writeOCState(ocState{PID: c.Process.Pid, Port: opencodePort})
 					opencodeURL = fmt.Sprintf("http://127.0.0.1:%d", opencodePort)
-					log.Printf("Web mode: vh (spawned detached OpenCode pid=%d port=%d, web port=%d)", c.Process.Pid, opencodePort, chamberPort)
+					log.Printf("Web mode: vh (spawned detached OpenCode pid=%d port=%d, web port=%d)", c.Process.Pid, opencodePort, webPort)
 				}
 
 			default:
 				opencodePort = freePort()
-				log.Printf("Web mode: vh (opencode serve internal port=%d, web port=%d)", opencodePort, chamberPort)
+				log.Printf("Web mode: vh (opencode serve internal port=%d, web port=%d)", opencodePort, webPort)
 				c, err := startOpenCodeServe(daemonOpenCodeBin, opencodePort, cwd)
 				if err != nil {
 					log.Fatalf("Failed to start opencode serve: %v", err)
@@ -349,7 +349,7 @@ var clientDaemonCmd = &cobra.Command{
 			vhCtx, vhCancel = context.WithCancel(context.Background())
 			go agg.Run(vhCtx)
 			vhHTTP = &http.Server{
-				Addr:    fmt.Sprintf("127.0.0.1:%d", chamberPort),
+				Addr:    fmt.Sprintf("127.0.0.1:%d", webPort),
 				Handler: srv.Handler(),
 				// Slowloris guard. No WriteTimeout/ReadTimeout: /vh/stream and the
 				// /oc event passthrough are long-lived SSE responses that a write
@@ -362,16 +362,16 @@ var clientDaemonCmd = &cobra.Command{
 					log.Fatalf("vh web server failed: %v", err)
 				}
 			}()
-			if err := waitForPort(chamberPort, 10*time.Second); err != nil {
-				log.Fatalf("vh web server failed to listen on port %d: %v", chamberPort, err)
+			if err := waitForPort(webPort, 10*time.Second); err != nil {
+				log.Fatalf("vh web server failed to listen on port %d: %v", webPort, err)
 			}
-			log.Printf("Verified vh web server is listening on port %d.", chamberPort)
+			log.Printf("Verified vh web server is listening on port %d.", webPort)
 
 		default:
 			log.Fatalf("Invalid --web value %q (expected %q, %q, or %q)", daemonWeb, WebOpenCode, WebOpenChamber, WebVH)
 		}
 
-		proxy := agent.NewProxy(chamberPort)
+		proxy := agent.NewProxy(webPort)
 		daemon := agent.NewDaemon(daemonController, workerID, workerName, "0.1.0", headerMap, proxy)
 
 		daemon.KillFunc = func() {
@@ -412,7 +412,7 @@ var clientDaemonCmd = &cobra.Command{
 					return true // No script to verify, assume alive to avoid false positives
 				}
 				port, err := getRunningOpenChamberPort(daemonChamber)
-				if err != nil || port != chamberPort {
+				if err != nil || port != webPort {
 					return false // Definitive proof it's dead
 				}
 				return true
@@ -428,7 +428,7 @@ var clientDaemonCmd = &cobra.Command{
 
 		go daemon.Start()
 
-		log.Printf("Daemon Proxy started for WorkerID %s (Web: %s, Port: %d)", workerID, daemonWeb, chamberPort)
+		log.Printf("Daemon Proxy started for WorkerID %s (Web: %s, Port: %d)", workerID, daemonWeb, webPort)
 
 		// Wait for shutdown signal
 		sigCh := make(chan os.Signal, 1)
@@ -468,8 +468,8 @@ func getRunningOpenChamberPort(chamberScript string) (int, error) {
 	return 0, fmt.Errorf("no running openchamber port pattern matched")
 }
 
-func startOpenChamber(chamberScript string, chamberPort int, workspace string) error {
-	scriptWithArgs := fmt.Sprintf("%s --port %d", chamberScript, chamberPort)
+func startOpenChamber(chamberScript string, webPort int, workspace string) error {
+	scriptWithArgs := fmt.Sprintf("%s --port %d", chamberScript, webPort)
 	cmd := exec.Command("bash", "-c", scriptWithArgs)
 	if workspace != "" {
 		cmd.Dir = workspace
@@ -582,7 +582,11 @@ func init() {
 	// Web UI selector
 	clientDaemonCmd.Flags().StringVar(&daemonWeb, "web", WebOpenCode, "Web UI backend: vh (built-in stateful UI), opencode (built-in `opencode web`), or openchamber")
 	clientDaemonCmd.Flags().StringVar(&daemonChamber, "chamber", "", "(openchamber only) Bash script to start OpenChamber")
-	clientDaemonCmd.Flags().IntVar(&daemonChamberPrt, "chamber-port", 0, "Port for the web UI to listen on (0 to auto-assign)")
+	clientDaemonCmd.Flags().IntVar(&daemonWebPort, "web-port", 0, "Port for the worker's web UI to listen on (0 to auto-assign). Pin it if a local 'mcp --local' needs a stable base-url.")
+	// Deprecated alias for --web-port (legacy name from the OpenChamber era; this
+	// port is the generic web-UI port for every --web mode, not OpenChamber-only).
+	clientDaemonCmd.Flags().IntVar(&daemonWebPort, "chamber-port", 0, "Deprecated: use --web-port")
+	_ = clientDaemonCmd.Flags().MarkDeprecated("chamber-port", "use --web-port")
 
 	// opencode web mode options
 	clientDaemonCmd.Flags().StringVar(&daemonOpenCodeBin, "opencode-bin", "opencode", "(opencode only) Path to the opencode binary")

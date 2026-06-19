@@ -116,7 +116,7 @@ func (d *Daemon) proxyToVH(w http.ResponseWriter, r *http.Request, worker *Worke
 	if method != http.MethodGet {
 		r.Header.Set("X-VH-CSRF", "1") // the worker /vh CSRF guard requires a custom header
 	}
-	// Force non-keep-alive on the proxied exchange. HandleChamberDirect HIJACKS the
+	// Force non-keep-alive on the proxied exchange. HandleWorkerDirect HIJACKS the
 	// inbound connection and pipes it raw to the worker; if the worker answers with
 	// keep-alive (Content-Length) the HTTP client reads the body and returns the
 	// still-hijacked connection to its pool, and a subsequent request is smuggled
@@ -126,7 +126,7 @@ func (d *Daemon) proxyToVH(w http.ResponseWriter, r *http.Request, worker *Worke
 	// the host-based browser proxy path is untouched.)
 	r.Header.Set("Connection", "close")
 	r.Close = true
-	d.Proxy.HandleChamberDirect(worker.ID, worker, w, r)
+	d.Proxy.HandleWorkerDirect(worker.ID, worker, w, r)
 }
 
 // dirQuery carries a ?dir= project selector through to the worker if present.

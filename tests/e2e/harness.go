@@ -64,7 +64,7 @@ func StartCluster() (*Cluster, error) {
 	}
 	c.workerSrv = httptest.NewServer(wsrv.Handler())
 	c.WorkerVHURL = c.workerSrv.URL
-	chamberPort, err := portOf(c.workerSrv.URL)
+	webPort, err := portOf(c.workerSrv.URL)
 	if err != nil {
 		return nil, err
 	}
@@ -88,7 +88,7 @@ func StartCluster() (*Cluster, error) {
 
 	// 4. Worker agent: dial the controller's tunnel endpoint, proxy to the worker
 	//    vh server's port.
-	proxy := agent.NewProxy(chamberPort)
+	proxy := agent.NewProxy(webPort)
 	ag := agent.NewDaemon("ws://"+daemonAddr+"/vh-solara/ws", c.WorkerID, "worker", "test", nil, proxy)
 	go ag.Start()
 

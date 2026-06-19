@@ -209,10 +209,10 @@ func (d *Daemon) handleStream(stream *tunnel.Stream) {
 func (d *Daemon) handleRawProxy(stream *tunnel.Stream, req *tunnel.RawProxyMessage) {
 	port := req.Port
 	if port == 0 {
-		port = d.Proxy.ChamberPort
+		port = d.Proxy.WebPort
 	}
 
-	// log.Printf("[AgentRawProxy] Requested port: %d (ChamberPort: %d)", req.Port, d.Proxy.ChamberPort)
+	// log.Printf("[AgentRawProxy] Requested port: %d (WebPort: %d)", req.Port, d.Proxy.WebPort)
 
 	if port == 0 {
 		log.Printf("[AgentRawProxy] No port configured, rejecting")
@@ -239,7 +239,7 @@ func (d *Daemon) handleRawProxy(stream *tunnel.Stream, req *tunnel.RawProxyMessa
 		if doCheck {
 			log.Printf("[AgentRawProxy] Failed to connect: %v", err)
 			if d.HealthCheck != nil && !d.HealthCheck() {
-				log.Printf("[AgentRawProxy] HealthCheck failed. Target OpenChamber is permanently offline. Exiting daemon.")
+				log.Printf("[AgentRawProxy] HealthCheck failed. Target web server is permanently offline. Exiting daemon.")
 				d.cancel()
 				if d.KillFunc != nil {
 					d.KillFunc()
