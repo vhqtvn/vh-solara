@@ -82,16 +82,18 @@ function splitMermaid(text: string): { type: "md" | "mermaid"; content: string }
 
 // One prose segment: daemon-rendered, syntax-highlighted HTML with copy buttons
 // and clickable file paths.
-function MarkdownHtml(props: { text: string }) {
+function MarkdownHtml(props: { text: string; live?: boolean }) {
   const [html] = createResource(
     () => props.text,
     (t) => renderMarkdown(t),
   );
   // Instant client-rendered fallback (same renderer as the live stream) so a
-  // settled block shows formatted prose immediately instead of flashing raw text
-  // during the /vh/render round-trip; the server HTML (chroma highlighting +
-  // sanitization) silently upgrades it once it arrives.
-  const fallback = createMemo(() => renderStreamMd(props.text));
+  // block that just finished streaming shows formatted prose immediately instead
+  // of flashing raw during the /vh/render round-trip; the server HTML (chroma +
+  // sanitization) silently upgrades it. ONLY for `live` blocks (the message that
+  // streamed in front of the user) — bulk-loaded history keeps the zero-cost raw
+  // fallback so opening a long transcript doesn't run a marked.parse per block.
+  const liveFallback = createMemo(() => (props.live ? renderStreamMd(props.text) : ""));
   let ref: HTMLDivElement | undefined;
   createEffect(() => {
     if (html())
@@ -106,7 +108,10 @@ function MarkdownHtml(props: { text: string }) {
     if (t?.dataset.path) openFile(t.dataset.path, t.dataset.line ? Number(t.dataset.line) : undefined);
   };
   return (
-    <Show when={html()} fallback={<div class="md" innerHTML={fallback()} />}>
+    <Show
+      when={html()}
+      fallback={props.live ? <div class="md" innerHTML={liveFallback()} /> : <div class="md-raw">{props.text}</div>}
+    >
       <div class="md" ref={ref} innerHTML={html()!} onClick={onClick} />
     </Show>
   );
@@ -151,6 +156,10 @@ function Mermaid(props: { src: string }) {
 // the whole text per token is O(n²)) so the in-flight reply is formatted, not
 // raw. The settled view re-renders it server-side (highlighting + mermaid).
 function Markdown(props: { text: string; settled: boolean }) {
+  // Captured at creation: true only for a block that started while streaming
+  // (the message the user is watching). History blocks are created already
+  // settled → false → cheap raw fallback (no per-block client parse on load).
+  const live = !props.settled;
   const [streamHtml, setStreamHtml] = createSignal("");
   let timer: number | undefined;
   createEffect(() => {
@@ -172,7 +181,7 @@ function Markdown(props: { text: string; settled: boolean }) {
   return (
     <Show when={props.settled} fallback={streamingView()}>
       <For each={splitMermaid(props.text)}>
-        {(seg) => (seg.type === "mermaid" ? <Mermaid src={seg.content} /> : <MarkdownHtml text={seg.content} />)}
+        {(seg) => (seg.type === "mermaid" ? <Mermaid src={seg.content} /> : <MarkdownHtml text={seg.content} live={live} />)}
       </For>
     </Show>
   );
