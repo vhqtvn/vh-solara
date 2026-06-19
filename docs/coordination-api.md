@@ -11,9 +11,12 @@ handoff thread; this doc tracks the implemented surface and decisions.
 > **Worker prerequisite:** the coordination API lives on vh-solara's own web
 > server, which a worker runs only in `--web vh` mode (`cmd/client-daemon.go`).
 > The other modes (`opencode`, `openchamber`) serve a different UI on the proxied
-> port and expose no `/vh/*`. No OpenChamber dependency anywhere in this stack —
-> the `ChamberPort`/`HandleChamberDirect` names in the tunnel are legacy and
-> mode-agnostic ("the worker's proxied web port"); in `vh` mode that's vh-solara.
+> port and expose no `/vh/*`. No OpenChamber dependency anywhere in this stack.
+> The worker's web port is `--web-port` (auto-assigned if unset; pin it for a
+> stable local-MCP base-url). The legacy `--chamber-port` flag and the
+> OpenChamber-era `ChamberPort`/`HandleChamberDirect` names were renamed to
+> `--web-port` / `WebPort` / `HandleWorkerDirect` (a deprecated `--chamber-port`
+> alias remains); only the genuine `--web openchamber` mode keeps its name.
 
 ## Status
 
@@ -150,7 +153,7 @@ launches as a `type: local` MCP server. **Two modes:**
   `--web vh` server's `/vh/*` directly — loopback, no controller, no bearer, no
   tunnel. This is the common case (an agent driving its *own* sessions) and works
   identically in both deployments: `local-server` (vh at e.g. `:7700`) and
-  `client-daemon --web vh` (the worker's local chamber port). It is **immune to
+  `client-daemon --web vh` (the worker's local `--web-port`). It is **immune to
   the tunnel-proxy smuggling path** — there is no hijacking proxy in front of a
   direct `/vh/*` server. Default base-url `http://127.0.0.1:7700`.
 - **controller (default):** HTTP client of the coordination API (`--base-url` /
