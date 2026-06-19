@@ -6,7 +6,7 @@
 // surfaces the same raw facts/verbs as the HTTP surface).
 //
 // Events stay on the SSE stream (/api/workers/{id}/events); MCP is
-// request/response, so the reflex loop owns the stream — the agent uses these
+// request/response, so the event-stream subscriber owns the stream — the agent uses these
 // tools for on-demand reads and actions.
 package mcp
 
