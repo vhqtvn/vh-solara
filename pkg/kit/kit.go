@@ -3,10 +3,10 @@
 // directory of templates + a manifest declaring parameters and layers. The
 // two-layer model the coordination kit uses:
 //
-//   - engine layer  (type "engine", e.g. controlplane-core):  vh-managed; an
-//     update overwrites these files (unless a file carries a vh:keep marker).
-//   - overlay layer (type "overlay", e.g. controlplane-policy): consumer-owned;
-//     an install/update NEVER clobbers an existing overlay file.
+//   - engine layer  (type "engine", e.g. <kit>-core):  vh-managed; an update
+//     overwrites these files (unless a file carries a vh:keep marker).
+//   - overlay layer (type "overlay", e.g. <kit>-policy): consumer-owned; an
+//     install/update NEVER clobbers an existing overlay file.
 //
 // Parameters are injected into template files via {{vh:name}} placeholders. A
 // lockfile (.vh-kit.json) in the repo records what was installed for idempotent

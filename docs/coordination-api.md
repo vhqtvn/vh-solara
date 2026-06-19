@@ -1,6 +1,6 @@
 # vh-solara coordination API (workstream V)
 
-Generic, policy-free mechanism for an external coordinator (e.g. controlplane) to
+Generic, policy-free mechanism for an external coordinator to
 drive opencode sessions across machines. vh-solara reports raw opencode facts and
 exposes read/write/subscribe verbs; **all "continue"/disposition/serialization
 policy lives in the consumer**, never here.
@@ -27,7 +27,7 @@ handoff thread; this doc tracks the implemented surface and decisions.
 | V3 / A3 | `/api/workers/{id}/*` cross-worker API through registry+tunnel; epoch+seq; bearer auth | ✅ done |
 | V4 / A4 | MCP facade over the read+write verbs | ✅ done |
 | V5 / B  | `Feature`/`Services` module mechanism; coordination verbs as the first module | ✅ done |
-| V6 / C  | two-layer kit provisioning (`controlplane-core` + `controlplane-policy`) | ✅ done |
+| V6 / C  | two-layer kit provisioning (engine + overlay layers) | ✅ done |
 
 ## V1 — gate facts (worker `/vh/*`)
 
@@ -172,7 +172,7 @@ ignored and verbs are body-addressed to `/vh/*` with the CSRF header):
 - Successful results attach `_meta.{epoch,seq}` from the worker's response
   headers, so an agent can track the cursor.
 - Events stay on SSE (`/api/workers/{id}/events`); MCP is request/response, so
-  the reflex loop owns the stream.
+  the event-stream subscriber owns the stream.
 
 Example opencode `opencode.json`:
 ```jsonc
@@ -211,7 +211,7 @@ is what an out-of-package module needs.
 ## V6 — kit provisioning (`vh-solara kit`)
 
 vh-solara provisions a versioned template kit into a repo; it ships **zero kit
-content** (kits — e.g. the controlplane kit — are authored by the consumer).
+content** (kits are authored by the consumer).
 
 - `vh-solara kit install <kit-dir> --repo <path> --param k=v ...`
 - `vh-solara kit status --repo <path>`
@@ -220,8 +220,8 @@ A kit = a directory with `manifest.json` + per-layer source dirs. Two layer type
 
 | type | semantics on (re)install |
 |------|---------------------------|
-| `engine` (e.g. `controlplane-core`) | vh-managed: **overwritten** on update, unless the existing file carries a `vh:keep` marker |
-| `overlay` (e.g. `controlplane-policy`) | consumer-owned: **never clobbered** — an existing overlay file is preserved |
+| `engine` (e.g. `<kit>-core`) | vh-managed: **overwritten** on update, unless the existing file carries a `vh:keep` marker |
+| `overlay` (e.g. `<kit>-policy`) | consumer-owned: **never clobbered** — an existing overlay file is preserved |
 
 - Parameters are declared in the manifest and injected into template files via
   `{{vh:name}}` placeholders. Required params are enforced; an undeclared param or
@@ -233,15 +233,15 @@ A kit = a directory with `manifest.json` + per-layer source dirs. Two layer type
 Manifest:
 ```jsonc
 {
-  "name": "controlplane", "version": "1.0.0",
+  "name": "example-kit", "version": "1.0.0",
   "parameters": [
     {"name": "controller_url", "required": true},
     {"name": "worker_id", "default": "w1"},
     {"name": "api_token", "secret": true}
   ],
   "layers": [
-    {"name": "controlplane-core",   "type": "engine",  "source": "core"},
-    {"name": "controlplane-policy", "type": "overlay", "source": "policy"}
+    {"name": "engine-core",   "type": "engine",  "source": "core"},
+    {"name": "engine-policy", "type": "overlay", "source": "policy"}
   ]
 }
 ```
