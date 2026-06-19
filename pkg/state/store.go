@@ -786,23 +786,32 @@ func (s *Store) recomputeLastAssistantLocked(sessionID string) {
 		se.lastFinish = me.finish
 		se.lastTokens = me.tokens
 		se.lastAsstCompleted = me.completed
-		se.lastAsstEmpty = !messageHasText(me)
+		se.lastAsstEmpty = !messageHasContent(me)
 		return
 	}
 }
 
-// messageHasText reports whether a message has any non-whitespace text part.
-// Tool/file/reasoning parts don't count — this is "did the assistant produce a
-// text reply", the signal a coordinator needs to tell an empty completed turn
-// (e.g. a stop with no text) from a real reply.
-func messageHasText(me *messageEntry) bool {
+// messageHasContent reports whether an assistant message did anything: produced a
+// non-whitespace TEXT reply, OR called a tool, OR emitted a file. A turn with any
+// of those is NOT empty. Only "envelope" parts (reasoning, step markers, etc.)
+// with no text/tool/file → empty (the GLM empty-stop case). A tool-only turn is
+// the agent WORKING, so it counts as non-empty (don't auto-continue it).
+func messageHasContent(me *messageEntry) bool {
 	for _, raw := range me.parts {
 		var p struct {
 			Type string `json:"type"`
 			Text string `json:"text"`
 		}
-		if json.Unmarshal(raw, &p) == nil && p.Type == "text" && strings.TrimSpace(p.Text) != "" {
+		if json.Unmarshal(raw, &p) != nil {
+			continue
+		}
+		switch p.Type {
+		case "tool", "file":
 			return true
+		case "text":
+			if strings.TrimSpace(p.Text) != "" {
+				return true
+			}
 		}
 	}
 	return false
