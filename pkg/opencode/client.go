@@ -161,6 +161,23 @@ func (c *Client) SetArchived(ctx context.Context, id string, ts *int64) error {
 	return nil
 }
 
+// Error is a non-2xx response from a write verb. It carries the upstream status
+// so a handler can propagate a meaningful client error (e.g. a stale request-id)
+// instead of masking everything as a 502.
+type Error struct {
+	Status int
+	Op     string
+	Body   string
+}
+
+func (e *Error) Error() string {
+	return fmt.Sprintf("%s: status %d: %s", e.Op, e.Status, e.Body)
+}
+
+func statusErr(op string, st int, b []byte) *Error {
+	return &Error{Status: st, Op: op, Body: strings.TrimSpace(string(b))}
+}
+
 // postRaw POSTs a JSON body to path and returns the status code + response body.
 // Schema-light: the body and response are raw JSON, so write verbs stay resilient
 // to OpenCode schema drift (the same philosophy as the read client). A nil body
@@ -196,7 +213,7 @@ func (c *Client) CreateSession(ctx context.Context, body json.RawMessage) (json.
 		return nil, err
 	}
 	if st < 200 || st >= 300 {
-		return nil, fmt.Errorf("POST /session: status %d: %s", st, strings.TrimSpace(string(b)))
+		return nil, statusErr("POST /session", st, b)
 	}
 	return b, nil
 }
@@ -210,7 +227,7 @@ func (c *Client) Prompt(ctx context.Context, sessionID string, body json.RawMess
 		return nil, err
 	}
 	if st < 200 || st >= 300 {
-		return nil, fmt.Errorf("POST /session/%s/prompt_async: status %d: %s", sessionID, st, strings.TrimSpace(string(b)))
+		return nil, statusErr("POST /session/"+sessionID+"/prompt_async", st, b)
 	}
 	return b, nil
 }
@@ -223,7 +240,7 @@ func (c *Client) Abort(ctx context.Context, sessionID string) error {
 		return err
 	}
 	if st < 200 || st >= 300 {
-		return fmt.Errorf("POST /session/%s/abort: status %d: %s", sessionID, st, strings.TrimSpace(string(b)))
+		return statusErr("POST /session/"+sessionID+"/abort", st, b)
 	}
 	return nil
 }
@@ -236,35 +253,38 @@ func (c *Client) AnswerQuestion(ctx context.Context, questionID string, body jso
 		return err
 	}
 	if st < 200 || st >= 300 {
-		return fmt.Errorf("POST /question/%s/reply: status %d: %s", questionID, st, strings.TrimSpace(string(b)))
+		return statusErr("POST /question/"+questionID+"/reply", st, b)
 	}
 	return nil
 }
 
 // ReplyPermission replies to a pending permission (POST /permission/:id/reply
-// with {"reply": "once"|"always"|"reject"}). On a non-2xx it retries OpenCode's
-// legacy session-scoped route ({"response": ...}) when a sessionID is given, for
-// older servers — mirroring the frontend's dual-route handling.
+// with {"reply": "once"|"always"|"reject"}). It falls back to OpenCode's legacy
+// session-scoped route ({"response": ...}) ONLY when the canonical route looks
+// absent (transport error, or 404/405) and a sessionID is given — a meaningful
+// 4xx from the canonical route (e.g. 400 bad reply, 404-as-already-cleared at the
+// resource) is returned as-is, not swallowed by a retry.
 func (c *Client) ReplyPermission(ctx context.Context, permissionID, sessionID, reply string) error {
 	body, _ := json.Marshal(map[string]string{"reply": reply})
 	st, b, err := c.postRaw(ctx, "/permission/"+permissionID+"/reply", body)
 	if err == nil && st >= 200 && st < 300 {
 		return nil
 	}
-	if sessionID == "" {
+	routeMissing := err != nil || st == 404 || st == 405
+	if sessionID == "" || !routeMissing {
 		if err != nil {
 			return err
 		}
-		return fmt.Errorf("POST /permission/%s/reply: status %d: %s", permissionID, st, strings.TrimSpace(string(b)))
+		return statusErr("POST /permission/"+permissionID+"/reply", st, b)
 	}
-	// Legacy fallback.
+	// Legacy fallback (older server without the canonical route).
 	legacy, _ := json.Marshal(map[string]string{"response": reply})
 	st2, b2, err2 := c.postRaw(ctx, "/session/"+sessionID+"/permissions/"+permissionID, legacy)
 	if err2 != nil {
 		return err2
 	}
 	if st2 < 200 || st2 >= 300 {
-		return fmt.Errorf("permission reply failed (canonical %d, legacy %d): %s", st, st2, strings.TrimSpace(string(b2)))
+		return statusErr("POST /session/"+sessionID+"/permissions/"+permissionID, st2, b2)
 	}
 	return nil
 }

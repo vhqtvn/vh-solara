@@ -2,9 +2,30 @@ package web
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
+
+	"github.com/vhqtvn/vh-solara/pkg/opencode"
 )
+
+// upstreamStatus maps an opencode write error to the verb's HTTP status: a 4xx
+// from opencode is propagated (so a stale request-id / bad arg surfaces as a
+// client error, not an opaque 502); transport or 5xx → 502. With goneOn404, a
+// 404 (the request/resource is no longer pending) becomes 410 Gone — the
+// request-id CAS semantics for answer-question / reply-permission (§5).
+func upstreamStatus(err error, goneOn404 bool) int {
+	var oe *opencode.Error
+	if errors.As(err, &oe) {
+		if goneOn404 && oe.Status == http.StatusNotFound {
+			return http.StatusGone
+		}
+		if oe.Status >= 400 && oe.Status < 500 {
+			return oe.Status
+		}
+	}
+	return http.StatusBadGateway
+}
 
 // coordinationFeature is the first Feature module (B dogfood): the typed,
 // daemon-aware write verbs (A1) — send / spawn / abort / answer-question /
@@ -105,7 +126,7 @@ func (h coordHandlers) send(w http.ResponseWriter, r *http.Request) {
 	h.svc.WithIdempotency(w, body.IdempotencyKey, func() (int, []byte) {
 		resp, err := agg.Client().Prompt(r.Context(), body.SessionID, jsonBytes(ocBody))
 		if err != nil {
-			return http.StatusBadGateway, errResp(err.Error())
+			return upstreamStatus(err, false), errResp(err.Error())
 		}
 		return http.StatusOK, jsonBytes(map[string]any{"ok": true, "sessionID": body.SessionID, "response": json.RawMessage(orNull(resp))})
 	})
@@ -143,7 +164,7 @@ func (h coordHandlers) spawn(w http.ResponseWriter, r *http.Request) {
 		}
 		sessRaw, err := agg.Client().CreateSession(r.Context(), jsonBytes(create))
 		if err != nil {
-			return http.StatusBadGateway, errResp(err.Error())
+			return upstreamStatus(err, false), errResp(err.Error())
 		}
 		var sess struct {
 			ID string `json:"id"`
@@ -166,7 +187,7 @@ func (h coordHandlers) spawn(w http.ResponseWriter, r *http.Request) {
 				ocBody["model"] = body.Model
 			}
 			if _, err := agg.Client().Prompt(r.Context(), sess.ID, jsonBytes(ocBody)); err != nil {
-				return http.StatusBadGateway, jsonBytes(map[string]any{"ok": false, "sessionID": sess.ID, "error": "session created but prompt failed: " + err.Error()})
+				return upstreamStatus(err, false), jsonBytes(map[string]any{"ok": false, "sessionID": sess.ID, "error": "session created but prompt failed: " + err.Error()})
 			}
 		}
 		return http.StatusOK, jsonBytes(map[string]any{"ok": true, "sessionID": sess.ID})
@@ -195,7 +216,7 @@ func (h coordHandlers) abort(w http.ResponseWriter, r *http.Request) {
 	agg := h.svc.Agg(h.svc.ReqDir(r))
 	h.svc.WithIdempotency(w, body.IdempotencyKey, func() (int, []byte) {
 		if err := agg.Client().Abort(r.Context(), body.SessionID); err != nil {
-			return http.StatusBadGateway, errResp(err.Error())
+			return upstreamStatus(err, false), errResp(err.Error())
 		}
 		return http.StatusOK, jsonBytes(map[string]any{"ok": true})
 	})
@@ -225,7 +246,7 @@ func (h coordHandlers) answerQuestion(w http.ResponseWriter, r *http.Request) {
 	h.svc.WithIdempotency(w, body.IdempotencyKey, func() (int, []byte) {
 		ocBody := jsonBytes(map[string]any{"answers": body.Answers})
 		if err := agg.Client().AnswerQuestion(r.Context(), body.QuestionID, ocBody); err != nil {
-			return http.StatusBadGateway, errResp(err.Error())
+			return upstreamStatus(err, true), errResp(err.Error())
 		}
 		return http.StatusOK, jsonBytes(map[string]any{"ok": true})
 	})
@@ -260,7 +281,7 @@ func (h coordHandlers) replyPermission(w http.ResponseWriter, r *http.Request) {
 	agg := h.svc.Agg(h.svc.ReqDir(r))
 	h.svc.WithIdempotency(w, body.IdempotencyKey, func() (int, []byte) {
 		if err := agg.Client().ReplyPermission(r.Context(), body.PermissionID, body.SessionID, body.Reply); err != nil {
-			return http.StatusBadGateway, errResp(err.Error())
+			return upstreamStatus(err, true), errResp(err.Error())
 		}
 		return http.StatusOK, jsonBytes(map[string]any{"ok": true})
 	})

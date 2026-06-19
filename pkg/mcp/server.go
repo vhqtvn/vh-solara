@@ -177,19 +177,21 @@ func toolDefs() []map[string]any {
 		{"name": "spawn_session", "description": "Create a session and optionally send a first prompt. Returns the new session id.",
 			"inputSchema": objSchema(map[string]any{
 				"worker": worker, "prompt": strProp("optional first prompt"), "title": strProp("optional title"),
-				"parent_id": strProp("optional parent session id"), "agent": strProp("optional agent"), "dir": dir,
+				"parent_id": strProp("optional parent session id"), "agent": strProp("optional agent"),
+				"idempotency_key": strProp("optional dedup key"), "dir": dir,
 			})},
 		{"name": "abort_session", "description": "Abort a session's in-flight turn. The resulting idle is asynchronous — wait for it before sending again.",
-			"inputSchema": objSchema(map[string]any{"worker": worker, "session_id": strProp("session id"), "dir": dir}, "session_id")},
+			"inputSchema": objSchema(map[string]any{"worker": worker, "session_id": strProp("session id"), "idempotency_key": strProp("optional dedup key"), "dir": dir}, "session_id")},
 		{"name": "answer_question", "description": "Reply to a pending question. answers is OpenCode's [[...]] shape.",
 			"inputSchema": objSchema(map[string]any{
 				"worker": worker, "session_id": strProp("session id"), "question_id": strProp("question id"),
-				"answers": map[string]any{"type": "array", "description": "answers per question, e.g. [[\"yes\"]]"}, "dir": dir,
+				"answers":         map[string]any{"type": "array", "description": "answers per question, e.g. [[\"yes\"]]"},
+				"idempotency_key": strProp("optional dedup key"), "dir": dir,
 			}, "session_id", "question_id", "answers")},
 		{"name": "reply_permission", "description": "Reply to a pending permission: once|always|reject.",
 			"inputSchema": objSchema(map[string]any{
 				"worker": worker, "session_id": strProp("session id"), "permission_id": strProp("permission id"),
-				"reply": strProp("once|always|reject"), "dir": dir,
+				"reply": strProp("once|always|reject"), "idempotency_key": strProp("optional dedup key"), "dir": dir,
 			}, "session_id", "permission_id", "reply")},
 		{"name": "archive_session", "description": "Archive a session (and its subtree). Archive only a confirmed-done session — it leaves the live view.",
 			"inputSchema": objSchema(map[string]any{"worker": worker, "session_id": strProp("session id"), "dir": dir}, "session_id")},
@@ -247,14 +249,26 @@ func (s *Server) handleToolCall(params json.RawMessage) (map[string]any, error) 
 		if v := str(args, "parent_id"); v != "" {
 			body["parentID"] = v
 		}
+		addIdem(body, args)
 		return s.callAPI(http.MethodPost, workerPath(worker, "/sessions"), dirVals(dir, nil), body)
 	case "abort_session":
-		return s.callAPI(http.MethodDelete, workerPath(worker, "/sessions/"+url.PathEscape(str(args, "session_id"))), dirVals(dir, nil), nil)
+		// abort is a DELETE (no body); idempotency_key rides the query (matches the
+		// controller's coordAbort).
+		q := dirVals(dir, nil)
+		if k := str(args, "idempotency_key"); k != "" {
+			if q == nil {
+				q = url.Values{}
+			}
+			q.Set("idempotency_key", k)
+		}
+		return s.callAPI(http.MethodDelete, workerPath(worker, "/sessions/"+url.PathEscape(str(args, "session_id"))), q, nil)
 	case "answer_question":
 		body := map[string]any{"answers": args["answers"]}
+		addIdem(body, args)
 		return s.callAPI(http.MethodPost, workerPath(worker, "/sessions/"+url.PathEscape(str(args, "session_id"))+"/questions/"+url.PathEscape(str(args, "question_id"))), dirVals(dir, nil), body)
 	case "reply_permission":
 		body := map[string]any{"reply": str(args, "reply")}
+		addIdem(body, args)
 		return s.callAPI(http.MethodPost, workerPath(worker, "/sessions/"+url.PathEscape(str(args, "session_id"))+"/permissions/"+url.PathEscape(str(args, "permission_id"))), dirVals(dir, nil), body)
 	case "archive_session":
 		return s.callAPI(http.MethodPost, workerPath(worker, "/sessions/"+url.PathEscape(str(args, "session_id"))+"/archive"), dirVals(dir, nil), nil)
@@ -276,6 +290,13 @@ func dirVals(dir string, v url.Values) url.Values {
 	}
 	v.Set("dir", dir)
 	return v
+}
+
+// addIdem copies an idempotency_key argument into a verb body when present.
+func addIdem(body, args map[string]any) {
+	if k := str(args, "idempotency_key"); k != "" {
+		body["idempotency_key"] = k
+	}
 }
 
 func str(m map[string]any, k string) string {

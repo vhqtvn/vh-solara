@@ -28,8 +28,9 @@ per-session `gate` map (keyed by sessionID):
 "gate": {
   "<sessionID>": {
     "activity": "idle|busy|retry|error",
-    "last_assistant_completed": true,        // latest assistant turn has time.completed
-    "finish_reason": "stop|length|tool-calls", // raw opencode `finish`; omitted if none/in-flight
+    "hydrated": true,                        // message state loaded (live OR history); see note
+    "last_assistant_completed": true,        // latest assistant turn has time.completed (authoritative iff hydrated)
+    "finish_reason": "stop|length|tool-calls", // raw opencode `finish` (authoritative iff hydrated); omitted if none/in-flight
     "subtree_busy": false,                    // any session in this subtree (incl. self) busy/retry
     "pending_question": false,                // a question awaits a TYPED reply (a plain message won't satisfy it)
     "pending_permission": false,
@@ -45,6 +46,11 @@ per-session `gate` map (keyed by sessionID):
   no message-history hydration, no N+1 detail fetch.
 - `subtree_busy` mirrors the frontend's `sessionWorking`/`descendantWorking`
   definition of a live session.
+- **`hydrated`**: after a daemon restart (new `epoch`), an idle, never-opened
+  session has no message state yet, so `last_assistant_completed=false` /
+  `finish_reason=""` mean **"not yet known", not "in-flight"**. `hydrated=false`
+  flags exactly that case — force-hydrate (open) the session, or trust
+  `activity`, before relying on the message-derived fields (§1.7).
 
 The §1.1 send gate = `activity == idle && !subtree_busy && last_assistant_completed
 && !pending_question && !pending_permission` — all readable from one snapshot.
@@ -75,8 +81,25 @@ Header `If-Idle-Seq: <seq>` on `/vh/send`. The send is accepted **only if** the
 session is still sendable (§1.1 gate) **and** its activity hasn't changed since
 the given snapshot seq; else `409`. Without the header, no CAS — the caller owns
 send-when-idle discipline (§1.8); CAS is the opt-in safety net against the
-double-write race. Reply verbs are naturally CAS-on-request-id (a cleared
-question/permission errors upstream), so they take no `If-Idle-Seq`.
+double-write race.
+
+**Contract:** the consumer passes the **global snapshot `seq`** it last observed
+the session sendable at. The server compares it to that session's
+**`activitySeq`** — the seq at which the session's activity last changed — and
+rejects (`409`) if `activitySeq > provided` (a turn started/finished in the gap)
+or the session isn't currently sendable. So a stale-but-still-idle session (a new
+turn completed since you looked) is correctly rejected, not double-driven.
+
+### Verb status mapping (request-id CAS, §5)
+
+A non-2xx from opencode is **propagated**, not masked as `502`: a `4xx` becomes
+that client status, and for `answer-question`/`reply-permission` a `404` (the
+request is no longer pending) maps to **`410 Gone`** — so a coordinator
+distinguishes "already handled" from a real gateway failure. Only transport
+errors and upstream `5xx` are `502`. `reply-permission`'s legacy-route fallback
+fires **only** when the canonical route looks absent (transport error / `404` /
+`405`); a meaningful canonical `4xx` (e.g. `400` bad reply) is returned as-is.
+Reply verbs are naturally CAS-on-request-id, so they take no `If-Idle-Seq`.
 
 ### Caveats baked into the contract
 
