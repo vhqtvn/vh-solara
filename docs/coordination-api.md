@@ -231,6 +231,29 @@ Manifest:
 }
 ```
 
+## Testing
+
+Each feature has package unit tests (state/web/server/mcp/kit). The cross-machine
+path is proven end-to-end by a **reusable Go harness** at `tests/e2e/` that stands
+up a real controller + a real worker over an actual **yamux tunnel** + a fake
+OpenCode (`pkg/fixtures`) — no docker, no opencode binary, no LLM:
+
+```
+go test ./tests/e2e/
+```
+
+`e2e.StartCluster()` is importable so other components can drive the same real
+stack. It covers, over the tunnel: V1 gate facts + epoch header, V3 bearer/auth +
+worker resolution, V2 spawn/send/abort + idempotency, V4 MCP tool calls, and a
+connection-smuggling regression. UI coverage stays in the Playwright lane
+(`web/tests/e2e`); the docker lane (`tests/e2e-docker`) runs a real opencode.
+
+> **Proxy note (fixed):** the controller raw-proxy hijacks the inbound
+> connection, so coordination requests are forwarded with `Connection: close` —
+> otherwise a keep-alive client pools the still-hijacked connection and smuggles
+> its next request straight down the tunnel, bypassing the router. Caught by the
+> e2e MCP test.
+
 ## Decisions (generic-mechanism-only)
 
 - Verbs are body-addressed under `/vh/*` for consistency with `/vh/archive`; the
