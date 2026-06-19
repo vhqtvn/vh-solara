@@ -23,11 +23,18 @@ import (
 	"time"
 )
 
-// Server is a stdio MCP server backed by the coordination API.
+// Server is a stdio MCP server backed by vh-solara's verbs. Two modes:
+//   - Local (default for an agent on the worker machine): target a local
+//     `--web vh` server's /vh/* directly (loopback, no controller, no bearer, no
+//     tunnel — so the connection-smuggling path doesn't apply). This is the
+//     common case: an agent driving its OWN sessions.
+//   - Controller: target a controller's /api/workers/{id}/* to drive ANY
+//     machine's worker (the cross-machine coordinator case; bearer-gated).
 type Server struct {
-	BaseURL       string // controller base, e.g. http://127.0.0.1:8080
-	Token         string // bearer for /api/...; empty if the API is open
-	DefaultWorker string // used when a tool call omits "worker"
+	BaseURL       string // vh server (local) or controller base
+	Token         string // bearer for controller mode; empty in local mode
+	DefaultWorker string // controller mode: used when a tool call omits "worker"
+	Local         bool   // true → drive a local /vh/* server directly
 	Version       string
 	HTTP          *http.Client
 }
@@ -212,48 +219,86 @@ func (s *Server) handleToolCall(params json.RawMessage) (map[string]any, error) 
 	if args == nil {
 		args = map[string]any{}
 	}
+
+	if p.Name == "list_workers" {
+		if s.Local {
+			// Local mode drives a single local worker; there is no fleet to list.
+			return toolText(`[{"id":"local","name":"local (this machine)","status":"online"}]`, map[string]any{}), nil
+		}
+		return s.callAPI(http.MethodGet, "/api/coord/workers", nil, nil)
+	}
+
 	worker := str(args, "worker")
 	if worker == "" {
 		worker = s.DefaultWorker
 	}
-	if worker == "" && p.Name != "list_workers" {
-		return nil, fmt.Errorf("no worker specified and no default worker configured")
+	if !s.Local && worker == "" {
+		return nil, fmt.Errorf("no worker specified and no default worker configured (controller mode)")
 	}
-	dir := str(args, "dir")
 
-	switch p.Name {
-	case "list_workers":
-		return s.callAPI(http.MethodGet, "/api/coord/workers", nil, nil)
-	case "list_sessions":
-		return s.callAPI(http.MethodGet, workerPath(worker, "/sessions"), dirVals(dir, nil), nil)
-	case "get_session":
-		sid := str(args, "session_id")
-		return s.callAPI(http.MethodGet, workerPath(worker, "/sessions/"+url.PathEscape(sid)), dirVals(dir, nil), nil)
-	case "send_message":
-		body := map[string]any{"text": str(args, "text")}
-		if k := str(args, "idempotency_key"); k != "" {
-			body["idempotency_key"] = k
+	method, path, q, body, hdr, err := s.buildCall(p.Name, worker, str(args, "dir"), args)
+	if err != nil {
+		return nil, err
+	}
+	return s.callAPIH(method, path, q, body, hdr)
+}
+
+// buildCall maps a tool to an HTTP request against the active backend. Local mode
+// targets the worker's own /vh/* (body-addressed verbs, CSRF header, no bearer);
+// controller mode targets /api/workers/{id}/* (path-addressed, bearer).
+func (s *Server) buildCall(name, worker, dir string, args map[string]any) (method, path string, q url.Values, body any, hdr map[string]string, err error) {
+	sid := str(args, "session_id")
+	if s.Local {
+		csrf := map[string]string{"X-VH-CSRF": "1"} // the worker /vh CSRF guard requires it on writes
+		switch name {
+		case "list_sessions":
+			return http.MethodGet, "/vh/snapshot", dirVals(dir, nil), nil, nil, nil
+		case "get_session":
+			return http.MethodGet, "/vh/snapshot", dirVals(dir, url.Values{"sessions": {sid}}), nil, nil, nil
+		case "send_message":
+			b := map[string]any{"sessionID": sid, "text": str(args, "text")}
+			addIdem(b, args)
+			if seq := str(args, "if_idle_seq"); seq != "" {
+				csrf["If-Idle-Seq"] = seq
+			}
+			return http.MethodPost, "/vh/send", dirVals(dir, nil), b, csrf, nil
+		case "spawn_session":
+			return http.MethodPost, "/vh/spawn", dirVals(dir, nil), spawnBody(args), csrf, nil
+		case "abort_session":
+			b := map[string]any{"sessionID": sid}
+			addIdem(b, args)
+			return http.MethodPost, "/vh/abort", dirVals(dir, nil), b, csrf, nil
+		case "answer_question":
+			b := map[string]any{"questionID": str(args, "question_id"), "answers": args["answers"]}
+			addIdem(b, args)
+			return http.MethodPost, "/vh/answer-question", dirVals(dir, nil), b, csrf, nil
+		case "reply_permission":
+			b := map[string]any{"permissionID": str(args, "permission_id"), "sessionID": sid, "reply": str(args, "reply")}
+			addIdem(b, args)
+			return http.MethodPost, "/vh/reply-permission", dirVals(dir, nil), b, csrf, nil
+		case "archive_session":
+			return http.MethodPost, "/vh/archive", dirVals(dir, nil), map[string]any{"sessionID": sid}, csrf, nil
 		}
-		hdr := map[string]string{}
+		return "", "", nil, nil, nil, fmt.Errorf("unknown tool: %s", name)
+	}
+
+	// Controller mode.
+	hdr = map[string]string{}
+	switch name {
+	case "list_sessions":
+		return http.MethodGet, workerPath(worker, "/sessions"), dirVals(dir, nil), nil, nil, nil
+	case "get_session":
+		return http.MethodGet, workerPath(worker, "/sessions/"+url.PathEscape(sid)), dirVals(dir, nil), nil, nil, nil
+	case "send_message":
+		b := map[string]any{"text": str(args, "text")}
+		addIdem(b, args)
 		if seq := str(args, "if_idle_seq"); seq != "" {
 			hdr["If-Idle-Seq"] = seq
 		}
-		return s.callAPIH(http.MethodPost, workerPath(worker, "/sessions/"+url.PathEscape(str(args, "session_id"))+"/message"), dirVals(dir, nil), body, hdr)
+		return http.MethodPost, workerPath(worker, "/sessions/"+url.PathEscape(sid)+"/message"), dirVals(dir, nil), b, hdr, nil
 	case "spawn_session":
-		body := map[string]any{}
-		for _, k := range []string{"prompt", "title", "agent"} {
-			if v := str(args, k); v != "" {
-				body[k] = v
-			}
-		}
-		if v := str(args, "parent_id"); v != "" {
-			body["parentID"] = v
-		}
-		addIdem(body, args)
-		return s.callAPI(http.MethodPost, workerPath(worker, "/sessions"), dirVals(dir, nil), body)
+		return http.MethodPost, workerPath(worker, "/sessions"), dirVals(dir, nil), spawnBody(args), nil, nil
 	case "abort_session":
-		// abort is a DELETE (no body); idempotency_key rides the query (matches the
-		// controller's coordAbort).
 		q := dirVals(dir, nil)
 		if k := str(args, "idempotency_key"); k != "" {
 			if q == nil {
@@ -261,20 +306,33 @@ func (s *Server) handleToolCall(params json.RawMessage) (map[string]any, error) 
 			}
 			q.Set("idempotency_key", k)
 		}
-		return s.callAPI(http.MethodDelete, workerPath(worker, "/sessions/"+url.PathEscape(str(args, "session_id"))), q, nil)
+		return http.MethodDelete, workerPath(worker, "/sessions/"+url.PathEscape(sid)), q, nil, nil, nil
 	case "answer_question":
-		body := map[string]any{"answers": args["answers"]}
-		addIdem(body, args)
-		return s.callAPI(http.MethodPost, workerPath(worker, "/sessions/"+url.PathEscape(str(args, "session_id"))+"/questions/"+url.PathEscape(str(args, "question_id"))), dirVals(dir, nil), body)
+		b := map[string]any{"answers": args["answers"]}
+		addIdem(b, args)
+		return http.MethodPost, workerPath(worker, "/sessions/"+url.PathEscape(sid)+"/questions/"+url.PathEscape(str(args, "question_id"))), dirVals(dir, nil), b, nil, nil
 	case "reply_permission":
-		body := map[string]any{"reply": str(args, "reply")}
-		addIdem(body, args)
-		return s.callAPI(http.MethodPost, workerPath(worker, "/sessions/"+url.PathEscape(str(args, "session_id"))+"/permissions/"+url.PathEscape(str(args, "permission_id"))), dirVals(dir, nil), body)
+		b := map[string]any{"reply": str(args, "reply")}
+		addIdem(b, args)
+		return http.MethodPost, workerPath(worker, "/sessions/"+url.PathEscape(sid)+"/permissions/"+url.PathEscape(str(args, "permission_id"))), dirVals(dir, nil), b, nil, nil
 	case "archive_session":
-		return s.callAPI(http.MethodPost, workerPath(worker, "/sessions/"+url.PathEscape(str(args, "session_id"))+"/archive"), dirVals(dir, nil), nil)
-	default:
-		return nil, fmt.Errorf("unknown tool: %s", p.Name)
+		return http.MethodPost, workerPath(worker, "/sessions/"+url.PathEscape(sid)+"/archive"), dirVals(dir, nil), nil, nil, nil
 	}
+	return "", "", nil, nil, nil, fmt.Errorf("unknown tool: %s", name)
+}
+
+func spawnBody(args map[string]any) map[string]any {
+	b := map[string]any{}
+	for _, k := range []string{"prompt", "title", "agent"} {
+		if v := str(args, k); v != "" {
+			b[k] = v
+		}
+	}
+	if v := str(args, "parent_id"); v != "" {
+		b["parentID"] = v
+	}
+	addIdem(b, args)
+	return b
 }
 
 func workerPath(worker, suffix string) string {
@@ -330,8 +388,8 @@ func (s *Server) callAPIH(method, path string, q url.Values, body any, hdr map[s
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	if s.Token != "" {
-		req.Header.Set("Authorization", "Bearer "+s.Token)
+	if s.Token != "" && !s.Local {
+		req.Header.Set("Authorization", "Bearer "+s.Token) // bearer is controller-mode only
 	}
 	for k, v := range hdr {
 		req.Header.Set(k, v)

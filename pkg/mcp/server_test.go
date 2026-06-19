@@ -16,6 +16,10 @@ type fakeController struct {
 	sendBody string
 	sendIdle string
 	failNext bool
+	// local-mode (/vh/*) capture
+	vhSendBody string
+	vhSendCSRF string
+	vhSendAuth string
 }
 
 func (f *fakeController) handler() http.Handler {
@@ -40,6 +44,20 @@ func (f *fakeController) handler() http.Handler {
 			w.Write([]byte("session not sendable"))
 			return
 		}
+		w.Write([]byte(`{"ok":true}`))
+	})
+	// Local-mode endpoints: a worker's own /vh/* served directly.
+	mux.HandleFunc("/vh/snapshot", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-VH-Epoch", "ep-local")
+		w.Write([]byte(`{"epoch":"ep-local","sessions":[{"id":"demo"}],"gate":{}}`))
+	})
+	mux.HandleFunc("/vh/send", func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		f.mu.Lock()
+		f.vhSendBody = string(b)
+		f.vhSendCSRF = r.Header.Get("X-VH-CSRF")
+		f.vhSendAuth = r.Header.Get("Authorization")
+		f.mu.Unlock()
 		w.Write([]byte(`{"ok":true}`))
 	})
 	return mux
@@ -143,6 +161,39 @@ func TestToolCallDefaultWorkerAndError(t *testing.T) {
 	text := res["content"].([]map[string]any)[0]["text"].(string)
 	if !strings.Contains(text, "409") {
 		t.Fatalf("error should mention HTTP 409, got %s", text)
+	}
+}
+
+func TestLocalModeTargetsVHDirectly(t *testing.T) {
+	f := &fakeController{}
+	ctrl := httptest.NewServer(f.handler())
+	t.Cleanup(ctrl.Close)
+	s := New(ctrl.URL, "ignored-token", "", "test")
+	s.Local = true // pure-local: hit /vh/* directly, no worker id, no bearer
+
+	// list_sessions → GET /vh/snapshot (not /api/workers/...).
+	res := callTool(t, s, `{"name":"list_sessions","arguments":{}}`)
+	if res["isError"] == true {
+		t.Fatalf("local list_sessions errored: %v", res)
+	}
+	if txt := res["content"].([]map[string]any)[0]["text"].(string); !strings.Contains(txt, "demo") {
+		t.Fatalf("local list_sessions should hit /vh/snapshot, got: %s", txt)
+	}
+
+	// send_message → POST /vh/send with sessionID in the BODY, CSRF header set,
+	// and NO Authorization (loopback, controller-mode token ignored).
+	res = callTool(t, s, `{"name":"send_message","arguments":{"session_id":"demo","text":"hi"}}`)
+	if res["isError"] == true {
+		t.Fatalf("local send errored: %v", res)
+	}
+	if !strings.Contains(f.vhSendBody, `"demo"`) || !strings.Contains(f.vhSendBody, `"hi"`) {
+		t.Fatalf("local send body should carry sessionID+text, got: %s", f.vhSendBody)
+	}
+	if f.vhSendCSRF != "1" {
+		t.Fatal("local writes must set X-VH-CSRF")
+	}
+	if f.vhSendAuth != "" {
+		t.Fatalf("local mode must not send Authorization, got %q", f.vhSendAuth)
 	}
 }
 
