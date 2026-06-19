@@ -41,6 +41,7 @@ var (
 	daemonWeb              string
 	daemonChamber          string
 	daemonWebPort          int
+	daemonVHSock           string
 	daemonOpenCodeBin      string
 	daemonOpenCodeHost     string
 	daemonOpenCodePasswd   string
@@ -348,9 +349,21 @@ var clientDaemonCmd = &cobra.Command{
 			var vhCtx context.Context
 			vhCtx, vhCancel = context.WithCancel(context.Background())
 			go agg.Run(vhCtx)
+			handler := srv.Handler()
+			// Optional AF_UNIX listener for the same /vh/* — reachable by bind-mount
+			// from a container with no host networking, no port discovery.
+			if daemonVHSock != "" {
+				uds, err := serveUnixSocket(daemonVHSock, handler)
+				if err != nil {
+					log.Fatalf("vh unix socket: %v", err)
+				}
+				defer uds.Close()
+				defer os.Remove(daemonVHSock)
+				log.Printf("vh web server also listening on unix socket %s", daemonVHSock)
+			}
 			vhHTTP = &http.Server{
 				Addr:    fmt.Sprintf("127.0.0.1:%d", webPort),
-				Handler: srv.Handler(),
+				Handler: handler,
 				// Slowloris guard. No WriteTimeout/ReadTimeout: /vh/stream and the
 				// /oc event passthrough are long-lived SSE responses that a write
 				// deadline would sever.
@@ -587,6 +600,7 @@ func init() {
 	// port is the generic web-UI port for every --web mode, not OpenChamber-only).
 	clientDaemonCmd.Flags().IntVar(&daemonWebPort, "chamber-port", 0, "Deprecated: use --web-port")
 	_ = clientDaemonCmd.Flags().MarkDeprecated("chamber-port", "use --web-port")
+	clientDaemonCmd.Flags().StringVar(&daemonVHSock, "vh-sock", "", "(vh only) Also serve /vh/* on this AF_UNIX socket path (bind-mount it to reach the worker from a container with no host networking)")
 
 	// opencode web mode options
 	clientDaemonCmd.Flags().StringVar(&daemonOpenCodeBin, "opencode-bin", "opencode", "(opencode only) Path to the opencode binary")

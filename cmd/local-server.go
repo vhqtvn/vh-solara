@@ -23,6 +23,7 @@ import (
 // `client-daemon --web=vh`: open the printed http://<addr> in a browser.
 var (
 	localAddr             string
+	localVHSock           string
 	localOpenCodeBin      string
 	localOpenCodeURL      string
 	localOpenCodeDetached bool
@@ -216,9 +217,21 @@ with --opencode-url, or spawn a survivable detached instance with
 		// restart hook also calls vhCancel; CancelFunc is idempotent).
 		defer vhCancel()
 		go agg.Run(vhCtx)
+		handler := srv.Handler()
+		// Optional AF_UNIX listener for the same /vh/* — reachable by bind-mount
+		// from a container with no host networking, no port discovery.
+		if localVHSock != "" {
+			uds, err := serveUnixSocket(localVHSock, handler)
+			if err != nil {
+				log.Fatalf("vh unix socket: %v", err)
+			}
+			defer uds.Close()
+			defer os.Remove(localVHSock)
+			log.Printf("vh local-server also listening on unix socket %s", localVHSock)
+		}
 		vhHTTP = &http.Server{
 			Addr:    localAddr,
-			Handler: srv.Handler(),
+			Handler: handler,
 			// No Read/Write timeout: /vh/stream + /oc event passthrough are SSE.
 			ReadHeaderTimeout: 15 * time.Second,
 			IdleTimeout:       120 * time.Second,
@@ -232,6 +245,7 @@ with --opencode-url, or spawn a survivable detached instance with
 
 func init() {
 	localServerCmd.Flags().StringVarP(&localAddr, "addr", "a", "127.0.0.1:7700", "Address to serve the vh web UI on")
+	localServerCmd.Flags().StringVar(&localVHSock, "vh-sock", "", "Also serve /vh/* on this AF_UNIX socket path (bind-mount it to reach the worker from a container with no host networking)")
 	localServerCmd.Flags().StringVar(&localOpenCodeBin, "opencode-bin", "opencode", "Path to the opencode binary")
 	localServerCmd.Flags().StringVar(&localOpenCodeURL, "opencode-url", "", "Attach to an externally-managed OpenCode at this URL instead of spawning one")
 	localServerCmd.Flags().BoolVar(&localOpenCodeDetached, "opencode-detached", false, "Spawn OpenCode detached and reconnect across restarts (survives self-update)")

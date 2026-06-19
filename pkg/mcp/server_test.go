@@ -3,12 +3,45 @@ package mcp
 import (
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 )
+
+func TestLocalModeOverUnixSocket(t *testing.T) {
+	f := &fakeController{}
+	sock := filepath.Join(t.TempDir(), "vh.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpSrv := &http.Server{Handler: f.handler()}
+	go func() { _ = httpSrv.Serve(ln) }()
+	t.Cleanup(func() { _ = httpSrv.Close() })
+
+	s := New("http://unix", "", "", "test")
+	s.Local = true
+	s.HTTP = UnixClient(sock) // dial the worker /vh/* over the socket
+
+	res := callTool(t, s, `{"name":"list_sessions","arguments":{}}`)
+	if res["isError"] == true {
+		t.Fatalf("list_sessions over UDS errored: %v", res)
+	}
+	if txt := res["content"].([]map[string]any)[0]["text"].(string); !strings.Contains(txt, "demo") {
+		t.Fatalf("UDS list_sessions should hit /vh/snapshot, got: %s", txt)
+	}
+	res = callTool(t, s, `{"name":"send_message","arguments":{"session_id":"demo","text":"hi"}}`)
+	if res["isError"] == true {
+		t.Fatalf("send_message over UDS errored: %v", res)
+	}
+	if f.vhSendCSRF != "1" {
+		t.Fatal("UDS write must still carry X-VH-CSRF")
+	}
+}
 
 // fakeController fakes the coordination API the MCP server calls.
 type fakeController struct {

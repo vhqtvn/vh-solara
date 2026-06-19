@@ -66,6 +66,32 @@ per-session `gate` map (keyed by sessionID):
 The §1.1 send gate = `activity == idle && !subtree_busy && last_assistant_completed
 && !pending_question && !pending_permission` — all readable from one snapshot.
 
+### Unix-socket access (no TCP / no port discovery)
+
+A worker can also serve the **same `/vh/*`** on an `AF_UNIX` socket, so a consumer
+that can't reach the worker's loopback TCP port — a container with no host
+networking, or to avoid auto-assigned `--web-port` discovery — bind-mounts the
+socket and calls it with zero network:
+
+- `vh-solara local-server --vh-sock /path/vh.sock`
+- `vh-solara client-daemon --web vh --vh-sock /path/vh.sock`
+
+Same handlers, same `X-VH-CSRF` + body verbs, same `X-VH-Epoch`/`X-VH-Seq`
+headers; it's an extra listener alongside the TCP one. The socket is created
+world-rw (`0666`) so a different-uid bind-mounted container process can reach it —
+exposure equals the worker's existing no-auth loopback TCP, but local-machine
+(file-system) only. Stale socket files are removed on start.
+
+Clients: `curl --unix-socket /path/vh.sock http://localhost/vh/snapshot`, Python
+`httpx` with a UDS transport, or our MCP server: `vh-solara mcp --sock
+/path/vh.sock` (implies `--local`; dials `/vh/*` over the socket). No socket-path
+convention is imposed — pick a path on a shared/bind-mounted volume and pass
+`--vh-sock`.
+
+The cross-worker controller API (`/api/workers/{id}/*`) is **not** affected: it's
+host↔host over the tunnel, so loopback TCP is fine there. UDS solves only the
+worker-direct / container-isolation case.
+
 ## V2 — typed write verbs (worker `/vh/*`)
 
 All POST, JSON body, behind the existing CSRF guard. Optional `idempotency_key`

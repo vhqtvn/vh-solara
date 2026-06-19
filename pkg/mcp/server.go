@@ -17,11 +17,28 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
 )
+
+// UnixClient returns an http.Client that dials the given AF_UNIX socket for every
+// request (the request URL's host/port is ignored — use a placeholder BaseURL
+// like http://unix). Lets local mode reach a worker's /vh/* over a bind-mounted
+// socket with no TCP / no host networking.
+func UnixClient(sock string) *http.Client {
+	return &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				var d net.Dialer
+				return d.DialContext(ctx, "unix", sock)
+			},
+		},
+	}
+}
 
 // Server is a stdio MCP server backed by vh-solara's verbs. Two modes:
 //   - Local (default for an agent on the worker machine): target a local
