@@ -348,12 +348,21 @@ func TestGateLastAssistantEmpty(t *testing.T) {
 		t.Fatal("whitespace-only text must be treated as empty")
 	}
 
-	// A tool part (no text) is empty; text discriminates, not finish.
+	// A tool-only turn (no text) is the agent WORKING → NON-empty (don't continue it).
 	s.Apply(ev("session.created", `{"info":{"id":"c"}}`))
 	s.Apply(ev("message.updated", `{"info":{"id":"m3","sessionID":"c","role":"assistant","time":{"created":1,"completed":2},"finish":"tool-calls"}}`))
 	s.Apply(ev("message.part.updated", `{"part":{"id":"p3","sessionID":"c","messageID":"m3","type":"tool","tool":"bash"}}`))
-	if !s.Snapshot(nil).Gate["c"].LastAssistantEmpty {
-		t.Fatal("a tool-only turn (no text) must be last_assistant_empty=true")
+	if s.Snapshot(nil).Gate["c"].LastAssistantEmpty {
+		t.Fatal("a tool-only turn must be NON-empty (the agent is working)")
+	}
+
+	// An "envelope" turn — reasoning only, no text/tool/file (the GLM empty-stop) →
+	// empty.
+	s.Apply(ev("session.created", `{"info":{"id":"d"}}`))
+	s.Apply(ev("message.updated", `{"info":{"id":"m4","sessionID":"d","role":"assistant","time":{"created":1,"completed":2},"finish":"stop"}}`))
+	s.Apply(ev("message.part.updated", `{"part":{"id":"p4","sessionID":"d","messageID":"m4","type":"reasoning","text":"thinking..."}}`))
+	if !s.Snapshot(nil).Gate["d"].LastAssistantEmpty {
+		t.Fatal("a reasoning-only (no text/tool/file) turn must be empty")
 	}
 }
 
