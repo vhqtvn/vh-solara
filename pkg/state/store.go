@@ -82,13 +82,21 @@ type Snapshot struct {
 // applies NO policy here (it does not, e.g., decide that finish_reason=="length"
 // means "send continue" — the consumer interprets).
 type GateFacts struct {
-	Activity               string          `json:"activity"`                 // idle|busy|retry|error
-	LastAssistantCompleted bool            `json:"last_assistant_completed"` // latest assistant turn has time.completed
-	FinishReason           string          `json:"finish_reason,omitempty"`  // raw opencode `finish` of the latest assistant msg; "" if none/in-flight
+	Activity string `json:"activity"` // idle|busy|retry|error
+	// Hydrated reports whether this session's messages have been loaded. The
+	// message-derived fields below (last_assistant_completed, finish_reason,
+	// tokens) are AUTHORITATIVE only when hydrated is true. After a daemon restart
+	// (new epoch) an idle, never-opened session reports hydrated=false with
+	// last_assistant_completed=false / empty finish_reason — that is "not yet
+	// known", NOT "in-flight". A coordinator should force-hydrate (open) the
+	// session, or trust `activity`, before relying on those fields (§1.7).
+	Hydrated               bool            `json:"hydrated"`
+	LastAssistantCompleted bool            `json:"last_assistant_completed"` // latest assistant turn has time.completed (meaningful iff hydrated)
+	FinishReason           string          `json:"finish_reason,omitempty"`  // raw opencode `finish` of the latest assistant msg (meaningful iff hydrated)
 	SubtreeBusy            bool            `json:"subtree_busy"`             // any session in this subtree (incl. self) is busy/retry
 	PendingQuestion        bool            `json:"pending_question"`         // a question awaits a typed reply (a plain message won't satisfy it)
 	PendingPermission      bool            `json:"pending_permission"`       // a permission awaits a typed reply
-	Tokens                 json.RawMessage `json:"tokens,omitempty"`         // raw token-usage object of the latest assistant turn
+	Tokens                 json.RawMessage `json:"tokens,omitempty"`         // raw token-usage object of the latest assistant turn (meaningful iff hydrated)
 }
 
 // MessageWithParts mirrors OpenCode's GET /session/:id/message item shape.
@@ -900,7 +908,12 @@ func (s *Store) Snapshot(messagesFor map[string]bool) Snapshot {
 			act = ActivityIdle // a never-touched session renders idle
 		}
 		snap.Gate[sid] = GateFacts{
-			Activity:               act,
+			Activity: act,
+			// We have message state (live events OR a history hydrate) iff msgLoaded or
+			// a messages entry exists. When false, the message-derived fields below are
+			// "not yet known", which a cold/un-opened session after a restart can't be
+			// distinguished from in-flight without this.
+			Hydrated:               s.msgLoaded[sid] || s.messages[sid] != nil,
 			LastAssistantCompleted: se.hasAssistant && se.lastAsstCompleted,
 			FinishReason:           se.lastFinish,
 			SubtreeBusy:            subtreeBusy[sid],

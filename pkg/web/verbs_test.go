@@ -17,13 +17,15 @@ import (
 // requests the verbs forward so a test can assert the mechanism (dedup, CAS,
 // body shaping) without a real server.
 type fakeOC struct {
-	mu           sync.Mutex
-	prompts      []string // bodies POSTed to /session/:id/prompt_async
-	creates      int
-	aborts       int
-	questions    []string
-	permissions  []string
-	permFailOnce bool // first /permission reply 400s (to exercise legacy fallback)
+	mu              sync.Mutex
+	prompts         []string // bodies POSTed to /session/:id/prompt_async
+	creates         int
+	aborts          int
+	questions       []string
+	permissions     []string
+	permRouteAbsent bool // canonical /permission reply 404s once (route missing → legacy fallback)
+	permCanonStatus int  // if non-zero, canonical /permission reply returns this status (no record)
+	qStatus         int  // if non-zero, /question reply returns this status (no record)
 }
 
 func (f *fakeOC) handler() http.Handler {
@@ -61,17 +63,25 @@ func (f *fakeOC) handler() http.Handler {
 	mux.HandleFunc("/question/", func(w http.ResponseWriter, r *http.Request) {
 		b, _ := readAll(r)
 		f.mu.Lock()
+		defer f.mu.Unlock()
+		if f.qStatus != 0 {
+			w.WriteHeader(f.qStatus)
+			return
+		}
 		f.questions = append(f.questions, b)
-		f.mu.Unlock()
 		w.WriteHeader(http.StatusOK)
 	})
 	mux.HandleFunc("/permission/", func(w http.ResponseWriter, r *http.Request) {
 		b, _ := readAll(r)
 		f.mu.Lock()
 		defer f.mu.Unlock()
-		if f.permFailOnce {
-			f.permFailOnce = false
-			w.WriteHeader(http.StatusBadRequest)
+		if f.permCanonStatus != 0 {
+			w.WriteHeader(f.permCanonStatus)
+			return
+		}
+		if f.permRouteAbsent {
+			f.permRouteAbsent = false
+			w.WriteHeader(http.StatusNotFound) // canonical route missing → legacy fallback
 			return
 		}
 		f.permissions = append(f.permissions, "canonical:"+b)
@@ -232,13 +242,51 @@ func TestReplyPermissionValidatesAndFallsBack(t *testing.T) {
 	if st, _, _ := post(t, web.URL+"/vh/reply-permission", `{"permissionID":"p1","reply":"maybe"}`, nil); st != 400 {
 		t.Fatalf("invalid reply must 400, got %d", st)
 	}
-	// Canonical route fails once → legacy fallback used (sessionID provided).
-	f.permFailOnce = true
+	// Canonical route absent (404) → legacy fallback used (sessionID provided).
+	f.permRouteAbsent = true
 	st, out, _ := post(t, web.URL+"/vh/reply-permission", `{"permissionID":"p1","sessionID":"a","reply":"once"}`, nil)
 	if st != 200 || out["ok"] != true {
 		t.Fatalf("permission reply with fallback should succeed, got %d %v", st, out)
 	}
 	if len(f.permissions) != 1 || !contains(f.permissions[0], "legacy:") {
 		t.Fatalf("expected legacy fallback to be used, got %v", f.permissions)
+	}
+}
+
+func TestReplyPermissionPropagatesMeaningful4xx(t *testing.T) {
+	f := &fakeOC{}
+	web, _ := newVerbServer(t, f)
+	// Canonical route returns a meaningful 400 (not route-missing) → propagate 400,
+	// do NOT fall back, do NOT mask as 502. sessionID is present.
+	f.permCanonStatus = http.StatusBadRequest
+	st, _, _ := post(t, web.URL+"/vh/reply-permission", `{"permissionID":"p1","sessionID":"a","reply":"once"}`, nil)
+	if st != http.StatusBadRequest {
+		t.Fatalf("a meaningful canonical 400 must propagate (not fall back / 502), got %d", st)
+	}
+	if len(f.permissions) != 0 {
+		t.Fatalf("no legacy fallback should have happened, got %v", f.permissions)
+	}
+}
+
+func TestAnswerQuestionAlreadyClearedMapsTo410(t *testing.T) {
+	f := &fakeOC{}
+	web, _ := newVerbServer(t, f)
+	// A reply to a no-longer-pending question → opencode 404 → we map to 410 Gone
+	// (request-id CAS, §5), so the coordinator distinguishes "already handled".
+	f.qStatus = http.StatusNotFound
+	st, _, _ := post(t, web.URL+"/vh/answer-question", `{"questionID":"q1","answers":[["yes"]]}`, nil)
+	if st != http.StatusGone {
+		t.Fatalf("answer to a cleared question should map 404→410, got %d", st)
+	}
+}
+
+func TestReplyPermissionAlreadyClearedMapsTo410(t *testing.T) {
+	f := &fakeOC{}
+	web, _ := newVerbServer(t, f)
+	// No sessionID → no legacy fallback; canonical 404 → 410.
+	f.permCanonStatus = http.StatusNotFound
+	st, _, _ := post(t, web.URL+"/vh/reply-permission", `{"permissionID":"p1","reply":"once"}`, nil)
+	if st != http.StatusGone {
+		t.Fatalf("reply to a cleared permission should map 404→410, got %d", st)
 	}
 }
