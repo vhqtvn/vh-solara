@@ -8,6 +8,13 @@ policy lives in the consumer**, never here.
 See the §1 contract (the distributed-state invariants a driver must honor) in the
 handoff thread; this doc tracks the implemented surface and decisions.
 
+> **Worker prerequisite:** the coordination API lives on vh-solara's own web
+> server, which a worker runs only in `--web vh` mode (`cmd/client-daemon.go`).
+> The other modes (`opencode`, `openchamber`) serve a different UI on the proxied
+> port and expose no `/vh/*`. No OpenChamber dependency anywhere in this stack —
+> the `ChamberPort`/`HandleChamberDirect` names in the tunnel are legacy and
+> mode-agnostic ("the worker's proxied web port"); in `vh` mode that's vh-solara.
+
 ## Status
 
 | Item | What | State |
