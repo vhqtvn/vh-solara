@@ -23,13 +23,10 @@ func NewProxy(registry *Registry) *Proxy {
 	}
 }
 
-// HandleChamberDirect proxies an OpenChamber request to the client via a yamux stream.
-func (p *Proxy) HandleChamberDirect(workerID string, worker *Worker, w http.ResponseWriter, r *http.Request) {
-	// log.Printf("[ChamberProxy] %s %s (Worker: %s, Upgrade: %q, Accept: %q)",
-	// 	r.Method, r.URL.Path, workerID, r.Header.Get("Upgrade"), r.Header.Get("Accept"))
-
-	// All chamber requests use raw TCP proxying for immediate chunk-by-chunk streaming.
-	// This handles HTTP, SSE, and WebSocket uniformly.
+// HandleWorkerDirect proxies a request to the worker's local web server via a
+// yamux stream. All requests use raw TCP proxying for immediate chunk-by-chunk
+// streaming, handling HTTP, SSE, and WebSocket uniformly.
+func (p *Proxy) HandleWorkerDirect(workerID string, worker *Worker, w http.ResponseWriter, r *http.Request) {
 	p.handleRawProxy(worker, w, r)
 }
 
@@ -58,7 +55,7 @@ func (p *Proxy) handleRawProxy(worker *Worker, w http.ResponseWriter, r *http.Re
 		BaseMessage: tunnel.BaseMessage{
 			Type: tunnel.TypeRawProxy,
 		},
-		Port: 0, // 0 means use ChamberPort on the agent side
+		Port: 0, // 0 means use the worker's web port on the agent side
 	}
 	// log.Printf("[RawProxy] Sending RawProxyMessage...")
 	if err := stream.WriteJSON(rawReq); err != nil {

@@ -69,6 +69,20 @@ type Server struct {
 	// auth, when set, gates the whole server (login + session). nil = no auth
 	// (only safe on a loopback bind; see auth.CheckBindSafety).
 	auth *auth.Authenticator
+
+	// idem dedups typed write verbs by their idempotency_key (A1).
+	idem *idemCache
+
+	// features are the capability modules mounted at startup (B). The
+	// coordination verbs are the first one (dogfood).
+	features []Feature
+}
+
+// RegisterFeature adds a capability module to be mounted by Handler(). Call
+// before Handler() is first invoked. Returns the server for chaining.
+func (s *Server) RegisterFeature(f Feature) *Server {
+	s.features = append(s.features, f)
+	return s
 }
 
 // SetAuth installs the auth layer as the outermost wrapper of Handler(). nil or
@@ -125,6 +139,8 @@ func NewServer(agg *aggregator.Aggregator, opencodeURL string, ringCapacity int)
 		opencodeURL: opencodeURL,
 		ringCap:     ringCapacity,
 		aggs:        map[string]*aggregator.Aggregator{"": agg},
+		idem:        newIdemCache(10 * time.Minute),
+		features:    defaultFeatures(),
 	}
 	return srv, nil
 }
@@ -177,6 +193,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/vh/quota", s.handleQuota)
 	mux.HandleFunc("/vh/archive", s.handleArchive)
 	mux.HandleFunc("/vh/unarchive", s.handleArchive)
+	// Feature modules (B) — the coordination write verbs (A1) are the first one.
+	s.mountFeatures(mux)
 	mux.HandleFunc("/vh/ack", s.handleAck)
 	mux.HandleFunc("/vh/archived", s.handleArchived)
 	mux.HandleFunc("/vh/reload", s.handleReload)
@@ -198,7 +216,25 @@ func (s *Server) Handler() http.Handler {
 	// Auth gates everything (login page + session); it sits inside securityHeaders
 	// so the login page still gets CSP, and outside cors/csrf so an unauthenticated
 	// request is challenged before reaching application logic. nil/ModeNone = no-op.
-	return securityHeaders(s.auth.Middleware(s.cors(csrfGuard(logRequests(mux)))))
+	return securityHeaders(s.auth.Middleware(s.cors(csrfGuard(logRequests(s.stampMeta(mux))))))
+}
+
+// stampMeta sets X-VH-Epoch and X-VH-Seq on /vh/* responses so a cross-worker
+// coordinator can key its resume cursor by (worker, epoch, seq) and detect a
+// worker restart (epoch change) from any response — not just a snapshot. The seq
+// is the head at request entry (a hint; the authoritative cursor is the snapshot/
+// stream's own seq). Headers are set before the handler writes, so they survive
+// streaming and hijacked (terminal/WebSocket) responses.
+func (s *Server) stampMeta(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/vh/") {
+			st := s.aggFor(reqDir(r)).Store()
+			h := w.Header()
+			h.Set("X-VH-Epoch", st.Epoch())
+			h.Set("X-VH-Seq", strconv.FormatUint(st.Head(), 10))
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // logRequests emits a debug line per /oc/* and mutating /vh/* request with the

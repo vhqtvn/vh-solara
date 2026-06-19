@@ -1,0 +1,1 @@
+{ "controller": "{{vh:controller_url}}", "worker": "{{vh:worker_id}}", "token": "{{vh:api_token}}" }

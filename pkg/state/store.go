@@ -7,6 +7,8 @@ package state
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"sync"
 
@@ -50,6 +52,11 @@ type ClientEvent struct {
 
 // Snapshot is the full current view plus the head seq a client resumes from.
 type Snapshot struct {
+	// Epoch identifies this store's lifetime. seq resets to 0 when the daemon
+	// restarts (the view is in-memory, not durable), so a resume cursor is only
+	// valid within one (epoch). A coordinator keys cursors by (worker, epoch, seq)
+	// and re-snapshots when the epoch it sees changes.
+	Epoch       string                        `json:"epoch"`
 	Seq         uint64                        `json:"seq"`
 	Sessions    []json.RawMessage             `json:"sessions"`
 	Messages    map[string][]MessageWithParts `json:"messages"`
@@ -58,10 +65,38 @@ type Snapshot struct {
 	Questions   map[string][]json.RawMessage  `json:"questions,omitempty"`
 	Statuses    map[string]json.RawMessage    `json:"statuses,omitempty"`
 	Activity    map[string]string             `json:"activity,omitempty"`
+	// Gate carries the per-session "is this safe to act on" facts inline (A2), so a
+	// coordinator evaluates its send/act gate from one snapshot — no N+1 detail
+	// fetch, no message-history walk. Keyed by sessionID.
+	Gate map[string]GateFacts `json:"gate,omitempty"`
 	// Root sessions that finished (their subtree went busy -> idle) and haven't
 	// been acknowledged yet — surfaced as an "unread/finished" indicator. Cleared
 	// via Ack (the client scrolling that session to the bottom).
 	Unread []string `json:"unread,omitempty"`
+}
+
+// GateFacts is the denormalized "is this session safe to act on" summary for one
+// session — the raw facts a coordinator composes into its send/act gate, carried
+// inline on every snapshot so a driver needn't issue an N+1 per-session detail
+// fetch or walk message history. Every field is a raw opencode fact; vh-solara
+// applies NO policy here (it does not, e.g., decide that finish_reason=="length"
+// means "send continue" — the consumer interprets).
+type GateFacts struct {
+	Activity string `json:"activity"` // idle|busy|retry|error
+	// Hydrated reports whether this session's messages have been loaded. The
+	// message-derived fields below (last_assistant_completed, finish_reason,
+	// tokens) are AUTHORITATIVE only when hydrated is true. After a daemon restart
+	// (new epoch) an idle, never-opened session reports hydrated=false with
+	// last_assistant_completed=false / empty finish_reason — that is "not yet
+	// known", NOT "in-flight". A coordinator should force-hydrate (open) the
+	// session, or trust `activity`, before relying on those fields (§1.7).
+	Hydrated               bool            `json:"hydrated"`
+	LastAssistantCompleted bool            `json:"last_assistant_completed"` // latest assistant turn has time.completed (meaningful iff hydrated)
+	FinishReason           string          `json:"finish_reason,omitempty"`  // raw opencode `finish` of the latest assistant msg (meaningful iff hydrated)
+	SubtreeBusy            bool            `json:"subtree_busy"`             // any session in this subtree (incl. self) is busy/retry
+	PendingQuestion        bool            `json:"pending_question"`         // a question awaits a typed reply (a plain message won't satisfy it)
+	PendingPermission      bool            `json:"pending_permission"`       // a permission awaits a typed reply
+	Tokens                 json.RawMessage `json:"tokens,omitempty"`         // raw token-usage object of the latest assistant turn (meaningful iff hydrated)
 }
 
 // MessageWithParts mirrors OpenCode's GET /session/:id/message item shape.
@@ -76,6 +111,14 @@ type sessionEntry struct {
 	id       string
 	parentID string
 	info     json.RawMessage
+	// Denormalized summary of the session's most recent assistant turn (A2),
+	// refreshed whenever an assistant message changes. Kept on the session so the
+	// tree-only list snapshot can carry the gate facts (finish reason + token
+	// usage) WITHOUT the session's full message history being hydrated.
+	hasAssistant      bool            // the session has at least one assistant message
+	lastFinish        string          // raw `finish` of the latest assistant msg ("" if none/in-flight)
+	lastTokens        json.RawMessage // raw `tokens` of the latest assistant msg
+	lastAsstCompleted bool            // the latest assistant msg has time.completed
 }
 
 type messageEntry struct {
@@ -87,6 +130,11 @@ type messageEntry struct {
 	// re-parsing JSON: an assistant message with no completed time is generating.
 	role      string
 	completed bool
+	// Cached from info for the gate facts (A2): opencode's `finish` reason
+	// (e.g. "stop"|"length"|"tool-calls"; present iff the turn completed) and the
+	// raw `tokens` usage object. Kept raw — vh-solara reports, never interprets.
+	finish string
+	tokens json.RawMessage
 }
 
 type sessionMessages struct {
@@ -113,6 +161,10 @@ type messageInfoEnvelope struct {
 	Time      struct {
 		Completed *float64 `json:"completed"`
 	} `json:"time"`
+	// Assistant-turn facts surfaced for the gate (A2). `finish` is opencode's
+	// raw completion reason; `tokens` the raw usage object.
+	Finish string          `json:"finish"`
+	Tokens json.RawMessage `json:"tokens"`
 }
 
 type partEnvelope struct {
@@ -130,6 +182,7 @@ type permissionEnvelope struct {
 type Store struct {
 	mu sync.RWMutex
 
+	epoch     string // stable for this store's lifetime; see Snapshot.Epoch
 	seq       uint64
 	sessions  map[string]*sessionEntry
 	messages  map[string]*sessionMessages           // sessionID -> messages
@@ -138,6 +191,11 @@ type Store struct {
 	questions map[string]map[string]json.RawMessage // sessionID -> questionID -> request
 	statuses  map[string]json.RawMessage            // sessionID -> status payload
 	activity  map[string]string                     // sessionID -> idle|busy|retry|error
+	// activitySeq[sid] = the event seq at which the session's activity last
+	// changed. Backs the If-Idle-Seq compare-and-swap: a coordinator that observed
+	// a session sendable at seq N can ask to send "only if nothing changed since
+	// N", so a turn that started-and-finished in the gap can't be double-driven.
+	activitySeq map[string]uint64
 	// Finished-unread tracking. busyCount[root] = number of busy/retry sessions in
 	// the root's subtree; when it falls to 0 the root is marked unread (a finished
 	// task awaiting acknowledgement). suppressUnread guards the hydrate reconcile.
@@ -154,21 +212,33 @@ type Store struct {
 	next int
 }
 
+// newEpoch returns a random per-lifetime store id. crypto/rand is used so it's
+// distinct across restarts without needing a clock (and stays unguessable).
+func newEpoch() string {
+	var b [12]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "ep-fallback"
+	}
+	return "ep-" + hex.EncodeToString(b[:])
+}
+
 // New returns an empty store with an event ring of the given capacity.
 func New(ringCapacity int) *Store {
 	return &Store{
-		sessions:  map[string]*sessionEntry{},
-		messages:  map[string]*sessionMessages{},
-		todos:     map[string]json.RawMessage{},
-		perms:     map[string]map[string]json.RawMessage{},
-		questions: map[string]map[string]json.RawMessage{},
-		statuses:  map[string]json.RawMessage{},
-		activity:  map[string]string{},
-		unread:    map[string]bool{},
-		busyCount: map[string]int{},
-		msgLoaded: map[string]bool{},
-		ring:      newRingBuffer(ringCapacity),
-		subs:      map[int]chan ClientEvent{},
+		epoch:       newEpoch(),
+		sessions:    map[string]*sessionEntry{},
+		messages:    map[string]*sessionMessages{},
+		todos:       map[string]json.RawMessage{},
+		perms:       map[string]map[string]json.RawMessage{},
+		questions:   map[string]map[string]json.RawMessage{},
+		statuses:    map[string]json.RawMessage{},
+		activity:    map[string]string{},
+		activitySeq: map[string]uint64{},
+		unread:      map[string]bool{},
+		busyCount:   map[string]int{},
+		msgLoaded:   map[string]bool{},
+		ring:        newRingBuffer(ringCapacity),
+		subs:        map[int]chan ClientEvent{},
 	}
 }
 
@@ -214,6 +284,7 @@ func (s *Store) setActivityLocked(sessionID, st string) {
 	}
 	s.activity[sessionID] = st
 	s.emit(KindActivity, rawObj(map[string]interface{}{"sessionID": sessionID, "state": st}))
+	s.activitySeq[sessionID] = s.seq // the seq of the activity event just emitted
 
 	// Track the root subtree's busy count to detect "finished" (busy -> idle).
 	wasBusy := prev == ActivityBusy || prev == ActivityRetry
@@ -487,6 +558,9 @@ func (s *Store) upsertSessionLocked(props json.RawMessage) {
 		return
 	}
 	s.sessions[env.ID] = &sessionEntry{id: env.ID, parentID: env.ParentID, info: p.Info}
+	// A session.updated replaces the entry, so repopulate the denormalized
+	// last-assistant summary from the (persisted) message view.
+	s.recomputeLastAssistantLocked(env.ID)
 	s.emit(KindSessionUpsert, p.Info)
 }
 
@@ -499,6 +573,7 @@ func (s *Store) deleteSessionLocked(id string) {
 	delete(s.questions, id)
 	delete(s.statuses, id)
 	delete(s.activity, id)
+	delete(s.activitySeq, id)
 	delete(s.unread, id)
 	delete(s.busyCount, id)
 	s.emit(KindSessionDelete, rawObj(map[string]interface{}{"id": id}))
@@ -625,14 +700,20 @@ func (s *Store) upsertMessageLocked(info json.RawMessage) {
 		me.info = info
 		me.role = env.Role
 		me.completed = env.Time.Completed != nil
+		me.finish = env.Finish
+		me.tokens = env.Tokens
 	} else {
 		sm.byID[env.ID] = &messageEntry{
 			id: env.ID, info: info, parts: map[string]json.RawMessage{},
 			role: env.Role, completed: env.Time.Completed != nil,
+			finish: env.Finish, tokens: env.Tokens,
 		}
 		sm.order = append(sm.order, env.ID)
 	}
 	s.emit(KindMessageUpsert, info)
+	if env.Role == "assistant" {
+		s.recomputeLastAssistantLocked(env.SessionID)
+	}
 
 	// Escalate to busy from the live message stream: OpenCode's session.status/idle
 	// events are not reliable for a streaming turn (a session can generate for
@@ -667,6 +748,39 @@ func (s *Store) assistantInflightLocked(sessionID string) bool {
 	return false
 }
 
+// recomputeLastAssistantLocked refreshes a session's denormalized last-assistant
+// summary (finish reason + token usage + completion of the most recent assistant
+// message) from the in-memory message view, so the tree-only list snapshot can
+// expose the gate facts without the full history being hydrated. A session that
+// ran a turn during this daemon's lifetime has its messages in the store from the
+// live event stream, so this is populated for exactly the sessions a coordinator
+// can observe transitioning. Caller holds s.mu.
+func (s *Store) recomputeLastAssistantLocked(sessionID string) {
+	se := s.sessions[sessionID]
+	if se == nil {
+		return
+	}
+	se.hasAssistant = false
+	se.lastFinish = ""
+	se.lastTokens = nil
+	se.lastAsstCompleted = false
+	sm := s.messages[sessionID]
+	if sm == nil {
+		return
+	}
+	for i := len(sm.order) - 1; i >= 0; i-- {
+		me := sm.byID[sm.order[i]]
+		if me == nil || me.role != "assistant" {
+			continue
+		}
+		se.hasAssistant = true
+		se.lastFinish = me.finish
+		se.lastTokens = me.tokens
+		se.lastAsstCompleted = me.completed
+		return
+	}
+}
+
 func (s *Store) deleteMessageLocked(sessionID, messageID string) {
 	sm := s.messages[sessionID]
 	if sm != nil {
@@ -675,6 +789,7 @@ func (s *Store) deleteMessageLocked(sessionID, messageID string) {
 			sm.order = removeString(sm.order, messageID)
 		}
 	}
+	s.recomputeLastAssistantLocked(sessionID)
 	s.emit(KindMessageDelete, rawObj(map[string]interface{}{"sessionID": sessionID, "messageID": messageID}))
 }
 
@@ -774,6 +889,7 @@ func (s *Store) Snapshot(messagesFor map[string]bool) Snapshot {
 	defer s.mu.RUnlock()
 
 	snap := Snapshot{
+		Epoch:       s.epoch,
 		Seq:         s.seq,
 		Messages:    map[string][]MessageWithParts{},
 		Todos:       map[string]json.RawMessage{},
@@ -781,6 +897,30 @@ func (s *Store) Snapshot(messagesFor map[string]bool) Snapshot {
 		Questions:   map[string][]json.RawMessage{},
 		Statuses:    map[string]json.RawMessage{},
 		Activity:    map[string]string{},
+		Gate:        map[string]GateFacts{},
+	}
+	// Per-session gate facts (denormalized; see GateFacts). subtree_busy needs a
+	// tree walk, so compute it once here in O(n) and index per session.
+	subtreeBusy := s.computeSubtreeBusyLocked()
+	for sid, se := range s.sessions {
+		act := s.activity[sid]
+		if act == "" {
+			act = ActivityIdle // a never-touched session renders idle
+		}
+		snap.Gate[sid] = GateFacts{
+			Activity: act,
+			// We have message state (live events OR a history hydrate) iff msgLoaded or
+			// a messages entry exists. When false, the message-derived fields below are
+			// "not yet known", which a cold/un-opened session after a restart can't be
+			// distinguished from in-flight without this.
+			Hydrated:               s.msgLoaded[sid] || s.messages[sid] != nil,
+			LastAssistantCompleted: se.hasAssistant && se.lastAsstCompleted,
+			FinishReason:           se.lastFinish,
+			SubtreeBusy:            subtreeBusy[sid],
+			PendingQuestion:        len(s.questions[sid]) > 0,
+			PendingPermission:      len(s.perms[sid]) > 0,
+			Tokens:                 se.lastTokens,
+		}
 	}
 	for sid, m := range s.questions {
 		for _, q := range m {
@@ -828,6 +968,73 @@ func (s *Store) Snapshot(messagesFor map[string]bool) Snapshot {
 	return snap
 }
 
+// computeSubtreeBusyLocked returns, for every session, whether any session in its
+// subtree (including itself) is busy or retry — the gate's "no busy descendant"
+// fact, so a coordinator needn't walk the tree itself. O(n) via memoized
+// post-order over the parent links. Caller holds s.mu.
+func (s *Store) computeSubtreeBusyLocked() map[string]bool {
+	children := map[string][]string{}
+	for id, se := range s.sessions {
+		if se.parentID != "" && s.sessions[se.parentID] != nil {
+			children[se.parentID] = append(children[se.parentID], id)
+		}
+	}
+	busy := func(id string) bool {
+		a := s.activity[id]
+		return a == ActivityBusy || a == ActivityRetry
+	}
+	memo := map[string]bool{}
+	var visit func(id string) bool
+	visit = func(id string) bool {
+		if v, ok := memo[id]; ok {
+			return v
+		}
+		// Seed before recursion so a malformed cyclic parent link can't recurse
+		// forever (session trees are acyclic, but never trust external data).
+		memo[id] = busy(id)
+		res := memo[id]
+		for _, c := range children[id] {
+			if visit(c) {
+				res = true
+			}
+		}
+		memo[id] = res
+		return res
+	}
+	for id := range s.sessions {
+		visit(id)
+	}
+	return memo
+}
+
+// SendableNow reports whether a plain message is safe to send to a session right
+// now — the §1.1 gate as a single fact — plus the seq at which the session's
+// activity last changed (for If-Idle-Seq CAS). sendable means: activity idle, no
+// busy descendant, the latest assistant turn completed (or none yet), and no
+// pending question or permission (those need a typed reply, not a message).
+// exists is false for an unknown session. This is a raw mechanism check; the
+// decision to *use* it (i.e. whether to gate a send) belongs to the caller.
+func (s *Store) SendableNow(sid string) (sendable bool, activitySeq uint64, exists bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	se := s.sessions[sid]
+	if se == nil {
+		return false, 0, false
+	}
+	act := s.activity[sid]
+	if act == "" {
+		act = ActivityIdle
+	}
+	subtreeBusy := s.computeSubtreeBusyLocked()[sid]
+	inflight := se.hasAssistant && !se.lastAsstCompleted
+	sendable = act == ActivityIdle &&
+		!subtreeBusy &&
+		!inflight &&
+		len(s.questions[sid]) == 0 &&
+		len(s.perms[sid]) == 0
+	return sendable, s.activitySeq[sid], true
+}
+
 // Subscribe registers a new live-tail consumer. Returns the channel and an
 // unsubscribe func. The channel is closed if the consumer falls too far behind.
 func (s *Store) Subscribe(buffer int) (<-chan ClientEvent, func()) {
@@ -845,6 +1052,17 @@ func (s *Store) Subscribe(buffer int) (<-chan ClientEvent, func()) {
 			delete(s.subs, id)
 		}
 	}
+}
+
+// Epoch returns this store's lifetime id (see Snapshot.Epoch).
+func (s *Store) Epoch() string { return s.epoch }
+
+// Head returns the current head seq without building a full snapshot — for
+// cheaply stamping X-VH-Seq response headers.
+func (s *Store) Head() uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.seq
 }
 
 // Replay returns buffered events with seq > cursor. ok is false when the cursor
@@ -923,6 +1141,8 @@ func (s *Store) reconcileMessagesLocked(sid string, list []MessageWithParts) {
 		}
 		me.role = env.Role
 		me.completed = env.Time.Completed != nil
+		me.finish = env.Finish
+		me.tokens = env.Tokens
 
 		seenPart := make(map[string]bool, len(mwp.Parts))
 		for _, part := range mwp.Parts {
@@ -959,6 +1179,7 @@ func (s *Store) reconcileMessagesLocked(sid string, list []MessageWithParts) {
 			}))
 		}
 	}
+	s.recomputeLastAssistantLocked(sid)
 }
 
 // IsMessagesLoaded reports whether a session's history has been fetched.

@@ -161,6 +161,134 @@ func (c *Client) SetArchived(ctx context.Context, id string, ts *int64) error {
 	return nil
 }
 
+// Error is a non-2xx response from a write verb. It carries the upstream status
+// so a handler can propagate a meaningful client error (e.g. a stale request-id)
+// instead of masking everything as a 502.
+type Error struct {
+	Status int
+	Op     string
+	Body   string
+}
+
+func (e *Error) Error() string {
+	return fmt.Sprintf("%s: status %d: %s", e.Op, e.Status, e.Body)
+}
+
+func statusErr(op string, st int, b []byte) *Error {
+	return &Error{Status: st, Op: op, Body: strings.TrimSpace(string(b))}
+}
+
+// postRaw POSTs a JSON body to path and returns the status code + response body.
+// Schema-light: the body and response are raw JSON, so write verbs stay resilient
+// to OpenCode schema drift (the same philosophy as the read client). A nil body
+// sends an empty POST.
+func (c *Client) postRaw(ctx context.Context, path string, body json.RawMessage) (int, []byte, error) {
+	var r io.Reader
+	if len(body) > 0 {
+		r = bytes.NewReader(body)
+	}
+	req, err := c.newRequest(ctx, http.MethodPost, path, r)
+	if err != nil {
+		return 0, nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	return resp.StatusCode, b, nil
+}
+
+// CreateSession creates a new session (POST /session). The body is forwarded raw
+// (e.g. {"parentID":...,"title":...} or {}); the response is OpenCode's Session
+// JSON, from which the caller reads the new id.
+func (c *Client) CreateSession(ctx context.Context, body json.RawMessage) (json.RawMessage, error) {
+	if len(body) == 0 {
+		body = json.RawMessage(`{}`)
+	}
+	st, b, err := c.postRaw(ctx, "/session", body)
+	if err != nil {
+		return nil, err
+	}
+	if st < 200 || st >= 300 {
+		return nil, statusErr("POST /session", st, b)
+	}
+	return b, nil
+}
+
+// Prompt sends a message to a session via POST /session/:id/prompt_async, which
+// forks the turn and returns at once (204) — so a coordinator's send never blocks
+// on the turn. The body is forwarded raw ({parts, agent?, model?, variant?}).
+func (c *Client) Prompt(ctx context.Context, sessionID string, body json.RawMessage) (json.RawMessage, error) {
+	st, b, err := c.postRaw(ctx, "/session/"+sessionID+"/prompt_async", body)
+	if err != nil {
+		return nil, err
+	}
+	if st < 200 || st >= 300 {
+		return nil, statusErr("POST /session/"+sessionID+"/prompt_async", st, b)
+	}
+	return b, nil
+}
+
+// Abort cancels a session's in-flight turn (POST /session/:id/abort). The
+// resulting idle arrives asynchronously on the event stream, not from this call.
+func (c *Client) Abort(ctx context.Context, sessionID string) error {
+	st, b, err := c.postRaw(ctx, "/session/"+sessionID+"/abort", nil)
+	if err != nil {
+		return err
+	}
+	if st < 200 || st >= 300 {
+		return statusErr("POST /session/"+sessionID+"/abort", st, b)
+	}
+	return nil
+}
+
+// AnswerQuestion replies to a pending question (POST /question/:id/reply). The
+// body is forwarded raw ({"answers": [[...]]}).
+func (c *Client) AnswerQuestion(ctx context.Context, questionID string, body json.RawMessage) error {
+	st, b, err := c.postRaw(ctx, "/question/"+questionID+"/reply", body)
+	if err != nil {
+		return err
+	}
+	if st < 200 || st >= 300 {
+		return statusErr("POST /question/"+questionID+"/reply", st, b)
+	}
+	return nil
+}
+
+// ReplyPermission replies to a pending permission (POST /permission/:id/reply
+// with {"reply": "once"|"always"|"reject"}). It falls back to OpenCode's legacy
+// session-scoped route ({"response": ...}) ONLY when the canonical route looks
+// absent (transport error, or 404/405) and a sessionID is given — a meaningful
+// 4xx from the canonical route (e.g. 400 bad reply, 404-as-already-cleared at the
+// resource) is returned as-is, not swallowed by a retry.
+func (c *Client) ReplyPermission(ctx context.Context, permissionID, sessionID, reply string) error {
+	body, _ := json.Marshal(map[string]string{"reply": reply})
+	st, b, err := c.postRaw(ctx, "/permission/"+permissionID+"/reply", body)
+	if err == nil && st >= 200 && st < 300 {
+		return nil
+	}
+	routeMissing := err != nil || st == 404 || st == 405
+	if sessionID == "" || !routeMissing {
+		if err != nil {
+			return err
+		}
+		return statusErr("POST /permission/"+permissionID+"/reply", st, b)
+	}
+	// Legacy fallback (older server without the canonical route).
+	legacy, _ := json.Marshal(map[string]string{"response": reply})
+	st2, b2, err2 := c.postRaw(ctx, "/session/"+sessionID+"/permissions/"+permissionID, legacy)
+	if err2 != nil {
+		return err2
+	}
+	if st2 < 200 || st2 >= 300 {
+		return statusErr("POST /session/"+sessionID+"/permissions/"+permissionID, st2, b2)
+	}
+	return nil
+}
+
 // SessionStatuses returns the current per-session status map (sessionID ->
 // SessionStatus) from GET /session/status.
 func (c *Client) SessionStatuses(ctx context.Context) (map[string]json.RawMessage, error) {

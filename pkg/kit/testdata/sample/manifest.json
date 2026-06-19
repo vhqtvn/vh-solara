@@ -1,0 +1,14 @@
+{
+  "name": "sample",
+  "version": "1.0.0",
+  "description": "test kit (engine + overlay)",
+  "parameters": [
+    {"name": "controller_url", "description": "controller base URL", "required": true},
+    {"name": "worker_id", "description": "worker id", "default": "w1"},
+    {"name": "api_token", "description": "bearer token", "secret": true}
+  ],
+  "layers": [
+    {"name": "core", "type": "engine", "source": "core"},
+    {"name": "policy", "type": "overlay", "source": "policy"}
+  ]
+}
