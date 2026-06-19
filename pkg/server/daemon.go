@@ -32,6 +32,12 @@ type Daemon struct {
 	// listener isn't reachable by untrusted parties).
 	RegSecret string
 
+	// APIToken, when non-empty, is the bearer token required on the cross-worker
+	// coordination API (/api/workers/{id}/sessions|events). Empty = open (only
+	// safe when the edge isn't reachable by untrusted parties). The coordination
+	// API bypasses the session-auth edge — it's a headless, non-browser client.
+	APIToken string
+
 	Registry   *Registry
 	Proxy      *Proxy
 	WSUpgrader websocket.Upgrader
@@ -84,6 +90,11 @@ func (d *Daemon) Start() error {
 	userMux.HandleFunc("POST /api/workers/{id}/kill", d.handleKillWorker)
 	userMux.HandleFunc("GET /{$}", d.handleUIPage)
 
+	// Cross-worker coordination API (A3) — its own mux, gated by a bearer token
+	// and matched BEFORE session auth (headless, non-browser client).
+	coordMux := http.NewServeMux()
+	d.registerCoordRoutes(coordMux)
+
 	// Wrap the userMux in a middleware to intercept wildcard host patterns
 	var rootHandler http.Handler = userMux
 
@@ -106,6 +117,10 @@ func (d *Daemon) Start() error {
 	// subdomain — outside the host interceptor. The worker registration listener
 	// (DaemonAddr) is separate and intentionally not covered here. nil = no-op.
 	rootHandler = d.Auth.Middleware(rootHandler)
+
+	// The coordination API sits OUTSIDE session auth (bearer-gated instead), so a
+	// headless coordinator reaches it without a browser session.
+	rootHandler = d.coordFront(coordMux, rootHandler)
 
 	log.Printf("Starting vh-solara user UI server on %s", d.Addr)
 	return http.ListenAndServe(d.Addr, rootHandler)
@@ -137,7 +152,7 @@ func (d *Daemon) hostInterceptor(pattern *regexp.Regexp, next http.Handler) http
 
 			log.Printf("[HostInterceptor] Proxying to worker %s (transport closed: %v)",
 				worker.ID, worker.Transport == nil || worker.Transport.IsClosed())
-			d.Proxy.HandleChamberDirect(worker.ID, worker, w, r)
+			d.Proxy.HandleWorkerDirect(worker.ID, worker, w, r)
 			return
 		}
 

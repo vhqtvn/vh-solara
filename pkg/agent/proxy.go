@@ -2,11 +2,11 @@ package agent
 
 // Proxy holds configuration for raw proxying to local services.
 type Proxy struct {
-	ChamberPort int // OpenChamber port (0 if not running)
+	WebPort int // the worker's local web UI port (whatever --web mode is running; 0 if none)
 }
 
-func NewProxy(chamberPort int) *Proxy {
+func NewProxy(webPort int) *Proxy {
 	return &Proxy{
-		ChamberPort: chamberPort,
+		WebPort: webPort,
 	}
 }
