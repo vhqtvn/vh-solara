@@ -122,6 +122,14 @@ func Generate(version string) string {
 	p("- `epoch` (in the snapshot and the `X-VH-Epoch` header) identifies the store lifetime; seq\n")
 	p("  resets on daemon restart — on epoch change, re-snapshot. Never compare seqs across epochs.\n\n")
 
+	p("## Multi-project (one worker, many project dirs)\n\n")
+	p("- A worker multiplexes one instance per project DIR (own store/epoch/seq). A session is\n")
+	p("  owned by the dir it was created under. Pass the SAME `?dir=<dir>` (or `x-opencode-directory`\n")
+	p("  header) on EVERY verb (snapshot/stream/send/spawn/abort/answer/reply/archive); omitting it\n")
+	p("  targets the default project — mismatched dir silently hits the wrong (often empty) instance.\n")
+	p("- `GET /vh/projects` → `[{dir, epoch, seq, sessions}]` lists the bridged instances; pin your\n")
+	p("  watch cursor to one project's (epoch, seq). Cross-machine: `/api/workers/{id}/projects`.\n\n")
+
 	p("## Transport\n\n")
 	p("- Local (agent on the worker machine): hit the worker's `/vh/*` directly, or run\n")
 	p("  `vh-solara mcp --local`. Over a Unix socket (container / no host networking): start the\n")

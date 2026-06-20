@@ -17,6 +17,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -186,6 +187,7 @@ func (s *Server) Handler() http.Handler {
 		writeJSONResp(w, map[string]string{"version": v})
 	})
 	mux.HandleFunc("/vh/snapshot", s.handleSnapshot)
+	mux.HandleFunc("/vh/projects", s.handleProjects)
 	mux.HandleFunc("/vh/stream", s.handleStream)
 	mux.HandleFunc("/vh/render", s.handleRender)
 	mux.HandleFunc("/vh/highlight.css", s.handleHighlightCSS)
@@ -401,6 +403,42 @@ func messageFilter(r *http.Request) map[string]bool {
 		}
 	}
 	return filter
+}
+
+// projectInfo describes one bridged project instance (a per-directory aggregator)
+// for the discovery endpoint.
+type projectInfo struct {
+	Dir      string `json:"dir"`   // project directory ("" = the worker's default project)
+	Epoch    string `json:"epoch"` // store lifetime id (changes on daemon restart)
+	Seq      uint64 `json:"seq"`   // current head seq for this project's store
+	Sessions int    `json:"sessions"`
+}
+
+// handleProjects lists the project instances this worker currently bridges — one
+// per directory (default "" plus any ?dir= touched). Machine-readable so a client
+// over the socket can discover which projects are live and their (epoch, seq)
+// before pinning a watch loop. A logical session is owned by exactly one project:
+// the dir it was created under. Pass that same ?dir= (or x-opencode-directory
+// header) on EVERY verb so spawn → snapshot → stream → abort/archive route to it.
+func (s *Server) handleProjects(w http.ResponseWriter, r *http.Request) {
+	s.aggMu.Lock()
+	type entry struct {
+		dir string
+		agg *aggregator.Aggregator
+	}
+	live := make([]entry, 0, len(s.aggs))
+	for dir, a := range s.aggs {
+		live = append(live, entry{dir, a})
+	}
+	s.aggMu.Unlock()
+
+	out := make([]projectInfo, 0, len(live))
+	for _, e := range live {
+		st := e.agg.Store()
+		out = append(out, projectInfo{Dir: e.dir, Epoch: st.Epoch(), Seq: st.Head(), Sessions: len(st.SessionIDs())})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Dir < out[j].Dir })
+	writeJSONResp(w, out)
 }
 
 func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {

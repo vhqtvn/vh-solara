@@ -160,6 +160,26 @@ func TestSnapshotStampsEpochSeqHeaders(t *testing.T) {
 	}
 }
 
+func TestProjectsEnumeratesInstances(t *testing.T) {
+	f := &fakeOC{}
+	web, agg := newVerbServer(t, f)
+	resp, err := http.Get(web.URL + "/vh/projects")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var got []map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0]["dir"] != "" {
+		t.Fatalf("want the default project enumerated, got %v", got)
+	}
+	if e, _ := got[0]["epoch"].(string); e == "" || e != agg.Store().Epoch() {
+		t.Fatalf("project epoch must match the store epoch, got %v want %q", got[0]["epoch"], agg.Store().Epoch())
+	}
+}
+
 func TestSendForwardsPrompt(t *testing.T) {
 	f := &fakeOC{}
 	web, _ := newVerbServer(t, f)

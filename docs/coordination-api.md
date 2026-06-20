@@ -92,6 +92,40 @@ The cross-worker controller API (`/api/workers/{id}/*`) is **not** affected: it'
 host↔host over the tunnel, so loopback TCP is fine there. UDS solves only the
 worker-direct / container-isolation case.
 
+> **Bind-mount the socket's DIRECTORY, not the file.** On restart vh recreates the
+> socket (new inode); a container that bind-mounted the file keeps the dead inode
+> (connection refused until recreate). Mount the parent dir (e.g. `-v
+> /run/vh-solara:/run/vh-solara`) and point clients at `<dir>/vh.sock`.
+
+### Multi-project routing (one worker, many project dirs)
+
+A worker's `/vh` server multiplexes **one aggregator per project directory** —
+each with its **own store, epoch, and seq**. A logical session is owned by exactly
+one project: **the `dir` it was created under**. Every `/vh/*` verb (snapshot,
+stream, send, spawn, abort, answer-question, reply-permission, archive) resolves
+its project from `?dir=<dir>` (or the `x-opencode-directory` header); omitting it
+targets the **default** project (`""` = the worker's cwd).
+
+So: **pass the same `?dir=` on every verb for a session.** Mismatched dir is a
+silent footgun — spawn under `dir=X` then snapshot/abort with no dir hits the
+empty default instance (the spawned session is invisible there, and abort/archive
+ack as no-ops against an instance that doesn't own it).
+
+Discover what's bridged (machine-readable, over the socket too):
+
+```
+GET /vh/projects → [{ "dir": "", "epoch": "ep-…", "seq": 6, "sessions": 3 },
+                    { "dir": "/work/alpha", "epoch": "ep-…", "seq": 2, "sessions": 1 }, …]
+```
+
+Each entry is a live per-dir instance with its own `epoch`/`seq`. Cross-machine
+mirror: `GET /api/workers/{id}/projects`. Resolve your project dir → its entry,
+then pin the watch loop's `(epoch, seq)` cursor to that instance — snapshot+stream
+with that `?dir=` are scoped to that store, and the per-dir `epoch` lets a watcher
+detect (and reject) ever flipping to a different project's instance mid-stream.
+(To enumerate *all* opencode projects, not just the bridged ones, use the
+`/oc/project` passthrough.)
+
 ## V2 — typed write verbs (worker `/vh/*`)
 
 All POST, JSON body, behind the existing CSRF guard. Optional `idempotency_key`
@@ -161,6 +195,7 @@ the session-auth edge — the coordinator is headless.
 | POST | `/api/workers/{id}/sessions/{sid}/archive` | `/vh/archive` |
 | POST | `/api/workers/{id}/sessions/{sid}/questions/{qid}` | `/vh/answer-question` |
 | POST | `/api/workers/{id}/sessions/{sid}/permissions/{pid}` | `/vh/reply-permission` |
+| GET | `/api/workers/{id}/projects` | `/vh/projects` (bridged per-dir instances) |
 | GET | `/api/workers/{id}/events` | `/vh/stream` (SSE; `?cursor=`/`Last-Event-ID`) |
 
 - **epoch + seq**: the worker stamps `X-VH-Epoch` / `X-VH-Seq` on every `/vh/*`

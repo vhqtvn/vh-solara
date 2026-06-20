@@ -39,6 +39,7 @@ func (d *Daemon) registerCoordRoutes(mux *http.ServeMux) {
 	// Bearer-gated worker discovery for headless clients (the dashboard's
 	// GET /api/workers is session-authed; this is its coordination-API peer).
 	mux.HandleFunc("GET /api/coord/workers", d.coordListWorkers)
+	mux.HandleFunc("GET /api/workers/{id}/projects", d.coordProjects)
 	mux.HandleFunc("GET /api/workers/{id}/sessions", d.coordSnapshot)
 	mux.HandleFunc("POST /api/workers/{id}/sessions", d.coordSpawn)
 	mux.HandleFunc("GET /api/workers/{id}/sessions/{sid}", d.coordSessionDetail)
@@ -171,6 +172,17 @@ func (d *Daemon) coordListWorkers(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(out)
+}
+
+// coordProjects lists the project instances a worker bridges (dir/epoch/seq/
+// sessions) — the cross-machine mirror of the worker's /vh/projects, so a
+// coordinator can resolve "this project dir" → the right per-project cursor.
+func (d *Daemon) coordProjects(w http.ResponseWriter, r *http.Request) {
+	worker, ok := d.coordWorker(w, r)
+	if !ok {
+		return
+	}
+	d.proxyToVH(w, r, worker, http.MethodGet, "/vh/projects", "", nil)
 }
 
 func (d *Daemon) coordSnapshot(w http.ResponseWriter, r *http.Request) {
