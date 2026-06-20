@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -582,24 +583,50 @@ func (s *Server) handleRender(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	results := make([]renderResult, 0, len(reqs))
-	for _, req := range reqs {
-		var html string
-		switch req.Kind {
-		case "markdown":
-			html = s.renderer.Markdown(req.Text)
-		case "diff":
-			html = s.renderer.Diff(req.File, req.Before, req.After)
-		case "patch":
-			if req.Mode == "split" {
-				html = s.renderer.PatchSplit(req.Patch)
-			} else {
-				html = s.renderer.Patch(req.Patch)
+	// Render the batch across goroutines: the per-block work (goldmark + chroma +
+	// sanitize) is CPU-bound and concurrent-safe (each call uses a local buffer;
+	// only the renderer's cache map is mutex-guarded), so a big first-open batch
+	// uses all cores instead of one. Bounded to NumCPU; results indexed (the
+	// client maps by id, order doesn't matter). An unrendered slot keeps ID="" and
+	// is filtered out (matches the old "skip unknown kind" behavior).
+	slots := make([]renderResult, len(reqs))
+	conc := runtime.NumCPU()
+	if conc < 1 {
+		conc = 1
+	}
+	sem := make(chan struct{}, conc)
+	var wg sync.WaitGroup
+	for i := range reqs {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			req := reqs[i]
+			var html string
+			switch req.Kind {
+			case "markdown":
+				html = s.renderer.Markdown(req.Text)
+			case "diff":
+				html = s.renderer.Diff(req.File, req.Before, req.After)
+			case "patch":
+				if req.Mode == "split" {
+					html = s.renderer.PatchSplit(req.Patch)
+				} else {
+					html = s.renderer.Patch(req.Patch)
+				}
+			default:
+				return // leave slot zero (ID=="") → filtered below
 			}
-		default:
-			continue
+			slots[i] = renderResult{ID: req.ID, HTML: html}
+		}(i)
+	}
+	wg.Wait()
+	results := make([]renderResult, 0, len(slots))
+	for _, r := range slots {
+		if r.ID != "" {
+			results = append(results, r)
 		}
-		results = append(results, renderResult{ID: req.ID, HTML: html})
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(results)
