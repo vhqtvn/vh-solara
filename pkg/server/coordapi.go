@@ -39,6 +39,7 @@ func (d *Daemon) registerCoordRoutes(mux *http.ServeMux) {
 	// Bearer-gated worker discovery for headless clients (the dashboard's
 	// GET /api/workers is session-authed; this is its coordination-API peer).
 	mux.HandleFunc("GET /api/coord/workers", d.coordListWorkers)
+	mux.HandleFunc("GET /api/workers/{id}/skill/emit", d.coordSkillEmit)
 	mux.HandleFunc("GET /api/workers/{id}/projects", d.coordProjects)
 	mux.HandleFunc("GET /api/workers/{id}/sessions", d.coordSnapshot)
 	mux.HandleFunc("POST /api/workers/{id}/sessions", d.coordSpawn)
@@ -172,6 +173,17 @@ func (d *Daemon) coordListWorkers(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(out)
+}
+
+// coordSkillEmit returns a worker's version-stamped client skill (the cross
+// machine mirror of /vh/skill/emit) so a coordinator can drift-check against the
+// running daemon's surface.
+func (d *Daemon) coordSkillEmit(w http.ResponseWriter, r *http.Request) {
+	worker, ok := d.coordWorker(w, r)
+	if !ok {
+		return
+	}
+	d.proxyToVH(w, r, worker, http.MethodGet, "/vh/skill/emit", "", nil)
 }
 
 // coordProjects lists the project instances a worker bridges (dir/epoch/seq/

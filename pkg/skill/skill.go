@@ -46,7 +46,9 @@ func Generate(version string) string {
 	p("# Driving vh-solara (coordination client) — %s\n\n", version)
 	p("vh-solara surfaces raw opencode facts and read/write/subscribe verbs; it carries NO\n")
 	p("coordination policy. This skill is GENERATED from the running binary's surface and\n")
-	p("version-stamped, so it can't drift — re-provision (`vh-solara skill install`) on upgrade.\n\n")
+	p("version-stamped, so it can't drift — re-provision (`vh-solara skill install`) on upgrade.\n")
+	p("Drift-check with no binary: `GET /vh/skill/emit` returns these exact bytes from the\n")
+	p("running daemon (header `X-VH-Skill-Version`); diff it against your committed copy.\n\n")
 
 	p("**Worker prerequisite:** the API lives on vh-solara's own web server, served only when a\n")
 	p("worker runs `--web vh` (`local-server`, or `client-daemon --web vh`).\n\n")

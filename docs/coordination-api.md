@@ -196,6 +196,7 @@ the session-auth edge — the coordinator is headless.
 | POST | `/api/workers/{id}/sessions/{sid}/questions/{qid}` | `/vh/answer-question` |
 | POST | `/api/workers/{id}/sessions/{sid}/permissions/{pid}` | `/vh/reply-permission` |
 | GET | `/api/workers/{id}/projects` | `/vh/projects` (bridged per-dir instances) |
+| GET | `/api/workers/{id}/skill/emit` | `/vh/skill/emit` (version-stamped client skill) |
 | GET | `/api/workers/{id}/events` | `/vh/stream` (SSE; `?cursor=`/`Last-Event-ID`) |
 
 - **epoch + seq**: the worker stamps `X-VH-Epoch` / `X-VH-Seq` on every `/vh/*`
@@ -316,6 +317,13 @@ hand-maintaining a copy that drifts:
 
 - `vh-solara skill emit` — write the generated `SKILL.md` to stdout (diff / CI check)
 - `vh-solara skill install --repo <path> [--out .opencode/skills/vh-solara]`
+- `GET /vh/skill/emit` — the **same bytes over HTTP/socket** (no binary needed),
+  `text/markdown` + an `X-VH-Skill-Version` header, generated from the **running
+  daemon's** surface (so emit-version ≡ `/vh/version`). A consumer with no
+  vh-solara binary drift-checks in-container: `curl --unix-socket … /vh/skill/emit`
+  → `diff` against the committed `SKILL.md` + compare the header to the pinned
+  version. Cross-machine mirror: `GET /api/workers/{id}/skill/emit`. Read-only;
+  `install` (writing into a repo) stays a host CLI step.
 
 The verb reference is generated from the **live MCP tool defs** and the gate-field
 list is **reflected from `state.GateFacts`**, so neither can silently drift from

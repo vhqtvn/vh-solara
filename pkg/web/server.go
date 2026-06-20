@@ -27,6 +27,7 @@ import (
 	"github.com/vhqtvn/vh-solara/pkg/auth"
 	"github.com/vhqtvn/vh-solara/pkg/quota"
 	"github.com/vhqtvn/vh-solara/pkg/render"
+	"github.com/vhqtvn/vh-solara/pkg/skill"
 	"github.com/vhqtvn/vh-solara/pkg/vhlog"
 )
 
@@ -97,6 +98,27 @@ func (s *Server) SetCORSOrigins(origins []string) { s.corsOrigins = origins }
 
 // SetAppVersion records this vh-solara build's version for GET /vh/version.
 func (s *Server) SetAppVersion(v string) { s.appVersion = v }
+
+// version is the running daemon's build version ("dev" if unstamped) — the single
+// source for /vh/version and the skill stamp, so they agree by construction.
+func (s *Server) version() string {
+	if s.appVersion != "" {
+		return s.appVersion
+	}
+	return "dev"
+}
+
+// handleSkillEmit serves the version-stamped client skill generated from the
+// RUNNING daemon's surface — the exact bytes `vh-solara skill emit` produces — so
+// a consumer (e.g. in a container with no vh-solara binary) can fetch it over the
+// socket and diff against its committed copy. Read-only; the version rides a
+// header so a pin-match is one call. Provisioning (install) stays a host CLI step.
+func (s *Server) handleSkillEmit(w http.ResponseWriter, r *http.Request) {
+	v := s.version()
+	w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
+	w.Header().Set("X-VH-Skill-Version", v)
+	_, _ = io.WriteString(w, skill.Generate(v))
+}
 
 // SetRestartOpenCode wires the daemon's OpenCode-restart hook. Optional.
 func (s *Server) SetRestartOpenCode(fn func(context.Context) error) { s.restartOC = fn }
@@ -179,12 +201,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/vh/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok"))
 	})
+	mux.HandleFunc("/vh/skill/emit", s.handleSkillEmit)
 	mux.HandleFunc("/vh/version", func(w http.ResponseWriter, r *http.Request) {
-		v := s.appVersion
-		if v == "" {
-			v = "dev"
-		}
-		writeJSONResp(w, map[string]string{"version": v})
+		writeJSONResp(w, map[string]string{"version": s.version()})
 	})
 	mux.HandleFunc("/vh/snapshot", s.handleSnapshot)
 	mux.HandleFunc("/vh/projects", s.handleProjects)

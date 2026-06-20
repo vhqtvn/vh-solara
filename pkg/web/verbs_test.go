@@ -160,6 +160,31 @@ func TestSnapshotStampsEpochSeqHeaders(t *testing.T) {
 	}
 }
 
+func TestSkillEmitEndpoint(t *testing.T) {
+	f := &fakeOC{}
+	web, _ := newVerbServer(t, f)
+	resp, err := http.Get(web.URL + "/vh/skill/emit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		t.Fatalf("want 200, got %d", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/markdown") {
+		t.Fatalf("want text/markdown, got %q", ct)
+	}
+	if resp.Header.Get("X-Vh-Skill-Version") == "" {
+		t.Fatal("missing X-VH-Skill-Version header")
+	}
+	// Real generated skill, not the SPA catch-all.
+	s := string(body)
+	if strings.HasPrefix(strings.TrimSpace(s), "<") || !strings.Contains(s, "### `send_message`") || !strings.Contains(s, "gate{}") {
+		t.Fatalf("body is not the generated skill: %.80s", s)
+	}
+}
+
 func TestProjectsEnumeratesInstances(t *testing.T) {
 	f := &fakeOC{}
 	web, agg := newVerbServer(t, f)

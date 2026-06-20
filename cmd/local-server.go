@@ -167,6 +167,7 @@ with --opencode-url, or spawn a survivable detached instance with
 			log.Fatalf("Auth setup failed: %v", err)
 		}
 		srv.SetAuth(authn)
+		srv.SetAppVersion(Version) // so /vh/version and /vh/skill/emit report the real build
 		srv.SetRestartOpenCode(func(ctx context.Context) error {
 			opencodeMu.Lock()
 			defer opencodeMu.Unlock()
