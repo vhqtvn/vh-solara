@@ -10,6 +10,12 @@ import { historyAt, historyLen, pushHistory } from "../history";
 import { type AcItem, commandSuggestions, fileSuggestions } from "../lib/complete";
 import ModelDialog from "./ModelDialog";
 import PartView from "./Part";
+import { Deferred } from "./Deferred";
+
+// Eager-mount the last N message rows (the tail you see on open + where new
+// messages and the live stream land), so scroll-to-bottom and streaming stay
+// correct; older rows mount lazily as they near the viewport (see Deferred).
+const EAGER_TAIL = 30;
 import QuestionCard from "./QuestionCard";
 import Icon from "./Icon";
 import BrandMark from "./BrandMark";
@@ -769,7 +775,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       <div class="chat-scroll" ref={scrollEl} onScroll={onScrolled}>
         <div class="chat-content" ref={contentEl} classList={{ ready: ready() }}>
           <For each={messages()}>
-            {(m) => (
+            {(m, i) => (
               <div class="msg" classList={{ user: m.info.role === "user", assistant: m.info.role === "assistant" }}>
                 <div class="msg-head">
                   <span class="msg-role">{roleLabel(m.info.role)}</span>
@@ -797,7 +803,12 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
                     </Show>
                   </div>
                 </div>
-                <div class="msg-parts">
+                <Deferred
+                  class="msg-parts"
+                  eager={i() >= messages().length - EAGER_TAIL}
+                  root={() => scrollEl}
+                  minHeight={48}
+                >
                   <For each={m.partOrder}>
                     {(pid) => (
                       <PartView
@@ -806,7 +817,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
                       />
                     )}
                   </For>
-                </div>
+                </Deferred>
                 <Show when={messageError(m.info)}>
                   <div class="msg-error">⚠ {messageError(m.info)}</div>
                 </Show>
