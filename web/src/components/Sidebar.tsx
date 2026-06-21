@@ -12,6 +12,21 @@ import Icon from "./Icon";
 
 export default function Sidebar(props: { open: boolean; onClose: () => void }) {
   const [archivedOpen, setArchivedOpen] = createSignal(false);
+  // Search is collapsed by default (rarely used, and it costs a whole row). A
+  // header toggle reveals it; an active filter keeps it shown so the filter is
+  // never silently hidden.
+  const [searchOpen, setSearchOpen] = createSignal(false);
+  let searchInput: HTMLInputElement | undefined;
+  const toggleSearch = () => {
+    const next = !(searchOpen() || searchQuery());
+    if (next) {
+      setSearchOpen(true);
+      queueMicrotask(() => searchInput?.focus());
+    } else {
+      setSearchQuery("");
+      setSearchOpen(false);
+    }
+  };
 
   // Drag the right edge to resize; the sidebar sits at the viewport's left, so
   // the new width is just the pointer's X. Width is clamped + persisted in layout.
@@ -47,6 +62,17 @@ export default function Sidebar(props: { open: boolean; onClose: () => void }) {
         <span class="status" classList={{ [state.status]: true }} data-tip="connection">
           {state.status}
         </span>
+        <button
+          type="button"
+          class="icon-btn"
+          classList={{ on: searchOpen() || !!searchQuery() }}
+          onClick={toggleSearch}
+          data-tip="Search sessions"
+          aria-label="Search sessions"
+          aria-pressed={searchOpen() || !!searchQuery()}
+        >
+          <Icon name="filter" />
+        </button>
         <button type="button" class="icon-btn" onClick={() => void newSession()} data-tip="New session" aria-label="Create session">
           <Icon name="plus" />
         </button>
@@ -55,21 +81,25 @@ export default function Sidebar(props: { open: boolean; onClose: () => void }) {
         </button>
       </div>
       <ProjectSwitcher />
-      <div class="session-search">
-        <Icon name="filter" size={13} />
-        <input
-          type="text"
-          class="session-search-input"
-          placeholder="Search sessions…"
-          value={searchQuery()}
-          onInput={(e) => setSearchQuery(e.currentTarget.value)}
-        />
-        <Show when={searchQuery()}>
-          <button type="button" class="session-search-clear" aria-label="Clear search" onClick={() => setSearchQuery("")}>
+      <Show when={searchOpen() || searchQuery()}>
+        <div class="session-search">
+          <Icon name="filter" size={13} />
+          <input
+            type="text"
+            class="session-search-input"
+            placeholder="Search sessions…"
+            ref={searchInput}
+            value={searchQuery()}
+            onInput={(e) => setSearchQuery(e.currentTarget.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Escape" && !searchQuery()) setSearchOpen(false);
+            }}
+          />
+          <button type="button" class="session-search-clear" aria-label="Clear search" onClick={() => { setSearchQuery(""); searchInput?.focus(); }}>
             <Icon name="x" size={12} />
           </button>
-        </Show>
-      </div>
+        </div>
+      </Show>
       <OrphanBanner />
       <SessionTree />
       <div class="sidebar-foot">

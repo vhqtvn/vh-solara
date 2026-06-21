@@ -1,5 +1,6 @@
 import { createResource, createSignal, For, onCleanup, onMount, Show } from "solid-js";
-import { CUSTOM_FIELDS, customTheme, setCustomTheme, setThemeId, theme, THEMES } from "../theme";
+import { CUSTOM_FIELDS, customTheme, exportCustomTheme, importCustomTheme, resetCustomTheme, seedCustomFromTheme, setCustomTheme, theme, THEMES } from "../theme";
+import ThemePicker from "./ThemePicker";
 import { customFont, font, FONTS, setCustomFont, setFontId } from "../font";
 import { hideBuiltin, setHideBuiltin } from "../models";
 import { setStreamLive, streamLive, treeDensity, setTreeDensity, uiScale, setUiScale, orientation, setOrientation, MIN_SCALE, MAX_SCALE } from "../prefs";
@@ -37,6 +38,26 @@ export default function SettingsDialog(props: { onClose: () => void }) {
   // for the label/thumb; null means "not dragging, show the committed scale".
   const [zoomDraft, setZoomDraft] = createSignal<number | null>(null);
   const zoomValue = () => zoomDraft() ?? uiScale();
+  // Custom-theme export/import scratch state (null = idle, else a transient note).
+  const [importText, setImportText] = createSignal("");
+  const [themeNote, setThemeNote] = createSignal<{ ok: boolean; msg: string } | null>(null);
+  const copyTheme = async () => {
+    try {
+      await navigator.clipboard.writeText(exportCustomTheme());
+      setThemeNote({ ok: true, msg: "Copied theme to clipboard." });
+    } catch {
+      setThemeNote({ ok: false, msg: "Clipboard blocked — copy from the import box instead." });
+      setImportText(exportCustomTheme());
+    }
+  };
+  const doImport = () => {
+    if (importCustomTheme(importText())) {
+      setThemeNote({ ok: true, msg: "Imported theme." });
+      setImportText("");
+    } else {
+      setThemeNote({ ok: false, msg: "Not a valid theme — expected JSON with #rrggbb colors." });
+    }
+  };
   // Terminal sessions (fetched when the Terminals tab is open).
   const [terms, { refetch: refetchTerms }] = createResource(sec, (s) => (s === "terminals" ? listTerms() : Promise.resolve([])));
 
@@ -72,15 +93,9 @@ export default function SettingsDialog(props: { onClose: () => void }) {
           </nav>
           <div class="settings-content">
             <Show when={sec() === "appearance"}>
-              <div class="setting-row">
+              <div class="setting-row setting-row-stack">
                 <label>Theme</label>
-                <Select
-                  class="theme-select"
-                  ariaLabel="Theme"
-                  value={theme()}
-                  options={THEMES.map((t) => ({ value: t.id, label: t.name }))}
-                  onChange={setThemeId}
-                />
+                <ThemePicker />
               </div>
               <p class="setting-hint">Light themes also switch code syntax highlighting.</p>
               <Show when={theme() === "custom"}>
@@ -105,8 +120,40 @@ export default function SettingsDialog(props: { onClose: () => void }) {
                       onChange={(e) => setCustomTheme({ light: e.currentTarget.checked })}
                     />
                   </label>
+                  <div class="custom-theme-actions">
+                    <Select
+                      ariaLabel="Start from a preset theme"
+                      value=""
+                      options={[
+                        { value: "", label: "Start from preset…" },
+                        ...THEMES.filter((t) => t.id !== "custom").map((t) => ({ value: t.id, label: t.name })),
+                      ]}
+                      onChange={(v) => {
+                        if (v) seedCustomFromTheme(v);
+                      }}
+                    />
+                    <button type="button" class="theme-select" onClick={() => void copyTheme()}>Copy</button>
+                    <button type="button" class="theme-select" onClick={() => { resetCustomTheme(); setThemeNote({ ok: true, msg: "Reset to default." }); }}>Reset</button>
+                  </div>
+                  <div class="custom-theme-import">
+                    <input
+                      type="text"
+                      class="theme-select"
+                      aria-label="Import theme JSON"
+                      placeholder="Paste theme JSON to import…"
+                      value={importText()}
+                      onInput={(e) => setImportText(e.currentTarget.value)}
+                    />
+                    <button type="button" class="theme-select" disabled={!importText().trim()} onClick={doImport}>Import</button>
+                  </div>
                 </div>
-                <p class="setting-hint">Pick the 7 base colors — the rest of the palette derives from them.</p>
+                <p class="setting-hint">
+                  Pick the 7 base colors — the rest of the palette derives from them. Start from a preset to fork it,
+                  Copy to share the palette, or paste JSON to import.
+                </p>
+                <Show when={themeNote()}>
+                  <p class="setting-hint" classList={{ "setting-err": !themeNote()!.ok }}>{themeNote()!.msg}</p>
+                </Show>
               </Show>
               <div class="setting-row">
                 <label>Session list</label>

@@ -136,8 +136,10 @@ test("sidebar search filters sessions and pinning floats one to the top", async 
   await page.goto("/");
   await expect(page.locator(".tree-node", { hasText: "Demo session" })).toBeVisible();
 
-  // Search narrows the tree to a flat match list.
+  // Search is collapsed by default — reveal it via the header toggle first.
+  await page.getByRole("button", { name: "Search sessions" }).click();
   const search = page.getByPlaceholder("Search sessions…");
+  await expect(search).toBeVisible();
   await search.fill("zzzznomatch");
   await expect(page.locator(".tree-empty")).toContainText("No matches");
   await search.fill("Demo");
@@ -150,6 +152,33 @@ test("sidebar search filters sessions and pinning floats one to the top", async 
   const menu = page.locator(".ctxm-menu");
   await menu.getByText(/Pin to top/).click();
   await expect(page.locator(".tree-node .dot.pin").first()).toBeVisible();
+});
+
+test("session search collapses by default and toggles from the header", async ({ page }) => {
+  await page.goto("/");
+  const search = page.getByPlaceholder("Search sessions…");
+  await expect(search).toBeHidden(); // collapsed by default → reclaims a row
+
+  const toggle = page.getByRole("button", { name: "Search sessions" });
+  await toggle.click();
+  await expect(search).toBeVisible();
+  await expect(search).toBeFocused();
+
+  // Clearing keeps the field open (just empties it).
+  await search.fill("Demo");
+  await page.locator(".session-search-clear").click();
+  await expect(search).toBeVisible();
+  await expect(search).toHaveValue("");
+
+  // Escape on an empty field collapses it.
+  await search.press("Escape");
+  await expect(search).toBeHidden();
+
+  // The header toggle, when a filter is active, clears it and collapses.
+  await toggle.click();
+  await search.fill("Demo");
+  await toggle.click();
+  await expect(search).toBeHidden();
 });
 
 test("right-click session title opens a menu; Archive… confirms related sessions", async ({ page }) => {
