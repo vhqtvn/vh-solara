@@ -1,5 +1,5 @@
 import { createResource, createSignal, For, onCleanup, onMount, Show } from "solid-js";
-import { setThemeId, theme, THEMES } from "../theme";
+import { CUSTOM_FIELDS, customTheme, setCustomTheme, setThemeId, theme, THEMES } from "../theme";
 import { customFont, font, FONTS, setCustomFont, setFontId } from "../font";
 import { hideBuiltin, setHideBuiltin } from "../models";
 import { setStreamLive, streamLive, treeDensity, setTreeDensity, uiScale, setUiScale, orientation, setOrientation, MIN_SCALE, MAX_SCALE } from "../prefs";
@@ -83,6 +83,31 @@ export default function SettingsDialog(props: { onClose: () => void }) {
                 />
               </div>
               <p class="setting-hint">Light themes also switch code syntax highlighting.</p>
+              <Show when={theme() === "custom"}>
+                <div class="custom-theme">
+                  <For each={CUSTOM_FIELDS}>
+                    {(f) => (
+                      <label class="custom-theme-row">
+                        <span>{f.label}</span>
+                        <input
+                          type="color"
+                          value={customTheme()[f.key]}
+                          onInput={(e) => setCustomTheme({ [f.key]: e.currentTarget.value })}
+                        />
+                      </label>
+                    )}
+                  </For>
+                  <label class="custom-theme-row">
+                    <span>Light mode (syntax + diff colors)</span>
+                    <input
+                      type="checkbox"
+                      checked={customTheme().light}
+                      onChange={(e) => setCustomTheme({ light: e.currentTarget.checked })}
+                    />
+                  </label>
+                </div>
+                <p class="setting-hint">Pick the 7 base colors — the rest of the palette derives from them.</p>
+              </Show>
               <div class="setting-row">
                 <label>Session list</label>
                 <Select

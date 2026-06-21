@@ -138,6 +138,30 @@
   --code-bg: #32302f; --code-surface: #1d2021;
   --md-h1: #fabd2f; --md-h2: #b8bb26; --md-code: #b8bb26; --md-marker: #fe8019;
 }
+:root.theme-rose-pine {
+  --bg: #191724; --bg-2: #1f1d2e; --border: #403d52;
+  --fg: #e0def4; --fg-dim: #908caa; --accent: #9ccfd8; --accent-2: #c4a7e7;
+}
+:root.theme-one-dark {
+  --bg: #282c34; --bg-2: #2c313a; --border: #3e4451;
+  --fg: #abb2bf; --fg-dim: #828997; --accent: #61afef; --accent-2: #c678dd;
+}
+:root.theme-everforest {
+  --bg: #2d353b; --bg-2: #343f44; --border: #475258;
+  --fg: #d3c6aa; --fg-dim: #9da9a0; --accent: #a7c080; --accent-2: #d699b6;
+}
+:root.theme-ayu {
+  --bg: #1f2430; --bg-2: #232834; --border: #383e4c;
+  --fg: #cccac2; --fg-dim: #8a9199; --accent: #ffcc66; --accent-2: #73d0ff;
+}
+:root.theme-solarized-dark {
+  --bg: #002b36; --bg-2: #073642; --border: #0a4b59;
+  --fg: #93a1a1; --fg-dim: #657b83; --accent: #268bd2; --accent-2: #d33682;
+}
+:root.theme-solarized-light {
+  --bg: #fdf6e3; --bg-2: #eee8d5; --border: #ddd6c1;
+  --fg: #586e75; --fg-dim: #93a1a1; --accent: #268bd2; --accent-2: #d33682;
+}
 /* On light themes the most-prominent text must be dark, not white. */
 /* Light-theme overrides apply to ALL light themes via the generic marker class
    (set in theme.ts), so Shire (light) gets them too — not just `light`. */
@@ -1094,6 +1118,15 @@ body {
 }
 .question-custom:focus { border-color: var(--accent); }
 .question-actions { display: flex; justify-content: flex-end; }
+
+/* Custom-theme editor (Settings → Appearance, shown when the Custom theme is selected). */
+.custom-theme { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+.custom-theme-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 0.875rem; color: var(--fg-dim); }
+.custom-theme-row input[type="color"] {
+  width: 38px; height: 24px; padding: 0; border: 1px solid var(--border);
+  border-radius: 5px; background: var(--bg-2); cursor: pointer;
+}
+.custom-theme-row input[type="checkbox"] { width: 16px; height: 16px; cursor: pointer; }
 .question-send {
   display: inline-flex;
   align-items: center;
