@@ -1087,6 +1087,10 @@ body {
   padding: 8px 11px;
   font: inherit;
   outline: none;
+  /* Multi-line free-text answer: wraps, grows vertically, user-resizable. */
+  resize: vertical;
+  min-height: 2.6em;
+  line-height: 1.4;
 }
 .question-custom:focus { border-color: var(--accent); }
 .question-actions { display: flex; justify-content: flex-end; }

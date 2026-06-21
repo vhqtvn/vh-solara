@@ -89,12 +89,18 @@ export default function QuestionCard(props: { question: Question }) {
             {/* Free-text is allowed unless the question opts out (custom:false) —
                 matching opencode, which defaults custom to enabled. */}
             <Show when={q.custom !== false}>
-              <input
+              <textarea
                 class="question-custom"
-                type="text"
-                placeholder="Type your own answer…"
+                rows={2}
+                placeholder="Type your own answer… (⌘/Ctrl+Enter to send)"
                 value={custom()[qi()] || ""}
                 onInput={(e) => setCustom((c) => ({ ...c, [qi()]: e.currentTarget.value }))}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                    e.preventDefault();
+                    void submit();
+                  }
+                }}
               />
             </Show>
           </div>
