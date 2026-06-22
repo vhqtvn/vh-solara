@@ -9,16 +9,25 @@ import { termKeys } from "../ui";
 // flows through term.onData() so IME/composition resolves to final bytes (the
 // thing openchamber gets wrong); the PTY is sized on connect + every resize so
 // vim and width-aware tools work. A mobile key bar supplies Esc/Tab/Ctrl/arrows.
-const ARROWS: Record<string, string> = { up: "\x1b[A", down: "\x1b[B", right: "\x1b[C", left: "\x1b[D" };
+// `termId` selects which server PTY to attach to (tabs); session/title are
+// optional labels for the management UI.
+const ARROW_FINAL: Record<string, string> = { up: "A", down: "B", right: "C", left: "D" };
 
-export default function TerminalPane() {
+export default function TerminalPane(props: { termId?: string; session?: string; title?: string }) {
   let host!: HTMLDivElement;
   let term: Xterm | undefined;
   let fit: FitAddon | undefined;
   let ws: WebSocket | null = null;
   let reconnectTimer: number | undefined;
+  let liveTimer: number | undefined;
+  let lastRecv = 0; // ms timestamp of the last byte/keepalive from the server
   let backoff = 500; // ms, doubles per failed attempt up to a cap
   let intentional = false; // true when WE closed it (hide/cleanup) — don't auto-reconnect
+  // A half-open link (tunnel/proxy silently dropped, no close frame reaches us)
+  // leaves the socket "open" while no bytes flow — keystrokes vanish with no
+  // error. The server sends a keepalive every ~15s; if we go this long with no
+  // traffic at all, assume the link is dead and reconnect (replays scrollback).
+  const LIVENESS_MS = 45000;
   const enc = new TextEncoder();
   // connecting = first/manual attempt; reconnecting = auto-retrying after a drop;
   // disconnected = stopped (shell exited / gave up) and waiting for the user.
@@ -35,6 +44,14 @@ export default function TerminalPane() {
   };
   // Accessory-bar key → escape/control sequence, then refocus the terminal.
   const key = (seq: string) => { send(seq); term?.focus(); };
+  // Arrow key sequence honoring the app's cursor-key mode: full-screen apps
+  // (vim/less/htop) enable DECCKM and then expect ESC O A, not ESC [ A. Physical
+  // arrows handle this in xterm automatically; the on-screen bar must mirror it
+  // or arrows misbehave inside vim (the common mobile case).
+  const arrowSeq = (d: string) => {
+    const app = !!(term as unknown as { modes?: { applicationCursorKeysMode?: boolean } })?.modes?.applicationCursorKeysMode;
+    return (app ? "\x1bO" : "\x1b[") + ARROW_FINAL[d];
+  };
 
   // Reconnect after an *unexpected* drop (proxy/idle timeout, network blip,
   // laptop sleep) so the terminal doesn't silently go dead — keystrokes are
@@ -61,10 +78,16 @@ export default function TerminalPane() {
     // Reset so the server's scrollback replay rebuilds the screen cleanly
     // (avoids doubling content on a reconnect).
     term?.reset();
-    ws = new WebSocket(`${proto}://${location.host}/vh/term/ws?dir=${encodeURIComponent(projectDir())}`);
+    const q = new URLSearchParams({ dir: projectDir(), id: props.termId || "shared" });
+    if (props.session) q.set("session", props.session);
+    if (props.title) q.set("title", props.title);
+    ws = new WebSocket(`${proto}://${location.host}/vh/term/ws?${q.toString()}`);
     ws.binaryType = "arraybuffer";
-    ws.onopen = () => { backoff = 500; setStatus("open"); sendResize(); term?.focus(); };
-    ws.onmessage = (e) => { if (e.data instanceof ArrayBuffer && term) term.write(new Uint8Array(e.data)); };
+    lastRecv = Date.now();
+    ws.onopen = () => { backoff = 500; lastRecv = Date.now(); setStatus("open"); sendResize(); term?.focus(); };
+    // Any frame — PTY output OR the server's text keepalive — proves the link is
+    // live; text keepalives are ignored for rendering but refresh the watchdog.
+    ws.onmessage = (e) => { lastRecv = Date.now(); if (e.data instanceof ArrayBuffer && term) term.write(new Uint8Array(e.data)); };
     ws.onclose = (e) => {
       ws = null;
       // 1000 = clean server close (shell exited / session ended) — stay down and
@@ -83,6 +106,26 @@ export default function TerminalPane() {
   }
   // User-initiated reconnect from the overlay (resets backoff, retries now).
   const reconnectNow = () => { backoff = 500; intentional = false; connect(); };
+
+  // Watchdog-initiated reconnect for a half-open link: the socket still reads
+  // "open" but nothing arrives. Tear it down and reattach (server replays the
+  // scrollback, so the screen — and vim — come back).
+  function forceReconnect() {
+    clearTimeout(reconnectTimer);
+    const c = ws;
+    ws = null;
+    try { c?.close(); } catch { /* already gone */ }
+    backoff = 500;
+    intentional = false;
+    setStatus("reconnecting");
+    connect();
+  }
+  function checkLiveness() {
+    if (intentional || document.visibilityState === "hidden") return;
+    if (ws && ws.readyState === WebSocket.OPEN && lastRecv && Date.now() - lastRecv > LIVENESS_MS) {
+      forceReconnect();
+    }
+  }
 
   // "Size only counts while visible": when the tab is hidden, detach so this
   // client stops constraining the shared PTY size; reattach (replay) on return.
@@ -136,10 +179,12 @@ export default function TerminalPane() {
     });
     ro.observe(host);
     document.addEventListener("visibilitychange", onVisibility);
+    liveTimer = window.setInterval(checkLiveness, 5000);
     onCleanup(() => {
       ro.disconnect();
       document.removeEventListener("visibilitychange", onVisibility);
       clearTimeout(hideTimer);
+      clearInterval(liveTimer);
       disconnect();
       term?.dispose();
     });
@@ -179,7 +224,7 @@ export default function TerminalPane() {
           <button type="button" classList={{ on: ctrl() }} onClick={() => (setCtrl((v) => !v), term?.focus())}>ctrl</button>
           <button type="button" onClick={() => key("\x03")}>^C</button>
           <For each={["left", "up", "down", "right"]}>
-            {(d) => <button type="button" onClick={() => key(ARROWS[d])}>{{ up: "↑", down: "↓", left: "←", right: "→" }[d]}</button>}
+            {(d) => <button type="button" onClick={() => key(arrowSeq(d))}>{{ up: "↑", down: "↓", left: "←", right: "→" }[d]}</button>}
           </For>
           <button type="button" onClick={() => key("|")}>|</button>
           <button type="button" onClick={() => key("~")}>~</button>

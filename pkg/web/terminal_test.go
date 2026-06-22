@@ -108,6 +108,66 @@ func TestTerminalPersistsAndReattaches(t *testing.T) {
 	readUntil(t, b, "persist_marker", 8*time.Second)
 }
 
+func dialTermID(t *testing.T, srv *httptest.Server, dir, id string) *websocket.Conn {
+	t.Helper()
+	u, _ := url.Parse(srv.URL)
+	u.Scheme = "ws"
+	q := url.Values{"dir": {dir}, "id": {id}}
+	u.RawQuery = q.Encode()
+	c, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
+	if err != nil {
+		t.Fatalf("dial id=%q: %v", id, err)
+	}
+	_ = c.WriteMessage(websocket.TextMessage, []byte(`{"resize":{"cols":80,"rows":24}}`))
+	return c
+}
+
+// Two different ids on the same dir are independent shells; a third client with
+// the same id shares the first's shell. killTermSession is id-scoped.
+func TestTerminalMultipleIDsPerDir(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("no shell")
+	}
+	dir := t.TempDir()
+	s := &Server{}
+	srv := httptest.NewServer(http.HandlerFunc(s.handleTerminalWS))
+	defer srv.Close()
+
+	a := dialTermID(t, srv, dir, "shared")
+	defer a.Close()
+	b := dialTermID(t, srv, dir, "session:abc")
+	defer b.Close()
+
+	// Each shell has its own scrollback — a marker written to one must NOT show
+	// in the other.
+	_ = a.WriteMessage(websocket.BinaryMessage, []byte("echo MARK_SHARED\n"))
+	readUntil(t, a, "MARK_SHARED", 8*time.Second)
+	_ = b.WriteMessage(websocket.BinaryMessage, []byte("echo MARK_SESSION\n"))
+	readUntil(t, b, "MARK_SESSION", 8*time.Second)
+
+	// dir-filtered list sees exactly the two terminals, with their ids.
+	got := listTermSessions(dir)
+	if len(got) != 2 {
+		t.Fatalf("want 2 terminals for dir, got %d: %+v", len(got), got)
+	}
+	ids := map[string]bool{}
+	for _, ti := range got {
+		ids[ti.ID] = true
+	}
+	if !ids["shared"] || !ids["session:abc"] {
+		t.Fatalf("missing expected ids, got %v", ids)
+	}
+
+	// Killing one id leaves the other alive.
+	if !killTermSession(dir, "session:abc") {
+		t.Fatalf("kill session:abc returned false")
+	}
+	time.Sleep(200 * time.Millisecond)
+	if got := listTermSessions(dir); len(got) != 1 || got[0].ID != "shared" {
+		t.Fatalf("after kill want only shared, got %+v", got)
+	}
+}
+
 func TestTerminalMinSizeAcrossClients(t *testing.T) {
 	if _, err := exec.LookPath("stty"); err != nil {
 		t.Skip("no stty")

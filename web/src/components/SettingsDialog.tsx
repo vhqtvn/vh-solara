@@ -333,8 +333,10 @@ export default function SettingsDialog(props: { onClose: () => void }) {
                     <div class="term-sess">
                       <div class="term-sess-head">
                         <span class="term-sess-dir" data-tip={t.dir}>{shortDir(t.dir)}</span>
-                        <span class="term-sess-meta">{t.clients} client{t.clients === 1 ? "" : "s"} · {t.cols}×{t.rows} · idle {t.idleSec}s</span>
-                        <button type="button" class="term-sess-kill" onClick={async () => { await killTerm(t.dir); refetchTerms(); }}>Kill</button>
+                        <span class="term-sess-meta">
+                          {t.title || (t.id === "shared" ? "Shell" : t.id)} · {t.clients} client{t.clients === 1 ? "" : "s"} · {t.cols}×{t.rows} · idle {t.idleSec}s
+                        </span>
+                        <button type="button" class="term-sess-kill" onClick={async () => { await killTerm(t.dir, t.id); refetchTerms(); }}>Kill</button>
                       </div>
                       <Show when={t.preview}>
                         <pre class="term-sess-preview">{t.preview}</pre>

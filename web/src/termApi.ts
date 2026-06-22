@@ -2,6 +2,9 @@
 // preview, and kill them. Distinct from the per-pane WebSocket.
 export interface TermInfo {
   dir: string;
+  id: string;
+  session?: string;
+  title?: string;
   clients: number;
   cols: number;
   rows: number;
@@ -9,21 +12,26 @@ export interface TermInfo {
   preview: string;
 }
 
-export async function listTerms(): Promise<TermInfo[]> {
+// List terminals; pass a dir to scope to one project (the dock tab strip), omit
+// for all projects (the Settings tab).
+export async function listTerms(dir?: string): Promise<TermInfo[]> {
   try {
-    const r = await fetch("/vh/term/list");
+    const q = dir ? `?dir=${encodeURIComponent(dir)}` : "";
+    const r = await fetch(`/vh/term/list${q}`);
     return r.ok ? ((await r.json()) as TermInfo[]) : [];
   } catch {
     return [];
   }
 }
 
-export async function killTerm(dir: string): Promise<boolean> {
+// Kill a terminal's shell. id defaults server-side to "shared". The CSRF header
+// is required for mutating /vh/* POSTs (csrfGuard) — without it the server 403s.
+export async function killTerm(dir: string, id?: string): Promise<boolean> {
   try {
     const r = await fetch("/vh/term/kill", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ dir }),
+      headers: { "Content-Type": "application/json", "X-VH-CSRF": "1" },
+      body: JSON.stringify({ dir, id }),
     });
     return r.ok;
   } catch {
