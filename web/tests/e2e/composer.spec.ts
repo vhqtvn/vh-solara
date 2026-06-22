@@ -50,3 +50,30 @@ test("agent picker excludes subagents and hidden agents", async ({ page }) => {
   await expect(page.locator(".vh-select-pop")).not.toContainText("general");
   await expect(page.locator(".vh-select-pop")).not.toContainText("summarize");
 });
+
+test.describe("composer paste button", () => {
+  test.use({ permissions: ["clipboard-read", "clipboard-write"] });
+
+  test("tap replaces the whole composer", async ({ page }) => {
+    await page.goto("/");
+    await page.getByRole("button", { name: /Demo session/ }).click();
+    const ta = page.getByPlaceholder(/Message/);
+    await page.evaluate(() => navigator.clipboard.writeText("PASTED_TEXT"));
+    await ta.click();
+    await page.keyboard.type("hello ");
+    await page.getByRole("button", { name: /^Paste/ }).click();
+    await expect(ta).toHaveValue("PASTED_TEXT");
+  });
+
+  test("long-press inserts at the caret instead of replacing", async ({ page }) => {
+    await page.goto("/");
+    await page.getByRole("button", { name: /Demo session/ }).click();
+    const ta = page.getByPlaceholder(/Message/);
+    await page.evaluate(() => navigator.clipboard.writeText("PASTED_TEXT"));
+    await ta.click();
+    await page.keyboard.type("hello ");
+    // Hold past the long-press threshold (delay between pointer down and up).
+    await page.getByRole("button", { name: /^Paste/ }).click({ delay: 700 });
+    await expect(ta).toHaveValue("hello PASTED_TEXT");
+  });
+});

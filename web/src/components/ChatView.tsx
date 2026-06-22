@@ -398,6 +398,71 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   }
   const syncCaret = () => taRef && setCaret(taRef.selectionStart ?? 0);
 
+  // Paste clipboard text into the composer. For mobile / no-physical-keyboard
+  // where ⌘/Ctrl+V isn't handy; image/file paste still goes through the
+  // textarea's onPaste. Reads via the async Clipboard API (needs a user gesture
+  // + permission — the tap/hold is the gesture); silently no-ops if
+  // denied/unsupported.
+  //   - "replace": overwrite the whole composer (the plain tap)
+  //   - "insert":  insert at the caret, replacing any selection (long-press)
+  async function pasteFromClipboard(mode: "replace" | "insert") {
+    let text = "";
+    try {
+      text = (await navigator.clipboard?.readText()) ?? "";
+    } catch {
+      taRef?.focus(); // permission denied / unsupported — leave the field focused so ⌘V works
+      return;
+    }
+    if (!text) {
+      taRef?.focus();
+      return;
+    }
+    let pos: number;
+    if (mode === "replace") {
+      setInput(text);
+      pos = text.length;
+    } else {
+      const cur = input();
+      const start = taRef?.selectionStart ?? cur.length;
+      const end = taRef?.selectionEnd ?? cur.length;
+      const before = cur.slice(0, start);
+      setInput(before + text + cur.slice(end));
+      pos = before.length + text.length;
+    }
+    histIdx = -1;
+    queueMicrotask(() => {
+      if (taRef) {
+        taRef.focus();
+        taRef.selectionStart = taRef.selectionEnd = pos;
+        setCaret(pos);
+      }
+    });
+  }
+
+  // Tap vs hold on the paste button: a plain tap replaces the whole composer; a
+  // long-press inserts at the caret. The hold fires from a timer (still inside
+  // the Clipboard API's transient-activation window) and suppresses the click
+  // that follows the release.
+  let pasteHoldTimer: number | undefined;
+  let pasteDidHold = false;
+  const onPasteDown = () => {
+    pasteDidHold = false;
+    clearTimeout(pasteHoldTimer);
+    pasteHoldTimer = window.setTimeout(() => {
+      pasteDidHold = true;
+      void pasteFromClipboard("insert");
+    }, 450);
+  };
+  const onPasteUp = () => clearTimeout(pasteHoldTimer);
+  const onPasteClick = () => {
+    clearTimeout(pasteHoldTimer);
+    if (pasteDidHold) {
+      pasteDidHold = false;
+      return; // the long-press already inserted
+    }
+    void pasteFromClipboard("replace");
+  };
+
   // The popup is portaled to <body> (fixed, above the composer) so chat content
   // can't paint over it. Anchored to the composer's rect; recomputed as items
   // change (which happens as you type, when the composer may have grown).
@@ -1020,6 +1085,19 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
               </Show>
             </Show>
             <span class="bar-spacer" />
+            <button
+              type="button"
+              class="bar-icon"
+              aria-label="Paste (hold to insert at cursor)"
+              data-tip="Paste — replaces all · hold to insert at cursor"
+              onClick={onPasteClick}
+              onPointerDown={onPasteDown}
+              onPointerUp={onPasteUp}
+              onPointerLeave={onPasteUp}
+              onPointerCancel={onPasteUp}
+            >
+              <Icon name="clipboard" />
+            </button>
             <button
               type="button"
               class="bar-icon"
