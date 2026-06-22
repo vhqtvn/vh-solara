@@ -1,4 +1,4 @@
-import { createEffect, createSignal, onCleanup, onMount, Show } from "solid-js";
+import { createEffect, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import Sidebar from "./components/Sidebar";
 import ChatView from "./components/ChatView";
 import GitView from "./components/GitView";
@@ -18,11 +18,15 @@ import AdminMenu from "./components/AdminMenu";
 import RestartOverlay from "./components/RestartOverlay";
 import CommandPalette from "./components/CommandPalette";
 import TerminalDock from "./components/TerminalDock";
+import ViewFrame from "./components/ViewFrame";
 import Icon from "./components/Icon";
 import { menuTriggers } from "./sessionMenu";
 import { isDesktop, sidebarCollapsed, sidebarWidth, toggleSidebar } from "./layout";
 import { draft, selectedId, state } from "./sync";
-import { adminOpen, setAdminOpen, setPaletteOpen, setSettingsOpen, setTermOpen, setView, settingsOpen, termOpen, view } from "./ui";
+import { refreshViews, views } from "./views";
+import { broadcastTheme, postThemeTo } from "./themeTokens";
+import { customTheme, theme } from "./theme";
+import { adminOpen, embeddedViewId, isEmbeddedView, setAdminOpen, setPaletteOpen, setSettingsOpen, setTermOpen, setView, settingsOpen, termOpen, view, VIEW_PREFIX } from "./ui";
 
 export default function App() {
   const [navOpen, setNavOpen] = createSignal(false);
@@ -46,14 +50,41 @@ export default function App() {
     if (t?.closest?.("input, textarea, [contenteditable='true'], .term, .md, .md-raw, .vh-diff, .msg-parts, .tool-output, .msg-inspect, .term-sess-preview")) return;
     e.preventDefault();
   };
+  // Consumer-registered embedded views: load on mount and refresh periodically
+  // (registration can happen after the page loads), so they appear in the
+  // view-switcher without a reload.
+  let viewsPoll: number | undefined;
+  // An embedded view may ask for the theme on its own load timing.
+  const onThemeRequest = (e: MessageEvent) => {
+    const d = e.data as { source?: string; type?: string } | null;
+    if (d?.source === "vh-solara" && d.type === "theme-request") postThemeTo(e.source as Window);
+  };
   onMount(() => {
     document.addEventListener("keydown", onGlobalKey);
     document.addEventListener("contextmenu", onContextMenu);
+    window.addEventListener("message", onThemeRequest);
+    void refreshViews();
+    viewsPoll = window.setInterval(() => void refreshViews(), 60000);
   });
   onCleanup(() => {
     document.removeEventListener("keydown", onGlobalKey);
     document.removeEventListener("contextmenu", onContextMenu);
+    window.removeEventListener("message", onThemeRequest);
+    clearInterval(viewsPoll);
   });
+  // Push the live theme to every embedded view whenever it changes (built-in or
+  // custom, light/dark) — operator toggles restyle the views without a reload.
+  // Deferred to a microtask: the effect fires synchronously on the signal write,
+  // which is BEFORE setThemeId/setCustomTheme call applyTheme(); reading computed
+  // styles now would see the previous theme. The microtask runs after applyTheme.
+  createEffect(() => {
+    theme();
+    customTheme();
+    queueMicrotask(broadcastTheme);
+  });
+  // The embedded view currently selected (if any), resolved from the live list.
+  const activeEmbedded = () =>
+    isEmbeddedView(view()) ? views().find((v) => v.view_id === embeddedViewId(view())) : undefined;
 
   // Long-press on the Settings button opens the server-admin popup (right-click
   // does on desktop). Plain click opens Settings. `lpFired` swallows the click
@@ -89,7 +120,13 @@ export default function App() {
             when={view() === "chat" && selected()}
             fallback={
               <span class="main-title">
-                {view() === "changes" ? "Changes" : view() === "notes" ? "Notes" : selected()?.title || "Select a session"}
+                {view() === "changes"
+                  ? "Changes"
+                  : view() === "notes"
+                    ? "Notes"
+                    : isEmbeddedView(view())
+                      ? activeEmbedded()?.title || "View"
+                      : selected()?.title || "Select a session"}
               </span>
             }
           >
@@ -111,6 +148,18 @@ export default function App() {
             <button type="button" classList={{ on: view() === "notes" }} onClick={() => setView("notes")}>
               Notes
             </button>
+            <For each={views()}>
+              {(v) => (
+                <button
+                  type="button"
+                  classList={{ on: view() === VIEW_PREFIX + v.view_id }}
+                  onClick={() => setView(VIEW_PREFIX + v.view_id)}
+                  title={v.title}
+                >
+                  {v.title}
+                </button>
+              )}
+            </For>
           </div>
           <Show when={selectedId()}>
             <HeaderUsage sessionId={selectedId()!} onInspect={() => setInspectorOpen(true)} />
@@ -164,6 +213,11 @@ export default function App() {
             }>
               <ChatView sessionId={selectedId()!} />
             </Show>
+          </Show>
+          {/* Consumer-registered embedded views — keyed so switching remounts a
+              fresh iframe attached to the right prefix. */}
+          <Show when={activeEmbedded()} keyed>
+            {(v) => <ViewFrame view={v} />}
           </Show>
         </div>
         <TerminalDock />

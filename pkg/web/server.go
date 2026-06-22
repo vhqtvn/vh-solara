@@ -79,6 +79,10 @@ type Server struct {
 	// features are the capability modules mounted at startup (B). The
 	// coordination verbs are the first one (dogfood).
 	features []Feature
+
+	// views holds consumer-registered reverse-proxy views (embedded sandboxed
+	// iframes, peer to chat). Generic + policy-free; see views.go.
+	views *viewRegistry
 }
 
 // RegisterFeature adds a capability module to be mounted by Handler(). Call
@@ -165,6 +169,7 @@ func NewServer(agg *aggregator.Aggregator, opencodeURL string, ringCapacity int)
 		aggs:        map[string]*aggregator.Aggregator{"": agg},
 		idem:        newIdemCache(10 * time.Minute),
 		features:    defaultFeatures(),
+		views:       newViewRegistry(),
 	}
 	return srv, nil
 }
@@ -207,6 +212,9 @@ func (s *Server) Handler() http.Handler {
 	})
 	mux.HandleFunc("/vh/snapshot", s.handleSnapshot)
 	mux.HandleFunc("/vh/projects", s.handleProjects)
+	mux.HandleFunc("/vh/views", s.handleViews)
+	mux.HandleFunc("/vh/theme.json", s.handleThemeJSON)
+	mux.HandleFunc("/vh/theme.css", s.handleThemeCSS)
 	mux.HandleFunc("/vh/stream", s.handleStream)
 	mux.HandleFunc("/vh/render", s.handleRender)
 	mux.HandleFunc("/vh/highlight.css", s.handleHighlightCSS)
@@ -238,7 +246,7 @@ func (s *Server) Handler() http.Handler {
 	// Auth gates everything (login page + session); it sits inside securityHeaders
 	// so the login page still gets CSP, and outside cors/csrf so an unauthenticated
 	// request is challenged before reaching application logic. nil/ModeNone = no-op.
-	return securityHeaders(s.auth.Middleware(s.cors(csrfGuard(logRequests(s.stampMeta(mux))))))
+	return securityHeaders(s.auth.Middleware(s.cors(csrfGuard(logRequests(s.stampMeta(s.dispatchView(mux)))))))
 }
 
 // stampMeta sets X-VH-Epoch and X-VH-Seq on /vh/* responses so a cross-worker

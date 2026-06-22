@@ -41,6 +41,7 @@ func (d *Daemon) registerCoordRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/coord/workers", d.coordListWorkers)
 	mux.HandleFunc("GET /api/workers/{id}/skill/emit", d.coordSkillEmit)
 	mux.HandleFunc("GET /api/workers/{id}/projects", d.coordProjects)
+	mux.HandleFunc("GET /api/workers/{id}/views", d.coordViews)
 	mux.HandleFunc("GET /api/workers/{id}/sessions", d.coordSnapshot)
 	mux.HandleFunc("POST /api/workers/{id}/sessions", d.coordSpawn)
 	mux.HandleFunc("GET /api/workers/{id}/sessions/{sid}", d.coordSessionDetail)
@@ -195,6 +196,19 @@ func (d *Daemon) coordProjects(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	d.proxyToVH(w, r, worker, http.MethodGet, "/vh/projects", "", nil)
+}
+
+// coordViews lists a worker's registered embedded views (the cross-machine
+// mirror of /vh/views) so a coordinator can discover them headlessly. The view
+// CONTENT itself rides the existing per-worker subdomain proxy (HostInterceptor
+// → HandleWorkerDirect), so the iframe loads the prefixed path through the same
+// path as the SPA — no extra controller routing needed.
+func (d *Daemon) coordViews(w http.ResponseWriter, r *http.Request) {
+	worker, ok := d.coordWorker(w, r)
+	if !ok {
+		return
+	}
+	d.proxyToVH(w, r, worker, http.MethodGet, "/vh/views", "", nil)
 }
 
 func (d *Daemon) coordSnapshot(w http.ResponseWriter, r *http.Request) {

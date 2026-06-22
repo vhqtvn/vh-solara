@@ -3,7 +3,12 @@
 import { createSignal } from "solid-js";
 import { loadVersioned, saveVersioned } from "./lib/store";
 
-export type View = "chat" | "changes" | "notes";
+// Built-in views plus consumer-registered embedded views, keyed "view:<id>".
+export type BuiltinView = "chat" | "changes" | "notes";
+export type View = BuiltinView | string;
+export const VIEW_PREFIX = "view:";
+export const isEmbeddedView = (v: string) => v.startsWith(VIEW_PREFIX);
+export const embeddedViewId = (v: string) => v.slice(VIEW_PREFIX.length);
 
 export const [view, setView] = createSignal<View>("chat");
 export const [settingsOpen, setSettingsOpen] = createSignal(false);
