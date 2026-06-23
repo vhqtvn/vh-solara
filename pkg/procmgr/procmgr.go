@@ -115,10 +115,16 @@ func (m *Manager) Start(spec ProcSpec) error {
 	if !ok {
 		p = newProc(m.base, spec)
 		m.procs[k] = p
-	} else {
-		p.spec = spec // refresh declaration on re-arm
 	}
 	m.mu.Unlock()
+	if ok {
+		// Refresh the declaration on re-arm under p.mu — a live supervisor loop
+		// reads p.spec (snapshotSpec/scheduleRestart/snapshot) under p.mu, so the
+		// m.mu held above is the wrong lock to guard this write.
+		p.mu.Lock()
+		p.spec = spec
+		p.mu.Unlock()
+	}
 	return p.arm()
 }
 
@@ -242,13 +248,21 @@ func (p *Proc) arm() error {
 		p.mu.Unlock()
 		return nil // already live
 	}
-	winding := p.ctx != nil && p.cancel != nil
+	prevCancel := p.cancel
 	prevDone := p.runDone
 	p.mu.Unlock()
 
-	// A previous loop may be winding down after a stop — wait for it to exit
-	// before re-arming (armMu keeps any other arm() out meanwhile).
-	if winding && prevDone != nil {
+	// A previous supervisor loop may still be alive but not "running" — parked in
+	// backoff after a failed/timed-out attempt (status failed/stopped, ctx NOT
+	// cancelled). Cancel it FIRST, then wait for it to exit, before re-arming.
+	// Without the cancel, under restart:always that loop would wake from backoff
+	// and relaunch, so its runDone would never close and this arm() (holding
+	// armMu) would block forever — wedging every later Start/Restart. (stop()
+	// uses the same cancel-then-drain.)
+	if prevCancel != nil {
+		prevCancel()
+	}
+	if prevDone != nil {
 		<-prevDone
 	}
 

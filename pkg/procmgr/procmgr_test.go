@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -185,6 +186,57 @@ func TestManager_OnFailureGivesUp(t *testing.T) {
 	}) {
 		st, _ := mgr.Status("/proj", "boom")
 		t.Fatalf("expected failed (gave up); status=%s restarts=%d", st.Status, st.Restarts)
+	}
+}
+
+// TestManager_ConcurrentArmNoDeadlock hammers Start/Restart on a never-ready
+// restart:always process. Every attempt hits readyTimeout → failed → backoff
+// sleep, the window where the supervisor loop is alive but not "running". A
+// concurrent arm() that waited on that loop WITHOUT cancelling it first would
+// wedge forever (the loop relaunches under restart:always). The test fails (by
+// timing out) if arm() ever deadlocks.
+func TestManager_ConcurrentArmNoDeadlock(t *testing.T) {
+	prevTO, prevB, prevMax := startupTimeout, backoffBase, maxBackoff
+	startupTimeout, backoffBase, maxBackoff = 150*time.Millisecond, 10*time.Millisecond, 30*time.Millisecond
+	t.Cleanup(func() { startupTimeout, backoffBase, maxBackoff = prevTO, prevB, prevMax })
+
+	mgr := NewManager(mgrCtx())
+	defer mgr.StopAll()
+	dir := t.TempDir()
+	spec := ProcSpec{
+		Dir: "/proj", ID: "stuck", Cwd: dir,
+		Argv:      []string{"/bin/sh", "-c", "sleep 60"},
+		Restart:   projectcfg.RestartAlways,
+		Readiness: &projectcfg.Readiness{Unix: filepath.Join(dir, "never.sock")},
+	}
+	if err := mgr.Start(spec); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		var wg sync.WaitGroup
+		for i := 0; i < 6; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for j := 0; j < 30; j++ {
+					if j%2 == 0 {
+						_ = mgr.Start(spec)
+					} else {
+						_ = mgr.Restart("/proj", "stuck")
+					}
+					time.Sleep(5 * time.Millisecond)
+				}
+			}()
+		}
+		wg.Wait()
+	}()
+	select {
+	case <-done:
+	case <-time.After(25 * time.Second):
+		t.Fatal("Start/Restart wedged — arm() deadlock regression")
 	}
 }
 
