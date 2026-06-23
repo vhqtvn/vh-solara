@@ -86,6 +86,13 @@ const PATHS: Record<string, () => JSX.Element> = {
     </>
   ),
   layers: () => <path d="M12 2 2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5" />,
+  // Alert triangle — error notifications.
+  alert: () => (
+    <>
+      <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
+      <path d="M12 9v4M12 17h.01" />
+    </>
+  ),
   // CPU/chip — repo-declared managed processes (distinct from `layers`, which
   // the Server/MCP/LSP/Plugins status popover uses).
   cpu: () => (

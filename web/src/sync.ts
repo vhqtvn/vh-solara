@@ -234,9 +234,6 @@ function applySessionEvent(kind: string, seq: number, payload: any) {
   persist();
 }
 
-function sessionTitle(id: string): string {
-  return state.sessions[id]?.title || "Session";
-}
 
 // Surface an assistant error as a dismissable notification.
 function notifyFromMessage(payload: any) {
@@ -246,7 +243,7 @@ function notifyFromMessage(payload: any) {
     pushNotification({
       kind: "error",
       sessionID: info.sessionID,
-      title: sessionTitle(info.sessionID) + " error",
+      title: "errored",
       detail: err.data?.message || err.name || "Assistant error",
     });
   }
@@ -335,7 +332,7 @@ function applyMessageEvent(kind: string, seq: number, payload: any, trackCursor 
             pushNotification({
               kind: "error",
               sessionID: payload.sessionID,
-              title: sessionTitle(payload.sessionID) + " error",
+              title: "errored",
               detail: e?.data?.message || e?.message || e?.name || "Session error",
             });
           }
@@ -404,7 +401,7 @@ function maybeNotifyRootDone(changedSessionID: string) {
     const t = setTimeout(() => {
       doneTimers.delete(root);
       if (!sessionWorking(root) && root !== selectedId()) {
-        pushNotification({ kind: "done", sessionID: root, title: sessionTitle(root) + " finished" });
+        pushNotification({ kind: "done", sessionID: root, title: "finished" });
       }
     }, DONE_SETTLE_MS);
     doneTimers.set(root, t);

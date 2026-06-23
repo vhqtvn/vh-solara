@@ -1591,7 +1591,13 @@ body {
 }
 .notif-item.action:hover, .notif-body.btn:hover { background: var(--bg); }
 .notif-ico { color: var(--accent); flex: none; margin-top: 1px; }
-.notif-item.err .notif-title { color: var(--danger-fg); }
+/* Per-kind icon accent so done/error/info are scannable at a glance. */
+.notif-item.done .notif-ico { color: var(--ok); }
+.notif-item.err .notif-ico { color: var(--danger); }
+.notif-item.info .notif-ico { color: var(--fg-dim); }
+/* The session name leads the line in bold accent: "**Session** finished". */
+.notif-session { color: var(--accent); font-weight: 600; }
+.notif-time { font-size: 11px; color: var(--fg-dim); margin-top: 2px; }
 .notif-body {
   display: flex;
   flex-direction: column;
