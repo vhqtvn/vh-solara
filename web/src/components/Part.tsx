@@ -196,7 +196,7 @@ function Mermaid(props: { src: string }) {
 // While streaming, render markdown live on the client (debounced — re-parsing
 // the whole text per token is O(n²)) so the in-flight reply is formatted, not
 // raw. The settled view re-renders it server-side (highlighting + mermaid).
-function Markdown(props: { text: string; settled: boolean }) {
+function Markdown(props: { text: string; settled: boolean; caret?: boolean }) {
   // Captured at creation: true only for a block that started while streaming
   // (the message the user is watching). History blocks are created already
   // settled → false → cheap raw fallback (no per-block client parse on load).
@@ -214,7 +214,9 @@ function Markdown(props: { text: string; settled: boolean }) {
     streamLive() ? (
       <div class="md md-stream">
         <div innerHTML={streamHtml()} />
-        <span class="stream-caret" aria-hidden="true" />
+        <Show when={props.caret}>
+          <span class="stream-caret" aria-hidden="true" />
+        </Show>
       </div>
     ) : (
       <></>
@@ -383,7 +385,7 @@ function ToolPart(props: { part: Part }) {
 
 // Reasoning block with a live "thinking" duration. While the part is still
 // streaming the timer ticks (created → now); once it ends it shows the total.
-function ReasoningPart(props: { part: Part; settled: boolean }) {
+function ReasoningPart(props: { part: Part; settled: boolean; tail?: boolean }) {
   const start = () => props.part.time?.start;
   const end = () => props.part.time?.end;
   const live = () => !props.settled && !end();
@@ -410,12 +412,12 @@ function ReasoningPart(props: { part: Part; settled: boolean }) {
           <span class="tool-dur reasoning-time" classList={{ live: live() }}>{elapsed()}</span>
         </Show>
       </summary>
-      <Markdown text={props.part.text || ""} settled={props.settled} />
+      <Markdown text={props.part.text || ""} settled={props.settled} caret={props.tail} />
     </details>
   );
 }
 
-export default function PartView(props: { part: Part; settled?: boolean }) {
+export default function PartView(props: { part: Part; settled?: boolean; tail?: boolean }) {
   const p = () => props.part;
   // A part is settled (worth the full markdown render) when the part itself has
   // ended, or when the owning message is settled — user messages never stream,
@@ -424,10 +426,10 @@ export default function PartView(props: { part: Part; settled?: boolean }) {
   return (
     <Switch>
       <Match when={p().type === "text"}>
-        <Markdown text={p().text || ""} settled={settled()} />
+        <Markdown text={p().text || ""} settled={settled()} caret={props.tail} />
       </Match>
       <Match when={p().type === "reasoning"}>
-        <ReasoningPart part={p()} settled={settled()} />
+        <ReasoningPart part={p()} settled={settled()} tail={props.tail} />
       </Match>
       <Match when={p().type === "tool"}>
         <ToolPart part={p()} />
@@ -446,7 +448,7 @@ export default function PartView(props: { part: Part; settled?: boolean }) {
 // some — this is our deliberate divergence from OpenChamber). Collapsed by
 // default, showing the last ACTIVITY_PREVIEW rows.
 const ACTIVITY_PREVIEW = 5;
-export function ActivityGroup(props: { parts: Part[]; settled: boolean }) {
+export function ActivityGroup(props: { parts: Part[]; settled: boolean; tailId?: string | null }) {
   const [expanded, setExpanded] = createSignal(false);
   const total = () => props.parts.length;
   const hidden = () => (expanded() ? 0 : Math.max(0, total() - ACTIVITY_PREVIEW));
@@ -467,7 +469,7 @@ export function ActivityGroup(props: { parts: Part[]; settled: boolean }) {
           {(p) => (
             <Switch>
               <Match when={p.type === "reasoning"}>
-                <ReasoningPart part={p} settled={props.settled} />
+                <ReasoningPart part={p} settled={props.settled} tail={p.id === props.tailId} />
               </Match>
               <Match when={p.type === "tool"}>
                 <ToolPart part={p} />

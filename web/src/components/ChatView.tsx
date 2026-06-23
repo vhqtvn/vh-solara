@@ -922,10 +922,17 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
                   <For each={groupParts(m)}>
                     {(it) => {
                       const settled = m.info.role === "user" || !!m.info.time?.completed;
+                      // The blinking caret belongs only to the actively-streaming
+                      // tail — the last part of the in-flight (last, uncompleted)
+                      // message — not after every finished thinking/text block.
+                      const tailId =
+                        !settled && i() === messages().length - 1
+                          ? m.partOrder[m.partOrder.length - 1]
+                          : null;
                       return it.kind === "activity" ? (
-                        <ActivityGroup parts={it.parts} settled={settled} />
+                        <ActivityGroup parts={it.parts} settled={settled} tailId={tailId} />
                       ) : (
-                        <PartView part={it.part} settled={settled} />
+                        <PartView part={it.part} settled={settled} tail={it.part.id === tailId} />
                       );
                     }}
                   </For>
