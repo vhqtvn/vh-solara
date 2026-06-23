@@ -2,13 +2,13 @@
 
 **VHSolara** (binary: `vh-solara`) is a lightweight, mobile-first web UI and aggregating daemon for OpenCode — control your coding agents on any machine, from one place, over a secure tunnel.
 
-A single Go binary runs next to OpenCode on each machine: it aggregates OpenCode's state into a resumable, real-time view and serves a custom, mobile-first web UI (a SolidJS SPA, installable as a PWA) embedded in the binary via `//go:embed`. Each instance connects to a central controller through a persistent multiplexed WebSocket tunnel ([yamux](https://github.com/hashicorp/yamux)), so you can reach and drive any machine's OpenCode sessions from one URL — with **no inbound network access to the worker**. The UI covers the full loop: a session/subsession tree, streaming chat, diffs, an in-browser terminal, git actions, a command palette, and live notifications.
+A single Go binary runs next to OpenCode on each machine: it aggregates OpenCode's state into a resumable, real-time view and serves a custom, mobile-first web UI (a SolidJS SPA, installable as a PWA) embedded in the binary via `//go:embed`. Each instance connects to a central controller through a persistent multiplexed WebSocket tunnel ([yamux](https://github.com/hashicorp/yamux)), so you can reach and drive any machine's OpenCode sessions from one URL — with **no inbound network access to the worker**. The UI covers the full loop: a session/subsession tree, streaming chat, diffs, an in-browser terminal, git actions, repo-declared [managed processes & embedded views](docs/managed-projects.md), a command palette, a themeable appearance (presets + a custom theme editor), and live notifications.
 
 > Built because OpenCode's own web UI and OpenChamber were heavy and didn't hold up on mobile (esp. Galaxy Fold) — `vh-solara` is the lean, phone-friendly alternative, resilient to flaky networks and reconnects.
 
 ## Screenshots
 
-Streaming chat — markdown, syntax-highlighted code, rendered math, tool calls with LSP diagnostics, and subagent sessions:
+Streaming chat — markdown, syntax-highlighted code, rendered math, a collapsible **Activity** timeline of tool calls (with LSP diagnostics), subagent sessions, right-aligned message bubbles, and a live **Tasks** indicator:
 
 ![Chat](docs/screenshots/chat-desktop.png)
 
@@ -161,8 +161,9 @@ The sidebar has a **project switcher** ("Add project…" takes an absolute path)
 each project is a directory, and the daemon lazily runs a separate
 aggregator + OpenCode subscription per directory (via the `x-opencode-directory`
 scope). Each connected client picks its own project independently, and sessions /
-archive are tracked per project. (Project notes/todos are currently global —
-per-project notes are a follow-up.)
+archive are tracked per project. The **Notes** tab is off by default and can be
+enabled globally (Settings → General) or per-repo via `"notes": true` in
+`.vh-solara/project.jsonc`.
 
 The daemon runs `opencode serve` headless on a private loopback port, aggregates its
 state, and serves the vh UI on the controller-proxied port. The UI is embedded in the
