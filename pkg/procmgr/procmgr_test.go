@@ -164,6 +164,30 @@ func TestManager_OnFailureRestarts(t *testing.T) {
 	}
 }
 
+func TestManager_OnFailureGivesUp(t *testing.T) {
+	prevN, prevB, prevMax := maxConsecutiveFailures, backoffBase, maxBackoff
+	maxConsecutiveFailures, backoffBase, maxBackoff = 3, 5*time.Millisecond, 5*time.Millisecond
+	t.Cleanup(func() { maxConsecutiveFailures, backoffBase, maxBackoff = prevN, prevB, prevMax })
+
+	mgr := NewManager(mgrCtx())
+	defer mgr.StopAll()
+	if err := mgr.Start(ProcSpec{
+		Dir: "/proj", ID: "boom", Cwd: ".",
+		Argv: []string{"/bin/sh", "-c", "exit 1"}, Restart: projectcfg.RestartOnFailure,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// A process that always fails must eventually give up (→ failed), not retry
+	// forever.
+	if !waitFor(t, 5*time.Second, func() bool {
+		st, _ := mgr.Status("/proj", "boom")
+		return st.Status == StatusFailed
+	}) {
+		st, _ := mgr.Status("/proj", "boom")
+		t.Fatalf("expected failed (gave up); status=%s restarts=%d", st.Status, st.Restarts)
+	}
+}
+
 func TestManager_NoRestartCleanExit(t *testing.T) {
 	mgr := NewManager(mgrCtx())
 	if err := mgr.Start(ProcSpec{

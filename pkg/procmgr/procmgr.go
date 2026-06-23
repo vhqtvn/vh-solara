@@ -291,6 +291,13 @@ func (p *Proc) stop() {
 // or the restart policy is exhausted.
 func (p *Proc) run(ctx context.Context) {
 	for ctx.Err() == nil {
+		// Clear readyAt for THIS attempt: scheduleRestart's streak-reset keys off
+		// "did this run stay ready a while", so a spawn failure (which never
+		// reaches launch's own reset) must not inherit a prior generation's
+		// readyAt and wrongly reset the failure streak.
+		p.mu.Lock()
+		p.readyAt = time.Time{}
+		p.mu.Unlock()
 		cmd, waitCh, err := p.launch(ctx)
 		if err != nil {
 			vhlog.Error("procmgr spawn failed", "id", p.spec.ID, "err", err)
@@ -428,7 +435,6 @@ func (p *Proc) launch(ctx context.Context) (*exec.Cmd, chan struct{}, error) {
 	p.status = StatusStarting
 	p.pid = cmd.Process.Pid
 	p.startedAt = time.Now()
-	p.readyAt = time.Time{} // cleared per generation; set again only if this run reaches ready
 	p.exitCode = 0
 	p.mu.Unlock()
 	vhlog.Info("procmgr started", "id", spec.ID, "pid", cmd.Process.Pid, "dir", spec.Dir)
@@ -460,7 +466,7 @@ func (p *Proc) awaitReady(ctx context.Context, waitCh chan struct{}) readyReason
 		defer timer.Stop()
 		select {
 		case <-timer.C:
-			if p.aliveNoLock() {
+			if p.alive() {
 				return readyYes
 			}
 			return readyExited
@@ -633,7 +639,9 @@ func (p *Proc) snapshotSpec() ProcSpec {
 	return p.spec
 }
 
-func (p *Proc) aliveNoLock() bool {
+// alive reports whether the process is currently running (pid set; the reaper
+// zeroes it on exit). Takes p.mu — do not call while holding it.
+func (p *Proc) alive() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.pid != 0
