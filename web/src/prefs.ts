@@ -105,3 +105,41 @@ export function setOrientation(v: "system" | "auto") {
   applyOrientation();
 }
 export { orientation };
+
+// Chat reading width: the message column + composer max-width, driven through a
+// --chat-width CSS var. "comfortable" is the original centered column (good for
+// prose); "wide"/"full" reclaim the side space a centered column wastes on a
+// large external monitor.
+const CHATW_KEY = "vh.prefs.chatWidth.v1";
+export type ChatWidth = "comfortable" | "wide" | "full";
+const CHATW_PX: Record<ChatWidth, string> = { comfortable: "860px", wide: "1180px", full: "100%" };
+const [chatWidth, setChatWidthSig] = createSignal<ChatWidth>(
+  loadVersioned<ChatWidth>(CHATW_KEY, 1, "comfortable", (o) =>
+    o === "wide" || o === "full" ? o : "comfortable"),
+);
+export function applyChatWidth() {
+  document.documentElement.style.setProperty("--chat-width", CHATW_PX[chatWidth()]);
+}
+export function setChatWidth(v: ChatWidth) {
+  setChatWidthSig(v);
+  saveVersioned(CHATW_KEY, 1, v);
+  applyChatWidth();
+}
+export { chatWidth };
+
+// Chat bubbles: render YOUR turns as a right-aligned bubble (Claude/OpenChamber
+// style) by toggling a root `chat-bubbles` class. Off → the original quiet
+// full-width card. Default on.
+const BUBBLE_KEY = "vh.prefs.chatBubbles.v1";
+const [chatBubbles, setChatBubblesSig] = createSignal<boolean>(
+  loadVersioned<boolean>(BUBBLE_KEY, 1, true, (old) => !(old === 0 || old === "0" || old === false)),
+);
+export function applyChatBubbles() {
+  document.documentElement.classList.toggle("chat-bubbles", chatBubbles());
+}
+export function setChatBubbles(on: boolean) {
+  setChatBubblesSig(on);
+  saveVersioned(BUBBLE_KEY, 1, on);
+  applyChatBubbles();
+}
+export { chatBubbles };

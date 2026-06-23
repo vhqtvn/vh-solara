@@ -837,7 +837,7 @@ body {
   .session-progress-bar { animation: none; clip-path: none; opacity: 0.7; }
 }
 .chat-scroll { flex: 1; overflow-y: auto; overflow-anchor: auto; padding: 16px; overscroll-behavior: contain; }
-.chat-content { max-width: 860px; margin: 0 auto; }
+.chat-content { max-width: var(--chat-width, 860px); margin: 0 auto; }
 /* Revealed once positioned (see ChatView ready signal) — the initial scroll
    jump happens while hidden, then a quick fade in. */
 .chat-content { opacity: 0; transition: opacity 0.12s ease; }
@@ -2087,7 +2087,7 @@ body {
 .composer {
   display: flex;
   flex-direction: column;
-  max-width: 860px;
+  max-width: var(--chat-width, 860px);
   margin: 0 auto;
   background: var(--bg-2);
   border: 1px solid var(--border);
@@ -2813,6 +2813,20 @@ div.katex-math { display: block; overflow-x: auto; margin: 0.7em 0; text-align: 
 }
 .msg-time, .msg-cost { color: var(--chat-timestamp); }
 .msg + .msg { margin-top: 0; }
+
+/* Chat bubbles (toggle: Settings → Appearance). Right-align YOUR turns as a
+   shrink-to-fit bubble capped at a fraction of the column (Claude/OpenChamber
+   style). Assistant turns stay full-width prose. Gated by the root class so it
+   can be switched off, falling back to the quiet full-width card above. */
+.chat-bubbles .msg.user { display: flex; flex-direction: column; align-items: flex-end; }
+.chat-bubbles .msg.user .msg-head { max-width: 85%; }
+.chat-bubbles .msg.user .msg-head .msg-actions { margin-left: 12px; }
+.chat-bubbles .msg.user .msg-parts {
+  max-width: 85%;
+  text-align: left; /* content reads L-to-R inside the right-aligned bubble */
+  border-top-left-radius: var(--radius-lg);
+  border-top-right-radius: var(--radius-sm); /* flip the asymmetric corner to the right */
+}
 
 /* ============================================================================
    (c) File-type badges + refined diff/git surfaces.

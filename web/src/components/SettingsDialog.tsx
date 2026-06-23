@@ -3,7 +3,7 @@ import { CUSTOM_FIELDS, customTheme, exportCustomTheme, importCustomTheme, reset
 import ThemePicker from "./ThemePicker";
 import { customFont, font, FONTS, setCustomFont, setFontId } from "../font";
 import { hideBuiltin, setHideBuiltin } from "../models";
-import { setStreamLive, streamLive, treeDensity, setTreeDensity, uiScale, setUiScale, orientation, setOrientation, MIN_SCALE, MAX_SCALE } from "../prefs";
+import { setStreamLive, streamLive, treeDensity, setTreeDensity, uiScale, setUiScale, orientation, setOrientation, MIN_SCALE, MAX_SCALE, chatWidth, setChatWidth, chatBubbles, setChatBubbles, type ChatWidth } from "../prefs";
 import { queueMode, setQueueMode } from "../queue";
 import { canInstall, installed, isIosSafari, promptInstall } from "../pwa-install";
 import { killTerm, listTerms } from "../termApi";
@@ -156,6 +156,37 @@ export default function SettingsDialog(props: { onClose: () => void }) {
             </Show>
 
             <Show when={sec() === "appearance"}>
+              <div class="setting-row">
+                <label>Chat width</label>
+                <Select
+                  class="theme-select"
+                  ariaLabel="Chat width"
+                  value={chatWidth()}
+                  options={[
+                    { value: "comfortable", label: "Comfortable" },
+                    { value: "wide", label: "Wide" },
+                    { value: "full", label: "Full width" },
+                  ]}
+                  onChange={(v) => setChatWidth(v as ChatWidth)}
+                />
+              </div>
+              <p class="setting-hint">
+                Caps the message column and composer width. Wider reclaims the side space a centered
+                column wastes on a large monitor; Comfortable keeps a readable line length for prose.
+              </p>
+              <div class="setting-row">
+                <label>Bubble your messages</label>
+                <input
+                  type="checkbox"
+                  aria-label="Bubble your messages"
+                  checked={chatBubbles()}
+                  onChange={(e) => setChatBubbles(e.currentTarget.checked)}
+                />
+              </div>
+              <p class="setting-hint">
+                On: your turns show as a right-aligned bubble (Claude/OpenChamber style). Off: a quiet
+                full-width card. The assistant always renders full-width.
+              </p>
               <div class="setting-row">
                 <label>Session list</label>
                 <Select
