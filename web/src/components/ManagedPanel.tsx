@@ -1,4 +1,4 @@
-import { createSignal, For, Show } from "solid-js";
+import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { controlProc, grantTrust, managed, procLogs, refreshManaged, type ProcStatus } from "../managed";
 import Icon from "./Icon";
 
@@ -34,10 +34,20 @@ export default function ManagedPanel(props: { onClose: () => void }) {
       else props.onClose();
     }
   };
-  // Defer so the opening click doesn't immediately close it.
-  setTimeout(() => document.addEventListener("click", onDoc), 0);
-  document.addEventListener("keydown", onKey);
-  void refreshManaged();
+  onMount(() => {
+    // Defer so the opening click doesn't immediately close it.
+    setTimeout(() => document.addEventListener("click", onDoc), 0);
+    document.addEventListener("keydown", onKey);
+    void refreshManaged();
+  });
+  // Without this, every close leaves the document listeners attached; the stale
+  // onDoc (closed over the old, now-detached rootEl) then fires on the next
+  // open-click and immediately closes the freshly-mounted panel — so it could
+  // never be reopened after the first dismiss.
+  onCleanup(() => {
+    document.removeEventListener("click", onDoc);
+    document.removeEventListener("keydown", onKey);
+  });
 
   async function approve() {
     setBusy(true);

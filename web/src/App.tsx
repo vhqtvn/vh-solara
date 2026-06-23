@@ -210,7 +210,7 @@ export default function App() {
                 data-tip="Project processes (repo-declared)"
                 onClick={() => setManagedOpen((v) => !v)}
               >
-                <Icon name="layers" />
+                <Icon name="cpu" />
               </button>
               <Show when={managedOpen()}>
                 <ManagedPanel onClose={() => setManagedOpen(false)} />
