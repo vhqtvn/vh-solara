@@ -88,6 +88,9 @@ type Server struct {
 	// managed, when set by the daemon, owns repo-declared processes+views for
 	// projects (.vh-solara/project.jsonc). nil = managed-projects disabled.
 	managed *Orchestrator
+	// managedDefaultOnce guards the one-time managed-project open of the default
+	// project (daemon cwd), triggered by the first request that touches it.
+	managedDefaultOnce sync.Once
 }
 
 // RegisterFeature adds a capability module to be mounted by Handler(). Call
@@ -144,8 +147,9 @@ func (s *Server) SetManaged(o *Orchestrator) { s.managed = o }
 // given process manager and trust store, sharing this server's view registry.
 // cfgOverride ("") uses conventional .vh-solara/project.jsonc discovery;
 // autoTrust is the headless escape hatch that approves configs without a prompt.
-// Returns the orchestrator so the caller can drive the default project's
-// discovery (per-dir discovery is triggered automatically by the open hook).
+// Discovery is lazy for every project (default + ?dir=): the aggFor open hook
+// fires on the first browser request that touches a project, so the returned
+// orchestrator need not be driven by the caller.
 func (s *Server) InitManaged(mgr *procmgr.Manager, trust *TrustStore, cfgOverride string, autoTrust bool) *Orchestrator {
 	o := NewOrchestrator(mgr, trust, s.views, cfgOverride)
 	o.autoTrust = autoTrust
@@ -200,6 +204,13 @@ func NewServer(agg *aggregator.Aggregator, opencodeURL string, ringCapacity int)
 // one lazily for directories beyond the default. Concurrent-safe.
 func (s *Server) aggFor(dir string) *aggregator.Aggregator {
 	if dir == "" {
+		// Managed-project hook for the DEFAULT project (daemon cwd). Fired on the
+		// first request that touches it — i.e. an authenticated browser actually
+		// opening the project — NOT at daemon boot, so a restart never silently
+		// runs repo-declared commands with no operator present.
+		if s.managed != nil {
+			s.managedDefaultOnce.Do(func() { s.managed.OpenProject("") })
+		}
 		return s.agg
 	}
 	s.aggMu.Lock()

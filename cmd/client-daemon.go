@@ -245,9 +245,10 @@ var clientDaemonCmd = &cobra.Command{
 			// Managed-project processes + views: discover a checked-in
 			// .vh-solara/project.jsonc, gate it behind explicit per-project trust,
 			// and run the declared processes (procmgr) + views (shared registry).
-			// Bound to a cancellable context torn down on shutdown. The default
-			// project (daemon cwd) is discovered now; other ?dir= projects are
-			// discovered lazily via the server's open hook.
+			// Bound to a cancellable context torn down on shutdown. Projects
+			// (including the default = daemon cwd) are discovered LAZILY when a
+			// browser first opens them — never at daemon boot — so a restart never
+			// silently starts repo-declared commands with no operator present.
 			procCtx, procCancel := context.WithCancel(context.Background())
 			procCtxCancel = procCancel
 			procMgr = procmgr.NewManager(procCtx)
@@ -256,11 +257,10 @@ var clientDaemonCmd = &cobra.Command{
 				log.Printf("Managed projects disabled: trust store unavailable: %v", err)
 			} else {
 				trustOnOpen := daemonTrustOnOpen || os.Getenv("VH_TRUST_CONFIG") != ""
-				orch := srv.InitManaged(procMgr, trustStore, daemonProjectConfig, trustOnOpen)
+				srv.InitManaged(procMgr, trustStore, daemonProjectConfig, trustOnOpen)
 				if trustOnOpen {
 					log.Printf("Managed projects: auto-trust enabled — repo-declared configs run without a prompt")
 				}
-				orch.OpenProject("") // default project = daemon cwd
 			}
 
 			// restartOpencodeLocked SIGTERMs + reaps the current opencode and

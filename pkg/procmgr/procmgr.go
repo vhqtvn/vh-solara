@@ -48,7 +48,7 @@ var (
 	maxConsecutiveFailures = 10
 )
 
-const logCap = 256 << 10 // 256 KiB ring per process
+var logCap = 256 << 10 // 256 KiB ring per process (var so tests can shrink it)
 
 // Status of a managed process.
 type Status string
@@ -75,6 +75,10 @@ type ProcSpec struct {
 	Env       map[string]string     // merged over the daemon environment
 	Restart   string                // projectcfg.Restart*
 	Readiness *projectcfg.Readiness // optional; nil → default settle heuristic
+	// OnReady, if set, is called (in its own goroutine) each time the process
+	// reaches readiness. The orchestrator uses it to register dependent views
+	// only once their backing process is actually up.
+	OnReady func()
 }
 
 // Manager owns the set of managed processes for one daemon. It is safe for
@@ -383,7 +387,11 @@ func (p *Proc) run(ctx context.Context) {
 		p.mu.Lock()
 		p.status = StatusReady
 		p.readyAt = time.Now()
+		onReady := p.spec.OnReady
 		p.mu.Unlock()
+		if onReady != nil {
+			go onReady() // register dependent views now that the process is up
+		}
 		// Health-watch until exit or stop.
 		p.healthLoop(ctx, waitCh)
 		p.killCmd(cmd, waitCh)
@@ -525,8 +533,9 @@ func (p *Proc) awaitReady(ctx context.Context, waitCh chan struct{}) readyReason
 func (p *Proc) healthLoop(ctx context.Context, waitCh chan struct{}) {
 	spec := p.snapshotSpec()
 	probe := newProbe(spec.Readiness, p.logs)
-	if probe == nil {
-		// No probe → just wait for exit.
+	if probe == nil || probe.oneShot {
+		// No recurring probe (none declared, or a one-shot log-readiness signal) →
+		// just watch for exit.
 		select {
 		case <-waitCh:
 		case <-ctx.Done():
@@ -765,7 +774,10 @@ func mergedEnv(extra map[string]string) []string {
 
 // --- readiness probe ---
 
-type probe struct{ check func(context.Context) bool }
+type probe struct {
+	check   func(context.Context) bool
+	oneShot bool // true for log-readiness: a startup-only signal, not a recurring health check
+}
 
 func newProbe(r *projectcfg.Readiness, logs *logRing) *probe {
 	if r == nil {
@@ -788,7 +800,11 @@ func newProbe(r *projectcfg.Readiness, logs *logRing) *probe {
 			vhlog.Error("procmgr bad readiness.log regex", "re", r.Log, "err", err)
 			return nil // fall back to settle
 		}
-		return &probe{check: func(ctx context.Context) bool {
+		// A log match is a one-shot STARTUP signal: the matched line eventually
+		// scrolls out of the bounded log ring, so re-running it as a recurring
+		// health check would flap a healthy process to "unhealthy". Mark it
+		// oneShot so healthLoop only watches for exit (no re-probing).
+		return &probe{oneShot: true, check: func(ctx context.Context) bool {
 			return re.Match(logs.snapshot())
 		}}
 	}

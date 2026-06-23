@@ -32,8 +32,22 @@ func newTestOrchestrator(t *testing.T) (*Orchestrator, *procmgr.Manager) {
 	return o, mgr
 }
 
+// sleepConfig's view has NO depends_on, so it registers immediately on grant
+// (these tests exercise trust/namespacing, not readiness gating — see
+// TestOrchestrator_ViewDeferredUntilReady for the depends_on path).
 const sleepConfig = `{
   // a managed project
+  "processes": [
+    { "id": "svc", "command": "/bin/sh -c \"sleep 60\"", "cwd": ".", "restart": "no" }
+  ],
+  "views": [
+    { "id": "svc", "path_prefix": "/svc", "upstream": "tcp:127.0.0.1:9" }
+  ]
+}`
+
+// depConfig's view depends on its process, so the view stays pending until the
+// process reaches readiness (here: the default 2 s settle of a live sleep).
+const depConfig = `{
   "processes": [
     { "id": "svc", "command": "/bin/sh -c \"sleep 60\"", "cwd": ".", "restart": "no" }
   ],
@@ -137,6 +151,34 @@ func TestOrchestrator_ReapprovalEvictsRemovedView(t *testing.T) {
 	v := o.views.match(managedViewPrefix(root, "/a"))
 	if v == nil || v.ID != managedViewKey(root, "renamed") {
 		t.Fatalf("/a should be served by the renamed view, got %+v", v)
+	}
+}
+
+// TestOrchestrator_ViewDeferredUntilReady verifies a depends_on view is NOT
+// registered until its process reaches readiness (so it never proxies to a
+// not-yet-bound upstream), then registers automatically once ready.
+func TestOrchestrator_ViewDeferredUntilReady(t *testing.T) {
+	root := writeManagedConfig(t, depConfig)
+	o, mgr := newTestOrchestrator(t)
+	defer mgr.StopAll()
+
+	if err := o.Grant(root); err != nil {
+		t.Fatal(err)
+	}
+	// Immediately after grant the process is still starting → view is pending,
+	// not yet routable.
+	if got := o.Snapshot(root).Views[0].Status; got != ViewPending {
+		t.Fatalf("view should be pending before readiness, got %s", got)
+	}
+	if o.views.match(managedViewPrefix(root, "/svc")) != nil {
+		t.Fatal("view must not be registered before its process is ready")
+	}
+	// Once the process settles to ready, the view registers on its own.
+	waitFor(t, func() bool {
+		return o.views.match(managedViewPrefix(root, "/svc")) != nil
+	}, "dependent view registered after process ready")
+	if got := o.Snapshot(root).Views[0].Status; got != ViewRegistered {
+		t.Fatalf("view should be registered after readiness, got %s", got)
 	}
 }
 

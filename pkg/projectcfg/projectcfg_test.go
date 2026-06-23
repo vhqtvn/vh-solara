@@ -175,6 +175,7 @@ func TestValidationErrors(t *testing.T) {
 		{"bad depends_on", `{"views":[{"id":"v","path_prefix":"/v","upstream":"unix:x","depends_on":"nope"}]}`, "does not match"},
 		{"bad restart", `{"processes":[{"id":"x","command":"a","restart":"forever"}]}`, "restart must be"},
 		{"empty command", `{"processes":[{"id":"x","command":""}]}`, "empty"},
+		{"empty array token", `{"processes":[{"id":"x","command":["echo","  "]}]}`, "is empty"},
 		{"bad id char", `{"processes":[{"id":"x y","command":"a"}]}`, "must be"},
 	}
 	for _, tc := range cases {

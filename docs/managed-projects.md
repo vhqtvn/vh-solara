@@ -29,7 +29,7 @@ Commit `.vh-solara/project.jsonc` (JSON with comments) at the project root:
       "env": { "BOARD_FOO": "bar" },       // optional, merged over the daemon env
       "restart": "on-failure",             // on-failure (default) | always | no
       "readiness": { "unix": ".vh-solara/run/board.sock" }
-      // other probes: "http": "http://unix:.…/healthz" | "log": "ready serving on"
+      // other probes: "http": "http://127.0.0.1:8080/healthz" | "log": "ready serving on"
     }
   ],
   // Views vh-solara reverse-proxies (same upstream spec as POST /vh/views).
@@ -103,19 +103,23 @@ For single-operator / headless setups, pass `--trust-on-open` (or set
 
 ## Readiness / health
 
-`readiness` is optional. Omit it and vh-solara applies a default heuristic
-(unix-socket upstream → ready once it accepts connections; otherwise a short
-settle). Declare one of:
+`readiness` is optional. Omit it and vh-solara applies a default heuristic: if a
+dependent view (`depends_on`) binds a `unix:` socket, the process is ready once
+that socket accepts connections; otherwise a short settle. Or declare one of:
 
-| Field | Ready when… |
-|-------|-------------|
-| `unix` | the unix socket accepts a connection |
-| `http` | the URL returns a 2xx (3 s timeout) |
-| `log`  | the regex matches the merged stdout/stderr |
+| Field | Ready when… | Recurring health check? |
+|-------|-------------|-------------------------|
+| `unix` | the unix socket accepts a connection | yes |
+| `http` | the URL (a `http(s)://host:port/…`, **not** a unix socket) returns a 2xx (3 s timeout) | yes |
+| `log`  | the regex matches the merged stdout/stderr | no — startup-only (the line scrolls out of the log ring) |
 
-Once ready, a process is health-checked on the same probe (if declared); sustained
-failure marks it `unhealthy` and applies the restart policy. Startup that never
-becomes ready within ~30 s is marked `failed`.
+Once ready, a process is health-checked on the same probe **except `log`**, which
+is a one-shot startup signal; sustained failure marks it `unhealthy` and applies
+the restart policy. Startup that never becomes ready within ~30 s is marked
+`failed`.
+
+A view with `depends_on` is **not registered until its process is ready** — so it
+never proxies to a not-yet-bound socket; until then it shows `pending`.
 
 ## HTTP API
 

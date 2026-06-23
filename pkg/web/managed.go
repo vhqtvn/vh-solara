@@ -56,6 +56,9 @@ type Orchestrator struct {
 	// (loadFresh), never from this cache.
 	cfgs    map[string]*projectcfg.LoadResult
 	viewReg map[string]map[string]string // dir → viewID → ViewRegistered|ViewPrefixConflict|ViewPending
+	// gen is bumped on every startLocked so a late "process ready" callback from a
+	// superseded config generation is ignored (no stale view registration).
+	gen map[string]uint64
 }
 
 // NewOrchestrator builds the orchestrator over the given manager, trust store, and
@@ -65,6 +68,7 @@ func NewOrchestrator(mgr *procmgr.Manager, trust *TrustStore, views *viewRegistr
 		mgr: mgr, trust: trust, views: views, cfgOverride: cfgOverride,
 		cfgs:    map[string]*projectcfg.LoadResult{},
 		viewReg: map[string]map[string]string{},
+		gen:     map[string]uint64{},
 	}
 }
 
@@ -115,11 +119,28 @@ func (o *Orchestrator) loadFresh(root string) *projectcfg.LoadResult {
 	return lr
 }
 
-// startLocked starts every declared process (idempotent) and registers every view
-// (recording prefix-conflicts as non-fatal). Caller holds o.mu.
+// startLocked starts every declared process (idempotent) and registers its views,
+// deferring any view with depends_on until its process is ready. Caller holds o.mu.
 func (o *Orchestrator) startLocked(root string, lr *projectcfg.LoadResult) {
+	// New generation: invalidates any in-flight "process ready" callback from a
+	// previous (now re-approved) config.
+	o.gen[root]++
+	gen := o.gen[root]
+
+	// Group views by the process they wait for (depends_on); the rest register now.
+	viewsByDep := map[string][]projectcfg.View{}
+	var immediate []projectcfg.View
+	for _, v := range lr.Config.Views {
+		if v.DependsOn != "" {
+			viewsByDep[v.DependsOn] = append(viewsByDep[v.DependsOn], v)
+		} else {
+			immediate = append(immediate, v)
+		}
+	}
+
 	// Processes.
-	for _, p := range lr.Config.Processes {
+	for i := range lr.Config.Processes {
+		p := lr.Config.Processes[i]
 		spec := procmgr.ProcSpec{
 			Dir:       root,
 			ID:        p.ID,
@@ -129,10 +150,34 @@ func (o *Orchestrator) startLocked(root string, lr *projectcfg.LoadResult) {
 			Restart:   p.Restart,
 			Readiness: p.Readiness,
 		}
+		deps := viewsByDep[p.ID]
+		// Documented default-readiness heuristic: if the author omitted a probe but
+		// a dependent view binds a unix socket, treat the process as ready once that
+		// socket accepts connections (otherwise procmgr falls back to a short settle).
+		if spec.Readiness == nil {
+			if sock := firstUnixUpstreamSock(deps); sock != "" {
+				spec.Readiness = &projectcfg.Readiness{Unix: sock}
+			}
+		}
+		// Authoring footgun: a view waiting on this process but bound to a different
+		// socket than the process's readiness.unix.
+		if p.Readiness != nil && p.Readiness.Unix != "" {
+			for _, v := range deps {
+				if s, ok := unixUpstreamSock(v.Upstream); ok && s != p.Readiness.Unix {
+					vhlog.Warn("managed-project view upstream socket differs from depended-on process readiness.unix",
+						"dir", root, "view", v.ID, "view_socket", s, "process", p.ID, "readiness_unix", p.Readiness.Unix)
+				}
+			}
+		}
+		if len(deps) > 0 {
+			pid := p.ID
+			spec.OnReady = func() { o.onProcReady(root, gen, pid) }
+		}
 		if err := o.mgr.Start(spec); err != nil {
 			vhlog.Error("managed-project process start failed", "dir", root, "id", p.ID, "err", err)
 		}
 	}
+
 	// Views. Evict any managed view this project registered under a previous
 	// (now re-approved) config but no longer declares — BEFORE re-registering, so
 	// a view renamed while keeping its path_prefix doesn't self-conflict against
@@ -147,10 +192,67 @@ func (o *Orchestrator) startLocked(root string, lr *projectcfg.LoadResult) {
 		}
 	}
 	reg := map[string]string{}
-	for _, v := range lr.Config.Views {
+	for _, v := range immediate {
 		reg[v.ID] = o.registerView(root, v)
 	}
+	// Dependent views: register now if the process is already ready (e.g. a
+	// re-approval of a still-running project), otherwise mark pending — the
+	// OnReady callback registers them once the process comes up.
+	for dep, vs := range viewsByDep {
+		ready := false
+		if st, ok := o.mgr.Status(root, dep); ok && st.Status == procmgr.StatusReady {
+			ready = true
+		}
+		for _, v := range vs {
+			if ready {
+				reg[v.ID] = o.registerView(root, v)
+			} else {
+				reg[v.ID] = ViewPending
+			}
+		}
+	}
 	o.viewReg[root] = reg
+}
+
+// onProcReady registers the views that depend on a process once it reaches
+// readiness. Fired from the supervisor goroutine; no-ops if a re-approval has
+// superseded this generation.
+func (o *Orchestrator) onProcReady(root string, gen uint64, procID string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.gen[root] != gen {
+		return // superseded by a newer config/approval
+	}
+	lr := o.cfgs[root]
+	reg := o.viewReg[root]
+	if lr == nil || reg == nil {
+		return
+	}
+	for _, v := range lr.Config.Views {
+		if v.DependsOn == procID {
+			reg[v.ID] = o.registerView(root, v)
+		}
+	}
+}
+
+// firstUnixUpstreamSock returns the socket path of the first view (in order)
+// whose upstream is a unix socket, or "" if none.
+func firstUnixUpstreamSock(views []projectcfg.View) string {
+	for _, v := range views {
+		if s, ok := unixUpstreamSock(v.Upstream); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+// unixUpstreamSock extracts the socket path from a "unix:<path>" upstream.
+func unixUpstreamSock(upstream string) (string, bool) {
+	const pre = "unix:"
+	if strings.HasPrefix(upstream, pre) {
+		return strings.TrimPrefix(upstream, pre), true
+	}
+	return "", false
 }
 
 // registerView builds the proxy for a declared view and registers it; returns the

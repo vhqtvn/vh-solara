@@ -280,15 +280,17 @@ func resolveCommand(raw json.RawMessage) (argv []string, shell string, err error
 	if len(raw) == 0 {
 		return nil, "", errors.New("missing")
 	}
-	// Try array first.
+	// Try array (direct argv) first.
 	var arr []string
 	if e := json.Unmarshal(raw, &arr); e == nil {
-		// Trim/validate each token is non-empty after trim of the executable.
-		out := make([]string, 0, len(arr))
-		for _, a := range arr {
-			out = append(out, a)
+		// Reject empty/whitespace-only tokens — they'd otherwise reach exec as an
+		// empty arg (or empty executable), almost always an authoring mistake.
+		for i, a := range arr {
+			if strings.TrimSpace(a) == "" {
+				return nil, "", fmt.Errorf("array element %d is empty", i)
+			}
 		}
-		return out, "", nil
+		return append([]string(nil), arr...), "", nil
 	}
 	var s string
 	if e := json.Unmarshal(raw, &s); e == nil {

@@ -148,25 +148,27 @@ func TestManagedHTTP_TrustGateThenProxy(t *testing.T) {
 		return ok && st.Status == procmgr.StatusReady
 	}, "managed process ready after grant")
 
-	// 4. The declared view is registered (origin=managed) at its per-project
-	// namespaced path, and listed when the list is scoped to this project.
-	vresp, err := http.Get(web.URL + "/vh/views?dir=" + root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var views []viewReg
-	json.NewDecoder(vresp.Body).Decode(&views)
-	vresp.Body.Close()
+	// 4. The depends_on view registers once the process is ready (async via the
+	// readiness callback), at its per-project namespaced path, and is listed when
+	// the list is scoped to this project.
 	wantPrefix := managedViewPrefix(root, "/demo")
-	found := false
-	for _, v := range views {
-		if v.ID == managedViewKey(root, "demo") && v.Origin == OriginManaged && v.Dir == root && v.PathPrefix == wantPrefix {
-			found = true
+	wantID := managedViewKey(root, "demo")
+	waitFor(t, func() bool {
+		vresp, err := http.Get(web.URL + "/vh/views?dir=" + root)
+		if err != nil {
+			return false
 		}
-	}
-	if !found {
-		t.Fatalf("managed view not registered at %s: %+v", wantPrefix, views)
-	}
+		var views []viewReg
+		json.NewDecoder(vresp.Body).Decode(&views)
+		vresp.Body.Close()
+		for _, v := range views {
+			if v.ID == wantID && v.Origin == OriginManaged && v.Dir == root && v.PathPrefix == wantPrefix {
+				return true
+			}
+		}
+		return false
+	}, "managed view registered after process ready")
+
 	// Scoping: a different project's list must NOT include this managed view.
 	oresp, err := http.Get(web.URL + "/vh/views?dir=" + filepath.Join(root, "other"))
 	if err != nil {

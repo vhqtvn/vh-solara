@@ -118,6 +118,51 @@ func TestManager_LogReadinessProbe(t *testing.T) {
 	}
 }
 
+// TestManager_LogReadinessDoesNotFlap guards the one-shot semantics: a log probe
+// is a STARTUP signal, not a recurring health check. The matched line is flooded
+// out of the (shrunk) log ring AFTER readiness, while the process stays alive;
+// with a recurring log health check this would flap to unhealthy/restart. It
+// must stay ready.
+func TestManager_LogReadinessDoesNotFlap(t *testing.T) {
+	prevCap, prevHI := logCap, healthInterval
+	logCap, healthInterval = 256, 20*time.Millisecond
+	t.Cleanup(func() { logCap, healthInterval = prevCap, prevHI })
+
+	mgr := NewManager(mgrCtx())
+	defer mgr.StopAll()
+	// READY stays alone in the ring ~0.6s (so the readiness probe detects it),
+	// then a flood evicts it from the 256-byte ring while the process stays alive.
+	if err := mgr.Start(ProcSpec{
+		Dir: "/proj", ID: "logger", Cwd: t.TempDir(),
+		Argv:      []string{"/bin/sh", "-c", "echo READY; sleep 0.6; i=0; while [ $i -lt 200 ]; do echo XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX; i=$((i+1)); done; sleep 10"},
+		Restart:   projectcfg.RestartNo,
+		Readiness: &projectcfg.Readiness{Log: "READY"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !waitFor(t, 5*time.Second, func() bool {
+		st, _ := mgr.Status("/proj", "logger")
+		return st.Status == StatusReady
+	}) {
+		t.Fatal("never reached ready")
+	}
+	// Wait until READY has been evicted from the ring (flood ran).
+	if !waitFor(t, 5*time.Second, func() bool {
+		b, _ := mgr.Logs("/proj", "logger", 0)
+		return !strings.Contains(string(b), "READY")
+	}) {
+		t.Fatal("READY never evicted from the log ring")
+	}
+	// Now, across several health intervals with READY gone, it must NOT flap.
+	for i := 0; i < 10; i++ {
+		time.Sleep(20 * time.Millisecond)
+		st, _ := mgr.Status("/proj", "logger")
+		if st.Status != StatusReady {
+			t.Fatalf("log-readiness flapped to %s (restarts=%d) — health re-probed a one-shot signal", st.Status, st.Restarts)
+		}
+	}
+}
+
 func TestManager_StartupTimeoutFailed(t *testing.T) {
 	prev := startupTimeout
 	startupTimeout = 800 * time.Millisecond
