@@ -58,6 +58,7 @@ export default function App() {
   // (registration can happen after the page loads), so they appear in the
   // view-switcher without a reload.
   let viewsPoll: number | undefined;
+  let managedPoll: number | undefined;
   // An embedded view may ask for the theme on its own load timing.
   const onThemeRequest = (e: MessageEvent) => {
     const d = e.data as { source?: string; type?: string } | null;
@@ -77,10 +78,10 @@ export default function App() {
     document.removeEventListener("contextmenu", onContextMenu);
     window.removeEventListener("message", onThemeRequest);
     clearInterval(viewsPoll);
+    clearInterval(managedPoll);
   });
   // Re-scope the managed view when the active project changes, and surface the
   // trust gate proactively when a project wants to run repo-declared commands.
-  let managedPoll: number | undefined;
   createEffect(() => {
     projectDir();
     void refreshManaged();

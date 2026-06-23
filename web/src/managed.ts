@@ -43,7 +43,7 @@ export interface ManagedProc {
 export interface ManagedViewStatus {
   id: string;
   path_prefix: string;
-  status: string; // registered | prefix-conflict
+  status: string; // registered | prefix-conflict | pending (not trusted yet)
 }
 export interface ManagedProject {
   dir: string;

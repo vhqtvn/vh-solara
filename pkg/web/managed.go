@@ -36,6 +36,7 @@ const (
 const (
 	ViewRegistered     = "registered"
 	ViewPrefixConflict = "prefix-conflict"
+	ViewPending        = "pending" // declared but not yet registered (project not trusted)
 )
 
 // Orchestrator owns repo-declared processes+views, gluing the config loader, the
@@ -47,10 +48,14 @@ type Orchestrator struct {
 	cfgOverride string        // --project-config override ("" = conventional discovery)
 	autoTrust   bool          // headless escape hatch: auto-approve configs on open
 
-	mu      sync.Mutex
-	cfgs    map[string]*projectcfg.LoadResult // cached per absolute dir
-	states  map[string]string                 // dir → project state
-	viewReg map[string]map[string]string      // dir → viewID → ViewRegistered|ViewPrefixConflict
+	mu sync.Mutex
+	// cfgs holds the TRUSTED, currently-running config per dir — and ONLY that.
+	// It is the single source of commands the manager may (re)launch, so a
+	// start/restart can never run a config edit that hasn't been re-approved.
+	// Trust state and the review are always derived from a fresh on-disk read
+	// (loadFresh), never from this cache.
+	cfgs    map[string]*projectcfg.LoadResult
+	viewReg map[string]map[string]string // dir → viewID → ViewRegistered|ViewPrefixConflict|ViewPending
 }
 
 // NewOrchestrator builds the orchestrator over the given manager, trust store, and
@@ -59,7 +64,6 @@ func NewOrchestrator(mgr *procmgr.Manager, trust *TrustStore, views *viewRegistr
 	return &Orchestrator{
 		mgr: mgr, trust: trust, views: views, cfgOverride: cfgOverride,
 		cfgs:    map[string]*projectcfg.LoadResult{},
-		states:  map[string]string{},
 		viewReg: map[string]map[string]string{},
 	}
 }
@@ -73,41 +77,33 @@ func (o *Orchestrator) OpenProject(dir string) {
 	if err != nil {
 		return
 	}
-	lr := o.loadCached(root)
-	o.mu.Lock()
-	defer o.mu.Unlock()
+	lr := o.loadFresh(root)
 	if lr == nil {
-		o.states[root] = StateNone
 		return
 	}
-	o.cfgs[root] = lr
 	if o.autoTrust && o.trust.State(root, lr.Hash) != TrustTrusted {
 		// Headless escape hatch (--trust-on-open / VH_TRUST_CONFIG): approve the
 		// config without a prompt. Intended for trusted single-user setups.
 		if err := o.trust.Grant(root, lr.Hash); err != nil {
 			vhlog.Warn("managed-project auto-trust failed", "dir", root, "err", err)
-			o.states[root] = StateAwaitTrust
 			return
 		}
 	}
-	switch o.trust.State(root, lr.Hash) {
-	case TrustTrusted:
-		o.states[root] = StateTrusted
+	// Only a trusted config is cached + started; an untrusted/changed config is
+	// left to the trust gate (the UI prompts; nothing runs until Grant).
+	if o.trust.IsTrusted(root, lr.Hash) {
+		o.mu.Lock()
+		o.cfgs[root] = lr
 		o.startLocked(root, lr)
-	case TrustChanged:
-		o.states[root] = StateChanged
-	default:
-		o.states[root] = StateAwaitTrust
+		o.mu.Unlock()
 	}
 }
 
-func (o *Orchestrator) loadCached(root string) *projectcfg.LoadResult {
-	o.mu.Lock()
-	cached := o.cfgs[root]
-	o.mu.Unlock()
-	if cached != nil {
-		return cached
-	}
+// loadFresh always reads + parses the config from disk (NO caching) so trust
+// state and the review reflect the CURRENT file — a config edit while the daemon
+// is up is seen immediately. nil = no config present (or unreadable). Never
+// touches o.mu, so callers may hold it or not.
+func (o *Orchestrator) loadFresh(root string) *projectcfg.LoadResult {
 	lr, err := projectcfg.Load(root, o.cfgOverride)
 	if err != nil {
 		if projectcfg.IsNotFound(err) {
@@ -186,17 +182,18 @@ func (o *Orchestrator) Grant(dir string) error {
 	if err != nil {
 		return err
 	}
-	lr := o.loadCached(root)
+	lr := o.loadFresh(root)
 	if lr == nil {
 		return fmt.Errorf("no managed-project config at %s", root)
 	}
+	// Approve exactly the config currently on disk (the same one Snapshot showed
+	// in the review), then pin + start it.
 	if err := o.trust.Grant(root, lr.Hash); err != nil {
 		return err
 	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.cfgs[root] = lr
-	o.states[root] = StateTrusted
 	o.startLocked(root, lr)
 	return nil
 }
@@ -220,17 +217,15 @@ func (o *Orchestrator) Control(dir, id, action string) error {
 	}
 }
 
-// specFor rebuilds the ProcSpec for a declared process (for start/restart after a
-// stop). Returns an empty-id spec (→ mgr errors) if the process isn't declared.
+// specFor rebuilds the ProcSpec for a declared process from the TRUSTED, running
+// config (o.cfgs) — never from a fresh disk read. This is a security boundary: a
+// manual start/restart must not launch a config edit that hasn't been
+// re-approved through the trust gate. Returns an empty-id spec (→ mgr errors) if
+// the project isn't currently trusted+loaded or the process isn't declared.
 func (o *Orchestrator) specFor(root, id string) procmgr.ProcSpec {
 	o.mu.Lock()
 	lr := o.cfgs[root]
 	o.mu.Unlock()
-	if lr == nil {
-		if lr2 := o.loadCached(root); lr2 != nil {
-			lr = lr2
-		}
-	}
 	if lr == nil {
 		return procmgr.ProcSpec{}
 	}
@@ -289,54 +284,43 @@ type ManagedViewStatus struct {
 	Status string `json:"status"`
 }
 
-// Snapshot builds the current view of a project for the UI.
+// Snapshot builds the current view of a project for the UI. It is READ-ONLY: it
+// reads the config fresh from disk so the state/review reflect the file right
+// now (an edit while the daemon is up flips the project to "changed"), but it
+// never starts anything — running processes keep their last-trusted config until
+// the operator re-approves through Grant.
 func (o *Orchestrator) Snapshot(dir string) ManagedProject {
 	root, _ := projectRoot(dir)
-	o.mu.Lock()
-	state := o.states[root]
-	lr := o.cfgs[root]
-	reg := o.viewReg[root]
-	o.mu.Unlock()
+	out := ManagedProject{Dir: root, Processes: []procmgr.ProcStatus{}, Views: []ManagedViewStatus{}}
 
-	out := ManagedProject{Dir: root, State: state, Processes: []procmgr.ProcStatus{}, Views: []ManagedViewStatus{}}
+	lr := o.loadFresh(root)
 	if lr == nil {
-		// Possibly never loaded (e.g. opened out-of-band); try once.
-		if lr2 := o.loadCached(root); lr2 != nil {
-			lr = lr2
-			o.mu.Lock()
-			o.cfgs[root] = lr
-			if state == "" {
-				o.states[root] = StateAwaitTrust
-				out.State = StateAwaitTrust
-			}
-			o.mu.Unlock()
-		} else {
-			if out.State == "" {
-				out.State = StateNone
-			}
-			return out
-		}
+		out.State = StateNone
+		return out
 	}
 	out.ConfigHash = lr.Hash
 
-	// Review payload whenever not yet trusted for this hash.
-	if t := o.trust.State(root, lr.Hash); t != TrustTrusted {
+	o.mu.Lock()
+	reg := o.viewReg[root]
+	o.mu.Unlock()
+
+	// State + review derive from the CURRENT file vs the trust record.
+	switch o.trust.State(root, lr.Hash) {
+	case TrustTrusted:
+		out.State = StateTrusted
+	case TrustChanged:
+		out.State = StateChanged
 		out.Review = buildReview(lr)
-		if t == TrustChanged && out.State == "" {
-			out.State = StateChanged
-		} else if out.State == "" {
-			out.State = StateAwaitTrust
-		}
+	default:
+		out.State = StateAwaitTrust
+		out.Review = buildReview(lr)
 	}
 
 	out.Processes = o.mgr.Statuses(root)
-	if reg == nil {
-		reg = map[string]string{}
-	}
 	for _, v := range lr.Config.Views {
 		st := reg[v.ID]
 		if st == "" {
-			st = ViewPrefixConflict // not yet registered (untrusted) — show as not-registered
+			st = ViewPending // declared but not registered yet (not trusted)
 		}
 		out.Views = append(out.Views, ManagedViewStatus{ID: v.ID, Prefix: v.PathPrefix, Status: st})
 	}

@@ -87,16 +87,20 @@ func (c *Config) canonical() []byte {
 	return b
 }
 
-// Hash returns the sha256 hex of the canonical declaration bytes. Stable across
-// comment/whitespace/repo-location changes; changes iff a declared value
-// changes.
+// Hash returns the sha256 hex of the canonical declaration bytes. Load computes
+// it on the as-PARSED config (before path resolution) so it is stable across
+// comment/whitespace/repo-location changes and changes iff a declared value
+// changes. Do not call it on a resolved Config — that would bind the hash to the
+// checkout's absolute paths.
 func (c *Config) Hash() string {
 	sum := sha256.Sum256(c.canonical())
 	return hex.EncodeToString(sum[:])
 }
 
-// CanonicalJSON is the pretty-printed declaration bytes shown in the trust
-// review (deterministic, so it matches what was hashed).
+// CanonicalJSON is the pretty-printed config shown in the trust review. It is
+// rendered from the RESOLVED config (absolute cwd/socket paths), which is the
+// more informative form for an operator reviewing what will run; the trust hash
+// itself is computed over the as-authored declarations (see Hash / Load).
 func (c *Config) CanonicalJSON() []byte {
 	b, _ := json.MarshalIndent(c, "", "  ")
 	return b
@@ -164,10 +168,17 @@ func Load(root, override string) (*LoadResult, error) {
 	}
 	c.Dir = rootAbs
 	c.Path = path
+	// Hash the DECLARATIONS as authored — BEFORE resolveAndValidate rewrites the
+	// relative readiness/upstream paths to absolute. Hashing after resolution
+	// would fold the checkout's absolute path into the hash, so a clone/move
+	// would re-gate trust even though nothing the author declared changed. The
+	// pre-resolution hash keeps the trust grant location-independent (a repo move
+	// keeps trust) and changes iff a declared value changes.
+	hash := c.Hash()
 	if err := resolveAndValidate(&c); err != nil {
 		return nil, fmt.Errorf("project config %s: %w", path, err)
 	}
-	return &LoadResult{Config: &c, Hash: c.Hash()}, nil
+	return &LoadResult{Config: &c, Hash: hash}, nil
 }
 
 func resolveAndValidate(c *Config) error {

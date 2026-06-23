@@ -49,5 +49,8 @@ pkg/web/dist/*
 # Agent-local tooling / config.
 .claude/
 
-# vh-solara per-project local data (message attachments, etc.).
-.vh-solara/
+# vh-solara per-project local data (message attachments, etc.) is ignored, but
+# the checked-in managed-project config (.vh-solara/project.jsonc) is NOT — it is
+# meant to be committed so the repo can declare its companion processes/views.
+.vh-solara/*
+!.vh-solara/project.jsonc

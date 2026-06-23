@@ -38,6 +38,14 @@ var (
 	healthFailThreshold = 2 // consecutive probe failures before kill+restart
 	maxBackoff          = 30 * time.Second
 	backoffBase         = 1 * time.Second
+	// healthyResetAfter is how long a process must STAY ready before its failure
+	// streak (which drives backoff) resets. Without this, a process that crashes
+	// right after becoming ready would reset backoff every cycle and hammer at
+	// backoffBase — the crash loop the backoff exists to dampen.
+	healthyResetAfter = 30 * time.Second
+	// maxConsecutiveFailures caps restart attempts for on-failure (give up →
+	// failed). restart:always is never capped (but still backs off).
+	maxConsecutiveFailures = 10
 )
 
 const logCap = 256 << 10 // 256 KiB ring per process
@@ -197,6 +205,7 @@ func (m *Manager) StopAll() {
 
 type Proc struct {
 	base  context.Context
+	armMu sync.Mutex // serializes arm() so two callers can't spawn two supervisor loops
 	mu    sync.Mutex
 	spec  ProcSpec
 	logs  *logRing
@@ -207,46 +216,54 @@ type Proc struct {
 	runDone chan struct{} // closed when the supervisor loop has exited
 
 	// runtime (guarded by mu)
-	status      Status
-	pid         int
-	startedAt   time.Time
-	readyAt     time.Time
-	exitCode    int
-	restartCount int
+	status       Status
+	pid          int
+	startedAt    time.Time
+	readyAt      time.Time
+	exitCode     int
+	restartCount int // cumulative restarts, monotonic (display)
+	failCount    int // consecutive failures since last sustained-ready (backoff + give-up)
 }
 
 func newProc(base context.Context, spec ProcSpec) *Proc {
 	return &Proc{base: base, spec: spec, logs: newLogRing(logCap), status: StatusStopped}
 }
 
-// arm (re)starts the supervisor loop for this proc.
+// arm (re)starts the supervisor loop for this proc. armMu serializes the whole
+// arm decision so two concurrent callers (e.g. a config-reload Start racing a
+// Restart) can't both pass the IsRunning() check and spawn two supervisor loops
+// for one Proc (which would double the child + leak a goroutine).
 func (p *Proc) arm() error {
+	p.armMu.Lock()
+	defer p.armMu.Unlock()
+
 	p.mu.Lock()
 	if p.status.IsRunning() {
 		p.mu.Unlock()
 		return nil // already live
 	}
-	if p.ctx != nil && p.cancel != nil {
-		// previous loop winding down after a stop — wait for it
-		done := p.runDone
-		p.mu.Unlock()
-		if done != nil {
-			<-done
-		}
-		p.mu.Lock()
+	winding := p.ctx != nil && p.cancel != nil
+	prevDone := p.runDone
+	p.mu.Unlock()
+
+	// A previous loop may be winding down after a stop — wait for it to exit
+	// before re-arming (armMu keeps any other arm() out meanwhile).
+	if winding && prevDone != nil {
+		<-prevDone
 	}
+
 	ctx, cancel := context.WithCancel(p.base)
+	p.mu.Lock()
 	p.ctx = ctx
 	p.cancel = cancel
 	p.stopF = false
 	p.status = StatusStarting
 	p.runDone = make(chan struct{})
 	runDone := p.runDone
-	ctx2 := ctx
 	p.mu.Unlock()
 	go func() {
 		defer close(runDone)
-		p.run(ctx2)
+		p.run(ctx)
 	}()
 	return nil
 }
@@ -281,7 +298,7 @@ func (p *Proc) run(ctx context.Context) {
 			if !p.shouldRestartExec() {
 				return
 			}
-			if !p.sleep(ctx, p.backoff()) {
+			if !p.scheduleRestart(ctx) {
 				return
 			}
 			continue
@@ -289,7 +306,7 @@ func (p *Proc) run(ctx context.Context) {
 		reason := p.awaitReady(ctx, waitCh)
 		switch reason {
 		case readyCancelled:
-			p.killCmd(cmd)
+			p.killCmd(cmd, waitCh)
 			<-waitCh
 			return
 		case readyExited:
@@ -316,12 +333,12 @@ func (p *Proc) run(ctx context.Context) {
 				}
 				return
 			}
-			if !p.sleep(ctx, p.backoff()) {
+			if !p.scheduleRestart(ctx) {
 				return
 			}
 			continue
 		case readyTimeout:
-			p.killCmd(cmd)
+			p.killCmd(cmd, waitCh)
 			<-waitCh
 			code := p.cmdExitCode()
 			p.set(StatusFailed)
@@ -329,7 +346,7 @@ func (p *Proc) run(ctx context.Context) {
 			if !p.shouldRestartExit(code) && !p.shouldRestartExec() {
 				return
 			}
-			if !p.sleep(ctx, p.backoff()) {
+			if !p.scheduleRestart(ctx) {
 				return
 			}
 			continue
@@ -339,11 +356,10 @@ func (p *Proc) run(ctx context.Context) {
 		p.mu.Lock()
 		p.status = StatusReady
 		p.readyAt = time.Now()
-		p.restartCount = 0 // reset backoff once we reached ready
 		p.mu.Unlock()
 		// Health-watch until exit or stop.
 		p.healthLoop(ctx, waitCh)
-		p.killCmd(cmd)
+		p.killCmd(cmd, waitCh)
 		<-waitCh
 		if ctx.Err() != nil {
 			return
@@ -364,7 +380,7 @@ func (p *Proc) run(ctx context.Context) {
 			}
 			return
 		}
-		if !p.sleep(ctx, p.backoff()) {
+		if !p.scheduleRestart(ctx) {
 			return
 		}
 	}
@@ -412,6 +428,7 @@ func (p *Proc) launch(ctx context.Context) (*exec.Cmd, chan struct{}, error) {
 	p.status = StatusStarting
 	p.pid = cmd.Process.Pid
 	p.startedAt = time.Now()
+	p.readyAt = time.Time{} // cleared per generation; set again only if this run reaches ready
 	p.exitCode = 0
 	p.mu.Unlock()
 	vhlog.Info("procmgr started", "id", spec.ID, "pid", cmd.Process.Pid, "dir", spec.Dir)
@@ -452,6 +469,10 @@ func (p *Proc) awaitReady(ctx context.Context, waitCh chan struct{}) readyReason
 		case <-ctx.Done():
 			return readyCancelled
 		}
+	}
+	// Check immediately so a fast unix/http upstream isn't delayed a whole tick.
+	if probe.check(ctx) {
+		return readyYes
 	}
 	t := time.NewTicker(500 * time.Millisecond)
 	defer t.Stop()
@@ -546,14 +567,43 @@ func (p *Proc) shouldRestartExec() bool {
 	return policy == projectcfg.RestartAlways || policy == projectcfg.RestartOnFailure || policy == ""
 }
 
-func (p *Proc) backoff() time.Duration {
+// scheduleRestart records a restart attempt, applies the give-up policy, and
+// waits the backoff. Returns false if the supervisor should stop (gave up, or
+// ctx cancelled during the wait). The failure streak — which drives both backoff
+// and give-up — resets only after the process stayed ready for healthyResetAfter,
+// so a fast crash-after-ready keeps backing off while a long-healthy run that
+// later dies restarts promptly.
+func (p *Proc) scheduleRestart(ctx context.Context) bool {
 	p.mu.Lock()
-	n := p.restartCount
+	if !p.readyAt.IsZero() && time.Since(p.readyAt) >= healthyResetAfter {
+		p.failCount = 0
+	}
+	p.failCount++
 	p.restartCount++
+	n := p.failCount
+	always := p.spec.Restart == projectcfg.RestartAlways
 	p.mu.Unlock()
-	d := backoffBase << n
-	if d > maxBackoff || d <= 0 {
-		d = maxBackoff
+
+	if !always && n > maxConsecutiveFailures {
+		p.set(StatusFailed)
+		vhlog.Warn("procmgr giving up after repeated failures", "id", p.spec.ID, "failures", n-1)
+		return false
+	}
+	return p.sleep(ctx, backoffFor(n-1))
+}
+
+// backoffFor returns the exponential backoff for the n-th consecutive failure
+// (n=0 → backoffBase), capped at maxBackoff and guarded against shift overflow.
+func backoffFor(n int) time.Duration {
+	if n < 0 {
+		n = 0
+	}
+	if n >= 30 {
+		return maxBackoff
+	}
+	d := backoffBase << uint(n)
+	if d <= 0 || d > maxBackoff {
+		return maxBackoff
 	}
 	return d
 }
@@ -589,21 +639,27 @@ func (p *Proc) aliveNoLock() bool {
 	return p.pid != 0
 }
 
-func (p *Proc) killCmd(cmd *exec.Cmd) {
+// killCmd SIGTERMs the whole process group, then escalates to SIGKILL after a
+// grace period UNLESS the process reaps first (done closed). Waiting on done
+// both bounds the escalation goroutine to the process lifetime (no leak / no
+// pile-up under frequent restarts) and avoids SIGKILLing a recycled pid group
+// after the child already exited. Killing the group is essential so a
+// shell-launched grandchild (e.g. `sh -c 'sleep 30'`) dies too — otherwise it
+// keeps the stdout pipe open and cmd.Wait deadlocks.
+func (p *Proc) killCmd(cmd *exec.Cmd, done <-chan struct{}) {
 	if cmd == nil || cmd.Process == nil {
 		return
 	}
 	pid := cmd.Process.Pid
-	// SIGTERM the whole group (Setpgid made pid the group leader), then escalate
-	// to SIGKILL after a grace period. Killing the group is essential so a
-	// shell-launched grandchild (e.g. `sh -c 'sleep 30'`) dies too — otherwise it
-	// keeps the stdout pipe open and cmd.Wait deadlocks.
 	_ = killGroup(pid, syscall.SIGTERM)
 	go func() {
 		t := time.NewTimer(3 * time.Second)
 		defer t.Stop()
-		<-t.C
-		_ = killGroup(pid, syscall.SIGKILL)
+		select {
+		case <-done: // reaped after SIGTERM — don't SIGKILL a possibly-recycled pid
+		case <-t.C:
+			_ = killGroup(pid, syscall.SIGKILL)
+		}
 	}()
 }
 
@@ -635,7 +691,7 @@ type ProcStatus struct {
 	Restart   string    `json:"restart"`
 	StartedAt time.Time `json:"started_at,omitempty"`
 	ReadyAt   time.Time `json:"ready_at,omitempty"`
-	ExitCode  int       `json:"exit_code,omitempty"`
+	ExitCode  int       `json:"exit_code"` // not omitempty: a clean exit 0 must be distinguishable
 	Restarts  int       `json:"restarts"`
 }
 

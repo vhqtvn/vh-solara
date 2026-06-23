@@ -136,6 +136,35 @@ func TestHashStabilityAndChange(t *testing.T) {
 	}
 }
 
+// TestHashLocationIndependent verifies the trust hash is computed over the
+// as-authored declarations (relative paths), so the SAME config under two
+// different checkout paths hashes identically — a clone/move keeps trust.
+func TestHashLocationIndependent(t *testing.T) {
+	body := `{
+  "processes": [{ "id": "board", "command": "board serve --socket .vh-solara/run/b.sock",
+    "readiness": { "unix": ".vh-solara/run/b.sock" } }],
+  "views": [{ "id": "board", "path_prefix": "/board", "upstream": "unix:.vh-solara/run/b.sock", "depends_on": "board" }]
+}`
+	dirA, dirB := t.TempDir(), t.TempDir()
+	writeConfig(t, dirA, body)
+	writeConfig(t, dirB, body)
+	ra, err := Load(dirA, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rb, err := Load(dirB, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ra.Hash != rb.Hash {
+		t.Fatalf("hash is location-dependent: %s (%s) != %s (%s)", ra.Hash, dirA, rb.Hash, dirB)
+	}
+	// Resolution still happened (paths absolute under each root).
+	if ra.Config.Views[0].Upstream == rb.Config.Views[0].Upstream {
+		t.Fatalf("expected resolved upstreams to differ by root, both = %s", ra.Config.Views[0].Upstream)
+	}
+}
+
 func TestValidationErrors(t *testing.T) {
 	cases := []struct {
 		name string

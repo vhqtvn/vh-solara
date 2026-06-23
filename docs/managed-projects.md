@@ -76,8 +76,11 @@ For single-operator / headless setups, pass `--trust-on-open` (or set
   registers the dependent views. Process health, logs, and start/stop/restart
   controls surface in the UI's project-processes panel.
 - **Restart policy.** `on-failure` (default) restarts a non-zero exit;
-  `always` restarts any exit; `no` never restarts. Backoff is exponential.
-  `always` is honored **within one daemon lifetime** — it is not "survive a
+  `always` restarts any exit; `no` never restarts. Backoff is exponential, and
+  the failure streak resets only after a process stays ready a while — so a
+  crash-after-ready keeps backing off instead of hammering. `on-failure` gives up
+  (→ `failed`) after a run of consecutive failures; `always` retries forever (but
+  still backs off). `always` is honored **within one daemon lifetime** — it is not "survive a
   daemon restart" (see next point).
 - **Daemon restart.** Processes do **not** auto-start on boot. They come back
   lazily when a browser re-opens the project (the persisted trust record means
@@ -123,4 +126,14 @@ All behind the worker's auth + CSRF guard (`X-VH-CSRF: 1` on mutations).
 | `POST` | `/vh/trust`  body `{"dir":"…"}` | Grant trust → starts the processes |
 
 A `processes[]` entry: `{id,status,pid,command,restart,started_at,ready_at,exit_code,restarts}`
-with `status` ∈ `stopped \| starting \| ready \| unhealthy \| failed`.
+with `status` ∈ `stopped \| starting \| ready \| unhealthy \| failed`. A `views[]`
+entry: `{id,path_prefix,status}` with `status` ∈ `registered \| prefix-conflict \|
+pending` (`pending` = declared but not registered because the project isn't
+trusted yet).
+
+`state` is computed from the config **on disk right now** vs. the trust record,
+so editing the config while the daemon is up flips the project to `changed`
+immediately. Editing does **not** disturb already-running processes — they keep
+the last-approved config, and even a manual `start`/`restart` relaunches the
+*approved* config, never an unreviewed edit. The new commands run only after you
+re-approve.

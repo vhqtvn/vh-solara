@@ -42,6 +42,41 @@ const sleepConfig = `{
   ]
 }`
 
+// TestOrchestrator_ConfigEditReGatesAndKeepsTrustedSpec verifies that editing
+// the config while the daemon is up (1) is detected immediately as "changed"
+// (no cache pinning it to the old state), and (2) does NOT let a start/restart
+// launch the unapproved edit — specFor stays on the trusted, running config.
+func TestOrchestrator_ConfigEditReGatesAndKeepsTrustedSpec(t *testing.T) {
+	root := writeManagedConfig(t, sleepConfig)
+	o, mgr := newTestOrchestrator(t)
+	defer mgr.StopAll()
+
+	if err := o.Grant(root); err != nil {
+		t.Fatal(err)
+	}
+	if snap := o.Snapshot(root); snap.State != StateTrusted {
+		t.Fatalf("after grant: state=%s want trusted", snap.State)
+	}
+
+	// Edit the config on disk (swap the command) WITHOUT re-approving.
+	edited := strings.Replace(sleepConfig, "sleep 60", "sleep 61", 1)
+	cfgPath := filepath.Join(root, ".vh-solara", "project.jsonc")
+	if err := os.WriteFile(cfgPath, []byte(edited), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// (1) The change is seen immediately — not only after a daemon restart.
+	if snap := o.Snapshot(root); snap.State != StateChanged {
+		t.Fatalf("after edit: state=%s want changed", snap.State)
+	}
+
+	// (2) A start/restart relaunches the APPROVED command, never the edit.
+	got := strings.Join(o.specFor(root, "svc").Argv, " ")
+	if !strings.Contains(got, "sleep 60") || strings.Contains(got, "sleep 61") {
+		t.Fatalf("specFor used unapproved edit: %q", got)
+	}
+}
+
 func TestOrchestrator_UntrustedThenGrant(t *testing.T) {
 	root := writeManagedConfig(t, sleepConfig)
 	o, mgr := newTestOrchestrator(t)
