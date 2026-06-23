@@ -7,6 +7,47 @@ import { streamLive } from "../prefs";
 import { openSession, setSelectedId } from "../sync";
 import { openFile } from "../files";
 import type { Part } from "../types";
+import Icon from "./Icon";
+
+// Friendly tool labels (mirrors OpenChamber's TOOL_METADATA displayName). Falls
+// back to a title-cased version of the raw tool name for anything unmapped.
+const TOOL_LABELS: Record<string, string> = {
+  read: "Read File", write: "Write File", edit: "Edit File", multiedit: "Multi-Edit",
+  patch: "Apply Patch", apply_patch: "Apply Patch", bash: "Shell", grep: "Search Files",
+  glob: "Find Files", list: "List Directory", ls: "List Directory", task: "Agent Task",
+  webfetch: "Fetch URL", fetch: "Fetch URL", websearch: "Web Search", codesearch: "Code Search",
+  todowrite: "Update Todos", todoread: "Read Todos", skill: "Load Skill", question: "Question", lsp: "LSP",
+};
+function toolLabel(tool: string): string {
+  const t = (tool || "").toLowerCase();
+  return TOOL_LABELS[t] || (tool || "").replace(/[_-]+/g, " ").replace(/\b\w/g, (c) => c.toUpperCase()) || tool;
+}
+// Map a tool to one of our available Icon glyphs (see Icon.tsx).
+function toolIconName(tool: string): string {
+  const t = (tool || "").toLowerCase();
+  if (/(edit|write|patch|create|str_replace)/.test(t)) return "edit";
+  if (/(bash|shell|cmd|terminal)/.test(t)) return "terminal";
+  if (/(read|view|cat)/.test(t)) return "eye";
+  if (/(grep|search|find|glob|ripgrep)/.test(t)) return "filter";
+  if (/(list|ls|dir)/.test(t)) return "menu";
+  if (/(fetch|curl|wget|web|google|bing)/.test(t)) return "send";
+  if (/(task|agent)/.test(t)) return "fork";
+  if (/todo/.test(t)) return "check";
+  if (/question/.test(t)) return "help";
+  if (/(lsp|skill)/.test(t)) return "info";
+  return "layers";
+}
+// Tool duration from its state.time (start→end), formatted like the reasoning
+// timer. Empty until the tool finishes.
+function durationText(part: Part): string {
+  const time = (part.state?.time || part.time || {}) as { start?: number; end?: number };
+  const s = time.start;
+  const e = time.end;
+  if (!s || !e) return "";
+  const secs = Math.max(0, (e - s) / 1000);
+  const d = secs < 0.05 ? 0.1 : secs;
+  return d < 60 ? `${d.toFixed(1)}s` : `${Math.floor(d / 60)}m ${Math.round(d % 60)}s`;
+}
 
 // Linkify file paths (containing "/" + an extension, optional :line) in
 // rendered prose so they jump to the file. Skips code/links.
@@ -294,8 +335,13 @@ function ToolPart(props: { part: Part }) {
     <div class="tool" classList={{ [status()]: true }}>
       <button type="button" class="tool-head" onClick={() => setOpen((v) => !v)}>
         <span class="tool-status" />
-        <span class="tool-name">{props.part.tool}</span>
-        <span class="tool-state">{state().title || status()}</span>
+        <span class="tool-ico"><Icon name={toolIconName(props.part.tool)} size={13} /></span>
+        <span class="tool-name">{toolLabel(props.part.tool)}</span>
+        <span class="tool-subject">{expr() || state().title || status()}</span>
+        <Show when={durationText(props.part)}>
+          <span class="tool-dur">{durationText(props.part)}</span>
+        </Show>
+        <span class="tool-chev" classList={{ rot: open() }}><Icon name="chevronDown" size={12} /></span>
         <Show when={subId()}>
           <span
             role="button"
@@ -353,12 +399,15 @@ function ReasoningPart(props: { part: Part; settled: boolean }) {
     const secs = Math.max(0, Math.round(((end() ?? now()) - s) / 1000));
     return secs < 60 ? `${secs}s` : `${Math.floor(secs / 60)}m ${secs % 60}s`;
   };
+  const snippet = () => (props.part.text || "").replace(/\s+/g, " ").trim().slice(0, 90);
   return (
     <details class="reasoning">
       <summary>
-        <span>thinking</span>
+        <span class="tool-ico"><Icon name="help" size={13} /></span>
+        <span class="tool-name">Thinking</span>
+        <span class="tool-subject">{snippet()}</span>
         <Show when={elapsed()}>
-          <span class="reasoning-time" classList={{ live: live() }}>{elapsed()}</span>
+          <span class="tool-dur reasoning-time" classList={{ live: live() }}>{elapsed()}</span>
         </Show>
       </summary>
       <Markdown text={props.part.text || ""} settled={props.settled} />
@@ -388,5 +437,45 @@ export default function PartView(props: { part: Part; settled?: boolean }) {
       </Match>
       {/* step-start/finish, snapshot, patch, agent, retry, compaction: omitted in v1 */}
     </Switch>
+  );
+}
+
+// ActivityGroup renders a run of consecutive tool/reasoning parts as one compact
+// "Activity" timeline (OpenChamber-style): a header that collapses the list, a
+// "+N more…" affordance, and per-row expand-to-full-detail (every tool, not just
+// some — this is our deliberate divergence from OpenChamber). Collapsed by
+// default, showing the last ACTIVITY_PREVIEW rows.
+const ACTIVITY_PREVIEW = 5;
+export function ActivityGroup(props: { parts: Part[]; settled: boolean }) {
+  const [expanded, setExpanded] = createSignal(false);
+  const total = () => props.parts.length;
+  const hidden = () => (expanded() ? 0 : Math.max(0, total() - ACTIVITY_PREVIEW));
+  const visible = () => (expanded() ? props.parts : props.parts.slice(-ACTIVITY_PREVIEW));
+  return (
+    <div class="activity">
+      <button type="button" class="activity-head" onClick={() => setExpanded((v) => !v)}>
+        <Icon name="cpu" size={14} />
+        <span class="activity-title">Activity</span>
+        <span class="activity-count">{total()}</span>
+        <span class="activity-chev" classList={{ rot: expanded() }}><Icon name="chevronDown" size={12} /></span>
+      </button>
+      <div class="activity-rows">
+        <Show when={hidden() > 0}>
+          <button type="button" class="activity-more" onClick={() => setExpanded(true)}>+{hidden()} more…</button>
+        </Show>
+        <For each={visible()}>
+          {(p) => (
+            <Switch>
+              <Match when={p.type === "reasoning"}>
+                <ReasoningPart part={p} settled={props.settled} />
+              </Match>
+              <Match when={p.type === "tool"}>
+                <ToolPart part={p} />
+              </Match>
+            </Switch>
+          )}
+        </For>
+      </div>
+    </div>
   );
 }

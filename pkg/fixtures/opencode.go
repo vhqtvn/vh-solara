@@ -68,6 +68,23 @@ func New() *FakeOpenCode {
 				"model": map[string]any{"providerID": "fake", "modelID": "dummy-think", "variant": "high"}},
 			Parts: []map[string]any{
 				textPart("m2", "demo", "p2", "Here's the plan:\n\n1. Extract the tokenizer\n2. Add tests\n\n```go\nfunc Parse(s string) (*AST, error) {\n\treturn parse(s)\n}\n```\n\nComplexity is $O(n \\log n)$; over the input:\n\n$$\\sum_{i=1}^{n} i = \\frac{n(n+1)}{2}$$\n\nEdited src/parser.go:2 accordingly.", now-4600),
+				// Reasoning + a few tools so the Activity timeline (grouping, the
+				// Thinking row, and the "+N more" collapse) is exercisable.
+				{"id": "p2r", "sessionID": "demo", "messageID": "m2", "type": "reasoning",
+					"text": "Let me read the tokenizer and the parser entrypoint before editing, then run the existing tests.",
+					"time": map[string]any{"start": now - 4580, "end": now - 4560}},
+				{"id": "p2a", "sessionID": "demo", "messageID": "m2", "type": "tool", "callID": "c0a", "tool": "grep",
+					"state": map[string]any{"status": "completed", "title": "search the codebase",
+						"input": map[string]any{"pattern": "func parse"}, "output": "src/parser.go:2\nsrc/tokenizer.go:14",
+						"time": map[string]any{"start": now - 4555, "end": now - 4540}}},
+				{"id": "p2b", "sessionID": "demo", "messageID": "m2", "type": "tool", "callID": "c0b", "tool": "read",
+					"state": map[string]any{"status": "completed", "title": "read parser.go",
+						"input": map[string]any{"filePath": "src/parser.go"}, "output": "package main\n\nfunc parse(s string) {}",
+						"time": map[string]any{"start": now - 4535, "end": now - 4520}}},
+				{"id": "p2c", "sessionID": "demo", "messageID": "m2", "type": "tool", "callID": "c0c", "tool": "read",
+					"state": map[string]any{"status": "completed", "title": "read tokenizer.go",
+						"input": map[string]any{"filePath": "src/tokenizer.go"}, "output": "package main\n// tokenizer",
+						"time": map[string]any{"start": now - 4515, "end": now - 4505}}},
 				{
 					"id": "p3", "sessionID": "demo", "messageID": "m2", "type": "tool", "callID": "c1", "tool": "edit",
 					"state": map[string]any{"status": "completed", "title": "edit parser.go",

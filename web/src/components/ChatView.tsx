@@ -9,7 +9,7 @@ import { dequeue, enqueue, queueFor, queueMode, removeQueued } from "../queue";
 import { historyAt, historyLen, pushHistory } from "../history";
 import { type AcItem, commandSuggestions, fileSuggestions } from "../lib/complete";
 import ModelDialog from "./ModelDialog";
-import PartView from "./Part";
+import PartView, { ActivityGroup } from "./Part";
 import { Deferred } from "./Deferred";
 
 // Eager-mount the last N message rows (the tail you see on open + where new
@@ -154,6 +154,33 @@ function permDetail(p: any): string {
     if (ps.length) return ps.join("\n");
   }
   return "";
+}
+
+// Group a message's parts for rendering: consecutive tool/reasoning parts fold
+// into one compact "Activity" timeline; text/file parts (and a lone reasoning
+// with no tools) render inline as before. Preserves part order.
+type RenderItem = { kind: "part"; part: any } | { kind: "activity"; parts: any[] };
+function groupParts(m: any): RenderItem[] {
+  const items: RenderItem[] = [];
+  let run: any[] = [];
+  const flush = () => {
+    if (!run.length) return;
+    const hasTool = run.some((p) => p?.type === "tool");
+    if (run.length === 1 && !hasTool) items.push({ kind: "part", part: run[0] });
+    else items.push({ kind: "activity", parts: run });
+    run = [];
+  };
+  for (const pid of m.partOrder || []) {
+    const p = m.parts[pid];
+    if (!p) continue;
+    if (p.type === "tool" || p.type === "reasoning") run.push(p);
+    else {
+      flush();
+      items.push({ kind: "part", part: p });
+    }
+  }
+  flush();
+  return items;
 }
 
 export default function ChatView(props: { sessionId: string; draft?: boolean }) {
@@ -892,13 +919,15 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
                   root={() => scrollEl}
                   minHeight={48}
                 >
-                  <For each={m.partOrder}>
-                    {(pid) => (
-                      <PartView
-                        part={m.parts[pid]}
-                        settled={m.info.role === "user" || !!m.info.time?.completed}
-                      />
-                    )}
+                  <For each={groupParts(m)}>
+                    {(it) => {
+                      const settled = m.info.role === "user" || !!m.info.time?.completed;
+                      return it.kind === "activity" ? (
+                        <ActivityGroup parts={it.parts} settled={settled} />
+                      ) : (
+                        <PartView part={it.part} settled={settled} />
+                      );
+                    }}
                   </For>
                 </Deferred>
                 <Show when={messageError(m.info)}>
