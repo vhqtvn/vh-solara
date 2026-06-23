@@ -15,6 +15,7 @@ import Select from "./Select";
 // "App" (install + orientation) only shows in a plain browser tab — once
 // installed, the standalone window doesn't need it.
 const sections = () => [
+  { id: "theme", name: "Theme" },
   { id: "appearance", name: "Appearance" },
   { id: "general", name: "General" },
   ...(installed() ? [] : [{ id: "app", name: "App" }]),
@@ -31,7 +32,7 @@ function shortDir(d: string): string {
 // Sectioned settings (sidebar nav + content), modeled on opencode's
 // dialog-settings and openchamber's SettingsView.
 export default function SettingsDialog(props: { onClose: () => void }) {
-  const [sec, setSec] = createSignal("appearance");
+  const [sec, setSec] = createSignal("theme");
   // UI-zoom slider: only APPLY the zoom on release (change), not on every input
   // — applying live rescales the whole UI (slider included) mid-drag, so the
   // thumb slips out from under the pointer. zoomDraft tracks the in-drag value
@@ -92,11 +93,8 @@ export default function SettingsDialog(props: { onClose: () => void }) {
             </For>
           </nav>
           <div class="settings-content">
-            <Show when={sec() === "appearance"}>
-              <div class="setting-row setting-row-stack">
-                <label>Theme</label>
-                <ThemePicker />
-              </div>
+            <Show when={sec() === "theme"}>
+              <ThemePicker />
               <p class="setting-hint">Light themes also switch code syntax highlighting.</p>
               <Show when={theme() === "custom"}>
                 <div class="custom-theme">
@@ -155,6 +153,9 @@ export default function SettingsDialog(props: { onClose: () => void }) {
                   <p class="setting-hint" classList={{ "setting-err": !themeNote()!.ok }}>{themeNote()!.msg}</p>
                 </Show>
               </Show>
+            </Show>
+
+            <Show when={sec() === "appearance"}>
               <div class="setting-row">
                 <label>Session list</label>
                 <Select
