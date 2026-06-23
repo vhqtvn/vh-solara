@@ -1,6 +1,7 @@
 import { createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { selectedId, setSelectedId, state } from "../sync";
 import { clearNotifications, dismissNotification, markAllRead, notifications } from "../notify";
+import { setView } from "../ui";
 import Icon from "./Icon";
 
 // Header bell + Facebook-style dropdown. Two kinds of entries:
@@ -37,6 +38,9 @@ export default function NotificationCenter() {
   }
   function goto(sid?: string) {
     if (sid && sid !== selectedId()) setSelectedId(sid);
+    // Switch to the Chat tab — the notification points at a session message, so
+    // Changes/Notes/an embedded view would show nothing relevant.
+    setView("chat");
     setOpen(false);
   }
 
