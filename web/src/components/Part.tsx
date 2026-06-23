@@ -448,14 +448,19 @@ export default function PartView(props: { part: Part; settled?: boolean; tail?: 
 // some — this is our deliberate divergence from OpenChamber). Collapsed by
 // default, showing the last ACTIVITY_PREVIEW rows.
 const ACTIVITY_PREVIEW = 5;
-export function ActivityGroup(props: { parts: Part[]; settled: boolean; tailId?: string | null }) {
-  const [expanded, setExpanded] = createSignal(false);
+export function ActivityGroup(props: { parts: Part[]; settled: boolean; tailId?: string | null; isLast?: boolean }) {
+  // Collapsed by default; the LAST activity group in the conversation starts
+  // expanded. `override` records a manual toggle and then wins, so reading older
+  // history doesn't re-collapse what you opened, and the newest group auto-opens
+  // (while the previous newest auto-collapses) as fresh activity streams in.
+  const [override, setOverride] = createSignal<boolean | null>(null);
+  const expanded = () => override() ?? !!props.isLast;
   const total = () => props.parts.length;
   const hidden = () => (expanded() ? 0 : Math.max(0, total() - ACTIVITY_PREVIEW));
   const visible = () => (expanded() ? props.parts : props.parts.slice(-ACTIVITY_PREVIEW));
   return (
     <div class="activity">
-      <button type="button" class="activity-head" onClick={() => setExpanded((v) => !v)}>
+      <button type="button" class="activity-head" onClick={() => setOverride(!expanded())}>
         <Icon name="cpu" size={14} />
         <span class="activity-title">Activity</span>
         <span class="activity-count">{total()}</span>
@@ -463,7 +468,7 @@ export function ActivityGroup(props: { parts: Part[]; settled: boolean; tailId?:
       </button>
       <div class="activity-rows">
         <Show when={hidden() > 0}>
-          <button type="button" class="activity-more" onClick={() => setExpanded(true)}>+{hidden()} more…</button>
+          <button type="button" class="activity-more" onClick={() => setOverride(true)}>+{hidden()} more…</button>
         </Show>
         <For each={visible()}>
           {(p) => (

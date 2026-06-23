@@ -267,6 +267,18 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // "Working" = the session is busy (shared with the sidebar spinner so they
   // always agree). See sessionWorking() for the activity + last-message logic.
   const working = createMemo(() => sessionWorking(props.sessionId));
+  // Key (first part id) of the LAST activity group in the whole conversation —
+  // that one renders expanded by default, all earlier ones collapsed.
+  const lastActivityKey = createMemo(() => {
+    const msgs = messages();
+    for (let mi = msgs.length - 1; mi >= 0; mi--) {
+      const items = groupParts(msgs[mi]);
+      for (let k = items.length - 1; k >= 0; k--) {
+        if (items[k].kind === "activity") return (items[k] as any).parts[0]?.id ?? null;
+      }
+    }
+    return null;
+  });
   // Agent todo list (OpenCode TodoWrite) → "Tasks N active · M left" pill.
   const todoCounts = createMemo(() => sessionTodoCounts(props.sessionId));
   const todoItems = createMemo(() => (props.sessionId ? state.todos[props.sessionId] || [] : []));
@@ -930,7 +942,12 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
                           ? m.partOrder[m.partOrder.length - 1]
                           : null;
                       return it.kind === "activity" ? (
-                        <ActivityGroup parts={it.parts} settled={settled} tailId={tailId} />
+                        <ActivityGroup
+                          parts={it.parts}
+                          settled={settled}
+                          tailId={tailId}
+                          isLast={it.parts[0]?.id === lastActivityKey()}
+                        />
                       ) : (
                         <PartView part={it.part} settled={settled} tail={it.part.id === tailId} />
                       );

@@ -18,17 +18,17 @@ import (
 
 // FakeOpenCode implements the subset of OpenCode's HTTP API the daemon uses.
 type FakeOpenCode struct {
-	mu       sync.Mutex
-	sessions []map[string]any
-	messages map[string][]messageWithParts // sessionID -> ordered messages
-	subs     map[int]chan string
-	nextSub  int
-	counter  int
-	pendingQ map[string]string         // questionID -> sessionID
+	mu          sync.Mutex
+	sessions    []map[string]any
+	messages    map[string][]messageWithParts // sessionID -> ordered messages
+	subs        map[int]chan string
+	nextSub     int
+	counter     int
+	pendingQ    map[string]string         // questionID -> sessionID
 	pendingQReq map[string]map[string]any // questionID -> full question request
-	pendingP map[string]map[string]any  // permissionID -> full permission request
-	archived map[string]bool           // sessionID -> archived (native time.archived)
-	busy     map[string]string         // sessionID -> status type (busy/retry); mirrors /session/status
+	pendingP    map[string]map[string]any // permissionID -> full permission request
+	archived    map[string]bool           // sessionID -> archived (native time.archived)
+	busy        map[string]string         // sessionID -> status type (busy/retry); mirrors /session/status
 }
 
 type messageWithParts struct {
@@ -41,8 +41,8 @@ type messageWithParts struct {
 // part plus a completed tool part.
 func New() *FakeOpenCode {
 	f := &FakeOpenCode{
-		messages: map[string][]messageWithParts{},
-		subs:     map[int]chan string{},
+		messages:    map[string][]messageWithParts{},
+		subs:        map[int]chan string{},
 		pendingQ:    map[string]string{},
 		pendingQReq: map[string]map[string]any{},
 		pendingP:    map[string]map[string]any{},
@@ -105,6 +105,27 @@ func New() *FakeOpenCode {
 						"input":    map[string]any{"description": "search the codebase", "subagent_type": "general"},
 						"output":   "found 3 matches", "time": map[string]any{"start": now - 4300, "end": now - 2100}},
 				},
+			},
+		},
+		// A second turn so there are TWO activity groups — the earlier one renders
+		// collapsed, only this (last) one expanded by default.
+		{
+			Info:  map[string]any{"id": "m3", "sessionID": "demo", "role": "user", "time": map[string]any{"created": now - 1800, "completed": now - 1800}},
+			Parts: []map[string]any{textPart("m3", "demo", "p5", "Now run the tests.", now-1800)},
+		},
+		{
+			Info: map[string]any{"id": "m4", "sessionID": "demo", "role": "assistant", "time": map[string]any{"created": now - 1700, "completed": now - 1200},
+				"model": map[string]any{"providerID": "fake", "modelID": "dummy-think", "variant": "high"}},
+			Parts: []map[string]any{
+				{"id": "p6", "sessionID": "demo", "messageID": "m4", "type": "tool", "callID": "c3", "tool": "bash",
+					"state": map[string]any{"status": "completed", "title": "go test ./...",
+						"input": map[string]any{"command": "go test ./..."}, "output": "ok parser 0.2s; ok tokenizer 0.1s",
+						"time": map[string]any{"start": now - 1690, "end": now - 1250}}},
+				{"id": "p7", "sessionID": "demo", "messageID": "m4", "type": "tool", "callID": "c4", "tool": "read",
+					"state": map[string]any{"status": "completed", "title": "read go.mod",
+						"input": map[string]any{"filePath": "go.mod"}, "output": "module demo",
+						"time": map[string]any{"start": now - 1245, "end": now - 1240}}},
+				textPart("m4", "demo", "p8", "Tests pass.", now-1230),
 			},
 		},
 	}
