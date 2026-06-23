@@ -133,18 +133,22 @@ func (o *Orchestrator) startLocked(root string, lr *projectcfg.LoadResult) {
 			vhlog.Error("managed-project process start failed", "dir", root, "id", p.ID, "err", err)
 		}
 	}
-	// Views.
+	// Views. Evict any managed view this project registered under a previous
+	// (now re-approved) config but no longer declares — BEFORE re-registering, so
+	// a view renamed while keeping its path_prefix doesn't self-conflict against
+	// the stale registration (and a removed view stops serving its old prefix).
+	newIDs := make(map[string]bool, len(lr.Config.Views))
+	for _, v := range lr.Config.Views {
+		newIDs[v.ID] = true
+	}
+	for oldID := range o.viewReg[root] {
+		if !newIDs[oldID] {
+			o.views.delManaged(root, oldID)
+		}
+	}
 	reg := map[string]string{}
 	for _, v := range lr.Config.Views {
 		reg[v.ID] = o.registerView(root, v)
-	}
-	// Evict managed views this project registered under a previous (now re-approved)
-	// config but no longer declares — otherwise a renamed/removed view's proxy
-	// would keep serving its old prefix.
-	for oldID := range o.viewReg[root] {
-		if _, ok := reg[oldID]; !ok {
-			o.views.delManaged(root, oldID)
-		}
 	}
 	o.viewReg[root] = reg
 }

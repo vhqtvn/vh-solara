@@ -119,6 +119,25 @@ func TestOrchestrator_ReapprovalEvictsRemovedView(t *testing.T) {
 	if v := o.views.match("/b"); v != nil {
 		t.Fatalf("view b should be evicted after re-approval, got %+v", v)
 	}
+
+	// Rename "a" → "renamed" while keeping prefix /a: the old id must be evicted
+	// BEFORE the new one registers, else /a self-conflicts and serves nothing.
+	renamed := `{
+  "processes": [{ "id": "svc", "command": "/bin/sh -c \"sleep 60\"", "cwd": ".", "restart": "no" }],
+  "views": [
+    { "id": "renamed", "path_prefix": "/a", "upstream": "tcp:127.0.0.1:9" }
+  ]
+}`
+	if err := os.WriteFile(cfgPath, []byte(renamed), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Grant(root); err != nil {
+		t.Fatal(err)
+	}
+	v := o.views.match("/a")
+	if v == nil || v.ID != "renamed" {
+		t.Fatalf("/a should be served by the renamed view, got %+v", v)
+	}
 }
 
 func TestOrchestrator_UntrustedThenGrant(t *testing.T) {

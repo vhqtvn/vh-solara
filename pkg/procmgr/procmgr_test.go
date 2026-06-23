@@ -240,6 +240,49 @@ func TestManager_ConcurrentArmNoDeadlock(t *testing.T) {
 	}
 }
 
+// TestManager_ConcurrentStartSpawnFailNoRace hammers Start (which refreshes
+// p.spec) on a proc whose supervisor loop is repeatedly hitting the spawn-fail
+// path (which logs the id). It catches any unsynchronized p.spec read in run().
+func TestManager_ConcurrentStartSpawnFailNoRace(t *testing.T) {
+	prevB, prevMax := backoffBase, maxBackoff
+	backoffBase, maxBackoff = 2*time.Millisecond, 2*time.Millisecond
+	t.Cleanup(func() { backoffBase, maxBackoff = prevB, prevMax })
+
+	mgr := NewManager(mgrCtx())
+	defer mgr.StopAll()
+	spec := ProcSpec{
+		Dir: "/proj", ID: "nope", Cwd: t.TempDir(),
+		Argv:    []string{"/nonexistent/definitely-not-here"},
+		Restart: projectcfg.RestartAlways, // never gives up → keeps looping the spawn-fail log
+	}
+	if err := mgr.Start(spec); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		var wg sync.WaitGroup
+		for i := 0; i < 4; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for j := 0; j < 50; j++ {
+					_ = mgr.Start(spec)
+					_, _ = mgr.Status("/proj", "nope")
+					time.Sleep(time.Millisecond)
+				}
+			}()
+		}
+		wg.Wait()
+	}()
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("Start wedged")
+	}
+}
+
 func TestManager_NoRestartCleanExit(t *testing.T) {
 	mgr := NewManager(mgrCtx())
 	if err := mgr.Start(ProcSpec{

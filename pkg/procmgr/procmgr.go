@@ -283,6 +283,11 @@ func (p *Proc) arm() error {
 }
 
 func (p *Proc) stop() {
+	// Hold armMu so stop can't interleave a concurrent arm() — otherwise stop
+	// could cancel/drain the OLD generation while arm installs a NEW (uncancelled)
+	// ctx, leaving a child running after the user asked to stop it.
+	p.armMu.Lock()
+	defer p.armMu.Unlock()
 	p.mu.Lock()
 	p.stopF = true
 	cancel := p.cancel
@@ -311,10 +316,11 @@ func (p *Proc) run(ctx context.Context) {
 		// readyAt and wrongly reset the failure streak.
 		p.mu.Lock()
 		p.readyAt = time.Time{}
+		id := p.spec.ID // captured under lock; Start may refresh p.spec concurrently
 		p.mu.Unlock()
 		cmd, waitCh, err := p.launch(ctx)
 		if err != nil {
-			vhlog.Error("procmgr spawn failed", "id", p.spec.ID, "err", err)
+			vhlog.Error("procmgr spawn failed", "id", id, "err", err)
 			p.set(StatusFailed)
 			if !p.shouldRestartExec() {
 				return
@@ -350,7 +356,7 @@ func (p *Proc) run(ctx context.Context) {
 					p.set(StatusStopped)
 				} else {
 					p.set(StatusFailed)
-					vhlog.Warn("procmgr process exited during startup", "id", p.spec.ID, "exit", code)
+					vhlog.Warn("procmgr process exited during startup", "id", id, "exit", code)
 				}
 				return
 			}
@@ -363,7 +369,7 @@ func (p *Proc) run(ctx context.Context) {
 			<-waitCh
 			code := p.cmdExitCode()
 			p.set(StatusFailed)
-			vhlog.Warn("procmgr process not ready in time", "id", p.spec.ID, "exit", code)
+			vhlog.Warn("procmgr process not ready in time", "id", id, "exit", code)
 			if !p.shouldRestartExit(code) && !p.shouldRestartExec() {
 				return
 			}
@@ -602,11 +608,12 @@ func (p *Proc) scheduleRestart(ctx context.Context) bool {
 	p.restartCount++
 	n := p.failCount
 	always := p.spec.Restart == projectcfg.RestartAlways
+	id := p.spec.ID
 	p.mu.Unlock()
 
 	if !always && n > maxConsecutiveFailures {
 		p.set(StatusFailed)
-		vhlog.Warn("procmgr giving up after repeated failures", "id", p.spec.ID, "failures", n-1)
+		vhlog.Warn("procmgr giving up after repeated failures", "id", id, "failures", n-1)
 		return false
 	}
 	return p.sleep(ctx, backoffFor(n-1))
