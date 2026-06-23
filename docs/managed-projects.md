@@ -37,7 +37,7 @@ Commit `.vh-solara/project.jsonc` (JSON with comments) at the project root:
     {
       "id": "board",
       "title": "Board",                    // optional, default = id
-      "path_prefix": "/board",             // verbatim; no trailing slash
+      "path_prefix": "/board",             // mounted per-project at /_p/<hash>/board
       "upstream": "unix:.vh-solara/run/board.sock",
       "depends_on": "board"                // process id backing the socket
     }
@@ -91,11 +91,15 @@ For single-operator / headless setups, pass `--trust-on-open` (or set
   no auto-teardown on project close — closing a tab does not kill your board.
   On daemon exit all managed processes are gracefully stopped (SIGTERM → SIGKILL)
   in defined order.
-- **Prefix isolation.** View prefixes are **verbatim** (the path you declare is
-  the path served), shared in one registry with manually-registered views. On a
-  single worker hosting several projects, a prefix collision is **non-fatal**:
-  the process still runs, the conflicting view is marked `prefix-conflict`, and
-  the first-registered view keeps the prefix.
+- **Per-project isolation.** Managed views are mounted under a **per-project
+  namespace** — the path you declare (`/board`) is served at
+  `/_p/<project-hash>/board`, and the iframe loads that path. This makes every
+  project's views fully independent: two projects on one worker can each declare
+  `/board` (and the same view `id`) without colliding, and a project's switcher
+  shows only its own views (plus any global manual `POST /vh/views` ones). The
+  only collision left is **intra-project** — two views in one config declaring
+  the same prefix — and it is **non-fatal**: the process still runs, the losing
+  view is marked `prefix-conflict`, and the first-registered one keeps the path.
 
 ## Readiness / health
 

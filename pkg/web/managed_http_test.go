@@ -148,26 +148,41 @@ func TestManagedHTTP_TrustGateThenProxy(t *testing.T) {
 		return ok && st.Status == procmgr.StatusReady
 	}, "managed process ready after grant")
 
-	// 4. The declared view is registered (origin=managed) and listed.
-	vresp, err := http.Get(web.URL + "/vh/views")
+	// 4. The declared view is registered (origin=managed) at its per-project
+	// namespaced path, and listed when the list is scoped to this project.
+	vresp, err := http.Get(web.URL + "/vh/views?dir=" + root)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var views []viewReg
 	json.NewDecoder(vresp.Body).Decode(&views)
 	vresp.Body.Close()
+	wantPrefix := managedViewPrefix(root, "/demo")
 	found := false
 	for _, v := range views {
-		if v.ID == "demo" && v.Origin == OriginManaged && v.Dir == root {
+		if v.ID == managedViewKey(root, "demo") && v.Origin == OriginManaged && v.Dir == root && v.PathPrefix == wantPrefix {
 			found = true
 		}
 	}
 	if !found {
-		t.Fatalf("managed view not registered: %+v", views)
+		t.Fatalf("managed view not registered at %s: %+v", wantPrefix, views)
+	}
+	// Scoping: a different project's list must NOT include this managed view.
+	oresp, err := http.Get(web.URL + "/vh/views?dir=" + filepath.Join(root, "other"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var otherViews []viewReg
+	json.NewDecoder(oresp.Body).Decode(&otherViews)
+	oresp.Body.Close()
+	for _, v := range otherViews {
+		if v.Origin == OriginManaged && v.Dir == root {
+			t.Fatalf("managed view leaked into another project's list: %+v", v)
+		}
 	}
 
 	// 5. The view is proxyable through dispatchView (prefix stripped, upstream hit).
-	presp, err := http.Get(web.URL + "/demo/")
+	presp, err := http.Get(web.URL + wantPrefix + "/")
 	if err != nil {
 		t.Fatal(err)
 	}

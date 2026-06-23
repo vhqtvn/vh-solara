@@ -101,7 +101,7 @@ func TestOrchestrator_ReapprovalEvictsRemovedView(t *testing.T) {
 	if err := o.Grant(root); err != nil {
 		t.Fatal(err)
 	}
-	if o.views.match("/a") == nil || o.views.match("/b") == nil {
+	if o.views.match(managedViewPrefix(root, "/a")) == nil || o.views.match(managedViewPrefix(root, "/b")) == nil {
 		t.Fatal("both views should be registered after grant")
 	}
 
@@ -113,10 +113,10 @@ func TestOrchestrator_ReapprovalEvictsRemovedView(t *testing.T) {
 	if err := o.Grant(root); err != nil {
 		t.Fatal(err)
 	}
-	if o.views.match("/a") == nil {
+	if o.views.match(managedViewPrefix(root, "/a")) == nil {
 		t.Fatal("view a should still be registered after re-approval")
 	}
-	if v := o.views.match("/b"); v != nil {
+	if v := o.views.match(managedViewPrefix(root, "/b")); v != nil {
 		t.Fatalf("view b should be evicted after re-approval, got %+v", v)
 	}
 
@@ -134,8 +134,8 @@ func TestOrchestrator_ReapprovalEvictsRemovedView(t *testing.T) {
 	if err := o.Grant(root); err != nil {
 		t.Fatal(err)
 	}
-	v := o.views.match("/a")
-	if v == nil || v.ID != "renamed" {
+	v := o.views.match(managedViewPrefix(root, "/a"))
+	if v == nil || v.ID != managedViewKey(root, "renamed") {
 		t.Fatalf("/a should be served by the renamed view, got %+v", v)
 	}
 }
@@ -171,8 +171,8 @@ func TestOrchestrator_UntrustedThenGrant(t *testing.T) {
 		return st.Status.IsRunning()
 	}, "process running after grant");
 
-	// View should be registered (origin=managed).
-	v := o.views.match("/svc")
+	// View should be registered (origin=managed) at its per-project namespaced path.
+	v := o.views.match(managedViewPrefix(root, "/svc"))
 	if v == nil || v.Origin != OriginManaged || v.Dir != root {
 		t.Fatalf("managed view not registered: %+v", v)
 	}
@@ -181,34 +181,108 @@ func TestOrchestrator_UntrustedThenGrant(t *testing.T) {
 	}
 }
 
+// dupPrefixConfig declares two views with the SAME prefix in one project.
+const dupPrefixConfig = `{
+  "processes": [{ "id": "svc", "command": "/bin/sh -c \"sleep 60\"", "cwd": ".", "restart": "no" }],
+  "views": [
+    { "id": "v1", "path_prefix": "/dash", "upstream": "tcp:127.0.0.1:9" },
+    { "id": "v2", "path_prefix": "/dash", "upstream": "tcp:127.0.0.1:9" }
+  ]
+}`
+
+// With namespacing, the only way to get a prefix conflict is INTRA-project: two
+// views in one config declaring the same prefix. It must be non-fatal (process
+// still runs; one view wins, the other is prefix-conflict).
 func TestOrchestrator_PrefixConflictNonFatal(t *testing.T) {
-	root := writeManagedConfig(t, sleepConfig)
+	root := writeManagedConfig(t, dupPrefixConfig)
 	o, mgr := newTestOrchestrator(t)
 	defer mgr.StopAll()
-
-	// Pre-register a MANUAL view on the same prefix.
-	manual := &viewReg{ID: "manual-svc", Title: "manual", PathPrefix: "/svc", Upstream: "tcp:127.0.0.1:9", Origin: OriginManual}
-	if err := o.views.put(manual); err != nil {
-		t.Fatal(err)
-	}
 
 	if err := o.Grant(root); err != nil {
 		t.Fatal(err)
 	}
-	// Process still runs (non-fatal).
 	waitFor(t, func() bool {
 		st, _ := mgr.Status(root, "svc")
 		return st.Status.IsRunning()
-	}, "process should still run despite view conflict");
+	}, "process should still run despite view conflict")
 
-	// View marked prefix-conflict; manual view untouched.
 	snap := o.Snapshot(root)
-	if got := snap.Views[0].Status; got != ViewPrefixConflict {
-		t.Fatalf("view status=%s want prefix-conflict", got)
+	var reg, conflict int
+	for _, vw := range snap.Views {
+		switch vw.Status {
+		case ViewRegistered:
+			reg++
+		case ViewPrefixConflict:
+			conflict++
+		}
 	}
-	v := o.views.match("/svc")
-	if v == nil || v.Origin != OriginManual {
-		t.Fatalf("manual view should remain registered, got %+v", v)
+	if reg != 1 || conflict != 1 {
+		t.Fatalf("want 1 registered + 1 conflict, got %+v", snap.Views)
+	}
+	if o.views.match(managedViewPrefix(root, "/dash")) == nil {
+		t.Fatal("the winning view should serve the namespaced /dash")
+	}
+}
+
+// A managed view and a manual view that declare the SAME prefix do NOT collide:
+// managed views live under a per-project namespace, manual views are global.
+func TestOrchestrator_ManagedIndependentOfManualSamePrefix(t *testing.T) {
+	root := writeManagedConfig(t, sleepConfig) // declares view "svc" at /svc
+	o, mgr := newTestOrchestrator(t)
+	defer mgr.StopAll()
+
+	manual := &viewReg{ID: "manual-svc", Title: "manual", PathPrefix: "/svc", Upstream: "tcp:127.0.0.1:9", Origin: OriginManual}
+	if err := o.views.put(manual); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Grant(root); err != nil {
+		t.Fatal(err)
+	}
+	if got := o.Snapshot(root).Views[0].Status; got != ViewRegistered {
+		t.Fatalf("managed view should register independently of the manual /svc, got %s", got)
+	}
+	if v := o.views.match("/svc"); v == nil || v.Origin != OriginManual {
+		t.Fatalf("manual /svc should be intact, got %+v", v)
+	}
+	if v := o.views.match(managedViewPrefix(root, "/svc")); v == nil || v.Origin != OriginManaged {
+		t.Fatalf("managed view should serve its namespaced prefix, got %+v", v)
+	}
+}
+
+// Two different projects declaring the SAME view id and prefix both register,
+// independently, at distinct namespaced paths; and each project's view list is
+// scoped to itself.
+func TestOrchestrator_CrossProjectViewsIndependent(t *testing.T) {
+	rootA := writeManagedConfig(t, sleepConfig)
+	rootB := writeManagedConfig(t, sleepConfig)
+	o, mgr := newTestOrchestrator(t)
+	defer mgr.StopAll()
+
+	if err := o.Grant(rootA); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Grant(rootB); err != nil {
+		t.Fatal(err)
+	}
+	va := o.views.match(managedViewPrefix(rootA, "/svc"))
+	vb := o.views.match(managedViewPrefix(rootB, "/svc"))
+	if va == nil || vb == nil {
+		t.Fatalf("both projects' views should register; a=%v b=%v", va, vb)
+	}
+	if va.PathPrefix == vb.PathPrefix || va.ID == vb.ID {
+		t.Fatalf("cross-project views must be namespaced apart: a=%s/%s b=%s/%s", va.ID, va.PathPrefix, vb.ID, vb.PathPrefix)
+	}
+	if got := o.Snapshot(rootA).Views[0].Status; got != ViewRegistered {
+		t.Fatalf("project A view should be registered, got %s", got)
+	}
+	if got := o.Snapshot(rootB).Views[0].Status; got != ViewRegistered {
+		t.Fatalf("project B view should be registered, got %s", got)
+	}
+	// listFor(A) must not leak B's managed view.
+	for _, vw := range o.views.listFor(rootA) {
+		if vw.Origin == OriginManaged && vw.Dir == rootB {
+			t.Fatalf("project A's view list leaked project B's managed view: %+v", vw)
+		}
 	}
 }
 

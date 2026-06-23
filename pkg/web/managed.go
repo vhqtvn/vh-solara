@@ -156,11 +156,14 @@ func (o *Orchestrator) startLocked(root string, lr *projectcfg.LoadResult) {
 // registerView builds the proxy for a declared view and registers it; returns the
 // view status (registered or prefix-conflict).
 func (o *Orchestrator) registerView(root string, v projectcfg.View) string {
-	prefix, err := normalizeViewPrefix(v.PathPrefix)
+	declared, err := normalizeViewPrefix(v.PathPrefix)
 	if err != nil {
 		vhlog.Warn("managed-project view bad prefix", "id", v.ID, "prefix", v.PathPrefix, "err", err)
 		return ViewPrefixConflict
 	}
+	// Mount under a per-project namespace so this project's views are independent
+	// of every other project's (a second project may declare the same prefix/id).
+	prefix := managedViewPrefix(root, declared)
 	proxy, err := buildViewProxy(prefix, v.Upstream)
 	if err != nil {
 		vhlog.Warn("managed-project view bad upstream", "id", v.ID, "upstream", v.Upstream, "err", err)
@@ -171,7 +174,7 @@ func (o *Orchestrator) registerView(root string, v projectcfg.View) string {
 		title = v.ID
 	}
 	reg := &viewReg{
-		ID:         v.ID,
+		ID:         managedViewKey(root, v.ID),
 		Title:      title,
 		PathPrefix: prefix,
 		Upstream:   v.Upstream,

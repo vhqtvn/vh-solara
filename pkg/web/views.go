@@ -141,6 +141,23 @@ func (vr *viewRegistry) list() []viewReg {
 	return out
 }
 
+// listFor returns the views a given project should see: every manual (global)
+// view plus only the managed views owned by dir. This keeps one project's
+// repo-declared views from showing up while another project is active.
+func (vr *viewRegistry) listFor(dir string) []viewReg {
+	vr.mu.RLock()
+	defer vr.mu.RUnlock()
+	out := make([]viewReg, 0, len(vr.byID))
+	for _, v := range vr.byID {
+		if v.Origin == OriginManaged && v.Dir != dir {
+			continue
+		}
+		out = append(out, *v)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Title < out[j].Title })
+	return out
+}
+
 func (vr *viewRegistry) put(v *viewReg) error {
 	vr.mu.Lock()
 	defer vr.mu.Unlock()
@@ -154,12 +171,26 @@ func (vr *viewRegistry) put(v *viewReg) error {
 	return nil
 }
 
+// managedViewKey is the registry id of a project's view: a short per-project
+// hash + the declared id. Two projects can declare the same view id without
+// colliding in the (global) registry.
+func managedViewKey(dir, id string) string { return "m_" + projectKey(dir)[:12] + "_" + id }
+
+// managedViewPrefix is the ROUTING path a project's view is mounted at: a short
+// per-project hash namespace + the declared path_prefix. The proxy is a single
+// HTTP origin, so two projects that both declare "/board" must serve at distinct
+// paths — this makes each project's views independent of every other's. The
+// declared prefix is what the author wrote; this is where vh-solara actually
+// mounts it (and what the iframe loads).
+func managedViewPrefix(dir, declared string) string { return "/_p/" + projectKey(dir)[:12] + declared }
+
 // putManaged registers a repo-declared view. It REPLACES only an existing managed
 // view with the SAME (origin,dir,id). Otherwise it inserts if the prefix is free.
 // It returns errPrefixConflict (without registering) if the prefix is held by a
-// manual view or a managed view from a different project — per the managed-process
-// design a collision is NON-FATAL: the process still runs, the view just doesn't
-// mount, surfacing as a "prefix-conflict" status in the UI.
+// manual view or another of THIS project's views — per the managed-process design
+// a collision is NON-FATAL: the process still runs, the view just doesn't mount,
+// surfacing as a "prefix-conflict" status in the UI. (Cross-project collisions
+// can't happen: both the id and the prefix are per-project namespaced.)
 func (vr *viewRegistry) putManaged(v *viewReg) error {
 	vr.mu.Lock()
 	defer vr.mu.Unlock()
@@ -180,16 +211,17 @@ func (vr *viewRegistry) putManaged(v *viewReg) error {
 	return nil
 }
 
-// delManaged removes the managed view for (dir,id); no-op if absent or not owned
-// by that (dir,id). Manual views are never evicted here.
-func (vr *viewRegistry) delManaged(dir, id string) bool {
+// delManaged removes the managed view for (dir, declaredID); no-op if absent or
+// not owned by that project. Manual views are never evicted here.
+func (vr *viewRegistry) delManaged(dir, declaredID string) bool {
+	key := managedViewKey(dir, declaredID)
 	vr.mu.Lock()
 	defer vr.mu.Unlock()
-	ex, ok := vr.byID[id]
+	ex, ok := vr.byID[key]
 	if !ok || ex.Origin != OriginManaged || ex.Dir != dir {
 		return false
 	}
-	delete(vr.byID, id)
+	delete(vr.byID, key)
 	return true
 }
 
@@ -401,7 +433,13 @@ func (s *Server) dispatchView(next http.Handler) http.Handler {
 func (s *Server) handleViews(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		writeJSONResp(w, s.views.list())
+		// With ?dir=, scope managed views to that project (manual views are always
+		// included). Without it (e.g. cross-worker listing), return everything.
+		if r.URL.Query().Has("dir") {
+			writeJSONResp(w, s.views.listFor(absDir(r.URL.Query().Get("dir"))))
+		} else {
+			writeJSONResp(w, s.views.list())
+		}
 	case http.MethodPost:
 		var in viewReg
 		r.Body = http.MaxBytesReader(w, r.Body, 1<<16)

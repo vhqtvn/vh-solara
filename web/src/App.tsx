@@ -84,6 +84,9 @@ export default function App() {
   // trust gate proactively when a project wants to run repo-declared commands.
   createEffect(() => {
     projectDir();
+    // Re-scope both the embedded views and the managed-project panel to the
+    // newly active project.
+    void refreshViews();
     void refreshManaged();
     clearInterval(managedPoll);
     managedPoll = window.setInterval(() => void refreshManaged(), 5000);
