@@ -138,6 +138,14 @@ func (o *Orchestrator) startLocked(root string, lr *projectcfg.LoadResult) {
 	for _, v := range lr.Config.Views {
 		reg[v.ID] = o.registerView(root, v)
 	}
+	// Evict managed views this project registered under a previous (now re-approved)
+	// config but no longer declares — otherwise a renamed/removed view's proxy
+	// would keep serving its old prefix.
+	for oldID := range o.viewReg[root] {
+		if _, ok := reg[oldID]; !ok {
+			o.views.delManaged(root, oldID)
+		}
+	}
 	o.viewReg[root] = reg
 }
 

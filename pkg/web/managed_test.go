@@ -77,6 +77,50 @@ func TestOrchestrator_ConfigEditReGatesAndKeepsTrustedSpec(t *testing.T) {
 	}
 }
 
+// TestOrchestrator_ReapprovalEvictsRemovedView verifies that re-approving a
+// config that dropped a view unregisters the removed view's proxy (no stale
+// prefix left serving).
+func TestOrchestrator_ReapprovalEvictsRemovedView(t *testing.T) {
+	twoViews := `{
+  "processes": [{ "id": "svc", "command": "/bin/sh -c \"sleep 60\"", "cwd": ".", "restart": "no" }],
+  "views": [
+    { "id": "a", "path_prefix": "/a", "upstream": "tcp:127.0.0.1:9" },
+    { "id": "b", "path_prefix": "/b", "upstream": "tcp:127.0.0.1:9" }
+  ]
+}`
+	oneView := `{
+  "processes": [{ "id": "svc", "command": "/bin/sh -c \"sleep 60\"", "cwd": ".", "restart": "no" }],
+  "views": [
+    { "id": "a", "path_prefix": "/a", "upstream": "tcp:127.0.0.1:9" }
+  ]
+}`
+	root := writeManagedConfig(t, twoViews)
+	o, mgr := newTestOrchestrator(t)
+	defer mgr.StopAll()
+
+	if err := o.Grant(root); err != nil {
+		t.Fatal(err)
+	}
+	if o.views.match("/a") == nil || o.views.match("/b") == nil {
+		t.Fatal("both views should be registered after grant")
+	}
+
+	// Drop view "b" on disk, then re-approve.
+	cfgPath := filepath.Join(root, ".vh-solara", "project.jsonc")
+	if err := os.WriteFile(cfgPath, []byte(oneView), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Grant(root); err != nil {
+		t.Fatal(err)
+	}
+	if o.views.match("/a") == nil {
+		t.Fatal("view a should still be registered after re-approval")
+	}
+	if v := o.views.match("/b"); v != nil {
+		t.Fatalf("view b should be evicted after re-approval, got %+v", v)
+	}
+}
+
 func TestOrchestrator_UntrustedThenGrant(t *testing.T) {
 	root := writeManagedConfig(t, sleepConfig)
 	o, mgr := newTestOrchestrator(t)
