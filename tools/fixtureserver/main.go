@@ -14,9 +14,12 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/vhqtvn/vh-solara/pkg/aggregator"
 	"github.com/vhqtvn/vh-solara/pkg/fixtures"
+	"github.com/vhqtvn/vh-solara/pkg/procmgr"
 	"github.com/vhqtvn/vh-solara/pkg/web"
 )
 
@@ -39,11 +42,21 @@ func main() {
 	}
 	// Isolate persisted notes/archive to a throwaway dir so fixture runs never
 	// touch the real user config (and start clean each process).
-	if os.Getenv("VH_STATE_DIR") == "" {
+	stateDir := os.Getenv("VH_STATE_DIR")
+	if stateDir == "" {
 		if d, err := os.MkdirTemp("", "vh-fixture-state-"); err == nil {
-			_ = os.Setenv("VH_STATE_DIR", d)
+			stateDir = d
+			_ = os.Setenv("VH_STATE_DIR", stateDir)
 		}
 	}
+	// Seed a managed-project fixture so the trust gate + processes panel are
+	// reachable from e2e without a real repo: create a project dir under the
+	// throwaway state tree and make it the default project (projectRoot("") =
+	// cwd). The config itself is written once the fake-opencode URL is known,
+	// and the project is opened after managed projects are wired below.
+	managedDir := filepath.Join(stateDir, "managed-project")
+	_ = os.MkdirAll(filepath.Join(managedDir, ".vh-solara"), 0o755)
+	_ = os.Chdir(managedDir)
 
 	// Fake OpenCode on a private loopback port.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -75,8 +88,39 @@ func main() {
 	srv.SetRestartOpenCode(func(context.Context) error { return nil })
 	srv.SetRestartServer(func() { log.Printf("(fixture) restart-server requested — no-op") })
 
+	// Wire managed projects (repo-declared processes + views). The fixture
+	// project dir (our cwd) carries a config pointing one view at the fake
+	// opencode; it starts UNTRUSTED so e2e can exercise the trust-review card,
+	// then grants it.
+	procCtx, procCancel := context.WithCancel(context.Background())
+	defer procCancel()
+	procMgr := procmgr.NewManager(procCtx)
+	if trust, err := web.NewTrustStore(); err != nil {
+		log.Printf("managed projects disabled: %v", err)
+	} else {
+		seedManagedFixture(managedDir, "tcp:"+strings.TrimPrefix(ocURL, "http://"))
+		orch := srv.InitManaged(procMgr, trust, "", false)
+		orch.OpenProject("")
+	}
+
 	log.Printf("vh fixture server: http://%s  (fake opencode at %s)", *addr, ocURL)
 	if err := http.ListenAndServe(*addr, srv.Handler()); err != nil {
 		log.Fatalf("vh web server: %v", err)
 	}
+}
+
+// seedManagedFixture writes a .vh-solara/project.jsonc declaring one long-lived
+// process (ready via the default-settle heuristic) and one view bound to the
+// given upstream, so the trust-review card + processes panel have something to
+// show. cwd "." resolves against the project root (the fixture dir).
+func seedManagedFixture(dir, upstream string) {
+	cfg := `{
+  "processes": [
+    { "id": "demo", "command": ["/bin/sh", "-c", "sleep 999"], "cwd": ".", "restart": "no" }
+  ],
+  "views": [
+    { "id": "demo", "title": "Demo", "path_prefix": "/managed-demo", "upstream": "` + upstream + `", "depends_on": "demo" }
+  ]
+}`
+	_ = os.WriteFile(filepath.Join(dir, ".vh-solara", "project.jsonc"), []byte(cfg), 0o644)
 }

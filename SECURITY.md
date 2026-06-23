@@ -96,6 +96,35 @@ separate app/frontend, pass `--cors-origin https://app.example.com` (repeatable;
 `*` allows any, which relaxes the cross-origin CSRF guard). Allowed origins receive
 full CORS including the `X-VH-CSRF` header.
 
+## Repo-declared managed processes (workspace trust)
+
+A project may declare companion processes in a checked-in
+`.vh-solara/project.jsonc` (a board, a docs server, …) that vh-solara starts and
+reverse-proxies for the lifetime the project is open. Because these are **shell
+commands authored in the repository**, running them is gated by a workspace-trust
+model modelled on editor workspace trust:
+
+- **Default posture: do not execute.** On first open the config is parsed but the
+  declared commands are *not* run. The project enters an `awaiting-trust` state
+  and the UI shows a review card listing the **exact command, working directory,
+  environment keys, restart policy, and socket/prefix** of each process — display
+  happens *before* any execution.
+- **Grant is an explicit, authenticated action.** Only the browser-authenticated
+  user can approve (the grant endpoint is behind the same CSRF guard and user-auth
+  edge as every other mutating `/vh/*`). There is no auto-approval on open.
+- **Per-project, per-config-hash.** The grant is recorded against the project
+  directory (canonicalised through symlinks to block alias bypass) *and* the
+  sha256 of the config's canonical JSON. Editing the config re-gates it; an
+  unchanged config is not re-prompted across daemon restarts.
+- **Runs as the daemon user.** Approved processes inherit the `client-daemon`'s
+  uid, environment, and filesystem/network access — identical to what the
+  existing `/oc` passthrough (and its shell) can already do. The trust gate is
+  the sole new guard; it does not sandbox. Treat a project you grant the same as
+  any other code you run from it.
+- **Headless escape hatch.** `--trust-on-open` (or `VH_TRUST_CONFIG=1`) auto-grants
+  on discovery for single-operator setups, with the same loud startup warning as
+  an insecure bind. Use only on hosts you fully control.
+
 ## Reporting a vulnerability
 
 Please report security issues privately via GitHub's **"Report a vulnerability"**
