@@ -51,6 +51,17 @@ manual view API: `unix:<path>`, `http(s)://host[:port]`, `tcp:host:port`.
 
 A config is optional — no file means nothing is managed for the project.
 
+### UI settings (`notes`)
+
+A top-level `"notes": true | false` enables/disables the **Notes** tab for this
+project, overriding the user's global Notes setting (Settings → General; off by
+default). It is a display flag only — **not** part of the trust hash, so toggling
+it never re-gates the declared processes, and it is read without a trust prompt.
+
+```jsonc
+{ "notes": true, "processes": [ /* … */ ] }
+```
+
 ## Trust
 
 Because the config can declare arbitrary shell commands, **vh-solara will not run

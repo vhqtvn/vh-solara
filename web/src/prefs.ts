@@ -143,3 +143,16 @@ export function setChatBubbles(on: boolean) {
   applyChatBubbles();
 }
 export { chatBubbles };
+
+// Notes feature: global enable for the Notes tab. Default OFF. A project can
+// override per-repo via `.vh-solara/project.jsonc` "notes" (see projectSettings
+// → notesVisible, which layers the per-project value over this global default).
+const NOTES_KEY = "vh.prefs.notesEnabled.v1";
+const [notesEnabled, setNotesEnabledSig] = createSignal<boolean>(
+  loadVersioned<boolean>(NOTES_KEY, 1, false, (old) => old === true || old === 1 || old === "1"),
+);
+export function setNotesEnabled(on: boolean) {
+  setNotesEnabledSig(on);
+  saveVersioned(NOTES_KEY, 1, on);
+}
+export { notesEnabled };

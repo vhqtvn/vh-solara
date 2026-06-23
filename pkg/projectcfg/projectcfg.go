@@ -40,6 +40,11 @@ type Config struct {
 	Path      string    `json:"-"` // absolute source file (for diagnostics)
 	Processes []Process `json:"processes,omitempty"`
 	Views     []View    `json:"views,omitempty"`
+	// Notes is a per-project UI display toggle (the Notes tab). Tri-state: nil =
+	// not declared (client falls back to its global pref). NOT part of the trust
+	// hash (see canonical) — it executes nothing, so toggling it must never
+	// re-gate the project's processes.
+	Notes *bool `json:"notes,omitempty"`
 }
 
 // Process is one declared companion process. Serialized fields mirror the
@@ -80,10 +85,15 @@ type View struct {
 	Sandbox    string `json:"sandbox,omitempty"`
 }
 
-// canonical is the serialization shape used for hashing: it drops the resolved
-// (json:"-") fields by construction (Config re-marshals without them).
+// canonical is the serialization shape used for hashing. It marshals ONLY the
+// executable surface (processes + views) — not display-only settings like
+// `notes` — so a UI toggle never re-gates trust. It also drops the resolved
+// (json:"-") fields by construction.
 func (c *Config) canonical() []byte {
-	b, _ := json.Marshal(c)
+	b, _ := json.Marshal(struct {
+		Processes []Process `json:"processes,omitempty"`
+		Views     []View    `json:"views,omitempty"`
+	}{c.Processes, c.Views})
 	return b
 }
 

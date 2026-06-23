@@ -253,6 +253,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/vh/projects", s.handleProjects)
 	mux.HandleFunc("/vh/views", s.handleViews)
 	mux.HandleFunc("/vh/managed", s.handleManaged)
+	mux.HandleFunc("/vh/project-settings", s.handleProjectSettings)
 	mux.HandleFunc("/vh/trust", s.handleTrust)
 	mux.HandleFunc("/vh/theme.json", s.handleThemeJSON)
 	mux.HandleFunc("/vh/theme.css", s.handleThemeCSS)

@@ -26,6 +26,7 @@ import { isDesktop, sidebarCollapsed, sidebarWidth, toggleSidebar } from "./layo
 import { draft, selectedId, state } from "./sync";
 import { refreshViews, views } from "./views";
 import { managed, refreshManaged } from "./managed";
+import { notesVisible, refreshProjectSettings } from "./projectSettings";
 import { broadcastTheme, postThemeTo } from "./themeTokens";
 import { customTheme, theme } from "./theme";
 import { adminOpen, embeddedViewId, isEmbeddedView, setAdminOpen, setPaletteOpen, setSettingsOpen, setTermOpen, setView, settingsOpen, termOpen, view, VIEW_PREFIX } from "./ui";
@@ -88,8 +89,14 @@ export default function App() {
     // newly active project.
     void refreshViews();
     void refreshManaged();
+    void refreshProjectSettings();
     clearInterval(managedPoll);
     managedPoll = window.setInterval(() => void refreshManaged(), 5000);
+  });
+  // If Notes gets hidden (global pref off + no per-project opt-in) while the
+  // Notes tab is active, fall back to Chat so the user isn't stuck on a blank tab.
+  createEffect(() => {
+    if (view() === "notes" && !notesVisible()) setView("chat");
   });
   createEffect(() => {
     const m = managed();
@@ -168,9 +175,11 @@ export default function App() {
             <button type="button" classList={{ on: view() === "changes" }} onClick={() => setView("changes")}>
               Changes
             </button>
-            <button type="button" classList={{ on: view() === "notes" }} onClick={() => setView("notes")}>
-              Notes
-            </button>
+            <Show when={notesVisible()}>
+              <button type="button" classList={{ on: view() === "notes" }} onClick={() => setView("notes")}>
+                Notes
+              </button>
+            </Show>
             <For each={views()}>
               {(v) => (
                 <button

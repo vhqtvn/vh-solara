@@ -3,7 +3,7 @@ import { CUSTOM_FIELDS, customTheme, exportCustomTheme, importCustomTheme, reset
 import ThemePicker from "./ThemePicker";
 import { customFont, font, FONTS, setCustomFont, setFontId } from "../font";
 import { hideBuiltin, setHideBuiltin } from "../models";
-import { setStreamLive, streamLive, treeDensity, setTreeDensity, uiScale, setUiScale, orientation, setOrientation, MIN_SCALE, MAX_SCALE, chatWidth, setChatWidth, chatBubbles, setChatBubbles, type ChatWidth } from "../prefs";
+import { setStreamLive, streamLive, treeDensity, setTreeDensity, uiScale, setUiScale, orientation, setOrientation, MIN_SCALE, MAX_SCALE, chatWidth, setChatWidth, chatBubbles, setChatBubbles, notesEnabled, setNotesEnabled, type ChatWidth } from "../prefs";
 import { queueMode, setQueueMode } from "../queue";
 import { canInstall, installed, isIosSafari, promptInstall } from "../pwa-install";
 import { killTerm, listTerms } from "../termApi";
@@ -273,6 +273,19 @@ export default function SettingsDialog(props: { onClose: () => void }) {
             </Show>
 
             <Show when={sec() === "general"}>
+              <div class="setting-row">
+                <label>Notes tab</label>
+                <input
+                  type="checkbox"
+                  aria-label="Enable Notes tab"
+                  checked={notesEnabled()}
+                  onChange={(e) => setNotesEnabled(e.currentTarget.checked)}
+                />
+              </div>
+              <p class="setting-hint">
+                Shows the Notes tab globally. Off by default. A repo can override per-project by setting
+                <code>"notes": true</code> in <code>.vh-solara/project.jsonc</code>.
+              </p>
               <div class="setting-row">
                 <label>Default agent</label>
                 <Show when={agents().length > 0} fallback={<span class="setting-hint">No agents loaded.</span>}>

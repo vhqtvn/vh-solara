@@ -515,6 +515,29 @@ func (s *Server) handleManaged(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleProjectSettings returns per-project UI settings read straight from
+// .vh-solara/project.jsonc — display flags, not executable, so this is NOT
+// trust-gated. Currently just `notes` (tri-state; omitted when not declared, so
+// the client falls back to its global pref). Tolerant: any read/parse miss
+// returns an empty object.
+func (s *Server) handleProjectSettings(w http.ResponseWriter, r *http.Request) {
+	out := map[string]any{}
+	root, err := projectRoot(reqDir(r))
+	if err != nil {
+		writeJSONResp(w, out)
+		return
+	}
+	override := ""
+	if s.managed != nil {
+		override = s.managed.cfgOverride
+	}
+	lr, err := projectcfg.Load(root, override)
+	if err == nil && lr.Config != nil && lr.Config.Notes != nil {
+		out["notes"] = *lr.Config.Notes
+	}
+	writeJSONResp(w, out)
+}
+
 // handleTrust: GET ?dir= → {state, config_hash}. POST {dir} → approve current
 // config + start the project.
 func (s *Server) handleTrust(w http.ResponseWriter, r *http.Request) {

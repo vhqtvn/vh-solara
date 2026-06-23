@@ -165,6 +165,31 @@ func TestHashLocationIndependent(t *testing.T) {
 	}
 }
 
+// TestNotesNotInTrustHash verifies the display-only `notes` flag is parsed but
+// excluded from the trust hash — toggling it must not re-gate the project's
+// processes.
+func TestNotesNotInTrustHash(t *testing.T) {
+	base := `{"processes":[{"id":"p","command":"echo hi"}]}`
+	withNotes := `{"notes":true,"processes":[{"id":"p","command":"echo hi"}]}`
+	dir := t.TempDir()
+	writeConfig(t, dir, base)
+	ra, err := Load(dir, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeConfig(t, dir, withNotes)
+	rb, err := Load(dir, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ra.Hash != rb.Hash {
+		t.Fatalf("notes changed the trust hash: %s vs %s", ra.Hash, rb.Hash)
+	}
+	if rb.Config.Notes == nil || !*rb.Config.Notes {
+		t.Fatalf("notes not parsed: %+v", rb.Config.Notes)
+	}
+}
+
 func TestValidationErrors(t *testing.T) {
 	cases := []struct {
 		name string
