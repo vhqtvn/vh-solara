@@ -53,12 +53,13 @@ export default function SessionContextMenu() {
   onMount(() => document.addEventListener("keydown", onKey));
   onCleanup(() => document.removeEventListener("keydown", onKey));
 
-  // Clamp a positioned menu inside the viewport (≈210×260 menu box).
+  // Clamp a positioned menu inside the viewport (≈240×300 menu box). On a short
+  // screen the top pins to 8 and the menu scrolls (max-height in styles.css).
   const pos = createMemo(() => {
     const t = menuTarget();
     if (!t || t.x == null || t.y == null) return null;
-    const x = Math.min(t.x, window.innerWidth - 210);
-    const y = Math.min(t.y, window.innerHeight - 260);
+    const x = Math.min(t.x, window.innerWidth - 240);
+    const y = Math.min(t.y, window.innerHeight - 300);
     return { x: Math.max(8, x), y: Math.max(8, y) };
   });
 
@@ -129,18 +130,23 @@ export default function SessionContextMenu() {
           <Icon name="stop" size={14} /> Stop{sessionWorking(props.id) ? "" : " (force)"}
         </button>
         <div class="ctxm-sep" />
-        <button type="button" class="ctxm-item" onClick={() => (copy(props.title), closeSessionMenu())}>
-          <Icon name="copy" size={14} /> Copy title
-        </button>
-        <button type="button" class="ctxm-item" onClick={() => (copy(props.id), closeSessionMenu())}>
-          <Icon name="copy" size={14} /> Copy session id
-        </button>
-        <button type="button" class="ctxm-item" onClick={() => (copy(line()), closeSessionMenu())}>
-          <Icon name="copy" size={14} /> Copy “title (id)”
-        </button>
-        <button type="button" class="ctxm-item" onClick={() => (void exportSessionMarkdown(props.id, props.title), closeSessionMenu())}>
-          <Icon name="copy" size={14} /> Export as Markdown
-        </button>
+        {/* Copy/export: a 2-column grid so the menu stays short on small screens
+            (the whole menu also scrolls as a safety net — see styles.css). */}
+        <div class="ctxm-grouplabel">Copy</div>
+        <div class="ctxm-grid">
+          <button type="button" class="ctxm-item" onClick={() => (copy(props.title), closeSessionMenu())}>
+            <Icon name="copy" size={14} /> Title
+          </button>
+          <button type="button" class="ctxm-item" onClick={() => (copy(props.id), closeSessionMenu())}>
+            <Icon name="copy" size={14} /> Session id
+          </button>
+          <button type="button" class="ctxm-item" onClick={() => (copy(line()), closeSessionMenu())}>
+            <Icon name="copy" size={14} /> Title + id
+          </button>
+          <button type="button" class="ctxm-item" onClick={() => (void exportSessionMarkdown(props.id, props.title), closeSessionMenu())}>
+            <Icon name="copy" size={14} /> Export .md
+          </button>
+        </div>
         <div class="ctxm-sep" />
         <button
           type="button"

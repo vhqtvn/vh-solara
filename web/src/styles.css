@@ -1823,7 +1823,13 @@ body {
 .ctxm-scrim { position: fixed; inset: 0; z-index: 70; }
 .ctxm-menu {
   position: fixed;
-  min-width: 200px;
+  min-width: 232px;
+  max-width: calc(100vw - 16px);
+  /* Never overflow the viewport — scroll if taller than the screen (small /
+     short windows). The clamp in SessionContextMenu keeps the top in view. */
+  max-height: calc(100dvh - 16px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
   background: var(--bg-2);
   border: 1px solid var(--border);
   border-radius: 10px;
@@ -1835,12 +1841,23 @@ body {
   width: min(420px, calc(100vw - 24px));
   margin: auto;
   align-self: center;
+  max-height: calc(100dvh - 32px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
   background: var(--bg-2);
   border: 1px solid var(--border);
   border-radius: 14px;
   box-shadow: var(--shadow-lg, 0 12px 32px rgba(0, 0, 0, 0.45));
   padding: 8px;
 }
+/* Compact copy/export group: a 2-up grid + a small section label. */
+.ctxm-grouplabel {
+  font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em;
+  color: var(--fg-dim); padding: 2px 10px 3px;
+}
+.ctxm-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 2px; }
+.ctxm-grid .ctxm-item { gap: 7px; padding: 8px 9px; min-width: 0; }
+.ctxm-grid .ctxm-item :not(svg) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ctxm-sheet-title {
   font-weight: 600;
   padding: 8px 10px 10px;
