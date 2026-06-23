@@ -1,5 +1,6 @@
 import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { controlProc, grantTrust, managed, procLogs, refreshManaged, type ProcStatus } from "../managed";
+import { isDesktop } from "../layout";
 import Icon from "./Icon";
 
 // Trust-review card + processes panel for a repo-declared managed project
@@ -78,8 +79,8 @@ export default function ManagedPanel(props: { onClose: () => void }) {
     setExpanded(s);
   }
 
-  return (
-    <div class="admin-menu managed-panel" role="dialog" aria-label="Project processes" ref={rootEl}>
+  const Body = () => (
+    <>
       <div class="admin-head">
         Project processes
         <Show when={proj()?.dir}>
@@ -128,10 +129,18 @@ export default function ManagedPanel(props: { onClose: () => void }) {
             <summary>Raw config</summary>
             <pre>{proj()!.review!.config_json}</pre>
           </details>
-          <button type="button" class="admin-btn accent" disabled={busy()} onClick={approve}>
-            <Icon name="check" size={14} />
-            {busy() ? "Starting…" : proj()?.state === "changed" ? "Re-approve & run" : "Trust & run"}
-          </button>
+          <div class="managed-trust-actions">
+            <button type="button" class="admin-btn accent" disabled={busy()} onClick={approve}>
+              <Icon name="check" size={14} />
+              {busy() ? "Starting…" : proj()?.state === "changed" ? "Re-approve & run" : "Trust & run"}
+            </button>
+            {/* Deny is just "don't run now" — closes without approving; nothing
+                executes and the project stays gated (the header button keeps its
+                warn highlight to re-open this review later). */}
+            <button type="button" class="admin-btn" disabled={busy()} onClick={props.onClose}>
+              Not now
+            </button>
+          </div>
         </div>
       </Show>
 
@@ -190,6 +199,30 @@ export default function ManagedPanel(props: { onClose: () => void }) {
           </For>
         </Show>
       </Show>
-    </div>
+    </>
+  );
+  // Desktop: a header-anchored dropdown. Mobile/narrow: a centered modal dialog
+  // (like Settings) — the dropdown overflowed the small viewport.
+  return (
+    <Show
+      when={isDesktop()}
+      fallback={
+        <div class="dialog-overlay" onClick={props.onClose}>
+          <div
+            class="managed-panel managed-dialog"
+            role="dialog"
+            aria-label="Project processes"
+            ref={rootEl}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <Body />
+          </div>
+        </div>
+      }
+    >
+      <div class="admin-menu managed-panel" role="dialog" aria-label="Project processes" ref={rootEl}>
+        <Body />
+      </div>
+    </Show>
   );
 }

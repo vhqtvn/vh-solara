@@ -27,6 +27,7 @@ import { draft, selectedId, state } from "./sync";
 import { refreshViews, views } from "./views";
 import { managed, refreshManaged } from "./managed";
 import { notesVisible, refreshProjectSettings } from "./projectSettings";
+import { pushNotification } from "./notify";
 import { broadcastTheme, postThemeTo } from "./themeTokens";
 import { customTheme, theme } from "./theme";
 import { adminOpen, embeddedViewId, isEmbeddedView, setAdminOpen, setPaletteOpen, setSettingsOpen, setTermOpen, setView, settingsOpen, termOpen, view, VIEW_PREFIX } from "./ui";
@@ -98,9 +99,24 @@ export default function App() {
   createEffect(() => {
     if (view() === "notes" && !notesVisible()) setView("chat");
   });
+  // A project awaiting trust must NOT auto-open the panel (that blocked the view,
+  // especially on mobile where it's a modal). Instead fire a red notification
+  // once per (dir, config) — the header Project-processes button keeps its warn
+  // highlight, and tapping it opens the review dialog to Trust or dismiss.
+  const notifiedTrust = new Set<string>();
   createEffect(() => {
     const m = managed();
-    if (m && (m.state === "awaiting-trust" || m.state === "changed")) setManagedOpen(true);
+    if (!m || (m.state !== "awaiting-trust" && m.state !== "changed")) return;
+    const key = m.dir + ":" + (m.config_hash || "");
+    if (notifiedTrust.has(key)) return;
+    notifiedTrust.add(key);
+    pushNotification({
+      kind: "error",
+      title:
+        m.state === "changed"
+          ? "A project's config changed — review it in Project processes before it runs."
+          : "A project wants to run repo-declared commands — review it in Project processes.",
+    });
   });
   // Push the live theme to every embedded view whenever it changes (built-in or
   // custom, light/dark) — operator toggles restyle the views without a reload.
