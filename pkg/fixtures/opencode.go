@@ -571,6 +571,15 @@ func (f *FakeOpenCode) handleEvent(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, "data: {\"type\":\"server.connected\",\"properties\":{}}\n\n")
 	fl.Flush()
 
+	// Seed an agent todo list (OpenCode TodoWrite) for the demo session so the
+	// "Tasks N active · M left" indicator is exercisable in the fixture lane.
+	fmt.Fprint(w, `data: {"type":"todo.updated","properties":{"sessionID":"demo","todos":[`+
+		`{"id":"t1","content":"Extract the tokenizer","status":"completed"},`+
+		`{"id":"t2","content":"Add parser tests","status":"in_progress"},`+
+		`{"id":"t3","content":"Wire error recovery","status":"pending"},`+
+		`{"id":"t4","content":"Update docs","status":"pending"}]}}`+"\n\n")
+	fl.Flush()
+
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 	for {

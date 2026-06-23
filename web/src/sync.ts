@@ -4,7 +4,7 @@
 // background sockets). State is reconciled by id, never nuked.
 import { createStore, produce } from "solid-js/store";
 import { createSignal, createRoot, createEffect, on } from "solid-js";
-import type { ConnStatus, Permission, Question, Session, SessionMessages, Snapshot } from "./types";
+import type { ConnStatus, Permission, Question, Session, SessionMessages, Snapshot, TodoItem } from "./types";
 import {
   anyDescendantWorking,
   buildMessages,
@@ -71,6 +71,9 @@ interface SyncState {
   activity: Record<string, string>;
   permissions: Record<string, Record<string, Permission>>;
   questions: Record<string, Record<string, Question>>;
+  // Per-session agent todo list (OpenCode TodoWrite), kept for all sessions so
+  // the "Tasks N active · M left" indicator works without opening them.
+  todos: Record<string, TodoItem[]>;
   // Root sessions that finished and haven't been acknowledged (server-tracked,
   // cross-device) — drives the "finished/unread" indicator in the tree.
   unread: Record<string, boolean>;
@@ -84,6 +87,7 @@ const [state, setState] = createStore<SyncState>({
   activity: loadActivity(initialDir),
   permissions: {},
   questions: {},
+  todos: {},
   unread: {},
   status: "connecting",
   cursor: loadCursor(initialDir),
@@ -183,6 +187,7 @@ export function switchProject(dir: string, fromUrl = false) {
       s.activity = loadActivity(dir);
       s.permissions = {};
       s.questions = {};
+      s.todos = {};
       s.unread = {};
       s.cursor = loadCursor(dir);
       s.status = "connecting";
@@ -208,6 +213,8 @@ function applySnapshot(snap: Snapshot) {
         s.questions[sid] = {};
         for (const q of qs) s.questions[sid][q.id] = q;
       }
+      s.todos = {};
+      for (const [sid, v] of Object.entries(snap.todos || {})) s.todos[sid] = normalizeTodos(v);
       s.unread = {};
       for (const id of snap.unread || []) s.unread[id] = true;
       s.cursor = snap.seq;
@@ -312,6 +319,11 @@ function applyMessageEvent(kind: string, seq: number, payload: any, trackCursor 
           break;
         case "unread.clear":
           if (payload.sessionID) delete s.unread[payload.sessionID];
+          break;
+        case "todo":
+          // OpenCode TodoWrite snapshot for a session (full list each time). The
+          // event payload is the `{ sessionID, todos }` envelope.
+          if (payload.sessionID) s.todos[payload.sessionID] = normalizeTodos(payload);
           break;
         case "status":
           // A session.error event carries an `error` payload (activity already
@@ -477,7 +489,7 @@ function connect(fresh = false) {
       applySessionEvent(kind, Number(ev.lastEventId), JSON.parse(ev.data));
     });
   }
-  for (const kind of ["status", "activity", "permission.upsert", "permission.delete", "question.upsert", "question.delete", "unread.set", "unread.clear"]) {
+  for (const kind of ["status", "activity", "permission.upsert", "permission.delete", "question.upsert", "question.delete", "unread.set", "unread.clear", "todo"]) {
     es.addEventListener(kind, (e) => {
       markSeen();
       const ev = e as MessageEvent;
@@ -779,6 +791,30 @@ export function runningSessionCount(): number {
 
 function descendantWorking(sessionID: string): boolean {
   return anyDescendantWorking(state.sessions, state.activity, sessionID, isActivityWorking);
+}
+
+// normalizeTodos extracts the todo array from either the bare array or the
+// daemon's `{ sessionID, todos }` envelope (snapshot stores the raw properties).
+function normalizeTodos(v: any): TodoItem[] {
+  if (Array.isArray(v)) return v as TodoItem[];
+  if (v && Array.isArray(v.todos)) return v.todos as TodoItem[];
+  return [];
+}
+
+// sessionTodoCounts summarizes a session's agent todo list (OpenCode TodoWrite)
+// for the "Tasks N active · M left" indicator: active = in_progress, left = not
+// yet completed (pending + in_progress), total = all items. Returns zeros when
+// the session has no todos.
+export function sessionTodoCounts(sessionID?: string): { active: number; left: number; total: number } {
+  const items = (sessionID && state.todos[sessionID]) || [];
+  let active = 0;
+  let left = 0;
+  for (const t of items) {
+    const st = t?.status;
+    if (st === "in_progress") active++;
+    if (st !== "completed" && st !== "cancelled") left++;
+  }
+  return { active, left, total: items.length };
 }
 
 // Optimistically mark a session idle (used right after aborting a turn) so the

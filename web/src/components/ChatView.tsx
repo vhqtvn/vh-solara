@@ -1,6 +1,6 @@
 import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show } from "solid-js";
 import { Portal } from "solid-js/web";
-import { ackSession, createSession, isSending, markSessionIdle, openSession, respondPermission, sessionWorking, setSelectedId, setSending, state } from "../sync";
+import { ackSession, createSession, isSending, markSessionIdle, openSession, respondPermission, sessionTodoCounts, sessionWorking, setSelectedId, setSending, state } from "../sync";
 import { getScroll, setScroll } from "../lib/scroll";
 import { chooseVariant, findModel, loadModels, models, selectionFor } from "../models";
 import { loadVersioned, saveVersioned } from "../lib/store";
@@ -240,6 +240,24 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // "Working" = the session is busy (shared with the sidebar spinner so they
   // always agree). See sessionWorking() for the activity + last-message logic.
   const working = createMemo(() => sessionWorking(props.sessionId));
+  // Agent todo list (OpenCode TodoWrite) → "Tasks N active · M left" pill.
+  const todoCounts = createMemo(() => sessionTodoCounts(props.sessionId));
+  const todoItems = createMemo(() => (props.sessionId ? state.todos[props.sessionId] || [] : []));
+  const [todosOpen, setTodosOpen] = createSignal(false);
+  let tasksBarEl: HTMLDivElement | undefined;
+  // Close the overlay popover on outside click. Listener lives only while open;
+  // onCleanup re-runs when todosOpen flips false, so nothing leaks.
+  createEffect(() => {
+    if (!todosOpen()) return;
+    const onDoc = (e: MouseEvent) => {
+      if (tasksBarEl && !e.composedPath().includes(tasksBarEl)) setTodosOpen(false);
+    };
+    const id = setTimeout(() => document.addEventListener("click", onDoc), 0);
+    onCleanup(() => {
+      clearTimeout(id);
+      document.removeEventListener("click", onDoc);
+    });
+  });
 
   function nearBottom() {
     return scrollEl
@@ -938,6 +956,30 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
               </div>
             )}
           </For>
+        </div>
+      </Show>
+
+      <Show when={todoCounts().left > 0}>
+        <div class="tasks-bar" classList={{ open: todosOpen() }} ref={tasksBarEl}>
+          <button type="button" class="tasks-pill" onClick={() => setTodosOpen((v) => !v)} aria-expanded={todosOpen()}>
+            <span class="tasks-label">Tasks</span>
+            <span class="tasks-count">{todoCounts().active} active</span>
+            <span class="tasks-sep">·</span>
+            <span class="tasks-count">{todoCounts().left} left</span>
+            <span class="tasks-chev" classList={{ rot: todosOpen() }}><Icon name="chevronDown" size={12} /></span>
+          </button>
+          <Show when={todosOpen()}>
+            <ul class="tasks-list">
+              <For each={todoItems()}>
+                {(t) => (
+                  <li class="tasks-item" classList={{ done: t.status === "completed", active: t.status === "in_progress", cancelled: t.status === "cancelled" }}>
+                    <span class="tasks-item-dot" />
+                    <span class="tasks-item-text">{t.content || "(untitled)"}</span>
+                  </li>
+                )}
+              </For>
+            </ul>
+          </Show>
         </div>
       </Show>
 

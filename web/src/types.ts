@@ -23,6 +23,21 @@ export interface Snapshot {
   permissions?: Record<string, Permission[]>;
   questions?: Record<string, Question[]>;
   unread?: string[];
+  // Per-session todos. The daemon stores the raw `todo.updated` properties, so
+  // each value is the ENVELOPE `{ sessionID, todos: [...] }`, not the bare array
+  // (normalized on the client — see normalizeTodos in sync.ts).
+  todos?: Record<string, unknown>;
+}
+
+// One agent todo (OpenCode's TodoWrite). The daemon passes the payload through
+// untouched; we only read content/status. status is OpenCode's set:
+// pending | in_progress | completed (| cancelled).
+export interface TodoItem {
+  id?: string;
+  content?: string;
+  status?: string;
+  priority?: string;
+  [k: string]: unknown;
 }
 
 // A pending question (OpenCode's interactive "ask the user" request). One
