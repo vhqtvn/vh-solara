@@ -62,13 +62,15 @@ const (
 )
 
 // IsRunning reports whether the status denotes a live (or starting) process.
-func (s Status) IsRunning() bool { return s == StatusStarting || s == StatusReady || s == StatusUnhealthy }
+func (s Status) IsRunning() bool {
+	return s == StatusStarting || s == StatusReady || s == StatusUnhealthy
+}
 
 // ProcSpec is the resolved declaration for one process (built by the
 // orchestrator from a projectcfg.Process, with a derived readiness if the
 // author omitted one).
 type ProcSpec struct {
-	Dir       string                // project root (absolute)
+	Dir       string // project root (absolute)
 	ID        string
 	Argv      []string              // resolved argv (sh -c <s> for a string command)
 	Cwd       string                // resolved absolute working directory
@@ -429,8 +431,9 @@ func (p *Proc) launch(ctx context.Context) (*exec.Cmd, chan struct{}, error) {
 	cmd.Env = mergedEnv(spec.Env)
 	// Put the child in its own process group so a stop can kill the WHOLE group
 	// (e.g. `sh -c 'sleep 30'` otherwise orphans sleep holding the stdout pipe,
-	// deadlocking cmd.Wait). Setpgid makes cmd.Process.Pid the group id.
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// deadlocking cmd.Wait). On unix this makes cmd.Process.Pid the group id; on
+	// Windows it is a no-op (see procmgr_{unix,windows}.go).
+	setProcGroup(cmd)
 	// On ctx cancel (stop/teardown) signal the whole group; WaitDelay bounds how
 	// long Wait blocks on the I/O copy goroutines afterwards (belt-and-braces).
 	cmd.Cancel = func() error {
@@ -701,11 +704,6 @@ func (p *Proc) killCmd(cmd *exec.Cmd, done <-chan struct{}) {
 	}()
 }
 
-// killGroup sends sig to the process group -pid (negative pid = group).
-func killGroup(pid int, sig syscall.Signal) error {
-	return syscall.Kill(-pid, sig)
-}
-
 func (p *Proc) cmdExitCode() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -738,16 +736,16 @@ func (p *Proc) snapshot() ProcStatus {
 	defer p.mu.Unlock()
 	cmd := strings.Join(p.spec.Argv, " ")
 	return ProcStatus{
-		Dir:        p.spec.Dir,
-		ID:         p.spec.ID,
-		Status:     p.status,
-		PID:        p.pid,
-		Command:    cmd,
-		Restart:    p.spec.Restart,
-		StartedAt:  p.startedAt,
-		ReadyAt:    p.readyAt,
-		ExitCode:   p.exitCode,
-		Restarts:   p.restartCount,
+		Dir:       p.spec.Dir,
+		ID:        p.spec.ID,
+		Status:    p.status,
+		PID:       p.pid,
+		Command:   cmd,
+		Restart:   p.spec.Restart,
+		StartedAt: p.startedAt,
+		ReadyAt:   p.readyAt,
+		ExitCode:  p.exitCode,
+		Restarts:  p.restartCount,
 	}
 }
 
