@@ -19,18 +19,22 @@ import RestartOverlay from "./components/RestartOverlay";
 import CommandPalette from "./components/CommandPalette";
 import TerminalDock from "./components/TerminalDock";
 import ViewFrame from "./components/ViewFrame";
+import ManagedPanel from "./components/ManagedPanel";
 import Icon from "./components/Icon";
 import { menuTriggers } from "./sessionMenu";
 import { isDesktop, sidebarCollapsed, sidebarWidth, toggleSidebar } from "./layout";
 import { draft, selectedId, state } from "./sync";
 import { refreshViews, views } from "./views";
+import { managed, refreshManaged } from "./managed";
 import { broadcastTheme, postThemeTo } from "./themeTokens";
 import { customTheme, theme } from "./theme";
 import { adminOpen, embeddedViewId, isEmbeddedView, setAdminOpen, setPaletteOpen, setSettingsOpen, setTermOpen, setView, settingsOpen, termOpen, view, VIEW_PREFIX } from "./ui";
+import { projectDir } from "./sync";
 
 export default function App() {
   const [navOpen, setNavOpen] = createSignal(false);
   const [inspectorOpen, setInspectorOpen] = createSignal(false);
+  const [managedOpen, setManagedOpen] = createSignal(false);
 
   // Global hotkeys: Cmd/Ctrl+K → command palette; Ctrl+` → terminal.
   const onGlobalKey = (e: KeyboardEvent) => {
@@ -65,12 +69,27 @@ export default function App() {
     window.addEventListener("message", onThemeRequest);
     void refreshViews();
     viewsPoll = window.setInterval(() => void refreshViews(), 60000);
+    // Repo-declared managed projects: refresh on mount + poll alongside views.
+    void refreshManaged();
   });
   onCleanup(() => {
     document.removeEventListener("keydown", onGlobalKey);
     document.removeEventListener("contextmenu", onContextMenu);
     window.removeEventListener("message", onThemeRequest);
     clearInterval(viewsPoll);
+  });
+  // Re-scope the managed view when the active project changes, and surface the
+  // trust gate proactively when a project wants to run repo-declared commands.
+  let managedPoll: number | undefined;
+  createEffect(() => {
+    projectDir();
+    void refreshManaged();
+    clearInterval(managedPoll);
+    managedPoll = window.setInterval(() => void refreshManaged(), 5000);
+  });
+  createEffect(() => {
+    const m = managed();
+    if (m && (m.state === "awaiting-trust" || m.state === "changed")) setManagedOpen(true);
   });
   // Push the live theme to every embedded view whenever it changes (built-in or
   // custom, light/dark) — operator toggles restyle the views without a reload.
@@ -174,6 +193,26 @@ export default function App() {
           >
             <Icon name="terminal" />
           </button>
+          <Show when={managed()}>
+            <div class="settings-wrap">
+              <button
+                type="button"
+                class="icon-btn"
+                classList={{
+                  on: managedOpen(),
+                  warn: managed()!.state === "awaiting-trust" || managed()!.state === "changed",
+                }}
+                aria-label="Project processes"
+                data-tip="Project processes (repo-declared)"
+                onClick={() => setManagedOpen((v) => !v)}
+              >
+                <Icon name="layers" />
+              </button>
+              <Show when={managedOpen()}>
+                <ManagedPanel onClose={() => setManagedOpen(false)} />
+              </Show>
+            </div>
+          </Show>
           <StatusPopover />
           <NotificationCenter />
           <div class="settings-wrap">

@@ -20,6 +20,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/vhqtvn/vh-solara/pkg/agent"
 	"github.com/vhqtvn/vh-solara/pkg/aggregator"
+	"github.com/vhqtvn/vh-solara/pkg/procmgr"
 	"github.com/vhqtvn/vh-solara/pkg/web"
 )
 
@@ -51,6 +52,8 @@ var (
 	daemonOpenCodeDetached bool
 	daemonExternalManaged  bool
 	daemonCORSOrigins      []string
+	daemonProjectConfig    string // --project-config override path for managed projects
+	daemonTrustOnOpen      bool   // headless: auto-approve repo-declared configs
 )
 
 var clientDaemonCmd = &cobra.Command{
@@ -99,6 +102,9 @@ var clientDaemonCmd = &cobra.Command{
 		var opencodeMu sync.Mutex // serializes restarts of opencodeServeCmd
 		var vhCancel context.CancelFunc
 		var vhHTTP *http.Server
+		// Managed-project process manager (torn down alongside OpenCode).
+		var procMgr *procmgr.Manager
+		var procCtxCancel context.CancelFunc
 
 		switch daemonWeb {
 		case WebOpenCode:
@@ -234,6 +240,27 @@ var clientDaemonCmd = &cobra.Command{
 			srv, err := web.NewServer(agg, opencodeURL, vhEventRingCapacity)
 			if err != nil {
 				log.Fatalf("Failed to build vh web server: %v", err)
+			}
+
+			// Managed-project processes + views: discover a checked-in
+			// .vh-solara/project.jsonc, gate it behind explicit per-project trust,
+			// and run the declared processes (procmgr) + views (shared registry).
+			// Bound to a cancellable context torn down on shutdown. The default
+			// project (daemon cwd) is discovered now; other ?dir= projects are
+			// discovered lazily via the server's open hook.
+			procCtx, procCancel := context.WithCancel(context.Background())
+			procCtxCancel = procCancel
+			procMgr = procmgr.NewManager(procCtx)
+			trustStore, err := web.NewTrustStore()
+			if err != nil {
+				log.Printf("Managed projects disabled: trust store unavailable: %v", err)
+			} else {
+				trustOnOpen := daemonTrustOnOpen || os.Getenv("VH_TRUST_CONFIG") != ""
+				orch := srv.InitManaged(procMgr, trustStore, daemonProjectConfig, trustOnOpen)
+				if trustOnOpen {
+					log.Printf("Managed projects: auto-trust enabled — repo-declared configs run without a prompt")
+				}
+				orch.OpenProject("") // default project = daemon cwd
 			}
 
 			// restartOpencodeLocked SIGTERMs + reaps the current opencode and
@@ -405,6 +432,14 @@ var clientDaemonCmd = &cobra.Command{
 			if opencodeServeCmd != nil && opencodeServeCmd.Process != nil && !daemonOpenCodeDetached {
 				log.Printf("Stopping opencode serve (pid=%d)...", opencodeServeCmd.Process.Pid)
 				_ = opencodeServeCmd.Process.Signal(syscall.SIGTERM)
+			}
+			// Tear down repo-declared managed processes (SIGTERM the process
+			// groups) and stop their supervisor goroutines.
+			if procMgr != nil {
+				procMgr.StopAll()
+			}
+			if procCtxCancel != nil {
+				procCtxCancel()
 			}
 			removeDaemonState()
 			os.Exit(0)
@@ -612,6 +647,10 @@ func init() {
 	clientDaemonCmd.Flags().BoolVar(&daemonExternalManaged, "external-managed", false, "(vh only) The vh daemon is run under a supervisor (e.g. systemd, Restart=always); on a 'restart server' request it exits cleanly and lets the supervisor relaunch it, instead of re-exec'ing itself")
 	clientDaemonCmd.Flags().StringVar(&daemonOpenCodeRestart, "opencode-restart-cmd", "", "(vh only, external) Command to restart externally-managed OpenCode, e.g. 'systemctl --user restart opencode'")
 	clientDaemonCmd.Flags().BoolVar(&daemonOpenCodeDetached, "opencode-detached", false, "(vh only) Spawn OpenCode detached and reconnect to it across vh restarts (survives self-update); vh owns it via a pidfile")
+
+	// Managed-project processes + views (repo-declared .vh-solara/project.jsonc).
+	clientDaemonCmd.Flags().StringVar(&daemonProjectConfig, "project-config", "", "(vh only) Override path to the managed-project config (default: <project>/.vh-solara/project.jsonc)")
+	clientDaemonCmd.Flags().BoolVar(&daemonTrustOnOpen, "trust-on-open", false, "(vh only) Auto-approve repo-declared configs without a prompt (headless escape hatch; also set via VH_TRUST_CONFIG=1). Use only on trusted single-user setups")
 
 	rootCmd.AddCommand(clientDaemonCmd)
 }

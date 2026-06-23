@@ -1,0 +1,283 @@
+package procmgr
+
+import (
+	"context"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/vhqtvn/vh-solara/pkg/projectcfg"
+)
+
+func TestMain(m *testing.M) {
+	// `go test` builds+runs the testdata helper as a real binary so the unix
+	// readiness path exercises a live socket served by a managed child.
+	os.Exit(m.Run())
+}
+
+// buildSockServer compiles testdata/sockserver into a temp binary and returns
+// its path. Skips the test if the toolchain is unavailable.
+func buildSockServer(t *testing.T) string {
+	t.Helper()
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go toolchain not on PATH")
+	}
+	out := filepath.Join(t.TempDir(), "sockserver")
+	if runtime.GOOS == "windows" {
+		out += ".exe"
+	}
+	cmd := exec.Command("go", "build", "-o", out, "./testdata/sockserver")
+	cmd.Env = append(os.Environ(), "GO111MODULE=on")
+	if b, err := cmd.CombinedOutput(); err != nil {
+		t.Skipf("go build sockserver: %v\n%s", err, b)
+	}
+	return out
+}
+
+func TestManager_UnixReadiness_BecomesReady(t *testing.T) {
+	bin := buildSockServer(t)
+	sock := filepath.Join(t.TempDir(), "s.sock")
+	_ = os.Remove(sock)
+	mgr := NewManager(mgrCtx())
+	if err := mgr.Start(ProcSpec{
+		Dir:       "/proj",
+		ID:        "board",
+		Argv:      []string{bin, sock},
+		Cwd:       ".",
+		Restart:   projectcfg.RestartNo,
+		Readiness: &projectcfg.Readiness{Unix: sock},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.StopAll()
+
+	if !waitFor(t, 8*time.Second, func() bool {
+		st, _ := mgr.Status("/proj", "board")
+		return st.Status == StatusReady
+	}) {
+		st, _ := mgr.Status("/proj", "board")
+		logs, _ := mgr.Logs("/proj", "board", 4096)
+		t.Fatalf("never reached ready; status=%s logs=%s", st.Status, logs)
+	}
+
+	// The view can now dial the socket the process serves.
+	c, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatalf("dial socket after ready: %v", err)
+	}
+	c.Close()
+}
+
+func TestManager_DefaultSettleReady(t *testing.T) {
+	mgr := NewManager(mgrCtx())
+	if err := mgr.Start(ProcSpec{
+		Dir:     "/proj",
+		ID:      "sleeper",
+		Argv:    []string{"/bin/sh", "-c", "sleep 30"},
+		Cwd:     t.TempDir(),
+		Restart: projectcfg.RestartNo,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.StopAll()
+	if !waitFor(t, 8*time.Second, func() bool {
+		st, _ := mgr.Status("/proj", "sleeper")
+		return st.Status == StatusReady
+	}) {
+		t.Fatal("default-settle never reached ready")
+	}
+}
+
+func TestManager_LogReadinessProbe(t *testing.T) {
+	mgr := NewManager(mgrCtx())
+	if err := mgr.Start(ProcSpec{
+		Dir:       "/proj",
+		ID:        "logger",
+		Argv:      []string{"/bin/sh", "-c", "echo starting; sleep 0.3; echo LISTENING; sleep 30"},
+		Cwd:       t.TempDir(),
+		Restart:   projectcfg.RestartNo,
+		Readiness: &projectcfg.Readiness{Log: "LISTENING"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.StopAll()
+	if !waitFor(t, 8*time.Second, func() bool {
+		st, _ := mgr.Status("/proj", "logger")
+		return st.Status == StatusReady
+	}) {
+		logs, _ := mgr.Logs("/proj", "logger", 4096)
+		t.Fatalf("log-readiness never reached ready\nLOGS:\n%s", string(logs))
+	}
+}
+
+func TestManager_StartupTimeoutFailed(t *testing.T) {
+	prev := startupTimeout
+	startupTimeout = 800 * time.Millisecond
+	t.Cleanup(func() { startupTimeout = prev })
+	mgr := NewManager(mgrCtx())
+	// A readiness socket that never appears → must hit startupTimeout → failed.
+	// restart:No so it stays failed (no retry loop).
+	if err := mgr.Start(ProcSpec{
+		Dir:       "/proj",
+		ID:        "never",
+		Argv:      []string{"/bin/sh", "-c", "sleep 120"},
+		Cwd:       ".",
+		Restart:   projectcfg.RestartNo,
+		Readiness: &projectcfg.Readiness{Unix: "/does/not/exist.sock"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.StopAll()
+	if !waitFor(t, startupTimeout+5*time.Second, func() bool {
+		st, _ := mgr.Status("/proj", "never")
+		return st.Status == StatusFailed
+	}) {
+		t.Fatal("expected failed(startup) after timeout")
+	}
+}
+
+func TestManager_OnFailureRestarts(t *testing.T) {
+	mgr := NewManager(mgrCtx())
+	if err := mgr.Start(ProcSpec{
+		Dir:     "/proj",
+		ID:      "crash",
+		Argv:    []string{"/bin/sh", "-c", "exit 7"},
+		Cwd:     ".",
+		Restart: projectcfg.RestartOnFailure,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.StopAll()
+	if !waitFor(t, 15*time.Second, func() bool {
+		st, _ := mgr.Status("/proj", "crash")
+		return st.Restarts >= 2
+	}) {
+		st, _ := mgr.Status("/proj", "crash")
+		t.Fatalf("expected on-failure restarts; restarts=%d status=%s", st.Restarts, st.Status)
+	}
+}
+
+func TestManager_NoRestartCleanExit(t *testing.T) {
+	mgr := NewManager(mgrCtx())
+	if err := mgr.Start(ProcSpec{
+		Dir:     "/proj",
+		ID:      "ok",
+		Argv:    []string{"/bin/sh", "-c", "exit 0"},
+		Cwd:     ".",
+		Restart: projectcfg.RestartNo,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !waitFor(t, 5*time.Second, func() bool {
+		st, _ := mgr.Status("/proj", "ok")
+		return st.Status == StatusStopped
+	}) {
+		st, _ := mgr.Status("/proj", "ok")
+		t.Fatalf("expected stopped after clean exit; status=%s", st.Status)
+	}
+}
+
+func TestManager_StopSetsStopped(t *testing.T) {
+	mgr := NewManager(mgrCtx())
+	if err := mgr.Start(ProcSpec{
+		Dir: "/proj", ID: "long", Cwd: t.TempDir(),
+		Argv: []string{"/bin/sh", "-c", "sleep 120"}, Restart: projectcfg.RestartAlways,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !waitFor(t, 6*time.Second, func() bool {
+		st, _ := mgr.Status("/proj", "long")
+		return st.Status == StatusReady
+	}) {
+		t.Fatal("not ready before stop")
+	}
+	mgr.Stop("/proj", "long")
+	st, _ := mgr.Status("/proj", "long")
+	if st.Status != StatusStopped {
+		t.Fatalf("expected stopped, got %s", st.Status)
+	}
+}
+
+func TestManager_StatusesScopedToDir(t *testing.T) {
+	mgr := NewManager(mgrCtx())
+	cwd := t.TempDir()
+	mgr.Start(ProcSpec{Dir: "/a", ID: "p1", Cwd: cwd, Argv: []string{"/bin/sh", "-c", "sleep 30"}, Restart: projectcfg.RestartNo})
+	mgr.Start(ProcSpec{Dir: "/b", ID: "p2", Cwd: cwd, Argv: []string{"/bin/sh", "-c", "sleep 30"}, Restart: projectcfg.RestartNo})
+	defer mgr.StopAll()
+	if got := len(mgr.Statuses("/a")); got != 1 {
+		t.Fatalf("dir /a: got %d procs", got)
+	}
+	if got := len(mgr.Statuses("/b")); got != 1 {
+		t.Fatalf("dir /b: got %d procs", got)
+	}
+}
+
+// --- probe helper unit tests ---
+
+func TestProbeUnixAndHTTP(t *testing.T) {
+	// unix probe true once listening.
+	dir := t.TempDir()
+	sock := filepath.Join(dir, "x.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	if !dialUnix(mgrCtx(), sock) {
+		t.Fatal("dialUnix should succeed on live socket")
+	}
+	if dialUnix(mgrCtx(), filepath.Join(dir, "nope.sock")) {
+		t.Fatal("dialUnix should fail on absent socket")
+	}
+
+	// http probe.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+	if !probeHTTP(mgrCtx(), srv.URL) {
+		t.Fatal("probeHTTP should pass on 2xx")
+	}
+	if probeHTTP(mgrCtx(), "http://127.0.0.1:1") {
+		t.Fatal("probeHTTP should fail on unreachable")
+	}
+}
+
+func TestLogsTail(t *testing.T) {
+	r := newLogRing(16)
+	r.append("hello world\n")
+	b := r.tail(5)
+	if string(b) != "orld\n" {
+		t.Fatalf("tail = %q", b)
+	}
+	if strings.Contains(string(r.tail(0)), "hello world") == false {
+		t.Fatal("tail(0) should return whole ring")
+	}
+}
+
+// --- test helpers ---
+
+// mgrCtx returns a context for a manager whose lifetime is bounded by the test
+// (the manager is always StopAll'd via t.Cleanup by each test). Background is
+// fine because the per-proc contexts derive from it and Stop/StopAll cancel.
+func mgrCtx() context.Context { return context.Background() }
+
+// waitFor polls cond every 50ms up to timeout; returns true once cond is true.
+func waitFor(t *testing.T, timeout time.Duration, cond func() bool) bool {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return true
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return cond()
+}

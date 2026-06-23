@@ -25,6 +25,7 @@ import (
 
 	"github.com/vhqtvn/vh-solara/pkg/aggregator"
 	"github.com/vhqtvn/vh-solara/pkg/auth"
+	"github.com/vhqtvn/vh-solara/pkg/procmgr"
 	"github.com/vhqtvn/vh-solara/pkg/quota"
 	"github.com/vhqtvn/vh-solara/pkg/render"
 	"github.com/vhqtvn/vh-solara/pkg/skill"
@@ -83,6 +84,10 @@ type Server struct {
 	// views holds consumer-registered reverse-proxy views (embedded sandboxed
 	// iframes, peer to chat). Generic + policy-free; see views.go.
 	views *viewRegistry
+
+	// managed, when set by the daemon, owns repo-declared processes+views for
+	// projects (.vh-solara/project.jsonc). nil = managed-projects disabled.
+	managed *Orchestrator
 }
 
 // RegisterFeature adds a capability module to be mounted by Handler(). Call
@@ -130,6 +135,23 @@ func (s *Server) SetRestartOpenCode(fn func(context.Context) error) { s.restartO
 // SetRestartServer wires the daemon's vh-server-restart hook (re-exec, or exit
 // for a supervisor to relaunch). Optional.
 func (s *Server) SetRestartServer(fn func()) { s.restartServer = fn }
+
+// SetManaged installs the managed-project orchestrator (repo-declared processes
+// + views). Optional; nil leaves managed projects disabled.
+func (s *Server) SetManaged(o *Orchestrator) { s.managed = o }
+
+// InitManaged builds and installs the managed-project orchestrator over the
+// given process manager and trust store, sharing this server's view registry.
+// cfgOverride ("") uses conventional .vh-solara/project.jsonc discovery;
+// autoTrust is the headless escape hatch that approves configs without a prompt.
+// Returns the orchestrator so the caller can drive the default project's
+// discovery (per-dir discovery is triggered automatically by the open hook).
+func (s *Server) InitManaged(mgr *procmgr.Manager, trust *TrustStore, cfgOverride string, autoTrust bool) *Orchestrator {
+	o := NewOrchestrator(mgr, trust, s.views, cfgOverride)
+	o.autoTrust = autoTrust
+	s.managed = o
+	return o
+}
 
 // NewServer builds the HTTP server. opencodeURL is the local OpenCode base URL
 // (e.g. http://127.0.0.1:4096) for write passthrough. ringCapacity sizes the
@@ -187,6 +209,12 @@ func (s *Server) aggFor(dir string) *aggregator.Aggregator {
 	}
 	a := aggregator.NewForDirectory(s.opencodeURL, dir, s.ringCap)
 	s.aggs[dir] = a
+	// Managed-project hook: discover .vh-solara/project.jsonc, gate on trust, and
+	// (if trusted) start declared processes + register views. Non-blocking; nil
+	// when the daemon hasn't enabled managed projects.
+	if s.managed != nil {
+		s.managed.OpenProject(dir)
+	}
 	go a.Run(context.Background())
 	return a
 }
@@ -213,6 +241,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/vh/snapshot", s.handleSnapshot)
 	mux.HandleFunc("/vh/projects", s.handleProjects)
 	mux.HandleFunc("/vh/views", s.handleViews)
+	mux.HandleFunc("/vh/managed", s.handleManaged)
+	mux.HandleFunc("/vh/trust", s.handleTrust)
 	mux.HandleFunc("/vh/theme.json", s.handleThemeJSON)
 	mux.HandleFunc("/vh/theme.css", s.handleThemeCSS)
 	mux.HandleFunc("/vh/stream", s.handleStream)

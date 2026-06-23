@@ -50,9 +50,20 @@ type viewReg struct {
 	PathPrefix string `json:"path_prefix"` // normalized, leading slash, no trailing slash
 	Upstream   string `json:"upstream"`
 	Sandbox    string `json:"sandbox,omitempty"` // iframe sandbox attr (sanitized)
+	// Origin labels who owns a registration: "manual" (operator POST /vh/views) or
+	// "managed" (a repo-declared project view). Dir is the project dir for managed
+	// views (empty for manual). Managed views are replaced/evicted by (dir,id).
+	Origin string `json:"origin,omitempty"`
+	Dir    string `json:"dir,omitempty"`
 
 	proxy *httputil.ReverseProxy `json:"-"`
 }
+
+// Origin tags. Default for a manual registration is OriginManual.
+const (
+	OriginManual  = "manual"
+	OriginManaged = "managed"
+)
 
 // viewCSP bounds a proxied page: same-origin only (no external load/exfiltration)
 // while still letting it run + letting OUR app frame it (frame-ancestors 'self').
@@ -135,14 +146,61 @@ func (vr *viewRegistry) put(v *viewReg) error {
 	defer vr.mu.Unlock()
 	// A prefix may belong to at most one view; reject a collision with a DIFFERENT id.
 	for _, ex := range vr.byID {
-		if ex.ID != v.ID && (ex.PathPrefix == v.PathPrefix ||
-			strings.HasPrefix(ex.PathPrefix+"/", v.PathPrefix+"/") ||
-			strings.HasPrefix(v.PathPrefix+"/", ex.PathPrefix+"/")) {
+		if ex.ID != v.ID && hasPrefixOverlap(ex.PathPrefix, v.PathPrefix) {
 			return errors.New("path_prefix overlaps an existing view (" + ex.ID + ")")
 		}
 	}
 	vr.byID[v.ID] = v
 	return nil
+}
+
+// putManaged registers a repo-declared view. It REPLACES only an existing managed
+// view with the SAME (origin,dir,id). Otherwise it inserts if the prefix is free.
+// It returns errPrefixConflict (without registering) if the prefix is held by a
+// manual view or a managed view from a different project — per the managed-process
+// design a collision is NON-FATAL: the process still runs, the view just doesn't
+// mount, surfacing as a "prefix-conflict" status in the UI.
+func (vr *viewRegistry) putManaged(v *viewReg) error {
+	vr.mu.Lock()
+	defer vr.mu.Unlock()
+	if ex, ok := vr.byID[v.ID]; ok {
+		if ex.Origin == v.Origin && ex.Dir == v.Dir {
+			vr.byID[v.ID] = v // re-registration for the same project+id (e.g. re-open)
+			return nil
+		}
+		// Same id owned by someone else (manual, or a different project).
+		return errPrefixConflict
+	}
+	for _, ex := range vr.byID {
+		if hasPrefixOverlap(ex.PathPrefix, v.PathPrefix) {
+			return errPrefixConflict
+		}
+	}
+	vr.byID[v.ID] = v
+	return nil
+}
+
+// delManaged removes the managed view for (dir,id); no-op if absent or not owned
+// by that (dir,id). Manual views are never evicted here.
+func (vr *viewRegistry) delManaged(dir, id string) bool {
+	vr.mu.Lock()
+	defer vr.mu.Unlock()
+	ex, ok := vr.byID[id]
+	if !ok || ex.Origin != OriginManaged || ex.Dir != dir {
+		return false
+	}
+	delete(vr.byID, id)
+	return true
+}
+
+// errPrefixConflict signals a non-fatal managed-view prefix collision.
+var errPrefixConflict = errors.New("path_prefix conflicts with an existing view")
+
+// hasPrefixOverlap is true if two prefixes are equal or one nests under the other.
+func hasPrefixOverlap(a, b string) bool {
+	return a == b ||
+		strings.HasPrefix(a+"/", b+"/") ||
+		strings.HasPrefix(b+"/", a+"/")
 }
 
 func (vr *viewRegistry) del(id string) bool {
@@ -371,6 +429,7 @@ func (s *Server) handleViews(w http.ResponseWriter, r *http.Request) {
 			PathPrefix: prefix,
 			Upstream:   strings.TrimSpace(in.Upstream),
 			Sandbox:    sanitizeSandbox(in.Sandbox),
+			Origin:     OriginManual,
 			proxy:      proxy,
 		}
 		if v.Title == "" {

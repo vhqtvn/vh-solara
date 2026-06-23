@@ -1371,6 +1371,40 @@ body {
 .admin-ok { font-size: 12px; color: var(--ok); padding: 0 2px; }
 .admin-sep { height: 1px; background: var(--border); margin: 2px 0; }
 
+/* Managed-project processes panel (repo-declared processes + trust review). */
+.managed-panel { width: 340px; }
+.managed-dir { margin-left: auto; font-size: 11px; font-weight: 400; color: var(--fg-dim); font-family: ui-monospace, Menlo, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 160px; }
+.managed-panel .admin-head { display: flex; align-items: center; gap: 6px; }
+.managed-err { font-size: 12px; color: var(--warn); padding: 2px 2px; }
+.managed-trust { display: flex; flex-direction: column; gap: 8px; padding: 6px 2px; }
+.managed-trust-warn { display: flex; gap: 6px; align-items: flex-start; font-size: 12px; color: var(--warn); line-height: 1.4; }
+.managed-subhead { font-size: 11px; font-weight: 600; color: var(--fg-dim); text-transform: uppercase; letter-spacing: 0.04em; padding: 4px 2px 0; }
+.managed-decl { display: flex; flex-direction: column; gap: 2px; padding: 4px 2px; border-top: 1px solid var(--border); }
+.managed-decl-id { font-size: 12px; font-weight: 600; }
+.managed-cmd { font-family: ui-monospace, Menlo, monospace; font-size: 11.5px; color: var(--fg); background: var(--bg); padding: 3px 6px; border-radius: 5px; word-break: break-all; white-space: pre-wrap; }
+.managed-meta { font-size: 11px; color: var(--fg-dim); }
+.managed-raw summary { font-size: 11px; color: var(--fg-dim); cursor: pointer; padding: 2px 0; }
+.managed-raw pre { font-family: ui-monospace, Menlo, monospace; font-size: 11px; max-height: 200px; overflow: auto; margin: 4px 0 0; padding: 6px; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; white-space: pre-wrap; word-break: break-all; }
+.managed-empty { font-size: 12px; color: var(--fg-dim); padding: 6px 2px; }
+.managed-proc { border-top: 1px solid var(--border); padding: 4px 0; }
+.managed-proc-row { display: flex; align-items: center; gap: 6px; }
+.managed-proc-toggle { display: flex; padding: 0; background: none; border: 0; cursor: pointer; color: var(--fg-dim); }
+.managed-chev { display: inline-flex; transition: transform 0.12s; }
+.managed-chev.rot { transform: rotate(-90deg); }
+.managed-proc-id { font-size: 13px; font-weight: 600; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.managed-status { font-size: 11px; padding: 1px 7px; border-radius: 10px; border: 1px solid var(--border); color: var(--fg-dim); }
+.managed-status.on { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, var(--border)); }
+.managed-status.bad { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, var(--border)); }
+.managed-proc-controls { display: flex; gap: 4px; }
+.admin-btn.sm { width: auto; padding: 3px 8px; font-size: 11.5px; gap: 4px; }
+.managed-proc-detail { padding: 4px 0 2px 18px; display: flex; flex-direction: column; gap: 3px; }
+.managed-log { font-family: ui-monospace, Menlo, monospace; font-size: 11px; max-height: 180px; overflow: auto; margin: 4px 0 2px 18px; padding: 6px; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; white-space: pre-wrap; word-break: break-all; }
+.managed-view { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 3px 2px; font-size: 12px; }
+.managed-view code { font-family: ui-monospace, Menlo, monospace; color: var(--fg); }
+.managed-view span { font-size: 11px; color: var(--fg-dim); }
+.managed-view span.bad { color: var(--warn); }
+.icon-btn.warn { color: var(--warn); }
+
 /* Install-app button in Settings → App. */
 .install-app-btn {
   display: inline-flex; align-items: center; gap: 8px;
