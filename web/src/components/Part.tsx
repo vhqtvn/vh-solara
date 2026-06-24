@@ -1,4 +1,5 @@
 import { createEffect, createMemo, createResource, createSignal, For, Match, onCleanup, Show, Switch } from "solid-js";
+import { createStore } from "solid-js/store";
 import { renderMarkdown } from "../render";
 import { renderStreamMd } from "../lib/md";
 import { renderMermaid } from "../lib/mermaid";
@@ -8,6 +9,7 @@ import { openSession, setSelectedId } from "../sync";
 import { openFile } from "../files";
 import type { Part } from "../types";
 import Icon from "./Icon";
+import Spinner from "./Spinner";
 
 // Friendly tool labels (mirrors OpenChamber's TOOL_METADATA displayName). Falls
 // back to a title-cased version of the raw tool name for anything unmapped.
@@ -37,6 +39,14 @@ function toolIconName(tool: string): string {
   if (/(lsp|skill)/.test(t)) return "info";
   return "layers";
 }
+// Per-part expand state, keyed by part id and held OUTSIDE the components.
+// The chat re-groups parts into fresh arrays as a turn streams, which re-creates
+// the row components — local open signals would reset on every new token (a
+// manually-expanded Thinking/tool would snap shut). Keying by id here makes the
+// toggle survive that churn.
+const [partOpen, setPartOpenStore] = createStore<Record<string, boolean>>({});
+const setPartOpen = (id: string, v: boolean) => setPartOpenStore(id, v);
+
 // Tool duration from its state.time (start→end), formatted like the reasoning
 // timer. Empty until the tool finishes.
 function durationText(part: Part): string {
@@ -264,11 +274,9 @@ function ToolBody(props: { text: string }) {
   );
 }
 
-function ToolPart(props: { part: Part }) {
+function ToolPart(props: { part: Part; tail?: boolean }) {
   const state = () => props.part.state || {};
   const status = () => state().status as string;
-  // Shell output (bash) shows inline by default; other tools start collapsed.
-  const [open, setOpen] = createSignal(props.part.tool === "bash");
   const output = () => state().output || state().error || "";
   // LSP diagnostics OpenCode attaches to edit/write/patch results, keyed by file.
   // Surface the errors (severity 1) so a broken edit is visible without digging.
@@ -333,17 +341,30 @@ function ToolPart(props: { part: Part }) {
       void openSession(id);
     }
   };
+  // Only the command/expression + output are behind the toggle (diagnostics show
+  // regardless). A row with neither has nothing to expand → no chevron, no toggle.
+  const hasDetail = () => !!(expr() || output());
+  // Default open only for the streaming tail (the session's last item); persisted
+  // per id so a manual toggle survives streaming re-renders.
+  const expanded = () => partOpen[props.part.id] ?? (!!props.tail && hasDetail());
+  const toggle = () => hasDetail() && setPartOpen(props.part.id, !expanded());
   return (
     <div class="tool" classList={{ [status()]: true }}>
-      <button type="button" class="tool-head" onClick={() => setOpen((v) => !v)}>
-        <span class="tool-status" />
+      <button type="button" class="tool-head" classList={{ "no-toggle": !hasDetail() }} onClick={toggle}>
+        {/* Running tools show the session-list shimmer (smaller); finished/failed
+            show a static status dot. */}
+        <Show when={status() === "running"} fallback={<span class="tool-status" />}>
+          <Spinner class="tool-spin" size={10} />
+        </Show>
         <span class="tool-ico"><Icon name={toolIconName(props.part.tool)} size={13} /></span>
         <span class="tool-name">{toolLabel(props.part.tool)}</span>
         <span class="tool-subject">{expr() || state().title || status()}</span>
         <Show when={durationText(props.part)}>
           <span class="tool-dur">{durationText(props.part)}</span>
         </Show>
-        <span class="tool-chev" classList={{ rot: open() }}><Icon name="chevronDown" size={12} /></span>
+        <Show when={hasDetail()}>
+          <span class="tool-chev" classList={{ rot: expanded() }}><Icon name="chevronDown" size={12} /></span>
+        </Show>
         <Show when={subId()}>
           <span
             role="button"
@@ -358,7 +379,7 @@ function ToolPart(props: { part: Part }) {
           </span>
         </Show>
       </button>
-      <Show when={open()}>
+      <Show when={expanded()}>
         <Show when={expr()}>
           <pre class="tool-cmd">{exprPrefix()}{expr()}</pre>
         </Show>
@@ -401,19 +422,28 @@ function ReasoningPart(props: { part: Part; settled: boolean; tail?: boolean }) 
     const secs = Math.max(0, Math.round(((end() ?? now()) - s) / 1000));
     return secs < 60 ? `${secs}s` : `${Math.floor(secs / 60)}m ${secs % 60}s`;
   };
-  const snippet = () => (props.part.text || "").replace(/\s+/g, " ").trim().slice(0, 90);
+  // Controlled (not native <details>) so the open state lives in the id-keyed
+  // store and survives streaming re-renders. Default open only for the tail (the
+  // live thinking) — no truncated snippet in the header; the body is the content.
+  const expanded = () => partOpen[props.part.id] ?? !!props.tail;
+  const toggle = () => setPartOpen(props.part.id, !expanded());
   return (
-    <details class="reasoning">
-      <summary>
+    <div class="reasoning" classList={{ open: expanded() }}>
+      <button type="button" class="tool-head reasoning-head" onClick={toggle}>
         <span class="tool-ico"><Icon name="help" size={13} /></span>
         <span class="tool-name">Thinking</span>
-        <span class="tool-subject">{snippet()}</span>
+        <span class="tool-subject" />
         <Show when={elapsed()}>
           <span class="tool-dur reasoning-time" classList={{ live: live() }}>{elapsed()}</span>
         </Show>
-      </summary>
-      <Markdown text={props.part.text || ""} settled={props.settled} caret={props.tail} />
-    </details>
+        <span class="tool-chev" classList={{ rot: expanded() }}><Icon name="chevronDown" size={12} /></span>
+      </button>
+      <Show when={expanded()}>
+        <div class="reasoning-body">
+          <Markdown text={props.part.text || ""} settled={props.settled} caret={props.tail} />
+        </div>
+      </Show>
+    </div>
   );
 }
 
@@ -432,7 +462,7 @@ export default function PartView(props: { part: Part; settled?: boolean; tail?: 
         <ReasoningPart part={p()} settled={settled()} tail={props.tail} />
       </Match>
       <Match when={p().type === "tool"}>
-        <ToolPart part={p()} />
+        <ToolPart part={p()} tail={props.tail} />
       </Match>
       <Match when={p().type === "file"}>
         <div class="file-chip">📎 {p().filename || p().mime}</div>
@@ -477,7 +507,7 @@ export function ActivityGroup(props: { parts: Part[]; settled: boolean; tailId?:
                 <ReasoningPart part={p} settled={props.settled} tail={p.id === props.tailId} />
               </Match>
               <Match when={p.type === "tool"}>
-                <ToolPart part={p} />
+                <ToolPart part={p} tail={p.id === props.tailId} />
               </Match>
             </Switch>
           )}

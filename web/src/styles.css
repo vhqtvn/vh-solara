@@ -963,14 +963,7 @@ body {
 }
 
 .reasoning { color: var(--fg-dim); margin: 0; border-radius: 7px; }
-.reasoning summary {
-  cursor: pointer; display: flex; align-items: center; gap: 7px;
-  padding: 4px 6px; border-radius: 7px; list-style: none;
-}
-.reasoning summary::-webkit-details-marker { display: none; }
-.reasoning summary::marker { content: ""; }
-.reasoning summary:hover { background: color-mix(in srgb, var(--fg) 6%, transparent); }
-.reasoning > .md { margin: 2px 0 6px 20px; }
+.reasoning-body { margin: 2px 0 6px 20px; }
 .reasoning-time { font-size: 11px; color: var(--fg-dim); font-variant-numeric: tabular-nums; }
 /* Pulse the duration while the model is actively thinking. */
 .reasoning-time.live { color: var(--accent); animation: pulse 1.1s ease-in-out infinite; }
@@ -1006,7 +999,12 @@ body {
   text-align: left;
 }
 .tool-head:hover { background: color-mix(in srgb, var(--fg) 6%, transparent); }
+/* A row with nothing to expand isn't a toggle. */
+.tool-head.no-toggle { cursor: default; }
+.tool-head.no-toggle:hover { background: transparent; }
 .tool-status { width: 7px; height: 7px; border-radius: 50%; background: var(--fg-dim); flex: 0 0 auto; }
+/* Running tool: the session-list shimmer, smaller and accent-tinted. */
+.tool-spin { flex: 0 0 auto; color: var(--accent); display: inline-flex; }
 .tool.running .tool-status { background: var(--accent); }
 .tool.completed .tool-status { background: var(--ok); }
 .tool.error .tool-status { background: var(--danger); }

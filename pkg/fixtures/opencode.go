@@ -128,6 +128,26 @@ func New() *FakeOpenCode {
 				textPart("m4", "demo", "p8", "Tests pass.", now-1230),
 			},
 		},
+		// An in-flight turn (no time.completed): a completed reasoning then a
+		// RUNNING bash — exercises the running-tool shimmer, the tail item opening
+		// by default, and the live streaming caret.
+		{
+			Info:  map[string]any{"id": "m5", "sessionID": "demo", "role": "user", "time": map[string]any{"created": now - 200, "completed": now - 200}},
+			Parts: []map[string]any{textPart("m5", "demo", "p9", "Add a benchmark and run it.", now-200)},
+		},
+		{
+			Info: map[string]any{"id": "m6", "sessionID": "demo", "role": "assistant", "time": map[string]any{"created": now - 180},
+				"model": map[string]any{"providerID": "fake", "modelID": "dummy-think", "variant": "high"}},
+			Parts: []map[string]any{
+				{"id": "p10", "sessionID": "demo", "messageID": "m6", "type": "reasoning",
+					"text": "I'll add a table-driven benchmark next to the parser tests, then run it.",
+					"time": map[string]any{"start": now - 175, "end": now - 150}},
+				{"id": "p11", "sessionID": "demo", "messageID": "m6", "type": "tool", "callID": "c5", "tool": "bash",
+					"state": map[string]any{"status": "running", "title": "go test -bench .",
+						"input":  map[string]any{"command": "go test -bench=. -run=^$ ./..."},
+						"output": "goos: linux\ngoarch: amd64\nBenchmarkParse-8 \t  ", "time": map[string]any{"start": now - 140}}},
+			},
+		},
 	}
 	f.messages["sub"] = []messageWithParts{
 		{
