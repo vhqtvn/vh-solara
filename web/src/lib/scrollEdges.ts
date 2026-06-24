@@ -37,6 +37,11 @@ function attach(el: HTMLElement) {
   if (tracked.has(el)) return;
   tracked.add(el);
   el.classList.add("scroll-edges");
+  // The shadow is a sticky pseudo, which pins to the PADDING edge — expose the
+  // container's padding so the CSS can pull it back to the border edge (flush).
+  const cs = getComputedStyle(el);
+  el.style.setProperty("--se-pt", cs.paddingTop);
+  el.style.setProperty("--se-pb", cs.paddingBottom);
   let raf = 0;
   const update = () => {
     raf = 0;
