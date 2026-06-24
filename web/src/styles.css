@@ -1124,6 +1124,20 @@ body {
 @media (prefers-reduced-motion: reduce) {
   .activity-rows-wrap, .activity-chev { transition: none; }
 }
+
+/* Generic expand/collapse animation for a tool's detail and a reasoning body
+   (same grid-track technique as the activity list — animates without a measured
+   pixel height). The clip child must hide overflow and allow shrinking. */
+.disclosure {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows 0.2s var(--ease, ease);
+}
+.disclosure.open { grid-template-rows: 1fr; }
+.disclosure-clip { overflow: hidden; min-height: 0; }
+@media (prefers-reduced-motion: reduce) {
+  .disclosure { transition: none; }
+}
 .tool-output-code .md { margin: 0; }
 .tool-output-code .md pre { margin: 0; border: 0; border-radius: 0; max-height: 320px; }
 .file-chip {

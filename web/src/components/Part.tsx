@@ -350,6 +350,11 @@ function ToolPart(props: { part: Part; tail?: boolean }) {
   // per id so a manual toggle survives streaming re-renders.
   const expanded = () => partOpen[props.part.id] ?? (!!props.tail && hasDetail());
   const toggle = () => hasDetail() && setPartOpen(props.part.id, !expanded());
+  // Keep the detail mounted once opened so the close animation has content.
+  const [revealed, setRevealed] = createSignal(expanded());
+  createEffect(() => {
+    if (expanded()) setRevealed(true);
+  });
   return (
     <div class="tool" classList={{ [status()]: true }}>
       <button type="button" class="tool-head" classList={{ "no-toggle": !hasDetail() }} onClick={toggle}>
@@ -381,14 +386,18 @@ function ToolPart(props: { part: Part; tail?: boolean }) {
           </span>
         </Show>
       </button>
-      <Show when={expanded()}>
-        <Show when={expr()}>
-          <pre class="tool-cmd">{exprPrefix()}{expr()}</pre>
-        </Show>
-        <Show when={output()}>
-          <ToolBody text={output()} />
-        </Show>
-      </Show>
+      <div class="disclosure" classList={{ open: expanded() }}>
+        <div class="disclosure-clip">
+          <Show when={revealed()}>
+            <Show when={expr()}>
+              <pre class="tool-cmd">{exprPrefix()}{expr()}</pre>
+            </Show>
+            <Show when={output()}>
+              <ToolBody text={output()} />
+            </Show>
+          </Show>
+        </div>
+      </div>
       {/* Diagnostics show even when collapsed — an edit that broke the file
           shouldn't require expanding to notice. */}
       <Show when={diagnostics().length > 0}>
@@ -429,6 +438,11 @@ function ReasoningPart(props: { part: Part; settled: boolean; tail?: boolean }) 
   // live thinking) — no truncated snippet in the header; the body is the content.
   const expanded = () => partOpen[props.part.id] ?? !!props.tail;
   const toggle = () => setPartOpen(props.part.id, !expanded());
+  // Keep the body mounted once opened so the close animation has content.
+  const [revealed, setRevealed] = createSignal(expanded());
+  createEffect(() => {
+    if (expanded()) setRevealed(true);
+  });
   // Bounded, scrollable body that sticks to the bottom while streaming — unless
   // the user scrolled up (then it stays put). A ResizeObserver on the content
   // re-anchors when new tokens grow it; onScroll tracks whether we're stuck.
@@ -459,13 +473,17 @@ function ReasoningPart(props: { part: Part; settled: boolean; tail?: boolean }) 
         </Show>
         <span class="tool-chev" classList={{ rot: expanded() }}><Icon name="chevronDown" size={12} /></span>
       </button>
-      <Show when={expanded()}>
-        <div class="reasoning-body" ref={bodyEl} onScroll={onScroll}>
-          <div ref={contentEl}>
-            <Markdown text={props.part.text || ""} settled={props.settled} caret={props.tail} />
-          </div>
+      <div class="disclosure" classList={{ open: expanded() }}>
+        <div class="disclosure-clip">
+          <Show when={revealed()}>
+            <div class="reasoning-body" ref={bodyEl} onScroll={onScroll}>
+              <div ref={contentEl}>
+                <Markdown text={props.part.text || ""} settled={props.settled} caret={props.tail} />
+              </div>
+            </div>
+          </Show>
         </div>
-      </Show>
+      </div>
     </div>
   );
 }
@@ -501,12 +519,11 @@ export default function PartView(props: { part: Part; settled?: boolean; tail?: 
 // tool, not just some — our deliberate divergence from OpenChamber). Collapsed
 // shows only the header + count; the LAST group in the conversation auto-opens.
 export function ActivityGroup(props: { parts: Part[]; settled: boolean; tailId?: string | null; isLast?: boolean }) {
-  // Collapsed by default; the LAST activity group in the conversation starts
-  // expanded. `override` records a manual toggle and then wins, so reading older
-  // history doesn't re-collapse what you opened, and the newest group auto-opens
-  // (while the previous newest auto-collapses) as fresh activity streams in.
+  // Expanded by default (the activity timeline shouldn't hide itself); `override`
+  // records a manual toggle and then wins, so a group you collapsed stays
+  // collapsed as fresh activity streams in.
   const [override, setOverride] = createSignal<boolean | null>(null);
-  const expanded = () => override() ?? !!props.isLast;
+  const expanded = () => override() ?? true;
   const total = () => props.parts.length;
   // Keep the rows mounted once revealed so the collapse animation has content to
   // shrink; a never-opened old group renders no rows at all (cheap history).
