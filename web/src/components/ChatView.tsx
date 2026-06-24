@@ -110,6 +110,14 @@ function roleLabel(role?: string): string {
   return role || "";
 }
 
+// The agent/subagent that produced an assistant message (e.g. "build", "plan",
+// or a custom subagent). Empty for user messages or when none was recorded.
+function agentLabel(info: any): string {
+  if (info?.role !== "assistant") return "";
+  const a = info.agent ?? info.mode;
+  return typeof a === "string" ? a.trim() : "";
+}
+
 function messageError(info: any): string | null {
   const e = info?.error;
   if (!e) return null;
@@ -1054,6 +1062,9 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
               <div class="msg" data-mid={m.id} classList={{ user: m.info.role === "user", assistant: m.info.role === "assistant" }}>
                 <div class="msg-head">
                   <span class="msg-role">{roleLabel(m.info.role)}</span>
+                  <Show when={agentLabel(m.info)}>
+                    <span class="msg-agent" data-tip={`Agent: ${agentLabel(m.info)}`}>@{agentLabel(m.info)}</span>
+                  </Show>
                   <Show when={modelLabel(m.info)}>
                     <span class="msg-model" data-tip={modelLabel(m.info)}>{modelLabel(m.info)}</span>
                   </Show>

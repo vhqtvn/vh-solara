@@ -945,6 +945,17 @@ body {
   color: var(--fg-dim);
 }
 .msg.user .msg-role { color: var(--accent); }
+.msg-agent {
+  font-size: 11px;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  border-radius: 999px;
+  padding: 1px 8px;
+  max-width: 22ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .msg-model {
   font-size: 11px;
   color: var(--fg-dim);

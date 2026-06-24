@@ -64,7 +64,7 @@ func New() *FakeOpenCode {
 			Parts: []map[string]any{textPart("m1", "demo", "p1", "Refactor the parser and explain the change.", now-4800)},
 		},
 		{
-			Info: map[string]any{"id": "m2", "sessionID": "demo", "role": "assistant", "time": map[string]any{"created": now - 4600, "completed": now - 4000},
+			Info: map[string]any{"id": "m2", "sessionID": "demo", "role": "assistant", "agent": "build", "time": map[string]any{"created": now - 4600, "completed": now - 4000},
 				"model": map[string]any{"providerID": "fake", "modelID": "dummy-think", "variant": "high"}},
 			Parts: []map[string]any{
 				textPart("m2", "demo", "p2", "Here's the plan:\n\n1. Extract the tokenizer\n2. Add tests\n\n```go\nfunc Parse(s string) (*AST, error) {\n\treturn parse(s)\n}\n```\n\nComplexity is $O(n \\log n)$; over the input:\n\n$$\\sum_{i=1}^{n} i = \\frac{n(n+1)}{2}$$\n\nEdited src/parser.go:2 accordingly.", now-4600),
@@ -114,7 +114,7 @@ func New() *FakeOpenCode {
 			Parts: []map[string]any{textPart("m3", "demo", "p5", "Now run the tests.", now-1800)},
 		},
 		{
-			Info: map[string]any{"id": "m4", "sessionID": "demo", "role": "assistant", "time": map[string]any{"created": now - 1700, "completed": now - 1200},
+			Info: map[string]any{"id": "m4", "sessionID": "demo", "role": "assistant", "agent": "plan", "time": map[string]any{"created": now - 1700, "completed": now - 1200},
 				"model": map[string]any{"providerID": "fake", "modelID": "dummy-think", "variant": "high"}},
 			Parts: []map[string]any{
 				{"id": "p6", "sessionID": "demo", "messageID": "m4", "type": "tool", "callID": "c3", "tool": "bash",
@@ -136,7 +136,7 @@ func New() *FakeOpenCode {
 			Parts: []map[string]any{textPart("m5", "demo", "p9", "Add a benchmark and run it.", now-200)},
 		},
 		{
-			Info: map[string]any{"id": "m6", "sessionID": "demo", "role": "assistant", "time": map[string]any{"created": now - 180},
+			Info: map[string]any{"id": "m6", "sessionID": "demo", "role": "assistant", "agent": "build", "time": map[string]any{"created": now - 180},
 				"model": map[string]any{"providerID": "fake", "modelID": "dummy-think", "variant": "high"}},
 			Parts: []map[string]any{
 				{"id": "p10", "sessionID": "demo", "messageID": "m6", "type": "reasoning",
@@ -153,7 +153,7 @@ func New() *FakeOpenCode {
 	}
 	f.messages["sub"] = []messageWithParts{
 		{
-			Info:  map[string]any{"id": "sm1", "sessionID": "sub", "role": "assistant", "time": map[string]any{"created": now - 2900, "completed": now - 2100}},
+			Info:  map[string]any{"id": "sm1", "sessionID": "sub", "role": "assistant", "agent": "general", "time": map[string]any{"created": now - 2900, "completed": now - 2100}},
 			Parts: []map[string]any{textPart("sm1", "sub", "sp1", "Searched 12 files, found 3 matches.", now-2900)},
 		},
 	}
@@ -185,9 +185,15 @@ func buildBenchMessages(n int, now float64) []messageWithParts {
 			continue
 		}
 		id := fmt.Sprintf("ba%d", i)
+		agent := "build"
+		if i%6 == 1 {
+			agent = "plan"
+		} else if i%6 == 3 {
+			agent = "general"
+		}
 		code := fmt.Sprintf("```go\nfunc tokenize%d(s string) []Token {\n\tvar out []Token\n\tfor _, r := range s {\n\t\tout = append(out, Token{R: r})\n\t}\n\treturn out // pass %d\n}\n```", i, i)
 		out = append(out, messageWithParts{
-			Info: map[string]any{"id": id, "sessionID": "bench", "role": "assistant",
+			Info: map[string]any{"id": id, "sessionID": "bench", "role": "assistant", "agent": agent,
 				"time": map[string]any{"created": t, "completed": t + 400}, "cost": 0.0021,
 				"tokens": map[string]any{"input": 1800 + i, "output": 240, "cache": map[string]any{"read": 900, "write": 0}}},
 			Parts: []map[string]any{
