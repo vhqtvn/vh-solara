@@ -1644,7 +1644,9 @@ body {
   cursor: pointer;
   font: inherit;
 }
-.notif-item.action:hover, .notif-body.btn:hover { background: var(--bg); }
+/* Highlight the WHOLE row on hover (icon + text + dismiss), not just the text
+   button — a partial box around the text alone read as broken. */
+.notif-item:hover { background: var(--bg); }
 .notif-ico { color: var(--accent); flex: none; margin-top: 1px; }
 /* Per-kind icon accent so done/error/info are scannable at a glance. */
 .notif-item.done .notif-ico { color: var(--ok); }
