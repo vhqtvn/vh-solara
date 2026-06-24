@@ -1,4 +1,4 @@
-import { createEffect, createSignal, For, onCleanup, onMount, Show } from "solid-js";
+import { createEffect, createSignal, For, on, onCleanup, onMount, Show } from "solid-js";
 import Sidebar from "./components/Sidebar";
 import ChatView from "./components/ChatView";
 import GitView from "./components/GitView";
@@ -99,6 +99,16 @@ export default function App() {
   createEffect(() => {
     if (view() === "notes" && !notesVisible()) setView("chat");
   });
+  // Activating a session must be VISIBLE. If we're on a non-Chat tab
+  // (Changes/Notes/an embedded view), selecting a session would otherwise look
+  // like nothing happened — so snap to Chat. Centralized here so every entry
+  // point (tree, notifications, jump-to-subsession, future ones) gets it for
+  // free. `defer` avoids firing on the initial mount / deep-linked view.
+  createEffect(
+    on(selectedId, (id, prev) => {
+      if (id && id !== prev && view() !== "chat") setView("chat");
+    }, { defer: true }),
+  );
   // A project awaiting trust must NOT auto-open the panel (that blocked the view,
   // especially on mobile where it's a modal). Instead fire a red notification
   // once per (dir, config) — the header Project-processes button keeps its warn
