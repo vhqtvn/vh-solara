@@ -838,17 +838,27 @@ body {
 }
 .chat-scroll { flex: 1; overflow-y: auto; overflow-anchor: auto; padding: 16px; overscroll-behavior: contain; }
 
-/* Scroll-edge fade affordance (installScrollEdges tags these). The mask fades a
-   ~20px edge ONLY when there's hidden content that way (se-top/se-bottom toggled
-   in JS), so overflow is visible without arrows. Theme-agnostic + nesting-safe. */
-.scroll-edges {
-  --se-t: 0px;
-  --se-b: 0px;
-  -webkit-mask-image: linear-gradient(to bottom, transparent, #000 var(--se-t), #000 calc(100% - var(--se-b)), transparent);
-  mask-image: linear-gradient(to bottom, transparent, #000 var(--se-t), #000 calc(100% - var(--se-b)), transparent);
+/* Scroll-edge affordance (installScrollEdges tags these + toggles se-top/se-
+   bottom). A sticky shadow overlay darkens an edge ONLY when there's hidden
+   content that way — a vignette that reads in dark themes (where a content fade
+   to bg was nearly invisible) and a drop-shadow in light. Theme-agnostic (semi-
+   transparent black) and nesting-safe (each surface has its own). Sticky pseudo
+   + negative margin = zero layout impact. */
+.scroll-edges::before,
+.scroll-edges::after {
+  content: "";
+  display: block;
+  position: sticky;
+  height: 26px;
+  z-index: 3;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.15s ease;
 }
-.scroll-edges.se-top { --se-t: 20px; }
-.scroll-edges.se-bottom { --se-b: 20px; }
+.scroll-edges::before { top: 0; margin-bottom: -26px; background: linear-gradient(to bottom, rgba(0, 0, 0, 0.55), transparent); }
+.scroll-edges::after { bottom: 0; margin-top: -26px; background: linear-gradient(to top, rgba(0, 0, 0, 0.55), transparent); }
+.scroll-edges.se-top::before { opacity: 1; }
+.scroll-edges.se-bottom::after { opacity: 1; }
 .chat-content { max-width: var(--chat-width, 860px); margin: 0 auto; }
 /* Revealed once positioned (see ChatView ready signal) — the initial scroll
    jump happens while hidden, then a quick fade in. */
