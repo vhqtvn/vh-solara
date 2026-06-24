@@ -897,10 +897,11 @@ body {
 
 .msg {
   margin: 0 0 18px;
-  /* Browser-native lazy rendering: off-screen messages skip layout/paint, and
-     the browser remembers their real size, so scroll height stays stable. */
-  content-visibility: auto;
-  contain-intrinsic-size: auto 60px;
+  /* No content-visibility here: it collapses off-screen messages to an estimated
+     size and expands them to real height when revealed, which shifts layout above
+     the viewport and makes scrolling UP jump. Laying messages out for real keeps
+     scroll position stable (native overflow-anchor on .chat-scroll handles the
+     async raw->rendered height change). */
 }
 .msg-head {
   display: flex;
@@ -1084,9 +1085,11 @@ body {
   font: 12px/1.5 ui-monospace, Menlo, monospace;
   white-space: pre-wrap;
 }
-/* JSON/XML tool output rendered through the markdown code path: drop the inner
-   .md margins and let the highlighted <pre> fill the tool body. */
-.tool-output-code { margin-left: 20px; }
+/* JSON/XML tool output rendered through the markdown code path: the highlighted
+   <pre> is the single scroll surface, so the wrapper must NOT also scroll — drop
+   its own max-height/overflow/padding (otherwise you get two nested scrollbars).
+   overflow:hidden just clips the inner square corners to the wrapper's radius. */
+.tool-output-code { margin-left: 20px; padding: 0; max-height: none; overflow: hidden; }
 
 /* Activity timeline: a run of tool/reasoning parts collapsed under one header
    (OpenChamber-style), each row expandable to full detail. */
