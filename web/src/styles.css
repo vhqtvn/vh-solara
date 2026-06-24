@@ -3,9 +3,6 @@
   /* Allow height:auto transitions (activity/tool expand animations). Ignored by
      browsers without support — those just snap. */
   interpolate-size: allow-keywords;
-  /* Scroll-edge fade color: a faint LIGHT edge on dark themes (a darkening
-     vignette was nearly invisible there); flipped to dark on light themes. */
-  --scroll-shadow: rgba(255, 255, 255, 0.24);
   --bg: #0d1117;
   --bg-2: #11161d;
   --border: #21262d;
@@ -191,7 +188,7 @@
 /* On light themes the most-prominent text must be dark, not white. */
 /* Light-theme overrides apply to ALL light themes via the generic marker class
    (set in theme.ts), so Shire (light) gets them too — not just `light`. */
-:root.theme-light-scoped { --fg-strong: var(--fg); --danger-fg: #cf222e; --accent-fg: #fff; --scroll-shadow: rgba(0, 0, 0, 0.3); }
+:root.theme-light-scoped { --fg-strong: var(--fg); --danger-fg: #cf222e; --accent-fg: #fff; }
 :root.theme-light-scoped .vh-diff-add { background: #e6ffec; color: #1f2328; }
 :root.theme-light-scoped .vh-diff-del { background: #ffebe9; color: #1f2328; }
 :root.theme-light-scoped .vh-diff-hunk { background: #ddf4ff; color: #0969da; }
@@ -862,17 +859,17 @@ body {
 .chat-scroll { flex: 1; overflow-y: auto; overflow-anchor: auto; padding: 16px; overscroll-behavior: contain; }
 
 /* Scroll-edge affordance (installScrollEdges tags these + toggles se-top/se-
-   bottom). An INSET box-shadow fades an edge ONLY when there's hidden content
-   that way. Inset shadow paints on the border box, so it's always flush with the
-   visible edge regardless of the container's padding (a sticky pseudo gets
-   clamped inside the padding and can't reach the edge). Theme-aware via
-   --scroll-shadow (light edge on dark, dark on light); nesting-safe. */
-.scroll-edges { transition: box-shadow 0.15s ease; }
-.scroll-edges.se-top { box-shadow: inset 0 17px 14px -14px var(--scroll-shadow); }
-.scroll-edges.se-bottom { box-shadow: inset 0 -17px 14px -14px var(--scroll-shadow); }
-.scroll-edges.se-top.se-bottom {
-  box-shadow: inset 0 17px 14px -14px var(--scroll-shadow), inset 0 -17px 14px -14px var(--scroll-shadow);
+   bottom). The edge content DISSOLVES to transparent only where there's hidden
+   content that way — a mask on the element, so it's flush regardless of padding
+   and inherently theme-aware (no color: pure transparency). Nesting-safe. */
+.scroll-edges {
+  --mt: 0px;
+  --mb: 0px;
+  -webkit-mask-image: linear-gradient(to bottom, transparent, #000 var(--mt), #000 calc(100% - var(--mb)), transparent);
+  mask-image: linear-gradient(to bottom, transparent, #000 var(--mt), #000 calc(100% - var(--mb)), transparent);
 }
+.scroll-edges.se-top { --mt: 24px; }
+.scroll-edges.se-bottom { --mb: 24px; }
 .chat-content { max-width: var(--chat-width, 860px); margin: 0 auto; }
 /* Revealed once positioned (see ChatView ready signal) — the initial scroll
    jump happens while hidden, then a quick fade in. */
