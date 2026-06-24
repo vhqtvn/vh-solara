@@ -837,6 +837,18 @@ body {
   .session-progress-bar { animation: none; clip-path: none; opacity: 0.7; }
 }
 .chat-scroll { flex: 1; overflow-y: auto; overflow-anchor: auto; padding: 16px; overscroll-behavior: contain; }
+
+/* Scroll-edge fade affordance (installScrollEdges tags these). The mask fades a
+   ~20px edge ONLY when there's hidden content that way (se-top/se-bottom toggled
+   in JS), so overflow is visible without arrows. Theme-agnostic + nesting-safe. */
+.scroll-edges {
+  --se-t: 0px;
+  --se-b: 0px;
+  -webkit-mask-image: linear-gradient(to bottom, transparent, #000 var(--se-t), #000 calc(100% - var(--se-b)), transparent);
+  mask-image: linear-gradient(to bottom, transparent, #000 var(--se-t), #000 calc(100% - var(--se-b)), transparent);
+}
+.scroll-edges.se-top { --se-t: 20px; }
+.scroll-edges.se-bottom { --se-b: 20px; }
 .chat-content { max-width: var(--chat-width, 860px); margin: 0 auto; }
 /* Revealed once positioned (see ChatView ready signal) — the initial scroll
    jump happens while hidden, then a quick fade in. */
