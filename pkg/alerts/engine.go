@@ -68,6 +68,16 @@ func (e *Engine) Attach(ctx context.Context, dir string, store *state.Store) {
 		firedReq: map[string]bool{},
 		now:      time.Now,
 	}
+	// Default delivery: in-app fan-out + outbound channels + Web Push. Tests swap
+	// this for a capturing sink to assert which notices fire.
+	w.deliver = func(n Notice) {
+		payload, _ := json.Marshal(n)
+		store.EmitNotice(payload)
+		e.dispatcher.Dispatch(n)
+		if e.pusher != nil {
+			e.pusher.Send(n)
+		}
+	}
 	e.watchers[dir] = w
 	e.mu.Unlock()
 	go w.run(ctx)
@@ -102,8 +112,9 @@ type watcher struct {
 	dir    string
 	store  *state.Store
 
-	baseline uint64 // snapshot head seq; only events past this may FIRE
+	baseline uint64        // snapshot head seq; only events past this may FIRE
 	now      func() time.Time
+	deliver  func(Notice) // delivery sink (swapped in tests)
 
 	mu       sync.Mutex
 	sessions map[string]*sessTrack
@@ -441,10 +452,5 @@ func (w *watcher) fire(sid, typ, detail string) {
 		Detail:    detail,
 		Ts:        w.now().UnixMilli(),
 	}
-	payload, _ := json.Marshal(n)
-	w.store.EmitNotice(payload)
-	w.engine.dispatcher.Dispatch(n)
-	if w.engine.pusher != nil {
-		w.engine.pusher.Send(n)
-	}
+	w.deliver(n)
 }
