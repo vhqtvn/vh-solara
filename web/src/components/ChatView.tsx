@@ -1,6 +1,6 @@
-import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show } from "solid-js";
+import { createEffect, createMemo, createSignal, For, Match, on, onCleanup, onMount, Show, Switch } from "solid-js";
 import { Portal } from "solid-js/web";
-import { ackSession, createSession, isSending, markSessionIdle, openSession, respondPermission, sessionTodoCounts, sessionWorking, setSelectedId, setSending, state } from "../sync";
+import { ackSession, createSession, isSending, markSessionIdle, openSession, respondPermission, sessionTodoCounts, sessionTodos, sessionWorking, setSelectedId, setSending, state } from "../sync";
 import { getScroll, setScroll } from "../lib/scroll";
 import { chooseVariant, findModel, loadModels, models, selectionFor } from "../models";
 import { loadVersioned, saveVersioned } from "../lib/store";
@@ -18,6 +18,8 @@ import { Deferred } from "./Deferred";
 const EAGER_TAIL = 30;
 import QuestionCard from "./QuestionCard";
 import Icon from "./Icon";
+import Spinner from "./Spinner";
+import { isDesktop } from "../layout";
 import BrandMark from "./BrandMark";
 import { pushNotification } from "../notify";
 import { log } from "../lib/log";
@@ -259,6 +261,20 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     const s = sm();
     return s ? s.order.map((id) => s.byId[id]) : [];
   });
+  // Chat navigator: a faint strip of markers (one per user turn) on the right
+  // edge — click to jump. Cheap: just markers + a tooltip, no rendered minimap.
+  // (Defined after `messages` — createMemo runs eagerly, so it must not read it
+  // before init.)
+  const userTurns = createMemo(() => messages().filter((m: any) => m.info?.role === "user"));
+  const turnText = (m: any) => {
+    const pid = (m.partOrder || []).find((id: string) => m.parts[id]?.type === "text");
+    const t = (pid && m.parts[pid]?.text) || "";
+    return t.replace(/\s+/g, " ").trim().slice(0, 140) || "(message)";
+  };
+  const jumpToMsg = (id: string) => {
+    const sel = `[data-mid="${typeof CSS !== "undefined" && CSS.escape ? CSS.escape(id) : id}"]`;
+    scrollEl?.querySelector(sel)?.scrollIntoView({ behavior: "smooth", block: "start" });
+  };
 
   const pendingPermissions = createMemo(() => Object.values(state.permissions[props.sessionId] || {}));
   const pendingQuestions = createMemo(() => Object.values(state.questions[props.sessionId] || {}));
@@ -323,9 +339,48 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   });
   // Agent todo list (OpenCode TodoWrite) → "Tasks N active · M left" pill.
   const todoCounts = createMemo(() => sessionTodoCounts(props.sessionId));
-  const todoItems = createMemo(() => (props.sessionId ? state.todos[props.sessionId] || [] : []));
+  const todoItems = createMemo(() => sessionTodos(props.sessionId));
   const [todosOpen, setTodosOpen] = createSignal(false);
   let tasksBarEl: HTMLDivElement | undefined;
+  let tasksListEl: HTMLUListElement | undefined;
+  // The popover is anchored bottom-right, so resizing means changing its size
+  // (it grows up/left). A top-left grip drags it; size persists. Restore on open.
+  const TASKS_SIZE_KEY = "vh.prefs.tasksSize.v1";
+  const restoreTasksSize = (el: HTMLUListElement) => {
+    try {
+      const s = JSON.parse(localStorage.getItem(TASKS_SIZE_KEY) || "null");
+      if (s?.w) el.style.width = s.w;
+      if (s?.h) { el.style.height = s.h; el.style.maxHeight = s.h; }
+    } catch {
+      /* ignore */
+    }
+  };
+  const startTasksResize = (e: PointerEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const el = tasksListEl;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    const sx = e.clientX, sy = e.clientY, sw = r.width, sh = r.height;
+    const move = (ev: PointerEvent) => {
+      const w = Math.max(220, Math.min(560, sw + (sx - ev.clientX))); // drag left → wider
+      const h = Math.max(120, Math.min(window.innerHeight * 0.72, sh + (sy - ev.clientY))); // drag up → taller
+      el.style.width = `${w}px`;
+      el.style.height = `${h}px`;
+      el.style.maxHeight = `${h}px`;
+    };
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      try {
+        localStorage.setItem(TASKS_SIZE_KEY, JSON.stringify({ w: el.style.width, h: el.style.height }));
+      } catch {
+        /* ignore */
+      }
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  };
   // Close the overlay popover on outside click. Listener lives only while open;
   // onCleanup re-runs when todosOpen flips false, so nothing leaks.
   createEffect(() => {
@@ -940,7 +995,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
         <div class="chat-content" ref={contentEl} classList={{ ready: ready() }}>
           <For each={messages()}>
             {(m, i) => (
-              <div class="msg" classList={{ user: m.info.role === "user", assistant: m.info.role === "assistant" }}>
+              <div class="msg" data-mid={m.id} classList={{ user: m.info.role === "user", assistant: m.info.role === "assistant" }}>
                 <div class="msg-head">
                   <span class="msg-role">{roleLabel(m.info.role)}</span>
                   <Show when={modelLabel(m.info)}>
@@ -997,6 +1052,16 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       </div>
       </Show>
 
+      <Show when={!props.draft && isDesktop() && userTurns().length > 1}>
+        <div class="chat-nav" aria-label="Jump to a turn">
+          <For each={userTurns()}>
+            {(m) => (
+              <button type="button" class="chat-nav-dot" title={turnText(m)} aria-label={turnText(m)} onClick={() => jumpToMsg(m.id)} />
+            )}
+          </For>
+        </div>
+      </Show>
+
       <Show when={!following()}>
         <button type="button" class="jump" onClick={jumpToLatest}>
           <Icon name="arrowDown" size={14} /> Latest
@@ -1047,11 +1112,19 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
             <span class="tasks-chev" classList={{ rot: todosOpen() }}><Icon name="chevronDown" size={12} /></span>
           </button>
           <Show when={todosOpen()}>
-            <ul class="tasks-list">
+            <ul class="tasks-list" ref={(el) => { tasksListEl = el; restoreTasksSize(el); }}>
+              {/* Top-left grip: drag to resize (grows up/left from the anchor). */}
+              <span class="tasks-resize" title="Drag to resize" onPointerDown={startTasksResize} />
               <For each={todoItems()}>
                 {(t) => (
                   <li class="tasks-item" classList={{ done: t.status === "completed", active: t.status === "in_progress", cancelled: t.status === "cancelled" }}>
-                    <span class="tasks-item-dot" />
+                    <span class="tasks-item-ico">
+                      <Switch fallback={<span class="tasks-pending" />}>
+                        <Match when={t.status === "in_progress"}><Spinner size={13} /></Match>
+                        <Match when={t.status === "completed"}><Icon name="check" size={13} /></Match>
+                        <Match when={t.status === "cancelled"}><Icon name="x" size={12} /></Match>
+                      </Switch>
+                    </span>
                     <span class="tasks-item-text">{t.content || "(untitled)"}</span>
                   </li>
                 )}

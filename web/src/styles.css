@@ -1,5 +1,8 @@
 :root {
   color-scheme: dark;
+  /* Allow height:auto transitions (activity/tool expand animations). Ignored by
+     browsers without support — those just snap. */
+  interpolate-size: allow-keywords;
   --bg: #0d1117;
   --bg-2: #11161d;
   --border: #21262d;
@@ -810,6 +813,23 @@ body {
 /* --- chat --- */
 .chat { display: flex; flex-direction: column; flex: 1; min-width: 0; position: relative; }
 
+/* Chat navigator: a faint vertical strip of markers (one per user turn) pinned
+   to the chat's right edge. Click a marker to jump to that turn; hover reveals
+   its text (native title). Faint until hovered so it stays out of the way. */
+.chat-nav {
+  position: absolute; right: 3px; top: 50%; transform: translateY(-50%);
+  display: flex; flex-direction: column; gap: 5px; align-items: flex-end;
+  max-height: 70%; overflow: hidden; padding: 6px 2px; z-index: 20;
+  opacity: 0.3; transition: opacity 0.15s ease;
+}
+.chat-nav:hover { opacity: 1; }
+.chat-nav-dot {
+  width: 16px; height: 4px; border-radius: 2px; padding: 0; border: 0; cursor: pointer;
+  background: var(--fg-dim); transition: width 0.12s ease, background 0.12s ease;
+}
+.chat-nav-dot:hover { width: 24px; background: var(--accent); }
+@media (pointer: coarse) { .chat-nav { display: none; } }
+
 /* opencode-style "running" progress bar (a whipping fill) while working. */
 .session-progress {
   position: absolute;
@@ -1005,7 +1025,7 @@ body {
 
 /* Compact activity row (used inside .activity). The whole head is the toggle;
    expanding reveals the command + output below. */
-.tool { border-radius: 7px; margin: 0; overflow: hidden; }
+.tool { border-radius: 7px; margin: 0; overflow: hidden; transition: height 0.18s var(--ease, ease); }
 .tool-head {
   display: flex;
   align-items: center;
@@ -1097,6 +1117,11 @@ body {
   margin: 2px 0 0 7px; padding-left: 12px;
   border-left: 1px solid var(--border);
   display: flex; flex-direction: column; gap: 1px;
+  /* Smoothly grow/shrink when toggling the group or expanding a tool row.
+     interpolate-size lets height:auto transition (Chrome 129+); degrades to an
+     instant change elsewhere. overflow:clip so revealed rows don't spill mid-anim. */
+  overflow: clip;
+  transition: height 0.2s var(--ease, ease);
 }
 .activity-more {
   align-self: flex-start; background: transparent; border: 0; color: var(--fg-dim);
@@ -2196,17 +2221,32 @@ body {
 /* Float the expanded list as an overlay above the pill (OpenChamber-style) so it
    never reflows/shrinks the chat. Anchored to the chat-width-aligned bar. */
 .tasks-list {
-  list-style: none; margin: 0; padding: 8px 10px; text-align: left;
+  list-style: none; margin: 0; padding: 6px; text-align: left;
   position: absolute; bottom: calc(100% - 2px); right: 14px; z-index: 45;
-  min-width: 240px; max-width: 460px;
+  min-width: 260px; width: 340px; max-width: min(560px, calc(100vw - 28px));
   background: var(--bg-2); border: 1px solid var(--border); border-radius: 10px;
   box-shadow: var(--shadow-lg, 0 12px 40px #0009);
-  max-height: 280px; overflow-y: auto;
+  height: 300px; max-height: min(70vh, 460px); overflow-y: auto; overscroll-behavior: contain;
 }
-.tasks-item { display: flex; align-items: flex-start; gap: 8px; padding: 3px 0; font-size: 13px; color: var(--fg); }
-.tasks-item-dot { flex: none; width: 8px; height: 8px; margin-top: 5px; border-radius: 50%; border: 1.5px solid var(--fg-dim); }
-.tasks-item.active .tasks-item-dot { border-color: var(--accent); background: var(--accent); }
-.tasks-item.done .tasks-item-dot { border-color: var(--ok); background: var(--ok); }
+/* Top-left resize grip (the popover grows up/left from its bottom-right anchor). */
+.tasks-resize {
+  position: absolute; top: 0; left: 0; width: 16px; height: 16px; cursor: nwse-resize; z-index: 2;
+  background: linear-gradient(135deg, var(--fg-dim) 0 2px, transparent 2px) no-repeat 3px 3px / 7px 7px;
+  opacity: 0.5;
+}
+.tasks-resize:hover { opacity: 1; }
+.tasks-item {
+  display: flex; align-items: flex-start; gap: 8px; padding: 6px 8px; border-radius: 7px;
+  font-size: 13px; line-height: 1.35; color: var(--fg);
+}
+.tasks-item:hover { background: color-mix(in srgb, var(--fg) 7%, transparent); }
+.tasks-item-ico { flex: none; width: 14px; height: 14px; margin-top: 1px; display: inline-flex; align-items: center; justify-content: center; }
+.tasks-item.active .tasks-item-ico { color: var(--accent); }
+.tasks-item.done .tasks-item-ico { color: var(--ok); }
+.tasks-item.cancelled .tasks-item-ico { color: var(--fg-dim); }
+/* Pending = hollow circle. */
+.tasks-pending { width: 10px; height: 10px; border-radius: 50%; border: 1.5px solid var(--fg-dim); }
+.tasks-item-text { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 .tasks-item.done .tasks-item-text { color: var(--fg-dim); text-decoration: line-through; }
 .tasks-item.cancelled .tasks-item-text { color: var(--fg-dim); text-decoration: line-through; opacity: 0.7; }
 
