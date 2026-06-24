@@ -18,6 +18,7 @@ import {
   sendTestChannel,
   type AlertConfig,
   type AlertChannel,
+  type ChannelType,
   type DeviceScope,
 } from "../alertsApi";
 
@@ -58,7 +59,7 @@ export default function NotificationsSettings() {
     const n = draft.channels.length + 1;
     setDraft("channels", (xs) => [
       ...xs,
-      { id: `webhook-${n}`, type: "generic", url: "", enabled: true, hasSecret: false, secret: "" },
+      { id: `channel-${n}`, type: "generic", url: "", enabled: true, hasSecret: false, secret: "", command: "", args: [] },
     ]);
     setDirty(true);
   };
@@ -87,9 +88,14 @@ export default function NotificationsSettings() {
   };
 
   const test = async (id: string) => {
-    setNote({ ok: true, msg: "Sending test…" });
+    const isCmd = draft.channels.find((c) => c.id === id)?.type === "command";
+    setNote({ ok: true, msg: isCmd ? "Running command…" : "Sending test…" });
     const r = await sendTestChannel(id);
-    setNote(r.ok ? { ok: true, msg: `Test sent (HTTP ${r.status}).` } : { ok: false, msg: `Test failed: ${r.error || r.status}` });
+    if (r.ok) {
+      setNote({ ok: true, msg: isCmd ? "Command ran (exit 0)." : `Test sent (HTTP ${r.status}).` });
+    } else {
+      setNote({ ok: false, msg: `Test failed: ${r.error || r.status}` });
+    }
   };
 
   const saveDetect = async (patch: Partial<AlertConfig["detect"]>) => {
@@ -177,18 +183,28 @@ export default function NotificationsSettings() {
               </Show>
 
               {/* Channels ------------------------------------------------------ */}
-              <h4 class="settings-group-title">Webhook channels</h4>
+              <h4 class="settings-group-title">Alert channels</h4>
               <For each={draft.channels} fallback={<p class="setting-hint">No channels yet.</p>}>
                 {(ch, i) => (
                   <div class="notif-channel">
                     <div class="setting-row">
                       <input
                         class="theme-select"
-                        aria-label="Channel id"
+                        aria-label="Channel name"
                         placeholder="name"
                         value={ch.id}
                         onInput={(e) => editChannel(i(), { id: e.currentTarget.value })}
                         style={{ "max-width": "9rem" }}
+                      />
+                      <Select
+                        class="theme-select"
+                        ariaLabel="Channel type"
+                        value={ch.type}
+                        options={[
+                          { value: "generic", label: "Webhook" },
+                          { value: "command", label: "Local command" },
+                        ]}
+                        onChange={(v) => editChannel(i(), { type: v as ChannelType })}
                       />
                       <input
                         type="checkbox"
@@ -200,23 +216,52 @@ export default function NotificationsSettings() {
                         <Icon name="x" />
                       </button>
                     </div>
-                    <input
-                      class="theme-select notif-wide"
-                      aria-label="Webhook URL"
-                      placeholder="https://… (or ${VH_ALERT_URL})"
-                      value={ch.url}
-                      onInput={(e) => editChannel(i(), { url: e.currentTarget.value })}
-                    />
-                    <input
-                      class="theme-select notif-wide"
-                      type="password"
-                      aria-label="HMAC secret"
-                      placeholder={ch.hasSecret ? "•••••• (unchanged — type to replace)" : "HMAC secret (optional)"}
-                      value={ch.secret || ""}
-                      onInput={(e) => editChannel(i(), { secret: e.currentTarget.value })}
-                    />
+
+                    <Show
+                      when={ch.type === "command"}
+                      fallback={
+                        <>
+                          <input
+                            class="theme-select notif-wide"
+                            aria-label="Webhook URL"
+                            placeholder="https://… (or ${VH_ALERT_URL})"
+                            value={ch.url}
+                            onInput={(e) => editChannel(i(), { url: e.currentTarget.value })}
+                          />
+                          <input
+                            class="theme-select notif-wide"
+                            type="password"
+                            aria-label="HMAC secret"
+                            placeholder={ch.hasSecret ? "•••••• (unchanged — type to replace)" : "HMAC secret (optional)"}
+                            value={ch.secret || ""}
+                            onInput={(e) => editChannel(i(), { secret: e.currentTarget.value })}
+                          />
+                        </>
+                      }
+                    >
+                      <input
+                        class="theme-select notif-wide"
+                        aria-label="Command"
+                        placeholder="/path/to/notify.sh (or ${VH_ALERT_CMD})"
+                        value={ch.command || ""}
+                        onInput={(e) => editChannel(i(), { command: e.currentTarget.value })}
+                      />
+                      <input
+                        class="theme-select notif-wide"
+                        aria-label="Command arguments"
+                        placeholder="arguments, space-separated (optional)"
+                        value={(ch.args || []).join(" ")}
+                        onInput={(e) => editChannel(i(), { args: e.currentTarget.value.split(/\s+/).filter(Boolean) })}
+                      />
+                    </Show>
+
                     <div class="setting-row">
-                      <button type="button" class="btn" onClick={() => void test(ch.id)} disabled={!ch.url}>
+                      <button
+                        type="button"
+                        class="btn"
+                        onClick={() => void test(ch.id)}
+                        disabled={ch.type === "command" ? !ch.command : !ch.url}
+                      >
                         Send test
                       </button>
                     </div>
@@ -230,9 +275,16 @@ export default function NotificationsSettings() {
                 </Show>
               </div>
               <p class="setting-hint">
-                Each notice is POSTed as JSON. With a secret set, requests carry an
-                <code> X-VH-Signature: sha256=… </code> HMAC over the body. Use <code>${"{VH_ALERT_*}"}</code> in a
-                URL/secret to read it from the daemon's environment instead of storing it in the file.
+                <strong>Webhook:</strong> the notice is POSTed as JSON; with a secret set, requests carry an
+                <code> X-VH-Signature: sha256=… </code> HMAC over the body.
+                <br />
+                <strong>Local command:</strong> the program runs on the daemon with the notice in its
+                environment — <code>VH_ALERT_TYPE</code>, <code>VH_ALERT_TITLE</code>, <code>VH_ALERT_PROJECT</code>,
+                <code>VH_ALERT_DETAIL</code>, <code>VH_ALERT_SESSION</code>, <code>VH_ALERT_ROOT</code>,
+                <code>VH_ALERT_TS</code>, and <code>VH_ALERT_JSON</code>.
+                <br />
+                Use <code>${"{VH_ALERT_*}"}</code> in any field to read it from the daemon's environment instead of
+                storing it in the file.
               </p>
 
               {/* Advanced ------------------------------------------------------ */}

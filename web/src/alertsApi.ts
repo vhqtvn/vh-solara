@@ -5,13 +5,17 @@
 export type ChannelPolicy = "always" | "when_unattended" | "never";
 export type DeviceScope = "off" | "current" | "all";
 
+export type ChannelType = "generic" | "command";
+
 export interface AlertChannel {
   id: string;
-  type: string;
+  type: ChannelType;
   url: string;
   enabled: boolean;
   hasSecret?: boolean; // from server (masked)
   secret?: string; // outbound only (a new/changed secret)
+  command?: string; // command type: executable/script path
+  args?: string[]; // command type: optional args
 }
 
 export interface AlertProfile {

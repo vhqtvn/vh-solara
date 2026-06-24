@@ -45,14 +45,24 @@ const (
 	ScopeAll     = "all"     // any session
 )
 
-// Channel is one outbound webhook target. Secrets support ${VH_...} env refs so
-// they needn't be written into the file in clear.
+// Channel types.
+const (
+	ChannelWebhook = "generic" // POST the notice JSON to a URL
+	ChannelCommand = "command" // run a local program, notice fields in the env
+)
+
+// Channel is one alert consumer. A "generic" channel POSTs the notice to a
+// webhook URL; a "command" channel runs a local program with the notice fields
+// in its environment (VH_ALERT_*). url/secret/command/args support ${VH_...}
+// env refs so secrets needn't be written into the file in clear.
 type Channel struct {
-	ID      string `json:"id"`
-	Type    string `json:"type"` // currently only "generic"
-	URL     string `json:"url"`
-	Secret  string `json:"secret,omitempty"` // HMAC-SHA256 signing key (optional)
-	Enabled bool   `json:"enabled"`
+	ID      string   `json:"id"`
+	Type    string   `json:"type"` // "generic" (webhook) | "command" (local exec)
+	URL     string   `json:"url,omitempty"`
+	Secret  string   `json:"secret,omitempty"`  // HMAC-SHA256 signing key (webhook, optional)
+	Command string   `json:"command,omitempty"` // executable/script path (command type)
+	Args    []string `json:"args,omitempty"`    // optional args (command type)
+	Enabled bool     `json:"enabled"`
 }
 
 // Profile bundles routing for a mode ("At desk", "Away", "Silent", …). Switch
@@ -235,6 +245,14 @@ func (s *Store) resolvedChannel(id string) (Channel, bool) {
 		if c.ID == id {
 			c.URL = resolveEnv(c.URL)
 			c.Secret = resolveEnv(c.Secret)
+			c.Command = resolveEnv(c.Command)
+			if len(c.Args) > 0 {
+				args := make([]string, len(c.Args))
+				for i, a := range c.Args {
+					args[i] = resolveEnv(a)
+				}
+				c.Args = args
+			}
 			return c, true
 		}
 	}

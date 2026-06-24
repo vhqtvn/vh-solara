@@ -46,12 +46,14 @@ func (alertsFeature) Name() string { return "alerts" }
 
 // wireChannel is the masked, client-facing channel shape.
 type wireChannel struct {
-	ID        string `json:"id"`
-	Type      string `json:"type"`
-	URL       string `json:"url"`
-	Enabled   bool   `json:"enabled"`
-	HasSecret bool   `json:"hasSecret"`
-	Secret    string `json:"secret,omitempty"` // inbound only (a new/changed secret)
+	ID        string   `json:"id"`
+	Type      string   `json:"type"`
+	URL       string   `json:"url"`
+	Enabled   bool     `json:"enabled"`
+	HasSecret bool     `json:"hasSecret"`
+	Secret    string   `json:"secret,omitempty"` // inbound only (a new/changed secret)
+	Command   string   `json:"command"`
+	Args      []string `json:"args"`
 }
 
 type wireConfig struct {
@@ -64,9 +66,13 @@ type wireConfig struct {
 func maskConfig(c alerts.Config) wireConfig {
 	out := wireConfig{Profiles: c.Profiles, Active: c.Active, Detect: c.Detect}
 	for _, ch := range c.Channels {
+		args := ch.Args
+		if args == nil {
+			args = []string{}
+		}
 		out.Channels = append(out.Channels, wireChannel{
 			ID: ch.ID, Type: ch.Type, URL: ch.URL, Enabled: ch.Enabled,
-			HasSecret: ch.Secret != "",
+			HasSecret: ch.Secret != "", Command: ch.Command, Args: args,
 		})
 	}
 	if out.Channels == nil {
@@ -91,8 +97,15 @@ func mergeConfig(prev alerts.Config, in wireConfig) alerts.Config {
 		if secret == "" {
 			secret = prevSecret[ch.ID] // keep stored secret (write-only field)
 		}
+		var args []string
+		for _, a := range ch.Args {
+			if a != "" {
+				args = append(args, a)
+			}
+		}
 		out.Channels = append(out.Channels, alerts.Channel{
 			ID: ch.ID, Type: ch.Type, URL: ch.URL, Enabled: ch.Enabled, Secret: secret,
+			Command: ch.Command, Args: args,
 		})
 	}
 	if out.Channels == nil {
