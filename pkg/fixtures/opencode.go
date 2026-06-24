@@ -140,7 +140,9 @@ func New() *FakeOpenCode {
 				"model": map[string]any{"providerID": "fake", "modelID": "dummy-think", "variant": "high"}},
 			Parts: []map[string]any{
 				{"id": "p10", "sessionID": "demo", "messageID": "m6", "type": "reasoning",
-					"text": "I'll add a table-driven benchmark next to the parser tests, then run it.",
+					"text": strings.Repeat("I'll add a table-driven benchmark next to the parser tests, then run it. "+
+						"First I need to check the existing harness, the input fixtures, and the timer setup so the "+
+						"numbers are comparable across runs. ", 14),
 					"time": map[string]any{"start": now - 175, "end": now - 150}},
 				{"id": "p11", "sessionID": "demo", "messageID": "m6", "type": "tool", "callID": "c5", "tool": "bash",
 					"state": map[string]any{"status": "running", "title": "go test -bench .",

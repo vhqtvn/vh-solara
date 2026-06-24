@@ -963,7 +963,7 @@ body {
 }
 
 .reasoning { color: var(--fg-dim); margin: 0; border-radius: 7px; }
-.reasoning-body { margin: 2px 0 6px 20px; }
+.reasoning-body { margin: 2px 0 6px 20px; max-height: 320px; overflow-y: auto; overscroll-behavior: contain; }
 .reasoning-time { font-size: 11px; color: var(--fg-dim); font-variant-numeric: tabular-nums; }
 /* Pulse the duration while the model is actively thinking. */
 .reasoning-time.live { color: var(--accent); animation: pulse 1.1s ease-in-out infinite; }
@@ -2923,12 +2923,13 @@ div.katex-math { display: block; overflow-x: auto; margin: 0.7em 0; text-align: 
    shrink-to-fit bubble capped at a fraction of the column (Claude/OpenChamber
    style). Assistant turns stay full-width prose. Gated by the root class so it
    can be switched off, falling back to the quiet full-width card above. */
-.chat-bubbles .msg.user { display: flex; flex-direction: column; align-items: flex-end; position: relative; }
+.chat-bubbles .msg.user { display: flex; flex-direction: column; align-items: flex-end; }
 .chat-bubbles .msg.user .msg-head { max-width: 85%; }
-/* Hover actions float at the row's top-left instead of reserving width in the
-   header — that reserved width (invisible buttons) shoved "You · time" off the
-   bubble's right edge. Out of flow, the label aligns flush with the bubble. */
-.chat-bubbles .msg.user .msg-actions { position: absolute; top: 2px; left: 0; margin: 0; }
+/* Actions sit to the LEFT of "You · time" within the right-aligned header (order
+   -1, no auto margin). The label stays flush with the bubble's right edge, the
+   buttons are right beside it (not floated to the far left), and the reserved
+   width means no layout shift when they fade in on hover. */
+.chat-bubbles .msg.user .msg-actions { order: -1; margin-left: 0; }
 .chat-bubbles .msg.user .msg-parts {
   max-width: 85%;
   text-align: left; /* content reads L-to-R inside the right-aligned bubble */

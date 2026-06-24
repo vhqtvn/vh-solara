@@ -211,7 +211,9 @@ function Markdown(props: { text: string; settled: boolean; caret?: boolean }) {
   // (the message the user is watching). History blocks are created already
   // settled → false → cheap raw fallback (no per-block client parse on load).
   const live = !props.settled;
-  const [streamHtml, setStreamHtml] = createSignal("");
+  // Seed synchronously so a (re)mount shows formatted content immediately rather
+  // than an empty frame; the debounced effect keeps it current as tokens arrive.
+  const [streamHtml, setStreamHtml] = createSignal(!props.settled && streamLive() ? renderStreamMd(props.text) : "");
   let timer: number | undefined;
   createEffect(() => {
     const text = props.text;
@@ -427,6 +429,25 @@ function ReasoningPart(props: { part: Part; settled: boolean; tail?: boolean }) 
   // live thinking) — no truncated snippet in the header; the body is the content.
   const expanded = () => partOpen[props.part.id] ?? !!props.tail;
   const toggle = () => setPartOpen(props.part.id, !expanded());
+  // Bounded, scrollable body that sticks to the bottom while streaming — unless
+  // the user scrolled up (then it stays put). A ResizeObserver on the content
+  // re-anchors when new tokens grow it; onScroll tracks whether we're stuck.
+  let bodyEl: HTMLDivElement | undefined;
+  let contentEl: HTMLDivElement | undefined;
+  let stick = true;
+  const onScroll = () => {
+    const e = bodyEl;
+    if (e) stick = e.scrollHeight - e.scrollTop - e.clientHeight < 24;
+  };
+  createEffect(() => {
+    if (!expanded() || !bodyEl || !contentEl) return;
+    stick = true; // (re)opening starts anchored at the bottom
+    const ro = new ResizeObserver(() => {
+      if (stick && bodyEl) bodyEl.scrollTop = bodyEl.scrollHeight;
+    });
+    ro.observe(contentEl);
+    onCleanup(() => ro.disconnect());
+  });
   return (
     <div class="reasoning" classList={{ open: expanded() }}>
       <button type="button" class="tool-head reasoning-head" onClick={toggle}>
@@ -439,8 +460,10 @@ function ReasoningPart(props: { part: Part; settled: boolean; tail?: boolean }) 
         <span class="tool-chev" classList={{ rot: expanded() }}><Icon name="chevronDown" size={12} /></span>
       </button>
       <Show when={expanded()}>
-        <div class="reasoning-body">
-          <Markdown text={props.part.text || ""} settled={props.settled} caret={props.tail} />
+        <div class="reasoning-body" ref={bodyEl} onScroll={onScroll}>
+          <div ref={contentEl}>
+            <Markdown text={props.part.text || ""} settled={props.settled} caret={props.tail} />
+          </div>
         </div>
       </Show>
     </div>

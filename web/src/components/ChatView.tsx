@@ -159,15 +159,20 @@ function permDetail(p: any): string {
 // Group a message's parts for rendering: consecutive tool/reasoning parts fold
 // into one compact "Activity" timeline; text/file parts (and a lone reasoning
 // with no tools) render inline as before. Preserves part order.
-type RenderItem = { kind: "part"; part: any } | { kind: "activity"; parts: any[] };
+// RenderItem carries a `key` derived from the part-id composition. The key only
+// changes when a part is ADDED/REMOVED — not when a part's text grows — so a
+// streaming turn keeps the same keys token-to-token, letting MessageParts reuse
+// the row components (parts mutate in place; see upsertPart) instead of
+// recreating them every token.
+type RenderItem = { kind: "part"; part: any; key: string } | { kind: "activity"; parts: any[]; key: string };
 function groupParts(m: any): RenderItem[] {
   const items: RenderItem[] = [];
   let run: any[] = [];
   const flush = () => {
     if (!run.length) return;
     const hasTool = run.some((p) => p?.type === "tool");
-    if (run.length === 1 && !hasTool) items.push({ kind: "part", part: run[0] });
-    else items.push({ kind: "activity", parts: run });
+    if (run.length === 1 && !hasTool) items.push({ kind: "part", part: run[0], key: "p:" + run[0].id });
+    else items.push({ kind: "activity", parts: run, key: "a:" + run.map((p) => p.id).join(",") });
     run = [];
   };
   for (const pid of m.partOrder || []) {
@@ -176,11 +181,48 @@ function groupParts(m: any): RenderItem[] {
     if (p.type === "tool" || p.type === "reasoning") run.push(p);
     else {
       flush();
-      items.push({ kind: "part", part: p });
+      items.push({ kind: "part", part: p, key: "p:" + p.id });
     }
   }
   flush();
   return items;
+}
+
+// Renders one message's parts. Memoizes the render-items and REUSES the wrapper
+// object for an unchanged key, so the row components persist across streaming
+// tokens (no flashing/jumping) and update reactively via the in-place part refs.
+function MessageParts(props: { m: any; isLastMessage: () => boolean; lastActivityKey: () => string | null }) {
+  let cache = new Map<string, RenderItem>();
+  const items = createMemo(() => {
+    const fresh = groupParts(props.m);
+    const next = new Map<string, RenderItem>();
+    const out = fresh.map((it) => {
+      const reused = cache.get(it.key) ?? it;
+      next.set(it.key, reused);
+      return reused;
+    });
+    cache = next;
+    return out;
+  });
+  const settled = () => props.m.info.role === "user" || !!props.m.info.time?.completed;
+  const tailId = () =>
+    !settled() && props.isLastMessage() ? props.m.partOrder[props.m.partOrder.length - 1] : null;
+  return (
+    <For each={items()}>
+      {(it) =>
+        it.kind === "activity" ? (
+          <ActivityGroup
+            parts={it.parts}
+            settled={settled()}
+            tailId={tailId()}
+            isLast={it.parts[0]?.id === props.lastActivityKey()}
+          />
+        ) : (
+          <PartView part={it.part} settled={settled()} tail={it.part.id === tailId()} />
+        )
+      }
+    </For>
+  );
 }
 
 export default function ChatView(props: { sessionId: string; draft?: boolean }) {
@@ -931,28 +973,11 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
                   root={() => scrollEl}
                   minHeight={48}
                 >
-                  <For each={groupParts(m)}>
-                    {(it) => {
-                      const settled = m.info.role === "user" || !!m.info.time?.completed;
-                      // The blinking caret belongs only to the actively-streaming
-                      // tail — the last part of the in-flight (last, uncompleted)
-                      // message — not after every finished thinking/text block.
-                      const tailId =
-                        !settled && i() === messages().length - 1
-                          ? m.partOrder[m.partOrder.length - 1]
-                          : null;
-                      return it.kind === "activity" ? (
-                        <ActivityGroup
-                          parts={it.parts}
-                          settled={settled}
-                          tailId={tailId}
-                          isLast={it.parts[0]?.id === lastActivityKey()}
-                        />
-                      ) : (
-                        <PartView part={it.part} settled={settled} tail={it.part.id === tailId} />
-                      );
-                    }}
-                  </For>
+                  <MessageParts
+                    m={m}
+                    isLastMessage={() => i() === messages().length - 1}
+                    lastActivityKey={lastActivityKey}
+                  />
                 </Deferred>
                 <Show when={messageError(m.info)}>
                   <div class="msg-error">⚠ {messageError(m.info)}</div>

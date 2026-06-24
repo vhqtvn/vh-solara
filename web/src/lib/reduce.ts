@@ -94,8 +94,16 @@ export function upsertPart(sm: SessionMessages, part: Part): void {
     sm.byId[part.messageID] = msg;
     sm.order.push(part.messageID);
   }
-  if (!msg.parts[part.id]) msg.partOrder.push(part.id);
-  msg.parts[part.id] = part;
+  if (!msg.parts[part.id]) {
+    msg.partOrder.push(part.id);
+    msg.parts[part.id] = part;
+  } else {
+    // Merge in place so the stored part KEEPS ITS REFERENCE. The chat groups
+    // parts into row components keyed by identity; replacing the object each
+    // streaming token would recreate the row (the Thinking block flashing empty
+    // and losing scroll). Mutating fields updates them reactively instead.
+    Object.assign(msg.parts[part.id], part);
+  }
 }
 
 export function deletePart(sm: SessionMessages, messageID: string, partID: string): void {
