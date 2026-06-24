@@ -342,11 +342,13 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   const todoItems = createMemo(() => sessionTodos(props.sessionId));
   const [todosOpen, setTodosOpen] = createSignal(false);
   let tasksBarEl: HTMLDivElement | undefined;
-  let tasksListEl: HTMLUListElement | undefined;
+  let tasksPopupEl: HTMLDivElement | undefined;
   // The popover is anchored bottom-right, so resizing means changing its size
   // (it grows up/left). A top-left grip drags it; size persists. Restore on open.
+  // The grip lives on the popup shell (not the inner scroller) so it stays put
+  // when the task list is scrolled.
   const TASKS_SIZE_KEY = "vh.prefs.tasksSize.v1";
-  const restoreTasksSize = (el: HTMLUListElement) => {
+  const restoreTasksSize = (el: HTMLElement) => {
     try {
       const s = JSON.parse(localStorage.getItem(TASKS_SIZE_KEY) || "null");
       if (s?.w) el.style.width = s.w;
@@ -358,7 +360,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   const startTasksResize = (e: PointerEvent) => {
     e.preventDefault();
     e.stopPropagation();
-    const el = tasksListEl;
+    const el = tasksPopupEl;
     if (!el) return;
     const r = el.getBoundingClientRect();
     const sx = e.clientX, sy = e.clientY, sw = r.width, sh = r.height;
@@ -1112,24 +1114,27 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
             <span class="tasks-chev" classList={{ rot: todosOpen() }}><Icon name="chevronDown" size={12} /></span>
           </button>
           <Show when={todosOpen()}>
-            <ul class="tasks-list" ref={(el) => { tasksListEl = el; restoreTasksSize(el); }}>
-              {/* Top-left grip: drag to resize (grows up/left from the anchor). */}
+            <div class="tasks-popup" ref={(el) => { tasksPopupEl = el; restoreTasksSize(el); }}>
+              {/* Top-left grip: drag to resize (grows up/left from the anchor).
+                  On the shell, not the scroller, so it's always reachable. */}
               <span class="tasks-resize" title="Drag to resize" onPointerDown={startTasksResize} />
-              <For each={todoItems()}>
-                {(t) => (
-                  <li class="tasks-item" classList={{ done: t.status === "completed", active: t.status === "in_progress", cancelled: t.status === "cancelled" }}>
-                    <span class="tasks-item-ico">
-                      <Switch fallback={<span class="tasks-pending" />}>
-                        <Match when={t.status === "in_progress"}><Spinner size={13} /></Match>
-                        <Match when={t.status === "completed"}><Icon name="check" size={13} /></Match>
-                        <Match when={t.status === "cancelled"}><Icon name="x" size={12} /></Match>
-                      </Switch>
-                    </span>
-                    <span class="tasks-item-text">{t.content || "(untitled)"}</span>
-                  </li>
-                )}
-              </For>
-            </ul>
+              <ul class="tasks-list">
+                <For each={todoItems()}>
+                  {(t) => (
+                    <li class="tasks-item" classList={{ done: t.status === "completed", active: t.status === "in_progress", cancelled: t.status === "cancelled" }}>
+                      <span class="tasks-item-ico">
+                        <Switch fallback={<span class="tasks-pending" />}>
+                          <Match when={t.status === "in_progress"}><Spinner size={13} /></Match>
+                          <Match when={t.status === "completed"}><Icon name="check" size={13} /></Match>
+                          <Match when={t.status === "cancelled"}><Icon name="x" size={12} /></Match>
+                        </Switch>
+                      </span>
+                      <span class="tasks-item-text">{t.content || "(untitled)"}</span>
+                    </li>
+                  )}
+                </For>
+              </ul>
+            </div>
           </Show>
         </div>
       </Show>

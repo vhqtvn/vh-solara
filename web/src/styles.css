@@ -2217,16 +2217,24 @@ body {
 .tasks-chev { display: inline-flex; transition: transform 0.12s ease; }
 .tasks-chev.rot { transform: rotate(180deg); }
 /* Float the expanded list as an overlay above the pill (OpenChamber-style) so it
-   never reflows/shrinks the chat. Anchored to the chat-width-aligned bar. */
-.tasks-list {
-  list-style: none; margin: 0; padding: 6px; text-align: left;
+   never reflows/shrinks the chat. Anchored to the chat-width-aligned bar. The
+   shell holds the position/size/chrome (and the resize grip); the inner <ul>
+   scrolls — so the grip never scrolls out of reach. */
+.tasks-popup {
   position: absolute; bottom: calc(100% - 2px); right: 14px; z-index: 45;
+  display: flex; flex-direction: column;
   min-width: 260px; width: 340px; max-width: min(560px, calc(100vw - 28px));
+  height: 300px; max-height: min(70vh, 460px);
   background: var(--bg-2); border: 1px solid var(--border); border-radius: 10px;
   box-shadow: var(--shadow-lg, 0 12px 40px #0009);
-  height: 300px; max-height: min(70vh, 460px); overflow-y: auto; overscroll-behavior: contain;
 }
-/* Top-left resize grip (the popover grows up/left from its bottom-right anchor). */
+.tasks-list {
+  list-style: none; margin: 0; padding: 6px; text-align: left;
+  flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain;
+  border-radius: inherit;
+}
+/* Top-left resize grip on the shell (the popover grows up/left from its
+   bottom-right anchor), pinned so scrolling the list never hides it. */
 .tasks-resize {
   position: absolute; top: 0; left: 0; width: 16px; height: 16px; cursor: nwse-resize; z-index: 2;
   background: linear-gradient(135deg, var(--fg-dim) 0 2px, transparent 2px) no-repeat 3px 3px / 7px 7px;
