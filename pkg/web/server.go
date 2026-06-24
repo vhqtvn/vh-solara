@@ -648,6 +648,15 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return // dropped as a slow consumer; client will reconnect + resume
 			}
+			if ev.Kind == "notice" {
+				// Transient alert (state.KindNotice): not part of the replayable
+				// view and it reuses the current head seq, so forward it WITHOUT the
+				// seq-baseline guard and WITHOUT an id line (don't move the resume
+				// cursor). A resuming client never replays it.
+				fmt.Fprintf(w, "event: notice\ndata: %s\n\n", ev.Payload)
+				flusher.Flush()
+				continue
+			}
 			if ev.Seq <= baseline {
 				continue // already covered by snapshot/replay
 			}

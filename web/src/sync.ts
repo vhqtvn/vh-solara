@@ -15,6 +15,7 @@ import {
   upsertPart,
 } from "./lib/reduce";
 import { pushNotification } from "./notify";
+import { handleNotice } from "./alerts";
 import { checkVersionNow } from "./pwa";
 import { log } from "./lib/log";
 import { loadVersioned, saveVersioned } from "./lib/store";
@@ -361,7 +362,7 @@ export function ackSession(id: string) {
 }
 
 // The root of a session (top of the parentID chain that's still in the store).
-function rootOf(id: string): string {
+export function rootOf(id: string): string {
   let cur = id;
   for (let guard = 0; guard < 10000; guard++) {
     const p = state.sessions[cur]?.parentID;
@@ -495,6 +496,15 @@ function connect(fresh = false) {
       applyMessageEvent(kind, Number(ev.lastEventId), JSON.parse(ev.data));
     });
   }
+  // Daemon-detected alerts (transient; no cursor advance). In-app + OS delivery.
+  es.addEventListener("notice", (e) => {
+    markSeen();
+    try {
+      handleNotice(JSON.parse((e as MessageEvent).data));
+    } catch {
+      /* ignore malformed notice */
+    }
+  });
   es.onopen = () => {
     markSeen();
     backoff = 1000; // healthy — reset backoff

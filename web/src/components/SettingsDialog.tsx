@@ -9,6 +9,7 @@ import { canInstall, installed, isIosSafari, promptInstall } from "../pwa-instal
 import { killTerm, listTerms } from "../termApi";
 import { agents, selectedAgent, setSelectedAgent } from "../agents";
 import QuotaPanel from "./QuotaPanel";
+import NotificationsSettings from "./NotificationsSettings";
 import Icon from "./Icon";
 import Select from "./Select";
 
@@ -17,6 +18,7 @@ import Select from "./Select";
 const sections = () => [
   { id: "theme", name: "Theme" },
   { id: "appearance", name: "Appearance" },
+  { id: "notifications", name: "Notifications" },
   { id: "general", name: "General" },
   ...(installed() ? [] : [{ id: "app", name: "App" }]),
   { id: "terminals", name: "Terminals" },
@@ -270,6 +272,10 @@ export default function SettingsDialog(props: { onClose: () => void }) {
                 </div>
                 <p class="setting-hint">Uses a font installed on your system (no external download).</p>
               </Show>
+            </Show>
+
+            <Show when={sec() === "notifications"}>
+              <NotificationsSettings />
             </Show>
 
             <Show when={sec() === "general"}>
