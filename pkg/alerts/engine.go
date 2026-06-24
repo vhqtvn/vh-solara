@@ -20,6 +20,7 @@ type Engine struct {
 	cfg        *Store
 	presence   *Presence
 	dispatcher *Dispatcher
+	pusher     *Pusher // optional; nil if Web Push is unavailable
 
 	mu       sync.Mutex
 	watchers map[string]*watcher // dir -> watcher
@@ -39,6 +40,12 @@ func (e *Engine) Presence() *Presence { return e.presence }
 
 // Dispatcher exposes the dispatcher (for the "send test" endpoint).
 func (e *Engine) Dispatcher() *Dispatcher { return e.dispatcher }
+
+// SetPusher attaches the Web Push sender (closed-app delivery). Optional.
+func (e *Engine) SetPusher(p *Pusher) { e.pusher = p }
+
+// Pusher exposes the Web Push sender (for the subscribe/key endpoints). May be nil.
+func (e *Engine) Pusher() *Pusher { return e.pusher }
 
 // Config exposes the config store (for settings endpoints).
 func (e *Engine) Config() *Store { return e.cfg }
@@ -437,4 +444,7 @@ func (w *watcher) fire(sid, typ, detail string) {
 	payload, _ := json.Marshal(n)
 	w.store.EmitNotice(payload)
 	w.engine.dispatcher.Dispatch(n)
+	if w.engine.pusher != nil {
+		w.engine.pusher.Send(n)
+	}
 }

@@ -24,6 +24,11 @@ func (s *Server) InitAlerts(ctx context.Context) (*alerts.Engine, error) {
 	presence := alerts.NewPresence()
 	dispatcher := alerts.NewDispatcher(store, presence)
 	engine := alerts.NewEngine(store, presence, dispatcher)
+	// Web Push (closed-app delivery) is optional — a key/store failure disables
+	// push without taking down the rest of alerts.
+	if pusher, perr := alerts.NewPusher(store, presence, stateBaseDir()); perr == nil {
+		engine.SetPusher(pusher)
+	}
 	s.RegisterFeature(alertsFeature{engine: engine})
 	s.SetAggHook(func(dir string, a *aggregator.Aggregator) {
 		engine.Attach(ctx, dir, a.Store())
@@ -178,6 +183,71 @@ func (f alertsFeature) Routes(svc Services) map[string]http.HandlerFunc {
 			idle := f.engine.Config().Get().Detect.IdleSec
 			devices := f.engine.Presence().Devices(durSec(idle * 3))
 			writeJSON(w, http.StatusOK, jsonBytes(map[string]any{"devices": devices}))
+		},
+		"/vh/alerts/push/key": func(w http.ResponseWriter, r *http.Request) {
+			p := f.engine.Pusher()
+			if p == nil {
+				writeJSON(w, http.StatusOK, jsonBytes(map[string]any{"enabled": false}))
+				return
+			}
+			writeJSON(w, http.StatusOK, jsonBytes(map[string]any{"enabled": true, "publicKey": p.PublicKey()}))
+		},
+		"/vh/alerts/push/subscribe": func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			p := f.engine.Pusher()
+			if p == nil {
+				writeJSON(w, http.StatusServiceUnavailable, errResp("push unavailable"))
+				return
+			}
+			// Accept the browser PushSubscription shape plus deviceId + scope.
+			var in struct {
+				DeviceID     string `json:"deviceId"`
+				Scope        string `json:"scope"`
+				Subscription struct {
+					Endpoint string `json:"endpoint"`
+					Keys     struct {
+						P256dh string `json:"p256dh"`
+						Auth   string `json:"auth"`
+					} `json:"keys"`
+				} `json:"subscription"`
+			}
+			if !decodeBody(w, r, &in) {
+				return
+			}
+			err := p.Subscribe(alerts.PushSub{
+				DeviceID: in.DeviceID,
+				Endpoint: in.Subscription.Endpoint,
+				P256dh:   in.Subscription.Keys.P256dh,
+				Auth:     in.Subscription.Keys.Auth,
+				Scope:    in.Scope,
+			})
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, errResp(err.Error()))
+				return
+			}
+			writeJSON(w, http.StatusOK, jsonBytes(map[string]any{"ok": true}))
+		},
+		"/vh/alerts/push/unsubscribe": func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			p := f.engine.Pusher()
+			if p == nil {
+				writeJSON(w, http.StatusOK, jsonBytes(map[string]any{"ok": true}))
+				return
+			}
+			var in struct {
+				DeviceID string `json:"deviceId"`
+			}
+			if !decodeBody(w, r, &in) {
+				return
+			}
+			_ = p.Unsubscribe(in.DeviceID)
+			writeJSON(w, http.StatusOK, jsonBytes(map[string]any{"ok": true}))
 		},
 		"/vh/alerts/test": func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodPost {

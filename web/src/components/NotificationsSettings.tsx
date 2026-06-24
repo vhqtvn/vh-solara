@@ -11,6 +11,7 @@ import {
   osPerm,
   enableOSNotifications,
 } from "../alerts";
+import { pushSupported, pushEnabled, enablePush, disablePush, syncPushScope } from "../push";
 import {
   getAlertConfig,
   saveAlertConfig,
@@ -135,12 +136,15 @@ export default function NotificationsSettings() {
                     { value: "current", label: "Current session only" },
                     { value: "all", label: "All sessions" },
                   ]}
-                  onChange={(v) => setScope(v as DeviceScope)}
+                  onChange={(v) => {
+                    setScope(v as DeviceScope);
+                    void syncPushScope();
+                  }}
                 />
               </div>
               <p class="setting-hint">
-                Controls in-app and OS notifications on THIS browser/PWA. Leave the app open (even
-                backgrounded) to receive OS notifications while away.
+                Controls in-app, OS, and push notifications on THIS browser/PWA. Leave the app open (even
+                backgrounded) for OS notifications; enable background push below to be reached when it's closed.
               </p>
               <Show when={notifSupported} fallback={<p class="setting-hint">OS notifications aren't supported here.</p>}>
                 <div class="setting-row">
@@ -159,6 +163,33 @@ export default function NotificationsSettings() {
                     </button>
                   </Show>
                 </div>
+              </Show>
+              <Show when={pushSupported}>
+                <div class="setting-row">
+                  <label>Background push</label>
+                  <Show
+                    when={!pushEnabled()}
+                    fallback={
+                      <button type="button" class="btn" onClick={() => void disablePush()}>Turn off</button>
+                    }
+                  >
+                    <button
+                      type="button"
+                      class="btn"
+                      onClick={async () => {
+                        const r = await enablePush();
+                        if (!r.ok) setNote({ ok: false, msg: `Push: ${r.error}` });
+                        else setNote({ ok: true, msg: "Background push enabled." });
+                      }}
+                    >
+                      Enable
+                    </button>
+                  </Show>
+                </div>
+                <p class="setting-hint">
+                  Reaches this device even when the app is fully closed (uses the browser's push service).
+                  Requires an installed PWA on some platforms.
+                </p>
               </Show>
 
               {/* Active profile ------------------------------------------------ */}

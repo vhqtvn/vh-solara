@@ -33,6 +33,42 @@ self.addEventListener("message", (e) => {
   if (e.data && e.data.type === "SKIP_WAITING") self.skipWaiting();
 });
 
+// Web Push: the daemon pushes a notice when the app is closed and you're away.
+// The payload is the same notice JSON the in-app handler renders.
+const PUSH_LABEL = {
+  finished: ["✅", "finished"],
+  waiting: ["⏳", "needs your input"],
+  "stuck-thinking": ["🤔", "is thinking for a long time"],
+  runaway: ["⚠️", "has a long-running command"],
+  stalled: ["💤", "has stalled"],
+};
+self.addEventListener("push", (e) => {
+  let n = {};
+  try { n = e.data ? e.data.json() : {}; } catch { n = {}; }
+  const l = PUSH_LABEL[n.type] || ["🔔", ""];
+  const name = n.title || (n.sessionID ? String(n.sessionID).slice(0, 8) : "Session");
+  const title = (l[0] + " " + name + " " + l[1]).trim();
+  e.waitUntil(
+    self.registration.showNotification(title, {
+      body: n.detail || n.project || "",
+      tag: (n.type || "notice") + ":" + (n.root || n.sessionID || ""),
+      data: { root: n.root, sessionID: n.sessionID },
+    }),
+  );
+});
+self.addEventListener("notificationclick", (e) => {
+  e.notification.close();
+  e.waitUntil(
+    (async () => {
+      const all = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+      for (const c of all) {
+        if ("focus" in c) return c.focus();
+      }
+      if (self.clients.openWindow) return self.clients.openWindow("/");
+    })(),
+  );
+});
+
 self.addEventListener("fetch", (e) => {
   const req = e.request;
   if (req.method !== "GET") return;
