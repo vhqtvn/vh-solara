@@ -639,6 +639,11 @@ func (f *FakeOpenCode) handleEvent(w http.ResponseWriter, r *http.Request) {
 		`{"id":"t3","content":"Wire error recovery","status":"pending"},`+
 		`{"id":"t4","content":"Update docs","status":"pending"}]}}`+"\n\n")
 	fl.Flush()
+	// Subagent todos too, so the parent's Tasks indicator rolls them up.
+	fmt.Fprint(w, `data: {"type":"todo.updated","properties":{"sessionID":"sub","todos":[`+
+		`{"id":"s1","content":"Grep the codebase for parse()","status":"completed"},`+
+		`{"id":"s2","content":"Summarize the matches","status":"in_progress"}]}}`+"\n\n")
+	fl.Flush()
 
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()

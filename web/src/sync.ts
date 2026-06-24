@@ -805,12 +805,42 @@ function normalizeTodos(v: any): TodoItem[] {
   return [];
 }
 
-// sessionTodoCounts summarizes a session's agent todo list (OpenCode TodoWrite)
-// for the "Tasks N active · M left" indicator: active = in_progress, left = not
-// yet completed (pending + in_progress), total = all items. Returns zeros when
-// the session has no todos.
+// All session ids in a subtree (the session + descendant subagents). Tasks roll
+// up like running state does, so a parent's indicator surfaces the todos its
+// subagents are working — without having to open each subsession.
+function subtreeSessionIds(rootID: string): string[] {
+  const childrenOf: Record<string, string[]> = {};
+  for (const id of Object.keys(state.sessions)) {
+    const p = state.sessions[id]?.parentID;
+    if (p) (childrenOf[p] ||= []).push(id);
+  }
+  const out: string[] = [];
+  const stack = [rootID];
+  while (stack.length) {
+    const id = stack.pop()!;
+    out.push(id);
+    for (const c of childrenOf[id] || []) stack.push(c);
+  }
+  return out;
+}
+
+// sessionTodos returns the agent todos (OpenCode TodoWrite) for a session AND
+// its subagents, in subtree order.
+export function sessionTodos(sessionID?: string): TodoItem[] {
+  if (!sessionID) return [];
+  const out: TodoItem[] = [];
+  for (const id of subtreeSessionIds(sessionID)) {
+    const items = state.todos[id];
+    if (items && items.length) out.push(...items);
+  }
+  return out;
+}
+
+// sessionTodoCounts summarizes the subtree todos for the "Tasks N active · M
+// left" indicator: active = in_progress, left = pending + in_progress (i.e. not
+// completed/cancelled), total = all. Zeros when there are none.
 export function sessionTodoCounts(sessionID?: string): { active: number; left: number; total: number } {
-  const items = (sessionID && state.todos[sessionID]) || [];
+  const items = sessionTodos(sessionID);
   let active = 0;
   let left = 0;
   for (const t of items) {
