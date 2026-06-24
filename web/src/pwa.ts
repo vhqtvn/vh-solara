@@ -21,24 +21,30 @@ export function applyUpdate() {
 // deploy (the embedded UI ships with it), so when it differs from the version we
 // loaded with, a newer UI is live on the server — surface the "reload" toast.
 // Works in a plain browser tab and through the tunnel, regardless of SW timing.
+let loadedVersion: string | null = null;
+async function checkVersion() {
+  try {
+    const r = await fetch("/vh/version", { cache: "no-store" });
+    if (!r.ok) return;
+    const v = (await r.json())?.version;
+    if (!v) return;
+    if (loadedVersion === null) loadedVersion = v;
+    else if (v !== loadedVersion) setUpdateReady(true);
+  } catch {
+    /* offline / transient — retry next tick */
+  }
+}
+
+// Run a version check immediately. Called on stream reconnect (sync.ts): a vh
+// self-update/restart drops the SSE stream, so reconnecting is the moment a new
+// build is most likely live — check then instead of waiting for the next poll.
+export const checkVersionNow = () => void checkVersion();
+
 export function startVersionCheck() {
-  let loaded: string | null = null;
-  const check = async () => {
-    try {
-      const r = await fetch("/vh/version", { cache: "no-store" });
-      if (!r.ok) return;
-      const v = (await r.json())?.version;
-      if (!v) return;
-      if (loaded === null) loaded = v;
-      else if (v !== loaded) setUpdateReady(true);
-    } catch {
-      /* offline / transient — retry next tick */
-    }
-  };
-  void check();
-  setInterval(check, 3 * 60 * 1000);
+  void checkVersion();
+  setInterval(checkVersion, 3 * 60 * 1000);
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible") void check();
+    if (document.visibilityState === "visible") void checkVersion();
   });
 }
 

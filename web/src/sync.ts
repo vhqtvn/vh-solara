@@ -15,6 +15,7 @@ import {
   upsertPart,
 } from "./lib/reduce";
 import { pushNotification } from "./notify";
+import { checkVersionNow } from "./pwa";
 import { log } from "./lib/log";
 import { loadVersioned, saveVersioned } from "./lib/store";
 
@@ -444,6 +445,7 @@ let es: EventSource | null = null;
 let lastSeen = 0; // ms of the last byte/event from the server (incl. pings)
 let reconnectTimer: number | undefined;
 let backoff = 1000; // grows on repeated failures, reset on a healthy open
+let everOpened = false; // first stream open is the initial load; later opens are reconnects
 const STALE_MS = 45_000; // ~3 missed 15s pings → assume the stream is dead
 
 function markSeen() {
@@ -497,6 +499,11 @@ function connect(fresh = false) {
     markSeen();
     backoff = 1000; // healthy — reset backoff
     setState("status", "live");
+    // A reconnect (not the first open) means the stream dropped and came back —
+    // typically a vh restart/self-update. Re-check the version so a new build
+    // surfaces the reload toast immediately instead of on the next poll.
+    if (everOpened) checkVersionNow();
+    everOpened = true;
   };
   es.onerror = () => {
     // EventSource auto-retries while CONNECTING; we only step in once it gives
