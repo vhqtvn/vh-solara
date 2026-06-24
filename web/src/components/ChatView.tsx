@@ -271,10 +271,33 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     const t = (pid && m.parts[pid]?.text) || "";
     return t.replace(/\s+/g, " ").trim().slice(0, 140) || "(message)";
   };
+  const cssEsc = (id: string) => (typeof CSS !== "undefined" && CSS.escape ? CSS.escape(id) : id);
   const jumpToMsg = (id: string) => {
-    const sel = `[data-mid="${typeof CSS !== "undefined" && CSS.escape ? CSS.escape(id) : id}"]`;
-    scrollEl?.querySelector(sel)?.scrollIntoView({ behavior: "smooth", block: "start" });
+    scrollEl?.querySelector(`[data-mid="${cssEsc(id)}"]`)?.scrollIntoView({ behavior: "smooth", block: "start" });
   };
+  // Navigator highlight: the user turn currently at the top of the viewport, plus
+  // a hover-preview bubble. Recomputed on scroll (rAF-throttled) — desktop only.
+  const [activeTurn, setActiveTurn] = createSignal<string>("");
+  const [navPreview, setNavPreview] = createSignal<{ text: string; y: number } | null>(null);
+  let navRaf = 0;
+  function updateActiveTurn() {
+    navRaf = 0;
+    if (!scrollEl) return;
+    const turns = userTurns();
+    if (!turns.length) return;
+    const cTop = scrollEl.getBoundingClientRect().top;
+    let active = turns[0].id;
+    for (const m of turns) {
+      const el = scrollEl.querySelector(`[data-mid="${cssEsc(m.id)}"]`) as HTMLElement | null;
+      if (!el) continue;
+      if (el.getBoundingClientRect().top - cTop <= 8) active = m.id;
+      else break; // turns are in order; first one below the fold ends the scan
+    }
+    setActiveTurn(active);
+  }
+  function scheduleActiveTurn() {
+    if (!navRaf) navRaf = requestAnimationFrame(updateActiveTurn);
+  }
 
   const pendingPermissions = createMemo(() => Object.values(state.permissions[props.sessionId] || {}));
   const pendingQuestions = createMemo(() => Object.values(state.questions[props.sessionId] || {}));
@@ -452,6 +475,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     const ro = new ResizeObserver(() => {
       if (maybeRestore()) return;
       if (following()) pin();
+      scheduleActiveTurn(); // content grew/mounted — refresh the navigator highlight
     });
     ro.observe(contentEl);
     onCleanup(() => {
@@ -467,6 +491,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     setFollowing(atBottom);
     if (!props.draft) setScroll(props.sessionId, atBottom ? 0 : scrollEl?.scrollTop ?? 0);
     if (atBottom) ackSession(props.sessionId);
+    scheduleActiveTurn();
   }
 
   const [focusMode, setFocusMode] = createSignal(false);
@@ -993,6 +1018,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
         </div>
       </Show>
       <Show when={!props.draft}>
+      <div class="chat-main">
       <div class="chat-scroll" ref={scrollEl} onScroll={onScrolled}>
         <div class="chat-content" ref={contentEl} classList={{ ready: ready() }}>
           <For each={messages()}>
@@ -1052,16 +1078,30 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
           </Show>
         </div>
       </div>
-      </Show>
-
-      <Show when={!props.draft && isDesktop() && userTurns().length > 1}>
-        <div class="chat-nav" aria-label="Jump to a turn">
-          <For each={userTurns()}>
-            {(m) => (
-              <button type="button" class="chat-nav-dot" title={turnText(m)} aria-label={turnText(m)} onClick={() => jumpToMsg(m.id)} />
-            )}
-          </For>
-        </div>
+        <Show when={isDesktop() && userTurns().length > 1}>
+          <div class="chat-nav" aria-label="Jump to a turn">
+            <For each={userTurns()}>
+              {(m) => (
+                <button
+                  type="button"
+                  class="chat-nav-dot"
+                  classList={{ active: activeTurn() === m.id }}
+                  aria-label={turnText(m)}
+                  aria-current={activeTurn() === m.id ? "true" : undefined}
+                  onClick={() => jumpToMsg(m.id)}
+                  onMouseEnter={(e) => setNavPreview({ text: turnText(m), y: e.currentTarget.offsetTop + e.currentTarget.offsetHeight / 2 })}
+                  onMouseLeave={() => setNavPreview(null)}
+                  onFocus={(e) => setNavPreview({ text: turnText(m), y: e.currentTarget.offsetTop + e.currentTarget.offsetHeight / 2 })}
+                  onBlur={() => setNavPreview(null)}
+                />
+              )}
+            </For>
+            <Show when={navPreview()}>
+              {(pv) => <div class="chat-nav-bubble" style={{ top: `${pv().y}px` }}>{pv().text}</div>}
+            </Show>
+          </div>
+        </Show>
+      </div>
       </Show>
 
       <Show when={!following()}>

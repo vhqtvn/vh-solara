@@ -816,18 +816,44 @@ body {
 /* Chat navigator: a faint vertical strip of markers (one per user turn) pinned
    to the chat's right edge. Click a marker to jump to that turn; hover reveals
    its text (native title). Faint until hovered so it stays out of the way. */
+/* Wraps the scroller + navigator so the navigator is bounded to the scroll
+   area's height (not the whole column incl. composer). */
+.chat-main { position: relative; flex: 1; min-height: 0; display: flex; flex-direction: column; }
+
+/* Right-edge navigator ("minimap"): one tick per user turn. Spans the scroll
+   area top→bottom; ticks flex-SHRINK so they always fit — a session with
+   hundreds of turns compresses to a dense strip instead of overflowing/clipping. */
 .chat-nav {
-  position: absolute; right: 3px; top: 50%; transform: translateY(-50%);
-  display: flex; flex-direction: column; gap: 5px; align-items: flex-end;
-  max-height: 70%; overflow: hidden; padding: 6px 2px; z-index: 20;
-  opacity: 0.3; transition: opacity 0.15s ease;
+  position: absolute; top: 10px; bottom: 10px; right: 3px;
+  display: flex; flex-direction: column; align-items: flex-end;
+  z-index: 20; opacity: 0.32; transition: opacity 0.15s ease;
 }
 .chat-nav:hover { opacity: 1; }
 .chat-nav-dot {
-  width: 16px; height: 4px; border-radius: 2px; padding: 0; border: 0; cursor: pointer;
-  background: var(--fg-dim); transition: width 0.12s ease, background 0.12s ease;
+  flex: 1 1 0; min-height: 0;        /* share the height; shrink to always fit */
+  width: 22px; padding: 0; border: 0; background: transparent; cursor: pointer;
+  display: flex; align-items: center; justify-content: flex-end;
 }
-.chat-nav-dot:hover { width: 24px; background: var(--accent); }
+/* The visible tick is a capped bar centred in the (possibly tall) flex slot, so
+   few turns read as evenly-spaced ticks and many turns read as a dense bar. */
+.chat-nav-dot::before {
+  content: ""; width: 16px; height: 100%; max-height: 5px; border-radius: 2px;
+  background: var(--fg-dim);
+  transition: width 0.12s ease, background 0.12s ease, max-height 0.12s ease;
+}
+.chat-nav-dot:hover::before { width: 22px; background: var(--fg); max-height: 6px; }
+.chat-nav-dot.active::before { width: 22px; background: var(--accent); max-height: 7px; }
+/* Hover/focus preview, anchored to the LEFT of the hovered tick. */
+.chat-nav-bubble {
+  position: absolute; right: 100%; margin-right: 10px; transform: translateY(-50%);
+  width: max-content; max-width: 300px;
+  background: var(--bg-2); color: var(--fg);
+  border: 1px solid var(--border); border-radius: 8px;
+  box-shadow: var(--shadow-lg, 0 12px 40px #0009);
+  padding: 7px 10px; font-size: 12.5px; line-height: 1.4;
+  pointer-events: none; z-index: 21;
+  display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden;
+}
 @media (pointer: coarse) { .chat-nav { display: none; } }
 
 /* opencode-style "running" progress bar (a whipping fill) while working. */
@@ -856,7 +882,7 @@ body {
 @media (prefers-reduced-motion: reduce) {
   .session-progress-bar { animation: none; clip-path: none; opacity: 0.7; }
 }
-.chat-scroll { flex: 1; overflow-y: auto; overflow-anchor: auto; padding: 16px; overscroll-behavior: contain; }
+.chat-scroll { flex: 1; min-height: 0; overflow-y: auto; overflow-anchor: auto; padding: 16px; overscroll-behavior: contain; }
 
 /* Scroll-edge affordance (installScrollEdges tags these + toggles se-top/se-
    bottom). The edge content DISSOLVES to transparent only where there's hidden
