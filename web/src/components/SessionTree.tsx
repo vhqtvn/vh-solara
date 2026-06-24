@@ -1,6 +1,6 @@
 import { createEffect, createMemo, For, Match, Show, Switch } from "solid-js";
 import { createSignal } from "solid-js";
-import { selectedId, setSelectedId, state } from "../sync";
+import { selectedId, setSelectedId, state, sessionNeedsInput } from "../sync";
 import { treeDensity } from "../prefs";
 import { isPinned, searchQuery } from "../sidebar";
 import { buildChildrenIndex } from "../lib/reduce";
@@ -124,6 +124,9 @@ function Node(props: {
   const kids = () => props.index()[props.session.id] || [];
   const activity = () => state.activity[props.session.id] || "idle";
   const busy = () => props.working(props.session.id);
+  // Subtree has a pending permission/question awaiting a typed reply. Reactive —
+  // clears itself the moment the request is answered.
+  const needsInput = () => sessionNeedsInput(props.session.id);
   // Detailed line-2 stats: running/idle across ALL direct children (not just
   // hidden ones — this is an always-on summary, unlike the expand-state footer).
   const runCount = () => kids().filter((c) => props.working(c.id)).length;
@@ -254,14 +257,19 @@ function Node(props: {
             <Show when={!busy() && activity() === "error"}>
               <span class="dot error" data-tip="error" />
             </Show>
+            {/* Needs input: a pending permission/question (here or in a subagent)
+                that's blocking until you reply. Takes visual priority. */}
+            <Show when={needsInput()}>
+              <span class="dot needs-input" data-tip="needs your input — reply to continue" />
+            </Show>
             {/* Finished-unread: a root task that completed but hasn't been viewed. */}
-            <Show when={!busy() && state.unread[props.session.id]}>
+            <Show when={!busy() && !needsInput() && state.unread[props.session.id]}>
               <span class="dot unread" data-tip="finished — not yet viewed" />
             </Show>
             <Show when={isPinned(props.session.id)}>
               <span class="dot pin" data-tip="pinned" />
             </Show>
-            <span class="tree-title" classList={{ unread: !busy() && !!state.unread[props.session.id] }}>
+            <span class="tree-title" classList={{ unread: !busy() && !!state.unread[props.session.id], "needs-input": needsInput() }}>
               {props.session.title || props.session.id}
             </span>
             <span class="tree-meta">
@@ -415,8 +423,11 @@ export default function SessionTree() {
                   >
                     <span class="tree-line1">
                       <Show when={isWorking(s.id)}><Spinner class="tree-spinner" /></Show>
+                      <Show when={sessionNeedsInput(s.id)}>
+                        <span class="dot needs-input" data-tip="needs your input — reply to continue" />
+                      </Show>
                       <Show when={isPinned(s.id)}><span class="dot pin" data-tip="pinned" /></Show>
-                      <span class="tree-title">{s.title || s.id}</span>
+                      <span class="tree-title" classList={{ "needs-input": sessionNeedsInput(s.id) }}>{s.title || s.id}</span>
                       <span class="tree-meta">
                         <RelTime class="tree-time" ms={s.time?.updated || s.time?.created} />
                       </span>

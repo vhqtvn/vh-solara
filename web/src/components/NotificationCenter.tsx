@@ -5,7 +5,7 @@ import { setView } from "../ui";
 import Icon from "./Icon";
 import RelTime from "./RelTime";
 
-const KIND_ICON = { done: "check", error: "alert", info: "info" } as const;
+const KIND_ICON = { done: "check", error: "alert", info: "info", waiting: "help" } as const;
 
 // Header bell + Facebook-style dropdown. Two kinds of entries:
 //  • Action needed — pending permissions/questions across all sessions, derived
@@ -111,7 +111,7 @@ export default function NotificationCenter() {
               <div class="notif-section">Recent</div>
               <For each={notifications.items}>
                 {(n) => (
-                  <div class="notif-item" classList={{ err: n.kind === "error", done: n.kind === "done", info: n.kind === "info" }}>
+                  <div class="notif-item" classList={{ err: n.kind === "error", done: n.kind === "done", info: n.kind === "info", waiting: n.kind === "waiting", read: n.read }}>
                     <span class="notif-ico"><Icon name={KIND_ICON[n.kind]} size={15} /></span>
                     <button type="button" class="notif-body btn" onClick={() => goto(n.sessionID)}>
                       <span class="notif-title">

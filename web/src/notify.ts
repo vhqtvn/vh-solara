@@ -5,7 +5,7 @@
 // they are derived from the sync store so they clear themselves on reply.
 import { createStore, produce } from "solid-js/store";
 
-export type NotifyKind = "error" | "done" | "info";
+export type NotifyKind = "error" | "done" | "info" | "waiting";
 
 export interface Notification {
   id: string;
@@ -15,6 +15,10 @@ export interface Notification {
   detail?: string;
   time: number;
   read: boolean;
+  // The daemon notice type (finished|waiting|stuck-thinking|runaway|stalled) when
+  // this came from an alert — lets us auto-mark-read the right ones as state
+  // resolves. Absent for client-side notifications (errors, etc.).
+  tag?: string;
 }
 
 interface NotifyState {
@@ -52,6 +56,13 @@ export function clearNotifications() {
 
 export function markAllRead() {
   setNotifications(produce((s) => s.items.forEach((n) => (n.read = true))));
+}
+
+// Mark matching notifications as read (without removing them) — used to auto-ack
+// a "needs input" nudge once the request is answered, or a "finished" nudge once
+// the session is archived. They stay in the list as history; the unread count drops.
+export function markRead(pred: (n: Notification) => boolean) {
+  setNotifications(produce((s) => s.items.forEach((n) => { if (pred(n)) n.read = true; })));
 }
 
 export { notifications };

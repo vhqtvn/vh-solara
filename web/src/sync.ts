@@ -14,7 +14,7 @@ import {
   upsertMessage,
   upsertPart,
 } from "./lib/reduce";
-import { pushNotification } from "./notify";
+import { pushNotification, markRead } from "./notify";
 import { handleNotice } from "./alerts";
 import { checkVersionNow } from "./pwa";
 import { log } from "./lib/log";
@@ -343,8 +343,34 @@ function applyMessageEvent(kind: string, seq: number, payload: any, trackCursor 
       if (trackCursor && seq) s.cursor = seq;
     }),
   );
-  if (kind === "activity" && payload.sessionID) maybeNotifyRootDone(payload.sessionID);
+  if (kind === "activity" && payload.sessionID) {
+    maybeNotifyRootDone(payload.sessionID);
+    maybeClearWaiting(payload.sessionID); // resumed working → no longer awaiting you
+  }
+  if ((kind === "permission.delete" || kind === "question.delete") && payload.sessionID) {
+    maybeClearWaiting(payload.sessionID); // answered → ack the "needs input" nudge
+  }
   persist();
+}
+
+// True when a session OR any of its subagents has a pending permission/question
+// (a typed reply it's blocked on). Reactive — clears itself when the request is
+// resolved. Surfaced in the session list and used to auto-ack the in-app nudge.
+export function sessionNeedsInput(sessionID: string): boolean {
+  for (const id of subtreeSessionIds(sessionID)) {
+    if (Object.keys(state.permissions[id] || {}).length > 0) return true;
+    if (Object.keys(state.questions[id] || {}).length > 0) return true;
+  }
+  return false;
+}
+
+// Once a session's subtree has no more pending input, mark its "waiting" nudge
+// read (the daemon's notice is keyed by the root session id).
+function maybeClearWaiting(sessionID: string) {
+  const root = rootOf(sessionID);
+  if (!sessionNeedsInput(root)) {
+    markRead((n) => n.kind === "waiting" && n.sessionID === root);
+  }
 }
 
 // Acknowledge a session as read (called when its bottom is reached): clears the
@@ -352,7 +378,10 @@ function applyMessageEvent(kind: string, seq: number, payload: any, trackCursor 
 export function ackSession(id: string) {
   if (!id) return;
   const root = rootOf(id);
-  if (!state.unread[root]) return; // nothing to ack
+  // Viewing a session acks ALL of its notifications (any kind) — the general
+  // rule: once you've looked at the session, its nudges are no longer unread.
+  markRead((n) => (n.sessionID || "") === root);
+  if (!state.unread[root]) return; // nothing more to ack (finished-unread flag)
   setState("unread", root, undefined as unknown as boolean);
   void fetch("/vh/ack", {
     method: "POST",
@@ -397,6 +426,9 @@ function maybeNotifyRootDone(changedSessionID: string) {
     }
     return;
   }
+  // Settled to idle: the transient "still working" alerts (stuck-thinking,
+  // runaway command, stalled) for this root no longer hold — ack them.
+  markRead((n) => (n.sessionID || "") === root && (n.tag === "stuck-thinking" || n.tag === "runaway" || n.tag === "stalled"));
   // Just settled into idle: schedule the ping, but only if it stays idle long
   // enough that this is a real turn-end and not a between-steps dip.
   if (was && !doneTimers.has(root)) {

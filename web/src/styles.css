@@ -475,6 +475,14 @@ body {
    its bottom (which acks it). */
 .dot.unread { background: var(--accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 30%, transparent); }
 .tree-title.unread { color: var(--accent) !important; font-weight: 600; }
+/* Needs-your-input: a blocking permission/question. Amber + pulsing ring so it
+   reads as "action required", distinct from the accent finished-unread dot. */
+.dot.needs-input {
+  background: var(--warn, #e8a838);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--warn, #e8a838) 32%, transparent);
+  animation: pulse 1.1s ease-in-out infinite;
+}
+.tree-title.needs-input { color: var(--warn, #e8a838) !important; font-weight: 600; }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
 
 .icon-btn {
@@ -1705,6 +1713,9 @@ body {
 .notif-item.done .notif-ico { color: var(--ok); }
 .notif-item.err .notif-ico { color: var(--danger); }
 .notif-item.info .notif-ico { color: var(--fg-dim); }
+.notif-item.waiting .notif-ico { color: var(--warn, #e8a838); }
+/* Read items dim back (still in the list as history). */
+.notif-item.read { opacity: 0.5; }
 /* The session name leads the line in bold accent: "**Session** finished". */
 .notif-session { color: var(--accent); font-weight: 600; }
 .notif-time { font-size: 11px; color: var(--fg-dim); margin-top: 2px; }

@@ -162,10 +162,12 @@ export function handleNotice(raw: unknown) {
 
   if (n.type !== "finished") {
     pushNotification({
-      kind: n.type === "waiting" ? "info" : "info",
+      // "waiting" gets its own kind so it can be auto-marked-read once answered.
+      kind: n.type === "waiting" ? "waiting" : "info",
       sessionID: n.root || n.sessionID,
       title: headline,
       detail: n.detail,
+      tag: n.type, // the notice type, for state-driven auto-mark-read
     });
   }
 

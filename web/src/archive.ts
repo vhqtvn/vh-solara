@@ -5,6 +5,7 @@ import type { Session } from "./types";
 import { openSession, selectedId, setSelectedId } from "./sync";
 import { clearScroll } from "./lib/scroll";
 import { clearQueue } from "./queue";
+import { markRead } from "./notify";
 
 export interface ArchivedLevel {
   sessions: Session[];
@@ -29,6 +30,9 @@ export async function archiveSession(id: string): Promise<string[]> {
   if (affected.length) {
     clearScroll(affected);
     clearQueue(affected);
+    // Archived sessions are gone from the live tree — ack any notifications for
+    // them (finished, waiting, etc.) so they don't linger as unread.
+    markRead((n) => affected.includes(n.sessionID || ""));
   }
   if (selectedId() && affected.includes(selectedId()!)) setSelectedId(null);
   return affected;
