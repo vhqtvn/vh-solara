@@ -128,8 +128,9 @@ function Node(props: {
   // hidden ones — this is an always-on summary, unlike the expand-state footer).
   const runCount = () => kids().filter((c) => props.working(c.id)).length;
   const idleCount = () => kids().length - runCount();
-  // How long the session ran (created → last updated). Empty when unknown or
-  // sub-second, so we don't print "ran for 0s".
+  // How long the session ran (created → last updated). Only meaningful once the
+  // session has FINISHED (see the !busy() guard at the render site); empty when
+  // unknown or sub-second so we don't print "ran for 0s".
   const ranFor = () => {
     const c = props.session.time?.created;
     const u = props.session.time?.updated;
@@ -279,7 +280,10 @@ function Node(props: {
                 fallback={
                   <span class="tree-sub-started">
                     started <RelTime mode="ago" ms={props.session.time?.created} />
-                    <Show when={ranFor()}>{`, ran for ${ranFor()}`}</Show>
+                    {/* Only for a FINISHED session: while it's still running,
+                        "ran for" (created→last-event) lags behind "started ago"
+                        and reads as wrong, so omit it. */}
+                    <Show when={!busy() && ranFor()}>{`, ran for ${ranFor()}`}</Show>
                   </span>
                 }
               >
