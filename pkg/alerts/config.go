@@ -11,6 +11,7 @@
 package alerts
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -156,19 +157,22 @@ func resolveEnv(s string) string {
 
 // Store loads/saves the config file and guards in-memory access.
 type Store struct {
-	path   string
-	mu     sync.RWMutex
-	cfg    Config
-	header []byte                     // leading comment/whitespace block, preserved verbatim
-	extra  map[string]json.RawMessage // unknown top-level keys, preserved on save
+	path string
+	mu   sync.RWMutex
+	cfg  Config
+	raw  []byte // last-written file bytes; surgical edits splice into this
 }
 
 // ConfigPath returns VH_STATE_DIR/alerts.jsonc (the daemon's per-host config).
 func ConfigPath(stateDir string) string { return filepath.Join(stateDir, "alerts.jsonc") }
 
+// topOrder fixes the key order for a freshly-seeded file and for any key that
+// has to be appended to a hand-written file missing it.
+var topOrder = []string{"detect", "active_profile", "profiles", "channels"}
+
 // NewStore loads the config from path, seeding a default file if absent.
 func NewStore(path string) (*Store, error) {
-	s := &Store{path: path, extra: map[string]json.RawMessage{}}
+	s := &Store{path: path}
 	raw, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
 		s.cfg = DefaultConfig()
@@ -180,46 +184,50 @@ func NewStore(path string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	s.header = leadingComment(raw)
-	stripped := stripJSONC(raw)
-	if err := json.Unmarshal(stripped, &s.cfg); err != nil {
+	s.raw = raw
+	if err := json.Unmarshal(stripJSONC(raw), &s.cfg); err != nil {
 		return nil, fmt.Errorf("alerts config %s: %w", path, err)
-	}
-	// Preserve any top-level keys we don't model, so a UI save never drops them.
-	all := map[string]json.RawMessage{}
-	_ = json.Unmarshal(stripped, &all)
-	for k, v := range all {
-		switch k {
-		case "channels", "profiles", "active_profile", "detect":
-		default:
-			s.extra[k] = v
-		}
 	}
 	return s, nil
 }
 
-// save writes the config losslessly-ish: the leading comment header is kept
-// verbatim, unknown top-level keys are preserved, and known keys serialize in a
-// stable order — so a UI edit produces a minimal diff. (Inline comments inside
-// the object are not yet preserved; that's a follow-up surgical editor.)
+// save persists the config. When a prior document exists it edits surgically —
+// only the bytes of values that actually changed are rewritten, so comments,
+// blank lines, key order, and unknown keys are preserved verbatim. A fresh file
+// is seeded with a clean, ordered render.
 func (s *Store) save() error {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	merged := map[string]json.RawMessage{}
-	for k, v := range s.extra {
-		merged[k] = v
-	}
-	add := func(k string, v any) { b, _ := json.Marshal(v); merged[k] = b }
-	add("channels", s.cfg.Channels)
-	add("profiles", s.cfg.Profiles)
-	add("active_profile", s.cfg.Active)
-	add("detect", s.cfg.Detect)
-	body, err := marshalOrdered(merged, []string{"detect", "active_profile", "profiles", "channels"})
-	if err != nil {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b, _ := json.Marshal(s.cfg)
+	var nv map[string]any
+	if err := json.Unmarshal(b, &nv); err != nil {
 		return err
 	}
-	out := append(append([]byte{}, s.header...), body...)
-	out = append(out, '\n')
+
+	var out []byte
+	if len(bytes.TrimSpace(s.raw)) > 0 {
+		edited, err := editJSONC(s.raw, nv, topOrder)
+		if err != nil {
+			return err
+		}
+		out = edited
+	} else {
+		merged := map[string]json.RawMessage{}
+		add := func(k string, v any) { vb, _ := json.Marshal(v); merged[k] = vb }
+		add("channels", s.cfg.Channels)
+		add("profiles", s.cfg.Profiles)
+		add("active_profile", s.cfg.Active)
+		add("detect", s.cfg.Detect)
+		body, err := marshalOrdered(merged, topOrder)
+		if err != nil {
+			return err
+		}
+		out = body
+	}
+	if !bytes.HasSuffix(out, []byte("\n")) {
+		out = append(out, '\n')
+	}
+
 	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
 		return err
 	}
@@ -227,7 +235,11 @@ func (s *Store) save() error {
 	if err := os.WriteFile(tmp, out, 0o600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, s.path)
+	if err := os.Rename(tmp, s.path); err != nil {
+		return err
+	}
+	s.raw = out // subsequent saves splice into the just-written document
+	return nil
 }
 
 // Get returns a copy-ish snapshot of the config (slices are shared read-only).

@@ -71,34 +71,6 @@ func stripTrailingCommas(b []byte) []byte {
 	return b
 }
 
-// leadingComment returns the bytes before the first structural '{' (the
-// top-level object opener), respecting comments — i.e. the file's header
-// comment/whitespace block, preserved verbatim across saves.
-func leadingComment(raw []byte) []byte {
-	n := len(raw)
-	i := 0
-	for i < n {
-		c := raw[i]
-		switch {
-		case c == '/' && i+1 < n && raw[i+1] == '/':
-			for i < n && raw[i] != '\n' {
-				i++
-			}
-		case c == '/' && i+1 < n && raw[i+1] == '*':
-			i += 2
-			for i+1 < n && !(raw[i] == '*' && raw[i+1] == '/') {
-				i++
-			}
-			i += 2
-		case c == '{':
-			return raw[:i]
-		default:
-			i++
-		}
-	}
-	return nil
-}
-
 // marshalOrdered pretty-prints a JSON object with the given keys first (in
 // order) then any remaining keys sorted, using 2-space indentation.
 func marshalOrdered(m map[string]json.RawMessage, order []string) ([]byte, error) {
