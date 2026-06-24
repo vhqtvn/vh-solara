@@ -7,27 +7,18 @@
 // A single global installer tags known scroll surfaces (and any added later —
 // dialogs, menus, popovers) so individual components don't need wiring.
 
+// Inner scroll panes only. The fade is an inset box-shadow, which would replace
+// any drop-shadow a surface already has — so popovers/menus/the tasks list
+// (which carry their own box-shadow) are intentionally excluded.
 const SELECTOR = [
   ".chat-scroll",
   ".tree",
   ".reasoning-body",
-  ".tasks-list",
-  ".palette-list",
-  ".notif-list",
   ".notes-view",
   ".git-body",
   ".dialog-body",
   ".settings-content",
   ".settings-nav",
-  ".admin-menu",
-  ".managed-dialog",
-  ".ctxm-menu",
-  ".ctxm-sheet",
-  ".confirm-list",
-  ".status-menu",
-  ".vh-select-pop",
-  ".vh-select-sheet",
-  ".ac-pop",
 ].join(",");
 
 const EDGE = 6; // px slack before an edge counts as "more content that way"
@@ -37,11 +28,6 @@ function attach(el: HTMLElement) {
   if (tracked.has(el)) return;
   tracked.add(el);
   el.classList.add("scroll-edges");
-  // The shadow is a sticky pseudo, which pins to the PADDING edge — expose the
-  // container's padding so the CSS can pull it back to the border edge (flush).
-  const cs = getComputedStyle(el);
-  el.style.setProperty("--se-pt", cs.paddingTop);
-  el.style.setProperty("--se-pb", cs.paddingBottom);
   let raf = 0;
   const update = () => {
     raf = 0;
