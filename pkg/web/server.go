@@ -88,6 +88,11 @@ type Server struct {
 	// managed, when set by the daemon, owns repo-declared processes+views for
 	// projects (.vh-solara/project.jsonc). nil = managed-projects disabled.
 	managed *Orchestrator
+
+	// aggHook, when set, is invoked for each project aggregator as it is touched
+	// (default project and every lazily-created one) — the alerts engine uses it
+	// to subscribe its detector to the project's store. Idempotent per dir.
+	aggHook func(dir string, a *aggregator.Aggregator)
 	// managedDefaultOnce guards the one-time managed-project open of the default
 	// project (daemon cwd), triggered by the first request that touches it.
 	managedDefaultOnce sync.Once
@@ -211,6 +216,9 @@ func (s *Server) aggFor(dir string) *aggregator.Aggregator {
 		if s.managed != nil {
 			s.managedDefaultOnce.Do(func() { s.managed.OpenProject("") })
 		}
+		if s.aggHook != nil {
+			s.aggHook("", s.agg)
+		}
 		return s.agg
 	}
 	s.aggMu.Lock()
@@ -226,9 +234,16 @@ func (s *Server) aggFor(dir string) *aggregator.Aggregator {
 	if s.managed != nil {
 		s.managed.OpenProject(dir)
 	}
+	if s.aggHook != nil {
+		s.aggHook(dir, a)
+	}
 	go a.Run(context.Background())
 	return a
 }
+
+// SetAggHook installs a per-project callback fired as each aggregator is touched
+// (default + lazily-created). The alerts engine uses it to subscribe. Optional.
+func (s *Server) SetAggHook(fn func(dir string, a *aggregator.Aggregator)) { s.aggHook = fn }
 
 // reqDir extracts the requested project directory from ?dir= (snapshot/stream)
 // or the x-opencode-directory header (passthrough).
@@ -632,6 +647,15 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		case ev, ok := <-ch:
 			if !ok {
 				return // dropped as a slow consumer; client will reconnect + resume
+			}
+			if ev.Kind == "notice" {
+				// Transient alert (state.KindNotice): not part of the replayable
+				// view and it reuses the current head seq, so forward it WITHOUT the
+				// seq-baseline guard and WITHOUT an id line (don't move the resume
+				// cursor). A resuming client never replays it.
+				fmt.Fprintf(w, "event: notice\ndata: %s\n\n", ev.Payload)
+				flusher.Flush()
+				continue
 			}
 			if ev.Seq <= baseline {
 				continue // already covered by snapshot/replay

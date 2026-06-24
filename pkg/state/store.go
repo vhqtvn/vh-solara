@@ -33,6 +33,11 @@ const (
 	KindQuestionClear   = "question.delete"
 	KindUnreadSet       = "unread.set"
 	KindUnreadClear     = "unread.clear"
+	// KindNotice carries a daemon-detected alert (turn finished, waiting on a
+	// human, stuck/runaway/stalled) for in-app delivery. It is NOT part of the
+	// materialized view — it's a transient fan-out, not stored in any snapshot —
+	// so a resuming client only sees notices emitted after it connects.
+	KindNotice = "notice"
 )
 
 // Per-session activity states surfaced to clients (sidebar status).
@@ -260,6 +265,27 @@ func (s *Store) emit(kind string, payload json.RawMessage) {
 		case ch <- ev:
 		default:
 			// Slow consumer: drop it. The client will reconnect and re-snapshot.
+			close(ch)
+			delete(s.subs, id)
+		}
+	}
+}
+
+// EmitNotice fans out a transient notice event to live subscribers. Unlike the
+// view events, a notice is not recorded into any snapshot — it is delivered only
+// to currently-connected clients (resuming clients won't replay it). Safe to
+// call from any goroutine.
+func (s *Store) EmitNotice(payload json.RawMessage) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// Fan out WITHOUT recording to the ring or advancing seq: a notice is a live
+	// alert, not part of the replayable view. Reusing the current head seq keeps
+	// resume cursors monotonic (no gap, no duplicate-advance).
+	ev := ClientEvent{Seq: s.seq, Kind: KindNotice, Payload: payload}
+	for id, ch := range s.subs {
+		select {
+		case ch <- ev:
+		default:
 			close(ch)
 			delete(s.subs, id)
 		}

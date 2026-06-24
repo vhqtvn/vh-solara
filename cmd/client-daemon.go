@@ -376,6 +376,13 @@ var clientDaemonCmd = &cobra.Command{
 			var vhCtx context.Context
 			vhCtx, vhCancel = context.WithCancel(context.Background())
 			go agg.Run(vhCtx)
+
+			// Notifications/alerts engine: daemon-side detection + outbound webhooks,
+			// plus the in-app notice bus. Non-fatal if its config can't load.
+			if _, err := srv.InitAlerts(vhCtx); err != nil {
+				log.Printf("alerts engine disabled: %v", err)
+			}
+
 			handler := srv.Handler()
 			// Optional AF_UNIX listener for the same /vh/* — reachable by bind-mount
 			// from a container with no host networking, no port discovery.

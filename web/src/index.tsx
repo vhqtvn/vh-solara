@@ -11,6 +11,7 @@ import { initPwaInstall } from "./pwa-install";
 import { installCsrf } from "./csrf";
 import { installViewport } from "./viewport";
 import { installScrollEdges } from "./lib/scrollEdges";
+import { startPresence } from "./alerts";
 import "./styles.css";
 
 installCsrf(); // must run before any fetch
@@ -27,5 +28,6 @@ void loadAgents();
 registerServiceWorker();
 startVersionCheck();
 initPwaInstall();
+startPresence();
 render(() => <App />, document.getElementById("root")!);
 installScrollEdges();

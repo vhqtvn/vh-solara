@@ -103,6 +103,12 @@ func main() {
 		orch.OpenProject("")
 	}
 
+	// Notifications/alerts engine, exactly as the daemon wires it — so the
+	// Settings → Notifications page and the in-app notice flow are demoable.
+	if _, err := srv.InitAlerts(context.Background()); err != nil {
+		log.Printf("(fixture) alerts engine disabled: %v", err)
+	}
+
 	log.Printf("vh fixture server: http://%s  (fake opencode at %s)", *addr, ocURL)
 	if err := http.ListenAndServe(*addr, srv.Handler()); err != nil {
 		log.Fatalf("vh web server: %v", err)
