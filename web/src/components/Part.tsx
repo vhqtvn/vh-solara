@@ -138,13 +138,13 @@ function MarkdownHtml(props: { text: string; live?: boolean }) {
     () => props.text,
     (t) => renderMarkdown(t),
   );
-  // Instant client-rendered fallback (same renderer as the live stream) so a
-  // block that just finished streaming shows formatted prose immediately instead
-  // of flashing raw during the /vh/render round-trip; the server HTML (chroma +
-  // sanitization) silently upgrades it. ONLY for `live` blocks (the message that
-  // streamed in front of the user) — bulk-loaded history keeps the zero-cost raw
-  // fallback so opening a long transcript doesn't run a marked.parse per block.
-  const liveFallback = createMemo(() => (props.live ? renderStreamMd(props.text) : ""));
+  // Instant client-rendered fallback (same renderer as the live stream) shown
+  // until the server HTML (chroma highlighting + sanitization) arrives and
+  // silently upgrades it. Used for history too — opening a session otherwise
+  // flashed RAW text → rendered as each block's /vh/render round-trip resolved.
+  // The cost is bounded: only on-screen parts mount (Deferred), so this is a
+  // handful of parses, not the whole transcript.
+  const clientMd = createMemo(() => renderStreamMd(props.text));
   let ref: HTMLDivElement | undefined;
   createEffect(() => {
     if (html())
@@ -161,7 +161,7 @@ function MarkdownHtml(props: { text: string; live?: boolean }) {
   return (
     <Show
       when={html()}
-      fallback={props.live ? <div class="md" innerHTML={liveFallback()} /> : <div class="md-raw">{props.text}</div>}
+      fallback={<div class="md" innerHTML={clientMd()} />}
     >
       <div class="md" ref={ref} innerHTML={html()!} onClick={onClick} />
     </Show>
