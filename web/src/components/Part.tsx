@@ -496,11 +496,10 @@ export default function PartView(props: { part: Part; settled?: boolean; tail?: 
 }
 
 // ActivityGroup renders a run of consecutive tool/reasoning parts as one compact
-// "Activity" timeline (OpenChamber-style): a header that collapses the list, a
-// "+N more…" affordance, and per-row expand-to-full-detail (every tool, not just
-// some — this is our deliberate divergence from OpenChamber). Collapsed by
-// default, showing the last ACTIVITY_PREVIEW rows.
-const ACTIVITY_PREVIEW = 5;
+// "Activity" timeline (OpenChamber-style): a header that discloses the full list
+// with a smooth open/close animation, and per-row expand-to-full-detail (every
+// tool, not just some — our deliberate divergence from OpenChamber). Collapsed
+// shows only the header + count; the LAST group in the conversation auto-opens.
 export function ActivityGroup(props: { parts: Part[]; settled: boolean; tailId?: string | null; isLast?: boolean }) {
   // Collapsed by default; the LAST activity group in the conversation starts
   // expanded. `override` records a manual toggle and then wins, so reading older
@@ -509,32 +508,42 @@ export function ActivityGroup(props: { parts: Part[]; settled: boolean; tailId?:
   const [override, setOverride] = createSignal<boolean | null>(null);
   const expanded = () => override() ?? !!props.isLast;
   const total = () => props.parts.length;
-  const hidden = () => (expanded() ? 0 : Math.max(0, total() - ACTIVITY_PREVIEW));
-  const visible = () => (expanded() ? props.parts : props.parts.slice(-ACTIVITY_PREVIEW));
+  // Keep the rows mounted once revealed so the collapse animation has content to
+  // shrink; a never-opened old group renders no rows at all (cheap history).
+  const [revealed, setRevealed] = createSignal(expanded());
+  createEffect(() => {
+    if (expanded()) setRevealed(true);
+  });
   return (
     <div class="activity">
-      <button type="button" class="activity-head" onClick={() => setOverride(!expanded())}>
+      <button
+        type="button"
+        class="activity-head"
+        aria-expanded={expanded()}
+        onClick={() => setOverride(!expanded())}
+      >
         <Icon name="cpu" size={14} />
         <span class="activity-title">Activity</span>
         <span class="activity-count">{total()}</span>
         <span class="activity-chev" classList={{ rot: expanded() }}><Icon name="chevronDown" size={12} /></span>
       </button>
-      <div class="activity-rows">
-        <Show when={hidden() > 0}>
-          <button type="button" class="activity-more" onClick={() => setOverride(true)}>+{hidden()} more…</button>
-        </Show>
-        <For each={visible()}>
-          {(p) => (
-            <Switch>
-              <Match when={p.type === "reasoning"}>
-                <ReasoningPart part={p} settled={props.settled} tail={p.id === props.tailId} />
-              </Match>
-              <Match when={p.type === "tool"}>
-                <ToolPart part={p} tail={p.id === props.tailId} />
-              </Match>
-            </Switch>
-          )}
-        </For>
+      <div class="activity-rows-wrap" classList={{ open: expanded() }}>
+        <div class="activity-rows">
+          <Show when={revealed()}>
+            <For each={props.parts}>
+              {(p) => (
+                <Switch>
+                  <Match when={p.type === "reasoning"}>
+                    <ReasoningPart part={p} settled={props.settled} tail={p.id === props.tailId} />
+                  </Match>
+                  <Match when={p.type === "tool"}>
+                    <ToolPart part={p} tail={p.id === props.tailId} />
+                  </Match>
+                </Switch>
+              )}
+            </For>
+          </Show>
+        </div>
       </div>
     </div>
   );

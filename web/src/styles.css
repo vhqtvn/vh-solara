@@ -1102,23 +1102,28 @@ body {
   font-size: 11px; color: var(--fg-dim); background: var(--code-bg);
   border-radius: 999px; padding: 0 7px; line-height: 18px; font-variant-numeric: tabular-nums;
 }
-.activity-chev { display: inline-flex; align-items: center; color: var(--fg-dim); transition: transform 0.12s ease; }
+.activity-chev { display: inline-flex; align-items: center; color: var(--fg-dim); transition: transform 0.18s var(--ease, ease); }
 .activity-chev.rot { transform: rotate(180deg); }
+/* Disclosure animation: a grid track collapses 1fr -> 0fr, which animates the
+   row block open/closed without needing a measured pixel height. The inner
+   element must clip its overflow and allow shrinking below content size. */
+.activity-rows-wrap {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows 0.22s var(--ease, ease);
+}
+.activity-rows-wrap.open { grid-template-rows: 1fr; }
 .activity-rows {
-  margin: 2px 0 0 7px; padding-left: 12px;
+  overflow: hidden;
+  min-height: 0;
+  margin-left: 7px; padding-left: 12px;
   border-left: 1px solid var(--border);
   display: flex; flex-direction: column; gap: 1px;
-  /* Smoothly grow/shrink when toggling the group or expanding a tool row.
-     interpolate-size lets height:auto transition (Chrome 129+); degrades to an
-     instant change elsewhere. overflow:clip so revealed rows don't spill mid-anim. */
-  overflow: clip;
-  transition: height 0.2s var(--ease, ease);
 }
-.activity-more {
-  align-self: flex-start; background: transparent; border: 0; color: var(--fg-dim);
-  cursor: pointer; font: inherit; font-size: 12px; padding: 3px 4px;
+.activity-rows-wrap.open .activity-rows { padding-top: 2px; }
+@media (prefers-reduced-motion: reduce) {
+  .activity-rows-wrap, .activity-chev { transition: none; }
 }
-.activity-more:hover { color: var(--fg); }
 .tool-output-code .md { margin: 0; }
 .tool-output-code .md pre { margin: 0; border: 0; border-radius: 0; max-height: 320px; }
 .file-chip {
