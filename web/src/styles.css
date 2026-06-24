@@ -820,29 +820,32 @@ body {
    area's height (not the whole column incl. composer). */
 .chat-main { position: relative; flex: 1; min-height: 0; display: flex; flex-direction: column; }
 
-/* Right-edge navigator ("minimap"): one tick per user turn. Spans the scroll
-   area top→bottom; ticks flex-SHRINK so they always fit — a session with
-   hundreds of turns compresses to a dense strip instead of overflowing/clipping. */
+/* Right-edge navigator ("minimap"): one tick per user turn, compact fixed
+   spacing. When there are more turns than fit, it shows a WINDOW centred on the
+   current turn with up/down indicators — so spacing stays constant regardless of
+   session length (never spread, never clipped). Centred in the scroll area. */
 .chat-nav {
-  position: absolute; top: 10px; bottom: 10px; right: 3px;
-  display: flex; flex-direction: column; align-items: flex-end;
-  z-index: 20; opacity: 0.32; transition: opacity 0.15s ease;
+  position: absolute; top: 0; bottom: 0; right: 3px;
+  display: flex; flex-direction: column; align-items: flex-end; justify-content: center;
+  gap: 5px; padding: 6px 2px; z-index: 20;
+  opacity: 0.32; transition: opacity 0.15s ease;
 }
 .chat-nav:hover { opacity: 1; }
 .chat-nav-dot {
-  flex: 1 1 0; min-height: 0;        /* share the height; shrink to always fit */
-  width: 22px; padding: 0; border: 0; background: transparent; cursor: pointer;
-  display: flex; align-items: center; justify-content: flex-end;
+  flex: 0 0 auto; width: 16px; height: 4px; border-radius: 2px;
+  padding: 0; border: 0; cursor: pointer; background: var(--fg-dim);
+  transition: width 0.12s ease, background 0.12s ease;
 }
-/* The visible tick is a capped bar centred in the (possibly tall) flex slot, so
-   few turns read as evenly-spaced ticks and many turns read as a dense bar. */
-.chat-nav-dot::before {
-  content: ""; width: 16px; height: 100%; max-height: 5px; border-radius: 2px;
-  background: var(--fg-dim);
-  transition: width 0.12s ease, background 0.12s ease, max-height 0.12s ease;
+.chat-nav-dot:hover { width: 24px; background: var(--fg); }
+.chat-nav-dot.active { width: 24px; background: var(--accent); }
+/* "More above / below" indicator (a faint chevron; click to page toward it). */
+.chat-nav-more {
+  flex: 0 0 auto; display: flex; align-items: center; justify-content: flex-end;
+  width: 16px; height: 11px; padding: 0; border: 0; background: transparent;
+  color: var(--fg-dim); cursor: pointer;
 }
-.chat-nav-dot:hover::before { width: 22px; background: var(--fg); max-height: 6px; }
-.chat-nav-dot.active::before { width: 22px; background: var(--accent); max-height: 7px; }
+.chat-nav-more:hover { color: var(--fg); }
+.chat-nav-more.up { transform: rotate(180deg); }
 /* Hover/focus preview, anchored to the LEFT of the hovered tick. */
 .chat-nav-bubble {
   position: absolute; right: 100%; margin-right: 10px; transform: translateY(-50%);

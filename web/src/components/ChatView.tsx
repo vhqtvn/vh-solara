@@ -298,6 +298,25 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   function scheduleActiveTurn() {
     if (!navRaf) navRaf = requestAnimationFrame(updateActiveTurn);
   }
+  // How many ticks fit at the fixed spacing (4px dot + 5px gap), leaving room for
+  // the two indicators. Recomputed on resize.
+  const [navCap, setNavCap] = createSignal(15);
+  function measureNavCap() {
+    if (!scrollEl) return;
+    const usable = scrollEl.clientHeight - 20 /*insets*/ - 28 /*indicators*/;
+    setNavCap(Math.max(5, Math.floor(usable / 9)));
+  }
+  // The visible window of ticks, centred on the active turn. When the whole set
+  // fits (N <= cap) this is just all of them (identical to the old minimap).
+  const navWindow = createMemo(() => {
+    const turns = userTurns();
+    const N = turns.length;
+    const cap = Math.max(3, Math.min(navCap(), N));
+    const ai = Math.max(0, turns.findIndex((t: any) => t.id === activeTurn()));
+    let start = Math.max(0, Math.min(ai - Math.floor(cap / 2), N - cap));
+    const end = Math.min(N, start + cap);
+    return { items: turns.slice(start, end), start, end, total: N };
+  });
 
   const pendingPermissions = createMemo(() => Object.values(state.permissions[props.sessionId] || {}));
   const pendingQuestions = createMemo(() => Object.values(state.questions[props.sessionId] || {}));
@@ -482,6 +501,15 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       ro.disconnect();
       if (scrollEl && !props.draft) setScroll(props.sessionId, scrollEl.scrollTop);
     });
+  });
+
+  // Track the scroll-area height to size the navigator window (how many ticks fit).
+  onMount(() => {
+    measureNavCap();
+    if (!scrollEl) return;
+    const ro = new ResizeObserver(() => measureNavCap());
+    ro.observe(scrollEl);
+    onCleanup(() => ro.disconnect());
   });
 
   // Scroll handling: track follow state, persist the offset, and mark the
@@ -1080,7 +1108,18 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       </div>
         <Show when={isDesktop() && userTurns().length > 1}>
           <div class="chat-nav" aria-label="Jump to a turn">
-            <For each={userTurns()}>
+            <Show when={navWindow().start > 0}>
+              <button
+                type="button"
+                class="chat-nav-more up"
+                title={`${navWindow().start} earlier turn${navWindow().start > 1 ? "s" : ""}`}
+                aria-label={`${navWindow().start} earlier turns`}
+                onClick={() => jumpToMsg(userTurns()[Math.max(0, navWindow().start - 1)].id)}
+              >
+                <Icon name="chevronDown" size={11} />
+              </button>
+            </Show>
+            <For each={navWindow().items}>
               {(m) => (
                 <button
                   type="button"
@@ -1096,6 +1135,17 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
                 />
               )}
             </For>
+            <Show when={navWindow().end < navWindow().total}>
+              <button
+                type="button"
+                class="chat-nav-more"
+                title={`${navWindow().total - navWindow().end} more turn${navWindow().total - navWindow().end > 1 ? "s" : ""}`}
+                aria-label={`${navWindow().total - navWindow().end} more turns`}
+                onClick={() => jumpToMsg(userTurns()[Math.min(navWindow().total - 1, navWindow().end)].id)}
+              >
+                <Icon name="chevronDown" size={11} />
+              </button>
+            </Show>
             <Show when={navPreview()}>
               {(pv) => <div class="chat-nav-bubble" style={{ top: `${pv().y}px` }}>{pv().text}</div>}
             </Show>
