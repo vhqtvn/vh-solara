@@ -43,7 +43,9 @@ test("empty state invites a new session", async ({ page }) => {
 test("settings appearance has a configurable display font", async ({ page }) => {
   await page.goto("/");
   await page.getByRole("button", { name: "Settings" }).click();
-  const fontSel = page.getByLabel("Display font");
+  const dialog = page.getByRole("dialog", { name: "Settings" });
+  await dialog.getByRole("button", { name: "Appearance" }).click();
+  const fontSel = dialog.getByLabel("Display font");
   await expect(fontSel).toBeVisible();
   await fontSel.click(); // open the custom dropdown
   await page.getByRole("option", { name: "Inter" }).click();
@@ -60,7 +62,9 @@ test("session list detailed density adds a second line per session", async ({ pa
   // No second line in the default (compact) density.
   await expect(page.locator(".tree-sub")).toHaveCount(0);
   await page.getByRole("button", { name: "Settings" }).click();
-  const densSel = page.getByLabel("Session list density");
+  const dialog = page.getByRole("dialog", { name: "Settings" });
+  await dialog.getByRole("button", { name: "Appearance" }).click();
+  const densSel = dialog.getByLabel("Session list density");
   await densSel.click();
   await page.getByRole("option", { name: /Detailed/ }).click();
   // Close settings.
@@ -129,34 +133,20 @@ test("message inspect shows tokens/cost/raw JSON", async ({ page }) => {
   await expect(page.locator(".msg-inspect").first()).toContainText("role");
 });
 
-test("clickable file path opens the file viewer at the line", async ({ page }) => {
+test("clicking a file path opens it in the code viewer", async ({ page }) => {
+  // The old modal FileViewer was replaced by the code viewer: a clicked path now
+  // opens the docked (desktop) / overlay (mobile) code surface, not a dialog.
   await page.goto("/");
   await page.getByRole("button", { name: /Demo session/ }).click();
   await page.locator(".filepath", { hasText: "src/parser.go" }).first().click();
-  const fv = page.getByRole("dialog", { name: "File" });
-  await expect(fv).toBeVisible();
-  await expect(fv).toContainText("src/parser.go");
-
-  // Syntax highlighting (client-side): Go keywords get hljs token spans, and the
-  // language is inferred from the .go extension.
-  await expect(fv.locator(".fv-lc .hljs-keyword").first()).toBeVisible();
-  await expect(fv.locator(".fv-lang .vh-select-label")).toHaveText("go");
-
-  // Changing the language re-highlights.
-  await fv.locator(".fv-lang .vh-select-btn").click();
-  await page.getByRole("option", { name: "python", exact: true }).click(); // portaled
-  await expect(fv.locator(".fv-lang .vh-select-label")).toHaveText("python");
-
-  // Word-wrap toggle flips the code block's wrap class.
-  await expect(fv.locator(".fv-code.wrap")).toHaveCount(0);
-  await fv.locator(".fv-wrap").click();
-  await expect(fv.locator(".fv-code.wrap")).toHaveCount(1);
+  await expect(page.locator(".code-dock.dock, .code-dock.overlay")).toBeVisible({ timeout: 6000 });
 });
 
 test("UI zoom scales the interface and persists (versioned)", async ({ page }) => {
   await page.goto("/");
   await page.getByRole("button", { name: "Settings" }).click();
   const dialog = page.getByRole("dialog", { name: "Settings" });
+  await dialog.getByRole("button", { name: "Appearance" }).click();
   const slider = dialog.getByRole("slider", { name: "UI zoom" });
   await expect(slider).toBeVisible();
   await slider.evaluate((el: HTMLInputElement) => {
@@ -214,7 +204,11 @@ test("shell mode (! prefix) runs a command and shows output", async ({ page }) =
   await page.getByRole("button", { name: /Demo session/ }).click();
   await page.getByPlaceholder(/Message/).fill("!ls -la");
   await page.keyboard.press("Enter");
-  await expect(page.getByText(/fixture shell output for: ls -la/)).toBeVisible({ timeout: 8000 });
-  // The bash tool shows the actual command line, not just a description.
-  await expect(page.locator(".tool-cmd").last()).toHaveText(/\$ ls -la/);
+  // The command runs as a bash tool whose head shows the command line.
+  const shellTool = page.locator(".tool").filter({ hasText: "ls -la" }).last();
+  await expect(shellTool).toBeVisible({ timeout: 8000 });
+  // The captured output sits behind the tool's disclosure — expand if collapsed.
+  const output = shellTool.getByText(/fixture shell output for: ls -la/);
+  if (!(await output.isVisible())) await shellTool.locator(".tool-head").click();
+  await expect(output).toBeVisible({ timeout: 4000 });
 });

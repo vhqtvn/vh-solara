@@ -49,3 +49,29 @@ jobs:
         run: npm run test:unit
       - name: build
         run: npm run build
+
+  # Fixture-backed Playwright e2e. Needs Go too — the Playwright webServer builds
+  # the SPA and runs ./tools/fixtureserver (real aggregator + fake OpenCode).
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: install deps
+        working-directory: web
+        run: npm ci
+      - name: install Playwright browser
+        working-directory: web
+        run: npx playwright install --with-deps chromium
+      - name: e2e
+        working-directory: web
+        run: npm run test:e2e

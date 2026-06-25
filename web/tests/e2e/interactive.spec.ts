@@ -76,6 +76,8 @@ test("header usage pill shows context + quota and opens the inspector", async ({
 });
 
 test("notes view persists a to-do and project notes to the server", async ({ page }) => {
+  // Notes is off by default now — enable the pref so the tab is present.
+  await page.addInitScript(() => localStorage.setItem("vh.prefs.notesEnabled.v1", JSON.stringify({ v: 1, data: true })));
   await page.goto("/");
   await page.getByRole("button", { name: "Notes", exact: true }).click();
 
@@ -194,9 +196,10 @@ test("right-click session title opens a menu; Archive… confirms related sessio
   await page.locator(".main-title.has-menu").click({ button: "right" });
   const menu = page.locator(".ctxm-menu");
   await expect(menu).toBeVisible();
-  await expect(menu).toContainText("Copy title");
-  await expect(menu).toContainText("Copy session id");
-  await expect(menu.getByText(/Copy .title \(id\)./)).toBeVisible();
+  // Copy is now a labelled group with Title / Session id / Title + id entries.
+  await expect(menu).toContainText("Copy");
+  await expect(menu).toContainText("Session id");
+  await expect(menu).toContainText("Title + id");
 
   // Archive… → confirmation lists the related sessions.
   await menu.getByText("Archive…").click();

@@ -61,9 +61,11 @@ test("light theme: a select control renders a light background, not dark", async
   await page.goto("/");
   await useLightTheme(page);
 
-  // Open Settings — its Theme/Session-list/etc. selects are .vh-select-btn.
+  // Open Settings → Appearance, whose density/font selects are .vh-select-btn.
   await page.getByRole("button", { name: "Settings" }).click();
-  const btn = page.locator(".vh-select-btn").first();
+  const dialog = page.getByRole("dialog", { name: "Settings" });
+  await dialog.getByRole("button", { name: "Appearance" }).click();
+  const btn = dialog.locator(".vh-select-btn").first();
   await expect(btn).toBeVisible();
 
   const bg = await btn.evaluate((el) => getComputedStyle(el).backgroundColor);
@@ -79,7 +81,8 @@ test("light theme: accent-filled controls (send button, active tab) use white te
 
   // The active view tab is filled with the (darker, on light) accent, so its
   // text must be white — not the dark navy that suits the dark theme's accent.
-  const activeTab = page.locator(".seg button.on");
+  // (.first() — the TabBar keeps a hidden measure-row that duplicates the tabs.)
+  const activeTab = page.locator(".tabbar-tab.on").first();
   await expect(activeTab).toBeVisible();
   expect(channelSum(await activeTab.evaluate((el) => getComputedStyle(el).color))).toBeGreaterThan(600);
 
