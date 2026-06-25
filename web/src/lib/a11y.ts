@@ -4,7 +4,12 @@
 // element aria-modal, moves focus inside on open, traps Tab/Shift+Tab within it,
 // and restores focus to the previously-focused element on close. Escape/outside-
 // click closing is left to each dialog (they already handle it).
-import { onCleanup } from "solid-js";
+import { createSignal, onCleanup } from "solid-js";
+
+// Count of open modal dialogs (anything using the `modal` directive). Lets
+// global hotkeys/menus stand down while a dialog owns the keyboard.
+const [modalCount, setModalCount] = createSignal(0);
+export const anyModalOpen = () => modalCount() > 0;
 
 const FOCUSABLE =
   'a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])';
@@ -17,6 +22,7 @@ function focusables(root: HTMLElement): HTMLElement[] {
 
 export function attachModal(el: HTMLElement): () => void {
   const prev = document.activeElement as HTMLElement | null;
+  setModalCount((n) => n + 1);
   el.setAttribute("aria-modal", "true");
   if (!el.getAttribute("role")) el.setAttribute("role", "dialog");
   // Move focus in so the keyboard/SR user starts inside the modal, not on the
@@ -58,6 +64,7 @@ export function attachModal(el: HTMLElement): () => void {
   document.addEventListener("keydown", onKey, true);
   return () => {
     document.removeEventListener("keydown", onKey, true);
+    setModalCount((n) => Math.max(0, n - 1));
     // Restore focus to whatever had it before the dialog opened.
     if (prev && document.contains(prev)) prev.focus();
   };
