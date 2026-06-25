@@ -146,11 +146,11 @@ func TestViewProxyContract(t *testing.T) {
 func TestViewPrefixValidation(t *testing.T) {
 	s := &Server{views: newViewRegistry()}
 	bad := []string{
-		`{"view_id":"a","path_prefix":"/","upstream":"unix:/x.sock"}`,       // root
-		`{"view_id":"a","path_prefix":"/vh/x","upstream":"unix:/x.sock"}`,   // reserved
-		`{"view_id":"a","path_prefix":"board","upstream":"unix:/x.sock"}`,   // no leading slash
-		`{"view_id":"a","path_prefix":"/ok","upstream":"ftp://x"}`,          // bad upstream
-		`{"view_id":"","path_prefix":"/ok","upstream":"unix:/x.sock"}`,      // no id
+		`{"view_id":"a","path_prefix":"/","upstream":"unix:/x.sock"}`,     // root
+		`{"view_id":"a","path_prefix":"/vh/x","upstream":"unix:/x.sock"}`, // reserved
+		`{"view_id":"a","path_prefix":"board","upstream":"unix:/x.sock"}`, // no leading slash
+		`{"view_id":"a","path_prefix":"/ok","upstream":"ftp://x"}`,        // bad upstream
+		`{"view_id":"","path_prefix":"/ok","upstream":"unix:/x.sock"}`,    // no id
 	}
 	for _, b := range bad {
 		rec := registerView(t, s, b)

@@ -211,7 +211,7 @@ func TestOrchestrator_UntrustedThenGrant(t *testing.T) {
 	waitFor(t, func() bool {
 		st, _ := mgr.Status(root, "svc")
 		return st.Status.IsRunning()
-	}, "process running after grant");
+	}, "process running after grant")
 
 	// View should be registered (origin=managed) at its per-project namespaced path.
 	v := o.views.match(managedViewPrefix(root, "/svc"))

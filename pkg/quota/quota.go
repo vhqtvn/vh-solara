@@ -22,13 +22,13 @@ import (
 
 // UsageWindow is one rate-limit/credit window for a provider.
 type UsageWindow struct {
-	Label            string   `json:"label"`
-	UsedPercent      *float64 `json:"usedPercent"`
-	RemainingPercent *float64 `json:"remainingPercent"`
-	WindowSeconds    *int64   `json:"windowSeconds"`
-	ResetAfterSeconds *int64  `json:"resetAfterSeconds"`
-	ResetAt          *int64   `json:"resetAt"`
-	ValueLabel       string   `json:"valueLabel,omitempty"`
+	Label             string   `json:"label"`
+	UsedPercent       *float64 `json:"usedPercent"`
+	RemainingPercent  *float64 `json:"remainingPercent"`
+	WindowSeconds     *int64   `json:"windowSeconds"`
+	ResetAfterSeconds *int64   `json:"resetAfterSeconds"`
+	ResetAt           *int64   `json:"resetAt"`
+	ValueLabel        string   `json:"valueLabel,omitempty"`
 }
 
 // ProviderResult is the per-provider quota report.

@@ -21,13 +21,13 @@ import (
 // Notice is the typed alert payload emitted on the store bus (for in-app
 // delivery) and POSTed to webhook channels.
 type Notice struct {
-	Type      string `json:"type"`              // finished | waiting | stuck-thinking | runaway | stalled
-	SessionID string `json:"sessionID"`         // the session the notice is about
-	Root      string `json:"root"`              // its root session
-	Project   string `json:"project"`           // project dir
-	Title     string `json:"title,omitempty"`   // session title (best-effort)
-	Detail    string `json:"detail,omitempty"`  // short human description
-	Ts        int64  `json:"ts"`                // unix millis when detected
+	Type      string `json:"type"`             // finished | waiting | stuck-thinking | runaway | stalled
+	SessionID string `json:"sessionID"`        // the session the notice is about
+	Root      string `json:"root"`             // its root session
+	Project   string `json:"project"`          // project dir
+	Title     string `json:"title,omitempty"`  // session title (best-effort)
+	Detail    string `json:"detail,omitempty"` // short human description
+	Ts        int64  `json:"ts"`               // unix millis when detected
 }
 
 // Dispatcher routes notices to webhook channels per the active profile,

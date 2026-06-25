@@ -79,15 +79,15 @@ func NewPusher(cfg *Store, presence *Presence, stateDir string) (*Pusher, error)
 		return nil, err
 	}
 	p := &Pusher{
-		cfg:      cfg,
-		presence: presence,
-		client:   &http.Client{Timeout: 10 * time.Second},
-		now:      time.Now,
+		cfg:       cfg,
+		presence:  presence,
+		client:    &http.Client{Timeout: 10 * time.Second},
+		now:       time.Now,
 		vapidPriv: priv,
 		vapidPub:  pub,
-		subs:     map[string]PushSub{},
-		subsPath: filepath.Join(stateDir, "push-subs.json"),
-		cool:     map[string]time.Time{},
+		subs:      map[string]PushSub{},
+		subsPath:  filepath.Join(stateDir, "push-subs.json"),
+		cool:      map[string]time.Time{},
 	}
 	p.loadSubs()
 	return p, nil

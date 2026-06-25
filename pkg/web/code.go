@@ -25,7 +25,7 @@ import (
 // /vh/code/* namespace, fronting OpenCode's language servers.
 
 const (
-	codeMaxFileBytes      = 2 << 20  // 2 MiB: refuse to read larger files
+	codeMaxFileBytes      = 2 << 20   // 2 MiB: refuse to read larger files
 	codeHighlightMaxBytes = 512 << 10 // 512 KiB: above this serve plain (chroma is O(n))
 	codeHighlightMaxLines = 6000      // and cap lines so a giant <pre> never hangs the page
 	codeSearchMaxResults  = 200

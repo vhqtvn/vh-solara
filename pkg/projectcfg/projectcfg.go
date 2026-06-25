@@ -59,10 +59,10 @@ type Process struct {
 	Readiness *Readiness        `json:"readiness,omitempty"`
 
 	// Resolved (json:"-" → not part of the canonical hash).
-	Argv          []string `json:"-"` // executable + args (sh -c <s> for a string command)
-	ShellCommand  string   `json:"-"` // original string form, if command was a string
-	AbsCwd        string   `json:"-"` // resolved absolute working directory
-	DisplayCommand string  `json:"-"` // human form for the trust review (joined argv or the shell string)
+	Argv           []string `json:"-"` // executable + args (sh -c <s> for a string command)
+	ShellCommand   string   `json:"-"` // original string form, if command was a string
+	AbsCwd         string   `json:"-"` // resolved absolute working directory
+	DisplayCommand string   `json:"-"` // human form for the trust review (joined argv or the shell string)
 }
 
 // Readiness is the optional readiness probe. Exactly one of Unix/HTTP/Log is

@@ -71,10 +71,6 @@ export function renderMarkdown(text: string): Promise<string> {
   return enqueue("markdown", text, { text });
 }
 
-export function renderDiff(file: string, before: string, after: string): Promise<string> {
-  return enqueue("diff", [file, before, after].join(""), { file, before, after });
-}
-
 export function renderPatch(patch: string, mode: "unified" | "split" = "unified"): Promise<string> {
   // Key by mode so unified and split are cached independently.
   return enqueue("patch", mode + "" + patch, mode === "split" ? { patch, mode } : { patch });

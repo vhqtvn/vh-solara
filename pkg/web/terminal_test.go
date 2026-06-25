@@ -179,7 +179,7 @@ func TestTerminalMinSizeAcrossClients(t *testing.T) {
 
 	a := dialTerm(t, srv, dir, 100, 50) // big
 	defer a.Close()
-	b := dialTerm(t, srv, dir, 40, 20)  // small → PTY should shrink to this
+	b := dialTerm(t, srv, dir, 40, 20) // small → PTY should shrink to this
 	defer b.Close()
 	time.Sleep(300 * time.Millisecond) // let both resizes apply
 

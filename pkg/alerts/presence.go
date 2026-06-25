@@ -10,11 +10,11 @@ import (
 type Device struct {
 	ID              string    `json:"id"`
 	Name            string    `json:"name,omitempty"`
-	FocusedRoot     string    `json:"focusedRoot,omitempty"`     // root session currently in view
-	Scope           string    `json:"scope,omitempty"`           // off | current | all (per-device override; empty = use profile default)
-	LastInteraction time.Time `json:"lastInteraction"`           // last real user interaction (tap/key)
-	LastSeen        time.Time `json:"lastSeen"`                  // last heartbeat
-	Idle            bool      `json:"idle"`                      // client self-reported idle (e.g. tab hidden)
+	FocusedRoot     string    `json:"focusedRoot,omitempty"` // root session currently in view
+	Scope           string    `json:"scope,omitempty"`       // off | current | all (per-device override; empty = use profile default)
+	LastInteraction time.Time `json:"lastInteraction"`       // last real user interaction (tap/key)
+	LastSeen        time.Time `json:"lastSeen"`              // last heartbeat
+	Idle            bool      `json:"idle"`                  // client self-reported idle (e.g. tab hidden)
 }
 
 // Presence aggregates device heartbeats into an attendance signal.

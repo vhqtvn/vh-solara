@@ -3,15 +3,13 @@
 // external resources). We post-process server-rendered prose: text nodes are
 // scanned for $$…$$ / \[…\] (display) and $…$ / \(…\) (inline) and replaced with
 // the rendered MathML, skipping code/links so prices and shell vars are safe.
-import katex from "katex";
-
-function renderTex(tex: string, display: boolean): string {
-  try {
-    return katex.renderToString(tex.trim(), { output: "mathml", throwOnError: false, displayMode: display });
-  } catch {
-    return "";
-  }
-}
+//
+// KaTeX is ~280KB, so it's loaded LAZILY (dynamic import) only the first time a
+// message actually contains math — most chats never do, so it stays out of the
+// main bundle.
+type Katex = (typeof import("katex"))["default"];
+let katexP: Promise<Katex> | null = null;
+const loadKatex = () => (katexP ??= import("katex").then((m) => m.default));
 
 // $$…$$ | \[…\] (display)  ·  $…$ | \(…\) (inline). Inline $…$ must not begin or
 // end with whitespace, so "costs $5 and $10" isn't treated as math.
@@ -20,6 +18,21 @@ const MATH_RE =
 
 export function renderMathIn(root: HTMLElement | undefined) {
   if (!root) return;
+  // Cheap pre-scan: if there's no math delimiter anywhere, return immediately —
+  // and crucially WITHOUT pulling in KaTeX.
+  const txt = root.textContent || "";
+  if (!txt.includes("$") && !txt.includes("\\(") && !txt.includes("\\[")) return;
+  void loadKatex().then((katex) => renderMathSync(root, katex));
+}
+
+function renderMathSync(root: HTMLElement, katex: Katex) {
+  const renderTex = (tex: string, display: boolean): string => {
+    try {
+      return katex.renderToString(tex.trim(), { output: "mathml", throwOnError: false, displayMode: display });
+    } catch {
+      return "";
+    }
+  };
   const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
     acceptNode(n) {
       const p = (n as Text).parentElement;
