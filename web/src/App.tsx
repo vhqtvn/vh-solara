@@ -182,6 +182,15 @@ export default function App() {
   // The embedded view currently selected (if any), resolved from the live list.
   const activeEmbedded = () =>
     isEmbeddedView(view()) ? views().find((v) => v.view_id === embeddedViewId(view())) : undefined;
+  // Identity the embedded iframe actually depends on: id + proxied prefix +
+  // sandbox. The 60s views poll replaces the view objects with fresh-but-equal
+  // ones, so keying the iframe on the object reference remounted (reloaded) it
+  // every minute. Keying on this stable string remounts only on a real
+  // switch/change, never on poll churn.
+  const activeViewKey = () => {
+    const v = activeEmbedded();
+    return v ? `${v.view_id} ${v.path_prefix} ${v.sandbox || ""}` : undefined;
+  };
 
   // Long-press on the Settings button opens the server-admin popup (right-click
   // does on desktop). Plain click opens Settings. `lpFired` swallows the click
@@ -336,10 +345,11 @@ export default function App() {
                 <ChatView sessionId={selectedId()!} />
               </Show>
             </Show>
-            {/* Consumer-registered embedded views — keyed so switching remounts a
-                fresh iframe attached to the right prefix. */}
-            <Show when={activeEmbedded()} keyed>
-              {(v) => <ViewFrame view={v} />}
+            {/* Consumer-registered embedded views — keyed on the view's stable
+                identity (id+prefix+sandbox), not the object, so switching remounts
+                a fresh iframe on the right prefix but the 60s poll doesn't. */}
+            <Show when={activeViewKey()} keyed>
+              {(_key) => <ViewFrame view={activeEmbedded()!} />}
             </Show>
           </div>
           {/* Code viewer: full (Code tab), a resizable peek dock, or a mobile
