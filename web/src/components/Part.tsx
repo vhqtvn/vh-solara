@@ -2,6 +2,7 @@ import { createEffect, createMemo, createResource, createSignal, For, Match, onC
 import { createStore } from "solid-js/store";
 import { renderMarkdown } from "../render";
 import { renderStreamMd } from "../lib/md";
+import { placeStreamCaret } from "../lib/streamCaret";
 import { renderMermaid } from "../lib/mermaid";
 import { renderMathIn } from "../lib/math";
 import { streamLive } from "../prefs";
@@ -261,17 +262,23 @@ function Markdown(props: { text: string; settled: boolean; caret?: boolean }) {
     timer = window.setTimeout(() => setStreamHtml(renderStreamMd(text)), 70);
   });
   onCleanup(() => clearTimeout(timer));
-  const streamingView = () =>
-    streamLive() ? (
-      <div class="md md-stream">
-        <div innerHTML={streamHtml()} />
-        <Show when={props.caret}>
-          <span class="stream-caret" aria-hidden="true" />
-        </Show>
-      </div>
-    ) : (
-      <></>
-    );
+  const streamingView = () => {
+    if (!streamLive()) return <></>;
+    let host: HTMLDivElement | undefined;
+    // A detached caret node we re-attach after each render: setting innerHTML
+    // wipes children, so we place it fresh into the last rendered block.
+    const caretEl = document.createElement("span");
+    caretEl.className = "stream-caret";
+    caretEl.setAttribute("aria-hidden", "true");
+    createEffect(() => {
+      const html = streamHtml();
+      const tail = props.caret; // track so the caret clears when this stops being the tail
+      if (!host) return;
+      host.innerHTML = html;
+      if (tail) placeStreamCaret(host, caretEl);
+    });
+    return <div class="md md-stream" ref={host} />;
+  };
   return (
     <Show when={props.settled} fallback={streamingView()}>
       <For each={splitMermaid(props.text)}>
