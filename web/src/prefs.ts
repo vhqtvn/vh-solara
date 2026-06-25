@@ -41,11 +41,11 @@ const [uiScale, setUiScaleSig] = createSignal<number>(loadVersioned<number>(SCAL
 const VIEWPORT_BASE = "width=device-width, viewport-fit=cover, interactive-widget=resizes-content";
 function setViewportScale(scale: number) {
   const meta = document.querySelector('meta[name="viewport"]');
-  // Lock the viewport at the user's scale (pinch stays disabled).
-  meta?.setAttribute(
-    "content",
-    `${VIEWPORT_BASE}, initial-scale=${scale}, minimum-scale=${scale}, maximum-scale=${scale}, user-scalable=no`,
-  );
+  // Seed the user's UI-zoom as the baseline, but DON'T lock it — pinch-zoom must
+  // stay available (WCAG 1.4.4). Allow a generous range around the baseline.
+  const min = Math.max(0.25, scale * 0.5).toFixed(2);
+  const max = Math.min(10, scale * 4).toFixed(2);
+  meta?.setAttribute("content", `${VIEWPORT_BASE}, initial-scale=${scale}, minimum-scale=${min}, maximum-scale=${max}`);
 }
 
 export function applyScale() {

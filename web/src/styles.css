@@ -401,8 +401,8 @@ body {
   border: 1px solid var(--border);
   color: var(--fg-dim);
 }
-.status.live { color: var(--ok); border-color: #238636; }
-.status.reconnecting { color: var(--warn); border-color: #9e6a03; }
+.status.live { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 70%, var(--border)); }
+.status.reconnecting { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 70%, var(--border)); }
 
 .tree {
   overflow-y: auto;
@@ -520,9 +520,9 @@ body {
   height: 7px;
   border-radius: 50%;
   flex: 0 0 auto;
-  background: #30363d;
+  background: var(--border);
 }
-.dot.idle { background: #30363d; }
+.dot.idle { background: var(--border); }
 .dot.error { background: var(--danger); }
 .dot.busy, .dot.retry {
   background: var(--accent);
@@ -750,7 +750,7 @@ body {
   --accent: #58a6ff;
   --accent-fg: #08111f;
 }
-.term-dock.full { position: absolute; inset: 0; z-index: 100; height: auto !important; }
+.term-dock.full { position: absolute; inset: 0; z-index: 100; height: auto !important; padding-top: env(safe-area-inset-top); }
 .term-dock-resize { position: absolute; top: -3px; left: 0; right: 0; height: 7px; cursor: ns-resize; z-index: 2; }
 .term-dock-head { display: flex; align-items: center; gap: 7px; padding: 4px 8px; border-bottom: 1px solid var(--border); font-size: 12px; color: var(--fg-dim); }
 .term-dock-head .icon-btn { width: 26px; height: 26px; }
@@ -818,7 +818,8 @@ body {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 10px 14px;
+  /* Clear notch/rounded corners on notched devices (viewport-fit=cover is set). */
+  padding: max(10px, env(safe-area-inset-top)) max(14px, env(safe-area-inset-right)) 10px max(14px, env(safe-area-inset-left));
   border-bottom: 1px solid var(--border);
 }
 /* flex:1 so the title absorbs width changes between tabs and the seg + right-side
@@ -847,7 +848,7 @@ body {
 .update-toast {
   position: fixed;
   left: 50%;
-  bottom: 18px;
+  bottom: calc(18px + env(safe-area-inset-bottom));
   transform: translateX(-50%);
   z-index: 80;
   display: flex;
@@ -879,7 +880,7 @@ body {
 .conn-toast {
   position: fixed;
   left: 50%;
-  top: 14px;
+  top: calc(14px + env(safe-area-inset-top));
   transform: translateX(-50%);
   z-index: 90;
   display: flex;
@@ -1723,7 +1724,7 @@ body {
   padding: 0 4px;
   border-radius: 999px;
   background: var(--danger);
-  color: #fff;
+  color: var(--danger-fg);
   font-size: 10px;
   font-weight: 600;
   line-height: 16px;
@@ -2406,7 +2407,7 @@ body {
 .tasks-item.done .tasks-item-text { color: var(--fg-dim); text-decoration: line-through; }
 .tasks-item.cancelled .tasks-item-text { color: var(--fg-dim); text-decoration: line-through; opacity: 0.7; }
 
-.composer-wrap { padding: 10px 14px; position: relative; z-index: 40; }
+.composer-wrap { padding: 10px max(14px, env(safe-area-inset-right)) max(10px, env(safe-area-inset-bottom)) max(14px, env(safe-area-inset-left)); position: relative; z-index: 40; }
 .composer {
   display: flex;
   flex-direction: column;
@@ -2508,7 +2509,7 @@ body {
   justify-content: center;
 }
 .send-btn:disabled { opacity: 0.45; cursor: default; }
-.send-btn.stop { background: var(--danger); color: #fff; }
+.send-btn.stop { background: var(--danger); color: var(--danger-fg); }
 /* Queue button (sits next to Stop while busy): accent outline, not filled, to
    read as secondary to the primary Stop. */
 .send-btn.queue { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
@@ -2615,7 +2616,7 @@ body {
 }
 .gitfile-status {
   width: 18px; height: 18px; flex: 0 0 auto; border-radius: 4px;
-  display: grid; place-items: center; font-size: 11px; font-weight: 700; color: #08111f;
+  display: grid; place-items: center; font-size: 11px; font-weight: 700; color: #fff;
 }
 .gitfile-status.added { background: var(--ok); }
 .gitfile-status.deleted { background: var(--danger); }
@@ -2788,7 +2789,7 @@ body {
   color: var(--fg-dim);
   white-space: nowrap;
 }
-.b-reason { color: #a371f7; border-color: #a371f755; }
+.b-reason { color: var(--accent-2); border-color: color-mix(in srgb, var(--accent-2) 33%, transparent); }
 .b-vision { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 33%, transparent); }
 .b-free { color: var(--accent); border-color: color-mix(in srgb, var(--sel) 33%, transparent); }
 .b-status { color: var(--warn); border-color: #9e6a0355; }
@@ -2946,7 +2947,7 @@ body {
 }
 .btn:hover { border-color: var(--accent); }
 .btn:disabled { opacity: 0.5; cursor: not-allowed; }
-.btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn-primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
 .link-btn {
   background: none;
   border: 0;
@@ -3560,7 +3561,7 @@ div.katex-math { display: block; overflow-x: auto; margin: 0.7em 0; text-align: 
 .code-dock.full { flex: 1 1 auto; }
 .code-dock.dock { flex: 0 0 auto; position: relative; border-left: 1px solid var(--border); max-width: 80vw; }
 .main-body.dock-left .code-dock.dock { order: -1; border-left: 0; border-right: 1px solid var(--border); }
-.code-dock.overlay { position: fixed; inset: 0; z-index: 200; box-shadow: var(--shadow-lg, 0 0 40px #000a); }
+.code-dock.overlay { position: fixed; inset: 0; z-index: 200; box-shadow: var(--shadow-lg, 0 0 40px #000a); padding-top: env(safe-area-inset-top); padding-bottom: env(safe-area-inset-bottom); }
 .code-dock-resize { position: absolute; top: 0; bottom: 0; left: -3px; width: 7px; cursor: col-resize; z-index: 3; }
 .main-body.dock-left .code-dock-resize { left: auto; right: -3px; }
 .code-dock-resize:hover { background: color-mix(in srgb, var(--accent) 40%, transparent); }
