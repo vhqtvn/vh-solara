@@ -2213,6 +2213,7 @@ body {
 .notes-head h2 { font-size: 15px; font-weight: 600; margin: 0; }
 .notes-count { font-size: 12px; color: var(--fg-dim); }
 .notes-saved { font-size: 12px; color: var(--fg-dim); }
+.notes-saved.error { color: var(--danger); }
 .notes-empty { color: var(--fg-dim); font-size: 13px; margin: 2px 0; }
 .todo-add { display: flex; gap: 8px; }
 .todo-add input {
