@@ -88,6 +88,7 @@ export default function CodeFrame() {
               <button
                 type="button"
                 class="icon-btn"
+                classList={{ "dock-flip": codeDockSide() === "right" }}
                 aria-label="Dock side"
                 data-tip={codeDockSide() === "right" ? "Dock left" : "Dock right"}
                 onClick={() => setCodeDockSide(codeDockSide() === "right" ? "left" : "right")}

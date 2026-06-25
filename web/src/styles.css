@@ -3609,6 +3609,10 @@ div.katex-math { display: block; overflow-x: auto; margin: 0.7em 0; text-align: 
 /* Keep the iframe from swallowing pointer events mid-resize (drag stayed smooth). */
 .code-dock.resizing .code-frame { pointer-events: none; }
 
+/* Dock-side toggle: mirror the panel icon so "dock left" and "dock right" read
+   as opposites (the panel sits on the side the dock will move to). */
+.icon-btn.dock-flip .icon { transform: scaleX(-1); }
+
 /* Open-file tabs (read-only, VS Code style). Horizontal strip above the toolbar. */
 .code-tabs {
   display: flex; align-items: stretch; flex: 0 0 auto; overflow-x: auto;
