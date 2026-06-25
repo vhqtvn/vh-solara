@@ -15,7 +15,7 @@ import {
   upsertPart,
 } from "./lib/reduce";
 import { pushNotification, markRead } from "./notify";
-import { handleNotice } from "./alerts";
+import { handleNotice, attendingNow } from "./alerts";
 import { checkVersionNow } from "./pwa";
 import { log } from "./lib/log";
 import { loadVersioned, saveVersioned } from "./lib/store";
@@ -378,9 +378,11 @@ function maybeClearWaiting(sessionID: string) {
 export function ackSession(id: string) {
   if (!id) return;
   const root = rootOf(id);
-  // Viewing a session acks ALL of its notifications (any kind) — the general
-  // rule: once you've looked at the session, its nudges are no longer unread.
-  markRead((n) => (n.sessionID || "") === root);
+  // Viewing a session acks ALL of its notifications (any kind) — but only when
+  // the user is actually PRESENT. Leaving the PWA open on a session while away
+  // (idle/backgrounded) must not silently mark its nudges read; that's the whole
+  // point of the alert. Explicit actions (answering, archiving) ack regardless.
+  if (attendingNow()) markRead((n) => (n.sessionID || "") === root);
   if (!state.unread[root]) return; // nothing more to ack (finished-unread flag)
   setState("unread", root, undefined as unknown as boolean);
   void fetch("/vh/ack", {

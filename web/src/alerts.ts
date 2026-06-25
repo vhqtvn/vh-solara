@@ -82,6 +82,14 @@ function markInteraction() {
   lastInteraction = Date.now();
 }
 
+// Whether the user is actually attending right now: the app is visible AND they
+// interacted recently. Used to decide whether merely having a session open counts
+// as "seen" — leaving the PWA open while away should NOT auto-ack its nudges.
+export function attendingNow(idleMs = 60_000): boolean {
+  if (typeof document !== "undefined" && document.hidden) return false;
+  return Date.now() - lastInteraction <= idleMs;
+}
+
 async function sendHeartbeat() {
   const focused = selectedId();
   await heartbeat({
