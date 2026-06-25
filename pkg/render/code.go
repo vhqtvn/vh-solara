@@ -16,8 +16,14 @@ import (
 // /vh/highlight.css (no inline styles, no per-file CSS). Line numbers are
 // emitted in a table with linkable `#L<n>` ids, giving a free gutter and
 // shareable deep-links. The work is O(file) and bounded by the caller's size cap.
-func (r *Renderer) HighlightFile(filename, source string) (string, error) {
-	lexer := lexers.Match(filename)
+func (r *Renderer) HighlightFile(filename, source, lang string) (string, error) {
+	var lexer chroma.Lexer
+	if lang != "" {
+		lexer = lexers.Get(lang) // explicit language override (by name or alias)
+	}
+	if lexer == nil {
+		lexer = lexers.Match(filename)
+	}
 	if lexer == nil {
 		lexer = lexers.Analyse(source)
 	}
@@ -59,6 +65,14 @@ func LexerName(filename string) string {
 // StyleNames returns the available chroma style names (for the highlight picker).
 func StyleNames() []string {
 	names := append([]string(nil), styles.Names()...)
+	sort.Strings(names)
+	return names
+}
+
+// LangNames returns the available chroma lexer names (for the language override
+// picker — e.g. when chroma mis-detects a file or it has no extension).
+func LangNames() []string {
+	names := append([]string(nil), lexers.Names(false)...)
 	sort.Strings(names)
 	return names
 }

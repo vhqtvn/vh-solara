@@ -67,9 +67,10 @@ func safeJoin(root, rel string) (string, bool) {
 }
 
 type codeEntry struct {
-	Name string `json:"name"`
-	Path string `json:"path"` // rel to project dir
-	Type string `json:"type"` // "dir" | "file"
+	Name    string `json:"name"`
+	Path    string `json:"path"` // rel to project dir
+	Type    string `json:"type"` // "dir" | "file"
+	Ignored bool   `json:"ignored,omitempty"`
 }
 
 // GET /vh/code/tree?path=<rel> — immediate children of one directory (lazy).
@@ -106,14 +107,14 @@ func (s *Server) handleCodeTree(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		childRel := filepath.ToSlash(filepath.Join(rel, e.Name()))
-		if ignored[childRel] {
-			continue
-		}
 		typ := "file"
 		if e.IsDir() {
 			typ = "dir"
 		}
-		out = append(out, codeEntry{Name: e.Name(), Path: childRel, Type: typ})
+		// Ignored entries are returned (flagged), not dropped — the client dims
+		// them and hides them behind a "show ignored" toggle, so e.g. node_modules
+		// is reachable without polluting the default view.
+		out = append(out, codeEntry{Name: e.Name(), Path: childRel, Type: typ, Ignored: ignored[childRel]})
 	}
 	// Dirs first, then files; each alphabetical (case-insensitive).
 	sort.Slice(out, func(i, j int) bool {
@@ -191,7 +192,11 @@ func (s *Server) handleCodeFile(w http.ResponseWriter, r *http.Request) {
 	}
 	src := string(data)
 	lines := strings.Count(src, "\n") + 1
+	langOverride := r.URL.Query().Get("lang")
 	lang := render.LexerName(name)
+	if langOverride != "" {
+		lang = langOverride
+	}
 	isMd := ext == ".md" || ext == ".markdown"
 
 	if r.URL.Query().Get("view") == "rendered" && isMd {
@@ -209,7 +214,7 @@ func (s *Server) handleCodeFile(w http.ResponseWriter, r *http.Request) {
 		}))
 		return
 	}
-	htmlStr, err := s.renderer.HighlightFile(name, src)
+	htmlStr, err := s.renderer.HighlightFile(name, src, langOverride)
 	if err != nil {
 		htmlStr = "<pre class=\"code-plain\">" + html.EscapeString(src) + "</pre>"
 	}
@@ -323,6 +328,53 @@ func (s *Server) handleCodeStyles(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, jsonBytes(map[string]any{
 		"styles": render.StyleNames(), "default": render.DefaultStyle,
 	}))
+}
+
+// GET /vh/code/langs — available chroma lexer names (language override picker).
+func (s *Server) handleCodeLangs(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, jsonBytes(map[string]any{"langs": render.LangNames()}))
+}
+
+// GET /vh/code/status — git working-tree status per path (for tree decorations).
+// Returns one status letter per changed path: "M" modified, "A" added, "D"
+// deleted, "R" renamed, "?" untracked/new. Empty when not a git repo.
+func (s *Server) handleCodeStatus(w http.ResponseWriter, r *http.Request) {
+	dir, ok := codeDir(r)
+	if !ok {
+		http.Error(w, "open a project directory", http.StatusBadRequest)
+		return
+	}
+	out, err := runGit(r.Context(), dir, "status", "--porcelain=v1", "-z", "--untracked-files=all")
+	status := map[string]string{}
+	if err != nil {
+		writeJSON(w, http.StatusOK, jsonBytes(map[string]any{"status": status}))
+		return
+	}
+	// -z records are NUL-separated; a rename record carries the OLD path as an
+	// extra NUL-terminated field after the new path.
+	parts := strings.Split(out, "\x00")
+	for i := 0; i < len(parts); i++ {
+		rec := parts[i]
+		if len(rec) < 4 {
+			continue
+		}
+		xy, path := rec[:2], rec[3:]
+		code := "?"
+		switch {
+		case xy == "??":
+			code = "?"
+		case xy[1] != ' ':
+			code = string(xy[1]) // worktree change wins for display
+		default:
+			code = string(xy[0]) // staged-only
+		}
+		if xy[0] == 'R' || xy[1] == 'R' {
+			code = "R"
+			i++ // skip the paired old-path field
+		}
+		status[filepath.ToSlash(path)] = code
+	}
+	writeJSON(w, http.StatusOK, jsonBytes(map[string]any{"status": status}))
 }
 
 // GET /vh/code/highlight.css?style=<name> — one chroma style, scoped to .code-hl,

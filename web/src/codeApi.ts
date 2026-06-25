@@ -9,6 +9,7 @@ export interface CodeEntry {
   name: string;
   path: string;
   type: "dir" | "file";
+  ignored?: boolean;
 }
 
 export interface CodeFile {
@@ -38,14 +39,35 @@ export async function codeTree(path: string): Promise<CodeEntry[]> {
   }
 }
 
-export async function codeFile(path: string, view?: "rendered"): Promise<CodeFile | null> {
+export async function codeFile(path: string, opts: { view?: "rendered"; lang?: string } = {}): Promise<CodeFile | null> {
   try {
-    const q = view ? `&view=${view}` : "";
+    const q = (opts.view ? `&view=${opts.view}` : "") + (opts.lang ? `&lang=${encodeURIComponent(opts.lang)}` : "");
     const r = await fetch(`/vh/code/file?${D()}&path=${encodeURIComponent(path)}${q}`);
     if (!r.ok) return null;
     return (await r.json()) as CodeFile;
   } catch {
     return null;
+  }
+}
+
+// Git working-tree status per path: "M" | "A" | "D" | "R" | "?" (new).
+export async function codeStatus(): Promise<Record<string, string>> {
+  try {
+    const r = await fetch(`/vh/code/status?${D()}`);
+    if (!r.ok) return {};
+    return (await r.json()).status ?? {};
+  } catch {
+    return {};
+  }
+}
+
+export async function codeLangs(): Promise<string[]> {
+  try {
+    const r = await fetch(`/vh/code/langs`);
+    if (!r.ok) return [];
+    return (await r.json()).langs ?? [];
+  } catch {
+    return [];
   }
 }
 

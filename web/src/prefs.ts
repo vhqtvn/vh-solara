@@ -158,6 +158,18 @@ export function setTabStyle(v: TabStyle) {
 }
 export { tabStyle };
 
+// Code tree: show git-ignored entries (node_modules, build output, …). Off by
+// default so the tree stays clean; toggle in the viewer to reveal them (dimmed).
+const CODE_SHOW_IGNORED_KEY = "vh.prefs.codeShowIgnored.v1";
+const [codeShowIgnored, setCodeShowIgnoredSig] = createSignal<boolean>(
+  loadVersioned<boolean>(CODE_SHOW_IGNORED_KEY, 1, false, (o) => o === true || o === 1 || o === "1"),
+);
+export function setCodeShowIgnored(on: boolean) {
+  setCodeShowIgnoredSig(on);
+  saveVersioned(CODE_SHOW_IGNORED_KEY, 1, on);
+}
+export { codeShowIgnored };
+
 // Code peek dock: which side it docks (desktop) and its width (px), persisted.
 const CODE_DOCK_SIDE_KEY = "vh.prefs.codeDockSide.v1";
 const [codeDockSide, setCodeDockSideSig] = createSignal<"left" | "right">(

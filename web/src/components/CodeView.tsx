@@ -1,8 +1,8 @@
 import { createEffect, createMemo, createResource, createSignal, For, Match, onCleanup, Show, Switch } from "solid-js";
 import { projectDir } from "../sync";
-import { codeFile, codeRawUrl, codeSearch, codeStyles, codeTree, type CodeEntry, type CodeFile, type CodeHit } from "../codeApi";
+import { codeFile, codeLangs, codeRawUrl, codeSearch, codeStatus, codeStyles, codeTree, type CodeEntry, type CodeFile, type CodeHit } from "../codeApi";
 import { codeOpenPath, setCodeOpenPath, codeOpenLine, setCodeOpenLine } from "../code";
-import { codeStyle, setCodeStyle, codeWrap, setCodeWrap } from "../prefs";
+import { codeStyle, setCodeStyle, codeWrap, setCodeWrap, codeShowIgnored, setCodeShowIgnored } from "../prefs";
 import Icon from "./Icon";
 import Select from "./Select";
 import Spinner from "./Spinner";
@@ -25,6 +25,8 @@ function TreeNode(props: {
   openPath: () => string;
   onOpen: (p: string) => void;
   onCtx: (x: number, y: number, path: string) => void;
+  status: () => Record<string, string>;
+  showIgnored: () => boolean;
 }) {
   const [open, setOpen] = createSignal(false);
   const [kids] = createResource(open, (o) => (o ? codeTree(props.entry.path) : Promise.resolve<CodeEntry[] | null>(null)));
@@ -32,12 +34,20 @@ function TreeNode(props: {
   const selected = () => props.openPath() === props.entry.path;
   let lpTimer: ReturnType<typeof setTimeout> | undefined;
   const ctx = (x: number, y: number) => isDir && props.onCtx(x, y, props.entry.path);
+  const visibleKids = () => (props.showIgnored() ? kids() || [] : (kids() || []).filter((e) => !e.ignored));
+  // Git status: a file's own code, or for a dir, "•" if any changed path is under it.
+  const st = () => {
+    if (!isDir) return props.status()[props.entry.path] || "";
+    const p = props.entry.path + "/";
+    for (const k in props.status()) if (k === props.entry.path || k.startsWith(p)) return "•";
+    return "";
+  };
   return (
     <div class="code-tree-node">
       <button
         type="button"
         class="code-tree-row"
-        classList={{ dir: isDir, selected: selected() }}
+        classList={{ dir: isDir, selected: selected(), ignored: !!props.entry.ignored }}
         style={{ "padding-left": `${4 + props.depth * 14}px` }}
         onClick={() => (isDir ? setOpen((v) => !v) : props.onOpen(props.entry.path))}
         onContextMenu={(e) => { if (isDir) { e.preventDefault(); ctx(e.clientX, e.clientY); } }}
@@ -50,11 +60,14 @@ function TreeNode(props: {
           <span class="code-tree-caret" classList={{ open: open() }}><Icon name="chevronDown" size={12} /></span>
         </Show>
         <span class="code-tree-name">{props.entry.name}</span>
+        <Show when={st()}>
+          <span class="code-st" classList={{ [`st-${st()}`]: true }}>{st()}</span>
+        </Show>
       </button>
       <Show when={isDir && open()}>
         <Show when={!kids.loading} fallback={<div class="code-tree-loading" style={{ "padding-left": `${18 + props.depth * 14}px` }}>…</div>}>
-          <For each={kids() || []}>
-            {(e) => <TreeNode entry={e} depth={props.depth + 1} openPath={props.openPath} onOpen={props.onOpen} onCtx={props.onCtx} />}
+          <For each={visibleKids()}>
+            {(e) => <TreeNode entry={e} depth={props.depth + 1} openPath={props.openPath} onOpen={props.onOpen} onCtx={props.onCtx} status={props.status} showIgnored={props.showIgnored} />}
           </For>
         </Show>
       </Show>
@@ -79,6 +92,11 @@ export default function CodeView() {
 
   // Tree root reloads when the project or the focus folder changes.
   const [roots] = createResource(() => ({ dir: projectDir(), root: focusRoot() }), (k) => codeTree(k.root));
+  // Git status decorations + language override.
+  const [status] = createResource(() => projectDir(), () => codeStatus());
+  const [langList] = createResource(codeLangs);
+  const [langOverride, setLangOverride] = createSignal("");
+  const visibleRoots = () => (codeShowIgnored() ? roots() || [] : (roots() || []).filter((e) => !e.ignored));
   // Crumb segments for the focus chip (‹ repo / a / b).
   const focusSegs = createMemo(() => {
     const f = focusRoot();
@@ -100,14 +118,15 @@ export default function CodeView() {
     (k) => (k.q.trim() ? codeSearch(k.q, k.scope) : Promise.resolve({ hits: [] as CodeHit[], capped: false })),
   );
 
-  // Open file (resource keyed on path + markdown-render toggle).
+  // Open file (resource keyed on path + markdown-render toggle + language override).
   const [file] = createResource(
-    () => ({ path: openPath(), rendered: mdRendered() }),
-    (k) => (k.path ? codeFile(k.path, k.rendered ? "rendered" : undefined) : Promise.resolve<CodeFile | null>(null)),
+    () => ({ path: openPath(), rendered: mdRendered(), lang: langOverride() }),
+    (k) => (k.path ? codeFile(k.path, { view: k.rendered ? "rendered" : undefined, lang: k.lang || undefined }) : Promise.resolve<CodeFile | null>(null)),
   );
 
   const open = (path: string, line?: number) => {
     setMdRendered(false);
+    setLangOverride(""); // a new file re-detects its language
     setTargetLine(line);
     setOpenPath(path);
   };
@@ -227,9 +246,22 @@ export default function CodeView() {
               }
             >
               <Show when={!roots.loading} fallback={<div class="code-tree-loading">…</div>}>
-                <For each={roots() || []}>
-                  {(e) => <TreeNode entry={e} depth={0} openPath={openPath} onOpen={(p) => open(p)} onCtx={(x, y, path) => setCtxMenu({ x, y, path })} />}
+                <For each={visibleRoots()}>
+                  {(e) => (
+                    <TreeNode
+                      entry={e}
+                      depth={0}
+                      openPath={openPath}
+                      onOpen={(p) => open(p)}
+                      onCtx={(x, y, path) => setCtxMenu({ x, y, path })}
+                      status={() => status() || {}}
+                      showIgnored={codeShowIgnored}
+                    />
+                  )}
                 </For>
+                <button type="button" class="code-show-ignored" onClick={() => { setCodeShowIgnored(!codeShowIgnored()); }}>
+                  {codeShowIgnored() ? "Hide ignored files" : "Show ignored files"}
+                </button>
               </Show>
             </Show>
           </div>
@@ -249,7 +281,15 @@ export default function CodeView() {
                   )}
                 </For>
               </div>
-              <Show when={file()?.lang}><span class="code-lang">{file()!.lang}</span></Show>
+              <Show when={file()?.kind === "text"}>
+                <Select
+                  class="code-lang-select"
+                  ariaLabel="Syntax language"
+                  value={langOverride()}
+                  options={[{ value: "", label: file()?.lang ? `Auto · ${file()!.lang}` : "Auto" }, ...((langList() ?? []).map((l) => ({ value: l, label: l })))]}
+                  onChange={setLangOverride}
+                />
+              </Show>
               <div class="code-actions">
                 <Show when={file()?.isMarkdown}>
                   <button type="button" class="btn code-btn" classList={{ on: mdRendered() }} onClick={() => setMdRendered((v) => !v)}>
