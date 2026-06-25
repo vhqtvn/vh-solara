@@ -2,7 +2,7 @@
 // its heavy DOM — file tree, highlighted files — stays out of the main document).
 // Communication is postMessage. The chat opens files across the boundary; the
 // parent forwards theme changes so the framed viewer restyles live.
-import { setCodeDockOpen, setCodeMobileOverlay } from "./ui";
+import { codeDockOpen, setCodeDockOpen, codeMobileOverlay, setCodeMobileOverlay, setView, view } from "./ui";
 import { isDesktop } from "./layout";
 
 const ORIGIN = typeof location !== "undefined" ? location.origin : "*";
@@ -55,4 +55,25 @@ export function openFileAt(pathOrRef: string, line?: number) {
 // Nudge the framed viewer to re-apply the (shared, same-origin) theme.
 export function postCodeTheme() {
   postToCodeFrame({ type: "vh-code:theme" });
+}
+
+// Toggle the docked code browser (header button / Ctrl-B). On desktop it opens
+// the side dock; from the full Code tab it converts to the dock beside chat. On
+// mobile it toggles the full-screen overlay.
+export function toggleCodeDock() {
+  if (!isDesktop()) {
+    setCodeMobileOverlay(!codeMobileOverlay());
+    return;
+  }
+  if (view() === "code") {
+    setView("chat");
+    setCodeDockOpen(true);
+    return;
+  }
+  setCodeDockOpen(!codeDockOpen());
+}
+
+// Whether the code browser is currently showing (dock / full / overlay).
+export function codeShowing(): boolean {
+  return view() === "code" || codeDockOpen() || codeMobileOverlay();
 }

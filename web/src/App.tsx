@@ -5,7 +5,7 @@ import GitView from "./components/GitView";
 import CodeFrame, { codeMode } from "./components/CodeFrame";
 import { codeDockSide } from "./prefs";
 import TabBar, { type TabItem } from "./components/TabBar";
-import { installCodeFrameHost, postCodeTheme } from "./codeFrame";
+import { codeShowing, installCodeFrameHost, postCodeTheme, toggleCodeDock } from "./codeFrame";
 import NotesView from "./components/NotesView";
 import SettingsDialog from "./components/SettingsDialog";
 import FileViewer from "./components/FileViewer";
@@ -63,6 +63,9 @@ export default function App() {
     } else if (e.ctrlKey && e.key === "`") {
       e.preventDefault();
       setTermOpen((v) => !v);
+    } else if ((e.metaKey || e.ctrlKey) && (e.key === "b" || e.key === "B")) {
+      e.preventDefault();
+      toggleCodeDock();
     }
   };
   // Suppress the browser's long-press / right-click page menu (download/share/
@@ -219,6 +222,16 @@ export default function App() {
           <Show when={selectedId()}>
             <HeaderUsage sessionId={selectedId()!} onInspect={() => setInspectorOpen(true)} />
           </Show>
+          <button
+            type="button"
+            class="icon-btn"
+            classList={{ on: codeShowing() }}
+            aria-label="Code dock"
+            data-tip="Code dock (Ctrl+B)"
+            onClick={() => toggleCodeDock()}
+          >
+            <Icon name="layers" />
+          </button>
           <button
             type="button"
             class="icon-btn"
