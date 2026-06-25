@@ -6,7 +6,7 @@ import { loadModels } from "./models";
 import { loadAgents } from "./agents";
 import { applyTheme } from "./theme";
 import { applyFont } from "./font";
-import { applyScale, applyOrientation, applyChatWidth, applyChatBubbles } from "./prefs";
+import "./prefs"; // import for side effect: DOM-affecting prefs apply reactively on load
 import { registerServiceWorker, startVersionCheck } from "./pwa";
 import { initPwaInstall } from "./pwa-install";
 import { installCsrf } from "./csrf";
@@ -19,8 +19,6 @@ installCsrf(); // must run before any fetch
 installViewport();
 applyTheme();
 applyFont();
-applyScale();
-applyChatWidth();
 
 const root = document.getElementById("root")!;
 const standalone = new URLSearchParams(location.search).get("standalone");
@@ -32,8 +30,6 @@ if (standalone === "code") {
   render(() => <StandaloneCode />, root);
   installScrollEdges();
 } else {
-  applyOrientation();
-  applyChatBubbles();
   startSync();
   void loadModels();
   void loadAgents();

@@ -1,6 +1,9 @@
 // Small UI preferences (versioned localStorage signals), kept out of the sync
-// store. Each is a persistedSignal (hydrate on load, persist on set); setters
-// that also touch the DOM wrap it with the side effect.
+// store. Each is a persistedSignal (hydrate on load, persist on set). The
+// DOM-affecting ones apply REACTIVELY (see the createRenderEffect block at the
+// bottom): the signal is the single source of truth, so setters just set it and
+// there's no boot list to keep in sync in index.tsx.
+import { createRenderEffect, createRoot } from "solid-js";
 import { persistedSignal, boolMigrate } from "./lib/store";
 
 // Live message streaming: when on (default), in-flight assistant text renders
@@ -58,7 +61,6 @@ export function applyScale() {
 }
 export function setUiScale(s: number) {
   setUiScaleRaw(Math.min(MAX_SCALE, Math.max(MIN_SCALE, Math.round(s * 100) / 100)));
-  applyScale();
 }
 
 // Screen orientation: "system" (respect the device/OS, incl. its rotation lock)
@@ -87,7 +89,6 @@ export function applyOrientation() {
 }
 export function setOrientation(v: "system" | "auto") {
   setOrientationRaw(v);
-  applyOrientation();
 }
 
 // Chat reading width: the message column + composer max-width, via --chat-width.
@@ -106,7 +107,6 @@ export function applyChatWidth() {
 }
 export function setChatWidth(v: ChatWidth) {
   setChatWidthRaw(v);
-  applyChatWidth();
 }
 
 // Chat bubbles: render YOUR turns as a right-aligned bubble by toggling a root
@@ -118,7 +118,6 @@ export function applyChatBubbles() {
 }
 export function setChatBubbles(on: boolean) {
   setChatBubblesRaw(on);
-  applyChatBubbles();
 }
 
 // View-tab display style in the header. "labels" (text, default) and "icons"
@@ -189,3 +188,16 @@ export const [notesEnabled, setNotesEnabled] = persistedSignal<boolean>(
   false,
   boolMigrate(false),
 );
+
+// Apply the DOM-affecting prefs reactively: each render-effect runs once now
+// (synchronous initial apply, before first paint) and again whenever its signal
+// changes. Replaces the manual apply() calls in setters + the boot list in
+// index.tsx. Guarded for non-DOM (unit-test) contexts.
+if (typeof document !== "undefined") {
+  createRoot(() => {
+    createRenderEffect(applyScale);
+    createRenderEffect(applyChatWidth);
+    createRenderEffect(applyChatBubbles);
+    createRenderEffect(applyOrientation);
+  });
+}
