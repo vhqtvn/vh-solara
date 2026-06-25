@@ -44,20 +44,19 @@ describe("placeStreamCaret", () => {
     expect(c.previousSibling?.textContent).toContain("rule is set");
   });
 
-  it("does not descend into a trailing inline element", () => {
+  it("enters a trailing inline element when nothing (real) follows it", () => {
+    // No text after the inline → the content ends inside it, so the caret does too.
     const root = render("<p>see <strong>bold</strong></p>");
     const c = caret();
     placeStreamCaret(root, c);
-    // After the <strong>, as the paragraph's last child — not inside it.
-    expect(c.parentElement?.tagName).toBe("P");
-    expect(c.previousElementSibling?.tagName).toBe("STRONG");
+    expect(c.parentElement?.tagName).toBe("STRONG");
   });
 
-  it("stops at the <pre> of a fenced block (code is inline-level)", () => {
+  it("enters the <code> of a fenced block (only whitespace follows)", () => {
     const root = render("<pre><code>x = 1</code></pre>");
     const c = caret();
     placeStreamCaret(root, c);
-    expect(c.parentElement?.tagName).toBe("PRE");
+    expect(c.parentElement?.tagName).toBe("CODE");
   });
 
   it("stops at the parent when the trailing element is void (image)", () => {
