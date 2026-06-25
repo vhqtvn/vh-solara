@@ -188,9 +188,19 @@ test("right-click session title opens a menu; Archive… confirms related sessio
   await page.getByRole("button", { name: "Create session" }).click();
   await page.getByPlaceholder("Message…").fill("menu me");
   await page.keyboard.press("Enter");
-  const liveNew = page.locator(".tree-node", { hasText: "New session" });
-  await expect(liveNew.first()).toBeVisible({ timeout: 8000 });
-  const beforeLive = await liveNew.count();
+
+  // The created session is selected and deep-linked into the URL — grab its id so
+  // the assertions target THIS session, not the shared pool of "New session" rows
+  // other tests in the serial run leave behind.
+  await expect.poll(() => new URL(page.url()).searchParams.get("session")).toBeTruthy();
+  const id = new URL(page.url()).searchParams.get("session")!;
+  const node = page.locator(`.tree-node[data-session-id="${id}"]`);
+  await expect(node).toBeVisible({ timeout: 8000 });
+
+  // Let the turn fully settle before archiving. Archiving mid-stream races the
+  // turn's trailing session.idle, which can re-hydrate the just-archived session
+  // back into the live tree — so wait for the assistant response to complete.
+  await expect(page.getByText(/Done\. Updated/).first()).toBeVisible({ timeout: 8000 });
 
   // Right-click the chat header title → positioned context menu.
   await page.locator(".main-title.has-menu").click({ button: "right" });
@@ -201,15 +211,15 @@ test("right-click session title opens a menu; Archive… confirms related sessio
   await expect(menu).toContainText("Session id");
   await expect(menu).toContainText("Title + id");
 
-  // Archive… → confirmation lists the related sessions.
+  // Archive… → confirmation lists the related sessions (just this one).
   await menu.getByText("Archive…").click();
   const confirm = page.getByRole("dialog", { name: "Confirm archive" });
   await expect(confirm).toBeVisible();
   await expect(confirm.locator(".confirm-list li")).toHaveCount(1);
   await confirm.getByRole("button", { name: /Archive/ }).click();
 
-  // Confirmed → session leaves the live tree (count drops; see note above).
-  await expect.poll(() => liveNew.count(), { timeout: 8000 }).toBeLessThan(beforeLive);
+  // Confirmed → this specific session leaves the live tree for good.
+  await expect(node).toHaveCount(0, { timeout: 8000 });
 });
 
 test("right-click → Rename updates the session title", async ({ page }) => {

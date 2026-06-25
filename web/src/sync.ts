@@ -2,407 +2,38 @@
 // of sessions, persists to localStorage for instant hydrate-on-open, and
 // proactively reconnects when the tab returns to the foreground (iOS suspends
 // background sockets). State is reconciled by id, never nuked.
-import { createStore, produce } from "solid-js/store";
-import { createSignal, createRoot, createEffect, on } from "solid-js";
-import type { ConnStatus, Permission, Question, Session, SessionMessages, Snapshot, TodoItem } from "./types";
+//
+// This module is the public facade + startup wiring. The implementation lives in
+// focused sibling modules under ./sync/:
+//   store         — the Solid store, selection/project/draft signals, persistence
+//   selectors     — pure derived reads (root/subtree walks, working rollup, todos)
+//   url           — ?session/?dir deep-linking
+//   orchestration — turning store changes into notifications/acks
+//   stream        — the two-EventSource state-machine + reconnect watchdog
+//   actions       — selection/project/draft/create + server round-trips
+import { createRoot, createEffect, on } from "solid-js";
+import { bindAlertsContext } from "./alerts";
 import {
-  anyDescendantWorking,
-  buildMessages,
-  deleteMessage,
-  deletePart,
-  sortMessages,
-  upsertMessage,
-  upsertPart,
-} from "./lib/reduce";
-import { pushNotification, markRead } from "./notify";
-import { handleNotice, attendingNow, bindAlertsContext } from "./alerts";
-import { checkVersionNow } from "./pwa";
-import { log } from "./lib/log";
-import { setView } from "./ui";
-import { loadVersioned, saveVersioned } from "./lib/store";
-
-const LS_SESSIONS = "vh.sessions.v1";
-const LS_CURSOR = "vh.cursor.v1";
-const LS_ACTIVITY = "vh.activity.v1";
-const LS_PROJECT = "vh.project.dir";
-
-// Persistence is keyed per project directory so each project hydrates its own
-// tree instantly on switch. "" is the default project (OpenCode serve cwd).
-const lsSessions = (dir: string) => `${LS_SESSIONS}:${dir}`;
-const lsCursor = (dir: string) => `${LS_CURSOR}:${dir}`;
-const lsActivity = (dir: string) => `${LS_ACTIVITY}:${dir}`;
-
-function loadSessions(dir: string): Record<string, Session> {
-  return loadVersioned<Record<string, Session>>(lsSessions(dir), 1, {}, (o) =>
-    o && typeof o === "object" ? (o as Record<string, Session>) : {},
-  );
-}
-const loadCursor = (dir: string) =>
-  loadVersioned<number>(lsCursor(dir), 1, 0, (o) => Number(o) || 0);
-// Activity is persisted alongside sessions so a reload hydrates running state
-// INSTANTLY. Without this, activity started empty on reload and — since the
-// stream resumes from the saved cursor — an activity=busy that fired before that
-// cursor was never replayed, so a busy session showed idle until the next event
-// (the reported "~1min to recognize busy after reload"). The live stream then
-// reconciles any change.
-function loadActivity(dir: string): Record<string, string> {
-  return loadVersioned<Record<string, string>>(lsActivity(dir), 1, {}, (o) =>
-    o && typeof o === "object" ? (o as Record<string, string>) : {},
-  );
-}
-
-// The workspace is the URL's source of truth (so each tab keeps its own across
-// reload and is shareable); localStorage is only the fallback when the URL omits
-// it. `?dir=` absent → default project (""); `?dir=` present (even empty) wins.
-function urlDir(): string | null {
-  try {
-    const u = new URLSearchParams(location.search);
-    return u.has("dir") ? u.get("dir") || "" : null;
-  } catch {
-    return null;
-  }
-}
-const initialDir =
-  urlDir() ?? loadVersioned<string>(LS_PROJECT, 1, "", (o) => (typeof o === "string" ? o : ""));
-
-interface SyncState {
-  sessions: Record<string, Session>;
-  // Messages are held only for opened sessions, to bound memory.
-  messages: Record<string, SessionMessages>;
-  // Per-session activity (busy/idle/error) and pending permissions are kept for
-  // ALL sessions so the sidebar/chat can surface status without opening them.
-  activity: Record<string, string>;
-  permissions: Record<string, Record<string, Permission>>;
-  questions: Record<string, Record<string, Question>>;
-  // Per-session agent todo list (OpenCode TodoWrite), kept for all sessions so
-  // the "Tasks N active · M left" indicator works without opening them.
-  todos: Record<string, TodoItem[]>;
-  // Root sessions that finished and haven't been acknowledged (server-tracked,
-  // cross-device) — drives the "finished/unread" indicator in the tree.
-  unread: Record<string, boolean>;
-  status: ConnStatus;
-  cursor: number;
-}
-
-const [state, setState] = createStore<SyncState>({
-  sessions: loadSessions(initialDir),
-  messages: {},
-  activity: loadActivity(initialDir),
-  permissions: {},
-  questions: {},
-  todos: {},
-  unread: {},
-  status: "connecting",
-  cursor: loadCursor(initialDir),
-});
-
-// In-flight sends, keyed by sessionID. OpenCode's POST /session/:id/message
-// blocks until the turn *settles* — which can be minutes, or forever if the
-// turn pauses on a permission or was interrupted mid-generation (a dangling
-// assistant turn after a restart). This MUST be per-session: the chat component
-// is reused across sessions, so a single shared "sending" flag meant one hung
-// send silently gated the composer of EVERY other session ("only the first
-// session after a restart works"). Keyed here, a stuck send only blocks its own
-// session.
-const [sendingState, setSendingState] = createStore<Record<string, boolean>>({});
-export function isSending(id: string): boolean {
-  return !!sendingState[id];
-}
-export function setSending(id: string, v: boolean): void {
-  setSendingState(id, v);
-}
-
-// Current project directory ("" = default). Multi-project: snapshot/stream and
-// /oc requests are scoped to this directory.
-const [projectDir, setProjectDirRaw] = createSignal(initialDir);
-
-const [selectedId, setSelectedIdRaw] = createSignal<string | null>(null);
-// Draft (composing) mode: "New session" enters this WITHOUT creating a server
-// session — the session is only created when the first message is sent.
-const [draft, setDraft] = createSignal(false);
-
-// Selecting any real session leaves draft mode.
-function setSelectedId(id: string | null) {
-  if (id) setDraft(false);
-  setSelectedIdRaw(id);
-  syncUrl(id);
-}
-
-// --- URL deep-linking ---------------------------------------------------------
-// The selected session lives in the URL (?session=<id>) so it survives reloads
-// and is shareable. We push history entries on selection (back/forward walk
-// session history) and apply the URL on load and on popstate.
-function currentUrlSession(): string | null {
-  try {
-    return new URLSearchParams(location.search).get("session");
-  } catch {
-    return null;
-  }
-}
-
-let applyingUrl = false; // guard so popstate-driven selection doesn't re-push
-// Write the current workspace + selected session to the URL. `replace` updates
-// in place (used to normalize the URL on load); otherwise a history entry is
-// pushed so back/forward walks selection + project history.
-function syncUrl(id: string | null, replace = false) {
-  if (applyingUrl || typeof location === "undefined") return;
-  try {
-    const url = new URL(location.href);
-    if (id) url.searchParams.set("session", id);
-    else url.searchParams.delete("session");
-    const dir = projectDir();
-    if (dir) url.searchParams.set("dir", dir);
-    else url.searchParams.delete("dir");
-    if (url.search === location.search) return;
-    if (replace) history.replaceState({ session: id, dir }, "", url);
-    else history.pushState({ session: id, dir }, "", url);
-  } catch {
-    /* history unavailable — selection still works in-memory */
-  }
-}
-
-let persistTimer: number | undefined;
-function persist() {
-  clearTimeout(persistTimer);
-  persistTimer = window.setTimeout(() => {
-    const dir = projectDir();
-    saveVersioned(lsSessions(dir), 1, state.sessions);
-    saveVersioned(lsCursor(dir), 1, state.cursor);
-    saveVersioned(lsActivity(dir), 1, state.activity);
-  }, 250);
-}
-
-// Switch the active project directory: reset to that project's persisted tree
-// and reconnect the stream scoped to it. "" = default project. `fromUrl` is set
-// by popstate (don't re-push history). The dir is mirrored to both localStorage
-// (fallback) and the URL (source of truth, per-tab).
-export function switchProject(dir: string, fromUrl = false) {
-  if (dir === projectDir()) return;
-  saveVersioned(LS_PROJECT, 1, dir);
-  setProjectDirRaw(dir);
-  setSelectedIdRaw(null);
-  setDraft(false);
-  if (!fromUrl) syncUrl(null);
-  setState(
-    produce((s) => {
-      s.sessions = loadSessions(dir);
-      s.messages = {};
-      s.activity = loadActivity(dir);
-      s.permissions = {};
-      s.questions = {};
-      s.todos = {};
-      s.unread = {};
-      s.cursor = loadCursor(dir);
-      s.status = "connecting";
-    }),
-  );
-  connect(true); // project switch: snapshot to fully reconcile the new project's state
-}
-
-function applySnapshot(snap: Snapshot) {
-  setState(
-    produce((s) => {
-      // Reconcile: replace the session set with the authoritative snapshot.
-      s.sessions = {};
-      for (const sess of snap.sessions || []) s.sessions[sess.id] = sess;
-      s.activity = { ...(snap.activity || {}) };
-      s.permissions = {};
-      for (const [sid, perms] of Object.entries(snap.permissions || {})) {
-        s.permissions[sid] = {};
-        for (const p of perms) s.permissions[sid][p.id] = p;
-      }
-      s.questions = {};
-      for (const [sid, qs] of Object.entries(snap.questions || {})) {
-        s.questions[sid] = {};
-        for (const q of qs) s.questions[sid][q.id] = q;
-      }
-      s.todos = {};
-      for (const [sid, v] of Object.entries(snap.todos || {})) s.todos[sid] = normalizeTodos(v);
-      s.unread = {};
-      for (const id of snap.unread || []) s.unread[id] = true;
-      s.cursor = snap.seq;
-    }),
-  );
-  persist();
-}
-
-function applySessionEvent(kind: string, seq: number, payload: any) {
-  setState(
-    produce((s) => {
-      if (kind === "session.upsert") s.sessions[payload.id] = payload;
-      else if (kind === "session.delete") delete s.sessions[payload.id];
-      if (seq) s.cursor = seq;
-    }),
-  );
-  persist();
-}
-
-
-// Surface an assistant error as a dismissable notification.
-function notifyFromMessage(payload: any) {
-  const info = payload?.info;
-  const err = info?.error;
-  if (info?.role === "assistant" && err) {
-    pushNotification({
-      kind: "error",
-      sessionID: info.sessionID,
-      title: "errored",
-      detail: err.data?.message || err.name || "Assistant error",
-    });
-  }
-}
-
-// Message/part events are applied only for opened sessions (those present in
-// state.messages) to bound memory. The mutation logic lives in ./lib/reduce.
-// trackCursor: whether this event should advance the persisted resume cursor.
-// Stream 2 (active-session messages) passes false — it always re-snapshots on
-// connect (never resumes), so letting its high-seq message events advance the
-// shared cursor would push Stream 1's resume point PAST structural events it
-// hasn't applied yet (e.g. an activity=busy), which then get skipped on
-// reconnect — leaving the sidebar stuck on a stale state (the "busy session
-// shows idle, no Stop button" bug). Only Stream 1's events move the cursor.
-function applyMessageEvent(kind: string, seq: number, payload: any, trackCursor = true) {
-  setState(
-    produce((s) => {
-      switch (kind) {
-        case "message.upsert": {
-          const sm = s.messages[payload.sessionID];
-          if (sm) upsertMessage(sm, payload);
-          notifyFromMessage(payload);
-          break;
-        }
-        case "message.delete": {
-          const sm = s.messages[payload.sessionID];
-          if (sm) deleteMessage(sm, payload.messageID);
-          break;
-        }
-        case "part.upsert": {
-          const sm = s.messages[payload.sessionID];
-          if (sm) upsertPart(sm, payload);
-          break;
-        }
-        case "part.delete": {
-          const sm = s.messages[payload.sessionID];
-          if (sm) deletePart(sm, payload.messageID, payload.partID);
-          break;
-        }
-        case "activity":
-          if (payload.sessionID) s.activity[payload.sessionID] = payload.state;
-          // The completion ping is decided AFTER the store updates (below), at
-          // the root level — not per-session — so a finished root pings once and
-          // noisy subsession completions don't.
-          break;
-        case "permission.upsert":
-          if (payload.sessionID && payload.id) {
-            if (!s.permissions[payload.sessionID]) s.permissions[payload.sessionID] = {};
-            s.permissions[payload.sessionID][payload.id] = payload;
-          }
-          break;
-        case "permission.delete":
-          if (payload.sessionID && s.permissions[payload.sessionID]) {
-            delete s.permissions[payload.sessionID][payload.permissionID];
-          }
-          break;
-        case "question.upsert":
-          if (payload.sessionID && payload.id) {
-            if (!s.questions[payload.sessionID]) s.questions[payload.sessionID] = {};
-            s.questions[payload.sessionID][payload.id] = payload;
-          }
-          break;
-        case "question.delete":
-          if (payload.sessionID && s.questions[payload.sessionID]) {
-            delete s.questions[payload.sessionID][payload.questionID];
-          }
-          break;
-        case "unread.set":
-          if (payload.sessionID) s.unread[payload.sessionID] = true;
-          break;
-        case "unread.clear":
-          if (payload.sessionID) delete s.unread[payload.sessionID];
-          break;
-        case "todo":
-          // OpenCode TodoWrite snapshot for a session (full list each time). The
-          // event payload is the `{ sessionID, todos }` envelope.
-          if (payload.sessionID) s.todos[payload.sessionID] = normalizeTodos(payload);
-          break;
-        case "status":
-          // A session.error event carries an `error` payload (activity already
-          // flipped to "error" via the separate activity event). Surface it so a
-          // failed turn/resume is VISIBLE — e.g. prompt_async reports a turn that
-          // couldn't start as a session.error rather than silently doing nothing.
-          if (payload?.error && payload.sessionID) {
-            const e = payload.error;
-            pushNotification({
-              kind: "error",
-              sessionID: payload.sessionID,
-              title: "errored",
-              detail: e?.data?.message || e?.message || e?.name || "Session error",
-            });
-          }
-          break; // activity drives the indicator; this only adds the notification
-      }
-      if (trackCursor && seq) s.cursor = seq;
-    }),
-  );
-  if (kind === "activity" && payload.sessionID) {
-    maybeNotifyRootDone(payload.sessionID);
-    maybeClearWaiting(payload.sessionID); // resumed working → no longer awaiting you
-  }
-  if ((kind === "permission.delete" || kind === "question.delete") && payload.sessionID) {
-    maybeClearWaiting(payload.sessionID); // answered → ack the "needs input" nudge
-  }
-  persist();
-}
-
-// True when a session OR any of its subagents has a pending permission/question
-// (a typed reply it's blocked on). Reactive — clears itself when the request is
-// resolved. Surfaced in the session list and used to auto-ack the in-app nudge.
-export function sessionNeedsInput(sessionID: string): boolean {
-  for (const id of subtreeSessionIds(sessionID)) {
-    if (Object.keys(state.permissions[id] || {}).length > 0) return true;
-    if (Object.keys(state.questions[id] || {}).length > 0) return true;
-  }
-  return false;
-}
-
-// Once a session's subtree has no more pending input, mark its "waiting" nudge
-// read (the daemon's notice is keyed by the root session id).
-function maybeClearWaiting(sessionID: string) {
-  const root = rootOf(sessionID);
-  if (!sessionNeedsInput(root)) {
-    markRead((n) => n.kind === "waiting" && n.sessionID === root);
-  }
-}
-
-// Acknowledge a session as read (called when its bottom is reached): clears the
-// finished-unread flag on its root, server-side (cross-device) + optimistically.
-export function ackSession(id: string) {
-  if (!id) return;
-  const root = rootOf(id);
-  // Viewing a session acks ALL of its notifications (any kind) — but only when
-  // the user is actually PRESENT. Leaving the PWA open on a session while away
-  // (idle/backgrounded) must not silently mark its nudges read; that's the whole
-  // point of the alert. Explicit actions (answering, archiving) ack regardless.
-  if (attendingNow()) markRead((n) => (n.sessionID || "") === root);
-  if (!state.unread[root]) return; // nothing more to ack (finished-unread flag)
-  setState("unread", root, undefined as unknown as boolean);
-  void fetch("/vh/ack", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ sessionID: id }),
-  }).catch(() => {});
-}
-
-// The root of a session (top of the parentID chain that's still in the store).
-export function rootOf(id: string): string {
-  let cur = id;
-  for (let guard = 0; guard < 10000; guard++) {
-    const p = state.sessions[cur]?.parentID;
-    if (!p || !state.sessions[p]) return cur;
-    cur = p;
-  }
-  return cur;
-}
+  state,
+  setState,
+  selectedId,
+  setSelectedIdRaw,
+  draft,
+  setDraft,
+  projectDir,
+  isSending,
+  setSending,
+  urlDir,
+} from "./sync/store";
+import { rootOf } from "./sync/selectors";
+import { currentUrlSession, syncUrl, setApplyingUrl } from "./sync/url";
+import {
+  connect,
+  openSessionStream,
+  watchdogTick,
+  maybeReconnect,
+} from "./sync/stream";
+import { setSelectedId, switchProject, openSession } from "./sync/actions";
 
 // Inject the session-store accessors alerts needs (instead of alerts importing
 // from sync — that was a cycle). Bound at load, before any heartbeat/notice runs.
@@ -411,259 +42,6 @@ bindAlertsContext({
   rootOf,
   sessionTitle: (id) => state.sessions[id]?.title,
 });
-
-type ModelRefLite = { providerID: string; modelID: string; variant?: string };
-
-// Read-only per-session model selectors, so the models module depends on these
-// views rather than reaching into the store's shape directly. session.model uses
-// `id`, message.model uses `modelID` — accept either.
-export function sessionModel(id: string): ModelRefLite | undefined {
-  const m = state.sessions[id]?.model;
-  const modelID = m?.modelID ?? m?.id;
-  return m?.providerID && modelID ? { providerID: m.providerID, modelID, variant: m.variant } : undefined;
-}
-
-// The model on the session's most recent user message.
-export function lastUserMessageModel(id: string): ModelRefLite | undefined {
-  const sm = state.messages[id];
-  if (!sm) return undefined;
-  for (let i = sm.order.length - 1; i >= 0; i--) {
-    const info: any = sm.byId[sm.order[i]]?.info;
-    if (info?.role === "user" && info.model?.providerID) {
-      return { providerID: info.model.providerID, modelID: info.model.modelID, variant: info.model.variant };
-    }
-  }
-  return undefined;
-}
-
-// Per-root "was its subtree working" memory, used to ping exactly once when a
-// root task fully completes (root + all its subagents idle). Subsession-level
-// completions never ping — only the root does.
-const rootWorking = new Map<string, boolean>();
-// Pending "finished" timers, keyed by root. A turn can dip idle for a moment
-// between steps (one step finishes, the next hasn't escalated to busy yet), so
-// we don't ping the instant the subtree reads idle — we wait for the idle to
-// SETTLE. If the root goes busy again before the timer fires, the run wasn't
-// actually done and we cancel, so a multi-step turn pings exactly once at the end.
-const doneTimers = new Map<string, ReturnType<typeof setTimeout>>();
-const DONE_SETTLE_MS = 4000;
-function maybeNotifyRootDone(changedSessionID: string) {
-  const root = rootOf(changedSessionID);
-  const nowWorking = sessionWorking(root); // folds in descendant activity
-  const was = rootWorking.get(root) ?? false;
-  rootWorking.set(root, nowWorking);
-  if (nowWorking) {
-    // Back to work (or still working): cancel any pending "finished" ping.
-    const t = doneTimers.get(root);
-    if (t !== undefined) {
-      clearTimeout(t);
-      doneTimers.delete(root);
-    }
-    return;
-  }
-  // Settled to idle: the transient "still working" alerts (stuck-thinking,
-  // runaway command, stalled) for this root no longer hold — ack them.
-  markRead((n) => (n.sessionID || "") === root && (n.tag === "stuck-thinking" || n.tag === "runaway" || n.tag === "stalled"));
-  // Just settled into idle: schedule the ping, but only if it stays idle long
-  // enough that this is a real turn-end and not a between-steps dip.
-  if (was && !doneTimers.has(root)) {
-    const t = setTimeout(() => {
-      doneTimers.delete(root);
-      if (!sessionWorking(root) && root !== selectedId()) {
-        pushNotification({ kind: "done", sessionID: root, title: "finished" });
-      }
-    }, DONE_SETTLE_MS);
-    doneTimers.set(root, t);
-  }
-}
-
-async function fetchSessionMessages(id: string): Promise<any[]> {
-  const res = await fetch(
-    `/vh/snapshot?sessions=${encodeURIComponent(id)}&dir=${encodeURIComponent(projectDir())}`,
-  );
-  const snap: Snapshot = await res.json();
-  return (snap.messages?.[id] as any[]) || [];
-}
-
-// Reserve a session's message slot so the chat renders immediately; the actual
-// history + live updates come from the active-session message stream (Stream 2),
-// which is the sole owner of message state to avoid a one-shot fetch clobbering
-// in-flight streamed deltas.
-export async function openSession(id: string) {
-  if (!state.messages[id]) setState("messages", id, { order: [], byId: {} });
-}
-
-// On a tree-stream resync, refresh cached message state for NON-active opened
-// sessions (the active one is owned by the live session stream, so skip it to
-// avoid clobbering streamed deltas).
-async function refreshOpenSessions() {
-  const active = selectedId();
-  for (const id of Object.keys(state.messages)) {
-    if (id === active) continue;
-    try {
-      const items = await fetchSessionMessages(id);
-      setState("messages", id, buildMessages(items));
-    } catch {
-      /* keep stale; reopening re-snapshots */
-    }
-  }
-}
-
-let es: EventSource | null = null;
-let lastSeen = 0; // ms of the last byte/event from the server (incl. pings)
-let reconnectTimer: number | undefined;
-let backoff = 1000; // grows on repeated failures, reset on a healthy open
-let everOpened = false; // first stream open is the initial load; later opens are reconnects
-const STALE_MS = 45_000; // ~3 missed 15s pings → assume the stream is dead
-
-function markSeen() {
-  lastSeen = Date.now();
-}
-
-// === Stream 1: tree + notifications (persistent) ============================
-// Structural (session/activity/status) + notification (permission/question)
-// events for ALL sessions. The server omits message/part events here
-// (sessions=""), so a busy project's background token-delta flood never delays
-// these important events. Resumable via cursor; watchdog + backoff guarded.
-//
-// `fresh` forces a full snapshot (no cursor) instead of resuming. Used on a page
-// load / project switch, where in-memory state was just hydrated from
-// localStorage and is INCOMPLETE — only sessions+activity are persisted, not
-// pending permissions/questions/unread. Resuming from the saved cursor would
-// replay only events AFTER it, so any state established before the cursor (a
-// busy activity, a pending permission/question) would be invisible. A snapshot
-// reconciles all current state authoritatively. Transient in-page reconnects
-// (watchdog/onerror/visibility) resume normally: in-memory state is intact, and
-// the server falls back to a snapshot itself if the gap exceeds its ring buffer.
-function connect(fresh = false) {
-  clearTimeout(reconnectTimer);
-  es?.close();
-  const cursorParam = fresh ? "" : `cursor=${state.cursor}&`;
-  es = new EventSource(`/vh/stream?${cursorParam}sessions=&dir=${encodeURIComponent(projectDir())}`);
-  markSeen();
-  log.debug("sync", "tree stream connect", { cursor: fresh ? "fresh" : state.cursor, dir: projectDir() });
-  es.addEventListener("snapshot", (e) => {
-    markSeen();
-    applySnapshot(JSON.parse((e as MessageEvent).data));
-    setState("status", "live");
-    void refreshOpenSessions();
-  });
-  es.addEventListener("ping", () => markSeen()); // heartbeat for the watchdog
-  for (const kind of ["session.upsert", "session.delete"]) {
-    es.addEventListener(kind, (e) => {
-      markSeen();
-      const ev = e as MessageEvent;
-      applySessionEvent(kind, Number(ev.lastEventId), JSON.parse(ev.data));
-    });
-  }
-  for (const kind of ["status", "activity", "permission.upsert", "permission.delete", "question.upsert", "question.delete", "unread.set", "unread.clear", "todo"]) {
-    es.addEventListener(kind, (e) => {
-      markSeen();
-      const ev = e as MessageEvent;
-      applyMessageEvent(kind, Number(ev.lastEventId), JSON.parse(ev.data));
-    });
-  }
-  // Daemon-detected alerts (transient; no cursor advance). In-app + OS delivery.
-  es.addEventListener("notice", (e) => {
-    markSeen();
-    try {
-      handleNotice(JSON.parse((e as MessageEvent).data));
-    } catch {
-      /* ignore malformed notice */
-    }
-  });
-  es.onopen = () => {
-    markSeen();
-    backoff = 1000; // healthy — reset backoff
-    setState("status", "live");
-    // A reconnect (not the first open) means the stream dropped and came back —
-    // typically a vh restart/self-update. Re-check the version so a new build
-    // surfaces the reload toast immediately instead of on the next poll.
-    if (everOpened) checkVersionNow();
-    everOpened = true;
-  };
-  es.onerror = () => {
-    // EventSource auto-retries while CONNECTING; we only step in once it gives
-    // up (CLOSED), with backoff, so a flaky network / daemon restart self-heals.
-    setState("status", "reconnecting");
-    if (es && es.readyState === EventSource.CLOSED) {
-      log.warn("sync", "tree stream closed → reconnecting", { backoff });
-      clearTimeout(reconnectTimer);
-      reconnectTimer = window.setTimeout(connect, backoff);
-      backoff = Math.min(backoff * 2, 15_000);
-    }
-  };
-}
-
-// === Stream 2: active-session messages ======================================
-// message/part events for ONLY the open session. Always snapshots fresh (no
-// cursor) so switching sessions can't miss/skip deltas; reopened on switch,
-// closed when nothing is open. Self-retries on error.
-let ses: EventSource | null = null;
-let sesId = "";
-let sesRetry: number | undefined;
-
-function closeSessionStream() {
-  clearTimeout(sesRetry);
-  ses?.close();
-  ses = null;
-  sesId = "";
-}
-
-function openSessionStream(id: string) {
-  if (id === sesId && ses && ses.readyState !== EventSource.CLOSED) return;
-  closeSessionStream();
-  if (!id) return;
-  sesId = id;
-  const open = () => {
-    if (sesId !== id) return;
-    ses?.close();
-    ses = new EventSource(`/vh/stream?sessions=${encodeURIComponent(id)}&dir=${encodeURIComponent(projectDir())}`);
-    log.debug("sync", "session stream connect", { id });
-    ses.addEventListener("snapshot", (e) => {
-      markSeen();
-      const snap: Snapshot = JSON.parse((e as MessageEvent).data);
-      setState("messages", id, buildMessages((snap.messages?.[id] as any[]) || []));
-    });
-    ses.addEventListener("ping", () => markSeen());
-    for (const kind of ["message.upsert", "message.delete", "part.upsert", "part.delete"]) {
-      ses!.addEventListener(kind, (e) => {
-        markSeen();
-        const ev = e as MessageEvent;
-        // trackCursor:false — Stream 2 must not advance Stream 1's resume cursor.
-        applyMessageEvent(kind, Number(ev.lastEventId), JSON.parse(ev.data), false);
-      });
-    }
-    ses.onerror = () => {
-      if (ses && ses.readyState === EventSource.CLOSED && sesId === id) {
-        clearTimeout(sesRetry);
-        sesRetry = window.setTimeout(open, 1500);
-      }
-    };
-  };
-  open();
-}
-
-// Force a reconnect when the tree stream has gone silent past the heartbeat
-// window (a dead-but-open socket EventSource won't surface as an error) or was
-// closed. Runs while the tab is visible.
-function watchdogTick() {
-  if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
-  if (!es || es.readyState === EventSource.CLOSED) {
-    connect();
-  } else if (lastSeen && Date.now() - lastSeen > STALE_MS) {
-    log.warn("sync", "stream stale → forcing reconnect", { silentMs: Date.now() - lastSeen });
-    setState("status", "reconnecting");
-    connect();
-  }
-  // The session stream self-retries on error; reopen if it died silently.
-  if (sesId && (!ses || ses.readyState === EventSource.CLOSED)) openSessionStream(sesId);
-}
-
-function maybeReconnect() {
-  if (!es || es.readyState === EventSource.CLOSED) connect();
-  else watchdogTick();
-}
 
 export function startSync() {
   connect(true); // page load: snapshot to fully reconcile (state hydrated from localStorage is partial)
@@ -694,7 +72,7 @@ export function startSync() {
   window.addEventListener("popstate", () => {
     const id = currentUrlSession();
     const dir = urlDir() ?? "";
-    applyingUrl = true;
+    setApplyingUrl(true);
     try {
       if (dir !== projectDir()) switchProject(dir, true);
       setSelectedIdRaw(id);
@@ -704,213 +82,43 @@ export function startSync() {
         void openSession(id);
       }
     } finally {
-      applyingUrl = false;
+      setApplyingUrl(false);
     }
   });
 }
 
-// "New session" no longer hits the server — it enters draft mode so an unused,
-// empty session is never created. The real session is created on first send.
-export function newSession() {
-  setSelectedIdRaw(null);
-  setDraft(true);
-  syncUrl(null);
-  setView("chat"); // composing always happens in the chat view
-}
-
-// Create a session on the server (called when the draft's first message is
-// sent). Returns the new id, or null on failure.
-export async function createSession(): Promise<string | null> {
-  try {
-    const res = await fetch("/oc/session", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: "{}",
-    });
-    const sess = await res.json();
-    if (sess?.id) {
-      setSelectedId(sess.id);
-      void openSession(sess.id);
-      return sess.id;
-    }
-  } catch {
-    /* caller surfaces the failure */
-  }
-  return null;
-}
-
-// Reply to a pending permission request: "once" | "always" | "reject".
-// Uses OpenCode's canonical permission-reply route (POST /permission/:id/reply
-// with {reply}); falls back to the legacy session-scoped route ({response}) for
-// older servers. Clears the card optimistically so the UI responds immediately.
-export async function respondPermission(sessionID: string, permissionID: string, response: string) {
-  setState(
-    produce((s) => {
-      if (s.permissions[sessionID]) delete s.permissions[sessionID][permissionID];
-    }),
-  );
-  log.debug("permission", "reply", { sessionID, permissionID, response });
-  try {
-    const res = await fetch(`/oc/permission/${encodeURIComponent(permissionID)}/reply`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ reply: response }),
-    });
-    if (res.ok) return;
-    log.warn("permission", "canonical reply not ok → legacy route", { status: res.status });
-  } catch (e) {
-    log.warn("permission", "canonical reply threw → legacy route", e);
-    /* fall through to the legacy route */
-  }
-  const legacy = await fetch(
-    `/oc/session/${encodeURIComponent(sessionID)}/permissions/${encodeURIComponent(permissionID)}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ response }),
-    },
-  );
-  if (!legacy.ok) log.error("permission", "reply failed on both routes", { status: legacy.status });
-}
-
-// Reply to a pending question. `answers` is one array of chosen labels (or
-// custom strings) per question in the request.
-// Generate an LLM title suggestion for a session on demand (used by "Regenerate
-// name"). Reuses OpenCode's purpose-built namer — POST /experimental/project/
-// :projectID/copy/generate-name {context} — which runs the small model and
-// returns a short slug, with NO session pollution (unlike sending a real
-// prompt). We de-slugify it into a readable title; the caller confirms/edits it
-// before applying. Returns null on failure (caller surfaces it). Unlike
-// OpenCode's built-in auto-title, this works on any session — multi-turn or not.
-export async function respondQuestion(questionID: string, answers: string[][]) {
-  log.debug("question", "reply", { questionID, answers });
-  const res = await fetch(`/oc/question/${encodeURIComponent(questionID)}/reply`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ answers }),
-  });
-  if (!res.ok) log.error("question", "reply failed", { status: res.status });
-}
-
-// Whether a session is actively working. Purely the authoritative activity
-// signal (matches opencode web: status.type !== "idle"), recovered on hydrate
-// from /session/status. No message-based heuristic — a turn terminated
-// mid-generation leaves an incomplete last message but is NOT busy, and must not
-// spin forever.
-export function sessionWorking(sessionID: string): boolean {
-  if (isActivityWorking(state.activity[sessionID])) return true;
-  // A running subagent (child) session keeps its parent chain "working" too.
-  // OpenCode's /session/status marks only the child (delegate) session busy, so
-  // the root/parent would otherwise render idle while its subagent is still
-  // generating. Propagate busy/retry up by checking descendants.
-  return descendantWorking(sessionID);
-}
-
-function isActivityWorking(act?: string): boolean {
-  return act === "busy" || act === "retry";
-}
-
-// runningSessionCount counts root sessions whose subtree is currently working —
-// the sessions a restart would interrupt. Subagents fold into their root via
-// sessionWorking(), so each running task counts once.
-export function runningSessionCount(): number {
-  let n = 0;
-  for (const id of Object.keys(state.sessions)) {
-    const s = state.sessions[id];
-    if (s?.parentID && state.sessions[s.parentID]) continue; // count roots only
-    if (sessionWorking(id)) n++;
-  }
-  return n;
-}
-
-function descendantWorking(sessionID: string): boolean {
-  return anyDescendantWorking(state.sessions, state.activity, sessionID, isActivityWorking);
-}
-
-// normalizeTodos extracts the todo array from either the bare array or the
-// daemon's `{ sessionID, todos }` envelope (snapshot stores the raw properties).
-function normalizeTodos(v: any): TodoItem[] {
-  if (Array.isArray(v)) return v as TodoItem[];
-  if (v && Array.isArray(v.todos)) return v.todos as TodoItem[];
-  return [];
-}
-
-// All session ids in a subtree (the session + descendant subagents). Tasks roll
-// up like running state does, so a parent's indicator surfaces the todos its
-// subagents are working — without having to open each subsession.
-function subtreeSessionIds(rootID: string): string[] {
-  const childrenOf: Record<string, string[]> = {};
-  for (const id of Object.keys(state.sessions)) {
-    const p = state.sessions[id]?.parentID;
-    if (p) (childrenOf[p] ||= []).push(id);
-  }
-  const out: string[] = [];
-  const stack = [rootID];
-  while (stack.length) {
-    const id = stack.pop()!;
-    out.push(id);
-    for (const c of childrenOf[id] || []) stack.push(c);
-  }
-  return out;
-}
-
-// sessionTodos returns the agent todos (OpenCode TodoWrite) for a session AND
-// its subagents, in subtree order.
-export function sessionTodos(sessionID?: string): TodoItem[] {
-  if (!sessionID) return [];
-  const out: TodoItem[] = [];
-  for (const id of subtreeSessionIds(sessionID)) {
-    const items = state.todos[id];
-    if (items && items.length) out.push(...items);
-  }
-  return out;
-}
-
-// sessionTodoCounts summarizes the subtree todos for the "Tasks N active · M
-// left" indicator: active = in_progress, left = pending + in_progress (i.e. not
-// completed/cancelled), total = all. Zeros when there are none.
-export function sessionTodoCounts(sessionID?: string): { active: number; left: number; total: number } {
-  const items = sessionTodos(sessionID);
-  let active = 0;
-  let left = 0;
-  for (const t of items) {
-    const st = t?.status;
-    if (st === "in_progress") active++;
-    if (st !== "completed" && st !== "cancelled") left++;
-  }
-  return { active, left, total: items.length };
-}
-
-// Optimistically mark a session idle (used right after aborting a turn) so the
-// working indicator clears immediately instead of waiting on server events —
-// OpenCode doesn't always emit an idle event on abort. Later events reconcile.
-// Abort a session's turn and clear its working indicator. Exposed for the
-// session menu as a recovery path: a turn killed mid-generation (e.g. a network
-// drop) can leave OpenCode reporting the session "busy" forever (a zombie turn)
-// while the composer's Stop button may be unavailable — this always works.
-export async function abortSession(sessionID: string) {
-  if (!sessionID) return;
-  markSessionIdle(sessionID);
-  try {
-    await fetch(`/oc/session/${encodeURIComponent(sessionID)}/abort`, { method: "POST" });
-  } catch (e) {
-    log.warn("abort", "request failed", e);
-  }
-}
-
-export function markSessionIdle(sessionID: string) {
-  setState(
-    produce((s) => {
-      s.activity[sessionID] = "idle";
-      const sm = s.messages[sessionID];
-      if (sm && sm.order.length) {
-        const last = sm.byId[sm.order[sm.order.length - 1]];
-        if (last && last.info.role === "assistant" && !last.info.time?.completed) {
-          last.info = { ...last.info, time: { ...(last.info.time || {}), completed: Date.now() } };
-        }
-      }
-    }),
-  );
-}
-
-export { state, selectedId, setSelectedId, draft, setDraft, projectDir };
+export {
+  // store
+  state,
+  selectedId,
+  draft,
+  setDraft,
+  projectDir,
+  isSending,
+  setSending,
+  // selectors
+  rootOf,
+  // actions
+  setSelectedId,
+  switchProject,
+  openSession,
+};
+export {
+  sessionNeedsInput,
+  sessionModel,
+  lastUserMessageModel,
+  sessionWorking,
+  runningSessionCount,
+  sessionTodos,
+  sessionTodoCounts,
+} from "./sync/selectors";
+export { ackSession } from "./sync/orchestration";
+export {
+  newSession,
+  createSession,
+  respondPermission,
+  respondQuestion,
+  abortSession,
+  markSessionIdle,
+} from "./sync/actions";
+export type { SyncState } from "./sync/store";

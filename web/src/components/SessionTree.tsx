@@ -255,6 +255,7 @@ function Node(props: {
           class="tree-node"
           classList={{ selected: selectedId() === props.session.id, sub: props.depth > 0, running: busy(), detailed: treeDensity() === "detailed" }}
           onClick={() => openSessionChat(props.session.id)}
+          data-session-id={props.session.id}
           data-tip={props.session.title || props.session.id}
           {...menuTriggers(() => props.session.id, () => props.session.title || props.session.id)}
         >
@@ -426,6 +427,7 @@ export default function SessionTree() {
                     class="tree-node"
                     classList={{ selected: selectedId() === s.id, running: isWorking(s.id), detailed: treeDensity() === "detailed" }}
                     onClick={() => openSessionChat(s.id)}
+                    data-session-id={s.id}
                     data-tip={s.title || s.id}
                     {...menuTriggers(() => s.id, () => s.title || s.id)}
                   >
