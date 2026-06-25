@@ -1,5 +1,6 @@
-import { createMemo, createResource, createSignal, onCleanup, onMount, Show } from "solid-js";
+import { createMemo, createResource, createSignal, Show } from "solid-js";
 import { oc } from "../api";
+import { dismiss } from "../lib/a11y";
 import ServersPanel from "./ServersPanel";
 import Icon from "./Icon";
 
@@ -18,26 +19,8 @@ export default function StatusPopover() {
     return "ok";
   });
 
-  let rootEl: HTMLDivElement | undefined;
-  const onDoc = (e: MouseEvent) => {
-    // composedPath (not contains) so a click on an inner control that re-renders
-    // and detaches the clicked node isn't misread as an outside click.
-    if (open() && rootEl && !e.composedPath().includes(rootEl)) setOpen(false);
-  };
-  const onKey = (e: KeyboardEvent) => {
-    if (e.key === "Escape") setOpen(false);
-  };
-  onMount(() => {
-    document.addEventListener("click", onDoc);
-    document.addEventListener("keydown", onKey);
-  });
-  onCleanup(() => {
-    document.removeEventListener("click", onDoc);
-    document.removeEventListener("keydown", onKey);
-  });
-
   return (
-    <div class="status-pop" ref={rootEl}>
+    <div class="status-pop" use:dismiss={() => open() && setOpen(false)}>
       <button
         type="button"
         class="icon-btn status-btn"

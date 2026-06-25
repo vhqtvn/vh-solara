@@ -68,11 +68,37 @@ export function modal(el: HTMLElement) {
   onCleanup(attachModal(el));
 }
 
+// Solid directive: <div use:dismiss={() => setOpen(false)}> closes a popover on
+// an outside click or Escape. Armed on the next tick so the click that opened it
+// doesn't immediately dismiss it. Uses composedPath (not el.contains) so a click
+// on an inner control that re-renders mid-click still counts as "inside" — the
+// Solid event-delegation footgun every popover was handling by hand. Best on a
+// panel that's mounted only while open (the listener lifetime tracks the panel).
+export function dismiss(el: HTMLElement, value: () => () => void) {
+  const onClose = value();
+  const onDoc = (e: MouseEvent) => {
+    if (!e.composedPath().includes(el)) onClose();
+  };
+  const onKey = (e: KeyboardEvent) => {
+    if (e.key === "Escape") onClose();
+  };
+  const id = window.setTimeout(() => {
+    document.addEventListener("click", onDoc);
+    document.addEventListener("keydown", onKey);
+  }, 0);
+  onCleanup(() => {
+    clearTimeout(id);
+    document.removeEventListener("click", onDoc);
+    document.removeEventListener("keydown", onKey);
+  });
+}
+
 declare module "solid-js" {
   // eslint-disable-next-line @typescript-eslint/no-namespace
   namespace JSX {
     interface Directives {
       modal: true;
+      dismiss: () => void;
     }
   }
 }

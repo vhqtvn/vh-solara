@@ -1,5 +1,6 @@
-import { createMemo, createResource, createSignal, For, onCleanup, onMount, Show } from "solid-js";
+import { createMemo, createResource, createSignal, For, Show } from "solid-js";
 import { addProject, fetchRecentProjects, projectDir, projects, removeProject, selectProject } from "../projects";
+import { dismiss } from "../lib/a11y";
 import Icon from "./Icon";
 import TextPromptDialog from "./TextPromptDialog";
 
@@ -17,20 +18,6 @@ export default function ProjectSwitcher() {
     return recents().filter((r) => !pinned.has(r.directory) && r.directory !== projectDir());
   });
 
-  let rootEl: HTMLDivElement | undefined;
-  const onDoc = (e: MouseEvent) => {
-    if (open() && rootEl && !e.composedPath().includes(rootEl)) setOpen(false);
-  };
-  const onKey = (e: KeyboardEvent) => e.key === "Escape" && setOpen(false);
-  onMount(() => {
-    document.addEventListener("click", onDoc);
-    document.addEventListener("keydown", onKey);
-  });
-  onCleanup(() => {
-    document.removeEventListener("click", onDoc);
-    document.removeEventListener("keydown", onKey);
-  });
-
   function openMenu() {
     setOpen((v) => !v);
     if (!open()) void refetch(); // refresh recents when opening
@@ -42,7 +29,7 @@ export default function ProjectSwitcher() {
   }
 
   return (
-    <div class="proj" ref={rootEl}>
+    <div class="proj" use:dismiss={() => open() && setOpen(false)}>
       <button type="button" class="proj-current" onClick={openMenu} data-tip={current()?.directory || "Default"}>
         <Icon name="layers" size={14} />
         <span class="proj-name">{current()?.name}</span>
