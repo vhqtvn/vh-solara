@@ -15,7 +15,7 @@ import {
   upsertPart,
 } from "./lib/reduce";
 import { pushNotification, markRead } from "./notify";
-import { handleNotice, attendingNow } from "./alerts";
+import { handleNotice, attendingNow, bindAlertsContext } from "./alerts";
 import { checkVersionNow } from "./pwa";
 import { log } from "./lib/log";
 import { setView } from "./ui";
@@ -403,6 +403,14 @@ export function rootOf(id: string): string {
   }
   return cur;
 }
+
+// Inject the session-store accessors alerts needs (instead of alerts importing
+// from sync — that was a cycle). Bound at load, before any heartbeat/notice runs.
+bindAlertsContext({
+  selectedId,
+  rootOf,
+  sessionTitle: (id) => state.sessions[id]?.title,
+});
 
 // Per-root "was its subtree working" memory, used to ping exactly once when a
 // root task fully completes (root + all its subagents idle). Subsession-level

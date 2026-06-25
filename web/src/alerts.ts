@@ -13,7 +13,22 @@ import { createSignal } from "solid-js";
 import { loadVersioned, saveVersioned } from "./lib/store";
 import { pushNotification } from "./notify";
 import { heartbeat, type DeviceScope } from "./alertsApi";
-import { rootOf, selectedId, state } from "./sync";
+
+// Session-store accessors, injected by sync at load (bindAlertsContext) instead
+// of imported — this is the leaf side of what was a sync↔alerts import cycle.
+// Safe no-op defaults so anything firing before bind is harmless.
+let getSelectedId: () => string | null = () => null;
+let getRoot: (id: string) => string = (id) => id;
+let getTitle: (id: string) => string | undefined = () => undefined;
+export function bindAlertsContext(ctx: {
+  selectedId: () => string | null;
+  rootOf: (id: string) => string;
+  sessionTitle: (id: string) => string | undefined;
+}) {
+  getSelectedId = ctx.selectedId;
+  getRoot = ctx.rootOf;
+  getTitle = ctx.sessionTitle;
+}
 
 // --- device identity --------------------------------------------------------
 
@@ -91,11 +106,11 @@ export function attendingNow(idleMs = 60_000): boolean {
 }
 
 async function sendHeartbeat() {
-  const focused = selectedId();
+  const focused = getSelectedId();
   await heartbeat({
     id: deviceId,
     name: deviceName(),
-    focusedRoot: focused ? rootOf(focused) : "",
+    focusedRoot: focused ? getRoot(focused) : "",
     scope: scope(),
     lastInteraction: new Date(lastInteraction).toISOString(),
     idle: typeof document !== "undefined" ? document.hidden : false,
@@ -149,9 +164,9 @@ function deliverable(n: Notice): boolean {
   if (s === "off") return false;
   if (s === "all") return true;
   // "current": only the session currently in view (matched by root).
-  const focused = selectedId();
+  const focused = getSelectedId();
   if (!focused) return false;
-  return rootOf(focused) === n.root || focused === n.sessionID;
+  return getRoot(focused) === n.root || focused === n.sessionID;
 }
 
 // handleNotice is called by the sync stream for each `notice` event. It adds an
@@ -164,7 +179,7 @@ export function handleNotice(raw: unknown) {
   if (!n || !n.type || !LABEL[n.type]) return;
   if (!deliverable(n)) return;
 
-  const name = n.title || state.sessions[n.sessionID]?.title || n.sessionID.slice(0, 8);
+  const name = n.title || getTitle(n.sessionID) || n.sessionID.slice(0, 8);
   const { emoji, verb } = LABEL[n.type];
   const headline = `${emoji} ${name} ${verb}`;
 
