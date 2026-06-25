@@ -1,42 +1,29 @@
-// Small UI preferences (versioned localStorage signals), kept out of the sync store.
-import { createSignal } from "solid-js";
-import { loadVersioned, saveVersioned } from "./lib/store";
+// Small UI preferences (versioned localStorage signals), kept out of the sync
+// store. Each is a persistedSignal (hydrate on load, persist on set); setters
+// that also touch the DOM wrap it with the side effect.
+import { persistedSignal, boolMigrate } from "./lib/store";
 
 // Live message streaming: when on (default), in-flight assistant text renders
 // token-by-token; when off ("block-by-block"), a part shows only once settled.
-const STREAM_KEY = "vh.prefs.streamLive.v1";
-const [streamLive, setStreamLiveSig] = createSignal<boolean>(
-  loadVersioned<boolean>(STREAM_KEY, 1, true, (old) => !(old === 0 || old === "0" || old === false)),
-);
-export function setStreamLive(on: boolean) {
-  setStreamLiveSig(on);
-  saveVersioned(STREAM_KEY, 1, on);
-}
-export { streamLive };
+export const [streamLive, setStreamLive] = persistedSignal<boolean>("vh.prefs.streamLive.v1", 1, true, boolMigrate(true));
 
 // Session-list density: "compact" (single line per session, the original) or
 // "detailed" (two lines — title row + a secondary line with direct-children
 // running/idle counts, falling back to started-at when there are none).
-const DENSITY_KEY = "vh.prefs.treeDensity.v1";
-const [treeDensity, setTreeDensitySig] = createSignal<"compact" | "detailed">(
-  loadVersioned<"compact" | "detailed">(DENSITY_KEY, 1, "compact", (o) =>
-    o === "detailed" ? "detailed" : "compact",
-  ),
+export const [treeDensity, setTreeDensity] = persistedSignal<"compact" | "detailed">(
+  "vh.prefs.treeDensity.v1",
+  1,
+  "compact",
+  (o) => (o === "detailed" ? "detailed" : "compact"),
 );
-export function setTreeDensity(v: "compact" | "detailed") {
-  setTreeDensitySig(v);
-  saveVersioned(DENSITY_KEY, 1, v);
-}
-export { treeDensity };
 
 // Client UI zoom: the user's own scale control. On mobile we drive the actual
-// viewport scale (a real "virtual viewport" zoom the user sets deliberately,
-// replacing the disabled pinch-zoom); on desktop, where the viewport meta is
-// ignored, we use CSS `zoom`. Clamped 0.5–1.6.
-const SCALE_KEY = "vh.prefs.uiScale.v1";
+// viewport scale (a real "virtual viewport" zoom the user sets deliberately);
+// on desktop, where the viewport meta is ignored, we use CSS `zoom`. Clamped.
 export const MIN_SCALE = 0.5;
 export const MAX_SCALE = 1.6;
-const [uiScale, setUiScaleSig] = createSignal<number>(loadVersioned<number>(SCALE_KEY, 1, 1));
+const [uiScale, setUiScaleRaw] = persistedSignal<number>("vh.prefs.uiScale.v1", 1, 1);
+export { uiScale };
 
 const VIEWPORT_BASE = "width=device-width, viewport-fit=cover, interactive-widget=resizes-content";
 function setViewportScale(scale: number) {
@@ -52,8 +39,8 @@ export function applyScale() {
   const scale = uiScale();
   const root = document.documentElement;
   const coarse = typeof matchMedia !== "undefined" && matchMedia("(pointer: coarse)").matches;
-  // ui-zoom always drives the viewport meta's initial/minimum/maximum-scale —
-  // the mechanism that actually scales on mobile (and webviews that honor it).
+  // ui-zoom always drives the viewport meta's initial/min/max-scale — the
+  // mechanism that actually scales on mobile (and webviews that honor it).
   setViewportScale(scale);
   if (coarse) {
     // Mobile: the meta scale above does the work; CSS zoom reset so they don't
@@ -70,21 +57,20 @@ export function applyScale() {
   }
 }
 export function setUiScale(s: number) {
-  const clamped = Math.min(MAX_SCALE, Math.max(MIN_SCALE, Math.round(s * 100) / 100));
-  setUiScaleSig(clamped);
-  saveVersioned(SCALE_KEY, 1, clamped);
+  setUiScaleRaw(Math.min(MAX_SCALE, Math.max(MIN_SCALE, Math.round(s * 100) / 100)));
   applyScale();
 }
-export { uiScale };
 
-// Screen orientation: "system" (default — respect the device/OS, including its
-// rotation lock) or "auto" (lock to "any" so the app rotates freely even when
-// the OS rotation-lock is on). Only effective in an installed PWA / fullscreen
-// on most browsers; calls are best-effort and ignored where unsupported.
-const ORIENT_KEY = "vh.prefs.orientation.v1";
-const [orientation, setOrientationSig] = createSignal<"system" | "auto">(
-  loadVersioned<"system" | "auto">(ORIENT_KEY, 1, "system", (o) => (o === "auto" ? "auto" : "system")),
+// Screen orientation: "system" (respect the device/OS, incl. its rotation lock)
+// or "auto" (lock to "any" so the app rotates freely). Only effective in an
+// installed PWA / fullscreen on most browsers; best-effort, ignored elsewhere.
+const [orientation, setOrientationRaw] = persistedSignal<"system" | "auto">(
+  "vh.prefs.orientation.v1",
+  1,
+  "system",
+  (o) => (o === "auto" ? "auto" : "system"),
 );
+export { orientation };
 export function applyOrientation() {
   const so: any = typeof screen !== "undefined" ? (screen as any).orientation : null;
   if (!so) return;
@@ -100,161 +86,106 @@ export function applyOrientation() {
   }
 }
 export function setOrientation(v: "system" | "auto") {
-  setOrientationSig(v);
-  saveVersioned(ORIENT_KEY, 1, v);
+  setOrientationRaw(v);
   applyOrientation();
 }
-export { orientation };
 
-// Chat reading width: the message column + composer max-width, driven through a
-// --chat-width CSS var. "comfortable" is the original centered column (good for
-// prose); "wide"/"full" reclaim the side space a centered column wastes on a
-// large external monitor.
-const CHATW_KEY = "vh.prefs.chatWidth.v1";
+// Chat reading width: the message column + composer max-width, via --chat-width.
+// "comfortable" is the original centered column; "wide"/"full" reclaim side space.
 export type ChatWidth = "comfortable" | "wide" | "full";
 const CHATW_PX: Record<ChatWidth, string> = { comfortable: "860px", wide: "1180px", full: "100%" };
-const [chatWidth, setChatWidthSig] = createSignal<ChatWidth>(
-  loadVersioned<ChatWidth>(CHATW_KEY, 1, "comfortable", (o) =>
-    o === "wide" || o === "full" ? o : "comfortable"),
+const [chatWidth, setChatWidthRaw] = persistedSignal<ChatWidth>(
+  "vh.prefs.chatWidth.v1",
+  1,
+  "comfortable",
+  (o) => (o === "wide" || o === "full" ? o : "comfortable"),
 );
+export { chatWidth };
 export function applyChatWidth() {
   document.documentElement.style.setProperty("--chat-width", CHATW_PX[chatWidth()]);
 }
 export function setChatWidth(v: ChatWidth) {
-  setChatWidthSig(v);
-  saveVersioned(CHATW_KEY, 1, v);
+  setChatWidthRaw(v);
   applyChatWidth();
 }
-export { chatWidth };
 
-// Chat bubbles: render YOUR turns as a right-aligned bubble (Claude/OpenChamber
-// style) by toggling a root `chat-bubbles` class. Off → the original quiet
-// full-width card. Default on.
-const BUBBLE_KEY = "vh.prefs.chatBubbles.v1";
-const [chatBubbles, setChatBubblesSig] = createSignal<boolean>(
-  loadVersioned<boolean>(BUBBLE_KEY, 1, true, (old) => !(old === 0 || old === "0" || old === false)),
-);
+// Chat bubbles: render YOUR turns as a right-aligned bubble by toggling a root
+// `chat-bubbles` class. Off → the original quiet full-width card. Default on.
+const [chatBubbles, setChatBubblesRaw] = persistedSignal<boolean>("vh.prefs.chatBubbles.v1", 1, true, boolMigrate(true));
+export { chatBubbles };
 export function applyChatBubbles() {
   document.documentElement.classList.toggle("chat-bubbles", chatBubbles());
 }
 export function setChatBubbles(on: boolean) {
-  setChatBubblesSig(on);
-  saveVersioned(BUBBLE_KEY, 1, on);
+  setChatBubblesRaw(on);
   applyChatBubbles();
 }
-export { chatBubbles };
 
-// View-tab display style in the header. "labels" (text, the default) and "icons"
-// both use priority+ overflow (surplus tabs collapse into a ⋯ menu); "dropdown"
-// is a single compact selector that scales to any number of views.
+// View-tab display style in the header. "labels" (text, default) and "icons"
+// both use priority+ overflow; "dropdown" is a single compact selector.
 export type TabStyle = "labels" | "icons" | "dropdown";
-const TABSTYLE_KEY = "vh.prefs.tabStyle.v1";
-const [tabStyle, setTabStyleSig] = createSignal<TabStyle>(
-  loadVersioned<TabStyle>(TABSTYLE_KEY, 1, "labels", (o) => (o === "icons" || o === "dropdown" ? o : "labels")),
+export const [tabStyle, setTabStyle] = persistedSignal<TabStyle>(
+  "vh.prefs.tabStyle.v1",
+  1,
+  "labels",
+  (o) => (o === "icons" || o === "dropdown" ? o : "labels"),
 );
-export function setTabStyle(v: TabStyle) {
-  setTabStyleSig(v);
-  saveVersioned(TABSTYLE_KEY, 1, v);
-}
-export { tabStyle };
 
 // Code tree: show git-ignored entries (node_modules, build output, …). Off by
 // default so the tree stays clean; toggle in the viewer to reveal them (dimmed).
-const CODE_SHOW_IGNORED_KEY = "vh.prefs.codeShowIgnored.v1";
-const [codeShowIgnored, setCodeShowIgnoredSig] = createSignal<boolean>(
-  loadVersioned<boolean>(CODE_SHOW_IGNORED_KEY, 1, false, (o) => o === true || o === 1 || o === "1"),
+export const [codeShowIgnored, setCodeShowIgnored] = persistedSignal<boolean>(
+  "vh.prefs.codeShowIgnored.v1",
+  1,
+  false,
+  boolMigrate(false),
 );
-export function setCodeShowIgnored(on: boolean) {
-  setCodeShowIgnoredSig(on);
-  saveVersioned(CODE_SHOW_IGNORED_KEY, 1, on);
-}
-export { codeShowIgnored };
 
 // Code tree: compact single-child folder chains (a/b/c as one row), VS Code's
 // "compact folders". On by default — keeps deep package trees shallow.
-const CODE_FLATTEN_KEY = "vh.prefs.codeFlatten.v1";
-const [codeFlatten, setCodeFlattenSig] = createSignal<boolean>(
-  loadVersioned<boolean>(CODE_FLATTEN_KEY, 1, true, (o) => !(o === false || o === 0 || o === "0")),
-);
-export function setCodeFlatten(on: boolean) {
-  setCodeFlattenSig(on);
-  saveVersioned(CODE_FLATTEN_KEY, 1, on);
-}
-export { codeFlatten };
+export const [codeFlatten, setCodeFlatten] = persistedSignal<boolean>("vh.prefs.codeFlatten.v1", 1, true, boolMigrate(true));
 
 // Code viewer: show the files sidebar (the tree column). Toggle to give the open
 // file the full width on desktop. Visible by default.
-const CODE_SIDEBAR_KEY = "vh.prefs.codeSidebarOpen.v1";
-const [codeSidebarOpen, setCodeSidebarOpenSig] = createSignal<boolean>(
-  loadVersioned<boolean>(CODE_SIDEBAR_KEY, 1, true, (o) => !(o === false || o === 0 || o === "0")),
+export const [codeSidebarOpen, setCodeSidebarOpen] = persistedSignal<boolean>(
+  "vh.prefs.codeSidebarOpen.v1",
+  1,
+  true,
+  boolMigrate(true),
 );
-export function setCodeSidebarOpen(on: boolean) {
-  setCodeSidebarOpenSig(on);
-  saveVersioned(CODE_SIDEBAR_KEY, 1, on);
-}
-export { codeSidebarOpen };
 
 // Code sidebar: show the search box. Toggled from the tree's filter menu so the
 // sidebar can be all-tree when search isn't needed. Visible by default.
-const CODE_SHOW_SEARCH_KEY = "vh.prefs.codeShowSearch.v1";
-const [codeShowSearch, setCodeShowSearchSig] = createSignal<boolean>(
-  loadVersioned<boolean>(CODE_SHOW_SEARCH_KEY, 1, true, (o) => !(o === false || o === 0 || o === "0")),
+export const [codeShowSearch, setCodeShowSearch] = persistedSignal<boolean>(
+  "vh.prefs.codeShowSearch.v1",
+  1,
+  true,
+  boolMigrate(true),
 );
-export function setCodeShowSearch(on: boolean) {
-  setCodeShowSearchSig(on);
-  saveVersioned(CODE_SHOW_SEARCH_KEY, 1, on);
-}
-export { codeShowSearch };
 
 // Code peek dock: which side it docks (desktop) and its width (px), persisted.
-const CODE_DOCK_SIDE_KEY = "vh.prefs.codeDockSide.v1";
-const [codeDockSide, setCodeDockSideSig] = createSignal<"left" | "right">(
-  loadVersioned<"left" | "right">(CODE_DOCK_SIDE_KEY, 1, "right", (o) => (o === "left" ? "left" : "right")),
+export const [codeDockSide, setCodeDockSide] = persistedSignal<"left" | "right">(
+  "vh.prefs.codeDockSide.v1",
+  1,
+  "right",
+  (o) => (o === "left" ? "left" : "right"),
 );
-export function setCodeDockSide(v: "left" | "right") {
-  setCodeDockSideSig(v);
-  saveVersioned(CODE_DOCK_SIDE_KEY, 1, v);
-}
-export { codeDockSide };
 
-const CODE_DOCK_W_KEY = "vh.prefs.codeDockWidth.v1";
-const [codeDockWidth, setCodeDockWidthSig] = createSignal<number>(loadVersioned<number>(CODE_DOCK_W_KEY, 1, 480));
-export function setCodeDockWidth(px: number) {
-  const clamped = Math.max(280, Math.min(900, Math.round(px)));
-  setCodeDockWidthSig(clamped);
-  saveVersioned(CODE_DOCK_W_KEY, 1, clamped);
-}
+const [codeDockWidth, setCodeDockWidthRaw] = persistedSignal<number>("vh.prefs.codeDockWidth.v1", 1, 480);
 export { codeDockWidth };
+export function setCodeDockWidth(px: number) {
+  setCodeDockWidthRaw(Math.max(280, Math.min(900, Math.round(px))));
+}
 
 // Code view: syntax-highlight style (chroma style name; "" = follow the app
 // theme via the shared sheet) and soft-wrap toggle. Persisted.
-const CODE_STYLE_KEY = "vh.prefs.codeStyle.v1";
-const [codeStyle, setCodeStyleSig] = createSignal<string>(loadVersioned<string>(CODE_STYLE_KEY, 1, ""));
-export function setCodeStyle(v: string) {
-  setCodeStyleSig(v);
-  saveVersioned(CODE_STYLE_KEY, 1, v);
-}
-export { codeStyle };
-
-const CODE_WRAP_KEY = "vh.prefs.codeWrap.v1";
-const [codeWrap, setCodeWrapSig] = createSignal<boolean>(
-  loadVersioned<boolean>(CODE_WRAP_KEY, 1, false, (o) => o === true || o === 1 || o === "1"),
-);
-export function setCodeWrap(on: boolean) {
-  setCodeWrapSig(on);
-  saveVersioned(CODE_WRAP_KEY, 1, on);
-}
-export { codeWrap };
+export const [codeStyle, setCodeStyle] = persistedSignal<string>("vh.prefs.codeStyle.v1", 1, "");
+export const [codeWrap, setCodeWrap] = persistedSignal<boolean>("vh.prefs.codeWrap.v1", 1, false, boolMigrate(false));
 
 // Notes feature: global enable for the Notes tab. Default OFF. A project can
-// override per-repo via `.vh-solara/project.jsonc` "notes" (see projectSettings
-// → notesVisible, which layers the per-project value over this global default).
-const NOTES_KEY = "vh.prefs.notesEnabled.v1";
-const [notesEnabled, setNotesEnabledSig] = createSignal<boolean>(
-  loadVersioned<boolean>(NOTES_KEY, 1, false, (old) => old === true || old === 1 || old === "1"),
+// override per-repo via `.vh-solara/project.jsonc` "notes".
+export const [notesEnabled, setNotesEnabled] = persistedSignal<boolean>(
+  "vh.prefs.notesEnabled.v1",
+  1,
+  false,
+  boolMigrate(false),
 );
-export function setNotesEnabled(on: boolean) {
-  setNotesEnabledSig(on);
-  saveVersioned(NOTES_KEY, 1, on);
-}
-export { notesEnabled };
