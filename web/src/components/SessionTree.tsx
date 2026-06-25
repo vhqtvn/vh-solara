@@ -1,6 +1,14 @@
 import { createEffect, createMemo, For, Match, Show, Switch } from "solid-js";
 import { createSignal } from "solid-js";
 import { selectedId, setSelectedId, state, sessionNeedsInput } from "../sync";
+import { setView } from "../ui";
+
+// Picking a session always shows its chat — even re-clicking the already-open
+// one while on another tab (Code/Changes) jumps you back to the conversation.
+const openSessionChat = (id: string) => {
+  setSelectedId(id);
+  setView("chat");
+};
 import { treeDensity } from "../prefs";
 import { isPinned, searchQuery } from "../sidebar";
 import { buildChildrenIndex } from "../lib/reduce";
@@ -246,7 +254,7 @@ function Node(props: {
           type="button"
           class="tree-node"
           classList={{ selected: selectedId() === props.session.id, sub: props.depth > 0, running: busy(), detailed: treeDensity() === "detailed" }}
-          onClick={() => setSelectedId(props.session.id)}
+          onClick={() => openSessionChat(props.session.id)}
           data-tip={props.session.title || props.session.id}
           {...menuTriggers(() => props.session.id, () => props.session.title || props.session.id)}
         >
@@ -417,7 +425,7 @@ export default function SessionTree() {
                     type="button"
                     class="tree-node"
                     classList={{ selected: selectedId() === s.id, running: isWorking(s.id), detailed: treeDensity() === "detailed" }}
-                    onClick={() => setSelectedId(s.id)}
+                    onClick={() => openSessionChat(s.id)}
                     data-tip={s.title || s.id}
                     {...menuTriggers(() => s.id, () => s.title || s.id)}
                   >
