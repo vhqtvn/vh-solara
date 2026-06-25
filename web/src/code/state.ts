@@ -3,7 +3,7 @@
 // chat (in the parent frame) drives them across the frame boundary via
 // postMessage — see codeFrame.ts.
 import { createSignal } from "solid-js";
-import { codeResolve } from "./codeApi";
+import { codeResolve } from "./api";
 
 // Open editor tabs (VS Code style, but read-only): the paths of files the user
 // has opened, in order. codeOpenPath is the active one.

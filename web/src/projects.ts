@@ -4,6 +4,7 @@
 import { createSignal } from "solid-js";
 import { projectDir, switchProject } from "./sync";
 import { loadVersioned, saveVersioned } from "./lib/store";
+import { log } from "./lib/log";
 
 export interface Project {
   directory: string; // "" = default project
@@ -57,7 +58,10 @@ export function selectProject(directory: string) {
 export async function fetchRecentProjects(): Promise<Project[]> {
   try {
     const res = await fetch("/oc/project");
-    if (!res.ok) return [];
+    if (!res.ok) {
+      log.warn("projects", `GET /project → HTTP ${res.status}`);
+      return [];
+    }
     const arr = await res.json();
     if (!Array.isArray(arr)) return [];
     // OpenCode can hold several project records for the SAME worktree (e.g. a
@@ -75,7 +79,8 @@ export async function fetchRecentProjects(): Promise<Project[]> {
       .sort((a, b) => b.updated - a.updated)
       .filter((p) => (seen.has(p.directory) ? false : (seen.add(p.directory), true)))
       .map(({ directory, name }) => ({ directory, name }));
-  } catch {
+  } catch (e) {
+    log.warn("projects", "GET /project failed", e);
     return [];
   }
 }

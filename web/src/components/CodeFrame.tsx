@@ -1,6 +1,6 @@
 import { createEffect, createMemo, createSignal, onCleanup, Show } from "solid-js";
 import { projectDir } from "../sync";
-import { bindCodeFrame } from "../codeFrame";
+import { bindCodeFrame } from "../code/frame";
 import { codeDockOpen, setCodeDockOpen, codeMobileOverlay, setCodeMobileOverlay, setView, view } from "../ui";
 import { isDesktop } from "../layout";
 import { codeDockSide, setCodeDockSide, codeDockWidth, setCodeDockWidth } from "../prefs";

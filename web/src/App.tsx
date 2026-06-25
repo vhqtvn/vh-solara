@@ -5,7 +5,8 @@ import GitView from "./components/GitView";
 import CodeFrame, { codeMode } from "./components/CodeFrame";
 import { codeDockSide } from "./prefs";
 import TabBar, { type TabItem } from "./components/TabBar";
-import { codeShowing, installCodeFrameHost, openFileAt, pathSelection, postCodeTheme, setPathSelection, toggleCodeDock } from "./codeFrame";
+import { codeShowing, installCodeFrameHost, openFileAt, pathSelection, postCodeTheme, setPathSelection, toggleCodeDock } from "./code/frame";
+import { anyModalOpen } from "./lib/a11y";
 import NotesView from "./components/NotesView";
 import SettingsDialog from "./components/SettingsDialog";
 import PathSelectionAction from "./components/PathSelectionAction";
@@ -56,12 +57,17 @@ export default function App() {
     return items;
   });
 
-  // Global hotkeys: Cmd/Ctrl+K → command palette; Ctrl+` → terminal.
+  // Global hotkeys: Cmd/Ctrl+K → command palette; Ctrl+` → terminal; Cmd/Ctrl+B
+  // → code dock. Cmd/Ctrl+K always works (it also closes the palette); the others
+  // stand down while a modal dialog owns the keyboard, so they don't act behind it.
   const onGlobalKey = (e: KeyboardEvent) => {
     if ((e.metaKey || e.ctrlKey) && (e.key === "k" || e.key === "K")) {
       e.preventDefault();
       setPaletteOpen((v) => !v);
-    } else if (e.ctrlKey && e.key === "`") {
+      return;
+    }
+    if (anyModalOpen()) return;
+    if (e.ctrlKey && e.key === "`") {
       e.preventDefault();
       setTermOpen((v) => !v);
     } else if ((e.metaKey || e.ctrlKey) && (e.key === "b" || e.key === "B")) {

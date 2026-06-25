@@ -4,7 +4,12 @@
 // element aria-modal, moves focus inside on open, traps Tab/Shift+Tab within it,
 // and restores focus to the previously-focused element on close. Escape/outside-
 // click closing is left to each dialog (they already handle it).
-import { onCleanup } from "solid-js";
+import { createSignal, onCleanup } from "solid-js";
+
+// Count of open modal dialogs (anything using the `modal` directive). Lets
+// global hotkeys/menus stand down while a dialog owns the keyboard.
+const [modalCount, setModalCount] = createSignal(0);
+export const anyModalOpen = () => modalCount() > 0;
 
 const FOCUSABLE =
   'a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])';
@@ -17,6 +22,7 @@ function focusables(root: HTMLElement): HTMLElement[] {
 
 export function attachModal(el: HTMLElement): () => void {
   const prev = document.activeElement as HTMLElement | null;
+  setModalCount((n) => n + 1);
   el.setAttribute("aria-modal", "true");
   if (!el.getAttribute("role")) el.setAttribute("role", "dialog");
   // Move focus in so the keyboard/SR user starts inside the modal, not on the
@@ -58,6 +64,7 @@ export function attachModal(el: HTMLElement): () => void {
   document.addEventListener("keydown", onKey, true);
   return () => {
     document.removeEventListener("keydown", onKey, true);
+    setModalCount((n) => Math.max(0, n - 1));
     // Restore focus to whatever had it before the dialog opened.
     if (prev && document.contains(prev)) prev.focus();
   };
@@ -74,13 +81,20 @@ export function modal(el: HTMLElement) {
 // on an inner control that re-renders mid-click still counts as "inside" — the
 // Solid event-delegation footgun every popover was handling by hand. Best on a
 // panel that's mounted only while open (the listener lifetime tracks the panel).
-export function dismiss(el: HTMLElement, value: () => () => void) {
-  const onClose = value();
+//
+// Pass a function (same handler for outside-click + Escape), or an object
+// { onClose, onEscape } when Escape needs different behaviour (e.g. close an
+// inner overlay first).
+export type DismissValue = (() => void) | { onClose: () => void; onEscape?: () => void };
+export function dismiss(el: HTMLElement, value: () => DismissValue) {
+  const v = value();
+  const onClose = typeof v === "function" ? v : v.onClose;
+  const onEscape = typeof v === "function" ? v : (v.onEscape ?? v.onClose);
   const onDoc = (e: MouseEvent) => {
     if (!e.composedPath().includes(el)) onClose();
   };
   const onKey = (e: KeyboardEvent) => {
-    if (e.key === "Escape") onClose();
+    if (e.key === "Escape") onEscape();
   };
   const id = window.setTimeout(() => {
     document.addEventListener("click", onDoc);
@@ -98,7 +112,7 @@ declare module "solid-js" {
   namespace JSX {
     interface Directives {
       modal: true;
-      dismiss: () => void;
+      dismiss: DismissValue;
     }
   }
 }

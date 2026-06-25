@@ -94,7 +94,7 @@ export interface Part {
   messageID: string;
   type: string;
   time?: { start?: number; end?: number };
-  [k: string]: any;
+  [k: string]: unknown;
 }
 
 export interface MessageView {

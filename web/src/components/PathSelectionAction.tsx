@@ -1,5 +1,5 @@
 import { createSignal, onCleanup, onMount, Show } from "solid-js";
-import { openFileAt, setPathSelection } from "../codeFrame";
+import { openFileAt, setPathSelection } from "../code/frame";
 import { looksLikePath } from "../lib/pathlike";
 import Icon from "./Icon";
 

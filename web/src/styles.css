@@ -1012,6 +1012,7 @@ body {
 .scroll-edges.se-top { --mt: 24px; }
 .scroll-edges.se-bottom { --mb: 24px; }
 .chat-content { max-width: var(--chat-width, 860px); margin: 0 auto; }
+.chat-empty { padding: 32px 16px; text-align: center; color: var(--fg-dim); font-size: 14px; }
 /* Revealed once positioned (see ChatView ready signal) — the initial scroll
    jump happens while hidden, then a quick fade in. */
 .chat-content { opacity: 0; transition: opacity 0.12s ease; }

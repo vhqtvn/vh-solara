@@ -5,7 +5,7 @@
 //   - the chosen model is sent as `model`, the variant as a top-level `variant`.
 import { createSignal } from "solid-js";
 import { createStore } from "solid-js/store";
-import { state } from "./sync";
+import { lastUserMessageModel, sessionModel } from "./sync";
 import { loadVersioned, saveVersioned } from "./lib/store";
 
 export interface ModelRef {
@@ -98,30 +98,6 @@ export function findModel(providerID: string, modelID: string): ModelRef | undef
   return models().find((m) => m.providerID === providerID && m.modelID === modelID);
 }
 
-// The model OpenCode persists on the session itself (server-side, shared across
-// clients/devices) — the authoritative per-session model.
-function fromSession(sessionId: string): Selection | undefined {
-  const m = state.sessions[sessionId]?.model;
-  // session.model uses `id`; message.model uses `modelID` — accept either, and
-  // only return a selection when the model id actually resolves (else it would
-  // mask the message/default fallbacks with an incomplete selection).
-  const modelID = m?.modelID ?? m?.id;
-  return m?.providerID && modelID ? { providerID: m.providerID, modelID, variant: m.variant } : undefined;
-}
-
-// The model last used in a session, read from its most recent user message.
-function fromMessages(sessionId: string): Selection | undefined {
-  const sm = state.messages[sessionId];
-  if (!sm) return undefined;
-  for (let i = sm.order.length - 1; i >= 0; i--) {
-    const info: any = sm.byId[sm.order[i]]?.info;
-    if (info?.role === "user" && info.model?.providerID) {
-      return { providerID: info.model.providerID, modelID: info.model.modelID, variant: info.model.variant };
-    }
-  }
-  return undefined;
-}
-
 // Some sources (agent config, persisted session model) encode the variant into
 // the model id as "modelID:variant". Left as-is it fails the catalog lookup, so
 // the model reads as a raw "model:variant" string and the variant dropdown
@@ -146,7 +122,9 @@ function normalizeSelection(sel: Selection | undefined): Selection | null {
 // server-persisted session model, else its last-used message model, else the
 // global default.
 export function selectionFor(sessionId: string): Selection | null {
-  return normalizeSelection(sessionSel[sessionId] ?? fromSession(sessionId) ?? fromMessages(sessionId) ?? defaultSel() ?? undefined);
+  return normalizeSelection(
+    sessionSel[sessionId] ?? sessionModel(sessionId) ?? lastUserMessageModel(sessionId) ?? defaultSel() ?? undefined,
+  );
 }
 
 export function chooseModel(sessionId: string, providerID: string, modelID: string) {

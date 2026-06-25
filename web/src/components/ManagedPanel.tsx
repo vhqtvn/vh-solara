@@ -1,6 +1,7 @@
-import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
+import { createSignal, For, onMount, Show } from "solid-js";
 import { controlProc, grantTrust, managed, procLogs, refreshManaged, type ProcStatus } from "../managed";
 import { isDesktop } from "../layout";
+import { dismiss } from "../lib/a11y";
 import Icon from "./Icon";
 
 // Trust-review card + processes panel for a repo-declared managed project
@@ -25,30 +26,9 @@ export default function ManagedPanel(props: { onClose: () => void }) {
   const [logText, setLogText] = createSignal("");
   const [expanded, setExpanded] = createSignal<Set<string>>(new Set());
 
-  let rootEl: HTMLDivElement | undefined;
-  const onDoc = (e: MouseEvent) => {
-    if (rootEl && !e.composedPath().includes(rootEl)) props.onClose();
-  };
-  const onKey = (e: KeyboardEvent) => {
-    if (e.key === "Escape") {
-      if (openLog()) setOpenLog(null);
-      else props.onClose();
-    }
-  };
-  onMount(() => {
-    // Defer so the opening click doesn't immediately close it.
-    setTimeout(() => document.addEventListener("click", onDoc), 0);
-    document.addEventListener("keydown", onKey);
-    void refreshManaged();
-  });
-  // Without this, every close leaves the document listeners attached; the stale
-  // onDoc (closed over the old, now-detached rootEl) then fires on the next
-  // open-click and immediately closes the freshly-mounted panel — so it could
-  // never be reopened after the first dismiss.
-  onCleanup(() => {
-    document.removeEventListener("click", onDoc);
-    document.removeEventListener("keydown", onKey);
-  });
+  onMount(() => void refreshManaged());
+  // Outside-click closes; Escape closes the open log overlay first, else the panel.
+  const dismissOpts = { onClose: () => props.onClose(), onEscape: () => (openLog() ? setOpenLog(null) : props.onClose()) };
 
   async function approve() {
     setBusy(true);
@@ -212,7 +192,6 @@ export default function ManagedPanel(props: { onClose: () => void }) {
             class="managed-panel managed-dialog"
             role="dialog"
             aria-label="Project processes"
-            ref={rootEl}
             onClick={(e) => e.stopPropagation()}
           >
             <Body />
@@ -220,7 +199,7 @@ export default function ManagedPanel(props: { onClose: () => void }) {
         </div>
       }
     >
-      <div class="admin-menu managed-panel" role="dialog" aria-label="Project processes" ref={rootEl}>
+      <div class="admin-menu managed-panel" role="dialog" aria-label="Project processes" use:dismiss={dismissOpts}>
         <Body />
       </div>
     </Show>

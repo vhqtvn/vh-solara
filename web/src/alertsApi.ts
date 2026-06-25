@@ -2,6 +2,8 @@
 // write-only: the server returns `hasSecret` (never the value); send a secret
 // only to set/change one, leave it empty to keep the stored one.
 
+import { log } from "./lib/log";
+
 export type ChannelPolicy = "always" | "when_unattended" | "never";
 export type DeviceScope = "off" | "current" | "all";
 
@@ -53,8 +55,10 @@ const POST = (url: string, body: unknown) =>
 export async function getAlertConfig(): Promise<AlertConfig | null> {
   try {
     const r = await fetch("/vh/alerts/config");
+    if (!r.ok) log.warn("alerts", `config GET → HTTP ${r.status}`);
     return r.ok ? ((await r.json()) as AlertConfig) : null;
-  } catch {
+  } catch (e) {
+    log.warn("alerts", "config GET failed", e);
     return null;
   }
 }
@@ -66,16 +70,21 @@ export async function saveAlertConfig(cfg: AlertConfig): Promise<AlertConfig | n
       headers: { "Content-Type": "application/json", "X-VH-CSRF": "1" },
       body: JSON.stringify(cfg),
     });
+    if (!r.ok) log.warn("alerts", `config PUT → HTTP ${r.status}`);
     return r.ok ? ((await r.json()) as AlertConfig) : null;
-  } catch {
+  } catch (e) {
+    log.warn("alerts", "config PUT failed", e);
     return null;
   }
 }
 
 export async function setActiveProfile(name: string): Promise<boolean> {
   try {
-    return (await POST("/vh/alerts/profile", { name })).ok;
-  } catch {
+    const r = await POST("/vh/alerts/profile", { name });
+    if (!r.ok) log.warn("alerts", `profile → HTTP ${r.status}`);
+    return r.ok;
+  } catch (e) {
+    log.warn("alerts", "profile failed", e);
     return false;
   }
 }
@@ -101,7 +110,8 @@ export async function heartbeat(d: {
   try {
     const r = await POST("/vh/alerts/presence", d);
     return r.ok ? ((await r.json()) as { attended: boolean }) : null;
-  } catch {
+  } catch (e) {
+    log.debug("alerts", "presence heartbeat failed", e); // 30s cadence — debug, not spam
     return null;
   }
 }

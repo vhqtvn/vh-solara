@@ -1,5 +1,7 @@
 // Terminal session management (Settings → Terminals): list live sessions with a
 // preview, and kill them. Distinct from the per-pane WebSocket.
+import { log } from "./lib/log";
+
 export interface TermInfo {
   dir: string;
   id: string;
@@ -18,8 +20,10 @@ export async function listTerms(dir?: string): Promise<TermInfo[]> {
   try {
     const q = dir ? `?dir=${encodeURIComponent(dir)}` : "";
     const r = await fetch(`/vh/term/list${q}`);
+    if (!r.ok) log.debug("term", `list → HTTP ${r.status}`);
     return r.ok ? ((await r.json()) as TermInfo[]) : [];
-  } catch {
+  } catch (e) {
+    log.debug("term", "list failed", e); // polled — keep at debug to avoid spam
     return [];
   }
 }
@@ -33,8 +37,10 @@ export async function killTerm(dir: string, id?: string): Promise<boolean> {
       headers: { "Content-Type": "application/json", "X-VH-CSRF": "1" },
       body: JSON.stringify({ dir, id }),
     });
+    if (!r.ok) log.warn("term", `kill → HTTP ${r.status}`);
     return r.ok;
-  } catch {
+  } catch (e) {
+    log.warn("term", "kill failed", e);
     return false;
   }
 }
