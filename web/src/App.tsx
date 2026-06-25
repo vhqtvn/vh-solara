@@ -2,8 +2,9 @@ import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Sh
 import Sidebar from "./components/Sidebar";
 import ChatView from "./components/ChatView";
 import GitView from "./components/GitView";
-import CodeView from "./components/CodeView";
+import CodeFrame from "./components/CodeFrame";
 import TabBar, { type TabItem } from "./components/TabBar";
+import { installCodeFrameHost, postCodeTheme } from "./codeFrame";
 import NotesView from "./components/NotesView";
 import SettingsDialog from "./components/SettingsDialog";
 import FileViewer from "./components/FileViewer";
@@ -85,6 +86,7 @@ export default function App() {
     document.addEventListener("keydown", onGlobalKey);
     document.addEventListener("contextmenu", onContextMenu);
     window.addEventListener("message", onThemeRequest);
+    installCodeFrameHost();
     void refreshViews();
     viewsPoll = window.setInterval(() => void refreshViews(), 60000);
     // Repo-declared managed projects: refresh on mount + poll alongside views.
@@ -151,7 +153,10 @@ export default function App() {
   createEffect(() => {
     theme();
     customTheme();
-    queueMicrotask(broadcastTheme);
+    queueMicrotask(() => {
+      broadcastTheme();
+      postCodeTheme(); // keep the framed code viewer in sync too
+    });
   });
   // The embedded view currently selected (if any), resolved from the live list.
   const activeEmbedded = () =>
@@ -274,9 +279,7 @@ export default function App() {
           <Show when={view() === "changes"}>
             <GitView />
           </Show>
-          <Show when={view() === "code"}>
-            <CodeView />
-          </Show>
+          <CodeFrame active={() => view() === "code"} />
           <Show when={view() === "chat"}>
             <Show when={selectedId()} fallback={
               <Show when={draft()} fallback={<EmptyState />}>

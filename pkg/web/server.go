@@ -407,7 +407,10 @@ var contentSecurityPolicy = strings.Join([]string{
 	"manifest-src 'self'",
 	"object-src 'none'",
 	"base-uri 'self'",
-	"frame-ancestors 'none'",
+	// 'self' (not 'none') so the app can frame its OWN pages — the code viewer
+	// runs in a same-origin iframe to keep its heavy DOM out of the main
+	// document. Cross-origin framing (clickjacking) is still blocked.
+	"frame-ancestors 'self'",
 }, "; ")
 
 func securityHeaders(next http.Handler) http.Handler {
@@ -415,7 +418,7 @@ func securityHeaders(next http.Handler) http.Handler {
 		h := w.Header()
 		h.Set("Content-Security-Policy", contentSecurityPolicy)
 		h.Set("X-Content-Type-Options", "nosniff")
-		h.Set("X-Frame-Options", "DENY")
+		h.Set("X-Frame-Options", "SAMEORIGIN")
 		h.Set("Referrer-Policy", "no-referrer")
 		next.ServeHTTP(w, r)
 	})

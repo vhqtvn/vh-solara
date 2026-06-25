@@ -448,7 +448,12 @@ func TestSecurityHeaders(t *testing.T) {
 	if resp.Header.Get("X-Content-Type-Options") != "nosniff" {
 		t.Fatal("missing X-Content-Type-Options: nosniff")
 	}
-	if resp.Header.Get("X-Frame-Options") != "DENY" {
-		t.Fatal("missing X-Frame-Options: DENY")
+	// SAMEORIGIN (not DENY): the app frames its own code viewer same-origin;
+	// cross-origin framing stays blocked.
+	if resp.Header.Get("X-Frame-Options") != "SAMEORIGIN" {
+		t.Fatal("expected X-Frame-Options: SAMEORIGIN")
+	}
+	if !strings.Contains(csp, "frame-ancestors 'self'") {
+		t.Fatalf("CSP frame-ancestors should be 'self': %q", csp)
 	}
 }

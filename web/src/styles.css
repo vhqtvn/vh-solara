@@ -3470,3 +3470,9 @@ div.katex-math { display: block; overflow-x: auto; margin: 0.7em 0; text-align: 
 .tabbar-select { min-width: 120px; }
 .tabbar-more { gap: 2px; width: auto; padding: 0 7px; }
 .tabbar-more-dots { font-size: 11px; letter-spacing: 1px; line-height: 1; }
+
+/* Code viewer hosted in a same-origin iframe (DOM isolated from the main app). */
+.code-frame { width: 100%; height: 100%; border: 0; display: block; background: var(--bg); }
+.code-frame.hidden { display: none; }
+.code-standalone { position: fixed; inset: 0; display: flex; }
+.code-standalone .code-view { flex: 1; }
