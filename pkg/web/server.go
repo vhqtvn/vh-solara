@@ -241,6 +241,21 @@ func (s *Server) aggFor(dir string) *aggregator.Aggregator {
 	return a
 }
 
+// aggForExisting returns the aggregator for dir only if one already exists —
+// WITHOUT creating it or firing the managed-project / open hooks. Request paths
+// that must not have the side effect of opening a project (header stamping on an
+// arbitrary ?dir=) use this, so a benign GET can't launch a project's managed
+// processes or grow the aggregator map for an attacker-chosen directory. Returns
+// the default aggregator for "" (already running) and nil for an unopened dir.
+func (s *Server) aggForExisting(dir string) *aggregator.Aggregator {
+	if dir == "" {
+		return s.agg
+	}
+	s.aggMu.Lock()
+	defer s.aggMu.Unlock()
+	return s.aggs[dir]
+}
+
 // SetAggHook installs a per-project callback fired as each aggregator is touched
 // (default + lazily-created). The alerts engine uses it to subscribe. Optional.
 func (s *Server) SetAggHook(fn func(dir string, a *aggregator.Aggregator)) { s.aggHook = fn }
@@ -325,7 +340,16 @@ func (s *Server) Handler() http.Handler {
 func (s *Server) stampMeta(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/vh/") {
-			st := s.aggFor(reqDir(r)).Store()
+			// Stamp from an EXISTING aggregator only — never open a project just to
+			// stamp headers. An unopened dir falls back to the default store; the
+			// real snapshot/stream endpoints (which do open it) carry the
+			// authoritative seq anyway, so the epoch (worker identity) is what
+			// matters here and is the same across this worker's stores.
+			a := s.aggForExisting(reqDir(r))
+			if a == nil {
+				a = s.agg
+			}
+			st := a.Store()
 			h := w.Header()
 			h.Set("X-VH-Epoch", st.Epoch())
 			h.Set("X-VH-Seq", strconv.FormatUint(st.Head(), 10))
