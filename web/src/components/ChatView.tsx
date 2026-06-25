@@ -1047,6 +1047,17 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
               </div>
             )}
           </For>
+          {/* Transcript-level states: blank while the first snapshot loads, an
+              empty hint once loaded-but-empty (sm() defined). Per-message errors
+              render inline above; this covers the whole-transcript case. */}
+          <Show when={messages().length === 0 && !working()}>
+            <Show
+              when={sm()}
+              fallback={<div class="chat-empty" role="status" aria-live="polite">Loading conversation…</div>}
+            >
+              <div class="chat-empty">No messages in this session yet.</div>
+            </Show>
+          </Show>
           <Show when={working()}>
             <div class="working" role="status" aria-live="polite" aria-label="Assistant is working">
               <span class="working-shimmer">Working…</span>
