@@ -1,5 +1,6 @@
-import { createResource, createSignal, onCleanup, onMount, Show } from "solid-js";
+import { createResource, createSignal, Show } from "solid-js";
 import { forceReload, resetLocalStorage, restartVhServer } from "../admin";
+import { dismiss } from "../lib/a11y";
 import Icon from "./Icon";
 import OpenCodeUpdateDialog, { RestartConfirm } from "./OpenCodeUpdateDialog";
 
@@ -46,30 +47,15 @@ export default function AdminMenu(props: { onClose: () => void }) {
     }
   }
 
-  let rootEl: HTMLDivElement | undefined;
-  const onDoc = (e: MouseEvent) => {
-    // The update dialog is portaled to <body> (outside rootEl), so a click in it
-    // would otherwise read as "outside" and close the menu (unmounting the
-    // dialog). Stay open while the dialog owns the interaction.
-    if (updateOpen()) return;
-    if (rootEl && !e.composedPath().includes(rootEl)) props.onClose();
-  };
-  const onKey = (e: KeyboardEvent) => {
-    if (updateOpen()) return; // the dialog handles its own Escape
-    if (e.key === "Escape") props.onClose();
-  };
-  onMount(() => {
-    // Defer so the opening click/contextmenu doesn't immediately close it.
-    setTimeout(() => document.addEventListener("click", onDoc), 0);
-    document.addEventListener("keydown", onKey);
-  });
-  onCleanup(() => {
-    document.removeEventListener("click", onDoc);
-    document.removeEventListener("keydown", onKey);
-  });
-
+  // Stay open while the portaled update dialog owns the interaction (a click in
+  // it reads as "outside" this menu; the dialog handles its own Escape).
   return (
-    <div class="admin-menu" role="dialog" aria-label="Server admin" ref={rootEl}>
+    <div
+      class="admin-menu"
+      role="dialog"
+      aria-label="Server admin"
+      use:dismiss={() => { if (!updateOpen()) props.onClose(); }}
+    >
       <div class="admin-head">Server admin</div>
 
       <div class="admin-rows">

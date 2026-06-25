@@ -81,13 +81,20 @@ export function modal(el: HTMLElement) {
 // on an inner control that re-renders mid-click still counts as "inside" — the
 // Solid event-delegation footgun every popover was handling by hand. Best on a
 // panel that's mounted only while open (the listener lifetime tracks the panel).
-export function dismiss(el: HTMLElement, value: () => () => void) {
-  const onClose = value();
+//
+// Pass a function (same handler for outside-click + Escape), or an object
+// { onClose, onEscape } when Escape needs different behaviour (e.g. close an
+// inner overlay first).
+export type DismissValue = (() => void) | { onClose: () => void; onEscape?: () => void };
+export function dismiss(el: HTMLElement, value: () => DismissValue) {
+  const v = value();
+  const onClose = typeof v === "function" ? v : v.onClose;
+  const onEscape = typeof v === "function" ? v : (v.onEscape ?? v.onClose);
   const onDoc = (e: MouseEvent) => {
     if (!e.composedPath().includes(el)) onClose();
   };
   const onKey = (e: KeyboardEvent) => {
-    if (e.key === "Escape") onClose();
+    if (e.key === "Escape") onEscape();
   };
   const id = window.setTimeout(() => {
     document.addEventListener("click", onDoc);
@@ -105,7 +112,7 @@ declare module "solid-js" {
   namespace JSX {
     interface Directives {
       modal: true;
-      dismiss: () => void;
+      dismiss: DismissValue;
     }
   }
 }
