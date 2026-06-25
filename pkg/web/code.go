@@ -126,17 +126,25 @@ func (s *Server) handleCodeTree(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, jsonBytes(map[string]any{"path": rel, "entries": out}))
 }
 
-// gitIgnored returns which of rels are git-ignored (batched). Empty if not a repo.
+// gitIgnored returns which of rels match the repo's ignore RULES (batched).
+// Empty if not a repo.
+//
+// --no-index: report by the .gitignore rules regardless of whether a path is
+// tracked. Plain `check-ignore` hides a path that is tracked even when it matches
+// an ignore pattern (a force-added or commit-then-ignored file), so such files
+// wrongly showed as non-ignored. For a "what matches .gitignore" indicator the
+// rule match is what we want. -z makes I/O NUL-delimited, so paths with spaces or
+// non-ASCII characters aren't quoted (which would break the key match).
 func gitIgnored(ctx context.Context, dir string, rels []string) map[string]bool {
 	ignored := map[string]bool{}
 	if len(rels) == 0 {
 		return ignored
 	}
-	cmd := exec.CommandContext(ctx, "git", "-C", dir, "check-ignore", "--stdin")
-	cmd.Stdin = strings.NewReader(strings.Join(rels, "\n"))
+	cmd := exec.CommandContext(ctx, "git", "-C", dir, "check-ignore", "-z", "--stdin", "--no-index")
+	cmd.Stdin = strings.NewReader(strings.Join(rels, "\x00"))
 	out, _ := cmd.Output() // exit 1 when nothing matches — fine
-	for _, l := range strings.Split(string(out), "\n") {
-		if l = strings.TrimSpace(l); l != "" {
+	for _, l := range strings.Split(string(out), "\x00") {
+		if l != "" {
 			ignored[l] = true
 		}
 	}
