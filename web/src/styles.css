@@ -185,33 +185,6 @@
   --bg: #faf4ed; --bg-2: #fffaf3; --border: #dfdad9;
   --fg: #575279; --fg-dim: #797593; --accent: #56949f; --accent-2: #907aa9;
 }
-/* E Ink (Black & White): paper-grey background, near-black ink, and a grayscale
-   palette throughout — even the semantic status colors become greys, separated
-   only by darkness, to mimic a monochrome e-reader's high-contrast page. */
-:root.theme-eink {
-  --bg: #f4f4f2; --bg-2: #e9e9e6; --border: #c2c2bf;
-  --fg: #161616; --fg-dim: #5a5a58; --accent: #2b2b2b; --accent-2: #4d4d4d;
-  --code-bg: #e9e9e6; --code-surface: #f4f4f2;
-  --danger: #161616; --warn: #4d4d4d; --ok: #6b6b6b; --sel: #2b2b2b;
-  --md-h1: #161616; --md-h2: #2b2b2b; --md-h3: var(--fg);
-  --md-link: #161616; --md-code: #2b2b2b; --md-marker: #2b2b2b;
-  --md-quote: #5a5a58; --md-quote-border: #9a9a97;
-  --chat-user-bg: #e9e9e6; --chat-user-border: #c2c2bf;
-}
-/* E Ink Color (Kaleido 3-like): a greyer paper than Carta (the colour filter
-   array dims the white point), near-black ink, and deliberately MUTED/
-   desaturated accents — Kaleido's gamut is washed-out, so the whole palette,
-   including status colours, stays low-saturation. */
-:root.theme-eink-color {
-  --bg: #eceae2; --bg-2: #e2e0d6; --border: #c3c1b6;
-  --fg: #24231f; --fg-dim: #6a685f; --accent: #4f7a8f; --accent-2: #9c6b52;
-  --code-bg: #e2e0d6; --code-surface: #eceae2;
-  --danger: #a8503f; --warn: #997b3a; --ok: #5f7e4f; --sel: #4f7a8f;
-  --md-h1: #9c6b52; --md-h2: #4f7a8f; --md-h3: var(--fg);
-  --md-link: #4f6f8f; --md-code: #5f7e4f; --md-marker: #9c6b52;
-  --md-quote: #6a685f; --md-quote-border: #b0a08f;
-  --chat-user-bg: #e2e0d6; --chat-user-border: #c3c1b6;
-}
 /* On light themes the most-prominent text must be dark, not white. */
 /* Light-theme overrides apply to ALL light themes via the generic marker class
    (set in theme.ts), so Shire (light) gets them too — not just `light`. */
@@ -219,6 +192,49 @@
 :root.theme-light-scoped .vh-diff-add { background: #e6ffec; color: #1f2328; }
 :root.theme-light-scoped .vh-diff-del { background: #ffebe9; color: #1f2328; }
 :root.theme-light-scoped .vh-diff-hunk { background: #ddf4ff; color: #0969da; }
+
+/* ===== E Ink themes — for use ON e-ink panels (not to simulate e-ink on LCD).
+   So: maximum contrast (pure #fff paper / #000 ink), no subtle low-contrast
+   greys that e-ink can't resolve, visible borders instead of shadows, and — for
+   colour — FULLY SATURATED source colours (the Kaleido colour-filter array dims
+   them on-device; pre-muting would make them vanish). Placed after the
+   light-scoped block so these override its shared tokens. */
+:root.theme-eink, :root.theme-eink-color {
+  --bg: #ffffff; --bg-2: #f2f2f2; --code-bg: #f2f2f2; --code-surface: #ffffff;
+  --fg: #000000; --fg-dim: #555555; --fg-strong: #000000;
+  --accent-fg: #ffffff; --danger-fg: #ffffff;
+  --bg-input: #ffffff; --bg-elev: #ffffff;
+}
+/* E Ink (B&W): a purely monochrome page. Even status colours are greys, set
+   apart only by darkness — there is no colour on a Carta panel. */
+:root.theme-eink {
+  --border: #6e6e6e; --accent: #000000; --accent-2: #000000;
+  --danger: #000000; --warn: #3a3a3a; --ok: #5e5e5e; --sel: #000000;
+  --md-h1: #000000; --md-h2: #000000; --md-h3: #000000;
+  --md-link: #000000; --md-code: #000000; --md-marker: #000000;
+  --md-quote: #3a3a3a; --md-quote-border: #6e6e6e;
+  --chat-user-bg: #f2f2f2; --chat-user-border: #6e6e6e;
+}
+/* E Ink Colour (Kaleido): same crisp B&W base, with bold, saturated accents so
+   they survive the panel's colour filter and still read as colour. */
+:root.theme-eink-color {
+  --border: #7a7a7a; --accent: #0b5cad; --accent-2: #b3431a;
+  --danger: #c0271b; --warn: #9a6400; --ok: #2e7d32; --sel: #0b5cad;
+  --md-h1: #b3431a; --md-h2: #0b5cad; --md-h3: #000000;
+  --md-link: #0b5cad; --md-code: #2e7d32; --md-marker: #b3431a;
+  --md-quote: #555555; --md-quote-border: #7a7a7a;
+  --chat-user-bg: #eaf2fb; --chat-user-border: #9cc0e8;
+}
+/* E-ink panels ghost and refresh slowly, so motion looks broken and wears the
+   screen. Neutralise transitions/animations (spinners, shimmer, the stream
+   caret, expand tweens) and honour reduced-motion implicitly. */
+:root.theme-eink *, :root.theme-eink *::before, :root.theme-eink *::after,
+:root.theme-eink-color *, :root.theme-eink-color *::before, :root.theme-eink-color *::after {
+  animation-duration: 0.001ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.001ms !important;
+  scroll-behavior: auto !important;
+}
 
 * { box-sizing: border-box; }
 
