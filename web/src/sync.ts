@@ -412,6 +412,30 @@ bindAlertsContext({
   sessionTitle: (id) => state.sessions[id]?.title,
 });
 
+type ModelRefLite = { providerID: string; modelID: string; variant?: string };
+
+// Read-only per-session model selectors, so the models module depends on these
+// views rather than reaching into the store's shape directly. session.model uses
+// `id`, message.model uses `modelID` — accept either.
+export function sessionModel(id: string): ModelRefLite | undefined {
+  const m = state.sessions[id]?.model;
+  const modelID = m?.modelID ?? m?.id;
+  return m?.providerID && modelID ? { providerID: m.providerID, modelID, variant: m.variant } : undefined;
+}
+
+// The model on the session's most recent user message.
+export function lastUserMessageModel(id: string): ModelRefLite | undefined {
+  const sm = state.messages[id];
+  if (!sm) return undefined;
+  for (let i = sm.order.length - 1; i >= 0; i--) {
+    const info: any = sm.byId[sm.order[i]]?.info;
+    if (info?.role === "user" && info.model?.providerID) {
+      return { providerID: info.model.providerID, modelID: info.model.modelID, variant: info.model.variant };
+    }
+  }
+  return undefined;
+}
+
 // Per-root "was its subtree working" memory, used to ping exactly once when a
 // root task fully completes (root + all its subagents idle). Subsession-level
 // completions never ping — only the root does.
