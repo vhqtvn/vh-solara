@@ -10,6 +10,11 @@ This complements the existing manual [`POST /vh/views`](coordination-api.md)
 self-register: the manual API is for processes you launch by hand; this feature
 is for processes the repo declares and vh-solara owns.
 
+> Building the embedded web app itself (the iframe/proxy contract, theme tokens,
+> and what JS/interactivity is allowed within the sandbox) is documented
+> separately in **[custom-views.md](custom-views.md)** — hand that to the repo
+> implementing the view.
+
 > **Worker prerequisite:** like the rest of `/vh/*`, managed processes run on the
 > `client-daemon` web server (`--web vh` mode).
 
