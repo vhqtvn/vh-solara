@@ -2,6 +2,7 @@ import { createEffect, createSignal, For, on, onCleanup, onMount, Show } from "s
 import Sidebar from "./components/Sidebar";
 import ChatView from "./components/ChatView";
 import GitView from "./components/GitView";
+import CodeView from "./components/CodeView";
 import NotesView from "./components/NotesView";
 import SettingsDialog from "./components/SettingsDialog";
 import FileViewer from "./components/FileViewer";
@@ -201,6 +202,9 @@ export default function App() {
             <button type="button" classList={{ on: view() === "changes" }} onClick={() => setView("changes")}>
               Changes
             </button>
+            <button type="button" classList={{ on: view() === "code" }} onClick={() => setView("code")}>
+              Code
+            </button>
             <Show when={notesVisible()}>
               <button type="button" classList={{ on: view() === "notes" }} onClick={() => setView("notes")}>
                 Notes
@@ -282,6 +286,9 @@ export default function App() {
           </Show>
           <Show when={view() === "changes"}>
             <GitView />
+          </Show>
+          <Show when={view() === "code"}>
+            <CodeView />
           </Show>
           <Show when={view() === "chat"}>
             <Show when={selectedId()} fallback={

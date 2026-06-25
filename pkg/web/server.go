@@ -296,6 +296,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/vh/git/discard", s.handleGitDiscard)
 	mux.HandleFunc("/vh/git/commit", s.handleGitCommit)
 	mux.HandleFunc("/vh/git/push", s.handleGitPush)
+	// Read-only codebase view.
+	mux.HandleFunc("/vh/code/tree", s.handleCodeTree)
+	mux.HandleFunc("/vh/code/file", s.handleCodeFile)
+	mux.HandleFunc("/vh/code/raw", s.handleCodeRaw)
+	mux.HandleFunc("/vh/code/search", s.handleCodeSearch)
+	mux.HandleFunc("/vh/code/styles", s.handleCodeStyles)
+	mux.HandleFunc("/vh/code/highlight.css", s.handleCodeHighlightCSS)
 	mux.HandleFunc("/vh/opencode-version", s.handleOpenCodeVersion)
 	mux.HandleFunc("/vh/update-opencode", s.handleUpdateOpenCode)
 	mux.HandleFunc("/oc/", s.handlePassthrough)

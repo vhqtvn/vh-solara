@@ -144,6 +144,26 @@ export function setChatBubbles(on: boolean) {
 }
 export { chatBubbles };
 
+// Code view: syntax-highlight style (chroma style name; "" = follow the app
+// theme via the shared sheet) and soft-wrap toggle. Persisted.
+const CODE_STYLE_KEY = "vh.prefs.codeStyle.v1";
+const [codeStyle, setCodeStyleSig] = createSignal<string>(loadVersioned<string>(CODE_STYLE_KEY, 1, ""));
+export function setCodeStyle(v: string) {
+  setCodeStyleSig(v);
+  saveVersioned(CODE_STYLE_KEY, 1, v);
+}
+export { codeStyle };
+
+const CODE_WRAP_KEY = "vh.prefs.codeWrap.v1";
+const [codeWrap, setCodeWrapSig] = createSignal<boolean>(
+  loadVersioned<boolean>(CODE_WRAP_KEY, 1, false, (o) => o === true || o === 1 || o === "1"),
+);
+export function setCodeWrap(on: boolean) {
+  setCodeWrapSig(on);
+  saveVersioned(CODE_WRAP_KEY, 1, on);
+}
+export { codeWrap };
+
 // Notes feature: global enable for the Notes tab. Default OFF. A project can
 // override per-repo via `.vh-solara/project.jsonc` "notes" (see projectSettings
 // → notesVisible, which layers the per-project value over this global default).

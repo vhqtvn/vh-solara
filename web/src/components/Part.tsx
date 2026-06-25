@@ -5,7 +5,8 @@ import { renderStreamMd } from "../lib/md";
 import { renderMermaid } from "../lib/mermaid";
 import { renderMathIn } from "../lib/math";
 import { streamLive } from "../prefs";
-import { openSession, setSelectedId } from "../sync";
+import { openSession, projectDir, setSelectedId } from "../sync";
+import { openFileAt } from "../code";
 import { openFile } from "../files";
 import type { Part } from "../types";
 import Icon from "./Icon";
@@ -331,6 +332,17 @@ function ToolPart(props: { part: Part; tail?: boolean }) {
   };
   // Prefix the expression with a sigil hinting the tool kind ($ for shell).
   const exprPrefix = () => (props.part.tool === "bash" ? "$ " : "");
+  // The file a read/edit/write-style tool touched → openable in the code view.
+  // Make a project-absolute path relative; ignore non-file tools (bash/grep/etc.).
+  const openableFile = (): string => {
+    const input = (state().input || (props.part as any).input || {}) as Record<string, any>;
+    const fp = input.filePath || input.path;
+    if (typeof fp !== "string" || !fp) return "";
+    const root = projectDir();
+    if (root && (fp === root || fp.startsWith(root + "/"))) return fp.slice(root.length + 1);
+    if (fp.startsWith("/")) return ""; // absolute, outside the project — can't open
+    return fp;
+  };
   // A `task` tool spawns a subagent; its child session id lets us jump there.
   const subId = (): string | undefined =>
     props.part.tool === "task"
@@ -371,6 +383,18 @@ function ToolPart(props: { part: Part; tail?: boolean }) {
         </Show>
         <Show when={hasDetail()}>
           <span class="tool-chev" classList={{ rot: expanded() }}><Icon name="chevronDown" size={12} /></span>
+        </Show>
+        <Show when={openableFile()}>
+          <span
+            role="button"
+            tabindex="0"
+            class="tool-open"
+            data-tip="Open in code view"
+            aria-label="Open in code view"
+            onClick={(e) => { e.stopPropagation(); openFileAt(openableFile()); }}
+          >
+            <Icon name="layers" size={13} />
+          </span>
         </Show>
         <Show when={subId()}>
           <span
