@@ -48,10 +48,23 @@ function toolIconName(tool: string): string {
 const [partOpen, setPartOpenStore] = createStore<Record<string, boolean>>({});
 const setPartOpen = (id: string, v: boolean) => setPartOpenStore(id, v);
 
+// The dynamic fields Part.tsx reads off a tool part's `state` (OpenCode's
+// payload). Typed once here so the part's `[k: string]: unknown` index signature
+// is narrowed in one place rather than cast at every access.
+interface ToolState {
+  status?: string;
+  output?: string;
+  error?: string;
+  input?: Record<string, unknown>;
+  metadata?: Record<string, any>;
+  time?: { start?: number; end?: number };
+  title?: string;
+}
+
 // Tool duration from its state.time (start→end), formatted like the reasoning
 // timer. Empty until the tool finishes.
 function durationText(part: Part): string {
-  const time = (part.state?.time || part.time || {}) as { start?: number; end?: number };
+  const time = ((part.state as ToolState | undefined)?.time || part.time || {}) as { start?: number; end?: number };
   const s = time.start;
   const e = time.end;
   if (!s || !e) return "";
@@ -303,8 +316,9 @@ function ToolBody(props: { text: string }) {
 }
 
 function ToolPart(props: { part: Part; tail?: boolean }) {
-  const state = () => props.part.state || {};
-  const status = () => state().status as string;
+  const state = () => (props.part.state || {}) as ToolState;
+  const tool = () => (props.part.tool as string | undefined) ?? "";
+  const status = () => state().status ?? "";
   const output = () => state().output || state().error || "";
   // LSP diagnostics OpenCode attaches to edit/write/patch results, keyed by file.
   // Surface the errors (severity 1) so a broken edit is visible without digging.
@@ -333,7 +347,7 @@ function ToolPart(props: { part: Part; tail?: boolean }) {
       for (const k of keys) if (typeof input[k] === "string" && input[k]) return input[k] as string;
       return "";
     };
-    switch (props.part.tool) {
+    switch (tool()) {
       case "bash":
         return pick("command");
       case "glob":
@@ -356,7 +370,7 @@ function ToolPart(props: { part: Part; tail?: boolean }) {
     }
   };
   // Prefix the expression with a sigil hinting the tool kind ($ for shell).
-  const exprPrefix = () => (props.part.tool === "bash" ? "$ " : "");
+  const exprPrefix = () => (tool() === "bash" ? "$ " : "");
   // The file a read/edit/write-style tool touched → openable in the code view.
   // Make a project-absolute path relative; ignore non-file tools (bash/grep/etc.).
   const openableFile = (): string => {
@@ -370,8 +384,8 @@ function ToolPart(props: { part: Part; tail?: boolean }) {
   };
   // A `task` tool spawns a subagent; its child session id lets us jump there.
   const subId = (): string | undefined =>
-    props.part.tool === "task"
-      ? state().metadata?.sessionId || props.part.metadata?.sessionId
+    tool() === "task"
+      ? state().metadata?.sessionId || (props.part.metadata as { sessionId?: string } | undefined)?.sessionId
       : undefined;
   const jump = () => {
     const id = subId();
@@ -400,8 +414,8 @@ function ToolPart(props: { part: Part; tail?: boolean }) {
         <Show when={status() === "running"} fallback={<span class="tool-status" />}>
           <Spinner class="tool-spin" size={10} />
         </Show>
-        <span class="tool-ico"><Icon name={toolIconName(props.part.tool)} size={13} /></span>
-        <span class="tool-name">{toolLabel(props.part.tool)}</span>
+        <span class="tool-ico"><Icon name={toolIconName(tool())} size={13} /></span>
+        <span class="tool-name">{toolLabel(tool())}</span>
         <span class="tool-subject">{expr() || state().title || status()}</span>
         <Show when={durationText(props.part)}>
           <span class="tool-dur">{durationText(props.part)}</span>
@@ -527,7 +541,7 @@ function ReasoningPart(props: { part: Part; settled: boolean; tail?: boolean }) 
           <Show when={revealed()}>
             <div class="reasoning-body" ref={bodyEl} onScroll={onScroll}>
               <div ref={contentEl}>
-                <Markdown text={props.part.text || ""} settled={props.settled} caret={props.tail} />
+                <Markdown text={(props.part.text as string) || ""} settled={props.settled} caret={props.tail} />
               </div>
             </div>
           </Show>
@@ -546,7 +560,7 @@ export default function PartView(props: { part: Part; settled?: boolean; tail?: 
   return (
     <Switch>
       <Match when={p().type === "text"}>
-        <Markdown text={p().text || ""} settled={settled()} caret={props.tail} />
+        <Markdown text={(p().text as string) || ""} settled={settled()} caret={props.tail} />
       </Match>
       <Match when={p().type === "reasoning"}>
         <ReasoningPart part={p()} settled={settled()} tail={props.tail} />
@@ -555,7 +569,7 @@ export default function PartView(props: { part: Part; settled?: boolean; tail?: 
         <ToolPart part={p()} tail={props.tail} />
       </Match>
       <Match when={p().type === "file"}>
-        <div class="file-chip">📎 {p().filename || p().mime}</div>
+        <div class="file-chip">📎 {(p().filename as string) || (p().mime as string)}</div>
       </Match>
       {/* step-start/finish, snapshot, patch, agent, retry, compaction: omitted in v1 */}
     </Switch>
