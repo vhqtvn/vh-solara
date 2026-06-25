@@ -596,8 +596,16 @@ body {
    sidebar-header buttons (search/new/close) to a comfortable size on coarse
    pointers only — mouse/desktop density is untouched. */
 @media (pointer: coarse) {
+  /* Touch-target floor: bump the 26px icon buttons and the primary send button
+     to a comfortable tap size, and give tiny inline close/dismiss buttons a
+     padded hit area without changing their visual glyph size. */
+  .icon-btn { width: 36px; height: 36px; }
   .sidebar-head .icon-btn,
   .sidebar-head .sidebar-close { width: 38px; height: 38px; font-size: 17px; }
+  .send-btn { min-width: 40px; min-height: 40px; }
+  .code-tab-close,
+  .queue-chip button,
+  .notif-x { min-width: 32px; min-height: 32px; }
 }
 /* Orphaned-sessions banner (parent root archived; surfaced so they can be cleaned up). */
 .orphan-banner {
