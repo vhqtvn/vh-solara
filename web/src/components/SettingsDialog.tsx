@@ -10,6 +10,7 @@ import { killTerm, listTerms } from "../termApi";
 import { agents, selectedAgent, setSelectedAgent } from "../agents";
 import QuotaPanel from "./QuotaPanel";
 import NotificationsSettings from "./NotificationsSettings";
+import { modal } from "../lib/a11y";
 import Icon from "./Icon";
 import Select from "./Select";
 
@@ -72,7 +73,7 @@ export default function SettingsDialog(props: { onClose: () => void }) {
 
   return (
     <div class="dialog-overlay" onClick={props.onClose}>
-      <div class="dialog settings" role="dialog" aria-label="Settings" onClick={(e) => e.stopPropagation()}>
+      <div class="dialog settings" role="dialog" aria-label="Settings" use:modal onClick={(e) => e.stopPropagation()}>
         <div class="dialog-head">
           <strong style={{ flex: "1", padding: "0 4px" }}>Settings</strong>
           <button type="button" class="icon-btn" aria-label="Close" onClick={props.onClose}>

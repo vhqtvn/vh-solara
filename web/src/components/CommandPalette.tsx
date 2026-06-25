@@ -5,6 +5,7 @@ import { toggleSidebar } from "../layout";
 import { setSearchQuery } from "../sidebar";
 import { exportSessionMarkdown } from "../export";
 import { selectedId } from "../sync";
+import { modal } from "../lib/a11y";
 import Icon from "./Icon";
 
 interface Cmd {
@@ -91,7 +92,7 @@ export default function CommandPalette() {
   return (
     <Show when={paletteOpen()}>
       <div class="palette-overlay" onClick={close}>
-        <div class="palette" role="dialog" aria-label="Command palette" onClick={(e) => e.stopPropagation()}>
+        <div class="palette" role="dialog" aria-label="Command palette" use:modal onClick={(e) => e.stopPropagation()}>
           <div class="palette-input-row">
             <Icon name="filter" size={14} />
             <input

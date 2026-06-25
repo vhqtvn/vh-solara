@@ -1119,7 +1119,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
             )}
           </For>
           <Show when={working()}>
-            <div class="working" aria-label="Assistant is working">
+            <div class="working" role="status" aria-live="polite" aria-label="Assistant is working">
               <span class="working-shimmer">Working…</span>
             </div>
           </Show>
