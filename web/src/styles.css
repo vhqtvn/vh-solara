@@ -257,13 +257,16 @@
   --chat-user-bg: #eaf2fb; --chat-user-border: #9cc0e8;
 }
 /* E-ink panels ghost and refresh slowly, so motion looks broken and wears the
-   screen. Neutralise transitions/animations (spinners, shimmer, the stream
-   caret, expand tweens) and honour reduced-motion implicitly. */
-:root.theme-eink *, :root.theme-eink *::before, :root.theme-eink *::after,
-:root.theme-eink-color *, :root.theme-eink-color *::before, :root.theme-eink-color *::after {
-  animation-duration: 0.001ms !important;
-  animation-iteration-count: 1 !important;
-  transition-duration: 0.001ms !important;
+   screen. Fully DISABLE animation + transition (spinners, shimmer, the stream
+   caret, expand tweens, entrance fades) — not just speed them up — so there is
+   no animation at all. !important also overrides Spinner's inline animation.
+   Safe: no animation here uses fill-mode to reveal from a hidden base, and
+   nothing listens for transition/animation-end, so elements simply render in
+   their resting state. */
+:root.theme-eink, :root.theme-eink *, :root.theme-eink *::before, :root.theme-eink *::after,
+:root.theme-eink-color, :root.theme-eink-color *, :root.theme-eink-color *::before, :root.theme-eink-color *::after {
+  animation: none !important;
+  transition: none !important;
   scroll-behavior: auto !important;
 }
 
