@@ -1,7 +1,7 @@
 import { createEffect, createMemo, createResource, createSignal, For, Match, onCleanup, Show, Switch } from "solid-js";
 import { projectDir } from "../sync";
-import { codeFile, codeLangs, codeRawUrl, codeSearch, codeStatus, codeStyles, codeTree, type CodeEntry, type CodeFile, type CodeHit } from "../codeApi";
-import { codeOpenPath, setCodeOpenPath, codeOpenLine, setCodeOpenLine, codeTabs, addCodeTab, closeCodeTab, resolvePicker, setResolvePicker, openResolved } from "../code";
+import { codeFile, codeLangs, codeRawUrl, codeSearch, codeStatus, codeStyles, codeTree, type CodeEntry, type CodeFile, type CodeHit } from "../code/api";
+import { codeOpenPath, setCodeOpenPath, codeOpenLine, setCodeOpenLine, codeTabs, addCodeTab, closeCodeTab, resolvePicker, setResolvePicker, openResolved } from "../code/state";
 import { codeStyle, setCodeStyle, codeWrap, setCodeWrap, codeShowIgnored, setCodeShowIgnored, codeFlatten, setCodeFlatten, codeShowSearch, setCodeShowSearch, codeSidebarOpen, setCodeSidebarOpen } from "../prefs";
 import Icon from "./Icon";
 import Select from "./Select";

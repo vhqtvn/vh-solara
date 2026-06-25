@@ -6,7 +6,7 @@ import { renderMermaid } from "../lib/mermaid";
 import { renderMathIn } from "../lib/math";
 import { streamLive } from "../prefs";
 import { openSession, projectDir, setSelectedId } from "../sync";
-import { openFileAt } from "../codeFrame";
+import { openFileAt } from "../code/frame";
 import { looksLikePath } from "../lib/pathlike";
 import type { Part } from "../types";
 import Icon from "./Icon";

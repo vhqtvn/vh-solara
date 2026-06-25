@@ -5,7 +5,7 @@ import GitView from "./components/GitView";
 import CodeFrame, { codeMode } from "./components/CodeFrame";
 import { codeDockSide } from "./prefs";
 import TabBar, { type TabItem } from "./components/TabBar";
-import { codeShowing, installCodeFrameHost, openFileAt, pathSelection, postCodeTheme, setPathSelection, toggleCodeDock } from "./codeFrame";
+import { codeShowing, installCodeFrameHost, openFileAt, pathSelection, postCodeTheme, setPathSelection, toggleCodeDock } from "./code/frame";
 import { anyModalOpen } from "./lib/a11y";
 import NotesView from "./components/NotesView";
 import SettingsDialog from "./components/SettingsDialog";

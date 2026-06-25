@@ -3,8 +3,8 @@
 // Communication is postMessage. The chat opens files across the boundary; the
 // parent forwards theme changes so the framed viewer restyles live.
 import { createSignal } from "solid-js";
-import { codeDockOpen, setCodeDockOpen, codeMobileOverlay, setCodeMobileOverlay, setView, view } from "./ui";
-import { isDesktop } from "./layout";
+import { codeDockOpen, setCodeDockOpen, codeMobileOverlay, setCodeMobileOverlay, setView, view } from "../ui";
+import { isDesktop } from "../layout";
 
 // The current path-like text selection (set by PathSelectionAction). When set,
 // the header Code button opens it instead of toggling — a reliable trigger on

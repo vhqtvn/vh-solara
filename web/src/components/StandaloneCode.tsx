@@ -1,6 +1,6 @@
 import { onCleanup, onMount } from "solid-js";
 import CodeView from "./CodeView";
-import { openFileLocal } from "../code";
+import { openFileLocal } from "../code/state";
 import { applyTheme } from "../theme";
 
 // The code viewer as a self-contained page, rendered inside a same-origin iframe

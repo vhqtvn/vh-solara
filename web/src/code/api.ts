@@ -1,8 +1,8 @@
 // Client for the read-only codebase view. All calls are scoped to the active
 // project directory; highlighting + search happen on the daemon, so this stays
 // thin (no client-side highlighter or indexer).
-import { projectDir } from "./sync";
-import { log } from "./lib/log";
+import { projectDir } from "../sync";
+import { log } from "../lib/log";
 
 const D = () => `dir=${encodeURIComponent(projectDir())}`;
 
