@@ -129,28 +129,13 @@ test("message inspect shows tokens/cost/raw JSON", async ({ page }) => {
   await expect(page.locator(".msg-inspect").first()).toContainText("role");
 });
 
-test("clickable file path opens the file viewer at the line", async ({ page }) => {
+test("clicking a file path opens it in the code viewer", async ({ page }) => {
+  // The old modal FileViewer was replaced by the code viewer: a clicked path now
+  // opens the docked (desktop) / overlay (mobile) code surface, not a dialog.
   await page.goto("/");
   await page.getByRole("button", { name: /Demo session/ }).click();
   await page.locator(".filepath", { hasText: "src/parser.go" }).first().click();
-  const fv = page.getByRole("dialog", { name: "File" });
-  await expect(fv).toBeVisible();
-  await expect(fv).toContainText("src/parser.go");
-
-  // Syntax highlighting (client-side): Go keywords get hljs token spans, and the
-  // language is inferred from the .go extension.
-  await expect(fv.locator(".fv-lc .hljs-keyword").first()).toBeVisible();
-  await expect(fv.locator(".fv-lang .vh-select-label")).toHaveText("go");
-
-  // Changing the language re-highlights.
-  await fv.locator(".fv-lang .vh-select-btn").click();
-  await page.getByRole("option", { name: "python", exact: true }).click(); // portaled
-  await expect(fv.locator(".fv-lang .vh-select-label")).toHaveText("python");
-
-  // Word-wrap toggle flips the code block's wrap class.
-  await expect(fv.locator(".fv-code.wrap")).toHaveCount(0);
-  await fv.locator(".fv-wrap").click();
-  await expect(fv.locator(".fv-code.wrap")).toHaveCount(1);
+  await expect(page.locator(".code-dock.dock, .code-dock.overlay")).toBeVisible({ timeout: 6000 });
 });
 
 test("UI zoom scales the interface and persists (versioned)", async ({ page }) => {
