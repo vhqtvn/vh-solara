@@ -170,6 +170,30 @@ export function setCodeShowIgnored(on: boolean) {
 }
 export { codeShowIgnored };
 
+// Code tree: compact single-child folder chains (a/b/c as one row), VS Code's
+// "compact folders". On by default — keeps deep package trees shallow.
+const CODE_FLATTEN_KEY = "vh.prefs.codeFlatten.v1";
+const [codeFlatten, setCodeFlattenSig] = createSignal<boolean>(
+  loadVersioned<boolean>(CODE_FLATTEN_KEY, 1, true, (o) => !(o === false || o === 0 || o === "0")),
+);
+export function setCodeFlatten(on: boolean) {
+  setCodeFlattenSig(on);
+  saveVersioned(CODE_FLATTEN_KEY, 1, on);
+}
+export { codeFlatten };
+
+// Code sidebar: show the search box. Toggled from the tree's filter menu so the
+// sidebar can be all-tree when search isn't needed. Visible by default.
+const CODE_SHOW_SEARCH_KEY = "vh.prefs.codeShowSearch.v1";
+const [codeShowSearch, setCodeShowSearchSig] = createSignal<boolean>(
+  loadVersioned<boolean>(CODE_SHOW_SEARCH_KEY, 1, true, (o) => !(o === false || o === 0 || o === "0")),
+);
+export function setCodeShowSearch(on: boolean) {
+  setCodeShowSearchSig(on);
+  saveVersioned(CODE_SHOW_SEARCH_KEY, 1, on);
+}
+export { codeShowSearch };
+
 // Code peek dock: which side it docks (desktop) and its width (px), persisted.
 const CODE_DOCK_SIDE_KEY = "vh.prefs.codeDockSide.v1";
 const [codeDockSide, setCodeDockSideSig] = createSignal<"left" | "right">(

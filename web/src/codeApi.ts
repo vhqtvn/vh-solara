@@ -29,9 +29,9 @@ export interface CodeHit {
   text: string;
 }
 
-export async function codeTree(path: string): Promise<CodeEntry[]> {
+export async function codeTree(path: string, flatten = true): Promise<CodeEntry[]> {
   try {
-    const r = await fetch(`/vh/code/tree?${D()}&path=${encodeURIComponent(path)}`);
+    const r = await fetch(`/vh/code/tree?${D()}&path=${encodeURIComponent(path)}${flatten ? "" : "&flatten=0"}`);
     if (!r.ok) return [];
     return (await r.json()).entries ?? [];
   } catch {

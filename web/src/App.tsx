@@ -48,7 +48,6 @@ export default function App() {
     const items: TabItem[] = [
       { key: "chat", label: "Chat", icon: "send" },
       { key: "changes", label: "Changes", icon: "fork" },
-      { key: "code", label: "Code", icon: "terminal" },
     ];
     if (notesVisible()) items.push({ key: "notes", label: "Notes", icon: "clipboard" });
     for (const v of views()) items.push({ key: VIEW_PREFIX + v.view_id, label: v.title, icon: "layers" });
@@ -226,11 +225,11 @@ export default function App() {
             type="button"
             class="icon-btn"
             classList={{ on: codeShowing() }}
-            aria-label="Code dock"
-            data-tip="Code dock (Ctrl+B)"
+            aria-label="Code"
+            data-tip="Code (Ctrl+B)"
             onClick={() => toggleCodeDock()}
           >
-            <Icon name="layers" />
+            <Icon name="code" />
           </button>
           <button
             type="button"

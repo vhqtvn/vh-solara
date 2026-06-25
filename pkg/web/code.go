@@ -100,6 +100,7 @@ func (s *Server) handleCodeTree(w http.ResponseWriter, r *http.Request) {
 		rels = append(rels, filepath.ToSlash(filepath.Join(rel, e.Name())))
 	}
 	ignored := gitIgnored(r.Context(), dir, rels)
+	flatten := r.URL.Query().Get("flatten") != "0"
 
 	out := []codeEntry{}
 	for _, e := range ents {
@@ -108,13 +109,21 @@ func (s *Server) handleCodeTree(w http.ResponseWriter, r *http.Request) {
 		}
 		childRel := filepath.ToSlash(filepath.Join(rel, e.Name()))
 		typ := "file"
+		name := e.Name()
+		path := childRel
 		if e.IsDir() {
 			typ = "dir"
+			// Compact-folders (VS Code style): a dir that only nests a single
+			// subdir chain (a → a/b → a/b/c) shows as one "a/b/c" node whose
+			// expansion lists the deepest dir directly.
+			if flatten {
+				name, path = compactDir(dir, childRel, e.Name())
+			}
 		}
 		// Ignored entries are returned (flagged), not dropped — the client dims
 		// them and hides them behind a "show ignored" toggle, so e.g. node_modules
 		// is reachable without polluting the default view.
-		out = append(out, codeEntry{Name: e.Name(), Path: childRel, Type: typ, Ignored: ignored[childRel]})
+		out = append(out, codeEntry{Name: name, Path: path, Type: typ, Ignored: ignored[childRel]})
 	}
 	// Dirs first, then files; each alphabetical (case-insensitive).
 	sort.Slice(out, func(i, j int) bool {
@@ -149,6 +158,44 @@ func gitIgnored(ctx context.Context, dir string, rels []string) map[string]bool 
 		}
 	}
 	return ignored
+}
+
+// compactDir collapses a single-child directory chain into one display node.
+// Starting at rel (display name `name`), it descends while the directory holds
+// exactly one non-.git entry that is itself a directory, joining the names. It
+// returns the joined display name and the deepest rel path (which the client
+// requests when the node is expanded). Depth-capped so a pathological tree can't
+// stall the listing.
+func compactDir(root, rel, name string) (string, string) {
+	display, cur := name, rel
+	for depth := 0; depth < 32; depth++ {
+		abs, ok := safeJoin(root, cur)
+		if !ok {
+			break
+		}
+		ents, err := os.ReadDir(abs)
+		if err != nil {
+			break
+		}
+		var only os.DirEntry
+		n := 0
+		for _, e := range ents {
+			if e.Name() == ".git" {
+				continue
+			}
+			n++
+			if n > 1 {
+				break
+			}
+			only = e
+		}
+		if n != 1 || only == nil || !only.IsDir() {
+			break
+		}
+		display = display + "/" + only.Name()
+		cur = filepath.ToSlash(filepath.Join(cur, only.Name()))
+	}
+	return display, cur
 }
 
 var imageExt = map[string]bool{

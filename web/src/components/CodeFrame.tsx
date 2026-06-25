@@ -68,7 +68,7 @@ export default function CodeFrame() {
         <Show when={mode() === "dock"}>
           <div class="code-dock-resize" onPointerDown={startResize} title="Drag to resize" />
         </Show>
-        <Show when={mode() === "dock" || mode() === "overlay"}>
+        <Show when={mode() !== "hidden"}>
           <div class="code-dock-head">
             <Show when={mode() === "overlay"}>
               <button type="button" class="icon-btn" aria-label="Back" onClick={close}><Icon name="arrowDown" size={16} /></button>
@@ -83,10 +83,15 @@ export default function CodeFrame() {
                 data-tip={codeDockSide() === "right" ? "Dock left" : "Dock right"}
                 onClick={() => setCodeDockSide(codeDockSide() === "right" ? "left" : "right")}
               >
-                <Icon name="layers" size={15} />
+                <Icon name="dock" size={15} />
               </button>
               <button type="button" class="icon-btn" aria-label="Expand to full" data-tip="Open full" onClick={() => { setCodeDockOpen(false); setView("code"); }}>
                 <Icon name="maximize" size={15} />
+              </button>
+            </Show>
+            <Show when={mode() === "full"}>
+              <button type="button" class="icon-btn" aria-label="Dock to side" data-tip="Dock to side" onClick={() => { setView("chat"); setCodeDockOpen(true); }}>
+                <Icon name="dock" size={15} />
               </button>
             </Show>
             <button type="button" class="icon-btn" aria-label="Close" onClick={close}><Icon name="x" size={15} /></button>

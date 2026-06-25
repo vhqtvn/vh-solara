@@ -3346,12 +3346,34 @@ div.katex-math { display: block; overflow-x: auto; margin: 0.7em 0; text-align: 
 }
 
 /* ===== Read-only code view ===== */
-.code-view { display: flex; height: 100%; min-height: 0; }
+/* min-width:0 so the view (and its wide, non-wrapping code <pre>) can shrink
+   inside a narrow container — the docked panel/iframe — instead of forcing its
+   min-content width and overflowing (which clipped the toolbar's right edge). */
+.code-view { display: flex; height: 100%; min-height: 0; min-width: 0; max-width: 100%; }
 .code-empty { padding: 24px; color: var(--fg-dim); font-size: 14px; }
 .code-sidebar {
   flex: 0 0 280px; min-width: 0; display: flex; flex-direction: column;
   border-right: 1px solid var(--border); min-height: 0;
 }
+/* Sidebar header: title + filter menu (search bar / ignored / compact toggles). */
+.code-side-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 6px 8px 2px 12px; flex: 0 0 auto;
+}
+.code-side-title { font-size: 11px; font-weight: 600; color: var(--fg-dim); text-transform: uppercase; letter-spacing: 0.05em; }
+.code-filter-wrap { position: relative; display: inline-flex; }
+.code-filter-menu {
+  position: absolute; top: calc(100% + 4px); right: 0; z-index: 20; min-width: 168px;
+  display: flex; flex-direction: column; gap: 2px; padding: 5px;
+  background: var(--bg-1, var(--bg)); border: 1px solid var(--border); border-radius: 8px;
+  box-shadow: var(--shadow-lg, 0 8px 24px #0006);
+}
+.code-filter-item {
+  display: flex; align-items: center; gap: 8px; padding: 5px 8px; border-radius: 6px;
+  font-size: 13px; color: var(--fg); cursor: pointer;
+}
+.code-filter-item:hover { background: var(--bg-2); }
+.code-filter-item input { accent-color: var(--accent); cursor: pointer; }
 .code-search {
   display: flex; align-items: center; gap: 6px; margin: 8px; padding: 5px 9px;
   background: var(--bg-2); border: 1px solid var(--border); border-radius: 8px; color: var(--fg-dim);
@@ -3384,11 +3406,13 @@ div.katex-math { display: block; overflow-x: auto; margin: 0.7em 0; text-align: 
 
 .code-main { flex: 1; min-width: 0; display: flex; flex-direction: column; min-height: 0; }
 .code-bar {
-  display: flex; align-items: center; gap: 8px; padding: 6px 10px;
+  display: flex; align-items: center; gap: 8px; padding: 6px 10px; flex-wrap: wrap; row-gap: 6px;
   border-bottom: 1px solid var(--border); flex: 0 0 auto;
 }
 .code-back { display: none; background: transparent; border: 0; color: var(--fg-dim); cursor: pointer; padding: 2px; }
-.code-breadcrumb { flex: 1; min-width: 0; display: flex; align-items: center; gap: 4px; overflow: hidden; font-size: 13px; }
+/* min-width floor so the controls wrap to a second row when the bar is narrow
+   (a docked panel) instead of overflowing and clipping the rightmost select. */
+.code-breadcrumb { flex: 1 1 80px; min-width: 80px; display: flex; align-items: center; gap: 4px; overflow: hidden; font-size: 13px; }
 .code-bc-sep { color: var(--fg-dim); }
 .code-bc-seg { color: var(--fg-dim); white-space: nowrap; }
 .code-bc-seg.last { color: var(--fg); font-weight: 600; }
@@ -3528,10 +3552,30 @@ div.katex-math { display: block; overflow-x: auto; margin: 0.7em 0; text-align: 
 .code-st.st-D { color: var(--danger, #ef7d57); }     /* deleted */
 .code-st.st-R { color: var(--accent); }              /* renamed */
 .code-tree-row.dir .code-st { font-size: 13px; }     /* the • rollup dot */
-.code-show-ignored {
-  display: block; width: 100%; text-align: left; margin-top: 6px;
-  background: transparent; border: 0; color: var(--fg-dim); cursor: pointer;
-  font: inherit; font-size: 12px; padding: 6px 8px; border-radius: 6px;
-}
-.code-show-ignored:hover { color: var(--fg); background: var(--bg-2); }
 .code-lang-select { font-size: 12px; min-width: 96px; }
+
+/* Open-file tabs (read-only, VS Code style). Horizontal strip above the toolbar. */
+.code-tabs {
+  display: flex; align-items: stretch; flex: 0 0 auto; overflow-x: auto;
+  border-bottom: 1px solid var(--border); background: var(--bg-2);
+  scrollbar-width: thin;
+}
+.code-tab {
+  display: inline-flex; align-items: center; flex: 0 0 auto; max-width: 200px;
+  border-right: 1px solid var(--border); color: var(--fg-dim);
+  border-top: 2px solid transparent;
+}
+.code-tab.active { background: var(--bg); color: var(--fg); border-top-color: var(--accent); }
+.code-tab-label {
+  display: inline-flex; align-items: center; gap: 6px; min-width: 0;
+  background: transparent; border: 0; color: inherit; cursor: pointer;
+  font: inherit; font-size: 12px; padding: 6px 4px 6px 10px;
+}
+.code-tab-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.code-tab-close {
+  display: inline-flex; align-items: center; justify-content: center;
+  background: transparent; border: 0; color: var(--fg-dim); cursor: pointer;
+  padding: 2px; margin: 0 6px 0 2px; border-radius: 4px; opacity: 0.6;
+}
+.code-tab-close:hover { opacity: 1; background: var(--bg-3, var(--border)); }
+.code-tab.active .code-tab-close { opacity: 0.8; }

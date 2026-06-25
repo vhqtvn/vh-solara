@@ -1,8 +1,8 @@
 import { createEffect, createMemo, createResource, createSignal, For, Match, onCleanup, Show, Switch } from "solid-js";
 import { projectDir } from "../sync";
 import { codeFile, codeLangs, codeRawUrl, codeSearch, codeStatus, codeStyles, codeTree, type CodeEntry, type CodeFile, type CodeHit } from "../codeApi";
-import { codeOpenPath, setCodeOpenPath, codeOpenLine, setCodeOpenLine } from "../code";
-import { codeStyle, setCodeStyle, codeWrap, setCodeWrap, codeShowIgnored, setCodeShowIgnored } from "../prefs";
+import { codeOpenPath, setCodeOpenPath, codeOpenLine, setCodeOpenLine, codeTabs, addCodeTab, closeCodeTab } from "../code";
+import { codeStyle, setCodeStyle, codeWrap, setCodeWrap, codeShowIgnored, setCodeShowIgnored, codeFlatten, setCodeFlatten, codeShowSearch, setCodeShowSearch } from "../prefs";
 import Icon from "./Icon";
 import Select from "./Select";
 import Spinner from "./Spinner";
@@ -29,7 +29,8 @@ function TreeNode(props: {
   showIgnored: () => boolean;
 }) {
   const [open, setOpen] = createSignal(false);
-  const [kids] = createResource(open, (o) => (o ? codeTree(props.entry.path) : Promise.resolve<CodeEntry[] | null>(null)));
+  // Re-fetch when the flatten preference changes so chains collapse/expand live.
+  const [kids] = createResource(() => (open() ? { flatten: codeFlatten() } : false), (k) => codeTree(props.entry.path, k.flatten));
   const isDir = props.entry.type === "dir";
   const selected = () => props.openPath() === props.entry.path;
   let lpTimer: ReturnType<typeof setTimeout> | undefined;
@@ -88,10 +89,11 @@ export default function CodeView() {
   // Focus folder: re-root the tree + scope search to a subtree (monorepo digging).
   const [focusRoot, setFocusRoot] = createSignal("");
   const [ctxMenu, setCtxMenu] = createSignal<{ x: number; y: number; path: string } | null>(null);
+  const [filterOpen, setFilterOpen] = createSignal(false);
   let paneEl: HTMLDivElement | undefined;
 
-  // Tree root reloads when the project or the focus folder changes.
-  const [roots] = createResource(() => ({ dir: projectDir(), root: focusRoot() }), (k) => codeTree(k.root));
+  // Tree root reloads when the project, focus folder, or flatten pref changes.
+  const [roots] = createResource(() => ({ dir: projectDir(), root: focusRoot(), flatten: codeFlatten() }), (k) => codeTree(k.root, k.flatten));
   // Git status decorations + language override.
   const [status] = createResource(() => projectDir(), () => codeStatus());
   const [langList] = createResource(codeLangs);
@@ -128,6 +130,15 @@ export default function CodeView() {
     setMdRendered(false);
     setLangOverride(""); // a new file re-detects its language
     setTargetLine(line);
+    addCodeTab(path);
+    setOpenPath(path);
+  };
+  // Switch to an already-open tab (no line target).
+  const activate = (path: string) => {
+    if (path === openPath()) return;
+    setMdRendered(false);
+    setLangOverride("");
+    setTargetLine(undefined);
     setOpenPath(path);
   };
 
@@ -177,6 +188,17 @@ export default function CodeView() {
     const id = setTimeout(() => document.addEventListener("click", close), 0);
     onCleanup(() => { clearTimeout(id); document.removeEventListener("click", close); });
   });
+  // Same for the sidebar filter menu — but keep it open while interacting with
+  // its own toggles (Solid delegates clicks to document, so stopPropagation in
+  // the menu wouldn't block this listener; test the target instead).
+  createEffect(() => {
+    if (!filterOpen()) return;
+    const close = (e: MouseEvent) => {
+      if (!(e.target as HTMLElement)?.closest(".code-filter-wrap")) setFilterOpen(false);
+    };
+    const id = setTimeout(() => document.addEventListener("click", close), 0);
+    onCleanup(() => { clearTimeout(id); document.removeEventListener("click", close); });
+  });
 
   const segments = createMemo(() => {
     const p = openPath();
@@ -199,18 +221,51 @@ export default function CodeView() {
     <Show when={projectDir()} fallback={<div class="code-empty">Open a project (not the default) to browse its code.</div>}>
       <div class="code-view code-hl" classList={{ "has-file": !!openPath() }}>
         <aside class="code-sidebar">
-          <div class="code-search">
-            <Icon name="filter" size={13} />
-            <input
-              class="code-search-input"
-              placeholder="Search code…"
-              value={query()}
-              onInput={(e) => setQuery(e.currentTarget.value)}
-            />
-            <Show when={query()}>
-              <button type="button" class="code-search-clear" aria-label="Clear" onClick={() => setQuery("")}><Icon name="x" size={12} /></button>
-            </Show>
+          <div class="code-side-head">
+            <span class="code-side-title">Files</span>
+            <div class="code-filter-wrap">
+              <button
+                type="button"
+                class="icon-btn"
+                aria-label="Filters"
+                data-tip="Filters"
+                classList={{ on: filterOpen() }}
+                onClick={(e) => { e.stopPropagation(); setFilterOpen((v) => !v); }}
+              >
+                <Icon name="filter" size={14} />
+              </button>
+              <Show when={filterOpen()}>
+                <div class="code-filter-menu" onClick={(e) => e.stopPropagation()}>
+                  <label class="code-filter-item">
+                    <input type="checkbox" checked={codeShowSearch()} onChange={(e) => { setCodeShowSearch(e.currentTarget.checked); if (!e.currentTarget.checked) setQuery(""); }} />
+                    Search bar
+                  </label>
+                  <label class="code-filter-item">
+                    <input type="checkbox" checked={codeShowIgnored()} onChange={(e) => setCodeShowIgnored(e.currentTarget.checked)} />
+                    Ignored files
+                  </label>
+                  <label class="code-filter-item">
+                    <input type="checkbox" checked={codeFlatten()} onChange={(e) => setCodeFlatten(e.currentTarget.checked)} />
+                    Compact folders
+                  </label>
+                </div>
+              </Show>
+            </div>
           </div>
+          <Show when={codeShowSearch()}>
+            <div class="code-search">
+              <Icon name="search" size={13} />
+              <input
+                class="code-search-input"
+                placeholder="Search code…"
+                value={query()}
+                onInput={(e) => setQuery(e.currentTarget.value)}
+              />
+              <Show when={query()}>
+                <button type="button" class="code-search-clear" aria-label="Clear" onClick={() => setQuery("")}><Icon name="x" size={12} /></button>
+              </Show>
+            </div>
+          </Show>
           <Show when={focusRoot()}>
             <div class="code-focus" title="Focused folder — tree & search are scoped here">
               <button type="button" class="code-focus-crumb" onClick={() => setFocusRoot("")}>‹ repo</button>
@@ -259,15 +314,27 @@ export default function CodeView() {
                     />
                   )}
                 </For>
-                <button type="button" class="code-show-ignored" onClick={() => { setCodeShowIgnored(!codeShowIgnored()); }}>
-                  {codeShowIgnored() ? "Hide ignored files" : "Show ignored files"}
-                </button>
               </Show>
             </Show>
           </div>
         </aside>
 
         <main class="code-main">
+          <Show when={codeTabs().length > 0}>
+            <div class="code-tabs scroll-edges">
+              <For each={codeTabs()}>
+                {(p) => (
+                  <div class="code-tab" classList={{ active: p === openPath() }}>
+                    <button type="button" class="code-tab-label" title={p} onClick={() => activate(p)}>
+                      <Icon name={fileIcon(p)} size={12} />
+                      <span class="code-tab-name">{p.split("/").pop()}</span>
+                    </button>
+                    <button type="button" class="code-tab-close" aria-label="Close tab" onClick={() => closeCodeTab(p)}><Icon name="x" size={11} /></button>
+                  </div>
+                )}
+              </For>
+            </div>
+          </Show>
           <Show when={openPath()} fallback={<div class="code-empty">Select a file to view.</div>}>
             <div class="code-bar">
               <button type="button" class="code-back" aria-label="Files" onClick={() => setOpenPath("")}><Icon name="menu" size={15} /></button>

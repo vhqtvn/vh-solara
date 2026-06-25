@@ -86,6 +86,22 @@ const PATHS: Record<string, () => JSX.Element> = {
     </>
   ),
   layers: () => <path d="M12 2 2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5" />,
+  // Angle brackets + slash — the code viewer.
+  code: () => <path d="m8 16-4-4 4-4M16 8l4 4-4 4M14 4l-4 16" />,
+  // Magnifier — code search.
+  search: () => (
+    <>
+      <circle cx="11" cy="11" r="7" />
+      <path d="m21 21-4.3-4.3" />
+    </>
+  ),
+  // Window with a docked side panel — collapse the full code view to the dock.
+  dock: () => (
+    <>
+      <rect x="3" y="4" width="18" height="16" rx="2" />
+      <path d="M15 4v16" />
+    </>
+  ),
   // Alert triangle — error notifications.
   alert: () => (
     <>

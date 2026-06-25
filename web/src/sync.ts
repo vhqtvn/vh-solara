@@ -18,6 +18,7 @@ import { pushNotification, markRead } from "./notify";
 import { handleNotice, attendingNow } from "./alerts";
 import { checkVersionNow } from "./pwa";
 import { log } from "./lib/log";
+import { setView } from "./ui";
 import { loadVersioned, saveVersioned } from "./lib/store";
 
 const LS_SESSIONS = "vh.sessions.v1";
@@ -682,6 +683,7 @@ export function newSession() {
   setSelectedIdRaw(null);
   setDraft(true);
   syncUrl(null);
+  setView("chat"); // composing always happens in the chat view
 }
 
 // Create a session on the server (called when the draft's first message is
