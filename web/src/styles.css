@@ -185,6 +185,33 @@
   --bg: #faf4ed; --bg-2: #fffaf3; --border: #dfdad9;
   --fg: #575279; --fg-dim: #797593; --accent: #56949f; --accent-2: #907aa9;
 }
+/* E Ink (Black & White): paper-grey background, near-black ink, and a grayscale
+   palette throughout — even the semantic status colors become greys, separated
+   only by darkness, to mimic a monochrome e-reader's high-contrast page. */
+:root.theme-eink {
+  --bg: #f4f4f2; --bg-2: #e9e9e6; --border: #c2c2bf;
+  --fg: #161616; --fg-dim: #5a5a58; --accent: #2b2b2b; --accent-2: #4d4d4d;
+  --code-bg: #e9e9e6; --code-surface: #f4f4f2;
+  --danger: #161616; --warn: #4d4d4d; --ok: #6b6b6b; --sel: #2b2b2b;
+  --md-h1: #161616; --md-h2: #2b2b2b; --md-h3: var(--fg);
+  --md-link: #161616; --md-code: #2b2b2b; --md-marker: #2b2b2b;
+  --md-quote: #5a5a58; --md-quote-border: #9a9a97;
+  --chat-user-bg: #e9e9e6; --chat-user-border: #c2c2bf;
+}
+/* E Ink Color (Kaleido 3-like): a greyer paper than Carta (the colour filter
+   array dims the white point), near-black ink, and deliberately MUTED/
+   desaturated accents — Kaleido's gamut is washed-out, so the whole palette,
+   including status colours, stays low-saturation. */
+:root.theme-eink-color {
+  --bg: #eceae2; --bg-2: #e2e0d6; --border: #c3c1b6;
+  --fg: #24231f; --fg-dim: #6a685f; --accent: #4f7a8f; --accent-2: #9c6b52;
+  --code-bg: #e2e0d6; --code-surface: #eceae2;
+  --danger: #a8503f; --warn: #997b3a; --ok: #5f7e4f; --sel: #4f7a8f;
+  --md-h1: #9c6b52; --md-h2: #4f7a8f; --md-h3: var(--fg);
+  --md-link: #4f6f8f; --md-code: #5f7e4f; --md-marker: #9c6b52;
+  --md-quote: #6a685f; --md-quote-border: #b0a08f;
+  --chat-user-bg: #e2e0d6; --chat-user-border: #c3c1b6;
+}
 /* On light themes the most-prominent text must be dark, not white. */
 /* Light-theme overrides apply to ALL light themes via the generic marker class
    (set in theme.ts), so Shire (light) gets them too — not just `light`. */

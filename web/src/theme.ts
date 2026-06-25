@@ -39,6 +39,8 @@ export const THEMES: ThemeDef[] = [
   { id: "solarized-light", name: "Solarized (light)", light: true, swatch: { bg: "#fdf6e3", fg: "#586e75", accent: "#268bd2", accent2: "#d33682" } },
   { id: "catppuccin-latte", name: "Catppuccin Latte", light: true, swatch: { bg: "#eff1f5", fg: "#4c4f69", accent: "#1e66f5", accent2: "#8839ef" } },
   { id: "rose-pine-dawn", name: "Rosé Pine Dawn", light: true, swatch: { bg: "#faf4ed", fg: "#575279", accent: "#56949f", accent2: "#907aa9" } },
+  { id: "eink", name: "E Ink (B&W)", light: true, swatch: { bg: "#f4f4f2", fg: "#161616", accent: "#2b2b2b", accent2: "#4d4d4d" } },
+  { id: "eink-color", name: "E Ink Color (Kaleido)", light: true, swatch: { bg: "#eceae2", fg: "#24231f", accent: "#4f7a8f", accent2: "#9c6b52" } },
   { id: "custom", name: "Custom…", swatch: { bg: "#0d1117", fg: "#c9d1d9", accent: "#58a6ff", accent2: "#d2a8ff" } },
 ];
 
