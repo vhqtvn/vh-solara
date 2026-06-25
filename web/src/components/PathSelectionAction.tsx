@@ -1,7 +1,12 @@
 import { createSignal, onCleanup, onMount, Show } from "solid-js";
-import { openFileAt } from "../codeFrame";
+import { openFileAt, setPathSelection } from "../codeFrame";
 import { looksLikePath } from "../lib/pathlike";
 import Icon from "./Icon";
+
+// Coarse pointers (touch): the OS text-selection menu sits exactly where our
+// floating action would, covering it — so suppress the floating button there and
+// rely on the header Code button (which opens the live path selection instead).
+const coarse = () => typeof matchMedia !== "undefined" && matchMedia("(pointer: coarse)").matches;
 
 // When the user selects a path-like run of text anywhere in the app (a path in a
 // chat message, a tool output, …), float an "Open file" action above it — works
@@ -16,6 +21,14 @@ export default function PathSelectionAction() {
     const sel = window.getSelection();
     const text = sel ? sel.toString() : "";
     if (!sel || sel.isCollapsed || !looksLikePath(text)) {
+      setBox(null);
+      setPathSelection(null);
+      return;
+    }
+    // Publish to the header Code button (the reliable trigger on touch).
+    setPathSelection(text.trim());
+    // Floating button only on fine pointers — on touch the OS menu covers it.
+    if (coarse()) {
       setBox(null);
       return;
     }

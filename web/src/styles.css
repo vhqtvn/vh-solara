@@ -3594,6 +3594,14 @@ div.katex-math { display: block; overflow-x: auto; margin: 0.7em 0; text-align: 
 }
 .path-sel-action:active { transform: translate(-50%, calc(-100% - 8px)) scale(0.96); }
 
+/* Header Code button lights up when a path-like text selection is its target
+   (tap it to open that file — the reliable trigger when the OS menu covers the
+   floating action on touch). */
+.icon-btn.has-target {
+  color: var(--accent);
+  box-shadow: inset 0 0 0 1.5px color-mix(in srgb, var(--accent) 60%, transparent);
+}
+
 /* Path-like inline code becomes a go-to link while Ctrl/Cmd is held. */
 .mod-down code.code-pathlike { cursor: pointer; text-decoration: underline dotted; text-underline-offset: 2px; }
 .mod-down code.code-pathlike:hover { color: var(--accent); }

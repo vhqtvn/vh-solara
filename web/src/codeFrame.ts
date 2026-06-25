@@ -2,8 +2,14 @@
 // its heavy DOM — file tree, highlighted files — stays out of the main document).
 // Communication is postMessage. The chat opens files across the boundary; the
 // parent forwards theme changes so the framed viewer restyles live.
+import { createSignal } from "solid-js";
 import { codeDockOpen, setCodeDockOpen, codeMobileOverlay, setCodeMobileOverlay, setView, view } from "./ui";
 import { isDesktop } from "./layout";
+
+// The current path-like text selection (set by PathSelectionAction). When set,
+// the header Code button opens it instead of toggling — a reliable trigger on
+// mobile, where the OS selection menu covers the floating "Open file" action.
+export const [pathSelection, setPathSelection] = createSignal<string | null>(null);
 
 const ORIGIN = typeof location !== "undefined" ? location.origin : "*";
 type Msg = { type: string; [k: string]: unknown };

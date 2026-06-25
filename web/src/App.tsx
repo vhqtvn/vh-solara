@@ -5,7 +5,7 @@ import GitView from "./components/GitView";
 import CodeFrame, { codeMode } from "./components/CodeFrame";
 import { codeDockSide } from "./prefs";
 import TabBar, { type TabItem } from "./components/TabBar";
-import { codeShowing, installCodeFrameHost, postCodeTheme, toggleCodeDock } from "./codeFrame";
+import { codeShowing, installCodeFrameHost, openFileAt, pathSelection, postCodeTheme, setPathSelection, toggleCodeDock } from "./codeFrame";
 import NotesView from "./components/NotesView";
 import SettingsDialog from "./components/SettingsDialog";
 import PathSelectionAction from "./components/PathSelectionAction";
@@ -41,6 +41,8 @@ export default function App() {
   const [navOpen, setNavOpen] = createSignal(false);
   const [inspectorOpen, setInspectorOpen] = createSignal(false);
   const [managedOpen, setManagedOpen] = createSignal(false);
+  // Path selection captured when the Code button is pressed (see its handlers).
+  let codeBtnTarget: string | null = null;
 
   // View tabs for the header switcher (built-ins + any embedded views). Icons
   // are best-effort (the icon style shows them with a tooltip).
@@ -234,10 +236,23 @@ export default function App() {
           <button
             type="button"
             class="icon-btn"
-            classList={{ on: codeShowing() }}
-            aria-label="Code"
-            data-tip="Code (Ctrl+B)"
-            onClick={() => toggleCodeDock()}
+            classList={{ on: codeShowing(), "has-target": !!pathSelection() }}
+            aria-label={pathSelection() ? "Open selected path" : "Code"}
+            data-tip={pathSelection() ? `Open ${pathSelection()}` : "Code (Ctrl+B)"}
+            // Capture the selection on pointerdown — the tap that follows
+            // collapses it before click would read it (notably on touch).
+            onPointerDown={() => (codeBtnTarget = pathSelection())}
+            onClick={() => {
+              const target = codeBtnTarget;
+              codeBtnTarget = null;
+              if (target) {
+                openFileAt(target);
+                setPathSelection(null);
+                window.getSelection()?.removeAllRanges();
+                return;
+              }
+              toggleCodeDock();
+            }}
           >
             <Icon name="code" />
           </button>
