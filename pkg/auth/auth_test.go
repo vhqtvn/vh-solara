@@ -42,11 +42,11 @@ func TestCheckBindSafety(t *testing.T) {
 
 func TestNewRejectsIncompleteConfig(t *testing.T) {
 	cases := []Config{
-		{Mode: ModePassphrase},                                                                    // no passphrase
-		{Mode: ModeTrustProxy},                                                                     // no header
-		{Mode: ModeOIDC, OIDCClientID: "x", OIDCRedirectURL: "y", AllowedDomains: []string{"z"}},   // no issuer
-		{Mode: ModeOIDC, OIDCIssuer: "https://x", OIDCClientID: "x", OIDCRedirectURL: "y"},         // no allow-list
-		{Mode: "bogus"},                                                                            // unknown mode
+		{Mode: ModePassphrase}, // no passphrase
+		{Mode: ModeTrustProxy}, // no header
+		{Mode: ModeOIDC, OIDCClientID: "x", OIDCRedirectURL: "y", AllowedDomains: []string{"z"}}, // no issuer
+		{Mode: ModeOIDC, OIDCIssuer: "https://x", OIDCClientID: "x", OIDCRedirectURL: "y"},       // no allow-list
+		{Mode: "bogus"}, // unknown mode
 	}
 	for i, c := range cases {
 		if _, err := New(context.Background(), c); err == nil {
@@ -188,8 +188,8 @@ func TestTrustProxyMode(t *testing.T) {
 }
 
 func TestSafeRedirect(t *testing.T) {
-	host := &Authenticator{cfg: Config{}}                                // host-only
-	shared := &Authenticator{cfg: Config{CookieDomain: ".example.com"}}  // shared
+	host := &Authenticator{cfg: Config{}}                               // host-only
+	shared := &Authenticator{cfg: Config{CookieDomain: ".example.com"}} // shared
 	r := httptest.NewRequest("GET", "https://app.example.com/", nil)
 
 	cases := []struct {
@@ -197,15 +197,15 @@ func TestSafeRedirect(t *testing.T) {
 		dest string
 		want bool
 	}{
-		{host, "/sessions/123", true},                         // relative path
-		{host, "//evil.com/x", false},                         // protocol-relative
-		{host, "https://app.example.com/x", true},             // same host
-		{host, "https://evil.com/x", false},                   // cross host (host-only)
-		{shared, "https://w1.example.com/x", true},            // sibling within shared domain
-		{shared, "https://example.com/x", true},               // apex within shared domain
-		{shared, "https://evil.com/x", false},                 // outside domain
-		{shared, "https://notexample.com.evil.com/x", false},  // suffix-trick must fail
-		{host, "", false},                                     // empty
+		{host, "/sessions/123", true},                        // relative path
+		{host, "//evil.com/x", false},                        // protocol-relative
+		{host, "https://app.example.com/x", true},            // same host
+		{host, "https://evil.com/x", false},                  // cross host (host-only)
+		{shared, "https://w1.example.com/x", true},           // sibling within shared domain
+		{shared, "https://example.com/x", true},              // apex within shared domain
+		{shared, "https://evil.com/x", false},                // outside domain
+		{shared, "https://notexample.com.evil.com/x", false}, // suffix-trick must fail
+		{host, "", false},                                    // empty
 	}
 	for _, c := range cases {
 		if got := c.a.safeRedirect(c.dest, r); got != c.want {

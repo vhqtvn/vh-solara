@@ -42,15 +42,6 @@ export interface AlertConfig {
   detect: AlertDetect;
 }
 
-export interface PresenceDevice {
-  id: string;
-  name?: string;
-  focusedRoot?: string;
-  scope?: string;
-  lastInteraction: string;
-  lastSeen: string;
-  idle: boolean;
-}
 
 const POST = (url: string, body: unknown) =>
   fetch(url, {
@@ -112,16 +103,5 @@ export async function heartbeat(d: {
     return r.ok ? ((await r.json()) as { attended: boolean }) : null;
   } catch {
     return null;
-  }
-}
-
-export async function listDevices(): Promise<PresenceDevice[]> {
-  try {
-    const r = await fetch("/vh/alerts/devices");
-    if (!r.ok) return [];
-    const j = (await r.json()) as { devices: PresenceDevice[] };
-    return j.devices || [];
-  } catch {
-    return [];
   }
 }

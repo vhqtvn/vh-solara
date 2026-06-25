@@ -35,8 +35,8 @@ type TrustRecord struct {
 
 // TrustStore is the per-project config-truth ledger.
 type TrustStore struct {
-	base string        // directory holding <sha1>.json records
-	mu   sync.Mutex    // guards the on-disk record files
+	base string     // directory holding <sha1>.json records
+	mu   sync.Mutex // guards the on-disk record files
 }
 
 // NewTrustStore creates a store rooted at <stateBaseDir()>/trust.

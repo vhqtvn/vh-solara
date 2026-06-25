@@ -9,8 +9,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/vhqtvn/vh-solara/pkg/projectcfg"
 	"github.com/vhqtvn/vh-solara/pkg/procmgr"
+	"github.com/vhqtvn/vh-solara/pkg/projectcfg"
 	"github.com/vhqtvn/vh-solara/pkg/vhlog"
 )
 
@@ -26,7 +26,7 @@ import (
 
 // Project states surfaced by the orchestrator.
 const (
-	StateNone       = "none"        // no .vh-solara/project.jsonc — not a managed project
+	StateNone       = "none" // no .vh-solara/project.jsonc — not a managed project
 	StateAwaitTrust = "awaiting-trust"
 	StateChanged    = "changed" // previously trusted but config hash differs now
 	StateTrusted    = "trusted" // trusted & processes started
@@ -371,7 +371,7 @@ type ManagedProject struct {
 
 // ManagedReview is the display-before-run payload for an untrusted config.
 type ManagedReview struct {
-	ConfigJSON string             `json:"config_json"`
+	ConfigJSON string              `json:"config_json"`
 	Processes  []ManagedReviewProc `json:"processes"`
 	Views      []ManagedReviewView `json:"views"`
 }
@@ -560,7 +560,9 @@ func (s *Server) handleTrust(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSONResp(w, map[string]any{"state": s.managed.trust.State(root, lr.Hash), "config_hash": lr.Hash})
 	case http.MethodPost:
-		var in struct{ Dir string `json:"dir"` }
+		var in struct {
+			Dir string `json:"dir"`
+		}
 		if !decodeBody(w, r, &in) {
 			return
 		}

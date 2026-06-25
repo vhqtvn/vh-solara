@@ -28,9 +28,6 @@ export function setDebug(v: boolean): void {
   }
 }
 
-export function debugEnabled(): boolean {
-  return on;
-}
 
 export const log = {
   debug: (scope: string, ...a: unknown[]) => {

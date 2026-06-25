@@ -1,5 +1,6 @@
-import { createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
+import { createMemo, createSignal, For, Show } from "solid-js";
 import { selectedId, setSelectedId, state } from "../sync";
+import { dismiss } from "../lib/a11y";
 import { clearNotifications, dismissNotification, markAllRead, notifications } from "../notify";
 import { setView } from "../ui";
 import Icon from "./Icon";
@@ -47,26 +48,10 @@ export default function NotificationCenter() {
     setOpen(false);
   }
 
-  let rootEl: HTMLDivElement | undefined;
-  const onDocClick = (e: MouseEvent) => {
-    if (open() && rootEl && !e.composedPath().includes(rootEl)) setOpen(false);
-  };
-  const onKey = (e: KeyboardEvent) => {
-    if (e.key === "Escape") setOpen(false);
-  };
-  onMount(() => {
-    document.addEventListener("click", onDocClick);
-    document.addEventListener("keydown", onKey);
-  });
-  onCleanup(() => {
-    document.removeEventListener("click", onDocClick);
-    document.removeEventListener("keydown", onKey);
-  });
-
   const empty = () => actions().length === 0 && notifications.items.length === 0;
 
   return (
-    <div class="notif" ref={rootEl}>
+    <div class="notif" use:dismiss={() => open() && setOpen(false)}>
       <button type="button" class="icon-btn notif-bell" aria-label="Notifications" data-tip="Notifications" onClick={toggle}>
         <Icon name="bell" />
         <Show when={count() > 0}>

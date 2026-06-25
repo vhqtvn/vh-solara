@@ -45,7 +45,7 @@ import (
 //   - server → client BINARY: raw PTY output
 
 const (
-	termScrollback = 256 * 1024      // replayed on attach
+	termScrollback = 256 * 1024       // replayed on attach
 	termIdleTTL    = 30 * time.Minute // kill a session with no clients after this
 )
 

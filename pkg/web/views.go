@@ -14,6 +14,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
+	"time"
 
 	"github.com/vhqtvn/vh-solara/pkg/vhlog"
 )
@@ -274,6 +276,40 @@ func normalizeViewPrefix(p string) (string, error) {
 // prefix on the way in, never forwards the vh session cookie, and on the way out
 // injects <base>, rewrites Location, overrides framing/CSP, and drops upstream
 // Set-Cookie (so the upstream can't touch vh-solara's origin cookies).
+// ssrfControl rejects a dial to a link-local address (169.254.0.0/16 and
+// fe80::/10) — most importantly the cloud-metadata endpoint 169.254.169.254 —
+// at connect time, so it catches both literal-IP and DNS-resolved upstreams.
+// Loopback and private LAN targets are deliberately allowed: this is a
+// single-user operator daemon that legitimately proxies localhost/LAN services,
+// so this blocks the high-value credential-theft vector without breaking that.
+func ssrfControl(_, address string, _ syscall.RawConn) error {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		host = address
+	}
+	ip := net.ParseIP(host)
+	if ip != nil && (ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()) {
+		return errors.New("view upstream blocked: link-local address " + host)
+	}
+	return nil
+}
+
+// ssrfTransport is the shared HTTP transport for http(s)/tcp view upstreams, with
+// the link-local dial guard above. (unix upstreams use their own socket dialer.)
+var ssrfTransport http.RoundTripper = &http.Transport{
+	Proxy: http.ProxyFromEnvironment,
+	DialContext: (&net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+		Control:   ssrfControl,
+	}).DialContext,
+	ForceAttemptHTTP2:     true,
+	MaxIdleConns:          100,
+	IdleConnTimeout:       90 * time.Second,
+	TLSHandshakeTimeout:   10 * time.Second,
+	ExpectContinueTimeout: 1 * time.Second,
+}
+
 func buildViewProxy(prefix, upstream string) (*httputil.ReverseProxy, error) {
 	var target *url.URL
 	var transport http.RoundTripper
@@ -298,14 +334,14 @@ func buildViewProxy(prefix, upstream string) (*httputil.ReverseProxy, error) {
 			return nil, err
 		}
 		target = &url.URL{Scheme: u.Scheme, Host: u.Host}
-		transport = http.DefaultTransport
+		transport = ssrfTransport
 	case strings.HasPrefix(upstream, "tcp:"):
 		host := strings.TrimPrefix(upstream, "tcp:")
 		if host == "" {
 			return nil, errors.New("tcp upstream missing host:port")
 		}
 		target = &url.URL{Scheme: "http", Host: host}
-		transport = http.DefaultTransport
+		transport = ssrfTransport
 	default:
 		return nil, errors.New("upstream must be unix:<path>, http(s)://host:port, or tcp:host:port")
 	}
@@ -369,17 +405,32 @@ func isHTMLResponse(resp *http.Response) bool {
 	return strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/html")
 }
 
+// maxInjectBytes caps how much HTML we buffer to inject <base>. A larger
+// response is streamed through untouched rather than read whole into memory
+// (which an oversized/malicious upstream could use to OOM the daemon).
+const maxInjectBytes = 4 << 20 // 4 MiB
+
 // injectBaseTag inserts <base href="<prefix>/"> so the consumer's RELATIVE asset
 // URLs resolve under the prefix. Inserted right after <head> (or <html>, or at
 // the start) — whichever appears first.
 func injectBaseTag(resp *http.Response, prefix string) error {
-	body, err := io.ReadAll(resp.Body)
-	_ = resp.Body.Close()
+	head, err := io.ReadAll(io.LimitReader(resp.Body, maxInjectBytes+1))
 	if err != nil {
+		_ = resp.Body.Close()
 		return err
 	}
+	if len(head) > maxInjectBytes {
+		// Too large to buffer safely — pass the body through unmodified (no
+		// <base> injection) by re-prepending what we already read.
+		resp.Body = struct {
+			io.Reader
+			io.Closer
+		}{io.MultiReader(bytes.NewReader(head), resp.Body), resp.Body}
+		return nil
+	}
+	_ = resp.Body.Close()
 	base := []byte(`<base href="` + prefix + `/">`)
-	out := insertAfterTag(body, base)
+	out := insertAfterTag(head, base)
 	resp.Body = io.NopCloser(bytes.NewReader(out))
 	resp.ContentLength = int64(len(out))
 	resp.Header.Set("Content-Length", strconv.Itoa(len(out)))

@@ -14,6 +14,24 @@
   --code-surface: #0b0f14;
   --sidebar-w: 280px;
 
+  /* Z-index scale. One ordered ladder for everything that overlaps globally, so
+     stacking is intentional instead of a pile of magic numbers. (Small, local
+     z-indexes inside a component's own stacking context — resize handles, sticky
+     table headers — stay as raw 2/3/6 and don't participate here.) */
+  --z-jump: 30;          /* jump-to-bottom pill (above the composer) */
+  --z-composer: 40;
+  --z-tasks: 45;         /* tasks popover anchored to the composer */
+  --z-drawer: 48;        /* mobile off-canvas sidebar + its scrim (above content, below dialogs) */
+  --z-dialog: 50;        /* base modal dialog overlay */
+  --z-popover: 60;       /* menus, status popovers, dropdowns */
+  --z-scrim: 70;         /* context-menu scrim */
+  --z-toast: 90;         /* connection / update toasts */
+  --z-modal: 150;        /* command palette, opencode-update overlay */
+  --z-modal-pop: 160;    /* composer autocomplete (above a modal) */
+  --z-overlay-full: 200; /* full-screen code overlay, restart overlay, portaled <Select> popup */
+  --z-floating: 300;     /* path-selection floating action */
+  --z-tooltip: 1000;
+
   /* Surfaces/emphasis derived from the palette so every theme (which only
      overrides --bg/--bg-2/--fg) adapts automatically. --bg-input: form controls
      (select buttons, text inputs); --bg-elev: elevated popups/sheets; --fg-strong:
@@ -307,7 +325,7 @@ body {
   user-select: none;
 }
 /* Where selecting/copying matters, re-enable it. */
-.md, .md-raw, .vh-diff, .fv-code, .msg-parts, .msg-inspect, .tool-output, .perm-detail,
+.md, .md-raw, .vh-diff, .msg-parts, .msg-inspect, .tool-output, .perm-detail,
 .term, .git-commit-msg, .term-sess-preview, input, textarea, pre, code, [contenteditable="true"] {
   -webkit-user-select: text;
   user-select: text;
@@ -401,8 +419,8 @@ body {
   border: 1px solid var(--border);
   color: var(--fg-dim);
 }
-.status.live { color: var(--ok); border-color: #238636; }
-.status.reconnecting { color: var(--warn); border-color: #9e6a03; }
+.status.live { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 70%, var(--border)); }
+.status.reconnecting { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 70%, var(--border)); }
 
 .tree {
   overflow-y: auto;
@@ -520,9 +538,9 @@ body {
   height: 7px;
   border-radius: 50%;
   flex: 0 0 auto;
-  background: #30363d;
+  background: var(--border);
 }
-.dot.idle { background: #30363d; }
+.dot.idle { background: var(--border); }
 .dot.error { background: var(--danger); }
 .dot.busy, .dot.retry {
   background: var(--accent);
@@ -578,8 +596,16 @@ body {
    sidebar-header buttons (search/new/close) to a comfortable size on coarse
    pointers only — mouse/desktop density is untouched. */
 @media (pointer: coarse) {
+  /* Touch-target floor: bump the 26px icon buttons and the primary send button
+     to a comfortable tap size, and give tiny inline close/dismiss buttons a
+     padded hit area without changing their visual glyph size. */
+  .icon-btn { width: 36px; height: 36px; }
   .sidebar-head .icon-btn,
   .sidebar-head .sidebar-close { width: 38px; height: 38px; font-size: 17px; }
+  .send-btn { min-width: 40px; min-height: 40px; }
+  .code-tab-close,
+  .queue-chip button,
+  .notif-x { min-width: 32px; min-height: 32px; }
 }
 /* Orphaned-sessions banner (parent root archived; surfaced so they can be cleaned up). */
 .orphan-banner {
@@ -750,7 +776,7 @@ body {
   --accent: #58a6ff;
   --accent-fg: #08111f;
 }
-.term-dock.full { position: absolute; inset: 0; z-index: 100; height: auto !important; }
+.term-dock.full { position: absolute; inset: 0; z-index: 100; height: auto !important; padding-top: env(safe-area-inset-top); }
 .term-dock-resize { position: absolute; top: -3px; left: 0; right: 0; height: 7px; cursor: ns-resize; z-index: 2; }
 .term-dock-head { display: flex; align-items: center; gap: 7px; padding: 4px 8px; border-bottom: 1px solid var(--border); font-size: 12px; color: var(--fg-dim); }
 .term-dock-head .icon-btn { width: 26px; height: 26px; }
@@ -818,7 +844,8 @@ body {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 10px 14px;
+  /* Clear notch/rounded corners on notched devices (viewport-fit=cover is set). */
+  padding: max(10px, env(safe-area-inset-top)) max(14px, env(safe-area-inset-right)) 10px max(14px, env(safe-area-inset-left));
   border-bottom: 1px solid var(--border);
 }
 /* flex:1 so the title absorbs width changes between tabs and the seg + right-side
@@ -847,7 +874,7 @@ body {
 .update-toast {
   position: fixed;
   left: 50%;
-  bottom: 18px;
+  bottom: calc(18px + env(safe-area-inset-bottom));
   transform: translateX(-50%);
   z-index: 80;
   display: flex;
@@ -879,7 +906,7 @@ body {
 .conn-toast {
   position: fixed;
   left: 50%;
-  top: 14px;
+  top: calc(14px + env(safe-area-inset-top));
   transform: translateX(-50%);
   z-index: 90;
   display: flex;
@@ -1723,7 +1750,7 @@ body {
   padding: 0 4px;
   border-radius: 999px;
   background: var(--danger);
-  color: #fff;
+  color: var(--danger-fg);
   font-size: 10px;
   font-weight: 600;
   line-height: 16px;
@@ -2194,6 +2221,7 @@ body {
 .notes-head h2 { font-size: 15px; font-weight: 600; margin: 0; }
 .notes-count { font-size: 12px; color: var(--fg-dim); }
 .notes-saved { font-size: 12px; color: var(--fg-dim); }
+.notes-saved.error { color: var(--danger); }
 .notes-empty { color: var(--fg-dim); font-size: 13px; margin: 2px 0; }
 .todo-add { display: flex; gap: 8px; }
 .todo-add input {
@@ -2406,7 +2434,7 @@ body {
 .tasks-item.done .tasks-item-text { color: var(--fg-dim); text-decoration: line-through; }
 .tasks-item.cancelled .tasks-item-text { color: var(--fg-dim); text-decoration: line-through; opacity: 0.7; }
 
-.composer-wrap { padding: 10px 14px; position: relative; z-index: 40; }
+.composer-wrap { padding: 10px max(14px, env(safe-area-inset-right)) max(10px, env(safe-area-inset-bottom)) max(14px, env(safe-area-inset-left)); position: relative; z-index: 40; }
 .composer {
   display: flex;
   flex-direction: column;
@@ -2508,7 +2536,7 @@ body {
   justify-content: center;
 }
 .send-btn:disabled { opacity: 0.45; cursor: default; }
-.send-btn.stop { background: var(--danger); color: #fff; }
+.send-btn.stop { background: var(--danger); color: var(--danger-fg); }
 /* Queue button (sits next to Stop while busy): accent outline, not filled, to
    read as secondary to the primary Stop. */
 .send-btn.queue { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
@@ -2615,7 +2643,7 @@ body {
 }
 .gitfile-status {
   width: 18px; height: 18px; flex: 0 0 auto; border-radius: 4px;
-  display: grid; place-items: center; font-size: 11px; font-weight: 700; color: #08111f;
+  display: grid; place-items: center; font-size: 11px; font-weight: 700; color: #fff;
 }
 .gitfile-status.added { background: var(--ok); }
 .gitfile-status.deleted { background: var(--danger); }
@@ -2667,7 +2695,9 @@ body {
   .sidebar {
     position: fixed;
     inset: 0 auto 0 0;
-    z-index: 20;
+    /* Above the composer/jump/tasks (z 40/30/45) so the open drawer + its
+       full-screen scrim aren't pierced by chat chrome; below dialogs. */
+    z-index: var(--z-drawer);
     width: min(var(--sidebar-w), 86vw); /* cap a large desktop width on phones */
     transform: translateX(-100%);
     transition: transform 0.18s ease;
@@ -2788,7 +2818,7 @@ body {
   color: var(--fg-dim);
   white-space: nowrap;
 }
-.b-reason { color: #a371f7; border-color: #a371f755; }
+.b-reason { color: var(--accent-2); border-color: color-mix(in srgb, var(--accent-2) 33%, transparent); }
 .b-vision { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 33%, transparent); }
 .b-free { color: var(--accent); border-color: color-mix(in srgb, var(--sel) 33%, transparent); }
 .b-status { color: var(--warn); border-color: #9e6a0355; }
@@ -2873,37 +2903,9 @@ body {
   color: var(--fg-dim);
 }
 
-/* clickable file paths + file viewer */
+/* clickable file paths */
 .filepath { color: var(--accent); cursor: pointer; text-decoration: underline dotted; text-underline-offset: 2px; }
 .filepath:hover { text-decoration: underline; }
-.fileviewer { width: 820px; }
-.fv-title { flex: 1; padding: 0 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, Menlo, monospace; font-size: 13px; }
-.fv-line { color: var(--accent); }
-.fv-body { padding: 0; }
-.fv-code { margin: 0; font: 12px/1.55 ui-monospace, Menlo, monospace; }
-.fv-row { display: flex; gap: 12px; padding: 0 12px; white-space: pre; }
-.fv-row.hl { background: color-mix(in srgb, var(--sel) 13%, transparent); }
-.fv-ln { color: var(--fg-dim); text-align: right; min-width: 3ch; user-select: none; flex: 0 0 auto; }
-.fv-lc { flex: 1; min-width: 0; }
-/* Word-wrap toggle: wrap long lines instead of horizontal scroll. */
-.fv-code.wrap .fv-row { white-space: normal; }
-.fv-code.wrap .fv-lc { white-space: pre-wrap; overflow-wrap: anywhere; }
-.fv-lang { max-width: 130px; margin-right: 4px; }
-.fv-wrap.on { color: var(--accent); border-color: var(--accent); }
-
-/* highlight.js token colors, mapped to our theme tokens so the viewer matches
-   the active palette (highlight.js classes; client-side highlighting). */
-.hljs-comment, .hljs-quote { color: var(--fg-dim); font-style: italic; }
-.hljs-keyword, .hljs-selector-tag, .hljs-literal, .hljs-doctag, .hljs-formula { color: var(--accent-2); }
-.hljs-string, .hljs-regexp, .hljs-addition, .hljs-meta-string { color: color-mix(in srgb, var(--ok) 80%, var(--fg)); }
-.hljs-number, .hljs-symbol, .hljs-bullet, .hljs-link, .hljs-meta, .hljs-selector-id { color: #d2a8ff; }
-.hljs-title, .hljs-section, .hljs-name, .hljs-selector-class, .hljs-title.function_ { color: var(--accent); }
-.hljs-type, .hljs-class .hljs-title, .hljs-built_in, .hljs-builtin-name { color: #79c0ff; }
-.hljs-attr, .hljs-attribute, .hljs-variable, .hljs-template-variable, .hljs-property { color: #f0883e; }
-.hljs-tag { color: var(--fg-dim); }
-.hljs-deletion { color: var(--danger); }
-.hljs-emphasis { font-style: italic; }
-.hljs-strong { font-weight: 600; }
 
 .mermaid-block { margin: 8px 0; border: 1px solid var(--border); border-radius: 6px; padding: 10px; background: var(--code-bg); }
 .mermaid-svg { overflow-x: auto; text-align: center; }
@@ -2974,7 +2976,7 @@ body {
 }
 .btn:hover { border-color: var(--accent); }
 .btn:disabled { opacity: 0.5; cursor: not-allowed; }
-.btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn-primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
 .link-btn {
   background: none;
   border: 0;
@@ -3118,7 +3120,7 @@ body {
   --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
 }
 body { font-family: var(--font-ui); font-size: var(--text-base); line-height: var(--lh); }
-code, pre, .vh-diff, .fv-code, .msg-cost, .tool-name, .gitfile-name, .kv, .msg-inspect, .git-branch {
+code, pre, .vh-diff, .msg-cost, .tool-name, .gitfile-name, .kv, .msg-inspect, .git-branch {
   font-family: var(--font-mono);
 }
 /* labels share one small scale */
@@ -3588,7 +3590,7 @@ div.katex-math { display: block; overflow-x: auto; margin: 0.7em 0; text-align: 
 .code-dock.full { flex: 1 1 auto; }
 .code-dock.dock { flex: 0 0 auto; position: relative; border-left: 1px solid var(--border); max-width: 80vw; }
 .main-body.dock-left .code-dock.dock { order: -1; border-left: 0; border-right: 1px solid var(--border); }
-.code-dock.overlay { position: fixed; inset: 0; z-index: 200; box-shadow: var(--shadow-lg, 0 0 40px #000a); }
+.code-dock.overlay { position: fixed; inset: 0; z-index: 200; box-shadow: var(--shadow-lg, 0 0 40px #000a); padding-top: env(safe-area-inset-top); padding-bottom: env(safe-area-inset-bottom); }
 .code-dock-resize { position: absolute; top: 0; bottom: 0; left: -3px; width: 7px; cursor: col-resize; z-index: 3; }
 .main-body.dock-left .code-dock-resize { left: auto; right: -3px; }
 .code-dock-resize:hover { background: color-mix(in srgb, var(--accent) 40%, transparent); }

@@ -29,7 +29,9 @@ func (s *Server) SetOpenCodeVersion(fn func(context.Context) (installed, running
 // streaming its output to w, and must NOT restart OpenCode — restart is a
 // separate, explicit user action so the operator can confirm the new version and
 // choose when to interrupt running sessions.
-func (s *Server) SetUpdateOpenCode(fn func(ctx context.Context, w io.Writer) error) { s.ocUpdateFn = fn }
+func (s *Server) SetUpdateOpenCode(fn func(ctx context.Context, w io.Writer) error) {
+	s.ocUpdateFn = fn
+}
 
 // GET /vh/opencode-version — installed vs running vs latest OpenCode version.
 func (s *Server) handleOpenCodeVersion(w http.ResponseWriter, r *http.Request) {

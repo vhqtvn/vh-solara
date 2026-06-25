@@ -125,6 +125,28 @@ model modelled on editor workspace trust:
   on discovery for single-operator setups, with the same loud startup warning as
   an insecure bind. Use only on hosts you fully control.
 
+## Trust boundaries (single authenticated operator)
+
+vh-solara is a **single-trusted-user daemon**: anyone who passes auth is treated
+as the operator who runs it, with the same reach as a shell on the host. Two
+capabilities follow from that by design — call them out so they aren't mistaken
+for bugs:
+
+- **`?dir=` is the operator's whole filesystem.** Code-view and git endpoints
+  act on the directory in `?dir=`/`x-opencode-directory`. Paths are confined
+  *within* that directory (`safeJoin` rejects `..` traversal and symlinks that
+  escape it — covered by tests), but the directory itself is operator-chosen, so
+  an authenticated caller can read files and run git in any repo on the host.
+  This matches what the `/oc` passthrough + its shell already allow. If the auth
+  secret is shared or leaks, this is the blast radius — don't share it.
+- **Embedded views proxy operator-registered upstreams.** A registered view
+  reverse-proxies an arbitrary `unix:`/`http(s)://`/`tcp:` upstream. The proxy
+  strips the vh-solara session cookie, drops the upstream's `Set-Cookie`, bounds
+  the buffered HTML, and **blocks link-local dials (169.254/16, `fe80::/10`) so
+  the cloud-metadata endpoint can't be reached**. It deliberately does *not*
+  restrict loopback/LAN targets — proxying a board on `localhost`/the LAN is the
+  feature. Treat the registration endpoint as operator-only.
+
 ## Reporting a vulnerability
 
 Please report security issues privately via GitHub's **"Report a vulnerability"**

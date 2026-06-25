@@ -1,5 +1,6 @@
 import { createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { chooseModel, type ModelRef, pickerModels, recentModels, selectionFor } from "../models";
+import { modal } from "../lib/a11y";
 import Icon from "./Icon";
 
 function Badges(props: { m: ModelRef }) {
@@ -75,7 +76,7 @@ export default function ModelDialog(props: { sessionId: string; onClose: () => v
 
   return (
     <div class="dialog-overlay" onClick={props.onClose}>
-      <div class="dialog" role="dialog" aria-label="Select model" onClick={(e) => e.stopPropagation()}>
+      <div class="dialog" role="dialog" aria-label="Select model" use:modal onClick={(e) => e.stopPropagation()}>
         <div class="dialog-head">
           <input
             class="dialog-search"

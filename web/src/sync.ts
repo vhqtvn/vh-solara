@@ -15,7 +15,7 @@ import {
   upsertPart,
 } from "./lib/reduce";
 import { pushNotification, markRead } from "./notify";
-import { handleNotice, attendingNow } from "./alerts";
+import { handleNotice, attendingNow, bindAlertsContext } from "./alerts";
 import { checkVersionNow } from "./pwa";
 import { log } from "./lib/log";
 import { setView } from "./ui";
@@ -404,6 +404,14 @@ export function rootOf(id: string): string {
   return cur;
 }
 
+// Inject the session-store accessors alerts needs (instead of alerts importing
+// from sync — that was a cycle). Bound at load, before any heartbeat/notice runs.
+bindAlertsContext({
+  selectedId,
+  rootOf,
+  sessionTitle: (id) => state.sessions[id]?.title,
+});
+
 // Per-root "was its subtree working" memory, used to ping exactly once when a
 // root task fully completes (root + all its subagents idle). Subsession-level
 // completions never ping — only the root does.
@@ -750,54 +758,6 @@ export async function respondPermission(sessionID: string, permissionID: string,
 // prompt). We de-slugify it into a readable title; the caller confirms/edits it
 // before applying. Returns null on failure (caller surfaces it). Unlike
 // OpenCode's built-in auto-title, this works on any session — multi-turn or not.
-function deslugify(s: string): string {
-  const t = s.replace(/[-_]+/g, " ").trim();
-  return t ? t.charAt(0).toUpperCase() + t.slice(1) : t;
-}
-
-export async function suggestTitle(sessionID: string): Promise<string | null> {
-  const sess = state.sessions[sessionID];
-  const projectID = sess?.projectID;
-  if (!projectID) {
-    log.warn("title", "no projectID for session; cannot generate name", { sessionID });
-    return null;
-  }
-  // Build context from the conversation (the first user message is the task,
-  // but include more so multi-turn sessions name from the whole thread).
-  let context = "";
-  try {
-    const r = await fetch(`/oc/session/${encodeURIComponent(sessionID)}/message`);
-    if (r.ok) {
-      const msgs = (await r.json()) as Array<{ info?: { role?: string }; parts?: Array<{ type?: string; text?: string }> }>;
-      const lines: string[] = [];
-      for (const m of msgs) {
-        for (const p of m.parts || []) {
-          if (p.type === "text" && p.text) lines.push(`${m.info?.role || "?"}: ${p.text}`);
-        }
-      }
-      context = lines.join("\n").slice(0, 2000);
-    }
-  } catch (e) {
-    log.warn("title", "context fetch failed", e);
-  }
-  log.debug("title", "generate-name", { sessionID, projectID, contextLen: context.length });
-  const res = await fetch(
-    `/oc/experimental/project/${encodeURIComponent(projectID)}/copy/generate-name`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ context }),
-    },
-  );
-  if (!res.ok) {
-    log.error("title", "generate-name failed", { status: res.status });
-    return null;
-  }
-  const data = (await res.json().catch(() => null)) as { name?: string } | null;
-  const name = data?.name?.trim();
-  return name ? deslugify(name) : null;
-}
-
 export async function respondQuestion(questionID: string, answers: string[][]) {
   log.debug("question", "reply", { questionID, answers });
   const res = await fetch(`/oc/question/${encodeURIComponent(questionID)}/reply`, {

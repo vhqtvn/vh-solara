@@ -1,5 +1,5 @@
 import { createSignal, For, onMount, Show } from "solid-js";
-import { addTodo, loadNotes, notesDoc, removeTodo, setNotes, toggleTodo } from "../notes";
+import { addTodo, loadNotes, notesDoc, removeTodo, saveState, setNotes, toggleTodo } from "../notes";
 import Icon from "./Icon";
 
 // Project-level notes + todos, persisted on the daemon so they sync across
@@ -72,7 +72,9 @@ export default function NotesView() {
         <section class="notes-section">
           <div class="notes-head">
             <h2>Notes</h2>
-            <span class="notes-saved">Saved on server</span>
+            <span class="notes-saved" classList={{ error: saveState() === "error" }}>
+              {saveState() === "saving" ? "Saving…" : saveState() === "error" ? "Save failed — retries on edit" : "Saved on server"}
+            </span>
           </div>
           <textarea
             class="notes-text"

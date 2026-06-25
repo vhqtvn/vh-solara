@@ -112,7 +112,7 @@ type watcher struct {
 	dir    string
 	store  *state.Store
 
-	baseline uint64        // snapshot head seq; only events past this may FIRE
+	baseline uint64 // snapshot head seq; only events past this may FIRE
 	now      func() time.Time
 	deliver  func(Notice) // delivery sink (swapped in tests)
 
