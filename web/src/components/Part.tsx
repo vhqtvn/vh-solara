@@ -252,16 +252,55 @@ function Markdown(props: { text: string; settled: boolean; caret?: boolean }) {
   // settled → false → cheap raw fallback (no per-block client parse on load).
   const live = !props.settled;
   // Seed synchronously so a (re)mount shows formatted content immediately rather
-  // than an empty frame; the debounced effect keeps it current as tokens arrive.
+  // than an empty frame; the reveal/debounce below keeps it current as tokens arrive.
   const [streamHtml, setStreamHtml] = createSignal(!props.settled && streamLive() ? renderStreamMd(props.text) : "");
-  let timer: number | undefined;
-  createEffect(() => {
-    const text = props.text;
-    if (props.settled || !streamLive()) return;
-    clearTimeout(timer);
-    timer = window.setTimeout(() => setStreamHtml(renderStreamMd(text)), 70);
-  });
-  onCleanup(() => clearTimeout(timer));
+  const smooth =
+    !props.settled && streamLive() &&
+    !(typeof window !== "undefined" && window.matchMedia?.("(prefers-reduced-motion: reduce)").matches);
+  if (smooth) {
+    // Smooth "typewriter" reveal: advance a shown-prefix toward the full
+    // accumulated text instead of popping in whole blocks as each (possibly
+    // large) network chunk flushes. The pace SELF-MATCHES the arrival rate via a
+    // first-order lag filter — each step reveals a fraction (dt/TAU) of the
+    // current backlog, so reveal-rate ≈ arrival-rate in steady state (≈TAU lag):
+    // a fast/bursty stream catches up quickly, a slow trickle reveals slowly, and
+    // it idles the moment it's caught up. Decoupled from chunk size.
+    const TAU = 110; // ms — reveal lag / smoothing time constant
+    let shown = props.text.length; // text already present (mount / session switch) shows at once
+    let raf: number | undefined;
+    let lastT = 0;
+    const tick = (t: number) => {
+      raf = undefined;
+      const target = props.text;
+      const backlog = target.length - shown;
+      if (backlog <= 0) { lastT = 0; return; } // caught up — idle until the effect reschedules
+      if (!lastT || t - lastT >= 22) {         // cap parse work at ~45fps
+        const dt = lastT ? Math.min(120, t - lastT) : 22; // clamp (e.g. after a hidden tab)
+        lastT = t;
+        const step = Math.max(1, Math.ceil(backlog * Math.min(1, dt / TAU)));
+        shown = Math.min(target.length, shown + step);
+        setStreamHtml(renderStreamMd(target.slice(0, shown)));
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    createEffect(() => {
+      const target = props.text; // re-run as deltas arrive
+      if (props.settled) return;
+      if (shown > target.length) shown = target.length; // defensive: text replaced/shrank
+      if (shown < target.length && raf === undefined) raf = requestAnimationFrame(tick);
+    });
+    onCleanup(() => { if (raf !== undefined) cancelAnimationFrame(raf); });
+  } else {
+    // Reduced-motion (or non-live): render the full accumulated text on change.
+    let timer: number | undefined;
+    createEffect(() => {
+      const text = props.text;
+      if (props.settled || !streamLive()) return;
+      clearTimeout(timer);
+      timer = window.setTimeout(() => setStreamHtml(renderStreamMd(text)), 70);
+    });
+    onCleanup(() => clearTimeout(timer));
+  }
   const streamingView = () => {
     if (!streamLive()) return <></>;
     let host: HTMLDivElement | undefined;
