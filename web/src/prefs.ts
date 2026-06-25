@@ -144,6 +144,20 @@ export function setChatBubbles(on: boolean) {
 }
 export { chatBubbles };
 
+// View-tab display style in the header. "labels" (text, the default) and "icons"
+// both use priority+ overflow (surplus tabs collapse into a ⋯ menu); "dropdown"
+// is a single compact selector that scales to any number of views.
+export type TabStyle = "labels" | "icons" | "dropdown";
+const TABSTYLE_KEY = "vh.prefs.tabStyle.v1";
+const [tabStyle, setTabStyleSig] = createSignal<TabStyle>(
+  loadVersioned<TabStyle>(TABSTYLE_KEY, 1, "labels", (o) => (o === "icons" || o === "dropdown" ? o : "labels")),
+);
+export function setTabStyle(v: TabStyle) {
+  setTabStyleSig(v);
+  saveVersioned(TABSTYLE_KEY, 1, v);
+}
+export { tabStyle };
+
 // Code view: syntax-highlight style (chroma style name; "" = follow the app
 // theme via the shared sheet) and soft-wrap toggle. Persisted.
 const CODE_STYLE_KEY = "vh.prefs.codeStyle.v1";

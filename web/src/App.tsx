@@ -1,8 +1,9 @@
-import { createEffect, createSignal, For, on, onCleanup, onMount, Show } from "solid-js";
+import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show } from "solid-js";
 import Sidebar from "./components/Sidebar";
 import ChatView from "./components/ChatView";
 import GitView from "./components/GitView";
 import CodeView from "./components/CodeView";
+import TabBar, { type TabItem } from "./components/TabBar";
 import NotesView from "./components/NotesView";
 import SettingsDialog from "./components/SettingsDialog";
 import FileViewer from "./components/FileViewer";
@@ -38,6 +39,19 @@ export default function App() {
   const [navOpen, setNavOpen] = createSignal(false);
   const [inspectorOpen, setInspectorOpen] = createSignal(false);
   const [managedOpen, setManagedOpen] = createSignal(false);
+
+  // View tabs for the header switcher (built-ins + any embedded views). Icons
+  // are best-effort (the icon style shows them with a tooltip).
+  const tabItems = createMemo<TabItem[]>(() => {
+    const items: TabItem[] = [
+      { key: "chat", label: "Chat", icon: "send" },
+      { key: "changes", label: "Changes", icon: "fork" },
+      { key: "code", label: "Code", icon: "terminal" },
+    ];
+    if (notesVisible()) items.push({ key: "notes", label: "Notes", icon: "clipboard" });
+    for (const v of views()) items.push({ key: VIEW_PREFIX + v.view_id, label: v.title, icon: "layers" });
+    return items;
+  });
 
   // Global hotkeys: Cmd/Ctrl+K → command palette; Ctrl+` → terminal.
   const onGlobalKey = (e: KeyboardEvent) => {
@@ -195,34 +209,7 @@ export default function App() {
               {selected()!.title || selectedId()}
             </span>
           </Show>
-          <div class="seg">
-            <button type="button" classList={{ on: view() === "chat" }} onClick={() => setView("chat")}>
-              Chat
-            </button>
-            <button type="button" classList={{ on: view() === "changes" }} onClick={() => setView("changes")}>
-              Changes
-            </button>
-            <button type="button" classList={{ on: view() === "code" }} onClick={() => setView("code")}>
-              Code
-            </button>
-            <Show when={notesVisible()}>
-              <button type="button" classList={{ on: view() === "notes" }} onClick={() => setView("notes")}>
-                Notes
-              </button>
-            </Show>
-            <For each={views()}>
-              {(v) => (
-                <button
-                  type="button"
-                  classList={{ on: view() === VIEW_PREFIX + v.view_id }}
-                  onClick={() => setView(VIEW_PREFIX + v.view_id)}
-                  title={v.title}
-                >
-                  {v.title}
-                </button>
-              )}
-            </For>
-          </div>
+          <TabBar items={tabItems} active={view} onSelect={setView} />
           <Show when={selectedId()}>
             <HeaderUsage sessionId={selectedId()!} onInspect={() => setInspectorOpen(true)} />
           </Show>

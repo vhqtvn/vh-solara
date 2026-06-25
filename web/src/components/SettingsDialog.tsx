@@ -3,7 +3,7 @@ import { CUSTOM_FIELDS, customTheme, exportCustomTheme, importCustomTheme, reset
 import ThemePicker from "./ThemePicker";
 import { customFont, font, FONTS, setCustomFont, setFontId } from "../font";
 import { hideBuiltin, setHideBuiltin } from "../models";
-import { setStreamLive, streamLive, treeDensity, setTreeDensity, uiScale, setUiScale, orientation, setOrientation, MIN_SCALE, MAX_SCALE, chatWidth, setChatWidth, chatBubbles, setChatBubbles, notesEnabled, setNotesEnabled, type ChatWidth } from "../prefs";
+import { setStreamLive, streamLive, treeDensity, setTreeDensity, uiScale, setUiScale, orientation, setOrientation, MIN_SCALE, MAX_SCALE, chatWidth, setChatWidth, chatBubbles, setChatBubbles, notesEnabled, setNotesEnabled, tabStyle, setTabStyle, type ChatWidth, type TabStyle } from "../prefs";
 import { queueMode, setQueueMode } from "../queue";
 import { canInstall, installed, isIosSafari, promptInstall } from "../pwa-install";
 import { killTerm, listTerms } from "../termApi";
@@ -158,6 +158,24 @@ export default function SettingsDialog(props: { onClose: () => void }) {
             </Show>
 
             <Show when={sec() === "appearance"}>
+              <div class="setting-row">
+                <label>Header tabs</label>
+                <Select
+                  class="theme-select"
+                  ariaLabel="Header tab style"
+                  value={tabStyle()}
+                  options={[
+                    { value: "labels", label: "Labels" },
+                    { value: "icons", label: "Icons" },
+                    { value: "dropdown", label: "Dropdown" },
+                  ]}
+                  onChange={(v) => setTabStyle(v as TabStyle)}
+                />
+              </div>
+              <p class="setting-hint">
+                How the Chat/Changes/Code/… view tabs render. Labels &amp; Icons collapse extras into a
+                “⋯” menu when they don’t fit; Dropdown is a single compact selector.
+              </p>
               <div class="setting-row">
                 <label>Chat width</label>
                 <Select
