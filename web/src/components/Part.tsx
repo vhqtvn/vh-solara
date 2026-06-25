@@ -7,7 +7,7 @@ import { renderMathIn } from "../lib/math";
 import { streamLive } from "../prefs";
 import { openSession, projectDir, setSelectedId } from "../sync";
 import { openFileAt } from "../codeFrame";
-import { openFile } from "../files";
+import { looksLikePath } from "../lib/pathlike";
 import type { Part } from "../types";
 import Icon from "./Icon";
 import Spinner from "./Spinner";
@@ -97,6 +97,16 @@ function linkifyPaths(root: HTMLElement | undefined) {
   }
 }
 
+// Tag path-like inline code (`src/foo.ts`) so it can show a go-to affordance
+// while a modifier is held (see the .mod-down rule); ctrl/cmd-click opens it.
+function tagInlineCodePaths(root: HTMLElement | undefined) {
+  if (!root) return;
+  root.querySelectorAll("code").forEach((c) => {
+    if (c.closest("pre") || c.classList.contains("code-pathlike")) return;
+    if (looksLikePath(c.textContent || "")) c.classList.add("code-pathlike");
+  });
+}
+
 // Inject a copy button into each server-rendered code block (innerHTML, so we
 // enhance the DOM rather than the markup).
 function addCodeCopyButtons(root: HTMLElement | undefined) {
@@ -153,11 +163,26 @@ function MarkdownHtml(props: { text: string; live?: boolean }) {
         renderMathIn(ref); // LaTeX → MathML before linkifying (skips code/links)
         addCodeCopyButtons(ref);
         linkifyPaths(ref);
+        tagInlineCodePaths(ref);
       });
   });
   const onClick = (e: MouseEvent) => {
-    const t = (e.target as HTMLElement).closest(".filepath") as HTMLElement | null;
-    if (t?.dataset.path) openFile(t.dataset.path, t.dataset.line ? Number(t.dataset.line) : undefined);
+    const tgt = e.target as HTMLElement;
+    // Ctrl/Cmd-click a path-like inline code span (`src/foo.ts`) opens it — like
+    // an editor's go-to. (Linkified .filepath spans, below, open on a plain click.)
+    if (e.metaKey || e.ctrlKey) {
+      const codeEl = tgt.closest("code") as HTMLElement | null;
+      if (codeEl && !codeEl.closest("pre")) {
+        const txt = (codeEl.textContent || "").trim();
+        if (looksLikePath(txt)) {
+          e.preventDefault();
+          openFileAt(txt);
+          return;
+        }
+      }
+    }
+    const t = tgt.closest(".filepath") as HTMLElement | null;
+    if (t?.dataset.path) openFileAt(t.dataset.path, t.dataset.line ? Number(t.dataset.line) : undefined);
   };
   return (
     <Show

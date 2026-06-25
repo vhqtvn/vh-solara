@@ -255,8 +255,10 @@ func (s *Server) handleCodeFile(w http.ResponseWriter, r *http.Request) {
 	isMd := ext == ".md" || ext == ".markdown"
 
 	if r.URL.Query().Get("view") == "rendered" && isMd {
+		// isMarkdown stays true on the rendered response too, so the viewer's
+		// Raw/Rendered toggle persists (lets the user switch back to source).
 		writeJSON(w, http.StatusOK, jsonBytes(map[string]any{
-			"kind": "markdown", "path": rel, "html": s.renderer.Markdown(src), "lang": lang, "lines": lines,
+			"kind": "markdown", "path": rel, "html": s.renderer.Markdown(src), "lang": lang, "lines": lines, "isMarkdown": true,
 		}))
 		return
 	}
@@ -376,6 +378,83 @@ func (s *Server) handleCodeSearch(w http.ResponseWriter, r *http.Request) {
 		hits = append(hits, searchHit{Path: filepath.ToSlash(a[0]), Line: ln, Text: text})
 	}
 	writeJSON(w, http.StatusOK, jsonBytes(map[string]any{"hits": hits, "capped": len(hits) >= limit}))
+}
+
+// GET /vh/code/resolve?path=<p> — resolve a loose/partial path (clicked or
+// selected in chat) to actual project file(s). Tries the literal path (relative
+// to root, or an absolute path that lands inside the project); if that misses
+// and the path is relative, falls back to a suffix match against the repo's
+// files (tracked + untracked, gitignore-respecting). Returns the matches.
+func (s *Server) handleCodeResolve(w http.ResponseWriter, r *http.Request) {
+	dir, ok := codeDir(r)
+	if !ok {
+		http.Error(w, "open a project directory", http.StatusBadRequest)
+		return
+	}
+	p := strings.TrimSpace(r.URL.Query().Get("path"))
+	// Defensive: strip a trailing :line[:col] the client didn't (digits only).
+	for {
+		i := strings.LastIndexByte(p, ':')
+		if i <= 0 || !isAllDigits(p[i+1:]) {
+			break
+		}
+		p = p[:i]
+	}
+	writeJSON(w, http.StatusOK, jsonBytes(map[string]any{"matches": resolvePath(r.Context(), dir, p)}))
+}
+
+func isAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// resolvePath maps a loose path to project-relative file(s). Order: an absolute
+// path inside the project (relativized), then the literal path relative to root,
+// then a suffix match (a/b/c.txt also matches x/a/b/c.txt) over the repo's files.
+func resolvePath(ctx context.Context, dir, p string) []string {
+	p = strings.TrimPrefix(filepath.ToSlash(strings.TrimSpace(p)), "./")
+	if p == "" {
+		return []string{}
+	}
+	cand := p
+	if filepath.IsAbs(p) {
+		if rel, err := filepath.Rel(dir, p); err == nil && !strings.HasPrefix(rel, "..") {
+			cand = filepath.ToSlash(rel)
+		}
+	}
+	// Literal hit (relative to root, traversal/symlink-confined).
+	if abs, ok := safeJoin(dir, cand); ok {
+		if st, err := os.Stat(abs); err == nil && !st.IsDir() {
+			return []string{cand}
+		}
+	}
+	// Suffix match across the repo's files (cached + untracked, gitignore-aware).
+	out, err := runGit(ctx, dir, "ls-files", "--cached", "--others", "--exclude-standard", "-z")
+	if err != nil {
+		return []string{}
+	}
+	base := filepath.ToSlash(cand)
+	matches := []string{}
+	for _, f := range strings.Split(out, "\x00") {
+		f = filepath.ToSlash(f)
+		if f == "" {
+			continue
+		}
+		if f == base || strings.HasSuffix(f, "/"+base) {
+			matches = append(matches, f)
+			if len(matches) >= 50 {
+				break
+			}
+		}
+	}
+	return matches
 }
 
 // GET /vh/code/styles — available chroma highlight styles (for the picker).

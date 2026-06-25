@@ -8,7 +8,7 @@ import TabBar, { type TabItem } from "./components/TabBar";
 import { codeShowing, installCodeFrameHost, postCodeTheme, toggleCodeDock } from "./codeFrame";
 import NotesView from "./components/NotesView";
 import SettingsDialog from "./components/SettingsDialog";
-import FileViewer from "./components/FileViewer";
+import PathSelectionAction from "./components/PathSelectionAction";
 import EmptyState from "./components/EmptyState";
 import NotificationCenter from "./components/NotificationCenter";
 import HeaderUsage from "./components/HeaderUsage";
@@ -85,8 +85,15 @@ export default function App() {
     const d = e.data as { source?: string; type?: string } | null;
     if (d?.source === "vh-solara" && d.type === "theme-request") postThemeTo(e.source as Window);
   };
+  // Reflect a held Ctrl/Cmd on the root so path-like inline code shows its
+  // ctrl-click go-to affordance (see .mod-down in styles.css).
+  const syncMod = (e: KeyboardEvent) => document.documentElement.classList.toggle("mod-down", e.ctrlKey || e.metaKey);
+  const clearMod = () => document.documentElement.classList.remove("mod-down");
   onMount(() => {
     document.addEventListener("keydown", onGlobalKey);
+    document.addEventListener("keydown", syncMod);
+    document.addEventListener("keyup", syncMod);
+    window.addEventListener("blur", clearMod);
     document.addEventListener("contextmenu", onContextMenu);
     window.addEventListener("message", onThemeRequest);
     installCodeFrameHost();
@@ -97,6 +104,9 @@ export default function App() {
   });
   onCleanup(() => {
     document.removeEventListener("keydown", onGlobalKey);
+    document.removeEventListener("keydown", syncMod);
+    document.removeEventListener("keyup", syncMod);
+    window.removeEventListener("blur", clearMod);
     document.removeEventListener("contextmenu", onContextMenu);
     window.removeEventListener("message", onThemeRequest);
     clearInterval(viewsPoll);
@@ -323,7 +333,7 @@ export default function App() {
       <Show when={inspectorOpen() && selectedId()}>
         <SessionInspector sessionId={selectedId()!} onClose={() => setInspectorOpen(false)} />
       </Show>
-      <FileViewer />
+      <PathSelectionAction />
       <SessionContextMenu />
       <Tooltip />
       <UpdateToast />

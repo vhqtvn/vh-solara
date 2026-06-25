@@ -301,6 +301,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/vh/code/file", s.handleCodeFile)
 	mux.HandleFunc("/vh/code/raw", s.handleCodeRaw)
 	mux.HandleFunc("/vh/code/search", s.handleCodeSearch)
+	mux.HandleFunc("/vh/code/resolve", s.handleCodeResolve)
 	mux.HandleFunc("/vh/code/status", s.handleCodeStatus)
 	mux.HandleFunc("/vh/code/styles", s.handleCodeStyles)
 	mux.HandleFunc("/vh/code/langs", s.handleCodeLangs)

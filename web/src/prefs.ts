@@ -182,6 +182,18 @@ export function setCodeFlatten(on: boolean) {
 }
 export { codeFlatten };
 
+// Code viewer: show the files sidebar (the tree column). Toggle to give the open
+// file the full width on desktop. Visible by default.
+const CODE_SIDEBAR_KEY = "vh.prefs.codeSidebarOpen.v1";
+const [codeSidebarOpen, setCodeSidebarOpenSig] = createSignal<boolean>(
+  loadVersioned<boolean>(CODE_SIDEBAR_KEY, 1, true, (o) => !(o === false || o === 0 || o === "0")),
+);
+export function setCodeSidebarOpen(on: boolean) {
+  setCodeSidebarOpenSig(on);
+  saveVersioned(CODE_SIDEBAR_KEY, 1, on);
+}
+export { codeSidebarOpen };
+
 // Code sidebar: show the search box. Toggled from the tree's filter menu so the
 // sidebar can be all-tree when search isn't needed. Visible by default.
 const CODE_SHOW_SEARCH_KEY = "vh.prefs.codeShowSearch.v1";

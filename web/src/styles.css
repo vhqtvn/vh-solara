@@ -3428,11 +3428,16 @@ div.katex-math { display: block; overflow-x: auto; margin: 0.7em 0; text-align: 
 .code-md { padding: 16px 20px; max-width: 860px; }
 /* chroma table output fills the pane; monospace + line gutter. */
 .code-content { font-size: 12.5px; }
-.code-content .chroma { background: transparent; }
+/* Default (theme-following) mode: blend with the app — transparent code bg, app
+   var for the gutter. When a chroma STYLE is picked (.code-styled), DON'T impose
+   these, so the style's own background + foreground apply as a coherent pair;
+   otherwise a light style's dark text landed on the app's dark bg → unreadable. */
+.code-view:not(.code-styled) .code-content .chroma { background: transparent; }
+.code-view:not(.code-styled) .code-content .lnt { color: var(--fg-dim); opacity: 0.6; }
 .code-content .lntable { border-spacing: 0; width: 100%; }
 .code-content .lntd { vertical-align: top; padding: 0; }
 .code-content .lntd:first-child { width: 1%; white-space: nowrap; user-select: none; }
-.code-content .lnt { color: var(--fg-dim); opacity: 0.6; padding: 0 12px 0 14px; }
+.code-content .lnt { padding: 0 12px 0 14px; }
 .code-content pre { margin: 0; padding: 8px 0; background: transparent; border: 0; border-radius: 0; }
 .code-content .lntd:last-child pre { padding-left: 6px; }
 .code-pane.wrap .code-content .lntd:last-child pre { white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -3553,6 +3558,48 @@ div.katex-math { display: block; overflow-x: auto; margin: 0.7em 0; text-align: 
 .code-st.st-R { color: var(--accent); }              /* renamed */
 .code-tree-row.dir .code-st { font-size: 13px; }     /* the • rollup dot */
 .code-lang-select { font-size: 12px; min-width: 96px; }
+
+/* Files-sidebar toggle (desktop): collapse the tree to give the file full width.
+   Only collapses while a file is open — with no file the tree always shows, so
+   the user can never be stranded on an empty pane with no way back. */
+.code-sidebar-toggle { display: none; }
+@media (min-width: 761px) {
+  .code-sidebar-toggle { display: inline-flex; }
+  .code-view.has-file.sidebar-collapsed .code-sidebar { display: none; }
+}
+
+/* Multi-match resolve picker: when a clicked/selected path matches several files. */
+.code-picker {
+  width: min(560px, 92vw); max-height: 70vh; display: flex; flex-direction: column;
+  background: var(--bg-1, var(--bg)); border: 1px solid var(--border); border-radius: 12px;
+  box-shadow: var(--shadow-lg, 0 16px 48px #0008); overflow: hidden;
+}
+.code-picker-head { padding: 12px 14px; font-size: 13px; color: var(--fg-dim); border-bottom: 1px solid var(--border); }
+.code-picker-list { overflow: auto; padding: 6px; min-height: 0; }
+.code-picker-item {
+  display: flex; align-items: center; gap: 9px; width: 100%; text-align: left;
+  background: transparent; border: 0; color: var(--fg); cursor: pointer;
+  font: inherit; font-size: 13px; padding: 8px 10px; border-radius: 8px;
+}
+.code-picker-item:hover { background: var(--bg-2); }
+.code-picker-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, Menlo, monospace; }
+
+/* Floating "Open file" action shown above a path-like text selection. */
+.path-sel-action {
+  position: fixed; transform: translate(-50%, calc(-100% - 8px)); z-index: 300;
+  display: inline-flex; align-items: center; gap: 6px; white-space: nowrap;
+  padding: 6px 11px; font: inherit; font-size: 12px; font-weight: 600;
+  color: var(--accent-fg, #fff); background: var(--accent); border: 0; border-radius: 999px;
+  box-shadow: var(--shadow-lg, 0 6px 20px #0007); cursor: pointer;
+}
+.path-sel-action:active { transform: translate(-50%, calc(-100% - 8px)) scale(0.96); }
+
+/* Path-like inline code becomes a go-to link while Ctrl/Cmd is held. */
+.mod-down code.code-pathlike { cursor: pointer; text-decoration: underline dotted; text-underline-offset: 2px; }
+.mod-down code.code-pathlike:hover { color: var(--accent); }
+
+/* Keep the iframe from swallowing pointer events mid-resize (drag stayed smooth). */
+.code-dock.resizing .code-frame { pointer-events: none; }
 
 /* Open-file tabs (read-only, VS Code style). Horizontal strip above the toolbar. */
 .code-tabs {

@@ -102,6 +102,13 @@ const PATHS: Record<string, () => JSX.Element> = {
       <path d="M15 4v16" />
     </>
   ),
+  // Window with a left panel — toggle the files sidebar in the code viewer.
+  sidebar: () => (
+    <>
+      <rect x="3" y="4" width="18" height="16" rx="2" />
+      <path d="M9 4v16" />
+    </>
+  ),
   // Alert triangle — error notifications.
   alert: () => (
     <>

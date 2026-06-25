@@ -71,6 +71,19 @@ export async function codeLangs(): Promise<string[]> {
   }
 }
 
+// Resolve a loose/partial path (clicked or selected in chat) to project file(s):
+// literal hit, else suffix match. 0 = not found, 1 = open it, >1 = let the user pick.
+export async function codeResolve(path: string): Promise<string[]> {
+  if (!path.trim()) return [];
+  try {
+    const r = await fetch(`/vh/code/resolve?${D()}&path=${encodeURIComponent(path)}`);
+    if (!r.ok) return [];
+    return (await r.json()).matches ?? [];
+  } catch {
+    return [];
+  }
+}
+
 export const codeRawUrl = (path: string) => `/vh/code/raw?${D()}&path=${encodeURIComponent(path)}`;
 
 export async function codeSearch(q: string, path = ""): Promise<{ hits: CodeHit[]; capped?: boolean }> {

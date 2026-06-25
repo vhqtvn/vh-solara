@@ -2,6 +2,7 @@ package render
 
 import (
 	"bytes"
+	"fmt"
 	"sort"
 
 	chroma "github.com/alecthomas/chroma/v2"
@@ -81,15 +82,33 @@ func LangNames() []string {
 // scope so picking a style only re-themes the code view (the global sheet still
 // covers code blocks elsewhere). Returns "" for an unknown style.
 func (r *Renderer) StyleCSS(name, scope string) (string, error) {
-	if styles.Get(name) == nil {
+	style := styles.Get(name)
+	if style == nil {
 		return "", nil
 	}
 	css, err := styleCSS(name)
 	if err != nil {
 		return "", err
 	}
-	if scope == "" {
-		return css, nil
+	if scope != "" {
+		css = scopeCSS(css, scope)
 	}
-	return scopeCSS(css, scope), nil
+	// Guarantee readable untokenized text. Some styles (e.g. github) set only a
+	// background on .chroma and no base text colour, so plain code would inherit
+	// the host page's foreground — light-on-light when a light style sits in our
+	// dark app. Pin the style's own text colour, or derive one from the
+	// background's brightness, as an explicit base.
+	bg := style.Get(chroma.Background)
+	base := "#e6e6e6"
+	if bg.Colour.IsSet() {
+		base = bg.Colour.String()
+	} else if bg.Background.IsSet() && bg.Background.Brightness() > 0.5 {
+		base = "#1a1a1a"
+	}
+	sel := ".chroma"
+	if scope != "" {
+		sel = scope + " .chroma"
+	}
+	css += fmt.Sprintf("\n%s { color: %s; }\n", sel, base)
+	return css, nil
 }

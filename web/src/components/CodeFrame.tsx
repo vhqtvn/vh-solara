@@ -40,9 +40,16 @@ export default function CodeFrame() {
     if (view() === "code") setView("chat");
   };
 
-  // Drag-to-resize the dock from its inner edge.
+  // Drag-to-resize the dock from its inner edge. The iframe would otherwise
+  // swallow pointermove the moment the cursor crossed into it (so the drag
+  // updated only in fits when over the thin handle) — capture the pointer on the
+  // handle and disable iframe hit-testing for the gesture so moves keep flowing.
+  const [resizing, setResizing] = createSignal(false);
   const startResize = (e: PointerEvent) => {
     e.preventDefault();
+    const handle = e.currentTarget as HTMLElement;
+    handle.setPointerCapture?.(e.pointerId);
+    setResizing(true);
     const startX = e.clientX;
     const startW = codeDockWidth();
     const move = (ev: PointerEvent) => {
@@ -50,19 +57,21 @@ export default function CodeFrame() {
       const dx = codeDockSide() === "right" ? startX - ev.clientX : ev.clientX - startX;
       setCodeDockWidth(startW + dx);
     };
-    const up = () => {
-      window.removeEventListener("pointermove", move);
-      window.removeEventListener("pointerup", up);
+    const up = (ev: PointerEvent) => {
+      handle.releasePointerCapture?.(ev.pointerId);
+      handle.removeEventListener("pointermove", move);
+      handle.removeEventListener("pointerup", up);
+      setResizing(false);
     };
-    window.addEventListener("pointermove", move);
-    window.addEventListener("pointerup", up);
+    handle.addEventListener("pointermove", move);
+    handle.addEventListener("pointerup", up);
   };
 
   return (
     <Show when={mounted()}>
       <div
         class="code-dock"
-        classList={{ full: mode() === "full", dock: mode() === "dock", overlay: mode() === "overlay", hidden: mode() === "hidden" }}
+        classList={{ full: mode() === "full", dock: mode() === "dock", overlay: mode() === "overlay", hidden: mode() === "hidden", resizing: resizing() }}
         style={mode() === "dock" ? { "flex-basis": `${codeDockWidth()}px` } : undefined}
       >
         <Show when={mode() === "dock"}>

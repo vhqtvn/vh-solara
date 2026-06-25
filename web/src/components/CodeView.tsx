@@ -1,8 +1,8 @@
 import { createEffect, createMemo, createResource, createSignal, For, Match, onCleanup, Show, Switch } from "solid-js";
 import { projectDir } from "../sync";
 import { codeFile, codeLangs, codeRawUrl, codeSearch, codeStatus, codeStyles, codeTree, type CodeEntry, type CodeFile, type CodeHit } from "../codeApi";
-import { codeOpenPath, setCodeOpenPath, codeOpenLine, setCodeOpenLine, codeTabs, addCodeTab, closeCodeTab } from "../code";
-import { codeStyle, setCodeStyle, codeWrap, setCodeWrap, codeShowIgnored, setCodeShowIgnored, codeFlatten, setCodeFlatten, codeShowSearch, setCodeShowSearch } from "../prefs";
+import { codeOpenPath, setCodeOpenPath, codeOpenLine, setCodeOpenLine, codeTabs, addCodeTab, closeCodeTab, resolvePicker, setResolvePicker, openResolved } from "../code";
+import { codeStyle, setCodeStyle, codeWrap, setCodeWrap, codeShowIgnored, setCodeShowIgnored, codeFlatten, setCodeFlatten, codeShowSearch, setCodeShowSearch, codeSidebarOpen, setCodeSidebarOpen } from "../prefs";
 import Icon from "./Icon";
 import Select from "./Select";
 import Spinner from "./Spinner";
@@ -15,6 +15,15 @@ function fileIcon(name: string): string {
   if (/\.(png|jpe?g|gif|webp|svg|ico|bmp|avif)$/i.test(name)) return "eye";
   if (/\.(md|markdown)$/i.test(name)) return "info";
   return "paperclip";
+}
+
+// chroma style ids ("github-dark", "abap") → a readable label ("Github Dark",
+// "Abap") for the picker — the raw id is what the user complained reads poorly.
+function prettyStyle(id: string): string {
+  return id
+    .split(/[-_]/)
+    .map((w) => (w ? w[0].toUpperCase() + w.slice(1) : w))
+    .join(" ");
 }
 
 // One tree node; children load lazily on first expand. Right-click / long-press
@@ -219,7 +228,10 @@ export default function CodeView() {
 
   return (
     <Show when={projectDir()} fallback={<div class="code-empty">Open a project (not the default) to browse its code.</div>}>
-      <div class="code-view code-hl" classList={{ "has-file": !!openPath() }}>
+      <div
+        class="code-view code-hl"
+        classList={{ "has-file": !!openPath(), "sidebar-collapsed": !codeSidebarOpen(), "code-styled": !!codeStyle() }}
+      >
         <aside class="code-sidebar">
           <div class="code-side-head">
             <span class="code-side-title">Files</span>
@@ -338,6 +350,16 @@ export default function CodeView() {
           <Show when={openPath()} fallback={<div class="code-empty">Select a file to view.</div>}>
             <div class="code-bar">
               <button type="button" class="code-back" aria-label="Files" onClick={() => setOpenPath("")}><Icon name="menu" size={15} /></button>
+              <button
+                type="button"
+                class="icon-btn code-sidebar-toggle"
+                classList={{ on: codeSidebarOpen() }}
+                aria-label="Toggle files sidebar"
+                data-tip={codeSidebarOpen() ? "Hide files" : "Show files"}
+                onClick={() => setCodeSidebarOpen(!codeSidebarOpen())}
+              >
+                <Icon name="sidebar" size={15} />
+              </button>
               <div class="code-breadcrumb">
                 <For each={segments()}>
                   {(seg, i) => (
@@ -372,7 +394,7 @@ export default function CodeView() {
                   class="code-style-select"
                   ariaLabel="Highlight style"
                   value={codeStyle()}
-                  options={[{ value: "", label: "Theme default" }, ...((styleList()?.styles ?? []).map((s) => ({ value: s, label: s })))]}
+                  options={[{ value: "", label: "Theme default" }, ...((styleList()?.styles ?? []).map((s) => ({ value: s, label: prettyStyle(s) })))]}
                   onChange={setCodeStyle}
                 />
               </div>
@@ -412,6 +434,25 @@ export default function CodeView() {
               <Show when={focusRoot()}>
                 <button type="button" onClick={() => { setFocusRoot(""); setCtxMenu(null); }}>Clear focus</button>
               </Show>
+            </div>
+          )}
+        </Show>
+        <Show when={resolvePicker()}>
+          {(pk) => (
+            <div class="dialog-overlay" onClick={() => setResolvePicker(null)}>
+              <div class="code-picker" role="dialog" aria-label="Choose file" onClick={(e) => e.stopPropagation()}>
+                <div class="code-picker-head">Multiple files match — choose one</div>
+                <div class="code-picker-list">
+                  <For each={pk().matches}>
+                    {(p) => (
+                      <button type="button" class="code-picker-item" title={p} onClick={() => { openResolved(p, pk().line); setResolvePicker(null); }}>
+                        <Icon name={fileIcon(p)} size={13} />
+                        <span class="code-picker-path">{p}</span>
+                      </button>
+                    )}
+                  </For>
+                </div>
+              </div>
             </div>
           )}
         </Show>
