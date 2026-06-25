@@ -33,11 +33,31 @@ describe("placeStreamCaret", () => {
     expect(c.parentElement?.textContent).toBe("b");
   });
 
-  it("descends into the <code> of a fenced block", () => {
+  it("trails AFTER text that follows an inline element (not inside it)", () => {
+    // The reported bug: a paragraph ending with text after an inline <code> put
+    // the caret inside the <code>, mid-line. It must land after the trailing text.
+    const root = render("<p>the <code>git-bypass</code> rule is set</p>");
+    const c = caret();
+    placeStreamCaret(root, c);
+    expect(c.parentElement?.tagName).toBe("P");
+    expect(root.querySelector("code")?.contains(c)).toBe(false);
+    expect(c.previousSibling?.textContent).toContain("rule is set");
+  });
+
+  it("does not descend into a trailing inline element", () => {
+    const root = render("<p>see <strong>bold</strong></p>");
+    const c = caret();
+    placeStreamCaret(root, c);
+    // After the <strong>, as the paragraph's last child — not inside it.
+    expect(c.parentElement?.tagName).toBe("P");
+    expect(c.previousElementSibling?.tagName).toBe("STRONG");
+  });
+
+  it("stops at the <pre> of a fenced block (code is inline-level)", () => {
     const root = render("<pre><code>x = 1</code></pre>");
     const c = caret();
     placeStreamCaret(root, c);
-    expect(c.parentElement?.tagName).toBe("CODE");
+    expect(c.parentElement?.tagName).toBe("PRE");
   });
 
   it("stops at the parent when the trailing element is void (image)", () => {
