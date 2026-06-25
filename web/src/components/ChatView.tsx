@@ -1058,11 +1058,6 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
               <div class="chat-empty">No messages in this session yet.</div>
             </Show>
           </Show>
-          <Show when={working()}>
-            <div class="working" role="status" aria-live="polite" aria-label="Assistant is working">
-              <span class="working-shimmer">Working…</span>
-            </div>
-          </Show>
         </div>
       </div>
         <Show when={isDesktop() && userTurns().length > 1}>
@@ -1153,7 +1148,18 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
         </div>
       </Show>
 
-      <Show when={todoCounts().left > 0}>
+      {/* Status row pinned above the composer (out of the scroll area, so it
+          never scrolls away): Working on the left, the Tasks pill on the right
+          when there are open tasks. */}
+      <Show when={working() || todoCounts().left > 0}>
+        <div class="chat-status">
+          <Show when={working()}>
+            <div class="working" role="status" aria-live="polite" aria-label="Assistant is working">
+              <span class="working-dots" aria-hidden="true"><i /><i /><i /></span>
+              <span class="working-shimmer">Working…</span>
+            </div>
+          </Show>
+          <Show when={todoCounts().left > 0}>
         <div class="tasks-bar" classList={{ open: todosOpen() }} ref={tasksBarEl}>
           <button type="button" class="tasks-pill" onClick={() => setTodosOpen((v) => !v)} aria-expanded={todosOpen()}>
             <span class="tasks-label">Tasks</span>
@@ -1184,6 +1190,8 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
                 </For>
               </ul>
             </div>
+          </Show>
+        </div>
           </Show>
         </div>
       </Show>
