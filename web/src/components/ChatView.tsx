@@ -1,4 +1,4 @@
-import { createEffect, createMemo, createSignal, For, Match, on, onCleanup, onMount, Show, Switch } from "solid-js";
+import { createEffect, createMemo, createSignal, For, Match, on, onCleanup, onMount, Show, Switch, untrack } from "solid-js";
 import { Portal } from "solid-js/web";
 import { ackSession, createSession, isSending, markSessionIdle, openSession, respondPermission, sessionTodoCounts, sessionTodos, sessionWorking, setSelectedId, setSending, state } from "../sync";
 import { getScroll, setScroll } from "../lib/scroll";
@@ -260,8 +260,16 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
 
   // In a draft, keep the model synced to the selected agent's configured model
   // so a new session starts on the agent's model (applies to "" = the default).
+  // Track only the inputs that should re-apply it (the draft flag, the selected
+  // agent, and the agent list finishing its load); run the apply UNTRACKED so its
+  // internal signal reads (notably pushRecent, which reads AND writes recentKeys)
+  // don't become dependencies — that read→write on a fresh array each run made
+  // the effect retrigger itself into a stack overflow.
   createEffect(() => {
-    if (props.draft) selectAgentForSession("", selectedAgent());
+    if (!props.draft) return;
+    const agent = selectedAgent();
+    agents(); // re-apply once the agent list (and its model) has loaded
+    untrack(() => selectAgentForSession("", agent));
   });
 
   const sm = () => state.messages[props.sessionId];
