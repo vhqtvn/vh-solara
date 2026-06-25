@@ -14,8 +14,10 @@ const status = (page: import("@playwright/test").Page) => procRow(page).locator(
 test("a repo-declared project is gated, then its processes run after approval", async ({ page }) => {
   await page.goto("/");
 
-  // The trust-review card auto-opens and shows the EXACT declared command before
-  // any of it runs (display-before-run).
+  // A project awaiting trust no longer auto-opens the panel (it fires a notice and
+  // warn-highlights the Project-processes button); open it to review. It then
+  // shows the EXACT declared command before any of it runs (display-before-run).
+  await page.getByRole("button", { name: "Project processes" }).click();
   const panel = page.locator(".managed-panel");
   await expect(panel).toBeVisible();
   await expect(panel.locator(".managed-trust")).toBeVisible();

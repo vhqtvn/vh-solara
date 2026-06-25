@@ -43,7 +43,9 @@ test("empty state invites a new session", async ({ page }) => {
 test("settings appearance has a configurable display font", async ({ page }) => {
   await page.goto("/");
   await page.getByRole("button", { name: "Settings" }).click();
-  const fontSel = page.getByLabel("Display font");
+  const dialog = page.getByRole("dialog", { name: "Settings" });
+  await dialog.getByRole("button", { name: "Appearance" }).click();
+  const fontSel = dialog.getByLabel("Display font");
   await expect(fontSel).toBeVisible();
   await fontSel.click(); // open the custom dropdown
   await page.getByRole("option", { name: "Inter" }).click();
@@ -60,7 +62,9 @@ test("session list detailed density adds a second line per session", async ({ pa
   // No second line in the default (compact) density.
   await expect(page.locator(".tree-sub")).toHaveCount(0);
   await page.getByRole("button", { name: "Settings" }).click();
-  const densSel = page.getByLabel("Session list density");
+  const dialog = page.getByRole("dialog", { name: "Settings" });
+  await dialog.getByRole("button", { name: "Appearance" }).click();
+  const densSel = dialog.getByLabel("Session list density");
   await densSel.click();
   await page.getByRole("option", { name: /Detailed/ }).click();
   // Close settings.
@@ -142,6 +146,7 @@ test("UI zoom scales the interface and persists (versioned)", async ({ page }) =
   await page.goto("/");
   await page.getByRole("button", { name: "Settings" }).click();
   const dialog = page.getByRole("dialog", { name: "Settings" });
+  await dialog.getByRole("button", { name: "Appearance" }).click();
   const slider = dialog.getByRole("slider", { name: "UI zoom" });
   await expect(slider).toBeVisible();
   await slider.evaluate((el: HTMLInputElement) => {
@@ -199,7 +204,11 @@ test("shell mode (! prefix) runs a command and shows output", async ({ page }) =
   await page.getByRole("button", { name: /Demo session/ }).click();
   await page.getByPlaceholder(/Message/).fill("!ls -la");
   await page.keyboard.press("Enter");
-  await expect(page.getByText(/fixture shell output for: ls -la/)).toBeVisible({ timeout: 8000 });
-  // The bash tool shows the actual command line, not just a description.
-  await expect(page.locator(".tool-cmd").last()).toHaveText(/\$ ls -la/);
+  // The command runs as a bash tool whose head shows the command line.
+  const shellTool = page.locator(".tool").filter({ hasText: "ls -la" }).last();
+  await expect(shellTool).toBeVisible({ timeout: 8000 });
+  // The captured output sits behind the tool's disclosure — expand if collapsed.
+  const output = shellTool.getByText(/fixture shell output for: ls -la/);
+  if (!(await output.isVisible())) await shellTool.locator(".tool-head").click();
+  await expect(output).toBeVisible({ timeout: 4000 });
 });

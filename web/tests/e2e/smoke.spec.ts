@@ -27,7 +27,9 @@ test("opening a session renders server-highlighted markdown and tool parts", asy
   await page.getByRole("button", { name: /Demo session/ }).click();
   // Daemon-rendered code block (chroma classes survive sanitization).
   await expect(page.locator(".md pre.chroma").first()).toBeVisible();
-  await expect(page.locator(".tool-name").first()).toContainText("edit");
+  // The first .tool-name is the reasoning part's "Thinking"; the edit tool
+  // renders with its friendly label "Edit File" — assert that one is present.
+  await expect(page.locator(".tool-name", { hasText: "Edit File" }).first()).toBeVisible();
   // LSP diagnostics from the edit are surfaced (severity-1 error, file:line:col).
   await expect(page.locator(".tool-diag")).toContainText("undefined: parse");
   await expect(page.locator(".tool-diag-loc")).toContainText("[2:9]");
