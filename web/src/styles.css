@@ -14,6 +14,24 @@
   --code-surface: #0b0f14;
   --sidebar-w: 280px;
 
+  /* Z-index scale. One ordered ladder for everything that overlaps globally, so
+     stacking is intentional instead of a pile of magic numbers. (Small, local
+     z-indexes inside a component's own stacking context — resize handles, sticky
+     table headers — stay as raw 2/3/6 and don't participate here.) */
+  --z-jump: 30;          /* jump-to-bottom pill (above the composer) */
+  --z-composer: 40;
+  --z-tasks: 45;         /* tasks popover anchored to the composer */
+  --z-drawer: 48;        /* mobile off-canvas sidebar + its scrim (above content, below dialogs) */
+  --z-dialog: 50;        /* base modal dialog overlay */
+  --z-popover: 60;       /* menus, status popovers, dropdowns */
+  --z-scrim: 70;         /* context-menu scrim */
+  --z-toast: 90;         /* connection / update toasts */
+  --z-modal: 150;        /* command palette, opencode-update overlay */
+  --z-modal-pop: 160;    /* composer autocomplete (above a modal) */
+  --z-overlay-full: 200; /* full-screen code overlay, restart overlay, portaled <Select> popup */
+  --z-floating: 300;     /* path-selection floating action */
+  --z-tooltip: 1000;
+
   /* Surfaces/emphasis derived from the palette so every theme (which only
      overrides --bg/--bg-2/--fg) adapts automatically. --bg-input: form controls
      (select buttons, text inputs); --bg-elev: elevated popups/sheets; --fg-strong:
@@ -2668,7 +2686,9 @@ body {
   .sidebar {
     position: fixed;
     inset: 0 auto 0 0;
-    z-index: 20;
+    /* Above the composer/jump/tasks (z 40/30/45) so the open drawer + its
+       full-screen scrim aren't pierced by chat chrome; below dialogs. */
+    z-index: var(--z-drawer);
     width: min(var(--sidebar-w), 86vw); /* cap a large desktop width on phones */
     transform: translateX(-100%);
     transition: transform 0.18s ease;
