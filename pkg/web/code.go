@@ -345,9 +345,11 @@ func (s *Server) handleCodeSearch(w http.ResponseWriter, r *http.Request) {
 	if n, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && n > 0 && n < codeSearchMaxResults {
 		limit = n
 	}
-	// -I skip binary, -n line numbers, -F fixed string, -i case-insensitive,
-	// --no-color, -e <query> (so a leading '-' isn't treated as a flag).
-	args := []string{"grep", "--untracked", "-I", "-n", "-F", "-i", "--no-color", "-e", q}
+	// -I skip binary, -n line numbers, -z NUL-delimit fields (so a path or line
+	// with a ':' isn't mis-split — and non-ASCII paths aren't quoted), -F fixed
+	// string, -i case-insensitive, --no-color, -e <query> (a leading '-' isn't a
+	// flag). With -z -n each match is "path\0lineno\0text\n".
+	args := []string{"grep", "--untracked", "-I", "-n", "-z", "-F", "-i", "--no-color", "-e", q}
 	// Optional focus folder: scope the search to a subtree via a pathspec.
 	if scope := strings.TrimPrefix(filepath.ToSlash(r.URL.Query().Get("path")), "/"); scope != "" {
 		if _, ok := safeJoin(dir, scope); ok {
@@ -362,8 +364,7 @@ func (s *Server) handleCodeSearch(w http.ResponseWriter, r *http.Request) {
 		if line == "" || len(hits) >= limit {
 			break
 		}
-		// path:line:text  (path may contain ':' only if quoted; tracked paths don't)
-		a := strings.SplitN(line, ":", 3)
+		a := strings.SplitN(line, "\x00", 3)
 		if len(a) < 3 {
 			continue
 		}
