@@ -51,10 +51,11 @@ export async function codeFile(path: string, view?: "rendered"): Promise<CodeFil
 
 export const codeRawUrl = (path: string) => `/vh/code/raw?${D()}&path=${encodeURIComponent(path)}`;
 
-export async function codeSearch(q: string): Promise<{ hits: CodeHit[]; capped?: boolean }> {
+export async function codeSearch(q: string, path = ""): Promise<{ hits: CodeHit[]; capped?: boolean }> {
   if (!q.trim()) return { hits: [] };
   try {
-    const r = await fetch(`/vh/code/search?${D()}&q=${encodeURIComponent(q)}`);
+    const scope = path ? `&path=${encodeURIComponent(path)}` : "";
+    const r = await fetch(`/vh/code/search?${D()}&q=${encodeURIComponent(q)}${scope}`);
     if (!r.ok) return { hits: [] };
     return await r.json();
   } catch {

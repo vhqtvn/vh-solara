@@ -285,9 +285,16 @@ func (s *Server) handleCodeSearch(w http.ResponseWriter, r *http.Request) {
 	}
 	// -I skip binary, -n line numbers, -F fixed string, -i case-insensitive,
 	// --no-color, -e <query> (so a leading '-' isn't treated as a flag).
+	args := []string{"grep", "--untracked", "-I", "-n", "-F", "-i", "--no-color", "-e", q}
+	// Optional focus folder: scope the search to a subtree via a pathspec.
+	if scope := strings.TrimPrefix(filepath.ToSlash(r.URL.Query().Get("path")), "/"); scope != "" {
+		if _, ok := safeJoin(dir, scope); ok {
+			args = append(args, "--", scope)
+		}
+	}
 	// --untracked also searches new files not yet committed (still respects
 	// .gitignore), so the search matches what the tree shows.
-	out, _ := runGit(r.Context(), dir, "grep", "--untracked", "-I", "-n", "-F", "-i", "--no-color", "-e", q)
+	out, _ := runGit(r.Context(), dir, args...)
 	hits := []searchHit{}
 	for _, line := range strings.Split(out, "\n") {
 		if line == "" || len(hits) >= limit {

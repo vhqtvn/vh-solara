@@ -2,7 +2,8 @@ import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Sh
 import Sidebar from "./components/Sidebar";
 import ChatView from "./components/ChatView";
 import GitView from "./components/GitView";
-import CodeFrame from "./components/CodeFrame";
+import CodeFrame, { codeMode } from "./components/CodeFrame";
+import { codeDockSide } from "./prefs";
 import TabBar, { type TabItem } from "./components/TabBar";
 import { installCodeFrameHost, postCodeTheme } from "./codeFrame";
 import NotesView from "./components/NotesView";
@@ -272,28 +273,35 @@ export default function App() {
             </Show>
           </div>
         </header>
-        <div class="main-body">
-          <Show when={view() === "notes"}>
-            <NotesView />
-          </Show>
-          <Show when={view() === "changes"}>
-            <GitView />
-          </Show>
-          <CodeFrame active={() => view() === "code"} />
-          <Show when={view() === "chat"}>
-            <Show when={selectedId()} fallback={
-              <Show when={draft()} fallback={<EmptyState />}>
-                <ChatView sessionId="" draft />
-              </Show>
-            }>
-              <ChatView sessionId={selectedId()!} />
+        <div
+          class="main-body"
+          classList={{ "code-full": codeMode() === "full", "code-dock-open": codeMode() === "dock", "dock-left": codeDockSide() === "left" }}
+        >
+          <div class="view-primary">
+            <Show when={view() === "notes"}>
+              <NotesView />
             </Show>
-          </Show>
-          {/* Consumer-registered embedded views — keyed so switching remounts a
-              fresh iframe attached to the right prefix. */}
-          <Show when={activeEmbedded()} keyed>
-            {(v) => <ViewFrame view={v} />}
-          </Show>
+            <Show when={view() === "changes"}>
+              <GitView />
+            </Show>
+            <Show when={view() === "chat"}>
+              <Show when={selectedId()} fallback={
+                <Show when={draft()} fallback={<EmptyState />}>
+                  <ChatView sessionId="" draft />
+                </Show>
+              }>
+                <ChatView sessionId={selectedId()!} />
+              </Show>
+            </Show>
+            {/* Consumer-registered embedded views — keyed so switching remounts a
+                fresh iframe attached to the right prefix. */}
+            <Show when={activeEmbedded()} keyed>
+              {(v) => <ViewFrame view={v} />}
+            </Show>
+          </div>
+          {/* Code viewer: full (Code tab), a resizable peek dock, or a mobile
+              overlay — one isolated iframe, see CodeFrame. */}
+          <CodeFrame />
         </div>
         <TerminalDock />
       </main>

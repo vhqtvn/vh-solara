@@ -158,6 +158,26 @@ export function setTabStyle(v: TabStyle) {
 }
 export { tabStyle };
 
+// Code peek dock: which side it docks (desktop) and its width (px), persisted.
+const CODE_DOCK_SIDE_KEY = "vh.prefs.codeDockSide.v1";
+const [codeDockSide, setCodeDockSideSig] = createSignal<"left" | "right">(
+  loadVersioned<"left" | "right">(CODE_DOCK_SIDE_KEY, 1, "right", (o) => (o === "left" ? "left" : "right")),
+);
+export function setCodeDockSide(v: "left" | "right") {
+  setCodeDockSideSig(v);
+  saveVersioned(CODE_DOCK_SIDE_KEY, 1, v);
+}
+export { codeDockSide };
+
+const CODE_DOCK_W_KEY = "vh.prefs.codeDockWidth.v1";
+const [codeDockWidth, setCodeDockWidthSig] = createSignal<number>(loadVersioned<number>(CODE_DOCK_W_KEY, 1, 480));
+export function setCodeDockWidth(px: number) {
+  const clamped = Math.max(280, Math.min(900, Math.round(px)));
+  setCodeDockWidthSig(clamped);
+  saveVersioned(CODE_DOCK_W_KEY, 1, clamped);
+}
+export { codeDockWidth };
+
 // Code view: syntax-highlight style (chroma style name; "" = follow the app
 // theme via the shared sheet) and soft-wrap toggle. Persisted.
 const CODE_STYLE_KEY = "vh.prefs.codeStyle.v1";

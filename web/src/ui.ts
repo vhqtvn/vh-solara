@@ -11,6 +11,11 @@ export const isEmbeddedView = (v: string) => v.startsWith(VIEW_PREFIX);
 export const embeddedViewId = (v: string) => v.slice(VIEW_PREFIX.length);
 
 export const [view, setView] = createSignal<View>("chat");
+// Code viewer peek: a side dock (desktop) beside the current view, or a
+// full-screen overlay (mobile), opened by clicking a file:line in the chat. The
+// Code TAB is the separate full "dig" mode (view === "code").
+export const [codeDockOpen, setCodeDockOpen] = createSignal(false);
+export const [codeMobileOverlay, setCodeMobileOverlay] = createSignal(false);
 export const [settingsOpen, setSettingsOpen] = createSignal(false);
 export const [adminOpen, setAdminOpen] = createSignal(false);
 export const [paletteOpen, setPaletteOpen] = createSignal(false);

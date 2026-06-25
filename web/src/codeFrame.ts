@@ -2,7 +2,8 @@
 // its heavy DOM — file tree, highlighted files — stays out of the main document).
 // Communication is postMessage. The chat opens files across the boundary; the
 // parent forwards theme changes so the framed viewer restyles live.
-import { setView } from "./ui";
+import { setCodeDockOpen, setCodeMobileOverlay } from "./ui";
+import { isDesktop } from "./layout";
 
 const ORIGIN = typeof location !== "undefined" ? location.origin : "*";
 type Msg = { type: string; [k: string]: unknown };
@@ -42,10 +43,12 @@ export function installCodeFrameHost() {
   });
 }
 
-// openFileAt (parent): switch to the Code tab and tell the framed viewer to open
-// the file/line. Accepts a raw "path:line" reference. Called from the chat.
+// openFileAt (parent): peek a file/line WITHOUT leaving the current view — opens
+// the side dock on desktop, a full-screen overlay on mobile — and tells the
+// framed viewer to open it. Accepts a raw "path:line" reference. Called from chat.
 export function openFileAt(pathOrRef: string, line?: number) {
-  setView("code");
+  if (isDesktop()) setCodeDockOpen(true);
+  else setCodeMobileOverlay(true);
   postToCodeFrame({ type: "vh-code:open", path: pathOrRef, line });
 }
 

@@ -17,12 +17,21 @@ function fileIcon(name: string): string {
   return "paperclip";
 }
 
-// One tree node; children load lazily on first expand.
-function TreeNode(props: { entry: CodeEntry; depth: number; openPath: () => string; onOpen: (p: string) => void }) {
+// One tree node; children load lazily on first expand. Right-click / long-press
+// a folder to focus it (re-root the tree) via onCtx.
+function TreeNode(props: {
+  entry: CodeEntry;
+  depth: number;
+  openPath: () => string;
+  onOpen: (p: string) => void;
+  onCtx: (x: number, y: number, path: string) => void;
+}) {
   const [open, setOpen] = createSignal(false);
   const [kids] = createResource(open, (o) => (o ? codeTree(props.entry.path) : Promise.resolve<CodeEntry[] | null>(null)));
   const isDir = props.entry.type === "dir";
   const selected = () => props.openPath() === props.entry.path;
+  let lpTimer: ReturnType<typeof setTimeout> | undefined;
+  const ctx = (x: number, y: number) => isDir && props.onCtx(x, y, props.entry.path);
   return (
     <div class="code-tree-node">
       <button
@@ -31,6 +40,10 @@ function TreeNode(props: { entry: CodeEntry; depth: number; openPath: () => stri
         classList={{ dir: isDir, selected: selected() }}
         style={{ "padding-left": `${4 + props.depth * 14}px` }}
         onClick={() => (isDir ? setOpen((v) => !v) : props.onOpen(props.entry.path))}
+        onContextMenu={(e) => { if (isDir) { e.preventDefault(); ctx(e.clientX, e.clientY); } }}
+        onPointerDown={(e) => { if (isDir && e.pointerType === "touch") lpTimer = setTimeout(() => ctx(e.clientX, e.clientY), 500); }}
+        onPointerUp={() => clearTimeout(lpTimer)}
+        onPointerLeave={() => clearTimeout(lpTimer)}
         title={props.entry.path}
       >
         <Show when={isDir} fallback={<span class="code-tree-ico file"><Icon name={fileIcon(props.entry.name)} size={13} /></span>}>
@@ -41,7 +54,7 @@ function TreeNode(props: { entry: CodeEntry; depth: number; openPath: () => stri
       <Show when={isDir && open()}>
         <Show when={!kids.loading} fallback={<div class="code-tree-loading" style={{ "padding-left": `${18 + props.depth * 14}px` }}>…</div>}>
           <For each={kids() || []}>
-            {(e) => <TreeNode entry={e} depth={props.depth + 1} openPath={props.openPath} onOpen={props.onOpen} />}
+            {(e) => <TreeNode entry={e} depth={props.depth + 1} openPath={props.openPath} onOpen={props.onOpen} onCtx={props.onCtx} />}
           </For>
         </Show>
       </Show>
@@ -59,10 +72,20 @@ export default function CodeView() {
   const [query, setQuery] = createSignal("");
   const [debounced, setDebounced] = createSignal("");
   const [mdRendered, setMdRendered] = createSignal(false);
+  // Focus folder: re-root the tree + scope search to a subtree (monorepo digging).
+  const [focusRoot, setFocusRoot] = createSignal("");
+  const [ctxMenu, setCtxMenu] = createSignal<{ x: number; y: number; path: string } | null>(null);
   let paneEl: HTMLDivElement | undefined;
 
-  // Root of the tree reloads when the project changes.
-  const [roots] = createResource(() => projectDir(), () => codeTree(""));
+  // Tree root reloads when the project or the focus folder changes.
+  const [roots] = createResource(() => ({ dir: projectDir(), root: focusRoot() }), (k) => codeTree(k.root));
+  // Crumb segments for the focus chip (‹ repo / a / b).
+  const focusSegs = createMemo(() => {
+    const f = focusRoot();
+    if (!f) return [] as { name: string; path: string }[];
+    let acc = "";
+    return f.split("/").map((name) => ((acc = acc ? `${acc}/${name}` : name), { name, path: acc }));
+  });
 
   // Debounced search.
   let searchTimer: ReturnType<typeof setTimeout> | undefined;
@@ -72,7 +95,10 @@ export default function CodeView() {
     searchTimer = setTimeout(() => setDebounced(q), 220);
   });
   onCleanup(() => clearTimeout(searchTimer));
-  const [results] = createResource(debounced, (q) => (q.trim() ? codeSearch(q) : Promise.resolve({ hits: [] as CodeHit[], capped: false })));
+  const [results] = createResource(
+    () => ({ q: debounced(), scope: focusRoot() }),
+    (k) => (k.q.trim() ? codeSearch(k.q, k.scope) : Promise.resolve({ hits: [] as CodeHit[], capped: false })),
+  );
 
   // Open file (resource keyed on path + markdown-render toggle).
   const [file] = createResource(
@@ -124,6 +150,15 @@ export default function CodeView() {
   });
   onCleanup(() => document.getElementById("vh-code-hl")?.remove());
 
+  // Close the focus context menu on any outside click (armed next tick so the
+  // opening contextmenu/long-press doesn't immediately dismiss it).
+  createEffect(() => {
+    if (!ctxMenu()) return;
+    const close = () => setCtxMenu(null);
+    const id = setTimeout(() => document.addEventListener("click", close), 0);
+    onCleanup(() => { clearTimeout(id); document.removeEventListener("click", close); });
+  });
+
   const segments = createMemo(() => {
     const p = openPath();
     if (!p) return [] as { name: string; path: string }[];
@@ -157,6 +192,19 @@ export default function CodeView() {
               <button type="button" class="code-search-clear" aria-label="Clear" onClick={() => setQuery("")}><Icon name="x" size={12} /></button>
             </Show>
           </div>
+          <Show when={focusRoot()}>
+            <div class="code-focus" title="Focused folder — tree & search are scoped here">
+              <button type="button" class="code-focus-crumb" onClick={() => setFocusRoot("")}>‹ repo</button>
+              <For each={focusSegs()}>
+                {(seg, i) => (
+                  <>
+                    <span class="code-bc-sep">/</span>
+                    <button type="button" class="code-focus-crumb" classList={{ last: i() === focusSegs().length - 1 }} onClick={() => setFocusRoot(seg.path)}>{seg.name}</button>
+                  </>
+                )}
+              </For>
+            </div>
+          </Show>
           <div class="code-tree tree">
             <Show
               when={!debounced().trim()}
@@ -180,7 +228,7 @@ export default function CodeView() {
             >
               <Show when={!roots.loading} fallback={<div class="code-tree-loading">…</div>}>
                 <For each={roots() || []}>
-                  {(e) => <TreeNode entry={e} depth={0} openPath={openPath} onOpen={(p) => open(p)} />}
+                  {(e) => <TreeNode entry={e} depth={0} openPath={openPath} onOpen={(p) => open(p)} onCtx={(x, y, path) => setCtxMenu({ x, y, path })} />}
                 </For>
               </Show>
             </Show>
@@ -250,6 +298,16 @@ export default function CodeView() {
             </div>
           </Show>
         </main>
+        <Show when={ctxMenu()}>
+          {(m) => (
+            <div class="code-ctx" style={{ left: `${m().x}px`, top: `${m().y}px` }}>
+              <button type="button" onClick={() => { setFocusRoot(m().path); setCtxMenu(null); }}>Focus this folder</button>
+              <Show when={focusRoot()}>
+                <button type="button" onClick={() => { setFocusRoot(""); setCtxMenu(null); }}>Clear focus</button>
+              </Show>
+            </div>
+          )}
+        </Show>
       </div>
     </Show>
   );
