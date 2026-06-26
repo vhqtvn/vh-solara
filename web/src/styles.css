@@ -1002,18 +1002,12 @@ body {
 }
 .chat-scroll { flex: 1; min-height: 0; overflow-y: auto; overflow-anchor: auto; padding: 16px; overscroll-behavior: contain; }
 
-/* Scroll-edge affordance (installScrollEdges tags these + toggles se-top/se-
-   bottom). The edge content DISSOLVES to transparent only where there's hidden
-   content that way — a mask on the element, so it's flush regardless of padding
-   and inherently theme-aware (no color: pure transparency). Nesting-safe. */
-.scroll-edges {
-  --mt: 0px;
-  --mb: 0px;
-  -webkit-mask-image: linear-gradient(to bottom, transparent, #000 var(--mt), #000 calc(100% - var(--mb)), transparent);
-  mask-image: linear-gradient(to bottom, transparent, #000 var(--mt), #000 calc(100% - var(--mb)), transparent);
-}
-.scroll-edges.se-top { --mt: 24px; }
-.scroll-edges.se-bottom { --mb: 24px; }
+/* Scroll-edge fade REMOVED. It was a gradient `mask-image` on the scroll surface
+   (.chat-scroll, .reasoning-body, …) — but a CSS mask on a scroll container forces
+   Firefox/WebRender to render the WHOLE scrollable content to an offscreen surface
+   and re-rasterize it to apply the mask. On the always-present chat scroll with a
+   complex/long transcript that was a heavy, near-persistent GPU raster cost
+   (the real-app heat that a bare test page never reproduced). Not worth a fade. */
 .chat-content { max-width: var(--chat-width, 860px); margin: 0 auto; }
 .chat-empty { padding: 32px 16px; text-align: center; color: var(--fg-dim); font-size: 14px; }
 /* Revealed once positioned (see ChatView ready signal) — the initial scroll

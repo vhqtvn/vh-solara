@@ -1,62 +1,14 @@
-// Scroll-edge affordance: fade the top/bottom edge of a scroll surface ONLY when
-// there's hidden content that way, so overflow is visible without arrows (which
-// don't compose when scrolls are many/nested). The fade is a CSS mask (see
-// .scroll-edges in styles.css) — theme-agnostic (no per-surface bg) and
-// nesting-safe (each surface masks itself).
+// Scroll-edge fade — REMOVED.
 //
-// A single global installer tags known scroll surfaces (and any added later —
-// dialogs, menus, popovers) so individual components don't need wiring.
-
-// Inner scroll panes only. The fade is an inset box-shadow, which would replace
-// any drop-shadow a surface already has — so popovers/menus/the tasks list
-// (which carry their own box-shadow) are intentionally excluded.
-const SELECTOR = [
-  ".chat-scroll",
-  ".tree",
-  ".reasoning-body",
-  ".notes-view",
-  ".git-body",
-  ".dialog-body",
-  ".settings-content",
-  ".settings-nav",
-].join(",");
-
-const EDGE = 6; // px slack before an edge counts as "more content that way"
-const tracked = new WeakSet<Element>();
-
-function attach(el: HTMLElement) {
-  if (tracked.has(el)) return;
-  tracked.add(el);
-  el.classList.add("scroll-edges");
-  let raf = 0;
-  const update = () => {
-    raf = 0;
-    el.classList.toggle("se-top", el.scrollTop > EDGE);
-    el.classList.toggle("se-bottom", el.scrollHeight - el.scrollTop - el.clientHeight > EDGE);
-  };
-  const schedule = () => {
-    if (!raf) raf = requestAnimationFrame(update);
-  };
-  el.addEventListener("scroll", schedule, { passive: true });
-  // Container resize AND content growth both change what's hidden.
-  new ResizeObserver(schedule).observe(el);
-  new MutationObserver(schedule).observe(el, { childList: true, subtree: true, characterData: true });
-  schedule();
-}
-
-function scan(root: ParentNode) {
-  if (root instanceof HTMLElement && root.matches?.(SELECTOR)) attach(root);
-  root.querySelectorAll?.<HTMLElement>(SELECTOR).forEach(attach);
-}
-
-// Tag current scroll surfaces and watch for ones mounted later.
-export function installScrollEdges() {
-  scan(document);
-  new MutationObserver((muts) => {
-    for (const m of muts) {
-      for (const n of m.addedNodes) {
-        if (n.nodeType === 1) scan(n as Element);
-      }
-    }
-  }).observe(document.body, { childList: true, subtree: true });
+// It used to tag scroll surfaces (.chat-scroll, .reasoning-body, …) with a
+// gradient `mask-image` that faded the top/bottom edges. But a CSS mask on a
+// scroll container forces Firefox/WebRender to render the WHOLE scrollable
+// content to an offscreen surface and re-rasterize it to apply the mask — a
+// heavy, near-persistent GPU cost on the always-present chat scroll with a long
+// transcript (the real-app heat a bare test page never reproduced). The tagger
+// also ran a per-surface MutationObserver(subtree, characterData) that fired on
+// every streamed character. Both gone. Kept as a no-op so callers/imports stay
+// valid; re-add a cheap edge fade (a small fixed gradient overlay) if wanted.
+export function installScrollEdges(): void {
+  /* intentionally empty */
 }
