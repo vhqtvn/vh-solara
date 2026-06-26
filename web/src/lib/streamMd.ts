@@ -43,6 +43,12 @@ function tokenHtml(token: unknown): string {
 // was, cutting active-block repaints ~25× while almost every block formats at its
 // boundary well before the cap fires.
 const REPARSE_MS = 5000;
+// Max chars in the still-streaming active block before we seal a chunk. A block
+// only grows unbounded when it has no blank-line boundary for a long stretch (a
+// long single paragraph / reasoning flow). Appending then re-flows the whole
+// growing block every update → O(n²) layout (the residual streaming heat after
+// raster was fixed). Sealing a leading chunk keeps per-update layout O(cap).
+const SEAL_CAP = 1000;
 
 export class StreamMd {
   private committedLen = 0; // source chars rendered into finalized (untouched) DOM
@@ -80,6 +86,12 @@ export class StreamMd {
       const delta = text.slice(this.parsedLen + this.tailLen);
       const boundary = delta.includes("\n\n") || (this.inCode && delta.includes("```"));
       if (!boundary && now - this.lastParse < REPARSE_MS) {
+        // Keep the active block bounded so its reflow stays cheap. Not for code —
+        // splitting a fence would break into two boxes.
+        if (!this.inCode && text.length - this.committedLen > SEAL_CAP) {
+          this.sealActive(text, now);
+          return;
+        }
         if (delta) {
           this.tailHost.appendChild(document.createTextNode(delta));
           this.tailLen += delta.length;
@@ -94,6 +106,50 @@ export class StreamMd {
   // puts its tail node here too, so the caret sits just after it.
   get caretHost(): HTMLElement {
     return caretTarget(this.host);
+  }
+
+  // Finalize a leading chunk of an oversized active block at the last clean break
+  // (newline preferred, else space), so the sealed text stops re-flowing and the
+  // active block shrinks back to the trailing remainder.
+  private sealActive(text: string, now: number): void {
+    const region = text.slice(this.committedLen);
+    let cut = region.lastIndexOf("\n");
+    if (cut < 0) cut = region.lastIndexOf(" ");
+    if (cut <= 0) {
+      // A huge run with no break to seal at — just append and accept it (rare).
+      const delta = text.slice(this.parsedLen + this.tailLen);
+      if (delta && this.tailHost) {
+        this.tailHost.appendChild(document.createTextNode(delta));
+        this.tailLen += delta.length;
+      }
+      return;
+    }
+    const split = this.committedLen + cut + 1;
+    // Drop the live active nodes, render the sealed chunk as finalized, then let
+    // reparse render the (now small) remainder as the new active block.
+    while (this.host.childNodes.length > this.committedNodes) this.host.lastChild!.remove();
+    this.commitSource(text.slice(this.committedLen, split));
+    this.committedLen = split;
+    this.reparse(text, now);
+  }
+
+  // Render a finalized markdown fragment and append its nodes as committed.
+  private commitSource(src: string): void {
+    let tokens: { raw: string }[];
+    try {
+      tokens = marked.lexer(src) as { raw: string }[];
+    } catch {
+      return;
+    }
+    for (const token of tokens) {
+      const html = tokenHtml(token);
+      if (html) {
+        const tpl = document.createElement("template");
+        tpl.innerHTML = html;
+        this.host.append(...Array.from(tpl.content.childNodes));
+      }
+    }
+    this.committedNodes = this.host.childNodes.length;
   }
 
   private reparse(text: string, now: number): void {
