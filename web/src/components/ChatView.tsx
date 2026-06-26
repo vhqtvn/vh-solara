@@ -436,14 +436,21 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // raw→rendered-HTML swap) — but only while following. Restore first if pending.
   onMount(() => {
     if (!contentEl) return;
+    // The navigator highlight is an O(turns) getBoundingClientRect sweep; running
+    // it on every streamed height change is wasteful. Debounce it so it recomputes
+    // once content settles. `pin()` stays per-fire (cheap) so following stays glued
+    // — a trailing debounce there would stop auto-scroll during a continuous stream.
+    let navDebounce: number | undefined;
     const ro = new ResizeObserver(() => {
       if (maybeRestore()) return;
       if (following()) pin();
-      scheduleActiveTurn(); // content grew/mounted — refresh the navigator highlight
+      clearTimeout(navDebounce);
+      navDebounce = window.setTimeout(scheduleActiveTurn, 150);
     });
     ro.observe(contentEl);
     onCleanup(() => {
       ro.disconnect();
+      clearTimeout(navDebounce);
       if (scrollEl && !props.draft) setScroll(props.sessionId, scrollEl.scrollTop);
     });
   });
