@@ -1725,8 +1725,10 @@ body {
 .restart-overlay {
   position: fixed; inset: 0; z-index: 200;
   display: grid; place-items: center;
-  background: color-mix(in srgb, var(--bg) 82%, transparent);
-  backdrop-filter: blur(3px);
+  /* No backdrop-filter: a full-screen blur re-computes EVERY frame on Firefox
+     while the spinner (or the chat behind) animates — pins the GPU to ~99°C. A
+     more-opaque scrim reads the same without the per-frame cost. */
+  background: color-mix(in srgb, var(--bg) 92%, transparent);
 }
 .restart-card {
   display: flex; flex-direction: column; align-items: center; gap: 10px;
