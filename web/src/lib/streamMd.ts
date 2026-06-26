@@ -48,7 +48,8 @@ export class StreamMd {
   private committedLen = 0; // source chars rendered into finalized (untouched) DOM
   private committedNodes = 0; // host child nodes that are finalized
   private parsedLen = 0; // source chars parsed into the active block's DOM
-  private tail: Text | null = null; // plain-text node holding parsedLen..end of the active block
+  private tailHost: HTMLElement | null = null; // active block element to append the tail into
+  private tailLen = 0; // raw chars appended after parsedLen (the not-yet-reparsed tail)
   private inCode = false; // the active block is an (open) fenced code block
   private lastParse = 0;
 
@@ -58,7 +59,8 @@ export class StreamMd {
     this.committedLen = 0;
     this.committedNodes = 0;
     this.parsedLen = 0;
-    this.tail = null;
+    this.tailHost = null;
+    this.tailLen = 0;
     this.inCode = false;
     this.lastParse = 0;
     this.host.textContent = "";
@@ -69,15 +71,19 @@ export class StreamMd {
   push(text: string, now = 0): void {
     if (text.length < this.committedLen) this.reset();
 
-    // Hot path: extend the active block's plain-text tail in place — one DOM
-    // write, no markdown parse, no rebuild. Used until a structural boundary or
-    // the time cap makes a real re-parse worthwhile.
-    if (this.tail && text.length >= this.parsedLen) {
-      const tailText = text.slice(this.parsedLen);
-      const added = tailText.slice(this.tail.data.length); // chars since last push
-      const boundary = added.includes("\n\n") || (this.inCode && added.includes("```"));
+    // Hot path: APPEND the new characters as a fresh text node — never rewrite
+    // existing text. Rewriting the tail node (tail.data = …) re-shapes and
+    // re-rasterizes the whole growing block every update (O(block) → O(n²),
+    // measured ~25× more raster); appending a new node only paints the new run.
+    // Used until a structural boundary or the time cap forces a real re-parse.
+    if (this.tailHost && text.length >= this.parsedLen + this.tailLen) {
+      const delta = text.slice(this.parsedLen + this.tailLen);
+      const boundary = delta.includes("\n\n") || (this.inCode && delta.includes("```"));
       if (!boundary && now - this.lastParse < REPARSE_MS) {
-        this.tail.data = tailText;
+        if (delta) {
+          this.tailHost.appendChild(document.createTextNode(delta));
+          this.tailLen += delta.length;
+        }
         return;
       }
     }
@@ -92,7 +98,8 @@ export class StreamMd {
 
   private reparse(text: string, now: number): void {
     this.lastParse = now;
-    this.tail = null;
+    this.tailHost = null;
+    this.tailLen = 0;
     // Drop the (re-rendered) active block; finalized nodes are kept.
     while (this.host.childNodes.length > this.committedNodes) this.host.lastChild!.remove();
 
@@ -120,9 +127,10 @@ export class StreamMd {
         this.committedLen += token.raw.length;
         this.committedNodes = this.host.childNodes.length;
       } else {
-        // The trailing in-progress block: everything up to here is now parsed;
-        // drop an empty text node at its end for the hot path to extend.
+        // The trailing in-progress block: everything up to here is now parsed.
+        // The hot path appends further characters as text nodes into `tailHost`.
         this.parsedLen = text.length;
+        this.tailLen = 0;
         this.inCode = token.type === "code";
         const end = caretTarget(this.host);
         // marked renders fenced code with a trailing "\n" inside <code>; strip it
@@ -131,8 +139,7 @@ export class StreamMd {
           const t = end.lastChild as Text;
           if (t.data.endsWith("\n")) t.data = t.data.slice(0, -1);
         }
-        this.tail = document.createTextNode("");
-        end.appendChild(this.tail);
+        this.tailHost = end;
       }
     }
   }
