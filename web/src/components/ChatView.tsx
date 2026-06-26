@@ -389,8 +389,15 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       ? scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight < 80
       : true;
   }
+  // Position we last set programmatically. A scroll event whose offset matches it
+  // is our own pin (not the user), so onScrolled can skip its work — otherwise
+  // each streamed pin fires a scroll event that re-runs nearBottom/ack/navigator
+  // every frame (a feedback loop that burned CPU during streaming).
+  let pinnedTop = -1;
   function pin() {
-    if (scrollEl) scrollEl.scrollTop = scrollEl.scrollHeight;
+    if (!scrollEl) return;
+    scrollEl.scrollTop = scrollEl.scrollHeight;
+    pinnedTop = scrollEl.scrollTop; // clamped value the scroll event will report
   }
   function jumpToLatest() {
     setFollowing(true);
@@ -467,6 +474,9 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // Scroll handling: track follow state, persist the offset, and mark the
   // session read (ack) when its bottom is reached.
   function onScrolled() {
+    // Our own pin() — not a user scroll. Skip the work; following/ack/navigator
+    // are already correct (we're glued to the bottom).
+    if (scrollEl && scrollEl.scrollTop === pinnedTop) return;
     const atBottom = nearBottom();
     setFollowing(atBottom);
     if (!props.draft) setScroll(props.sessionId, atBottom ? 0 : scrollEl?.scrollTop ?? 0);
