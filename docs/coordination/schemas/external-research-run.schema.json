@@ -1,0 +1,165 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "vh-solara External Research Run",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "task_id",
+    "provider",
+    "provider_task_id",
+    "provider_url",
+    "status",
+    "plan_required",
+    "plan_status",
+    "source_policy",
+    "allowed_domains",
+    "prioritized_domains",
+    "private_sources",
+    "attachments",
+    "target_artifact_type",
+    "target_artifact_path",
+    "progress_summary",
+    "result_available",
+    "next_action",
+    "last_polled_at",
+    "created_at",
+    "updated_at",
+    "history"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "task_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "provider": {
+      "type": "string",
+      "minLength": 1
+    },
+    "provider_task_id": {
+      "type": ["string", "null"]
+    },
+    "provider_url": {
+      "type": ["string", "null"]
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "planned",
+        "running",
+        "input_required",
+        "paused",
+        "completed",
+        "failed",
+        "cancelled"
+      ]
+    },
+    "plan_required": {
+      "type": "boolean"
+    },
+    "plan_status": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "approved",
+        "edited",
+        "not_needed"
+      ]
+    },
+    "source_policy": {
+      "type": "string",
+      "enum": [
+        "repo_only",
+        "web_repo",
+        "restricted_sites"
+      ]
+    },
+    "allowed_domains": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "prioritized_domains": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "private_sources": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "attachments": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "target_artifact_type": {
+      "type": "string",
+      "enum": [
+        "sources",
+        "decision"
+      ]
+    },
+    "target_artifact_path": {
+      "type": "string",
+      "minLength": 1
+    },
+    "progress_summary": {
+      "type": "string"
+    },
+    "result_available": {
+      "type": "boolean"
+    },
+    "next_action": {
+      "type": "string",
+      "minLength": 1
+    },
+    "last_polled_at": {
+      "type": ["string", "null"],
+      "format": "date-time"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "history": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "at",
+          "event"
+        ],
+        "properties": {
+          "at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "event": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "note": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "additionalProperties": false
+}

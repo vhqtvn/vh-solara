@@ -1,0 +1,24 @@
+# lineage.yml - S1 render lineage (decision D3-B).
+# Shim-owned and lineage-ONLY. This is NOT policy authority: it cannot answer
+# "which profile?" (S3), "is this file safe to overwrite?" (S2), or "which
+# services run?" (S4). See the config-authority model.
+# Do not hand-edit; the harness rewrites this file on render/update.
+lineage_version: "1"
+template:
+    source: templates/core
+    commit: ""
+    ref: harness/0.1.0
+copier:
+    version: ""
+answers:
+    digest: sha256:18b9ccb9c2c3b8f46165304210ab83f1132152862a177e1b28fbb55207e0fd04
+    selected_keys:
+        - project_name
+        - project_slug
+    values:
+        project_name: vh-solara
+        project_slug: vh-solara
+render:
+    last_successful_update_id: af5375846f20bfd1
+    last_successful_render_at: "2026-06-26T20:07:05Z"
+    rendered_by: embed-fs

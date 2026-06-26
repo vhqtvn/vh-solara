@@ -1,0 +1,9 @@
+run_shape_version: "0.1"
+# S4 runtime shape (.vh-agent-harness/run-shape.yml). Project-owned: edit freely;
+# `vh-agent-harness update` never overwrites this file. See the run-shape spec.
+runtime:
+  backend: host-shell
+# services: {}      # none for host-shell; declare for docker_compose
+# lifecycle: {}     # hooks are scripts/ pointers; absent = no-op
+# runners: {}
+# verbs: {}

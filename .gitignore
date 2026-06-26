@@ -54,3 +54,7 @@ pkg/web/dist/*
 # meant to be committed so the repo can declare its companion processes/views.
 .vh-solara/*
 !.vh-solara/project.jsonc
+# vh-agent-harness operator-local state (per-developer model overrides,
+# coordinator runs, ssh, cleared-assumptions). NOT committed. The committed
+# harness config lives under .vh-agent-harness/ and .opencode/.
+.local/

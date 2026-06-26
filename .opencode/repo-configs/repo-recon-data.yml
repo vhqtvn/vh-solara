@@ -1,0 +1,29 @@
+# Repo-recon structural data — PROJECT-GENERATED (external_generated).
+#
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │ OWNERSHIP: external_generated.                                            │
+# │ The harness seeds this blank skeleton on first install and then LEAVES IT │
+# │ ALONE on every update. The project's repo-recon generator skill (or a     │
+# │ project agent / maintainer) owns the contents. The harness NEVER          │
+# │ overwrites this file.                                                     │
+# └──────────────────────────────────────────────────────────────────────────┘
+#
+# This file is the project-scoped structural map consumed by agents to orient
+# quickly: entrypoints (where execution begins), hotspots (files most likely to
+# need reading for a change), packages (logical boundaries), tests (suites +
+# how to run them).
+#
+# SCHEMA (validated by `vh-agent-harness doctor` / internal/schema/repo_recon.go):
+#   entrypoints  : array of objects, each with a `name` OR `path`
+#   hotspots     : array of objects, each with a `name` OR `path`
+#   packages     : map keyed by package name, each value an object (path/role)
+#   tests        : array of objects, each with a `name` OR `path`
+#   (no other top-level keys allowed)
+#
+# Populate this file via the repo-recon generator skill:
+#   load the `repo-recon` skill and ask it to create / refresh the data.
+
+entrypoints: []
+hotspots: []
+packages: {}
+tests: []

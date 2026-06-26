@@ -1,0 +1,420 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "vh-solara Coordination Task Card",
+  "type": "object",
+  "required": [
+    "task_id",
+    "title",
+    "task_type",
+    "coordination_mode",
+    "primary_lane",
+    "report_envelope",
+    "status",
+    "session_aliases",
+    "active_session_alias",
+    "claimed_at",
+    "report_paths",
+    "review_paths",
+    "history",
+    "created_at",
+    "updated_at"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "task_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1
+    },
+    "task_type": {
+      "type": "string",
+      "enum": ["implementation", "study", "research"]
+    },
+    "coordination_mode": {
+      "type": "string",
+      "enum": ["short", "medium", "long"]
+    },
+    "primary_lane": {
+      "type": "string",
+      "minLength": 1
+    },
+    "research_question": {
+      "type": "string"
+    },
+    "source_policy": {
+      "type": ["string", "null"],
+      "enum": ["repo_only", "web_repo", "restricted_sites", null]
+    },
+    "source_allowlist": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "desired_artifact_type": {
+      "type": ["string", "null"],
+      "enum": ["sources", "decision", null]
+    },
+    "target_artifact_path": {
+      "type": ["string", "null"]
+    },
+    "rough_scope": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "open_questions": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "ready_criteria": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "files_in_scope": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "constraints": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "non_goals": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "success_criteria": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "validation_plan": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "report_envelope": {
+      "type": "string",
+      "enum": ["minimal", "standard", "synthesis"]
+    },
+    "backlog_id": {
+      "type": ["string", "null"]
+    },
+    "workstream_slug": {
+      "type": ["string", "null"]
+    },
+    "dependencies": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "owner_notes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "draft",
+        "ready",
+        "working",
+        "reported",
+        "blocked",
+        "completed",
+        "cancelled"
+      ]
+    },
+    "session_aliases": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "active_session_alias": {
+      "type": ["string", "null"]
+    },
+    "claimed_at": {
+      "type": ["string", "null"],
+      "format": "date-time"
+    },
+    "report_paths": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "review_paths": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "latest_report": {
+      "type": ["object", "null"],
+      "required": [
+        "path",
+        "title",
+        "status",
+        "report_envelope",
+        "created_at",
+        "summary",
+        "promotion_recommended"
+      ],
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "reported",
+            "blocked",
+            "completed"
+          ]
+        },
+        "report_envelope": {
+          "type": "string",
+          "enum": ["minimal", "standard", "synthesis"]
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "promotion_recommended": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": true
+    },
+    "next_action": {
+      "type": "string"
+    },
+    "last_review": {
+      "type": ["object", "null"],
+      "required": [
+        "path",
+        "reviewed_at",
+        "title",
+        "status",
+        "summary",
+        "next_action"
+      ],
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "reviewed_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "session_name": {
+          "type": ["string", "null"]
+        },
+        "title": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "ready",
+            "working",
+            "reported",
+            "blocked",
+            "completed",
+            "cancelled"
+          ]
+        },
+        "summary": {
+          "type": "string"
+        },
+        "next_action": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "history": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["at", "event"],
+        "properties": {
+          "at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "event": {
+            "type": "string"
+          },
+          "session_name": {
+            "type": ["string", "null"]
+          },
+          "status": {
+            "type": "string"
+          },
+          "note": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "task_type": {
+            "const": "research"
+          }
+        },
+        "required": ["task_type"]
+      },
+      "then": {
+        "required": [
+          "research_question",
+          "source_policy",
+          "desired_artifact_type",
+          "target_artifact_path"
+        ],
+        "properties": {
+          "research_question": {
+            "type": "string",
+            "minLength": 1
+          },
+          "source_policy": {
+            "type": "string",
+            "enum": ["repo_only", "web_repo", "restricted_sites"]
+          },
+          "desired_artifact_type": {
+            "type": "string",
+            "enum": ["sources", "decision"]
+          },
+          "target_artifact_path": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "draft"
+          }
+        },
+        "required": ["status"]
+      },
+      "then": {
+        "anyOf": [
+          {
+            "properties": {
+              "rough_scope": {
+                "minItems": 1
+              }
+            }
+          },
+          {
+            "properties": {
+              "open_questions": {
+                "minItems": 1
+              }
+            }
+          },
+          {
+            "properties": {
+              "ready_criteria": {
+                "minItems": 1
+              }
+            }
+          }
+        ]
+      },
+      "else": {
+        "properties": {
+          "files_in_scope": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1
+          },
+          "success_criteria": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1
+          },
+          "validation_plan": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "working"
+          }
+        },
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "active_session_alias": {
+            "type": "string",
+            "minLength": 1
+          },
+          "claimed_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      }
+    }
+  ],
+  "additionalProperties": false
+}

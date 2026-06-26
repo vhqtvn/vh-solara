@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Synthesis Coordination Report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "report_type",
+    "task_id",
+    "coordinator_session",
+    "coordination_mode",
+    "overall_status",
+    "sessions_consulted",
+    "conflicting_findings",
+    "resolved_view",
+    "open_risks",
+    "durable_updates_required",
+    "recommended_next_fan_out"
+  ],
+  "properties": {
+    "report_type": {
+      "const": "synthesis"
+    },
+    "task_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "coordinator_session": {
+      "type": "string",
+      "minLength": 1
+    },
+    "coordination_mode": {
+      "type": "string",
+      "enum": [
+        "medium",
+        "long"
+      ]
+    },
+    "overall_status": {
+      "type": "string",
+      "enum": [
+        "completed",
+        "blocked",
+        "partial"
+      ]
+    },
+    "sessions_consulted": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "conflicting_findings": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "resolved_view": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "open_risks": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "durable_updates_required": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "recommended_next_fan_out": {
+      "type": "string",
+      "minLength": 1
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/artifact"
+      }
+    }
+  },
+  "$defs": {
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "label",
+        "path"
+      ],
+      "properties": {
+        "label": {
+          "type": "string",
+          "minLength": 1
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}

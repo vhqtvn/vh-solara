@@ -1,0 +1,18 @@
+# vh-harness-profile.yml (platform_armed) - vh-agent-harness platform default.
+#
+# This is the S3 feature-surface selection file. It is platform_armed: the
+# platform owns the schema + this default, and the project edits within the
+# envelope. On update the substrate does a schema-aware STRUCTURAL reconcile
+# (union append-only arrays; project-wins per keyed feature; project-selectable
+# profile within the enum). It NEVER wholesale-overwrites this file.
+#
+# This is the platform DEFAULT (v1): the minimal core corpus. Overlays widen
+# modules/overlays/features in later slices; the schema
+# (internal/schema/harness_profile.go) is the contract.
+profile: minimal
+modules:
+  - core
+features:
+  backlog: false
+overlays: []
+policy_packs: []

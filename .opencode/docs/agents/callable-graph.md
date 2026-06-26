@@ -1,0 +1,90 @@
+# Callable Graph
+
+## Public entrypoints
+
+Only these should be treated as direct user-facing agents:
+
+- `coordination` (read-only routing, default primary agent)
+- `build` (execution owner, delegated by coordination)
+
+All other agents are delegated specialists.
+
+## Routing model
+
+1. `coordination` routes to `build` by default.
+2. `coordination` may directly call read-only specialists when scope is narrow.
+3. `build` owns implementation and may call editable specialists.
+4. Closeout goes through `commit-message` and/or `ship-review` as needed.
+
+## Delegation ownership
+
+Only these agents should fan out via `permission.task`:
+
+- `build`
+- `coordination`
+- `project-coordinator`
+- `commit-message` (to `commit-reviewer` only)
+- `commit-reviewer` (to `commit-reviewer-a`, `commit-reviewer-b`, and `commit-reviewer-c` only; `commit-reviewer-d` deferred until premium tier is enabled)
+
+All other specialists should keep `task: { "*": "deny" }` to prevent lateral drift.
+
+## Specialist classes
+
+This graph lists ONLY the CORE roster shipped by the harness. Overlay packs
+(e.g. a web overlay, a project domain overlay, ...) append their own specialists
+to this graph via a `callable-graph-snippet.md` that is merged onto this file
+when the pack is selected in `vh-harness-profile.yml` `overlays: [...]`. Do not
+hand-write overlay specialists here — declare them in the overlay pack's snippet.
+
+- Read-only specialists (core):
+  - `project-coordinator`
+  - `debate`
+  - `planner`
+  - `researcher`
+  - `repo-explorer`
+  - `commit-reviewer`
+  - `ship-review`
+  - `solution-brief`
+- Editable specialists (core):
+  - `docs-steward`
+
+## Internal cluster pattern
+
+For private helper families (implemented for debate):
+
+- one visible orchestrator (`debate`)
+- hidden helpers (`debate-*`)
+- strict task allowlist on the orchestrator:
+   - `"task": { "*": "deny", "debate-*": "allow" }`
+
+#### Commit-reviewer cluster
+
+`commit-reviewer` is an internal cluster: one visible orchestrator (`commit-reviewer`) dispatches to hidden leaves across multiple tiers. Tier structure is defined in `.opencode/config/review-tiers.json` — currently Tier 1 (free, B+C), Tier 2 (cheap, A), and Tier 3 (premium, D, disabled). The leaves are identical except for description frontmatter; running independent reviews across tiers reduces single-model blind spots. The orchestrator performs mechanical JSON aggregation with strict consensus within each tier and fail-fast escalation across tiers — all tiers must approve for an overall approve. The delegation ownership rule (§2) applies: only the orchestrator may call the leaves via `task`.
+
+Cluster pattern:
+- visible: `commit-reviewer` (orchestrator, in read-only specialists list)
+- hidden: `commit-reviewer-a`, `commit-reviewer-b`, `commit-reviewer-c` (leaves, not in callable graph; `commit-reviewer-d` deferred until premium tier enabled)
+- task allowlist on orchestrator: `{ "*": "deny", "commit-reviewer-a": "allow", "commit-reviewer-b": "allow", "commit-reviewer-c": "allow" }`
+- leaves have `task: { "*": "deny" }` — cannot call anyone
+- review modes are documented in `commit-reviewer-modes.md`
+
+## Research-to-debate workflow
+
+For web-grounded option discovery or creative solution finding:
+
+- keep retrieval and source gathering in `researcher`
+- hand off grounded options to `debate` for bounded comparison and critique
+- do not add a second hidden web-research path under `debate-*` unless the
+  callable graph is intentionally revised
+
+## Naming consistency rule
+
+Agent IDs must match across:
+
+- `opencode.jsonc`
+- `.opencode/agents/*.md`
+- `AGENTS.md`
+- `docs/coordination/*` lane and role docs
+
+Do not keep dual IDs for one role (for example a release agent carrying both a
+generic name and a project-specific name).

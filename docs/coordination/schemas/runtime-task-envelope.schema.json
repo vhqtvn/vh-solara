@@ -1,0 +1,119 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Runtime Coordinator Task Envelope",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "task_id",
+    "coordination_mode",
+    "status",
+    "lane",
+    "requested_by",
+    "session_alias",
+    "depends_on",
+    "files_in_scope",
+    "summary",
+    "updated_at"
+  ],
+  "properties": {
+    "task_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "coordination_mode": {
+      "type": "string",
+      "enum": [
+        "short",
+        "medium",
+        "long"
+      ]
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "submitted",
+        "working",
+        "input_required",
+        "completed",
+        "failed",
+        "cancelled"
+      ]
+    },
+    "lane": {
+      "type": "string",
+      "minLength": 1
+    },
+    "requested_by": {
+      "type": "string",
+      "minLength": 1
+    },
+    "session_alias": {
+      "type": "string",
+      "minLength": 1
+    },
+    "depends_on": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "files_in_scope": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/artifact"
+      }
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1
+    },
+    "confidence": {
+      "type": "string",
+      "enum": [
+        "high",
+        "medium",
+        "low"
+      ]
+    },
+    "risk": {
+      "type": "string",
+      "enum": [
+        "low",
+        "medium",
+        "high"
+      ]
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "$defs": {
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "label",
+        "path"
+      ],
+      "properties": {
+        "label": {
+          "type": "string",
+          "minLength": 1
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,47 @@
+exclusive_paths:
+  docs/planning/backlog.md:
+    owner_lanes:
+      - docs
+    conflict_note: Only one session should update backlog status at a time.
+
+  docs/checkpoints/:
+    owner_lanes:
+      - docs
+    conflict_note: Avoid parallel edits to the same checkpoint document.
+
+  opencode.jsonc:
+    owner_lanes:
+      - coordination
+    conflict_note: Agent topology and task permissions should be changed in one focused slice.
+
+  .opencode/agents/:
+    owner_lanes:
+      - coordination
+    conflict_note: Keep agent topology and prompts aligned with opencode.jsonc.
+
+  .opencode/commands/:
+    owner_lanes:
+      - coordination
+      - docs
+    conflict_note: Command templates should move with the durable workflow they load.
+
+  docker-compose.vps.yml:
+    owner_lanes:
+      - deployment
+    conflict_note: Do not edit while a live release rollout or VPS smoke pass is active.
+
+  .local/demo-server/:
+    owner_lanes:
+      - deployment
+    conflict_note: Treat as local-only operator state. Do not rewrite during unrelated work.
+
+safe_parallel:
+  - read_only_repo_mapping
+  - checkpoint_reading_without_edits
+  - local_workstream_note_updates
+  - browser_qa_against_stable_frontend_contract
+
+coordination_rules:
+  - Prefer one editing session per canonical file.
+  - If a task crosses lanes, pick one primary owner and name the handoff boundary explicitly.
+  - When in doubt, update backlog and checkpoint state before opening a second implementation lane.

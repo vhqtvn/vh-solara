@@ -1,0 +1,32 @@
+{
+    "_comment": "Leaf model files live in .local/config/agent-model/ (gitignored, operator-managed). Each leaf listed here must have a corresponding model file and opencode.jsonc agent entry. Disabled tiers (premium) are listed here for future activation — their leaf agents are NOT registered in opencode.jsonc until the tier is enabled. Temperature is NOT set here — it is pinned per-agent in opencode.jsonc.",
+    "schema_version": 1,
+    "tiers": [
+        {
+            "name": "free",
+            "description": "Free-tier models — first gate",
+            "leaves": [
+                "commit-reviewer-a",
+                "commit-reviewer-b",
+                "commit-reviewer-c",
+                "commit-reviewer-d"
+            ],
+            "within_tier_aggregation": "strict_consensus"
+        },
+        {
+            "name": "premium",
+            "description": "Premium models — final gate",
+            "leaves": ["commit-reviewer-e"],
+            "within_tier_aggregation": "strict_consensus",
+            "disabled": true
+        }
+    ],
+    "fail_fast": true,
+    "escalation_policy": "all_approve",
+    "findings_combination": "merge_across_tiers",
+    "lightweight_review": {
+        "doc_globs": ["researches/**/*.md", "docs/**/*.md", "docs/*.md", "researches/*.md"],
+        "mode": "single_leaf",
+        "leaf_selector": "first"
+    }
+}

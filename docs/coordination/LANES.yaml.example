@@ -1,0 +1,142 @@
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │ OWNERSHIP: overlay (project-supplied).                                    │
+# │ This is an EXAMPLE. A consuming project copies this file to LANES.yaml    │
+# │ and fills in its own lanes. The generic harness lanes below are kept as   │
+# │ defaults; project-specific lanes (e.g. per-service lanes, release lanes)   │
+# │ are added by the project.                                                  │
+# │                                                                            │
+# │ The structure (scope / owned_paths / primary_specialists /                │
+# │ default_review_mode / default_file_cap / required_context_files /         │
+# │ review_focus) is stable and consumed by commit-reviewer lane defaults.    │
+# └──────────────────────────────────────────────────────────────────────────┘
+
+lanes:
+  coordination:
+    scope: Cross-boundary task routing, role selection, prompt shaping, and handoff structure
+    owned_paths:
+      - docs/coordination/
+      - .opencode/agents/coordination.md
+      - .opencode/agents/commit-message.md
+      - .opencode/agents/project-coordinator.md
+      - .opencode/commands/coordination.md
+      - opencode.jsonc
+    primary_specialists:
+      - coordination
+      - project-coordinator
+      - docs-steward
+    default_review_mode: merge-ready
+    default_file_cap: 8
+    required_context_files:
+      - AGENTS.md
+      - docs/coordination/README.md
+      - docs/coordination/LANES.yaml
+      - docs/coordination/CONFLICT_MATRIX.yaml
+    review_focus:
+      - agent or command surface drift
+      - conflicting ownership rules
+      - durable-vs-local state boundary mistakes
+
+  docs:
+    scope: Backlog, checkpoints, durable repo guidance, and operating rules
+    owned_paths:
+      - docs/planning/
+      - docs/checkpoints/
+      - docs/ai/
+      - AGENTS.md
+    primary_specialists:
+      - docs-steward
+    default_review_mode: merge-ready
+    default_file_cap: 8
+    required_context_files:
+      - AGENTS.md
+      - docs/planning/backlog.md
+      - docs/coordination/README.md
+    review_focus:
+      - history preservation
+      - durable-doc drift
+      - archive churn that obscures review scope
+
+  research:
+    scope: Durable source packets, option comparisons, and revisit-later technical memos
+    owned_paths:
+      - researches/
+      - .opencode/agents/researcher.md
+    primary_specialists:
+      - researcher
+      - docs-steward
+    default_review_mode: merge-ready
+    default_file_cap: 8
+    required_context_files:
+      - AGENTS.md
+      - researches/README.md
+      - researches/AGENTS.md
+    review_focus:
+      - source freshness and attribution quality
+      - conclusions that exceed the cited evidence
+      - premature promotion of research into live repo policy
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # PROJECT: add project-specific lanes below. A lane typically maps to a
+  # major boundary in the repo. The project supplies its own service paths,
+  # release docs, and specialist agents (including any shipped by an overlay).
+  # Replace the placeholders below with your own concrete lanes.
+  #
+  # Shipped example shapes (project fills these in or removes them):
+  #
+  #   deployment:
+  #     scope: VPS/cloud release runbooks, inventories, and remote operator workflows
+  #     owned_paths:
+  #       - docs/deployment/
+  #       - .local/deployments/
+  #       - .opencode/agents/<release-agent>.md
+  #     primary_specialists:
+  #       - <release-agent>          # project-supplied or overlay-supplied
+  #       - project-coordinator
+  #       - docs-steward
+  #     default_review_mode: merge-ready
+  #     default_file_cap: 8
+  #     required_context_files:
+  #       - AGENTS.md
+  #     review_focus:
+  #       - provider or environment drift
+  #       - secret or private-host leakage
+  #       - operator steps that are incomplete or unsafe
+  #
+  #   <service-a>:                  # e.g. an HTTP entrypoint lane
+  #     scope: HTTP entrypoints, request/response wiring, and auth handoffs
+  #     owned_paths:
+  #       - <path/to/service-a>
+  #     primary_specialists:
+  #       - <service-a-specialist>
+  #     default_review_mode: runtime-policy
+  #     default_file_cap: 8
+  #     required_context_files:
+  #       - AGENTS.md
+  #     review_focus:
+  #       - request/response contract drift
+  #       - auth or permission boundary mistakes
+  #       - transport logic leaking domain behavior
+  #
+  #   <service-b>:                  # e.g. a background-execution lane
+  #     scope: background execution and queue handoffs
+  #     owned_paths:
+  #       - <path/to/service-b>
+  #     primary_specialists:
+  #       - <service-b-specialist>
+  #     default_review_mode: runtime-policy
+  #     default_file_cap: 8
+  #     required_context_files:
+  #       - AGENTS.md
+  #     review_focus:
+  #       - retry and idempotency mistakes
+  #       - queue contract drift
+  #       - hidden service-local business logic
+  #
+  #   <domain-lane>:                # a domain-specific lane
+  #     scope: <one focused vertical slice of the project's domain>
+  #     owned_paths:
+  #       - <path/to/domain-boundary>
+  #     primary_specialists:
+  #       - <domain-specialist>
+  #     ...
+  # ──────────────────────────────────────────────────────────────────────────

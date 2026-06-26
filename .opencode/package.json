@@ -1,0 +1,9 @@
+{
+  "type": "module",
+  "private": true,
+  "description": "Harness .opencode node deps for the shell-guard engine (web-tree-sitter + tree-sitter-bash WASM). Run `npm install` here as a post-install step after `vh-agent-harness install` — node_modules is NOT vendored by go:embed.",
+  "dependencies": {
+    "tree-sitter-bash": "0.25.0",
+    "web-tree-sitter": "0.25.10"
+  }
+}
