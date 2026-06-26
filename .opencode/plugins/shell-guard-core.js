@@ -429,7 +429,7 @@ export function normalizeGitC(tokens, root) {
 // test reuse.
 export function isGateWrapperInDevShExec(cmd) {
     const normalized = stripLeadingEnvVarsFromString(cmd).trim();
-    if (!normalized.startsWith("harness ")) return false;
+    if (!normalized.startsWith("vh-agent-harness ")) return false;
     // Use includes (not startsWith) to catch nested invocations like:
     // vh-agent-harness exec bash -c '.opencode/scripts/commit-gate.sh ...'
     // False positives here are safe (over-blocking) vs under-blocking (bypass)
@@ -506,15 +506,15 @@ export async function evaluate(command) {
         return {
             action: "deny",
             reason:
-                "Env vars before harness run on the host and don't reach the container. " +
+                "Env vars before vh-agent-harness exec run on the host and don't reach the container. " +
                 "Put them inside: vh-agent-harness exec bash -c 'ENV=value your-cmd'",
         };
     }
 
-    if (command.trim().startsWith("harness git ")) {
+    if (command.trim().startsWith("vh-agent-harness git ")) {
         return {
             action: "deny",
-            reason: "Git commands must be run directly, not through harness.",
+            reason: "Git commands must be run directly, not through vh-agent-harness.",
         };
     }
 
@@ -523,14 +523,14 @@ export async function evaluate(command) {
     // `vh-agent-harness exec ...`.
     const normalizedCmd = stripLeadingEnvVarsFromString(command.trim());
 
-    if (normalizedCmd.startsWith("harness git ")) {
+    if (normalizedCmd.startsWith("vh-agent-harness git ")) {
         return {
             action: "deny",
-            reason: "Git commands must be run directly, not through harness.",
+            reason: "Git commands must be run directly, not through vh-agent-harness.",
         };
     }
 
-    if (normalizedCmd.startsWith("harness ")) {
+    if (normalizedCmd.startsWith("vh-agent-harness ")) {
         // Inspect vh-agent-harness exec payloads for gate-wrapper invocations.
         // Non-committer agents must not reach commit-gate.sh through the wrapper.
         if (isGateWrapperInDevShExec(command.trim())) {
@@ -558,7 +558,7 @@ export async function evaluate(command) {
             action: "deny",
             reason:
                 "Commands outside the read-only inspection surface must run through" +
-                " harness. This command could not be parsed safely for" +
+                " vh-agent-harness. This command could not be parsed safely for" +
                 " read-only validation.",
         };
     }
@@ -643,7 +643,7 @@ export async function evaluate(command) {
         action: "deny",
         reason:
             "Commands outside the read-only inspection surface must run through" +
-            " harness (read docs/ai/shell-execution.md if not familiar)." +
+            " vh-agent-harness (read docs/ai/shell-execution.md if not familiar)." +
             " Direct read-only commands are " +
             COMMANDS.readonly.map(trimEndStar).join(", ") +
             ". The following command is not allowed: " +

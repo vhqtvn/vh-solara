@@ -15,7 +15,7 @@ export const server = async ({ client, directory }) => {
 - Dev compose has no \`container_name\` declarations; Docker Compose auto-names as \`vh-solara-<service>-1\` (e.g., \`vh-solara-dev-1\`, \`vh-solara-api-1\`).
 - API base inside container: project-supplied (see project overlay).
 - Demo credentials / API routes: project-supplied. A consuming project appends its
-  concrete block here (see compaction-primitives.project.example.md overlay).
+  concrete block here (run `vh-agent-harness example .opencode/plugins/compaction-primitives.project.md`).
 
 ### Git Mutation Routing
 - Only the \`committer\` agent (C) may execute git mutations, through the gated-commit protocol.

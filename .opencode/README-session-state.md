@@ -71,7 +71,7 @@ The session plugin does not register the tool again. Tool loading and plugin loa
 
 `shell-guard` is responsible for:
 - allowing a narrow read-only shell surface for exploration
-- requiring `harness ...` for everything outside that narrow read-only surface
+- requiring `vh-agent-harness ...` for everything outside that narrow read-only surface
 
 `coordination-hints` is responsible for:
 - watching `session.diff` and surfacing non-blocking local hints after edits
@@ -283,7 +283,7 @@ When shell inspection is needed, the intended narrow read-only surface is:
 
 Avoid `cat` for broad exploration and avoid dumping full files unless explicitly needed.
 
-Anything outside that read-only surface should run through `harness ...`.
+Anything outside that read-only surface should run through `vh-agent-harness ...`.
 
 ## Session continuity and compaction
 

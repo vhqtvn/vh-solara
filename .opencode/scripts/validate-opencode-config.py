@@ -26,12 +26,8 @@ VALID_COLOR_TOKENS = {"info", "success", "secondary", "warning", "accent", "prim
 HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{3,8}$")
 
 
-def strip_jsonc_comments(text: str) -> str:
-    """Remove single-line (//) and multi-line (/* */) comments from JSONC text.
-
-    Also strips trailing commas before ] or } (valid JSONC), but only
-    when outside quoted strings.
-    """
+def _strip_comments(text: str) -> str:
+    """Remove single-line (//) and multi-line (/* */) comments, outside strings."""
     result: list[str] = []
     i = 0
     in_string = False
@@ -62,14 +58,48 @@ def strip_jsonc_comments(text: str) -> str:
             while i + 1 < len(text) and not (text[i] == "*" and text[i + 1] == "/"):
                 i += 1
             i += 2  # skip */
+        else:
+            result.append(ch)
+            i += 1
+
+    return "".join(result)
+
+
+def _strip_trailing_commas(text: str) -> str:
+    """Remove trailing commas before } or ], outside strings.
+
+    Assumes comments are ALREADY stripped, so the forward lookahead from a comma
+    only ever sees whitespace then a structural token. (When comments were still
+    present, a comma followed by a // or /* */ comment before the closing bracket
+    was wrongly kept, leaving a real trailing comma that broke json.loads on
+    valid JSONC — and, via the commit-gate validator, blocked every commit.)
+    """
+    result: list[str] = []
+    i = 0
+    in_string = False
+    while i < len(text):
+        ch = text[i]
+
+        if in_string:
+            result.append(ch)
+            if ch == "\\" and i + 1 < len(text):
+                i += 1
+                result.append(text[i])
+            elif ch == '"':
+                in_string = False
+            i += 1
+            continue
+
+        if ch == '"':
+            in_string = True
+            result.append(ch)
+            i += 1
         elif ch == ",":
-            # Check if the comma is trailing (only whitespace before } or ])
             j = i + 1
             while j < len(text) and text[j] in (" ", "\t", "\n", "\r"):
                 j += 1
             if j < len(text) and text[j] in ("}", "]"):
-                # Trailing comma — skip it (don't append the comma)
-                i += 1
+                i += 1  # trailing comma — drop it
             else:
                 result.append(ch)
                 i += 1
@@ -78,6 +108,18 @@ def strip_jsonc_comments(text: str) -> str:
             i += 1
 
     return "".join(result)
+
+
+def strip_jsonc_comments(text: str) -> str:
+    """Strip // and /* */ comments AND trailing commas before ]/} (valid JSONC).
+
+    Two passes by design: comments FIRST, then trailing commas. This guarantees
+    the trailing-comma lookahead only sees structural tokens, so a legal trailing
+    comma followed by comment(s) before the closing bracket is correctly removed.
+    A single interleaved pass left such commas in place and json.loads rejected
+    valid JSONC (blocking all commits through the commit-gate validator).
+    """
+    return _strip_trailing_commas(_strip_comments(text))
 
 
 def validate_jsonc() -> list[str]:

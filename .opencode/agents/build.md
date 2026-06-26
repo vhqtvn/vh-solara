@@ -20,7 +20,7 @@ If your mission text and these docs disagree, surface the conflict to the operat
 
 ## Shell hygiene
 
-- Prefix every shell command with `vh-agent-harness exec …` (or use a `harness <subcommand>` wrapper). Direct host-side commands fall through opencode's permission table to `*: ask` and burn operator confirmations.
+- Prefix every shell command with `vh-agent-harness exec …` (or use a `vh-agent-harness <subcommand>` wrapper). Direct host-side commands fall through opencode's permission table to `*: ask` and burn operator confirmations.
 - Pipelines that mix `vh-agent-harness exec …` on the left with a raw command on the right (`vh-agent-harness exec <cloud-cli> … | <raw-cmd> …`) also prompt — wrap the whole pipeline inside a single `vh-agent-harness exec bash -c '…'` or use the wrapped subcommand.
 - The `shell-guard` plugin (`.opencode/plugins/shell-guard.js`) refuses a list of high-risk patterns. If a deny fires, do **not** paraphrase the command to evade it (no base64, no splitting verbs across two calls, no quoting tricks). Read the rule's `why`, pick the canonical alternative, or surface the situation.
 
@@ -40,8 +40,8 @@ Most recurring prompts come from commands the matcher's safe-parser cannot parse
 
 ## Wrapped subcommands you should reach for
 
-- `harness ssh-trust <host>` — appends `ssh-keyscan` output to `.local/ssh/known_hosts` on the host. Run this once per VPS so subsequent ssh works with no `-o` flags. `.local/ssh/` is bind-mounted RO into the dev container on purpose; you cannot append from inside.
-- Project-specific wrapped subcommands (e.g. host-side container image build/push to a remote registry for managed training runtimes) — if the consuming project ships extra `harness <subcommand>` wrappers, prefer them over raw `docker build` / `docker login` / `docker push`. See the project overlay.
+- `vh-agent-harness ssh-trust <host>` — appends `ssh-keyscan` output to `.local/ssh/known_hosts` on the host. Run this once per VPS so subsequent ssh works with no `-o` flags. `.local/ssh/` is bind-mounted RO into the dev container on purpose; you cannot append from inside.
+- Project-specific wrapped subcommands (e.g. host-side container image build/push to a remote registry for managed training runtimes) — if the consuming project ships extra `vh-agent-harness <subcommand>` wrappers, prefer them over raw `docker build` / `docker login` / `docker push`. See the project overlay.
 - `vh-agent-harness exec terraform -chdir=infra/terraform/demo …` — terraform state is local to the repo directory and terraform runs in the dev container. Do not re-init terraform on the VPS.
 
 <!-- HARNESS:EXTEND custom-verbs -->

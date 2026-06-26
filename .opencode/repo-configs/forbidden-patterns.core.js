@@ -17,7 +17,7 @@
 // on-VPS bans) belong in the PROJECT overlay file
 // `forbidden-patterns.project.js` (project_owned), NOT here. The harness
 // scaffolds a blank `forbidden-patterns.project.js` on install; the project
-// fills it. See forbidden-patterns.project.example.js for the pattern.
+// fills it. Run `vh-agent-harness example .opencode/repo-configs/forbidden-patterns.project.js` for the pattern.
 //
 // These rules apply to the full command string, including everything wrapped
 // inside `vh-agent-harness exec ...`, `bash -c '...'`, or ssh remote payloads. Each
@@ -80,7 +80,7 @@ export function inspectorAllowIf(inspectorGroup) {
         "(?![\\s\\S]*(?:&&|\\|\\||[;&|`]|\\$\\())" +
         "(?:^\\s*" +
             "(?:[A-Z_][A-Z0-9_]*=\\S*\\s+)*" + // leading env-var assignments
-            "(?:harness\\s+(?:[A-Za-z]+\\s+)*exec\\s+)?" + // harness [subcmd] exec
+            "(?:vh-agent-harness\\s+(?:[A-Za-z]+\\s+)*exec\\s+(?:--\\s+)?)?" + // vh-agent-harness [subcmd] exec [--]
             "(?:" + inspectorGroup + ")(?=\\s|$)" + // inspector verb in command position
         "|\\b(?:bash|sh|zsh)\\s+-[a-z]*c\\s+['\"]\\s*" + // inside shell -c '...'
             "(?:[A-Z_][A-Z0-9_]*=\\S*\\s+)*" +
@@ -133,7 +133,7 @@ export const FORBIDDEN_PATTERNS = [
         why:
             "Do not disable SSH host-key verification. The dev container has" +
             " .local/ssh/ bind-mounted RO, so you cannot append to known_hosts" +
-            " from inside — that is intentional. Run `harness ssh-trust <host>`" +
+            " from inside — that is intentional. Run `vh-agent-harness ssh-trust <host>`" +
             " on the host side once, then ssh from inside with no flags. MITM" +
             " on a public IP is real.",
     },

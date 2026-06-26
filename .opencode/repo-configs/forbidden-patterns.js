@@ -11,9 +11,9 @@
 // │ This file concatenates them into a single exported FORBIDDEN_PATTERNS.     │
 // │                                                                            │
 // │ A consuming project MUST NOT edit this file. To add project-specific       │
-// │ rules, copy forbidden-patterns.project.example.js to                        │
-// │ forbidden-patterns.project.js and fill it in. The merge pattern is core    │
-// │ first, then project (see forbidden-patterns.project.example.js).           │
+// │ rules, edit forbidden-patterns.project.js (run `vh-agent-harness example    │
+// │ .opencode/repo-configs/forbidden-patterns.project.js` for templates). The   │
+// │ merge pattern is core first, then project.                                 │
 // └──────────────────────────────────────────────────────────────────────────┘
 //
 // The project overlay is OPTIONAL: if forbidden-patterns.project.js does not
@@ -46,5 +46,5 @@ try {
 }
 
 // Merge: core rules first, then project-specific rules. This matches the merge
-// pattern documented in forbidden-patterns.project.example.js (line ~67).
+// pattern documented via `vh-agent-harness example .opencode/repo-configs/forbidden-patterns.project.js`.
 export const FORBIDDEN_PATTERNS = [..._CORE, ..._project];

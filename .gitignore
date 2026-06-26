@@ -58,3 +58,18 @@ pkg/web/dist/*
 # coordinator runs, ssh, cleared-assumptions). NOT committed. The committed
 # harness config lives under .vh-agent-harness/ and .opencode/.
 .local/
+
+# vh-agent-harness runtime/written state — agent scratch, session/workstream
+# state, commit-gate scratch, and Python caches. NOT committed. (The harness's
+# own starter .gitignore lists these as "never commit"; .local/ above already
+# covers the operator-local .local/* subtrees and tmp/ covers repo scratch.)
+.opencode/state/
+.opencode/sessions/
+.opencode/plans/
+.opencode/runs/
+.opencode/scripts/__pycache__/
+.git/commit-gate/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
