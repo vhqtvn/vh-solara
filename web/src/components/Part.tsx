@@ -2,6 +2,7 @@ import { createEffect, createMemo, createResource, createSignal, For, Match, onC
 import { createStore } from "solid-js/store";
 import { renderMarkdown } from "../render";
 import { renderStreamMd } from "../lib/md";
+import { StreamMd } from "../lib/streamMd";
 import { placeStreamCaret } from "../lib/streamCaret";
 import { renderMermaid } from "../lib/mermaid";
 import { renderMathIn } from "../lib/math";
@@ -251,71 +252,71 @@ function Markdown(props: { text: string; settled: boolean; caret?: boolean }) {
   // (the message the user is watching). History blocks are created already
   // settled → false → cheap raw fallback (no per-block client parse on load).
   const live = !props.settled;
-  // Seed synchronously so a (re)mount shows formatted content immediately rather
-  // than an empty frame; the reveal/debounce below keeps it current as tokens arrive.
-  const [streamHtml, setStreamHtml] = createSignal(!props.settled && streamLive() ? renderStreamMd(props.text) : "");
-  const smooth =
-    !props.settled && streamLive() &&
-    !(typeof window !== "undefined" && window.matchMedia?.("(prefers-reduced-motion: reduce)").matches);
-  if (smooth) {
-    // Smooth "typewriter" reveal: advance a shown-prefix toward the full
-    // accumulated text instead of popping in whole blocks as each (possibly
-    // large) network chunk flushes. The pace SELF-MATCHES the arrival rate via a
-    // first-order lag filter — each step reveals a fraction (dt/TAU) of the
-    // current backlog, so reveal-rate ≈ arrival-rate in steady state (≈TAU lag):
-    // a fast/bursty stream catches up quickly, a slow trickle reveals slowly, and
-    // it idles the moment it's caught up. Decoupled from chunk size.
-    const TAU = 110; // ms — reveal lag / smoothing time constant
-    let shown = props.text.length; // text already present (mount / session switch) shows at once
-    let raf: number | undefined;
-    let lastT = 0;
-    const tick = (t: number) => {
-      raf = undefined;
-      const target = props.text;
-      const backlog = target.length - shown;
-      if (backlog <= 0) { lastT = 0; return; } // caught up — idle until the effect reschedules
-      if (!lastT || t - lastT >= 22) {         // cap parse work at ~45fps
-        const dt = lastT ? Math.min(120, t - lastT) : 22; // clamp (e.g. after a hidden tab)
-        lastT = t;
-        const step = Math.max(1, Math.ceil(backlog * Math.min(1, dt / TAU)));
-        shown = Math.min(target.length, shown + step);
-        setStreamHtml(renderStreamMd(target.slice(0, shown)));
-      }
-      raf = requestAnimationFrame(tick);
-    };
-    createEffect(() => {
-      const target = props.text; // re-run as deltas arrive
-      if (props.settled) return;
-      if (shown > target.length) shown = target.length; // defensive: text replaced/shrank
-      if (shown < target.length && raf === undefined) raf = requestAnimationFrame(tick);
-    });
-    onCleanup(() => { if (raf !== undefined) cancelAnimationFrame(raf); });
-  } else {
-    // Reduced-motion (or non-live): render the full accumulated text on change.
-    let timer: number | undefined;
-    createEffect(() => {
-      const text = props.text;
-      if (props.settled || !streamLive()) return;
-      clearTimeout(timer);
-      timer = window.setTimeout(() => setStreamHtml(renderStreamMd(text)), 70);
-    });
-    onCleanup(() => clearTimeout(timer));
-  }
   const streamingView = () => {
     if (!streamLive()) return <></>;
     let host: HTMLDivElement | undefined;
-    // A detached caret node we re-attach after each render: setting innerHTML
-    // wipes children, so we place it fresh into the last rendered block.
+    let engine: StreamMd | undefined;
+    // A detached caret node re-attached after each render (the active block is
+    // rebuilt each tick, which removes it), placed at the end of the last line.
     const caretEl = document.createElement("span");
     caretEl.className = "stream-caret";
     caretEl.setAttribute("aria-hidden", "true");
-    createEffect(() => {
-      const html = streamHtml();
-      const tail = props.caret; // track so the caret clears when this stops being the tail
+    const render = (text: string, tail?: boolean) => {
       if (!host) return;
-      host.innerHTML = html;
+      (engine ||= new StreamMd(host)).push(text);
       if (tail) placeStreamCaret(host, caretEl);
-    });
+    };
+
+    const reduce = typeof window !== "undefined" && window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+    if (reduce) {
+      // No animated reveal: render the full accumulated text on change (debounced).
+      let timer: number | undefined;
+      createEffect(() => {
+        const text = props.text;
+        const tail = props.caret;
+        if (props.settled) return;
+        clearTimeout(timer);
+        timer = window.setTimeout(() => render(text, tail), 70);
+      });
+      onCleanup(() => clearTimeout(timer));
+    } else {
+      // Smooth "typewriter" reveal: advance a shown-prefix toward the full text so
+      // output flows steadily instead of popping in whole blocks as each (possibly
+      // large) chunk flushes. The pace SELF-MATCHES arrival via a first-order lag
+      // filter — each step reveals a fraction (dt/TAU) of the backlog, so reveal-
+      // rate ≈ arrival-rate (≈TAU lag): bursts catch up, a trickle reveals slowly,
+      // and it idles when caught up. Each step is cheap — the StreamMd engine only
+      // rebuilds the trailing block — so the cadence is a steady modest fps, not
+      // throttled by message length.
+      const TAU = 110; // ms — reveal lag / smoothing time constant
+      let shown = props.text.length; // text already present (mount / switch) shows at once
+      let raf: number | undefined;
+      let lastT = 0;
+      const tick = (t: number) => {
+        raf = undefined;
+        const target = props.text;
+        const backlog = target.length - shown;
+        if (backlog <= 0) { lastT = 0; return; } // caught up — idle until the effect reschedules
+        if (!lastT || t - lastT >= 40) { // ~25fps; cheap per step (active block only)
+          const dt = lastT ? Math.min(240, t - lastT) : 40; // clamp (e.g. after a hidden tab)
+          lastT = t;
+          shown = Math.min(target.length, shown + Math.max(1, Math.ceil(backlog * Math.min(1, dt / TAU))));
+          render(target.slice(0, shown), props.caret);
+        }
+        raf = requestAnimationFrame(tick);
+      };
+      createEffect(() => {
+        const target = props.text; // re-run as deltas arrive
+        if (props.settled) return;
+        if (shown > target.length) shown = target.length; // defensive: text replaced/shrank
+        if (shown < target.length) {
+          if (raf === undefined) raf = requestAnimationFrame(tick);
+        } else {
+          render(target.slice(0, shown), props.caret); // seed / keep caret fresh when caught up
+        }
+      });
+      onCleanup(() => { if (raf !== undefined) cancelAnimationFrame(raf); });
+    }
     return <div class="md md-stream" ref={host} />;
   };
   return (
