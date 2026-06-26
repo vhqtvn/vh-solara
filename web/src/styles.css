@@ -1145,6 +1145,12 @@ body {
 @media (prefers-reduced-motion: reduce) { .stream-caret { animation: none; } }
 .md :first-child { margin-top: 0; }
 .md :last-child { margin-bottom: 0; }
+/* Make each streamed block its own layout/paint unit. Appending to the active
+   (last) block otherwise forces the browser to rebuild the WHOLE message's
+   display list, which GROWS with the message → O(n²) repaint as a reply streams
+   (the climbing temp). With per-block containment the completed blocks above are
+   retained and only the growing block repaints. */
+.md-stream > * { contain: layout paint; }
 .md pre {
   background: var(--code-bg);
   border: 1px solid var(--border);
