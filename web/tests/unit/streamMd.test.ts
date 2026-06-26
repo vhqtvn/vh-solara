@@ -78,7 +78,7 @@ describe("StreamMd (incremental streaming markdown)", () => {
     md.push("**bo", 0);
     md.push("**bold**", 10); // within cap → shown raw
     expect(h.querySelector("strong")).toBeNull();
-    md.push("**bold**", 300); // past the cap → re-parsed, now formatted
+    md.push("**bold**", 6000); // past the cap → re-parsed, now formatted
     expect(h.querySelector("strong")?.textContent).toBe("bold");
   });
 

@@ -34,7 +34,15 @@ function tokenHtml(token: unknown): string {
   return html.replace(URL_SCRUB, ' $1="#"');
 }
 
-const REPARSE_MS = 200; // time cap: how stale the trailing block's formatting may get
+// Time cap for re-parsing the trailing block. A re-parse re-renders that block's
+// HTML (re-innerHTML), which repaints it and clobbers any text selection inside —
+// so we want it RARE. Block boundaries (blank line / fence close) still re-parse
+// immediately and finalize+format the block, so this cap only governs an
+// un-terminated block (a long paragraph/list/code still streaming): its inline
+// markdown stays raw for at most this long before formatting. 5s ≫ the 200ms it
+// was, cutting active-block repaints ~25× while almost every block formats at its
+// boundary well before the cap fires.
+const REPARSE_MS = 5000;
 
 export class StreamMd {
   private committedLen = 0; // source chars rendered into finalized (untouched) DOM
