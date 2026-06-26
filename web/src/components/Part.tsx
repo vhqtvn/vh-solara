@@ -269,7 +269,11 @@ function Markdown(props: { text: string; settled: boolean; caret?: boolean }) {
     // itself is cheap. Here we render at most once per FRAME_MS, skip entirely
     // when nothing changed, and idle between deltas — the model's own chunking
     // gives the streaming feel.
-    const FRAME_MS = 60;
+    // Each render mutates the DOM, which forces a display-list rebuild + paint of
+    // the (contained) message — the dominant streaming cost per the Firefox
+    // profile. Painting fewer times/sec is the most direct heat reduction, and
+    // streamed text reads fine at ~8fps, so coalesce harder.
+    const FRAME_MS = 120;
     let timer: number | undefined;
     let lastRender = 0;
     const flush = () => {
