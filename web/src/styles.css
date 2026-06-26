@@ -466,15 +466,12 @@ body {
   border-top: 1px solid var(--border);
 }
 .tree-spinner { flex: 0 0 auto; width: 11px; height: 11px; color: var(--accent); }
-/* Composited breathe on the WHOLE spinner element (opacity on the GPU) — the SVG
-   blob is rasterized once, not re-rasterized per frame. */
-[data-component="spinner"] {
-  animation: spinner-breathe 1.15s ease-in-out infinite;
-  will-change: opacity;
-}
-@keyframes spinner-breathe { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+/* Per-cell shimmer (each square fades on its own randomized phase — the original
+   opencode look). */
+@keyframes spin-pulse { 0%, 100% { opacity: 0.4; } 50% { opacity: 1; } }
+@keyframes spin-pulse-dim { 0%, 100% { opacity: 0.15; } 50% { opacity: 0.35; } }
 @media (prefers-reduced-motion: reduce) {
-  [data-component="spinner"] { animation: none; opacity: 0.85; }
+  [data-component="spinner"] rect { animation: none !important; }
 }
 .tree-twisty {
   flex: none;
