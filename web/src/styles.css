@@ -3300,10 +3300,7 @@ div.katex-math { display: block; overflow-x: auto; margin: 0.7em 0; text-align: 
    it's ONE tiny ~24px glyph (not a scroll container / not a growing message),
    but the drop-shadow is the first lever to drop if GPU heat ever returns. */
 .working {
-  display: inline-flex; align-items: center; gap: 10px; min-width: 0;
-  padding: 6px 12px; border-radius: 999px;
-  background: color-mix(in srgb, var(--fg) 5%, transparent);
-  border: 1px solid color-mix(in srgb, var(--fg) 8%, transparent);
+  display: inline-flex; align-items: center; gap: 8px; min-width: 0;
   font-size: var(--text-sm); font-weight: 650; line-height: 1;
   color: var(--fg);
 }
