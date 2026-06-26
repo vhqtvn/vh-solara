@@ -36,7 +36,9 @@ function trailingText(child: Element): string {
   return s;
 }
 
-export function placeStreamCaret(root: HTMLElement, caret: HTMLElement): void {
+// The element at the end of the last rendered line — where the caret (and the
+// streaming engine's plain-text tail node) should be appended.
+export function caretTarget(root: HTMLElement): HTMLElement {
   let el: HTMLElement = root;
   while (el.lastElementChild) {
     const child = el.lastElementChild as HTMLElement;
@@ -47,5 +49,9 @@ export function placeStreamCaret(root: HTMLElement, caret: HTMLElement): void {
     if (INLINE.has(tag) && trailingText(child).trim() !== "") break;
     el = child;
   }
-  el.appendChild(caret);
+  return el;
+}
+
+export function placeStreamCaret(root: HTMLElement, caret: HTMLElement): void {
+  caretTarget(root).appendChild(caret);
 }
