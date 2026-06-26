@@ -1039,16 +1039,22 @@ body {
 
 .msg {
   margin: 0 0 18px;
-  /* Isolate each message as a layout + paint container. While a reply streams,
-     the daemon profile showed the WHOLE transcript's display list being rebuilt
-     from the viewport root every update (nsLayoutUtils::PaintFrame →
-     ViewportFrame::BuildDisplayList), which pinned the CPU/heat. Paint
-     containment lets the browser cull off-screen messages from display-list
-     building and keeps the growing message's reflow from invalidating siblings.
-     NOTE: deliberately NOT content-visibility — that collapses off-screen
-     messages to an estimated size and makes scrolling UP jump (see history); this
-     bounds the paint work while laying every message out at its real height. */
-  contain: layout paint;
+  /* Virtualization-lite. A Firefox profile of a streaming reply showed the WHOLE
+     transcript's display list being rebuilt from the viewport root every update
+     (nsLayoutUtils::PaintFrame → ViewportFrame::BuildDisplayList ≈72%), which is
+     what pinned the CPU/heat. content-visibility:auto skips layout/paint/
+     display-list building for OFF-screen messages (the browser-native equivalent
+     of react-window that ChatGPT-style UIs use), and applies layout+paint
+     containment to on-screen ones so the growing message's reflow can't
+     invalidate siblings.
+     An earlier attempt was reverted because collapsing off-screen messages to an
+     estimate made scrolling UP jump. The fix is the `auto` keyword in
+     contain-intrinsic-size: the browser REMEMBERS each message's last rendered
+     height, so re-revealing a message restores its real size — no jump. (Only a
+     never-yet-rendered message uses the 6rem fallback; overflow-anchor on
+     .chat-scroll absorbs that.) */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 6rem;
 }
 .msg-head {
   display: flex;
