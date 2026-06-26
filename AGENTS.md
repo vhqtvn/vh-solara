@@ -25,6 +25,35 @@ Notes for agents and contributors working in this repo.
   `go run ./tools/fixtureserver`, so go must be on PATH).
 - Go e2e harness: `tests/e2e/` (`e2e.StartCluster()`).
 
+## Web frontend performance — Firefox/WebRender GPU gotchas
+
+The UI runs on the user's GPU. Firefox/WebRender punishes a few CSS patterns far
+harder than Chromium, and they can pin a GPU to ~99°C while looking innocent. A
+long saga traced the heat to these — avoid them on large/scrolling/always-present
+surfaces (the chat scroll, message list, reasoning body):
+
+- **`mask-image` / `-webkit-mask` on a scroll container is the worst.** It forces
+  the WHOLE scrollable content to render to an offscreen surface and
+  re-rasterize. We had a gradient edge-fade mask on `.chat-scroll`/`.reasoning-body`
+  that re-rastered the entire transcript **on every scroll frame** → "scroll
+  up/down and the temp climbs," in any session. Removed (see `lib/scrollEdges.ts`).
+  This was the actual culprit; everything else below was secondary.
+- **`backdrop-filter: blur` is a per-frame full re-blur** of whatever's behind it.
+  Don't use it on overlays (removed from `.restart-overlay`).
+- **`contain: paint` / `content-visibility: auto` per element can make it WORSE,
+  not better.** Each becomes its own compositing surface/blob; with many of them
+  the GPU blows past its surface budget into a degraded, stuck-hot state. They
+  did NOT help here — don't reach for them as a perf fix on Firefox.
+- **Per-frame work scales with total DOM,** because a repaint/animation can trigger
+  a full-document display-list rebuild. So cap streaming re-render rate (the live
+  markdown stream is coalesced to ~5fps in `Part.tsx`) and prefer cheap DOM ops
+  (the `StreamMd` engine appends text nodes; it never rewrites a growing node).
+- Diagnosing: a bare repro page often won't reproduce it — the cost is the real
+  app's complex scene. Capture a Firefox profiler trace and look under
+  `Update the rendering → Paint` for `ViewportFrame::BuildDisplayList` (display
+  list) vs `Grouper`/`GetBlobItemData` (blob raster). Headless browsers don't
+  GPU-rasterize, so they can't reproduce the heat.
+
 ## Conventions
 
 - State-changing `/vh/*` requests require the `X-VH-CSRF: 1` header (the SPA's
