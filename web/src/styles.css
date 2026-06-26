@@ -466,8 +466,17 @@ body {
   border-top: 1px solid var(--border);
 }
 .tree-spinner { flex: 0 0 auto; width: 11px; height: 11px; color: var(--accent); }
-@keyframes spin-pulse { 0%, 100% { opacity: 0.4; } 50% { opacity: 1; } }
-@keyframes spin-pulse-dim { 0%, 100% { opacity: 0.15; } 50% { opacity: 0.35; } }
+/* Composited breathe on the WHOLE spinner element — opacity animates on the GPU,
+   so the SVG blob is rasterized once and never re-rasterized per frame (the old
+   per-<rect> opacity keyframes did, forcing continuous main-thread paint). */
+[data-component="spinner"] {
+  animation: spinner-breathe 1.15s ease-in-out infinite;
+  will-change: opacity;
+}
+@keyframes spinner-breathe { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+@media (prefers-reduced-motion: reduce) {
+  [data-component="spinner"] { animation: none; opacity: 0.85; }
+}
 .tree-twisty {
   flex: none;
   width: 18px;
@@ -3323,26 +3332,19 @@ div.katex-math { display: block; overflow-x: auto; margin: 0.7em 0; text-align: 
   0%, 70%, 100% { transform: translateY(0); opacity: 0.4; }
   35% { transform: translateY(-5px); opacity: 1; }
 }
-/* "Working…" with a light sweep across the glyphs (clipped gradient). Just the
-   one short label, so the per-frame repaint is negligible. */
+/* "Working…" label — a gentle opacity pulse (composited). NOT a text-clipped
+   animated gradient: the profile showed that as continuous nsCSSGradientRenderer
+   ::Paint every frame (main-thread). The bouncing dots carry the motion. */
 .working-shimmer {
   font-size: var(--text-sm); font-weight: 600; letter-spacing: 0.01em;
-  background: linear-gradient(100deg,
-    color-mix(in srgb, var(--accent) 50%, var(--fg)) 0%,
-    color-mix(in srgb, var(--accent) 50%, var(--fg)) 35%,
-    var(--accent) 50%,
-    color-mix(in srgb, var(--accent) 50%, var(--fg)) 65%,
-    color-mix(in srgb, var(--accent) 50%, var(--fg)) 100%);
-  background-size: 220% 100%;
-  -webkit-background-clip: text; background-clip: text;
-  color: transparent; -webkit-text-fill-color: transparent;
-  animation: working-sweep 1.6s linear infinite;
+  color: color-mix(in srgb, var(--accent) 55%, var(--fg));
+  animation: working-pulse 1.6s ease-in-out infinite;
 }
-@keyframes working-sweep { from { background-position: 220% 0; } to { background-position: -20% 0; } }
+@keyframes working-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
 @media (prefers-reduced-motion: reduce) {
   .working-shimmer {
-    animation: none; background: none;
-    color: var(--fg-dim); -webkit-text-fill-color: var(--fg-dim);
+    animation: none;
+    color: var(--fg-dim);
   }
   .working-dots i { animation: none; opacity: 0.6; }
 }
