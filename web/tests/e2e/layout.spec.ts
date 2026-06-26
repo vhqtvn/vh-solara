@@ -149,7 +149,7 @@ test("the Working… indicator shows while the assistant streams", async ({ page
   await page.getByPlaceholder("Message…").fill("stream please");
   await page.keyboard.press("Enter");
   // The Working… shimmer appears during the streamed turn…
-  await expect(page.locator(".working-shimmer")).toBeVisible({ timeout: 5000 });
+  await expect(page.locator(".working-text")).toBeVisible({ timeout: 5000 });
   // …and clears once the turn completes.
-  await expect(page.locator(".working-shimmer")).toHaveCount(0, { timeout: 8000 });
+  await expect(page.locator(".working-text")).toHaveCount(0, { timeout: 8000 });
 });

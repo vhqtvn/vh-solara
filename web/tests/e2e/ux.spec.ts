@@ -12,10 +12,10 @@ test("sending a prompt shows a working spinner that returns to idle", async ({ p
   await expect(page.locator(".tree-node .tree-spinner").first()).toBeVisible({ timeout: 5000 });
   // ...and the chat shows the "Working…" shimmer (driven by the busy activity
   // signal, not just an in-flight assistant message)...
-  await expect(page.locator(".working-shimmer")).toBeVisible();
+  await expect(page.locator(".working-text")).toBeVisible();
   // ...and both settle when the turn completes.
   await expect(page.locator(".tree-node .tree-spinner")).toHaveCount(0, { timeout: 8000 });
-  await expect(page.locator(".working-shimmer")).toHaveCount(0, { timeout: 8000 });
+  await expect(page.locator(".working-text")).toHaveCount(0, { timeout: 8000 });
 });
 
 test("a message sent while busy is queued, then auto-sent when the turn finishes", async ({ page }) => {
@@ -61,12 +61,12 @@ test("Stop clears the working indicator immediately (abort)", async ({ page }) =
   // [[stall]] keeps the turn busy server-side for several seconds.
   await page.getByPlaceholder("Message…").fill("[[stall]] hang please");
   await page.keyboard.press("Enter");
-  await expect(page.locator(".working-shimmer")).toBeVisible({ timeout: 5000 });
+  await expect(page.locator(".working-text")).toBeVisible({ timeout: 5000 });
 
   // Stop aborts on the server AND clears the local working state right away,
   // even though the fixture (like OpenCode) emits no idle event on abort.
   await page.locator(".send-btn.stop").click();
-  await expect(page.locator(".working-shimmer")).toHaveCount(0, { timeout: 2000 });
+  await expect(page.locator(".working-text")).toHaveCount(0, { timeout: 2000 });
   await expect(page.locator(".tree-node .tree-spinner")).toHaveCount(0, { timeout: 2000 });
 });
 
