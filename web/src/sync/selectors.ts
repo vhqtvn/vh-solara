@@ -41,6 +41,19 @@ export function lastUserMessageModel(id: string): ModelRefLite | undefined {
   return undefined;
 }
 
+// The agent of the session's most recent message that carries one (OpenCode
+// stamps `agent` on assistant messages). Used to restore the composer's agent
+// per session, the same way the model is restored from the last user message.
+export function sessionLastAgent(id: string): string | undefined {
+  const sm = state.messages[id];
+  if (!sm) return undefined;
+  for (let i = sm.order.length - 1; i >= 0; i--) {
+    const info: any = sm.byId[sm.order[i]]?.info;
+    if (info?.agent) return info.agent as string;
+  }
+  return undefined;
+}
+
 // True when a session OR any of its subagents has a pending permission/question
 // (a typed reply it's blocked on). Reactive — clears itself when the request is
 // resolved. Surfaced in the session list and used to auto-ack the in-app nudge.

@@ -107,6 +107,7 @@ export {
   sessionNeedsInput,
   sessionModel,
   lastUserMessageModel,
+  sessionLastAgent,
   sessionWorking,
   runningSessionCount,
   sessionTodos,

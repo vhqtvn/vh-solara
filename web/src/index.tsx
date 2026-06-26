@@ -1,7 +1,8 @@
 import { render } from "solid-js/web";
+import { createEffect, createRoot, on } from "solid-js";
 import App from "./App";
 import StandaloneCode from "./components/StandaloneCode";
-import { startSync } from "./sync";
+import { projectDir, startSync } from "./sync";
 import { loadModels } from "./models";
 import { loadAgents } from "./agents";
 import { applyTheme } from "./theme";
@@ -33,6 +34,12 @@ if (standalone === "code") {
   startSync();
   void loadModels();
   void loadAgents();
+  // Agents and models are project-scoped (OpenCode resolves them per directory).
+  // Reload them when the active project changes so a switch doesn't keep the old
+  // project's agent list / models. defer: the initial load is the two calls above.
+  createRoot(() =>
+    createEffect(on(projectDir, () => { void loadAgents(); void loadModels(); }, { defer: true })),
+  );
   registerServiceWorker();
   startVersionCheck();
   initPwaInstall();

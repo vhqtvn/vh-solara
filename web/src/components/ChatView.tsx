@@ -5,7 +5,7 @@ import { getScroll, setScroll } from "../lib/scroll";
 import { highlightInput } from "../lib/composerHighlight";
 import { chooseVariant, findModel, loadModels, models, selectionFor } from "../models";
 import { loadVersioned, saveVersioned } from "../lib/store";
-import { activeAgent, agents, selectAgentForSession, selectedAgent } from "../agents";
+import { activeAgent, agentForSession, agents, selectAgentForSession, selectedAgent } from "../agents";
 import { dequeue, enqueue, queueFor, queueMode, removeQueued } from "../queue";
 import { historyAt, historyLen, pushHistory } from "../history";
 import { type AcItem, commandSuggestions, fileSuggestions } from "../lib/complete";
@@ -732,7 +732,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // so a queued message keeps the config it was composed with.
   function captureConfig(id: string): QueueConfig {
     const s = selectionFor(id);
-    return { providerID: s?.providerID, modelID: s?.modelID, variant: s?.variant, agent: activeAgent() || undefined };
+    return { providerID: s?.providerID, modelID: s?.modelID, variant: s?.variant, agent: activeAgent(props.sessionId) || undefined };
   }
 
   // Build + POST a prompt with explicit parts and send config (shared by direct
@@ -763,7 +763,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       providerID: s?.providerID || models()[0]?.providerID,
       modelID: s?.modelID || models()[0]?.modelID,
       variant: s?.variant,
-      agent: activeAgent() || undefined,
+      agent: activeAgent(props.sessionId) || undefined,
     };
     setAttachments([]);
     return sendParts(key, id, parts, config);
@@ -860,7 +860,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     if (!command || !id || isSending(key)) return false;
     setSending(key, true);
     const body: any = { command };
-    const ag = activeAgent();
+    const ag = activeAgent(props.sessionId);
     if (ag) body.agent = ag; // never fall back to a hardcoded "build" that may be disabled
     const s = selectionFor(id);
     if (s) body.model = { providerID: s.providerID, modelID: s.modelID };
@@ -1333,7 +1333,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
               <Select
                 class="bar-select agent-select"
                 ariaLabel="Agent"
-                value={selectedAgent() ?? ""}
+                value={agentForSession(props.sessionId)}
                 options={agents().map((a) => ({ value: a.name, label: `@${a.name}` }))}
                 onChange={(v) => selectAgentForSession(props.sessionId, v)}
               />

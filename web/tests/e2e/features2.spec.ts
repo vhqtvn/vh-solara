@@ -1,16 +1,21 @@
 import { expect, test } from "@playwright/test";
 
-test("composer has an agent selector defaulting to the config default_agent", async ({ page }) => {
+test("composer agent reflects the session's last-used agent; new sessions use the config default", async ({ page }) => {
   await page.goto("/");
+  // The demo session's most recent assistant turn ran @build, so the composer
+  // restores THAT per session — not the global/config default.
   await page.getByRole("button", { name: /Demo session/ }).click();
   const agent = page.locator(".agent-select");
   await expect(agent).toBeVisible();
-  // The fixture config sets default_agent="plan", which wins over the stored
-  // pick — the custom select's button shows the selected agent.
-  await expect(agent.locator(".vh-select-label")).toHaveText("@plan");
+  await expect(agent.locator(".vh-select-label")).toHaveText("@build");
   // The reply model is taken from the session's persisted model (OpenCode names
   // it `id`), so it shows the model — not "Select model".
   await expect(page.locator(".model-btn-name")).toHaveText("Dummy Model");
+
+  // A NEW session has no history, so it falls back to the config default_agent
+  // (the fixture sets default_agent="plan").
+  await page.getByRole("button", { name: "Create session" }).click();
+  await expect(agent.locator(".vh-select-label")).toHaveText("@plan");
 });
 
 test("header servers popover has Server/MCP/LSP/Plugins tabs", async ({ page }) => {
