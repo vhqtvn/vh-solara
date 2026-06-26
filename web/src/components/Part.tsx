@@ -498,6 +498,27 @@ function ToolPart(props: { part: Part; tail?: boolean }) {
 
 // Reasoning block with a live "thinking" duration. While the part is still
 // streaming the timer ticks (created → now); once it ends it shows the total.
+// While a reasoning block streams it can grow to tens of thousands of chars. The
+// body is a 320px scroll box, but the browser still builds the display list for
+// the ENTIRE block every update (overflow bounds raster, not display-list build)
+// → cost climbs with length and pins the GPU (the reported thinking-block heat).
+// So during streaming we keep only a bounded TAIL of raw text in the DOM (what's
+// actually visible in the box anyway); the full formatted markdown renders once
+// on settle. Constant DOM size → flat cost regardless of total length.
+function ReasoningStream(props: { text: string }) {
+  const WINDOW = 4000;
+  const win = (t: string) => (t.length > WINDOW ? "…\n" + t.slice(-WINDOW) : t);
+  const [shown, setShown] = createSignal(win(props.text));
+  let timer: number | undefined;
+  createEffect(() => {
+    const t = props.text;
+    if (timer !== undefined) return; // coalesce to ~5fps; constant-size update
+    timer = window.setTimeout(() => { timer = undefined; setShown(win(t)); }, 200);
+  });
+  onCleanup(() => clearTimeout(timer));
+  return <div class="md md-raw">{shown()}</div>;
+}
+
 function ReasoningPart(props: { part: Part; settled: boolean; tail?: boolean }) {
   const start = () => props.part.time?.start;
   const end = () => props.part.time?.end;
@@ -559,7 +580,12 @@ function ReasoningPart(props: { part: Part; settled: boolean; tail?: boolean }) 
           <Show when={revealed()}>
             <div class="reasoning-body" ref={bodyEl} onScroll={onScroll}>
               <div ref={contentEl}>
-                <Markdown text={(props.part.text as string) || ""} settled={props.settled} caret={props.tail} />
+                <Show
+                  when={props.settled}
+                  fallback={<ReasoningStream text={(props.part.text as string) || ""} />}
+                >
+                  <Markdown text={(props.part.text as string) || ""} settled={true} />
+                </Show>
               </div>
             </div>
           </Show>
