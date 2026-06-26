@@ -2,7 +2,7 @@
 
 **VHSolara** (binary: `vh-solara`) is a lightweight, mobile-first web UI and aggregating daemon for OpenCode — control your coding agents on any machine, from one place, over a secure tunnel.
 
-A single Go binary runs next to OpenCode on each machine: it aggregates OpenCode's state into a resumable, real-time view and serves a custom, mobile-first web UI (a SolidJS SPA, installable as a PWA) embedded in the binary via `//go:embed`. Each instance connects to a central controller through a persistent multiplexed WebSocket tunnel ([yamux](https://github.com/hashicorp/yamux)), so you can reach and drive any machine's OpenCode sessions from one URL — with **no inbound network access to the worker**. The UI covers the full loop: a session/subsession tree, streaming chat, diffs, an in-browser terminal, git actions, repo-declared [managed processes & embedded views](docs/managed-projects.md), a command palette, a themeable appearance (presets + a custom theme editor), and live notifications.
+A single Go binary runs next to OpenCode on each machine: it aggregates OpenCode's state into a resumable, real-time view and serves a custom, mobile-first web UI (a SolidJS SPA, installable as a PWA) embedded in the binary via `//go:embed`. Each instance connects to a central controller through a persistent multiplexed WebSocket tunnel ([yamux](https://github.com/hashicorp/yamux)), so you can reach and drive any machine's OpenCode sessions from one URL — with **no inbound network access to the worker**. The UI covers the full loop: a session/subsession tree, streaming chat, diffs, an in-browser terminal, git actions, repo-declared [managed processes & embedded views](docs/guides/managed-projects.md), a command palette, a themeable appearance (presets + a custom theme editor), and live notifications.
 
 > Built because OpenCode's own web UI and OpenChamber were heavy and didn't hold up on mobile (esp. Galaxy Fold) — `vh-solara` is the lean, phone-friendly alternative, resilient to flaky networks and reconnects.
 
@@ -140,7 +140,7 @@ loud warning.
 
 Start the daemon on each developer machine. Three web UI backends are available via `--web`:
 
-- `vh` — vh-solara's own built-in UI: a stateful daemon (persistent OpenCode subscription, materialized view, resumable sync) serving a lightweight SolidJS client designed for phone/multi-client use, with a real sidebar, an eager session→subsession tree, server-side markdown/highlight/diff rendering, and a git Changes view. See `web/` and `documents/03`–`04`.
+- `vh` — vh-solara's own built-in UI: a stateful daemon (persistent OpenCode subscription, materialized view, resumable sync) serving a lightweight SolidJS client designed for phone/multi-client use, with a real sidebar, an eager session→subsession tree, server-side markdown/highlight/diff rendering, and a git Changes view. See `web/` and `docs/architecture/03`–`04`.
 - `opencode` (default) — OpenCode's built-in `opencode web` UI.
 - `openchamber` — the legacy OpenChamber UI.
 
@@ -297,7 +297,7 @@ origins, strict same-origin CORS). Workers bind loopback and are reachable only
 through the controller, which is the single user-auth edge.
 
 See **[SECURITY.md](SECURITY.md)** for the model and how to configure it, and
-[`documents/06-auth.md`](documents/06-auth.md) for the design rationale.
+[`docs/architecture/06-auth.md`](docs/architecture/06-auth.md) for the design rationale.
 
 ## CLI Subcommands
 

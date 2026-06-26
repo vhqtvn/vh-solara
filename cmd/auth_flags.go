@@ -11,7 +11,7 @@ import (
 )
 
 // authFlags holds the --auth-* flag values shared by the public-edge commands
-// (controller, local-server, client-daemon). See documents/06-auth.md.
+// (controller, local-server, client-daemon). See docs/architecture/06-auth.md.
 type authFlags struct {
 	mode             string
 	oidcIssuer       string

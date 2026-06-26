@@ -1,6 +1,6 @@
 services:
   # Central controller. Put nginx in front for TLS, auth, and wildcard host
-  # routing (see README / documents/01-initial-spec.md).
+  # routing (see README / docs/architecture/01-initial-spec.md).
   server:
     build:
       context: .

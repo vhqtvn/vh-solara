@@ -2,8 +2,8 @@
 
 SolidJS + Vite. Lightweight by design (no virtual DOM; heavy rendering —
 markdown, syntax highlight, diffs — is done by the daemon, see
-`documents/04-render-pipeline.md`). The client consumes the daemon's resumable
-sync protocol (`documents/03-stateful-aggregator.md`).
+`docs/architecture/04-render-pipeline.md`). The client consumes the daemon's resumable
+sync protocol (`docs/architecture/03-stateful-aggregator.md`).
 
 ## Build (produces the embedded UI)
 

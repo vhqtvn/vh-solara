@@ -339,8 +339,8 @@ reasoning body):
 - Per-project runtime data lives under `.vh-solara/` (gitignored — distinct from
   this harness's `.vh-agent-harness/`). A project may commit
   `.vh-solara/project.jsonc` to declare managed processes — see
-  [`docs/managed-projects.md`](../docs/managed-projects.md). Building the embedded
-  view app itself: [`docs/custom-views.md`](../docs/custom-views.md).
+  [`docs/guides/managed-projects.md`](../docs/guides/managed-projects.md). Building the embedded
+  view app itself: [`docs/guides/custom-views.md`](../docs/guides/custom-views.md).
 
 ## Not applicable
 

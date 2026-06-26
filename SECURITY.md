@@ -2,7 +2,7 @@
 
 This document covers VHSolara's security model: how the pieces trust each other,
 the authentication options, and the browser-facing hardening. The full auth
-design rationale is in [`documents/06-auth.md`](documents/06-auth.md).
+design rationale is in [`docs/architecture/06-auth.md`](docs/architecture/06-auth.md).
 
 ## Trust model at a glance
 

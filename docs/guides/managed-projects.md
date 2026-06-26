@@ -6,7 +6,7 @@ discover it, **start the processes itself**, wait for them to be ready, and
 **register their views** automatically whenever the project is open. No manual
 launch, no SSH, no self-register code.
 
-This complements the existing manual [`POST /vh/views`](coordination-api.md)
+This complements the existing manual [`POST /vh/views`](../architecture/coordination-api.md)
 self-register: the manual API is for processes you launch by hand; this feature
 is for processes the repo declares and vh-solara owns.
 

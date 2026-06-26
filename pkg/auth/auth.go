@@ -1,5 +1,5 @@
 // Package auth is the secure-by-default login layer for published deployments
-// (see documents/06-auth.md). It is the only place in the repo that imports an
+// (see docs/architecture/06-auth.md). It is the only place in the repo that imports an
 // auth library; the rest of the codebase wraps its handler with one Middleware.
 //
 // Three modes, all funnelled through one server-side session (scs): OIDC SSO
