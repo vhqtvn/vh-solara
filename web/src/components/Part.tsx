@@ -262,16 +262,10 @@ function Markdown(props: { text: string; settled: boolean; caret?: boolean }) {
     caretEl.className = "stream-caret";
     caretEl.setAttribute("aria-hidden", "true");
 
-    // Render via the incremental engine, COALESCED to ≤~16fps and only when the
-    // text actually changes, and idle between deltas.
-    // Each render mutates the DOM, which forces a (Firefox/WebRender) display-list
-    // rebuild + paint of the message — and for a long block that paint is the
-    // dominant cost and impossible to make cheap enough across engines. So we cap
-    // the live-render rate hard (~1.5fps): the text still appears progressively,
-    // but the paint work per second is bounded regardless of block size. This is
-    // the deliberate footprint tradeoff — live formatting is a slow reveal, not a
-    // per-frame typewriter.
-    const FRAME_MS = 700;
+    // Render via the incremental engine, coalesced to a fixed rate and only when
+    // the text actually changes (idle between deltas). 5fps keeps the live
+    // formatted reveal smooth while bounding paint work per second.
+    const FRAME_MS = 200; // ~5fps
     let timer: number | undefined;
     let lastRender = 0;
     const flush = () => {
@@ -498,27 +492,6 @@ function ToolPart(props: { part: Part; tail?: boolean }) {
 
 // Reasoning block with a live "thinking" duration. While the part is still
 // streaming the timer ticks (created → now); once it ends it shows the total.
-// While a reasoning block streams it can grow to tens of thousands of chars. The
-// body is a 320px scroll box, but the browser still builds the display list for
-// the ENTIRE block every update (overflow bounds raster, not display-list build)
-// → cost climbs with length and pins the GPU (the reported thinking-block heat).
-// So during streaming we keep only a bounded TAIL of raw text in the DOM (what's
-// actually visible in the box anyway); the full formatted markdown renders once
-// on settle. Constant DOM size → flat cost regardless of total length.
-function ReasoningStream(props: { text: string }) {
-  const WINDOW = 4000;
-  const win = (t: string) => (t.length > WINDOW ? "…\n" + t.slice(-WINDOW) : t);
-  const [shown, setShown] = createSignal(win(props.text));
-  let timer: number | undefined;
-  createEffect(() => {
-    const t = props.text;
-    if (timer !== undefined) return; // coalesce to ~5fps; constant-size update
-    timer = window.setTimeout(() => { timer = undefined; setShown(win(t)); }, 200);
-  });
-  onCleanup(() => clearTimeout(timer));
-  return <div class="md md-raw">{shown()}</div>;
-}
-
 function ReasoningPart(props: { part: Part; settled: boolean; tail?: boolean }) {
   const start = () => props.part.time?.start;
   const end = () => props.part.time?.end;
@@ -580,12 +553,7 @@ function ReasoningPart(props: { part: Part; settled: boolean; tail?: boolean }) 
           <Show when={revealed()}>
             <div class="reasoning-body" ref={bodyEl} onScroll={onScroll}>
               <div ref={contentEl}>
-                <Show
-                  when={props.settled}
-                  fallback={<ReasoningStream text={(props.part.text as string) || ""} />}
-                >
-                  <Markdown text={(props.part.text as string) || ""} settled={true} />
-                </Show>
+                <Markdown text={(props.part.text as string) || ""} settled={props.settled} caret={props.tail} />
               </div>
             </div>
           </Show>
