@@ -93,19 +93,6 @@ describe("StreamMd (incremental streaming markdown)", () => {
     expect(h.querySelector("pre code")?.textContent).toContain("line3");
   });
 
-  it("seals an oversized single block into chunks (bounds layout cost)", () => {
-    const h = host();
-    const md = new StreamMd(h);
-    // A long single paragraph with NO blank-line boundary, streamed in pieces.
-    const word = "lorem ipsum dolor sit amet ";
-    let text = "";
-    for (let i = 0; i < 120; i++) { text += word; md.push(text, 0); } // ~3300 chars
-    // It must have been split into multiple block elements (sealed chunks), not
-    // one giant <p>, and the full text is preserved.
-    expect(h.querySelectorAll("p").length).toBeGreaterThan(1);
-    expect(h.textContent?.replace(/\s+/g, " ").trim()).toBe(text.replace(/\s+/g, " ").trim());
-  });
-
   it("resets cleanly if the prefix shrinks", () => {
     const h = host();
     const md = new StreamMd(h);

@@ -263,17 +263,15 @@ function Markdown(props: { text: string; settled: boolean; caret?: boolean }) {
     caretEl.setAttribute("aria-hidden", "true");
 
     // Render via the incremental engine, COALESCED to ≤~16fps and only when the
-    // text actually changes. This is the key CPU fix: a fast stream emits many
-    // deltas/sec, and a per-frame requestAnimationFrame reveal re-rendered
-    // continuously (pinning a core / heating the machine) even though the engine
-    // itself is cheap. Here we render at most once per FRAME_MS, skip entirely
-    // when nothing changed, and idle between deltas — the model's own chunking
-    // gives the streaming feel.
-    // Each render mutates the DOM, which forces a display-list rebuild + paint of
-    // the (contained) message — the dominant streaming cost per the Firefox
-    // profile. Painting fewer times/sec is the most direct heat reduction, and
-    // streamed text reads fine at ~8fps, so coalesce harder.
-    const FRAME_MS = 120;
+    // text actually changes, and idle between deltas.
+    // Each render mutates the DOM, which forces a (Firefox/WebRender) display-list
+    // rebuild + paint of the message — and for a long block that paint is the
+    // dominant cost and impossible to make cheap enough across engines. So we cap
+    // the live-render rate hard (~1.5fps): the text still appears progressively,
+    // but the paint work per second is bounded regardless of block size. This is
+    // the deliberate footprint tradeoff — live formatting is a slow reveal, not a
+    // per-frame typewriter.
+    const FRAME_MS = 700;
     let timer: number | undefined;
     let lastRender = 0;
     const flush = () => {

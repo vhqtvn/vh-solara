@@ -1048,22 +1048,10 @@ body {
 
 .msg {
   margin: 0 0 18px;
-  /* Virtualization-lite. A Firefox profile of a streaming reply showed the WHOLE
-     transcript's display list being rebuilt from the viewport root every update
-     (nsLayoutUtils::PaintFrame → ViewportFrame::BuildDisplayList ≈72%), which is
-     what pinned the CPU/heat. content-visibility:auto skips layout/paint/
-     display-list building for OFF-screen messages (the browser-native equivalent
-     of react-window that ChatGPT-style UIs use), and applies layout+paint
-     containment to on-screen ones so the growing message's reflow can't
-     invalidate siblings.
-     An earlier attempt was reverted because collapsing off-screen messages to an
-     estimate made scrolling UP jump. The fix is the `auto` keyword in
-     contain-intrinsic-size: the browser REMEMBERS each message's last rendered
-     height, so re-revealing a message restores its real size — no jump. (Only a
-     never-yet-rendered message uses the 6rem fallback; overflow-anchor on
-     .chat-scroll absorbs that.) */
-  content-visibility: auto;
-  contain-intrinsic-size: auto 6rem;
+  /* No content-visibility / contain here: on Firefox/WebRender they push each
+     message onto its own compositing surface (blob), which made streaming hotter,
+     not cooler. Streaming cost is instead bounded by capping the live-render rate
+     (see Part.tsx). */
 }
 .msg-head {
   display: flex;
@@ -1154,12 +1142,6 @@ body {
 @media (prefers-reduced-motion: reduce) { .stream-caret { animation: none; } }
 .md :first-child { margin-top: 0; }
 .md :last-child { margin-bottom: 0; }
-/* Make each streamed block its own layout/paint unit. Appending to the active
-   (last) block otherwise forces the browser to rebuild the WHOLE message's
-   display list, which GROWS with the message → O(n²) repaint as a reply streams
-   (the climbing temp). With per-block containment the completed blocks above are
-   retained and only the growing block repaints. */
-.md-stream > * { contain: layout paint; }
 .md pre {
   background: var(--code-bg);
   border: 1px solid var(--border);
