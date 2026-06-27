@@ -22,9 +22,10 @@ test("project agentStyles render a colored agent chip and a picker swatch", asyn
   // The project declares a display treatment for the `build` agent in
   // .vh-solara/project.jsonc (served via /vh/project-settings). Intercept it so
   // the test owns the config without touching the repo's real file.
-  await page.route("**/vh/project-settings*", (route) =>
-    route.fulfill({ json: { agentStyles: { build: { label: "BLD", color: "warn", style: "solid" } } } }),
-  );
+  await page.route("**/vh/project-settings*", (route) => {
+    if (route.request().url().includes("/project-settings/watch")) return route.continue();
+    return route.fulfill({ json: { agentStyles: { build: { label: "BLD", color: "warn", style: "solid" } } } });
+  });
   await page.goto("/");
   await page.getByRole("button", { name: /Demo session/ }).click();
 

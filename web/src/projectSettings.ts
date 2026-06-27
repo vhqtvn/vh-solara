@@ -76,6 +76,26 @@ export function agentDisplay(name?: string): AgentDisplay | undefined {
   return { label: label || undefined, color, style };
 }
 
+// Live watch: an SSE the daemon pushes on whenever .vh-solara/project.jsonc is
+// created/modified/removed (it polls the file's mtime server-side). On each
+// nudge we re-read settings, so the agent-style chips and the editor reflect an
+// external edit with no manual reload. Re-pointed when the active project
+// changes; EventSource auto-reconnects on a dropped connection.
+let es: EventSource | null = null;
+let watchDir: string | null = null;
+export function watchProjectSettings() {
+  const dir = projectDir();
+  if (es && watchDir === dir) return;
+  es?.close();
+  watchDir = dir;
+  try {
+    es = new EventSource("/vh/project-settings/watch?dir=" + encodeURIComponent(dir));
+    es.onmessage = () => void refreshProjectSettings();
+  } catch {
+    es = null; // SSE unavailable — the manual Reload button still works.
+  }
+}
+
 export async function refreshProjectSettings() {
   try {
     const res = await fetch("/vh/project-settings?dir=" + encodeURIComponent(projectDir()));

@@ -8,6 +8,7 @@ test("agent-styles editor edits a row, previews a diff, and saves", async ({ pag
   let committed: any = null;
   await page.route("**/vh/project-settings*", async (route) => {
     const req = route.request();
+    if (req.url().includes("/project-settings/watch")) return route.continue(); // real SSE
     if (req.method() === "GET") {
       await route.fulfill({ json: { agentStyles: { build: { label: "BLD", color: "warn", style: "solid" } } } });
       return;

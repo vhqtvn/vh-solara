@@ -4,7 +4,7 @@
 // never a raw color), a chip-style choice, and a live preview. Save shows a
 // confirm diff of the actual file change before writing; Reload re-reads from
 // disk (handling a missing/just-deleted file gracefully).
-import { createMemo, createSignal, For, onMount, Show } from "solid-js";
+import { createEffect, createMemo, createSignal, For, on, onMount, Show } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
 import { agents } from "../agents";
 import { projectDir } from "../sync";
@@ -38,6 +38,12 @@ export default function AgentStylesView() {
     return [...set].sort();
   });
 
+  // Baseline (JSON of the rows as last seeded from disk) → drives `dirty`, so a
+  // live external change knows whether it can safely reseed or must defer to the
+  // user's unsaved edits.
+  let baseline = "{}";
+  const dirty = () => JSON.stringify(rows) !== baseline;
+
   // (Re)seed the editable rows from what's currently loaded from disk.
   function seed() {
     const raw = agentStylesRaw();
@@ -47,6 +53,7 @@ export default function AgentStylesView() {
       next[n] = { label: r.label || "", color: r.color || "", style: r.style || "soft" };
     }
     setRows(reconcile(next));
+    baseline = JSON.stringify(next);
   }
 
   async function reload() {
@@ -55,6 +62,16 @@ export default function AgentStylesView() {
     seed();
   }
   onMount(reload);
+
+  // The file changed on disk (the live watch re-read it). If the user has no
+  // unsaved edits, reflect it immediately; otherwise leave their work alone and
+  // point them at Reload.
+  createEffect(
+    on(agentStylesRaw, () => {
+      if (!dirty()) seed();
+      else setMsg("Config changed on disk — Reload to load it.");
+    }, { defer: true }),
+  );
 
   // Build the agentStyles object to persist: only agents the user actually
   // styled (a label or a color); style rides along only when styled.

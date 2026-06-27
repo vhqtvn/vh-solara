@@ -32,7 +32,7 @@ import { isDesktop, sidebarCollapsed, sidebarWidth, toggleSidebar } from "./layo
 import { draft, selectedId, state } from "./sync";
 import { refreshViews, views } from "./views";
 import { managed, refreshManaged } from "./managed";
-import { notesVisible, refreshProjectSettings } from "./projectSettings";
+import { notesVisible, refreshProjectSettings, watchProjectSettings } from "./projectSettings";
 import { pushNotification } from "./notify";
 import { broadcastTheme, postThemeTo } from "./themeTokens";
 import { customTheme, theme } from "./theme";
@@ -131,6 +131,7 @@ export default function App() {
     void refreshViews();
     void refreshManaged();
     void refreshProjectSettings();
+    watchProjectSettings(); // re-point the live config watch at the active project
     clearInterval(managedPoll);
     managedPoll = window.setInterval(() => void refreshManaged(), 5000);
   });

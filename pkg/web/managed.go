@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/vhqtvn/vh-solara/pkg/procmgr"
 	"github.com/vhqtvn/vh-solara/pkg/projectcfg"
@@ -606,6 +607,77 @@ func (s *Server) handleProjectSettings(w http.ResponseWriter, r *http.Request) {
 
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// handleProjectSettingsWatch is an SSE stream that emits `data: changed` whenever
+// the project's .vh-solara/project.jsonc is created, modified, or removed — so
+// the editor and the agent-style chips reflect an external edit (a git pull,
+// another tool, the supervisor) without a manual reload. Dependency-free: it
+// polls the file's existence/mtime/size on a short ticker (one tiny stat per
+// project per ~1.2s), which is plenty responsive for a rarely-changing config.
+func (s *Server) handleProjectSettingsWatch(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+	override := ""
+	if s.managed != nil {
+		override = s.managed.cfgOverride
+	}
+	root, err := projectRoot(reqDir(r))
+	if err != nil {
+		http.Error(w, "no project root", http.StatusBadRequest)
+		return
+	}
+	path, err := projectcfg.ResolvePath(root, override)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	h := w.Header()
+	h.Set("Content-Type", "text/event-stream")
+	h.Set("Cache-Control", "no-cache")
+	h.Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprint(w, ": ok\n\n")
+	flusher.Flush()
+
+	type snap struct {
+		exists bool
+		mod    time.Time
+		size   int64
+	}
+	read := func() snap {
+		fi, err := os.Stat(path)
+		if err != nil {
+			return snap{}
+		}
+		return snap{true, fi.ModTime(), fi.Size()}
+	}
+	last := read()
+
+	poll := time.NewTicker(1200 * time.Millisecond)
+	defer poll.Stop()
+	beat := time.NewTicker(25 * time.Second)
+	defer beat.Stop()
+	ctx := r.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-poll.C:
+			if cur := read(); cur != last {
+				last = cur
+				fmt.Fprint(w, "data: changed\n\n")
+				flusher.Flush()
+			}
+		case <-beat.C:
+			fmt.Fprint(w, ": hb\n\n")
+			flusher.Flush()
+		}
 	}
 }
 
