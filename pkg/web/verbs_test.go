@@ -28,6 +28,8 @@ type fakeOC struct {
 	permRouteAbsent bool // canonical /permission reply 404s once (route missing → legacy fallback)
 	permCanonStatus int  // if non-zero, canonical /permission reply returns this status (no record)
 	qStatus         int  // if non-zero, /question reply returns this status (no record)
+	createStatus    int  // if non-zero, POST /session returns this status (create failure)
+	promptStatus    int  // if non-zero, /session/:id/prompt_async returns this status (prompt failure)
 }
 
 func (f *fakeOC) handler() http.Handler {
@@ -36,7 +38,12 @@ func (f *fakeOC) handler() http.Handler {
 		if r.Method == http.MethodPost {
 			f.mu.Lock()
 			f.creates++
+			cs := f.createStatus
 			f.mu.Unlock()
+			if cs != 0 {
+				w.WriteHeader(cs)
+				return
+			}
 			w.Write([]byte(`{"id":"new_sess","title":"t"}`))
 			return
 		}
@@ -50,6 +57,10 @@ func (f *fakeOC) handler() http.Handler {
 		case bytesHasSuffix(p, "/prompt_async"):
 			b, _ := readAll(r)
 			f.prompts = append(f.prompts, b)
+			if f.promptStatus != 0 {
+				w.WriteHeader(f.promptStatus)
+				return
+			}
 			w.WriteHeader(http.StatusNoContent)
 		case bytesHasSuffix(p, "/abort"):
 			f.aborts++
@@ -262,10 +273,18 @@ func TestIdempotentSendReplays(t *testing.T) {
 	f := &fakeOC{}
 	web, _ := newVerbServer(t, f)
 	body := `{"sessionID":"a","text":"continue","idempotency_key":"k1"}`
-	st1, _, _ := post(t, web.URL+"/vh/send", body, nil)
-	st2, _, h2 := post(t, web.URL+"/vh/send", body, nil)
+	st1, out1, _ := post(t, web.URL+"/vh/send", body, nil)
+	st2, out2, h2 := post(t, web.URL+"/vh/send", body, nil)
 	if st1 != 200 || st2 != 200 {
 		t.Fatalf("both want 200, got %d %d", st1, st2)
+	}
+	// Fresh send delivers a prompt into an existing session.
+	if out1["outcome"] != OutcomePromptRetried {
+		t.Fatalf("fresh send outcome want %q, got %v", OutcomePromptRetried, out1["outcome"])
+	}
+	// A replay must report outcome=reused (the side effect already happened).
+	if out2["outcome"] != OutcomeReused {
+		t.Fatalf("replay send outcome want %q, got %v", OutcomeReused, out2["outcome"])
 	}
 	if h2.Get("X-VH-Idempotent-Replay") != "1" {
 		t.Fatal("second identical-key send should be a replay")
@@ -282,8 +301,165 @@ func TestSpawnCreatesAndPrompts(t *testing.T) {
 	if st != 200 || out["sessionID"] != "new_sess" {
 		t.Fatalf("spawn want sessionID new_sess, got %d %v", st, out)
 	}
+	if out["outcome"] != OutcomeCreated {
+		t.Fatalf("fresh spawn outcome want %q, got %v", OutcomeCreated, out["outcome"])
+	}
 	if f.creates != 1 || len(f.prompts) != 1 {
 		t.Fatalf("spawn must create once and prompt once, got creates=%d prompts=%d", f.creates, len(f.prompts))
+	}
+}
+
+// TestSpawnOutcomeReused verifies a replayed spawn (same idempotency_key) reports
+// outcome=reused and does NOT re-execute the side effect (no second create).
+func TestSpawnOutcomeReused(t *testing.T) {
+	f := &fakeOC{}
+	web, _ := newVerbServer(t, f)
+	body := `{"prompt":"hi","title":"T","idempotency_key":"sp-1"}`
+	st1, out1, h1 := post(t, web.URL+"/vh/spawn", body, nil)
+	if st1 != 200 || out1["outcome"] != OutcomeCreated {
+		t.Fatalf("fresh spawn want outcome=%q, got %d %v", OutcomeCreated, st1, out1)
+	}
+	if h1.Get("X-VH-Idempotent-Replay") != "" {
+		t.Fatal("first spawn must not be a replay")
+	}
+	st2, out2, h2 := post(t, web.URL+"/vh/spawn", body, nil)
+	if st2 != 200 || out2["outcome"] != OutcomeReused {
+		t.Fatalf("replay spawn want outcome=%q, got %d %v", OutcomeReused, st2, out2)
+	}
+	if h2.Get("X-VH-Idempotent-Replay") != "1" {
+		t.Fatal("second identical-key spawn should be a replay")
+	}
+	if out1["sessionID"] != out2["sessionID"] {
+		t.Fatalf("replay should return the same sessionID, got %v vs %v", out1["sessionID"], out2["sessionID"])
+	}
+	if f.creates != 1 {
+		t.Fatalf("replay must not re-create, got creates=%d", f.creates)
+	}
+}
+
+// TestSpawnOutcomeFailedCreate verifies a create-session failure tags outcome=failed
+// and surfaces no sessionID.
+func TestSpawnOutcomeFailedCreate(t *testing.T) {
+	f := &fakeOC{createStatus: http.StatusInternalServerError}
+	web, _ := newVerbServer(t, f)
+	st, out, _ := post(t, web.URL+"/vh/spawn", `{"prompt":"hi","idempotency_key":"sp-fail"}`, nil)
+	if st < 500 {
+		t.Fatalf("create-failure want a 5xx-class status, got %d", st)
+	}
+	if out["outcome"] != OutcomeFailed {
+		t.Fatalf("create-failure outcome want %q, got %v", OutcomeFailed, out["outcome"])
+	}
+	if _, ok := out["sessionID"]; ok {
+		t.Fatalf("create-failure should not carry a sessionID, got %v", out["sessionID"])
+	}
+}
+
+// TestSendOutcomeFailed verifies a send transport/prompt failure tags outcome=failed.
+func TestSendOutcomeFailed(t *testing.T) {
+	f := &fakeOC{promptStatus: http.StatusInternalServerError}
+	web, _ := newVerbServer(t, f)
+	st, out, _ := post(t, web.URL+"/vh/send", `{"sessionID":"a","text":"x","idempotency_key":"sd-fail"}`, nil)
+	if st < 500 {
+		t.Fatalf("send-failure want a 5xx-class status, got %d", st)
+	}
+	if out["outcome"] != OutcomeFailed {
+		t.Fatalf("send-failure outcome want %q, got %v", OutcomeFailed, out["outcome"])
+	}
+}
+
+// TestSpawnOutcomeFailedReplayStaysFailed verifies the idempotency replay of a
+// terminal failure is returned VERBATIM (outcome stays "failed", never rewritten
+// to "reused") and does NOT re-execute the side effect. This is the contract the
+// caller's failure-rate accounting depends on: a retry of a failed attempt is a
+// cached replay, not a fresh execution, and the retryable signal is preserved.
+func TestSpawnOutcomeFailedReplayStaysFailed(t *testing.T) {
+	f := &fakeOC{createStatus: http.StatusBadGateway}
+	web, _ := newVerbServer(t, f)
+	body := `{"prompt":"hi","idempotency_key":"sp-fail-replay"}`
+	st1, out1, h1 := post(t, web.URL+"/vh/spawn", body, nil)
+	if st1 < 500 {
+		t.Fatalf("first spawn-failure want a 5xx-class status, got %d", st1)
+	}
+	if out1["outcome"] != OutcomeFailed {
+		t.Fatalf("first spawn-failure outcome want %q, got %v", OutcomeFailed, out1["outcome"])
+	}
+	if h1.Get("X-VH-Idempotent-Replay") != "" {
+		t.Fatal("first spawn must not be a replay")
+	}
+	if f.creates != 1 {
+		t.Fatalf("first spawn must hit create once, got creates=%d", f.creates)
+	}
+	// Retry with the SAME idempotency_key → cached replay, no re-execute.
+	st2, out2, h2 := post(t, web.URL+"/vh/spawn", body, nil)
+	if st2 != st1 {
+		t.Fatalf("replay must return the cached status %d, got %d", st1, st2)
+	}
+	if out2["outcome"] != OutcomeFailed {
+		t.Fatalf("replayed failure must stay %q (not rewritten to %q), got %v", OutcomeFailed, OutcomeReused, out2["outcome"])
+	}
+	if h2.Get("X-VH-Idempotent-Replay") != "1" {
+		t.Fatal("retried identical-key spawn should be a replay")
+	}
+	if f.creates != 1 {
+		t.Fatalf("replay must NOT re-execute create, got creates=%d", f.creates)
+	}
+}
+
+// TestSendOutcomeFailedReplayStaysFailed is the send-side mirror: a replayed
+// send failure stays "failed" and is not re-forwarded to the upstream prompt.
+func TestSendOutcomeFailedReplayStaysFailed(t *testing.T) {
+	f := &fakeOC{promptStatus: http.StatusBadGateway}
+	web, _ := newVerbServer(t, f)
+	body := `{"sessionID":"a","text":"x","idempotency_key":"sd-fail-replay"}`
+	st1, out1, h1 := post(t, web.URL+"/vh/send", body, nil)
+	if st1 < 500 {
+		t.Fatalf("first send-failure want a 5xx-class status, got %d", st1)
+	}
+	if out1["outcome"] != OutcomeFailed {
+		t.Fatalf("first send-failure outcome want %q, got %v", OutcomeFailed, out1["outcome"])
+	}
+	if h1.Get("X-VH-Idempotent-Replay") != "" {
+		t.Fatal("first send must not be a replay")
+	}
+	if len(f.prompts) != 1 {
+		t.Fatalf("first send must forward once, got prompts=%d", len(f.prompts))
+	}
+	st2, out2, h2 := post(t, web.URL+"/vh/send", body, nil)
+	if st2 != st1 {
+		t.Fatalf("replay must return the cached status %d, got %d", st1, st2)
+	}
+	if out2["outcome"] != OutcomeFailed {
+		t.Fatalf("replayed failure must stay %q (not rewritten to %q), got %v", OutcomeFailed, OutcomeReused, out2["outcome"])
+	}
+	if h2.Get("X-VH-Idempotent-Replay") != "1" {
+		t.Fatal("retried identical-key send should be a replay")
+	}
+	if len(f.prompts) != 1 {
+		t.Fatalf("replay must NOT re-forward prompt, got prompts=%d", len(f.prompts))
+	}
+}
+
+// TestSpawnOutcomeCreateOkPromptFailed verifies the spawn branch where session
+// creation succeeds but the first prompt fails: outcome is "failed", ok is false,
+// AND a sessionID is present (a session WAS minted despite the prompt failure).
+func TestSpawnOutcomeCreateOkPromptFailed(t *testing.T) {
+	f := &fakeOC{promptStatus: http.StatusInternalServerError}
+	web, _ := newVerbServer(t, f)
+	st, out, _ := post(t, web.URL+"/vh/spawn", `{"prompt":"hi","idempotency_key":"sp-promptfail"}`, nil)
+	if st < 500 {
+		t.Fatalf("create-ok-prompt-failed want a 5xx-class status, got %d", st)
+	}
+	if out["ok"] != false {
+		t.Fatalf("create-ok-prompt-failed want ok=false, got %v", out["ok"])
+	}
+	if out["outcome"] != OutcomeFailed {
+		t.Fatalf("create-ok-prompt-failed outcome want %q, got %v", OutcomeFailed, out["outcome"])
+	}
+	if out["sessionID"] != "new_sess" {
+		t.Fatalf("create-ok-prompt-failed should carry the minted sessionID, got %v", out["sessionID"])
+	}
+	if f.creates != 1 || len(f.prompts) != 1 {
+		t.Fatalf("create must succeed and prompt must be attempted once, got creates=%d prompts=%d", f.creates, len(f.prompts))
 	}
 }
 

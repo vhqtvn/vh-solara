@@ -91,7 +91,12 @@ func (f *fakeController) handler() http.Handler {
 		f.vhSendCSRF = r.Header.Get("X-VH-CSRF")
 		f.vhSendAuth = r.Header.Get("Authorization")
 		f.mu.Unlock()
-		w.Write([]byte(`{"ok":true}`))
+		w.Header().Set("X-VH-Seq", "7")
+		w.Write([]byte(`{"ok":true,"outcome":"prompt_retried_to_existing"}`))
+	})
+	mux.HandleFunc("/vh/spawn", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-VH-Seq", "9")
+		w.Write([]byte(`{"ok":true,"sessionID":"ses_new","outcome":"created"}`))
 	})
 	return mux
 }
@@ -227,6 +232,43 @@ func TestLocalModeTargetsVHDirectly(t *testing.T) {
 	}
 	if f.vhSendAuth != "" {
 		t.Fatalf("local mode must not send Authorization, got %q", f.vhSendAuth)
+	}
+}
+
+// TestLocalModeOutcomeInMeta verifies the body's "outcome" field is lifted into
+// the MCP tool result _meta (alongside epoch/seq) so a structured client reads it
+// without parsing the text blob.
+func TestLocalModeOutcomeInMeta(t *testing.T) {
+	f := &fakeController{}
+	ctrl := httptest.NewServer(f.handler())
+	t.Cleanup(ctrl.Close)
+	s := New(ctrl.URL, "", "", "test")
+	s.Local = true
+
+	// send_message → outcome "prompt_retried_to_existing" in _meta.
+	res := callTool(t, s, `{"name":"send_message","arguments":{"session_id":"demo","text":"hi"}}`)
+	if res["isError"] == true {
+		t.Fatalf("send errored: %v", res)
+	}
+	meta, _ := res["_meta"].(map[string]any)
+	if meta == nil {
+		t.Fatalf("send result missing _meta: %v", res)
+	}
+	if meta["outcome"] != "prompt_retried_to_existing" {
+		t.Fatalf("send _meta.outcome want prompt_retried_to_existing, got %v", meta["outcome"])
+	}
+	if meta["seq"] != "7" {
+		t.Fatalf("send _meta.seq want 7, got %v", meta["seq"])
+	}
+
+	// spawn_session → outcome "created" in _meta.
+	res = callTool(t, s, `{"name":"spawn_session","arguments":{"prompt":"go"}}`)
+	if res["isError"] == true {
+		t.Fatalf("spawn errored: %v", res)
+	}
+	meta, _ = res["_meta"].(map[string]any)
+	if meta == nil || meta["outcome"] != "created" {
+		t.Fatalf("spawn _meta.outcome want created, got %v", meta)
 	}
 }
 

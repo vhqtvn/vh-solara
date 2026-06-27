@@ -202,8 +202,8 @@ duplicate gets `409`). TTL 10 min.
 
 | Verb | Route | Body |
 |------|-------|------|
-| send-message | `POST /vh/send` | `{sessionID, text? \| parts?, agent?, model?, variant?, idempotency_key?}` |
-| spawn | `POST /vh/spawn` | `{prompt? \| parts?, agent?, model?, title?, parentID?, idempotency_key?}` → `{ok, sessionID}` |
+| send-message | `POST /vh/send` | `{sessionID, text? \| parts?, agent?, model?, variant?, idempotency_key?}` → `{ok, sessionID, response, outcome}` |
+| spawn | `POST /vh/spawn` | `{prompt? \| parts?, agent?, model?, title?, parentID?, idempotency_key?}` → `{ok, sessionID, outcome}` |
 | abort | `POST /vh/abort` | `{sessionID, idempotency_key?}` |
 | answer-question | `POST /vh/answer-question` | `{questionID, answers, idempotency_key?}` |
 | reply-permission | `POST /vh/reply-permission` | `{permissionID, sessionID?, reply: once\|always\|reject, idempotency_key?}` |
@@ -246,6 +246,51 @@ Reply verbs are naturally CAS-on-request-id, so they take no `If-Idle-Seq`.
   not send-after-abort synchronously (use CAS or wait for the idle transition).
 - **archive removes the session from the live view** — archive only a
   confirmed-done session.
+
+### Result `outcome` (caller accounting)
+
+The spawn and send result bodies carry a machine-readable `outcome` field so a
+caller parsing the body (not headers) can classify the result for its accounting.
+The fresh-vs-replayed distinction was previously available only via the
+`X-VH-Idempotent-Replay` header; `outcome` puts it in the body.
+
+Enum (all five defined for forward coherence; the current surface produces
+`created`/`reused`/`prompt_retried_to_existing`/`failed` — `refused` is reserved,
+with no producer yet):
+
+| outcome | meaning | produced by |
+|---------|---------|-------------|
+| `created` | spawn minted a new session (slot-consuming) | spawn (fresh) |
+| `reused` | an idempotency replay of a prior success; the side effect already happened | spawn/send (replay of `created`/`prompt_retried_to_existing`) |
+| `prompt_retried_to_existing` | a prompt was delivered into an existing session | send (fresh) |
+| `refused` | deterministic rejection before any side effect (spawn-time) | *(reserved — no producer yet)* |
+| `failed` | accepted but errored upstream (transient/retryable) | spawn/send (upstream error) |
+
+**Accounting semantics:** ONLY `created` means a new session was minted
+(slot-consuming). `reused` / `refused` / `failed` are non-counting. A caller
+counts `created` and ignores the rest. On an idempotency replay, a success-class
+fresh outcome (`created` / `prompt_retried_to_existing`) is rewritten to `reused`
+in the cached body; a `failed` replay stays `failed` (the retryable signal is
+preserved). The `X-VH-Idempotent-Replay: 1` header is unchanged (backward compat).
+
+Result shapes:
+
+```
+spawn  created:                  {"ok":true, "sessionID":"...", "outcome":"created"}
+spawn  replay:                   {"ok":true, "sessionID":"...", "outcome":"reused"}
+spawn  create-ok-prompt-failed:  {"ok":false,"sessionID":"...","error":"...","outcome":"failed"}
+spawn  create-failed:            {"ok":false,"error":"...","outcome":"failed"}
+
+send   fresh-delivered:          {"ok":true, "sessionID":"...","response":{...},"outcome":"prompt_retried_to_existing"}
+send   replay:                   {"ok":true, "sessionID":"...","response":{...},"outcome":"reused"}
+send   transport error:          {"ok":false,"error":"...","outcome":"failed"}
+```
+
+In the MCP surface (V4), the outcome is also lifted into the tool result
+`_meta.outcome` (alongside `epoch`/`seq`) so a structured client reads it without
+parsing the text blob. Note `_meta.outcome` is a success-path structured hint
+(mirroring the `_meta.epoch`/`_meta.seq` precedent): on the error path
+(`toolError`), `outcome` is carried only in the text body, not in `_meta`.
 
 ## V3 — cross-worker API (controller `/api/workers/{id}/*`)
 

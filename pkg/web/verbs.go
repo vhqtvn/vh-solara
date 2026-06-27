@@ -53,6 +53,26 @@ func (coordinationFeature) Routes(svc Services) map[string]http.HandlerFunc {
 // idempotency key travels in the request body, not a header.
 const ifIdleSeqHeader = "If-Idle-Seq"
 
+// outcome values classify a verb result so a caller parsing the JSON body (not
+// headers) can classify it for its accounting. ONLY "created" means a new session
+// was minted (slot-consuming); all others are non-counting.
+//   - created                  : spawn minted a new session.
+//   - reused                   : an idempotency replay of a prior success — the
+//     side effect already happened; don't re-count it.
+//   - prompt_retried_to_existing: a prompt was delivered into an existing session
+//     (send). Not slot-consuming (the session predates it).
+//   - refused                  : deterministic rejection before any side effect
+//     (spawn-time policy gate). Reserved — no producer
+//     in this slice; produced by a later permission gate.
+//   - failed                   : accepted but errored upstream (transient/retryable).
+const (
+	OutcomeCreated       = "created"
+	OutcomeReused        = "reused"
+	OutcomePromptRetried = "prompt_retried_to_existing"
+	OutcomeRefused       = "refused"
+	OutcomeFailed        = "failed"
+)
+
 type coordHandlers struct{ svc Services }
 
 // send POSTs a message to a session. Body: {sessionID, text?|parts?, agent?,
@@ -123,12 +143,12 @@ func (h coordHandlers) send(w http.ResponseWriter, r *http.Request) {
 		ocBody["variant"] = body.Variant
 	}
 
-	h.svc.WithIdempotency(w, body.IdempotencyKey, func() (int, []byte) {
+	h.svc.WithIdempotency(w, body.IdempotencyKey, func() (int, []byte, string) {
 		resp, err := agg.Client().Prompt(r.Context(), body.SessionID, jsonBytes(ocBody))
 		if err != nil {
-			return upstreamStatus(err, false), errResp(err.Error())
+			return upstreamStatus(err, false), errRespOutcome(err.Error(), OutcomeFailed), OutcomeFailed
 		}
-		return http.StatusOK, jsonBytes(map[string]any{"ok": true, "sessionID": body.SessionID, "response": json.RawMessage(orNull(resp))})
+		return http.StatusOK, jsonBytes(map[string]any{"ok": true, "sessionID": body.SessionID, "response": json.RawMessage(orNull(resp)), "outcome": OutcomePromptRetried}), OutcomePromptRetried
 	})
 }
 
@@ -154,7 +174,7 @@ func (h coordHandlers) spawn(w http.ResponseWriter, r *http.Request) {
 	}
 	agg := h.svc.Agg(h.svc.ReqDir(r))
 
-	h.svc.WithIdempotency(w, body.IdempotencyKey, func() (int, []byte) {
+	h.svc.WithIdempotency(w, body.IdempotencyKey, func() (int, []byte, string) {
 		create := map[string]any{}
 		if body.Title != "" {
 			create["title"] = body.Title
@@ -164,14 +184,14 @@ func (h coordHandlers) spawn(w http.ResponseWriter, r *http.Request) {
 		}
 		sessRaw, err := agg.Client().CreateSession(r.Context(), jsonBytes(create))
 		if err != nil {
-			return upstreamStatus(err, false), errResp(err.Error())
+			return upstreamStatus(err, false), errRespOutcome(err.Error(), OutcomeFailed), OutcomeFailed
 		}
 		var sess struct {
 			ID string `json:"id"`
 		}
 		_ = json.Unmarshal(sessRaw, &sess)
 		if sess.ID == "" {
-			return http.StatusBadGateway, errResp("spawn: created session has no id")
+			return http.StatusBadGateway, errRespOutcome("spawn: created session has no id", OutcomeFailed), OutcomeFailed
 		}
 		if len(body.Parts) > 0 || body.Prompt != "" {
 			ocBody := map[string]any{}
@@ -187,10 +207,10 @@ func (h coordHandlers) spawn(w http.ResponseWriter, r *http.Request) {
 				ocBody["model"] = body.Model
 			}
 			if _, err := agg.Client().Prompt(r.Context(), sess.ID, jsonBytes(ocBody)); err != nil {
-				return upstreamStatus(err, false), jsonBytes(map[string]any{"ok": false, "sessionID": sess.ID, "error": "session created but prompt failed: " + err.Error()})
+				return upstreamStatus(err, false), jsonBytes(map[string]any{"ok": false, "sessionID": sess.ID, "error": "session created but prompt failed: " + err.Error(), "outcome": OutcomeFailed}), OutcomeFailed
 			}
 		}
-		return http.StatusOK, jsonBytes(map[string]any{"ok": true, "sessionID": sess.ID})
+		return http.StatusOK, jsonBytes(map[string]any{"ok": true, "sessionID": sess.ID, "outcome": OutcomeCreated}), OutcomeCreated
 	})
 }
 
@@ -214,11 +234,11 @@ func (h coordHandlers) abort(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	agg := h.svc.Agg(h.svc.ReqDir(r))
-	h.svc.WithIdempotency(w, body.IdempotencyKey, func() (int, []byte) {
+	h.svc.WithIdempotency(w, body.IdempotencyKey, func() (int, []byte, string) {
 		if err := agg.Client().Abort(r.Context(), body.SessionID); err != nil {
-			return upstreamStatus(err, false), errResp(err.Error())
+			return upstreamStatus(err, false), errResp(err.Error()), ""
 		}
-		return http.StatusOK, jsonBytes(map[string]any{"ok": true})
+		return http.StatusOK, jsonBytes(map[string]any{"ok": true}), ""
 	})
 }
 
@@ -243,12 +263,12 @@ func (h coordHandlers) answerQuestion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	agg := h.svc.Agg(h.svc.ReqDir(r))
-	h.svc.WithIdempotency(w, body.IdempotencyKey, func() (int, []byte) {
+	h.svc.WithIdempotency(w, body.IdempotencyKey, func() (int, []byte, string) {
 		ocBody := jsonBytes(map[string]any{"answers": body.Answers})
 		if err := agg.Client().AnswerQuestion(r.Context(), body.QuestionID, ocBody); err != nil {
-			return upstreamStatus(err, true), errResp(err.Error())
+			return upstreamStatus(err, true), errResp(err.Error()), ""
 		}
-		return http.StatusOK, jsonBytes(map[string]any{"ok": true})
+		return http.StatusOK, jsonBytes(map[string]any{"ok": true}), ""
 	})
 }
 
@@ -279,10 +299,10 @@ func (h coordHandlers) replyPermission(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	agg := h.svc.Agg(h.svc.ReqDir(r))
-	h.svc.WithIdempotency(w, body.IdempotencyKey, func() (int, []byte) {
+	h.svc.WithIdempotency(w, body.IdempotencyKey, func() (int, []byte, string) {
 		if err := agg.Client().ReplyPermission(r.Context(), body.PermissionID, body.SessionID, body.Reply); err != nil {
-			return upstreamStatus(err, true), errResp(err.Error())
+			return upstreamStatus(err, true), errResp(err.Error()), ""
 		}
-		return http.StatusOK, jsonBytes(map[string]any{"ok": true})
+		return http.StatusOK, jsonBytes(map[string]any{"ok": true}), ""
 	})
 }

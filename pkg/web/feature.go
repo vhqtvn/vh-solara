@@ -34,27 +34,55 @@ type Services struct {
 
 // WithIdempotency runs fn unless the idempotency key replays a prior response (or
 // a concurrent duplicate is in flight → 409). With an empty key, fn runs plainly.
-// fn returns (status, jsonBody). This is the one write-safety primitive a feature
-// needs; the CAS lives in the verb that wants it (via Agg(...).Store()).
-func (svc Services) WithIdempotency(w http.ResponseWriter, key string, fn func() (int, []byte)) {
+// fn returns (status, jsonBody, outcome). outcome is the fresh result
+// classification (see the Outcome* constants in verbs.go) a caller parsing the
+// JSON body uses for its accounting. On replay, a success-class fresh outcome
+// (created / prompt_retried_to_existing) is rewritten to "reused" in the cached
+// body, so a body-only caller sees the non-counting replay signal without
+// inspecting headers. The X-VH-Idempotent-Replay header is preserved (backward
+// compat). This is the one write-safety primitive a feature needs; the CAS lives
+// in the verb that wants it (via Agg(...).Store()).
+func (svc Services) WithIdempotency(w http.ResponseWriter, key string, fn func() (int, []byte, string)) {
 	if key == "" {
-		st, b := fn()
+		st, b, _ := fn()
 		writeJSON(w, st, b)
 		return
 	}
 	entry, replay, inflight := svc.idem.begin(key)
 	if replay {
 		w.Header().Set("X-VH-Idempotent-Replay", "1")
-		writeJSON(w, entry.status, entry.body)
+		writeJSON(w, entry.status, rewriteOutcomeReused(entry.body, entry.outcome))
 		return
 	}
 	if inflight {
 		http.Error(w, "idempotency_key already in progress", http.StatusConflict)
 		return
 	}
-	st, b := fn()
-	svc.idem.finish(key, st, b)
+	st, b, oc := fn()
+	svc.idem.finish(key, st, b, oc)
 	writeJSON(w, st, b)
+}
+
+// rewriteOutcomeReused rewrites the cached body's "outcome" field to "reused" for
+// success-class fresh outcomes (created / prompt_retried_to_existing) — the side
+// effect they describe already happened and is being re-reported, so a body-only
+// caller sees the non-counting replay signal. Terminal outcomes (failed / refused)
+// and bodies without an outcome field are returned verbatim: a replayed failure
+// stays a failure (the retryable signal is preserved).
+func rewriteOutcomeReused(body []byte, freshOutcome string) []byte {
+	if freshOutcome != OutcomeCreated && freshOutcome != OutcomePromptRetried {
+		return body
+	}
+	var m map[string]any
+	if json.Unmarshal(body, &m) != nil {
+		return body
+	}
+	m["outcome"] = OutcomeReused
+	out, err := json.Marshal(m)
+	if err != nil {
+		return body
+	}
+	return out
 }
 
 func writeJSON(w http.ResponseWriter, status int, body []byte) {
@@ -104,9 +132,10 @@ type idemCache struct {
 }
 
 type idemEntry struct {
-	status int
-	body   []byte
-	at     time.Time
+	status  int
+	body    []byte
+	outcome string
+	at      time.Time
 }
 
 func newIdemCache(ttl time.Duration) *idemCache {
@@ -126,11 +155,11 @@ func (c *idemCache) begin(key string) (entry idemEntry, replay bool, inflight bo
 	return idemEntry{}, false, false
 }
 
-func (c *idemCache) finish(key string, status int, body []byte) {
+func (c *idemCache) finish(key string, status int, body []byte, outcome string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.inflight, key)
-	c.done[key] = idemEntry{status: status, body: body, at: time.Now()}
+	c.done[key] = idemEntry{status: status, body: body, outcome: outcome, at: time.Now()}
 	for k, e := range c.done {
 		if time.Since(e.at) >= c.ttl {
 			delete(c.done, k)
@@ -146,6 +175,12 @@ func jsonBytes(v any) []byte {
 }
 
 func errResp(msg string) []byte { return jsonBytes(map[string]any{"ok": false, "error": msg}) }
+
+// errRespOutcome is errResp with a result outcome classification, used by verbs
+// that tag their failures (spawn/send → "failed").
+func errRespOutcome(msg, outcome string) []byte {
+	return jsonBytes(map[string]any{"ok": false, "error": msg, "outcome": outcome})
+}
 
 func decodeBody(w http.ResponseWriter, r *http.Request, v any) bool {
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)

@@ -198,12 +198,12 @@ func toolDefs() []map[string]any {
 			"inputSchema": objSchema(map[string]any{"worker": worker, "dir": dir})},
 		{"name": "get_session", "description": "Get one session's detail incl. messages and gate facts.",
 			"inputSchema": objSchema(map[string]any{"worker": worker, "session_id": strProp("session id"), "dir": dir}, "session_id")},
-		{"name": "send_message", "description": "Send a message to a session. Optional if_idle_seq enables compare-and-swap (send only if still sendable since that snapshot seq).",
+		{"name": "send_message", "description": "Send a message to a session. Optional if_idle_seq enables compare-and-swap (send only if still sendable since that snapshot seq). Result body carries an `outcome` field (prompt_retried_to_existing on a fresh deliver, reused on an idempotency replay, failed on an upstream error) for the caller's accounting.",
 			"inputSchema": objSchema(map[string]any{
 				"worker": worker, "session_id": strProp("session id"), "text": strProp("message text"),
 				"idempotency_key": strProp("optional dedup key"), "if_idle_seq": strProp("optional CAS seq"), "dir": dir,
 			}, "session_id", "text")},
-		{"name": "spawn_session", "description": "Create a session and optionally send a first prompt. Returns the new session id.",
+		{"name": "spawn_session", "description": "Create a session and optionally send a first prompt. Returns the new session id. Result body carries an `outcome` field (created on a fresh spawn, reused on an idempotency replay, failed on an upstream error) for the caller's accounting.",
 			"inputSchema": objSchema(map[string]any{
 				"worker": worker, "prompt": strProp("optional first prompt"), "title": strProp("optional title"),
 				"parent_id": strProp("optional parent session id"), "agent": strProp("optional agent"),
@@ -424,17 +424,36 @@ func (s *Server) callAPIH(method, path string, q url.Values, body any, hdr map[s
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	text := string(respBody)
 	meta := map[string]any{"epoch": resp.Header.Get("X-VH-Epoch"), "seq": resp.Header.Get("X-VH-Seq")}
+	// Lift the body's "outcome" field into _meta so a structured MCP client reads
+	// it without parsing the text blob. Present on spawn/send results (and their
+	// idempotency replays); absent on other verbs → nothing added.
+	if oc := extractOutcome(respBody); oc != "" {
+		meta["outcome"] = oc
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return toolError(fmt.Sprintf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(text))), nil
 	}
 	return toolText(text, meta), nil
 }
 
-// toolText wraps a successful payload. The epoch/seq are appended as a structured
-// hint so an agent can track the cursor.
+// extractOutcome pulls the "outcome" classification from a verb response body, if
+// present. Returns "" for bodies without one (non-spawn/send verbs, or non-JSON).
+func extractOutcome(body []byte) string {
+	var env struct {
+		Outcome string `json:"outcome"`
+	}
+	if json.Unmarshal(body, &env) != nil {
+		return ""
+	}
+	return env.Outcome
+}
+
+// toolText wraps a successful payload. The epoch/seq (and outcome, when present)
+// are appended as a structured hint so an agent can track the cursor and classify
+// the result without parsing the text blob.
 func toolText(text string, meta map[string]any) map[string]any {
 	out := map[string]any{"content": []map[string]any{{"type": "text", "text": text}}}
-	if meta["epoch"] != "" || meta["seq"] != "" {
+	if meta["epoch"] != "" || meta["seq"] != "" || meta["outcome"] != "" {
 		out["_meta"] = meta
 	}
 	return out
