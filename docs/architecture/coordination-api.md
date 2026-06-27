@@ -45,6 +45,7 @@ per-session `gate` map (keyed by sessionID):
     "subtree_busy": false,                    // any session in this subtree (incl. self) busy/retry
     "pending_question": false,                // a question awaits a TYPED reply (a plain message won't satisfy it)
     "pending_permission": false,
+    "permission_blocked": false,            // OBSERVABLE FACT (not a policy): this session's fail-closed spawn policy auto-rejected a prompt. Sticky past the permission clearing; cleared on session termination. Implies the spawn carried permission_policy=fail_fast
     "tokens": { "input": 0, "output": 0, "total": 0, "cache": {"read":0,"write":0} } // raw usage; omitted if none
   }
 }
@@ -203,7 +204,7 @@ duplicate gets `409`). TTL 10 min.
 | Verb | Route | Body |
 |------|-------|------|
 | send-message | `POST /vh/send` | `{sessionID, text? \| parts?, agent?, model?, variant?, idempotency_key?}` → `{ok, sessionID, response, outcome}` |
-| spawn | `POST /vh/spawn` | `{prompt? \| parts?, agent?, model?, title?, parentID?, idempotency_key?}` → `{ok, sessionID, outcome}` |
+| spawn | `POST /vh/spawn` | `{prompt? \| parts?, agent?, model?, title?, parentID?, idempotency_key?, permission_policy?}` → `{ok, sessionID, outcome}` |
 | abort | `POST /vh/abort` | `{sessionID, idempotency_key?}` |
 | answer-question | `POST /vh/answer-question` | `{questionID, answers, idempotency_key?}` |
 | reply-permission | `POST /vh/reply-permission` | `{permissionID, sessionID?, reply: once\|always\|reject, idempotency_key?}` |
@@ -255,19 +256,18 @@ The fresh-vs-replayed distinction was previously available only via the
 `X-VH-Idempotent-Replay` header; `outcome` puts it in the body.
 
 Enum (all five defined for forward coherence; the current surface produces
-`created`/`reused`/`prompt_retried_to_existing`/`failed` — `refused` is reserved,
-with no producer yet):
+`created`/`reused`/`prompt_retried_to_existing`/`refused`/`failed`):
 
 | outcome | meaning | produced by |
 |---------|---------|-------------|
-| `created` | spawn minted a new session (slot-consuming) | spawn (fresh) |
+| `created` | spawn minted a new session (counting) | spawn (fresh) |
 | `reused` | an idempotency replay of a prior success; the side effect already happened | spawn/send (replay of `created`/`prompt_retried_to_existing`) |
 | `prompt_retried_to_existing` | a prompt was delivered into an existing session | send (fresh) |
-| `refused` | deterministic rejection before any side effect (spawn-time) | *(reserved — no producer yet)* |
+| `refused` | deterministic rejection BEFORE any side effect (no session minted, nothing widened) | spawn with an unknown/illegal `permission_policy` |
 | `failed` | accepted but errored upstream (transient/retryable) | spawn/send (upstream error) |
 
 **Accounting semantics:** ONLY `created` means a new session was minted
-(slot-consuming). `reused` / `refused` / `failed` are non-counting. A caller
+(counting). `reused` / `refused` / `failed` are non-counting. A caller
 counts `created` and ignores the rest. On an idempotency replay, a success-class
 fresh outcome (`created` / `prompt_retried_to_existing`) is rewritten to `reused`
 in the cached body; a `failed` replay stays `failed` (the retryable signal is
@@ -280,6 +280,7 @@ spawn  created:                  {"ok":true, "sessionID":"...", "outcome":"creat
 spawn  replay:                   {"ok":true, "sessionID":"...", "outcome":"reused"}
 spawn  create-ok-prompt-failed:  {"ok":false,"sessionID":"...","error":"...","outcome":"created"}
 spawn  create-failed:            {"ok":false,"error":"...","outcome":"failed"}
+spawn  refused-permission-policy:{"ok":false,"error":"unknown permission_policy: ...","outcome":"refused"}
 
 send   fresh-delivered:          {"ok":true, "sessionID":"...","response":{...},"outcome":"prompt_retried_to_existing"}
 send   replay:                   {"ok":true, "sessionID":"...","response":{...},"outcome":"reused"}
@@ -288,7 +289,7 @@ send   transport error:          {"ok":false,"error":"...","outcome":"failed"}
 
 > `ok:false` + `outcome:"created"` = a session was minted but its first turn failed
 > (outcome is the accounting/mint signal; ok is operational status). A minted session
-> is slot-consuming regardless of whether its first turn completed, so this branch is
+> is counting regardless of whether its first turn completed, so this branch is
 > `created`, never `failed` (which is reserved for the no-mint case).
 
 In the MCP surface (V4), the outcome is also lifted into the tool result
@@ -296,6 +297,55 @@ In the MCP surface (V4), the outcome is also lifted into the tool result
 parsing the text blob. Note `_meta.outcome` is a success-path structured hint
 (mirroring the `_meta.epoch`/`_meta.seq` precedent): on the error path
 (`toolError`), `outcome` is carried only in the text body, not in `_meta`.
+
+### Fail-closed permission policy for unattended spawning (V2)
+
+A spawned worker is often **unattended** — no human is watching to click "allow"
+on a permission prompt. Without a policy, such a worker hangs on the first
+prompt. The optional spawn body param `permission_policy` arms a **fail-closed**
+watcher so a prompt can never block the worker:
+
+- **`permission_policy: "fail_fast"`** (alias `"auto_reject"`): after the spawn
+  mints, the worker registers the session as fail-closed. When that session
+  later raises a permission prompt, the worker auto-issues
+  `reply_permission(..., "reject")` **server-side** — never `"always"`, so the
+  prompt cannot widen what the unattended worker is allowed to do. The spawn
+  outcome **stays `created`** (the mint happened, the session is counted); a
+  DISTINCT `permission_blocked` gate fact is raised on that session so the
+  caller can observe the auto-reject post-hoc.
+- **Absent/empty** = a normal spawn; no binding, no auto-reject.
+- **Any other value** (e.g. a typo, or an attempted permissive value) is
+  **refused BEFORE mint**: `outcome:"refused"`, `ok:false`,
+  `error:"unknown permission_policy: ..."`, and the opencode session is NOT
+  created. This is the **fail-closed property**: a spawner that passes garbage
+  can, at worst, get a refusal or a more-restrictive session — never a wider
+  grant. There is deliberately **no permissive value** (no `auto_allow`/`always`).
+
+This is a **vh-solara concern only**: the param is not forwarded into opencode's
+session-create payload (opencode has no equivalent single flag); vh-solara owns
+the guarantee. The POLICY (the binding + the reject action) lives in the web
+layer; the store only records the observable `permission_blocked` fact (see §1
+gate facts), consistent with the store carrying no policy.
+
+The auto-reject is delivered by a **per-directory reconcile sweep**, not a live
+event-tail subscriber. The store's event fan-out is lossy on overflow (a slow
+subscriber's channel is closed and the subscriber is dropped), so a subscriber-
+based watcher could exit silently and never re-arm, defeating the guarantee with
+no signal. Instead, a goroutine per project store reads the authoritative
+`Snapshot` every `permReconcileInterval` (2s) and rejects any pending permission
+for a fail_fast session. This makes fail-closed a **bounded-latency guarantee**
+(≤2s) that rests on the deterministic sweep, not on event delivery — it holds
+even if every live-tail event is lost. Rejecting a permission that was already
+cleared is idempotent (the stale-reject error is swallowed/logged); `reject` is
+never widened to `always`.
+
+The binding is **in-memory only**. A worker restart loses it, so a `fail_fast`
+session that hits a prompt *after* a restart is NOT auto-rejected. This is
+acceptable because (a) such sessions are short-lived relative to worker uptime,
+and (b) the caller already has a backstop: `pending_permission` exposes the
+pending permission id on the gate, and the caller can reject it explicitly via
+`reply_permission`. (Restart also resets the in-memory gate view regardless, so
+no `permission_blocked` fact survives a restart.)
 
 ## V3 — cross-worker API (controller `/api/workers/{id}/*`)
 

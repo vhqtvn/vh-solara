@@ -121,6 +121,13 @@ func readAll(r *http.Request) (string, error) {
 // newVerbServer wires a Server whose client points at the fake. The aggregator's
 // Run loop is NOT started; tests seed the store via the returned aggregator.
 func newVerbServer(t *testing.T, f *fakeOC) (*httptest.Server, *aggregator.Aggregator) {
+	web, agg, _ := newVerbServerSrv(t, f)
+	return web, agg
+}
+
+// newVerbServerSrv is newVerbServer but also returns the Server (needed by tests
+// that inspect web-layer state such as the fail-closed permission binding).
+func newVerbServerSrv(t *testing.T, f *fakeOC) (*httptest.Server, *aggregator.Aggregator, *Server) {
 	t.Helper()
 	oc := httptest.NewServer(f.handler())
 	t.Cleanup(oc.Close)
@@ -131,7 +138,7 @@ func newVerbServer(t *testing.T, f *fakeOC) (*httptest.Server, *aggregator.Aggre
 	}
 	web := httptest.NewServer(srv.Handler())
 	t.Cleanup(web.Close)
-	return web, agg
+	return web, agg, srv
 }
 
 func ev(typ, props string) opencode.Event {

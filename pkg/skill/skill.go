@@ -30,6 +30,7 @@ var gateSemantics = map[string]string{
 	"subtree_busy":             "any session in this subtree (incl. self) is busy/retry.",
 	"pending_question":         "a question awaits a TYPED reply — a plain message will NOT satisfy it.",
 	"pending_permission":       "a permission awaits a typed reply (once|always|reject).",
+	"permission_blocked":       "OBSERVABLE FACT (not a policy): this session's fail-closed spawn policy auto-rejected a prompt. Sticky past the permission clearing so a caller sees it post-hoc; cleared on session termination. Implies the spawn carried permission_policy=fail_fast.",
 	"tokens":                   "raw token-usage object of the latest assistant turn.",
 }
 
@@ -114,6 +115,19 @@ func Generate(version string) string {
 	p("  re-read gate; `400` = malformed call, fix it (don't loop); `5xx`/transport = route-around.\n")
 	p("- **abort is async** — the resulting idle arrives on the stream later; don't send-after-abort\n")
 	p("  synchronously (CAS or wait for the idle transition).\n")
+	p("- **Unattended/automated spawning — fail-closed permission policy**: pass\n")
+	p("  `permission_policy=fail_fast` (alias `auto_reject`) on spawn so a worker that hits a\n")
+	p("  permission prompt while unattended CANNOT hang — vh-solara auto-rejects the prompt\n")
+	p("  server-side (NEVER `always`, so the prompt can't widen what the worker can do) and raises\n")
+	p("  the `permission_blocked` gate fact for that session. The spawn outcome STAYS `created`\n")
+	p("  (the mint happened, the session is counted); `permission_blocked` is a SEPARATE, post-hoc\n")
+	p("  observable for the caller's accounting. Any other/unknown `permission_policy` value is\n")
+	p("  REFUSED pre-mint (`outcome=refused`, `ok=false`) — a spawner passing garbage can, at worst,\n")
+	p("  get a refusal or a more-restrictive session, never a wider grant. The binding is in-memory\n")
+	p("  only: a worker restart loses it, so a fail_fast session that prompts after restart is NOT\n")
+	p("  auto-rejected (backstop: `pending_permission` + `reply_permission` still let the caller\n")
+	p("  reject explicitly). This is a vh-solara spawn param; it never reaches opencode's session\n")
+	p("  create payload.\n")
 	p("- **Idempotency**: pass `idempotency_key` on writes so a retry can't double-execute (10-min,\n")
 	p("  per worker lifetime; resets on epoch change). A replay returns the cached result; a\n")
 	p("  success-class outcome (`created`/`prompt_retried_to_existing`) is rewritten to `reused`,\n")
@@ -123,15 +137,15 @@ func Generate(version string) string {
 	p("## Result `outcome` (caller accounting)\n\n")
 	p("The spawn and send result bodies carry a machine-readable `outcome` field so a caller\n")
 	p("parsing the body (not headers) can classify the result for its accounting. ONLY `created`\n")
-	p("means a new session was minted (slot-consuming); all others are non-counting.\n\n")
+	p("means a new session was minted (counting); all others are non-counting.\n\n")
 	p("- `created` — spawn minted a new session.\n")
 	p("- `reused` — an idempotency replay of a prior success; the side effect already happened.\n")
 	p("- `prompt_retried_to_existing` — a prompt was delivered into an existing session (send).\n")
-	p("- `refused` — deterministic rejection before any side effect (spawn-time; reserved).\n")
+	p("- `refused` — deterministic rejection BEFORE any side effect: today, an unknown/illegal `permission_policy` on spawn (no session minted, nothing widened). The caller's accounting treats this as non-counting and safe to surface.\n")
 	p("- `failed` — accepted but errored upstream (transient/retryable).\n\n")
 	p("Note: `ok:false` + `outcome:\"created\"` means a session was minted but its first turn failed\n")
 	p("(outcome is the accounting/mint signal; ok is operational status). A minted session is\n")
-	p("slot-consuming even if the first turn errored, so that branch is `created`, never `failed`\n")
+	p("counting even if the first turn errored, so that branch is `created`, never `failed`\n")
 	p("(which is reserved for the no-mint case).\n\n")
 	p("On an idempotency replay, a success-class fresh outcome (`created` / `prompt_retried_to_existing`)\n")
 	p("is rewritten to `reused`; a `failed` replay stays `failed`. In the MCP surface the outcome is\n")

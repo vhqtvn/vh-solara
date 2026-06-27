@@ -30,6 +30,10 @@ type Services struct {
 	// idem backs WithIdempotency; not exported so a feature must go through the
 	// helper (consistent replay/in-flight semantics).
 	idem *idemCache
+	// RegisterFailFast records a freshly-minted session as fail-closed-permission
+	// (unattended/automated spawning). Called only on the fresh-execution path of
+	// a fail_fast spawn's idempotent handler (so a replay never double-registers).
+	RegisterFailFast func(sessionID string)
 }
 
 // WithIdempotency runs fn unless the idempotency key replays a prior response (or
@@ -106,7 +110,7 @@ func defaultFeatures() []Feature {
 
 // services builds the Services value passed to features.
 func (s *Server) services() Services {
-	return Services{Agg: s.aggFor, ReqDir: reqDir, idem: s.idem}
+	return Services{Agg: s.aggFor, ReqDir: reqDir, idem: s.idem, RegisterFailFast: s.registerFailFast}
 }
 
 // mountFeatures registers every feature's routes on the mux.

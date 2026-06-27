@@ -203,11 +203,13 @@ func toolDefs() []map[string]any {
 				"worker": worker, "session_id": strProp("session id"), "text": strProp("message text"),
 				"idempotency_key": strProp("optional dedup key"), "if_idle_seq": strProp("optional CAS seq"), "dir": dir,
 			}, "session_id", "text")},
-		{"name": "spawn_session", "description": "Create a session and optionally send a first prompt. Returns the new session id. Result body carries an `outcome` field (created on a fresh spawn, reused on an idempotency replay, failed on an upstream error) for the caller's accounting.",
+		{"name": "spawn_session", "description": "Create a session and optionally send a first prompt. Returns the new session id. Result body carries an `outcome` field (created on a fresh spawn, reused on an idempotency replay, refused when permission_policy is unknown/illegal, failed on an upstream error) for the caller's accounting. permission_policy=fail_fast arms a fail-closed watcher so an unattended spawn that raises a permission prompt is auto-rejected (never widened) and surfaces permission_blocked on the gate.",
 			"inputSchema": objSchema(map[string]any{
 				"worker": worker, "prompt": strProp("optional first prompt"), "title": strProp("optional title"),
 				"parent_id": strProp("optional parent session id"), "agent": strProp("optional agent"),
-				"idempotency_key": strProp("optional dedup key"), "dir": dir,
+				"idempotency_key":   strProp("optional dedup key"),
+				"permission_policy": strProp("optional fail-closed policy for unattended spawning; legal: fail_fast (alias auto_reject). unknown values are refused pre-mint"),
+				"dir":               dir,
 			})},
 		{"name": "abort_session", "description": "Abort a session's in-flight turn. The resulting idle is asynchronous — wait for it before sending again.",
 			"inputSchema": objSchema(map[string]any{"worker": worker, "session_id": strProp("session id"), "idempotency_key": strProp("optional dedup key"), "dir": dir}, "session_id")},
@@ -352,6 +354,11 @@ func spawnBody(args map[string]any) map[string]any {
 	}
 	if v := str(args, "parent_id"); v != "" {
 		b["parentID"] = v
+	}
+	// permission_policy is a vh-solara spawn param (NOT an opencode create
+	// field): the worker's spawn handler arms the fail-closed watcher from it.
+	if v := str(args, "permission_policy"); v != "" {
+		b["permission_policy"] = v
 	}
 	addIdem(b, args)
 	return b

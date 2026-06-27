@@ -104,11 +104,17 @@ type GateFacts struct {
 	// the completion REASON, not a content signal — it's present on every
 	// completed turn (incl. empty ones, e.g. stop with no text), so it can't
 	// discriminate empty from non-empty; this field does. Meaningful iff hydrated.
-	LastAssistantEmpty bool            `json:"last_assistant_empty"`
-	SubtreeBusy        bool            `json:"subtree_busy"`       // any session in this subtree (incl. self) is busy/retry
-	PendingQuestion    bool            `json:"pending_question"`   // a question awaits a typed reply (a plain message won't satisfy it)
-	PendingPermission  bool            `json:"pending_permission"` // a permission awaits a typed reply
-	Tokens             json.RawMessage `json:"tokens,omitempty"`   // raw token-usage object of the latest assistant turn (meaningful iff hydrated)
+	LastAssistantEmpty bool `json:"last_assistant_empty"`
+	SubtreeBusy        bool `json:"subtree_busy"`       // any session in this subtree (incl. self) is busy/retry
+	PendingQuestion    bool `json:"pending_question"`   // a question awaits a typed reply (a plain message won't satisfy it)
+	PendingPermission  bool `json:"pending_permission"` // a permission awaits a typed reply
+	// PermissionBlocked records that this session's automated-spawn permission
+	// policy auto-rejected a prompt (an observable fact, NOT a policy — the policy
+	// that triggered the reject lives in the web layer). It is STICKY past the
+	// permission clearing so a caller observes it post-hoc, and clears on session
+	// termination. See store.MarkPermissionBlocked.
+	PermissionBlocked bool            `json:"permission_blocked"`
+	Tokens            json.RawMessage `json:"tokens,omitempty"` // raw token-usage object of the latest assistant turn (meaningful iff hydrated)
 }
 
 // MessageWithParts mirrors OpenCode's GET /session/:id/message item shape.
@@ -202,8 +208,14 @@ type Store struct {
 	todos     map[string]json.RawMessage            // sessionID -> todos payload
 	perms     map[string]map[string]json.RawMessage // sessionID -> permID -> permission
 	questions map[string]map[string]json.RawMessage // sessionID -> questionID -> request
-	statuses  map[string]json.RawMessage            // sessionID -> status payload
-	activity  map[string]string                     // sessionID -> idle|busy|retry|error
+	// permBlocked[sid] records that the session's automated-spawn permission
+	// policy auto-rejected a prompt. This is an observable FACT (the gate renders
+	// it as GateFacts.PermissionBlocked); the POLICY that decided the reject
+	// lives in the web layer. It is sticky past the permission clearing and
+	// cleared on session termination (deleteSessionLocked).
+	permBlocked map[string]bool
+	statuses    map[string]json.RawMessage // sessionID -> status payload
+	activity    map[string]string          // sessionID -> idle|busy|retry|error
 	// activitySeq[sid] = the event seq at which the session's activity last
 	// changed. Backs the If-Idle-Seq compare-and-swap: a coordinator that observed
 	// a session sendable at seq N can ask to send "only if nothing changed since
@@ -244,6 +256,7 @@ func New(ringCapacity int) *Store {
 		todos:       map[string]json.RawMessage{},
 		perms:       map[string]map[string]json.RawMessage{},
 		questions:   map[string]map[string]json.RawMessage{},
+		permBlocked: map[string]bool{},
 		statuses:    map[string]json.RawMessage{},
 		activity:    map[string]string{},
 		activitySeq: map[string]uint64{},
@@ -610,6 +623,12 @@ func (s *Store) deleteSessionLocked(id string) {
 	delete(s.activitySeq, id)
 	delete(s.unread, id)
 	delete(s.busyCount, id)
+	// Clear the automated-spawn permission-blocked fact on termination. This is
+	// the single session-removal chokepoint (live session.deleted, archive via
+	// time.archived, and hydrate prune all funnel here), so one delete covers
+	// every termination cause. Caller accounting keyed on permission_blocked
+	// observes it while the session is alive; once gone, the gate is gone too.
+	delete(s.permBlocked, id)
 	s.emit(KindSessionDelete, rawObj(map[string]interface{}{"id": id}))
 }
 
@@ -988,6 +1007,7 @@ func (s *Store) Snapshot(messagesFor map[string]bool) Snapshot {
 			SubtreeBusy:            subtreeBusy[sid],
 			PendingQuestion:        len(s.questions[sid]) > 0,
 			PendingPermission:      len(s.perms[sid]) > 0,
+			PermissionBlocked:      s.permBlocked[sid],
 			Tokens:                 se.lastTokens,
 		}
 	}
@@ -1121,6 +1141,21 @@ func (s *Store) Subscribe(buffer int) (<-chan ClientEvent, func()) {
 			delete(s.subs, id)
 		}
 	}
+}
+
+// MarkPermissionBlocked records that sessionID's automated-spawn permission
+// policy auto-rejected a prompt. This sets an OBSERVABLE FACT (rendered on the
+// gate as PermissionBlocked) — the policy decision lives in the web layer; the
+// store only records the outcome so callers can observe it post-hoc. The flag
+// is sticky past the permission clearing and is cleared on session termination
+// (deleteSessionLocked). No-op if the session is no longer tracked.
+func (s *Store) MarkPermissionBlocked(sessionID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.sessions[sessionID]; !ok {
+		return
+	}
+	s.permBlocked[sessionID] = true
 }
 
 // Epoch returns this store's lifetime id (see Snapshot.Epoch).

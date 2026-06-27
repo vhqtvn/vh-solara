@@ -62,8 +62,9 @@ const ifIdleSeqHeader = "If-Idle-Seq"
 //   - prompt_retried_to_existing: a prompt was delivered into an existing session
 //     (send). Not slot-consuming (the session predates it).
 //   - refused                  : deterministic rejection before any side effect
-//     (spawn-time policy gate). Reserved — no producer
-//     in this slice; produced by a later permission gate.
+//     (the spawn handler's fail-closed permission_policy validation path: an
+//     unknown/illegal policy is refused before mint — no session created,
+//     nothing widened).
 //   - failed                   : accepted but errored upstream (transient/retryable).
 const (
 	OutcomeCreated       = "created"
@@ -153,21 +154,29 @@ func (h coordHandlers) send(w http.ResponseWriter, r *http.Request) {
 }
 
 // spawn creates a session and optionally sends it a first prompt. Body:
-// {prompt?, parts?, agent?, model?, title?, parentID?, idempotency_key?}; dir via
-// ?dir= / x-opencode-directory. Returns {ok, sessionID}.
+// {prompt?, parts?, agent?, model?, title?, parentID?, idempotency_key?,
+//
+//	permission_policy?}; dir via ?dir= / x-opencode-directory. Returns {ok,
+//
+// sessionID}. permission_policy is vh-solara-only: it arms a fail-closed
+// permission watcher on the spawned session (unattended/automated spawning) so a
+// prompt can't hang the worker. It is NOT forwarded to opencode's CreateSession
+// (no equivalent single flag there); the create body is built from title+parentID
+// only, as always.
 func (h coordHandlers) spawn(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	var body struct {
-		Prompt         string          `json:"prompt"`
-		Parts          json.RawMessage `json:"parts"`
-		Agent          string          `json:"agent"`
-		Model          json.RawMessage `json:"model"`
-		Title          string          `json:"title"`
-		ParentID       string          `json:"parentID"`
-		IdempotencyKey string          `json:"idempotency_key"`
+		Prompt           string          `json:"prompt"`
+		Parts            json.RawMessage `json:"parts"`
+		Agent            string          `json:"agent"`
+		Model            json.RawMessage `json:"model"`
+		Title            string          `json:"title"`
+		ParentID         string          `json:"parentID"`
+		IdempotencyKey   string          `json:"idempotency_key"`
+		PermissionPolicy string          `json:"permission_policy"`
 	}
 	if !decodeBody(w, r, &body) {
 		return
@@ -175,6 +184,23 @@ func (h coordHandlers) spawn(w http.ResponseWriter, r *http.Request) {
 	agg := h.svc.Agg(h.svc.ReqDir(r))
 
 	h.svc.WithIdempotency(w, body.IdempotencyKey, func() (int, []byte, string) {
+		// Fail-closed validation BEFORE mint: an unknown permission_policy is
+		// REFUSED with no CreateSession call (no side effect, no widening). A
+		// prompt-influenced spawner passing garbage can, at worst, get a refusal
+		// or a more-restrictive session — never a wider grant. Absent/empty means
+		// a normal spawn (no binding); "fail_fast"/"auto_reject" arm the watcher.
+		// There is deliberately NO permissive value (no auto_allow/always).
+		switch body.PermissionPolicy {
+		case "", "fail_fast", "auto_reject":
+		default:
+			return http.StatusBadRequest, jsonBytes(map[string]any{
+				"ok":                false,
+				"error":             "unknown permission_policy: " + body.PermissionPolicy,
+				"outcome":           OutcomeRefused,
+				"sessionID":         "",
+				"permission_policy": body.PermissionPolicy,
+			}), OutcomeRefused
+		}
 		create := map[string]any{}
 		if body.Title != "" {
 			create["title"] = body.Title
@@ -192,6 +218,15 @@ func (h coordHandlers) spawn(w http.ResponseWriter, r *http.Request) {
 		_ = json.Unmarshal(sessRaw, &sess)
 		if sess.ID == "" {
 			return http.StatusBadGateway, errRespOutcome("spawn: created session has no id", OutcomeFailed), OutcomeFailed
+		}
+		// Arm the fail-closed watcher for this session. This runs only on the
+		// fresh-execution path (a replay returns the cached response without
+		// re-running fn), so the binding is registered exactly once. The watcher
+		// was already subscribed to this dir's store by aggFor above, so a later
+		// permission prompt will be auto-rejected (never "always") and surface
+		// the permission_blocked observable on the gate.
+		if body.PermissionPolicy != "" {
+			h.svc.RegisterFailFast(sess.ID)
 		}
 		if len(body.Parts) > 0 || body.Prompt != "" {
 			ocBody := map[string]any{}

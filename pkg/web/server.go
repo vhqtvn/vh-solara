@@ -25,10 +25,12 @@ import (
 
 	"github.com/vhqtvn/vh-solara/pkg/aggregator"
 	"github.com/vhqtvn/vh-solara/pkg/auth"
+	"github.com/vhqtvn/vh-solara/pkg/opencode"
 	"github.com/vhqtvn/vh-solara/pkg/procmgr"
 	"github.com/vhqtvn/vh-solara/pkg/quota"
 	"github.com/vhqtvn/vh-solara/pkg/render"
 	"github.com/vhqtvn/vh-solara/pkg/skill"
+	"github.com/vhqtvn/vh-solara/pkg/state"
 	"github.com/vhqtvn/vh-solara/pkg/vhlog"
 )
 
@@ -76,6 +78,28 @@ type Server struct {
 
 	// idem dedups typed write verbs by their idempotency_key (A1).
 	idem *idemCache
+
+	// failFast is the set of sessionIDs whose spawn requested the fail-closed
+	// permission policy (unattended/automated spawning): when such a session
+	// raises a permission prompt, the permission watcher auto-rejects it (never
+	// "always") so an unattended worker can't hang on a prompt. SessionIDs are
+	// globally unique opencode UUIDs, so one server-wide set is correct across
+	// project dirs. IN-MEMORY ONLY: a server restart loses the binding, so a
+	// fail_fast session that hits a prompt after restart would not be
+	// auto-rejected. Acceptable because such sessions are short-lived relative to
+	// server uptime, and the caller already has a backstop —
+	// snapshot.permissions[sessionID] exposes the pending permission ID and the
+	// caller can reject it via reply_permission itself.
+	failFastMu sync.RWMutex
+	failFast   map[string]struct{}
+
+	// watcherOn + watcherMu guard the one-time, per-dir registration of the
+	// fail-closed permission reconcile sweep on each project's store (idempotent
+	// per dir, like aggHook). Registered from aggFor so the sweep is running
+	// before any fail_fast session can be minted (the spawn that creates it
+	// calls aggFor first).
+	watcherMu sync.Mutex
+	watcherOn map[string]bool
 
 	// features are the capability modules mounted at startup (B). The
 	// coordination verbs are the first one (dogfood).
@@ -201,6 +225,8 @@ func NewServer(agg *aggregator.Aggregator, opencodeURL string, ringCapacity int)
 		idem:        newIdemCache(10 * time.Minute),
 		features:    defaultFeatures(),
 		views:       newViewRegistry(),
+		failFast:    map[string]struct{}{},
+		watcherOn:   map[string]bool{},
 	}
 	return srv, nil
 }
@@ -219,6 +245,7 @@ func (s *Server) aggFor(dir string) *aggregator.Aggregator {
 		if s.aggHook != nil {
 			s.aggHook("", s.agg)
 		}
+		s.ensurePermissionWatcher("", s.agg)
 		return s.agg
 	}
 	s.aggMu.Lock()
@@ -237,6 +264,7 @@ func (s *Server) aggFor(dir string) *aggregator.Aggregator {
 	if s.aggHook != nil {
 		s.aggHook(dir, a)
 	}
+	s.ensurePermissionWatcher(dir, a)
 	go a.Run(context.Background())
 	return a
 }
@@ -259,6 +287,147 @@ func (s *Server) aggForExisting(dir string) *aggregator.Aggregator {
 // SetAggHook installs a per-project callback fired as each aggregator is touched
 // (default + lazily-created). The alerts engine uses it to subscribe. Optional.
 func (s *Server) SetAggHook(fn func(dir string, a *aggregator.Aggregator)) { s.aggHook = fn }
+
+// registerFailFast records sessionID as a fail-closed-permission spawn. Called
+// only on the fresh-execution path of a fail_fast spawn's idempotent handler,
+// so a replay never double-registers. See the failFast field doc.
+func (s *Server) registerFailFast(sessionID string) {
+	s.failFastMu.Lock()
+	defer s.failFastMu.Unlock()
+	s.failFast[sessionID] = struct{}{}
+}
+
+// isFailFast reports whether sessionID was spawned with the fail-closed
+// permission policy. Used by the permission watcher to decide auto-reject.
+func (s *Server) isFailFast(sessionID string) bool {
+	s.failFastMu.RLock()
+	defer s.failFastMu.RUnlock()
+	_, ok := s.failFast[sessionID]
+	return ok
+}
+
+// failFastCount returns the number of registered fail-closed sessions. Test-only
+// accessor (kept unexported, same-package); production reads isFailFast per id.
+func (s *Server) failFastCount() int {
+	s.failFastMu.RLock()
+	defer s.failFastMu.RUnlock()
+	return len(s.failFast)
+}
+
+// ensurePermissionWatcher arms the fail-closed permission reconcile sweep for a
+// project's store, once per dir (idempotent, guarded by watcherOn). It is called
+// from aggFor so it runs for the default project and every lazily-created dir,
+// and — critically — BEFORE any fail_fast session can be minted: the spawn that
+// creates such a session calls aggFor first, so the sweep is always running in
+// time. The sweep keeps the POLICY in the web layer: for any pending permission
+// whose session is registered fail_fast it auto-rejects (never "always") and
+// records the observable fact on the store. The store stays policy-free.
+//
+// Why a reconcile sweep and not a live-tail subscriber: the store's emit() is
+// lossy on overflow — a slow subscriber's channel is CLOSED and the subscriber
+// is dropped, so a `for ev := range ch` watcher exits SILENTLY and never re-arms
+// (watcherOn stays set), which defeated the fail-closed guarantee with no signal
+// (F1). The guarantee must rest on a deterministic backstop, not on event
+// delivery. So instead of subscribing to the lossy channel, this starts a
+// goroutine that periodically reads the authoritative Snapshot and rejects
+// pending fail_fast permissions. Bounded latency = permReconcileInterval.
+type permissionEnv struct {
+	ID        string `json:"id"`
+	SessionID string `json:"sessionID"`
+}
+
+func (s *Server) ensurePermissionWatcher(dir string, a *aggregator.Aggregator) {
+	s.watcherMu.Lock()
+	if s.watcherOn[dir] {
+		s.watcherMu.Unlock()
+		return
+	}
+	s.watcherOn[dir] = true
+	s.watcherMu.Unlock()
+
+	go s.runPermissionReconcile(a)
+}
+
+// permReconcileInterval is the period of the per-directory fail-closed
+// permission reconcile sweep. It is the BOUNDED LATENCY of the fail-closed
+// guarantee: a fail_fast session's pending permission is rejected within at most
+// one interval of becoming pending, regardless of store event-tail loss (the
+// sweep reads the authoritative Snapshot, not the lossy live-tail channel).
+//
+// 2s is a deliberate tradeoff: fast enough that an unattended spawn's prompt
+// never hangs in practice, slow enough that an idle dir does negligible work
+// (one Snapshot read per tick; a reject RPC fires only when a fail_fast perm is
+// actually pending). Lower it if a deployment needs sub-second auto-reject.
+const permReconcileInterval = 2 * time.Second
+
+// permRejectTimeout bounds a single auto-reject RPC. Generous because the reject
+// goes through the local opencode server, which may be briefly busy.
+const permRejectTimeout = 10 * time.Second
+
+// runPermissionReconcile is the per-directory fail-closed backstop. It does NOT
+// depend on the store's lossy live-tail channel. Lifetime is PROCESS-LIFETIME:
+// the goroutine runs for as long as this daemon owns the aggregator's store.
+// There is no per-re-arm leak because ensurePermissionWatcher registers the
+// sweep exactly once per dir (guarded by watcherOn). A shutdown context is
+// intentionally omitted — on daemon exit the whole process (and the local
+// opencode server it drives) goes away together, so the ticker simply stops.
+func (s *Server) runPermissionReconcile(a *aggregator.Aggregator) {
+	ticker := time.NewTicker(permReconcileInterval)
+	defer ticker.Stop()
+	store := a.Store()
+	client := a.Client()
+	// One sweep immediately on arming, so a permission already pending at
+	// registration is rejected with ~0 latency instead of waiting a full tick.
+	s.reconcileFailFastPerms(store, client)
+	for range ticker.C {
+		s.reconcileFailFastPerms(store, client)
+	}
+}
+
+// reconcileFailFastPerms reads the authoritative store Snapshot and, for every
+// PENDING permission whose session is registered fail_fast, rejects it (never
+// "always") and records the observable permission_blocked fact. This makes
+// fail-closed a bounded-latency guarantee even if every live-tail event is lost:
+// the Snapshot is the source of truth, not the event stream.
+//
+// Idempotent: a permission that was already replied/cleared between the snapshot
+// read and the reject returns an error from ReplyPermission, which is swallowed
+// (logged) — a stale reject is harmless and expected, since the sweep races the
+// permission's normal clear path (store.Apply permission.replied deletes the perm
+// before the next snapshot, so a cleared perm is not re-rejected beyond the one
+// in-flight race window). The client is the per-dir aggregator's Client() (same
+// dir→client resolution the aggregator uses for every other write verb).
+func (s *Server) reconcileFailFastPerms(store *state.Store, client *opencode.Client) {
+	snap := store.Snapshot(nil)
+	for sessionID, perms := range snap.Permissions {
+		if !s.isFailFast(sessionID) {
+			continue
+		}
+		for _, raw := range perms {
+			var env permissionEnv
+			if err := json.Unmarshal(raw, &env); err != nil || env.ID == "" || env.SessionID == "" {
+				continue
+			}
+			// NEVER "always": no persistent grant, so a prompt can't widen what
+			// the unattended worker is allowed to do.
+			ctx, cancel := context.WithTimeout(context.Background(), permRejectTimeout)
+			err := client.ReplyPermission(ctx, env.ID, sessionID, "reject")
+			cancel()
+			if err != nil {
+				// Swallow: a stale/already-cleared permission errors here, the
+				// expected outcome of an idempotent sweep racing the perm's clear.
+				// Log so a genuine failure is observable, but never propagate —
+				// the guarantee must not break on a benign reject race.
+				vhlog.Error("permission reconcile: auto-reject failed",
+					"sessionID", sessionID, "permissionID", env.ID, "err", err)
+				continue
+			}
+			store.MarkPermissionBlocked(sessionID)
+			vhlog.Info("permission reconcile: auto-rejected fail_fast permission",
+				"sessionID", sessionID, "permissionID", env.ID)
+		}
+	}
+}
 
 // reqDir extracts the requested project directory from ?dir= (snapshot/stream)
 // or the x-opencode-directory header (passthrough).

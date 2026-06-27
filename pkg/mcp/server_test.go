@@ -293,3 +293,25 @@ func TestServeLoopNewlineDelimited(t *testing.T) {
 		t.Fatalf("first response should be id 1, got %v", first["id"])
 	}
 }
+
+// TestSpawnBodyPermissionPolicy asserts the MCP spawn body carries
+// permission_policy through to the worker's /vh/spawn (it is a vh-solara spawn
+// param, NOT an opencode create field, so it must travel in the spawn body and
+// never reach opencode's CreateSession payload).
+func TestSpawnBodyPermissionPolicy(t *testing.T) {
+	b := spawnBody(map[string]any{
+		"prompt": "hi", "permission_policy": "fail_fast", "idempotency_key": "k",
+	})
+	if b["permission_policy"] != "fail_fast" {
+		t.Fatalf("spawnBody must copy permission_policy, got %v", b["permission_policy"])
+	}
+	// Alias accepted verbatim (validation is worker-side).
+	if got := spawnBody(map[string]any{"permission_policy": "auto_reject"})["permission_policy"]; got != "auto_reject" {
+		t.Fatalf("spawnBody must pass auto_reject through verbatim, got %v", got)
+	}
+	// Absent/empty policy must not add the key: the default spawn path is
+	// unchanged and nothing leaks into the opencode create body.
+	if _, ok := spawnBody(map[string]any{"prompt": "hi"})["permission_policy"]; ok {
+		t.Fatal("spawnBody must not emit permission_policy when absent")
+	}
+}
