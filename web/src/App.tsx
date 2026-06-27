@@ -54,7 +54,6 @@ export default function App() {
       { key: "changes", label: "Changes", icon: "fork" },
     ];
     if (notesVisible()) items.push({ key: "notes", label: "Notes", icon: "clipboard" });
-    items.push({ key: "agents", label: "Agents", icon: "edit" });
     for (const v of views()) items.push({ key: VIEW_PREFIX + v.view_id, label: v.title, icon: "layers" });
     return items;
   });

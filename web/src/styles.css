@@ -553,6 +553,21 @@ body {
 }
 .dot.retry { background: var(--warn); }
 
+/* Per-agent badge on a session row (agentStyles). Compact; color is a sanitized
+   theme token (var(--agent-color), set inline) in one of three variants. */
+.tree-agent {
+  flex: 0 0 auto;
+  font-size: 9px; font-weight: 700; letter-spacing: 0.02em; line-height: 1;
+  padding: 2px 5px; border-radius: 999px; border: 1px solid transparent;
+  color: var(--agent-color, var(--accent));
+  background: color-mix(in srgb, var(--agent-color, var(--accent)) 16%, transparent);
+}
+.tree-agent[data-chip="outline"] {
+  background: transparent;
+  border-color: color-mix(in srgb, var(--agent-color, var(--accent)) 60%, transparent);
+}
+.tree-agent[data-chip="solid"] { background: var(--agent-color, var(--accent)); color: var(--bg); }
+
 /* Pinned sessions: a tinted band with a left accent rail at the top of the list,
    set off from the rest by a hairline. No per-row pin icon — the group IS the
    signal (pin/unpin still lives in the row's context menu). */
@@ -1958,6 +1973,17 @@ body {
 
 /* --- project switcher --- */
 .proj { position: relative; padding: 8px; border-bottom: 1px solid var(--border); }
+/* Project switcher + a small settings gear (per-project agent styles) on one row;
+   the row carries the divider so the gear underlines flush with the switcher. */
+.proj-bar { display: flex; align-items: stretch; border-bottom: 1px solid var(--border); }
+.proj-bar .proj { flex: 1; min-width: 0; border-bottom: 0; }
+.proj-settings {
+  flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center;
+  width: 38px; margin: 8px 8px 8px 0;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+  color: var(--fg-dim); cursor: pointer;
+}
+.proj-settings:hover { border-color: var(--accent); color: var(--fg); }
 .proj-current {
   display: flex;
   align-items: center;
@@ -3835,9 +3861,17 @@ div.katex-math { display: block; overflow-x: auto; margin: 0.7em 0; text-align: 
 }
 .agents-modal {
   background: var(--bg); border: 1px solid var(--border); border-radius: 12px;
-  width: min(760px, 100%); max-height: 84vh; display: flex; flex-direction: column;
+  width: min(760px, 100%); max-width: 100%; max-height: 84vh;
+  display: flex; flex-direction: column; overflow: hidden; /* clip; the diff scrolls inside */
   padding: 16px 18px; box-shadow: 0 18px 50px rgba(0, 0, 0, 0.45);
 }
 .agents-modal h3 { margin: 0 0 4px; font-size: 15px; }
-.agents-diff { margin: 12px 0; overflow: auto; border: 1px solid var(--border); border-radius: 8px; }
-.agents-modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
+/* The rendered diff can be tall AND wide (long comment lines). It must take the
+   slack and scroll BOTH ways inside the modal, never grow it — min-width/height:0
+   lets the flex child shrink below its content's intrinsic size. */
+.agents-diff {
+  flex: 1 1 auto; min-height: 0; min-width: 0;
+  margin: 12px 0; overflow: auto;
+  border: 1px solid var(--border); border-radius: 8px;
+}
+.agents-modal-actions { flex: 0 0 auto; display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }

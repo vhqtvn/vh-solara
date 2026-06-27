@@ -27,16 +27,18 @@ test("project agentStyles render a colored agent chip and a picker swatch", asyn
     return route.fulfill({ json: { agentStyles: { build: { label: "BLD", color: "warn", style: "solid" } } } });
   });
   await page.goto("/");
+  // Open the demo session so its messages (and last agent @build) are loaded.
   await page.getByRole("button", { name: /Demo session/ }).click();
 
-  // The demo's most recent assistant turn ran @build → its message badge becomes
-  // the styled chip: the terse label, the solid variant.
-  const chip = page.locator(".msg-agent.styled").first();
+  // The badge shows on the SESSION-LIST row (not in the chat transcript): the
+  // demo's last agent ran @build → a colored chip with the terse label/variant.
+  const chip = page.locator(".tree-agent", { hasText: "BLD" }).first();
   await expect(chip).toBeVisible();
-  await expect(chip).toHaveText("BLD");
   await expect(chip).toHaveAttribute("data-chip", "solid");
+  // It is NOT rendered as a styled chip in the message head.
+  await expect(page.locator(".msg-agent.styled")).toHaveCount(0);
 
-  // The composer picker shows a color swatch for the (build) agent it restored.
+  // The composer picker still shows a color swatch for the (build) agent.
   await expect(page.locator(".agent-select .vh-select-swatch")).toBeVisible();
 });
 

@@ -1,6 +1,7 @@
 import { createEffect, createMemo, For, Match, Show, Switch } from "solid-js";
 import { createSignal } from "solid-js";
-import { selectedId, setSelectedId, state, sessionNeedsInput } from "../sync";
+import { selectedId, setSelectedId, state, sessionNeedsInput, sessionLastAgent } from "../sync";
+import { agentDisplay } from "../projectSettings";
 import { setView } from "../ui";
 
 // Picking a session always shows its chat — even re-clicking the already-open
@@ -118,6 +119,26 @@ function buildWorkingSet(): Set<string> {
     }
   }
   return set;
+}
+
+// The per-agent badge on a session row: a compact colored chip for the session's
+// most-recent agent, shown only when the project gave that agent a label
+// (agentStyles in .vh-solara/project.jsonc) — so the list stays quiet by default.
+function AgentChip(props: { sessionID: string }) {
+  const name = () => sessionLastAgent(props.sessionID);
+  const d = () => agentDisplay(name());
+  return (
+    <Show when={d()?.label}>
+      <span
+        class="tree-agent"
+        data-chip={d()!.style}
+        style={d()!.color ? { "--agent-color": d()!.color! } : undefined}
+        data-tip={`Agent: ${name()}`}
+      >
+        {d()!.label}
+      </span>
+    </Show>
+  );
 }
 
 function Node(props: {
@@ -275,6 +296,7 @@ function Node(props: {
             <Show when={!busy() && !needsInput() && state.unread[props.session.id]}>
               <span class="dot unread" data-tip="finished — not yet viewed" />
             </Show>
+            <AgentChip sessionID={props.session.id} />
             <span class="tree-title" classList={{ unread: !busy() && !!state.unread[props.session.id], "needs-input": needsInput() }}>
               {props.session.title || props.session.id}
             </span>
@@ -431,6 +453,7 @@ export default function SessionTree() {
                       <Show when={sessionNeedsInput(s.id)}>
                         <span class="dot needs-input" data-tip="needs your input — reply to continue" />
                       </Show>
+                      <AgentChip sessionID={s.id} />
                       <span class="tree-title" classList={{ "needs-input": sessionNeedsInput(s.id) }}>{s.title || s.id}</span>
                       <span class="tree-meta">
                         <RelTime class="tree-time" ms={s.time?.updated || s.time?.created} />

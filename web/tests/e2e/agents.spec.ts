@@ -26,10 +26,8 @@ test("agent-styles editor edits a row, previews a diff, and saves", async ({ pag
   });
 
   await page.goto("/");
-  // Reach the editor via the command palette (robust across tab label/icon modes).
-  await page.keyboard.press("Control+k");
-  await page.getByPlaceholder("Type a command or session…").fill("Agent styles");
-  await page.getByText("Go to Agent styles").click();
+  // Reach the editor via the settings gear beside the project switcher.
+  await page.locator(".proj-settings").click();
 
   // The @build row is seeded from the (mocked) file.
   const buildRow = page.locator(".agents-row", { hasText: "@build" });

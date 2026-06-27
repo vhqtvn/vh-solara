@@ -9,6 +9,7 @@ import OrphanBanner from "./OrphanBanner";
 import HelpInspector from "./HelpInspector";
 import BrandMark from "./BrandMark";
 import Icon from "./Icon";
+import { setView } from "../ui";
 
 export default function Sidebar(props: { open: boolean; onClose: () => void }) {
   const [archivedOpen, setArchivedOpen] = createSignal(false);
@@ -80,7 +81,21 @@ export default function Sidebar(props: { open: boolean; onClose: () => void }) {
           <Icon name="x" />
         </button>
       </div>
-      <ProjectSwitcher />
+      <div class="proj-bar">
+        <ProjectSwitcher />
+        <button
+          type="button"
+          class="proj-settings"
+          aria-label="Agent styles"
+          data-tip="Agent styles (this project)"
+          onClick={() => {
+            setView("agents");
+            props.onClose(); // close the mobile slide-over; no-op on desktop
+          }}
+        >
+          <Icon name="settings" size={15} />
+        </button>
+      </div>
       <Show when={searchOpen() || searchQuery()}>
         <div class="session-search">
           <Icon name="filter" size={13} />

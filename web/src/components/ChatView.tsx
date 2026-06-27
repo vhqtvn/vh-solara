@@ -48,25 +48,14 @@ function agentLabel(info: any): string {
   return typeof a === "string" ? a.trim() : "";
 }
 
-// The agent badge in a message head. When the project declared a display
-// treatment for this agent (agentStyles in .vh-solara/project.jsonc), it renders
-// as a colored chip — using the agent's terse label if one was given, else the
-// usual @name. Otherwise it's the plain @name as before. Reactive in the project
-// config, so switching projects re-resolves it.
+// The agent label in a message head — plain @name. The COLORED per-agent badge
+// (agentStyles) lives on the session-list rows, not here (deliberately keeping
+// the transcript quiet).
 function MsgAgent(props: { info: any }) {
   const name = () => agentLabel(props.info);
-  const d = () => agentDisplay(name());
   return (
     <Show when={name()}>
-      <span
-        class="msg-agent"
-        classList={{ styled: !!d() }}
-        data-chip={d()?.style}
-        style={d()?.color ? { "--agent-color": d()!.color! } : undefined}
-        data-tip={`Agent: ${name()}`}
-      >
-        {d()?.label || `@${name()}`}
-      </span>
+      <span class="msg-agent" data-tip={`Agent: ${name()}`}>@{name()}</span>
     </Show>
   );
 }
