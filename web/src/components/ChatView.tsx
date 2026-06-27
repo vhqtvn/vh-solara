@@ -546,12 +546,20 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   }
   // When the (reused) view switches sessions, arm a restore for the new one and
   // hide it until that restore positions it. The leaving session's read cursor is
-  // already current (written on scroll-idle by the observer); we just cancel any
-  // pending debounce — by the time this effect runs the memo/DOM have already
-  // flipped to the entering session, so measuring geometry here would record the
-  // wrong session. (Worst case: a scroll made <400ms before switching isn't
-  // captured — but the cursor is monotonic, so it never regresses, only lags by
-  // one idle period.)
+  // written on scroll-idle by the debounced observer; we cancel any pending
+  // debounce here because measuring geometry now would record the WRONG session —
+  // by the time this effect runs the memo/DOM have already flipped to the entering
+  // session. The gap: a scroll made <400ms before switching is not persisted.
+  //   - If the leaving session's anchor was already set, this is benign: the
+  //     monotonic guard (isCursorAhead) keeps the last-flushed anchor, so
+  //     reopening lands a little ahead of where the user was.
+  //   - If the leaving session was at the BOTTOM (anchor cleared / caught-up) and
+  //     the user scrolled up to read older messages, the cancelled flush leaves
+  //     the anchor cleared — reopening lands at the newest message, losing the
+  //     scroll-up position. This is a known edge case; a perf-safe synchronous
+  //     snapshot on switch (see backlog P1-WEB-004) would close it. Measuring per
+  //     scroll frame is NOT an option — it reintroduces the per-frame layout sweep
+  //     behind the Firefox/WebRender heat saga (AGENTS.md "Web frontend performance").
   createEffect(
     on(
       () => props.sessionId,
