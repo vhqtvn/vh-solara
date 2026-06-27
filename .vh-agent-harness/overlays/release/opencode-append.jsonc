@@ -1,0 +1,40 @@
+// opencode-append.jsonc — `release` overlay pack.
+//
+// Deep-merged into opencode.jsonc by the seam when `release` is active. This is
+// the append-merge surface for the `releaser` agent's opencode.jsonc block.
+//
+// IMPORTANT — interaction with update-opencode-config.js:
+// The renderer rewrites each agent's permission.bash AND permission.task block
+// interior from the fixed command groups (it does lines.splice on the whole
+// block). So this file deliberately provides:
+//   - the agent METADATA (description / mode / color / prompt), which the
+//     renderer never touches and which therefore survives every re-render; and
+//   - EMPTY `permission.bash` + `permission.task` placeholders, which the
+//     renderer fills from LOCATION_RULES / TASK_RULES (permission-pack.jsonc).
+// Do NOT put command patterns inside permission.bash here — they would be wiped
+// on the next `update-opencode-config.js` run.
+//
+// How the wrapper is permitted: the releaser invokes the release wrapper as
+//   vh-agent-harness exec scripts/release-tag.sh vX.Y.Z
+// which matches the renderer-emitted `"vh-agent-harness *": "allow"` entry
+// (devSh decision for the releaser). Runtime is host-shell, so `vh-agent-harness
+// exec` runs the wrapper on the host with host git auth (same as commit-gate.sh).
+// Shell-guard sees no `git (tag|push)` token in that command string and passes.
+{
+    "agent": {
+        "releaser": {
+            "description": "Release agent — analyzes changes since the last tag, decides the semver bump, and creates+pushes the release tag via the sanctioned wrapper.",
+            "mode": "subagent",
+            "color": "accent",
+            "prompt": "{file:.opencode/agents/releaser.md}",
+            "permission": {
+                "bash": {
+                    "__placeholder__": "deny"
+                },
+                "task": {
+                    "__placeholder__": "deny"
+                }
+            }
+        }
+    }
+}

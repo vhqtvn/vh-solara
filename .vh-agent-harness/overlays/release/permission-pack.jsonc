@@ -1,0 +1,42 @@
+// permission-pack.jsonc — `release` overlay pack.
+//
+// Declares the `releaser` agent's permission contribution. Consumed by
+// update-opencode-config.js (loadPermissionPacks) once the seam materializes
+// this file to .opencode/sys-scripts/permission-packs/release.jsonc (which
+// happens when `release` is listed in vh-harness-profile.yml `overlays: [...]`).
+//
+// Per-agent field contract (see update-opencode-config.js lines 309-315):
+//   location     -> permission.bash location decisions for the agent
+//   task         -> permission.task allowlist for the agent
+//   gateExempt   -> (omitted) releaser does NOT delegate to the committer; it
+//                   has its own sanctioned release wrapper, so it carries an
+//                   explicit `gate: "deny"` and is NOT a committer-delegator.
+//   delegateFrom -> core orchestrators whose task allowlist gets an auto-
+//                   injected `releaser: "allow"` entry while this pack is active.
+//
+// The releaser's actual mutation (git tag + git push) is performed by the
+// project wrapper scripts/release-tag.sh, invoked as a simple command. The
+// permission.bash entry that lets the agent run that wrapper is contributed via
+// the pack's opencode-append.jsonc (see that file). The `location` decisions
+// below cover the agent's read-only analysis surface only.
+{
+    "agents": {
+        "releaser": {
+            "location": {
+                "wildcard": "deny",
+                "readonly": "allow",
+                "git_readonly": "allow",
+                "gate": "deny",
+                "devSh": "allow"
+            },
+            "task": {
+                "*": "deny"
+            },
+            "delegateFrom": [
+                "build",
+                "coordination",
+                "project-coordinator"
+            ]
+        }
+    }
+}
