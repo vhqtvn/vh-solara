@@ -300,6 +300,12 @@ func (s *Server) Handler() http.Handler {
 	s.mountFeatures(mux)
 	mux.HandleFunc("/vh/ack", s.handleAck)
 	mux.HandleFunc("/vh/archived", s.handleArchived)
+	// Fleet inventory + closeout reads for programmatic consumers (distinct
+	// from /vh/archived above, which is the SPA's paginated archived-TREE
+	// browser). See pkg/web/sessions.go for the /vh/sessions vs /vh/archived
+	// distinction and the shaped schema.
+	mux.HandleFunc("/vh/sessions", s.handleSessions)
+	mux.HandleFunc("/vh/sessions/closeout", s.handleSessionsCloseout)
 	mux.HandleFunc("/vh/reload", s.handleReload)
 	mux.HandleFunc("/vh/restart-opencode", s.handleRestartOpenCode)
 	mux.HandleFunc("/vh/restart-server", s.handleRestartServer)

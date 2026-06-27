@@ -126,6 +126,74 @@ detect (and reject) ever flipping to a different project's instance mid-stream.
 (To enumerate *all* opencode projects, not just the bridged ones, use the
 `/oc/project` passthrough.)
 
+### Read inventory verbs (`GET /vh/sessions`, `GET /vh/sessions/closeout`)
+
+Two **HTTP-only** shaped GETs for a programmatic consumer to enumerate the session
+fleet and read closeout text on demand, **without touching opencode's private
+SQLite**. They wrap the existing opencode-client paths (`ListSessions` /
+`ListArchivedSessions` / `Messages`) and shape the raw JSON into a stable,
+vh-solara-owned schema (decoupling consumers from opencode's internal schema).
+They are deliberately **not** in the MCP tool surface (V4) — the MCP facade is for
+*driving* sessions; these reads are for fleet inventory. `?dir=<dir>` (or the
+`x-opencode-directory` header) is required on both (same project pin as every
+verb). See `pkg/web/sessions.go`.
+
+**`GET /vh/sessions`** — flat fleet inventory:
+
+```
+GET /vh/sessions?dir=<dir>&include_archived=0|1&since=<ms>&roots_only=0|1
+→ { "dir": "<dir>",
+    "sessions": [
+      { "id": "<sid>", "alias": "", "title": "<title>", "dir": "<dir>",
+        "active": true, "parentID": null,
+        "time": { "updated": 1719…, "created": 1719…, "archived": null } }
+    ] }
+```
+
+- `include_archived` (default `0`): `1` also pulls archived sessions (merged,
+  deduped by id). `active` is true iff `time.archived` is null/0; `parentID` is
+  null for roots, string for children.
+- `since=<ms-epoch>`: recency cutoff — drops sessions whose latest of
+  updated/created is older.
+- `roots_only` (default `1`): `0` includes child/sub-sessions.
+- Ordered by `time.updated` DESC (→ created → id). `alias` is `""` (no slug
+  field is exposed by the pinned opencode version).
+- **Empty/absent is never an error:** unknown dir or empty fleet → `200` +
+  `sessions:[]`. Only a transport failure (opencode unreachable) → `502`
+  (mirrors `/vh/archived`).
+
+**`GET /vh/sessions/closeout`** — last assistant message text, batched:
+
+```
+GET /vh/sessions/closeout?dir=<dir>&id=a,b&id=c
+→ { "dir": "<dir>",
+    "closeouts": {
+      "<sid_1>": { "present": true,  "text": "<FULL last assistant text>" },
+      "<sid_2>": { "present": true,  "text": "" },
+      "<sid_3>": { "present": false, "text": null }
+    } }
+```
+
+- `id` accepts **repeatable** values AND **comma-lists** (forms may be mixed);
+  ids are deduped and **every requested id appears as a key**.
+- For each id: fetch messages, find the LAST assistant message (`role ==
+  "assistant"`, latest by `time.created`, tie-break id DESC), concatenate its
+  text parts (`type == "text"`, in order).
+- Semantics: `present:true`+`text:"<…>"` = readable assistant message with text;
+  `present:true`+`text:""` = assistant exists but no text parts;
+  `present:false`+`text:null` = no readable assistant message / unreadable /
+  unknown id. A per-id failure never fails the batch (maps to `present:false`);
+  unknown dir → all `present:false`.
+- **HR1 — never truncate:** the full last assistant text is returned. If a
+  future hard server-side length limit is ever introduced it must surface as an
+  explicit `truncated:true` flag + documented max, never a silent cut.
+
+> **`/vh/sessions` vs `/vh/archived`**: both read archived sessions but serve
+> different consumers. `/vh/sessions` is a **flat fleet INVENTORY** for
+> programmatic consumers (shaped schema, server-side filtering). `/vh/archived`
+> is the SPA's **paginated archived-TREE browser** (one level at a time, child
+> counts, raw passthrough). Keep both.
+
 ## V2 — typed write verbs (worker `/vh/*`)
 
 All POST, JSON body, behind the existing CSRF guard. Optional `idempotency_key`
