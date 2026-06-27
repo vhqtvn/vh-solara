@@ -16,7 +16,7 @@
 // already prepends the core array. Re-merging core here duplicates every core
 // rule in the final list.
 //
-// See forbidden-patterns.project.example.js for ready-to-adapt rule templates
+// See: vh-agent-harness example .opencode/repo-configs/forbidden-patterns.project.js  (prints ready-to-adapt rule templates)
 // (host fingerprints, secret env-vars, infra lifecycle bans, DB-table bans) and
 // the shared inspector-allowIf builder.
 //
