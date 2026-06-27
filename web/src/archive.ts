@@ -3,7 +3,7 @@
 // thousands of archived sessions never overloads the browser.
 import type { Session } from "./types";
 import { openSession, selectedId, setSelectedId } from "./sync";
-import { clearScroll } from "./lib/scroll";
+import { clearReadAnchors } from "./lib/scroll";
 import { clearQueue } from "./queue";
 import { markRead } from "./notify";
 
@@ -25,10 +25,10 @@ export async function archiveSession(id: string): Promise<string[]> {
   });
   const j = await res.json().catch(() => ({}));
   const affected: string[] = j.affected || [];
-  // Archived sessions leave the live tree for good — drop their saved scroll
-  // offsets and any queued messages so the persistent stores stay minimal.
+  // Archived sessions leave the live tree for good — drop their saved read
+  // anchors and any queued messages so the persistent stores stay minimal.
   if (affected.length) {
-    clearScroll(affected);
+    clearReadAnchors(affected);
     clearQueue(affected);
     // Archived sessions are gone from the live tree — ack any notifications for
     // them (finished, waiting, etc.) so they don't linger as unread.

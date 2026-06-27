@@ -1397,6 +1397,47 @@ body {
   box-shadow: 0 2px 10px #0008;
 }
 
+/* "Live" indicator: a subtle positive cue that the viewport is live-anchored to
+   the tail (the complement of .jump, which shows when scrolled away). Same anchor
+   spot as .jump since the two states are mutually exclusive. Muted + non-interactive
+   (it's a status, not an action). GPU-cheap by design: a small static pill whose
+   only animation is a slow opacity/scale pulse on a 7px leaf dot — compositor-only,
+   no layout/paint on the document, and none of the Firefox/WebRender trap patterns
+   (no backdrop-filter / mask-image / per-element contain / content-visibility). */
+.live {
+  position: absolute;
+  bottom: 76px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 30;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 11px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--bg) 86%, transparent);
+  color: var(--fg-dim);
+  font-size: var(--text-xs);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  pointer-events: none;
+  box-shadow: 0 1px 4px #0004;
+  animation: live-in 0.16s var(--ease);
+}
+.live-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: live-pulse 2.4s var(--ease) infinite;
+}
+.live-text { line-height: 1; }
+@keyframes live-in { from { opacity: 0; transform: translate(-50%, 6px); } to { opacity: 1; transform: translate(-50%, 0); } }
+@keyframes live-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.4; transform: scale(0.78); }
+}
+
 .msg-error {
   margin-top: 6px;
   padding: 8px 10px;

@@ -1,7 +1,7 @@
 import { createEffect, createMemo, createSignal, For, Match, on, onCleanup, onMount, Show, Switch, untrack } from "solid-js";
 import { Portal } from "solid-js/web";
 import { ackSession, createSession, currentVerb, isSending, markSessionIdle, openSession, respondPermission, sessionTodoCounts, sessionTodos, sessionWorking, setSelectedId, setSending, state } from "../sync";
-import { getScroll, setScroll } from "../lib/scroll";
+import { bottommostRead, clearReadAnchor, getReadAnchor, setReadAnchor } from "../lib/scroll";
 import { highlightInput } from "../lib/composerHighlight";
 import { chooseVariant, findModel, loadModels, models, selectionFor } from "../models";
 import { loadVersioned, saveVersioned } from "../lib/store";
@@ -435,7 +435,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
 
   function nearBottom() {
     return scrollEl
-      ? scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight < 80
+      ? scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight < 24
       : true;
   }
   // Position we last set programmatically. A scroll event whose offset matches it
@@ -453,30 +453,117 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     pin();
   }
 
-  // Scroll restore: reopening a session returns to where it was left (else the
-  // bottom). `restoredFor` tracks which session we've positioned.
+  // Scroll restore: reopening a session returns to its read-up-to anchor (the
+  // last message scrolled past), else the bottom. `restoredFor` tracks which
+  // session we've positioned. The anchor is a monotonic messageID cursor
+  // (lib/scroll); `following` stays per-device and is NOT part of the cursor.
   let restoredFor = "";
+  // Debounced read-cursor write: computing the bottommost-read message forces a
+  // layout sweep (getBoundingClientRect over rows), so it must NOT run per
+  // scroll frame. We schedule it on scroll-idle (~400ms quiet) and flush on
+  // unmount. localStorage is written at most once per idle period — never per
+  // frame (Firefox/WebRender perf: see AGENTS.md "Web frontend performance").
+  let readCursorTimer: number | undefined;
+  function scheduleReadCursor() {
+    clearTimeout(readCursorTimer);
+    readCursorTimer = window.setTimeout(() => flushReadCursor(props.sessionId), 400);
+  }
+  // Compute + persist the current read cursor for `sid` right now. Monotonic:
+  // only advances forward (scrolling up to re-read never lowers the stored
+  // anchor). At the bottom → caught up → drop the anchor (sparse default).
+  function flushReadCursor(sid: string) {
+    clearTimeout(readCursorTimer);
+    readCursorTimer = undefined;
+    if (props.draft || !scrollEl || !sid) return;
+    if (nearBottom()) {
+      clearReadAnchor(sid);
+      return;
+    }
+    const cand = bottommostReadFromDom();
+    if (!cand) return;
+    if (isCursorAhead(cand, getReadAnchor(sid))) setReadAnchor(sid, cand);
+  }
+  // Read-through cursor from live geometry: the bottommost message whose top has
+  // scrolled to/past the container top. Stops measuring at the first row below
+  // the top (rows are in order), so it's ~O(rows above the fold) per sweep.
+  function bottommostReadFromDom(): string | undefined {
+    if (!scrollEl) return undefined;
+    const cTop = scrollEl.getBoundingClientRect().top;
+    const rows: { id: string; top: number }[] = [];
+    for (const m of messages()) {
+      const el = scrollEl.querySelector(`[data-mid="${cssEsc(m.id)}"]`) as HTMLElement | null;
+      if (!el) continue; // unmounted (lazy) — can't measure; skip
+      const top = el.getBoundingClientRect().top - cTop;
+      rows.push({ id: m.id, top });
+      if (top > 0) break; // first row below the top ends the sweep
+    }
+    return bottommostRead(rows);
+  }
+  // Is `cand` ahead of (or equal-and-newer than) the stored anchor in message
+  // order? Drives the monotonic guard. A missing/stale stored anchor is treated
+  // as behind, so the first write always lands.
+  function isCursorAhead(cand: string, stored: string | undefined): boolean {
+    if (!stored) return true;
+    if (cand === stored) return false;
+    const order = sm()?.order ?? [];
+    return order.indexOf(cand) > order.indexOf(stored);
+  }
   function maybeRestore() {
     if (restoredFor === props.sessionId || !scrollEl) return false;
-    restoredFor = props.sessionId;
-    const saved = props.draft ? undefined : getScroll(props.sessionId);
-    if (saved != null) {
-      setFollowing(false);
-      scrollEl.scrollTop = Math.min(saved, scrollEl.scrollHeight);
+    const anchor = props.draft ? undefined : getReadAnchor(props.sessionId);
+    if (anchor) {
+      // Defer until the session's message snapshot has arrived. On a fresh page
+      // reload, the rAF fallback / an early RO can fire before the network
+      // delivers messages — without this guard the anchor row wouldn't exist
+      // yet, we'd fall to the bottom, mark restoredFor, and lose the anchor for
+      // good. Returning false (without setting restoredFor) lets the next RO
+      // (fired when messages land and contentEl grows) retry the restore.
+      if (!sm()) return false;
+      restoredFor = props.sessionId;
+      // Position the anchor at the top of the viewport (instant — no smooth
+      // flash on restore). The message ROW ([data-mid]) always exists in the
+      // DOM; only its heavy parts are lazy-mounted (Deferred), so this works
+      // even for a mid-conversation anchor — the parts mount as they near the
+      // viewport right after, and browser scroll-anchoring (overflow-anchor:
+      // auto) absorbs the off-screen height changes as deferred content fills in.
+      const el = scrollEl.querySelector(`[data-mid="${cssEsc(anchor)}"]`) as HTMLElement | null;
+      if (el && (sm()?.order ?? []).includes(anchor)) {
+        setFollowing(false);
+        const delta = el.getBoundingClientRect().top - scrollEl.getBoundingClientRect().top;
+        scrollEl.scrollTop += delta;
+      } else {
+        // Stale anchor (message since deleted) — fall back to the bottom.
+        setFollowing(true);
+        pin();
+      }
     } else {
+      restoredFor = props.sessionId;
       setFollowing(true);
       pin();
     }
     setReady(true); // positioned — safe to reveal
     return true;
   }
-  // When the (reused) view switches sessions, save the one we're leaving, arm a
-  // restore for the new one, and hide it until that restore positions it.
+  // When the (reused) view switches sessions, arm a restore for the new one and
+  // hide it until that restore positions it. The leaving session's read cursor is
+  // already current (written on scroll-idle by the observer); we just cancel any
+  // pending debounce — by the time this effect runs the memo/DOM have already
+  // flipped to the entering session, so measuring geometry here would record the
+  // wrong session. (Worst case: a scroll made <400ms before switching isn't
+  // captured — but the cursor is monotonic, so it never regresses, only lags by
+  // one idle period.)
   createEffect(
     on(
       () => props.sessionId,
       (id, prevId) => {
-        if (prevId && scrollEl && restoredFor === prevId) setScroll(prevId, scrollEl.scrollTop);
+        if (prevId) clearTimeout(readCursorTimer);
+        // Reset the self-pin sentinel: it's stale from the leaving session, and
+        // an anchor restore doesn't pin to refresh it — so without this reset the
+        // slice-a RO guard (scrollTop < pinnedTop) could mis-trigger against a
+        // stale-large value when the user later reaches a shorter session's
+        // bottom. -1 is the "no valid pin yet" sentinel (scrollTop >= -1 always
+        // holds, so the first real pin after switch proceeds normally).
+        pinnedTop = -1;
         restoredFor = "";
         setReady(false);
         // Fallback reveal: if no content change fires the ResizeObserver (so
@@ -511,7 +598,20 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     let navDebounce: number | undefined;
     const ro = new ResizeObserver(() => {
       if (maybeRestore()) return;
-      if (following()) pin();
+      if (following()) {
+        // Guard the RO re-pin path (the "↓ Latest" race). While following, a
+        // growing transcript used to re-pin unconditionally — but if the user
+        // scrolled UP since our last pin, that pin() would overwrite their
+        // in-flight position AND re-arm pinnedTop to the new bottom, so the
+        // onScrolled self-pin guard then mis-classified the override as our own
+        // pin and setFollowing(false) never ran (the button never appeared).
+        // Fix (Option B): only re-pin when the user hasn't moved up from the last
+        // pin (scrollTop >= pinnedTop). Otherwise they scrolled up — let that
+        // win: drop following and do NOT pin. (pinnedTop starts at -1, and
+        // scrollTop >= -1 always holds, so the very first pin is unaffected.)
+        if (scrollEl && scrollEl.scrollTop < pinnedTop) setFollowing(false);
+        else pin();
+      }
       clearTimeout(navDebounce);
       navDebounce = window.setTimeout(scheduleActiveTurn, 150);
     });
@@ -519,7 +619,11 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     onCleanup(() => {
       ro.disconnect();
       clearTimeout(navDebounce);
-      if (scrollEl && !props.draft) setScroll(props.sessionId, scrollEl.scrollTop);
+      // Flush the current session's read cursor before the reused view unmounts
+      // (e.g. navigating to settings). At unmount the DOM still reflects this
+      // session, so the geometry sweep is valid here (unlike on session switch).
+      clearTimeout(readCursorTimer);
+      if (scrollEl && !props.draft) flushReadCursor(props.sessionId);
     });
   });
 
@@ -532,16 +636,26 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     onCleanup(() => ro.disconnect());
   });
 
-  // Scroll handling: track follow state, persist the offset, and mark the
-  // session read (ack) when its bottom is reached.
+  // Scroll handling: track follow state, advance the read cursor (debounced),
+  // and mark the session read (ack) when its bottom is reached.
   function onScrolled() {
     // Our own pin() — not a user scroll. Skip the work; following/ack/navigator
     // are already correct (we're glued to the bottom).
     if (scrollEl && scrollEl.scrollTop === pinnedTop) return;
     const atBottom = nearBottom();
     setFollowing(atBottom);
-    if (!props.draft) setScroll(props.sessionId, atBottom ? 0 : scrollEl?.scrollTop ?? 0);
-    if (atBottom) ackSession(props.sessionId);
+    if (!props.draft) {
+      if (atBottom) {
+        // Caught up: cursor == lastMessageID, stored as the sparse no-entry
+        // default. Ack unread state now that the tail is in view.
+        clearReadAnchor(props.sessionId);
+        ackSession(props.sessionId);
+      } else {
+        // Scrolled away from the tail: schedule a debounced geometry sweep +
+        // monotonic cursor write. NEVER per frame (see flushReadCursor).
+        scheduleReadCursor();
+      }
+    }
     scheduleActiveTurn();
   }
 
@@ -1195,6 +1309,25 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
           </div>
         </Show>
       </div>
+      </Show>
+
+      {/*
+        Local "following latest" cue (slice b). The only tail-anchored signal
+        used to be the ABSENCE of the "↓ Latest" button. This adds a subtle
+        positive indicator when the viewport is live-anchored to the tail.
+        `following` is per-device (NOT synced), so this is a purely local cue.
+        It's the complement of the jump button below: following() shows the live
+        indicator; !following() shows "↓ Latest" — the two never render together,
+        so they share the same anchor spot without conflict. Gated off drafts (a
+        draft has no transcript to be "live" on). GPU-cheap: a tiny static pill
+        with a slow opacity/scale pulse on a 7px dot only (no backdrop-filter,
+        mask-image, or per-element contain/content-visibility — see AGENTS.md).
+      */}
+      <Show when={following() && !props.draft}>
+        <div class="live" role="status" aria-label="Following latest">
+          <span class="live-dot" aria-hidden="true" />
+          <span class="live-text">Live</span>
+        </div>
       </Show>
 
       <Show when={!following()}>
