@@ -24,7 +24,7 @@ export const [treeDensity, setTreeDensity] = persistedSignal<"compact" | "detail
 // viewport scale (a real "virtual viewport" zoom the user sets deliberately);
 // on desktop, where the viewport meta is ignored, we use CSS `zoom`. Clamped.
 export const MIN_SCALE = 0.5;
-export const MAX_SCALE = 1.6;
+export const MAX_SCALE = 2.0; // 200% — the WCAG 1.4.4 reference level for text resize / zoom.
 const [uiScale, setUiScaleRaw] = persistedSignal<number>("vh.prefs.uiScale.v1", 1, 1);
 export { uiScale };
 

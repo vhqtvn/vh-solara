@@ -41,4 +41,14 @@ describe("setViewportScale disables pinch-zoom", () => {
     expect(c).toContain("minimum-scale=1.20");
     expect(c).toContain("maximum-scale=1.20");
   });
+
+  it("accepts the 200% ceiling (WCAG 1.4.4) without clamping to the old 1.6", () => {
+    setUiScale(2);
+    applyScale();
+    const c = viewportContent();
+    expect(c).toContain("initial-scale=2.00");
+    expect(c).toContain("minimum-scale=2.00");
+    expect(c).toContain("maximum-scale=2.00");
+    expect(c).toContain("user-scalable=no");
+  });
 });
