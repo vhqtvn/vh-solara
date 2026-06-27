@@ -1,6 +1,6 @@
 import { createEffect, createMemo, createSignal, For, Match, on, onCleanup, onMount, Show, Switch, untrack } from "solid-js";
 import { Portal } from "solid-js/web";
-import { ackSession, createSession, isSending, markSessionIdle, openSession, respondPermission, sessionTodoCounts, sessionTodos, sessionWorking, setSelectedId, setSending, state } from "../sync";
+import { ackSession, createSession, currentVerb, isSending, markSessionIdle, openSession, respondPermission, sessionTodoCounts, sessionTodos, sessionWorking, setSelectedId, setSending, state } from "../sync";
 import { getScroll, setScroll } from "../lib/scroll";
 import { highlightInput } from "../lib/composerHighlight";
 import { chooseVariant, findModel, loadModels, models, selectionFor } from "../models";
@@ -325,6 +325,35 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // "Working" = the session is busy (shared with the sidebar spinner so they
   // always agree). See sessionWorking() for the activity + last-message logic.
   const working = createMemo(() => sessionWorking(props.sessionId));
+  // Honest verb for the Working pill ("Reading parser.go · 4s", "Thinking · 3s",
+  // "Waiting for approval · 8s"). Derived in selectors (currentVerb) so the
+  // sidebar can reuse it later; the selector is clock-free, so the elapsed
+  // timer ticks here (1s, mirroring ReasoningPart) and only while the pill shows.
+  const verb = createMemo(() => currentVerb(props.sessionId));
+  const [verbNow, setVerbNow] = createSignal(Date.now());
+  createEffect(() => {
+    if (!working() || !verb()) return;
+    const t = setInterval(() => setVerbNow(Date.now()), 1000);
+    onCleanup(() => clearInterval(t));
+  });
+  const verbElapsed = createMemo(() => {
+    const v = verb();
+    if (!v || !v.startMs) return "";
+    const secs = Math.max(0, Math.round((verbNow() - v.startMs) / 1000));
+    return secs < 60 ? `${secs}s` : `${Math.floor(secs / 60)}m ${secs % 60}s`;
+  });
+  // Verb-only (stable) label for the live region's aria-label. Intentionally
+  // excludes the elapsed timer: the .working element is aria-live="polite", so
+  // mutating its accessible name once per second (the verbNow 1s ticker) would
+  // announce every tick. Announcing only on verb transitions keeps screen
+  // readers quiet between meaningful state changes; the ticking elapsed span is
+  // aria-hidden in the markup below.
+  const workingAriaLabel = createMemo(() => {
+    const v = verb();
+    if (!v) return "Working";
+    const subj = v.subject ? ` ${v.subject}` : "";
+    return `${v.verb}${subj}`;
+  });
   // Key (first part id) of the LAST activity group in the whole conversation —
   // that one renders expanded by default, all earlier ones collapsed.
   const lastActivityKey = createMemo(() => {
@@ -1182,7 +1211,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       <Show when={working() || todoCounts().left > 0}>
         <div class="chat-status">
           <Show when={working()}>
-            <div class="working" role="status" aria-live="polite" aria-label="Working">
+            <div class="working" role="status" aria-live="polite" aria-label={workingAriaLabel()}>
               <svg class="vh-inline-mark" viewBox="440 212 136 136" aria-hidden="true">
                 <g class="vh-base">
                   <path d="M440,236L483,325L498,326L541,237L526,237L493,307L490,309L455,236Z" />
@@ -1195,7 +1224,20 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
                 <path class="vh-current" d="M449 236L486 318L493 309L535 237M569 236L569 277L533 280L568 282L569 326" />
                 <path class="vh-current hot" d="M449 236L486 318L493 309L535 237M569 236L569 277L533 280L568 282L569 326" />
               </svg>
-              <span class="working-text">Working<span class="working-dots" aria-hidden="true" /></span>
+              {/* Verb + (optional subject) + animated ellipsis + elapsed. The dots
+                  sit at the END of the activity description (right before the
+                  timer) so "Reading parser.go... · 4s" and "Thinking... · 3s"
+                  stay consistent; subject truncates with ellipsis like .tool-subject. */}
+              <span class="working-text">
+                <span class="working-verb">{verb()?.verb ?? "Working"}</span>
+                <Show when={verb()?.subject}>
+                  {(s) => <span class="working-subject">{s()}</span>}
+                </Show>
+                <span class="working-dots" aria-hidden="true" />
+                <Show when={verbElapsed()}>
+                  {(e) => <span class="working-elapsed" aria-hidden="true"> · {e()}</span>}
+                </Show>
+              </span>
             </div>
           </Show>
           <Show when={todoCounts().left > 0}>

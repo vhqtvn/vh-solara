@@ -10,23 +10,11 @@ import { streamLive } from "../prefs";
 import { openSession, projectDir, setSelectedId } from "../sync";
 import { openFileAt } from "../code/frame";
 import { looksLikePath } from "../lib/pathlike";
+import { toolLabel, toolSubject } from "../lib/toolLabel";
 import type { Part } from "../types";
 import Icon from "./Icon";
 import Spinner from "./Spinner";
 
-// Friendly tool labels (mirrors OpenChamber's TOOL_METADATA displayName). Falls
-// back to a title-cased version of the raw tool name for anything unmapped.
-const TOOL_LABELS: Record<string, string> = {
-  read: "Read File", write: "Write File", edit: "Edit File", multiedit: "Multi-Edit",
-  patch: "Apply Patch", apply_patch: "Apply Patch", bash: "Shell", grep: "Search Files",
-  glob: "Find Files", list: "List Directory", ls: "List Directory", task: "Agent Task",
-  webfetch: "Fetch URL", fetch: "Fetch URL", websearch: "Web Search", codesearch: "Code Search",
-  todowrite: "Update Todos", todoread: "Read Todos", skill: "Load Skill", question: "Question", lsp: "LSP",
-};
-function toolLabel(tool: string): string {
-  const t = (tool || "").toLowerCase();
-  return TOOL_LABELS[t] || (tool || "").replace(/[_-]+/g, " ").replace(/\b\w/g, (c) => c.toUpperCase()) || tool;
-}
 // Map a tool to one of our available Icon glyphs (see Icon.tsx).
 function toolIconName(tool: string): string {
   const t = (tool || "").toLowerCase();
@@ -353,34 +341,9 @@ function ToolPart(props: { part: Part; tail?: boolean }) {
   // The salient input "expression" for a tool — the command for bash, the
   // pattern for glob/grep, the path for read/write, the url for webfetch, etc.
   // The title is only a short description, so show the real argument that ran.
-  const expr = (): string => {
-    const input = (state().input || (props.part as any).input || {}) as Record<string, any>;
-    const pick = (...keys: string[]) => {
-      for (const k of keys) if (typeof input[k] === "string" && input[k]) return input[k] as string;
-      return "";
-    };
-    switch (tool()) {
-      case "bash":
-        return pick("command");
-      case "glob":
-        return pick("pattern", "query");
-      case "grep":
-        return pick("pattern", "query", "regex");
-      case "read":
-      case "write":
-      case "edit":
-      case "multiedit":
-        return pick("filePath", "file", "path");
-      case "list":
-      case "ls":
-        return pick("path", "dir");
-      case "webfetch":
-      case "fetch":
-        return pick("url");
-      default:
-        return "";
-    }
-  };
+  // Logic lives in the shared toolSubject() helper (also used by the Working
+  // pill) so the per-tool argument mapping has one home.
+  const expr = (): string => toolSubject(props.part);
   // Prefix the expression with a sigil hinting the tool kind ($ for shell).
   const exprPrefix = () => (tool() === "bash" ? "$ " : "");
   // The file a read/edit/write-style tool touched → openable in the code view.

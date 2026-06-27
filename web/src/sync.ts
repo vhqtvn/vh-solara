@@ -109,10 +109,12 @@ export {
   lastUserMessageModel,
   sessionLastAgent,
   sessionWorking,
+  currentVerb,
   runningSessionCount,
   sessionTodos,
   sessionTodoCounts,
 } from "./sync/selectors";
+export type { CurrentVerb } from "./sync/selectors";
 export { ackSession } from "./sync/orchestration";
 export {
   newSession,

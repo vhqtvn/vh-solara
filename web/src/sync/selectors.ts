@@ -2,8 +2,9 @@
 // working-state rollup, todo aggregation, and the per-session model selectors.
 // All pure reads of `state` (no mutation, no I/O), so they sit just above the
 // store in the dependency graph and everything else can read through them.
-import type { TodoItem } from "../types";
+import type { SessionMessages, TodoItem } from "../types";
 import { anyDescendantWorking } from "../lib/reduce";
+import { toolSubject, toolVerb } from "../lib/toolLabel";
 import { state } from "./store";
 
 // The root of a session (top of the parentID chain that's still in the store).
@@ -98,6 +99,88 @@ export function runningSessionCount(): number {
 
 function descendantWorking(sessionID: string): boolean {
   return anyDescendantWorking(state.sessions, state.activity, sessionID, isActivityWorking);
+}
+
+// What the agent is doing right now, surfaced as the Working pill's verb + an
+// elapsed-timer base. Pure read of `state` (the caller supplies the ticking
+// clock — consumed by ChatView's working-status memos `verb`, `verbElapsed`,
+// and `workingAriaLabel` — so this selector stays clock-free and only
+// recomputes when the part stream changes).
+//
+// Returns null when the session isn't working (the pill is hidden). Otherwise,
+// in priority order:
+//   1. Waiting for approval — a pending permission/question on this session.
+//   2. Active tool — the newest running tool part of the last assistant turn.
+//   3. Thinking — the newest live reasoning part (no time.end).
+//   4. Working — generic fallback (between steps, or a verb we don't model).
+export interface CurrentVerb {
+  verb: string;
+  subject?: string;
+  // Epoch-ms the elapsed timer counts from. 0 = unknown (show the verb only).
+  // Tool/reasoning use the part's step-level start; Waiting/Working use the
+  // current turn's start (newest message created time).
+  startMs: number;
+}
+
+export function currentVerb(sessionID: string): CurrentVerb | null {
+  if (!sessionWorking(sessionID)) return null;
+  const sm = state.messages[sessionID];
+  // 1) Waiting for operator approval/question — prefer this so a long elapsed
+  //    never reads as "stuck" when the agent is actually blocked on the operator.
+  if (Object.keys(state.permissions[sessionID] || {}).length > 0 ||
+      Object.keys(state.questions[sessionID] || {}).length > 0) {
+    return { verb: "Waiting for approval", startMs: turnStartMs(sm) };
+  }
+  // 2/3) The active verb from the last assistant turn's parts.
+  const active = activeVerbFromTurn(sm);
+  if (active) return active;
+  // 4) Fallback.
+  return { verb: "Working", startMs: turnStartMs(sm) };
+}
+
+// Scan the newest assistant message's parts (newest-first) for the current verb.
+// Two passes so a running tool always wins over an older live reasoning part:
+//   pass 1 — newest running tool; pass 2 — newest live reasoning.
+// Only the newest assistant message is considered — that's the in-flight turn.
+function activeVerbFromTurn(sm: SessionMessages | undefined): CurrentVerb | null {
+  if (!sm) return null;
+  let m: SessionMessages["byId"][string] | undefined;
+  for (let mi = sm.order.length - 1; mi >= 0; mi--) {
+    const cand = sm.byId[sm.order[mi]];
+    if (cand?.info?.role === "assistant") { m = cand; break; }
+  }
+  if (!m) return null;
+  const order = m.partOrder || [];
+  for (let i = order.length - 1; i >= 0; i--) {
+    const p = m.parts[order[i]];
+    if (p?.type === "tool") {
+      const st = (p.state || {}) as { status?: string; time?: { start?: number } };
+      if (st.status === "running") {
+        const subject = toolSubject(p);
+        return {
+          verb: toolVerb((p.tool as string | undefined) ?? ""),
+          subject: subject || undefined,
+          startMs: st.time?.start || (p.time?.start as number | undefined) || 0,
+        };
+      }
+    }
+  }
+  for (let i = order.length - 1; i >= 0; i--) {
+    const p = m.parts[order[i]];
+    if (p?.type === "reasoning" && !p.time?.end) {
+      return { verb: "Thinking", startMs: (p.time?.start as number | undefined) || 0 };
+    }
+  }
+  return null;
+}
+
+// The current turn's start: the newest message's created time (the user message
+// just sent, or the in-flight assistant message). Used as the elapsed base when
+// no specific part bounds the verb (Waiting / generic Working).
+function turnStartMs(sm: SessionMessages | undefined): number {
+  if (!sm?.order.length) return 0;
+  const last = sm.byId[sm.order[sm.order.length - 1]];
+  return (last?.info?.time?.created as number | undefined) || 0;
 }
 
 // normalizeTodos extracts the todo array from either the bare array or the

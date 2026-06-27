@@ -3361,6 +3361,9 @@ div.katex-math { display: block; overflow-x: auto; margin: 0.7em 0; text-align: 
    but the drop-shadow is the first lever to drop if GPU heat ever returns. */
 .working {
   display: inline-flex; align-items: center; gap: 8px; min-width: 0;
+  /* Cap width so a long tool subject truncates instead of pushing the Tasks
+     pill off-screen. The subject span ellipses (see .working-subject). */
+  max-width: min(70vw, 540px);
   font-size: var(--text-sm); font-weight: 650; line-height: 1;
   color: var(--fg);
 }
@@ -3387,8 +3390,18 @@ div.katex-math { display: block; overflow-x: auto; margin: 0.7em 0; text-align: 
   animation-duration: 0.85s;
 }
 @keyframes vh-inline-current { to { stroke-dashoffset: 0; } }
-.working-text { display: inline-flex; align-items: baseline; color: var(--fg); }
-.working-dots { display: inline-block; width: 18px; color: var(--accent); }
+.working-text { display: inline-flex; align-items: baseline; min-width: 0; color: var(--fg); }
+.working-verb { flex: 0 0 auto; }
+/* Subject truncates like .tool-subject (overflow ellipsis) so a long command or
+   path doesn't overflow the pill or the row. */
+.working-subject {
+  flex: 1 1 auto; min-width: 0; margin-left: 6px;
+  color: var(--fg-dim); font-weight: 500; font-size: 0.92em;
+  font-family: ui-monospace, Menlo, monospace;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.working-elapsed { flex: 0 0 auto; color: var(--fg-dim); font-weight: 550; font-variant-numeric: tabular-nums; }
+.working-dots { display: inline-block; width: 18px; flex: 0 0 auto; color: var(--accent); }
 .working-dots::after { content: ""; animation: working-dots 1.2s steps(4, end) infinite; }
 @keyframes working-dots {
   0% { content: ""; }
