@@ -258,8 +258,11 @@ func (h coordHandlers) spawn(w http.ResponseWriter, r *http.Request) {
 }
 
 // abort cancels a session's in-flight turn. Body: {sessionID, idempotency_key?}.
-// NOTE: the resulting idle is asynchronous — callers must wait for the
-// session.idle transition before sending again (do not send-after-abort).
+// OpenCode does not emit session.idle on abort, so after the upstream abort
+// succeeds we mark the session idle authoritatively (Store.MarkIdle) — otherwise
+// the activity stays "busy" and a later stream-reconnect snapshot re-applies it,
+// re-arming the working indicator on a turn the user already stopped. Callers
+// may send again immediately (no need to wait for a session.idle transition).
 func (h coordHandlers) abort(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -281,6 +284,9 @@ func (h coordHandlers) abort(w http.ResponseWriter, r *http.Request) {
 		if err := agg.Client().Abort(r.Context(), body.SessionID); err != nil {
 			return upstreamStatus(err, false), errResp(err.Error()), ""
 		}
+		// The turn was stopped: clear the authoritative activity so reconnects
+		// and second tabs see idle, matching the client's optimistic clear.
+		agg.Store().MarkIdle(body.SessionID)
 		return http.StatusOK, jsonBytes(map[string]any{"ok": true}), ""
 	})
 }

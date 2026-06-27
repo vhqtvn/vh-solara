@@ -63,8 +63,11 @@ test("Stop clears the working indicator immediately (abort)", async ({ page }) =
   await page.keyboard.press("Enter");
   await expect(page.locator(".working-text")).toBeVisible({ timeout: 5000 });
 
-  // Stop aborts on the server AND clears the local working state right away,
-  // even though the fixture (like OpenCode) emits no idle event on abort.
+  // Stop aborts on the server AND clears the local working state right away.
+  // The fixture's OpenCode layer emits no idle on abort (like real OpenCode);
+  // the /vh/abort verb marks the session idle authoritatively server-side, and
+  // the client clears optimistically too — so the indicator must be gone at
+  // once and STAY gone (a reconnect snapshot can't re-arm a stopped turn).
   await page.locator(".send-btn.stop").click();
   await expect(page.locator(".working-text")).toHaveCount(0, { timeout: 2000 });
   await expect(page.locator(".tree-node .tree-spinner")).toHaveCount(0, { timeout: 2000 });

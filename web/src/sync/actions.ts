@@ -144,11 +144,17 @@ export async function respondQuestion(questionID: string, answers: string[][]) {
 // session menu as a recovery path: a turn killed mid-generation (e.g. a network
 // drop) can leave OpenCode reporting the session "busy" forever (a zombie turn)
 // while the composer's Stop button may be unavailable — this always works.
+// Routes through /vh/abort so the server marks the session idle authoritatively
+// too (OpenCode emits no session.idle on abort), keeping reconnects consistent.
 export async function abortSession(sessionID: string) {
   if (!sessionID) return;
   markSessionIdle(sessionID);
   try {
-    await fetch(`/oc/session/${encodeURIComponent(sessionID)}/abort`, { method: "POST" });
+    await fetch("/vh/abort", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionID }),
+    });
   } catch (e) {
     log.warn("abort", "request failed", e);
   }

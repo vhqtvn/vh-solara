@@ -1143,7 +1143,14 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     // Clear the working indicator immediately — OpenCode doesn't reliably emit
     // an idle event on abort, so without this the spinner/shimmer would linger.
     markSessionIdle(props.sessionId);
-    await fetch(`/oc/session/${encodeURIComponent(props.sessionId)}/abort`, { method: "POST" });
+    // /vh/abort (not the /oc passthrough) also marks the session idle
+    // authoritatively server-side, so a stream-reconnect snapshot can't re-arm
+    // the working indicator on this stopped turn.
+    await fetch("/vh/abort", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionID: props.sessionId }),
+    });
   }
 
   function onKeyDown(e: KeyboardEvent) {
@@ -1332,9 +1339,9 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
         mask-image, or per-element contain/content-visibility — see AGENTS.md).
       */}
       <Show when={following() && !props.draft}>
-        <div class="live" role="status" aria-label="Following latest">
-          <span class="live-dot" aria-hidden="true" />
-          <span class="live-text">Live</span>
+        <div class="chat-live" role="status" aria-label="Following latest">
+          <span class="chat-live-dot" aria-hidden="true" />
+          <span class="chat-live-text">Live</span>
         </div>
       </Show>
 

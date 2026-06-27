@@ -1403,8 +1403,12 @@ body {
    (it's a status, not an action). GPU-cheap by design: a small static pill whose
    only animation is a slow opacity/scale pulse on a 7px leaf dot — compositor-only,
    no layout/paint on the document, and none of the Firefox/WebRender trap patterns
-   (no backdrop-filter / mask-image / per-element contain / content-visibility). */
-.live {
+   (no backdrop-filter / mask-image / per-element contain / content-visibility).
+   The class is `chat-live` (not `live`) on purpose: `live` is already a modifier on
+   `.status`/`.reasoning-time`, and a bare `.live` rule here would also match the
+   sidebar's `<span class="status live">` connection pill, yanking it out of the
+   header via position:absolute. */
+.chat-live {
   position: absolute;
   bottom: 76px;
   left: 50%;
@@ -1422,18 +1426,18 @@ body {
   letter-spacing: 0.02em;
   pointer-events: none;
   box-shadow: 0 1px 4px #0004;
-  animation: live-in 0.16s var(--ease);
+  animation: chat-live-in 0.16s var(--ease);
 }
-.live-dot {
+.chat-live-dot {
   width: 7px;
   height: 7px;
   border-radius: 50%;
   background: var(--accent);
-  animation: live-pulse 2.4s var(--ease) infinite;
+  animation: chat-live-pulse 2.4s var(--ease) infinite;
 }
-.live-text { line-height: 1; }
-@keyframes live-in { from { opacity: 0; transform: translate(-50%, 6px); } to { opacity: 1; transform: translate(-50%, 0); } }
-@keyframes live-pulse {
+.chat-live-text { line-height: 1; }
+@keyframes chat-live-in { from { opacity: 0; transform: translate(-50%, 6px); } to { opacity: 1; transform: translate(-50%, 0); } }
+@keyframes chat-live-pulse {
   0%, 100% { opacity: 1; transform: scale(1); }
   50% { opacity: 0.4; transform: scale(0.78); }
 }

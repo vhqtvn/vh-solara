@@ -392,6 +392,18 @@ func (s *Store) AckUnread(sessionID string) {
 	s.clearUnreadLocked(s.rootOfLocked(sessionID))
 }
 
+// MarkIdle authoritatively marks a session idle and emits the activity event.
+// Used by the abort verb: OpenCode does not emit session.idle on abort, so
+// without this the authoritative activity stays "busy" until a stale event (or
+// a stream reconnect's snapshot) re-applies it and re-arms the working
+// indicator on a turn the user already stopped. setActivityLocked is a no-op
+// when already idle, so a later real session.idle reconciles harmlessly.
+func (s *Store) MarkIdle(sessionID string) {
+	s.mu.Lock()
+	s.setActivityLocked(sessionID, ActivityIdle)
+	s.mu.Unlock()
+}
+
 // SetActivityFromStatuses seeds activity from a GET /session/status snapshot
 // (sessionID -> SessionStatus). Used by the aggregator on (re)hydrate.
 // SetActivityFromStatuses makes /session/status the authoritative source of
