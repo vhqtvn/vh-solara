@@ -55,12 +55,12 @@ const ifIdleSeqHeader = "If-Idle-Seq"
 
 // outcome values classify a verb result so a caller parsing the JSON body (not
 // headers) can classify it for its accounting. ONLY "created" means a new session
-// was minted (slot-consuming); all others are non-counting.
+// was minted (counting); all others are non-counting.
 //   - created                  : spawn minted a new session.
 //   - reused                   : an idempotency replay of a prior success — the
 //     side effect already happened; don't re-count it.
 //   - prompt_retried_to_existing: a prompt was delivered into an existing session
-//     (send). Not slot-consuming (the session predates it).
+//     (send). Not counting (the session predates it).
 //   - refused                  : deterministic rejection before any side effect
 //     (the spawn handler's fail-closed permission_policy validation path: an
 //     unknown/illegal policy is refused before mint — no session created,
@@ -243,12 +243,12 @@ func (h coordHandlers) spawn(w http.ResponseWriter, r *http.Request) {
 			}
 			if _, err := agg.Client().Prompt(r.Context(), sess.ID, jsonBytes(ocBody)); err != nil {
 				// A session WAS minted (sess.ID set) even though its first turn failed. By the
-				// accounting rule a minted session is slot-consuming, so outcome MUST be "created"
+				// accounting rule a minted session is counting, so outcome MUST be "created"
 				// (not "failed", which is reserved for the no-mint case). ok:false + outcome:"created"
 				// is intentional and correct: outcome is the mint/accounting signal (a session exists
-				// → slot consumed), ok is the operational status (the first turn did not complete).
+				// → the session is counted), ok is the operational status (the first turn did not complete).
 				// The classification is also "created" (success-class) so an idempotency replay
-				// rewrites the body outcome to "reused" — the slot was already counted on the first
+				// rewrites the body outcome to "reused" — the session was already counted on the first
 				// attempt and must not be double-counted on retry.
 				return upstreamStatus(err, false), jsonBytes(map[string]any{"ok": false, "sessionID": sess.ID, "error": "session created but prompt failed: " + err.Error(), "outcome": OutcomeCreated}), OutcomeCreated
 			}

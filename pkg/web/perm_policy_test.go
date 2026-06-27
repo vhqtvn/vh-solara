@@ -236,7 +236,7 @@ func TestPermissionBlockedUnknownSession(t *testing.T) {
 	}
 }
 
-// TestReconcileRejectsFailFastAfterOverflow is the F1 regression. It reproduces
+// TestSweepRejectsFailFastAfterOverflow is the F1 regression. It reproduces
 // the EXACT failure mode the old live-tail watcher had: the store's lossy emit()
 // CLOSES a subscriber's channel on overflow, so a `for ev := range ch` watcher
 // would exit silently and never re-arm (defeating the guarantee with no signal).
@@ -247,7 +247,7 @@ func TestPermissionBlockedUnknownSession(t *testing.T) {
 //
 // Deterministic: it calls reconcileFailFastPerms directly (no ticker timing, no
 // waiting). This is the backstop the guarantee now rests on.
-func TestReconcileRejectsFailFastAfterOverflow(t *testing.T) {
+func TestSweepRejectsFailFastAfterOverflow(t *testing.T) {
 	f := &fakeOC{}
 	_, agg, srv := newVerbServerSrv(t, f)
 	store := agg.Store()
@@ -304,10 +304,10 @@ func TestReconcileRejectsFailFastAfterOverflow(t *testing.T) {
 	}
 }
 
-// TestReconcileRejectsMultipleFailFastSessions proves one reconcile sweep
+// TestSweepRejectsMultipleFailFastSessions proves one reconcile sweep
 // rejects every pending permission across multiple fail_fast sessions in the
 // same dir. Deterministic: calls reconcileFailFastPerms directly.
-func TestReconcileRejectsMultipleFailFastSessions(t *testing.T) {
+func TestSweepRejectsMultipleFailFastSessions(t *testing.T) {
 	f := &fakeOC{}
 	_, agg, srv := newVerbServerSrv(t, f)
 	store := agg.Store()

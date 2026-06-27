@@ -448,7 +448,7 @@ func TestSendOutcomeFailedReplayStaysFailed(t *testing.T) {
 
 // TestSpawnOutcomeCreateOkPromptFailed verifies the spawn branch where session
 // creation succeeds but the first prompt fails: outcome is "created" (a session
-// WAS minted → slot-consuming), ok is false (the first turn did not complete),
+// WAS minted → counting), ok is false (the first turn did not complete),
 // AND a sessionID is present. ok:false + outcome:"created" is intentional:
 // outcome is the accounting/mint signal; ok is the operational status.
 func TestSpawnOutcomeCreateOkPromptFailed(t *testing.T) {
@@ -462,7 +462,7 @@ func TestSpawnOutcomeCreateOkPromptFailed(t *testing.T) {
 		t.Fatalf("create-ok-prompt-failed want ok=false, got %v", out["ok"])
 	}
 	if out["outcome"] != OutcomeCreated {
-		t.Fatalf("create-ok-prompt-failed outcome want %q (a session was minted → slot-consuming), got %v", OutcomeCreated, out["outcome"])
+		t.Fatalf("create-ok-prompt-failed outcome want %q (a session was minted → counting), got %v", OutcomeCreated, out["outcome"])
 	}
 	if out["sessionID"] != "new_sess" {
 		t.Fatalf("create-ok-prompt-failed should carry the minted sessionID, got %v", out["sessionID"])
