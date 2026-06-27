@@ -1,0 +1,115 @@
+package projectcfg
+
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+)
+
+// parseStyles round-trips the spliced output through the same JSONC loader the
+// daemon uses, so a passing test proves the edit stays loadable.
+func parseStyles(t *testing.T, b []byte) map[string]AgentStyle {
+	t.Helper()
+	var c Config
+	if err := json.Unmarshal(stripJSONC(b), &c); err != nil {
+		t.Fatalf("spliced output does not parse: %v\n---\n%s", err, b)
+	}
+	return c.AgentStyles
+}
+
+func TestSpliceReplacesExistingKeyPreservingComments(t *testing.T) {
+	src := []byte(`{
+  // companion processes (trust-gated — must survive the edit)
+  "processes": [{ "id": "p", "command": "echo hi" }],
+  "agentStyles": {
+    "build": { "color": "muted" } // old value, will be replaced
+  },
+  "notes": true
+}`)
+	out, err := SpliceTopLevelKey(src, "agentStyles", map[string]AgentStyle{
+		"supervisor": {Label: "SUP", Color: "danger", Style: "solid"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := parseStyles(t, out)
+	if _, gone := s["build"]; gone {
+		t.Fatalf("old agentStyles value not replaced: %+v", s)
+	}
+	if s["supervisor"].Label != "SUP" || s["supervisor"].Color != "danger" {
+		t.Fatalf("new value not written: %+v", s)
+	}
+	str := string(out)
+	if !strings.Contains(str, "trust-gated — must survive") {
+		t.Fatalf("a comment outside the value was lost:\n%s", str)
+	}
+	if !strings.Contains(str, `"command": "echo hi"`) || !strings.Contains(str, `"notes": true`) {
+		t.Fatalf("a sibling key was disturbed:\n%s", str)
+	}
+}
+
+func TestSpliceInsertsWhenAbsentKeepingSiblings(t *testing.T) {
+	src := []byte(`{
+  // top comment
+  "processes": [{ "id": "p", "command": "echo hi" }]
+}`)
+	out, err := SpliceTopLevelKey(src, "agentStyles", map[string]AgentStyle{
+		"plan": {Color: "accent"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := parseStyles(t, out)
+	if s["plan"].Color != "accent" {
+		t.Fatalf("inserted value missing: %+v", s)
+	}
+	if !strings.Contains(string(out), "top comment") {
+		t.Fatalf("comment lost on insert:\n%s", out)
+	}
+	// The trust-gated section must be byte-identical in spirit (still parses to
+	// the same process).
+	var c Config
+	_ = json.Unmarshal(stripJSONC(out), &c)
+	if len(c.Processes) != 1 || string(c.Processes[0].Command) == "" {
+		t.Fatalf("processes disturbed by insert: %+v", c.Processes)
+	}
+}
+
+func TestSpliceCreatesFreshWhenNoRoot(t *testing.T) {
+	for _, src := range []string{"", "   \n  ", "// only a comment\n"} {
+		out, err := SpliceTopLevelKey([]byte(src), "agentStyles", map[string]AgentStyle{
+			"x": {Label: "X"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if parseStyles(t, out)["x"].Label != "X" {
+			t.Fatalf("fresh doc not authored for %q: %s", src, out)
+		}
+	}
+}
+
+func TestSpliceHandlesBracesInStringsAndComments(t *testing.T) {
+	// A `}` inside a string and inside a comment must not be mistaken for the
+	// end of the agentStyles object.
+	src := []byte(`{
+  "agentStyles": { "a": { "label": "}" } /* trailing } brace */ },
+  "notes": false
+}`)
+	out, err := SpliceTopLevelKey(src, "agentStyles", map[string]AgentStyle{
+		"b": {Label: "B"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := parseStyles(t, out)
+	if _, stillThere := s["a"]; stillThere {
+		t.Fatalf("old value not fully replaced (brace/string/comment miscount): %+v", s)
+	}
+	if s["b"].Label != "B" {
+		t.Fatalf("new value missing: %+v", s)
+	}
+	if !strings.Contains(string(out), `"notes": false`) {
+		t.Fatalf("sibling after a tricky value was dropped:\n%s", out)
+	}
+}

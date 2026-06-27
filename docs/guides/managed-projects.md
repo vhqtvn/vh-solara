@@ -67,6 +67,35 @@ it never re-gates the declared processes, and it is read without a trust prompt.
 { "notes": true, "processes": [ /* … */ ] }
 ```
 
+### Agent styles (`agentStyles`)
+
+Give specific agents a distinct look so, say, a supervisor stands apart from the
+everyday build/coordination agents. Map an agent name to a display treatment:
+
+```jsonc
+{
+  "agentStyles": {
+    "supervisor":   { "label": "SUP",   "color": "danger",  "style": "solid"   },
+    "coordination": { "label": "COORD", "color": "accent2", "style": "outline" },
+    "build":        { "color": "accent" }
+  }
+}
+```
+
+- **`label`** — a terse chip text (≤ 6 chars). Only agents with a label get a
+  chip on their messages; everything else keeps the plain `@name`, so the
+  message head stays compact. Opt agents in deliberately.
+- **`color`** — a **theme token name**, never a raw color: one of `accent`,
+  `accent2`, `ok`, `warn`, `danger`, `muted` (the OpenCode spellings
+  `success`/`warning`/`error` are accepted as aliases). Any other value is
+  ignored. The chip and the composer's agent picker pick up the theme color, so
+  it stays correct across light/dark and custom themes.
+- **`style`** — the chip variant: `soft` (faint tint, default), `outline`
+  (bordered), or `solid` (filled).
+
+Like `notes`, this is display-only — **not** part of the trust hash, and it's
+sanitized client-side (no arbitrary color or CSS reaches the page).
+
 ## Trust
 
 Because the config can declare arbitrary shell commands, **vh-solara will not run

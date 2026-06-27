@@ -33,6 +33,7 @@ export default function CommandPalette() {
     { id: "chat", label: "Go to Chat", run: () => setView("chat") },
     { id: "changes", label: "Go to Changes", run: () => setView("changes") },
     { id: "notes", label: "Go to Notes", run: () => setView("notes") },
+    { id: "agents", label: "Go to Agent styles", run: () => setView("agents") },
     { id: "focus", label: "Focus composer", run: () => focusComposer() },
     { id: "settings", label: "Open Settings", run: () => setSettingsOpen(true) },
     { id: "admin", label: "Server admin", run: () => setAdminOpen(true) },

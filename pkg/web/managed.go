@@ -1,6 +1,7 @@
 package web
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -515,27 +516,97 @@ func (s *Server) handleManaged(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleProjectSettings returns per-project UI settings read straight from
-// .vh-solara/project.jsonc — display flags, not executable, so this is NOT
-// trust-gated. Currently just `notes` (tri-state; omitted when not declared, so
-// the client falls back to its global pref). Tolerant: any read/parse miss
-// returns an empty object.
+// projectSettingsMu serializes the read-modify-write of project.jsonc so two
+// concurrent saves can't interleave and corrupt the file.
+var projectSettingsMu sync.Mutex
+
+// handleProjectSettings serves per-project UI settings read from (GET) and the
+// display-only `agentStyles` written back to (PUT) .vh-solara/project.jsonc.
+//
+// GET returns `notes` (tri-state; omitted when not declared, so the client falls
+// back to its global pref) and `agentStyles` (raw declared treatments — the
+// client sanitizes color/style against fixed enums). Tolerant: any read/parse
+// miss returns an empty object.
+//
+// PUT { agentStyles, dryRun } edits ONLY the agentStyles key via a
+// comment-preserving splice that never touches the trust-gated processes/views
+// (and leaves the trust hash unchanged, so no re-gate). dryRun returns the old
+// and new file text for a confirm-diff; otherwise the new text is written
+// (creating .vh-solara/ as needed).
 func (s *Server) handleProjectSettings(w http.ResponseWriter, r *http.Request) {
-	out := map[string]any{}
-	root, err := projectRoot(reqDir(r))
-	if err != nil {
-		writeJSONResp(w, out)
-		return
-	}
 	override := ""
 	if s.managed != nil {
 		override = s.managed.cfgOverride
 	}
-	lr, err := projectcfg.Load(root, override)
-	if err == nil && lr.Config != nil && lr.Config.Notes != nil {
-		out["notes"] = *lr.Config.Notes
+	switch r.Method {
+	case http.MethodGet:
+		out := map[string]any{}
+		root, err := projectRoot(reqDir(r))
+		if err != nil {
+			writeJSONResp(w, out)
+			return
+		}
+		lr, err := projectcfg.Load(root, override)
+		if err == nil && lr.Config != nil {
+			if lr.Config.Notes != nil {
+				out["notes"] = *lr.Config.Notes
+			}
+			if len(lr.Config.AgentStyles) > 0 {
+				out["agentStyles"] = lr.Config.AgentStyles
+			}
+		}
+		writeJSONResp(w, out)
+
+	case http.MethodPut, http.MethodPost:
+		var body struct {
+			AgentStyles map[string]projectcfg.AgentStyle `json:"agentStyles"`
+			DryRun      bool                             `json:"dryRun"`
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "invalid body", http.StatusBadRequest)
+			return
+		}
+		root, err := projectRoot(reqDir(r))
+		if err != nil {
+			http.Error(w, "no project root", http.StatusBadRequest)
+			return
+		}
+		path, err := projectcfg.ResolvePath(root, override)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		projectSettingsMu.Lock()
+		defer projectSettingsMu.Unlock()
+
+		oldRaw, readErr := os.ReadFile(path)
+		if readErr != nil && !os.IsNotExist(readErr) {
+			http.Error(w, readErr.Error(), http.StatusInternalServerError)
+			return
+		}
+		newRaw, err := projectcfg.SpliceTopLevelKey(oldRaw, "agentStyles", body.AgentStyles)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if body.DryRun {
+			writeJSONResp(w, map[string]any{"old": string(oldRaw), "new": string(newRaw)})
+			return
+		}
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if err := os.WriteFile(path, newRaw, 0o644); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSONResp(w, map[string]any{"ok": true})
+
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
-	writeJSONResp(w, out)
 }
 
 // handleTrust: GET ?dir= → {state, config_hash}. POST {dir} → approve current

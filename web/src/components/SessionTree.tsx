@@ -275,9 +275,6 @@ function Node(props: {
             <Show when={!busy() && !needsInput() && state.unread[props.session.id]}>
               <span class="dot unread" data-tip="finished — not yet viewed" />
             </Show>
-            <Show when={isPinned(props.session.id)}>
-              <span class="dot pin" data-tip="pinned" />
-            </Show>
             <span class="tree-title" classList={{ unread: !busy() && !!state.unread[props.session.id], "needs-input": needsInput() }}>
               {props.session.title || props.session.id}
             </span>
@@ -394,12 +391,10 @@ export default function SessionTree() {
     prevWorking = new Set(w);
     if (changed) persist(next);
   });
-  // Pinned roots float to the top (stable within each group).
-  const sortedRoots = createMemo(() => {
-    const r = roots();
-    const pin = r.filter((s) => isPinned(s.id));
-    return pin.length ? [...pin, ...r.filter((s) => !isPinned(s.id))] : r;
-  });
+  // Pinned roots float to the top as a distinct, tinted group; the rest follow.
+  // Position (above the divider) is the pin signal — no per-row pin marker.
+  const pinnedRoots = createMemo(() => roots().filter((s) => isPinned(s.id)));
+  const unpinnedRoots = createMemo(() => roots().filter((s) => !isPinned(s.id)));
   // Search collapses the tree into a flat, recency-sorted list of title matches
   // across the whole project (pinned first) — "find a session", not navigate.
   const results = createMemo(() => {
@@ -436,7 +431,6 @@ export default function SessionTree() {
                       <Show when={sessionNeedsInput(s.id)}>
                         <span class="dot needs-input" data-tip="needs your input — reply to continue" />
                       </Show>
-                      <Show when={isPinned(s.id)}><span class="dot pin" data-tip="pinned" /></Show>
                       <span class="tree-title" classList={{ "needs-input": sessionNeedsInput(s.id) }}>{s.title || s.id}</span>
                       <span class="tree-meta">
                         <RelTime class="tree-time" ms={s.time?.updated || s.time?.created} />
@@ -449,14 +443,34 @@ export default function SessionTree() {
           </Show>
         }
       >
-        <Show when={sortedRoots().length > 0} fallback={<div class="tree-empty">No sessions yet</div>}>
-          <For each={sortedRoots()}>
+        <Show when={roots().length > 0} fallback={<div class="tree-empty">No sessions yet</div>}>
+          <Show when={pinnedRoots().length > 0}>
+            <div class="tree-pinned">
+              <For each={pinnedRoots()}>
+                {(s, i) => (
+                  <Node
+                    session={s}
+                    depth={0}
+                    prefix={[]}
+                    isLast={i() === pinnedRoots().length - 1}
+                    index={index}
+                    ancestors={ancestors}
+                    working={isWorking}
+                  />
+                )}
+              </For>
+            </div>
+            <Show when={unpinnedRoots().length > 0}>
+              <div class="tree-pin-sep" aria-hidden="true" />
+            </Show>
+          </Show>
+          <For each={unpinnedRoots()}>
             {(s, i) => (
               <Node
                 session={s}
                 depth={0}
                 prefix={[]}
-                isLast={i() === sortedRoots().length - 1}
+                isLast={i() === unpinnedRoots().length - 1}
                 index={index}
                 ancestors={ancestors}
                 working={isWorking}

@@ -190,6 +190,32 @@ func TestNotesNotInTrustHash(t *testing.T) {
 	}
 }
 
+// TestAgentStylesParsedNotInTrustHash verifies the display-only agentStyles map
+// is parsed but, like notes, excluded from the trust hash — it's advisory render
+// data the client sanitizes, so it executes nothing and must not re-gate.
+func TestAgentStylesParsedNotInTrustHash(t *testing.T) {
+	base := `{"processes":[{"id":"p","command":"echo hi"}]}`
+	withStyles := `{"agentStyles":{"supervisor":{"label":"SUP","color":"warn","style":"solid"}},"processes":[{"id":"p","command":"echo hi"}]}`
+	dir := t.TempDir()
+	writeConfig(t, dir, base)
+	ra, err := Load(dir, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeConfig(t, dir, withStyles)
+	rb, err := Load(dir, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ra.Hash != rb.Hash {
+		t.Fatalf("agentStyles changed the trust hash: %s vs %s", ra.Hash, rb.Hash)
+	}
+	s, ok := rb.Config.AgentStyles["supervisor"]
+	if !ok || s.Label != "SUP" || s.Color != "warn" || s.Style != "solid" {
+		t.Fatalf("agentStyles not parsed: %+v", rb.Config.AgentStyles)
+	}
+}
+
 func TestValidationErrors(t *testing.T) {
 	cases := []struct {
 		name string

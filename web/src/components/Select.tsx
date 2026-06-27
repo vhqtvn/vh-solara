@@ -6,6 +6,8 @@ export interface SelectOption {
   value: string;
   label: string;
   disabled?: boolean;
+  swatch?: string; // optional color dot (a CSS color/var) shown before the label
+  sub?: string; // optional secondary line under the label (e.g. a description)
 }
 
 // A custom dropdown replacing native <select>. The popup is PORTALED to <body>
@@ -97,7 +99,15 @@ export default function Select(props: {
           disabled={o.disabled}
           onClick={() => pick(o)}
         >
-          <span class="vh-select-opt-label">{o.label}</span>
+          <Show when={o.swatch}>
+            <span class="vh-select-swatch" style={{ background: o.swatch! }} aria-hidden="true" />
+          </Show>
+          <span class="vh-select-opt-text">
+            <span class="vh-select-opt-label">{o.label}</span>
+            <Show when={o.sub}>
+              <span class="vh-select-opt-sub">{o.sub}</span>
+            </Show>
+          </span>
           <Show when={o.value === props.value}>
             <Icon name="check" size={13} />
           </Show>
@@ -118,6 +128,9 @@ export default function Select(props: {
         disabled={props.disabled}
         onClick={toggle}
       >
+        <Show when={current()?.swatch}>
+          <span class="vh-select-swatch" style={{ background: current()!.swatch! }} aria-hidden="true" />
+        </Show>
         <span class="vh-select-label">{current()?.label ?? props.placeholder ?? "Select…"}</span>
         <Icon name="chevronDown" size={13} />
       </button>

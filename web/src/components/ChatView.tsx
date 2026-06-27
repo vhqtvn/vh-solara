@@ -26,6 +26,7 @@ import { pushNotification } from "../notify";
 import { log } from "../lib/log";
 import RelTime from "./RelTime";
 import Select from "./Select";
+import { agentDisplay } from "../projectSettings";
 
 const draftKey = (sid: string) => "vh.draft." + sid;
 
@@ -45,6 +46,29 @@ function agentLabel(info: any): string {
   if (info?.role !== "assistant") return "";
   const a = info.agent ?? info.mode;
   return typeof a === "string" ? a.trim() : "";
+}
+
+// The agent badge in a message head. When the project declared a display
+// treatment for this agent (agentStyles in .vh-solara/project.jsonc), it renders
+// as a colored chip — using the agent's terse label if one was given, else the
+// usual @name. Otherwise it's the plain @name as before. Reactive in the project
+// config, so switching projects re-resolves it.
+function MsgAgent(props: { info: any }) {
+  const name = () => agentLabel(props.info);
+  const d = () => agentDisplay(name());
+  return (
+    <Show when={name()}>
+      <span
+        class="msg-agent"
+        classList={{ styled: !!d() }}
+        data-chip={d()?.style}
+        style={d()?.color ? { "--agent-color": d()!.color! } : undefined}
+        data-tip={`Agent: ${name()}`}
+      >
+        {d()?.label || `@${name()}`}
+      </span>
+    </Show>
+  );
 }
 
 function messageError(info: any): string | null {
@@ -1016,9 +1040,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
               <div class="msg" data-mid={m.id} classList={{ user: m.info.role === "user", assistant: m.info.role === "assistant" }}>
                 <div class="msg-head">
                   <span class="msg-role">{roleLabel(m.info.role)}</span>
-                  <Show when={agentLabel(m.info)}>
-                    <span class="msg-agent" data-tip={`Agent: ${agentLabel(m.info)}`}>@{agentLabel(m.info)}</span>
-                  </Show>
+                  <MsgAgent info={m.info} />
                   <Show when={modelLabel(m.info)}>
                     <span class="msg-model" data-tip={modelLabel(m.info)}>{modelLabel(m.info)}</span>
                   </Show>
@@ -1345,7 +1367,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
                 class="bar-select agent-select"
                 ariaLabel="Agent"
                 value={agentForSession(props.sessionId)}
-                options={agents().map((a) => ({ value: a.name, label: `@${a.name}` }))}
+                options={agents().map((a) => ({ value: a.name, label: `@${a.name}`, swatch: agentDisplay(a.name)?.color, sub: a.description }))}
                 onChange={(v) => selectAgentForSession(props.sessionId, v)}
               />
             </Show>

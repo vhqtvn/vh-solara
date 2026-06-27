@@ -45,6 +45,21 @@ type Config struct {
 	// hash (see canonical) — it executes nothing, so toggling it must never
 	// re-gate the project's processes.
 	Notes *bool `json:"notes,omitempty"`
+	// AgentStyles maps an agent name to a display treatment (a terse label, a
+	// theme color, a chip style) so the UI can set, say, a supervisor apart from
+	// build/coordination. Pure display data — the client sanitizes color/style
+	// against fixed enums, so it executes nothing and is NOT part of the trust
+	// hash.
+	AgentStyles map[string]AgentStyle `json:"agentStyles,omitempty"`
+}
+
+// AgentStyle is the per-agent display treatment declared by a project. All
+// fields are advisory: the client maps Color to a theme token (rejecting any
+// value outside its enum — never a raw color) and Style to a fixed chip variant.
+type AgentStyle struct {
+	Label string `json:"label,omitempty"` // short chip text (e.g. "SUP"); absent → no per-message chip
+	Color string `json:"color,omitempty"` // theme-token name: accent|accent2|ok|warn|danger|muted
+	Style string `json:"style,omitempty"` // chip variant: soft|outline|solid
 }
 
 // Process is one declared companion process. Serialized fields mirror the

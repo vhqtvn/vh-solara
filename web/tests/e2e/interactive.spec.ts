@@ -149,11 +149,12 @@ test("sidebar search filters sessions and pinning floats one to the top", async 
   await page.locator(".session-search-clear").click();
   await expect(search).toHaveValue("");
 
-  // Pin via the context menu → a pin dot appears.
+  // Pin via the context menu → the session moves into the tinted pinned group
+  // at the top (no per-row pin icon; position is the signal).
   await page.locator(".tree-node", { hasText: "Demo session" }).first().click({ button: "right" });
   const menu = page.locator(".ctxm-menu");
   await menu.getByText(/Pin to top/).click();
-  await expect(page.locator(".tree-node .dot.pin").first()).toBeVisible();
+  await expect(page.locator(".tree-pinned .tree-node", { hasText: "Demo session" })).toBeVisible();
 });
 
 test("session search collapses by default and toggles from the header", async ({ page }) => {

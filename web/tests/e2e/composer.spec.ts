@@ -45,7 +45,8 @@ test("agent picker excludes subagents and hidden agents", async ({ page }) => {
   await page.locator(".agent-select .vh-select-btn").click();
   const opts = page.locator(".vh-select-pop .vh-select-opt"); // popup is portaled to <body>
   await expect(opts).toHaveCount(2); // build + plan only
-  await expect(opts).toHaveText(["@build", "@plan"]);
+  // Options now carry a color swatch + description sub-line, so match the label.
+  await expect(page.locator(".vh-select-pop .vh-select-opt-label")).toHaveText(["@build", "@plan"]);
   // "general" is a subagent and "summarize" is hidden — neither should appear.
   await expect(page.locator(".vh-select-pop")).not.toContainText("general");
   await expect(page.locator(".vh-select-pop")).not.toContainText("summarize");

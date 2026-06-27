@@ -552,7 +552,21 @@ body {
   animation: pulse 1.1s ease-in-out infinite;
 }
 .dot.retry { background: var(--warn); }
-.dot.pin { background: var(--accent-2, #b39dff); }
+
+/* Pinned sessions: a tinted band with a left accent rail at the top of the list,
+   set off from the rest by a hairline. No per-row pin icon — the group IS the
+   signal (pin/unpin still lives in the row's context menu). */
+.tree-pinned {
+  border-left: 2px solid color-mix(in srgb, var(--accent) 70%, transparent);
+  border-radius: 0 8px 8px 0;
+  background: color-mix(in srgb, var(--accent) 9%, transparent);
+  padding: 3px 0 4px 3px;
+}
+.tree-pin-sep {
+  height: 0;
+  border-top: 1px solid color-mix(in srgb, var(--fg) 16%, transparent);
+  margin: 9px 10px 10px;
+}
 
 /* Session search box (sidebar). */
 .session-search {
@@ -710,6 +724,10 @@ body {
 .vh-select-opt.sel { color: var(--accent); }
 .vh-select-opt.disabled { opacity: 0.5; cursor: default; }
 .vh-select-opt-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Optional per-agent color dot + a description sub-line in the picker. */
+.vh-select-swatch { width: 9px; height: 9px; border-radius: 50%; flex: 0 0 auto; }
+.vh-select-opt-text { display: flex; flex-direction: column; gap: 1px; min-width: 0; flex: 1; }
+.vh-select-opt-sub { font-size: 11px; color: var(--fg-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* Text-prompt dialog input. */
 .vh-prompt-label { display: block; font-size: var(--text-sm); color: var(--fg-dim); margin-bottom: 6px; }
@@ -1066,6 +1084,22 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+/* Project-styled agent badge: a colored chip in one of three variants. Color is
+   a sanitized theme token (var(--agent-color), set inline); never a raw value. */
+.msg-agent.styled {
+  color: var(--agent-color, var(--accent));
+  background: color-mix(in srgb, var(--agent-color, var(--accent)) 16%, transparent);
+  border: 1px solid transparent;
+  font-weight: 600;
+}
+.msg-agent.styled[data-chip="outline"] {
+  background: transparent;
+  border-color: color-mix(in srgb, var(--agent-color, var(--accent)) 60%, transparent);
+}
+.msg-agent.styled[data-chip="solid"] {
+  background: var(--agent-color, var(--accent));
+  color: var(--bg);
 }
 .msg-model {
   font-size: 11px;
@@ -3762,3 +3796,48 @@ div.katex-math { display: block; overflow-x: auto; margin: 0.7em 0; text-align: 
 }
 .code-tab-close:hover { opacity: 1; background: var(--bg-3, var(--border)); }
 .code-tab.active .code-tab-close { opacity: 0.8; }
+
+/* Per-project agent-styles editor (Agents tab). */
+.agents-editor { height: 100%; overflow: auto; padding: 16px 18px 28px; }
+.agents-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+.agents-title { font-size: var(--text-lg, 16px); font-weight: 700; margin: 0 0 4px; }
+.agents-sub { font-size: var(--text-sm); color: var(--fg-dim); margin: 0; max-width: 60ch; }
+.agents-sub code { font-family: var(--font-mono); font-size: 11px; background: var(--bg-2); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; }
+.agents-actions { display: flex; gap: 8px; flex: 0 0 auto; }
+.agents-msg { margin: 12px 0 0; font-size: var(--text-sm); color: var(--fg-dim); }
+.agents-rows { margin-top: 16px; display: flex; flex-direction: column; gap: 2px; }
+.agents-row {
+  display: grid;
+  grid-template-columns: minmax(90px, 1.2fr) 76px 132px 110px minmax(80px, 1fr);
+  gap: 10px; align-items: center;
+  padding: 6px 8px; border-radius: 8px;
+}
+.agents-row:not(.agents-row-head):hover { background: color-mix(in srgb, var(--fg) 4%, transparent); }
+.agents-row-head { font-size: 11px; color: var(--fg-dim); text-transform: uppercase; letter-spacing: 0.04em; padding-bottom: 2px; }
+.agents-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.agents-label {
+  background: var(--bg-2); color: var(--fg); border: 1px solid var(--border);
+  border-radius: 6px; padding: 5px 8px; font: inherit; font-size: 12px; width: 100%;
+}
+.agents-label:focus { outline: none; border-color: var(--accent); }
+.agents-preview { display: flex; min-width: 0; }
+@media (max-width: 720px) {
+  .agents-row { grid-template-columns: 1fr 1fr; grid-auto-rows: min-content; }
+  .agents-row-head { display: none; }
+  .agents-name { grid-column: 1 / -1; }
+}
+
+/* Confirm-diff modal. */
+.agents-modal-scrim {
+  position: fixed; inset: 0; z-index: 60;
+  background: color-mix(in srgb, var(--bg) 60%, transparent);
+  display: grid; place-items: center; padding: 20px;
+}
+.agents-modal {
+  background: var(--bg); border: 1px solid var(--border); border-radius: 12px;
+  width: min(760px, 100%); max-height: 84vh; display: flex; flex-direction: column;
+  padding: 16px 18px; box-shadow: 0 18px 50px rgba(0, 0, 0, 0.45);
+}
+.agents-modal h3 { margin: 0 0 4px; font-size: 15px; }
+.agents-diff { margin: 12px 0; overflow: auto; border: 1px solid var(--border); border-radius: 8px; }
+.agents-modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }

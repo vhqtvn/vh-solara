@@ -18,6 +18,27 @@ test("composer agent reflects the session's last-used agent; new sessions use th
   await expect(agent.locator(".vh-select-label")).toHaveText("@plan");
 });
 
+test("project agentStyles render a colored agent chip and a picker swatch", async ({ page }) => {
+  // The project declares a display treatment for the `build` agent in
+  // .vh-solara/project.jsonc (served via /vh/project-settings). Intercept it so
+  // the test owns the config without touching the repo's real file.
+  await page.route("**/vh/project-settings*", (route) =>
+    route.fulfill({ json: { agentStyles: { build: { label: "BLD", color: "warn", style: "solid" } } } }),
+  );
+  await page.goto("/");
+  await page.getByRole("button", { name: /Demo session/ }).click();
+
+  // The demo's most recent assistant turn ran @build → its message badge becomes
+  // the styled chip: the terse label, the solid variant.
+  const chip = page.locator(".msg-agent.styled").first();
+  await expect(chip).toBeVisible();
+  await expect(chip).toHaveText("BLD");
+  await expect(chip).toHaveAttribute("data-chip", "solid");
+
+  // The composer picker shows a color swatch for the (build) agent it restored.
+  await expect(page.locator(".agent-select .vh-select-swatch")).toBeVisible();
+});
+
 test("header servers popover has Server/MCP/LSP/Plugins tabs", async ({ page }) => {
   await page.goto("/");
   // Opened from a header status button (opencode-web style), not Settings.

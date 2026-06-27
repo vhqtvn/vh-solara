@@ -8,6 +8,7 @@ import TabBar, { type TabItem } from "./components/TabBar";
 import { codeShowing, installCodeFrameHost, openFileAt, pathSelection, postCodeTheme, setPathSelection, toggleCodeDock } from "./code/frame";
 import { anyModalOpen } from "./lib/a11y";
 import NotesView from "./components/NotesView";
+import AgentStylesView from "./components/AgentStylesView";
 import SettingsDialog from "./components/SettingsDialog";
 import PathSelectionAction from "./components/PathSelectionAction";
 import EmptyState from "./components/EmptyState";
@@ -53,6 +54,7 @@ export default function App() {
       { key: "changes", label: "Changes", icon: "fork" },
     ];
     if (notesVisible()) items.push({ key: "notes", label: "Notes", icon: "clipboard" });
+    items.push({ key: "agents", label: "Agents", icon: "edit" });
     for (const v of views()) items.push({ key: VIEW_PREFIX + v.view_id, label: v.title, icon: "layers" });
     return items;
   });
@@ -230,9 +232,11 @@ export default function App() {
                   ? "Changes"
                   : view() === "notes"
                     ? "Notes"
-                    : isEmbeddedView(view())
-                      ? activeEmbedded()?.title || "View"
-                      : selected()?.title || "Select a session"}
+                    : view() === "agents"
+                      ? "Agent styles"
+                      : isEmbeddedView(view())
+                        ? activeEmbedded()?.title || "View"
+                        : selected()?.title || "Select a session"}
               </span>
             }
           >
@@ -335,6 +339,9 @@ export default function App() {
             </Show>
             <Show when={view() === "changes"}>
               <GitView />
+            </Show>
+            <Show when={view() === "agents"}>
+              <AgentStylesView />
             </Show>
             <Show when={view() === "chat"}>
               <Show when={selectedId()} fallback={
