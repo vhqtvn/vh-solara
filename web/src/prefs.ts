@@ -31,11 +31,21 @@ export { uiScale };
 const VIEWPORT_BASE = "width=device-width, viewport-fit=cover, interactive-widget=resizes-content";
 function setViewportScale(scale: number) {
   const meta = document.querySelector('meta[name="viewport"]');
-  // Seed the user's UI-zoom as the baseline, but DON'T lock it — pinch-zoom must
-  // stay available (WCAG 1.4.4). Allow a generous range around the baseline.
-  const min = Math.max(0.25, scale * 0.5).toFixed(2);
-  const max = Math.min(10, scale * 4).toFixed(2);
-  meta?.setAttribute("content", `${VIEWPORT_BASE}, initial-scale=${scale}, minimum-scale=${min}, maximum-scale=${max}`);
+  // Pinch-zoom is DISABLED on purpose. A pinch shrinks visualViewport.height,
+  // which --app-h (see viewport.ts) feeds straight into .app's height
+  // (styles.css: calc(var(--app-h) / var(--ui-zoom))) — so a pinch pushes the
+  // composer up off the bottom and leaves dead space below .app. Locking
+  // minimum-scale = maximum-scale = the UI-zoom baseline (plus user-scalable=no)
+  // keeps visualViewport.height stable; it then only changes for the keyboard /
+  // orientation, which is exactly the case --app-h was built to track. The UI-zoom
+  // slider (Settings) remains the single, deliberate zoom control, so WCAG 1.4.4
+  // (resize text/zoom) is still satisfied — just not via a gesture that breaks the
+  // layout model.
+  const s = scale.toFixed(2);
+  meta?.setAttribute(
+    "content",
+    `${VIEWPORT_BASE}, initial-scale=${s}, minimum-scale=${s}, maximum-scale=${s}, user-scalable=no`,
+  );
 }
 
 export function applyScale() {
