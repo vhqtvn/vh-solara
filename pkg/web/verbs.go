@@ -207,7 +207,15 @@ func (h coordHandlers) spawn(w http.ResponseWriter, r *http.Request) {
 				ocBody["model"] = body.Model
 			}
 			if _, err := agg.Client().Prompt(r.Context(), sess.ID, jsonBytes(ocBody)); err != nil {
-				return upstreamStatus(err, false), jsonBytes(map[string]any{"ok": false, "sessionID": sess.ID, "error": "session created but prompt failed: " + err.Error(), "outcome": OutcomeFailed}), OutcomeFailed
+				// A session WAS minted (sess.ID set) even though its first turn failed. By the
+				// accounting rule a minted session is slot-consuming, so outcome MUST be "created"
+				// (not "failed", which is reserved for the no-mint case). ok:false + outcome:"created"
+				// is intentional and correct: outcome is the mint/accounting signal (a session exists
+				// → slot consumed), ok is the operational status (the first turn did not complete).
+				// The classification is also "created" (success-class) so an idempotency replay
+				// rewrites the body outcome to "reused" — the slot was already counted on the first
+				// attempt and must not be double-counted on retry.
+				return upstreamStatus(err, false), jsonBytes(map[string]any{"ok": false, "sessionID": sess.ID, "error": "session created but prompt failed: " + err.Error(), "outcome": OutcomeCreated}), OutcomeCreated
 			}
 		}
 		return http.StatusOK, jsonBytes(map[string]any{"ok": true, "sessionID": sess.ID, "outcome": OutcomeCreated}), OutcomeCreated

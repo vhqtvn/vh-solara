@@ -440,8 +440,10 @@ func TestSendOutcomeFailedReplayStaysFailed(t *testing.T) {
 }
 
 // TestSpawnOutcomeCreateOkPromptFailed verifies the spawn branch where session
-// creation succeeds but the first prompt fails: outcome is "failed", ok is false,
-// AND a sessionID is present (a session WAS minted despite the prompt failure).
+// creation succeeds but the first prompt fails: outcome is "created" (a session
+// WAS minted → slot-consuming), ok is false (the first turn did not complete),
+// AND a sessionID is present. ok:false + outcome:"created" is intentional:
+// outcome is the accounting/mint signal; ok is the operational status.
 func TestSpawnOutcomeCreateOkPromptFailed(t *testing.T) {
 	f := &fakeOC{promptStatus: http.StatusInternalServerError}
 	web, _ := newVerbServer(t, f)
@@ -452,8 +454,8 @@ func TestSpawnOutcomeCreateOkPromptFailed(t *testing.T) {
 	if out["ok"] != false {
 		t.Fatalf("create-ok-prompt-failed want ok=false, got %v", out["ok"])
 	}
-	if out["outcome"] != OutcomeFailed {
-		t.Fatalf("create-ok-prompt-failed outcome want %q, got %v", OutcomeFailed, out["outcome"])
+	if out["outcome"] != OutcomeCreated {
+		t.Fatalf("create-ok-prompt-failed outcome want %q (a session was minted → slot-consuming), got %v", OutcomeCreated, out["outcome"])
 	}
 	if out["sessionID"] != "new_sess" {
 		t.Fatalf("create-ok-prompt-failed should carry the minted sessionID, got %v", out["sessionID"])

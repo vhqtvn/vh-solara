@@ -278,13 +278,18 @@ Result shapes:
 ```
 spawn  created:                  {"ok":true, "sessionID":"...", "outcome":"created"}
 spawn  replay:                   {"ok":true, "sessionID":"...", "outcome":"reused"}
-spawn  create-ok-prompt-failed:  {"ok":false,"sessionID":"...","error":"...","outcome":"failed"}
+spawn  create-ok-prompt-failed:  {"ok":false,"sessionID":"...","error":"...","outcome":"created"}
 spawn  create-failed:            {"ok":false,"error":"...","outcome":"failed"}
 
 send   fresh-delivered:          {"ok":true, "sessionID":"...","response":{...},"outcome":"prompt_retried_to_existing"}
 send   replay:                   {"ok":true, "sessionID":"...","response":{...},"outcome":"reused"}
 send   transport error:          {"ok":false,"error":"...","outcome":"failed"}
 ```
+
+> `ok:false` + `outcome:"created"` = a session was minted but its first turn failed
+> (outcome is the accounting/mint signal; ok is operational status). A minted session
+> is slot-consuming regardless of whether its first turn completed, so this branch is
+> `created`, never `failed` (which is reserved for the no-mint case).
 
 In the MCP surface (V4), the outcome is also lifted into the tool result
 `_meta.outcome` (alongside `epoch`/`seq`) so a structured client reads it without
