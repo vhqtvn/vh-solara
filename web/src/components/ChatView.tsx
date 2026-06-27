@@ -185,6 +185,13 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // initial scroll jump (top → restored/bottom) is never painted — switching
   // sessions reveals the content already in place instead of flashing.
   const [ready, setReady] = createSignal(false);
+  // Loading overlay for the switch → ready window (large sessions): a non-draft
+  // session whose transcript is still being positioned hides `.chat-content`
+  // (opacity:0 until `ready`), so a heavy render leaves a blank area. This shows
+  // a cheap spinner sibling instead. Delayed ~150ms so a near-instant switch
+  // (ready flips within a frame or two) never flashes the indicator; the timer
+  // is cancelled whenever `ready` flips back to true.
+  const [showLoading, setShowLoading] = createSignal(false);
   const [input, setInput] = createSignal("");
   // Per-session in-flight guard (lives in the sync store, not this reused
   // component) so a send that hangs on one session never blocks another.
@@ -481,6 +488,18 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       },
     ),
   );
+  // Drive the switch → ready loading overlay (above). Reads `ready()` + the draft
+  // flag; writes `showLoading`. The write never becomes a dependency (this effect
+  // never reads showLoading), so there's no re-trigger loop.
+  createEffect(() => {
+    const hidden = !props.draft && !ready();
+    if (!hidden) {
+      setShowLoading(false);
+      return;
+    }
+    const t = window.setTimeout(() => setShowLoading(true), 150);
+    onCleanup(() => clearTimeout(t));
+  });
   // Re-pin through every height change (new message, streaming tokens, and the
   // raw→rendered-HTML swap) — but only while following. Restore first if pending.
   onMount(() => {
@@ -1117,6 +1136,19 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
           </Show>
         </div>
       </div>
+        {/*
+          Switch → ready loading overlay (sibling of .chat-scroll inside
+          .chat-main — deliberately NOT inside .chat-content, which is hidden by
+          the `ready` class). Covers the heavy-render window for a large session
+          and hides the instant `ready` flips. See .chat-loading styles for the
+          GPU-cheap rationale (no mask/backdrop-filter/contain/content-visibility).
+        */}
+        <Show when={!props.draft && !ready() && showLoading()}>
+          <div class="chat-loading" role="status" aria-live="polite">
+            <Spinner size={20} />
+            <span class="chat-loading-text">Loading…</span>
+          </div>
+        </Show>
         <Show when={isDesktop() && userTurns().length > 1}>
           <div class="chat-nav" aria-label="Jump to a turn">
             <Show when={navWindow().start > 0}>

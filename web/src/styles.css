@@ -1045,6 +1045,25 @@ body {
    (the real-app heat that a bare test page never reproduced). Not worth a fade. */
 .chat-content { max-width: var(--chat-width, 860px); margin: 0 auto; }
 .chat-empty { padding: 32px 16px; text-align: center; color: var(--fg-dim); font-size: 14px; }
+/* Switch → ready loading overlay (see ChatView's `showLoading`). Absolute over
+   .chat-main (position: relative). Kept GPU-cheap: a static spinner + text on
+   the existing background — NO mask-image, NO backdrop-filter, NO contain, NO
+   per-element content-visibility (each is a WebRender trap on always-present
+   surfaces; see the removed scroll-edge fade note above). pointer-events:none so
+   it never blocks interaction during the brief render window. */
+.chat-loading {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  color: var(--fg-dim);
+  pointer-events: none;
+  z-index: 1;
+}
+.chat-loading-text { font-size: 14px; }
 /* Revealed once positioned (see ChatView ready signal) — the initial scroll
    jump happens while hidden, then a quick fade in. */
 .chat-content { opacity: 0; transition: opacity 0.12s ease; }
