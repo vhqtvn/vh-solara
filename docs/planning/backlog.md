@@ -48,6 +48,9 @@ Older `done` and `cancelled` history lives under [docs/planning/archive/index.md
 | --- | --- | --- | --- | --- | --- | --- |
 | P0-API-001 | todo | API | Tighten CSP `script-src` to `'self'` (drop `unsafe-inline` / `eval`) once stable. |  | From TODO at pkg/web/server.go:601. |  |
 | P0-API-002 | todo | API | Map opencode session alias / share slug into `shapeSessions` once the pinned opencode version exposes it in session JSON. |  | From TODO at pkg/web/sessions.go:283. |  |
+| P1-WEB-001 | todo | WEB | Tighten or fix the dropped session-switch cursor save: a scroll-up→switch inside the 400ms debounce window fully misses (pending flushReadCursor cancelled before writing), so the scrolled-up position is lost entirely on reopen — comment overstates it as a one-idle-period lag. Either correct the comment, or add a synchronous cursor snapshot on switch for a stronger guarantee. |  | D-F1 from commit-review of acdef8e. ChatView.tsx session-switch effect (~:555-577) + scheduleReadCursor debounce (~:467-470). |  |
+| P1-WEB-002 | todo | WEB | Extract isCursorAhead (the monotonic read-cursor invariant) into a pure orderAhead(cand, stored, order) helper in web/src/lib/scroll.ts and add unit-test cases (stored missing → true, cand===stored → false, cand newer, cand older, both absent). Currently a private closure in ChatView.tsx:505-510, untested. |  | D-F2 / A-F2 from commit-review of acdef8e. Model the tests on the existing bottommostRead tests in web/tests/unit/scroll.test.ts. |  |
+| P1-WEB-003 | todo | WEB | Add Playwright e2e covering the browser-smoke gap for the scroll read-position feature: (a) stream into a following viewport, scroll up mid-stream, assert the .jump "↓ Latest" button appears; (b) reload with a stored read anchor and assert the viewport lands on the anchored [data-mid] row. |  | C-F1 / D-F3 from commit-review of acdef8e. Web e2e suite runs via `cd web && npx playwright test`; webServer is scripts/fixture-web.sh. |  |
 
 ## Later
 
