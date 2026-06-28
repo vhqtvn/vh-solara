@@ -522,13 +522,17 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     if (restoredFor === props.sessionId || !scrollEl) return false;
     const anchor = props.draft ? undefined : getReadAnchor(props.sessionId);
     if (anchor) {
-      // Defer until the session's message snapshot has arrived. On a fresh page
-      // reload, the rAF fallback / an early RO can fire before the network
-      // delivers messages — without this guard the anchor row wouldn't exist
-      // yet, we'd fall to the bottom, mark restoredFor, and lose the anchor for
-      // good. Returning false (without setting restoredFor) lets the next RO
-      // (fired when messages land and contentEl grows) retry the restore.
-      if (!sm()) return false;
+      // Defer until the session's message snapshot has arrived (order non-empty).
+      // On a fresh page reload, the rAF fallback / an early RO can fire before
+      // the network delivers messages — without this guard the anchor row
+      // wouldn't exist yet, we'd fall to the bottom, mark restoredFor, and lose
+      // the anchor for good. Returning false (without setting restoredFor) lets
+      // the next RO (fired when messages land and contentEl grows) retry the
+      // restore. NOTE: keyed off order LENGTH, not object truthiness — openSession
+      // (sync/actions.ts) pre-initializes the message slot to a truthy-but-empty
+      // {order:[],byId:{}} the instant a session is selected, so sm() is truthy
+      // BEFORE the real snapshot arrives; an empty order means "not delivered yet".
+      if (!sm()?.order?.length) return false;
       restoredFor = props.sessionId;
       // Position the anchor at the top of the viewport (instant — no smooth
       // flash on restore). The message ROW ([data-mid]) always exists in the
@@ -550,6 +554,14 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       restoredFor = props.sessionId;
       setFollowing(true);
       pin();
+      // Pinned to the bottom on open — no scroll event fires for a programmatic
+      // position, so onScrolled/ackSession never runs (and even a synthetic
+      // scroll from pin() is skipped by the self-pin sentinel in onScrolled).
+      // Ack explicitly so the finished-unread dot clears immediately when a
+      // finished session is opened already at the bottom. The anchor branch
+      // above deliberately does NOT ack — a restored mid-history anchor means
+      // the user had NOT read to the bottom.
+      if (!props.draft) ackSession(props.sessionId);
     }
     setReady(true); // positioned — safe to reveal
     return true;
@@ -604,6 +616,22 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     }
     const t = window.setTimeout(() => setShowLoading(true), 150);
     onCleanup(() => clearTimeout(t));
+  });
+  // Reactive ack: covers "session finished WHILE the user was already glued to
+  // the bottom watching it". The server sends an unread.set event → the dot
+  // appears — but no scroll event fires (the viewport didn't move), so
+  // onScrolled/ackSession never runs and the dot sticks until a manual scroll.
+  // This effect acks when unread is set AND we're following AND at the bottom.
+  // Reactivity keys off unread/following/ready (signals), NOT off nearBottom()
+  // (a live DOM geometry read) — so it re-runs only when those signals change,
+  // never per scroll frame. ackSession early-returns once unread is cleared, and
+  // already honors the attendingNow() presence gate internally, so the
+  // setState/fetch it performs can't loop or over-fire this effect.
+  createEffect(() => {
+    if (props.draft || !ready() || !following()) return;
+    if (!state.unread[props.sessionId]) return;
+    if (!nearBottom()) return;
+    ackSession(props.sessionId);
   });
   // Re-pin through every height change (new message, streaming tokens, and the
   // raw→rendered-HTML swap) — but only while following. Restore first if pending.
