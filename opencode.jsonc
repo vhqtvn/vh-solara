@@ -995,6 +995,7 @@
             "color": "accent",
             "description": "Release agent — analyzes changes since the last tag, decides the semver bump, and creates+pushes the release tag via the sanctioned wrapper.",
             "mode": "subagent",
+            "model": "{file:./.local/config/agent-model/releaser}",
             "permission": {
                 "bash": {
                     "*": "deny",
