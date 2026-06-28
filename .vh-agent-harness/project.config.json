@@ -5,7 +5,7 @@
   "project": {
     "name": "vh-solara",
     "slug": "vh-solara",
-    "coordinator_dir": "vhsolara-coordinator",
+    "coordinator_dir": "coordinator",
     "profile": "minimal",
 
     "//_profile_options": "python-monolith | ts-frontend | ml-repo | infra-only | docs-only | minimal",
