@@ -71,3 +71,61 @@ test("terminal: a session-bound tab can be opened for the selected session", asy
   // The new tab is selected (a session terminal).
   await expect(page.locator(".term-tab.on")).toHaveCount(1);
 });
+
+test("terminal: full-screen TUI (vim) stays live — xterm DECRQM stall regression", async ({ page }) => {
+  // Regression for the xterm.js v6 DECRQM parser stall. vim emits
+  // CSI [?] 12 $ p (DECRQM — "report mode") during startup to probe the
+  // cursor-blink mode. xterm.js v6's built-in DECRQM handler deadlocks its
+  // async write processor, so every term.write() AFTER that sequence queues
+  // but never renders: the screen freezes on vim's first frame while input
+  // still flows to the PTY, so the user types blind with no feedback and can't
+  // even see :q work. The fix registers a no-op CSI handler that swallows
+  // DECRQM before the broken built-in runs.
+  //
+  // This test launches vim, types a marker in insert mode, and asserts the
+  // marker renders on screen — which only happens if the parser did NOT stall.
+  // It then quits vim and types a shell command, proving the terminal stays
+  // fully interactive through a TUI launch → use → exit cycle.
+  await page.goto(`/?dir=${encodeURIComponent(repoRoot)}`);
+  await page.getByRole("button", { name: "Terminal", exact: true }).click();
+  await page.waitForSelector(".term-host");
+  await page.waitForSelector(".term-status.open", { timeout: 10000 });
+  await page.locator(".term-host").click();
+
+  // Unique throwaway path per run + `vim -n` (no swap file) so a vim killed by
+  // a prior/failed run can't leave a .swp that trips E325: ATTENTION on the
+  // next launch. :q! discards the buffer, so no file is written on success.
+  const witness = `tmp/_decrqm_regression_${Date.now()}.txt`;
+  await page.keyboard.type(`vim -n ${witness}`);
+  await page.keyboard.press("Enter");
+  // Wait until vim has drawn its UI — empty-buffer tildes ("~") only appear
+  // once vim has rendered, which is also past the DECRQM probe that triggers
+  // the stall. Polling (vs a fixed sleep) keeps this deterministic across
+  // machines and vim startup speeds.
+  await expect.poll(async () => (await page.locator(".xterm-rows").innerText()).includes("~"), {
+    timeout: 10000,
+  }).toBe(true);
+
+  // Enter insert mode and type a unique marker. With the stall, the screen is
+  // frozen at vim's first frame and this never renders.
+  await page.keyboard.type("i");
+  await page.waitForTimeout(150);
+  const marker = "DECRQM_LIVE_MARKER_42";
+  await page.keyboard.type(marker);
+  await expect.poll(async () => (await page.locator(".xterm-rows").innerText()).includes(marker), {
+    timeout: 8000,
+  }).toBe(true);
+
+  // Quit vim (:q! discards the buffer) and confirm the shell prompt returns by
+  // running an echo whose output must render — proving the terminal is live end
+  // to end, not just the insert echo.
+  await page.keyboard.press("Escape");
+  await page.keyboard.type(":q!");
+  await page.keyboard.press("Enter");
+  await page.waitForTimeout(400); // let the shell reclaim the tty
+  await page.keyboard.type("echo VIM_EXITED_OK");
+  await page.keyboard.press("Enter");
+  await expect.poll(async () => (await page.locator(".xterm-rows").innerText()).includes("VIM_EXITED_OK"), {
+    timeout: 8000,
+  }).toBe(true);
+});

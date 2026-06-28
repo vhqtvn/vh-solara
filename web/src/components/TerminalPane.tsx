@@ -161,6 +161,19 @@ export default function TerminalPane(props: { termId?: string; session?: string;
     }
     try { fit.fit(); } catch { /* host not laid out yet */ }
 
+    // Work around an xterm.js v6 parser stall: its built-in DECRQM handler
+    // (CSI [?] Ps $ p — "report mode", which full-screen TUIs like vim emit
+    // during startup to probe cursor-key/alt-screen/etc. state) deadlocks the
+    // async write processor. Once vim sends it, every later term.write() queues
+    // but never renders — the screen freezes on vim's first frame while input
+    // still flows, so the user types blind with no feedback and can't even see
+    // :q work. Register a no-op handler that swallows DECRQM (both the private
+    // `?` and non-private forms) before the broken built-in runs. Programs fall
+    // back to defaults without the reply, so this is safe; revisit on a xterm
+    // upgrade that fixes the stall.
+    term.parser.registerCsiHandler({ intermediates: "$", final: "p" }, () => true);
+    term.parser.registerCsiHandler({ prefix: "?", intermediates: "$", final: "p" }, () => true);
+
     // onData is IME-safe: composition resolves to final bytes here.
     term.onData((d) => {
       let out = d;
