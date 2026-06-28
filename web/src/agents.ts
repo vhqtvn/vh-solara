@@ -49,9 +49,16 @@ export function agentForSession(sessionID: string): string {
 // Select an agent for a session and, if the agent declares a model, switch the
 // session's model to it (OpenCode ties a model+variant to each agent). Pass ""
 // as sessionID for a draft so the new session inherits the agent's model.
+// ONLY a draft pick (sessionID === "") updates the GLOBAL default that new
+// sessions inherit; a pick for an existing session is per-session only, so it
+// cannot contaminate other sessions whose own resolution is absent.
 export function selectAgentForSession(sessionID: string, name: string) {
   setSessionAgentSel(sessionID, name); // remember the pick for THIS session
-  setSelectedAgent(name); // also the global default (new-session inheritance)
+  // Only a draft pick (sessionID === "") updates the GLOBAL default that new
+  // sessions inherit. A pick for an existing session must NOT mutate the global,
+  // or every other session whose own resolution is absent falls back to it and
+  // silently flips to this session's agent.
+  if (sessionID === "") setSelectedAgent(name);
   const a = agents().find((x) => x.name === name);
   if (a?.model?.providerID && a.model.modelID) {
     applyModel(sessionID, a.model.providerID, a.model.modelID, a.variant);
