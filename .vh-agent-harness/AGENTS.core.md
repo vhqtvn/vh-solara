@@ -41,6 +41,29 @@ something narrower.
 <!-- The line below is filled by the project overlay (AGENTS.mission.md). -->
 <!-- PROJECT: one-line description of what this repository builds. -->
 
+## Extending the harness
+
+The `.opencode/` tree and `opencode.jsonc` are **GENERATED** from
+`.vh-agent-harness/` plus the embedded corpus. Never hand-edit a managed file
+under `.opencode/` — any edit there vanishes on the next
+`vh-agent-harness update`. Make your change under `.vh-agent-harness/` instead.
+
+Do NOT use OpenCode's built-in `customize-opencode` skill to change the harness
+— use an overlay pack. Only invoke `customize-opencode` when you have a specific
+reason unrelated to the generated tree.
+
+Overlays are the extension unit. A pack at
+`.vh-agent-harness/overlays/<pack>/` carries `agents/`, `commands/`, `skills/`
+plus `opencode-append.jsonc` (deep-merged into the rendered `opencode.jsonc`),
+and optionally `permission-pack.jsonc` and `callable-graph-snippet.md`.
+
+Select a pack by listing its name under `overlays:` in
+`.vh-agent-harness/vh-harness-profile.yml`, then run `vh-agent-harness update`
+(preview with `--dry-run` first).
+
+When unsure, run `vh-agent-harness guide` first. Run `/harness` for the full
+add-an-agent / add-command / add-skill recipe and the overlay anatomy.
+
 ## Must read
 
 <!-- CORE: generic harness + coordination docs. -->
@@ -215,7 +238,7 @@ When making changes:
 - For multi-session coordination work, classify the task as `short`, `medium`, or `long` before fanning out. Use `docs/coordination/TASK_MODES.md` and `docs/coordination/RUNTIME_MODEL.md` to decide whether `.opencode/state/` is enough or whether a local runtime layer under `.local/coordinator/` is justified.
 - Use `repo-explorer` as a path finder and call-graph tracer first. Ask for exact full file bodies only through an explicit read command when needed.
 - For read-only shell inspection, prefer narrow commands such as `ls`, `find`, `grep`, `sed -n`, `head`, `tail`, `jq`, and `git grep`. Avoid `cat` dumps for exploration.
-- Prefer the standard command templates under `.opencode/commands/` when they fit the task: `coordination`, `write-task`, `research`, `solution-brief`, `task-ready`, `task-update`, `task-repair`, `task-list`, `task-open`, `resume-task`, `task-closeout`, `task-review`, `repo-map`, `read-files`, `draft-plan`, `approve-plan`, `plan-save`, `plans`, `adopt-plan`, `implement`, `implement-goal`, `workstream-start`, `workstream-open`, `workstream-update`, `workstream-clear`, `runtime-audit`, `backlog-cleanup`, `docs-sync`, `ship-review`, and `commit-review`.
+- Prefer the standard command templates under `.opencode/commands/` when they fit the task: `coordination`, `harness`, `write-task`, `research`, `solution-brief`, `task-ready`, `task-update`, `task-repair`, `task-list`, `task-open`, `resume-task`, `task-closeout`, `task-review`, `repo-map`, `read-files`, `draft-plan`, `approve-plan`, `plan-save`, `plans`, `adopt-plan`, `implement`, `implement-goal`, `workstream-start`, `workstream-open`, `workstream-update`, `workstream-clear`, `runtime-audit`, `backlog-cleanup`, `docs-sync`, `ship-review`, and `commit-review`.
 - Commit gate rule for every agent/session: before any `git commit` attempt, run `commit-reviewer` (typically via `/commit-review`) on the exact slice, read the reviewer response, and stop when it returns blocked/split guidance.
 - **Escape hatch:** If the gated-commit mechanism locks up, the operator can bypass it: `rm -rf .git/commit-gate.lock/ && git reset --mixed` clears the lock and index, then `SKIP_COMMIT_GATE=1 git commit ...` commits directly. This is operator-only — agents must never use this path.
 - When using `/commit-review`, always provide a `Feature summary` and `Exact file list`. Prefer naming the `Primary lane` and any relevant repo rules/docs up front. If the review intentionally spans more than 8 files, include `File-cap override` with a short reason. Use `docs/coordination/PROMPT_TEMPLATE.md` or `.github/prompts/commit-review.prompt.md` for the repo-standard request shape.

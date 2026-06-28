@@ -10,10 +10,30 @@ Use this skill to create or update repo-local OpenCode skills for this repositor
 
 The target environment is a coding repo, not the ChatGPT skill marketplace. Optimize for:
 
-- repo-local skills under `.opencode/skills/<name>/SKILL.md`
+- repo-local skills under an overlay pack (see "Where skills live" below)
 - archived-session mining when repeated workflows already exist
 - concise, triggerable descriptions that OpenCode can select correctly
 - repo-safe validation and iteration, not ZIP packaging or UI metadata
+
+## Where skills live
+
+**In a repo managed by `vh-agent-harness`, the `.opencode/skills/` tree is
+GENERATED** — the harness renders it from `.vh-agent-harness/` plus the embedded
+corpus on every `vh-agent-harness update`, so any skill you drop at
+`.opencode/skills/<name>/` is overwritten and lost.
+
+- **New skills go in an overlay pack:**
+  `.vh-agent-harness/overlays/<pack>/skills/<name>/`. List the pack under
+  `overlays:` in `vh-harness-profile.yml` and run `vh-agent-harness update`.
+- **The `.opencode/skills/` path is ONLY correct when you are editing
+  `templates/core/`** — i.e. developing the harness itself. A consumer repo must
+  not hand-edit that generated tree.
+- Do NOT use OpenCode's built-in `customize-opencode` skill to add a skill — use
+  an overlay pack. Only invoke `customize-opencode` for a reason unrelated to the
+  generated tree.
+- When unsure, run `vh-agent-harness guide`; run `/harness` for the full
+  add-a-skill recipe and overlay anatomy. Use `init_skill.py` with an overlay
+  target path (see "Validation").
 
 ## What a good repo skill does
 
@@ -24,15 +44,20 @@ The target environment is a coding repo, not the ChatGPT skill marketplace. Opti
 
 ## Repo-specific layout
 
-Use this structure by default:
+In a harness-managed repo, create the skill inside an overlay pack; the path
+shown below is relative to the pack root
+(`.vh-agent-harness/overlays/<pack>/`). Use this structure by default:
 
 ```text
-.opencode/skills/<skill-name>/
+<pack>/skills/<skill-name>/
   SKILL.md
   references/   # optional
   scripts/      # optional
   assets/       # optional
 ```
+
+(The `.opencode/skills/<name>/` path is generated — see "Where skills live". Use
+it only when editing `templates/core/` to develop the harness itself.)
 
 ## When to ask questions
 
@@ -57,7 +82,10 @@ Skip extra questioning when the repo already provides enough evidence:
    - `SKILL.md` only for lightweight guidance
    - `references/` for durable detail that would bloat `SKILL.md`
    - `scripts/` only for deterministic, repeatedly reused operations
-4. Initialize or update the skill under `.opencode/skills/`.
+4. Initialize or update the skill inside its overlay pack
+   (`.vh-agent-harness/overlays/<pack>/skills/<name>/`); use `init_skill.py
+   --path` with the overlay target. Only edit under `.opencode/skills/` when you
+   are developing the harness itself (`templates/core/`).
 5. Validate the frontmatter and structure.
 6. Iterate after reviewing how well the skill would trigger.
 
@@ -91,10 +119,13 @@ Use the bundled validator for quick checks:
 vh-agent-harness exec python .opencode/skills/skill-creator/scripts/quick_validate.py .opencode/skills/<skill-name>
 ```
 
-When creating a new skill scaffold, use:
+When creating a new skill scaffold, use the overlay target path in a
+harness-managed repo (the `.opencode/skills/` default is generated and will be
+overwritten — `init_skill.py` warns when you point it there):
 
 ```bash
-vh-agent-harness exec python .opencode/skills/skill-creator/scripts/init_skill.py <skill-name>
+vh-agent-harness exec python .opencode/skills/skill-creator/scripts/init_skill.py <skill-name> \
+  --path .vh-agent-harness/overlays/<pack>/skills
 ```
 
 ## Output expectations
