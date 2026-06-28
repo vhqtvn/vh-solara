@@ -196,6 +196,16 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // Per-session in-flight guard (lives in the sync store, not this reused
   // component) so a send that hangs on one session never blocks another.
   const sending = createMemo(() => isSending(props.sessionId || "draft"));
+  // Whether send() can resolve an agent + model right now — the single hinge for
+  // the disabled Send button AND the send() guard. agents() must be loaded
+  // (activeAgent falls back to a leak-prone chain when empty), and a model must
+  // be resolvable for this session — mirroring sendText's own check
+  // (selectionFor(id) present, else the catalog must be loaded so models()[0]
+  // exists). Once agents/models load this clears automatically: the grayed-out
+  // Send re-enables with no extra wiring.
+  const readyToSend = createMemo(() =>
+    agents().length > 0 && (models().length > 0 || !!selectionFor(props.sessionId)),
+  );
   // Pending attachments (file parts) to send with the next message.
   interface Attachment { url: string; filename: string; mime: string }
   const [attachments, setAttachments] = createSignal<Attachment[]>([]);
@@ -1054,6 +1064,14 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   async function send() {
     const text = input().trim();
     if (!text && attachments().length === 0) return;
+    // Gate before any state change: if agents/models aren't loaded yet, a send
+    // would route through the leak-prone fallback chain (empty agent list) and
+    // likely fail. Surface it and preserve the typed text (do NOT clear input).
+    // Covers both the Enter-key path and the button click.
+    if (!readyToSend()) {
+      pushNotification({ kind: "info", sessionID: props.sessionId, title: "Still loading…" });
+      return;
+    }
     if (text) pushHistory(text); // recall with Up/Down later
     histIdx = -1;
     // Queue instead of sending while the session is busy — OpenCode rejects a
@@ -1573,7 +1591,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
             />
           </div>
           <div class="composer-bar">
-            <Show when={agents().length > 0}>
+            <Show when={agents().length > 0} fallback={<span class="bar-loading">Loading agents…</span>}>
               <Select
                 class="bar-select agent-select"
                 ariaLabel="Agent"
@@ -1636,7 +1654,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
             <Show
               when={working()}
               fallback={
-                <button type="button" class="send-btn" aria-label="Send" onClick={send} disabled={sending()}>
+                <button type="button" class="send-btn" aria-label="Send" onClick={send} disabled={sending() || !readyToSend()}>
                   <Icon name="send" />
                 </button>
               }
@@ -1644,7 +1662,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
               {/* Busy: Stop aborts the running turn; a Queue button appears once
                   you've typed something (Enter queues too). */}
               <Show when={queueMode() && input().trim().length > 0}>
-                <button type="button" class="send-btn queue" aria-label="Queue" data-tip="Queue — sends when the current turn finishes" onClick={send}>
+                <button type="button" class="send-btn queue" aria-label="Queue" data-tip="Queue — sends when the current turn finishes" disabled={!readyToSend()} onClick={send}>
                   <Icon name="plus" />
                 </button>
               </Show>
