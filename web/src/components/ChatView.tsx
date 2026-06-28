@@ -1338,14 +1338,14 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
         with a slow opacity/scale pulse on a 7px dot only (no backdrop-filter,
         mask-image, or per-element contain/content-visibility — see AGENTS.md).
       */}
-      <Show when={following() && !props.draft}>
+      <Show when={following() && !props.draft && !focusMode()}>
         <div class="chat-live" role="status" aria-label="Following latest">
           <span class="chat-live-dot" aria-hidden="true" />
           <span class="chat-live-text">Live</span>
         </div>
       </Show>
 
-      <Show when={!following()}>
+      <Show when={!following() && !focusMode()}>
         <button type="button" class="jump" onClick={jumpToLatest}>
           <Icon name="arrowDown" size={14} /> Latest
         </button>

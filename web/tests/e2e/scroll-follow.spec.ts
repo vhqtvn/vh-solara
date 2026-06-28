@@ -75,6 +75,19 @@ async function setScrollTop(page: import("@playwright/test").Page, value: number
   }, value);
 }
 
+// Toggle the composer Focus-mode button. In focus mode the expanded composer
+// (`.composer.focus`, inset:0) covers the toggle, so Playwright's normal click
+// fails its pointer-actionability check — and force:true still dispatches at the
+// button's coordinates, landing on the overlapping textarea. A native el.click()
+// fires a real bubbling click event that SolidJS's delegated onClick catches
+// regardless of what is painted on top, so it reliably flips the focusMode
+// signal in both directions.
+async function toggleFocus(page: import("@playwright/test").Page) {
+  await page
+    .locator('button[aria-label="Focus mode"]')
+    .evaluate((el: HTMLElement) => el.click());
+}
+
 // (1) Tail state: glued to the live tail → Live pill shows, Latest button absent.
 test("at the tail: Live pill visible, Latest button absent", async ({ page }) => {
   await openDemo(page);
@@ -127,4 +140,66 @@ test("mid-stream scroll up still surfaces the Latest button", async ({ page }) =
   await expect(page.locator("button.jump")).toBeVisible({ timeout: 3000 });
   // And it must not be occluded by the composer while the turn is live.
   expect(await topmostAtCenter(page, "button.jump")).toBe(true);
+});
+
+// (5) Focus mode hides both Live pill and Latest button.
+//
+// Why: in focus mode the composer fills the whole `.chat` card
+// (`.composer.focus` is position:absolute; inset:0; z-index:30), but
+// `.chat-live` and `.jump` are anchored at bottom:76px inside `.chat` — that
+// anchor was calibrated for the normal (short) composer height. Left ungated,
+// the pill/button float over and paint onto the full-card textarea. The `<Show>`
+// gates now also check `!focusMode()`, suppressing both cues while the expanded
+// composer is up (semantically correct: they're tail/scroll cues that are
+// meaningless over a full-card input). This test guards both gates — each one
+// establishes the relevant `following` state and verifies the cue renders
+// BEFORE entering focus mode (so the in-focus count:0 is unambiguous). Both
+// gates and both reactivity checks run from one page load: the Live-pill section
+// at the tail (following=true), then a normal-mode scroll-up switches to
+// following=false for the Latest-button section. Toggling focus does not touch
+// the following signal, so each section's following state is preserved across
+// its on/off toggle pair.
+//
+// NOTE: this test intentionally does NOT use openDemo(). openDemo's click-based
+// re-glue (clicking button.jump when the load lands away from the tail) is the
+// documented flaky spot in this suite: the ResizeObserver re-pin guard can flip
+// `following` back to true mid-click, detaching button.jump and hanging the
+// 30s test budget. It hits whichever scroll-follow test runs LAST hardest,
+// because earlier tests mutate the shared demo session (test 4 streams a turn
+// that grows the transcript). That makes openDemo unreliable for this test
+// specifically. We instead glue to the tail deterministically by scrolling to
+// the bottom — the app's onScrolled sets following=true when near the bottom,
+// mounting .chat-live — same end state as openDemo, no detach-prone click.
+test("focus mode hides both Live pill and Latest button", async ({ page }) => {
+  await page.setViewportSize(VP);
+  await page.goto("/?session=demo");
+  await expect(page.locator(".msg").first()).toBeVisible({ timeout: 10000 });
+  // Glue to the tail deterministically (see NOTE above).
+  await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
+    el.scrollTop = el.scrollHeight;
+  });
+  // following=true now → Live pill is up. PROVES the tail state going in, so
+  // the count:0 below can only be explained by the focusMode gate.
+  await expect(page.locator(".chat-live")).toBeVisible({ timeout: 5000 });
+
+  // --- Live pill gate + reactivity (following=true) ---
+  await toggleFocus(page); // focus mode on
+  await expect(page.locator(".chat-live")).toHaveCount(0);
+  await toggleFocus(page); // focus mode off — following is unchanged (no scroll)
+  // Reactivity: the Live pill reappears, proving the gate is driven by
+  // focusMode() and is not a permanent hide.
+  await expect(page.locator(".chat-live")).toBeVisible({ timeout: 3000 });
+
+  // --- Switch to following=false in NORMAL mode (reliable; see tests 2–4) ---
+  await setScrollTop(page, 0);
+  // PROVES following=false going in, so the count:0 below is unambiguous
+  // (without this, count:0 would pass whether following were true OR false).
+  await expect(page.locator("button.jump")).toBeVisible({ timeout: 3000 });
+
+  // --- Latest button gate + reactivity (following=false) ---
+  await toggleFocus(page); // focus mode on — button suppressed (would float
+  await expect(page.locator("button.jump")).toHaveCount(0); //   over the textarea)
+  await toggleFocus(page); // focus mode off — following still false (no scroll)
+  // Reactivity: the Latest button reappears.
+  await expect(page.locator("button.jump")).toBeVisible({ timeout: 3000 });
 });
