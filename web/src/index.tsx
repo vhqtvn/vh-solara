@@ -24,16 +24,22 @@ import "./styles.css";
 // `ensuring` guard keeps concurrent triggers single-flight. Stops as soon as
 // agents() populates. This is what un-sticks the "new-session draft shows no
 // agent" screen: the boot load bailed silently (agents() left []), and since
-// projectDir doesn't change afterward nothing re-triggered it.
+// projectDir doesn't change afterward nothing re-triggered it. A rejecting
+// fetch is caught and retried the same way — it never mutates agents(), so the
+// empty state stays intact and the budget keeps counting down.
 let ensuring = false;
 async function ensureAgentsLoaded() {
   if (ensuring) return;
   ensuring = true;
   try {
     for (let attempt = 0; attempt < 6 && agents().length === 0; attempt++) {
-      await loadAgents();
+      try {
+        await loadAgents();
+      } catch {
+        // reject = treat as still empty; continue retry budget
+      }
       if (agents().length > 0) break;
-      await new Promise((r) => setTimeout(r, Math.min(500 * 2 ** attempt, 8000)));
+      if (attempt < 5) await new Promise((r) => setTimeout(r, Math.min(500 * 2 ** attempt, 8000)));
     }
     // Models are best-effort here: sendText fetches them on demand too, but a
     // reload on stream-ready lets the model button appear alongside the agent
