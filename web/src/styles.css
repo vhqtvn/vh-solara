@@ -1385,7 +1385,11 @@ body {
   bottom: 76px;
   left: 50%;
   transform: translateX(-50%);
-  z-index: 30; /* above the composer so the whole pill stays clickable */
+  /* Above .composer-wrap (z-index: 40): the composer (textarea + button bar)
+     is tall enough to overlap this bottom:76px anchor, so a lower z-index lets
+     it paint over and occlude the button — the "↓ Latest" pill vanished behind
+     the composer. 45 clears the composer yet stays under dialogs/modals (60+). */
+  z-index: 45;
   background: var(--accent);
   color: var(--accent-fg);
   border: 0;
@@ -1413,7 +1417,7 @@ body {
   bottom: 76px;
   left: 50%;
   transform: translateX(-50%);
-  z-index: 30;
+  z-index: 45; /* same anchor spot as .jump — must also clear .composer-wrap (40) */
   display: inline-flex;
   align-items: center;
   gap: 5px;
