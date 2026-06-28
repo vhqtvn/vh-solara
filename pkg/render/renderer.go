@@ -145,6 +145,12 @@ func (c *codeHighlighter) renderFencedCodeBlock(w util.BufWriter, source []byte,
 	// only chroma.Text tokens, so the formatter wraps each line in
 	// <span class="line"> but emits no token classes (no coloring) — exactly
 	// the wanted structural envelope for non-code pastes.
+	// NOTE: the info string is used as a language name only. Stock
+	// goldmark-highlighting/v2 fence attributes (hl_lines, linenos,
+	// linenostart, nohl, hl_style) are intentionally not parsed — this
+	// compact renderer replaced the stock extension (28d32c68) for spacing
+	// parity. Re-add attribute parsing + tests if these ever become
+	// user-facing.
 	lexer := lexers.Get(string(n.Language(source)))
 	if lexer == nil {
 		lexer = lexers.Get("text")
