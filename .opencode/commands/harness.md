@@ -22,7 +22,16 @@ when asked to add an agent, command, or skill.
 3. Add `agents/<name>.md` — YAML frontmatter with `description` and
    `mode: subagent`, then a prompt body. The identity tokens — `PROJECT_NAME`,
    `PROJECT_SLUG`, `COORDINATOR_DIR` — resolve at render time (in the source
-   corpus they are written as double-brace sentinels).
+   corpus they are written as double-brace sentinels). **Case rule for
+   `vh-solara`:** the renderer is case-aware — when the sentinel is
+   immediately followed by `_` (a SCREAMING_SNAKE identifier context, e.g.
+   `VH-SOLARA_JWT_SECRET` → `MYPROJ_JWT_SECRET`) it substitutes the
+   UPPER-CASED slug; otherwise (paths, container names, image prefixes — e.g.
+   `vh-solara-dev-1`) it substitutes the lower-case slug. So env-var /
+   secret names that must be UPPER should be written `VH-SOLARA_…`, and
+   paths/services that must be lower should be written `vh-solara-…` (or
+   any non-`_` separator). Source of truth:
+   `internal/substrate/renderer.go` (`substituteProjectSlugSentinel`).
 4. Add `opencode-append.jsonc` at the pack root with:
    - the new agent block (`description`, `mode: subagent`, `prompt:
      "{file:.opencode/agents/<name>.md}"`, and its `permission` map), and
