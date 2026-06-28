@@ -1,0 +1,69 @@
+{
+  "//": "vh-agent-harness :: project.config.json — the project config the seam reads at render time.",
+  "//_purpose": "Save this to .vh-agent-harness/project.config.json and fill it in BEFORE `install` (or before an `update` that re-seeds). install/update resolve {{MISSION_SUMMARY}}, {{ARCHITECTURE_SUMMARY}}, {{DB_USER}}, {{DB_NAME}} from project.* into the seeded CLAUDE.md/Makefile. Get this template with: vh-agent-harness example .vh-agent-harness/project.config.json",
+
+  "project": {
+    "name": "vh-solara",
+    "slug": "vh-solara",
+    "coordinator_dir": "vhsolara-coordinator",
+    "profile": "minimal",
+
+    "//_profile_options": "python-monolith | ts-frontend | ml-repo | infra-only | docs-only | minimal",
+
+    "lanes": [
+      {"id": "coordination", "purpose": "cross-boundary routing"},
+      {"id": "docs", "purpose": "durable repo guidance"},
+      {"id": "research", "purpose": "read-only source gathering"},
+      {"id": "go", "purpose": "Go binary, controller/worker, embed"},
+      {"id": "web", "purpose": "SolidJS SPA frontend"}
+    ],
+
+    "roles": [
+      "project-coordinator",
+      "build",
+      "researcher",
+      "repo-explorer",
+      "docs-steward",
+      "commit-reviewer",
+      "committer",
+      "ship-review"
+    ],
+
+    "//_roles_note": "Core coordination roles ship with the harness. PROJECT-only specialists (e.g. a release role, an infra role) are added by the project in its own config; do not assume any here.",
+
+    "forbidden_patterns": [
+      "//_project_specific_deny_rules_appended_to_forbidden-patterns.core.js",
+      "// vh-solara: no project-specific deny rules beyond core (host-run Go binary + embedded SPA; no datasets, no demo API)."
+    ],
+
+    "demo_vps_fingerprint": "none",
+
+    "instruction_docs": [],
+
+    "product_prefixes": ["pkg/", "cmd/", "web/"],
+
+    "//_product_prefixes_note": "Directories that count as product code for coordination hints. Default for monorepos. coordination-hints-lib.js keeps this default in Phase 1; a future read from this field is documented as a TODO there.",
+
+    "ml_training_provider": "none",
+
+    "//_ml_training_provider_options": "none | <provider>. The harness core ships no ML-training provider integration. A project that needs one (GPU compose, a training-job skill, provider-specific custom verbs/hooks) adds it from its own overlay; the starter carries none.",
+
+    "mission_summary": "vh-solara is a single Go binary that runs next to OpenCode on each machine: it aggregates OpenCode's state into a resumable, real-time view and serves a custom, mobile-first web UI (a SolidJS SPA, installable as a PWA) embedded via `//go:embed`. Each instance connects to a central controller through a persistent multiplexed WebSocket tunnel (yamux), so an operator can reach and drive any machine's OpenCode sessions from one URL with no inbound network access to the worker.",
+
+    "architecture_summary": [
+      "Single Go binary (module `github.com/vhqtvn/vh-solara`, Go 1.25) that embeds the web UI via `//go:embed` and serves it from `pkg/web/dist/`.",
+      "Web UI is a mobile-first SolidJS SPA built with Vite + TypeScript (installable as a PWA), source in `web/`; `pkg/web/dist/` holds a committed placeholder `index.html` so the Go build compiles without a frontend build.",
+      "Controller<->worker topology: each worker opens an outbound, persistent multiplexed WebSocket tunnel (yamux) to a central controller, so workers expose no inbound ports; an operator reaches and drives any worker's OpenCode from one controller URL.",
+      "Aggregates OpenCode session/subsession state into a resumable, real-time tree view (streaming chat, diffs, terminal, git actions), drivable from phone or desktop.",
+      "Per-project managed processes and embedded views are declared via a repo-resident `.vh-solara/project.jsonc`.",
+      "Tag-driven releases: pushing a `v*` tag triggers a GitHub Actions workflow that builds the SPA and stamps `cmd.Version` via ldflags."
+    ],
+
+    "db_user": "",
+    "db_name": "",
+
+    "compose_services": [],
+
+    "//_compose_services_note": "The project's actual service topology (app services, datastores, caches, object stores). The core ships NEUTRAL placeholders only; a Python monolith might list api/queue-consumer/web + a SQL store + a queue + an object store, a TS frontend might list web only. Fill these per project — the harness assumes none."
+  }
+}
