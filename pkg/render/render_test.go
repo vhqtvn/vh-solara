@@ -27,6 +27,45 @@ func TestCodeHighlightingSurvivesSanitization(t *testing.T) {
 	}
 }
 
+func TestCodeBlockChromaEnvelopeForBareAndUnknown(t *testing.T) {
+	r := New()
+
+	// A bare fence (no info-string) must now route through chroma's structural
+	// envelope: <pre class="chroma"><code><span class="line">…</span></code></pre>.
+	// Previously it fell through to plain <pre><code> with no per-line spans,
+	// so bare code blocks (plain-text pastes) rendered with looser spacing than
+	// language-fenced blocks.
+	bare := r.Markdown("```\nplain line one\nplain line two\n```")
+	if !strings.Contains(bare, `class="chroma"`) {
+		t.Fatalf("bare fence missing chroma envelope: %s", bare)
+	}
+	if !strings.Contains(bare, `<span class="line">`) {
+		t.Fatalf("bare fence missing per-line spans: %s", bare)
+	}
+
+	// An unrecognized language fence must get the same structural envelope.
+	unknown := r.Markdown("```totallymadelang\nsome text\n```")
+	if !strings.Contains(unknown, `class="chroma"`) {
+		t.Fatalf("unknown-language fence missing chroma envelope: %s", unknown)
+	}
+	if !strings.Contains(unknown, `<span class="line">`) {
+		t.Fatalf("unknown-language fence missing per-line spans: %s", unknown)
+	}
+
+	// A recognized language must still carry its token classes (e.g. go's "kd"
+	// keyword), i.e. the envelope change must not regress real highlighting.
+	goOut := r.Markdown("```go\nfunc main() {}\n```")
+	if !strings.Contains(goOut, `class="chroma"`) {
+		t.Fatalf("go fence lost chroma envelope: %s", goOut)
+	}
+	if !strings.Contains(goOut, `<span class="line">`) {
+		t.Fatalf("go fence lost per-line spans: %s", goOut)
+	}
+	if !strings.Contains(goOut, `class="kd"`) {
+		t.Fatalf("go fence lost token-class highlighting: %s", goOut)
+	}
+}
+
 func TestMarkdownSanitizesXSS(t *testing.T) {
 	r := New()
 	out := r.Markdown("hello <script>alert(1)</script> world")

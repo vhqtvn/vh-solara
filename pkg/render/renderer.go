@@ -13,12 +13,16 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/alecthomas/chroma/v2"
 	chromahtml "github.com/alecthomas/chroma/v2/formatters/html"
+	"github.com/alecthomas/chroma/v2/lexers"
 	"github.com/alecthomas/chroma/v2/styles"
 	"github.com/microcosm-cc/bluemonday"
 	"github.com/yuin/goldmark"
-	highlighting "github.com/yuin/goldmark-highlighting/v2"
+	"github.com/yuin/goldmark/ast"
 	"github.com/yuin/goldmark/extension"
+	"github.com/yuin/goldmark/renderer"
+	"github.com/yuin/goldmark/util"
 )
 
 // DefaultStyle is the chroma style for code (dark, the default). LightStyle is
@@ -45,12 +49,13 @@ func New() *Renderer {
 	md := goldmark.New(
 		goldmark.WithExtensions(
 			extension.GFM,
-			highlighting.NewHighlighting(
-				highlighting.WithStyle(DefaultStyle),
-				// Class mode (not inline styles) so heights are stable and the
-				// theme is a single cacheable stylesheet (GET /vh/highlight.css).
-				highlighting.WithFormatOptions(chromahtml.WithClasses(true)),
-			),
+			// Custom chroma NodeRenderer (see codeHighlighter). Routes EVERY
+			// fenced code block — bare, unrecognized-language, and recognized —
+			// through chroma's structural envelope so they all share the same
+			// per-line <span class="line"> spacing. Replaces the stock
+			// goldmark-highlighting extension, whose bare/unknown fallback
+			// emitted plain <pre><code> with no per-line spans.
+			newCodeHighlighter(),
 		),
 	)
 
@@ -68,6 +73,96 @@ func New() *Renderer {
 		diffCache: map[string]string{},
 		cacheCap:  2048,
 	}
+}
+
+// codeHighlighter is a goldmark NodeRenderer (+ Extender) that routes every
+// fenced code block through chroma's structural HTML envelope.
+//
+// Why this exists: the stock github.com/yuin/goldmark-highlighting/v2 extension
+// only engages chroma when the info-string names a lexer chroma recognizes
+// (lexers.Get != nil). Bare fences (``` ``` ```) and unrecognized-language
+// fences (``` ```totallymadelang ```) fell through to goldmark's plain
+// <pre><code>…</code></pre> fallback, which lacks the per-line
+// <span class="line"> wrapping that gives language-fenced blocks their tighter
+// spacing. Routing those blocks through chroma's plaintext lexer (which emits
+// only chroma.Text tokens — no token classes, so no coloring) yields the full
+// envelope with no visual change beyond the shared line spacing.
+//
+// Recognized languages are unchanged: lexers.Get returns their real lexer, so
+// token-class highlighting (e.g. <span class="kd">func</span>) is preserved.
+type codeHighlighter struct {
+	formatter *chromahtml.Formatter
+	style     *chroma.Style
+}
+
+// newCodeHighlighter builds a renderer using class-based chroma formatting
+// (no inline styles) and the package's default (dark) style. The formatter and
+// style are immutable after construction and safe for concurrent use — Format
+// only reads config and writes to the per-call writer.
+func newCodeHighlighter() *codeHighlighter {
+	style := styles.Get(DefaultStyle)
+	if style == nil {
+		style = styles.Fallback
+	}
+	return &codeHighlighter{
+		formatter: chromahtml.New(chromahtml.WithClasses(true)),
+		style:     style,
+	}
+}
+
+// Extend implements goldmark.Extender. Registered at priority 200 (matching the
+// stock highlighting extension) so it overrides goldmark's built-in
+// fenced-code-block HTML renderer.
+func (c *codeHighlighter) Extend(m goldmark.Markdown) {
+	m.Renderer().AddOptions(renderer.WithNodeRenderers(util.Prioritized(c, 200)))
+}
+
+// RegisterFuncs implements renderer.NodeRenderer.
+func (c *codeHighlighter) RegisterFuncs(reg renderer.NodeRendererFuncRegisterer) {
+	reg.Register(ast.KindFencedCodeBlock, c.renderFencedCodeBlock)
+}
+
+// renderFencedCodeBlock emits the chroma envelope for a fenced code block. All
+// output is produced on the entering pass (mirroring goldmark's own code-block
+// renderers); the exiting pass is a no-op.
+func (c *codeHighlighter) renderFencedCodeBlock(w util.BufWriter, source []byte, node ast.Node, entering bool) (ast.WalkStatus, error) {
+	if !entering {
+		return ast.WalkContinue, nil
+	}
+	n := node.(*ast.FencedCodeBlock)
+
+	// Gather the raw code text. FencedCodeBlock content is held as source
+	// segments, so join them verbatim (same as the stock renderer).
+	var buf bytes.Buffer
+	for i := 0; i < n.Lines().Len(); i++ {
+		line := n.Lines().At(i)
+		buf.Write(line.Value(source))
+	}
+
+	// Pick a lexer: the named language's lexer when chroma recognizes it,
+	// otherwise chroma's plaintext lexer. n.Language returns nil for a bare
+	// fence; lexers.Get returns nil for an unrecognized name. Plaintext emits
+	// only chroma.Text tokens, so the formatter wraps each line in
+	// <span class="line"> but emits no token classes (no coloring) — exactly
+	// the wanted structural envelope for non-code pastes.
+	lexer := lexers.Get(string(n.Language(source)))
+	if lexer == nil {
+		lexer = lexers.Get("text")
+	}
+	lexer = chroma.Coalesce(lexer)
+
+	it, err := lexer.Tokenise(nil, buf.String())
+	if err != nil {
+		// Tokenise essentially never fails; if it does, fall back to a plain
+		// escaped <pre><code> so the block still renders safely.
+		_, _ = w.WriteString("<pre><code>")
+		_, _ = w.WriteString(html.EscapeString(buf.String()))
+		_, _ = w.WriteString("</code></pre>\n")
+		return ast.WalkContinue, nil
+	}
+
+	_ = c.formatter.Format(w, c.style, it)
+	return ast.WalkContinue, nil
 }
 
 // Markdown renders GFM markdown (with highlighted code blocks) to sanitized HTML.
