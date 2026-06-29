@@ -589,6 +589,7 @@ print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))
     # No changes to commit
     rm -f "$private_index" 2>/dev/null || true
     rm -f "$(_session_meta_path "$uuid")" 2>/dev/null || true
+    _gate_gc_sweep || true
     json_out "{\"status\":\"no_changes\",\"tree_hash\":\"${tree_hash}\"}"
     return 0
   fi

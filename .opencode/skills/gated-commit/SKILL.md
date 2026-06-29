@@ -124,16 +124,22 @@ GATE_MSG_EOF
   --message-file ".git/commit-gate/msg-${UUID}" \
   --session-alias ALIAS
 
-# 5. After review + commit (or release), clean up temp files
-rm -f ".git/commit-gate/msg-${UUID}" ".git/commit-gate/paths-${UUID}"
+# 5. No manual cleanup — the gate reaps stale session scratch automatically.
+#    `commit-gate.sh` runs its GC on the commit, release, and `no_changes`
+#    paths: it sweeps aged orphans (msg-/paths-/meta-/index-/merge-) older
+#    than COMMIT_GATE_GC_MAX_AGE. Agents MUST NOT manually
+#    `rm` `.git/commit-gate/*` scratch — the bare-`rm` form is not allowlisted
+#    for any agent (shell-guard denies it) and is now redundant.
 ```
 
-> **Belt-and-suspenders:** since the GC addition, `commit-gate.sh` now
-> self-cleans session-uuid scratch (`msg-`/`paths-`) on successful commit and
-> release, and also sweeps aged orphans (older than `COMMIT_GATE_GC_MAX_AGE`,
-> default 3600s) on those same paths. The manual `rm -f` above remains good
-> hygiene and covers the `no_changes` edge case (which does not trigger the
-> gate's GC).
+> **Automatic scratch cleanup:** `commit-gate.sh` self-cleans session-uuid
+> scratch (`msg-`/`paths-`) on successful commit, release, AND the `no_changes`
+> no-op branch, and sweeps aged orphans (older than `COMMIT_GATE_GC_MAX_AGE`,
+> default 3600s) on those same paths. Abandoned and no-op sessions may leave
+> scratch behind temporarily, but it is reaped on the next
+> commit/release/`no_changes` operation by TTL. Agents MUST NOT manually `rm`
+> `.git/commit-gate/*` — it is not allowlisted for any agent (shell-guard
+> denies it) and is now unnecessary.
 
 **Blessed one-liner (acquire):**
 ```

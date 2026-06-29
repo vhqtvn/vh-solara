@@ -146,9 +146,9 @@ Follow these rules to stay on the parsed, sanctioned path:
    - Why: each wrapper subcommand is a single literal allowlist entry; the raw forms are not.
 
 5. **Git operations route through the `committer` subagent (committer-exclusive gate).**
-   - Good: delegate `commit`/stage requests to the `committer` agent, which owns `.opencode/scripts/commit-gate.sh`.
-   - Bad: running `commit-gate.sh` / `git add` / `git commit` / `git branch …` directly from build or coordination.
-   - Why: the `git-mutation-bypass` rule denies git mutations outside the committer; improvised gate calls stall runs.
+   - Good: delegate `commit`/stage requests to the `committer` agent, which owns `.opencode/scripts/commit-gate.sh`. Pass ONLY this session's explicit file/path list. A concurrently-dirty working tree is normal during concurrent sessions — do not let unrelated dirty files dominate your handoff; they are mechanically excluded by the private-index gate.
+   - Bad: running `commit-gate.sh` / `git add` / `git commit` / `git branch …` / `git checkout` / `git status`-driven cleanup directly from build or coordination.
+   - Why: the `git-mutation-bypass` rule denies git mutations outside the committer; improvised gate calls and raw cleanups stall runs. For a stray file another session left dirty that this session does NOT own, the sanctioned in-session unblock is `commit-gate.sh revert <paths>` (restores to HEAD; no lock/CAS/index/ref mutation) — not a commit, not raw git, not the operator escape hatch.
 
 6. **Env vars and `timeout` go INSIDE `vh-agent-harness exec bash -c '...'`, never as a host-shell prefix before `harness`.** A prefix runs on the HOST and never reaches the container — shell-guard now rejects it.
    - Good: `vh-agent-harness exec bash -c 'FOO=bar python -m mymodule'`

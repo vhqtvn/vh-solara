@@ -18,6 +18,7 @@ export const COMMANDS = {
         "jq *",
         "find *",
         "echo *",
+        "printf *",
         "sleep *",
         "sed -n *",
         ".opencode/scripts/readonly-scripts.sh *",

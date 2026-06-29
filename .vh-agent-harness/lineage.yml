@@ -7,7 +7,7 @@ lineage_version: "1"
 template:
     source: templates/core
     commit: ""
-    ref: harness/0.1.7
+    ref: harness/0.1.8
 copier:
     version: ""
 answers:
@@ -19,6 +19,6 @@ answers:
         project_name: vh-solara
         project_slug: vh-solara
 render:
-    last_successful_update_id: a8259609ad7884e3
-    last_successful_render_at: "2026-06-29T04:10:43Z"
+    last_successful_update_id: 9e2d76e2f2b374a7
+    last_successful_render_at: "2026-06-29T22:16:53Z"
     rendered_by: embed-fs
