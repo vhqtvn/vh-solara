@@ -45,6 +45,7 @@ if (!storedId) {
 export const deviceId = storedId;
 
 function defaultName(): string {
+  if (typeof navigator === "undefined") return "Device";
   const ua = navigator.userAgent;
   const os = /Android/.test(ua) ? "Android" : /iP(hone|ad|od)/.test(ua) ? "iOS" :
     /Mac/.test(ua) ? "Mac" : /Win/.test(ua) ? "Windows" : /Linux/.test(ua) ? "Linux" : "Device";
