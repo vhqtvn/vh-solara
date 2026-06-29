@@ -49,9 +49,6 @@ export function agentForSession(sessionID: string): string {
 // Select an agent for a session and, if the agent declares a model, switch the
 // session's model to it (OpenCode ties a model+variant to each agent). Pass ""
 // as sessionID for a draft so the new session inherits the agent's model.
-// ONLY a draft pick (sessionID === "") updates the GLOBAL default that new
-// sessions inherit; a pick for an existing session is per-session only, so it
-// cannot contaminate other sessions whose own resolution is absent.
 export function selectAgentForSession(sessionID: string, name: string) {
   setSessionAgentSel(sessionID, name); // remember the pick for THIS session
   // Only a draft pick (sessionID === "") updates the GLOBAL default that new
@@ -70,6 +67,12 @@ export function selectAgentForSession(sessionID: string, name: string) {
 //      merged project-over-global by opencode),
 //   2. vh-solara's own stored pick (localStorage),
 //   3. "build", else the first usable agent.
+//
+// Contract: atomic. `agents()` is mutated exactly once — only after Promise.all
+// resolves, never mid-fetch. A rejecting fetch leaves `agents()` untouched, so
+// the retry-while-empty loop in `ensureAgentsLoaded` (index.tsx) can rely on a
+// thrown loadAgents() meaning "loaded nothing, retry". Do not add a partial
+// setAgents before a later await without re-checking that caller.
 export async function loadAgents() {
   const [list, config] = await Promise.all([
     oc.get<AgentInfo[]>("/agent"),

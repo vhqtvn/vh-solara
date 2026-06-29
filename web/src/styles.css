@@ -2670,7 +2670,14 @@ body {
 /* Neutral placeholder shown in the composer bar while agents are still loading
    (the agent/model selects are gated on a non-empty list). Matches bar-btn's
    metrics so the bar doesn't reflow when the real select replaces it. */
-.bar-loading { color: var(--fg-dim); font-size: 12px; padding: 5px 8px; }
+.bar-loading {
+  color: var(--fg-dim);
+  font-size: 12px;
+  padding: 5px 8px;
+  border-radius: 7px;
+  display: inline-flex;
+  line-height: inherit;
+}
 .bar-icon {
   background: transparent;
   border: 0;
