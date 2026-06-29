@@ -110,23 +110,51 @@ function tagInlineCodePaths(root: HTMLElement | undefined) {
   });
 }
 
-// Inject a copy button into each server-rendered code block (innerHTML, so we
-// enhance the DOM rather than the markup).
+// Inject copy + word-wrap buttons into each server-rendered code block
+// (innerHTML, so we enhance the DOM rather than the markup). Each pre is wrapped
+// in a non-scrolling .code-block container: the pre itself is the horizontal
+// scroll surface for long lines, so anchoring the action buttons to the wrapper
+// (which does not scroll) keeps them pinned at the top-right instead of riding
+// off-screen with the scrolled content.
 function addCodeCopyButtons(root: HTMLElement | undefined) {
   if (!root) return;
   root.querySelectorAll("pre").forEach((pre) => {
-    if (pre.querySelector(".code-copy")) return;
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "code-copy";
-    btn.textContent = "copy";
-    const code = pre.querySelector("code") as HTMLElement | null;
-    btn.addEventListener("click", () => {
-      void navigator.clipboard?.writeText((code ?? pre).innerText);
-      btn.textContent = "copied";
-      setTimeout(() => (btn.textContent = "copy"), 1200);
+    if (pre.closest(".code-block")) return; // already wrapped
+    const parent = pre.parentElement;
+    if (!parent) return;
+    const block = document.createElement("div");
+    block.className = "code-block";
+    parent.replaceChild(block, pre);
+    block.appendChild(pre);
+
+    const actions = document.createElement("div");
+    actions.className = "code-actions";
+
+    // Word-wrap toggle (renders to the LEFT of copy via the flex container).
+    const wrapBtn = document.createElement("button");
+    wrapBtn.type = "button";
+    wrapBtn.className = "code-wrap";
+    wrapBtn.textContent = "wrap";
+    wrapBtn.addEventListener("click", () => {
+      const on = pre.classList.toggle("wrap");
+      wrapBtn.textContent = on ? "unwrap" : "wrap";
     });
-    pre.appendChild(btn);
+
+    const copyBtn = document.createElement("button");
+    copyBtn.type = "button";
+    copyBtn.className = "code-copy";
+    copyBtn.textContent = "copy";
+    const code = pre.querySelector("code") as HTMLElement | null;
+    copyBtn.addEventListener("click", () => {
+      void navigator.clipboard?.writeText((code ?? pre).innerText);
+      copyBtn.textContent = "copied";
+      setTimeout(() => (copyBtn.textContent = "copy"), 1200);
+    });
+
+    // DOM order in the flex container = visual order: wrap (left), copy (right).
+    actions.appendChild(wrapBtn);
+    actions.appendChild(copyBtn);
+    block.appendChild(actions);
   });
 }
 

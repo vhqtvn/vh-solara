@@ -1164,11 +1164,21 @@ body {
 }
 .msg-actions button:hover { color: var(--fg); background: color-mix(in srgb, var(--fg) 8%, transparent); }
 
-.md pre { position: relative; }
-.code-copy {
+/* The wrapper owns the code block's vertical rhythm (matching the UA <pre>
+   default of 1em 0 that .md pre does not override) and the pre's margin is
+   zeroed below, so the trailing .code-actions sibling can't keep the pre's
+   bottom margin from collapsing cleanly into the wrapper. */
+.md .code-block { position: relative; margin: 1em 0; }
+/* Action buttons live in a flex container pinned to the non-scrolling wrapper,
+   so they stay put while the pre scrolls horizontally beneath them. */
+.md .code-block > .code-actions {
   position: absolute;
   top: 6px;
   right: 6px;
+  display: flex;
+  gap: 4px;
+}
+.code-copy, .code-wrap {
   background: color-mix(in srgb, var(--bg-2) 80%, transparent);
   border: 1px solid var(--border);
   color: var(--fg-dim);
@@ -1179,8 +1189,9 @@ body {
   opacity: 0;
   transition: opacity 0.12s;
 }
-.md pre:hover .code-copy { opacity: 1; }
-.code-copy:hover { color: var(--fg); }
+.md .code-block:hover .code-copy,
+.md .code-block:hover .code-wrap { opacity: 1; }
+.code-copy:hover, .code-wrap:hover { color: var(--fg); }
 
 .md, .md-raw { overflow-wrap: anywhere; }
 .md-raw { white-space: pre-wrap; }
@@ -1207,6 +1218,12 @@ body {
   padding: 10px 12px;
   overflow-x: auto;
 }
+/* Pre inside a .code-block wrapper drops its own margin (the wrapper owns it). */
+.md .code-block > pre { margin: 0; }
+/* Word-wrap toggle (.code-wrap button flips this on per block): switches from
+   the default scroll (pre) to wrapped (pre-wrap) so long lines fold instead of
+   overflowing horizontally. */
+.md pre.wrap { white-space: pre-wrap; overflow-wrap: anywhere; }
 .md code { font-family: ui-monospace, Menlo, monospace; font-size: 13px; }
 .md :not(pre) > code {
   background: var(--md-code-bg);
@@ -1369,6 +1386,7 @@ body {
   .disclosure { transition: none; }
 }
 .tool-output-code .md { margin: 0; }
+.tool-output-code .code-block { margin: 0; }
 .tool-output-code .md pre { margin: 0; border: 0; border-radius: 0; max-height: 320px; }
 .file-chip {
   display: inline-block;
@@ -2985,12 +3003,13 @@ body {
 
 /* --- touch vs hover: only HIDE hover-affordances on real hover devices, so
    touch screens (phones, Galaxy Fold) always show message/code actions. --- */
-.msg-actions, .code-copy { opacity: 1; }
+.msg-actions, .code-copy, .code-wrap { opacity: 1; }
 @media (hover: hover) and (pointer: fine) {
   .msg-actions { opacity: 0; }
   .msg:hover .msg-actions { opacity: 1; }
-  .code-copy { opacity: 0; }
-  .md pre:hover .code-copy { opacity: 1; }
+  .code-copy, .code-wrap { opacity: 0; }
+  .md .code-block:hover .code-copy,
+  .md .code-block:hover .code-wrap { opacity: 1; }
 }
 
 /* --- narrow screens (Galaxy Fold folded ~280px and unfolded) --- */
