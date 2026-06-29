@@ -1,6 +1,6 @@
 import { createEffect, createMemo, createSignal, For, Match, on, onCleanup, onMount, Show, Switch, untrack } from "solid-js";
 import { Portal } from "solid-js/web";
-import { ackSession, createSession, currentVerb, isSending, markSessionIdle, openSession, respondPermission, sessionTodoCounts, sessionTodos, sessionWorking, setSelectedId, setSending, state } from "../sync";
+import { ackSession, createSession, currentVerb, isSending, markSessionIdle, openSession, respondPermission, rootOf, sessionTodoCounts, sessionTodos, sessionWorking, setSelectedId, setSending, state } from "../sync";
 import { bottommostRead, clearReadAnchor, getReadAnchor, setReadAnchor } from "../lib/scroll";
 import { highlightInput } from "../lib/composerHighlight";
 import { chooseVariant, findModel, loadModels, models, selectionFor } from "../models";
@@ -624,12 +624,18 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // This effect acks when unread is set AND we're following AND at the bottom.
   // Reactivity keys off unread/following/ready (signals), NOT off nearBottom()
   // (a live DOM geometry read) — so it re-runs only when those signals change,
-  // never per scroll frame. ackSession early-returns once unread is cleared, and
-  // already honors the attendingNow() presence gate internally, so the
-  // setState/fetch it performs can't loop or over-fire this effect.
+  // never per scroll frame. The unread gate keys off the ROOT id (rootOf), not
+  // the raw session id: state.unread is keyed by root server-side, so a
+  // subsession viewer glued to its bottom also sees its root's dot clear
+  // (matching onScrolled's ackSession, which resolves to root internally — the
+  // ackSession call below still takes the raw id for the same reason). Loop-
+  // safety: ackSession clears the very signal this effect tracks
+  // (setState("unread", root, undefined)) and early-returns when
+  // !state.unread[root], so it can't re-trigger. (attendingNow() only governs
+  // notification markRead, not the unread clear.)
   createEffect(() => {
     if (props.draft || !ready() || !following()) return;
-    if (!state.unread[props.sessionId]) return;
+    if (!state.unread[rootOf(props.sessionId)]) return;
     if (!nearBottom()) return;
     ackSession(props.sessionId);
   });
