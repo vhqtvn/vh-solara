@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { reconcile } from "solid-js/store";
 import { setState } from "../../src/sync/store";
-import { currentVerb } from "../../src/sync/selectors";
+import { currentVerb, sessionLastAgent } from "../../src/sync/selectors";
 import type { Part } from "../../src/types";
 
 // The Working pill's verb selector. `currentVerb` is a pure read of `state`, so
@@ -46,6 +46,7 @@ beforeEach(() => {
   setState("permissions", reconcile({}));
   setState("questions", reconcile({}));
   setState("todos", reconcile({}));
+  setState("lastAgents", reconcile({}));
 });
 
 describe("currentVerb (Working pill)", () => {
@@ -143,5 +144,49 @@ describe("currentVerb (Working pill)", () => {
         state: { status: "running", input: {}, time: { start: 2000 } } },
     ]);
     expect(currentVerb(SID)).toEqual({ verb: "Running", subject: undefined, startMs: 2000 });
+  });
+});
+
+// sessionLastAgent backs the per-agent chip in the tree. On a COLD tree (no
+// session opened), the client holds no messages, so the chip must render from
+// the snapshot-seeded lastAgents map. Once a session is opened (messages
+// loaded), the live scan is authoritative and reflects streaming updates.
+describe("sessionLastAgent (tree chip / cold + live)", () => {
+  const COLD = "cold";
+  const LIVE = "live";
+
+  it("returns undefined when neither messages nor a seeded lastAgent exist", () => {
+    expect(sessionLastAgent("none")).toBeUndefined();
+  });
+
+  it("renders from the snapshot-seeded lastAgents map on a COLD tree (no messages)", () => {
+    // No messages loaded for COLD — the tree-only snapshot carries none. The
+    // snapshot seeds lastAgents so the chip renders before any open.
+    setState("lastAgents", COLD, "build");
+    expect(sessionLastAgent(COLD)).toBe("build");
+  });
+
+  it("prefers the live message scan when messages are loaded (authoritative)", () => {
+    // Seed a stale value; opening the session must reflect the live agent.
+    setState("lastAgents", LIVE, "plan");
+    setState("messages", LIVE, {
+      order: ["m1"],
+      byId: {
+        m1: { id: "m1", info: { id: "m1", sessionID: LIVE, role: "assistant", agent: "build" }, partOrder: [], parts: {} },
+      },
+    });
+    expect(sessionLastAgent(LIVE)).toBe("build");
+  });
+
+  it("returns undefined when loaded but no assistant message carries an agent", () => {
+    setState("lastAgents", LIVE, "build");
+    setState("messages", LIVE, {
+      order: ["m1"],
+      byId: {
+        m1: { id: "m1", info: { id: "m1", sessionID: LIVE, role: "user" }, partOrder: [], parts: {} },
+      },
+    });
+    // Loaded + authoritative: no assistant → undefined (NOT the stale seed).
+    expect(sessionLastAgent(LIVE)).toBeUndefined();
   });
 });

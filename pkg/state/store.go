@@ -71,6 +71,12 @@ type Snapshot struct {
 	Questions   map[string][]json.RawMessage  `json:"questions,omitempty"`
 	Statuses    map[string]json.RawMessage    `json:"statuses,omitempty"`
 	Activity    map[string]string             `json:"activity,omitempty"`
+	// LastAgents carries the agent name of each session's most recent assistant
+	// turn, so the tree can render per-agent chips on a COLD snapshot — before any
+	// session's message history is hydrated. Like Activity, this is a snapshot-only
+	// facet (NOT on the session payload) so it survives per-session upsert events
+	// (which replace the session object on the client). Keyed by sessionID.
+	LastAgents map[string]string `json:"lastAgents,omitempty"`
 	// Gate carries the per-session "is this safe to act on" facts inline (A2), so a
 	// coordinator evaluates its send/act gate from one snapshot — no N+1 detail
 	// fetch, no message-history walk. Keyed by sessionID.
@@ -138,6 +144,7 @@ type sessionEntry struct {
 	lastTokens        json.RawMessage // raw `tokens` of the latest assistant msg
 	lastAsstCompleted bool            // the latest assistant msg has time.completed
 	lastAsstEmpty     bool            // the latest assistant msg has no non-whitespace text content
+	lastAgent         string          // the agent name of the latest assistant msg (cold-seedable; see SetLastAgents)
 }
 
 type messageEntry struct {
@@ -154,6 +161,9 @@ type messageEntry struct {
 	// raw `tokens` usage object. Kept raw — vh-solara reports, never interprets.
 	finish string
 	tokens json.RawMessage
+	// agent is the opencode `info.agent` string cached from info, used to populate
+	// lastAgent on the session entry when this is the latest assistant message.
+	agent string
 }
 
 type sessionMessages struct {
@@ -184,6 +194,10 @@ type messageInfoEnvelope struct {
 	// raw completion reason; `tokens` the raw usage object.
 	Finish string          `json:"finish"`
 	Tokens json.RawMessage `json:"tokens"`
+	// Agent is opencode's `info.agent` (the agent that produced an assistant
+	// message). Cached here so the denormalized lastAgent on the session entry can
+	// be set without re-parsing info.
+	Agent string `json:"agent"`
 }
 
 type partEnvelope struct {
@@ -616,7 +630,17 @@ func (s *Store) upsertSessionLocked(props json.RawMessage) {
 		}
 		return
 	}
+	// Preserve the cold-seeded lastAgent (set by SetLastAgents during hydrate)
+	// across a session.updated that replaces the entry. Without this, a
+	// metadata/title update for an un-opened session would wipe its cold-seeded
+	// agent chip. recomputeLastAssistantLocked below does NOT restore it for
+	// un-hydrated sessions (it leaves lastAgent untouched when sm==nil), so we
+	// carry it over explicitly here.
+	prev := s.sessions[env.ID]
 	s.sessions[env.ID] = &sessionEntry{id: env.ID, parentID: env.ParentID, info: p.Info}
+	if prev != nil {
+		s.sessions[env.ID].lastAgent = prev.lastAgent
+	}
 	// A session.updated replaces the entry, so repopulate the denormalized
 	// last-assistant summary from the (persisted) message view.
 	s.recomputeLastAssistantLocked(env.ID)
@@ -767,11 +791,12 @@ func (s *Store) upsertMessageLocked(info json.RawMessage) {
 		me.completed = env.Time.Completed != nil
 		me.finish = env.Finish
 		me.tokens = env.Tokens
+		me.agent = env.Agent
 	} else {
 		sm.byID[env.ID] = &messageEntry{
 			id: env.ID, info: info, parts: map[string]json.RawMessage{},
 			role: env.Role, completed: env.Time.Completed != nil,
-			finish: env.Finish, tokens: env.Tokens,
+			finish: env.Finish, tokens: env.Tokens, agent: env.Agent,
 		}
 		sm.order = append(sm.order, env.ID)
 	}
@@ -825,15 +850,30 @@ func (s *Store) recomputeLastAssistantLocked(sessionID string) {
 	if se == nil {
 		return
 	}
+	sm := s.messages[sessionID]
+	if sm == nil {
+		// Messages not hydrated. Reset the gate-facts fields that are only
+		// authoritative when hydrated (mirrors the pre-existing behavior), but
+		// PRESERVE lastAgent — it may have been cold-seeded by SetLastAgents
+		// during hydrate for a session whose full history we deliberately don't
+		// fetch. Resetting it here would wipe every cold-seeded chip the moment a
+		// session.updated (e.g. a title/metadata refresh) replaced the entry, since
+		// upsertSessionLocked routes here after the replace. lastAgent becomes
+		// authoritative again once the session is opened (messages loaded → this
+		// branch is skipped and the scan below sets it from real data).
+		se.hasAssistant = false
+		se.lastFinish = ""
+		se.lastTokens = nil
+		se.lastAsstCompleted = false
+		se.lastAsstEmpty = false
+		return
+	}
 	se.hasAssistant = false
 	se.lastFinish = ""
 	se.lastTokens = nil
 	se.lastAsstCompleted = false
 	se.lastAsstEmpty = false
-	sm := s.messages[sessionID]
-	if sm == nil {
-		return
-	}
+	se.lastAgent = ""
 	for i := len(sm.order) - 1; i >= 0; i-- {
 		me := sm.byID[sm.order[i]]
 		if me == nil || me.role != "assistant" {
@@ -844,6 +884,7 @@ func (s *Store) recomputeLastAssistantLocked(sessionID string) {
 		se.lastTokens = me.tokens
 		se.lastAsstCompleted = me.completed
 		se.lastAsstEmpty = !messageHasContent(me)
+		se.lastAgent = me.agent
 		return
 	}
 }
@@ -997,6 +1038,7 @@ func (s *Store) Snapshot(messagesFor map[string]bool) Snapshot {
 		Statuses:    map[string]json.RawMessage{},
 		Activity:    map[string]string{},
 		Gate:        map[string]GateFacts{},
+		LastAgents:  map[string]string{},
 	}
 	// Per-session gate facts (denormalized; see GateFacts). subtree_busy needs a
 	// tree walk, so compute it once here in O(n) and index per session.
@@ -1021,6 +1063,9 @@ func (s *Store) Snapshot(messagesFor map[string]bool) Snapshot {
 			PendingPermission:      len(s.perms[sid]) > 0,
 			PermissionBlocked:      s.permBlocked[sid],
 			Tokens:                 se.lastTokens,
+		}
+		if se.lastAgent != "" {
+			snap.LastAgents[sid] = se.lastAgent
 		}
 	}
 	for sid, m := range s.questions {
@@ -1259,6 +1304,7 @@ func (s *Store) reconcileMessagesLocked(sid string, list []MessageWithParts) {
 		me.completed = env.Time.Completed != nil
 		me.finish = env.Finish
 		me.tokens = env.Tokens
+		me.agent = env.Agent
 
 		seenPart := make(map[string]bool, len(mwp.Parts))
 		for _, part := range mwp.Parts {
@@ -1334,6 +1380,24 @@ func (s *Store) SetSessionMessages(sid string, list []MessageWithParts) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.reconcileMessagesLocked(sid, list)
+}
+
+// SetLastAgents cold-seeds the agent name of each session's most recent
+// assistant turn, fetched as a lightweight message tail by the aggregator during
+// hydrate. This is what lets the tree render per-agent chips on a COLD snapshot
+// (before any session's full message history is hydrated) — the tree-only
+// snapshot carries no messages, so lastAgent can't be derived client-side until
+// the session is opened. Re-seeding on each reconnect is idempotent. Once a
+// session is opened (messages loaded), recomputeLastAssistantLocked overrides
+// the seed authoritatively from the full history.
+func (s *Store) SetLastAgents(agents map[string]string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for sid, agent := range agents {
+		if se := s.sessions[sid]; se != nil {
+			se.lastAgent = agent
+		}
+	}
 }
 
 func removeString(xs []string, x string) []string {

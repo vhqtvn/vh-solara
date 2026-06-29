@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/vhqtvn/vh-solara/pkg/opencode"
@@ -157,6 +158,14 @@ func (a *Aggregator) hydrate(ctx context.Context) error {
 	}
 	a.store.Hydrate(sessions, messages)
 
+	// Seed lastAgent (the agent of a session's most recent assistant turn) for
+	// sessions whose messages were NOT fetched above. The tree snapshot carries
+	// no messages, so without this the per-agent chips on cold/un-opened sessions
+	// would stay empty until a session is opened. We fetch only a lightweight tail
+	// (newest N messages) per session and scan it for the most recent assistant
+	// message's info.agent — bounded concurrency keeps thousands of sessions sane.
+	a.seedColdLastAgents(ctx, sessions)
+
 	// Seed per-session activity (busy/idle/error) so the sidebar shows status
 	// for sessions even before any live status event arrives.
 	if statuses, err := a.client.SessionStatuses(ctx); err == nil {
@@ -173,4 +182,81 @@ func (a *Aggregator) hydrate(ctx context.Context) error {
 		a.store.SetPendingPermissions(ps)
 	}
 	return nil
+}
+
+// coldTailLimit is the number of newest messages fetched per un-opened session
+// to derive its lastAgent for the tree chips. It only needs to be large enough
+// to typically contain the most recent assistant turn.
+const coldTailLimit = 10
+
+// seedColdLastAgents fetches a lightweight message tail for each session NOT
+// already loaded (messages reconciled authoritatively above) and seeds its
+// lastAgent in the store. This is what makes per-agent chips render on a cold
+// tree before any session is opened. Errors per session are logged and skipped
+// (graceful — no worse than today's empty chip). Re-runs on every (re)connect
+// are idempotent.
+func (a *Aggregator) seedColdLastAgents(ctx context.Context, sessions []json.RawMessage) {
+	loaded := make(map[string]bool)
+	for _, id := range a.store.LoadedSessions() {
+		loaded[id] = true
+	}
+
+	type sessEnv struct {
+		ID string `json:"id"`
+	}
+
+	var (
+		mu         sync.Mutex
+		wg         sync.WaitGroup
+		lastAgents = map[string]string{}
+		sem        = make(chan struct{}, 8) // bound concurrency; limit=10 keeps each fetch cheap
+	)
+	for _, raw := range sessions {
+		var se sessEnv
+		if json.Unmarshal(raw, &se) != nil || se.ID == "" {
+			continue
+		}
+		if loaded[se.ID] {
+			continue // messages already reconciled authoritatively
+		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(id string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			items, err := a.client.MessagesTail(ctx, id, coldTailLimit)
+			if err != nil {
+				log.Printf("[aggregator] lastAgent tail fetch failed for %s: %v", id, err)
+				return
+			}
+			if agent := lastAssistantAgent(items); agent != "" {
+				mu.Lock()
+				lastAgents[id] = agent
+				mu.Unlock()
+			}
+		}(se.ID)
+	}
+	wg.Wait()
+	if len(lastAgents) > 0 {
+		a.store.SetLastAgents(lastAgents)
+	}
+}
+
+// lastAssistantAgent scans a list of raw {info,parts} messages from the END
+// backward and returns the info.agent of the most recent assistant message, or "".
+// The opencode message page is newest-window, oldest-first within the window, so
+// the last array element is the newest message.
+func lastAssistantAgent(items []json.RawMessage) string {
+	for i := len(items) - 1; i >= 0; i-- {
+		var m struct {
+			Info struct {
+				Role  string `json:"role"`
+				Agent string `json:"agent"`
+			} `json:"info"`
+		}
+		if json.Unmarshal(items[i], &m) == nil && m.Info.Role == "assistant" && m.Info.Agent != "" {
+			return m.Info.Agent
+		}
+	}
+	return ""
 }

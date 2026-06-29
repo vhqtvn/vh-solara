@@ -433,3 +433,68 @@ func TestHydrateDiffEmitsOnlyChanges(t *testing.T) {
 		t.Fatalf("idempotent hydrate should emit nothing, seq moved from %d to %d", stable, s.Snapshot(nil).Seq)
 	}
 }
+
+// TestLastAgentTrackedFromAssistantMessages verifies lastAgent is derived from
+// the most recent assistant message's info.agent and exposed in the snapshot via
+// the LastAgents facet (so the tree renders chips on a cold tree without message
+// history). Also covers the cold-seed survival across session.updated.
+func TestLastAgentTrackedFromAssistantMessages(t *testing.T) {
+	s := New(100)
+	s.Apply(ev("session.created", `{"info":{"id":"a"}}`))
+	// A user message carries no agent → no chip yet.
+	s.Apply(ev("message.updated", `{"info":{"id":"u1","sessionID":"a","role":"user"}}`))
+	if got := s.Snapshot(nil).LastAgents["a"]; got != "" {
+		t.Fatalf("no assistant yet: want empty lastAgent, got %q", got)
+	}
+	// First assistant turn with agent=build.
+	s.Apply(ev("message.updated", `{"info":{"id":"m1","sessionID":"a","role":"assistant","agent":"build"}}`))
+	if got := s.Snapshot(nil).LastAgents["a"]; got != "build" {
+		t.Fatalf("want lastAgent 'build', got %q", got)
+	}
+	// A newer assistant message with a different agent overrides.
+	s.Apply(ev("message.updated", `{"info":{"id":"m2","sessionID":"a","role":"assistant","agent":"plan"}}`))
+	if got := s.Snapshot(nil).LastAgents["a"]; got != "plan" {
+		t.Fatalf("newer assistant: want lastAgent 'plan', got %q", got)
+	}
+
+	// lastAgent survives a session.updated that replaces the entry (mirrors how
+	// finish_reason survives in TestGateFactsFinishAndUsage).
+	s.Apply(ev("session.updated", `{"info":{"id":"a","title":"renamed"}}`))
+	if got := s.Snapshot(nil).LastAgents["a"]; got != "plan" {
+		t.Fatalf("lastAgent must survive session.updated, got %q", got)
+	}
+
+	// A session with no assistant message has no lastAgent.
+	s.Apply(ev("session.created", `{"info":{"id":"b"}}`))
+	if _, ok := s.Snapshot(nil).LastAgents["b"]; ok {
+		t.Fatal("session with no assistant must not appear in LastAgents")
+	}
+}
+
+// TestLastAgentColdSeedPreserved verifies the cold-seed flow: SetLastAgents
+// (called by the aggregator hydrate for un-opened sessions) seeds the field, a
+// subsequent session.updated preserves it (messages still un-hydrated), and
+// opening the session (loading messages) makes the live scan authoritative.
+func TestLastAgentColdSeedPreserved(t *testing.T) {
+	s := New(100)
+	s.Apply(ev("session.created", `{"info":{"id":"cold"}}`))
+	// Cold-seed the agent as the aggregator would for an un-opened session.
+	s.SetLastAgents(map[string]string{"cold": "build"})
+	if got := s.Snapshot(nil).LastAgents["cold"]; got != "build" {
+		t.Fatalf("cold-seed: want lastAgent 'build', got %q", got)
+	}
+	// A metadata refresh (session.updated) must NOT wipe the cold-seed.
+	s.Apply(ev("session.updated", `{"info":{"id":"cold","title":"refreshed"}}`))
+	if got := s.Snapshot(nil).LastAgents["cold"]; got != "build" {
+		t.Fatalf("cold-seed must survive session.updated, got %q", got)
+	}
+	// Once the session is opened (messages loaded), the live scan takes over —
+	// here the loaded history has an assistant with agent=plan, which overrides.
+	s.SetSessionMessages("cold", []MessageWithParts{
+		{Info: json.RawMessage(`{"id":"a1","sessionID":"cold","role":"user"}`)},
+		{Info: json.RawMessage(`{"id":"a2","sessionID":"cold","role":"assistant","agent":"plan"}`)},
+	})
+	if got := s.Snapshot(nil).LastAgents["cold"]; got != "plan" {
+		t.Fatalf("loaded session: want live-derived lastAgent 'plan', got %q", got)
+	}
+}

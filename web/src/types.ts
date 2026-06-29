@@ -27,6 +27,12 @@ export interface Snapshot {
   // each value is the ENVELOPE `{ sessionID, todos: [...] }`, not the bare array
   // (normalized on the client — see normalizeTodos in sync.ts).
   todos?: Record<string, unknown>;
+  // Per-session agent name (of the most recent assistant turn), seeded by the
+  // daemon from a lightweight message tail so the tree can render per-agent
+  // chips on a COLD snapshot before any session is opened (the tree snapshot
+  // carries no messages). A snapshot-only facet — NOT on the Session payload —
+  // so it survives per-session upsert events. See sessionLastAgent.
+  lastAgents?: Record<string, string>;
 }
 
 // One agent todo (OpenCode's TodoWrite). The daemon passes the payload through

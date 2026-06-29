@@ -318,6 +318,25 @@ func (c *Client) Messages(ctx context.Context, sessionID string) ([]json.RawMess
 	return out, nil
 }
 
+// MessagesTail returns the most recent `limit` messages of a session as raw JSON
+// objects. It uses OpenCode's `?limit=N` query (sst/opencode MessageV2.page:
+// orders by desc(time_created) then reverses → the N NEWEST messages, in
+// chronological order within the page). A limit <= 0 requests the full list.
+// Used by the aggregator during cold hydrate to seed the tree's per-agent chips
+// (the agent lives on assistant messages as info.agent) without fetching every
+// session's full history.
+func (c *Client) MessagesTail(ctx context.Context, sessionID string, limit int) ([]json.RawMessage, error) {
+	path := "/session/" + sessionID + "/message"
+	if limit > 0 {
+		path += "?limit=" + fmt.Sprintf("%d", limit)
+	}
+	var out []json.RawMessage
+	if err := c.getJSON(ctx, path, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // Event is one OpenCode SSE event: { id, type, properties }.
 type Event struct {
 	ID         string          `json:"id"`

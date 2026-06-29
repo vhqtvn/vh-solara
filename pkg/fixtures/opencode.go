@@ -581,7 +581,14 @@ func (f *FakeOpenCode) handleSession(w http.ResponseWriter, r *http.Request) {
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	writeJSON(w, f.messages[id])
+	// Honor ?limit=N like real OpenCode (sst/opencode MessageV2.page: newest N
+	// messages, in chronological order within the window). The fixture stores
+	// messages in chronological order, so the newest window is the tail slice.
+	msgs := f.messages[id]
+	if l, _ := strconv.Atoi(r.URL.Query().Get("limit")); l > 0 && l < len(msgs) {
+		msgs = msgs[len(msgs)-l:]
+	}
+	writeJSON(w, msgs)
 }
 
 // simulateShell emits a user message containing the command and an assistant

@@ -44,15 +44,25 @@ export function lastUserMessageModel(id: string): ModelRefLite | undefined {
 
 // The agent of the session's most recent message that carries one (OpenCode
 // stamps `agent` on assistant messages). Used to restore the composer's agent
-// per session, the same way the model is restored from the last user message.
+// per session, the same way the model is restored from the last user message,
+// AND to render the per-agent chip in the tree.
+//
+// When the session's messages are LOADED (open), the live scan is authoritative
+// — it reflects the newest assistant turn as events stream in (the snapshot-seeded
+// lastAgents map only refreshes on snapshot/reconnect, so preferring it would
+// show a STALE agent for an open session). When messages are NOT loaded
+// (cold/un-opened session on a fresh tree), fall back to the snapshot-seeded
+// lastAgents map so the chip renders immediately without opening the session.
 export function sessionLastAgent(id: string): string | undefined {
   const sm = state.messages[id];
-  if (!sm) return undefined;
-  for (let i = sm.order.length - 1; i >= 0; i--) {
-    const info: any = sm.byId[sm.order[i]]?.info;
-    if (info?.agent) return info.agent as string;
+  if (sm) {
+    for (let i = sm.order.length - 1; i >= 0; i--) {
+      const info: any = sm.byId[sm.order[i]]?.info;
+      if (info?.agent) return info.agent as string;
+    }
+    return undefined; // loaded but no assistant message with an agent yet
   }
-  return undefined;
+  return state.lastAgents[id];
 }
 
 // True when a session OR any of its subagents has a pending permission/question

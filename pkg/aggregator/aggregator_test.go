@@ -51,3 +51,27 @@ func TestHydrateRecoversPendingQuestion(t *testing.T) {
 		t.Fatal("expected hydrate to recover the pending question, got none")
 	}
 }
+
+// A cold tree (fresh daemon, no session opened) must still render per-agent
+// chips. hydrate fetches a lightweight message tail per un-opened session and
+// seeds lastAgent — the tree snapshot carries no messages, so without this the
+// chip would stay empty until a session is opened. The demo fixture seeds
+// assistant turns m2=build, m4=plan, m6=build (newest); sub seeds sm1=general.
+func TestHydrateSeedsColdLastAgents(t *testing.T) {
+	oc := httptest.NewServer(fixtures.New().Handler())
+	defer oc.Close()
+
+	agg := New(oc.URL, 100)
+	if err := agg.Rehydrate(context.Background()); err != nil {
+		t.Fatalf("rehydrate: %v", err)
+	}
+	snap := agg.Store().Snapshot(nil)
+	// On a fresh aggregator, demo is NOT in LoadedSessions() — the cold path
+	// (tail fetch) must seed its lastAgent from the newest assistant message.
+	if got := snap.LastAgents["demo"]; got != "build" {
+		t.Fatalf("cold demo lastAgent: want 'build' (newest assistant m6), got %q", got)
+	}
+	if got := snap.LastAgents["sub"]; got != "general" {
+		t.Fatalf("cold sub lastAgent: want 'general' (sm1), got %q", got)
+	}
+}

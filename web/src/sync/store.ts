@@ -11,6 +11,7 @@ import { loadVersioned, saveVersioned } from "../lib/store";
 const LS_SESSIONS = "vh.sessions.v1";
 const LS_CURSOR = "vh.cursor.v1";
 const LS_ACTIVITY = "vh.activity.v1";
+const LS_LASTAGENTS = "vh.lastagents.v1";
 export const LS_PROJECT = "vh.project.dir";
 
 // Persistence is keyed per project directory so each project hydrates its own
@@ -18,6 +19,7 @@ export const LS_PROJECT = "vh.project.dir";
 export const lsSessions = (dir: string) => `${LS_SESSIONS}:${dir}`;
 export const lsCursor = (dir: string) => `${LS_CURSOR}:${dir}`;
 export const lsActivity = (dir: string) => `${LS_ACTIVITY}:${dir}`;
+export const lsLastAgents = (dir: string) => `${LS_LASTAGENTS}:${dir}`;
 
 export function loadSessions(dir: string): Record<string, Session> {
   return loadVersioned<Record<string, Session>>(lsSessions(dir), 1, {}, (o) =>
@@ -34,6 +36,14 @@ export const loadCursor = (dir: string) =>
 // reconciles any change.
 export function loadActivity(dir: string): Record<string, string> {
   return loadVersioned<Record<string, string>>(lsActivity(dir), 1, {}, (o) =>
+    o && typeof o === "object" ? (o as Record<string, string>) : {},
+  );
+}
+// Per-session agent names (for tree chips) are persisted alongside sessions so
+// a reload renders the chips INSTANTLY — before the snapshot/stream arrive.
+// Mirrors activity's persistence rationale. The live stream reconciles updates.
+export function loadLastAgents(dir: string): Record<string, string> {
+  return loadVersioned<Record<string, string>>(lsLastAgents(dir), 1, {}, (o) =>
     o && typeof o === "object" ? (o as Record<string, string>) : {},
   );
 }
@@ -59,6 +69,9 @@ export interface SyncState {
   // Per-session activity (busy/idle/error) and pending permissions are kept for
   // ALL sessions so the sidebar/chat can surface status without opening them.
   activity: Record<string, string>;
+  // Per-session agent name (most recent assistant turn) for ALL sessions, so the
+  // tree can render per-agent chips on a cold tree before any session is opened.
+  lastAgents: Record<string, string>;
   permissions: Record<string, Record<string, Permission>>;
   questions: Record<string, Record<string, Question>>;
   // Per-session agent todo list (OpenCode TodoWrite), kept for all sessions so
@@ -75,6 +88,7 @@ export const [state, setState] = createStore<SyncState>({
   sessions: loadSessions(initialDir),
   messages: {},
   activity: loadActivity(initialDir),
+  lastAgents: loadLastAgents(initialDir),
   permissions: {},
   questions: {},
   todos: {},
@@ -116,5 +130,6 @@ export function persist() {
     saveVersioned(lsSessions(dir), 1, state.sessions);
     saveVersioned(lsCursor(dir), 1, state.cursor);
     saveVersioned(lsActivity(dir), 1, state.activity);
+    saveVersioned(lsLastAgents(dir), 1, state.lastAgents);
   }, 250);
 }

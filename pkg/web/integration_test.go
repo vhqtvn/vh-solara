@@ -294,12 +294,16 @@ func TestLazyHydration(t *testing.T) {
 	go agg.Run(ctx)
 	waitFor(t, func() bool { return len(agg.Store().Snapshot(map[string]bool{}).Sessions) == 2 }, "hydrate 2 sessions")
 
-	// At startup, no per-session message endpoint should have been hit.
-	fake.mu.Lock()
-	total := fake.msgGets["a"] + fake.msgGets["b"]
-	fake.mu.Unlock()
-	if total != 0 {
-		t.Fatalf("expected 0 message fetches at startup (lazy), got %d", total)
+	// At startup, no session's FULL message history is hydrated — the aggregator
+	// fetches only a lightweight message tail per session (to seed lastAgent for
+	// the tree's per-agent chips on a cold tree), never the full transcript. The
+	// lazy contract is "full transcripts load on open", which the tree-only
+	// snapshot confirms: its Messages map is empty.
+	if agg.Store().IsMessagesLoaded("a") || agg.Store().IsMessagesLoaded("b") {
+		t.Fatal("startup must not fully hydrate any session's messages (lazy)")
+	}
+	if got := len(agg.Store().Snapshot(map[string]bool{}).Messages); got != 0 {
+		t.Fatalf("tree-only snapshot must carry no full transcripts, got %d sessions", got)
 	}
 
 	srv, err := NewServer(agg, ocSrv.URL, 1000)
@@ -323,14 +327,15 @@ func TestLazyHydration(t *testing.T) {
 		t.Fatalf("expected a's 1 message after open, got %d", len(snap.Messages["a"]))
 	}
 
-	fake.mu.Lock()
-	ga, gb := fake.msgGets["a"], fake.msgGets["b"]
-	fake.mu.Unlock()
-	if ga != 1 {
-		t.Fatalf("expected exactly 1 fetch for 'a', got %d", ga)
+	// Opening "a" fully hydrates only a; "b" stays lazy (never opened). The raw
+	// fetch count is no longer the invariant (a lightweight tail is fetched per
+	// session at startup for lastAgent chips); the invariant is which sessions
+	// have their FULL transcript loaded.
+	if !agg.Store().IsMessagesLoaded("a") {
+		t.Fatal("opening 'a' must fully hydrate its messages")
 	}
-	if gb != 0 {
-		t.Fatalf("expected 0 fetches for unopened 'b', got %d", gb)
+	if agg.Store().IsMessagesLoaded("b") {
+		t.Fatal("'b' must remain un-hydrated (never opened)")
 	}
 }
 

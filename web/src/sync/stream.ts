@@ -26,6 +26,7 @@ function applySnapshot(snap: Snapshot) {
       s.sessions = {};
       for (const sess of snap.sessions || []) s.sessions[sess.id] = sess;
       s.activity = { ...(snap.activity || {}) };
+      s.lastAgents = { ...(snap.lastAgents || {}) };
       s.permissions = {};
       for (const [sid, perms] of Object.entries(snap.permissions || {})) {
         s.permissions[sid] = {};
