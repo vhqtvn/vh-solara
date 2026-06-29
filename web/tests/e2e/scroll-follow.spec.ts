@@ -2,9 +2,9 @@ import { expect, test } from "@playwright/test";
 
 // Regression guard for the "↓ Latest" scroll-to-bottom button in ChatView.
 //
-// The button (<button class="jump">) renders via `<Show when={!following()}>`
+// The button (<button class="jump">) renders via `<Show when={!following() && !focusMode() && messages().length > 0 && !isChild()}>`
 // once the user scrolls away from the live tail; the complementary ".chat-live"
-// Live pill renders via `<Show when={following() && !props.draft}>` while glued
+// Live pill renders via `<Show when={following() && !focusMode() && messages().length > 0 && !isChild()}>` while glued
 // to the tail. The two are mutually exclusive and share the same anchor spot
 // (bottom:76px, centered) inside `.chat`.
 //

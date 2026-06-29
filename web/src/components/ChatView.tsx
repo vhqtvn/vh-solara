@@ -1392,7 +1392,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
           is measured from the scroll-area bottom — the pill sits just above where
           the composer begins, never on the textarea. See .jump/.chat-live styles.
         */}
-        <Show when={following() && !props.draft && !focusMode() && messages().length > 0 && !isChild()}>
+        <Show when={following() && !focusMode() && messages().length > 0 && !isChild()}>
           <div class="chat-live" role="status" aria-label="Following latest">
             <span class="chat-live-dot" aria-hidden="true" />
             <span class="chat-live-text">Live</span>
