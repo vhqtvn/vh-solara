@@ -18,7 +18,7 @@
      stacking is intentional instead of a pile of magic numbers. (Small, local
      z-indexes inside a component's own stacking context — resize handles, sticky
      table headers — stay as raw 2/3/6 and don't participate here.) */
-  --z-jump: 45;          /* "↓ Latest" / "Live" pill — above the composer (40): a squeezed .chat-main can make the pill overflow downward over the composer/status (see .jump clamp) */
+  --z-jump: 46;          /* "↓ Latest" / "Live" pill — above the composer (40) and the tasks popover (45): a squeezed .chat-main can make the pill overflow downward over the composer/status (see .jump clamp); DOM order would resolve any tie anyway (the tasks popover is composer-anchored in a later subtree, so they don't co-occur spatially) */
   --z-composer: 40;      /* composer bar (textarea + actions) */
   --z-tasks: 45;         /* tasks popover anchored to the composer */
   --z-drawer: 48;        /* mobile off-canvas sidebar + its scrim (above content, below dialogs) */
