@@ -1,10 +1,10 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { cleanup, render, waitFor } from "@solidjs/testing-library";
+import { cleanup, fireEvent, render, waitFor } from "@solidjs/testing-library";
 import { reconcile } from "solid-js/store";
 import { setState, setSelectedIdRaw } from "../../src/sync/store";
 import type { Session } from "../../src/types";
-import SessionTree from "../../src/components/SessionTree";
+import SessionTree, { __resetTreeForTest } from "../../src/components/SessionTree";
 
 // The twisty glyph (collapse/expand marker on a parent row) must reflect whether
 // the node's subtree ACTUALLY has running work. The `filtered` mode is the
@@ -24,6 +24,12 @@ beforeEach(() => {
   // treeMode persists to localStorage; clear it so each test starts with the
   // default "filtered" mode for every node.
   localStorage.clear();
+  // The module-level treeMode/userToggled signals are initialized once at first
+  // import; localStorage.clear() above wipes their persisted backing store but
+  // NOT the in-memory signal, so reset them explicitly (after the clear, so
+  // loadModes() reads {} → all-default). prevWorking/didInit/prevSessionKeys
+  // are component-instance scoped and reset naturally per render().
+  __resetTreeForTest();
 });
 
 afterEach(() => cleanup());
@@ -147,5 +153,129 @@ describe("SessionTree auto-tidy init", () => {
     const rootTwisty = twistyFor(container as unknown as HTMLElement, "root");
     expect(rootTwisty.getAttribute("aria-label")).toBe("Subtree: temp (click to cycle)");
     expect(rootTwisty.querySelector(".twisty-temp")).not.toBeNull();
+  });
+});
+
+// A session that syncs in AFTER mount is missed by the one-shot init pass, and
+// the delta loops only collapse nodes they observed LEAVE the working set — so
+// an idle newcomer with the default `filtered` mode would sit open showing zero
+// children. The effect tracks seen session keys (prevSessionKeys) and collapses
+// newly-arrived idle filtered nodes on later runs.
+
+describe("SessionTree auto-tidy late arrival", () => {
+  it("collapses a newly-arrived idle filtered node that syncs in after mount", async () => {
+    // Mount with an unrelated session so the init pass has already run
+    // (didInit = true) before the newcomer arrives.
+    putSession({ id: "seed", title: "Seed" });
+
+    const { container } = render(() => <SessionTree />);
+    // readMode("seed") === "collapsed" is the signal the init pass has fired.
+    await waitFor(() => expect(readMode("seed")).toBe("collapsed"));
+
+    // Now sync in a new idle parent + child — no persisted mode, subtree idle.
+    putSession({ id: "sX", title: "Late" });
+    putSession({ id: "sXc", title: "Late child", parentID: "sX", time: { updated: 1 } });
+
+    // The late-arrival pass collapses the idle filtered newcomer. Without it sX
+    // would stay in default `filtered` (its persisted/displayed mode never
+    // becoming "collapsed").
+    await waitFor(() => {
+      expect(readMode("sX")).toBe("collapsed");
+    });
+    const twisty = twistyFor(container as unknown as HTMLElement, "sX");
+    expect(twisty.getAttribute("aria-label")).toBe("Subtree: collapsed (click to cycle)");
+    // Collapsed: child hidden, no funnel (idle), plain chevron.
+    expect(container.querySelector('.tree-node[data-session-id="sXc"]')).toBeNull();
+    expect(twisty.querySelector(".twisty-running")).toBeNull();
+    expect(twisty.querySelector("span.open")).toBeNull();
+  });
+
+  it("keeps a newly-arrived busy node filtered so its running children stay visible", async () => {
+    putSession({ id: "seed", title: "Seed" });
+
+    const { container } = render(() => <SessionTree />);
+    await waitFor(() => expect(readMode("seed")).toBe("collapsed"));
+
+    // New parent with a BUSY child → parent enters the working set on arrival.
+    putSession({ id: "sX", title: "Late" });
+    putSession({ id: "sXc", title: "Late child", parentID: "sX", time: { updated: 1 } });
+    setState("activity", "sXc", "busy");
+
+    // sX is in the working set, so !w.has(id) is false → NOT collapsed; it
+    // stays filtered, revealing the running child.
+    await waitFor(() => {
+      expect(readMode("sX")).toBe("filtered");
+    });
+    const twisty = twistyFor(container as unknown as HTMLElement, "sX");
+    expect(twisty.getAttribute("aria-label")).toBe("Subtree: filtered (click to cycle)");
+    expect(container.querySelector('.tree-node[data-session-id="sXc"]')).not.toBeNull();
+    expect(twisty.querySelector(".twisty-running")).not.toBeNull();
+  });
+
+  it("reveals the active session's path as temp through a late-arriving collapsed ancestor", async () => {
+    putSession({ id: "seed", title: "Seed" });
+
+    const { container } = render(() => <SessionTree />);
+    await waitFor(() => expect(readMode("seed")).toBe("collapsed"));
+
+    // Active leaf arrives pointing at a parent that hasn't synced yet.
+    setSelectedIdRaw("leaf");
+    putSession({ id: "leaf", title: "Leaf", parentID: "late", time: { updated: 3 } });
+
+    // Now the idle ancestor arrives post-mount → collapsed by the late-arrival
+    // pass, yet display() must resolve it to `temp` so the active leaf stays
+    // reachable through it (same guarantee the init pass gives on-load cases).
+    putSession({ id: "late", title: "Late ancestor" });
+    await waitFor(() => expect(readMode("late")).toBe("collapsed"));
+
+    expect(container.querySelector('.tree-node[data-session-id="late"]')).not.toBeNull();
+    expect(container.querySelector('.tree-node[data-session-id="leaf"]')).not.toBeNull();
+    const lateTwisty = twistyFor(container as unknown as HTMLElement, "late");
+    expect(lateTwisty.getAttribute("aria-label")).toBe("Subtree: temp (click to cycle)");
+    expect(lateTwisty.querySelector(".twisty-temp")).not.toBeNull();
+  });
+});
+
+// Module-level treeMode/userToggled signals are shared across every render in
+// the suite. __resetTreeForTest() in beforeEach is what keeps cases isolated;
+// this pair regresses that: if the reset were removed, the dirtier's expanded
+// state would leak and the "fresh" case would see root start expanded. (Run
+// `npx vitest run --shuffle` twice to confirm no order dependence.)
+
+describe("SessionTree module-state isolation", () => {
+  it("dirties module state by expanding a node", async () => {
+    putSession({ id: "root", title: "Root" });
+    putSession({ id: "child", title: "Child", parentID: "root", time: { updated: 1 } });
+
+    const { container } = render(() => <SessionTree />);
+    const twisty = twistyFor(container as unknown as HTMLElement, "root");
+
+    // Init collapses the idle root first; then cycle collapsed → filtered →
+    // expanded via the twisty so treeMode holds {root: expanded} and
+    // userToggled holds {root}.
+    await waitFor(() => expect(readMode("root")).toBe("collapsed"));
+    await fireEvent.click(twisty);
+    await waitFor(() => expect(readMode("root")).toBe("filtered"));
+    await fireEvent.click(twisty);
+    await waitFor(() => expect(readMode("root")).toBe("expanded"));
+    expect(twisty.getAttribute("aria-label")).toBe("Subtree: expanded (click to cycle)");
+  });
+
+  it("starts a fresh node in the default collapsed state after a prior test expanded it", async () => {
+    putSession({ id: "root", title: "Root" });
+    putSession({ id: "child", title: "Child", parentID: "root", time: { updated: 1 } });
+
+    const { container } = render(() => <SessionTree />);
+    const twisty = twistyFor(container as unknown as HTMLElement, "root");
+
+    // __resetTreeForTest() (called in beforeEach, AFTER localStorage.clear)
+    // resets the module signals to defaults, so the init pass collapses the
+    // idle root as on a cold load. Without the reset, treeMode()["root"] would
+    // still be "expanded" from the dirtier above: readMode would stick at
+    // "filtered" (init won't re-collapse an already-non-filtered leaked node,
+    // and localStorage was cleared) and root would render expanded.
+    await waitFor(() => expect(readMode("root")).toBe("collapsed"));
+    expect(twisty.getAttribute("aria-label")).toBe("Subtree: collapsed (click to cycle)");
+    expect(container.querySelector('.tree-node[data-session-id="child"]')).toBeNull();
   });
 });

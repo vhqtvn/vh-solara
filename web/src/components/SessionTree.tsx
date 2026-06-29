@@ -55,6 +55,17 @@ const modeOf = (id: string): TreeMode => treeMode()[id] || "filtered";
 // changes).
 const [userToggled, setUserToggled] = createSignal<Set<string>>(new Set());
 
+// Test-only: reset the module-level signals so test cases don't leak state.
+// treeMode/userToggled are initialized once at first import; localStorage.clear()
+// wipes the persisted backing store but NOT the in-memory signal, so without this
+// a prior test's persisted/toggled entries survive into the next render.
+// Component-instance state (prevWorking/didInit/prevSessionKeys) is fresh per
+// render() and is intentionally not touched here.
+export function __resetTreeForTest() {
+  setTreeMode(loadModes());
+  setUserToggled(new Set<string>());
+}
+
 function persist(next: Record<string, TreeMode>) {
   saveVersioned(LS_MODE, 1, next);
   setTreeMode(next);
@@ -394,6 +405,12 @@ export default function SessionTree() {
   // to filtered (surfaces the active work); a filtered node that goes idle
   // collapses (nothing left to show). Expanded nodes are left alone.
   let prevWorking = new Set<string>();
+  // Session keys seen on the previous effect run. The init pass is one-shot, so
+  // a session syncing in AFTER mount (didInit already true) in an idle +
+  // default-filtered state isn't caught by the delta loops (they only collapse
+  // nodes they observed LEAVE the working set). Tracking seen keys lets a later
+  // run collapse only the NEWLY-arrived idle filtered newcomers.
+  let prevSessionKeys = new Set<string>();
   // One-shot init: the delta logic below only collapses a filtered node when it
   // SEES it leave the working set — but prevWorking starts empty, so a node
   // whose mode is the default `filtered` and whose subtree finished BEFORE this
@@ -406,23 +423,47 @@ export default function SessionTree() {
   createEffect(() => {
     const w = working();
     // Read current modes (so a concurrent manual toggle isn't clobbered). The
-    // prevWorking guard makes a re-run from our own persist a no-op, so this
-    // can't loop.
+    // prevWorking guard makes a re-run from our own persist a no-op, so the
+    // delta passes below can't loop; the late-arrival pass is likewise guarded
+    // by prevSessionKeys (newcomers are folded into it the same run they're
+    // collapsed). Reading allKeys unconditionally also keeps the effect
+    // subscribed to the session key set after init, so a post-mount arrival
+    // actually re-runs this effect.
     const modes = treeMode();
     const next = { ...modes };
     let changed = false;
+    const allKeys = Object.keys(state.sessions);
+    const currentKeys = new Set(allKeys);
     if (!didInit) {
       // First mount: collapse default/persisted `filtered` nodes whose subtree
       // has no running work. Reads `next` (== modes at this point) so it stays
       // consistent with the delta pass below and shares the single persist().
-      for (const id of Object.keys(state.sessions)) {
+      for (const id of allKeys) {
         if ((next[id] ?? "filtered") === "filtered" && !w.has(id)) {
           next[id] = "collapsed";
           changed = true;
         }
       }
       didInit = true;
+    } else {
+      // Post-mount late arrival: the init pass is one-shot, but a session that
+      // syncs in AFTER mount in an idle + default-`filtered` state would
+      // otherwise sit open showing zero children — the delta loops only
+      // collapse nodes they observed LEAVE the working set, and a newcomer was
+      // never in prevWorking. Collapse only the NEWLY-arrived idle filtered
+      // nodes. A newly-arrived BUSY session is in `w`, so `!w.has(id)` is false
+      // and it stays filtered (running children visible). A late-arriving idle
+      // ancestor of the active session still reveals its path via `temp` —
+      // display() keys that off m !== "expanded", so a collapsed mode resolves
+      // (same guarantee the init pass relies on).
+      for (const id of allKeys) {
+        if (!prevSessionKeys.has(id) && (next[id] ?? "filtered") === "filtered" && !w.has(id)) {
+          next[id] = "collapsed";
+          changed = true;
+        }
+      }
     }
+    prevSessionKeys = currentKeys;
     for (const id of w) {
       if (!prevWorking.has(id) && (modes[id] ?? "filtered") === "collapsed") {
         next[id] = "filtered";
