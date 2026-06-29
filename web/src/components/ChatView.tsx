@@ -703,7 +703,19 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   onMount(() => {
     measureNavCap();
     if (!scrollEl) return;
-    const ro = new ResizeObserver(() => measureNavCap());
+    const ro = new ResizeObserver(() => {
+      measureNavCap();
+      // Viewport resized (window resize, mobile keyboard toggle, layout shift).
+      // When following, re-glue to the bottom: a viewport SHRINK leaves scrollTop
+      // unchanged while the bottom edge (scrollHeight - clientHeight) moves down,
+      // so without this we'd sit "Live" but not actually at the tail — no scroll
+      // event fires on a shrink (no clamp), so onScrolled never runs to correct it
+      // and the contentEl RO doesn't fire (content height unchanged). A viewport
+      // GROW self-corrects via the clamp scroll event, but re-pinning there too is
+      // harmless and cheaper than special-casing. Gated on ready() so initial
+      // scroll-restore (maybeRestore) owns positioning until it completes.
+      if (following() && ready()) pin();
+    });
     ro.observe(scrollEl);
     onCleanup(() => ro.disconnect());
   });

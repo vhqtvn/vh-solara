@@ -413,3 +413,87 @@ test("a content shrink while Live keeps following (no false user-scroll-up)", as
   await expect(page.locator(".chat-live")).toBeVisible({ timeout: 3000 });
   await expect(page.locator("button.jump")).toHaveCount(0);
 });
+
+// (8) Regression: a VIEWPORT shrink while Live (following=true, glued to the tail)
+//     must re-glue to the new bottom — the tail must not drift up off-screen while
+//     the Live pill still claims we're following. Distinct from (7): (7) exercises
+//     the contentEl ResizeObserver (a CONTENT height change); this exercises the
+//     scrollEl ResizeObserver (a VIEWPORT height change with content unchanged).
+//
+// Root cause this guards: while Live, `following` is true and the viewport sits at
+// the bottom edge (scrollTop ≈ scrollHeight - clientHeight). When the VIEWPORT
+// shrinks (mobile keyboard appearing, window/console resize, layout shift),
+// clientHeight drops, so the bottom edge (scrollHeight - clientHeight) moves DOWN
+// — but scrollTop is unchanged (a shrink does NOT clamp, since the new max is
+// LARGER, so NO scroll event fires) and scrollHeight is unchanged (content didn't
+// change, so the contentEl ResizeObserver doesn't fire either). Result: following
+// stays true, the Live pill stays visible, but the viewport is now stale — sitting
+// above the new bottom — and nothing re-glues it. (A viewport GROW is the inverse:
+// the new max is smaller, the browser DOES clamp scrollTop down → a scroll event
+// fires → onScrolled → nearBottom() → stays following; only the SHRINK is broken.)
+//
+// The fix lives in the EXISTING scrollEl ResizeObserver (the one that already
+// tracks measureNavCap): it fires exactly on this viewport resize, and now also
+// re-pins to the bottom while following (gated on ready() so initial scroll-restore
+// via maybeRestore owns positioning until it completes).
+//
+// Reproduction: load at a TALL viewport (400×600) so .chat-main has room to shrink
+// into, glue to the tail deterministically (scroll to bottom — same pattern as
+// tests 5–7, avoids the detach-prone openDemo click), then SHRINK to 400×320 (the
+// VP the rest of the suite uses; .chat-main drops from ~348px to ~68px — a ~280px
+// shrink that definitely fires the scrollEl RO and moves the bottom edge well past
+// the 24px nearBottom threshold). We assert the GEOMETRY is at the bottom, NOT just
+// the Live pill: following is never re-evaluated on a shrink (no scroll event), so
+// the pill stays visible even under the bug — the geometry check is the only thing
+// that catches it. Then we grow back and re-assert to confirm the resize round-trip.
+test("a viewport shrink while Live re-glues to the tail", async ({ page }) => {
+  // Start TALL so .chat-main has room to shrink into. At 400×600 .chat-main is
+  // ~348px (the non-scroll chrome — header/.chat-status/.composer-wrap — eats the
+  // rest); the demo transcript (scrollHeight ~1450) still overflows at this size.
+  await page.setViewportSize({ width: VP.width, height: 600 });
+  await page.goto("/?session=demo");
+  await expect(page.locator(".msg").first()).toBeVisible({ timeout: 10000 });
+
+  // Glue to the tail deterministically (app's onScrolled sets following=true near
+  // the bottom) — same end state as openDemo, no detach-prone click.
+  await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
+    el.scrollTop = el.scrollHeight;
+  });
+  await expect(page.locator(".chat-live")).toBeVisible({ timeout: 5000 });
+  await expect(page.locator("button.jump")).toHaveCount(0);
+
+  // SHRINK the viewport to VP (400×320): .chat-main drops ~280px, so the bottom
+  // edge (scrollHeight - clientHeight) moves DOWN ~280px while scrollTop is
+  // unchanged (no clamp on a shrink → no scroll event → onScrolled never runs).
+  // Simulates the mobile-keyboard-up / console-resize shrink.
+  await page.setViewportSize(VP);
+
+  // The fix: the scrollEl ResizeObserver fired and re-pinned to the new bottom
+  // while following. Poll because the RO fires on a later frame. This GEOMETRY
+  // assertion is what catches the bug — without the fix scrollTop is stale ~280px
+  // above the new bottom, but the Live pill stays visible (following never
+  // re-evaluated), so a pill-only check would pass under the bug.
+  await expect.poll(
+    async () =>
+      page.locator(".chat-scroll").evaluate((e: HTMLElement) =>
+        e.scrollHeight - e.scrollTop - e.clientHeight < 24 ? 1 : 0,
+      ),
+    { timeout: 3000 },
+  ).toBe(1);
+  await expect(page.locator(".chat-live")).toBeVisible({ timeout: 3000 });
+  await expect(page.locator("button.jump")).toHaveCount(0);
+
+  // Grow back to the tall size and re-assert glued to the tail. (A grow
+  // self-corrects via the clamp scroll event in any case, but this confirms the
+  // end-to-end resize round-trip leaves us following at the bottom.)
+  await page.setViewportSize({ width: VP.width, height: 600 });
+  await expect.poll(
+    async () =>
+      page.locator(".chat-scroll").evaluate((e: HTMLElement) =>
+        e.scrollHeight - e.scrollTop - e.clientHeight < 24 ? 1 : 0,
+      ),
+    { timeout: 3000 },
+  ).toBe(1);
+  await expect(page.locator(".chat-live")).toBeVisible({ timeout: 3000 });
+  await expect(page.locator("button.jump")).toHaveCount(0);
+});
