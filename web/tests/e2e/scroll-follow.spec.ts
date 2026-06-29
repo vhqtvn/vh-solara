@@ -6,7 +6,7 @@ import { expect, test } from "@playwright/test";
 // once the user scrolls away from the live tail; the complementary ".chat-live"
 // Live pill renders via `<Show when={following() && !focusMode() && messages().length > 0 && !isChild()}>` while glued
 // to the tail. The two are mutually exclusive and share the same anchor spot
-// (bottom:76px, centered) inside `.chat`.
+// (bottom:8px, centered) inside `.chat-main` (the scroll viewport).
 //
 // This regression has re-broken before. The most recent failure was NOT a logic
 // bug — `following()` flipped to false correctly and the button rendered — but
@@ -146,8 +146,8 @@ test("mid-stream scroll up still surfaces the Latest button", async ({ page }) =
 //
 // Why: in focus mode the composer fills the whole `.chat` card
 // (`.composer.focus` is position:absolute; inset:0; z-index:30), but
-// `.chat-live` and `.jump` are anchored at bottom:76px inside `.chat` — that
-// anchor was calibrated for the normal (short) composer height. Left ungated,
+// `.chat-live` and `.jump` sit just inside the bottom edge of the scroll
+// viewport (bottom:8px inside `.chat-main`, above the composer). Left ungated,
 // the pill/button float over and paint onto the full-card textarea. The `<Show>`
 // gates now also check `!focusMode()`, suppressing both cues while the expanded
 // composer is up (semantically correct: they're tail/scroll cues that are
