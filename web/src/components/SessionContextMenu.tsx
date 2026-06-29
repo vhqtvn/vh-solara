@@ -1,4 +1,4 @@
-import { createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
+import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { abortSession, sessionWorking, state } from "../sync";
 import { suggestTitle } from "../sessionTitle";
 import { isPinned, togglePin } from "../sidebar";
@@ -54,14 +54,44 @@ export default function SessionContextMenu() {
   onMount(() => document.addEventListener("keydown", onKey));
   onCleanup(() => document.removeEventListener("keydown", onKey));
 
-  // Clamp a positioned menu inside the viewport (≈240×300 menu box). On a short
-  // screen the top pins to 8 and the menu scrolls (max-height in styles.css).
+  // Clamp a positioned menu inside the viewport. The vertical clamp uses the
+  // menu's MEASURED height (not a magic constant), so a right-click near the
+  // bottom of a long session list no longer clips the lower items (Copy grid,
+  // Archive…). On a screen shorter than the menu, the top pins to 8 and the
+  // menu scrolls internally (max-height in styles.css). The 240 is a stable
+  // approximation of the menu width (min-width: 232px); the menu's height is
+  // what actually varies, so only that is measured.
+  const MENU_FALLBACK_H = 320;
+  let menuEl: HTMLDivElement | undefined;
+  const [measuredH, setMeasuredH] = createSignal(MENU_FALLBACK_H);
+
   const pos = createMemo(() => {
     const t = menuTarget();
     if (!t || t.x == null || t.y == null) return null;
     const x = Math.min(t.x, window.innerWidth - 240);
-    const y = Math.min(t.y, window.innerHeight - 300);
+    const y = Math.min(t.y, window.innerHeight - measuredH() - 8);
     return { x: Math.max(8, x), y: Math.max(8, y) };
+  });
+
+  // After the positioned menu mounts, measure its real height and re-clamp via
+  // pos(). pos() is null while the menu is closed (or in touch/long-press mode),
+  // so we reset to the fallback then — a future open starts from the safe
+  // default rather than a value measured under a different viewport size. The
+  // measure runs after one requestAnimationFrame so layout has settled; a single
+  // 1-frame position correction may show on open, which is acceptable. Re-measure
+  // on viewport resize while the menu is open.
+  const remeasure = () => menuEl && setMeasuredH(menuEl.offsetHeight);
+  createEffect(() => {
+    if (!pos()) {
+      setMeasuredH(MENU_FALLBACK_H);
+      return;
+    }
+    const raf = requestAnimationFrame(remeasure);
+    window.addEventListener("resize", remeasure);
+    onCleanup(() => {
+      cancelAnimationFrame(raf);
+      window.removeEventListener("resize", remeasure);
+    });
   });
 
   const related = createMemo(() => {
@@ -174,6 +204,7 @@ export default function SessionContextMenu() {
         <div class="ctxm-scrim" onClick={closeSessionMenu} onContextMenu={(e) => (e.preventDefault(), closeSessionMenu())}>
           <div
             class="ctxm-menu"
+            ref={menuEl}
             role="menu"
             style={{ left: `${pos()!.x}px`, top: `${pos()!.y}px` }}
             onClick={(e) => e.stopPropagation()}
