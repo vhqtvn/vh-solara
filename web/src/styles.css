@@ -18,7 +18,7 @@
      stacking is intentional instead of a pile of magic numbers. (Small, local
      z-indexes inside a component's own stacking context — resize handles, sticky
      table headers — stay as raw 2/3/6 and don't participate here.) */
-  --z-jump: 30;          /* "↓ Latest" / "Live" pill, overlaid on the chat scroll area */
+  --z-jump: 45;          /* "↓ Latest" / "Live" pill — above the composer (40): a squeezed .chat-main can make the pill overflow downward over the composer/status (see .jump clamp) */
   --z-composer: 40;      /* composer bar (textarea + actions) */
   --z-tasks: 45;         /* tasks popover anchored to the composer */
   --z-drawer: 48;        /* mobile off-canvas sidebar + its scrim (above content, below dialogs) */
@@ -1400,13 +1400,25 @@ body {
 
 .jump {
   position: absolute;
-  bottom: 8px;
+  /* Clamp the bottom offset so the pill can never overflow .chat-main's TOP edge.
+     .chat-main (the scroll viewport) is squeezed to ~68px at a 400×320 viewport —
+     header + .chat-status + .composer-wrap eat the rest of .chat — and at smaller
+     heights a plain bottom:8px would push this ~31px pill UP out of .chat-main and
+     over the header, where the header's Code button (button.icon-btn[aria-label=Code],
+     center ~y=24) occludes it and Playwright can never click it (it retries until the
+     30s budget is gone — the scroll-follow e2e failures). min(8px, calc(100% - 40px))
+     keeps bottom:8px while .chat-main is tall, but once .chat-main shrinks below
+     ~48px it caps the pill to sit ~9px inside .chat-main's top (40px ≈ pill height +
+     safety), so the pill overflows DOWN over .chat-status instead of UP over the
+     header. .chat-main's top always sits at the header's bottom, so the pill is
+     structurally barred from the header band at any viewport. */
+  bottom: min(8px, calc(100% - 40px));
   left: 50%;
   transform: translateX(-50%);
-  /* Anchored inside .chat-main (the scroll viewport), so this is 8px above the
-     scroll-area bottom — i.e. just above where the composer begins. The composer
-     is a sibling OUTSIDE .chat-main, so there's no z-fight with it; this z-index
-     only needs to clear .chat-scroll's own content (messages/tool outputs). */
+  /* z-index above the composer (see --z-jump): anchored inside .chat-main (the scroll
+     viewport), 8px above its bottom edge. The clamp above can make the pill overflow
+     DOWNWARD over .chat-status/.composer at tiny viewports, so it must paint above the
+     composer to stay clickable; it stays below dialogs/overlays. */
   z-index: var(--z-jump);
   background: var(--accent);
   color: var(--accent-fg);
@@ -1432,7 +1444,12 @@ body {
    header via position:absolute. */
 .chat-live {
   position: absolute;
-  bottom: 8px;
+  /* Same header-overflow clamp as .jump (see .jump comment): at tiny viewports where
+     .chat-main is squeezed below the pill, plain bottom:8px would push this UP over
+     the header. min(8px, calc(100% - 40px)) keeps it inside .chat-main, overflowing
+     down over .chat-status instead. The two states are mutually exclusive, so they
+     share the 40px constant; .chat-live (~22px) just sits a touch lower when clamped. */
+  bottom: min(8px, calc(100% - 40px));
   left: 50%;
   transform: translateX(-50%);
   z-index: var(--z-jump); /* same anchor spot as .jump (mutually exclusive states) */
