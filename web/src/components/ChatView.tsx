@@ -1375,32 +1375,36 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
             </Show>
           </div>
         </Show>
+        {/*
+          Local "following latest" cue (slice b). The only tail-anchored signal
+          used to be the ABSENCE of the "↓ Latest" button. This adds a subtle
+          positive indicator when the viewport is live-anchored to the tail.
+          `following` is per-device (NOT synced), so this is a purely local cue.
+          It's the complement of the jump button below: following() shows the live
+          indicator; !following() shows "↓ Latest" — the two never render together,
+          so they share the same anchor spot without conflict. Gated off drafts (a
+          draft has no transcript to be "live" on). GPU-cheap: a tiny static pill
+          with a slow opacity/scale pulse on a 7px dot only (no backdrop-filter,
+          mask-image, or per-element contain/content-visibility — see AGENTS.md).
+
+          Anchor: these are children of .chat-main (the scroll viewport), not of
+          .chat (the whole column incl. the composer), so position:absolute bottom
+          is measured from the scroll-area bottom — the pill sits just above where
+          the composer begins, never on the textarea. See .jump/.chat-live styles.
+        */}
+        <Show when={following() && !props.draft && !focusMode() && messages().length > 0 && !isChild()}>
+          <div class="chat-live" role="status" aria-label="Following latest">
+            <span class="chat-live-dot" aria-hidden="true" />
+            <span class="chat-live-text">Live</span>
+          </div>
+        </Show>
+
+        <Show when={!following() && !focusMode() && messages().length > 0 && !isChild()}>
+          <button type="button" class="jump" onClick={jumpToLatest}>
+            <Icon name="arrowDown" size={14} /> Latest
+          </button>
+        </Show>
       </div>
-      </Show>
-
-      {/*
-        Local "following latest" cue (slice b). The only tail-anchored signal
-        used to be the ABSENCE of the "↓ Latest" button. This adds a subtle
-        positive indicator when the viewport is live-anchored to the tail.
-        `following` is per-device (NOT synced), so this is a purely local cue.
-        It's the complement of the jump button below: following() shows the live
-        indicator; !following() shows "↓ Latest" — the two never render together,
-        so they share the same anchor spot without conflict. Gated off drafts (a
-        draft has no transcript to be "live" on). GPU-cheap: a tiny static pill
-        with a slow opacity/scale pulse on a 7px dot only (no backdrop-filter,
-        mask-image, or per-element contain/content-visibility — see AGENTS.md).
-      */}
-      <Show when={following() && !props.draft && !focusMode()}>
-        <div class="chat-live" role="status" aria-label="Following latest">
-          <span class="chat-live-dot" aria-hidden="true" />
-          <span class="chat-live-text">Live</span>
-        </div>
-      </Show>
-
-      <Show when={!following() && !focusMode()}>
-        <button type="button" class="jump" onClick={jumpToLatest}>
-          <Icon name="arrowDown" size={14} /> Latest
-        </button>
       </Show>
 
       <Show when={pendingQuestions().length > 0}>
