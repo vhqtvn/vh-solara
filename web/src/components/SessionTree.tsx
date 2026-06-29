@@ -259,7 +259,11 @@ function Node(props: {
             {/* expanded=chevron-down, collapsed=chevron-right (rotated),
                 filtered=funnel, temp=eye. */}
             <Switch>
-              <Match when={display() === "filtered"}>
+              {/* The funnel marks a `filtered` node ONLY while its subtree has
+                  live work. An idle filtered node (the default mode for every
+                  untouched parent) renders the ordinary chevron below — otherwise
+                  it would pulse forever even with nothing running underneath. */}
+              <Match when={display() === "filtered" && (busy() || runCount() > 0)}>
                 <span class="twisty-running"><Icon name="filter" size={12} /></span>
               </Match>
               <Match when={display() === "temp"}>
@@ -390,6 +394,15 @@ export default function SessionTree() {
   // to filtered (surfaces the active work); a filtered node that goes idle
   // collapses (nothing left to show). Expanded nodes are left alone.
   let prevWorking = new Set<string>();
+  // One-shot init: the delta logic below only collapses a filtered node when it
+  // SEES it leave the working set — but prevWorking starts empty, so a node
+  // whose mode is the default `filtered` and whose subtree finished BEFORE this
+  // mount is never caught (it sits in `filtered` showing zero children). On the
+  // first run we collapse every filtered node that isn't in the working set.
+  // This is once-only; later start/stop transitions are the delta logic's job.
+  // (An ancestor of the active session still reveals its path via `temp` —
+  // display() keys that off m !== "expanded", so a collapsed mode resolves too.)
+  let didInit = false;
   createEffect(() => {
     const w = working();
     // Read current modes (so a concurrent manual toggle isn't clobbered). The
@@ -398,6 +411,18 @@ export default function SessionTree() {
     const modes = treeMode();
     const next = { ...modes };
     let changed = false;
+    if (!didInit) {
+      // First mount: collapse default/persisted `filtered` nodes whose subtree
+      // has no running work. Reads `next` (== modes at this point) so it stays
+      // consistent with the delta pass below and shares the single persist().
+      for (const id of Object.keys(state.sessions)) {
+        if ((next[id] ?? "filtered") === "filtered" && !w.has(id)) {
+          next[id] = "collapsed";
+          changed = true;
+        }
+      }
+      didInit = true;
+    }
     for (const id of w) {
       if (!prevWorking.has(id) && (modes[id] ?? "filtered") === "collapsed") {
         next[id] = "filtered";
