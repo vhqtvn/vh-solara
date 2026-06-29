@@ -453,10 +453,16 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // each streamed pin fires a scroll event that re-runs nearBottom/ack/navigator
   // every frame (a feedback loop that burned CPU during streaming).
   let pinnedTop = -1;
+  // Content height captured at the last pin(). Companion to pinnedTop: a shrink
+  // (reasoning/tool block collapsing on de-tail, or the raw→rendered-HTML swap
+  // landing shorter) clamps scrollTop below pinnedTop with NO user intent — the
+  // RO re-pin guard must distinguish that from a real user scroll-up.
+  let pinnedScrollHeight = -1;
   function pin() {
     if (!scrollEl) return;
     scrollEl.scrollTop = scrollEl.scrollHeight;
     pinnedTop = scrollEl.scrollTop; // clamped value the scroll event will report
+    pinnedScrollHeight = scrollEl.scrollHeight; // content size at pin time
   }
   function jumpToLatest() {
     setFollowing(true);
@@ -661,8 +667,22 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
         // pin (scrollTop >= pinnedTop). Otherwise they scrolled up — let that
         // win: drop following and do NOT pin. (pinnedTop starts at -1, and
         // scrollTop >= -1 always holds, so the very first pin is unaffected.)
-        if (scrollEl && scrollEl.scrollTop < pinnedTop) setFollowing(false);
-        else pin();
+        //
+        // BUT a content SHRINK also yields scrollTop < pinnedTop with no user
+        // intent: when content above/around the viewport shrinks, the browser
+        // clamps scrollTop down to the new (smaller) max bottom. Known triggers
+        // — a reasoning/thinking block collapsing the instant it stops being the
+        // tail (expanded only while tail, body up to 320px), a tool part
+        // collapsing on de-tail (same !!props.tail pattern), or the
+        // raw→rendered-HTML swap landing shorter than the raw stream. Those are
+        // layout changes we should FOLLOW, not abandon. So only treat the dip as
+        // user intent when content did NOT shrink since the last pin; otherwise
+        // re-pin to the new (smaller) bottom and keep following (Live preserved).
+        if (scrollEl) {
+          const shrank = pinnedScrollHeight > 0 && scrollEl.scrollHeight < pinnedScrollHeight;
+          if (scrollEl.scrollTop < pinnedTop && !shrank) setFollowing(false);
+          else pin();
+        }
       }
       clearTimeout(navDebounce);
       navDebounce = window.setTimeout(scheduleActiveTurn, 150);
@@ -691,9 +711,16 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // Scroll handling: track follow state, advance the read cursor (debounced),
   // and mark the session read (ack) when its bottom is reached.
   function onScrolled() {
-    // Our own pin() — not a user scroll. Skip the work; following/ack/navigator
-    // are already correct (we're glued to the bottom).
-    if (scrollEl && scrollEl.scrollTop === pinnedTop) return;
+    // Our own pin() while following — not a user scroll. Skip the work;
+    // following/ack/navigator are already correct (glued to the bottom).
+    // NOTE the && following(): a user who scrolled up (following=false) and then
+    // scrolls back to the bottom lands on the same scrollTop as the last pin (no
+    // new content since → scrollHeight unchanged → same clamp); we must NOT bail
+    // there or setFollowing(true) never runs and the Latest button never flips
+    // back to the Live pill. pinnedTop is only ever -1 or a bottom clamp (set in
+    // pin() after scrollTop=scrollHeight), so when following is false and
+    // scrollTop===pinnedTop, nearBottom() is necessarily true → safe to follow.
+    if (scrollEl && scrollEl.scrollTop === pinnedTop && following()) return;
     const atBottom = nearBottom();
     setFollowing(atBottom);
     if (!props.draft) {
@@ -1392,14 +1419,14 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
           is measured from the scroll-area bottom — the pill sits just above where
           the composer begins, never on the textarea. See .jump/.chat-live styles.
         */}
-        <Show when={following() && !focusMode() && messages().length > 0 && !isChild()}>
+        <Show when={following() && !focusMode() && messages().length > 0}>
           <div class="chat-live" role="status" aria-label="Following latest">
             <span class="chat-live-dot" aria-hidden="true" />
             <span class="chat-live-text">Live</span>
           </div>
         </Show>
 
-        <Show when={!following() && !focusMode() && messages().length > 0 && !isChild()}>
+        <Show when={!following() && !focusMode() && messages().length > 0}>
           <button type="button" class="jump" onClick={jumpToLatest}>
             <Icon name="arrowDown" size={14} /> Latest
           </button>

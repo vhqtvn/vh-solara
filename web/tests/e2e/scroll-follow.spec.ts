@@ -2,9 +2,9 @@ import { expect, test } from "@playwright/test";
 
 // Regression guard for the "↓ Latest" scroll-to-bottom button in ChatView.
 //
-// The button (<button class="jump">) renders via `<Show when={!following() && !focusMode() && messages().length > 0 && !isChild()}>`
+// The button (<button class="jump">) renders via `<Show when={!following() && !focusMode() && messages().length > 0}>`
 // once the user scrolls away from the live tail; the complementary ".chat-live"
-// Live pill renders via `<Show when={following() && !focusMode() && messages().length > 0 && !isChild()}>` while glued
+// Live pill renders via `<Show when={following() && !focusMode() && messages().length > 0}>` while glued
 // to the tail. The two are mutually exclusive and share the same anchor spot
 // (bottom:8px, centered) inside `.chat-main` (the scroll viewport).
 //
@@ -59,13 +59,20 @@ async function openDemo(page: import("@playwright/test").Page) {
   // the browser clamp scrollTop down, which the app's ResizeObserver re-pin
   // guard reads as "user scrolled up" and drops `following` — so the demo no
   // longer reliably loads glued to the tail. Rather than depend on that
-  // unrelated load behaviour, we explicitly re-glue (clicking "↓ Latest" only if
-  // the load landed away from the tail) so every case starts from a known tail.
-  // (The scroll-subsystem quirk itself is out of scope for this regression fix.)
-  await expect(page.locator("button.jump, .chat-live").first()).toBeVisible({ timeout: 5000 });
-  if (await page.locator("button.jump").count()) {
-    await page.locator("button.jump").click();
-  }
+  // unrelated load behaviour, we explicitly re-glue.
+  //
+  // We glue by scrolling to the bottom (the app's onScrolled sets following=true
+  // when near the bottom, mounting .chat-live) instead of clicking "↓ Latest".
+  // The click was a documented flaky spot: it had no timeout, so if a geometry
+  // regression ever made the button's click point occluded again (it has — by
+  // the header Code button at 400×320), the click retried until the whole 30s
+  // test budget was gone, failing every test that calls openDemo. The scroll is
+  // deterministic and detach-proof — same proven pattern test 5 below uses and
+  // chat-controls-gating.spec test 1. (The scroll-subsystem quirk itself is out
+  // of scope for this regression fix.)
+  await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
+    el.scrollTop = el.scrollHeight;
+  });
   await expect(page.locator(".chat-live")).toBeVisible({ timeout: 5000 });
 }
 
@@ -114,7 +121,10 @@ test("clicking Latest re-glues to the tail", async ({ page }) => {
   await setScrollTop(page, 0);
   const jump = page.locator("button.jump");
   await expect(jump).toBeVisible({ timeout: 3000 });
-  await jump.click();
+  // Short timeout: this is the one intentional .jump click left in the suite.
+  // If a future geometry regression makes it occluded again, fail fast here
+  // (5s) instead of burning the whole 30s test budget on click retries.
+  await jump.click({ timeout: 5000 });
   // Near-bottom again (within the 24px nearBottom threshold the app uses).
   const atBottom = await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
     return el.scrollHeight - el.scrollTop - el.clientHeight < 24;
@@ -202,4 +212,204 @@ test("focus mode hides both Live pill and Latest button", async ({ page }) => {
   await toggleFocus(page); // focus mode off — following still false (no scroll)
   // Reactivity: the Latest button reappears.
   await expect(page.locator("button.jump")).toBeVisible({ timeout: 3000 });
+});
+
+// (6) Regression: scrolling back to the bottom after scrolling up MUST flip the
+//     "↓ Latest" button back to the "Live" pill.
+//
+// The onScrolled self-pin guard bails when scrollEl.scrollTop === pinnedTop
+// (pinnedTop is the clamp the last programmatic pin() wrote, i.e. the bottom).
+// That bail is a perf optimization for our OWN pins while following — without
+// it, every streamed pin re-runs nearBottom/ack/navigator per frame. But the
+// bail used to fire even when following was FALSE: a user who scrolled up
+// (following=false → Latest button) and then scrolled back to the bottom landed
+// on the SAME scrollTop as the last pin (no new content since → scrollHeight
+// unchanged → same clamp), so onScrolled bailed before setFollowing(true) ran,
+// following stayed false, and the Live pill never came back — the Latest button
+// was stuck up forever. The guard now also requires `&& following()`, so it only
+// short-circuits the exact case it exists for (our own pin while glued).
+//
+// Reproduction avoids openDemo on purpose: openDemo's click-based re-glue is the
+// documented detach-prone flaky spot (see the focus-mode test NOTE above — the RO
+// re-pin guard can unmount button.jump mid-click and hang the 30s budget). We
+// instead glue deterministically by scrolling to the bottom, and we capture the
+// clamp value so the scroll-back lands on the EXACT scrollTop pin() wrote. The
+// demo transcript is small and static (no streaming), and Deferred rows mount
+// once and never unmount, so scrollHeight is stable and the clamp matches
+// pinnedTop on the way back down.
+test("scrolling back to the bottom flips Latest → Live", async ({ page }) => {
+  await page.setViewportSize(VP);
+  await page.goto("/?session=demo");
+  await expect(page.locator(".msg").first()).toBeVisible({ timeout: 10000 });
+
+  // Glue to the tail deterministically. The RO path pins while following=true,
+  // arming pinnedTop to this bottom clamp; capture it so the scroll-back below
+  // lands on the exact value pin() wrote.
+  const bottomClamp = await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
+    el.scrollTop = el.scrollHeight;
+    return el.scrollTop;
+  });
+  // following=true → Live pill up, Latest button absent.
+  await expect(page.locator(".chat-live")).toBeVisible({ timeout: 5000 });
+  await expect(page.locator("button.jump")).toHaveCount(0);
+
+  // Scroll away from the tail → following=false, Latest button appears, Live pill hides.
+  await setScrollTop(page, 0);
+  await expect(page.locator("button.jump")).toBeVisible({ timeout: 3000 });
+  await expect(page.locator(".chat-live")).toHaveCount(0);
+
+  // Scroll back to the EXACT clamp the last pin() wrote (== pinnedTop). The OLD
+  // guard bailed here with following still false; with the `&& following()` fix,
+  // onScrolled runs → nearBottom() true → setFollowing(true).
+  await setScrollTop(page, bottomClamp);
+  // Following flips true → Live pill reappears, Latest button hides.
+  await expect(page.locator(".chat-live")).toBeVisible({ timeout: 3000 });
+  await expect(page.locator("button.jump")).toHaveCount(0);
+});
+
+// (7) Regression: a transcript height SHRINK while Live (following=true, glued to
+//     the tail) must NOT drop `following`. The Live pill must persist and the
+//     Latest button must stay absent.
+//
+// Root cause this guards: the ResizeObserver re-pin guard in ChatView reads
+// `scrollTop < pinnedTop` as "the user scrolled up since our last pin → drop
+// following and let their position win" (the documented "↓ Latest" race fix).
+// But a content SHRINK also clamps `scrollTop` below `pinnedTop` with NO user
+// intent: when content above/around the viewport shrinks, the browser clamps
+// `scrollTop` down to the new (smaller) max bottom. The guard then wrongly set
+// `following=false`, refused to re-pin, and subsequent streaming content drifted
+// off-screen — Live was lost on a mere layout shrink.
+//
+// Real triggers: a reasoning/thinking block collapsing the instant it stops
+// being the tail (expanded only while tail — body up to 320px), a tool part
+// collapsing on de-tail (same `!!props.tail` pattern in Part.tsx), or the
+// raw→rendered-HTML swap landing shorter than the raw stream. All three shrink
+// `.chat-content` (the element the RO observes), so the guard sees the same
+// `scrollTop < pinnedTop` dip each time.
+//
+// WHY A GENERIC SHRINK (not a real reasoning→text de-tail stream): the fixture
+// backend (pkg/fixtures/opencode.go simulatePrompt/streamAssistant) ONLY streams
+// plain text parts — no reasoning part can ever become the streaming tail, so
+// the exact "thinking block expands as tail then collapses when text streams
+// below it" sequence cannot be driven through the fixture's prompt flow. A
+// deterministic DOM-driven shrink exercises the IDENTICAL code path the RO
+// callback + the guard at ChatView.tsx run for a real collapse: both reduce
+// `.chat-content`'s height, which is all the RO observes, without any
+// streaming-timing nondeterminism.
+//
+// WHY THE SHRINK IS GRADUAL (multi-frame), NOT a single discrete removal: the
+// real reasoning/tool collapse is a CSS grid TRANSITION (`.disclosure`
+// grid-template-rows: 1fr→0fr) that shrinks over multiple animation frames. A
+// single DISCRETE removal (e.g. `el.remove()` in one step) is VACUOUS here — its
+// ResizeObserver notification for that one step reads the PRE-clamp scrollTop
+// (still === pinnedTop), so `scrollTop < pinnedTop` is false, the guard takes
+// the else→pin() branch, pinnedTop stays correct, and even a pure shrink
+// self-heals via onScrolled (nearBottom after the clamp → setFollowing(true)).
+// The GRADUAL sequence matches the real transition's timing: on each intermediate
+// frame the browser clamps scrollTop in layout BEFORE the RO notification fires,
+// so the guard observes a POST-clamp `scrollTop < pinnedTop` on every step. With
+// the bug, that fired setFollowing(false) on each step (re-armed by onScrolled
+// while still at the bottom, so the break was hidden during the shrink) but pin()
+// NEVER ran, leaving pinnedTop STALE at the tall pre-shrink value. The very next
+// GROWTH frame then saw `scrollTop < stale-pinnedTop`, fired setFollowing(false)
+// WITHOUT pinning, and growth doesn't move scrollTop so no scroll event fired to
+// re-arm following — the viewport drifted off the tail and the Latest button
+// appeared. That grow-after-gradual-shrink is the precise failure mode this test
+// pins down, and it requires the multi-frame shrink to arm the stale pinnedTop.
+//
+// Like tests (5) and (6), this deliberately avoids openDemo()'s detach-prone
+// click-based re-glue (the documented flaky spot in this suite) and glues to the
+// tail deterministically by scrolling to the bottom.
+test("a content shrink while Live keeps following (no false user-scroll-up)", async ({ page }) => {
+  await page.setViewportSize(VP);
+  await page.goto("/?session=demo");
+  await expect(page.locator(".msg").first()).toBeVisible({ timeout: 10000 });
+
+  // Glue to the tail deterministically (app's onScrolled sets following=true near
+  // the bottom). This arms pinnedTop/pinnedScrollHeight to the current content
+  // via the RO's first pin(). Live pill up, Latest button absent.
+  await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
+    el.scrollTop = el.scrollHeight;
+  });
+  await expect(page.locator(".chat-live")).toBeVisible({ timeout: 5000 });
+  await expect(page.locator("button.jump")).toHaveCount(0);
+
+  // Append a tall block to .chat-content (the RO-observed element). The RO fires,
+  // following is true, so pin() re-glues to the new bottom and arms the tall
+  // pinnedScrollHeight we need for the subsequent shrink to register as `shrank`.
+  // Poll until the app has caught up (scrollTop is back within 24px of bottom).
+  await page.locator(".chat-content").evaluate((el: HTMLElement) => {
+    const t = document.createElement("div");
+    t.id = "__e2e_shrink_block";
+    t.style.height = "600px";
+    t.style.background = "transparent";
+    el.appendChild(t);
+  });
+  await expect.poll(
+    async () =>
+      page.locator(".chat-scroll").evaluate((e: HTMLElement) =>
+        e.scrollHeight - e.scrollTop - e.clientHeight < 24 ? 1 : 0,
+      ),
+    { timeout: 3000 },
+  ).toBe(1);
+  // STILL Live after the grow (sanity).
+  await expect(page.locator(".chat-live")).toBeVisible({ timeout: 3000 });
+  await expect(page.locator("button.jump")).toHaveCount(0);
+
+  // GRADUAL SHRINK over many frames — the essential reproduction. Step the
+  // injected block's height through [500,400,300,200,100,0], waiting 2 rAFs +
+  // 30ms between steps (matches the .disclosure grid-transition cadence). On
+  // each step the browser clamps scrollTop in layout before the RO fires, so the
+  // guard sees post-clamp `scrollTop < pinnedTop`. With the bug this set
+  // following=false every step (re-armed by onScrolled) but never ran pin(),
+  // leaving pinnedTop STALE at the tall pre-shrink value — which the growth
+  // below then exposes.
+  await page.locator("#__e2e_shrink_block").evaluate(
+    (el: HTMLElement) =>
+      new Promise<void>((resolve) => {
+        const steps = [500, 400, 300, 200, 100, 0];
+        let i = 0;
+        const tick = () => {
+          if (i >= steps.length) return resolve();
+          el.style.height = steps[i] + "px";
+          i++;
+          requestAnimationFrame(() =>
+            requestAnimationFrame(() => setTimeout(tick, 30)),
+          );
+        };
+        tick();
+      }),
+  );
+
+  // GROW, one frame at a time (append six 60px blocks, 2 rAFs + 30ms apart).
+  // With the bug: pinnedTop is stale (tall), so each growth frame's RO callback
+  // sees `scrollTop < pinnedTop` and sets following=false WITHOUT pinning; growth
+  // doesn't move scrollTop, so no scroll event fires to re-arm following → the
+  // viewport drifts off the tail and the Latest button appears. With the fix:
+  // pin() ran on the shrink frames, keeping pinnedTop tracking the smaller max,
+  // so growth is followed and Live persists.
+  await page.locator(".chat-content").evaluate(
+    (el: HTMLElement) =>
+      new Promise<void>((resolve) => {
+        let n = 0;
+        const tick = () => {
+          if (n >= 6) return resolve();
+          const d = document.createElement("div");
+          d.style.height = "60px";
+          d.style.background = "transparent";
+          el.appendChild(d);
+          n++;
+          requestAnimationFrame(() =>
+            requestAnimationFrame(() => setTimeout(tick, 30)),
+          );
+        };
+        tick();
+      }),
+  );
+
+  // The fix: following stayed true through shrink + growth. Live pill persists
+  // and the Latest button stays absent. (Under the bug: following dropped during
+  // the growth, .chat-live→0, button.jump→visible, failing here.)
+  await expect(page.locator(".chat-live")).toBeVisible({ timeout: 3000 });
+  await expect(page.locator("button.jump")).toHaveCount(0);
 });
