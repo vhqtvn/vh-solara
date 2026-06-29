@@ -16,5 +16,5 @@ Documents:
 
 Operational note:
 
-- Keep `opencode.jsonc` permissions synchronized via `.opencode/sys-scripts/update-opencode-config.js`.
-- Treat `COMMANDS`, `LOCATION_RULES`, `TASK_RULES`, and `CLUSTER_DEFS` in that script as the maintenance surface.
+- Keep `opencode.jsonc` permissions synchronized via `vh-agent-harness update` (Go-native emitter in `internal/permconfig/`).
+- Treat the permission tables in `internal/permconfig/tables.go` (core agents) or each overlay pack's `permission-pack.jsonc` (overlay agents) as the maintenance surface.

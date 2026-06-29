@@ -39,7 +39,7 @@
                     "git rev-parse *": "allow",
                     "git check-ignore *": "allow",
                     ".opencode/scripts/readonly-scripts.sh *": "allow",
-                    "vh-agent-harness *": "allow",
+                    "vh-agent-harness *": "allow"
                 },
                 "edit": "allow",
                 "skill": {
@@ -58,7 +58,7 @@
                     "docs-steward": "allow",
                     "debate": "allow",
                     "solution-brief": "allow",
-                    "releaser": "allow",
+                    "releaser": "allow"
                 },
                 "webfetch": "allow"
             },
@@ -110,12 +110,12 @@
                     ".opencode/scripts/commit-gate.sh release *": "deny",
                     ".opencode/scripts/commit-gate.sh heartbeat *": "deny",
                     ".opencode/scripts/commit-gate.sh stage-message *": "deny",
-                    "vh-agent-harness *": "allow",
+                    "vh-agent-harness *": "allow"
                 },
                 "edit": "deny",
                 "task": {
                     "*": "deny",
-                    "commit-reviewer": "allow",
+                    "commit-reviewer": "allow"
                 },
                 "webfetch": "deny"
             },
@@ -166,7 +166,7 @@
                     ".opencode/scripts/commit-gate.sh release *": "deny",
                     ".opencode/scripts/commit-gate.sh heartbeat *": "deny",
                     ".opencode/scripts/commit-gate.sh stage-message *": "deny",
-                    "vh-agent-harness *": "allow",
+                    "vh-agent-harness *": "allow"
                 },
                 "edit": "deny",
                 "task": {
@@ -174,7 +174,7 @@
                     "commit-reviewer-a": "allow",
                     "commit-reviewer-b": "allow",
                     "commit-reviewer-c": "allow",
-                    "commit-reviewer-d": "allow",
+                    "commit-reviewer-d": "allow"
                 },
                 "webfetch": "deny"
             },
@@ -182,17 +182,10 @@
         },
         "commit-reviewer-a": {
             "description": "Leaf A of commit-reviewer cluster",
-            "mode": "subagent",
             "hidden": true,
-            "prompt": "{file:.opencode/agents/commit-reviewer-a.md}",
+            "mode": "subagent",
             "model": "{file:./.local/config/agent-model/commit-reviewer-a}",
-            "temperature": 0.1,
             "permission": {
-                "edit": "deny",
-                "webfetch": "deny",
-                "task": {
-                    "*": "deny",
-                },
                 "bash": {
                     "*": "deny",
                     "jq *": "allow",
@@ -233,23 +226,23 @@
                     ".opencode/scripts/commit-gate.sh release *": "deny",
                     ".opencode/scripts/commit-gate.sh heartbeat *": "deny",
                     ".opencode/scripts/commit-gate.sh stage-message *": "deny",
-                    "vh-agent-harness *": "allow",
+                    "vh-agent-harness *": "allow"
                 },
+                "edit": "deny",
+                "task": {
+                    "*": "deny"
+                },
+                "webfetch": "deny"
             },
+            "prompt": "{file:.opencode/agents/commit-reviewer-a.md}",
+            "temperature": 0.1
         },
         "commit-reviewer-b": {
             "description": "Leaf B of commit-reviewer cluster",
-            "mode": "subagent",
             "hidden": true,
-            "prompt": "{file:.opencode/agents/commit-reviewer-b.md}",
+            "mode": "subagent",
             "model": "{file:./.local/config/agent-model/commit-reviewer-b}",
-            "temperature": 0.1,
             "permission": {
-                "edit": "deny",
-                "webfetch": "deny",
-                "task": {
-                    "*": "deny",
-                },
                 "bash": {
                     "*": "deny",
                     "jq *": "allow",
@@ -290,23 +283,23 @@
                     ".opencode/scripts/commit-gate.sh release *": "deny",
                     ".opencode/scripts/commit-gate.sh heartbeat *": "deny",
                     ".opencode/scripts/commit-gate.sh stage-message *": "deny",
-                    "vh-agent-harness *": "allow",
+                    "vh-agent-harness *": "allow"
                 },
+                "edit": "deny",
+                "task": {
+                    "*": "deny"
+                },
+                "webfetch": "deny"
             },
+            "prompt": "{file:.opencode/agents/commit-reviewer-b.md}",
+            "temperature": 0.1
         },
         "commit-reviewer-c": {
             "description": "Leaf C of commit-reviewer cluster",
-            "mode": "subagent",
             "hidden": true,
-            "prompt": "{file:.opencode/agents/commit-reviewer-c.md}",
+            "mode": "subagent",
             "model": "{file:./.local/config/agent-model/commit-reviewer-c}",
-            "temperature": 0.1,
             "permission": {
-                "edit": "deny",
-                "webfetch": "deny",
-                "task": {
-                    "*": "deny",
-                },
                 "bash": {
                     "*": "deny",
                     "jq *": "allow",
@@ -347,23 +340,23 @@
                     ".opencode/scripts/commit-gate.sh release *": "deny",
                     ".opencode/scripts/commit-gate.sh heartbeat *": "deny",
                     ".opencode/scripts/commit-gate.sh stage-message *": "deny",
-                    "vh-agent-harness *": "allow",
+                    "vh-agent-harness *": "allow"
                 },
+                "edit": "deny",
+                "task": {
+                    "*": "deny"
+                },
+                "webfetch": "deny"
             },
+            "prompt": "{file:.opencode/agents/commit-reviewer-c.md}",
+            "temperature": 0.1
         },
         "commit-reviewer-d": {
             "description": "Leaf D of commit-reviewer cluster",
-            "mode": "subagent",
             "hidden": true,
-            "prompt": "{file:.opencode/agents/commit-reviewer-d.md}",
+            "mode": "subagent",
             "model": "{file:./.local/config/agent-model/commit-reviewer-d}",
-            "temperature": 0.1,
             "permission": {
-                "edit": "deny",
-                "webfetch": "deny",
-                "task": {
-                    "*": "deny",
-                },
                 "bash": {
                     "*": "deny",
                     "jq *": "allow",
@@ -404,9 +397,16 @@
                     ".opencode/scripts/commit-gate.sh release *": "deny",
                     ".opencode/scripts/commit-gate.sh heartbeat *": "deny",
                     ".opencode/scripts/commit-gate.sh stage-message *": "deny",
-                    "vh-agent-harness *": "allow",
+                    "vh-agent-harness *": "allow"
                 },
+                "edit": "deny",
+                "task": {
+                    "*": "deny"
+                },
+                "webfetch": "deny"
             },
+            "prompt": "{file:.opencode/agents/commit-reviewer-d.md}",
+            "temperature": 0.1
         },
         "committer": {
             "color": "warning",
@@ -454,12 +454,12 @@
                     ".opencode/scripts/commit-gate.sh release *": "allow",
                     ".opencode/scripts/commit-gate.sh heartbeat *": "allow",
                     ".opencode/scripts/commit-gate.sh stage-message *": "allow",
-                    "vh-agent-harness *": "deny",
+                    "vh-agent-harness *": "deny"
                 },
                 "edit": "deny",
                 "task": {
                     "*": "deny",
-                    "commit-reviewer": "allow",
+                    "commit-reviewer": "allow"
                 },
                 "webfetch": "deny"
             },
@@ -503,7 +503,7 @@
                     "git rev-parse *": "allow",
                     "git check-ignore *": "allow",
                     ".opencode/scripts/readonly-scripts.sh *": "allow",
-                    "vh-agent-harness *": "allow",
+                    "vh-agent-harness *": "allow"
                 },
                 "edit": "deny",
                 "task": {
@@ -519,7 +519,7 @@
                     "committer": "allow",
                     "debate": "allow",
                     "solution-brief": "allow",
-                    "releaser": "allow",
+                    "releaser": "allow"
                 },
                 "webfetch": "deny"
             },
@@ -573,14 +573,14 @@
                     ".opencode/scripts/commit-gate.sh release *": "deny",
                     ".opencode/scripts/commit-gate.sh heartbeat *": "deny",
                     ".opencode/scripts/commit-gate.sh stage-message *": "deny",
-                    "vh-agent-harness *": "deny",
+                    "vh-agent-harness *": "deny"
                 },
                 "edit": "deny",
                 "task": {
                     "*": "deny",
                     "debate-proposer": "allow",
                     "debate-critic": "allow",
-                    "debate-synth": "allow",
+                    "debate-synth": "allow"
                 },
                 "webfetch": "deny"
             },
@@ -635,11 +635,11 @@
                     ".opencode/scripts/commit-gate.sh release *": "deny",
                     ".opencode/scripts/commit-gate.sh heartbeat *": "deny",
                     ".opencode/scripts/commit-gate.sh stage-message *": "deny",
-                    "vh-agent-harness *": "deny",
+                    "vh-agent-harness *": "deny"
                 },
                 "edit": "deny",
                 "task": {
-                    "*": "deny",
+                    "*": "deny"
                 },
                 "webfetch": "deny"
             },
@@ -694,11 +694,11 @@
                     ".opencode/scripts/commit-gate.sh release *": "deny",
                     ".opencode/scripts/commit-gate.sh heartbeat *": "deny",
                     ".opencode/scripts/commit-gate.sh stage-message *": "deny",
-                    "vh-agent-harness *": "deny",
+                    "vh-agent-harness *": "deny"
                 },
                 "edit": "deny",
                 "task": {
-                    "*": "deny",
+                    "*": "deny"
                 },
                 "webfetch": "deny"
             },
@@ -753,11 +753,11 @@
                     ".opencode/scripts/commit-gate.sh release *": "deny",
                     ".opencode/scripts/commit-gate.sh heartbeat *": "deny",
                     ".opencode/scripts/commit-gate.sh stage-message *": "deny",
-                    "vh-agent-harness *": "deny",
+                    "vh-agent-harness *": "deny"
                 },
                 "edit": "deny",
                 "task": {
-                    "*": "deny",
+                    "*": "deny"
                 },
                 "webfetch": "deny"
             },
@@ -803,12 +803,12 @@
                     "git rev-parse *": "allow",
                     "git check-ignore *": "allow",
                     ".opencode/scripts/readonly-scripts.sh *": "allow",
-                    "vh-agent-harness *": "ask",
+                    "vh-agent-harness *": "ask"
                 },
                 "edit": "allow",
                 "task": {
                     "*": "deny",
-                    "committer": "allow",
+                    "committer": "allow"
                 },
                 "webfetch": "deny"
             },
@@ -860,14 +860,14 @@
                     ".opencode/scripts/commit-gate.sh release *": "deny",
                     ".opencode/scripts/commit-gate.sh heartbeat *": "deny",
                     ".opencode/scripts/commit-gate.sh stage-message *": "deny",
-                    "vh-agent-harness *": "ask",
+                    "vh-agent-harness *": "ask"
                 },
                 "edit": "deny",
                 "skill": {
                     "*": "allow"
                 },
                 "task": {
-                    "*": "deny",
+                    "*": "deny"
                 },
                 "webfetch": "allow"
             }
@@ -918,11 +918,11 @@
                     ".opencode/scripts/commit-gate.sh release *": "deny",
                     ".opencode/scripts/commit-gate.sh heartbeat *": "deny",
                     ".opencode/scripts/commit-gate.sh stage-message *": "deny",
-                    "vh-agent-harness *": "allow",
+                    "vh-agent-harness *": "allow"
                 },
                 "edit": "deny",
                 "task": {
-                    "*": "deny",
+                    "*": "deny"
                 },
                 "webfetch": "allow"
             },
@@ -968,7 +968,7 @@
                     "git rev-parse *": "allow",
                     "git check-ignore *": "allow",
                     ".opencode/scripts/readonly-scripts.sh *": "allow",
-                    "vh-agent-harness *": "allow",
+                    "vh-agent-harness *": "allow"
                 },
                 "edit": "deny",
                 "task": {
@@ -983,7 +983,7 @@
                     "committer": "allow",
                     "debate": "allow",
                     "solution-brief": "allow",
-                    "releaser": "allow",
+                    "releaser": "allow"
                 },
                 "webfetch": "deny"
             },
@@ -1037,10 +1037,10 @@
                     ".opencode/scripts/commit-gate.sh release *": "deny",
                     ".opencode/scripts/commit-gate.sh heartbeat *": "deny",
                     ".opencode/scripts/commit-gate.sh stage-message *": "deny",
-                    "vh-agent-harness *": "allow",
+                    "vh-agent-harness *": "allow"
                 },
                 "task": {
-                    "*": "deny",
+                    "*": "deny"
                 }
             },
             "prompt": "{file:.opencode/agents/releaser.md}"
@@ -1091,11 +1091,11 @@
                     ".opencode/scripts/commit-gate.sh release *": "deny",
                     ".opencode/scripts/commit-gate.sh heartbeat *": "deny",
                     ".opencode/scripts/commit-gate.sh stage-message *": "deny",
-                    "vh-agent-harness *": "ask",
+                    "vh-agent-harness *": "ask"
                 },
                 "edit": "deny",
                 "task": {
-                    "*": "deny",
+                    "*": "deny"
                 },
                 "webfetch": "deny"
             },
@@ -1148,11 +1148,11 @@
                     ".opencode/scripts/commit-gate.sh release *": "deny",
                     ".opencode/scripts/commit-gate.sh heartbeat *": "deny",
                     ".opencode/scripts/commit-gate.sh stage-message *": "deny",
-                    "vh-agent-harness *": "allow",
+                    "vh-agent-harness *": "allow"
                 },
                 "edit": "deny",
                 "task": {
-                    "*": "deny",
+                    "*": "deny"
                 },
                 "webfetch": "allow"
             },
@@ -1206,11 +1206,11 @@
                     ".opencode/scripts/commit-gate.sh release *": "deny",
                     ".opencode/scripts/commit-gate.sh heartbeat *": "deny",
                     ".opencode/scripts/commit-gate.sh stage-message *": "deny",
-                    "vh-agent-harness *": "allow",
+                    "vh-agent-harness *": "allow"
                 },
                 "edit": "deny",
                 "task": {
-                    "*": "deny",
+                    "*": "deny"
                 },
                 "webfetch": "deny"
             },
@@ -1262,14 +1262,14 @@
                     ".opencode/scripts/commit-gate.sh release *": "deny",
                     ".opencode/scripts/commit-gate.sh heartbeat *": "deny",
                     ".opencode/scripts/commit-gate.sh stage-message *": "deny",
-                    "vh-agent-harness *": "deny",
+                    "vh-agent-harness *": "deny"
                 },
                 "edit": "deny",
                 "task": {
                     "*": "deny",
                     "researcher": "allow",
                     "debate": "allow",
-                    "planner": "allow",
+                    "planner": "allow"
                 },
                 "webfetch": "deny"
             },
@@ -1291,45 +1291,45 @@
     "permission": {
         "bash": {
             "*": "deny",
-            ".opencode/scripts/commit-gate.sh acquire *": "deny",
-            ".opencode/scripts/commit-gate.sh commit *": "deny",
-            ".opencode/scripts/commit-gate.sh heartbeat *": "deny",
-            ".opencode/scripts/commit-gate.sh release *": "deny",
-            ".opencode/scripts/commit-gate.sh revert *": "deny",
-            ".opencode/scripts/commit-gate.sh stage-message *": "deny",
-            ".opencode/scripts/commit-gate.sh status": "deny",
-            ".opencode/scripts/readonly-scripts.sh *": "allow",
+            "jq *": "allow",
+            "ls *": "allow",
+            "rg *": "allow",
+            "wc *": "allow",
             "cat *": "allow",
             "cut *": "allow",
             "date *": "allow",
             "echo *": "allow",
             "find *": "allow",
-            "git blame *": "allow",
-            "git cat-file *": "allow",
-            "git check-ignore *": "allow",
-            "git diff *": "allow",
-            "git grep *": "allow",
-            "git log *": "allow",
-            "git ls-files *": "allow",
-            "git ls-tree *": "allow",
-            "git rev-parse *": "allow",
-            "git show *": "allow",
-            "git show-ref *": "allow",
-            "git status *": "allow",
             "grep *": "allow",
             "head *": "allow",
-            "jq *": "allow",
-            "ls *": "allow",
-            "rg *": "allow",
-            "sed -n *": "allow",
-            "sleep *": "allow",
             "sort *": "allow",
             "tail *": "allow",
             "true *": "allow",
             "uniq *": "allow",
+            "sleep *": "allow",
             "uuidgen": "deny",
-            "vh-agent-harness *": "allow",
-            "wc *": "allow"
+            "sed -n *": "allow",
+            "git log *": "allow",
+            "git diff *": "allow",
+            "git grep *": "allow",
+            "git show *": "allow",
+            "git blame *": "allow",
+            "git status *": "allow",
+            "git ls-tree *": "allow",
+            "git cat-file *": "allow",
+            "git ls-files *": "allow",
+            "git show-ref *": "allow",
+            "git rev-parse *": "allow",
+            "git check-ignore *": "allow",
+            ".opencode/scripts/commit-gate.sh status": "deny",
+            ".opencode/scripts/readonly-scripts.sh *": "allow",
+            ".opencode/scripts/commit-gate.sh commit *": "deny",
+            ".opencode/scripts/commit-gate.sh revert *": "deny",
+            ".opencode/scripts/commit-gate.sh acquire *": "deny",
+            ".opencode/scripts/commit-gate.sh release *": "deny",
+            ".opencode/scripts/commit-gate.sh heartbeat *": "deny",
+            ".opencode/scripts/commit-gate.sh stage-message *": "deny",
+            "vh-agent-harness *": "allow"
         },
         "edit": "ask",
         "read": {
