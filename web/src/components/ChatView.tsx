@@ -603,6 +603,13 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       const el = scrollEl.querySelector(`[data-mid="${cssEsc(anchor)}"]`) as HTMLElement | null;
       if (el && (sm()?.order ?? []).includes(anchor)) {
         setFollowing(false);
+        // Restored to a mid-history anchor = genuine read intent (we land away
+        // from the bottom). Arm the latch like the scroll-away arm (~:812) so
+        // the busy-edge self-heal effect (~:390, edge && !userScrolledUp()) does
+        // NOT yank the reader off this anchor to the tail on reopen of a busy
+        // session. The stale/no-anchor branches below arm false because they
+        // land AT the bottom (system restore = follow intent reset).
+        setUserScrolledUp(true);
         const delta = el.getBoundingClientRect().top - scrollEl.getBoundingClientRect().top;
         scrollEl.scrollTop += delta;
       } else {

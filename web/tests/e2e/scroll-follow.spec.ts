@@ -658,3 +658,122 @@ test("the Live pill hides when the turn finishes (working gate + focus gate)", a
   // true; the pill is hidden only because the turn is idle/finished.
   await expectFollowingTail(page);
 });
+
+// (12) Reopen of a BUSY session at a stored mid-history anchor is NOT yanked to
+//      the tail (the maybeRestore anchor-found latch fix).
+//
+// Sibling of test 10b. 10b covers the intent-latch armed by a DELIBERATE
+// scroll-up (onScrolled's `!atBottom && !shrank` site); this test covers the
+// OTHER false-flip site that must also arm the latch: maybeRestore's
+// anchor-found branch (ChatView.tsx), which restores the viewport to a stored
+// mid-history read anchor on session open. Before the fix that branch set
+// `following=false` WITHOUT arming `userScrolledUp`, so on reopen of a BUSY
+// session the busy-edge self-heal effect (edge=`!prevWorking && working()`,
+// gated on `!userScrolledUp()`) fired on the first `ready()` flip and yanked the
+// reader off the restored anchor to the tail — the "busy-at-reopen-anchor yank".
+//
+// Why a reload is required (and not just a session switch): `prevWorking` is a
+// per-component-instance closure var, NOT reset on session switch (ChatView is
+// reused across switches), so the false→true busy edge on an already-busy
+// session is only delivered on a FRESH mount — i.e. a page reload. test 10b
+// doesn't reload because it arms the latch via a real scroll event in-page.
+//
+// Why [[stall]] is required (not just "m6 has no time.completed"): `working()` is
+// activity-driven (`state.activity[sessionID]` from `/session/status` +
+// `session.status` events), NOT message-heuristic — an in-flight message alone
+// does NOT make a session busy. The fixture's busy map starts empty, so the demo
+// loads idle. We drive a real busy turn with [[stall]] (the established pattern
+// from tests 4/9/11) so `state.activity.demo=busy` is in the snapshot the
+// reloaded page hydrates from.
+//
+// Anchor seeding: the read anchor lives in localStorage under `vh.scroll.v2` as
+// a versioned envelope `{v:1,data:{demo:"m4"}}`, loaded ONCE at scroll.ts import
+// via loadVersioned. We seed it with `page.addInitScript`, which runs before any
+// page script on EVERY navigation (including the reload), so the anchor is
+// present before scroll.ts imports — and re-seeded on reload even if the bug's
+// page-1 yank cleared it (a valid regression guard). m4 is a mid-history message
+// (NOT the last, m6), so a restored-to-m4 viewport is provably NOT at the
+// bottom.
+//
+// Non-vacuity notes (this file's convention):
+//  - The pre-busy "not at the bottom" assertion is ESSENTIAL, not decorative:
+//    without a valid anchor the restore lands at the bottom (following=true,
+//    latch=false via the no-anchor branch) and the post-reload state under fix
+//    and bug converge (both at the tail) — the test would pass vacuously. This
+//    pre-assertion proves the seed took and we really are at a mid-history
+//    anchor going into the reload.
+//  - There is no literal "unread dot retained" assertion here: the dot lives in
+//    `state.unread`, which the fixture only populates for FINISHED-but-unviewed
+//    sessions; a BUSY demo carries no dot, so such an assertion would be
+//    vacuous. The retention is guaranteed indirectly: the ack effect
+//    early-returns at `!following()` (ChatView.tsx), and `button.jump` being
+//    visible PROVES following=false post-reload — which is exactly the
+//    !following() condition that keeps the dot lit. We assert the cause
+//    (following=false) rather than a dot that this fixture lane cannot seed.
+test("reopen of a busy session at a stored anchor is not yanked to the tail", async ({ page }) => {
+  // Seed a mid-history read anchor (m4) for the demo session BEFORE the SPA
+  // imports scroll.ts. addInitScript re-runs on the reload below, re-seeding
+  // even if page-1 cleared it.
+  await page.addInitScript(() => {
+    window.localStorage.setItem(
+      "vh.scroll.v2",
+      JSON.stringify({ v: 1, data: { demo: "m4" } }),
+    );
+  });
+  await page.setViewportSize(VP);
+  await page.goto("/?session=demo");
+  await expect(page.locator(".msg").first()).toBeVisible({ timeout: 10000 });
+
+  // The anchor restored: viewport is at m4 (mid-history), NOT at the bottom.
+  // This pre-assertion is the non-vacuity guard (see header comment) — it
+  // proves the seed took before we drive the busy turn + reload.
+  await expect.poll(
+    async () =>
+      page.locator(".chat-scroll").evaluate((e: HTMLElement) =>
+        e.scrollHeight - e.scrollTop - e.clientHeight < 24 ? 1 : 0,
+      ),
+    { timeout: 5000 },
+  ).toBe(0);
+  // following=false at the anchor → "↓ Latest" is offered, Live pill hidden.
+  await expect(page.locator("button.jump")).toBeVisible({ timeout: 3000 });
+  await expect(page.locator(".chat-live")).toHaveCount(0);
+
+  // Drive a BUSY turn so the reloaded page hydrates state.activity.demo=busy.
+  // [[stall]] sleeps ~5s server-side before emitting idle — the reload + assert
+  // window fits inside that (same proven window as tests 4/9/11).
+  await page.getByPlaceholder("Message…").fill("[[stall]] reopen at anchor");
+  await page.keyboard.press("Enter");
+  await expect(page.locator(".working-text")).toBeVisible({ timeout: 5000 });
+
+  // Reload → fresh ChatView mount with working()=true at the first ready() flip.
+  // The busy-edge self-heal effect fires here: under the BUG it yanks to the
+  // tail (edge && !userScrolledUp() — latch was left unset); under the FIX the
+  // armed latch suppresses it and the viewport stays at the restored anchor.
+  await page.reload();
+  await expect(page.locator(".msg").first()).toBeVisible({ timeout: 10000 });
+  // Confirm the reloaded page sees the busy turn (working()=true) — i.e. the
+  // self-heal edge really did fire and following has settled either way.
+  await expect(page.locator(".working-text")).toBeVisible({ timeout: 5000 });
+
+  // PRIMARY (geometry-first, not pill-based): the viewport STAYS at the anchor,
+  // NOT yanked to the tail. Under the bug this polls to 1 (at bottom) and fails.
+  await expect.poll(
+    async () =>
+      page.locator(".chat-scroll").evaluate((e: HTMLElement) =>
+        e.scrollHeight - e.scrollTop - e.clientHeight < 24 ? 1 : 0,
+      ),
+    { timeout: 5000 },
+  ).toBe(0);
+  // following=false at the anchor: "↓ Latest" offered (this is also the
+  // indirect proof the unread dot is retained — see header comment), Live pill
+  // hidden (following false, so the `following() && working()` Show is false).
+  await expect(page.locator("button.jump")).toBeVisible({ timeout: 3000 });
+  await expect(page.locator(".chat-live")).toHaveCount(0);
+
+  // Un-strand: the reader jumps back to the tail via "↓ Latest". jumpToLatest
+  // clears the latch + re-glues (following=true). button.jump is stable to
+  // click here — following was false, so there's no ResizeObserver re-pin race
+  // competing for the click target (the detach-prone case openDemo documents).
+  await page.locator("button.jump").click({ timeout: 5000 });
+  await expectFollowingTail(page);
+});
