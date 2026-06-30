@@ -31,6 +31,21 @@ export default function ServersPanel() {
       if (v !== undefined && v !== null && v !== "") rows.push({ k, v: String(v) });
     };
     push("Connection", state.status);
+    // Feature 1 (S1/S3): server generation + staleness. A changed epoch across a
+    // live connection means the daemon restarted. Mirrors the connection-health
+    // toast; useful here as a persistent diagnostic.
+    push("Server epoch", state.epoch);
+    // Feature 3 (L1): connection-vs-server latency per stream, so an operator
+    // can tell a slow connection from a slow server. `conn` = EventSource open
+    // (pure connection); `server` = open → first snapshot (ensureMessages +
+    // compute + serialize). Tree stream = tree+notifications; session stream =
+    // the active session's messages.
+    const latTree = state.connLatency.tree;
+    const latSes = state.connLatency.session;
+    const fmt = (o?: number, s?: number) =>
+      o != null || s != null ? `conn ${o ?? "—"}ms · server ${s ?? "—"}ms` : "—";
+    push("Tree latency", fmt(latTree.open, latTree.snap));
+    push("Session latency", fmt(latSes.open, latSes.snap));
     push("Theme", c.theme);
     push("Model", c.model);
     push("Small model", c.small_model);
@@ -87,7 +102,9 @@ export default function ServersPanel() {
       </Show>
 
       <Show when={tab() === "mcp"}>
-        <Show when={mcpRows().length > 0} fallback={<div class="placeholder">None configured.</div>}>
+        <Show when={mcpRows().length > 0} fallback={
+          mcp.loading ? <div class="placeholder">Loading…</div> : <div class="placeholder">None configured.</div>
+        }>
           <For each={mcpRows()}>
             {(s) => (
               <div class="m-row">
@@ -107,7 +124,9 @@ export default function ServersPanel() {
       </Show>
 
       <Show when={tab() === "lsp"}>
-        <Show when={lspRows().length > 0} fallback={<div class="placeholder">None active.</div>}>
+        <Show when={lspRows().length > 0} fallback={
+          lsp.loading ? <div class="placeholder">Loading…</div> : <div class="placeholder">None active.</div>
+        }>
           <For each={lspRows()}>
             {(s: any) => (
               <div class="m-row">
@@ -125,7 +144,9 @@ export default function ServersPanel() {
       </Show>
 
       <Show when={tab() === "plugins"}>
-        <Show when={plugins().length > 0} fallback={<div class="placeholder">None installed.</div>}>
+        <Show when={plugins().length > 0} fallback={
+          config.loading ? <div class="placeholder">Loading…</div> : <div class="placeholder">None installed.</div>
+        }>
           <For each={plugins()}>
             {(p) => (
               <div class="m-row">

@@ -499,6 +499,49 @@ func TestLastAgentColdSeedPreserved(t *testing.T) {
 	}
 }
 
+// TestColdSeedMemoAndInvalidation covers the reconnect fetch-storm memo at the
+// store layer: ColdSeedNeeded reports only un-seeded tracked sessions,
+// MarkColdSeeded suppresses them on subsequent queries, and the memo is dropped
+// on session removal (the single deleteSessionLocked chokepoint) so a session
+// recreated under the same id is re-seeded. Mirrors the aggregator's use.
+func TestColdSeedMemoAndInvalidation(t *testing.T) {
+	s := New(100)
+	s.Apply(ev("session.created", `{"info":{"id":"a"}}`))
+	s.Apply(ev("session.created", `{"info":{"id":"b"}}`))
+
+	// Initially both are un-seeded; an untracked id is ignored.
+	need := s.ColdSeedNeeded([]string{"a", "b", "ghost"})
+	if len(need) != 2 {
+		t.Fatalf("initial ColdSeedNeeded: want [a b], got %v", need)
+	}
+
+	// Seed both: ColdSeedNeeded goes empty for them.
+	s.MarkColdSeeded("a")
+	s.MarkColdSeeded("b")
+	if got := s.ColdSeedNeeded([]string{"a", "b"}); len(got) != 0 {
+		t.Fatalf("after seeding both: want [] (both memoized), got %v", got)
+	}
+
+	// MarkColdSeeded is a no-op for a session deleted in the race window.
+	s.MarkColdSeeded("ghost") // not tracked -> must not be recorded
+	if got := s.ColdSeedNeeded([]string{"ghost"}); len(got) != 0 {
+		t.Fatalf("untracked session must never be reported as needing seed, got %v", got)
+	}
+
+	// Removing "a" (live session.deleted funnels through deleteSessionLocked)
+	// drops its memo; recreating it makes it need seeding again. "b" — never
+	// removed — must stay seeded (no over-invalidation on an unrelated removal).
+	s.Apply(ev("session.deleted", `{"info":{"id":"a"}}`))
+	s.Apply(ev("session.created", `{"info":{"id":"a"}}`))
+	need = s.ColdSeedNeeded([]string{"a", "b"})
+	if len(need) != 1 || need[0] != "a" {
+		t.Fatalf("after remove+recreate of a: want [a] (re-seeded), got %v", need)
+	}
+	if got := s.ColdSeedNeeded([]string{"b"}); len(got) != 0 {
+		t.Fatalf("b must remain seeded (invalidate only on its own removal), got %v", got)
+	}
+}
+
 // TestRecomputeCurrentVerbRunningThenCleared covers the Tier-A current-activity
 // facet (O4 hybrid): a running tool part seeds the facet (surfaced in the
 // snapshot so an UNOPENED subagent's "Reading parser.go" renders without loading

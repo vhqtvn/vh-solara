@@ -72,7 +72,11 @@ function StagingPanel(props: { onChanged: () => void }) {
 
   return (
     <Show when={projectDir()} fallback={<p class="setting-hint git-hint">Open a project (not the default) to stage &amp; commit from here.</p>}>
-      <Show when={files().length > 0} fallback={<p class="setting-hint git-hint">Working tree clean.</p>}>
+      <Show when={files().length > 0} fallback={
+        status.loading
+          ? <div class="placeholder">Loading…</div>
+          : <p class="setting-hint git-hint">Working tree clean.</p>
+      }>
         <div class="git-stage">
           <div class="git-stage-head">
             <span>{files().length} changed</span>

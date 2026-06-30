@@ -14,8 +14,29 @@ export interface Session {
   time?: { created?: number; updated?: number };
 }
 
+// Per-session gate facts the daemon stamps into the snapshot so the client can
+// tell "this session's data is fully aggregated" from "still loading after a
+// restart" WITHOUT opening it. `hydrated` mirrors Go's GateFacts.Hydrated
+// (pkg/state/store.go): true once the session's messages are loaded. The daemon
+// serves HTTP while still aggregating after a restart, so early snapshots have
+// hydrated=false for sessions whose tail hasn't been pulled yet — the client
+// uses that to show a loading hint instead of looking stale/empty.
+export interface GateFacts {
+  hydrated?: boolean;
+  activity?: string;
+  [k: string]: unknown;
+}
+
 export interface Snapshot {
   seq: number;
+  // Daemon generation (pkg/state/store.go Snapshot.Epoch). Stable for the life
+  // of a process; CHANGES across a restart. The client reads it (and/or the
+  // X-VH-Epoch response header) to detect a server restart mid-connection and
+  // merge-protect its caches against mid-aggregation snapshots. Optional for
+  // back-compat with older daemons that didn't emit it.
+  epoch?: string;
+  // Per-session gate facts (hydrated state). Optional; older daemons omit it.
+  gate?: Record<string, GateFacts>;
   sessions: Session[];
   messages?: Record<string, unknown[]>;
   statuses?: Record<string, unknown>;

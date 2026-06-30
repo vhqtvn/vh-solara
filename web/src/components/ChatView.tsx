@@ -246,6 +246,12 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   });
 
   const sm = () => state.messages[props.sessionId];
+  // True once the real message snapshot has been delivered for this session.
+  // openSession pre-reserves a truthy-but-empty slot, so sm() truthiness alone
+  // can't tell "still loading" from "genuinely empty" — this flag does. Mirrors
+  // maybeRestore's order-length guard below (~:591-595) and drives the
+  // transcript empty/loading discriminator at the bottom of the render.
+  const delivered = () => !!state.messagesLoaded[props.sessionId];
   const messages = createMemo(() => {
     const s = sm();
     return s ? s.order.map((id) => s.byId[id]) : [];
@@ -1427,12 +1433,15 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
               </div>
             )}
           </For>
-          {/* Transcript-level states: blank while the first snapshot loads, an
-              empty hint once loaded-but-empty (sm() defined). Per-message errors
-              render inline above; this covers the whole-transcript case. */}
+          {/* Transcript-level states: a loading hint while the first snapshot
+              is in flight (slot reserved but not yet delivered), then an empty
+              hint once delivered-and-empty. openSession pre-reserves a
+              truthy-but-empty slot, so we key off `delivered` (messagesLoaded),
+              NOT sm() truthiness — otherwise "No messages" flashes before the
+              snapshot lands. Per-message errors render inline above. */}
           <Show when={messages().length === 0 && !working()}>
             <Show
-              when={sm()}
+              when={delivered()}
               fallback={<div class="chat-empty" role="status" aria-live="polite">Loading conversation…</div>}
             >
               <div class="chat-empty">No messages in this session yet.</div>

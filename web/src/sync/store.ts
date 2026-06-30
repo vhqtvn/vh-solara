@@ -66,6 +66,16 @@ export interface SyncState {
   sessions: Record<string, Session>;
   // Messages are held only for opened sessions, to bound memory.
   messages: Record<string, SessionMessages>;
+  // Per-session flag: true once the active-session message snapshot (Stream 2)
+  // or a refreshOpenSessions fetch has delivered the real message list. Why this
+  // exists: openSession() pre-reserves a truthy-but-empty {order:[],byId:{}}
+  // slot the INSTANT a session is selected, so messages[id] is truthy BEFORE the
+  // real snapshot arrives. Gating the transcript empty/loading state on that
+  // truthiness shows "No messages" during the gap. This flag separates
+  // "reserved-but-not-delivered" (→ loading) from "delivered-and-empty"
+  // (→ genuinely no messages). See ChatView maybeRestore's order-length guard
+  // and the transcript empty-state discriminator.
+  messagesLoaded: Record<string, boolean>;
   // Per-session activity (busy/idle/error) and pending permissions are kept for
   // ALL sessions so the sidebar/chat can surface status without opening them.
   activity: Record<string, string>;
@@ -90,11 +100,37 @@ export interface SyncState {
   unread: Record<string, boolean>;
   status: ConnStatus;
   cursor: number;
+  // --- Connection-health diagnostics (FE-only) -----------------------------
+  // lastSeen: ms-of-last-SSE-byte, mirrored from the stream's hot-path
+  // module var (throttled to ~1 write/sec to avoid per-event reactive churn).
+  // The authoritative staleness check lives in stream.ts (isStale), reading the
+  // unthrottled module var; this field is for debug display only.
+  lastSeen: number;
+  // epoch: the daemon generation from the snapshot (or X-VH-Epoch header).
+  // A change across a live connection means the server restarted.
+  epoch: string;
+  // epochChanged: latched true when an epoch transition is detected during a
+  // live connection (NOT the first snapshot after load). Consumed + cleared by
+  // the connection-health toast to surface "Server restarted — re-syncing…".
+  epochChanged: boolean;
+  // hydrated: per-session gate facts (snap.gate[id].hydrated). Rebuilt from
+  // each tree snapshot. A row whose hydrated[id]===false is still being
+  // aggregated after a restart → show a loading hint instead of looking stale.
+  hydrated: Record<string, boolean>;
+  // connLatency: per-stream connection-vs-server latency diagnostics
+  // (Feature 3). `open` = EventSource construction → onopen (pure connection
+  // latency); `snap` = onopen → first snapshot event (server processing:
+  // ensureMessages + snapshot compute + serialize).
+  connLatency: {
+    tree: { open?: number; snap?: number };
+    session: { open?: number; snap?: number };
+  };
 }
 
 export const [state, setState] = createStore<SyncState>({
   sessions: loadSessions(initialDir),
   messages: {},
+  messagesLoaded: {},
   activity: loadActivity(initialDir),
   lastAgents: loadLastAgents(initialDir),
   currentVerbs: {},
@@ -104,6 +140,11 @@ export const [state, setState] = createStore<SyncState>({
   unread: {},
   status: "connecting",
   cursor: loadCursor(initialDir),
+  lastSeen: 0,
+  epoch: "",
+  epochChanged: false,
+  hydrated: {},
+  connLatency: { tree: {}, session: {} },
 });
 
 // In-flight sends, keyed by sessionID. OpenCode's POST /session/:id/message

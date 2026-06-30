@@ -279,6 +279,15 @@ type Store struct {
 	// are hydrated lazily (on first open) so startup doesn't fetch every
 	// session's history — critical with thousands of sessions.
 	msgLoaded map[string]bool
+	// seeded marks sessions whose lastAgent has already been cold-seeded by the
+	// aggregator (via a lightweight message-tail fetch during hydrate). It makes
+	// the cold-seed fire-once-per-session for the aggregator's lifetime instead
+	// of on every (re)connect: a seeded session is skipped until it is removed.
+	// Cleared in deleteSessionLocked, so a removed-then-recreated session is
+	// re-seeded. Distinct from msgLoaded: opening a session (msgLoaded) derives
+	// lastAgent authoritatively from the full history; seeded only suppresses
+	// the lightweight tail re-fetch for un-opened sessions.
+	seeded map[string]bool
 
 	ring *ringBuffer
 	subs map[int]chan ClientEvent
@@ -311,6 +320,7 @@ func New(ringCapacity int) *Store {
 		unread:      map[string]bool{},
 		busyCount:   map[string]int{},
 		msgLoaded:   map[string]bool{},
+		seeded:      map[string]bool{},
 		ring:        newRingBuffer(ringCapacity),
 		subs:        map[int]chan ClientEvent{},
 	}
@@ -697,6 +707,10 @@ func (s *Store) deleteSessionLocked(id string) {
 	delete(s.sessions, id)
 	delete(s.messages, id)
 	delete(s.msgLoaded, id)
+	// Drop the cold-seed memo so a session recreated under the same id (live
+	// session.deleted then session.created, an archive/un-archive, or a hydrate
+	// prune-then-reappear) gets its lastAgent re-seeded from a fresh tail fetch.
+	delete(s.seeded, id)
 	delete(s.todos, id)
 	delete(s.perms, id)
 	delete(s.questions, id)
@@ -1552,9 +1566,11 @@ func (s *Store) SetSessionMessages(sid string, list []MessageWithParts) {
 // hydrate. This is what lets the tree render per-agent chips on a COLD snapshot
 // (before any session's full message history is hydrated) — the tree-only
 // snapshot carries no messages, so lastAgent can't be derived client-side until
-// the session is opened. Re-seeding on each reconnect is idempotent. Once a
-// session is opened (messages loaded), recomputeLastAssistantLocked overrides
-// the seed authoritatively from the full history.
+// the session is opened. Re-seeding is memoized (ColdSeedNeeded/MarkColdSeeded):
+// each cold session is tail-fetched at most once per aggregator lifetime, so
+// reconnects skip already-seeded sessions. Once a session is opened (messages
+// loaded), recomputeLastAssistantLocked overrides the seed authoritatively from
+// the full history.
 func (s *Store) SetLastAgents(agents map[string]string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1562,6 +1578,38 @@ func (s *Store) SetLastAgents(agents map[string]string) {
 		if se := s.sessions[sid]; se != nil {
 			se.lastAgent = agent
 		}
+	}
+}
+
+// ColdSeedNeeded returns the subset of `ids` whose lastAgent has NOT yet been
+// cold-seeded, limited to sessions currently tracked. The aggregator calls this
+// on (re)connect to fetch a lightweight tail for only the un-seeded sessions
+// instead of re-fetching every cold session every time. It is a read-only query
+// (claim happens per-session in MarkColdSeeded after a successful fetch), so a
+// fetch failure is not marked seeded and retries on the next reconnect — same
+// graceful behavior as before this memo existed.
+func (s *Store) ColdSeedNeeded(ids []string) []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if s.sessions[id] != nil && !s.seeded[id] {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+// MarkColdSeeded records that a session's lastAgent has been cold-seeded, so
+// subsequent reconnects skip re-fetching its tail. Only marks sessions that
+// still exist: a delete that raced between the tail fetch and this call leaves
+// seeded clean, so a recreated session is re-seeded. Caller passes one id at a
+// time as each tail fetch succeeds (8-wide in the aggregator).
+func (s *Store) MarkColdSeeded(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.sessions[id] != nil {
+		s.seeded[id] = true
 	}
 }
 

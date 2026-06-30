@@ -16,6 +16,7 @@ import {
   setDraft,
   loadSessions,
   loadActivity,
+  loadLastAgents,
   loadCursor,
   LS_PROJECT,
 } from "./store";
@@ -44,11 +45,19 @@ export function switchProject(dir: string, fromUrl = false) {
     produce((s) => {
       s.sessions = loadSessions(dir);
       s.messages = {};
+      s.messagesLoaded = {};
       s.activity = loadActivity(dir);
+      // B2b audit: lastAgents is a per-session facet that must NOT carry over
+      // from the previous project (orphan-map gap). Like activity, it is
+      // per-project persisted, so hydrate the new project's chips instantly and
+      // let the live snapshot reconcile. Without this, a switched-away project's
+      // agent labels lingered until the first snapshot landed.
+      s.lastAgents = loadLastAgents(dir);
       s.permissions = {};
       s.questions = {};
       s.todos = {};
       s.unread = {};
+      s.hydrated = {}; // Feature 1 (S4): reset per-session hydration gate for the new project
       s.cursor = loadCursor(dir);
       s.status = "connecting";
     }),
@@ -61,7 +70,13 @@ export function switchProject(dir: string, fromUrl = false) {
 // which is the sole owner of message state to avoid a one-shot fetch clobbering
 // in-flight streamed deltas.
 export async function openSession(id: string) {
-  if (!state.messages[id]) setState("messages", id, { order: [], byId: {} });
+  // Mark not-delivered only when actually reserving a fresh slot. A reopening
+  // session keeps its cached messages (and its delivered=true) so it renders
+  // instantly instead of flashing a loading state. See SyncState.messagesLoaded.
+  if (!state.messages[id]) {
+    setState("messages", id, { order: [], byId: {} });
+    setState("messagesLoaded", id, false);
+  }
 }
 
 // "New session" no longer hits the server — it enters draft mode so an unused,
@@ -176,4 +191,14 @@ export function markSessionIdle(sessionID: string) {
       }
     }),
   );
+}
+
+// Clear the latched epoch-transition flag. Set by applySnapshot (stream.ts) when
+// an epoch transition is detected on a LIVE connection, and consumed here by the
+// connection-health toast (ConnectionToast.tsx) once it has surfaced
+// "Server restarted — re-syncing…". Exposed as a NARROW action so the public
+// sync barrel no longer re-exports the raw store setter (setState) just for this
+// one consumer — the only prior external user of that re-export was the toast.
+export function consumeEpochChanged(): void {
+  setState("epochChanged", false);
 }

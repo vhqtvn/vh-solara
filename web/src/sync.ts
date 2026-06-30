@@ -32,6 +32,7 @@ import {
   openSessionStream,
   watchdogTick,
   maybeReconnect,
+  tickHealth,
 } from "./sync/stream";
 import { setSelectedId, switchProject, openSession } from "./sync/actions";
 
@@ -51,6 +52,10 @@ export function startSync() {
   );
   // Periodic health check: reconnects a closed/stale stream without a reload.
   window.setInterval(watchdogTick, 10_000);
+  // Feature 1 (stale indicator): a faster, reconnect-free health tick so the
+  // status dot can surface staleness (a silent-but-open socket) BEFORE the 10s
+  // watchdog reconnects it. Cheap — only advances a signal the status dot reads.
+  window.setInterval(tickHealth, 5_000);
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") maybeReconnect();
   });
@@ -123,5 +128,11 @@ export {
   respondQuestion,
   abortSession,
   markSessionIdle,
+  consumeEpochChanged,
 } from "./sync/actions";
 export type { SyncState } from "./sync/store";
+// Feature 1 (stale indicator) + Feature 2 (updating indicator): connection-
+// health selectors + their thresholds, for the sidebar status dot and any
+// diagnostic surface.
+export { isStale, isUpdating } from "./sync/stream";
+export { STALE_MS, UPDATING_DEBOUNCE_MS } from "./sync/stream";

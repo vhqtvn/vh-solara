@@ -397,7 +397,11 @@ export default function SettingsDialog(props: { onClose: () => void }) {
                 <label>Active terminals</label>
                 <button type="button" class="theme-select" onClick={() => refetchTerms()}>Refresh</button>
               </div>
-              <Show when={(terms() || []).length > 0} fallback={<p class="setting-hint">No active terminal sessions.</p>}>
+              <Show when={(terms() || []).length > 0} fallback={
+                terms.loading
+                  ? <p class="setting-hint">Loading terminals…</p>
+                  : <p class="setting-hint">No active terminal sessions.</p>
+              }>
                 <For each={terms()}>
                   {(t) => (
                     <div class="term-sess">

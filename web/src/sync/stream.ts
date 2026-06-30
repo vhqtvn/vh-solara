@@ -3,6 +3,7 @@
 // watchdog, backoff reconnect, foreground/online recovery). It owns transport
 // and store reconciliation; notification policy lives in ./orchestration.
 import { produce } from "solid-js/store";
+import { createSignal } from "solid-js";
 import type { Snapshot } from "../types";
 import {
   buildMessages,
@@ -19,14 +20,79 @@ import { state, setState, projectDir, selectedId, persist } from "./store";
 import { normalizeTodos } from "./selectors";
 import { notifyFromMessage, maybeNotifyRootDone, maybeClearWaiting } from "./orchestration";
 
-function applySnapshot(snap: Snapshot) {
+// mergeLastAgents — the agent-label fix (S3). During a server restart the
+// daemon serves HTTP while still aggregating session tails, so a mid-hydrate
+// tree snapshot carries an INCOMPLETE lastAgents map (sessions whose tail
+// hasn't been pulled yet are simply absent). The old code wholesale-replaced
+// the FE cache (`s.lastAgents = {...snap.lastAgents}`), which erased correct
+// labels — the agent chips blanked until the next FULL snapshot landed. This
+// merge keeps any FE entry the incoming snapshot omits/empties, so a
+// mid-aggregation snapshot can only ADD or UPDATE labels, never wipe them.
+// Incoming non-empty values still win (so a genuine change applies once
+// aggregation completes). Pure + exported for unit testing.
+export function mergeLastAgents(
+  prev: Record<string, string>,
+  incoming: Record<string, string>,
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [id, name] of Object.entries(incoming)) {
+    if (name) out[id] = name; // server-provided label (authoritative when present)
+  }
+  for (const [id, name] of Object.entries(prev)) {
+    if (name && !out[id]) out[id] = name; // keep FE cache when the snapshot omits it
+  }
+  return out;
+}
+
+// epochChanged — pure epoch-transition detector. True only when we already had
+// a real epoch AND the incoming one differs (a restart while connected). The
+// first snapshot after a page load has an empty prevEpoch → not a change.
+export function epochChanged(prevEpoch: string, incomingEpoch: string): boolean {
+  return !!prevEpoch && !!incomingEpoch && prevEpoch !== incomingEpoch;
+}
+
+// Exported for integration tests (tests/unit/applySnapshot.test.ts) — it mutates
+// the singleton store, so the tests drive it directly and assert on `state`.
+export function applySnapshot(snap: Snapshot) {
+  bumpUpdating();
+  const incomingEpoch = snap.epoch || "";
+  const changed = epochChanged(state.epoch, incomingEpoch);
+  // B2a resync window: mergeLastAgents is ONLY correct while the server is
+  // re-aggregating after a restart. Outside that window a complete AUTHORITATIVE
+  // snapshot must be able to CLEAR a label (e.g. a session whose latest
+  // assistant no longer has an agent, or whose recomputed messages yield none).
+  // We are "resyncing" when ANY of these hold:
+  //   - this snapshot is itself an epoch transition (`changed`), OR
+  //   - the latched epochChanged flag from a recent transition is still set
+  //     (the toast hasn't consumed it yet — e.g. back-to-back snapshots in one
+  //     reactive tick), OR
+  //   - any session in this snapshot is still hydrated===false (its tail hasn't
+  //     been pulled yet → the lastAgents map is incomplete).
+  // `state.epochChanged` is read BEFORE the latch is (re)set below, so the first
+  // transition snapshot is caught via `changed` and later window snapshots via
+  // the latch / hydration. Only an EXPLICIT hydrated===false counts — an omitted
+  // gate (older daemon) or omitted hydrated must NOT pin resync mode forever
+  // (that would reintroduce the overcorrection and block legitimate clears).
+  const resyncing =
+    changed ||
+    state.epochChanged ||
+    Object.values(snap.gate || {}).some((g) => !!g && g.hydrated === false);
   setState(
     produce((s) => {
       // Reconcile: replace the session set with the authoritative snapshot.
       s.sessions = {};
       for (const sess of snap.sessions || []) s.sessions[sess.id] = sess;
       s.activity = { ...(snap.activity || {}) };
-      s.lastAgents = { ...(snap.lastAgents || {}) };
+      // B2a: merge-protect labels only INSIDE the resync window (above) so a
+      // mid-aggregation snapshot can ADD/UPDATE but never wipe. Outside the
+      // window the server map is authoritative — a wholesale replace lets a
+      // legitimate clear (an id the server omits) propagate. mergeLastAgents
+      // semantics are unchanged for the resync branch (incoming non-empty wins;
+      // FE entries the snapshot omits are kept). The wholesale branch also
+      // prunes orphans: ids absent from snap.lastAgents are dropped.
+      s.lastAgents = resyncing
+        ? mergeLastAgents(s.lastAgents, snap.lastAgents || {})
+        : { ...(snap.lastAgents || {}) };
       // Tier-A current-verb facets seed from the snapshot (active sessions only;
       // the daemon omits idle/cleared ones). Ephemeral — never persisted.
       s.currentVerbs = { ...(snap.currentVerbs || {}) };
@@ -44,17 +110,41 @@ function applySnapshot(snap: Snapshot) {
       for (const [sid, v] of Object.entries(snap.todos || {})) s.todos[sid] = normalizeTodos(v);
       s.unread = {};
       for (const id of snap.unread || []) s.unread[id] = true;
+      // S4 per-session hydration gate (snap.gate[id].hydrated). Rebuilt each
+      // snapshot; rows with hydrated===false are still being aggregated after a
+      // restart and can show a loading hint instead of looking stale.
+      s.hydrated = {};
+      for (const [id, g] of Object.entries(snap.gate || {})) s.hydrated[id] = !!g?.hydrated;
+      // S3 epoch transition: latch so the connection-health toast can surface
+      // "Server restarted — re-syncing…". The merge-protect above already
+      // shielded the labels from this (potentially mid-aggregation) snapshot.
+      if (changed) s.epochChanged = true;
+      if (incomingEpoch) s.epoch = incomingEpoch;
       s.cursor = snap.seq;
     }),
   );
   persist();
 }
 
-function applySessionEvent(kind: string, seq: number, payload: any) {
+// Exported for integration tests (tests/unit/applySnapshot.test.ts).
+export function applySessionEvent(kind: string, seq: number, payload: any) {
+  bumpUpdating();
   setState(
     produce((s) => {
       if (kind === "session.upsert") s.sessions[payload.id] = payload;
-      else if (kind === "session.delete") delete s.sessions[payload.id];
+      else if (kind === "session.delete") {
+        delete s.sessions[payload.id];
+        // B2b: prune the per-session metadata maps so a deleted session's facts
+        // don't leak and can't resurrect on id-reuse. lastAgents/hydrated are
+        // snapshot-seeded facets that must not outlive the session; messagesLoaded
+        // is the open-session delivery flag, cleared here to stay consistent with
+        // the session's removal. (s.messages is owned by the Stream-2 / openSession
+        // lifecycle and reconciled separately, so it is NOT pruned here — see
+        // SyncState.messagesLoaded.)
+        delete s.lastAgents[payload.id];
+        delete s.hydrated[payload.id];
+        delete s.messagesLoaded[payload.id];
+      }
       if (seq) s.cursor = seq;
     }),
   );
@@ -71,6 +161,7 @@ function applySessionEvent(kind: string, seq: number, payload: any) {
 // reconnect — leaving the sidebar stuck on a stale state (the "busy session
 // shows idle, no Stop button" bug). Only Stream 1's events move the cursor.
 function applyMessageEvent(kind: string, seq: number, payload: any, trackCursor = true) {
+  bumpUpdating();
   setState(
     produce((s) => {
       switch (kind) {
@@ -193,6 +284,7 @@ async function refreshOpenSessions() {
     try {
       const items = await fetchSessionMessages(id);
       setState("messages", id, buildMessages(items));
+      setState("messagesLoaded", id, true);
     } catch {
       /* keep stale; reopening re-snapshots */
     }
@@ -204,10 +296,57 @@ let lastSeen = 0; // ms of the last byte/event from the server (incl. pings)
 let reconnectTimer: number | undefined;
 let backoff = 1000; // grows on repeated failures, reset on a healthy open
 let everOpened = false; // first stream open is the initial load; later opens are reconnects
-const STALE_MS = 45_000; // ~3 missed 15s pings → assume the stream is dead
+export const STALE_MS = 45_000; // ~3 missed 15s pings → assume the stream is dead
 
+// --- Feature 1: staleness (S1) ---------------------------------------------
+// healthNow is a coarse tick (bumped by the watchdog) so staleness re-evaluates
+// over wall-clock time even with no store writes. isStale reads the
+// NON-reactive module `lastSeen` (plain var → no per-event subscription), so
+// consumers of isStale only re-run on healthNow / state.status changes, not on
+// every SSE byte. This keeps the stale indicator off the per-token hot path.
+const [healthNow, setHealthNow] = createSignal(0);
+// tickHealth advances the coarse health tick WITHOUT touching the watchdog's
+// reconnect logic. Called on a faster cadence than the 10s watchdog (see
+// startSync) so a stale-but-open socket surfaces the stale indicator BEFORE
+// the watchdog reconnects it — otherwise isStale() could never render (the
+// watchdog flips status to "reconnecting" in the same tick it detects staleness).
+export function tickHealth() {
+  setHealthNow((n) => n + 1);
+}
+export function isStale(): boolean {
+  healthNow(); // subscribe to the coarse tick
+  return state.status === "live" && lastSeen > 0 && Date.now() - lastSeen > STALE_MS;
+}
+// lastSeenStateWritten throttles the mirror into the reactive store: markSeen
+// fires on every SSE byte, but writing state.lastSeen that often would notify
+// the debug surfaces per-token. Bound it to ~1 write/sec.
+let lastSeenStateWritten = 0;
 function markSeen() {
   lastSeen = Date.now();
+  const now = lastSeen;
+  if (now - lastSeenStateWritten >= 1000) {
+    lastSeenStateWritten = now;
+    setState("lastSeen", now);
+  }
+}
+
+// --- Feature 2: anti-spam "updating" indicator (U3 debounce) ---------------
+// Leading edge lights the indicator on the first data event; trailing edge
+// holds it for UPDATING_DEBOUNCE_MS after the LAST event, then clears. A token
+// stream (events <600ms apart) keeps it continuously lit without per-token
+// flicker; a pause longer than the window turns it off. bumpUpdating is called
+// at the top of applySnapshot/applySessionEvent/applyMessageEvent — the data
+// reconciliation entry points for both streams.
+export const UPDATING_DEBOUNCE_MS = 600;
+const [updating, setUpdating] = createSignal(false);
+let updatingTimer: number | undefined;
+export function isUpdating(): boolean {
+  return updating();
+}
+function bumpUpdating() {
+  setUpdating(true);
+  clearTimeout(updatingTimer);
+  updatingTimer = window.setTimeout(() => setUpdating(false), UPDATING_DEBOUNCE_MS);
 }
 
 // === Stream 1: tree + notifications (persistent) ============================
@@ -225,16 +364,44 @@ function markSeen() {
 // reconciles all current state authoritatively. Transient in-page reconnects
 // (watchdog/onerror/visibility) resume normally: in-memory state is intact, and
 // the server falls back to a snapshot itself if the gap exceeds its ring buffer.
+// --- Feature 3: connection-vs-server latency diagnostic (L1, FE-only) -----
+// Purely additive instrumentation (zero server change). For each stream we
+// capture three performance.now() stamps and derive two deltas:
+//   open = onopen − EventSource construction  (pure connection latency)
+//   snap = first snapshot − onopen            (server: ensureMessages + compute
+//                                              + serialize)
+// The first snapshot per connection bounds `snap`; later snapshots are normal
+// deltas and aren't timed. Surfaces in ServersPanel as "conn: Xms · server: Yms"
+// per stream so an operator can tell a slow connection from a slow server.
+function recordLatency(stream: "tree" | "session", phase: "open" | "snap", ms: number): void {
+  setState("connLatency", stream, phase, Math.max(0, Math.round(ms)));
+}
+// Per-connection stamps/flags. Reset on each (re)open; snap recorded once.
+let treeT0 = 0;
+let treeT1 = 0;
+let treeSnapDone = false;
+let sesT0 = 0;
+let sesT1 = 0;
+let sesSnapDone = false;
+
 export function connect(fresh = false) {
   clearTimeout(reconnectTimer);
   es?.close();
   const cursorParam = fresh ? "" : `cursor=${state.cursor}&`;
+  treeT0 = performance.now(); // L1 t0: connection attempt begins
+  treeT1 = 0;
+  treeSnapDone = false;
   es = new EventSource(`/vh/stream?${cursorParam}sessions=&dir=${encodeURIComponent(projectDir())}`);
   markSeen();
   log.debug("sync", "tree stream connect", { cursor: fresh ? "fresh" : state.cursor, dir: projectDir() });
   es.addEventListener("snapshot", (e) => {
     markSeen();
     applySnapshot(JSON.parse((e as MessageEvent).data));
+    // L1 t2: first snapshot of this connection → server-processing delta.
+    if (!treeSnapDone) {
+      treeSnapDone = true;
+      if (treeT1) recordLatency("tree", "snap", performance.now() - treeT1);
+    }
     setState("status", "live");
     void refreshOpenSessions();
   });
@@ -264,6 +431,9 @@ export function connect(fresh = false) {
   });
   es.onopen = () => {
     markSeen();
+    // L1 t1: socket established → pure connection-latency delta.
+    treeT1 = performance.now();
+    if (treeT0) recordLatency("tree", "open", treeT1 - treeT0);
     backoff = 1000; // healthy — reset backoff
     setState("status", "live");
     // A reconnect (not the first open) means the stream dropped and came back —
@@ -308,14 +478,34 @@ export function openSessionStream(id: string) {
   const open = () => {
     if (sesId !== id) return;
     ses?.close();
+    sesT0 = performance.now(); // L1 t0: session-stream connection attempt
+    sesT1 = 0;
+    sesSnapDone = false;
     ses = new EventSource(`/vh/stream?sessions=${encodeURIComponent(id)}&dir=${encodeURIComponent(projectDir())}`);
     log.debug("sync", "session stream connect", { id });
     ses.addEventListener("snapshot", (e) => {
       markSeen();
       const snap: Snapshot = JSON.parse((e as MessageEvent).data);
+      // L1 t2: first snapshot of this connection → server-processing delta
+      // (ensureMessages for this session + snapshot compute + serialize).
+      if (!sesSnapDone) {
+        sesSnapDone = true;
+        if (sesT1) recordLatency("session", "snap", performance.now() - sesT1);
+      }
       setState("messages", id, buildMessages((snap.messages?.[id] as any[]) || []));
+      // The real snapshot has landed → mark this session delivered so the
+      // transcript distinguishes "loading" from "delivered-and-empty".
+      setState("messagesLoaded", id, true);
     });
     ses.addEventListener("ping", () => markSeen());
+    // L1 t1: socket established → pure connection-latency delta. Stream 2 had
+    // no explicit onopen before; added for the latency diagnostic (and parity
+    // with Stream 1's connect/backoff semantics).
+    ses.onopen = () => {
+      markSeen();
+      sesT1 = performance.now();
+      if (sesT0) recordLatency("session", "open", sesT1 - sesT0);
+    };
     for (const kind of ["message.upsert", "message.delete", "part.upsert", "part.delete"]) {
       ses!.addEventListener(kind, (e) => {
         markSeen();
@@ -339,6 +529,9 @@ export function openSessionStream(id: string) {
 // closed. Runs while the tab is visible.
 export function watchdogTick() {
   if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
+  // Feature 1: re-evaluate staleness over wall-clock time (no store write on
+  // a silent-but-open socket). Coarse tick only — safe on the per-frame budget.
+  setHealthNow((n) => n + 1);
   if (!es || es.readyState === EventSource.CLOSED) {
     connect();
   } else if (lastSeen && Date.now() - lastSeen > STALE_MS) {

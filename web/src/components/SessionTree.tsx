@@ -311,6 +311,14 @@ function Node(props: {
             <Show when={!busy() && !needsInput() && state.unread[props.session.id]}>
               <span class="dot unread" data-tip="finished — not yet viewed" />
             </Show>
+            {/* Feature 1 (S4): this session exists in the tree but the daemon is
+                still aggregating its tail (hydrated=false, typically right after
+                a restart while the server serves HTTP early). A subtle faded dot
+                so the row reads "still loading" rather than "stale/empty". Only
+                while live — the connecting state is already conveyed by the dot. */}
+            <Show when={state.status === "live" && state.hydrated[props.session.id] === false && !busy()}>
+              <span class="dot hydrating" data-tip="loading from server…" />
+            </Show>
             <AgentChip sessionID={props.session.id} />
             <span class="tree-title" classList={{ unread: !busy() && !!state.unread[props.session.id], "needs-input": needsInput() }}>
               {props.session.title || props.session.id}

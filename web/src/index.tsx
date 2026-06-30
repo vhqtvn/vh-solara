@@ -15,6 +15,7 @@ import { installCsrf } from "./csrf";
 import { installViewport } from "./viewport";
 import { installScrollEdges } from "./lib/scrollEdges";
 import { startPresence } from "./alerts";
+import { refreshProjectSettings } from "./projectSettings";
 import "./styles.css";
 
 // Best-effort: re-fire loadAgents()/loadModels() and retry while agents stay
@@ -91,12 +92,19 @@ if (standalone === "code") {
   // the stream's first open (onopen) and every reconnect set status to "live".
   // defer: the boot calls own the very first attempt; this fires on each
   // connecting→live transition (initial open AND reconnect after a drop).
+  // S3 supplement: ALSO re-pull project settings here. refreshProjectSettings
+  // otherwise only runs on projectDir change (App.tsx), so a reconnect after a
+  // server restart — where the project.jsonc watch EventSource also died and
+  // re-opened — could leave agent-style chips stale until a manual reload.
   createRoot(() =>
     createEffect(
       on(
         () => state.status === "live",
         (live, prev) => {
-          if (live && !prev) void ensureAgentsLoaded();
+          if (live && !prev) {
+            void ensureAgentsLoaded();
+            void refreshProjectSettings();
+          }
         },
         { defer: true },
       ),
