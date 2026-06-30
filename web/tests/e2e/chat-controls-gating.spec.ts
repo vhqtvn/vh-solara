@@ -4,8 +4,14 @@ import { expect, test } from "@playwright/test";
 //
 // Two controls anchor at the bottom of `.chat-main` (the scroll viewport):
 //
-//   .chat-live — the "Live" pill, shown while glued to the live tail:
-//     <Show when={following() && !focusMode() && messages().length > 0}>
+//   .chat-live — the "Live" pill, shown while glued to the live tail AND while a
+//     turn is live (busy/retrying):
+//     <Show when={following() && working() && !focusMode() && messages().length > 0}>
+//     The `&& working()` gate (commit 419ea39) hides the pill on finished/idle
+//     turns — the idle demo/other/sub fixtures all have working()=false, so the
+//     pill never shows there; tail-following is asserted via geometry instead
+//     (expectFollowingTail below), and the pill itself is exercised under a real
+//     busy turn in test (3) and in scroll-follow.spec.ts test 11.
 //
 //   button.jump — the "↓ Latest" button, shown after scrolling away from the
 //     tail:
@@ -46,10 +52,50 @@ import { expect, test } from "@playwright/test";
 // scrolling. The other two sessions don't depend on scrolling.
 const VP = { width: 400, height: 320 };
 
-// (1) Populated parent (demo): the Live pill and the Latest button are
-//     mutually exclusive on the `following` signal. Glued to the tail the Live
-//     pill is up and the button is absent; scrolling away flips them.
-test("demo: Live pill and Latest button flip on following at the tail", async ({ page }) => {
+// Geometry-first "following the tail" check — mirrors scroll-follow.spec.ts's
+// expectFollowingTail. The idle demo/other fixtures have working()=false, so the
+// .chat-live pill is hidden by the `&& working()` gate (419ea39) even at the tail;
+// following=true is proved here via bottom geometry + the absent "↓ Latest" button.
+async function expectFollowingTail(page: import("@playwright/test").Page) {
+  await expect.poll(
+    async () =>
+      page.locator(".chat-scroll").evaluate((e: HTMLElement) =>
+        e.scrollHeight - e.scrollTop - e.clientHeight < 24 ? 1 : 0,
+      ),
+    { timeout: 5000 },
+  ).toBe(1);
+  await expect(page.locator("button.jump")).toHaveCount(0);
+}
+
+// Prompt a session via the same route the composer uses (POST prompt_async), run
+// in-page so the request is same-origin and carries the X-VH-CSRF header the
+// state-changing-request guard requires. A prompt containing [[stall]] keeps the
+// session busy ~5s (no assistant message), giving a stable window to assert a
+// control gated on working() (used in test 3 — a child session has no composer to
+// type into, so we drive its busy state through the API).
+async function promptSession(page: import("@playwright/test").Page, id: string, text: string) {
+  await page.evaluate(
+    async ({ id, text }) => {
+      const res = await fetch(`/oc/session/${id}/prompt_async`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-VH-CSRF": "1" },
+        body: JSON.stringify({ parts: [{ type: "text", text }] }),
+      });
+      if (!res.ok && res.status !== 204) {
+        throw new Error(`prompt_async ${id} -> ${res.status}`);
+      }
+    },
+    { id, text },
+  );
+}
+
+// (1) Populated parent (demo): the controls flip on `following`. The `&& working()`
+//     gate (419ea39) hides the Live pill on the idle demo, so the tail state is
+//     asserted via geometry + the absent "↓ Latest" button; scrolling away flips
+//     following=false and surfaces the button. The pill's OWN `following` gate
+//     under working()=true is covered in scroll-follow.spec.ts test 11 (it needs a
+//     busy turn, impossible on the static idle demo here).
+test("demo: Latest button flips on following at the tail (Live pill gated on working)", async ({ page }) => {
   await page.setViewportSize(VP);
   await page.goto("/?session=demo");
   await expect(page.locator(".msg").first()).toBeVisible({ timeout: 10000 });
@@ -60,12 +106,14 @@ test("demo: Live pill and Latest button flip on following at the tail", async ({
   await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
     el.scrollTop = el.scrollHeight;
   });
-  // following=true → Live pill is up, Latest button is absent.
-  await expect(page.locator(".chat-live")).toBeVisible({ timeout: 5000 });
-  await expect(page.locator("button.jump")).toHaveCount(0);
+  // following=true. The idle demo's Live pill is HIDDEN by the `&& working()` gate
+  // (419ea39 — the pill renders only while a turn is live), so prove following=true
+  // via bottom geometry + the absent "↓ Latest" button (expectFollowingTail).
+  await expectFollowingTail(page);
 
-  // Scroll away from the tail: following flips false → Latest button appears,
-  // Live pill disappears. Proves BOTH gates read `following`.
+  // Scroll away from the tail: following flips false → "↓ Latest" appears. The
+  // Live pill stays absent (it needs following && working; following is now false),
+  // proving the pill's `following` gate reads the signal even when hidden by working.
   await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
     el.scrollTop = 0;
   });
@@ -88,14 +136,17 @@ test("other: both Live pill and Latest button absent for an empty session", asyn
   await expect(page.locator("button.jump")).toHaveCount(0);
 });
 
-// (3) Child/subagent session (sub): the auto-follow controls now RENDER.
-//     This guards the REMOVAL of the `!isChild()` term on both gates: `sub` HAS
-//     one message (so `messages().length > 0` is true) and is a normal scroll
-//     surface, so exactly one of the Live pill / Latest button must render on
-//     the `following` signal, exactly like a parent session. The controls are
-//     anchored to `.chat-main` (the scroll viewport), NOT the composer, so they
-//     position correctly even though the child view has no composer.
-test("sub: the Live pill / Latest button render in a child/subagent session", async ({ page }) => {
+// (3) Child/subagent session (sub): the auto-follow controls RENDER in a child.
+//     This guards the REMOVAL of the `!isChild()` term on both gates. Under the
+//     `&& working()` gate (419ea39) an idle single-message child at the tail shows
+//     NEITHER cue (pill needs working; button needs !following) — a vacuous count:0
+//     indistinguishable from isChild still suppressing both. So we drive a real busy
+//     turn (a subagent working while you watch it is exactly the live scenario the
+//     pill exists for) via the API — a child has no composer to type into — and
+//     assert the Live pill renders in the child: following (never scrolled) &&
+//     working (busy) && !isChild. The controls are anchored to `.chat-main` (the
+//     scroll viewport), NOT the composer, so they position correctly without one.
+test("sub: the Live pill renders in a working child/subagent session", async ({ page }) => {
   await page.goto("/?session=sub");
   // The child-note replaces the composer for subagent sessions; it only renders
   // once isChild() has resolved true (state.sessions[sub].parentID synced in),
@@ -104,11 +155,16 @@ test("sub: the Live pill / Latest button render in a child/subagent session", as
   // "disabled for subagent" notice.)
   await expect(page.locator(".composer-child-note")).toBeVisible({ timeout: 10000 });
 
-  // Exactly one of the Live pill / Latest button renders — they are mutually
-  // exclusive on `following`. `sub` is a single short message at rest at the
-  // default viewport, so following=true (its initial value) and the Live pill is
-  // the one that's up; the Latest button is absent.
-  await expect(page.locator(".chat-live, button.jump")).toHaveCount(1);
-  await expect(page.locator(".chat-live")).toBeVisible();
+  // Drive a busy turn so working()=true. [[stall]] holds the session busy ~5s
+  // (no assistant message), a stable window to assert the pill. `sub` is a
+  // non-scrollable single-message child at rest (following=true), so the only
+  // cue reachable to non-vacuously prove the !isChild() removal is the Live pill.
+  await promptSession(page, "sub", "[[stall]] subagent controls probe");
+  await expect(page.locator(".working-text")).toBeVisible({ timeout: 8000 });
+
+  // The Live pill renders in the child: following && working && !focusMode &&
+  // messages>0, AND (the point) the old !isChild() term no longer suppresses it.
+  // The "↓ Latest" button stays absent (following=true; we never scrolled).
+  await expect(page.locator(".chat-live")).toBeVisible({ timeout: 3000 });
   await expect(page.locator("button.jump")).toHaveCount(0);
 });

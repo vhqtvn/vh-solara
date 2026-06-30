@@ -133,8 +133,19 @@ test("a session finishing while watched at the bottom clears the dot", async ({ 
   await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
     el.scrollTop = el.scrollHeight;
   });
-  // Confirm the tail-glue took: the Live pill only renders while following().
-  await expect(page.locator(".chat-live")).toBeVisible({ timeout: 5000 });
+  // Confirm the tail-glue took via geometry. `other` is idle here (pre-prompt),
+  // so the .chat-live pill is hidden by the `&& working()` gate (419ea39 — see
+  // scroll-follow.spec.ts expectFollowingTail) even though following=true; the
+  // bottom geometry + absent "↓ Latest" button prove following && nearBottom(),
+  // which is exactly the reactive ack's precondition.
+  await expect.poll(
+    async () =>
+      page.locator(".chat-scroll").evaluate((e: HTMLElement) =>
+        e.scrollHeight - e.scrollTop - e.clientHeight < 24 ? 1 : 0,
+      ),
+    { timeout: 5000 },
+  ).toBe(1);
+  await expect(page.locator("button.jump")).toHaveCount(0);
 
   // Prompt the session we are watching → busy (shimmer) → idle. The busy→idle
   // transition arms the dot server-side; the reactive effect acks it at the
