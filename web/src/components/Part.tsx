@@ -284,11 +284,15 @@ function Markdown(props: { text: string; settled: boolean; caret?: boolean }) {
     const FRAME_MS = 200; // ~5fps
     let timer: number | undefined;
     let lastRender = 0;
-    const flush = () => {
+    // `force` re-formats the trailing block on demand (used on tab-resume so
+    // inline markdown snaps in with the raw text, not up to REPARSE_MS later).
+    // Steady-state flushes pass false and stay throttled by the REPARSE_MS cap
+    // (heat guardrail — forced reparse is once-per-resume, never per-frame).
+    const flush = (force = false) => {
       timer = undefined;
       if (!host) return;
       lastRender = performance.now();
-      (engine ||= new StreamMd(host)).push(props.text, lastRender);
+      (engine ||= new StreamMd(host)).push(props.text, lastRender, force);
       if (props.caret) placeStreamCaret(host, caretEl);
     };
     createEffect(() => {
@@ -297,7 +301,25 @@ function Markdown(props: { text: string; settled: boolean; caret?: boolean }) {
       if (props.settled || timer !== undefined) return; // a render is already queued — coalesce
       timer = window.setTimeout(flush, Math.max(0, FRAME_MS - (performance.now() - lastRender)));
     });
-    onCleanup(() => { if (timer !== undefined) clearTimeout(timer); });
+    // Snap-on-resume: while the tab is hidden the browser throttles setTimeout
+    // to ≥1s (intensive throttling → ~once/30s), so flush() rarely fires and the
+    // rendered length falls behind the store's text. On return to visible, cancel
+    // any queued (throttled) tick and flush now — StreamMd.push drains an
+    // arbitrarily large delta in one call, so the part snaps to the latest text
+    // in a single frame instead of slowly floating in.
+    const onVisible = () => {
+      if (document.visibilityState !== "visible") return;
+      if (props.settled) return; // live engine is unmounted on settle — nothing to snap
+      if (timer === undefined) return; // nothing queued → renderer is current, nothing to snap
+      clearTimeout(timer);
+      timer = undefined;
+      flush(true);
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    onCleanup(() => {
+      document.removeEventListener("visibilitychange", onVisible);
+      if (timer !== undefined) clearTimeout(timer);
+    });
     return <div class="md md-stream" ref={host} />;
   };
   return (

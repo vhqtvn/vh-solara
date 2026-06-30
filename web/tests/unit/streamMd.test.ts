@@ -101,4 +101,28 @@ describe("StreamMd (incremental streaming markdown)", () => {
     expect(h.querySelectorAll("p")).toHaveLength(1);
     expect(h.querySelector("p")?.textContent).toBe("Totally");
   });
+
+  it("drains a large accumulated delta in a single push (snap-on-resume invariant)", () => {
+    // While the tab was hidden the store kept accumulating; on resume one flush
+    // hands push the whole delta, which the hot path must append in one text
+    // node — so the rendered length catches up to props.text in a single frame.
+    const h = host();
+    const md = new StreamMd(h);
+    md.push("seed", 0);
+    const big = "seed" + " word".repeat(2000);
+    md.push(big, 100); // within REPARSE_MS, no boundary → single hot-path append
+    expect(h.querySelector("p")?.textContent).toBe(big);
+  });
+
+  it("force-reparses the trailing block on demand (snap-on-resume formatting)", () => {
+    // A forced reparse bypasses the REPARSE_MS cap once so inline formatting
+    // settles together with the raw text on resume (Part.tsx passes force=true).
+    const h = host();
+    const md = new StreamMd(h);
+    md.push("**bo", 0);
+    md.push("**bold**", 10); // within cap, no boundary → stays raw
+    expect(h.querySelector("strong")).toBeNull();
+    md.push("**bold**", 20, true); // force bypasses the cap → re-parsed, formatted
+    expect(h.querySelector("strong")?.textContent).toBe("bold");
+  });
 });

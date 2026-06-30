@@ -67,8 +67,10 @@ export class StreamMd {
   }
 
   // Render `text` (a prefix of the full streamed message). `now` is a timestamp
-  // (ms) used only for the re-parse time cap; pass performance.now().
-  push(text: string, now = 0): void {
+  // (ms) used only for the re-parse time cap; pass performance.now(). `force`
+  // bypasses that cap once (tab-resume snap) so inline formatting settles with
+  // the raw text instead of up to REPARSE_MS later; steady state never sets it.
+  push(text: string, now = 0, force = false): void {
     if (text.length < this.committedLen) this.reset();
 
     // Hot path: APPEND the new characters as a fresh text node — never rewrite
@@ -79,7 +81,7 @@ export class StreamMd {
     if (this.tailHost && text.length >= this.parsedLen + this.tailLen) {
       const delta = text.slice(this.parsedLen + this.tailLen);
       const boundary = delta.includes("\n\n") || (this.inCode && delta.includes("```"));
-      if (!boundary && now - this.lastParse < REPARSE_MS) {
+      if (!force && !boundary && now - this.lastParse < REPARSE_MS) {
         if (delta) {
           this.tailHost.appendChild(document.createTextNode(delta));
           this.tailLen += delta.length;
