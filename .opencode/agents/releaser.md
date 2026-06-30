@@ -39,6 +39,24 @@ constant** — the tag IS the version. See AGENTS.md → "Releases are tag-drive
    wrong bump. The discovery pipeline in Step 1 is the canonical `sort -V`
    form; next-version math is integer arithmetic on the
    `(MAJOR, MINOR, PATCH)` tuple.
+7. **The discovered `LAST` is authoritative; orchestrator hints are
+   non-binding.** Any baseline / "last tag" / next-version figure supplied by a
+   delegating orchestrator (coordinator, build) is a HINT only — you ALWAYS
+   recompute `LAST` from the Step 1 `sort -V` pipeline and the bump from the
+   actual commits, and you PROCEED with the computed tag. A delegated generic
+   "cut a release" request IS the ask that rule 4 requires, and the
+   next-version tag computed from actual repo state is exactly the tag that was
+   asked for. The ONLY legitimate reasons to stop and return a refusal
+   (`tag_pushed: false`) are genuine blockers:
+   - the working tree is dirty,
+   - `HEAD == LAST` (nothing new to release),
+   - there are no `v*` tags at all AND the operator supplied no floor version,
+   - the operator EXPLICITLY named a specific target version that CONFLICTS with
+     the computed one (a real ambiguity only the operator can resolve).
+   A stale or wrong orchestrator hint is NOT a blocker: if a hint disagrees with
+   the discovered `LAST`, record the discrepancy in the JSON `note` field (see
+   Output format) and PROCEED with the computed tag. Do not stall the release to
+   reconcile a hint.
 
 ## Flow
 
@@ -74,8 +92,11 @@ describe` is not allowlisted):
 - Commits since `LAST`: `git log ${LAST}..HEAD --format='%H%n%s%n%b%n---END---'`
   (the `---END---` delimiter separates multi-line bodies).
 - HEAD sha: `git rev-parse HEAD`.
-- Refuse early if `HEAD == LAST` (nothing new to release) — return an error in
-  the JSON, do not call the wrapper.
+- Refuse early (return a refusal JSON, do not call the wrapper) ONLY for a
+  genuine blocker — `HEAD == LAST` (nothing new to release) is one; see Hard
+  rule 7 for the full refusal taxonomy. An orchestrator-supplied "last tag" or
+  next-version figure that disagrees with the discovered `LAST` is NOT a refusal
+  reason — record the discrepancy in the JSON `note` and proceed.
 
 ### Step 2 — Decide the semver bump from conventional commits
 
@@ -153,21 +174,25 @@ Relay the wrapper's JSON result verbatim in your output.
 
 ## Output format
 
-Always return a single JSON object (plus the wrapper's result embedded). If you
-refused (e.g. nothing to release, dirty tree), still return JSON with the reason
-and `tag_pushed: false`:
+Always return a single JSON object (plus the wrapper's result embedded). Refuse
+(return JSON with `tag_pushed: false` and an `error`) ONLY for a genuine blocker
+— see Hard rule 7 for the full taxonomy. An orchestrator hint that disagrees
+with the discovered `LAST` is NOT a refusal reason: record the discrepancy in the
+optional `note` string field and proceed. `note` is optional on every result
+(omit it or set `null` when there is nothing to record):
 
 ```json
 {
-  "last_tag": "v1.33.0",
-  "next_version": "v1.34.0",
-  "bump": "minor",
-  "rationale": { "breaking": 0, "feat": 2, "fix": 1, "other": 5 },
+  "last_tag": "v1.34.4",
+  "next_version": "v1.34.5",
+  "bump": "patch",
+  "rationale": { "breaking": 0, "feat": 0, "fix": 1, "other": 2 },
   "tag_pushed": true,
-  "tag": "v1.34.0",
+  "tag": "v1.34.5",
   "commit": "<40-char sha of HEAD>",
-  "changelog": "## Added\n- feat(...): ...\n\n## Fixed\n- fix(...): ...\n",
-  "wrapper_result": { "ok": true, "tag": "v1.34.0", "commit": "...", "pushed": true, "error": null }
+  "changelog": "## Fixed\n- fix(...): ...\n",
+  "note": "orchestrator stated v1.9.0 but discovered LAST is v1.34.4; proceeded with discovered value",
+  "wrapper_result": { "ok": true, "tag": "v1.34.5", "commit": "...", "pushed": true, "error": null }
 }
 ```
 
@@ -175,7 +200,7 @@ On refusal:
 
 ```json
 {
-  "last_tag": "v1.33.0",
+  "last_tag": "v1.34.4",
   "next_version": null,
   "bump": null,
   "rationale": null,
@@ -183,8 +208,9 @@ On refusal:
   "tag": null,
   "commit": "<sha>",
   "changelog": null,
+  "note": null,
   "wrapper_result": null,
-  "error": "HEAD == last tag (v1.33.0): nothing new to release"
+  "error": "HEAD == last tag (v1.34.4): nothing new to release"
 }
 ```
 
