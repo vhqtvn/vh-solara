@@ -5,7 +5,7 @@
 // without a cycle. State is reconciled by id, never nuked.
 import { createStore } from "solid-js/store";
 import { createSignal } from "solid-js";
-import type { ConnStatus, Permission, Question, Session, SessionMessages, TodoItem } from "../types";
+import type { ConnStatus, Permission, Question, Session, SessionMessages, TodoItem, VerbFacet } from "../types";
 import { loadVersioned, saveVersioned } from "../lib/store";
 
 const LS_SESSIONS = "vh.sessions.v1";
@@ -72,6 +72,14 @@ export interface SyncState {
   // Per-session agent name (most recent assistant turn) for ALL sessions, so the
   // tree can render per-agent chips on a cold tree before any session is opened.
   lastAgents: Record<string, string>;
+  // Per-session current-verb facet (raw tool primitive) for ALL sessions, so an
+  // UNOPENED task-tool subagent's chat row can show rich activity ("Reading
+  // parser.go") WITHOUT loading Tier-B (message) data. Ephemeral and NOT
+  // persisted: a stale verb on reload would be misleading (the agent may have
+  // moved on), so this self-heals from the snapshot facet + the next live
+  // activity.verb event within seconds — unlike lastAgents/activity, which ARE
+  // persisted to render chips/state instantly on a cold reload.
+  currentVerbs: Record<string, VerbFacet>;
   permissions: Record<string, Record<string, Permission>>;
   questions: Record<string, Record<string, Question>>;
   // Per-session agent todo list (OpenCode TodoWrite), kept for all sessions so
@@ -89,6 +97,7 @@ export const [state, setState] = createStore<SyncState>({
   messages: {},
   activity: loadActivity(initialDir),
   lastAgents: loadLastAgents(initialDir),
+  currentVerbs: {},
   permissions: {},
   questions: {},
   todos: {},

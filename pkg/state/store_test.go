@@ -498,3 +498,163 @@ func TestLastAgentColdSeedPreserved(t *testing.T) {
 		t.Fatalf("loaded session: want live-derived lastAgent 'plan', got %q", got)
 	}
 }
+
+// TestRecomputeCurrentVerbRunningThenCleared covers the Tier-A current-activity
+// facet (O4 hybrid): a running tool part seeds the facet (surfaced in the
+// snapshot so an UNOPENED subagent's "Reading parser.go" renders without loading
+// Tier-B messages), and the authoritative idle signal clears it — even though a
+// stale part snapshot may still read status:"running".
+func TestRecomputeCurrentVerbRunningThenCleared(t *testing.T) {
+	s := New(100)
+	s.Apply(ev("session.created", `{"info":{"id":"child","parentID":"root"}}`))
+	s.Apply(ev("message.updated", `{"info":{"id":"m1","sessionID":"child","role":"assistant","time":{"created":1}}}`))
+	s.Apply(ev("message.part.updated", `{"part":{"id":"p1","sessionID":"child","messageID":"m1","type":"tool","tool":"read","state":{"status":"running","input":{"filePath":"src/parser.go"},"time":{"start":4000}}}}`))
+
+	snap := s.Snapshot(map[string]bool{}) // tree-only — messages NOT included
+	facet, ok := snap.CurrentVerbs["child"]
+	if !ok {
+		t.Fatal("tree-only snapshot missing currentVerbs for a session with a running tool")
+	}
+	if facet.Tool != "read" {
+		t.Fatalf("want facet tool 'read', got %q", facet.Tool)
+	}
+	// The salient state (input + status + time.start) is carried; the client
+	// formats it via its existing toolVerb/toolSubject (Path B2).
+	var st struct {
+		Status string         `json:"status"`
+		Input  map[string]any `json:"input"`
+		Time   struct {
+			Start float64 `json:"start"`
+		} `json:"time"`
+	}
+	if json.Unmarshal(facet.State, &st) != nil {
+		t.Fatalf("facet state not valid JSON: %s", facet.State)
+	}
+	if st.Status != "running" || st.Input["filePath"] != "src/parser.go" || st.Time.Start != 4000 {
+		t.Fatalf("facet salient state wrong: status=%q input=%v time=%+v", st.Status, st.Input, st.Time)
+	}
+	// Tree-only snapshot must NOT have hydrated the child's messages — this is
+	// the whole point: the verb renders without Tier-B message data.
+	if _, loaded := snap.Messages["child"]; loaded {
+		t.Fatal("tree-only snapshot must not carry the child's messages")
+	}
+
+	// The session goes idle (turn truly ended). Even if a later part snapshot
+	// hadn't flipped the tool to completed, the authoritative idle clears the
+	// facet so a stale "Reading …" can't linger.
+	s.Apply(ev("session.idle", `{"sessionID":"child"}`))
+	if got := s.Snapshot(map[string]bool{}).CurrentVerbs; len(got) != 0 {
+		t.Fatalf("want currentVerbs cleared on idle, got %+v", got)
+	}
+}
+
+// TestRecomputeCurrentVerbPicksNewestRunningTool mirrors the client's
+// activeVerbFromTurn precedence: among the newest assistant message's parts, the
+// NEWEST running tool wins; a completed tool is skipped in favor of an older
+// running one. A non-running latest part does not clear an older running tool.
+func TestRecomputeCurrentVerbPicksNewestRunningTool(t *testing.T) {
+	s := New(100)
+	s.Apply(ev("session.created", `{"info":{"id":"s"}}`))
+	s.Apply(ev("message.updated", `{"info":{"id":"m1","sessionID":"s","role":"assistant"}}`))
+	s.Apply(ev("message.part.updated", `{"part":{"id":"p1","sessionID":"s","messageID":"m1","type":"tool","tool":"bash","state":{"status":"running","input":{"command":"old"},"time":{"start":1000}}}}`))
+	s.Apply(ev("message.part.updated", `{"part":{"id":"p2","sessionID":"s","messageID":"m1","type":"tool","tool":"read","state":{"status":"completed"},"time":{"start":2000,"end":2100}}}`))
+	// p2 is newer but completed; p1 (older) is still running → facet is p1.
+	if got := s.Snapshot(nil).CurrentVerbs["s"].Tool; got != "bash" {
+		t.Fatalf("want oldest-running 'bash' when newest tool completed, got %q", got)
+	}
+	// A newer running tool takes over.
+	s.Apply(ev("message.part.updated", `{"part":{"id":"p3","sessionID":"s","messageID":"m1","type":"tool","tool":"grep","state":{"status":"running","input":{"pattern":"TODO"},"time":{"start":3000}}}}`))
+	if got := s.Snapshot(nil).CurrentVerbs["s"].Tool; got != "grep" {
+		t.Fatalf("want newest running 'grep', got %q", got)
+	}
+}
+
+// TestCurrentVerbPreservedAcrossSessionUpsert mirrors the lastAgent guarantee:
+// a session.updated that replaces the entry (e.g. a metadata/title refresh) must
+// NOT wipe a live-set current-activity facet for a running subagent.
+func TestCurrentVerbPreservedAcrossSessionUpsert(t *testing.T) {
+	s := New(100)
+	s.Apply(ev("session.created", `{"info":{"id":"child"}}`))
+	s.Apply(ev("message.updated", `{"info":{"id":"m1","sessionID":"child","role":"assistant"}}`))
+	s.Apply(ev("message.part.updated", `{"part":{"id":"p1","sessionID":"child","messageID":"m1","type":"tool","tool":"read","state":{"status":"running","input":{"filePath":"a.go"},"time":{"start":1}}}}`))
+	s.Apply(ev("session.updated", `{"info":{"id":"child","title":"refreshed"}}`))
+	if got := s.Snapshot(nil).CurrentVerbs["child"].Tool; got != "read" {
+		t.Fatalf("currentVerb must survive session.updated, got %q", got)
+	}
+}
+
+// drainKind reads all currently-buffered events of `kind` from ch (non-blocking).
+func drainKind(ch <-chan ClientEvent, kind string) []ClientEvent {
+	var out []ClientEvent
+	for {
+		select {
+		case e := <-ch:
+			if e.Kind == kind {
+				out = append(out, e)
+			}
+		default:
+			return out
+		}
+	}
+}
+
+// TestActivityVerbEmitOnTransitionNotDelta is the Stream-1 routing contract for
+// the Tier-A verb event: a tool transition (running tool appears) emits exactly
+// one KindActivityVerb; the per-token delta path (message.part.delta) emits
+// NONE; an identical re-upsert is idempotent (no extra emit); idle clears it.
+// The event kind is NOT prefixed message./part. so the web layer's sendable()
+// always-streams it on the tree-only Stream 1 to every client (mirrors activity).
+func TestActivityVerbEmitOnTransitionNotDelta(t *testing.T) {
+	s := New(100)
+	ch, unsub := s.Subscribe(128)
+	defer unsub()
+	drainKind(ch, "") // drop the subscribe-time backlog (none, but be safe)
+
+	s.Apply(ev("session.created", `{"info":{"id":"s"}}`))
+	s.Apply(ev("message.updated", `{"info":{"id":"m1","sessionID":"s","role":"assistant"}}`))
+	drainKind(ch, "") // drop session.upsert + message.upsert
+
+	// 1) A running tool appears → exactly one activity.verb carrying tool + state.
+	s.Apply(ev("message.part.updated", `{"part":{"id":"p1","sessionID":"s","messageID":"m1","type":"tool","tool":"read","state":{"status":"running","input":{"filePath":"src/parser.go"},"output":"","time":{"start":4000}}}}`))
+	evs := drainKind(ch, KindActivityVerb)
+	if len(evs) != 1 {
+		t.Fatalf("running tool: want 1 %s event, got %d", KindActivityVerb, len(evs))
+	}
+	var p struct {
+		SessionID string          `json:"sessionID"`
+		Tool      string          `json:"tool"`
+		State     json.RawMessage `json:"state"`
+	}
+	if json.Unmarshal(evs[0].Payload, &p) != nil || p.SessionID != "s" || p.Tool != "read" {
+		t.Fatalf("activity.verb payload wrong: %s", evs[0].Payload)
+	}
+	// State carries salient fields; the mutable `output` is trimmed so growth
+	// doesn't re-emit.
+	var st map[string]json.RawMessage
+	_ = json.Unmarshal(p.State, &st)
+	if _, hasOutput := st["output"]; hasOutput {
+		t.Fatalf("facet state must trim mutable output, got %s", p.State)
+	}
+
+	// 2) Re-upsert the SAME running tool (state byte-stable) → idempotent, no emit.
+	s.Apply(ev("message.part.updated", `{"part":{"id":"p1","sessionID":"s","messageID":"m1","type":"tool","tool":"read","state":{"status":"running","input":{"filePath":"src/parser.go"},"output":"grow","time":{"start":4000}}}}`))
+	if len(drainKind(ch, KindActivityVerb)) != 0 {
+		t.Fatal("re-upsert of a stable running tool must not re-emit activity.verb")
+	}
+
+	// 3) The per-token delta path must NOT drive verb emission.
+	s.Apply(ev("message.part.delta", `{"sessionID":"s","messageID":"m1","partID":"p2","field":"text","delta":"tok"}`))
+	if len(drainKind(ch, KindActivityVerb)) != 0 {
+		t.Fatal("message.part.delta must not emit activity.verb")
+	}
+
+	// 4) Idle clears the facet → one activity.verb with empty tool.
+	s.Apply(ev("session.idle", `{"sessionID":"s"}`))
+	evs = drainKind(ch, KindActivityVerb)
+	if len(evs) != 1 {
+		t.Fatalf("idle: want 1 clearing %s event, got %d", KindActivityVerb, len(evs))
+	}
+	if json.Unmarshal(evs[0].Payload, &p) != nil || p.Tool != "" {
+		t.Fatalf("idle clear payload must have empty tool, got %s", evs[0].Payload)
+	}
+}

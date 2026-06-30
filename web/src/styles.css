@@ -1318,6 +1318,17 @@ body {
   display: inline-flex; align-items: center; flex: 0 0 auto; margin-left: 6px;
   color: var(--accent);
 }
+/* Rich activity verb for a working task-tool subagent ("Reading parser.go"),
+   shown next to the .tool-sub-spin spinner — replacing today's bare spinner
+   with the actual verb. Sourced from the Tier-A facet (no message load).
+   Cheap inline text only — no mask-image/backdrop-filter/contain, since this
+   sits in the GPU-hot chat-scroll surface (see AGENTS.md GPU-perf bans). */
+.tool-sub-verb {
+  font-size: 11px;
+  color: var(--accent);
+  white-space: nowrap;
+  margin-left: 5px;
+}
 .tool-open {
   display: inline-flex; align-items: center; color: var(--fg-dim);
   padding: 2px 4px; margin-left: 6px; border-radius: 6px; cursor: pointer; flex: 0 0 auto;

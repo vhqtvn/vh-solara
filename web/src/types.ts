@@ -33,6 +33,29 @@ export interface Snapshot {
   // carries no messages). A snapshot-only facet — NOT on the Session payload —
   // so it survives per-session upsert events. See sessionLastAgent.
   lastAgents?: Record<string, string>;
+  // Per-session current-verb facet (raw tool primitive) so an UNOPENED
+  // task-tool subagent's chat row can show rich activity ("Reading parser.go")
+  // WITHOUT loading Tier-B (message) data. The daemon seeds this in the tree
+  // snapshot (alongside lastAgents) and pushes live on tool transitions via the
+  // activity.verb event; the client formats it through the EXISTING
+  // toolVerb/toolSubject (Path B2 — Go does not replicate the per-tool target
+  // picker). Empty tool = no active facet for that session.
+  currentVerbs?: Record<string, VerbFacet>;
+}
+
+// Tier-A "current verb" facet: the RAW tool part primitive the daemon emits so
+// the client can render rich activity for an UNOPENED subagent. `state` carries
+// only the salient fields (status/input/time.start) — Go trims output/error/
+// metadata so the byte payload is stable across running-tool output growth
+// (idempotent emission, no churn). The client never interprets this struct in
+// Go; it feeds {tool, state} back into toolVerb/toolSubject verbatim.
+export interface VerbFacet {
+  tool: string;
+  state?: {
+    status?: string;
+    input?: Record<string, unknown>;
+    time?: { start?: number };
+  };
 }
 
 // One agent todo (OpenCode's TodoWrite). The daemon passes the payload through

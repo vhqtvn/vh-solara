@@ -29,10 +29,17 @@ const (
 	KindPermissionClear = "permission.delete"
 	KindStatus          = "status"
 	KindActivity        = "activity"
-	KindQuestionSet     = "question.upsert"
-	KindQuestionClear   = "question.delete"
-	KindUnreadSet       = "unread.set"
-	KindUnreadClear     = "unread.clear"
+	// KindActivityVerb carries a session's current rich activity (the tool name +
+	// its salient state) so a client can render "Reading parser.go" for an
+	// UNOPENED subagent — without loading its Tier-B messages. It is NOT prefixed
+	// message./part. so the web layer's sendable() always-streams it on the
+	// tree-only Stream 1 to every client (mirrors activity/todo). Emitted only on
+	// facet change (idempotent); cleared (empty tool) on idle/error/turn-complete.
+	KindActivityVerb  = "activity.verb"
+	KindQuestionSet   = "question.upsert"
+	KindQuestionClear = "question.delete"
+	KindUnreadSet     = "unread.set"
+	KindUnreadClear   = "unread.clear"
 	// KindNotice carries a daemon-detected alert (turn finished, waiting on a
 	// human, stuck/runaway/stalled) for in-app delivery. It is NOT part of the
 	// materialized view — it's a transient fan-out, not stored in any snapshot —
@@ -77,6 +84,14 @@ type Snapshot struct {
 	// facet (NOT on the session payload) so it survives per-session upsert events
 	// (which replace the session object on the client). Keyed by sessionID.
 	LastAgents map[string]string `json:"lastAgents,omitempty"`
+	// CurrentVerbs carries the rich current activity (tool + salient state) of
+	// each session that is currently mid-tool, so a client can render
+	// "Reading parser.go" for an UNOPENED subagent from the tree-only snapshot —
+	// without loading its Tier-B messages. Like LastAgents, this is a snapshot-only
+	// facet (NOT on the session payload) so it survives per-session upsert events.
+	// Only sessions with a live running tool appear; the facet self-heals on the
+	// next live part event. Keyed by sessionID.
+	CurrentVerbs map[string]VerbFacet `json:"currentVerbs,omitempty"`
 	// Gate carries the per-session "is this safe to act on" facts inline (A2), so a
 	// coordinator evaluates its send/act gate from one snapshot — no N+1 detail
 	// fetch, no message-history walk. Keyed by sessionID.
@@ -129,6 +144,18 @@ type MessageWithParts struct {
 	Parts []json.RawMessage `json:"parts"`
 }
 
+// VerbFacet is the RAW current-activity primitive for a session — the tool name
+// plus the salient slice of its part `state` (input + status + time.start). The
+// client formats it via its EXISTING toolVerb/toolSubject (Path B2); Go does NOT
+// replicate the per-tool target picker. Only the formatting-salient state fields
+// are carried (not the mutable output/error/metadata) so a running tool whose
+// output grows part-by-part does NOT re-emit the facet — the verb/subject are
+// stable across that growth. Empty (Tool=="") means "no current activity".
+type VerbFacet struct {
+	Tool  string          `json:"tool"`
+	State json.RawMessage `json:"state,omitempty"`
+}
+
 // --- internal view structures ---
 
 type sessionEntry struct {
@@ -145,6 +172,13 @@ type sessionEntry struct {
 	lastAsstCompleted bool            // the latest assistant msg has time.completed
 	lastAsstEmpty     bool            // the latest assistant msg has no non-whitespace text content
 	lastAgent         string          // the agent name of the latest assistant msg (cold-seedable; see SetLastAgents)
+	// currentVerb is the session's rich current-activity facet (tool + salient
+	// state), refreshed on tool transitions and cleared on idle/error/turn-
+	// complete. Surfaced in the snapshot as CurrentVerbs so a client renders the
+	// verb for an UNOPENED subagent. Preserved across a session.updated that
+	// replaces the entry (mirrors lastAgent) so a metadata refresh can't wipe a
+	// live-set verb.
+	currentVerb VerbFacet
 }
 
 type messageEntry struct {
@@ -346,6 +380,14 @@ func (s *Store) setActivityLocked(sessionID, st string) {
 	s.activity[sessionID] = st
 	s.emit(KindActivity, rawObj(map[string]interface{}{"sessionID": sessionID, "state": st}))
 	s.activitySeq[sessionID] = s.seq // the seq of the activity event just emitted
+
+	// Clear the rich current-activity facet when the session stops working
+	// (idle/error). The turn's last tool part may still read status:"running"
+	// (a stale snapshot), so the authoritative activity signal — not the
+	// message scan — owns the "definitely not doing anything anymore" clear.
+	if st != ActivityBusy && st != ActivityRetry {
+		s.setCurrentVerbLocked(sessionID, VerbFacet{})
+	}
 
 	// Track the root subtree's busy count to detect "finished" (busy -> idle).
 	wasBusy := prev == ActivityBusy || prev == ActivityRetry
@@ -640,6 +682,10 @@ func (s *Store) upsertSessionLocked(props json.RawMessage) {
 	s.sessions[env.ID] = &sessionEntry{id: env.ID, parentID: env.ParentID, info: p.Info}
 	if prev != nil {
 		s.sessions[env.ID].lastAgent = prev.lastAgent
+		// Preserve the live-set current-activity facet across an entry-replacing
+		// session.updated (mirrors lastAgent) so a metadata/title refresh can't
+		// wipe "Reading parser.go" for a running subagent.
+		s.sessions[env.ID].currentVerb = prev.currentVerb
 	}
 	// A session.updated replaces the entry, so repopulate the denormalized
 	// last-assistant summary from the (persisted) message view.
@@ -803,6 +849,11 @@ func (s *Store) upsertMessageLocked(info json.RawMessage) {
 	s.emit(KindMessageUpsert, info)
 	if env.Role == "assistant" {
 		s.recomputeLastAssistantLocked(env.SessionID)
+		// An assistant message.updated marks a turn boundary (a completing turn's
+		// running tools finalize, or a new multi-step turn begins): re-evaluate the
+		// current-activity facet. When all tools completed it clears; when a new
+		// turn's first tool is already running it sets.
+		s.recomputeCurrentVerbLocked(env.SessionID)
 	}
 
 	// Escalate to busy from the live message stream: OpenCode's session.status/idle
@@ -889,6 +940,108 @@ func (s *Store) recomputeLastAssistantLocked(sessionID string) {
 	}
 }
 
+// recomputeCurrentVerbLocked refreshes a session's rich current-activity facet
+// (tool name + salient state) from the in-memory message view, mirroring the
+// client's activeVerbFromTurn scan: the newest assistant message is scanned
+// newest-part-first for the first RUNNING tool, whose {tool, state} becomes the
+// facet. When no running tool is found (turn boundary, all tools completed) the
+// facet is cleared. It is the Tier-A source that lets a client render
+// "Reading parser.go" for an UNOPENED subagent — Go emits the RAW primitive and
+// the client formats it via its existing toolVerb/toolSubject (Path B2).
+//
+// Only the formatting-salient state fields (input + status + time.start) are
+// stored, so a running tool whose output grows part-by-part does NOT re-emit:
+// the verb/subject are stable across that growth. Idempotent — emits
+// KindActivityVerb only when the facet actually changes. Caller holds s.mu.
+//
+// Hooked from upsertPartLocked (part snapshots → tool transitions) and
+// upsertMessageLocked (assistant turn boundary); cleared authoritatively by
+// setActivityLocked on idle/error. Mirrors recomputeLastAssistantLocked.
+func (s *Store) recomputeCurrentVerbLocked(sessionID string) {
+	se := s.sessions[sessionID]
+	if se == nil {
+		return
+	}
+	var next VerbFacet
+	if sm := s.messages[sessionID]; sm != nil {
+		for i := len(sm.order) - 1; i >= 0; i-- {
+			me := sm.byID[sm.order[i]]
+			if me == nil || me.role != "assistant" {
+				continue
+			}
+			// Newest assistant message: scan its parts newest-first for the first
+			// running tool (matches activeVerbFromTurn's pass-1 precedence).
+			for j := len(me.partOrder) - 1; j >= 0; j-- {
+				raw := me.parts[me.partOrder[j]]
+				var p struct {
+					Type  string          `json:"type"`
+					Tool  string          `json:"tool"`
+					State json.RawMessage `json:"state"`
+				}
+				if json.Unmarshal(raw, &p) != nil || p.Type != "tool" {
+					continue
+				}
+				var st struct {
+					Status string          `json:"status"`
+					Input  json.RawMessage `json:"input"`
+					Time   struct {
+						Start *float64 `json:"start"`
+					} `json:"time"`
+				}
+				_ = json.Unmarshal(p.State, &st)
+				if st.Status != "running" {
+					continue // not live — keep scanning older parts
+				}
+				next = VerbFacet{Tool: p.Tool, State: verbStatePayload(st.Status, st.Input, st.Time.Start)}
+				break
+			}
+			break // only the newest assistant message bounds the in-flight turn
+		}
+	}
+	s.setCurrentVerbLocked(sessionID, next)
+}
+
+// verbStatePayload marshals the formatting-salient slice of a tool part's state
+// (input + status + time.start) into a stable object the client feeds verbatim
+// to toolVerb/toolSubject. Trimming the mutable output/error/metadata keeps the
+// facet byte-stable while a tool runs, so its growing output doesn't re-emit.
+// json.Marshal sorts map keys, so the output is deterministic for byte compare.
+func verbStatePayload(status string, input json.RawMessage, start *float64) json.RawMessage {
+	m := map[string]any{}
+	if status != "" {
+		m["status"] = status
+	}
+	if len(input) > 0 && string(input) != "null" {
+		m["input"] = input // already JSON; embed raw (json.Marshal copies bytes)
+	}
+	if start != nil {
+		m["time"] = map[string]any{"start": *start}
+	}
+	b, _ := json.Marshal(m)
+	return b
+}
+
+// setCurrentVerbLocked records a session's current-activity facet and emits a
+// KindActivityVerb event ONLY when it changes (idempotent). An empty Tool clears
+// the facet. Caller holds s.mu.
+func (s *Store) setCurrentVerbLocked(sessionID string, facet VerbFacet) {
+	se := s.sessions[sessionID]
+	if se == nil {
+		return
+	}
+	prev := se.currentVerb
+	if facet.Tool == prev.Tool && bytes.Equal(facet.State, prev.State) {
+		return
+	}
+	se.currentVerb = facet
+	payload, _ := json.Marshal(map[string]any{
+		"sessionID": sessionID,
+		"tool":      facet.Tool,
+		"state":     json.RawMessage(facet.State),
+	})
+	s.emit(KindActivityVerb, payload)
+}
+
 // messageHasContent reports whether an assistant message did anything: produced a
 // non-whitespace TEXT reply, OR called a tool, OR emitted a file. A turn with any
 // of those is NOT empty. Only "envelope" parts (reasoning, step markers, etc.)
@@ -954,6 +1107,11 @@ func (s *Store) upsertPartLocked(part json.RawMessage) {
 	// summary. Streaming deltas don't need this — the turn isn't completed yet, and
 	// a part.updated snapshot follows them.
 	s.recomputeLastAssistantLocked(env.SessionID)
+	// Tool transitions arrive as part.updated snapshots (status running→completed,
+	// or a new tool starting): refresh the rich current-activity facet. The
+	// per-token delta path (appendPartDeltaLocked) deliberately does NOT route here
+	// — it must not drive verb emission.
+	s.recomputeCurrentVerbLocked(env.SessionID)
 }
 
 // appendPartDeltaLocked applies a streaming text delta to a part (creating a
@@ -1029,16 +1187,17 @@ func (s *Store) Snapshot(messagesFor map[string]bool) Snapshot {
 	defer s.mu.RUnlock()
 
 	snap := Snapshot{
-		Epoch:       s.epoch,
-		Seq:         s.seq,
-		Messages:    map[string][]MessageWithParts{},
-		Todos:       map[string]json.RawMessage{},
-		Permissions: map[string][]json.RawMessage{},
-		Questions:   map[string][]json.RawMessage{},
-		Statuses:    map[string]json.RawMessage{},
-		Activity:    map[string]string{},
-		Gate:        map[string]GateFacts{},
-		LastAgents:  map[string]string{},
+		Epoch:        s.epoch,
+		Seq:          s.seq,
+		Messages:     map[string][]MessageWithParts{},
+		Todos:        map[string]json.RawMessage{},
+		Permissions:  map[string][]json.RawMessage{},
+		Questions:    map[string][]json.RawMessage{},
+		Statuses:     map[string]json.RawMessage{},
+		Activity:     map[string]string{},
+		Gate:         map[string]GateFacts{},
+		LastAgents:   map[string]string{},
+		CurrentVerbs: map[string]VerbFacet{},
 	}
 	// Per-session gate facts (denormalized; see GateFacts). subtree_busy needs a
 	// tree walk, so compute it once here in O(n) and index per session.
@@ -1066,6 +1225,12 @@ func (s *Store) Snapshot(messagesFor map[string]bool) Snapshot {
 		}
 		if se.lastAgent != "" {
 			snap.LastAgents[sid] = se.lastAgent
+		}
+		// Surface the live current-activity facet (only sessions with a running
+		// tool carry one) so a client renders the rich verb for an UNOPENED
+		// subagent straight from the tree-only snapshot.
+		if se.currentVerb.Tool != "" {
+			snap.CurrentVerbs[sid] = se.currentVerb
 		}
 	}
 	for sid, m := range s.questions {

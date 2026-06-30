@@ -47,6 +47,7 @@ beforeEach(() => {
   setState("questions", reconcile({}));
   setState("todos", reconcile({}));
   setState("lastAgents", reconcile({}));
+  setState("currentVerbs", reconcile({}));
 });
 
 describe("currentVerb (Working pill)", () => {
@@ -144,6 +145,94 @@ describe("currentVerb (Working pill)", () => {
         state: { status: "running", input: {}, time: { start: 2000 } } },
     ]);
     expect(currentVerb(SID)).toEqual({ verb: "Running", subject: undefined, startMs: 2000 });
+  });
+});
+
+// currentVerb's Tier-A facet fallback (Path B2). For an UNOPENED task-tool
+// subagent, the daemon ships a RAW tool primitive (tool + trimmed state) on the
+// tree stream so the chat row can show rich activity ("Reading parser.go")
+// WITHOUT loading Tier-B messages. The selector formats it via the SAME
+// toolVerb/toolSubject as the opened path. Precedence: opened child's loaded
+// messages (activeVerbFromTurn) → facet → coarse "Working". Opened always wins.
+describe("currentVerb (Tier-A facet fallback for unopened subagent)", () => {
+  const CHILD = "child";
+
+  // Mark CHILD as working (session present + busy). Mirrors setWorking() but
+  // for an arbitrary id — the helpers above hardcode SID.
+  function childWorking(): void {
+    setState("sessions", CHILD, { id: CHILD });
+    setState("activity", CHILD, "busy");
+  }
+
+  // Load an assistant turn (with parts) for CHILD, marking it OPENED. Mirrors
+  // setTurn() but targets CHILD so currentVerb sees messages loaded.
+  function childTurn(parts: Part[], created = 5000): void {
+    setState("messages", CHILD, {
+      order: [MID],
+      byId: {
+        [MID]: {
+          id: MID,
+          info: { id: MID, sessionID: CHILD, role: "assistant", time: { created } },
+          partOrder: parts.map((p) => p.id),
+          parts: Object.fromEntries(parts.map((p) => [p.id, p])),
+        },
+      },
+    });
+  }
+
+  function setFacet(facet: { tool: string; state?: any }): void {
+    setState("currentVerbs", CHILD, facet);
+  }
+
+  it("formats the facet verb+subject when the child is unopened (no messages)", () => {
+    childWorking();
+    setFacet({ tool: "read", state: { status: "running", input: { filePath: "src/parser.go" }, time: { start: 4000 } } });
+    // No messages loaded for CHILD → facet path.
+    expect(currentVerb(CHILD)).toEqual({ verb: "Reading", subject: "src/parser.go", startMs: 4000 });
+  });
+
+  it("opened child's loaded messages override the facet (authoritative)", () => {
+    childWorking();
+    // Stale facet says "Reading old.go"; the live message scan finds a bash run.
+    setFacet({ tool: "read", state: { status: "running", input: { filePath: "old.go" }, time: { start: 1000 } } });
+    childTurn([
+      { id: "p1", sessionID: CHILD, messageID: MID, type: "tool", tool: "bash",
+        state: { status: "running", input: { command: "go test" }, time: { start: 9000 } } },
+    ]);
+    // Messages loaded → activeVerbFromTurn wins, the facet is ignored.
+    expect(currentVerb(CHILD)).toEqual({ verb: "Running", subject: "go test", startMs: 9000 });
+  });
+
+  it("opened child with no live part degrades to 'Working', NOT the facet", () => {
+    childWorking();
+    setFacet({ tool: "read", state: { status: "running", input: { filePath: "facet.go" }, time: { start: 1000 } } });
+    // Opened turn has only a completed tool — activeVerbFromTurn returns null,
+    // but because messages ARE loaded (sm present), the facet must NOT surface.
+    childTurn([
+      { id: "p1", sessionID: CHILD, messageID: MID, type: "tool", tool: "bash",
+        state: { status: "completed" }, time: { start: 1000, end: 1100 } },
+    ]);
+    expect(currentVerb(CHILD)).toEqual({ verb: "Working", subject: undefined, startMs: 5000 });
+  });
+
+  it("degrades to 'Working' when unopened and no facet is present", () => {
+    childWorking();
+    // No facet, no messages → coarse fallback (the existing spinner behavior).
+    expect(currentVerb(CHILD)).toEqual({ verb: "Working", subject: undefined, startMs: 0 });
+  });
+
+  it("omits subject when the facet tool has no salient argument", () => {
+    childWorking();
+    setFacet({ tool: "task", state: { status: "running", input: {}, time: { start: 2000 } } });
+    expect(currentVerb(CHILD)).toEqual({ verb: "Running", subject: undefined, startMs: 2000 });
+  });
+
+  it("returns null when the session is not working, even if a facet is present", () => {
+    setState("sessions", CHILD, { id: CHILD });
+    setState("activity", CHILD, "idle");
+    setFacet({ tool: "read", state: { status: "running", input: { filePath: "x.go" }, time: { start: 1 } } });
+    // sessionWorking gates first; a stale facet left in the map must not render.
+    expect(currentVerb(CHILD)).toBeNull();
   });
 });
 

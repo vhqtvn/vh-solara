@@ -2,7 +2,7 @@
 // working-state rollup, todo aggregation, and the per-session model selectors.
 // All pure reads of `state` (no mutation, no I/O), so they sit just above the
 // store in the dependency graph and everything else can read through them.
-import type { SessionMessages, TodoItem } from "../types";
+import type { Part, SessionMessages, TodoItem } from "../types";
 import { anyDescendantWorking } from "../lib/reduce";
 import { toolSubject, toolVerb } from "../lib/toolLabel";
 import { state } from "./store";
@@ -144,6 +144,25 @@ export function currentVerb(sessionID: string): CurrentVerb | null {
   // 2/3) The active verb from the last assistant turn's parts.
   const active = activeVerbFromTurn(sm);
   if (active) return active;
+  // 3.5) Tier-A facet for an UNOPENED session: when messages aren't loaded
+  //   (the session/subagent was never opened), fall back to the snapshot-seeded
+  //   / live-streamed raw tool primitive and format it via the SAME per-tool
+  //   toolVerb/toolSubject the opened path uses (Path B2 — Go ships the raw
+  //   primitive, TS owns the target picker). Opened sessions (sm present) are
+  //   already authoritative above, so this only fires for cold rows; an opened
+  //   session never degrades to the facet even if its live scan finds nothing.
+  if (!sm) {
+    const facet = state.currentVerbs[sessionID];
+    if (facet?.tool) {
+      const part = { tool: facet.tool, state: facet.state } as unknown as Part;
+      const subject = toolSubject(part);
+      return {
+        verb: toolVerb(facet.tool),
+        subject: subject || undefined,
+        startMs: facet.state?.time?.start || 0,
+      };
+    }
+  }
   // 4) Fallback.
   return { verb: "Working", startMs: turnStartMs(sm) };
 }

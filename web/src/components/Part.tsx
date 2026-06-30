@@ -7,7 +7,8 @@ import { placeStreamCaret } from "../lib/streamCaret";
 import { renderMermaid } from "../lib/mermaid";
 import { renderMathIn } from "../lib/math";
 import { streamLive } from "../prefs";
-import { openSession, projectDir, sessionNeedsInput, sessionWorking, setSelectedId, state as syncState } from "../sync";
+import { openSession, projectDir, sessionNeedsInput, sessionWorking, setSelectedId, state as syncState, currentVerb } from "../sync";
+import type { CurrentVerb } from "../sync";
 import { openFileAt } from "../code/frame";
 import { looksLikePath } from "../lib/pathlike";
 import { toolLabel, toolSubject } from "../lib/toolLabel";
@@ -438,6 +439,24 @@ function ToolPart(props: { part: Part; tail?: boolean }) {
     if (sessionWorking(id)) return "working";
     return "idle";
   });
+  // Rich activity verb for the spawned subagent ("Reading parser.go"), surfaced
+  // WITHOUT opening the child: currentVerb(id) reads the Tier-A facet
+  // (syncState.currentVerbs) for an unopened child and formats it via the same
+  // toolVerb/toolSubject as the opened path; an opened child uses its loaded
+  // messages. Direct proxy reads only — transition-bounded (the memo only
+  // re-runs when the child's verb slice changes), no ticking clock here so the
+  // selector stays clock-free. "" for the generic "Working" fallback keeps the
+  // bare spinner there (matches today's behavior; "Working" text everywhere
+  // would be noisy and defeat the rich-verb goal).
+  const childVerb = createMemo<CurrentVerb | null>(() => {
+    const id = subId();
+    return id ? currentVerb(id) : null;
+  });
+  const verbLabel = createMemo(() => {
+    const v = childVerb();
+    if (!v || v.verb === "Working") return "";
+    return v.subject ? `${v.verb} ${v.subject}` : v.verb;
+  });
   // Only the command/expression + output are behind the toggle (diagnostics show
   // regardless). A row with neither has nothing to expand → no chevron, no toggle.
   const hasDetail = () => !!(expr() || output());
@@ -492,8 +511,15 @@ function ToolPart(props: { part: Part; tail?: boolean }) {
               <span class="tool-sub-status needs-input" data-tip="needs your input — reply to continue" aria-label="needs your input" />
             </Match>
             <Match when={childStatus() === "working"}>
-              <span class="tool-sub-spin" data-tip="working" aria-label="working">
+              <span
+                class="tool-sub-spin"
+                data-tip={verbLabel() || "working"}
+                aria-label={verbLabel() || "working"}
+              >
                 <Spinner size={11} />
+                <Show when={verbLabel()}>
+                  <span class="tool-sub-verb">{verbLabel()}</span>
+                </Show>
               </span>
             </Match>
           </Switch>

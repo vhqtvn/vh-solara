@@ -27,6 +27,9 @@ function applySnapshot(snap: Snapshot) {
       for (const sess of snap.sessions || []) s.sessions[sess.id] = sess;
       s.activity = { ...(snap.activity || {}) };
       s.lastAgents = { ...(snap.lastAgents || {}) };
+      // Tier-A current-verb facets seed from the snapshot (active sessions only;
+      // the daemon omits idle/cleared ones). Ephemeral — never persisted.
+      s.currentVerbs = { ...(snap.currentVerbs || {}) };
       s.permissions = {};
       for (const [sid, perms] of Object.entries(snap.permissions || {})) {
         s.permissions[sid] = {};
@@ -131,6 +134,18 @@ function applyMessageEvent(kind: string, seq: number, payload: any, trackCursor 
           // event payload is the `{ sessionID, todos }` envelope.
           if (payload.sessionID) s.todos[payload.sessionID] = normalizeTodos(payload);
           break;
+        case "activity.verb":
+          // Tier-A rich-activity facet for an UNOPENED session: the RAW tool
+          // primitive (tool + trimmed state) so the chat row can format
+          // "Reading parser.go" via toolVerb/toolSubject without loading Tier-B
+          // messages. Empty tool clears it (idle/error/turn-complete). Mirrors
+          // the activity/todo live-patch patterns; Stream-1 always-streams it
+          // (sendable passes any kind not prefixed message./part.).
+          if (payload.sessionID) {
+            if (payload.tool) s.currentVerbs[payload.sessionID] = { tool: payload.tool, state: payload.state };
+            else delete s.currentVerbs[payload.sessionID];
+          }
+          break;
         case "status":
           // A session.error event carries an `error` payload (activity already
           // flipped to "error" via the separate activity event). Surface it so a
@@ -231,7 +246,7 @@ export function connect(fresh = false) {
       applySessionEvent(kind, Number(ev.lastEventId), JSON.parse(ev.data));
     });
   }
-  for (const kind of ["status", "activity", "permission.upsert", "permission.delete", "question.upsert", "question.delete", "unread.set", "unread.clear", "todo"]) {
+  for (const kind of ["status", "activity", "activity.verb", "permission.upsert", "permission.delete", "question.upsert", "question.delete", "unread.set", "unread.clear", "todo"]) {
     es.addEventListener(kind, (e) => {
       markSeen();
       const ev = e as MessageEvent;
