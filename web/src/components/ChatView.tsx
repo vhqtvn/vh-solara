@@ -181,6 +181,20 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   let scrollEl: HTMLDivElement | undefined;
   let contentEl: HTMLDivElement | undefined;
   const [following, setFollowing] = createSignal(true);
+  // Intent latch for the auto-follow self-heal. `following()` flips false for
+  // several reasons — a genuine user scroll-up (drop Live, show "↓ Latest"), a
+  // content-shrink clamp (system), or a programmatic reposition (restore). Only
+  // the first is real user intent to read history. The latch is armed ONLY at
+  // the genuine-scroll-away false-flip sites and cleared at every "re-engage"
+  // site (jumpToLatest, scroll back to bottom, session switch, restore-to-bottom).
+  // The self-heal effect (working() busy edge) then re-engages Live UNLESS the
+  // latch is set — so a new turn re-glues a user who happened to lose Live for
+  // any non-intent reason, but does NOT yank a deliberate reader.
+  //
+  // DELIBERATELY NOT cleared on the busy edge itself: "scroll up, then a new
+  // turn starts" must keep the reader in place (the stated lifecycle). Clearing
+  // on turn-start would re-yank them, defeating the latch.
+  const [userScrolledUp, setUserScrolledUp] = createSignal(false);
   // Hide the transcript until it's positioned for the current session, so the
   // initial scroll jump (top → restored/bottom) is never painted — switching
   // sessions reveals the content already in place instead of flashing.
@@ -353,6 +367,31 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     const t = setInterval(() => setVerbNow(Date.now()), 1000);
     onCleanup(() => clearInterval(t));
   });
+  // Self-heal: when a new turn starts or a busy session resumes (working() goes
+  // false→true), re-engage Live and re-glue to the bottom — UNLESS the user
+  // deliberately scrolled up to read history (intent latch). Before this, any
+  // Live loss was permanent until manual scroll-back: following() had no engage
+  // site on turn-start/resume (only open/switch/Latest/scroll-back/maybeRestore
+  // engaged it), so a coincident content-shrink clamp or RO guard trip during
+  // reasoning/tool-block settling dropped Live for the rest of the turn.
+  //
+  // Edge tracking uses a hand-rolled prev cursor (not Solid's on(prev)) so we
+  // can hold the cursor until ready(): during initial scroll-restore working()
+  // may already be true (a resumed busy session) and we must NOT re-pin before
+  // maybeRestore has positioned the viewport. Returning before updating
+  // prevWorking means the first ready() flip still delivers the busy edge.
+  // Gated on ready() (reads it as a dep) to mirror the viewport-shrink re-pin.
+  let prevWorking = false;
+  createEffect(() => {
+    const w = working();
+    if (!ready()) return; // hold edge cursor until positioned
+    const edge = !prevWorking && w;
+    prevWorking = w;
+    if (edge && !userScrolledUp()) {
+      setFollowing(true);
+      pin();
+    }
+  });
   const verbElapsed = createMemo(() => {
     const v = verb();
     if (!v || !v.startMs) return "";
@@ -466,6 +505,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   }
   function jumpToLatest() {
     setFollowing(true);
+    setUserScrolledUp(false); // user explicitly chose to follow again
     pin();
   }
 
@@ -568,11 +608,13 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       } else {
         // Stale anchor (message since deleted) — fall back to the bottom.
         setFollowing(true);
+        setUserScrolledUp(false); // system restore to bottom — not user intent
         pin();
       }
     } else {
       restoredFor = props.sessionId;
       setFollowing(true);
+      setUserScrolledUp(false); // opened at the bottom — not user intent
       pin();
       // Pinned to the bottom on open — no scroll event fires for a programmatic
       // position, so onScrolled/ackSession never runs (and even a synthetic
@@ -694,8 +736,12 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
         // re-pin to the new (smaller) bottom and keep following (Live preserved).
         if (scrollEl) {
           const shrank = pinnedScrollHeight > 0 && scrollEl.scrollHeight < pinnedScrollHeight;
-          if (scrollEl.scrollTop < pinnedTop && !shrank) setFollowing(false);
-          else pin();
+          if (scrollEl.scrollTop < pinnedTop && !shrank) {
+            setFollowing(false);
+            setUserScrolledUp(true); // genuine scroll-up since last pin (not a shrink clamp)
+          } else {
+            pin();
+          }
         }
       }
       clearTimeout(navDebounce);
@@ -748,7 +794,23 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     // scrollTop===pinnedTop, nearBottom() is necessarily true → safe to follow.
     if (scrollEl && scrollEl.scrollTop === pinnedTop && following()) return;
     const atBottom = nearBottom();
+    // Intent latch: a real user scroll-away from the bottom arms the latch so
+    // the self-heal effect does NOT yank them on the next busy edge. Distinguish
+    // genuine intent from a content-shrink clamp: when content above the
+    // viewport shrinks (reasoning/tool block collapse, raw→rendered-HTML swap),
+    // the browser clamps scrollTop down and nearBottom() can transiently flip
+    // false with NO user intent — arming the latch there would suppress self-
+    // heal for the rest of a settling turn. So only arm when content did NOT
+    // shrink since the last pin. The own-pin bail above already returned for
+    // our programmatic pins, so reaching here with atBottom=false is either a
+    // user wheel/touch/drag or a system clamp — the shrink guard splits them.
+    const shrank = scrollEl && pinnedScrollHeight > 0 && scrollEl.scrollHeight < pinnedScrollHeight;
     setFollowing(atBottom);
+    if (atBottom) {
+      setUserScrolledUp(false); // back at the bottom — re-engage intent reset
+    } else if (!shrank) {
+      setUserScrolledUp(true); // genuine scroll-away (not a content-shrink clamp)
+    }
     if (!props.draft) {
       if (atBottom) {
         // Caught up: cursor == lastMessageID, stored as the sparse no-entry
@@ -954,6 +1016,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       () => props.sessionId,
       () => {
         setFollowing(true);
+        setUserScrolledUp(false); // entering a session = fresh follow intent
         setInput(loadVersioned<string>(draftKey(props.sessionId || "__new__"), 1, "", (o) => (typeof o === "string" ? o : "")));
         requestAnimationFrame(pin);
       },
@@ -1445,7 +1508,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
           is measured from the scroll-area bottom — the pill sits just above where
           the composer begins, never on the textarea. See .jump/.chat-live styles.
         */}
-        <Show when={following() && !focusMode() && messages().length > 0}>
+        <Show when={following() && working() && !focusMode() && messages().length > 0}>
           <div class="chat-live" role="status" aria-label="Following latest">
             <span class="chat-live-dot" aria-hidden="true" />
             <span class="chat-live-text">Live</span>

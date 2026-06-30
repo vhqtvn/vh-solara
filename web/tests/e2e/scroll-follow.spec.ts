@@ -4,9 +4,13 @@ import { expect, test } from "@playwright/test";
 //
 // The button (<button class="jump">) renders via `<Show when={!following() && !focusMode() && messages().length > 0}>`
 // once the user scrolls away from the live tail; the complementary ".chat-live"
-// Live pill renders via `<Show when={following() && !focusMode() && messages().length > 0}>` while glued
-// to the tail. The two are mutually exclusive and share the same anchor spot
-// (bottom:8px, centered) inside `.chat-main` (the scroll viewport).
+// Live pill renders via `<Show when={following() && working() && !focusMode() && messages().length > 0}>`
+// while glued to the tail AND while a turn is live (busy/retrying). The `&& working()`
+// gate hides the Live pill on finished/idle turns (test 11) — the idle demo fixture
+// has working()=false, so the pill never shows there; tests that only need to prove
+// `following=true` use the geometry-first `expectFollowingTail` helper instead. The
+// two cues are mutually exclusive and share the same anchor spot (bottom:8px,
+// centered) inside `.chat-main` (the scroll viewport).
 //
 // This regression has re-broken before. The most recent failure was NOT a logic
 // bug — `following()` flipped to false correctly and the button rendered — but
@@ -49,6 +53,25 @@ async function topmostAtCenter(
   });
 }
 
+// Geometry-first "following the tail" assertion: proves following=true (glued
+// to the live tail) via bottom geometry + the absence of the "↓ Latest" button.
+// It deliberately does NOT depend on the .chat-live Live pill: that pill now
+// also requires working() (it hides on finished/idle turns — see test 11 and
+// the gate at ChatView.tsx `<Show when={following() && working() && ...}>`).
+// The idle demo fixture has working()=false, so a pill-based assertion there
+// would be vacuous; this helper is the non-vacuous replacement for the old
+// ".chat-live visible" checks in openDemo and tests 1/5/6/7/8.
+async function expectFollowingTail(page: import("@playwright/test").Page) {
+  await expect.poll(
+    async () =>
+      page.locator(".chat-scroll").evaluate((e: HTMLElement) =>
+        e.scrollHeight - e.scrollTop - e.clientHeight < 24 ? 1 : 0,
+      ),
+    { timeout: 5000 },
+  ).toBe(1);
+  await expect(page.locator("button.jump")).toHaveCount(0);
+}
+
 async function openDemo(page: import("@playwright/test").Page) {
   await page.setViewportSize(VP);
   await page.goto("/?session=demo");
@@ -73,7 +96,10 @@ async function openDemo(page: import("@playwright/test").Page) {
   await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
     el.scrollTop = el.scrollHeight;
   });
-  await expect(page.locator(".chat-live")).toBeVisible({ timeout: 5000 });
+  // Geometry-first (see expectFollowingTail): the idle demo has working()=false,
+  // so the .chat-live pill is hidden by the `&& working()` gate even though
+  // following=true. Assert the glued geometry + no "↓ Latest" button instead.
+  await expectFollowingTail(page);
 }
 
 async function setScrollTop(page: import("@playwright/test").Page, value: number) {
@@ -95,11 +121,13 @@ async function toggleFocus(page: import("@playwright/test").Page) {
     .evaluate((el: HTMLElement) => el.click());
 }
 
-// (1) Tail state: glued to the live tail → Live pill shows, Latest button absent.
-test("at the tail: Live pill visible, Latest button absent", async ({ page }) => {
+// (1) Tail state: glued to the live tail → following=true (geometry at the
+//     bottom, "↓ Latest" button absent). The .chat-live pill itself hides on
+//     the idle demo (working()=false per the `&& working()` gate), so we assert
+//     the glued geometry, not the pill.
+test("at the tail: following the tail, Latest button absent", async ({ page }) => {
   await openDemo(page);
-  await expect(page.locator(".chat-live")).toBeVisible();
-  await expect(page.locator("button.jump")).toHaveCount(0);
+  await expectFollowingTail(page);
 });
 
 // (2) Scroll up reveals the Latest button on top of the composer.
@@ -152,7 +180,7 @@ test("mid-stream scroll up still surfaces the Latest button", async ({ page }) =
   expect(await topmostAtCenter(page, "button.jump")).toBe(true);
 });
 
-// (5) Focus mode hides both Live pill and Latest button.
+// (5) Focus mode hides the Latest button (and the Live pill when working).
 //
 // Why: in focus mode the composer fills the whole `.chat` card
 // (`.composer.focus` is position:absolute; inset:0; z-index:30), but
@@ -161,14 +189,17 @@ test("mid-stream scroll up still surfaces the Latest button", async ({ page }) =
 // the pill/button float over and paint onto the full-card textarea. The `<Show>`
 // gates now also check `!focusMode()`, suppressing both cues while the expanded
 // composer is up (semantically correct: they're tail/scroll cues that are
-// meaningless over a full-card input). This test guards both gates — each one
-// establishes the relevant `following` state and verifies the cue renders
-// BEFORE entering focus mode (so the in-focus count:0 is unambiguous). Both
-// gates and both reactivity checks run from one page load: the Live-pill section
-// at the tail (following=true), then a normal-mode scroll-up switches to
-// following=false for the Latest-button section. Toggling focus does not touch
-// the following signal, so each section's following state is preserved across
-// its on/off toggle pair.
+// meaningless over a full-card input).
+//
+// This test guards the `!focusMode()` gate via the button.jump half
+// (following=false): it establishes following=false, verifies the button renders
+// BEFORE entering focus mode (so the in-focus count:0 is unambiguous), then
+// toggles focus off and confirms reactivity. The identical `!focusMode()` clause
+// on the .chat-live Show is symmetric; its effect under working()=true is
+// covered in test 11 (the idle demo here has working()=false, so the .chat-live
+// pill is hidden by the `&& working()` gate regardless of focus — not a useful
+// signal here). Toggling focus does not touch the following signal, so the
+// following=false state is preserved across the on/off toggle pair.
 //
 // NOTE: this test intentionally does NOT use openDemo(). openDemo's click-based
 // re-glue (clicking button.jump when the load lands away from the tail) is the
@@ -179,8 +210,8 @@ test("mid-stream scroll up still surfaces the Latest button", async ({ page }) =
 // that grows the transcript). That makes openDemo unreliable for this test
 // specifically. We instead glue to the tail deterministically by scrolling to
 // the bottom — the app's onScrolled sets following=true when near the bottom,
-// mounting .chat-live — same end state as openDemo, no detach-prone click.
-test("focus mode hides both Live pill and Latest button", async ({ page }) => {
+// same end state as openDemo, no detach-prone click.
+test("focus mode hides the Latest button (focus gate reactivity)", async ({ page }) => {
   await page.setViewportSize(VP);
   await page.goto("/?session=demo");
   await expect(page.locator(".msg").first()).toBeVisible({ timeout: 10000 });
@@ -188,25 +219,21 @@ test("focus mode hides both Live pill and Latest button", async ({ page }) => {
   await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
     el.scrollTop = el.scrollHeight;
   });
-  // following=true now → Live pill is up. PROVES the tail state going in, so
-  // the count:0 below can only be explained by the focusMode gate.
-  await expect(page.locator(".chat-live")).toBeVisible({ timeout: 5000 });
+  // following=true now (glued to the tail). PROVES the tail state going in via
+  // GEOMETRY (not the .chat-live pill): the idle demo has working()=false, so
+  // the pill is hidden by the `&& working()` gate even at the tail. The
+  // focusMode gate's effect on the .chat-live pill (needs working()=true) is
+  // covered in test 11; here the identical `!focusMode()` clause is exercised
+  // via the button.jump half below (following=false).
+  await expectFollowingTail(page);
 
-  // --- Live pill gate + reactivity (following=true) ---
-  await toggleFocus(page); // focus mode on
-  await expect(page.locator(".chat-live")).toHaveCount(0);
-  await toggleFocus(page); // focus mode off — following is unchanged (no scroll)
-  // Reactivity: the Live pill reappears, proving the gate is driven by
-  // focusMode() and is not a permanent hide.
-  await expect(page.locator(".chat-live")).toBeVisible({ timeout: 3000 });
-
-  // --- Switch to following=false in NORMAL mode (reliable; see tests 2–4) ---
+  // --- Latest button gate + reactivity (following=false) ---
+  // Switch to following=false in NORMAL mode (reliable; see tests 2–4).
   await setScrollTop(page, 0);
   // PROVES following=false going in, so the count:0 below is unambiguous
   // (without this, count:0 would pass whether following were true OR false).
   await expect(page.locator("button.jump")).toBeVisible({ timeout: 3000 });
 
-  // --- Latest button gate + reactivity (following=false) ---
   await toggleFocus(page); // focus mode on — button suppressed (would float
   await expect(page.locator("button.jump")).toHaveCount(0); //   over the textarea)
   await toggleFocus(page); // focus mode off — following still false (no scroll)
@@ -249,9 +276,9 @@ test("scrolling back to the bottom flips Latest → Live", async ({ page }) => {
     el.scrollTop = el.scrollHeight;
     return el.scrollTop;
   });
-  // following=true → Live pill up, Latest button absent.
-  await expect(page.locator(".chat-live")).toBeVisible({ timeout: 5000 });
-  await expect(page.locator("button.jump")).toHaveCount(0);
+  // following=true → glued to the tail (geometry), Latest button absent. The
+  // .chat-live pill hides on the idle demo (working()=false), so assert geometry.
+  await expectFollowingTail(page);
 
   // Scroll away from the tail → following=false, Latest button appears, Live pill hides.
   await setScrollTop(page, 0);
@@ -262,9 +289,10 @@ test("scrolling back to the bottom flips Latest → Live", async ({ page }) => {
   // guard bailed here with following still false; with the `&& following()` fix,
   // onScrolled runs → nearBottom() true → setFollowing(true).
   await setScrollTop(page, bottomClamp);
-  // Following flips true → Live pill reappears, Latest button hides.
-  await expect(page.locator(".chat-live")).toBeVisible({ timeout: 3000 });
-  await expect(page.locator("button.jump")).toHaveCount(0);
+  // Following flips true → re-glued to the tail (geometry), Latest button hides.
+  // (.chat-live stays hidden: idle demo, working()=false — the flip is proven by
+  // geometry + the button.jump disappearance, not the pill.)
+  await expectFollowingTail(page);
 });
 
 // (7) Regression: a transcript height SHRINK while Live (following=true, glued to
@@ -327,12 +355,12 @@ test("a content shrink while Live keeps following (no false user-scroll-up)", as
 
   // Glue to the tail deterministically (app's onScrolled sets following=true near
   // the bottom). This arms pinnedTop/pinnedScrollHeight to the current content
-  // via the RO's first pin(). Live pill up, Latest button absent.
+  // via the RO's first pin(). Glued to the tail, Latest button absent. The
+  // .chat-live pill hides on the idle demo (working()=false), so assert geometry.
   await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
     el.scrollTop = el.scrollHeight;
   });
-  await expect(page.locator(".chat-live")).toBeVisible({ timeout: 5000 });
-  await expect(page.locator("button.jump")).toHaveCount(0);
+  await expectFollowingTail(page);
 
   // Append a tall block to .chat-content (the RO-observed element). The RO fires,
   // following is true, so pin() re-glues to the new bottom and arms the tall
@@ -352,9 +380,8 @@ test("a content shrink while Live keeps following (no false user-scroll-up)", as
       ),
     { timeout: 3000 },
   ).toBe(1);
-  // STILL Live after the grow (sanity).
-  await expect(page.locator(".chat-live")).toBeVisible({ timeout: 3000 });
-  await expect(page.locator("button.jump")).toHaveCount(0);
+  // STILL following after the grow (sanity) — geometry, since idle demo hides the pill.
+  await expectFollowingTail(page);
 
   // GRADUAL SHRINK over many frames — the essential reproduction. Step the
   // injected block's height through [500,400,300,200,100,0], waiting 2 rAFs +
@@ -407,11 +434,11 @@ test("a content shrink while Live keeps following (no false user-scroll-up)", as
       }),
   );
 
-  // The fix: following stayed true through shrink + growth. Live pill persists
-  // and the Latest button stays absent. (Under the bug: following dropped during
-  // the growth, .chat-live→0, button.jump→visible, failing here.)
-  await expect(page.locator(".chat-live")).toBeVisible({ timeout: 3000 });
-  await expect(page.locator("button.jump")).toHaveCount(0);
+  // The fix: following stayed true through shrink + growth. Glued to the tail,
+  // Latest button stays absent. (Under the bug: following dropped during the
+  // growth, button.jump→visible, failing here.) Geometry-first since the idle
+  // demo hides the .chat-live pill.
+  await expectFollowingTail(page);
 });
 
 // (8) Regression: a VIEWPORT shrink while Live (following=true, glued to the tail)
@@ -455,12 +482,12 @@ test("a viewport shrink while Live re-glues to the tail", async ({ page }) => {
   await expect(page.locator(".msg").first()).toBeVisible({ timeout: 10000 });
 
   // Glue to the tail deterministically (app's onScrolled sets following=true near
-  // the bottom) — same end state as openDemo, no detach-prone click.
+  // the bottom) — same end state as openDemo, no detach-prone click. Geometry-first
+  // (idle demo hides the .chat-live pill via the `&& working()` gate).
   await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
     el.scrollTop = el.scrollHeight;
   });
-  await expect(page.locator(".chat-live")).toBeVisible({ timeout: 5000 });
-  await expect(page.locator("button.jump")).toHaveCount(0);
+  await expectFollowingTail(page);
 
   // SHRINK the viewport to VP (400×320): .chat-main drops ~280px, so the bottom
   // edge (scrollHeight - clientHeight) moves DOWN ~280px while scrollTop is
@@ -469,31 +496,165 @@ test("a viewport shrink while Live re-glues to the tail", async ({ page }) => {
   await page.setViewportSize(VP);
 
   // The fix: the scrollEl ResizeObserver fired and re-pinned to the new bottom
-  // while following. Poll because the RO fires on a later frame. This GEOMETRY
-  // assertion is what catches the bug — without the fix scrollTop is stale ~280px
-  // above the new bottom, but the Live pill stays visible (following never
-  // re-evaluated), so a pill-only check would pass under the bug.
-  await expect.poll(
-    async () =>
-      page.locator(".chat-scroll").evaluate((e: HTMLElement) =>
-        e.scrollHeight - e.scrollTop - e.clientHeight < 24 ? 1 : 0,
-      ),
-    { timeout: 3000 },
-  ).toBe(1);
-  await expect(page.locator(".chat-live")).toBeVisible({ timeout: 3000 });
-  await expect(page.locator("button.jump")).toHaveCount(0);
+  // while following. This GEOMETRY assertion is what catches the bug — without
+  // the fix scrollTop is stale ~280px above the new bottom (a pill-only check
+  // would pass under the bug, and the idle demo hides the pill regardless).
+  await expectFollowingTail(page);
 
   // Grow back to the tall size and re-assert glued to the tail. (A grow
   // self-corrects via the clamp scroll event in any case, but this confirms the
   // end-to-end resize round-trip leaves us following at the bottom.)
   await page.setViewportSize({ width: VP.width, height: 600 });
-  await expect.poll(
-    async () =>
-      page.locator(".chat-scroll").evaluate((e: HTMLElement) =>
-        e.scrollHeight - e.scrollTop - e.clientHeight < 24 ? 1 : 0,
-      ),
-    { timeout: 3000 },
-  ).toBe(1);
+  // Geometry-first re-assert (idle demo hides the pill).
+  await expectFollowingTail(page);
+});
+
+// (9) Composer auto-grow while Live keeps following at the tail.
+//
+// Empirical capture of the "composer resize is covered" claim: `.chat-scroll`
+// is `flex:1;min-height:0` (styles.css) and `.composer-wrap` is an in-flow
+// sibling, so growing the composer (autosize() up to MAX_COMPOSER_PX=200)
+// SHRINKS `.chat-scroll`'s box → fires the scrollEl ResizeObserver → the
+// `if (following() && ready()) pin()` re-glue at ChatView.tsx keeps Live. This
+// test drives that path end-to-end: a busy turn (so working()=true and the
+// .chat-live pill renders — it hides on the idle demo via `&& working()`), then
+// a long multi-line composer draft forcing several autosize growth steps, then a
+// geometry + pill assertion.
+test("composer auto-grow while Live keeps following at the tail", async ({ page }) => {
+  await page.setViewportSize(VP);
+  await page.goto("/?session=demo");
+  await expect(page.locator(".msg").first()).toBeVisible({ timeout: 10000 });
+  // Glue to the tail (geometry-first).
+  await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
+    el.scrollTop = el.scrollHeight;
+  });
+  await expectFollowingTail(page);
+  // Drive a busy turn so working()=true and the .chat-live pill renders. [[stall]]
+  // keeps the turn busy server-side for ~5s — enough window to type + assert.
+  await page.getByPlaceholder("Message…").fill("[[stall]] composer grow");
+  await page.keyboard.press("Enter");
+  await expect(page.locator(".working-text")).toBeVisible({ timeout: 5000 });
+  // .chat-live is up now (following && working && !focus).
   await expect(page.locator(".chat-live")).toBeVisible({ timeout: 3000 });
-  await expect(page.locator("button.jump")).toHaveCount(0);
+
+  // Type a long multi-line draft to force several autosize() growth steps (each
+  // step shrinks .chat-scroll → scrollEl RO → re-pin while following). 16 lines
+  // overshoots MAX_COMPOSER_PX=200 so the cap is exercised too.
+  const tall = Array.from({ length: 16 }, (_, i) => `composer growth line number ${i + 1}`).join("\n");
+  await page.getByPlaceholder("Message…").fill(tall);
+  // Still glued to the tail (bottom geometry, no "↓ Latest" button) and the Live
+  // pill is still visible — the composer growth did NOT drop following.
+  await expectFollowingTail(page);
+  await expect(page.locator(".chat-live")).toBeVisible({ timeout: 3000 });
+});
+
+// (10a) [SKIPPED] Spurious Live loss then a new turn → Live re-engages.
+//
+// This is the "self-heal catches a NON-intent loss" branch of the lifecycle
+// (decision: re-engage on new turn/resume UNLESS the intent latch is set). Under
+// the fix, a content-shrink clamp no longer drops `following` at all — the
+// contentEl ResizeObserver guard's `!shrank` discriminator re-pins instead of
+// flipping following false (test 7 pins that down). So there is no deterministic
+// e2e-reachable path that leaves `following=false` WITHOUT also arming the intent
+// latch `userScrolledUp`: every remaining false-flip site is either a genuine
+// user scroll-up (arms the latch → 10b) or the maybeRestore anchor branch on
+// reopen (system restore, does NOT arm the latch, but requires seeding a read
+// anchor + reload — not exposed cleanly by the fixture's prompt flow).
+//
+// To exercise this branch deterministically you would either (a) extend the
+// fixture (pkg/fixtures/opencode.go) to emit a content-shrink that bypasses the
+// `!shrank` guard, or (b) expose a test-only hook to call setFollowing(false)
+// without scrolling, then drive a new turn and assert `.chat-live` returns +
+// bottom geometry. Skipped until such a hook lands; the complementary intent
+// branch (10b) IS covered below.
+test.skip("spurious Live loss re-engages on a new turn (needs fixture hook)", async () => {
+  // placeholder — see comment above for how to make this deterministic.
+});
+
+// (10b) A deliberate scroll-up reader is NOT yanked when a new turn starts.
+//
+// The operator's desired lifecycle: Live re-engages on new turn/resume BUT does
+// NOT yank a user who deliberately scrolled up to read history (intent-latch,
+// not always-yank). This test pins the intent branch: scroll up (arms the latch
+// at onScrolled's `!atBottom && !shrank` site), start a new turn (the working()
+// false→true busy edge the self-heal effect watches), and verify self-heal is
+// SUPPRESSED — the reader stays where they are.
+test("a deliberate scroll-up reader is not yanked when a new turn starts", async ({ page }) => {
+  await page.setViewportSize(VP);
+  await page.goto("/?session=demo");
+  await expect(page.locator(".msg").first()).toBeVisible({ timeout: 10000 });
+  // Glue to the tail (following=true, latch=false).
+  await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
+    el.scrollTop = el.scrollHeight;
+  });
+  await expectFollowingTail(page);
+
+  // Deliberately scroll UP to read history — genuine user intent. This arms the
+  // intent latch (userScrolledUp=true) at onScrolled's `!atBottom && !shrank`
+  // site, drops following, and surfaces the "↓ Latest" button.
+  await setScrollTop(page, 0);
+  await expect(page.locator("button.jump")).toBeVisible({ timeout: 3000 });
+
+  // Start a NEW turn. working() goes false→true (the busy edge). The fix's
+  // intent-latch check (`!userScrolledUp()`) must keep self-heal from
+  // re-engaging — the reader stays put. (A normal prompt streams + finishes fast;
+  // the assertions hold throughout because following never flips back true.)
+  await page.getByPlaceholder("Message…").fill("a new turn while reading history");
+  await page.keyboard.press("Enter");
+  await expect(page.locator(".working-text")).toBeVisible({ timeout: 5000 });
+
+  // NOT yanked: still scrolled up (NOT at the bottom), Live pill stays hidden,
+  // and the "↓ Latest" button remains available so the reader can jump back.
+  await expect(page.locator(".chat-live")).toHaveCount(0);
+  await expect(page.locator("button.jump")).toBeVisible({ timeout: 3000 });
+  const atBottom = await page.locator(".chat-scroll").evaluate(
+    (el: HTMLElement) => el.scrollHeight - el.scrollTop - el.clientHeight < 24,
+  );
+  expect(atBottom).toBe(false);
+});
+
+// (11) The Live pill hides when the turn finishes (working gate), and focus mode
+//      still hides it while busy (focus gate under working()=true).
+//
+// Two gates on the .chat-live Show are exercised here under working()=true
+// (impossible on the idle demo, so they can't live in tests 1/5/6/7/8):
+//   - `&& working()`: when the turn finishes (working() false) the pill hides
+//     EVEN THOUGH following is still true (we never scrolled). The complementary
+//     "↓ Latest" button also stays absent (following true) — finished tail state
+//     shows neither cue. (test 11's primary purpose.)
+//   - `!focusMode()`: while busy, focus mode still suppresses the pill, and
+//     toggling back reveals it (reactivity). Moved here from test 5, which can't
+//     show the pill on the idle demo.
+test("the Live pill hides when the turn finishes (working gate + focus gate)", async ({ page }) => {
+  await page.setViewportSize(VP);
+  await page.goto("/?session=demo");
+  await expect(page.locator(".msg").first()).toBeVisible({ timeout: 10000 });
+  await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
+    el.scrollTop = el.scrollHeight;
+  });
+  await expectFollowingTail(page);
+
+  // Start a busy turn so working()=true and the .chat-live pill renders.
+  await page.getByPlaceholder("Message…").fill("[[stall]] finish gate");
+  await page.keyboard.press("Enter");
+  await expect(page.locator(".working-text")).toBeVisible({ timeout: 5000 });
+  // Pill is up: following && working && !focus.
+  await expect(page.locator(".chat-live")).toBeVisible({ timeout: 3000 });
+
+  // Focus-gate coverage under working()=true. Focus mode hides the pill; toggling
+  // back reveals it — proves the `!focusMode()` clause still gates the pill while
+  // busy (the identical clause on button.jump is covered in test 5).
+  await toggleFocus(page);
+  await expect(page.locator(".chat-live")).toHaveCount(0);
+  await toggleFocus(page);
+  await expect(page.locator(".chat-live")).toBeVisible({ timeout: 3000 });
+
+  // Wait for the stall turn to finish → working() flips false. Per the
+  // `&& working()` gate the Live pill hides even though following is still true.
+  // (Generous timeout: [[stall]] sleeps ~5s server-side before emitting idle.)
+  await expect(page.locator(".working-text")).toHaveCount(0, { timeout: 12000 });
+  await expect(page.locator(".chat-live")).toHaveCount(0);
+  // Still glued to the tail (geometry) and no "↓ Latest" button — following is
+  // true; the pill is hidden only because the turn is idle/finished.
+  await expectFollowingTail(page);
 });
