@@ -103,17 +103,21 @@ test("terminal: full-screen TUI (vim) stays live — xterm DECRQM stall regressi
   // the stall. Polling (vs a fixed sleep) keeps this deterministic across
   // machines and vim startup speeds.
   await expect.poll(async () => (await page.locator(".xterm-rows").innerText()).includes("~"), {
-    timeout: 10000,
+    timeout: 15000,
   }).toBe(true);
 
   // Enter insert mode and type a unique marker. With the stall, the screen is
   // frozen at vim's first frame and this never renders.
   await page.keyboard.type("i");
-  await page.waitForTimeout(150);
+  // xterm exposes no reliable insert-mode signal, so give vim time to actually
+  // enter insert mode before sending the marker — otherwise the marker keystrokes
+  // land as normal-mode commands and never render. The marker poll below is the
+  // real guard; on the green path it returns instantly. Widened for slow CI.
+  await page.waitForTimeout(400);
   const marker = "DECRQM_LIVE_MARKER_42";
   await page.keyboard.type(marker);
   await expect.poll(async () => (await page.locator(".xterm-rows").innerText()).includes(marker), {
-    timeout: 8000,
+    timeout: 15000,
   }).toBe(true);
 
   // Quit vim (:q! discards the buffer) and confirm the shell prompt returns by
@@ -126,6 +130,6 @@ test("terminal: full-screen TUI (vim) stays live — xterm DECRQM stall regressi
   await page.keyboard.type("echo VIM_EXITED_OK");
   await page.keyboard.press("Enter");
   await expect.poll(async () => (await page.locator(".xterm-rows").innerText()).includes("VIM_EXITED_OK"), {
-    timeout: 8000,
+    timeout: 15000,
   }).toBe(true);
 });
