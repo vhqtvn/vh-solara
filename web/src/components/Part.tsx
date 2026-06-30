@@ -7,7 +7,7 @@ import { placeStreamCaret } from "../lib/streamCaret";
 import { renderMermaid } from "../lib/mermaid";
 import { renderMathIn } from "../lib/math";
 import { streamLive } from "../prefs";
-import { openSession, projectDir, setSelectedId } from "../sync";
+import { openSession, projectDir, sessionNeedsInput, sessionWorking, setSelectedId, state as syncState } from "../sync";
 import { openFileAt } from "../code/frame";
 import { looksLikePath } from "../lib/pathlike";
 import { toolLabel, toolSubject } from "../lib/toolLabel";
@@ -419,6 +419,25 @@ function ToolPart(props: { part: Part; tail?: boolean }) {
       void openSession(id);
     }
   };
+  // Depth-1 live status of the spawned subagent, derived purely from Tier-A
+  // store data (activity/permissions/questions are kept for ALL sessions, so the
+  // child need not be opened to read its state). The reads go through the store
+  // proxy directly — syncState.activity[id], and sessionNeedsInput/sessionWorking
+  // reading permissions/questions[id] — so Solid tracks those specific keys and
+  // this memo only re-runs when the child's status TRANSITIONS. Token streaming
+  // mutates state.messages, never these maps, so the indicator stays stable
+  // across tokens (the row itself already persists in place via upsertPart).
+  // Hidden when idle — nothing to flag — mirroring the session tree. (Aliased
+  // `state as syncState` because this module's local `state` is the tool part's
+  // own state accessor at line 369.)
+  const childStatus = createMemo<"none" | "error" | "needs-input" | "working" | "idle">(() => {
+    const id = subId();
+    if (!id) return "none";
+    if (syncState.activity[id] === "error") return "error";
+    if (sessionNeedsInput(id)) return "needs-input";
+    if (sessionWorking(id)) return "working";
+    return "idle";
+  });
   // Only the command/expression + output are behind the toggle (diagnostics show
   // regardless). A row with neither has nothing to expand → no chevron, no toggle.
   const hasDetail = () => !!(expr() || output());
@@ -461,16 +480,35 @@ function ToolPart(props: { part: Part; tail?: boolean }) {
           </span>
         </Show>
         <Show when={subId()}>
+          {/* Depth-1 live status of the spawned subagent (Tier-A store data
+              only). Mirrors the session-tree dot affordance: error → red dot,
+              needs-input → amber pulse, working → accent spinner. Idle renders
+              nothing (no Match hits) — nothing to flag. Sits left of the fork. */}
+          <Switch>
+            <Match when={childStatus() === "error"}>
+              <span class="tool-sub-status error" data-tip="error" aria-label="error" />
+            </Match>
+            <Match when={childStatus() === "needs-input"}>
+              <span class="tool-sub-status needs-input" data-tip="needs your input — reply to continue" aria-label="needs your input" />
+            </Match>
+            <Match when={childStatus() === "working"}>
+              <span class="tool-sub-spin" data-tip="working" aria-label="working">
+                <Spinner size={11} />
+              </span>
+            </Match>
+          </Switch>
           <span
             role="button"
             tabindex="0"
             class="tool-jump"
+            data-tip="Open subsession"
+            aria-label="Open subsession"
             onClick={(e) => {
               e.stopPropagation();
               jump();
             }}
           >
-            open subsession →
+            <Icon name="fork" size={13} />
           </span>
         </Show>
       </button>

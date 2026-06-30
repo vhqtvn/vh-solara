@@ -1292,15 +1292,32 @@ body {
 .tool-chev { display: inline-flex; align-items: center; color: var(--fg-dim); flex: 0 0 auto; transition: transform 0.12s ease; }
 .tool-chev.rot { transform: rotate(180deg); }
 .tool-jump {
-  font-size: 12px;
+  display: inline-flex; align-items: center;
   color: var(--accent);
-  border: 1px solid color-mix(in srgb, var(--sel) 33%, transparent);
-  border-radius: 999px;
-  padding: 1px 8px;
-  margin-left: 8px;
-  cursor: pointer;
+  padding: 2px 4px; margin-left: 6px; border-radius: 6px;
+  cursor: pointer; flex: 0 0 auto;
 }
-.tool-jump:hover { background: color-mix(in srgb, var(--sel) 13%, transparent); }
+.tool-jump:hover { background: color-mix(in srgb, var(--accent) 13%, transparent); }
+/* Depth-1 live status of a task tool's spawned subagent (Tier-A store data
+   only — activity/permissions/questions are kept for ALL sessions, so the child
+   need not be opened). Sits just left of the .tool-jump fork. Mirrors the
+   session-tree dot affordance: error = red, needs-input = amber pulse, working
+   = accent spinner. Hidden when idle (nothing to flag), like the tree. Cheap
+   styling only — no mask-image/backdrop-filter/contain (this is the GPU-hot
+   chat-scroll surface). */
+.tool-sub-status {
+  width: 7px; height: 7px; border-radius: 50%; flex: 0 0 auto; margin-left: 6px;
+}
+.tool-sub-status.error { background: var(--danger); }
+.tool-sub-status.needs-input {
+  background: var(--warn, #e8a838);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--warn, #e8a838) 32%, transparent);
+  animation: pulse 1.1s ease-in-out infinite;
+}
+.tool-sub-spin {
+  display: inline-flex; align-items: center; flex: 0 0 auto; margin-left: 6px;
+  color: var(--accent);
+}
 .tool-open {
   display: inline-flex; align-items: center; color: var(--fg-dim);
   padding: 2px 4px; margin-left: 6px; border-radius: 6px; cursor: pointer; flex: 0 0 auto;
