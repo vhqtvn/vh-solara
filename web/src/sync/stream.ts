@@ -160,7 +160,7 @@ export function applySessionEvent(kind: string, seq: number, payload: any) {
 // hasn't applied yet (e.g. an activity=busy), which then get skipped on
 // reconnect — leaving the sidebar stuck on a stale state (the "busy session
 // shows idle, no Stop button" bug). Only Stream 1's events move the cursor.
-function applyMessageEvent(kind: string, seq: number, payload: any, trackCursor = true) {
+export function applyMessageEvent(kind: string, seq: number, payload: any, trackCursor = true) {
   bumpUpdating();
   setState(
     produce((s) => {
@@ -184,6 +184,29 @@ function applyMessageEvent(kind: string, seq: number, payload: any, trackCursor 
         case "part.delete": {
           const sm = s.messages[payload.sessionID];
           if (sm) deletePart(sm, payload.messageID, payload.partID);
+          break;
+        }
+        case "messages.loaded": {
+          // Slice C async-hydration completion: the daemon finished fetching this
+          // session's FULL message history (emitted even when the fetch returned
+          // zero or unchanged messages, since those produce no message.* delta).
+          // Flip the per-client delivery flag so the transcript moves from
+          // "loading" to "delivered-and-empty" (or renders the just-hydrated msg
+          // deltas that Stream 2 forwarded alongside this on the same connection).
+          if (payload.sessionID) s.messagesLoaded[payload.sessionID] = true;
+          break;
+        }
+        case "messages.error": {
+          // Background fetch failed; the daemon left the session UNLOADED (it
+          // retries on the next selection/reconnect). Log only — keep the loading
+          // UI up rather than showing a misleading empty transcript. Surfacing
+          // this as an explicit error state is a documented residual risk.
+          if (payload?.sessionID) {
+            log.warn("sync", "messages hydration failed", {
+              id: payload.sessionID,
+              error: payload.error,
+            });
+          }
           break;
         }
         case "activity":
@@ -470,6 +493,30 @@ export function closeSessionStream() {
   sesId = "";
 }
 
+// applySessionSnapshot applies a Stream-2 (active-session) snapshot to the store.
+// Extracted from the EventSource `snapshot` closure so the Slice C partial-
+// snapshot contract — a hydrating snapshot (gate.messagesLoaded===false) must NOT
+// mark the session delivered — is unit-testable. The connection-side bookkeeping
+// (markSeen, latency) stays in the listener; this is the pure reconciliation.
+export function applySessionSnapshot(id: string, snap: Snapshot) {
+  setState("messages", id, buildMessages((snap.messages?.[id] as any[]) || []));
+  // Mark delivered ONLY when the snapshot's gate says the daemon has the FULL
+  // history (messagesLoaded !== false). Slice C async hydration sends a PARTIAL
+  // snapshot immediately (before the upstream fetch completes) with
+  // messagesLoaded=false — keep the loading UI up; the messages.loaded event (or
+  // a later re-snapshot) flips this. `undefined` (older daemon without the gate
+  // field) stays delivered to preserve back-compat. An explicit false must
+  // ACTIVELY clear a stale delivered=true (e.g. after a daemon restart / epoch
+  // change while the session was open) — otherwise the empty-order snapshot
+  // renders "delivered-and-empty" instead of "loading".
+  const loaded = snap.gate?.[id]?.messagesLoaded;
+  if (loaded === false) {
+    setState("messagesLoaded", id, false);
+  } else {
+    setState("messagesLoaded", id, true); // true OR undefined (older daemon) → delivered
+  }
+}
+
 export function openSessionStream(id: string) {
   if (id === sesId && ses && ses.readyState !== EventSource.CLOSED) return;
   closeSessionStream();
@@ -487,15 +534,13 @@ export function openSessionStream(id: string) {
       markSeen();
       const snap: Snapshot = JSON.parse((e as MessageEvent).data);
       // L1 t2: first snapshot of this connection → server-processing delta
-      // (ensureMessages for this session + snapshot compute + serialize).
+      // (snapshot compute + serialize). Since Slice C the upstream full-fetch
+      // is async/best-effort, so this window no longer covers ensureMessages.
       if (!sesSnapDone) {
         sesSnapDone = true;
         if (sesT1) recordLatency("session", "snap", performance.now() - sesT1);
       }
-      setState("messages", id, buildMessages((snap.messages?.[id] as any[]) || []));
-      // The real snapshot has landed → mark this session delivered so the
-      // transcript distinguishes "loading" from "delivered-and-empty".
-      setState("messagesLoaded", id, true);
+      applySessionSnapshot(id, snap);
     });
     ses.addEventListener("ping", () => markSeen());
     // L1 t1: socket established → pure connection-latency delta. Stream 2 had
@@ -506,7 +551,7 @@ export function openSessionStream(id: string) {
       sesT1 = performance.now();
       if (sesT0) recordLatency("session", "open", sesT1 - sesT0);
     };
-    for (const kind of ["message.upsert", "message.delete", "part.upsert", "part.delete"]) {
+    for (const kind of ["message.upsert", "message.delete", "part.upsert", "part.delete", "messages.loaded", "messages.error"]) {
       ses!.addEventListener(kind, (e) => {
         markSeen();
         const ev = e as MessageEvent;

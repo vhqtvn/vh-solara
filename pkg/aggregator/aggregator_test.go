@@ -234,3 +234,310 @@ func TestRehydrateSeedSurvivesRequestCancel(t *testing.T) {
 		t.Fatalf("seed died with the canceled request: sub lastAgent want 'general', got %q", got)
 	}
 }
+
+// slowFullMessageHandler wraps an OpenCode handler and delays the FULL message
+// fetch (GET /session/:id/message with NO ?limit=) — exactly the request
+// client.Messages issues (the lazy-hydration path) — while leaving every other
+// request (incl. the cold-seed's ?limit= tail) fast. This is the async-msg
+// analog of slowTailHandler. The !limit distinction is what separates the
+// lazy full-fetch from the cold-seed tail-fetch.
+type slowFullMessageHandler struct {
+	inner    http.Handler
+	delay    time.Duration
+	mu       sync.Mutex
+	count    map[string]int // sessionID -> full-fetch count
+	released chan struct{}  // optional: if set, block fetches until closed (deterministic in-flight)
+}
+
+func (h *slowFullMessageHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/session/") &&
+		strings.HasSuffix(r.URL.Path, "/message") && r.URL.Query().Get("limit") == "" {
+		sid := strings.TrimPrefix(r.URL.Path, "/session/")
+		sid = strings.TrimSuffix(sid, "/message")
+		h.mu.Lock()
+		h.count[sid]++
+		h.mu.Unlock()
+		if h.released != nil {
+			<-h.released // hold the fetch open until the test releases it
+		}
+		if h.delay > 0 {
+			time.Sleep(h.delay)
+		}
+	}
+	h.inner.ServeHTTP(w, r)
+}
+
+func (h *slowFullMessageHandler) countOf(sid string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.count[sid]
+}
+
+// waitForCount polls until the full-fetch count for sid reaches want or the
+// deadline lapses. Used to deterministically observe an in-flight fetch (e.g.
+// before canceling a request ctx, to prove the background survives).
+func (h *slowFullMessageHandler) waitForCount(t *testing.T, sid string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if h.countOf(sid) >= want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("full-fetch count for %s: want %d, got %d (timed out)", sid, want, h.countOf(sid))
+}
+
+// TestEnsureMessagesAsyncSingleFlight proves concurrent opens of the same
+// (unloaded) session collapse to ONE upstream fetch — the per-session in-flight
+// map dedupes. This keeps a rapid session-switch / multi-consumer storm from
+// fanning out into N full GET /session/:id/message requests.
+func TestEnsureMessagesAsyncSingleFlight(t *testing.T) {
+	const delay = 80 * time.Millisecond
+	h := &slowFullMessageHandler{inner: fixtures.New().Handler(), delay: delay, count: map[string]int{}}
+	oc := httptest.NewServer(h)
+	defer oc.Close()
+
+	agg := New(oc.URL, 100)
+	// Seed the session into the tree so it is a known candidate (EnsureMessagesAsync
+	// no-ops early on "" / already-loaded only; it issues the fetch regardless of
+	// tree presence, but a present session is the realistic path).
+	if err := agg.Rehydrate(context.Background()); err != nil {
+		t.Fatalf("rehydrate: %v", err)
+	}
+	agg.waitColdSeed()
+	// demo is NOT loaded after a cold hydrate (cold-seed only tails; the full
+	// history fetch happens on open). Sanity-check the precondition.
+	if agg.Store().IsMessagesLoaded("demo") {
+		t.Fatal("precondition: demo must NOT be loaded before async hydration")
+	}
+
+	// Register + launch the first fetch synchronously so the in-flight slot
+	// exists before we fan out concurrent opens against it (otherwise the test
+	// could read the count before the callers are even scheduled).
+	agg.EnsureMessagesAsync(context.Background(), "demo")
+	// Fan out several MORE concurrent opens; every one must dedupe against the
+	// already-in-flight fetch (not start a second).
+	for i := 0; i < 5; i++ {
+		go agg.EnsureMessagesAsync(context.Background(), "demo")
+	}
+	agg.waitMessagesAsync("demo")
+
+	if got := h.countOf("demo"); got != 1 {
+		t.Fatalf("concurrent opens must collapse to 1 full fetch, got %d", got)
+	}
+	if !agg.Store().IsMessagesLoaded("demo") {
+		t.Fatal("after the fetch, demo must be marked loaded")
+	}
+
+	// A subsequent open is a no-op (already loaded) → no second fetch.
+	agg.EnsureMessagesAsync(context.Background(), "demo")
+	if got := h.countOf("demo"); got != 1 {
+		t.Fatalf("already-loaded session must not trigger a second fetch, got %d", got)
+	}
+}
+
+// TestEnsureMessagesAsyncSuccessEmitsCompletion proves the success path:
+// SetSessionMessages marks loaded AND a messages.loaded completion event is
+// emitted — UNCONDITIONALLY, even when the fetch returns ZERO messages. This is
+// the empty/no-diff completion trap: without the explicit event, a fetch that
+// produced no message.* deltas would never signal "done" and the client would
+// wedge on its loading state forever.
+func TestEnsureMessagesAsyncSuccessEmitsCompletion(t *testing.T) {
+	// A fixture session whose message history is EMPTY (no assistant/user turns)
+	// isolates the zero-message case. We synthesize one via a tiny handler that
+	// answers GET /session/empty/message with [].
+	mux := http.NewServeMux()
+	mux.HandleFunc("/session/empty/message", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("limit") == "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte("[]"))
+			return
+		}
+		http.Error(w, "no tail", http.StatusNotFound)
+	})
+	// Delegate everything else to the standard fixture so the aggregator's
+	// hydrate (sessions list, cold-seed tails) still works.
+	inner := fixtures.New().Handler()
+	mux.Handle("/", inner)
+	oc := httptest.NewServer(mux)
+	defer oc.Close()
+
+	agg := New(oc.URL, 100)
+	// Subscribe to capture the completion event.
+	ch, unsub := agg.Store().Subscribe(128)
+	defer unsub()
+
+	agg.EnsureMessagesAsync(context.Background(), "empty")
+	agg.waitMessagesAsync("empty")
+
+	if !agg.Store().IsMessagesLoaded("empty") {
+		t.Fatal("empty-session fetch must still mark loaded")
+	}
+	// Drain subscribers and assert a messages.loaded arrived. Even though the
+	// fetch returned zero messages (no message.* delta), the explicit
+	// completion event must fire.
+	var sawLoaded bool
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) && !sawLoaded {
+		select {
+		case e := <-ch:
+			if e.Kind == "messages.loaded" {
+				sawLoaded = true
+			}
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	if !sawLoaded {
+		t.Fatal("zero-message fetch must still emit messages.loaded (the empty/no-diff completion trap)")
+	}
+}
+
+// TestEnsureMessagesAsyncFailureEmitsError proves the failure path: an upstream
+// error emits messages.error, clears the in-flight slot (so a reselect retries),
+// and does NOT mark the session loaded.
+func TestEnsureMessagesAsyncFailureEmitsError(t *testing.T) {
+	// Count the full-fetch requests (no ?limit=, exactly what client.Messages
+	// issues) so the test can prove the retry actually re-issues an upstream
+	// fetch rather than short-circuiting on a stale in-flight slot.
+	var (
+		mu        sync.Mutex
+		fullCount int
+	)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/session/broken/message", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("limit") == "" {
+			mu.Lock()
+			fullCount++
+			mu.Unlock()
+			http.Error(w, "upstream down", http.StatusInternalServerError)
+			return
+		}
+		http.Error(w, "no tail", http.StatusNotFound)
+	})
+	mux.Handle("/", fixtures.New().Handler())
+	oc := httptest.NewServer(mux)
+	defer oc.Close()
+
+	agg := New(oc.URL, 100)
+	ch, unsub := agg.Store().Subscribe(128)
+	defer unsub()
+
+	agg.EnsureMessagesAsync(context.Background(), "broken")
+	agg.waitMessagesAsync("broken")
+
+	if agg.Store().IsMessagesLoaded("broken") {
+		t.Fatal("a failed fetch must NOT mark the session loaded (retry on reselect)")
+	}
+	// The in-flight slot must be cleared so the next selection retries.
+	agg.msgMu.Lock()
+	_, stillInflight := agg.msgInflight["broken"]
+	agg.msgMu.Unlock()
+	if stillInflight {
+		t.Fatal("a failed fetch must clear the in-flight slot so a reselect retries")
+	}
+	// The first attempt must have hit the upstream exactly once.
+	mu.Lock()
+	firstFetches := fullCount
+	mu.Unlock()
+	if firstFetches != 1 {
+		t.Fatalf("first fetch: want 1 full upstream GET, got %d", firstFetches)
+	}
+	// A messages.error must be emitted.
+	var sawErr bool
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) && !sawErr {
+		select {
+		case e := <-ch:
+			if e.Kind == "messages.error" {
+				sawErr = true
+			}
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	if !sawErr {
+		t.Fatal("a failed fetch must emit messages.error")
+	}
+
+	// Retry on reselect: a second trigger issues a fresh fetch (the slot was
+	// cleared and the session is still unloaded).
+	agg.EnsureMessagesAsync(context.Background(), "broken")
+	agg.waitMessagesAsync("broken")
+	// The retry must have issued a SECOND upstream GET — proving the cleared
+	// slot allowed a genuine re-fetch rather than a silent no-op.
+	mu.Lock()
+	retryFetches := fullCount
+	mu.Unlock()
+	if retryFetches != 2 {
+		t.Fatalf("retry must issue a fresh upstream GET: want 2 (1 fail + 1 retry), got %d", retryFetches)
+	}
+}
+
+// TestEnsureMessagesAsyncSurvivesRequestCancel proves the lifetime binding: the
+// background fetch must be bound to the AGGREGATOR's lifetime (a.runCtx, or
+// WithoutCancel(ctx) before Run), NOT to the caller's ctx. handleStream passes
+// r.Context() (well, Background() in the helper, but the contract is the same);
+// canceling a short-lived caller ctx must NOT abort a still-in-flight fetch.
+// Mirrors TestRehydrateSeedSurvivesRequestCancel.
+func TestEnsureMessagesAsyncSurvivesRequestCancel(t *testing.T) {
+	released := make(chan struct{})
+	h := &slowFullMessageHandler{inner: fixtures.New().Handler(), count: map[string]int{}, released: released}
+	oc := httptest.NewServer(h)
+	defer oc.Close()
+
+	agg := New(oc.URL, 100)
+	// A short-lived caller ctx, modeling handleStream's r.Context() dying when
+	// the handler returns.
+	reqCtx, cancel := context.WithCancel(context.Background())
+	agg.EnsureMessagesAsync(reqCtx, "demo")
+	// Wait until the fetch is observably in flight, THEN cancel the caller ctx.
+	h.waitForCount(t, "demo", 1)
+	cancel()
+	// Release the fetch and let it complete. If the goroutine were bound to
+	// reqCtx, this completion would never happen (loaded stays false).
+	close(released)
+	agg.waitMessagesAsync("demo")
+
+	if !agg.Store().IsMessagesLoaded("demo") {
+		t.Fatal("the background fetch must survive the caller-ctx cancel and mark loaded")
+	}
+}
+
+// TestEnsureMessagesAsyncShutdownCancels proves the goroutine is bound to the
+// aggregator's lifetime: canceling a.runCtx (Run's ctx) aborts the in-flight
+// fetch silently — no spurious messages.error into a torn-down store, and the
+// session stays unloaded (a fresh aggregator / reconnect retries).
+func TestEnsureMessagesAsyncShutdownCancels(t *testing.T) {
+	released := make(chan struct{})
+	h := &slowFullMessageHandler{inner: fixtures.New().Handler(), count: map[string]int{}, released: released}
+	oc := httptest.NewServer(h)
+	defer oc.Close()
+
+	agg := New(oc.URL, 100)
+	// Run binds a.runCtx; canceling it models aggregator shutdown. Set it under
+	// its documented guard (seedMu) like Run does, since EnsureMessagesAsync
+	// reads it under seedMu.
+	runCtx, runCancel := context.WithCancel(context.Background())
+	agg.seedMu.Lock()
+	agg.runCtx = runCtx
+	agg.seedMu.Unlock()
+
+	agg.EnsureMessagesAsync(context.Background(), "demo")
+	h.waitForCount(t, "demo", 1)
+	// Shut the aggregator down while the fetch is in flight.
+	runCancel()
+	// Release the (now-cancelled) fetch's gate so the goroutine observes the
+	// shutdown and exits cleanly.
+	close(released)
+	agg.waitMessagesAsync("demo")
+
+	if agg.Store().IsMessagesLoaded("demo") {
+		t.Fatal("a shutdown must NOT mark the session loaded")
+	}
+	agg.msgMu.Lock()
+	_, stillInflight := agg.msgInflight["demo"]
+	agg.msgMu.Unlock()
+	if stillInflight {
+		t.Fatal("shutdown must clear the in-flight slot")
+	}
+}

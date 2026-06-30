@@ -23,6 +23,20 @@ export interface Session {
 // uses that to show a loading hint instead of looking stale/empty.
 export interface GateFacts {
   hydrated?: boolean;
+  // messagesLoaded mirrors Go's GateFacts.MessagesLoaded (pkg/state/store.go):
+  // the STRICT "daemon has fetched this session's FULL message history" memo,
+  // distinct from `hydrated` (which is true once ANY message state exists —
+  // including a partial live-event-only entry). On the async-hydration path the
+  // Stream-2 first-open snapshot sends immediately WITHOUT waiting for the
+  // upstream fetch, so the snapshot's gate carries messagesLoaded=false until
+  // the background load completes; the client keeps its loading UI up until the
+  // messages.loaded event (or a gate with messagesLoaded=true) lands.
+  // NAMING NOTE: this server GateFacts field shares its JSON spelling with the
+  // FE SyncState.messagesLoaded map (web/src/sync/store.ts) BY DESIGN — both
+  // answer "is this session's message data complete" — but they are NOT the
+  // same value: the gate field is the daemon-side fetch memo, the SyncState map
+  // is the per-client "Stream 2 has delivered it to me" flag.
+  messagesLoaded?: boolean;
   activity?: string;
   [k: string]: unknown;
 }

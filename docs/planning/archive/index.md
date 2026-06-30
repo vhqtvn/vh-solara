@@ -6,7 +6,7 @@ Older `done` and `cancelled` history from `docs/planning/backlog.md` lives here.
 
 | File | Period | Done | Cancelled | Notes |
 | --- | --- | --- | --- | --- |
-| (none) | n/a | 0 | 0 | No archive files have been created yet. |
+| [backlog-archive-2026-q2.md](backlog-archive-2026-q2.md) | 2026 Q2 | 1 | 0 | Older completed rows archived out of the active backlog. |
 
 ## Retrieval
 

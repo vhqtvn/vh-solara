@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { beforeEach, describe, expect, it } from "vitest";
 import { reconcile } from "solid-js/store";
-import { applySnapshot, applySessionEvent } from "../../src/sync/stream";
+import { applySnapshot, applySessionEvent, applySessionSnapshot, applyMessageEvent } from "../../src/sync/stream";
 import { state, setState } from "../../src/sync/store";
 import type { Snapshot } from "../../src/types";
 
@@ -18,6 +18,7 @@ import type { Snapshot } from "../../src/types";
 // each slice down to empty — a true reset (selectors.test.ts pattern).
 beforeEach(() => {
   setState("sessions", reconcile({}));
+  setState("messages", reconcile({}));
   setState("lastAgents", reconcile({}));
   setState("hydrated", reconcile({}));
   setState("messagesLoaded", reconcile({}));
@@ -140,5 +141,110 @@ describe("applySessionEvent — B2b session.delete prunes per-session maps", () 
     expect(state.sessions.s1).toEqual({ id: "s1", title: "t" });
     expect(state.lastAgents.s1).toBe("build"); // untouched
     expect(state.hydrated.s1).toBe(true); // untouched
+  });
+});
+
+// Slice C — async selected-session hydration. The Stream-2 first-open snapshot
+// no longer waits for the upstream full-message fetch: a hydrating snapshot
+// (gate.messagesLoaded===false) must keep the loading UI up until the explicit
+// messages.loaded completion event lands (or a re-snapshot reports loaded).
+describe("applySessionSnapshot / applyMessageEvent — Slice C async hydration", () => {
+  it("a HYDRATING partial snapshot does NOT mark the session delivered", () => {
+    // openSession sets messagesLoaded=false on open; the hydrating snapshot must
+    // NOT flip it to true (only messages.loaded / a loaded gate does).
+    setState("messagesLoaded", "s1", false);
+    const snap: Snapshot = {
+      seq: 1,
+      sessions: [{ id: "s1" }],
+      gate: { s1: { messagesLoaded: false } }, // background fetch still in flight
+      messages: { s1: [] },
+    };
+    applySessionSnapshot("s1", snap);
+    // messages slice is populated (empty order) but the delivery flag stays false
+    // so the transcript shows "loading" rather than "delivered-and-empty".
+    expect(state.messagesLoaded.s1).toBe(false);
+    expect(state.messages.s1).toBeDefined();
+  });
+
+  it("a FULL snapshot (messagesLoaded true) marks the session delivered", () => {
+    const snap: Snapshot = {
+      seq: 1,
+      sessions: [{ id: "s1" }],
+      gate: { s1: { messagesLoaded: true } },
+      messages: { s1: [{ info: { id: "m1", sessionID: "s1", role: "user" }, parts: [] }] },
+    };
+    applySessionSnapshot("s1", snap);
+    expect(state.messagesLoaded.s1).toBe(true);
+    expect(state.messages.s1.order).toEqual(["m1"]);
+  });
+
+  it("an older daemon (gate.messagesLoaded omitted) stays delivered (back-compat)", () => {
+    const snap: Snapshot = {
+      seq: 1,
+      sessions: [{ id: "s1" }],
+      gate: { s1: {} }, // no messagesLoaded field → undefined !== false → delivered
+      messages: { s1: [] },
+    };
+    applySessionSnapshot("s1", snap);
+    expect(state.messagesLoaded.s1).toBe(true);
+  });
+
+  it("a hydrating snapshot ACTIVELY clears a stale delivered=true (daemon restart case)", () => {
+    // A session that was previously delivered (messagesLoaded===true, e.g. the
+    // daemon restarted / epoch changed while the session was open and stale
+    // delivered state lingers) must be flipped BACK to loading when a hydrating
+    // partial snapshot (gate.messagesLoaded===false) overwrites messages[id].
+    // Otherwise the empty-order snapshot renders "delivered-and-empty".
+    setState("messagesLoaded", "s1", true);
+    const snap: Snapshot = {
+      seq: 1,
+      sessions: [{ id: "s1" }],
+      gate: { s1: { messagesLoaded: false } },
+      messages: { s1: [] },
+    };
+    applySessionSnapshot("s1", snap);
+    expect(state.messagesLoaded.s1).toBe(false);
+    expect(state.messages.s1).toBeDefined();
+  });
+
+  it("messages.loaded flips the delivery flag (the completion signal)", () => {
+    setState("messagesLoaded", "s1", false); // was hydrating
+    applyMessageEvent("messages.loaded", 42, { sessionID: "s1" }, false);
+    expect(state.messagesLoaded.s1).toBe(true);
+    // trackCursor:false → Stream 2 must NOT advance the shared resume cursor.
+    expect(state.cursor).toBe(0);
+  });
+
+  it("messages.loaded fires even when the fetch returned no message.* deltas", () => {
+    // Empty/unchanged fetch: no message.upsert would ever land, but the
+    // completion event still flips the flag → "delivered-and-empty".
+    setState("messagesLoaded", "s1", false);
+    applyMessageEvent("messages.loaded", 43, { sessionID: "s1" }, false);
+    expect(state.messagesLoaded.s1).toBe(true);
+  });
+
+  it("messages.error does NOT claim completion (keeps loading UI up)", () => {
+    setState("messagesLoaded", "s1", false);
+    applyMessageEvent("messages.error", 44, { sessionID: "s1", error: "boom" }, false);
+    // Error path logs + leaves the session loading (retry on reselect); the
+    // delivery flag must NOT flip to true (would show a misleading empty view).
+    expect(state.messagesLoaded.s1).toBe(false);
+  });
+
+  it("message.upsert arriving BEFORE completion is applied without claiming loaded", () => {
+    // Stream 2 forwards reconciled deltas on the same connection as the fetch;
+    // they can land before messages.loaded. They must populate the transcript
+    // but not flip the delivery flag (only messages.loaded does). The
+    // message.upsert payload is the FLAT MessageInfo ({id,sessionID,role}).
+    setState("messagesLoaded", "s1", false);
+    setState("messages", "s1", { order: [], byId: {} });
+    applyMessageEvent(
+      "message.upsert",
+      40,
+      { id: "m1", sessionID: "s1", role: "user" },
+      false,
+    );
+    expect(state.messages.s1.order).toContain("m1");
+    expect(state.messagesLoaded.s1).toBe(false);
   });
 });

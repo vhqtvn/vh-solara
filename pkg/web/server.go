@@ -761,6 +761,28 @@ func (s *Server) ensureMessages(ctx context.Context, agg *aggregator.Aggregator,
 	}
 }
 
+// triggerMessageLoad is the NON-BLOCKING counterpart of ensureMessages used on
+// the Stream 2 first-open path: it kicks off async hydration (EnsureMessagesAsync)
+// for unloaded selected sessions and returns immediately, so handleStream can
+// send the snapshot at once and then forward the message.*/part.* deltas +
+// messages.loaded completion over the same open connection as the background
+// fetch reconciles. This is what makes selecting an unloaded session fast on
+// first open. No-op (deduped to one in-flight fetch) for already-loaded or
+// in-flight sessions. NOTE: handleSnapshot (the one-shot GET) intentionally
+// keeps the SYNCHRONOUS ensureMessages above — a snapshot consumer expects the
+// full current view in the response body.
+func (s *Server) triggerMessageLoad(agg *aggregator.Aggregator, filter map[string]bool) {
+	if filter == nil { // "all" — explicit firehose; async-trigger every unloaded session
+		for _, id := range agg.Store().SessionIDs() {
+			agg.EnsureMessagesAsync(context.Background(), id)
+		}
+		return
+	}
+	for id := range filter {
+		agg.EnsureMessagesAsync(context.Background(), id)
+	}
+}
+
 // handleAck clears a root session's finished-unread flag (the client scrolled
 // that session to the bottom). POST /vh/ack {sessionID}. Cross-device: the
 // resulting unread.clear event/snapshot reaches every connected client.
@@ -817,7 +839,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		if filter == nil { // "all"
 			return true
 		}
-		if !strings.HasPrefix(kind, "message.") && !strings.HasPrefix(kind, "part.") {
+		if !strings.HasPrefix(kind, "message.") && !strings.HasPrefix(kind, "part.") && !strings.HasPrefix(kind, "messages.") {
 			return true // structural + notifications: always
 		}
 		var p struct {
@@ -843,7 +865,12 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		baseline = head
 	} else {
 		// Fresh client or cursor too old: send a full snapshot, then live-tail.
-		s.ensureMessages(r.Context(), agg, filter)
+		// NON-BLOCKING hydration: kick the upstream fetch off in the background
+		// (EnsureMessagesAsync) so the snapshot sends immediately, then forward
+		// message.*/part.* deltas + messages.loaded over this same connection as
+		// the fetch reconciles. Subscribe-before-trigger is preserved (we
+		// subscribed above) so no completion event slips through the gap.
+		s.triggerMessageLoad(agg, filter)
 		snap := store.Snapshot(filter)
 		b, _ := json.Marshal(snap)
 		writeRaw(w, snap.Seq, "snapshot", b)

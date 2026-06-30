@@ -18,12 +18,31 @@ import (
 
 // Client-facing event kinds. The payload is the raw OpenCode payload, untouched.
 const (
-	KindSessionUpsert   = "session.upsert"
-	KindSessionDelete   = "session.delete"
-	KindMessageUpsert   = "message.upsert"
-	KindMessageDelete   = "message.delete"
-	KindPartUpsert      = "part.upsert"
-	KindPartDelete      = "part.delete"
+	KindSessionUpsert = "session.upsert"
+	KindSessionDelete = "session.delete"
+	KindMessageUpsert = "message.upsert"
+	KindMessageDelete = "message.delete"
+	KindPartUpsert    = "part.upsert"
+	KindPartDelete    = "part.delete"
+	// KindMessagesLoaded is the authoritative "this session's full message
+	// history has been fetched and reconciled" completion signal for an
+	// on-demand (lazy async) hydration. Emitted by the aggregator's
+	// EnsureMessagesAsync after a successful fetch — UNCONDITIONALLY, including
+	// when the fetch returned zero or byte-identical messages (no message.*
+	// delta would otherwise ever signal "done" → a client would wedge on its
+	// loading state forever). Recorded in the ring (replayable, seq-stamped),
+	// like message.*/part.*; the snapshot gate's MessagesLoaded=true is the
+	// same fact for a connecting client, so the event only matters while a
+	// fetch is in flight for a client already connected. Session-scoped
+	// (payload {sessionID}); the web layer's sendable() filters it to a
+	// subscribed session so the tree-only Stream 1 never sees it.
+	KindMessagesLoaded = "messages.loaded"
+	// KindMessagesError signals an on-demand message hydration fetch FAILED for
+	// a session. The session is NOT marked loaded (a later selection / transport
+	// reconnect retries). Emitted so a connected client can surface the failure
+	// instead of wedging on the loading state. Same lifetime/replay scope as
+	// KindMessagesLoaded. Payload {sessionID, error}.
+	KindMessagesError   = "messages.error"
 	KindTodo            = "todo"
 	KindPermissionSet   = "permission.upsert"
 	KindPermissionClear = "permission.delete"
@@ -117,7 +136,31 @@ type GateFacts struct {
 	// last_assistant_completed=false / empty finish_reason — that is "not yet
 	// known", NOT "in-flight". A coordinator should force-hydrate (open) the
 	// session, or trust `activity`, before relying on those fields (§1.7).
-	Hydrated               bool   `json:"hydrated"`
+	Hydrated bool `json:"hydrated"`
+	// MessagesLoaded reports strictly whether this session's FULL message
+	// history has been fetched (the msgLoaded memo) — NOT "do we have any
+	// message state at all". It is the gate-side counterpart of the lazy-async
+	// hydration completion (the messages.loaded event / EnsureMessagesAsync).
+	//
+	// Distinct from Hydrated (above), which is "we have message state (live
+	// events OR a history hydrate)" and conflates partial-exists with
+	// fully-loaded: a session that received live message.* events has
+	// messages[sid]!=nil → Hydrated=true but MessagesLoaded=false (the tail of
+	// live deltas is NOT the full ordered history). A client must base its
+	// "deliver the transcript / stop showing the loading state" decision on
+	// MessagesLoaded, not Hydrated.
+	//
+	// NAMING: this Go field serializes to JSON `"messagesLoaded"`, the SAME
+	// spelling as the FE's web/src/sync/store.ts SyncState.messagesLoaded map
+	// (Record<string,boolean>). They are DIFFERENT facts that happen to share a
+	// name by design (the FE map mirrors this gate field per connected client):
+	//   - server gate GateFacts.MessagesLoaded = "the daemon fetched this
+	//     session's full history" (the msgLoaded memo, set by the aggregator's
+	//     background fetch).
+	//   - FE SyncState.messagesLoaded[id] = "Stream 2 has DELIVERED the real
+	//     message list for this session to THIS client" (set from the snapshot
+	//     gate, when true, OR from a messages.loaded event).
+	MessagesLoaded         bool   `json:"messagesLoaded"`
 	LastAssistantCompleted bool   `json:"last_assistant_completed"` // latest assistant turn has time.completed (meaningful iff hydrated)
 	FinishReason           string `json:"finish_reason,omitempty"`  // raw opencode `finish` of the latest assistant msg (meaningful iff hydrated)
 	// LastAssistantEmpty is true when the latest assistant message has no
@@ -366,6 +409,31 @@ func (s *Store) EmitNotice(payload json.RawMessage) {
 func rawObj(kv map[string]interface{}) json.RawMessage {
 	b, _ := json.Marshal(kv)
 	return b
+}
+
+// EmitMessagesLoaded fans out a messages.loaded completion event for ONE
+// session: the authoritative "this session's full message history has been
+// fetched and reconciled" signal. Recorded in the ring (replayable) so it
+// composes with the seq-baseline guard like any view event. The aggregator
+// emits this after a successful EnsureMessagesAsync fetch — including when the
+// fetch returned zero or byte-identical messages, so a connected client never
+// wedges on its loading state waiting for a message.* delta that never comes.
+// Safe to call from any goroutine.
+func (s *Store) EmitMessagesLoaded(sid string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.emit(KindMessagesLoaded, rawObj(map[string]interface{}{"sessionID": sid}))
+}
+
+// EmitMessagesError fans out a messages.error for ONE session: an on-demand
+// hydration fetch failed and the session is NOT marked loaded (a later
+// selection / transport reconnect retries). Emitted so a connected client can
+// surface the failure instead of wedging on the loading state. Safe to call
+// from any goroutine.
+func (s *Store) EmitMessagesError(sid string, errMsg string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.emit(KindMessagesError, rawObj(map[string]interface{}{"sessionID": sid, "error": errMsg}))
 }
 
 // normalizeActivity maps an OpenCode SessionStatus.type to a UI activity state.
@@ -1227,7 +1295,12 @@ func (s *Store) Snapshot(messagesFor map[string]bool) Snapshot {
 			// a messages entry exists. When false, the message-derived fields below are
 			// "not yet known", which a cold/un-opened session after a restart can't be
 			// distinguished from in-flight without this.
-			Hydrated:               s.msgLoaded[sid] || s.messages[sid] != nil,
+			Hydrated: s.msgLoaded[sid] || s.messages[sid] != nil,
+			// MessagesLoaded is the STRICT "full history fetched" memo (msgLoaded),
+			// independent of whether live message.* events have populated a partial
+			// messages[sid] entry. See the GateFacts.MessagesLoaded doc for why it is
+			// distinct from Hydrated.
+			MessagesLoaded:         s.msgLoaded[sid],
 			LastAssistantCompleted: se.hasAssistant && se.lastAsstCompleted,
 			LastAssistantEmpty:     se.lastAsstEmpty,
 			FinishReason:           se.lastFinish,

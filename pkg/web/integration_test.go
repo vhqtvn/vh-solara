@@ -25,12 +25,18 @@ type fakeOpenCode struct {
 	events   chan string    // raw JSON event payloads ({id,type,properties})
 	prompts  []string       // bodies POSTed to /session/:id/message (prompt passthrough)
 	msgGets  map[string]int // GET /session/:id/message hit counts (lazy-hydration test)
+	holdMu   sync.Mutex
+	// msgHold lets a test BLOCK the full-message GET for a session until the
+	// chan is closed — used by the async-hydration test to assert the snapshot
+	// lands BEFORE the upstream fetch completes. nil (default) = no hold.
+	msgHold map[string]chan struct{}
 }
 
 func newFake() *fakeOpenCode {
 	return &fakeOpenCode{
 		messages: map[string]string{},
 		msgGets:  map[string]int{},
+		msgHold:  map[string]chan struct{}{},
 		events:   make(chan string, 16),
 	}
 }
@@ -46,6 +52,15 @@ func (f *fakeOpenCode) handler() http.Handler {
 		// /session/{id}/message — GET lists, POST is a prompt.
 		id := strings.TrimPrefix(r.URL.Path, "/session/")
 		id = strings.TrimSuffix(id, "/message")
+		// Optional per-session hold: if a test registered a chan for this id,
+		// block here until it's closed. Wait OUTSIDE f.mu so the session-list
+		// endpoint (which also locks f.mu) can't deadlock against a held fetch.
+		f.holdMu.Lock()
+		hold := f.msgHold[id]
+		f.holdMu.Unlock()
+		if hold != nil {
+			<-hold
+		}
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		if r.Method == http.MethodPost {
@@ -174,6 +189,31 @@ func readSSEEvent(t *testing.T, r *bufio.Reader) string {
 		line = strings.TrimRight(line, "\r\n")
 		if strings.HasPrefix(line, "event:") {
 			return strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+		}
+	}
+}
+
+// readSSEFrame reads one full SSE frame (until the terminating blank line) and
+// returns its event name + the (single) data payload. Used by the async test
+// which needs to inspect the snapshot body, not just the event kind.
+func readSSEFrame(t *testing.T, r *bufio.Reader) (event, data string) {
+	t.Helper()
+	for {
+		line, err := r.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read stream: %v", err)
+		}
+		line = strings.TrimRight(line, "\r\n")
+		if line == "" {
+			if event != "" {
+				return event, data
+			}
+			continue // leading blank / separator
+		}
+		if strings.HasPrefix(line, "event:") {
+			event = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+		} else if strings.HasPrefix(line, "data:") {
+			data = strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		}
 	}
 }
@@ -337,6 +377,93 @@ func TestLazyHydration(t *testing.T) {
 	if agg.Store().IsMessagesLoaded("b") {
 		t.Fatal("'b' must remain un-hydrated (never opened)")
 	}
+}
+
+// TestStreamAsyncHydration verifies the Stream-2 first-open path no longer
+// blocks the snapshot behind the synchronous full-message fetch (Slice C).
+// Selecting an unloaded session must send a partial snapshot IMMEDIATELY (before
+// the upstream GET /session/:id/message completes), then forward the
+// message.*/part.* deltas + the messages.loaded completion over the SAME open
+// connection as the background fetch reconciles.
+func TestStreamAsyncHydration(t *testing.T) {
+	fake := newFake()
+	fake.sessions = []string{`{"id":"a","title":"A","time":{"updated":1}}`}
+	fake.messages["a"] = `[{"info":{"id":"m1","sessionID":"a","role":"user"},"parts":[{"id":"p1","sessionID":"a","messageID":"m1","type":"text","text":"hi"}]}]`
+	// Hold the full-message GET open so the snapshot observably lands first.
+	hold := make(chan struct{})
+	fake.msgHold["a"] = hold
+
+	ocSrv := httptest.NewServer(fake.handler())
+	defer ocSrv.Close()
+
+	agg := aggregator.New(ocSrv.URL, 1000)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go agg.Run(ctx)
+	waitFor(t, func() bool { return len(agg.Store().Snapshot(map[string]bool{}).Sessions) == 1 }, "hydrate session a")
+
+	srv, _ := NewServer(agg, ocSrv.URL, 1000)
+	web := httptest.NewServer(srv.Handler())
+	defer web.Close()
+
+	// Fresh Stream-2 client for session "a". The snapshot must land BEFORE the
+	// held full-message fetch completes — the old sync path (ensureMessages)
+	// would have blocked here until GET /session/a/message returned.
+	resp, err := http.Get(web.URL + "/vh/stream?sessions=a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	reader := bufio.NewReader(resp.Body)
+
+	ev, data := readSSEFrame(t, reader)
+	if ev != "snapshot" {
+		t.Fatalf("first frame want 'snapshot', got %q", ev)
+	}
+	var snap struct {
+		Messages map[string][]json.RawMessage `json:"messages"`
+		Gate     map[string]struct {
+			MessagesLoaded bool `json:"messagesLoaded"`
+		} `json:"gate"`
+	}
+	if err := json.Unmarshal([]byte(data), &snap); err != nil {
+		t.Fatal(err)
+	}
+	if len(snap.Messages["a"]) != 0 {
+		t.Fatalf("async snapshot must NOT carry messages while fetch in flight, got %d", len(snap.Messages["a"]))
+	}
+	// Gate is built for every known session regardless of the message filter, so
+	// "a" must be present and report NOT-yet-loaded.
+	if g, ok := snap.Gate["a"]; !ok {
+		t.Fatal("async snapshot gate missing session a")
+	} else if g.MessagesLoaded {
+		t.Fatal("async snapshot gate must report messagesLoaded=false while fetch in flight")
+	}
+
+	// Release the held fetch — the background hydration now completes and the
+	// SAME connection receives the reconciled message/part deltas + the
+	// messages.loaded completion event.
+	close(hold)
+
+	var sawMessageUpsert, sawLoaded bool
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && !(sawMessageUpsert && sawLoaded) {
+		ev, _ = readSSEFrame(t, reader)
+		switch ev {
+		case "message.upsert":
+			sawMessageUpsert = true
+		case "messages.loaded":
+			sawLoaded = true
+		}
+	}
+	if !sawMessageUpsert {
+		t.Fatal("stream must forward message.upsert after the background fetch reconciles")
+	}
+	if !sawLoaded {
+		t.Fatal("stream must forward messages.loaded completion after the background fetch")
+	}
+	// The completion marked the session loaded server-side.
+	waitFor(t, func() bool { return agg.Store().IsMessagesLoaded("a") }, "session a loaded after completion")
 }
 
 // TestCSRFGuard verifies state-changing API requests require the custom header,

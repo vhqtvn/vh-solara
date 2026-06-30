@@ -701,3 +701,92 @@ func TestActivityVerbEmitOnTransitionNotDelta(t *testing.T) {
 		t.Fatalf("idle clear payload must have empty tool, got %s", evs[0].Payload)
 	}
 }
+
+// TestGateMessagesLoadedVsHydrated pins the Slice-C gate contract: Hydrated
+// conflates "any message state" (live events OR a history hydrate), while
+// MessagesLoaded is the STRICT "full history fetched" memo. A session that has
+// only received live message.* events has messages[sid]!=nil → Hydrated=true
+// but MessagesLoaded MUST be false (the tail of live deltas is not the full
+// ordered history). Only SetSessionMessages (the history fetch path) flips
+// MessagesLoaded.
+func TestGateMessagesLoadedVsHydrated(t *testing.T) {
+	s := New(100)
+	s.Apply(ev("session.created", `{"info":{"id":"a"}}`))
+	// Cold: no message state at all → both false.
+	if g := s.Snapshot(nil).Gate["a"]; g.Hydrated || g.MessagesLoaded {
+		t.Fatalf("cold session: want Hydrated=false MessagesLoaded=false, got %+v", g)
+	}
+	// Live message events populate messages[sid] (Hydrated=true) but do NOT
+	// fetch the full history (MessagesLoaded stays false). This is the
+	// partial-exists case Slice C must distinguish from fully-loaded.
+	s.Apply(ev("message.updated", `{"info":{"id":"m1","sessionID":"a","role":"assistant","time":{"created":1,"completed":2},"finish":"stop"}}`))
+	if g := s.Snapshot(nil).Gate["a"]; !g.Hydrated || g.MessagesLoaded {
+		t.Fatalf("live-only session: want Hydrated=true MessagesLoaded=false, got %+v", g)
+	}
+	// A history fetch (the lazy hydration path) flips MessagesLoaded.
+	s.SetSessionMessages("a", nil)
+	if g := s.Snapshot(nil).Gate["a"]; !g.Hydrated || !g.MessagesLoaded {
+		t.Fatalf("after SetSessionMessages: want Hydrated=true MessagesLoaded=true, got %+v", g)
+	}
+}
+
+// TestEmitMessagesLoadedError pins the two new completion events: they are
+// emitted to subscribers, seq-stamped + recorded in the ring (replayable), and
+// carry the sessionID (+ error) payload. The aggregator relies on these to
+// signal on-demand-hydration completion/failure to a connected Stream-2 client.
+func TestEmitMessagesLoadedError(t *testing.T) {
+	s := New(100)
+	ch, unsub := s.Subscribe(128)
+	defer unsub()
+	drainKind(ch, "") // drop subscribe-time backlog
+
+	s.EmitMessagesLoaded("a")
+	loaded := drainKind(ch, KindMessagesLoaded)
+	if len(loaded) != 1 {
+		t.Fatalf("want 1 %s event, got %d", KindMessagesLoaded, len(loaded))
+	}
+	var p1 struct{ SessionID string }
+	if json.Unmarshal(loaded[0].Payload, &p1) != nil || p1.SessionID != "a" {
+		t.Fatalf("messages.loaded payload must be {sessionID:a}, got %s", loaded[0].Payload)
+	}
+	if loaded[0].Seq == 0 {
+		t.Fatal("messages.loaded must be seq-stamped (replayable)")
+	}
+
+	s.EmitMessagesError("b", "boom")
+	errd := drainKind(ch, KindMessagesError)
+	if len(errd) != 1 {
+		t.Fatalf("want 1 %s event, got %d", KindMessagesError, len(errd))
+	}
+	var p2 struct {
+		SessionID string
+		Error     string
+	}
+	if json.Unmarshal(errd[0].Payload, &p2) != nil || p2.SessionID != "b" || p2.Error != "boom" {
+		t.Fatalf("messages.error payload must be {sessionID:b,error:boom}, got %s", errd[0].Payload)
+	}
+	if errd[0].Seq <= loaded[0].Seq {
+		t.Fatal("messages.error seq must advance past the prior event")
+	}
+
+	// Replay must include both (they are part of the replayable ring), so a
+	// resuming client that missed them converges. Snapshot gate is the
+	// authoritative per-session state; the events only matter while a fetch is
+	// in flight.
+	evs, _, ok := s.Replay(0)
+	if !ok {
+		t.Fatal("Replay(0) must be ok")
+	}
+	var loadN, errN int
+	for _, e := range evs {
+		switch e.Kind {
+		case KindMessagesLoaded:
+			loadN++
+		case KindMessagesError:
+			errN++
+		}
+	}
+	if loadN != 1 || errN != 1 {
+		t.Fatalf("replay must contain 1 messages.loaded + 1 messages.error, got load=%d err=%d", loadN, errN)
+	}
+}

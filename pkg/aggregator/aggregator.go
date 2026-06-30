@@ -39,13 +39,25 @@ type Aggregator struct {
 	// cancelled.
 	seedMu   sync.Mutex
 	seedDone chan struct{}
+
+	// msgMu guards msgInflight. msgInflight[sid] is non-nil (open) while an
+	// EnsureMessagesAsync fetch is in flight for that session; absent means none.
+	// This collapses concurrent opens of the same session (rapid switching, a
+	// reopen before the first completed, or several Stream-2 consumers) to ONE
+	// upstream GET /session/:id/message — the losers are already subscribed and
+	// simply receive the eventual messages.loaded / messages.error event. An
+	// entry is cleared on completion (success OR failure) so a later selection
+	// retries after a failure (the session is not left loaded on error).
+	msgMu       sync.Mutex
+	msgInflight map[string]chan struct{}
 }
 
 // New builds an aggregator targeting an opencode server base URL.
 func New(baseURL string, ringCapacity int) *Aggregator {
 	return &Aggregator{
-		client: opencode.New(baseURL),
-		store:  state.New(ringCapacity),
+		client:      opencode.New(baseURL),
+		store:       state.New(ringCapacity),
+		msgInflight: map[string]chan struct{}{},
 	}
 }
 
@@ -54,7 +66,7 @@ func New(baseURL string, ringCapacity int) *Aggregator {
 func NewForDirectory(baseURL, directory string, ringCapacity int) *Aggregator {
 	c := opencode.New(baseURL)
 	c.Directory = directory
-	return &Aggregator{client: c, store: state.New(ringCapacity)}
+	return &Aggregator{client: c, store: state.New(ringCapacity), msgInflight: map[string]chan struct{}{}}
 }
 
 // Directory returns the project directory this aggregator is scoped to ("" =
@@ -90,6 +102,104 @@ func (a *Aggregator) EnsureMessages(ctx context.Context, sessionID string) error
 	}
 	a.store.SetSessionMessages(sessionID, decodeMessages(items))
 	return nil
+}
+
+// EnsureMessagesAsync is the non-blocking lazy-hydration entrypoint used by the
+// session-selection path (Stream 2 first open). It does NOT wait for the
+// upstream fetch: it returns immediately so handleStream can send the snapshot
+// (partial — no messages yet) at once, then forward message.*/part.* deltas +
+// the messages.loaded completion over the SAME open connection as the
+// background fetch reconciles the result. This is what makes selecting an
+// unloaded session fast on first open (the old EnsureMessages blocked the
+// snapshot behind a full GET /session/:id/message).
+//
+// Per-session single-flight: concurrent calls for the same session collapse to
+// ONE upstream fetch (a loser that's already subscribed just receives the
+// eventual completion event). No-op if the session is already loaded.
+//
+// The fetch goroutine is bound to the AGGREGATOR's LIFETIME ctx (a.runCtx), NOT
+// the caller's ctx: handleStream's r.Context() dies the moment the SSE handler
+// returns, but the fetch must survive to populate the store + emit completion
+// for the NEXT client that opens the session. Mirrors startColdSeed's lifetime
+// binding; falls back to a request-detached ctx (context.WithoutCancel) when Run
+// hasn't been called yet (tests calling this directly).
+//
+// On success: SetSessionMessages (marks loaded, emits message.*/part.* deltas)
+// THEN EmitMessagesLoaded — UNCONDITIONALLY, so a fetch that returned zero or
+// byte-identical messages (no diff deltas) still signals completion and the
+// client doesn't wedge on its loading state. On failure (and NOT a shutdown):
+// log + EmitMessagesError, leave the session UNLOADED so a reselect / transport
+// reconnect retries; on shutdown (ctx cancelled) just exit silently.
+func (a *Aggregator) EnsureMessagesAsync(ctx context.Context, sessionID string) {
+	if sessionID == "" || a.store.IsMessagesLoaded(sessionID) {
+		return
+	}
+	a.msgMu.Lock()
+	if _, ok := a.msgInflight[sessionID]; ok {
+		// A fetch is already in flight for this session; the caller is already
+		// subscribed and will receive the eventual completion event — dedupe.
+		a.msgMu.Unlock()
+		return
+	}
+	done := make(chan struct{})
+	a.msgInflight[sessionID] = done
+	a.msgMu.Unlock()
+	// Derive the fetch ctx from the AGGREGATOR's lifetime (a.runCtx), NOT the
+	// caller's: handleStream's r.Context() is cancelled when the handler
+	// returns, which would abort a fetch the store needs. Read under seedMu —
+	// a.runCtx is the seedMu-guarded lifetime ctx Run captures (mirrors
+	// startColdSeed). When Run hasn't run yet (a.runCtx == nil, e.g. tests),
+	// detach from the caller so a short-lived ctx can't kill it mid-fetch.
+	a.seedMu.Lock()
+	fetchCtx := a.runCtx
+	a.seedMu.Unlock()
+	if fetchCtx == nil {
+		fetchCtx = context.WithoutCancel(ctx)
+	}
+
+	go func() {
+		defer func() {
+			a.msgMu.Lock()
+			if a.msgInflight[sessionID] == done {
+				delete(a.msgInflight, sessionID)
+			}
+			a.msgMu.Unlock()
+			close(done)
+		}()
+		items, err := a.client.Messages(fetchCtx, sessionID)
+		if err != nil {
+			if fetchCtx.Err() != nil {
+				// Aggregator shutting down (or caller ctx cancelled in a direct
+				// test path): don't spam a completion event into a torn-down
+				// store, and don't log a spurious failure. The session stays
+				// unloaded; a later selection on a fresh aggregator retries.
+				return
+			}
+			log.Printf("[aggregator] EnsureMessagesAsync failed for %s: %v", sessionID, err)
+			a.store.EmitMessagesError(sessionID, err.Error())
+			return
+		}
+		a.store.SetSessionMessages(sessionID, decodeMessages(items))
+		// ALWAYS emit completion — even when the fetch returned zero or unchanged
+		// messages (SetSessionMessages emitted no message.* delta in those
+		// cases). Without this a client would wedge on the loading state forever
+		// waiting for a delta that never arrives.
+		a.store.EmitMessagesLoaded(sessionID)
+	}()
+}
+
+// waitMessagesAsync blocks until any in-flight EnsureMessagesAsync fetch for the
+// given session completes (success or failure). Production callers do NOT wait
+// — the fetch is intentionally non-blocking. Exposed for tests that need to
+// observe the hydrated end-state (or the cleared in-flight slot after a
+// failure) synchronously. Mirrors waitColdSeed.
+func (a *Aggregator) waitMessagesAsync(sessionID string) {
+	a.msgMu.Lock()
+	done := a.msgInflight[sessionID]
+	a.msgMu.Unlock()
+	if done != nil {
+		<-done
+	}
 }
 
 // Rehydrate re-fetches the full state from OpenCode and reconciles the store.
