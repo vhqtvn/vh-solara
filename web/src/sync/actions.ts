@@ -46,6 +46,7 @@ export function switchProject(dir: string, fromUrl = false) {
       s.sessions = loadSessions(dir);
       s.messages = {};
       s.messagesLoaded = {};
+      s.messagesError = {};
       s.activity = loadActivity(dir);
       // B2b audit: lastAgents is a per-session facet that must NOT carry over
       // from the previous project (orphan-map gap). Like activity, it is

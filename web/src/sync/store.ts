@@ -76,6 +76,15 @@ export interface SyncState {
   // (→ genuinely no messages). See ChatView maybeRestore's order-length guard
   // and the transcript empty-state discriminator.
   messagesLoaded: Record<string, boolean>;
+  // Per-session flag: the active-session background hydration FAILED (the daemon
+  // emitted messages.error and left the session unloaded). Distinct from
+  // messagesLoaded (which stays false on error): ChatView's visual-reveal gate
+  // holds the transcript hidden until EITHER delivered OR errored, so a failed
+  // hydration reveals whatever partial content we have (instead of wedging on a
+  // blank loading state forever — messages.loaded never arrives on failure).
+  // Cleared by a later messages.loaded / a successful Stream-2 snapshot, and
+  // pruned on session.delete (mirrors messagesLoaded).
+  messagesError: Record<string, boolean>;
   // Per-session activity (busy/idle/error) and pending permissions are kept for
   // ALL sessions so the sidebar/chat can surface status without opening them.
   activity: Record<string, string>;
@@ -131,6 +140,7 @@ export const [state, setState] = createStore<SyncState>({
   sessions: loadSessions(initialDir),
   messages: {},
   messagesLoaded: {},
+  messagesError: {},
   activity: loadActivity(initialDir),
   lastAgents: loadLastAgents(initialDir),
   currentVerbs: {},

@@ -144,6 +144,7 @@ export function applySessionEvent(kind: string, seq: number, payload: any) {
         delete s.lastAgents[payload.id];
         delete s.hydrated[payload.id];
         delete s.messagesLoaded[payload.id];
+        delete s.messagesError[payload.id];
       }
       if (seq) s.cursor = seq;
     }),
@@ -193,15 +194,22 @@ export function applyMessageEvent(kind: string, seq: number, payload: any, track
           // Flip the per-client delivery flag so the transcript moves from
           // "loading" to "delivered-and-empty" (or renders the just-hydrated msg
           // deltas that Stream 2 forwarded alongside this on the same connection).
-          if (payload.sessionID) s.messagesLoaded[payload.sessionID] = true;
+          // Clear any prior messagesError: a later successful load supersedes a
+          // past failure (e.g. retry after a transient background-hydration error).
+          if (payload.sessionID) {
+            s.messagesLoaded[payload.sessionID] = true;
+            delete s.messagesError[payload.sessionID];
+          }
           break;
         }
         case "messages.error": {
           // Background fetch failed; the daemon left the session UNLOADED (it
-          // retries on the next selection/reconnect). Log only — keep the loading
-          // UI up rather than showing a misleading empty transcript. Surfacing
-          // this as an explicit error state is a documented residual risk.
+          // retries on the next selection/reconnect). Record the failure so the
+          // chat's visual-reveal gate can fall back to showing whatever partial
+          // content was streamed (instead of wedging forever on a blank loading
+          // state — messages.loaded never arrives on failure). Log as well.
           if (payload?.sessionID) {
+            s.messagesError[payload.sessionID] = true;
             log.warn("sync", "messages hydration failed", {
               id: payload.sessionID,
               error: payload.error,
@@ -522,6 +530,14 @@ export function applySessionSnapshot(id: string, snap: Snapshot) {
     setState("messagesLoaded", id, false);
   } else {
     setState("messagesLoaded", id, true); // true OR undefined (older daemon) → delivered
+    // A delivered snapshot supersedes a prior background-hydration failure
+    // (e.g. retry after error, or a Stream-2 reconnect): clear the error so the
+    // chat's reveal gate stops treating this session as "failed/partial".
+    setState(
+      produce((s) => {
+        delete s.messagesError[id];
+      }),
+    );
   }
 }
 

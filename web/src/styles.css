@@ -1070,6 +1070,10 @@ body {
    (the real-app heat that a bare test page never reproduced). Not worth a fade. */
 .chat-content { max-width: var(--chat-width, 860px); margin: 0 auto; }
 .chat-empty { padding: 32px 16px; text-align: center; color: var(--fg-dim); font-size: 14px; }
+/* Failed-background-hydration hint (ChatView's messageFailed empty-state branch).
+   Just color + a faint top rule — no mask/backdrop/contain/content-visibility
+   (WebRender traps on always-present surfaces). */
+.chat-empty.chat-error { color: var(--fg, currentColor); border-top: 1px solid var(--line, rgba(0,0,0,0.08)); }
 /* Switch → ready loading overlay (see ChatView's `showLoading`). Absolute over
    .chat-main (position: relative). Kept GPU-cheap: a static spinner + text on
    the existing background — NO mask-image, NO backdrop-filter, NO contain, NO
@@ -1089,8 +1093,15 @@ body {
   z-index: 1;
 }
 .chat-loading-text { font-size: 14px; }
-/* Revealed once positioned (see ChatView ready signal) — the initial scroll
-   jump happens while hidden, then a quick fade in. */
+/* VISUAL REVEAL GATE — `.ready` is added to .chat-content when ChatView's
+   `revealed()` memo is true: positioned (ready, for scroll-restore geometry) AND
+   fully delivered (messagesLoaded) OR the background fetch failed. The opacity:0
+   window is intentionally wider than `ready()` alone: it covers the WHOLE
+   Slice-C async-hydration window (partial snapshot → message/part deltas →
+   messages.loaded) so the transcript never visibly populates top-down. opacity:0
+   (NOT display:none / visibility:hidden) preserves layout geometry, so scroll
+   restore / maybeRestore / Deferred measurement all read correct dimensions while
+   hidden. A quick fade in once delivered. See ChatView `revealed`. */
 .chat-content { opacity: 0; transition: opacity 0.12s ease; }
 .chat-content.ready { opacity: 1; }
 

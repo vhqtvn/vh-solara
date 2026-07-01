@@ -252,6 +252,25 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // maybeRestore's order-length guard below (~:591-595) and drives the
   // transcript empty/loading discriminator at the bottom of the render.
   const delivered = () => !!state.messagesLoaded[props.sessionId];
+  // messageFailed: the active-session background hydration emitted
+  // messages.error and the daemon left the session UNLOADED (it retries on next
+  // selection/reconnect). The reveal gate falls back to this so a failed
+  // hydration reveals whatever partial content was streamed instead of wedging
+  // forever on a blank loading state (messages.loaded never arrives on failure).
+  const messageFailed = () => !!state.messagesError[props.sessionId];
+  // revealed: the VISUAL transcript reveal gate. This is the O2 fix for the
+  // "transcript grows top-down" symptom: a large session's Slice-C async
+  // hydration streams a PARTIAL snapshot (messagesLoaded=false) followed by
+  // message.*/part.* deltas and finally messages.loaded. Without this gate the
+  // transcript populated progressively while already visible. `revealed` holds
+  // the .chat-content opacity:hidden + loading overlay up until the transcript
+  // is BOTH positioned (ready, for scroll-restore geometry) AND fully delivered
+  // (delivered) — or the fetch failed (messageFailed), in which case we show
+  // the partial content with an error hint rather than hanging on loading.
+  // `ready()` semantics are intentionally left UNTOUCHED (it still drives
+  // scroll-restore, self-heal, and ack timing); `revealed` is a separate,
+  // purely-visual gate layered on top.
+  const revealed = createMemo(() => ready() && (delivered() || messageFailed()));
   const messages = createMemo(() => {
     const s = sm();
     return s ? s.order.map((id) => s.byId[id]) : [];
@@ -706,11 +725,15 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       },
     ),
   );
-  // Drive the switch → ready loading overlay (above). Reads `ready()` + the draft
-  // flag; writes `showLoading`. The write never becomes a dependency (this effect
-  // never reads showLoading), so there's no re-trigger loop.
+  // Drive the switch → ready loading overlay (above). Reads `revealed()` + the
+  // draft flag; writes `showLoading`. The write never becomes a dependency (this
+  // effect never reads showLoading), so there's no re-trigger loop. `revealed`
+  // (not bare `ready()`) is the right gate here: the overlay must stay up for
+  // the WHOLE partial-hydration window (messagesLoaded=false → deltas →
+  // loaded), not just the positioning window, so the transcript never visibly
+  // populates behind a transparent overlay.
   createEffect(() => {
-    const hidden = !props.draft && !ready();
+    const hidden = !props.draft && !revealed();
     if (!hidden) {
       setShowLoading(false);
       return;
@@ -1407,7 +1430,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       <Show when={!props.draft}>
       <div class="chat-main">
       <div class="chat-scroll" ref={scrollEl} onScroll={onScrolled}>
-        <div class="chat-content" ref={contentEl} classList={{ ready: ready() }}>
+        <div class="chat-content" ref={contentEl} classList={{ ready: revealed() }}>
           <For each={messages()}>
             {(m, i) => (
               <div class="msg" data-mid={m.id} classList={{ user: m.info.role === "user", assistant: m.info.role === "assistant" }}>
@@ -1460,18 +1483,35 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
             )}
           </For>
           {/* Transcript-level states: a loading hint while the first snapshot
-              is in flight (slot reserved but not yet delivered), then an empty
-              hint once delivered-and-empty. openSession pre-reserves a
-              truthy-but-empty slot, so we key off `delivered` (messagesLoaded),
+              is in flight (slot reserved but not yet delivered), an empty hint
+              once delivered-and-empty, or a failure hint if the background
+              hydration errored. openSession pre-reserves a truthy-but-empty
+              slot, so we key off `delivered` (messagesLoaded) / `messageFailed`,
               NOT sm() truthiness — otherwise "No messages" flashes before the
-              snapshot lands. Per-message errors render inline above. */}
+              snapshot lands. Per-message errors render inline above.
+
+              Note on `messageFailed`: the reveal gate (`revealed()`) already
+              unhides the transcript on failure so partial content is visible.
+              This empty-state hint only renders when messages().length === 0 —
+              so a FAILED fetch with NO partial content surfaces an explicit
+              error rather than a blank/ambiguous "Loading…" that would never
+              resolve (messages.loaded never arrives on failure). A non-empty
+              failed transcript shows the streamed content; the inline role=alert
+              is omitted there to avoid covering real messages. */}
           <Show when={messages().length === 0 && !working()}>
-            <Show
-              when={delivered()}
-              fallback={<div class="chat-empty" role="status" aria-live="polite">Loading conversation…</div>}
-            >
-              <div class="chat-empty">No messages in this session yet.</div>
-            </Show>
+            <Switch>
+              <Match when={messageFailed()}>
+                <div class="chat-empty chat-error" role="alert">
+                  Couldn’t load this conversation. Select it again to retry.
+                </div>
+              </Match>
+              <Match when={delivered()}>
+                <div class="chat-empty">No messages in this session yet.</div>
+              </Match>
+              <Match when={true}>
+                <div class="chat-empty" role="status" aria-live="polite">Loading conversation…</div>
+              </Match>
+            </Switch>
           </Show>
         </div>
       </div>
@@ -1479,10 +1519,13 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
           Switch → ready loading overlay (sibling of .chat-scroll inside
           .chat-main — deliberately NOT inside .chat-content, which is hidden by
           the `ready` class). Covers the heavy-render window for a large session
-          and hides the instant `ready` flips. See .chat-loading styles for the
-          GPU-cheap rationale (no mask/backdrop-filter/contain/content-visibility).
+          and hides the instant `revealed` flips. Gated on `revealed()` (not bare
+          `ready()`) so the overlay stays up for the WHOLE partial-hydration
+          window — without this the transcript would visibly populate behind a
+          transparent overlay. See .chat-loading styles for the GPU-cheap
+          rationale (no mask/backdrop-filter/contain/content-visibility).
         */}
-        <Show when={!props.draft && !ready() && showLoading()}>
+        <Show when={!props.draft && !revealed() && showLoading()}>
           <div class="chat-loading" role="status" aria-live="polite">
             <Spinner size={20} />
             <span class="chat-loading-text">Loading…</span>
