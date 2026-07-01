@@ -777,3 +777,158 @@ test("reopen of a busy session at a stored anchor is not yanked to the tail", as
   await page.locator("button.jump").click({ timeout: 5000 });
   await expectFollowingTail(page);
 });
+
+// (13) Tab resume must re-engage Live after a hidden content reshuffle.
+//
+// This is the deterministic reproduction of the reported "Live stops after some
+// time, around tab resume" failure. Root cause: while the tab is hidden the
+// browser suppresses ResizeObserver delivery (it queues + coalesces callbacks
+// until the tab returns), but Solid reactivity + layout still run, so a turn can
+// settle (raw md-stream → compact MarkdownHtml swap, a shrink) and new content
+// can regrow it. If an intermediate settle-shrink clamped scrollTop DOWN and
+// content then regrew so the NET scrollHeight is back to ≈ its pre-hidden value,
+// the single coalesced RO callback delivered on resume sees `scrollTop <
+// pinnedTop` (clamped) with `!shrank` (net grew/not-shrunk vs the stale pre-
+// hidden pin) — the contentEl ResizeObserver guard at ChatView.tsx then
+// mis-classifies this as a genuine user scroll-up: setFollowing(false) +
+// setUserScrolledUp(true) (intent latch ARMED). Because the latch is armed the
+// self-heal effect (the only auto-re-engage, fires on the working() false→true
+// edge gated by !userScrolledUp()) cannot recover it — Live stays dead until the
+// user manually scrolls back / clicks "↓ Latest" / a new turn clears it.
+//
+// The fix is an additive `visibilitychange` listener in ChatView: on tab →
+// visible, if ready() and the intent latch is NOT set, re-engage following +
+// re-pin. visibilitychange dispatches BEFORE the rendering step where the queued
+// RO delivers, so the re-pin refreshes pinnedTop/pinnedScrollHeight to the
+// CURRENT post-hidden state first; the guard then sees scrollTop===pinnedTop and
+// re-pins cleanly instead of tripping on the stale pre-hidden baseline.
+//
+// Reproduction strategy: a real tab-hide is not feasible from Playwright
+// (document.hidden is OS-driven, read-only), so we SIMULATE the hidden→resume
+// coalesced-RO geometry in one synchronous evaluate script:
+//   1. Glue to the tail + append a tall block (RO pins → armed tall pinnedTop).
+//   2. SYNCHRONOUSLY shrink the block to 0 (layout clamps scrollTop DOWN to the
+//      shorter max) then regrow it to a NEW larger size (scrollTop stays at the
+//      clamped value; net scrollHeight is now LARGER than pinnedScrollHeight).
+//      RO callbacks are delivered asynchronously (after the script, before
+//      paint), so the guard sees only the NET result with a STALE pinnedTop —
+//      exactly the coalesced geometry a real tab-hide delivers on resume.
+//   3. INSIDE the same script, AFTER the reshuffle, dispatch a synthetic
+//      `visibilitychange` (resume). In Playwright document.visibilityState is
+//      already "visible", so the fix's listener runs its body and re-pins to the
+//      post-reshuffle state BEFORE the queued RO delivers. Without the fix the
+//      dispatch is a no-op and the queued RO mis-fires.
+//
+// Non-vacuity: the appended tall block + regrow-to-larger forces a NET size
+// change so the RO actually fires (an exactly-net-neutral reshuffle would not
+// deliver an RO callback). The mis-fire geometry — scrollTop well below
+// pinnedTop with !shrank — is the precise condition the guard's `!shrank`
+// discriminator cannot see (it only compares current scrollHeight to the stale
+// pin), which is why test 7's gradual single-step shrink (where pin() runs
+// between steps and keeps pinnedTop fresh) does NOT cover this resume case.
+//
+// This test FAILS before the fix (queued RO mis-fires → following=false →
+// button.jump appears, geometry off the tail) and PASSES after (the listener
+// re-pinned first → the RO re-pins cleanly → Live persists).
+test("tab resume re-engages Live after a hidden content reshuffle", async ({ page }) => {
+  await page.setViewportSize(VP);
+  await page.goto("/?session=demo");
+  await expect(page.locator(".msg").first()).toBeVisible({ timeout: 10000 });
+  // Glue to the tail (following=true). Geometry-first (idle demo hides the pill).
+  await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
+    el.scrollTop = el.scrollHeight;
+  });
+  await expectFollowingTail(page);
+
+  // Append a tall block so the contentEl RO pins a TALL pinnedTop/pinnedScroll-
+  // Height — the "pre-hidden baseline" we then go stale against. Poll until the
+  // app has re-glued (scrollTop back within 24px of the bottom).
+  await page.locator(".chat-content").evaluate((el: HTMLElement) => {
+    const t = document.createElement("div");
+    t.id = "__e2e_resume_block";
+    t.style.height = "600px";
+    t.style.background = "transparent";
+    el.appendChild(t);
+  });
+  await expect.poll(
+    async () =>
+      page.locator(".chat-scroll").evaluate((e: HTMLElement) =>
+        e.scrollHeight - e.scrollTop - e.clientHeight < 24 ? 1 : 0,
+      ),
+    { timeout: 3000 },
+  ).toBe(1);
+
+  // The simulated hidden→resume reshuffle, ALL in one synchronous script so the
+  // RO does not deliver (and re-pin) between the shrink and the regrow.
+  //
+  // A layout flush is REQUIRED between the shrink and the regrow: setting
+  // height="0px" then height="700px" back-to-back with no intervening layout
+  // read is layout-batched into the final value only, so the intermediate shrink
+  // is never realized and scrollTop never clamps (verified empirically — the
+  // test passes even without the fix in that case, i.e. it's vacuous). Reading
+  // scrollEl.scrollHeight between the writes forces layout, which realizes the
+  // shrink and clamps scrollTop DOWN to the shorter max; the subsequent regrow
+  // to 700 (LARGER than the 600 baseline) leaves scrollTop at the clamped value
+  // while net scrollHeight exceeds pinnedScrollHeight. The RO that fires after
+  // this script then sees `scrollTop < pinnedTop && !shrank` — the mis-fire.
+  //
+  // Dispatching visibilitychange at the END (still synchronous, before the RO
+  // delivers) is the simulated resume: with the fix the listener re-pins to the
+  // post-reshuffle state first, so the guard sees scrollTop===pinnedTop and
+  // re-pins cleanly; without the fix the dispatch is inert and the queued RO
+  // mis-fires (following=false + latch armed).
+  await page.evaluate(() => {
+    const block = document.getElementById("__e2e_resume_block") as HTMLElement;
+    const scroll = document.querySelector(".chat-scroll") as HTMLElement;
+    block.style.height = "0px"; // shrink
+    void scroll.scrollHeight; // FORCE layout → clamps scrollTop DOWN
+    block.style.height = "700px"; // regrow LARGER than the 600 baseline → !shrank
+    void scroll.scrollHeight; // FORCE layout → taller, scrollTop stays clamped
+    document.dispatchEvent(new Event("visibilitychange")); // simulated resume
+  });
+
+  // The fix: the resume listener re-pinned before the queued RO delivered, so
+  // the guard re-pinned cleanly and Live persists. Under the bug the queued RO
+  // mis-fired (following=false + latch armed) → button.jump appears and the
+  // geometry sits off the tail (expectFollowingTail times out → test fails).
+  await expectFollowingTail(page);
+});
+
+// (14) Tab resume does NOT yank a deliberate reader (resume intent-latch gate).
+//
+// Sibling of (13) and test (10b). (13) covers the resume re-engage when the
+// latch is NOT set (the bug fix); this covers the complementary branch: a user
+// who deliberately scrolled up to read history (intent latch armed at
+// onScrolled's `!atBottom && !shrank` site) must NOT be yanked back to the tail
+// when the tab resumes. The fix's listener is gated on `!userScrolledUp()`,
+// mirroring the self-heal's intent-latch contract (test 10b) but on the resume
+// transition. This pins the gate so a future change that drops the
+// `!userScrolledUp()` check cannot introduce an always-yank-on-resume.
+test("tab resume does not yank a deliberate reader (intent latch)", async ({ page }) => {
+  await page.setViewportSize(VP);
+  await page.goto("/?session=demo");
+  await expect(page.locator(".msg").first()).toBeVisible({ timeout: 10000 });
+  // Glue to the tail (following=true, latch=false).
+  await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
+    el.scrollTop = el.scrollHeight;
+  });
+  await expectFollowingTail(page);
+
+  // Deliberately scroll UP to read history — genuine user intent. Arms the latch
+  // (userScrolledUp=true), drops following, surfaces "↓ Latest".
+  await setScrollTop(page, 0);
+  await expect(page.locator("button.jump")).toBeVisible({ timeout: 3000 });
+
+  // Simulated tab resume. The fix's listener must early-return at the
+  // `!userScrolledUp()` gate; the reader stays put (NOT yanked to the tail).
+  await page.evaluate(() => document.dispatchEvent(new Event("visibilitychange")));
+
+  // NOT yanked: still scrolled up (NOT at the bottom), Live pill hidden, and the
+  // "↓ Latest" button remains available so the reader can jump back when ready.
+  await expect(page.locator(".chat-live")).toHaveCount(0);
+  await expect(page.locator("button.jump")).toBeVisible();
+  const atBottom = await page.locator(".chat-scroll").evaluate(
+    (el: HTMLElement) => el.scrollHeight - el.scrollTop - el.clientHeight < 24,
+  );
+  expect(atBottom).toBe(false);
+});

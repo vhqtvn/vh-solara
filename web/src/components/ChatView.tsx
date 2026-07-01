@@ -398,6 +398,32 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       pin();
     }
   });
+  // Resume re-engage: while the tab is hidden the browser throttles timers but
+  // Solid reactivity + layout still run, so a turn can settle (raw md-stream →
+  // compact MarkdownHtml swap, a shrink) and new content can regrow it. RO
+  // callbacks are NOT delivered while hidden — they queue and coalesce, then
+  // deliver a single one on resume. If an intermediate settle-shrink clamped
+  // scrollTop DOWN and content then regrew so the NET scrollHeight is back near
+  // its pre-hidden value, the queued RO guard below sees scrollTop<pinnedTop
+  // (clamped) with !shrank (net grew) and mis-classifies it as a genuine user
+  // scroll-up — setFollowing(false)+latch armed — which the self-heal cannot
+  // recover (it needs a working() edge or a cleared latch). Live would stay dead
+  // until manual scroll-back / Latest click / a new turn.
+  //
+  // visibilitychange dispatches before the rendering step where the queued RO
+  // delivers, so re-pin here to refresh pinnedTop/pinnedScrollHeight to the
+  // CURRENT post-hidden state first: the guard then sees scrollTop===pinnedTop
+  // and re-pins cleanly instead of tripping on the stale pre-hidden baseline.
+  // Gated on ready() + !userScrolledUp() to mirror the self-heal (won't yank a
+  // genuine reader who deliberately scrolled up during/after backgrounding).
+  const onVisibleReengage = () => {
+    if (document.visibilityState !== "visible") return;
+    if (!ready() || userScrolledUp()) return;
+    setFollowing(true);
+    pin();
+  };
+  document.addEventListener("visibilitychange", onVisibleReengage);
+  onCleanup(() => document.removeEventListener("visibilitychange", onVisibleReengage));
   const verbElapsed = createMemo(() => {
     const v = verb();
     if (!v || !v.startMs) return "";
