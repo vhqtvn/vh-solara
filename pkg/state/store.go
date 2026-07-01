@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/vhqtvn/vh-solara/pkg/opencode"
 )
@@ -241,6 +242,26 @@ type messageEntry struct {
 	// agent is the opencode `info.agent` string cached from info, used to populate
 	// lastAgent on the session entry when this is the latest assistant message.
 	agent string
+	// deltaBuf is the native streaming-text accumulator (Option C / P1-AGG-004):
+	// per (partID, field) it holds the authoritative accumulated field text in a
+	// strings.Builder so a token-delta flood appends at amortized O(len(delta))
+	// instead of the old per-char full JSON unmarshal+marshal + O(n²) full-text
+	// copy. me.parts[partID] lags the accumulator by at most one throttle window
+	// and is reconciled on flush (flushPartDeltasLocked). Keyed by
+	// partID+"\x00"+field. A missing entry means "no unflushed text beyond what
+	// me.parts already records". Reset to truth on upsertPartLocked (a
+	// message.part.updated snapshot supersedes buffered deltas) and on
+	// reconcileMessagesLocked (a history fetch is authoritative).
+	deltaBuf map[string]*strings.Builder
+	// deltaLastEmit bounds the part.upsert emit rate for THIS message's streaming
+	// field: a delta appends to deltaBuf unconditionally, but the (O(part size)
+	// marshal + emit + ring push) only fires when time.Since(deltaLastEmit) >=
+	// deltaFlushInterval. Lazy time-check under s.mu — no timer goroutine, no
+	// producer backpressure. The zero value means "never emitted" so the first
+	// delta of a burst always flushes (first token appears instantly); the FE
+	// further coalesces streaming markdown to ~5fps, so ~30fps of part events is
+	// well within the live-feel budget.
+	deltaLastEmit time.Time
 }
 
 type sessionMessages struct {
@@ -1201,6 +1222,11 @@ func (s *Store) upsertPartLocked(part json.RawMessage) {
 	}
 	me.parts[env.ID] = part
 	s.emit(KindPartUpsert, part)
+	// Authoritative snapshot: discard any unflushed streaming accumulator for
+	// this part — the snapshot supersedes buffered deltas (never let stale
+	// buffered text override truth). The next delta re-seeds the accumulator
+	// from this snapshot's field value, so deltas append onto the correct base.
+	discardPartDeltaLocked(me, env.ID)
 	// A part can finalize the latest assistant turn's text content (and parts may
 	// arrive after the completed message.updated), so refresh the empty/finish
 	// summary. Streaming deltas don't need this — the turn isn't completed yet, and
@@ -1213,10 +1239,22 @@ func (s *Store) upsertPartLocked(part json.RawMessage) {
 	s.recomputeCurrentVerbLocked(env.SessionID)
 }
 
-// appendPartDeltaLocked applies a streaming text delta to a part (creating a
-// minimal text part if the delta precedes its part.updated), then re-emits the
-// part so clients render the accumulated text live. A later message.part.updated
-// snapshot overwrites it authoritatively.
+// deltaFlushInterval bounds the part.upsert emit rate during a token-delta
+// burst (Option C / P1-AGG-004). A package-level var (not const) so tests can
+// override it for deterministic throttle assertions. 30ms ≈ 33fps of part
+// events — well within the live-feel budget (the FE coalesces streaming
+// markdown to ~5fps in components/Part.tsx / lib/streamMd.ts), while cutting
+// the per-char marshal+emit+ring-push cost to ~1× per window.
+var deltaFlushInterval = 30 * time.Millisecond
+
+// appendPartDeltaLocked applies a streaming text delta to a part using a NATIVE
+// accumulator (strings.Builder) + a lazy time-throttled emit, instead of the
+// old per-delta full JSON unmarshal+marshal + O(n²) full-text copy. The delta is
+// always appended to the accumulator (cheap); the expensive rebuild+emit fires
+// at most once per deltaFlushInterval. A later message.part.updated snapshot
+// overwrites the part authoritatively and resets the accumulator (see
+// upsertPartLocked); Snapshot flushes unflushed accumulators so a point-in-time
+// read reflects the live accumulated text.
 func (s *Store) appendPartDeltaLocked(sessionID, messageID, partID, field, delta string) {
 	if field == "" {
 		field = "text"
@@ -1232,33 +1270,115 @@ func (s *Store) appendPartDeltaLocked(sessionID, messageID, partID, field, delta
 		sm.byID[messageID] = me
 		sm.order = append(sm.order, messageID)
 	}
-	existing, had := me.parts[partID]
-	var part map[string]any
-	if had {
-		_ = json.Unmarshal(existing, &part)
-	}
-	if part == nil {
-		part = map[string]any{"id": partID, "sessionID": sessionID, "messageID": messageID, "type": "text"}
-	}
-	if !had {
+	// Ensure a part envelope exists (a delta can precede its part.updated) so
+	// the part is ordered + the accumulator has a base to seed from. A later
+	// message.part.updated overwrites it authoritatively.
+	if _, had := me.parts[partID]; !had {
+		me.parts[partID] = partPlaceholderJSON(partID, sessionID, messageID)
 		me.partOrder = append(me.partOrder, partID)
 	}
-	prev, _ := part[field].(string)
-	part[field] = prev + delta
-	updated, err := json.Marshal(part)
-	if err != nil {
-		return
+
+	// Native accumulator: append the delta to a strings.Builder keyed by
+	// (partID, field). strings.Builder amortizes the growth, so N single-char
+	// deltas cost O(N) total — NOT the old O(n²) full-text copy. The Builder
+	// holds the authoritative accumulated field text; me.parts[partID] lags by
+	// at most one throttle window.
+	key := partID + "\x00" + field
+	buf, ok := me.deltaBuf[key]
+	if !ok {
+		buf = &strings.Builder{}
+		// Seed from the part's current authoritative field value (a prior
+		// snapshot's text, or "" for the placeholder). This is the ONE unmarshal
+		// per burst — not per char.
+		var p map[string]any
+		_ = json.Unmarshal(me.parts[partID], &p)
+		if v, ok := p[field].(string); ok {
+			buf.WriteString(v)
+		}
+		if me.deltaBuf == nil {
+			me.deltaBuf = map[string]*strings.Builder{}
+		}
+		me.deltaBuf[key] = buf
 	}
-	me.parts[partID] = updated
-	s.emit(KindPartUpsert, updated)
+	buf.WriteString(delta)
+
+	// Time-throttled flush (lazy, no goroutine): rebuild the part JSON from the
+	// native accumulator + emit part.upsert at most ~1× per deltaFlushInterval.
+	// The first delta of a burst always flushes (deltaLastEit zero → elapsed
+	// huge) so the first token appears instantly.
+	now := time.Now()
+	if now.Sub(me.deltaLastEmit) >= deltaFlushInterval {
+		me.flushPartDeltasLocked(s, true)
+		me.deltaLastEmit = now
+	}
 
 	// Streaming deltas mean the turn is actively generating right now — assert
-	// busy (cheap no-op once set). Cleared when the assistant message completes
-	// (upsertMessageLocked) or on session.idle. This makes the running indicator
-	// track real token flow even when OpenCode's session.status lags.
+	// busy (cheap no-op once set) even when this delta was buffered. Cleared
+	// when the assistant message completes (upsertMessageLocked) or on
+	// session.idle. This makes the running indicator track real token flow even
+	// when OpenCode's session.status lags.
 	if me.role != "user" {
 		s.setActivityLocked(sessionID, ActivityBusy)
 	}
+}
+
+// flushPartDeltasLocked rebuilds me.parts from any unflushed deltaBuf entries
+// and, when emit is true, emits a part.upsert for each changed part. Called at
+// the throttle boundary in appendPartDeltaLocked (emit=true, under Apply's
+// lock) and from Snapshot (emit=false, a point-in-time read). The accumulators
+// are KEPT across the flush (not deleted): subsequent deltas keep appending to
+// the same Builder, and the next flush SETS the field from the full accumulated
+// text (never appends), so there is no double-application. Reset happens only
+// on authoritative overwrite (upsertPartLocked / reconcileMessagesLocked) or
+// part deletion. Caller holds s.mu.
+func (me *messageEntry) flushPartDeltasLocked(s *Store, emit bool) {
+	for key, buf := range me.deltaBuf {
+		partID, field, ok := strings.Cut(key, "\x00")
+		if !ok {
+			continue
+		}
+		var part map[string]any
+		_ = json.Unmarshal(me.parts[partID], &part)
+		if part == nil {
+			// Defensive: the placeholder is always created in appendPartDeltaLocked
+			// before a buffer exists, so this only triggers under malformed state.
+			part = map[string]any{"id": partID, "type": "text"}
+		}
+		part[field] = buf.String()
+		if updated, err := json.Marshal(part); err == nil {
+			me.parts[partID] = updated
+			if emit {
+				s.emit(KindPartUpsert, updated)
+			}
+		}
+	}
+}
+
+// discardPartDeltaLocked drops every streaming accumulator entry whose partID
+// matches — used when an authoritative snapshot (message.part.updated) or a
+// history-fetch reconcile supersedes buffered deltas, and on part deletion.
+// Caller holds s.mu.
+func discardPartDeltaLocked(me *messageEntry, partID string) {
+	if me == nil || me.deltaBuf == nil {
+		return
+	}
+	for k := range me.deltaBuf {
+		if pid, _, ok := strings.Cut(k, "\x00"); ok && pid == partID {
+			delete(me.deltaBuf, k)
+		}
+	}
+}
+
+// partPlaceholderJSON returns a minimal text-part JSON for a delta that arrived
+// before its message.part.updated (so the part is orderable + the accumulator
+// has a base to seed from). The streaming field starts empty; deltas populate
+// it via the native accumulator. A later message.part.updated overwrites it
+// authoritatively.
+func partPlaceholderJSON(partID, sessionID, messageID string) json.RawMessage {
+	b, _ := json.Marshal(map[string]any{
+		"id": partID, "sessionID": sessionID, "messageID": messageID, "type": "text",
+	})
+	return b
 }
 
 func (s *Store) deletePartLocked(sessionID, messageID, partID string) {
@@ -1268,6 +1388,8 @@ func (s *Store) deletePartLocked(sessionID, messageID, partID string) {
 				delete(me.parts, partID)
 				me.partOrder = removeString(me.partOrder, partID)
 			}
+			// Drop any streaming accumulator for the deleted part.
+			discardPartDeltaLocked(me, partID)
 		}
 	}
 	s.emit(KindPartDelete, rawObj(map[string]interface{}{
@@ -1282,8 +1404,22 @@ func (s *Store) deletePartLocked(sessionID, messageID, partID string) {
 // sessions' messages; an empty (non-nil) map includes none — letting a phone
 // fetch a tree-only snapshot and pull message history per session on demand.
 func (s *Store) Snapshot(messagesFor map[string]bool) Snapshot {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Flush any unflushed streaming accumulators first so the snapshot reflects
+	// the live accumulated text, not the last throttle-window flush (a
+	// reconnecting client must converge on the exact current field text). Under
+	// the WRITE lock because flushing mutates me.parts; Snapshot is infrequent
+	// (per client connect/reconnect) so this adds no contention beyond Apply's
+	// existing single-writer serialization. emit=false: this is a point-in-time
+	// read — the live tail gets its part.upsert emits from the throttle flush in
+	// appendPartDeltaLocked, so a silent flush here sends no duplicate event.
+	for _, sm := range s.messages {
+		for _, me := range sm.byID {
+			me.flushPartDeltasLocked(s, false)
+		}
+	}
 
 	snap := Snapshot{
 		Epoch:        s.epoch,
@@ -1660,6 +1796,12 @@ func (s *Store) reconcileMessagesLocked(sid string, list []MessageWithParts) {
 			me.info = mwp.Info
 			s.emit(KindMessageUpsert, mwp.Info)
 		}
+		// A history fetch is authoritative for this message's parts: discard any
+		// streaming accumulators (they were building on stale/live bases). The
+		// fetched parts below overwrite me.parts; subsequent deltas re-seed from
+		// the fetched field values.
+		me.deltaBuf = nil
+		me.deltaLastEmit = time.Time{}
 		me.role = env.Role
 		me.completed = env.Time.Completed != nil
 		me.finish = env.Finish
