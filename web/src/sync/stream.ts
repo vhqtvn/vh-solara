@@ -299,19 +299,27 @@ async function fetchSessionMessages(id: string): Promise<any[]> {
 
 // On a tree-stream resync, refresh cached message state for NON-active opened
 // sessions (the active one is owned by the live session stream, so skip it to
-// avoid clobbering streamed deltas).
-async function refreshOpenSessions() {
+// avoid clobbering streamed deltas). Dispatched CONCURRENTLY: an operator with
+// N open sessions used to wait N serial /vh/snapshot round-trips on every tree
+// reconnect (each blocking on upstream client.Messages on a cold daemon).
+// Promise.all fans them out in one tick; the inner try/catch keeps the prior
+// per-session error isolation (one failed fetch keeps stale + does NOT reject
+// the batch, so the other sessions still refresh).
+// Exported for unit testing (tests/unit/refreshOpenSessions.test.ts).
+export async function refreshOpenSessions() {
   const active = selectedId();
-  for (const id of Object.keys(state.messages)) {
-    if (id === active) continue;
-    try {
-      const items = await fetchSessionMessages(id);
-      setState("messages", id, buildMessages(items));
-      setState("messagesLoaded", id, true);
-    } catch {
-      /* keep stale; reopening re-snapshots */
-    }
-  }
+  await Promise.all(
+    Object.keys(state.messages).map(async (id) => {
+      if (id === active) return;
+      try {
+        const items = await fetchSessionMessages(id);
+        setState("messages", id, buildMessages(items));
+        setState("messagesLoaded", id, true);
+      } catch {
+        /* keep stale; reopening re-snapshots */
+      }
+    }),
+  );
 }
 
 let es: EventSource | null = null;

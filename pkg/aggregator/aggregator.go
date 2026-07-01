@@ -308,21 +308,61 @@ func (a *Aggregator) hydrate(ctx context.Context) error {
 	// fetched on later reconnects. See startColdSeed.
 	a.startColdSeed(ctx, sessions)
 
-	// Seed per-session activity (busy/idle/error) so the sidebar shows status
-	// for sessions even before any live status event arrives.
-	if statuses, err := a.client.SessionStatuses(ctx); err == nil {
+	// Seed per-session activity (busy/idle/error) and recover any pending
+	// questions/permissions. These are three INDEPENDENT upstream GETs, so we
+	// fan them out concurrently: on cold start / reconnect (epoch change) this
+	// makes first-snapshot time pay ~1 round-trip (max latency) instead of the
+	// sum of three. opencode.Client is safe for concurrent use — it carries no
+	// per-call mutable state (only the shared, goroutine-safe http.Client) and
+	// seedColdLastAgents already fans out 8-wide against it; the three store
+	// mutators each take s.mu, so concurrent Set* calls are safe too.
+	//
+	// Best-effort semantics: these three calls enrich facets of the UI (activity
+	// status, pending questions, pending permissions). A failure leaves only
+	// those facets stale until the next poll — it must NOT fail hydrate. This
+	// matches the prior serial code's `err == nil`-guard behavior (hydrate
+	// always returned nil regardless of these calls), so POST /vh/reload error
+	// propagation is unchanged. The concurrent fan-out is retained purely for
+	// the perf win above; each failure is logged via log.Printf for
+	// observability. These calls are synchronous w.r.t. hydrate (wg.Wait()
+	// blocks), so they use the same ctx discipline as the rest of hydrate: a
+	// cancelled ctx aborts all three promptly, and defer wg.Done() runs even on
+	// a panic so wg.Wait() never deadlocks (no goroutine leak).
+	var wg sync.WaitGroup
+	run := func(name string, fn func() error) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := fn(); err != nil {
+				log.Printf("[aggregator] %s failed: %v", name, err)
+			}
+		}()
+	}
+	run("SessionStatuses", func() error {
+		statuses, err := a.client.SessionStatuses(ctx)
+		if err != nil {
+			return err
+		}
 		a.store.SetActivityFromStatuses(statuses)
-	}
-
-	// Recover questions/permissions still pending an answer. These only arrive
-	// via live events otherwise, so without this a daemon restart (or a fresh
-	// client) would drop an unanswered question/permission the user must act on.
-	if qs, err := a.client.ListQuestions(ctx); err == nil {
+		return nil
+	})
+	run("ListQuestions", func() error {
+		qs, err := a.client.ListQuestions(ctx)
+		if err != nil {
+			return err
+		}
 		a.store.SetPendingQuestions(qs)
-	}
-	if ps, err := a.client.ListPermissions(ctx); err == nil {
+		return nil
+	})
+	run("ListPermissions", func() error {
+		ps, err := a.client.ListPermissions(ctx)
+		if err != nil {
+			return err
+		}
 		a.store.SetPendingPermissions(ps)
-	}
+		return nil
+	})
+	wg.Wait()
 	return nil
 }
 

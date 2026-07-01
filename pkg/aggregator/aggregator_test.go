@@ -541,3 +541,137 @@ func TestEnsureMessagesAsyncShutdownCancels(t *testing.T) {
 		t.Fatal("shutdown must clear the in-flight slot")
 	}
 }
+
+// gatedRouteHandler wraps the fixture handler and GATES exactly the three
+// routes hydrate fans out concurrently — GET /session/status, /question,
+// /permission. Each gated route records that it was entered (under mu) and then
+// blocks on <-release until the test closes release. This is the
+// hydrate-fan-out analog of slowFullMessageHandler: it makes the three upstream
+// GETs observably in-flight at once, so a test can prove they run concurrently.
+type gatedRouteHandler struct {
+	inner   http.Handler
+	mu      sync.Mutex
+	entered int
+	release chan struct{}
+}
+
+func (h *gatedRouteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		switch r.URL.Path {
+		case "/session/status", "/question", "/permission":
+			h.mu.Lock()
+			h.entered++
+			h.mu.Unlock()
+			<-h.release // block until the test observes all three entered
+		}
+	}
+	h.inner.ServeHTTP(w, r)
+}
+
+func (h *gatedRouteHandler) count() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.entered
+}
+
+// TestHydrateFansOutStatusQuestionsPermissionsConcurrently proves the three
+// independent upstream GETs hydrate issues after the snapshot (SessionStatuses,
+// ListQuestions, ListPermissions) run CONCURRENTLY, not serially. On cold start
+// / reconnect (epoch change) this is what makes first-snapshot time pay ~1
+// round-trip (max latency) instead of the sum of three.
+//
+// Deterministic: the three routes gate on a shared release channel. The test
+// waits until all three are entered (in-flight at once) before releasing any.
+// Reaching entered==3 is IMPOSSIBLE under serial execution — the first call
+// would block on release forever, so the second and third would never be
+// dispatched. It can only reach 3 if all three were dispatched concurrently.
+func TestHydrateFansOutStatusQuestionsPermissionsConcurrently(t *testing.T) {
+	release := make(chan struct{})
+	h := &gatedRouteHandler{inner: fixtures.New().Handler(), release: release}
+	oc := httptest.NewServer(h)
+	defer oc.Close()
+
+	agg := New(oc.URL, 100)
+
+	// Run hydrate on a goroutine; it blocks once it reaches the fan-out, since
+	// all three gated routes are held on release.
+	errc := make(chan error, 1)
+	go func() { errc <- agg.Rehydrate(context.Background()) }()
+
+	// Wait until all three gated routes are entered concurrently. Under serial
+	// execution this can never reach 3 — the definitive concurrency proof.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && h.count() < 3 {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if got := h.count(); got != 3 {
+		t.Fatalf("expected all 3 hydrate fan-out calls entered concurrently, got %d (serial execution would never reach 3)", got)
+	}
+
+	// All three are in flight at once: release them and assert hydrate returns
+	// cleanly with the store populated.
+	close(release)
+	select {
+	case err := <-errc:
+		if err != nil {
+			t.Fatalf("rehydrate: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("rehydrate did not return after release")
+	}
+	agg.waitColdSeed()
+}
+
+// TestHydrateSwallowsEnrichmentErrors locks in the swallow+log semantics of
+// hydrate's three-way enrichment fan-out (SessionStatuses/ListQuestions/
+// ListPermissions): an upstream failure in ONE call must NOT fail hydrate
+// (POST /vh/reload must not 502 on a partial enrichment), and the OTHER two
+// calls must still apply their side-effects — proving a single failure does not
+// abort its siblings. This matches the prior serial `err == nil`-guard behavior
+// while keeping the concurrent fan-out; the failing call's error is logged
+// rather than returned.
+func TestHydrateSwallowsEnrichmentErrors(t *testing.T) {
+	mux := http.NewServeMux()
+	// ListQuestions (GET /question) fails — the call under test.
+	mux.HandleFunc("/question", func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "upstream down", http.StatusInternalServerError)
+	})
+	// SessionStatuses succeeds with an OBSERVABLE side-effect: demo is reported
+	// busy, which SetActivityFromStatuses reflects in Snapshot().Activity.
+	mux.HandleFunc("/session/status", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"demo":{"type":"busy"}}`))
+	})
+	// ListPermissions succeeds with an OBSERVABLE side-effect: one pending
+	// permission for demo, which SetPendingPermissions reflects in
+	// Snapshot().Permissions.
+	mux.HandleFunc("/permission", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`[{"id":"p1","sessionID":"demo"}]`))
+	})
+	// Delegate everything else (incl. /session list + cold-seed tails) to the
+	// standard fixture so hydrate's earlier phases still succeed.
+	mux.Handle("/", fixtures.New().Handler())
+	oc := httptest.NewServer(mux)
+	defer oc.Close()
+
+	agg := New(oc.URL, 100)
+	// hydrate must SWALLOW the /question failure: nil return, not a 500-surfaced
+	// error. (Matches prior serial err == nil-guard behavior.)
+	if err := agg.Rehydrate(context.Background()); err != nil {
+		t.Fatalf("hydrate must swallow enrichment errors (best-effort), got: %v", err)
+	}
+	agg.waitColdSeed()
+
+	snap := agg.Store().Snapshot(nil)
+	// Isolation proof #1: SessionStatuses' side-effect landed despite
+	// ListQuestions failing — demo is marked busy.
+	if got := snap.Activity["demo"]; got != "busy" {
+		t.Fatalf("SessionStatuses side-effect must survive ListQuestions' failure: demo activity want \"busy\", got %q", got)
+	}
+	// Isolation proof #2: ListPermissions' side-effect landed too — one pending
+	// permission for demo.
+	if got := len(snap.Permissions["demo"]); got != 1 {
+		t.Fatalf("ListPermissions side-effect must survive ListQuestions' failure: demo permissions want 1, got %d", got)
+	}
+}
