@@ -589,3 +589,130 @@ func TestSecurityHeaders(t *testing.T) {
 		t.Fatalf("CSP frame-ancestors should be 'self': %q", csp)
 	}
 }
+
+// TestStreamTreeOnlySurvivesTokenFlood is the end-to-end wiring proof for the
+// event-delivery latency fix (Option A): a tree-only SSE stream (?sessions=,
+// empty filter — drops ALL message-class events) must keep delivering structural
+// events promptly while a background session floods token deltas. Before the
+// fix, the store subscription queued every message.part.delta (re-emitted as
+// part.upsert) into the stream's 256-slot channel; the egress sendable() filter
+// discarded them only AFTER they were already queued, so a trailing
+// session.upsert landed behind the flood ("session appeared late"). Now the
+// interest filter is pushed upstream into store.SubscribeWith, so message-class
+// events never enter the channel at all.
+func TestStreamTreeOnlySurvivesTokenFlood(t *testing.T) {
+	fake := newFake()
+	fake.sessions = []string{`{"id":"a","title":"A","time":{"updated":1}}`}
+	ocSrv := httptest.NewServer(fake.handler())
+	defer ocSrv.Close()
+
+	agg := aggregator.New(ocSrv.URL, 1000)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go agg.Run(ctx)
+	waitFor(t, func() bool { return len(agg.Store().Snapshot(nil).Sessions) == 1 }, "hydrate session a")
+
+	srv, _ := NewServer(agg, ocSrv.URL, 1000)
+	web := httptest.NewServer(srv.Handler())
+	defer web.Close()
+
+	// Tree-only stream: ?sessions= → empty filter → Interest drops ALL
+	// message-class events upstream.
+	resp, err := http.Get(web.URL + "/vh/stream?sessions=")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	reader := bufio.NewReader(resp.Body)
+	if first := readSSEEvent(t, reader); first != "snapshot" {
+		t.Fatalf("first stream event want 'snapshot', got %q", first)
+	}
+
+	// Flood: a background session emitting many token deltas, then a trailing
+	// structural session.created the operator must see promptly.
+	for i := 0; i < 60; i++ {
+		fake.events <- `{"type":"message.part.delta","properties":{"sessionID":"bg","messageID":"m1","partID":"p1","field":"text","delta":"x"}}`
+	}
+	fake.events <- `{"type":"session.created","properties":{"info":{"id":"late","title":"Late"}}}`
+
+	// Wait until the structural event is applied to the store (proves the flood
+	// and the session.created both flowed through the aggregator).
+	waitFor(t, func() bool {
+		for _, s := range agg.Store().Snapshot(nil).Sessions {
+			if string(s) == `{"id":"late"}` || strings.Contains(string(s), `"id":"late"`) {
+				return true
+			}
+		}
+		return false
+	}, "late session applied to store")
+
+	// Read SSE events until the trailing session.upsert arrives. NONE of the
+	// events seen along the way may be message-class (message.*/part.*/messages.*)
+	// — that would mean a token event leaked past the upstream interest filter.
+	// Structural events (activity, etc.) are expected and fine. Bounded by a
+	// timeout so a regression fails fast instead of hanging on a lost event.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		kind := readSSEEventWithTimeout(t, reader, 3*time.Second)
+		if isMessageClassSSE(kind) {
+			t.Fatalf("tree-only stream received message-class event %q — upstream interest filter leaked it", kind)
+		}
+		if kind == "session.upsert" {
+			return // success: structural event arrived, no token event leaked
+		}
+	}
+	t.Fatal("timed out waiting for the trailing session.upsert on the tree-only stream")
+}
+
+// isMessageClassSSE mirrors state.isMessageClassKind over the SSE event names
+// the server emits (see server.go sendable()). Kept local to avoid a web→state
+// kind-name dependency in test code.
+func isMessageClassSSE(event string) bool {
+	switch event {
+	case "message.upsert", "message.delete",
+		"part.upsert", "part.delete",
+		"messages.loaded", "messages.error":
+		return true
+	}
+	return false
+}
+
+// readSSEEventWithTimeout wraps readSSEEvent with a deadline so a missing event
+// fails the test fast instead of hanging on the blocking SSE read.
+func readSSEEventWithTimeout(t *testing.T, r *bufio.Reader, d time.Duration) string {
+	t.Helper()
+	type res struct {
+		v   string
+		err error
+	}
+	c := make(chan res, 1)
+	go func() {
+		v, err := readSSEEventErr(r)
+		c <- res{v, err}
+	}()
+	select {
+	case got := <-c:
+		if got.err != nil {
+			t.Fatalf("read stream: %v", got.err)
+		}
+		return got.v
+	case <-time.After(d):
+		t.Fatal("timed out reading SSE event")
+		return ""
+	}
+}
+
+// readSSEEventErr is readSSEEvent but returns the error instead of fataling, so
+// it can run in a goroutine.
+func readSSEEventErr(r *bufio.Reader) (string, error) {
+	for {
+		line, err := r.ReadString('\n')
+		if err != nil {
+			return "", err
+		}
+		line = strings.TrimRight(line, "\r\n")
+		if strings.HasPrefix(line, "event:") {
+			return strings.TrimSpace(strings.TrimPrefix(line, "event:")), nil
+		}
+	}
+}

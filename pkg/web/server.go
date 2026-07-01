@@ -851,7 +851,19 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 
 	// Subscribe before resolving the resume baseline so no event slips through
 	// the gap between snapshot/replay and the live tail.
-	ch, unsub := store.Subscribe(256)
+	//
+	// Push the interest filter UPSTREAM into the store subscription: irrelevant
+	// token-delta floods (re-emitted by the store as part.upsert) never enter
+	// this stream's channel. Before this, a structural-only tree stream's 256-slot
+	// channel could fill with background message/part events it discards at the
+	// egress sendable() check below, queueing a trailing session.upsert behind
+	// them ("session appeared late"). The downstream sendable() stays as a
+	// DEFENSIVE compatibility check (do not remove); the important guarantee is
+	// that excluded events never enter the channel. filter == nil (?sessions=all)
+	// → firehose Interest; a non-nil filter (incl. empty, the tree-only Stream 1)
+	// → message-class events restricted to the selected sessions.
+	interest := state.Interest{MessageSessions: filter}
+	ch, unsub := store.SubscribeWith(256, interest)
 	defer unsub()
 
 	var baseline uint64

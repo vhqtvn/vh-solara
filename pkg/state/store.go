@@ -333,7 +333,7 @@ type Store struct {
 	seeded map[string]bool
 
 	ring *ringBuffer
-	subs map[int]chan ClientEvent
+	subs map[int]*subscriber
 	next int
 }
 
@@ -365,21 +365,38 @@ func New(ringCapacity int) *Store {
 		msgLoaded:   map[string]bool{},
 		seeded:      map[string]bool{},
 		ring:        newRingBuffer(ringCapacity),
-		subs:        map[int]chan ClientEvent{},
+		subs:        map[int]*subscriber{},
 	}
 }
 
 // emit stamps, records, and fans out a client event. Caller must hold s.mu.
+//
+// Interest filtering is applied HERE (upstream of the channel) so a
+// subscriber whose Interest excludes the event never has it enqueued — a slow
+// high-volume producer (background subagent token deltas, re-emitted as
+// part.upsert) cannot fill a structural-only subscriber's channel and starve it
+// of the session.upsert/activity/status events it actually wants. The
+// payload's sessionID is resolved ONCE per emit (at most one JSON unmarshal,
+// regardless of subscriber count) and only for message-class events.
+// Nonblocking fanout is preserved for INCLUDED events: a full channel still
+// closes+removes that subscriber, never blocking the producer.
 func (s *Store) emit(kind string, payload json.RawMessage) {
 	s.seq++
 	ev := ClientEvent{Seq: s.seq, Kind: kind, Payload: payload}
 	s.ring.push(ev)
-	for id, ch := range s.subs {
+	sid := ""
+	if isMessageClassKind(kind) {
+		sid = payloadSessionID(payload)
+	}
+	for id, sub := range s.subs {
+		if !sub.interest.wants(kind, sid) {
+			continue // excluded by interest: never enters this channel
+		}
 		select {
-		case ch <- ev:
+		case sub.ch <- ev:
 		default:
 			// Slow consumer: drop it. The client will reconnect and re-snapshot.
-			close(ch)
+			close(sub.ch)
 			delete(s.subs, id)
 		}
 	}
@@ -396,11 +413,11 @@ func (s *Store) EmitNotice(payload json.RawMessage) {
 	// alert, not part of the replayable view. Reusing the current head seq keeps
 	// resume cursors monotonic (no gap, no duplicate-advance).
 	ev := ClientEvent{Seq: s.seq, Kind: KindNotice, Payload: payload}
-	for id, ch := range s.subs {
+	for id, sub := range s.subs {
 		select {
-		case ch <- ev:
+		case sub.ch <- ev:
 		default:
-			close(ch)
+			close(sub.ch)
 			delete(s.subs, id)
 		}
 	}
@@ -1433,20 +1450,111 @@ func (s *Store) SendableNow(sid string) (sendable bool, activitySeq uint64, exis
 	return sendable, s.activitySeq[sid], true
 }
 
-// Subscribe registers a new live-tail consumer. Returns the channel and an
-// unsubscribe func. The channel is closed if the consumer falls too far behind.
+// subscriber is one live-tail consumer registration: its buffered channel plus
+// the Interest that governs which emitted events are enqueued. Held under s.mu.
+type subscriber struct {
+	ch       chan ClientEvent
+	interest Interest
+}
+
+// Interest expresses which events a live-tail subscriber wants, evaluated at
+// fanout time so irrelevant high-volume events never enter the subscriber's
+// channel. The zero value means "all events" (the historical Subscribe
+// behavior): structural, notification, control, AND every message/part event
+// for every session.
+//
+// A non-zero Interest restricts ONLY the message-class events
+// (message.*/part.*/messages.*) to the sessions listed in MessageSessions.
+// Structural/notification/control events (session.*, activity, status, todo,
+// unread.*, activity.verb, permission.*, question.*, notice) are ALWAYS
+// delivered — they are the channels an operator must not lose behind a token
+// flood. This mirrors the web layer's sendable() priority separation, pushed
+// upstream from SSE egress into the store fanout.
+//
+// MessageSessions == nil means "deliver all message-class events too" (the
+// firehose, matching the web layer's ?sessions=all). A non-nil map (including an
+// empty one) means "deliver message-class events only for sessions in the set"
+// (an empty set drops ALL message-class events — the tree-only Stream 1).
+type Interest struct {
+	// MessageSessions is the allow-set of session ids for message-class events.
+	// nil = all (firehose); non-nil (incl. empty) = only the listed sessions.
+	MessageSessions map[string]bool
+}
+
+// wants reports whether a subscriber with this interest wants an event of the
+// given kind whose payload sessionID is sid ("" when the event is not
+// message-class or has no sessionID). It is the SINGLE place that maps an event
+// kind to a delivery class, so the kind→class rule is not duplicated across the
+// codebase (the web layer's sendable() stays only as a defensive double-check).
+func (i Interest) wants(kind, sid string) bool {
+	if !isMessageClassKind(kind) {
+		return true // structural/notification/control: always delivered
+	}
+	if i.MessageSessions == nil {
+		return true // firehose: all message-class events
+	}
+	return sid != "" && i.MessageSessions[sid]
+}
+
+// isMessageClassKind reports whether kind is a message/part/messages event —
+// the ONLY kinds subject to per-session interest filtering. Every other kind
+// (session.*, activity, status, todo, unread.*, activity.verb, permission.*,
+// question.*, notice) is delivered to every subscriber unconditionally. Listed
+// by exact Kind constant (not string-prefix matching) so the set is explicit,
+// typed, and greppable.
+func isMessageClassKind(kind string) bool {
+	switch kind {
+	case KindMessageUpsert, KindMessageDelete,
+		KindPartUpsert, KindPartDelete,
+		KindMessagesLoaded, KindMessagesError:
+		return true
+	}
+	return false
+}
+
+// payloadSessionID extracts the top-level "sessionID" from a message-class
+// event payload (one JSON unmarshal). Returns "" when absent or unparseable;
+// callers treat "" as "not in any allow-set" (the event is dropped for filtered
+// subscribers), matching the web layer's sendable() semantics.
+func payloadSessionID(payload json.RawMessage) string {
+	var p struct {
+		SessionID string `json:"sessionID"`
+	}
+	_ = json.Unmarshal(payload, &p)
+	return p.SessionID
+}
+
+// Subscribe registers a live-tail consumer that receives ALL events (the zero
+// Interest). Returns the channel and an unsubscribe func. The channel is closed
+// if the consumer falls too far behind (nonblocking fanout is preserved).
+//
+// Backward-compatible entry point: internal consumers that need every event
+// (the alerts engine) and existing tests use it unchanged. Use SubscribeWith to
+// restrict message-class events to a session allow-set.
 func (s *Store) Subscribe(buffer int) (<-chan ClientEvent, func()) {
+	return s.SubscribeWith(buffer, Interest{})
+}
+
+// SubscribeWith registers a live-tail consumer whose Interest is applied AT
+// FANOUT: events the interest excludes never enter the channel, so a slow
+// high-volume producer (e.g. a background subagent's token-delta flood, which
+// the store re-emits as part.upsert events) cannot fill a structural-only
+// subscriber's channel and starve it of the session.upsert/activity/status
+// events it actually wants. The nonblocking guarantee is preserved for included
+// events — a full channel still closes+removes the subscriber, never blocking
+// the producer. See Interest for the kind→class mapping.
+func (s *Store) SubscribeWith(buffer int, interest Interest) (<-chan ClientEvent, func()) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	id := s.next
 	s.next++
-	ch := make(chan ClientEvent, buffer)
-	s.subs[id] = ch
-	return ch, func() {
+	sub := &subscriber{ch: make(chan ClientEvent, buffer), interest: interest}
+	s.subs[id] = sub
+	return sub.ch, func() {
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		if c, ok := s.subs[id]; ok {
-			close(c)
+		if cur, ok := s.subs[id]; ok {
+			close(cur.ch)
 			delete(s.subs, id)
 		}
 	}
