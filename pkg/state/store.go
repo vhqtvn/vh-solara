@@ -1304,7 +1304,7 @@ func (s *Store) appendPartDeltaLocked(sessionID, messageID, partID, field, delta
 
 	// Time-throttled flush (lazy, no goroutine): rebuild the part JSON from the
 	// native accumulator + emit part.upsert at most ~1× per deltaFlushInterval.
-	// The first delta of a burst always flushes (deltaLastEit zero → elapsed
+	// The first delta of a burst always flushes (deltaLastEmit zero → elapsed
 	// huge) so the first token appears instantly.
 	now := time.Now()
 	if now.Sub(me.deltaLastEmit) >= deltaFlushInterval {

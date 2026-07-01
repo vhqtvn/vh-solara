@@ -122,11 +122,17 @@ func TestDeltaCoalesce_AuthoritativeReconciliation_BufferedTextDropped(t *testin
 	s.Apply(ev("message.updated", `{"info":{"id":"m1","sessionID":"sess","role":"assistant"}}`))
 	s.Apply(ev("message.part.updated", `{"part":{"id":"p1","sessionID":"sess","messageID":"m1","type":"text","text":"BASE"}}`))
 
-	// One flush on the first delta (deltaLastEmit zero), then this stays buffered.
+	// The first delta flushes immediately (deltaLastEmit starts at zero → elapsed
+	// huge). The SECOND delta (and any later one) lands genuinely UNFLUSHED in
+	// deltaBuf, held back by the hour-long throttle window — this is the stale
+	// buffer discardPartDeltaLocked must drop when the snapshot arrives.
 	applyDelta(s, "sess", "m1", "p1", "text", "buffered-not-yet-flushed")
-	// Authoritative snapshot arrives before the buffer ever flushes.
+	applyDelta(s, "sess", "m1", "p1", "text", "more-buffered")
+	// Authoritative snapshot arrives before the second delta ever flushes.
 	s.Apply(ev("message.part.updated", `{"part":{"id":"p1","sessionID":"sess","messageID":"m1","type":"text","text":"AUTHORITATIVE"}}`))
 
+	// The unflushed "more-buffered" text must be DISCARDED (not later re-applied
+	// on top of the snapshot): the result reflects the authoritative text alone.
 	if got := partText(s.Snapshot(nil), "sess", "p1"); got != "AUTHORITATIVE" {
 		t.Fatalf("buffered text leaked past authoritative snapshot: want %q got %q", "AUTHORITATIVE", got)
 	}
@@ -359,11 +365,4 @@ func BenchmarkApplyPartDeltaFlushEveryDelta(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		s.Apply(ev("message.part.delta", `{"sessionID":"s","messageID":"m1","partID":"p1","field":"text","delta":"x"}`))
 	}
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
