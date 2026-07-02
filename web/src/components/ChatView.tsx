@@ -644,6 +644,27 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       // {order:[],byId:{}} the instant a session is selected, so sm() is truthy
       // BEFORE the real snapshot arrives; an empty order means "not delivered yet".
       if (!sm()?.order?.length) return false;
+      // Defer until the seeded ANCHOR specifically has arrived — not just any
+      // message. The length guard above only blocks the empty-order window. Lazy
+      // hydration then streams a PARTIAL snapshot: the store's
+      // reconcileMessagesLocked emits one message.upsert per message in a loop,
+      // so order grows one id at a time BEFORE messages.loaded flips delivered()
+      // (~:254). An RO can fire when order=["m1"] (length truthy → guard passes)
+      // but the seeded anchor (e.g. m4) isn't in it yet. Restoring then would
+      // miss the anchor, fall into the stale-anchor pin below, and — restoredFor
+      // already set — lock out every later retry, yanking the reader to the live
+      // tail and losing their read position. Defer (return false, no restoredFor)
+      // until EITHER the anchor lands in order OR delivery completes.
+      //
+      // The !delivered() gate is what keeps a GENUINELY-stale anchor (post
+      // full-delivery the id is simply absent — deleted/truncated history) from
+      // wedging the view: once delivered() is true (and per-message upserts are
+      // all processed before messages.loaded, the anchor is guaranteed in order
+      // if it exists at all) we stop deferring and fall through to the pin
+      // below. restoredFor is set only AFTER this check so a no-op deferral
+      // never locks out retries.
+      const order = sm()?.order ?? [];
+      if (!order.includes(anchor) && !delivered()) return false;
       restoredFor = props.sessionId;
       // Position the anchor at the top of the viewport (instant — no smooth
       // flash on restore). The message ROW ([data-mid]) always exists in the
@@ -652,7 +673,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       // viewport right after, and browser scroll-anchoring (overflow-anchor:
       // auto) absorbs the off-screen height changes as deferred content fills in.
       const el = scrollEl.querySelector(`[data-mid="${cssEsc(anchor)}"]`) as HTMLElement | null;
-      if (el && (sm()?.order ?? []).includes(anchor)) {
+      if (el && order.includes(anchor)) {
         setFollowing(false);
         // Restored to a mid-history anchor = genuine read intent (we land away
         // from the bottom). Arm the latch like the scroll-away arm (~:812) so
