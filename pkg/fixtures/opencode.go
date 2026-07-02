@@ -57,6 +57,14 @@ func New() *FakeOpenCode {
 			"time":  map[string]any{"created": now - 5000, "updated": now}},
 		{"id": "sub", "projectID": "proj", "parentID": "demo", "title": "Subagent: search", "directory": "/work/demo", "time": map[string]any{"created": now - 3000, "updated": now - 2000}},
 		{"id": "other", "projectID": "proj", "title": "Another root", "directory": "/work/other", "time": map[string]any{"created": now - 9000, "updated": now - 9000}},
+		// Slow-hydration session: a normal root session whose full-message GET is
+		// held for a bounded window (see handleSession) so the .chat-content reveal
+		// gate's opacity:0 → opacity:1 transition is observable end-to-end by
+		// Playwright (web/tests/e2e/reveal-gate.spec.ts). A root (no parentID) so it
+		// doesn't perturb demo's hidden-idle-children footer count (smoke.spec.ts).
+		{"id": "slow", "projectID": "proj", "title": "Slow hydration", "directory": "/work/slow",
+			"model": map[string]any{"providerID": "fake", "id": "dummy", "variant": "default"},
+			"time":  map[string]any{"created": now - 4000, "updated": now - 4000}},
 	}
 	f.messages["demo"] = []messageWithParts{
 		{
@@ -155,6 +163,27 @@ func New() *FakeOpenCode {
 		{
 			Info:  map[string]any{"id": "sm1", "sessionID": "sub", "role": "assistant", "agent": "general", "time": map[string]any{"created": now - 2900, "completed": now - 2100}},
 			Parts: []map[string]any{textPart("sm1", "sub", "sp1", "Searched 12 files, found 3 matches.", now-2900)},
+		},
+	}
+	// Slow-hydration session messages: a few turns so the partial→loaded window is
+	// meaningful (the aggregator streams a partial snapshot then fills via deltas).
+	// Otherwise a normal transcript — see handleSession for the bounded GET delay.
+	f.messages["slow"] = []messageWithParts{
+		{
+			Info:  map[string]any{"id": "sl1", "sessionID": "slow", "role": "user", "time": map[string]any{"created": now - 3900, "completed": now - 3900}},
+			Parts: []map[string]any{textPart("sl1", "slow", "slp1", "Summarize the rollout plan.", now-3900)},
+		},
+		{
+			Info:  map[string]any{"id": "sl2", "sessionID": "slow", "role": "assistant", "agent": "build", "time": map[string]any{"created": now - 3850, "completed": now - 3700}},
+			Parts: []map[string]any{textPart("sl2", "slow", "slp2", "Here's the rollout plan in three phases: canary, ramp, full. Each gates on the error budget.", now-3850)},
+		},
+		{
+			Info:  map[string]any{"id": "sl3", "sessionID": "slow", "role": "user", "time": map[string]any{"created": now - 3600, "completed": now - 3600}},
+			Parts: []map[string]any{textPart("sl3", "slow", "slp3", "What's the rollback path?", now-3600)},
+		},
+		{
+			Info:  map[string]any{"id": "sl4", "sessionID": "slow", "role": "assistant", "agent": "build", "time": map[string]any{"created": now - 3550, "completed": now - 3400}},
+			Parts: []map[string]any{textPart("sl4", "slow", "slp4", "Rollback is automatic: the canary watches the SLO and reverts to the previous image within 60s.", now-3550)},
 		},
 	}
 	// Opt-in heavy session for benchmarking: VH_BENCH_MESSAGES=N seeds a "bench"
@@ -577,6 +606,33 @@ func (f *FakeOpenCode) handleSession(w http.ResponseWriter, r *http.Request) {
 		go f.simulatePrompt(id, promptText(body))
 		w.WriteHeader(http.StatusNoContent)
 		return
+	}
+
+	// Slow-hydration fixture mode (e2e reveal-gate coverage): hold the "slow"
+	// session's full-message GET for a bounded window so the Slice-C async-hydration
+	// partial→loaded state is observable by Playwright. The production fixture
+	// returns messages instantly, so without this the partial-hydration window —
+	// and thus the .chat-content opacity:0 reveal gate (web/src/styles.css,
+	// ChatView.tsx `revealed()`) — can't be exercised end-to-end. The aggregator
+	// streams a partial snapshot (messagesLoaded=false) while this GET is in flight,
+	// then message.* deltas + messages.loaded once it returns (see
+	// pkg/web/integration_test.go::TestStreamAsyncHydration for the exact shape).
+	//
+	// Sleep OUTSIDE f.mu — mirrors pkg/web/integration_test.go's msgHold pattern —
+	// so the held fetch can't block the /session list endpoint, the /event SSE
+	// stream's emit(), or the cold-seed fan-out for other sessions during the
+	// serial e2e suite. Bounded well under 1.5s so a hung/leaked run can't wedge
+	// the serial suite while still reliably exposing both the hidden + revealed
+	// states. (Cold-seed's MessagesTail GET also hits this and sleeps once in the
+	// background; harmless — it only postpones slow's lastAgent chip, not session
+	// availability, and does NOT mark MessagesLoaded so the client-open fetch
+	// still fires and produces the partial window.)
+	//
+	// Keyed off the session ID (NOT prompt text like [[stall]]/[[perm]]/[[ask]] in
+	// simulatePrompt) because the partial snapshot is produced by the aggregator
+	// stream on session open, not by a prompt — there is no prompt text to match.
+	if id == "slow" && r.Method == http.MethodGet {
+		time.Sleep(900 * time.Millisecond)
 	}
 
 	f.mu.Lock()
