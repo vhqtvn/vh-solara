@@ -528,6 +528,23 @@ export function applySessionSnapshot(id: string, snap: Snapshot) {
   const loaded = snap.gate?.[id]?.messagesLoaded;
   if (loaded === false) {
     setState("messagesLoaded", id, false);
+    // Slice C "hydration attempt started": a partial snapshot (messagesLoaded
+    // ===false) is the client-side signal that fires for BOTH openSession-driven
+    // hydration AND a Stream-2 reconnect retry (which does NOT call openSession).
+    // Clear any stale messagesError here so the chat's reveal gate does not show
+    // the "select again to retry" hint while a retry is ALREADY in flight —
+    // revealed() = ready() && (delivered() || messageFailed()) would otherwise
+    // release on the stale failure. If this retry ALSO fails, messages.error
+    // re-sets the flag (the messages.error case above). This is the single
+    // correct reset point: openSession has no reset (it would miss the reconnect
+    // path), and the daemon has no messages.started event (only messages.loaded
+    // / messages.error — pkg/state/store.go), so a proactive clear here is the
+    // only mechanism. Mirrors the else-branch clear below.
+    setState(
+      produce((s) => {
+        delete s.messagesError[id];
+      }),
+    );
   } else {
     setState("messagesLoaded", id, true); // true OR undefined (older daemon) → delivered
     // A delivered snapshot supersedes a prior background-hydration failure

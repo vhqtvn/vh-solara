@@ -22,6 +22,7 @@ beforeEach(() => {
   setState("lastAgents", reconcile({}));
   setState("hydrated", reconcile({}));
   setState("messagesLoaded", reconcile({}));
+  setState("messagesError", reconcile({})); // F5: was leaking across tests
   setState("epoch", "");
   setState("epochChanged", false);
   setState("cursor", 0);
@@ -119,11 +120,12 @@ describe("applySnapshot — B2a resync-window lastAgents gating", () => {
 });
 
 describe("applySessionEvent — B2b session.delete prunes per-session maps", () => {
-  it("deletes lastAgents/hydrated/messagesLoaded alongside the session", () => {
+  it("deletes lastAgents/hydrated/messagesLoaded/messagesError alongside the session", () => {
     setState("sessions", "s1", { id: "s1" });
     setState("lastAgents", "s1", "build");
     setState("hydrated", "s1", true);
     setState("messagesLoaded", "s1", true);
+    setState("messagesError", "s1", true);
 
     applySessionEvent("session.delete", 99, { id: "s1" });
 
@@ -131,6 +133,7 @@ describe("applySessionEvent — B2b session.delete prunes per-session maps", () 
     expect(state.lastAgents.s1).toBeUndefined();
     expect(state.hydrated.s1).toBeUndefined();
     expect(state.messagesLoaded.s1).toBeUndefined();
+    expect(state.messagesError.s1).toBeUndefined();
     expect(state.cursor).toBe(99); // the cursor still advances on a tracked event
   });
 
@@ -223,12 +226,66 @@ describe("applySessionSnapshot / applyMessageEvent — Slice C async hydration",
     expect(state.messagesLoaded.s1).toBe(true);
   });
 
-  it("messages.error does NOT claim completion (keeps loading UI up)", () => {
+  it("messages.error sets messagesError + keeps messagesLoaded false", () => {
     setState("messagesLoaded", "s1", false);
     applyMessageEvent("messages.error", 44, { sessionID: "s1", error: "boom" }, false);
-    // Error path logs + leaves the session loading (retry on reselect); the
-    // delivery flag must NOT flip to true (would show a misleading empty view).
+    // messages.error is NOT completion, so it must NOT flip the delivery flag
+    // (messagesLoaded stays false — a true here would show a misleading empty
+    // view). But 4fa8255 sets a SEPARATE messagesError flag so ChatView's reveal
+    // gate (revealed = ready && (delivered || messageFailed)) releases: a failed
+    // hydration reveals whatever partial content we have + an error hint instead
+    // of wedging on the loading UI forever (messages.loaded never arrives on
+    // failure). So the old "keeps loading UI up" claim misdescribes post-4fa8255
+    // behavior; only "messagesLoaded stays false" is still accurate.
     expect(state.messagesLoaded.s1).toBe(false);
+    expect(state.messagesError.s1).toBe(true);
+  });
+
+  it("messages.loaded clears a prior messagesError (retry success supersedes failure)", () => {
+    // A later successful load must clear a past failure flag so the reveal gate
+    // stops treating the session as "failed/partial" (stream.ts messages.loaded).
+    setState("messagesLoaded", "s1", false);
+    setState("messagesError", "s1", true);
+    applyMessageEvent("messages.loaded", 50, { sessionID: "s1" }, false);
+    expect(state.messagesLoaded.s1).toBe(true);
+    expect(state.messagesError.s1).toBeUndefined();
+  });
+
+  it("a DELIVERED session snapshot clears a prior messagesError", () => {
+    // A snapshot whose gate reports the full history (messagesLoaded !== false)
+    // supersedes a prior background-hydration failure (retry after error, or a
+    // Stream-2 reconnect that re-snapshots loaded) (stream.ts else-branch).
+    setState("messagesError", "s1", true);
+    const snap: Snapshot = {
+      seq: 1,
+      sessions: [{ id: "s1" }],
+      gate: { s1: { messagesLoaded: true } }, // delivered
+      messages: { s1: [] },
+    };
+    applySessionSnapshot("s1", snap);
+    expect(state.messagesLoaded.s1).toBe(true);
+    expect(state.messagesError.s1).toBeUndefined();
+  });
+
+  it("a PARTIAL snapshot (gate.messagesLoaded===false) clears a prior messagesError", () => {
+    // F3/F4 regression guard: a hydration attempt's partial snapshot is the
+    // client-side "hydration started" signal that fires for BOTH openSession-
+    // driven hydration AND a Stream-2 reconnect retry (which does NOT call
+    // openSession). It must proactively clear a stale messagesError so the
+    // reveal gate does not release on the prior failure while a retry is already
+    // in flight (otherwise the chat shows the "select again to retry" hint
+    // during an in-flight retry). If the retry ALSO fails, messages.error
+    // re-sets the flag.
+    setState("messagesError", "s1", true);
+    const snap: Snapshot = {
+      seq: 1,
+      sessions: [{ id: "s1" }],
+      gate: { s1: { messagesLoaded: false } }, // partial — fetch in flight
+      messages: { s1: [] },
+    };
+    applySessionSnapshot("s1", snap);
+    expect(state.messagesLoaded.s1).toBe(false);
+    expect(state.messagesError.s1).toBeUndefined();
   });
 
   it("message.upsert arriving BEFORE completion is applied without claiming loaded", () => {
