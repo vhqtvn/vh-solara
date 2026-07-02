@@ -59,8 +59,8 @@
       "Tag-driven releases: pushing a `v*` tag triggers a GitHub Actions workflow that builds the SPA and stamps `cmd.Version` via ldflags."
     ],
 
-    "db_user": "",
-    "db_name": "",
+    "db_user": "none",
+    "db_name": "none",
 
     "compose_services": [],
 
