@@ -1101,7 +1101,20 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
         setFollowing(true);
         setUserScrolledUp(false); // entering a session = fresh follow intent
         setInput(loadVersioned<string>(draftKey(props.sessionId || "__new__"), 1, "", (o) => (typeof o === "string" ? o : "")));
-        requestAnimationFrame(pin);
+        // Pin to bottom on the next frame — but only if we're still following.
+        // This races the chat-scroll session-switch restore (maybeRestore): if the
+        // restored session had a stored mid-history anchor, maybeRestore's anchor
+        // branch runs between this effect and the rAF and sets following=false
+        // (positioning the viewport at the anchor). An unconditional pin() here
+        // would then yank the reader off the anchor to the live tail and clear the
+        // seed. Guard on following() — every other pin() caller (self-heal, resume,
+        // both ROs) already gates on it; this was the lone unguarded caller. When
+        // maybeRestore restored an anchor (following=false) the pin is skipped; when
+        // it pinned to bottom itself (no-anchor/stale branch) or hasn't run yet,
+        // following stays true and the backstop pin proceeds unchanged.
+        requestAnimationFrame(() => {
+          if (following()) pin();
+        });
       },
     ),
   );

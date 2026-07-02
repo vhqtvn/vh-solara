@@ -37,6 +37,7 @@ machine-readable completion date (`YYYY-MM-DD`) in `Notes` for `done` /
 Older `done` and `cancelled` history lives under [docs/planning/archive/index.md](archive/index.md) and is meant for on-demand reading instead of auto-loading into the active backlog context.
 
 - [2026 Q2](archive/backlog-archive-2026-q2.md) - 12 done / 0 cancelled
+- [Undated](archive/backlog-archive-undated.md) - 1 done / 0 cancelled
 
 ## Now
 
