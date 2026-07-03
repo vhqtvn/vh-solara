@@ -16,7 +16,7 @@ function swBuildId(): Plugin {
   return {
     name: "vh-sw-build-id",
     closeBundle() {
-      const sw = path.resolve(webRoot, "../pkg/web/dist/sw.js");
+      const sw = path.resolve(webRoot, "dist-build/sw.js");
       if (existsSync(sw)) {
         writeFileSync(sw, readFileSync(sw, "utf8").replace(/__BUILD_ID__/g, id));
       }
@@ -27,8 +27,12 @@ function swBuildId(): Plugin {
 export default defineConfig({
   plugins: [solid(), swBuildId()],
   build: {
-    // Emit into the Go embed directory so the daemon serves the built SPA.
-    outDir: "../pkg/web/dist",
+    // Emit into a gitignored STAGING dir (web/dist-build), NOT the Go embed
+    // source (pkg/web/dist). Embed-producing targets (`make build`/`install`/
+    // `fixtures`, the release workflow) materialize (copy) the staged bundle
+    // into pkg/web/dist right before `go build`. This keeps `make web` from
+    // clobbering the tracked fallback placeholder pkg/web/dist/index.html.
+    outDir: "dist-build",
     emptyOutDir: true,
     target: "es2020",
   },

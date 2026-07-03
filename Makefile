@@ -1,15 +1,20 @@
 # vh-solara developer tasks.
-# The web UI is embedded into the Go binary, so build the SPA before the binary.
+# The web UI is embedded into the Go binary. `make web` builds the SPA into a
+# gitignored staging dir (web/dist-build); embed-producing targets materialize
+# (copy) the staged bundle into pkg/web/dist right before `go build`.
 
-.PHONY: web build install test test-web e2e e2e-keep docker fixtures bench
+.PHONY: web web-materialize build install test test-web e2e e2e-keep docker fixtures bench
 
-web: ## Build the SolidJS UI into pkg/web/dist (embedded by the binary)
+web: ## Build the SolidJS UI into the staging dir web/dist-build (gitignored, NOT pkg/web/dist)
 	cd web && npm install && npm run build
 
-build: web ## Build the vh-solara binary (single file, UI embedded via go:embed)
+web-materialize: web ## Copy staged SPA (web/dist-build) into the Go embed dir pkg/web/dist
+	cp -r web/dist-build/. pkg/web/dist/
+
+build: web-materialize ## Build the vh-solara binary (single file, UI embedded via go:embed)
 	go build -o vh-solara .
 
-install: web ## Build the UI then `go install` the single embedded binary into GOBIN
+install: web-materialize ## Build the UI then `go install` the single embedded binary into GOBIN
 	go install .
 
 test: ## Run Go unit/integration tests
@@ -19,7 +24,9 @@ test-web: ## Run web unit tests + fixture-backed Playwright e2e (needs Node >= 2
 	cd web && npm run test:unit && npm run test:e2e
 
 fixtures: ## Run the fixture-backed web stack locally on :8099 (no opencode needed)
-	cd web && npm run build && cd .. && go run ./tools/fixtureserver -addr 127.0.0.1:8099
+	cd web && npm run build
+	cp -r web/dist-build/. pkg/web/dist/
+	go run ./tools/fixtureserver -addr 127.0.0.1:8099
 
 bench: ## Benchmark the chat view (VH_BENCH_MESSAGES=N complex messages, default 300)
 	bash web/scripts/bench.sh

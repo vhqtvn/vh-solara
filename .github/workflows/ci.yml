@@ -49,6 +49,18 @@ jobs:
         run: npm run test:unit
       - name: build
         run: npm run build
+      - name: guard — make web leaves no tracked dist changes
+        # `npm run build` must stage into the gitignored web/dist-build/ and NEVER
+        # dirty the tracked fallback placeholder pkg/web/dist/index.html. If it
+        # does, the Vite outDir / materialize contract has regressed.
+        working-directory: .
+        run: |
+          if ! git diff --exit-code -- pkg/web/dist/index.html; then
+            echo "::error::npm run build dirtied the tracked placeholder pkg/web/dist/index.html."
+            echo "The SPA build must write to the gitignored staging dir (web/dist-build), not pkg/web/dist."
+            git --no-pager diff -- pkg/web/dist/index.html
+            exit 1
+          fi
 
   # Fixture-backed Playwright e2e. Needs Go too — the Playwright webServer builds
   # the SPA and runs ./tools/fixtureserver (real aggregator + fake OpenCode).

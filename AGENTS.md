@@ -314,12 +314,20 @@ It lets an operator:
 
 ## Web frontend (`web/`)
 
-- SolidJS SPA built with Vite; TypeScript. The bundle under `pkg/web/dist/` is
-  gitignored **except** a placeholder `index.html` so `//go:embed dist` compiles
-  without a frontend build. **Do not commit a real `vite build` output** —
-  `make web` / the release workflow rebuilds it. (When a local build dirties
-  `pkg/web/dist/index.html`, `git checkout -- pkg/web/dist/index.html` before
-  committing.)
+- SolidJS SPA built with Vite; TypeScript. `make web` builds the SPA into a
+  **gitignored staging dir** (`web/dist-build/`), NOT into `pkg/web/dist/`. A
+  self-contained fallback `pkg/web/dist/index.html` is tracked so `//go:embed
+  dist` compiles and a cold `go build`/`go test` works with **no frontend build**
+  (it renders a "web UI was not built" banner — fully self-contained, with no
+  `/assets` or `/sw.js` references). Embed-producing targets (`make build`/
+  `install`/`fixtures`, the release workflow) **materialize** — copy
+  `web/dist-build/*` → `pkg/web/dist/` — immediately before `go build`, so the
+  binary embeds the real SPA. `make web` alone leaves `git status` clean (a CI
+  guard asserts `pkg/web/dist/index.html` is untouched). NOTE: `make build` /
+  materialize overwrites `pkg/web/dist/index.html` locally; do NOT commit in that
+  state — restore the committed placeholder first (operators:
+  `git checkout -- pkg/web/dist/index.html`; agents: route through the committer
+  / `.opencode/scripts/commit-gate.sh revert pkg/web/dist/index.html`).
 - Full build (Node ≥ 20): `make build` (or `make web` for the SPA only).
 - SPA unit tests: `cd web && npx vitest run`. Typecheck: `npm run typecheck`.
 - Playwright e2e: `cd web && export PATH=$PATH:/usr/local/go/bin && npx playwright

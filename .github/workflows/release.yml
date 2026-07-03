@@ -28,13 +28,17 @@ jobs:
           node-version: 20
 
       - name: Build web UI (embedded into the binary)
-        # pkg/web/dist is NOT committed (only a placeholder index.html). This step
-        # produces the real SPA bundle that `go build` embeds via //go:embed dist,
-        # so it MUST run before "Build binaries".
+        # `npm run build` stages the SPA into the gitignored web/dist-build/
+        # (NOT pkg/web/dist, which holds the tracked fallback placeholder). The
+        # materialize step then copies the staged bundle into pkg/web/dist/ so
+        # the subsequent `go build` embeds the real SPA via //go:embed dist.
+        # Both MUST run before "Build binaries".
         run: |
           cd web
           npm ci
           npm run build
+      - name: Materialize staged SPA into pkg/web/dist
+        run: cp -r web/dist-build/. pkg/web/dist/
 
       - name: Download dependencies
         run: go mod download

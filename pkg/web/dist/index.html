@@ -4,24 +4,46 @@
     <meta charset="utf-8" />
     <meta
       name="viewport"
-      content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content"
+      content="width=device-width, initial-scale=1, viewport-fit=cover"
     />
     <title>VHSolara</title>
-    <!-- PWA: installable + auto-updating (see public/sw.js). -->
-    <link rel="manifest" href="/manifest.webmanifest" />
-    <meta name="theme-color" content="#0d1117" />
-    <link rel="icon" href="/icon.svg" type="image/svg+xml" />
-    <link rel="apple-touch-icon" href="/icon.svg" />
-    <meta name="apple-mobile-web-app-capable" content="yes" />
-    <meta name="mobile-web-app-capable" content="yes" />
-    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-    <meta name="apple-mobile-web-app-title" content="VHSolara" />
-    <!-- Chroma theme for server-rendered code blocks (served by the daemon). -->
-    <link rel="stylesheet" href="/vh/highlight.css" />
-    <script type="module" crossorigin src="/assets/index-BlYvDfj5.js"></script>
-    <link rel="stylesheet" crossorigin href="/assets/index-OcCCfv-3.css">
+    <!-- Self-contained fallback. This file is the ONLY tracked file under
+         pkg/web/dist: it lets a cold `go build`/`go test` compile and serve a
+         real page with NO frontend build. It must NOT reference the hashed SPA
+         bundle or the service worker (those exist only after `make web` stages a
+         real build and an embed-producing target materializes it here). Run
+         `make build` / the release workflow to produce the real SPA shell. -->
+    <style>
+      :root { color-scheme: dark; }
+      html, body {
+        margin: 0; min-height: 100%;
+        background: #0d1117; color: #c9d1d9;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+          Helvetica, Arial, sans-serif;
+      }
+      main {
+        min-height: 100vh; min-height: 100dvh;
+        display: flex; align-items: center; justify-content: center;
+        text-align: center; padding: 1.5rem;
+      }
+      .box { max-width: 32rem; }
+      h1 { font-size: 1.2rem; font-weight: 600; margin: 0 0 0.75rem; }
+      p { margin: 0.5rem 0; line-height: 1.5; color: #8b949e; }
+      code {
+        background: #161b22; color: #c9d1d9;
+        padding: 0.1rem 0.35rem; border-radius: 6px; font-size: 0.9rem;
+      }
+    </style>
   </head>
   <body>
-    <div id="root"></div>
+    <main>
+      <div class="box">
+        <h1>vh-solara web UI was not built.</h1>
+        <p>
+          Run <code>make build</code> for an embedded SPA build, or use the
+          frontend dev workflow (<code>cd web &amp;&amp; npm run dev</code>).
+        </p>
+      </div>
+    </main>
   </body>
 </html>

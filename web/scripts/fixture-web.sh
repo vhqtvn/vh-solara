@@ -12,6 +12,9 @@ repo_root="$(cd "$web_dir/.." && pwd)"
 echo "[fixture-web] building SPA…"
 (cd "$web_dir" && npm run build >/dev/null)
 
+echo "[fixture-web] materializing staged SPA into pkg/web/dist…"
+cp -r "$web_dir/dist-build/." "$repo_root/pkg/web/dist/"
+
 echo "[fixture-web] starting fixture server on $ADDR"
 cd "$repo_root"
 # Demo quota for the Usage panel is baked into fixtureserver (VH_QUOTA_FIXTURE);
