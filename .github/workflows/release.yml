@@ -38,7 +38,7 @@ jobs:
           npm ci
           npm run build
       - name: Materialize staged SPA into pkg/web/dist
-        run: cp -r web/dist-build/. pkg/web/dist/
+        run: bash web/scripts/materialize.sh
 
       - name: Download dependencies
         run: go mod download
