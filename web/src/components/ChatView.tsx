@@ -850,13 +850,19 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       measureNavCap();
       // Viewport resized (window resize, mobile keyboard toggle, layout shift).
       // When following, re-glue to the bottom: a viewport SHRINK leaves scrollTop
-      // unchanged while the bottom edge (scrollHeight - clientHeight) moves down,
-      // so without this we'd sit "Live" but not actually at the tail — no scroll
-      // event fires on a shrink (no clamp), so onScrolled never runs to correct it
-      // and the contentEl RO doesn't fire (content height unchanged). A viewport
-      // GROW self-corrects via the clamp scroll event, but re-pinning there too is
-      // harmless and cheaper than special-casing. Gated on ready() so initial
-      // scroll-restore (maybeRestore) owns positioning until it completes.
+      // ~unchanged while the bottom edge (scrollHeight - clientHeight) moves DOWN,
+      // so without this re-pin we'd sit "Live" but not actually at the tail. This
+      // RO is the corrector for that moved bottom edge: the contentEl RO doesn't
+      // fire (content height unchanged), and although a shrink does NOT clamp
+      // scrollTop (the new max is larger), sub-pixel / layout-rounding resize CAN
+      // still re-emit a `scroll` event with scrollTop off by ≤1px vs the last pin.
+      // That stray event reaches onScrolled below; its self-pin bail tolerates the
+      // ≤1px drift (Math.abs(scrollTop - pinnedTop) <= 1, NOT strict ===) so it is
+      // NOT mistaken for a user scroll-away — which would drop following + arm the
+      // intent latch and defeat this very corrector. A viewport GROW self-corrects
+      // via the clamp scroll event; re-pinning there too is harmless and cheaper
+      // than special-casing. Gated on ready() so initial scroll-restore
+      // (maybeRestore) owns positioning until it completes.
       if (following() && ready()) pin();
     });
     ro.observe(scrollEl);
@@ -875,7 +881,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     // back to the Live pill. pinnedTop is only ever -1 or a bottom clamp (set in
     // pin() after scrollTop=scrollHeight), so when following is false and
     // scrollTop===pinnedTop, nearBottom() is necessarily true → safe to follow.
-    if (scrollEl && scrollEl.scrollTop === pinnedTop && following()) return;
+    if (scrollEl && following() && Math.abs(scrollEl.scrollTop - pinnedTop) <= 1) return;
     const atBottom = nearBottom();
     // Intent latch: a real user scroll-away from the bottom arms the latch so
     // the self-heal effect does NOT yank them on the next busy edge. Distinguish
