@@ -75,10 +75,14 @@ make build      # builds the SPA (needs Node ≥ 20 once) then the embedded bina
 make install    # same, then `go install .` into $GOBIN
 ```
 
-> If `pkg/web/dist` is committed (it is, for releases), a plain `go build` /
-> `go install github.com/vhqtvn/vh-solara@latest` works with **no Node toolchain** —
-> the prebuilt UI is already in the source tree and gets embedded directly.
-> To rebuild the UI from source: `cd web && npm install && npm run build` (or `make web`).
+> A plain `go build` / `go install github.com/vhqtvn/vh-solara@latest` still works
+> with **no Node toolchain**, but it embeds a self-contained *"web UI was not
+> built"* placeholder — not the real SPA. The committed `pkg/web/dist/index.html`
+> is that fallback banner only, not a prebuilt UI. To build a binary with the
+> **real embedded SPA**, run `make build` (it builds the SPA into gitignored
+> `web/dist-build/`, then materializes it into `pkg/web/dist/` before compiling).
+> A release does this automatically via the tag-driven GitHub Actions workflow.
+> `npm run build` (or `make web`) emits into `web/dist-build/`, not `pkg/web/dist/`.
 
 ### Docker
 
@@ -170,7 +174,7 @@ state, and serves the vh UI on the controller-proxied port. The UI is embedded i
 binary; to rebuild it after changing `web/`:
 
 ```bash
-cd web && npm install && npm run build   # emits into pkg/web/dist (Go-embedded)
+cd web && npm install && npm run build   # emits into web/dist-build/ (materialized into pkg/web/dist by make build)
 ```
 
 **Reload / restart / update under a supervisor (systemd).** With the default

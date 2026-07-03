@@ -88,4 +88,4 @@ The shipped hybrid model is sound and its headline invariant — `make web` neve
 - B2: **high** on the WCAG fact, **confirmed** on intent (operator).
 
 ## Follow-up status
-B1, B5, B4, and the B2 comment are implemented in a parallel build slice (task `P1-WEB-026`). A and B3 remain deferred/dropped.
+B1, B5, B4, and the B2 comment are implemented in a parallel build slice (task `P1-WEB-027`). A and B3 remain deferred/dropped.

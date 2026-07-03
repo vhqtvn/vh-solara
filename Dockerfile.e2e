@@ -11,12 +11,12 @@ COPY web ./web
 RUN cd web && npm run build
 
 # 2) Build the Go binaries (e2e server + fake LLM).
-FROM golang:1.23-alpine AS gobuild
+FROM golang:1.25-alpine AS gobuild
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-COPY --from=webbuild /app/pkg/web/dist ./pkg/web/dist
+COPY --from=webbuild /app/web/dist-build ./pkg/web/dist
 ENV CGO_ENABLED=0 GOTOOLCHAIN=local
 RUN go build -trimpath -o /out/e2eserver ./tools/e2eserver \
  && go build -trimpath -o /out/fakellm ./tools/fakellm

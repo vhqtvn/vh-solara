@@ -10,11 +10,15 @@ sync protocol (`docs/architecture/03-stateful-aggregator.md`).
 ```bash
 cd web
 npm install
-npm run build      # emits into ../pkg/web/dist, which the Go binary embeds
+npm run build      # emits into ../web/dist-build (staging); run make build to materialize + embed
 ```
 
-Then build the daemon as usual (`go build`). The built `pkg/web/dist` is
-committed because the Go binary embeds it via `//go:embed`.
+A plain `go build` embeds the committed fallback placeholder banner at
+`pkg/web/dist/index.html` (self-contained, no Node toolchain required), NOT the
+real SPA. `pkg/web/dist/index.html` is committed only as that fallback;
+`web/dist-build/` is gitignored. Run `make build` to materialize the staged SPA
+into `pkg/web/dist/` and embed the real UI (the tag-driven release workflow does
+this automatically).
 
 ## Dev
 
