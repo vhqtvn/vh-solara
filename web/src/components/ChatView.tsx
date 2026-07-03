@@ -1190,7 +1190,13 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       body.model = { providerID: config.providerID, modelID: config.modelID };
       if (config.variant) body.variant = config.variant; // PromptInput.variant is top-level
     }
-    jumpToLatest();
+    // Only re-glue to the tail when the user is already following it. If they
+    // deliberately scrolled up to read history (userScrolledUp armed), preserve
+    // their read position — the "↓ Latest" pill offers a manual jump back. An
+    // unconditional yank here cleared the intent latch synchronously at send and
+    // defeated it (bug 10b). Mirrors the busy-edge self-heal's !userScrolledUp()
+    // gate so send-time and turn-start agree on intent.
+    if (!userScrolledUp()) jumpToLatest();
     return dispatchSend(key, id, `/oc/session/${encodeURIComponent(id)}/prompt_async`, body, "Message failed to send");
   }
 
@@ -1309,7 +1315,11 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     if (ag) body.agent = ag; // never fall back to a hardcoded "build" that may be disabled
     const s = selectionFor(id);
     if (s) body.model = { providerID: s.providerID, modelID: s.modelID };
-    jumpToLatest();
+    // Same intent-latch gate as sendParts above: don't yank a reader who
+    // deliberately scrolled up. Gated on !userScrolledUp() (the intent latch),
+    // not following(), so a transient following=false from a content-shrink
+    // clamp still re-glues — only a genuine scroll-up read is preserved (10b).
+    if (!userScrolledUp()) jumpToLatest();
     return dispatchSend(key, id, `/oc/session/${encodeURIComponent(id)}/shell`, body, "Shell command failed");
   }
 
