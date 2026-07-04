@@ -1,7 +1,8 @@
-import { createEffect, createSignal, onCleanup, Show } from "solid-js";
+import { Show } from "solid-js";
 import { Portal } from "solid-js/web";
 import { respondPermission } from "../sync";
 import Icon from "./Icon";
+import { useCardPopup } from "./cardPopup";
 
 // Category label for a permission request (best-effort: the structured fields
 // OpenCode sends, in priority order). Moved here verbatim from ChatView so the
@@ -36,32 +37,16 @@ export default function PermissionCard(props: {
   sessionID: string;
   perm: any;
 }) {
-  const [popupOpen, setPopupOpen] = createSignal(false);
-  let lastFocus: HTMLElement | null = null;
-  let popRef: HTMLDivElement | undefined;
+  // Shared popup chrome (open/close + focus capture/restore + ESC + Tab trap).
+  // See components/cardPopup.ts. The body is stateless here, so the popup is
+  // really "a second render surface for focus"; the trap is what keeps that
+  // surface self-contained.
+  const popup = useCardPopup();
 
   const label = () => permLabel(props.perm);
   const detail = () => permDetail(props.perm);
   const act = (resp: string) =>
     respondPermission(props.sessionID, props.perm.id, resp);
-
-  const openPopup = () => {
-    lastFocus = document.activeElement as HTMLElement | null;
-    setPopupOpen(true);
-    queueMicrotask(() => popRef?.focus());
-  };
-  const closePopup = () => {
-    setPopupOpen(false);
-    queueMicrotask(() => lastFocus?.focus?.());
-  };
-  createEffect(() => {
-    if (!popupOpen()) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") closePopup();
-    };
-    document.addEventListener("keydown", onKey);
-    onCleanup(() => document.removeEventListener("keydown", onKey));
-  });
 
   // Shared body: the <pre> detail + the three fast actions. Used by both the
   // inline surface and the popup overlay.
@@ -101,7 +86,7 @@ export default function PermissionCard(props: {
           <button
             type="button"
             class="card-icon-btn"
-            onClick={openPopup}
+            onClick={popup.show}
             data-tip="Open in popup"
             aria-label="Open permission in popup"
           >
@@ -114,11 +99,11 @@ export default function PermissionCard(props: {
       {body()}
 
       {/* Popup surface — mirrors the card (shared body) for long <pre> focus. */}
-      <Show when={popupOpen()}>
+      <Show when={popup.open()}>
         <Portal>
-          <div class="card-pop-overlay" onClick={closePopup}>
+          <div class="card-pop-overlay" onClick={popup.hide}>
             <div
-              ref={popRef}
+              ref={popup.setPopRef}
               class="card-pop card-pop-perm"
               role="dialog"
               aria-modal="true"
@@ -131,7 +116,7 @@ export default function PermissionCard(props: {
                 <button
                   type="button"
                   class="card-icon-btn"
-                  onClick={closePopup}
+                  onClick={popup.hide}
                   aria-label="Close popup"
                 >
                   <Icon name="x" size={14} />

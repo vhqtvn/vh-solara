@@ -133,4 +133,100 @@ describe("QuestionCard — in-stream card + shared-state popup", () => {
       expect(document.querySelector(".card-pop")).toBeNull(),
     );
   });
+
+  // --- Focus trap (B-F1) ------------------------------------------------
+  // While the popup is open, Tab/Shift+Tab must cycle ONLY among focusables
+  // INSIDE the overlay (wrap first↔last) and never escape to elements behind
+  // it. jsdom supports document.activeElement + element.focus(), so this is
+  // testable without a browser. The focusable set is re-queried at trap time,
+  // so the test mirrors the real selector: option buttons, the custom textarea,
+  // the action buttons, and the head tool buttons.
+  const tabFocusables = (root: ParentNode): HTMLElement[] =>
+    Array.from(
+      root.querySelectorAll<HTMLElement>(
+        'button:not([disabled]),textarea:not([disabled]),input:not([disabled]),[tabindex]:not([tabindex="-1"])',
+      ),
+    );
+
+  it("Tab from the last focusable wraps to the first inside the overlay", async () => {
+    const { container } = render(() => <QuestionCard question={question} />);
+    await waitFor(() =>
+      expect(container.textContent).toContain("Which approach"),
+    );
+    const card = container.querySelector(".question-card") as HTMLElement;
+    (
+      card.querySelector(
+        '[aria-label="Open answer in popup"]',
+      ) as HTMLButtonElement
+    ).click();
+    const pop = await waitFor(
+      () => document.querySelector(".card-pop") as HTMLElement,
+    );
+    const f = tabFocusables(pop);
+    expect(f.length).toBeGreaterThan(0);
+    const first = f[0];
+    const last = f[f.length - 1];
+
+    last.focus();
+    expect(document.activeElement).toBe(last);
+
+    // Forward Tab at the boundary → trap prevents default and wraps to first.
+    document.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Tab", bubbles: true }),
+    );
+    expect(document.activeElement).toBe(first);
+    // Focus never escaped the overlay.
+    expect(pop.contains(document.activeElement)).toBe(true);
+  });
+
+  it("Shift+Tab from the first focusable wraps to the last inside the overlay", async () => {
+    const { container } = render(() => <QuestionCard question={question} />);
+    await waitFor(() =>
+      expect(container.textContent).toContain("Which approach"),
+    );
+    const card = container.querySelector(".question-card") as HTMLElement;
+    (
+      card.querySelector(
+        '[aria-label="Open answer in popup"]',
+      ) as HTMLButtonElement
+    ).click();
+    const pop = await waitFor(
+      () => document.querySelector(".card-pop") as HTMLElement,
+    );
+    const f = tabFocusables(pop);
+    const first = f[0];
+    const last = f[f.length - 1];
+
+    first.focus();
+    expect(document.activeElement).toBe(first);
+
+    document.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Tab", shiftKey: true, bubbles: true }),
+    );
+    expect(document.activeElement).toBe(last);
+    expect(pop.contains(document.activeElement)).toBe(true);
+  });
+
+  it("the trap is NOT active when the popup is closed (inline body stays tabbable)", async () => {
+    const { container } = render(() => <QuestionCard question={question} />);
+    await waitFor(() =>
+      expect(container.textContent).toContain("Which approach"),
+    );
+    // Popup is closed; dispatching Tab/Shift+Tab must not throw and must not
+    // create a stray focus leap — there is no overlay to trap within, so the
+    // listener is unregistered (onCleanup in useCardPopup).
+    expect(document.querySelector(".card-pop")).toBeNull();
+    document.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Tab", bubbles: true }),
+    );
+    document.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Tab", shiftKey: true, bubbles: true }),
+    );
+    // Inline option buttons are still present and focusable directly.
+    const inlineOpt = container.querySelector(
+      ".question-opt",
+    ) as HTMLButtonElement;
+    inlineOpt.focus();
+    expect(document.activeElement).toBe(inlineOpt);
+  });
 });

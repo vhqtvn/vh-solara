@@ -1,16 +1,10 @@
-import {
-  createEffect,
-  createResource,
-  createSignal,
-  For,
-  onCleanup,
-  Show,
-} from "solid-js";
+import { createResource, createSignal, For, Show } from "solid-js";
 import { Portal } from "solid-js/web";
 import type { Question } from "../types";
 import { respondQuestion } from "../sync";
 import { renderMarkdown } from "../render";
 import Icon from "./Icon";
+import { useCardPopup } from "./cardPopup";
 
 // Goldmark wraps a lone paragraph as <p>…</p>. Inside a <button> that is
 // invalid phrasing content, so for INLINE contexts (option label/description)
@@ -66,10 +60,11 @@ export default function QuestionCard(props: { question: Question }) {
   const [custom, setCustom] = createSignal<Record<number, string>>({});
   const [busy, setBusy] = createSignal(false);
   const [layout, setLayout] = createSignal<"v" | "h">("v");
-  const [popupOpen, setPopupOpen] = createSignal(false);
 
-  let lastFocus: HTMLElement | null = null;
-  let popRef: HTMLDivElement | undefined;
+  // Shared popup chrome (open/close + focus capture/restore + ESC + Tab trap).
+  // The card's signals and `body()` stay here; only the popup lifecycle is
+  // delegated. See components/cardPopup.ts.
+  const popup = useCardPopup();
 
   function toggle(qi: number, label: string, multiple?: boolean) {
     setPicked((prev) => {
@@ -105,25 +100,6 @@ export default function QuestionCard(props: { question: Question }) {
       setBusy(false);
     }
   }
-
-  // --- Popup lifecycle (ESC + backdrop close + focus return) --------------
-  const openPopup = () => {
-    lastFocus = document.activeElement as HTMLElement | null;
-    setPopupOpen(true);
-    queueMicrotask(() => popRef?.focus());
-  };
-  const closePopup = () => {
-    setPopupOpen(false);
-    queueMicrotask(() => lastFocus?.focus?.());
-  };
-  createEffect(() => {
-    if (!popupOpen()) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") closePopup();
-    };
-    document.addEventListener("keydown", onKey);
-    onCleanup(() => document.removeEventListener("keydown", onKey));
-  });
 
   const toggleLayout = () => setLayout((l) => (l === "v" ? "h" : "v"));
   // Shared H/V toggle button — used in BOTH the inline head and the popup head,
@@ -230,7 +206,7 @@ export default function QuestionCard(props: { question: Question }) {
           <button
             type="button"
             class="card-icon-btn"
-            onClick={openPopup}
+            onClick={popup.show}
             data-tip="Open in popup"
             aria-label="Open answer in popup"
           >
@@ -244,11 +220,11 @@ export default function QuestionCard(props: { question: Question }) {
 
       {/* Popup surface — mirrors the card with SHARED STATE. Renders the same
           `body()` and the same toggle bound to the same signals. */}
-      <Show when={popupOpen()}>
+      <Show when={popup.open()}>
         <Portal>
-          <div class="card-pop-overlay" onClick={closePopup}>
+          <div class="card-pop-overlay" onClick={popup.hide}>
             <div
-              ref={popRef}
+              ref={popup.setPopRef}
               class="card-pop card-pop-question"
               role="dialog"
               aria-modal="true"
@@ -265,7 +241,7 @@ export default function QuestionCard(props: { question: Question }) {
                   <button
                     type="button"
                     class="card-icon-btn"
-                    onClick={closePopup}
+                    onClick={popup.hide}
                     aria-label="Close popup"
                   >
                     <Icon name="x" size={14} />
