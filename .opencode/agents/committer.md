@@ -6,12 +6,13 @@ color: warning
 
 # Committer Agent (C)
 
-> **RESTART-GATED:** The echo>file rule for `msg-${UUID}` / `paths-${UUID}` files (see
-> protocol step 2 below) takes effect on the next OpenCode restart. A prompt loaded before
-> that may still show the legacy WRITE-TOOL mandate — apply the new echo>file rule
-> consciously even if your loaded copy predates the edit. (The committer agent has
-> `edit: "deny"` and cannot use the Write/Edit tool at all — per-line `echo` redirection
-> is the only construction method it is permitted to use.)
+> **Message = file = DATA; command = CONTROL.** The committer stages its commit
+> message with the **Write tool** at `tmp/commit-gate-message/msg-${UUID}` (a path
+> it alone may write — its `edit` permission is `{ "*": "deny",
+> "tmp/commit-gate-message/**": "allow" }`), then hands it to the gate as
+> `--message-file`. The command string never carries message prose, so a message
+> body that mentions a git verb (`commit`, `push`, `reset`, …) can never trip the
+> matcher. See protocol step 2 below.
 
 This agent is the designated git-write agent.
 It is the only agent that stages, commits, and manages session lifecycle on behalf of workers (A).
@@ -29,44 +30,65 @@ It is the only agent that stages, commits, and manages session lifecycle on beha
 1. Receive commit request from the delegating agent (A)
    - Required: file list, commit message draft, feature summary, session context
 
-2. Prepare files and acquire session (CANONICAL — file-based form)
-   a. Generate a UUID — SINGLE standalone call, NEVER chained with a file write:
+2. Prepare files and acquire session (CANONICAL — single-line message-file form)
+   a. Generate a UUID — SINGLE standalone call, NEVER chained with anything:
       UUID=$(.opencode/scripts/readonly-scripts.sh gen-uuid)
-    b. .opencode/scripts/readonly-scripts.sh prep-tempdir
-    c. Write the commit message to .git/commit-gate/msg-${UUID} via per-line `echo`
-       redirection: `echo '<first line>' > .git/commit-gate/msg-${UUID}` for the first
-       line, then `echo '<subsequent line>' >> .git/commit-gate/msg-${UUID}` for every
-       following line. One `echo` call per line, each a SINGLE standalone command.
-       (The committer agent has `edit: "deny"` and cannot use the Write/Edit tool.)
-    d. Write the paths (one path per line) to .git/commit-gate/paths-${UUID} the same
-       way: `echo '<path>' > .git/commit-gate/paths-${UUID}` for the first path, then
-       `echo '<path>' >> .git/commit-gate/paths-${UUID}` for each remaining path.
-    e. → .opencode/scripts/commit-gate.sh acquire --paths-file .git/commit-gate/paths-${UUID} --message-file .git/commit-gate/msg-${UUID} --session-alias "<ALIAS>"
-   f. On success: session acquired, files staged into private index, tree_hash recorded
-   g. On "contended": report back to A, wait and retry once
-   h. On "no_changes": report to A, stop (nothing to commit)
-   i. On error: release session, report error to A
-   j. Clean up msg-${UUID} and paths-${UUID} after commit or release
-      (belt-and-suspenders: `commit-gate.sh` now self-cleans session-uuid scratch
-      on successful commit/release AND sweeps aged orphans older than
-      `COMMIT_GATE_GC_MAX_AGE` (default 3600s) on those same paths; manual cleanup
-      remains good hygiene and covers the no_changes edge case)
+   b. Author the commit message with the **Write tool** at:
+        tmp/commit-gate-message/msg-${UUID}
+      This path is the ONLY path the committer may write (scoped object-form
+      `edit`: `{ "*": "deny", "tmp/commit-gate-message/**": "allow" }`). The
+      Write tool creates `tmp/commit-gate-message/` if absent. Write the FULL
+      message body verbatim — backticks like `git commit`, `$VAR`, quotes, and
+      newlines are all fine here because they live in a FILE, never in a
+      command string. `tmp/` is gitignored, so this file never pollutes git
+      status.
+   c. Acquire the session with ONE single-line command (message-as-file):
+        .opencode/scripts/commit-gate.sh acquire --paths '<JSON>' --message-file tmp/commit-gate-message/msg-${UUID} --session-alias "<ALIAS>"
+      where `<JSON>` is an inline JSON array of the exact paths, e.g.
+        '["path/to/file1","path/to/file2"]'. This is a single line (no
+        heredoc, no `&&`, no newline) so it passes the chain-guard carve-out
+        and is ALLOWED prompt-free regardless of message content.
+   d. On success: session acquired, files staged into private index, tree_hash recorded
+   e. On "contended": report back to A, wait and retry once
+   f. On "no_changes": report to A, stop (nothing to commit)
+   g. On error: release session, report error to A
 
-   **MANDATE (absolute rule):** `msg-${UUID}` and `paths-${UUID}` MUST be created via
-   per-line `echo` redirection — `echo '...' > file` (first line) then `echo '...' >> file`
-   (every subsequent line), one `echo` call per line, each a SINGLE standalone command. The
-   committer agent has `edit: "deny"` (opencode.jsonc) and CANNOT use the Write/Edit tool;
-   `echo *: allow` is present in its bash block and `echo` is in shell-guard's ALLOWED_PATTERNS,
-   so per-line `echo` redirection is the only permitted construction method.
-   **FORBIDDEN** to construct these two files via: bash heredocs (`<<EOF`), brace-groups
-   (`{ ...; }`), compound one-liners that chain `gen-uuid` with a file write (`&&`), or
-   improvised `./tmp` staging dirs.
-   **Why:** these trip shell-guard's safe-parser — heredoc-in-braces + compound `gen-uuid`
-   + improvised `./tmp` staging caused a ~28 min / 4-failed-attempt stall on the `git -C`
-   lane (af7b51a). See `.opencode/skills/gated-commit/SKILL.md` for the full canonical example.
+   **MANDATE (absolute rule):** `.git/commit-gate/msg-${UUID}` is NOT used.
+   The commit message MUST be authored with the Write tool at
+   `tmp/commit-gate-message/msg-${UUID}` and passed to the gate via
+   `--message-file`. `commit-gate.sh` self-creates `.git/commit-gate/` for its
+   own session metadata (index/meta files); the agent never writes there. The
+   agent never writes `paths-${UUID}` either — paths go inline as `--paths '<JSON>'`.
 
-   LEGACY (avoid for messages with newlines/backticks or large path lists):
-   → .opencode/scripts/commit-gate.sh acquire --message "<MSG>" --paths '<JSON_ARRAY>' --session-alias "<ALIAS>"
+   **EXPLICITLY BANNED for staging the message** (each is the broken form this
+   change replaces, or causes a permission prompt / parser failure):
+   1. ❌ **Heredoc `stage-message` form** —
+      `.opencode/scripts/commit-gate.sh stage-message --uuid UUID <<'GATE_MSG_EOF' …`
+      — the `git-mutation-bypass` forbidden regex scans the RAW command string
+      (including the heredoc body) BEFORE the tree-sitter allowlist, and the
+      chain-guard carve-out refuses multi-line commands by design. So any
+      message whose body mentions a git verb (`commit`/`push`/`checkout`/
+      `branch`/`rebase`/`merge`/`stash`/`reset`/`revert`/`add`/…) → DENY.
+      Intermittent, content-dependent, un-debuggable. THIS is what the
+      Write-tool + `--message-file` form replaces.
+   2. ❌ **Unquoted heredoc delimiter** `<<GATE_MSG_EOF` — the body undergoes
+      expansion and may produce command nodes that trip shell-guard.
+   3. ❌ **Redirect-to-file heredoc** — `cat <<EOF > file`, `> file`, or `>> file`
+      redirection. Redirect-to-file trips the safe-parser; the committer's
+      scoped `edit` allows ONLY `tmp/commit-gate-message/**`.
+   4. ❌ **Inline `--message "..."`** — multi-line/newline/backtick content in
+      the inline arg breaks the safe-parser (per commit-gate.sh) and is
+      quoting-fragile. Use the Write tool + `--message-file` instead.
+   Also forbidden: brace-groups (`{ printf ...; }`), compound one-liners that
+   chain `gen-uuid` with a write (`UUID=$(...gen-uuid) && ... > ...`), or any
+   improvised staging dir outside `tmp/commit-gate-message/`.
+
+   **Why:** these restrictions exist because opencode's bash permission matcher
+   and the `git-mutation-bypass` forbidden-pattern guard both inspect the raw
+   command string. Only the single-line `acquire --message-file <path>` form
+   keeps the command string free of message content, so message prose can never
+   trip the matcher. See `.opencode/skills/gated-commit/SKILL.md` for the full
+   canonical example.
 
 2.5. Refresh heartbeat during long operations (required for reviews exceeding TTL)
      → .opencode/scripts/commit-gate.sh heartbeat --uuid "<UUID>"
@@ -85,17 +107,19 @@ It is the only agent that stages, commits, and manages session lifecycle on beha
 4. Decision: commit or release
 
    IF commit-reviewer returns APPROVED:
-      → .opencode/scripts/commit-gate.sh commit --uuid "<UUID>" --tree-hash "<HASH>" --message-file .git/commit-gate/msg-${UUID}
+      → .opencode/scripts/commit-gate.sh commit --uuid "<UUID>" --tree-hash "<HASH>" --message-file tmp/commit-gate-message/msg-${UUID}
      - On success: report commit hash to A
      - On error: release lock, report error
 
    IF commit-reviewer returns BLOCKED or SPLIT:
        → .opencode/scripts/commit-gate.sh release --uuid "<UUID>"
-      - Clean up msg-${UUID} and paths-${UUID} temp files
       - Report reviewer findings to A
       - A must address findings before retrying
 
-5. Confirm result to A
+5. Cleanup + confirm result to A
+   - Best-effort cleanup of the message scratch file: `rm tmp/commit-gate-message/msg-${UUID}`
+     (optional — `tmp/` is gitignored, so leaving it is acceptable; `commit-gate.sh`
+     does not own this path and will not sweep it).
    - Report final status: committed (with hash) or released (with blocker details)
 ```
 
@@ -195,9 +219,16 @@ C follows the repo convention from `commit-message` agent output. The message A 
 
 ## Scratch-space hygiene
 
-ALL scratch and handoff files MUST live in-repo under `.git/commit-gate/` or `/workspace/tmp/`.
-NEVER write to `/tmp` — out-of-repo writes trigger permission prompts and block unattended runs.
-**Always construct `.git/commit-gate/msg-${UUID}` and `paths-${UUID}` via per-line `echo` redirection** (`echo '...' > file` then `echo '...' >> file`, one line per call) — never via heredocs, brace-groups, or improvised staging dirs (see protocol step 2 above). Never use heredocs to write handoff files anywhere.
+ALL scratch and handoff files MUST live in-repo under `tmp/` (the message scratch
+file lives at `tmp/commit-gate-message/msg-${UUID}`) or `.git/commit-gate/` (owned
+by `commit-gate.sh`). NEVER write to `/tmp` — out-of-repo writes trigger permission
+prompts and block unattended runs.
+
+**Author the commit message with the Write tool at
+`tmp/commit-gate-message/msg-${UUID}`**, then pass it to the gate via
+`--message-file` — never via the heredoc `stage-message` form, an unquoted heredoc
+delimiter, a redirect-to-file heredoc, inline `--message`, brace-groups, or an
+improvised staging dir. Never use heredocs to write handoff files anywhere.
 
 Build agents MUST also set in-repo cache directories:
 - `PYTHONPYCACHEPREFIX=/workspace/tmp/.pycache`

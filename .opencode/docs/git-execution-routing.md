@@ -25,17 +25,26 @@ difficult; see the threat model in the gated-commit spec for known residual risk
 
 ### 1. Shell-guard plugin (`.opencode/plugins/shell-guard.js`)
 
-- **Gate commands** (`commit-gate.sh acquire/commit/release/heartbeat/status`) are in
-  `ALLOWED_PATTERNS` and pass through shell-guard.
-- **Canonical invocation**: Use `--message-file` and `--paths-file` (file-based args)
-  instead of inline `--message` / `--paths` (JSON array). File-based args avoid
-  tree-sitter parse failures when messages contain newlines or backticks.
+- **Gate commands** (`commit-gate.sh acquire/commit/release/heartbeat/revert/stage-message`)
+  are in `ALLOWED_PATTERNS` and pass through shell-guard.
+- **Read-only probe** (`commit-gate.sh status`) is a pure-read metadata lookup (lock/session
+  state) that lives in the readonly group, so ALL agents — including gate-exempt ones
+  (`build`/`coordination`/`project-coordinator`/`docs-steward`) — get prompt-free lock checks.
+  It is not a gate command.
+- **Canonical invocation (single-line message-file form):** The committer authors its
+  commit message with the **Write tool** at `tmp/commit-gate-message/msg-${UUID}` — the
+  single path its scoped object-form `edit` allows (`{ "*": "deny",
+  "tmp/commit-gate-message/**": "allow" }`) — then passes it to the gate as
+  `--message-file`. The command string never carries message prose, so the
+  `git-mutation-bypass` forbidden regex (which scans the RAW command string before the
+  tree-sitter allowlist) and the chain-guard carve-out (which refuses multi-line
+  commands) can never reject a commit because of its message body.
   ```bash
-  .opencode/scripts/commit-gate.sh acquire \
-    --paths-file .git/commit-gate/paths-${UUID} \
-    --message-file .git/commit-gate/msg-${UUID} \
-    --session-alias ALIAS
+  .opencode/scripts/commit-gate.sh acquire --paths '<JSON>' --message-file tmp/commit-gate-message/msg-${UUID} --session-alias ALIAS
   ```
+  Banned for staging the message: the heredoc `stage-message` form, unquoted heredoc
+  delimiters, redirect-to-file heredocs, and inline `--message "..."`. See
+  `.opencode/skills/gated-commit/SKILL.md`.
 - **Git mutation bypass** (`git-mutation-bypass` in forbidden-patterns) blocks
   raw `git add`, `git commit`, `git reset`, `git push`, etc. for ALL agents.
 - **Operator escape hatch**: `SKIP_COMMIT_GATE=1` is operator-only (host terminal).

@@ -424,6 +424,58 @@ export function normalizeGitC(tokens, root) {
     };
 }
 
+// ---------------------------------------------------------------------------
+// Optional `git --no-pager` (and `--paging=no`) support.
+//
+// Background: the `git_readonly` allowlist matches bare `git <subcommand>` token
+// sequences, and the `git-mutation-bypass` forbidden regex matches
+// `\bgit\s+(add|commit|...)\b`. Neither fires when a global paging flag is
+// inserted between `git` and the subcommand, so:
+//   - `git --no-pager log` falls through to opencode's permission gate (prompt),
+//     instead of being cleanly allowed like `git log`.
+//   - `git --no-pager commit` slips PAST `git-mutation-bypass` (a real hole):
+//     the regex requires the mutation verb ADJACENT to `git`, but `--no-pager`
+//     sits between them.
+//
+// Fix: in the git-mutation re-scan loop (evaluate), after reconstructing the
+// command string from normalized tokens, strip a run of safe global paging
+// flags so the forbidden re-scan sees the bare `git <verb>` form. Mutations are
+// then re-caught by re-running denyByForbiddenPatterns on the stripped
+// reconstruction (single source of truth for mutation verbs), and the readonly
+// config-table entries added for `git --no-pager <sub> *` (permconfig tables)
+// handle the prompt-free allow path for the ORIGINAL (un-stripped) tokens.
+//
+// Conservative: only `--no-pager` and its exact synonym `--paging=no` are
+// recognized. Every other global flag (incl. `--git-dir`/`--work-tree`, which
+// take path args and could escape the repo) is left in place, so it stays
+// between `git` and the subcommand and conservatively does NOT match the
+// readonly allowlist.
+//
+// This is a STRING normalizer (it runs on the reconstruction the re-scan loop
+// already builds), mirroring normalizeGitC's detect-strip-reconstruct pattern.
+// Returns { changed: bool, cmd: string }; non-git commands and git commands
+// without a leading safe global flag are returned unchanged.
+// ---------------------------------------------------------------------------
+
+// Conservative set of safe git global flags that may sit between `git` and the
+// subcommand. These only affect output paging and never mutate state.
+const GIT_SAFE_GLOBAL_FLAGS = new Set(["--no-pager", "--paging=no"]);
+
+export function normalizeGitGlobalFlags(cmd) {
+    const tokens = cmd.split(/\s+/).filter(Boolean);
+    if (tokens.length === 0 || tokens[0] !== "git") {
+        return { changed: false, cmd };
+    }
+    let i = 1;
+    while (i < tokens.length && GIT_SAFE_GLOBAL_FLAGS.has(tokens[i])) {
+        i++;
+    }
+    if (i === 1) {
+        return { changed: false, cmd }; // no leading safe global flag present
+    }
+    return { changed: true, cmd: ["git", ...tokens.slice(i)].join(" ") };
+}
+
 // Detect whether a command string is a vh-agent-harness exec invocation that
 // attempts to reach commit-gate.sh.  Used by the engine and exported for
 // test reuse.
@@ -539,10 +591,10 @@ export async function evaluate(command) {
                 reason:
                     "Gate wrapper (commit-gate.sh) must be invoked directly, not through vh-agent-harness exec. " +
                     "Only the committer agent can use the gate wrapper. " +
-                    "Blessed form: .opencode/scripts/commit-gate.sh acquire " +
-                    "--paths-file .git/commit-gate/paths-${UUID} " +
-                    "--message-file .git/commit-gate/msg-${UUID} " +
-                    "--session-alias ALIAS",
+                    "Blessed form: committer authors the message with the Write tool at " +
+                    "tmp/commit-gate-message/msg-${UUID}, then runs the single-line " +
+                    ".opencode/scripts/commit-gate.sh acquire --paths '<JSON>' " +
+                    "--message-file tmp/commit-gate-message/msg-${UUID} --session-alias ALIAS",
             };
         }
 
@@ -595,9 +647,21 @@ export async function evaluate(command) {
     // git-mutation-bypass as the single source of truth for
     // mutation verbs (we do NOT duplicate the verb list), so
     // `git -C <valid> commit` -> stripped `git commit` -> denied.
+    //
+    // CHANGE 1 (Q1a safety): normalize safe global flags (e.g.
+    // `--no-pager`) on the reconstruction BEFORE this re-scan, so
+    // `git --no-pager commit` (whose flag sits between `git` and the
+    // verb, defeating the git-mutation-bypass regex at scan #1) is
+    // re-caught once the flag is stripped. Scoped to this re-scan:
+    // the allowlist match below still sees the ORIGINAL tokens, so the
+    // config-table entries added for `git --no-pager <readonly-sub> *`
+    // remain the authority for the prompt-free readonly path. Mirrors
+    // the normalizeGitC re-scan pattern: normalize the reconstruction,
+    // re-run denyByForbiddenPatterns.
     for (const tokens of normalizedCommands) {
         if (tokens.length > 0 && tokens[0] === "git") {
-            const reconstruction = tokens.join(" ");
+            const g = normalizeGitGlobalFlags(tokens.join(" "));
+            const reconstruction = g.changed ? g.cmd : tokens.join(" ");
             const strippedForbidden =
                 denyByForbiddenPatterns(reconstruction);
             if (strippedForbidden) {
