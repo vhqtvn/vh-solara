@@ -46,7 +46,11 @@ tmp/
 # touches tracked files; `make build`/materialize overwrites pkg/web/dist/index.html
 # locally (restore the committed placeholder before committing).
 node_modules/
-web/test-results/
+# Playwright test-results/ output (artifacts + .last-run.json). Can appear at
+# the repo root or under web/ depending on the CWD `npx playwright test` runs
+# from, so match at any level (no leading slash). web/playwright-report/ is the
+# separate HTML report and stays anchored to web/.
+test-results/
 web/playwright-report/
 web/dist-build/
 pkg/web/dist/*
