@@ -1,6 +1,6 @@
 import { createEffect, createMemo, createSignal, For, Match, on, onCleanup, onMount, Show, Switch, untrack } from "solid-js";
 import { Portal } from "solid-js/web";
-import { ackSession, createSession, currentVerb, isSending, markSessionIdle, openSession, respondPermission, rootOf, sessionTodoCounts, sessionTodos, sessionWorking, setSelectedId, setSending, state } from "../sync";
+import { ackSession, createSession, currentVerb, isSending, markSessionIdle, openSession, rootOf, sessionTodoCounts, sessionTodos, sessionWorking, setSelectedId, setSending, state } from "../sync";
 import { bottommostRead, clearReadAnchor, getReadAnchor, setReadAnchor } from "../lib/scroll";
 import { highlightInput } from "../lib/composerHighlight";
 import { chooseVariant, findModel, loadModels, models, selectionFor } from "../models";
@@ -18,6 +18,8 @@ import { Deferred } from "./Deferred";
 // correct; older rows mount lazily as they near the viewport (see Deferred).
 const EAGER_TAIL = 30;
 import QuestionCard from "./QuestionCard";
+import PermissionCard from "./PermissionCard";
+import PendingInput from "./PendingInput";
 import Icon from "./Icon";
 import Spinner from "./Spinner";
 import { isDesktop } from "../layout";
@@ -88,24 +90,6 @@ function costLabel(info: any): string {
   const tok = (info.tokens?.input || 0) + (info.tokens?.output || 0);
   if (tok > 0) parts.push(tok >= 1000 ? `${(tok / 1000).toFixed(1)}k tok` : `${tok} tok`);
   return parts.join(" · ");
-}
-
-// A permission request's category (e.g. "bash", "edit") for the card header.
-function permLabel(p: any): string {
-  return String(p?.permission || p?.type || p?.title || "").trim();
-}
-// The concrete thing being requested — the command / file / description — so the
-// user knows what they're approving (OpenCode's payload puts it in metadata or
-// the patterns; title/type are usually empty, which is why it read blank).
-function permDetail(p: any): string {
-  const m = (p?.metadata || {}) as Record<string, any>;
-  const cand = m.command ?? m.cmd ?? m.filePath ?? m.path ?? m.description ?? m.title;
-  if (typeof cand === "string" && cand.trim()) return cand.trim();
-  if (Array.isArray(p?.patterns)) {
-    const ps = p.patterns.filter((x: any) => typeof x === "string" && x && x !== "*");
-    if (ps.length) return ps.join("\n");
-  }
-  return "";
 }
 
 // Group a message's parts for rendering: consecutive tool/reasoning parts fold
@@ -180,6 +164,7 @@ function MessageParts(props: { m: any; isLastMessage: () => boolean; lastActivit
 export default function ChatView(props: { sessionId: string; draft?: boolean }) {
   let scrollEl: HTMLDivElement | undefined;
   let contentEl: HTMLDivElement | undefined;
+  let chatMainEl: HTMLDivElement | undefined;
   const [following, setFollowing] = createSignal(true);
   // Intent latch for the auto-follow self-heal. `following()` flips false for
   // several reasons — a genuine user scroll-up (drop Live, show "↓ Latest"), a
@@ -334,6 +319,12 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
 
   const pendingPermissions = createMemo(() => Object.values(state.permissions[props.sessionId] || {}));
   const pendingQuestions = createMemo(() => Object.values(state.questions[props.sessionId] || {}));
+  // True when there is any active blocker (question OR permission) for this
+  // session. The blocker jump pill (PendingInput) wins over the "↓ Latest" pill
+  // — "↓ Latest" is suppressed while a blocker is active so the two never
+  // coexist. In practice an OpenCode session blocks on one item at a time, so
+  // this is usually exactly one card.
+  const blockerActive = createMemo(() => pendingQuestions().length + pendingPermissions().length > 0);
 
   // A child/subagent session (spawned by a `task` tool) cannot be prompted
   // directly — like opencode web, we disable the composer and offer a jump back
@@ -1478,7 +1469,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
         </div>
       </Show>
       <Show when={!props.draft}>
-      <div class="chat-main">
+      <div class="chat-main" ref={chatMainEl}>
       <div class="chat-scroll" ref={scrollEl} onScroll={onScrolled}>
         <div class="chat-content" ref={contentEl} classList={{ ready: revealed() }}>
           <For each={messages()}>
@@ -1562,6 +1553,28 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
                 <div class="chat-empty" role="status" aria-live="polite">Loading conversation…</div>
               </Match>
             </Switch>
+          </Show>
+          {/*
+            Pending-input surfaces (QuestionCard / PermissionCard) render as the
+            LAST item inside the chat-stream content container, not in a fixed
+            bottom `.perms` strip. The PendingInput host owns the in-stream
+            placement, the IntersectionObserver-driven jump pill (root =
+            .chat-scroll), and is payload-agnostic — QuestionCard and
+            PermissionCard plug in as children (composition, not a generic
+            single-renderer). Questions render before permissions (arrival order
+            is hard to track across two collections, but a session blocks on one
+            item at a time in practice).
+          */}
+          <Show when={blockerActive()}>
+            <PendingInput
+              scrollRoot={() => scrollEl}
+              pillMount={() => chatMainEl}
+              pillLabel={() => (pendingQuestions().length > 0 ? "Answer needed" : "Permission requested")}
+              onJump={jumpToLatest}
+            >
+              <For each={pendingQuestions()}>{(q) => <QuestionCard question={q as any} />}</For>
+              <For each={pendingPermissions()}>{(p) => <PermissionCard sessionID={props.sessionId} perm={p} />}</For>
+            </PendingInput>
           </Show>
         </div>
       </div>
@@ -1650,46 +1663,12 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
           </div>
         </Show>
 
-        <Show when={!following() && !focusMode() && messages().length > 0}>
+        <Show when={!following() && !focusMode() && messages().length > 0 && !blockerActive()}>
           <button type="button" class="jump" onClick={jumpToLatest}>
             <Icon name="arrowDown" size={14} /> Latest
           </button>
         </Show>
       </div>
-      </Show>
-
-      <Show when={pendingQuestions().length > 0}>
-        <div class="perms">
-          <For each={pendingQuestions()}>{(q) => <QuestionCard question={q as any} />}</For>
-        </div>
-      </Show>
-
-      <Show when={pendingPermissions().length > 0}>
-        <div class="perms">
-          <For each={pendingPermissions()}>
-            {(p) => (
-              <div class="perm-card">
-                <div class="perm-title">
-                  🔒 Permission requested<Show when={permLabel(p)}>: <strong>{permLabel(p)}</strong></Show>
-                </div>
-                <Show when={permDetail(p)}>
-                  <pre class="perm-detail">{permDetail(p)}</pre>
-                </Show>
-                <div class="perm-actions">
-                  <button type="button" onClick={() => respondPermission(props.sessionId, p.id, "once")}>
-                    Allow once
-                  </button>
-                  <button type="button" onClick={() => respondPermission(props.sessionId, p.id, "always")}>
-                    Always
-                  </button>
-                  <button type="button" class="reject" onClick={() => respondPermission(props.sessionId, p.id, "reject")}>
-                    Reject
-                  </button>
-                </div>
-              </div>
-            )}
-          </For>
-        </div>
       </Show>
 
       {/* Status row pinned above the composer (out of the scroll area, so it

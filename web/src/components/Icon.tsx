@@ -125,6 +125,18 @@ const PATHS: Record<string, () => JSX.Element> = {
       <path d="M9 1v3M15 1v3M9 20v3M15 20v3M20 9h3M20 14h3M1 9h3M1 14h3" />
     </>
   ),
+  // Stacked rows with leading bullets — the question card's VERTICAL option
+  // layout (one option per row). Used as the current-state glyph on the H/V
+  // toggle; clicking it flips to the horizontal "columns" layout.
+  rows: () => <path d="M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01" />,
+  // Two side-by-side chips of differing width — the question card's HORIZONTAL
+  // option layout (options flow as wrapping chips).
+  columns: () => (
+    <>
+      <rect x="3" y="5" width="7" height="14" rx="2" />
+      <rect x="14" y="5" width="7" height="10" rx="2" />
+    </>
+  ),
 };
 
 export default function Icon(props: { name: keyof typeof PATHS | string; size?: number }) {

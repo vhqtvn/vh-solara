@@ -1555,14 +1555,110 @@ body {
   font-size: 13px;
 }
 
-.perms {
-  border-top: 1px solid var(--border);
-  padding: 10px 14px;
+/* In-stream wrapper for the active pending-input surfaces. Renders as the LAST
+   item inside .chat-content (the chat-stream content container), not as a fixed
+   bottom strip — so there is no `max-height: 40%` clamp and no separate overflow
+   surface. Cards sit flush with the transcript width. */
+.pending-input {
   display: flex;
   flex-direction: column;
   gap: 8px;
-  max-height: 40%;
+  margin-top: 8px;
+}
+
+/* Shared card chrome: title row + tool cluster (H/V toggle on questions, popup
+   trigger on every card). Reused by both the inline surface and the popup head
+   so the two look identical. */
+.card-tools { display: inline-flex; align-items: center; gap: 2px; flex: none; }
+.card-icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--fg-dim);
+  border-radius: 6px;
+  cursor: pointer;
+  font: inherit;
+  transition: border-color 0.12s, color 0.12s, background-color 0.12s;
+}
+.card-icon-btn:hover {
+  color: var(--fg);
+  border-color: var(--fg-dim);
+  background: color-mix(in srgb, var(--fg) 7%, transparent);
+}
+
+/* Popup overlay — a SECOND render surface of the same card (shared signals).
+   Centered dialog on desktop, bottom sheet on narrow widths. Stays below the
+   drawer/modal/scrim layers (--z-dialog) on purpose. */
+.card-pop-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-dialog);
+  background: color-mix(in srgb, #000 55%, transparent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  animation: card-pop-fade 0.14s var(--ease, ease);
+}
+.card-pop {
+  width: min(640px, 100%);
+  max-height: min(82vh, 720px);
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: var(--shadow-lg, 0 12px 32px rgba(0, 0, 0, 0.45));
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  animation: card-pop-in 0.16s var(--ease, ease);
+  /* Focus target for ESC-aware dialog (tabindex=-1). */
+  outline: none;
+}
+.card-pop-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+  font-weight: 600;
+  font-size: 13px;
+}
+.card-pop-title { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
+.card-pop-question .card-pop-title { color: var(--accent); }
+.card-pop-body {
+  padding: 14px;
   overflow-y: auto;
+  /* The popup body renders the card's inner items directly (no .question-card
+     wrapper), so give it the same vertical rhythm as an inline card. */
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+@keyframes card-pop-fade { from { opacity: 0; } to { opacity: 1; } }
+@keyframes card-pop-in {
+  from { opacity: 0; transform: translateY(8px) scale(0.99); }
+  to { opacity: 1; transform: none; }
+}
+@media (max-width: 540px) {
+  /* Bottom sheet on phones: the card is wide enough that the option buttons,
+     markdown bodies, and textarea must stay readable at 360–414px. */
+  .card-pop-overlay { align-items: flex-end; padding: 0; }
+  .card-pop {
+    width: 100%;
+    max-width: 100%;
+    max-height: 88vh;
+    border-radius: 14px 14px 0 0;
+    animation: card-pop-in-sheet 0.18s var(--ease, ease);
+  }
+  @keyframes card-pop-in-sheet {
+    from { opacity: 0; transform: translateY(16px); }
+    to { opacity: 1; transform: none; }
+  }
 }
 .perm-card {
   border: 1px solid color-mix(in srgb, var(--warn) 33%, transparent);
@@ -1571,6 +1667,11 @@ body {
   padding: 10px 12px;
 }
 .perm-title { margin-bottom: 8px; }
+/* When the title sits inside a .perm-head (card-chrome) row, drop its own
+   bottom margin — the head row carries the spacing, and the popup-trigger
+   button sits to its right. */
+.perm-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+.perm-head .perm-title { margin-bottom: 0; }
 .perm-detail {
   margin: 0 0 10px;
   padding: 6px 9px;
@@ -1607,17 +1708,26 @@ body {
 .question-head {
   display: flex;
   align-items: center;
+  justify-content: space-between;
   gap: 6px;
   font-weight: 600;
   font-size: 13px;
   color: var(--accent);
   margin-bottom: 10px;
 }
+.question-head-title { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
 .question-item { margin-bottom: 12px; }
 .question-item:last-of-type { margin-bottom: 8px; }
 .question-label { font-size: 12px; color: var(--fg-dim); text-transform: uppercase; letter-spacing: 0.04em; }
 .question-text { margin: 2px 0 8px; }
 .question-options { display: flex; flex-direction: column; gap: 6px; }
+/* Manual H/V layout toggle (questions only). In `h` mode options flow as
+   wrapping chips instead of a vertical list. The custom-answer textarea is
+   ALWAYS full-width/vertical — the toggle only affects the option buttons. */
+.question-options.h { flex-direction: row; flex-wrap: wrap; align-items: stretch; }
+.question-options.h .question-opt { flex: 0 1 auto; max-width: 100%; }
+.question-options.h .question-opt-key { align-self: center; }
+.question-options.h .question-opt-body { flex: 1 1 auto; min-width: 0; }
 .question-opt {
   display: flex;
   flex-direction: row;
