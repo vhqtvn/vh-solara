@@ -153,7 +153,7 @@ export default function AgentStylesView() {
         </div>
         <div class="agents-actions">
           <button type="button" class="btn" onClick={reload} disabled={busy()} data-tip="Re-read the file from disk">
-            <Icon name="retry" size={14} /> Reload
+            <Icon name="retry" size={14} />Reload
           </button>
           <button type="button" class="btn btn-primary" onClick={preview} disabled={busy()}>
             Save…

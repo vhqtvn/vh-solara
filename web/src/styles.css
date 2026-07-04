@@ -4132,6 +4132,12 @@ div.katex-math { display: block; overflow-x: auto; margin: 0.7em 0; text-align: 
 .agents-sub { font-size: var(--text-sm); color: var(--fg-dim); margin: 0; max-width: 60ch; }
 .agents-sub code { font-family: var(--font-mono); font-size: 11px; background: var(--bg-2); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; }
 .agents-actions { display: flex; gap: 8px; flex: 0 0 auto; }
+.agents-actions .btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
 .agents-msg { margin: 12px 0 0; font-size: var(--text-sm); color: var(--fg-dim); }
 .agents-rows { margin-top: 16px; display: flex; flex-direction: column; gap: 2px; }
 .agents-row {
