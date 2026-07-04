@@ -52,7 +52,7 @@ func SpliceTopLevelKey(raw []byte, key string, value any) ([]byte, error) {
 		return []byte(fmt.Sprintf("{\n  %q: %s\n}\n", key, enc)), nil
 	}
 
-	if vs, ve, ok := findTopLevelValue(scan, open, key); ok {
+	if _, vs, ve, ok := findTopLevelValue(scan, open, key); ok {
 		out := make([]byte, 0, len(raw)+len(enc))
 		out = append(out, raw[:vs]...)
 		out = append(out, enc...)
@@ -67,6 +67,49 @@ func SpliceTopLevelKey(raw []byte, key string, value any) ([]byte, error) {
 	out = append(out, ins...)
 	out = append(out, raw[open+1:]...)
 	return out, nil
+}
+
+// RemoveTopLevelKey returns raw with the root object's `key` (and its value)
+// removed, preserving every comment, every other key, and the file's formatting
+// outside the removed span. Like SpliceTopLevelKey it is a surgical text edit,
+// NOT a re-marshal: only the target pair is cut out. A trailing-or-leading comma
+// adjacent to the removed pair is consumed so the result stays valid JSONC
+// (JSONC permits trailing commas, so leaving one would also be fine — consuming
+// it just keeps the file tidy). When the key is absent (or there is no root
+// object) raw is returned unchanged.
+func RemoveTopLevelKey(raw []byte, key string) []byte {
+	scan := blankComments(raw)
+	open := indexRootOpen(scan)
+	if open < 0 {
+		return raw
+	}
+	keyStart, _, valEnd, ok := findTopLevelValue(scan, open, key)
+	if !ok {
+		return raw
+	}
+	// Cut [keyStart, valEnd). Then consume ONE adjacent comma so the result is
+	// valid JSONC: prefer the comma trailing the value (skip whitespace forward);
+	// if none, fall back to the comma leading the key (skip whitespace backward).
+	start, end := keyStart, valEnd
+	j := valEnd
+	for j < len(scan) && isJSONSpace(scan[j]) {
+		j++
+	}
+	if j < len(scan) && scan[j] == ',' {
+		end = j + 1
+	} else {
+		i := keyStart
+		for i > 0 && isJSONSpace(scan[i-1]) {
+			i--
+		}
+		if i > 0 && scan[i-1] == ',' {
+			start = i - 1
+		}
+	}
+	out := make([]byte, 0, len(raw)-(end-start))
+	out = append(out, raw[:start]...)
+	out = append(out, raw[end:]...)
+	return out
 }
 
 // blankComments copies b, replacing JSONC comment bytes with spaces (newlines
@@ -150,10 +193,14 @@ func indexRootOpen(scan []byte) int {
 	return -1
 }
 
-// findTopLevelValue locates the value span [start,end) of the root object's
-// `key` (depth 1, immediately inside the root object opened at openIdx). Operates
-// on the blanked scan buffer; the returned offsets are valid in the source too.
-func findTopLevelValue(scan []byte, openIdx int, key string) (start, end int, found bool) {
+// findTopLevelValue locates the span of the root object's `key` (depth 1,
+// immediately inside the root object opened at openIdx) and returns three
+// offsets: keyStart (the key's opening `"`), valStart (the value's first byte),
+// and valEnd (just past the value's last byte). Operates on the blanked scan
+// buffer; the returned offsets are valid in the source too. SpliceTopLevelKey
+// uses valStart/valEnd to rewrite the value; RemoveTopLevelKey uses
+// keyStart/valEnd to cut the whole pair.
+func findTopLevelValue(scan []byte, openIdx int, key string) (keyStart, valStart, valEnd int, found bool) {
 	target := []byte(`"` + key + `"`)
 	depth := 0
 	inStr := false
@@ -174,6 +221,7 @@ func findTopLevelValue(scan []byte, openIdx int, key string) (start, end int, fo
 		switch c {
 		case '"':
 			if depth == 1 && bytes.HasPrefix(scan[i:], target) {
+				ks := i
 				j := i + len(target)
 				for j < n && isJSONSpace(scan[j]) {
 					j++
@@ -183,7 +231,7 @@ func findTopLevelValue(scan []byte, openIdx int, key string) (start, end int, fo
 					for j < n && isJSONSpace(scan[j]) {
 						j++
 					}
-					return j, valueEnd(scan, j), true
+					return ks, j, valueEnd(scan, j), true
 				}
 			}
 			inStr = true
@@ -198,7 +246,7 @@ func findTopLevelValue(scan []byte, openIdx int, key string) (start, end int, fo
 			i++
 		}
 	}
-	return 0, 0, false
+	return 0, 0, 0, false
 }
 
 // valueEnd returns the index just past the JSON value starting at s.

@@ -1,5 +1,5 @@
 // Per-project agent-styles editor. Reads/writes the display-only `agentStyles`
-// block of THIS project's .vh-solara/preferences.jsonc overlay (via
+// block of THIS project's .vh-solara/preferences.local.jsonc overlay (via
 // /vh/project-settings), which is gitignored so a personal UI pref never dirties
 // the committed project.jsonc. No JSON typing: a row per agent with a label, a
 // theme-color picker (swatches, never a raw color), a chip-style choice, and a
@@ -114,7 +114,7 @@ export default function AgentStylesView() {
         setMsg("No changes to save.");
         return;
       }
-      const html = await renderDiff(".vh-solara/preferences.jsonc", old, nw);
+      const html = await renderDiff(".vh-solara/preferences.local.jsonc", old, nw);
       setDiff({ html, payload: payload() });
     } finally {
       setBusy(false);
@@ -137,7 +137,7 @@ export default function AgentStylesView() {
       }
       setDiff(null);
       await reload();
-      setMsg("Saved to .vh-solara/preferences.jsonc.");
+        setMsg("Saved to .vh-solara/preferences.local.jsonc.");
     } finally {
       setBusy(false);
     }
@@ -149,7 +149,7 @@ export default function AgentStylesView() {
         <div>
           <h2 class="agents-title">Agent styles</h2>
           <p class="agents-sub">
-            Per-project — saved to <code>.vh-solara/preferences.jsonc</code> — local, gitignored. Give an agent a label and a
+            Per-project — saved to <code>.vh-solara/preferences.local.jsonc</code> — local, gitignored. Give an agent a label and a
             theme color so it stands apart in the picker and on its messages.
           </p>
         </div>
@@ -224,7 +224,7 @@ export default function AgentStylesView() {
         <div class="agents-modal-scrim" onClick={() => setDiff(null)}>
           <div class="agents-modal" onClick={(e) => e.stopPropagation()}>
             <h3>Confirm changes</h3>
-            <p class="agents-sub">This writes <code>.vh-solara/preferences.jsonc</code> (local, gitignored). Comments and the rest of the file are kept; the committed <code>project.jsonc</code> is never touched.</p>
+            <p class="agents-sub">This writes <code>.vh-solara/preferences.local.jsonc</code> (local, gitignored). Comments and the rest of the file are kept; the committed <code>project.jsonc</code> is never touched.</p>
             <div class="agents-diff vh-diff" innerHTML={diff()!.html} />
             <div class="agents-modal-actions">
               <button type="button" class="btn" onClick={() => setDiff(null)} disabled={busy()}>

@@ -46,8 +46,8 @@ func getProjectSettings(t *testing.T, ws *httptest.Server, dir string) map[strin
 }
 
 // TestProjectSettingsGET_OverlayAgentStylesWinsOverBase: when both project.jsonc
-// and preferences.jsonc declare agentStyles, the overlay FULLY REPLACES the base
-// (whole-map overwrite), while notes still comes from project.jsonc.
+// and preferences.local.jsonc declare agentStyles, the overlay FULLY REPLACES the
+// base (whole-map overwrite), while notes still comes from project.jsonc.
 func TestProjectSettingsGET_OverlayAgentStylesWinsOverBase(t *testing.T) {
 	ws := newWebServer(t)
 	defer ws.Close()
@@ -57,7 +57,7 @@ func TestProjectSettingsGET_OverlayAgentStylesWinsOverBase(t *testing.T) {
   "agentStyles": { "build": { "label": "BLD", "color": "warn" } }
 }`)
 	// Overlay declares a DIFFERENT agentStyles — it must fully replace the base.
-	if err := os.WriteFile(filepath.Join(root, ".vh-solara", "preferences.jsonc"),
+	if err := os.WriteFile(filepath.Join(root, ".vh-solara", "preferences.local.jsonc"),
 		[]byte(`{ "agentStyles": { "supervisor": { "label": "SUP", "color": "danger" } } }`), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -82,8 +82,9 @@ func TestProjectSettingsGET_OverlayAgentStylesWinsOverBase(t *testing.T) {
 	}
 }
 
-// TestProjectSettingsGET_OverlayAbsentReturnsBase: with no preferences.jsonc,
-// the base notes + agentStyles from project.jsonc stand on their own.
+// TestProjectSettingsGET_OverlayAbsentReturnsBase: with no
+// preferences.local.jsonc, the base notes + agentStyles from project.jsonc stand
+// on their own.
 func TestProjectSettingsGET_OverlayAbsentReturnsBase(t *testing.T) {
 	ws := newWebServer(t)
 	defer ws.Close()
@@ -92,7 +93,7 @@ func TestProjectSettingsGET_OverlayAbsentReturnsBase(t *testing.T) {
   "notes": true,
   "agentStyles": { "build": { "label": "BLD", "color": "warn" } }
 }`)
-	// No preferences.jsonc — the base must stand on its own.
+	// No preferences.local.jsonc — the base must stand on its own.
 
 	body := getProjectSettings(t, ws, root)
 	if v, ok := body["notes"].(bool); !ok || !v {
@@ -119,7 +120,7 @@ func TestProjectSettingsGET_OverlayPresentButNoAgentStyles_BaseWins(t *testing.T
   "agentStyles": { "build": { "label": "BLD", "color": "warn" } }
 }`)
 	// Overlay exists but declares NO agentStyles — base agentStyles must win.
-	if err := os.WriteFile(filepath.Join(root, ".vh-solara", "preferences.jsonc"),
+	if err := os.WriteFile(filepath.Join(root, ".vh-solara", "preferences.local.jsonc"),
 		[]byte(`{ /* nothing here yet */ }`), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -135,7 +136,7 @@ func TestProjectSettingsGET_OverlayPresentButNoAgentStyles_BaseWins(t *testing.T
 }
 
 // TestProjectSettingsPUT_WritesOnlyPreferences: the PUT must write ONLY the
-// gitignored preferences.jsonc overlay — project.jsonc must be byte-identical
+// gitignored preferences.local.jsonc overlay — project.jsonc must be byte-identical
 // before and after. This is the load-bearing invariant of the overlay split.
 func TestProjectSettingsPUT_WritesOnlyPreferences(t *testing.T) {
 	ws := newWebServer(t)
@@ -178,17 +179,17 @@ func TestProjectSettingsPUT_WritesOnlyPreferences(t *testing.T) {
 	if !bytes.Equal(before, after) {
 		t.Fatalf("project.jsonc was mutated by the PUT:\nbefore: %s\nafter: %s", before, after)
 	}
-	// (2) preferences.jsonc was created and carries the new agentStyles.
-	pref, err := os.ReadFile(filepath.Join(root, ".vh-solara", "preferences.jsonc"))
+	// (2) preferences.local.jsonc was created and carries the new agentStyles.
+	pref, err := os.ReadFile(filepath.Join(root, ".vh-solara", "preferences.local.jsonc"))
 	if err != nil {
-		t.Fatalf("preferences.jsonc not created: %v", err)
+		t.Fatalf("preferences.local.jsonc not created: %v", err)
 	}
 	styles, err := projectcfg.ParseAgentStyles(pref)
 	if err != nil {
-		t.Fatalf("preferences.jsonc unparseable: %v\n%s", err, pref)
+		t.Fatalf("preferences.local.jsonc unparseable: %v\n%s", err, pref)
 	}
 	if styles["supervisor"].Label != "SUP" {
-		t.Fatalf("agentStyles not written to preferences.jsonc: %+v\n%s", styles, pref)
+		t.Fatalf("agentStyles not written to preferences.local.jsonc: %+v\n%s", styles, pref)
 	}
 	// (3) project.jsonc still carries its ORIGINAL base agentStyles (unchanged).
 	baseStyles, err := projectcfg.ParseAgentStyles(before)
@@ -207,7 +208,7 @@ func TestProjectSettingsPUT_DryRunDoesNotWrite(t *testing.T) {
 	defer ws.Close()
 
 	root := writeProjectFile(t, "project.jsonc", `{ "agentStyles": { "build": { "label": "BLD" } } }`)
-	prefPath := filepath.Join(root, ".vh-solara", "preferences.jsonc")
+	prefPath := filepath.Join(root, ".vh-solara", "preferences.local.jsonc")
 
 	payload, _ := json.Marshal(map[string]any{
 		"agentStyles": map[string]any{"supervisor": map[string]any{"label": "SUP"}},
@@ -240,6 +241,41 @@ func TestProjectSettingsPUT_DryRunDoesNotWrite(t *testing.T) {
 	}
 	// Neither file should have been created/modified.
 	if _, err := os.Stat(prefPath); !os.IsNotExist(err) {
-		t.Fatalf("dryRun created preferences.jsonc: %v", err)
+		t.Fatalf("dryRun created preferences.local.jsonc: %v", err)
+	}
+}
+
+// TestProjectSettingsGET_PostMigrationBaseHasNoAgentStyles: after the one-time
+// migration, project.jsonc carries NO agentStyles (it was moved out) and the
+// overlay is the SOLE source. GET must still surface the overlay's agentStyles —
+// the base-absent path is the normal post-migration steady state, not a degenerate
+// case. notes still comes from project.jsonc (it is never migrated).
+func TestProjectSettingsGET_PostMigrationBaseHasNoAgentStyles(t *testing.T) {
+	ws := newWebServer(t)
+	defer ws.Close()
+
+	// Base declares notes but NO agentStyles (the post-migration steady state).
+	root := writeProjectFile(t, "project.jsonc", `{
+  "notes": false
+}`)
+	// Overlay carries the migrated agentStyles — the sole source now.
+	if err := os.WriteFile(filepath.Join(root, ".vh-solara", "preferences.local.jsonc"),
+		[]byte(`{ "agentStyles": { "supervisor": { "label": "SUP", "color": "danger" } } }`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	body := getProjectSettings(t, ws, root)
+	// notes still surfaces from the base.
+	if v, ok := body["notes"].(bool); !ok || v {
+		t.Fatalf("notes not surfaced from base: %+v", body)
+	}
+	// agentStyles comes from the overlay (base has none).
+	styles, ok := body["agentStyles"].(map[string]any)
+	if !ok {
+		t.Fatalf("agentStyles missing: %+v", body)
+	}
+	sup, ok := styles["supervisor"].(map[string]any)
+	if !ok || sup["label"] != "SUP" {
+		t.Fatalf("overlay agentStyles not surfaced when base has no agentStyles: %+v", styles)
 	}
 }

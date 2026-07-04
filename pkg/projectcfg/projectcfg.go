@@ -31,9 +31,11 @@ const ConfigName = ".vh-solara/project.jsonc"
 // path (relative to the project root). It mirrors ConfigName's location but is
 // NOT committed: it holds display-only overrides (today: agentStyles) that an
 // operator personalizes via the UI, so saving them never dirties the checked-in
-// project.jsonc. It is covered by the repo's `.vh-solara/*` ignore rule (no
-// exception entry, unlike project.jsonc).
-const PreferencesName = ".vh-solara/preferences.jsonc"
+// project.jsonc. The `.local` suffix matches the standard local-ignore pattern
+// (covered by both the repo's `.vh-solara/*` rule and the auto-created
+// `.vh-solara/.gitignore`'s `*.local` / `*.local.jsonc` globs), so it is ignored
+// even outside a `.vh-solara/*`-ignoring checkout.
+const PreferencesName = ".vh-solara/preferences.local.jsonc"
 
 // Restart policies.
 const (

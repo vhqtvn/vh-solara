@@ -57,10 +57,13 @@ manual view API: `unix:<path>`, `http(s)://host[:port]`, `tcp:host:port`.
 A config is optional — no file means nothing is managed for the project.
 
 > **What to commit:** `project.jsonc` is the declarative surface — processes,
-> views, the `notes` flag, and (optionally) a team-default `agentStyles`. The
-> display-only `agentStyles` you set via the editor are saved to a **separate,
-> gitignored** `.vh-solara/preferences.jsonc` instead, so personalizing your UI
-> never dirties `git status`. See [Agent styles](#agent-styles-agentstyles).
+> views, and the `notes` flag. The display-only `agentStyles` you set via the
+> editor are saved to a **separate, gitignored** `.vh-solara/preferences.local.jsonc`
+> instead, so personalizing your UI never dirties `git status`. On project open,
+> any `agentStyles` left in `project.jsonc` is **auto-migrated** to that local
+> overlay (one-time, idempotent), and a `.vh-solara/.gitignore` is auto-created to
+> keep the overlay out of `git status`. See
+> [Agent styles](#agent-styles-agentstyles).
 
 ### UI settings (`notes`)
 
@@ -102,28 +105,36 @@ everyday build/coordination agents. Map an agent name to a display treatment:
 Like `notes`, this is display-only — **not** part of the trust hash, and it's
 sanitized client-side (no arbitrary color or CSS reaches the page).
 
-#### Where it's saved — `project.jsonc` vs `preferences.jsonc`
+#### Where it's saved — `project.jsonc` vs `preferences.local.jsonc`
 
 `agentStyles` is a **personal UI preference**, not a repo declaration. The
 in-product editor (Settings → Agent styles) writes it to a **gitignored local
-overlay** at `.vh-solara/preferences.jsonc`, so styling your agents never dirties
-`git status` and never conflicts on a `git pull`. The editor and the agent chips
-read a merge of two files:
+overlay** at `.vh-solara/preferences.local.jsonc`, so styling your agents never
+dirties `git status` and never conflicts on a `git pull`. The editor and the
+agent chips read a merge of two files:
 
-- **`.vh-solara/preferences.jsonc`** (local, **gitignored**) — where the editor
-  saves. If it declares `agentStyles`, that map **fully replaces** the base (a
-  whole-map overwrite, not a per-agent merge). Absent, or present without the
-  key → the base is used as-is. Nothing else lives here today.
-- **`.vh-solara/project.jsonc`** (committed) — an **optional team default**. A
-  repo may commit a starter `agentStyles` so everyone gets sensible chips out of
-  the box; each operator's local overlay then overrides it wholesale. **Nothing
-  ever writes `agentStyles` back into `project.jsonc`** — to change the team
-  default, edit it by hand and commit.
+- **`.vh-solara/preferences.local.jsonc`** (local, **gitignored**) — where the
+  editor saves. If it declares `agentStyles`, that map **fully replaces** the
+  base (a whole-map overwrite, not a per-agent merge). Absent, or present without
+  the key → the base is used as-is. Nothing else lives here today.
+- **`.vh-solara/project.jsonc`** (committed) — **declarative-only** (processes,
+  views, `notes`). It no longer holds `agentStyles` in steady state: on project
+  open, any `agentStyles` found here is **auto-migrated** into the local overlay
+  (comment-preserving removal from `project.jsonc`, value written to
+  `preferences.local.jsonc`), so a repo may still ship a starter map that each
+  operator's first open adopts as their personal default — but it then lives in
+  their ignored overlay, never written back into `project.jsonc`.
+
+The first open of a project also auto-creates a `.vh-solara/.gitignore` (with
+`*.local` / `*.local.jsonc`) if one is not already present, so the local overlay
+stays out of `git status` without each operator having to add it by hand. Both
+the migration and the `.gitignore` step are idempotent — re-running them is a
+no-op once the steady state is reached.
 
 `notes` stays a `project.jsonc` declaration: it has no UI writer, so set it by
 hand (see above). In practice, then, `project.jsonc` is **declarative-only**
-(processes, views, `notes`, and an optional team-default `agentStyles`), while
-each operator's personal `agentStyles` lives in the ignored overlay.
+(processes, views, `notes`), while each operator's personal `agentStyles` lives
+in the ignored overlay.
 
 ## Trust
 

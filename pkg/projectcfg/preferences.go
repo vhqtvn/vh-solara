@@ -8,8 +8,9 @@ import (
 // ResolvePreferencesPath returns the personal-preferences overlay path for a
 // project root, mirroring ResolvePath: the overlay lives in the SAME directory
 // as the resolved config (so `--project-config` relocates both together) and is
-// named preferences.jsonc. Used by the editor write-back (PUT) and the live
-// watch (SSE), which must know the target even when the file does not yet exist.
+// named preferences.local.jsonc. Used by the editor write-back (PUT), the live
+// watch (SSE), and the one-time migration (EnsureLocalSetup) — all of which must
+// know the target even when the file does not yet exist.
 func ResolvePreferencesPath(root, override string) (string, error) {
 	cfgPath, err := ResolvePath(root, override)
 	if err != nil {

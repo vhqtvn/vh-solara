@@ -113,3 +113,83 @@ func TestSpliceHandlesBracesInStringsAndComments(t *testing.T) {
 		t.Fatalf("sibling after a tricky value was dropped:\n%s", out)
 	}
 }
+
+// parseFull round-trips the edited output through the JSONC loader so a passing
+// test proves the result stays loadable as a full Config (not just agentStyles).
+func parseFull(t *testing.T, b []byte) *Config {
+	t.Helper()
+	var c Config
+	if err := json.Unmarshal(stripJSONC(b), &c); err != nil {
+		t.Fatalf("edited output does not parse: %v\n---\n%s", err, b)
+	}
+	return &c
+}
+
+func TestRemoveExistingKeyPreservesSiblingsAndComments(t *testing.T) {
+	src := []byte(`{
+  // companion processes (trust-gated — must survive the edit)
+  "processes": [{ "id": "p", "command": "echo hi" }],
+  "agentStyles": {
+    "build": { "color": "muted" } // old value, will be removed
+  },
+  "notes": true
+}`)
+	out := RemoveTopLevelKey(src, "agentStyles")
+	c := parseFull(t, out)
+	if c.AgentStyles != nil && len(c.AgentStyles) > 0 {
+		t.Fatalf("agentStyles not removed: %+v", c.AgentStyles)
+	}
+	str := string(out)
+	if !strings.Contains(str, "trust-gated — must survive") {
+		t.Fatalf("a comment outside the removed value was lost:\n%s", str)
+	}
+	if !strings.Contains(str, `"command": "echo hi"`) || !strings.Contains(str, `"notes": true`) {
+		t.Fatalf("a sibling key was disturbed:\n%s", str)
+	}
+}
+
+func TestRemoveAbsentKeyIsNoop(t *testing.T) {
+	src := []byte(`{
+  // top comment
+  "processes": [{ "id": "p", "command": "echo hi" }]
+}`)
+	out := RemoveTopLevelKey(src, "agentStyles")
+	if string(out) != string(src) {
+		t.Fatalf("removing an absent key changed the file:\nwant: %s\ngot:  %s", src, out)
+	}
+}
+
+func TestRemoveOnlyKeyLeavesValidEmptyObject(t *testing.T) {
+	for _, src := range [][]byte{
+		[]byte(`{ "agentStyles": { "build": { "label": "B" } } }`),
+		// Trailing comma after the only key must also collapse cleanly.
+		[]byte(`{ "agentStyles": { "build": { "label": "B" } }, }`),
+	} {
+		out := RemoveTopLevelKey(src, "agentStyles")
+		c := parseFull(t, out)
+		if c.AgentStyles != nil && len(c.AgentStyles) > 0 {
+			t.Fatalf("agentStyles not removed: %+v\ncase: %s", c.AgentStyles, src)
+		}
+	}
+}
+
+func TestRemoveHandlesBracesInStringsAndComments(t *testing.T) {
+	// A `}` inside a string and inside a comment must not be mistaken for the
+	// end of the agentStyles object — the cut must stop at the real value end,
+	// leaving the sibling intact.
+	src := []byte(`{
+  "agentStyles": { "a": { "label": "}" } /* trailing } brace */ },
+  "notes": false
+}`)
+	out := RemoveTopLevelKey(src, "agentStyles")
+	c := parseFull(t, out)
+	if c.AgentStyles != nil && len(c.AgentStyles) > 0 {
+		t.Fatalf("agentStyles not removed (brace/string/comment miscount): %+v", c.AgentStyles)
+	}
+	if c.Notes == nil || *c.Notes != false {
+		t.Fatalf("sibling after a tricky value was dropped or disturbed: %+v", c.Notes)
+	}
+	if !strings.Contains(string(out), `"notes": false`) {
+		t.Fatalf("sibling text not preserved:\n%s", out)
+	}
+}

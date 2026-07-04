@@ -64,7 +64,8 @@ pkg/web/dist/*
 # meant to be committed so the repo can declare its companion processes/views.
 .vh-solara/*
 !.vh-solara/project.jsonc
-# .vh-solara/preferences.jsonc is intentionally ignored local prefs (UI
+!.vh-solara/.gitignore
+# .vh-solara/preferences.local.jsonc is intentionally ignored local prefs (UI
 # agentStyles overlay saved by the editor); covered by .vh-solara/* above.
 # vh-agent-harness operator-local state (per-developer model overrides,
 # coordinator runs, ssh, cleared-assumptions). NOT committed. The committed

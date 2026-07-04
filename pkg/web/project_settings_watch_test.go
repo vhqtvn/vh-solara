@@ -54,7 +54,7 @@ func TestProjectSettingsWatchEmitsOnChange(t *testing.T) {
 	waitForLine(t, lines, "data: changed", 5*time.Second)
 }
 
-// The watch must ALSO fire when the gitignored preferences.jsonc overlay
+// The watch must ALSO fire when the gitignored preferences.local.jsonc overlay
 // appears or changes — the editor reads a merge of both files, so an external
 // edit to either must nudge a reload. A missing overlay is the normal starting
 // state and must not fire on its own.
@@ -91,9 +91,10 @@ func TestProjectSettingsWatchEmitsOnPreferencesChange(t *testing.T) {
 	// Drain the initial ": ok" comment.
 	waitForLine(t, lines, "ok", 2*time.Second)
 
-	// Create the overlay (preferences.jsonc) — the poller watches both files, so
-	// creating the overlay alone must fire even though project.jsonc is absent.
-	if err := os.WriteFile(filepath.Join(cfgDir, "preferences.jsonc"), []byte(`{"agentStyles":{"y":{"label":"Y"}}}`), 0o644); err != nil {
+	// Create the overlay (preferences.local.jsonc) — the poller watches both
+	// files, so creating the overlay alone must fire even though project.jsonc
+	// is absent.
+	if err := os.WriteFile(filepath.Join(cfgDir, "preferences.local.jsonc"), []byte(`{"agentStyles":{"y":{"label":"Y"}}}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	waitForLine(t, lines, "data: changed", 5*time.Second)
