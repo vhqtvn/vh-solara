@@ -517,23 +517,28 @@ func (s *Server) handleManaged(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// projectSettingsMu serializes the read-modify-write of project.jsonc so two
-// concurrent saves can't interleave and corrupt the file.
+// projectSettingsMu serializes the read-modify-write of preferences.jsonc so two
+// concurrent saves can't interleave and corrupt the overlay file.
 var projectSettingsMu sync.Mutex
 
-// handleProjectSettings serves per-project UI settings read from (GET) and the
-// display-only `agentStyles` written back to (PUT) .vh-solara/project.jsonc.
+// handleProjectSettings serves per-project UI settings. GET merges the checked-in
+// project.jsonc (base: notes + a team-default agentStyles) with the gitignored
+// preferences.jsonc overlay (personal agentStyles that fully replace the base);
+// PUT writes the display-only `agentStyles` ONLY to preferences.jsonc — it never
+// touches project.jsonc, so a personal UI pref never dirties the committed file.
 //
 // GET returns `notes` (tri-state; omitted when not declared, so the client falls
-// back to its global pref) and `agentStyles` (raw declared treatments — the
-// client sanitizes color/style against fixed enums). Tolerant: any read/parse
-// miss returns an empty object.
+// back to its global pref — always from project.jsonc) and `agentStyles` (raw
+// declared treatments — the client sanitizes color/style against fixed enums;
+// the overlay wins over the base via whole-map overwrite). Tolerant: any
+// read/parse miss returns an empty object.
 //
-// PUT { agentStyles, dryRun } edits ONLY the agentStyles key via a
-// comment-preserving splice that never touches the trust-gated processes/views
-// (and leaves the trust hash unchanged, so no re-gate). dryRun returns the old
-// and new file text for a confirm-diff; otherwise the new text is written
-// (creating .vh-solara/ as needed).
+// PUT { agentStyles, dryRun } edits ONLY the agentStyles key of preferences.jsonc
+// via a comment-preserving splice (creating the overlay fresh when absent). It
+// never touches the trust-gated processes/views of project.jsonc (and leaves the
+// trust hash unchanged, so no re-gate). dryRun returns the old and new overlay
+// text for a confirm-diff; otherwise the new text is written (creating
+// .vh-solara/ as needed).
 func (s *Server) handleProjectSettings(w http.ResponseWriter, r *http.Request) {
 	override := ""
 	if s.managed != nil {
@@ -547,6 +552,9 @@ func (s *Server) handleProjectSettings(w http.ResponseWriter, r *http.Request) {
 			writeJSONResp(w, out)
 			return
 		}
+		// Base: notes + agentStyles from the checked-in project.jsonc (a team
+		// default the operator may or may not have committed). notes always comes
+		// from here — it has no UI writer and is a repo declaration.
 		lr, err := projectcfg.Load(root, override)
 		if err == nil && lr.Config != nil {
 			if lr.Config.Notes != nil {
@@ -554,6 +562,18 @@ func (s *Server) handleProjectSettings(w http.ResponseWriter, r *http.Request) {
 			}
 			if len(lr.Config.AgentStyles) > 0 {
 				out["agentStyles"] = lr.Config.AgentStyles
+			}
+		}
+		// Overlay: the gitignored preferences.jsonc (personal/local). If it
+		// declares agentStyles it FULLY REPLACES the base map (whole-map
+		// overwrite, not a per-key merge), so a local pref always wins. A missing
+		// overlay file is the normal case and is tolerated silently — the base
+		// stands on its own.
+		if prefPath, perr := projectcfg.ResolvePreferencesPath(root, override); perr == nil {
+			if raw, rerr := os.ReadFile(prefPath); rerr == nil {
+				if styles, parseErr := projectcfg.ParseAgentStyles(raw); parseErr == nil && styles != nil {
+					out["agentStyles"] = styles
+				}
 			}
 		}
 		writeJSONResp(w, out)
@@ -573,7 +593,11 @@ func (s *Server) handleProjectSettings(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "no project root", http.StatusBadRequest)
 			return
 		}
-		path, err := projectcfg.ResolvePath(root, override)
+		// CRITICAL: the PUT writes ONLY the gitignored preferences.jsonc overlay.
+		// It never reads, splices, or writes project.jsonc — a personal UI pref
+		// must not mutate the checked-in declarative file. SpliceTopLevelKey
+		// already creates a fresh document when the overlay is absent.
+		path, err := projectcfg.ResolvePreferencesPath(root, override)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -611,11 +635,14 @@ func (s *Server) handleProjectSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleProjectSettingsWatch is an SSE stream that emits `data: changed` whenever
-// the project's .vh-solara/project.jsonc is created, modified, or removed — so
-// the editor and the agent-style chips reflect an external edit (a git pull,
-// another tool, the supervisor) without a manual reload. Dependency-free: it
-// polls the file's existence/mtime/size on a short ticker (one tiny stat per
-// project per ~1.2s), which is plenty responsive for a rarely-changing config.
+// EITHER of the project's settings files — the checked-in .vh-solara/project.jsonc
+// (team default) or the gitignored .vh-solara/preferences.jsonc (personal overlay)
+// — is created, modified, or removed, so the editor and the agent-style chips
+// reflect an external edit (a git pull, another tool, the supervisor) without a
+// manual reload. Dependency-free: it polls both files' existence/mtime/size on a
+// short ticker (one tiny stat per file per project per ~1.2s), which is plenty
+// responsive for rarely-changing config. A missing preferences.jsonc is a stable
+// zero-state and never fires on its own.
 func (s *Server) handleProjectSettingsWatch(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -631,7 +658,12 @@ func (s *Server) handleProjectSettingsWatch(w http.ResponseWriter, r *http.Reque
 		http.Error(w, "no project root", http.StatusBadRequest)
 		return
 	}
-	path, err := projectcfg.ResolvePath(root, override)
+	cfgPath, err := projectcfg.ResolvePath(root, override)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	prefPath, err := projectcfg.ResolvePreferencesPath(root, override)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -645,17 +677,26 @@ func (s *Server) handleProjectSettingsWatch(w http.ResponseWriter, r *http.Reque
 	fmt.Fprint(w, ": ok\n\n")
 	flusher.Flush()
 
-	type snap struct {
+	// fileSnap captures the existence/mtime/size of ONE file. A missing file is
+	// a stable zero-state (a never-created preferences.jsonc must not fire), so
+	// the watch tolerates the overlay's absence without error.
+	type fileSnap struct {
 		exists bool
 		mod    time.Time
 		size   int64
 	}
-	read := func() snap {
-		fi, err := os.Stat(path)
+	statOne := func(p string) fileSnap {
+		fi, err := os.Stat(p)
 		if err != nil {
-			return snap{}
+			return fileSnap{}
 		}
-		return snap{true, fi.ModTime(), fi.Size()}
+		return fileSnap{true, fi.ModTime(), fi.Size()}
+	}
+	// Aggregate both files: any change in EITHER (create/modify/remove) flips the
+	// combined snapshot, so the editor reflects an external edit to the team
+	// default (project.jsonc) or the personal overlay (preferences.jsonc).
+	read := func() [2]fileSnap {
+		return [2]fileSnap{statOne(cfgPath), statOne(prefPath)}
 	}
 	last := read()
 

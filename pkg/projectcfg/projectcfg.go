@@ -27,6 +27,14 @@ import (
 // project root).
 const ConfigName = ".vh-solara/project.jsonc"
 
+// PreferencesName is the conventional, gitignored personal-preferences overlay
+// path (relative to the project root). It mirrors ConfigName's location but is
+// NOT committed: it holds display-only overrides (today: agentStyles) that an
+// operator personalizes via the UI, so saving them never dirties the checked-in
+// project.jsonc. It is covered by the repo's `.vh-solara/*` ignore rule (no
+// exception entry, unlike project.jsonc).
+const PreferencesName = ".vh-solara/preferences.jsonc"
+
 // Restart policies.
 const (
 	RestartOnFailure = "on-failure" // default: restart on unexpected exit
