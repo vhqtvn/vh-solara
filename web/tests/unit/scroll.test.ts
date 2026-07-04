@@ -4,6 +4,7 @@ import type {
   clearReadAnchor as ClearReadAnchor,
   clearReadAnchors as ClearReadAnchors,
   getReadAnchor as GetReadAnchor,
+  orderAhead as OrderAhead,
   setReadAnchor as SetReadAnchor,
 } from "../../src/lib/scroll";
 
@@ -22,9 +23,9 @@ const mem: Record<string, string> = {};
   },
 };
 
-// `bottommostRead` is a pure function (no module state), so it can be imported
-// statically and exercised directly.
-import { bottommostRead } from "../../src/lib/scroll";
+// `bottommostRead` + `orderAhead` are pure functions (no module state), so they
+// can be imported statically and exercised directly.
+import { bottommostRead, orderAhead } from "../../src/lib/scroll";
 
 // Re-import the store (which holds module-level cache) fresh per test.
 async function store() {
@@ -158,5 +159,42 @@ describe("bottommostRead (pure geometry helper)", () => {
 
   it("returns undefined for an empty list", () => {
     expect(bottommostRead([])).toBeUndefined();
+  });
+});
+
+describe("orderAhead (monotonic read-cursor guard)", () => {
+  // The message-order array (newest-known session message order). orderAhead is
+  // pure: order is passed explicitly, no closure captures. Modeled on the
+  // bottommostRead tests above. Covers the 5 cases pinned in P1-WEB-002.
+  const order = ["m1", "m2", "m3", "m4"];
+
+  it("treats a missing stored anchor as behind (candidate is ahead → true)", () => {
+    // First write always lands: nothing stored means the candidate establishes
+    // the cursor regardless of its position in order.
+    expect(orderAhead("m3", undefined, order)).toBe(true);
+  });
+
+  it("is not ahead when candidate equals stored (→ false)", () => {
+    // Equal is not forward progress; the guard no-ops so storage isn't rewritten.
+    expect(orderAhead("m2", "m2", order)).toBe(false);
+  });
+
+  it("is ahead when the candidate is newer than stored (→ true)", () => {
+    expect(orderAhead("m4", "m1", order)).toBe(true);
+  });
+
+  it("is not ahead when the candidate is older than stored (→ false)", () => {
+    // Monotonic: scrolling up to re-read never lowers the stored anchor.
+    expect(orderAhead("m1", "m3", order)).toBe(false);
+  });
+
+  it("returns true when both candidate and stored are absent", () => {
+    // At the call site cand is always a non-empty string (flushReadCursor guards
+    // `if (!cand) return;` before calling), so "both absent" is a pure-helper
+    // edge that never fires at runtime. The former closure's first short-circuit
+    // (`if (!stored) return true;`) resolves it to true before cand is examined;
+    // this pins that faithful behavior (no new semantics invented). An empty
+    // cand string represents "absent" the same way setReadAnchor treats falsy.
+    expect(orderAhead("", undefined, order)).toBe(true);
   });
 });

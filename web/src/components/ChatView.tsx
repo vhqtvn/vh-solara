@@ -1,7 +1,13 @@
 import { createEffect, createMemo, createSignal, For, Match, on, onCleanup, onMount, Show, Switch, untrack } from "solid-js";
 import { Portal } from "solid-js/web";
 import { ackSession, createSession, currentVerb, isSending, markSessionIdle, openSession, rootOf, sessionTodoCounts, sessionTodos, sessionWorking, setSelectedId, setSending, state } from "../sync";
-import { bottommostRead, clearReadAnchor, getReadAnchor, setReadAnchor } from "../lib/scroll";
+import {
+  bottommostRead,
+  clearReadAnchor,
+  getReadAnchor,
+  orderAhead,
+  setReadAnchor,
+} from "../lib/scroll";
 import { highlightInput } from "../lib/composerHighlight";
 import { chooseVariant, findModel, loadModels, models, selectionFor } from "../models";
 import { loadVersioned, saveVersioned } from "../lib/store";
@@ -579,7 +585,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     }
     const cand = bottommostReadFromDom();
     if (!cand) return;
-    if (isCursorAhead(cand, getReadAnchor(sid))) setReadAnchor(sid, cand);
+    if (orderAhead(cand, getReadAnchor(sid), sm()?.order ?? [])) setReadAnchor(sid, cand);
   }
   // Read-through cursor from live geometry: the bottommost message whose top has
   // scrolled to/past the container top. Stops measuring at the first row below
@@ -613,13 +619,10 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   }
   // Is `cand` ahead of (or equal-and-newer than) the stored anchor in message
   // order? Drives the monotonic guard. A missing/stale stored anchor is treated
-  // as behind, so the first write always lands.
-  function isCursorAhead(cand: string, stored: string | undefined): boolean {
-    if (!stored) return true;
-    if (cand === stored) return false;
-    const order = sm()?.order ?? [];
-    return order.indexOf(cand) > order.indexOf(stored);
-  }
+  // as behind, so the first write always lands. Extracted as the pure
+  // `orderAhead` helper in lib/scroll (the `order` array is threaded explicitly
+  // at the call site above so the helper has no closure captures and is unit-
+  // tested in tests/unit/scroll.test.ts).
   function maybeRestore() {
     if (restoredFor === props.sessionId || !scrollEl) return false;
     const anchor = props.draft ? undefined : getReadAnchor(props.sessionId);
@@ -705,7 +708,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // by the time this effect runs the memo/DOM have already flipped to the entering
   // session. The gap: a scroll made <400ms before switching is not persisted.
   //   - If the leaving session's anchor was already set, this is benign: the
-  //     monotonic guard (isCursorAhead) keeps the last-flushed anchor, so
+  //     monotonic guard (orderAhead) keeps the last-flushed anchor, so
   //     reopening lands a little ahead of where the user was.
   //   - If the leaving session was at the BOTTOM (anchor cleared / caught-up) and
   //     the user scrolled up to read older messages, the cancelled flush leaves

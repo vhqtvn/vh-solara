@@ -83,3 +83,23 @@ export function bottommostRead(rows: { id: string; top: number }[]): string | un
   }
   return found;
 }
+
+// Is `cand` ahead of (newer than) the stored read anchor in message order? Drives
+// the monotonic read-cursor guard: the stored anchor only ever advances forward,
+// never backward (scrolling up to re-read never lowers it). A missing/stale
+// stored anchor is treated as behind, so the first write always lands.
+//
+// Pure: no signals, no DOM, no closure captures. The message `order` array
+// (newest-known message order from the session store) is passed explicitly so
+// this is unit-testable in isolation. Extracted verbatim from the former private
+// `isCursorAhead` closure in ChatView — same short-circuit order, same return
+// values, only the `order` capture became a parameter.
+export function orderAhead(
+  cand: string,
+  stored: string | undefined,
+  order: string[],
+): boolean {
+  if (!stored) return true;
+  if (cand === stored) return false;
+  return order.indexOf(cand) > order.indexOf(stored);
+}
