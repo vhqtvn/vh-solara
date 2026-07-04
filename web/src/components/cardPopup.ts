@@ -22,10 +22,13 @@ import { createEffect, createSignal, onCleanup, type Accessor } from "solid-js";
 // the inline `body()` stays normally tabbable (the listener is torn down with
 // onCleanup the moment `open()` flips false and the <Show> unmounts the Portal).
 
-// Standard focusable approximation. `:not([tabindex="-1"])` excludes the dialog
-// container itself, which carries tabindex="-1" as the ESC/focus target and must
-// NOT be part of the Tab cycle.
-const FOCUSABLE =
+// Standard focusable approximation: matches standard focusables (a[href], button,
+// textarea, input, select — all `:not([disabled])`) plus explicitly-tabbable
+// elements. The `:not([tabindex="-1"])` clause excludes ANY element marked
+// tabindex="-1", not just the overlay container. The container itself carries
+// tabindex="-1" as the ESC/focus target (focused explicitly via popRef.focus())
+// and so stays out of the Tab cycle, along with any other tabindex="-1" element.
+export const FOCUSABLE =
   'a[href],button:not([disabled]),textarea:not([disabled]),input:not([disabled]),select:not([disabled]),[tabindex]:not([tabindex="-1"])';
 
 export interface CardPopup {

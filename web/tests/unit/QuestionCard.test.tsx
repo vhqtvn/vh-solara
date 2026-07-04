@@ -18,6 +18,7 @@ vi.mock("../../src/sync", () => ({
 }));
 
 import QuestionCard from "../../src/components/QuestionCard";
+import { FOCUSABLE } from "../../src/components/cardPopup";
 import type { Question } from "../../src/types";
 
 const question: Question = {
@@ -143,9 +144,7 @@ describe("QuestionCard — in-stream card + shared-state popup", () => {
   // the action buttons, and the head tool buttons.
   const tabFocusables = (root: ParentNode): HTMLElement[] =>
     Array.from(
-      root.querySelectorAll<HTMLElement>(
-        'button:not([disabled]),textarea:not([disabled]),input:not([disabled]),[tabindex]:not([tabindex="-1"])',
-      ),
+      root.querySelectorAll<HTMLElement>(FOCUSABLE),
     );
 
   it("Tab from the last focusable wraps to the first inside the overlay", async () => {

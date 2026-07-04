@@ -79,7 +79,7 @@ describe("PermissionCard — inline fast actions + shared-state popup", () => {
     expect(respondPermission.mock.calls[0]).toEqual([sessionID, "p1", "reject"]);
   });
 
-  it("popup mirrors the card: an action clicked INSIDE the popup fires respondPermission and closes", async () => {
+  it("popup mirrors + shared action: Reject inside popup fires respondPermission (popup stays mounted in mocked context; closes in production via store unmount)", async () => {
     const { container } = render(() => (
       <PermissionCard sessionID={sessionID} perm={perm} />
     ));
