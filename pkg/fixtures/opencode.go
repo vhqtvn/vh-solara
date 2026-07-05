@@ -24,11 +24,12 @@ type FakeOpenCode struct {
 	subs        map[int]chan string
 	nextSub     int
 	counter     int
-	pendingQ    map[string]string         // questionID -> sessionID
-	pendingQReq map[string]map[string]any // questionID -> full question request
-	pendingP    map[string]map[string]any // permissionID -> full permission request
-	archived    map[string]bool           // sessionID -> archived (native time.archived)
-	busy        map[string]string         // sessionID -> status type (busy/retry); mirrors /session/status
+	pendingQ    map[string]string             // questionID -> sessionID
+	pendingQReq map[string]map[string]any     // questionID -> full question request
+	pendingP    map[string]map[string]any     // permissionID -> full permission request
+	archived    map[string]bool               // sessionID -> archived (native time.archived)
+	busy        map[string]string             // sessionID -> status type (busy/retry); mirrors /session/status
+	baseline    map[string][]messageWithParts // sessionID -> seeded message list snapshot for /fixture/reset
 }
 
 type messageWithParts struct {
@@ -194,6 +195,13 @@ func New() *FakeOpenCode {
 			"directory": "/work/bench", "time": map[string]any{"created": now - 8000, "updated": now},
 		})
 		f.messages["bench"] = buildBenchMessages(n, now)
+	}
+	// Snapshot the seeded messages so /fixture/reset can restore the baseline
+	// transcript between serial e2e tests (stall/prompt turns otherwise accumulate
+	// across iterations and skew the follow-to-tail geometry the suite asserts).
+	f.baseline = map[string][]messageWithParts{}
+	for sid, msgs := range f.messages {
+		f.baseline[sid] = append([]messageWithParts(nil), msgs...)
 	}
 	return f
 }
@@ -373,6 +381,7 @@ func (f *FakeOpenCode) Handler() http.Handler {
 				"patch": "@@ -1,3 +1,4 @@\n func Parse(s string) (*AST, error) {\n-\treturn parse(s)\n+\ttok := tokenize(s)\n+\treturn parse(tok)\n }"},
 		})
 	})
+	mux.HandleFunc("/fixture/reset", f.handleFixtureReset)
 	mux.HandleFunc("/question/", f.handleQuestion)
 	mux.HandleFunc("/question", func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
@@ -891,6 +900,31 @@ func (f *FakeOpenCode) streamAssistant(sessionID, asstID, apID string, chunks []
 	f.emit("message.part.updated", map[string]any{"part": finalPart})
 	f.emit("message.updated", map[string]any{"info": asstInfo})
 	f.emit("session.idle", map[string]any{"sessionID": sessionID})
+}
+
+// handleFixtureReset restores a session's message list to its seeded baseline,
+// clears any mirrored busy status, and emits session.idle. It lets a serial
+// Playwright suite absorb leaked [[stall]] busy goroutines and transcript
+// accumulation from prior tests so each iteration starts from a clean baseline.
+// Test-only infrastructure — never exercised by the shipped binary.
+func (f *FakeOpenCode) handleFixtureReset(w http.ResponseWriter, r *http.Request) {
+	session := r.URL.Query().Get("session")
+	if session == "" {
+		http.Error(w, "missing session", http.StatusBadRequest)
+		return
+	}
+	f.mu.Lock()
+	if base, ok := f.baseline[session]; ok {
+		f.messages[session] = append([]messageWithParts(nil), base...)
+	} else {
+		delete(f.messages, session)
+	}
+	delete(f.busy, session)
+	f.mu.Unlock()
+	// Notify any connected client the session is idle; a fresh page.goto re-reads
+	// the cleared status regardless, so this is belt-and-suspenders.
+	f.emit("session.idle", map[string]any{"sessionID": session})
+	writeJSON(w, map[string]any{"reset": session})
 }
 
 func (f *FakeOpenCode) appendMessage(sessionID string, m messageWithParts) {
