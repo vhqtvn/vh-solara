@@ -96,6 +96,51 @@ async function waitForTree(page: Page) {
   await expect(page.locator(".tree-node").first()).toBeVisible({ timeout: 10000 });
 }
 
+// P1-WEB-004: in-app session switch via popstate. The session-switch effect
+// (where the arm-time stash flush lives) fires on SPA navigation — props.sessionId
+// changes while ChatView stays MOUNTED. page.goto would UNMOUNT ChatView and lose
+// the in-memory armedCand stash, bypassing the fix entirely, so the tests must
+// drive the same popstate path the app's own history navigation uses. pushState
+// updates window.location synchronously; the manually dispatched PopStateEvent
+// triggers sync.ts's popstate handler → setSelectedIdRaw(id) → switch effect.
+async function switchSessionInApp(page: Page, id: string) {
+  await page.evaluate((sid) => {
+    const url = new URL(window.location.href);
+    url.searchParams.set("session", sid);
+    history.pushState({}, "", url.toString());
+    window.dispatchEvent(new PopStateEvent("popstate"));
+  }, id);
+}
+
+// Confirm a session's tree row is marked selected — proves the popstate switch
+// took and SolidJS has flushed the selection signal through the tree.
+async function waitForSessionSelected(page: Page, id: string) {
+  await expect(
+    page.locator(`.tree-node[data-session-id="${id}"].selected`),
+  ).toBeVisible({ timeout: 5000 });
+}
+
+// P1-WEB-004: read a session's persisted read anchor DIRECTLY from localStorage
+// (key "vh.scroll.v2", wrapped as {v:1,data:{[sid]:msgId}} by lib/store.ts
+// saveVersioned). This is the most direct proof that the arm-time stash flush
+// (or its invalidation) had the intended persistence effect — independent of the
+// reopen/restore path that maybeRestore drives.
+async function readAnchor(page: Page, id: string): Promise<string | undefined> {
+  return page.evaluate((sid) => {
+    try {
+      const raw = localStorage.getItem("vh.scroll.v2");
+      if (!raw) return undefined;
+      const parsed = JSON.parse(raw);
+      if (parsed && parsed.v === 1 && parsed.data && typeof parsed.data === "object") {
+        return (parsed.data as Record<string, string>)[sid] ?? undefined;
+      }
+      return undefined;
+    } catch {
+      return undefined;
+    }
+  }, id);
+}
+
 // (1) PRIMARY: open a finished unread session at the bottom → dot clears without
 // scrolling. This is the exact P1-WEB-005 regression: before the fix, opening a
 // finished session at the bottom left the dot until the user scrolled.
@@ -233,4 +278,145 @@ test("opening a session at a mid-history anchor keeps the dot", async ({ page })
   await expect(page.locator(".chat-live")).toHaveCount(0);
   // (b) The unread dot remains visible (no ack fired on the anchor branch).
   await expect(dot(page, "other")).toBeVisible();
+});
+
+// (4) P1-WEB-004 REGRESSION — the <400ms debounce-window loss. Before the fix,
+// scrolling UP from the bottom and switching sessions FAST (before the 400ms
+// debounce fired) lost the read position entirely: the switch effect cancelled
+// the pending flush (which would have captured the scroll-up anchor), and by
+// the time the effect ran the DOM had flipped to the entering session, so
+// bottommostReadFromDom would have measured the wrong session. The fix captures
+// the read position at arm-time (leading-edge throttled in scheduleReadCursor)
+// and flushes that stash for the OUTGOING session on switch.
+//
+// SWITCH MECHANISM: the switch TO demo uses in-app popstate (ChatView stays
+// mounted, the switch effect fires, the stash flush runs — this is the code path
+// under test). The reopen uses page.goto instead: an in-app switch-back triggers
+// openSession("other") which pre-initializes the message slot to empty, the
+// browser clamps scrollTop to 0, onScrolled runs, and (when a prior serial-suite
+// test left demo at a mid-history anchor, leaving following=false globally) the
+// self-pin bail does NOT fire and the atBottom branch clears the anchor before
+// maybeRestore can read it. page.goto gives a fresh mount (following starts true,
+// pinnedTop starts -1 → self-pin bail protects the anchor) — the same reopen
+// path the guard test (3) already relies on. The stash flush itself is verified
+// DIRECTLY by reading localStorage right after the in-app switch to demo.
+test("scroll-up read position survives a fast (<400ms) session switch (P1-WEB-004)", async ({ page }) => {
+  await page.setViewportSize(VP);
+  // 1. Build an overflowing transcript in `other` (same seed shape as the guard
+  //    test). 3 turns comfortably overflow the ~70px chat clientHeight at 320px.
+  await page.goto("/?session=other");
+  await expect(page.locator(".msg").first()).toBeVisible({ timeout: 10000 });
+  // Clear any stale read anchor left on `other` by earlier serial-suite tests
+  // (e.g. the guard test writes a mid-history anchor that persists in
+  // localStorage). Scroll to the bottom so onScrolled's atBottom branch fires
+  // clearReadAnchor + invalidates the stash → known bottom-pinned start state.
+  await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
+    el.scrollTop = el.scrollHeight;
+  });
+  await expect(page.locator("button.jump")).toHaveCount(0, { timeout: 3000 });
+  for (let i = 0; i < 3; i++) {
+    await promptSession(
+      page,
+      "other",
+      `P1-WEB-004 regression seed turn ${i + 1}.\nSecond line.\nThird line.\nFourth line.\nFifth line.`,
+    );
+    await waitForTurnSettled(page);
+  }
+  // 2. Scroll to the TOP. onScrolled fires → scheduleReadCursor's leading-edge
+  //    captures the read position into armedCand SYNCHRONOUSLY (this is the fix).
+  //    The "↓ Latest" button appearing proves following=false → onScrolled ran.
+  await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
+    el.scrollTop = 0;
+  });
+  await expect(page.locator("button.jump")).toBeVisible({ timeout: 3000 });
+  // 3. Switch to demo FAST — NO waitForTimeout, so the 400ms debounce is still
+  //    pending and is cancelled by the switch effect. Before the fix the anchor
+  //    was never written. The fix flushes armedCand for `other` (outgoing) here.
+  await switchSessionInApp(page, "demo");
+  await waitForSessionSelected(page, "demo");
+  // 4. DIRECT verification: the stash flush persisted a read anchor for `other`.
+  //    This is the synchronous proof of the fix — independent of the reopen path.
+  //    Before the fix this readAnchor call returns undefined (the pending flush
+  //    was cancelled, nothing else wrote the anchor within the <400ms window).
+  expect(await readAnchor(page, "other")).toBeDefined();
+  // 5. Reopen `other` via a fresh page load (NOT in-app — see the switch-
+  //    mechanism note above). Fresh mount → following starts true, pinnedTop
+  //    starts -1 → self-pin bail protects the anchor through the empty-content
+  //    window. maybeRestore defers until the snapshot arrives, then restores to
+  //    the anchor written from the stash → NOT pinned at the bottom.
+  await page.goto("/?session=other");
+  await expect(page.locator(".msg").first()).toBeVisible({ timeout: 10000 });
+  // Before the fix: anchor lost → maybeRestore no-anchor branch → pinned to
+  //    bottom. After the fix: anchor written from the stash → restored to top.
+  await expect.poll(
+    async () =>
+      page.locator(".chat-scroll").evaluate((e: HTMLElement) =>
+        e.scrollTop < e.scrollHeight - e.clientHeight - 24 ? 1 : 0,
+      ),
+    { timeout: 5000 },
+  ).toBe(1);
+});
+
+// (5) P1-WEB-004 INVALIDATION GUARD — the return-to-bottom stash clear. The
+// arm-time stash (armedCand) must be invalidated when the user scrolls back to
+// the bottom, else a stale mid-history anchor would re-apply on the next switch.
+// flushReadCursor's nearBottom branch and onScrolled's atBottom branch both clear
+// the stash (the two clearReadAnchor sites). This test would FAIL if the stash
+// were added WITHOUT the invalidation — it is the regression guard for the
+// mandatory refinement that keeps the stash from going stale.
+//
+// SWITCH MECHANISM: same as test (4) — in-app popstate for the switch to demo
+// (exercises the stash flush path), page.goto for the reopen (avoids the
+// openSession-clears-messages onScrolled side effect).
+test("scroll back to bottom invalidates the arm-time stash (P1-WEB-004)", async ({ page }) => {
+  await page.setViewportSize(VP);
+  await page.goto("/?session=other");
+  await expect(page.locator(".msg").first()).toBeVisible({ timeout: 10000 });
+  // Clear stale read anchor from prior serial-suite tests (see test (4)'s comment).
+  await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
+    el.scrollTop = el.scrollHeight;
+  });
+  await expect(page.locator("button.jump")).toHaveCount(0, { timeout: 3000 });
+  for (let i = 0; i < 3; i++) {
+    await promptSession(
+      page,
+      "other",
+      `P1-WEB-004 invalidation seed turn ${i + 1}.\nSecond line.\nThird line.\nFourth line.\nFifth line.`,
+    );
+    await waitForTurnSettled(page);
+  }
+  // 1. Scroll UP — arms the stash (leading-edge capture). "↓ Latest" visible
+  //    proves onScrolled ran and following=false.
+  await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
+    el.scrollTop = 0;
+  });
+  await expect(page.locator("button.jump")).toBeVisible({ timeout: 3000 });
+  // 2. Scroll BACK to the bottom. onScrolled's atBottom branch fires →
+  //    clearReadAnchor + (the fix) armedCand invalidated. "↓ Latest" vanishing
+  //    proves the return-to-bottom scroll was processed.
+  await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
+    el.scrollTop = el.scrollHeight;
+  });
+  await expect(page.locator("button.jump")).toHaveCount(0, { timeout: 3000 });
+  // 3. Switch to demo in-app. The stash was invalidated, so the switch effect's
+  //    stash flush finds armedCand===undefined and writes NO anchor.
+  await switchSessionInApp(page, "demo");
+  await waitForSessionSelected(page, "demo");
+  // 4. DIRECT verification: `other` has no persisted anchor. Without the
+  //    invalidation, the stale stash would have re-written it here.
+  expect(await readAnchor(page, "other")).toBeUndefined();
+  // 5. Reopen `other` via fresh page load. No anchor → maybeRestore's no-anchor
+  //    branch pins to the bottom.
+  await page.goto("/?session=other");
+  await expect(page.locator(".msg").first()).toBeVisible({ timeout: 10000 });
+  // Without the invalidation, the stale stash would have written a mid-history
+  // anchor → restored away from the bottom. With the fix, the stash was cleared
+  // → no anchor → pinned at the bottom.
+  await expect.poll(
+    async () =>
+      page.locator(".chat-scroll").evaluate((e: HTMLElement) =>
+        e.scrollHeight - e.scrollTop - e.clientHeight < 24 ? 1 : 0,
+      ),
+    { timeout: 5000 },
+  ).toBe(1);
 });

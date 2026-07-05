@@ -568,7 +568,20 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // unmount. localStorage is written at most once per idle period — never per
   // frame (Firefox/WebRender perf: see AGENTS.md "Web frontend performance").
   let readCursorTimer: number | undefined;
+  let armedCand: { sid: string; cand: string } | undefined; // P1-WEB-004: throttled arm-time stash for the switch flush
+  let lastArmMs = 0; // P1-WEB-004
   function scheduleReadCursor() {
+    // P1-WEB-004: throttled arm-time capture so the session-switch flush has the
+    // OUTGOING session's last-known read position (leading-edge: first arm fires
+    // immediately, making the <400ms switch case deterministic). At 5/sec this is
+    // a CPU layout-read (bottommostReadFromDom is reads-only, one flush), idle
+    // during streaming — not the GPU re-raster heat-saga class.
+    const now = Date.now();
+    if (!props.draft && scrollEl && now - lastArmMs >= 200) {
+      lastArmMs = now;
+      const cand = bottommostReadFromDom();
+      if (cand) armedCand = { sid: props.sessionId, cand };
+    }
     clearTimeout(readCursorTimer);
     readCursorTimer = window.setTimeout(() => flushReadCursor(props.sessionId), 400);
   }
@@ -581,6 +594,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     if (props.draft || !scrollEl || !sid) return;
     if (nearBottom()) {
       clearReadAnchor(sid);
+      if (armedCand?.sid === sid) armedCand = undefined;
       return;
     }
     const cand = bottommostReadFromDom();
@@ -706,21 +720,37 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // written on scroll-idle by the debounced observer; we cancel any pending
   // debounce here because measuring geometry now would record the WRONG session —
   // by the time this effect runs the memo/DOM have already flipped to the entering
-  // session. The gap: a scroll made <400ms before switching is not persisted.
-  //   - If the leaving session's anchor was already set, this is benign: the
-  //     monotonic guard (orderAhead) keeps the last-flushed anchor, so
-  //     reopening lands a little ahead of where the user was.
-  //   - If the leaving session was at the BOTTOM (anchor cleared / caught-up) and
-  //     the user scrolled up to read older messages, the cancelled flush leaves
-  //     the anchor cleared — reopening lands at the newest message, losing the
-  //     scroll-up position. This is a known edge case; a perf-safe synchronous
-  //     snapshot on switch (see backlog P1-WEB-004) would close it. Measuring per
-  //     scroll frame is NOT an option — it reintroduces the per-frame layout sweep
-  //     behind the Firefox/WebRender heat saga (AGENTS.md "Web frontend performance").
+  // session.
+  //
+  // P1-WEB-004 — the <400ms switch gap is closed via an arm-time stash.
+  // scheduleReadCursor captures (sid, bottommostReadFromDom) on a throttled
+  // leading edge (≤5/sec) as the user scrolls, so the OUTGOING session's
+  // last-known read position survives even when the 400ms debounce is still
+  // pending at switch time. The effect body below flushes that stash (monotonic
+  // guard against the OUTGOING session's order, NOT sm()?.order — that's already
+  // the entering session here) BEFORE clearing the pending debounce. Measuring per
+  // scroll FRAME was NOT an option — the throttled leading edge is a CPU
+  // layout-read (reads-only, one flush) at ≤5/sec, idle during streaming,
+  // categorically distinct from the per-frame GPU re-raster heat saga
+  // (AGENTS.md "Web frontend performance").
+  //
+  // The stash is invalidated at every anchor-clear site (flushReadCursor
+  // nearBottom branch + onScrolled atBottom branch): a scroll-up →
+  // return-to-bottom → switch sequence must NOT re-apply a stale mid-history
+  // anchor on switch.
   createEffect(
     on(
       () => props.sessionId,
       (id, prevId) => {
+        // P1-WEB-004: flush the arm-time stash for the OUTGOING session before the
+        // debounce is cancelled. Monotonic guard against the outgoing session's order
+        // (NOT sm()?.order — that's the entering session at this point).
+        if (prevId && armedCand && armedCand.sid === prevId) {
+          const order = state.messages[prevId]?.order ?? [];
+          if (orderAhead(armedCand.cand, getReadAnchor(prevId), order)) setReadAnchor(prevId, armedCand.cand);
+        }
+        armedCand = undefined; // consumed; entering session re-arms on its own scroll
+        lastArmMs = 0;
         if (prevId) clearTimeout(readCursorTimer);
         // Reset the self-pin sentinel: it's stale from the leaving session, and
         // an anchor restore doesn't pin to refresh it — so without this reset the
@@ -899,6 +929,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
         // Caught up: cursor == lastMessageID, stored as the sparse no-entry
         // default. Ack unread state now that the tail is in view.
         clearReadAnchor(props.sessionId);
+        if (armedCand?.sid === props.sessionId) armedCand = undefined;
         ackSession(props.sessionId);
       } else {
         // Scrolled away from the tail: schedule a debounced geometry sweep +
