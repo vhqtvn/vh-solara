@@ -73,14 +73,12 @@ async function expectFollowingTail(page: import("@playwright/test").Page) {
 }
 
 async function openDemo(page: import("@playwright/test").Page) {
-  await page.setViewportSize(VP);
-  await page.goto("/?session=demo");
-  await expect(page.locator(".msg").first()).toBeVisible({ timeout: 10000 });
-  // Glue deterministically to the tail. The e2e suite is serial and mutates the
-  // shared demo session (extra streamed turns, pending [[ask]] questions); on
-  // reload a streamed turn settling / content shrinking above the fold can make
-  // the browser clamp scrollTop down, which the app's ResizeObserver re-pin
-  // guard reads as "user scrolled up" and drops `following` — so the demo no
+  // beforeEach already loaded demo (VP + goto + msg.first + absorbed any leaked
+  // [[stall]] busy goroutine). Glue deterministically to the tail. The e2e suite
+  // is serial and mutates the shared demo session (extra streamed turns, pending
+  // [[ask]] questions); on reload a streamed turn settling / content shrinking
+  // above the fold can make the browser clamp scrollTop down, which the app's
+  // ResizeObserver re-pin guard reads as "user scrolled up" and drops `following` — so the demo no
   // longer reliably loads glued to the tail. Rather than depend on that
   // unrelated load behaviour, we explicitly re-glue.
   //
@@ -120,6 +118,48 @@ async function toggleFocus(page: import("@playwright/test").Page) {
     .locator('button[aria-label="Focus mode"]')
     .evaluate((el: HTMLElement) => el.click());
 }
+
+// Serial-suite-scoped setup for every demo-based test. The e2e suite is serial
+// (workers:1, fullyParallel:false) and shares ONE mutable fixture backend. Two
+// cross-test contaminants build up across the ~50 serial iterations:
+//
+//   1. Leaked [[stall]] busy goroutine. A prior [[stall]] test (4/9/11/12)
+//      spawns a 5s-busy goroutine in pkg/fixtures/opencode.go (simulatePrompt
+//      emits session.status busy, then `time.Sleep(5s)`, with a DEFERRED
+//      session.idle). Tests 4/9 do NOT wait for it to finish before they end,
+//      so it can still be mid-sleep when the NEXT test loads demo.
+//
+//   2. Transcript accumulation. Every simulatePrompt appends a PERSISTENT
+//      message (user msg at appendMessage; assistant turn for non-stall sends).
+//      Across 50 serial iterations × 5 sending tests the demo transcript grows
+//      to hundreds of messages with UNEVEN heights (code/math blocks from test
+//      10b). A long uneven transcript shifts the follow-to-tail geometry so a
+//      focus-toggle reflow drifts off the bottom → following() flips false.
+//
+// The fixture reset (POST /oc/fixture/reset) restores demo's messages to the
+// seeded baseline and clears the mirrored busy map, absorbing BOTH contaminants.
+// The subsequent wait-for-idle is a redundant safety net (passes instantly
+// since reset already cleared busy). Tests that need a DIFFERENT load (test 8
+// tall viewport, test 12 addInitScript before goto) keep their own goto — the
+// reset has already run before they load regardless. This is a SERIAL-ONLY
+// flake: test 11 is 50/50 green in isolation (Probe 1 baseline).
+test.beforeEach(async ({ page, request }) => {
+  // Restore the fixture backend baseline (messages + busy) for demo before the
+  // test loads it. The `request` fixture resolves the relative URL against the
+  // configured baseURL (page.request would resolve against the page's current
+  // URL, which is about:blank before any goto — silently failing the POST).
+  // Routes through the real web server's /oc/* passthrough; the X-VH-CSRF
+  // header satisfies the shared CSRF guard on /oc/* POSTs.
+  const reset = await request.post("/oc/fixture/reset?session=demo", {
+    headers: { "X-VH-CSRF": "1" },
+  });
+  expect(reset.ok()).toBe(true);
+  await page.setViewportSize(VP);
+  await page.goto("/?session=demo");
+  await expect(page.locator(".msg").first()).toBeVisible({ timeout: 10000 });
+  // Safety net: confirm demo is idle after the reset (absorbs any leaked goroutine).
+  await expect(page.locator(".working-text")).toHaveCount(0, { timeout: 8000 });
+});
 
 // (1) Tail state: glued to the live tail → following=true (geometry at the
 //     bottom, "↓ Latest" button absent). The .chat-live pill itself hides on
@@ -212,9 +252,7 @@ test("mid-stream scroll up still surfaces the Latest button", async ({ page }) =
 // the bottom — the app's onScrolled sets following=true when near the bottom,
 // same end state as openDemo, no detach-prone click.
 test("focus mode hides the Latest button (focus gate reactivity)", async ({ page }) => {
-  await page.setViewportSize(VP);
-  await page.goto("/?session=demo");
-  await expect(page.locator(".msg").first()).toBeVisible({ timeout: 10000 });
+  // beforeEach loaded demo (VP + absorbed any leaked stall goroutine).
   // Glue to the tail deterministically (see NOTE above).
   await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
     el.scrollTop = el.scrollHeight;
@@ -265,9 +303,7 @@ test("focus mode hides the Latest button (focus gate reactivity)", async ({ page
 // once and never unmount, so scrollHeight is stable and the clamp matches
 // pinnedTop on the way back down.
 test("scrolling back to the bottom flips Latest → Live", async ({ page }) => {
-  await page.setViewportSize(VP);
-  await page.goto("/?session=demo");
-  await expect(page.locator(".msg").first()).toBeVisible({ timeout: 10000 });
+  // beforeEach loaded demo (VP + absorbed any leaked stall goroutine).
 
   // Glue to the tail deterministically. The RO path pins while following=true,
   // arming pinnedTop to this bottom clamp; capture it so the scroll-back below
@@ -349,9 +385,7 @@ test("scrolling back to the bottom flips Latest → Live", async ({ page }) => {
 // click-based re-glue (the documented flaky spot in this suite) and glues to the
 // tail deterministically by scrolling to the bottom.
 test("a content shrink while Live keeps following (no false user-scroll-up)", async ({ page }) => {
-  await page.setViewportSize(VP);
-  await page.goto("/?session=demo");
-  await expect(page.locator(".msg").first()).toBeVisible({ timeout: 10000 });
+  // beforeEach loaded demo (VP + absorbed any leaked stall goroutine).
 
   // Glue to the tail deterministically (app's onScrolled sets following=true near
   // the bottom). This arms pinnedTop/pinnedScrollHeight to the current content
@@ -521,9 +555,7 @@ test("a viewport shrink while Live re-glues to the tail", async ({ page }) => {
 // a long multi-line composer draft forcing several autosize growth steps, then a
 // geometry + pill assertion.
 test("composer auto-grow while Live keeps following at the tail", async ({ page }) => {
-  await page.setViewportSize(VP);
-  await page.goto("/?session=demo");
-  await expect(page.locator(".msg").first()).toBeVisible({ timeout: 10000 });
+  // beforeEach loaded demo (VP + absorbed any leaked stall goroutine).
   // Glue to the tail (geometry-first).
   await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
     el.scrollTop = el.scrollHeight;
@@ -580,9 +612,7 @@ test.skip("spurious Live loss re-engages on a new turn (needs fixture hook)", as
 // false→true busy edge the self-heal effect watches), and verify self-heal is
 // SUPPRESSED — the reader stays where they are.
 test("a deliberate scroll-up reader is not yanked when a new turn starts", async ({ page }) => {
-  await page.setViewportSize(VP);
-  await page.goto("/?session=demo");
-  await expect(page.locator(".msg").first()).toBeVisible({ timeout: 10000 });
+  // beforeEach loaded demo (VP + absorbed any leaked stall goroutine).
   // Glue to the tail (following=true, latch=false).
   await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
     el.scrollTop = el.scrollHeight;
@@ -626,9 +656,10 @@ test("a deliberate scroll-up reader is not yanked when a new turn starts", async
 //     toggling back reveals it (reactivity). Moved here from test 5, which can't
 //     show the pill on the idle demo.
 test("the Live pill hides when the turn finishes (working gate + focus gate)", async ({ page }) => {
-  await page.setViewportSize(VP);
-  await page.goto("/?session=demo");
-  await expect(page.locator(".msg").first()).toBeVisible({ timeout: 10000 });
+  // beforeEach loaded demo (VP + absorbed any leaked stall goroutine) — this
+  // wait-for-idle is the OPERATIVE load that makes (11) stable in the serial
+  // suite (the leaked [[stall]] from a prior test is what made send() hit the
+  // queue gate and race the disappearance assertions below).
   await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
     el.scrollTop = el.scrollHeight;
   });
@@ -831,9 +862,7 @@ test("reopen of a busy session at a stored anchor is not yanked to the tail", as
 // button.jump appears, geometry off the tail) and PASSES after (the listener
 // re-pinned first → the RO re-pins cleanly → Live persists).
 test("tab resume re-engages Live after a hidden content reshuffle", async ({ page }) => {
-  await page.setViewportSize(VP);
-  await page.goto("/?session=demo");
-  await expect(page.locator(".msg").first()).toBeVisible({ timeout: 10000 });
+  // beforeEach loaded demo (VP + absorbed any leaked stall goroutine).
   // Glue to the tail (following=true). Geometry-first (idle demo hides the pill).
   await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
     el.scrollTop = el.scrollHeight;
@@ -905,9 +934,7 @@ test("tab resume re-engages Live after a hidden content reshuffle", async ({ pag
 // transition. This pins the gate so a future change that drops the
 // `!userScrolledUp()` check cannot introduce an always-yank-on-resume.
 test("tab resume does not yank a deliberate reader (intent latch)", async ({ page }) => {
-  await page.setViewportSize(VP);
-  await page.goto("/?session=demo");
-  await expect(page.locator(".msg").first()).toBeVisible({ timeout: 10000 });
+  // beforeEach loaded demo (VP + absorbed any leaked stall goroutine).
   // Glue to the tail (following=true, latch=false).
   await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
     el.scrollTop = el.scrollHeight;
