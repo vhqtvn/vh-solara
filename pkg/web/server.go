@@ -384,26 +384,31 @@ func (s *Server) runPermissionReconcile(a *aggregator.Aggregator) {
 	}
 }
 
-// reconcileFailFastPerms reads the authoritative store Snapshot and, for every
-// PENDING permission whose session is registered fail_fast, rejects it (never
-// "always") and records the observable permission_blocked fact. This makes
-// fail-closed a bounded-latency guarantee even if every live-tail event is lost:
-// the Snapshot is the source of truth, not the event stream.
+// reconcileFailFastPerms reads the authoritative store permission set and, for
+// every PENDING permission whose session is registered fail_fast, rejects it
+// (never "always") and records the observable permission_blocked fact. This
+// makes fail-closed a bounded-latency guarantee even if every live-tail event is
+// lost: the store's permission set is the source of truth, not the event stream.
 //
-// Idempotent: a permission that was already replied/cleared between the snapshot
+// It uses PendingPermissions (read-locked, perms-only) rather than Snapshot:
+// Snapshot materializes the entire view under the WRITE lock, which is wasted
+// cost here since only permissions are read — and that write lock blocks
+// incoming events and client-connect Snapshots for the duration of every sweep.
+//
+// Idempotent: a permission that was already replied/cleared between the perms
 // read and the reject returns an error from ReplyPermission, which is swallowed
 // (logged) — a stale reject is harmless and expected, since the sweep races the
 // permission's normal clear path (store.Apply permission.replied deletes the perm
-// before the next snapshot, so a cleared perm is not re-rejected beyond the one
+// before the next read, so a cleared perm is not re-rejected beyond the one
 // in-flight race window). The client is the per-dir aggregator's Client() (same
 // dir→client resolution the aggregator uses for every other write verb).
 func (s *Server) reconcileFailFastPerms(store *state.Store, client *opencode.Client) {
-	snap := store.Snapshot(nil)
-	for sessionID, perms := range snap.Permissions {
+	perms := store.PendingPermissions()
+	for sessionID, plist := range perms {
 		if !s.isFailFast(sessionID) {
 			continue
 		}
-		for _, raw := range perms {
+		for _, raw := range plist {
 			var env permissionEnv
 			if err := json.Unmarshal(raw, &env); err != nil || env.ID == "" || env.SessionID == "" {
 				continue

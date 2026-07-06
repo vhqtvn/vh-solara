@@ -941,6 +941,38 @@ func (s *Store) SetPendingPermissions(requests []json.RawMessage) {
 	}
 }
 
+// PendingPermissions returns a copy of the pending-permission set under a READ
+// lock. It exists so callers that only need permissions (e.g. the 2s reconcile
+// backstop) do not pay for a full Snapshot: Snapshot materializes every
+// message/part of every loaded session (an O(n) tree walk), flushes streaming
+// accumulators, and builds the whole materialized view under the store's WRITE
+// lock — blocking incoming OpenCode events and client-connect Snapshots the
+// whole time. The reconcile loop reads only permissions, so a read-locked
+// perms-only read is the proportional cost.
+//
+// The return shape (map[sessionID][]json.RawMessage) and copy semantics match
+// Snapshot.Permissions exactly: the outer map and each per-session slice are
+// fresh allocations, while the underlying json.RawMessage byte arrays are shared
+// with the store (callers treat returned permission payloads as read-only, as
+// they already do for Snapshot.Permissions).
+func (s *Store) PendingPermissions() map[string][]json.RawMessage {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make(map[string][]json.RawMessage, len(s.perms))
+	for sid, m := range s.perms {
+		// Omit empty-inner-map sessions to match Snapshot.Permissions exactly.
+		if len(m) == 0 {
+			continue
+		}
+		list := make([]json.RawMessage, 0, len(m))
+		for _, perm := range m {
+			list = append(list, perm)
+		}
+		out[sid] = list
+	}
+	return out
+}
+
 func (s *Store) upsertMessageLocked(info json.RawMessage) {
 	var env messageInfoEnvelope
 	if json.Unmarshal(info, &env) != nil || env.ID == "" || env.SessionID == "" {

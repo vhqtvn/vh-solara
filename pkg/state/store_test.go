@@ -2,6 +2,8 @@ package state
 
 import (
 	"encoding/json"
+	"reflect"
+	"sort"
 	"testing"
 
 	"github.com/vhqtvn/vh-solara/pkg/opencode"
@@ -213,6 +215,148 @@ func TestPermissionAskedSurfacesAndRepliedClears(t *testing.T) {
 	s.Apply(ev("permission.replied", `{"sessionID":"a","requestID":"per_1","reply":"once"}`))
 	if got := s.Snapshot(nil).Permissions["a"]; len(got) != 0 {
 		t.Fatalf("want permission cleared after reply, got %d", len(got))
+	}
+}
+
+// normalizePerms converts a map[sessionID][]json.RawMessage into an order-
+// independent form (sessionID -> sorted raw strings) so two reads can be
+// compared regardless of map/slice iteration order.
+func normalizePerms(m map[string][]json.RawMessage) map[string][]string {
+	out := make(map[string][]string, len(m))
+	for sid, list := range m {
+		ss := make([]string, len(list))
+		for i, raw := range list {
+			ss[i] = string(raw)
+		}
+		sort.Strings(ss)
+		out[sid] = ss
+	}
+	return out
+}
+
+// TestPendingPermissionsRoundTrip verifies SetPendingPermissions (the rehydrate
+// path) is readable through PendingPermissions with the expected shape.
+func TestPendingPermissionsRoundTrip(t *testing.T) {
+	s := New(100)
+	s.SetPendingPermissions([]json.RawMessage{
+		json.RawMessage(`{"id":"p1","sessionID":"a","permission":"bash"}`),
+		json.RawMessage(`{"id":"p2","sessionID":"a","permission":"edit"}`),
+		json.RawMessage(`{"id":"p3","sessionID":"b","permission":"bash"}`),
+	})
+	got := s.PendingPermissions()
+	if len(got) != 2 {
+		t.Fatalf("want 2 sessions with pending perms, got %d (%v)", len(got), got)
+	}
+	if len(got["a"]) != 2 {
+		t.Fatalf("session a want 2 perms, got %d", len(got["a"]))
+	}
+	if len(got["b"]) != 1 {
+		t.Fatalf("session b want 1 perm, got %d", len(got["b"]))
+	}
+	// An unknown session returns no entry (map zero value is nil).
+	if _, ok := got["nope"]; ok {
+		t.Fatal("unknown session must not appear in the map")
+	}
+}
+
+// TestPendingPermissionsMatchesSnapshot is the core correctness property for
+// switching the reconcile loop off Snapshot: PendingPermissions must surface the
+// SAME pending set Snapshot.Permissions does (the reconcile loop must not see a
+// different set of permissions to reject). Both paths iterate the same store
+// field, so this is a parity assertion against the prior source of truth.
+func TestPendingPermissionsMatchesSnapshot(t *testing.T) {
+	s := New(100)
+	s.SetPendingPermissions([]json.RawMessage{
+		json.RawMessage(`{"id":"p1","sessionID":"a","permission":"bash"}`),
+		json.RawMessage(`{"id":"p2","sessionID":"a","permission":"edit"}`),
+		json.RawMessage(`{"id":"p3","sessionID":"b","permission":"bash"}`),
+	})
+	// A live event arriving between the two reads must be visible to both in the
+	// same way: add one more for a then read both back-to-back.
+	s.Apply(ev("permission.asked", `{"id":"p4","sessionID":"a","permission":"web"}`))
+
+	want := normalizePerms(s.Snapshot(nil).Permissions)
+	got := normalizePerms(s.PendingPermissions())
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("PendingPermissions diverged from Snapshot.Permissions:\n got=%v\nwant=%v", got, want)
+	}
+}
+
+// TestPendingPermissionsOmitsEmptyInnerMap is the empty-inner-map parity edge
+// case for advisory D1. A session key can linger in s.perms with a zero-length
+// inner map when its last perm is deleted but the session itself is not yet
+// removed — reachable via the permission.replied handler and the
+// SetPendingPermissions reconcile (store.go delete-before-removal paths).
+// Snapshot.Permissions omits such a session entirely (it only assigns a key
+// inside the append loop), so PendingPermissions must omit it too rather than
+// emitting out[sid] = []json.RawMessage{}.
+func TestPendingPermissionsOmitsEmptyInnerMap(t *testing.T) {
+	s := New(100)
+	// Seed a real perm for session "a", then reply to clear it. After the reply,
+	// s.perms["a"] still exists (the replied handler deletes the inner entry,
+	// not the session key) but its inner map is empty — the exact divergence
+	// state. A second session "b" keeps a real perm so the maps aren't trivially
+	// empty.
+	s.Apply(ev("permission.asked", `{"id":"per_1","sessionID":"a","permission":"bash","title":"run x"}`))
+	s.Apply(ev("permission.asked", `{"id":"per_2","sessionID":"b","permission":"edit","title":"edit y"}`))
+	s.Apply(ev("permission.replied", `{"sessionID":"a","requestID":"per_1","reply":"once"}`))
+
+	// Both reads must OMIT session "a" (the empty-inner-map session) and keep
+	// session "b" (the populated one). Parity holds on both sides.
+	snapPerms := s.Snapshot(nil).Permissions
+	got := s.PendingPermissions()
+
+	if _, ok := snapPerms["a"]; ok {
+		t.Fatalf(`Snapshot.Permissions must omit the empty-inner-map session "a", got %v`, snapPerms["a"])
+	}
+	if _, ok := got["a"]; ok {
+		t.Fatalf(`PendingPermissions must omit the empty-inner-map session "a", got %v`, got["a"])
+	}
+	if _, ok := snapPerms["b"]; !ok || len(snapPerms["b"]) != 1 {
+		t.Fatalf(`Snapshot.Permissions must still surface populated session "b" with 1 perm, got %v`, snapPerms["b"])
+	}
+	if _, ok := got["b"]; !ok || len(got["b"]) != 1 {
+		t.Fatalf(`PendingPermissions must still surface populated session "b" with 1 perm, got %v`, got["b"])
+	}
+
+	// And the two readers agree on the whole map (the core parity property,
+	// now including the empty-inner-map edge).
+	if !reflect.DeepEqual(normalizePerms(got), normalizePerms(snapPerms)) {
+		t.Fatalf("PendingPermissions diverged from Snapshot.Permissions on the empty-inner-map edge:\n got=%v\nwant=%v",
+			normalizePerms(got), normalizePerms(snapPerms))
+	}
+}
+
+// TestPendingPermissionsReturnsIndependentCopies asserts the structural copy
+// contract: the returned outer map and per-session slices are independent of the
+// store, so a caller mutating the returned structure (adding/removing keys,
+// appending to a slice) cannot corrupt the store's pending-permission state.
+// (The underlying json.RawMessage byte arrays are intentionally shared with the
+// store, matching Snapshot.Permissions — callers treat them as read-only.)
+func TestPendingPermissionsReturnsIndependentCopies(t *testing.T) {
+	s := New(100)
+	s.SetPendingPermissions([]json.RawMessage{
+		json.RawMessage(`{"id":"p1","sessionID":"a","permission":"bash"}`),
+	})
+	got := s.PendingPermissions()
+
+	// Mutate the returned structure: add a fake session, drop a real one, append
+	// to a slice, and reassign a slice entry. None of this may reach the store.
+	got["injected"] = []json.RawMessage{json.RawMessage(`{"id":"evil","sessionID":"x"}`)}
+	delete(got, "a")
+	got["a"] = append(got["a"], json.RawMessage(`{"id":"extra","sessionID":"a"}`))
+
+	// A fresh read must be unaffected.
+	again := s.PendingPermissions()
+	if _, ok := again["injected"]; ok {
+		t.Fatal("mutating the returned map must not add sessions to the store")
+	}
+	if len(again["a"]) != 1 {
+		t.Fatalf("session a still wants 1 perm after caller mutated its returned copy, got %d", len(again["a"]))
+	}
+	// Snapshot.Permissions (the other reader of the same field) must agree.
+	if len(s.Snapshot(nil).Permissions["a"]) != 1 {
+		t.Fatal("Snapshot.Permissions must also be unaffected by caller mutation of the PendingPermissions result")
 	}
 }
 
