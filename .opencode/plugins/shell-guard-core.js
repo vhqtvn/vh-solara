@@ -22,11 +22,29 @@
 // evaluate NEVER throws on a deny — it returns it. It throws ONLY on an engine
 // fault (WASM load failure, rule-import fault) so the caller (eval.js / the Go
 // hook) fails safe.
+//
+// Global-flag detect/parse (git -C / --no-pager / etc.): evaluate(command,
+// commandCwd) walks leading git global flags via a registry-driven walker to
+// extract the verb past them and classify any `-C` path. This powers the
+// security DECISIONS and NOTHING else — evaluate NEVER returns a command
+// rewrite and the plugin wrapper (shell-guard.js) NEVER mutates
+// output.args.command:
+//   - mutation-slip guard: verb in GIT_MUTATION_VERBS past any leading flag
+//     -> deny (covers `git -C <ext> commit`, `git --git-dir=/x commit`,
+//     `git --no-pager commit`).
+//   - relative `-C` (`.`, `..`, subdir) -> deny + actionable notice.
+//   - external `-C` readonly -> ask; external `-C` mutation -> deny (via the
+//     mutation-slip guard above).
+//   - info flags (`--help`/`--version`/...) with no verb -> allow.
+// For the internal allowlist check, when every consumed flag is execution-safe
+// to drop (paging flags, or `-C <abs commandCwd>` that is a no-op), evaluate
+// matches the STRIPPED token form so `git --no-pager diff x` is recognized as
+// the readonly `git diff x`. This classification is INTERNAL to the decision —
+// it does not escape as a rewrite. eval.js emits `{action, reason}` only.
 
-import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { COMMANDS } from "../repo-configs/allowed-commands.js";
+import { COMMANDS, GIT_MUTATION_VERBS } from "../repo-configs/allowed-commands.js";
 import { FORBIDDEN_PATTERNS } from "../repo-configs/forbidden-patterns.js";
 // NOTE: web-tree-sitter is imported LAZILY inside getBashParser() (dynamic
 // import), so the engine loads even when the optional WASM parser is absent.
@@ -245,25 +263,39 @@ export function stripLeadingEnvVarsFromString(cmd) {
 }
 
 // ---------------------------------------------------------------------------
-// Optional `git -C <path>` support.
+// Generic git global-flag detect/parse (registry-driven walker).
 //
-// Background: the `git_readonly` allowlist matches bare `git <subcommand>` token
-// sequences, and the `git-mutation-bypass` forbidden regex matches
-// `\bgit\s+(add|commit|...)\b`. Neither fires when a `-C <path>` is inserted
-// between `git` and the subcommand, so:
-//   - `git -C <valid> log` falls through to opencode's permission gate (prompt),
-//     instead of being cleanly allowed like `git log`.
-//   - `git -C <valid> commit` slips PAST `git-mutation-bypass` (a real hole).
+// Background: opencode's permission matcher is path-blind glob over the raw
+// command text (`git diff *` matches `git diff x`, but NOT `git -C <root> diff`
+// or `git --no-pager diff`). shell-guard's `tool.execute.before` hook DOES NOT
+// rewrite the command — a detector has a safe fallback (ask) but a rewriter
+// does not, and real agent commands (pipelines, sequences, subshells) make a
+// safe whole-command rewrite unprovable. Instead the walker POWERS THE
+// DECISION: it extracts the verb past leading global flags and classifies any
+// `-C` path so the security verdicts (mutation-slip guard, relative-`-C`
+// deny+notice, external-`-C` routing, info-flag allow) fire correctly. For
+// shell-guard's INTERNAL allowlist check only, when every consumed flag is
+// execution-safe to drop the stripped token form is matched so a readonly
+// `git --no-pager diff` is recognized; this classification never escapes as a
+// command rewrite.
 //
-// Fix: after parseCommands + env-var strip, if the token sequence is
-// `git -C <path> <rest...>` with a SINGLE, well-formed, in-project <path>, strip
-// the `-C <path>` so both downstream checks see the normalized `git ...` form.
-// Mutations are then re-caught by re-running denyByForbiddenPatterns on the
-// stripped reconstruction (single source of truth for mutation verbs — we do
-// NOT duplicate the verb list), and readonly subcommands match the allowlist.
+// Droppable-vs-keep classification (decision-internal; what EXECUTES is never
+// changed):
+//   - paging flags (`-p`,`--paginate`,`-P`,`--no-pager`)        -> always safe
+//   - `-C <abs path>` where path === commandCwd                  -> no-op (cwd)
+//   - everything else (config/repo-location/behavior flags, or a
+//     `-C` pointing elsewhere)                                   -> KEEP (prompt)
 //
-// Anything out-of-project, malformed, multiple, or a symlink escape is a hard
-// deny. Non-git commands and git commands without `-C` are returned unchanged.
+// The walker also powers the UNIFORM mutation-slip guard: it extracts the verb
+// PAST any leading global flags and tests it against GIT_MUTATION_VERBS, so a
+// mutation hidden behind `-C`/`--git-dir`/an unknown flag is DENIED regardless
+// of adjacency — closing `git -C <ext> commit`, `git --git-dir=/x commit`, and
+// `git --no-pager commit` without re-scanning a stripped reconstruction.
+//
+// `commandCwd` is the command's real working directory (the plugin wrapper
+// derives it from output.args.workdir, falling back to repoRoot()). A `-C`
+// path equal to it is the in-project no-op reference; anything else is
+// in-project-subdir or external.
 // ---------------------------------------------------------------------------
 
 // Repo root derived from this file's location (.opencode/plugins/shell-guard-core.js
@@ -290,7 +322,7 @@ export function repoRoot() {
 // (in- or out-of-project) still fall through to the normal permission table.
 //
 // Resolve relative paths against the repo root (NOT process.cwd(), unreliable
-// in the plugin server context — mirrors validateGitCPath).
+// in the plugin server context — same cwd-robustness rationale as repoRoot()).
 // ---------------------------------------------------------------------------
 export function resolveReadPath(filePath, root) {
     if (!filePath || typeof filePath !== "string") return null;
@@ -316,164 +348,237 @@ export function unquoteToken(text) {
     return text;
 }
 
-// Two-tier in-project path validation for `git -C <path>`.
-//
-// Tier 1 (lexical, no fs): resolve relative to repoRoot and confirm the target
-//   is the repo root itself or beneath it. Catches `..` escapes and absolute
-//   paths outside the repo immediately; works for non-existent paths too.
-// Tier 2 (symlink, fs): if the lexical target exists, realpath both the target
-//   and the repo root and re-confirm containment on the realpaths. Catches
-//   symlink escapes. If the path does not yet exist, Tier 1 is authoritative
-//   (a non-existent path cannot yet be a symlink escape).
-//
-// Returns { ok: true } or { ok: false, reason }.
-export function validateGitCPath(unquotedPath, root) {
-    const repoRootPath = root || repoRoot();
-    let target;
-    try {
-        target = path.resolve(repoRootPath, unquotedPath);
-    } catch (e) {
-        return {
-            ok: false,
-            reason: `git -C path could not be resolved: ${unquotedPath}`,
-        };
-    }
-    const inProject =
-        target === repoRootPath ||
-        target.startsWith(repoRootPath + path.sep);
-    if (!inProject) {
-        return {
-            ok: false,
-            reason: `git -C path escapes repo root: ${unquotedPath}`,
-        };
-    }
-    if (fs.existsSync(target)) {
-        let realTarget;
-        let realRoot;
-        try {
-            realTarget = fs.realpathSync(target);
-            realRoot = fs.realpathSync(repoRootPath);
-        } catch (e) {
-            return {
-                ok: false,
-                reason: `git -C path could not be resolved (realpath): ${unquotedPath}`,
-            };
-        }
-        const realInProject =
-            realTarget === realRoot ||
-            realTarget.startsWith(realRoot + path.sep);
-        if (!realInProject) {
-            return {
-                ok: false,
-                reason: `git -C path is a symlink escaping repo root: ${unquotedPath}`,
-            };
-        }
-    }
-    return { ok: true };
-}
-
-// Validate and strip a SINGLE leading `git -C <path>` from env-stripped tokens.
-//
-// Input tokens MUST already have leading env-var assignments removed
-// (stripLeadingEnvVars). Returns:
-//   { tokens, deny: null }           — normalized (or unchanged if no -C)
-//   { tokens, deny: "<reason>" }     — malformed / out-of-project / symlink escape
-//
-// The returned `tokens` always has length >= 1 when input does. On deny, the
-// caller throws before any allowlist check runs.
-export function normalizeGitC(tokens, root) {
-    if (tokens.length === 0 || tokens[0] !== "git") {
-        return { tokens, deny: null };
-    }
-    // Only a single optional leading `-C <path>` before the subcommand.
-    if (tokens.length < 2 || tokens[1] !== "-C") {
-        return { tokens, deny: null };
-    }
-    // tokens[1] === "-C" from here on.
-    // Need at least `git -C <path> <subcommand>` (4 tokens).
-    if (tokens.length < 4) {
-        return {
-            tokens,
-            deny: "git -C requires a path and a subcommand",
-        };
-    }
-    const pathToken = tokens[2];
-    // The path argument must not itself be a flag (e.g. `git -C --git-dir log`).
-    if (pathToken.startsWith("-")) {
-        return {
-            tokens,
-            deny: `git -C path argument looks like a flag: ${pathToken}`,
-        };
-    }
-    // Reject multiple `-C` (e.g. `git -C a -C b log`).
-    if (tokens.length >= 5 && tokens[3] === "-C") {
-        return {
-            tokens,
-            deny: "multiple git -C flags are not allowed",
-        };
-    }
-    const unquoted = unquoteToken(pathToken);
-    const validation = validateGitCPath(unquoted, root);
-    if (!validation.ok) {
-        return { tokens, deny: validation.reason };
-    }
-    // Strip `-C` and the path, keep `git` + the rest.
-    return {
-        tokens: [tokens[0], ...tokens.slice(3)],
-        deny: null,
-    };
-}
-
 // ---------------------------------------------------------------------------
-// Optional `git --no-pager` (and `--paging=no`) support.
+// Git global-flag registry + walker.
 //
-// Background: the `git_readonly` allowlist matches bare `git <subcommand>` token
-// sequences, and the `git-mutation-bypass` forbidden regex matches
-// `\bgit\s+(add|commit|...)\b`. Neither fires when a global paging flag is
-// inserted between `git` and the subcommand, so:
-//   - `git --no-pager log` falls through to opencode's permission gate (prompt),
-//     instead of being cleanly allowed like `git log`.
-//   - `git --no-pager commit` slips PAST `git-mutation-bypass` (a real hole):
-//     the regex requires the mutation verb ADJACENT to `git`, but `--no-pager`
-//     sits between them.
+// The registry is the spec for every git global flag that may sit between
+// `git` and the subcommand (sourced from `git --help`'s usage line). Each entry
+// declares how the flag consumes its value (valueForm) and whether dropping it
+// is an execution no-op (stripPolicy):
 //
-// Fix: in the git-mutation re-scan loop (evaluate), after reconstructing the
-// command string from normalized tokens, strip a run of safe global paging
-// flags so the forbidden re-scan sees the bare `git <verb>` form. Mutations are
-// then re-caught by re-running denyByForbiddenPatterns on the stripped
-// reconstruction (single source of truth for mutation verbs), and the readonly
-// config-table entries added for `git --no-pager <sub> *` (permconfig tables)
-// handle the prompt-free allow path for the ORIGINAL (un-stripped) tokens.
+//   valueForm:
+//     "next"        — consumes the NEXT token as its value (e.g. `-C <path>`)
+//     "eq"          — value attached via `=` in the SAME token (`--git-dir=/x`)
+//     "optional-eq" — value optional via `=` (`--exec-path` / `--exec-path=/x`)
+//                     IMPORTANT: never consumes a separate next token
+//     "none"        — boolean flag, no value (`--no-pager`)
 //
-// Conservative: only `--no-pager` and its exact synonym `--paging=no` are
-// recognized. Every other global flag (incl. `--git-dir`/`--work-tree`, which
-// take path args and could escape the repo) is left in place, so it stays
-// between `git` and the subcommand and conservatively does NOT match the
-// readonly allowlist.
-//
-// This is a STRING normalizer (it runs on the reconstruction the re-scan loop
-// already builds), mirroring normalizeGitC's detect-strip-reconstruct pattern.
-// Returns { changed: bool, cmd: string }; non-git commands and git commands
-// without a leading safe global flag are returned unchanged.
+//   stripPolicy:
+//     "always"      — display-only; safe to DROP from the internal stripped
+//                     form (paging)
+//     "conditional" — drop only if a predicate holds (only `-C`: strip iff the
+//                     path is absolute AND === commandCwd)
+//     "never"       — skip PAST it for verb-reach but NEVER drop it from the
+//                     internal stripped form (config / repo-location / behavior
+//                     flags)
+//     "info"        — terminal read-only info request (`--help`/`--version`);
+//                     no verb follows; allow without an allowlist match
 // ---------------------------------------------------------------------------
 
-// Conservative set of safe git global flags that may sit between `git` and the
-// subcommand. These only affect output paging and never mutate state.
-const GIT_SAFE_GLOBAL_FLAGS = new Set(["--no-pager", "--paging=no"]);
+const GIT_GLOBAL_FLAG_REGISTRY = [
+    { flags: ["-C"], valueForm: "next", stripPolicy: "conditional" },
+    { flags: ["-c"], valueForm: "next", stripPolicy: "never" },
+    { flags: ["--git-dir"], valueForm: "eq", stripPolicy: "never" },
+    { flags: ["--work-tree"], valueForm: "eq", stripPolicy: "never" },
+    { flags: ["--namespace"], valueForm: "eq", stripPolicy: "never" },
+    { flags: ["--config-env"], valueForm: "eq", stripPolicy: "never" },
+    { flags: ["--exec-path"], valueForm: "optional-eq", stripPolicy: "never" },
+    // Paging flags — display-only, always safe to drop. NOTE: `--paging=no` is
+    // NOT a real git flag (absent from `git --help`); the prior
+    // GIT_SAFE_GLOBAL_FLAGS listed it by mistake. The canonical set is
+    // -p/--paginate/-P/--no-pager.
+    {
+        flags: ["-p", "--paginate", "-P", "--no-pager"],
+        valueForm: "none",
+        stripPolicy: "always",
+    },
+    { flags: ["--no-replace-objects", "--bare"], valueForm: "none", stripPolicy: "never" },
+    // Terminal info requests — read-only, no verb follows.
+    {
+        flags: ["-v", "--version", "-h", "--help", "--html-path", "--man-path", "--info-path"],
+        valueForm: "none",
+        stripPolicy: "info",
+    },
+];
 
-export function normalizeGitGlobalFlags(cmd) {
-    const tokens = cmd.split(/\s+/).filter(Boolean);
-    if (tokens.length === 0 || tokens[0] !== "git") {
-        return { changed: false, cmd };
+// Lookup a token in the registry. Returns { entry, valueAttached } or null.
+//   - exact token match (none / next / optional-eq-without-value forms)
+//   - `--flag=value` split (eq / optional-eq-with-value forms)
+// A token that starts with `-` but matches nothing is returned as null so the
+// walker can treat it as an unknown never-strip boolean (see walkGitGlobals).
+function lookupGitGlobalFlag(token) {
+    if (token === "-" || token === "--" || !token.startsWith("-")) return null;
+    // Exact match first.
+    for (const entry of GIT_GLOBAL_FLAG_REGISTRY) {
+        if (entry.flags.includes(token)) {
+            return { entry, valueAttached: null };
+        }
     }
+    // `--flag=value` split for eq / optional-eq forms.
+    const eqIdx = token.indexOf("=");
+    if (eqIdx > 2) {
+        // > 2 so bare `-x` (no flag name) is not mistaken; only `--…=…`/`-C=…`.
+        const flagPart = token.slice(0, eqIdx);
+        const valuePart = token.slice(eqIdx + 1);
+        for (const entry of GIT_GLOBAL_FLAG_REGISTRY) {
+            if (
+                entry.flags.includes(flagPart) &&
+                (entry.valueForm === "eq" || entry.valueForm === "optional-eq")
+            ) {
+                return { entry, valueAttached: valuePart };
+            }
+        }
+    }
+    return null;
+}
+
+// walkGitGlobals — consume leading git global flags starting at tokens[1]
+// (tokens[0] MUST === "git"; the caller guards this). Returns:
+//   {
+//     verb: string|null,          // first non-flag token, or null if none
+//     rewrittenTokens: string[],  // stripped token list (globals removed per
+//                                 // stripPolicy); used for INTERNAL allowlist
+//                                 // matching only — NEVER emitted as a rewrite
+//     fullyStrippable: bool,      // true ONLY if every consumed flag was "always"
+//                                 // or a satisfied "conditional" AND no
+//                                 // "never"/"info"/unsatisfied-conditional flag
+//                                 // was consumed (i.e. the stripped form is
+//                                 // semantically equivalent for the decision)
+//     deny: string|null,          // set when a relative `-C` is seen
+//     infoOnly: bool,             // true when an "info" flag was consumed and
+//                                 // no verb followed (e.g. `git --help`)
+//   }
+//
+// Unknown flags starting with `-` (len > 1, not bare `-`/`--`) are treated as
+// never-strip booleans (consume exactly 1 token) so a mutation hidden behind an
+// unrecognized flag is STILL caught: the verb is extracted past it and tested
+// against GIT_MUTATION_VERBS by evaluate(). This is conservative — an unknown
+// flag yields a non-strippable classification, so the original form prompts.
+export function walkGitGlobals(tokens, commandCwd) {
+    const out = ["git"]; // rebuilt token list
+    let fullyStrippable = true;
+    let infoOnly = false;
     let i = 1;
-    while (i < tokens.length && GIT_SAFE_GLOBAL_FLAGS.has(tokens[i])) {
-        i++;
+
+    while (i < tokens.length) {
+        const tok = tokens[i];
+
+        // Verb boundary: bare `-`, `--` (options terminator), or a non-flag token.
+        if (tok === "-" || tok === "--" || !tok.startsWith("-")) {
+            const verb = tok === "--" ? (tokens[i + 1] ?? null) : tok;
+            return {
+                verb: verb ?? null,
+                rewrittenTokens: out.concat(tokens.slice(i + (tok === "--" ? 1 : 0))),
+                fullyStrippable: fullyStrippable && !infoOnly,
+                deny: null,
+                infoOnly,
+            };
+        }
+
+        const lookup = lookupGitGlobalFlag(tok);
+        if (!lookup) {
+            // Unknown flag: never-strip boolean, consume 1 token. Keeps the verb
+            // reachable for the mutation guard while guaranteeing no rewrite.
+            out.push(tok);
+            fullyStrippable = false;
+            i++;
+            continue;
+        }
+
+        const { entry, valueAttached } = lookup;
+        const { valueForm, stripPolicy } = entry;
+        let valueToken = null;
+
+        if (valueForm === "next") {
+            if (i + 1 >= tokens.length) {
+                // Flag needs a value but none follows — malformed; stop here,
+                // no verb. Conservatively not strippable.
+                return {
+                    verb: null,
+                    rewrittenTokens: out.concat(tokens.slice(i)),
+                    fullyStrippable: false,
+                    deny: null,
+                    infoOnly,
+                };
+            }
+            valueToken = tokens[i + 1];
+            i += 2;
+        } else if (valueForm === "eq") {
+            // Value attached via `=`; git also accepts a space-separated value,
+            // so consume the next token defensively when no `=` is present.
+            if (valueAttached === null) {
+                if (i + 1 >= tokens.length) {
+                    return {
+                        verb: null,
+                        rewrittenTokens: out.concat(tokens.slice(i)),
+                        fullyStrippable: false,
+                        deny: null,
+                        infoOnly,
+                    };
+                }
+                valueToken = tokens[i + 1];
+                i += 2;
+            } else {
+                i += 1;
+            }
+        } else {
+            // "optional-eq" (never consumes a next token) and "none".
+            i += 1;
+        }
+
+        // Apply the strip policy to decide whether the flag survives the
+        // internal stripped form.
+        if (stripPolicy === "always") {
+            continue; // drop (do not push)
+        }
+        if (stripPolicy === "info") {
+            infoOnly = true;
+            fullyStrippable = false;
+            if (valueForm === "next") out.push(tok, valueToken);
+            else out.push(tok);
+            continue;
+        }
+        if (stripPolicy === "never") {
+            fullyStrippable = false;
+            if (valueForm === "next") out.push(tok, valueToken);
+            else out.push(tok);
+            continue;
+        }
+        // stripPolicy === "conditional" (only `-C <path>`).
+        const rawPath = unquoteToken(valueToken);
+        if (!path.isAbsolute(rawPath)) {
+            // Relative `-C` (`.`, `..`, `subdir/...`) — deny with an actionable
+            // notice. Relative paths defeat the `=== commandCwd` no-op test
+            // (normalization / symlink / `..` hazards), so they are refused
+            // outright rather than auto-resolved.
+            return {
+                verb: null,
+                rewrittenTokens: out.concat([tok, valueToken]).concat(tokens.slice(i)),
+                fullyStrippable: false,
+                deny: "relative -C paths are not auto-normalized; use an absolute path equal to the working directory or drop -C",
+                infoOnly: false,
+            };
+        }
+        const resolvedC = path.resolve(rawPath);
+        const cwdNorm = path.resolve(commandCwd);
+        if (resolvedC === cwdNorm) {
+            continue; // absolute and === commandCwd: no-op, strip it
+        }
+        // Absolute in-project subdir OR external: KEEP (no internal strip).
+        // The verb is still extracted past it for the mutation guard and the
+        // routing hint (handled by evaluate).
+        fullyStrippable = false;
+        out.push(tok, valueToken);
     }
-    if (i === 1) {
-        return { changed: false, cmd }; // no leading safe global flag present
-    }
-    return { changed: true, cmd: ["git", ...tokens.slice(i)].join(" ") };
+
+    // Consumed only flags, no verb followed.
+    return {
+        verb: null,
+        rewrittenTokens: out,
+        fullyStrippable: fullyStrippable && !infoOnly,
+        deny: null,
+        infoOnly,
+    };
 }
 
 // Detect whether a command string is a vh-agent-harness exec invocation that
@@ -512,7 +617,7 @@ function isAllowedCommand(tokens) {
 }
 
 // ---------------------------------------------------------------------------
-// evaluate(command) — the single decision entrypoint.
+// evaluate(command, commandCwd) — the single decision entrypoint.
 //
 // Ported VERBATIM from the bash branch of the plugin's tool.execute.before
 // handler (the procedural body that ran on every `bash` tool invocation). The
@@ -520,6 +625,21 @@ function isAllowedCommand(tokens) {
 //   throw new Error(msg)        -> { action:"deny",  reason: msg }
 //   console.error(hint); return -> { action:"ask",   reason: hint }
 //   bare return (all checks ok) -> { action:"allow", reason: "" }
+//
+// commandCwd is the command's real working directory (the plugin wrapper
+// derives it from output.args.workdir, falling back to repoRoot()). It is the
+// reference for classifying `-C <abs path>`: a `-C` equal to it is an
+// in-project no-op; anything else is in-project-subdir or external. It
+// defaults to repoRoot() when omitted (eval.js / the Go bridge have no
+// workdir, so they use repoRoot).
+//
+// Return shape: { action:"allow"|"deny"|"ask", reason:"..." }. evaluate NEVER
+// returns a `rewrite` field and the plugin wrapper NEVER mutates the command —
+// detection/parse drives the DECISION only (see the file header). When every
+// consumed git global flag is execution-safe to drop, the STRIPPED token form
+// is matched against the internal allowlist so a readonly `git --no-pager
+// diff` is recognized as allow; this classification is internal and does not
+// escape as a command rewrite.
 //
 // contract:
 //   - NEVER throws on a deny — returns it.
@@ -529,7 +649,8 @@ function isAllowedCommand(tokens) {
 //   - command is a STRING (mirrors output.args.command). The Go bridge joins
 //     argv with single spaces before calling node.
 // ---------------------------------------------------------------------------
-export async function evaluate(command) {
+export async function evaluate(command, commandCwd) {
+    const cwd = commandCwd || repoRoot();
     // Empty / null / whitespace command guard.
     if (command == null || (typeof command === "string" && command.trim() === "")) {
         return { action: "deny", reason: "empty command" };
@@ -615,87 +736,126 @@ export async function evaluate(command) {
         };
     }
 
-    // Normalize optional leading `git -C <path>` into `git ...` so
-    // that BOTH downstream layers see the bare form:
-    //   - forbidden re-scan (below) re-catches mutations routed
-    //     through `-C` via the existing git-mutation-bypass regex;
-    //   - the allowlist (isAllowedCommand) re-matches readonly
-    //     subcommands without hitting the permission prompt.
-    // A validated, single, in-project `-C <path>` is stripped;
-    // anything out-of-project, malformed, multiple, or a symlink
-    // escape is a hard deny here. Non-git commands and git commands
-    // without `-C` pass through unchanged (no regression).
+    // Per-command git global-flag detect/parse via the registry walker.
+    //
+    // The walker consumes leading git global flags (value-form aware) and
+    // produces the verb + a rebuilt token list. Outcomes per command:
+    //   - deny (relative `-C`)                  -> hard deny + actionable notice
+    //   - infoOnly (e.g. `git --help`)          -> read-only info, auto-allow
+    //                                              this command (skip the
+    //                                              allowlist check below)
+    //   - verb in GIT_MUTATION_VERBS            -> hard deny (UNIFORM
+    //                                              mutation-slip guard — covers
+    //                                              external `-C`, `--git-dir`,
+    //                                              unknown flags; the verb is
+    //                                              extracted PAST any leading
+    //                                              flag so adjacency no longer
+    //                                              matters)
+    //   - readonly + fullyStrippable            -> push STRIPPED tokens so the
+    //                                              internal allowlist matches
+    //                                              the bare `git <verb> ...`
+    //                                              form (decision-internal; NO
+    //                                              command rewrite is produced)
+    //   - otherwise                             -> push ORIGINAL env-stripped
+    //                                              tokens (allowlist sees the
+    //                                              original -> prompt if unmatched)
+    //
+    // Each entry carries the walker-extracted verb so the routing hint below
+    // reasons about the REAL verb (e.g. `log` in `git --no-pager log`) rather
+    // than `blocked[1]`, which can be a polluted flag token (`--no-pager` is in
+    // GIT_READONLY_SUBCOMMANDS as a side effect of the `git --no-pager <sub> *`
+    // config entries). `autoAllow` marks info-only commands that skip the
+    // allowlist.
     const normalizedCommands = [];
     for (const tokens of commands) {
         const envStripped = stripLeadingEnvVars(tokens);
-        const cResult = normalizeGitC(envStripped);
-        if (cResult.deny) {
-            return {
-                action: "deny",
-                reason:
-                    "Blocked by shell-guard: " +
-                    cResult.deny +
-                    ". (git -C only accepts a single in-project" +
-                    " path. See docs/ai/shell-execution.md.)",
-            };
-        }
-        normalizedCommands.push(cResult.tokens);
-    }
 
-    // Re-run the forbidden-pattern scan on the stripped-token
-    // reconstruction for git commands. This reuses
-    // git-mutation-bypass as the single source of truth for
-    // mutation verbs (we do NOT duplicate the verb list), so
-    // `git -C <valid> commit` -> stripped `git commit` -> denied.
-    //
-    // CHANGE 1 (Q1a safety): normalize safe global flags (e.g.
-    // `--no-pager`) on the reconstruction BEFORE this re-scan, so
-    // `git --no-pager commit` (whose flag sits between `git` and the
-    // verb, defeating the git-mutation-bypass regex at scan #1) is
-    // re-caught once the flag is stripped. Scoped to this re-scan:
-    // the allowlist match below still sees the ORIGINAL tokens, so the
-    // config-table entries added for `git --no-pager <readonly-sub> *`
-    // remain the authority for the prompt-free readonly path. Mirrors
-    // the normalizeGitC re-scan pattern: normalize the reconstruction,
-    // re-run denyByForbiddenPatterns.
-    for (const tokens of normalizedCommands) {
-        if (tokens.length > 0 && tokens[0] === "git") {
-            const g = normalizeGitGlobalFlags(tokens.join(" "));
-            const reconstruction = g.changed ? g.cmd : tokens.join(" ");
-            const strippedForbidden =
-                denyByForbiddenPatterns(reconstruction);
-            if (strippedForbidden) {
+        if (envStripped.length > 0 && envStripped[0] === "git") {
+            const w = walkGitGlobals(envStripped, cwd);
+            if (w.deny) {
                 return {
                     action: "deny",
                     reason:
-                        `Blocked by shell-guard rule '${strippedForbidden.id}': ${strippedForbidden.why}` +
-                        " (See docs/ai/shell-execution.md → 'Forbidden patterns'." +
-                        " If you believe this is a false positive, surface the" +
-                        " command to the operator instead of working around it.)",
+                        "Blocked by shell-guard: " + w.deny +
+                        ". (See docs/ai/shell-execution.md.)",
                 };
             }
+            if (w.infoOnly) {
+                // Terminal read-only info request (`git --help`/`git --version`).
+                // Auto-allow this command without an allowlist match; no rewrite.
+                normalizedCommands.push({ tokens: envStripped, verb: w.verb, autoAllow: true });
+                continue;
+            }
+            // UNIFORM mutation-slip guard: the walker extracted the verb PAST
+            // any leading global flag, so `git -C <ext> commit`,
+            // `git --git-dir=/x commit`, and `git --no-pager commit` are all
+            // denied here regardless of flag adjacency. This reuses
+            // GIT_MUTATION_VERBS (the single source of truth that builds the
+            // git-mutation-bypass regex) — no verb-list duplication.
+            if (w.verb && GIT_MUTATION_VERBS.includes(w.verb)) {
+                return {
+                    action: "deny",
+                    reason:
+                        "Blocked by shell-guard rule 'git-mutation-bypass': " +
+                        "Git mutations must go through the commit-gate wrapper. " +
+                        "Only the committer agent (C) may execute git writes, " +
+                        "and only through `.opencode/scripts/commit-gate.sh`. " +
+                        "See .opencode/docs/git-execution-routing.md." +
+                        " (Verb '" + w.verb + "' routed past a global flag.)",
+                };
+            }
+            if (w.fullyStrippable) {
+                // Execution-safe to drop every consumed flag. Match the
+                // STRIPPED token form against the internal allowlist so a
+                // readonly `git --no-pager diff x` is recognized as
+                // `git diff x` (matches `git diff *`). This classification is
+                // INTERNAL to the allow/deny/ask decision — it does NOT produce
+                // a rewrite and the plugin wrapper does NOT mutate the command.
+                // opencode's L2 matcher still sees the ORIGINAL command text;
+                // prompt-free coverage for `git --no-pager <sub>` comes from
+                // the config-table `git --no-pager <sub> *` L2 rules, not a
+                // rewrite.
+                normalizedCommands.push({ tokens: w.rewrittenTokens, verb: w.verb, autoAllow: false });
+                continue;
+            }
+            // Not fully strippable (a `never`/`info` flag present, or `-C`
+            // pointing elsewhere): the allowlist sees the ORIGINAL tokens
+            // below, so the command prompts as before. The walker verb is
+            // still carried for the routing hint.
+            normalizedCommands.push({ tokens: envStripped, verb: w.verb, autoAllow: false });
+            continue;
         }
+
+        normalizedCommands.push({ tokens: envStripped, verb: null, autoAllow: false });
     }
 
     const blocked = normalizedCommands.find(
-        (tokens) => !isAllowedCommand(tokens),
+        (c) => !c.autoAllow && !isAllowedCommand(c.tokens),
     );
     if (!blocked) {
-        // Every parsed command matched the read-only allowlist: allow.
+        // Every parsed command was auto-allowed (info) or matched the read-only
+        // allowlist: allow. NO rewrite is returned — the plugin wrapper never
+        // mutates the command (detect/parse for the decision only).
         return { action: "allow", reason: "" };
     }
 
-    // Git non-read-only routing hint — O3 hint-only design (no agent identity).
-    if (blocked[0] === "git" && (blocked.length < 2 ||
-        !GIT_READONLY_SUBCOMMANDS.has(blocked[1]))) {
-        // Non-blocking: pass through (ask) so the caller's permission layer
-        // can apply ask/deny. The routing hint is the reason. (Mirrors the
-        // plugin's `console.error(hint); return;` passthrough.)
+    // Git routing hint — O3 hint-only design (no agent identity).
+    //
+    // By this point every git MUTATION has already been denied by the
+    // mutation-slip guard above. So any git command reaching the allowlist-
+    // failure is either a recognized readonly verb in an un-allowlisted flag
+    // form (e.g. `git --no-pager --paging=no log`, `git -C <ext> diff`,
+    // `git --git-dir=/x diff`) OR an unrecognized non-mutation verb. Both route
+    // to `ask` (prompt) — NOT a hard deny — so opencode's per-agent permission
+    // table decides. This uses the WALKER verb (blocked.verb), not blocked[1],
+    // so the `--no-pager` pollution of GIT_READONLY_SUBCOMMANDS cannot invert
+    // the decision. Non-git blocked commands still hard-deny.
+    if (blocked.tokens[0] === "git") {
         return {
             action: "ask",
             reason:
                 "[shell-guard] Non-read-only or unrecognized git command detected: " +
-                JSON.stringify(blocked) +
+                JSON.stringify(blocked.tokens) +
                 ". Only the committer agent may execute git mutations," +
                 " through the commit-gate wrapper. See" +
                 " .opencode/docs/git-execution-routing.md." +

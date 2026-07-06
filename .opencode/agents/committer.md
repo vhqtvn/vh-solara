@@ -182,6 +182,7 @@ The review MUST be treated as BLOCKED (release lock, report failure to A) if ANY
 6. **No task delegation except commit-reviewer.** May only invoke `commit-reviewer` for review. All other work stays within the protocol.
 7. **Preserve the commit message.** Use the message provided by A. Do not rewrite it.
 8. **Report machine-parseable results.** All outputs from the wrapper are JSON. Parse and relay the relevant fields to A.
+9. **Commit `docs/planning/backlog.md` ALONE.** The shared task-status ledger must NEVER travel in the same commit as code/docs changes — the commit-gate O1 preflight refuses an `acquire` whose `--paths` mixes `docs/planning/backlog.md` with any other path (status `path_error` / `backlog_must_commit_separately`). If a worker hands you a mixed path set, do NOT attempt to stage it: tell the worker to load the `backlog` skill and split — commit code first (without the ledger), then re-read `docs/planning/backlog.md` from disk and commit the backlog alone (backlog-only acquire). This is the W2/split-commit enforcement that keeps a concurrent backlog edit from `cas_conflict`-ing a clean code commit.
 
 ## Input from A
 

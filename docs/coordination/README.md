@@ -20,12 +20,47 @@ Use the existing source of truth that already owns each kind of state.
 
 | State | Canonical location | Notes |
 | --- | --- | --- |
-| Active task status | `docs/planning/backlog.md` | The backlog remains the canonical task queue and status ledger. |
+| Active task status | `docs/planning/backlog.md` | The backlog is the canonical task queue and status ledger — an **eventually-consistent** shared file. Agents edit it **freely**; split-commit is ENFORCED at the commit boundary by the commit-gate O1 preflight (`acquire` refuses any path list that mixes the ledger with code/docs), and residual drift is reconciled each cycle by the promoter (normalize-check + holding-area reconciliation + backlog-only commit). Code commits never wait on a backlog blob. |
 | Durable decisions, blockers, completions | `docs/checkpoints/` | Commit only durable snapshots worth reopening later. |
 | Release and environment facts | `docs/deployment/` | Keep provider/demo state in release docs, not in generic coordination files. |
 | Live task execution state | `.opencode/state/sessions/<alias>/` | Session-scoped task contracts, checkpoints, handoffs, and open questions. |
 | Live cross-session theme state | `.opencode/state/workstreams/<slug>/` | Long-lived local theme context that should not become backlog rows by default. |
+| Conditional candidate holding area | `.local/coordinator/tasks/` | Gitignored **transport, not truth** for DEFER/p2 follow-up candidates awaiting curation. Unpromoted candidates may be lost (intentionally fine). The promoter curates DoR-meeting candidates into `backlog.md`. |
 | Local operator overlays | `.local/coordinator/` | Private, gitignored operator state and preferences. |
+
+### Free-edits + curation model (eventual consistency)
+
+Agents edit `docs/planning/backlog.md` directly. The ledger is
+**eventually-consistent**: there is no real-time per-edit nudge (none is
+achievable in opencode v1.14.x), so safety is delivered by two layers that
+converge on correctness without blocking edits:
+
+1. **Hybrid split-commit conflict discipline (gate-enforced).** The commit-gate
+   O1 preflight refuses an `acquire` whose `--paths` mixes
+   `docs/planning/backlog.md` with any other path — so a backlog change can
+   never `cas_conflict` a code commit. The rejection message is the teaching:
+   agents learn split-commit at the commit boundary. On `cas_conflict` for a
+   backlog-only commit, re-read from the new HEAD, re-apply only your rows, and
+   retry. Dirty backlog edits are **preserved before any restore** — never
+   blind-revert `backlog.md`. See [PROMOTER_RUNBOOK.md](PROMOTER_RUNBOOK.md).
+2. **Intake curation.** DEFER findings and p2 follow-ups NEVER become backlog
+   rows directly. They land in `.local/coordinator/tasks/` as
+   conditional candidates and reach the backlog only after a trigger fires AND
+   the promotion Definition of Ready is met (concrete area + file scope +
+   validation plan + clear slice + provenance). The promoter runs the
+   `check-defer-triggers.js` predicate checker as a review aid (promoter-use-
+   only; never a commit hook; never blocking).
+
+The **promoter** curates candidates, batch-promotes a cycle's consolidated
+status transitions (normalize + archive + one backlog commit), and runs the
+narrow eventual-consistency pass (normalize `--check`, holding-area ↔ backlog
+reconciliation, blind-revert-symptom detection) that repairs residual drift.
+It is a curator and cycle-consolidator, not the sole writer — agents write
+their own rows.
+
+See [PROMOTER_RUNBOOK.md](PROMOTER_RUNBOOK.md) for the promoter procedure,
+the eventual-consistency pass, conflict resolution, and the Definition of
+Ready.
 
 ## Coordination Planes
 
@@ -82,7 +117,10 @@ Use:
 ## Coordination Rules
 
 1. Keep `docs/planning/backlog.md` as the only committed task-status source of
-   truth.
+   truth. Agents edit it freely; commit backlog changes SEPARATELY from code so
+   a concurrent backlog edit can never block a clean code commit. DEFER/p2
+   follow-ups route to `.local/coordinator/tasks/` as conditional
+   candidates, not direct backlog rows.
 2. Keep `docs/checkpoints/` as the durable record for meaningful blockers,
    decisions, and closeouts.
 3. Keep `.opencode/state/` as local runtime coordination state.
@@ -100,8 +138,10 @@ Use:
    or perform inline research that belongs in a researcher session.
 7. For medium and long tasks, use structured report envelopes instead of freeform
    chat summaries.
-8. Only one coordinator or synthesizer writes back to canonical backlog or
-   checkpoint state for a given fan-in cycle.
+8. Commit backlog SEPARATELY from code each cycle (hybrid split-commit). At
+   fan-in, one synthesizer writes the durable closeout in `docs/checkpoints/`,
+   not every worker. DEFER/p2 candidates are curated into the backlog by the
+   promoter only after trigger + Definition of Ready.
 9. When a coordination change alters durable operating rules, update the
    matching OpenCode or GitHub instruction surface in the same slice.
 

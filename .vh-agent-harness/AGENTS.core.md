@@ -264,18 +264,88 @@ When making changes:
 The canonical planning documents live under `docs/planning/` and `docs/checkpoints/`.
 
 ### Canonical files
-- `docs/planning/backlog.md` is the source of truth for task status.
+- `docs/planning/backlog.md` is the source of truth for task status. Agents
+  edit it **freely**; conflict discipline is enforced at the commit/workflow
+  layer, not by blocking edits (see "Conflict discipline" below).
 - `docs/planning/archive/` stores older `done` / `cancelled` rows moved out of the active backlog for on-demand retrieval.
 - `docs/planning/roadmap.md` describes phase ordering and milestone intent.
 - `docs/checkpoints/` stores dated progress snapshots only when a checkpoint is worth committing.
 
+### Conflict discipline (hybrid split-commit)
+
+Agents edit `docs/planning/backlog.md` freely. The disciplines that keep a
+backlog edit from blocking a code commit live at the **commit/workflow layer**,
+not in the permission map:
+
+- **Re-read from disk before editing** — the file is a shared ledger; always
+  load the latest content from disk immediately before your edit so you build
+  on current state, not a stale copy.
+- **Edit only your own task rows** — scope your edit to the rows you own
+  (matched by stable task ID). Do not touch unrelated rows.
+- **Commit backlog SEPARATELY from code** — never bundle a backlog-status
+  change into a code commit. A code commit carries code (+ tests + the docs
+  that justify the code); a backlog commit carries backlog rows. One backlog
+  commit per work cycle is the target. This is what keeps a concurrent
+  backlog edit from blocking a clean code commit.
+- **On `cas_conflict`, re-read + re-apply + retry — do NOT revert
+  `backlog.md` to unblock.** Reverting the shared ledger to HEAD discards
+  other agents' promoted state. The canonical recovery is to re-read the file
+  from the new HEAD, re-apply only your rows, and retry. The
+  `commit-gate.sh revert` path is for stray CODE files this session does not
+  own; it must NOT be used on `backlog.md`.
+
+Load the `backlog` skill (`.opencode/skills/backlog/SKILL.md`) for the full
+quick-reference before substantial backlog work. A non-blocking reminder fires
+on the first edit of `backlog.md` per session.
+
+### DEFER / follow-up curation (intake, not direct rows)
+
+DEFER findings and p2 follow-up/cleanup items NEVER become backlog rows
+directly. They land in `.local/coordinator/tasks/` as **conditional
+candidates** (transport, not truth) and reach `backlog.md` only after a
+trigger fires AND the promoter applies the promotion Definition of Ready:
+
+- **Capture** a DEFER/follow-up via `/write-task` into
+  `.local/coordinator/tasks/` with Notes-prefix provenance:
+  `source:review-defer` (or `source:p2-followup`), `trigger:path_touched(<path>)`
+  (or another approved predicate), `studied:YYYY-MM-DD`.
+- **Holding area is transport, not truth.** Unpromoted candidates may be lost —
+  this is intentionally fine, because they are not trusted work yet. Do not
+  create a parallel committed ledger for them.
+- **Promotion Definition of Ready (DoR):** a candidate reaches `backlog.md`
+  only if ALL of: trigger has fired (or operator override) + concrete area +
+  file scope + validation plan + clear slice + provenance Notes. Run the
+  predicate checker (`node .opencode/scripts/check-defer-triggers.js`) as a
+  promotion-review aid — it is **promoter-use-only**, never wired into a commit
+  hook, never blocking.
+- **Reviewer DEFER never becomes a direct backlog row.** A `/commit-review`
+  DEFER finding is captured to `.local/` and curated later; it is not
+  transcribed into `backlog.md` in the same slice.
+
+### Picking contract (R1)
+
+Before acting on any backlog row, **re-study the cited files/state**. A backlog
+row is a pointer, not a complete specification: re-read the referenced code,
+docs, and prior decisions, then act on the current reality rather than the
+row's summary.
+
 ### Agent update requirements
-- Before substantial work, update the matching row in `docs/planning/backlog.md` to `in_progress` and add owner/date notes. If no matching row exists, add a new task instead of reusing an unrelated one.
-- When finishing work, move the task to `done` and record the changed files and verification performed.
-- If new follow-up work is discovered, add a new task with a new ID instead of overloading the current task.
-- If blocked, move the task to `blocked` with the exact blocker and the next decision needed.
-- Do not delete old tasks silently. Move abandoned items to `cancelled` and leave a short reason.
-- After backlog edits that complete/cancel work or otherwise create section drift, run the backlog normalizer (`/backlog-cleanup` or `vh-agent-harness exec node .opencode/scripts/normalize-backlog.js`) so `Now` / `Next` / `Later` stay active-only and older history is archived under `docs/planning/archive/`.
+- Before substantial work, set the row to `in_progress` (+ owner + date) with a
+  direct edit. Re-read from disk first; edit only your row.
+- When finishing work, set the row to `done` with the changed files and
+  verification performed, in a backlog commit SEPARATE from the code commit.
+- If new follow-up work is discovered, capture it as a conditional candidate in
+  `.local/coordinator/tasks/` (see "DEFER / follow-up curation"); do
+  NOT add it to `backlog.md` unless its trigger has fired and it meets the DoR.
+- If blocked, set the row to `blocked` with the exact blocker and the next
+  decision needed.
+- Do not delete old tasks silently. Move abandoned items to `cancelled` with a
+  short reason.
+- After batch-editing `backlog.md` in a way that completes/cancels work or
+  creates section drift, run the backlog normalizer (`/backlog-cleanup` or
+  `vh-agent-harness exec node .opencode/scripts/normalize-backlog.js`) so
+  `Now` / `Next` / `Later` stay active-only and older history is archived under
+  `docs/planning/archive/`.
 - Do not rewrite unrelated task history while updating the backlog.
 
 ### Task formatting rules

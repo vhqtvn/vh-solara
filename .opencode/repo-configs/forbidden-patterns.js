@@ -24,6 +24,13 @@
 
 import { FORBIDDEN_PATTERNS as _CORE } from "./forbidden-patterns.core.js";
 
+// Re-export the canonical git mutation verb set so shell-guard-core.js can
+// import BOTH FORBIDDEN_PATTERNS and GIT_MUTATION_VERBS from this single
+// aggregator (one rule-load path). This keeps the verb list in exactly one
+// place (forbidden-patterns.core.js) and lets the walker's mutation-slip guard
+// reuse it without duplicating the alternation.
+export { GIT_MUTATION_VERBS } from "./forbidden-patterns.core.js";
+
 // Attempt to load the OPTIONAL project overlay. Absent-overlay is benign; a
 // present-but-broken overlay must fail loudly (do not swallow syntax/runtime
 // errors — only the module-not-found codes).

@@ -8,8 +8,8 @@
 #   heartbeat --uuid UUID
 #   status
 #   revert    --paths '<JSON_ARRAY>' | --paths-file FILE | <path> [<path>...]
-#   stage-message --uuid UUID    # reads message from STDIN, writes msg-${UUID}
-#                                # atomically (temp + rename)
+#   stage-message --uuid UUID    # (deprecated) reads message from STDIN,
+#                                # writes msg-${UUID} atomically (temp + rename)
 #
 # Subcommands (legacy — inline form, avoid for messages with newlines/backticks):
 #   acquire   --paths JSON_ARRAY [--message MSG] [--session-alias ALIAS]
@@ -431,6 +431,71 @@ print('\n'.join(paths))
     # Non-empty JSON input produced empty output without error — shouldn't happen
     # but guard against silent parse issues
     json_out "{\"status\":\"path_error\",\"reason\":\"paths_json_invalid\"}"
+    return 1
+  fi
+
+  # -------------------------------------------------------------------
+  # O1 packaging-policy preflight (W2/split-commit enforcement).
+  #
+  # This is NOT a merge-algorithm change — it is a pre-acquire path-list
+  # guard. The shared docs/planning/backlog.md ledger MUST NOT travel in the
+  # same commit as code/docs changes: a concurrent backlog edit would
+  # cas_conflict the entire code commit (the original W1 problem). With no
+  # real-time per-edit nudge achievable in opencode v1.14.x, agents learn the
+  # discipline HERE, at the commit boundary — the rejection message below IS
+  # the teaching, which makes split-commit ENFORCED rather than advisory.
+  #
+  # ALLOW: docs/planning/backlog.md alone, OR a path list with no backlog file.
+  # REJECT: docs/planning/backlog.md appears alongside any other path.
+  #
+  # Path comparison is NORMALIZED, not exact-string: a git-valid but
+  # non-canonical spelling (./prefix, embedded /./, /../ collapse) must still
+  # trip the guard. Reuses the same lexical stack algorithm as
+  # _validate_in_repo_path (ports normalizeGitCPath): split on '/', drop "."
+  # and empty segments, pop the stack on "..". No fs reads (lexical only).
+  # -------------------------------------------------------------------
+  local _has_backlog=0 _total_paths=0 _p _seg _part
+  local -a _stk
+  while IFS= read -r _p; do
+    [[ -z "$_p" ]] && continue
+    _total_paths=$((_total_paths + 1))
+    # Lexical normalization to canonical repo-relative form.
+    _stk=()
+    _seg="$_p"
+    while [[ -n "$_seg" ]]; do
+      [[ "$_seg" == /* ]] && _seg="${_seg:1}"
+      if [[ "$_seg" == */* ]]; then
+        _part="${_seg%%/*}"
+        _seg="${_seg#*/}"
+      else
+        _part="$_seg"
+        _seg=""
+      fi
+      case "$_part" in
+        ""|".") continue ;;
+        "..")
+          ((${#_stk[@]})) && unset '_stk[${#_stk[@]}-1]'
+          ;;
+        *) _stk+=("$_part") ;;
+      esac
+    done
+    local _norm=""
+    ((${#_stk[@]})) && _norm="$(IFS=/; printf '%s' "${_stk[*]}")"
+    [[ "$_norm" == "docs/planning/backlog.md" ]] && _has_backlog=1
+  done <<< "$path_list"
+  if [[ $_has_backlog -eq 1 && $_total_paths -gt 1 ]]; then
+    cat >&2 <<'EOF'
+docs/planning/backlog.md must be committed separately from code/docs changes (W1 conflict-prevention policy).
+Recovery:
+  1. Split this slice: commit the code without the backlog ledger first.
+  2. Re-read the current docs/planning/backlog.md from disk.
+  3. Re-apply ONLY your owned row changes (stable IDs; never rewrite another lane's row).
+  4. Run: node .opencode/scripts/normalize-backlog.js --check
+  5. Commit the backlog alone (backlog-only acquire).
+  6. Load the `backlog` skill for the full procedure.
+Do NOT `commit-gate.sh revert docs/planning/backlog.md` to resolve a conflict.
+EOF
+    json_out "{\"status\":\"path_error\",\"reason\":\"backlog_must_commit_separately\",\"backlog_path\":\"docs/planning/backlog.md\",\"path_count\":${_total_paths}}"
     return 1
   fi
 
@@ -1342,31 +1407,35 @@ print(json.dumps(sys.argv[1:]))
 }
 
 # ---------------------------------------------------------------------------
-# Subcommand: stage-message
+# Subcommand: stage-message   (DEPRECATED — see rationale below)
 #
-# Atomic commit-message writer (INFRA-GATE-004a). The committer agent has
-# edit:deny and cannot use the Write tool for .git/* paths; inline
-# `--message "..."` breaks shell-guard's tree-sitter safe-parser on
-# newlines/backticks; and the prior per-line `echo >> msg-${UUID}` mandate
-# exhausted the agent step budget on long messages. This subcommand lets the
-# committer stage the full message in ONE tool call:
+# DEPRECATED (decision C3; v0.2.1 migration). The mandated commit-message
+# flow since v0.2.1 is: the committer authors the message with the Write tool
+# at tmp/commit-gate-message/msg-${UUID}, then passes it via
+# `acquire --message-file FILE` / `commit --message-file FILE` (--message-file
+# is accepted symmetrically on BOTH subcommands). That path is one Write call
+# + one --message-file flag and does not need this subcommand.
 #
-#   commit-gate.sh stage-message --uuid UUID <<'GATE_MSG_EOF'
-#   <full message body, including backticks/$/quotes/newlines>
-#   GATE_MSG_EOF
+# This subcommand is retained for backward compatibility and for symmetry in
+# the SKIP_COMMIT_GATE dispatch path; it is NOT removed. The v0.2.1 migration
+# BANS the heredoc form (the STDIN <<'GATE_MSG_EOF' idiom this command was
+# built around) — new committer code MUST use the Write-tool -> --message-file
+# flow instead. Invoking it prints a one-line deprecation notice to stderr.
 #
-# tree-sitter-bash honors the QUOTED heredoc delimiter: the body is literal
-# (no spurious command nodes from `git commit` / $(...) / $VAR inside it) and
-# commandParts skips the redirect token, so the invocation parses to a single
-# command `[commit-gate.sh, stage-message, --uuid, UUID]` — allowlisted under
-# the `gate` array in .opencode/repo-configs/allowed-commands.js. The
-# git-mutation-bypass allowIf exempts the gate-wrapper prefix, so a body that
-# literally contains `git commit`/`git reset` does not trigger a deny.
+# Historical context (INFRA-GATE-004a): stage-message predates the scoped
+# edit-permission model. The original rationale claimed the committer had
+# flat edit:deny — that was never accurate for the rendered output:
+# internal/permconfig emits the committer's edit permission as the scoped
+# object form {"*":"deny","tmp/commit-gate-message/**":"allow"} (see
+# internal/permconfig/tables.go: EditOverrides + CommitGateMessageGlob, and
+# emit.go: computeEditBlock), so the committer CAN Write the message file
+# directly. (Note: templates/core/opencode.jsonc.tmpl still carries a flat
+# "edit":"deny" literal and disagrees with the emitter; that template seam
+# is tracked separately and is NOT fixed here.)
 #
-# The message is written ATOMICALLY: STDIN -> sibling temp file -> rename
-# into ${GATE_INDEX_DIR}/msg-${UUID}. On ANY failure the temp file is removed
-# and a JSON error is returned -- a partial msg-${UUID} is never left in place.
-#
+# The write itself is still ATOMIC: STDIN -> sibling temp file -> rename into
+# ${GATE_INDEX_DIR}/msg-${UUID}. On ANY failure the temp file is removed and
+# a JSON error is returned -- a partial msg-${UUID} is never left in place.
 # This is a pure scratch-file write (no gating to bypass), so it routes to
 # cmd_stage_message unchanged in BOTH the normal and SKIP_COMMIT_GATE
 # dispatch paths.
@@ -1375,6 +1444,12 @@ print(json.dumps(sys.argv[1:]))
 #   commit-gate.sh stage-message --uuid UUID    # reads message from STDIN
 # ---------------------------------------------------------------------------
 cmd_stage_message() {
+  # Deprecation notice (decision C3): routed to stderr so the JSON status
+  # object on stdout is not corrupted. The v0.2.1-mandated flow is the
+  # Write tool -> acquire/commit --message-file; this subcommand is retained
+  # for backward compatibility and SKIP_COMMIT_GATE symmetry only.
+  echo "stage-message: deprecated; use Write tool -> acquire/commit --message-file" >&2
+
   local uuid=""
 
   while [[ $# -gt 0 ]]; do

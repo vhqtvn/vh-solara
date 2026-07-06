@@ -88,8 +88,13 @@ A finding MAY be marked DEFER ONLY if:
 If you cannot express the trigger in the grammar, the finding is DROP,
 not DEFER.
 
-Phase 1 note: DEFER findings are recorded as non-blocking with a trigger
-note in text. No DEFER persistence is implemented yet.
+Phase 1 note: DEFER findings are non-blocking. The trigger grammar above IS the
+intake predicate — a DEFER finding should be captured into
+`.local/coordinator/tasks/` (via `/write-task`) as a conditional
+candidate (transport, not truth) with Notes provenance (`source:review-defer`,
+the trigger expression, `studied:YYYY-MM-DD`). It reaches
+`docs/planning/backlog.md` only after the trigger fires AND the promoter applies
+the Definition of Ready. DEFER never becomes a direct backlog row.
 
 ### DROP criteria (the default)
 
