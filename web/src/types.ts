@@ -137,6 +137,13 @@ export interface Permission {
   // command/path patterns it covers, and tool metadata (often {command,...}).
   permission?: string;
   patterns?: string[];
+  // The arity-prefix wildcard patterns OpenCode grants server-side when the
+  // operator replies "always" (e.g. ["git diff *", "npm run build *"]). The
+  // daemon relays the permission payload untouched (pkg/state/store.go), so
+  // this field is already present at runtime — declaring it here lets
+  // PermissionCard surface the "Always" grant set instead of approving it
+  // blind. ["*"] is the single-catch-all special case.
+  always?: string[];
   metadata?: Record<string, unknown>;
   [k: string]: unknown;
 }
