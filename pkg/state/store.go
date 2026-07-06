@@ -1430,14 +1430,37 @@ func (s *Store) deletePartLocked(sessionID, messageID, partID string) {
 	s.recomputeLastAssistantLocked(sessionID)
 }
 
-// Snapshot returns the current view and the head seq. The session tree, todos,
-// permissions, and statuses are always included (they are small); messages are
-// included only for sessions in messagesFor. A nil messagesFor includes all
-// sessions' messages; an empty (non-nil) map includes none — letting a phone
-// fetch a tree-only snapshot and pull message history per session on demand.
+// Snapshot returns the current view and the head seq. The filter has THREE
+// shapes, all load-bearing for the web session-load latency contract:
+//   - messagesFor == nil          → firehose: every session's messages AND every
+//     per-session structural row (Sessions/Gate/Questions/Activity/LastAgents/
+//     CurrentVerbs/Permissions/Todos/Statuses/Unread). Used by ?sessions=all.
+//   - messagesFor != nil && empty → Stream-1 tree owner: the FULL structural
+//     tree for ALL sessions (the session-list view) but NO messages. The full
+//     tree here is sacred — it is the session-list view.
+//   - messagesFor != nil && > 0   → Stream-2 "open one session": SCOPE. Only the
+//     SELECTED sessions' structural rows AND messages ship; every other session
+//     is omitted entirely from the per-session-keyed maps. The Stream-2 consumer
+//     (applySessionSnapshot / fetchSessionMessages) reads only
+//     snap.messages[id] + snap.gate[id].messagesLoaded, so omitting unselected
+//     sessions' structural rows is safe and avoids shipping the whole tree on
+//     every "open one session" request.
+//
+// scopeSelected gates ONLY the len > 0 case; nil and empty-{} are UNCHANGED.
 func (s *Store) Snapshot(messagesFor map[string]bool) Snapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	scopeSelected := messagesFor != nil && len(messagesFor) > 0
+	// inScope reports whether a session's per-session structural rows should
+	// ship. When scopeSelected, only the selected sessions ship; nil/{} ship
+	// every session (firehose / full tree).
+	inScope := func(sid string) bool {
+		if !scopeSelected {
+			return true
+		}
+		return messagesFor[sid]
+	}
 
 	// Flush any unflushed streaming accumulators first so the snapshot reflects
 	// the live accumulated text, not the last throttle-window flush (a
@@ -1447,9 +1470,27 @@ func (s *Store) Snapshot(messagesFor map[string]bool) Snapshot {
 	// existing single-writer serialization. emit=false: this is a point-in-time
 	// read — the live tail gets its part.upsert emits from the throttle flush in
 	// appendPartDeltaLocked, so a silent flush here sends no duplicate event.
-	for _, sm := range s.messages {
-		for _, me := range sm.byID {
-			me.flushPartDeltasLocked(s, false)
+	//
+	// When scopeSelected, only the selected sessions are flushed. This is safe:
+	// deltaBuf is owned strictly per messageEntry (per session/message) and a
+	// flush touches only that entry's own me.parts (no cross-session invariant),
+	// and flushPartDeltasLocked KEEPS the accumulators — so an unselected
+	// session's buffered deltas stay intact and converge on the next full
+	// Snapshot(nil)/Snapshot({}) or the throttle flush in appendPartDeltaLocked.
+	// No data loss.
+	if scopeSelected {
+		for sid := range messagesFor {
+			if sm := s.messages[sid]; sm != nil {
+				for _, me := range sm.byID {
+					me.flushPartDeltasLocked(s, false)
+				}
+			}
+		}
+	} else {
+		for _, sm := range s.messages {
+			for _, me := range sm.byID {
+				me.flushPartDeltasLocked(s, false)
+			}
 		}
 	}
 
@@ -1467,9 +1508,15 @@ func (s *Store) Snapshot(messagesFor map[string]bool) Snapshot {
 		CurrentVerbs: map[string]VerbFacet{},
 	}
 	// Per-session gate facts (denormalized; see GateFacts). subtree_busy needs a
-	// tree walk, so compute it once here in O(n) and index per session.
+	// tree walk, so compute it once here in O(n) and index per session. The walk
+	// is ALWAYS global even when scopeSelected: a selected session's subtree_busy
+	// depends on its descendants, which may themselves be unselected. Only the
+	// per-session READ into snap.Gate below is scoped by inScope.
 	subtreeBusy := s.computeSubtreeBusyLocked()
 	for sid, se := range s.sessions {
+		if !inScope(sid) {
+			continue
+		}
 		act := s.activity[sid]
 		if act == "" {
 			act = ActivityIdle // a never-touched session renders idle
@@ -1506,17 +1553,28 @@ func (s *Store) Snapshot(messagesFor map[string]bool) Snapshot {
 		}
 	}
 	for sid, m := range s.questions {
+		if !inScope(sid) {
+			continue
+		}
 		for _, q := range m {
 			snap.Questions[sid] = append(snap.Questions[sid], q)
 		}
 	}
 	for sid, st := range s.activity {
+		if !inScope(sid) {
+			continue
+		}
 		snap.Activity[sid] = st
 	}
 	for id := range s.unread {
-		snap.Unread = append(snap.Unread, id)
+		if inScope(id) {
+			snap.Unread = append(snap.Unread, id)
+		}
 	}
-	for _, se := range s.sessions {
+	for sid, se := range s.sessions {
+		if !inScope(sid) {
+			continue
+		}
 		snap.Sessions = append(snap.Sessions, se.info)
 	}
 	for sid, sm := range s.messages {
@@ -1538,14 +1596,23 @@ func (s *Store) Snapshot(messagesFor map[string]bool) Snapshot {
 		snap.Messages[sid] = list
 	}
 	for sid, t := range s.todos {
+		if !inScope(sid) {
+			continue
+		}
 		snap.Todos[sid] = t
 	}
 	for sid, m := range s.perms {
+		if !inScope(sid) {
+			continue
+		}
 		for _, perm := range m {
 			snap.Permissions[sid] = append(snap.Permissions[sid], perm)
 		}
 	}
 	for sid, st := range s.statuses {
+		if !inScope(sid) {
+			continue
+		}
 		snap.Statuses[sid] = st
 	}
 	return snap

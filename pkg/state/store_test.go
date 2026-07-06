@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"sort"
 	"testing"
+	"time"
 
 	"github.com/vhqtvn/vh-solara/pkg/opencode"
 )
@@ -932,5 +933,226 @@ func TestEmitMessagesLoadedError(t *testing.T) {
 	}
 	if loadN != 1 || errN != 1 {
 		t.Fatalf("replay must contain 1 messages.loaded + 1 messages.error, got load=%d err=%d", loadN, errN)
+	}
+}
+
+// sessionIDsFromSnapshot unmarshals snap.Sessions (raw info blobs) into a set of
+// session IDs, so a scoping test can assert which sessions shipped without
+// depending on slice order (map-iteration order is non-deterministic).
+func sessionIDsFromSnapshot(t *testing.T, snap Snapshot) map[string]bool {
+	t.Helper()
+	out := map[string]bool{}
+	for _, raw := range snap.Sessions {
+		var e sessionEnvelope
+		if json.Unmarshal(raw, &e) == nil && e.ID != "" {
+			out[e.ID] = true
+		}
+	}
+	return out
+}
+
+// setupTwoSessionStore seeds a store with two sessions (a, b), each carrying a
+// representative spread of per-session structural data so a scoping test can
+// assert each field is included/excluded independently: an assistant message
+// (→ Messages + LastAgents), a pending permission (→ Permissions +
+// Gate.PendingPermission), and a pending question (→ Questions +
+// Gate.PendingQuestion). SetSessionMessages (the authoritative history-fetch
+// path) both populates messages AND flips msgLoaded[sid]=true, so the gate's
+// MessagesLoaded field is meaningful for the FE-contract assertion. Both
+// sessions are marked idle so they appear in Activity.
+func setupTwoSessionStore(t *testing.T) *Store {
+	t.Helper()
+	s := New(100)
+	for _, sid := range []string{"a", "b"} {
+		s.Apply(ev("session.created", `{"info":{"id":"`+sid+`"}}`))
+		s.SetSessionMessages(sid, []MessageWithParts{
+			{Info: json.RawMessage(`{"id":"m_` + sid + `","sessionID":"` + sid + `","role":"assistant","agent":"builder"}`),
+				Parts: []json.RawMessage{json.RawMessage(`{"id":"p_` + sid + `","sessionID":"` + sid + `","messageID":"m_` + sid + `","type":"text","text":"hi"}`)}},
+		})
+		s.Apply(ev("permission.asked", `{"id":"perm_`+sid+`","sessionID":"`+sid+`","permission":"bash"}`))
+		s.Apply(ev("question.asked", `{"id":"q_`+sid+`","sessionID":"`+sid+`"}`))
+		s.MarkIdle(sid)
+	}
+	// Deterministically seed LastAgents (the scoping test cares about WHICH
+	// sessions ship, not how lastAgent was derived).
+	s.SetLastAgents(map[string]string{"a": "builder", "b": "builder"})
+	return s
+}
+
+// TestSnapshotNilIsFirehose pins the messagesFor==nil contract: every session's
+// messages AND every per-session structural row ship. Slice 2 leaves this case
+// UNCHANGED.
+func TestSnapshotNilIsFirehose(t *testing.T) {
+	s := setupTwoSessionStore(t)
+	snap := s.Snapshot(nil)
+
+	ids := sessionIDsFromSnapshot(t, snap)
+	if !ids["a"] || !ids["b"] {
+		t.Fatalf("nil snapshot must ship BOTH sessions, got sessions=%v", ids)
+	}
+	for _, sid := range []string{"a", "b"} {
+		if msgs, ok := snap.Messages[sid]; !ok || len(msgs) != 1 {
+			t.Fatalf("nil snapshot must ship %q's messages, got Messages[%q]=%v", sid, sid, snap.Messages[sid])
+		}
+		if _, ok := snap.Gate[sid]; !ok {
+			t.Fatalf("nil snapshot must ship %q's gate", sid)
+		}
+		if _, ok := snap.Permissions[sid]; !ok || len(snap.Permissions[sid]) != 1 {
+			t.Fatalf("nil snapshot must ship %q's permission", sid)
+		}
+		if _, ok := snap.Questions[sid]; !ok || len(snap.Questions[sid]) != 1 {
+			t.Fatalf("nil snapshot must ship %q's question", sid)
+		}
+		if _, ok := snap.LastAgents[sid]; !ok {
+			t.Fatalf("nil snapshot must ship %q's lastAgent", sid)
+		}
+		if _, ok := snap.Activity[sid]; !ok {
+			t.Fatalf("nil snapshot must ship %q's activity", sid)
+		}
+	}
+}
+
+// TestSnapshotEmptyIsTreeOnly pins the Stream-1 contract (messagesFor != nil &&
+// empty): NO messages, but the FULL structural tree for ALL sessions — it is the
+// session-list view. Slice 2 leaves this case UNCHANGED.
+func TestSnapshotEmptyIsTreeOnly(t *testing.T) {
+	s := setupTwoSessionStore(t)
+	snap := s.Snapshot(map[string]bool{})
+
+	// Tree-only: NO messages at all.
+	if len(snap.Messages) != 0 {
+		t.Fatalf("empty-filter (tree-only) snapshot must ship NO messages, got %d sessions", len(snap.Messages))
+	}
+	// ...but the FULL structural tree for ALL sessions.
+	ids := sessionIDsFromSnapshot(t, snap)
+	if !ids["a"] || !ids["b"] {
+		t.Fatalf("tree-only snapshot must still ship BOTH sessions (full tree), got sessions=%v", ids)
+	}
+	for _, sid := range []string{"a", "b"} {
+		if _, ok := snap.Gate[sid]; !ok {
+			t.Fatalf("tree-only snapshot must ship %q's gate (full tree)", sid)
+		}
+		if _, ok := snap.Permissions[sid]; !ok {
+			t.Fatalf("tree-only snapshot must ship %q's permission (full tree)", sid)
+		}
+		if _, ok := snap.Questions[sid]; !ok {
+			t.Fatalf("tree-only snapshot must ship %q's question (full tree)", sid)
+		}
+		if _, ok := snap.LastAgents[sid]; !ok {
+			t.Fatalf("tree-only snapshot must ship %q's lastAgent (full tree)", sid)
+		}
+	}
+}
+
+// TestSnapshotScopedOmitsUnselected is the core Slice 2 assertion: a non-empty
+// filter (Stream-2 "open one session") ships messages + per-session structural
+// rows for the SELECTED session ONLY. An unrelated session "b" is omitted from
+// EVERY per-session-keyed structural map (Sessions/Gate/Questions/Activity/
+// LastAgents/Permissions). It also covers the FE contract: the open-session
+// stream reads gate[a].messagesLoaded, so gate["a"] must be present.
+func TestSnapshotScopedOmitsUnselected(t *testing.T) {
+	s := setupTwoSessionStore(t)
+	snap := s.Snapshot(map[string]bool{"a": true})
+
+	// Messages: only "a".
+	if msgs, ok := snap.Messages["a"]; !ok || len(msgs) != 1 {
+		t.Fatalf(`scoped snapshot must ship selected "a"'s messages, got Messages[a]=%v`, snap.Messages["a"])
+	}
+	if _, ok := snap.Messages["b"]; ok {
+		t.Fatal(`scoped snapshot must NOT ship unselected "b"'s messages`)
+	}
+
+	// Sessions slice: only "a".
+	ids := sessionIDsFromSnapshot(t, snap)
+	if !ids["a"] {
+		t.Fatalf(`scoped snapshot must ship selected "a"'s session row, got sessions=%v`, ids)
+	}
+	if ids["b"] {
+		t.Fatalf(`scoped snapshot must NOT ship unselected "b"'s session row, got sessions=%v`, ids)
+	}
+
+	// Every per-session structural map: "a" present, "b" ABSENT.
+	if _, ok := snap.Gate["a"]; !ok {
+		t.Fatal(`scoped snapshot must ship selected "a"'s gate`)
+	}
+	if _, ok := snap.Gate["b"]; ok {
+		t.Fatal(`scoped snapshot must NOT ship unselected "b"'s gate`)
+	}
+	// FE contract: applySessionSnapshot reads snap.gate[a].messagesLoaded. It
+	// must be present (and true here, since SetSessionMessages flipped msgLoaded).
+	if !snap.Gate["a"].MessagesLoaded {
+		t.Fatalf(`scoped snapshot gate["a"].messagesLoaded must be true after SetSessionMessages, got false`)
+	}
+
+	if _, ok := snap.Permissions["a"]; !ok || len(snap.Permissions["a"]) != 1 {
+		t.Fatalf(`scoped snapshot must ship "a"'s permission, got Permissions[a]=%v`, snap.Permissions["a"])
+	}
+	if _, ok := snap.Permissions["b"]; ok {
+		t.Fatal(`scoped snapshot must NOT ship "b"'s permission`)
+	}
+
+	if _, ok := snap.Questions["a"]; !ok || len(snap.Questions["a"]) != 1 {
+		t.Fatalf(`scoped snapshot must ship "a"'s question, got Questions[a]=%v`, snap.Questions["a"])
+	}
+	if _, ok := snap.Questions["b"]; ok {
+		t.Fatal(`scoped snapshot must NOT ship "b"'s question`)
+	}
+
+	if _, ok := snap.LastAgents["a"]; !ok {
+		t.Fatal(`scoped snapshot must ship "a"'s lastAgent`)
+	}
+	if _, ok := snap.LastAgents["b"]; ok {
+		t.Fatal(`scoped snapshot must NOT ship "b"'s lastAgent`)
+	}
+
+	if _, ok := snap.Activity["a"]; !ok {
+		t.Fatal(`scoped snapshot must ship "a"'s activity`)
+	}
+	if _, ok := snap.Activity["b"]; ok {
+		t.Fatal(`scoped snapshot must NOT ship "b"'s activity`)
+	}
+}
+
+// TestSnapshotScopedFlushConverges proves the delta-flush scoping invariant: a
+// scoped Snapshot flushes ONLY the selected sessions' streaming accumulators,
+// and an unselected session's BUFFERED (unflushed) deltas stay intact in
+// deltaBuf and converge on the next full Snapshot(nil) — no data loss. The
+// throttle window is stretched to an hour so all deltas after the first land
+// (and stay) in the buffer; only a Snapshot flush materializes them. (The other
+// half of the invariant — deltaBuf ownership is strictly per messageEntry with
+// no cross-session state — is structural; see flushPartDeltasLocked.)
+func TestSnapshotScopedFlushConverges(t *testing.T) {
+	withFlushInterval(t, time.Hour)
+
+	s := New(100)
+	for _, sid := range []string{"a", "b"} {
+		s.Apply(ev("session.created", `{"info":{"id":"`+sid+`"}}`))
+		s.Apply(ev("message.updated", `{"info":{"id":"m_`+sid+`","sessionID":"`+sid+`","role":"assistant"}}`))
+		s.Apply(ev("message.part.updated", `{"part":{"id":"p_`+sid+`","sessionID":"`+sid+`","messageID":"m_`+sid+`","type":"text","text":""}}`))
+	}
+	// First delta of a burst always flushes; subsequent ones buffer for the hour.
+	applyDelta(s, "a", "m_a", "p_a", "text", "A1")
+	applyDelta(s, "a", "m_a", "p_a", "text", "A2") // buffered
+	applyDelta(s, "b", "m_b", "p_b", "text", "B1")
+	applyDelta(s, "b", "m_b", "p_b", "text", "B2") // buffered — must NOT be lost
+
+	// Scoped to "a": "a" is flushed (A1+A2 materialize); "b" is NOT flushed and
+	// (correctly) omitted from messages.
+	scoped := s.Snapshot(map[string]bool{"a": true})
+	if got := partText(scoped, "a", "p_a"); got != "A1A2" {
+		t.Fatalf(`scoped snapshot must flush selected "a"'s buffered deltas, want A1A2, got %q`, got)
+	}
+	if _, ok := scoped.Messages["b"]; ok {
+		t.Fatal(`scoped snapshot must NOT ship unselected "b"'s messages`)
+	}
+
+	// Full snapshot must converge "b"'s still-buffered deltas (B1B2) — proving
+	// the scoped flush did not drop them.
+	full := s.Snapshot(nil)
+	if got := partText(full, "b", "p_b"); got != "B1B2" {
+		t.Fatalf(`full Snapshot(nil) must converge unselected "b"'s buffered deltas (no data loss), want B1B2, got %q`, got)
+	}
+	if got := partText(full, "a", "p_a"); got != "A1A2" {
+		t.Fatalf(`full Snapshot(nil) must retain "a"'s materialized text, want A1A2, got %q`, got)
 	}
 }
