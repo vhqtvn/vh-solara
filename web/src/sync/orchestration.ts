@@ -33,7 +33,15 @@ export function maybeClearWaiting(sessionID: string) {
 
 // Acknowledge a session as read (called when its bottom is reached): clears the
 // finished-unread flag on its root, server-side (cross-device) + optimistically.
-export function ackSession(id: string) {
+//
+// `opts.force` (used only from the maybeRestore no-anchor open path) sends the
+// POST /vh/ack unconditionally: that path can race ahead of Stream-1 arming the
+// FE unread flag on a fresh page load, so the armed guard below would skip the
+// POST and the server-side dot would never clear (open-at-bottom race,
+// P1-WEB-005). The server's clearUnreadLocked is idempotent (no-op when the
+// root is not unread), so a forced POST is safe. The optimistic local clear
+// stays guarded by `armed` to avoid spurious non-unread clears.
+export function ackSession(id: string, opts?: { force?: boolean }) {
   if (!id) return;
   const root = rootOf(id);
   // Viewing a session acks ALL of its notifications (any kind) — but only when
@@ -41,8 +49,9 @@ export function ackSession(id: string) {
   // (idle/backgrounded) must not silently mark its nudges read; that's the whole
   // point of the alert. Explicit actions (answering, archiving) ack regardless.
   if (attendingNow()) markRead((n) => (n.sessionID || "") === root);
-  if (!state.unread[root]) return; // nothing more to ack (finished-unread flag)
-  setState("unread", root, undefined as unknown as boolean);
+  const armed = !!state.unread[root];
+  if (!armed && !opts?.force) return; // nothing more to ack (finished-unread flag)
+  if (armed) setState("unread", root, undefined as unknown as boolean);
   void fetch("/vh/ack", {
     method: "POST",
     headers: { "Content-Type": "application/json" },

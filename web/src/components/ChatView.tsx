@@ -190,6 +190,13 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // initial scroll jump (top → restored/bottom) is never painted — switching
   // sessions reveals the content already in place instead of flashing.
   const [ready, setReady] = createSignal(false);
+  // Bumped each time the content ResizeObserver re-pins to the bottom while
+  // following. The reactive ack effect (below) reads this so it re-evaluates
+  // nearBottom() after a RO re-pin — otherwise a transient nearBottom()==false
+  // at the moment unread is armed (lazy-hydration growing the transcript past
+  // the last pin) makes the effect bail, and since nearBottom() is a plain DOM
+  // read (not a signal) the effect never re-runs even after the RO re-glues.
+  const [repinTick, setRepinTick] = createSignal(0);
   // Loading overlay for the switch → ready window (large sessions): a non-draft
   // session whose transcript is still being positioned hides `.chat-content`
   // (opacity:0 until `ready`), so a heavy render leaves a blank area. This shows
@@ -710,7 +717,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       // finished session is opened already at the bottom. The anchor branch
       // above deliberately does NOT ack — a restored mid-history anchor means
       // the user had NOT read to the bottom.
-      if (!props.draft) ackSession(props.sessionId);
+      if (!props.draft) ackSession(props.sessionId, { force: true });
     }
     setReady(true); // positioned — safe to reveal
     return true;
@@ -803,6 +810,10 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // !state.unread[root], so it can't re-trigger. (attendingNow() only governs
   // notification markRead, not the unread clear.)
   createEffect(() => {
+    // Re-evaluate when the RO re-pins to the bottom (repinTick) — see decl. The
+    // signal reads below are what make this effect reactive; repinTick closes
+    // the gap where nearBottom() is a non-reactive DOM read.
+    repinTick();
     if (props.draft || !ready() || !following()) return;
     if (!state.unread[rootOf(props.sessionId)]) return;
     if (!nearBottom()) return;
@@ -850,6 +861,9 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
             pin();
           }
         }
+        // Nudge the reactive ack to re-check nearBottom() now that geometry
+        // settled (closes the late-arm window described at repinTick's decl).
+        setRepinTick((t) => t + 1);
       }
       clearTimeout(navDebounce);
       navDebounce = window.setTimeout(scheduleActiveTurn, 150);

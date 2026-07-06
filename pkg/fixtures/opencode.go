@@ -920,6 +920,23 @@ func (f *FakeOpenCode) handleFixtureReset(w http.ResponseWriter, r *http.Request
 		delete(f.messages, session)
 	}
 	delete(f.busy, session)
+	// Also clear any leaked pending question/permission blocker state for this
+	// session. A prior test may have armed an unanswered [[ask]]/[[perm]] that
+	// would otherwise mount a PendingInput/permission pill on the next open,
+	// polluting session-agnostic assertions (e.g. scroll-follow button.jump
+	// counts). These maps are keyed by question/permission ID with sessionID
+	// inside the value, so clearing by session requires a value scan.
+	for qid, sid := range f.pendingQ {
+		if sid == session {
+			delete(f.pendingQ, qid)
+			delete(f.pendingQReq, qid)
+		}
+	}
+	for pid, req := range f.pendingP {
+		if s, _ := req["sessionID"].(string); s == session {
+			delete(f.pendingP, pid)
+		}
+	}
 	f.mu.Unlock()
 	// Notify any connected client the session is idle; a fresh page.goto re-reads
 	// the cleared status regardless, so this is belt-and-suspenders.
