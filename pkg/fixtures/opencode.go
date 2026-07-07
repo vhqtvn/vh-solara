@@ -925,19 +925,44 @@ func (f *FakeOpenCode) handleFixtureReset(w http.ResponseWriter, r *http.Request
 	// would otherwise mount a PendingInput/permission pill on the next open,
 	// polluting session-agnostic assertions (e.g. scroll-follow button.jump
 	// counts). These maps are keyed by question/permission ID with sessionID
-	// inside the value, so clearing by session requires a value scan.
+	// inside the value, so clearing by session requires a value scan. Collect the
+	// cleared IDs here (emit cannot run under f.mu — it takes the lock itself).
+	var clearedQ, clearedP []string
 	for qid, sid := range f.pendingQ {
 		if sid == session {
 			delete(f.pendingQ, qid)
 			delete(f.pendingQReq, qid)
+			clearedQ = append(clearedQ, qid)
 		}
 	}
 	for pid, req := range f.pendingP {
 		if s, _ := req["sessionID"].(string); s == session {
 			delete(f.pendingP, pid)
+			clearedP = append(clearedP, pid)
 		}
 	}
 	f.mu.Unlock()
+	// Emit the resolve events so the AGGREGATOR store (pkg/state/store.go — the
+	// SPA's snapshot source) drops the leaked blocker too. Clearing only the
+	// fixture maps above is NOT sufficient: the aggregator holds the
+	// question/permission in its store until a resolve event or a re-hydrate
+	// (cold start / reconnect / POST /vh/reload), and the serial e2e suite never
+	// re-hydrates between spec files. Without these emits, a leaked
+	// [[ask]]/[[perm]] from an earlier spec file (e.g. interactive.spec.ts,
+	// which sorts before scroll-follow.spec.ts) arms blockerActive() on every
+	// subsequent demo open → the PendingInput blocker card mounts at the stream
+	// tail (a second button.jump via PendingInput.tsx:64 once the card scrolls
+	// out of view), polluting button.jump count assertions during content
+	// reshuffles (scroll-follow tests 7 / :864). question.replied/
+	// permission.replied map to KindQuestionClear/KindPermissionClear in the
+	// store (store.go:754,721), which clear the store AND forward a
+	// question.delete/permission.delete to any connected SPA. (P1-WEB-032/033.)
+	for _, qid := range clearedQ {
+		f.emit("question.replied", map[string]any{"sessionID": session, "requestID": qid})
+	}
+	for _, pid := range clearedP {
+		f.emit("permission.replied", map[string]any{"sessionID": session, "requestID": pid})
+	}
 	// Notify any connected client the session is idle; a fresh page.goto re-reads
 	// the cleared status regardless, so this is belt-and-suspenders.
 	f.emit("session.idle", map[string]any{"sessionID": session})
