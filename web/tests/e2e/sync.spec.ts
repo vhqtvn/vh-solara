@@ -39,8 +39,12 @@ test("switching sessions re-targets the message stream", async ({ page }) => {
   await page.getByRole("button", { name: /Another root/ }).click();
   await expect(page).toHaveURL(/[?&]session=other/);
   await expect(page.locator(".main-title")).toContainText("Another root");
-  // "other" has no messages → its own transcript state, not demo's turns.
-  await expect(page.getByText("Done. Updated").first()).toHaveCount(0);
+  // "other" has no messages → its own (empty) transcript state, not demo's turns.
+  // Assert the transcript is empty directly via the per-message `.msg` selector
+  // (the same one counted above). This is pollution-independent — it verifies
+  // re-targeting whether or not prior serial specs left extra turns in demo —
+  // and avoids coupling the check to a specific streamed-text marker.
+  await expect(page.locator(".msg")).toHaveCount(0);
 });
 
 test("a prompt drives the session busy → idle (activity reconciliation)", async ({ page }) => {
