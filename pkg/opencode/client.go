@@ -130,8 +130,10 @@ func (c *Client) ListPermissions(ctx context.Context) ([]json.RawMessage, error)
 // ListArchivedSessions returns the archived sessions for the resolved workspace
 // (OpenCode excludes archived from the default /session list).
 func (c *Client) ListArchivedSessions(ctx context.Context) ([]json.RawMessage, error) {
-	// 1.17.x ignores the archived param and returns ALL sessions; the archived
-	// browser filters to archived client-side. Fetch the lot adaptively.
+	// 1.17.x ignores the archived param and returns ALL sessions (archived +
+	// non-archived). The non-archived entries are filtered out server-side in
+	// pkg/web/archive.go's archivedLevel (which inspects time.archived). Fetch
+	// the lot adaptively so the filter has everything to work with.
 	return c.listSessionsAdaptive(ctx, "/session?archived=true&limit=%d")
 }
 

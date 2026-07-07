@@ -199,11 +199,20 @@ func archivedLevel(sessions []json.RawMessage, parent string, offset, limit int)
 			ID       string `json:"id"`
 			ParentID string `json:"parentID"`
 			Time     struct {
-				Updated float64 `json:"updated"`
-				Created float64 `json:"created"`
+				Updated  float64  `json:"updated"`
+				Created  float64  `json:"created"`
+				Archived *float64 `json:"archived"`
 			} `json:"time"`
 		}
 		if json.Unmarshal(raw, &env) != nil || env.ID == "" {
+			continue
+		}
+		// OpenCode 1.17.x ignores the ?archived=true param and returns ALL
+		// sessions (archived + non-archived). Filter server-side here: only a
+		// genuinely archived session (time.archived set to a non-zero value)
+		// belongs in the browser. Mirrors sessionEnvelope.archivedAt() in
+		// pkg/state/store.go.
+		if env.Time.Archived == nil || *env.Time.Archived == 0 {
 			continue
 		}
 		archivedID[env.ID] = true
