@@ -1081,25 +1081,22 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   }
 
   // Tap vs hold on the paste button: a plain tap replaces the whole composer; a
-  // long-press inserts at the caret. The hold fires from a timer (still inside
-  // the Clipboard API's transient-activation window) and suppresses the click
-  // that follows the release.
-  let pasteHoldTimer: number | undefined;
-  let pasteDidHold = false;
+  // long-press (>=450ms between pointerdown and click) inserts at the caret.
+  // Classification is by elapsed wall-clock hold time, NOT by whether a timer
+  // callback raced the click handler — the previous timer+flag scheme
+  // misclassified as "replace" when main-thread jank stalled the event loop
+  // past 450ms (CI load, throttled devices). The insert runs in the click
+  // handler, which is still inside the transient-activation window opened by
+  // pointerdown (lasts several seconds), so clipboard read works.
+  let pasteDownAt = 0;
   const onPasteDown = () => {
-    pasteDidHold = false;
-    clearTimeout(pasteHoldTimer);
-    pasteHoldTimer = window.setTimeout(() => {
-      pasteDidHold = true;
-      void pasteFromClipboard("insert");
-    }, 450);
+    pasteDownAt = Date.now();
   };
-  const onPasteUp = () => clearTimeout(pasteHoldTimer);
+  const onPasteUp = () => {}; // no-op; elapsed check on click makes hold load-independent
   const onPasteClick = () => {
-    clearTimeout(pasteHoldTimer);
-    if (pasteDidHold) {
-      pasteDidHold = false;
-      return; // the long-press already inserted
+    if (Date.now() - pasteDownAt >= 450) {
+      void pasteFromClipboard("insert");
+      return;
     }
     void pasteFromClipboard("replace");
   };
@@ -1613,7 +1610,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
             is hard to track across two collections, but a session blocks on one
             item at a time in practice).
           */}
-          <Show when={blockerActive()}>
+          <Show when={blockerActive() && !focusMode()}>
             <PendingInput
               scrollRoot={() => scrollEl}
               pillMount={() => chatMainEl}

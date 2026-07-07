@@ -126,7 +126,22 @@ test("terminal: full-screen TUI (vim) stays live — xterm DECRQM stall regressi
   await page.keyboard.press("Escape");
   await page.keyboard.type(":q!");
   await page.keyboard.press("Enter");
-  await page.waitForTimeout(400); // let the shell reclaim the tty
+  // Poll until the shell has reclaimed the tty before typing the echo. Vim runs
+  // inline here (no alternate screen), so its tildes/status-line persist in the
+  // scrollback after exit and can't be used as an "all clear" — the shell prompt
+  // itself begins with a "~" segment, so "no ~" never becomes true. Instead wait
+  // for the shell to redraw its prompt: the last non-empty row becomes a bare
+  // ">" prompt sigil on an empty command line. The previous fixed 400ms wait was
+  // flaky under CI load (vim teardown + tty-reclaim can exceed it, swallowing
+  // the echo keystrokes); this is load-independent.
+  await expect.poll(
+    async () => {
+      const text = (await page.locator(".xterm-rows").innerText()).trimEnd();
+      const last = text.split("\n").pop();
+      return last !== undefined && last.trim() === ">";
+    },
+    { timeout: 10000 },
+  ).toBe(true);
   await page.keyboard.type("echo VIM_EXITED_OK");
   await page.keyboard.press("Enter");
   await expect.poll(async () => (await page.locator(".xterm-rows").innerText()).includes("VIM_EXITED_OK"), {
