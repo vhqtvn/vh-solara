@@ -151,6 +151,27 @@ export default function TerminalPane(props: { termId?: string; session?: string;
     fit = new FitAddon();
     term.loadAddon(fit);
     term.open(host);
+    // Copy/paste via Ctrl+Shift+C/V. The listener rides `host` in the capture
+    // phase so it beats xterm's own keydown handler (on .xterm-helper-textarea);
+    // preventDefault + stopImmediatePropagation suppress both the browser
+    // dev-tools shortcut AND xterm's handling (no stray ETX / double-paste).
+    const onTermKey = (e: KeyboardEvent) => {
+      if (!e.ctrlKey || !e.shiftKey || e.altKey || e.metaKey) return;
+      const k = e.key.toLowerCase();
+      if (k === "c") {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        const sel = term?.getSelection() ?? "";
+        if (sel && navigator.clipboard) navigator.clipboard.writeText(sel).catch(() => {});
+        // Empty selection is a no-op, but we still ate the event so dev tools
+        // doesn't pop open — matches gnome-terminal behavior.
+      } else if (k === "v") {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        if (navigator.clipboard) navigator.clipboard.readText().then((t) => { if (t) send(t); }).catch(() => {});
+      }
+    };
+    host.addEventListener("keydown", onTermKey, true);
     // Harden the hidden input for mobile: no autocorrect/capitalize/IME surprises.
     const ta = host.querySelector(".xterm-helper-textarea") as HTMLTextAreaElement | null;
     if (ta) {
@@ -195,6 +216,7 @@ export default function TerminalPane(props: { termId?: string; session?: string;
     liveTimer = window.setInterval(checkLiveness, 5000);
     onCleanup(() => {
       ro.disconnect();
+      host.removeEventListener("keydown", onTermKey, true);
       document.removeEventListener("visibilitychange", onVisibility);
       clearTimeout(hideTimer);
       clearInterval(liveTimer);
