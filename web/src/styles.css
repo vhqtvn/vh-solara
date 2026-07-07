@@ -629,9 +629,11 @@ body {
   animation: pulse 1.1s ease-in-out infinite;
 }
 .tree-title.needs-input { color: var(--warn, #e8a838) !important; font-weight: 600; }
-/* Feature 1 (S4): session exists in the tree but the daemon is still aggregating
-   its tail (hydrated=false, typically right after a restart). A faint muted dot
-   so the row reads "still loading" — non-urgent, so dim + slow pulse. */
+/* Feature 1 (S4): a TRANSIENT "loading from server…" indicator shown only while
+   a session's message history is being fetched (cold-open, messagesLoaded===false).
+   Absent for idle never-opened rows (messagesLoaded===undefined) and cleared the
+   moment the fetch resolves — not a permanent label. A faint muted dot so the
+   row reads "still loading" — non-urgent, so dim + slow pulse. */
 .dot.hydrating {
   background: var(--fg-dim);
   animation: pulse 1.6s ease-in-out infinite;
