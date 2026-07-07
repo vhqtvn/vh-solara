@@ -311,12 +311,19 @@ function Node(props: {
             <Show when={!busy() && !needsInput() && state.unread[props.session.id]}>
               <span class="dot unread" data-tip="finished — not yet viewed" />
             </Show>
-            {/* Feature 1 (S4): this session exists in the tree but the daemon is
-                still aggregating its tail (hydrated=false, typically right after
-                a restart while the server serves HTTP early). A subtle faded dot
-                so the row reads "still loading" rather than "stale/empty". Only
-                while live — the connecting state is already conveyed by the dot. */}
-            <Show when={state.status === "live" && state.hydrated[props.session.id] === false && !busy()}>
+            {/* Transient per-session loading indicator: shown ONLY while THIS
+                session's full message history is actively being fetched
+                (messagesLoaded===false — the row was selected and Stream-2
+                reserved the slot / delivered a cold partial snapshot, now awaiting
+                messages.loaded). It is NOT shown for idle never-opened sessions
+                (messagesLoaded===undefined): those are lazily unfetched by design
+                (Go Hydrated is false-by-design until first open), not "loading."
+                Cleared the moment the fetch completes. Driven by messagesLoaded,
+                NOT hydrated: hydrated conflates "never lazily fetched" with
+                "actively aggregating," so keying off it armed the dot PERMANENTLY
+                on every idle never-opened session. Suppressed while busy() so the
+                running-agent spinner wins. */}
+            <Show when={state.status === "live" && state.messagesLoaded[props.session.id] === false && !busy()}>
               <span class="dot hydrating" data-tip="loading from server…" />
             </Show>
             <AgentChip sessionID={props.session.id} />
