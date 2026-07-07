@@ -87,3 +87,11 @@ jobs:
       - name: e2e
         working-directory: web
         run: npm run test:e2e
+      - name: upload Playwright artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-e2e
+          path: tmp/agent-runs/playwright
+          retention-days: 14
+          if-no-files-found: ignore
