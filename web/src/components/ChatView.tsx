@@ -782,8 +782,6 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
         armedCand = undefined; // consumed; entering session re-arms on its own scroll
         lastArmMs = 0;
         if (prevId) clearTimeout(readCursorTimer);
-        // Reset the self-pin sentinel: it's stale from the leaving session, and
-        // an anchor restore doesn't pin to refresh it — so without this reset the
         // Reset the geometry baseline: it's stale from the leaving session, and
         // an anchor restore doesn't pin to refresh it — so without this reset the
         // content RO delta could be measured against a stale-large value when the
