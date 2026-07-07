@@ -168,7 +168,7 @@ export default function TerminalPane(props: { termId?: string; session?: string;
       } else if (k === "v") {
         e.preventDefault();
         e.stopImmediatePropagation();
-        if (navigator.clipboard) navigator.clipboard.readText().then((t) => { if (t) send(t); }).catch(() => {});
+        if (navigator.clipboard) navigator.clipboard.readText().then((t) => { if (t) term?.paste(t); }).catch(() => {});
       }
     };
     host.addEventListener("keydown", onTermKey, true);
