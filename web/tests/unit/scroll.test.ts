@@ -23,9 +23,17 @@ const mem: Record<string, string> = {};
   },
 };
 
-// `bottommostRead` + `orderAhead` are pure functions (no module state), so they
-// can be imported statically and exercised directly.
-import { bottommostRead, orderAhead } from "../../src/lib/scroll";
+// `bottommostRead` + `orderAhead` + `classifyScrollDelta` are pure functions
+// (no module state), so they can be imported statically and exercised directly.
+import {
+  bottommostRead,
+  classifyScrollDelta,
+  orderAhead,
+} from "../../src/lib/scroll";
+import type {
+  ScrollGeometry,
+  ScrollMode,
+} from "../../src/lib/scroll";
 
 // Re-import the store (which holds module-level cache) fresh per test.
 async function store() {
@@ -196,5 +204,368 @@ describe("orderAhead (monotonic read-cursor guard)", () => {
     // this pins that faithful behavior (no new semantics invented). An empty
     // cand string represents "absent" the same way setReadAnchor treats falsy.
     expect(orderAhead("", undefined, order)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// classifyScrollDelta — dual-axis geometry reducer (option A_plus).
+//
+// Every case models a real scroll-surface transition the chat view must
+// classify correctly. Geometry is {scrollTop, scrollHeight, clientHeight}; the
+// reducer decomposes content-delta + viewport-delta + clamp and treats genuine
+// user scroll-intent as the RESIDUAL. See scroll.ts for the full rationale.
+// ---------------------------------------------------------------------------
+
+// Convenience: build a tail-mode call centered on the common "glued to bottom"
+// starting geometry (scrollHeight 2000, clientHeight 600 → maxBottom 1400).
+function tail(
+  previous: ScrollGeometry,
+  current: ScrollGeometry,
+  following = true,
+) {
+  return classifyScrollDelta({
+    previous,
+    current,
+    mode: "tail" as ScrollMode,
+    following,
+  });
+}
+
+describe("classifyScrollDelta — tail/following", () => {
+  // Starting glued to the bottom: scrollTop === maxBottom (1400).
+  const atBottom = (): ScrollGeometry => ({ scrollTop: 1400, scrollHeight: 2000, clientHeight: 600 });
+
+  it("content grow-at-tail, viewport unchanged → re-pin to new bottom (no intent flip)", () => {
+    const d = tail(atBottom(), { scrollTop: 1400, scrollHeight: 2200, clientHeight: 600 });
+    expect(d.contentDelta).toBe(200);
+    expect(d.viewportDelta).toBe(0);
+    expect(d.residualUserDelta).toBe(0);
+    expect(d.intent).toBe("none"); // layout churn, NOT user scroll
+    expect(d.shouldScroll).toBe(true);
+    expect(d.newScrollTop).toBe(1600); // new maxBottom
+  });
+
+  it("content grow-at-tail + viewport shrink (typing during a live stream) → re-pin", () => {
+    // Simultaneous content-grow and viewport-shrink in ONE frame: the single-axis
+    // `shrank` classifier mis-fired on this; the dual-axis reducer handles both.
+    const d = tail(atBottom(), { scrollTop: 1400, scrollHeight: 2200, clientHeight: 500 });
+    expect(d.contentDelta).toBe(200);
+    expect(d.viewportDelta).toBe(-100);
+    expect(d.residualUserDelta).toBe(0);
+    expect(d.intent).toBe("none");
+    expect(d.shouldScroll).toBe(true);
+    expect(d.newScrollTop).toBe(1700);
+  });
+
+  it("content grow-at-tail + viewport grow → re-pin", () => {
+    const d = tail(atBottom(), { scrollTop: 1400, scrollHeight: 2200, clientHeight: 700 });
+    expect(d.viewportDelta).toBe(100);
+    expect(d.residualUserDelta).toBe(0);
+    expect(d.intent).toBe("none");
+    expect(d.shouldScroll).toBe(true);
+    expect(d.newScrollTop).toBe(1500);
+  });
+
+  it("content shrink, viewport unchanged → clamped to new bottom, reached-bottom", () => {
+    // Was at bottom (1400); content shrank so maxBottom fell to 1200 and the
+    // browser clamped scrollTop to 1200.
+    const d = tail(atBottom(), { scrollTop: 1200, scrollHeight: 1800, clientHeight: 600 });
+    expect(d.contentDelta).toBe(-200);
+    expect(d.residualUserDelta).toBe(0);
+    expect(d.intent).toBe("reached-bottom");
+    expect(d.shouldScroll).toBe(false); // already clamped, no write needed
+  });
+
+  it("content shrink + viewport shrink → reached-bottom, no churn", () => {
+    const d = tail(atBottom(), { scrollTop: 1300, scrollHeight: 1800, clientHeight: 500 });
+    expect(d.contentDelta).toBe(-200);
+    expect(d.viewportDelta).toBe(-100);
+    expect(d.residualUserDelta).toBe(0);
+    expect(d.intent).toBe("reached-bottom");
+    expect(d.shouldScroll).toBe(false);
+  });
+
+  it("content shrink + viewport grow → reached-bottom, no churn", () => {
+    const d = tail(atBottom(), { scrollTop: 1100, scrollHeight: 1800, clientHeight: 700 });
+    expect(d.residualUserDelta).toBe(0);
+    expect(d.intent).toBe("reached-bottom");
+    expect(d.shouldScroll).toBe(false);
+  });
+
+  it("viewport-only shrink (composer grow) → residual 0, intent none, re-pin (keep following)", () => {
+    // THE deadlock root: previously this flipped following false. The reducer
+    // classifies it as layout churn (intent none) so the caller keeps following
+    // and the tail branch re-glues to the new bottom.
+    const d = tail(atBottom(), { scrollTop: 1400, scrollHeight: 2000, clientHeight: 500 });
+    expect(d.contentDelta).toBe(0);
+    expect(d.viewportDelta).toBe(-100);
+    expect(d.residualUserDelta).toBe(0);
+    expect(d.intent).toBe("none");
+    expect(d.shouldScroll).toBe(true);
+    expect(d.newScrollTop).toBe(1500);
+  });
+
+  it("viewport-only grow (composer shrink, stuck-on-Latest fix) → reached-bottom re-engage signal", () => {
+    // Following was false (killed by the deadlock); composer shrinks back so
+    // clientHeight grows, browser clamps scrollTop down to the new maxBottom.
+    // No scroll event fires for a pure clientHeight grow, so the RO must see
+    // reached-bottom and the caller re-engages following.
+    const d = tail(
+      { scrollTop: 1400, scrollHeight: 2000, clientHeight: 600 },
+      { scrollTop: 1300, scrollHeight: 2000, clientHeight: 700 },
+      false, // following already false (stuck state)
+    );
+    expect(d.viewportDelta).toBe(100);
+    expect(d.residualUserDelta).toBe(0);
+    expect(d.intent).toBe("reached-bottom");
+    // Tail branch is gated on following (false) → no programmatic write; the
+    // reached-bottom intent is the re-engage signal the caller acts on.
+    expect(d.shouldScroll).toBe(false);
+  });
+
+  it("residual user-scroll-up → user-scroll-up, no re-pin (drop following)", () => {
+    const d = tail(atBottom(), { scrollTop: 800, scrollHeight: 2000, clientHeight: 600 });
+    expect(d.residualUserDelta).toBe(-600);
+    expect(d.intent).toBe("user-scroll-up");
+    expect(d.shouldScroll).toBe(false); // tail branch skips on user-scroll-up
+    expect(d.newScrollTop).toBeUndefined();
+  });
+
+  it("residual user-scroll-down (still above bottom) → user-scroll-down, no re-engage yet", () => {
+    // Was scrolled up (800); user scrolled down to 1000 but not yet to bottom.
+    const d = tail(
+      { scrollTop: 800, scrollHeight: 2000, clientHeight: 600 },
+      { scrollTop: 1000, scrollHeight: 2000, clientHeight: 600 },
+      false,
+    );
+    expect(d.residualUserDelta).toBe(200);
+    expect(d.intent).toBe("user-scroll-down");
+    expect(d.shouldScroll).toBe(false);
+  });
+
+  it("residual user-scroll-down reaching the bottom → reached-bottom wins (re-engage)", () => {
+    // atBottom is checked before the residual-down branch, so scrolling all the
+    // way down classifies as reached-bottom (the re-engage signal), not
+    // user-scroll-down.
+    const d = tail(
+      { scrollTop: 800, scrollHeight: 2000, clientHeight: 600 },
+      { scrollTop: 1400, scrollHeight: 2000, clientHeight: 600 },
+      false,
+    );
+    expect(d.intent).toBe("reached-bottom");
+  });
+
+  it("max-scroll clamp on dramatic content shrink → reached-bottom, no churn", () => {
+    const d = tail(atBottom(), { scrollTop: 400, scrollHeight: 1000, clientHeight: 600 });
+    expect(d.residualUserDelta).toBe(0);
+    expect(d.intent).toBe("reached-bottom");
+    expect(d.shouldScroll).toBe(false);
+  });
+
+  it("sub-pixel residual within epsilon → none (absorbs clamp churn)", () => {
+    const d = classifyScrollDelta({
+      previous: atBottom(),
+      current: { scrollTop: 1400.4, scrollHeight: 2200, clientHeight: 600 },
+      mode: "tail",
+      following: true,
+      epsilon: 1,
+    });
+    expect(d.residualUserDelta).toBeCloseTo(0.4, 6);
+    expect(d.intent).toBe("none");
+  });
+
+  it("residual just outside epsilon → classified as intent", () => {
+    const d = classifyScrollDelta({
+      previous: atBottom(),
+      current: { scrollTop: 800, scrollHeight: 2200, clientHeight: 600 },
+      mode: "tail",
+      following: true,
+      epsilon: 1,
+    });
+    // expected = clamp(1400, 1600) = 1400; residual = 800 - 1400 = -600
+    expect(d.residualUserDelta).toBe(-600);
+    expect(d.intent).toBe("user-scroll-up");
+  });
+
+  it("tail re-pin is epsilon-guarded against a no-op frame (no churn)", () => {
+    // Already exactly at the new bottom: the write would be a no-op, so
+    // shouldScroll stays false to avoid infinite RO/onScroll churn.
+    const d = tail(atBottom(), { scrollTop: 1400, scrollHeight: 2000, clientHeight: 600 });
+    expect(d.intent).toBe("reached-bottom");
+    expect(d.shouldScroll).toBe(false);
+  });
+});
+
+describe("classifyScrollDelta — read/not-following (anchor preservation)", () => {
+  // Read-mode starting geometry: scrolled up to 500, viewport 600, content 2000.
+  const readStart = (): ScrollGeometry => ({ scrollTop: 500, scrollHeight: 2000, clientHeight: 600 });
+
+  function read(previous: ScrollGeometry, current: ScrollGeometry, anchorDelta?: number) {
+    return classifyScrollDelta({
+      previous,
+      current,
+      mode: "read" as ScrollMode,
+      following: false,
+      anchorDelta,
+    });
+  }
+
+  it("grow-above-viewport, browser compensated (overflow-anchor worked) → anchor preserved, no write", () => {
+    // Content grew above the anchor by 200; the browser kept the anchor pinned
+    // so scrollTop tracked +200.
+    const d = read(readStart(), { scrollTop: 700, scrollHeight: 2200, clientHeight: 600 }, 200);
+    expect(d.residualUserDelta).toBe(0);
+    expect(d.intent).toBe("none");
+    expect(d.shouldScroll).toBe(false);
+  });
+
+  it("grow-above-viewport, browser FROZE → compensation failure corrects the anchor", () => {
+    // overflow-anchor:auto failed during hydration: anchor moved +200 but
+    // scrollTop stayed at 500. The reducer corrects it mechanically.
+    const d = read(readStart(), { scrollTop: 500, scrollHeight: 2200, clientHeight: 600 }, 200);
+    expect(d.expectedScrollTop).toBe(700);
+    expect(d.residualUserDelta).toBe(-200);
+    expect(d.intent).toBe("none"); // corrected, NOT mistaken for user scroll
+    expect(d.shouldScroll).toBe(true);
+    expect(d.newScrollTop).toBe(700);
+  });
+
+  it("grow-below (content appended below anchor) → read position unchanged", () => {
+    const d = read(readStart(), { scrollTop: 500, scrollHeight: 2500, clientHeight: 600 }, 0);
+    expect(d.residualUserDelta).toBe(0);
+    expect(d.intent).toBe("none");
+    expect(d.shouldScroll).toBe(false);
+  });
+
+  it("shrink-above, browser compensated → anchor preserved", () => {
+    // Content above the anchor shrank by 100; browser tracked scrollTop -100.
+    const d = read(readStart(), { scrollTop: 400, scrollHeight: 1900, clientHeight: 600 }, -100);
+    expect(d.residualUserDelta).toBe(0);
+    expect(d.intent).toBe("none");
+    expect(d.shouldScroll).toBe(false);
+  });
+
+  it("shrink-above, browser FROZE → compensation failure corrects the anchor", () => {
+    const d = read(readStart(), { scrollTop: 500, scrollHeight: 1900, clientHeight: 600 }, -100);
+    expect(d.expectedScrollTop).toBe(400);
+    expect(d.residualUserDelta).toBe(100);
+    expect(d.intent).toBe("none");
+    expect(d.shouldScroll).toBe(true);
+    expect(d.newScrollTop).toBe(400);
+  });
+
+  it("viewport shrink (composer grow) without residual → visible anchor preserved", () => {
+    const d = read(readStart(), { scrollTop: 500, scrollHeight: 2000, clientHeight: 500 }, 0);
+    expect(d.viewportDelta).toBe(-100);
+    expect(d.residualUserDelta).toBe(0);
+    expect(d.intent).toBe("none");
+    expect(d.shouldScroll).toBe(false);
+  });
+
+  it("viewport grow (composer shrink) without residual → visible anchor preserved", () => {
+    const d = read(readStart(), { scrollTop: 500, scrollHeight: 2000, clientHeight: 700 }, 0);
+    expect(d.viewportDelta).toBe(100);
+    expect(d.residualUserDelta).toBe(0);
+    expect(d.intent).toBe("none");
+    expect(d.shouldScroll).toBe(false);
+  });
+
+  it("simultaneous grow-above + viewport shrink, browser compensated → both axes handled", () => {
+    const d = read(readStart(), { scrollTop: 700, scrollHeight: 2200, clientHeight: 500 }, 200);
+    expect(d.contentDelta).toBe(200);
+    expect(d.viewportDelta).toBe(-100);
+    expect(d.residualUserDelta).toBe(0);
+    expect(d.intent).toBe("none");
+    expect(d.shouldScroll).toBe(false);
+  });
+
+  it("simultaneous shrink-above + viewport grow, browser compensated → both axes handled", () => {
+    const d = read(readStart(), { scrollTop: 400, scrollHeight: 1900, clientHeight: 700 }, -100);
+    expect(d.residualUserDelta).toBe(0);
+    expect(d.intent).toBe("none");
+    expect(d.shouldScroll).toBe(false);
+  });
+
+  it("residual user-scroll-up still detected while not following (read mode)", () => {
+    const d = read(readStart(), { scrollTop: 200, scrollHeight: 2000, clientHeight: 600 }, 0);
+    expect(d.residualUserDelta).toBe(-300);
+    expect(d.intent).toBe("user-scroll-up");
+    expect(d.shouldScroll).toBe(false);
+  });
+});
+
+describe("classifyScrollDelta — restore / hydration / load-more", () => {
+  function read(previous: ScrollGeometry, current: ScrollGeometry, anchorDelta?: number) {
+    return classifyScrollDelta({
+      previous,
+      current,
+      mode: "read" as ScrollMode,
+      following: false,
+      anchorDelta,
+    });
+  }
+
+  it("stored data-mid anchor arrives after partial load → corrects to anchor", () => {
+    // Partial load left scrollTop at 500; the anchor element then arrives and
+    // hydration adds height above it (anchorDelta +100) but the browser froze.
+    const d = read(
+      { scrollTop: 500, scrollHeight: 1500, clientHeight: 600 },
+      { scrollTop: 500, scrollHeight: 1600, clientHeight: 600 },
+      100,
+    );
+    expect(d.expectedScrollTop).toBe(600);
+    expect(d.intent).toBe("none");
+    expect(d.shouldScroll).toBe(true);
+    expect(d.newScrollTop).toBe(600);
+  });
+
+  it("deferred hydration changes height above anchor → corrects proportionally", () => {
+    const d = read(
+      { scrollTop: 500, scrollHeight: 1500, clientHeight: 600 },
+      { scrollTop: 500, scrollHeight: 1750, clientHeight: 600 },
+      250,
+    );
+    expect(d.expectedScrollTop).toBe(750);
+    expect(d.shouldScroll).toBe(true);
+    expect(d.newScrollTop).toBe(750);
+  });
+
+  it("load-more prepends content above anchor → read position preserved", () => {
+    const d = read(
+      { scrollTop: 500, scrollHeight: 2000, clientHeight: 600 },
+      { scrollTop: 500, scrollHeight: 2400, clientHeight: 600 },
+      400,
+    );
+    expect(d.expectedScrollTop).toBe(900);
+    expect(d.shouldScroll).toBe(true);
+    expect(d.newScrollTop).toBe(900);
+  });
+
+  it("anchor-correction (read mode) and tail-follow (tail mode) are mutually exclusive in one cycle", () => {
+    // Same geometry, different mode: tail re-pins to bottom; read preserves the
+    // read position. A single reducer call picks exactly one behavior.
+    const prev = { scrollTop: 1400, scrollHeight: 2000, clientHeight: 600 };
+    const curr = { scrollTop: 1400, scrollHeight: 2200, clientHeight: 600 };
+
+    const tailDecision = classifyScrollDelta({
+      previous: prev,
+      current: curr,
+      mode: "tail",
+      following: true,
+    });
+    expect(tailDecision.shouldScroll).toBe(true);
+    expect(tailDecision.newScrollTop).toBe(1600); // re-pin to bottom
+
+    const readDecision = classifyScrollDelta({
+      previous: prev,
+      current: curr,
+      mode: "read",
+      following: false,
+      anchorDelta: 0, // no anchor shift → no correction
+    });
+    // Read mode does NOT chase the bottom; it leaves the viewport where it is.
+    expect(readDecision.intent).toBe("none");
+    expect(readDecision.shouldScroll).toBe(false);
+    expect(readDecision.newScrollTop).toBeUndefined();
   });
 });

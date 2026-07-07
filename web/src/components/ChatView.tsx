@@ -3,11 +3,13 @@ import { Portal } from "solid-js/web";
 import { ackSession, createSession, currentVerb, isSending, markSessionIdle, openSession, rootOf, sessionTodoCounts, sessionTodos, sessionWorking, setSelectedId, setSending, state } from "../sync";
 import {
   bottommostRead,
+  classifyScrollDelta,
   clearReadAnchor,
   getReadAnchor,
   orderAhead,
   setReadAnchor,
 } from "../lib/scroll";
+import type { ScrollGeometry } from "../lib/scroll";
 import { highlightInput } from "../lib/composerHighlight";
 import { chooseVariant, findModel, loadModels, models, selectionFor } from "../models";
 import { loadVersioned, saveVersioned } from "../lib/store";
@@ -427,18 +429,19 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // callbacks are NOT delivered while hidden — they queue and coalesce, then
   // deliver a single one on resume. If an intermediate settle-shrink clamped
   // scrollTop DOWN and content then regrew so the NET scrollHeight is back near
-  // its pre-hidden value, the queued RO guard below sees scrollTop<pinnedTop
-  // (clamped) with !shrank (net grew) and mis-classifies it as a genuine user
-  // scroll-up — setFollowing(false)+latch armed — which the self-heal cannot
-  // recover (it needs a working() edge or a cleared latch). Live would stay dead
-  // until manual scroll-back / Latest click / a new turn.
+  // its pre-hidden value, the queued RO below would measure against a stale
+  // baseline and mis-classify the clamp as a genuine user scroll-up —
+  // setFollowing(false)+latch armed — which the self-heal cannot recover (it
+  // needs a working() edge or a cleared latch). Live would stay dead until
+  // manual scroll-back / Latest click / a new turn.
   //
   // visibilitychange dispatches before the rendering step where the queued RO
-  // delivers, so re-pin here to refresh pinnedTop/pinnedScrollHeight to the
-  // CURRENT post-hidden state first: the guard then sees scrollTop===pinnedTop
-  // and re-pins cleanly instead of tripping on the stale pre-hidden baseline.
-  // Gated on ready() + !userScrolledUp() to mirror the self-heal (won't yank a
-  // genuine reader who deliberately scrolled up during/after backgrounding).
+  // delivers, so re-pin here to refresh the geometry baseline (pinnedGeom) to
+  // the CURRENT post-hidden state first: the reducer then sees residual within
+  // epsilon and re-pins cleanly instead of tripping on the stale pre-hidden
+  // baseline. Gated on ready() + !userScrolledUp() to mirror the self-heal
+  // (won't yank a genuine reader who deliberately scrolled up during/after
+  // backgrounding).
   const onVisibleReengage = () => {
     if (document.visibilityState !== "visible") return;
     if (!ready() || userScrolledUp()) return;
@@ -542,21 +545,35 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       ? scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight < 24
       : true;
   }
-  // Position we last set programmatically. A scroll event whose offset matches it
-  // is our own pin (not the user), so onScrolled can skip its work — otherwise
-  // each streamed pin fires a scroll event that re-runs nearBottom/ack/navigator
-  // every frame (a feedback loop that burned CPU during streaming).
-  let pinnedTop = -1;
-  // Content height captured at the last pin(). Companion to pinnedTop: a shrink
-  // (reasoning/tool block collapsing on de-tail, or the raw→rendered-HTML swap
-  // landing shorter) clamps scrollTop below pinnedTop with NO user intent — the
-  // RO re-pin guard must distinguish that from a real user scroll-up.
-  let pinnedScrollHeight = -1;
+  // Dual-axis scroll geometry snapshot at the last programmatic position.
+  // Records scrollTop + scrollHeight + clientHeight so classifyScrollDelta can
+  // decompose content-delta + viewport-delta + clamp and treat genuine user
+  // scroll-intent as the RESIDUAL. The single-axis "shrank" boolean it replaces
+  // mis-classified the composer grow/shrink autoscroll deadlock (typing grows
+  // the textarea → viewport shrinks in the same frame content grows). Sentinel
+  // {-1,-1,-1} means "no valid snapshot yet".
+  let pinnedGeom: ScrollGeometry = { scrollTop: -1, scrollHeight: -1, clientHeight: -1 };
+  // Read-mode logical anchor tracking: the data-mid id we restored to and its
+  // content-coordinate offset at restore/pin time, so a grow/shrink ABOVE the
+  // viewport that overflow-anchor:auto failed to track can be corrected
+  // mechanically (measured anchorDelta) instead of being mistaken for user
+  // intent during hydration / load-more.
+  let restoredAnchorId: string | undefined;
+  let restoredAnchorOffset = -1;
+  function geom(el: HTMLElement | undefined): ScrollGeometry {
+    if (!el) return { scrollTop: -1, scrollHeight: -1, clientHeight: -1 };
+    return { scrollTop: el.scrollTop, scrollHeight: el.scrollHeight, clientHeight: el.clientHeight };
+  }
+  // Anchor's top edge in content (scroll) coordinates. Shifts exactly by the
+  // amount of content added/removed above it → the read-mode anchorDelta.
+  function anchorContentOffset(el: HTMLElement): number {
+    if (!scrollEl) return -1;
+    return el.getBoundingClientRect().top - scrollEl.getBoundingClientRect().top + scrollEl.scrollTop;
+  }
   function pin() {
     if (!scrollEl) return;
     scrollEl.scrollTop = scrollEl.scrollHeight;
-    pinnedTop = scrollEl.scrollTop; // clamped value the scroll event will report
-    pinnedScrollHeight = scrollEl.scrollHeight; // content size at pin time
+    pinnedGeom = geom(scrollEl); // clamped value + content/viewport size at pin time
   }
   function jumpToLatest() {
     setFollowing(true);
@@ -699,6 +716,12 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
         setUserScrolledUp(true);
         const delta = el.getBoundingClientRect().top - scrollEl.getBoundingClientRect().top;
         scrollEl.scrollTop += delta;
+        // Record the logical anchor + baseline geometry so the content RO can
+        // measure anchorDelta on later hydration/load-more and correct a
+        // frozen viewport mechanically (overflow-anchor:auto is assist-only).
+        restoredAnchorId = anchor;
+        restoredAnchorOffset = anchorContentOffset(el);
+        pinnedGeom = geom(scrollEl);
       } else {
         // Stale anchor (message since deleted) — fall back to the bottom.
         setFollowing(true);
@@ -761,11 +784,15 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
         if (prevId) clearTimeout(readCursorTimer);
         // Reset the self-pin sentinel: it's stale from the leaving session, and
         // an anchor restore doesn't pin to refresh it — so without this reset the
-        // slice-a RO guard (scrollTop < pinnedTop) could mis-trigger against a
-        // stale-large value when the user later reaches a shorter session's
-        // bottom. -1 is the "no valid pin yet" sentinel (scrollTop >= -1 always
-        // holds, so the first real pin after switch proceeds normally).
-        pinnedTop = -1;
+        // Reset the geometry baseline: it's stale from the leaving session, and
+        // an anchor restore doesn't pin to refresh it — so without this reset the
+        // content RO delta could be measured against a stale-large value when the
+        // user later reaches a shorter session's bottom. {-1,-1,-1} is the "no
+        // valid snapshot yet" sentinel, so the first real pin after switch
+        // proceeds normally.
+        pinnedGeom = { scrollTop: -1, scrollHeight: -1, clientHeight: -1 };
+        restoredAnchorId = undefined;
+        restoredAnchorOffset = -1;
         restoredFor = "";
         setReady(false);
         // Fallback reveal: if no content change fires the ResizeObserver (so
@@ -830,41 +857,51 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     let navDebounce: number | undefined;
     const ro = new ResizeObserver(() => {
       if (maybeRestore()) return;
+      if (!scrollEl) return;
+      const current = geom(scrollEl);
+      // Single scroll-action gate per cycle: tail-follow XOR read-anchor, never
+      // both. following() picks the axis; maybeRestore already returned above if
+      // it owned this cycle. The dual-axis reducer decomposes content-delta +
+      // viewport-delta + clamp and treats genuine user scroll-intent as the
+      // RESIDUAL — replacing the single-axis `scrollTop < pinnedTop && !shrank`
+      // guard that deadlocked on simultaneous content-grow + viewport-shrink
+      // (typing during a live stream / composer grow).
       if (following()) {
-        // Guard the RO re-pin path (the "↓ Latest" race). While following, a
-        // growing transcript used to re-pin unconditionally — but if the user
-        // scrolled UP since our last pin, that pin() would overwrite their
-        // in-flight position AND re-arm pinnedTop to the new bottom, so the
-        // onScrolled self-pin guard then mis-classified the override as our own
-        // pin and setFollowing(false) never ran (the button never appeared).
-        // Fix (Option B): only re-pin when the user hasn't moved up from the last
-        // pin (scrollTop >= pinnedTop). Otherwise they scrolled up — let that
-        // win: drop following and do NOT pin. (pinnedTop starts at -1, and
-        // scrollTop >= -1 always holds, so the very first pin is unaffected.)
-        //
-        // BUT a content SHRINK also yields scrollTop < pinnedTop with no user
-        // intent: when content above/around the viewport shrinks, the browser
-        // clamps scrollTop down to the new (smaller) max bottom. Known triggers
-        // — a reasoning/thinking block collapsing the instant it stops being the
-        // tail (expanded only while tail, body up to 320px), a tool part
-        // collapsing on de-tail (same !!props.tail pattern), or the
-        // raw→rendered-HTML swap landing shorter than the raw stream. Those are
-        // layout changes we should FOLLOW, not abandon. So only treat the dip as
-        // user intent when content did NOT shrink since the last pin; otherwise
-        // re-pin to the new (smaller) bottom and keep following (Live preserved).
-        if (scrollEl) {
-          const shrank = pinnedScrollHeight > 0 && scrollEl.scrollHeight < pinnedScrollHeight;
-          if (scrollEl.scrollTop < pinnedTop && !shrank) {
-            setFollowing(false);
-            setUserScrolledUp(true); // genuine scroll-up since last pin (not a shrink clamp)
-          } else {
-            pin();
-          }
+        const d = classifyScrollDelta({ previous: pinnedGeom, current, mode: "tail", following: true });
+        if (d.intent === "user-scroll-up") {
+          // Genuine scroll-away since the last pin (residual outside epsilon
+          // after content+viewport+clamp accounted). Let it win; do NOT pin.
+          setFollowing(false);
+          setUserScrolledUp(true);
+        } else if (d.shouldScroll && d.newScrollTop !== undefined) {
+          // Layout churn (grow/shrink/viewport resize) while still following:
+          // re-glue to the bottom. Epsilon-guarded inside the reducer against
+          // no-op churn.
+          scrollEl.scrollTop = d.newScrollTop;
         }
         // Nudge the reactive ack to re-check nearBottom() now that geometry
         // settled (closes the late-arm window described at repinTick's decl).
         setRepinTick((t) => t + 1);
+      } else if (restoredAnchorId) {
+        // Read mode: preserve the logical anchor through grow/shrink ABOVE the
+        // viewport that overflow-anchor:auto failed to track (hydration,
+        // load-more, reasoning-block fill-in). Measure the anchor's content-
+        // coordinate shift and route it through the reducer; a frozen viewport
+        // is corrected mechanically instead of mistaken for user intent.
+        const ael = scrollEl.querySelector(`[data-mid="${cssEsc(restoredAnchorId)}"]`) as HTMLElement | null;
+        if (ael) {
+          const off = anchorContentOffset(ael);
+          const anchorDelta = restoredAnchorOffset >= 0 ? off - restoredAnchorOffset : 0;
+          const d = classifyScrollDelta({ previous: pinnedGeom, current, mode: "read", following: false, anchorDelta });
+          if (d.shouldScroll && d.newScrollTop !== undefined) {
+            scrollEl.scrollTop = d.newScrollTop;
+          }
+          restoredAnchorOffset = off; // advance measured baseline
+        }
       }
+      // Advance the geometry baseline to the settled state (after any write +
+      // browser clamp) so the next RO computes an incremental delta.
+      pinnedGeom = geom(scrollEl);
       clearTimeout(navDebounce);
       navDebounce = window.setTimeout(scheduleActiveTurn, 150);
     });
@@ -886,22 +923,25 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     if (!scrollEl) return;
     const ro = new ResizeObserver(() => {
       measureNavCap();
-      // Viewport resized (window resize, mobile keyboard toggle, layout shift).
-      // When following, re-glue to the bottom: a viewport SHRINK leaves scrollTop
-      // ~unchanged while the bottom edge (scrollHeight - clientHeight) moves DOWN,
-      // so without this re-pin we'd sit "Live" but not actually at the tail. This
-      // RO is the corrector for that moved bottom edge: the contentEl RO doesn't
-      // fire (content height unchanged), and although a shrink does NOT clamp
-      // scrollTop (the new max is larger), sub-pixel / layout-rounding resize CAN
-      // still re-emit a `scroll` event with scrollTop off by ≤1px vs the last pin.
-      // That stray event reaches onScrolled below; its self-pin bail tolerates the
-      // ≤1px drift (Math.abs(scrollTop - pinnedTop) <= 1, NOT strict ===) so it is
-      // NOT mistaken for a user scroll-away — which would drop following + arm the
-      // intent latch and defeat this very corrector. A viewport GROW self-corrects
-      // via the clamp scroll event; re-pinning there too is harmless and cheaper
-      // than special-casing. Gated on ready() so initial scroll-restore
-      // (maybeRestore) owns positioning until it completes.
-      if (following() && ready()) pin();
+      // Viewport resized (window resize, mobile keyboard toggle, composer
+      // grow/shrink, layout shift). When following, re-glue to the bottom: a
+      // viewport SHRINK leaves scrollTop ~unchanged while the bottom edge moves
+      // DOWN, so without this re-pin we'd sit "Live" but not at the tail. Gated
+      // on ready() so initial scroll-restore (maybeRestore) owns positioning.
+      //
+      // When NOT following but the resize landed us at the bottom, re-engage:
+      // a pure clientHeight GROW (composer shrinking back) fires NO scroll
+      // event, so onScrolled can't recover — this is the "stuck on ↓ Latest"
+      // path. nearBottom() (not pinnedGeom-dependent) gates it so a reader
+      // scrolled up mid-history is never yanked.
+      if (!scrollEl || !ready()) return;
+      if (following()) {
+        pin();
+      } else if (nearBottom()) {
+        setFollowing(true);
+        setUserScrolledUp(false);
+        pin();
+      }
     });
     ro.observe(scrollEl);
     onCleanup(() => ro.disconnect());
@@ -910,47 +950,57 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // Scroll handling: track follow state, advance the read cursor (debounced),
   // and mark the session read (ack) when its bottom is reached.
   function onScrolled() {
-    // Our own pin() while following — not a user scroll. Skip the work;
-    // following/ack/navigator are already correct (glued to the bottom).
-    // NOTE the && following(): a user who scrolled up (following=false) and then
-    // scrolls back to the bottom lands on the same scrollTop as the last pin (no
-    // new content since → scrollHeight unchanged → same clamp); we must NOT bail
-    // there or setFollowing(true) never runs and the Latest button never flips
-    // back to the Live pill. pinnedTop is only ever -1 or a bottom clamp (set in
-    // pin() after scrollTop=scrollHeight), so when following is false and
-    // scrollTop===pinnedTop, nearBottom() is necessarily true → safe to follow.
-    if (scrollEl && following() && Math.abs(scrollEl.scrollTop - pinnedTop) <= 1) return;
-    const atBottom = nearBottom();
-    // Intent latch: a real user scroll-away from the bottom arms the latch so
-    // the self-heal effect does NOT yank them on the next busy edge. Distinguish
-    // genuine intent from a content-shrink clamp: when content above the
-    // viewport shrinks (reasoning/tool block collapse, raw→rendered-HTML swap),
-    // the browser clamps scrollTop down and nearBottom() can transiently flip
-    // false with NO user intent — arming the latch there would suppress self-
-    // heal for the rest of a settling turn. So only arm when content did NOT
-    // shrink since the last pin. The own-pin bail above already returned for
-    // our programmatic pins, so reaching here with atBottom=false is either a
-    // user wheel/touch/drag or a system clamp — the shrink guard splits them.
-    const shrank = scrollEl && pinnedScrollHeight > 0 && scrollEl.scrollHeight < pinnedScrollHeight;
-    setFollowing(atBottom);
-    if (atBottom) {
-      setUserScrolledUp(false); // back at the bottom — re-engage intent reset
-    } else if (!shrank) {
-      setUserScrolledUp(true); // genuine scroll-away (not a content-shrink clamp)
-    }
-    if (!props.draft) {
-      if (atBottom) {
-        // Caught up: cursor == lastMessageID, stored as the sparse no-entry
-        // default. Ack unread state now that the tail is in view.
+    if (!scrollEl) return;
+    const current = geom(scrollEl);
+    // Own-pin bail (perf guard): a scroll event whose offset matches our last
+    // programmatic pin is our own write, not user input — skip the per-frame
+    // nearBottom/ack/navigator work. NOTE the && following(): this KEEPS
+    // following true (just returns), which is the composer-grow deadlock fix —
+    // the old code fell through and flipped following false because nearBottom()
+    // was stale after the viewport moved. Tolerate ≤1px sub-pixel drift.
+    if (following() && Math.abs(current.scrollTop - pinnedGeom.scrollTop) <= 1) return;
+    // Classify the transition through the dual-axis reducer: content-delta +
+    // viewport-delta + clamp are accounted for, and genuine user scroll-intent
+    // is the RESIDUAL. This replaces the single-axis `shrank` guard that
+    // mis-fired on simultaneous viewport-shrink + content-grow.
+    const d = classifyScrollDelta({
+      previous: pinnedGeom,
+      current,
+      mode: following() ? "tail" : "read",
+      following: following(),
+    });
+    if (d.intent === "reached-bottom") {
+      // Re-engage following (scroll-back-to-bottom, or a clamp that landed us
+      // at the bottom). Clear the intent latch + ack unread.
+      setFollowing(true);
+      setUserScrolledUp(false);
+      if (!props.draft) {
         clearReadAnchor(props.sessionId);
         if (armedCand?.sid === props.sessionId) armedCand = undefined;
         ackSession(props.sessionId);
-      } else {
-        // Scrolled away from the tail: schedule a debounced geometry sweep +
-        // monotonic cursor write. NEVER per frame (see flushReadCursor).
+      }
+    } else if (d.intent === "user-scroll-up" || d.intent === "user-scroll-down") {
+      // Genuine scroll-away from the tail (residual outside epsilon). Drop
+      // following + arm the latch so the busy-edge self-heal does NOT yank the
+      // reader. Schedule a debounced read-cursor write.
+      setFollowing(false);
+      setUserScrolledUp(true);
+      if (!props.draft) scheduleReadCursor();
+    } else {
+      // intent === "none": layout churn (content/viewport resize fully
+      // accounted for, residual within epsilon). Do NOT flip following — that
+      // flip was the deadlock root. While following, the tail branch already
+      // targeted the bottom; apply it so a viewport shrink re-glues. While not
+      // following, preserve position (schedule a cursor read).
+      if (following() && d.shouldScroll && d.newScrollTop !== undefined) {
+        scrollEl.scrollTop = d.newScrollTop;
+      } else if (!props.draft) {
         scheduleReadCursor();
       }
     }
+    // Advance the baseline to the settled geometry (after any write) so the
+    // next scroll/RO event computes an incremental delta.
+    pinnedGeom = geom(scrollEl);
     scheduleActiveTurn();
   }
 

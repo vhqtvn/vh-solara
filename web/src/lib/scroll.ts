@@ -103,3 +103,164 @@ export function orderAhead(
   if (cand === stored) return false;
   return order.indexOf(cand) > order.indexOf(stored);
 }
+
+// ---------------------------------------------------------------------------
+// Dual-axis scroll geometry reducer (option A_plus).
+//
+// Root defect being fixed: the chat-scroll sentinel previously recorded only
+// `scrollTop` + `scrollHeight` and classified layout mutation with a single
+// boolean ("did content shrink?"). Content-resize and viewport-resize
+// routinely happen in the SAME frame (typing during a live stream grows the
+// composer → viewport shrinks while a block appends → content grows; mobile
+// keyboard toggle; hydration + composer grow; paste/recall), so a single-axis
+// classifier is structurally inadequate and either deadlocks autoscroll or
+// yanks a preserved read position.
+//
+// The fix decomposes BOTH axes (content delta + viewport delta) and treats
+// genuine user scroll-intent as the RESIDUAL after content+viewport movement
+// AND the scroll-range clamp are accounted for. A residual within epsilon is
+// layout churn (do nothing / re-glue); a residual outside epsilon is real
+// user intent (drop following / re-engage / preserve anchor).
+//
+// Read mode additionally accepts an `anchorDelta` (measured shift of the
+// logical `data-mid` anchor) so a grow-ABOVE-viewport or shrink-ABOVE that
+// the browser's `overflow-anchor:auto` failed to track can be corrected
+// mechanically instead of being mistaken for user intent.
+// ---------------------------------------------------------------------------
+
+export interface ScrollGeometry {
+  scrollTop: number;
+  scrollHeight: number;
+  clientHeight: number;
+}
+
+export type ScrollMode = "tail" | "read";
+
+export type ScrollIntent =
+  | "none"
+  | "user-scroll-up"
+  | "user-scroll-down"
+  | "reached-bottom";
+
+export interface ScrollDecision {
+  // Should the caller apply a programmatic scrollTop write this cycle?
+  shouldScroll: boolean;
+  // The target scrollTop to write (only meaningful when shouldScroll is true).
+  newScrollTop?: number;
+  // The scrollTop the browser SHOULD be reporting after content+viewport delta
+  // + clamp, assuming NO user intent. residualUserDelta is measured against it.
+  expectedScrollTop: number;
+  // current.scrollTop - expectedScrollTop. Within ±epsilon == layout churn;
+  // outside == real user scroll-intent.
+  residualUserDelta: number;
+  // current.scrollHeight - previous.scrollHeight (content axis).
+  contentDelta: number;
+  // current.clientHeight - previous.clientHeight (viewport axis).
+  viewportDelta: number;
+  // Classified intent derived from the residual (+ tail/reached-bottom logic).
+  intent: ScrollIntent;
+}
+
+export interface ClassifyScrollDeltaArgs {
+  previous: ScrollGeometry;
+  current: ScrollGeometry;
+  mode: ScrollMode;
+  following: boolean;
+  // Measured shift of the logical data-mid anchor (read mode only). Positive =
+  // content grew above the anchor (anchor pushed down); negative = shrank
+  // above. When non-zero in read mode the expected scrollTop tracks the anchor
+  // so a browser that did NOT keep the anchor pinned is corrected instead of
+  // being read as user intent.
+  anchorDelta?: number;
+  // Absorb sub-pixel / clamp churn. Default ~1px.
+  epsilon?: number;
+}
+
+const DEFAULT_EPSILON = 1;
+
+function clampTop(value: number, maxBottom: number): number {
+  if (value < 0) return 0;
+  if (value > maxBottom) return maxBottom;
+  return value;
+}
+
+// Classify a scroll-area geometry transition into an intent + programmatic
+// scroll decision. Pure: no DOM, no signals, no side effects — fully unit
+// testable in isolation.
+export function classifyScrollDelta(
+  args: ClassifyScrollDeltaArgs,
+): ScrollDecision {
+  const eps = args.epsilon ?? DEFAULT_EPSILON;
+  const anchorDelta = args.anchorDelta ?? 0;
+  const prev = args.previous;
+  const curr = args.current;
+
+  const contentDelta = curr.scrollHeight - prev.scrollHeight;
+  const viewportDelta = curr.clientHeight - prev.clientHeight;
+  const maxBottomCurr = Math.max(0, curr.scrollHeight - curr.clientHeight);
+
+  // Expected scrollTop model: the browser keeps the scrollTop numeric value
+  // fixed through content/viewport mutation, then clamps it to the new scroll
+  // range. In read mode, when the logical anchor shifted, the expected value
+  // tracks the anchor so an unfrozen viewport is corrected mechanically.
+  const expectedScrollTop =
+    args.mode === "read" && anchorDelta !== 0
+      ? clampTop(prev.scrollTop + anchorDelta, maxBottomCurr)
+      : clampTop(prev.scrollTop, maxBottomCurr);
+
+  const residualUserDelta = curr.scrollTop - expectedScrollTop;
+  const distFromBottom =
+    curr.scrollHeight - curr.scrollTop - curr.clientHeight;
+  const atBottom = distFromBottom <= eps;
+
+  let intent: ScrollIntent = "none";
+  let shouldScroll = false;
+  let newScrollTop: number | undefined;
+
+  // READ-mode compensation failure: the logical anchor moved but the browser
+  // did NOT move scrollTop to track it (overflow-anchor:auto unreliable during
+  // hydration / load-more). Correct it mechanically. Detected by: anchor
+  // shifted, but scrollTop barely moved relative to PREVIOUS (so it wasn't a
+  // user scroll) yet the residual against the anchor-tracked expectation is
+  // large. Covers both grow-above-froze (residual negative) and
+  // shrink-above-froze (residual positive), unified by abs().
+  if (
+    args.mode === "read" &&
+    anchorDelta !== 0 &&
+    Math.abs(curr.scrollTop - prev.scrollTop) <= eps &&
+    Math.abs(residualUserDelta) > eps
+  ) {
+    intent = "none";
+    shouldScroll = true;
+    newScrollTop = expectedScrollTop;
+  } else if (atBottom) {
+    intent = "reached-bottom";
+  } else if (residualUserDelta < -eps) {
+    intent = "user-scroll-up";
+  } else if (residualUserDelta > eps) {
+    intent = "user-scroll-down";
+  } else {
+    intent = "none";
+  }
+
+  // TAIL-mode re-glue: while following, any non-user-scroll-up transition is
+  // layout churn we must absorb by re-pinning to the bottom. Epsilon-guard the
+  // write so a no-op frame doesn't churn RO/onScroll.
+  if (args.mode === "tail" && args.following && intent !== "user-scroll-up") {
+    const target = maxBottomCurr;
+    if (Math.abs(curr.scrollTop - target) > eps) {
+      shouldScroll = true;
+      newScrollTop = target;
+    }
+  }
+
+  return {
+    shouldScroll,
+    newScrollTop,
+    expectedScrollTop,
+    residualUserDelta,
+    contentDelta,
+    viewportDelta,
+    intent,
+  };
+}
