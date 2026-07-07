@@ -39,13 +39,30 @@ export default function ServersPanel() {
     // can tell a slow connection from a slow server. `conn` = EventSource open
     // (pure connection); `server` = open → first snapshot (ensureMessages +
     // compute + serialize). Tree stream = tree+notifications; session stream =
-    // the active session's messages.
+    // the active session's messages. The session line also carries `hydrate` =
+    // first snapshot → messages.loaded (the upstream full-fetch wait `server`
+    // is blind to on a cold session): a number = cold fetch took Yms, "warm" =
+    // the snapshot already had the full history (instant switch), "…" = cold
+    // and still fetching (the stall in progress).
     const latTree = state.connLatency.tree;
     const latSes = state.connLatency.session;
     const fmt = (o?: number, s?: number) =>
       o != null || s != null ? `conn ${o ?? "—"}ms · server ${s ?? "—"}ms` : "—";
-    push("Tree latency", fmt(latTree.open, latTree.snap));
-    push("Session latency", fmt(latSes.open, latSes.snap));
+    const fmtSes = (
+      o?: number, s?: number, h?: number | "warm",
+      f?: number, r?: number,
+    ) => {
+      const hp = h == null ? "…" : h === "warm" ? "warm" : `${h}ms`;
+      const hasAny = o != null || s != null || h != null;
+      if (!hasAny) return "—";
+      const base = `conn ${o ?? "—"}ms · server ${s ?? "—"}ms · hydrate ${hp}`;
+      // fetch/rec split `hydrate` — only present when the daemon reported it on
+      // a cold messages.loaded. "—" = absent (old daemon / warm / still fetching).
+      return f != null || r != null
+        ? `${base} · fetch ${f ?? "—"}ms / rec ${r ?? "—"}ms`
+        : base;
+    };
+    push("Session latency", fmtSes(latSes.open, latSes.snap, latSes.hydrate, latSes.fetchMs, latSes.reconcileMs));
     push("Theme", c.theme);
     push("Model", c.model);
     push("Small model", c.small_model);
@@ -80,7 +97,7 @@ export default function ServersPanel() {
               <span class="m-row-main">
                 <span class="m-name">{r.k}</span>
               </span>
-              <span class="m-prov srv-val">{r.v}</span>
+              <span class="m-prov srv-val" title={r.v}>{r.v}</span>
             </div>
           )}
         </For>

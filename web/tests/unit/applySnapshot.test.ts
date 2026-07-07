@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
 import { beforeEach, describe, expect, it } from "vitest";
 import { reconcile } from "solid-js/store";
-import { applySnapshot, applySessionEvent, applySessionSnapshot, applyMessageEvent } from "../../src/sync/stream";
+import { gzipSync } from "node:zlib";
+import { applySnapshot, applySessionEvent, applySessionSnapshot, applyMessageEvent, decodeMessagesBatch } from "../../src/sync/stream";
 import { state, setState } from "../../src/sync/store";
 import type { Snapshot } from "../../src/types";
 
@@ -303,5 +304,74 @@ describe("applySessionSnapshot / applyMessageEvent — Slice C async hydration",
     );
     expect(state.messages.s1.order).toContain("m1");
     expect(state.messagesLoaded.s1).toBe(false);
+  });
+
+  it("messages.batch wholesale-sets the transcript (cold-load structural fix)", () => {
+    // Fix #3: a cold-load collapses the N per-message/per-part upserts into ONE
+    // messages.batch carrying the full reconciled list. The client ingests it in
+    // a single buildMessages mutation (the same path applySessionSnapshot uses
+    // for a warm snapshot) — NOT as N individual events. Decoupled from the
+    // reveal gate: content only; messages.loaded (still emitted after the batch)
+    // flips messagesLoaded. So a batch landing while messagesLoaded===false
+    // stages the content but does NOT claim loaded.
+    setState("messagesLoaded", "s1", false);
+    setState("messages", "s1", { order: [], byId: {} });
+    applyMessageEvent(
+      "messages.batch",
+      41,
+      {
+        sessionID: "s1",
+        messages: [
+          { info: { id: "m1", sessionID: "s1", role: "user", time: { created: 1 } }, parts: [{ id: "p1", sessionID: "s1", messageID: "m1", type: "text", text: "a" }] },
+          { info: { id: "m2", sessionID: "s1", role: "assistant", time: { created: 2 } }, parts: [{ id: "p2", sessionID: "s1", messageID: "m2", type: "text", text: "b" }] },
+        ],
+      },
+      false,
+    );
+    // Wholesale set: both messages + both parts present, in order.
+    expect(state.messages.s1.order).toEqual(["m1", "m2"]);
+    expect(state.messages.s1.byId.m1.parts.p2).toBeUndefined();
+    expect(state.messages.s1.byId.m1.parts.p1).toBeDefined();
+    expect(state.messages.s1.byId.m2.parts.p2).toBeDefined();
+    // The batch carries CONTENT; it must NOT flip the delivery flag (the gate
+    // still waits for messages.loaded — P1-WEB-020 reveal gate is load-bearing).
+    expect(state.messagesLoaded.s1).toBe(false);
+    // trackCursor:false → Stream 2 must NOT advance the shared resume cursor.
+    expect(state.cursor).toBe(0);
+
+    // messages.loaded AFTER the batch flips the gate open (content was staged).
+    applyMessageEvent("messages.loaded", 42, { sessionID: "s1" }, false);
+    expect(state.messagesLoaded.s1).toBe(true);
+    // Content survived — the wholesale set is not clobbered by the gate flip.
+    expect(state.messages.s1.order).toEqual(["m1", "m2"]);
+  });
+
+  it("messages.batch ingest path works with a gzip+base64 compressed payload (decode then apply)", async () => {
+    // End-to-end of the new compressed cold-load: the server emits
+    // {sessionID, encoding:"gzip64", data: base64(gzip({"messages":[...]}))}.
+    // The stream.ts listener decodes via decodeMessagesBatch THEN hands the
+    // decoded {sessionID, messages} to applyMessageEvent's "messages.batch"
+    // case (unchanged). This pins the decode→apply contract the listener
+    // relies on: the case must keep reading payload.sessionID + payload.messages.
+    setState("messagesLoaded", "s7", false);
+    setState("messages", "s7", { order: [], byId: {} });
+    const messages = [
+      { info: { id: "m1", sessionID: "s7", role: "user", time: { created: 1 } }, parts: [{ id: "p1", sessionID: "s7", messageID: "m1", type: "text", text: "a" }] },
+      { info: { id: "m2", sessionID: "s7", role: "assistant", time: { created: 2 } }, parts: [{ id: "p2", sessionID: "s7", messageID: "m2", type: "text", text: "b" }] },
+    ];
+    const data = Buffer.from(gzipSync(Buffer.from(JSON.stringify({ messages })))).toString("base64");
+    // Mirrors the listener body: decode first, then apply the decoded payload.
+    const decoded = await decodeMessagesBatch({ sessionID: "s7", encoding: "gzip64", data });
+    applyMessageEvent("messages.batch", 50, decoded, false);
+    // Wholesale set landed; gate NOT flipped (content-only, like the raw case).
+    expect(state.messages.s7.order).toEqual(["m1", "m2"]);
+    expect(state.messages.s7.byId.m1.parts.p1).toBeDefined();
+    expect(state.messages.s7.byId.m2.parts.p2).toBeDefined();
+    expect(state.messagesLoaded.s7).toBe(false);
+    expect(state.cursor).toBe(0); // trackCursor:false
+    // The subsequent gate flip still works after the compressed ingest.
+    applyMessageEvent("messages.loaded", 51, { sessionID: "s7" }, false);
+    expect(state.messagesLoaded.s7).toBe(true);
+    expect(state.messages.s7.order).toEqual(["m1", "m2"]);
   });
 });

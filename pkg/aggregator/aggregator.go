@@ -125,9 +125,10 @@ func (a *Aggregator) EnsureMessages(ctx context.Context, sessionID string) error
 // hasn't been called yet (tests calling this directly).
 //
 // On success: SetSessionMessages (marks loaded, emits message.*/part.* deltas)
-// THEN EmitMessagesLoaded — UNCONDITIONALLY, so a fetch that returned zero or
-// byte-identical messages (no diff deltas) still signals completion and the
-// client doesn't wedge on its loading state. On failure (and NOT a shutdown):
+// THEN EmitMessagesLoaded (carrying fetch/reconcile split timing) —
+// UNCONDITIONALLY, so a fetch that returned zero or byte-identical messages (no
+// diff deltas) still signals completion and the client doesn't wedge on its
+// loading state. On failure (and NOT a shutdown):
 // log + EmitMessagesError, leave the session UNLOADED so a reselect / transport
 // reconnect retries; on shutdown (ctx cancelled) just exit silently.
 func (a *Aggregator) EnsureMessagesAsync(ctx context.Context, sessionID string) {
@@ -166,6 +167,15 @@ func (a *Aggregator) EnsureMessagesAsync(ctx context.Context, sessionID string) 
 			a.msgMu.Unlock()
 			close(done)
 		}()
+		// Split the `hydrate` window the client already measures (first snapshot
+		// → messages.loaded): fetchMs = the upstream OpenCode GET
+		// /session/:id/message round-trip; reconcileMs = the daemon-side
+		// SetSessionMessages (decode + id-level diff + emit). Carried on the
+		// messages.loaded event so the Servers panel can attribute a
+		// session-switch stall to upstream-fetch vs daemon-reconcile without a
+		// second probe. `server` (snap) is blind to this window since Slice C
+		// made the upstream fetch async/best-effort.
+		t0 := time.Now()
 		items, err := a.client.Messages(fetchCtx, sessionID)
 		if err != nil {
 			if fetchCtx.Err() != nil {
@@ -175,16 +185,21 @@ func (a *Aggregator) EnsureMessagesAsync(ctx context.Context, sessionID string) 
 				// unloaded; a later selection on a fresh aggregator retries.
 				return
 			}
-			log.Printf("[aggregator] EnsureMessagesAsync failed for %s: %v", sessionID, err)
+			// Include fetchMs in the log: a background fetch the operator isn't
+			// watching still took wall-clock time before failing, useful signal.
+			log.Printf("[aggregator] EnsureMessagesAsync failed for %s (fetch=%dms): %v", sessionID, time.Since(t0).Milliseconds(), err)
 			a.store.EmitMessagesError(sessionID, err.Error())
 			return
 		}
+		fetchMs := time.Since(t0).Milliseconds()
+		tR := time.Now()
 		a.store.SetSessionMessages(sessionID, decodeMessages(items))
+		reconcileMs := time.Since(tR).Milliseconds()
 		// ALWAYS emit completion — even when the fetch returned zero or unchanged
 		// messages (SetSessionMessages emitted no message.* delta in those
 		// cases). Without this a client would wedge on the loading state forever
 		// waiting for a delta that never arrives.
-		a.store.EmitMessagesLoaded(sessionID)
+		a.store.EmitMessagesLoaded(sessionID, fetchMs, reconcileMs)
 	}()
 }
 

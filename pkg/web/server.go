@@ -820,6 +820,18 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	h.Set("X-Accel-Buffering", "no")
 	h.Set("Connection", "keep-alive")
 
+	// Honest conn: flush a no-op SSE comment IMMEDIATELY so the client's onopen
+	// fires at handler entry (Go sends response headers on the first Write/Flush;
+	// without this, onopen is delayed until the trailing snapshot flush, so ALL
+	// pre-flush work — including Snapshot compute — is silently charged to the
+	// client's `conn` measurement and `server/snap` reads ~0ms). The comment line
+	// is ignored by EventSource (a `:`-prefixed line per the SSE spec) but it
+	// forces the headers out, making `conn` transport-only (DNS/TCP/tunnel-
+	// setup/slot-queuing) and letting subsequent server compute show up honestly
+	// in `server/snap`. Do NOT move/remove the existing snapshot flush below.
+	fmt.Fprintf(w, ": hello\n\n")
+	flusher.Flush()
+
 	// Prefer the Last-Event-ID header (sent automatically by EventSource on
 	// reconnect) over the cursor query param.
 	cursorStr := r.Header.Get("Last-Event-ID")

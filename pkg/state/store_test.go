@@ -1,7 +1,11 @@
 package state
 
 import (
+	"bytes"
+	"compress/gzip"
+	"encoding/base64"
 	"encoding/json"
+	"io"
 	"reflect"
 	"sort"
 	"testing"
@@ -885,14 +889,25 @@ func TestEmitMessagesLoadedError(t *testing.T) {
 	defer unsub()
 	drainKind(ch, "") // drop subscribe-time backlog
 
-	s.EmitMessagesLoaded("a")
+	s.EmitMessagesLoaded("a", 5, 3)
 	loaded := drainKind(ch, KindMessagesLoaded)
 	if len(loaded) != 1 {
 		t.Fatalf("want 1 %s event, got %d", KindMessagesLoaded, len(loaded))
 	}
-	var p1 struct{ SessionID string }
+	var p1 struct {
+		SessionID   string
+		FetchMs     int64
+		ReconcileMs int64
+	}
 	if json.Unmarshal(loaded[0].Payload, &p1) != nil || p1.SessionID != "a" {
-		t.Fatalf("messages.loaded payload must be {sessionID:a}, got %s", loaded[0].Payload)
+		t.Fatalf("messages.loaded payload must carry sessionID:a, got %s", loaded[0].Payload)
+	}
+	// The split-timing fields are part of the payload shape now. The VALUES are
+	// non-deterministic in production (real fetch/reconcile wall-clock); here we
+	// pass deterministic inputs, so assert presence + non-negative only — the
+	// same relaxation the aggregator tests use — to avoid coupling to numbers.
+	if p1.FetchMs < 0 || p1.ReconcileMs < 0 {
+		t.Fatalf("messages.loaded payload must carry fetchMs/reconcileMs (>=0), got %s", loaded[0].Payload)
 	}
 	if loaded[0].Seq == 0 {
 		t.Fatal("messages.loaded must be seq-stamped (replayable)")
@@ -933,6 +948,142 @@ func TestEmitMessagesLoadedError(t *testing.T) {
 	}
 	if loadN != 1 || errN != 1 {
 		t.Fatalf("replay must contain 1 messages.loaded + 1 messages.error, got load=%d err=%d", loadN, errN)
+	}
+}
+
+// TestColdLoadEmitsSingleMessagesBatch pins the Fix #3 structural change: a
+// cold-load SetSessionMessages (session not previously loaded) must emit exactly
+// ONE KindMessagesBatch carrying the full reconciled message+part list, instead
+// of N per-message message.upsert + per-part part.upsert events. This collapses
+// the cold-load N-event fan-out (over the controller tunnel each event becomes a
+// yamux frame + WebSocket message + flow-control round-trip — the root cause of
+// the session-switch cold-load stall) into a single event. It also asserts:
+//   - the batch precedes messages.loaded (the aggregator emits loaded AFTER
+//     SetSessionMessages; loaded stays the back-of-channel completion signal /
+//     reveal gate), and
+//   - a WARM reconcile (a second SetSessionMessages once the session is already
+//     loaded — the daemon OpenCode-stream reconnect path) reverts to individual
+//     message.upsert/part.upsert emits (incremental reconcile, no batch), and
+//   - the batch payload's sessionID + message count match the input.
+func TestColdLoadEmitsSingleMessagesBatch(t *testing.T) {
+	s := New(100)
+	s.Apply(ev("session.created", `{"info":{"id":"cold"}}`))
+	ch, unsub := s.Subscribe(256) // firehose: see every message-class event
+	defer unsub()
+	drainKind(ch, "") // drop subscribe-time backlog
+
+	// COLD load: 3 messages, each with a part. Previously this fanned out to
+	// 3 message.upsert + 3 part.upsert = 6 events; now it must be ONE batch.
+	s.SetSessionMessages("cold", []MessageWithParts{
+		{Info: json.RawMessage(`{"id":"m1","sessionID":"cold","role":"user","time":{"created":1}}`),
+			Parts: []json.RawMessage{json.RawMessage(`{"id":"p1","sessionID":"cold","messageID":"m1","type":"text","text":"a"}`)}},
+		{Info: json.RawMessage(`{"id":"m2","sessionID":"cold","role":"assistant","time":{"created":2}}`),
+			Parts: []json.RawMessage{json.RawMessage(`{"id":"p2","sessionID":"cold","messageID":"m2","type":"text","text":"b"}`)}},
+		{Info: json.RawMessage(`{"id":"m3","sessionID":"cold","role":"user","time":{"created":3}}`),
+			Parts: []json.RawMessage{json.RawMessage(`{"id":"p3","sessionID":"cold","messageID":"m3","type":"text","text":"c"}`)}},
+	})
+	// Mirrors the aggregator's EnsureMessagesAsync ordering: SetSessionMessages
+	// (the batch) THEN EmitMessagesLoaded (the completion signal).
+	s.EmitMessagesLoaded("cold", 10, 5)
+
+	// Collect the message-class events IN ORDER (drainAll preserves arrival
+	// order; drainKind filters, so use drainAll and keep the kinds we care
+	// about).
+	var got []string
+	for _, e := range drainAll(ch) {
+		switch e.Kind {
+		case KindMessageUpsert, KindPartUpsert, KindMessagesBatch, KindMessagesLoaded:
+			got = append(got, e.Kind)
+			if e.Kind == KindMessagesBatch {
+				// The batch payload is now {sessionID, encoding, data} where
+				// data is base64(gzip({"messages":[...]})). sessionID stays
+				// plain so interest filtering (payloadSessionID / sendable)
+				// keeps working — round-trip the compression here.
+				var env struct {
+					SessionID string `json:"sessionID"`
+					Encoding  string `json:"encoding"`
+					Data      string `json:"data"`
+				}
+				if err := json.Unmarshal(e.Payload, &env); err != nil {
+					t.Fatalf("messages.batch payload unmarshal: %v", err)
+				}
+				if env.SessionID != "cold" {
+					t.Fatalf("messages.batch sessionID: want cold, got %q", env.SessionID)
+				}
+				if env.Encoding != "gzip64" {
+					t.Fatalf("messages.batch encoding: want gzip64, got %q", env.Encoding)
+				}
+				// Plain sessionID must survive at the top level (the store/web
+				// interest filters rely on it): re-extract it the same way
+				// payloadSessionID does to pin the invariant.
+				if got := payloadSessionID(e.Payload); got != "cold" {
+					t.Fatalf("payloadSessionID(batch): want cold, got %q", got)
+				}
+				raw, err := base64.StdEncoding.DecodeString(env.Data)
+				if err != nil {
+					t.Fatalf("messages.batch base64 decode: %v", err)
+				}
+				gr, err := gzip.NewReader(bytes.NewReader(raw))
+				if err != nil {
+					t.Fatalf("messages.batch gzip reader: %v", err)
+				}
+				inner, err := io.ReadAll(gr)
+				if err != nil {
+					t.Fatalf("messages.batch gunzip: %v", err)
+				}
+				var p struct {
+					Messages []MessageWithParts `json:"messages"`
+				}
+				if err := json.Unmarshal(inner, &p); err != nil {
+					t.Fatalf("messages.batch inner unmarshal: %v", err)
+				}
+				if len(p.Messages) != 3 {
+					t.Fatalf("messages.batch message count: want 3, got %d", len(p.Messages))
+				}
+				// Each message carries its part (mirrors snapshot serialization).
+				for i, m := range p.Messages {
+					if len(m.Parts) != 1 {
+						t.Fatalf("messages.batch message %d part count: want 1, got %d", i, len(m.Parts))
+					}
+				}
+			}
+		}
+	}
+
+	// Exactly ONE batch (no per-message/per-part upserts), THEN messages.loaded.
+	wantSeq := []string{KindMessagesBatch, KindMessagesLoaded}
+	if !reflect.DeepEqual(got, wantSeq) {
+		t.Fatalf("cold-load event sequence: want %v, got %v", wantSeq, got)
+	}
+
+	// WARM reconcile: a second SetSessionMessages on the now-loaded session
+	// (the daemon OpenCode-stream reconnect path) must emit INDIVIDUAL upserts
+	// again — incremental reconcile, no batch. Add a new message + change one.
+	drainAll(ch) // clear
+	s.SetSessionMessages("cold", []MessageWithParts{
+		{Info: json.RawMessage(`{"id":"m1","sessionID":"cold","role":"user","time":{"created":1}}`),
+			Parts: []json.RawMessage{json.RawMessage(`{"id":"p1","sessionID":"cold","messageID":"m1","type":"text","text":"a"}`)}},
+		{Info: json.RawMessage(`{"id":"m2","sessionID":"cold","role":"assistant","time":{"created":2}}`),
+			Parts: []json.RawMessage{json.RawMessage(`{"id":"p2","sessionID":"cold","messageID":"m2","type":"text","text":"b"}`)}},
+		{Info: json.RawMessage(`{"id":"m3","sessionID":"cold","role":"user","time":{"created":3}}`),
+			Parts: []json.RawMessage{json.RawMessage(`{"id":"p3","sessionID":"cold","messageID":"m3","type":"text","text":"c"}`)}},
+		{Info: json.RawMessage(`{"id":"m4","sessionID":"cold","role":"assistant","time":{"created":4}}`),
+			Parts: []json.RawMessage{json.RawMessage(`{"id":"p4","sessionID":"cold","messageID":"m4","type":"text","text":"d"}`)}},
+	})
+	var warmBatch, warmUpsert int
+	for _, e := range drainAll(ch) {
+		switch e.Kind {
+		case KindMessagesBatch:
+			warmBatch++
+		case KindMessageUpsert, KindPartUpsert:
+			warmUpsert++
+		}
+	}
+	if warmBatch != 0 {
+		t.Fatalf("warm reconcile must NOT emit a batch, got %d", warmBatch)
+	}
+	if warmUpsert == 0 {
+		t.Fatalf("warm reconcile must emit individual upserts (incremental), got 0")
 	}
 }
 

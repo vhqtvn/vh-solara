@@ -2740,7 +2740,25 @@ body {
 }
 .srv-tab:hover { color: var(--fg); }
 .srv-tab.on { color: var(--fg); border-bottom-color: var(--accent); font-weight: 500; }
-.srv-val { font-variant-numeric: tabular-nums; max-width: 60%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.srv-val {
+  font-variant-numeric: tabular-nums;
+  /* Diagnostics panel (Server tab): show the FULL value (latency strings can be
+     long — conn/server/hydrate/fetch/rec), not a clipped "…" that needs devtools
+     to read. Drop the truncation; let the value wrap and claim a value column
+     (flex:1) so a long string wraps within its share instead of overflowing or
+     crushing the short label. Mobile already wraps the whole .m-row (flex-wrap),
+     so there the value lands on its own full-width line. user-select is re-
+     enabled here because the app shell disables selection globally (so a long-
+     press on chrome doesn't pop a callout); the latency string is meant to be
+     copyable. overflow-wrap breaks long unbroken tokens (epoch id, URL). No GPU-
+     forbidden primitives (no mask-image/backdrop-filter/contain/content-visibility). */
+  user-select: text;
+  -webkit-user-select: text;
+  -webkit-touch-callout: default;
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
 .srv-actions { display: flex; align-items: center; gap: 10px; margin: 10px 0 4px; }
 .srv-action {
   display: inline-flex;

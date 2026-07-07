@@ -129,10 +129,32 @@ export interface SyncState {
   // connLatency: per-stream connection-vs-server latency diagnostics
   // (Feature 3). `open` = EventSource construction → onopen (pure connection
   // latency); `snap` = onopen → first snapshot event (server processing:
-  // ensureMessages + snapshot compute + serialize).
+  // ensureMessages + snapshot compute + serialize). Session stream also carries
+  // `hydrate` = first snapshot arrival → messages.loaded arrival — the upstream
+  // full-fetch wait that `snap` is blind to on a COLD session (the snapshot
+  // ships instantly with gate.messagesLoaded=false, then the daemon fetches the
+  // full history async; the client reveal gate holds until messages.loaded).
+  // `"warm"` marks a session whose first snapshot already had
+  // gate.messagesLoaded===true (no fetch needed → messages.loaded never comes);
+  // undefined = cold and still waiting, OR no session stream open. The
+  // warm-vs-number split is itself the diagnostic signal (warm switch = instant,
+  // cold switch = the multi-second stall).
+  //
+  // `fetchMs`/`reconcileMs` split `hydrate` (a cold session that fired
+  // messages.loaded): fetchMs = the upstream OpenCode GET round-trip,
+  // reconcileMs = the daemon-side SetSessionMessages. Carried on the
+  // messages.loaded payload; absent (undefined) for an older daemon, a warm
+  // session (messages.loaded never fires), or while a cold fetch is still in
+  // flight — the UI renders "—" then.
   connLatency: {
     tree: { open?: number; snap?: number };
-    session: { open?: number; snap?: number };
+    session: {
+      open?: number;
+      snap?: number;
+      hydrate?: number | "warm";
+      fetchMs?: number;
+      reconcileMs?: number;
+    };
   };
 }
 

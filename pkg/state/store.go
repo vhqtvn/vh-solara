@@ -7,7 +7,9 @@ package state
 
 import (
 	"bytes"
+	"compress/gzip"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"strings"
@@ -43,7 +45,29 @@ const (
 	// reconnect retries). Emitted so a connected client can surface the failure
 	// instead of wedging on the loading state. Same lifetime/replay scope as
 	// KindMessagesLoaded. Payload {sessionID, error}.
-	KindMessagesError   = "messages.error"
+	KindMessagesError = "messages.error"
+	// KindMessagesBatch carries a session's ENTIRE cold-load message+part
+	// history as ONE wholesale event, collapsing what would otherwise be N
+	// per-message message.upsert + per-part part.upsert events into a single
+	// fan-out unit. Emitted by reconcileMessagesLocked ONLY on a cold-load
+	// (session was not previously loaded: msgLoaded[sid] false at entry) — the
+	// warm/incremental reconcile path (daemon OpenCode-stream reconnect for an
+	// already-loaded session) keeps emitting individual upserts so a connected
+	// client reconciles incrementally. The payload is {sessionID, encoding,
+	// data}: sessionID stays PLAIN TEXT so the store/web interest filters
+	// (payloadSessionID / sendable) keep working — only the heavy messages
+	// array is compressed. "encoding":"gzip64" marks the form; "data" is the
+	// base64-encoded gzip of the inner {messages:[...]} JSON (text compresses
+	// ~5-10x, cutting cold-load hydrate over the controller tunnel; base64 is
+	// required because SSE data: fields are text/UTF-8 and raw gzip bytes are
+	// not valid UTF-8). The client (web/src/sync/stream.ts) base64-decodes +
+	// gunzips (native DecompressionStream) + JSON.parses it back to
+	// {sessionID, messages} and ingests via the same buildMessages path a warm
+	// snapshot uses. Emitted BEFORE EmitMessagesLoaded so messages.loaded
+	// remains the back-of-channel completion signal (the client reveal gate
+	// still waits for it). Message-class (filtered to subscribed sessions like
+	// the other message.* / part.* / messages.* kinds).
+	KindMessagesBatch   = "messages.batch"
 	KindTodo            = "todo"
 	KindPermissionSet   = "permission.upsert"
 	KindPermissionClear = "permission.delete"
@@ -456,11 +480,22 @@ func rawObj(kv map[string]interface{}) json.RawMessage {
 // emits this after a successful EnsureMessagesAsync fetch — including when the
 // fetch returned zero or byte-identical messages, so a connected client never
 // wedges on its loading state waiting for a message.* delta that never comes.
-// Safe to call from any goroutine.
-func (s *Store) EmitMessagesLoaded(sid string) {
+//
+// fetchMs/reconcileMs split the window the client already measures as `hydrate`
+// (first snapshot → this event): fetchMs = the upstream OpenCode GET
+// /session/:id/message round-trip; reconcileMs = the daemon-side
+// SetSessionMessages (decode + id-level diff + emit). They are carried verbatim
+// on the payload so the Servers panel can show where a session-switch stall
+// lives without a second probe. Non-negative; the only production caller is the
+// aggregator's EnsureMessagesAsync. Safe to call from any goroutine.
+func (s *Store) EmitMessagesLoaded(sid string, fetchMs, reconcileMs int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.emit(KindMessagesLoaded, rawObj(map[string]interface{}{"sessionID": sid}))
+	s.emit(KindMessagesLoaded, rawObj(map[string]interface{}{
+		"sessionID":   sid,
+		"fetchMs":     fetchMs,
+		"reconcileMs": reconcileMs,
+	}))
 }
 
 // EmitMessagesError fans out a messages.error for ONE session: an on-demand
@@ -1741,7 +1776,8 @@ func isMessageClassKind(kind string) bool {
 	switch kind {
 	case KindMessageUpsert, KindMessageDelete,
 		KindPartUpsert, KindPartDelete,
-		KindMessagesLoaded, KindMessagesError:
+		KindMessagesLoaded, KindMessagesError,
+		KindMessagesBatch:
 		return true
 	}
 	return false
@@ -1871,7 +1907,21 @@ func (s *Store) Hydrate(sessions []json.RawMessage, messages map[string][]Messag
 // reconcileMessagesLocked diffs one session's full message list into the store,
 // emitting upsert/delete events for changes, and marks the session's messages
 // as loaded. Caller must hold s.mu.
+//
+// Cold-load batching: when the session was NOT previously loaded
+// (s.msgLoaded[sid] false at entry — the SetSessionMessages lazy-hydration path,
+// or a Hydrate on a fresh daemon with no connected clients), the per-message
+// message.upsert + per-part part.upsert emits are SUPPRESSED and a SINGLE
+// KindMessagesBatch is emitted instead, carrying the entire reconciled
+// message+part list as one wholesale payload. This collapses the cold-load
+// N-event fan-out (over the controller tunnel each event becomes a yamux frame
+// + WebSocket message + flow-control round-trip — the root cause of the
+// session-switch cold-load stall) into a single event the client ingests in one
+// mutation. The warm/incremental path (msgLoaded already true — a daemon
+// OpenCode-stream reconnect for an already-loaded session) keeps emitting
+// individual upserts so a connected client reconciles only the diffs.
 func (s *Store) reconcileMessagesLocked(sid string, list []MessageWithParts) {
+	coldLoad := !s.msgLoaded[sid] // detect BEFORE setting it true (msgLoaded lifecycle is unchanged)
 	s.msgLoaded[sid] = true
 	sm := s.messages[sid]
 	if sm == nil {
@@ -1890,10 +1940,14 @@ func (s *Store) reconcileMessagesLocked(sid string, list []MessageWithParts) {
 			me = &messageEntry{id: env.ID, info: mwp.Info, parts: map[string]json.RawMessage{}}
 			sm.byID[env.ID] = me
 			sm.order = append(sm.order, env.ID)
-			s.emit(KindMessageUpsert, mwp.Info)
+			if !coldLoad {
+				s.emit(KindMessageUpsert, mwp.Info)
+			}
 		} else if !bytes.Equal(me.info, mwp.Info) {
 			me.info = mwp.Info
-			s.emit(KindMessageUpsert, mwp.Info)
+			if !coldLoad {
+				s.emit(KindMessageUpsert, mwp.Info)
+			}
 		}
 		// A history fetch is authoritative for this message's parts: discard any
 		// streaming accumulators (they were building on stale/live bases). The
@@ -1917,19 +1971,25 @@ func (s *Store) reconcileMessagesLocked(sid string, list []MessageWithParts) {
 			if old, ok := me.parts[pe.ID]; !ok {
 				me.parts[pe.ID] = part
 				me.partOrder = append(me.partOrder, pe.ID)
-				s.emit(KindPartUpsert, part)
+				if !coldLoad {
+					s.emit(KindPartUpsert, part)
+				}
 			} else if !bytes.Equal(old, part) {
 				me.parts[pe.ID] = part
-				s.emit(KindPartUpsert, part)
+				if !coldLoad {
+					s.emit(KindPartUpsert, part)
+				}
 			}
 		}
 		for pid := range me.parts {
 			if !seenPart[pid] {
 				delete(me.parts, pid)
 				me.partOrder = removeString(me.partOrder, pid)
-				s.emit(KindPartDelete, rawObj(map[string]interface{}{
-					"sessionID": sid, "messageID": env.ID, "partID": pid,
-				}))
+				if !coldLoad {
+					s.emit(KindPartDelete, rawObj(map[string]interface{}{
+						"sessionID": sid, "messageID": env.ID, "partID": pid,
+					}))
+				}
 			}
 		}
 	}
@@ -1937,12 +1997,80 @@ func (s *Store) reconcileMessagesLocked(sid string, list []MessageWithParts) {
 		if !seenMsg[mid] {
 			delete(sm.byID, mid)
 			sm.order = removeString(sm.order, mid)
-			s.emit(KindMessageDelete, rawObj(map[string]interface{}{
-				"sessionID": sid, "messageID": mid,
-			}))
+			if !coldLoad {
+				s.emit(KindMessageDelete, rawObj(map[string]interface{}{
+					"sessionID": sid, "messageID": mid,
+				}))
+			}
 		}
 	}
 	s.recomputeLastAssistantLocked(sid)
+
+	if coldLoad {
+		// Collapse the cold-load N-event fan-out into ONE wholesale event. The
+		// payload mirrors the snapshot's message serialization (MessageWithParts
+		// {Info, Parts}) so the client ingests it identically. Built from the
+		// reconciled state (post-diff), so it reflects whatever live events may
+		// have arrived pre-fetch too. Emitted here (last) so the caller's
+		// EmitMessagesLoaded remains the back-of-channel completion signal.
+		s.emitMessagesBatchLocked(sid)
+	}
+}
+
+// emitMessagesBatchLocked emits a single KindMessagesBatch carrying a session's
+// entire reconciled message+part list as ONE wholesale payload. Caller must hold
+// s.mu. The message shape (MessageWithParts{Info, Parts}) and ordering mirror
+// the Snapshot message serialization exactly, so the client ingests the batch
+// via the same buildMessages path a warm-session snapshot uses.
+//
+// The payload is APPLICATION-COMPRESSED to cut cold-load hydrate latency over
+// the controller tunnel (text compresses ~5-10x; the transport — SSE over
+// yamux/WebSocket through nginx — does NOT compress). shape:
+//
+//	{"sessionID": sid, "encoding":"gzip64", "data":"<base64-gzip>"}
+//
+// sessionID stays PLAIN TEXT so payloadSessionID (store interest filter) and
+// sendable() (web egress filter) keep extracting it — replacing the whole
+// payload with a base64 blob would silently drop the batch for Stream-2
+// (open-session) subscribers. Only the heavy messages array is compressed:
+// "data" is base64( gzip( {"messages":[...]} ) ). base64 is required because
+// SSE data: fields are text/UTF-8 and raw gzip bytes are not valid UTF-8.
+// Always-compress policy (the batch only fires for cold-loads, which are
+// non-trivial by nature, so there is no small-payload case worth a threshold).
+func (s *Store) emitMessagesBatchLocked(sid string) {
+	sm := s.messages[sid]
+	if sm == nil {
+		return // defensive: no message state (e.g. an empty cold fetch)
+	}
+	list := make([]MessageWithParts, 0, len(sm.order))
+	for _, mid := range sm.order {
+		me := sm.byID[mid]
+		if me == nil {
+			continue
+		}
+		parts := make([]json.RawMessage, 0, len(me.partOrder))
+		for _, pid := range me.partOrder {
+			parts = append(parts, me.parts[pid])
+		}
+		list = append(list, MessageWithParts{Info: me.info, Parts: parts})
+	}
+	inner, _ := json.Marshal(struct {
+		Messages []MessageWithParts `json:"messages"`
+	}{Messages: list})
+	// gzip the inner messages JSON, then base64-encode so the bytes survive
+	// SSE's text/UTF-8 data: framing. Default compression level: the batch is
+	// emitted under s.mu and only on cold-load, so the marginal CPU is fine and
+	// gzip's default (DefaultCompression) gives the best size/speed tradeoff.
+	var buf bytes.Buffer
+	gw := gzip.NewWriter(&buf)
+	_, _ = gw.Write(inner) // gzip.Writer.Write does not return a meaningful error mid-stream
+	_ = gw.Close()
+	payload, _ := json.Marshal(struct {
+		SessionID string `json:"sessionID"`
+		Encoding  string `json:"encoding"`
+		Data      string `json:"data"`
+	}{SessionID: sid, Encoding: "gzip64", Data: base64.StdEncoding.EncodeToString(buf.Bytes())})
+	s.emit(KindMessagesBatch, payload)
 }
 
 // IsMessagesLoaded reports whether a session's history has been fetched.

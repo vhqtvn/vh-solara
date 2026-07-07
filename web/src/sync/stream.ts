@@ -202,6 +202,24 @@ export function applyMessageEvent(kind: string, seq: number, payload: any, track
           }
           break;
         }
+        case "messages.batch": {
+          // Cold-load wholesale content: the daemon collapsed the session's
+          // entire cold-load message+part history (what would otherwise be N
+          // per-message message.upsert + per-part part.upsert events) into ONE
+          // event. Ingest it in a single buildMessages mutation — the same path
+          // applySessionSnapshot uses for a warm-session snapshot — so the
+          // transcript populates without N reactive rounds (over the controller
+          // tunnel each event is a yamux frame + WebSocket message, the root
+          // cause of the cold-load stall). DECOUPLED from the reveal gate: this
+          // carries content only; messages.loaded (still emitted after the batch)
+          // flips messagesLoaded so the gate opens. The batch MAY arrive before
+          // messages.loaded — that is the whole point (content staged, then the
+          // gate flips). Live message.upsert/part.upsert are unchanged.
+          if (payload.sessionID) {
+            s.messages[payload.sessionID] = buildMessages(payload.messages || []);
+          }
+          break;
+        }
         case "messages.error": {
           // Background fetch failed; the daemon left the session UNLOADED (it
           // retries on the next selection/reconnect). Record the failure so the
@@ -405,15 +423,64 @@ function bumpUpdating() {
 // the server falls back to a snapshot itself if the gap exceeds its ring buffer.
 // --- Feature 3: connection-vs-server latency diagnostic (L1, FE-only) -----
 // Purely additive instrumentation (zero server change). For each stream we
-// capture three performance.now() stamps and derive two deltas:
-//   open = onopen − EventSource construction  (pure connection latency)
-//   snap = first snapshot − onopen            (server: ensureMessages + compute
-//                                              + serialize)
+// capture performance.now() stamps and derive deltas:
+//   open    = onopen − EventSource construction      (pure connection latency)
+//   snap    = first snapshot − onopen                (server: ensureMessages + compute
+//                                                      + serialize)
+//   hydrate = messages.loaded arrival − first snapshot   [SESSION STREAM ONLY]
+//                                                      (upstream full-fetch wait —
+//                                                      the gap `snap` misses on a
+//                                                      cold session: the snapshot
+//                                                      ships instantly with
+//                                                      gate.messagesLoaded=false,
+//                                                      then the daemon fetches the
+//                                                      full history async; the
+//                                                      client reveal gate holds
+//                                                      until messages.loaded)
 // The first snapshot per connection bounds `snap`; later snapshots are normal
-// deltas and aren't timed. Surfaces in ServersPanel as "conn: Xms · server: Yms"
-// per stream so an operator can tell a slow connection from a slow server.
+// deltas and aren't timed. `hydrate` records once per connection (only on a
+// cold first snapshot); a warm first snapshot (gate.messagesLoaded!==false) is
+// stamped "warm" since messages.loaded never arrives for it. Surfaces in
+// ServersPanel as "conn Xms · server Yms · hydrate (Yms|warm|…)" so an operator
+// can tell a slow connection from a slow server from a slow upstream fetch.
 function recordLatency(stream: "tree" | "session", phase: "open" | "snap", ms: number): void {
   setState("connLatency", stream, phase, Math.max(0, Math.round(ms)));
+}
+// recordSessionHydrate writes the session-stream `hydrate` L1 stamp (kept
+// separate from recordLatency because its value is a number|"warm"|undefined
+// union, not a rounded ms). number = cold session, messages.loaded delta ms;
+// "warm" = first snapshot already had gate.messagesLoaded===true (no fetch
+// needed); undefined = cold and waiting for messages.loaded (clears any stale
+// value from a prior connection so the UI shows the in-progress wait).
+function recordSessionHydrate(value: number | "warm" | undefined): void {
+  setState(
+    "connLatency",
+    "session",
+    "hydrate",
+    typeof value === "number" ? Math.max(0, Math.round(value)) : value,
+  );
+}
+// recordSessionFetchSplit writes the session-stream `fetchMs`/`reconcileMs` L1
+// stamps — the daemon-side split of `hydrate` (only present on a COLD session
+// that fired messages.loaded): fetchMs = upstream OpenCode GET round-trip,
+// reconcileMs = daemon SetSessionMessages. undefined = not reported for this
+// connection yet (older daemon omits the fields on the wire; a warm session
+// never fires messages.loaded; a cold fetch is still in flight). Cleared on
+// each (re)open's first snapshot so a stale value from a prior connection can't
+// leak. Reads defensively — the payload is JSON, fields optional on the wire.
+function recordSessionFetchSplit(fetchMs: number | undefined, reconcileMs: number | undefined): void {
+  setState(
+    "connLatency",
+    "session",
+    "fetchMs",
+    typeof fetchMs === "number" ? Math.max(0, Math.round(fetchMs)) : undefined,
+  );
+  setState(
+    "connLatency",
+    "session",
+    "reconcileMs",
+    typeof reconcileMs === "number" ? Math.max(0, Math.round(reconcileMs)) : undefined,
+  );
 }
 // Per-connection stamps/flags. Reset on each (re)open; snap recorded once.
 let treeT0 = 0;
@@ -422,6 +489,21 @@ let treeSnapDone = false;
 let sesT0 = 0;
 let sesT1 = 0;
 let sesSnapDone = false;
+// L1 hydrate stamps (session stream only). sesFirstSnap = first-snapshot
+// arrival time (hydrate t0); sesHydrating = the first snapshot was cold
+// (gate.messagesLoaded===false) so a later messages.loaded closes the window.
+let sesFirstSnap = 0;
+let sesHydrating = false;
+// In-flight messages.batch decodes keyed by sessionID. The batch payload is
+// application-compressed (gzip+base64) and its decode is ASYNC (native
+// DecompressionStream); EventSource fires the next event (messages.loaded) as
+// soon as the batch listener RETURNS — i.e. before the decode resolves.
+// Without coordination messages.loaded would flip messagesLoaded (the reveal
+// gate) before the batch content staged → flash of empty content at reveal.
+// The batch listener stashes its decode promise here; the messages.loaded /
+// messages.error listener awaits any pending entry for the session before
+// flipping the gate. Cleared as each batch lands (try/finally in the listener).
+const pendingBatch = new Map<string, Promise<void>>();
 
 export function connect(fresh = false) {
   clearTimeout(reconnectTimer);
@@ -558,6 +640,65 @@ export function applySessionSnapshot(id: string, snap: Snapshot) {
   }
 }
 
+// decodeMessagesBatch reverses the server's application-level compression of
+// the cold-load messages.batch payload. The server emits {sessionID, encoding,
+// data} where data = base64( gzip( {"messages":[...]} ) ). sessionID stays
+// PLAIN TEXT so the store/web interest filters (payloadSessionID / sendable)
+// keep extracting it — replacing the whole payload with a base64 blob would
+// silently drop the batch for Stream-2 (open-session) subscribers; only the
+// heavy messages array is compressed. This helper returns {sessionID,
+// messages} in the exact shape applyMessageEvent's "messages.batch" case
+// already consumes, so that case is UNCHANGED by compression. Uses native
+// DecompressionStream + atob (no pako dep; Chrome 80+/FF 113+/Safari 16.4+ —
+// fine for this PWA's modern-browser target). Exported for unit testing.
+export async function decodeMessagesBatch(payload: {
+  sessionID?: string;
+  encoding?: string;
+  data?: string;
+  messages?: any[];
+}): Promise<{ sessionID: string; messages: any[] }> {
+  const sessionID = payload.sessionID || "";
+  // Pass-through for a non-compressed payload (a non-conforming server, or a
+  // future threshold policy that emits raw JSON below a size cutoff). Keeps the
+  // helper a total function.
+  if (payload.encoding !== "gzip64" || !payload.data) {
+    return { sessionID, messages: payload.messages || [] };
+  }
+  // Feature-detect: an older browser without DecompressionStream cannot decode.
+  // Fall back to whatever inline messages arrived (likely empty) and log — the
+  // server always compresses today, so this only matters for an old client.
+  if (typeof DecompressionStream === "undefined") {
+    log.warn("sync", "DecompressionStream unavailable; messages.batch undecodable", { id: sessionID });
+    return { sessionID, messages: payload.messages || [] };
+  }
+  // atob → binary string → Uint8Array.
+  const bin = atob(payload.data);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  // Pipe through native gzip decompression, drain to one buffer.
+  const ds = new DecompressionStream("gzip");
+  const writer = ds.writable.getWriter();
+  writer.write(bytes);
+  writer.close();
+  const reader = ds.readable.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    total += value.length;
+  }
+  const merged = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) {
+    merged.set(c, off);
+    off += c.length;
+  }
+  const inner = JSON.parse(new TextDecoder().decode(merged));
+  return { sessionID, messages: inner.messages || [] };
+}
+
 export function openSessionStream(id: string) {
   if (id === sesId && ses && ses.readyState !== EventSource.CLOSED) return;
   closeSessionStream();
@@ -569,6 +710,8 @@ export function openSessionStream(id: string) {
     sesT0 = performance.now(); // L1 t0: session-stream connection attempt
     sesT1 = 0;
     sesSnapDone = false;
+    sesFirstSnap = 0; // L1 hydrate: reset per (re)open
+    sesHydrating = false;
     ses = new EventSource(`/vh/stream?sessions=${encodeURIComponent(id)}&dir=${encodeURIComponent(projectDir())}`);
     log.debug("sync", "session stream connect", { id });
     ses.addEventListener("snapshot", (e) => {
@@ -579,7 +722,23 @@ export function openSessionStream(id: string) {
       // is async/best-effort, so this window no longer covers ensureMessages.
       if (!sesSnapDone) {
         sesSnapDone = true;
-        if (sesT1) recordLatency("session", "snap", performance.now() - sesT1);
+        const now = performance.now();
+        if (sesT1) recordLatency("session", "snap", now - sesT1);
+        // L1 hydrate t0: first-snapshot arrival. The same `now` bounds both
+        // the snap delta and the hydrate delta (messages.loaded − first
+        // snapshot). Warm-vs-cold is read from the snapshot's gate: a warm
+        // session (gate.messagesLoaded!==false) already has the full history,
+        // so messages.loaded never arrives → stamp "warm"; a cold session
+        // (gate.messagesLoaded===false) clears any stale value so the UI
+        // shows the in-progress upstream-fetch wait until messages.loaded.
+        sesFirstSnap = now;
+        const cold = snap.gate?.[id]?.messagesLoaded === false;
+        sesHydrating = cold;
+        recordSessionHydrate(cold ? undefined : "warm");
+        // Clear any stale fetch/rec split from a prior connection. They only
+        // land when THIS connection's messages.loaded arrives (cold session);
+        // a warm snapshot never fires it, so they must read "—" until then.
+        recordSessionFetchSplit(undefined, undefined);
       }
       applySessionSnapshot(id, snap);
     });
@@ -592,12 +751,76 @@ export function openSessionStream(id: string) {
       sesT1 = performance.now();
       if (sesT0) recordLatency("session", "open", sesT1 - sesT0);
     };
-    for (const kind of ["message.upsert", "message.delete", "part.upsert", "part.delete", "messages.loaded", "messages.error"]) {
-      ses!.addEventListener(kind, (e) => {
+    for (const kind of ["message.upsert", "message.delete", "part.upsert", "part.delete", "messages.loaded", "messages.error", "messages.batch"]) {
+      ses!.addEventListener(kind, async (e) => {
         markSeen();
         const ev = e as MessageEvent;
-        // trackCursor:false — Stream 2 must not advance Stream 1's resume cursor.
-        applyMessageEvent(kind, Number(ev.lastEventId), JSON.parse(ev.data), false);
+        // Parse the payload once (was inline at applyMessageEvent); reused for
+        // the split-timing read below. trackCursor:false — Stream 2 must not
+        // advance Stream 1's resume cursor.
+        const data = JSON.parse(ev.data);
+        const sid: string | undefined = data?.sessionID;
+
+        // messages.batch is application-compressed (gzip+base64) to cut cold-
+        // load hydrate latency over the controller tunnel. The decode is ASYNC
+        // (native DecompressionStream), but EventSource fires the next event
+        // (messages.loaded) as soon as this listener RETURNS — i.e. before the
+        // decode resolves. Without coordination messages.loaded would flip
+        // messagesLoaded (the reveal gate, P1-WEB-020) before the batch content
+        // staged → flash of empty content at reveal. Promise-gate: stash the
+        // decode promise keyed by sessionID; the messages.loaded/messages.error
+        // path below awaits any pending entry before flipping the gate. The
+        // batch case of applyMessageEvent is UNCHANGED — it receives an
+        // already-decoded {sessionID, messages} (same shape as before
+        // compression). NOTE: an async listener with NO await on the warm path
+        // runs synchronously to completion (async functions only suspend at an
+        // awaited expression), so message.upsert/part.upsert floods pay zero
+        // microtask latency — only batch (decode) and loaded/error (gate wait)
+        // ever await.
+        if (kind === "messages.batch") {
+          const p = (async () => {
+            const decoded = await decodeMessagesBatch(data);
+            applyMessageEvent("messages.batch", Number(ev.lastEventId), decoded, false);
+          })();
+          if (sid) pendingBatch.set(sid, p);
+          try {
+            await p;
+          } finally {
+            if (sid) pendingBatch.delete(sid);
+          }
+          return;
+        }
+
+        // messages.loaded / messages.error: await any in-flight batch decode
+        // for this session so the gate opens AFTER content is staged. (Also
+        // makes the L1 hydrate timing stamp below include the decode cost —
+        // more correct.) If no batch is pending this is a no-op.
+        if (sid && pendingBatch.has(sid)) {
+          await pendingBatch.get(sid);
+        }
+
+        // L1 hydrate: messages.loaded arrival closes the cold-session
+        // upstream-fetch window that `snap` misses. Recorded once per
+        // connection — sesHydrating flips off so a duplicate messages.loaded
+        // (or one arriving after a warm snapshot, which never set the flag)
+        // does not overwrite the stamp. Belongs to THIS connection: the flag
+        // and sesFirstSnap are reset in open() and only this connection's
+        // (still-open) EventSource fires its listeners, so a torn-down prior
+        // connection cannot stamp a stale delta here.
+        if (kind === "messages.loaded" && sesHydrating && sesFirstSnap) {
+          sesHydrating = false;
+          recordSessionHydrate(performance.now() - sesFirstSnap);
+          // Split-timing: the daemon reports how much of `hydrate` was the
+          // upstream fetch vs the daemon-side reconcile. Read defensively — an
+          // older daemon omits fetchMs/reconcileMs (render "—"). Parsed on the
+          // same cold-session path as the hydrate stamp (a warm session never
+          // reaches here).
+          recordSessionFetchSplit(
+            typeof data.fetchMs === "number" ? data.fetchMs : undefined,
+            typeof data.reconcileMs === "number" ? data.reconcileMs : undefined,
+          );
+        }
+        applyMessageEvent(kind, Number(ev.lastEventId), data, false);
       });
     }
     ses.onerror = () => {

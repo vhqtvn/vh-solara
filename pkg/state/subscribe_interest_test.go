@@ -107,12 +107,12 @@ func TestSubscribeWithActiveSessionInterest(t *testing.T) {
 	// Message/part/loaded for A (subscribed) — must be delivered.
 	s.Apply(ev("message.updated", `{"info":{"id":"mA","sessionID":"A","role":"assistant"}}`))
 	s.Apply(ev("message.part.updated", `{"part":{"id":"pA","sessionID":"A","messageID":"mA","type":"text","text":"hi"}}`))
-	s.EmitMessagesLoaded("A")
+	s.EmitMessagesLoaded("A", 0, 0)
 
 	// Message/part/loaded for B (NOT subscribed) — must be filtered upstream.
 	s.Apply(ev("message.updated", `{"info":{"id":"mB","sessionID":"B","role":"assistant"}}`))
 	s.Apply(ev("message.part.updated", `{"part":{"id":"pB","sessionID":"B","messageID":"mB","type":"text","text":"x"}}`))
-	s.EmitMessagesLoaded("B")
+	s.EmitMessagesLoaded("B", 0, 0)
 
 	// Structural activity for B must still flow to this subscriber.
 	s.Apply(ev("session.idle", `{"sessionID":"B"}`))
