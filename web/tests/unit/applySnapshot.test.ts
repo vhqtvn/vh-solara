@@ -21,7 +21,6 @@ beforeEach(() => {
   setState("sessions", reconcile({}));
   setState("messages", reconcile({}));
   setState("lastAgents", reconcile({}));
-  setState("hydrated", reconcile({}));
   setState("messagesLoaded", reconcile({}));
   setState("messagesError", reconcile({})); // F5: was leaking across tests
   setState("epoch", "");
@@ -121,10 +120,9 @@ describe("applySnapshot — B2a resync-window lastAgents gating", () => {
 });
 
 describe("applySessionEvent — B2b session.delete prunes per-session maps", () => {
-  it("deletes lastAgents/hydrated/messagesLoaded/messagesError alongside the session", () => {
+  it("deletes lastAgents/messagesLoaded/messagesError alongside the session", () => {
     setState("sessions", "s1", { id: "s1" });
     setState("lastAgents", "s1", "build");
-    setState("hydrated", "s1", true);
     setState("messagesLoaded", "s1", true);
     setState("messagesError", "s1", true);
 
@@ -132,7 +130,6 @@ describe("applySessionEvent — B2b session.delete prunes per-session maps", () 
 
     expect(state.sessions.s1).toBeUndefined();
     expect(state.lastAgents.s1).toBeUndefined();
-    expect(state.hydrated.s1).toBeUndefined();
     expect(state.messagesLoaded.s1).toBeUndefined();
     expect(state.messagesError.s1).toBeUndefined();
     expect(state.cursor).toBe(99); // the cursor still advances on a tracked event
@@ -140,11 +137,9 @@ describe("applySessionEvent — B2b session.delete prunes per-session maps", () 
 
   it("does not prune metadata on session.upsert (only the session row is touched)", () => {
     setState("lastAgents", "s1", "build");
-    setState("hydrated", "s1", true);
     applySessionEvent("session.upsert", 7, { id: "s1", title: "t" });
     expect(state.sessions.s1).toEqual({ id: "s1", title: "t" });
     expect(state.lastAgents.s1).toBe("build"); // untouched
-    expect(state.hydrated.s1).toBe(true); // untouched
   });
 });
 

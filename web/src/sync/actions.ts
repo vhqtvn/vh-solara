@@ -58,7 +58,6 @@ export function switchProject(dir: string, fromUrl = false) {
       s.questions = {};
       s.todos = {};
       s.unread = {};
-      s.hydrated = {}; // Feature 1 (S4): reset per-session hydration gate for the new project
       s.cursor = loadCursor(dir);
       s.status = "connecting";
     }),

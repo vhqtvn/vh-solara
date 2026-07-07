@@ -110,11 +110,6 @@ export function applySnapshot(snap: Snapshot) {
       for (const [sid, v] of Object.entries(snap.todos || {})) s.todos[sid] = normalizeTodos(v);
       s.unread = {};
       for (const id of snap.unread || []) s.unread[id] = true;
-      // S4 per-session hydration gate (snap.gate[id].hydrated). Rebuilt each
-      // snapshot; rows with hydrated===false are still being aggregated after a
-      // restart and can show a loading hint instead of looking stale.
-      s.hydrated = {};
-      for (const [id, g] of Object.entries(snap.gate || {})) s.hydrated[id] = !!g?.hydrated;
       // S3 epoch transition: latch so the connection-health toast can surface
       // "Server restarted — re-syncing…". The merge-protect above already
       // shielded the labels from this (potentially mid-aggregation) snapshot.
@@ -135,14 +130,13 @@ export function applySessionEvent(kind: string, seq: number, payload: any) {
       else if (kind === "session.delete") {
         delete s.sessions[payload.id];
         // B2b: prune the per-session metadata maps so a deleted session's facts
-        // don't leak and can't resurrect on id-reuse. lastAgents/hydrated are
-        // snapshot-seeded facets that must not outlive the session; messagesLoaded
+        // don't leak and can't resurrect on id-reuse. lastAgents is a
+        // snapshot-seeded facet that must not outlive the session; messagesLoaded
         // is the open-session delivery flag, cleared here to stay consistent with
         // the session's removal. (s.messages is owned by the Stream-2 / openSession
         // lifecycle and reconciled separately, so it is NOT pruned here — see
         // SyncState.messagesLoaded.)
         delete s.lastAgents[payload.id];
-        delete s.hydrated[payload.id];
         delete s.messagesLoaded[payload.id];
         delete s.messagesError[payload.id];
       }

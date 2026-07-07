@@ -122,10 +122,6 @@ export interface SyncState {
   // live connection (NOT the first snapshot after load). Consumed + cleared by
   // the connection-health toast to surface "Server restarted — re-syncing…".
   epochChanged: boolean;
-  // hydrated: per-session gate facts (snap.gate[id].hydrated). Rebuilt from
-  // each tree snapshot. A row whose hydrated[id]===false is still being
-  // aggregated after a restart → show a loading hint instead of looking stale.
-  hydrated: Record<string, boolean>;
   // connLatency: per-stream connection-vs-server latency diagnostics
   // (Feature 3). `open` = EventSource construction → onopen (pure connection
   // latency); `snap` = onopen → first snapshot event (server processing:
@@ -175,7 +171,6 @@ export const [state, setState] = createStore<SyncState>({
   lastSeen: 0,
   epoch: "",
   epochChanged: false,
-  hydrated: {},
   connLatency: { tree: {}, session: {} },
 });
 
