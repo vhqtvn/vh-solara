@@ -14,6 +14,20 @@ async function termList(page: import("@playwright/test").Page, dir: string) {
   }, dir);
 }
 
+async function termKill(page: import("@playwright/test").Page, dir: string, id: string) {
+  return page.evaluate(
+    async ({ d, i }) => {
+      const r = await fetch(`/vh/term/kill`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-VH-CSRF": "1" },
+        body: JSON.stringify({ dir: d, id: i }),
+      });
+      return r.ok;
+    },
+    { d: dir, i: id },
+  );
+}
+
 test("terminal tabs: separate shells, add, switch, and per-tab kill", async ({ page }) => {
   await page.goto(`/?dir=${encodeURIComponent(repoRoot)}`);
   await page.getByRole("button", { name: "Terminal", exact: true }).click();
@@ -87,6 +101,14 @@ test("terminal: full-screen TUI (vim) stays live — xterm DECRQM stall regressi
   // It then quits vim and types a shell command, proving the terminal stays
   // fully interactive through a TUI launch → use → exit cycle.
   await page.goto(`/?dir=${encodeURIComponent(repoRoot)}`);
+  // Kill any leftover shared PTY from a prior iteration or failed run so the
+  // Terminal click below spawns a FRESH shell with empty scrollback. The shared
+  // PTY persists across SPA reconnects: each page.goto reattaches to the same
+  // pty and replays its accumulated buffer, so a stale vim session, leftover
+  // tildes, or a prior echo output would otherwise pollute the polls below
+  // (e.g. the "~" probe would match stale scrollback before vim renders).
+  // No-op if no shared session exists yet, so this is safe on the first run.
+  await termKill(page, repoRoot, "shared");
   await page.getByRole("button", { name: "Terminal", exact: true }).click();
   await page.waitForSelector(".term-host");
   await page.waitForSelector(".term-status.open", { timeout: 10000 });
@@ -114,7 +136,7 @@ test("terminal: full-screen TUI (vim) stays live — xterm DECRQM stall regressi
   // land as normal-mode commands and never render. The marker poll below is the
   // real guard; on the green path it returns instantly. Widened for slow CI.
   await page.waitForTimeout(400);
-  const marker = "DECRQM_LIVE_MARKER_42";
+  const marker = `DECRQM_LIVE_${Date.now()}`;
   await page.keyboard.type(marker);
   await expect.poll(async () => (await page.locator(".xterm-rows").innerText()).includes(marker), {
     timeout: 15000,
@@ -126,21 +148,43 @@ test("terminal: full-screen TUI (vim) stays live — xterm DECRQM stall regressi
   await page.keyboard.press("Escape");
   await page.keyboard.type(":q!");
   await page.keyboard.press("Enter");
-  // Poll until the shell has reclaimed the tty before typing the echo. Vim runs
-  // inline here (no alternate screen), so its tildes/status-line persist in the
-  // scrollback after exit and can't be used as an "all clear" — the shell prompt
-  // itself begins with a "~" segment, so "no ~" never becomes true. Instead wait
-  // for the shell to redraw its prompt: the last non-empty row becomes a bare
-  // ">" prompt sigil on an empty command line. The previous fixed 400ms wait was
-  // flaky under CI load (vim teardown + tty-reclaim can exceed it, swallowing
-  // the echo keystrokes); this is load-independent.
-  await expect.poll(
-    async () => {
-      const text = (await page.locator(".xterm-rows").innerText()).trimEnd();
-      const last = text.split("\n").pop();
-      return last !== undefined && last.trim() === ">";
-    },
-    { timeout: 10000 },
+  // Wait until the shell has reclaimed the tty before typing the witness echo.
+  // Vim runs inline here (no alternate screen), so its tildes/status-line
+  // persist in the scrollback after exit and can't be used as an "all clear" —
+  // the shell prompt itself begins with a "~" segment, so "no ~" never becomes
+  // true. Pattern-matching the shell prompt is environment-specific (a bare ">"
+  // sigil on a zsh+powerlevel10k host vs "runner@host:...$" on CI bash, and the
+  // prompt may embed a live clock), so it cannot be a reliable cross-env signal.
+  //
+  // Instead send a UNIQUE sentinel echo and poll for its OUTPUT. When the
+  // sentinel token renders, the shell's line discipline is echoing input —
+  // positively proving it reclaimed the tty and is ready to execute commands —
+  // with no prompt-shape dependency and no stale-buffer match (the token is
+  // unique per run). A bounded retry handles the vim-teardown race where the
+  // first send is consumed by vim's exit path: on poll timeout, press Enter
+  // (flush any partial line) and resend. Duplicate sentinel echoes are
+  // harmless. The subsequent `echo VIM_EXITED_OK` witness output-poll is a
+  // SECOND, independent guard (it asserts the command's OUTPUT rendered, not
+  // just input echo): if the sentinel gave a false positive, the witness poll
+  // would still fail.
+  const ready = `VH_READY_${Date.now()}`;
+  let reclaimed = false;
+  for (let attempt = 0; attempt < 5 && !reclaimed; attempt++) {
+    await page.keyboard.type(`echo ${ready}`);
+    await page.keyboard.press("Enter");
+    try {
+      await expect.poll(async () => (await page.locator(".xterm-rows").innerText()).includes(ready), {
+        timeout: 4000,
+      }).toBe(true);
+      reclaimed = true;
+    } catch {
+      // vim-teardown race: flush a partial line and resend on the next attempt.
+      await page.keyboard.press("Enter");
+    }
+  }
+  expect(
+    reclaimed,
+    "shell did not reclaim the tty after vim quit (sentinel echo never rendered)",
   ).toBe(true);
   await page.keyboard.type("echo VIM_EXITED_OK");
   await page.keyboard.press("Enter");
