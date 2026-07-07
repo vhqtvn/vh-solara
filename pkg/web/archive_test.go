@@ -160,3 +160,88 @@ func TestArchivedLevelEmptyInput(t *testing.T) {
 		t.Fatalf("empty input want items/total/counts all empty, got items=%d total=%d counts=%v", len(items), total, counts)
 	}
 }
+
+// equalSet reports whether want and got hold the same ids regardless of order
+// (archivedDescendants returns a subtree whose traversal order is irrelevant to
+// its callers).
+func equalSet(want, got []string) bool {
+	if len(want) != len(got) {
+		return false
+	}
+	w := make(map[string]int, len(want))
+	for _, s := range want {
+		w[s]++
+	}
+	for _, s := range got {
+		if w[s]--; w[s] < 0 {
+			return false
+		}
+	}
+	for _, c := range w {
+		if c != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// TestArchivedDescendantsIncludesSubtree covers the core contract: for an
+// archived root, archivedDescendants returns the root plus every genuinely
+// archived session transitively parented by it.
+func TestArchivedDescendantsIncludesSubtree(t *testing.T) {
+	sessions := []json.RawMessage{
+		// archived root r1
+		archSession(t, "r1", "", 5, 30, floatPtr(15)),
+		// archived child c1 of r1
+		archSession(t, "c1", "r1", 8, 50, floatPtr(20)),
+		// archived grandchild g1 of r1 (via c1)
+		archSession(t, "g1", "c1", 9, 60, floatPtr(25)),
+	}
+	got := archivedDescendants(sessions, "r1")
+	want := []string{"r1", "c1", "g1"}
+	if !equalSet(want, got) {
+		t.Fatalf("r1 subtree want %v, got %v", want, got)
+	}
+}
+
+// TestArchivedDescendantsFiltersNonArchived exercises the consistency fix:
+// OpenCode 1.17.x ignores ?archived=true and returns archived AND non-archived
+// sessions. archivedDescendants must keep only genuinely archived sessions
+// (time.archived set to a non-zero value) in the computed subtree — a
+// non-archived child, descendant, or sibling must never be folded in.
+func TestArchivedDescendantsFiltersNonArchived(t *testing.T) {
+	sessions := []json.RawMessage{
+		// archived root r1
+		archSession(t, "r1", "", 5, 30, floatPtr(15)),
+		// archived child c1 of r1
+		archSession(t, "c1", "r1", 8, 50, floatPtr(20)),
+		// NON-archived child c2 of r1 (time.archived nil) — must be excluded
+		archSession(t, "c2", "r1", 9, 60, nil),
+		// NON-archived grandchild g0 under c2 (time.archived nil) — must be
+		// excluded even though its parent chain reaches r1.
+		archSession(t, "g0", "c2", 1, 2, nil),
+		// NON-archived sibling r2 (time.archived=0, treated as non-archived,
+		// mirroring store.go archivedAt) — must be excluded.
+		archSession(t, "r2", "", 1, 2, floatPtr(0)),
+	}
+	got := archivedDescendants(sessions, "r1")
+	want := []string{"r1", "c1"}
+	if !equalSet(want, got) {
+		t.Fatalf("r1 subtree want %v (non-archived c2/g0/r2 excluded), got %v", want, got)
+	}
+}
+
+// TestArchivedDescendantsUnknownID guards the fallback at the existing
+// archive.go return: when the target id is not present in the (filtered)
+// archived set, archivedDescendants returns [id] so the caller still attempts
+// the single-id operation.
+func TestArchivedDescendantsUnknownID(t *testing.T) {
+	sessions := []json.RawMessage{
+		archSession(t, "r1", "", 5, 30, floatPtr(15)),
+	}
+	got := archivedDescendants(sessions, "missing")
+	want := []string{"missing"}
+	if !equalSet(want, got) {
+		t.Fatalf("unknown id want %v, got %v", want, got)
+	}
+}

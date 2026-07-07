@@ -66,8 +66,11 @@ func (s *Server) handleArchive(w http.ResponseWriter, r *http.Request) {
 	writeJSONResp(w, map[string]any{"ok": true, "affected": affected})
 }
 
-// archivedDescendants returns id plus every session in the archived set
-// transitively parented by it.
+// archivedDescendants returns id plus every genuinely archived session
+// transitively parented by it. The input list is OpenCode's archived-set
+// response, but 1.17.x ignores ?archived=true and returns ALL sessions, so
+// non-archived entries (time.archived nil/0) are filtered out below — only
+// real archived sessions participate in the computed subtree.
 func archivedDescendants(sessions []json.RawMessage, id string) []string {
 	children := map[string][]string{}
 	known := map[string]bool{}
@@ -75,8 +78,19 @@ func archivedDescendants(sessions []json.RawMessage, id string) []string {
 		var env struct {
 			ID       string `json:"id"`
 			ParentID string `json:"parentID"`
+			Time     struct {
+				Archived *float64 `json:"archived"`
+			} `json:"time"`
 		}
 		if json.Unmarshal(raw, &env) != nil || env.ID == "" {
+			continue
+		}
+		// OpenCode 1.17.x ignores the ?archived=true param and returns ALL
+		// sessions (archived + non-archived). Filter server-side here: only a
+		// genuinely archived session (time.archived set to a non-zero value)
+		// belongs in the subtree. Mirrors sessionEnvelope.archivedAt() in
+		// pkg/state/store.go.
+		if env.Time.Archived == nil || *env.Time.Archived == 0 {
 			continue
 		}
 		known[env.ID] = true
