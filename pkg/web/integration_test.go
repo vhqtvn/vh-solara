@@ -383,8 +383,12 @@ func TestLazyHydration(t *testing.T) {
 // blocks the snapshot behind the synchronous full-message fetch (Slice C).
 // Selecting an unloaded session must send a partial snapshot IMMEDIATELY (before
 // the upstream GET /session/:id/message completes), then forward the
-// message.*/part.* deltas + the messages.loaded completion over the SAME open
-// connection as the background fetch reconciles.
+// reconciled content + the messages.loaded completion over the SAME open
+// connection as the background fetch reconciles. Because the held fetch is a
+// cold-load for this session (msgLoaded was false at entry), the cold-load
+// contract pinned by store_test.go::TestColdLoadEmitsSingleMessagesBatch sends
+// the reconciled content as a single KindMessagesBatch ("messages.batch") event
+// (NOT per-message message.upsert events) followed by messages.loaded.
 func TestStreamAsyncHydration(t *testing.T) {
 	fake := newFake()
 	fake.sessions = []string{`{"id":"a","title":"A","time":{"updated":1}}`}
@@ -441,23 +445,24 @@ func TestStreamAsyncHydration(t *testing.T) {
 	}
 
 	// Release the held fetch — the background hydration now completes and the
-	// SAME connection receives the reconciled message/part deltas + the
-	// messages.loaded completion event.
+	// SAME connection receives the reconciled content (a single messages.batch
+	// for this cold-load, per the contract above) + the messages.loaded
+	// completion event.
 	close(hold)
 
-	var sawMessageUpsert, sawLoaded bool
+	var sawMessagesBatch, sawLoaded bool
 	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) && !(sawMessageUpsert && sawLoaded) {
+	for time.Now().Before(deadline) && !(sawMessagesBatch && sawLoaded) {
 		ev, _ = readSSEFrame(t, reader)
 		switch ev {
-		case "message.upsert":
-			sawMessageUpsert = true
+		case "messages.batch":
+			sawMessagesBatch = true
 		case "messages.loaded":
 			sawLoaded = true
 		}
 	}
-	if !sawMessageUpsert {
-		t.Fatal("stream must forward message.upsert after the background fetch reconciles")
+	if !sawMessagesBatch {
+		t.Fatal("stream must forward messages.batch after the background fetch reconciles the cold-load")
 	}
 	if !sawLoaded {
 		t.Fatal("stream must forward messages.loaded completion after the background fetch")
