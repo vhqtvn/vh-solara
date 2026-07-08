@@ -1195,6 +1195,14 @@ body {
 }
 .msg-time, .msg-cost { font-size: 11px; color: var(--fg-dim); }
 .msg-cost { font-family: ui-monospace, Menlo, monospace; }
+.msg-perf {
+  display: inline-flex;
+  align-items: center;
+  color: var(--fg-dim);
+  cursor: help;
+  outline: none;
+}
+.msg-perf:hover, .msg-perf:focus-visible { color: var(--fg); }
 .msg-actions {
   margin-left: auto;
   display: flex;
