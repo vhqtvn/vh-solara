@@ -139,6 +139,7 @@ export function applySessionEvent(kind: string, seq: number, payload: any) {
         delete s.lastAgents[payload.id];
         delete s.messagesLoaded[payload.id];
         delete s.messagesError[payload.id];
+        delete s.refreshing[payload.id];
       }
       if (seq) s.cursor = seq;
     }),
@@ -582,6 +583,11 @@ export function closeSessionStream() {
   clearTimeout(sesRetry);
   ses?.close();
   ses = null;
+  // Drop the warm silent-swap indicator for the session being closed: if we
+  // switch away before its first snapshot lands, its `refreshing` flag would
+  // otherwise never be cleared (that connection's snapshot listener is gone),
+  // leaking a permanent dot on the row.
+  if (sesId) setState("refreshing", sesId, false);
   sesId = "";
 }
 
@@ -706,6 +712,12 @@ export function openSessionStream(id: string) {
     sesSnapDone = false;
     sesFirstSnap = 0; // L1 hydrate: reset per (re)open
     sesHydrating = false;
+    // Warm silent-swap: this (re)open is showing cached/stale message state
+    // until this connection's first authoritative snapshot lands. Arm the
+    // per-session refresh indicator; the snapshot listener clears it (and
+    // closeSessionStream clears it on switch-away). Set per (re)open so a
+    // reconnect retry re-arms it.
+    setState("refreshing", id, true);
     ses = new EventSource(`/vh/stream?sessions=${encodeURIComponent(id)}&dir=${encodeURIComponent(projectDir())}`);
     log.debug("sync", "session stream connect", { id });
     ses.addEventListener("snapshot", (e) => {
@@ -734,6 +746,11 @@ export function openSessionStream(id: string) {
         // a warm snapshot never fires it, so they must read "—" until then.
         recordSessionFetchSplit(undefined, undefined);
       }
+      // Authoritative snapshot for THIS connection landed — the cached/stale
+      // render is now superseded; clear the per-session refresh indicator BEFORE
+      // reconciling so the row's .dot.refreshing drops in the same reactive tick
+      // the fresh data paints. Idempotent on later snapshots this connection.
+      setState("refreshing", id, false);
       applySessionSnapshot(id, snap);
     });
     ses.addEventListener("ping", () => markSeen());

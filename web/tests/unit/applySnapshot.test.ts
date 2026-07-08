@@ -23,6 +23,7 @@ beforeEach(() => {
   setState("lastAgents", reconcile({}));
   setState("messagesLoaded", reconcile({}));
   setState("messagesError", reconcile({})); // F5: was leaking across tests
+  setState("refreshing", reconcile({}));
   setState("epoch", "");
   setState("epochChanged", false);
   setState("cursor", 0);
@@ -120,11 +121,12 @@ describe("applySnapshot — B2a resync-window lastAgents gating", () => {
 });
 
 describe("applySessionEvent — B2b session.delete prunes per-session maps", () => {
-  it("deletes lastAgents/messagesLoaded/messagesError alongside the session", () => {
+  it("deletes lastAgents/messagesLoaded/messagesError/refreshing alongside the session", () => {
     setState("sessions", "s1", { id: "s1" });
     setState("lastAgents", "s1", "build");
     setState("messagesLoaded", "s1", true);
     setState("messagesError", "s1", true);
+    setState("refreshing", "s1", true);
 
     applySessionEvent("session.delete", 99, { id: "s1" });
 
@@ -132,6 +134,7 @@ describe("applySessionEvent — B2b session.delete prunes per-session maps", () 
     expect(state.lastAgents.s1).toBeUndefined();
     expect(state.messagesLoaded.s1).toBeUndefined();
     expect(state.messagesError.s1).toBeUndefined();
+    expect(state.refreshing.s1).toBeUndefined();
     expect(state.cursor).toBe(99); // the cursor still advances on a tracked event
   });
 

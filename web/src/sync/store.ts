@@ -85,6 +85,19 @@ export interface SyncState {
   // Cleared by a later messages.loaded / a successful Stream-2 snapshot, and
   // pruned on session.delete (mirrors messagesLoaded).
   messagesError: Record<string, boolean>;
+  // Per-session flag: this session's Stream-2 (active-session) connection is
+  // OPEN and its first authoritative snapshot has NOT arrived yet this
+  // connection — i.e. we are showing cached/stale message state (a warm reopen
+  // renders instantly from the in-memory transcript) while the fresh snapshot
+  // is still in flight (the ~5s daemon-side serve). Distinct from
+  // messagesLoaded (which flips true IMMEDIATELY on a warm snapshot, so it
+  // cannot signal "cached, refresh pending") and from connLatency.session.hydrate
+  // (a per-CONNECTION one-shot diagnostic, not a live per-session flag). Set
+  // true when openSessionStream (re)opens the stream, cleared when that
+  // connection's first snapshot lands (stream.ts) or the stream is
+  // closed/switched away. Drives the per-row .dot.refreshing warm silent-swap
+  // indicator. Ephemeral — NOT persisted, pruned on session.delete.
+  refreshing: Record<string, boolean>;
   // Per-session activity (busy/idle/error) and pending permissions are kept for
   // ALL sessions so the sidebar/chat can surface status without opening them.
   activity: Record<string, string>;
@@ -159,6 +172,7 @@ export const [state, setState] = createStore<SyncState>({
   messages: {},
   messagesLoaded: {},
   messagesError: {},
+  refreshing: {},
   activity: loadActivity(initialDir),
   lastAgents: loadLastAgents(initialDir),
   currentVerbs: {},

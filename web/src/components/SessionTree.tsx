@@ -326,6 +326,18 @@ function Node(props: {
             <Show when={state.status === "live" && state.messagesLoaded[props.session.id] === false && !busy()}>
               <span class="dot hydrating" data-tip="loading from server…" />
             </Show>
+            {/* Warm silent-swap indicator: the session's Stream-2 connection is
+                open and we are showing cached/stale message state while its fresh
+                authoritative snapshot is still in flight (the ~5s daemon-side
+                serve). Distinct from .dot.hydrating (cold-open, messagesLoaded
+                ===false): shown ONLY on a WARM reopen (messagesLoaded !== false)
+                so the two never stack — the `!== false` here is a de-dup guard,
+                NOT the driver (the driver is solely state.refreshing[id]). Cleared
+                the instant the snapshot lands. Suppressed while busy() so the
+                running spinner wins. */}
+            <Show when={state.status === "live" && state.refreshing[props.session.id] && state.messagesLoaded[props.session.id] !== false && !busy()}>
+              <span class="dot refreshing" data-tip="refreshing from server…" />
+            </Show>
             <AgentChip sessionID={props.session.id} />
             <span class="tree-title" classList={{ unread: !busy() && !!state.unread[props.session.id], "needs-input": needsInput() }}>
               {props.session.title || props.session.id}
