@@ -73,8 +73,18 @@ test.describe("composer paste button", () => {
     await page.evaluate(() => navigator.clipboard.writeText("PASTED_TEXT"));
     await ta.click();
     await page.keyboard.type("hello ");
-    // Hold past the long-press threshold (delay between pointer down and up).
-    await page.getByRole("button", { name: /^Paste/ }).click({ delay: 700 });
+    // Long-press the Paste button: hold pointer-down past the 450ms threshold the
+    // handler uses to distinguish insert-at-caret (>=450ms) from replace-all. Use
+    // raw mouse.down()/up() — trusted pointer events that carry clipboard
+    // transient activation — with an explicit wait, instead of click({ delay }),
+    // whose actionability re-checks during the hold can abort the click mid-press
+    // under load (leaving the paste handler unfired → nothing pasted).
+    const paste = page.getByRole("button", { name: /^Paste/ });
+    const box = (await paste.boundingBox())!;
+    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+    await page.mouse.down();
+    await page.waitForTimeout(550); // > 450ms threshold
+    await page.mouse.up();
     await expect(ta).toHaveValue("hello PASTED_TEXT");
   });
 });

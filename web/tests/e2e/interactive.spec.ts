@@ -104,10 +104,20 @@ test("archive removes a session from the tree and the Archived browser restores 
   await page.getByRole("button", { name: "Create session" }).click();
   await page.getByPlaceholder("Message…").fill("archive me");
   await page.keyboard.press("Enter");
-  // It now exists + is selected; wait for the assistant turn so it's settled.
-  const liveNew = page.locator(".tree-node", { hasText: "New session" });
-  await expect(liveNew.first()).toBeVisible({ timeout: 8000 });
-  const beforeLive = await liveNew.count();
+
+  // The created session is selected and deep-linked into the URL — grab its id so
+  // the assertions target THIS session, not the shared pool of "New session" rows
+  // other tests in the serial run leave behind.
+  await expect.poll(() => new URL(page.url()).searchParams.get("session")).toBeTruthy();
+  const id = new URL(page.url()).searchParams.get("session")!;
+  const node = page.locator(`.tree-node[data-session-id="${id}"]`);
+  await expect(node).toBeVisible({ timeout: 8000 });
+
+  // Let the turn fully settle before archiving. Archiving mid-stream races the
+  // turn's trailing session.idle, which can re-hydrate the just-archived session
+  // back into the live tree — so wait for the assistant response to complete (the
+  // fixture streams "Done. Updated `parser.go` …" for a plain prompt).
+  await expect(page.getByText(/Done\. Updated/).first()).toBeVisible({ timeout: 8000 });
 
   // Archive via the session inspector (Usage pill → Session details → Archive).
   await page.getByRole("button", { name: "Usage", exact: true }).click();
@@ -120,9 +130,8 @@ test("archive removes a session from the tree and the Archived browser restores 
   await expect(confirm).toBeVisible();
   await confirm.getByRole("button", { name: /Archive/ }).click();
 
-  // It leaves the live tree… (assert the count dropped — the shared fixture may
-  // hold stray "New session" nodes from other specs, so don't pin an exact N).
-  await expect.poll(() => liveNew.count(), { timeout: 8000 }).toBeLessThan(beforeLive);
+  // Confirmed → this specific session leaves the live tree for good.
+  await expect(node).toHaveCount(0, { timeout: 8000 });
 
   // …and shows up in the Archived browser, where Restore brings it back.
   await page.getByRole("button", { name: "Archived" }).click();
