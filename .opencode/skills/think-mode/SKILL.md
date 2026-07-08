@@ -107,4 +107,4 @@ Treat as refinement input — apply to the scaffolded prompt or framing and re-p
 
 - `AGENTS.md` — canonical role descriptions for researcher / debate / planner / solution-brief
 - `docs/coding-agent-in-research/solution-brief/README.md` — solution-brief usage rules
-- `docs/ai/opencode-skills.md` — overall skills guide
+- `vh-agent-harness docs opencode-skills` — overall skills guide

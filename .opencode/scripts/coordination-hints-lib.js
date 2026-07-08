@@ -36,8 +36,6 @@ const COORDINATION_EXACT_PATHS = new Set([
     ".opencode/README-session-state.md",
     ".opencode/scripts/state-lib.js",
     "AGENTS.md",
-    "docs/ai/opencode-memory-model.md",
-    "docs/ai/opencode-session-workflow.md",
     "opencode.jsonc",
 ]);
 

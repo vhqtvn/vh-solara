@@ -52,7 +52,7 @@ function runForSession(sessionID, sessionName, slug, body) {
             "## Must Read",
             "",
             "- docs/planning/backlog.md",
-            "- docs/ai/opencode-session-workflow.md",
+            "- vh-agent-harness docs opencode-session-workflow",
             "",
             "## Must Do",
             "",
@@ -103,7 +103,7 @@ function runForSession(sessionID, sessionName, slug, body) {
             rejectedOptionsBody:
                 "- Do not turn the workstream into baseline always-loaded instructions.",
             linksBody:
-                "- docs/ai/opencode-session-workflow.md\n- .opencode/README-session-state.md",
+                "- vh-agent-harness docs opencode-session-workflow\n- .opencode/README-session-state.md",
             cwd: "/verification",
         },
     );

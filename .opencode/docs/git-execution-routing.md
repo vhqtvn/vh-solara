@@ -45,6 +45,13 @@ difficult; see the threat model in the gated-commit spec for known residual risk
   Banned for staging the message: the heredoc `stage-message` form, unquoted heredoc
   delimiters, redirect-to-file heredocs, and inline `--message "..."`. See
   `.opencode/skills/gated-commit/SKILL.md`.
+- **No manual cleanup of the message scratch:** `commit-gate.sh` reclaims
+  `tmp/commit-gate-message/msg-${UUID}` itself — on successful commit, release, and
+  the `no_changes` no-op branch, plus an aged-orphan GC sweep (older than
+  `COMMIT_GATE_GC_MAX_AGE`, default 3600s) — exactly as it does for its own
+  `.git/commit-gate/` scratch. Agents MUST NOT `rm` anything under
+  `tmp/commit-gate-message/` — `rm` is not allowlisted for any agent (shell-guard
+  denies it) and is now unnecessary on both scratch surfaces.
 - **Git mutation bypass** (`git-mutation-bypass` in forbidden-patterns) blocks
   raw `git add`, `git commit`, `git reset`, `git push`, etc. for ALL agents.
 - **Operator escape hatch**: `SKIP_COMMIT_GATE=1` is operator-only (host terminal).

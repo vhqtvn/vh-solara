@@ -122,7 +122,7 @@ After the workstream exists, prefer targeted updates:
 Repo-local skills are optional helpers, not guaranteed automatic behavior.
 
 - if a task depends on a skill, name it explicitly in the prompt, task contract, or plan
-- keep the skill catalog in `docs/ai/opencode-skills.md` as read-when-relevant guidance rather than baseline always-loaded context
+- keep the skill catalog (`vh-agent-harness docs opencode-skills`) as read-when-relevant guidance rather than baseline always-loaded context
 
 ## Draft -> Approve -> Implement flow
 

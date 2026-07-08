@@ -1656,7 +1656,7 @@
     "default_agent": "coordination",
     "instructions": [
         "AGENTS.md",
-        "docs/ai/opencode-session-workflow.md"
+        ".vh-agent-harness/docs/opencode-session-workflow.md"
     ],
     "permission": {
         "bash": {

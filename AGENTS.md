@@ -74,9 +74,9 @@ add-an-agent / add-command / add-skill recipe and the overlay anatomy.
 
 ## Read when relevant
 
-- `docs/ai/opencode-session-workflow.md` before starting substantial OpenCode work that may span multiple turns, evaluations, or handoffs
-- `docs/ai/opencode-prompt-guide.md` before writing non-trivial prompts so they include task type, settled assumptions, contradiction audit, expected files, and closeout expectations
-- `docs/ai/opencode-memory-model.md` when shaping or changing agent-memory conventions, workstream memory, or local/private OpenCode state
+- `vh-agent-harness docs opencode-session-workflow` before starting substantial OpenCode work that may span multiple turns, evaluations, or handoffs
+- `vh-agent-harness docs opencode-prompt-guide` before writing non-trivial prompts so they include task type, settled assumptions, contradiction audit, expected files, and closeout expectations
+- `vh-agent-harness docs opencode-memory-model` when shaping or changing agent-memory conventions, workstream memory, or local/private OpenCode state
 - `docs/coordination/README.md` when shaping cross-boundary ownership, handoffs, blocker rules, or prompt/closeout coordination
 - `docs/coordination/TASK_MODES.md` and `docs/coordination/RUNTIME_MODEL.md` when a task may span multiple sessions, several subagent reports, or a local coordination runtime
 - `researches/AGENTS.md` when creating or updating durable comparative research material, source packets, or option memos
@@ -85,9 +85,9 @@ add-an-agent / add-command / add-skill recipe and the overlay anatomy.
 - the relevant `researches/decisions/` memo when designing or changing the repo's durable research workflow, source-packet conventions, long-running research setup, or `/research` entrypoint
 - the relevant `researches/decisions/` memo when designing browser-driven external research providers, provider polling/check status flows, or `.local/coordinator/research-runs/`
 - `.local/AGENTS.md` when working in local-only operator state such as `.local/coordinator/`, `.local/config/`, or `.local/ssh/`
-- `docs/ai/opencode-skills.md` when the task depends on a repo-local OpenCode skill or when you need to know which local skill should be invoked explicitly
+- `vh-agent-harness docs opencode-skills` when the task depends on a repo-local OpenCode skill or when you need to know which local skill should be invoked explicitly
 - `docs/ai/shell-execution.md` before planning or running shell commands
-- `docs/ai/temprary-files.md` before generating temporary artifacts or run-specific outputs
+- `vh-agent-harness docs temporary-files` before generating temporary artifacts or run-specific outputs
 - `docs/planning/current-index.md` when a prompt references "the current plan" or supplies dated planning/checkpoint paths that may have drifted
 - task-specific durable guidance under `docs/ai/` when a boundary already has its own playbook
 - `opencode.jsonc` when operating through OpenCode and needing the current plan/build permissions, subagents, or command templates
@@ -112,7 +112,7 @@ add-an-agent / add-command / add-skill recipe and the overlay anatomy.
 - Run project commands through `harness`. Do not rely on host-level `python`, `pytest`, `npm`, `pnpm`, `yarn`, or `docker compose`.
 - The `shell-guard` plugin refuses a list of high-risk patterns (Docker socket access, ad-hoc apt installs, host-key bypass, scp deploys, cloud-provider lifecycle on Terraform-managed resources, raw database writes against protected identity/auth tables, project JWT secrets on the command line). See `docs/ai/shell-execution.md` → "Forbidden patterns". If a deny fires, do not paraphrase the command to evade it — read the rule's `why` and pick the canonical alternative, or surface the situation to the operator.
 - For agent-driven shell work, prefer `vh-agent-harness exec <cmd>` and avoid interactive `vh-agent-harness shell` unless a human explicitly asks for it.
-- For long-running detached work that may outlive one shell call/session, name the relevant skill explicitly: `gpu-use` for GPU jobs, `bgshell-job` for non-GPU shell jobs (see `docs/ai/opencode-skills.md`).
+- For long-running detached work that may outlive one shell call/session, name the relevant skill explicitly: `bgshell-job` for non-GPU shell jobs (see `vh-agent-harness docs opencode-skills`).
 - Ensure the dev environment is running before containerized commands when required.
 - Put transient artifacts under repo-scoped `./tmp/`, never system-level temp paths such as `/tmp`.
 - Delete temporary scripts, logs, downloads, and harnesses you created when the task is complete.

@@ -215,11 +215,19 @@ function extractTriggers(body) {
     return { mode: "all", items: triggers };
 }
 
-// Evaluate one candidate. Returns a report object.
+// Evaluate one candidate. Returns a report object. `body` is the PARSED JSON
+// task-card object (not the raw file text): task_id and owner_notes are read
+// natively so DEFER/p2-followup cards (.json produced by /write-task) are
+// honored. The Notes-prefix trigger grammar is fed UNMODIFIED to
+// extractTriggers as the owner_notes[] text joined by newlines — the existing
+// `^trigger:` regex + predicate parser are unchanged.
 function evaluateCandidate(file, body, since, changedPaths) {
-    const idMatch = body.match(/(?:^task_id|^id):\s*(\S+)/im);
-    const id = idMatch ? idMatch[1] : path.basename(file, ".md");
-    const trig = extractTriggers(body);
+    const id = (body && typeof body.task_id === "string" && body.task_id)
+        || path.basename(file, ".json");
+    const notesText = (body && Array.isArray(body.owner_notes))
+        ? body.owner_notes.join("\n")
+        : "";
+    const trig = extractTriggers(notesText);
     if (!trig.items || trig.items.length === 0) {
         return { id, file, met: false, mode: "none", note: "no-trigger-line", details: [] };
     }
@@ -243,7 +251,7 @@ function main() {
     try {
         files = fs
             .readdirSync(tasksDir)
-            .filter((f) => f.endsWith(".md"))
+            .filter((f) => f.endsWith(".json"))
             .map((f) => path.join(tasksDir, f));
     } catch (_) {
         process.stdout.write(
@@ -259,11 +267,12 @@ function main() {
         : `diff-since=${since} (git unavailable — predicates degrade to not-met)`;
 
     const reports = files.map((f) => {
-        let body = "";
+        let body = null;
         try {
-            body = fs.readFileSync(f, "utf8");
+            const raw = fs.readFileSync(f, "utf8");
+            body = JSON.parse(raw);
         } catch (_) {
-            body = "";
+            body = null;
         }
         return evaluateCandidate(f, body, since, changedPaths);
     });

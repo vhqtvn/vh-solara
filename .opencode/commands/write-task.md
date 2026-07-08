@@ -37,6 +37,7 @@ Workflow:
   - optional `workstream_slug`
   - optional `dependencies`
   - optional `owner_notes`
+    - for DEFER / p2-followup / review-defer conditional candidates, the Notes-prefix provenance lines (`source:...`, `trigger:...`, `studied:...`) MUST go here, one string per array element — `check-defer-triggers.js` reads them from `owner_notes[]` (NOT from the file body). `trigger:path_touched(<literal-repo-relative-path>)` is the most common predicate; the path is matched as a literal against `git diff --name-only` (no globbing).
   - optional `next_action`
 - if the inferred task is a new `task_type: research`, stop and tell the user to use `/research` instead of `/write-task`
   - `/write-task` remains the generic entrypoint for `implementation` and `study`

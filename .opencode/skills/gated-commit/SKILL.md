@@ -120,18 +120,21 @@ UUID=$(.opencode/scripts/readonly-scripts.sh gen-uuid)
 # 4. (After commit-reviewer APPROVED) commit:
 .opencode/scripts/commit-gate.sh commit --uuid "${UUID}" --tree-hash "<HASH>" --message-file tmp/commit-gate-message/msg-${UUID}
 
-# 5. Best-effort cleanup (optional — tmp/ is gitignored; commit-gate.sh does
-#    not own tmp/commit-gate-message/ and will not sweep it):
-rm tmp/commit-gate-message/msg-${UUID}
+# 5. No manual cleanup needed — tmp/ is gitignored. commit-gate.sh reclaims
+#    BOTH its own session scratch under .git/commit-gate/ AND the agent-owned
+#    message file tmp/commit-gate-message/msg-${UUID} on successful commit,
+#    release, and the no_changes no-op branch, and sweeps aged orphans (older
+#    than COMMIT_GATE_GC_MAX_AGE, default 3600s) on both surfaces.
 ```
 
-> **No manual `.git/commit-gate/` cleanup.** `commit-gate.sh` self-cleans its
-> own session scratch (`msg-`/`paths-`/`meta-`/`index-`) on successful commit,
-> release, AND the `no_changes` no-op branch, and sweeps aged orphans (older
-> than `COMMIT_GATE_GC_MAX_AGE`, default 3600s) on those same paths. Agents MUST
-> NOT manually `rm` `.git/commit-gate/*` — it is not allowlisted for any agent
-> (shell-guard denies it) and is now unnecessary. The agent-owned message file
-> under `tmp/commit-gate-message/` is the agent's to clean (optional).
+> **No manual cleanup of gate scratch.** `commit-gate.sh` self-cleans BOTH its
+> own session scratch under `.git/commit-gate/` (`msg-`/`paths-`/`meta-`/
+> `index-`) AND the agent-owned message file `tmp/commit-gate-message/msg-${UUID}`
+> on successful commit, release, AND the `no_changes` no-op branch, and sweeps
+> aged orphans (older than `COMMIT_GATE_GC_MAX_AGE`, default 3600s) on both
+> surfaces. Agents MUST NOT manually `rm` anything under `.git/commit-gate/` OR
+> `tmp/commit-gate-message/` — `rm` is not allowlisted for any agent
+> (shell-guard denies it) and is now unnecessary on both paths.
 
 **Blessed one-liner (acquire):**
 ```

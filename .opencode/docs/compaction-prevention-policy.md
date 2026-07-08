@@ -1,7 +1,7 @@
 # Compaction-Prevention Policy
 
 > **Source:** `researches/decisions/2026-06-01-compaction-prevent-vs-recover.md`
-> **Session workflow:** `docs/ai/opencode-session-workflow.md`
+> **Session workflow:** `vh-agent-harness docs opencode-session-workflow`
 
 ## Policy statement
 
@@ -39,6 +39,6 @@ Before starting a non-trivial session, confirm:
 
 ## Cross-references
 
-- Full session workflow: `docs/ai/opencode-session-workflow.md`
+- Full session workflow: `vh-agent-harness docs opencode-session-workflow`
 - Source analysis (Option A+B): `researches/decisions/2026-06-01-compaction-prevent-vs-recover.md`
 - Compaction-primitives recovery: `docs/ai/compaction-primitives.md`

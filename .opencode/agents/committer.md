@@ -117,9 +117,14 @@ It is the only agent that stages, commits, and manages session lifecycle on beha
       - A must address findings before retrying
 
 5. Cleanup + confirm result to A
-   - Best-effort cleanup of the message scratch file: `rm tmp/commit-gate-message/msg-${UUID}`
-     (optional — `tmp/` is gitignored, so leaving it is acceptable; `commit-gate.sh`
-     does not own this path and will not sweep it).
+   - No manual cleanup needed. `commit-gate.sh` reclaims BOTH its own session
+     scratch under `.git/commit-gate/` AND the agent-owned message file
+     `tmp/commit-gate-message/msg-${UUID}` on successful commit, release, and
+     the `no_changes` no-op branch, and sweeps aged orphans (older than
+     `COMMIT_GATE_GC_MAX_AGE`, default 3600s) on both surfaces. Agents MUST NOT
+     manually `rm` anything under `.git/commit-gate/` OR
+     `tmp/commit-gate-message/` — `rm` is not allowlisted for any agent
+     (shell-guard denies it) and is now unnecessary.
    - Report final status: committed (with hash) or released (with blocker details)
 ```
 

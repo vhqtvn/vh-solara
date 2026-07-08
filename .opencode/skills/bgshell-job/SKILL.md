@@ -39,6 +39,6 @@ State is saved under:
 
 ## When not to use
 
-- do not use this for GPU work; use `gpu-use` instead
+- do not use this for GPU work
 - do not use this for quick commands that complete inside one shell call
 - do not use this as a substitute for CI or remote job scheduling
