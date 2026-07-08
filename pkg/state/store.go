@@ -1857,6 +1857,23 @@ func (s *Store) Head() uint64 {
 	return s.seq
 }
 
+// RunningRoots returns the number of session roots whose subtree has at least
+// one busy/retry session (busyCount[root] > 0). It mirrors the SPA
+// runningSessionCount() semantics per-workspace: a root counts if any turn is
+// in flight anywhere in its subtree. Used to aggregate a cross-workspace
+// "restart will interrupt N running sessions" count without building snapshots.
+func (s *Store) RunningRoots() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	n := 0
+	for _, c := range s.busyCount {
+		if c > 0 {
+			n++
+		}
+	}
+	return n
+}
+
 // Replay returns buffered events with seq > cursor. ok is false when the cursor
 // is older than the buffer's oldest retained event (caller must send a snapshot).
 func (s *Store) Replay(cursor uint64) (events []ClientEvent, head uint64, ok bool) {

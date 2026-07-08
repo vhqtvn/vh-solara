@@ -2,7 +2,7 @@ import { createResource, createSignal, Show } from "solid-js";
 import { forceReload, resetLocalStorage, restartVhServer } from "../admin";
 import { dismiss } from "../lib/a11y";
 import Icon from "./Icon";
-import OpenCodeUpdateDialog, { RestartConfirm } from "./OpenCodeUpdateDialog";
+import OpenCodeUpdateDialog from "./OpenCodeUpdateDialog";
 
 // Server-admin popup (versions + update/reload/restart + local-storage reset),
 // opened by right-clicking / long-pressing the Settings button. Kept out of the
@@ -18,9 +18,6 @@ export default function AdminMenu(props: { onClose: () => void }) {
   const [updateOpen, setUpdateOpen] = createSignal(false);
   const [reloading, setReloading] = createSignal(false);
   const [reloadedAt, setReloadedAt] = createSignal(0);
-  const [confirmRestart, setConfirmRestart] = createSignal(false);
-  const [restarting, setRestarting] = createSignal(false);
-  const [restartMsg, setRestartMsg] = createSignal("");
   const [confirmReset, setConfirmReset] = createSignal(false);
 
   async function reloadServer() {
@@ -30,20 +27,6 @@ export default function AdminMenu(props: { onClose: () => void }) {
       setReloadedAt(Date.now());
     } finally {
       setReloading(false);
-    }
-  }
-  async function restartOpenCode() {
-    setRestarting(true);
-    setRestartMsg("");
-    try {
-      const res = await fetch("/vh/restart-opencode", { method: "POST" });
-      setRestartMsg(res.ok ? "✓ restarted" : res.status === 501 ? "Not managed here" : "Restart failed");
-      if (res.ok) void refetchVer();
-    } catch {
-      setRestartMsg("Restart failed");
-    } finally {
-      setRestarting(false);
-      setConfirmRestart(false);
     }
   }
 
@@ -75,7 +58,11 @@ export default function AdminMenu(props: { onClose: () => void }) {
         </div>
       </div>
 
-      {/* Update OpenCode — opens the streaming-log dialog. */}
+      {/* Update OpenCode — opens the streaming-log dialog, which owns BOTH the
+          install (update/reinstall) and the restart confirmation. The menu
+          entry keeps a STABLE label regardless of version state so it never
+          flips identity while npm resolves (the dialog carries the
+          update-vs-reinstall nuance + the loading state). */}
       <button
         type="button"
         class="admin-btn"
@@ -84,13 +71,7 @@ export default function AdminMenu(props: { onClose: () => void }) {
         onClick={() => setUpdateOpen(true)}
       >
         <Icon name="layers" size={14} />
-        {!ocVer()
-          ? "Checking…"
-          : ocVer()!.restartNeeded
-            ? "Apply OpenCode update…"
-            : ocVer()!.updateAvailable
-              ? "Update OpenCode…"
-              : "Update OpenCode (reinstall)…"}
+        {ocVer() ? "Update OpenCode…" : "Checking…"}
       </button>
 
       <button type="button" class="admin-btn" disabled={reloading()} onClick={reloadServer}>
@@ -101,17 +82,6 @@ export default function AdminMenu(props: { onClose: () => void }) {
       <button type="button" class="admin-btn" onClick={() => (props.onClose(), restartVhServer())}>
         <Icon name="retry" size={14} /> Restart vh server
       </button>
-
-      {/* Restart OpenCode — session-aware confirmation. */}
-      <Show
-        when={!confirmRestart()}
-        fallback={<RestartConfirm restarting={restarting()} onConfirm={restartOpenCode} onCancel={() => setConfirmRestart(false)} />}
-      >
-        <button type="button" class="admin-btn" onClick={() => (setRestartMsg(""), setConfirmRestart(true))}>
-          <Icon name="retry" size={14} /> Restart OpenCode…
-        </button>
-        <Show when={restartMsg()}><span class="admin-ok">{restartMsg()}</span></Show>
-      </Show>
 
       <div class="admin-sep" />
 

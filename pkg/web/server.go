@@ -483,6 +483,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/vh/reload", s.handleReload)
 	mux.HandleFunc("/vh/restart-opencode", s.handleRestartOpenCode)
 	mux.HandleFunc("/vh/restart-server", s.handleRestartServer)
+	mux.HandleFunc("/vh/running-sessions", s.handleRunningSessions)
 	mux.HandleFunc("/vh/term/ws", s.handleTerminalWS)
 	mux.HandleFunc("/vh/term/list", s.handleTermList)
 	mux.HandleFunc("/vh/term/kill", s.handleTermKill)
@@ -741,6 +742,47 @@ func (s *Server) handleProjects(w http.ResponseWriter, r *http.Request) {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Dir < out[j].Dir })
 	writeJSONResp(w, out)
+}
+
+// handleRunningSessions aggregates how many sessions are currently running ACROSS ALL
+// workspaces the daemon manages — not just the one the SPA is viewing. Restarting
+// OpenCode interrupts every workspace, so the restart-confirmation warning must reflect the
+// whole fleet, and the SPA's per-workspace runningSessionCount() can't see beyond
+// its own projectDir(). Each workspace aggregator shares the single opencodeURL
+// (one OpenCode process we own), and a session belongs to exactly one dir,
+// so summing RunningRoots() across aggregators can't double-count.
+type runningWorkspaceInfo struct {
+	Dir   string `json:"dir"`
+	Count int    `json:"count"`
+}
+
+type runningSessionsResp struct {
+	Count      int                   `json:"count"`
+	Workspaces []runningWorkspaceInfo `json:"workspaces"`
+}
+
+func (s *Server) handleRunningSessions(w http.ResponseWriter, r *http.Request) {
+	type entry struct {
+		dir string
+		agg *aggregator.Aggregator
+	}
+	s.aggMu.Lock()
+	live := make([]entry, 0, len(s.aggs))
+	for dir, a := range s.aggs {
+		live = append(live, entry{dir, a})
+	}
+	s.aggMu.Unlock()
+
+	resp := runningSessionsResp{}
+	for _, e := range live {
+		n := e.agg.Store().RunningRoots()
+		resp.Count += n
+		if n > 0 {
+			resp.Workspaces = append(resp.Workspaces, runningWorkspaceInfo{Dir: e.dir, Count: n})
+		}
+	}
+	sort.Slice(resp.Workspaces, func(i, j int) bool { return resp.Workspaces[i].Dir < resp.Workspaces[j].Dir })
+	writeJSONResp(w, resp)
 }
 
 func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
