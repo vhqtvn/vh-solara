@@ -24,10 +24,11 @@ test("desktop: wordmark shows at full width, all controls on one line", async ({
   const r = (await head.boundingBox())!;
   expect(r.height).toBeLessThan(64); // single row — no wrap
 
-  // Logo, helper, status pill and the two desktop buttons all sit inside the box.
+  // Logo (the brand-mark glyph, now embedded inside .status-mark), helper,
+  // status mark and the two desktop buttons all sit inside the box.
   within(await head.locator(".brand-mark").boundingBox(), r);
   within(await head.locator(".help-inspect").boundingBox(), r);
-  within(await head.locator(".status-ind").boundingBox(), r);
+  within(await head.locator(".status-mark").boundingBox(), r);
   for (const label of ["Search sessions", "Create session"]) {
     within(await head.getByRole("button", { name: label }).boundingBox(), r);
   }

@@ -7,33 +7,9 @@ import ArchivedDialog from "./ArchivedDialog";
 import ProjectSwitcher from "./ProjectSwitcher";
 import OrphanBanner from "./OrphanBanner";
 import HelpInspector from "./HelpInspector";
-import BrandMark from "./BrandMark";
+import StatusMark from "./StatusMark";
 import Icon from "./Icon";
 import { setView } from "../ui";
-
-// Animated connection-health indicator for the sidebar header (5 states). The
-// markup is constant — 6 layered spans (track / arc / arc.two / core / check /
-// minus); the sole state class on the root drives all color + motion via CSS
-// (see `.status-ind` in styles.css). role="img" + aria-label expose the state
-// to screen readers without a chatty live region (it's read on traversal).
-function StatusIndicator(props: { state: string; tip: string }) {
-  return (
-    <span
-      class="status-ind"
-      classList={{ [props.state]: true }}
-      role="img"
-      aria-label={props.tip}
-      data-tip={props.tip}
-    >
-      <span class="track" />
-      <span class="arc" />
-      <span class="arc two" />
-      <span class="core" />
-      <span class="check" />
-      <span class="minus" />
-    </span>
-  );
-}
 
 export default function Sidebar(props: { open: boolean; onClose: () => void }) {
   const [archivedOpen, setArchivedOpen] = createSignal(false);
@@ -47,10 +23,10 @@ export default function Sidebar(props: { open: boolean; onClose: () => void }) {
   const stale = createMemo(() => isStale());
   const syncing = createMemo(() => isUpdating() && state.status === "live");
   const statusTip = createMemo(() => {
-    if (stale()) return `stale — no data for over ${Math.round(STALE_MS / 1000)}s`;
-    if (syncing()) return "syncing…";
-    if (state.status === "reconnecting") return "reconnecting…";
-    return "connection";
+    if (stale()) return `Status: stale — no data for over ${Math.round(STALE_MS / 1000)}s`;
+    if (syncing()) return "Status: syncing…";
+    if (state.status === "reconnecting") return "Status: reconnecting…";
+    return "Status: connection";
   });
   // Exactly ONE indicator state class at a time. The indicator draws a check
   // mark in `live` and a minus in `stale`; the naive classList
@@ -109,10 +85,9 @@ export default function Sidebar(props: { open: boolean; onClose: () => void }) {
   return (
     <aside class="sidebar" classList={{ open: props.open }}>
       <div class="sidebar-head">
-        <BrandMark class="brand-mark" />
+        <StatusMark state={indState()} tip={statusTip()} />
         <strong>VHSolara</strong>
         <HelpInspector />
-        <StatusIndicator state={indState()} tip={statusTip()} />
         <button
           type="button"
           class="icon-btn"
