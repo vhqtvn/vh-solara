@@ -639,6 +639,18 @@ body {
   animation: pulse 1.6s ease-in-out infinite;
   opacity: 0.6;
 }
+/* Warm silent-swap "refreshing…" indicator: the open session's fresh snapshot
+   is still in flight while cached/stale content is shown. Distinct from the grey
+   .dot.hydrating (cold-open) — a hollow accent ring with a slow pulse reads as
+   "updating what you're looking at", not "loading from scratch". Cheap opacity
+   pulse only (see AGENTS.md Firefox/WebRender perf notes — no filters/masks). */
+.dot.refreshing {
+  background: transparent;
+  border: 1.5px solid var(--accent);
+  box-sizing: border-box;
+  animation: pulse 1.4s ease-in-out infinite;
+  opacity: 0.7;
+}
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
 
 .icon-btn {
