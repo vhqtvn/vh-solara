@@ -420,3 +420,125 @@ test("scroll back to bottom invalidates the arm-time stash (P1-WEB-004)", async 
     { timeout: 5000 },
   ).toBe(1);
 });
+
+// (6) P1-WEB-039 REGRESSION — onScrolled is the lone scroll/position effect
+//     without a `ready()` guard.
+//
+// BUG: when switching IN-APP (within one ChatView mount) to a session not yet
+//     cached, openSession pre-reserves a truthy-but-empty messages slot
+//     {order:[],byId:{}} (sync/actions.ts) and the scroll-restore effect
+//     (ChatView.tsx:794-827) runs setReady(false). onScrolled — the .chat-scroll
+//     scroll handler — is the ONLY one of the six scroll/position effects
+//     WITHOUT a `ready()` guard (the other five — :441,:470,:865,:958,:1207 —
+//     already bail on `if (!ready()) return;`). A scroll event during the
+//     !ready() empty-order window drives classifyScrollDelta, whose
+//     reached-bottom branch fires clearReadAnchor(props.sessionId) — DESTROYING
+//     the entering session's persisted read anchor before maybeRestore can read
+//     it. maybeRestore NEVER clears the anchor itself (only the stale/no-anchor
+//     branches pin to the bottom), so the ready() guard is the sole defense on
+//     the onScrolled path.
+//
+// FIX: `if (!ready()) return;` at the top of onScrolled (after the scrollEl
+//      guard), matching the established ready() pattern.
+//
+// REPRODUCTION STRATEGY: the harmful path needs onScrolled to run with
+//   ready()=false AND following()=false during the empty-order window. (Note:
+//   the composer session-switch effect at ChatView.tsx:1231-1253 also runs
+//   setFollowing(true) on every switch, so the natural empty-content collapse
+//   is normally caught by the following()-gated self-pin bail and does NOT
+//   reach clearReadAnchor by itself. The vuln CLASS is nonetheless real:
+//   following()=false is reachable during the !ready() window — e.g. the user
+//   scrolls the entering session up, then back to the bottom, before the
+//   snapshot loads — and onScrolled is the lone unguarded effect.) Over the
+//   fast local fixture that window is sub-frame, so we make the test
+//   DETERMINISTIC by (a) seeding slow's anchor in the in-memory scroll cache
+//   via addInitScript so clearReadAnchor is observable (it is a no-op when
+//   cache[id]===undefined), (b) monkey-patching EventSource to delay slow's
+//   per-session stream events by 2 s so messages[slow] stays empty (ready()
+//   stays false), and (c) dispatching TWO synthetic scroll events during the
+//   !ready() window — scroll 1 (to the top) flips following()=false via
+//   classifyScrollDelta's user-scroll-up branch; scroll 2 (to the bottom) then
+//   trips reached-bottom → clearReadAnchor. This exercises the exact vuln code
+//   path WITHOUT depending on natural fixture timing.
+test("in-app switch to an empty uncached session preserves its stored read anchor (P1-WEB-039)", async ({ page }) => {
+  await page.setViewportSize(VP);
+
+  // (a) Seed slow's read anchor in localStorage BEFORE the app loads so
+  //     loadVersioned reads it into the in-memory cache (lib/scroll.ts
+  //     module-level `cache`). clearReadAnchor is a NO-OP when cache[id]===
+  //     undefined, so this pre-load seed is what makes the vuln observable.
+  // (b) Delay slow's per-session stream events by 2 s so messages[slow] stays
+  //     empty (ready() stays false). addInitScript evaluates as raw JS — no TS.
+  await page.addInitScript(() => {
+    localStorage.setItem(
+      "vh.scroll.v2",
+      JSON.stringify({ v: 1, data: { slow: "seed-anchor-mid" } }),
+    );
+    var OrigES = window.EventSource;
+    function DelayedSnapshotES(url, opts) {
+      var es = opts !== undefined ? new OrigES(url, opts) : new OrigES(url);
+      if (typeof url === "string" && url.indexOf("sessions=slow") !== -1) {
+        var origAdd = es.addEventListener.bind(es);
+        es.addEventListener = function (type, listener, options) {
+          if (listener) {
+            return origAdd(type, function (ev) {
+              setTimeout(function () {
+                if (typeof listener === "function") listener(ev);
+                else listener.handleEvent(ev);
+              }, 2000);
+            }, options);
+          }
+          return origAdd(type, listener, options);
+        };
+      }
+      return es;
+    }
+    DelayedSnapshotES.prototype = OrigES.prototype;
+    DelayedSnapshotES.CLOSED = OrigES.CLOSED;
+    DelayedSnapshotES.OPEN = OrigES.OPEN;
+    DelayedSnapshotES.CONNECTING = OrigES.CONNECTING;
+    window.EventSource = DelayedSnapshotES;
+  });
+
+  // ── FROM session: mount ChatView with seeded content so ready()=true before
+  //     the switch. demo has seeded overflow; no prompting keeps the test
+  //     deterministic across repeat-each iterations (no fixture state leak).
+  await page.goto("/?session=demo");
+  await expect(page.locator(".chat-scroll")).toBeVisible({ timeout: 10000 });
+  await expect(page.locator(".msg[data-mid]").first()).toBeVisible({ timeout: 10000 });
+  // Sanity: slow's seeded anchor loaded into the in-memory cache at init.
+  expect(await readAnchor(page, "slow")).toBe("seed-anchor-mid");
+
+  // ── THE VULN SWITCH (in-app popstate — ChatView stays mounted). ──────────
+  // openSession("slow") reserves the empty slot → the 2 s delayed stream keeps
+  // messages[slow] empty → maybeRestore defers (order empty) → ready() stays
+  // false. The switch effects set following(true) + pinnedGeom=sentinel, then
+  // the RO callback + rAF pin advance pinnedGeom to the placeholder geometry.
+  await switchSessionInApp(page, "slow");
+  await waitForSessionSelected(page, "slow");
+  await page.waitForTimeout(200);
+
+  // ── Dispatch TWO synthetic scrolls during the !ready() window. ──────────
+  // onScrolled is bound via SolidJS onScroll; dispatchEvent fires it sync.
+  // Scroll 1 (top): following() is true going in but the scroll-up residual
+  //   flips it false (classifyScrollDelta user-scroll-up). Scroll 2 (bottom):
+  //   following() is now false so the self-pin bail does NOT fire, and
+  //   atBottom trips reached-bottom → clearReadAnchor("slow").
+  //   WITHOUT fix: clearReadAnchor("slow") fires → anchor destroyed (RED).
+  //   WITH fix: `if (!ready()) return;` bails on BOTH → anchor survives (GREEN).
+  await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
+    const bottom = el.scrollHeight - el.clientHeight;
+    // Scroll 1: up to the top (flip following()=false).
+    el.scrollTop = 0;
+    el.dispatchEvent(new Event("scroll", { bubbles: true }));
+    // Scroll 2: back to the bottom (reached-bottom → clearReadAnchor).
+    el.scrollTop = bottom;
+    el.dispatchEvent(new Event("scroll", { bubbles: true }));
+  });
+
+  // The anchor must survive: clearReadAnchor must NOT have fired during the
+  // !ready() window. Polling covers async event timing.
+  await expect
+    .poll(async () => readAnchor(page, "slow"), { timeout: 4000 })
+    .toBe("seed-anchor-mid");
+});

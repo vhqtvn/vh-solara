@@ -972,6 +972,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // and mark the session read (ack) when its bottom is reached.
   function onScrolled() {
     if (!scrollEl) return;
+    if (!ready()) return;
     const current = geom(scrollEl);
     // Own-pin bail (perf guard): a scroll event whose offset matches our last
     // programmatic pin is our own write, not user input — skip the per-frame
