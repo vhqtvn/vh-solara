@@ -26,7 +26,8 @@ export default function Sidebar(props: { open: boolean; onClose: () => void }) {
     if (stale()) return `Status: stale — no data for over ${Math.round(STALE_MS / 1000)}s`;
     if (syncing()) return "Status: syncing…";
     if (state.status === "reconnecting") return "Status: reconnecting…";
-    return "Status: connection";
+    if (state.status === "connecting") return "Status: connecting…";
+    return "Status: connected";
   });
   // Exactly ONE indicator state class at a time. The indicator draws a check
   // mark in `live` and a minus in `stale`; the naive classList

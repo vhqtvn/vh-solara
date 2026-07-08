@@ -471,7 +471,7 @@ body {
   --status: var(--fg-dim);
   --status-soft: color-mix(in srgb, var(--fg-dim) 22%, transparent);
   --orbital-tint: var(--accent);
-  --size: 32px;
+  --size: 24px;
   position: relative;
   width: var(--size);
   height: var(--size);
@@ -484,7 +484,7 @@ body {
 }
 .status-mark svg {
   width: 100%; height: 100%; display: block; overflow: visible;
-  filter: drop-shadow(0 0 10px var(--status-soft)) drop-shadow(0 4px 12px rgba(0,0,0,.34));
+  filter: drop-shadow(0 0 4px var(--status-soft)) drop-shadow(0 2px 5px rgba(0,0,0,.32));
   transition: color .22s ease, filter .22s ease, opacity .22s ease, transform .22s ease;
 }
 .status-mark .brand-mark path { transform-box: fill-box; transform-origin: center; }
@@ -494,26 +494,26 @@ body {
 .status-mark .halo, .status-mark .orbital, .status-mark .scan {
   content: ""; position: absolute; inset: 0; border-radius: 999px; pointer-events: none;
 }
-.status-mark::before { border: 1px solid var(--status-soft); opacity: .28; transform: scale(.9); }
-.status-mark::after { inset: -3px; background: radial-gradient(circle, var(--status-soft), transparent 62%); opacity: .18; z-index: -1; }
-.halo { inset: -5px; border: 1px solid transparent; border-top-color: var(--status); border-right-color: color-mix(in srgb, var(--status), transparent 45%); opacity: .55; transform: scale(.98); }
-.orbital { inset: -2px; border: 1px solid transparent; border-left-color: var(--orbital-tint); border-bottom-color: color-mix(in srgb, var(--orbital-tint), transparent 65%); opacity: 0; transform: rotate(0deg) scale(.96); }
-.packet, .spark { width: 4px; height: 4px; inset: auto; border-radius: 999px; background: currentColor; box-shadow: 0 0 10px currentColor; opacity: 0; }
-.packet.a { left:50%; top:50%; margin:-2px 0 0 -2px; }
-.packet.b { left:50%; top:50%; margin:-2px 0 0 -2px; animation-delay:.18s; }
-.packet.c { left:50%; top:50%; margin:-2px 0 0 -2px; animation-delay:.36s; }
+.status-mark::before { border: .75px solid var(--status-soft); opacity: .28; transform: scale(.92); }
+.status-mark::after { inset: -2px; background: radial-gradient(circle, var(--status-soft), transparent 62%); opacity: .16; z-index: -1; }
+.halo { inset: -3px; border: .75px solid transparent; border-top-color: var(--status); border-right-color: color-mix(in srgb, var(--status), transparent 45%); opacity: .55; transform: scale(.98); }
+.orbital { inset: -1px; border: .75px solid transparent; border-left-color: var(--orbital-tint); border-bottom-color: color-mix(in srgb, var(--orbital-tint), transparent 65%); opacity: 0; transform: rotate(0deg) scale(.96); }
+.packet, .spark { position: absolute; width: 2px; height: 2px; inset: auto; border-radius: 999px; background: currentColor; box-shadow: 0 0 5px currentColor; opacity: 0; }
+.packet.a { left:50%; top:50%; margin:-1px 0 0 -1px; }
+.packet.b { left:50%; top:50%; margin:-1px 0 0 -1px; animation-delay:.18s; }
+.packet.c { left:50%; top:50%; margin:-1px 0 0 -1px; animation-delay:.36s; }
 .spark.a { left:0; top:42%; }
-.spark.b { right:4px; top:16%; animation-delay:.12s; }
-.spark.c { right:9px; bottom:0; animation-delay:.26s; }
-.scan { inset:-4px; background: conic-gradient(from 0deg, transparent 0 68%, var(--status-soft) 72%, transparent 78% 100%); opacity:0; -webkit-mask: radial-gradient(circle, transparent 56%, #000 58% 65%, transparent 67%); mask: radial-gradient(circle, transparent 56%, #000 58% 65%, transparent 67%); }
+.spark.b { right:2px; top:16%; animation-delay:.12s; }
+.spark.c { right:7px; bottom:0; animation-delay:.26s; }
+.scan { inset:-3px; background: conic-gradient(from 0deg, transparent 0 68%, var(--status-soft) 72%, transparent 78% 100%); opacity:0; -webkit-mask: radial-gradient(circle, transparent 56%, #000 58% 65%, transparent 67%); mask: radial-gradient(circle, transparent 56%, #000 58% 65%, transparent 67%); }
 /* Corner status badge — the semantic state carrier. Excluded from the inset:0
    layer reset above so its own corner inset (auto 3px 3px auto) applies. The
    --bg box-shadow ring separates it from the glyph in both theme families. */
 .status-mark .status-core {
   content: ""; position: absolute; border-radius: 999px; pointer-events: none;
-  inset: auto 3px 3px auto; width: 9px; height: 9px;
-  border: 1px solid rgba(255,255,255,.72); background: var(--status);
-  box-shadow: 0 0 0 2px var(--bg), 0 0 12px var(--status); opacity: .96;
+  inset: auto 1px 1px auto; width: 5px; height: 5px;
+  border: .75px solid rgba(255,255,255,.72); background: var(--status);
+  box-shadow: 0 0 0 1.5px var(--bg), 0 0 6px var(--status); opacity: .96;
 }
 .status-mark .status-core::before, .status-mark .status-core::after { content:""; position:absolute; inset:0; border-radius:inherit; }
 
@@ -533,16 +533,16 @@ body {
 .status-mark.connecting .status-core { animation: core-search 1.05s ease-in-out infinite; }
 .status-mark.live .brand-mark { animation: live-settle 2.2s ease-in-out infinite; }
 .status-mark.live .halo { animation: live-halo 2.2s ease-in-out infinite; }
-.status-mark.live .status-core::before { border: solid var(--bg); border-width: 0 1.5px 1.5px 0; width:3px; height:5px; left:2px; top:0; border-radius:0; transform: rotate(45deg); }
+.status-mark.live .status-core::before { border: solid var(--bg); border-width: 0 .9px .9px 0; width:1.6px; height:2.7px; left:1.25px; top:.35px; border-radius:0; transform: rotate(45deg); }
 .status-mark.stale svg { opacity: .86; }
 .status-mark.stale .halo { border-style: dashed; animation: stale-drift 3s linear infinite; }
-.status-mark.stale .status-core::before { width:1px; height:4px; left:3px; top:1px; background:var(--bg); transform-origin: bottom center; animation: clock-hand 2.4s steps(8) infinite; }
-.status-mark.stale .status-core::after { width:4px; height:1px; left:3px; top:4px; background:var(--bg); border-radius:0; }
+.status-mark.stale .status-core::before { width:.75px; height:2.5px; left:1.75px; top:.6px; background:var(--bg); transform-origin: bottom center; animation: clock-hand 2.4s steps(8) infinite; }
+.status-mark.stale .status-core::after { width:2.4px; height:.75px; left:1.75px; top:2.6px; background:var(--bg); border-radius:0; }
 .status-mark.syncing .halo { animation: spin 1.15s linear infinite; }
 .status-mark.syncing .orbital { opacity: .9; animation: spin-rev .82s linear infinite; }
 .status-mark.syncing .packet { opacity: 0; color: var(--accent); animation: packet-orbit 1.1s ease-in-out infinite; }
 .status-mark.syncing .brand-mark path:nth-child(3), .status-mark.syncing .brand-mark path:nth-child(6) { animation: sync-flash 1s ease-in-out infinite; }
-.status-mark.syncing .status-core::before, .status-mark.syncing .status-core::after { width:5px; height:5px; border:1px solid var(--bg); border-left-color:transparent; border-bottom-color:transparent; transform: rotate(45deg); left:1px; top:1px; border-radius:50%; }
+.status-mark.syncing .status-core::before, .status-mark.syncing .status-core::after { width:3px; height:3px; border:.75px solid var(--bg); border-left-color:transparent; border-bottom-color:transparent; transform: rotate(45deg); left:.55px; top:.55px; border-radius:50%; }
 .status-mark.syncing .status-core::after { transform: rotate(225deg); }
 .status-mark.reconnecting svg { animation: reconnect-jolt 1s steps(2, end) infinite; }
 .status-mark.reconnecting .brand-mark path:nth-child(1), .status-mark.reconnecting .brand-mark path:nth-child(2) { animation: reconnect-split 1s ease-in-out infinite; }
@@ -550,31 +550,31 @@ body {
 .status-mark.reconnecting .orbital { opacity: .8; animation: reconnect-orbit .72s ease-in-out infinite; }
 .status-mark.reconnecting .spark { opacity: 0; animation: spark-burst .72s ease-out infinite; }
 .status-mark.reconnecting .status-core { animation: core-alert .72s ease-in-out infinite; }
-.status-mark.reconnecting .status-core::before { width:1px; height:5px; left:3px; top:1px; background:var(--bg); }
-.status-mark.reconnecting .status-core::after { width:1px; height:1px; left:3px; bottom:1px; background:var(--bg); }
+.status-mark.reconnecting .status-core::before { width:.75px; height:2.8px; left:1.75px; top:.55px; background:var(--bg); }
+.status-mark.reconnecting .status-core::after { width:.75px; height:.75px; left:1.75px; bottom:.55px; background:var(--bg); }
 
 /* spin is reused from the shared @keyframes spin (~2278). spin-rev and the rest
    are status-mark-local. Orbits (loading-dot-orbit / packet-orbit) are tuned for
-   the 32px header size (translateX 11/13px, scaled from the design's 18/21px on
-   52px) so packets orbit just inside the glyph edge. All keyframes are
-   opacity/transform/filter-only → compositor-friendly. Reduced motion is handled
-   globally by the repo's prefers-reduced-motion * override (~3774); the e-ink
-   animation:none kill switch (~284) is documented in the block header above. */
+   the 24px header size (translateX 8/9px, filter blur 4px) so packets orbit just
+   inside the glyph edge. All keyframes are opacity/transform/filter-only →
+   compositor-friendly. Reduced motion is handled globally by the repo's
+   prefers-reduced-motion * override (~3774); the e-ink animation:none kill
+   switch (~284) is documented in the block header above. */
 @keyframes spin-rev { to { transform: rotate(-360deg); } }
 @keyframes mark-breathe { 0%,100%{transform:scale(.98);opacity:.78;} 50%{transform:scale(1.025);opacity:1;} }
-@keyframes live-settle { 0%,100%{transform:scale(1);filter:drop-shadow(0 0 10px var(--status-soft)) drop-shadow(0 4px 12px rgba(0,0,0,.34));} 50%{transform:scale(1.018);filter:drop-shadow(0 0 15px var(--status-soft)) drop-shadow(0 4px 12px rgba(0,0,0,.34));} }
+@keyframes live-settle { 0%,100%{transform:scale(1);filter:drop-shadow(0 0 4px var(--status-soft)) drop-shadow(0 2px 5px rgba(0,0,0,.32));} 50%{transform:scale(1.018);filter:drop-shadow(0 0 7px var(--status-soft)) drop-shadow(0 2px 5px rgba(0,0,0,.32));} }
 @keyframes live-halo { 0%,100%{opacity:.22;transform:scale(.96);} 50%{opacity:.5;transform:scale(1.04);} }
 @keyframes stale-drift { to { transform: rotate(360deg); } }
 @keyframes clock-hand { to { transform: rotate(360deg); } }
 @keyframes sync-flash { 0%,100%{opacity:.62;transform:translateY(0);} 50%{opacity:1;transform:translateY(-2px);} }
-@keyframes loading-dot-orbit { 0%{transform:rotate(0deg) translateX(11px) rotate(0deg) scale(.62);opacity:.18;} 18%{opacity:.9;} 62%{opacity:.9;} 100%{transform:rotate(360deg) translateX(11px) rotate(-360deg) scale(.62);opacity:.18;} }
-@keyframes packet-orbit { 0%{transform:rotate(0deg) translateX(13px) rotate(0deg) scale(.58);opacity:0;} 18%{opacity:.9;} 70%{opacity:.9;} 100%{transform:rotate(360deg) translateX(13px) rotate(-360deg) scale(.58);opacity:0;} }
+@keyframes loading-dot-orbit { 0%{transform:rotate(0deg) translateX(8px) rotate(0deg) scale(.78);opacity:.18;} 18%{opacity:.9;} 62%{opacity:.9;} 100%{transform:rotate(360deg) translateX(8px) rotate(-360deg) scale(.78);opacity:.18;} }
+@keyframes packet-orbit { 0%{transform:rotate(0deg) translateX(9px) rotate(0deg) scale(.72);opacity:0;} 18%{opacity:.9;} 70%{opacity:.9;} 100%{transform:rotate(360deg) translateX(9px) rotate(-360deg) scale(.72);opacity:0;} }
 @keyframes core-search { 0%,100%{transform:scale(.78);opacity:.72;} 50%{transform:scale(1.12);opacity:1;} }
-@keyframes reconnect-jolt { 0%,100%{transform:translate(0,0) scale(1);} 25%{transform:translate(1px,-1px) scale(1.01);} 55%{transform:translate(-1px,1px) scale(.99);} }
-@keyframes reconnect-split { 0%,100%{transform:translateX(0);} 32%{transform:translateX(-2px);} 64%{transform:translateX(2px);} }
+@keyframes reconnect-jolt { 0%,100%{transform:translate(0,0) scale(1);} 25%{transform:translate(.45px,-.45px) scale(1.01);} 55%{transform:translate(-.45px,.45px) scale(.99);} }
+@keyframes reconnect-split { 0%,100%{transform:translateX(0);} 32%{transform:translateX(-.9px);} 64%{transform:translateX(.9px);} }
 @keyframes reconnect-ring { 0%{transform:rotate(0deg) scale(.92);opacity:.2;} 42%{transform:rotate(180deg) scale(1.12);opacity:.82;} 100%{transform:rotate(360deg) scale(.92);opacity:.2;} }
 @keyframes reconnect-orbit { 0%,100%{transform:rotate(20deg) scale(.88);opacity:.15;} 50%{transform:rotate(220deg) scale(1.05);opacity:.85;} }
-@keyframes spark-burst { 0%{transform:scale(.4);opacity:0;} 28%{opacity:1;} 100%{transform:translate(6px,-3px) scale(1);opacity:0;} }
+@keyframes spark-burst { 0%{transform:scale(.4);opacity:0;} 28%{opacity:1;} 100%{transform:translate(4px,-2px) scale(1);opacity:0;} }
 @keyframes core-alert { 0%,100%{transform:scale(.92);} 50%{transform:scale(1.16);} }
 
 .tree {
