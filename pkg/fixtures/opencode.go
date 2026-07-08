@@ -382,6 +382,7 @@ func (f *FakeOpenCode) Handler() http.Handler {
 		})
 	})
 	mux.HandleFunc("/fixture/reset", f.handleFixtureReset)
+	mux.HandleFunc("/fixture/busy", f.handleFixtureBusy)
 	mux.HandleFunc("/question/", f.handleQuestion)
 	mux.HandleFunc("/question", func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
@@ -967,6 +968,30 @@ func (f *FakeOpenCode) handleFixtureReset(w http.ResponseWriter, r *http.Request
 	// the cleared status regardless, so this is belt-and-suspenders.
 	f.emit("session.idle", map[string]any{"sessionID": session})
 	writeJSON(w, map[string]any{"reset": session})
+}
+
+// handleFixtureBusy marks a session busy and emits session.status so the
+// aggregator store (pkg/state) counts it as a running root — surfacing as a
+// running badge in the project switcher's activity data (GET /vh/running-sessions).
+// Pairs with /fixture/reset (which clears busy). Deterministic and sticky: the
+// session stays running until reset, so an e2e can switch away, reopen the
+// switcher, and still observe the badge. Test-only infrastructure — never
+// exercised by the shipped binary.
+func (f *FakeOpenCode) handleFixtureBusy(w http.ResponseWriter, r *http.Request) {
+	session := r.URL.Query().Get("session")
+	if session == "" {
+		http.Error(w, "missing session", http.StatusBadRequest)
+		return
+	}
+	// emit takes the lock itself (and mirrors the status into f.busy), so do NOT
+	// hold f.mu here. The aggregator for the session's dir is long-lived in the
+	// worker's s.aggs and stays subscribed to /event, so the status reaches it
+	// even after the SPA has switched to another workspace.
+	f.emit("session.status", map[string]any{
+		"sessionID": session,
+		"status":    map[string]any{"type": "busy"},
+	})
+	writeJSON(w, map[string]any{"busy": session})
 }
 
 func (f *FakeOpenCode) appendMessage(sessionID string, m messageWithParts) {

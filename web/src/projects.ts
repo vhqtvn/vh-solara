@@ -85,4 +85,107 @@ export async function fetchRecentProjects(): Promise<Project[]> {
   }
 }
 
+// --- Project activity (cross-workspace session/running counts) ---
+//
+// The switcher dialog annotates each project row with how many sessions a
+// workspace has and how many are currently running. The ACTIVE project's counts
+// come from the live client store (no round-trip); every other project's come
+// from the worker backend:
+//   GET /vh/projects         -> [{dir, epoch, seq, sessions}]  (one per bridged dir)
+//   GET /vh/running-sessions -> {count, workspaces:[{dir, count}]}  (dirs with >0 running)
+// Both key by the exact project directory, so they merge into the pinned list
+// by `dir`. The merge + sort below is a PURE function (no DOM, no fetch) so it
+// can be unit-tested directly.
+
+export interface ProjectEndpointItem {
+  dir: string;
+  sessions: number;
+}
+export interface RunningWorkspaceItem {
+  dir: string;
+  count: number;
+}
+export interface RunningSessionsPayload {
+  count: number;
+  workspaces: RunningWorkspaceItem[];
+}
+
+export interface ActivityMaps {
+  sessions: Map<string, number>; // dir -> total session count (/vh/projects)
+  running: Map<string, number>; // dir -> running root count (/vh/running-sessions)
+}
+
+// A row the switcher renders: a project enriched with activity + the active
+// marker. `active` rides wherever the row lands in the sort.
+export interface ProjectActivityRow {
+  directory: string;
+  name: string;
+  sessions: number; // 0 when unknown
+  running: number; // 0 when not running / unknown
+  active: boolean; // true for projectDir()
+}
+
+// Reduce the two raw endpoint payloads into dir->count lookup maps. Only dirs
+// with count > 0 land in `running` (matches the backend, which omits idle dirs).
+export function buildActivityMaps(
+  projectsEndpoint: ProjectEndpointItem[],
+  runningEndpoint: RunningSessionsPayload,
+): ActivityMaps {
+  const sessions = new Map<string, number>();
+  for (const p of Array.isArray(projectsEndpoint) ? projectsEndpoint : []) sessions.set(p.dir, p.sessions);
+  const running = new Map<string, number>();
+  for (const w of runningEndpoint?.workspaces ?? []) if (w.count > 0) running.set(w.dir, w.count);
+  return { sessions, running };
+}
+
+// Enrich + sort the pinned project list. Sort order: running projects first,
+// then case-insensitive name. The active project keeps its marker wherever it
+// sorts. The active project's counts come from the LIVE store (activeRunning /
+// activeSessions) to avoid a round-trip; other projects use the endpoint maps.
+export function mergeProjectActivity(
+  pinned: Project[],
+  maps: ActivityMaps,
+  activeDir: string,
+  activeRunning: number,
+  activeSessions: number,
+): ProjectActivityRow[] {
+  const { sessions, running } = maps;
+  const rows: ProjectActivityRow[] = pinned.map((p) => {
+    const isActive = p.directory === activeDir;
+    return {
+      directory: p.directory,
+      name: p.name,
+      active: isActive,
+      sessions: isActive ? activeSessions : sessions.get(p.directory) || 0,
+      running: isActive ? activeRunning : running.get(p.directory) || 0,
+    };
+  });
+  rows.sort((a, b) => {
+    const ar = a.running > 0 ? 1 : 0;
+    const br = b.running > 0 ? 1 : 0;
+    if (ar !== br) return br - ar; // running first
+    return a.name.localeCompare(b.name, undefined, { sensitivity: "base" }); // then name, case-insensitive
+  });
+  return rows;
+}
+
+// Fetch both activity endpoints (coalesced via Promise.all). Never throws: on
+// any failure returns empty maps so the dialog still renders with names alone.
+export async function fetchProjectActivity(): Promise<ActivityMaps> {
+  try {
+    const [pr, rs] = await Promise.all([fetch("/vh/projects"), fetch("/vh/running-sessions")]);
+    const projects: unknown = pr.ok ? await pr.json() : [];
+    const running: unknown = rs.ok ? await rs.json() : null;
+    return buildActivityMaps(
+      Array.isArray(projects) ? (projects as ProjectEndpointItem[]) : [],
+      running && Array.isArray((running as RunningSessionsPayload).workspaces)
+        ? (running as RunningSessionsPayload)
+        : { count: 0, workspaces: [] },
+    );
+  } catch (e) {
+    log.warn("projects", "activity fetch failed", e);
+    return { sessions: new Map(), running: new Map() };
+  }
+}
+
 export { projects, projectDir };

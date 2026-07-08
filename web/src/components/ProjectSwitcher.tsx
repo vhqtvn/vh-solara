@@ -1,15 +1,48 @@
 import { createMemo, createResource, createSignal, For, Show } from "solid-js";
-import { addProject, fetchRecentProjects, projectDir, projects, removeProject, selectProject } from "../projects";
-import { dismiss } from "../lib/a11y";
+import {
+  ActivityMaps,
+  addProject,
+  fetchProjectActivity,
+  fetchRecentProjects,
+  mergeProjectActivity,
+  projectDir,
+  projects,
+  removeProject,
+  selectProject,
+} from "../projects";
+import { dismiss, modal } from "../lib/a11y";
+import { runningSessionCount, state } from "../sync";
 import Icon from "./Icon";
 import TextPromptDialog from "./TextPromptDialog";
 
 // Project switcher: pick the active project directory (re-scopes the whole UI to
-// that OpenCode workspace). Pinned projects persist locally; "Recent" comes from
-// OpenCode (GET /project); "Add project…" takes an absolute path.
+// that OpenCode workspace). Opens as a DIALOG (not an inline dropdown) so the
+// full list + activity badges are reachable on mobile and desktop alike. Pinned
+// projects persist locally; "Recent" comes from OpenCode (GET /project); "Add
+// project…" takes an absolute path. Activity (sessions/running counts) for the
+// NON-active projects comes from GET /vh/projects + /vh/running-sessions; the
+// active project uses the live client store to avoid a round-trip.
 export default function ProjectSwitcher() {
   const [open, setOpen] = createSignal(false);
   const [recents, { refetch }] = createResource(fetchRecentProjects, { initialValue: [] });
+
+  // Activity is fetched ON DIALOG OPEN (coalesced, never a tight loop). Held as a
+  // signal so rows/recent badges react when it resolves; an in-flight guard
+  // dedupes concurrent triggers.
+  const [activity, setActivity] = createSignal<ActivityMaps | null>(null);
+  let inflight: Promise<void> | null = null;
+  function loadActivity() {
+    if (inflight) return;
+    inflight = fetchProjectActivity()
+      .then((m) => {
+        setActivity(m);
+      })
+      .catch(() => {})
+      .finally(() => {
+        inflight = null;
+      });
+  }
+
   const current = () => projects().find((p) => p.directory === projectDir()) || projects()[0];
 
   // Recents not already pinned (and not the active one).
@@ -18,10 +51,28 @@ export default function ProjectSwitcher() {
     return recents().filter((r) => !pinned.has(r.directory) && r.directory !== projectDir());
   });
 
-  function openMenu() {
-    setOpen((v) => !v);
-    if (!open()) void refetch(); // refresh recents when opening
+  // Enriched + sorted rows (running-first, then case-insensitive name). The
+  // active project uses live store counts (runningSessionCount() + session
+  // count); others use the endpoint activity data.
+  const rows = createMemo(() =>
+    mergeProjectActivity(
+      projects(),
+      activity() ?? { sessions: new Map(), running: new Map() },
+      projectDir(),
+      runningSessionCount(),
+      Object.keys(state.sessions).length,
+    ),
+  );
+
+  function toggle() {
+    const next = !open();
+    setOpen(next);
+    if (next) {
+      void refetch(); // refresh recents when opening
+      loadActivity(); // refresh activity when opening
+    }
   }
+
   const [addOpen, setAddOpen] = createSignal(false);
   function add() {
     setOpen(false);
@@ -29,55 +80,103 @@ export default function ProjectSwitcher() {
   }
 
   return (
-    <div class="proj" use:dismiss={() => open() && setOpen(false)}>
-      <button type="button" class="proj-current" onClick={openMenu} data-tip={current()?.directory || "Default"}>
+    <div class="proj">
+      <button type="button" class="proj-current" onClick={toggle} data-tip={current()?.directory || "Default"}>
         <Icon name="layers" size={14} />
         <span class="proj-name">{current()?.name}</span>
         <Icon name="chevronDown" size={14} />
       </button>
       <Show when={open()}>
-        <div class="proj-menu" role="menu">
-          <For each={projects()}>
-            {(p) => (
-              <div class="proj-item" classList={{ on: p.directory === projectDir() }}>
-                <button type="button" class="proj-pick" onClick={() => (selectProject(p.directory), setOpen(false))}>
-                  <span class="proj-item-name">{p.name}</span>
-                  <Show when={p.directory}>
-                    <span class="proj-item-dir">{p.directory}</span>
-                  </Show>
-                </button>
-                <Show when={p.directory}>
-                  <button
-                    type="button"
-                    class="proj-remove"
-                    aria-label="Remove project"
-                    data-tip="Remove from list"
-                    onClick={(e) => (e.stopPropagation(), removeProject(p.directory))}
-                  >
-                    <Icon name="x" size={13} />
-                  </button>
-                </Show>
-              </div>
-            )}
-          </For>
+        <div class="dialog-overlay" use:dismiss={() => setOpen(false)}>
+          <div
+            class="dialog projects-dialog"
+            role="dialog"
+            aria-label="Switch project"
+            use:modal
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div class="dialog-head">
+              <span class="dialog-title">Switch project</span>
+              <button type="button" class="icon-btn" aria-label="Close" onClick={() => setOpen(false)}>
+                <Icon name="x" size={14} />
+              </button>
+            </div>
+            <div class="dialog-body">
+              <For each={rows()}>
+                {(p) => (
+                  <div class="proj-item" classList={{ on: p.active }}>
+                    <button
+                      type="button"
+                      class="proj-pick"
+                      aria-current={p.active ? "true" : undefined}
+                      onClick={() => (selectProject(p.directory), setOpen(false))}
+                    >
+                      <span class="proj-item-name">
+                        {p.name}
+                        <Show when={p.active}>
+                          <span class="proj-active" aria-hidden="true" />
+                        </Show>
+                      </span>
+                      <span class="proj-item-dir">
+                        <Show when={p.directory} fallback="default workspace">
+                          {p.directory}
+                        </Show>
+                        <Show when={p.running > 0 || p.sessions > 0}>
+                          {" \u00b7 "}
+                          <span classList={{ "proj-badge": true, run: p.running > 0 }}>
+                            <Show when={p.running > 0}>
+                              <span class="proj-badge-dot" aria-hidden="true" />
+                              {p.running} running
+                            </Show>
+                            <Show when={p.running > 0 && p.sessions > 0}>{", "}</Show>
+                            <Show when={p.sessions > 0}>{p.sessions} sessions</Show>
+                          </span>
+                        </Show>
+                      </span>
+                    </button>
+                    <Show when={p.directory}>
+                      <button
+                        type="button"
+                        class="proj-remove"
+                        aria-label="Remove project"
+                        data-tip="Remove from list"
+                        onClick={(e) => (e.stopPropagation(), removeProject(p.directory))}
+                      >
+                        <Icon name="x" size={13} />
+                      </button>
+                    </Show>
+                  </div>
+                )}
+              </For>
 
-          <Show when={freshRecents().length > 0}>
-            <div class="proj-section">Recent (OpenCode)</div>
-            <For each={freshRecents()}>
-              {(p) => (
-                <div class="proj-item">
-                  <button type="button" class="proj-pick" onClick={() => (addProject(p.directory), setOpen(false))}>
-                    <span class="proj-item-name">{p.name}</span>
-                    <span class="proj-item-dir">{p.directory}</span>
-                  </button>
-                </div>
-              )}
-            </For>
-          </Show>
+              <Show when={freshRecents().length > 0}>
+                <div class="proj-section">Recent (OpenCode)</div>
+                <For each={freshRecents()}>
+                  {(r) => (
+                    <div class="proj-item">
+                      <button type="button" class="proj-pick" onClick={() => (addProject(r.directory), setOpen(false))}>
+                        <span class="proj-item-name">{r.name}</span>
+                        <span class="proj-item-dir">
+                          {r.directory}
+                          <Show when={(activity()?.running.get(r.directory) ?? 0) > 0}>
+                            {" \u00b7 "}
+                            <span class="proj-badge run">
+                              <span class="proj-badge-dot" aria-hidden="true" />
+                              {activity()!.running.get(r.directory)} running
+                            </span>
+                          </Show>
+                        </span>
+                      </button>
+                    </div>
+                  )}
+                </For>
+              </Show>
 
-          <button type="button" class="proj-add" onClick={add}>
-            <Icon name="plus" size={14} /> Add project…
-          </button>
+              <button type="button" class="proj-add" onClick={add}>
+                <Icon name="plus" size={14} /> Add project…
+              </button>
+            </div>
+          </div>
         </div>
       </Show>
       <TextPromptDialog

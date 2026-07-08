@@ -910,11 +910,13 @@ body {
   font: inherit;
 }
 .vh-prompt-input:focus { outline: none; border-color: var(--accent); }
-/* Mobile: dialogs dock to the bottom as a sheet. */
-@media (max-width: 640px) {
-  .dialog-overlay { align-items: flex-end; }
-  .dialog { width: 100%; max-width: 100%; border-bottom-left-radius: 0; border-bottom-right-radius: 0; }
-}
+/* NOTE: mobile dialog sizing is intentionally FULLSCREEN. The canonical rule
+   lives with the other narrow-screen overrides further down (the @media
+   (max-width:720px) block: dialog-overlay padding 0 + dialog 100%/border0/
+   radius0). Desktop stays a centered modal (the .dialog defaults above). There
+   used to be a competing max-width:640px bottom-sheet rule here; it was dead —
+   the 720px block already overrode it to fullscreen (later source order wins) —
+   so fullscreen is the deliberate house style, not an accident. */
 
 /* Subtree footer: summarizes hidden children (running/idle counts). */
 .tree-footer-row { min-height: 0; }
@@ -2534,6 +2536,42 @@ body {
   margin-top: 4px;
 }
 
+/* --- project switcher DIALOG (Slice 1) --- */
+/* Slightly more compact than the 560px default since rows are short. Desktop
+   only; mobile is fullscreen via the canonical @media(max-width:720px) block. */
+.dialog.projects-dialog { width: 480px; }
+.projects-dialog .dialog-body { display: flex; flex-direction: column; gap: 1px; }
+/* Active-project marker: a small accent dot inline with the name (the .on row
+   tint is the primary cue; this makes it legible at a glance). */
+.proj-active {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-left: 6px;
+  vertical-align: middle;
+  background: var(--accent);
+  border-radius: 50%;
+}
+/* Activity badge: "N running" / "N sessions", appended to the directory line.
+   The running variant is accent-colored with a static status dot (no animation —
+   this is an ephemeral dialog, but we keep it cheap and never animate always-on
+   surfaces per the Firefox/WebRender guidance). */
+.proj-badge { font-size: 11px; color: var(--fg-dim); white-space: nowrap; }
+.proj-badge.run { color: var(--accent); font-weight: 500; }
+.proj-badge-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-right: 4px;
+  vertical-align: middle;
+  background: var(--accent);
+  border-radius: 50%;
+}
+/* On fullscreen mobile the close button gets a comfortable tap target. */
+@media (max-width: 720px) {
+  .projects-dialog .icon-btn { padding: 8px; }
+}
+
 /* --- sidebar footer + archived browser --- */
 .sidebar-foot { border-top: 1px solid var(--border); padding: 6px; }
 .sidebar-foot-btn {
@@ -3474,6 +3512,8 @@ body {
 
 /* --- narrow screens (Galaxy Fold folded ~280px and unfolded) --- */
 @media (max-width: 720px) {
+  /* Canonical mobile dialog sizing: FULLSCREEN by design (see the note near
+     .vh-prompt-input). Applies to every dialog — switcher, prompt, palette. */
   .dialog-overlay { padding: 0; }
   .dialog { width: 100%; max-width: 100%; height: 100%; max-height: 100%; border: 0; border-radius: 0; }
   /* One row on mobile too: the tab bar collapses surplus views into its ⋯ menu
