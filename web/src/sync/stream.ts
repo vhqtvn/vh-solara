@@ -318,29 +318,66 @@ async function fetchSessionMessages(id: string): Promise<any[]> {
   return (snap.messages?.[id] as any[]) || [];
 }
 
+// Bounds tunnel pressure from the warm-open refresh fan-out. Each open session
+// triggers a full-transcript /vh/snapshot pull, and firing all N at once (the
+// original Promise.all) contends the single yamux-over-WebSocket tunnel —
+// head-of-line / bandwidth contention inflates each warm open's latency into
+// seconds at large N. Server compute is sub-20ms (measured); the latency is
+// transport. Capping concurrency keeps the tunnel from saturating so individual
+// pulls complete faster. The knee (concurrency vs throughput) is inferred, not
+// measured — the operator-side acceptance signal is before/after `snap` ms in
+// ServersPanel under a large-N warm reconnect.
+export const REFRESH_CONCURRENCY = 3;
+
+// runWithConcurrency — bounded-fan-out runner with per-item fault isolation, no
+// external dependency. Processes `items` with at most `limit` calls to `fn`
+// in flight at once. A rejection from one item does NOT abort its siblings: the
+// worker catches each item's rejection in isolation and keeps pulling the next,
+// so every item is attempted and the returned promise always resolves (matches
+// refreshOpenSessions' per-session try/catch tolerance). `limit` is clamped to
+// [1, items.length]. Exported for unit testing.
+export async function runWithConcurrency<T>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<void>,
+): Promise<void> {
+  const queue = items.slice();
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < queue.length) {
+      const i = cursor++;
+      try {
+        await fn(queue[i]);
+      } catch {
+        /* isolated — one item's failure does not abort its siblings */
+      }
+    }
+  };
+  const n = Math.max(1, Math.min(limit, queue.length));
+  await Promise.all(Array.from({ length: n }, worker));
+}
+
 // On a tree-stream resync, refresh cached message state for NON-active opened
 // sessions (the active one is owned by the live session stream, so skip it to
-// avoid clobbering streamed deltas). Dispatched CONCURRENTLY: an operator with
-// N open sessions used to wait N serial /vh/snapshot round-trips on every tree
-// reconnect (each blocking on upstream client.Messages on a cold daemon).
-// Promise.all fans them out in one tick; the inner try/catch keeps the prior
-// per-session error isolation (one failed fetch keeps stale + does NOT reject
+// avoid clobbering streamed deltas). Dispatched with BOUNDED concurrency: an
+// operator with N open sessions has N full-transcript /vh/snapshot pulls to
+// re-issue on every tree reconnect, but firing all N at once saturates the
+// controller tunnel (see REFRESH_CONCURRENCY). The inner try/catch keeps the
+// per-session error isolation (one failed fetch keeps stale + does NOT starve
 // the batch, so the other sessions still refresh).
 // Exported for unit testing (tests/unit/refreshOpenSessions.test.ts).
 export async function refreshOpenSessions() {
   const active = selectedId();
-  await Promise.all(
-    Object.keys(state.messages).map(async (id) => {
-      if (id === active) return;
-      try {
-        const items = await fetchSessionMessages(id);
-        setState("messages", id, buildMessages(items));
-        setState("messagesLoaded", id, true);
-      } catch {
-        /* keep stale; reopening re-snapshots */
-      }
-    }),
-  );
+  await runWithConcurrency(Object.keys(state.messages), REFRESH_CONCURRENCY, async (id) => {
+    if (id === active) return;
+    try {
+      const items = await fetchSessionMessages(id);
+      setState("messages", id, buildMessages(items));
+      setState("messagesLoaded", id, true);
+    } catch {
+      /* keep stale; reopening re-snapshots */
+    }
+  });
 }
 
 let es: EventSource | null = null;
