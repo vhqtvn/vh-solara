@@ -1516,7 +1516,11 @@ body {
   animation: pulse 1.1s ease-in-out infinite;
 }
 .tool-sub-spin {
-  display: inline-flex; align-items: center; flex: 0 0 auto; margin-left: 6px;
+  /* flex: 0 1 auto + min-width: 0 so this nested flex can give way in the
+     .tool-head row when its .tool-sub-verb is long, instead of shoving the
+     .tool-jump fork off the line. The Spinner child keeps its size (it has a
+     min-content floor); only the verb shrinks/truncates. */
+  display: inline-flex; align-items: center; flex: 0 1 auto; min-width: 0; margin-left: 6px;
   color: var(--accent);
 }
 /* Rich activity verb for a working task-tool subagent ("Reading parser.go"),
@@ -1529,6 +1533,17 @@ body {
   color: var(--accent);
   white-space: nowrap;
   margin-left: 5px;
+  /* Truncate instead of overflowing the .tool-head row (mirrors .tool-subject).
+     flex: 0 1 auto → take natural width but allow shrink; min-width: 0 drops
+     the nowrap min-content floor so the row can reclaim space; max-width caps
+     a very long verb (e.g. a streamed bash command) so it never dominates the
+     row even when room exists. overflow+ellipsis do the visual clip. The full
+     verb stays accessible via .tool-sub-spin's data-tip/aria-label. */
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 40ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .tool-open {
   display: inline-flex; align-items: center; color: var(--fg-dim);
