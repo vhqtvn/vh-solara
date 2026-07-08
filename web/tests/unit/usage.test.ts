@@ -74,6 +74,17 @@ describe("turnStats", () => {
     expect(s.ttftMs).toBe(250); // reasoning (250), not tool (100) or text (500)
   });
 
+  it("clamps TTFT to 0 when the earliest part start precedes info.time.created (clock skew)", () => {
+    const m = mk(
+      [{ id: "p1", type: "text", text: "hi", time: { start: 999_900 } }],
+      { time: { created: 1_000_000, completed: 1_005_000 }, tokens: { output: 100 } },
+    );
+    const s = turnStats(m)!;
+    expect(s.ttftMs).toBe(0); // clamped, not −100 and not null
+    // tok/s still derived from the valid completed − created duration (5s)
+    expect(s.tokPerSec).toBeCloseTo(20, 5); // 100 / 5s
+  });
+
   it("returns null for a user message", () => {
     const m = mk([], { role: "user", time: { created: 1, completed: 2 } });
     expect(turnStats(m)).toBeNull();

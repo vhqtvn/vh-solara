@@ -69,7 +69,7 @@ export function turnStats(m: MessageView): TurnStats | null {
     const s = p.time?.start;
     if (typeof s === "number" && (firstStart === null || s < firstStart)) firstStart = s;
   }
-  const ttftMs = firstStart !== null ? firstStart - created : null;
+  const ttftMs = firstStart !== null ? Math.max(0, firstStart - created) : null;
 
   const output = info.tokens?.output;
   const durMs = completed - created; // full turn (completed − created)
