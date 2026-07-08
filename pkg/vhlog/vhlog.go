@@ -6,6 +6,9 @@
 //
 // Without it, only Info/Warn/Error are emitted; Debug is dropped. Output goes to
 // stderr alongside the daemon's existing log.Printf lines.
+//
+// A local debug-configured binary (see `make build-debug`) forces debug on at
+// build time via ldflags, so VH_DEBUG=1 isn't needed; the env var still wins.
 package vhlog
 
 import (
@@ -14,7 +17,12 @@ import (
 	"strings"
 )
 
-var debugOn = parseEnabled(os.Getenv("VH_DEBUG"))
+// debugForced is stamped to "1" via -ldflags for a local debug-configured
+// build (see `make build-debug`) so debug tracing is on without VH_DEBUG=1.
+// The VH_DEBUG env var still wins as an additional override.
+var debugForced = "0"
+
+var debugOn = parseEnabled(os.Getenv("VH_DEBUG")) || parseEnabled(debugForced)
 
 func parseEnabled(v string) bool {
 	switch strings.ToLower(strings.TrimSpace(v)) {

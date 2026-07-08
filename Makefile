@@ -3,7 +3,7 @@
 # gitignored staging dir (web/dist-build); embed-producing targets materialize
 # (copy) the staged bundle into pkg/web/dist right before `go build`.
 
-.PHONY: web web-materialize build install test test-web e2e e2e-keep docker fixtures bench
+.PHONY: web web-materialize build build-debug install test test-web e2e e2e-keep docker fixtures bench
 
 web: ## Build the SolidJS UI into the staging dir web/dist-build (gitignored, NOT pkg/web/dist)
 	cd web && npm install && npm run build
@@ -13,6 +13,9 @@ web-materialize: web ## Copy staged SPA (web/dist-build) into the Go embed dir p
 
 build: web-materialize ## Build the vh-solara binary (single file, UI embedded via go:embed)
 	go build -o vh-solara .
+
+build-debug: web-materialize ## Build a local debug binary: debug logging forced on (no VH_DEBUG=1 needed); mirrors the cmd.Version ldflags pattern
+	go build -ldflags "-X github.com/vhqtvn/vh-solara/pkg/vhlog.debugForced=1" -o vh-solara .
 
 install: web-materialize ## Build the UI then `go install` the single embedded binary into GOBIN
 	go install .
