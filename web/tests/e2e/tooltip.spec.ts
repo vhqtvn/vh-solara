@@ -69,3 +69,88 @@ test("a short tooltip is centred over its anchor", async ({ page }) => {
   const tipCentre = box.x + box.width / 2;
   expect(Math.abs(tipCentre - anchorCentre)).toBeLessThanOrEqual(2);
 });
+
+// Injects a NESTED data-tip pair (outer button > inner span) at fixed coords.
+async function probeNested(page: import("@playwright/test").Page) {
+  await page.evaluate(() => {
+    document.getElementById("tip-probe")?.remove();
+    const outer = document.createElement("button");
+    outer.id = "tip-outer";
+    outer.setAttribute("data-tip", "OUTER");
+    outer.textContent = "outer label "; // padding so part of outer is not under inner
+    Object.assign(outer.style, {
+      position: "fixed",
+      zIndex: "999",
+      top: "120px",
+      left: "300px",
+      width: "220px",
+      height: "60px",
+      display: "block",
+    });
+    const inner = document.createElement("span");
+    inner.id = "tip-inner";
+    inner.setAttribute("data-tip", "INNER");
+    inner.textContent = "inner";
+    Object.assign(inner.style, {
+      display: "inline-block",
+      width: "50px",
+      height: "24px",
+      background: "#f00",
+    });
+    outer.appendChild(inner);
+    document.body.appendChild(outer);
+  });
+}
+
+test("nested data-tip: hovering the inner element shows the inner tip", async ({ page }) => {
+  await probeNested(page);
+  const bubble = page.locator(".tooltip");
+  // Hover the inner span's centre -> should show INNER (not OUTER).
+  await page.locator("#tip-inner").hover();
+  await expect(bubble).toBeVisible();
+  await expect(bubble).toHaveText("INNER");
+  // Move onto the outer button, at a point NOT over the inner span -> OUTER.
+  await page.locator("#tip-outer").hover({ position: { x: 200, y: 30 } });
+  await expect(bubble).toHaveText("OUTER");
+  // Back onto the inner span -> INNER again (verifies re-entry promotes).
+  await page.locator("#tip-inner").hover();
+  await expect(bubble).toHaveText("INNER");
+});
+
+// Regression guard for the nested-tip promotion. The delegated `onOut` resolves
+// the destination's own `data-tip`, so promotion does NOT depend on a follow-up
+// `pointerover` reaching the document handler. Here the inner span intercepts
+// its own `pointerover` (stopPropagation) so it never bubbles to the delegated
+// listener — exactly the case where the old contains-guard left OUTER stuck.
+test("nested data-tip promotes even when the inner pointerover is intercepted", async ({ page }) => {
+  await page.evaluate(() => {
+    document.getElementById("tip-probe")?.remove();
+    const outer = document.createElement("button");
+    outer.id = "tip-outer";
+    outer.setAttribute("data-tip", "OUTER");
+    outer.textContent = "outer label ";
+    Object.assign(outer.style, {
+      position: "fixed", zIndex: "999", top: "180px", left: "300px",
+      width: "220px", height: "60px", display: "block",
+    });
+    const inner = document.createElement("span");
+    inner.id = "tip-inner";
+    inner.setAttribute("data-tip", "INNER");
+    inner.textContent = "inner";
+    Object.assign(inner.style, {
+      display: "inline-block", width: "50px", height: "24px", background: "#f00",
+    });
+    // Swallow the follow-up pointerover so it never reaches the delegated
+    // document handler (mimics stopPropagation / suppressed delivery).
+    inner.addEventListener("pointerover", (e) => e.stopPropagation());
+    outer.appendChild(inner);
+    document.body.appendChild(outer);
+  });
+  const bubble = page.locator(".tooltip");
+  // Land on OUTER first, then traverse onto the inner span.
+  await page.locator("#tip-outer").hover({ position: { x: 200, y: 30 } });
+  await expect(bubble).toHaveText("OUTER");
+  await page.locator("#tip-inner").hover();
+  // onOut must switch to INNER even though inner's pointerover was intercepted.
+  await expect(bubble).toHaveText("INNER");
+});

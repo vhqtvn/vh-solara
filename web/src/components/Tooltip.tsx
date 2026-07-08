@@ -69,8 +69,22 @@ export default function Tooltip() {
   });
   const onOut = (e: PointerEvent | FocusEvent) => {
     if (!current) return;
-    const to = (e as any).relatedTarget as Node | null;
-    if (to && current.contains(to)) return; // moved within the same element
+    const to = (e as any).relatedTarget as HTMLElement | null;
+    // Resolve where the pointer/focus is going. If it lands on a *different*
+    // tipped element (e.g. a nested `data-tip` descendant), switch to it right
+    // now instead of waiting for the follow-up `pointerover` — that follow-up
+    // is not guaranteed to reach this delegated handler (it can be intercepted
+    // by a stopPropagation on the way up, or suppressed by a browser quirk),
+    // which left the outer tip stuck. If it's the same tip (moved within the
+    // same tipped element / to a non-tipped descendant of it), keep it.
+    const next = to?.closest?.("[data-tip]") as HTMLElement | null;
+    if (next) {
+      if (next !== current) {
+        current = next;
+        show(next);
+      }
+      return;
+    }
     hide();
   };
 
