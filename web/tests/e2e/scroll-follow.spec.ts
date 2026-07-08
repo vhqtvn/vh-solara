@@ -282,17 +282,19 @@ test("focus mode hides the Latest button (focus gate reactivity)", async ({ page
 // (6) Regression: scrolling back to the bottom after scrolling up MUST flip the
 //     "↓ Latest" button back to the "Live" pill.
 //
-// The onScrolled self-pin guard bails when scrollEl.scrollTop === pinnedTop
-// (pinnedTop is the clamp the last programmatic pin() wrote, i.e. the bottom).
-// That bail is a perf optimization for our OWN pins while following — without
-// it, every streamed pin re-runs nearBottom/ack/navigator per frame. But the
-// bail used to fire even when following was FALSE: a user who scrolled up
-// (following=false → Latest button) and then scrolled back to the bottom landed
-// on the SAME scrollTop as the last pin (no new content since → scrollHeight
-// unchanged → same clamp), so onScrolled bailed before setFollowing(true) ran,
-// following stayed false, and the Live pill never came back — the Latest button
-// was stuck up forever. The guard now also requires `&& following()`, so it only
-// short-circuits the exact case it exists for (our own pin while glued).
+// The onScrolled self-pin guard bails when the current scrollTop is within 1px
+// of `pinnedGeom.scrollTop` (pinnedGeom.scrollTop is the clamp the last
+// programmatic pin() wrote, i.e. the bottom). That bail is a perf optimization
+// for our OWN pins while following — without it, every streamed pin re-runs
+// nearBottom/ack/navigator per frame. But in the old single-axis sentinel model
+// (pre-reducer, `pinnedTop`) the bail used to fire even when following was FALSE:
+// a user who scrolled up (following=false → Latest button) and then scrolled back
+// to the bottom landed on the SAME scrollTop as the last pin (no new content
+// since → scrollHeight unchanged → same clamp), so onScrolled bailed before
+// setFollowing(true) ran, following stayed false, and the Live pill never came
+// back — the Latest button was stuck up forever. The guard now also requires
+// `&& following()`, so it only short-circuits the exact case it exists for (our
+// own pin while glued).
 //
 // Reproduction avoids openDemo on purpose: openDemo's click-based re-glue is the
 // documented detach-prone flaky spot (see the focus-mode test NOTE above — the RO
@@ -301,12 +303,12 @@ test("focus mode hides the Latest button (focus gate reactivity)", async ({ page
 // clamp value so the scroll-back lands on the EXACT scrollTop pin() wrote. The
 // demo transcript is small and static (no streaming), and Deferred rows mount
 // once and never unmount, so scrollHeight is stable and the clamp matches
-// pinnedTop on the way back down.
+// pinnedGeom.scrollTop on the way back down.
 test("scrolling back to the bottom flips Latest → Live", async ({ page }) => {
   // beforeEach loaded demo (VP + absorbed any leaked stall goroutine).
 
   // Glue to the tail deterministically. The RO path pins while following=true,
-  // arming pinnedTop to this bottom clamp; capture it so the scroll-back below
+  // arming pinnedGeom.scrollTop to this bottom clamp; capture it so the scroll-back below
   // lands on the exact value pin() wrote.
   const bottomClamp = await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
     el.scrollTop = el.scrollHeight;
@@ -321,7 +323,7 @@ test("scrolling back to the bottom flips Latest → Live", async ({ page }) => {
   await expect(page.locator("button.jump")).toBeVisible({ timeout: 3000 });
   await expect(page.locator(".chat-live")).toHaveCount(0);
 
-  // Scroll back to the EXACT clamp the last pin() wrote (== pinnedTop). The OLD
+  // Scroll back to the EXACT clamp the last pin() wrote (== pinnedGeom.scrollTop). The OLD
   // guard bailed here with following still false; with the `&& following()` fix,
   // onScrolled runs → nearBottom() true → setFollowing(true).
   await setScrollTop(page, bottomClamp);
@@ -335,21 +337,28 @@ test("scrolling back to the bottom flips Latest → Live", async ({ page }) => {
 //     the tail) must NOT drop `following`. The Live pill must persist and the
 //     Latest button must stay absent.
 //
-// Root cause this guards: the ResizeObserver re-pin guard in ChatView reads
-// `scrollTop < pinnedTop` as "the user scrolled up since our last pin → drop
-// following and let their position win" (the documented "↓ Latest" race fix).
-// But a content SHRINK also clamps `scrollTop` below `pinnedTop` with NO user
-// intent: when content above/around the viewport shrinks, the browser clamps
-// `scrollTop` down to the new (smaller) max bottom. The guard then wrongly set
-// `following=false`, refused to re-pin, and subsequent streaming content drifted
-// off-screen — Live was lost on a mere layout shrink.
+// Root cause this guards (HISTORICAL — the old `pinnedTop`/`pinnedScrollHeight`
+// single-axis sentinel, pre-reducer): the ResizeObserver re-pin guard in
+// ChatView read `scrollTop < pinnedTop` as "the user scrolled up since our last
+// pin → drop following and let their position win" (the documented "↓ Latest"
+// race fix). But a content SHRINK also clamped `scrollTop` below `pinnedTop`
+// with NO user intent: when content above/around the viewport shrinks, the
+// browser clamps `scrollTop` down to the new (smaller) max bottom. The guard
+// then wrongly set `following=false`, refused to re-pin, and subsequent
+// streaming content drifted off-screen — Live was lost on a mere layout shrink.
+// (The current code uses `pinnedGeom` + the dual-axis `classifyScrollDelta`
+// reducer, which decomposes content-delta + viewport-delta + clamp and treats
+// genuine user scroll-intent as the RESIDUAL — a pure shrink with no residual no
+// longer flips following. This test still pins the regression so a future change
+// that re-introduces a single-axis guard cannot slip it back.)
 //
 // Real triggers: a reasoning/thinking block collapsing the instant it stops
 // being the tail (expanded only while tail — body up to 320px), a tool part
 // collapsing on de-tail (same `!!props.tail` pattern in Part.tsx), or the
 // raw→rendered-HTML swap landing shorter than the raw stream. All three shrink
-// `.chat-content` (the element the RO observes), so the guard sees the same
-// `scrollTop < pinnedTop` dip each time.
+// `.chat-content` (the element the RO observes), so the old guard saw the same
+// `scrollTop < pinnedTop` dip each time (the current reducer decomposes the
+// shrink as a content-delta instead).
 //
 // WHY A GENERIC SHRINK (not a real reasoning→text de-tail stream): the fixture
 // backend (pkg/fixtures/opencode.go simulatePrompt/streamAssistant) ONLY streams
@@ -363,23 +372,27 @@ test("scrolling back to the bottom flips Latest → Live", async ({ page }) => {
 //
 // WHY THE SHRINK IS GRADUAL (multi-frame), NOT a single discrete removal: the
 // real reasoning/tool collapse is a CSS grid TRANSITION (`.disclosure`
-// grid-template-rows: 1fr→0fr) that shrinks over multiple animation frames. A
-// single DISCRETE removal (e.g. `el.remove()` in one step) is VACUOUS here — its
-// ResizeObserver notification for that one step reads the PRE-clamp scrollTop
-// (still === pinnedTop), so `scrollTop < pinnedTop` is false, the guard takes
-// the else→pin() branch, pinnedTop stays correct, and even a pure shrink
-// self-heals via onScrolled (nearBottom after the clamp → setFollowing(true)).
-// The GRADUAL sequence matches the real transition's timing: on each intermediate
-// frame the browser clamps scrollTop in layout BEFORE the RO notification fires,
-// so the guard observes a POST-clamp `scrollTop < pinnedTop` on every step. With
-// the bug, that fired setFollowing(false) on each step (re-armed by onScrolled
-// while still at the bottom, so the break was hidden during the shrink) but pin()
-// NEVER ran, leaving pinnedTop STALE at the tall pre-shrink value. The very next
-// GROWTH frame then saw `scrollTop < stale-pinnedTop`, fired setFollowing(false)
+// grid-template-rows: 1fr→0fr) that shrinks over multiple animation frames. In
+// the old single-axis model a single DISCRETE removal (e.g. `el.remove()` in one
+// step) was VACUOUS here — its ResizeObserver notification for that one step
+// read the PRE-clamp scrollTop (still === pinnedTop), so `scrollTop < pinnedTop`
+// was false, the guard took the else→pin() branch, pinnedTop stayed correct, and
+// even a pure shrink self-healed via onScrolled (nearBottom after the clamp →
+// setFollowing(true)). The GRADUAL sequence matched the real transition's
+// timing: on each intermediate frame the browser clamps scrollTop in layout
+// BEFORE the RO notification fires, so the old guard observed a POST-clamp
+// `scrollTop < pinnedTop` on every step. With the bug, that fired
+// setFollowing(false) on each step (re-armed by onScrolled while still at the
+// bottom, so the break was hidden during the shrink) but pin() NEVER ran,
+// leaving pinnedTop STALE at the tall pre-shrink value. The very next GROWTH
+// frame then saw `scrollTop < stale-pinnedTop`, fired setFollowing(false)
 // WITHOUT pinning, and growth doesn't move scrollTop so no scroll event fired to
 // re-arm following — the viewport drifted off the tail and the Latest button
-// appeared. That grow-after-gradual-shrink is the precise failure mode this test
-// pins down, and it requires the multi-frame shrink to arm the stale pinnedTop.
+// appeared. That grow-after-gradual-shrink was the precise failure mode this
+// test pins down, and it required the multi-frame shrink to arm the stale
+// pinnedTop. (Under the current reducer the stale-sentinel path no longer exists
+// — content-delta is decomposed each fire — but the gradual reproduction still
+// exercises the same RO cadence so the guard stays honest.)
 //
 // Like tests (5) and (6), this deliberately avoids openDemo()'s detach-prone
 // click-based re-glue (the documented flaky spot in this suite) and glues to the
@@ -388,9 +401,9 @@ test("a content shrink while Live keeps following (no false user-scroll-up)", as
   // beforeEach loaded demo (VP + absorbed any leaked stall goroutine).
 
   // Glue to the tail deterministically (app's onScrolled sets following=true near
-  // the bottom). This arms pinnedTop/pinnedScrollHeight to the current content
-  // via the RO's first pin(). Glued to the tail, Latest button absent. The
-  // .chat-live pill hides on the idle demo (working()=false), so assert geometry.
+  // the bottom). This arms pinnedGeom to the current content via the RO's first
+  // pin(). Glued to the tail, Latest button absent. The .chat-live pill hides on
+  // the idle demo (working()=false), so assert geometry.
   await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
     el.scrollTop = el.scrollHeight;
   });
@@ -398,8 +411,9 @@ test("a content shrink while Live keeps following (no false user-scroll-up)", as
 
   // Append a tall block to .chat-content (the RO-observed element). The RO fires,
   // following is true, so pin() re-glues to the new bottom and arms the tall
-  // pinnedScrollHeight we need for the subsequent shrink to register as `shrank`.
-  // Poll until the app has caught up (scrollTop is back within 24px of bottom).
+  // pinnedGeom.scrollHeight we need for the subsequent shrink to register as a
+  // negative content-delta in the reducer. Poll until the app has caught up
+  // (scrollTop is back within 24px of bottom).
   await page.locator(".chat-content").evaluate((el: HTMLElement) => {
     const t = document.createElement("div");
     t.id = "__e2e_shrink_block";
@@ -421,10 +435,10 @@ test("a content shrink while Live keeps following (no false user-scroll-up)", as
   // injected block's height through [500,400,300,200,100,0], waiting 2 rAFs +
   // 30ms between steps (matches the .disclosure grid-transition cadence). On
   // each step the browser clamps scrollTop in layout before the RO fires, so the
-  // guard sees post-clamp `scrollTop < pinnedTop`. With the bug this set
-  // following=false every step (re-armed by onScrolled) but never ran pin(),
-  // leaving pinnedTop STALE at the tall pre-shrink value — which the growth
-  // below then exposes.
+  // old single-axis guard saw post-clamp `scrollTop < pinnedTop`. With the bug
+  // this set following=false every step (re-armed by onScrolled) but never ran
+  // pin(), leaving pinnedTop STALE at the tall pre-shrink value — which the
+  // growth below then exposed.
   await page.locator("#__e2e_shrink_block").evaluate(
     (el: HTMLElement) =>
       new Promise<void>((resolve) => {
@@ -443,12 +457,14 @@ test("a content shrink while Live keeps following (no false user-scroll-up)", as
   );
 
   // GROW, one frame at a time (append six 60px blocks, 2 rAFs + 30ms apart).
-  // With the bug: pinnedTop is stale (tall), so each growth frame's RO callback
-  // sees `scrollTop < pinnedTop` and sets following=false WITHOUT pinning; growth
-  // doesn't move scrollTop, so no scroll event fires to re-arm following → the
-  // viewport drifts off the tail and the Latest button appears. With the fix:
-  // pin() ran on the shrink frames, keeping pinnedTop tracking the smaller max,
-  // so growth is followed and Live persists.
+  // With the old sentinel bug: pinnedTop was stale (tall), so each growth frame's
+  // RO callback saw `scrollTop < pinnedTop` and set following=false WITHOUT
+  // pinning; growth doesn't move scrollTop, so no scroll event fired to re-arm
+  // following → the viewport drifted off the tail and the Latest button appeared.
+  // With the fix: pin() ran on the shrink frames, keeping pinnedTop tracking the
+  // smaller max, so growth was followed and Live persisted. (Under the current
+  // reducer the content-delta + clamp are decomposed each fire so this stale path
+  // can't recur — the test still drives the cadence as a regression guard.)
   await page.locator(".chat-content").evaluate(
     (el: HTMLElement) =>
       new Promise<void>((resolve) => {
@@ -812,38 +828,43 @@ test("reopen of a busy session at a stored anchor is not yanked to the tail", as
 // (13) Tab resume must re-engage Live after a hidden content reshuffle.
 //
 // This is the deterministic reproduction of the reported "Live stops after some
-// time, around tab resume" failure. Root cause: while the tab is hidden the
-// browser suppresses ResizeObserver delivery (it queues + coalesces callbacks
-// until the tab returns), but Solid reactivity + layout still run, so a turn can
-// settle (raw md-stream → compact MarkdownHtml swap, a shrink) and new content
-// can regrow it. If an intermediate settle-shrink clamped scrollTop DOWN and
-// content then regrew so the NET scrollHeight is back to ≈ its pre-hidden value,
-// the single coalesced RO callback delivered on resume sees `scrollTop <
-// pinnedTop` (clamped) with `!shrank` (net grew/not-shrunk vs the stale pre-
-// hidden pin) — the contentEl ResizeObserver guard at ChatView.tsx then
-// mis-classifies this as a genuine user scroll-up: setFollowing(false) +
+// time, around tab resume" failure. Root cause (HISTORICAL — the old
+// `pinnedTop`/`pinnedScrollHeight` single-axis sentinel, pre-reducer): while the
+// tab is hidden the browser suppresses ResizeObserver delivery (it queues +
+// coalesces callbacks until the tab returns), but Solid reactivity + layout still
+// run, so a turn can settle (raw md-stream → compact MarkdownHtml swap, a
+// shrink) and new content can regrow it. If an intermediate settle-shrink
+// clamped scrollTop DOWN and content then regrew so the NET scrollHeight is back
+// to ≈ its pre-hidden value, the single coalesced RO callback delivered on
+// resume saw `scrollTop < pinnedTop` (clamped) with `!shrank` (net grew/not-
+// shrunk vs the stale pre-hidden pin) — the contentEl ResizeObserver guard then
+// mis-classified this as a genuine user scroll-up: setFollowing(false) +
 // setUserScrolledUp(true) (intent latch ARMED). Because the latch is armed the
 // self-heal effect (the only auto-re-engage, fires on the working() false→true
-// edge gated by !userScrolledUp()) cannot recover it — Live stays dead until the
-// user manually scrolls back / clicks "↓ Latest" / a new turn clears it.
+// edge gated by !userScrolledUp()) could not recover it — Live stayed dead until
+// the user manually scrolled back / clicked "↓ Latest" / a new turn cleared it.
 //
 // The fix is an additive `visibilitychange` listener in ChatView: on tab →
 // visible, if ready() and the intent latch is NOT set, re-engage following +
 // re-pin. visibilitychange dispatches BEFORE the rendering step where the queued
-// RO delivers, so the re-pin refreshes pinnedTop/pinnedScrollHeight to the
-// CURRENT post-hidden state first; the guard then sees scrollTop===pinnedTop and
-// re-pins cleanly instead of tripping on the stale pre-hidden baseline.
+// RO delivers, so the re-pin refreshes the geometry baseline (`pinnedGeom`) to
+// the CURRENT post-hidden state first; the reducer then sees a residual within
+// epsilon and re-pins cleanly instead of tripping on the stale pre-hidden
+// baseline. (The listener predates the reducer and originally refreshed the
+// single-axis `pinnedTop`/`pinnedScrollHeight`; the baseline name changed to
+// `pinnedGeom` but the "refresh-before-queued-RO-delivers" contract is
+// unchanged.)
 //
 // Reproduction strategy: a real tab-hide is not feasible from Playwright
 // (document.hidden is OS-driven, read-only), so we SIMULATE the hidden→resume
 // coalesced-RO geometry in one synchronous evaluate script:
-//   1. Glue to the tail + append a tall block (RO pins → armed tall pinnedTop).
+//   1. Glue to the tail + append a tall block (RO pins → armed tall pinnedGeom).
 //   2. SYNCHRONOUSLY shrink the block to 0 (layout clamps scrollTop DOWN to the
 //      shorter max) then regrow it to a NEW larger size (scrollTop stays at the
-//      clamped value; net scrollHeight is now LARGER than pinnedScrollHeight).
+//      clamped value; net scrollHeight is now LARGER than pinnedGeom.scrollHeight).
 //      RO callbacks are delivered asynchronously (after the script, before
-//      paint), so the guard sees only the NET result with a STALE pinnedTop —
-//      exactly the coalesced geometry a real tab-hide delivers on resume.
+//      paint), so the reducer sees only the NET result against a STALE pinnedGeom
+//      — exactly the coalesced geometry a real tab-hide delivers on resume.
 //   3. INSIDE the same script, AFTER the reshuffle, dispatch a synthetic
 //      `visibilitychange` (resume). In Playwright document.visibilityState is
 //      already "visible", so the fix's listener runs its body and re-pins to the
@@ -853,10 +874,11 @@ test("reopen of a busy session at a stored anchor is not yanked to the tail", as
 // Non-vacuity: the appended tall block + regrow-to-larger forces a NET size
 // change so the RO actually fires (an exactly-net-neutral reshuffle would not
 // deliver an RO callback). The mis-fire geometry — scrollTop well below
-// pinnedTop with !shrank — is the precise condition the guard's `!shrank`
-// discriminator cannot see (it only compares current scrollHeight to the stale
-// pin), which is why test 7's gradual single-step shrink (where pin() runs
-// between steps and keeps pinnedTop fresh) does NOT cover this resume case.
+// pinnedGeom.scrollTop with net content growth — is the precise condition the old
+// `scrollTop < pinnedTop && !shrank` guard could not see (it only compared the
+// current scrollHeight to the stale pin), which is why test 7's gradual single-
+// step shrink (where pin() runs between steps and keeps pinnedGeom fresh) does
+// NOT cover this resume case.
 //
 // This test FAILS before the fix (queued RO mis-fires → following=false →
 // button.jump appears, geometry off the tail) and PASSES after (the listener
@@ -869,9 +891,9 @@ test("tab resume re-engages Live after a hidden content reshuffle", async ({ pag
   });
   await expectFollowingTail(page);
 
-  // Append a tall block so the contentEl RO pins a TALL pinnedTop/pinnedScroll-
-  // Height — the "pre-hidden baseline" we then go stale against. Poll until the
-  // app has re-glued (scrollTop back within 24px of the bottom).
+  // Append a tall block so the contentEl RO pins a TALL pinnedGeom — the
+  // "pre-hidden baseline" we then go stale against. Poll until the app has
+  // re-glued (scrollTop back within 24px of the bottom).
   await page.locator(".chat-content").evaluate((el: HTMLElement) => {
     const t = document.createElement("div");
     t.id = "__e2e_resume_block";
@@ -898,14 +920,17 @@ test("tab resume re-engages Live after a hidden content reshuffle", async ({ pag
   // scrollEl.scrollHeight between the writes forces layout, which realizes the
   // shrink and clamps scrollTop DOWN to the shorter max; the subsequent regrow
   // to 700 (LARGER than the 600 baseline) leaves scrollTop at the clamped value
-  // while net scrollHeight exceeds pinnedScrollHeight. The RO that fires after
-  // this script then sees `scrollTop < pinnedTop && !shrank` — the mis-fire.
+  // while net scrollHeight exceeds the baseline pinnedGeom.scrollHeight. The RO
+  // that fires after this script then sees scrollTop below the baseline with net
+  // content growth — the stale-baseline mis-fire (in the old single-axis model
+  // this read as `scrollTop < pinnedTop && !shrank`).
   //
   // Dispatching visibilitychange at the END (still synchronous, before the RO
   // delivers) is the simulated resume: with the fix the listener re-pins to the
-  // post-reshuffle state first, so the guard sees scrollTop===pinnedTop and
-  // re-pins cleanly; without the fix the dispatch is inert and the queued RO
-  // mis-fires (following=false + latch armed).
+  // post-reshuffle state first, so the reducer sees a residual within epsilon
+  // (scrollTop ≈ pinnedGeom.scrollTop) and re-pins cleanly; without the fix the
+  // dispatch is inert and the queued RO mis-fires (following=false + latch
+  // armed).
   await page.evaluate(() => {
     const block = document.getElementById("__e2e_resume_block") as HTMLElement;
     const scroll = document.querySelector(".chat-scroll") as HTMLElement;
