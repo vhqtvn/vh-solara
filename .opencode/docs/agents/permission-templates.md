@@ -4,9 +4,18 @@ These templates are intended for `opencode.jsonc` hardening.
 
 ## 1) Read-only observer template
 
+The `edit` block here is the shape the permconfig emitter produces for every
+read-only (deny) agent: a broad `deny` first, then the universal `tmp/**`
+allow last. `tmp/` is gitignored and watcher-ignored, so it is the sanctioned
+disposable-scratch surface every agent may Write without a prompt while every
+other edit decision stays denied (findLast — last match wins).
+
 ```jsonc
 {
-  "edit": "deny",
+  "edit": {
+    "*": "deny",
+    "tmp/**": "allow"
+  },
   "webfetch": "deny",
   "task": {
     "*": "deny",

@@ -610,6 +610,102 @@ export function isEnvPrefixedDevShExec(cmd) {
     return stripped === PREFIX || stripped.startsWith(PREFIX + " ");
 }
 
+// F1: detect a WRAPPED git mutation routed through `vh-agent-harness exec` (or
+// exec-ro) with a global flag between `git` and the verb — e.g.
+// `vh-agent-harness exec git --no-pager commit`, `exec git -C /x push`,
+// `exec git --git-dir=/x commit`. The bare adjacency regex
+// (`git-mutation-bypass` in forbidden-patterns) cannot match this form because
+// the flag breaks `\bgit\s+<verb>` adjacency, so a wrapped mutation slips past
+// the harness branch's allow. This guard closes that bypass for WRAPPED
+// payloads ONLY:
+//   - It does NOT touch direct `vh-agent-harness git …` (already denied at the
+//     startsWith("vh-agent-harness git ") branch above evaluate's harness
+//     branch — no double-deny, no conflict).
+//   - It does NOT touch non-wrapped git (handled by the per-command walker
+//     later in evaluate).
+//   - It does NOT surface walkGitGlobals' relative-`-C` deny or path
+//     classification here: exec is a TRUST layer meant to allow arbitrary
+//     non-git commands; this guard plugs the mutation hole ONLY.
+//
+// Reuses walkGitGlobals (verb extraction past global flags) and
+// GIT_MUTATION_VERBS (single source of truth) — NO new parser, NO regex, NO
+// local verb copy. Returns a `{ action, reason }` deny object or null (caller
+// falls through to the existing allow on null).
+//
+// Wrapper-flag semantics mirror cobra's exec flag table in
+// internal/cli/exec_shell.go (SetInterspersed(false) stops flag parsing at the
+// first positional, so wrapper flags must precede the payload):
+//   --service <v> | --service=<v>           (StringVar)
+//   --workdir <v> | --workdir=<v> | -w <v> | -w<v>  (StringVarP)
+//   --tty | -t                               (BoolVarP)
+//   --                                       (options terminator)
+// exec-ro accepts only an optional `--` (no service/workdir/tty flags).
+export function detectWrappedGitMutation(normalizedCmd, cwd) {
+    const commands = fallbackParse(normalizedCmd);
+    if (commands.length === 0) return null;
+    const tokens = commands[0];
+    if (tokens.length < 2) return null;
+    if (tokens[0] !== "vh-agent-harness") return null;
+    const wrapper = tokens[1];
+    if (wrapper !== "exec" && wrapper !== "exec-ro") return null;
+
+    let i = 2;
+    if (wrapper === "exec") {
+        // Skip harness wrapper flags before the payload command. An
+        // unrecognized token is treated as the start of the payload (cobra
+        // stops flag parsing at the first positional).
+        while (i < tokens.length) {
+            const tok = tokens[i];
+            if (tok === "--") { i++; break; }
+            if (tok === "--service" || tok === "--workdir" || tok === "-w") {
+                // Value in the NEXT token.
+                i += 2;
+                continue;
+            }
+            if (tok.startsWith("--service=") || tok.startsWith("--workdir=")) {
+                i += 1;
+                continue;
+            }
+            if (tok.startsWith("-w") && tok.length > 2) {
+                // Stuck form `-w<value>`.
+                i += 1;
+                continue;
+            }
+            if (tok === "--tty" || tok === "-t") {
+                i += 1;
+                continue;
+            }
+            // Not a recognized wrapper flag: payload starts here.
+            break;
+        }
+    } else {
+        // exec-ro: skip an optional options terminator only.
+        if (tokens[i] === "--") i++;
+    }
+
+    const payload = tokens.slice(i);
+    if (payload.length === 0 || payload[0] !== "git") return null;
+
+    const w = walkGitGlobals(payload, cwd);
+    // Mutation-slip guard ONLY. Do NOT surface w.deny (relative -C) or
+    // path-classify here — exec is a trust layer; this plugs the mutation
+    // hole only. Read-only git verbs and non-git payloads fall through.
+    if (w.verb && GIT_MUTATION_VERBS.includes(w.verb)) {
+        return {
+            action: "deny",
+            reason:
+                "Blocked by shell-guard rule 'git-mutation-bypass': " +
+                "Git mutations must go through the commit-gate wrapper. " +
+                "Only the committer agent (C) may execute git writes, " +
+                "and only through `.opencode/scripts/commit-gate.sh`. " +
+                "See .opencode/docs/git-execution-routing.md." +
+                " (Wrapped `vh-agent-harness " + wrapper + " git …` routed verb '" +
+                w.verb + "' past a global flag.)",
+        };
+    }
+    return null;
+}
+
 function isAllowedCommand(tokens) {
     const stripped = stripLeadingEnvVars(tokens);
     if (stripped.length === 0) return false;
@@ -717,6 +813,18 @@ export async function evaluate(command, commandCwd) {
                     ".opencode/scripts/commit-gate.sh acquire --paths '<JSON>' " +
                     "--message-file tmp/commit-gate-message/msg-${UUID} --session-alias ALIAS",
             };
+        }
+
+        // F1: detect a WRAPPED git mutation routed past a global flag
+        // (`vh-agent-harness exec git --no-pager commit`,
+        // `exec git -C /x push`, `exec git --git-dir=/x commit`). The adjacency
+        // regex cannot match a flag between `git` and the verb; this guard
+        // closes the bypass for WRAPPED payloads only. Reuses walkGitGlobals +
+        // GIT_MUTATION_VERBS — no regex, no local verb copy. Read-only git and
+        // non-git payloads fall through to the existing allow.
+        const wrappedMutation = detectWrappedGitMutation(normalizedCmd, cwd);
+        if (wrappedMutation) {
+            return wrappedMutation;
         }
 
         // harness branch passed: allow (mirrors the plugin's bare `return;`).
