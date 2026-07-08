@@ -37,6 +37,8 @@ import { log } from "../lib/log";
 import RelTime from "./RelTime";
 import Select from "./Select";
 import { agentDisplay } from "../projectSettings";
+import { fmtTurnStats, turnStats } from "../usage";
+import type { MessageView } from "../types";
 
 const draftKey = (sid: string) => "vh.draft." + sid;
 
@@ -166,6 +168,27 @@ function MessageParts(props: { m: any; isLastMessage: () => boolean; lastActivit
         )
       }
     </For>
+  );
+}
+
+// Per-turn performance (tok/s · TTFT) for a SETTLED assistant turn, behind a
+// hover ⓘ icon so the footer stays clean. Memoized — turnStats only walks parts
+// for a completed assistant message (gated at the call site on role+completed),
+// so it never runs for in-flight turns and never touches the streaming hot loop.
+// The hover surface is a plain delegated `data-tip` tooltip (static text), so it
+// is cheap to render and free of the GPU-punishing patterns (no backdrop-filter,
+// mask-image, or contain) called out for the chat surface.
+function MsgPerf(props: { m: MessageView }) {
+  const tip = createMemo(() => {
+    const s = turnStats(props.m);
+    return s ? fmtTurnStats(s) : "";
+  });
+  return (
+    <Show when={tip()}>
+      <span class="msg-perf" data-tip={tip()} tabindex="0" aria-label="Turn performance">
+        <Icon name="info" size={12} />
+      </span>
+    </Show>
   );
 }
 
@@ -1597,6 +1620,9 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
                   <RelTime class="msg-time" mode="ago" ms={m.info.time?.created} />
                   <Show when={costLabel(m.info)}>
                     <span class="msg-cost">{costLabel(m.info)}</span>
+                  </Show>
+                  <Show when={m.info.role === "assistant" && m.info.time?.completed}>
+                    <MsgPerf m={m} />
                   </Show>
                   <div class="msg-actions">
                     <button type="button" data-tip="Copy" aria-label="Copy" onClick={() => copyMessage(m)}>
