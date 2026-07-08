@@ -545,11 +545,19 @@ func (s *Server) stampMeta(next http.Handler) http.Handler {
 // permission/question reply, archive, restart) whose silent failures are the
 // hard ones to diagnose after the fact. Gated by VH_DEBUG so the default path
 // (and SSE/streaming responses) run completely unwrapped.
+//
+// GET /vh/snapshot is also logged: it is the one-shot snapshot path whose
+// server time is the daemon-side signal for warm-session hydrate latency (the
+// frontend's conn·server·hydrate diagnostic line is the only other signal).
+// GET /vh/stream is intentionally NOT logged — it is a long-lived EventSource,
+// so its dur_ms would be the whole stream lifetime (minutes/hours), useless for
+// measuring first-snapshot latency.
 func logRequests(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := r.URL.Path
 		interesting := strings.HasPrefix(p, "/oc/") ||
-			(strings.HasPrefix(p, "/vh/") && r.Method != http.MethodGet)
+			(strings.HasPrefix(p, "/vh/") && r.Method != http.MethodGet) ||
+			(p == "/vh/snapshot" && r.Method == http.MethodGet)
 		if !vhlog.Enabled() || !interesting {
 			next.ServeHTTP(w, r)
 			return
@@ -757,7 +765,7 @@ type runningWorkspaceInfo struct {
 }
 
 type runningSessionsResp struct {
-	Count      int                   `json:"count"`
+	Count      int                    `json:"count"`
 	Workspaces []runningWorkspaceInfo `json:"workspaces"`
 }
 
