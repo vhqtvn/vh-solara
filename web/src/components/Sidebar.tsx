@@ -11,15 +11,39 @@ import BrandMark from "./BrandMark";
 import Icon from "./Icon";
 import { setView } from "../ui";
 
+// Animated connection-health indicator for the sidebar header (5 states). The
+// markup is constant — 6 layered spans (track / arc / arc.two / core / check /
+// minus); the sole state class on the root drives all color + motion via CSS
+// (see `.status-ind` in styles.css). role="img" + aria-label expose the state
+// to screen readers without a chatty live region (it's read on traversal).
+function StatusIndicator(props: { state: string; tip: string }) {
+  return (
+    <span
+      class="status-ind"
+      classList={{ [props.state]: true }}
+      role="img"
+      aria-label={props.tip}
+      data-tip={props.tip}
+    >
+      <span class="track" />
+      <span class="arc" />
+      <span class="arc two" />
+      <span class="core" />
+      <span class="check" />
+      <span class="minus" />
+    </span>
+  );
+}
+
 export default function Sidebar(props: { open: boolean; onClose: () => void }) {
   const [archivedOpen, setArchivedOpen] = createSignal(false);
-  // Connection-health facets for the status dot. `stale` (Feature 1): the live
-  // stream has gone quiet past the heartbeat window but the socket hasn't
+  // Connection-health facets for the status indicator. `stale` (Feature 1): the
+  // live stream has gone quiet past the heartbeat window but the socket hasn't
   // dropped yet (the watchdog will force a reconnect shortly). `syncing`
   // (Feature 2): data is flowing right now — debounced so per-token events
   // don't flicker, just a subtle pulse while a turn streams. Both read signals
-  // (state.status / healthNow / updating) so the dot re-renders only on real
-  // transitions, not per SSE byte.
+  // (state.status / healthNow / updating) so the indicator re-renders only on
+  // real transitions, not per SSE byte.
   const stale = createMemo(() => isStale());
   const syncing = createMemo(() => isUpdating() && state.status === "live");
   const statusTip = createMemo(() => {
@@ -27,6 +51,19 @@ export default function Sidebar(props: { open: boolean; onClose: () => void }) {
     if (syncing()) return "syncing…";
     if (state.status === "reconnecting") return "reconnecting…";
     return "connection";
+  });
+  // Exactly ONE indicator state class at a time. The indicator draws a check
+  // mark in `live` and a minus in `stale`; the naive classList
+  // ({[status]:true, stale, syncing}) would stack `live`+`stale` (status stays
+  // "live" even while stale/syncing are true) and render BOTH symbols at once.
+  // Collapse to a single state by priority: hard socket states win; within
+  // "live", stale outranks syncing (same ordering as statusTip above).
+  const indState = createMemo(() => {
+    if (state.status === "reconnecting") return "reconnecting";
+    if (state.status === "connecting") return "connecting";
+    if (stale()) return "stale";
+    if (syncing()) return "syncing";
+    return "live";
   });
   // Search is collapsed by default (rarely used, and it costs a whole row). A
   // header toggle reveals it; an active filter keeps it shown so the filter is
@@ -75,13 +112,7 @@ export default function Sidebar(props: { open: boolean; onClose: () => void }) {
         <BrandMark class="brand-mark" />
         <strong>VHSolara</strong>
         <HelpInspector />
-        <span
-          class="status"
-          classList={{ [state.status]: true, stale: stale(), syncing: syncing() }}
-          data-tip={statusTip()}
-        >
-          {state.status}
-        </span>
+        <StatusIndicator state={indState()} tip={statusTip()} />
         <button
           type="button"
           class="icon-btn"

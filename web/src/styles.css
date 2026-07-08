@@ -385,10 +385,10 @@ body {
    only the title gives up space. */
 .sidebar-head .brand-mark,
 .sidebar-head .help-inspect,
-.sidebar-head .status,
+.sidebar-head .status-ind,
 .sidebar-head .icon-btn,
 .sidebar-head .sidebar-close { flex: 0 0 auto; }
-.sidebar-head .status { margin-left: auto; }
+.sidebar-head .status-ind { margin-left: auto; }
 /* When the header is too narrow to fit the title alongside the controls, drop
    the wordmark and keep just the logo — controls always win. The threshold is
    higher on touch because the controls are larger there (see coarse rule below),
@@ -412,32 +412,147 @@ body {
 }
 .help-inspect:active { cursor: grabbing; border-color: var(--accent); color: var(--accent); }
 
-.status {
-  font-size: 11px;
-  padding: 1px 6px;
+/* Connection-health INDICATOR in the sidebar header (replaces the former text
+   pill, then a plain disc). A layered 18px widget: track ring + spinning arc(s)
+   + core + check/minus glyph, with one of five states applied as a sole class
+   on the root (see StatusIndicator / indState in Sidebar.tsx). Adapted from the
+   operator's dark-theme demo for the repo's HEX, multi-theme tokens:
+   • tones — demo --info/--bad/--muted alias to repo --accent/--danger/--fg-dim
+     (--ok/--warn are native). All resolved alpha goes through color-mix, never
+     rgb(var(--tone)/a) (invalid on a hex token). Solid fills use the hex directly.
+   • --track-alpha is expressed as a color-mix PERCENT (not 0..1) so it slots
+     straight into color-mix without a calc() wrapper.
+   • the 1px core ring is derived from --bg (not white) so it reads as a clean
+     core/track separator in both dark and light themes.
+   • --ease + @keyframes spin are REUSED from the repo (not redefined).
+   GPU note: contain:layout paint + translateZ(0) give this its own compositor
+   surface; the arc spin is a transform-only rotate (no repaint), and the mask
+   is STATIC — fundamentally unlike the mask-on-a-scroll-container heat trap
+   (see AGENTS.mission.md). No backdrop-filter / content-visibility. Real
+   Firefox/WebRender heat verification is an operator follow-up (headless can't
+   GPU-rasterize). NB: root class is `.status-ind` — distinct from `.status-dot`
+   (the status-pop corner badge, ~1965) and from `.chat-live` (~1531). */
+.status-ind {
+  --info: var(--accent);
+  --bad: var(--danger);
+  --muted: var(--fg-dim);
+  --tone: var(--muted);
+  --tone-2: var(--tone);
+  --size: 18px;
+  --ring: 2px;
+  --core-size: 7px;
+  --track-alpha: 20%;
+  --arc-opacity: 0;
+  --arc-start: 0deg;
+  --core-opacity: 1;
+  position: relative;
+  display: inline-block;
+  width: var(--size);
+  height: var(--size);
   border-radius: 999px;
-  border: 1px solid var(--border);
-  color: var(--fg-dim);
+  isolation: isolate;
+  contain: layout paint;
+  transform: translateZ(0);
 }
-.status.live { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 70%, var(--border)); }
-.status.reconnecting { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 70%, var(--border)); }
-/* Feature 1 (stale): live socket but no data past the heartbeat window — the
-   watchdog will reconnect shortly. Amber but dimmer than a full reconnect so
-   the two states read distinctly. Opacity-only pulse (small element → cheap,
-   WebRender-safe). */
-.status.stale {
-  color: var(--warn);
-  border-color: color-mix(in srgb, var(--warn) 45%, var(--border));
-  animation: status-sync-pulse 1.6s ease-in-out infinite;
+.status-ind > span {
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  display: block;
+  border-radius: 999px;
+  pointer-events: none;
 }
-/* Feature 2 (syncing): data is flowing right now. A subtle accent pulse only —
-   it must not be noisy. Overrides .live when both apply (defined after it). */
-.status.syncing {
-  color: var(--accent);
-  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
-  animation: status-sync-pulse 1.2s ease-in-out infinite;
+.status-ind .track {
+  width: 100%;
+  height: 100%;
+  border: var(--ring) solid color-mix(in srgb, var(--tone) var(--track-alpha), transparent);
 }
-@keyframes status-sync-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+.status-ind .arc {
+  width: 100%;
+  height: 100%;
+  opacity: var(--arc-opacity);
+  background: conic-gradient(from var(--arc-start), transparent 0 12%, var(--tone) 12% 36%, transparent 36% 100%);
+  -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - var(--ring) - 1px), #000 calc(100% - var(--ring)));
+          mask: radial-gradient(farthest-side, transparent calc(100% - var(--ring) - 1px), #000 calc(100% - var(--ring)));
+}
+.status-ind .arc.two {
+  width: calc(100% - 2px);
+  height: calc(100% - 2px);
+  background: conic-gradient(from calc(var(--arc-start) + 168deg), transparent 0 6%, var(--tone-2) 6% 21%, transparent 21% 100%);
+}
+.status-ind .core {
+  width: var(--core-size);
+  height: var(--core-size);
+  opacity: var(--core-opacity);
+  background: var(--tone);
+  box-shadow: 0 0 0 1px var(--bg), 0 0 14px color-mix(in srgb, var(--tone) 22%, transparent);
+  z-index: 2;
+}
+/* White glyphs sit on a saturated core (--ok/--warn/--danger), so they read in
+   both dark and light themes. Literal rgb(255 255 255 / a) is fine here (not a
+   token). */
+.status-ind .check {
+  width: 5px;
+  height: 9px;
+  z-index: 3;
+  opacity: 0;
+  border-radius: 1px;
+  border-right: 1.8px solid rgb(255 255 255 / .95);
+  border-bottom: 1.8px solid rgb(255 255 255 / .95);
+  transform: translateY(-1px) rotate(42deg) scale(.74);
+}
+.status-ind .minus {
+  width: 7px;
+  height: 2px;
+  z-index: 3;
+  opacity: 0;
+  background: rgb(255 255 255 / .94);
+  transform: scaleX(.58);
+}
+
+/* --- states: exactly ONE applies (indState in Sidebar.tsx collapses stacking) */
+.status-ind.connecting { --tone: var(--info); --track-alpha: 22%; --arc-opacity: 1; }
+.status-ind.connecting .arc { animation: spin 1s linear infinite; }
+.status-ind.connecting .core { animation: sind-pulse-soft 1.18s var(--ease) infinite; }
+
+.status-ind.live { --tone: var(--ok); --core-size: 10px; --track-alpha: 34%; }
+.status-ind.live .track { transform: scale(.92); }
+.status-ind.live .check { opacity: 1; transform: translateY(-1px) rotate(42deg) scale(1); }
+.status-ind.live .core { animation: sind-live-glow 2.4s var(--ease) infinite; }
+
+.status-ind.stale { --tone: var(--warn); --core-size: 9px; --track-alpha: 24%; --arc-opacity: .72; }
+.status-ind.stale .track { transform: scale(.94); }
+.status-ind.stale .arc {
+  background: repeating-conic-gradient(from -8deg, var(--tone) 0 14deg, transparent 14deg 34deg);
+  animation: sind-drift 5s linear infinite;
+}
+.status-ind.stale .core { animation: sind-stale-breathe 2.6s var(--ease) infinite; }
+.status-ind.stale .minus { opacity: 1; transform: scaleX(1); }
+
+.status-ind.syncing { --tone: var(--ok); --tone-2: var(--info); --track-alpha: 26%; --arc-opacity: 1; }
+.status-ind.syncing .arc { animation: spin 1.35s linear infinite; }
+.status-ind.syncing .arc.two { animation: spin 1.35s linear infinite reverse; }
+.status-ind.syncing .core { animation: sind-sync-settle 1.35s var(--ease) infinite; }
+
+.status-ind.reconnecting { --tone: var(--bad); --track-alpha: 25%; --arc-opacity: 1; }
+.status-ind.reconnecting .track { animation: sind-ring-alert .9s var(--ease) infinite; }
+.status-ind.reconnecting .arc { animation: spin .72s linear infinite; }
+.status-ind.reconnecting .core { animation: sind-urgent-pulse .9s var(--ease) infinite; }
+
+/* `spin` is reused from the shared @keyframes spin (~2144). The rest are
+   indicator-local (sind- prefix avoids any future name clashes). All are
+   opacity/transform-only → compositor-friendly. Reduced motion is handled
+   globally by the repo's prefers-reduced-motion * override (~3602). */
+@keyframes sind-drift { to { transform: rotate(.18turn); } }
+@keyframes sind-pulse-soft { 0%,100% { opacity:.68; transform:scale(.78); } 50% { opacity:1; transform:scale(1.08); } }
+@keyframes sind-live-glow {
+  0%,100% { box-shadow: 0 0 0 1px var(--bg), 0 0 9px color-mix(in srgb, var(--tone) 18%, transparent); }
+  50% { box-shadow: 0 0 0 1px var(--bg), 0 0 16px color-mix(in srgb, var(--tone) 28%, transparent); }
+}
+@keyframes sind-stale-breathe { 0%,100% { opacity:.66; transform:scale(.95); } 50% { opacity:.96; transform:scale(1.03); } }
+@keyframes sind-sync-settle { 0%,100% { transform:scale(.94); } 50% { transform:scale(1.08); } }
+@keyframes sind-urgent-pulse { 0%,100% { opacity:.72; transform:scale(.78); } 50% { opacity:1; transform:scale(1.14); } }
+@keyframes sind-ring-alert { 0%,100% { opacity:.78; transform:scale(.92); } 50% { opacity:1; transform:scale(1.1); } }
 
 .tree {
   overflow-y: auto;
@@ -1735,8 +1850,13 @@ body {
    content-visibility — all are traps on always-present scrolling surfaces. */
 /* The eye lives inside .perm-actions, whose `button` rule pads text actions
    (5px 12px); neutralize so .card-icon-btn's 26px square holds under the
-   global border-box sizing. */
-.perm-actions .card-icon-btn { padding: 0; }
+   global border-box sizing. `align-self: stretch` + `height: auto` override
+   .card-icon-btn's fixed height:26px so the eye stretches to the row's tallest
+   item (the text buttons), instead of sitting visibly shorter. Width stays 26px
+   (from .card-icon-btn), so it remains a narrow icon column; the 13px eye SVG
+   stays centered via .card-icon-btn's align/justify-center. Scoped to
+   .perm-actions only — the global .card-icon-btn stays 26px square elsewhere. */
+.perm-actions .card-icon-btn { padding: 0; align-self: stretch; height: auto; }
 .perm-eye { flex: none; }
 .perm-always {
   margin: 8px 0 2px;
@@ -3569,7 +3689,7 @@ body {
   letter-spacing: -0.006em;
 }
 .main-title, .sidebar-head strong { letter-spacing: -0.01em; font-weight: 600; }
-.m-group-label, .msg-role, .status { letter-spacing: 0.02em; }
+.m-group-label, .msg-role { letter-spacing: 0.02em; }
 
 /* Visible keyboard focus everywhere (quality floor). */
 :where(button, select, textarea, a, input, [role="button"], [tabindex]):focus-visible {
@@ -3625,7 +3745,7 @@ code, pre, .vh-diff, .msg-cost, .tool-name, .gitfile-name, .kv, .msg-inspect, .g
   font-family: var(--font-mono);
 }
 /* labels share one small scale */
-.msg-role, .m-group-label, .status, .tree-count, .msg-time, .msg-cost, .badge, .tool-state, .m-prov,
+.msg-role, .m-group-label, .tree-count, .msg-time, .msg-cost, .badge, .tool-state, .m-prov,
 .settings-nav-item, .setting-hint, .gitfile-counts { font-size: var(--text-xs); }
 .tree-node, .m-name, .setting-row label, .bar-select, .bar-btn, .chip, .model-select, .theme-select { font-size: var(--text-sm); }
 
