@@ -70,7 +70,7 @@ with no runtime asset files to ship.
 git clone https://github.com/vhqtvn/vh-solara
 cd vh-solara
 
-make build      # builds the SPA (needs Node ≥ 20 once) then the embedded binary → ./vh-solara
+make build      # builds the SPA (needs Node ≥ 24 once) then the embedded binary → ./vh-solara
 # or
 make install    # same, then `go install .` into $GOBIN
 ```

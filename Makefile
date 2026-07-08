@@ -23,7 +23,7 @@ install: web-materialize ## Build the UI then `go install` the single embedded b
 test: ## Run Go unit/integration tests
 	go test ./pkg/...
 
-test-web: ## Run web unit tests + fixture-backed Playwright e2e (needs Node >= 20)
+test-web: ## Run web unit tests + fixture-backed Playwright e2e (needs Node >= 24)
 	cd web && npm run test:unit && npm run test:e2e
 
 fixtures: web-materialize ## Run the fixture-backed web stack locally on :8099 (no opencode needed)

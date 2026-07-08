@@ -7,7 +7,7 @@
 // the dispatch ordering (loaded awaits the batch) is covered by the listener's
 // promise-gate in stream.ts and exercised end-to-end by Playwright.
 //
-// Node 18+ (this repo targets ≥20) ships DecompressionStream + atob as globals
+// Node 18+ (this repo targets ≥24) ships DecompressionStream + atob as globals
 // (undici), so the REAL decode path runs here — no mock. The fixture is
 // compressed with node:zlib gzipSync + Buffer.toString("base64"), mirroring the
 // server's compress/gzip + encoding/base64 round-trip exactly.

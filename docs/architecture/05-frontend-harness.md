@@ -51,8 +51,8 @@ Playwright writes traces, screenshots, video, and the HTML report under
 
 ## Requirements / gotchas
 
-- **Node ≥ 20** for Playwright (its TS config loader needs ≥18.19; use Node 20).
-  Vite build/unit tests run on 18 too, but standardize on 20.
+- **Node ≥ 24** for Playwright (its TS config loader needs ≥18.19; use Node 24).
+  Vite build/unit tests run on 18 too, but standardize on 24.
 - The fixture server runs the real Go stack, so `go run` needs the project's Go
   toolchain (go.mod pins 1.23).
 - Keep fixtures production-shaped and update `pkg/fixtures` when the OpenCode

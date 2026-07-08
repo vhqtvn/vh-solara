@@ -25,7 +25,7 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
 
       - name: Build web UI (embedded into the binary)
         # `npm run build` stages the SPA into the gitignored web/dist-build/

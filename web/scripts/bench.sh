@@ -3,7 +3,7 @@
 # server seeded with VH_BENCH_MESSAGES (default 300) complex messages (markdown
 # + code + tool calls + diffs), and runs scripts/bench.mjs to report
 # load-to-render, DOM size, content-visibility effectiveness, scroll jank and
-# JS heap. Needs Node >= 20.
+# JS heap. Needs Node >= 24.
 set -euo pipefail
 
 N="${VH_BENCH_MESSAGES:-300}"

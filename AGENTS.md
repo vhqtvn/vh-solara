@@ -398,7 +398,7 @@ It lets an operator:
   state — restore the committed placeholder first (operators:
   `git checkout -- pkg/web/dist/index.html`; agents: route through the committer
   / `.opencode/scripts/commit-gate.sh revert pkg/web/dist/index.html`).
-- Full build (Node ≥ 20): `make build` (or `make web` for the SPA only).
+- Full build (Node ≥ 24): `make build` (or `make web` for the SPA only).
 - SPA unit tests: `cd web && npx vitest run`. Typecheck: `npm run typecheck`.
 - Playwright e2e: `cd web && export PATH=$PATH:/usr/local/go/bin && npx playwright
   test` (the `webServer` runs `scripts/fixture-web.sh`, which builds the SPA and
