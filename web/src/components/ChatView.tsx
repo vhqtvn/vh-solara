@@ -1168,6 +1168,20 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   function autosize() {
     const ta = taRef;
     if (!ta) return;
+    // Capture the bottom-anchor state BEFORE resizing: growing/shrinking the
+    // composer changes .chat-scroll's clientHeight (they share the flex column),
+    // and the async scrollEl ResizeObserver that normally re-glues the tail can
+    // land a frame late (visible jump) or be skipped when following()==false yet
+    // the user is still near the bottom — leaving scrollTop fixed and tucking the
+    // tail UNDER the composer. Pinning here, synchronously in the same frame as
+    // the keystroke, keeps distFromBottom≈0 (latest content stays visible, no
+    // transient) in BOTH idle and working states. `nearBottom()` is read against
+    // the PRE-resize geometry so a grow that pushes distFromBottom past the
+    // re-engage threshold is still corrected. ready() gates session-switch
+    // scroll-restore (maybeRestore owns positioning during the switch→ready
+    // window). The scrollEl RO re-confirms after layout (idempotent) and owns
+    // non-typing resizes (window resize, mobile keyboard toggle).
+    const stick = !!scrollEl && ready() && (following() || nearBottom());
     if (focusMode()) {
       ta.style.height = "100%";
     } else {
@@ -1175,6 +1189,12 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       ta.style.height = Math.min(ta.scrollHeight, MAX_COMPOSER_PX) + "px";
     }
     if (mirrorRef) mirrorRef.scrollTop = ta.scrollTop;
+    // Re-pin so the tail stays visible. pin() (not a raw scrollTop write) so the
+    // geometry baseline pinnedGeom advances in lockstep — otherwise the scroll
+    // event from this pin fails onScrolled's own-pin bail (|Δ|>1 once streaming
+    // content has grown the tail since the last baseline) and following is
+    // mis-classified away. Cheap: one layout per keystroke, not per scroll frame.
+    if (stick) pin();
   }
   // Re-measure after any value change (typing, draft restore, send-clear).
   createEffect(() => {
