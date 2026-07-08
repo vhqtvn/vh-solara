@@ -494,10 +494,10 @@ body {
 .status-mark .halo, .status-mark .orbital, .status-mark .scan {
   content: ""; position: absolute; inset: 0; border-radius: 999px; pointer-events: none;
 }
-.status-mark::before { border: .75px solid var(--status-soft); opacity: .28; transform: scale(.92); }
+.status-mark::before { border: .75px solid var(--status-soft); opacity: .28; transform: scale(.92); transition: border-color .22s ease; }
 .status-mark::after { inset: -2px; background: radial-gradient(circle, var(--status-soft), transparent 62%); opacity: .16; z-index: -1; }
-.halo { inset: -3px; border: .75px solid transparent; border-top-color: var(--status); border-right-color: color-mix(in srgb, var(--status), transparent 45%); opacity: .55; transform: scale(.98); }
-.orbital { inset: -1px; border: .75px solid transparent; border-left-color: var(--orbital-tint); border-bottom-color: color-mix(in srgb, var(--orbital-tint), transparent 65%); opacity: 0; transform: rotate(0deg) scale(.96); }
+.halo { inset: -3px; border: .75px solid transparent; border-top-color: var(--status); border-right-color: color-mix(in srgb, var(--status), transparent 45%); opacity: .55; transform: scale(.98); transition: border-color .22s ease; }
+.orbital { inset: -1px; border: .75px solid transparent; border-left-color: var(--orbital-tint); border-bottom-color: color-mix(in srgb, var(--orbital-tint), transparent 65%); opacity: 0; transform: rotate(0deg) scale(.96); transition: opacity .22s ease, border-color .22s ease; }
 .packet, .spark { position: absolute; width: 2px; height: 2px; inset: auto; border-radius: 999px; background: currentColor; box-shadow: 0 0 5px currentColor; opacity: 0; }
 .packet.a { left:50%; top:50%; margin:-1px 0 0 -1px; }
 .packet.b { left:50%; top:50%; margin:-1px 0 0 -1px; animation-delay:.18s; }
@@ -505,23 +505,24 @@ body {
 .spark.a { left:0; top:42%; }
 .spark.b { right:2px; top:16%; animation-delay:.12s; }
 .spark.c { right:7px; bottom:0; animation-delay:.26s; }
-.scan { inset:-3px; background: conic-gradient(from 0deg, transparent 0 68%, var(--status-soft) 72%, transparent 78% 100%); opacity:0; -webkit-mask: radial-gradient(circle, transparent 56%, #000 58% 65%, transparent 67%); mask: radial-gradient(circle, transparent 56%, #000 58% 65%, transparent 67%); }
-/* Corner status badge — the semantic state carrier. Excluded from the inset:0
-   layer reset above so its own corner inset (auto 3px 3px auto) applies. The
-   --bg box-shadow ring separates it from the glyph in both theme families. */
+.scan { inset:-3px; background: conic-gradient(from 0deg, transparent 0 68%, var(--status-soft) 72%, transparent 78% 100%); opacity:0; -webkit-mask: radial-gradient(circle, transparent 56%, #000 58% 65%, transparent 67%); mask: radial-gradient(circle, transparent 56%, #000 58% 65%, transparent 67%); transition: opacity .22s ease; }
+/* Top-left corner status badge — the semantic state carrier. Excluded from the
+   inset:0 layer reset above so its own corner inset (1px auto auto 1px) applies.
+   The --bg box-shadow ring separates it from the glyph in both theme families. */
 .status-mark .status-core {
   content: ""; position: absolute; border-radius: 999px; pointer-events: none;
-  inset: auto 1px 1px auto; width: 5px; height: 5px;
+  inset: 1px auto auto 1px; width: 5px; height: 5px;
   border: .75px solid rgba(255,255,255,.72); background: var(--status);
   box-shadow: 0 0 0 1.5px var(--bg), 0 0 6px var(--status); opacity: .96;
+  transition: background-color .22s ease, box-shadow .22s ease;
 }
 .status-mark .status-core::before, .status-mark .status-core::after { content:""; position:absolute; inset:0; border-radius:inherit; }
 
 /* --- states: exactly ONE applies (indState in Sidebar.tsx collapses stacking).
    Each sets --status (glyph + core fill + svg currentColor), --status-soft (the
    glow alpha, via color-mix on the token), and --accent (orbital/counter tint). */
-.status-mark.connecting { --status: var(--accent); --status-soft: color-mix(in srgb, var(--accent) 32%, transparent); --orbital-tint: var(--accent); }
-.status-mark.live { --status: var(--ok); --status-soft: color-mix(in srgb, var(--ok) 28%, transparent); --orbital-tint: var(--ok); }
+.status-mark.connecting { --status: var(--fg-dim); --status-soft: color-mix(in srgb, var(--fg-dim) 28%, transparent); --orbital-tint: var(--fg-dim); }
+.status-mark.live { --status: var(--accent); --status-soft: color-mix(in srgb, var(--accent) 28%, transparent); --orbital-tint: var(--accent); }
 .status-mark.stale { --status: var(--warn); --status-soft: color-mix(in srgb, var(--warn) 28%, transparent); --orbital-tint: var(--warn); }
 .status-mark.syncing { --status: var(--ok); --status-soft: color-mix(in srgb, var(--ok) 28%, transparent); --orbital-tint: var(--accent); }
 .status-mark.reconnecting { --status: var(--danger); --status-soft: color-mix(in srgb, var(--danger) 30%, transparent); --orbital-tint: var(--warn); }
