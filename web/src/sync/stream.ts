@@ -416,12 +416,15 @@ function bumpUpdating() {
 // reconciles all current state authoritatively. Transient in-page reconnects
 // (watchdog/onerror/visibility) resume normally: in-memory state is intact, and
 // the server falls back to a snapshot itself if the gap exceeds its ring buffer.
-// --- Feature 3: connection-vs-server latency diagnostic (L1, FE-only) -----
+// --- Feature 3: connection-vs-first-snapshot latency diagnostic (L1, FE-only) -
 // Purely additive instrumentation (zero server change). For each stream we
 // capture performance.now() stamps and derive deltas:
 //   open    = onopen − EventSource construction      (pure connection latency)
-//   snap    = first snapshot − onopen                (server: ensureMessages + compute
-//                                                      + serialize)
+//   snap    = first snapshot − onopen                (end-to-end: server compute + serialize +
+//                                                      tunnel transport of the payload through
+//                                                      the controller; under refreshOpenSessions
+//                                                      fan-out the transport dominates, NOT
+//                                                      server compute)
 //   hydrate = messages.loaded arrival − first snapshot   [SESSION STREAM ONLY]
 //                                                      (upstream full-fetch wait —
 //                                                      the gap `snap` misses on a
@@ -436,8 +439,9 @@ function bumpUpdating() {
 // deltas and aren't timed. `hydrate` records once per connection (only on a
 // cold first snapshot); a warm first snapshot (gate.messagesLoaded!==false) is
 // stamped "warm" since messages.loaded never arrives for it. Surfaces in
-// ServersPanel as "conn Xms · server Yms · hydrate (Yms|warm|…)" so an operator
-// can tell a slow connection from a slow server from a slow upstream fetch.
+// ServersPanel as "conn Xms · snap Yms · hydrate (Yms|warm|…)" so an operator
+// can tell a slow connection from a slow first-snapshot (server compute + tunnel
+// transport) from a slow upstream fetch.
 function recordLatency(stream: "tree" | "session", phase: "open" | "snap", ms: number): void {
   setState("connLatency", stream, phase, Math.max(0, Math.round(ms)));
 }

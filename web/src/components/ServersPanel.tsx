@@ -35,19 +35,21 @@ export default function ServersPanel() {
     // live connection means the daemon restarted. Mirrors the connection-health
     // toast; useful here as a persistent diagnostic.
     push("Server epoch", state.epoch);
-    // Feature 3 (L1): connection-vs-server latency per stream, so an operator
-    // can tell a slow connection from a slow server. `conn` = EventSource open
-    // (pure connection); `server` = open → first snapshot (ensureMessages +
-    // compute + serialize). Tree stream = tree+notifications; session stream =
-    // the active session's messages. The session line also carries `hydrate` =
-    // first snapshot → messages.loaded (the upstream full-fetch wait `server`
-    // is blind to on a cold session): a number = cold fetch took Yms, "warm" =
-    // the snapshot already had the full history (instant switch), "…" = cold
-    // and still fetching (the stall in progress).
+    // Feature 3 (L1): connection-vs-first-snapshot latency per stream, so an
+    // operator can tell a slow connection from a slow first-snapshot arrival.
+    // `conn` = EventSource open (pure connection); `snap` = open → first
+    // snapshot arrival (end-to-end: server compute + serialize + tunnel transport
+    // of the payload through the controller; under refreshOpenSessions fan-out the
+    // tunnel transit dominates — server compute itself is sub-20ms). Tree stream
+    // = tree+notifications; session stream = the active session's messages. The
+    // session line also carries `hydrate` = first snapshot → messages.loaded (the
+    // upstream full-fetch wait `snap` is blind to on a cold session): a number =
+    // cold fetch took Yms, "warm" = the snapshot already had the full history
+    // (instant switch), "…" = cold and still fetching (the stall in progress).
     const latTree = state.connLatency.tree;
     const latSes = state.connLatency.session;
     const fmt = (o?: number, s?: number) =>
-      o != null || s != null ? `conn ${o ?? "—"}ms · server ${s ?? "—"}ms` : "—";
+      o != null || s != null ? `conn ${o ?? "—"}ms · snap ${s ?? "—"}ms` : "—";
     const fmtSes = (
       o?: number, s?: number, h?: number | "warm",
       f?: number, r?: number,
@@ -55,7 +57,7 @@ export default function ServersPanel() {
       const hp = h == null ? "…" : h === "warm" ? "warm" : `${h}ms`;
       const hasAny = o != null || s != null || h != null;
       if (!hasAny) return "—";
-      const base = `conn ${o ?? "—"}ms · server ${s ?? "—"}ms · hydrate ${hp}`;
+      const base = `conn ${o ?? "—"}ms · snap ${s ?? "—"}ms · hydrate ${hp}`;
       // fetch/rec split `hydrate` — only present when the daemon reported it on
       // a cold messages.loaded. "—" = absent (old daemon / warm / still fetching).
       return f != null || r != null

@@ -135,10 +135,12 @@ export interface SyncState {
   // live connection (NOT the first snapshot after load). Consumed + cleared by
   // the connection-health toast to surface "Server restarted — re-syncing…".
   epochChanged: boolean;
-  // connLatency: per-stream connection-vs-server latency diagnostics
+  // connLatency: per-stream connection-vs-first-snapshot latency diagnostics
   // (Feature 3). `open` = EventSource construction → onopen (pure connection
-  // latency); `snap` = onopen → first snapshot event (server processing:
-  // ensureMessages + snapshot compute + serialize). Session stream also carries
+  // latency); `snap` = onopen → first snapshot event (end-to-end: server compute +
+  // snapshot serialize + tunnel transport of the payload through the controller —
+  // under refreshOpenSessions fan-out the transit dominates; server compute is
+  // sub-20ms). Session stream also carries
   // `hydrate` = first snapshot arrival → messages.loaded arrival — the upstream
   // full-fetch wait that `snap` is blind to on a COLD session (the snapshot
   // ships instantly with gate.messagesLoaded=false, then the daemon fetches the
