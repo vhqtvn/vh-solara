@@ -370,6 +370,31 @@ function ToolPart(props: { part: Part; tail?: boolean }) {
   const state = () => (props.part.state || {}) as ToolState;
   const tool = () => (props.part.tool as string | undefined) ?? "";
   const status = () => state().status ?? "";
+  // Live duration timer — mirrors ReasoningPart's elapsed() (see ~line 590):
+  // while the tool is running (status "running", a real start, no end yet) the
+  // slot ticks once a second; once `end` lands it falls back to durationText()'s
+  // sub-second-precise final value. The interval is per-row (cheap at 1fps — the
+  // same convention the reasoning timer uses) and torn down via onCleanup so a
+  // scrolled-off / collapsed row never leaks a ticking timer.
+  const time = () => state().time || props.part.time || {};
+  const start = () => time().start;
+  const end = () => time().end;
+  const running = () => status() === "running" && !!start() && !end();
+  const [now, setNow] = createSignal(Date.now());
+  createEffect(() => {
+    if (!running() || !start()) return;
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    onCleanup(() => clearInterval(t));
+  });
+  const liveDuration = () => {
+    if (running()) {
+      const s = start();
+      if (!s) return "";
+      const secs = Math.max(0, Math.round((now() - s) / 1000));
+      return secs < 60 ? `${secs}s` : `${Math.floor(secs / 60)}m ${secs % 60}s`;
+    }
+    return durationText(props.part);
+  };
   const output = () => state().output || state().error || "";
   // LSP diagnostics OpenCode attaches to edit/write/patch results, keyed by file.
   // Surface the errors (severity 1) so a broken edit is visible without digging.
@@ -480,8 +505,8 @@ function ToolPart(props: { part: Part; tail?: boolean }) {
         <span class="tool-ico"><Icon name={toolIconName(tool())} size={13} /></span>
         <span class="tool-name">{toolLabel(tool())}</span>
         <span class="tool-subject">{expr() || state().title || status()}</span>
-        <Show when={durationText(props.part)}>
-          <span class="tool-dur">{durationText(props.part)}</span>
+        <Show when={liveDuration()}>
+          <span class="tool-dur" classList={{ live: running() }}>{liveDuration()}</span>
         </Show>
         <Show when={hasDetail()}>
           <span class="tool-chev" classList={{ rot: expanded() }}><Icon name="chevronDown" size={12} /></span>

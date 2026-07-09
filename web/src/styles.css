@@ -1491,6 +1491,8 @@ body {
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .tool-dur { flex: 0 0 auto; color: var(--fg-dim); font-size: 11px; font-variant-numeric: tabular-nums; }
+/* Live (running) tool duration: accent-tinted, mirroring .reasoning-time.live. */
+.tool-dur.live { color: var(--accent); }
 .tool-chev { display: inline-flex; align-items: center; color: var(--fg-dim); flex: 0 0 auto; transition: transform 0.12s ease; }
 .tool-chev.rot { transform: rotate(180deg); }
 .tool-jump {
