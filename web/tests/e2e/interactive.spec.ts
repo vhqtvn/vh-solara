@@ -1,9 +1,10 @@
 import { expect, test } from "@playwright/test";
+import { projectUrl } from "./util";
 
 // Sends a prompt containing the fixture trigger and returns once the assistant
 // turn settles. The fixture maps [[ask]] -> a question.asked event.
 async function openDemo(page: import("@playwright/test").Page) {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   await page.getByRole("button", { name: /Demo session/ }).click();
 }
 
@@ -78,7 +79,7 @@ test("header usage pill shows context + quota and opens the inspector", async ({
 test("notes view persists a to-do and project notes to the server", async ({ page }) => {
   // Notes is off by default now — enable the pref so the tab is present.
   await page.addInitScript(() => localStorage.setItem("vh.prefs.notesEnabled.v1", JSON.stringify({ v: 1, data: true })));
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   await page.getByRole("button", { name: "Notes", exact: true }).click();
 
   // Add a to-do.
@@ -99,7 +100,7 @@ test("notes view persists a to-do and project notes to the server", async ({ pag
 });
 
 test("archive removes a session from the tree and the Archived browser restores it", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   // Create a fresh session so we don't disturb the seeded demo sessions.
   await page.getByRole("button", { name: "Create session" }).click();
   await page.getByPlaceholder("Message…").fill("archive me");
@@ -144,7 +145,7 @@ test("archive removes a session from the tree and the Archived browser restores 
 });
 
 test("sidebar search filters sessions and pinning floats one to the top", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   await expect(page.locator(".tree-node", { hasText: "Demo session" })).toBeVisible();
 
   // Search is collapsed by default — reveal it via the header toggle first.
@@ -167,7 +168,7 @@ test("sidebar search filters sessions and pinning floats one to the top", async 
 });
 
 test("session search collapses by default and toggles from the header", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   const search = page.getByPlaceholder("Search sessions…");
   await expect(search).toBeHidden(); // collapsed by default → reclaims a row
 
@@ -194,7 +195,7 @@ test("session search collapses by default and toggles from the header", async ({
 });
 
 test("right-click session title opens a menu; Archive… confirms related sessions", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   await page.getByRole("button", { name: "Create session" }).click();
   await page.getByPlaceholder("Message…").fill("menu me");
   await page.keyboard.press("Enter");
@@ -233,7 +234,7 @@ test("right-click session title opens a menu; Archive… confirms related sessio
 });
 
 test("right-click → Rename updates the session title", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   // Use a fresh session so we don't rename the shared demo session.
   await page.getByRole("button", { name: "Create session" }).click();
   await page.getByPlaceholder("Message…").fill("rename me");
@@ -254,7 +255,7 @@ test("right-click → Rename updates the session title", async ({ page }) => {
 });
 
 test("right-click → Regenerate name asks the model then confirms the new title", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   await page.getByRole("button", { name: "Create session" }).click();
   await page.getByPlaceholder("Message…").fill("name me");
   await page.keyboard.press("Enter");
@@ -275,7 +276,7 @@ test("right-click → Regenerate name asks the model then confirms the new title
 });
 
 test("settings → usage shows multi-provider quota with pace", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   await page.getByRole("button", { name: "Settings" }).click();
   const dialog = page.getByRole("dialog", { name: "Settings" });
   await dialog.getByRole("button", { name: "Usage" }).click();

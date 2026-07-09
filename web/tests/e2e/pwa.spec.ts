@@ -1,7 +1,8 @@
 import { expect, test } from "@playwright/test";
+import { projectUrl } from "./util";
 
 test("PWA: manifest, icon and service worker are served and linked", async ({ page, baseURL }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
 
   // The manifest is linked from the document head.
   await expect(page.locator('link[rel="manifest"]')).toHaveAttribute("href", "/manifest.webmanifest");
@@ -26,7 +27,7 @@ test("PWA: manifest, icon and service worker are served and linked", async ({ pa
 });
 
 test("PWA: the service worker registers and controls the page", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   const ready = await page.evaluate(async () => {
     if (!("serviceWorker" in navigator)) return false;
     const reg = await navigator.serviceWorker.ready;

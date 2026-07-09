@@ -1,6 +1,7 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { expect, test } from "@playwright/test";
+import { projectUrl } from "./util";
 
 // Repo root — a real directory, so the PTY can actually spawn a shell. (The
 // fixture's own project dir hosts the fake sessions, but the terminal needs a
@@ -70,7 +71,7 @@ test("terminal tabs: separate shells, add, switch, and per-tab kill", async ({ p
 });
 
 test("terminal: a session-bound tab can be opened for the selected session", async ({ page }) => {
-  await page.goto("/"); // fixture's own project → has sessions to select
+  await page.goto(projectUrl("/")); // fixture's own project → has sessions to select
   await page.locator(".tree-node").first().click();
   await page.getByRole("button", { name: "Terminal", exact: true }).click();
   await page.waitForSelector(".term-dock");

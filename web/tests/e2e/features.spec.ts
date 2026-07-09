@@ -1,7 +1,8 @@
 import { expect, test } from "@playwright/test";
+import { projectUrl } from "./util";
 
 test("model picker dialog: search, badges, pick, then variant dropdown", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   await page.getByRole("button", { name: /Demo session/ }).click();
 
   await page.locator(".model-btn").click();
@@ -31,7 +32,7 @@ test("model picker dialog: search, badges, pick, then variant dropdown", async (
 });
 
 test("selecting an agent switches the model to the agent's configured model", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   await page.getByRole("button", { name: /Demo session/ }).click();
 
   // Start on a specific model explicitly.
@@ -53,7 +54,7 @@ test("selecting an agent switches the model to the agent's configured model", as
 
 test("layout has no horizontal overflow at Galaxy Fold folded width (280px)", async ({ page }) => {
   await page.setViewportSize({ width: 280, height: 653 });
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   // The sidebar collapses to a drawer; its toggle is shown.
   await expect(page.locator(".nav-toggle")).toBeVisible();
   const overflow = await page.evaluate(
@@ -63,7 +64,7 @@ test("layout has no horizontal overflow at Galaxy Fold folded width (280px)", as
 });
 
 test("theme selector switches palettes (light/dim/dark)", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   await page.getByRole("button", { name: "Settings" }).click();
   const html = page.locator("html");
   const select = page.getByLabel("Theme"); // the custom-select button

@@ -1,11 +1,12 @@
 import { expect, test } from "@playwright/test";
+import { projectUrl } from "./util";
 
 // Fixture-backed smoke tests. The fake OpenCode seeds a "demo" root session
 // with a "Subagent: search" subsession, an assistant message with a
 // markdown/code block and a completed tool call, and a working-tree diff.
 
 test("session tree filters idle subsessions by default and expands to show them", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   await expect(page.getByRole("button", { name: /Demo session/ })).toBeVisible();
   // Wait for the shared fixture to settle (no running sessions) so the tree
   // isn't re-sorting/auto-tidying under the click.
@@ -23,7 +24,7 @@ test("session tree filters idle subsessions by default and expands to show them"
 });
 
 test("opening a session renders server-highlighted markdown and tool parts", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   await page.getByRole("button", { name: /Demo session/ }).click();
   // Daemon-rendered code block (chroma classes survive sanitization).
   await expect(page.locator(".md pre.chroma").first()).toBeVisible();
@@ -39,14 +40,14 @@ test("opening a session renders server-highlighted markdown and tool parts", asy
 });
 
 test("Changes view renders a git diff", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   await page.getByRole("button", { name: "Changes", exact: true }).click();
   await page.getByText("parser.go").click();
   await expect(page.locator(".vh-diff-add").first()).toBeVisible();
 });
 
 test("Changes view toggles between inline and split diff layouts", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   await page.getByRole("button", { name: "Changes", exact: true }).click();
   await page.getByText("parser.go").click();
   await expect(page.locator(".vh-diff-add").first()).toBeVisible();
@@ -60,7 +61,7 @@ test("Changes view toggles between inline and split diff layouts", async ({ page
 });
 
 test("sending a prompt streams an assistant response", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   await page.getByRole("button", { name: /Demo session/ }).click();
   await page.getByPlaceholder("Message…").fill("hello fixture");
   await page.keyboard.press("Enter");

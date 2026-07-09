@@ -1,9 +1,10 @@
 import { expect, test } from "@playwright/test";
+import { projectUrl } from "./util";
 
 // The demo session has a completed `task` tool part linking to the "sub"
 // subsession; clicking it should jump into that subsession's chat.
 test("a task tool part jumps to its subsession", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   await page.getByRole("button", { name: /Demo session/ }).click();
 
   // The task tool part exposes an "open subsession" affordance.

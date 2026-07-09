@@ -1,7 +1,8 @@
 import { expect, test } from "@playwright/test";
+import { projectUrl } from "./util";
 
 test("sidebar collapses, persists, and exposes a resize handle (desktop)", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   await expect(page.locator(".sidebar")).toBeVisible();
   await expect(page.locator(".sidebar-resize")).toBeAttached();
 
@@ -22,7 +23,7 @@ test("sidebar collapses, persists, and exposes a resize handle (desktop)", async
 // Server-admin controls live in a popup opened by right-clicking / long-pressing
 // the Settings button (kept out of the Servers popover and Settings dialog).
 test("server admin popup can reload (rehydrate) state without restarting OpenCode", async ({ page, baseURL }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   await page.getByRole("button", { name: "Settings" }).click({ button: "right" });
   const pop = page.getByRole("dialog", { name: "Server admin" });
   await expect(pop.getByRole("button", { name: /Force reload \(clear cache\)/ })).toBeVisible();
@@ -43,7 +44,7 @@ test("server admin popup can reload (rehydrate) state without restarting OpenCod
 });
 
 test("admin popup shows both vh-solara and OpenCode versions", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   await page.getByRole("button", { name: "Settings" }).click({ button: "right" });
   const pop = page.getByRole("dialog", { name: "Server admin" });
   await expect(pop).toContainText("VHSolara");
@@ -55,7 +56,7 @@ test("admin popup shows both vh-solara and OpenCode versions", async ({ page }) 
 // the daemon manages, fetched on mount — so we drive it through the dialog's
 // post-install state.
 test("Restart OpenCode is owned by the update dialog, warns before acting, and can be cancelled", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   await page.getByRole("button", { name: "Settings" }).click({ button: "right" });
   const pop = page.getByRole("dialog", { name: "Server admin" });
 
@@ -78,7 +79,7 @@ test("Restart OpenCode is owned by the update dialog, warns before acting, and c
 });
 
 test("OpenCode update opens a dialog, streams the log, then offers restart", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   await page.getByRole("button", { name: "Settings" }).click({ button: "right" });
   const pop = page.getByRole("dialog", { name: "Server admin" });
 
@@ -123,7 +124,7 @@ test("terminal dock toggles from the header", async ({ page }) => {
 });
 
 test("terminal header controls stay light on a light theme (dark island)", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   await page.evaluate(() => {
     const el = document.documentElement;
     el.className = el.className.replace(/\btheme-\S+/g, "").trim();
@@ -145,7 +146,7 @@ test("terminal header controls stay light on a light theme (dark island)", async
 test("a new server version surfaces the update toast", async ({ page }) => {
   let version = "v-1";
   await page.route("**/vh/version", (route) => route.fulfill({ json: { version } }));
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   // First poll records v-1; no toast yet.
   await expect(page.locator(".update-toast")).toHaveCount(0);
   // Server ships a new version; the next visibility-triggered check notices.
@@ -156,7 +157,7 @@ test("a new server version surfaces the update toast", async ({ page }) => {
 });
 
 test("Settings → Terminals lists sessions (empty by default)", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   await page.getByRole("button", { name: "Settings" }).click();
   const dialog = page.getByRole("dialog", { name: "Settings" });
   await dialog.getByRole("button", { name: "Terminals", exact: true }).click();
@@ -164,7 +165,7 @@ test("Settings → Terminals lists sessions (empty by default)", async ({ page }
 });
 
 test("the Working… indicator shows while the assistant streams", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   // Use a fresh session (not the shared demo) so we don't perturb other specs.
   await page.getByRole("button", { name: "Create session" }).click();
   await page.getByPlaceholder("Message…").fill("stream please");

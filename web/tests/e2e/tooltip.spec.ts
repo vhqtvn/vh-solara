@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { projectUrl } from "./util";
 
 // Adds a probe button with a chosen `data-tip` at fixed coordinates, hovers it,
 // and returns the rendered `.tooltip` box plus the viewport width.
@@ -28,7 +29,7 @@ async function probeTip(
 }
 
 test.beforeEach(async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   // Wait for the app (and its root <Tooltip/>) to mount.
   await expect(page.getByRole("button", { name: /Demo session/ })).toBeVisible();
 });

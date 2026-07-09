@@ -1,7 +1,8 @@
 import { expect, test } from "@playwright/test";
+import { projectUrl } from "./util";
 
 test("composer highlights mentions/paths/code and auto-grows then caps", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   await page.getByRole("button", { name: /Demo session/ }).click();
   const ta = page.getByPlaceholder(/Message/);
 
@@ -20,7 +21,7 @@ test("composer highlights mentions/paths/code and auto-grows then caps", async (
 });
 
 test("composer markdown-highlights headings, bold, links and fenced code", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   await page.getByRole("button", { name: /Demo session/ }).click();
   await page
     .getByPlaceholder(/Message/)
@@ -33,14 +34,14 @@ test("composer markdown-highlights headings, bold, links and fenced code", async
 });
 
 test("composer shows a shell-mode rail for a leading !", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   await page.getByRole("button", { name: /Demo session/ }).click();
   await page.getByPlaceholder(/Message/).fill("!ls -la");
   await expect(page.locator(".composer-field.shell")).toBeVisible();
 });
 
 test("agent picker excludes subagents and hidden agents", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   await page.getByRole("button", { name: /Demo session/ }).click();
   await page.locator(".agent-select .vh-select-btn").click();
   const opts = page.locator(".vh-select-pop .vh-select-opt"); // popup is portaled to <body>
@@ -56,7 +57,7 @@ test.describe("composer paste button", () => {
   test.use({ permissions: ["clipboard-read", "clipboard-write"] });
 
   test("tap replaces the whole composer", async ({ page }) => {
-    await page.goto("/");
+    await page.goto(projectUrl("/"));
     await page.getByRole("button", { name: /Demo session/ }).click();
     const ta = page.getByPlaceholder(/Message/);
     await page.evaluate(() => navigator.clipboard.writeText("PASTED_TEXT"));
@@ -67,7 +68,7 @@ test.describe("composer paste button", () => {
   });
 
   test("long-press inserts at the caret instead of replacing", async ({ page }) => {
-    await page.goto("/");
+    await page.goto(projectUrl("/"));
     await page.getByRole("button", { name: /Demo session/ }).click();
     const ta = page.getByPlaceholder(/Message/);
     await page.evaluate(() => navigator.clipboard.writeText("PASTED_TEXT"));

@@ -16,6 +16,14 @@ import (
 	"time"
 )
 
+// demoDir is the single consolidated project directory under which ALL real
+// fixture sessions live. The e2e suite loads this dir explicitly (via ?dir=)
+// so no test relies on the synthetic default-project/cwd path. The /session
+// handler returns the full real session set for this dir; any other non-empty
+// dir still gets the synthetic per-directory placeholder so the project
+// switcher remains demoable for dirs with no real sessions.
+const demoDir = "/work/demo"
+
 // FakeOpenCode implements the subset of OpenCode's HTTP API the daemon uses.
 type FakeOpenCode struct {
 	mu          sync.Mutex
@@ -57,13 +65,13 @@ func New() *FakeOpenCode {
 			"model": map[string]any{"providerID": "fake", "id": "dummy", "variant": "default"},
 			"time":  map[string]any{"created": now - 5000, "updated": now}},
 		{"id": "sub", "projectID": "proj", "parentID": "demo", "title": "Subagent: search", "directory": "/work/demo", "time": map[string]any{"created": now - 3000, "updated": now - 2000}},
-		{"id": "other", "projectID": "proj", "title": "Another root", "directory": "/work/other", "time": map[string]any{"created": now - 9000, "updated": now - 9000}},
+		{"id": "other", "projectID": "proj", "title": "Another root", "directory": demoDir, "time": map[string]any{"created": now - 9000, "updated": now - 9000}},
 		// Slow-hydration session: a normal root session whose full-message GET is
 		// held for a bounded window (see handleSession) so the .chat-content reveal
 		// gate's opacity:0 → opacity:1 transition is observable end-to-end by
 		// Playwright (web/tests/e2e/reveal-gate.spec.ts). A root (no parentID) so it
 		// doesn't perturb demo's hidden-idle-children footer count (smoke.spec.ts).
-		{"id": "slow", "projectID": "proj", "title": "Slow hydration", "directory": "/work/slow",
+		{"id": "slow", "projectID": "proj", "title": "Slow hydration", "directory": demoDir,
 			"model": map[string]any{"providerID": "fake", "id": "dummy", "variant": "default"},
 			"time":  map[string]any{"created": now - 4000, "updated": now - 4000}},
 	}
@@ -192,7 +200,7 @@ func New() *FakeOpenCode {
 	if n, _ := strconv.Atoi(os.Getenv("VH_BENCH_MESSAGES")); n > 0 {
 		f.sessions = append(f.sessions, map[string]any{
 			"id": "bench", "title": "Benchmark (" + strconv.Itoa(n) + " msgs)",
-			"directory": "/work/bench", "time": map[string]any{"created": now - 8000, "updated": now},
+			"directory": demoDir, "time": map[string]any{"created": now - 8000, "updated": now},
 		})
 		f.messages["bench"] = buildBenchMessages(n, now)
 	}
@@ -469,7 +477,7 @@ func (f *FakeOpenCode) handleSessionRoot(w http.ResponseWriter, r *http.Request)
 		now := float64(time.Now().UnixMilli())
 		s := map[string]any{
 			"id": fmt.Sprintf("ses_new%d", f.counter), "projectID": "proj", "title": "New session",
-			"directory": "/work/new", "time": map[string]any{"created": now, "updated": now},
+			"directory": demoDir, "time": map[string]any{"created": now, "updated": now},
 		}
 		f.sessions = append(f.sessions, s)
 		f.mu.Unlock()
@@ -477,10 +485,14 @@ func (f *FakeOpenCode) handleSessionRoot(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, s)
 		return
 	}
-	// Multi-project: scope by the x-opencode-directory header. A non-empty
-	// directory returns a synthetic per-directory session so the project
-	// switcher is demoable/testable.
-	if dir := r.Header.Get("x-opencode-directory"); dir != "" {
+	// Multi-project: scope by the x-opencode-directory header. All real fixture
+	// sessions live under the consolidated demoDir, so a request for that dir
+	// falls through to the full real set below (reproducing the everything-visible
+	// behavior the e2e suite relies on, now via an explicit project dir instead
+	// of the synthetic default-project/cwd). Any OTHER non-empty directory returns
+	// a synthetic per-directory session so the project switcher remains
+	// demoable/testable for dirs with no real sessions (e.g. /work/alpha).
+	if dir := r.Header.Get("x-opencode-directory"); dir != "" && dir != demoDir {
 		base := dir
 		if i := strings.LastIndex(strings.TrimRight(dir, "/"), "/"); i >= 0 {
 			base = strings.TrimRight(dir, "/")[i+1:]
@@ -588,7 +600,7 @@ func (f *FakeOpenCode) handleSession(w http.ResponseWriter, r *http.Request) {
 		f.counter++
 		now := float64(time.Now().UnixMilli())
 		s := map[string]any{"id": fmt.Sprintf("ses_fork%d", f.counter), "parentID": id,
-			"title": "Fork", "directory": "/work/demo", "time": map[string]any{"created": now, "updated": now}}
+			"title": "Fork", "directory": demoDir, "time": map[string]any{"created": now, "updated": now}}
 		f.sessions = append(f.sessions, s)
 		f.mu.Unlock()
 		f.emit("session.created", map[string]any{"info": s})

@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { projectUrl } from "./util";
 
 // Parse "rgb(r, g, b)" / "rgba(...)" to a 0–255 luminance-ish channel sum.
 function channelSum(color: string): number {
@@ -20,7 +21,7 @@ async function useLightTheme(page: import("@playwright/test").Page) {
 }
 
 test("every semantic theme variable is defined (no referenced-but-undefined vars)", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   // The whole light-theme contrast saga came from vars referenced with hardcoded
   // dark fallbacks but never defined. Guard that they all resolve to a value.
   const VARS = [
@@ -35,7 +36,7 @@ test("every semantic theme variable is defined (no referenced-but-undefined vars
 });
 
 test("light theme defines the surface/emphasis vars that selects & session list use", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   await useLightTheme(page);
 
   // The bug: --bg-input/--bg-elev/--fg-strong were never defined, so controls
@@ -58,7 +59,7 @@ test("light theme defines the surface/emphasis vars that selects & session list 
 });
 
 test("light theme: a select control renders a light background, not dark", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   await useLightTheme(page);
 
   // Open Settings → Appearance, whose density/font selects are .vh-select-btn.
@@ -75,7 +76,7 @@ test("light theme: a select control renders a light background, not dark", async
 });
 
 test("light theme: accent-filled controls (send button, active tab) use white text", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   await useLightTheme(page);
   await page.getByRole("button", { name: /Demo session/ }).click();
 
@@ -93,7 +94,7 @@ test("light theme: accent-filled controls (send button, active tab) use white te
 });
 
 test("light theme: a destructive menu item uses a readable red, not faint pink", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   await useLightTheme(page);
   await page.getByRole("button", { name: /Demo session/ }).click();
 
@@ -119,7 +120,7 @@ test("markdown code blocks use the light syntax sheet on every light theme (not 
   await page.addInitScript(() => {
     localStorage.setItem("vh.theme.v1", JSON.stringify({ v: 1, data: "shire-light" }));
   });
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   await page.getByRole("button", { name: /Demo session/ }).click();
   const block = page.locator(".md pre.chroma").first();
   await expect(block).toBeVisible();

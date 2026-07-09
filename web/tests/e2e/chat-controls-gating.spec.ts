@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { projectUrl } from "./util";
 
 // Regression guard for the ChatView tail/scroll control GATES.
 //
@@ -97,7 +98,7 @@ async function promptSession(page: import("@playwright/test").Page, id: string, 
 //     busy turn, impossible on the static idle demo here).
 test("demo: Latest button flips on following at the tail (Live pill gated on working)", async ({ page }) => {
   await page.setViewportSize(VP);
-  await page.goto("/?session=demo");
+  await page.goto(projectUrl("/?session=demo"));
   await expect(page.locator(".msg").first()).toBeVisible({ timeout: 10000 });
 
   // Glue to the tail deterministically (the app's onScrolled sets following=true
@@ -125,7 +126,7 @@ test("demo: Latest button flips on following at the tail (Live pill gated on wor
 //     `messages().length > 0` term on both gates — without it the Live pill or
 //     Latest button would render over an empty transcript.
 test("other: both Live pill and Latest button absent for an empty session", async ({ page }) => {
-  await page.goto("/?session=other");
+  await page.goto(projectUrl("/?session=other"));
   // Confirm the right session loaded (not a stale demo view) before asserting.
   await expect(page.locator(".main-title")).toContainText("Another root", { timeout: 10000 });
 
@@ -147,7 +148,7 @@ test("other: both Live pill and Latest button absent for an empty session", asyn
 //     working (busy) && !isChild. The controls are anchored to `.chat-main` (the
 //     scroll viewport), NOT the composer, so they position correctly without one.
 test("sub: the Live pill renders in a working child/subagent session", async ({ page }) => {
-  await page.goto("/?session=sub");
+  await page.goto(projectUrl("/?session=sub"));
   // The child-note replaces the composer for subagent sessions; it only renders
   // once isChild() has resolved true (state.sessions[sub].parentID synced in),
   // so waiting for it guarantees the session has settled before we assert on

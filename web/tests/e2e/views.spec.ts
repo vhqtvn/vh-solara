@@ -1,11 +1,12 @@
 import { expect, test } from "@playwright/test";
+import { projectUrl } from "./util";
 
 // A consumer registers an embedded view; the SPA surfaces it as a button in the
 // view-switcher and mounts a sandboxed iframe at its path prefix. We point at an
 // unreachable upstream — only the SPA surface (button + iframe attrs) is under
 // test here; the proxy/prefix contract is covered by the Go TestViewProxyContract.
 test("a registered embedded view shows a button and mounts a sandboxed iframe", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   await page.evaluate(async () => {
     await fetch("/vh/views", {
       method: "POST",

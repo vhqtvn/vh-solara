@@ -1,9 +1,10 @@
 import { expect, test } from "@playwright/test";
+import { projectUrl } from "./util";
 
 // Fixture-backed tests for the parallel-session / permission UX.
 
 test("sending a prompt shows a working spinner that returns to idle", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   await page.getByRole("button", { name: /Demo session/ }).click();
   await page.getByPlaceholder("Message…").fill("hello");
   await page.keyboard.press("Enter");
@@ -19,7 +20,7 @@ test("sending a prompt shows a working spinner that returns to idle", async ({ p
 });
 
 test("a message sent while busy is queued, then auto-sent when the turn finishes", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   await page.getByRole("button", { name: /Demo session/ }).click();
   const composer = page.getByPlaceholder("Message…");
   // Start a turn that stays busy for several seconds.
@@ -40,7 +41,7 @@ test("a message sent while busy is queued, then auto-sent when the turn finishes
 });
 
 test("Up-arrow recalls a previously sent prompt", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   await page.getByRole("button", { name: /Demo session/ }).click();
   const composer = page.getByPlaceholder("Message…");
   await composer.fill("first prompt for history");
@@ -56,7 +57,7 @@ test("Up-arrow recalls a previously sent prompt", async ({ page }) => {
 });
 
 test("Stop clears the working indicator immediately (abort)", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   await page.getByRole("button", { name: /Demo session/ }).click();
   // [[stall]] keeps the turn busy server-side for several seconds.
   await page.getByPlaceholder("Message…").fill("[[stall]] hang please");
@@ -74,7 +75,7 @@ test("Stop clears the working indicator immediately (abort)", async ({ page }) =
 });
 
 test("New session defers creation until the first message is sent", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   const treeNew = page.locator(".tree-node", { hasText: "New session" });
   const before = await treeNew.count();
 
@@ -90,7 +91,7 @@ test("New session defers creation until the first message is sent", async ({ pag
 });
 
 test("a permission request shows an actionable card that Reject dismisses", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   await page.getByRole("button", { name: /Demo session/ }).click();
   await page.getByPlaceholder("Message…").fill("[[perm]] please run it");
   await page.keyboard.press("Enter");

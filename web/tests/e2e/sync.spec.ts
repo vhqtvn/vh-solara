@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { projectUrl } from "./util";
 
 // Behaviour safety-net for the sync.ts decomposition (stream state-machine / URL
 // deep-linking / activity reconciliation). These are the interactions a careless
@@ -6,7 +7,7 @@ import { expect, test } from "@playwright/test";
 // BEFORE refactoring so the split is verified, not hoped.
 
 test("back/forward navigates session selection (pushState + popstate)", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   await page.getByRole("button", { name: /Demo session/ }).click();
   await expect(page).toHaveURL(/[?&]session=demo/);
   await expect(page.locator(".main-title")).toContainText("Demo session");
@@ -28,7 +29,7 @@ test("back/forward navigates session selection (pushState + popstate)", async ({
 });
 
 test("switching sessions re-targets the message stream", async ({ page }) => {
-  await page.goto("/?session=demo");
+  await page.goto(projectUrl("/?session=demo"));
   // demo has rendered content (its assistant turn ran tools).
   await expect(page.locator(".msg").first()).toBeVisible({ timeout: 8000 });
   const demoMsgs = await page.locator(".msg").count();
@@ -53,7 +54,7 @@ test("switching sessions re-targets the message stream", async ({ page }) => {
 });
 
 test("a prompt drives the session busy → idle (activity reconciliation)", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   await page.getByRole("button", { name: /Demo session/ }).click();
   await page.getByPlaceholder("Message…").fill("hello fixture");
   await page.keyboard.press("Enter");

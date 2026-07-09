@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { projectUrl } from "./util";
 
 // Regression guard for bug P1-WEB-005: the "finished — not yet viewed" unread
 // dot (.dot.unread in a SessionTree row) must clear correctly in the two cases
@@ -148,7 +149,7 @@ test("opening a finished unread session at the bottom clears the dot", async ({ 
   await page.setViewportSize(VP);
   // View demo so `other` is NOT the selected session — its completion will then
   // arm the unread dot against an unselected root.
-  await page.goto("/?session=demo");
+  await page.goto(projectUrl("/?session=demo"));
   await waitForTree(page);
 
   // Prompt `other` while it is unselected → busy→idle → markUnread → dot appears.
@@ -160,7 +161,7 @@ test("opening a finished unread session at the bottom clears the dot", async ({ 
   // Open `other`. It has no stored read anchor → maybeRestore takes the no-anchor
   // bottom-pin branch → following=true, pinned to the tail, and (the fix)
   // ackSession(other) fires. The dot must clear with NO user scrolling.
-  await page.goto("/?session=other");
+  await page.goto(projectUrl("/?session=other"));
   await expect(page.locator(".msg").first()).toBeVisible({ timeout: 10000 });
   await expect(dot(page, "other")).toHaveCount(0, { timeout: 10000 });
 });
@@ -171,7 +172,7 @@ test("opening a finished unread session at the bottom clears the dot", async ({ 
 // scrolled or reopened; the reactive createEffect now acks it at the bottom.
 test("a session finishing while watched at the bottom clears the dot", async ({ page }) => {
   await page.setViewportSize(VP);
-  await page.goto("/?session=other");
+  await page.goto(projectUrl("/?session=other"));
   await expect(page.locator(".msg").first()).toBeVisible({ timeout: 10000 });
   // Glue deterministically to the tail so following() && nearBottom() hold when
   // the turn completes (the reactive ack's precondition).
@@ -232,7 +233,7 @@ test("opening a session at a mid-history anchor keeps the dot", async ({ page })
   //    appends a user + assistant message; 3 turns comfortably overflow the
   //    ~70px chat-scroll clientHeight at this 320px viewport. Serial turns
   //    (settle between each) avoid concurrent simulatePrompt on one session.
-  await page.goto("/?session=other");
+  await page.goto(projectUrl("/?session=other"));
   await expect(page.locator(".msg").first()).toBeVisible({ timeout: 10000 });
   for (let i = 0; i < 3; i++) {
     await promptSession(
@@ -256,7 +257,7 @@ test("opening a session at a mid-history anchor keeps the dot", async ({ page })
   await page.waitForTimeout(600);
   // 3. Switch away to demo. The anchor persists (the session-switch effect
   //    cancels only the PENDING debounce, which already fired and wrote).
-  await page.goto("/?session=demo");
+  await page.goto(projectUrl("/?session=demo"));
   await waitForTree(page);
   // 4. Prompt `other` while it is NOT selected → busy→idle → markUnread → dot.
   await promptSession(page, "other", "unread-dot guard probe");
@@ -266,7 +267,7 @@ test("opening a session at a mid-history anchor keeps the dot", async ({ page })
   //    restores to the anchor: following=false, scrollTop at the anchor (top),
   //    NOT the bottom. The anchor branch does not ack; following/nearBottom are
   //    false so the reactive effect and onScrolled don't fire either → dot STAYS.
-  await page.goto("/?session=other");
+  await page.goto(projectUrl("/?session=other"));
   await expect(page.locator(".msg").first()).toBeVisible({ timeout: 10000 });
   // (a) Restored to the mid-history anchor, NOT pinned at the bottom (at least
   //     24px — the app's nearBottom threshold — shy of the max scroll).
@@ -304,7 +305,7 @@ test("scroll-up read position survives a fast (<400ms) session switch (P1-WEB-00
   await page.setViewportSize(VP);
   // 1. Build an overflowing transcript in `other` (same seed shape as the guard
   //    test). 3 turns comfortably overflow the ~70px chat clientHeight at 320px.
-  await page.goto("/?session=other");
+  await page.goto(projectUrl("/?session=other"));
   await expect(page.locator(".msg").first()).toBeVisible({ timeout: 10000 });
   // Clear any stale read anchor left on `other` by earlier serial-suite tests
   // (e.g. the guard test writes a mid-history anchor that persists in
@@ -344,7 +345,7 @@ test("scroll-up read position survives a fast (<400ms) session switch (P1-WEB-00
   //    starts -1 → self-pin bail protects the anchor through the empty-content
   //    window. maybeRestore defers until the snapshot arrives, then restores to
   //    the anchor written from the stash → NOT pinned at the bottom.
-  await page.goto("/?session=other");
+  await page.goto(projectUrl("/?session=other"));
   await expect(page.locator(".msg").first()).toBeVisible({ timeout: 10000 });
   // Before the fix: anchor lost → maybeRestore no-anchor branch → pinned to
   //    bottom. After the fix: anchor written from the stash → restored to top.
@@ -370,7 +371,7 @@ test("scroll-up read position survives a fast (<400ms) session switch (P1-WEB-00
 // openSession-clears-messages onScrolled side effect).
 test("scroll back to bottom invalidates the arm-time stash (P1-WEB-004)", async ({ page }) => {
   await page.setViewportSize(VP);
-  await page.goto("/?session=other");
+  await page.goto(projectUrl("/?session=other"));
   await expect(page.locator(".msg").first()).toBeVisible({ timeout: 10000 });
   // Clear stale read anchor from prior serial-suite tests (see test (4)'s comment).
   await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
@@ -407,7 +408,7 @@ test("scroll back to bottom invalidates the arm-time stash (P1-WEB-004)", async 
   expect(await readAnchor(page, "other")).toBeUndefined();
   // 5. Reopen `other` via fresh page load. No anchor → maybeRestore's no-anchor
   //    branch pins to the bottom.
-  await page.goto("/?session=other");
+  await page.goto(projectUrl("/?session=other"));
   await expect(page.locator(".msg").first()).toBeVisible({ timeout: 10000 });
   // Without the invalidation, the stale stash would have written a mid-history
   // anchor → restored away from the bottom. With the fix, the stash was cleared
@@ -503,7 +504,7 @@ test("in-app switch to an empty uncached session preserves its stored read ancho
   // ── FROM session: mount ChatView with seeded content so ready()=true before
   //     the switch. demo has seeded overflow; no prompting keeps the test
   //     deterministic across repeat-each iterations (no fixture state leak).
-  await page.goto("/?session=demo");
+  await page.goto(projectUrl("/?session=demo"));
   await expect(page.locator(".chat-scroll")).toBeVisible({ timeout: 10000 });
   await expect(page.locator(".msg[data-mid]").first()).toBeVisible({ timeout: 10000 });
   // Sanity: slow's seeded anchor loaded into the in-memory cache at init.

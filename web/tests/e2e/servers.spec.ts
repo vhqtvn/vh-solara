@@ -1,7 +1,8 @@
 import { expect, test } from "@playwright/test";
+import { projectUrl } from "./util";
 
 test("plugins tab shows the full plugin id, not a truncated trailing '…'", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   await page.getByRole("button", { name: "Servers" }).click();
   await page.getByRole("tab", { name: "Plugins" }).click();
 

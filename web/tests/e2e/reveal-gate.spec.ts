@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { projectUrl } from "./util";
 
 // Regression guard for the ChatView VISUAL REVEAL GATE (.chat-content opacity).
 //
@@ -27,7 +28,7 @@ import { expect, test } from "@playwright/test";
 test("slow session: .chat-content hides at opacity:0 during hydration then reveals at opacity:1", async ({
   page,
 }) => {
-  await page.goto("/?session=slow");
+  await page.goto(projectUrl("/?session=slow"));
   const content = page.locator(".chat-content");
 
   // Wait for the element to attach. Deliberately NOT `toBeVisible` — it cannot

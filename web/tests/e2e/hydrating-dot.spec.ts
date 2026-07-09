@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { projectUrl } from "./util";
 
 // Pins the CURRENT behaviour of the ".dot.hydrating" indicator after its driver
 // switched from the removed `state.hydrated` mirror to `messagesLoaded[id]`.
@@ -113,7 +114,7 @@ async function createNeverOpenedSession(page: Page): Promise<string> {
 // DESIRED (dot absent) assertion gates the test.
 test("never-opened idle session must not show a permanent hydrating dot", async ({ page }) => {
   await page.setViewportSize(VP);
-  await page.goto("/?session=demo");
+  await page.goto(projectUrl("/?session=demo"));
   await waitForTree(page);
 
   // Create a guaranteed never-opened session (see strategy above).
@@ -128,7 +129,7 @@ test("never-opened idle session must not show a permanent hydrating dot", async 
   // Reload so Stream-1 reconnects and renders `id` from a fresh snapshot. Under
   // the messagesLoaded driver this does NOT arm the dot (messagesLoaded[id]
   // stays undefined for an idle never-opened row).
-  await page.goto("/?session=demo");
+  await page.goto(projectUrl("/?session=demo"));
   await waitForTree(page);
   await expect(page.locator(`.tree-node[data-session-id="${id}"]`)).toBeVisible({
     timeout: 10000,
@@ -165,7 +166,7 @@ test("never-opened idle session must not show a permanent hydrating dot", async 
 // state.
 test("selecting a never-opened session must clear its hydrating dot", async ({ page }) => {
   await page.setViewportSize(VP);
-  await page.goto("/?session=demo");
+  await page.goto(projectUrl("/?session=demo"));
   await waitForTree(page);
 
   const id = await createNeverOpenedSession(page);
@@ -174,7 +175,7 @@ test("selecting a never-opened session must clear its hydrating dot", async ({ p
   });
   // Reload → fresh Stream-1 snapshot. Under the messagesLoaded driver `id`
   // stays idle (messagesLoaded===undefined → no dot).
-  await page.goto("/?session=demo");
+  await page.goto(projectUrl("/?session=demo"));
   await waitForTree(page);
   await expect(page.locator(`.tree-node[data-session-id="${id}"]`)).toBeVisible({
     timeout: 10000,

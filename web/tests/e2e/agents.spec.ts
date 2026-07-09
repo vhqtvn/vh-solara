@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { projectUrl } from "./util";
 
 // The agent-styles editor reads/writes the project's .vh-solara/project.jsonc via
 // /vh/project-settings. We intercept that endpoint so the test owns the data and
@@ -25,7 +26,7 @@ test("agent-styles editor edits a row, previews a diff, and saves", async ({ pag
     }
   });
 
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   // Reach the editor via the settings gear beside the project switcher.
   await page.locator(".proj-settings").click();
 

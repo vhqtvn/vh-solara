@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { projectUrl } from "./util";
 
 // Safety-net for the ChatView navigator (one of the pieces a ChatView
 // decomposition would extract). The demo session has two user turns, so on a
@@ -6,7 +7,7 @@ import { expect, test } from "@playwright/test";
 // to that turn. Locks the behaviour before extracting <ChatNavigator>.
 
 test("desktop turn navigator shows a dot per turn and jumps on click", async ({ page }) => {
-  await page.goto("/?session=demo");
+  await page.goto(projectUrl("/?session=demo"));
   await expect(page.locator(".msg").first()).toBeVisible({ timeout: 8000 });
 
   const nav = page.locator(".chat-nav");

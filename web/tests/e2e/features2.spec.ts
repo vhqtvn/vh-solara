@@ -1,7 +1,8 @@
 import { expect, test } from "@playwright/test";
+import { projectUrl } from "./util";
 
 test("composer agent reflects the session's last-used agent; new sessions use the config default", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   // The demo session's most recent assistant turn ran @build, so the composer
   // restores THAT per session — not the global/config default.
   await page.getByRole("button", { name: /Demo session/ }).click();
@@ -26,7 +27,7 @@ test("project agentStyles render a colored agent chip and a picker swatch", asyn
     if (route.request().url().includes("/project-settings/watch")) return route.continue();
     return route.fulfill({ json: { agentStyles: { build: { label: "BLD", color: "warn", style: "solid" } } } });
   });
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   // Open the demo session so its messages (and last agent @build) are loaded.
   await page.getByRole("button", { name: /Demo session/ }).click();
 
@@ -43,7 +44,7 @@ test("project agentStyles render a colored agent chip and a picker swatch", asyn
 });
 
 test("header servers popover has Server/MCP/LSP/Plugins tabs", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   // Opened from a header status button (opencode-web style), not Settings.
   await page.getByRole("button", { name: "Servers" }).click();
   const pop = page.getByRole("dialog", { name: "Servers" });
@@ -61,7 +62,7 @@ test("header servers popover has Server/MCP/LSP/Plugins tabs", async ({ page }) 
 });
 
 test("empty state invites a new session", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   await expect(page.locator(".empty-title")).toContainText("VHSolara");
   await page.locator(".empty-cta").click();
   // Selecting/creating a session replaces the empty state with the chat.
@@ -70,7 +71,7 @@ test("empty state invites a new session", async ({ page }) => {
 });
 
 test("settings appearance has a configurable display font", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   await page.getByRole("button", { name: "Settings" }).click();
   const dialog = page.getByRole("dialog", { name: "Settings" });
   await dialog.getByRole("button", { name: "Appearance" }).click();
@@ -87,7 +88,7 @@ test("settings appearance has a configurable display font", async ({ page }) => 
 });
 
 test("session list detailed density adds a second line per session", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   // No second line in the default (compact) density.
   await expect(page.locator(".tree-sub")).toHaveCount(0);
   await page.getByRole("button", { name: "Settings" }).click();
@@ -103,7 +104,7 @@ test("session list detailed density adds a second line per session", async ({ pa
 });
 
 test("composer autocompletes @file, @agent and /command", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   await page.getByRole("button", { name: /Demo session/ }).click();
   const composer = page.getByPlaceholder("Message…");
 
@@ -121,7 +122,7 @@ test("composer autocompletes @file, @agent and /command", async ({ page }) => {
 });
 
 test("Cmd/Ctrl+K command palette runs an action", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   await page.keyboard.press("Control+k");
   const palette = page.getByRole("dialog", { name: "Command palette" });
   await expect(palette).toBeVisible();
@@ -134,7 +135,7 @@ test("Cmd/Ctrl+K command palette runs an action", async ({ page }) => {
 });
 
 test("settings App section (browser only) offers PWA install + orientation note", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   await page.getByRole("button", { name: "Settings" }).click();
   const dialog = page.getByRole("dialog", { name: "Settings" });
   // In a plain browser tab the App section is present.
@@ -145,7 +146,7 @@ test("settings App section (browser only) offers PWA install + orientation note"
 });
 
 test("settings has Appearance, General, Servers and About sections", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   await page.getByRole("button", { name: "Settings" }).click();
   const dialog = page.getByRole("dialog", { name: "Settings" });
   for (const s of ["Appearance", "General", "Usage", "About"]) {
@@ -154,7 +155,7 @@ test("settings has Appearance, General, Servers and About sections", async ({ pa
 });
 
 test("message inspect shows tokens/cost/raw JSON", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   await page.getByRole("button", { name: /Demo session/ }).click();
   const msg = page.locator(".msg.assistant").first();
   await msg.hover();
@@ -165,14 +166,14 @@ test("message inspect shows tokens/cost/raw JSON", async ({ page }) => {
 test("clicking a file path opens it in the code viewer", async ({ page }) => {
   // The old modal FileViewer was replaced by the code viewer: a clicked path now
   // opens the docked (desktop) / overlay (mobile) code surface, not a dialog.
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   await page.getByRole("button", { name: /Demo session/ }).click();
   await page.locator(".filepath", { hasText: "src/parser.go" }).first().click();
   await expect(page.locator(".code-dock.dock, .code-dock.overlay")).toBeVisible({ timeout: 6000 });
 });
 
 test("UI zoom scales the interface and persists (versioned)", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   await page.getByRole("button", { name: "Settings" }).click();
   const dialog = page.getByRole("dialog", { name: "Settings" });
   await dialog.getByRole("button", { name: "Appearance" }).click();
@@ -193,7 +194,7 @@ test("UI zoom scales the interface and persists (versioned)", async ({ page }) =
 });
 
 test("hovering a control shows a DOM tooltip (not native title)", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   // No native title attributes anywhere (they spawn windows in some WMs).
   await expect(page.locator("[title]")).toHaveCount(0);
   // data-tip drives a DOM tooltip on hover.
@@ -202,7 +203,7 @@ test("hovering a control shows a DOM tooltip (not native title)", async ({ page 
 });
 
 test("settings toggles live message streaming", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   await page.getByRole("button", { name: "Settings" }).click();
   const dialog = page.getByRole("dialog", { name: "Settings" });
   await dialog.getByRole("button", { name: "General" }).click();
@@ -213,6 +214,13 @@ test("settings toggles live message streaming", async ({ page }) => {
 });
 
 test("attaching a file shows a chip, uploads, and clears after send", async ({ page }) => {
+  // Resisted-consolidation: the upload (POST /vh/attach) writes to
+  // <projectRoot>/.vh-solara/sessions/<id>/attachments/ (pkg/web/attach.go).
+  // projectRoot("/work/demo") resolves to the fake "/work/demo" which can't be
+  // created at the FS root (no root perm), so the upload 500s and no chip
+  // appears. Only the cwd/Default project (a real temp dir the fixtureserver
+  // chdirs into) is writable. Commit 2 (removes the default project) must give
+  // the fixture a real writable project dir and migrate this goto.
   await page.goto("/");
   await page.getByRole("button", { name: /Demo session/ }).click();
   await page.locator(".composer input[type=file]").setInputFiles({
@@ -229,7 +237,7 @@ test("attaching a file shows a chip, uploads, and clears after send", async ({ p
 });
 
 test("shell mode (! prefix) runs a command and shows output", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   await page.getByRole("button", { name: /Demo session/ }).click();
   await page.getByPlaceholder(/Message/).fill("!ls -la");
   await page.keyboard.press("Enter");

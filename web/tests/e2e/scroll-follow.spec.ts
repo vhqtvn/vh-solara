@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { projectUrl } from "./util";
 
 // Regression guard for the "↓ Latest" scroll-to-bottom button in ChatView.
 //
@@ -155,7 +156,7 @@ test.beforeEach(async ({ page, request }) => {
   });
   expect(reset.ok()).toBe(true);
   await page.setViewportSize(VP);
-  await page.goto("/?session=demo");
+  await page.goto(projectUrl("/?session=demo"));
   await expect(page.locator(".msg").first()).toBeVisible({ timeout: 10000 });
   // Safety net: confirm demo is idle after the reset (absorbs any leaked goroutine).
   await expect(page.locator(".working-text")).toHaveCount(0, { timeout: 8000 });
@@ -528,7 +529,7 @@ test("a viewport shrink while Live re-glues to the tail", async ({ page }) => {
   // ~348px (the non-scroll chrome — header/.chat-status/.composer-wrap — eats the
   // rest); the demo transcript (scrollHeight ~1450) still overflows at this size.
   await page.setViewportSize({ width: VP.width, height: 600 });
-  await page.goto("/?session=demo");
+  await page.goto(projectUrl("/?session=demo"));
   await expect(page.locator(".msg").first()).toBeVisible({ timeout: 10000 });
 
   // Glue to the tail deterministically (app's onScrolled sets following=true near
@@ -768,7 +769,7 @@ test("reopen of a busy session at a stored anchor is not yanked to the tail", as
     );
   });
   await page.setViewportSize(VP);
-  await page.goto("/?session=demo");
+  await page.goto(projectUrl("/?session=demo"));
   await expect(page.locator(".msg").first()).toBeVisible({ timeout: 10000 });
 
   // The anchor restored: viewport is at m4 (mid-history), NOT at the bottom.

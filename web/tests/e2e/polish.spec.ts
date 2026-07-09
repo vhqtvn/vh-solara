@@ -1,7 +1,8 @@
 import { expect, test } from "@playwright/test";
+import { projectUrl } from "./util";
 
 test("messages show timestamps, code blocks have a copy button, retry resends", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   await page.getByRole("button", { name: /Demo session/ }).click();
 
   // Relative timestamp on messages (sub-minute reads "just now"; older reads
@@ -20,7 +21,7 @@ test("messages show timestamps, code blocks have a copy button, retry resends", 
 });
 
 test("assistant messages show the model beside the role", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   await page.getByRole("button", { name: /Demo session/ }).click();
 
   // The seeded assistant turn carries model {fake/dummy-think, variant high};

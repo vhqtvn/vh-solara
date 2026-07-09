@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { projectUrl } from "./util";
 
 // P1-WEB-003: Playwright e2e coverage for the scroll read-position feature.
 // Two sub-tasks that the existing browser-smoke suite did NOT exercise:
@@ -153,7 +154,7 @@ async function rowGeometry(page: Page, mid: string) {
 // completion latch retention — the precise gap C-F1 flagged.
 test("mid-stream scroll up surfaces the Latest button through stream completion", async ({ page }) => {
   await page.setViewportSize(VP);
-  await page.goto("/?session=demo");
+  await page.goto(projectUrl("/?session=demo"));
   await expect(page.locator(".msg").first()).toBeVisible({ timeout: 10000 });
   // Glue to the tail (following=true). The demo transcript overflows at
   // 400×320 (scrollHeight ~1450 vs clientHeight ~70), so scrolling up is
@@ -225,7 +226,7 @@ test("mid-stream scroll up surfaces the Latest button through stream completion"
 // not the row we intended).
 test("reload lands on the stored read-anchor [data-mid] row", async ({ page }) => {
   await page.setViewportSize(VP);
-  await page.goto("/?session=other");
+  await page.goto(projectUrl("/?session=other"));
   // `other` starts EMPTY in the fixture (no seed messages, unlike `demo`). Wait
   // for the chat view to mount (not for messages — there are none yet), then
   // build the transcript before asserting/gluing.

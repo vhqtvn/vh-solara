@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { projectUrl } from "./util";
 
 // The sidebar header must keep every control on a SINGLE line and never clip a
 // button: the wordmark ("VHSolara") is the only flexible item, so it yields —
@@ -15,7 +16,7 @@ function within(b: { x: number; y: number; width: number; height: number } | nul
 }
 
 test("desktop: wordmark shows at full width, all controls on one line", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   const head = page.locator(".sidebar-head");
   await expect(head).toBeVisible();
   await expect(head.locator("strong")).toBeVisible();
@@ -35,7 +36,7 @@ test("desktop: wordmark shows at full width, all controls on one line", async ({
 });
 
 test("narrow sidebar: wordmark drops, logo + buttons stay on one line", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(projectUrl("/"));
   await page.evaluate(() => document.documentElement.style.setProperty("--sidebar-w", "200px"));
   const head = page.locator(".sidebar-head");
   await expect(head.locator("strong")).toBeHidden(); // container query hides it
@@ -54,7 +55,7 @@ test.describe("touch / mobile", () => {
   test.use({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, deviceScaleFactor: 3 });
 
   test("comfortable touch targets, wordmark dropped, nothing wraps or clips", async ({ page }) => {
-    await page.goto("/");
+    await page.goto(projectUrl("/"));
     // Bring the slide-over sidebar fully on-screen (kill the slide transform so
     // measurements aren't taken mid-animation).
     await page.evaluate(() => {
