@@ -1,4 +1,15 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
+
+// The dismiss directive (lib/a11y.ts) arms its keydown (Escape) + click
+// (outside-click) listeners on a setTimeout(0) AFTER the overlay mounts — so the
+// click that opened the dialog can't immediately dismiss it. A test that opens
+// the dialog and then presses Escape in the very next step can race ahead of
+// that arming (toBeVisible resolves synchronously with the mount, before the
+// arming macrotask fires) and the Escape is lost. Yield one page event-loop turn
+// so the listener is attached before relying on Escape dismissal.
+async function armDismiss(page: Page) {
+  await page.evaluate(() => new Promise<void>((r) => setTimeout(r, 0)));
+}
 
 // The project switcher opens as a DIALOG (Slice 1): clicking the .proj-current
 // trigger mounts a .dialog-overlay/.dialog containing the project rows, recents,
@@ -189,4 +200,192 @@ test("project switcher filters rows by search and shows a no-results state", asy
   await expect(page.locator(".proj-item-name", { hasText: "Default" })).toBeVisible();
   await expect(page.locator(".proj-item-name", { hasText: "alpha" })).toBeVisible();
   await expect(page.locator(".proj-item-name", { hasText: "beta" })).toBeVisible();
+});
+
+// Slice 3: removing a pinned project requires an inline confirmation, so a stray
+// tap can't drop a project. The row swaps its remove (✕) button for inline
+// Confirm/Cancel controls — no separate dialog, no window.confirm. Only one row
+// may be in confirm state at a time (starting remove on another row supersedes).
+test("project switcher confirms inline before removing a pinned project", async ({ browser }) => {
+  // Fresh context (own localStorage) so pin state is self-contained and this
+  // doesn't depend on prior serial tests.
+  const ctx = await browser.newContext();
+  const page = await ctx.newPage();
+  await page.goto("/");
+
+  // Pin alpha + beta via recents so there are TWO removable pinned rows (Default
+  // has no remove button: directory "" → can't be unpinned).
+  await page.locator(".proj-current").click();
+  await expect(page.getByRole("dialog", { name: "Switch project" })).toBeVisible();
+  await page.locator(".proj-pick", { hasText: "alpha" }).click();
+  await expect(page.locator(".proj-name")).toContainText("alpha", { timeout: 8000 });
+
+  await page.locator(".proj-current").click();
+  await page.locator(".proj-pick", { hasText: "beta" }).click();
+  await expect(page.locator(".proj-name")).toContainText("beta", { timeout: 8000 });
+
+  // Reopen; both alpha and beta are now pinned (removable) rows.
+  await page.locator(".proj-current").click();
+  const dialog = page.getByRole("dialog", { name: "Switch project" });
+  await expect(dialog).toBeVisible();
+
+  // (1) Clicking remove does NOT remove immediately: the inline confirm controls
+  // appear, and alpha is still listed. (Semantic locators for the new controls.)
+  await dialog.getByRole("button", { name: "Remove alpha", exact: true }).click();
+  await expect(dialog.getByRole("button", { name: "Confirm remove alpha", exact: true })).toBeVisible();
+  await expect(dialog.getByRole("button", { name: "Cancel remove alpha", exact: true })).toBeVisible();
+  await expect(dialog.locator(".proj-item-name", { hasText: "alpha" })).toBeVisible();
+
+  // (2) Only ONE row can be pending at a time: starting remove on beta supersedes
+  // alpha's confirm — beta is now confirming, alpha reverted to its normal button.
+  await dialog.getByRole("button", { name: "Remove beta", exact: true }).click();
+  await expect(dialog.getByRole("button", { name: "Confirm remove beta", exact: true })).toBeVisible();
+  await expect(dialog.getByRole("button", { name: "Confirm remove alpha", exact: true })).toHaveCount(0);
+  await expect(dialog.getByRole("button", { name: "Remove alpha", exact: true })).toBeVisible();
+
+  // (3) Cancel keeps the project pinned: beta's confirm controls vanish and beta
+  // is still removable (its remove button is back).
+  await dialog.getByRole("button", { name: "Cancel remove beta", exact: true }).click();
+  await expect(dialog.getByRole("button", { name: "Confirm remove beta", exact: true })).toHaveCount(0);
+  await expect(dialog.getByRole("button", { name: "Remove beta", exact: true })).toBeVisible();
+
+  // (4) Confirm actually unpins: start alpha's confirm, then confirm it. alpha's
+  // remove button is gone afterwards (recents have NO remove buttons, so an
+  // absent "Remove alpha" button proves alpha is no longer pinned even if it
+  // reappears under "Recent (OpenCode)").
+  await dialog.getByRole("button", { name: "Remove alpha", exact: true }).click();
+  await dialog.getByRole("button", { name: "Confirm remove alpha", exact: true }).click();
+  await expect(dialog.getByRole("button", { name: "Remove alpha", exact: true })).toHaveCount(0);
+
+  await ctx.close();
+});
+
+// --- Dismissal + confirm-reset state machine (the F1 regression surface) ---
+// The use:dismiss wiring bug silently disabled BOTH outside-click and Escape
+// dismissal. These verify dismissal (Escape + backdrop click) and the pending-
+// confirm reset branches. Locators are semantic (getByRole dialog/button,
+// getByLabel) for dialog-open and confirm/cancel controls; the backdrop click
+// targets the structural .dialog-overlay element (an action target, not a
+// state assertion, so it is not subject to the pre-existing CSS-selector flake).
+
+// Escape with no inline confirm pending closes the whole dialog (onEscape ->
+// setOpen(false)). This is one of the branches F1 had dead.
+test("project switcher closes on Escape when no confirm is pending", async ({ page }) => {
+  await page.goto("/");
+  await page.locator(".proj-current").click();
+  const dialog = page.getByRole("dialog", { name: "Switch project" });
+  await expect(dialog).toBeVisible();
+
+  // With no inline confirm pending, Escape closes the whole dialog. Arm first —
+  // see armDismiss — so the press doesn't race the directive's setTimeout(0).
+  await armDismiss(page);
+  await page.keyboard.press("Escape");
+  await expect(dialog).not.toBeVisible();
+});
+
+// Clicking the overlay backdrop (outside the centered .dialog panel) closes the
+// dialog (onClose -> setOpen(false)). The other branch F1 had dead.
+test("project switcher closes on an outside (backdrop) click", async ({ page }) => {
+  await page.goto("/");
+  await page.locator(".proj-current").click();
+  const dialog = page.getByRole("dialog", { name: "Switch project" });
+  await expect(dialog).toBeVisible();
+
+  // The overlay is fixed full-screen (inset:0) with 16px padding around the
+  // centered 480px dialog, so a point in the top-left padding band is guaranteed
+  // off the panel and lands on the overlay backdrop.
+  const overlay = page.locator(".dialog-overlay");
+  await overlay.click({ position: { x: 8, y: 8 } });
+  await expect(dialog).not.toBeVisible();
+});
+
+// Escape while an inline confirm is pending cancels the confirm (Split mode:
+// onEscape differs from onClose) and keeps the dialog open.
+test("project switcher: Escape cancels a pending confirm and keeps the dialog open", async ({ browser }) => {
+  // Fresh context (own localStorage) so pin state is self-contained.
+  const ctx = await browser.newContext();
+  const page = await ctx.newPage();
+  await page.goto("/");
+
+  // Pin alpha via recents so it is a removable pinned row.
+  await page.locator(".proj-current").click();
+  await expect(page.getByRole("dialog", { name: "Switch project" })).toBeVisible();
+  await page.locator(".proj-pick", { hasText: "alpha" }).click();
+  await expect(page.locator(".proj-name")).toContainText("alpha", { timeout: 8000 });
+
+  // Reopen and start alpha's inline confirm.
+  await page.locator(".proj-current").click();
+  const dialog = page.getByRole("dialog", { name: "Switch project" });
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole("button", { name: "Remove alpha", exact: true }).click();
+  await expect(dialog.getByRole("button", { name: "Confirm remove alpha", exact: true })).toBeVisible();
+
+  // Escape cancels the confirm (alpha's normal remove button returns) but does
+  // NOT close the dialog.
+  await page.keyboard.press("Escape");
+  await expect(dialog.getByRole("button", { name: "Confirm remove alpha", exact: true })).toHaveCount(0);
+  await expect(dialog.getByRole("button", { name: "Remove alpha", exact: true })).toBeVisible();
+  await expect(dialog).toBeVisible();
+
+  await ctx.close();
+});
+
+// A pending confirm must not survive a dialog close/reopen (the createEffect
+// that resets pendingRemove when open() goes false).
+test("project switcher: a pending confirm resets when the dialog closes and reopens", async ({ browser }) => {
+  const ctx = await browser.newContext();
+  const page = await ctx.newPage();
+  await page.goto("/");
+
+  await page.locator(".proj-current").click();
+  await expect(page.getByRole("dialog", { name: "Switch project" })).toBeVisible();
+  await page.locator(".proj-pick", { hasText: "alpha" }).click();
+  await expect(page.locator(".proj-name")).toContainText("alpha", { timeout: 8000 });
+
+  // Open, start alpha's confirm, then close via the X button.
+  await page.locator(".proj-current").click();
+  const dialog = page.getByRole("dialog", { name: "Switch project" });
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole("button", { name: "Remove alpha", exact: true }).click();
+  await expect(dialog.getByRole("button", { name: "Confirm remove alpha", exact: true })).toBeVisible();
+  await dialog.getByRole("button", { name: "Close", exact: true }).click();
+  await expect(dialog).not.toBeVisible();
+
+  // Reopen: no confirm lingers — alpha shows its normal remove button, not the
+  // confirm cluster.
+  await page.locator(".proj-current").click();
+  const reopened = page.getByRole("dialog", { name: "Switch project" });
+  await expect(reopened).toBeVisible();
+  await expect(reopened.getByRole("button", { name: "Confirm remove alpha", exact: true })).toHaveCount(0);
+  await expect(reopened.getByRole("button", { name: "Remove alpha", exact: true })).toBeVisible();
+
+  await ctx.close();
+});
+
+// Typing into search cancels a pending confirm (the onInput handler resets
+// pendingRemove alongside setQuery).
+test("project switcher: typing in search cancels a pending confirm", async ({ browser }) => {
+  const ctx = await browser.newContext();
+  const page = await ctx.newPage();
+  await page.goto("/");
+
+  await page.locator(".proj-current").click();
+  await expect(page.getByRole("dialog", { name: "Switch project" })).toBeVisible();
+  await page.locator(".proj-pick", { hasText: "alpha" }).click();
+  await expect(page.locator(".proj-name")).toContainText("alpha", { timeout: 8000 });
+
+  await page.locator(".proj-current").click();
+  const dialog = page.getByRole("dialog", { name: "Switch project" });
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole("button", { name: "Remove alpha", exact: true }).click();
+  await expect(dialog.getByRole("button", { name: "Confirm remove alpha", exact: true })).toBeVisible();
+
+  // "alpha" keeps alpha in the filtered list so the row/remove-button assertion
+  // is robust to list re-filtering.
+  const search = dialog.getByLabel("Search projects");
+  await search.fill("alpha");
+  await expect(dialog.getByRole("button", { name: "Confirm remove alpha", exact: true })).toHaveCount(0);
+  await expect(dialog.getByRole("button", { name: "Remove alpha", exact: true })).toBeVisible();
+
+  await ctx.close();
 });

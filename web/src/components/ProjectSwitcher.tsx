@@ -1,4 +1,4 @@
-import { createMemo, createResource, createSignal, For, Show } from "solid-js";
+import { createEffect, createMemo, createResource, createSignal, For, Show } from "solid-js";
 import {
   ActivityMaps,
   addProject,
@@ -46,6 +46,52 @@ export default function ProjectSwitcher() {
   }
 
   const current = () => projects().find((p) => p.directory === projectDir()) || projects()[0];
+
+  // Inline remove-confirm state (Slice 3): clicking a pinned row's remove
+  // button does NOT unpin immediately — instead that row enters a confirm
+  // state showing inline Confirm/Cancel controls. Only ONE row can be pending
+  // at a time: starting confirm on a different row overwrites this signal, so
+  // the previous row reverts to its normal remove button (supersede — simpler
+  // and more predictable than cancelling-first). Held as a single directory
+  // string (or null), so the single-value signal itself enforces the one-at-a-
+  // time rule with no extra bookkeeping.
+  const [pendingRemove, setPendingRemove] = createSignal<string | null>(null);
+  function startRemove(directory: string) {
+    setPendingRemove(directory);
+  }
+  function confirmRemove(directory: string) {
+    removeProject(directory);
+    setPendingRemove(null);
+  }
+  function cancelRemove() {
+    setPendingRemove(null);
+  }
+  // Reset the pending state whenever the dialog closes (covers every close
+  // path: overlay click, close button, Escape, selecting a project, Add…). A
+  // stale confirm state must never persist on a row that is now hidden.
+  createEffect(() => {
+    if (!open()) setPendingRemove(null);
+  });
+
+  // Dismissal config for use:dismiss on the overlay. MUST be passed as an
+  // OBJECT (not wrapped in an arrow): Solid compiles use:dismiss={expr} so the
+  // directive receives an accessor () => expr, and dismiss() runs value() once
+  // to pick its branch (a11y.ts: typeof v === "function" ? v : v.onClose).
+  // Wrapping in `() => ({...})` makes value() return that arrow, takes the
+  // function branch, and silently wires onClose/onEscape to a no-op arrow —
+  // outside-click AND Escape dismissal both go dead. The object form makes
+  // value() return the config so onClose (outside-click) closes the dialog and
+  // onEscape cancels a pending confirm first, else closes. (ManagedPanel uses
+  // the same const form — see its dismissOpts.)
+  const dismissOpts = {
+    onClose: () => setOpen(false),
+    onEscape: () => {
+      // Escape cancels an inline confirm first (rather than closing the whole
+      // dialog); if no confirm is pending, Escape closes as usual.
+      if (pendingRemove()) setPendingRemove(null);
+      else setOpen(false);
+    },
+  };
 
   // Recents not already pinned (and not the active one).
   const freshRecents = createMemo(() => {
@@ -101,7 +147,7 @@ export default function ProjectSwitcher() {
         <Icon name="chevronDown" size={14} />
       </button>
       <Show when={open()}>
-        <div class="dialog-overlay" use:dismiss={() => setOpen(false)} onClick={() => setOpen(false)}>
+        <div class="dialog-overlay" use:dismiss={dismissOpts} onClick={() => setOpen(false)}>
           <div
             class="dialog projects-dialog"
             role="dialog"
@@ -116,7 +162,7 @@ export default function ProjectSwitcher() {
                 autocomplete="off"
                 aria-label="Search projects"
                 value={query()}
-                onInput={(e) => setQuery(e.currentTarget.value)}
+                onInput={(e) => (setQuery(e.currentTarget.value), setPendingRemove(null))}
               />
               <button type="button" class="icon-btn" aria-label="Close" onClick={() => setOpen(false)}>
                 <Icon name="x" size={14} />
@@ -163,15 +209,40 @@ export default function ProjectSwitcher() {
                       </span>
                     </button>
                     <Show when={p.directory}>
-                      <button
-                        type="button"
-                        class="proj-remove"
-                        aria-label="Remove project"
-                        data-tip="Remove from list"
-                        onClick={(e) => (e.stopPropagation(), removeProject(p.directory))}
+                      <Show
+                        when={pendingRemove() === p.directory}
+                        fallback={
+                          <button
+                            type="button"
+                            class="proj-remove"
+                            aria-label={`Remove ${p.name}`}
+                            data-tip="Remove from list"
+                            onClick={(e) => (e.stopPropagation(), startRemove(p.directory))}
+                          >
+                            <Icon name="x" size={13} />
+                          </button>
+                        }
                       >
-                        <Icon name="x" size={13} />
-                      </button>
+                        <span class="proj-confirm">
+                          <span class="proj-confirm-text" aria-hidden="true">Remove?</span>
+                          <button
+                            type="button"
+                            class="proj-confirm-go"
+                            aria-label={`Confirm remove ${p.name}`}
+                            onClick={(e) => (e.stopPropagation(), confirmRemove(p.directory))}
+                          >
+                            Remove
+                          </button>
+                          <button
+                            type="button"
+                            class="proj-confirm-cancel"
+                            aria-label={`Cancel remove ${p.name}`}
+                            onClick={(e) => (e.stopPropagation(), cancelRemove())}
+                          >
+                            Cancel
+                          </button>
+                        </span>
+                      </Show>
                     </Show>
                   </div>
                 )}
