@@ -2423,7 +2423,7 @@ body {
 
 /* --- session inspector --- */
 .dialog.inspector { max-width: 520px; }
-.dialog-title { font-weight: 600; flex: 1; }
+.dialog-title { font-weight: 600; flex: 1; display: flex; align-items: center; gap: 6px; }
 .insp-sub { font-weight: 600; padding: 4px 4px 0; }
 .insp-sub.dim { font-weight: 400; font-size: 13px; color: var(--fg-dim); padding-top: 2px; }
 .insp-grid {
@@ -3452,6 +3452,10 @@ body {
 /* OpenCode update dialog */
 .ocu-overlay { z-index: 150; } /* above the admin popup (z-index 60) it's launched from */
 .dialog.ocu { width: 520px; }
+/* Stack the icon above the "Update OpenCode" label. Scoped to this dialog so
+   the shared .dialog-title base rule (inline icon + label) stays intact for
+   every other dialog. */
+.dialog.ocu .dialog-title { flex-direction: column; align-items: flex-start; gap: 2px; }
 .ocu-body { padding: 12px; display: flex; flex-direction: column; gap: 10px; }
 .ocu-foot {
   display: flex;
