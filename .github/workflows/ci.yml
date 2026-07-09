@@ -83,7 +83,7 @@ jobs:
         run: npm ci
       - name: install Playwright browser
         working-directory: web
-        run: npx playwright install --with-deps chromium
+        run: npx playwright install --with-deps chromium firefox
       - name: e2e
         working-directory: web
         run: npm run test:e2e

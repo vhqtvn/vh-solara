@@ -42,7 +42,17 @@ export default defineConfig({
     screenshot: "only-on-failure",
     video: "retain-on-failure",
   },
-  projects: [{ name: "chromium", use: { ...devices["Desktop Chrome"] } }],
+  projects: [
+    { name: "chromium", use: { ...devices["Desktop Chrome"] } },
+    // Firefox runs ONLY the codeview regression. The parent<->iframe ready
+    // handshake can lose the open command on firefox (the child's vh-code:ready
+    // is processed before the iframe `load` event, so the parent flushed through
+    // a still-null frame reference) but not on chromium, which ordered them the
+    // other way and masked the bug. codeview.spec.ts is the one flow that needs
+    // a second engine. Scoped via testMatch so the serial, fixture-state-shared
+    // suite is NOT re-run wholesale on a second engine (flakiness/noise).
+    { name: "firefox", use: { ...devices["Desktop Firefox"] }, testMatch: /codeview\.spec\.ts/ },
+  ],
   webServer: useExistingWebServer
     ? undefined
     : {

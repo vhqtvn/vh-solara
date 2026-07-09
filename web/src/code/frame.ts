@@ -28,10 +28,17 @@ export function postToCodeFrame(msg: Msg) {
   else pending.push(msg);
 }
 
-// bindCodeFrame is called when the iframe element (re)loads.
+// bindCodeFrame is called when the iframe element (re)loads. It captures the
+// element reference but does NOT reset `ready`. On Firefox the child's
+// vh-code:ready (posted from onMount during document load) is processed BEFORE
+// the iframe `load` event reaches the parent; resetting ready here would clobber
+// the just-set flag and leave every subsequent open queued-but-never-flushed
+// (the child does not re-post ready without a reload). The `load` event means
+// the child document is fully loaded — its message listener is already active —
+// so leaving ready=true is safe. A genuine iframe reload re-runs the child's
+// onMount, which re-posts ready and re-flushes pending.
 export function bindCodeFrame(el: HTMLIFrameElement | null) {
   frame = el;
-  ready = false;
 }
 
 let installed = false;
@@ -44,7 +51,19 @@ export function installCodeFrameHost() {
     if (e.origin !== ORIGIN) return;
     if ((e.data as Msg)?.type === "vh-code:ready") {
       ready = true;
-      while (pending.length) send(pending.shift()!);
+      // The framed viewer announces readiness from its onMount, which runs
+      // DURING document load — BEFORE the iframe's `load` event reaches the
+      // parent (and thus before bindCodeFrame sets `frame`). Flushing through
+      // module-level `frame` here would no-op (frame is still null) and the
+      // queued message would be shifted out of `pending` but never delivered,
+      // so the file never opens (Firefox processes the message before `load`;
+      // Chromium happens to order them the other way, hiding the bug). The
+      // ready event carries its own source window, so post straight back to it
+      // — timing-independent of when bindCodeFrame runs. bindCodeFrame no longer
+      // resets ready (see its comment), so after the initial flush subsequent
+      // opens deliver directly through the module-level frame.
+      const w = e.source as (Window | null);
+      while (pending.length) w?.postMessage(pending.shift()!, ORIGIN);
     }
   });
 }

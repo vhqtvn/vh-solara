@@ -163,15 +163,6 @@ test("message inspect shows tokens/cost/raw JSON", async ({ page }) => {
   await expect(page.locator(".msg-inspect").first()).toContainText("role");
 });
 
-test("clicking a file path opens it in the code viewer", async ({ page }) => {
-  // The old modal FileViewer was replaced by the code viewer: a clicked path now
-  // opens the docked (desktop) / overlay (mobile) code surface, not a dialog.
-  await page.goto(projectUrl("/"));
-  await page.getByRole("button", { name: /Demo session/ }).click();
-  await page.locator(".filepath", { hasText: "src/parser.go" }).first().click();
-  await expect(page.locator(".code-dock.dock, .code-dock.overlay")).toBeVisible({ timeout: 6000 });
-});
-
 test("UI zoom scales the interface and persists (versioned)", async ({ page }) => {
   await page.goto(projectUrl("/"));
   await page.getByRole("button", { name: "Settings" }).click();
