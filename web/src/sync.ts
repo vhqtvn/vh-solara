@@ -29,6 +29,7 @@ import { rootOf } from "./sync/selectors";
 import { currentUrlSession, syncUrl, setApplyingUrl } from "./sync/url";
 import {
   connect,
+  closeSessionStream,
   openSessionStream,
   watchdogTick,
   maybeReconnect,
@@ -45,7 +46,12 @@ bindAlertsContext({
 });
 
 export function startSync() {
-  connect(true); // page load: snapshot to fully reconcile (state hydrated from localStorage is partial)
+  // Page load: snapshot to fully reconcile ONLY when a project is already
+  // selected (deep link ?dir= or localStorage fallback). With no project the app
+  // shows the no-project empty state and does NOT bridge the daemon's cwd;
+  // selecting a project later calls connect(true) via switchProject.
+  if (projectDir()) connect(true);
+  else closeSessionStream(); // ensure no stray session stream from a prior tab state
   // The active-session message stream follows the selection.
   createRoot(() =>
     createEffect(on(selectedId, (id) => openSessionStream(id ?? ""), { defer: true })),

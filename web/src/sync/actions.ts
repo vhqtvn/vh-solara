@@ -21,7 +21,7 @@ import {
   LS_PROJECT,
 } from "./store";
 import { syncUrl } from "./url";
-import { connect } from "./stream";
+import { closeSessionStream, connect } from "./stream";
 
 // Selecting any real session leaves draft mode.
 export function setSelectedId(id: string | null) {
@@ -31,9 +31,11 @@ export function setSelectedId(id: string | null) {
 }
 
 // Switch the active project directory: reset to that project's persisted tree
-// and reconnect the stream scoped to it. "" = default project. `fromUrl` is set
-// by popstate (don't re-push history). The dir is mirrored to both localStorage
-// (fallback) and the URL (source of truth, per-tab).
+// and reconnect the stream scoped to it. `fromUrl` is set by popstate (don't
+// re-push history). The dir is mirrored to both localStorage (fallback) and the
+// URL (source of truth, per-tab). `dir === ""` lands the app on the no-project
+// empty state: the daemon's cwd is not a meaningful project, so we close the
+// streams and clear per-project state instead of bridging cwd.
 export function switchProject(dir: string, fromUrl = false) {
   if (dir === projectDir()) return;
   saveVersioned(LS_PROJECT, 1, dir);
@@ -62,6 +64,16 @@ export function switchProject(dir: string, fromUrl = false) {
       s.status = "connecting";
     }),
   );
+  if (!dir) {
+    // No-project state: tear down both streams so nothing keeps bridging the old
+    // project (or cwd). connect() would no-op too, but closing the session
+    // stream explicitly is required (connect only owns the tree stream). Leave
+    // status as "connecting"; the no-project view hides the session tree, so the
+    // status dot is not in a misleading state for the user's current focus.
+    closeSessionStream();
+    connect(true); // early-returns on empty dir but closes the tree stream
+    return;
+  }
   connect(true); // project switch: snapshot to fully reconcile the new project's state
 }
 

@@ -114,7 +114,8 @@ test("terminal dock toggles from the header", async ({ page }) => {
   await expect(page.locator(".term-dock")).toHaveCount(0);
   await page.getByRole("button", { name: "Terminal" }).click();
   await expect(page.locator(".term-dock")).toBeVisible();
-  // Default project has no real dir → the terminal needs one.
+  // No project selected (daemon cwd is not a meaningful project) → the terminal
+  // pane shows its "Open a project" empty state rather than bridging cwd.
   await expect(page.locator(".term-empty")).toContainText("Open a project");
   // The key-bar toggle is in the dock header.
   await expect(page.locator(".term-dock").getByLabel("Toggle key bar")).toBeVisible();
@@ -158,6 +159,19 @@ test("a new server version surfaces the update toast", async ({ page }) => {
 
 test("Settings → Terminals lists sessions (empty by default)", async ({ page }) => {
   await page.goto(projectUrl("/"));
+  // Prior serial tests under demoDir (features2's shell-mode "!" opens a real
+  // PTY via the TerminalPane) can leave terminal sessions registered with the
+  // daemon: closing the page drops the client, but the session itself survives
+  // the 30min idle TTL and would surface here (the Settings tab lists ALL
+  // terminals across projects). No terminal pane is mounted in THIS test, so
+  // killing now can't trigger a client-side reconnect. Clear the slate first.
+  const list = await page.request.get("/vh/term/list");
+  for (const t of ((await list.json()) ?? []) as { dir?: string; id?: string }[]) {
+    await page.request.post("/vh/term/kill", {
+      data: { dir: t.dir, id: t.id },
+      headers: { "X-VH-CSRF": "1" },
+    });
+  }
   await page.getByRole("button", { name: "Settings" }).click();
   const dialog = page.getByRole("dialog", { name: "Settings" });
   await dialog.getByRole("button", { name: "Terminals", exact: true }).click();

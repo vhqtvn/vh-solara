@@ -18,16 +18,22 @@ async function armDismiss(page: Page) {
 
 test("project switcher opens a dialog, marks the active project, and re-scopes the session tree", async ({ page }) => {
   await page.goto("/");
-  // Default project shows the seeded demo sessions.
-  await expect(page.locator(".tree-node", { hasText: "Demo session" })).toBeVisible();
-  await expect(page.locator(".proj-name")).toContainText("Default");
+  // No project is selected by default (the daemon's cwd is not a meaningful
+  // project), so the switcher trigger invites the user to pick one.
+  await expect(page.locator(".proj-name")).toContainText("Select project");
 
-  // Open the switcher dialog.
+  // Open the switcher dialog and pin alpha via the recents entry — it becomes
+  // the active project and scopes the tree to its synthetic session.
   await page.locator(".proj-current").click();
   await expect(page.getByRole("dialog", { name: "Switch project" })).toBeVisible();
+  await page.locator(".proj-pick", { hasText: "alpha" }).click();
+  await expect(page.locator(".proj-name")).toContainText("alpha", { timeout: 8000 });
+  await expect(page.locator(".tree-node", { hasText: "Project: alpha" })).toBeVisible({ timeout: 8000 });
 
-  // The active project (Default) is marked with the .on row tint.
-  await expect(page.locator(".proj-item.on", { hasText: /Default/ })).toBeVisible();
+  // Reopen; alpha is now the active pinned row (marked with the .on tint).
+  await page.locator(".proj-current").click();
+  await expect(page.getByRole("dialog", { name: "Switch project" })).toBeVisible();
+  await expect(page.locator(".proj-item.on", { hasText: /alpha/ })).toBeVisible();
 
   // Add a project via the dialog (DOM prompt → a directory path).
   await page.getByRole("button", { name: /Add project/ }).click();
@@ -35,10 +41,10 @@ test("project switcher opens a dialog, marks the active project, and re-scopes t
   await page.locator(".vh-prompt .confirm-go").click();
 
   // The UI re-scopes: the switcher shows the new project and the tree shows ITS
-  // sessions (fixture returns one synthetic session per directory), not demo's.
+  // sessions (fixture returns one synthetic session per directory), not alpha's.
   await expect(page.locator(".proj-name")).toContainText("projectx", { timeout: 8000 });
   await expect(page.locator(".tree-node", { hasText: "Project: projectx" })).toBeVisible({ timeout: 8000 });
-  await expect(page.locator(".tree-node", { hasText: "Demo session" })).toHaveCount(0);
+  await expect(page.locator(".tree-node", { hasText: "Project: alpha" })).toHaveCount(0);
 
   // The workspace is encoded in the URL so the tab is self-describing (survives
   // reload, supports a per-tab workspace).
@@ -46,12 +52,11 @@ test("project switcher opens a dialog, marks the active project, and re-scopes t
   await page.reload();
   await expect(page.locator(".tree-node", { hasText: "Project: projectx" })).toBeVisible({ timeout: 8000 });
 
-  // Switching back to Default restores the demo sessions. The Default row's
-  // accessible name now carries its directory/badge text, so match by substring.
+  // Switching back to alpha (a pinned row) restores its sessions.
   await page.locator(".proj-current").click();
   await expect(page.locator(".dialog.projects-dialog")).toBeVisible();
-  await page.getByRole("button", { name: /Default project/ }).click();
-  await expect(page.locator(".tree-node", { hasText: "Demo session" })).toBeVisible({ timeout: 8000 });
+  await page.locator(".proj-pick", { hasText: "alpha" }).click();
+  await expect(page.locator(".tree-node", { hasText: "Project: alpha" })).toBeVisible({ timeout: 8000 });
 });
 
 test("project switcher offers OpenCode recents to pin", async ({ page }) => {
@@ -136,10 +141,11 @@ test("project switcher shows a running badge for a non-active workspace", async 
   }
   expect(alphaRunning).toBe(true);
 
-  // Switch back to Default so alpha becomes a NON-active pinned row.
+  // Pin beta via recents and switch to it so alpha becomes a NON-active pinned
+  // row (no synthetic Default project exists anymore — beta takes the active slot).
   await page.locator(".proj-current").click();
-  await page.getByRole("button", { name: /Default project/ }).click();
-  await expect(page.locator(".proj-name")).toContainText("Default", { timeout: 8000 });
+  await page.locator(".proj-pick", { hasText: "beta" }).click();
+  await expect(page.locator(".proj-name")).toContainText("beta", { timeout: 8000 });
 
   // Reopen the dialog: the alpha row shows a running badge (it is not the active
   // project, so its activity comes from the endpoint).
@@ -170,23 +176,21 @@ test("project switcher filters rows by search and shows a no-results state", asy
   const search = page.getByLabel("Search projects");
   await expect(search).toBeVisible();
 
-  // Initially the full list is shown: Default (pinned) + alpha, beta (recents).
-  await expect(page.locator(".proj-item-name", { hasText: "Default" })).toBeVisible();
+  // Initially the list shows the OpenCode recents (alpha, beta) — no synthetic
+  // default row exists anymore (the daemon's cwd is not a meaningful project).
   await expect(page.locator(".proj-item-name", { hasText: "alpha" })).toBeVisible();
   await expect(page.locator(".proj-item-name", { hasText: "beta" })).toBeVisible();
 
-  // Typing a query matching only alpha (by name) hides the other rows.
+  // Typing a query matching only alpha (by name) hides beta.
   await search.fill("alpha");
   await expect(page.locator(".proj-item-name", { hasText: "alpha" })).toBeVisible();
-  await expect(page.locator(".proj-item-name", { hasText: "Default" })).toHaveCount(0);
   await expect(page.locator(".proj-item-name", { hasText: "beta" })).toHaveCount(0);
 
   // Matching by directory works too (case-insensitive): "WORK" hits both
-  // /work/alpha and /work/Beta, drops Default (directory "").
+  // /work/alpha and /work/beta.
   await search.fill("WORK");
   await expect(page.locator(".proj-item-name", { hasText: "alpha" })).toBeVisible();
   await expect(page.locator(".proj-item-name", { hasText: "beta" })).toBeVisible();
-  await expect(page.locator(".proj-item-name", { hasText: "Default" })).toHaveCount(0);
 
   // A query that matches nothing shows the no-results message and no rows.
   // ("Add project…" is .proj-add, NOT .proj-item, so it stays reachable.)
@@ -197,7 +201,6 @@ test("project switcher filters rows by search and shows a no-results state", asy
 
   // Clearing the query restores the full list.
   await search.fill("");
-  await expect(page.locator(".proj-item-name", { hasText: "Default" })).toBeVisible();
   await expect(page.locator(".proj-item-name", { hasText: "alpha" })).toBeVisible();
   await expect(page.locator(".proj-item-name", { hasText: "beta" })).toBeVisible();
 });
@@ -213,8 +216,7 @@ test("project switcher confirms inline before removing a pinned project", async 
   const page = await ctx.newPage();
   await page.goto("/");
 
-  // Pin alpha + beta via recents so there are TWO removable pinned rows (Default
-  // has no remove button: directory "" → can't be unpinned).
+  // Pin alpha + beta via recents so there are TWO removable pinned rows.
   await page.locator(".proj-current").click();
   await expect(page.getByRole("dialog", { name: "Switch project" })).toBeVisible();
   await page.locator(".proj-pick", { hasText: "alpha" }).click();

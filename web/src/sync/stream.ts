@@ -544,6 +544,14 @@ const pendingBatch = new Map<string, Promise<void>>();
 export function connect(fresh = false) {
   clearTimeout(reconnectTimer);
   es?.close();
+  // No project selected (daemon cwd is not a meaningful project): do NOT open
+  // a tree stream. The watchdog/maybeReconnect also no-op while projectDir is
+  // empty, so nothing auto-reconnects the cwd bridge. Selecting a project
+  // (switchProject) calls connect(true) explicitly.
+  if (!projectDir()) {
+    es = null;
+    return;
+  }
   const cursorParam = fresh ? "" : `cursor=${state.cursor}&`;
   treeT0 = performance.now(); // L1 t0: connection attempt begins
   treeT1 = 0;
@@ -743,7 +751,9 @@ export async function decodeMessagesBatch(payload: {
 export function openSessionStream(id: string) {
   if (id === sesId && ses && ses.readyState !== EventSource.CLOSED) return;
   closeSessionStream();
-  if (!id) return;
+  // No project selected → nothing to stream (and no cwd bridge). Guards both
+  // the no-project state and a stray selection cleared before a project lands.
+  if (!id || !projectDir()) return;
   sesId = id;
   const open = () => {
     if (sesId !== id) return;
@@ -890,6 +900,12 @@ export function openSessionStream(id: string) {
 // closed. Runs while the tab is visible.
 export function watchdogTick() {
   if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
+  // No project selected: never (re)connect the cwd bridge. The watchdog just
+  // advances the stale-health tick (cheap, harmless) and stands down otherwise.
+  if (!projectDir()) {
+    setHealthNow((n) => n + 1);
+    return;
+  }
   // Feature 1: re-evaluate staleness over wall-clock time (no store write on
   // a silent-but-open socket). Coarse tick only — safe on the per-frame budget.
   setHealthNow((n) => n + 1);
@@ -905,6 +921,9 @@ export function watchdogTick() {
 }
 
 export function maybeReconnect() {
+  // No project selected: no stream to reconnect (and connect() would no-op
+  // anyway, but avoid even the readyState read / status churn).
+  if (!projectDir()) return;
   if (!es || es.readyState === EventSource.CLOSED) connect();
   else watchdogTick();
 }

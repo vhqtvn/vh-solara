@@ -22,7 +22,29 @@ import (
 // handler returns the full real session set for this dir; any other non-empty
 // dir still gets the synthetic per-directory placeholder so the project
 // switcher remains demoable for dirs with no real sessions.
-const demoDir = "/work/demo"
+//
+// It is a VAR (not const) so the fixtureserver can repoint it to a real
+// writable on-disk directory (SetDemoDir) — required by tests that write into
+// the project tree (e.g. attachment upload, which creates
+// <demoDir>/.vh-solara/sessions/<sid>/attachments). The default "/work/demo"
+// stays for Go unit tests that never touch the filesystem.
+var demoDir = "/work/demo"
+
+// SetDemoDir repoints the consolidated demo project directory (and the
+// directory all seeded sessions report). Must be called before New(). Used by
+// the fixtureserver to point demoDir at a real writable path it created on
+// disk; Go unit tests leave the default (no FS writes needed).
+func SetDemoDir(d string) {
+	if d != "" {
+		demoDir = d
+	}
+}
+
+// DemoDir returns the current consolidated demo directory (the fixtureserver
+// exposes it to e2e via env so the TS test harness and the Go fixture agree).
+func DemoDir() string {
+	return demoDir
+}
 
 // FakeOpenCode implements the subset of OpenCode's HTTP API the daemon uses.
 type FakeOpenCode struct {
@@ -60,11 +82,11 @@ func New() *FakeOpenCode {
 	}
 	now := float64(time.Now().UnixMilli())
 	f.sessions = []map[string]any{
-		{"id": "demo", "projectID": "proj", "title": "Demo session", "directory": "/work/demo",
+		{"id": "demo", "projectID": "proj", "title": "Demo session", "directory": demoDir,
 			// Real OpenCode names the session model `id` (not `modelID`).
 			"model": map[string]any{"providerID": "fake", "id": "dummy", "variant": "default"},
 			"time":  map[string]any{"created": now - 5000, "updated": now}},
-		{"id": "sub", "projectID": "proj", "parentID": "demo", "title": "Subagent: search", "directory": "/work/demo", "time": map[string]any{"created": now - 3000, "updated": now - 2000}},
+		{"id": "sub", "projectID": "proj", "parentID": "demo", "title": "Subagent: search", "directory": demoDir, "time": map[string]any{"created": now - 3000, "updated": now - 2000}},
 		{"id": "other", "projectID": "proj", "title": "Another root", "directory": demoDir, "time": map[string]any{"created": now - 9000, "updated": now - 9000}},
 		// Slow-hydration session: a normal root session whose full-message GET is
 		// held for a bounded window (see handleSession) so the .chat-content reveal

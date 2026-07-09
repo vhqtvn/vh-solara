@@ -14,6 +14,7 @@ import {
 } from "../projects";
 import { dismiss, modal } from "../lib/a11y";
 import { runningSessionCount, rootSessionCount } from "../sync";
+import { projSwitcherOpen as open, setProjSwitcherOpen as setOpen } from "../ui";
 import Icon from "./Icon";
 import TextPromptDialog from "./TextPromptDialog";
 
@@ -25,7 +26,6 @@ import TextPromptDialog from "./TextPromptDialog";
 // NON-active projects comes from GET /vh/projects + /vh/running-sessions; the
 // active project uses the live client store to avoid a round-trip.
 export default function ProjectSwitcher() {
-  const [open, setOpen] = createSignal(false);
   const [query, setQuery] = createSignal("");
   const [recents, { refetch }] = createResource(fetchRecentProjects, { initialValue: [] });
 
@@ -46,7 +46,10 @@ export default function ProjectSwitcher() {
       });
   }
 
-  const current = () => projects().find((p) => p.directory === projectDir()) || projects()[0];
+  // The active project, or undefined when no project is selected (the daemon's
+  // cwd is not a meaningful project, so nothing is pinned by default). The
+  // trigger renders a "Select project" placeholder in that case.
+  const current = () => projects().find((p) => p.directory === projectDir());
 
   // Inline remove-confirm state (Slice 3): clicking a pinned row's remove
   // button does NOT unpin immediately — instead that row enters a confirm
@@ -187,9 +190,9 @@ export default function ProjectSwitcher() {
 
   return (
     <div class="proj">
-      <button type="button" class="proj-current" onClick={toggle} data-tip={current()?.directory || "Default"}>
+      <button type="button" class="proj-current" onClick={toggle} data-tip={current()?.directory || "Select project"}>
         <Icon name="layers" size={14} />
-        <span class="proj-name">{current()?.name}</span>
+        <span class="proj-name">{current()?.name ?? "Select project"}</span>
         <Icon name="chevronDown" size={14} />
       </button>
       <Show when={open()}>
@@ -238,9 +241,7 @@ export default function ProjectSwitcher() {
                         </Show>
                       </span>
                       <span class="proj-item-dir">
-                        <Show when={p.directory} fallback="default workspace">
-                          {p.directory}
-                        </Show>
+                        {p.directory}
                         <Show when={p.running > 0 || p.idle > 0}>
                           {" \u00b7 "}
                           <span classList={{ "proj-badge": true, run: p.running > 0 }}>

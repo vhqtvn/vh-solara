@@ -1,23 +1,25 @@
 // Client-side project list (mirrors OpenCode web: projects = directories the
-// user has opened, persisted locally). The default project ("" = OpenCode serve
-// cwd) is always present. Selecting a project re-scopes the daemon via sync.
+// user has opened, persisted locally). vh-solara runs as a daemon whose cwd is
+// NOT a meaningful project, so NO project is selected by default: the list is
+// empty until the user pins one (recents / Add project…). Selecting a project
+// re-scopes the daemon via sync.
 import { createSignal } from "solid-js";
 import { projectDir, switchProject } from "./sync";
 import { loadVersioned, saveVersioned } from "./lib/store";
 import { log } from "./lib/log";
 
 export interface Project {
-  directory: string; // "" = default project
+  directory: string; // absolute path; never "" (no synthetic default)
   name: string;
 }
 
 const LS_PROJECTS = "vh.projects.v1";
-const DEFAULT: Project = { directory: "", name: "Default project" };
 
 function load(): Project[] {
   const saved = loadVersioned<Project[]>(LS_PROJECTS, 1, [], (old) => (Array.isArray(old) ? (old as Project[]) : []));
-  const list = saved.filter((p) => p && p.directory); // drop any stored default
-  return [DEFAULT, ...list];
+  // Drop any legacy stored default (directory "") so a pre-default-removal
+  // localStorage can't resurrect the synthetic cwd project.
+  return saved.filter((p) => p && p.directory);
 }
 
 const [projects, setProjects] = createSignal<Project[]>(load());
@@ -42,9 +44,11 @@ export function addProject(rawPath: string) {
 }
 
 export function removeProject(directory: string) {
-  if (!directory) return; // can't remove the default
+  if (!directory) return; // no synthetic default exists; nothing to remove
   setProjects(projects().filter((p) => p.directory !== directory));
   save();
+  // Removing the active project lands the app on the no-project empty state
+  // (projectDir "") rather than silently bridging another workspace.
   if (projectDir() === directory) switchProject("");
 }
 

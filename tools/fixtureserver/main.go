@@ -33,6 +33,15 @@ const demoQuotaJSON = `{"providers":[` +
 	`{"providerId":"openrouter","providerName":"OpenRouter","ok":true,"configured":true,"windows":[` +
 	`{"label":"credits","usedPercent":30,"remainingPercent":70,"windowSeconds":null,"resetAfterSeconds":null,"resetAt":null,"valueLabel":"$14.00 remaining"}]}]}`
 
+// demoProjectDir is the on-disk directory the consolidated demo project maps
+// to. It MUST be writable: the attachment upload handler writes into
+// <dir>/.vh-solara/sessions/<sid>/attachments, and several e2e specs load this
+// dir via ?dir=. The fixtureserver creates it on startup so a non-root user
+// (or a container without /work) still has a real writable project root.
+// Overridable via VH_DEMO_DIR (the e2e webServer passes a repo-relative path so
+// the Go fixture and the TS test harness share one source of truth).
+const defaultDemoDir = "/work/demo"
+
 func main() {
 	addr := flag.String("addr", "127.0.0.1:8099", "address for the vh web server")
 	flag.Parse()
@@ -40,6 +49,22 @@ func main() {
 	if os.Getenv("VH_QUOTA_FIXTURE") == "" {
 		_ = os.Setenv("VH_QUOTA_FIXTURE", demoQuotaJSON)
 	}
+	// Resolve + create the consolidated demo project directory BEFORE seeding
+	// the fixture (sessions report this directory). MkdirAll is idempotent and
+	// tolerates concurrent runs. VH_DEMO_DIR lets the e2e lane pin a known
+	// repo-relative path; the default /work/demo is used when unset (e.g. a
+	// root-owned container that can create /work/demo).
+	demoProjectDir := os.Getenv("VH_DEMO_DIR")
+	if demoProjectDir == "" {
+		demoProjectDir = defaultDemoDir
+	}
+	if err := os.MkdirAll(demoProjectDir, 0o755); err != nil {
+		// Non-fatal: specs that don't write to the project tree still work with
+		// a non-existent dir; only attachment-style tests need it on disk.
+		log.Printf("fixture: could not create demo dir %q: %v (attach-style e2e may fail)", demoProjectDir, err)
+	}
+	fixtures.SetDemoDir(demoProjectDir)
+	log.Printf("fixture: demo project dir = %s", demoProjectDir)
 	// Isolate persisted notes/archive to a throwaway dir so fixture runs never
 	// touch the real user config (and start clean each process).
 	stateDir := os.Getenv("VH_STATE_DIR")

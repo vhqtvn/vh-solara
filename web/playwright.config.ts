@@ -5,6 +5,13 @@ import { defineConfig, devices } from "@playwright/test";
 const webRoot = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(webRoot, "..");
 
+// The consolidated demo project dir, shared by the Go fixtureserver (which
+// creates it on disk) and the TS test harness (which builds ?dir= URLs from
+// util.demoDir). MUST be the SAME path fixture-web.sh passes to the
+// fixtureserver, else the attach upload (writes under <dir>/.vh-solara/...) and
+// the ?dir= the tests load won't match. Set before tests load util.ts.
+process.env.VH_DEMO_DIR = process.env.VH_DEMO_DIR || path.join(repoRoot, "tmp", "fixture-demo");
+
 // Artifacts stay under repo-scoped tmp/ (mirrors trueai-dev's discipline).
 const artifactRoot = process.env.PLAYWRIGHT_ARTIFACTS_DIR
   ? path.resolve(process.env.PLAYWRIGHT_ARTIFACTS_DIR)

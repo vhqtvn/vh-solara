@@ -214,14 +214,12 @@ test("settings toggles live message streaming", async ({ page }) => {
 });
 
 test("attaching a file shows a chip, uploads, and clears after send", async ({ page }) => {
-  // Resisted-consolidation: the upload (POST /vh/attach) writes to
+  // The upload (POST /vh/attach) writes to
   // <projectRoot>/.vh-solara/sessions/<id>/attachments/ (pkg/web/attach.go).
-  // projectRoot("/work/demo") resolves to the fake "/work/demo" which can't be
-  // created at the FS root (no root perm), so the upload 500s and no chip
-  // appears. Only the cwd/Default project (a real temp dir the fixtureserver
-  // chdirs into) is writable. Commit 2 (removes the default project) must give
-  // the fixture a real writable project dir and migrate this goto.
-  await page.goto("/");
+  // The fixtureserver creates util.demoDir as a real writable dir on disk (see
+  // VH_DEMO_DIR wiring in playwright.config.ts / fixture-web.sh), so loading it
+  // via projectUrl("/") makes the upload succeed under the demo project.
+  await page.goto(projectUrl("/"));
   await page.getByRole("button", { name: /Demo session/ }).click();
   await page.locator(".composer input[type=file]").setInputFiles({
     name: "note.txt",

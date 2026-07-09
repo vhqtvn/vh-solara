@@ -1,5 +1,5 @@
 import { createSignal, createMemo, Show } from "solid-js";
-import { newSession, state, isStale, isUpdating, STALE_MS } from "../sync";
+import { newSession, state, isStale, isUpdating, STALE_MS, projectDir } from "../sync";
 import { searchQuery, setSearchQuery } from "../sidebar";
 import { setSidebarWidth } from "../layout";
 import SessionTree from "./SessionTree";
@@ -142,7 +142,9 @@ export default function Sidebar(props: { open: boolean; onClose: () => void }) {
         </div>
       </Show>
       <OrphanBanner />
-      <SessionTree />
+      <Show when={projectDir()}>
+        <SessionTree />
+      </Show>
       <div class="sidebar-foot">
         <button type="button" class="sidebar-foot-btn" onClick={() => setArchivedOpen(true)}>
           <Icon name="layers" size={14} /> Archived

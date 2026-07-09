@@ -12,6 +12,7 @@ import AgentStylesView from "./components/AgentStylesView";
 import SettingsDialog from "./components/SettingsDialog";
 import PathSelectionAction from "./components/PathSelectionAction";
 import EmptyState from "./components/EmptyState";
+import NoProjectState from "./components/NoProjectState";
 import NotificationCenter from "./components/NotificationCenter";
 import HeaderUsage from "./components/HeaderUsage";
 import StatusPopover from "./components/StatusPopover";
@@ -334,6 +335,11 @@ export default function App() {
           classList={{ "code-full": codeMode() === "full", "code-dock-open": codeMode() === "dock", "dock-left": codeDockSide() === "left" }}
         >
           <div class="view-primary">
+            {/* No project selected (daemon cwd is not a meaningful project):
+                show the no-project empty state instead of the session view.
+                The session view + its no-SESSION EmptyState live below, gated
+                on a real projectDir(). */}
+            <Show when={projectDir()} fallback={<NoProjectState />}>
             <Show when={view() === "notes"}>
               <NotesView />
             </Show>
@@ -357,6 +363,7 @@ export default function App() {
                 a fresh iframe on the right prefix but the 60s poll doesn't. */}
             <Show when={activeViewKey()} keyed>
               {(_key) => <ViewFrame view={activeEmbedded()!} />}
+            </Show>
             </Show>
           </div>
           {/* Code viewer: full (Code tab), a resizable peek dock, or a mobile

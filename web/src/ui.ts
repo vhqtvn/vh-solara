@@ -19,6 +19,10 @@ export const [codeMobileOverlay, setCodeMobileOverlay] = createSignal(false);
 export const [settingsOpen, setSettingsOpen] = createSignal(false);
 export const [adminOpen, setAdminOpen] = createSignal(false);
 export const [paletteOpen, setPaletteOpen] = createSignal(false);
+// Project switcher dialog open-flag, lifted global so the no-project empty
+// state's CTA can open the switcher from outside the ProjectSwitcher component
+// (it lives in App → .view-primary, a sibling of the sidebar switcher trigger).
+export const [projSwitcherOpen, setProjSwitcherOpen] = createSignal(false);
 // Terminal: a bottom dock that can expand to full-screen (always full on mobile).
 export const [termOpen, setTermOpen] = createSignal(false);
 export const [termFull, setTermFull] = createSignal(false);
