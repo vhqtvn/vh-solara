@@ -115,11 +115,11 @@ ack as no-ops against an instance that doesn't own it).
 Discover what's bridged (machine-readable, over the socket too):
 
 ```
-GET /vh/projects → [{ "dir": "", "epoch": "ep-…", "seq": 6, "sessions": 3 },
-                    { "dir": "/work/alpha", "epoch": "ep-…", "seq": 2, "sessions": 1 }, …]
+GET /vh/projects → [{ "dir": "", "epoch": "ep-…", "seq": 6, "roots": 3 },
+                    { "dir": "/work/alpha", "epoch": "ep-…", "seq": 2, "roots": 1 }, …]
 ```
 
-Each entry is a live per-dir instance with its own `epoch`/`seq`. Cross-machine
+Each entry is a live per-dir instance with its own `epoch`/`seq`; `roots` counts **root sessions only** (children + archived excluded), so `roots` minus the matching `GET /vh/running-sessions` workspace count is the idle-root count. Cross-machine
 mirror: `GET /api/workers/{id}/projects`. Resolve your project dir → its entry,
 then pin the watch loop's `(epoch, seq)` cursor to that instance — snapshot+stream
 with that `?dir=` are scoped to that store, and the per-dir `epoch` lets a watcher
