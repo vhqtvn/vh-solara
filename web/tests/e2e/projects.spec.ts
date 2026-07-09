@@ -389,3 +389,51 @@ test("project switcher: typing in search cancels a pending confirm", async ({ br
 
   await ctx.close();
 });
+
+// Slice 5: every non-default project row has a "Copy link" button that writes
+// the per-project deep link (${origin}${pathname}?dir=<encoded dir>) to the
+// clipboard, so an operator can grab/share/bookmark a per-project URL. This
+// verifies the URL is built correctly AND that the click actually lands in the
+// clipboard (the primary behavior). The URL is also exposed via a data-link
+// attribute as a deterministic cross-check (clipboard read can be flaky). The
+// recents row is used here (the fixture serves alpha/beta at "/"), but pinned
+// rows carry the SAME button (CopyLinkButton is shared).
+test("project switcher: Copy link writes the per-project deep link to the clipboard", async ({ browser }) => {
+  // Fresh context so clipboard permissions + localStorage are self-contained.
+  const ctx = await browser.newContext();
+  await ctx.grantPermissions(["clipboard-read", "clipboard-write"]);
+  const page = await ctx.newPage();
+  await page.goto("/");
+
+  // The expected deep link is built from the page's own origin+pathname so it
+  // is robust to the fixture's random port. pathname is "/", so the base is the
+  // origin with a trailing slash (matches ProjectSwitcher.projectLink).
+  const u = new URL(page.url());
+  const base = `${u.origin}${u.pathname}`;
+  const expected = `${base}?dir=${encodeURIComponent("/work/alpha")}`;
+
+  await page.locator(".proj-current").click();
+  const dialog = page.getByRole("dialog", { name: "Switch project" });
+  await expect(dialog).toBeVisible();
+
+  // alpha is in the recents list (GET /project). Its row has a Copy link button.
+  // The deterministic cross-check: data-link carries the exact URL the click
+  // will write, proving buildProjectLink output before involving the clipboard.
+  const copyBtn = dialog.getByRole("button", { name: "Copy link to alpha", exact: true });
+  await expect(copyBtn).toBeVisible();
+  await expect(copyBtn).toHaveAttribute("data-link", expected);
+
+  // Click writes the URL to the clipboard. Read it back via the async Clipboard
+  // API (granted above) and assert it equals the built deep link.
+  await copyBtn.click();
+  await expect
+    .poll(async () => page.evaluate(() => navigator.clipboard.readText()), { timeout: 5000 })
+    .toBe(expected);
+
+  // The copied confirmation flips the icon (copy→check) + aria-label + tints the
+  // button .copied for ~1.5s. Assert the label swap as a cheap confirmation-UX
+  // check (the class/icon are covered by the unit + visual layers).
+  await expect(dialog.getByRole("button", { name: "Copied link to alpha", exact: true })).toBeVisible();
+
+  await ctx.close();
+});

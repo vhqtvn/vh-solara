@@ -193,6 +193,19 @@ export function filterProjectRows<T extends { name: string; directory: string }>
   );
 }
 
+// Build a per-project deep-link URL the switcher's "Copy link" button exposes:
+// `${base}?dir=<encoded dir>`. `base` is the page's origin+pathname (NO query or
+// hash — pass `${location.origin}${location.pathname}`); `dir` is the project
+// directory. The `?dir=` switching machinery already round-trips end-to-end
+// (sync/url.ts writes it, sync/store.ts reads it), so a per-project link needs
+// only this consumer that BUILDS the URL. Pure (no DOM, no signals) so it can be
+// unit-tested in isolation, mirroring filterProjectRows/mergeProjectActivity. An
+// empty `dir` still yields `${base}?dir=` (a total function); callers gate the
+// affordance on a non-empty dir, since the default workspace has no special link.
+export function buildProjectLink(base: string, dir: string): string {
+  return `${base}?dir=${encodeURIComponent(dir)}`;
+}
+
 // Fetch both activity endpoints (coalesced via Promise.all). Never throws: on
 // any failure returns empty maps so the dialog still renders with names alone.
 export async function fetchProjectActivity(): Promise<ActivityMaps> {

@@ -2553,6 +2553,27 @@ body {
   border-radius: 5px;
 }
 .proj-remove:hover { background: var(--bg); color: var(--fg); }
+/* Copy-link affordance (Slice 5): a per-project deep-link (?dir=<dir>) grab
+   button on every non-default row (pinned + recents). One tap writes the full
+   URL to the clipboard; the icon swaps copy→check + tints accent for ~1.5s
+   (cheap reactive glyph/color swap, no animation — mirrors the Part.tsx
+   code-copy revert cadence). Clustered with the remove (✕) button in a tight
+   flex group so the trailing controls align. No mask-image, no backdrop-filter,
+   no contain:paint/content-visibility (those hurt on Firefox/WebRender). */
+.proj-actions { display: flex; align-items: center; gap: 1px; margin-right: 4px; flex: none; }
+.proj-copy {
+  flex: none;
+  background: transparent;
+  border: 0;
+  color: var(--fg-dim);
+  cursor: pointer;
+  padding: 4px;
+  border-radius: 5px;
+}
+.proj-copy:hover { background: var(--bg); color: var(--fg); }
+/* Copied (✓) confirmation state: accent tint so success reads at a glance
+   without any animation/raster work. */
+.proj-copy.copied { color: var(--accent); }
 /* Inline remove-confirm cluster (Slice 3): when a pinned row's remove button
    is clicked, the row swaps that single icon for a tight "Remove? / Remove /
    Cancel" group. This is a cheap conditional DOM swap inside one row (no list

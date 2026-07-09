@@ -2,6 +2,7 @@ import { createEffect, createMemo, createResource, createSignal, For, Show } fro
 import {
   ActivityMaps,
   addProject,
+  buildProjectLink,
   fetchProjectActivity,
   fetchRecentProjects,
   filterProjectRows,
@@ -66,11 +67,56 @@ export default function ProjectSwitcher() {
   function cancelRemove() {
     setPendingRemove(null);
   }
-  // Reset the pending state whenever the dialog closes (covers every close
-  // path: overlay click, close button, Escape, selecting a project, Add…). A
-  // stale confirm state must never persist on a row that is now hidden.
+
+  // Copy-link affordance (Slice 5): every NON-default project row (pinned AND
+  // recents) gets a "Copy link" button that writes the per-project deep link
+  // (`${origin}${pathname}?dir=<dir>`) to the clipboard. The copied row's icon
+  // flips copy→check for ~1.5s as a confirmation — a cheap reactive DOM swap
+  // mirroring the Part.tsx code-copy revert cadence (no animation, no
+  // mask-image, no backdrop-filter: those punish Firefox/WebRender). The link
+  // itself is also stashed in a `data-link` attribute so tests + inspect can
+  // read it without the clipboard (clipboard read can be flaky in harness).
+  // `copiedDir` is a single-value signal (like pendingRemove): only one row
+  // shows "Copied" at a time, and the guarded revert keeps a later copy on a
+  // different row from being cut short.
+  const [copiedDir, setCopiedDir] = createSignal<string | null>(null);
+  function projectLink(directory: string): string {
+    return buildProjectLink(`${location.origin}${location.pathname}`, directory);
+  }
+  function copyLink(directory: string) {
+    void navigator.clipboard?.writeText(projectLink(directory));
+    setCopiedDir(directory);
+    setTimeout(() => setCopiedDir((prev) => (prev === directory ? null : prev)), 1500);
+  }
+  // The button is shared across pinned + recents rows. Reads copiedDir from the
+  // closure (component-local; there is a single ProjectSwitcher instance). The
+  // reactive Icon `name` + classList + data-tip swap is the whole confirmation
+  // — no extra DOM, no transition heavier than the icon glyph change.
+  const CopyLinkButton = (p: { directory: string; name: string }) => {
+    const copied = () => copiedDir() === p.directory;
+    return (
+      <button
+        type="button"
+        class="proj-copy"
+        classList={{ copied: copied() }}
+        data-tip={copied() ? "Copied!" : "Copy link"}
+        data-link={projectLink(p.directory)}
+        aria-label={copied() ? `Copied link to ${p.name}` : `Copy link to ${p.name}`}
+        onClick={(e) => (e.stopPropagation(), copyLink(p.directory))}
+      >
+        <Icon name={copied() ? "check" : "copy"} size={13} />
+      </button>
+    );
+  };
+
+  // Reset the pending + copied states whenever the dialog closes (covers every
+  // close path: overlay click, close button, Escape, selecting a project,
+  // Add…). A stale confirm/copied state must never persist on a hidden row.
   createEffect(() => {
-    if (!open()) setPendingRemove(null);
+    if (!open()) {
+      setPendingRemove(null);
+      setCopiedDir(null);
+    }
   });
 
   // Dismissal config for use:dismiss on the overlay. MUST be passed as an
@@ -212,15 +258,18 @@ export default function ProjectSwitcher() {
                       <Show
                         when={pendingRemove() === p.directory}
                         fallback={
-                          <button
-                            type="button"
-                            class="proj-remove"
-                            aria-label={`Remove ${p.name}`}
-                            data-tip="Remove from list"
-                            onClick={(e) => (e.stopPropagation(), startRemove(p.directory))}
-                          >
-                            <Icon name="x" size={13} />
-                          </button>
+                          <span class="proj-actions">
+                            <CopyLinkButton directory={p.directory} name={p.name} />
+                            <button
+                              type="button"
+                              class="proj-remove"
+                              aria-label={`Remove ${p.name}`}
+                              data-tip="Remove from list"
+                              onClick={(e) => (e.stopPropagation(), startRemove(p.directory))}
+                            >
+                              <Icon name="x" size={13} />
+                            </button>
+                          </span>
                         }
                       >
                         <span class="proj-confirm">
@@ -279,6 +328,7 @@ export default function ProjectSwitcher() {
                             </Show>
                           </span>
                         </button>
+                        <CopyLinkButton directory={r.directory} name={r.name} />
                       </div>
                     );
                   }}
