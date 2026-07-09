@@ -346,10 +346,33 @@ type Event struct {
 	Properties json.RawMessage `json:"properties"`
 }
 
-// SubscribeEvents opens GET /event and invokes handler for each event until the
-// context is cancelled, the stream ends, or handler returns an error. It does
-// not reconnect — the caller (aggregator) owns the reconnect/re-hydrate loop,
-// since OpenCode's stream has no replay.
+// idleTimeout is how long SubscribeEvents tolerates receiving NO data before
+// declaring the OpenCode event stream dead-but-open (half-open TCP / stalled
+// peer). OpenCode emits a `server.heartbeat` SSE data frame roughly every
+// 10s (measured against a live `opencode serve`: server.connected followed
+// by server.heartbeat every ~10.0s), so 45s comfortably spans ~4 missed
+// heartbeats — long enough that a live-but-idle stream is never falsely
+// dropped, short enough that a wedged connection is returned to the
+// aggregator's reconnect loop in well under a minute.
+//
+// It is a package var purely so tests can shrink it for fast coverage; tests
+// in this package do not run in parallel. TCP keepalive is already active via
+// Go's default http transport (net.Dialer.KeepAlive 30s) as additional
+// defense-in-depth for true peer death.
+var idleTimeout = 45 * time.Second
+
+// SubscribeEvents opens GET /event and invokes handler for each event until
+// the context is cancelled, the stream ends, handler returns an error, or the
+// stream goes idle for longer than idleTimeout. It does not reconnect — the
+// caller (aggregator) owns the reconnect/re-hydrate loop, since OpenCode's
+// stream has no replay.
+//
+// The blocking bufio read is run in a per-line goroutine and the main loop
+// selects over {next line, ctx.Done, idle timer}. This makes a half-open
+// connection — where ReadString would otherwise block forever and the old
+// `select { case <-ctx.Done()... default: }` (which sat OUTSIDE the blocking
+// read) never ran — interruptible, so a dead stream returns to the caller for
+// reconnect instead of silently freezing live UI updates.
 func (c *Client) SubscribeEvents(ctx context.Context, handler func(Event) error) error {
 	req, err := c.newRequest(ctx, http.MethodGet, "/event", nil)
 	if err != nil {
@@ -357,7 +380,9 @@ func (c *Client) SubscribeEvents(ctx context.Context, handler func(Event) error)
 	}
 	req.Header.Set("Accept", "text/event-stream")
 
-	// No client-level timeout for the streaming connection.
+	// No client-level timeout for the streaming connection; a timeout here
+	// would kill a healthy long-lived stream. Liveness is enforced by the
+	// idle timer in the read loop below, not by the HTTP client.
 	httpClient := &http.Client{}
 	resp, err := httpClient.Do(req)
 	if err != nil {
@@ -385,14 +410,55 @@ func (c *Client) SubscribeEvents(ctx context.Context, handler func(Event) error)
 		return handler(ev)
 	}
 
+	// A single line read result delivered from the reader goroutine.
+	type readResult struct {
+		line string
+		err  error
+	}
+
 	for {
+		// Run the blocking ReadString in a short-lived goroutine so the
+		// select below can also react to ctx cancellation and the idle
+		// timer. The goroutine performs exactly ONE read and sends the
+		// result once into a buffered (cap 1) channel. When the main loop
+		// returns (ctx cancel / idle / handler error) it closes resp.Body,
+		// which unblocks the goroutine's in-flight ReadString (it returns
+		// an error); the goroutine then sends into the cap-1 buffer and
+		// exits. Because it sends at most once and the channel is buffered,
+		// it can never block after the caller has stopped reading — no
+		// goroutine leak.
+		readc := make(chan readResult, 1)
+		go func() {
+			line, err := reader.ReadString('\n')
+			readc <- readResult{line, err}
+		}()
+
+		// A fresh idle timer each iteration: it only fires if NO line
+		// arrives within idleTimeout. Any received byte/frame — including
+		// OpenCode's heartbeat data frames, or a `:` comment line — starts
+		// a new iteration and thus a fresh timer, so a live-but-idle stream
+		// is never falsely dropped.
+		idleTimer := time.NewTimer(idleTimeout)
+
+		var line string
+		var readErr error
 		select {
 		case <-ctx.Done():
+			idleTimer.Stop()
+			// Closing the body unblocks the goroutine blocked in ReadString.
+			_ = resp.Body.Close()
 			return ctx.Err()
-		default:
+		case <-idleTimer.C:
+			// No data for idleTimeout → the stream is dead-but-open. Close
+			// the body (unblocks the reader goroutine) and surface a stall
+			// error so the aggregator's reconnect+re-hydrate loop fires.
+			_ = resp.Body.Close()
+			return fmt.Errorf("subscribe /event: idle timeout (no data in %v)", idleTimeout)
+		case r := <-readc:
+			idleTimer.Stop()
+			line, readErr = r.line, r.err
 		}
 
-		line, err := reader.ReadString('\n')
 		if len(line) > 0 {
 			line = strings.TrimRight(line, "\r\n")
 			switch {
@@ -407,12 +473,12 @@ func (c *Client) SubscribeEvents(ctx context.Context, handler func(Event) error)
 				// ignore `event:`, `id:`, comments (`:`), etc.
 			}
 		}
-		if err != nil {
-			if err == io.EOF {
+		if readErr != nil {
+			if readErr == io.EOF {
 				_ = dispatch()
 				return io.EOF
 			}
-			return err
+			return readErr
 		}
 	}
 }
