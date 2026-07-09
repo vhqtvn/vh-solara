@@ -719,10 +719,10 @@ func messageFilter(r *http.Request) map[string]bool {
 // projectInfo describes one bridged project instance (a per-directory aggregator)
 // for the discovery endpoint.
 type projectInfo struct {
-	Dir      string `json:"dir"`   // project directory ("" = the worker's default project)
-	Epoch    string `json:"epoch"` // store lifetime id (changes on daemon restart)
-	Seq      uint64 `json:"seq"`   // current head seq for this project's store
-	Sessions int    `json:"sessions"`
+	Dir   string `json:"dir"`   // project directory ("" = the worker's default project)
+	Epoch string `json:"epoch"` // store lifetime id (changes on daemon restart)
+	Seq   uint64 `json:"seq"`   // current head seq for this project's store
+	Roots int    `json:"roots"` // live ROOT session count (children/archived excluded)
 }
 
 // handleProjects lists the project instances this worker currently bridges — one
@@ -746,7 +746,7 @@ func (s *Server) handleProjects(w http.ResponseWriter, r *http.Request) {
 	out := make([]projectInfo, 0, len(live))
 	for _, e := range live {
 		st := e.agg.Store()
-		out = append(out, projectInfo{Dir: e.dir, Epoch: st.Epoch(), Seq: st.Head(), Sessions: len(st.SessionIDs())})
+		out = append(out, projectInfo{Dir: e.dir, Epoch: st.Epoch(), Seq: st.Head(), Roots: st.RootCount()})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Dir < out[j].Dir })
 	writeJSONResp(w, out)

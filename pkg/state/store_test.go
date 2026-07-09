@@ -468,6 +468,79 @@ func TestGateSubtreeBusyAndPendingFlags(t *testing.T) {
 	}
 }
 
+// TestRootCount covers the live-root total that backs the project switcher's
+// "X running, Y idle" badge (idle = roots − running). RootCount must (a) count
+// ROOTS only — children never count even while attached to a live parent;
+// (b) treat an orphaned child (parentID not in the live tree) as its own root,
+// matching rootOfLocked / busyCount / RunningRoots; (c) exclude archived
+// sessions (archive via time.archived funnels through deleteSessionLocked); and
+// (d) never fall below RunningRoots, since both draw from the same population.
+func TestRootCount(t *testing.T) {
+	s := New(100)
+
+	// Empty store → 0 roots, 0 running.
+	if got := s.RootCount(); got != 0 {
+		t.Fatalf("empty store: want 0 roots, got %d", got)
+	}
+
+	// Children never count: a is a root, a1 is its child. b is a second root.
+	s.Apply(ev("session.created", `{"info":{"id":"a"}}`))
+	s.Apply(ev("session.created", `{"info":{"id":"a1","parentID":"a"}}`))
+	s.Apply(ev("session.created", `{"info":{"id":"b"}}`))
+	if got := s.RootCount(); got != 2 {
+		t.Fatalf("two roots (a, b) + one child (a1): want 2 roots, got %d", got)
+	}
+
+	// An orphan (parentID not in the live tree) counts as its own root — same
+	// orphan-inclusive definition as rootOfLocked / busyCount / RunningRoots.
+	s.Apply(ev("session.created", `{"info":{"id":"o","parentID":"ghost"}}`))
+	if got := s.RootCount(); got != 3 {
+		t.Fatalf("orphan child o: want 3 roots (a, b, o), got %d", got)
+	}
+
+	// RootCount draws from the SAME population as RunningRoots (live roots), so
+	// roots >= running always holds. Make a's subtree busy via its child a1.
+	s.Apply(ev("session.status", `{"sessionID":"a1","status":{"type":"busy"}}`))
+	running := s.RunningRoots()
+	if running != 1 {
+		t.Fatalf("busy child a1 should make 1 running root, got %d", running)
+	}
+	if roots := s.RootCount(); roots < running {
+		t.Fatalf("roots (%d) must be >= running (%d)", roots, running)
+	}
+
+	// Archiving a live ROOT removes it from the live tree (time.archived funnels
+	// through deleteSessionLocked), so it stops counting. Archived sessions must
+	// NOT inflate the idle count. b and o are childless roots, so archiving them
+	// drops the count cleanly.
+	s.Apply(ev("session.updated", `{"info":{"id":"b","time":{"archived":12345}}}`))
+	if got := s.RootCount(); got != 2 {
+		t.Fatalf("after archiving root b: want 2 roots (a, o), got %d", got)
+	}
+	s.Apply(ev("session.updated", `{"info":{"id":"o","time":{"archived":99999}}}`))
+	if got := s.RootCount(); got != 1 {
+		t.Fatalf("after archiving root o: want 1 root (a), got %d", got)
+	}
+
+	// Orphan promotion: deleting root a leaves its child a1 with no live parent,
+	// so a1 becomes its own root (matches rootOfLocked's orphan-inclusive walk).
+	// The count stays 1 (a out, a1 promoted) — proving children aren't lost,
+	// they re-root.
+	s.Apply(ev("session.deleted", `{"info":{"id":"a"}}`))
+	if got := s.RootCount(); got != 1 {
+		t.Fatalf("after deleting root a: want 1 root (a1 promoted), got %d", got)
+	}
+
+	// Removing the last session brings it to 0.
+	s.Apply(ev("session.deleted", `{"info":{"id":"a1"}}`))
+	if got := s.RootCount(); got != 0 {
+		t.Fatalf("after deleting a1: want 0 roots, got %d", got)
+	}
+	if got := s.RunningRoots(); got != 0 {
+		t.Fatalf("after deleting the last root: want 0 running, got %d", got)
+	}
+}
+
 func TestGateLastAssistantEmpty(t *testing.T) {
 	s := New(100)
 	s.Apply(ev("session.created", `{"info":{"id":"a"}}`))

@@ -11,7 +11,7 @@ import {
   selectProject,
 } from "../projects";
 import { dismiss, modal } from "../lib/a11y";
-import { runningSessionCount, state } from "../sync";
+import { runningSessionCount, rootSessionCount } from "../sync";
 import Icon from "./Icon";
 import TextPromptDialog from "./TextPromptDialog";
 
@@ -52,15 +52,16 @@ export default function ProjectSwitcher() {
   });
 
   // Enriched + sorted rows (running-first, then case-insensitive name). The
-  // active project uses live store counts (runningSessionCount() + session
-  // count); others use the endpoint activity data.
+  // active project uses live store counts (runningSessionCount() + rootSession
+  // count); others use the endpoint activity data. Both counts are ROOT-ONLY
+  // (children/archived excluded), so idle = roots − running is meaningful.
   const rows = createMemo(() =>
     mergeProjectActivity(
       projects(),
-      activity() ?? { sessions: new Map(), running: new Map() },
+      activity() ?? { roots: new Map(), running: new Map() },
       projectDir(),
       runningSessionCount(),
-      Object.keys(state.sessions).length,
+      rootSessionCount(),
     ),
   );
 
@@ -121,15 +122,15 @@ export default function ProjectSwitcher() {
                         <Show when={p.directory} fallback="default workspace">
                           {p.directory}
                         </Show>
-                        <Show when={p.running > 0 || p.sessions > 0}>
+                        <Show when={p.running > 0 || p.idle > 0}>
                           {" \u00b7 "}
                           <span classList={{ "proj-badge": true, run: p.running > 0 }}>
                             <Show when={p.running > 0}>
                               <span class="proj-badge-dot" aria-hidden="true" />
                               {p.running} running
                             </Show>
-                            <Show when={p.running > 0 && p.sessions > 0}>{", "}</Show>
-                            <Show when={p.sessions > 0}>{p.sessions} sessions</Show>
+                            <Show when={p.running > 0 && p.idle > 0}>{", "}</Show>
+                            <Show when={p.idle > 0}>{p.idle} idle</Show>
                           </span>
                         </Show>
                       </span>
@@ -152,23 +153,37 @@ export default function ProjectSwitcher() {
               <Show when={freshRecents().length > 0}>
                 <div class="proj-section">Recent (OpenCode)</div>
                 <For each={freshRecents()}>
-                  {(r) => (
-                    <div class="proj-item">
-                      <button type="button" class="proj-pick" onClick={() => (addProject(r.directory), setOpen(false))}>
-                        <span class="proj-item-name">{r.name}</span>
-                        <span class="proj-item-dir">
-                          {r.directory}
-                          <Show when={(activity()?.running.get(r.directory) ?? 0) > 0}>
-                            {" \u00b7 "}
-                            <span class="proj-badge run">
-                              <span class="proj-badge-dot" aria-hidden="true" />
-                              {activity()!.running.get(r.directory)} running
-                            </span>
-                          </Show>
-                        </span>
-                      </button>
-                    </div>
-                  )}
+                  {(r) => {
+                    // Recents may not be bridged in /vh/projects, so a root count
+                    // is NOT guaranteed. When one IS present for this dir, show
+                    // idle too (consistency with pinned rows); otherwise fall back
+                    // to running-only. idle is defensive: max(0, roots − running).
+                    const act = () => activity();
+                    const rootsKnown = () => act()?.roots.has(r.directory) ?? false;
+                    const run = () => act()?.running.get(r.directory) ?? 0;
+                    const idle = () => (rootsKnown() ? Math.max(0, (act()!.roots.get(r.directory) ?? 0) - run()) : 0);
+                    return (
+                      <div class="proj-item">
+                        <button type="button" class="proj-pick" onClick={() => (addProject(r.directory), setOpen(false))}>
+                          <span class="proj-item-name">{r.name}</span>
+                          <span class="proj-item-dir">
+                            {r.directory}
+                            <Show when={run() > 0 || idle() > 0}>
+                              {" \u00b7 "}
+                              <span classList={{ "proj-badge": true, run: run() > 0 }}>
+                                <Show when={run() > 0}>
+                                  <span class="proj-badge-dot" aria-hidden="true" />
+                                  {run()} running
+                                </Show>
+                                <Show when={run() > 0 && idle() > 0}>{", "}</Show>
+                                <Show when={idle() > 0}>{idle()} idle</Show>
+                              </span>
+                            </Show>
+                          </span>
+                        </button>
+                      </div>
+                    );
+                  }}
                 </For>
               </Show>
 

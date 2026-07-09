@@ -98,8 +98,8 @@ test("project switcher shows a running badge for a non-active workspace", async 
     .poll(
       async () => {
         const r = await api.get("/vh/projects");
-        const j = (await r.json()) as { dir: string; sessions: number }[];
-        return (j ?? []).some((p) => p.dir === "/work/alpha" && p.sessions >= 1);
+        const j = (await r.json()) as { dir: string; roots: number }[];
+        return (j ?? []).some((p) => p.dir === "/work/alpha" && p.roots >= 1);
       },
       { timeout: 10000 },
     )
@@ -138,7 +138,12 @@ test("project switcher shows a running badge for a non-active workspace", async 
   await expect(alphaRow).toBeVisible();
   await expect(alphaRow).not.toHaveClass(/\bon\b/); // not the active project
   await expect(alphaRow.locator(".proj-badge.run")).toBeVisible({ timeout: 8000 });
-  await expect(alphaRow.locator(".proj-badge.run")).toContainText(/running/);
+  // proj_alpha is the single root in /work/alpha and is busy, so the badge reads
+  // "1 running" (idle = roots − running = 0, omitted). The old "N sessions" label
+  // must be gone (the field was renamed sessions → roots and the badge now shows
+  // running/idle, never "sessions").
+  await expect(alphaRow.locator(".proj-badge.run")).toContainText(/1 running/);
+  await expect(alphaRow.locator(".proj-badge.run")).not.toContainText(/sessions/);
 
   // Cleanup so the sticky busy state doesn't leak into later serial tests.
   await api.post("/oc/fixture/reset?session=proj_alpha", { headers: { "X-VH-CSRF": "1" } });

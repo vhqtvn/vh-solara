@@ -188,7 +188,7 @@ func (d *Daemon) coordSkillEmit(w http.ResponseWriter, r *http.Request) {
 }
 
 // coordProjects lists the project instances a worker bridges (dir/epoch/seq/
-// sessions) — the cross-machine mirror of the worker's /vh/projects, so a
+// roots) — the cross-machine mirror of the worker's /vh/projects, so a
 // coordinator can resolve "this project dir" → the right per-project cursor.
 func (d *Daemon) coordProjects(w http.ResponseWriter, r *http.Request) {
 	worker, ok := d.coordWorker(w, r)

@@ -116,6 +116,7 @@ export {
   sessionWorking,
   currentVerb,
   runningSessionCount,
+  rootSessionCount,
   sessionTodos,
   sessionTodoCounts,
 } from "./sync/selectors";

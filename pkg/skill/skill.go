@@ -164,7 +164,7 @@ func Generate(version string) string {
 	p("  owned by the dir it was created under. Pass the SAME `?dir=<dir>` (or `x-opencode-directory`\n")
 	p("  header) on EVERY verb (snapshot/stream/send/spawn/abort/answer/reply/archive); omitting it\n")
 	p("  targets the default project — mismatched dir silently hits the wrong (often empty) instance.\n")
-	p("- `GET /vh/projects` → `[{dir, epoch, seq, sessions}]` lists the bridged instances; pin your\n")
+	p("- `GET /vh/projects` → `[{dir, epoch, seq, roots}]` lists the bridged instances; pin your\n")
 	p("  watch cursor to one project's (epoch, seq). Cross-machine: `/api/workers/{id}/projects`.\n\n")
 
 	p("## Read inventory verbs (GET — programmatic, HTTP-only; NOT MCP tools)\n\n")

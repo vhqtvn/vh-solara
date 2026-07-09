@@ -1874,6 +1874,29 @@ func (s *Store) RunningRoots() int {
 	return n
 }
 
+// RootCount returns the number of LIVE session roots — roots among the
+// non-archived sessions in the live tree. It uses the SAME orphan-inclusive root
+// definition as rootOfLocked / busyCount / RunningRoots: a session is a root when
+// it has no parentID OR its parentID is not present in the live store, so a child
+// never counts even if its parent has been archived (an orphaned child becomes its
+// own root). Archived sessions are already removed from s.sessions (archive via
+// time.archived funnels through deleteSessionLocked), so they're excluded
+// naturally and don't inflate the count. RootCount draws from the same population
+// RunningRoots() does, so roots >= running always holds; pair the two for an idle
+// count (idle = roots − running). Used by /vh/projects for the project switcher's
+// per-workspace "X running, Y idle" badge (children were never meant to count).
+func (s *Store) RootCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	n := 0
+	for _, e := range s.sessions {
+		if e.parentID == "" || s.sessions[e.parentID] == nil {
+			n++
+		}
+	}
+	return n
+}
+
 // Replay returns buffered events with seq > cursor. ok is false when the cursor
 // is older than the buffer's oldest retained event (caller must send a snapshot).
 func (s *Store) Replay(cursor uint64) (events []ClientEvent, head uint64, ok bool) {

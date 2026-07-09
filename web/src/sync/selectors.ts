@@ -107,6 +107,24 @@ export function runningSessionCount(): number {
   return n;
 }
 
+// rootSessionCount counts LIVE root sessions — the total that pairs with
+// runningSessionCount() to derive an idle count (roots − running) for the project
+// switcher's "X running, Y idle" badge. Uses the SAME orphan-inclusive root
+// definition as runningSessionCount() (a session is a root when it has no
+// parentID OR its parentID is not in the live store), so a child never counts and
+// an orphaned child becomes its own root. Archived sessions are removed from
+// state.sessions on the session.delete stream event (stream.ts), so they're
+// excluded naturally — the Go RootCount() and this draw from the SAME population.
+export function rootSessionCount(): number {
+  let n = 0;
+  for (const id of Object.keys(state.sessions)) {
+    const s = state.sessions[id];
+    if (s?.parentID && state.sessions[s.parentID]) continue; // count roots only
+    n++;
+  }
+  return n;
+}
+
 function descendantWorking(sessionID: string): boolean {
   return anyDescendantWorking(state.sessions, state.activity, sessionID, isActivityWorking);
 }

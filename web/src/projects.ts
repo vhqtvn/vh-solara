@@ -85,21 +85,22 @@ export async function fetchRecentProjects(): Promise<Project[]> {
   }
 }
 
-// --- Project activity (cross-workspace session/running counts) ---
+// --- Project activity (cross-workspace root/running counts) ---
 //
-// The switcher dialog annotates each project row with how many sessions a
+// The switcher dialog annotates each project row with how many LIVE roots a
 // workspace has and how many are currently running. The ACTIVE project's counts
 // come from the live client store (no round-trip); every other project's come
 // from the worker backend:
-//   GET /vh/projects         -> [{dir, epoch, seq, sessions}]  (one per bridged dir)
+//   GET /vh/projects         -> [{dir, epoch, seq, roots}]  (live ROOT count per bridged dir)
 //   GET /vh/running-sessions -> {count, workspaces:[{dir, count}]}  (dirs with >0 running)
 // Both key by the exact project directory, so they merge into the pinned list
-// by `dir`. The merge + sort below is a PURE function (no DOM, no fetch) so it
-// can be unit-tested directly.
+// by `dir`. Root counts are ROOT-ONLY (children/archived excluded) on both sides,
+// so idle = roots − running is meaningful. The merge + sort below is a PURE
+// function (no DOM, no fetch) so it can be unit-tested directly.
 
 export interface ProjectEndpointItem {
   dir: string;
-  sessions: number;
+  roots: number;
 }
 export interface RunningWorkspaceItem {
   dir: string;
@@ -111,7 +112,7 @@ export interface RunningSessionsPayload {
 }
 
 export interface ActivityMaps {
-  sessions: Map<string, number>; // dir -> total session count (/vh/projects)
+  roots: Map<string, number>; // dir -> LIVE root count (/vh/projects)
   running: Map<string, number>; // dir -> running root count (/vh/running-sessions)
 }
 
@@ -120,8 +121,8 @@ export interface ActivityMaps {
 export interface ProjectActivityRow {
   directory: string;
   name: string;
-  sessions: number; // 0 when unknown
   running: number; // 0 when not running / unknown
+  idle: number; // max(0, roots − running); 0 when roots unknown
   active: boolean; // true for projectDir()
 }
 
@@ -131,33 +132,38 @@ export function buildActivityMaps(
   projectsEndpoint: ProjectEndpointItem[],
   runningEndpoint: RunningSessionsPayload,
 ): ActivityMaps {
-  const sessions = new Map<string, number>();
-  for (const p of Array.isArray(projectsEndpoint) ? projectsEndpoint : []) sessions.set(p.dir, p.sessions);
+  const roots = new Map<string, number>();
+  for (const p of Array.isArray(projectsEndpoint) ? projectsEndpoint : []) roots.set(p.dir, p.roots);
   const running = new Map<string, number>();
   for (const w of runningEndpoint?.workspaces ?? []) if (w.count > 0) running.set(w.dir, w.count);
-  return { sessions, running };
+  return { roots, running };
 }
 
 // Enrich + sort the pinned project list. Sort order: running projects first,
 // then case-insensitive name. The active project keeps its marker wherever it
 // sorts. The active project's counts come from the LIVE store (activeRunning /
-// activeSessions) to avoid a round-trip; other projects use the endpoint maps.
+// activeRoots) to avoid a round-trip; other projects use the endpoint maps.
+// `idle` is derived defensively as max(0, roots − running) so a transient
+// roots < running (data race between the two endpoints) can never render a
+// negative idle count.
 export function mergeProjectActivity(
   pinned: Project[],
   maps: ActivityMaps,
   activeDir: string,
   activeRunning: number,
-  activeSessions: number,
+  activeRoots: number,
 ): ProjectActivityRow[] {
-  const { sessions, running } = maps;
+  const { roots, running } = maps;
   const rows: ProjectActivityRow[] = pinned.map((p) => {
     const isActive = p.directory === activeDir;
+    const run = isActive ? activeRunning : running.get(p.directory) || 0;
+    const tot = isActive ? activeRoots : roots.get(p.directory) || 0;
     return {
       directory: p.directory,
       name: p.name,
       active: isActive,
-      sessions: isActive ? activeSessions : sessions.get(p.directory) || 0,
-      running: isActive ? activeRunning : running.get(p.directory) || 0,
+      running: run,
+      idle: Math.max(0, tot - run),
     };
   });
   rows.sort((a, b) => {
@@ -184,7 +190,7 @@ export async function fetchProjectActivity(): Promise<ActivityMaps> {
     );
   } catch (e) {
     log.warn("projects", "activity fetch failed", e);
-    return { sessions: new Map(), running: new Map() };
+    return { roots: new Map(), running: new Map() };
   }
 }
 
