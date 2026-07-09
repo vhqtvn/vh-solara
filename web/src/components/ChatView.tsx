@@ -17,6 +17,7 @@ import { activeAgent, agentForSession, agents, selectAgentForSession, selectedAg
 import { dequeue, enqueue, queueFor, queueMode, removeQueued } from "../queue";
 import { historyAt, historyLen, pushHistory } from "../history";
 import { type AcItem, commandSuggestions, fileSuggestions } from "../lib/complete";
+import { harvestPastedFiles } from "../lib/paste";
 import ModelDialog from "./ModelDialog";
 import PartView, { ActivityGroup } from "./Part";
 import { Deferred } from "./Deferred";
@@ -244,7 +245,10 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     agents().length > 0 && (models().length > 0 || !!selectionFor(props.sessionId)),
   );
   // Pending attachments (file parts) to send with the next message.
-  interface Attachment { url: string; filename: string; mime: string }
+  // `file` is set ONLY for draft-queued attachments (no server session yet):
+  // the raw File is held locally and uploaded at send time, then `file` is
+  // dropped and a real `url` takes its place (see flushPendingAttachments).
+  interface Attachment { url: string; filename: string; mime: string; file?: File }
   const [attachments, setAttachments] = createSignal<Attachment[]>([]);
   const [uploading, setUploading] = createSignal(false);
   let fileInputRef: HTMLInputElement | undefined;
@@ -1267,29 +1271,75 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     return props.sessionId;
   }
 
-  // Upload a file into the project's .vh-solara attachments dir and queue it
-  // as a file part for the next message. Drafts get a real session first so the
-  // attachment lands under sessions/<id>/.
-  async function addFiles(files: FileList | null) {
+  // Upload one file into the project's .vh-solara attachments dir; returns the
+  // server-backed Attachment (with a real url) or null on failure.
+  async function uploadFile(file: File, id: string): Promise<Attachment | null> {
+    const fd = new FormData();
+    fd.append("file", file);
+    const res = await fetch(`/vh/attach?session=${encodeURIComponent(id)}`, {
+      method: "POST",
+      body: fd,
+    });
+    if (!res.ok) return null;
+    const part = await res.json();
+    if (!part?.url) return null;
+    return { url: part.url, filename: part.filename, mime: part.mime };
+  }
+
+  // Synthetic key for a draft-queued attachment (no server session yet). Real
+  // uploads get a server url; pending ones get this so removeAttachment (which
+  // keys on url) still works on the chip before send.
+  let pendingSeq = 0;
+  const pendingKey = () => `pending:${++pendingSeq}`;
+
+  // Upload any draft-queued (pending) attachments now that a session exists,
+  // replacing their synthetic keys with real server urls. Called right after
+  // createSession() in send(). A no-op for live sessions, whose attachments
+  // upload immediately in addFiles.
+  async function flushPendingAttachments(id: string) {
+    const pending = attachments().filter((a) => a.file);
+    if (pending.length === 0) return;
+    setUploading(true);
+    try {
+      const resolved: Attachment[] = [];
+      for (const a of pending) {
+        const r = await uploadFile(a.file!, id);
+        if (r) resolved.push(r);
+      }
+      // Keep already-uploaded entries; replace pending ones with resolved urls.
+      setAttachments((prev) => [...prev.filter((a) => !a.file), ...resolved]);
+    } finally {
+      setUploading(false);
+    }
+  }
+
+  // Queue a file as an attachment for the next message. For a LIVE session the
+  // upload happens now (chip shows a server-backed url immediately). For a DRAFT
+  // there is no session yet — never create one on paste/pick just to upload:
+  // createSession() navigates away from the draft hero and this component-local
+  // attachment state is lost on the remount. Instead queue the raw File locally
+  // (chip shows from filename) and upload it at send time, once the session
+  // exists (see flushPendingAttachments in send()).
+  async function addFiles(files: FileList | File[] | null) {
     if (!files || files.length === 0) return;
-    const id = await ensureSession();
+    if (fileInputRef) fileInputRef.value = "";
+    const arr = Array.from(files);
+    if (props.draft) {
+      for (const file of arr) {
+        setAttachments((a) => [...a, { url: pendingKey(), filename: file.name, mime: file.type, file }]);
+      }
+      return;
+    }
+    const id = props.sessionId;
     if (!id) return;
     setUploading(true);
     try {
-      for (const file of Array.from(files)) {
-        const fd = new FormData();
-        fd.append("file", file);
-        const res = await fetch(`/vh/attach?session=${encodeURIComponent(id)}`, {
-          method: "POST",
-          body: fd,
-        });
-        if (!res.ok) continue;
-        const part = await res.json();
-        if (part?.url) setAttachments((a) => [...a, { url: part.url, filename: part.filename, mime: part.mime }]);
+      for (const file of arr) {
+        const uploaded = await uploadFile(file, id);
+        if (uploaded) setAttachments((a) => [...a, uploaded]);
       }
     } finally {
       setUploading(false);
-      if (fileInputRef) fileInputRef.value = "";
     }
   }
   const removeAttachment = (url: string) => setAttachments((a) => a.filter((x) => x.url !== url));
@@ -1482,6 +1532,9 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       setInput(text); // session creation failed; keep the text for retry
       return;
     }
+    // A draft may have queued attachments locally (no session existed at paste
+    // time). Now that we have an id, upload them so buildParts sees real urls.
+    await flushPendingAttachments(id);
     // On failure, restore the composer text so a silent noop never loses what
     // the user typed (they can edit/retry instead of re-typing).
     const ok = text.startsWith("!")
@@ -1988,10 +2041,17 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
               onPaste={(e) => {
                 // Paste an image/file (e.g. a screenshot) straight into the
                 // composer as an attachment; plain-text paste falls through.
-                const files = e.clipboardData?.files;
-                if (files && files.length > 0) {
+                // Many browsers expose pasted files ONLY via clipboardData.items
+                // (getAsFile) while .files stays empty, so harvest both and
+                // prefer items (see lib/paste.ts).
+                const cd = e.clipboardData;
+                const harvested = harvestPastedFiles(
+                  cd?.files ? Array.from(cd.files) : null,
+                  cd?.items ? Array.from(cd.items) : null,
+                );
+                if (harvested.length > 0) {
                   e.preventDefault();
-                  void addFiles(files);
+                  void addFiles(harvested);
                 }
               }}
               placeholder={"Message…   (! = shell, /undo /redo)"}
