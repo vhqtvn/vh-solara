@@ -62,7 +62,7 @@ test("project switcher opens a dialog, marks the active project, and re-scopes t
 test("project switcher offers OpenCode recents to pin", async ({ page }) => {
   await page.goto("/");
   await page.locator(".proj-current").click();
-  await expect(page.locator(".dialog.projects-dialog")).toBeVisible();
+  await expect(page.getByRole("dialog", { name: "Switch project" })).toBeVisible();
 
   // Recent section lists projects from OpenCode (GET /project), newest first.
   await expect(page.locator(".proj-section", { hasText: /Recent/ })).toBeVisible({ timeout: 8000 });
@@ -88,7 +88,7 @@ test("project switcher shows a running badge for a non-active workspace", async 
   // lazily create the alpha aggregator and hydrate its synthetic session
   // (id "proj_alpha", directory /work/alpha).
   await page.locator(".proj-current").click();
-  await expect(page.locator(".dialog.projects-dialog")).toBeVisible();
+  await expect(page.getByRole("dialog", { name: "Switch project" })).toBeVisible();
   await page.locator(".proj-pick", { hasText: "alpha" }).click();
   await expect(page.locator(".proj-name")).toContainText("alpha", { timeout: 8000 });
 
@@ -150,7 +150,7 @@ test("project switcher shows a running badge for a non-active workspace", async 
   // Reopen the dialog: the alpha row shows a running badge (it is not the active
   // project, so its activity comes from the endpoint).
   await page.locator(".proj-current").click();
-  await expect(page.locator(".dialog.projects-dialog")).toBeVisible();
+  await expect(page.getByRole("dialog", { name: "Switch project" })).toBeVisible();
   const alphaRow = page.locator(".proj-item", { hasText: "alpha" });
   await expect(alphaRow).toBeVisible();
   await expect(alphaRow).not.toHaveClass(/\bon\b/); // not the active project
