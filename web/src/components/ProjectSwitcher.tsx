@@ -4,6 +4,7 @@ import {
   addProject,
   fetchProjectActivity,
   fetchRecentProjects,
+  filterProjectRows,
   mergeProjectActivity,
   projectDir,
   projects,
@@ -24,6 +25,7 @@ import TextPromptDialog from "./TextPromptDialog";
 // active project uses the live client store to avoid a round-trip.
 export default function ProjectSwitcher() {
   const [open, setOpen] = createSignal(false);
+  const [query, setQuery] = createSignal("");
   const [recents, { refetch }] = createResource(fetchRecentProjects, { initialValue: [] });
 
   // Activity is fetched ON DIALOG OPEN (coalesced, never a tight loop). Held as a
@@ -65,10 +67,21 @@ export default function ProjectSwitcher() {
     ),
   );
 
+  // Search/filter: case-insensitive substring on name OR directory. The filter
+  // itself is pure (projects.ts → filterProjectRows); memos recompute only when
+  // rows or query change.
+  const filteredRows = createMemo(() => filterProjectRows(rows(), query()));
+  const filteredRecents = createMemo(() => filterProjectRows(freshRecents(), query()));
+  const hasAny = createMemo(() => rows().length > 0 || freshRecents().length > 0);
+  const noResults = createMemo(
+    () => hasAny() && query().trim() !== "" && filteredRows().length === 0 && filteredRecents().length === 0,
+  );
+
   function toggle() {
     const next = !open();
     setOpen(next);
     if (next) {
+      setQuery("");
       void refetch(); // refresh recents when opening
       loadActivity(); // refresh activity when opening
     }
@@ -88,7 +101,7 @@ export default function ProjectSwitcher() {
         <Icon name="chevronDown" size={14} />
       </button>
       <Show when={open()}>
-        <div class="dialog-overlay" use:dismiss={() => setOpen(false)}>
+        <div class="dialog-overlay" use:dismiss={() => setOpen(false)} onClick={() => setOpen(false)}>
           <div
             class="dialog projects-dialog"
             role="dialog"
@@ -97,13 +110,27 @@ export default function ProjectSwitcher() {
             onClick={(e) => e.stopPropagation()}
           >
             <div class="dialog-head">
-              <span class="dialog-title">Switch project</span>
+              <input
+                class="dialog-search"
+                placeholder="Search projects…"
+                autocomplete="off"
+                aria-label="Search projects"
+                value={query()}
+                onInput={(e) => setQuery(e.currentTarget.value)}
+              />
               <button type="button" class="icon-btn" aria-label="Close" onClick={() => setOpen(false)}>
                 <Icon name="x" size={14} />
               </button>
             </div>
             <div class="dialog-body">
-              <For each={rows()}>
+              <Show when={!hasAny()}>
+                <p class="proj-empty">No projects yet — use “Add project…” to pin one.</p>
+              </Show>
+              <Show when={noResults()}>
+                <p class="proj-empty">No matching projects</p>
+              </Show>
+              <Show when={hasAny() && !noResults()}>
+              <For each={filteredRows()}>
                 {(p) => (
                   <div class="proj-item" classList={{ on: p.active }}>
                     <button
@@ -150,9 +177,9 @@ export default function ProjectSwitcher() {
                 )}
               </For>
 
-              <Show when={freshRecents().length > 0}>
+              <Show when={filteredRecents().length > 0}>
                 <div class="proj-section">Recent (OpenCode)</div>
-                <For each={freshRecents()}>
+                <For each={filteredRecents()}>
                   {(r) => {
                     // Recents may not be bridged in /vh/projects, so a root count
                     // is NOT guaranteed. When one IS present for this dir, show
@@ -185,6 +212,7 @@ export default function ProjectSwitcher() {
                     );
                   }}
                 </For>
+              </Show>
               </Show>
 
               <button type="button" class="proj-add" onClick={add}>

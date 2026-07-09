@@ -2611,6 +2611,17 @@ body {
   background: var(--accent);
   border-radius: 50%;
 }
+/* Empty / no-results: a single muted, centered line. This is an ephemeral
+   dialog (not a streaming surface), so plain text is cheapest — no mask-image,
+   no backdrop-filter, no contain:paint/content-visibility (those hurt on
+   Firefox/WebRender per the repo perf guidance). */
+.proj-empty {
+  margin: 0;
+  padding: 18px 12px;
+  text-align: center;
+  font-size: 13px;
+  color: var(--fg-dim);
+}
 /* On fullscreen mobile the close button gets a comfortable tap target. */
 @media (max-width: 720px) {
   .projects-dialog .icon-btn { padding: 8px; }

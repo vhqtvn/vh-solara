@@ -175,6 +175,24 @@ export function mergeProjectActivity(
   return rows;
 }
 
+// Filter project rows by a case-insensitive substring match against the row's
+// name OR directory (either matching keeps the row). An empty/whitespace query
+// is a no-op that returns the input array unchanged, so an idle dialog never
+// rebuilds the list. Pure (no DOM, no signals) so it can be unit-tested in
+// isolation, mirroring mergeProjectActivity. Generic over any row shape that
+// carries { name, directory } so it serves both the enriched ProjectActivityRow
+// (pinned) and the plain Project (recents).
+export function filterProjectRows<T extends { name: string; directory: string }>(
+  rows: T[],
+  query: string,
+): T[] {
+  const q = (query ?? "").trim().toLowerCase();
+  if (!q) return rows;
+  return rows.filter(
+    (r) => r.name.toLowerCase().includes(q) || r.directory.toLowerCase().includes(q),
+  );
+}
+
 // Fetch both activity endpoints (coalesced via Promise.all). Never throws: on
 // any failure returns empty maps so the dialog still renders with names alone.
 export async function fetchProjectActivity(): Promise<ActivityMaps> {

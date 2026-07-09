@@ -13,7 +13,7 @@ test("project switcher opens a dialog, marks the active project, and re-scopes t
 
   // Open the switcher dialog.
   await page.locator(".proj-current").click();
-  await expect(page.locator(".dialog.projects-dialog")).toBeVisible();
+  await expect(page.getByRole("dialog", { name: "Switch project" })).toBeVisible();
 
   // The active project (Default) is marked with the .on row tint.
   await expect(page.locator(".proj-item.on", { hasText: /Default/ })).toBeVisible();
@@ -148,4 +148,45 @@ test("project switcher shows a running badge for a non-active workspace", async 
   // Cleanup so the sticky busy state doesn't leak into later serial tests.
   await api.post("/oc/fixture/reset?session=proj_alpha", { headers: { "X-VH-CSRF": "1" } });
   await ctx.close();
+});
+
+test("project switcher filters rows by search and shows a no-results state", async ({ page }) => {
+  await page.goto("/");
+  await page.locator(".proj-current").click();
+  await expect(page.getByRole("dialog", { name: "Switch project" })).toBeVisible();
+
+  // The search input lives in the dialog head (reuses the .dialog-search styling).
+  const search = page.getByLabel("Search projects");
+  await expect(search).toBeVisible();
+
+  // Initially the full list is shown: Default (pinned) + alpha, beta (recents).
+  await expect(page.locator(".proj-item-name", { hasText: "Default" })).toBeVisible();
+  await expect(page.locator(".proj-item-name", { hasText: "alpha" })).toBeVisible();
+  await expect(page.locator(".proj-item-name", { hasText: "beta" })).toBeVisible();
+
+  // Typing a query matching only alpha (by name) hides the other rows.
+  await search.fill("alpha");
+  await expect(page.locator(".proj-item-name", { hasText: "alpha" })).toBeVisible();
+  await expect(page.locator(".proj-item-name", { hasText: "Default" })).toHaveCount(0);
+  await expect(page.locator(".proj-item-name", { hasText: "beta" })).toHaveCount(0);
+
+  // Matching by directory works too (case-insensitive): "WORK" hits both
+  // /work/alpha and /work/Beta, drops Default (directory "").
+  await search.fill("WORK");
+  await expect(page.locator(".proj-item-name", { hasText: "alpha" })).toBeVisible();
+  await expect(page.locator(".proj-item-name", { hasText: "beta" })).toBeVisible();
+  await expect(page.locator(".proj-item-name", { hasText: "Default" })).toHaveCount(0);
+
+  // A query that matches nothing shows the no-results message and no rows.
+  // ("Add project…" is .proj-add, NOT .proj-item, so it stays reachable.)
+  await search.fill("zzzznomatch");
+  await expect(page.locator(".proj-empty", { hasText: /No matching/ })).toBeVisible();
+  await expect(page.locator(".proj-item")).toHaveCount(0);
+  await expect(page.locator(".proj-add")).toBeVisible();
+
+  // Clearing the query restores the full list.
+  await search.fill("");
+  await expect(page.locator(".proj-item-name", { hasText: "Default" })).toBeVisible();
+  await expect(page.locator(".proj-item-name", { hasText: "alpha" })).toBeVisible();
+  await expect(page.locator(".proj-item-name", { hasText: "beta" })).toBeVisible();
 });
