@@ -182,10 +182,11 @@ export function mergeProjectActivity(
 // Filter project rows by a case-insensitive substring match against the row's
 // name OR directory (either matching keeps the row). An empty/whitespace query
 // is a no-op that returns the input array unchanged, so an idle dialog never
-// rebuilds the list. Pure (no DOM, no signals) so it can be unit-tested in
-// isolation, mirroring mergeProjectActivity. Generic over any row shape that
-// carries { name, directory } so it serves both the enriched ProjectActivityRow
-// (pinned) and the plain Project (recents).
+// rebuilds the list. `query` may be null/undefined (coerced to empty → no-op),
+// matching the impl's `(query ?? "").trim().toLowerCase()`. Pure (no DOM, no
+// signals) so it can be unit-tested in isolation, mirroring mergeProjectActivity.
+// Generic over any row shape that carries { name, directory } so it serves both
+// the enriched ProjectActivityRow (pinned) and the plain Project (recents).
 export function filterProjectRows<T extends { name: string; directory: string }>(
   rows: T[],
   query: string,

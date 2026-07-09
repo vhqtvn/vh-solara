@@ -54,7 +54,7 @@ test("project switcher opens a dialog, marks the active project, and re-scopes t
 
   // Switching back to alpha (a pinned row) restores its sessions.
   await page.locator(".proj-current").click();
-  await expect(page.locator(".dialog.projects-dialog")).toBeVisible();
+  await expect(page.getByRole("dialog", { name: "Switch project" })).toBeVisible();
   await page.locator(".proj-pick", { hasText: "alpha" }).click();
   await expect(page.locator(".tree-node", { hasText: "Project: alpha" })).toBeVisible({ timeout: 8000 });
 });
@@ -203,6 +203,47 @@ test("project switcher filters rows by search and shows a no-results state", asy
   await search.fill("");
   await expect(page.locator(".proj-item-name", { hasText: "alpha" })).toBeVisible();
   await expect(page.locator(".proj-item-name", { hasText: "beta" })).toBeVisible();
+});
+
+// F6 regression guard: a search filter typed in one open of the switcher must
+// NOT persist across close/reopen. The open-setup (clearing query + refetching
+// recents/activity) lives in a createEffect keyed on open(), so EVERY opener
+// shares one path — including the no-project empty-state CTA (NoProjectState →
+// setProjSwitcherOpen(true)), which previously bypassed the toggle()-only
+// setup and rendered with a stale filter. The CTA path is hard to exercise
+// from within a project (the no-project state only shows when projectDir()===""),
+// so this guards the shared open-setup via the sidebar trigger reopen, which
+// the CTA also drives. Assert the search input is empty AND the filtered-out
+// rows are visible again after reopen.
+test("project switcher clears a stale search filter on close/reopen", async ({ page }) => {
+  await page.goto("/");
+  await page.locator(".proj-current").click();
+  const dialog = page.getByRole("dialog", { name: "Switch project" });
+  await expect(dialog).toBeVisible();
+  const search = dialog.getByLabel("Search projects");
+
+  // Recents (alpha, beta) are both visible before any filtering.
+  await expect(dialog.locator(".proj-item-name", { hasText: "alpha" })).toBeVisible();
+  await expect(dialog.locator(".proj-item-name", { hasText: "beta" })).toBeVisible();
+
+  // Typing "alpha" hides beta (filtered out by the substring match).
+  await search.fill("alpha");
+  await expect(dialog.locator(".proj-item-name", { hasText: "alpha" })).toBeVisible();
+  await expect(dialog.locator(".proj-item-name", { hasText: "beta" })).toHaveCount(0);
+
+  // Close (backdrop click) then reopen via the same sidebar trigger. The
+  // open-setup effect clears the query on the rising edge of open().
+  await page.locator(".dialog-overlay").click({ position: { x: 8, y: 8 } });
+  await expect(dialog).not.toBeVisible();
+
+  await page.locator(".proj-current").click();
+  const reopened = page.getByRole("dialog", { name: "Switch project" });
+  await expect(reopened).toBeVisible();
+
+  // The search input is empty again and BOTH rows are visible (no stale filter).
+  await expect(reopened.getByLabel("Search projects")).toHaveValue("");
+  await expect(reopened.locator(".proj-item-name", { hasText: "alpha" })).toBeVisible();
+  await expect(reopened.locator(".proj-item-name", { hasText: "beta" })).toBeVisible();
 });
 
 // Slice 3: removing a pinned project requires an inline confirmation, so a stray

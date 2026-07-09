@@ -71,6 +71,21 @@ export default function ProjectSwitcher() {
     setPendingRemove(null);
   }
 
+  // Focus management (S3): clicking a pinned row's Remove button replaces that
+  // (focused) button with the .proj-confirm cluster — without a proactive move,
+  // focus can fall to body. Land focus on the Confirm button instead. The ref
+  // targets the single .proj-confirm-go button (only one confirm cluster exists
+  // at a time — pendingRemove is single-valued). queueMicrotask yields so the
+  // freshly-mounted cluster is in the DOM before .focus(); supersede (switching
+  // from one row's confirm to another) sets pendingRemove to the new dir, the
+  // old cluster unmounts + the new one mounts, and this effect re-runs to focus
+  // the NEW confirm button.
+  let confirmBtn: HTMLButtonElement | undefined;
+  createEffect(() => {
+    const dir = pendingRemove();
+    if (dir) queueMicrotask(() => confirmBtn?.focus());
+  });
+
   // Copy-link affordance (Slice 5): every NON-default project row (pinned AND
   // recents) gets a "Copy link" button that writes the per-project deep link
   // (`${origin}${pathname}?dir=<dir>`) to the clipboard. The copied row's icon
@@ -112,11 +127,22 @@ export default function ProjectSwitcher() {
     );
   };
 
-  // Reset the pending + copied states whenever the dialog closes (covers every
-  // close path: overlay click, close button, Escape, selecting a project,
-  // Add…). A stale confirm/copied state must never persist on a hidden row.
+  // Open/close setup runs on EVERY open/close transition via this effect (not
+  // inside toggle()), so every opener shares one path: the sidebar trigger
+  // (toggle), the no-project empty-state CTA (NoProjectState →
+  // setProjSwitcherOpen(true)), and any future setProjSwitcherOpen(true). On
+  // the rising edge it clears the search query and refreshes recents + activity
+  // (a stale filter/badge from one open must never bleed into the next). On the
+  // falling edge it resets pendingRemove + copiedDir (a stale confirm/copied
+  // state must never persist on a hidden row). Reading open() is the sole
+  // dependency; the signals it writes do not write open(), so there is no loop.
   createEffect(() => {
-    if (!open()) {
+    const o = open();
+    if (o) {
+      setQuery("");
+      void refetch(); // refresh recents on each open
+      loadActivity(); // refresh activity badges on each open
+    } else {
       setPendingRemove(null);
       setCopiedDir(null);
     }
@@ -173,13 +199,11 @@ export default function ProjectSwitcher() {
   );
 
   function toggle() {
-    const next = !open();
-    setOpen(next);
-    if (next) {
-      setQuery("");
-      void refetch(); // refresh recents when opening
-      loadActivity(); // refresh activity when opening
-    }
+    // The open/close setup (query clear, recents/activity refetch on open;
+    // pendingRemove/copiedDir reset on close) lives in the createEffect keyed
+    // on open() above, so EVERY opener (this trigger, the no-project CTA, any
+    // setProjSwitcherOpen(true)) shares one path.
+    setOpen(!open());
   }
 
   const [addOpen, setAddOpen] = createSignal(false);
@@ -278,6 +302,7 @@ export default function ProjectSwitcher() {
                           <button
                             type="button"
                             class="proj-confirm-go"
+                            ref={confirmBtn}
                             aria-label={`Confirm remove ${p.name}`}
                             onClick={(e) => (e.stopPropagation(), confirmRemove(p.directory))}
                           >
