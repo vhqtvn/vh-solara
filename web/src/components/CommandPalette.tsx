@@ -94,7 +94,7 @@ export default function CommandPalette() {
   return (
     <Show when={paletteOpen()}>
       <div class="palette-overlay" onClick={close}>
-        <div class="palette" role="dialog" aria-label="Command palette" use:modal onClick={(e) => e.stopPropagation()}>
+        <div class="palette" role="dialog" aria-label="Command palette" use:modal data-autofocus-keyboard onClick={(e) => e.stopPropagation()}>
           <div class="palette-input-row">
             <Icon name="filter" size={14} />
             <input

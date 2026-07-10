@@ -20,6 +20,35 @@ function focusables(root: HTMLElement): HTMLElement[] {
   );
 }
 
+// HTML input types that pop the on-screen (soft) keyboard when focused on a
+// touch device. Auto-focusing one of these as a dialog opens shrinks the
+// viewport by summoning the keyboard — reported as jarring on mobile. To avoid
+// that, focusFirst() skips these on coarse pointers and lands on the next
+// focusable (e.g. the close button), or on the container if there is none.
+//
+// A dialog opts back IN to focusing a keyboard-popper on open by setting
+// `data-autofocus-keyboard` on its root element (CommandPalette does this,
+// since its entire purpose is immediate typing). Scope is strict: <select>,
+// checkboxes, radios, ranges, the date/time family, file, and buttons do NOT
+// pop a soft keyboard, so they are excluded and stay valid auto-focus targets.
+const KEYBOARD_TYPES = new Set([
+  "text",
+  "search",
+  "email",
+  "url",
+  "tel",
+  "password",
+  "number",
+]);
+function popsKeyboard(el: HTMLElement): boolean {
+  if (el.tagName === "TEXTAREA") return true;
+  if (el.tagName === "INPUT") {
+    const t = (el as HTMLInputElement).type; // "" when no type attr → behaves as text
+    return t === "" || KEYBOARD_TYPES.has(t);
+  }
+  return false;
+}
+
 export function attachModal(el: HTMLElement): () => void {
   const prev = document.activeElement as HTMLElement | null;
   setModalCount((n) => n + 1);
@@ -30,8 +59,22 @@ export function attachModal(el: HTMLElement): () => void {
   // the ref runs. Skip if the dialog already focused something itself.
   const focusFirst = () => {
     if (el.contains(document.activeElement)) return;
-    const first = focusables(el)[0];
-    if (first) first.focus();
+    const candidates = focusables(el);
+    // On a coarse pointer (touch) don't auto-focus an element that pops the
+    // soft keyboard on open — that shrinks the viewport. Pick the first NON-
+    // keyboard focusable instead. A dialog opts back in with
+    // `data-autofocus-keyboard` (CommandPalette's reason for being is immediate
+    // typing). Fine pointers (desktop) keep today's behavior unchanged.
+    const coarse =
+      typeof window !== "undefined" &&
+      typeof window.matchMedia === "function" &&
+      window.matchMedia("(pointer: coarse)").matches;
+    const allowKeyboard = el.dataset.autofocusKeyboard !== undefined;
+    const pick =
+      coarse && !allowKeyboard
+        ? candidates.find((c) => !popsKeyboard(c))
+        : candidates[0];
+    if (pick) pick.focus();
     else {
       el.tabIndex = -1;
       el.focus();
