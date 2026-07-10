@@ -622,6 +622,130 @@ func TestStreamAsyncHydrationLiveUpdateDuringFetch(t *testing.T) {
 	}
 }
 
+// TestStreamAsyncHydrationContentPrecedenceDuringFetch pins C-F2: the cold-load
+// reconcile must NOT overwrite the BODY of an existing entry whose content a
+// live event updated during the in-flight full-history GET. The stale fetched
+// body (captured before the live update) must lose to the newer live body.
+//
+// Sibling to TestStreamAsyncHydrationLiveUpdateDuringFetch, which pins the
+// PRESENCE case (live-arrived entries absent from the fetch must survive — the
+// 248c402 delete-missing gate). This test pins the CONTENT case: an entry
+// present in BOTH the fetch and the store, where the store copy is newer
+// because a live event touched it mid-fetch. The common streaming scenario is
+// an assistant part appending text while the background GET is in flight.
+func TestStreamAsyncHydrationContentPrecedenceDuringFetch(t *testing.T) {
+	fake := newFake()
+	fake.sessions = []string{`{"id":"a","title":"A","time":{"updated":1}}`}
+	// The stale full-history GET returns m1 with p1 text "fetched-stale" and
+	// role "user" (the pre-live state). During the in-flight GET, LIVE events
+	// will UPDATE both p1's body and m1's body to NEWER content.
+	fake.messages["a"] = `[{"info":{"id":"m1","sessionID":"a","role":"user"},"parts":[{"id":"p1","sessionID":"a","messageID":"m1","type":"text","text":"fetched-stale"}]}]`
+	hold := make(chan struct{})
+	fake.msgHold["a"] = hold
+
+	ocSrv := httptest.NewServer(fake.handler())
+	defer ocSrv.Close()
+
+	agg := aggregator.New(ocSrv.URL, 1000)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go agg.Run(ctx)
+	waitFor(t, func() bool { return len(agg.Store().Snapshot(map[string]bool{}).Sessions) == 1 }, "hydrate session a")
+
+	srv, _ := NewServer(agg, ocSrv.URL, 1000)
+	web := httptest.NewServer(srv.Handler())
+	defer web.Close()
+
+	// Open the stream for session "a" → EnsureMessagesAsync → background GET
+	// blocks on the hold. The partial snapshot proves the GET is in flight.
+	resp, err := http.Get(web.URL + "/vh/stream?sessions=a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	reader := bufio.NewReader(resp.Body)
+	ev, _ := readSSEFrame(t, reader)
+	if ev != "snapshot" {
+		t.Fatalf("first frame want 'snapshot', got %q", ev)
+	}
+
+	// Helpers to read reconciled store content.
+	partText := func(msgID, partID string) string {
+		for _, mwp := range agg.Store().Snapshot(map[string]bool{"a": true}).Messages["a"] {
+			var mi struct {
+				ID string `json:"id"`
+			}
+			json.Unmarshal(mwp.Info, &mi)
+			if mi.ID != msgID {
+				continue
+			}
+			for _, part := range mwp.Parts {
+				var pe struct {
+					ID   string `json:"id"`
+					Text string `json:"text"`
+				}
+				json.Unmarshal(part, &pe)
+				if pe.ID == partID {
+					return pe.Text
+				}
+			}
+		}
+		return ""
+	}
+	msgRoleCompleted := func(msgID string) (role string, completed bool) {
+		for _, mwp := range agg.Store().Snapshot(map[string]bool{"a": true}).Messages["a"] {
+			var mi struct {
+				ID   string `json:"id"`
+				Role string `json:"role"`
+				Time struct {
+					Completed *float64 `json:"completed"`
+				} `json:"time"`
+			}
+			json.Unmarshal(mwp.Info, &mi)
+			if mi.ID == msgID {
+				return mi.Role, mi.Time.Completed != nil
+			}
+		}
+		return "", false
+	}
+
+	// WHILE the full GET is held, inject LIVE updates to EXISTING entries
+	// (same IDs as the fetched list) with NEWER content — the common
+	// streaming-overwrite case:
+	//  - p1 text "fetched-stale" → "live-newer" (a content body overwrite).
+	//  - m1 body role "user" → "assistant" + completion (a message body
+	//    overwrite — the cached role/completed fields are also at stake).
+	fake.events <- `{"type":"message.part.updated","properties":{"part":{"id":"p1","sessionID":"a","messageID":"m1","type":"text","text":"live-newer"}}}`
+	fake.events <- `{"type":"message.updated","properties":{"info":{"id":"m1","sessionID":"a","role":"assistant","agent":"test","time":{"completed":999}}}}`
+
+	// Guarantee the live events have been applied BEFORE releasing the held GET
+	// (removes all timing nondeterminism — the only variable is whether
+	// reconcileMessagesLocked preserves the live content).
+	waitFor(t, func() bool { return partText("m1", "p1") == "live-newer" }, "live part p1 content applied to store during in-flight fetch")
+	waitFor(t, func() bool {
+		role, completed := msgRoleCompleted("m1")
+		return role == "assistant" && completed
+	}, "live message m1 body applied to store during in-flight fetch")
+
+	// Release the held stale GET → the cold reconcile completes.
+	close(hold)
+	waitFor(t, func() bool { return agg.Store().IsMessagesLoaded("a") }, "session a loaded after stale reconcile")
+
+	// CONTRACT (C-F2): the LIVE body must survive the stale reconcile. The
+	// fetched body ("fetched-stale" / role "user") must NOT overwrite the
+	// live-newer body that arrived during the fetch window.
+	if got := partText("m1", "p1"); got != "live-newer" {
+		t.Errorf("LIVE PART BODY CLOBBERED: p1 text after reconcile want %q, got %q (stale fetched body won)", "live-newer", got)
+	}
+	role, completed := msgRoleCompleted("m1")
+	if role != "assistant" {
+		t.Errorf("LIVE MESSAGE BODY CLOBBERED: m1 role after reconcile want %q, got %q (stale fetched role won)", "assistant", role)
+	}
+	if !completed {
+		t.Errorf("LIVE MESSAGE BODY CLOBBERED: m1 completion lost after reconcile (stale fetched body won)")
+	}
+}
+
 // TestCSRFGuard verifies state-changing API requests require the custom header,
 // reads don't, and the side-effect-free /vh/render is exempt.
 func TestCSRFGuard(t *testing.T) {

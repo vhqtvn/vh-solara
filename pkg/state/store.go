@@ -297,6 +297,21 @@ type messageEntry struct {
 	// further coalesces streaming markdown to ~5fps, so ~30fps of part events is
 	// well within the live-feel budget.
 	deltaLastEmit time.Time
+	// liveTouchedBody marks a message whose BODY (info + cached fields) was
+	// set by a live event (upsertMessageLocked) during an in-flight cold
+	// full-history GET. On a cold-load reconcile the live body is NEWER than
+	// the stale fetched body, so reconcile must NOT overwrite it. Not checked
+	// on a warm resync (coldLoad==false), where the fetched list IS
+	// authoritative. Cleared after each cold reconcile.
+	liveTouchedBody bool
+	// liveTouchedParts tracks per-part live updates (upsertPartLocked /
+	// appendPartDeltaLocked) during an in-flight cold full-history GET. A
+	// part flagged here is skipped on cold-load reconcile (its live body +
+	// unflushed streaming accumulator are newer than the stale fetched body).
+	// A non-empty map also preserves the message-level deltaBuf across the
+	// reconcile (streaming deltas have authoritative accumulated text that a
+	// stale fetch must not discard). Cleared after each cold reconcile.
+	liveTouchedParts map[string]bool
 }
 
 type sessionMessages struct {
@@ -378,6 +393,16 @@ type Store struct {
 	// are hydrated lazily (on first open) so startup doesn't fetch every
 	// session's history — critical with thousands of sessions.
 	msgLoaded map[string]bool
+	// coldFetchActive marks sessions whose background full-history GET
+	// (EnsureMessagesAsync) is in flight. Live events that arrive while this
+	// flag is set tag their entries (liveTouchedBody / liveTouchedParts) so
+	// the cold-load reconcile does NOT clobber the newer live body with the
+	// stale fetched one (C-F2). Set by MarkColdFetchStart (called by the
+	// aggregator before the GET); cleared in the cold-load reconcile block
+	// after SetSessionMessages has merged. Distinct from msgLoaded: msgLoaded
+	// persists for the session lifetime (marks "history was loaded"),
+	// coldFetchActive is a transient in-flight window.
+	coldFetchActive map[string]bool
 	// seeded marks sessions whose lastAgent has already been cold-seeded by the
 	// aggregator (via a lightweight message-tail fetch during hydrate). It makes
 	// the cold-seed fire-once-per-session for the aggregator's lifetime instead
@@ -406,22 +431,23 @@ func newEpoch() string {
 // New returns an empty store with an event ring of the given capacity.
 func New(ringCapacity int) *Store {
 	return &Store{
-		epoch:       newEpoch(),
-		sessions:    map[string]*sessionEntry{},
-		messages:    map[string]*sessionMessages{},
-		todos:       map[string]json.RawMessage{},
-		perms:       map[string]map[string]json.RawMessage{},
-		questions:   map[string]map[string]json.RawMessage{},
-		permBlocked: map[string]bool{},
-		statuses:    map[string]json.RawMessage{},
-		activity:    map[string]string{},
-		activitySeq: map[string]uint64{},
-		unread:      map[string]bool{},
-		busyCount:   map[string]int{},
-		msgLoaded:   map[string]bool{},
-		seeded:      map[string]bool{},
-		ring:        newRingBuffer(ringCapacity),
-		subs:        map[int]*subscriber{},
+		epoch:           newEpoch(),
+		sessions:        map[string]*sessionEntry{},
+		messages:        map[string]*sessionMessages{},
+		todos:           map[string]json.RawMessage{},
+		perms:           map[string]map[string]json.RawMessage{},
+		questions:       map[string]map[string]json.RawMessage{},
+		permBlocked:     map[string]bool{},
+		statuses:        map[string]json.RawMessage{},
+		activity:        map[string]string{},
+		activitySeq:     map[string]uint64{},
+		unread:          map[string]bool{},
+		busyCount:       map[string]int{},
+		msgLoaded:       map[string]bool{},
+		coldFetchActive: map[string]bool{},
+		seeded:          map[string]bool{},
+		ring:            newRingBuffer(ringCapacity),
+		subs:            map[int]*subscriber{},
 	}
 }
 
@@ -859,6 +885,7 @@ func (s *Store) deleteSessionLocked(id string) {
 	delete(s.sessions, id)
 	delete(s.messages, id)
 	delete(s.msgLoaded, id)
+	delete(s.coldFetchActive, id)
 	// Drop the cold-seed memo so a session recreated under the same id (live
 	// session.deleted then session.created, an archive/un-archive, or a hydrate
 	// prune-then-reappear) gets its lastAgent re-seeded from a fresh tail fetch.
@@ -1036,6 +1063,15 @@ func (s *Store) upsertMessageLocked(info json.RawMessage) {
 		me.finish = env.Finish
 		me.tokens = env.Tokens
 		me.agent = env.Agent
+		// Mark live-touched so a concurrent cold-load reconcile (background
+		// full-history GET in flight) does NOT clobber this newer live body
+		// with the stale fetched one (C-F2). Only tagged while a cold GET is
+		// in flight (coldFetchActive); events outside that window are
+		// authoritative snapshots the next reconcile can overwrite. Cleared
+		// after the cold reconcile.
+		if s.coldFetchActive[env.SessionID] {
+			me.liveTouchedBody = true
+		}
 	} else {
 		sm.byID[env.ID] = &messageEntry{
 			id: env.ID, info: info, parts: map[string]json.RawMessage{},
@@ -1043,6 +1079,12 @@ func (s *Store) upsertMessageLocked(info json.RawMessage) {
 			finish: env.Finish, tokens: env.Tokens, agent: env.Agent,
 		}
 		sm.order = append(sm.order, env.ID)
+		// A live-created message is also live-touched (its body is at least as
+		// new as what the in-flight cold GET will return) — but only while a
+		// cold GET is in flight.
+		if s.coldFetchActive[env.SessionID] {
+			sm.byID[env.ID].liveTouchedBody = true
+		}
 	}
 	s.emit(KindMessageUpsert, info)
 	if env.Role == "assistant" {
@@ -1299,6 +1341,17 @@ func (s *Store) upsertPartLocked(part json.RawMessage) {
 		me.partOrder = append(me.partOrder, env.ID)
 	}
 	me.parts[env.ID] = part
+	// Mark live-touched so a concurrent cold-load reconcile does NOT clobber
+	// this newer live part body with the stale fetched one (C-F2). Only tagged
+	// while a cold GET is in flight (coldFetchActive); events outside that
+	// window are authoritative snapshots the next reconcile can overwrite.
+	// Cleared after the cold reconcile.
+	if s.coldFetchActive[env.SessionID] {
+		if me.liveTouchedParts == nil {
+			me.liveTouchedParts = map[string]bool{}
+		}
+		me.liveTouchedParts[env.ID] = true
+	}
 	s.emit(KindPartUpsert, part)
 	// Authoritative snapshot: discard any unflushed streaming accumulator for
 	// this part — the snapshot supersedes buffered deltas (never let stale
@@ -1354,6 +1407,17 @@ func (s *Store) appendPartDeltaLocked(sessionID, messageID, partID, field, delta
 	if _, had := me.parts[partID]; !had {
 		me.parts[partID] = partPlaceholderJSON(partID, sessionID, messageID)
 		me.partOrder = append(me.partOrder, partID)
+	}
+	// Mark live-touched so a concurrent cold-load reconcile does NOT clobber
+	// this part's live-accumulated text (deltaBuf) with the stale fetched
+	// body, nor wipe the unflushed accumulator (C-F2). Only tagged while a
+	// cold GET is in flight (coldFetchActive). Cleared after the cold
+	// reconcile.
+	if s.coldFetchActive[sessionID] {
+		if me.liveTouchedParts == nil {
+			me.liveTouchedParts = map[string]bool{}
+		}
+		me.liveTouchedParts[partID] = true
 	}
 
 	// Native accumulator: append the delta to a strings.Builder keyed by
@@ -1994,23 +2058,39 @@ func (s *Store) reconcileMessagesLocked(sid string, list []MessageWithParts) {
 			if !coldLoad {
 				s.emit(KindMessageUpsert, mwp.Info)
 			}
-		} else if !bytes.Equal(me.info, mwp.Info) {
+		} else if !bytes.Equal(me.info, mwp.Info) && !(coldLoad && me.liveTouchedBody) {
+			// C-F2: on a cold load, a live message.updated during the in-flight
+			// GET means the store body is NEWER than the stale fetched body —
+			// preserve the live body (skip the overwrite). The warm resync
+			// path (coldLoad==false) treats the fetch as authoritative and
+			// still overwrites unconditionally.
 			me.info = mwp.Info
 			if !coldLoad {
 				s.emit(KindMessageUpsert, mwp.Info)
 			}
 		}
-		// A history fetch is authoritative for this message's parts: discard any
-		// streaming accumulators (they were building on stale/live bases). The
-		// fetched parts below overwrite me.parts; subsequent deltas re-seed from
-		// the fetched field values.
-		me.deltaBuf = nil
-		me.deltaLastEmit = time.Time{}
-		me.role = env.Role
-		me.completed = env.Time.Completed != nil
-		me.finish = env.Finish
-		me.tokens = env.Tokens
-		me.agent = env.Agent
+		// C-F2: when a live event touched the message body during the cold
+		// fetch window, the live info + cached fields are newer than the stale
+		// fetched envelope — preserve them wholesale (do NOT overwrite the
+		// cached role/completed/finish/tokens/agent from the stale fetch).
+		if !(coldLoad && me.liveTouchedBody) {
+			me.role = env.Role
+			me.completed = env.Time.Completed != nil
+			me.finish = env.Finish
+			me.tokens = env.Tokens
+			me.agent = env.Agent
+		}
+		// A history fetch is authoritative for this message's parts: discard
+		// streaming accumulators (they were building on stale/live bases) —
+		// UNLESS a live part event (snapshot or delta) touched this message
+		// during the fetch window, in which case the accumulators hold newer
+		// live text the stale fetch must not discard (C-F2). (A non-empty
+		// deltaBuf implies at least one live-touched part, so this check also
+		// covers unflushed streaming text.)
+		if !(coldLoad && len(me.liveTouchedParts) > 0) {
+			me.deltaBuf = nil
+			me.deltaLastEmit = time.Time{}
+		}
 
 		seenPart := make(map[string]bool, len(mwp.Parts))
 		for _, part := range mwp.Parts {
@@ -2025,7 +2105,12 @@ func (s *Store) reconcileMessagesLocked(sid string, list []MessageWithParts) {
 				if !coldLoad {
 					s.emit(KindPartUpsert, part)
 				}
-			} else if !bytes.Equal(old, part) {
+			} else if !bytes.Equal(old, part) && !(coldLoad && me.liveTouchedParts[pe.ID]) {
+				// C-F2: on a cold load, a live part event (snapshot or delta) during
+				// the in-flight GET means the store part body is NEWER than the
+				// stale fetched body — preserve the live body (skip the overwrite).
+				// The warm resync path (coldLoad==false) treats the fetch as
+				// authoritative and still overwrites.
 				me.parts[pe.ID] = part
 				if !coldLoad {
 					s.emit(KindPartUpsert, part)
@@ -2068,6 +2153,15 @@ func (s *Store) reconcileMessagesLocked(sid string, list []MessageWithParts) {
 	s.recomputeLastAssistantLocked(sid)
 
 	if coldLoad {
+		// Clear the live-touch markers (C-F2): they are scoped to the cold-fetch
+		// window and have served their purpose. Cold load happens once per
+		// session lifetime (msgLoaded is cleared only by deleteSessionLocked),
+		// but clearing here keeps the semantics explicit and the memory tidy.
+		for _, me := range sm.byID {
+			me.liveTouchedBody = false
+			me.liveTouchedParts = nil
+		}
+		delete(s.coldFetchActive, sid)
 		// Collapse the cold-load N-event fan-out into ONE wholesale event. The
 		// payload mirrors the snapshot's message serialization (MessageWithParts
 		// {Info, Parts}) so the client ingests it identically. Built from the
@@ -2162,6 +2256,29 @@ func (s *Store) LoadedSessions() []string {
 		out = append(out, id)
 	}
 	return out
+}
+
+// MarkColdFetchStart records that a background full-history GET is in flight
+// for the given session. Live events that arrive while the flag is set tag
+// their entries (liveTouchedBody / liveTouchedParts) so the subsequent
+// cold-load reconcile (SetSessionMessages) preserves the newer live body
+// instead of clobbering it with the stale fetched one (C-F2). Called by the
+// aggregator's EnsureMessagesAsync before the GET; cleared by
+// reconcileMessagesLocked after the cold merge completes, or by
+// ClearColdFetchActive if the GET fails before a reconcile runs.
+func (s *Store) MarkColdFetchStart(sessionID string) {
+	s.mu.Lock()
+	s.coldFetchActive[sessionID] = true
+	s.mu.Unlock()
+}
+
+// ClearColdFetchActive removes the in-flight marker for a session whose cold
+// GET failed (no reconcile will run to clear it). Idempotent — a successful
+// reconcile already cleared it.
+func (s *Store) ClearColdFetchActive(sessionID string) {
+	s.mu.Lock()
+	delete(s.coldFetchActive, sessionID)
+	s.mu.Unlock()
 }
 
 // SetSessionMessages installs a freshly-fetched message list for one session

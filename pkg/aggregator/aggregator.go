@@ -165,6 +165,10 @@ func (a *Aggregator) EnsureMessagesAsync(ctx context.Context, sessionID string) 
 				delete(a.msgInflight, sessionID)
 			}
 			a.msgMu.Unlock()
+			// On GET failure (no reconcile ran to clear it) drop the
+			// cold-fetch marker so gap events between failure and retry
+			// are not wrongly preserved by the next successful reconcile.
+			a.store.ClearColdFetchActive(sessionID)
 			close(done)
 		}()
 		// Split the `hydrate` window the client already measures (first snapshot
@@ -175,6 +179,13 @@ func (a *Aggregator) EnsureMessagesAsync(ctx context.Context, sessionID string) 
 		// session-switch stall to upstream-fetch vs daemon-reconcile without a
 		// second probe. `server` (snap) is blind to this window since Slice C
 		// made the upstream fetch async/best-effort.
+		//
+		// Mark the cold-fetch window as in-flight BEFORE the GET so live
+		// events that arrive during the (potentially blocking) GET tag their
+		// entries — the subsequent SetSessionMessages reconcile then preserves
+		// the newer live body instead of clobbering it with the stale fetched
+		// one (C-F2). Cleared by reconcileMessagesLocked after the merge.
+		a.store.MarkColdFetchStart(sessionID)
 		t0 := time.Now()
 		items, err := a.client.Messages(fetchCtx, sessionID)
 		if err != nil {
