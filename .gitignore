@@ -47,6 +47,8 @@ tmp/
 # `make web` and `make build` leave tracked files clean; `make clean-web-embed`
 # removes the generated artifacts and returns to the cold-fallback state.
 node_modules/
+# Vite dependency/cache dir (optimizeDeps cache; safe to ignore).
+.vite/
 # Playwright test-results/ output (artifacts + .last-run.json). Can appear at
 # the repo root or under web/ depending on the CWD `npx playwright test` runs
 # from, so match at any level (no leading slash). web/playwright-report/ is the
