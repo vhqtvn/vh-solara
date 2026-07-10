@@ -721,6 +721,90 @@ func TestLastAgentColdSeedPreserved(t *testing.T) {
 	}
 }
 
+// TestSetLastAgentsEmitsLiveEvent pins the fix for the cold-tree chip
+// regression: SetLastAgents (the aggregator's background cold seed) must fan out
+// a lastAgent.set event per session whose label actually changed, so a client
+// already connected when the seed completes receives the label as a live update
+// (its first snapshot landed mid-seed with an empty lastAgents map). Emission is
+// idempotent (no re-emit for an unchanged value), skips unknown sessions, and
+// never broadcasts an empty seed (nothing for the chip to show). Mirrors how
+// setCurrentVerbLocked fans activity.verb out for a snapshot-only facet.
+func TestSetLastAgentsEmitsLiveEvent(t *testing.T) {
+	s := New(100)
+	s.Apply(ev("session.created", `{"info":{"id":"a"}}`))
+	s.Apply(ev("session.created", `{"info":{"id":"b"}}`))
+	ch, unsub := s.Subscribe(64)
+	defer unsub()
+
+	// First seed: one event per known session, none for the unknown "ghost".
+	s.SetLastAgents(map[string]string{"a": "build", "b": "plan", "ghost": "x"})
+
+	type ev struct{ sid, agent string }
+	var got []ev
+	drain := func() {
+		for {
+			select {
+			case e := <-ch:
+				if e.Kind != KindLastAgentSet {
+					continue // ignore session.upsert etc.
+				}
+				var p struct {
+					SessionID string `json:"sessionID"`
+					Agent     string `json:"agent"`
+				}
+				if json.Unmarshal(e.Payload, &p) == nil {
+					got = append(got, ev{p.SessionID, p.Agent})
+				}
+			default:
+				return
+			}
+		}
+	}
+	drain()
+	if len(got) != 2 {
+		t.Fatalf("seed: want 2 lastAgent.set events (a,b), got %d: %+v", len(got), got)
+	}
+	byID := map[string]string{}
+	for _, e := range got {
+		byID[e.sid] = e.agent
+	}
+	if byID["a"] != "build" || byID["b"] != "plan" {
+		t.Fatalf("seed payloads wrong: %+v", byID)
+	}
+	// Snapshot must still carry both (the event does not replace the snapshot facet).
+	snap := s.Snapshot(nil)
+	if snap.LastAgents["a"] != "build" || snap.LastAgents["b"] != "plan" {
+		t.Fatalf("snapshot lastAgents wrong: %+v", snap.LastAgents)
+	}
+
+	// Idempotent: re-seeding the SAME value must NOT re-emit (no fanout spam).
+	s.SetLastAgents(map[string]string{"a": "build"})
+	got = nil
+	drain()
+	if len(got) != 0 {
+		t.Fatalf("idempotent re-seed must not re-emit, got %d events: %+v", len(got), got)
+	}
+
+	// A genuine change DOES re-emit (one event, for the changed session only).
+	s.SetLastAgents(map[string]string{"a": "plan", "b": "plan"})
+	got = nil
+	drain()
+	if len(got) != 1 || got[0].sid != "a" || got[0].agent != "plan" {
+		t.Fatalf("changed-value re-seed: want one a=plan event, got %+v", got)
+	}
+
+	// An empty seed clears the field but must NOT broadcast (nothing to show).
+	s.SetLastAgents(map[string]string{"a": ""})
+	got = nil
+	drain()
+	if len(got) != 0 {
+		t.Fatalf("empty seed must not broadcast, got %+v", got)
+	}
+	if s.Snapshot(nil).LastAgents["a"] != "" {
+		t.Fatal("empty seed must clear the snapshot facet")
+	}
+}
+
 // TestColdSeedMemoAndInvalidation covers the reconnect fetch-storm memo at the
 // store layer: ColdSeedNeeded reports only un-seeded tracked sessions,
 // MarkColdSeeded suppresses them on subsequent queries, and the memo is dropped

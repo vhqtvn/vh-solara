@@ -84,6 +84,17 @@ const (
 	KindQuestionClear = "question.delete"
 	KindUnreadSet     = "unread.set"
 	KindUnreadClear   = "unread.clear"
+	// KindLastAgentSet carries a session's cold-seeded lastAgent (the agent name
+	// of its most recent assistant turn) to ALREADY-CONNECTED clients. lastAgent
+	// is a snapshot-only facet (carried in Snapshot.LastAgents, NOT on the
+	// session payload), and the cold seed (SetLastAgents) runs as a non-blocking
+	// background goroutine that typically completes AFTER a client's first
+	// snapshot landed — so without this live event the seeded label would sit in
+	// the store unseen until the next reconnect served a fresh snapshot. Emitted
+	// per session only when the value actually changes (idempotent). NOT prefixed
+	// message./part. so the web layer's sendable() always-streams it on the
+	// tree-only Stream 1 (mirrors activity.verb / activity / unread.*).
+	KindLastAgentSet = "lastAgent.set"
 	// KindNotice carries a daemon-detected alert (turn finished, waiting on a
 	// human, stuck/runaway/stalled) for in-app delivery. It is NOT part of the
 	// materialized view — it's a transient fan-out, not stored in any snapshot —
@@ -2165,9 +2176,26 @@ func (s *Store) SetLastAgents(agents map[string]string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for sid, agent := range agents {
-		if se := s.sessions[sid]; se != nil {
-			se.lastAgent = agent
+		se := s.sessions[sid]
+		if se == nil {
+			continue
 		}
+		if se.lastAgent == agent {
+			continue // idempotent: no change, no fanout
+		}
+		se.lastAgent = agent
+		if agent == "" {
+			continue // never broadcast an empty seed (nothing for the chip to show)
+		}
+		// Push the seeded label to already-connected clients as a live event:
+		// the cold seed runs as a background goroutine that usually finishes
+		// AFTER a client's first snapshot, so Snapshot.LastAgents would otherwise
+		// not carry this label until the next reconnect. Mirrors how
+		// setCurrentVerbLocked fans activity.verb out for a snapshot-only facet.
+		s.emit(KindLastAgentSet, rawObj(map[string]interface{}{
+			"sessionID": sid,
+			"agent":     agent,
+		}))
 	}
 }
 

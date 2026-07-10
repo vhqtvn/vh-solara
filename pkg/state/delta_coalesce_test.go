@@ -317,13 +317,14 @@ func allKinds() []string {
 		KindStatus, KindActivity, KindActivityVerb,
 		KindQuestionSet, KindQuestionClear,
 		KindUnreadSet, KindUnreadClear,
+		KindLastAgentSet,
 		KindNotice,
 	}
 }
 
 func TestMessageClassKind_NoDriftFromWebPrefix(t *testing.T) {
 	kinds := allKinds()
-	const want = 20
+	const want = 21
 	if len(kinds) != want {
 		t.Fatalf("allKinds() has %d entries — if you added/removed a Kind constant, update this list and the count", len(kinds))
 	}

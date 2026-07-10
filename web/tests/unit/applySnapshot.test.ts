@@ -4,6 +4,7 @@ import { reconcile } from "solid-js/store";
 import { gzipSync } from "node:zlib";
 import { applySnapshot, applySessionEvent, applySessionSnapshot, applyMessageEvent, decodeMessagesBatch } from "../../src/sync/stream";
 import { state, setState } from "../../src/sync/store";
+import { sessionLastAgent } from "../../src/sync/selectors";
 import type { Snapshot } from "../../src/types";
 
 // B2a (resync-window gating of lastAgents) + B2b (session.delete prunes the
@@ -371,5 +372,47 @@ describe("applySessionSnapshot / applyMessageEvent — Slice C async hydration",
     applyMessageEvent("messages.loaded", 51, { sessionID: "s7" }, false);
     expect(state.messagesLoaded.s7).toBe(true);
     expect(state.messages.s7.order).toEqual(["m1", "m2"]);
+  });
+});
+
+// Cold-tree chip regression: the daemon's background cold seed
+// (seedColdLastAgents, a non-blocking goroutine) usually completes AFTER this
+// client's first snapshot landed, so Snapshot.LastAgents carried nothing for
+// the un-opened session and the per-agent chip stayed blank until the session
+// was opened. The seed now pushes a live "lastAgent.set" event; the chip must
+// render from it BEFORE any session is opened. sessionLastAgent backs the chip.
+describe("applyMessageEvent — lastAgent.set cold-seed live patch (tree chip)", () => {
+  it("renders the cold chip from a live lastAgent.set event before any session is opened", () => {
+    // No messages loaded, no seeded label → no chip.
+    expect(sessionLastAgent("cold")).toBeUndefined();
+    // The background seed delivers the label as a live event after the snapshot.
+    applyMessageEvent("lastAgent.set", 1, { sessionID: "cold", agent: "build" });
+    expect(state.lastAgents.cold).toBe("build");
+    // sessionLastAgent is what AgentChip reads; it must now resolve to "build".
+    expect(sessionLastAgent("cold")).toBe("build");
+  });
+
+  it("clears the cold chip when an empty agent arrives", () => {
+    setState("lastAgents", "cold", "build");
+    applyMessageEvent("lastAgent.set", 2, { sessionID: "cold", agent: "" });
+    expect(state.lastAgents.cold).toBeUndefined();
+    expect(sessionLastAgent("cold")).toBeUndefined();
+  });
+
+  it("keeps live-scan precedence: a loaded session shows its real agent, not the seeded value", () => {
+    // A live event would overwrite the seed map, but the selector MUST still
+    // prefer the authoritative message scan once messages are loaded.
+    setState("lastAgents", "live", "stale");
+    setState("messages", "live", {
+      order: ["m1"],
+      byId: {
+        m1: { id: "m1", info: { id: "m1", sessionID: "live", role: "assistant", agent: "real" }, partOrder: [], parts: {} },
+      },
+    });
+    applyMessageEvent("lastAgent.set", 3, { sessionID: "live", agent: "seeded" });
+    // The event updated the seed map (mirroring the daemon), but the chip reads
+    // the live assistant turn's agent, NOT the stale/seeded value.
+    expect(state.lastAgents.live).toBe("seeded");
+    expect(sessionLastAgent("live")).toBe("real");
   });
 });

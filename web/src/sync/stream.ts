@@ -281,6 +281,21 @@ export function applyMessageEvent(kind: string, seq: number, payload: any, track
             else delete s.currentVerbs[payload.sessionID];
           }
           break;
+        case "lastAgent.set":
+          // Cold-seed live-patch: the daemon's background seedColdLastAgents
+          // (a non-blocking goroutine) usually finishes AFTER this client's
+          // first snapshot landed, so Snapshot.LastAgents didn't carry this
+          // session's agent. This event delivers the seeded agent name to an
+          // already-connected client so the per-agent chip renders in the tree
+          // BEFORE the session is opened. sessionLastAgent still prefers the
+          // live message scan once messages load (live-scan-takes-precedence),
+          // so this only fills the cold gap. Mirrors activity.verb's pattern
+          // (a snapshot-only facet pushed live).
+          if (payload.sessionID) {
+            if (payload.agent) s.lastAgents[payload.sessionID] = payload.agent;
+            else delete s.lastAgents[payload.sessionID];
+          }
+          break;
         case "status":
           // A session.error event carries an `error` payload (activity already
           // flipped to "error" via the separate activity event). Surface it so a
@@ -541,6 +556,29 @@ let sesHydrating = false;
 // flipping the gate. Cleared as each batch lands (try/finally in the listener).
 const pendingBatch = new Map<string, Promise<void>>();
 
+// TREE_STREAM_KINDS — the named SSE events Stream 1 (the tree stream)
+// subscribes to and forwards to applyMessageEvent. Exported so a unit test
+// can PIN it: a snapshot-only facet pushed live (activity.verb,
+// lastAgent.set) MUST appear here, or EventSource silently drops the frame
+// even though applyMessageEvent has the handler case — that was the
+// cold-chip gap (handler present, listener absent). Structural session
+// events (session.upsert/delete) route through applySessionEvent and are
+// registered in a separate loop above; message.* kinds are Stream 2
+// (active-session) only.
+export const TREE_STREAM_KINDS = [
+  "status",
+  "activity",
+  "activity.verb",
+  "lastAgent.set",
+  "permission.upsert",
+  "permission.delete",
+  "question.upsert",
+  "question.delete",
+  "unread.set",
+  "unread.clear",
+  "todo",
+] as const;
+
 export function connect(fresh = false) {
   clearTimeout(reconnectTimer);
   es?.close();
@@ -578,7 +616,7 @@ export function connect(fresh = false) {
       applySessionEvent(kind, Number(ev.lastEventId), JSON.parse(ev.data));
     });
   }
-  for (const kind of ["status", "activity", "activity.verb", "permission.upsert", "permission.delete", "question.upsert", "question.delete", "unread.set", "unread.clear", "todo"]) {
+  for (const kind of TREE_STREAM_KINDS) {
     es.addEventListener(kind, (e) => {
       markSeen();
       const ev = e as MessageEvent;

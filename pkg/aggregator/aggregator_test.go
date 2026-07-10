@@ -79,6 +79,53 @@ func TestHydrateSeedsColdLastAgents(t *testing.T) {
 	}
 }
 
+// TestColdSeedPushesLastAgentEventToConnectedClient pins the fix for the
+// cold-tree chip regression: a client subscribed to the store BEFORE the
+// background cold seed completes must receive the seeded agent name as a LIVE
+// lastAgent.set event — so the per-agent chip renders in the tree without the
+// session being opened and without waiting for a reconnect to serve a fresh
+// snapshot. Before the fix, SetLastAgents mutated se.lastAgent but emitted
+// nothing, and snapshots are served fresh per connection, so a client whose
+// first snapshot landed mid-seed saw an empty lastAgents map and a blank chip
+// until it reconnected. The other cold-seed tests all waitColdSeed() before
+// asserting; this one subscribes first and reads the event off the channel.
+func TestColdSeedPushesLastAgentEventToConnectedClient(t *testing.T) {
+	oc := httptest.NewServer(fixtures.New().Handler())
+	defer oc.Close()
+
+	agg := New(oc.URL, 100)
+	// Subscribe BEFORE hydrate triggers the seed — exactly like a client already
+	// connected when the daemon's background seedColdLastAgents runs.
+	ch, unsub := agg.Store().Subscribe(128)
+	defer unsub()
+
+	if err := agg.Rehydrate(context.Background()); err != nil {
+		t.Fatalf("rehydrate: %v", err)
+	}
+	// Do NOT waitColdSeed before reading the channel: the delivery mechanism
+	// under test IS the live event, not a later snapshot.
+	agents := map[string]string{}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && agents["demo"] == "" {
+		select {
+		case e := <-ch:
+			if e.Kind == "lastAgent.set" {
+				var p struct {
+					SessionID string `json:"sessionID"`
+					Agent     string `json:"agent"`
+				}
+				if json.Unmarshal(e.Payload, &p) == nil {
+					agents[p.SessionID] = p.Agent
+				}
+			}
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	if got := agents["demo"]; got != "build" {
+		t.Fatalf("connected client must receive lastAgent.set demo=build via live event, got %q (all: %+v)", got, agents)
+	}
+}
+
 // tailCountingHandler wraps an OpenCode handler and counts lightweight tail
 // fetches (GET /session/:id/message?limit=...) per session. This is exactly the
 // request seedColdLastAgents issues, so the count is the "cold-seed fetch storm"
