@@ -55,6 +55,7 @@
 @import "./foundation/tokens.css";
 @import "./foundation/reset.css";
 @import "./foundation/typography.css";
+@import "./foundation/scrollbars.css";
 @import "./foundation/z-index.css";
 @import "./foundation/perf-guards.css";
 /* legacy region — imported as ordered source-order shards (Stage 1 split).

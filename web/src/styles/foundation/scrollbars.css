@@ -1,0 +1,70 @@
+/* foundation/scrollbars.css — global thin themed scrollbars.
+ *
+ * Replaces the thick OS-default scrollbar on EVERY scrollable surface in the
+ * app so Chromium-based browsers (Chrome, Edge on Windows + Linux) and Firefox
+ * render a thin, app-themed scrollbar instead. This is a CSS-only, GPU-safe
+ * styling layer: it uses the standard `scrollbar-width` + `scrollbar-color`
+ * properties (Firefox / standard) and the `::-webkit-scrollbar*` pseudo-element
+ * family (Chromium / Safari). It introduces NONE of the GPU-expensive patterns
+ * forbidden by AGENTS.md → "Web frontend performance — Firefox/WebRender GPU
+ * gotchas" (no `mask-image` / `-webkit-mask`, no `backdrop-filter: blur`, no
+ * `contain: paint`, no `content-visibility: auto`). Plain scrollbar properties
+ * are categorically safe — they never trigger an offscreen raster surface.
+ *
+ * WHY GLOBAL (`*`): the app has ~30 scrollable surfaces spread across legacy
+ * shards and component CSS Modules. Editing each one would touch ~15 files and
+ * guarantee drift. A single universal rule styles them all once; the two
+ * intentional opt-outs keep working via specificity:
+ *   - `.seg` (legacy/70-composer-diff-git.css) hides its scrollbar with
+ *     `scrollbar-width: none` + `::-webkit-scrollbar { display: none }`. The
+ *     class (specificity 0,1,0) beats `*` (0,0,0), so it wins.
+ *   - `.term-tabs` / `.code-tabs` already set `scrollbar-width: thin` (Firefox)
+ *     and now also pick up themed `::-webkit-scrollbar*` from this rule.
+ *
+ * `scrollbar-width` / `scrollbar-color` are NOT inherited, so they are applied
+ * to every element directly via `*`; non-scrollable elements ignore them. The
+ * colors reuse theme tokens (`--fg-dim`) which resolve in ALL shipped themes
+ * (every theme block in tokens.css defines `--fg-dim`), so the thumb adapts to
+ * dark, light, dim, midnight, hc, shire-*, tokyonight, dracula, nord,
+ * catppuccin, gruvbox, rose-pine, one-dark, everforest, ayu, solarized-*,
+ * monokai, kanagawa, material, catppuccin-latte, rose-pine-dawn, paper,
+ * paper-color, eink, and eink-color. No hardcoded colors.
+ */
+
+/* Firefox + standard. `scrollbar-color: <thumb> <track>`. The thumb is a
+ * translucent --fg-dim so it reads as a quiet, themed slider over the surface
+ * beneath; the track is transparent (no gutter). */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--fg-dim) 45%, transparent) transparent;
+}
+
+/* Chromium / Safari / legacy webkit. Sizing applies to both axes (vertical and
+ * horizontal scrollbars), so horizontal overflow surfaces (`.vh-diff`, katex
+ * tables, code trees) are themed too. 10px is visibly thinner than the Windows
+ * OS default (~16px) while remaining an easy pointer target. */
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+/* `background-clip: padding-box` + a transparent 2px border insets the thumb
+ * from the edge so it never touches the container border — matches the thin,
+ * unobtrusive Firefox `scrollbar-width: thin` look. */
+*::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--fg-dim) 45%, transparent);
+  border: 2px solid transparent;
+  border-radius: 6px;
+  background-clip: padding-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--fg-dim) 70%, transparent);
+  background-clip: padding-box;
+}
+/* The corner where two scrollbars would meet (e.g. a surface scrollable on
+ * both axes). Keep it transparent so it blends with the surface. */
+*::-webkit-scrollbar-corner {
+  background: transparent;
+}
