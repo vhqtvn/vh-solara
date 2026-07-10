@@ -1,0 +1,63 @@
+/* Copy-friendly cold-open timing block (SessionInspector section).
+   Co-located module; consumes global theme tokens. Selectable surface — no
+   GPU-expensive effects (no mask/backdrop-filter/content-visibility). */
+
+.wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 4px;
+}
+.head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--fg-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.copy {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  color: var(--fg);
+  border-radius: 7px;
+  padding: 3px 9px;
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+}
+.copy:hover {
+  border-color: var(--accent);
+}
+/* Selectable text: the operator drags to select these numbers for a bug report.
+   Plain monospaced <pre>, line-wrapped left-aligned. */
+.pre {
+  margin: 0;
+  padding: 9px 11px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-family: ui-monospace, Menlo, monospace;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--fg);
+  white-space: pre-wrap;
+  word-break: break-all;
+  user-select: text;
+  -webkit-user-select: text;
+  overflow-wrap: anywhere;
+}
+.note {
+  margin: 0;
+  font-size: 11.5px;
+  color: var(--fg-dim);
+  line-height: 1.45;
+}

@@ -3,6 +3,7 @@ import { state } from "../sync";
 import { findModel, selectionFor } from "../models";
 import { openArchiveConfirm } from "../sessionMenu";
 import QuotaPanel from "./QuotaPanel";
+import SessionTimingBlock from "./SessionTimingBlock";
 import Icon from "./Icon";
 import "./SessionInspector.css";
 
@@ -139,6 +140,9 @@ export default function SessionInspector(props: { sessionId: string; onClose: ()
 
           <div class="insp-section">Provider quota</div>
           <QuotaPanel />
+
+          <div class="insp-section">Cold-open timing</div>
+          <SessionTimingBlock sessionId={props.sessionId} />
 
           <div class="insp-section">Manage</div>
           <button type="button" class="insp-archive" onClick={archive}>

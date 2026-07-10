@@ -18,6 +18,9 @@ export const [codeDockOpen, setCodeDockOpen] = createSignal(false);
 export const [codeMobileOverlay, setCodeMobileOverlay] = createSignal(false);
 export const [settingsOpen, setSettingsOpen] = createSignal(false);
 export const [adminOpen, setAdminOpen] = createSignal(false);
+// Hidden diagnostic-log viewer (cold-open timing ring buffer). Reached from the
+// server-admin menu (right-click / long-press Settings), not a visible button.
+export const [diagLogOpen, setDiagLogOpen] = createSignal(false);
 export const [paletteOpen, setPaletteOpen] = createSignal(false);
 // Project switcher dialog open-flag, lifted global so the no-project empty
 // state's CTA can open the switcher from outside the ProjectSwitcher component

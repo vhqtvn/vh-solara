@@ -1,6 +1,7 @@
 import { createResource, createSignal, Show } from "solid-js";
 import { forceReload, resetLocalStorage, restartVhServer } from "../admin";
 import { dismiss } from "../lib/a11y";
+import { setDiagLogOpen } from "../ui";
 import Icon from "./Icon";
 import OpenCodeUpdateDialog from "./OpenCodeUpdateDialog";
 
@@ -81,6 +82,10 @@ export default function AdminMenu(props: { onClose: () => void }) {
 
       <button type="button" class="admin-btn" onClick={() => (props.onClose(), restartVhServer())}>
         <Icon name="retry" size={14} /> Restart vh server
+      </button>
+
+      <button type="button" class="admin-btn" onClick={() => (props.onClose(), setDiagLogOpen(true))}>
+        <Icon name="info" size={14} /> Diagnostic log…
       </button>
 
       <div class="admin-sep" />
