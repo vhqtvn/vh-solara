@@ -13,6 +13,7 @@ import NotificationsSettings from "./NotificationsSettings";
 import { modal } from "../lib/a11y";
 import Icon from "./Icon";
 import Select from "./Select";
+import styles from "./SettingsDialog.module.css";
 
 // "App" (install + orientation) only shows in a plain browser tab — once
 // installed, the standalone window doesn't need it.
@@ -80,8 +81,8 @@ export default function SettingsDialog(props: { onClose: () => void }) {
             <Icon name="x" />
           </button>
         </div>
-        <div class="settings-body">
-          <nav class="settings-nav">
+        <div class={styles["settings-body"]}>
+          <nav class={styles["settings-nav"]}>
             <For each={sections()}>
               {(s) => (
                 <button
@@ -95,15 +96,15 @@ export default function SettingsDialog(props: { onClose: () => void }) {
               )}
             </For>
           </nav>
-          <div class="settings-content">
+          <div class={styles["settings-content"]}>
             <Show when={sec() === "theme"}>
               <ThemePicker />
               <p class="setting-hint">Light themes also switch code syntax highlighting.</p>
               <Show when={theme() === "custom"}>
-                <div class="custom-theme">
+                <div class={styles["custom-theme"]}>
                   <For each={CUSTOM_FIELDS}>
                     {(f) => (
-                      <label class="custom-theme-row">
+                      <label class={styles["custom-theme-row"]}>
                         <span>{f.label}</span>
                         <input
                           type="color"
@@ -113,7 +114,7 @@ export default function SettingsDialog(props: { onClose: () => void }) {
                       </label>
                     )}
                   </For>
-                  <label class="custom-theme-row">
+                  <label class={styles["custom-theme-row"]}>
                     <span>Light mode (syntax + diff colors)</span>
                     <input
                       type="checkbox"
@@ -121,7 +122,7 @@ export default function SettingsDialog(props: { onClose: () => void }) {
                       onChange={(e) => setCustomTheme({ light: e.currentTarget.checked })}
                     />
                   </label>
-                  <div class="custom-theme-actions">
+                  <div class={styles["custom-theme-actions"]}>
                     <Select
                       ariaLabel="Start from a preset theme"
                       value=""
@@ -136,7 +137,7 @@ export default function SettingsDialog(props: { onClose: () => void }) {
                     <button type="button" class="theme-select" onClick={() => void copyTheme()}>Copy</button>
                     <button type="button" class="theme-select" onClick={() => { resetCustomTheme(); setThemeNote({ ok: true, msg: "Reset to default." }); }}>Reset</button>
                   </div>
-                  <div class="custom-theme-import">
+                  <div class={styles["custom-theme-import"]}>
                     <input
                       type="text"
                       class="theme-select"
@@ -153,7 +154,7 @@ export default function SettingsDialog(props: { onClose: () => void }) {
                   Copy to share the palette, or paste JSON to import.
                 </p>
                 <Show when={themeNote()}>
-                  <p class="setting-hint" classList={{ "setting-err": !themeNote()!.ok }}>{themeNote()!.msg}</p>
+                  <p class="setting-hint" classList={{ [styles["setting-err"]]: !themeNote()!.ok }}>{themeNote()!.msg}</p>
                 </Show>
               </Show>
             </Show>
@@ -238,7 +239,7 @@ export default function SettingsDialog(props: { onClose: () => void }) {
               <p class="setting-hint">Non-system fonts load on demand from Google Fonts.</p>
               <div class="setting-row">
                 <label>UI zoom</label>
-                <div class="zoom-control">
+                <div class={styles["zoom-control"]}>
                   <input
                     type="range"
                     aria-label="UI zoom"
@@ -252,7 +253,7 @@ export default function SettingsDialog(props: { onClose: () => void }) {
                       setZoomDraft(null);
                     }}
                   />
-                  <button type="button" class="zoom-reset" onClick={() => { setUiScale(1); setZoomDraft(null); }}>
+                  <button type="button" class={styles["zoom-reset"]} onClick={() => { setUiScale(1); setZoomDraft(null); }}>
                     {Math.round(zoomValue() * 100)}%
                   </button>
                 </div>
@@ -383,7 +384,7 @@ export default function SettingsDialog(props: { onClose: () => void }) {
                   </p>
                 }
               >
-                <button type="button" class="install-app-btn" onClick={() => void promptInstall()}>
+                <button type="button" class={styles["install-app-btn"]} onClick={() => void promptInstall()}>
                   <Icon name="plus" size={14} /> Install app
                 </button>
               </Show>
@@ -404,13 +405,13 @@ export default function SettingsDialog(props: { onClose: () => void }) {
               }>
                 <For each={terms()}>
                   {(t) => (
-                    <div class="term-sess">
-                      <div class="term-sess-head">
-                        <span class="term-sess-dir" data-tip={t.dir}>{shortDir(t.dir)}</span>
-                        <span class="term-sess-meta">
+                    <div class={styles["term-sess"]}>
+                      <div class={styles["term-sess-head"]}>
+                        <span class={styles["term-sess-dir"]} data-tip={t.dir}>{shortDir(t.dir)}</span>
+                        <span class={styles["term-sess-meta"]}>
                           {t.title || (t.id === "shared" ? "Shell" : t.id)} · {t.clients} client{t.clients === 1 ? "" : "s"} · {t.cols}×{t.rows} · idle {t.idleSec}s
                         </span>
-                        <button type="button" class="term-sess-kill" onClick={async () => { await killTerm(t.dir, t.id); refetchTerms(); }}>Kill</button>
+                        <button type="button" class={styles["term-sess-kill"]} onClick={async () => { await killTerm(t.dir, t.id); refetchTerms(); }}>Kill</button>
                       </div>
                       <Show when={t.preview}>
                         <pre class="term-sess-preview">{t.preview}</pre>

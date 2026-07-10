@@ -1,0 +1,28 @@
+/* DOM tooltip (replaces native title; data-tip driven). Portaled to <body> as
+   fixed-position. `.tooltip` is kept :global because e2e (tooltip.spec,
+   features2.spec) queries the literal `.tooltip` class selector; the module CSS
+   still applies to the portaled element regardless. `.above` is sole-owned by
+   Tooltip (no other component uses it as a class) and is NOT queried by e2e, so
+   it is scoped locally and applied via `classList={{ [styles.above]: ... }}`.
+   `tip-in` keyframes is sole-owned and lives here (local); the `animation`
+   shorthand ref is auto-rewritten by Vite to the local keyframes name. */
+:global(.tooltip) {
+  position: fixed;
+  z-index: 1000;
+  transform: translateX(-50%);
+  max-width: 280px;
+  padding: 4px 8px;
+  background: var(--bg-2);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: var(--shadow-lg, 0 8px 24px rgba(0, 0, 0, 0.4));
+  font-size: 12px;
+  line-height: 1.35;
+  white-space: normal;
+  overflow-wrap: break-word;
+  pointer-events: none;
+  animation: tip-in 0.1s ease;
+}
+:global(.tooltip).above { transform: translate(-50%, -100%); }
+@keyframes tip-in { from { opacity: 0; } to { opacity: 1; } }

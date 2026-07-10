@@ -1,6 +1,7 @@
 import { createEffect, Show } from "solid-js";
 import { state } from "../sync";
 import { setVhRestarting, vhRestarting } from "../admin";
+import styles from "./RestartOverlay.module.css";
 
 // Full-screen overlay shown while the vh server restarts: "Restarting →
 // Reconnecting", auto-dismissed once the stream is live again (after it dropped),
@@ -23,13 +24,13 @@ export default function RestartOverlay() {
 
   return (
     <Show when={vhRestarting()}>
-      <div class="restart-overlay" role="alertdialog" aria-label="Restarting server">
-        <div class="restart-card">
-          <span class="restart-spinner" aria-hidden="true" />
+      <div class={styles["restart-overlay"]} role="alertdialog" aria-label="Restarting server">
+        <div class={styles["restart-card"]}>
+          <span class={styles["restart-spinner"]} aria-hidden="true" />
           <h2>Restarting vh server</h2>
-          <p class="restart-phase">{phase()}</p>
-          <p class="restart-hint">OpenCode keeps running; your sessions are safe.</p>
-          <button type="button" class="restart-reload" onClick={() => location.reload()}>
+          <p class={styles["restart-phase"]}>{phase()}</p>
+          <p class={styles["restart-hint"]}>OpenCode keeps running; your sessions are safe.</p>
+          <button type="button" class={styles["restart-reload"]} onClick={() => location.reload()}>
             Force reload
           </button>
         </div>

@@ -1,0 +1,36 @@
+/* Provider quota (Settings > Usage). Scoped from legacy.css.
+   .quota-name / .quota-win-label / .quota-pace (+modifiers) stay :global —
+   queried by e2e (interactive.spec.ts). .warn / .hot / .ok are shared global
+   modifiers used on .quota-fill and .quota-pace. */
+
+.quota { display: flex; flex-direction: column; gap: 12px; }
+.quota-head { display: flex; align-items: center; gap: 10px; }
+.quota-refresh {
+  flex: none;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  color: var(--fg);
+  border-radius: 7px;
+  padding: 5px 11px;
+  cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+}
+.quota-refresh:hover { border-color: var(--accent); }
+.quota-card { border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; background: var(--bg); }
+.quota-card-head { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 8px; }
+:global(.quota-name) { font-weight: 600; }
+.quota-err { font-size: 12px; color: var(--danger-fg); }
+.quota-win { margin-top: 10px; }
+.quota-win:first-of-type { margin-top: 0; }
+.quota-win-top { display: flex; justify-content: space-between; align-items: baseline; font-size: 13px; margin-bottom: 4px; }
+:global(.quota-win-label) { color: var(--fg-dim); text-transform: uppercase; letter-spacing: 0.04em; font-size: 11px; }
+.quota-win-val { font-variant-numeric: tabular-nums; }
+.quota-bar { height: 7px; background: var(--border); border-radius: 999px; overflow: hidden; }
+.quota-fill { height: 100%; background: var(--accent); border-radius: 999px; transition: width 0.25s var(--ease, ease); }
+.quota-fill:global(.warn) { background: var(--warn); }
+.quota-fill:global(.hot) { background: var(--danger); }
+.quota-meta { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 12px; color: var(--fg-dim); margin-top: 5px; }
+:global(.quota-pace.ok) { color: var(--ok); }
+:global(.quota-pace.warn) { color: var(--warn); }
+:global(.quota-pace.hot) { color: var(--danger); }

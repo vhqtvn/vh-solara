@@ -1,0 +1,101 @@
+/* Question card (interactive "answer needed"). Scoped from legacy.css.
+   :global classes — queried by e2e (interactive.spec.ts) AND unit
+   (QuestionCard.test.tsx): .question-card, .question-opt-key,
+   .question-opt-label, .question-custom, .question-options, .question-opt,
+   .question-send (+ compound .on/.h modifiers).
+   .card-tools / .card-icon-btn / .card-pop-* are shared with PermissionCard and
+   stay in legacy.css. .md / .md-raw are global (Phase 5). .h / .v / .on are
+   shared global modifiers. */
+
+:global(.question-card) {
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--border));
+  background: color-mix(in srgb, var(--accent) 8%, var(--bg-2));
+  border-radius: 8px;
+  padding: 12px 14px;
+}
+.question-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--accent);
+  margin-bottom: 10px;
+}
+.question-head-title { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
+.question-item { margin-bottom: 12px; }
+.question-item:last-of-type { margin-bottom: 8px; }
+.question-label { font-size: 12px; color: var(--fg-dim); text-transform: uppercase; letter-spacing: 0.04em; }
+.question-text { margin: 2px 0 8px; }
+:global(.question-options) { display: flex; flex-direction: column; gap: 6px; }
+/* Manual H/V layout toggle (questions only). In `h` mode options flow as
+   wrapping chips instead of a vertical list. The custom-answer textarea is
+   ALWAYS full-width/vertical — the toggle only affects the option buttons. */
+:global(.question-options.h) { flex-direction: row; flex-wrap: wrap; align-items: stretch; }
+:global(.question-options.h .question-opt) { flex: 0 1 auto; max-width: 100%; }
+:global(.question-options.h .question-opt-key) { align-self: center; }
+:global(.question-options.h) .question-opt-body { flex: 1 1 auto; min-width: 0; }
+:global(.question-opt) {
+  display: flex;
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 9px;
+  text-align: left;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--fg);
+  border-radius: 7px;
+  padding: 8px 11px;
+  cursor: pointer;
+  font: inherit;
+  transition: border-color 0.12s, background-color 0.12s;
+}
+:global(.question-opt-key) {
+  flex: none;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  color: var(--accent);
+  min-width: 16px;
+}
+:global(.question-opt.on) :global(.question-opt-key) { color: var(--accent); }
+.question-opt-body { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+:global(.question-opt:hover) { border-color: var(--accent); }
+:global(.question-opt.on) {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 16%, var(--bg));
+}
+:global(.question-opt-label) { font-weight: 500; }
+.question-opt-desc { font-size: 12px; color: var(--fg-dim); }
+:global(.question-custom) {
+  margin-top: 8px;
+  width: 100%;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  color: var(--fg);
+  padding: 8px 11px;
+  font: inherit;
+  outline: none;
+  /* Multi-line free-text answer: wraps, grows vertically, user-resizable. */
+  resize: vertical;
+  min-height: 2.6em;
+  line-height: 1.4;
+}
+:global(.question-custom):focus { border-color: var(--accent); }
+.question-actions { display: flex; justify-content: flex-end; }
+:global(.question-send) {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--accent);
+  background: color-mix(in srgb, var(--accent) 22%, var(--bg));
+  color: var(--fg);
+  border-radius: 7px;
+  padding: 7px 14px;
+  cursor: pointer;
+  font: inherit;
+  font-weight: 500;
+}
+:global(.question-send:hover:not(:disabled)) { background: color-mix(in srgb, var(--accent) 34%, var(--bg)); }
+:global(.question-send:disabled) { opacity: 0.5; cursor: not-allowed; }

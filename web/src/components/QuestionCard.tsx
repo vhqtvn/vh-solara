@@ -5,6 +5,7 @@ import { respondQuestion } from "../sync";
 import { renderMarkdown } from "../render";
 import Icon from "./Icon";
 import { useCardPopup } from "./cardPopup";
+import styles from "./QuestionCard.module.css";
 
 // Goldmark wraps a lone paragraph as <p>…</p>. Inside a <button> that is
 // invalid phrasing content, so for INLINE contexts (option label/description)
@@ -126,11 +127,11 @@ export default function QuestionCard(props: { question: Question }) {
     <>
       <For each={items()}>
         {(q, qi) => (
-          <div class="question-item">
+          <div class={styles["question-item"]}>
             <Show when={q.header}>
-              <div class="question-label">{q.header}</div>
+              <div class={styles["question-label"]}>{q.header}</div>
             </Show>
-            <Md block class="question-text" text={q.question} />
+            <Md block class={styles["question-text"]} text={q.question} />
             <Show when={q.options && q.options.length}>
               <div
                 class="question-options"
@@ -148,10 +149,10 @@ export default function QuestionCard(props: { question: Question }) {
                       <span class="question-opt-key" aria-hidden="true">
                         {String.fromCharCode(65 + (oi() % 26))}:
                       </span>
-                      <span class="question-opt-body">
+                      <span class={styles["question-opt-body"]}>
                         <Md class="question-opt-label" text={opt.label} />
                         <Show when={opt.description}>
-                          <Md class="question-opt-desc" text={opt.description!} />
+                          <Md class={styles["question-opt-desc"]} text={opt.description!} />
                         </Show>
                       </span>
                     </button>
@@ -181,7 +182,7 @@ export default function QuestionCard(props: { question: Question }) {
           </div>
         )}
       </For>
-      <div class="question-actions">
+      <div class={styles["question-actions"]}>
         <button
           type="button"
           class="question-send"
@@ -197,8 +198,8 @@ export default function QuestionCard(props: { question: Question }) {
   return (
     <div class="question-card">
       {/* Inline head: title + H/V toggle + popup-open trigger. */}
-      <div class="question-head">
-        <span class="question-head-title">
+      <div class={styles["question-head"]}>
+        <span class={styles["question-head-title"]}>
           <Icon name="help" size={15} /> Answer needed
         </span>
         <span class="card-tools">

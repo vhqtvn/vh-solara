@@ -1,0 +1,22 @@
+/* Connection-health toast (sync drop / recovery). `.warn`/`.ok` are shared
+   generic modifiers (also used by status-dot, icon-btn, quota-*, setting-note),
+   so they stay :global; the dynamic `classList={{ [kind]: true }}` in the TSX
+   applies the plain class name, which the :global selectors match. */
+.conn-toast {
+  position: fixed;
+  left: 50%;
+  top: calc(14px + env(safe-area-inset-top));
+  transform: translateX(-50%);
+  z-index: 90;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  border-radius: 999px;
+  box-shadow: var(--shadow-lg, 0 12px 32px rgba(0, 0, 0, 0.45));
+  padding: 7px 14px;
+  max-width: calc(100vw - 24px);
+  animation: dialog-in 0.16s var(--ease, ease);
+}
+.conn-toast:global(.warn) { background: color-mix(in srgb, var(--warn) 22%, var(--bg-2)); border: 1px solid var(--warn); color: var(--fg); }
+.conn-toast:global(.ok) { background: color-mix(in srgb, var(--ok) 20%, var(--bg-2)); border: 1px solid var(--ok); color: var(--fg); }

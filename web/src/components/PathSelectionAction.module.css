@@ -1,0 +1,9 @@
+/* Floating "Open file" action shown above a path-like text selection. */
+.path-sel-action {
+  position: fixed; transform: translate(-50%, calc(-100% - 8px)); z-index: 300;
+  display: inline-flex; align-items: center; gap: 6px; white-space: nowrap;
+  padding: 6px 11px; font: inherit; font-size: 12px; font-weight: 600;
+  color: var(--accent-fg, #fff); background: var(--accent); border: 0; border-radius: 999px;
+  box-shadow: var(--shadow-lg, 0 6px 20px #0007); cursor: pointer;
+}
+.path-sel-action:active { transform: translate(-50%, calc(-100% - 8px)) scale(0.96); }

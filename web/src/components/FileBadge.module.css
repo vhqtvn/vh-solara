@@ -1,0 +1,19 @@
+/* A small colored extension chip identifying a file type (color comes from the
+   component's inline `style`, so currentColor drives the tinted fill/border). */
+.file-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 26px;
+  height: 16px;
+  padding: 0 5px;
+  border-radius: 4px;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: lowercase;
+  background: color-mix(in srgb, currentColor 16%, transparent);
+  border: 1px solid color-mix(in srgb, currentColor 30%, transparent);
+  flex: 0 0 auto;
+}

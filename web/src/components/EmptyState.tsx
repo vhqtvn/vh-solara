@@ -1,6 +1,10 @@
 import { newSession } from "../sync";
 import Icon from "./Icon";
 import BrandMark from "./BrandMark";
+// Side-effect import: the `.empty*` classes are :global here (shared verbatim
+// with NoProjectState.tsx), so this import only emits the global CSS into the
+// bundle; EmptyState keeps plain string class names.
+import "./EmptyState.module.css";
 
 // The no-session screen: an invitation to act, not a dead end (frontend-design
 // skill — "an empty screen is an invitation to act").

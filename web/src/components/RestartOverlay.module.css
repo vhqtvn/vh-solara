@@ -1,0 +1,32 @@
+/* --- restart overlay (full-screen while the vh server restarts) --- */
+/* "spin" is a SHARED keyframe that stays global in legacy.css; it is referenced
+   here by its bare name (same pattern as ConnectionToast's dialog-in and
+   EmptyState's empty-float global animation references). */
+.restart-overlay {
+  position: fixed; inset: 0; z-index: 200;
+  display: grid; place-items: center;
+  /* No backdrop-filter: a full-screen blur re-computes EVERY frame on Firefox
+     while the spinner (or the chat behind) animates — pins the GPU to ~99°C. A
+     more-opaque scrim reads the same without the per-frame cost. */
+  background: color-mix(in srgb, var(--bg) 92%, transparent);
+}
+.restart-card {
+  display: flex; flex-direction: column; align-items: center; gap: 10px;
+  padding: 28px 36px; text-align: center;
+  background: var(--bg-2); border: 1px solid var(--border); border-radius: 14px;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.5);
+}
+.restart-card h2 { margin: 0; font-size: 17px; }
+.restart-phase { margin: 0; color: var(--accent); font-size: 14px; }
+.restart-hint { margin: 0; color: var(--fg-dim); font-size: 12px; }
+.restart-spinner {
+  width: 28px; height: 28px; border-radius: 50%;
+  border: 3px solid var(--border); border-top-color: var(--accent);
+  animation: spin 0.8s linear infinite;
+}
+.restart-reload {
+  margin-top: 6px; padding: 8px 16px; font: inherit; font-size: 13px;
+  background: var(--bg); color: var(--fg);
+  border: 1px solid var(--border); border-radius: 8px; cursor: pointer;
+}
+.restart-reload:hover { border-color: var(--accent); }

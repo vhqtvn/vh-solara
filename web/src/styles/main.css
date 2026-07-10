@@ -1,0 +1,48 @@
+/* styles/main.css — single CSS entrypoint for the app.
+ *
+ * Imported by web/src/index.tsx (replacing the former `import "./styles.css"`).
+ * This file was produced by the web-css-refactor arc, Phase 1: the 4,599-line
+ * web/src/styles.css monolith was split (verbatim, no rule text edited) into:
+ *
+ *   foundation/tokens.css      :root vars (incl. the --z-* ladder) + every
+ *                                theme-class block + the eink !important
+ *                                animation-disable.  (orig. lines 1-289)
+ *   foundation/reset.css       * {box-sizing}, html/body/#root.   (291-301)
+ *   foundation/typography.css   body { background; color; font }.  (303-307)
+ *   foundation/z-index.css     documentation only (see file).      (new)
+ *   foundation/perf-guards.css documentation only (see file).      (new)
+ *   legacy.css                 everything else, in original order. (309-4599)
+ *
+ * The component islands, markdown/chat/streaming hot paths, overlays, late
+ * overrides and the bottom "Professional design pass" :root block ALL still
+ * live in legacy.css for now. They migrate island-by-island in later phases.
+ *
+ * ── @layer status: COMMENTED (comments-only fallback) ──────────────────────
+ * The intended cascade-layer order is:
+ *
+ *     @layer foundation, base, layout, components, overrides, legacy;
+ *
+ * It is deliberately left as a COMMENT. Activating cascade layers changes
+ * resolution semantics: layer order beats specificity, and !important is
+ * resolved earliest-layer-first among layered rules. Several foundation rules
+ * (the theme-scoped .vh-diff-* overrides at lower specificity, and the eink
+ * !important animation-disable) would change precedence relative to legacy
+ * rules once layered — a real regression risk (e.g. legacy .vh-diff-* would
+ * beat :root.theme-light-scoped .vh-diff-* purely on layer order) that headless
+ * Playwright cannot reliably catch, since the suite asserts DOM/behavior, not
+ * pixel snapshots. The file STRUCTURE is in place; promoting to an active
+ * @layer is a follow-up to be done deliberately, rule-by-rule, during the
+ * Phase 3/4 island carve-out. Until then every rule stays UNLAYERED, and the
+ * @import order below reproduces the original styles.css source order EXACTLY,
+ * so cascade behavior is unchanged.
+ *
+ * Intended layer order (commented — promote in a later slice):
+ * @layer foundation, base, layout, components, overrides, legacy;
+ */
+
+@import "./foundation/tokens.css";
+@import "./foundation/reset.css";
+@import "./foundation/typography.css";
+@import "./foundation/z-index.css";
+@import "./foundation/perf-guards.css";
+@import "./legacy.css";

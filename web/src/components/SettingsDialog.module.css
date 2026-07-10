@@ -1,0 +1,82 @@
+/* Settings dialog component-owned rules. Scoped from legacy.css (scattered
+   regions). These stay GLOBAL in legacy.css and are NOT migrated here:
+     .dialog.settings, .settings-nav-item (in shared multi-selector lists at
+     legacy ~3479/3519), .setting-row, .setting-hint, .theme-select, .dialog*,
+     .icon-btn, .btn — all shared primitives.
+   .term-sess-preview stays :global here because it appears in a shared
+   font-family multi-selector list in legacy.css. */
+
+/* --- Settings → Terminals: session management. --- */
+.term-sess { border: 1px solid var(--border); border-radius: 8px; margin-bottom: 8px; overflow: hidden; }
+.term-sess-head { display: flex; align-items: center; gap: 10px; padding: 8px 10px; background: var(--bg-2); }
+.term-sess-dir { font-family: ui-monospace, Menlo, monospace; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.term-sess-meta { flex: 1; font-size: 11px; color: var(--fg-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.term-sess-kill { flex: 0 0 auto; padding: 5px 12px; font: inherit; font-size: 12px; background: var(--bg); color: var(--danger); border: 1px solid color-mix(in srgb, var(--danger) 45%, var(--border)); border-radius: 6px; cursor: pointer; }
+.term-sess-kill:hover { background: color-mix(in srgb, var(--danger) 14%, var(--bg)); }
+:global(.term-sess-preview) { margin: 0; padding: 8px 10px; font: 11px/1.45 ui-monospace, Menlo, monospace; color: var(--fg-dim); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 96px; overflow-y: auto; border-top: 1px solid var(--border); }
+
+/* Custom-theme editor (Settings → Appearance, shown when the Custom theme is selected). */
+.custom-theme { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+.custom-theme-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 0.875rem; color: var(--fg-dim); }
+.custom-theme-row input[type="color"] {
+  width: 38px; height: 24px; padding: 0; border: 1px solid var(--border);
+  border-radius: 5px; background: var(--bg-2); cursor: pointer;
+}
+.custom-theme-row input[type="checkbox"] { width: 16px; height: 16px; cursor: pointer; }
+.custom-theme-actions { display: flex; gap: 6px; margin-top: 4px; flex-wrap: wrap; }
+.custom-theme-actions > * { flex: 1 1 auto; min-width: 0; }
+.custom-theme-import { display: flex; gap: 6px; }
+.custom-theme-import input { flex: 1 1 auto; min-width: 0; }
+.custom-theme-import button { flex: 0 0 auto; }
+.setting-err { color: var(--danger, #f85149); }
+
+/* Install-app button in Settings → App. */
+.install-app-btn {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 8px 14px; font: inherit; font-size: 13px;
+  background: var(--accent); color: var(--accent-fg);
+  border: 0; border-radius: 8px; cursor: pointer;
+}
+.install-app-btn:hover { opacity: 0.92; }
+
+/* --- settings dialog body/nav/content --- */
+/* Fixed height so switching tabs doesn't resize the dialog (content scrolls).
+   (.dialog.settings width/height stays global in legacy.css.) */
+.settings-body { display: flex; min-height: 0; flex: 1; }
+.settings-nav {
+  flex: 0 0 150px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px;
+  border-right: 1px solid var(--border);
+  overflow-y: auto;
+}
+.settings-content { flex: 1; overflow-y: auto; padding: 14px 16px; min-width: 0; }
+.zoom-control { display: flex; align-items: center; gap: 8px; min-width: 160px; }
+.zoom-control input[type="range"] { flex: 1; accent-color: var(--accent); }
+.zoom-reset {
+  flex: none;
+  min-width: 44px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--fg);
+  border-radius: 6px;
+  padding: 3px 6px;
+  font: inherit;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+.zoom-reset:hover { border-color: var(--accent); }
+
+@media (max-width: 720px) {
+  .settings-body { flex-direction: column; }
+  .settings-nav {
+    flex: 0 0 auto;
+    flex-direction: row;
+    overflow-x: auto;
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+  }
+}

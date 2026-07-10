@@ -1,0 +1,11 @@
+* { box-sizing: border-box; }
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  /* No rubber-band/overscroll at the page level (avoids pull-to-refresh and the
+     whole-page bounce). Inner scrollers (.tree, .chat-scroll, dialogs) keep
+     their own scrolling and only stop the chain via overscroll-behavior. */
+  overscroll-behavior: none;
+  overflow: hidden;
+}

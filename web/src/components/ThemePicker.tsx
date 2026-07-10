@@ -1,5 +1,6 @@
 import { For, Show } from "solid-js";
 import { customTheme, setThemeId, theme, THEMES } from "../theme";
+import styles from "./ThemePicker.module.css";
 
 // Visual theme selector: a scrollable list where each row shows a mini preview
 // (background fill + accent / accent-2 / text swatches) next to the name, so a
@@ -15,7 +16,7 @@ export default function ThemePicker() {
   };
 
   return (
-    <div class="theme-picker" role="listbox" aria-label="Theme">
+    <div class={styles["theme-picker"]} role="listbox" aria-label="Theme">
       <For each={THEMES}>
         {(t) => {
           const s = () => swatchFor(t.id);
@@ -24,19 +25,19 @@ export default function ThemePicker() {
               type="button"
               role="option"
               aria-selected={theme() === t.id}
-              class="theme-picker-item"
+              class={styles["theme-picker-item"]}
               classList={{ on: theme() === t.id }}
               onClick={() => setThemeId(t.id)}
               title={t.name}
             >
-              <span class="theme-swatch" style={{ background: s().bg, "border-color": s().accent }} aria-hidden="true">
-                <span class="theme-swatch-dot" style={{ background: s().accent }} />
-                <span class="theme-swatch-dot" style={{ background: s().accent2 }} />
-                <span class="theme-swatch-dot" style={{ background: s().fg }} />
+              <span class={styles["theme-swatch"]} style={{ background: s().bg, "border-color": s().accent }} aria-hidden="true">
+                <span class={styles["theme-swatch-dot"]} style={{ background: s().accent }} />
+                <span class={styles["theme-swatch-dot"]} style={{ background: s().accent2 }} />
+                <span class={styles["theme-swatch-dot"]} style={{ background: s().fg }} />
               </span>
-              <span class="theme-picker-name">{t.name}</span>
+              <span class={styles["theme-picker-name"]}>{t.name}</span>
               <Show when={theme() === t.id}>
-                <span class="theme-picker-check" aria-hidden="true">✓</span>
+                <span class={styles["theme-picker-check"]} aria-hidden="true">✓</span>
               </Show>
             </button>
           );

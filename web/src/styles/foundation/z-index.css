@@ -1,0 +1,30 @@
+/* foundation/z-index.css — z-index contract (documentation; no rules yet).
+ *
+ * The actual stacking ladder is a set of CSS custom properties defined VERBATIM
+ * inside the :root block in tokens.css (originally lines 21-33 of styles.css):
+ *
+ *     --z-jump:        46    "↓ Latest" / "Live" pill
+ *     --z-composer:    40    composer bar (textarea + actions)
+ *     --z-tasks:       45    tasks popover anchored to the composer
+ *     --z-drawer:      48    mobile off-canvas sidebar + scrim
+ *     --z-dialog:      50    base modal dialog overlay
+ *     --z-popover:     60    menus, status popovers, dropdowns
+ *     --z-scrim:       70    context-menu scrim
+ *     --z-toast:       90    connection / update toasts
+ *     --z-modal:      150    command palette, opencode-update overlay
+ *     --z-modal-pop:  160    composer autocomplete (above a modal)
+ *     --z-overlay-full:200   full-screen code overlay, restart overlay,
+ *                            portaled <Select> popup
+ *     --z-floating:   300    path-selection floating action
+ *     --z-tooltip:   1000    tooltips
+ *
+ * Extracting the --z-* declarations out of :root into this file would split the
+ * :root declaration block, which is NOT a verbatim move — so Phase 1 leaves the
+ * vars where they are. Small/local z-indexes that live inside a component's own
+ * stacking context (resize handles, sticky table headers — raw 2/3/6) also stay
+ * inline in legacy.css and don't participate in the global ladder.
+ *
+ * This file is the designated HOME for the Phase 4 work: consolidate raw
+ * `z-index:` declarations scattered across legacy.css onto the --z-* ladder.
+ * No rules are moved in Phase 1.
+ */

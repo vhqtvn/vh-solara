@@ -2,6 +2,7 @@ import { createSignal, onCleanup, onMount, Show } from "solid-js";
 import { openFileAt, setPathSelection } from "../code/frame";
 import { looksLikePath } from "../lib/pathlike";
 import Icon from "./Icon";
+import styles from "./PathSelectionAction.module.css";
 
 // Coarse pointers (touch): the OS text-selection menu sits exactly where our
 // floating action would, covering it — so suppress the floating button there and
@@ -72,7 +73,7 @@ export default function PathSelectionAction() {
       {(b) => (
         <button
           type="button"
-          class="path-sel-action"
+          class={styles["path-sel-action"]}
           style={{ left: `${b().x}px`, top: `${b().y}px` }}
           // Keep the selection alive: a plain mousedown on the button would
           // collapse it before the click fires.

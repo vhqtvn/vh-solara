@@ -1,0 +1,289 @@
+:root {
+  color-scheme: dark;
+  /* Allow height:auto transitions (activity/tool expand animations). Ignored by
+     browsers without support — those just snap. */
+  interpolate-size: allow-keywords;
+  --bg: #0d1117;
+  --bg-2: #11161d;
+  --border: #21262d;
+  --fg: #c9d1d9;
+  --fg-dim: #8b949e;
+  --accent: #58a6ff;
+  --accent-2: #d2a8ff; /* secondary hue for h1/emphasis (openchamber-style) */
+  --code-bg: #161b22;
+  --code-surface: #0b0f14;
+  --sidebar-w: 280px;
+
+  /* Z-index scale. One ordered ladder for everything that overlaps globally, so
+     stacking is intentional instead of a pile of magic numbers. (Small, local
+     z-indexes inside a component's own stacking context — resize handles, sticky
+     table headers — stay as raw 2/3/6 and don't participate here.) */
+  --z-jump: 46;          /* "↓ Latest" / "Live" pill — above the composer (40) and the tasks popover (45): a squeezed .chat-main can make the pill overflow downward over the composer/status (see .jump clamp); DOM order would resolve any tie anyway (the tasks popover is composer-anchored in a later subtree, so they don't co-occur spatially) */
+  --z-composer: 40;      /* composer bar (textarea + actions) */
+  --z-tasks: 45;         /* tasks popover anchored to the composer */
+  --z-drawer: 48;        /* mobile off-canvas sidebar + its scrim (above content, below dialogs) */
+  --z-dialog: 50;        /* base modal dialog overlay */
+  --z-popover: 60;       /* menus, status popovers, dropdowns */
+  --z-scrim: 70;         /* context-menu scrim */
+  --z-toast: 90;         /* connection / update toasts */
+  --z-modal: 150;        /* command palette, opencode-update overlay */
+  --z-modal-pop: 160;    /* composer autocomplete (above a modal) */
+  --z-overlay-full: 200; /* full-screen code overlay, restart overlay, portaled <Select> popup */
+  --z-floating: 300;     /* path-selection floating action */
+  --z-tooltip: 1000;
+
+  /* Surfaces/emphasis derived from the palette so every theme (which only
+     overrides --bg/--bg-2/--fg) adapts automatically. --bg-input: form controls
+     (select buttons, text inputs); --bg-elev: elevated popups/sheets; --fg-strong:
+     the most prominent text (e.g. a running session). Previously these were
+     referenced only with hardcoded dark fallbacks, so selects rendered dark on
+     light themes. */
+  --bg-input: var(--bg);
+  --bg-elev: var(--bg-2);
+  --fg-strong: #fff;
+  /* Destructive-action text. A light pink reads on dark menus but washes out on
+     a light one, so light themes override it with a darker red. */
+  --danger-fg: #ffb4ba;
+  /* Text/icons on an --accent fill. Dark themes have a light-blue accent, so dark
+     navy reads best; light themes have a darker, saturated accent, so they
+     override this with white. */
+  --accent-fg: #08111f;
+  /* Semantic status colors (dots, badges, borders, tints). Saturated mid-tones
+     that read on both light and dark; tint/translucent variants are derived via
+     color-mix at the use site. */
+  --danger: #f85149;
+  --warn: #d29922;
+  --ok: #3fb950;
+  --sel: #1f6feb; /* selection / "current" highlight base */
+
+  /* Markdown + chat coloring tokens (openchamber's theme model, ported). Most
+     derive from the base palette via color-mix so every theme stays coherent;
+     only --accent-2 is set per theme. Override any token in a theme block to
+     fine-tune. */
+  --md-h1: var(--accent-2);
+  --md-h2: var(--accent);
+  --md-h3: var(--fg);
+  --md-link: var(--accent);
+  --md-bold: var(--fg);
+  --md-code: color-mix(in srgb, var(--accent) 82%, var(--fg));
+  --md-code-bg: var(--code-bg);
+  --md-quote: var(--fg-dim);
+  --md-quote-border: color-mix(in srgb, var(--accent) 55%, var(--border));
+  --md-marker: var(--accent);
+  --md-hr: var(--border);
+  --chat-user-fg: var(--fg);
+  --chat-user-bg: color-mix(in srgb, var(--accent) 9%, var(--bg-2));
+  --chat-user-border: color-mix(in srgb, var(--accent) 22%, var(--border));
+  --chat-assistant-fg: var(--fg);
+  --chat-assistant-bg: transparent;
+  --chat-timestamp: var(--fg-dim);
+}
+
+/* Light theme: variable overrides for the app chrome. Code syntax colors come
+   from the .theme-light-scoped rules in /vh/highlight.css. */
+:root.theme-light {
+  --bg: #ffffff;
+  --bg-2: #f6f8fa;
+  --border: #d0d7de;
+  --fg: #1f2328;
+  --fg-dim: #656d76;
+  --accent: #0969da;
+  --accent-2: #8250df;
+  --code-bg: #f6f8fa;
+  --code-surface: #f6f8fa;
+}
+:root.theme-dim {
+  --bg: #1c2128; --bg-2: #22272e; --border: #373e47;
+  --fg: #adbac7; --fg-dim: #768390; --accent: #539bf5; --accent-2: #dcbdfb;
+  --code-bg: #2d333b; --code-surface: #22272e;
+}
+:root.theme-midnight {
+  --bg: #06080d; --bg-2: #0b0f17; --border: #1b2230;
+  --fg: #c9d1d9; --fg-dim: #7a8699; --accent: #6cb6ff; --accent-2: #b39dff;
+  --code-bg: #0b0f17; --code-surface: #06080d;
+}
+:root.theme-hc {
+  --bg: #000000; --bg-2: #0a0a0a; --border: #4d4d4d;
+  --fg: #ffffff; --fg-dim: #c9c9c9; --accent: #4cc2ff; --accent-2: #e0a3ff;
+  --code-bg: #0a0a0a; --code-surface: #000000;
+}
+/* OpenChamber "Fields of the Shire" palettes, ported. These lean on the
+   markdown/chat token defaults but recolor headings/quotes to the warm Shire
+   hues for a distinctly different reading experience. */
+:root.theme-shire-dark {
+  --bg: #1b1815; --bg-2: #23201c; --border: #413e3a;
+  --fg: #ebe0d1; --fg-dim: #83796f; --accent: #7a8a5a; --accent-2: #c47a3a;
+  --code-bg: #23201c; --code-surface: #1b1815;
+  --md-h1: #c47a3a; --md-h2: #93a56b; --md-h3: var(--fg);
+  --md-link: #5a6d7a; --md-code: #93a56b; --md-quote: #a89888;
+  --md-marker: #c47a3a;
+  --chat-user-bg: #272a25; --chat-user-border: #413e3a;
+}
+:root.theme-shire-light {
+  --bg: #f9f5eb; --bg-2: #efe8da; --border: #ddd3c2;
+  --fg: #1a1612; --fg-dim: #8a7e72; --accent: #5d6e3f; --accent-2: #8c5520;
+  --code-bg: #efe8da; --code-surface: #f9f5eb;
+  --md-h1: #8c5520; --md-h2: #5d6e3f; --md-h3: var(--fg);
+  --md-link: #3d4f5a; --md-code: #5d6e3f; --md-quote: #6f6457;
+  --md-marker: #8c5520;
+  --chat-user-bg: #efe8da; --chat-user-border: #ddd3c2;
+}
+/* Popular community palettes (chrome + accents; markdown tokens derive). */
+:root.theme-tokyonight {
+  --bg: #1a1b26; --bg-2: #1f2335; --border: #2f334d;
+  --fg: #c0caf5; --fg-dim: #7a82a8; --accent: #7aa2f7; --accent-2: #bb9af7;
+  --code-bg: #1f2335; --code-surface: #16161e;
+  --md-h2: #7dcfff; --md-code: #9ece6a;
+}
+:root.theme-dracula {
+  --bg: #282a36; --bg-2: #2d2f3d; --border: #3b3d4d;
+  --fg: #f8f8f2; --fg-dim: #8a8da3; --accent: #bd93f9; --accent-2: #ff79c6;
+  --code-bg: #21222c; --code-surface: #1d1e26;
+  --md-h2: #8be9fd; --md-code: #50fa7b;
+}
+:root.theme-nord {
+  --bg: #2e3440; --bg-2: #343b49; --border: #434c5e;
+  --fg: #e5e9f0; --fg-dim: #8a93a5; --accent: #88c0d0; --accent-2: #b48ead;
+  --code-bg: #292e39; --code-surface: #242933;
+  --md-h2: #81a1c1; --md-code: #a3be8c;
+}
+:root.theme-catppuccin {
+  --bg: #1e1e2e; --bg-2: #252537; --border: #363a4f;
+  --fg: #cdd6f4; --fg-dim: #8087a2; --accent: #89b4fa; --accent-2: #cba6f7;
+  --code-bg: #232336; --code-surface: #181825;
+  --md-h2: #89dceb; --md-code: #a6e3a1;
+}
+:root.theme-gruvbox {
+  --bg: #282828; --bg-2: #32302f; --border: #504945;
+  --fg: #ebdbb2; --fg-dim: #a89984; --accent: #83a598; --accent-2: #d3869b;
+  --code-bg: #32302f; --code-surface: #1d2021;
+  --md-h1: #fabd2f; --md-h2: #b8bb26; --md-code: #b8bb26; --md-marker: #fe8019;
+}
+:root.theme-rose-pine {
+  --bg: #191724; --bg-2: #1f1d2e; --border: #403d52;
+  --fg: #e0def4; --fg-dim: #908caa; --accent: #9ccfd8; --accent-2: #c4a7e7;
+}
+:root.theme-one-dark {
+  --bg: #282c34; --bg-2: #2c313a; --border: #3e4451;
+  --fg: #abb2bf; --fg-dim: #828997; --accent: #61afef; --accent-2: #c678dd;
+}
+:root.theme-everforest {
+  --bg: #2d353b; --bg-2: #343f44; --border: #475258;
+  --fg: #d3c6aa; --fg-dim: #9da9a0; --accent: #a7c080; --accent-2: #d699b6;
+}
+:root.theme-ayu {
+  --bg: #1f2430; --bg-2: #232834; --border: #383e4c;
+  --fg: #cccac2; --fg-dim: #8a9199; --accent: #ffcc66; --accent-2: #73d0ff;
+}
+:root.theme-solarized-dark {
+  --bg: #002b36; --bg-2: #073642; --border: #0a4b59;
+  --fg: #93a1a1; --fg-dim: #657b83; --accent: #268bd2; --accent-2: #d33682;
+}
+:root.theme-solarized-light {
+  --bg: #fdf6e3; --bg-2: #eee8d5; --border: #ddd6c1;
+  --fg: #586e75; --fg-dim: #93a1a1; --accent: #268bd2; --accent-2: #d33682;
+}
+:root.theme-monokai {
+  --bg: #272822; --bg-2: #2d2e27; --border: #49483e;
+  --fg: #f8f8f2; --fg-dim: #75715e; --accent: #66d9ef; --accent-2: #f92672;
+}
+:root.theme-kanagawa {
+  --bg: #1f1f28; --bg-2: #2a2a37; --border: #54546d;
+  --fg: #dcd7ba; --fg-dim: #727169; --accent: #7e9cd8; --accent-2: #957fb8;
+}
+:root.theme-material {
+  --bg: #263238; --bg-2: #2e3c43; --border: #425057;
+  --fg: #eeffff; --fg-dim: #8d9ea3; --accent: #82aaff; --accent-2: #c792ea;
+}
+:root.theme-catppuccin-latte {
+  --bg: #eff1f5; --bg-2: #e6e9ef; --border: #ccd0da;
+  --fg: #4c4f69; --fg-dim: #8c8fa1; --accent: #1e66f5; --accent-2: #8839ef;
+}
+:root.theme-rose-pine-dawn {
+  --bg: #faf4ed; --bg-2: #fffaf3; --border: #dfdad9;
+  --fg: #575279; --fg-dim: #797593; --accent: #56949f; --accent-2: #907aa9;
+}
+/* On light themes the most-prominent text must be dark, not white. */
+/* Light-theme overrides apply to ALL light themes via the generic marker class
+   (set in theme.ts), so Shire (light) gets them too — not just `light`. */
+:root.theme-light-scoped { --fg-strong: var(--fg); --danger-fg: #cf222e; --accent-fg: #fff; }
+:root.theme-light-scoped .vh-diff-add { background: #e6ffec; color: #1f2328; }
+:root.theme-light-scoped .vh-diff-del { background: #ffebe9; color: #1f2328; }
+:root.theme-light-scoped .vh-diff-hunk { background: #ddf4ff; color: #0969da; }
+
+/* ===== Paper themes — an e-ink/paper READING aesthetic on a normal (LCD)
+   screen: soft, low-contrast grey paper with restful ink, motion left intact.
+   (For an actual e-ink panel use the "E Ink" themes below — max contrast +
+   no motion — instead.) Placed after the light-scoped block so --danger-fg
+   reads white on the dark/muted danger fills. */
+:root.theme-paper, :root.theme-paper-color { --danger-fg: #ffffff; }
+/* Paper: warm-grey page, near-black ink, fully grayscale — even status colours
+   are greys, set apart only by darkness, like a monochrome e-reader. */
+:root.theme-paper {
+  --bg: #f4f4f2; --bg-2: #e9e9e6; --border: #c2c2bf;
+  --fg: #161616; --fg-dim: #5a5a58; --accent: #2b2b2b; --accent-2: #4d4d4d;
+  --code-bg: #e9e9e6; --code-surface: #f4f4f2;
+  --danger: #161616; --warn: #4d4d4d; --ok: #6b6b6b; --sel: #2b2b2b;
+  --md-h1: #161616; --md-h2: #2b2b2b; --md-h3: var(--fg);
+  --md-link: #161616; --md-code: #2b2b2b; --md-marker: #2b2b2b;
+  --md-quote: #5a5a58; --md-quote-border: #9a9a97;
+  --chat-user-bg: #e9e9e6; --chat-user-border: #c2c2bf;
+}
+/* Paper Color: a greyer paper with deliberately MUTED, desaturated accents —
+   the washed look of a Kaleido panel reproduced on a bright screen. */
+:root.theme-paper-color {
+  --bg: #eceae2; --bg-2: #e2e0d6; --border: #c3c1b6;
+  --fg: #24231f; --fg-dim: #6a685f; --accent: #4f7a8f; --accent-2: #9c6b52;
+  --code-bg: #e2e0d6; --code-surface: #eceae2;
+  --danger: #a8503f; --warn: #997b3a; --ok: #5f7e4f; --sel: #4f7a8f;
+  --md-h1: #9c6b52; --md-h2: #4f7a8f; --md-h3: var(--fg);
+  --md-link: #4f6f8f; --md-code: #5f7e4f; --md-marker: #9c6b52;
+  --md-quote: #6a685f; --md-quote-border: #b0a08f;
+  --chat-user-bg: #e2e0d6; --chat-user-border: #c3c1b6;
+}
+
+/* ===== E Ink themes — for use ON e-ink panels (not to simulate e-ink on LCD).
+   So: maximum contrast (pure #fff paper / #000 ink), no subtle low-contrast
+   greys that e-ink can't resolve, visible borders instead of shadows, and — for
+   colour — FULLY SATURATED source colours (the Kaleido colour-filter array dims
+   them on-device; pre-muting would make them vanish). Placed after the
+   light-scoped block so these override its shared tokens. */
+:root.theme-eink, :root.theme-eink-color {
+  --bg: #ffffff; --bg-2: #f2f2f2; --code-bg: #f2f2f2; --code-surface: #ffffff;
+  --fg: #000000; --fg-dim: #555555; --fg-strong: #000000;
+  --accent-fg: #ffffff; --danger-fg: #ffffff;
+  --bg-input: #ffffff; --bg-elev: #ffffff;
+}
+/* E Ink (B&W): a purely monochrome page. Even status colours are greys, set
+   apart only by darkness — there is no colour on a Carta panel. */
+:root.theme-eink {
+  --border: #6e6e6e; --accent: #000000; --accent-2: #000000;
+  --danger: #000000; --warn: #3a3a3a; --ok: #5e5e5e; --sel: #000000;
+  --md-h1: #000000; --md-h2: #000000; --md-h3: #000000;
+  --md-link: #000000; --md-code: #000000; --md-marker: #000000;
+  --md-quote: #3a3a3a; --md-quote-border: #6e6e6e;
+  --chat-user-bg: #f2f2f2; --chat-user-border: #6e6e6e;
+}
+/* E Ink Colour (Kaleido): same crisp B&W base, with bold, saturated accents so
+   they survive the panel's colour filter and still read as colour. */
+:root.theme-eink-color {
+  --border: #7a7a7a; --accent: #0b5cad; --accent-2: #b3431a;
+  --danger: #c0271b; --warn: #9a6400; --ok: #2e7d32; --sel: #0b5cad;
+  --md-h1: #b3431a; --md-h2: #0b5cad; --md-h3: #000000;
+  --md-link: #0b5cad; --md-code: #2e7d32; --md-marker: #b3431a;
+  --md-quote: #555555; --md-quote-border: #7a7a7a;
+  --chat-user-bg: #eaf2fb; --chat-user-border: #9cc0e8;
+}
+/* E-ink panels ghost and refresh slowly, so motion looks broken and wears the
+   screen. Fully DISABLE animation + transition (spinners, shimmer, the stream
+   caret, expand tweens, entrance fades) — not just speed them up — so there is
+   no animation at all. !important also overrides Spinner's inline animation.
+   Safe: no animation here uses fill-mode to reveal from a hidden base, and
+   nothing listens for transition/animation-end, so elements simply render in
+   their resting state. */
+:root.theme-eink, :root.theme-eink *, :root.theme-eink *::before, :root.theme-eink *::after,
+:root.theme-eink-color, :root.theme-eink-color *, :root.theme-eink-color *::before, :root.theme-eink-color *::after {
+  animation: none !important;
+  transition: none !important;
+  scroll-behavior: auto !important;
+}

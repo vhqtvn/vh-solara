@@ -1,5 +1,6 @@
 import { createEffect, createSignal, onCleanup, onMount, Show } from "solid-js";
 import { hoverCapable, inspectAt, placeTooltip, type Rectish } from "../tooltip";
+import styles from "./Tooltip.module.css";
 
 // DOM-based tooltip (mounted once at the app root). We avoid the native `title`
 // attribute because some window managers (e.g. swaywm) spawn a new window for
@@ -112,7 +113,7 @@ export default function Tooltip() {
       <div
         ref={bubble}
         class="tooltip"
-        classList={{ above: !!pos()?.above }}
+        classList={{ [styles.above]: !!pos()?.above }}
         role="tooltip"
         style={
           pos()

@@ -1,0 +1,268 @@
+/* Part.tsx streaming chrome (tool / activity / reasoning rows, mermaid, file-chip).
+   Scoped from legacy.css (CSS-module migration, Phase 5). Verbatim rule moves.
+
+   GLOBAL DECISIONS (classes kept :global and why):
+   - .tool-head / .tool-name / .tool-dur / .tool-jump / .tool-diag / .tool-diag-loc
+     stay :global — queried by tests:
+       .tool-head      web/tests/e2e/features2.spec.ts:238 (.locator)
+       .tool-name      web/tests/e2e/smoke.spec.ts:33 (.locator)
+       .tool-dur       web/tests/unit/PartTool.test.tsx:53,54,97 (querySelector)
+       .tool-jump      web/tests/e2e/subsession.spec.ts:11 (.locator)
+       .tool-diag      web/tests/e2e/smoke.spec.ts:35 (.locator)
+       .tool-diag-loc  web/tests/e2e/smoke.spec.ts:36 (.locator)
+   - .no-toggle stays :global — it only ever modifies the global .tool-head, so a
+     bare :global(.tool-head.no-toggle) carries it with zero scoping benefit lost.
+   - Modifier/state classes .rot / .open / .error / .needs-input / .live and the
+     dynamic tool status strings (running/completed/error, set via classList
+     {[status()]: true}) stay :global — they are shared across components or are
+     dynamic strings that cannot be module keys. They appear here only inside
+     :global(...) wrappers on compound selectors.
+   - Shared keyframe `pulse` is referenced by BARE NAME (resolves to the global
+     @keyframes pulse in legacy.css) — same convention as ConnectionToast
+     `dialog-in` / RestartOverlay `spin`.
+
+   DEFERRED (still in legacy.css, intentionally NOT migrated):
+   - .md* markdown typography — styles innerHTML-generated elements (h1/p/a/code),
+     not JSX classes; scoping would be 100% :global with no benefit.
+   - .md-raw — shared with GitView.tsx (its loading fallback).
+   - .reasoning-body — the bounded GPU-hot scroll surface for the thinking
+     transcript (AGENTS.md GPU-perf bans; deferred with the ChatView slice).
+   - .stream-caret / .filepath / .code-block / .code-actions / .code-wrap /
+     .code-copy / .code-pathlike / pre.wrap — created imperatively (DOM) inside
+     the innerHTML markdown content, not JSX-set. */
+
+/* --- reasoning (Thinking) row --- */
+.reasoning { color: var(--fg-dim); margin: 0; border-radius: 7px; }
+.reasoning-time { font-size: 11px; color: var(--fg-dim); font-variant-numeric: tabular-nums; }
+/* Pulse the duration while the model is actively thinking. */
+/* No pulse animation: a continuous repaint that runs the whole time a reasoning
+   block streams (and can force display-list rebuilds of the growing block). The
+   accent color alone signals "live". */
+.reasoning-time:global(.live) { color: var(--accent); }
+
+/* LSP diagnostics surfaced on an edit/write tool result. */
+.tool-diags {
+  display: flex; flex-direction: column; gap: 2px;
+  margin: 6px 10px 8px;
+  padding: 6px 9px;
+  font: 12px/1.5 ui-monospace, Menlo, monospace;
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--danger) 35%, var(--border));
+  border-radius: 6px;
+}
+/* .tool-diag / .tool-diag-loc stay :global — queried by smoke.spec.ts. */
+:global(.tool-diag) { color: var(--fg); overflow-wrap: anywhere; }
+:global(.tool-diag-loc) { color: var(--danger); font-variant-numeric: tabular-nums; }
+
+/* Compact activity row (used inside .activity). The whole head is the toggle;
+   expanding reveals the command + output below. */
+.tool { border-radius: 7px; margin: 0; overflow: hidden; transition: height 0.18s var(--ease, ease); }
+/* .tool-head stays :global — queried by features2.spec.ts. */
+:global(.tool-head) {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  padding: 4px 6px;
+  background: transparent;
+  border: 0;
+  border-radius: 7px;
+  color: var(--fg);
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+:global(.tool-head:hover) { background: color-mix(in srgb, var(--fg) 6%, transparent); }
+/* A row with nothing to expand isn't a toggle. */
+:global(.tool-head.no-toggle) { cursor: default; }
+:global(.tool-head.no-toggle:hover) { background: transparent; }
+.tool-status { width: 7px; height: 7px; border-radius: 50%; background: var(--fg-dim); flex: 0 0 auto; }
+/* Running tool: the session-list shimmer, smaller and accent-tinted. */
+.tool-spin { flex: 0 0 auto; color: var(--accent); display: inline-flex; }
+/* Status strings (running/completed/error) are dynamic classList keys — :global. */
+.tool:global(.running) .tool-status { background: var(--accent); }
+.tool:global(.completed) .tool-status { background: var(--ok); }
+.tool:global(.error) .tool-status { background: var(--danger); }
+.tool-ico { display: inline-flex; align-items: center; color: var(--fg-dim); flex: 0 0 auto; }
+/* .tool-name stays :global — queried by smoke.spec.ts. */
+:global(.tool-name) { font-weight: 550; font-size: 13px; flex: 0 0 auto; }
+.tool-subject {
+  flex: 1 1 auto; min-width: 0; color: var(--fg-dim); font-size: 12px;
+  font-family: ui-monospace, Menlo, monospace;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* .tool-dur stays :global — queried by PartTool.test.tsx. */
+:global(.tool-dur) { flex: 0 0 auto; color: var(--fg-dim); font-size: 11px; font-variant-numeric: tabular-nums; }
+/* Live (running) tool duration: accent-tinted, mirroring .reasoning-time.live. */
+:global(.tool-dur.live) { color: var(--accent); }
+.tool-chev { display: inline-flex; align-items: center; color: var(--fg-dim); flex: 0 0 auto; transition: transform 0.12s ease; }
+.tool-chev:global(.rot) { transform: rotate(180deg); }
+/* .tool-jump stays :global — queried by subsession.spec.ts. */
+:global(.tool-jump) {
+  display: inline-flex; align-items: center;
+  color: var(--accent);
+  padding: 2px 4px; margin-left: 6px; border-radius: 6px;
+  cursor: pointer; flex: 0 0 auto;
+}
+:global(.tool-jump:hover) { background: color-mix(in srgb, var(--accent) 13%, transparent); }
+/* Depth-1 live status of a task tool's spawned subagent (Tier-A store data
+   only — activity/permissions/questions are kept for ALL sessions, so the child
+   need not be opened). Sits just left of the .tool-jump fork. Mirrors the
+   session-tree dot affordance: error = red, needs-input = amber pulse, working
+   = accent spinner. Hidden when idle (nothing to flag), like the tree. Cheap
+   styling only — no mask-image/backdrop-filter/contain (this is the GPU-hot
+   chat-scroll surface). */
+.tool-sub-status {
+  width: 7px; height: 7px; border-radius: 50%; flex: 0 0 auto; margin-left: 6px;
+}
+.tool-sub-status:global(.error) { background: var(--danger); }
+.tool-sub-status:global(.needs-input) {
+  background: var(--warn, #e8a838);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--warn, #e8a838) 32%, transparent);
+  animation: pulse 1.1s ease-in-out infinite;
+}
+.tool-sub-spin {
+  /* flex: 0 1 auto + min-width: 0 so this nested flex can give way in the
+     .tool-head row when its .tool-sub-verb is long, instead of shoving the
+     .tool-jump fork off the line. The Spinner child keeps its size (it has a
+     min-content floor); only the verb shrinks/truncates. */
+  display: inline-flex; align-items: center; flex: 0 1 auto; min-width: 0; margin-left: 6px;
+  color: var(--accent);
+}
+/* Rich activity verb for a working task-tool subagent ("Reading parser.go"),
+   shown next to the .tool-sub-spin spinner — replacing today's bare spinner
+   with the actual verb. Sourced from the Tier-A facet (no message load).
+   Cheap inline text only — no mask-image/backdrop-filter/contain, since this
+   sits in the GPU-hot chat-scroll surface (see AGENTS.md GPU-perf bans). */
+.tool-sub-verb {
+  font-size: 11px;
+  color: var(--accent);
+  white-space: nowrap;
+  margin-left: 5px;
+  /* Truncate instead of overflowing the .tool-head row (mirrors .tool-subject).
+     flex: 0 1 auto → take natural width but allow shrink; min-width: 0 drops
+     the nowrap min-content floor so the row can reclaim space; max-width caps
+     a very long verb (e.g. a streamed bash command) so it never dominates the
+     row even when room exists. overflow+ellipsis do the visual clip. The full
+     verb stays accessible via .tool-sub-spin's data-tip/aria-label. */
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 40ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tool-open {
+  display: inline-flex; align-items: center; color: var(--fg-dim);
+  padding: 2px 4px; margin-left: 6px; border-radius: 6px; cursor: pointer; flex: 0 0 auto;
+}
+.tool-open:hover { color: var(--accent); background: color-mix(in srgb, var(--accent) 13%, transparent); }
+/* user-select carried from the legacy grouped ".md, …, .tool-output, …"
+   selector: the <div class="tool-output tool-output-code"> variant is NOT a <pre>,
+   so it no longer inherits text-selectability once .tool-output is scoped. */
+.tool-output {
+  margin: 2px 0 4px 20px;
+  padding: 8px 11px;
+  background: var(--code-surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow-x: auto;
+  font: 12px/1.5 ui-monospace, Menlo, monospace;
+  white-space: pre-wrap;
+  max-height: 320px;
+  -webkit-user-select: text;
+  user-select: text;
+  -webkit-touch-callout: default;
+}
+/* The actual command/expression line for a tool (shown above its output). */
+.tool-cmd {
+  margin: 2px 0 4px 20px;
+  padding: 8px 11px;
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--md-code, var(--accent));
+  overflow-x: auto;
+  font: 12px/1.5 ui-monospace, Menlo, monospace;
+  white-space: pre-wrap;
+}
+/* JSON/XML tool output rendered through the markdown code path: the highlighted
+   <pre> is the single scroll surface, so the wrapper must NOT also scroll — drop
+   its own max-height/overflow/padding (otherwise you get two nested scrollbars).
+   overflow:hidden just clips the inner square corners to the wrapper's radius. */
+.tool-output-code { margin-left: 20px; padding: 0; max-height: none; overflow: hidden; }
+
+/* --- activity timeline --- */
+/* Activity timeline: a run of tool/reasoning parts collapsed under one header
+   (OpenChamber-style), each row expandable to full detail. */
+.activity { margin: 8px 0 12px; }
+.activity-head {
+  display: inline-flex; align-items: center; gap: 7px;
+  background: transparent; border: 0; color: var(--fg-dim); cursor: pointer;
+  padding: 3px 2px; font: inherit;
+}
+.activity-head:hover { color: var(--fg); }
+.activity-title { font-weight: 600; font-size: 0.9rem; color: var(--fg); }
+.activity-count {
+  font-size: 11px; color: var(--fg-dim); background: var(--code-bg);
+  border-radius: 999px; padding: 0 7px; line-height: 18px; font-variant-numeric: tabular-nums;
+}
+.activity-chev { display: inline-flex; align-items: center; color: var(--fg-dim); transition: transform 0.18s var(--ease, ease); }
+.activity-chev:global(.rot) { transform: rotate(180deg); }
+/* Disclosure animation: a grid track collapses 1fr -> 0fr, which animates the
+   row block open/closed without needing a measured pixel height. The inner
+   element must clip its overflow and allow shrinking below content size. */
+.activity-rows-wrap {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows 0.22s var(--ease, ease);
+}
+.activity-rows-wrap:global(.open) { grid-template-rows: 1fr; }
+.activity-rows {
+  overflow: hidden;
+  min-height: 0;
+  margin-left: 7px; padding-left: 12px;
+  border-left: 1px solid var(--border);
+  display: flex; flex-direction: column; gap: 1px;
+}
+.activity-rows-wrap:global(.open) .activity-rows { padding-top: 2px; }
+@media (prefers-reduced-motion: reduce) {
+  .activity-rows-wrap, .activity-chev { transition: none; }
+}
+
+/* Generic expand/collapse animation for a tool's detail and a reasoning body
+   (same grid-track technique as the activity list — animates without a measured
+   pixel height). The clip child must hide overflow and allow shrinking. */
+.disclosure {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows 0.2s var(--ease, ease);
+}
+.disclosure:global(.open) { grid-template-rows: 1fr; }
+.disclosure-clip { overflow: hidden; min-height: 0; }
+@media (prefers-reduced-motion: reduce) {
+  .disclosure { transition: none; }
+}
+
+/* tool-output-code descendants target global innerHTML markdown classes (.md /
+   .code-block, generated by the markdown renderer + DOM-injected code buttons). */
+.tool-output-code :global(.md) { margin: 0; }
+.tool-output-code :global(.code-block) { margin: 0; }
+.tool-output-code :global(.md) pre { margin: 0; border: 0; border-radius: 0; max-height: 320px; }
+
+.file-chip {
+  display: inline-block;
+  font-size: 12px;
+  color: var(--fg-dim);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 2px 8px;
+  margin: 4px 0;
+}
+
+/* --- mermaid diagrams --- */
+.mermaid-block { margin: 8px 0; border: 1px solid var(--border); border-radius: 6px; padding: 10px; background: var(--code-bg); }
+.mermaid-svg { overflow-x: auto; text-align: center; }
+.mermaid-svg svg { max-width: 100%; height: auto; }
+.mermaid-actions { display: flex; gap: 8px; margin-top: 6px; }
+.mermaid-actions button { background: transparent; border: 1px solid var(--border); color: var(--fg-dim); border-radius: 5px; padding: 2px 9px; cursor: pointer; font: inherit; font-size: 12px; }
+.mermaid-actions button:hover { color: var(--fg); }

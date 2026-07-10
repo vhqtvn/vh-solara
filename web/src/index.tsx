@@ -16,7 +16,7 @@ import { installViewport } from "./viewport";
 import { installScrollEdges } from "./lib/scrollEdges";
 import { startPresence } from "./alerts";
 import { refreshProjectSettings } from "./projectSettings";
-import "./styles.css";
+import "./styles/main.css";
 
 // Best-effort: re-fire loadAgents()/loadModels() and retry while agents stay
 // empty, so a flaky first /oc/agent response (OpenCode not yet connected when

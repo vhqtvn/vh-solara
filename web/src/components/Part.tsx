@@ -15,6 +15,7 @@ import { toolLabel, toolSubject } from "../lib/toolLabel";
 import type { Part } from "../types";
 import Icon from "./Icon";
 import Spinner from "./Spinner";
+import styles from "./Part.module.css";
 
 // Map a tool to one of our available Icon glyphs (see Icon.tsx).
 function toolIconName(tool: string): string {
@@ -240,11 +241,11 @@ function downloadSvg(svg: string, name: string) {
 function Mermaid(props: { src: string }) {
   const [svg] = createResource(() => props.src, renderMermaid);
   return (
-    <div class="mermaid-block">
+    <div class={styles["mermaid-block"]}>
       <Show when={svg()} fallback={<pre class="md-raw">{props.src}</pre>}>
-        <div class="mermaid-svg" innerHTML={svg()!} />
+        <div class={styles["mermaid-svg"]} innerHTML={svg()!} />
       </Show>
-      <div class="mermaid-actions">
+      <div class={styles["mermaid-actions"]}>
         <button type="button" onClick={() => void navigator.clipboard?.writeText(props.src)}>
           copy
         </button>
@@ -358,8 +359,8 @@ function ToolBody(props: { text: string }) {
     return null;
   };
   return (
-    <Show when={fenced()} fallback={<pre class="tool-output">{props.text}</pre>}>
-      <div class="tool-output tool-output-code">
+    <Show when={fenced()} fallback={<pre class={styles["tool-output"]}>{props.text}</pre>}>
+      <div class={`${styles["tool-output"]} ${styles["tool-output-code"]}`}>
         <MarkdownHtml text={fenced()!} />
       </div>
     </Show>
@@ -495,27 +496,27 @@ function ToolPart(props: { part: Part; tail?: boolean }) {
     if (expanded()) setRevealed(true);
   });
   return (
-    <div class="tool" classList={{ [status()]: true }}>
+    <div class={styles.tool} classList={{ [status()]: true }}>
       <button type="button" class="tool-head" classList={{ "no-toggle": !hasDetail() }} onClick={toggle}>
         {/* Running tools show the session-list shimmer (smaller); finished/failed
             show a static status dot. */}
-        <Show when={status() === "running"} fallback={<span class="tool-status" />}>
-          <Spinner class="tool-spin" size={10} />
+        <Show when={status() === "running"} fallback={<span class={styles["tool-status"]} />}>
+          <Spinner class={styles["tool-spin"]} size={10} />
         </Show>
-        <span class="tool-ico"><Icon name={toolIconName(tool())} size={13} /></span>
+        <span class={styles["tool-ico"]}><Icon name={toolIconName(tool())} size={13} /></span>
         <span class="tool-name">{toolLabel(tool())}</span>
-        <span class="tool-subject">{expr() || state().title || status()}</span>
+        <span class={styles["tool-subject"]}>{expr() || state().title || status()}</span>
         <Show when={liveDuration()}>
           <span class="tool-dur" classList={{ live: running() }}>{liveDuration()}</span>
         </Show>
         <Show when={hasDetail()}>
-          <span class="tool-chev" classList={{ rot: expanded() }}><Icon name="chevronDown" size={12} /></span>
+          <span class={styles["tool-chev"]} classList={{ rot: expanded() }}><Icon name="chevronDown" size={12} /></span>
         </Show>
         <Show when={openableFile()}>
           <span
             role="button"
             tabindex="0"
-            class="tool-open"
+            class={styles["tool-open"]}
             data-tip="Open in code view"
             aria-label="Open in code view"
             onClick={(e) => { e.stopPropagation(); openFileAt(openableFile()); }}
@@ -530,20 +531,20 @@ function ToolPart(props: { part: Part; tail?: boolean }) {
               nothing (no Match hits) — nothing to flag. Sits left of the fork. */}
           <Switch>
             <Match when={childStatus() === "error"}>
-              <span class="tool-sub-status error" data-tip="error" aria-label="error" />
+              <span class={`${styles["tool-sub-status"]} error`} data-tip="error" aria-label="error" />
             </Match>
             <Match when={childStatus() === "needs-input"}>
-              <span class="tool-sub-status needs-input" data-tip="needs your input — reply to continue" aria-label="needs your input" />
+              <span class={`${styles["tool-sub-status"]} needs-input`} data-tip="needs your input — reply to continue" aria-label="needs your input" />
             </Match>
             <Match when={childStatus() === "working"}>
               <span
-                class="tool-sub-spin"
+                class={styles["tool-sub-spin"]}
                 data-tip={verbLabel() || "working"}
                 aria-label={verbLabel() || "working"}
               >
                 <Spinner size={11} />
                 <Show when={verbLabel()}>
-                  <span class="tool-sub-verb">{verbLabel()}</span>
+                  <span class={styles["tool-sub-verb"]}>{verbLabel()}</span>
                 </Show>
               </span>
             </Match>
@@ -563,11 +564,11 @@ function ToolPart(props: { part: Part; tail?: boolean }) {
           </span>
         </Show>
       </button>
-      <div class="disclosure" classList={{ open: expanded() }}>
-        <div class="disclosure-clip">
+      <div class={styles.disclosure} classList={{ open: expanded() }}>
+        <div class={styles["disclosure-clip"]}>
           <Show when={revealed()}>
             <Show when={expr()}>
-              <pre class="tool-cmd">{exprPrefix()}{expr()}</pre>
+              <pre class={styles["tool-cmd"]}>{exprPrefix()}{expr()}</pre>
             </Show>
             <Show when={output()}>
               <ToolBody text={output()} />
@@ -578,7 +579,7 @@ function ToolPart(props: { part: Part; tail?: boolean }) {
       {/* Diagnostics show even when collapsed — an edit that broke the file
           shouldn't require expanding to notice. */}
       <Show when={diagnostics().length > 0}>
-        <div class="tool-diags">
+        <div class={styles["tool-diags"]}>
           <For each={diagnostics()}>
             {(d) => (
               <div class="tool-diag">
@@ -640,18 +641,18 @@ function ReasoningPart(props: { part: Part; settled: boolean; tail?: boolean }) 
     onCleanup(() => ro.disconnect());
   });
   return (
-    <div class="reasoning" classList={{ open: expanded() }}>
+    <div class={styles.reasoning} classList={{ open: expanded() }}>
       <button type="button" class="tool-head reasoning-head" onClick={toggle}>
-        <span class="tool-ico"><Icon name="help" size={13} /></span>
+        <span class={styles["tool-ico"]}><Icon name="help" size={13} /></span>
         <span class="tool-name">Thinking</span>
-        <span class="tool-subject" />
+        <span class={styles["tool-subject"]} />
         <Show when={elapsed()}>
-          <span class="tool-dur reasoning-time" classList={{ live: live() }}>{elapsed()}</span>
+          <span class={`tool-dur ${styles["reasoning-time"]}`} classList={{ live: live() }}>{elapsed()}</span>
         </Show>
-        <span class="tool-chev" classList={{ rot: expanded() }}><Icon name="chevronDown" size={12} /></span>
+        <span class={styles["tool-chev"]} classList={{ rot: expanded() }}><Icon name="chevronDown" size={12} /></span>
       </button>
-      <div class="disclosure" classList={{ open: expanded() }}>
-        <div class="disclosure-clip">
+      <div class={styles.disclosure} classList={{ open: expanded() }}>
+        <div class={styles["disclosure-clip"]}>
           <Show when={revealed()}>
             <div class="reasoning-body" ref={bodyEl} onScroll={onScroll}>
               <div ref={contentEl}>
@@ -683,7 +684,7 @@ export default function PartView(props: { part: Part; settled?: boolean; tail?: 
         <ToolPart part={p()} tail={props.tail} />
       </Match>
       <Match when={p().type === "file"}>
-        <div class="file-chip">📎 {(p().filename as string) || (p().mime as string)}</div>
+        <div class={styles["file-chip"]}>📎 {(p().filename as string) || (p().mime as string)}</div>
       </Match>
       {/* step-start/finish, snapshot, patch, agent, retry, compaction: omitted in v1 */}
     </Switch>
@@ -709,20 +710,20 @@ export function ActivityGroup(props: { parts: Part[]; settled: boolean; tailId?:
     if (expanded()) setRevealed(true);
   });
   return (
-    <div class="activity">
+    <div class={styles.activity}>
       <button
         type="button"
-        class="activity-head"
+        class={styles["activity-head"]}
         aria-expanded={expanded()}
         onClick={() => setOverride(!expanded())}
       >
         <Icon name="cpu" size={14} />
-        <span class="activity-title">Activity</span>
-        <span class="activity-count">{total()}</span>
-        <span class="activity-chev" classList={{ rot: expanded() }}><Icon name="chevronDown" size={12} /></span>
+        <span class={styles["activity-title"]}>Activity</span>
+        <span class={styles["activity-count"]}>{total()}</span>
+        <span class={styles["activity-chev"]} classList={{ rot: expanded() }}><Icon name="chevronDown" size={12} /></span>
       </button>
-      <div class="activity-rows-wrap" classList={{ open: expanded() }}>
-        <div class="activity-rows">
+      <div class={styles["activity-rows-wrap"]} classList={{ open: expanded() }}>
+        <div class={styles["activity-rows"]}>
           <Show when={revealed()}>
             <For each={props.parts}>
               {(p) => (

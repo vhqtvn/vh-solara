@@ -22,6 +22,7 @@ import {
   type ChannelType,
   type DeviceScope,
 } from "../alertsApi";
+import styles from "./NotificationsSettings.module.css";
 
 const POLICY_LABEL: Record<string, string> = {
   always: "always",
@@ -115,7 +116,7 @@ export default function NotificationsSettings() {
           return (
             <>
               {/* This device --------------------------------------------------- */}
-              <h4 class="settings-group-title">This device</h4>
+              <h4 class={styles["settings-group-title"]}>This device</h4>
               <div class="setting-row">
                 <label>Device name</label>
                 <input
@@ -151,7 +152,7 @@ export default function NotificationsSettings() {
                   <label>OS notifications</label>
                   <Show
                     when={osPerm() !== "granted"}
-                    fallback={<span class="notif-ok">Enabled</span>}
+                    fallback={<span class={styles["notif-ok"]}>Enabled</span>}
                   >
                     <button
                       type="button"
@@ -193,7 +194,7 @@ export default function NotificationsSettings() {
               </Show>
 
               {/* Active profile ------------------------------------------------ */}
-              <h4 class="settings-group-title">Active profile</h4>
+              <h4 class={styles["settings-group-title"]}>Active profile</h4>
               <div class="setting-row">
                 <label>Profile</label>
                 <Select
@@ -214,10 +215,10 @@ export default function NotificationsSettings() {
               </Show>
 
               {/* Channels ------------------------------------------------------ */}
-              <h4 class="settings-group-title">Alert channels</h4>
+              <h4 class={styles["settings-group-title"]}>Alert channels</h4>
               <For each={draft.channels} fallback={<p class="setting-hint">No channels yet.</p>}>
                 {(ch, i) => (
-                  <div class="notif-channel">
+                  <div class={styles["notif-channel"]}>
                     <div class="setting-row">
                       <input
                         class="theme-select"
@@ -253,14 +254,14 @@ export default function NotificationsSettings() {
                       fallback={
                         <>
                           <input
-                            class="theme-select notif-wide"
+                            class={`theme-select ${styles["notif-wide"]}`}
                             aria-label="Webhook URL"
                             placeholder="https://… (or ${VH_ALERT_URL})"
                             value={ch.url}
                             onInput={(e) => editChannel(i(), { url: e.currentTarget.value })}
                           />
                           <input
-                            class="theme-select notif-wide"
+                            class={`theme-select ${styles["notif-wide"]}`}
                             type="password"
                             aria-label="HMAC secret"
                             placeholder={ch.hasSecret ? "•••••• (unchanged — type to replace)" : "HMAC secret (optional)"}
@@ -271,14 +272,14 @@ export default function NotificationsSettings() {
                       }
                     >
                       <input
-                        class="theme-select notif-wide"
+                        class={`theme-select ${styles["notif-wide"]}`}
                         aria-label="Command"
                         placeholder="/path/to/notify.sh (or ${VH_ALERT_CMD})"
                         value={ch.command || ""}
                         onInput={(e) => editChannel(i(), { command: e.currentTarget.value })}
                       />
                       <input
-                        class="theme-select notif-wide"
+                        class={`theme-select ${styles["notif-wide"]}`}
                         aria-label="Command arguments"
                         placeholder="arguments, space-separated (optional)"
                         value={(ch.args || []).join(" ")}
@@ -319,8 +320,8 @@ export default function NotificationsSettings() {
               </p>
 
               {/* Advanced ------------------------------------------------------ */}
-              <button type="button" class="notif-advanced-toggle" onClick={() => setAdvanced((v) => !v)}>
-                <span class="notif-caret" classList={{ open: advanced() }}><Icon name="chevronDown" size={13} /></span>
+              <button type="button" class={styles["notif-advanced-toggle"]} onClick={() => setAdvanced((v) => !v)}>
+                <span class={styles["notif-caret"]} classList={{ open: advanced() }}><Icon name="chevronDown" size={13} /></span>
                 Detection thresholds
               </button>
               <Show when={advanced()}>
@@ -337,10 +338,10 @@ export default function NotificationsSettings() {
               </Show>
 
               <Show when={note()}>
-                {(n) => <p class="setting-note" classList={{ ok: n().ok, err: !n().ok }}>{n().msg}</p>}
+                {(n) => <p class={styles["setting-note"]} classList={{ ok: n().ok, err: !n().ok }}>{n().msg}</p>}
               </Show>
               <Show when={!cfg.loading && !config()}>
-                <p class="setting-note err">
+                <p class={`${styles["setting-note"]} err`}>
                   Alerts engine unavailable. <button type="button" class="link-btn" onClick={() => void refetch()}>Retry</button>
                 </p>
               </Show>

@@ -1,6 +1,7 @@
 import { createEffect, createSignal, onCleanup, Show } from "solid-js";
 import { state, consumeEpochChanged } from "../sync";
 import Icon from "./Icon";
+import styles from "./ConnectionToast.module.css";
 
 // A transient toast for sync health: warns when the live stream drops (the
 // store auto-reconnects in the background), and briefly confirms when it
@@ -56,7 +57,7 @@ export default function ConnectionToast() {
 
   return (
     <Show when={toast()}>
-      <div class="conn-toast" classList={{ [toast()!.kind]: true }} role="status">
+      <div class={styles["conn-toast"]} classList={{ [toast()!.kind]: true }} role="status">
         <Icon name={toast()!.kind === "warn" ? "help" : "check"} size={15} />
         <span>{toast()!.text}</span>
       </div>

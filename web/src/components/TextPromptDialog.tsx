@@ -1,5 +1,6 @@
 import { createEffect, createSignal, Show } from "solid-js";
 import Icon from "./Icon";
+import styles from "./TextPromptDialog.module.css";
 
 // A DOM text-input dialog replacing window.prompt (which spawns a separate OS
 // window under tiling WMs). Desktop-centered / mobile bottom-sheet via CSS.
@@ -44,7 +45,7 @@ export default function TextPromptDialog(props: {
           </div>
           <div class="dialog-body">
             <Show when={props.label}>
-              <label class="vh-prompt-label">{props.label}</label>
+              <label class={styles["vh-prompt-label"]}>{props.label}</label>
             </Show>
             <input
               ref={inputRef}

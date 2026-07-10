@@ -1,0 +1,35 @@
+/* Non-intrusive "a new version is available" banner (PWA update).
+   `.update-toast` is kept :global because e2e (layout.spec:152/156/157) queries
+   it by the literal class selector; the -text/-btn helpers are sole-owned and
+   not queried by any test, so they stay scoped. `dialog-in` is a shared global
+   keyframe (defined in legacy.css). */
+:global(.update-toast) {
+  position: fixed;
+  left: 50%;
+  bottom: calc(18px + env(safe-area-inset-bottom));
+  transform: translateX(-50%);
+  z-index: 80;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  box-shadow: var(--shadow-lg, 0 12px 32px rgba(0, 0, 0, 0.45));
+  padding: 8px 8px 8px 14px;
+  max-width: calc(100vw - 24px);
+  animation: dialog-in 0.16s var(--ease, ease);
+}
+.update-toast-text { font-size: 13px; }
+.update-toast-btn {
+  border: 0;
+  background: var(--accent);
+  color: var(--accent-fg);
+  font-weight: 600;
+  border-radius: 999px;
+  padding: 6px 14px;
+  cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+}
+.update-toast-btn:hover { filter: brightness(1.08); }

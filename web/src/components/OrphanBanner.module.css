@@ -1,0 +1,25 @@
+/* Orphaned-sessions banner (parent root archived; surfaced so they can be cleaned up). */
+.orphan-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 4px 8px;
+  padding: 6px 10px;
+  border: 1px solid color-mix(in srgb, var(--warn) 45%, var(--border));
+  background: color-mix(in srgb, var(--warn) 12%, transparent);
+  border-radius: 8px;
+  font-size: var(--text-sm);
+}
+.orphan-banner-text { display: inline-flex; align-items: center; gap: 6px; color: var(--fg); flex: 1; }
+.orphan-banner-btn {
+  flex: none;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--fg);
+  border-radius: 6px;
+  padding: 3px 10px;
+  cursor: pointer;
+}
+.orphan-banner-btn:hover { background: color-mix(in srgb, var(--fg) 10%, transparent); }
+.orphan-root { display: block; font-size: 11px; color: var(--fg-dim); }
+.orphan-root-active { color: var(--warn); }

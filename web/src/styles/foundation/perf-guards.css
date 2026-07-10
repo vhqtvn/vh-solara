@@ -1,0 +1,41 @@
+/* foundation/perf-guards.css — Firefox/WebRender GPU guardrails (documentation).
+ *
+ * This file carries NO rules. It exists to pin the binding performance
+ * constraints (from AGENTS.md → "Web frontend performance — Firefox/WebRender
+ * GPU gotchas") at the top of the cascade where every future migration can see
+ * them. The patterns below MUST NOT be (re)introduced on large, scrolling, or
+ * always-present surfaces — they can pin a GPU to ~99°C while looking innocent.
+ *
+ * The UI runs on the user's GPU. Firefox/WebRender punishes a few CSS patterns
+ * far harder than Chromium. Avoid these on large/scrolling/always-present
+ * surfaces (the chat scroll, message list, reasoning body):
+ *
+ *   1. mask-image / -webkit-mask on a SCROLL CONTAINER — WORST offender.
+ *      Forces the whole scrollable content onto an offscreen surface and
+ *      re-rasterizes it on every scroll frame. A gradient edge-fade mask on
+ *      .chat-scroll / .reasoning-body re-rasterized the entire transcript on
+ *      every scroll frame ("scroll and the temp climbs"). It was the actual
+ *      culprit behind a long heat saga; removed (see lib/scrollEdges.ts).
+ *   2. backdrop-filter: blur(...) on overlays — re-blurs the backdrop every
+ *      frame (removed from .restart-overlay).
+ *   3. per-element contain: paint / content-visibility: auto — made it WORSE
+ *      on Firefox WebRender (each becomes a compositing surface/blob; too many
+ *      blow past the GPU surface budget into a stuck-hot state). Not a fix.
+ *   4. per-frame work scales with total DOM — a repaint/animation can trigger
+ *      a full-document display-list rebuild, so cap streaming re-render rate
+ *      (the live markdown stream is coalesced to ~5fps in components/Part.tsx)
+ *      and prefer cheap DOM ops (lib/streamMd.ts appends text nodes; never
+ *      rewrites a growing node).
+ *
+ * Diagnosing: a bare repro page often won't reproduce it — the cost is the real
+ * app's complex scene. Capture a Firefox profiler trace and look under
+ *   Update the rendering → Paint
+ * for ViewportFrame::BuildDisplayList (display list) vs Grouper/GetBlobItemData
+ * (blob raster). Headless browsers do not GPU-rasterize, so they cannot
+ * reproduce the heat.
+ *
+ * NOTE on the .scan rule in legacy.css: it uses a static -webkit-mask/mask
+ * (radial-gradient) on a small status indicator, NOT a scroll container, and it
+ * is NOT animated via the mask. That pre-existing usage is acceptable and is
+ * intentionally NOT touched in this slice.
+ */

@@ -1,0 +1,47 @@
+/* Header view-tab bar (priority+ overflow). Scoped from legacy.css.
+   .tabbar-tab / .tabbar-tab.on / .tabbar-tab.icon stay :global — queried by
+   e2e (theme.spec.ts: ".tabbar-tab.on"). .seg is a shared global primitive. */
+
+.tabbar {
+  flex: 1 1 auto; min-width: 0; position: relative;
+  display: flex; align-items: center; justify-content: flex-end; gap: 6px;
+}
+.tabbar-row { min-width: 0; }
+.tabbar .tabbar-row:global(.seg) { overflow: visible; max-width: none; margin-left: 0; }
+/* Hidden row used only to measure natural item widths. */
+.tabbar-measure {
+  position: absolute; left: 0; top: 0; visibility: hidden; pointer-events: none;
+  white-space: nowrap; max-width: none;
+}
+:global(.tabbar-tab) {
+  background: transparent; border: 0; color: var(--fg-dim); cursor: pointer;
+  font: inherit; font-size: 13px; padding: 4px 12px; white-space: nowrap; border-radius: 6px;
+  display: inline-flex; align-items: center; gap: 6px;
+}
+:global(.tabbar-tab.on) { background: var(--accent); color: var(--accent-fg); font-weight: 600; }
+:global(.tabbar-tab.icon) { padding: 5px 9px; }
+.tabbar-ico { display: inline-flex; }
+.tabbar-overflow { position: relative; flex: 0 0 auto; }
+.tabbar-more {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 30px; height: 28px; padding: 0; border: 0; border-radius: 6px;
+  background: transparent; color: var(--fg-dim); cursor: pointer;
+}
+.tabbar-more:hover, .tabbar-more:global(.on) { color: var(--fg); background: var(--bg-2); }
+.tabbar-more:global(.on) { color: var(--accent); }
+.tabbar-menu {
+  position: absolute; top: calc(100% + 4px); right: 0; z-index: 60; min-width: 150px;
+  display: flex; flex-direction: column; padding: 4px;
+  background: var(--bg-2); border: 1px solid var(--border); border-radius: 8px;
+  box-shadow: var(--shadow-lg, 0 12px 40px #0009);
+}
+.tabbar-menu-item {
+  display: flex; align-items: center; gap: 8px; text-align: left; width: 100%;
+  background: transparent; border: 0; color: var(--fg); cursor: pointer;
+  font: inherit; font-size: 13px; padding: 7px 9px; border-radius: 6px;
+}
+.tabbar-menu-item:hover { background: var(--bg); }
+.tabbar-menu-item:global(.on) { color: var(--accent); font-weight: 600; }
+.tabbar-select { min-width: 120px; }
+.tabbar-more { gap: 2px; width: auto; padding: 0 7px; }
+.tabbar-more-dots { font-size: 11px; letter-spacing: 1px; line-height: 1; }

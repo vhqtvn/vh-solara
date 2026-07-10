@@ -1,0 +1,43 @@
+/* Notifications settings page. Scoped from legacy.css.
+   .setting-row / .theme-select / .setting-hint / .btn / .btn-primary /
+   .link-btn / .icon-btn are shared primitives that stay global in legacy.css.
+   .ok / .err / .open are shared global modifiers used on scoped classes here. */
+
+.settings-group-title {
+  margin: 18px 0 4px;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--fg-dim);
+}
+.settings-group-title:first-child { margin-top: 0; }
+.setting-note { font-size: 12px; margin: 8px 0; }
+.setting-note:global(.ok) { color: var(--accent); }
+.setting-note:global(.err) { color: var(--danger, #e5534b); }
+.notif-channel {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin: 8px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.notif-channel :global(.setting-row) { padding: 2px 0; }
+.notif-wide { width: 100%; box-sizing: border-box; }
+.notif-ok { color: var(--accent); font-size: 13px; }
+.notif-advanced-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: none;
+  border: 0;
+  color: var(--fg);
+  cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+  margin: 16px 0 4px;
+  padding: 0;
+}
+.notif-caret { display: inline-flex; transition: transform 0.15s ease; transform: rotate(-90deg); }
+.notif-caret:global(.open) { transform: rotate(0deg); }

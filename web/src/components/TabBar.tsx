@@ -2,6 +2,7 @@ import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show }
 import { tabStyle } from "../prefs";
 import Icon from "./Icon";
 import Select from "./Select";
+import styles from "./TabBar.module.css";
 
 export interface TabItem {
   key: string;
@@ -81,7 +82,7 @@ export default function TabBar(props: { items: () => TabItem[]; active: () => st
   const tabBtn = (it: TabItem, inMenu = false) => (
     <button
       type="button"
-      class={inMenu ? "tabbar-menu-item" : "tabbar-tab"}
+      class={inMenu ? styles["tabbar-menu-item"] : "tabbar-tab"}
       classList={{ on: props.active() === it.key, icon: !inMenu && tabStyle() === "icons" }}
       data-tip={!inMenu && tabStyle() === "icons" ? it.label : undefined}
       aria-label={it.label}
@@ -91,7 +92,7 @@ export default function TabBar(props: { items: () => TabItem[]; active: () => st
       }}
     >
       <Show when={(inMenu || tabStyle() === "icons") && it.icon}>
-        <span class="tabbar-ico"><Icon name={it.icon!} size={14} /></span>
+        <span class={styles["tabbar-ico"]}><Icon name={it.icon!} size={14} /></span>
       </Show>
       <Show when={inMenu || tabStyle() !== "icons"}>
         <span class="tabbar-label">{it.label}</span>
@@ -104,7 +105,7 @@ export default function TabBar(props: { items: () => TabItem[]; active: () => st
       when={tabStyle() !== "dropdown"}
       fallback={
         <Select
-          class="tabbar-select"
+          class={styles["tabbar-select"]}
           ariaLabel="View"
           value={props.active()}
           options={props.items().map((it) => ({ value: it.key, label: it.label }))}
@@ -112,32 +113,32 @@ export default function TabBar(props: { items: () => TabItem[]; active: () => st
         />
       }
     >
-      <div class="tabbar" classList={{ icons: tabStyle() === "icons" }} ref={wrapEl}>
-        <div class="tabbar-row seg" ref={rowEl}>
+      <div class={styles.tabbar} classList={{ icons: tabStyle() === "icons" }} ref={wrapEl}>
+        <div class={`${styles["tabbar-row"]} seg`} ref={rowEl}>
           <For each={visible()}>{(it) => tabBtn(it)}</For>
         </div>
         <Show when={hidden().length > 0}>
-          <div class="tabbar-overflow">
+          <div class={styles["tabbar-overflow"]}>
             <button
               type="button"
-              class="tabbar-more"
+              class={styles["tabbar-more"]}
               classList={{ on: hidden().some((it) => it.key === props.active()) }}
               aria-label="More views"
               data-tip="More views"
               onClick={(e) => { e.stopPropagation(); setMenuOpen((v) => !v); }}
             >
-              <span class="tabbar-more-dots">•••</span>
+              <span class={styles["tabbar-more-dots"]}>•••</span>
               <Icon name="chevronDown" size={11} />
             </button>
             <Show when={menuOpen()}>
-              <div class="tabbar-menu">
+              <div class={styles["tabbar-menu"]}>
                 <For each={hidden()}>{(it) => tabBtn(it, true)}</For>
               </div>
             </Show>
           </div>
         </Show>
         {/* Hidden measuring row: all items at natural width (never wraps). */}
-        <div class="tabbar-row seg tabbar-measure" ref={measureEl} aria-hidden="true">
+        <div class={`${styles["tabbar-row"]} seg ${styles["tabbar-measure"]}`} ref={measureEl} aria-hidden="true">
           <For each={props.items()}>{(it) => tabBtn(it)}</For>
         </div>
       </div>

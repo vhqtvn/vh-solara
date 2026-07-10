@@ -1,0 +1,24 @@
+/* Empty-state invitation screens. NOTE: these classes are NOT sole-owned —
+   both EmptyState.tsx AND NoProjectState.tsx render identical `.empty*` markup,
+   so every class is :global and both components keep their plain string class
+   names. EmptyState.tsx imports this module for its side effect (the global CSS
+   is emitted app-wide once loaded). The `empty-float` keyframes stays global in
+   legacy.css (referenced here as a global animation name). */
+:global(.empty) { flex: 1; display: grid; place-items: center; padding: var(--s-5); }
+:global(.empty-card) { display: flex; flex-direction: column; align-items: center; text-align: center; max-width: 360px; }
+:global(.empty-mark) { width: 64px; height: 64px; color: var(--accent); margin-bottom: var(--s-3); animation: empty-float 4s var(--ease) infinite; }
+:global(.empty-title) { margin: 0 0 6px; font-size: var(--text-lg); font-weight: 650; letter-spacing: -0.01em; }
+:global(.empty-sub) { margin: 0 0 var(--s-4); color: var(--fg-dim); }
+:global(.empty-cta) {
+  display: inline-flex; align-items: center; gap: 6px;
+  background: var(--accent); color: var(--accent-fg); border: 0;
+  border-radius: var(--radius); padding: 8px 16px; font: inherit; font-weight: 600; cursor: pointer;
+  transition: transform 0.08s var(--ease), filter 0.12s var(--ease);
+}
+:global(.empty-cta):hover { filter: brightness(1.08); }
+:global(.empty-cta):active { transform: scale(0.96); }
+:global(.empty-tips) { display: flex; flex-wrap: wrap; gap: var(--s-3); justify-content: center; margin-top: var(--s-5); color: var(--fg-dim); font-size: var(--text-xs); }
+:global(.empty-tips) kbd {
+  font-family: var(--font-mono); font-size: 10px;
+  background: var(--bg-2); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; color: var(--fg);
+}

@@ -3,6 +3,7 @@ import { orphanSessions, rootInfoFor, type RootInfo } from "../orphans";
 import { archiveSession } from "../archive";
 import type { Session } from "../types";
 import Icon from "./Icon";
+import styles from "./OrphanBanner.module.css";
 
 // A banner that surfaces orphaned sessions (parent root archived) so they're
 // known, plus a confirmed bulk-archive that shows each orphan's root and whether
@@ -37,12 +38,12 @@ export default function OrphanBanner() {
 
   return (
     <Show when={orphans().length > 0}>
-      <div class="orphan-banner">
-        <span class="orphan-banner-text">
+      <div class={styles["orphan-banner"]}>
+        <span class={styles["orphan-banner-text"]}>
           <Icon name="help" size={13} /> {orphans().length} orphaned{" "}
           {orphans().length === 1 ? "session" : "sessions"}
         </span>
-        <button type="button" class="orphan-banner-btn" onClick={() => void openDialog()}>
+        <button type="button" class={styles["orphan-banner-btn"]} onClick={() => void openDialog()}>
           Archive orphans
         </button>
       </div>
@@ -67,7 +68,7 @@ export default function OrphanBanner() {
                   {(r) => (
                     <li>
                       <span class="confirm-title">{r.orphan.title || r.orphan.id}</span>
-                      <span class="orphan-root" classList={{ "orphan-root-active": !!r.root && !r.root.archived }}>
+                      <span class={styles["orphan-root"]} classList={{ [styles["orphan-root-active"]]: !!r.root && !r.root.archived }}>
                         root: {r.root ? r.root.title : "resolving…"}
                         {r.root ? (r.root.archived ? " · archived" : " · ACTIVE") : ""}
                       </span>

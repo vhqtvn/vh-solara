@@ -1,0 +1,14 @@
+/* Text-prompt dialog input. */
+/* .vh-prompt-input is :global because e2e tests query it directly
+   (interactive.spec.ts, projects.spec.ts: page.locator(".vh-prompt-input")). */
+.vh-prompt-label { display: block; font-size: var(--text-sm); color: var(--fg-dim); margin-bottom: 6px; }
+:global(.vh-prompt-input) {
+  width: 100%;
+  background: var(--bg-input, #0d1117);
+  border: 1px solid var(--border);
+  color: var(--fg);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font: inherit;
+}
+:global(.vh-prompt-input):focus { outline: none; border-color: var(--accent); }
