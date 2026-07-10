@@ -11,10 +11,18 @@
  *   foundation/typography.css   body { background; color; font }.  (303-307)
  *   foundation/z-index.css     documentation only (see file).      (new)
  *   foundation/perf-guards.css documentation only (see file).      (new)
- *   legacy/*.css              everything else, in original order. (309-4599)
- *                            Stage 1 split legacy.css into ordered source-
- *                            order shards under legacy/ (00- through 80-);
- *                            concatenating them reproduces legacy.css verbatim.
+ *   legacy/*.css              the remaining CSS, in original order. There is NO
+ *                            single legacy.css file: it was split (Stage 1)
+ *                            into 10 ordered source-preserving shards under
+ *                            legacy/ — 00-app-globals, 10-sidebar-statusmark,
+ *                            20-session-tree, 30-main-terminal, 40-chat-stream
+ *                            (HOT PATH), 50-chat-overlays, 60-notifications-
+ *                            inspector, 65-sessions-notes-servers, 70-composer-
+ *                            diff-git, 80-professional-pass (LATE override,
+ *                            imported LAST). Concatenating the shards in import
+ *                            order reproduces the former legacy.css verbatim, so
+ *                            cascade behavior is unchanged. See main.css below
+ *                            for the ordered @import list.
  *
  * The component islands, markdown/chat/streaming hot paths, overlays, late
  * overrides and the bottom "Professional design pass" :root block ALL still

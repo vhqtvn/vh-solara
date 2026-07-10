@@ -401,7 +401,7 @@ It lets an operator:
   removes the generated artifacts and returns to the true cold-fallback embed
   state (placeholder.html only).
 - Full build (Node ≥ 24): `make build` (or `make web` for the SPA only).
-- SPA unit tests: `cd web && npx vitest run`. Typecheck: `npm run typecheck`.
+- SPA unit tests: `cd web && npm run test:unit` (preferred over bare `npx vitest run`, which from the repo root can resolve to a cached vitest that lacks the project jsdom config). Typecheck: `npm run typecheck`.
 - Playwright e2e: `cd web && export PATH=$PATH:/usr/local/go/bin && npx playwright
   test` (the `webServer` runs `scripts/fixture-web.sh`, which builds the SPA and
   `go run ./tools/fixtureserver`, so go must be on PATH). The e2e suite is serial

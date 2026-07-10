@@ -18,14 +18,24 @@ AI-first architecture. The single entrypoint is imported once from `index.tsx`.
 web/src/
 ├── index.tsx                 # imports "./styles/main.css" once
 └── styles/
-    ├── main.css              # single entrypoint; @imports foundation then legacy.css
+    ├── main.css              # single entrypoint; @imports foundation then the legacy shards in order
     ├── foundation/
     │   ├── tokens.css        # :root vars + theme-* class vars + --z-* ladder
     │   ├── reset.css         # CSS reset
     │   ├── typography.css    # global typography
     │   ├── z-index.css       # documentation-only z-index reference
     │   └── perf-guards.css   # documentation-only performance guardrails
-    └── legacy.css            # transitional remainder (~3,565 lines, shrinking)
+    └── legacy/               # former legacy.css, split into 10 ordered source-preserving shards
+        ├── 00-app-globals.css              # .app + user-select globals
+        ├── 10-sidebar-statusmark.css       # sidebar chrome + status-mark glyph + keyframes
+        ├── 20-session-tree.css             # tree, dots, session-search, icon-btn, vh-select
+        ├── 30-main-terminal.css            # .main, term-dock, main-head, main-body
+        ├── 40-chat-stream.css              # HOT PATH: .chat, .chat-scroll, .msg, .md, .reasoning-body
+        ├── 50-chat-overlays.css            # jump, chat-live, msg-error, perm-*, usage, status-pop, admin-menu
+        ├── 60-notifications-inspector.css  # notifications, session inspector, project switcher
+        ├── 65-sessions-notes-servers.css   # sidebar-foot, archived, ctxm, confirm, notes/todos, servers
+        ├── 70-composer-diff-git.css        # composer/tasks, diff, git, staging, dialogs, model-rows, settings
+        └── 80-professional-pass.css        # LATE professional design pass + appended features (imported LAST)
 └── components/
     └── Component.tsx         # component-owned
     └── Component.module.css  # co-located scoped styles
@@ -37,11 +47,15 @@ Layer responsibilities:
 |-------|-----------------|-----------|
 | `foundation/` | Global tokens, theme, z-index, reset, typography, perf-guards | App-wide foundation — changed rarely, deliberately |
 | `Component.module.css` | Component-owned scoped styles, co-located beside the `*.tsx` | Owned by that component |
-| `legacy.css` | Transitional remainder — rules not yet carved out into modules | Shrinking; each carve removes a region |
+| `legacy/` (10 shards) | Transitional remainder — rules not yet carved out into modules | Shrinking; each carve removes a region from a shard |
 
-`main.css` imports the foundation files then `legacy.css` **in original source
-order**, so the refactor changed zero cascade behavior — it only moved bytes and
-added scoping where safe.
+`main.css` imports the foundation files then the 10 `legacy/` shards **in
+original source order**. The Stage 1 shard split was cascade-safe: concatenating
+the shards in import order reproduced the former `legacy.css` **byte-for-byte**
+(used as the mechanical control), so it moved bytes and added scoping where safe
+without changing cascade behavior. `legacy.css` as a single file no longer exists
+— it is the logical name for the ordered `legacy/` shard set. 24 components now
+own their own modules (17 original + 7 Stage 2 Batch 1).
 
 > Note: `@layer` is currently shipped as a **comment**, not active. See
 > "Open follow-ups" for why promoting it is cascade-sensitive.
@@ -70,7 +84,7 @@ Rules:
 ## 3. The 8 migration carry-forward rules
 
 These are the hard-won AI-first guidance distilled from the actual migration.
-Follow them when carving a region out of `legacy.css` into a module.
+Follow them when carving a region out of the legacy shards into a module.
 
 1. **Test-queried classes stay `:global`.** For each class, grep **both**
    `web/tests/e2e/*.spec.ts` **and** `web/tests/unit/*.test.tsx`. If **any** test
@@ -86,10 +100,12 @@ Follow them when carving a region out of `legacy.css` into a module.
 
 3. **Shared keyframes stay global.** Migrate a `@keyframes` local **only if** it
    is sole-owned **and** all referrers move with it. Shared keyframes
-   (`dialog-in`, `empty-float`, `spin`, `pulse`, …) stay in `legacy.css`.
+   (`dialog-in`, `empty-float`, `spin`, `pulse`, …) stay in the legacy shards
+   (typically `10-sidebar-statusmark.css` for chrome animations).
 
-4. **Re-read `legacy.css` from disk before each carve.** Line numbers shift as
-   regions are removed. Never carve from a stale copy.
+4. **Re-read the relevant shard from disk before each carve.** Line numbers
+   shift as regions are removed and shards are carved down. Never carve from a
+   stale copy.
 
 5. **Side-effect import for shared markup.** If a component's class markup is
    reused by another component (e.g. `EmptyState`'s `.empty*` reused by
@@ -101,10 +117,15 @@ Follow them when carving a region out of `legacy.css` into a module.
    `.tooltip-text` stay scoped. UpdateToast: `.update-toast` is `:global` but
    `-text` / `-btn` stay scoped.
 
-7. **Deferred-after-recon is a GOOD outcome.** Do NOT force a migration that
-   needs contortions. A component that is 100% `:global` (e.g. `ProjectSwitcher`:
-   all `proj-*` e2e-queried) gives **zero scoping benefit** — leave it in
-   `legacy.css`.
+7. **A 100%-`:global` module can still be worth migrating** — for
+   **concurrent-edit conflict isolation** and **locate-ability**, not just CSS
+   scoping. This rule was **reframed** from its original "zero scoping benefit →
+   leave it in `legacy.css`": a component whose classes are all `:global` (e.g.
+   `ProjectSwitcher`: all `proj-*` e2e-queried) still benefits from owning its
+   own module file, because multiple agents editing CSS concurrently no longer
+   fight over a shared shard and a reader can locate the component's rules
+   without grepping the whole legacy set. Do NOT force migrations that need
+   contortions — but do not reject a clean move solely on "it's all `:global`".
 
 8. **Shared keyframe references from modules use the bare global animation name.**
    This project's Vite/postcss-modules resolves bare names to global keyframes
@@ -117,25 +138,37 @@ A short, repeatable procedure:
 
 1. **Determine sole-ownership.** Grep all of `web/src` for the component's
    classes. A class used only by this component is a carve candidate.
-2. **Find test selectors.** Grep `web/tests/e2e/*.spec.ts` **and**
+2. **Competition check (Stage 2 criterion).** A selector is migratable only if
+   **ALL** of its rules can move into the module together. Grep the late
+   override shard (`80-professional-pass.css`) for any rule on the same
+   selectors — a competing override you cannot account for means the move would
+   silently change precedence. If an unaccounted competitor exists, defer; do not
+   move a partial rule set.
+3. **Find test selectors.** Grep `web/tests/e2e/*.spec.ts` **and**
    `web/tests/unit/*.test.tsx` for global-selector queries on those classes.
-3. **Create `Component.module.css`.** Scope sole-owned, non-test-queried classes.
+4. **Create `Component.module.css`.** Scope sole-owned, non-test-queried classes.
    Mark shared and test-queried classes as `:global(...)`.
-4. **Update the TSX.** Add `import styles from "./Component.module.css"` and
+5. **Update the TSX.** Add `import styles from "./Component.module.css"` and
    switch scoped class refs to `styles["name"]`. Leave global classes as literal
    strings (SolidJS `class=`/`classList=` — **not** React `className`).
-5. **Carve the rules out of `legacy.css`.** Re-read `legacy.css` from disk first
-   (rule 4); line numbers have shifted.
-6. **Verify** (see next section).
+6. **Carve the rules out of the legacy shard.** Re-read the relevant shard from
+   disk first (rule 4); line numbers have shifted.
+7. **Verify** (see next section).
 
 ## 5. Verification commands (per slice)
 
 ```bash
 cd web && npm run typecheck
-cd web && npx vitest run
+cd web && npm run test:unit
 cd web && npx vite build
 cd web && export PATH=$PATH:/usr/local/go/bin && npx playwright test <relevant.spec.ts>
 ```
+
+> **Vitest command note:** the canonical unit-test command is
+> `cd web && npm run test:unit` (= `vitest run` via the project's local config).
+> Prefer it over bare `npx vitest run`: running `npx vitest` from the repo root
+> (or with a stale/cached resolver) can pick up a vitest that does not see the
+> project's jsdom config, so tests fail with a missing-`jsdom`/environment error.
 
 Typecheck + vitest + vite build + targeted e2e is the **sufficient net** for a
 CSS-module migration. The reasoning: such a change only moves bytes verbatim and
@@ -186,11 +219,11 @@ there, not better — each becomes a compositing surface.)
 
 ## 8. Hot paths (deliberate-legacy) — what was NOT migrated and why
 
-The following stay **global** in `legacy.css`. They were deliberately deferred
-because scoping provides no benefit or because they are high-risk GPU surfaces
-that warrant a dedicated session.
+The following stay **global** in the legacy shards (mostly the `40-chat-stream.css`
+hot path). They were deliberately deferred because scoping provides no benefit or
+because they are high-risk GPU surfaces that warrant a dedicated session.
 
-| Class / group | Why it stays global in `legacy.css` |
+| Class / group | Why it stays global in the legacy shards |
 |---------------|--------------------------------------|
 | `.md` + `.md *` | innerHTML-generated markdown typography — styles raw elements (`h1`/`p`/`a`/`code`); scoping has no benefit |
 | `.md-raw` | shared with `GitView.tsx` |
@@ -208,10 +241,12 @@ deferred because each is cascade-sensitive, not mechanical.
   layer-order beats specificity and `!important` resolves earliest-layer-first.
   Concrete regression risk: `:root.theme-light-scoped .vh-diff-*` would lose to
   plain legacy `.vh-diff-*`. Do this carefully, later.
-- **Fold the "Professional design pass" `:root` token cluster** (legacy
-  ~3096–3171) into `tokens.css`. These come **late in source order** to override
-  the original tokens, so the move is cascade-sensitive, not mechanical — the
-  relocation must preserve the override precedence.
-- **Continue carving `legacy.css`** for remaining shared-chrome-entangled
+- **Fold the "Professional design pass" `:root` token cluster** into
+  `tokens.css`. These live in the late `80-professional-pass.css` shard and come
+  **late in source order** to override the original tokens, so the move is
+  cascade-sensitive, not mechanical — the relocation must preserve the override
+  precedence (this is the same "unaccounted competitor" surface that the Stage 2
+  competition check in §4 guards against).
+- **Continue carving the legacy shards** for remaining shared-chrome-entangled
   components (command palette, model dialog, session inspector/tree, git view,
   etc.) when their shared-primitive seams become clear.
