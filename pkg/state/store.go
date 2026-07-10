@@ -2258,23 +2258,31 @@ func (s *Store) LoadedSessions() []string {
 	return out
 }
 
-// MarkColdFetchStart records that a background full-history GET is in flight
-// for the given session. Live events that arrive while the flag is set tag
-// their entries (liveTouchedBody / liveTouchedParts) so the subsequent
-// cold-load reconcile (SetSessionMessages) preserves the newer live body
-// instead of clobbering it with the stale fetched one (C-F2). Called by the
-// aggregator's EnsureMessagesAsync before the GET; cleared by
-// reconcileMessagesLocked after the cold merge completes, or by
-// ClearColdFetchActive if the GET fails before a reconcile runs.
+// MarkColdFetchStart records that a full-history GET is in flight for the given
+// session. Live events that arrive while the flag is set tag their entries
+// (liveTouchedBody / liveTouchedParts) so the subsequent cold-load reconcile
+// (SetSessionMessages) preserves the newer live body instead of clobbering it
+// with the stale fetched one (C-F2). Called by BOTH aggregator cold-load paths
+// before the GET — EnsureMessagesAsync (the async first-open path, a853677) and
+// EnsureMessages (the synchronous GET /vh/snapshot path, bf88e7e) — each setting
+// it after the IsMessagesLoaded early-return and before client.Messages. It is
+// cleared on success by reconcileMessagesLocked after the cold merge completes,
+// and on failure by ClearColdFetchActive in the winner's defer (no reconcile
+// runs to clear it).
 func (s *Store) MarkColdFetchStart(sessionID string) {
 	s.mu.Lock()
 	s.coldFetchActive[sessionID] = true
 	s.mu.Unlock()
 }
 
-// ClearColdFetchActive removes the in-flight marker for a session whose cold
-// GET failed (no reconcile will run to clear it). Idempotent — a successful
-// reconcile already cleared it.
+// ClearColdFetchActive removes the in-flight cold-fetch marker for a session.
+// Called UNCONDITIONALLY in the winner's defer of BOTH cold-load paths
+// (EnsureMessages and EnsureMessagesAsync): on GET failure it is the only clear
+// (no reconcile runs to clear it), and on success it is idempotent — the
+// cold-load reconcile (reconcileMessagesLocked) already cleared the marker
+// inside SetSessionMessages. This keeps a transient gap event between a failed
+// GET and its retry from being wrongly preserved by the next successful
+// reconcile.
 func (s *Store) ClearColdFetchActive(sessionID string) {
 	s.mu.Lock()
 	delete(s.coldFetchActive, sessionID)

@@ -722,3 +722,222 @@ func TestHydrateSwallowsEnrichmentErrors(t *testing.T) {
 		t.Fatalf("ListPermissions side-effect must survive ListQuestions' failure: demo permissions want 1, got %d", got)
 	}
 }
+
+// TestEnsureMessagesSyncFailureEmitsErrorAndRetries mirrors
+// TestEnsureMessagesAsyncFailureEmitsError for the SYNC EnsureMessages path. On a
+// failed upstream GET the sync winner must: return the error to the caller, emit
+// messages.error, clear the in-flight slot (so the failure path does not strand a
+// reselect), and leave the session unloaded — so a second call issues a fresh GET
+// (genuine retry, not a silent no-op on a stale slot).
+//
+// coldFetchActive note: pkg/state/store.go's coldFetchActive map is unexported
+// with no accessor (this slice is comment-only on store.go), so we assert the
+// in-flight slot is cleared instead. That transitively proves ClearColdFetchActive
+// ran: the sync defer (aggregator.go ~216-224) clears the slot AND calls
+// ClearColdFetchActive unconditionally in the same critical section. The async
+// mirror test asserts the same way.
+func TestEnsureMessagesSyncFailureEmitsErrorAndRetries(t *testing.T) {
+	// Count the full-fetch requests (no ?limit=, exactly what client.Messages
+	// issues) so the test can prove the retry actually re-issues an upstream
+	// fetch rather than short-circuiting on a stale in-flight slot.
+	var (
+		mu        sync.Mutex
+		fullCount int
+	)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/session/broken/message", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("limit") == "" {
+			mu.Lock()
+			fullCount++
+			mu.Unlock()
+			http.Error(w, "upstream down", http.StatusInternalServerError)
+			return
+		}
+		http.Error(w, "no tail", http.StatusNotFound)
+	})
+	mux.Handle("/", fixtures.New().Handler())
+	oc := httptest.NewServer(mux)
+	defer oc.Close()
+
+	agg := New(oc.URL, 100)
+	ch, unsub := agg.Store().Subscribe(128)
+	defer unsub()
+
+	// First call: the sync winner's GET fails.
+	err := agg.EnsureMessages(context.Background(), "broken")
+	if err == nil {
+		t.Fatal("EnsureMessages must return the upstream error on a failed GET")
+	}
+	if agg.Store().IsMessagesLoaded("broken") {
+		t.Fatal("a failed fetch must NOT mark the session loaded (retry on reselect)")
+	}
+	// The in-flight slot must be cleared so the next selection retries.
+	agg.msgMu.Lock()
+	_, stillInflight := agg.msgInflight["broken"]
+	agg.msgMu.Unlock()
+	if stillInflight {
+		t.Fatal("a failed fetch must clear the in-flight slot so a reselect retries")
+	}
+	// The first attempt must have hit the upstream exactly once.
+	mu.Lock()
+	firstFetches := fullCount
+	mu.Unlock()
+	if firstFetches != 1 {
+		t.Fatalf("first fetch: want 1 full upstream GET, got %d", firstFetches)
+	}
+	// A messages.error must be emitted.
+	var sawErr bool
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) && !sawErr {
+		select {
+		case e := <-ch:
+			if e.Kind == "messages.error" {
+				sawErr = true
+			}
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	if !sawErr {
+		t.Fatal("a failed fetch must emit messages.error")
+	}
+
+	// Retry on reselect: a second call issues a fresh fetch (the slot was cleared
+	// and the session is still unloaded). Proves the failure path did not strand
+	// the slot.
+	err = agg.EnsureMessages(context.Background(), "broken")
+	if err == nil {
+		t.Fatal("retry must also surface the upstream error (still failing)")
+	}
+	mu.Lock()
+	retryFetches := fullCount
+	mu.Unlock()
+	if retryFetches != 2 {
+		t.Fatalf("retry must issue a fresh upstream GET: want 2 (1 fail + 1 retry), got %d", retryFetches)
+	}
+}
+
+// TestEnsureMessagesSyncSingleFlightWaiter proves the sync single-flight waiter's
+// retry/no-op semantics. Two concurrent sync EnsureMessages calls race for the
+// same unloaded session; the first to register the done chan is the WINNER, the
+// second parks on <-done (or takes the under-lock re-check branch). The outcome
+// is fully determined by the winner's GET result:
+//
+//   - WinnerFailsWaiterRetries: winner's GET fails → defer clears slot + marker +
+//     closes done. The waiter wakes, loops, re-checks IsMessagesLoaded (still
+//     false), becomes the fresh winner, and its GET succeeds. Exactly 2 upstream
+//     GETs (winner-fail + waiter-win); final state loaded.
+//   - WinnerSucceedsWaiterNoop: winner's GET succeeds → SetSessionMessages marks
+//     loaded + closes done. The waiter wakes, loops, re-checks IsMessagesLoaded
+//     (now true), returns nil. Exactly 1 upstream GET (the winner's); final
+//     state loaded.
+//
+// Deterministic rendezvous: a hold channel blocks the winner's GET inside the
+// handler until the test closes it; a notify channel signals GET-in-flight so the
+// test starts the waiter only after the winner's slot is registered (the slot is
+// registered at aggregator.go ~207, before client.Messages at ~226, so it exists
+// when notify fires). No sleeps. The GET-count + loaded-state assertions are
+// invariant to whether the waiter parks on <-done or hits the under-lock re-check
+// branch under adversarial scheduling — both paths yield the same counts.
+func TestEnsureMessagesSyncSingleFlightWaiter(t *testing.T) {
+	const sid = "race"
+	const successBody = `[{"info":{"id":"m1","sessionID":"race","role":"user"},"parts":[{"id":"p1","sessionID":"race","messageID":"m1","type":"text","text":"loaded"}]}]`
+
+	cases := []struct {
+		name      string
+		failFirst bool
+		wantGETs  int
+	}{
+		{"WinnerFailsWaiterRetries", true, 2},
+		{"WinnerSucceedsWaiterNoop", false, 1},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var (
+				mu        sync.Mutex
+				fullCount int
+			)
+			hold := make(chan struct{})      // blocks GET(s) until closed
+			notify := make(chan struct{}, 1) // signals GET #1 in flight
+
+			mux := http.NewServeMux()
+			mux.HandleFunc("/session/"+sid+"/message", func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Query().Get("limit") == "" {
+					mu.Lock()
+					fullCount++
+					n := fullCount
+					mu.Unlock()
+					select {
+					case notify <- struct{}{}:
+					default:
+					}
+					<-hold // deterministic in-flight: block until released
+					if tc.failFirst && n == 1 {
+						http.Error(w, "upstream down", http.StatusInternalServerError)
+						return
+					}
+					w.Header().Set("Content-Type", "application/json")
+					w.Write([]byte(successBody))
+					return
+				}
+				http.Error(w, "no tail", http.StatusNotFound)
+			})
+			mux.Handle("/", fixtures.New().Handler())
+			oc := httptest.NewServer(mux)
+			defer oc.Close()
+
+			agg := New(oc.URL, 100)
+			ctx := context.Background()
+
+			// Launch the WINNER: it registers the done chan, then issues the GET
+			// which blocks on hold inside the handler.
+			winErr := make(chan error, 1)
+			go func() { winErr <- agg.EnsureMessages(ctx, sid) }()
+
+			// Wait until the winner's GET is observably in flight. At this point
+			// the done chan is already registered in msgInflight[sid] (registered
+			// before client.Messages), so the waiter will find it.
+			<-notify
+
+			// Launch the WAITER. It will either park on <-done (if the winner is
+			// still in flight) or hit the under-lock re-check branch (if the winner
+			// already completed). Either path yields the same GET-count + loaded
+			// outcome.
+			waitErr := make(chan error, 1)
+			go func() { waitErr <- agg.EnsureMessages(ctx, sid) }()
+
+			// Release the winner's GET: it completes (fail or succeed), its defer
+			// clears the slot + marker + closes done, and the waiter proceeds.
+			close(hold)
+
+			// Collect both results.
+			if err := <-winErr; (err == nil) == tc.failFirst {
+				t.Fatalf("winner EnsureMessages: failFirst=%v, got err=%v", tc.failFirst, err)
+			}
+			if err := <-waitErr; err != nil {
+				t.Fatalf("waiter EnsureMessages: want nil error, got %v", err)
+			}
+
+			// Assert exact upstream full GET count.
+			mu.Lock()
+			gotGETs := fullCount
+			mu.Unlock()
+			if gotGETs != tc.wantGETs {
+				t.Fatalf("upstream full GETs: want %d, got %d", tc.wantGETs, gotGETs)
+			}
+
+			// Assert final loaded state.
+			if !agg.Store().IsMessagesLoaded(sid) {
+				t.Fatal("final state must be loaded (winner or waiter succeeded)")
+			}
+
+			// Assert the in-flight slot is cleared after both calls complete.
+			agg.msgMu.Lock()
+			_, stillInflight := agg.msgInflight[sid]
+			agg.msgMu.Unlock()
+			if stillInflight {
+				t.Fatal("in-flight slot must be cleared after both calls complete")
+			}
+		})
+	}
+}
