@@ -40,11 +40,12 @@ tmp/
 # STAGING dir (web/dist-build/), NOT the Go embed source. Embed-producing
 # targets (`make build`/`install`/`fixtures`, the release workflow) then
 # materialize (copy) the staged bundle into pkg/web/dist/ right before
-# `go build`, so the binary embeds the real SPA. Only pkg/web/dist/index.html
-# is tracked — a self-contained fallback placeholder that keeps a cold
-# `go build`/`go test` working with NO frontend build. `make web` alone never
-# touches tracked files; `make build`/materialize overwrites pkg/web/dist/index.html
-# locally (restore the committed placeholder before committing).
+# `go build`, so the binary embeds the real SPA. Only pkg/web/dist/placeholder.html
+# is tracked — a self-contained fallback banner that keeps a cold
+# `go build`/`go test` working with NO frontend build. The generated
+# index.html (+ assets/sw.js/icons) under pkg/web/dist/ is gitignored, so
+# `make web` and `make build` leave tracked files clean; `make clean-web-embed`
+# removes the generated artifacts and returns to the cold-fallback state.
 node_modules/
 # Playwright test-results/ output (artifacts + .last-run.json). Can appear at
 # the repo root or under web/ depending on the CWD `npx playwright test` runs
@@ -54,7 +55,7 @@ test-results/
 web/playwright-report/
 web/dist-build/
 pkg/web/dist/*
-!pkg/web/dist/index.html
+!pkg/web/dist/placeholder.html
 
 # Agent-local tooling / config.
 .claude/

@@ -77,8 +77,8 @@ make install    # same, then `go install .` into $GOBIN
 
 > A plain `go build` / `go install github.com/vhqtvn/vh-solara@latest` still works
 > with **no Node toolchain**, but it embeds a self-contained *"web UI was not
-> built"* placeholder — not the real SPA. The committed `pkg/web/dist/index.html`
-> is that fallback banner only, not a prebuilt UI. To build a binary with the
+> built"* placeholder — not the real SPA. The committed
+> `pkg/web/dist/placeholder.html` is that fallback banner only, not a prebuilt UI. To build a binary with the
 > **real embedded SPA**, run `make build` (it builds the SPA into gitignored
 > `web/dist-build/`, then materializes it into `pkg/web/dist/` before compiling).
 > A release does this automatically via the tag-driven GitHub Actions workflow.

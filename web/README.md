@@ -14,11 +14,13 @@ npm run build      # emits into ../web/dist-build (staging); run make build to m
 ```
 
 A plain `go build` embeds the committed fallback placeholder banner at
-`pkg/web/dist/index.html` (self-contained, no Node toolchain required), NOT the
-real SPA. `pkg/web/dist/index.html` is committed only as that fallback;
-`web/dist-build/` is gitignored. Run `make build` to materialize the staged SPA
+`pkg/web/dist/placeholder.html` (self-contained, no Node toolchain required),
+NOT the real SPA. `pkg/web/dist/placeholder.html` is committed only as that
+fallback; the generated `pkg/web/dist/index.html` (real SPA shell) and
+`web/dist-build/` are gitignored. Run `make build` to materialize the staged SPA
 into `pkg/web/dist/` and embed the real UI (the tag-driven release workflow does
-this automatically).
+this automatically). `make clean-web-embed` removes generated artifacts and
+returns to the cold-fallback state.
 
 ## Dev
 

@@ -7,12 +7,14 @@
       content="width=device-width, initial-scale=1, viewport-fit=cover"
     />
     <title>VHSolara</title>
-    <!-- Self-contained fallback. This file is the ONLY tracked file under
-         pkg/web/dist: it lets a cold `go build`/`go test` compile and serve a
-         real page with NO frontend build. It must NOT reference the hashed SPA
-         bundle or the service worker (those exist only after `make web` stages a
-         real build and an embed-producing target materializes it here). Run
-         `make build` / the release workflow to produce the real SPA shell. -->
+    <!-- Self-contained fallback. This file (placeholder.html) is the ONLY tracked
+         file under pkg/web/dist: it lets a cold `go build`/`go test` compile and
+         serve a real page with NO frontend build. It must NOT reference the hashed
+         SPA bundle or the service worker (those exist only after `make web` stages
+         a real build and an embed-producing target materializes the generated
+         index.html + assets here, which are gitignored). Run `make build` / the
+         release workflow to produce the real SPA shell; `make clean-web-embed`
+         removes the generated artifacts and returns to this cold-fallback state. -->
     <style>
       :root { color-scheme: dark; }
       html, body {

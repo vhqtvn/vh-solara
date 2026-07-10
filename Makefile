@@ -3,7 +3,7 @@
 # gitignored staging dir (web/dist-build); embed-producing targets materialize
 # (copy) the staged bundle into pkg/web/dist right before `go build`.
 
-.PHONY: web web-materialize build build-debug install test test-web e2e e2e-keep docker fixtures bench
+.PHONY: web web-materialize build build-debug install test test-web e2e e2e-keep docker fixtures bench clean-web-embed
 
 web: ## Build the SolidJS UI into the staging dir web/dist-build (gitignored, NOT pkg/web/dist)
 	cd web && npm install && npm run build
@@ -40,3 +40,6 @@ e2e-keep: ## Same as e2e but leave the container running for inspection
 
 docker: ## Build the production image
 	docker build -t vh-solara .
+
+clean-web-embed: ## Remove generated SPA artifacts from pkg/web/dist (preserve tracked placeholder.html → cold-fallback embed)
+	rm -rf pkg/web/dist/assets pkg/web/dist/index.html pkg/web/dist/*.js pkg/web/dist/*.map pkg/web/dist/*.webmanifest pkg/web/dist/*.svg pkg/web/dist/*.png 2>/dev/null || true

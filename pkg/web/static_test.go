@@ -11,11 +11,11 @@ func TestServesEmbeddedSPA(t *testing.T) {
 	ws := newWebServer(t)
 	defer ws.Close()
 
-	// Root serves the embedded index.html. That is either the real SPA shell
-	// (when an embed-producing target materialized a `make web` build into
-	// pkg/web/dist) or the self-contained fallback placeholder committed so a
-	// cold `go build`/`go test` works with NO frontend build. <title>VHSolara</title>
-	// is present in both, so it is the stable marker for "index.html was served".
+	// Root serves embedded index.html (the real SPA shell, when an
+	// embed-producing target materialized a `make web` build into pkg/web/dist)
+	// or the self-contained fallback placeholder.html (cold build with NO
+	// frontend build). <title>VHSolara</title> is present in both, so it is the
+	// stable marker for "an html shell was served".
 	resp, err := http.Get(ws.URL + "/")
 	if err != nil {
 		t.Fatal(err)

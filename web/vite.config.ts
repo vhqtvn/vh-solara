@@ -31,7 +31,7 @@ export default defineConfig({
     // source (pkg/web/dist). Embed-producing targets (`make build`/`install`/
     // `fixtures`, the release workflow) materialize (copy) the staged bundle
     // into pkg/web/dist right before `go build`. This keeps `make web` from
-    // clobbering the tracked fallback placeholder pkg/web/dist/index.html.
+    // clobbering the tracked fallback placeholder pkg/web/dist/placeholder.html.
     outDir: "dist-build",
     emptyOutDir: true,
     target: "es2020",

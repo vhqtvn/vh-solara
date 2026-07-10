@@ -30,18 +30,20 @@ It lets an operator:
 
 - SolidJS SPA built with Vite; TypeScript. `make web` builds the SPA into a
   **gitignored staging dir** (`web/dist-build/`), NOT into `pkg/web/dist/`. A
-  self-contained fallback `pkg/web/dist/index.html` is tracked so `//go:embed
-  dist` compiles and a cold `go build`/`go test` works with **no frontend build**
-  (it renders a "web UI was not built" banner — fully self-contained, with no
-  `/assets` or `/sw.js` references). Embed-producing targets (`make build`/
-  `install`/`fixtures`, the release workflow) **materialize** — copy
-  `web/dist-build/*` → `pkg/web/dist/` — immediately before `go build`, so the
-  binary embeds the real SPA. `make web` alone leaves `git status` clean (a CI
-  guard asserts `pkg/web/dist/index.html` is untouched). NOTE: `make build` /
-  materialize overwrites `pkg/web/dist/index.html` locally; do NOT commit in that
-  state — restore the committed placeholder first (operators:
-  `git checkout -- pkg/web/dist/index.html`; agents: route through the committer
-  / `.opencode/scripts/commit-gate.sh revert pkg/web/dist/index.html`).
+  self-contained fallback `pkg/web/dist/placeholder.html` is tracked so
+  `//go:embed dist` compiles and a cold `go build`/`go test` works with **no
+  frontend build** (it renders a "web UI was not built" banner — fully
+  self-contained, with no `/assets` or `/sw.js` references). Generated
+  `pkg/web/dist/index.html` (the real SPA shell) and its assets are gitignored.
+  Embed-producing targets (`make build`/`install`/`fixtures`, the release
+  workflow) **materialize** — copy `web/dist-build/*` → `pkg/web/dist/` —
+  immediately before `go build`, so the binary embeds the real SPA. `make web`
+  alone leaves `git status` clean (a CI guard asserts
+  `pkg/web/dist/placeholder.html` is untouched). `make build`/materialize writes
+  the gitignored generated `index.html` + assets under `pkg/web/dist/` locally —
+  since those are gitignored, `git status` stays clean; `make clean-web-embed`
+  removes the generated artifacts and returns to the true cold-fallback embed
+  state (placeholder.html only).
 - Full build (Node ≥ 24): `make build` (or `make web` for the SPA only).
 - SPA unit tests: `cd web && npx vitest run`. Typecheck: `npm run typecheck`.
 - Playwright e2e: `cd web && export PATH=$PATH:/usr/local/go/bin && npx playwright

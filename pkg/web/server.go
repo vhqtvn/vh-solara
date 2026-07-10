@@ -1103,19 +1103,40 @@ func (s *Server) handlePassthrough(w http.ResponseWriter, r *http.Request) {
 	s.proxy.ServeHTTP(w, r)
 }
 
-// handleStatic serves embedded assets, falling back to index.html for SPA routes.
+// handleStatic serves embedded static files. Real assets (hashed bundles,
+// sw.js, manifest, icons) are served by http.FileServer. For the root path and
+// unknown client routes (SPA history fallback) it serves embedded index.html
+// when a real SPA build is materialized, otherwise the self-contained
+// placeholder.html — the only tracked file under dist/ — so a cold
+// `go build`/`go test` with no frontend build serves a banner page instead of a
+// directory listing. This explicitly does NOT rely on http.FileServer's
+// directory-index/listing semantics, which would list the directory when
+// index.html is absent.
 func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 	p := strings.TrimPrefix(r.URL.Path, "/")
-	if p == "" {
-		p = "index.html"
+	// Serve an existing embedded static file directly (real assets, sw.js,
+	// manifest, icons, etc.).
+	if p != "" {
+		if f, err := s.staticFS.Open(p); err == nil {
+			f.Close()
+			s.static.ServeHTTP(w, r)
+			return
+		}
 	}
-	if f, err := s.staticFS.Open(p); err == nil {
-		f.Close()
-		s.static.ServeHTTP(w, r)
+	// Root or SPA-history fallback: prefer index.html (the real SPA shell,
+	// present only after an embed-producing target materialized a build); fall
+	// back to placeholder.html (the always-tracked cold-build banner). Both are
+	// served as text/html directly from the embed FS so the fallback does not
+	// depend on FileServer resolving a directory index.
+	if data, err := fs.ReadFile(s.staticFS, "index.html"); err == nil {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write(data)
 		return
 	}
-	// SPA fallback.
-	r2 := r.Clone(r.Context())
-	r2.URL.Path = "/"
-	s.static.ServeHTTP(w, r2)
+	if data, err := fs.ReadFile(s.staticFS, "placeholder.html"); err == nil {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write(data)
+		return
+	}
+	http.NotFound(w, r)
 }
