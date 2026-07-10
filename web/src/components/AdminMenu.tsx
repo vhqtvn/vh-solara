@@ -4,6 +4,7 @@ import { dismiss } from "../lib/a11y";
 import { setDiagLogOpen } from "../ui";
 import Icon from "./Icon";
 import OpenCodeUpdateDialog from "./OpenCodeUpdateDialog";
+import RestartOpenCode from "./RestartOpenCode";
 
 // Server-admin popup (versions + update/reload/restart + local-storage reset),
 // opened by right-clicking / long-pressing the Settings button. Kept out of the
@@ -59,11 +60,13 @@ export default function AdminMenu(props: { onClose: () => void }) {
         </div>
       </div>
 
-      {/* Update OpenCode — opens the streaming-log dialog, which owns BOTH the
-          install (update/reinstall) and the restart confirmation. The menu
-          entry keeps a STABLE label regardless of version state so it never
-          flips identity while npm resolves (the dialog carries the
-          update-vs-reinstall nuance + the loading state). */}
+      {/* Update OpenCode — opens the streaming-log dialog, which owns the
+          install (update/reinstall). Restart is owned by RestartOpenCode
+          (the permanent menu entry below, plus the dialog footer which mounts
+          the same component gated by offerRestart()). The menu entry keeps a
+          STABLE label regardless of version state so it never flips identity
+          while npm resolves (the dialog carries the update-vs-reinstall
+          nuance + the loading state). */}
       <button
         type="button"
         class="admin-btn"
@@ -74,6 +77,17 @@ export default function AdminMenu(props: { onClose: () => void }) {
         <Icon name="layers" size={14} />
         {ocVer() ? "Update OpenCode…" : "Checking…"}
       </button>
+
+      {/* Restart OpenCode — a PERMANENT, standalone restart affordance. This is
+          the only restart entry available at idle when there is no pending
+          install / restartNeeded signal (the UX gap RestartOpenCode closes).
+          It reuses the SAME RestartOpenCode component as the update dialog
+          footer, so every restart path traverses the session-aware confirmation
+          and there is exactly ONE caller of /vh/restart-opencode. A conventional
+          full-width .admin-btn row — no split/two-up pattern. onRestarted
+          refreshes the version readout above so a completed restart updates the
+          displayed running version. */}
+      <RestartOpenCode onRestarted={() => void refetchVer()} />
 
       <button type="button" class="admin-btn" disabled={reloading()} onClick={reloadServer}>
         <Icon name="retry" size={14} /> {reloading() ? "Reloading…" : "Reload server state"}

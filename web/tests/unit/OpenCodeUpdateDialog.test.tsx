@@ -34,6 +34,20 @@ function withFetch(map: Record<string, unknown>) {
 
 const VER_UPDATE = { installed: "0.1.0", running: "0.1.0", latest: "0.2.0", updateAvailable: true, restartNeeded: false };
 const VER_LATEST = { installed: "0.2.0", running: "0.2.0", latest: "0.2.0", updateAvailable: false, restartNeeded: false };
+// Installed differs from running → restartNeeded. At idle this is the only
+// state that offers Restart in the footer (offerRestart's idle branch).
+const VER_RESTART = { installed: "0.2.0", running: "0.1.0", latest: "0.2.0", updateAvailable: false, restartNeeded: true };
+
+// A footer restart entry is rendered by RestartOpenCode (the entry button reads
+// "Restart OpenCode…"). Collected from the portaled dialog's footer so it does
+// not match the install-area button or the Close button.
+function footerRestartBtns(): HTMLButtonElement[] {
+  const foot = document.querySelector(".ocu-foot");
+  if (!foot) return [];
+  return Array.from(foot.querySelectorAll("button")).filter((b) =>
+    (b.textContent || "").includes("Restart OpenCode"),
+  );
+}
 
 describe("OpenCodeUpdateDialog — stable action slot (D2) + collapsed log (D4)", () => {
   afterEach(() => {
@@ -105,5 +119,98 @@ describe("OpenCodeUpdateDialog — stable action slot (D2) + collapsed log (D4)"
     (document.querySelector(".ocu-log-toggle") as HTMLButtonElement).click();
     await waitFor(() => expect(document.querySelector(".ocu-log")).toBeTruthy());
     expect(document.querySelector(".ocu-log")!.textContent).toContain("update complete");
+  });
+});
+
+describe("OpenCodeUpdateDialog — restart-offer gating + extracted RestartConfirm flow", () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+    streamOpenCodeUpdate.mockReset();
+  });
+
+  it("does NOT offer restart at idle when restartNeeded is false", async () => {
+    vi.stubGlobal("fetch", withFetch({ "/vh/opencode-version": VER_LATEST }));
+    render(() => <OpenCodeUpdateDialog onClose={() => {}} />);
+
+    // Wait for the version readout to resolve (so offerRestart has stable input).
+    await waitFor(() =>
+      expect(document.querySelector(".ocu-install-vers")).toBeTruthy(),
+    );
+    // No restart entry in the footer at idle without restartNeeded.
+    expect(footerRestartBtns().length).toBe(0);
+  });
+
+  it("offers restart at idle when restartNeeded is true", async () => {
+    vi.stubGlobal("fetch", withFetch({ "/vh/opencode-version": VER_RESTART }));
+    render(() => <OpenCodeUpdateDialog onClose={() => {}} />);
+
+    const btn = await waitFor(() => {
+      const b = footerRestartBtns()[0];
+      expect(b).toBeTruthy();
+      return b;
+    });
+    expect(btn.textContent).toContain("Restart OpenCode");
+  });
+
+  it("offers restart after a completed install (done) regardless of restartNeeded", async () => {
+    vi.stubGlobal("fetch", withFetch({ "/vh/opencode-version": VER_UPDATE }));
+    streamOpenCodeUpdate.mockImplementation(async (append: (s: string) => void) => {
+      append("[vh] update complete\n");
+    });
+    render(() => <OpenCodeUpdateDialog onClose={() => {}} />);
+
+    const installBtn = await waitFor(() => {
+      const b = document.querySelector(".ocu-action-slot button") as HTMLButtonElement;
+      expect(b).toBeTruthy();
+      return b;
+    });
+    installBtn.click();
+    // Done → offerRestart() is true (done branch) → footer restart entry shows.
+    await waitFor(() => expect(document.querySelector(".ocu-ok")).toBeTruthy());
+    expect(footerRestartBtns().length).toBe(1);
+  });
+
+  it("activating the footer restart entry traverses RestartConfirm before any POST", async () => {
+    // /vh/running-sessions is fetched by RestartConfirm on mount; wire it so the
+    // warning resolves. The restart POST itself is left unreachable (Cancel).
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (url.includes("/vh/opencode-version"))
+          return Promise.resolve(jsonResp(VER_RESTART));
+        if (url.includes("/vh/running-sessions"))
+          return Promise.resolve(jsonResp({ count: 2, workspaces: [{ dir: "/w", count: 2 }] }));
+        return Promise.resolve(jsonResp(null, false));
+      }),
+    );
+    render(() => <OpenCodeUpdateDialog onClose={() => {}} />);
+
+    const entry = await waitFor(() => {
+      const b = footerRestartBtns()[0];
+      expect(b).toBeTruthy();
+      return b;
+    });
+    entry.click();
+
+    // The extracted flow still surfaces RestartConfirm (session-interrupt gate).
+    const confirm = await waitFor(() => {
+      const el = document.querySelector(".ocu-confirm") as HTMLElement;
+      expect(el).toBeTruthy();
+      return el;
+    });
+    await waitFor(() => expect(confirm.textContent).toContain("2 running sessions"));
+  });
+
+  it("install/reinstall behavior does not regress (reinstall label still resolves)", async () => {
+    vi.stubGlobal("fetch", withFetch({ "/vh/opencode-version": VER_LATEST }));
+    render(() => <OpenCodeUpdateDialog onClose={() => {}} />);
+
+    const btn = await waitFor(() => {
+      const b = document.querySelector(".ocu-action-slot button") as HTMLButtonElement;
+      expect(b).toBeTruthy();
+      return b;
+    });
+    expect(btn.textContent).toContain("Reinstall latest");
   });
 });

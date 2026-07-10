@@ -51,31 +51,26 @@ test("admin popup shows both vh-solara and OpenCode versions", async ({ page }) 
   await expect(pop).toContainText("OpenCode");
 });
 
-// Restart OpenCode is now owned SOLELY by the update dialog (the admin menu
-// just opens it). The confirmation counts running sessions across ALL workspaces
-// the daemon manages, fetched on mount — so we drive it through the dialog's
-// post-install state.
-test("Restart OpenCode is owned by the update dialog, warns before acting, and can be cancelled", async ({ page }) => {
+// Restart OpenCode is reachable two ways: a PERMANENT standalone entry in the
+// admin menu (the only restart affordance at idle), and the post-install footer
+// of the update dialog. Both traverse the SAME session-aware confirmation
+// (counted across ALL workspaces the daemon manages), so we drive it through
+// the menu's standalone entry here.
+test("Restart OpenCode has a permanent menu entry that warns before acting and can be cancelled", async ({ page }) => {
   await page.goto(projectUrl("/"));
   await page.getByRole("button", { name: "Settings" }).click({ button: "right" });
   const pop = page.getByRole("dialog", { name: "Server admin" });
 
-  // The admin menu no longer carries a standalone restart entry.
-  await expect(pop.getByRole("button", { name: /^Restart OpenCode/ })).toHaveCount(0);
+  // The admin menu carries a permanent standalone restart entry.
+  await expect(pop.getByRole("button", { name: /^Restart OpenCode/ })).toBeVisible();
 
-  // Reach a state that offers restart (done, after an install attempt).
-  await pop.getByRole("button", { name: /Update OpenCode…/ }).click();
-  const dlg = page.getByRole("dialog", { name: "Update OpenCode" });
-  await dlg.getByRole("button", { name: /Update to 0\.2\.0/ }).click();
-  await expect(dlg.locator(".ocu-ok")).toContainText("Installed", { timeout: 8000 });
-
-  // Clicking restart shows a session-aware warning (counted across workspaces).
-  await dlg.locator(".ocu-foot").getByRole("button", { name: "Restart OpenCode" }).click();
-  await expect(dlg.locator(".ocu-confirm")).toContainText(/running session/, { timeout: 5000 });
+  // Activating it shows a session-aware warning (counted across workspaces).
+  await pop.getByRole("button", { name: /^Restart OpenCode/ }).click();
+  await expect(pop.locator(".ocu-confirm")).toContainText(/running session/, { timeout: 5000 });
 
   // Cancel backs out without restarting.
-  await dlg.getByRole("button", { name: "Cancel" }).click();
-  await expect(dlg.locator(".ocu-confirm")).toHaveCount(0);
+  await pop.getByRole("button", { name: "Cancel" }).click();
+  await expect(pop.locator(".ocu-confirm")).toHaveCount(0);
 });
 
 test("OpenCode update opens a dialog, streams the log, then offers restart", async ({ page }) => {
@@ -103,8 +98,9 @@ test("OpenCode update opens a dialog, streams the log, then offers restart", asy
   await dlg.getByRole("button", { name: /Hide install log/ }).click();
   await expect(dlg.locator(".ocu-log")).toHaveCount(0);
 
-  // Post-update offers an explicit Restart OpenCode + Close (no auto-restart),
-  // both owned by the dialog.
+  // Post-update offers an explicit Restart OpenCode + Close (no auto-restart).
+  // Restart OpenCode here is the same RestartOpenCode component as the
+  // permanent admin-menu entry (owned by RestartOpenCode, not the dialog).
   await expect(dlg.locator(".ocu-foot").getByRole("button", { name: "Restart OpenCode" })).toBeVisible();
   await expect(dlg.locator(".ocu-foot").getByRole("button", { name: "Close" })).toBeVisible();
 });

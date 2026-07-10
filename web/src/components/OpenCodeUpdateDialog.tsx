@@ -2,6 +2,7 @@ import { createResource, createSignal, onCleanup, onMount, Show } from "solid-js
 import { Portal } from "solid-js/web";
 import { streamOpenCodeUpdate } from "../admin";
 import Icon from "./Icon";
+import RestartOpenCode from "./RestartOpenCode";
 
 type Versions = {
   installed: string;
@@ -20,11 +21,14 @@ type Versions = {
 //     install action (update / reinstall) in a STABLE slot. While npm version
 //     data is unresolved that slot shows a loading indicator, never a button
 //     whose label would later flip — that was the flicker root cause.
-// Restart is owned ONLY by this dialog (the admin menu just opens it): the
-// footer offers Restart OpenCode in the states where it applies, behind a
-// session-aware confirmation that counts running sessions across ALL workspaces
-// the daemon manages — restarting OpenCode interrupts every workspace, not just
-// the one this tab is viewing.
+// Restart is owned by the shared RestartOpenCode component (also mounted as a
+// permanent standalone entry in the admin menu): this dialog gates WHEN it
+// appears in the footer via offerRestart() and passes its version refetch as
+// onRestarted. RestartOpenCode renders its own entry + a session-aware
+// confirmation that counts running sessions across ALL workspaces the daemon
+// manages (restarting OpenCode interrupts every workspace, not just the one
+// this tab is viewing) + the result line — and is the SOLE caller of
+// /vh/restart-opencode.
 export default function OpenCodeUpdateDialog(props: { onClose: () => void }) {
   const [ver, { refetch }] = createResource<Versions | null>(() =>
     fetch("/vh/opencode-version").then((r) => (r.ok ? r.json() : null)).catch(() => null),
@@ -37,11 +41,6 @@ export default function OpenCodeUpdateDialog(props: { onClose: () => void }) {
   // D4: the install log collapses to a result line on completion and is exposed
   // on demand. While updating it streams live (this flag is ignored then).
   const [showLog, setShowLog] = createSignal(false);
-
-  // Restart sub-flow — this dialog is the single owner.
-  const [confirmRestart, setConfirmRestart] = createSignal(false);
-  const [restarting, setRestarting] = createSignal(false);
-  const [restartMsg, setRestartMsg] = createSignal("");
 
   let logEl: HTMLPreElement | undefined;
   const append = (t: string) => {
@@ -62,25 +61,6 @@ export default function OpenCodeUpdateDialog(props: { onClose: () => void }) {
     } catch (e) {
       append("\n[vh] " + (e instanceof Error ? e.message : "update failed") + "\n");
       setPhase("failed");
-    }
-  }
-
-  async function doRestart() {
-    setRestarting(true);
-    setRestartMsg("");
-    try {
-      const res = await fetch("/vh/restart-opencode", { method: "POST" });
-      if (res.ok) {
-        setRestartMsg("✓ OpenCode restarted");
-        await refetch();
-      } else {
-        setRestartMsg(res.status === 501 ? "Not managed here" : "Restart failed");
-      }
-    } catch {
-      setRestartMsg("Restart failed");
-    } finally {
-      setRestarting(false);
-      setConfirmRestart(false);
     }
   }
 
@@ -153,9 +133,6 @@ export default function OpenCodeUpdateDialog(props: { onClose: () => void }) {
             </div>
           </Show>
 
-          {/* Restart result reads as a distinct terminal state, not a log line. */}
-          <Show when={restartMsg()}><p class="ocu-restart-result">{restartMsg()}</p></Show>
-
           {/* Install area (bottom, delimited): version readout + the single
               install action in a stable slot. No element here changes identity
               or position based on updateAvailable. */}
@@ -196,72 +173,19 @@ export default function OpenCodeUpdateDialog(props: { onClose: () => void }) {
         </div>
 
         <div class="dialog-foot ocu-foot">
-          {/* Restart is owned by this dialog only; the admin menu just opens it. */}
-          <Show
-            when={!confirmRestart()}
-            fallback={<RestartConfirm restarting={restarting()} onConfirm={doRestart} onCancel={() => setConfirmRestart(false)} />}
-          >
-            <Show when={offerRestart()}>
-              <button
-                type="button"
-                class="admin-btn accent"
-                disabled={restarting()}
-                onClick={() => (setRestartMsg(""), setConfirmRestart(true))}
-              >
-                <Icon name="retry" size={14} /> Restart OpenCode
-              </button>
-            </Show>
-            <button type="button" class="admin-btn" disabled={phase() === "updating"} onClick={props.onClose}>Close</button>
+          {/* Restart is owned by the shared RestartOpenCode component (the SOLE
+              caller of /vh/restart-opencode); this dialog gates WHEN it appears
+              via offerRestart() and hands its version refetch as onRestarted so
+              a successful restart refreshes the version readout. RestartOpenCode
+              renders its own entry button + session-aware confirmation + result
+              line. */}
+          <Show when={offerRestart()}>
+            <RestartOpenCode onRestarted={refetch} disabled={phase() === "updating"} />
           </Show>
+          <button type="button" class="admin-btn" disabled={phase() === "updating"} onClick={props.onClose}>Close</button>
         </div>
       </div>
     </div>
     </Portal>
-  );
-}
-
-// RestartConfirm is the session-aware confirmation. It states exactly how many
-// running sessions a restart will interrupt — counted across ALL workspaces the
-// daemon manages (restarting OpenCode interrupts every workspace, not just the
-// one this tab is viewing). The count is fetched on mount from
-// /vh/running-sessions; until it resolves the warning reads "Checking active
-// sessions…" so we never show a stale per-workspace number. Includes "0 running
-// sessions" so "safe" is explicit, never implied by silence.
-type RunningSessions = { count: number; workspaces: { dir: string; count: number }[] };
-
-export function RestartConfirm(props: { restarting: boolean; onConfirm: () => void; onCancel: () => void }) {
-  const [data, setData] = createSignal<RunningSessions | null>(null);
-  onMount(() => {
-    fetch("/vh/running-sessions")
-      .then((r) => (r.ok ? r.json() : null))
-      .then((d: RunningSessions | null) => setData(d ?? { count: 0, workspaces: [] }))
-      .catch(() => setData({ count: 0, workspaces: [] }));
-  });
-  const count = () => data()?.count ?? 0;
-  const wsCount = () => data()?.workspaces.length ?? 0;
-
-  return (
-    <div class="ocu-confirm">
-      <Show
-        when={data() !== null}
-        fallback={<span class="ocu-confirm-loading">Checking active sessions…</span>}
-      >
-        <span classList={{ warn: count() > 0 }}>
-          <Show
-            when={count() > 0}
-            fallback={<>0 running sessions — safe to restart. OpenCode will be briefly unavailable; sessions are preserved.</>}
-          >
-            ⚠ {count()} running session{count() === 1 ? "" : "s"}
-            {wsCount() > 1 ? ` across ${wsCount()} workspaces` : ""} will be interrupted. The in-flight turn(s) stop; sessions and history are preserved.
-          </Show>
-        </span>
-      </Show>
-      <div class="admin-confirm-btns">
-        <button type="button" class="admin-btn danger" disabled={props.restarting} onClick={props.onConfirm}>
-          {props.restarting ? "Restarting…" : "Restart OpenCode"}
-        </button>
-        <button type="button" class="admin-btn" disabled={props.restarting} onClick={props.onCancel}>Cancel</button>
-      </div>
-    </div>
   );
 }
