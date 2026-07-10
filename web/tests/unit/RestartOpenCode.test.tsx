@@ -307,4 +307,241 @@ describe("RestartOpenCode — owns the restart operation", () => {
     expect(entry).toBeTruthy();
     expect(entry.classList.contains("accent")).toBe(false);
   });
+
+  // ─────────────────────────────────────────────────────────────────────
+  // Fix A — fail-closed on unknown session count (tri-state)
+  // ─────────────────────────────────────────────────────────────────────
+
+  it("Fix A: loading state shows 'Checking active sessions…' before fetch resolves", async () => {
+    // Never resolves → pinned in the loading branch.
+    vi.stubGlobal("fetch", vi.fn(() => new Promise(() => {})));
+
+    render(() => <RestartOpenCode />);
+    (document.querySelector("button.admin-btn") as HTMLButtonElement).click();
+    await waitFor(() => expect(document.querySelector(".ocu-confirm")).toBeTruthy());
+    const loading = document.querySelector(".ocu-confirm-loading") as HTMLElement;
+    expect(loading).toBeTruthy();
+    expect(loading.textContent).toContain("Checking active sessions");
+  });
+
+  it("Fix A: non-OK /vh/running-sessions → unknown message + Restart disabled (fail-closed)", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (url.includes("/vh/running-sessions"))
+          return Promise.resolve(new Response(null, { status: 500 }));
+        return Promise.resolve(jsonResp(null, false, 500));
+      }),
+    );
+
+    render(() => <RestartOpenCode />);
+    (document.querySelector("button.admin-btn") as HTMLButtonElement).click();
+    const confirm = await waitFor(() => {
+      const el = document.querySelector(".ocu-confirm") as HTMLElement;
+      expect(el).toBeTruthy();
+      return el;
+    });
+    await waitFor(() =>
+      expect(confirm.textContent).toContain("Couldn't verify active sessions"),
+    );
+    // Fail-closed: Restart disabled, Cancel still enabled.
+    const [restartBtn, cancelBtn] = document.querySelectorAll(".admin-confirm-btns button");
+    expect((restartBtn as HTMLButtonElement).disabled).toBe(true);
+    expect((cancelBtn as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("Fix A: network error on /vh/running-sessions → unknown message + Restart disabled", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (url.includes("/vh/running-sessions")) return Promise.reject(new Error("network"));
+        return Promise.resolve(jsonResp(null, false, 500));
+      }),
+    );
+
+    render(() => <RestartOpenCode />);
+    (document.querySelector("button.admin-btn") as HTMLButtonElement).click();
+    const confirm = await waitFor(() => {
+      const el = document.querySelector(".ocu-confirm") as HTMLElement;
+      expect(el).toBeTruthy();
+      return el;
+    });
+    await waitFor(() =>
+      expect(confirm.textContent).toContain("Couldn't verify active sessions"),
+    );
+    const [restartBtn] = document.querySelectorAll(".admin-confirm-btns button");
+    expect((restartBtn as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("Fix A: known count==0 still shows 'safe to restart' with Restart ENABLED (regression guard)", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (url.includes("/vh/running-sessions"))
+          return Promise.resolve(jsonResp({ count: 0, workspaces: [] }));
+        return Promise.resolve(jsonResp(null, false, 500));
+      }),
+    );
+
+    render(() => <RestartOpenCode />);
+    (document.querySelector("button.admin-btn") as HTMLButtonElement).click();
+    const confirm = await waitFor(() => {
+      const el = document.querySelector(".ocu-confirm") as HTMLElement;
+      expect(el).toBeTruthy();
+      return el;
+    });
+    await waitFor(() => expect(confirm.textContent).toContain("0 running sessions"));
+    expect(confirm.textContent).toContain("safe to restart");
+    const [restartBtn] = document.querySelectorAll(".admin-confirm-btns button");
+    expect((restartBtn as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("Fix A: known count>0 shows the ⚠ interruption warning with Restart ENABLED", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (url.includes("/vh/running-sessions"))
+          return Promise.resolve(
+            jsonResp({
+              count: 2,
+              workspaces: [{ dir: "/a", count: 2 }],
+            }),
+          );
+        return Promise.resolve(jsonResp(null, false, 500));
+      }),
+    );
+
+    render(() => <RestartOpenCode />);
+    (document.querySelector("button.admin-btn") as HTMLButtonElement).click();
+    const confirm = await waitFor(() => {
+      const el = document.querySelector(".ocu-confirm") as HTMLElement;
+      expect(el).toBeTruthy();
+      return el;
+    });
+    await waitFor(() => expect(confirm.textContent).toContain("2 running sessions"));
+    const [restartBtn] = document.querySelectorAll(".admin-confirm-btns button");
+    expect((restartBtn as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  // ─────────────────────────────────────────────────────────────────────
+  // Fix B — restart failure must not render success-green
+  // ─────────────────────────────────────────────────────────────────────
+
+  it("Fix B: 501 failure ('Not managed here') renders with .err, not plain success-green", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (url.includes("/vh/running-sessions")) return Promise.resolve(jsonResp(RUNNING));
+        if (url.includes("/vh/restart-opencode"))
+          return Promise.resolve(jsonResp(null, false, 501));
+        return Promise.resolve(jsonResp(null, false, 500));
+      }),
+    );
+
+    render(() => <RestartOpenCode />);
+    (document.querySelector("button.admin-btn") as HTMLButtonElement).click();
+    await waitFor(() => expect(document.querySelector(".ocu-confirm")).toBeTruthy());
+    (document.querySelectorAll(".admin-confirm-btns button")[0] as HTMLButtonElement).click();
+
+    const result = await waitFor(() => {
+      const el = document.querySelector(".ocu-restart-result") as HTMLElement;
+      expect(el).toBeTruthy();
+      return el;
+    });
+    expect(result.textContent).toContain("Not managed here");
+    expect(result.classList.contains("err")).toBe(true);
+  });
+
+  it("Fix B: generic 500 failure ('Restart failed') renders with .err", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (url.includes("/vh/running-sessions")) return Promise.resolve(jsonResp(RUNNING));
+        if (url.includes("/vh/restart-opencode"))
+          return Promise.resolve(jsonResp(null, false, 500));
+        return Promise.resolve(jsonResp(null, false, 500));
+      }),
+    );
+
+    render(() => <RestartOpenCode />);
+    (document.querySelector("button.admin-btn") as HTMLButtonElement).click();
+    await waitFor(() => expect(document.querySelector(".ocu-confirm")).toBeTruthy());
+    (document.querySelectorAll(".admin-confirm-btns button")[0] as HTMLButtonElement).click();
+
+    const result = await waitFor(() => {
+      const el = document.querySelector(".ocu-restart-result") as HTMLElement;
+      expect(el).toBeTruthy();
+      return el;
+    });
+    expect(result.textContent).toContain("Restart failed");
+    expect(result.classList.contains("err")).toBe(true);
+  });
+
+  it("Fix B: success ('✓ OpenCode restarted') stays green — no .err modifier", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (url.includes("/vh/running-sessions")) return Promise.resolve(jsonResp(RUNNING));
+        if (url.includes("/vh/restart-opencode")) return Promise.resolve(jsonResp({}));
+        return Promise.resolve(jsonResp(null, false, 500));
+      }),
+    );
+
+    render(() => <RestartOpenCode />);
+    (document.querySelector("button.admin-btn") as HTMLButtonElement).click();
+    await waitFor(() => expect(document.querySelector(".ocu-confirm")).toBeTruthy());
+    (document.querySelectorAll(".admin-confirm-btns button")[0] as HTMLButtonElement).click();
+
+    const result = await waitFor(() => {
+      const el = document.querySelector(".ocu-restart-result") as HTMLElement;
+      expect(el).toBeTruthy();
+      return el;
+    });
+    expect(result.textContent).toContain("OpenCode restarted");
+    expect(result.classList.contains("err")).toBe(false);
+  });
+
+  // ─────────────────────────────────────────────────────────────────────
+  // Fix C — defensive onCleanup for onActiveChange
+  // ─────────────────────────────────────────────────────────────────────
+
+  it("Fix C: unmount while confirm open emits a final false via onActiveChange", async () => {
+    const onActiveChange = vi.fn();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (url.includes("/vh/running-sessions")) return Promise.resolve(jsonResp(RUNNING));
+        return Promise.resolve(jsonResp(null, false, 500));
+      }),
+    );
+
+    const { unmount } = render(() => <RestartOpenCode onActiveChange={onActiveChange} />);
+    (document.querySelector("button.admin-btn") as HTMLButtonElement).click();
+    await waitFor(() => expect(document.querySelector(".ocu-confirm")).toBeTruthy());
+    expect(onActiveChange).toHaveBeenLastCalledWith(true);
+
+    // Unmount while the confirm is still open (active) → onCleanup emits the
+    // final false so the parent's restartActive flag is not stranded at true.
+    unmount();
+    expect(onActiveChange).toHaveBeenLastCalledWith(false);
+  });
+
+  it("Fix C: idle mount+unmount never calls onActiveChange (defer:true + no cleanup at idle)", async () => {
+    const onActiveChange = vi.fn();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (url.includes("/vh/running-sessions")) return Promise.resolve(jsonResp(RUNNING));
+        return Promise.resolve(jsonResp(null, false, 500));
+      }),
+    );
+
+    const { unmount } = render(() => <RestartOpenCode onActiveChange={onActiveChange} />);
+    await waitFor(() => expect(document.querySelector("button.admin-btn")).toBeTruthy());
+    expect(onActiveChange).not.toHaveBeenCalled();
+    // Unmount without ever going active — the deferred effect never ran, so no
+    // onCleanup was ever registered; nothing fires on disposal either.
+    unmount();
+    expect(onActiveChange).not.toHaveBeenCalled();
+  });
 });

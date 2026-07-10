@@ -1,4 +1,4 @@
-import { createEffect, createSignal, on, onMount, Show } from "solid-js";
+import { createEffect, createSignal, on, onCleanup, onMount, Show } from "solid-js";
 import Icon from "./Icon";
 
 // RestartOpenCode OWNS the complete OpenCode-restart operation end to end: the
@@ -37,6 +37,10 @@ export default function RestartOpenCode(props: RestartOpenCodeProps) {
   const [confirmRestart, setConfirmRestart] = createSignal(false);
   const [restarting, setRestarting] = createSignal(false);
   const [restartMsg, setRestartMsg] = createSignal("");
+  // Tracks whether the current restartMsg is a success (green) or a failure
+  // (red). A failure result must NOT render through the success-green result
+  // box — it carries the .err modifier so the color matches the outcome.
+  const [restartOk, setRestartOk] = createSignal(true);
 
   // Reflect the active (blocking) state to an optional parent callback so a host
   // dialog can focus-lock (hide its Close button) while RestartConfirm is open or
@@ -46,7 +50,15 @@ export default function RestartOpenCode(props: RestartOpenCodeProps) {
   createEffect(
     on(
       () => confirmRestart() || restarting(),
-      (active) => props.onActiveChange?.(active),
+      (active) => {
+        // Defensive: if the component unmounts while active (confirm open or a
+        // POST in-flight), emit a final false so the parent's restartActive
+        // flag is not stranded at true. defer:true still skips the initial
+        // idle mount — and because the effect never runs at idle, no cleanup
+        // is registered there either, so an idle mount+unmount emits nothing.
+        onCleanup(() => props.onActiveChange?.(false));
+        props.onActiveChange?.(active);
+      },
       { defer: true },
     ),
   );
@@ -58,16 +70,20 @@ export default function RestartOpenCode(props: RestartOpenCodeProps) {
   async function doRestart() {
     setRestarting(true);
     setRestartMsg("");
+    setRestartOk(true);
     try {
       const res = await fetch("/vh/restart-opencode", { method: "POST" });
       if (res.ok) {
         setRestartMsg("✓ OpenCode restarted");
+        setRestartOk(true);
         props.onRestarted?.();
       } else {
         setRestartMsg(res.status === 501 ? "Not managed here" : "Restart failed");
+        setRestartOk(false);
       }
     } catch {
       setRestartMsg("Restart failed");
+      setRestartOk(false);
     } finally {
       setRestarting(false);
       setConfirmRestart(false);
@@ -89,7 +105,9 @@ export default function RestartOpenCode(props: RestartOpenCodeProps) {
           line. Shown alongside the entry so a completed restart is visible and
           the entry remains available to restart again. */}
       <Show when={restartMsg()}>
-        <p class="ocu-restart-result">{restartMsg()}</p>
+        <p class="ocu-restart-result" classList={{ err: !restartOk() }}>
+          {restartMsg()}
+        </p>
       </Show>
       <button
         type="button"
@@ -111,45 +129,76 @@ export default function RestartOpenCode(props: RestartOpenCodeProps) {
 // /vh/running-sessions; until it resolves the warning reads "Checking active
 // sessions…" so we never show a stale per-workspace number. Includes "0 running
 // sessions" so "safe" is explicit, never implied by silence.
+// Tri-state for the running-sessions fetch. The previous implementation
+// collapsed both a non-OK response and a network error to {count:0}, which
+// rendered an UNKNOWN count as "0 running sessions — safe to restart" with the
+// danger Restart button ENABLED — under-reporting exactly when uncertain. Fail
+// closed instead: a non-OK response or a network error becomes "unknown", which
+// surfaces an explicit uncertainty message and DISABLES the Restart button
+// (Cancel stays enabled). The known count==0 path ("safe to restart") is
+// unchanged.
+type ConfirmState =
+  | { status: "loading" }
+  | { status: "known"; data: RunningSessions }
+  | { status: "unknown" };
+
 export function RestartConfirm(props: {
   restarting: boolean;
   onConfirm: () => void;
   onCancel: () => void;
 }) {
-  const [data, setData] = createSignal<RunningSessions | null>(null);
+  const [state, setState] = createSignal<ConfirmState>({ status: "loading" });
   onMount(() => {
     fetch("/vh/running-sessions")
       .then((r) => (r.ok ? r.json() : null))
-      .then((d: RunningSessions | null) => setData(d ?? { count: 0, workspaces: [] }))
-      .catch(() => setData({ count: 0, workspaces: [] }));
+      .then((d: RunningSessions | null) =>
+        setState(d ? { status: "known", data: d } : { status: "unknown" }),
+      )
+      .catch(() => setState({ status: "unknown" }));
   });
-  const count = () => data()?.count ?? 0;
-  const wsCount = () => data()?.workspaces.length ?? 0;
+  // Accessors are only meaningful inside the "known" render branch (guarded in
+  // JSX); they return 0 elsewhere so the disabled-unknown path never reads a
+  // stale count.
+  const known = (): RunningSessions | null => {
+    const s = state();
+    return s.status === "known" ? s.data : null;
+  };
+  const count = () => known()?.count ?? 0;
+  const wsCount = () => known()?.workspaces.length ?? 0;
 
   return (
     <div class="ocu-confirm">
       <Show
-        when={data() !== null}
+        when={state().status !== "loading"}
         fallback={<span class="ocu-confirm-loading">Checking active sessions…</span>}
       >
-        <span classList={{ warn: count() > 0 }}>
-          <Show
-            when={count() > 0}
-            fallback={
-              <>0 running sessions — safe to restart. OpenCode will be briefly unavailable; sessions are preserved.</>
-            }
-          >
-            ⚠ {count()} running session{count() === 1 ? "" : "s"}
-            {wsCount() > 1 ? ` across ${wsCount()} workspaces` : ""} will be interrupted. The
-            in-flight turn(s) stop; sessions and history are preserved.
-          </Show>
-        </span>
+        <Show
+          when={state().status === "known"}
+          fallback={
+            <span class="warn">
+              Couldn't verify active sessions — restart will interrupt any that are running.
+            </span>
+          }
+        >
+          <span classList={{ warn: count() > 0 }}>
+            <Show
+              when={count() > 0}
+              fallback={
+                <>0 running sessions — safe to restart. OpenCode will be briefly unavailable; sessions are preserved.</>
+              }
+            >
+              ⚠ {count()} running session{count() === 1 ? "" : "s"}
+              {wsCount() > 1 ? ` across ${wsCount()} workspaces` : ""} will be interrupted. The
+              in-flight turn(s) stop; sessions and history are preserved.
+            </Show>
+          </span>
+        </Show>
       </Show>
       <div class="admin-confirm-btns">
         <button
           type="button"
           class="admin-btn danger"
-          disabled={props.restarting}
+          disabled={props.restarting || state().status === "unknown"}
           onClick={props.onConfirm}
         >
           {props.restarting ? "Restarting…" : "Restart OpenCode"}

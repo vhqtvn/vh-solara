@@ -427,6 +427,12 @@
   color: var(--ok);
   background: var(--code-surface);
 }
+/* Failure result keeps the same result-box treatment, recolored to danger so a
+   failed restart does not read as success-green. */
+.ocu-restart-result.err {
+  color: var(--danger);
+  border-left-color: var(--danger);
+}
 .m-group-label {
   font-size: 11px;
   text-transform: uppercase;
