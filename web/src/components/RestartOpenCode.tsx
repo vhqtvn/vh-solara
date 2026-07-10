@@ -1,4 +1,4 @@
-import { createSignal, onMount, Show } from "solid-js";
+import { createEffect, createSignal, on, onMount, Show } from "solid-js";
 import Icon from "./Icon";
 
 // RestartOpenCode OWNS the complete OpenCode-restart operation end to end: the
@@ -22,6 +22,13 @@ import Icon from "./Icon";
 export type RestartOpenCodeProps = {
   onRestarted?: () => void; // fired after a successful POST (dialog refetches)
   disabled?: boolean; // dialog disables while an install is running
+  accent?: boolean; // dialog footer restyles the entry as .admin-btn.accent
+  // Emits true when this component is in an interactive/blocking state
+  // (RestartConfirm open OR a restart POST in-flight), false when back to idle.
+  // The update dialog uses this to hide its Close button (focus-lock) while a
+  // restart confirmation/POST owns the footer. Deferred so the initial mount
+  // (idle) does not churn the parent's state.
+  onActiveChange?: (active: boolean) => void;
 };
 
 type RunningSessions = { count: number; workspaces: { dir: string; count: number }[] };
@@ -30,6 +37,19 @@ export default function RestartOpenCode(props: RestartOpenCodeProps) {
   const [confirmRestart, setConfirmRestart] = createSignal(false);
   const [restarting, setRestarting] = createSignal(false);
   const [restartMsg, setRestartMsg] = createSignal("");
+
+  // Reflect the active (blocking) state to an optional parent callback so a host
+  // dialog can focus-lock (hide its Close button) while RestartConfirm is open or
+  // a restart POST is in-flight. `defer: true` skips the initial idle run so a
+  // fresh mount does not spuriously toggle the parent's state — only real
+  // transitions (confirm opened/closed, POST start/finish) emit.
+  createEffect(
+    on(
+      () => confirmRestart() || restarting(),
+      (active) => props.onActiveChange?.(active),
+      { defer: true },
+    ),
+  );
 
   // The single POST to /vh/restart-opencode. On success the optional callback
   // fires so a host dialog can refresh its version readout; failure surfaces a
@@ -74,6 +94,7 @@ export default function RestartOpenCode(props: RestartOpenCodeProps) {
       <button
         type="button"
         class="admin-btn"
+        classList={{ accent: !!props.accent }}
         disabled={props.disabled || restarting()}
         onClick={() => (setRestartMsg(""), setConfirmRestart(true))}
       >

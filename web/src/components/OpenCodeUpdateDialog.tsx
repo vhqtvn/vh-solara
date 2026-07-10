@@ -41,6 +41,10 @@ export default function OpenCodeUpdateDialog(props: { onClose: () => void }) {
   // D4: the install log collapses to a result line on completion and is exposed
   // on demand. While updating it streams live (this flag is ignored then).
   const [showLog, setShowLog] = createSignal(false);
+  // M3: focus-lock — while RestartOpenCode is in an interactive/blocking state
+  // (RestartConfirm open or a restart POST in-flight) the dialog hides its Close
+  // button so the footer restart flow owns the user's attention.
+  const [restartActive, setRestartActive] = createSignal(false);
 
   let logEl: HTMLPreElement | undefined;
   const append = (t: string) => {
@@ -180,9 +184,20 @@ export default function OpenCodeUpdateDialog(props: { onClose: () => void }) {
               renders its own entry button + session-aware confirmation + result
               line. */}
           <Show when={offerRestart()}>
-            <RestartOpenCode onRestarted={refetch} disabled={phase() === "updating"} />
+            <RestartOpenCode
+              onRestarted={refetch}
+              disabled={phase() === "updating"}
+              accent
+              onActiveChange={setRestartActive}
+            />
           </Show>
-          <button type="button" class="admin-btn" disabled={phase() === "updating"} onClick={props.onClose}>Close</button>
+          {/* Close is hidden (not merely disabled) while an install runs OR while
+              the footer restart flow is active (confirm open / POST in-flight),
+              so the restart confirmation owns the footer — a focus-lock restoring
+              the pre-extraction behavior. */}
+          <Show when={!(phase() === "updating" || restartActive())}>
+            <button type="button" class="admin-btn" onClick={props.onClose}>Close</button>
+          </Show>
         </div>
       </div>
     </div>

@@ -49,6 +49,19 @@ function footerRestartBtns(): HTMLButtonElement[] {
   );
 }
 
+// The footer Close button (text exactly "Close"). Hidden (not rendered) while an
+// install runs OR while the footer restart flow is active (confirm open / POST
+// in-flight) — the focus-lock restored by M3.
+function footerCloseBtn(): HTMLButtonElement | null {
+  const foot = document.querySelector(".ocu-foot");
+  if (!foot) return null;
+  return (
+    (Array.from(foot.querySelectorAll("button")).find(
+      (b) => (b.textContent || "").trim() === "Close",
+    ) as HTMLButtonElement | undefined) ?? null
+  );
+}
+
 describe("OpenCodeUpdateDialog — stable action slot (D2) + collapsed log (D4)", () => {
   afterEach(() => {
     cleanup();
@@ -212,5 +225,42 @@ describe("OpenCodeUpdateDialog — restart-offer gating + extracted RestartConfi
       return b;
     });
     expect(btn.textContent).toContain("Reinstall latest");
+  });
+
+  it("M3: hides the footer Close button while RestartConfirm is open and restores it on cancel (no POST)", async () => {
+    const fetchMock = vi.fn((url: string) => {
+      if (url.includes("/vh/opencode-version"))
+        return Promise.resolve(jsonResp(VER_RESTART));
+      if (url.includes("/vh/running-sessions"))
+        return Promise.resolve(jsonResp({ count: 0, workspaces: [] }));
+      return Promise.resolve(jsonResp(null, false));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(() => <OpenCodeUpdateDialog onClose={() => {}} />);
+
+    // Footer restart entry is offered (idle + restartNeeded via VER_RESTART).
+    const entry = await waitFor(() => {
+      const b = footerRestartBtns()[0];
+      expect(b).toBeTruthy();
+      return b;
+    });
+    // Close is visible before activating the restart flow.
+    expect(footerCloseBtn()).not.toBeNull();
+
+    // Activate the restart entry → RestartConfirm opens → Close is hidden
+    // (focus-lock so the confirm owns the footer).
+    entry.click();
+    await waitFor(() => expect(document.querySelector(".ocu-confirm")).toBeTruthy());
+    expect(footerCloseBtn()).toBeNull();
+
+    // Cancel the confirm → Close reappears.
+    (document.querySelectorAll(".admin-confirm-btns button")[1] as HTMLButtonElement).click();
+    await waitFor(() => expect(document.querySelector(".ocu-confirm")).toBeNull());
+    expect(footerCloseBtn()).not.toBeNull();
+
+    // No restart POST occurred on this cancel path.
+    expect(
+      fetchMock.mock.calls.find((c) => (c[0] as string).includes("/vh/restart-opencode")),
+    ).toBeUndefined();
   });
 });

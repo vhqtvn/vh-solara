@@ -255,4 +255,56 @@ describe("RestartOpenCode — owns the restart operation", () => {
     (document.querySelectorAll(".admin-confirm-btns button")[0] as HTMLButtonElement).click(); // Confirm (ok)
     await waitFor(() => expect(onRestarted).toHaveBeenCalledTimes(1));
   });
+
+  it("onActiveChange emits true when confirm opens and false when it closes (no initial emit)", async () => {
+    const onActiveChange = vi.fn();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (url.includes("/vh/running-sessions")) return Promise.resolve(jsonResp(RUNNING));
+        return Promise.resolve(jsonResp(null, false, 500));
+      }),
+    );
+
+    render(() => <RestartOpenCode onActiveChange={onActiveChange} />);
+
+    // Idle on mount: the effect is deferred (defer: true) so the initial idle
+    // (false) state does NOT fire the callback — no spurious parent churn.
+    await waitFor(() => expect(document.querySelector("button.admin-btn")).toBeTruthy());
+    expect(onActiveChange).not.toHaveBeenCalled();
+
+    // Open confirm → active becomes true.
+    (document.querySelector("button.admin-btn") as HTMLButtonElement).click();
+    await waitFor(() => expect(document.querySelector(".ocu-confirm")).toBeTruthy());
+    expect(onActiveChange).toHaveBeenLastCalledWith(true);
+
+    // Cancel → active becomes false.
+    (document.querySelectorAll(".admin-confirm-btns button")[1] as HTMLButtonElement).click();
+    await waitFor(() => expect(document.querySelector(".ocu-confirm")).toBeNull());
+    expect(onActiveChange).toHaveBeenLastCalledWith(false);
+  });
+
+  it("applies the accent class to the entry button when accent is passed", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => Promise.resolve(jsonResp(RUNNING))),
+    );
+
+    render(() => <RestartOpenCode accent />);
+    const entry = document.querySelector("button.admin-btn") as HTMLButtonElement;
+    expect(entry).toBeTruthy();
+    expect(entry.classList.contains("accent")).toBe(true);
+  });
+
+  it("does NOT apply the accent class when accent is omitted", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => Promise.resolve(jsonResp(RUNNING))),
+    );
+
+    render(() => <RestartOpenCode />);
+    const entry = document.querySelector("button.admin-btn") as HTMLButtonElement;
+    expect(entry).toBeTruthy();
+    expect(entry.classList.contains("accent")).toBe(false);
+  });
 });
