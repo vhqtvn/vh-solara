@@ -135,6 +135,28 @@
 }
 
 /* --- project switcher DIALOG (Slice 1) --- */
+/* Header UX: the shared .icon-btn carries a fixed 26px height, which defeats
+   the flex container's default align-items: stretch (a definite cross-size
+   falls back to flex-start) — so the close X sat small/low beside the ~38px
+   search input and read as a competing peer box. Reassert stretch on the
+   header and drop the fixed height on the close button so it tracks the
+   input's height (derived from the input's own padding, no magic pixels).
+   Scoped to .projects-dialog only — ModelDialog shares the markup pattern but
+   must keep its default chrome. */
+.projects-dialog .dialog-head { align-items: stretch; }
+.projects-dialog .dialog-head .icon-btn {
+  height: auto;
+  align-self: stretch;
+  /* Quiet dismissal: transparent border keeps the box model identical to the
+     bordered search field (perfect height harmony) while removing the visual
+     frame; muted glyph brightens only on hover. Stays a clear tap target. */
+  border-color: transparent;
+  color: var(--fg-dim);
+}
+.projects-dialog .dialog-head .icon-btn:hover {
+  background: color-mix(in srgb, var(--fg) 8%, transparent);
+  color: var(--fg);
+}
 /* Slightly more compact than the 560px default since rows are short. Desktop
    only; mobile is fullscreen via the canonical @media(max-width:720px) block. */
 .dialog.projects-dialog { width: 480px; }
