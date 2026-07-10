@@ -471,6 +471,157 @@ func TestStreamAsyncHydration(t *testing.T) {
 	waitFor(t, func() bool { return agg.Store().IsMessagesLoaded("a") }, "session a loaded after completion")
 }
 
+// TestStreamAsyncHydrationLiveUpdateDuringFetch pins the O2 background-hydration
+// ordering contract that TestStreamAsyncHydration does NOT cover: a LIVE upstream
+// message/part update landing on the event tail WHILE the unbounded full-history
+// GET is in flight, then the stale-but-now-arriving full reconciliation must NOT
+// clobber the newer live state.
+//
+// The store's reconcile (SetSessionMessages -> reconcileMessagesLocked) treats the
+// fetched list as authoritative: messages present in the store but ABSENT from the
+// fetch are deleted (store.go ~2047-2057). When a live event arrives during the
+// in-flight fetch, the fetch snapshot is stale relative to that live state, so the
+// reconciliation must not discard the live message. This test forces the
+// live-arrives-first ordering deterministically (waitFor m2 in store BEFORE
+// releasing the held GET) so the only variable is whether reconcile preserves m2.
+func TestStreamAsyncHydrationLiveUpdateDuringFetch(t *testing.T) {
+	fake := newFake()
+	fake.sessions = []string{`{"id":"a","title":"A","time":{"updated":1}}`}
+	// The stale full-history GET returns ONLY m1 (the pre-live state). m2 is
+	// injected purely via the live event tail and is deliberately ABSENT from
+	// the fetched list, so a presence-based reconcile would delete it.
+	fake.messages["a"] = `[{"info":{"id":"m1","sessionID":"a","role":"user"},"parts":[{"id":"p1","sessionID":"a","messageID":"m1","type":"text","text":"hi"}]}]`
+	hold := make(chan struct{})
+	fake.msgHold["a"] = hold
+
+	ocSrv := httptest.NewServer(fake.handler())
+	defer ocSrv.Close()
+
+	agg := aggregator.New(ocSrv.URL, 1000)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go agg.Run(ctx)
+	waitFor(t, func() bool { return len(agg.Store().Snapshot(map[string]bool{}).Sessions) == 1 }, "hydrate session a")
+
+	srv, _ := NewServer(agg, ocSrv.URL, 1000)
+	web := httptest.NewServer(srv.Handler())
+	defer web.Close()
+
+	// Open the stream for session "a": this triggers EnsureMessagesAsync, whose
+	// background GET blocks on the hold. The partial snapshot proves the GET is
+	// in flight (the frame lands before the upstream fetch completes).
+	resp, err := http.Get(web.URL + "/vh/stream?sessions=a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	reader := bufio.NewReader(resp.Body)
+	ev, _ := readSSEFrame(t, reader)
+	if ev != "snapshot" {
+		t.Fatalf("first frame want 'snapshot', got %q", ev)
+	}
+
+	// WHILE the full GET is held, inject LIVE upstream updates via the event tail
+	// (the same path the daemon subscribes to in production):
+	//  - m2: a brand-new assistant message, deliberately ABSENT from the fetch
+	//    (not added to fake.messages) so a presence-based message reconcile would
+	//    delete it. This pins the message delete-missing gate.
+	//  - p2: m2's text part (under the live m2).
+	//  - p1b: a brand-new text part under m1 — the FETCHED message. m1 is in the
+	//    fetch but only with p1, so p1b is absent from the fetched part list; a
+	//    presence-based PART reconcile would delete it. This pins the part
+	//    delete-missing gate (the same bug class, on the per-message part loop).
+	fake.events <- `{"type":"message.updated","properties":{"info":{"id":"m2","sessionID":"a","role":"assistant","agent":"test"}}}`
+	fake.events <- `{"type":"message.part.updated","properties":{"part":{"id":"p2","sessionID":"a","messageID":"m2","type":"text","text":"live!"}}}`
+	fake.events <- `{"type":"message.part.updated","properties":{"part":{"id":"p1b","sessionID":"a","messageID":"m1","type":"text","text":"live-extra"}}}`
+
+	// Snapshot helpers to read the reconciled store state.
+	msgIDs := func() map[string]bool {
+		ids := map[string]bool{}
+		for _, mwp := range agg.Store().Snapshot(map[string]bool{"a": true}).Messages["a"] {
+			var env struct {
+				ID string `json:"id"`
+			}
+			json.Unmarshal(mwp.Info, &env)
+			ids[env.ID] = true
+		}
+		return ids
+	}
+	partIDs := func(msgID string) map[string]bool {
+		ids := map[string]bool{}
+		for _, mwp := range agg.Store().Snapshot(map[string]bool{"a": true}).Messages["a"] {
+			var env struct {
+				ID string `json:"id"`
+			}
+			json.Unmarshal(mwp.Info, &env)
+			if env.ID != msgID {
+				continue
+			}
+			for _, part := range mwp.Parts {
+				var pe struct {
+					ID string `json:"id"`
+				}
+				json.Unmarshal(part, &pe)
+				ids[pe.ID] = true
+			}
+		}
+		return ids
+	}
+	// partExists scans every message's parts in session a (regardless of message
+	// Info), so it also observes a part attached to a placeholder message whose
+	// info is still nil (the upsertPartLocked "part before message.updated"
+	// placeholder created when a live part lands before its fetched message).
+	partExists := func(partID string) bool {
+		for _, mwp := range agg.Store().Snapshot(map[string]bool{"a": true}).Messages["a"] {
+			for _, part := range mwp.Parts {
+				var pe struct {
+					ID string `json:"id"`
+				}
+				json.Unmarshal(part, &pe)
+				if pe.ID == partID {
+					return true
+				}
+			}
+		}
+		return false
+	}
+
+	// Guarantee the live events have been applied to the store BEFORE releasing
+	// the held GET. This removes all timing nondeterminism: the only remaining
+	// variable is whether reconcileMessagesLocked preserves m2 and p1b.
+	waitFor(t, func() bool { return msgIDs()["m2"] }, "live message m2 applied to store during in-flight fetch")
+	waitFor(t, func() bool { return partExists("p1b") }, "live part p1b applied to store during in-flight fetch")
+
+	// Release the held stale GET -> the background reconciliation completes.
+	close(hold)
+	waitFor(t, func() bool { return agg.Store().IsMessagesLoaded("a") }, "session a loaded after stale reconcile")
+
+	// CONTRACT: the final store must reflect BOTH the reconciled full history
+	// (m1) AND the newer live updates (m2 + p1b). The stale reconciliation must
+	// NOT have deleted a live message/part merely because it was absent from the
+	// fetch snapshot.
+	ids := msgIDs()
+	if !ids["m1"] {
+		t.Errorf("reconciled full history missing m1: %v", ids)
+	}
+	if !ids["m2"] {
+		t.Errorf("LIVE UPDATE CLOBBERED: stale reconcile deleted m2 (absent from fetch snapshot) — store has %v", ids)
+	}
+	// m1's parts: the fetched p1 AND the live-arrived p1b must both survive.
+	m1Parts := partIDs("m1")
+	if !m1Parts["p1"] {
+		t.Errorf("reconciled full history missing m1/p1: %v", m1Parts)
+	}
+	if !m1Parts["p1b"] {
+		t.Errorf("LIVE PART CLOBBERED: stale reconcile deleted m1/p1b (absent from fetch snapshot) — m1 parts %v", m1Parts)
+	}
+	// m2's live part p2 must survive (it lives under the live message m2).
+	m2Parts := partIDs("m2")
+	if !m2Parts["p2"] {
+		t.Errorf("live part m2/p2 missing after reconcile: %v", m2Parts)
+	}
+}
+
 // TestCSRFGuard verifies state-changing API requests require the custom header,
 // reads don't, and the side-effect-free /vh/render is exempt.
 func TestCSRFGuard(t *testing.T) {

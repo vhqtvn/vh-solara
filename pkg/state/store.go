@@ -2032,27 +2032,37 @@ func (s *Store) reconcileMessagesLocked(sid string, list []MessageWithParts) {
 				}
 			}
 		}
+		// Absence-deletion is AUTHORITATIVE-only: skipped on a cold load
+		// (coldLoad==true), where the fetched list can be stale relative to
+		// live message/part events that arrived during the in-flight fetch.
+		// On a cold load the live event tail is the source of truth for "what
+		// exists now"; deleting a store part merely because it's absent from a
+		// stale fetch would clobber newer live state (e.g. a live
+		// message.part.updated for a brand-new part landing mid-fetch).
 		for pid := range me.parts {
-			if !seenPart[pid] {
+			if !seenPart[pid] && !coldLoad {
 				delete(me.parts, pid)
 				me.partOrder = removeString(me.partOrder, pid)
-				if !coldLoad {
-					s.emit(KindPartDelete, rawObj(map[string]interface{}{
-						"sessionID": sid, "messageID": env.ID, "partID": pid,
-					}))
-				}
+				s.emit(KindPartDelete, rawObj(map[string]interface{}{
+					"sessionID": sid, "messageID": env.ID, "partID": pid,
+				}))
 			}
 		}
 	}
+	// Same cold-load gate as the part loop above: on a cold load a fetched
+	// message list can be stale relative to live events, so absence from the
+	// fetch is NOT a reliable deletion signal — only the warm resync path
+	// (reconnect/re-fetch for an already-loaded session, coldLoad==false)
+	// reconciles authoritatively and prunes absent messages. Live deletion
+	// (session.deleted / explicit removal events) is the authoritative prune
+	// path for a cold-loaded session.
 	for mid := range sm.byID {
-		if !seenMsg[mid] {
+		if !seenMsg[mid] && !coldLoad {
 			delete(sm.byID, mid)
 			sm.order = removeString(sm.order, mid)
-			if !coldLoad {
-				s.emit(KindMessageDelete, rawObj(map[string]interface{}{
-					"sessionID": sid, "messageID": mid,
-				}))
-			}
+			s.emit(KindMessageDelete, rawObj(map[string]interface{}{
+				"sessionID": sid, "messageID": mid,
+			}))
 		}
 	}
 	s.recomputeLastAssistantLocked(sid)
