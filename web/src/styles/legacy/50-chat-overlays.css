@@ -282,30 +282,8 @@
 .admin-btn.sm { width: auto; padding: 3px 8px; font-size: 11.5px; gap: 4px; }
 .icon-btn.warn { color: var(--warn); }
 
-/* --- command palette (Cmd/Ctrl+K) --- */
-.palette-overlay {
-  position: fixed; inset: 0; z-index: var(--z-modal);
-  display: flex; justify-content: center; align-items: flex-start;
-  padding-top: 12vh;
-  background: color-mix(in srgb, var(--bg) 55%, transparent);
-}
-.palette {
-  width: min(560px, 92vw);
-  display: flex; flex-direction: column;
-  background: var(--bg-2); border: 1px solid var(--border); border-radius: 12px;
-  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.5); overflow: hidden;
-}
-.palette-input-row { display: flex; align-items: center; gap: 8px; padding: 11px 14px; border-bottom: 1px solid var(--border); color: var(--fg-dim); }
-.palette-input { flex: 1; border: 0; background: transparent; color: var(--fg); font: inherit; font-size: 15px; outline: none; }
-.palette-list { max-height: 50vh; overflow-y: auto; padding: 6px; }
-.palette-item {
-  display: flex; align-items: center; gap: 10px; width: 100%; text-align: left;
-  padding: 9px 10px; border: 0; border-radius: 8px; background: transparent;
-  color: var(--fg); font: inherit; font-size: 14px; cursor: pointer;
-}
-.palette-item.active { background: color-mix(in srgb, var(--accent) 18%, transparent); }
-.palette-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.palette-hint { font-size: 11px; color: var(--fg-dim); text-transform: uppercase; letter-spacing: 0.04em; }
-.palette-empty { padding: 16px; text-align: center; color: var(--fg-dim); font-size: 13px; }
+/* @keyframes spin — shared global animation (e.g. CommandPalette loader).
+   The .palette-* command-palette rules were carved out to
+   CommandPalette.module.css (Stage 2 Batch 1); this keyframe stays here. */
 @keyframes spin { to { transform: rotate(360deg); } }
 
