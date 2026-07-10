@@ -196,7 +196,7 @@
   white-space: nowrap;
 }
 .msg-time, .msg-cost { font-size: 11px; color: var(--fg-dim); }
-.msg-cost { font-family: ui-monospace, Menlo, monospace; }
+.msg-cost { font-family: var(--font-mono); }
 .msg-perf {
   display: inline-flex;
   align-items: center;
@@ -287,7 +287,7 @@
    the default scroll (pre) to wrapped (pre-wrap) so long lines fold instead of
    overflowing horizontally. */
 .md pre.wrap { white-space: pre-wrap; overflow-wrap: anywhere; }
-.md code { font-family: ui-monospace, Menlo, monospace; font-size: 13px; }
+.md code { font-family: var(--font-mono); font-size: 13px; }
 .md :not(pre) > code {
   background: var(--md-code-bg);
   color: var(--md-code);

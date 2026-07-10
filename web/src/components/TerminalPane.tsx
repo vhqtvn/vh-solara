@@ -4,6 +4,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import { projectDir } from "../sync";
 import { termKeys } from "../ui";
+import { monoFontStack } from "../font";
 
 // A real terminal: xterm.js over a WebSocket-backed PTY (/vh/term/ws). Input
 // flows through term.onData() so IME/composition resolves to final bytes (the
@@ -143,7 +144,11 @@ export default function TerminalPane(props: { termId?: string; session?: string;
     term = new Xterm({
       cursorBlink: true,
       fontSize: 13,
-      fontFamily: "ui-monospace, Menlo, Consolas, monospace",
+      // Drive the terminal from the same mono font the user picks in Settings
+      // → Code font, for consistency. xterm takes a literal fontFamily at
+      // creation (not a CSS var), so we resolve the active stack here. A change
+      // applies on the next terminal creation (tab switch/reconnect), not live.
+      fontFamily: monoFontStack(),
       allowProposedApi: true,
       theme: { background: "#0b0f17" },
       scrollback: 5000,

@@ -34,6 +34,13 @@ export const THEMES: ThemeDef[] = [
   { id: "monokai", name: "Monokai", swatch: { bg: "#272822", fg: "#f8f8f2", accent: "#66d9ef", accent2: "#f92672" } },
   { id: "kanagawa", name: "Kanagawa", swatch: { bg: "#1f1f28", fg: "#dcd7ba", accent: "#7e9cd8", accent2: "#957fb8" } },
   { id: "material", name: "Material Ocean", swatch: { bg: "#263238", fg: "#eeffff", accent: "#82aaff", accent2: "#c792ea" } },
+  { id: "synthwave-84", name: "Synthwave '84", swatch: { bg: "#262335", fg: "#ffffff", accent: "#f92aad", accent2: "#36f9f6" } },
+  { id: "night-owl", name: "Night Owl", swatch: { bg: "#011627", fg: "#d6deeb", accent: "#82aaff", accent2: "#c792ea" } },
+  { id: "cobalt2", name: "Cobalt2", swatch: { bg: "#193549", fg: "#ffffff", accent: "#ffc600", accent2: "#ff628c" } },
+  { id: "catppuccin-macchiato", name: "Catppuccin Macchiato", swatch: { bg: "#24273a", fg: "#cad3f5", accent: "#8aadf4", accent2: "#c6a0f6" } },
+  { id: "catppuccin-frappe", name: "Catppuccin Frappé", swatch: { bg: "#303446", fg: "#c6d0f5", accent: "#8caaee", accent2: "#ca9ee6" } },
+  { id: "kanagawa-dragon", name: "Kanagawa Dragon", swatch: { bg: "#181616", fg: "#c5c9c5", accent: "#7e9cd8", accent2: "#957fb8" } },
+  { id: "gruvbox-material", name: "Gruvbox Material", swatch: { bg: "#1d2021", fg: "#d4be98", accent: "#7daea3", accent2: "#d3869b" } },
   { id: "light", name: "Light", light: true, swatch: { bg: "#ffffff", fg: "#1f2328", accent: "#0969da", accent2: "#8250df" } },
   { id: "shire-light", name: "Shire (light)", light: true, swatch: { bg: "#f9f5eb", fg: "#1a1612", accent: "#5d6e3f", accent2: "#8c5520" } },
   { id: "solarized-light", name: "Solarized (light)", light: true, swatch: { bg: "#fdf6e3", fg: "#586e75", accent: "#268bd2", accent2: "#d33682" } },
@@ -43,6 +50,8 @@ export const THEMES: ThemeDef[] = [
   { id: "paper-color", name: "Paper Color", light: true, swatch: { bg: "#eceae2", fg: "#24231f", accent: "#4f7a8f", accent2: "#9c6b52" } },
   { id: "eink", name: "E Ink", light: true, swatch: { bg: "#ffffff", fg: "#000000", accent: "#000000", accent2: "#000000" } },
   { id: "eink-color", name: "E Ink Color", light: true, swatch: { bg: "#ffffff", fg: "#000000", accent: "#0b5cad", accent2: "#b3431a" } },
+  { id: "one-light", name: "One Light", light: true, swatch: { bg: "#fafafa", fg: "#383a42", accent: "#4078f2", accent2: "#a626a4" } },
+  { id: "ayu-light", name: "Ayu Light", light: true, swatch: { bg: "#fafafa", fg: "#5b6773", accent: "#399ee6", accent2: "#f9ae58" } },
   { id: "custom", name: "Custom…", swatch: { bg: "#0d1117", fg: "#c9d1d9", accent: "#58a6ff", accent2: "#d2a8ff" } },
 ];
 

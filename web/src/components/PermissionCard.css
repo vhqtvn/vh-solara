@@ -124,6 +124,6 @@
 .perm-always-list li { line-height: 1.5; }
 .perm-always-list code,
 .perm-always-one code {
-  font-family: var(--font-mono, ui-monospace, monospace);
+  font-family: var(--font-mono);
 }
 .perm-always-list code { color: var(--fg); }

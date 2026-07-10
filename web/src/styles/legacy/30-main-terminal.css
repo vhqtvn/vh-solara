@@ -39,5 +39,5 @@
    (responsive on mobile — fills whatever the body gets). */
 .view-frame { flex: 1; width: 100%; height: 100%; border: 0; background: var(--bg); }
 .placeholder { color: var(--fg-dim); padding: 16px; }
-.kv { font-family: ui-monospace, Menlo, monospace; font-size: 13px; }
+.kv { font-family: var(--font-mono); font-size: 13px; }
 

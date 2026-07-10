@@ -51,7 +51,7 @@
 .git-stage-row.staged { background: color-mix(in srgb, var(--ok) 8%, transparent); }
 .git-stage-x { width: 14px; text-align: center; color: var(--fg-dim); }
 .git-stage-row.staged .git-stage-x { color: var(--ok); }
-.git-stage-name { flex: 1; font-family: ui-monospace, Menlo, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.git-stage-name { flex: 1; font-family: var(--font-mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .git-mini {
   flex: 0 0 auto; min-width: 24px; height: 24px; padding: 0 7px;
   display: inline-flex; align-items: center; justify-content: center;

@@ -106,7 +106,7 @@
 .confirm-list li:first-child { border-top: 0; }
 .confirm-list li.root { background: color-mix(in srgb, var(--accent) 8%, transparent); }
 .confirm-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.confirm-id { font-size: 11px; color: var(--fg-dim); font-family: ui-monospace, Menlo, monospace; }
+.confirm-id { font-size: 11px; color: var(--fg-dim); font-family: var(--font-mono); }
 .confirm-actions {
   display: flex;
   justify-content: flex-end;

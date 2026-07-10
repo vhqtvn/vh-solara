@@ -197,7 +197,7 @@
 }
 .ac-kind.agent { color: var(--accent); }
 .ac-kind.command { color: var(--warn); }
-.ac-label { flex: 0 0 auto; font-family: ui-monospace, Menlo, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 55%; }
+.ac-label { flex: 0 0 auto; font-family: var(--font-mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 55%; }
 .ac-detail { flex: 1; color: var(--fg-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
 
 /* Queued-messages row above the composer. */
@@ -230,7 +230,7 @@
 
 /* --- diff / patch rendering (shared by chat diffs + git) --- */
 .vh-diff {
-  font: 12px/1.5 ui-monospace, Menlo, monospace;
+  font: 12px/1.5 var(--font-mono);
   overflow-x: auto;
   border: 1px solid var(--border);
   border-radius: 6px;
@@ -268,8 +268,8 @@
    typography rules in shard 80 (font-family / font-size lists) so they cannot
    move without splitting a shared rule. Their base rules stay here and their
    refinements stay in 80 — cascade unchanged. */
-.git-branch { font-family: ui-monospace, Menlo, monospace; color: var(--fg-dim); }
-.gitfile-name { flex: 1; font-family: ui-monospace, Menlo, monospace; overflow: hidden; text-overflow: ellipsis; }
+.git-branch { font-family: var(--font-mono); color: var(--fg-dim); }
+.gitfile-name { flex: 1; font-family: var(--font-mono); overflow: hidden; text-overflow: ellipsis; }
 .gitfile-counts { font-size: 12px; display: flex; gap: 6px; }
 .gitfile-counts .adds { color: var(--ok); }
 .gitfile-counts .dels { color: var(--danger); }
@@ -357,7 +357,7 @@
   border: 1px solid var(--border);
   border-radius: 8px;
   padding: 8px 10px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-family: var(--font-mono);
   font-size: 12px;
   line-height: 1.45;
   color: var(--fg);
@@ -553,7 +553,7 @@
   background: var(--code-surface);
   border: 1px solid var(--border);
   border-radius: 6px;
-  font: 11px/1.5 ui-monospace, Menlo, monospace;
+  font: 11px/1.5 var(--font-mono);
   white-space: pre-wrap;
   overflow-x: auto;
   max-height: 320px;

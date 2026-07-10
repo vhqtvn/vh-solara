@@ -142,7 +142,7 @@
   background: var(--bg-input, #0d1117);
   border: 1px solid var(--border);
   border-radius: 6px;
-  font-family: var(--font-mono, ui-monospace, monospace);
+  font-family: var(--font-mono);
   font-size: 12px;
   white-space: pre-wrap;
   word-break: break-word;
@@ -261,7 +261,7 @@
 .admin-rows { display: flex; flex-direction: column; gap: 2px; margin-bottom: 4px; }
 .admin-ver { display: flex; justify-content: space-between; font-size: 12px; padding: 2px 2px; }
 .admin-ver > span:first-child { color: var(--fg-dim); }
-.admin-ver-val { font-family: ui-monospace, Menlo, monospace; font-variant-numeric: tabular-nums; }
+.admin-ver-val { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
 .admin-btn {
   display: flex; align-items: center; gap: 8px;
   width: 100%; text-align: left;

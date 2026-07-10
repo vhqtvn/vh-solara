@@ -1,7 +1,7 @@
 import { createResource, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { CUSTOM_FIELDS, customTheme, exportCustomTheme, importCustomTheme, resetCustomTheme, seedCustomFromTheme, setCustomTheme, theme, THEMES } from "../theme";
 import ThemePicker from "./ThemePicker";
-import { customFont, font, FONTS, setCustomFont, setFontId } from "../font";
+import { customFont, font, FONTS, monoFont, MONO_FONTS, setCustomFont, setFontId, setMonoFontId } from "../font";
 import { hideBuiltin, setHideBuiltin } from "../models";
 import { setStreamLive, streamLive, treeDensity, setTreeDensity, uiScale, setUiScale, orientation, setOrientation, MIN_SCALE, MAX_SCALE, chatWidth, setChatWidth, chatBubbles, setChatBubbles, notesEnabled, setNotesEnabled, tabStyle, setTabStyle, type ChatWidth, type TabStyle } from "../prefs";
 import { queueMode, setQueueMode } from "../queue";
@@ -234,6 +234,17 @@ export default function SettingsDialog(props: { onClose: () => void }) {
                   value={font()}
                   options={FONTS.map((f) => ({ value: f.id, label: f.name }))}
                   onChange={setFontId}
+                />
+              </div>
+              <p class="setting-hint">Non-system fonts load on demand from Google Fonts.</p>
+              <div class="setting-row">
+                <label>Code font</label>
+                <Select
+                  class="theme-select"
+                  ariaLabel="Code font"
+                  value={monoFont()}
+                  options={MONO_FONTS.map((f) => ({ value: f.id, label: f.name }))}
+                  onChange={setMonoFontId}
                 />
               </div>
               <p class="setting-hint">Non-system fonts load on demand from Google Fonts.</p>

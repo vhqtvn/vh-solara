@@ -195,6 +195,54 @@
   --bg: #263238; --bg-2: #2e3c43; --border: #425057;
   --fg: #eeffff; --fg-dim: #8d9ea3; --accent: #82aaff; --accent-2: #c792ea;
 }
+/* --- Additional community palettes (chrome + accents; markdown tokens derive). --- */
+/* Synthwave '84 — neon pink/cyan on a deep purple. (Robb Owen, synthwave-vscode.) */
+:root.theme-synthwave-84 {
+  --bg: #262335; --bg-2: #1a1721; --border: #34294f;
+  --fg: #ffffff; --fg-dim: #848bbd; --accent: #f92aad; --accent-2: #36f9f6;
+  --code-bg: #1a1721; --code-surface: #15101e;
+}
+/* Night Owl — deep navy with bright blues/purples. (Sarah Drasner, night-owl.) */
+:root.theme-night-owl {
+  --bg: #011627; --bg-2: #0b2942; --border: #1d3b53;
+  --fg: #d6deeb; --fg-dim: #637777; --accent: #82aaff; --accent-2: #c792ea;
+  --code-bg: #0b2942; --code-surface: #011627;
+}
+/* Cobalt2 — cobalt blue with warm yellow/pink accents. (Wes Bos, cobalt2-vscode.) */
+:root.theme-cobalt2 {
+  --bg: #193549; --bg-2: #122738; --border: #2a4556;
+  --fg: #ffffff; --fg-dim: #8eb0c8; --accent: #ffc600; --accent-2: #ff628c;
+  --code-bg: #122738; --code-surface: #0e1e2c;
+}
+/* Catppuccin Macchiato. (Catppuccin community, palette v1.x.) */
+:root.theme-catppuccin-macchiato {
+  --bg: #24273a; --bg-2: #1e2030; --border: #363a4f;
+  --fg: #cad3f5; --fg-dim: #6e738d; --accent: #8aadf4; --accent-2: #c6a0f6;
+  --code-bg: #1e2030; --code-surface: #181926;
+  --md-h2: #91d7e3; --md-code: #a6da95;
+}
+/* Catppuccin Frappé. (Catppuccin community, palette v1.x.) */
+:root.theme-catppuccin-frappe {
+  --bg: #303446; --bg-2: #292c3c; --border: #414559;
+  --fg: #c6d0f5; --fg-dim: #737994; --accent: #8caaee; --accent-2: #ca9ee6;
+  --code-bg: #292c3c; --code-surface: #232634;
+  --md-h2: #99d1db; --md-code: #a6d189;
+}
+/* Kanagawa Dragon — a much darker, desaturated Kanagawa variant.
+   (reirei235/kanagawa — the "dragon" background with the family's accents.) */
+:root.theme-kanagawa-dragon {
+  --bg: #181616; --bg-2: #1b1a1a; --border: #3a3736;
+  --fg: #c5c9c5; --fg-dim: #8b8d88; --accent: #7e9cd8; --accent-2: #957fb8;
+  --code-bg: #1b1a1a; --code-surface: #141313;
+}
+/* Gruvbox Material (dark, "hard" background) — softer fg than gruvbox.
+   (sainnhe/gruvbox-material.) */
+:root.theme-gruvbox-material {
+  --bg: #1d2021; --bg-2: #282828; --border: #3c3836;
+  --fg: #d4be98; --fg-dim: #a89984; --accent: #7daea3; --accent-2: #d3869b;
+  --code-bg: #282828; --code-surface: #1d2021;
+  --md-h1: #d8a657; --md-h2: #a9b665; --md-code: #a9b665;
+}
 :root.theme-catppuccin-latte {
   --bg: #eff1f5; --bg-2: #e6e9ef; --border: #ccd0da;
   --fg: #4c4f69; --fg-dim: #8c8fa1; --accent: #1e66f5; --accent-2: #8839ef;
@@ -202,6 +250,19 @@
 :root.theme-rose-pine-dawn {
   --bg: #faf4ed; --bg-2: #fffaf3; --border: #dfdad9;
   --fg: #575279; --fg-dim: #797593; --accent: #56949f; --accent-2: #907aa9;
+}
+/* Atom One Light. (Atom team, atom-one-light — light variant of One Dark.) */
+:root.theme-one-light {
+  --bg: #fafafa; --bg-2: #f0f0f0; --border: #e5e5e5;
+  --fg: #383a42; --fg-dim: #9da0a6; --accent: #4078f2; --accent-2: #a626a4;
+  --code-bg: #f0f0f0; --code-surface: #fafafa;
+  --md-h2: #0184bc; --md-code: #50a14f;
+}
+/* Ayu Light. (ayu theme — light variant; blue accent + warm orange.) */
+:root.theme-ayu-light {
+  --bg: #fafafa; --bg-2: #f3f3f0; --border: #e6e7e8;
+  --fg: #5b6773; --fg-dim: #97989e; --accent: #399ee6; --accent-2: #f9ae58;
+  --code-bg: #f3f3f0; --code-surface: #fafafa;
 }
 /* On light themes the most-prominent text must be dark, not white. */
 /* Light-theme overrides apply to ALL light themes via the generic marker class

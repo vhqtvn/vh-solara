@@ -7,7 +7,7 @@ import { agents, loadAgents } from "./agents";
 import { loadModels, models } from "./models";
 import { pushNotification } from "./notify";
 import { applyTheme } from "./theme";
-import { applyFont } from "./font";
+import { applyFont, applyMonoFont } from "./font";
 import "./prefs"; // import for side effect: DOM-affecting prefs apply reactively on load
 import { registerServiceWorker, startVersionCheck } from "./pwa";
 import { initPwaInstall } from "./pwa-install";
@@ -65,6 +65,7 @@ installCsrf(); // must run before any fetch
 installViewport();
 applyTheme();
 applyFont();
+applyMonoFont();
 
 const root = document.getElementById("root")!;
 const standalone = new URLSearchParams(location.search).get("standalone");

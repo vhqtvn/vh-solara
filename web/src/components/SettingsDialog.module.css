@@ -9,11 +9,11 @@
 /* --- Settings → Terminals: session management. --- */
 .term-sess { border: 1px solid var(--border); border-radius: 8px; margin-bottom: 8px; overflow: hidden; }
 .term-sess-head { display: flex; align-items: center; gap: 10px; padding: 8px 10px; background: var(--bg-2); }
-.term-sess-dir { font-family: ui-monospace, Menlo, monospace; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.term-sess-dir { font-family: var(--font-mono); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .term-sess-meta { flex: 1; font-size: 11px; color: var(--fg-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .term-sess-kill { flex: 0 0 auto; padding: 5px 12px; font: inherit; font-size: 12px; background: var(--bg); color: var(--danger); border: 1px solid color-mix(in srgb, var(--danger) 45%, var(--border)); border-radius: 6px; cursor: pointer; }
 .term-sess-kill:hover { background: color-mix(in srgb, var(--danger) 14%, var(--bg)); }
-:global(.term-sess-preview) { margin: 0; padding: 8px 10px; font: 11px/1.45 ui-monospace, Menlo, monospace; color: var(--fg-dim); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 96px; overflow-y: auto; border-top: 1px solid var(--border); }
+:global(.term-sess-preview) { margin: 0; padding: 8px 10px; font: 11px/1.45 var(--font-mono); color: var(--fg-dim); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 96px; overflow-y: auto; border-top: 1px solid var(--border); }
 
 /* Custom-theme editor (Settings → Appearance, shown when the Custom theme is selected). */
 .custom-theme { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
