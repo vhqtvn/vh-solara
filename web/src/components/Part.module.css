@@ -56,7 +56,7 @@
 
 /* Compact activity row (used inside .activity). The whole head is the toggle;
    expanding reveals the command + output below. */
-.tool { border-radius: 7px; margin: 0; overflow: hidden; transition: height 0.18s var(--ease, ease); }
+:global(.tool) { border-radius: 7px; margin: 0; overflow: hidden; transition: height 0.18s var(--ease, ease); }
 /* .tool-head stays :global — queried by features2.spec.ts. */
 :global(.tool-head) {
   display: flex;
@@ -80,9 +80,9 @@
 /* Running tool: the session-list shimmer, smaller and accent-tinted. */
 .tool-spin { flex: 0 0 auto; color: var(--accent); display: inline-flex; }
 /* Status strings (running/completed/error) are dynamic classList keys — :global. */
-.tool:global(.running) .tool-status { background: var(--accent); }
-.tool:global(.completed) .tool-status { background: var(--ok); }
-.tool:global(.error) .tool-status { background: var(--danger); }
+:global(.tool.running) .tool-status { background: var(--accent); }
+:global(.tool.completed) .tool-status { background: var(--ok); }
+:global(.tool.error) .tool-status { background: var(--danger); }
 .tool-ico { display: inline-flex; align-items: center; color: var(--fg-dim); flex: 0 0 auto; }
 /* .tool-name stays :global — queried by smoke.spec.ts. */
 :global(.tool-name) { font-weight: 550; font-size: 13px; flex: 0 0 auto; }

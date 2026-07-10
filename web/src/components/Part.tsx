@@ -496,7 +496,7 @@ function ToolPart(props: { part: Part; tail?: boolean }) {
     if (expanded()) setRevealed(true);
   });
   return (
-    <div class={styles.tool} classList={{ [status()]: true }}>
+    <div class="tool" classList={{ [status()]: true }}>
       <button type="button" class="tool-head" classList={{ "no-toggle": !hasDetail() }} onClick={toggle}>
         {/* Running tools show the session-list shimmer (smaller); finished/failed
             show a static status dot. */}
