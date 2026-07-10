@@ -90,12 +90,25 @@ func decodeMessages(items []json.RawMessage) []state.MessageWithParts {
 	return mwp
 }
 
-// EnsureMessages lazily loads a session's message history on first open. It is
-// a no-op once the session is loaded; subsequent live events keep it current.
+// EnsureMessages lazily loads a session's message history on first open (the
+// synchronous path used by GET /vh/snapshot). It is a no-op once the session is
+// loaded; subsequent live events keep it current.
+//
+// Like EnsureMessagesAsync it marks the cold-fetch window active for the
+// duration of the (potentially blocking) GET so a live event arriving
+// mid-fetch tags its entries and the subsequent SetSessionMessages reconcile
+// preserves the newer live content instead of clobbering it with the stale
+// fetched body (C-F2). MarkColdFetchStart is set AFTER the IsMessagesLoaded
+// early-return (never for an already-warm session) and BEFORE the GET. The
+// defer ClearColdFetchActive covers the GET-FAILURE path (no reconcile runs to
+// clear the marker); the cold-load SUCCESS path already clears it inside
+// reconcileMessagesLocked, and the deferred Clear is idempotent there.
 func (a *Aggregator) EnsureMessages(ctx context.Context, sessionID string) error {
 	if sessionID == "" || a.store.IsMessagesLoaded(sessionID) {
 		return nil
 	}
+	a.store.MarkColdFetchStart(sessionID)
+	defer a.store.ClearColdFetchActive(sessionID)
 	items, err := a.client.Messages(ctx, sessionID)
 	if err != nil {
 		return err
