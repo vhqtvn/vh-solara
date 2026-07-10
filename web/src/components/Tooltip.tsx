@@ -6,11 +6,25 @@ import styles from "./Tooltip.module.css";
 // attribute because some window managers (e.g. swaywm) spawn a new window for
 // it; elements opt in with `data-tip="…"`. Delegated hover/focus, fixed-position
 // bubble clamped to the viewport.
+// Hover delay: tooltips don't appear instantly — the pointer must rest on a
+// tipped element for this long before the bubble shows (like a native tooltip).
+const HOVER_DELAY_MS = 450;
+
 export default function Tooltip() {
   const [tip, setTip] = createSignal<{ text: string; rect: Rectish } | null>(null);
   const [pos, setPos] = createSignal<{ x: number; y: number; above: boolean } | null>(null);
   let current: HTMLElement | null = null;
   let bubble: HTMLDivElement | undefined;
+  // Pending hover-delay timer. When armed, a tipped element has been entered but
+  // the bubble hasn't shown yet; on fire we re-check that the element is still
+  // actually hovered/focused (pointerout can be missed) before showing.
+  let hoverTimer: ReturnType<typeof setTimeout> | undefined;
+  const clearHoverTimer = () => {
+    if (hoverTimer !== undefined) {
+      clearTimeout(hoverTimer);
+      hoverTimer = undefined;
+    }
+  };
 
   function show(target: HTMLElement) {
     const text = target.getAttribute("data-tip");
@@ -19,6 +33,7 @@ export default function Tooltip() {
     setTip({ text, rect: { left: r.left, top: r.top, bottom: r.bottom, width: r.width } });
   }
   const hide = () => {
+    clearHoverTimer();
     current = null;
     setTip(null);
   };
@@ -42,14 +57,30 @@ export default function Tooltip() {
     );
   });
 
-  const onOver = (e: Event) => {
-    if (!hoverCapable) return; // touch: no auto-tooltips (use the ? inspector)
-    const t = (e.target as HTMLElement)?.closest?.("[data-tip]") as HTMLElement | null;
-    if (t && t !== current) {
-      current = t;
-      show(t);
-    }
+  // Arm the hover-delay timer for `target`, replacing any pending arm. On fire
+  // we defensively re-check that the element is still genuinely interacted with
+  // before showing: for the pointer path we trust the browser's own `:hover`
+  // tracking (more reliable than our event chain — if a `pointerout` was missed,
+  // `:hover` is already false and we drop the stale target). `:hover` is false
+  // during keyboard focus, so `fromFocus` short-circuits the check and shows
+  // unconditionally (focusout→onOut cancels).
+  const armShow = (target: HTMLElement, fromFocus: boolean) => {
+    clearHoverTimer();
+    current = target;
+    hoverTimer = setTimeout(() => {
+      hoverTimer = undefined;
+      if (current && (fromFocus || current.matches(":hover"))) show(current);
+      else hide();
+    }, HOVER_DELAY_MS);
   };
+  const enter = (t: HTMLElement | null, fromFocus: boolean) => {
+    if (!hoverCapable) return; // touch: no auto-tooltips (use the ? inspector)
+    if (t && t !== current) armShow(t, fromFocus);
+  };
+  const onOverPointer = (e: Event) =>
+    enter((e.target as HTMLElement)?.closest?.("[data-tip]") as HTMLElement | null, false);
+  const onOverFocus = (e: Event) =>
+    enter((e.target as HTMLElement)?.closest?.("[data-tip]") as HTMLElement | null, true);
 
   // Draggable "?" inspector: while it tracks a point, show the tip of whatever is
   // under it (skipping the inspector button itself).
@@ -63,6 +94,7 @@ export default function Tooltip() {
     const t = el?.closest?.("[data-tip]:not(.help-inspect)") as HTMLElement | null;
     if (t) {
       current = t;
+      clearHoverTimer(); // inspector path is immediate; cancel any pending hover show
       show(t);
     } else if (current) {
       hide();
@@ -81,8 +113,15 @@ export default function Tooltip() {
     const next = to?.closest?.("[data-tip]") as HTMLElement | null;
     if (next) {
       if (next !== current) {
-        current = next;
-        show(next);
+        // Switching between tipped elements still respects the delay: re-arm a
+        // fresh timer via the shared helper so the new tip doesn't flash
+        // instantly. `fromFocus` is derived from the event type — DOM fires
+        // focusout before focusin, so when Tabbing tip→tip the follow-up
+        // focusin is a no-op (current is already `next`); without threading
+        // fromFocus here, the armed timer's `:hover`-only guard would suppress
+        // the keyboard-focused tip (`:hover` is false under keyboard focus).
+        const fromFocus = (e as Event).type === "focusout" || (e as Event).type === "blur";
+        armShow(next, fromFocus);
       }
       return;
     }
@@ -90,18 +129,19 @@ export default function Tooltip() {
   };
 
   onMount(() => {
-    document.addEventListener("pointerover", onOver);
+    document.addEventListener("pointerover", onOverPointer);
     document.addEventListener("pointerout", onOut as EventListener);
-    document.addEventListener("focusin", onOver);
+    document.addEventListener("focusin", onOverFocus);
     document.addEventListener("focusout", onOut as EventListener);
     document.addEventListener("scroll", hide, true);
     window.addEventListener("pointerdown", hide);
     window.addEventListener("blur", hide);
   });
   onCleanup(() => {
-    document.removeEventListener("pointerover", onOver);
+    clearHoverTimer();
+    document.removeEventListener("pointerover", onOverPointer);
     document.removeEventListener("pointerout", onOut as EventListener);
-    document.removeEventListener("focusin", onOver);
+    document.removeEventListener("focusin", onOverFocus);
     document.removeEventListener("focusout", onOut as EventListener);
     document.removeEventListener("scroll", hide, true);
     window.removeEventListener("pointerdown", hide);
