@@ -7,6 +7,7 @@ import { type GitFile, gitCommit, gitDiscard, gitPush, gitStage, gitStatus, gitU
 import { pushNotification } from "../notify";
 import FileBadge from "./FileBadge";
 import Icon from "./Icon";
+import "./GitView.css";
 
 type DiffLayout = "unified" | "split";
 const LS_LAYOUT = "vh.diff.layout.v1";

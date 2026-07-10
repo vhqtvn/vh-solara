@@ -172,12 +172,10 @@ div.katex-math { display: block; overflow-x: auto; margin: 0.7em 0; text-align: 
 .vh-diff-hunk { background: color-mix(in srgb, var(--accent) 12%, transparent); color: var(--accent); }
 .vh-diff-meta { color: var(--fg-dim); }
 
-/* git rows */
-.gitfile { border-radius: var(--radius); }
-.gitfile-head { padding: 8px 10px; gap: 10px; }
+/* git rows: .gitfile, .gitfile-head, .gitfile-status, .git-head refinements
+   moved to GitView.css (with their base rules). .gitfile-name stays
+   here (DEFERRED — also in the combined font-family list at line 83). */
 .gitfile-name { display: inline-flex; align-items: center; gap: 8px; }
-.gitfile-status { border-radius: var(--radius-sm); }
-.git-head { gap: var(--s-3); }
 
 /* `empty-float` is a GLOBAL keyframes: the `.empty*` rules moved to
    EmptyState.module.css (as :global) and reference this name. Kept here so the

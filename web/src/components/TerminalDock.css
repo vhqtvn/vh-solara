@@ -1,0 +1,83 @@
+/* TerminalDock — resizable bottom dock (desktop) / full-screen (mobile), plus
+   the tab strip and the per-pane connection chrome (rendered by TerminalPane,
+   which is always mounted alongside this dock).
+   Plain CSS (not a CSS Module) because all selectors are global. Vite reliably
+   bundles plain CSS imports — unlike .module.css wrappers which Rollup
+   tree-shakes when the styles binding is unused.
+   Carved verbatim from legacy/30-main-terminal.css lines 9-79 (base rules;
+   no refinements exist in shard 80 or any other shard). The shared
+   @keyframes pulse stays global in legacy/50-chat-overlays.css (referenced
+   here by bare name). `.term` also appears in a combined user-select rule
+   (00-app-globals.css) that sets a different property — left in legacy. */
+
+/* --- terminal dock --- */
+.term-dock {
+  display: flex; flex-direction: column; flex: none;
+  min-height: 120px; border-top: 1px solid var(--border);
+  background: #0b0f17; position: relative;
+  /* The dock is a fixed-dark island (its xterm bg is hardcoded dark too). Pin
+     the palette to dark values inside it so the header/controls/overlay stay
+     legible on light themes instead of inheriting dark-on-dark foreground. */
+  --bg: #0b0f17;
+  --fg: #c9d1d9;
+  --fg-dim: #8b949e;
+  --border: #30363d;
+  --bg-2: #161b22;
+  --accent: #58a6ff;
+  --accent-fg: #08111f;
+}
+.term-dock.full { position: absolute; inset: 0; z-index: 100; height: auto !important; padding-top: env(safe-area-inset-top); } /* literal: between --z-toast (90) and --z-modal (150) */
+.term-dock-resize { position: absolute; top: -3px; left: 0; right: 0; height: 7px; cursor: ns-resize; z-index: 2; }
+.term-dock-head { display: flex; align-items: center; gap: 7px; padding: 4px 8px; border-bottom: 1px solid var(--border); font-size: 12px; color: var(--fg-dim); }
+.term-dock-head .icon-btn { width: 26px; height: 26px; }
+.term-dock-title { font-weight: 600; }
+/* Tab strip: scrollable row of terminals, each a label + a kill (×). */
+.term-tabs { display: flex; align-items: center; gap: 4px; min-width: 0; overflow-x: auto; flex: 1 1 auto; scrollbar-width: thin; }
+.term-tab { display: inline-flex; align-items: center; flex: 0 0 auto; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; background: transparent; max-width: 180px; }
+.term-tab.on { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.term-tab-label { background: transparent; border: 0; color: var(--fg-dim); padding: 2px 6px; font-size: 12px; cursor: pointer; max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.term-tab.on .term-tab-label { color: var(--fg); }
+.term-tab-kill { background: transparent; border: 0; color: var(--fg-dim); padding: 0 4px 0 0; cursor: pointer; display: inline-grid; place-items: center; opacity: 0.6; }
+.term-tab-kill:hover { opacity: 1; color: var(--danger, #f85149); }
+.term-tab-add { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 3px; background: transparent; border: 1px solid var(--border); border-radius: 6px; color: var(--fg-dim); padding: 2px 6px; font-size: 12px; cursor: pointer; }
+.term-tab-add:hover { color: var(--fg); border-color: var(--accent); }
+@media (pointer: coarse) {
+  .term-tab-label { padding: 6px 8px; }
+  .term-tab-kill { padding: 6px 6px 6px 2px; }
+  .term-tab-add { padding: 6px 8px; }
+}
+.term { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+.term-host { flex: 1; min-height: 0; padding: 4px 4px 0 8px; position: relative; }
+.term-host .term-status { position: absolute; top: 6px; right: 8px; z-index: 2; }
+.term-host .xterm { height: 100%; }
+.term-empty { padding: 16px; color: var(--fg-dim); font-size: 13px; }
+.term-keys { display: flex; gap: 6px; padding: 6px 8px; border-top: 1px solid var(--border); overflow-x: auto; -webkit-overflow-scrolling: touch; }
+.term-keys button {
+  flex: 0 0 auto; min-width: 34px; height: 30px; padding: 0 8px;
+  background: var(--bg-2); color: var(--fg); border: 1px solid var(--border);
+  border-radius: 6px; font: inherit; font-size: 13px; cursor: pointer;
+  -webkit-user-select: none; user-select: none; touch-action: manipulation;
+}
+.term-keys button.on { border-color: var(--accent); color: var(--accent); }
+.term-status { flex: 0 0 auto; width: 8px; height: 8px; border-radius: 50%; align-self: center; margin-left: auto; }
+.term-status.open { background: var(--ok); }
+.term-status.connecting { background: var(--warn); }
+.term-status.reconnecting { background: var(--warn); animation: pulse 1.1s ease-in-out infinite; }
+.term-status.disconnected { background: var(--danger); }
+
+/* Connection-state overlay: a dead/dropped PTY otherwise looks alive (the cursor
+   blinks locally) while silently eating keystrokes. */
+.term-overlay {
+  position: absolute; inset: 0; z-index: 3;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px;
+  background: color-mix(in srgb, var(--bg) 78%, transparent);
+  font-size: 13px; color: var(--fg-dim); text-align: center; padding: 12px;
+}
+.term-overlay.err .term-overlay-msg { color: var(--danger-fg); }
+.term-overlay-msg { font-weight: 500; }
+.term-reconnect {
+  padding: 5px 14px; font: inherit; font-size: 13px; font-weight: 600;
+  background: var(--accent); color: var(--accent-fg);
+  border: 0; border-radius: 6px; cursor: pointer;
+}
+.term-reconnect:hover { filter: brightness(1.08); }

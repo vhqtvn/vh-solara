@@ -261,68 +261,18 @@
 .vh-diff-split .vh-diff-ctx { color: var(--fg-dim); }
 
 /* --- git (Changes) view --- */
-.git { display: flex; flex-direction: column; flex: 1; min-width: 0; }
-.git-head {
-  display: flex; align-items: center; gap: 10px;
-  padding: 10px 14px; border-bottom: 1px solid var(--border);
-}
+/* GitView base rules moved to GitView.css (plain CSS, all global): .git, .git-head,
+   .gitfile, .gitfile-head, .gitfile-status(+variants), .gitfile-diff,
+   .gitfile-loading, .git-hint, .git-stage*, .git-mini, .git-commit*. The
+   selectors below are DEFERRED — they also appear in combined multi-selector
+   typography rules in shard 80 (font-family / font-size lists) so they cannot
+   move without splitting a shared rule. Their base rules stay here and their
+   refinements stay in 80 — cascade unchanged. */
 .git-branch { font-family: ui-monospace, Menlo, monospace; color: var(--fg-dim); }
-.git-head .seg { margin-left: 0; }
-.git-refresh { margin-left: auto; background: transparent; border: 1px solid var(--border); color: var(--fg); border-radius: 6px; padding: 3px 9px; cursor: pointer; }
-.git-body { flex: 1; overflow-y: auto; padding: 12px; }
-
-.gitfile { border: 1px solid var(--border); border-radius: 6px; margin-bottom: 8px; overflow: hidden; }
-.gitfile-head {
-  display: flex; align-items: center; gap: 10px; width: 100%;
-  padding: 7px 10px; background: var(--bg-2); border: 0; color: var(--fg);
-  cursor: pointer; font: inherit; text-align: left;
-}
-.gitfile-status {
-  width: 18px; height: 18px; flex: 0 0 auto; border-radius: 4px;
-  display: grid; place-items: center; font-size: 11px; font-weight: 700; color: #fff;
-}
-.gitfile-status.added { background: var(--ok); }
-.gitfile-status.deleted { background: var(--danger); }
-.gitfile-status.modified { background: var(--warn); }
 .gitfile-name { flex: 1; font-family: ui-monospace, Menlo, monospace; overflow: hidden; text-overflow: ellipsis; }
 .gitfile-counts { font-size: 12px; display: flex; gap: 6px; }
 .gitfile-counts .adds { color: var(--ok); }
 .gitfile-counts .dels { color: var(--danger); }
-.gitfile-diff { border-top: 1px solid var(--border); }
-.gitfile-diff .vh-diff { border: 0; border-radius: 0; }
-.gitfile-loading { padding: 8px 10px; color: var(--fg-dim); }
-
-/* --- staging + commit panel --- */
-.git-hint { margin: 6px 4px 12px; }
-.git-stage { border: 1px solid var(--border); border-radius: 8px; margin-bottom: 12px; overflow: hidden; }
-.git-stage-head { display: flex; align-items: center; gap: 8px; padding: 7px 10px; background: var(--bg-2); font-size: 12px; color: var(--fg-dim); }
-.git-stage-row { display: flex; align-items: center; gap: 8px; padding: 5px 10px; border-top: 1px solid var(--border); font-size: 13px; }
-.git-stage-row.staged { background: color-mix(in srgb, var(--ok) 8%, transparent); }
-.git-stage-x { width: 14px; text-align: center; color: var(--fg-dim); }
-.git-stage-row.staged .git-stage-x { color: var(--ok); }
-.git-stage-name { flex: 1; font-family: ui-monospace, Menlo, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.git-mini {
-  flex: 0 0 auto; min-width: 24px; height: 24px; padding: 0 7px;
-  display: inline-flex; align-items: center; justify-content: center;
-  background: var(--bg); color: var(--fg); border: 1px solid var(--border);
-  border-radius: 6px; cursor: pointer; font: inherit; font-size: 13px;
-}
-.git-mini:hover:not(:disabled) { border-color: var(--accent); }
-.git-mini:disabled { opacity: 0.5; cursor: default; }
-.git-mini.danger:hover:not(:disabled) { border-color: var(--danger); color: var(--danger); }
-.git-commit { padding: 8px 10px; border-top: 1px solid var(--border); }
-.git-commit-msg {
-  width: 100%; resize: vertical; box-sizing: border-box;
-  background: var(--bg); color: var(--fg); border: 1px solid var(--border);
-  border-radius: 6px; padding: 6px 8px; font: inherit; font-size: 13px; outline: none;
-}
-.git-commit-msg:focus { border-color: var(--accent); }
-.git-commit-actions { display: flex; gap: 8px; margin-top: 6px; }
-.git-commit-btn {
-  flex: 1; padding: 7px 12px; font: inherit; font-size: 13px;
-  background: var(--accent); color: var(--accent-fg); border: 0; border-radius: 7px; cursor: pointer;
-}
-.git-commit-btn:disabled { opacity: 0.45; cursor: default; }
 
 /* Narrow screens (phone): sidebar becomes an off-canvas drawer, toggled — but
    still a real panel, with the main content always present underneath. */
