@@ -1,7 +1,7 @@
 import { createSignal, For, onMount, Show } from "solid-js";
 import { addTodo, loadNotes, notesDoc, removeTodo, saveState, setNotes, toggleTodo } from "../notes";
 import Icon from "./Icon";
-import "./NotesView.module.css";
+import "./NotesView.css";
 
 // Project-level notes + todos, persisted on the daemon so they sync across
 // devices and survive reconnects. Notes are free-form markdown; todos are a

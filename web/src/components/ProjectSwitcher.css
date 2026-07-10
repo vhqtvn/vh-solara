@@ -3,8 +3,8 @@
    .proj-empty/.proj-item/.proj-item-name/.proj-name/.proj-pick/.proj-section/
    .proj-settings). Side-effect import only.
    .proj-bar/.proj-settings stay in legacy/60 (Sidebar's). */
-:global(.proj) { position: relative; padding: 8px; border-bottom: 1px solid var(--border); }
-:global(.proj-current) {
+.proj { position: relative; padding: 8px; border-bottom: 1px solid var(--border); }
+.proj-current {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -18,9 +18,9 @@
   font: inherit;
   font-size: 13px;
 }
-:global(.proj-current:hover) { border-color: var(--accent); }
-:global(.proj-name) { flex: 1; text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
-:global(.proj-menu) {
+.proj-current:hover { border-color: var(--accent); }
+.proj-name { flex: 1; text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
+.proj-menu {
   position: absolute;
   top: calc(100% - 2px);
   left: 8px;
@@ -34,10 +34,10 @@
   max-height: 60vh;
   overflow-y: auto;
 }
-:global(.proj-item) { display: flex; align-items: center; border-radius: 6px; }
-:global(.proj-item.on) { background: color-mix(in srgb, var(--accent) 15%, transparent); }
-:global(.proj-item:hover) { background: color-mix(in srgb, var(--fg) 7%, transparent); }
-:global(.proj-pick) {
+.proj-item { display: flex; align-items: center; border-radius: 6px; }
+.proj-item.on { background: color-mix(in srgb, var(--accent) 15%, transparent); }
+.proj-item:hover { background: color-mix(in srgb, var(--fg) 7%, transparent); }
+.proj-pick {
   flex: 1;
   display: flex;
   flex-direction: column;
@@ -51,9 +51,9 @@
   font: inherit;
   padding: 7px 9px;
 }
-:global(.proj-item-name) { font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-:global(.proj-item-dir) { font-size: 11px; color: var(--fg-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-:global(.proj-remove) {
+.proj-item-name { font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.proj-item-dir { font-size: 11px; color: var(--fg-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.proj-remove {
   flex: none;
   background: transparent;
   border: 0;
@@ -63,11 +63,11 @@
   margin-right: 4px;
   border-radius: 5px;
 }
-:global(.proj-remove:hover) { background: var(--bg); color: var(--fg); }
+.proj-remove:hover { background: var(--bg); color: var(--fg); }
 /* Copy-link affordance: per-project deep-link (?dir=<dir>) grab button.
    No mask-image/backdrop-filter/contain/content-visibility (WebRender traps). */
-:global(.proj-actions) { display: flex; align-items: center; gap: 1px; margin-right: 4px; flex: none; }
-:global(.proj-copy) {
+.proj-actions { display: flex; align-items: center; gap: 1px; margin-right: 4px; flex: none; }
+.proj-copy {
   flex: none;
   background: transparent;
   border: 0;
@@ -76,24 +76,24 @@
   padding: 4px;
   border-radius: 5px;
 }
-:global(.proj-copy:hover) { background: var(--bg); color: var(--fg); }
-:global(.proj-copy.copied) { color: var(--accent); }
+.proj-copy:hover { background: var(--bg); color: var(--fg); }
+.proj-copy.copied { color: var(--accent); }
 /* Inline remove-confirm cluster: swaps the remove icon for a tight
    "Remove? / Remove / Cancel" group. Cheap conditional DOM swap. */
-:global(.proj-confirm) {
+.proj-confirm {
   display: flex;
   align-items: center;
   gap: 4px;
   margin-right: 4px;
   flex: none;
 }
-:global(.proj-confirm-text) {
+.proj-confirm-text {
   font-size: 11px;
   color: var(--fg-dim);
   white-space: nowrap;
 }
-:global(.proj-confirm-go),
-:global(.proj-confirm-cancel) {
+.proj-confirm-go,
+.proj-confirm-cancel {
   flex: none;
   background: transparent;
   border: 0;
@@ -103,11 +103,11 @@
   font: inherit;
   font-size: 12px;
 }
-:global(.proj-confirm-go) { color: var(--danger); }
-:global(.proj-confirm-go:hover) { background: color-mix(in srgb, var(--danger) 14%, transparent); }
-:global(.proj-confirm-cancel) { color: var(--fg-dim); }
-:global(.proj-confirm-cancel:hover) { background: var(--bg); color: var(--fg); }
-:global(.proj-add) {
+.proj-confirm-go { color: var(--danger); }
+.proj-confirm-go:hover { background: color-mix(in srgb, var(--danger) 14%, transparent); }
+.proj-confirm-cancel { color: var(--fg-dim); }
+.proj-confirm-cancel:hover { background: var(--bg); color: var(--fg); }
+.proj-add {
   display: flex;
   align-items: center;
   gap: 7px;
@@ -122,8 +122,8 @@
   font-size: 13px;
   padding: 8px 9px;
 }
-:global(.proj-add:hover) { background: color-mix(in srgb, var(--accent) 10%, transparent); }
-:global(.proj-section) {
+.proj-add:hover { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+.proj-section {
   font-size: 10px;
   font-weight: 600;
   letter-spacing: 0.04em;
@@ -137,10 +137,10 @@
 /* --- project switcher DIALOG (Slice 1) --- */
 /* Slightly more compact than the 560px default since rows are short. Desktop
    only; mobile is fullscreen via the canonical @media(max-width:720px) block. */
-:global(.dialog.projects-dialog) { width: 480px; }
-:global(.projects-dialog .dialog-body) { display: flex; flex-direction: column; gap: 1px; }
+.dialog.projects-dialog { width: 480px; }
+.projects-dialog .dialog-body { display: flex; flex-direction: column; gap: 1px; }
 /* Active-project marker: a small accent dot inline with the name. */
-:global(.proj-active) {
+.proj-active {
   display: inline-block;
   width: 6px;
   height: 6px;
@@ -151,9 +151,9 @@
 }
 /* Activity badge: "N running" / "N sessions". No animation on always-on
    surfaces (WebRender guidance). */
-:global(.proj-badge) { font-size: 11px; color: var(--fg-dim); white-space: nowrap; }
-:global(.proj-badge.run) { color: var(--accent); font-weight: 500; }
-:global(.proj-badge-dot) {
+.proj-badge { font-size: 11px; color: var(--fg-dim); white-space: nowrap; }
+.proj-badge.run { color: var(--accent); font-weight: 500; }
+.proj-badge-dot {
   display: inline-block;
   width: 6px;
   height: 6px;
@@ -163,7 +163,7 @@
   border-radius: 50%;
 }
 /* Empty / no-results: a single muted, centered line. */
-:global(.proj-empty) {
+.proj-empty {
   margin: 0;
   padding: 18px 12px;
   text-align: center;
@@ -172,5 +172,5 @@
 }
 /* On fullscreen mobile the close button gets a comfortable tap target. */
 @media (max-width: 720px) {
-  :global(.projects-dialog .icon-btn) { padding: 8px; }
+  .projects-dialog .icon-btn { padding: 8px; }
 }

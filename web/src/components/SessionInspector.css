@@ -2,15 +2,15 @@
    All classes :global: these are session-inspector-specific (sole-owned,
    competition-free per the Stage 2 cascade audit), but kept :global so the
    markup stays plain string class names (side-effect import only). */
-:global(.insp-sub) { font-weight: 600; padding: 4px 4px 0; }
-:global(.insp-sub.dim) { font-weight: 400; font-size: 13px; color: var(--fg-dim); padding-top: 2px; }
-:global(.insp-grid) {
+.insp-sub { font-weight: 600; padding: 4px 4px 0; }
+.insp-sub.dim { font-weight: 400; font-size: 13px; color: var(--fg-dim); padding-top: 2px; }
+.insp-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(96px, 1fr));
   gap: 8px;
   margin: 14px 4px;
 }
-:global(.insp-stat) {
+.insp-stat {
   display: flex;
   flex-direction: column;
   gap: 3px;
@@ -19,17 +19,17 @@
   border-radius: 8px;
   padding: 10px 12px;
 }
-:global(.insp-stat-val) { font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; }
-:global(.insp-stat-key) { font-size: 11px; color: var(--fg-dim); text-transform: uppercase; letter-spacing: 0.04em; }
-:global(.insp-section) {
+.insp-stat-val { font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.insp-stat-key { font-size: 11px; color: var(--fg-dim); text-transform: uppercase; letter-spacing: 0.04em; }
+.insp-section {
   font-size: 12px;
   text-transform: uppercase;
   letter-spacing: 0.05em;
   color: var(--fg-dim);
   margin: 6px 4px 4px;
 }
-:global(.insp-turns) { display: flex; flex-direction: column; }
-:global(.insp-turn) {
+.insp-turns { display: flex; flex-direction: column; }
+.insp-turn {
   display: flex;
   align-items: center;
   gap: 10px;
@@ -37,12 +37,12 @@
   border-top: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
   font-size: 13px;
 }
-:global(.insp-turn-n) { color: var(--fg-dim); width: 28px; flex: none; }
-:global(.insp-turn-model) { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-:global(.insp-turn-tok) { color: var(--fg-dim); font-variant-numeric: tabular-nums; }
-:global(.insp-turn-cost) { font-variant-numeric: tabular-nums; }
-:global(.insp-note) { font-size: 12px; color: var(--fg-dim); margin: 14px 4px 4px; line-height: 1.5; }
-:global(.insp-archive) {
+.insp-turn-n { color: var(--fg-dim); width: 28px; flex: none; }
+.insp-turn-model { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.insp-turn-tok { color: var(--fg-dim); font-variant-numeric: tabular-nums; }
+.insp-turn-cost { font-variant-numeric: tabular-nums; }
+.insp-note { font-size: 12px; color: var(--fg-dim); margin: 14px 4px 4px; line-height: 1.5; }
+.insp-archive {
   display: inline-flex;
   align-items: center;
   gap: 8px;
@@ -55,5 +55,5 @@
   font: inherit;
   font-size: 13px;
 }
-:global(.insp-archive:hover) { background: color-mix(in srgb, var(--warn) 18%, var(--bg)); }
-:global(.insp-archive-note) { color: var(--fg-dim); font-size: 12px; }
+.insp-archive:hover { background: color-mix(in srgb, var(--warn) 18%, var(--bg)); }
+.insp-archive-note { color: var(--fg-dim); font-size: 12px; }

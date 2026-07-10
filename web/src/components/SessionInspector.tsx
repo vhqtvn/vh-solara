@@ -4,7 +4,7 @@ import { findModel, selectionFor } from "../models";
 import { openArchiveConfirm } from "../sessionMenu";
 import QuotaPanel from "./QuotaPanel";
 import Icon from "./Icon";
-import "./SessionInspector.module.css";
+import "./SessionInspector.css";
 
 // Whole-session inspector: aggregate cost/token/message stats plus a per-turn
 // breakdown. OpenCode exposes no provider quota endpoint, so this reports the

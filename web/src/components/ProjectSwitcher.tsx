@@ -13,7 +13,7 @@ import {
   selectProject,
 } from "../projects";
 import { dismiss, modal } from "../lib/a11y";
-import "./ProjectSwitcher.module.css";
+import "./ProjectSwitcher.css";
 import { runningSessionCount, rootSessionCount } from "../sync";
 import { projSwitcherOpen as open, setProjSwitcherOpen as setOpen } from "../ui";
 import Icon from "./Icon";

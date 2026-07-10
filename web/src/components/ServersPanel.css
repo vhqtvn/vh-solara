@@ -3,13 +3,13 @@
    side-effect-only migration). The shared m-row/m-name/m-prov/m-badges/m-check/
    m-group-label/m-row-main and b-free/b-status rules are shared with ModelDialog
    and stay in the shard (Stage 3 chrome.css). Side-effect import only. */
-:global(.srv-tabs) {
+.srv-tabs {
   display: flex;
   gap: 4px;
   border-bottom: 1px solid var(--border);
   margin-bottom: 10px;
 }
-:global(.srv-tab) {
+.srv-tab {
   background: transparent;
   border: 0;
   border-bottom: 2px solid transparent;
@@ -20,9 +20,9 @@
   font-size: 13px;
   margin-bottom: -1px;
 }
-:global(.srv-tab:hover) { color: var(--fg); }
-:global(.srv-tab.on) { color: var(--fg); border-bottom-color: var(--accent); font-weight: 500; }
-:global(.srv-val) {
+.srv-tab:hover { color: var(--fg); }
+.srv-tab.on { color: var(--fg); border-bottom-color: var(--accent); font-weight: 500; }
+.srv-val {
   font-variant-numeric: tabular-nums;
   /* Diagnostics panel (Server tab): show the FULL value (latency strings can be
      long — conn/server/hydrate/fetch/rec), not a clipped "…" that needs devtools
@@ -41,8 +41,8 @@
   min-width: 0;
   overflow-wrap: anywhere;
 }
-:global(.srv-actions) { display: flex; align-items: center; gap: 10px; margin: 10px 0 4px; }
-:global(.srv-action) {
+.srv-actions { display: flex; align-items: center; gap: 10px; margin: 10px 0 4px; }
+.srv-action {
   display: inline-flex;
   align-items: center;
   gap: 7px;
@@ -55,11 +55,11 @@
   font: inherit;
   font-size: 13px;
 }
-:global(.srv-action:hover:not(:disabled)) { border-color: var(--accent); }
-:global(.srv-action:disabled) { opacity: 0.6; cursor: progress; }
-:global(.srv-action.accent) { border-color: var(--accent); color: var(--accent); }
-:global(.srv-action.danger) { border-color: color-mix(in srgb, var(--warn) 50%, var(--border)); background: color-mix(in srgb, var(--warn) 14%, var(--bg)); }
-:global(.srv-action.danger:hover:not(:disabled)) { background: color-mix(in srgb, var(--warn) 24%, var(--bg)); }
-:global(.srv-action-ok) { font-size: 12px; color: var(--ok); }
-:global(.srv-warn) { display: flex; flex-direction: column; gap: 8px; font-size: 13px; }
-:global(.srv-warn-btns) { display: flex; gap: 8px; }
+.srv-action:hover:not(:disabled) { border-color: var(--accent); }
+.srv-action:disabled { opacity: 0.6; cursor: progress; }
+.srv-action.accent { border-color: var(--accent); color: var(--accent); }
+.srv-action.danger { border-color: color-mix(in srgb, var(--warn) 50%, var(--border)); background: color-mix(in srgb, var(--warn) 14%, var(--bg)); }
+.srv-action.danger:hover:not(:disabled) { background: color-mix(in srgb, var(--warn) 24%, var(--bg)); }
+.srv-action-ok { font-size: 12px; color: var(--ok); }
+.srv-warn { display: flex; flex-direction: column; gap: 8px; font-size: 13px; }
+.srv-warn-btns { display: flex; gap: 8px; }

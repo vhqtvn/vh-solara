@@ -4,7 +4,7 @@ import { fetchArchived, restoreAndOpen, unarchiveSession } from "../archive";
 import type { Session } from "../types";
 import Icon from "./Icon";
 import RelTime from "./RelTime";
-import "./ArchivedDialog.module.css";
+import "./ArchivedDialog.css";
 
 // Lazy, paginated archived-session browser. Roots load in pages (50 at a time);
 // a node's children load only when expanded. This bounds memory/DOM regardless

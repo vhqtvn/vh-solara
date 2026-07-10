@@ -4,7 +4,7 @@ import type { Permission } from "../types";
 import { respondPermission } from "../sync";
 import Icon from "./Icon";
 import { useCardPopup } from "./cardPopup";
-import "./PermissionCard.module.css";
+import "./PermissionCard.css";
 
 // Category label for a permission request (best-effort: the structured fields
 // OpenCode sends, in priority order). Moved here verbatim from ChatView so the
