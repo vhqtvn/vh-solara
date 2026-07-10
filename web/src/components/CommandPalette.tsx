@@ -7,6 +7,7 @@ import { exportSessionMarkdown } from "../export";
 import { selectedId } from "../sync";
 import { modal } from "../lib/a11y";
 import Icon from "./Icon";
+import "./CommandPalette.module.css";
 
 interface Cmd {
   id: string;

@@ -1,0 +1,176 @@
+/* ProjectSwitcher — current-project bar + dropdown picker + projects dialog.
+   All classes :global (HEAVILY test-queried: .proj-add/.proj-badge/.proj-current/
+   .proj-empty/.proj-item/.proj-item-name/.proj-name/.proj-pick/.proj-section/
+   .proj-settings). Side-effect import only.
+   .proj-bar/.proj-settings stay in legacy/60 (Sidebar's). */
+:global(.proj) { position: relative; padding: 8px; border-bottom: 1px solid var(--border); }
+:global(.proj-current) {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--fg);
+  padding: 8px 10px;
+  cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+}
+:global(.proj-current:hover) { border-color: var(--accent); }
+:global(.proj-name) { flex: 1; text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
+:global(.proj-menu) {
+  position: absolute;
+  top: calc(100% - 2px);
+  left: 8px;
+  right: 8px;
+  z-index: 30;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: var(--shadow-lg, 0 12px 32px rgba(0, 0, 0, 0.45));
+  padding: 5px;
+  max-height: 60vh;
+  overflow-y: auto;
+}
+:global(.proj-item) { display: flex; align-items: center; border-radius: 6px; }
+:global(.proj-item.on) { background: color-mix(in srgb, var(--accent) 15%, transparent); }
+:global(.proj-item:hover) { background: color-mix(in srgb, var(--fg) 7%, transparent); }
+:global(.proj-pick) {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  background: transparent;
+  border: 0;
+  color: var(--fg);
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+  padding: 7px 9px;
+}
+:global(.proj-item-name) { font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+:global(.proj-item-dir) { font-size: 11px; color: var(--fg-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+:global(.proj-remove) {
+  flex: none;
+  background: transparent;
+  border: 0;
+  color: var(--fg-dim);
+  cursor: pointer;
+  padding: 4px;
+  margin-right: 4px;
+  border-radius: 5px;
+}
+:global(.proj-remove:hover) { background: var(--bg); color: var(--fg); }
+/* Copy-link affordance: per-project deep-link (?dir=<dir>) grab button.
+   No mask-image/backdrop-filter/contain/content-visibility (WebRender traps). */
+:global(.proj-actions) { display: flex; align-items: center; gap: 1px; margin-right: 4px; flex: none; }
+:global(.proj-copy) {
+  flex: none;
+  background: transparent;
+  border: 0;
+  color: var(--fg-dim);
+  cursor: pointer;
+  padding: 4px;
+  border-radius: 5px;
+}
+:global(.proj-copy:hover) { background: var(--bg); color: var(--fg); }
+:global(.proj-copy.copied) { color: var(--accent); }
+/* Inline remove-confirm cluster: swaps the remove icon for a tight
+   "Remove? / Remove / Cancel" group. Cheap conditional DOM swap. */
+:global(.proj-confirm) {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-right: 4px;
+  flex: none;
+}
+:global(.proj-confirm-text) {
+  font-size: 11px;
+  color: var(--fg-dim);
+  white-space: nowrap;
+}
+:global(.proj-confirm-go),
+:global(.proj-confirm-cancel) {
+  flex: none;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  padding: 4px 7px;
+  border-radius: 5px;
+  font: inherit;
+  font-size: 12px;
+}
+:global(.proj-confirm-go) { color: var(--danger); }
+:global(.proj-confirm-go:hover) { background: color-mix(in srgb, var(--danger) 14%, transparent); }
+:global(.proj-confirm-cancel) { color: var(--fg-dim); }
+:global(.proj-confirm-cancel:hover) { background: var(--bg); color: var(--fg); }
+:global(.proj-add) {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  background: transparent;
+  border: 0;
+  border-top: 1px solid var(--border);
+  margin-top: 4px;
+  color: var(--accent);
+  cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+  padding: 8px 9px;
+}
+:global(.proj-add:hover) { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+:global(.proj-section) {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--fg-dim);
+  padding: 8px 9px 3px;
+  border-top: 1px solid var(--border);
+  margin-top: 4px;
+}
+
+/* --- project switcher DIALOG (Slice 1) --- */
+/* Slightly more compact than the 560px default since rows are short. Desktop
+   only; mobile is fullscreen via the canonical @media(max-width:720px) block. */
+:global(.dialog.projects-dialog) { width: 480px; }
+:global(.projects-dialog .dialog-body) { display: flex; flex-direction: column; gap: 1px; }
+/* Active-project marker: a small accent dot inline with the name. */
+:global(.proj-active) {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-left: 6px;
+  vertical-align: middle;
+  background: var(--accent);
+  border-radius: 50%;
+}
+/* Activity badge: "N running" / "N sessions". No animation on always-on
+   surfaces (WebRender guidance). */
+:global(.proj-badge) { font-size: 11px; color: var(--fg-dim); white-space: nowrap; }
+:global(.proj-badge.run) { color: var(--accent); font-weight: 500; }
+:global(.proj-badge-dot) {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-right: 4px;
+  vertical-align: middle;
+  background: var(--accent);
+  border-radius: 50%;
+}
+/* Empty / no-results: a single muted, centered line. */
+:global(.proj-empty) {
+  margin: 0;
+  padding: 18px 12px;
+  text-align: center;
+  font-size: 13px;
+  color: var(--fg-dim);
+}
+/* On fullscreen mobile the close button gets a comfortable tap target. */
+@media (max-width: 720px) {
+  :global(.projects-dialog .icon-btn) { padding: 8px; }
+}

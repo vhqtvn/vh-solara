@@ -1,0 +1,90 @@
+/* NotesView — project-level notes (markdown textarea) + todos (checklist).
+   All classes :global (test-queried: .notes/.notes-text/.todo-text).
+   Side-effect import only. */
+:global(.notes-view) { flex: 1; overflow-y: auto; }
+:global(.notes-inner) { max-width: 760px; margin: 0 auto; padding: 18px 16px 40px; display: flex; flex-direction: column; gap: 26px; }
+:global(.notes-section) { display: flex; flex-direction: column; gap: 10px; }
+:global(.notes-head) { display: flex; align-items: baseline; justify-content: space-between; }
+:global(.notes-head h2) { font-size: 15px; font-weight: 600; margin: 0; }
+:global(.notes-count) { font-size: 12px; color: var(--fg-dim); }
+:global(.notes-saved) { font-size: 12px; color: var(--fg-dim); }
+:global(.notes-saved.error) { color: var(--danger); }
+:global(.notes-empty) { color: var(--fg-dim); font-size: 13px; margin: 2px 0; }
+:global(.todo-add) { display: flex; gap: 8px; }
+:global(.todo-add input) {
+  flex: 1;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--fg);
+  padding: 9px 12px;
+  font: inherit;
+  outline: none;
+}
+:global(.todo-add input:focus) { border-color: var(--accent); }
+:global(.todo-add-btn) {
+  flex: none;
+  width: 38px;
+  border: 1px solid var(--border);
+  background: var(--bg-2);
+  color: var(--fg);
+  border-radius: 8px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+:global(.todo-add-btn:hover:not(:disabled)) { border-color: var(--accent); }
+:global(.todo-add-btn:disabled) { opacity: 0.4; cursor: not-allowed; }
+:global(.todo-list) { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
+:global(.todo-item) {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 4px;
+  border-top: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
+}
+:global(.todo-check) {
+  flex: none;
+  width: 20px;
+  height: 20px;
+  border: 1.5px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-2);
+  color: var(--accent);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+:global(.todo-check:hover) { border-color: var(--accent); }
+:global(.todo-item.done .todo-check) { background: color-mix(in srgb, var(--accent) 22%, var(--bg)); border-color: var(--accent); }
+:global(.todo-text) { flex: 1; min-width: 0; word-break: break-word; }
+:global(.todo-item.done .todo-text) { text-decoration: line-through; color: var(--fg-dim); }
+:global(.todo-del) {
+  flex: none;
+  background: transparent;
+  border: 0;
+  color: var(--fg-dim);
+  cursor: pointer;
+  padding: 3px;
+  border-radius: 5px;
+  opacity: 0;
+  transition: opacity 0.12s;
+}
+:global(.todo-item:hover .todo-del) { opacity: 1; }
+:global(.todo-del:hover) { background: var(--bg-2); color: var(--fg); }
+:global(.notes-text) {
+  width: 100%;
+  min-height: 240px;
+  resize: vertical;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  color: var(--fg);
+  padding: 12px 14px;
+  font: inherit;
+  line-height: 1.6;
+  outline: none;
+}
+:global(.notes-text:focus) { border-color: var(--accent); }

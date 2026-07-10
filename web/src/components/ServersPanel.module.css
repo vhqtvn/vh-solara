@@ -1,0 +1,65 @@
+/* ServersPanel — Server / MCP / LSP / Plugins tabs + diagnostics values.
+   All classes :global (no test queries, but :global for consistency with the
+   side-effect-only migration). The shared m-row/m-name/m-prov/m-badges/m-check/
+   m-group-label/m-row-main and b-free/b-status rules are shared with ModelDialog
+   and stay in the shard (Stage 3 chrome.css). Side-effect import only. */
+:global(.srv-tabs) {
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 10px;
+}
+:global(.srv-tab) {
+  background: transparent;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  color: var(--fg-dim);
+  padding: 7px 10px;
+  cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+  margin-bottom: -1px;
+}
+:global(.srv-tab:hover) { color: var(--fg); }
+:global(.srv-tab.on) { color: var(--fg); border-bottom-color: var(--accent); font-weight: 500; }
+:global(.srv-val) {
+  font-variant-numeric: tabular-nums;
+  /* Diagnostics panel (Server tab): show the FULL value (latency strings can be
+     long — conn/server/hydrate/fetch/rec), not a clipped "…" that needs devtools
+     to read. Drop the truncation; let the value wrap and claim a value column
+     (flex:1) so a long string wraps within its share instead of overflowing or
+     crushing the short label. Mobile already wraps the whole .m-row (flex-wrap),
+     so there the value lands on its own full-width line. user-select is re-
+     enabled here because the app shell disables selection globally (so a long-
+     press on chrome doesn't pop a callout); the latency string is meant to be
+     copyable. overflow-wrap breaks long unbroken tokens (epoch id, URL). No GPU-
+     forbidden primitives (no mask-image/backdrop-filter/contain/content-visibility). */
+  user-select: text;
+  -webkit-user-select: text;
+  -webkit-touch-callout: default;
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+:global(.srv-actions) { display: flex; align-items: center; gap: 10px; margin: 10px 0 4px; }
+:global(.srv-action) {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  color: var(--fg);
+  border-radius: 7px;
+  padding: 7px 12px;
+  cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+}
+:global(.srv-action:hover:not(:disabled)) { border-color: var(--accent); }
+:global(.srv-action:disabled) { opacity: 0.6; cursor: progress; }
+:global(.srv-action.accent) { border-color: var(--accent); color: var(--accent); }
+:global(.srv-action.danger) { border-color: color-mix(in srgb, var(--warn) 50%, var(--border)); background: color-mix(in srgb, var(--warn) 14%, var(--bg)); }
+:global(.srv-action.danger:hover:not(:disabled)) { background: color-mix(in srgb, var(--warn) 24%, var(--bg)); }
+:global(.srv-action-ok) { font-size: 12px; color: var(--ok); }
+:global(.srv-warn) { display: flex; flex-direction: column; gap: 8px; font-size: 13px; }
+:global(.srv-warn-btns) { display: flex; gap: 8px; }

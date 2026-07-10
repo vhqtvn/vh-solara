@@ -125,89 +125,17 @@
   border-color: var(--fg-dim);
   background: color-mix(in srgb, var(--fg) 7%, transparent);
 }
-
-/* Popup overlay — a SECOND render surface of the same card (shared signals).
-   Centered dialog on desktop, bottom sheet on narrow widths. Stays below the
-   drawer/modal/scrim layers (--z-dialog) on purpose. */
-.card-pop-overlay {
-  position: fixed;
-  inset: 0;
-  z-index: var(--z-dialog);
-  background: color-mix(in srgb, #000 55%, transparent);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 16px;
-  animation: card-pop-fade 0.14s var(--ease, ease);
-}
-.card-pop {
-  width: min(640px, 100%);
-  max-height: min(82vh, 720px);
-  background: var(--bg-2);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  box-shadow: var(--shadow-lg, 0 12px 32px rgba(0, 0, 0, 0.45));
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-  animation: card-pop-in 0.16s var(--ease, ease);
-  /* Focus target for ESC-aware dialog (tabindex=-1). */
-  outline: none;
-}
-.card-pop-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  padding: 10px 14px;
-  border-bottom: 1px solid var(--border);
-  font-weight: 600;
-  font-size: 13px;
-}
-.card-pop-title { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
-.card-pop-question .card-pop-title { color: var(--accent); }
-.card-pop-body {
-  padding: 14px;
-  overflow-y: auto;
-  /* The popup body renders the card's inner items directly (no .question-card
-     wrapper), so give it the same vertical rhythm as an inline card. */
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
 @keyframes card-pop-fade { from { opacity: 0; } to { opacity: 1; } }
 @keyframes card-pop-in {
   from { opacity: 0; transform: translateY(8px) scale(0.99); }
   to { opacity: 1; transform: none; }
 }
 @media (max-width: 540px) {
-  /* Bottom sheet on phones: the card is wide enough that the option buttons,
-     markdown bodies, and textarea must stay readable at 360–414px. */
-  .card-pop-overlay { align-items: flex-end; padding: 0; }
-  .card-pop {
-    width: 100%;
-    max-width: 100%;
-    max-height: 88vh;
-    border-radius: 14px 14px 0 0;
-    animation: card-pop-in-sheet 0.18s var(--ease, ease);
-  }
   @keyframes card-pop-in-sheet {
     from { opacity: 0; transform: translateY(16px); }
     to { opacity: 1; transform: none; }
   }
 }
-.perm-card {
-  border: 1px solid color-mix(in srgb, var(--warn) 33%, transparent);
-  background: color-mix(in srgb, var(--warn) 14%, var(--bg));
-  border-radius: 8px;
-  padding: 10px 12px;
-}
-.perm-title { margin-bottom: 8px; }
-/* When the title sits inside a .perm-head (card-chrome) row, drop its own
-   bottom margin — the head row carries the spacing, and the popup-trigger
-   button sits to its right. */
-.perm-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
-.perm-head .perm-title { margin-bottom: 0; }
 .perm-detail {
   margin: 0 0 10px;
   padding: 6px 9px;
@@ -221,67 +149,6 @@
   max-height: 160px;
   overflow: auto;
 }
-.perm-actions { display: flex; gap: 8px; }
-.perm-actions button {
-  border: 1px solid var(--border);
-  background: var(--bg-2);
-  color: var(--fg);
-  border-radius: 6px;
-  padding: 5px 12px;
-  cursor: pointer;
-  font: inherit;
-}
-.perm-actions button:hover { background: color-mix(in srgb, var(--fg) 9%, transparent); }
-.perm-actions button.reject { border-color: color-mix(in srgb, var(--danger) 33%, transparent); color: var(--danger-fg); }
-
-/* --- "Always" grant-set reveal (.perm-always) ---------------------------
-   Surfaces the arity-prefix wildcard patterns OpenCode will grant when the
-   operator clicks "Always" (perm.always). The region is mount/unmount-gated
-   by <Show> in PermissionCard (so it is out of the a11y tree entirely until
-   revealed) — this CSS only styles it once it is shown:
-     • inline: shown when the eye toggle pins it open OR (desktop pointer:fine)
-       the "Always" button is hovered — both driven by JS signals, not CSS
-       :hover, so touch never fires the peek and the pin never fights the peek.
-     • popup: always shown in full (the popup is the browsable surface for big
-       lists), with no eye/hover affordance.
-   GPU notes (WebRender): plain max-height + overflow:auto for the cap. No
-   mask-image / -webkit-mask, no backdrop-filter, no per-element contain or
-   content-visibility — all are traps on always-present scrolling surfaces. */
-/* The eye lives inside .perm-actions, whose `button` rule pads text actions
-   (5px 12px); neutralize so .card-icon-btn's 26px square holds under the
-   global border-box sizing. `align-self: stretch` + `height: auto` override
-   .card-icon-btn's fixed height:26px so the eye stretches to the row's tallest
-   item (the text buttons), instead of sitting visibly shorter. Width stays 26px
-   (from .card-icon-btn), so it remains a narrow icon column; the 13px eye SVG
-   stays centered via .card-icon-btn's align/justify-center. Scoped to
-   .perm-actions only — the global .card-icon-btn stays 26px square elsewhere. */
-.perm-actions .card-icon-btn { padding: 0; align-self: stretch; height: auto; }
-.perm-eye { flex: none; }
-.perm-always {
-  margin: 8px 0 2px;
-  padding: 6px 9px;
-  background: var(--bg-input, #0d1117);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  font-size: 12px;
-  color: var(--fg-dim);
-}
-.perm-always-head { margin-bottom: 4px; color: var(--fg); }
-.perm-always-one { margin: 0; color: var(--fg); }
-/* Capped scroll region: ~6-8 lines, then scroll. Keeps a big &&-chain (many
-   arity-prefixes) from blowing out the chat stream. */
-.perm-always-list {
-  margin: 0;
-  padding-left: 18px;
-  max-height: 8rem;
-  overflow: auto;
-}
-.perm-always-list li { line-height: 1.5; }
-.perm-always-list code,
-.perm-always-one code {
-  font-family: var(--font-mono, ui-monospace, monospace);
-}
-.perm-always-list code { color: var(--fg); }
 
 /* --- header Usage pill (donut + context%) + popover (OpenChamber-style) --- */
 .usage { position: relative; }

@@ -1,0 +1,129 @@
+/* PermissionCard — inline permission request card + popup overlay surface +
+   "Always" grant-set reveal. All classes :global (test-queried: .perm-actions/
+   .perm-card/.perm-title/.card-pop). Side-effect import only.
+   The card-pop keyframes (card-pop-fade/card-pop-in/card-pop-in-sheet) stay
+   global in legacy/50-chat-overlays.css and are referenced here by bare name
+   (same pattern as EmptyState.module.css → empty-float).
+   .perm-detail is DEFERRED — it has a competitor in 00-app-globals.css (part of
+   the shared user-select:text selector list). */
+
+/* Popup overlay — a SECOND render surface of the same card (shared signals).
+   Centered dialog on desktop, bottom sheet on narrow widths. */
+:global(.card-pop-overlay) {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-dialog);
+  background: color-mix(in srgb, #000 55%, transparent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  animation: card-pop-fade 0.14s var(--ease, ease);
+}
+:global(.card-pop) {
+  width: min(640px, 100%);
+  max-height: min(82vh, 720px);
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: var(--shadow-lg, 0 12px 32px rgba(0, 0, 0, 0.45));
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  animation: card-pop-in 0.16s var(--ease, ease);
+  /* Focus target for ESC-aware dialog (tabindex=-1). */
+  outline: none;
+}
+:global(.card-pop-head) {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+  font-weight: 600;
+  font-size: 13px;
+}
+:global(.card-pop-title) { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
+:global(.card-pop-question .card-pop-title) { color: var(--accent); }
+:global(.card-pop-body) {
+  padding: 14px;
+  overflow-y: auto;
+  /* The popup body renders the card's inner items directly (no .question-card
+     wrapper), so give it the same vertical rhythm as an inline card. */
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+@media (max-width: 540px) {
+  /* Bottom sheet on phones: the card is wide enough that the option buttons,
+     markdown bodies, and textarea must stay readable at 360–414px. */
+  :global(.card-pop-overlay) { align-items: flex-end; padding: 0; }
+  :global(.card-pop) {
+    width: 100%;
+    max-width: 100%;
+    max-height: 88vh;
+    border-radius: 14px 14px 0 0;
+    animation: card-pop-in-sheet 0.18s var(--ease, ease);
+  }
+}
+
+/* --- permission card (inline surface) --- */
+:global(.perm-card) {
+  border: 1px solid color-mix(in srgb, var(--warn) 33%, transparent);
+  background: color-mix(in srgb, var(--warn) 14%, var(--bg));
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+:global(.perm-title) { margin-bottom: 8px; }
+/* When the title sits inside a .perm-head (card-chrome) row, drop its own
+   bottom margin — the head row carries the spacing, and the popup-trigger
+   button sits to its right. */
+:global(.perm-head) { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+:global(.perm-head .perm-title) { margin-bottom: 0; }
+:global(.perm-actions) { display: flex; gap: 8px; }
+:global(.perm-actions button) {
+  border: 1px solid var(--border);
+  background: var(--bg-2);
+  color: var(--fg);
+  border-radius: 6px;
+  padding: 5px 12px;
+  cursor: pointer;
+  font: inherit;
+}
+:global(.perm-actions button:hover) { background: color-mix(in srgb, var(--fg) 9%, transparent); }
+:global(.perm-actions button.reject) { border-color: color-mix(in srgb, var(--danger) 33%, transparent); color: var(--danger-fg); }
+
+/* --- "Always" grant-set reveal (.perm-always) ---
+   Surfaces the arity-prefix wildcard patterns OpenCode will grant when the
+   operator clicks "Always". GPU notes: plain max-height + overflow:auto. No
+   mask-image/backdrop-filter/contain/content-visibility (WebRender traps). */
+/* The eye lives inside .perm-actions, whose `button` rule pads text actions
+   (5px 12px); neutralize so .card-icon-btn's 26px square holds. Scoped to
+   .perm-actions only — the global .card-icon-btn stays 26px square elsewhere. */
+:global(.perm-actions .card-icon-btn) { padding: 0; align-self: stretch; height: auto; }
+:global(.perm-eye) { flex: none; }
+:global(.perm-always) {
+  margin: 8px 0 2px;
+  padding: 6px 9px;
+  background: var(--bg-input, #0d1117);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 12px;
+  color: var(--fg-dim);
+}
+:global(.perm-always-head) { margin-bottom: 4px; color: var(--fg); }
+:global(.perm-always-one) { margin: 0; color: var(--fg); }
+/* Capped scroll region: ~6-8 lines, then scroll. */
+:global(.perm-always-list) {
+  margin: 0;
+  padding-left: 18px;
+  max-height: 8rem;
+  overflow: auto;
+}
+:global(.perm-always-list li) { line-height: 1.5; }
+:global(.perm-always-list code),
+:global(.perm-always-one code) {
+  font-family: var(--font-mono, ui-monospace, monospace);
+}
+:global(.perm-always-list code) { color: var(--fg); }

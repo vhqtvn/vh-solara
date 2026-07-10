@@ -1,6 +1,7 @@
 import { createResource, createSignal, For, Show } from "solid-js";
 import { oc } from "../api";
 import { state } from "../sync";
+import "./ServersPanel.module.css";
 
 // Server / MCP / LSP / Plugins, shown as tabs (mirrors opencode web's server
 // popup). Data from /oc/config, /oc/mcp, /oc/lsp.

@@ -1,0 +1,78 @@
+/* ArchivedDialog — lazy paginated archived-session browser (tree + restore).
+   All classes :global (test-queried: .arch-restore/.arch-row). Side-effect
+   import only. .sidebar-foot/.sidebar-foot-btn stay in the shard (Sidebar's). */
+:global(.dialog.archived) { max-width: 560px; height: min(80vh, 680px); }
+:global(.arch-body) { padding: 6px; }
+:global(.arch-row) { display: flex; align-items: center; gap: 4px; border-radius: 8px; }
+:global(.arch-row:hover) { background: color-mix(in srgb, var(--fg) 6%, transparent); }
+:global(.arch-twisty) {
+  flex: none;
+  width: 22px;
+  height: 30px;
+  background: transparent;
+  border: 0;
+  color: var(--fg-dim);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+:global(.arch-twisty.leaf) { cursor: default; }
+:global(.arch-twisty span) { display: inline-flex; transition: transform 0.12s var(--ease, ease); }
+:global(.arch-twisty span.open) { transform: rotate(0deg); }
+:global(.arch-twisty span:not(.open)) { transform: rotate(-90deg); }
+:global(.arch-main) {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+  background: transparent;
+  border: 0;
+  color: var(--fg);
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+  padding: 7px 4px;
+}
+:global(.arch-title) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+:global(.arch-meta) { display: flex; align-items: center; gap: 6px; flex: none; }
+:global(.arch-count) {
+  font-size: 11px;
+  color: var(--fg-dim);
+  background: color-mix(in srgb, var(--fg) 10%, transparent);
+  border-radius: 999px;
+  padding: 1px 7px;
+}
+:global(.arch-time) { font-size: 11px; color: var(--fg-dim); font-variant-numeric: tabular-nums; }
+:global(.arch-restore) {
+  flex: none;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--fg-dim);
+  border-radius: 6px;
+  padding: 4px 9px;
+  margin-right: 6px;
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  opacity: 0;
+}
+:global(.arch-row:hover .arch-restore) { opacity: 1; }
+:global(.arch-restore:hover) { border-color: var(--accent); color: var(--fg); }
+:global(.arch-more) {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: 0;
+  color: var(--accent);
+  cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+  padding: 8px 10px;
+}
+:global(.arch-more:hover) { text-decoration: underline; }
+@media (hover: none) {
+  :global(.arch-restore) { opacity: 1; }
+}
