@@ -40,16 +40,33 @@ type Aggregator struct {
 	seedMu   sync.Mutex
 	seedDone chan struct{}
 
-	// msgMu guards msgInflight. msgInflight[sid] is non-nil (open) while an
-	// EnsureMessagesAsync fetch is in flight for that session; absent means none.
-	// This collapses concurrent opens of the same session (rapid switching, a
-	// reopen before the first completed, or several Stream-2 consumers) to ONE
-	// upstream GET /session/:id/message — the losers are already subscribed and
-	// simply receive the eventual messages.loaded / messages.error event. An
-	// entry is cleared on completion (success OR failure) so a later selection
-	// retries after a failure (the session is not left loaded on error).
+	// msgMu guards msgInflight. msgInflight[sid] is non-nil (open) while a cold
+	// message-history fetch is in flight for that session — registered by EITHER
+	// EnsureMessagesAsync (the stream first-open path) OR EnsureMessages (the
+	// synchronous GET /vh/snapshot path); absent means none. This collapses
+	// concurrent opens of the same cold session (rapid switching, a reopen before
+	// the first completed, several Stream-2 consumers, or a sync snapshot racing
+	// an async stream) to ONE upstream GET /session/:id/message. An async loser
+	// is already subscribed and simply receives the eventual messages.loaded /
+	// messages.error event; a sync EnsureMessages loser WAITS on the done chan
+	// and re-checks IsMessagesLoaded (no-op on winner-success, retry as the next
+	// winner on winner-failure). The winner — async OR sync — emits the
+	// completion event so a deduped async caller never wedges. An entry is
+	// cleared on completion (success OR failure) so a later selection retries
+	// after a failure (the session is not left loaded on error).
 	msgMu       sync.Mutex
 	msgInflight map[string]chan struct{}
+
+	// msgGateHook (test-only, nil in production) is invoked once per
+	// EnsureMessages / EnsureMessagesAsync call immediately AFTER the unlocked
+	// IsMessagesLoaded fast-path gate returns false — i.e. at the START of the
+	// TOCTOU window between that unlocked read and msgMu acquisition. A test
+	// may block in the callback to deterministically park a caller there while
+	// a prior winner completes its full cold-fetch lifecycle (GET +
+	// SetSessionMessages sets msgLoaded, defer reclaims the slot), reproducing
+	// the exact schedule the under-lock IsMessagesLoaded re-check must close.
+	// NOT guarded by a lock — install it once before any concurrent call.
+	msgGateHook func(sessionID string)
 }
 
 // New builds an aggregator targeting an opencode server base URL.
@@ -79,6 +96,17 @@ func (a *Aggregator) Store() *state.Store { return a.store }
 // Client exposes the underlying OpenCode client (used for write passthrough).
 func (a *Aggregator) Client() *opencode.Client { return a.client }
 
+// SetMsgGateHook installs a TEST-ONLY rendezvous callback fired once per
+// EnsureMessages / EnsureMessagesAsync call immediately after the unlocked
+// IsMessagesLoaded fast-path gate returns false — i.e. at the start of the
+// TOCTOU window between that unlocked read and msgMu acquisition. A test blocks
+// in the callback to deterministically park a caller there while a prior winner
+// completes its full cold-fetch lifecycle, then observes whether the under-lock
+// IsMessagesLoaded re-check closes the race (no redundant GET / no warm-resync
+// clobber). Nil (the default) is a no-op; production code never sets it. Not
+// lock-guarded — install once before any concurrent call.
+func (a *Aggregator) SetMsgGateHook(fn func(sessionID string)) { a.msgGateHook = fn }
+
 func decodeMessages(items []json.RawMessage) []state.MessageWithParts {
 	mwp := make([]state.MessageWithParts, 0, len(items))
 	for _, it := range items {
@@ -94,27 +122,125 @@ func decodeMessages(items []json.RawMessage) []state.MessageWithParts {
 // synchronous path used by GET /vh/snapshot). It is a no-op once the session is
 // loaded; subsequent live events keep it current.
 //
-// Like EnsureMessagesAsync it marks the cold-fetch window active for the
-// duration of the (potentially blocking) GET so a live event arriving
+// SINGLE-FLIGHT (C-F2): this coordinates with EnsureMessagesAsync through the
+// SHARED msgInflight[sessionID] slot, collapsing sync↔sync AND sync↔async
+// duplicates of the same cold session to ONE upstream GET. After the
+// IsMessagesLoaded gate it acquires msgMu: if a fetch is already in flight
+// (async OR sync winner), the caller WAITS on the existing done chan (the
+// waiter), then re-checks IsMessagesLoaded — on winner-success the data is now
+// loaded (loop → no-op return); on winner-failure the slot was reclaimed and the
+// session is still unloaded, so the loop retries as the next winner. A
+// request-ctx cancel (client disconnect) aborts the wait via the select. A
+// waiter never issues a GET of its own, so at most ONE upstream fetch serves all
+// concurrent callers — this is what closes C-F2 (no second warm reconcile of the
+// same cold load can clobber live-arrived content).
+//
+// COMPLETION SIGNAL: the shared slot is also used by EnsureMessagesAsync, whose
+// deduped callers rely on receiving messages.loaded / messages.error from the
+// winner. So the sync WINNER emits those events too — without this, an async
+// caller that deduped against a sync winner would never receive the completion
+// signal and its SSE client would wedge on the loading state. The sync endpoint
+// itself ignores the events (it returns the snapshot directly).
+//
+// COLD-FETCH WINDOW: like EnsureMessagesAsync the winner marks cold-fetch-active
+// for the duration of the (potentially blocking) GET so a live event arriving
 // mid-fetch tags its entries and the subsequent SetSessionMessages reconcile
 // preserves the newer live content instead of clobbering it with the stale
 // fetched body (C-F2). MarkColdFetchStart is set AFTER the IsMessagesLoaded
-// early-return (never for an already-warm session) and BEFORE the GET. The
-// defer ClearColdFetchActive covers the GET-FAILURE path (no reconcile runs to
-// clear the marker); the cold-load SUCCESS path already clears it inside
-// reconcileMessagesLocked, and the deferred Clear is idempotent there.
+// early-return (never for an already-warm session) and BEFORE the GET; the
+// deferred ClearColdFetchActive covers the GET-FAILURE path (no reconcile runs
+// to clear the marker) and is idempotent on the success path (the cold-load
+// reconcile already cleared it inside reconcileMessagesLocked).
 func (a *Aggregator) EnsureMessages(ctx context.Context, sessionID string) error {
-	if sessionID == "" || a.store.IsMessagesLoaded(sessionID) {
+	if sessionID == "" {
 		return nil
 	}
-	a.store.MarkColdFetchStart(sessionID)
-	defer a.store.ClearColdFetchActive(sessionID)
-	items, err := a.client.Messages(ctx, sessionID)
-	if err != nil {
-		return err
+	for {
+		if a.store.IsMessagesLoaded(sessionID) {
+			return nil
+		}
+		// msgGateHook (test-only, nil in production): rendezvous right at the
+		// start of the TOCTOU window — AFTER the unlocked IsMessagesLoaded
+		// fast-path read and BEFORE msgMu acquisition — so a test can
+		// deterministically park a caller here while a prior winner runs its
+		// full cold-fetch lifecycle, then prove the under-lock re-check below
+		// closes the race. See SetMsgGateHook + TestEnsureMessagesTOCTOURecheck.
+		if a.msgGateHook != nil {
+			a.msgGateHook(sessionID)
+		}
+		a.msgMu.Lock()
+		// UNDER-LOCK RE-CHECK (TOCTOU close, commit-reviewer tier1_b:F1): the
+		// unlocked IsMessagesLoaded gate above is a fast-path that races with a
+		// concurrent winner's full lifecycle. Between that read and this Lock a
+		// prior winner may have completed SetSessionMessages (msgLoaded[sid]=true,
+		// set inside store.mu) AND reclaimed its slot (delete(msgInflight, sid),
+		// set inside msgMu). The winner sets msgLoaded BEFORE its defer acquires
+		// msgMu to delete the slot, and we now hold msgMu after that defer
+		// released it — so observing msgLoaded here is happens-before-correct.
+		// A re-check that finds the session loaded returns nil WITHOUT becoming a
+		// fresh winner / issuing a redundant GET (whose warm-resync reconcile,
+		// coldLoad==false, would authoritatively clobber live content — the C-F2
+		// symptom via a different path). The outer unlocked gate stays as a
+		// fast-path to avoid contending on msgMu for warm calls; this under-lock
+		// re-check is the correctness gate.
+		if a.store.IsMessagesLoaded(sessionID) {
+			a.msgMu.Unlock()
+			return nil
+		}
+		if done, ok := a.msgInflight[sessionID]; ok {
+			// A fetch (async OR sync) is already in flight for this session.
+			// Wait for it, then re-evaluate at the top of the loop. ctx aborts
+			// the wait: the sync caller's request ctx can die (client
+			// disconnect) while an async winner is bound to a.runCtx (which
+			// outlives the request) — without the select the waiter would block
+			// until that longer-lived winner finishes.
+			a.msgMu.Unlock()
+			select {
+			case <-done:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			continue
+		}
+		// No inflight entry: become the winner and run the fetch inline.
+		done := make(chan struct{})
+		a.msgInflight[sessionID] = done
+		a.msgMu.Unlock()
+
+		a.store.MarkColdFetchStart(sessionID)
+		// Reclaim the slot + unblock waiters on BOTH success and failure: a
+		// waiter observing a failed winner re-checks IsMessagesLoaded (still
+		// false) and loops to retry as the next winner. Slot-clear +
+		// ClearColdFetchActive + close(done) mirror EnsureMessagesAsync's defer
+		// ordering so a woken waiter never sees a stale slot.
+		defer func() {
+			a.msgMu.Lock()
+			if a.msgInflight[sessionID] == done {
+				delete(a.msgInflight, sessionID)
+			}
+			a.msgMu.Unlock()
+			a.store.ClearColdFetchActive(sessionID)
+			close(done)
+		}()
+		t0 := time.Now()
+		items, err := a.client.Messages(ctx, sessionID)
+		if err != nil {
+			// Signal failure to any async caller that deduped against this sync
+			// winner (shared-slot completion contract). The session stays
+			// unloaded; the defer above cleared the slot so a reselect retries.
+			a.store.EmitMessagesError(sessionID, err.Error())
+			return err
+		}
+		fetchMs := time.Since(t0).Milliseconds()
+		tR := time.Now()
+		a.store.SetSessionMessages(sessionID, decodeMessages(items))
+		reconcileMs := time.Since(tR).Milliseconds()
+		// Signal completion to any async caller deduped against this sync winner
+		// (unconditional, mirroring EnsureMessagesAsync, so the client exits the
+		// loading state even when the fetch returned zero/unchanged messages).
+		a.store.EmitMessagesLoaded(sessionID, fetchMs, reconcileMs)
+		return nil
 	}
-	a.store.SetSessionMessages(sessionID, decodeMessages(items))
-	return nil
 }
 
 // EnsureMessagesAsync is the non-blocking lazy-hydration entrypoint used by the
@@ -148,7 +274,23 @@ func (a *Aggregator) EnsureMessagesAsync(ctx context.Context, sessionID string) 
 	if sessionID == "" || a.store.IsMessagesLoaded(sessionID) {
 		return
 	}
+	if a.msgGateHook != nil {
+		a.msgGateHook(sessionID)
+	}
 	a.msgMu.Lock()
+	// UNDER-LOCK RE-CHECK (TOCTOU close, tier1_b:F1): same window + fix as
+	// EnsureMessages — see the longer note there. Between the unlocked
+	// IsMessagesLoaded read and this Lock a prior winner (async OR sync) may
+	// have loaded the session (SetSessionMessages set msgLoaded) AND reclaimed
+	// its slot (defer deleted msgInflight). Acquiring msgMu after that defer
+	// guarantees we observe msgLoaded==true, so a caller that now finds NO slot
+	// must NOT become a fresh winner (which would spawn a redundant GET whose
+	// warm-resync reconcile clobbers live content); it returns instead. The
+	// unlocked gate above stays as a fast-path; this is the correctness gate.
+	if a.store.IsMessagesLoaded(sessionID) {
+		a.msgMu.Unlock()
+		return
+	}
 	if _, ok := a.msgInflight[sessionID]; ok {
 		// A fetch is already in flight for this session; the caller is already
 		// subscribed and will receive the eventual completion event — dedupe.

@@ -283,6 +283,54 @@ func TestDeltaCoalesce_HistoryFetchResetsAccumulator(t *testing.T) {
 	}
 }
 
+// TestDeltaCoalesce_ColdLoadPreservesUnflushedDeltaBuf pins the store.go:2090
+// guard INDEPENDENTLY of the part-body guard (store.go:2108): on a cold-load
+// reconcile, a message whose part was LIVE-touched during the in-flight cold GET
+// must NOT have its unflushed deltaBuf accumulator wiped — the buffered streaming
+// text is newer than the stale fetched body and must survive the reconcile so a
+// later flush re-materializes the full live-accumulated text. Sibling to
+// TestDeltaCoalesce_HistoryFetchResetsAccumulator, which exercises the OPPOSITE
+// case (NO cold-fetch-active marker → the accumulator IS correctly reset by the
+// authoritative history fetch).
+//
+// Removing the `coldLoad && len(me.liveTouchedParts) > 0` condition at
+// store.go:2090 makes this test fail: the unflushed "tail" is nil'd and only the
+// already-flushed "live-" prefix survives (the part-body guard at 2108 still
+// keeps "live-", so the failure is specifically "live-" ≠ "live-tail").
+func TestDeltaCoalesce_ColdLoadPreservesUnflushedDeltaBuf(t *testing.T) {
+	withFlushInterval(t, time.Hour)
+
+	s := New(1000)
+	s.Apply(ev("session.created", `{"info":{"id":"sess"}}`))
+	s.Apply(ev("message.updated", `{"info":{"id":"m1","sessionID":"sess","role":"assistant"}}`))
+	s.Apply(ev("message.part.updated", `{"part":{"id":"p1","sessionID":"sess","messageID":"m1","type":"text","text":""}}`))
+
+	// Open the cold-fetch window: while coldFetchActive is set, appendPartDeltaLocked
+	// tags liveTouchedParts["p1"]=true so both reconcile guards preserve the part.
+	s.MarkColdFetchStart("sess")
+
+	// First delta flushes immediately (deltaLastEmit zero → elapsed huge); the
+	// SECOND delta lands genuinely UNFLUSHED in deltaBuf, held by the hour-long
+	// throttle window — this is the accumulator the store.go:2090 guard protects.
+	applyDelta(s, "sess", "m1", "p1", "text", "live-")
+	applyDelta(s, "sess", "m1", "p1", "text", "tail")
+
+	// The cold-load reconcile arrives with a STALE fetched body for p1
+	// ("fetched-stale") that must NOT win over the live-accumulated text.
+	s.SetSessionMessages("sess", []MessageWithParts{{
+		Info:  json.RawMessage(`{"id":"m1","sessionID":"sess","role":"assistant"}`),
+		Parts: []json.RawMessage{json.RawMessage(`{"id":"p1","sessionID":"sess","messageID":"m1","type":"text","text":"fetched-stale"}`)},
+	}})
+
+	// Snapshot forces a flush of the (surviving) deltaBuf → the FULL live-
+	// accumulated text "live-tail" must be present: not the stale "fetched-stale"
+	// (part-body guard) and not just the flushed prefix "live-" (deltaBuf guard).
+	if got := partText(s.Snapshot(nil), "sess", "p1"); got != "live-tail" {
+		t.Fatalf("unflushed deltaBuf lost across cold-load reconcile: want %q, got %q "+
+			"(store.go:2090 guard failed — only the flushed prefix survived)", "live-tail", got)
+	}
+}
+
 // --- P1-AGG-005: classification-drift test ---
 //
 // store classifies message-class events by exact Kind constant
