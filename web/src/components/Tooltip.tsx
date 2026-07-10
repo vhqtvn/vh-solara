@@ -59,17 +59,34 @@ export default function Tooltip() {
 
   // Arm the hover-delay timer for `target`, replacing any pending arm. On fire
   // we defensively re-check that the element is still genuinely interacted with
-  // before showing: for the pointer path we trust the browser's own `:hover`
-  // tracking (more reliable than our event chain — if a `pointerout` was missed,
-  // `:hover` is already false and we drop the stale target). `:hover` is false
-  // during keyboard focus, so `fromFocus` short-circuits the check and shows
-  // unconditionally (focusout→onOut cancels).
+  // before showing — BOTH paths re-verify at fire time, symmetrically: the
+  // pointer path trusts the browser's own `:hover` tracking (more reliable than
+  // our event chain — if a `pointerout` was missed, `:hover` is already false
+  // and we drop the stale target); the focus path re-checks
+  // `document.activeElement` rather than trusting the closed-over `fromFocus`
+  // flag (a missed focusout could leave that flag stale — activeElement is the
+  // ground truth, symmetric to the pointer path's :hover). `:hover` is false
+  // under keyboard focus, so the focus path cannot reuse the pointer check.
   const armShow = (target: HTMLElement, fromFocus: boolean) => {
     clearHoverTimer();
+    // We are arming a show for a DIFFERENT target (both call sites guard
+    // `!== current`), so drop any stale bubble now instead of leaving the
+    // previous tip visible over the new target for the whole delay. On a
+    // first-enter this is a no-op (nothing was shown yet).
+    setTip(null);
     current = target;
     hoverTimer = setTimeout(() => {
       hoverTimer = undefined;
-      if (current && (fromFocus || current.matches(":hover"))) show(current);
+      if (!current) {
+        hide();
+        return;
+      }
+      const stillInteracted = fromFocus
+        ? current === document.activeElement ||
+          // Element.contains(null) returns false per spec — safe cast.
+          current.contains(document.activeElement as Node | null)
+        : current.matches(":hover");
+      if (stillInteracted) show(current);
       else hide();
     }, HOVER_DELAY_MS);
   };
