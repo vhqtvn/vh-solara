@@ -149,8 +149,24 @@ describe("Tooltip", () => {
     vi.advanceTimersByTime(HOVER_DELAY_MS);
     expect(tipEl()?.textContent ?? "").toContain("alpha");
 
-    // Tab to B: jsdom blurs A (focusout, relatedTarget=B) then focuses B
-    // (focusin). The focusout inter-tip branch re-arms a fresh timer for B.
+    // Tab A→B: dispatch the focusout EXPLICITLY with relatedTarget=B so onOut's
+    // inter-tip branch deterministically derives fromFocus=true and re-arms a
+    // fresh timer for B (D2: don't rely on jsdom auto-populating relatedTarget
+    // when b.focus() runs — that is version-dependent and not guaranteed).
+    a.dispatchEvent(new FocusEvent("focusout", { bubbles: true, relatedTarget: b }));
+
+    // F4 negative: the re-arm cleared A's stale bubble IMMEDIATELY via
+    // setTip(null) at the top of armShow — before the new 450ms delay fires.
+    // Pin this so removing that line regresses (the stale "alpha" would linger
+    // over B for the whole delay).
+    expect(tipEl()).toBeNull();
+
+    // b.focus() makes B the active element (the fire-time activeElement re-check
+    // needs document.activeElement === B). Any focusout b.focus() also fires on
+    // A is harmless: current is already B, so onOut's inter-tip branch no-ops
+    // (next === current → return); or — were its relatedTarget unset — hide()
+    // runs and the follow-up focusin re-arms B. Either way the end state lands
+    // on B's tip after the delay.
     b.focus();
     vi.advanceTimersByTime(HOVER_DELAY_MS);
     const tip = tipEl();
