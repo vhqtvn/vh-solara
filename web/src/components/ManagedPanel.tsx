@@ -169,7 +169,7 @@ export default function ManagedPanel(props: { onClose: () => void }) {
           )}
         </For>
         <Show when={(proj()?.views.length ?? 0) > 0}>
-          <div class="managed-subhead">Views</div>
+          <div class={styles["managed-subhead"]}>Views</div>
           <For each={proj()!.views}>
             {(v) => (
               <div class={styles["managed-view"]}>
