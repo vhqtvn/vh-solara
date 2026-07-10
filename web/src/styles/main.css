@@ -9,6 +9,7 @@
  *                                animation-disable.  (orig. lines 1-289)
  *   foundation/reset.css       * {box-sizing}, html/body/#root.   (291-301)
  *   foundation/typography.css   body { background; color; font }.  (303-307)
+ *   foundation/scrollbars.css  global thin themed scrollbars (all themes).(new)
  *   foundation/z-index.css     documentation only (see file).      (new)
  *   foundation/perf-guards.css documentation only (see file).      (new)
  *   legacy/*.css              the remaining CSS, in original order. There is NO

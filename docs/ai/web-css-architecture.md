@@ -23,6 +23,7 @@ web/src/
     │   ├── tokens.css        # :root vars + theme-* class vars + --z-* ladder
     │   ├── reset.css         # CSS reset
     │   ├── typography.css    # global typography
+    │   ├── scrollbars.css   # global thin themed scrollbars (all themes, GPU-safe)
     │   ├── z-index.css       # documentation-only z-index reference
     │   └── perf-guards.css   # documentation-only performance guardrails
     └── legacy/               # former legacy.css, split into 10 ordered source-preserving shards
