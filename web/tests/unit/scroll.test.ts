@@ -569,3 +569,80 @@ describe("classifyScrollDelta — restore / hydration / load-more", () => {
     expect(readDecision.newScrollTop).toBeUndefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Interaction-scoped follow hold (Approach E) — pure classifier invariant.
+//
+// While the operator interacts with the PendingInput blocker card, ChatView
+// suppresses ONLY the content-resize re-glue-to-bottom write (holdActive gate).
+// This is safe ONLY because the pure classifier, given a held-steady scrollTop
+// and growing content, NEVER classifies the cycle as user-scroll-up. These
+// tests pin that invariant: repeated content-grow cycles while held stay
+// intent "none" with shouldScroll + a new maxBottom, and on release the
+// deferred write lands cleanly without arming userScrolledUp.
+// ---------------------------------------------------------------------------
+describe("classifyScrollDelta — interaction-scoped follow hold (Approach E) invariant", () => {
+  // Start glued to the bottom (scrollTop === maxBottom === 1400).
+  const atBottom = (): ScrollGeometry => ({ scrollTop: 1400, scrollHeight: 2000, clientHeight: 600 });
+
+  it("repeated content-grow while scrollTop is held steady → intent stays 'none' across cycles (never user-scroll-up)", () => {
+    // This is the core safety invariant: the RO advances pinnedGeom to the
+    // settled geometry each cycle (which, while held, has the SAME scrollTop as
+    // the previous cycle — the write was skipped). So prev.scrollTop ===
+    // curr.scrollTop every cycle → residual 0 → intent "none".
+    let prev: ScrollGeometry = atBottom();
+    // Cycle 1: content grows by 100, scrollTop held at 1400 (write skipped).
+    let curr: ScrollGeometry = { scrollTop: 1400, scrollHeight: 2100, clientHeight: 600 };
+    let d = tail(prev, curr, true);
+    expect(d.intent).toBe("none");
+    expect(d.shouldScroll).toBe(true);
+    expect(d.newScrollTop).toBe(1500); // new maxBottom (2100-600)
+    // RO advances baseline to settled geometry (scrollTop unchanged because
+    // the write was suppressed).
+    prev = curr;
+
+    // Cycle 2: content grows another 100, scrollTop still 1400.
+    curr = { scrollTop: 1400, scrollHeight: 2200, clientHeight: 600 };
+    d = tail(prev, curr, true);
+    expect(d.intent).toBe("none");
+    expect(d.shouldScroll).toBe(true);
+    expect(d.newScrollTop).toBe(1600);
+    prev = curr;
+
+    // Cycle 3: more growth.
+    curr = { scrollTop: 1400, scrollHeight: 2500, clientHeight: 600 };
+    d = tail(prev, curr, true);
+    expect(d.intent).toBe("none");
+    expect(d.shouldScroll).toBe(true);
+    expect(d.newScrollTop).toBe(1900);
+  });
+
+  it("on release, the deferred write lands cleanly — single cycle classifies shouldScroll + no userScrolledUp", () => {
+    // After the hold releases, scrollTop is still at the held value (1400) but
+    // the write is no longer suppressed. The RO fires once more with the SAME
+    // settled geometry; the classifier sees residual 0 (prev.scrollTop advanced
+    // to the held 1400, curr.scrollTop still 1400) → intent "none", shouldScroll
+    // true, newScrollTop = current maxBottom. A single re-pin lands; following
+    // stays true; userScrolledUp is never armed.
+    const prev: ScrollGeometry = { scrollTop: 1400, scrollHeight: 2500, clientHeight: 600 };
+    const curr: ScrollGeometry = { scrollTop: 1400, scrollHeight: 2500, clientHeight: 600 };
+    const d = tail(prev, curr, true);
+    expect(d.intent).toBe("none");
+    expect(d.shouldScroll).toBe(true);
+    expect(d.newScrollTop).toBe(1900); // 2500 - 600
+    expect(d.residualUserDelta).toBe(0);
+  });
+
+  it("hold does not mask genuine user-scroll-up — if the operator scrolls up while held, the classifier still sees it", () => {
+    // The hold suppresses the WRITE, not the classifier. If the operator
+    // genuinely scrolls up during the hold, the next RO cycle sees a negative
+    // residual and classifies user-scroll-up — ChatView then drops following
+    // and arms userScrolledUp as usual. This guarantees manual scroll-up is
+    // respected even during the hold.
+    const prev: ScrollGeometry = { scrollTop: 1400, scrollHeight: 2500, clientHeight: 600 };
+    const curr: ScrollGeometry = { scrollTop: 800, scrollHeight: 2500, clientHeight: 600 };
+    const d = tail(prev, curr, true);
+    expect(d.intent).toBe("user-scroll-up");
+    expect(d.shouldScroll).toBe(false);
+  });
+});

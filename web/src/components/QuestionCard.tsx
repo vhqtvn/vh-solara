@@ -1,10 +1,11 @@
-import { createResource, createSignal, For, Show } from "solid-js";
+import { createEffect, createResource, createSignal, For, Show } from "solid-js";
 import { Portal } from "solid-js/web";
 import type { Question } from "../types";
 import { respondQuestion } from "../sync";
 import { renderMarkdown } from "../render";
 import Icon from "./Icon";
 import { useCardPopup } from "./cardPopup";
+import { usePendingInputHold } from "./PendingInput";
 import styles from "./QuestionCard.module.css";
 
 // Goldmark wraps a lone paragraph as <p>…</p>. Inside a <button> that is
@@ -66,6 +67,14 @@ export default function QuestionCard(props: { question: Question }) {
   // The card's signals and `body()` stay here; only the popup lifecycle is
   // delegated. See components/cardPopup.ts.
   const popup = useCardPopup();
+
+  // Report popup-open up to the PendingInput host so it can keep the
+  // interaction-scoped follow hold active while the operator is in the
+  // portaled popup (focus leaves the wrapper subtree into the portal, so
+  // focus-within alone would release a hold mid-interaction). No-op when the
+  // card is rendered without a PendingInput ancestor (standalone tests).
+  const hold = usePendingInputHold();
+  createEffect(() => hold?.setPopupOpen(popup.open()));
 
   function toggle(qi: number, label: string, multiple?: boolean) {
     setPicked((prev) => {

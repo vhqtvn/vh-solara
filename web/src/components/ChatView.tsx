@@ -212,6 +212,18 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // turn starts" must keep the reader in place (the stated lifecycle). Clearing
   // on turn-start would re-yank them, defeating the latch.
   const [userScrolledUp, setUserScrolledUp] = createSignal(false);
+  // Interaction-scoped follow hold (Approach E). While the operator is actively
+  // interacting with the PendingInput blocker card (hover/press/focus/popup-
+  // open/pinned-reveal), PendingInput reports `held=true` via onHoldChange and
+  // we suppress ONLY the programmatic content-resize re-glue-to-bottom write in
+  // the content ResizeObserver below. This is SEPARATE transient state from
+  // `following` / `userScrolledUp`: the scroll classifier, the viewport-resize
+  // RO, composer grow/shrink handling, and onScrolled are all untouched. The
+  // hold is safe because while scrollTop is held steady and content grows, the
+  // classifier sees residualUserDelta=0 → intent "none" (never user-scroll-up),
+  // so skipping the write does NOT arm userScrolledUp; on release the next cycle
+  // still classifies shouldScroll=true and a single re-pin lands cleanly.
+  const [holdActive, setHoldActive] = createSignal(false);
   // Hide the transcript until it's positioned for the current session, so the
   // initial scroll jump (top → restored/bottom) is never painted — switching
   // sessions reveals the content already in place instead of flashing.
@@ -898,10 +910,13 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
           // after content+viewport+clamp accounted). Let it win; do NOT pin.
           setFollowing(false);
           setUserScrolledUp(true);
-        } else if (d.shouldScroll && d.newScrollTop !== undefined) {
+        } else if (d.shouldScroll && d.newScrollTop !== undefined && !holdActive()) {
           // Layout churn (grow/shrink/viewport resize) while still following:
           // re-glue to the bottom. Epsilon-guarded inside the reducer against
-          // no-op churn.
+          // no-op churn. SUPPRESSED while the operator is interacting with the
+          // PendingInput blocker (holdActive) — see the signal's declaration
+          // for the safety invariant. The classifier still runs (above) so
+          // intent/gates advance normally; only this one write is skipped.
           scrollEl.scrollTop = d.newScrollTop;
         }
         // Nudge the reactive ack to re-check nearBottom() now that geometry
@@ -1238,6 +1253,12 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       () => {
         setFollowing(true);
         setUserScrolledUp(false); // entering a session = fresh follow intent
+        // Defense-in-depth (commit-review tier1_b/F1): PendingInput now releases
+        // its hold on unmount, but if a prior session's card unmounted mid-
+        // interaction AND its cleanup ran inside the session-switch transition,
+        // a stale holdActive could survive. Reset it here alongside the other
+        // transient scroll-state resets so a fresh session always starts unheld.
+        setHoldActive(false);
         setInput(loadVersioned<string>(draftKey(props.sessionId || "__new__"), 1, "", (o) => (typeof o === "string" ? o : "")));
         // Pin to bottom on the next frame — but only if we're still following.
         // This races the chat-scroll session-switch restore (maybeRestore): if the
@@ -1764,6 +1785,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
               pillMount={() => chatMainEl}
               pillLabel={() => (pendingQuestions().length > 0 ? "Answer needed" : "Permission requested")}
               onJump={jumpToLatest}
+              onHoldChange={(h) => setHoldActive(h)}
             >
               <For each={pendingQuestions()}>{(q) => <QuestionCard question={q as any} />}</For>
               <For each={pendingPermissions()}>{(p) => <PermissionCard sessionID={props.sessionId} perm={p} />}</For>

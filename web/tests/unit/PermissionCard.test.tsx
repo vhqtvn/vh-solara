@@ -13,6 +13,10 @@ vi.mock("../../src/sync", () => ({
 }));
 
 import PermissionCard from "../../src/components/PermissionCard";
+import {
+  PendingInputHoldContext,
+  type PendingInputHoldReport,
+} from "../../src/components/PendingInput";
 
 // Representative permission: a bash tool call. `permission` → permLabel;
 // `metadata.command` → permDetail (the <pre> body). The sessionID lives on the
@@ -24,6 +28,13 @@ const perm = {
   sessionID,
   permission: "bash",
   metadata: { command: "rm -rf /tmp/scratch" },
+};
+
+// Permission carrying an "Always" grant-set (OpenCode stamps arity-prefix
+// wildcards here). Exercises the eye-toggle reveal + hold notification.
+const permWithAlways = {
+  ...perm,
+  always: ["git diff *", "npm run build *"],
 };
 
 describe("PermissionCard — inline fast actions + shared-state popup", () => {
@@ -128,5 +139,78 @@ describe("PermissionCard — inline fast actions + shared-state popup", () => {
     await waitFor(() =>
       expect(document.querySelector(".card-pop")).toBeNull(),
     );
+  });
+});
+
+describe("PermissionCard — 'Always' grant-set pinned reveal + hold notification", () => {
+  afterEach(() => {
+    cleanup();
+    respondPermission.mockClear();
+  });
+
+  it("eye toggle pins the grant-set reveal open (click toggles alwaysPinned)", () => {
+    const { container } = render(() => (
+      <PermissionCard sessionID={sessionID} perm={permWithAlways} />
+    ));
+    // The reveal region is hidden by default (no pin, no hover).
+    expect(container.querySelector(".perm-always")).toBeNull();
+    // The eye toggle button is present (only when always list exists, inline).
+    const eye = container.querySelector(".perm-eye") as HTMLButtonElement;
+    expect(eye).toBeTruthy();
+    // Click → pins the reveal open.
+    eye.click();
+    const region = container.querySelector(".perm-always") as HTMLElement;
+    expect(region).toBeTruthy();
+    expect(region.querySelectorAll(".perm-always-list li").length).toBe(2);
+    // Click again → unpins.
+    eye.click();
+    expect(container.querySelector(".perm-always")).toBeNull();
+  });
+
+  it("reports pinned reveal up to PendingInput hold context", () => {
+    const setPinnedReveal = vi.fn();
+    const setPopupOpen = vi.fn();
+    const report: PendingInputHoldReport = { setPopupOpen, setPinnedReveal };
+    const { container } = render(() => (
+      <PendingInputHoldContext.Provider value={report}>
+        <PermissionCard sessionID={sessionID} perm={permWithAlways} />
+      </PendingInputHoldContext.Provider>
+    ));
+    // Initial mount: createEffect reports pinned=false.
+    expect(setPinnedReveal).toHaveBeenCalledWith(false);
+    // Pin the reveal.
+    (container.querySelector(".perm-eye") as HTMLButtonElement).click();
+    expect(setPinnedReveal).toHaveBeenCalledWith(true);
+  });
+
+  it("reports popup open up to PendingInput hold context", async () => {
+    const setPinnedReveal = vi.fn();
+    const setPopupOpen = vi.fn();
+    const report: PendingInputHoldReport = { setPopupOpen, setPinnedReveal };
+    const { container } = render(() => (
+      <PendingInputHoldContext.Provider value={report}>
+        <PermissionCard sessionID={sessionID} perm={permWithAlways} />
+      </PendingInputHoldContext.Provider>
+    ));
+    // Initial mount: popup closed.
+    expect(setPopupOpen).toHaveBeenCalledWith(false);
+    setPopupOpen.mockClear();
+    // Open the popup.
+    (
+      container.querySelector(
+        '[aria-label="Open permission in popup"]',
+      ) as HTMLButtonElement
+    ).click();
+    await waitFor(() =>
+      expect(setPopupOpen).toHaveBeenCalledWith(true),
+    );
+  });
+
+  it("standalone card (no PendingInput context) does not throw — hold report is optional", () => {
+    // usePendingInputHold returns undefined when no Provider is above the card.
+    // The card's createEffect uses optional chaining, so this is a safe no-op.
+    expect(() =>
+      render(() => <PermissionCard sessionID={sessionID} perm={permWithAlways} />),
+    ).not.toThrow();
   });
 });

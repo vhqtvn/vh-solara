@@ -1,9 +1,10 @@
-import { For, Show, createSignal } from "solid-js";
+import { createEffect, For, Show, createSignal } from "solid-js";
 import { Portal } from "solid-js/web";
 import type { Permission } from "../types";
 import { respondPermission } from "../sync";
 import Icon from "./Icon";
 import { useCardPopup } from "./cardPopup";
+import { usePendingInputHold } from "./PendingInput";
 import "./PermissionCard.css";
 
 // Category label for a permission request (best-effort: the structured fields
@@ -76,6 +77,14 @@ export default function PermissionCard(props: {
   const [alwaysPinned, setAlwaysPinned] = createSignal(false);
   const [alwaysHover, setAlwaysHover] = createSignal(false);
   const alwaysShown = () => alwaysPinned() || alwaysHover();
+
+  // Report popup-open + pinned-reveal up to the PendingInput host so it can
+  // keep the interaction-scoped follow hold active while the operator is in
+  // the portaled popup or has the "Always" grant-set pinned open. No-op when
+  // the card is rendered without a PendingInput ancestor (standalone tests).
+  const hold = usePendingInputHold();
+  createEffect(() => hold?.setPopupOpen(popup.open()));
+  createEffect(() => hold?.setPinnedReveal(alwaysPinned()));
 
   const alwaysList = (): string[] | null => {
     const a = props.perm.always;
