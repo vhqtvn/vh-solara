@@ -326,10 +326,17 @@ export function applyMessageEvent(kind: string, seq: number, payload: any, track
 }
 
 async function fetchSessionMessages(id: string): Promise<any[]> {
+  // z=1 opts into gzip64 snapshot encoding (server maybeCompressSnapshot) so the
+  // full transcript ships compressed through the controller tunnel — the same
+  // win as the Stream-2 snapshot. refreshOpenSessions fans one of these out per
+  // open session on a tree reconnect, so without it each pull ships a full
+  // uncompressed transcript and they contend the tunnel. decodeSnapshot is a
+  // pass-through when the response carries no `encoding` (old server / small
+  // snapshot under the threshold), so an old server keeps working.
   const res = await fetch(
-    `/vh/snapshot?sessions=${encodeURIComponent(id)}&dir=${encodeURIComponent(projectDir())}`,
+    `/vh/snapshot?sessions=${encodeURIComponent(id)}&dir=${encodeURIComponent(projectDir())}&z=1`,
   );
-  const snap: Snapshot = await res.json();
+  const snap: Snapshot = await decodeSnapshot<Snapshot>(await res.json());
   return (snap.messages?.[id] as any[]) || [];
 }
 
@@ -472,11 +479,18 @@ function bumpUpdating() {
 // Purely additive instrumentation (zero server change). For each stream we
 // capture performance.now() stamps and derive deltas:
 //   open    = onopen − EventSource construction      (pure connection latency)
-//   snap    = first snapshot − onopen                (end-to-end: server compute + serialize +
+//   snap    = first snapshot FRAME − onopen          (end-to-end: server compute + serialize +
 //                                                      tunnel transport of the payload through
 //                                                      the controller; under refreshOpenSessions
 //                                                      fan-out the transport dominates, NOT
-//                                                      server compute)
+//                                                      server compute). The snapshot payload is
+//                                                      gzip64-compressed when large (a warm open
+//                                                      of a loaded session inlines the whole
+//                                                      transcript) — `snap` measures transport of
+//                                                      the COMPRESSED size, which is the win this
+//                                                      surfaces. Stamped on frame ARRIVAL, before
+//                                                      the client-side decode, so it stays a pure
+//                                                      transport signal (decode is ms-scale CPU).
 //   hydrate = messages.loaded arrival − first snapshot   [SESSION STREAM ONLY]
 //                                                      (upstream full-fetch wait —
 //                                                      the gap `snap` misses on a
@@ -555,6 +569,19 @@ let sesHydrating = false;
 // messages.error listener awaits any pending entry for the session before
 // flipping the gate. Cleared as each batch lands (try/finally in the listener).
 const pendingBatch = new Map<string, Promise<void>>();
+// In-flight gzip64 snapshot decode for the CURRENT session connection. A warm
+// open ships the transcript compressed (server maybeCompressSnapshot); the
+// decode is ASYNC (native DecompressionStream). applySessionSnapshot
+// WHOLESALE-REPLACES messages[id], so a message.upsert/part.upsert landing in
+// the decode window would be applied then silently clobbered by the stale-but-
+// now-decoded snapshot. Promise-gate exactly like pendingBatch: the shared
+// message-kind listener awaits this before processing ANY live event for the
+// session. Connect-time only (a snapshot decode is ms-scale) and bounded to one
+// (the current connection's). Reset on each (re)open. sesSnapshotDecoding is
+// the cheap boolean the firehose path checks to avoid a microtask when no decode
+// is in flight (message.upsert/part.upsert floods must stay zero-latency).
+let sesSnapshotDecode: Promise<void> = Promise.resolve();
+let sesSnapshotDecoding = false;
 
 // TREE_STREAM_KINDS — the named SSE events Stream 1 (the tree stream)
 // subscribes to and forwards to applyMessageEvent. Exported so a unit test
@@ -727,39 +754,17 @@ export function applySessionSnapshot(id: string, snap: Snapshot) {
   }
 }
 
-// decodeMessagesBatch reverses the server's application-level compression of
-// the cold-load messages.batch payload. The server emits {sessionID, encoding,
-// data} where data = base64( gzip( {"messages":[...]} ) ). sessionID stays
-// PLAIN TEXT so the store/web interest filters (payloadSessionID / sendable)
-// keep extracting it — replacing the whole payload with a base64 blob would
-// silently drop the batch for Stream-2 (open-session) subscribers; only the
-// heavy messages array is compressed. This helper returns {sessionID,
-// messages} in the exact shape applyMessageEvent's "messages.batch" case
-// already consumes, so that case is UNCHANGED by compression. Uses native
-// DecompressionStream + atob (no pako dep; Chrome 80+/FF 113+/Safari 16.4+ —
-// fine for this PWA's modern-browser target). Exported for unit testing.
-export async function decodeMessagesBatch(payload: {
-  sessionID?: string;
-  encoding?: string;
-  data?: string;
-  messages?: any[];
-}): Promise<{ sessionID: string; messages: any[] }> {
-  const sessionID = payload.sessionID || "";
-  // Pass-through for a non-compressed payload (a non-conforming server, or a
-  // future threshold policy that emits raw JSON below a size cutoff). Keeps the
-  // helper a total function.
-  if (payload.encoding !== "gzip64" || !payload.data) {
-    return { sessionID, messages: payload.messages || [] };
-  }
-  // Feature-detect: an older browser without DecompressionStream cannot decode.
-  // Fall back to whatever inline messages arrived (likely empty) and log — the
-  // server always compresses today, so this only matters for an old client.
-  if (typeof DecompressionStream === "undefined") {
-    log.warn("sync", "DecompressionStream unavailable; messages.batch undecodable", { id: sessionID });
-    return { sessionID, messages: payload.messages || [] };
-  }
+// decodeGzip64 reverses the server's gzip+base64 application compression
+// (base64 → atob → Uint8Array → native DecompressionStream → UTF-8 string).
+// Shared by the cold-load messages.batch decoder, the session-snapshot decoder,
+// and the GET /vh/snapshot decoder so all three walk ONE decompression path.
+// Returns "" when the runtime lacks DecompressionStream (an old browser) so each
+// caller can fall back to whatever raw payload it has and log. No pako dep;
+// relies on Chrome 80+/FF 113+/Safari 16.4+ native support (this PWA's target).
+async function decodeGzip64(data: string): Promise<string> {
+  if (typeof DecompressionStream === "undefined") return "";
   // atob → binary string → Uint8Array.
-  const bin = atob(payload.data);
+  const bin = atob(data);
   const bytes = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
   // Pipe through native gzip decompression, drain to one buffer.
@@ -782,8 +787,62 @@ export async function decodeMessagesBatch(payload: {
     merged.set(c, off);
     off += c.length;
   }
-  const inner = JSON.parse(new TextDecoder().decode(merged));
+  return new TextDecoder().decode(merged);
+}
+
+// decodeMessagesBatch reverses the server's application-level compression of
+// the cold-load messages.batch payload. The server emits {sessionID, encoding,
+// data} where data = base64( gzip( {"messages":[...]} ) ). sessionID stays
+// PLAIN TEXT so the store/web interest filters (payloadSessionID / sendable)
+// keep extracting it — replacing the whole payload with a base64 blob would
+// silently drop the batch for Stream-2 (open-session) subscribers; only the
+// heavy messages array is compressed. This helper returns {sessionID,
+// messages} in the exact shape applyMessageEvent's "messages.batch" case
+// already consumes, so that case is UNCHANGED by compression. Exported for
+// unit testing.
+export async function decodeMessagesBatch(payload: {
+  sessionID?: string;
+  encoding?: string;
+  data?: string;
+  messages?: any[];
+}): Promise<{ sessionID: string; messages: any[] }> {
+  const sessionID = payload.sessionID || "";
+  // Pass-through for a non-compressed payload (a non-conforming server, or a
+  // future threshold policy that emits raw JSON below a size cutoff). Keeps the
+  // helper a total function.
+  if (payload.encoding !== "gzip64" || !payload.data) {
+    return { sessionID, messages: payload.messages || [] };
+  }
+  const text = await decodeGzip64(payload.data);
+  if (!text) {
+    // Older browser without DecompressionStream cannot decode. Fall back to
+    // whatever inline messages arrived (likely empty) and log — the server
+    // always compresses today, so this only matters for an old client.
+    log.warn("sync", "DecompressionStream unavailable; messages.batch undecodable", { id: sessionID });
+    return { sessionID, messages: payload.messages || [] };
+  }
+  const inner = JSON.parse(text);
   return { sessionID, messages: inner.messages || [] };
+}
+
+// decodeSnapshot reverses the server's gzip64 snapshot compression
+// (pkg/web maybeCompressSnapshot) used for BOTH the Stream-2 session snapshot
+// (SSE) and the GET /vh/snapshot response. Returns the decoded object.
+// Pass-through when the payload carries no gzip64 envelope — covers an old
+// server (never compresses) and a snapshot that fell under the server's size
+// threshold (sent raw: cold/messageless partial snapshots, small trees). The
+// generic <T> lets callers keep their typed Snapshot view. Exported for unit
+// testing.
+export async function decodeSnapshot<T = unknown>(payload: {
+  encoding?: string;
+  data?: string;
+}): Promise<T> {
+  if (payload.encoding === "gzip64" && payload.data) {
+    const text = await decodeGzip64(payload.data);
+    if (text) return JSON.parse(text) as T;
+    log.warn("sync", "DecompressionStream unavailable; snapshot undecodable");
+  }
+  return payload as unknown as T;
 }
 
 export function openSessionStream(id: string) {
@@ -801,46 +860,79 @@ export function openSessionStream(id: string) {
     sesSnapDone = false;
     sesFirstSnap = 0; // L1 hydrate: reset per (re)open
     sesHydrating = false;
+    sesSnapshotDecode = Promise.resolve(); // no in-flight decode at (re)open
+    sesSnapshotDecoding = false;
     // Warm silent-swap: this (re)open is showing cached/stale message state
     // until this connection's first authoritative snapshot lands. Arm the
     // per-session refresh indicator; the snapshot listener clears it (and
     // closeSessionStream clears it on switch-away). Set per (re)open so a
     // reconnect retry re-arms it.
     setState("refreshing", id, true);
-    ses = new EventSource(`/vh/stream?sessions=${encodeURIComponent(id)}&dir=${encodeURIComponent(projectDir())}`);
+    ses = new EventSource(`/vh/stream?sessions=${encodeURIComponent(id)}&dir=${encodeURIComponent(projectDir())}&z=1`);
     log.debug("sync", "session stream connect", { id });
     ses.addEventListener("snapshot", (e) => {
       markSeen();
-      const snap: Snapshot = JSON.parse((e as MessageEvent).data);
-      // L1 t2: first snapshot of this connection → server-processing delta
-      // (snapshot compute + serialize). Since Slice C the upstream full-fetch
-      // is async/best-effort, so this window no longer covers ensureMessages.
-      if (!sesSnapDone) {
+      const raw = JSON.parse((e as MessageEvent).data);
+      // L1 t2: stamp `snap` on FRAME ARRIVAL, before any decode. The window
+      // measures pure transport (server compute + serialize + tunnel) — the
+      // bottleneck this feature targets. Including the client-side gzip64 decode
+      // (ms-scale local CPU) would muddy the transport signal the L1
+      // instrumentation exists to surface. Same `now` bounds both the snap
+      // delta and the hydrate t0.
+      const first = !sesSnapDone;
+      const now = performance.now();
+      if (first) {
         sesSnapDone = true;
-        const now = performance.now();
         if (sesT1) recordLatency("session", "snap", now - sesT1);
-        // L1 hydrate t0: first-snapshot arrival. The same `now` bounds both
-        // the snap delta and the hydrate delta (messages.loaded − first
-        // snapshot). Warm-vs-cold is read from the snapshot's gate: a warm
-        // session (gate.messagesLoaded!==false) already has the full history,
-        // so messages.loaded never arrives → stamp "warm"; a cold session
-        // (gate.messagesLoaded===false) clears any stale value so the UI
-        // shows the in-progress upstream-fetch wait until messages.loaded.
         sesFirstSnap = now;
-        const cold = snap.gate?.[id]?.messagesLoaded === false;
-        sesHydrating = cold;
-        recordSessionHydrate(cold ? undefined : "warm");
-        // Clear any stale fetch/rec split from a prior connection. They only
-        // land when THIS connection's messages.loaded arrives (cold session);
-        // a warm snapshot never fires it, so they must read "—" until then.
-        recordSessionFetchSplit(undefined, undefined);
       }
-      // Authoritative snapshot for THIS connection landed — the cached/stale
-      // render is now superseded; clear the per-session refresh indicator BEFORE
-      // reconciling so the row's .dot.refreshing drops in the same reactive tick
-      // the fresh data paints. Idempotent on later snapshots this connection.
-      setState("refreshing", id, false);
-      applySessionSnapshot(id, snap);
+      // Apply the decoded snapshot: hydrate stamping (needs snap.gate) + clear
+      // the per-session refresh indicator + reconcile. The server gzip64-wraps
+      // the snapshot when z=1 AND it exceeds the size threshold (a warm open of
+      // a loaded session — the megabyte transcript). Small/cold/messageless
+      // snapshots ship raw (no `encoding`) and skip the async decode.
+      const applySnap = (snap: Snapshot) => {
+        if (first) {
+          // L1 hydrate: warm-vs-cold read from the snapshot's gate. A warm
+          // session (gate.messagesLoaded!==false) already has the full history,
+          // so messages.loaded never arrives → stamp "warm"; a cold session
+          // (gate.messagesLoaded===false) clears any stale value so the UI
+          // shows the in-progress upstream-fetch wait until messages.loaded.
+          const cold = snap.gate?.[id]?.messagesLoaded === false;
+          sesHydrating = cold;
+          recordSessionHydrate(cold ? undefined : "warm");
+          // Clear any stale fetch/rec split from a prior connection. They only
+          // land when THIS connection's messages.loaded arrives (cold session);
+          // a warm snapshot never fires it, so they must read "—" until then.
+          recordSessionFetchSplit(undefined, undefined);
+        }
+        // Authoritative snapshot for THIS connection landed — the cached/stale
+        // render is now superseded; clear the per-session refresh indicator
+        // BEFORE reconciling so the row's .dot.refreshing drops in the same
+        // reactive tick the fresh data paints. Idempotent on later snapshots.
+        setState("refreshing", id, false);
+        applySessionSnapshot(id, snap);
+      };
+      // Compressed path: async decode, gated behind sesSnapshotDecode so live
+      // message/part events in the decode window serialize behind it (the
+      // shared listener awaits it) — applySessionSnapshot WHOLESALE-REPLACES
+      // messages[id], so a live event applied mid-decode would be clobbered
+      // when the stale-but-now-decoded snapshot lands. Until applySnap runs the
+      // PRIOR messages stay in the store → no flash-of-empty through the decode
+      // window (the reveal gate stays faithful). Raw path: synchronous apply,
+      // exactly the legacy behavior (cold small snapshots, zero decode latency).
+      if (raw.encoding === "gzip64") {
+        sesSnapshotDecoding = true;
+        sesSnapshotDecode = (async () => {
+          try {
+            applySnap(await decodeSnapshot<Snapshot>(raw));
+          } finally {
+            sesSnapshotDecoding = false;
+          }
+        })();
+      } else {
+        applySnap(raw);
+      }
     });
     ses.addEventListener("ping", () => markSeen());
     // L1 t1: socket established → pure connection-latency delta. Stream 2 had
@@ -860,6 +952,15 @@ export function openSessionStream(id: string) {
         // advance Stream 1's resume cursor.
         const data = JSON.parse(ev.data);
         const sid: string | undefined = data?.sessionID;
+
+        // Serialize against an in-flight gzip64 snapshot decode for this
+        // connection. applySessionSnapshot WHOLESALE-REPLACES messages[id]; a
+        // live message/part event applied during the decode window would be
+        // clobbered when the (stale-but-now-decoded) snapshot lands. Wait ONLY
+        // when a decode is actually in flight — the boolean check is a no-op on
+        // the fast path so message.upsert/part.upsert floods keep zero microtask
+        // latency. Connect-time only (a snapshot decode is ms-scale).
+        if (sesSnapshotDecoding) await sesSnapshotDecode;
 
         // messages.batch is application-compressed (gzip+base64) to cut cold-
         // load hydrate latency over the controller tunnel. The decode is ASYNC

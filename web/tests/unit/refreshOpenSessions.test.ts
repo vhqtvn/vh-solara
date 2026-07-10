@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { reconcile } from "solid-js/store";
+import { gzipSync } from "node:zlib";
 import { refreshOpenSessions, runWithConcurrency, REFRESH_CONCURRENCY } from "../../src/sync/stream";
 import { state, setState, setSelectedIdRaw } from "../../src/sync/store";
 
@@ -35,9 +36,14 @@ afterEach(() => {
 });
 
 // Parse the mocked fetch's URL and pull the `sessions` query param (the per-id
-// refresh request shape: /vh/snapshot?sessions=<id>&dir=<dir>).
+// refresh request shape: /vh/snapshot?sessions=<id>&dir=<dir>&z=1).
 function sessionOf(url: string): string {
   return new URL(url, "http://x").searchParams.get("sessions") || "";
+}
+// paramOf reads an arbitrary query param off the mocked fetch URL. Used to
+// assert the z=1 gzip64 opt-in on the reconnect refresh.
+function paramOf(url: string, key: string): string {
+  return new URL(url, "http://x").searchParams.get(key) || "";
 }
 
 describe("refreshOpenSessions — bounded-concurrent reconnect refresh", () => {
@@ -146,6 +152,48 @@ describe("refreshOpenSessions — bounded-concurrent reconnect refresh", () => {
     vi.stubGlobal("fetch", fetchMock);
     await expect(refreshOpenSessions()).resolves.toBeUndefined();
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("opts into gzip64 snapshot encoding on the refresh fetch URL (z=1)", async () => {
+    // fetchSessionMessages appends z=1 so the server gzip64-wraps the warm
+    // transcript — the same compression win as the Stream-2 snapshot, applied to
+    // the reconnect fan-out. Pin the param so a regression that drops it (and
+    // silently ships uncompressed transcripts again) is caught here.
+    setState("messages", "z", { order: [], byId: {} });
+    const seenURLs: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        seenURLs.push(url);
+        return Promise.resolve({ ok: true, json: () => ({ messages: { z: [] } }) });
+      }),
+    );
+    await refreshOpenSessions();
+    expect(seenURLs).toHaveLength(1);
+    expect(paramOf(seenURLs[0], "z")).toBe("1");
+    expect(sessionOf(seenURLs[0])).toBe("z");
+  });
+
+  it("decodes a gzip64 snapshot response to the session messages", async () => {
+    // The server (pkg/web maybeCompressSnapshot) replies with the gzip64
+    // envelope when z=1 + the payload is large. fetchSessionMessages runs the
+    // body through decodeSnapshot (same native DecompressionStream path as the
+    // SSE snapshot), so a compressed response must round-trip to the transcript.
+    // Mirror the server's compression (JSON → gzip → base64) for the fixture.
+    setState("messages", "gz", { order: [], byId: {} });
+    const transcript = [
+      { info: { id: "m1", sessionID: "gz", role: "user" }, parts: [{ id: "p1", type: "text", text: "hi" }] },
+      { info: { id: "m2", sessionID: "gz", role: "assistant" }, parts: [{ id: "p2", type: "text", text: "yo" }] },
+    ];
+    const inner = JSON.stringify({ gate: { gz: { messagesLoaded: true } }, messages: { gz: transcript } });
+    const data = Buffer.from(gzipSync(Buffer.from(inner))).toString("base64");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => Promise.resolve({ ok: true, json: () => ({ encoding: "gzip64", data }) })),
+    );
+    await refreshOpenSessions();
+    expect(state.messagesLoaded.gz).toBe(true);
+    expect(state.messages.gz.order).toEqual(["m1", "m2"]);
   });
 });
 

@@ -5,8 +5,11 @@ package web
 
 import (
 	"bufio"
+	"bytes"
+	"compress/gzip"
 	"context"
 	"embed"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -798,8 +801,16 @@ func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 	filter := messageFilter(r)
 	s.ensureMessages(r.Context(), agg, filter)
 	snap := agg.Store().Snapshot(filter)
+	b, _ := json.Marshal(snap)
+	// gzip64-wrap on the same opt-in (z=1) + threshold as the stream snapshot.
+	// fetchSessionMessages (refreshOpenSessions) pulls these on a tree reconnect
+	// for every open session — each was shipping a full uncompressed transcript
+	// through the tunnel. Application-level gzip64 (not HTTP Content-Encoding)
+	// so it is tunnel-agnostic: the controller raw-proxies the body verbatim
+	// (io.Copy in pkg/server/proxy.go) and the client decodes unconditionally.
+	// A client that did not opt in (no z=1) gets the legacy raw JSON unchanged.
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(snap)
+	w.Write(maybeCompressSnapshot(b, wantsCompress(r)))
 }
 
 // ensureMessages lazily hydrates the messages for the sessions a snapshot/stream
@@ -952,7 +963,14 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		s.triggerMessageLoad(agg, filter)
 		snap := store.Snapshot(filter)
 		b, _ := json.Marshal(snap)
-		writeRaw(w, snap.Seq, "snapshot", b)
+		// gzip64-wrap the snapshot when the client opted in (z=1) AND it is large
+		// enough to benefit (a warm open of a loaded session — the megabyte-scale
+		// transcript inlined at snap.Messages[sid]). Small/cold/messageless
+		// snapshots fall under the threshold and ship raw. The envelope mirrors
+		// the cold-load messages.batch gzip64 shape so the client decodes via the
+		// same path; this is what cuts a warm open's end-to-end `snap` transport
+		// ~3.4x (the controller tunnel does not compress at any lower layer).
+		writeRaw(w, snap.Seq, "snapshot", maybeCompressSnapshot(b, wantsCompress(r)))
 		baseline = snap.Seq
 	}
 	flusher.Flush()
@@ -1002,6 +1020,54 @@ func writeEvent(w io.Writer, seq uint64, kind string, payload []byte) {
 
 func writeRaw(w io.Writer, seq uint64, event string, data []byte) {
 	fmt.Fprintf(w, "id: %d\nevent: %s\ndata: %s\n\n", seq, event, data)
+}
+
+// snapshotCompressThreshold is the minimum marshaled-snapshot size above which
+// maybeCompressSnapshot will gzip64-wrap the payload. Below it the raw JSON is
+// sent as-is: small payloads (cold/messageless partial snapshots, the tree-only
+// snapshot) gain nothing from gzip and base64 inflates them, and keeping them
+// raw lets the client ingest them on the synchronous fast path (no async
+// DecompressionStream round-trip). The warm open of a loaded session is the only
+// snapshot that exceeds this (a full transcript — megabytes), which is exactly
+// the case the compression targets.
+const snapshotCompressThreshold = 2048
+
+// wantsCompress reports whether the client opted into gzip64 snapshot encoding
+// via the `z=1` query flag. EventSource cannot set custom request headers, so
+// the opt-in is a query param (not Accept-Encoding). An absent/false flag keeps
+// the legacy raw-JSON wire shape bit-for-bit — this is what protects a stale
+// cached PWA (old client) against a new server that would otherwise emit a
+// base64 blob it cannot render. The client's decode helper is a total function
+// (pass-through when encoding is absent), so the reverse (new client, old
+// server) also interops without special handling.
+func wantsCompress(r *http.Request) bool {
+	return r.URL.Query().Get("z") == "1"
+}
+
+// maybeCompressSnapshot gzip64-wraps a marshaled snapshot payload when compress
+// is requested AND the payload is large enough to benefit. The envelope mirrors
+// the cold-load messages.batch convention exactly:
+//
+//	{"encoding":"gzip64","data":"<base64(gzip(snapshotJSON))>"}
+//
+// so the client decodes it through the same native DecompressionStream path.
+// Returns the bytes to write as the event/response body (the envelope when
+// compressed, or the input unchanged when not). base64 is required because SSE
+// data: fields are text/UTF-8 and raw gzip bytes are not valid UTF-8; the same
+// applies to a JSON response body a client parses before feature-detecting.
+func maybeCompressSnapshot(raw []byte, compress bool) []byte {
+	if !compress || len(raw) < snapshotCompressThreshold {
+		return raw
+	}
+	var buf bytes.Buffer
+	gw := gzip.NewWriter(&buf)
+	_, _ = gw.Write(raw) // gzip.Writer.Write does not return a meaningful error mid-stream
+	_ = gw.Close()
+	out, _ := json.Marshal(struct {
+		Encoding string `json:"encoding"`
+		Data     string `json:"data"`
+	}{Encoding: "gzip64", Data: base64.StdEncoding.EncodeToString(buf.Bytes())})
+	return out
 }
 
 // renderRequest is one item in a POST /vh/render batch. Clients render in-flight
