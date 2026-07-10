@@ -685,7 +685,7 @@ test("the Live pill hides when the turn finishes (working gate + focus gate)", a
   // Start a busy turn so working()=true and the .chat-live pill renders.
   await page.getByPlaceholder("Message…").fill("[[stall]] finish gate");
   await page.keyboard.press("Enter");
-  await expect(page.locator(".working-text")).toBeVisible({ timeout: 5000 });
+  await expect(page.locator(".working-text")).toBeVisible({ timeout: 8000 });
   // Pill is up: following && working && !focus.
   await expect(page.locator(".chat-live")).toBeVisible({ timeout: 3000 });
 

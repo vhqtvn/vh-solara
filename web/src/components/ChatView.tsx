@@ -1343,8 +1343,13 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // exists (see flushPendingAttachments in send()).
   async function addFiles(files: FileList | File[] | null) {
     if (!files || files.length === 0) return;
-    if (fileInputRef) fileInputRef.value = "";
+    // Snapshot the files BEFORE clearing the input: e.currentTarget.files is a
+    // LIVE FileList tied to the <input>, so setting fileInputRef.value = ""
+    // empties it. Materializing the array first means the upload still sees the
+    // picked files. (The paste path passes standalone File objects not tied to
+    // the input, so it was never affected.)
     const arr = Array.from(files);
+    if (fileInputRef) fileInputRef.value = "";
     if (props.draft) {
       for (const file of arr) {
         setAttachments((a) => [...a, { url: pendingKey(), filename: file.name, mime: file.type, file }]);
