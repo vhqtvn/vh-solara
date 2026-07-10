@@ -1,0 +1,311 @@
+/* --- chat --- */
+.chat { display: flex; flex-direction: column; flex: 1; min-width: 0; position: relative; }
+
+/* Chat navigator: a faint vertical strip of markers (one per user turn) pinned
+   to the chat's right edge. Click a marker to jump to that turn; hover reveals
+   its text (native title). Faint until hovered so it stays out of the way. */
+/* Wraps the scroller + navigator so the navigator is bounded to the scroll
+   area's height (not the whole column incl. composer). */
+.chat-main { position: relative; flex: 1; min-height: 0; display: flex; flex-direction: column; }
+
+/* Right-edge navigator ("minimap"): one tick per user turn, compact fixed
+   spacing. When there are more turns than fit, it shows a WINDOW centred on the
+   current turn with up/down indicators — so spacing stays constant regardless of
+   session length (never spread, never clipped). Centred in the scroll area. */
+.chat-nav {
+  position: absolute; top: 0; bottom: 0; right: 3px;
+  display: flex; flex-direction: column; align-items: flex-end; justify-content: center;
+  gap: 5px; padding: 6px 2px; z-index: 20;
+  opacity: 0.32; transition: opacity 0.15s ease;
+}
+.chat-nav:hover { opacity: 1; }
+.chat-nav-dot {
+  flex: 0 0 auto; width: 16px; height: 4px; border-radius: 2px;
+  padding: 0; border: 0; cursor: pointer; background: var(--fg-dim);
+  transition: width 0.12s ease, background 0.12s ease;
+}
+.chat-nav-dot:hover { width: 24px; background: var(--fg); }
+.chat-nav-dot.active { width: 24px; background: var(--accent); }
+/* "More above / below" indicator (a faint chevron; click to page toward it). */
+.chat-nav-more {
+  flex: 0 0 auto; display: flex; align-items: center; justify-content: flex-end;
+  width: 16px; height: 11px; padding: 0; border: 0; background: transparent;
+  color: var(--fg-dim); cursor: pointer;
+}
+.chat-nav-more:hover { color: var(--fg); }
+.chat-nav-more.up { transform: rotate(180deg); }
+/* Hover/focus preview, anchored to the LEFT of the hovered tick. */
+.chat-nav-bubble {
+  position: absolute; right: 100%; margin-right: 10px; transform: translateY(-50%);
+  width: max-content; max-width: 300px;
+  background: var(--bg-2); color: var(--fg);
+  border: 1px solid var(--border); border-radius: 8px;
+  box-shadow: var(--shadow-lg, 0 12px 40px #0009);
+  padding: 7px 10px; font-size: 12.5px; line-height: 1.4;
+  pointer-events: none; z-index: 21;
+  display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden;
+}
+@media (pointer: coarse) { .chat-nav { display: none; } }
+
+/* opencode-style "running" progress bar (a whipping fill) while working. */
+.session-progress {
+  position: absolute;
+  inset: 0 0 auto;
+  height: 2px;
+  overflow: hidden;
+  pointer-events: none;
+  z-index: 6;
+}
+.session-progress-bar {
+  width: 100%;
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent);
+  clip-path: inset(0 100% 0 0 round 999px);
+  will-change: clip-path;
+  animation: session-progress-whip 1100ms infinite;
+}
+@keyframes session-progress-whip {
+  0% { clip-path: inset(0 100% 0 0 round 999px); animation-timing-function: cubic-bezier(0.2, 0.8, 0.2, 1); }
+  48% { clip-path: inset(0 0 0 0 round 999px); animation-timing-function: cubic-bezier(0.65, 0, 0.35, 1); }
+  100% { clip-path: inset(0 0 0 100% round 999px); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .session-progress-bar { animation: none; clip-path: none; opacity: 0.7; }
+}
+.chat-scroll { flex: 1; min-height: 0; overflow-y: auto; overflow-anchor: auto; padding: 16px; overscroll-behavior: contain; }
+
+/* Scroll-edge fade REMOVED. It was a gradient `mask-image` on the scroll surface
+   (.chat-scroll, .reasoning-body, …) — but a CSS mask on a scroll container forces
+   Firefox/WebRender to render the WHOLE scrollable content to an offscreen surface
+   and re-rasterize it to apply the mask. On the always-present chat scroll with a
+   complex/long transcript that was a heavy, near-persistent GPU raster cost
+   (the real-app heat that a bare test page never reproduced). Not worth a fade. */
+.chat-content { max-width: var(--chat-width, 860px); margin: 0 auto; }
+.chat-empty { padding: 32px 16px; text-align: center; color: var(--fg-dim); font-size: 14px; }
+/* Failed-background-hydration hint (ChatView's messageFailed empty-state branch).
+   Just color + a faint top rule — no mask/backdrop/contain/content-visibility
+   (WebRender traps on always-present surfaces). */
+.chat-empty.chat-error { color: var(--fg, currentColor); border-top: 1px solid var(--line, rgba(0,0,0,0.08)); }
+/* Switch → ready loading overlay (see ChatView's `showLoading`). Absolute over
+   .chat-main (position: relative). Kept GPU-cheap: a static spinner + text on
+   the existing background — NO mask-image, NO backdrop-filter, NO contain, NO
+   per-element content-visibility (each is a WebRender trap on always-present
+   surfaces; see the removed scroll-edge fade note above). pointer-events:none so
+   it never blocks interaction during the brief render window. */
+.chat-loading {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  color: var(--fg-dim);
+  pointer-events: none;
+  z-index: 1;
+}
+.chat-loading-text { font-size: 14px; }
+/* VISUAL REVEAL GATE — `.ready` is added to .chat-content when ChatView's
+   `revealed()` memo is true: positioned (ready, for scroll-restore geometry) AND
+   fully delivered (messagesLoaded) OR the background fetch failed. The opacity:0
+   window is intentionally wider than `ready()` alone: it covers the WHOLE
+   Slice-C async-hydration window (partial snapshot → message/part deltas →
+   messages.loaded) so the transcript never visibly populates top-down. opacity:0
+   (NOT display:none / visibility:hidden) preserves layout geometry, so scroll
+   restore / maybeRestore / Deferred measurement all read correct dimensions while
+   hidden. A quick fade in once delivered. See ChatView `revealed`. */
+.chat-content { opacity: 0; transition: opacity 0.12s ease; }
+.chat-content.ready { opacity: 1; }
+
+/* Draft (new-session) layout: no history, so center the composer with a hero
+   above it (OpenChamber-style) instead of stranding it below empty space. */
+.chat.draft { justify-content: center; align-items: center; padding: 24px 16px; }
+.chat.draft .composer-wrap { width: 100%; padding: 0; }
+.chat.draft .composer { margin: 0 auto; max-width: 760px; }
+.chat.draft .composer-text { min-height: 104px; }
+.chat-hero { max-width: 760px; width: 100%; margin: 0 auto 16px; text-align: center; padding: 0 4px; }
+.chat-hero-mark {
+  width: 60px;
+  height: 60px;
+  margin: 0 auto 14px;
+  display: block;
+  color: var(--accent); /* recolorable glyph — takes the theme accent */
+}
+/* The standalone `.brand-mark` sizing/color rule used to live here; it is gone
+   now that the sidebar logo lives inside `.status-mark` (`.status-mark svg`
+   sizes the glyph and the root's `color: var(--status)` recolors it per state).
+   The recolorable BrandMark glyph is still reused elsewhere via `.empty-mark`
+   (EmptyState) and `.chat-hero-mark` (ChatView). */
+.chat-hero-title { font-size: 20px; font-weight: 600; margin: 0 0 6px; letter-spacing: -0.01em; }
+.chat-hero-sub { color: var(--fg-dim); margin: 0; font-size: 14px; }
+
+.msg {
+  margin: 0 0 18px;
+  /* No content-visibility / contain here: on Firefox/WebRender they push each
+     message onto its own compositing surface (blob), which made streaming hotter,
+     not cooler. Streaming cost is instead bounded by capping the live-render rate
+     (see Part.tsx). */
+}
+.msg-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+.msg-role {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--fg-dim);
+}
+.msg.user .msg-role { color: var(--accent); }
+.msg-agent {
+  font-size: 11px;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  border-radius: 999px;
+  padding: 1px 8px;
+  max-width: 22ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Project-styled agent badge: a colored chip in one of three variants. Color is
+   a sanitized theme token (var(--agent-color), set inline); never a raw value. */
+.msg-agent.styled {
+  color: var(--agent-color, var(--accent));
+  background: color-mix(in srgb, var(--agent-color, var(--accent)) 16%, transparent);
+  border: 1px solid transparent;
+  font-weight: 600;
+}
+.msg-agent.styled[data-chip="outline"] {
+  background: transparent;
+  border-color: color-mix(in srgb, var(--agent-color, var(--accent)) 60%, transparent);
+}
+.msg-agent.styled[data-chip="solid"] {
+  background: var(--agent-color, var(--accent));
+  color: var(--bg);
+}
+.msg-model {
+  font-size: 11px;
+  color: var(--fg-dim);
+  max-width: 40ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.msg-time, .msg-cost { font-size: 11px; color: var(--fg-dim); }
+.msg-cost { font-family: ui-monospace, Menlo, monospace; }
+.msg-perf {
+  display: inline-flex;
+  align-items: center;
+  color: var(--fg-dim);
+  cursor: help;
+  outline: none;
+}
+.msg-perf:hover, .msg-perf:focus-visible { color: var(--fg); }
+.msg-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 4px;
+  opacity: 0;
+  transition: opacity 0.12s;
+}
+.msg:hover .msg-actions { opacity: 1; }
+.msg-actions button {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--fg-dim);
+  border-radius: 5px;
+  padding: 1px 7px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.msg-actions button:hover { color: var(--fg); background: color-mix(in srgb, var(--fg) 8%, transparent); }
+
+/* The wrapper owns the code block's vertical rhythm (matching the UA <pre>
+   default of 1em 0 that .md pre does not override) and the pre's margin is
+   zeroed below, so the trailing .code-actions sibling can't keep the pre's
+   bottom margin from collapsing cleanly into the wrapper. */
+.md .code-block { position: relative; margin: 1em 0; }
+/* Action buttons live in a flex container pinned to the non-scrolling wrapper,
+   so they stay put while the pre scrolls horizontally beneath them. */
+.md .code-block > .code-actions {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  display: flex;
+  gap: 4px;
+}
+.code-copy, .code-wrap {
+  background: color-mix(in srgb, var(--bg-2) 80%, transparent);
+  border: 1px solid var(--border);
+  color: var(--fg-dim);
+  border-radius: 5px;
+  padding: 1px 7px;
+  font-size: 11px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.12s;
+}
+.md .code-block:hover .code-copy,
+.md .code-block:hover .code-wrap { opacity: 1; }
+.code-copy:hover, .code-wrap:hover { color: var(--fg); }
+
+/* .md rules stay global: they style innerHTML-generated markdown elements
+   (h1/p/a/code), not JSX classes — scoping has no benefit. (.md-raw is also
+   shared with GitView.tsx's loading fallback.) */
+.md, .md-raw { overflow-wrap: anywhere; }
+.md-raw { white-space: pre-wrap; }
+/* Streaming caret: a blinking cursor at the end of in-flight text so a turn
+   reads as actively streaming even between part flushes. */
+.stream-caret {
+  display: inline-block;
+  width: 0.55em;
+  height: 1.05em;
+  margin-left: 1px;
+  vertical-align: text-bottom;
+  background: var(--accent);
+  border-radius: 1px;
+  animation: stream-blink 1s steps(2, start) infinite;
+}
+@keyframes stream-blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
+@media (prefers-reduced-motion: reduce) { .stream-caret { animation: none; } }
+.md :first-child { margin-top: 0; }
+.md :last-child { margin-bottom: 0; }
+.md pre {
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+  overflow-x: auto;
+}
+/* Pre inside a .code-block wrapper drops its own margin (the wrapper owns it). */
+.md .code-block > pre { margin: 0; }
+/* Word-wrap toggle (.code-wrap button flips this on per block): switches from
+   the default scroll (pre) to wrapped (pre-wrap) so long lines fold instead of
+   overflowing horizontally. */
+.md pre.wrap { white-space: pre-wrap; overflow-wrap: anywhere; }
+.md code { font-family: ui-monospace, Menlo, monospace; font-size: 13px; }
+.md :not(pre) > code {
+  background: var(--md-code-bg);
+  color: var(--md-code);
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+
+/* .reasoning and .reasoning-time moved to Part.module.css (scoped).
+   .reasoning-body stays global here: it is the bounded GPU-hot scroll surface
+   for the thinking transcript (deferred from the CSS-module migration — see
+   AGENTS.md GPU-perf bans; it travels with the ChatView slice). */
+.reasoning-body { margin: 2px 0 6px 20px; max-height: 320px; overflow-y: auto; }
+
+/* Part.tsx streaming chrome — .tool / .tool-* / .activity-* / .disclosure /
+   .disclosure-clip / .file-chip / .mermaid-* — moved to Part.module.css
+   (scoped). Test-queried (.tool-head / .tool-name / .tool-dur / .tool-jump /
+   .tool-diag / .tool-diag-loc) and shared modifiers (.rot / .open / .error /
+   .needs-input / .live / status strings) are :global there. .md* markdown
+   typography, .md-raw, .reasoning-body, .stream-caret and the DOM-injected
+   .filepath / .code-* stay global here (see notes where they live). */
+

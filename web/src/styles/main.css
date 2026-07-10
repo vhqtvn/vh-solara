@@ -11,11 +11,15 @@
  *   foundation/typography.css   body { background; color; font }.  (303-307)
  *   foundation/z-index.css     documentation only (see file).      (new)
  *   foundation/perf-guards.css documentation only (see file).      (new)
- *   legacy.css                 everything else, in original order. (309-4599)
+ *   legacy/*.css              everything else, in original order. (309-4599)
+ *                            Stage 1 split legacy.css into ordered source-
+ *                            order shards under legacy/ (00- through 80-);
+ *                            concatenating them reproduces legacy.css verbatim.
  *
  * The component islands, markdown/chat/streaming hot paths, overlays, late
  * overrides and the bottom "Professional design pass" :root block ALL still
- * live in legacy.css for now. They migrate island-by-island in later phases.
+ * live in the legacy/ shards for now. They migrate island-by-island in later
+ * phases.
  *
  * ── @layer status: COMMENTED (comments-only fallback) ──────────────────────
  * The intended cascade-layer order is:
@@ -45,4 +49,16 @@
 @import "./foundation/typography.css";
 @import "./foundation/z-index.css";
 @import "./foundation/perf-guards.css";
-@import "./legacy.css";
+/* legacy region — imported as ordered source-order shards (Stage 1 split).
+ * Concatenating these shards in order reproduces the former legacy.css
+ * byte-for-byte, so cascade behavior is unchanged. */
+@import "./legacy/00-app-globals.css";
+@import "./legacy/10-sidebar-statusmark.css";
+@import "./legacy/20-session-tree.css";
+@import "./legacy/30-main-terminal.css";
+@import "./legacy/40-chat-stream.css";
+@import "./legacy/50-chat-overlays.css";
+@import "./legacy/60-notifications-inspector.css";
+@import "./legacy/65-sessions-notes-servers.css";
+@import "./legacy/70-composer-diff-git.css";
+@import "./legacy/80-professional-pass.css";

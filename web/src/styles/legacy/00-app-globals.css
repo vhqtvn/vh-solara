@@ -1,0 +1,27 @@
+.app {
+  display: flex;
+  /* --app-h is the VISUAL viewport height (see viewport.ts): it shrinks when the
+     on-screen keyboard opens, so the composer stays above the keyboard instead
+     of the page panning. Falls back to dvh/100% where the var isn't set yet. */
+  height: 100%;
+  height: 100dvh;
+  /* Divided by --ui-zoom so desktop CSS `zoom` (which scales this fixed px
+     height to <100%) still fills the viewport instead of leaving dead space. */
+  height: calc(var(--app-h, 100dvh) / var(--ui-zoom, 1));
+  overflow: hidden;
+  /* App-like: the chrome (sidebar, header, buttons, tree) isn't selectable, so a
+     long-press doesn't pop text selection / the callout on touch (Android Edge,
+     iOS). Readable/copyable content opts back in below. */
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+/* Where selecting/copying matters, re-enable it. (.tool-output moved to
+   Part.module.css — its scoped rule carries these user-select declarations.) */
+.md, .md-raw, .vh-diff, .msg-parts, .msg-inspect, .perm-detail,
+.term, .git-commit-msg, .term-sess-preview, input, textarea, pre, code, [contenteditable="true"] {
+  -webkit-user-select: text;
+  user-select: text;
+  -webkit-touch-callout: default;
+}
+

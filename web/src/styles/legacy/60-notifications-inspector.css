@@ -1,0 +1,380 @@
+/* --- notification center --- */
+.notif { position: relative; }
+.notif-bell { position: relative; }
+.notif-badge {
+  position: absolute;
+  top: -5px;
+  right: -5px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 999px;
+  background: var(--danger);
+  color: var(--danger-fg);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 16px;
+  text-align: center;
+}
+.notif-menu {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  width: 340px;
+  max-width: calc(100vw - 24px);
+  max-height: min(70vh, 520px);
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: var(--shadow-lg, 0 12px 32px rgba(0, 0, 0, 0.45));
+  z-index: var(--z-popover);
+  overflow: hidden;
+}
+.notif-menu-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  font-weight: 600;
+  font-size: 13px;
+}
+.notif-clear {
+  background: transparent;
+  border: 0;
+  color: var(--accent);
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+}
+.notif-list { overflow-y: auto; }
+.notif-section {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--fg-dim);
+  padding: 8px 12px 4px;
+}
+.notif-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 9px 12px;
+  border-top: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
+}
+.notif-item.action {
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: 0;
+  border-top: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
+  color: var(--fg);
+  cursor: pointer;
+  font: inherit;
+}
+/* Highlight the WHOLE row on hover (icon + text + dismiss), not just the text
+   button — a partial box around the text alone read as broken. */
+.notif-item:hover { background: var(--bg); }
+.notif-ico { color: var(--accent); flex: none; margin-top: 1px; }
+/* Per-kind icon accent so done/error/info are scannable at a glance. */
+.notif-item.done .notif-ico { color: var(--ok); }
+.notif-item.err .notif-ico { color: var(--danger); }
+.notif-item.info .notif-ico { color: var(--fg-dim); }
+.notif-item.waiting .notif-ico { color: var(--warn, #e8a838); }
+/* Read items dim back (still in the list as history). */
+.notif-item.read { opacity: 0.5; }
+/* The session name leads the line in bold accent: "**Session** finished". */
+.notif-session { color: var(--accent); font-weight: 600; }
+.notif-time { font-size: 11px; color: var(--fg-dim); margin-top: 2px; }
+.notif-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+.notif-body.btn {
+  text-align: left;
+  background: transparent;
+  border: 0;
+  color: var(--fg);
+  cursor: pointer;
+  font: inherit;
+  border-radius: 6px;
+  padding: 0;
+}
+.notif-title { font-size: 13px; overflow: hidden; text-overflow: ellipsis; }
+.notif-meta, .notif-detail { font-size: 12px; color: var(--fg-dim); }
+.notif-x {
+  background: transparent;
+  border: 0;
+  color: var(--fg-dim);
+  cursor: pointer;
+  flex: none;
+  padding: 2px;
+  border-radius: 5px;
+}
+.notif-x:hover { background: var(--bg); color: var(--fg); }
+.notif-empty { padding: 18px 12px; text-align: center; color: var(--fg-dim); font-size: 13px; }
+
+/* --- session inspector --- */
+.dialog.inspector { max-width: 520px; }
+.dialog-title { font-weight: 600; flex: 1; display: flex; align-items: center; gap: 6px; }
+.insp-sub { font-weight: 600; padding: 4px 4px 0; }
+.insp-sub.dim { font-weight: 400; font-size: 13px; color: var(--fg-dim); padding-top: 2px; }
+.insp-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(96px, 1fr));
+  gap: 8px;
+  margin: 14px 4px;
+}
+.insp-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+.insp-stat-val { font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.insp-stat-key { font-size: 11px; color: var(--fg-dim); text-transform: uppercase; letter-spacing: 0.04em; }
+.insp-section {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--fg-dim);
+  margin: 6px 4px 4px;
+}
+.insp-turns { display: flex; flex-direction: column; }
+.insp-turn {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 4px;
+  border-top: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
+  font-size: 13px;
+}
+.insp-turn-n { color: var(--fg-dim); width: 28px; flex: none; }
+.insp-turn-model { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.insp-turn-tok { color: var(--fg-dim); font-variant-numeric: tabular-nums; }
+.insp-turn-cost { font-variant-numeric: tabular-nums; }
+.insp-note { font-size: 12px; color: var(--fg-dim); margin: 14px 4px 4px; line-height: 1.5; }
+.insp-archive {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid color-mix(in srgb, var(--warn) 45%, var(--border));
+  background: color-mix(in srgb, var(--warn) 10%, var(--bg));
+  color: var(--fg);
+  border-radius: 8px;
+  padding: 8px 12px;
+  cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+}
+.insp-archive:hover { background: color-mix(in srgb, var(--warn) 18%, var(--bg)); }
+.insp-archive-note { color: var(--fg-dim); font-size: 12px; }
+
+/* --- project switcher --- */
+.proj { position: relative; padding: 8px; border-bottom: 1px solid var(--border); }
+/* Project switcher + a small settings gear (per-project agent styles) on one row;
+   the row carries the divider so the gear underlines flush with the switcher. */
+.proj-bar { display: flex; align-items: stretch; border-bottom: 1px solid var(--border); }
+.proj-bar .proj { flex: 1; min-width: 0; border-bottom: 0; }
+.proj-settings {
+  flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center;
+  width: 38px; margin: 8px 8px 8px 0;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+  color: var(--fg-dim); cursor: pointer;
+}
+.proj-settings:hover { border-color: var(--accent); color: var(--fg); }
+.proj-current {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--fg);
+  padding: 8px 10px;
+  cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+}
+.proj-current:hover { border-color: var(--accent); }
+.proj-name { flex: 1; text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
+.proj-menu {
+  position: absolute;
+  top: calc(100% - 2px);
+  left: 8px;
+  right: 8px;
+  z-index: 30;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: var(--shadow-lg, 0 12px 32px rgba(0, 0, 0, 0.45));
+  padding: 5px;
+  max-height: 60vh;
+  overflow-y: auto;
+}
+.proj-item { display: flex; align-items: center; border-radius: 6px; }
+.proj-item.on { background: color-mix(in srgb, var(--accent) 15%, transparent); }
+.proj-item:hover { background: color-mix(in srgb, var(--fg) 7%, transparent); }
+.proj-pick {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  background: transparent;
+  border: 0;
+  color: var(--fg);
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+  padding: 7px 9px;
+}
+.proj-item-name { font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.proj-item-dir { font-size: 11px; color: var(--fg-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.proj-remove {
+  flex: none;
+  background: transparent;
+  border: 0;
+  color: var(--fg-dim);
+  cursor: pointer;
+  padding: 4px;
+  margin-right: 4px;
+  border-radius: 5px;
+}
+.proj-remove:hover { background: var(--bg); color: var(--fg); }
+/* Copy-link affordance (Slice 5): a per-project deep-link (?dir=<dir>) grab
+   button on every non-default row (pinned + recents). One tap writes the full
+   URL to the clipboard; the icon swaps copy→check + tints accent for ~1.5s
+   (cheap reactive glyph/color swap, no animation — mirrors the Part.tsx
+   code-copy revert cadence). Clustered with the remove (✕) button in a tight
+   flex group so the trailing controls align. No mask-image, no backdrop-filter,
+   no contain:paint/content-visibility (those hurt on Firefox/WebRender). */
+.proj-actions { display: flex; align-items: center; gap: 1px; margin-right: 4px; flex: none; }
+.proj-copy {
+  flex: none;
+  background: transparent;
+  border: 0;
+  color: var(--fg-dim);
+  cursor: pointer;
+  padding: 4px;
+  border-radius: 5px;
+}
+.proj-copy:hover { background: var(--bg); color: var(--fg); }
+/* Copied (✓) confirmation state: accent tint so success reads at a glance
+   without any animation/raster work. */
+.proj-copy.copied { color: var(--accent); }
+/* Inline remove-confirm cluster (Slice 3): when a pinned row's remove button
+   is clicked, the row swaps that single icon for a tight "Remove? / Remove /
+   Cancel" group. This is a cheap conditional DOM swap inside one row (no list
+   re-raster, no animation) — no mask-image, no backdrop-filter, no
+   contain:paint/content-visibility (those hurt on Firefox/WebRender). */
+.proj-confirm {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-right: 4px;
+  flex: none;
+}
+.proj-confirm-text {
+  font-size: 11px;
+  color: var(--fg-dim);
+  white-space: nowrap;
+}
+.proj-confirm-go,
+.proj-confirm-cancel {
+  flex: none;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  padding: 4px 7px;
+  border-radius: 5px;
+  font: inherit;
+  font-size: 12px;
+}
+.proj-confirm-go { color: var(--danger); }
+.proj-confirm-go:hover { background: color-mix(in srgb, var(--danger) 14%, transparent); }
+.proj-confirm-cancel { color: var(--fg-dim); }
+.proj-confirm-cancel:hover { background: var(--bg); color: var(--fg); }
+.proj-add {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  background: transparent;
+  border: 0;
+  border-top: 1px solid var(--border);
+  margin-top: 4px;
+  color: var(--accent);
+  cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+  padding: 8px 9px;
+}
+.proj-add:hover { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+.proj-section {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--fg-dim);
+  padding: 8px 9px 3px;
+  border-top: 1px solid var(--border);
+  margin-top: 4px;
+}
+
+/* --- project switcher DIALOG (Slice 1) --- */
+/* Slightly more compact than the 560px default since rows are short. Desktop
+   only; mobile is fullscreen via the canonical @media(max-width:720px) block. */
+.dialog.projects-dialog { width: 480px; }
+.projects-dialog .dialog-body { display: flex; flex-direction: column; gap: 1px; }
+/* Active-project marker: a small accent dot inline with the name (the .on row
+   tint is the primary cue; this makes it legible at a glance). */
+.proj-active {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-left: 6px;
+  vertical-align: middle;
+  background: var(--accent);
+  border-radius: 50%;
+}
+/* Activity badge: "N running" / "N sessions", appended to the directory line.
+   The running variant is accent-colored with a static status dot (no animation —
+   this is an ephemeral dialog, but we keep it cheap and never animate always-on
+   surfaces per the Firefox/WebRender guidance). */
+.proj-badge { font-size: 11px; color: var(--fg-dim); white-space: nowrap; }
+.proj-badge.run { color: var(--accent); font-weight: 500; }
+.proj-badge-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-right: 4px;
+  vertical-align: middle;
+  background: var(--accent);
+  border-radius: 50%;
+}
+/* Empty / no-results: a single muted, centered line. This is an ephemeral
+   dialog (not a streaming surface), so plain text is cheapest — no mask-image,
+   no backdrop-filter, no contain:paint/content-visibility (those hurt on
+   Firefox/WebRender per the repo perf guidance). */
+.proj-empty {
+  margin: 0;
+  padding: 18px 12px;
+  text-align: center;
+  font-size: 13px;
+  color: var(--fg-dim);
+}
+/* On fullscreen mobile the close button gets a comfortable tap target. */
+@media (max-width: 720px) {
+  .projects-dialog .icon-btn { padding: 8px; }
+}
+
