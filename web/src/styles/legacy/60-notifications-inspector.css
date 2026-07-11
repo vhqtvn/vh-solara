@@ -130,6 +130,20 @@
 .proj-bar .proj { flex: 1; min-width: 0; border-bottom: 0; }
 .proj-settings {
   flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center;
+  /* Height-equal to .proj-current without hardcoded pixels. reset.css sets
+     `* { box-sizing: border-box }`, so `height` resolves the gear's BORDER-BOX.
+     .styles.wrap is a flex item of .proj-bar (align-items: stretch) so it is
+     stretched to the full bar height H = .proj-current border-box + .proj's
+     8px vertical padding (16px). `height: 100%` would set the gear border-box
+     to H; margins are added OUTSIDE the border-box and do NOT reduce a
+     percentage height, so that would overflow the wrapper by 16px and render
+     the gear TALLER than .proj-current. Instead `calc(100% - 16px)` subtracts
+     the gear's own 8px+8px vertical margin from the wrapper height, making the
+     gear border-box = H - 16px = .proj-current border-box, exactly equal.
+     Tracks font-size/content changes for free. inline-flex (like inline-block)
+     honors height + vertical margins, and the flex-item wrapper is a BFC so no
+     margin collapse. */
+  height: calc(100% - 16px);
   width: 38px; margin: 8px 8px 8px 0;
   background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
   color: var(--fg-dim); cursor: pointer;
