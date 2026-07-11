@@ -47,7 +47,7 @@ test("admin popup shows both vh-solara and OpenCode versions", async ({ page }) 
   await page.goto(projectUrl("/"));
   await page.getByRole("button", { name: "Settings" }).click({ button: "right" });
   const pop = page.getByRole("dialog", { name: "Server admin" });
-  await expect(pop).toContainText("VHSolara");
+  await expect(pop).toContainText("VH Solara");
   await expect(pop).toContainText("OpenCode");
 });
 

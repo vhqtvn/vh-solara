@@ -1,8 +1,9 @@
 // @vitest-environment jsdom
 //
-// Menu-wiring assertions for the restructured admin popup: it renders exactly
-// three labeled sections (OpenCode / VH Solara Server / Diagnostics). "Update"
-// is a STABLE, state-independent label, and "Restart" is a PERMANENT entry that
+// Menu-wiring assertions for the restructured admin popup: only the Diagnostics
+// section carries an .admin-section-head; OpenCode and VH Solara are labeled via
+// their .admin-ver rows. "Update" is a STABLE, state-independent label, and
+// "Restart" is a PERMANENT entry that
 // opens a centered portaled dialog hosting the shared RestartOpenCode in
 // autoConfirm mode — so the session-aware confirmation (.ocu-confirm) shows
 // immediately, with no redundant entry-button click.
@@ -50,15 +51,22 @@ describe("AdminMenu — three sections, stable Update, centered Restart dialog",
     vi.unstubAllGlobals();
   });
 
-  it("renders the three section headers verbatim", async () => {
+  it("Diagnostics section-head remains; OpenCode/VH Solara labeled via version rows", async () => {
     stubVersions(OC_VER_IDLE);
     render(() => <AdminMenu onClose={() => {}} />);
 
     await waitFor(() => expect(menuBtn("Update")).toBeTruthy());
+    // Only the Diagnostics section-head remains; the OpenCode and VH Solara
+    // sections are now labeled by their .admin-ver first-span.
     const heads = Array.from(document.querySelectorAll(".admin-section-head")).map(
       (h) => (h.textContent || "").trim(),
     );
-    expect(heads).toEqual(["OpenCode", "VH Solara Server", "Diagnostics"]);
+    expect(heads).toEqual(["Diagnostics"]);
+    const verLabels = Array.from(document.querySelectorAll(".admin-ver")).map((row) => {
+      const first = row.querySelector("span");
+      return (first?.textContent || "").trim();
+    });
+    expect(verLabels).toEqual(expect.arrayContaining(["OpenCode", "VH Solara"]));
   });
 
   it("keeps 'Update' as a stable, state-independent label", async () => {

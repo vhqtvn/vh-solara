@@ -276,6 +276,8 @@
 .admin-confirm { display: flex; flex-direction: column; gap: 6px; font-size: 12px; color: var(--fg-dim); padding: 4px 2px; }
 .admin-confirm-btns { display: flex; gap: 6px; }
 .admin-confirm-btns .admin-btn { width: auto; flex: 1; justify-content: center; }
+.admin-btn-row { display: flex; gap: 6px; }
+.admin-btn-row .admin-btn { width: auto; flex: 1; justify-content: center; }
 .admin-ok { font-size: 12px; color: var(--ok); padding: 0 2px; }
 .admin-sep { height: 1px; background: var(--border); margin: 2px 0; }
 /* Section header inside the admin popup — small/uppercase/dim, modeled on the

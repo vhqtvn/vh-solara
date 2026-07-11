@@ -59,7 +59,6 @@ export default function AdminMenu(props: { onClose: () => void }) {
       <div class="admin-head">Server admin</div>
 
       {/* --- OpenCode --- */}
-      <div class="admin-section-head">OpenCode</div>
       <div class="admin-ver">
         <span>OpenCode</span>
         <span class="admin-ver-val">
@@ -75,39 +74,42 @@ export default function AdminMenu(props: { onClose: () => void }) {
           regardless of version state so it never flips identity while npm
           resolves (the dialog carries the update-vs-reinstall nuance + the
           loading state). */}
-      <button
-        type="button"
-        class="admin-btn"
-        classList={{ accent: !!ocVer()?.updateAvailable || !!ocVer()?.restartNeeded }}
-        disabled={!ocVer()}
-        onClick={() => setUpdateOpen(true)}
-      >
-        <Icon name="layers" size={14} />
-        {ocVer() ? "Update" : "Checking…"}
-      </button>
-      {/* Restart OpenCode — opens a centered portaled dialog hosting the shared
-          RestartOpenCode (autoConfirm), so the session-aware confirmation shows
-          immediately. RestartOpenCode remains the SOLE caller of
-          /vh/restart-opencode; this entry only frames it. */}
-      <button type="button" class="admin-btn" onClick={() => setRestartOpen(true)}>
-        <Icon name="retry" size={14} /> Restart
-      </button>
+      <div class="admin-btn-row">
+        <button
+          type="button"
+          class="admin-btn"
+          classList={{ accent: !!ocVer()?.updateAvailable || !!ocVer()?.restartNeeded }}
+          disabled={!ocVer()}
+          onClick={() => setUpdateOpen(true)}
+        >
+          <Icon name="layers" size={14} />
+          {ocVer() ? "Update" : "Checking…"}
+        </button>
+        {/* Restart OpenCode — opens a centered portaled dialog hosting the
+            shared RestartOpenCode (autoConfirm), so the session-aware
+            confirmation shows immediately. RestartOpenCode remains the SOLE
+            caller of /vh/restart-opencode; this entry only frames it. */}
+        <button type="button" class="admin-btn" onClick={() => setRestartOpen(true)}>
+          <Icon name="retry" size={14} /> Restart
+        </button>
+      </div>
 
       {/* --- VH Solara Server --- */}
-      <div class="admin-section-head">VH Solara Server</div>
       <div class="admin-ver">
-        <span>VHSolara</span>
+        <span>VH Solara</span>
         <span class="admin-ver-val">{vhVer()?.version ?? "…"}</span>
       </div>
-      <button type="button" class="admin-btn" disabled={reloading()} onClick={reloadServer}>
-        <Icon name="retry" size={14} /> {reloading() ? "Rebuilding…" : "Rebuild state"}
-      </button>
+      <div class="admin-btn-row">
+        <button type="button" class="admin-btn" disabled={reloading()} onClick={reloadServer}>
+          <Icon name="retry" size={14} /> {reloading() ? "Rebuilding…" : "Rebuild state"}
+        </button>
+        <button type="button" class="admin-btn" onClick={() => (props.onClose(), restartVhServer())}>
+          <Icon name="retry" size={14} /> Restart server
+        </button>
+      </div>
       <Show when={reloadedAt() > 0 && !reloading()}>
         <span class="admin-ok">✓ rebuilt from OpenCode</span>
       </Show>
-      <button type="button" class="admin-btn" onClick={() => (props.onClose(), restartVhServer())}>
-        <Icon name="retry" size={14} /> Restart server
-      </button>
 
       {/* --- Diagnostics --- */}
       <div class="admin-section-head">Diagnostics</div>
