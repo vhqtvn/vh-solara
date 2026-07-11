@@ -57,7 +57,6 @@ jobs:
           build windows amd64 vh-solara-windows-amd64.exe
           build windows arm64 vh-solara-windows-arm64.exe
           build windows 386   vh-solara-windows-386.exe
-          build windows arm   vh-solara-windows-arm.exe
           build darwin  amd64 vh-solara-darwin-amd64
           build darwin  arm64 vh-solara-darwin-arm64
 
@@ -71,4 +70,4 @@ jobs:
           generate_release_notes: true
           body: |
             VHSolara ${{ github.ref_name }} — single binary (controller + agent daemon + embedded web UI).
-            Assets: vh-solara-{linux,windows,darwin}-{amd64,arm64,386,arm}, verified by SHA256SUMS.
+            Assets: vh-solara-{linux,darwin}-{amd64,arm64} + linux-{386,arm} + windows-{amd64,arm64,386}, verified by SHA256SUMS.
