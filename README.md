@@ -2,7 +2,7 @@
 
 **VHSolara** (binary: `vh-solara`) is a lightweight, mobile-first web UI and aggregating daemon for OpenCode — control your coding agents on any machine, from one place, over a secure tunnel.
 
-A single Go binary runs next to OpenCode on each machine: it aggregates OpenCode's state into a resumable, real-time view and serves a custom, mobile-first web UI (a SolidJS SPA, installable as a PWA) embedded in the binary via `//go:embed`. Each instance connects to a central controller through a persistent multiplexed WebSocket tunnel ([yamux](https://github.com/hashicorp/yamux)), so you can reach and drive any machine's OpenCode sessions from one URL — with **no inbound network access to the worker**. The UI covers the full loop: a session/subsession tree, streaming chat, diffs, an in-browser terminal, git actions, repo-declared [managed processes & embedded views](docs/guides/managed-projects.md), a command palette, a themeable appearance (presets + a custom theme editor), and live notifications.
+A single Go binary runs next to OpenCode on each machine: it aggregates OpenCode's state into a resumable, real-time view and serves a custom, mobile-first web UI (a SolidJS SPA, installable as a PWA) embedded in the binary via `//go:embed`. Each instance connects to a central controller through a persistent multiplexed WebSocket tunnel ([yamux](https://github.com/hashicorp/yamux)), so you can reach and drive any machine's OpenCode sessions from one URL — with **no inbound network access to the worker**. The UI covers the full loop: a session/subsession tree, streaming chat, diffs, an in-browser terminal, git actions, repo-declared [managed processes & embedded views](docs/guides/managed-projects.md), a command palette, a themeable appearance (presets, a custom theme editor, and selectable UI & monospace fonts), and live notifications.
 
 > Built because OpenCode's own web UI and OpenChamber were heavy and didn't hold up on mobile (esp. Galaxy Fold) — `vh-solara` is the lean, phone-friendly alternative, resilient to flaky networks and reconnects.
 
@@ -161,7 +161,7 @@ Start the daemon on each developer machine. Three web UI backends are available 
 ```
 
 **Multiple projects.** One daemon can serve several project directories at once.
-The sidebar has a **project switcher** ("Add project…" takes an absolute path);
+The sidebar has a **searchable project switcher** ("Add project…" takes an absolute path);
 each project is a directory, and the daemon lazily runs a separate
 aggregator + OpenCode subscription per directory (via the `x-opencode-directory`
 scope). Each connected client picks its own project independently, and sessions /
@@ -262,19 +262,16 @@ in the vh unit so a self-update's exit is picked up.
 
 > **Note**: In `openchamber` mode, `--chamber` takes a bash script and `--port` is appended as an argument. Environment variables `OPENCODE_HOST`, `OPENCODE_PORT`, `OPENCODE_SKIP_START`, and `PORT` are also set. If omitted, sessions run without the OpenChamber web UI.
 
-### 3. Start or Control OpenCode
+### 3. Create & Control Sessions
 
-Once the `client-daemon` is running, use `vh-solara` from the CLI to start sessions:
+Once the `client-daemon` is running, sessions are created and driven from the
+web UI (the "New session" / "Create session" button). The CLI covers lifecycle
+management:
 
 ```bash
-# Starts a new OpenCode session in the current directory
-vh-solara
-
-# List active sessions (interactive TUI)
-vh-solara list
-
-# Kill a session by UUID
-vh-solara kill <uuid>
+vh-solara kill          # stop ALL local vh daemons + the OpenCode they own (global)
+vh-solara kill --force  # SIGKILL instead of SIGTERM
+vh-solara health        # print local health/debug info
 ```
 
 ### 4. Access the Web UI
@@ -283,7 +280,7 @@ With wildcard DNS and Nginx routing `*.mysite.com` to the server's `--addr`:
 
 1. Developer agent `my-dev-01` connects to the server.
 2. Browse to `https://my-dev-01-<uuid>.mysite.com`.
-3. The server proxies your browser session through the tunnel to the worker's local web UI (OpenCode Web by default, or OpenChamber with `--web=openchamber`).
+3. The server proxies your browser session through the tunnel to the worker's local web UI (the built-in `vh` UI with `--web=vh`, OpenCode Web by default, or OpenChamber with `--web=openchamber`).
 4. Visit `http://localhost:8080` for the management dashboard.
 
 The `vh` UI is a **PWA**: open it in a browser and use "Install app" (desktop
@@ -310,8 +307,8 @@ See **[SECURITY.md](SECURITY.md)** for the model and how to configure it, and
 | `local-server` | Serve the `vh` UI locally — no controller/tunnel (single-host) |
 | `client-daemon` | Run the persistent client daemon (connects to a controller) |
 | `server` | Run the central controller server |
-| `list` | List active OpenCode sessions (interactive TUI) |
 | `kill` | Stop **all** local vh daemons + the OpenCode instances they own (global) |
+| `mcp` | Run an MCP (stdio) facade over the cross-worker coordination API |
 | `health` | Print local health/debug info |
 | `version` | Print version/build info |
 | `update` | Download + install the latest release binary, verified by SHA256 |
