@@ -307,7 +307,10 @@ See **[SECURITY.md](SECURITY.md)** for the model and how to configure it, and
 | `local-server` | Serve the `vh` UI locally — no controller/tunnel (single-host) |
 | `client-daemon` | Run the persistent client daemon (connects to a controller) |
 | `server` | Run the central controller server |
+| `kit` | Provision template kits into a repo (engine + overlay layers) |
+| `skill` | Emit/install the version-synced client skill for driving vh-solara |
 | `kill` | Stop **all** local vh daemons + the OpenCode instances they own (global) |
+| `netns` | Inspect/create/debug the private network namespace |
 | `mcp` | Run an MCP (stdio) facade over the cross-worker coordination API |
 | `health` | Print local health/debug info |
 | `version` | Print version/build info |
