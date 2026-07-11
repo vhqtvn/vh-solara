@@ -27,7 +27,7 @@ test("server admin popup can reload (rehydrate) state without restarting OpenCod
   await page.getByRole("button", { name: "Settings" }).click({ button: "right" });
   const pop = page.getByRole("dialog", { name: "Server admin" });
   await expect(pop.getByRole("button", { name: /Force reload \(clear cache\)/ })).toBeVisible();
-  await pop.getByRole("button", { name: /Reload server state/ }).click();
+  await pop.getByRole("button", { name: /Rebuild state/ }).click();
   await expect(pop.locator(".admin-ok")).toBeVisible({ timeout: 8000 });
 
   // CSRF: a state-changing request without the custom header is rejected…
@@ -37,8 +37,8 @@ test("server admin popup can reload (rehydrate) state without restarting OpenCod
   const res = await page.request.post(`${baseURL}/vh/reload`, { headers: { "X-VH-CSRF": "1" } });
   expect(res.ok()).toBeTruthy();
 
-  // The "Restart vh server" control + endpoint are present (fixture no-op).
-  await expect(pop.getByRole("button", { name: /Restart vh server/ })).toBeVisible();
+  // The "Restart server" control + endpoint are present (fixture no-op).
+  await expect(pop.getByRole("button", { name: /Restart server/ })).toBeVisible();
   const rs = await page.request.post(`${baseURL}/vh/restart-server`, { headers: { "X-VH-CSRF": "1" } });
   expect(rs.ok()).toBeTruthy();
 });
@@ -51,26 +51,29 @@ test("admin popup shows both vh-solara and OpenCode versions", async ({ page }) 
   await expect(pop).toContainText("OpenCode");
 });
 
-// Restart OpenCode is reachable two ways: a PERMANENT standalone entry in the
-// admin menu (the only restart affordance at idle), and the post-install footer
-// of the update dialog. Both traverse the SAME session-aware confirmation
-// (counted across ALL workspaces the daemon manages), so we drive it through
-// the menu's standalone entry here.
+// Restart OpenCode is reachable two ways: a Restart button in the admin menu
+// (opens a centered RestartOpenCodeDialog) and the post-install footer of the
+// update dialog. Both use the SAME session-aware confirmation (counted across
+// ALL workspaces the daemon manages); here we drive it through the menu's
+// Restart button and its portaled dialog.
 test("Restart OpenCode has a permanent menu entry that warns before acting and can be cancelled", async ({ page }) => {
   await page.goto(projectUrl("/"));
   await page.getByRole("button", { name: "Settings" }).click({ button: "right" });
   const pop = page.getByRole("dialog", { name: "Server admin" });
 
-  // The admin menu carries a permanent standalone restart entry.
-  await expect(pop.getByRole("button", { name: /^Restart OpenCode/ })).toBeVisible();
+  // The admin menu's Restart button opens a centered portaled dialog (NOT the
+  // inline pop). The dialog is portaled to <body>, so it reads as "outside"
+  // the admin popup — query it by its own role/aria-label, not via `pop`.
+  await pop.getByRole("button", { name: /^Restart$/ }).click();
+  const restartDlg = page.getByRole("dialog", { name: "Restart OpenCode" });
 
-  // Activating it shows a session-aware warning (counted across workspaces).
-  await pop.getByRole("button", { name: /^Restart OpenCode/ }).click();
-  await expect(pop.locator(".ocu-confirm")).toContainText(/running session/, { timeout: 5000 });
+  // The session-aware warning (counted across workspaces) lives inside the
+  // portaled dialog's RestartOpenCode (autoConfirm lands on the confirm step).
+  await expect(restartDlg.locator(".ocu-confirm")).toContainText(/running session/, { timeout: 5000 });
 
-  // Cancel backs out without restarting.
-  await pop.getByRole("button", { name: "Cancel" }).click();
-  await expect(pop.locator(".ocu-confirm")).toHaveCount(0);
+  // Cancel backs out without restarting (confirm dismissed; dialog stays open).
+  await restartDlg.getByRole("button", { name: "Cancel" }).click();
+  await expect(restartDlg.locator(".ocu-confirm")).toHaveCount(0);
 });
 
 test("OpenCode update opens a dialog, streams the log, then offers restart", async ({ page }) => {
@@ -81,8 +84,8 @@ test("OpenCode update opens a dialog, streams the log, then offers restart", asy
   // Fixture reports installed/running 0.1.0 → latest 0.2.0.
   await expect(pop).toContainText("0.2.0");
 
-  // Opens the dedicated update dialog via the STABLE menu entry.
-  await pop.getByRole("button", { name: /Update OpenCode…/ }).click();
+  // Opens the dedicated update dialog via the stable "Update" menu entry.
+  await pop.getByRole("button", { name: /Update/ }).click();
   const dlg = page.getByRole("dialog", { name: "Update OpenCode" });
   await expect(dlg).toBeVisible();
 

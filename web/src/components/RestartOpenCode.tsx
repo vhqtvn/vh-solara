@@ -23,6 +23,12 @@ export type RestartOpenCodeProps = {
   onRestarted?: () => void; // fired after a successful POST (dialog refetches)
   disabled?: boolean; // dialog disables while an install is running
   accent?: boolean; // dialog footer restyles the entry as .admin-btn.accent
+  // When true the component skips the entry-button click and shows RestartConfirm
+  // immediately. Used by RestartOpenCodeDialog so the centered popup lands
+  // directly on the confirm step. The POST behavior and RestartConfirm are
+  // unchanged; the entry button is still rendered if confirmRestart is reset to
+  // false (e.g. after Cancel / after a completed restart).
+  autoConfirm?: boolean;
   // Emits true when this component is in an interactive/blocking state
   // (RestartConfirm open OR a restart POST in-flight), false when back to idle.
   // The update dialog uses this to hide its Close button (focus-lock) while a
@@ -34,7 +40,9 @@ export type RestartOpenCodeProps = {
 type RunningSessions = { count: number; workspaces: { dir: string; count: number }[] };
 
 export default function RestartOpenCode(props: RestartOpenCodeProps) {
-  const [confirmRestart, setConfirmRestart] = createSignal(false);
+  // autoConfirm lands on the confirm step without an entry-button click (used by
+  // RestartOpenCodeDialog). Read once at setup; autoConfirm is a static prop.
+  const [confirmRestart, setConfirmRestart] = createSignal(!!props.autoConfirm);
   const [restarting, setRestarting] = createSignal(false);
   const [restartMsg, setRestartMsg] = createSignal("");
   // Tracks whether the current restartMsg is a success (green) or a failure

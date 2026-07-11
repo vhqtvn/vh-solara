@@ -330,6 +330,11 @@
 /* OpenCode update dialog */
 .ocu-overlay { z-index: var(--z-modal); } /* above the admin popup (z-index 60) it's launched from */
 .dialog.ocu { width: 520px; }
+/* Restart OpenCode dialog — same centered-popup model as the update dialog:
+   portaled to <body> and lifted above the admin popup via var(--z-modal). */
+.rocd-overlay { z-index: var(--z-modal); } /* above the admin popup (z-index 60) it's launched from */
+.dialog.rocd { width: 440px; }
+.rocd-body { padding: 12px; display: flex; flex-direction: column; gap: 8px; }
 /* Stack the icon above the "Update OpenCode" label. Scoped to this dialog so
    the shared .dialog-title base rule (inline icon + label) stays intact for
    every other dialog. */
