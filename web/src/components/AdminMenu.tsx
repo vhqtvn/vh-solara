@@ -100,11 +100,11 @@ export default function AdminMenu(props: { onClose: () => void }) {
         <span class="admin-ver-val">{vhVer()?.version ?? "…"}</span>
       </div>
       <div class="admin-btn-row">
-        <button type="button" class="admin-btn" disabled={reloading()} onClick={reloadServer}>
-          <Icon name="retry" size={14} /> {reloading() ? "Rebuilding…" : "Rebuild state"}
+        <button type="button" class="admin-btn" aria-label="Rebuild state" title="Rebuild state" disabled={reloading()} onClick={reloadServer}>
+          <Icon name="retry" size={14} /> {reloading() ? "Rebuilding…" : "Rebuild"}
         </button>
-        <button type="button" class="admin-btn" onClick={() => (props.onClose(), restartVhServer())}>
-          <Icon name="retry" size={14} /> Restart server
+        <button type="button" class="admin-btn" aria-label="Restart server" title="Restart server" onClick={() => (props.onClose(), restartVhServer())}>
+          <Icon name="retry" size={14} /> Restart
         </button>
       </div>
       <Show when={reloadedAt() > 0 && !reloading()}>
