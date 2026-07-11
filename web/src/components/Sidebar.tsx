@@ -139,8 +139,8 @@ export default function Sidebar(props: { open: boolean; onClose: () => void }) {
           <button
             type="button"
             class="proj-settings"
-            aria-label="Project settings"
-            data-tip="Project settings"
+            aria-label="Project menu"
+            data-tip="Project menu"
             aria-haspopup="menu"
             aria-expanded={projMenuOpen()}
             onClick={() => setProjMenuOpen((v) => !v)}
@@ -148,7 +148,7 @@ export default function Sidebar(props: { open: boolean; onClose: () => void }) {
             <Icon name="settings" size={15} />
           </button>
           <Show when={projMenuOpen()}>
-            <div class={styles.menu} role="menu" aria-label="Project settings">
+            <div class={styles.menu} role="menu" aria-label="Project menu">
               <button
                 type="button"
                 class={styles.menuItem}
