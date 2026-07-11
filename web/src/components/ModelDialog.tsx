@@ -83,7 +83,6 @@ export default function ModelDialog(props: { sessionId: string; onClose: () => v
             placeholder="Search models…"
             value={q()}
             onInput={(e) => setQ(e.currentTarget.value)}
-            autofocus
           />
           <button type="button" class="icon-btn" aria-label="Close" onClick={props.onClose}>
             <Icon name="x" />
