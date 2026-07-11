@@ -139,8 +139,17 @@ test("sending the draft uploads the pending attachment to the new session", asyn
   // its echoed user message, so the on-disk file is the proof the upload ran.
   // (The new session's attachments dir is empty before send, so finding the
   // file there is unambiguous.)
-  const sid = new URL(page.url()).searchParams.get("session");
-  expect(sid).toMatch(/^ses_new\d+$/);
+  //
+  // The new session id lands in ?session= once createSession()'s POST resolves
+  // and setSelectedId() → syncUrl() pushes it. That fetch is a SEPARATE async
+  // path from the session.created stream event that surfaced the tree node
+  // above, so the URL can lag the tree by a tick — poll instead of reading once
+  // or this races (flake: tree shown, ?session= still null).
+  await expect.poll(
+    () => new URL(page.url()).searchParams.get("session"),
+    { timeout: 10000, message: "URL ?session=<ses_newN> after draft send" },
+  ).toMatch(/^ses_new\d+$/);
+  const sid = new URL(page.url()).searchParams.get("session")!;
   const dir = path.join(demoDir, ".vh-solara", "sessions", sid!, "attachments");
   await expect.poll(
     async () => {
