@@ -113,8 +113,13 @@ whether the daemon stayed up or re-hydrated.
 
 ## Scope notes
 
-- **Single workspace for v1.** `opencode serve` resolves directory from its cwd; the
-  daemon runs one workspace. Multi-project (querying `?directory=` per project) is later.
+- **One serve, many directories (multi-project shipped).** The daemon owns a single
+  `opencode serve` process; multiple project folders are served over that one process
+  via the `x-opencode-directory` HTTP header. Upstream `opencode serve` pins nothing at
+  startup (`instance: false`) — it resolves the project **per request**, defaulting to
+  the daemon's cwd when the header is absent. Opening a folder lazily creates a
+  per-directory aggregator (HTTP client + store + SSE sub against the same serve), not a
+  new process.
 - **Rendering** (markdown/highlight/diff → HTML) is a separate server-side concern layered
   on top of the view; see the rendering pipeline doc. The view stores raw payloads; the
   render layer can cache rendered HTML keyed by part id + content hash.
