@@ -64,7 +64,13 @@ type Server struct {
 
 	// restartOC, when set by the daemon, restarts the managed OpenCode process.
 	// nil in environments that don't manage OpenCode (e.g. the fixture server).
-	restartOC     func(context.Context) error
+	restartOC func(context.Context) error
+	// externalOC reports whether OpenCode is attached externally (--opencode-url)
+	// rather than spawned/co-located by this daemon. Drives the direct-DB
+	// unarchive topology guard (pkg/web/archive.go): in external mode the local DB
+	// file is NOT guaranteed to be the remote instance's DB, so unarchive refuses
+	// unless VH_OPENCODE_DB_PATH is set. Default false (spawned topology).
+	externalOC    bool
 	restartServer func()
 	ocVersionFn   func(context.Context) (installed, running, latest string, err error)
 	ocUpdateFn    func(ctx context.Context, w io.Writer) error
@@ -166,6 +172,11 @@ func (s *Server) handleSkillEmit(w http.ResponseWriter, r *http.Request) {
 
 // SetRestartOpenCode wires the daemon's OpenCode-restart hook. Optional.
 func (s *Server) SetRestartOpenCode(fn func(context.Context) error) { s.restartOC = fn }
+
+// SetExternalOpenCode records whether OpenCode is attached externally
+// (--opencode-url) rather than spawned/co-located by this daemon. Drives the
+// direct-DB unarchive topology guard in pkg/web/archive.go.
+func (s *Server) SetExternalOpenCode(external bool) { s.externalOC = external }
 
 // SetRestartServer wires the daemon's vh-server-restart hook (re-exec, or exit
 // for a supervisor to relaunch). Optional.

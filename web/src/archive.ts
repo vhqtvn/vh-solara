@@ -44,6 +44,17 @@ export async function unarchiveSession(id: string): Promise<string[]> {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ sessionID: id }),
   });
+  // Surface failures instead of mapping any error to `affected: []`, which
+  // previously made a broken unarchive look like an empty success to callers
+  // (and hid the underlying PATCH-400 bug for months). The server returns the
+  // backend's error text on failure (e.g. the schema-drift refusal from the
+  // direct-DB writer), so throw it for the UI to present.
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(
+      `unarchive failed (${res.status}): ${body || res.statusText}`,
+    );
+  }
   const j = await res.json().catch(() => ({}));
   return j.affected || [];
 }

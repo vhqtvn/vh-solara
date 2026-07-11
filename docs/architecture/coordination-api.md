@@ -153,7 +153,11 @@ GET /vh/sessions?dir=<dir>&include_archived=0|1&since=<ms>&roots_only=0|1
 
 - `include_archived` (default `0`): `1` also pulls archived sessions (merged,
   deduped by id). `active` is true iff `time.archived` is null/0; `parentID` is
-  null for roots, string for children.
+  null for roots, string for children. (vh-solara treats both `null` and `0` as
+  active for display; **OpenCode's own** authoritative model is strictly
+  `time_archived IS NULL` — `0` is still archived in OpenCode. vh-solara
+  unarchives by writing `NULL` directly, never `0`. See
+  [`opencode-sqlite-unarchive.md`](opencode-sqlite-unarchive.md).)
 - `since=<ms-epoch>`: recency cutoff — drops sessions whose latest of
   updated/created is older.
 - `roots_only` (default `1`): `0` includes child/sub-sessions.
@@ -247,6 +251,15 @@ Reply verbs are naturally CAS-on-request-id, so they take no `If-Idle-Seq`.
   not send-after-abort synchronously (use CAS or wait for the idle transition).
 - **archive removes the session from the live view** — archive only a
   confirmed-done session.
+- **unarchive is NOT an HTTP operation.** `POST /vh/archive` (archiving, with a
+  finite timestamp) is a working HTTP `PATCH` and is unchanged. But OpenCode
+  1.17.x **rejects** `PATCH /session/:id {"time":{"archived":null}}` with 400
+  (the request schema is `Schema.optional(Schema.Finite)`, which rejects `null`),
+  and there is no dedicated unarchive endpoint. vh-solara therefore unarchives
+  (restores) by writing `time_archived = NULL` **directly** to OpenCode's SQLite
+  DB. See [`opencode-sqlite-unarchive.md`](opencode-sqlite-unarchive.md)
+  (validated against `opencode v1.17.14`) for the full coupling contract. The
+  direct write emits no `session.updated` event; the worker re-hydrates after it.
 
 ### Result `outcome` (caller accounting)
 

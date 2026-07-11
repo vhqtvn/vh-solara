@@ -73,6 +73,15 @@
   padding: 8px 10px;
 }
 .arch-more:hover { text-decoration: underline; }
+.arch-error {
+  margin: 4px 6px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  font-size: 12px;
+  word-break: break-word;
+  background: color-mix(in srgb, var(--danger, #e5484d) 12%, transparent);
+  color: var(--danger, #e5484d);
+}
 @media (hover: none) {
   .arch-restore { opacity: 1; }
 }

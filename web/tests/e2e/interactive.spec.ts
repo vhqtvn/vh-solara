@@ -99,7 +99,7 @@ test("notes view persists a to-do and project notes to the server", async ({ pag
   expect(saved.todos.some((t: any) => t.text.startsWith("ship it"))).toBeTruthy();
 });
 
-test("archive removes a session from the tree and the Archived browser restores it", async ({ page }) => {
+test("archive removes a session from the tree and lists it in the Archived browser", async ({ page }) => {
   await page.goto(projectUrl("/"));
   // Create a fresh session so we don't disturb the seeded demo sessions.
   await page.getByRole("button", { name: "Create session" }).click();
@@ -134,14 +134,18 @@ test("archive removes a session from the tree and the Archived browser restores 
   // Confirmed → this specific session leaves the live tree for good.
   await expect(node).toHaveCount(0, { timeout: 8000 });
 
-  // …and shows up in the Archived browser, where Restore brings it back.
+  // …and shows up in the Archived browser.
   await page.getByRole("button", { name: "Archived" }).click();
   const arch = page.getByRole("dialog", { name: "Archived sessions" });
   await expect(arch).toBeVisible();
   await expect(arch.locator(".arch-row").first()).toBeVisible({ timeout: 8000 });
-  const beforeArch = await arch.locator(".arch-row").count();
-  await arch.locator(".arch-restore").first().click();
-  await expect.poll(() => arch.locator(".arch-row").count(), { timeout: 8000 }).toBeLessThan(beforeArch);
+
+  // NOTE: the restore (unarchive) step is NOT exercised here. The fixture has no
+  // real SQLite backing, so the direct-DB unarchive path
+  // (pkg/opencode/db.go UnarchiveSessions) cannot run end-to-end against it —
+  // and the fixture's PATCH handler is now faithful to real OpenCode (a present
+  // null returns 400, not a clear). Unarchive is unit-covered instead by
+  // pkg/opencode/db_test.go (positive, negative, and schema-drift cases).
 });
 
 test("sidebar search filters sessions and pinning floats one to the top", async ({ page }) => {

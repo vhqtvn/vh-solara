@@ -245,3 +245,57 @@ func TestArchivedDescendantsUnknownID(t *testing.T) {
 		t.Fatalf("unknown id want %v, got %v", want, got)
 	}
 }
+
+// TestArchivedDescendantsRetryReachesArchivedChildAfterRootUnarchives is the
+// regression for blocker b-F1: a partial-batch unarchive failure leaves the
+// root already active (time.archived cleared) while a child stays archived.
+// The recovery contract — re-clicking Restore on the SAME root retries the
+// still-archived child — was false under the old archivedDescendants, because
+// it built its tree only from the archived set, so once the root left that set
+// the child became unreachable (the function returned [root] only).
+//
+// Setup mirrors that post-partial-failure state: root r1 is ACTIVE (no
+// time.archived), child c1 is still archived. The retry on r1 must include c1.
+func TestArchivedDescendantsRetryReachesArchivedChildAfterRootUnarchives(t *testing.T) {
+	sessions := []json.RawMessage{
+		// r1 already unarchived (partial-batch success) — ACTIVE, no archived ts.
+		archSession(t, "r1", "", 5, 30, nil),
+		// c1 still archived (mid-batch failure) — the retry MUST reach it.
+		archSession(t, "c1", "r1", 8, 50, floatPtr(20)),
+	}
+	got := archivedDescendants(sessions, "r1")
+	want := []string{"r1", "c1"}
+	if !equalSet(want, got) {
+		t.Fatalf("retry on active root r1 want %v (still-archived child c1 must be reachable), got %v", want, got)
+	}
+	// Specifically assert the previously-unreachable child is present.
+	hit := false
+	for _, id := range got {
+		if id == "c1" {
+			hit = true
+		}
+	}
+	if !hit {
+		t.Fatalf("still-archived child c1 not reached on retry of active root r1: got %v", got)
+	}
+}
+
+// TestArchivedDescendantsRetryReachesDeepArchivedDescendant covers the deeper
+// partial-failure shape: the root and one mid-level descendant unarchived, but
+// a deeper archived descendant is still pending, reached through an
+// already-active intermediate node.
+func TestArchivedDescendantsRetryReachesDeepArchivedDescendant(t *testing.T) {
+	sessions := []json.RawMessage{
+		// r1 already active (unarchived) — retry root.
+		archSession(t, "r1", "", 5, 30, nil),
+		// m1 already active — mid node that already unarchived.
+		archSession(t, "m1", "r1", 6, 40, nil),
+		// g1 still archived — must be reached through the active r1->m1 chain.
+		archSession(t, "g1", "m1", 7, 50, floatPtr(25)),
+	}
+	got := archivedDescendants(sessions, "r1")
+	want := []string{"r1", "g1"}
+	if !equalSet(want, got) {
+		t.Fatalf("retry want %v (deep archived g1 via active r1->m1), got %v", want, got)
+	}
+}

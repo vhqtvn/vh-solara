@@ -24,6 +24,9 @@ export default function ArchivedDialog(props: { onClose: () => void }) {
   const [levels, setLevels] = createStore<Record<string, LevelState>>({});
   const [expanded, setExpanded] = createSignal<Record<string, boolean>>({});
   const [busy, setBusy] = createSignal(false);
+  // Restore errors (e.g. the unarchive backend refusing on schema drift) are
+  // surfaced here instead of being swallowed into an empty success.
+  const [restoreError, setRestoreError] = createSignal<string | null>(null);
   // Which level ("" = roots) is currently fetching, so its "Load more" button can
   // show "Loading…" instead of appearing frozen.
   const [loadingParent, setLoadingParent] = createSignal<string | null>(null);
@@ -67,7 +70,14 @@ export default function ArchivedDialog(props: { onClose: () => void }) {
 
   async function restore(id: string, e: Event) {
     e.stopPropagation();
-    await unarchiveSession(id);
+    setRestoreError(null);
+    try {
+      await unarchiveSession(id);
+    } catch (err) {
+      // Don't drop the row on failure — it is still archived.
+      setRestoreError(err instanceof Error ? err.message : String(err));
+      return;
+    }
     // Drop the row from its level cache so it disappears from the browser.
     for (const parent of Object.keys(levels)) {
       const lvl = levels[parent];
@@ -98,7 +108,12 @@ export default function ArchivedDialog(props: { onClose: () => void }) {
               </span>
             </Show>
           </button>
-          <button type="button" class="arch-main" onClick={() => restoreAndOpen(id).then(props.onClose)}>
+          <button type="button" class="arch-main" onClick={() => {
+            setRestoreError(null);
+            restoreAndOpen(id)
+              .then(props.onClose)
+              .catch((err) => setRestoreError(err instanceof Error ? err.message : String(err)));
+          }}>
             <span class="arch-title">{p.s.title || id}</span>
             <span class="arch-meta">
               <Show when={kids() > 0}>
@@ -144,6 +159,9 @@ export default function ArchivedDialog(props: { onClose: () => void }) {
           </button>
         </div>
         <div class="dialog-body arch-body">
+          <Show when={restoreError()}>
+            <p class="arch-error">Restore failed: {restoreError()}</p>
+          </Show>
           <Show
             when={roots() && roots()!.rows.length > 0}
             fallback={<p class="setting-hint">{busy() ? "Loading…" : "No archived sessions."}</p>}

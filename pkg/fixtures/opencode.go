@@ -575,19 +575,44 @@ func (f *FakeOpenCode) handleSession(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case action == "" && r.Method == http.MethodPatch:
 		// Update a session: archive (time.archived) and/or title.
+		//
+		// FAITHFUL to OpenCode 1.17.x UpdatePayload
+		// (Schema.optional(Schema.Finite)): a PRESENT JSON null for
+		// time.archived is REJECTED with 400 — the schema does not accept
+		// null. Only a finite number value is accepted, and it always SETS
+		// archived (PATCH can never CLEAR it). This is exactly why vh-solara
+		// unarchives via a direct SQLite write instead of PATCH; see
+		// docs/architecture/opencode-sqlite-unarchive.md. The previous fixture
+		// modeled null-as-clear, which hid the real 400 for months.
+		//
+		// `archived` is decoded as json.RawMessage so a present null can be
+		// told apart from an absent key (both would otherwise be a nil
+		// *float64).
 		var body struct {
 			Title *string `json:"title"`
 			Time  *struct {
-				Archived *float64 `json:"archived"`
+				Archived json.RawMessage `json:"archived"`
 			} `json:"time"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
-		f.mu.Lock()
-		if body.Time != nil {
-			f.archived[id] = body.Time.Archived != nil && *body.Time.Archived != 0
+		if body.Time != nil && len(body.Time.Archived) > 0 {
+			// time.archived key is PRESENT.
+			if strings.TrimSpace(string(body.Time.Archived)) == "null" {
+				http.Error(w, "time.archived must be a finite timestamp; null is not accepted (OpenCode 1.17.x rejects clearing via PATCH)", http.StatusBadRequest)
+				return
+			}
+			var ts float64
+			if err := json.Unmarshal(body.Time.Archived, &ts); err != nil {
+				http.Error(w, "time.archived must be a number", http.StatusBadRequest)
+				return
+			}
+			f.mu.Lock()
+			f.archived[id] = true // a finite value always SETS archived; PATCH never clears.
+			f.mu.Unlock()
 		}
 		var updated map[string]any
 		if body.Title != nil {
+			f.mu.Lock()
 			for _, s := range f.sessions {
 				if s["id"] == id {
 					s["title"] = *body.Title
@@ -595,8 +620,8 @@ func (f *FakeOpenCode) handleSession(w http.ResponseWriter, r *http.Request) {
 					break
 				}
 			}
+			f.mu.Unlock()
 		}
-		f.mu.Unlock()
 		if updated != nil {
 			f.emit("session.updated", map[string]any{"info": updated})
 		}

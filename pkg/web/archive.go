@@ -6,6 +6,8 @@ import (
 	"sort"
 	"strconv"
 	"time"
+
+	"github.com/vhqtvn/vh-solara/pkg/opencode"
 )
 
 // Archiving uses OpenCode's NATIVE archive (PATCH /session/:id time.archived):
@@ -34,21 +36,41 @@ func (s *Server) handleArchive(w http.ResponseWriter, r *http.Request) {
 
 	var affected []string
 	if unarchive {
+		// Topology guard (runs BEFORE any DB open): direct-DB unarchive writes
+		// to a PROCESS-LOCAL SQLite file. In the spawned/co-located topology
+		// that file IS the running instance's DB (env inherited). In the
+		// external topology (--opencode-url) the session ids come from a REMOTE
+		// instance but the DB resolver targets a LOCAL file that may not match
+		// — refuse fast unless the operator explicitly bound
+		// VH_OPENCODE_DB_PATH. See docs/architecture/opencode-sqlite-unarchive.md.
+		if err := opencode.UnarchiveGuard(s.externalOC); err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
 		// Archived sessions aren't in the live store; compute the subtree from
-		// OpenCode's archived list, then clear time.archived on each.
+		// OpenCode's archived list, then clear time_archived on each.
+		//
+		// Unarchive writes DIRECTLY to OpenCode's SQLite DB
+		// (opencode.UnarchiveSessions) rather than going through the HTTP API:
+		// OpenCode 1.17.x has no HTTP way to clear archived (PATCH with a JSON
+		// null for time.archived is rejected with 400 — its request schema is
+		// Schema.optional(Schema.Finite), which does not accept null). See
+		// docs/architecture/opencode-sqlite-unarchive.md for the coupling
+		// contract and the drift guard. Archiving (the else branch below) still
+		// uses the working HTTP PATCH with a finite timestamp.
 		ids, err := agg.Client().ListArchivedSessions(r.Context())
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
 		affected = archivedDescendants(ids, body.SessionID)
-		for _, id := range affected {
-			if err := agg.Client().SetArchived(r.Context(), id, nil); err != nil {
-				http.Error(w, err.Error(), http.StatusBadGateway)
-				return
-			}
+		if err := opencode.UnarchiveSessions(r.Context(), affected); err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
 		}
-		// Re-hydrate so the restored sessions re-enter the live tree.
+		// Re-hydrate so the restored sessions re-enter the live tree. The direct
+		// DB write emits no session.updated event, so the local store would
+		// otherwise still consider these sessions archived until a refresh.
 		_ = agg.Rehydrate(r.Context())
 	} else {
 		// The subtree is live, so cascade is computed from the store.
@@ -67,13 +89,28 @@ func (s *Server) handleArchive(w http.ResponseWriter, r *http.Request) {
 }
 
 // archivedDescendants returns id plus every genuinely archived session
-// transitively parented by it. The input list is OpenCode's archived-set
-// response, but 1.17.x ignores ?archived=true and returns ALL sessions, so
-// non-archived entries (time.archived nil/0) are filtered out below — only
-// real archived sessions participate in the computed subtree.
+// transitively parented by it, so that re-clicking Restore (unarchive) on id
+// retries any member of its subtree that is still archived — including the
+// case where id itself already unarchived (a partial-batch failure can leave a
+// child archived after its parent succeeded).
+//
+// The input list is OpenCode's archived-set response, but 1.17.x ignores
+// ?archived=true and returns ALL sessions (archived + active). The subtree
+// traversal is therefore built from ALL of them — so the parent→child link to
+// a still-archived child survives even after the root leaves the archived set
+// — and only the still-archived members (plus the root itself, as an idempotent
+// no-op re-write) are collected for unarchive. A non-archived descendant is
+// traversed (so a deeper archived member stays reachable) but is never folded
+// into the result (it is already active). See the "Batch semantics" section of
+// docs/architecture/opencode-sqlite-unarchive.md.
 func archivedDescendants(sessions []json.RawMessage, id string) []string {
+	// Build the parent→children map from ALL sessions (active + archived) so
+	// the subtree stays reachable for retry even after the root unarchives — a
+	// partial-batch failure can leave a child archived while its parent is
+	// already active, and that child must remain reachable through it. Track
+	// which members are genuinely archived so the collected set stays minimal.
 	children := map[string][]string{}
-	known := map[string]bool{}
+	archived := map[string]bool{}
 	for _, raw := range sessions {
 		var env struct {
 			ID       string `json:"id"`
@@ -85,28 +122,36 @@ func archivedDescendants(sessions []json.RawMessage, id string) []string {
 		if json.Unmarshal(raw, &env) != nil || env.ID == "" {
 			continue
 		}
-		// OpenCode 1.17.x ignores the ?archived=true param and returns ALL
-		// sessions (archived + non-archived). Filter server-side here: only a
-		// genuinely archived session (time.archived set to a non-zero value)
-		// belongs in the subtree. Mirrors sessionEnvelope.archivedAt() in
-		// pkg/state/store.go.
-		if env.Time.Archived == nil || *env.Time.Archived == 0 {
-			continue
-		}
-		known[env.ID] = true
 		if env.ParentID != "" {
 			children[env.ParentID] = append(children[env.ParentID], env.ID)
 		}
+		// OpenCode 1.17.x ignores the ?archived=true param and returns ALL
+		// sessions (archived + non-archived). Track only genuinely archived
+		// members (time.archived set to a non-zero value) so non-archived
+		// descendants are traversed but never collected. Mirrors
+		// sessionEnvelope.archivedAt() in pkg/state/store.go.
+		if env.Time.Archived != nil && *env.Time.Archived != 0 {
+			archived[env.ID] = true
+		}
 	}
-	if !known[id] {
-		return []string{id} // not in the archived list, but try the single id
-	}
+	// Walk the full subtree rooted at id. Collect id itself (an idempotent
+	// no-op re-write if it is already active) plus every still-archived member.
+	// This is what makes a retry complete the batch: a child left archived by a
+	// partial failure remains reachable through its now-active parent. seen
+	// guards against a revisit loop on malformed parent links.
 	out := []string{}
+	seen := map[string]bool{}
 	stack := []string{id}
 	for len(stack) > 0 {
 		cur := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
-		out = append(out, cur)
+		if seen[cur] {
+			continue
+		}
+		seen[cur] = true
+		if cur == id || archived[cur] {
+			out = append(out, cur)
+		}
 		stack = append(stack, children[cur]...)
 	}
 	return out
