@@ -137,15 +137,15 @@ func (c *Client) ListArchivedSessions(ctx context.Context) ([]json.RawMessage, e
 	return c.listSessionsAdaptive(ctx, "/session?archived=true&limit=%d")
 }
 
-// SetArchived sets (ts != nil) or clears (ts == nil) a session's archived
-// timestamp via OpenCode's native archive (PATCH /session/:id). This is the
-// real archive — it persists in OpenCode and is visible to every client.
-func (c *Client) SetArchived(ctx context.Context, id string, ts *int64) error {
-	var archived any // null clears the archive
-	if ts != nil {
-		archived = *ts
-	}
-	body, _ := json.Marshal(map[string]any{"time": map[string]any{"archived": archived}})
+// SetArchived sets a session's archived timestamp via OpenCode's native archive
+// (PATCH /session/:id time.archived). This is the real archive — it persists in
+// OpenCode and is visible to every client. The timestamp is always a finite
+// value (the set path): OpenCode 1.17.x has no HTTP mechanism to clear
+// (restore) an archive — a PATCH with a JSON null for time.archived is rejected
+// with 400 — so unarchive goes through the direct-SQLite path instead
+// (pkg/opencode/db.go). See docs/architecture/opencode-sqlite-unarchive.md.
+func (c *Client) SetArchived(ctx context.Context, id string, ts int64) error {
+	body, _ := json.Marshal(map[string]any{"time": map[string]any{"archived": ts}})
 	req, err := c.newRequest(ctx, http.MethodPatch, "/session/"+id, bytes.NewReader(body))
 	if err != nil {
 		return err

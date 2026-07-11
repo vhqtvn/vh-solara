@@ -77,7 +77,7 @@ func (s *Server) handleArchive(w http.ResponseWriter, r *http.Request) {
 		affected = agg.Store().Descendants(body.SessionID)
 		ts := time.Now().UnixMilli()
 		for _, id := range affected {
-			if err := agg.Client().SetArchived(r.Context(), id, &ts); err != nil {
+			if err := agg.Client().SetArchived(r.Context(), id, ts); err != nil {
 				http.Error(w, err.Error(), http.StatusBadGateway)
 				return
 			}

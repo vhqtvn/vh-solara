@@ -1,6 +1,6 @@
 # OpenCode direct-SQLite unarchive — coupling contract
 
-> **validatedAgainst:** `opencode v1.17.14` (sst/opencode tag v1.17.14, Jul 6 2026)
+> **validatedAgainst:** `opencode v1.17.18` (sst/opencode tag v1.17.18, Jul 6 2026)
 >
 > Evidence base: [`researches/sources/opencode-unarchive-patch-audit.md`](../../researches/sources/opencode-unarchive-patch-audit.md) (why HTTP unarchive is impossible) and [`researches/sources/opencode-sqlite-unarchive-spec.md`](../../researches/sources/opencode-sqlite-unarchive-spec.md) (the full DB-path/driver/SQL/concurrency/drift spec this code implements). Every path/schema/pragma claim below is cited to those packets.
 
@@ -34,7 +34,7 @@ OpenCode's SQLite DB.
 a working HTTP `PATCH` with a finite timestamp value, which decodes and stores
 fine. Only the *clear* goes through the direct-DB path.
 
-## The coupling surface (validated @ v1.17.14)
+## The coupling surface (validated @ v1.17.18)
 
 `pkg/opencode/db.go` depends on exactly three things:
 
@@ -83,7 +83,7 @@ PRAGMA table_info(session)
 
 and asserts the `session` table exists and has a column `time_archived` whose type
 contains `INTEGER` and whose `notnull = 0`. On **any** mismatch it returns a loud
-`*SchemaError` (naming this doc + `validatedAgainst = opencode v1.17.14`) and the
+`*SchemaError` (naming this doc + `validatedAgainst = opencode v1.17.18`) and the
 caller **refuses the write**. A future OpenCode that renames the column, retypes
 it, or drops the table turns into a visible, localized refusal — never a silent
 wrong-file or wrong-column write. `PRAGMA table_info` is used (not `sqlite_master`

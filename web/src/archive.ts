@@ -23,6 +23,16 @@ export async function archiveSession(id: string): Promise<string[]> {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ sessionID: id }),
   });
+  // Surface failures instead of mapping any error to `affected: []`, which
+  // would make a broken archive look like an empty success to callers. The
+  // archive HTTP path itself works (a finite timestamp is accepted), so this
+  // only surfaces transport/server errors. Mirrors unarchiveSession below.
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(
+      `archive failed (${res.status}): ${body || res.statusText}`,
+    );
+  }
   const j = await res.json().catch(() => ({}));
   const affected: string[] = j.affected || [];
   // Archived sessions leave the live tree for good — drop their saved read

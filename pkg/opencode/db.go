@@ -23,9 +23,9 @@ package opencode
 //
 // Every schema/path claim below is validated against:
 //
-//	validatedAgainst = "opencode v1.17.14"
+//	validatedAgainst = "opencode v1.17.18"
 //
-// (sst/opencode tag v1.17.14). Source citations live in
+// (sst/opencode tag v1.17.18). Source citations live in
 // researches/sources/opencode-sqlite-unarchive-spec.md.
 
 import (
@@ -47,15 +47,15 @@ import (
 // which upstream version it was checked against.
 const (
 	opencodeCouplingDoc    = "docs/architecture/opencode-sqlite-unarchive.md"
-	opencodeValidatedTag   = "opencode v1.17.14"
+	opencodeValidatedTag   = "opencode v1.17.18"
 	opencodeDBOverrideEnv  = "VH_OPENCODE_DB_PATH" // operator escape hatch: explicit absolute DB file path
 	opencodeChannelEnv     = "VH_OPENCODE_CHANNEL" // optional: names the OpenCode installation channel when it is NOT a published one (latest/beta/prod)
 	opencodeDBPathCliTO    = 3 * time.Second       // `opencode db path` shell-out budget
 	opencodeShelloutOpenTO = 5 * time.Second       // open + self-check + UPDATE budget (single point write)
 )
 
-// Captured v1.17.14 session-table contract the unarchive UPDATE depends on.
-// Source: packages/core/src/session/sql.ts @ v1.17.14 (SessionTable).
+// Captured v1.17.18 session-table contract the unarchive UPDATE depends on.
+// Source: packages/core/src/session/sql.ts @ v1.17.18 (SessionTable).
 // The runtime self-check (assertSessionSchema) compares the live DB against
 // these; any mismatch refuses the write loudly.
 const (
@@ -72,7 +72,7 @@ const (
 var opencodePublishedChannels = map[string]bool{"latest": true, "beta": true, "prod": true}
 
 // SchemaError is returned when the live OpenCode DB no longer matches the
-// captured v1.17.14 contract (renamed column/table, retyped column, added NOT
+// captured v1.17.18 contract (renamed column/table, retyped column, added NOT
 // NULL, etc.) or the DB file is missing/unreadable. It is intentionally LOUD:
 // its message names the coupling doc and the validated version so silent
 // corruption can never happen — a schema drift turns into a visible, localized
@@ -210,7 +210,7 @@ func dbPathViaCLI(ctx context.Context) (string, bool) {
 	return p, true
 }
 
-// fallbackDBPath re-implements OpenCode's Database.path() (v1.17.14) in Go. It
+// fallbackDBPath re-implements OpenCode's Database.path() (v1.17.18) in Go. It
 // reads the SAME env the running `opencode serve` process sees (vh-solara
 // inherits the environment). xdg-basedir is XDG-spec-literal — it does NO
 // platform branching, so macOS uses ~/.local/share too (NOT ~/Library/...).
@@ -348,7 +348,7 @@ func openDB(path string) (*sql.DB, error) {
 }
 
 // assertSessionSchema is the always-on runtime drift guard. Before any UPDATE
-// it introspects the live DB and asserts the captured v1.17.14 contract holds:
+// it introspects the live DB and asserts the captured v1.17.18 contract holds:
 // the `session` table exists and has a `time_archived` column whose type
 // contains INTEGER and which is nullable (notnull=0). On ANY mismatch it
 // returns a loud *SchemaError and the caller refuses the write.

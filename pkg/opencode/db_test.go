@@ -26,7 +26,7 @@ func openTempDB(t *testing.T, path, schema string) *sql.DB {
 	return db
 }
 
-// mimickedSchema is a minimal v1.17.14 `session` table that contains the
+// mimickedSchema is a minimal v1.17.18 `session` table that contains the
 // columns the unarchive code path reads/writes (id PK, time_archived, and
 // time_updated so the test can assert it is NOT bumped). Other columns the real
 // table has (project_id, title, ...) are intentionally omitted — they are not

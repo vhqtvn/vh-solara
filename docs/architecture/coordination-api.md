@@ -258,7 +258,7 @@ Reply verbs are naturally CAS-on-request-id, so they take no `If-Idle-Seq`.
   and there is no dedicated unarchive endpoint. vh-solara therefore unarchives
   (restores) by writing `time_archived = NULL` **directly** to OpenCode's SQLite
   DB. See [`opencode-sqlite-unarchive.md`](opencode-sqlite-unarchive.md)
-  (validated against `opencode v1.17.14`) for the full coupling contract. The
+  (validated against `opencode v1.17.18`) for the full coupling contract. The
   direct write emits no `session.updated` event; the worker re-hydrates after it.
 
 ### Result `outcome` (caller accounting)
