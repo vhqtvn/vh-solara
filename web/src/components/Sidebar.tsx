@@ -10,6 +10,8 @@ import HelpInspector from "./HelpInspector";
 import StatusMark from "./StatusMark";
 import Icon from "./Icon";
 import { setView } from "../ui";
+import { dismiss } from "../lib/a11y";
+import styles from "./Sidebar.module.css";
 
 export default function Sidebar(props: { open: boolean; onClose: () => void }) {
   const [archivedOpen, setArchivedOpen] = createSignal(false);
@@ -55,6 +57,30 @@ export default function Sidebar(props: { open: boolean; onClose: () => void }) {
     } else {
       setSearchQuery("");
       setSearchOpen(false);
+    }
+  };
+
+  // Project-settings dropdown (gear beside the project switcher): holds the
+  // Agent-styles editor entry and the per-project Reload action.
+  const [projMenuOpen, setProjMenuOpen] = createSignal(false);
+  // reloading tracks the in-flight /vh/reload-project POST so the item shows a
+  // spinner and can't be double-fired. The browser's SSE EventSource auto-
+  // reconnects once the daemon drops the old aggregator's store, so no page
+  // reload is needed — the live view rebuilds against the fresh aggregator.
+  const [reloading, setReloading] = createSignal(false);
+  const reloadProject = async () => {
+    if (reloading()) return;
+    setReloading(true);
+    try {
+      // CSRF (X-VH-CSRF) + x-opencode-directory are auto-added by installCsrf();
+      // dir is also carried via ?dir= so the default project (no header) is
+      // still scoped correctly via reqDir().
+      await fetch("/vh/reload-project?dir=" + encodeURIComponent(projectDir() || ""), {
+        method: "POST",
+      });
+    } finally {
+      setReloading(false);
+      setProjMenuOpen(false);
     }
   };
 
@@ -109,18 +135,52 @@ export default function Sidebar(props: { open: boolean; onClose: () => void }) {
       </div>
       <div class="proj-bar">
         <ProjectSwitcher />
-        <button
-          type="button"
-          class="proj-settings"
-          aria-label="Agent styles"
-          data-tip="Agent styles (this project)"
-          onClick={() => {
-            setView("agents");
-            props.onClose(); // close the mobile slide-over; no-op on desktop
-          }}
-        >
-          <Icon name="settings" size={15} />
-        </button>
+        <div class={styles.wrap} use:dismiss={() => projMenuOpen() && setProjMenuOpen(false)}>
+          <button
+            type="button"
+            class="proj-settings"
+            aria-label="Project settings"
+            data-tip="Project settings"
+            aria-haspopup="menu"
+            aria-expanded={projMenuOpen()}
+            onClick={() => setProjMenuOpen((v) => !v)}
+          >
+            <Icon name="settings" size={15} />
+          </button>
+          <Show when={projMenuOpen()}>
+            <div class={styles.menu} role="menu" aria-label="Project settings">
+              <button
+                type="button"
+                class={styles.menuItem}
+                role="menuitem"
+                onClick={() => {
+                  setProjMenuOpen(false);
+                  setView("agents");
+                  props.onClose(); // close the mobile slide-over; no-op on desktop
+                }}
+              >
+                <Icon name="settings" size={14} />
+                Agent styles
+              </button>
+              <button
+                type="button"
+                class={styles.menuItem}
+                role="menuitem"
+                disabled={reloading()}
+                aria-label="Reload to apply config changes. Running sessions finish undisturbed."
+                title="Reload to apply config changes. Running sessions finish undisturbed."
+                onClick={() => void reloadProject()}
+              >
+                <Show when={reloading()} fallback={<Icon name="retry" size={14} />}>
+                  <span class={styles.spinning}>
+                    <Icon name="retry" size={14} />
+                  </span>
+                </Show>
+                Reload project
+              </button>
+            </div>
+          </Show>
+        </div>
       </div>
       <Show when={searchOpen() || searchQuery()}>
         <div class="session-search">

@@ -27,8 +27,11 @@ test("agent-styles editor edits a row, previews a diff, and saves", async ({ pag
   });
 
   await page.goto(projectUrl("/"));
-  // Reach the editor via the settings gear beside the project switcher.
+  // Reach the editor via the settings gear beside the project switcher. The gear
+  // now opens a project-settings dropdown (Agent styles / Reload project); open
+  // it, then pick the Agent-styles entry.
   await page.locator(".proj-settings").click();
+  await page.getByRole("menuitem", { name: "Agent styles" }).click();
 
   // The @build row is seeded from the (mocked) file.
   const buildRow = page.locator(".agents-row", { hasText: "@build" });

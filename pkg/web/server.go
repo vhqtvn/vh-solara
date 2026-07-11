@@ -107,8 +107,15 @@ type Server struct {
 	// per dir, like aggHook). Registered from aggFor so the sweep is running
 	// before any fail_fast session can be minted (the spawn that creates it
 	// calls aggFor first).
-	watcherMu sync.Mutex
-	watcherOn map[string]bool
+	//
+	// watcherCancel holds the per-dir cancel func for the sweep goroutine, so a
+	// non-default dir's sweep can be stopped cleanly when Reload drops its
+	// aggregator (stopPermissionWatcher). The default dir's sweep ("") has no
+	// stopper: it is process-lifetime and is never reloaded. Both maps are
+	// guarded by watcherMu.
+	watcherMu     sync.Mutex
+	watcherOn     map[string]bool
+	watcherCancel map[string]context.CancelFunc
 
 	// features are the capability modules mounted at startup (B). The
 	// coordination verbs are the first one (dogfood).
@@ -228,19 +235,20 @@ func NewServer(agg *aggregator.Aggregator, opencodeURL string, ringCapacity int)
 		return nil, err
 	}
 	srv := &Server{
-		agg:         agg,
-		proxy:       rp,
-		staticFS:    sub,
-		renderer:    render.New(),
-		static:      http.FileServer(http.FS(sub)),
-		opencodeURL: opencodeURL,
-		ringCap:     ringCapacity,
-		aggs:        map[string]*aggregator.Aggregator{"": agg},
-		idem:        newIdemCache(10 * time.Minute),
-		features:    defaultFeatures(),
-		views:       newViewRegistry(),
-		failFast:    map[string]struct{}{},
-		watcherOn:   map[string]bool{},
+		agg:           agg,
+		proxy:         rp,
+		staticFS:      sub,
+		renderer:      render.New(),
+		static:        http.FileServer(http.FS(sub)),
+		opencodeURL:   opencodeURL,
+		ringCap:       ringCapacity,
+		aggs:          map[string]*aggregator.Aggregator{"": agg},
+		idem:          newIdemCache(10 * time.Minute),
+		features:      defaultFeatures(),
+		views:         newViewRegistry(),
+		failFast:      map[string]struct{}{},
+		watcherOn:     map[string]bool{},
+		watcherCancel: map[string]context.CancelFunc{},
 	}
 	return srv, nil
 }
@@ -279,7 +287,11 @@ func (s *Server) aggFor(dir string) *aggregator.Aggregator {
 		s.aggHook(dir, a)
 	}
 	s.ensurePermissionWatcher(dir, a)
-	go a.Run(context.Background())
+	// Run under a context the aggregator itself can cancel via Stop(), so
+	// handleReloadProject can drop ONE project (a.Stop()) without disturbing the
+	// default or any other project. RunManaged derives the cancellable child and
+	// arms a.cancel internally.
+	go a.RunManaged(context.Background())
 	return a
 }
 
@@ -356,10 +368,12 @@ func (s *Server) ensurePermissionWatcher(dir string, a *aggregator.Aggregator) {
 		s.watcherMu.Unlock()
 		return
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	s.watcherOn[dir] = true
+	s.watcherCancel[dir] = cancel
 	s.watcherMu.Unlock()
 
-	go s.runPermissionReconcile(a)
+	go s.runPermissionReconcile(ctx, a)
 }
 
 // permReconcileInterval is the period of the per-directory fail-closed
@@ -379,13 +393,21 @@ const permReconcileInterval = 2 * time.Second
 const permRejectTimeout = 10 * time.Second
 
 // runPermissionReconcile is the per-directory fail-closed backstop. It does NOT
-// depend on the store's lossy live-tail channel. Lifetime is PROCESS-LIFETIME:
-// the goroutine runs for as long as this daemon owns the aggregator's store.
-// There is no per-re-arm leak because ensurePermissionWatcher registers the
-// sweep exactly once per dir (guarded by watcherOn). A shutdown context is
-// intentionally omitted — on daemon exit the whole process (and the local
-// opencode server it drives) goes away together, so the ticker simply stops.
-func (s *Server) runPermissionReconcile(a *aggregator.Aggregator) {
+// depend on the store's lossy live-tail channel.
+//
+// Lifetime: the DEFAULT dir's sweep ("") is PROCESS-LIFETIME — the goroutine
+// runs for as long as this daemon owns the default aggregator's store, and its
+// ctx is never cancelled by Reload (handleReloadProject skips teardown for the
+// default dir). A NON-DEFAULT dir's sweep is STOPPABLE: stopPermissionWatcher
+// cancels its ctx when handleReloadProject drops that dir's aggregator, so the
+// goroutine exits promptly instead of ticking forever on an orphaned store. On
+// daemon exit the whole process (and the local opencode server it drives) goes
+// away together, so any still-running sweep's ticker simply stops.
+//
+// There is no per-re-arm leak: ensurePermissionWatcher registers the sweep
+// exactly once per dir (guarded by watcherOn), and after Reload clears
+// watcherOn[dir] a subsequent aggFor(dir) re-arms a FRESH sweep.
+func (s *Server) runPermissionReconcile(ctx context.Context, a *aggregator.Aggregator) {
 	ticker := time.NewTicker(permReconcileInterval)
 	defer ticker.Stop()
 	store := a.Store()
@@ -393,9 +415,29 @@ func (s *Server) runPermissionReconcile(a *aggregator.Aggregator) {
 	// One sweep immediately on arming, so a permission already pending at
 	// registration is rejected with ~0 latency instead of waiting a full tick.
 	s.reconcileFailFastPerms(store, client)
-	for range ticker.C {
-		s.reconcileFailFastPerms(store, client)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.reconcileFailFastPerms(store, client)
+		}
 	}
+}
+
+// stopPermissionWatcher stops and clears the per-dir fail-closed permission
+// reconcile sweep for dir. It is a safe no-op if dir has no armed sweep. Called
+// from handleReloadProject's non-default teardown branch so the sweep goroutine
+// exits instead of ticking forever on the dropped aggregator's orphaned store.
+// The DEFAULT dir ("") is never passed here — its sweep is process-lifetime.
+func (s *Server) stopPermissionWatcher(dir string) {
+	s.watcherMu.Lock()
+	defer s.watcherMu.Unlock()
+	if cancel, ok := s.watcherCancel[dir]; ok {
+		cancel()
+		delete(s.watcherCancel, dir)
+	}
+	delete(s.watcherOn, dir)
 }
 
 // reconcileFailFastPerms reads the authoritative store permission set and, for
@@ -495,6 +537,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/vh/sessions", s.handleSessions)
 	mux.HandleFunc("/vh/sessions/closeout", s.handleSessionsCloseout)
 	mux.HandleFunc("/vh/reload", s.handleReload)
+	mux.HandleFunc("/vh/reload-project", s.handleReloadProject)
 	mux.HandleFunc("/vh/restart-opencode", s.handleRestartOpenCode)
 	mux.HandleFunc("/vh/restart-server", s.handleRestartServer)
 	mux.HandleFunc("/vh/running-sessions", s.handleRunningSessions)

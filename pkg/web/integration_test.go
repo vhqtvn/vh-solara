@@ -49,6 +49,20 @@ type fakeOpenCode struct {
 	// existing tests are unaffected. Cold-seed tail GETs carry ?limit= and are
 	// never signalled here.
 	msgFullGetReady chan struct{}
+
+	// disposes records the x-opencode-directory header value seen on each
+	// POST /instance/dispose, in arrival order. The reload-project test asserts
+	// the right project (and only that project) was disposed.
+	disposeMu sync.Mutex
+	disposes  []string
+	// onDispose, when non-nil, is invoked synchronously inside the
+	// /instance/dispose handler (after recording the dir, before returning),
+	// with the x-opencode-directory value. It is the deterministic injection
+	// point for the concurrent-reload test: the handler's caller blocks on the
+	// RPC response, so whatever the hook does (e.g. swap a fresh aggregator
+	// into s.aggs) is guaranteed to have happened before the caller's teardown
+	// recheck. nil (default) = no-op, so existing tests are unaffected.
+	onDispose func(dir string)
 }
 
 func newFake() *fakeOpenCode {
@@ -132,7 +146,36 @@ func (f *fakeOpenCode) handler() http.Handler {
 			}
 		}
 	})
+	// POST /instance/dispose — mirrors OpenCode's per-directory instance-cache
+	// eviction. Records the x-opencode-directory header (the project being
+	// disposed) and returns the upstream success body (a JSON boolean `true`).
+	mux.HandleFunc("/instance/dispose", func(w http.ResponseWriter, r *http.Request) {
+		dir := r.Header.Get("x-opencode-directory")
+		f.disposeMu.Lock()
+		f.disposes = append(f.disposes, dir)
+		hook := f.onDispose
+		f.disposeMu.Unlock()
+		// Run the injection hook (if any) BEFORE responding, so the caller —
+		// which blocks on this RPC — observes the hook's effects when it
+		// resumes into its teardown path. Mirrors the existing msgHold pattern
+		// of making the fake a deterministic rendezvous.
+		if hook != nil {
+			hook(dir)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, "true")
+	})
 	return mux
+}
+
+// disposedDirs returns a snapshot of the x-opencode-directory values seen on
+// each POST /instance/dispose, in arrival order (test assertion helper).
+func (f *fakeOpenCode) disposedDirs() []string {
+	f.disposeMu.Lock()
+	defer f.disposeMu.Unlock()
+	out := make([]string, len(f.disposes))
+	copy(out, f.disposes)
+	return out
 }
 
 func waitFor(t *testing.T, cond func() bool, msg string) {

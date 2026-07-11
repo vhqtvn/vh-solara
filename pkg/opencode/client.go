@@ -247,6 +247,27 @@ func (c *Client) Abort(ctx context.Context, sessionID string) error {
 	return nil
 }
 
+// Dispose evicts this client's project from OpenCode's per-directory instance
+// cache via POST /instance/dispose. It is scoped by the per-client
+// x-opencode-directory header (set in newRequest from c.Directory), so it
+// invalidates exactly ONE project's layered service graph — in-flight requests
+// on that project finish undisturbed on the old instance, and the NEXT request
+// rebuilds the full per-directory graph (including Config.node) fresh from disk,
+// picking up config edits. Other projects are untouched.
+//
+// The method is named after the upstream route (POST /instance/dispose); the
+// user-facing feature is "Reload project" — see pkg/web handleReloadProject.
+func (c *Client) Dispose(ctx context.Context) error {
+	st, b, err := c.postRaw(ctx, "/instance/dispose", nil)
+	if err != nil {
+		return err
+	}
+	if st < 200 || st >= 300 {
+		return statusErr("POST /instance/dispose", st, b)
+	}
+	return nil
+}
+
 // AnswerQuestion replies to a pending question (POST /question/:id/reply). The
 // body is forwarded raw ({"answers": [[...]]}).
 func (c *Client) AnswerQuestion(ctx context.Context, questionID string, body json.RawMessage) error {

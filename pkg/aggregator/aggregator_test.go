@@ -941,3 +941,130 @@ func TestEnsureMessagesSyncSingleFlightWaiter(t *testing.T) {
 		})
 	}
 }
+
+// Stop() is the teardown half of POST /vh/reload-project: it cancels the
+// aggregator's Run context (so the event tail, hydrate, and cold-seed exit) and
+// closes the store's subscribers (so downstream SSE streams drop and browsers
+// reconnect against a fresh aggregator). This test exercises the full lifecycle
+// — RunManaged arms a.cancel, Run runs, Stop() cancels+ closes — and asserts
+// both observable effects: Run returns and a live subscriber's channel closes.
+func TestStopCancelsRunAndClosesSubscribers(t *testing.T) {
+	oc := httptest.NewServer(fixtures.New().Handler())
+	defer oc.Close()
+
+	agg := New(oc.URL, 100)
+
+	// RunManaged derives a cancellable child of the parent ctx and arms a.cancel
+	// internally (this is exactly how aggFor starts a per-project aggregator).
+	done := make(chan struct{})
+	go func() {
+		agg.RunManaged(context.Background())
+		close(done)
+	}()
+
+	// Subscribe and wait until Run has hydrated enough to emit at least one live
+	// event — proof the loop is actually running before we Stop it.
+	ch, unsub := agg.Store().Subscribe(128)
+	defer unsub()
+	deadline := time.Now().Add(3 * time.Second)
+	gotEvent := false
+	for time.Now().Before(deadline) && !gotEvent {
+		select {
+		case <-ch:
+			gotEvent = true
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	if !gotEvent {
+		t.Fatal("aggregator never emitted an event before Stop (Run not running?)")
+	}
+
+	agg.Stop()
+
+	// (1) Run must have exited because a.cancel() cancelled its ctx.
+	select {
+	case <-done:
+		// good
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run did not return after Stop()")
+	}
+
+	// (2) The subscriber channel must be closed (Store.Close): a receive returns
+	// the zero value with ok==false. Drain any buffered events first, then a
+	// fresh receive must show the close.
+	drained := false
+	for !drained {
+		select {
+		case _, ok := <-ch:
+			if !ok {
+				drained = true
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("subscriber channel was not closed by Stop() (Store.Close)")
+		}
+	}
+}
+
+// Stop() must be safe on the DEFAULT aggregator too — the daemon starts the
+// default with plain Run (no a.cancel), so a Stop of it nil-checks cancel and
+// still closes the store. This guards the nil path explicitly (the default
+// aggregator is process-lifetime and is never dropped via handleReloadProject,
+// but Stop must not panic if ever invoked on it).
+func TestStopNilCancelIsSafe(t *testing.T) {
+	oc := httptest.NewServer(fixtures.New().Handler())
+	defer oc.Close()
+
+	agg := New(oc.URL, 100)
+	// Start Run directly (NOT RunManaged) so agg.cancel stays nil — this is the
+	// daemon's default-aggregator start path. The parent ctx is cancellable only
+	// for test cleanup; agg.cancel is never armed.
+	parentCtx, cancelParent := context.WithCancel(context.Background())
+	defer cancelParent()
+	done := make(chan struct{})
+	go func() {
+		agg.Run(parentCtx) // plain Run, like the daemon — leaves cancel nil
+		close(done)
+	}()
+
+	// Wait for Run to be live.
+	ch, unsub := agg.Store().Subscribe(128)
+	defer unsub()
+	deadline := time.Now().Add(3 * time.Second)
+	gotEvent := false
+	for time.Now().Before(deadline) && !gotEvent {
+		select {
+		case <-ch:
+			gotEvent = true
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	if !gotEvent {
+		t.Fatal("default aggregator never emitted an event before Stop")
+	}
+
+	// cancel is nil here; Stop must not panic. It closes the store (subscribers
+	// drop) but does NOT cancel Run (the default has no armed cancel).
+	agg.Stop()
+
+	// Subscriber channel closed by Store.Close.
+	closed := false
+	for !closed {
+		select {
+		case _, ok := <-ch:
+			if !ok {
+				closed = true
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("subscriber channel was not closed by Stop() on default aggregator")
+		}
+	}
+
+	// Clean up the still-running default aggregator (its cancel was nil, so Stop
+	// didn't end Run) via the parent ctx before the server closes.
+	cancelParent()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("default Run did not exit after parent cancel")
+	}
+}

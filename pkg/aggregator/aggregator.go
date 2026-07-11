@@ -28,6 +28,16 @@ type Aggregator struct {
 	// Guarded by seedMu. nil until Run has been called.
 	runCtx context.Context
 
+	// cancel stops the aggregator's Run loop (and everything that derives from
+	// runCtx: the event tail, hydrate, cold-seed, async message fetches). It is
+	// the cancellation half of a project reload (POST /vh/reload-project): the
+	// web layer sets it under aggMu before starting Run, and handleReloadProject
+	// invokes Stop() under aggMu to drop a per-project aggregator without
+	// disturbing the default or any other project. nil for the default
+	// aggregator (process-lifetime, started outside aggFor) and until aggFor
+	// arms it — Stop() nil-checks it.
+	cancel context.CancelFunc
+
 	// seedMu guards seedDone (and runCtx). seedDone is non-nil (and open) while
 	// a background cold-seed goroutine is in flight, nil when none is running.
 	// The cold-seed runs OFF the hydrate hot path (it no longer blocks
@@ -95,6 +105,39 @@ func (a *Aggregator) Store() *state.Store { return a.store }
 
 // Client exposes the underlying OpenCode client (used for write passthrough).
 func (a *Aggregator) Client() *opencode.Client { return a.client }
+
+// Stop tears down this aggregator: cancels its Run context (stopping the event
+// tail, hydrate, cold-seed, and async message fetches) and closes its store's
+// subscribers (forcing downstream SSE streams to exit so browsers reconnect
+// against a fresh aggregator). It is the teardown half of a project reload
+// (POST /vh/reload-project).
+//
+// cancel is armed by aggFor under aggMu before Run starts, so the happens-before
+// edge from a concurrent Stop() (also under aggMu) is established. The default
+// aggregator's cancel is nil (it is started outside aggFor as process-lifetime);
+// Stop() nil-checks it and still closes the store, but the default aggregator is
+// never dropped from the map — see handleReloadProject. Safe to call more than
+// once: a second close of an already-closed channel is avoided because Store.Close
+// clears its subscriber map under the store lock (idempotent).
+func (a *Aggregator) Stop() {
+	if a.cancel != nil {
+		a.cancel()
+	}
+	if a.store != nil {
+		a.store.Close()
+	}
+}
+
+// RunManaged arms a.cancel with a cancellable child of ctx, then blocks on Run.
+// It lets the web layer start a per-project aggregator whose lifetime it can
+// later end via Stop() (POST /vh/reload-project) without the web package having
+// to touch the unexported cancel field. The default aggregator is started by the
+// daemon with plain Run (no cancel) — it is process-lifetime and never dropped.
+func (a *Aggregator) RunManaged(ctx context.Context) {
+	managed, cancel := context.WithCancel(ctx)
+	a.cancel = cancel
+	a.Run(managed)
+}
 
 // SetMsgGateHook installs a TEST-ONLY rendezvous callback fired once per
 // EnsureMessages / EnsureMessagesAsync call immediately after the unlocked

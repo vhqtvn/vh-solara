@@ -172,6 +172,75 @@ func (s *Server) handleReload(w http.ResponseWriter, r *http.Request) {
 	writeJSONResp(w, map[string]any{"ok": true})
 }
 
+// POST /vh/reload-project — evict ONE project's cached OpenCode instance and
+// drop this daemon's aggregator for it, so the NEXT access rebuilds both fresh
+// from disk (picking up config edits) WITHOUT the fleet-wide `opencode serve`
+// restart and WITHOUT disturbing other projects (including the default). The
+// user-facing label is "Reload project"; the upstream route this drives is
+// POST /instance/dispose (see pkg/opencode Client.Dispose).
+//
+// Sequence:
+//  1. Dispose the OpenCode instance cache for dir (in-flight turns finish on
+//     the old instance; the next request rebuilds Config.node fresh).
+//  2. For a NON-default dir (dir != ""): stop the per-dir permission-reconcile
+//     sweep (stopPermissionWatcher), tear this daemon's aggregator down
+//     (a.Stop cancels its Run + closes its store's SSE subscribers) and drop it
+//     from s.aggs so the next aggFor builds a fresh one. Guarded against a
+//     double-dispose race by re-checking s.aggs[dir]==a under aggMu.
+//  3. For the DEFAULT dir (dir == ""): dispose only — the default aggregator is
+//     process-lifetime (held by s.agg and started outside aggFor, so a.cancel is
+//     nil); tearing it down would leave s.agg dangling. The default permission
+//     sweep is likewise process-lifetime (never stopped by Reload). The OpenCode
+//     instance rebuild still applies config edits on the next request.
+func (s *Server) handleReloadProject(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	dir := reqDir(r)
+
+	// Resolve the per-project client so Dispose carries the right
+	// x-opencode-directory header. For a dir we already have an aggregator for,
+	// reuse its client; otherwise build a throwaway client scoped to dir (the
+	// default — dir == "" — falls back to OpenCode's process cwd). The default
+	// aggregator is stored under both s.agg and s.aggs[""], so dir == "" resolves
+	// to it directly.
+	s.aggMu.Lock()
+	a, ok := s.aggs[dir]
+	s.aggMu.Unlock()
+	var client *opencode.Client
+	if ok {
+		client = a.Client()
+	} else {
+		client = opencode.New(s.opencodeURL)
+		client.Directory = dir
+	}
+	if err := client.Dispose(r.Context()); err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	// Teardown is for NON-default projects only (see method doc). For dir == ""
+	// the default aggregator is process-lifetime and must stay.
+	if dir != "" && ok {
+		s.aggMu.Lock()
+		// Re-check under the lock: a concurrent reload for the same dir may have
+		// already swapped the aggregator (T1 deleted `a`, a later aggFor built
+		// `a2` and armed ITS watcher). Only stop the watcher + Stop+delete the
+		// exact aggregator we disposed, so a stale request never disarms a2's
+		// freshly-armed sweep. stopPermissionWatcher nests watcherMu INSIDE
+		// aggMu — the same order aggFor already establishes via its
+		// ensurePermissionWatcher call.
+		if cur := s.aggs[dir]; cur == a {
+			s.stopPermissionWatcher(dir)
+			a.Stop()
+			delete(s.aggs, dir)
+		}
+		s.aggMu.Unlock()
+	}
+	writeJSONResp(w, map[string]any{"ok": true})
+}
+
 // POST /vh/restart-server — restart the vh daemon itself (re-exec, or exit for a
 // supervisor to relaunch). Responds first, then triggers the restart; the client
 // reconnects automatically. OpenCode survives only in detached/external mode.

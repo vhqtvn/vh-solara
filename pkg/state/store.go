@@ -1906,6 +1906,25 @@ func (s *Store) SubscribeWith(buffer int, interest Interest) (<-chan ClientEvent
 	}
 }
 
+// Close tears down all live subscribers: each subscriber's channel is closed
+// and dropped from the registry. This forces downstream SSE handleStream loops
+// (which range over their subscriber channel) to exit cleanly so the browser
+// reconnects and re-snapshots against a freshly-built aggregator. It is the
+// teardown half of a project reload: after the aggregator's Run context is
+// cancelled, Close severs any in-flight client streams for the old store.
+//
+// Safe to call from any goroutine; idempotent (closing an already-closed set is
+// a no-op because the map is cleared under s.mu). New subscribers registered
+// after Close get a fresh, open channel — Close is one-shot, not sticky.
+func (s *Store) Close() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id, sub := range s.subs {
+		close(sub.ch)
+		delete(s.subs, id)
+	}
+}
+
 // MarkPermissionBlocked records that sessionID's automated-spawn permission
 // policy auto-rejected a prompt. This sets an OBSERVABLE FACT (rendered on the
 // gate as PermissionBlocked) — the policy decision lives in the web layer; the

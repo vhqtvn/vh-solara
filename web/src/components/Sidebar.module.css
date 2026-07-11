@@ -1,0 +1,66 @@
+/* Sidebar project-settings dropdown menu. Co-located module per the CSS
+   architecture (docs/ai/web-css-architecture.md): the new dropdown panel is
+   scoped here, while the legacy global .proj-bar / .proj-settings (the gear
+   button styling) stay in styles/legacy/60-notifications-inspector.css. Mirrors
+   the TabBar overflow-menu shape (positioning, tokens, hover) for visual
+   consistency across the two dropdowns. */
+
+/* The gear button's positioning context — the menu anchors to its bottom-right. */
+.wrap {
+  position: relative;
+  flex: 0 0 auto;
+}
+
+.menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 60;
+  min-width: 180px;
+  display: flex;
+  flex-direction: column;
+  padding: 4px;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: var(--shadow-lg, 0 12px 40px #0009);
+}
+
+.menuItem {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  text-align: left;
+  width: 100%;
+  background: transparent;
+  border: 0;
+  color: var(--fg);
+  cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+  padding: 7px 9px;
+  border-radius: 6px;
+}
+.menuItem:hover {
+  background: var(--bg);
+}
+.menuItem:disabled {
+  color: var(--fg-dim);
+  cursor: default;
+  opacity: 0.7;
+}
+.menuItem:disabled:hover {
+  background: transparent;
+}
+
+/* The "Reload project" item's inline status spinner glyph (shown while the
+   dispose POST is in flight). */
+.spinning {
+  display: inline-flex;
+  animation: projReloadSpin 0.8s linear infinite;
+}
+@keyframes projReloadSpin {
+  to {
+    transform: rotate(360deg);
+  }
+}
