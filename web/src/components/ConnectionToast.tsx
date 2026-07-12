@@ -11,6 +11,12 @@ import styles from "./ConnectionToast.module.css";
 // connection, it restarted while you were connected — the merge-protect in
 // applySnapshot already shielded the agent chips, and this toast tells you a
 // re-sync is in flight.
+//
+// TRANSPORT ONLY — this toast reflects the worker SSE stream (sync.ts), NOT
+// OpenCode's own health. "Server restarted" here means the vh-solara daemon,
+// never OpenCode; OpenCode lifecycle (starting/failed/…) is surfaced separately
+// by OpenCodeHealthPanel. Keep the wording topology-agnostic so the two can't
+// be conflated.
 export default function ConnectionToast() {
   const [toast, setToast] = createSignal<{ kind: "warn" | "ok"; text: string } | null>(null);
   let showTimer: number | undefined;
@@ -29,7 +35,9 @@ export default function ConnectionToast() {
       // the subsequent live transition does NOT also fire a "Reconnected".
       consumeEpochChanged();
       warned = false;
-      setToast({ kind: "warn", text: "Server restarted — re-syncing…" });
+      // Say "vh-solara" explicitly so this can't be read as an OpenCode event
+      // (the OpenCodeHealthPanel owns OpenCode lifecycle separately).
+      setToast({ kind: "warn", text: "vh-solara restarted — re-syncing…" });
       hideTimer = window.setTimeout(() => setToast(null), 4000);
       return;
     }

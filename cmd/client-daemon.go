@@ -20,6 +20,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/vhqtvn/vh-solara/pkg/agent"
 	"github.com/vhqtvn/vh-solara/pkg/aggregator"
+	"github.com/vhqtvn/vh-solara/pkg/oclife"
 	"github.com/vhqtvn/vh-solara/pkg/procmgr"
 	"github.com/vhqtvn/vh-solara/pkg/web"
 )
@@ -100,6 +101,15 @@ var clientDaemonCmd = &cobra.Command{
 		// aggregator goroutine and a handle to the embedded web server.
 		var opencodeServeCmd *exec.Cmd
 		var opencodeMu sync.Mutex // serializes restarts of opencodeServeCmd
+		// ocReapDone is closed by the owned-topology reaper goroutine once it has
+		// reaped opencodeServeCmd (the SOLE Wait() caller in normal operation).
+		// restartOpencodeLocked waits on it instead of a racing second Wait().
+		var ocReapDone chan struct{}
+		// ocLife is the worker-local OpenCode lifecycle, served at
+		// /vh/opencode/status. nil outside the WebVH arm. It is the decoupling
+		// hinge: a fatal OpenCode startup failure is recorded here as a failed
+		// state instead of killing the reporting worker.
+		var ocLife *oclife.Lifecycle
 		var vhCancel context.CancelFunc
 		var vhHTTP *http.Server
 		// Managed-project process manager (torn down alongside OpenCode).
@@ -165,6 +175,23 @@ var clientDaemonCmd = &cobra.Command{
 			external := daemonOpenCodeURL != ""
 			var opencodeURL string
 			opencodePort := 0
+
+			// The topology fixes the lifecycle capability posture (owned /
+			// detached / external). It is determined BEFORE any spawn so that a
+			// fatal spawn/listen failure can be recorded in the lifecycle
+			// instead of killing the worker: the whole point of p1-oc-001 is
+			// that a dead OpenCode must NOT take the reporting worker with it.
+			var topo oclife.Topology
+			switch {
+			case external:
+				topo = oclife.TopologyExternal
+			case daemonOpenCodeDetached:
+				topo = oclife.TopologyDetached
+			default:
+				topo = oclife.TopologyOwned
+			}
+			ocLife = oclife.New(topo)
+
 			switch {
 			case external:
 				// External-managed: attach to an already-running OpenCode (e.g. its
@@ -172,9 +199,16 @@ var clientDaemonCmd = &cobra.Command{
 				opencodeURL = strings.TrimRight(daemonOpenCodeURL, "/")
 				log.Printf("Web mode: vh (external OpenCode at %s, web port=%d)", opencodeURL, webPort)
 				if err := waitForURL(opencodeURL+"/session", 30*time.Second); err != nil {
-					log.Fatalf("external OpenCode not reachable at %s: %v", opencodeURL, err)
+					// DECOUPLED: do NOT kill the worker. Record the failure and
+					// keep serving so the operator can diagnose + restart OpenCode
+					// remotely through the tunnel. opencodeURL stays set (the
+					// lazy proxy dials it per-request and surfaces 502).
+					log.Printf("external OpenCode not reachable at %s: %v (worker stays up; opencode status=failed)", opencodeURL, err)
+					ocLife.SetFailed(fmt.Sprintf("external OpenCode not reachable at %s: %v", opencodeURL, err), nil)
+				} else {
+					ocLife.SetReady()
+					log.Printf("Attached to external OpenCode at %s.", opencodeURL)
 				}
-				log.Printf("Attached to external OpenCode at %s.", opencodeURL)
 
 			case daemonOpenCodeDetached:
 				// Managed-but-survivable: reconnect to the OpenCode we spawned
@@ -183,43 +217,82 @@ var clientDaemonCmd = &cobra.Command{
 				if st, ok := readOCState(); ok && ocInstanceOurs(st) {
 					opencodePort = st.Port
 					opencodeURL = fmt.Sprintf("http://127.0.0.1:%d", st.Port)
+					ocLife.SetReady() // reconnected to a known-live instance
+					// Seed the lifecycle ring with the detached disk-log tail so
+					// /vh/opencode/logs reflects recent history after a vh reconnect:
+					// the in-memory ring is fresh on restart, but the process kept
+					// running and accumulating output on disk. Without this the
+					// endpoint returns 200/empty despite HasLogTail=true.
+					seedRingFromDiskLog(ocLife.Ring(), ocLogPath())
 					log.Printf("Web mode: vh (reconnected to our detached OpenCode pid=%d port=%d, web port=%d)", st.PID, st.Port, webPort)
 				} else {
 					opencodePort = freePort()
 					if st, ok := readOCState(); ok && portFree(st.Port) {
 						opencodePort = st.Port // reuse the stable port when free
 					}
-					c, err := startOpenCodeServeDetached(daemonOpenCodeBin, opencodePort, cwd)
-					if err != nil {
-						log.Fatalf("Failed to start detached opencode serve: %v", err)
-					}
-					opencodeServeCmd = c
-					if err := waitForPort(opencodePort, 30*time.Second); err != nil {
-						log.Fatalf("opencode serve failed to listen on port %d: %v", opencodePort, err)
-					}
-					writeOCState(ocState{PID: c.Process.Pid, Port: opencodePort})
+					// Pre-set opencodeURL so a failure below still leaves a
+					// parseable (dead) loopback target for the lazy proxy.
 					opencodeURL = fmt.Sprintf("http://127.0.0.1:%d", opencodePort)
-					log.Printf("Web mode: vh (spawned detached OpenCode pid=%d port=%d, web port=%d)", c.Process.Pid, opencodePort, webPort)
+					// Fan the detached process's output into the lifecycle ring
+					// alongside the per-project disk log (unblocks Slice 2 logs).
+					c, err := startOpenCodeServeDetached(daemonOpenCodeBin, opencodePort, cwd, ocLife.Ring().Writer())
+					if err != nil {
+						log.Printf("Failed to start detached opencode serve: %v (worker stays up; opencode status=failed)", err)
+						ocLife.SetFailed(fmt.Sprintf("failed to start detached opencode serve: %v", err), nil)
+					} else {
+						opencodeServeCmd = c
+						if err := waitForPort(opencodePort, 30*time.Second); err != nil {
+							log.Printf("opencode serve failed to listen on port %d: %v (worker stays up; opencode status=failed)", opencodePort, err)
+							ocLife.SetFailed(fmt.Sprintf("opencode serve failed to listen on port %d: %v", opencodePort, err), nil)
+						} else {
+							writeOCState(ocState{PID: c.Process.Pid, Port: opencodePort})
+							ocLife.SetReady()
+							log.Printf("Web mode: vh (spawned detached OpenCode pid=%d port=%d, web port=%d)", c.Process.Pid, opencodePort, webPort)
+						}
+					}
 				}
 
-			default:
+			default: // owned
 				opencodePort = freePort()
 				log.Printf("Web mode: vh (opencode serve internal port=%d, web port=%d)", opencodePort, webPort)
-				c, err := startOpenCodeServe(daemonOpenCodeBin, opencodePort, cwd)
-				if err != nil {
-					log.Fatalf("Failed to start opencode serve: %v", err)
-				}
-				opencodeServeCmd = c
-				log.Printf("Started opencode serve on port %d (pid=%d)", opencodePort, c.Process.Pid)
-				if err := waitForPort(opencodePort, 30*time.Second); err != nil {
-					log.Fatalf("opencode serve failed to listen on port %d: %v", opencodePort, err)
-				}
-				log.Printf("Verified opencode serve is listening on port %d.", opencodePort)
+				// Pre-set opencodeURL so a failure below still leaves a parseable
+				// (dead) loopback target for the lazy proxy.
 				opencodeURL = fmt.Sprintf("http://127.0.0.1:%d", opencodePort)
+				// Fan the owned process's output into the lifecycle ring alongside
+				// the daemon's stdout (unblocks Slice 2 logs view).
+				c, err := startOpenCodeServe(daemonOpenCodeBin, opencodePort, cwd, ocLife.Ring().Writer())
+				if err != nil {
+					log.Printf("Failed to start opencode serve: %v (worker stays up; opencode status=failed)", err)
+					ocLife.SetFailed(fmt.Sprintf("failed to start opencode serve: %v", err), nil)
+				} else {
+					opencodeServeCmd = c
+					log.Printf("Started opencode serve on port %d (pid=%d)", opencodePort, c.Process.Pid)
+					// Owned reaper: the SOLE Wait() caller for this child during
+					// normal operation. It records a post-startup crash in the
+					// lifecycle (and, as a side effect, populates cmd.ProcessState
+					// so the HealthCheck's existing ProcessState check works —
+					// previously nobody reaped the owned child, so a crash was
+					// never detected). The done channel lets restartOpencodeLocked
+					// observe the reap without a racing second Wait().
+					ocReapDone = make(chan struct{})
+					go reapOwnedOpenCode(c, ocReapDone, ocLife)
+					if err := waitForPort(opencodePort, 30*time.Second); err != nil {
+						log.Printf("opencode serve failed to listen on port %d: %v (worker stays up; opencode status=failed)", opencodePort, err)
+						ocLife.SetFailed(fmt.Sprintf("opencode serve failed to listen on port %d: %v", opencodePort, err), nil)
+					} else {
+						ocLife.SetReady()
+						log.Printf("Verified opencode serve is listening on port %d.", opencodePort)
+					}
+				}
 			}
 			if opencodeURL == "" {
-				log.Fatalf("internal error: opencodeURL not set (no OpenCode target)")
+				// Defensive: every arm above sets a parseable URL (a dead
+				// loopback on failure). If a future arm forgets, fall back
+				// rather than kill the worker — the whole point of this slice.
+				opencodeURL = "http://127.0.0.1:0"
+				log.Printf("internal warning: opencodeURL not set by topology arm; using dead loopback %s", opencodeURL)
 			}
+			ocLife.SetOpenCodeURL(opencodeURL)
 			// A detached OpenCode shares this process's systemd cgroup; with the
 			// default KillMode=control-group a unit restart kills it too. Nudge the
 			// operator to set KillMode=process so detached OpenCode actually survives.
@@ -245,6 +318,10 @@ var clientDaemonCmd = &cobra.Command{
 			// the direct-DB unarchive guard can refuse fast in that topology (the
 			// local DB may not be the remote instance's). See pkg/opencode/db.go.
 			srv.SetExternalOpenCode(external)
+			// Expose the worker-local OpenCode lifecycle at /vh/opencode/status
+			// so the controller/operator can observe a failed OpenCode THROUGH
+			// the tunnel without this worker having died with it.
+			srv.SetOpenCodeLifecycle(ocLife)
 
 			// Managed-project processes + views: discover a checked-in
 			// .vh-solara/project.jsonc, gate it behind explicit per-project trust,
@@ -269,7 +346,9 @@ var clientDaemonCmd = &cobra.Command{
 
 			// restartOpencodeLocked SIGTERMs + reaps the current opencode and
 			// respawns it on the same port; the aggregator's reconnect loop
-			// re-hydrates automatically. Caller must hold opencodeMu.
+			// re-hydrates automatically. Caller must hold opencodeMu. It also
+			// drives the lifecycle state machine (starting → ready | failed) so
+			// /vh/opencode/status reflects the restart outcome.
 			restartOpencodeLocked := func() error {
 				if external {
 					// We don't own the process; restart via the operator's command
@@ -277,14 +356,22 @@ var clientDaemonCmd = &cobra.Command{
 					if daemonOpenCodeRestart == "" {
 						return fmt.Errorf("OpenCode is externally managed; set --opencode-restart-cmd to enable restart from the UI")
 					}
+					ocLife.SetStarting()
 					if err := runShellCmd(context.Background(), daemonOpenCodeRestart, cwd, nil); err != nil {
+						ocLife.SetFailed(fmt.Sprintf("external restart command failed: %v", err), nil)
 						return err
 					}
-					return waitForURL(opencodeURL+"/session", 30*time.Second)
+					if err := waitForURL(opencodeURL+"/session", 30*time.Second); err != nil {
+						ocLife.SetFailed(fmt.Sprintf("external OpenCode not reachable after restart: %v", err), nil)
+						return err
+					}
+					ocLife.SetReady()
+					return nil
 				}
 				if daemonOpenCodeDetached {
 					// Kill the recorded detached instance (we may not hold its *Cmd
 					// after a vh reconnect) and respawn detached on the same port.
+					ocLife.SetStarting()
 					if st, ok := readOCState(); ok {
 						killPID(st.PID)
 					}
@@ -292,27 +379,48 @@ var clientDaemonCmd = &cobra.Command{
 						killPID(opencodeServeCmd.Process.Pid)
 					}
 					time.Sleep(300 * time.Millisecond)
-					c, err := startOpenCodeServeDetached(daemonOpenCodeBin, opencodePort, cwd)
+					c, err := startOpenCodeServeDetached(daemonOpenCodeBin, opencodePort, cwd, ocLife.Ring().Writer())
 					if err != nil {
+						ocLife.SetFailed(fmt.Sprintf("failed to start detached opencode serve: %v", err), nil)
 						return err
 					}
 					opencodeServeCmd = c
 					if err := waitForPort(opencodePort, 30*time.Second); err != nil {
+						ocLife.SetFailed(fmt.Sprintf("opencode serve failed to listen on port %d: %v", opencodePort, err), nil)
 						return err
 					}
 					writeOCState(ocState{PID: c.Process.Pid, Port: opencodePort})
+					ocLife.SetReady()
 					return nil
 				}
+				// Owned. The reaper goroutine is the SOLE Wait() caller, so stop the
+				// current child by signaling + waiting on its reaper-done channel
+				// (NOT a second Wait — that would race the reaper). Then respawn on
+				// the same port and start a fresh reaper for the new child.
+				ocLife.SetStarting()
+				oldDone := ocReapDone
 				if opencodeServeCmd != nil && opencodeServeCmd.Process != nil {
 					_ = opencodeServeCmd.Process.Signal(syscall.SIGTERM)
-					_ = opencodeServeCmd.Wait()
 				}
-				c, err := startOpenCodeServe(daemonOpenCodeBin, opencodePort, cwd)
+				if oldDone != nil {
+					<-oldDone // reaper has reaped the old child; safe to respawn
+				}
+				c, err := startOpenCodeServe(daemonOpenCodeBin, opencodePort, cwd, ocLife.Ring().Writer())
 				if err != nil {
+					ocLife.SetFailed(fmt.Sprintf("failed to start opencode serve: %v", err), nil)
+					opencodeServeCmd = nil
+					ocReapDone = nil
 					return err
 				}
 				opencodeServeCmd = c
-				return waitForPort(opencodePort, 30*time.Second)
+				ocReapDone = make(chan struct{})
+				go reapOwnedOpenCode(c, ocReapDone, ocLife)
+				if err := waitForPort(opencodePort, 30*time.Second); err != nil {
+					ocLife.SetFailed(fmt.Sprintf("opencode serve failed to listen on port %d: %v", opencodePort, err), nil)
+					return err
+				}
+				ocLife.SetReady()
+				return nil
 			}
 
 			if len(daemonCORSOrigins) > 0 {
@@ -476,10 +584,14 @@ var clientDaemonCmd = &cobra.Command{
 				}
 				return true
 			case WebVH:
-				// Dead only if the internal opencode serve process has exited.
-				if opencodeServeCmd != nil && opencodeServeCmd.ProcessState != nil {
-					return false
-				}
+				// The worker's OWN web server is alive as long as this daemon
+				// process is running (it is this process). OpenCode health is a
+				// SEPARATE concern, surfaced via /vh/opencode/status (ocLife) —
+				// a dead OpenCode must NOT take the reporting worker offline.
+				// Returning false here exits the daemon (pkg/agent/daemon.go),
+				// so the old opencodeServeCmd.ProcessState check that coupled
+				// worker death to OpenCode death is deliberately removed as the
+				// core of p1-oc-001's decoupling.
 				return true
 			}
 			return true
@@ -576,8 +688,11 @@ func startOpenCodeWeb(bin, hostname string, port int, password, workspace string
 // startOpenCodeServe launches `opencode serve` headless on a loopback port,
 // returning the started cmd. No server password is set: the internal server is
 // bound to 127.0.0.1 and only reachable through the tunnel, where the controller
-// and nginx enforce auth.
-func startOpenCodeServe(bin string, port int, workspace string) (*exec.Cmd, error) {
+// and nginx enforce auth. When extraW writers are supplied, the process's
+// stdout/stderr are fanned out to them IN ADDITION to the daemon's own stdout —
+// used to mirror output into the OpenCode lifecycle ring (owned topology) so
+// /vh/opencode/logs (Slice 2) can serve a bounded tail from a captured child.
+func startOpenCodeServe(bin string, port int, workspace string, extraW ...io.Writer) (*exec.Cmd, error) {
 	if bin == "" {
 		bin = "opencode"
 	}
@@ -586,8 +701,23 @@ func startOpenCodeServe(bin string, port int, workspace string) (*exec.Cmd, erro
 		cmd.Dir = workspace
 	}
 	cmd.Env = os.Environ()
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	// Fan stdout/stderr to the daemon's inherited stdout AND any extra sinks
+	// (the lifecycle ring). nil sinks are dropped so a caller passing an
+	// explicit nil stays safe; io.MultiWriter panics on a nil Write.
+	sinks := []io.Writer{os.Stdout}
+	for _, w := range extraW {
+		if w != nil {
+			sinks = append(sinks, w)
+		}
+	}
+	if len(sinks) == 1 {
+		cmd.Stdout = sinks[0]
+		cmd.Stderr = sinks[0]
+	} else {
+		mw := io.MultiWriter(sinks...)
+		cmd.Stdout = mw
+		cmd.Stderr = mw
+	}
 
 	// Tie the child's lifetime to the daemon (no orphan on abrupt daemon exit).
 	setDetachedAttrs(cmd)
@@ -628,6 +758,49 @@ func waitForURL(url string, timeout time.Duration) error {
 		time.Sleep(300 * time.Millisecond)
 	}
 	return fmt.Errorf("%s not reachable after %v", url, timeout)
+}
+
+// reapOwnedOpenCode is the SOLE Wait() caller for the owned `opencode serve`
+// child during normal operation. It exists so a POST-STARTUP crash is observed:
+// it records the exit in the lifecycle (so /vh/opencode/status reflects death
+// rather than lying "ready") and, as a side effect, populates cmd.ProcessState
+// (which the old HealthCheck relied on but never got, because nothing reaped
+// the owned child). The done channel is closed once the reap completes, so
+// restartOpencodeLocked can observe it instead of a racing second Wait (a
+// second Wait on the same *Cmd races the first and is a data race).
+//
+// A clean (code 0) exit is recorded as stopped; any other exit (or a Wait
+// error) is recorded as failed with the exit code when observable. life may be
+// nil for callers that only want the reap side effect.
+func reapOwnedOpenCode(cmd *exec.Cmd, done chan struct{}, life *oclife.Lifecycle) {
+	err := cmd.Wait()
+	if done != nil {
+		close(done)
+	}
+	if life == nil {
+		return
+	}
+	var (
+		ec      *int
+		summary string
+	)
+	if cmd.ProcessState != nil {
+		code := cmd.ProcessState.ExitCode()
+		ec = &code
+	}
+	if err != nil {
+		summary = err.Error()
+	}
+	switch {
+	case ec != nil && *ec == 0 && summary == "":
+		life.SetStopped()
+	case summary == "" && ec != nil:
+		life.SetFailed(fmt.Sprintf("opencode serve exited with code %d", *ec), ec)
+	case summary == "":
+		life.SetFailed("opencode serve exited", ec)
+	default:
+		life.SetFailed(summary, ec)
+	}
 }
 
 func init() {

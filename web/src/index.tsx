@@ -5,7 +5,7 @@ import StandaloneCode from "./components/StandaloneCode";
 import { projectDir, startSync, state } from "./sync";
 import { agents, loadAgents } from "./agents";
 import { loadModels, models } from "./models";
-import { pushNotification } from "./notify";
+import { startLifecyclePolling } from "./opencode-lifecycle";
 import { applyTheme } from "./theme";
 import { applyFont, applyMonoFont } from "./font";
 import "./prefs"; // import for side effect: DOM-affecting prefs apply reactively on load
@@ -46,16 +46,13 @@ async function ensureAgentsLoaded() {
     // reload on stream-ready lets the model button appear alongside the agent
     // dropdown and clears the readyToSend gate.
     if (models().length === 0) void loadModels();
-    // Only surface a notice once the retry budget is exhausted — avoid spam on
-    // transient blips. A later reconnect (status → live) re-runs this and may
-    // still recover.
-    if (agents().length === 0) {
-      pushNotification({
-        kind: "info",
-        title: "Couldn't load agents",
-        detail: "OpenCode may not be connected — will retry on reconnect.",
-      });
-    }
+    // NOTE: we intentionally do NOT surface a generic "OpenCode may not be
+    // connected" notification here. OpenCode connectivity/health is owned by
+    // the lifecycle store (opencode-lifecycle.ts) and surfaced by the
+    // OpenCodeHealthPanel — agent loading is a separate concern and can also
+    // fail for non-OC reasons. The retry loop above recovers silently on the
+    // next reconnect; a persistent agent-list failure is rare and not worth a
+    // misleading OC-down banner.
   } finally {
     ensuring = false;
   }
@@ -78,6 +75,12 @@ if (standalone === "code") {
   installScrollEdges();
 } else {
   startSync();
+  // OpenCode lifecycle health polling (independent of the worker SSE stream):
+  // the worker being reachable (state.status "live") only means the vh-solara
+  // worker is up — OpenCode itself may still be starting/failed. This adaptive
+  // poll feeds the OpenCodeHealthPanel which replaces the old generic
+  // "OpenCode may not be connected" inference.
+  startLifecyclePolling();
   void loadModels();
   void loadAgents();
   // Agents and models are project-scoped (OpenCode resolves them per directory).

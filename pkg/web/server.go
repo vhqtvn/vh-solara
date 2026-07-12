@@ -28,6 +28,7 @@ import (
 
 	"github.com/vhqtvn/vh-solara/pkg/aggregator"
 	"github.com/vhqtvn/vh-solara/pkg/auth"
+	"github.com/vhqtvn/vh-solara/pkg/oclife"
 	"github.com/vhqtvn/vh-solara/pkg/opencode"
 	"github.com/vhqtvn/vh-solara/pkg/procmgr"
 	"github.com/vhqtvn/vh-solara/pkg/quota"
@@ -75,6 +76,12 @@ type Server struct {
 	ocVersionFn   func(context.Context) (installed, running, latest string, err error)
 	ocUpdateFn    func(ctx context.Context, w io.Writer) error
 	appVersion    string // this vh-solara build's version (set by the daemon)
+
+	// ocLifecycle is the worker-local OpenCode lifecycle, exposed at
+	// /vh/opencode/status. nil on servers that don't manage an OpenCode (e.g.
+	// the fixture server); the handler returns 503 in that case. Set by the
+	// daemon (client-daemon.go) after the topology is known.
+	ocLifecycle *oclife.Lifecycle
 
 	// corsOrigins is the explicit allowlist of cross-origin callers. Empty =
 	// no CORS (strict same-origin). "*" allows any origin (which disables the
@@ -189,6 +196,13 @@ func (s *Server) SetRestartOpenCode(fn func(context.Context) error) { s.restartO
 // (--opencode-url) rather than spawned/co-located by this daemon. Drives the
 // direct-DB unarchive topology guard in pkg/web/archive.go.
 func (s *Server) SetExternalOpenCode(external bool) { s.externalOC = external }
+
+// SetOpenCodeLifecycle wires the worker-local OpenCode lifecycle so it is
+// reachable at /vh/opencode/status. The lifecycle is the p1-oc-001 decoupling
+// hinge: a fatal OpenCode startup failure is recorded as a failed state here
+// instead of killing the worker, so the operator can observe + restart
+// OpenCode through the tunnel while the worker keeps reporting.
+func (s *Server) SetOpenCodeLifecycle(l *oclife.Lifecycle) { s.ocLifecycle = l }
 
 // SetRestartServer wires the daemon's vh-server-restart hook (re-exec, or exit
 // for a supervisor to relaunch). Optional.
@@ -577,6 +591,20 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/vh/code/highlight.css", s.handleCodeHighlightCSS)
 	mux.HandleFunc("/vh/opencode-version", s.handleOpenCodeVersion)
 	mux.HandleFunc("/vh/update-opencode", s.handleUpdateOpenCode)
+	// OpenCode lifecycle snapshot (owned/detached/external topology + state +
+	// capabilities). GET-only; auth-gated like the other /vh/* routes. This is
+	// the p1-oc-001 decoupling surface: it is served DIRECTLY (no OpenCode
+	// dial), so it answers even when OpenCode has crashed and its port refuses
+	// connections — which is exactly when the operator most needs to see it.
+	mux.HandleFunc("/vh/opencode/status", s.handleOpenCodeStatus)
+	// OpenCode log tail + restart (Slice 2). The log tail is a bounded read of
+	// the lifecycle ring (owned/detached only); restart triggers the daemon's
+	// restartOpencodeLocked via the existing restartOC hook. Both are
+	// capability-aware: an external topology gets 501 (logs) / 405 (restart)
+	// instead of fake data. Auth-gated like the other /vh/* routes; the restart
+	// POST is CSRF-protected by csrfGuard.
+	mux.HandleFunc("/vh/opencode/logs", s.handleOpenCodeLogs)
+	mux.HandleFunc("/vh/opencode/restart", s.handleOpenCodeRestart)
 	mux.HandleFunc("/oc/", s.handlePassthrough)
 	mux.HandleFunc("/", s.handleStatic)
 	// Auth gates everything (login page + session); it sits inside securityHeaders

@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/vhqtvn/vh-solara/pkg/projectcfg"
+	"github.com/vhqtvn/vh-solara/pkg/ringlog"
 	"github.com/vhqtvn/vh-solara/pkg/vhlog"
 )
 
@@ -193,7 +194,7 @@ func (m *Manager) Logs(dir, id string, max int) ([]byte, bool) {
 	if !ok {
 		return nil, false
 	}
-	return p.logs.tail(max), true
+	return p.logs.Tail(max), true
 }
 
 // StopAll gracefully stops every managed process (daemon teardown). Best-effort
@@ -220,7 +221,7 @@ type Proc struct {
 	armMu sync.Mutex // serializes arm() so two callers can't spawn two supervisor loops
 	mu    sync.Mutex
 	spec  ProcSpec
-	logs  *logRing
+	logs  *ringlog.Ring
 	stopF bool // user-requested stop; suppress restart
 
 	ctx     context.Context
@@ -238,7 +239,7 @@ type Proc struct {
 }
 
 func newProc(base context.Context, spec ProcSpec) *Proc {
-	return &Proc{base: base, spec: spec, logs: newLogRing(logCap), status: StatusStopped}
+	return &Proc{base: base, spec: spec, logs: ringlog.New(logCap), status: StatusStopped}
 }
 
 // arm (re)starts the supervisor loop for this proc. armMu serializes the whole
@@ -445,7 +446,7 @@ func (p *Proc) launch(ctx context.Context) (*exec.Cmd, chan struct{}, error) {
 	cmd.WaitDelay = 4 * time.Second
 	// Merge stdout+stderr into the log ring via a shared writer. exec spins up
 	// the copy goroutines and closes them when the process exits.
-	w := &ringWriter{ring: p.logs}
+	w := p.logs.Writer()
 	cmd.Stdout = w
 	cmd.Stderr = w
 	if err := cmd.Start(); err != nil {
@@ -777,7 +778,7 @@ type probe struct {
 	oneShot bool // true for log-readiness: a startup-only signal, not a recurring health check
 }
 
-func newProbe(r *projectcfg.Readiness, logs *logRing) *probe {
+func newProbe(r *projectcfg.Readiness, logs *ringlog.Ring) *probe {
 	if r == nil {
 		return nil
 	}
@@ -803,7 +804,7 @@ func newProbe(r *projectcfg.Readiness, logs *logRing) *probe {
 		// health check would flap a healthy process to "unhealthy". Mark it
 		// oneShot so healthLoop only watches for exit (no re-probing).
 		return &probe{oneShot: true, check: func(ctx context.Context) bool {
-			return re.Match(logs.snapshot())
+			return re.Match(logs.Snapshot())
 		}}
 	}
 	return nil
@@ -831,54 +832,4 @@ func probeHTTP(ctx context.Context, url string) bool {
 	}
 	resp.Body.Close()
 	return resp.StatusCode >= 200 && resp.StatusCode < 300
-}
-
-// --- log ring ---
-
-// ringWriter is an io.Writer that appends raw bytes into a logRing. It backs a
-// process's merged stdout/stderr capture.
-type ringWriter struct{ ring *logRing }
-
-func (w *ringWriter) Write(b []byte) (int, error) {
-	w.ring.append(string(b))
-	return len(b), nil
-}
-
-// logRing is a bounded byte ring (last logCap bytes). Append-only; reads return
-// the tail.
-type logRing struct {
-	mu  sync.Mutex
-	buf []byte
-	cap int
-}
-
-func newLogRing(cap int) *logRing { return &logRing{cap: cap} }
-
-func (l *logRing) append(s string) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.buf = append(l.buf, s...)
-	if len(l.buf) > l.cap {
-		l.buf = append([]byte(nil), l.buf[len(l.buf)-l.cap:]...)
-	}
-}
-
-func (l *logRing) snapshot() []byte {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	out := make([]byte, len(l.buf))
-	copy(out, l.buf)
-	return out
-}
-
-func (l *logRing) tail(max int) []byte {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	b := l.buf
-	if max > 0 && len(b) > max {
-		b = b[len(b)-max:]
-	}
-	out := make([]byte, len(b))
-	copy(out, b)
-	return out
 }

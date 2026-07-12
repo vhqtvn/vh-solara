@@ -21,6 +21,7 @@ import SessionContextMenu from "./components/SessionContextMenu";
 import Tooltip from "./components/Tooltip";
 import UpdateToast from "./components/UpdateToast";
 import ConnectionToast from "./components/ConnectionToast";
+import OpenCodeHealthPanel from "./components/OpenCodeHealthPanel";
 import AdminMenu from "./components/AdminMenu";
 import RestartOverlay from "./components/RestartOverlay";
 import WorkingOverlay from "./components/WorkingOverlay";
@@ -392,6 +393,7 @@ export default function App() {
       <Tooltip />
       <UpdateToast />
       <ConnectionToast />
+      <OpenCodeHealthPanel />
       <RestartOverlay />
       <WorkingOverlay />
       <CommandPalette />

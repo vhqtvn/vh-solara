@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/vhqtvn/vh-solara/pkg/projectcfg"
+	"github.com/vhqtvn/vh-solara/pkg/ringlog"
 )
 
 func TestMain(m *testing.M) {
@@ -415,13 +416,13 @@ func TestProbeUnixAndHTTP(t *testing.T) {
 }
 
 func TestLogsTail(t *testing.T) {
-	r := newLogRing(16)
-	r.append("hello world\n")
-	b := r.tail(5)
+	r := ringlog.New(16)
+	r.Append("hello world\n")
+	b := r.Tail(5)
 	if string(b) != "orld\n" {
 		t.Fatalf("tail = %q", b)
 	}
-	if strings.Contains(string(r.tail(0)), "hello world") == false {
+	if strings.Contains(string(r.Tail(0)), "hello world") == false {
 		t.Fatal("tail(0) should return whole ring")
 	}
 }
