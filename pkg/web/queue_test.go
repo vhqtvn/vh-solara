@@ -1,0 +1,886 @@
+package web
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strconv"
+	"sync"
+	"sync/atomic"
+	"testing"
+
+	"github.com/vhqtvn/vh-solara/pkg/aggregator"
+)
+
+// newTestStore builds a sessionQueueStore rooted at a temp dir so tests get a
+// clean filesystem each run.
+func newTestStore(t *testing.T, sessionID string) (*sessionQueueStore, string) {
+	t.Helper()
+	root := t.TempDir()
+	return &sessionQueueStore{path: queuePath(root, sessionID)}, root
+}
+
+func mustEnqueue(t *testing.T, s *sessionQueueStore, text string) QueueItem {
+	t.Helper()
+	it, err := s.Enqueue(text, nil, QueueSendConfig{}, "")
+	if err != nil {
+		t.Fatalf("Enqueue(%q): %v", text, err)
+	}
+	return it
+}
+
+func TestQueueEnqueuePersistsAndReloads(t *testing.T) {
+	s, root := newTestStore(t, "s1")
+	mustEnqueue(t, s, "first")
+	mustEnqueue(t, s, "second")
+
+	got, err := s.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].Text != "first" || got[1].Text != "second" {
+		t.Fatalf("List = %+v, want [first,second]", got)
+	}
+	for _, it := range got {
+		if it.State != QueuePending {
+			t.Fatalf("state = %s, want pending", it.State)
+		}
+		if it.ID == "" {
+			t.Fatal("backend-issued id is empty")
+		}
+	}
+
+	// Reload from disk: a fresh store pointing at the same file sees both.
+	s2 := &sessionQueueStore{path: queuePath(root, "s1")}
+	got2, err := s2.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got2) != 2 || got2[0].ID != got[0].ID || got2[1].ID != got[1].ID {
+		t.Fatalf("reload lost items or order: %+v", got2)
+	}
+}
+
+func TestQueueFIFOOrdering(t *testing.T) {
+	s, _ := newTestStore(t, "s1")
+	for i := 0; i < 5; i++ {
+		mustEnqueue(t, s, "m"+strconv.Itoa(i))
+	}
+	// Claim must return the oldest pending first, in FIFO order.
+	for i := 0; i < 5; i++ {
+		it, won, err := s.Claim()
+		if err != nil || !won {
+			t.Fatalf("claim %d: won=%v err=%v", i, won, err)
+		}
+		want := "m" + strconv.Itoa(i)
+		if it.Text != want {
+			t.Fatalf("claim %d = %q, want %q (FIFO)", i, it.Text, want)
+		}
+	}
+	// No more pending.
+	_, won, err := s.Claim()
+	if err != nil || won {
+		t.Fatalf("claim after drain: won=%v err=%v", won, err)
+	}
+}
+
+func TestQueueClaimSingleWinner(t *testing.T) {
+	s, _ := newTestStore(t, "s1")
+	mustEnqueue(t, s, "only")
+
+	// Two simultaneous claims: exactly one must win, the other gets nothing.
+	var winners int64
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, won, err := s.Claim()
+			if err != nil {
+				t.Errorf("claim: %v", err)
+				return
+			}
+			if won {
+				atomic.AddInt64(&winners, 1)
+			}
+		}()
+	}
+	wg.Wait()
+	if winners != 1 {
+		t.Fatalf("expected exactly 1 claim winner, got %d", winners)
+	}
+}
+
+func TestQueueConcurrentEnqueuesPreserved(t *testing.T) {
+	s, root := newTestStore(t, "s1")
+	const N = 50
+	var wg sync.WaitGroup
+	for i := 0; i < N; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := s.Enqueue("x", nil, QueueSendConfig{}, ""); err != nil {
+				t.Errorf("enqueue: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+	got, err := s.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != N {
+		t.Fatalf("expected %d items after concurrent enqueue, got %d", N, len(got))
+	}
+	// Orders must be unique and monotonic (no two items share an order).
+	seen := map[uint64]bool{}
+	var prev uint64
+	for _, it := range got {
+		if seen[it.Order] {
+			t.Fatalf("duplicate order %d", it.Order)
+		}
+		seen[it.Order] = true
+		if it.Order < prev {
+			t.Fatalf("orders not monotonic in slice: %d after %d", it.Order, prev)
+		}
+		prev = it.Order
+	}
+	// Reload confirms all N were durable.
+	s2 := &sessionQueueStore{path: queuePath(root, "s1")}
+	got2, _ := s2.List()
+	if len(got2) != N {
+		t.Fatalf("reload lost concurrent items: got %d", len(got2))
+	}
+}
+
+func TestQueueRemoveOnlyPending(t *testing.T) {
+	s, _ := newTestStore(t, "s1")
+	a := mustEnqueue(t, s, "a")
+	b := mustEnqueue(t, s, "b")
+
+	// Claim b's predecessor a → a is now dispatching, not removable.
+	if _, won, err := s.Claim(); err != nil || !won {
+		t.Fatalf("claim: won=%v err=%v", won, err)
+	}
+	if err := s.Remove(a.ID); !errors.Is(err, errQueueNotRemovable) {
+		t.Fatalf("remove dispatching item: err=%v, want errQueueNotRemovable", err)
+	}
+	// b is still pending → removable.
+	if err := s.Remove(b.ID); err != nil {
+		t.Fatalf("remove pending item: %v", err)
+	}
+	got, _ := s.List()
+	if len(got) != 1 || got[0].ID != a.ID {
+		t.Fatalf("after remove, got %+v, want only [a]", got)
+	}
+	// Missing item → not-found.
+	if err := s.Remove("q-does-not-exist"); !errors.Is(err, errQueueNotFound) {
+		t.Fatalf("remove missing: err=%v, want errQueueNotFound", err)
+	}
+}
+
+func TestQueueClaimedItemNotClaimedTwice(t *testing.T) {
+	s, _ := newTestStore(t, "s1")
+	mustEnqueue(t, s, "only")
+	it, won, err := s.Claim()
+	if err != nil || !won {
+		t.Fatalf("first claim: won=%v err=%v", won, err)
+	}
+	// Second claim: nothing pending (the item is dispatching, not pending).
+	_, won2, err := s.Claim()
+	if err != nil || won2 {
+		t.Fatalf("second claim: won=%v err=%v, want no winner", won2, err)
+	}
+	if it.State != QueueDispatching {
+		t.Fatalf("claimed item state = %s, want dispatching", it.State)
+	}
+}
+
+func TestQueueTerminalSurvivesRestart(t *testing.T) {
+	s, root := newTestStore(t, "s1")
+	a := mustEnqueue(t, s, "a")
+	if _, won, err := s.Claim(); err != nil || !won {
+		t.Fatalf("claim: %v", won)
+	}
+	if _, err := s.Resolve(a.ID, QueueFailed, "definitive rejection"); err != nil {
+		t.Fatalf("resolve failed: %v", err)
+	}
+
+	// Reload: the failed item must persist (no time-based cleanup, no repend).
+	s2 := &sessionQueueStore{path: queuePath(root, "s1")}
+	got, err := s2.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].State != QueueFailed || got[0].Detail != "definitive rejection" {
+		t.Fatalf("reload: got %+v, want one failed item with detail", got)
+	}
+}
+
+func TestQueueResolveNeverRepends(t *testing.T) {
+	s, _ := newTestStore(t, "s1")
+	a := mustEnqueue(t, s, "a")
+
+	// Resolving a PENDING item is rejected (must claim first).
+	if _, err := s.Resolve(a.ID, QueueSent, ""); !errors.Is(err, errQueueNotClaimed) {
+		t.Fatalf("resolve pending: err=%v, want errQueueNotClaimed", err)
+	}
+	// A non-terminal target (pending) is rejected outright.
+	if _, _, err := s.resolveTarget(a.ID, QueuePending, ""); !errors.Is(err, errQueueCannotRepend) {
+		t.Fatalf("resolve to pending: err=%v, want errQueueCannotRepend", err)
+	}
+
+	// Claim then resolve sent. Re-resolving to failed/unknown is allowed (idempotent
+	// re-report) but never repends.
+	if _, won, err := s.Claim(); err != nil || !won {
+		t.Fatalf("claim: %v", won)
+	}
+	if _, err := s.Resolve(a.ID, QueueSent, ""); err != nil {
+		t.Fatalf("resolve sent: %v", err)
+	}
+	if _, err := s.Resolve(a.ID, QueueUnknown, "network blip"); err != nil {
+		t.Fatalf("re-resolve terminal→terminal: %v", err)
+	}
+	got, _ := s.List()
+	if got[0].State != QueueUnknown {
+		t.Fatalf("after re-resolve state = %s, want unknown", got[0].State)
+	}
+	// No resolution path can return it to pending.
+	for _, st := range []QueueItemState{QueuePending} {
+		if _, _, err := s.resolveTarget(a.ID, st, ""); !errors.Is(err, errQueueCannotRepend) {
+			t.Fatalf("resolve to %s repended: err=%v", st, err)
+		}
+	}
+}
+
+// resolveTarget wraps Resolve so tests can assert the cannot-repend guard
+// without going through the HTTP layer.
+func (s *sessionQueueStore) resolveTarget(id string, target QueueItemState, detail string) (QueueItem, bool, error) {
+	if !isTerminalState(target) {
+		return QueueItem{}, false, errQueueCannotRepend
+	}
+	it, err := s.Resolve(id, target, detail)
+	return it, err == nil, err
+}
+
+func TestQueueMalformedFileIsExplicitError(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, ".vh-solara", "sessions", "s1")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Write truncated/garbage JSON.
+	if err := os.WriteFile(queuePath(root, "s1"), []byte(`{"items":[{"id":"x","order`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := &sessionQueueStore{path: queuePath(root, "s1")}
+	if _, err := s.List(); err == nil {
+		t.Fatal("List on malformed file: want explicit error, got nil (silent loss)")
+	}
+	// Enqueue must also fail loudly rather than overwriting/losing the bad file.
+	if _, err := s.Enqueue("x", nil, QueueSendConfig{}, ""); err == nil {
+		t.Fatal("Enqueue on malformed file: want explicit error, got nil")
+	}
+}
+
+func TestQueueRegistryDeleteStoreRemovesFile(t *testing.T) {
+	root := t.TempDir()
+	qr := newQueueRegistry()
+	st := qr.store(root, "s1")
+	mustEnqueue(t, st, "a")
+	// File exists.
+	if _, err := os.Stat(queuePath(root, "s1")); err != nil {
+		t.Fatalf("queue.json should exist: %v", err)
+	}
+	qr.deleteStore(root, "s1")
+	// File gone.
+	if _, err := os.Stat(queuePath(root, "s1")); !os.IsNotExist(err) {
+		t.Fatalf("after deleteStore: want not-exist, got %v", err)
+	}
+	// deleteStore on a never-loaded session still removes any file on disk.
+	if err := os.MkdirAll(filepath.Dir(queuePath(root, "s2")), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(queuePath(root, "s2"), []byte(`{"order":0,"items":[]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	qr.deleteStore(root, "s2")
+	if _, err := os.Stat(queuePath(root, "s2")); !os.IsNotExist(err) {
+		t.Fatalf("deleteStore never-loaded: want not-exist, got %v", err)
+	}
+}
+
+// --- HTTP-level smoke (CSRF, routing, response shapes) -----------------------
+
+func newQueueTestServer(t *testing.T) (*httptest.Server, string) {
+	t.Helper()
+	root := t.TempDir()
+	oc := httptest.NewServer(http.NotFoundHandler())
+	t.Cleanup(oc.Close)
+	agg := aggregator.New(oc.URL, 100)
+	srv, err := NewServer(agg, oc.URL, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Override the project root resolution to the temp dir by setting the
+	// daemon cwd: projectRoot("") returns os.Getwd(), so chdir into root makes
+	// the default project resolve there.
+	t.Chdir(root)
+	web := httptest.NewServer(srv.Handler())
+	t.Cleanup(web.Close)
+	return web, root
+}
+
+func csrfPost(t *testing.T, url string, body any) *http.Response {
+	t.Helper()
+	b, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(b))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(csrfHeader, "1")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp
+}
+
+func TestQueueHTTPCSRFEnforced(t *testing.T) {
+	web, _ := newQueueTestServer(t)
+	// POST without CSRF header → 403.
+	b, _ := json.Marshal(map[string]any{"text": "hi"})
+	resp, err := http.Post(web.URL+"/vh/session/s1/queue", "application/json", bytes.NewReader(b))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("POST without CSRF: got %d, want 403", resp.StatusCode)
+	}
+}
+
+func TestQueueHTTPEndpointRoundTrip(t *testing.T) {
+	web, root := newQueueTestServer(t)
+	sid := "s1"
+
+	// Enqueue two.
+	r1 := csrfPost(t, web.URL+"/vh/session/"+sid+"/queue", map[string]any{"text": "first", "originClientId": "browser-A"})
+	defer r1.Body.Close()
+	if r1.StatusCode != 200 {
+		b, _ := io.ReadAll(r1.Body)
+		t.Fatalf("enqueue 1: %d %s", r1.StatusCode, b)
+	}
+	var enq1 struct {
+		Item QueueItem `json:"item"`
+	}
+	if err := json.NewDecoder(r1.Body).Decode(&enq1); err != nil {
+		t.Fatal(err)
+	}
+	r2 := csrfPost(t, web.URL+"/vh/session/"+sid+"/queue", map[string]any{"text": "second"})
+	defer r2.Body.Close()
+	if r2.StatusCode != 200 {
+		t.Fatalf("enqueue 2: %d", r2.StatusCode)
+	}
+
+	// List.
+	resp, err := http.Get(web.URL + "/vh/session/" + sid + "/queue")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var list struct {
+		Items []QueueItem `json:"items"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Items) != 2 {
+		t.Fatalf("list: got %d items, want 2", len(list.Items))
+	}
+	if list.Items[0].OriginClientID != "browser-A" {
+		t.Fatalf("originClientId not echoed: %+v", list.Items[0])
+	}
+
+	// Claim returns the oldest (first).
+	cr := csrfPost(t, web.URL+"/vh/session/"+sid+"/queue/claim", map[string]any{})
+	defer cr.Body.Close()
+	var claim struct {
+		Item QueueItem `json:"item"`
+	}
+	if err := json.NewDecoder(cr.Body).Decode(&claim); err != nil {
+		t.Fatal(err)
+	}
+	if claim.Item.Text != "first" {
+		t.Fatalf("claim returned %q, want first (FIFO)", claim.Item.Text)
+	}
+
+	// Claim again → null item (second is still pending! claim only takes the
+	// oldest pending; after claiming first, second is now the oldest pending).
+	// So a second claim SHOULD return "second", not null. Verify it does.
+	cr2 := csrfPost(t, web.URL+"/vh/session/"+sid+"/queue/claim", map[string]any{})
+	defer cr2.Body.Close()
+	var claim2 struct {
+		Item *QueueItem `json:"item"`
+	}
+	if err := json.NewDecoder(cr2.Body).Decode(&claim2); err != nil {
+		t.Fatal(err)
+	}
+	if claim2.Item == nil || claim2.Item.Text != "second" {
+		t.Fatalf("second claim: got %+v, want second", claim2.Item)
+	}
+
+	// Third claim → null (nothing pending).
+	cr3 := csrfPost(t, web.URL+"/vh/session/"+sid+"/queue/claim", map[string]any{})
+	defer cr3.Body.Close()
+	var claim3 struct {
+		Item *QueueItem `json:"item"`
+	}
+	if err := json.NewDecoder(cr3.Body).Decode(&claim3); err != nil {
+		t.Fatal(err)
+	}
+	if claim3.Item != nil {
+		t.Fatalf("third claim: got %+v, want null", claim3.Item)
+	}
+
+	// Resolve the first (dispatching) as failed.
+	rr := csrfPost(t, web.URL+"/vh/session/"+sid+"/queue/"+claim.Item.ID+"/resolve", map[string]any{"state": "failed", "detail": "rejected"})
+	defer rr.Body.Close()
+	if rr.StatusCode != 200 {
+		b, _ := io.ReadAll(rr.Body)
+		t.Fatalf("resolve failed: %d %s", rr.StatusCode, b)
+	}
+
+	// Resolve to pending → 400 (cannot repend).
+	rrBad := csrfPost(t, web.URL+"/vh/session/"+sid+"/queue/"+claim.Item.ID+"/resolve", map[string]any{"state": "pending"})
+	defer rrBad.Body.Close()
+	if rrBad.StatusCode != 400 {
+		t.Fatalf("resolve to pending: got %d, want 400", rrBad.StatusCode)
+	}
+
+	// Remove a dispatching item → 409.
+	req, _ := http.NewRequest(http.MethodDelete, web.URL+"/vh/session/"+sid+"/queue/"+claim.Item.ID, nil)
+	req.Header.Set(csrfHeader, "1")
+	dr, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dr.Body.Close()
+	if dr.StatusCode != http.StatusConflict {
+		t.Fatalf("remove dispatching: got %d, want 409", dr.StatusCode)
+	}
+
+	// The queue file is durable on disk (archive cleanup is exercised at the
+	// store/registry level in TestQueueRegistryDeleteStoreRemovesFile; the HTTP
+	// archive path requires a live session in the aggregator store, which is
+	// out of scope for the queue store contract).
+	if _, err := os.Stat(queuePath(root, sid)); err != nil {
+		t.Fatalf("queue.json should be durable on disk: %v", err)
+	}
+}
+
+// TestQueueRegistryConcurrentArchiveVsEnqueueNoResurrection is the regression
+// guard for B2: a concurrent archive (deleteStore) vs enqueue must not
+// RESURRECT the deleted queue nor silently lose a durably-enqueued item.
+//
+// Buggy mechanism (pre-fix): deleteStore acquired qr.mu, removed the map entry,
+// RELEASED qr.mu, then acquired the OLD st.mu and os.Remove'd the file. A
+// concurrent store()/Enqueue (needing qr.mu, now free) created a NEW
+// sessionQueueStore at the same path, lazily load()ed the STILL-EXISTING file
+// (picking up the seeded items), enqueued, and save()d — writing the old items
+// back to disk (resurrection) or being deleted by a late os.Remove (silent
+// loss). The NEW store had a DIFFERENT mutex than the OLD st, so locking only
+// st.mu did nothing to block the racer.
+//
+// The fix holds qr.mu across BOTH the map-removal AND os.Remove, so store()
+// cannot create a new entry until deleteStore fully completes. This test fires
+// the race in a loop and asserts the resurrection invariant holds: after
+// deleteStore has completed, NONE of the pre-archive seeded items may appear on
+// disk, and every on-disk item is a legitimately post-archive enqueue.
+func TestQueueRegistryConcurrentArchiveVsEnqueueNoResurrection(t *testing.T) {
+	const iterations = 50 // many shots at the window; pre-fix resurrects quickly
+	for iter := 0; iter < iterations; iter++ {
+		root := t.TempDir()
+		qr := newQueueRegistry()
+
+		// Seed items durably — these are the "resurrection bait". Without the
+		// fix, a racer's new store load()s them from the not-yet-removed file.
+		seed := qr.store(root, "s1")
+		seedIDs := make(map[string]bool)
+		for i := 0; i < 3; i++ {
+			it := mustEnqueue(t, seed, "seed-"+strconv.Itoa(iter)+"-"+strconv.Itoa(i))
+			seedIDs[it.ID] = true
+		}
+
+		// Race ONE archive against MANY enqueues. Race items use a distinct text
+		// prefix so we can tell them apart from resurrected seed items on disk.
+		const racers = 60
+		var wg sync.WaitGroup
+		wg.Add(1 + racers)
+		go func() {
+			defer wg.Done()
+			qr.deleteStore(root, "s1")
+		}()
+		successfulRaceTexts := make([][]string, racers)
+		var mu sync.Mutex
+		for g := 0; g < racers; g++ {
+			g := g
+			text := "race-" + strconv.Itoa(iter) + "-" + strconv.Itoa(g)
+			go func() {
+				defer wg.Done()
+				s := qr.store(root, "s1")
+				if _, err := s.Enqueue(text, nil, QueueSendConfig{}, ""); err == nil {
+					mu.Lock()
+					successfulRaceTexts[g] = []string{text}
+					mu.Unlock()
+				}
+			}()
+		}
+		wg.Wait()
+
+		// Reload from disk via a FRESH store (bypassing the registry cache) to
+		// read the authoritative on-disk state, not a stale in-memory copy.
+		fresh := &sessionQueueStore{path: queuePath(root, "s1")}
+		list, err := fresh.List()
+		if err != nil {
+			t.Fatalf("iter %d: reload after race: %v", iter, err)
+		}
+
+		// Build the set of legitimately-successful race texts (some enqueues
+		// may have errored if they hit the malformed/reload path — none should
+		// here, but be defensive).
+		okRace := map[string]bool{}
+		for _, texts := range successfulRaceTexts {
+			for _, tx := range texts {
+				okRace[tx] = true
+			}
+		}
+
+		// Invariant 1 (no resurrection): no seeded item may be on disk after
+		// deleteStore completed. Pre-fix this fired when a racer's new store
+		// load()ed the seeded file during the archive window and save()d it back.
+		for _, it := range list {
+			if seedIDs[it.ID] {
+				t.Fatalf("iter %d: RESURRECTION — seeded item %q present on disk after archive (deleteStore window not closed by registry lock)", iter, it.Text)
+			}
+		}
+
+		// Invariant 2 (no phantom): every on-disk item must be a legitimately
+		// successful race enqueue. No item may appear on disk that no goroutine
+		// durably committed. (A successful enqueue that was later deleted by
+		// archive is simply absent — that is correct, not a loss.)
+		for _, it := range list {
+			if !okRace[it.Text] {
+				t.Fatalf("iter %d: PHANTOM — on-disk item %q was not a successful enqueue", iter, it.Text)
+			}
+		}
+	}
+}
+
+// TestQueueRegistryArchiveAfterEnqueuePreservesPostArchiveEnqueue is the
+// deterministic complement to the race test above: when an enqueue strictly
+// FOLLOWS a completed deleteStore, it MUST be durable on disk (no silent loss).
+// This pins the post-fix serial behavior: store() creates a fresh empty store
+// (load finds no file), enqueues, and saves — the item survives.
+func TestQueueRegistryArchiveAfterEnqueuePreservesPostArchiveEnqueue(t *testing.T) {
+	root := t.TempDir()
+	qr := newQueueRegistry()
+	st := qr.store(root, "s1")
+	mustEnqueue(t, st, "before-archive")
+	// Archive deletes the seeded item + the file.
+	qr.deleteStore(root, "s1")
+	if _, err := os.Stat(queuePath(root, "s1")); !os.IsNotExist(err) {
+		t.Fatalf("after deleteStore: want not-exist, got %v", err)
+	}
+	// An enqueue strictly after archive must survive (fresh store, no file →
+	// load is empty → enqueue → save creates a new file with exactly this item).
+	st2 := qr.store(root, "s1")
+	it, err := st2.Enqueue("after-archive", nil, QueueSendConfig{}, "")
+	if err != nil {
+		t.Fatalf("enqueue after archive: %v", err)
+	}
+	fresh := &sessionQueueStore{path: queuePath(root, "s1")}
+	list, err := fresh.List()
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if len(list) != 1 || list[0].ID != it.ID || list[0].Text != "after-archive" {
+		t.Fatalf("post-archive enqueue lost or resurrected: %+v", list)
+	}
+	// The pre-archive item MUST NOT have resurrected.
+	for _, x := range list {
+		if x.Text == "before-archive" {
+			t.Fatalf("pre-archive item resurrected after deleteStore: %+v", x)
+		}
+	}
+}
+
+// TestQueueResolveRollsBackOnSaveFailure pins D1: Resolve mutates State/Detail/
+// ResolvedAt in memory before save(); a save failure must restore the prior
+// terminal state so the in-memory view stays consistent with disk (mirrors
+// Enqueue/Claim rollback). We force a save failure by pointing the store path
+// at an unwritable location (a path whose parent dir cannot be created).
+func TestQueueResolveRollsBackOnSaveFailure(t *testing.T) {
+	root := t.TempDir()
+	qr := newQueueRegistry()
+	st := qr.store(root, "s1")
+	a := mustEnqueue(t, st, "a")
+	if _, won, err := st.Claim(); err != nil || !won {
+		t.Fatalf("claim: won=%v err=%v", won, err)
+	}
+	if _, err := st.Resolve(a.ID, QueueSent, "first-ok"); err != nil {
+		t.Fatalf("resolve sent: %v", err)
+	}
+	got, _ := st.List()
+	if got[0].State != QueueSent || got[0].Detail != "first-ok" {
+		t.Fatalf("precondition: want sent/first-ok, got %+v", got[0])
+	}
+
+	// Corrupt the on-disk file so the NEXT save (writeQueueAtomic does
+	// MkdirAll(dir) — make the queue path's parent a FILE so MkdirAll fails).
+	// This makes save() return an error without touching the item fields.
+	parent := filepath.Dir(st.path)
+	if err := os.RemoveAll(parent); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(parent, []byte("blocker"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Resolve to a NEW terminal state; save() must fail and the in-memory item
+	// must roll back to the prior sent/first-ok (not unknown/second).
+	if _, err := st.Resolve(a.ID, QueueUnknown, "second"); err == nil {
+		t.Fatal("resolve: want save error from blocked parent dir, got nil")
+	}
+	got2, _ := st.List()
+	if len(got2) != 1 {
+		t.Fatalf("rollback: want 1 item, got %d", len(got2))
+	}
+	if got2[0].State != QueueSent || got2[0].Detail != "first-ok" {
+		t.Fatalf("rollback failed: want sent/first-ok, got state=%s detail=%q", got2[0].State, got2[0].Detail)
+	}
+	if got2[0].ResolvedAt != got[0].ResolvedAt {
+		t.Fatalf("rollback failed: ResolvedAt changed %d -> %d", got[0].ResolvedAt, got2[0].ResolvedAt)
+	}
+}
+
+// TestQueueRemoveRollsBackOnSaveFailure pins F2: Remove mutates the in-memory
+// slice (shortens it) before save(); a save failure must restore the pre-remove
+// slice so the in-memory view stays consistent with disk (mirrors the
+// Resolve/Enqueue/Claim rollback pattern). Without rollback, a save failure
+// would leave memory without the item while disk still has it, and a later
+// successful mutation would persist the shortened slice — silently deleting an
+// item whose remove request failed. We force a save failure by making the queue
+// path's parent dir unwritable (a file where a dir is expected → MkdirAll fails).
+func TestQueueRemoveRollsBackOnSaveFailure(t *testing.T) {
+	root := t.TempDir()
+	qr := newQueueRegistry()
+	st := qr.store(root, "s1")
+	a := mustEnqueue(t, st, "a")
+	b := mustEnqueue(t, st, "b")
+
+	// Precondition: two pending items present.
+	got, _ := st.List()
+	if len(got) != 2 {
+		t.Fatalf("precondition: want 2 items, got %d", len(got))
+	}
+
+	// Block save() by replacing the queue path's parent dir with a file so
+	// writeQueueAtomic's MkdirAll fails. This makes save() return an error
+	// without touching the item fields (same mechanism as the Resolve test).
+	parent := filepath.Dir(st.path)
+	if err := os.RemoveAll(parent); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(parent, []byte("blocker"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Remove a pending item; save() must fail and the in-memory item must roll
+	// back so both items are still present.
+	if err := st.Remove(a.ID); err == nil {
+		t.Fatal("remove: want save error from blocked parent dir, got nil")
+	}
+	got2, _ := st.List()
+	if len(got2) != 2 {
+		t.Fatalf("rollback: want 2 items still present, got %d", len(got2))
+	}
+	ids := map[string]bool{got2[0].ID: true, got2[1].ID: true}
+	if !ids[a.ID] || !ids[b.ID] {
+		t.Fatalf("rollback failed: want both a(%q) and b(%q) present, got %+v", a.ID, b.ID, got2)
+	}
+
+	// A subsequent successful operation can still see the item: unblock the dir
+	// and claim the oldest pending (a) — it must succeed, proving the rolled-
+	// back item is genuinely still in the store and operational.
+	if err := os.Remove(parent); err != nil {
+		t.Fatal(err)
+	}
+	it, won, err := st.Claim()
+	if err != nil || !won {
+		t.Fatalf("claim after rollback: won=%v err=%v", won, err)
+	}
+	if it.ID != a.ID {
+		t.Fatalf("claim after rollback: got %q, want oldest pending a(%q)", it.ID, a.ID)
+	}
+}
+
+// TestQueueArchivedStoreRejectsRetainedPointer is the deterministic BLK-1
+// regression guard. The bug: handleQueueEnqueue resolves s.queues.store(root,
+// sid) — which acquires+releases qr.mu and returns a *sessionQueueStore — and
+// THEN calls Enqueue (which acquires st.mu). During that gap a concurrent
+// deleteStore (archive) can fully complete: it takes qr.mu, removes the map
+// entry, takes st.mu, os.Removes queue.json, releases both. The retained
+// pointer's Enqueue then proceeds: loaded==true so it appends to the STALE
+// pre-archive s.items and save() writes queue.json back into existence —
+// resurrecting archived-away messages plus the new item.
+//
+// The B2 race test (TestQueueRegistryConcurrentArchiveVsEnqueueNoResurrection)
+// misses this because it re-looks-up via store() each iteration rather than
+// HOLDING a pointer across the archive boundary. This test holds the pointer.
+//
+// The fix: deleteStore sets st.archived=true (the tombstone) under BOTH qr.mu
+// and st.mu before map removal + os.Remove; every mutation checks `archived`
+// right after acquiring st.mu and returns errQueueArchived without mutating or
+// save()ing — so a retained pointer can no longer resurrect.
+func TestQueueArchivedStoreRejectsRetainedPointer(t *testing.T) {
+	root := t.TempDir()
+	qr := newQueueRegistry()
+	sid := "s1"
+
+	// 1. Seed a store with N items via store().Enqueue and confirm queue.json
+	//    exists with them.
+	const seedN = 3
+	seedIDs := make([]string, 0, seedN)
+	for i := 0; i < seedN; i++ {
+		it := mustEnqueue(t, qr.store(root, sid), "seed-"+strconv.Itoa(i))
+		seedIDs = append(seedIDs, it.ID)
+	}
+	if _, err := os.Stat(queuePath(root, sid)); err != nil {
+		t.Fatalf("queue.json should exist after seeding: %v", err)
+	}
+
+	// 2. Obtain a retained pointer via store(root, sid). This is the pointer
+	//    the handler holds across the archive gap (BLK-1).
+	st := qr.store(root, sid)
+
+	// 3. deleteStore simulates archive: tombstones st and removes the file.
+	qr.deleteStore(root, sid)
+
+	// 4. Enqueue on the RETAINED st pointer must return errQueueArchived (not
+	//    append, not save, not resurrect).
+	if _, err := st.Enqueue("retained-pointer", nil, QueueSendConfig{}, ""); !errors.Is(err, errQueueArchived) {
+		t.Fatalf("retained Enqueue after archive: err=%v, want errQueueArchived", err)
+	}
+
+	// 5. queue.json must NOT exist on disk — no resurrection.
+	if _, err := os.Stat(queuePath(root, sid)); !os.IsNotExist(err) {
+		t.Fatalf("BLK-1 RESURRECTION: queue.json exists after retained-pointer Enqueue (err=%v); tombstone failed to block save()", err)
+	}
+
+	// 6. The same retained-pointer gap applies to Claim/Resolve/Remove: each
+	//    acquires only st.mu, so each must observe archived==true and refuse.
+	if _, _, err := st.Claim(); !errors.Is(err, errQueueArchived) {
+		t.Fatalf("retained Claim after archive: err=%v, want errQueueArchived", err)
+	}
+	if _, err := st.Resolve(seedIDs[0], QueueSent, ""); !errors.Is(err, errQueueArchived) {
+		t.Fatalf("retained Resolve after archive: err=%v, want errQueueArchived", err)
+	}
+	if err := st.Remove(seedIDs[0]); !errors.Is(err, errQueueArchived) {
+		t.Fatalf("retained Remove after archive: err=%v, want errQueueArchived", err)
+	}
+	// Resolve to a non-terminal target still returns errQueueCannotRepend
+	// (checked before lock acquisition) — confirms the archived check does not
+	// shadow the cannot-repend guard.
+	if _, err := st.Resolve(seedIDs[0], QueuePending, ""); !errors.Is(err, errQueueCannotRepend) {
+		t.Fatalf("retained Resolve to pending: err=%v, want errQueueCannotRepend (checked pre-lock)", err)
+	}
+
+	// 7. A FRESH store() lookup AFTER deleteStore creates a brand-new
+	//    sessionQueueStore (archived==false, loaded==false) — correct
+	//    post-archive behavior, NOT tombstoned. Its Enqueue load()s (no file →
+	//    empty), appends, save()s → a new queue.json with ONLY the new item.
+	freshIt, err := qr.store(root, sid).Enqueue("after-archive", nil, QueueSendConfig{}, "")
+	if err != nil {
+		t.Fatalf("fresh post-archive Enqueue: %v", err)
+	}
+	fresh := &sessionQueueStore{path: queuePath(root, sid)}
+	list, err := fresh.List()
+	if err != nil {
+		t.Fatalf("fresh reload: %v", err)
+	}
+	if len(list) != 1 || list[0].ID != freshIt.ID || list[0].Text != "after-archive" {
+		t.Fatalf("fresh post-archive queue = %+v, want only [after-archive]", list)
+	}
+	for _, x := range list {
+		for _, sid := range seedIDs {
+			if x.ID == sid {
+				t.Fatalf("BLK-1 RESURRECTION: seeded item %q present in fresh post-archive queue", x.Text)
+			}
+		}
+	}
+}
+
+// TestQueueArchivedStoreConcurrentNoResurrection is the -race concurrency
+// variant of BLK-1: a goroutine HOLDS a retained store pointer and enqueues
+// against it while another goroutine calls deleteStore. Under the tombstone
+// fix, the retained Enqueue either (a) completes before deleteStore tombstones
+// (file then removed by archive — correct), or (b) observes archived==true and
+// returns errQueueArchived. It must NEVER resurrect the archived-away seeded
+// items on disk. The deterministic test above is the primary guard; this
+// variant exercises the race detector and the resurrection invariant in a loop.
+func TestQueueArchivedStoreConcurrentNoResurrection(t *testing.T) {
+	const iterations = 40
+	for iter := 0; iter < iterations; iter++ {
+		root := t.TempDir()
+		qr := newQueueRegistry()
+		sid := "s1"
+
+		// Seed items durably — resurrection bait.
+		seed := qr.store(root, sid)
+		seedIDs := make(map[string]bool)
+		for i := 0; i < 3; i++ {
+			it := mustEnqueue(t, seed, "seed-"+strconv.Itoa(iter)+"-"+strconv.Itoa(i))
+			seedIDs[it.ID] = true
+		}
+
+		// Retained pointer held across the archive boundary (the BLK-1 gap).
+		st := qr.store(root, sid)
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_, _ = st.Enqueue("retained", nil, QueueSendConfig{}, "")
+		}()
+		go func() {
+			defer wg.Done()
+			qr.deleteStore(root, sid)
+		}()
+		wg.Wait()
+
+		// Reload the authoritative on-disk state via a fresh store (bypassing
+		// the registry cache). If queue.json does not exist, archive won —
+		// correct. If it exists, every item must be the retained enqueue (never
+		// a seeded item).
+		fresh := &sessionQueueStore{path: queuePath(root, sid)}
+		list, err := fresh.List()
+		if err != nil {
+			t.Fatalf("iter %d: reload: %v", iter, err)
+		}
+		for _, it := range list {
+			if seedIDs[it.ID] {
+				t.Fatalf("iter %d: BLK-1 RESURRECTION — seeded item %q on disk after concurrent archive+retained-enqueue", iter, it.Text)
+			}
+		}
+	}
+}

@@ -4,7 +4,7 @@
 import type { Session } from "./types";
 import { openSession, selectedId, setSelectedId } from "./sync";
 import { clearReadAnchors } from "./lib/scroll";
-import { clearQueue } from "./queue";
+import { clearQueueCache } from "./queue";
 import { markRead } from "./notify";
 
 export interface ArchivedLevel {
@@ -35,11 +35,13 @@ export async function archiveSession(id: string): Promise<string[]> {
   }
   const j = await res.json().catch(() => ({}));
   const affected: string[] = j.affected || [];
-  // Archived sessions leave the live tree for good — drop their saved read
-  // anchors and any queued messages so the persistent stores stay minimal.
+  // Archived sessions leave the live tree for good — the backend deletes their
+  // queue state server-side (handleArchive clears .vh-solara/sessions/<id>/queue.json
+  // for each affected session). Here we just prune the local cache so the UI
+  // drops them immediately; this is NOT a write to queue authority.
   if (affected.length) {
     clearReadAnchors(affected);
-    clearQueue(affected);
+    clearQueueCache(affected);
     // Archived sessions are gone from the live tree — ack any notifications for
     // them (finished, waiting, etc.) so they don't linger as unread.
     markRead((n) => affected.includes(n.sessionID || ""));

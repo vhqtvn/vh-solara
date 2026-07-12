@@ -88,6 +88,11 @@ type Server struct {
 	// idem dedups typed write verbs by their idempotency_key (A1).
 	idem *idemCache
 
+	// queues is the backend-authoritative per-session message queue registry,
+	// keyed by (project root, sessionID). One store per session; lazy-loaded;
+	// durable via .vh-solara/sessions/<id>/queue.json. See queue.go.
+	queues *queueRegistry
+
 	// failFast is the set of sessionIDs whose spawn requested the fail-closed
 	// permission policy (unattended/automated spawning): when such a session
 	// raises a permission prompt, the permission watcher auto-rejects it (never
@@ -246,6 +251,7 @@ func NewServer(agg *aggregator.Aggregator, opencodeURL string, ringCapacity int)
 		idem:          newIdemCache(10 * time.Minute),
 		features:      defaultFeatures(),
 		views:         newViewRegistry(),
+		queues:        newQueueRegistry(),
 		failFast:      map[string]struct{}{},
 		watcherOn:     map[string]bool{},
 		watcherCancel: map[string]context.CancelFunc{},
@@ -526,6 +532,15 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/vh/quota", s.handleQuota)
 	mux.HandleFunc("/vh/archive", s.handleArchive)
 	mux.HandleFunc("/vh/unarchive", s.handleArchive)
+	// Backend-authoritative per-session message queue (GET/POST list+enqueue,
+	// claim, resolve, delete). Under /vh/* (beside the other write verbs), NOT
+	// under /oc/* which stays a transparent proxy. Method-routed via Go 1.22
+	// patterns; CSRF is enforced by csrfGuard on the unsafe methods.
+	mux.HandleFunc("GET /vh/session/{sessionId}/queue", s.handleQueueList)
+	mux.HandleFunc("POST /vh/session/{sessionId}/queue", s.handleQueueEnqueue)
+	mux.HandleFunc("DELETE /vh/session/{sessionId}/queue/{itemId}", s.handleQueueRemove)
+	mux.HandleFunc("POST /vh/session/{sessionId}/queue/claim", s.handleQueueClaim)
+	mux.HandleFunc("POST /vh/session/{sessionId}/queue/{itemId}/resolve", s.handleQueueResolve)
 	// Feature modules (B) — the coordination write verbs (A1) are the first one.
 	s.mountFeatures(mux)
 	mux.HandleFunc("/vh/ack", s.handleAck)

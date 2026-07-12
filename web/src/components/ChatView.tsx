@@ -14,7 +14,8 @@ import { highlightInput } from "../lib/composerHighlight";
 import { chooseVariant, findModel, loadModels, models, selectionFor } from "../models";
 import { loadVersioned, saveVersioned } from "../lib/store";
 import { activeAgent, agentForSession, agents, selectAgentForSession, selectedAgent } from "../agents";
-import { dequeue, enqueue, queueFor, queueMode, removeQueued } from "../queue";
+import { claimQueued, enqueue, fetchQueue, hasQueueState, migrateLegacyQueue, queueFor, queueMode, removeQueued, resolveQueued } from "../queue";
+import { createQueueDrainer } from "../queueDrain";
 import { historyAt, historyLen, pushHistory } from "../history";
 import { type AcItem, commandSuggestions, fileSuggestions } from "../lib/complete";
 import { harvestPastedFiles } from "../lib/paste";
@@ -1424,33 +1425,131 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     return sendParts(key, id, parts, config);
   }
 
-  // Auto-drain the queue: when the session is idle and has queued messages, send
-  // the next one (FIFO, one per turn — the send makes it busy again, and the
-  // next idle drains the following). Guarded so concurrent effect runs can't
-  // double-send.
-  let draining = false;
-  async function drainQueue() {
-    const id = props.sessionId;
-    if (props.draft || !id || draining || isSending(id) || working()) return;
-    const next = dequeue(id);
-    if (!next) return;
-    draining = true;
+  // Auto-drain the queue: when the session is idle and has queued messages,
+  // CLAIM the oldest pending item (the atomic cross-client boundary — only one
+  // browser wins), send it, then RESOLVE the outcome. The single-flight
+  // `draining` flag and the per-session sending-guard lifecycle live in the
+  // extracted createQueueDrainer so they can be unit-tested in isolation
+  // (the setSending-leak regression: the finally MUST release the sending guard
+  // or items 2..N stall in pending). No silent retry: a definitive rejection is
+  // recorded as `failed`; an ambiguous interruption as `unknown`. Neither ever
+  // returns to `pending`.
+  //
+  // dispatchQueuedItem (below) holds the actual POST + outcome classification +
+  // scroll/notification side effects; the drainer only owns the lifecycle shell.
+  async function dispatchQueuedItem(
+    id: string,
+    text: string,
+    attachments: { url: string; filename: string; mime: string }[],
+    config: QueueConfig,
+    itemId: string,
+  ): Promise<{ state: "sent" | "failed" | "unknown"; detail: string }> {
+    const body: any = { parts: buildParts(text, attachments) };
+    if (config.agent) body.agent = config.agent;
+    if (config.providerID && config.modelID) {
+      body.model = { providerID: config.providerID, modelID: config.modelID };
+      if (config.variant) body.variant = config.variant;
+    }
+    if (!userScrolledUp()) jumpToLatest();
     try {
-      setSending(id, true);
-      const config = next.sendConfig?.providerID && next.sendConfig?.modelID ? (next.sendConfig as QueueConfig) : captureConfig(id);
-      await sendParts(id, id, buildParts(next.text, next.attachments), config);
-    } finally {
-      draining = false;
+      const res = await fetch(`/oc/session/${encodeURIComponent(id)}/prompt_async`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (res.ok) return { state: "sent", detail: "" };
+      // Definitive rejection (non-2xx) — failed, never re-enqueue.
+      let detail = "";
+      try { detail = (await res.text()).slice(0, 300); } catch {}
+      const msg = detail || `HTTP ${res.status}`;
+      log.error("send", "queued POST rejected", { id, itemId, status: res.status, detail: msg });
+      pushNotification({ kind: "error", sessionID: id, title: "Queued message failed to send", detail: msg });
+      return { state: "failed", detail: msg };
+    } catch (e) {
+      // Network error / interruption — ambiguous, never repend.
+      const msg = String(e);
+      log.error("send", "queued POST threw", { id, itemId, err: msg });
+      pushNotification({ kind: "error", sessionID: id, title: "Queued message send interrupted", detail: msg });
+      return { state: "unknown", detail: msg };
     }
   }
+  // Wire the extracted drain state machine to ChatView's closures. The drainer
+  // owns the `draining` flag + sending-guard lifecycle; dispatch/claim/resolve
+  // stay here (config capture, POST, outcome classification, refresh).
+  const queueDrainer = createQueueDrainer({
+    canDrain: () => !props.draft && !working(),
+    getId: () => props.sessionId,
+    claim: claimQueued,
+    dispatch: (id, claimed) => {
+      const config = claimed.sendConfig?.providerID && claimed.sendConfig?.modelID
+        ? (claimed.sendConfig as QueueConfig)
+        : captureConfig(id);
+      return dispatchQueuedItem(id, claimed.text, claimed.attachments, config, claimed.id);
+    },
+    resolve: resolveQueued,
+    setSending,
+    isSending,
+    onResolved: (id) => void fetchQueue(id),
+  });
   // Fires on busy→idle (turn finished) and on opening an idle session that still
   // has a queue (its turn finished while elsewhere). Reads queue length + working
-  // reactively; the guards above keep it single-flight.
+  // reactively; the guards above keep it single-flight. pendingCount counts only
+  // items the FE may still dispatch (pending) — dispatching/terminal items stay
+  // visible but don't re-trigger a drain.
   createEffect(() => {
     void props.sessionId;
     const idle = !working();
-    const pending = !props.draft && props.sessionId ? queueFor(props.sessionId).length : 0;
-    if (idle && pending > 0) queueMicrotask(() => void drainQueue());
+    const items = !props.draft ? queueFor(props.sessionId) : [];
+    const pending = items.filter((q) => q.state === "pending").length;
+    if (idle && pending > 0) queueMicrotask(() => void queueDrainer.drain());
+  });
+  // Pull-based sync: refresh the selected session's queue on open, on stream
+  // reconnect (status live-after-reconnecting), on window focus/visibility, and
+  // poll ~5s while the selected session has any queue state. Correctness never
+  // depends on a push channel (/vh/stream is a reconnect trigger only).
+  createEffect(() => {
+    const id = props.sessionId;
+    if (props.draft || !id) return;
+    // Session open: migrate any legacy local queue into the backend, then fetch.
+    void (async () => {
+      await migrateLegacyQueue(id);
+      void fetchQueue(id);
+    })();
+  });
+  createEffect(() => {
+    // Reconnect trigger: when the stream goes live after a reconnect, refresh.
+    const st = state.status;
+    void st; // track status transitions
+    if (st === "live" && !props.draft && props.sessionId) {
+      void fetchQueue(props.sessionId);
+    }
+  });
+  let pollTimer: ReturnType<typeof setInterval> | undefined;
+  createEffect(() => {
+    const id = props.sessionId;
+    const has = !props.draft && id ? hasQueueState(id) : false;
+    // Restart the poll whenever the has-state signal changes.
+    clearInterval(pollTimer);
+    pollTimer = undefined;
+    if (has) {
+      pollTimer = setInterval(() => {
+        if (!props.draft && props.sessionId && document.visibilityState === "visible") {
+          void fetchQueue(props.sessionId);
+        }
+      }, 5000);
+    }
+  });
+  onMount(() => {
+    const onFocus = () => {
+      if (!props.draft && props.sessionId) void fetchQueue(props.sessionId);
+    };
+    window.addEventListener("focus", onFocus);
+    document.addEventListener("visibilitychange", onFocus);
+    onCleanup(() => {
+      window.removeEventListener("focus", onFocus);
+      document.removeEventListener("visibilitychange", onFocus);
+      clearInterval(pollTimer);
+    });
   });
 
   // POST a prompt/shell command and decide success WITHOUT waiting out the whole
@@ -1544,7 +1643,14 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     // concurrent prompt, so we hold it and auto-send when the turn finishes.
     // (Shell/undo/redo aren't queueable — they only run against a live session.)
     if (queueMode() && !props.draft && props.sessionId && working() && !text.startsWith("!") && text !== "/undo" && text !== "/redo") {
-      enqueue(props.sessionId, { text, attachments: attachments(), sendConfig: captureConfig(props.sessionId) });
+      const sid = props.sessionId;
+      try {
+        await enqueue(sid, { text, attachments: attachments(), sendConfig: captureConfig(sid) });
+      } catch {
+        // Enqueue failed — preserve the composed text (no silent loss) and warn.
+        pushNotification({ kind: "error", sessionID: sid, title: "Could not queue message", detail: text.slice(0, 120) });
+        return;
+      }
       setInput("");
       setAttachments([]);
       return;
@@ -2007,21 +2113,56 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
               </div>
             </Portal>
           </Show>
-          {/* Queued messages waiting for the running turn to finish. */}
+          {/* Queue chips reflect the backend-authoritative per-session queue.
+              pending → removable; dispatching → in flight; failed/unknown →
+              terminal, retained until the operator archives the session (DELETE
+              is pending-only on the backend, so terminal chips have no remove). */}
           <Show when={!props.draft && queueFor(props.sessionId).length > 0}>
             <div class="queue-row">
               <span class="queue-label" data-tip="Sent automatically when the current turn finishes">
                 Queued
               </span>
               <For each={queueFor(props.sessionId)}>
-                {(q) => (
-                  <span class="queue-chip" data-tip={q.text}>
-                    <span class="queue-text">{q.text || "(attachment)"}</span>
-                    <button type="button" aria-label="Remove queued message" onClick={() => removeQueued(props.sessionId, q.id)}>
-                      <Icon name="x" size={11} />
-                    </button>
-                  </span>
-                )}
+                {(q) => {
+                  const tip = (): string => {
+                    if (q.state === "failed" || q.state === "unknown") {
+                      return q.detail
+                        ? `${q.state === "failed" ? "Failed" : "Interrupted"}: ${q.detail}`
+                        : q.state === "failed"
+                          ? "Failed to send"
+                          : "Send was interrupted";
+                    }
+                    if (q.state === "dispatching") return "Sending…";
+                    return q.text;
+                  };
+                  const label = (): string => {
+                    if (q.state === "dispatching") return "Sending…";
+                    if (q.state === "failed") return "Failed";
+                    if (q.state === "unknown") return "Unknown";
+                    return "";
+                  };
+                  return (
+                    <span
+                      class="queue-chip"
+                      data-state={q.state}
+                      data-tip={tip()}
+                    >
+                      <Show when={label()}>
+                        <span class="queue-state">{label()}</span>
+                      </Show>
+                      <span class="queue-text">{q.text || "(attachment)"}</span>
+                      <Show when={q.state === "pending"}>
+                        <button
+                          type="button"
+                          aria-label="Remove queued message"
+                          onClick={() => void removeQueued(props.sessionId, q.id)}
+                        >
+                          <Icon name="x" size={11} />
+                        </button>
+                      </Show>
+                    </span>
+                  );
+                }}
               </For>
             </div>
           </Show>

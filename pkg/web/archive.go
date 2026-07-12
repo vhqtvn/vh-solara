@@ -84,6 +84,16 @@ func (s *Server) handleArchive(w http.ResponseWriter, r *http.Request) {
 		}
 		// Drop them from the live view immediately (clients prune via delete).
 		agg.Store().RemoveSessions(affected)
+		// Archive clears the queue: a successful archive deletes that session's
+		// queue state (matches the prior FE-only behavior and the operator's
+		// confirmed policy). Done AFTER the archive commits so a failed archive
+		// never loses queued messages.
+		root, err := projectRoot(dir)
+		if err == nil {
+			for _, id := range affected {
+				s.queues.deleteStore(root, safeID.ReplaceAllString(id, ""))
+			}
+		}
 	}
 	writeJSONResp(w, map[string]any{"ok": true, "affected": affected})
 }
