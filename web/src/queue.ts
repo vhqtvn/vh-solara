@@ -13,9 +13,12 @@
 //
 // `claim` is the cross-client boundary (one browser wins). Neither `failed` nor
 // `unknown` ever returns to `pending`; they persist until explicit operator
-// dismissal. Correctness never depends on a push channel — the FE pulls on
-// session open, after every mutation, on focus/visibility, on stream reconnect,
-// and polls ~5s while the selected session has queue state.
+// dismissal. `sent` is filtered from the visible queue: a successfully-
+// dispatched queued message is now in the transcript, so its chip clears (the
+// cache retains it internally only to drive the F1 reconcile overlay).
+// Correctness never depends on a push channel — the FE pulls on session open,
+// after every mutation, on focus/visibility, on stream reconnect, and polls
+// ~5s while the selected session has queue state.
 import { createSignal } from "solid-js";
 import { createStore, produce } from "solid-js/store";
 import { loadVersioned, saveVersioned } from "./lib/store";
@@ -79,13 +82,19 @@ export { queueMode };
 // --- reactive read ---------------------------------------------------------
 
 export function queueFor(sessionId: string): QueuedMessage[] {
-  return queues[sessionId] || [];
+  // `sent` items are filtered from the read view: a successfully-dispatched
+  // queued message is now in the transcript, so its chip must clear. The cache
+  // still retains `sent` internally (for the F1 reconcile overlay), but the
+  // visible queue holds only pending/dispatching/failed/unknown. `failed` and
+  // `unknown` stay displayed until explicit operator dismissal.
+  return (queues[sessionId] || []).filter((m) => m.state !== "sent");
 }
 
-// True when a session has any items in the cache (pending/dispatching/terminal).
-// Drives the ~5s poll: polling runs only while there's something to show.
+// True when a session has any VISIBLE items (pending/dispatching/failed/unknown).
+// Drives the ~5s poll: polling runs only while there's something to show. A
+// session whose only item is `sent` has nothing to show, so polling stops.
 export function hasQueueState(sessionId: string): boolean {
-  return (queues[sessionId] || []).length > 0;
+  return (queues[sessionId] || []).some((m) => m.state !== "sent");
 }
 
 // --- backend operations ----------------------------------------------------

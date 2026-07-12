@@ -1371,10 +1371,14 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   }
   const removeAttachment = (url: string) => setAttachments((a) => a.filter((x) => x.url !== url));
 
-  function buildParts(text: string, atts: Attachment[]): any[] {
+  function buildParts(text: string, atts?: Attachment[]): any[] {
+    // `atts` is optional in practice: the backend serializes QueueItem.Attachments
+    // with `omitempty`, so a queued item with no attachments arrives with
+    // attachments === undefined. Iterating undefined throws TypeError, which
+    // rejects the drain's dispatch promise and strands the item at `dispatching`.
     const parts: any[] = [];
     if (text) parts.push({ type: "text", text });
-    for (const a of atts) parts.push({ type: "file", url: a.url, filename: a.filename, mime: a.mime });
+    for (const a of atts ?? []) parts.push({ type: "file", url: a.url, filename: a.filename, mime: a.mime });
     return parts;
   }
 

@@ -7,8 +7,9 @@
 // reactive CACHE plus the sole dispatcher. These tests pin the cache↔backend
 // contract: enqueue preserves captured sendConfig and throws on non-2xx (no
 // silent loss), fetchQueue is an authoritative refresh, claim marks the winner
-// dispatching, resolve records a terminal outcome WITHOUT removing the item
-// (failed/unknown stay displayed until explicit dismissal), the legacy
+// dispatching, resolve records a terminal outcome — `sent` is filtered from the
+// visible queue (the message is now in the transcript, so the chip clears) while
+// `failed`/`unknown` stay displayed until explicit dismissal — the legacy
 // vh.queue.v1 map is migrated entry-by-entry and retired only on full success,
 // and archive prunes the local cache (the backend deletes the file).
 //
@@ -229,7 +230,7 @@ describe("claimQueued — single-winner dispatch boundary", () => {
   });
 });
 
-describe("resolveQueued — terminal outcome; never repends; stays displayed", () => {
+describe("resolveQueued — terminal outcome; never repends; sent clears / failed+unknown stay", () => {
   it("records failed and keeps the item displayed with detail (no re-enqueue)", async () => {
     const sid = "s-res-1";
     touched.push(sid);
@@ -280,22 +281,28 @@ describe("resolveQueued — terminal outcome; never repends; stays displayed", (
     expect(arr[0].state).not.toBe("pending");
   });
 
-  it("records sent (happy path)", async () => {
+  it("records sent (happy path): the chip clears — sent is filtered from the visible queue", async () => {
     const sid = "s-res-3";
     touched.push(sid);
     vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(res(200, { items: [item("q-1", { state: "dispatching" })] }))));
     await fetchQueue(sid);
+    let resolveHit = false;
     vi.stubGlobal(
       "fetch",
       vi.fn((url: string) => {
         if (url.endsWith(`/vh/session/${sid}/queue/q-1/resolve`)) {
+          resolveHit = true;
           return Promise.resolve(res(200, { item: item("q-1", { state: "sent" }) }));
         }
         return Promise.resolve(res(404, {}));
       }),
     );
     await resolveQueued(sid, "q-1", "sent", "");
-    expect(queueFor(sid)[0].state).toBe("sent");
+    // The resolve WRITE recorded the sent outcome...
+    expect(resolveHit).toBe(true);
+    // ...and the sent item is filtered from the visible queue (the message is
+    // now in the transcript, so the chip clears).
+    expect(queueFor(sid)).toHaveLength(0);
   });
 });
 
@@ -324,12 +331,11 @@ describe("resolveQueued — resolve-write failure (F1: no misleading dispatching
 
     await resolveQueued(sid, "q-1", "sent", "dispatched-ok");
 
-    // Local cache reflects the KNOWN terminal outcome — NOT a misleading dispatching.
-    const arr = queueFor(sid);
-    expect(arr).toHaveLength(1);
-    expect(arr[0].state).toBe("sent");
-    expect(arr[0].state).not.toBe("dispatching");
-    expect(arr[0].detail).toBe("dispatched-ok");
+    // The dispatch SUCCEEDED (prompt_async returned) — only the resolve WRITE
+    // failed. The sent item is filtered from the visible queue (the message is
+    // in the transcript), so the chip clears; it is NOT stranded in a misleading
+    // `dispatching`. The cache retains `sent` internally to drive reconcile.
+    expect(queueFor(sid)).toHaveLength(0);
 
     // The resolve WRITE was retried (bounded): >1 attempt to bring backend to terminal.
     const resolveCalls = fetchMock.mock.calls.filter((c) => String(c[0]).includes("/resolve")).length;
@@ -362,9 +368,11 @@ describe("resolveQueued — resolve-write failure (F1: no misleading dispatching
 
     // Once the backend catches up to terminal, the overlay is dropped (backend
     // is authoritative again) and the backend's terminal state is shown as-is.
-    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(res(200, { items: [item("q-1", { state: "sent" })] }))));
+    // (Uses `failed` — a RETAINED terminal — so "shown as-is" is observable;
+    // `sent` would be filtered from the visible queue.)
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(res(200, { items: [item("q-1", { state: "failed", detail: "rejected" })] }))));
     await fetchQueue(sid);
-    expect(queueFor(sid)[0].state).toBe("sent");
+    expect(queueFor(sid)[0].state).toBe("failed");
   });
 
   it("on resolve-500 then 200 (retry succeeds): local cache reflects the authoritative terminal echo", async () => {
@@ -374,6 +382,8 @@ describe("resolveQueued — resolve-write failure (F1: no misleading dispatching
     await fetchQueue(sid);
 
     // First resolve attempt 500, second attempt 200 with authoritative item.
+    // Uses `failed` (a RETAINED terminal) so the echoed resolvedAt is observable
+    // in the visible queue; a `sent` echo would be filtered from the view.
     let attempt = 0;
     vi.stubGlobal(
       "fetch",
@@ -381,15 +391,15 @@ describe("resolveQueued — resolve-write failure (F1: no misleading dispatching
         if (String(url).includes("/resolve")) {
           attempt++;
           if (attempt === 1) return Promise.resolve(res(500, {}));
-          return Promise.resolve(res(200, { item: item("q-1", { state: "sent", order: 1, resolvedAt: 42 }) }));
+          return Promise.resolve(res(200, { item: item("q-1", { state: "failed", order: 1, resolvedAt: 42 }) }));
         }
         return Promise.resolve(res(404, {}));
       }),
     );
 
-    await resolveQueued(sid, "q-1", "sent", "");
+    await resolveQueued(sid, "q-1", "failed", "boom");
     const after = queueFor(sid)[0];
-    expect(after.state).toBe("sent");
+    expect(after.state).toBe("failed");
     // Authoritative resolvedAt from the server echo once the write landed.
     expect(after.resolvedAt).toBe(42);
   });
