@@ -71,7 +71,7 @@ type QueueItem struct {
 	Order          uint64            `json:"order"`
 	State          QueueItemState    `json:"state"`
 	Text           string            `json:"text"`
-	Attachments    []QueueAttachment `json:"attachments,omitempty"`
+	Attachments    []QueueAttachment `json:"attachments"`
 	SendConfig     QueueSendConfig   `json:"sendConfig,omitempty"`
 	OriginClientID string            `json:"originClientId,omitempty"`
 	CreatedAt      int64             `json:"createdAt"`
@@ -143,6 +143,19 @@ func (s *sessionQueueStore) load() error {
 	}
 	s.items = doc.Items
 	s.order = doc.Order
+	// Normalize legacy on-disk items: a queue.json persisted BEFORE the
+	// attachments-always-array contract had no `attachments` key (the field used
+	// omitempty), so json.Unmarshal leaves QueueItem.Attachments nil. With the
+	// omitempty tag now removed, a nil slice would serialize as
+	// "attachments":null — breaking the contract the Enqueue nil→[]
+	// normalization (above) establishes for NEW enqueues. Apply the same
+	// nil→empty normalization here so EVERY item read from disk serializes as
+	// "attachments":[] regardless of when it was written. Symmetric with Enqueue.
+	for i := range s.items {
+		if s.items[i].Attachments == nil {
+			s.items[i].Attachments = []QueueAttachment{}
+		}
+	}
 	// Defend against a file written with Order==0 but non-empty items: rebuild
 	// the counter from the max observed order so the next enqueue stays
 	// monotonic. (Also covers a hand-edited file.)
@@ -207,6 +220,13 @@ func (s *sessionQueueStore) Enqueue(text string, attachments []QueueAttachment, 
 	}
 	if err := s.load(); err != nil {
 		return QueueItem{}, err
+	}
+	// Normalize nil→empty so the wire shape is always "attachments":[] (never
+	// null, never omitted). Go marshals a nil slice as `null`; with the omitempty
+	// tag removed above, a nil would serialize as "attachments":null. The sole
+	// FE consumer (buildParts) iterates this field — the contract must be an array.
+	if attachments == nil {
+		attachments = []QueueAttachment{}
 	}
 	s.order++
 	item := QueueItem{

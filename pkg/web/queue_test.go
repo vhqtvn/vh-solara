@@ -66,6 +66,96 @@ func TestQueueEnqueuePersistsAndReloads(t *testing.T) {
 	}
 }
 
+// TestQueueAttachmentsAlwaysArrayOnWire pins the wire contract: an item enqueued
+// with nil/empty attachments MUST serialize as "attachments":[] — never absent
+// (omitempty) and never null (nil slice). The sole FE consumer (buildParts)
+// iterates this field; undefined/null would throw without the ?? [] guard.
+func TestQueueAttachmentsAlwaysArrayOnWire(t *testing.T) {
+	s, _ := newTestStore(t, "s1")
+
+	// nil is the common case: mustEnqueue passes nil, and an HTTP body with no
+	// attachments field decodes to nil (queue_http.go:94, no omitempty on decode).
+	it, err := s.Enqueue("no-atts", nil, QueueSendConfig{}, "")
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	raw, err := json.Marshal(it)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if !bytes.Contains(raw, []byte(`"attachments":[]`)) {
+		t.Fatalf("wire: attachments not an empty array: %s", raw)
+	}
+
+	var back QueueItem
+	if err := json.Unmarshal(raw, &back); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if back.Attachments == nil {
+		t.Fatal("unmarshaled Attachments = nil, want non-nil empty slice")
+	}
+	if len(back.Attachments) != 0 {
+		t.Fatalf("unmarshaled Attachments len = %d, want 0", len(back.Attachments))
+	}
+
+	list, err := s.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	listRaw, _ := json.Marshal(list)
+	if !bytes.Contains(listRaw, []byte(`"attachments":[]`)) {
+		t.Fatalf("list wire: attachments not an empty array: %s", listRaw)
+	}
+}
+
+// TestQueueLegacyReloadAttachmentsAlwaysArray pins the reload-path half of the
+// "attachments always an array on the wire" contract. A queue.json persisted
+// BEFORE this slice had no `attachments` key on items (the field used omitempty),
+// so json.Unmarshal leaves QueueItem.Attachments nil. With omitempty now
+// removed, a nil would serialize as "attachments":null — breaking the contract
+// the Enqueue nil→[] normalization establishes for new items. The load()
+// post-load normalization must convert nil→[] for EVERY item read from disk so
+// a legacy file reloaded via List() still serializes as "attachments":[].
+func TestQueueLegacyReloadAttachmentsAlwaysArray(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, ".vh-solara", "sessions", "s1")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Legacy on-disk item: NO `attachments` key (the pre-slice shape). Match the
+	// queueFile envelope load() reads: {"order":N,"items":[...]}.
+	legacy := []byte(`{"order":1,"items":[` +
+		`{"id":"q-legacy","order":1,"state":"pending","text":"legacy-no-atts","createdAt":1700000000000}` +
+		`]}`)
+	if err := os.WriteFile(queuePath(root, "s1"), legacy, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Fresh store re-reads the seeded file via load() (no in-memory cache).
+	s := &sessionQueueStore{path: queuePath(root, "s1")}
+	list, err := s.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("List: got %d items, want 1", len(list))
+	}
+	if list[0].Attachments == nil {
+		t.Fatal("legacy item Attachments = nil after load, want non-nil empty slice (load normalization missing)")
+	}
+
+	// The wire shape MUST be "attachments":[] — present and an empty array, not
+	// absent (omitempty) and not null (nil slice).
+	raw, err := json.Marshal(list)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if !bytes.Contains(raw, []byte(`"attachments":[]`)) {
+		t.Fatalf("legacy reload wire: attachments not an empty array: %s", raw)
+	}
+}
+
 func TestQueueFIFOOrdering(t *testing.T) {
 	s, _ := newTestStore(t, "s1")
 	for i := 0; i < 5; i++ {
