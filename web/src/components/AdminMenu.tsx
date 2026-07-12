@@ -11,7 +11,7 @@ import RestartOpenCodeDialog from "./RestartOpenCodeDialog";
 // panel and Settings dialog so those stay focused on info/preferences.
 //
 // Organized into three labeled sections:
-//   • OpenCode          — version readout + Update / Restart
+//   • OpenCode          — version readout + Update/Reinstall (by state) / Restart
 //   • VH Solara Server  — version readout + Rebuild state / Restart server
 //   • Diagnostics       — Diagnostic log / Reset local storage / Force reload
 //
@@ -69,11 +69,13 @@ export default function AdminMenu(props: { onClose: () => void }) {
           </Show>
         </span>
       </div>
-      {/* Update OpenCode — opens the streaming-log dialog, which owns the
-          install (update/reinstall). The menu entry keeps a STABLE label
-          regardless of version state so it never flips identity while npm
-          resolves (the dialog carries the update-vs-reinstall nuance + the
-          loading state). */}
+      {/* Install OpenCode — opens the streaming-log dialog, which owns the
+          install. The menu label mirrors the dialog's action: "Update" when a
+          newer version is available, "Reinstall" when already up-to-date
+          (and "Checking…" while the version probe is unresolved). The backend
+          returns installed/running/latest atomically, so the label resolves in
+          one step — no flicker. The dialog still carries the detailed
+          "Update to {latest}" / "Reinstall latest" + the version rows. */}
       <div class="admin-btn-row">
         <button
           type="button"
@@ -83,7 +85,7 @@ export default function AdminMenu(props: { onClose: () => void }) {
           onClick={() => setUpdateOpen(true)}
         >
           <Icon name="layers" size={14} />
-          {ocVer() ? "Update" : "Checking…"}
+          {ocVer() ? (ocVer()!.updateAvailable ? "Update" : "Reinstall") : "Checking…"}
         </button>
         {/* Restart OpenCode — opens a centered portaled dialog hosting the
             shared RestartOpenCode (autoConfirm), so the session-aware

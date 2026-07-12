@@ -84,7 +84,8 @@ test("OpenCode update opens a dialog, streams the log, then offers restart", asy
   // Fixture reports installed/running 0.1.0 → latest 0.2.0.
   await expect(pop).toContainText("0.2.0");
 
-  // Opens the dedicated update dialog via the stable "Update" menu entry.
+  // Opens the dedicated update dialog via the "Update" menu entry (fixture
+  // reports an update available: installed 0.1.0 → latest 0.2.0).
   await pop.getByRole("button", { name: /Update/ }).click();
   const dlg = page.getByRole("dialog", { name: "Update OpenCode" });
   await expect(dlg).toBeVisible();

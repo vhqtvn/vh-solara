@@ -2,8 +2,9 @@
 //
 // Menu-wiring assertions for the restructured admin popup: only the Diagnostics
 // section carries an .admin-section-head; OpenCode and VH Solara are labeled via
-// their .admin-ver rows. "Update" is a STABLE, state-independent label, and
-// "Restart" is a PERMANENT entry that
+// their .admin-ver rows. The install label is state-dependent: "Reinstall" at
+// idle (no update), "Update" when a newer version is available. "Restart" is a
+// PERMANENT entry that
 // opens a centered portaled dialog hosting the shared RestartOpenCode in
 // autoConfirm mode — so the session-aware confirmation (.ocu-confirm) shows
 // immediately, with no redundant entry-button click.
@@ -17,6 +18,14 @@ const OC_VER_IDLE = {
   running: "0.2.0",
   latest: "0.2.0",
   updateAvailable: false,
+  restartNeeded: false,
+};
+
+const OC_VER_UPDATE = {
+  installed: "0.1.0",
+  running: "0.1.0",
+  latest: "0.2.0",
+  updateAvailable: true,
   restartNeeded: false,
 };
 
@@ -45,7 +54,7 @@ function menuBtn(label: string): HTMLButtonElement | undefined {
   ) as HTMLButtonElement | undefined;
 }
 
-describe("AdminMenu — three sections, stable Update, centered Restart dialog", () => {
+describe("AdminMenu — three sections, Update/Reinstall by state, centered Restart dialog", () => {
   afterEach(() => {
     cleanup();
     vi.unstubAllGlobals();
@@ -55,7 +64,7 @@ describe("AdminMenu — three sections, stable Update, centered Restart dialog",
     stubVersions(OC_VER_IDLE);
     render(() => <AdminMenu onClose={() => {}} />);
 
-    await waitFor(() => expect(menuBtn("Update")).toBeTruthy());
+    await waitFor(() => expect(menuBtn("Reinstall")).toBeTruthy());
     // Only the Diagnostics section-head remains; the OpenCode and VH Solara
     // sections are now labeled by their .admin-ver first-span.
     const heads = Array.from(document.querySelectorAll(".admin-section-head")).map(
@@ -69,18 +78,28 @@ describe("AdminMenu — three sections, stable Update, centered Restart dialog",
     expect(verLabels).toEqual(expect.arrayContaining(["OpenCode", "VH Solara"]));
   });
 
-  it("keeps 'Update' as a stable, state-independent label", async () => {
+  it("shows 'Reinstall' at idle and 'Update' when a newer version is available", async () => {
+    // Idle: installed == latest → no update → "Reinstall".
     stubVersions(OC_VER_IDLE);
     render(() => <AdminMenu onClose={() => {}} />);
+    const idle = await waitFor(() => {
+      const b = menuBtn("Reinstall");
+      expect(b).toBeTruthy();
+      return b!;
+    });
+    expect(idle.textContent).toBe("Reinstall");
+    cleanup();
+    vi.unstubAllGlobals();
 
-    const update = await waitFor(() => {
+    // Update available: installed 0.1.0 → latest 0.2.0 → "Update".
+    stubVersions(OC_VER_UPDATE);
+    render(() => <AdminMenu onClose={() => {}} />);
+    const withUpdate = await waitFor(() => {
       const b = menuBtn("Update");
       expect(b).toBeTruthy();
       return b!;
     });
-    // Stable: once version data resolves, the label is exactly "Update" (it is
-    // "Checking…" only while unresolved — never version-dependent otherwise).
-    expect(update.textContent).toBe("Update");
+    expect(withUpdate.textContent).toBe("Update");
   });
 
   it("permanently renders 'Restart' even at idle and opens the session-aware confirm on click", async () => {
