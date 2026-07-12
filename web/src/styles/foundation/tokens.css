@@ -28,7 +28,7 @@
   --z-toast: 90;         /* connection / update toasts */
   --z-modal: 150;        /* command palette, opencode-update overlay */
   --z-modal-pop: 160;    /* composer autocomplete (above a modal) */
-  --z-overlay-full: 200; /* full-screen code overlay, restart overlay, portaled <Select> popup */
+  --z-overlay-full: 200; /* full-screen code overlay, restart overlay, working overlay, portaled <Select> popup */
   --z-floating: 300;     /* path-selection floating action */
   --z-tooltip: 1000;
 

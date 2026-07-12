@@ -1,6 +1,7 @@
 import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { createStore } from "solid-js/store";
 import { fetchArchived, restoreAndOpen, unarchiveSession } from "../archive";
+import { withGlobalBusy } from "../busy";
 import type { Session } from "../types";
 import Icon from "./Icon";
 import RelTime from "./RelTime";
@@ -71,22 +72,24 @@ export default function ArchivedDialog(props: { onClose: () => void }) {
   async function restore(id: string, e: Event) {
     e.stopPropagation();
     setRestoreError(null);
-    try {
-      await unarchiveSession(id);
-    } catch (err) {
-      // Don't drop the row on failure — it is still archived.
-      setRestoreError(err instanceof Error ? err.message : String(err));
-      return;
-    }
-    // Drop the row from its level cache so it disappears from the browser.
-    for (const parent of Object.keys(levels)) {
-      const lvl = levels[parent];
-      if (lvl?.rows.some((r) => r.id === id)) {
-        setLevels(parent, "rows", (rows) => rows.filter((r) => r.id !== id));
-        setLevels(parent, "loaded", (n) => Math.max(0, n - 1));
-        setLevels(parent, "total", (n) => Math.max(0, n - 1));
+    await withGlobalBusy(async () => {
+      try {
+        await unarchiveSession(id);
+      } catch (err) {
+        // Don't drop the row on failure — it is still archived.
+        setRestoreError(err instanceof Error ? err.message : String(err));
+        return;
       }
-    }
+      // Drop the row from its level cache so it disappears from the browser.
+      for (const parent of Object.keys(levels)) {
+        const lvl = levels[parent];
+        if (lvl?.rows.some((r) => r.id === id)) {
+          setLevels(parent, "rows", (rows) => rows.filter((r) => r.id !== id));
+          setLevels(parent, "loaded", (n) => Math.max(0, n - 1));
+          setLevels(parent, "total", (n) => Math.max(0, n - 1));
+        }
+      }
+    });
   }
 
   function Row(p: { s: Session; parent: string; depth: number }) {
@@ -110,9 +113,14 @@ export default function ArchivedDialog(props: { onClose: () => void }) {
           </button>
           <button type="button" class="arch-main" onClick={() => {
             setRestoreError(null);
-            restoreAndOpen(id)
-              .then(props.onClose)
-              .catch((err) => setRestoreError(err instanceof Error ? err.message : String(err)));
+            void withGlobalBusy(async () => {
+              try {
+                await restoreAndOpen(id);
+                props.onClose();
+              } catch (err) {
+                setRestoreError(err instanceof Error ? err.message : String(err));
+              }
+            });
           }}>
             <span class="arch-title">{p.s.title || id}</span>
             <span class="arch-meta">

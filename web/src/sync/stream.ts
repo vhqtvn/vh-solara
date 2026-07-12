@@ -19,6 +19,7 @@ import { log } from "../lib/log";
 import { state, setState, projectDir, selectedId, persist } from "./store";
 import { normalizeTodos } from "./selectors";
 import { notifyFromMessage, maybeNotifyRootDone, maybeClearWaiting } from "./orchestration";
+import { isGateActive, currentGateEpoch, markBusyDirty, setReconcileFn } from "../busy";
 
 // mergeLastAgents — the agent-label fix (S3). During a server restart the
 // daemon serves HTTP while still aggregating session tails, so a mid-hydrate
@@ -460,6 +461,18 @@ function bumpUpdating() {
   updatingTimer = window.setTimeout(() => setUpdating(false), UPDATING_DEBOUNCE_MS);
 }
 
+// advanceCursor — cursor-only path for deferred Stream-1 frames during a global
+// busy scope. applySnapshot/applySessionEvent/applyMessageEvent couple cursor
+// advancement with store mutation; this extracts just the cursor+persist so the
+// resume point stays current while the store is left untouched. The gate then
+// latches dirty (if reconciling) so the final coalesced refresh catches up.
+function advanceCursor(seq: number) {
+  if (seq) {
+    setState("cursor", seq);
+    persist();
+  }
+}
+
 // === Stream 1: tree + notifications (persistent) ============================
 // Structural (session/activity/status) + notification (permission/question)
 // events for ALL sessions. The server omits message/part events here
@@ -606,6 +619,70 @@ export const TREE_STREAM_KINDS = [
   "todo",
 ] as const;
 
+// --- Global busy-scope gate (archive/unarchive) -----------------------------
+// While a global busy scope is active (see ../busy.ts), stream frames are
+// deferred: markSeen runs (watchdog health), but store mutation is suppressed.
+// On the outermost release, reconcileBusy() requests fresh authoritative
+// snapshots. expectTreeSnap / expectSessionSnap identify the ONE expected fresh
+// snapshot per stream (from connect(true) / openSessionStream); all other frames
+// during reconciliation are deferred + latch dirty. The precheck found that
+// applySnapshot sets s.cursor = snap.seq UNCONDITIONALLY (no seq>cursor guard),
+// so a fresh snapshot CAN clobber newer accepted state — therefore the gate is
+// retained through both resume snapshots and the dirty-pass rule applies (at most
+// one extra coalesced pass).
+let expectTreeSnap = false;
+let expectSessionSnap = false;
+let reconcileResolve: (() => void) | null = null;
+let reconcileTimer: number | undefined;
+
+// maybeResolveReconcile — resolves the pending reconciliation promise once ALL
+// expected snapshots have been applied (or were superseded by a stale-epoch
+// discard). Called from the snapshot listeners after each expected frame lands.
+function maybeResolveReconcile() {
+  if (!expectTreeSnap && !expectSessionSnap && reconcileResolve) {
+    const r = reconcileResolve;
+    reconcileResolve = null;
+    clearTimeout(reconcileTimer);
+    r();
+  }
+}
+
+// reconcileBusy — registered with busy.ts via setReconcileFn. Called on the
+// outermost busy release. Requests ONE fresh tree snapshot (connect(true) drops
+// the tree EventSource and reconnects with no cursor) and ONE fresh session
+// snapshot for the selected session (openSessionStream drops + reconnects).
+// Resolves once both expected snapshots have been applied, or a 15s safety
+// timeout. If no session is selected, only the tree refresh is requested.
+function reconcileBusy(): Promise<void> {
+  return new Promise<void>((resolve) => {
+    const sel = selectedId();
+    reconcileResolve = resolve;
+    expectTreeSnap = true;
+    expectSessionSnap = !!sel;
+    connect(true);
+    // force=true so the selected session's Stream-2 EventSource is recreated
+    // even when it's already healthy/open — the fresh snapshot this produces is
+    // what clears expectSessionSnap and resolves reconciliation promptly.
+    if (sel) openSessionStream(sel, true);
+    // Safety: if the fresh snapshots don't arrive in 15s (e.g. the server is
+    // unresponsive), clear the flags and resolve so the overlay doesn't wedge.
+    clearTimeout(reconcileTimer);
+    reconcileTimer = window.setTimeout(() => {
+      expectTreeSnap = false;
+      expectSessionSnap = false;
+      maybeResolveReconcile();
+    }, 15_000);
+    // If there's nothing to wait for (shouldn't happen — expectTreeSnap is
+    // always set — but defensive), resolve immediately.
+    maybeResolveReconcile();
+  });
+}
+
+// Register the reconciliation callback once at module load. reconcileBusy is a
+// hoisted function declaration; connect/openSessionStream are also hoisted, so
+// the reference is valid even though they're textually defined below.
+setReconcileFn(reconcileBusy);
+
 export function connect(fresh = false) {
   clearTimeout(reconnectTimer);
   es?.close();
@@ -626,7 +703,19 @@ export function connect(fresh = false) {
   log.debug("sync", "tree stream connect", { cursor: fresh ? "fresh" : state.cursor, dir: projectDir() });
   es.addEventListener("snapshot", (e) => {
     markSeen();
-    applySnapshot(JSON.parse((e as MessageEvent).data));
+    const snap = JSON.parse((e as MessageEvent).data);
+    if (isGateActive() && !expectTreeSnap) {
+      // Deferred tree snapshot during a busy scope — advance the resume cursor
+      // (Stream 1) but do NOT mutate the store or run refreshOpenSessions.
+      advanceCursor(snap.seq);
+      markBusyDirty();
+      return;
+    }
+    if (expectTreeSnap) {
+      expectTreeSnap = false;
+      maybeResolveReconcile();
+    }
+    applySnapshot(snap);
     // L1 t2: first snapshot of this connection → server-processing delta.
     if (!treeSnapDone) {
       treeSnapDone = true;
@@ -640,14 +729,28 @@ export function connect(fresh = false) {
     es.addEventListener(kind, (e) => {
       markSeen();
       const ev = e as MessageEvent;
-      applySessionEvent(kind, Number(ev.lastEventId), JSON.parse(ev.data));
+      const seq = Number(ev.lastEventId);
+      if (isGateActive()) {
+        // Deferred — Stream 1 advances the resume cursor but does not mutate.
+        advanceCursor(seq);
+        markBusyDirty();
+        return;
+      }
+      applySessionEvent(kind, seq, JSON.parse(ev.data));
     });
   }
   for (const kind of TREE_STREAM_KINDS) {
     es.addEventListener(kind, (e) => {
       markSeen();
       const ev = e as MessageEvent;
-      applyMessageEvent(kind, Number(ev.lastEventId), JSON.parse(ev.data));
+      const seq = Number(ev.lastEventId);
+      if (isGateActive()) {
+        // Deferred — Stream 1 advances the resume cursor but does not mutate.
+        advanceCursor(seq);
+        markBusyDirty();
+        return;
+      }
+      applyMessageEvent(kind, seq, JSON.parse(ev.data));
     });
   }
   // Daemon-detected alerts (transient; no cursor advance). In-app + OS delivery.
@@ -845,8 +948,17 @@ export async function decodeSnapshot<T = unknown>(payload: {
   return payload as unknown as T;
 }
 
-export function openSessionStream(id: string) {
-  if (id === sesId && ses && ses.readyState !== EventSource.CLOSED) return;
+export function openSessionStream(id: string, force = false) {
+  // `force` bypasses the "already open" early-return so a caller can demand a
+  // FRESH authoritative snapshot even when the selected session's Stream-2
+  // EventSource is healthy. Used by reconcileBusy() on the outermost busy
+  // release: without it, an archive/unarchive WITH a selected session would
+  // never re-request the session snapshot (the EventSource is still OPEN), so
+  // expectSessionSnap stays true and the overlay only clears via the 15s safety
+  // timeout — the exact UX this feature exists to fix. force=true → skip the
+  // early-return → closeSessionStream() tears down the existing connection →
+  // open() recreates the EventSource fresh.
+  if (!force && id === sesId && ses && ses.readyState !== EventSource.CLOSED) return;
   closeSessionStream();
   // No project selected → nothing to stream (and no cwd bridge). Guards both
   // the no-project state and a stray selection cleared before a project lands.
@@ -886,6 +998,18 @@ export function openSessionStream(id: string) {
         if (sesT1) recordLatency("session", "snap", now - sesT1);
         sesFirstSnap = now;
       }
+      // Global busy gate: while a busy scope is active, suppress store mutation.
+      // The ONE expected fresh snapshot (from openSessionStream during
+      // reconciliation) is allowed through; all other frames are deferred.
+      if (isGateActive() && !expectSessionSnap) {
+        // Deferred Stream-2 frame — neither mutate the store nor advance the
+        // shared cursor (Stream 2 never advances it). Latch dirty so the
+        // coalesced refresh catches up.
+        markBusyDirty();
+        return;
+      }
+      const wasExpected = expectSessionSnap;
+      if (wasExpected) expectSessionSnap = false;
       // Apply the decoded snapshot: hydrate stamping (needs snap.gate) + clear
       // the per-session refresh indicator + reconcile. The server gzip64-wraps
       // the snapshot when z=1 AND it exceeds the size threshold (a warm open of
@@ -921,17 +1045,35 @@ export function openSessionStream(id: string) {
       // PRIOR messages stay in the store → no flash-of-empty through the decode
       // window (the reveal gate stays faithful). Raw path: synchronous apply,
       // exactly the legacy behavior (cold small snapshots, zero decode latency).
+      //
+      // Epoch guard: capture the gate epoch at decode start. If the gate
+      // activated (or a new reconcile pass started) during the decode, the
+      // epoch mismatches and the stale decode is discarded — it must NOT
+      // mutate the store or clear the overlay. If this was the expected
+      // snapshot, still resolve so reconcile doesn't wedge (dirty was latched).
       if (raw.encoding === "gzip64") {
+        const ep = currentGateEpoch();
         sesSnapshotDecoding = true;
         sesSnapshotDecode = (async () => {
           try {
-            applySnap(await decodeSnapshot<Snapshot>(raw));
+            const snap = await decodeSnapshot<Snapshot>(raw);
+            if (ep === currentGateEpoch()) {
+              applySnap(snap);
+            } else if (isGateActive()) {
+              markBusyDirty();
+            }
           } finally {
             sesSnapshotDecoding = false;
           }
         })();
+        // Resolve after the decode lands (or is queued via microtask for the
+        // stale case) — the expected snapshot has been "received".
+        if (wasExpected) {
+          sesSnapshotDecode.then(() => maybeResolveReconcile());
+        }
       } else {
         applySnap(raw);
+        if (wasExpected) maybeResolveReconcile();
       }
     });
     ses.addEventListener("ping", () => markSeen());
@@ -946,12 +1088,22 @@ export function openSessionStream(id: string) {
     for (const kind of ["message.upsert", "message.delete", "part.upsert", "part.delete", "messages.loaded", "messages.error", "messages.batch"]) {
       ses!.addEventListener(kind, async (e) => {
         markSeen();
+        if (isGateActive()) {
+          // Deferred Stream-2 frame — neither mutate the store nor advance the
+          // shared cursor. Latch dirty so the coalesced refresh catches up.
+          markBusyDirty();
+          return;
+        }
         const ev = e as MessageEvent;
         // Parse the payload once (was inline at applyMessageEvent); reused for
         // the split-timing read below. trackCursor:false — Stream 2 must not
         // advance Stream 1's resume cursor.
         const data = JSON.parse(ev.data);
         const sid: string | undefined = data?.sessionID;
+        // Capture the gate epoch at entry so post-await application points can
+        // detect that the gate activated during an await (snapshot decode or
+        // batch decode) and refuse to mutate the store.
+        const ep = currentGateEpoch();
 
         // Serialize against an in-flight gzip64 snapshot decode for this
         // connection. applySessionSnapshot WHOLESALE-REPLACES messages[id]; a
@@ -961,6 +1113,11 @@ export function openSessionStream(id: string) {
         // the fast path so message.upsert/part.upsert floods keep zero microtask
         // latency. Connect-time only (a snapshot decode is ms-scale).
         if (sesSnapshotDecoding) await sesSnapshotDecode;
+        // Epoch guard: the gate may have activated during the snapshot-decode wait.
+        if (ep !== currentGateEpoch()) {
+          if (isGateActive()) markBusyDirty();
+          return;
+        }
 
         // messages.batch is application-compressed (gzip+base64) to cut cold-
         // load hydrate latency over the controller tunnel. The decode is ASYNC
@@ -981,7 +1138,12 @@ export function openSessionStream(id: string) {
         if (kind === "messages.batch") {
           const p = (async () => {
             const decoded = await decodeMessagesBatch(data);
-            applyMessageEvent("messages.batch", Number(ev.lastEventId), decoded, false);
+            // Epoch guard: the gate may have activated during the batch decode.
+            if (ep === currentGateEpoch()) {
+              applyMessageEvent("messages.batch", Number(ev.lastEventId), decoded, false);
+            } else if (isGateActive()) {
+              markBusyDirty();
+            }
           })();
           if (sid) pendingBatch.set(sid, p);
           try {
@@ -998,6 +1160,11 @@ export function openSessionStream(id: string) {
         // more correct.) If no batch is pending this is a no-op.
         if (sid && pendingBatch.has(sid)) {
           await pendingBatch.get(sid);
+        }
+        // Epoch guard: the gate may have activated during the batch-decode wait.
+        if (ep !== currentGateEpoch()) {
+          if (isGateActive()) markBusyDirty();
+          return;
         }
 
         // L1 hydrate: messages.loaded arrival closes the cold-session

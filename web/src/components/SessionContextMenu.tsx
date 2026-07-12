@@ -6,6 +6,7 @@ import { exportSessionMarkdown } from "../export";
 import { pushNotification } from "../notify";
 import { buildChildrenIndex } from "../lib/reduce";
 import { archiveSession } from "../archive";
+import { withGlobalBusy } from "../busy";
 import {
   archiveTarget,
   closeArchiveConfirm,
@@ -193,8 +194,10 @@ export default function SessionContextMenu() {
   async function doArchive() {
     const t = archiveTarget();
     if (!t) return;
-    await archiveSession(t.id);
-    closeArchiveConfirm();
+    await withGlobalBusy(async () => {
+      await archiveSession(t.id);
+      closeArchiveConfirm();
+    });
   }
 
   return (

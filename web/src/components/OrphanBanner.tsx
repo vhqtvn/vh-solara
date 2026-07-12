@@ -1,6 +1,7 @@
 import { createMemo, createSignal, For, Show } from "solid-js";
 import { orphanSessions, rootInfoFor, type RootInfo } from "../orphans";
 import { archiveSession } from "../archive";
+import { withGlobalBusy } from "../busy";
 import type { Session } from "../types";
 import Icon from "./Icon";
 import styles from "./OrphanBanner.module.css";
@@ -28,9 +29,13 @@ export default function OrphanBanner() {
     setBusy(true);
     try {
       // Archive each orphan (and its own subsessions) — sequential to be gentle
-      // on the server when there are many.
-      for (const o of orphans()) await archiveSession(o.id);
-      setOpen(false);
+      // on the server when there are many. ONE outer global-busy scope around
+      // the whole loop (not per-iteration) so the overlay stays continuously
+      // visible and reconciliation runs once at the end.
+      await withGlobalBusy(async () => {
+        for (const o of orphans()) await archiveSession(o.id);
+        setOpen(false);
+      });
     } finally {
       setBusy(false);
     }

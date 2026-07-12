@@ -23,6 +23,7 @@ import UpdateToast from "./components/UpdateToast";
 import ConnectionToast from "./components/ConnectionToast";
 import AdminMenu from "./components/AdminMenu";
 import RestartOverlay from "./components/RestartOverlay";
+import WorkingOverlay from "./components/WorkingOverlay";
 import CommandPalette from "./components/CommandPalette";
 import TerminalDock from "./components/TerminalDock";
 import ViewFrame from "./components/ViewFrame";
@@ -392,6 +393,7 @@ export default function App() {
       <UpdateToast />
       <ConnectionToast />
       <RestartOverlay />
+      <WorkingOverlay />
       <CommandPalette />
     </div>
   );
