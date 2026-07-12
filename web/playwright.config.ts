@@ -25,6 +25,7 @@ const baseURL = process.env.PLAYWRIGHT_BASE_URL ?? "http://127.0.0.1:8099";
 const useExistingWebServer = process.env.PLAYWRIGHT_USE_EXISTING_WEB_SERVER === "1";
 
 export default defineConfig({
+  globalSetup: path.resolve(webRoot, "global-setup.ts"),
   testDir: path.join(webRoot, "tests/e2e"),
   fullyParallel: false,
   // One shared fixture backend with mutable session state -> run serially so
