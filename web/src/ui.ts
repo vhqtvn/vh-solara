@@ -21,6 +21,9 @@ export const [adminOpen, setAdminOpen] = createSignal(false);
 // Hidden diagnostic-log viewer (cold-open timing ring buffer). Reached from the
 // server-admin menu (right-click / long-press Settings), not a visible button.
 export const [diagLogOpen, setDiagLogOpen] = createSignal(false);
+// OpenCode process-logs viewer (always-accessible ring tail). Reached from the
+// server-admin menu's Diagnostics section, sibling to the diagnostic log.
+export const [ocLogsOpen, setOcLogsOpen] = createSignal(false);
 export const [paletteOpen, setPaletteOpen] = createSignal(false);
 // Project switcher dialog open-flag, lifted global so the no-project empty
 // state's CTA can open the switcher from outside the ProjectSwitcher component

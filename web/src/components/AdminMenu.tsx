@@ -1,7 +1,7 @@
 import { createResource, createSignal, Show } from "solid-js";
 import { forceReload, resetLocalStorage, restartVhServer } from "../admin";
 import { dismiss } from "../lib/a11y";
-import { setDiagLogOpen } from "../ui";
+import { setDiagLogOpen, setOcLogsOpen } from "../ui";
 import Icon from "./Icon";
 import OpenCodeUpdateDialog from "./OpenCodeUpdateDialog";
 import RestartOpenCodeDialog from "./RestartOpenCodeDialog";
@@ -113,6 +113,9 @@ export default function AdminMenu(props: { onClose: () => void }) {
 
       {/* --- Diagnostics --- */}
       <div class="admin-section-head">Diagnostics</div>
+      <button type="button" class="admin-btn" onClick={() => (props.onClose(), setOcLogsOpen(true))}>
+        <Icon name="terminal" size={14} /> OpenCode logs
+      </button>
       <button type="button" class="admin-btn" onClick={() => (props.onClose(), setDiagLogOpen(true))}>
         <Icon name="info" size={14} /> Diagnostic log
       </button>

@@ -30,6 +30,7 @@ import TerminalDock from "./components/TerminalDock";
 import ViewFrame from "./components/ViewFrame";
 import ManagedPanel from "./components/ManagedPanel";
 import DiagLogDialog from "./components/DiagLogDialog";
+import OpenCodeLogsDialog from "./components/OpenCodeLogsDialog";
 import Icon from "./components/Icon";
 import { menuTriggers } from "./sessionMenu";
 import { isDesktop, sidebarCollapsed, sidebarWidth, toggleSidebar } from "./layout";
@@ -41,7 +42,7 @@ import { notesVisible, refreshProjectSettings, watchProjectSettings } from "./pr
 import { pushNotification } from "./notify";
 import { broadcastTheme, postThemeTo } from "./themeTokens";
 import { customTheme, theme } from "./theme";
-import { adminOpen, diagLogOpen, embeddedViewId, isEmbeddedView, setAdminOpen, setDiagLogOpen, setPaletteOpen, setSettingsOpen, setTermOpen, setView, settingsOpen, termOpen, view, VIEW_PREFIX } from "./ui";
+import { adminOpen, diagLogOpen, embeddedViewId, isEmbeddedView, ocLogsOpen, setAdminOpen, setDiagLogOpen, setOcLogsOpen, setPaletteOpen, setSettingsOpen, setTermOpen, setView, settingsOpen, termOpen, view, VIEW_PREFIX } from "./ui";
 import { projectDir } from "./sync";
 
 export default function App() {
@@ -387,6 +388,9 @@ export default function App() {
       </Show>
       <Show when={diagLogOpen()}>
         <DiagLogDialog onClose={() => setDiagLogOpen(false)} />
+      </Show>
+      <Show when={ocLogsOpen()}>
+        <OpenCodeLogsDialog onClose={() => setOcLogsOpen(false)} />
       </Show>
       <PathSelectionAction />
       <SessionContextMenu />

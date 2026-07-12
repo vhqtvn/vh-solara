@@ -1,0 +1,89 @@
+/* OpenCode logs dialog — an always-accessible viewer for the OpenCode process
+ * stdout/stderr ring tail (reached from the server-admin menu's Diagnostics
+ * section, independent of OpenCode health state).
+ *
+ * Scoped; consumes foundation tokens only (see web/src/styles/foundation/
+ * tokens.css). The dialog chrome (.dialog / .dialog-head / .dialog-body) is the
+ * shared global base; this module owns only the log-viewer internals.
+ *
+ * PERF (AGENTS.md → "Web frontend performance — Firefox/WebRender"): the logs
+ * <pre> is a scroll container. The following patterns pin WebRender to ~99°C on
+ * a scrolling surface and are DELIBERATELY absent here:
+ *   - NO mask-image / -webkit-mask
+ *   - NO backdrop-filter: blur
+ *   - NO contain: paint / content-visibility: auto
+ * The ring tail is bounded, so a full <pre> re-render on change is cheap; the
+ * component additionally skips the signal write when the text is unchanged.
+ */
+
+.note {
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--fg-dim);
+  padding: 6px 2px;
+}
+
+.loghead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--fg-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.refresh {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font: inherit;
+  font-size: 11px;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--fg-dim);
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 2px 7px;
+  cursor: pointer;
+}
+.refresh:hover:not(:disabled) {
+  color: var(--fg);
+  border-color: var(--accent);
+}
+.refresh:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+/* Scroll container — intentionally plain. NO mask-image, NO backdrop-filter,
+ * NO contain/content-visibility (each pins WebRender to ~99°C on a scrolling
+ * surface). A bounded ring tail re-rendered on change is cheap. */
+.log {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.4;
+  margin: 0;
+  /* Leaves room for the dialog head + the loghead row on both desktop and the
+   * full-screen mobile dialog. */
+  max-height: 62vh;
+  overflow: auto;
+  padding: 8px;
+  background: var(--code-surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--fg);
+  white-space: pre-wrap;
+  word-break: break-all;
+  user-select: text;
+  -webkit-user-select: text;
+}
+.err {
+  font-size: 11px;
+  color: var(--warn);
+  margin-top: 6px;
+}
