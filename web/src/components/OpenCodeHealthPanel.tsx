@@ -23,6 +23,7 @@ import {
   lifecycleAvailable,
   restartOpenCode,
   snapshot,
+  type LifecycleState,
 } from "../opencode-lifecycle";
 import Icon from "./Icon";
 import styles from "./OpenCodeHealthPanel.module.css";
@@ -42,16 +43,26 @@ export default function OpenCodeHealthPanel() {
   // ── ready pill auto-fade ────────────────────────────────────────────────
   const [showReady, setShowReady] = createSignal(false);
   let readyTimer: ReturnType<typeof setTimeout> | undefined;
+  // Track the previously-seen lifecycle state so the ready pill fires only on
+  // the TRANSITION into "ready" — not on every steady-state poll. The snapshot
+  // signal emits a brand-new object reference on each 5s poll
+  // (refreshOpenCodeLifecycle → setSnapshot), and SolidJS re-runs this effect
+  // on every new reference even when .state is unchanged; without this guard
+  // the pill would re-pop and reset the auto-fade timer every poll.
+  let prevState: LifecycleState | undefined;
   createEffect(() => {
     const st = snap()?.state;
     if (st === "ready" && lifecycleAvailable()) {
-      setShowReady(true);
-      clearTimeout(readyTimer);
-      readyTimer = setTimeout(() => setShowReady(false), READY_PILL_MS);
+      if (prevState !== "ready") {
+        setShowReady(true);
+        clearTimeout(readyTimer);
+        readyTimer = setTimeout(() => setShowReady(false), READY_PILL_MS);
+      }
     } else {
       setShowReady(false);
       clearTimeout(readyTimer);
     }
+    prevState = st;
   });
   onCleanup(() => clearTimeout(readyTimer));
 

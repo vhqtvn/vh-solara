@@ -362,4 +362,96 @@ describe("OpenCodeHealthPanel", () => {
     expect(document.body.textContent).toContain("safe to restart");
     expect(findRestartBtn().disabled).toBe(false);
   });
+
+  // ─────────────────────────────────────────────────────────────────────
+  // Ready-pill transition gating.
+  // The snapshot signal emits a brand-new object reference on every 5s poll
+  // (refreshOpenCodeLifecycle → setSnapshot(snap)), so the panel's createEffect
+  // re-runs every poll even when .state is unchanged. The ready pill must fire
+  // only on the TRANSITION into "ready", not re-pop on every steady-state poll.
+  // ─────────────────────────────────────────────────────────────────────
+
+  it("ready pill fires once on the transition into ready and is NOT re-popped by steady-state ready polls", async () => {
+    // Fake timers so we can deterministically fast-forward past the 4s
+    // READY_PILL_MS auto-fade without a real-time wait.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      // Each /vh/opencode/status response is a FRESH object reference (shallow
+      // clone) — mirroring real polling where JSON.parse yields a new object
+      // each call, which is what re-triggers the effect every 5s.
+      vi.stubGlobal(
+        "fetch",
+        vi.fn((url: string) => {
+          if (url.includes("/vh/opencode/status"))
+            return Promise.resolve(resp({ ...OWNED_READY }));
+          return Promise.resolve(resp({}, false, 404));
+        }),
+      );
+      const { store, Panel } = await fresh();
+      // First ready poll → transition (undefined → ready) → pill pops.
+      await store.refreshOpenCodeLifecycle();
+      render(() => <Panel />);
+
+      await waitFor(() => {
+        expect(document.body.textContent).toContain("OpenCode ready");
+      });
+
+      // Fast-forward past READY_PILL_MS (4000). The auto-fade fires and the
+      // pill must hide.
+      await vi.advanceTimersByTimeAsync(4100);
+      await waitFor(() => {
+        expect(document.body.textContent).not.toContain("OpenCode ready");
+      });
+
+      // A subsequent steady-state ready poll emits a new snapshot reference
+      // with the SAME state="ready", re-triggering the effect. With the
+      // transition guard, the pill must NOT re-pop.
+      await store.refreshOpenCodeLifecycle();
+      // Drain microtasks + any deferred effect flush.
+      await vi.advanceTimersByTimeAsync(50);
+      expect(document.body.textContent).not.toContain("OpenCode ready");
+
+      // A third poll must likewise not re-pop.
+      await store.refreshOpenCodeLifecycle();
+      await vi.advanceTimersByTimeAsync(50);
+      expect(document.body.textContent).not.toContain("OpenCode ready");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("ready pill fires on the transition from failed → ready", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const statusBody = { current: { ...OWNED_FAILED } };
+      vi.stubGlobal(
+        "fetch",
+        vi.fn((url: string) => {
+          if (url.includes("/vh/opencode/status"))
+            return Promise.resolve(resp({ ...statusBody.current }));
+          if (url.includes("/vh/opencode/logs"))
+            return Promise.resolve(resp(null, true, 200, ""));
+          return Promise.resolve(resp({}, false, 404));
+        }),
+      );
+      const { store, Panel } = await fresh();
+      await store.refreshOpenCodeLifecycle();
+      render(() => <Panel />);
+
+      await waitFor(() => {
+        expect(document.body.textContent).toContain("OpenCode failed to start");
+      });
+      // No ready pill while failed.
+      expect(document.body.textContent).not.toContain("OpenCode ready");
+
+      // Transition failed → ready: pill must pop.
+      statusBody.current = { ...OWNED_READY };
+      await store.refreshOpenCodeLifecycle();
+      await waitFor(() => {
+        expect(document.body.textContent).toContain("OpenCode ready");
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
