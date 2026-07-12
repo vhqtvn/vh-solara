@@ -180,4 +180,186 @@ describe("OpenCodeHealthPanel", () => {
     expect(document.querySelector('[role="status"]')).toBeNull();
     expect(document.querySelector('[role="alert"]')).toBeNull();
   });
+
+  // ─────────────────────────────────────────────────────────────────────
+  // F2 — restart-confirm gate
+  // The health panel's restart button must NOT POST /vh/opencode/restart
+  // immediately. It enters an inline confirm step that fetches
+  // /vh/running-sessions and shows a session-interrupt warning; the POST fires
+  // only on Confirm. Fail-closed disables Restart while the count is unknown.
+  // ─────────────────────────────────────────────────────────────────────
+
+  // Locate the restart affordance by its button label. After entering the
+  // confirm step the entry button is replaced by a confirm button with the
+  // same label, so this always returns the currently-visible one.
+  function findRestartBtn(): HTMLButtonElement {
+    const b = Array.from(document.querySelectorAll("button")).find((btn) =>
+      btn.textContent?.includes("Restart OpenCode"),
+    ) as HTMLButtonElement | undefined;
+    if (!b) throw new Error("no visible Restart OpenCode button");
+    return b;
+  }
+
+  it("F2: clicking restart shows a session-interrupt warning and does NOT POST until Confirm", async () => {
+    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+      if (url.includes("/vh/opencode/status"))
+        return Promise.resolve(resp(OWNED_FAILED));
+      if (url.includes("/vh/opencode/logs"))
+        return Promise.resolve(resp(null, true, 200, ""));
+      if (url.includes("/vh/running-sessions"))
+        return Promise.resolve(
+          resp({ count: 2, workspaces: [{ dir: "/a", count: 2 }] }),
+        );
+      if (
+        url.includes("/vh/opencode/restart") &&
+        (init as RequestInit | undefined)?.method === "POST"
+      )
+        return Promise.resolve(resp(OWNED_READY));
+      return Promise.resolve(resp({}, false, 404));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const { store, Panel } = await fresh();
+    await store.refreshOpenCodeLifecycle();
+    render(() => <Panel />);
+
+    await waitFor(() =>
+      expect(document.body.textContent).toContain("OpenCode failed to start"),
+    );
+
+    // Entry click → enters confirm, fetches sessions, shows the warning.
+    findRestartBtn().click();
+    await waitFor(() =>
+      expect(document.body.textContent).toContain("2 running sessions"),
+    );
+    expect(document.body.textContent).toContain("will be interrupted");
+
+    // No restart POST yet — the gate holds.
+    expect(
+      fetchMock.mock.calls.find(
+        ([u, i]) =>
+          (u as string).includes("/vh/opencode/restart") &&
+          (i as RequestInit | undefined)?.method === "POST",
+      ),
+    ).toBeUndefined();
+
+    // Confirm → exactly one POST to /vh/opencode/restart.
+    findRestartBtn().click();
+    await waitFor(() => {
+      const posts = fetchMock.mock.calls.filter(
+        ([u, i]) =>
+          (u as string).includes("/vh/opencode/restart") &&
+          (i as RequestInit | undefined)?.method === "POST",
+      );
+      expect(posts.length).toBe(1);
+    });
+  });
+
+  it("F2: Cancel does NOT POST and returns to the entry button", async () => {
+    const fetchMock = vi.fn((url: string) => {
+      if (url.includes("/vh/opencode/status"))
+        return Promise.resolve(resp(OWNED_FAILED));
+      if (url.includes("/vh/opencode/logs"))
+        return Promise.resolve(resp(null, true, 200, ""));
+      if (url.includes("/vh/running-sessions"))
+        return Promise.resolve(resp({ count: 2, workspaces: [] }));
+      return Promise.resolve(resp({}, false, 404));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const { store, Panel } = await fresh();
+    await store.refreshOpenCodeLifecycle();
+    render(() => <Panel />);
+
+    await waitFor(() =>
+      expect(document.body.textContent).toContain("OpenCode failed to start"),
+    );
+    findRestartBtn().click();
+    await waitFor(() =>
+      expect(document.body.textContent).toContain("2 running sessions"),
+    );
+
+    // Cancel is the second button in the confirm actions row.
+    const cancelBtn = Array.from(document.querySelectorAll("button")).find(
+      (b) => b.textContent === "Cancel",
+    ) as HTMLButtonElement;
+    cancelBtn.click();
+
+    // Back to the entry button (the confirm warning is gone), no POST made.
+    await waitFor(() =>
+      expect(document.body.textContent).toContain("Restart OpenCode"),
+    );
+    expect(document.body.textContent).not.toContain("will be interrupted");
+    expect(
+      fetchMock.mock.calls.find(([u, i]) =>
+        (u as string).includes("/vh/opencode/restart"),
+      ),
+    ).toBeUndefined();
+  });
+
+  it("F2: fail-closed — unknown session count disables Restart (Cancel still works)", async () => {
+    const fetchMock = vi.fn((url: string) => {
+      if (url.includes("/vh/opencode/status"))
+        return Promise.resolve(resp(OWNED_FAILED));
+      if (url.includes("/vh/opencode/logs"))
+        return Promise.resolve(resp(null, true, 200, ""));
+      if (url.includes("/vh/running-sessions"))
+        return Promise.resolve(resp(null, false, 500));
+      return Promise.resolve(resp({}, false, 404));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const { store, Panel } = await fresh();
+    await store.refreshOpenCodeLifecycle();
+    render(() => <Panel />);
+
+    await waitFor(() =>
+      expect(document.body.textContent).toContain("OpenCode failed to start"),
+    );
+    findRestartBtn().click();
+    await waitFor(() =>
+      expect(document.body.textContent).toContain(
+        "Couldn't verify active sessions",
+      ),
+    );
+
+    // Fail-closed: Restart disabled, Cancel enabled.
+    expect(findRestartBtn().disabled).toBe(true);
+    const cancelBtn = Array.from(document.querySelectorAll("button")).find(
+      (b) => b.textContent === "Cancel",
+    ) as HTMLButtonElement;
+    expect(cancelBtn.disabled).toBe(false);
+
+    // No POST possible (disabled), and none was attempted.
+    expect(
+      fetchMock.mock.calls.find(([u]) =>
+        (u as string).includes("/vh/opencode/restart"),
+      ),
+    ).toBeUndefined();
+  });
+
+  it("F2: 0 running sessions shows 'safe to restart' with Restart enabled", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (url.includes("/vh/opencode/status"))
+          return Promise.resolve(resp(OWNED_FAILED));
+        if (url.includes("/vh/opencode/logs"))
+          return Promise.resolve(resp(null, true, 200, ""));
+        if (url.includes("/vh/running-sessions"))
+          return Promise.resolve(resp({ count: 0, workspaces: [] }));
+        return Promise.resolve(resp({}, false, 404));
+      }),
+    );
+    const { store, Panel } = await fresh();
+    await store.refreshOpenCodeLifecycle();
+    render(() => <Panel />);
+
+    await waitFor(() =>
+      expect(document.body.textContent).toContain("OpenCode failed to start"),
+    );
+    findRestartBtn().click();
+    await waitFor(() =>
+      expect(document.body.textContent).toContain("0 running sessions"),
+    );
+    expect(document.body.textContent).toContain("safe to restart");
+    expect(findRestartBtn().disabled).toBe(false);
+  });
 });

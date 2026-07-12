@@ -130,12 +130,49 @@ export default function OpenCodeHealthPanel() {
   // ── Restart ─────────────────────────────────────────────────────────────
   const [restarting, setRestarting] = createSignal(false);
   const [restartErr, setRestartErr] = createSignal(false);
+
+  // F2: confirm gate. Restarting OpenCode interrupts every running session
+  // across ALL workspaces the daemon manages (not just this tab's view), so the
+  // restart button does NOT POST immediately. Instead it enters an inline
+  // confirm step (rendered inside the card — no separate centered dialog, since
+  // the health panel is already a card overlay) that fetches
+  // /vh/running-sessions and shows a warning. Mirrors RestartConfirm's tri-state
+  // (loading / known / unknown) so the warning is honest about uncertainty;
+  // fail-closed disables Restart while the count is unknown (the operator can
+  // still Cancel). The POST still targets /vh/opencode/restart (NOT the legacy
+  // /vh/restart-opencode) because it returns a post-restart Snapshot the store
+  // adopts directly.
+  const [confirmRestart, setConfirmRestart] = createSignal(false);
+  type SessionFetchState = "loading" | "known" | "unknown";
+  const [sessionState, setSessionState] =
+    createSignal<SessionFetchState>("loading");
+  const [sessionCount, setSessionCount] = createSignal(0);
+
+  async function enterConfirm(): Promise<void> {
+    setConfirmRestart(true);
+    setRestartErr(false);
+    setSessionState("loading");
+    try {
+      const res = await fetch("/vh/running-sessions");
+      if (!res.ok) {
+        setSessionState("unknown");
+        return;
+      }
+      const d = (await res.json()) as { count?: number };
+      setSessionCount(d.count ?? 0);
+      setSessionState("known");
+    } catch {
+      setSessionState("unknown");
+    }
+  }
+
   async function onRestart(): Promise<void> {
     if (restarting()) return;
     setRestarting(true);
     setRestartErr(false);
     const ok = await restartOpenCode();
     setRestarting(false);
+    setConfirmRestart(false);
     if (!ok) setRestartErr(true);
   }
 
@@ -266,24 +303,100 @@ export default function OpenCodeHealthPanel() {
             </Show>
           </Show>
 
-          {/* Restart (owned/detached only). */}
+          {/* Restart (owned/detached only). F2: an inline confirm gate shows a
+              session-interrupt warning before the POST. The POST still targets
+              /vh/opencode/restart (returns the post-restart Snapshot). */}
           <Show when={snap()?.capabilities.can_restart}>
-            <div class={styles["och-actions"]}>
-              <button
-                type="button"
-                class={styles["och-restart"]}
-                onClick={() => void onRestart()}
-                disabled={restarting()}
-              >
-                <Icon name="retry" size={14} />
-                {restarting() ? "Restarting…" : "Restart OpenCode"}
-              </button>
-              <Show when={restartErr()}>
-                <span class={styles["och-restart-err"]}>
-                  Restart failed — try again.
-                </span>
-              </Show>
-            </div>
+            <Show
+              when={!confirmRestart()}
+              fallback={
+                <div class={styles["och-confirm"]}>
+                  <Show
+                    when={sessionState() !== "loading"}
+                    fallback={
+                      <span class={styles["och-confirm-loading"]}>
+                        Checking active sessions…
+                      </span>
+                    }
+                  >
+                    <Show
+                      when={sessionState() === "known"}
+                      fallback={
+                        <span class={styles["och-confirm-warn"]}>
+                          Couldn't verify active sessions — restart will
+                          interrupt any that are running.
+                        </span>
+                      }
+                    >
+                      <Show
+                        when={sessionCount() > 0}
+                        fallback={
+                          <span class={styles["och-confirm-safe"]}>
+                            0 running sessions — safe to restart. OpenCode will
+                            be briefly unavailable; sessions are preserved.
+                          </span>
+                        }
+                      >
+                        <span class={styles["och-confirm-warn"]}>
+                          ⚠ {sessionCount()} running session
+                          {sessionCount() === 1 ? "" : "s"} will be interrupted.
+                          In-flight turn(s) stop; sessions and history are
+                          preserved.
+                        </span>
+                      </Show>
+                    </Show>
+                  </Show>
+                  <div class={styles["och-actions"]}>
+                    <button
+                      type="button"
+                      class={styles["och-restart"]}
+                      onClick={() => void onRestart()}
+                      disabled={
+                        restarting() ||
+                        sessionState() === "loading" ||
+                        sessionState() === "unknown"
+                      }
+                    >
+                      <Icon name="retry" size={14} />
+                      {restarting() ? "Restarting…" : "Restart OpenCode"}
+                    </button>
+                    <button
+                      type="button"
+                      class={styles["och-cancel"]}
+                      onClick={() => {
+                        if (restarting()) return;
+                        setConfirmRestart(false);
+                      }}
+                      disabled={restarting()}
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                  <Show when={restartErr()}>
+                    <span class={styles["och-restart-err"]}>
+                      Restart failed — try again.
+                    </span>
+                  </Show>
+                </div>
+              }
+            >
+              <div class={styles["och-actions"]}>
+                <button
+                  type="button"
+                  class={styles["och-restart"]}
+                  onClick={() => void enterConfirm()}
+                  disabled={restarting()}
+                >
+                  <Icon name="retry" size={14} />
+                  {restarting() ? "Restarting…" : "Restart OpenCode"}
+                </button>
+                <Show when={restartErr()}>
+                  <span class={styles["och-restart-err"]}>
+                    Restart failed — try again.
+                  </span>
+                </Show>
+              </div>
+            </Show>
           </Show>
         </div>
       </Show>

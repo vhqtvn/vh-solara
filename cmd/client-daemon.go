@@ -772,14 +772,17 @@ func waitForURL(url string, timeout time.Duration) error {
 // A clean (code 0) exit is recorded as stopped; any other exit (or a Wait
 // error) is recorded as failed with the exit code when observable. life may be
 // nil for callers that only want the reap side effect.
+//
+// ORDERING INVARIANT: the lifecycle state-set (SetStopped/SetFailed) MUST
+// happen BEFORE close(done). restartOpencodeLocked unblocks its owned restart
+// on <-oldDone, so closing done only after the state is recorded guarantees
+// that the restart path's SetStarting() → SetReady() overwrites the reaper's
+// honest exit report in the correct order. Closing done first (the old
+// ordering) let this reaper's state-set land AFTER the fresh SetReady() under
+// scheduler/GC delay, stranding the lifecycle on failed/stopped until the next
+// poll. See TestReapOwnedOpenCode* for the ordering guarantee.
 func reapOwnedOpenCode(cmd *exec.Cmd, done chan struct{}, life *oclife.Lifecycle) {
 	err := cmd.Wait()
-	if done != nil {
-		close(done)
-	}
-	if life == nil {
-		return
-	}
 	var (
 		ec      *int
 		summary string
@@ -791,15 +794,23 @@ func reapOwnedOpenCode(cmd *exec.Cmd, done chan struct{}, life *oclife.Lifecycle
 	if err != nil {
 		summary = err.Error()
 	}
-	switch {
-	case ec != nil && *ec == 0 && summary == "":
-		life.SetStopped()
-	case summary == "" && ec != nil:
-		life.SetFailed(fmt.Sprintf("opencode serve exited with code %d", *ec), ec)
-	case summary == "":
-		life.SetFailed("opencode serve exited", ec)
-	default:
-		life.SetFailed(summary, ec)
+	// Record the exit BEFORE closing done — see the ORDERING INVARIANT above.
+	if life != nil {
+		switch {
+		case ec != nil && *ec == 0 && summary == "":
+			life.SetStopped()
+		case summary == "" && ec != nil:
+			life.SetFailed(fmt.Sprintf("opencode serve exited with code %d", *ec), ec)
+		case summary == "":
+			life.SetFailed("opencode serve exited", ec)
+		default:
+			life.SetFailed(summary, ec)
+		}
+	}
+	// Close done LAST so a caller observing it knows the reaper has fully
+	// recorded the exit (both the Wait return and the lifecycle state-set).
+	if done != nil {
+		close(done)
 	}
 }
 
