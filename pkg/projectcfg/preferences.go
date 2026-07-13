@@ -34,3 +34,20 @@ func ParseAgentStyles(raw []byte) (map[string]AgentStyle, error) {
 	}
 	return doc.AgentStyles, nil
 }
+
+// ParseNameReplacements parses ONLY the nameReplacements array from raw JSONC
+// bytes — the personal-preferences overlay. It returns (nil, nil) when
+// nameReplacements is absent, so a caller can treat "key not present" exactly
+// like "file not present": both mean "no overlay; use the base". A present-but-
+// empty `nameReplacements: []` returns a non-nil empty slice (an explicit
+// clear). A populated array preserves order. A malformed document returns an
+// error. This mirrors ParseAgentStyles' absent-vs-empty distinction.
+func ParseNameReplacements(raw []byte) ([]NameReplacementRule, error) {
+	var doc struct {
+		NameReplacements []NameReplacementRule `json:"nameReplacements,omitempty"`
+	}
+	if err := json.Unmarshal(stripJSONC(raw), &doc); err != nil {
+		return nil, err
+	}
+	return doc.NameReplacements, nil
+}

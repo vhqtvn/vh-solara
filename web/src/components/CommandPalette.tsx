@@ -2,6 +2,7 @@ import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show }
 import { paletteOpen, setPaletteOpen, setSettingsOpen, setAdminOpen, setView, focusComposer } from "../ui";
 import { newSession, openSession, setSelectedId, state } from "../sync";
 import { toggleSidebar } from "../layout";
+import { displayName } from "../projectSettings";
 import { setSearchQuery } from "../sidebar";
 import { exportSessionMarkdown } from "../export";
 import { selectedId } from "../sync";
@@ -34,7 +35,7 @@ export default function CommandPalette() {
     { id: "chat", label: "Go to Chat", run: () => setView("chat") },
     { id: "changes", label: "Go to Changes", run: () => setView("changes") },
     { id: "notes", label: "Go to Notes", run: () => setView("notes") },
-    { id: "agents", label: "Go to Agent styles", run: () => setView("agents") },
+    { id: "preferences", label: "Go to Preferences", run: () => setView("preferences") },
     { id: "focus", label: "Focus composer", run: () => focusComposer() },
     { id: "settings", label: "Open Settings", run: () => setSettingsOpen(true) },
     { id: "admin", label: "Server admin", run: () => setAdminOpen(true) },
@@ -53,7 +54,7 @@ export default function CommandPalette() {
       .slice(0, 8)
       .map((s) => ({
         id: "go:" + s.id,
-        label: s.title || s.id,
+        label: displayName(s.title || s.id),
         hint: "session",
         run: () => { setSelectedId(s.id); void openSession(s.id); },
       }));

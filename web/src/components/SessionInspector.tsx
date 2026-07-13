@@ -2,6 +2,7 @@ import { createMemo, For, onCleanup, onMount, Show } from "solid-js";
 import { state } from "../sync";
 import { findModel, selectionFor } from "../models";
 import { openArchiveConfirm } from "../sessionMenu";
+import { displayName } from "../projectSettings";
 import QuotaPanel from "./QuotaPanel";
 import SessionTimingBlock from "./SessionTimingBlock";
 import Icon from "./Icon";
@@ -81,7 +82,7 @@ export default function SessionInspector(props: { sessionId: string; onClose: ()
           </button>
         </div>
         <div class="dialog-body">
-          <div class="insp-sub">{session()?.title || props.sessionId}</div>
+          <div class="insp-sub">{displayName(session()?.title || props.sessionId)}</div>
           <Show when={model()}>
             <div class="insp-sub dim">
               {model()!.name} · {model()!.provider}

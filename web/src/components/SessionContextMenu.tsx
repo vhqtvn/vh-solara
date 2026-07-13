@@ -15,6 +15,7 @@ import {
   openArchiveConfirm,
 } from "../sessionMenu";
 import type { Session } from "../types";
+import { displayName } from "../projectSettings";
 import Icon from "./Icon";
 import TextPromptDialog from "./TextPromptDialog";
 
@@ -251,7 +252,7 @@ export default function SessionContextMenu() {
       <Show when={menuTarget() && !pos()}>
         <div class="dialog-overlay" onClick={closeSessionMenu}>
           <div class="ctxm-sheet" role="menu" onClick={(e) => e.stopPropagation()}>
-            <div class="ctxm-sheet-title">{menuTarget()!.title}</div>
+            <div class="ctxm-sheet-title">{displayName(menuTarget()!.title)}</div>
             <Items id={menuTarget()!.id} title={menuTarget()!.title} />
           </div>
         </div>
@@ -276,7 +277,7 @@ export default function SessionContextMenu() {
                 <For each={related()}>
                   {(s, i) => (
                     <li classList={{ root: i() === 0 }}>
-                      <span class="confirm-title">{s.title || s.id}</span>
+                      <span class="confirm-title">{displayName(s.title || s.id)}</span>
                       <span class="confirm-id">{s.id}</span>
                     </li>
                   )}

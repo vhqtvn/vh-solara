@@ -538,25 +538,31 @@ func (s *Server) handleManaged(w http.ResponseWriter, r *http.Request) {
 // preferences.local.jsonc overlay, and the migration also rewrites
 // project.jsonc — a shared lock prevents a concurrent PUT from interleaving).
 
-// handleProjectSettings serves per-project UI settings. GET merges the checked-in
-// project.jsonc (base: notes + a team-default agentStyles) with the gitignored
-// preferences.local.jsonc overlay (personal agentStyles that fully replace the
-// base); PUT writes the display-only `agentStyles` ONLY to
-// preferences.local.jsonc — it never touches project.jsonc, so a personal UI pref
-// never dirties the committed file.
+// handleProjectSettings serves per-project UI settings. GET merges the
+// checked-in project.jsonc (base: notes + a team-default agentStyles +
+// nameReplacements) with the gitignored preferences.local.jsonc overlay
+// (personal agentStyles / nameReplacements that fully replace the base); PUT
+// writes the display-only `agentStyles` and/or `nameReplacements` ONLY to
+// preferences.local.jsonc — it never touches project.jsonc, so a personal UI
+// pref never dirties the committed file.
 //
 // GET returns `notes` (tri-state; omitted when not declared, so the client falls
-// back to its global pref — always from project.jsonc) and `agentStyles` (raw
+// back to its global pref — always from project.jsonc), `agentStyles` (raw
 // declared treatments — the client sanitizes color/style against fixed enums;
-// the overlay wins over the base via whole-map overwrite). Tolerant: any
-// read/parse miss returns an empty object.
+// the overlay wins over the base via whole-map overwrite), and `nameReplacements`
+// (an ordered array of display-only regex text replacements applied to session
+// titles at render sites; the overlay wins over the base via whole-array
+// overwrite). Each key merges independently. Tolerant: any read/parse miss
+// returns an empty object.
 //
-// PUT { agentStyles, dryRun } edits ONLY the agentStyles key of
-// preferences.local.jsonc via a comment-preserving splice (creating the overlay
-// fresh when absent). It never touches the trust-gated processes/views of
-// project.jsonc (and leaves the trust hash unchanged, so no re-gate). dryRun
-// returns the old and new overlay text for a confirm-diff; otherwise the new
-// text is written (creating .vh-solara/ as needed).
+// PUT { agentStyles?, nameReplacements?, dryRun } edits ONLY the supplied keys
+// of preferences.local.jsonc via comment-preserving splices (creating the
+// overlay fresh when absent). Presence-aware: a key sent as null/absent is a
+// no-op and is never written `null`, so a replacements-only save leaves
+// agentStyles byte-intact and vice versa. It never touches the trust-gated
+// processes/views of project.jsonc (and leaves the trust hash unchanged, so no
+// re-gate). dryRun returns the old and new overlay text for a confirm-diff;
+// otherwise the new text is written (creating .vh-solara/ as needed).
 func (s *Server) handleProjectSettings(w http.ResponseWriter, r *http.Request) {
 	override := ""
 	if s.managed != nil {
@@ -570,9 +576,10 @@ func (s *Server) handleProjectSettings(w http.ResponseWriter, r *http.Request) {
 			writeJSONResp(w, out)
 			return
 		}
-		// Base: notes + agentStyles from the checked-in project.jsonc (a team
-		// default the operator may or may not have committed). notes always comes
-		// from here — it has no UI writer and is a repo declaration.
+		// Base: notes + agentStyles + nameReplacements from the checked-in
+		// project.jsonc (a team default the operator may or may not have
+		// committed). notes always comes from here — it has no UI writer and is
+		// a repo declaration.
 		lr, err := projectcfg.Load(root, override)
 		if err == nil && lr.Config != nil {
 			if lr.Config.Notes != nil {
@@ -581,29 +588,45 @@ func (s *Server) handleProjectSettings(w http.ResponseWriter, r *http.Request) {
 			if len(lr.Config.AgentStyles) > 0 {
 				out["agentStyles"] = lr.Config.AgentStyles
 			}
+			if len(lr.Config.NameReplacements) > 0 {
+				out["nameReplacements"] = lr.Config.NameReplacements
+			}
 		}
 		// Overlay: the gitignored preferences.local.jsonc (personal/local). If it
 		// declares agentStyles it FULLY REPLACES the base map (whole-map
-		// overwrite, not a per-key merge), so a local pref always wins. A missing
-		// overlay file is the normal case and is tolerated silently — the base
-		// stands on its own.
+		// overwrite, not a per-key merge), so a local pref always wins; likewise
+		// nameReplacements fully replaces the base array. A missing overlay file
+		// is the normal case and is tolerated silently — the base stands on its
+		// own. Each key merges independently (one present, the other absent).
 		if prefPath, perr := projectcfg.ResolvePreferencesPath(root, override); perr == nil {
 			if raw, rerr := os.ReadFile(prefPath); rerr == nil {
 				if styles, parseErr := projectcfg.ParseAgentStyles(raw); parseErr == nil && styles != nil {
 					out["agentStyles"] = styles
+				}
+				if repls, parseErr := projectcfg.ParseNameReplacements(raw); parseErr == nil && repls != nil {
+					out["nameReplacements"] = repls
 				}
 			}
 		}
 		writeJSONResp(w, out)
 
 	case http.MethodPut, http.MethodPost:
+		// Presence-aware pointers: a key is applied ONLY when its pointer is
+		// non-nil (i.e. the client explicitly sent it, even as an empty map/
+		// array). An omitted key is a no-op — it is never written `null`, so a
+		// replacements-only save leaves agentStyles byte-intact and vice versa.
 		var body struct {
-			AgentStyles map[string]projectcfg.AgentStyle `json:"agentStyles"`
-			DryRun      bool                             `json:"dryRun"`
+			AgentStyles      *map[string]projectcfg.AgentStyle `json:"agentStyles"`
+			NameReplacements *[]projectcfg.NameReplacementRule `json:"nameReplacements"`
+			DryRun           bool                              `json:"dryRun"`
 		}
 		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, "invalid body", http.StatusBadRequest)
+			return
+		}
+		if body.AgentStyles == nil && body.NameReplacements == nil {
+			http.Error(w, "no settings supplied", http.StatusBadRequest)
 			return
 		}
 		root, err := projectRoot(reqDir(r))
@@ -614,7 +637,9 @@ func (s *Server) handleProjectSettings(w http.ResponseWriter, r *http.Request) {
 		// CRITICAL: the PUT writes ONLY the gitignored preferences.local.jsonc
 		// overlay. It never reads, splices, or writes project.jsonc — a personal
 		// UI pref must not mutate the checked-in declarative file. SpliceTopLevelKey
-		// already creates a fresh document when the overlay is absent.
+		// already creates a fresh document when the overlay is absent. Each
+		// supplied key is spliced sequentially into one evolving overlay text
+		// (deterministic order: agentStyles, then nameReplacements).
 		path, err := projectcfg.ResolvePreferencesPath(root, override)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -628,10 +653,22 @@ func (s *Server) handleProjectSettings(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, readErr.Error(), http.StatusInternalServerError)
 			return
 		}
-		newRaw, err := projectcfg.SpliceTopLevelKey(oldRaw, "agentStyles", body.AgentStyles)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
+		newRaw := append([]byte(nil), oldRaw...)
+		if body.AgentStyles != nil {
+			n, err := projectcfg.SpliceTopLevelKey(newRaw, "agentStyles", *body.AgentStyles)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			newRaw = n
+		}
+		if body.NameReplacements != nil {
+			n, err := projectcfg.SpliceTopLevelKey(newRaw, "nameReplacements", *body.NameReplacements)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			newRaw = n
 		}
 		if body.DryRun {
 			writeJSONResp(w, map[string]any{"old": string(oldRaw), "new": string(newRaw)})

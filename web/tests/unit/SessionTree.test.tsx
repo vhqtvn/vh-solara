@@ -5,7 +5,8 @@ import { reconcile } from "solid-js/store";
 import { setState, setSelectedIdRaw } from "../../src/sync/store";
 import type { Session } from "../../src/types";
 import SessionTree, { __resetTreeForTest } from "../../src/components/SessionTree";
-import { __resetPinnedForTest } from "../../src/sidebar";
+import { __resetPinnedForTest, setSearchQuery } from "../../src/sidebar";
+import { setNameReplacements } from "../../src/projectSettings";
 
 // The twisty glyph (collapse/expand marker on a parent row) must reflect whether
 // the node's subtree ACTUALLY has running work. The `filtered` mode is the
@@ -346,5 +347,43 @@ describe("SessionTree pinned order", () => {
     // The unpinned row has no handle and no data-pinned-id.
     const unpinnedRow = container.querySelector('.tree-row:not([data-pinned-id])');
     expect(unpinnedRow?.querySelector(".tree-drag")).toBeNull();
+  });
+});
+
+describe("displayName boundary", () => {
+  afterEach(() => {
+    setNameReplacements([]);
+    setSearchQuery("");
+  });
+
+  it("transforms visible title + tooltip but keeps search filter raw", async () => {
+    setNameReplacements([{ pattern: "\\[\\[X\\]\\]", replacement: "Y", flags: "g" }]);
+    putSession({ id: "s1", title: "[[X]] test", time: { created: 1, updated: 1 } } as Session);
+    const { container } = render(() => <SessionTree />);
+
+    // DISPLAY: visible title + tooltip are transformed.
+    await waitFor(() => {
+      const node = container.querySelector('.tree-node[data-session-id="s1"]');
+      expect(node).toBeTruthy();
+    });
+    const node = container.querySelector('.tree-node[data-session-id="s1"]') as HTMLElement;
+    expect(node.getAttribute("data-tip")).toBe("Y test");
+    expect(node.querySelector(".tree-title")?.textContent).toBe("Y test");
+
+    // RAW: search uses the raw title. Searching for the DISPLAY form ("Y test")
+    // does NOT match the session.
+    setSearchQuery("Y test");
+    await waitFor(() => {
+      expect(container.querySelector('.tree-node[data-session-id="s1"]')).toBeNull();
+    });
+
+    // RAW: searching for the RAW title ("[[X]]") DOES find the session,
+    // even though its visible label shows "Y test" (DISPLAY).
+    setSearchQuery("[[X]]");
+    await waitFor(() => {
+      const searchNode = container.querySelector('.tree-node[data-session-id="s1"]');
+      expect(searchNode).toBeTruthy();
+      expect(searchNode?.querySelector(".tree-title")?.textContent).toBe("Y test");
+    });
   });
 });

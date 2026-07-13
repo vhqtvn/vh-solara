@@ -155,12 +155,12 @@ export default function Sidebar(props: { open: boolean; onClose: () => void }) {
                 role="menuitem"
                 onClick={() => {
                   setProjMenuOpen(false);
-                  setView("agents");
+                  setView("preferences");
                   props.onClose(); // close the mobile slide-over; no-op on desktop
                 }}
               >
                 <Icon name="settings" size={14} />
-                Agent styles
+                Preferences
               </button>
               <button
                 type="button"

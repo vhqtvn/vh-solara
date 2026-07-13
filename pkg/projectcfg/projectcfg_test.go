@@ -216,6 +216,63 @@ func TestAgentStylesParsedNotInTrustHash(t *testing.T) {
 	}
 }
 
+// TestNameReplacementsParsedNotInTrustHash verifies the display-only
+// nameReplacements array is parsed but, like notes and agentStyles, excluded
+// from the trust hash — it's advisory render data the client compiles
+// client-side, so it executes nothing and must not re-gate.
+func TestNameReplacementsParsedNotInTrustHash(t *testing.T) {
+	base := `{"processes":[{"id":"p","command":"echo hi"}]}`
+	withRepls := `{"nameReplacements":[{"pattern":"[[IMPORTANT]]","replacement":"❗","flags":"g"}],"processes":[{"id":"p","command":"echo hi"}]}`
+	dir := t.TempDir()
+	writeConfig(t, dir, base)
+	ra, err := Load(dir, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeConfig(t, dir, withRepls)
+	rb, err := Load(dir, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ra.Hash != rb.Hash {
+		t.Fatalf("nameReplacements changed the trust hash: %s vs %s", ra.Hash, rb.Hash)
+	}
+	if len(rb.Config.NameReplacements) != 1 {
+		t.Fatalf("nameReplacements not parsed: %+v", rb.Config.NameReplacements)
+	}
+	r := rb.Config.NameReplacements[0]
+	if r.Pattern != "[[IMPORTANT]]" || r.Replacement != "❗" || r.Flags != "g" {
+		t.Fatalf("nameReplacements[0] fields not parsed: %+v", r)
+	}
+}
+
+// TestNameReplacementsAbsentVsEmpty verifies the omitempty-tagged field keeps
+// the absent-vs-empty distinction used by ParseNameReplacements' caller.
+func TestNameReplacementsAbsentVsEmpty(t *testing.T) {
+	dir := t.TempDir()
+	// Absent key → nil slice.
+	writeConfig(t, dir, `{"processes":[{"id":"p","command":"echo hi"}]}`)
+	ra, err := Load(dir, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ra.Config.NameReplacements != nil {
+		t.Fatalf("absent nameReplacements should be nil: %+v", ra.Config.NameReplacements)
+	}
+	// Present `[]` → non-nil empty slice (explicit clear).
+	writeConfig(t, dir, `{"nameReplacements":[],"processes":[{"id":"p","command":"echo hi"}]}`)
+	rb, err := Load(dir, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rb.Config.NameReplacements == nil {
+		t.Fatal("present [] nameReplacements should be non-nil empty slice")
+	}
+	if len(rb.Config.NameReplacements) != 0 {
+		t.Fatalf("present [] nameReplacements should be empty: %+v", rb.Config.NameReplacements)
+	}
+}
+
 func TestValidationErrors(t *testing.T) {
 	cases := []struct {
 		name string

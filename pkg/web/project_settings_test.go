@@ -45,6 +45,26 @@ func getProjectSettings(t *testing.T, ws *httptest.Server, dir string) map[strin
 	return out
 }
 
+// putProjectSettings issues a PUT (with the required CSRF header) and returns
+// the raw response body bytes.
+func putProjectSettings(t *testing.T, ws *httptest.Server, dir string, payload map[string]any) []byte {
+	t.Helper()
+	b, _ := json.Marshal(payload)
+	req, _ := http.NewRequest(http.MethodPut, ws.URL+"/vh/project-settings?dir="+dir, bytes.NewReader(b))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-VH-CSRF", "1")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("put status: %d body: %s", resp.StatusCode, body)
+	}
+	return body
+}
+
 // TestProjectSettingsGET_OverlayAgentStylesWinsOverBase: when both project.jsonc
 // and preferences.local.jsonc declare agentStyles, the overlay FULLY REPLACES the
 // base (whole-map overwrite), while notes still comes from project.jsonc.
@@ -277,5 +297,357 @@ func TestProjectSettingsGET_PostMigrationBaseHasNoAgentStyles(t *testing.T) {
 	sup, ok := styles["supervisor"].(map[string]any)
 	if !ok || sup["label"] != "SUP" {
 		t.Fatalf("overlay agentStyles not surfaced when base has no agentStyles: %+v", styles)
+	}
+}
+
+// --- nameReplacements (display-only session-title replacement layer) ---
+
+// TestProjectSettingsGET_NameReplacementsBaseWhenOverlayAbsent: with no overlay,
+// the base nameReplacements array stands on its own.
+func TestProjectSettingsGET_NameReplacementsBaseWhenOverlayAbsent(t *testing.T) {
+	ws := newWebServer(t)
+	defer ws.Close()
+
+	root := writeProjectFile(t, "project.jsonc", `{
+  "nameReplacements": [{ "pattern": "base", "replacement": "B", "flags": "g" }]
+}`)
+
+	body := getProjectSettings(t, ws, root)
+	repls, ok := body["nameReplacements"].([]any)
+	if !ok || len(repls) != 1 {
+		t.Fatalf("base nameReplacements not surfaced: %+v", body)
+	}
+	r := repls[0].(map[string]any)
+	if r["pattern"] != "base" || r["replacement"] != "B" || r["flags"] != "g" {
+		t.Fatalf("base nameReplacements fields wrong: %+v", r)
+	}
+}
+
+// TestProjectSettingsGET_OverlayNameReplacementsWinsOverBase: when both files
+// declare nameReplacements, the overlay FULLY REPLACES the base array.
+func TestProjectSettingsGET_OverlayNameReplacementsWinsOverBase(t *testing.T) {
+	ws := newWebServer(t)
+	defer ws.Close()
+
+	root := writeProjectFile(t, "project.jsonc", `{
+  "nameReplacements": [{ "pattern": "base", "replacement": "B" }]
+}`)
+	if err := os.WriteFile(filepath.Join(root, ".vh-solara", "preferences.local.jsonc"),
+		[]byte(`{ "nameReplacements": [{ "pattern": "overlay", "replacement": "O", "flags": "g" }] }`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	body := getProjectSettings(t, ws, root)
+	repls, ok := body["nameReplacements"].([]any)
+	if !ok {
+		t.Fatalf("nameReplacements missing: %+v", body)
+	}
+	if len(repls) != 1 {
+		t.Fatalf("overlay should fully replace base array, got len=%d: %+v", len(repls), repls)
+	}
+	r := repls[0].(map[string]any)
+	if r["pattern"] != "overlay" {
+		t.Fatalf("overlay nameReplacements not surfaced (base should be gone): %+v", r)
+	}
+}
+
+// TestProjectSettingsGET_OverlayEmptyArrayClearsBase: a present `[]` in the
+// overlay explicitly clears the base array (overlay presence wins, even empty).
+func TestProjectSettingsGET_OverlayEmptyArrayClearsBase(t *testing.T) {
+	ws := newWebServer(t)
+	defer ws.Close()
+
+	root := writeProjectFile(t, "project.jsonc", `{
+  "nameReplacements": [{ "pattern": "base", "replacement": "B" }]
+}`)
+	if err := os.WriteFile(filepath.Join(root, ".vh-solara", "preferences.local.jsonc"),
+		[]byte(`{ "nameReplacements": [] }`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	body := getProjectSettings(t, ws, root)
+	repls, ok := body["nameReplacements"].([]any)
+	if !ok {
+		t.Fatalf("nameReplacements key should be present (explicit clear): %+v", body)
+	}
+	if len(repls) != 0 {
+		t.Fatalf("explicit [] should clear, got %+v", repls)
+	}
+}
+
+// TestProjectSettingsGET_IndependentMergeOfTwoKeys: agentStyles and
+// nameReplacements merge independently — base agentStyles + overlay
+// nameReplacements both surface (and vice versa).
+func TestProjectSettingsGET_IndependentMergeOfTwoKeys(t *testing.T) {
+	ws := newWebServer(t)
+	defer ws.Close()
+
+	// Case 1: base carries agentStyles; overlay carries nameReplacements.
+	root := writeProjectFile(t, "project.jsonc", `{
+  "agentStyles": { "build": { "label": "BLD" } }
+}`)
+	if err := os.WriteFile(filepath.Join(root, ".vh-solara", "preferences.local.jsonc"),
+		[]byte(`{ "nameReplacements": [{ "pattern": "x", "replacement": "y" }] }`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	body := getProjectSettings(t, ws, root)
+	if _, ok := body["agentStyles"].(map[string]any); !ok {
+		t.Fatalf("base agentStyles should surface alongside overlay nameReplacements: %+v", body)
+	}
+	if _, ok := body["nameReplacements"].([]any); !ok {
+		t.Fatalf("overlay nameReplacements should surface alongside base agentStyles: %+v", body)
+	}
+
+	// Case 2: base carries nameReplacements; overlay carries agentStyles.
+	root2 := writeProjectFile(t, "project.jsonc", `{
+  "nameReplacements": [{ "pattern": "x", "replacement": "y" }]
+}`)
+	if err := os.WriteFile(filepath.Join(root2, ".vh-solara", "preferences.local.jsonc"),
+		[]byte(`{ "agentStyles": { "supervisor": { "label": "SUP" } } }`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	body2 := getProjectSettings(t, ws, root2)
+	if _, ok := body2["agentStyles"].(map[string]any); !ok {
+		t.Fatalf("overlay agentStyles should surface alongside base nameReplacements: %+v", body2)
+	}
+	if _, ok := body2["nameReplacements"].([]any); !ok {
+		t.Fatalf("base nameReplacements should surface alongside overlay agentStyles: %+v", body2)
+	}
+}
+
+// TestProjectSettingsPUT_NameReplacementsOnlyLeavesAgentStylesIntact: a PUT with
+// ONLY nameReplacements must leave an existing agentStyles key byte-intact in
+// the overlay (the splice is key-presence-aware: omitted keys are no-ops, never
+// written null).
+func TestProjectSettingsPUT_NameReplacementsOnlyLeavesAgentStylesIntact(t *testing.T) {
+	ws := newWebServer(t)
+	defer ws.Close()
+
+	root := writeProjectFile(t, "project.jsonc", `{}`)
+	prefPath := filepath.Join(root, ".vh-solara", "preferences.local.jsonc")
+	seeded := `{
+  "agentStyles": { "supervisor": { "label": "SUP", "color": "danger" } }
+}`
+	if err := os.WriteFile(prefPath, []byte(seeded), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	putProjectSettings(t, ws, root, map[string]any{
+		"nameReplacements": []map[string]any{
+			{"pattern": "x", "replacement": "y"},
+		},
+	})
+
+	pref, err := os.ReadFile(prefPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	styles, err := projectcfg.ParseAgentStyles(pref)
+	if err != nil {
+		t.Fatalf("preferences unparseable: %v\n%s", err, pref)
+	}
+	if styles["supervisor"].Label != "SUP" || styles["supervisor"].Color != "danger" {
+		t.Fatalf("agentStyles should be byte-intact when only nameReplacements supplied: %+v\n%s", styles, pref)
+	}
+	repls, err := projectcfg.ParseNameReplacements(pref)
+	if err != nil {
+		t.Fatalf("preferences unparseable: %v\n%s", err, pref)
+	}
+	if len(repls) != 1 || repls[0].Pattern != "x" || repls[0].Replacement != "y" {
+		t.Fatalf("nameReplacements not written: %+v\n%s", repls, pref)
+	}
+}
+
+// TestProjectSettingsPUT_AgentStylesOnlyLeavesNameReplacementsIntact: the
+// converse — agentStyles-only PUT must not disturb an existing nameReplacements
+// key.
+func TestProjectSettingsPUT_AgentStylesOnlyLeavesNameReplacementsIntact(t *testing.T) {
+	ws := newWebServer(t)
+	defer ws.Close()
+
+	root := writeProjectFile(t, "project.jsonc", `{}`)
+	prefPath := filepath.Join(root, ".vh-solara", "preferences.local.jsonc")
+	seeded := `{
+  "nameReplacements": [{ "pattern": "x", "replacement": "y" }]
+}`
+	if err := os.WriteFile(prefPath, []byte(seeded), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	putProjectSettings(t, ws, root, map[string]any{
+		"agentStyles": map[string]any{
+			"supervisor": map[string]any{"label": "SUP"},
+		},
+	})
+
+	pref, err := os.ReadFile(prefPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repls, err := projectcfg.ParseNameReplacements(pref)
+	if err != nil {
+		t.Fatalf("preferences unparseable: %v\n%s", err, pref)
+	}
+	if len(repls) != 1 || repls[0].Pattern != "x" || repls[0].Replacement != "y" {
+		t.Fatalf("nameReplacements should be intact when only agentStyles supplied: %+v\n%s", repls, pref)
+	}
+}
+
+// TestProjectSettingsPUT_CombinedUpdatesBothKeys: supplying both keys splices
+// both into one evolving overlay, in deterministic order (agentStyles, then
+// nameReplacements).
+func TestProjectSettingsPUT_CombinedUpdatesBothKeys(t *testing.T) {
+	ws := newWebServer(t)
+	defer ws.Close()
+
+	root := writeProjectFile(t, "project.jsonc", `{}`)
+
+	putProjectSettings(t, ws, root, map[string]any{
+		"agentStyles": map[string]any{
+			"supervisor": map[string]any{"label": "SUP"},
+		},
+		"nameReplacements": []map[string]any{
+			{"pattern": "x", "replacement": "y", "flags": "g"},
+		},
+	})
+
+	pref, err := os.ReadFile(filepath.Join(root, ".vh-solara", "preferences.local.jsonc"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	styles, err := projectcfg.ParseAgentStyles(pref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if styles["supervisor"].Label != "SUP" {
+		t.Fatalf("agentStyles not written in combined save: %+v", styles)
+	}
+	repls, err := projectcfg.ParseNameReplacements(pref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(repls) != 1 || repls[0].Pattern != "x" || repls[0].Flags != "g" {
+		t.Fatalf("nameReplacements not written in combined save: %+v", repls)
+	}
+	// Determinism: re-running the identical PUT on a fresh fixture produces the
+	// exact same overlay text (the splice is a pure function; calling the two
+	// keys in fixed order yields a stable result regardless of textual layout).
+	root2 := writeProjectFile(t, "project.jsonc", `{}`)
+	putProjectSettings(t, ws, root2, map[string]any{
+		"agentStyles":      map[string]any{"supervisor": map[string]any{"label": "SUP"}},
+		"nameReplacements": []map[string]any{{"pattern": "x", "replacement": "y", "flags": "g"}},
+	})
+	pref2, err := os.ReadFile(filepath.Join(root2, ".vh-solara", "preferences.local.jsonc"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(pref, pref2) {
+		t.Fatalf("combined PUT is not deterministic:\nfirst:  %s\nsecond: %s", pref, pref2)
+	}
+}
+
+// TestProjectSettingsPUT_DryRunCombinedDoesNotWrite: a combined dryRun returns
+// the old+new overlay text WITHOUT writing either file.
+func TestProjectSettingsPUT_DryRunCombinedDoesNotWrite(t *testing.T) {
+	ws := newWebServer(t)
+	defer ws.Close()
+
+	root := writeProjectFile(t, "project.jsonc", `{}`)
+	prefPath := filepath.Join(root, ".vh-solara", "preferences.local.jsonc")
+
+	b := putProjectSettings(t, ws, root, map[string]any{
+		"agentStyles":      map[string]any{"supervisor": map[string]any{"label": "SUP"}},
+		"nameReplacements": []map[string]any{{"pattern": "x", "replacement": "y"}},
+		"dryRun":           true,
+	})
+	var out struct {
+		Old string `json:"old"`
+		New string `json:"new"`
+	}
+	if err := json.Unmarshal(b, &out); err != nil {
+		t.Fatalf("decode dryRun: %v\n%s", err, b)
+	}
+	if out.New == "" {
+		t.Fatal("dryRun new should contain the would-be overlay text")
+	}
+	if !bytes.Contains([]byte(out.New), []byte(`"agentStyles"`)) || !bytes.Contains([]byte(out.New), []byte(`"nameReplacements"`)) {
+		t.Fatalf("dryRun new should contain both keys:\n%s", out.New)
+	}
+	if _, err := os.Stat(prefPath); !os.IsNotExist(err) {
+		t.Fatalf("dryRun created preferences.local.jsonc: %v", err)
+	}
+}
+
+// TestProjectSettingsPUT_TrustHashUnchanged: a real PUT must not touch
+// project.jsonc — re-Loading it yields the same trust hash as before. This is
+// the fixture-level guarantee (project.jsonc / trust hash never modified).
+func TestProjectSettingsPUT_TrustHashUnchanged(t *testing.T) {
+	ws := newWebServer(t)
+	defer ws.Close()
+
+	root := writeProjectFile(t, "project.jsonc", `{
+  "processes": [{ "id": "p", "command": "echo hi" }]
+}`)
+	before, err := projectcfg.Load(root, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeHash := before.Hash
+	beforeBytes, err := os.ReadFile(filepath.Join(root, ".vh-solara", "project.jsonc"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	putProjectSettings(t, ws, root, map[string]any{
+		"nameReplacements": []map[string]any{{"pattern": "x", "replacement": "y"}},
+	})
+
+	afterBytes, err := os.ReadFile(filepath.Join(root, ".vh-solara", "project.jsonc"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(beforeBytes, afterBytes) {
+		t.Fatalf("project.jsonc bytes changed across PUT:\nbefore: %s\nafter:  %s", beforeBytes, afterBytes)
+	}
+	after, err := projectcfg.Load(root, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Hash != beforeHash {
+		t.Fatalf("trust hash changed across PUT: %s -> %s", beforeHash, after.Hash)
+	}
+}
+
+// TestProjectSettingsPUT_OmittedKeyNotWrittenNull: when a key is omitted, the
+// overlay must NOT contain a `null` for it (the splice is a no-op for omitted
+// keys). Checks both directions.
+func TestProjectSettingsPUT_OmittedKeyNotWrittenNull(t *testing.T) {
+	ws := newWebServer(t)
+	defer ws.Close()
+
+	// nameReplacements only — no agentStyles null.
+	root1 := writeProjectFile(t, "project.jsonc", `{}`)
+	putProjectSettings(t, ws, root1, map[string]any{
+		"nameReplacements": []map[string]any{{"pattern": "x", "replacement": "y"}},
+	})
+	pref1, err := os.ReadFile(filepath.Join(root1, ".vh-solara", "preferences.local.jsonc"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(pref1, []byte(`"agentStyles"`)) {
+		t.Fatalf("omitted agentStyles should not appear at all:\n%s", pref1)
+	}
+
+	// agentStyles only — no nameReplacements null.
+	root2 := writeProjectFile(t, "project.jsonc", `{}`)
+	putProjectSettings(t, ws, root2, map[string]any{
+		"agentStyles": map[string]any{"supervisor": map[string]any{"label": "SUP"}},
+	})
+	pref2, err := os.ReadFile(filepath.Join(root2, ".vh-solara", "preferences.local.jsonc"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(pref2, []byte(`"nameReplacements"`)) {
+		t.Fatalf("omitted nameReplacements should not appear at all:\n%s", pref2)
 	}
 }

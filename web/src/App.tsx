@@ -8,7 +8,7 @@ import TabBar, { type TabItem } from "./components/TabBar";
 import { codeShowing, installCodeFrameHost, openFileAt, pathSelection, postCodeTheme, setPathSelection, toggleCodeDock } from "./code/frame";
 import { anyModalOpen } from "./lib/a11y";
 import NotesView from "./components/NotesView";
-import AgentStylesView from "./components/AgentStylesView";
+import PreferencesView from "./components/PreferencesView";
 import SettingsDialog from "./components/SettingsDialog";
 import PathSelectionAction from "./components/PathSelectionAction";
 import EmptyState from "./components/EmptyState";
@@ -38,7 +38,7 @@ import { draft, selectedId, state } from "./sync";
 import { startDiagCapture } from "./sync/diaglog";
 import { refreshViews, views } from "./views";
 import { managed, refreshManaged } from "./managed";
-import { notesVisible, refreshProjectSettings, watchProjectSettings } from "./projectSettings";
+import { displayName, notesVisible, refreshProjectSettings, watchProjectSettings } from "./projectSettings";
 import { pushNotification } from "./notify";
 import { broadcastTheme, postThemeTo } from "./themeTokens";
 import { customTheme, theme } from "./theme";
@@ -241,11 +241,11 @@ export default function App() {
                   ? "Changes"
                   : view() === "notes"
                     ? "Notes"
-                    : view() === "agents"
-                      ? "Agent styles"
+                    : view() === "preferences"
+                      ? "Preferences"
                       : isEmbeddedView(view())
                         ? activeEmbedded()?.title || "View"
-                        : selected()?.title || "Select a session"}
+                        : displayName(selected()?.title || "Select a session")}
               </span>
             }
           >
@@ -254,7 +254,7 @@ export default function App() {
               data-tip="Right-click or long-press for actions"
               {...menuTriggers(() => selectedId()!, () => selected()!.title || selectedId()!)}
             >
-              {selected()!.title || selectedId()}
+              {displayName(selected()!.title || selectedId() || "")}
             </span>
           </Show>
           <TabBar items={tabItems} active={view} onSelect={setView} />
@@ -354,8 +354,8 @@ export default function App() {
             <Show when={view() === "changes"}>
               <GitView />
             </Show>
-            <Show when={view() === "agents"}>
-              <AgentStylesView />
+            <Show when={view() === "preferences"}>
+              <PreferencesView />
             </Show>
             <Show when={view() === "chat"}>
               <Show when={selectedId()} fallback={

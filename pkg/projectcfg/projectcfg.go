@@ -61,6 +61,12 @@ type Config struct {
 	// against fixed enums, so it executes nothing and is NOT part of the trust
 	// hash.
 	AgentStyles map[string]AgentStyle `json:"agentStyles,omitempty"`
+	// NameReplacements is the ordered array of display-only regex text
+	// replacements applied to session titles at render sites (see
+	// NameReplacementRule). Like AgentStyles, it is advisory display data — the
+	// client compiles each rule client-side with fail-soft skipping — so it
+	// executes nothing and is NOT part of the trust hash.
+	NameReplacements []NameReplacementRule `json:"nameReplacements,omitempty"`
 }
 
 // AgentStyle is the per-agent display treatment declared by a project. All
@@ -70,6 +76,21 @@ type AgentStyle struct {
 	Label string `json:"label,omitempty"` // short chip text (e.g. "SUP"); absent → no per-message chip
 	Color string `json:"color,omitempty"` // theme-token name: accent|accent2|ok|warn|danger|muted
 	Style string `json:"style,omitempty"` // chip variant: soft|outline|solid
+}
+
+// NameReplacementRule is one display-only regex text replacement a user applies
+// to session titles in the UI. Rules form an ORDERED array applied sequentially
+// (rule n sees rule n-1's output). All fields are advisory display data — the
+// client compiles Pattern with Flags client-side (standard JS replacement
+// semantics: $&, $1, named captures) and applies the result ONLY at render
+// sites; the canonical title in store, search, copy, rename, export, archive,
+// terminal binding, and persisted state stays raw. It executes nothing and is
+// NOT part of the trust hash. Fail-soft: an invalid pattern/flags is skipped at
+// render time (and stays persisted until fixed), never fatal.
+type NameReplacementRule struct {
+	Pattern     string `json:"pattern"`         // JS regex source, e.g. `\[\[IMPORTANT\]\]`
+	Replacement string `json:"replacement"`     // JS replacement string ($&, $1, named captures supported)
+	Flags       string `json:"flags,omitempty"` // JS regex flags, e.g. "g"; absent → single replace
 }
 
 // Process is one declared companion process. Serialized fields mirror the

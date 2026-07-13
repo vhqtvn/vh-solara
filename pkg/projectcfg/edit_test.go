@@ -125,6 +125,98 @@ func parseFull(t *testing.T, b []byte) *Config {
 	return &c
 }
 
+// parseRepls round-trips the spliced output through the same JSONC loader the
+// daemon uses, so a passing test proves the edit stays loadable and the
+// nameReplacements array round-trips with order/flags preserved.
+func parseRepls(t *testing.T, b []byte) []NameReplacementRule {
+	t.Helper()
+	var c Config
+	if err := json.Unmarshal(stripJSONC(b), &c); err != nil {
+		t.Fatalf("spliced output does not parse: %v\n---\n%s", err, b)
+	}
+	return c.NameReplacements
+}
+
+func TestSpliceNameReplacementsInsertsWhenAbsentKeepingSiblings(t *testing.T) {
+	src := []byte(`{
+  // top comment
+  "processes": [{ "id": "p", "command": "echo hi" }]
+}`)
+	out, err := SpliceTopLevelKey(src, "nameReplacements", []NameReplacementRule{
+		{Pattern: `\[\[A\]\]`, Replacement: "A!", Flags: "g"},
+		{Pattern: `\[\[B\]\]`, Replacement: "B!"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := parseRepls(t, out)
+	if len(r) != 2 || r[0].Pattern != `\[\[A\]\]` || r[0].Flags != "g" || r[1].Pattern != `\[\[B\]\]` {
+		t.Fatalf("inserted value missing/order/flags wrong: %+v", r)
+	}
+	if r[1].Flags != "" {
+		t.Fatalf("absent flags should serialize away (omitempty): %+v", r[1])
+	}
+	if !strings.Contains(string(out), "top comment") {
+		t.Fatalf("comment lost on insert:\n%s", out)
+	}
+	var c Config
+	_ = json.Unmarshal(stripJSONC(out), &c)
+	if len(c.Processes) != 1 {
+		t.Fatalf("processes disturbed by insert: %+v", c.Processes)
+	}
+}
+
+func TestSpliceNameReplacementsReplacesExistingPreservingSiblings(t *testing.T) {
+	src := []byte(`{
+  // companion processes (trust-gated — must survive the edit)
+  "processes": [{ "id": "p", "command": "echo hi" }],
+  "nameReplacements": [
+    { "pattern": "old", "replacement": "x" } // old value, will be replaced
+  ],
+  "notes": true
+}`)
+	out, err := SpliceTopLevelKey(src, "nameReplacements", []NameReplacementRule{
+		{Pattern: "new", Replacement: "y", Flags: "g"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := parseRepls(t, out)
+	if len(r) != 1 || r[0].Pattern != "new" || r[0].Replacement != "y" || r[0].Flags != "g" {
+		t.Fatalf("old value not replaced / fields wrong: %+v", r)
+	}
+	str := string(out)
+	if !strings.Contains(str, "trust-gated — must survive") {
+		t.Fatalf("a comment outside the value was lost:\n%s", str)
+	}
+	if !strings.Contains(str, `"command": "echo hi"`) || !strings.Contains(str, `"notes": true`) {
+		t.Fatalf("a sibling key was disturbed:\n%s", str)
+	}
+}
+
+// TestSpliceNameReplacementsExplicitEmptyClears: writing an empty (non-nil)
+// slice authors `[]`, which decodes back to a non-nil empty slice — the overlay
+// key PRESENCE is preserved (so it replaces the base wholesale), not absent.
+func TestSpliceNameReplacementsExplicitEmptyClears(t *testing.T) {
+	src := []byte(`{
+  "nameReplacements": [{ "pattern": "old", "replacement": "x" }]
+}`)
+	out, err := SpliceTopLevelKey(src, "nameReplacements", []NameReplacementRule{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := parseFull(t, out)
+	if c.NameReplacements == nil {
+		t.Fatalf("explicit [] should decode to non-nil empty slice, got nil:\n%s", out)
+	}
+	if len(c.NameReplacements) != 0 {
+		t.Fatalf("explicit [] should clear the array, got %+v:\n%s", c.NameReplacements, out)
+	}
+	if !strings.Contains(string(out), `"nameReplacements": []`) {
+		t.Fatalf("expected an explicit empty array in the authored text:\n%s", out)
+	}
+}
+
 func TestRemoveExistingKeyPreservesSiblingsAndComments(t *testing.T) {
 	src := []byte(`{
   // companion processes (trust-gated — must survive the edit)

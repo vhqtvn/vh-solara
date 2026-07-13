@@ -2,6 +2,7 @@ import { createMemo, createSignal, For, Show } from "solid-js";
 import { orphanSessions, rootInfoFor, type RootInfo } from "../orphans";
 import { archiveSession } from "../archive";
 import { withGlobalBusy } from "../busy";
+import { displayName } from "../projectSettings";
 import type { Session } from "../types";
 import Icon from "./Icon";
 import styles from "./OrphanBanner.module.css";
@@ -72,9 +73,9 @@ export default function OrphanBanner() {
                 <For each={rows()}>
                   {(r) => (
                     <li>
-                      <span class="confirm-title">{r.orphan.title || r.orphan.id}</span>
+                      <span class="confirm-title">{displayName(r.orphan.title || r.orphan.id)}</span>
                       <span class={styles["orphan-root"]} classList={{ [styles["orphan-root-active"]]: !!r.root && !r.root.archived }}>
-                        root: {r.root ? r.root.title : "resolving…"}
+                        root: {r.root ? displayName(r.root.title) : "resolving…"}
                         {r.root ? (r.root.archived ? " · archived" : " · ACTIVE") : ""}
                       </span>
                     </li>

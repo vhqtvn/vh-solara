@@ -1,0 +1,222 @@
+/* PreferencesView co-located styles (session-names section + section headers).
+   Per docs/ai/web-css-architecture.md: new owned styles live here using
+   foundation tokens only; the legacy .agents-* shard is NOT grown (the
+   agent-styles section keeps its existing global classes). No mask-image on
+   scroll containers, no backdrop-filter blur, no per-element
+   contain/content-visibility (WebRender perf). */
+
+.namesSection {
+  margin-top: 20px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.sectionTitle {
+  font-size: var(--text-lg, 16px);
+  font-weight: 700;
+  margin: 0 0 4px;
+}
+
+.sectionSub {
+  font-size: var(--text-sm);
+  color: var(--fg-dim);
+  margin: 0 0 14px;
+  max-width: 60ch;
+}
+.sectionSub code {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 5px;
+}
+
+/* Ordered rule rows. A 4-column grid: pattern | replacement | flags | actions,
+   with the optional error line wrapping full-width below its row. */
+.rulesHead {
+  display: none; /* compact: no header row; placeholders are self-describing */
+}
+@media (min-width: 720px) {
+  .rulesHead {
+    display: grid;
+    grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr) 64px minmax(96px, auto);
+    gap: 8px;
+    align-items: center;
+    font-size: 11px;
+    color: var(--fg-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    padding: 0 4px 4px;
+  }
+}
+
+.ruleRow {
+  display: grid;
+  grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr) 64px minmax(96px, auto);
+  gap: 8px;
+  align-items: start;
+  padding: 6px 8px;
+  border-radius: 8px;
+}
+.ruleRow:hover {
+  background: color-mix(in srgb, var(--fg) 4%, transparent);
+}
+.ruleInvalid {
+  /* subtle red tint so an invalid row is locatable at a glance without alarm */
+  background: color-mix(in srgb, var(--danger, var(--fg-dim)) 8%, transparent);
+}
+
+.rulePattern,
+.ruleReplacement,
+.ruleFlags {
+  background: var(--bg-2);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 8px;
+  font: inherit;
+  font-size: 12px;
+  width: 100%;
+  font-family: var(--font-mono);
+}
+.rulePattern:focus,
+.ruleReplacement:focus,
+.ruleFlags:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.ruleActions {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  flex: 0 0 auto;
+}
+.ruleBtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: var(--fg-dim);
+  cursor: pointer;
+}
+.ruleBtn:hover:not(:disabled) {
+  background: var(--bg);
+  color: var(--fg);
+  border-color: var(--border);
+}
+.ruleBtn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.ruleError {
+  grid-column: 1 / -1;
+  font-size: 11px;
+  color: var(--danger, var(--fg-dim));
+  padding: 2px 2px 4px;
+}
+
+.addRule {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+  background: transparent;
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  color: var(--fg-dim);
+  font: inherit;
+  font-size: 12px;
+  padding: 5px 10px;
+  cursor: pointer;
+}
+.addRule:hover {
+  color: var(--fg);
+  border-color: var(--accent);
+}
+
+/* Preview box: editable sample (raw → displayed) + bounded live session list. */
+.preview {
+  margin-top: 16px;
+  padding: 12px;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.previewSample {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.previewLabel {
+  font-size: 11px;
+  color: var(--fg-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.previewInput {
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 8px;
+  font: inherit;
+  font-size: 12px;
+  flex: 1 1 200px;
+  min-width: 0;
+}
+.previewInput:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.previewArrow {
+  color: var(--fg-dim);
+  font-size: 13px;
+}
+.previewResult {
+  font-size: 13px;
+  color: var(--fg);
+  word-break: break-word;
+}
+
+.previewSessions {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.previewSessionRow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 12px;
+}
+.previewRaw {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--fg-dim);
+  word-break: break-all;
+}
+.previewShown {
+  color: var(--fg);
+  word-break: break-word;
+}
+
+@media (max-width: 720px) {
+  .ruleRow {
+    grid-template-columns: 1fr 1fr;
+    grid-auto-rows: min-content;
+  }
+  .ruleActions {
+    grid-column: 1 / -1;
+    justify-content: flex-end;
+  }
+}

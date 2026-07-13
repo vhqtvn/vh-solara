@@ -76,6 +76,80 @@ export function agentDisplay(name?: string): AgentDisplay | undefined {
   return { label: label || undefined, color, style };
 }
 
+// --- Display-only session-title replacement layer -----------------------------
+//
+// An ordered array of regex text replacements a user applies to session titles
+// for DISPLAY ONLY. Rules apply sequentially (rule n sees rule n-1's output).
+// Operational boundaries — search filters, copy buffers, rename inputs, export
+// filenames/headings, archive targets, terminal binding, persisted state — all
+// keep the RAW title. Only render leaves call displayName(). See
+// docs/ai/web-css-architecture.md et al. and the display-vs-raw matrix.
+export interface NameReplacementRule {
+  pattern: string; // JS regex source, e.g. `\[\[IMPORTANT\]\]`
+  replacement: string; // JS replacement string ($&, $1, named captures supported)
+  flags?: string; // JS regex flags, e.g. "g"; absent → single replace
+}
+
+export interface CompiledNameReplacement {
+  regex: RegExp;
+  replacement: string;
+}
+
+// A compiled set: the VALID rules to apply (invalid ones skipped, fail-soft) and
+// a parallel errors array indexed by the ORIGINAL rule position so the editor
+// can show per-row validation. `undefined` at index i = rule i compiled fine.
+export interface CompiledNameReplacements {
+  rules: CompiledNameReplacement[];
+  errors: (string | undefined)[];
+}
+
+// compileNameReplacements compiles a draft/saved rules array once, fail-soft:
+// each invalid pattern/flags is recorded in `errors` and skipped, so a later
+// valid rule still applies. Never throws. (Accepted limitation: a valid-but-
+// pathological regex can peg CPU — personal-pref risk, out of scope to prevent.)
+export function compileNameReplacements(rules: NameReplacementRule[]): CompiledNameReplacements {
+  const out: CompiledNameReplacement[] = [];
+  const errors: (string | undefined)[] = [];
+  for (let i = 0; i < rules.length; i++) {
+    const r = rules[i] ?? {};
+    const pattern = typeof r.pattern === "string" ? r.pattern : "";
+    const replacement = typeof r.replacement === "string" ? r.replacement : "";
+    const flags = typeof r.flags === "string" ? r.flags : "";
+    try {
+      out.push({ regex: new RegExp(pattern, flags), replacement });
+      errors[i] = undefined;
+    } catch (e) {
+      errors[i] = e instanceof Error ? e.message : String(e);
+    }
+  }
+  return { rules: out, errors };
+}
+
+// applyNameReplacements runs a compiled set sequentially over rawTitle (rule n
+// sees rule n-1's output), with standard JS replacement semantics. Never throws
+// — per-rule replacement failures are defensively caught and skipped. Do NOT
+// trim/normalize the result; an intentionally empty result is valid.
+export function applyNameReplacements(set: CompiledNameReplacements, rawTitle: string): string {
+  if (typeof rawTitle !== "string") return "";
+  let result = rawTitle;
+  for (const r of set.rules) {
+    try {
+      result = result.replace(r.regex, r.replacement);
+    } catch {
+      /* defensively skip a failing replacement; continue with the rest */
+    }
+  }
+  return result;
+}
+
+// compileNameReplacementErrors returns the per-rule validation errors for a
+// DRAFT array (the editor calls this on each keystroke to flag invalid rows).
+export function compileNameReplacementErrors(
+  rules: NameReplacementRule[],
+): (string | undefined)[] {
+  return compileNameReplacements(rules).errors;
+}
+
 // Live watch: an SSE the daemon pushes on whenever .vh-solara/project.jsonc is
 // created/modified/removed (it polls the file's mtime server-side). On each
 // nudge we re-read settings, so the agent-style chips and the editor reflect an
@@ -102,14 +176,57 @@ export async function refreshProjectSettings() {
     if (!res.ok) {
       setProjectNotes(null);
       setAgentStylesRaw({});
+      setNameReplacements([]);
       return;
     }
-    const s = (await res.json()) as { notes?: boolean; agentStyles?: Record<string, any> };
+    const s = (await res.json()) as {
+      notes?: boolean;
+      agentStyles?: Record<string, any>;
+      nameReplacements?: NameReplacementRule[];
+    };
     setProjectNotes(typeof s.notes === "boolean" ? s.notes : null);
     setAgentStylesRaw(s.agentStyles && typeof s.agentStyles === "object" ? s.agentStyles : {});
+    setNameReplacements(Array.isArray(s.nameReplacements) ? s.nameReplacements : []);
   } catch {
     /* offline — keep the last value */
   }
+}
+
+// --- Signal-backed resolver (for DISPLAY leaves) ------------------------------
+//
+// nameReplacements is the saved overlay, populated by refreshProjectSettings +
+// re-read on the SSE nudge. The display leaves (SessionTree, context-menu sheet,
+// command-palette label, …) call displayName(); operational boundaries keep raw.
+const [nameReplacements, setNameReplacements] = createSignal<NameReplacementRule[]>([]);
+export { nameReplacements, setNameReplacements };
+
+// Compiled-rule cache: recompile ONLY when the rules-array identity changes
+// (refreshProjectSettings replaces the array wholesale), so a render storm of
+// displayName() calls never recompiles. Keyed on array identity, not contents —
+// a no-op refresh that allocates a new [] still recompiles, which is cheap and
+// correct; the point is to avoid per-render/per-title compilation.
+let compiledKey: NameReplacementRule[] | null = null;
+let compiledSet: CompiledNameReplacements = { rules: [], errors: [] };
+function compiledNameReplacements(): CompiledNameReplacements {
+  const rules = nameReplacements();
+  if (rules !== compiledKey) {
+    compiledKey = rules;
+    compiledSet = compileNameReplacements(rules);
+  }
+  return compiledSet;
+}
+
+// nameReplacementErrors exposes per-rule validation errors for the SAVED rules.
+// The editor reads DRAFT errors via compileNameReplacementErrors directly.
+export function nameReplacementErrors(): (string | undefined)[] {
+  return compiledNameReplacements().errors;
+}
+
+// displayName applies the saved sequential fail-soft replacement pipeline to a
+// raw session title for DISPLAY ONLY. Never throws; invalid rules are skipped +
+// flagged, never fatal. Do NOT trim/normalize the result.
+export function displayName(rawTitle: string): string {
+  return applyNameReplacements(compiledNameReplacements(), rawTitle);
 }
 
 // notesVisible is the effective Notes-tab visibility: a per-project declaration

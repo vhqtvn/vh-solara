@@ -4,7 +4,7 @@ import { createSignal } from "solid-js";
 import { loadVersioned, saveVersioned } from "./lib/store";
 
 // Built-in views plus consumer-registered embedded views, keyed "view:<id>".
-export type BuiltinView = "chat" | "changes" | "notes" | "agents" | "code";
+export type BuiltinView = "chat" | "changes" | "notes" | "preferences" | "code";
 export type View = BuiltinView | string;
 export const VIEW_PREFIX = "view:";
 export const isEmbeddedView = (v: string) => v.startsWith(VIEW_PREFIX);

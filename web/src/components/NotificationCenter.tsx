@@ -3,6 +3,7 @@ import { selectedId, setSelectedId, state } from "../sync";
 import { dismiss } from "../lib/a11y";
 import { clearNotifications, dismissNotification, markAllRead, notifications } from "../notify";
 import { setView } from "../ui";
+import { displayName } from "../projectSettings";
 import Icon from "./Icon";
 import RelTime from "./RelTime";
 
@@ -33,7 +34,7 @@ export default function NotificationCenter() {
   });
 
   const count = createMemo(() => actions().length + notifications.items.filter((n) => !n.read).length);
-  const sessionName = (sid?: string) => (sid ? state.sessions[sid]?.title || "Session" : "");
+  const sessionName = (sid?: string) => (sid ? displayName(state.sessions[sid]?.title || "Session") : "");
 
   function toggle() {
     const next = !open();

@@ -2,6 +2,7 @@ import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { createStore } from "solid-js/store";
 import { fetchArchived, restoreAndOpen, unarchiveSession } from "../archive";
 import { withGlobalBusy } from "../busy";
+import { displayName } from "../projectSettings";
 import type { Session } from "../types";
 import Icon from "./Icon";
 import RelTime from "./RelTime";
@@ -122,7 +123,7 @@ export default function ArchivedDialog(props: { onClose: () => void }) {
               }
             });
           }}>
-            <span class="arch-title">{p.s.title || id}</span>
+            <span class="arch-title">{displayName(p.s.title || id)}</span>
             <span class="arch-meta">
               <Show when={kids() > 0}>
                 <span class="arch-count">{kids()}</span>

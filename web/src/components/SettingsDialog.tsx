@@ -8,6 +8,7 @@ import { queueMode, setQueueMode } from "../queue";
 import { canInstall, installed, isIosSafari, promptInstall } from "../pwa-install";
 import { killTerm, listTerms } from "../termApi";
 import { agents, selectedAgent, setSelectedAgent } from "../agents";
+import { displayName } from "../projectSettings";
 import QuotaPanel from "./QuotaPanel";
 import NotificationsSettings from "./NotificationsSettings";
 import { modal } from "../lib/a11y";
@@ -420,7 +421,7 @@ export default function SettingsDialog(props: { onClose: () => void }) {
                       <div class={styles["term-sess-head"]}>
                         <span class={styles["term-sess-dir"]} data-tip={t.dir}>{shortDir(t.dir)}</span>
                         <span class={styles["term-sess-meta"]}>
-                          {t.title || (t.id === "shared" ? "Shell" : t.id)} · {t.clients} client{t.clients === 1 ? "" : "s"} · {t.cols}×{t.rows} · idle {t.idleSec}s
+                          {t.title ? displayName(t.title) : (t.id === "shared" ? "Shell" : t.id)} · {t.clients} client{t.clients === 1 ? "" : "s"} · {t.cols}×{t.rows} · idle {t.idleSec}s
                         </span>
                         <button type="button" class={styles["term-sess-kill"]} onClick={async () => { await killTerm(t.dir, t.id); refetchTerms(); }}>Kill</button>
                       </div>

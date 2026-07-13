@@ -1,7 +1,7 @@
 import { createEffect, createMemo, For, Match, Show, Switch } from "solid-js";
 import { createSignal } from "solid-js";
 import { selectedId, setSelectedId, state, sessionNeedsInput, sessionLastAgent } from "../sync";
-import { agentDisplay } from "../projectSettings";
+import { agentDisplay, displayName } from "../projectSettings";
 import { setView } from "../ui";
 
 // Picking a session always shows its chat — even re-clicking the already-open
@@ -309,7 +309,7 @@ function Node(props: {
           classList={{ selected: selectedId() === props.session.id, sub: props.depth > 0, running: busy(), detailed: treeDensity() === "detailed" }}
           onClick={() => openSessionChat(props.session.id)}
           data-session-id={props.session.id}
-          data-tip={props.session.title || props.session.id}
+          data-tip={displayName(props.session.title || props.session.id)}
           {...menuTriggers(() => props.session.id, () => props.session.title || props.session.id)}
         >
           <span class="tree-line1">
@@ -357,7 +357,7 @@ function Node(props: {
             </Show>
             <AgentChip sessionID={props.session.id} />
             <span class="tree-title" classList={{ unread: !busy() && !!state.unread[props.session.id], "needs-input": needsInput() }}>
-              {props.session.title || props.session.id}
+              {displayName(props.session.title || props.session.id)}
             </span>
             <span class="tree-meta">
               <Show when={kids().length > 0}>
@@ -664,7 +664,7 @@ export default function SessionTree() {
                     classList={{ selected: selectedId() === s.id, running: isWorking(s.id), detailed: treeDensity() === "detailed" }}
                     onClick={() => openSessionChat(s.id)}
                     data-session-id={s.id}
-                    data-tip={s.title || s.id}
+                    data-tip={displayName(s.title || s.id)}
                     {...menuTriggers(() => s.id, () => s.title || s.id)}
                   >
                     <span class="tree-line1">
@@ -673,7 +673,7 @@ export default function SessionTree() {
                         <span class="dot needs-input" data-tip="needs your input — reply to continue" />
                       </Show>
                       <AgentChip sessionID={s.id} />
-                      <span class="tree-title" classList={{ "needs-input": sessionNeedsInput(s.id) }}>{s.title || s.id}</span>
+                      <span class="tree-title" classList={{ "needs-input": sessionNeedsInput(s.id) }}>{displayName(s.title || s.id)}</span>
                       <span class="tree-meta">
                         <RelTime class="tree-time" ms={s.time?.updated || s.time?.created} />
                       </span>
