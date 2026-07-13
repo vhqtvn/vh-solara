@@ -11,7 +11,7 @@ const openSessionChat = (id: string) => {
   setView("chat");
 };
 import { treeDensity } from "../prefs";
-import { isPinned, searchQuery } from "../sidebar";
+import { isPinned, searchQuery, reconciledPinnedOrder, movePinnedTo } from "../sidebar";
 import { buildChildrenIndex } from "../lib/reduce";
 import { menuTriggers } from "../sessionMenu";
 import type { Session } from "../types";
@@ -160,6 +160,14 @@ function Node(props: {
   index: () => Record<string, Session[]>;
   ancestors: () => Set<string>;
   working: (id: string) => boolean;
+  // Pinned-root drag-to-reorder affordance. Only set for pinned root rows
+  // (depth 0 inside .tree-pinned). When set, the row carries a drag handle and
+  // reflects the in-flight DnD state (source dimming + drop indicator).
+  pinnedDnd?: {
+    onHandleDown: (e: PointerEvent) => void;
+    dragging: boolean;
+    drop: "before" | "after" | null;
+  };
 }) {
   const kids = () => props.index()[props.session.id] || [];
   const activity = () => state.activity[props.session.id] || "idle";
@@ -248,7 +256,16 @@ function Node(props: {
 
   return (
     <>
-      <div class="tree-row" classList={{ selected: selectedId() === props.session.id }}>
+      <div
+        class="tree-row"
+        classList={{
+          selected: selectedId() === props.session.id,
+          dragging: !!props.pinnedDnd?.dragging,
+          "drop-before": props.pinnedDnd?.drop === "before",
+          "drop-after": props.pinnedDnd?.drop === "after",
+        }}
+        data-pinned-id={props.pinnedDnd ? props.session.id : undefined}
+      >
         <span class="tree-guides" aria-hidden="true">
           <For each={props.prefix}>{(rail) => <span class="tg-cell" classList={{ rail }} />}</For>
           <Show when={props.depth > 0}>
@@ -375,6 +392,22 @@ function Node(props: {
             </span>
           </Show>
         </button>
+        {/* Drag handle for reorderable pinned roots only. Sibling of .tree-node
+            inside .tree-row, so a touch on it does NOT bubble to .tree-node's
+            context-menu touch handlers (siblings, not ancestors) — clean gesture
+            separation, no long-press-menu conflict. Pointer-only affordance;
+            keyboard reorder is a deferred follow-up (AT users still have
+            pin/unpin via the row's context menu). */}
+        <Show when={props.pinnedDnd}>
+          <span
+            class="tree-drag"
+            data-tip="Drag to reorder"
+            title="Drag to reorder"
+            onPointerDown={(e) => props.pinnedDnd!.onHandleDown(e)}
+          >
+            <Icon name="grip" size={14} />
+          </span>
+        </Show>
       </div>
 
       <For each={visibleKids()}>
@@ -507,9 +540,94 @@ export default function SessionTree() {
     if (changed) persist(next);
   });
   // Pinned roots float to the top as a distinct, tinted group; the rest follow.
-  // Position (above the divider) is the pin signal — no per-row pin marker.
-  const pinnedRoots = createMemo(() => roots().filter((s) => isPinned(s.id)));
+  // Position (above the divider) is the pin signal — no per-row pin marker. The
+  // pinned group is also reorderable by drag: the order comes from the
+  // persisted pinned-order array (reconciled against membership), so a root
+  // synced in later still lands in its saved slot; a pinned id whose session
+  // hasn't synced yet is dropped here and reappears in place once it does.
+  const pinnedRoots = createMemo(() => {
+    const byId = new Map(roots().map((s) => [s.id, s] as const));
+    return reconciledPinnedOrder()
+      .map((id) => byId.get(id))
+      .filter((s): s is Session => !!s);
+  });
   const unpinnedRoots = createMemo(() => roots().filter((s) => !isPinned(s.id)));
+
+  // --- pinned-root drag-to-reorder -----------------------------------------
+  // Pointer-event based (works on touch + mouse; HTML5 DnD alone is insufficient
+  // on touch). Follows the repo's established resize-handle pattern
+  // (Sidebar.tsx startResize, CodeFrame.tsx startResize): capture the pointer on
+  // the handle, listen for move/up on the handle, hit-test drop targets against
+  // the pinned rows' bounding rects.
+  const [dragId, setDragId] = createSignal<string | null>(null);
+  const [dropTarget, setDropTarget] = createSignal<{ id: string; pos: "before" | "after" } | null>(null);
+  let pinnedContainer: HTMLDivElement | undefined;
+
+  function startPinnedDrag(sessionId: string, e: PointerEvent) {
+    // preventDefault: suppress text selection + synthetic click on the row.
+    // stopPropagation: keep the gesture on the handle (defensive — the handle is
+    // a sibling of .tree-node so its touch handlers don't fire anyway).
+    e.preventDefault();
+    e.stopPropagation();
+    const handle = e.currentTarget as HTMLElement;
+    handle.setPointerCapture?.(e.pointerId);
+    const threshold = 4; // px of movement before a tap becomes a drag
+    const startY = e.clientY;
+    let dragging = false;
+
+    const rows = (): HTMLElement[] =>
+      pinnedContainer
+        ? Array.from(pinnedContainer.querySelectorAll<HTMLElement>("[data-pinned-id]"))
+        : [];
+
+    // Pick the pinned row whose vertical center is closest to the pointer; its
+    // half (top/bottom) decides before/after. The dragged row is excluded, so
+    // the result is always a valid neighbor to drop beside.
+    const computeDrop = (clientY: number): { id: string; pos: "before" | "after" } | null => {
+      let best: { id: string; pos: "before" | "after" } | null = null;
+      let bestDist = Infinity;
+      for (const row of rows()) {
+        const id = row.dataset.pinnedId;
+        if (!id || id === sessionId) continue;
+        const r = row.getBoundingClientRect();
+        const mid = r.top + r.height / 2;
+        const dist = Math.abs(clientY - mid);
+        if (dist < bestDist) {
+          bestDist = dist;
+          best = { id, pos: clientY < mid ? "before" : "after" };
+        }
+      }
+      return best;
+    };
+
+    const move = (ev: PointerEvent) => {
+      if (!dragging) {
+        if (Math.abs(ev.clientY - startY) < threshold) return;
+        dragging = true;
+        setDragId(sessionId);
+        document.body.style.userSelect = "none";
+        document.body.style.cursor = "grabbing";
+      }
+      setDropTarget(computeDrop(ev.clientY));
+    };
+    const finish = () => {
+      handle.removeEventListener("pointermove", move);
+      handle.removeEventListener("pointerup", finish);
+      handle.removeEventListener("pointercancel", finish);
+      handle.releasePointerCapture?.(e.pointerId);
+      document.body.style.userSelect = "";
+      document.body.style.cursor = "";
+      if (dragging) {
+        const drop = dropTarget();
+        if (drop) movePinnedTo(sessionId, drop.id, drop.pos);
+      }
+      setDragId(null);
+      setDropTarget(null);
+    };
+    handle.addEventListener("pointermove", move);
+    handle.addEventListener("pointerup", finish);
+    handle.addEventListener("pointercancel", finish);
+  }
   // Search collapses the tree into a flat, recency-sorted list of title matches
   // across the whole project (pinned first) — "find a session", not navigate.
   const results = createMemo(() => {
@@ -561,7 +679,7 @@ export default function SessionTree() {
       >
         <Show when={roots().length > 0} fallback={<div class="tree-empty">No sessions yet</div>}>
           <Show when={pinnedRoots().length > 0}>
-            <div class="tree-pinned">
+            <div class="tree-pinned" ref={(el) => (pinnedContainer = el)}>
               <For each={pinnedRoots()}>
                 {(s, i) => (
                   <Node
@@ -572,6 +690,11 @@ export default function SessionTree() {
                     index={index}
                     ancestors={ancestors}
                     working={isWorking}
+                    pinnedDnd={{
+                      onHandleDown: (e) => startPinnedDrag(s.id, e),
+                      dragging: dragId() === s.id,
+                      drop: dropTarget()?.id === s.id ? dropTarget()!.pos : null,
+                    }}
                   />
                 )}
               </For>

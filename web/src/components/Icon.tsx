@@ -137,6 +137,18 @@ const PATHS: Record<string, () => JSX.Element> = {
       <rect x="14" y="5" width="7" height="10" rx="2" />
     </>
   ),
+  // Six-dot grip — the drag handle on reorderable pinned root rows. Filled dots
+  // (per-element fill/stroke override the svg-level stroke=filled defaults).
+  grip: () => (
+    <>
+      <circle cx="9" cy="6" r="1.4" fill="currentColor" stroke="none" />
+      <circle cx="15" cy="6" r="1.4" fill="currentColor" stroke="none" />
+      <circle cx="9" cy="12" r="1.4" fill="currentColor" stroke="none" />
+      <circle cx="15" cy="12" r="1.4" fill="currentColor" stroke="none" />
+      <circle cx="9" cy="18" r="1.4" fill="currentColor" stroke="none" />
+      <circle cx="15" cy="18" r="1.4" fill="currentColor" stroke="none" />
+    </>
+  ),
 };
 
 export default function Icon(props: { name: keyof typeof PATHS | string; size?: number }) {

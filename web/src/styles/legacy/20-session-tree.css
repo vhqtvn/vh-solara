@@ -159,6 +159,45 @@
   margin: 9px 10px 10px;
 }
 
+/* Drag handle for reorderable pinned root rows (sits at the row's right edge).
+   Appears on hover for mouse; always visible on coarse pointers (touch). The
+   handle is a sibling of .tree-node inside .tree-row, so a touch on it never
+   bubbles to .tree-node's long-press context-menu handler — clean gesture
+   separation. touch-action:none lets a touch drag claim the vertical gesture
+   instead of scrolling. GPU-cheap: solid colors + a tiny opacity transition,
+   no mask/backdrop-filter/contain (the pinned list is small and static). */
+.tree-drag {
+  flex: 0 0 auto;
+  align-self: stretch;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  margin: 0 1px;
+  color: var(--fg-dim);
+  cursor: grab;
+  opacity: 0;
+  transition: opacity 0.12s var(--ease, ease);
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+  touch-action: none;
+}
+.tree-row:hover .tree-drag { opacity: 0.8; }
+.tree-drag:hover { color: var(--fg); opacity: 1; }
+@media (pointer: coarse) {
+  /* Always visible + a comfortable drag target on touch. */
+  .tree-drag { opacity: 0.7; width: 32px; }
+}
+/* In-flight drag visual: dim the source row and freeze its handle. Placed
+   AFTER the :hover rule so equal specificity is resolved by source order. */
+.tree-row.dragging { opacity: 0.4; }
+.tree-row.dragging .tree-drag { cursor: grabbing; opacity: 0.4; }
+/* Drop indicator: a 2px accent rule on the target row's near edge. Inset
+   box-shadow — no layout shift, no pseudo-element, no blur. */
+.tree-row.drop-before { box-shadow: inset 0 2px 0 0 var(--accent); }
+.tree-row.drop-after { box-shadow: inset 0 -2px 0 0 var(--accent); }
+
 /* Session search box (sidebar). */
 .session-search {
   display: flex; align-items: center; gap: 6px;

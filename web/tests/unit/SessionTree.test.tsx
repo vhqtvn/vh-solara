@@ -5,6 +5,7 @@ import { reconcile } from "solid-js/store";
 import { setState, setSelectedIdRaw } from "../../src/sync/store";
 import type { Session } from "../../src/types";
 import SessionTree, { __resetTreeForTest } from "../../src/components/SessionTree";
+import { __resetPinnedForTest } from "../../src/sidebar";
 
 // The twisty glyph (collapse/expand marker on a parent row) must reflect whether
 // the node's subtree ACTUALLY has running work. The `filtered` mode is the
@@ -30,6 +31,8 @@ beforeEach(() => {
   // loadModes() reads {} → all-default). prevWorking/didInit/prevSessionKeys
   // are component-instance scoped and reset naturally per render().
   __resetTreeForTest();
+  // Pinned membership/order signals also persist; reset alongside the clear.
+  __resetPinnedForTest();
 });
 
 afterEach(() => cleanup());
@@ -277,5 +280,71 @@ describe("SessionTree module-state isolation", () => {
     await waitFor(() => expect(readMode("root")).toBe("collapsed"));
     expect(twisty.getAttribute("aria-label")).toBe("Subtree: collapsed (click to cycle)");
     expect(container.querySelector('.tree-node[data-session-id="child"]')).toBeNull();
+  });
+});
+
+// Pinned roots are now rendered in the persisted pinned-order (reconciled
+// against membership). These cases verify the render consumes that order and
+// that the reorder drag handle is scoped to the pinned section only.
+
+function seedVersioned(key: string, data: unknown) {
+  localStorage.setItem(key, JSON.stringify({ v: 1, data }));
+}
+
+function pinnedRenderedIds(container: HTMLElement): string[] {
+  const pinned = container.querySelector(".tree-pinned");
+  if (!pinned) return [];
+  return Array.from(pinned.querySelectorAll<HTMLElement>("[data-pinned-id]")).map((el) =>
+    el.getAttribute("data-pinned-id")!,
+  );
+}
+
+describe("SessionTree pinned order", () => {
+  it("renders pinned roots in the persisted order, not the roots' natural order", async () => {
+    // Roots arrive newest-first by `buildChildrenIndex`; pin three and persist
+    // a custom order so c is first. The render must follow the order array.
+    putSession({ id: "a", title: "A", time: { updated: 1 } });
+    putSession({ id: "b", title: "B", time: { updated: 2 } });
+    putSession({ id: "c", title: "C", time: { updated: 3 } });
+    seedVersioned("vh.pinned.v1", ["a", "b", "c"]);
+    seedVersioned("vh.pinned-order.v1", ["c", "a", "b"]);
+    __resetPinnedForTest();
+
+    const { container } = render(() => <SessionTree />);
+
+    await waitFor(() => {
+      expect(pinnedRenderedIds(container as unknown as HTMLElement)).toEqual(["c", "a", "b"]);
+    });
+  });
+
+  it("falls back to the set's natural order when no order array exists (lazy migration)", async () => {
+    putSession({ id: "a", title: "A", time: { updated: 1 } });
+    putSession({ id: "b", title: "B", time: { updated: 2 } });
+    seedVersioned("vh.pinned.v1", ["a", "b"]); // membership only, no order array
+    __resetPinnedForTest();
+
+    const { container } = render(() => <SessionTree />);
+
+    await waitFor(() => {
+      expect(pinnedRenderedIds(container as unknown as HTMLElement)).toEqual(["a", "b"]);
+    });
+  });
+
+  it("renders a drag handle only inside the pinned section, never on unpinned rows", async () => {
+    putSession({ id: "p1", title: "Pinned", time: { updated: 1 } });
+    putSession({ id: "u1", title: "Unpinned", time: { updated: 2 } });
+    seedVersioned("vh.pinned.v1", ["p1"]);
+    __resetPinnedForTest();
+
+    const { container } = render(() => <SessionTree />);
+
+    await waitFor(() => expect(container.querySelector(".tree-pinned")).not.toBeNull());
+    // Exactly one handle, and it lives inside .tree-pinned.
+    const handles = container.querySelectorAll(".tree-drag");
+    expect(handles.length).toBe(1);
+    expect(handles[0].closest(".tree-pinned")).not.toBeNull();
+    // The unpinned row has no handle and no data-pinned-id.
+    const unpinnedRow = container.querySelector('.tree-row:not([data-pinned-id])');
+    expect(unpinnedRow?.querySelector(".tree-drag")).toBeNull();
   });
 });
