@@ -2,4 +2,5 @@ profile: supervised
 features:
     backlog: false
 overlays:
+    - auto-classifier-pilot
     - release
