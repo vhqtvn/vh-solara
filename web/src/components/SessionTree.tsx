@@ -610,23 +610,31 @@ export default function SessionTree() {
       }
       setDropTarget(computeDrop(ev.clientY));
     };
-    const finish = () => {
+    const cleanup = () => {
       handle.removeEventListener("pointermove", move);
       handle.removeEventListener("pointerup", finish);
-      handle.removeEventListener("pointercancel", finish);
+      handle.removeEventListener("pointercancel", cancel);
       handle.releasePointerCapture?.(e.pointerId);
       document.body.style.userSelect = "";
       document.body.style.cursor = "";
-      if (dragging) {
-        const drop = dropTarget();
-        if (drop) movePinnedTo(sessionId, drop.id, drop.pos);
-      }
       setDragId(null);
       setDropTarget(null);
     };
+    // pointerup: commit a real drop. Capture the drop target BEFORE cleanup
+    // resets it (setDropTarget(null) would otherwise null it mid-commit).
+    const finish = () => {
+      const drop = dragging ? dropTarget() : null;
+      cleanup();
+      if (drop) movePinnedTo(sessionId, drop.id, drop.pos);
+    };
+    // pointercancel: the OS interrupted the gesture (scroll/resize/etc.), so any
+    // hovered target is stale. Same exit hygiene as finish, but NO commit.
+    const cancel = () => {
+      cleanup();
+    };
     handle.addEventListener("pointermove", move);
     handle.addEventListener("pointerup", finish);
-    handle.addEventListener("pointercancel", finish);
+    handle.addEventListener("pointercancel", cancel);
   }
   // Search collapses the tree into a flat, recency-sorted list of title matches
   // across the whole project (pinned first) — "find a session", not navigate.

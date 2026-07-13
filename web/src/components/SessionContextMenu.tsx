@@ -1,7 +1,7 @@
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { abortSession, sessionWorking, state } from "../sync";
 import { suggestTitle } from "../sessionTitle";
-import { isPinned, togglePin } from "../sidebar";
+import { isPinned, togglePin, movePinnedByOffset, reconciledPinnedOrder } from "../sidebar";
 import { exportSessionMarkdown } from "../export";
 import { pushNotification } from "../notify";
 import { buildChildrenIndex } from "../lib/reduce";
@@ -145,6 +145,29 @@ export default function SessionContextMenu() {
         <button type="button" class="ctxm-item" onClick={() => (togglePin(props.id), closeSessionMenu())}>
           <Icon name="layers" size={14} /> {isPinned(props.id) ? "Unpin" : "Pin to top"}
         </button>
+        {/* Keyboard reorder for pinned ROOT sessions only (the pointer drag
+            handle has no keyboard affordance). The scope fence matches the
+            drag feature: subsessions and unpinned rows never show these.
+            Disabled at the ends so the first item's "Move up" and last item's
+            "Move down" read as inert rather than firing a no-op. */}
+        <Show when={isPinned(props.id) && !state.sessions[props.id]?.parentID}>
+          <button
+            type="button"
+            class="ctxm-item"
+            disabled={reconciledPinnedOrder()[0] === props.id}
+            onClick={() => (movePinnedByOffset(props.id, -1), closeSessionMenu())}
+          >
+            <Icon name="arrowUp" size={14} /> Move up
+          </button>
+          <button
+            type="button"
+            class="ctxm-item"
+            disabled={reconciledPinnedOrder()[reconciledPinnedOrder().length - 1] === props.id}
+            onClick={() => (movePinnedByOffset(props.id, 1), closeSessionMenu())}
+          >
+            <Icon name="arrowDown" size={14} /> Move down
+          </button>
+        </Show>
         <button type="button" class="ctxm-item" onClick={() => rename(props.id, props.title)}>
           <Icon name="edit" size={14} /> Rename…
         </button>

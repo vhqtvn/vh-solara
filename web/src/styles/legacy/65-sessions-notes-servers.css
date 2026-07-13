@@ -83,6 +83,11 @@
 .ctxm-item:hover { background: color-mix(in srgb, var(--fg) 8%, transparent); }
 .ctxm-item.danger { color: var(--danger-fg); }
 .ctxm-item.danger:hover { background: color-mix(in srgb, var(--danger) 14%, transparent); }
+/* Disabled menu item (e.g. "Move up" on the first pinned root): dimmed, no
+   pointer cue, and no hover background so it reads as inert. Follows the repo's
+   established :disabled convention. */
+.ctxm-item:disabled { opacity: 0.5; cursor: not-allowed; }
+.ctxm-item:disabled:hover { background: transparent; }
 .ctxm-sep { height: 1px; background: var(--border); margin: 5px 4px; }
 
 .dialog.confirm { max-width: 440px; }

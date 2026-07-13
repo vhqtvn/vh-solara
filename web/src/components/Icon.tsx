@@ -73,6 +73,7 @@ const PATHS: Record<string, () => JSX.Element> = {
       <path d="m9 15-3 3 3 3" />
     </>
   ),
+  arrowUp: () => <path d="M12 19V5M5 12l7-7 7 7" />,
   arrowDown: () => <path d="M12 5v14M19 12l-7 7-7-7" />,
   paperclip: () => (
     <path d="M21.4 11.05 12.2 20.2a5 5 0 0 1-7.07-7.07l9.19-9.19a3 3 0 0 1 4.24 4.24l-9.2 9.19a1 1 0 0 1-1.41-1.41l8.48-8.49" />

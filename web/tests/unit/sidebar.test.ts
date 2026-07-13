@@ -5,6 +5,7 @@ import {
   togglePin,
   reconciledPinnedOrder,
   movePinnedTo,
+  movePinnedByOffset,
   __resetPinnedForTest,
 } from "../../src/sidebar";
 
@@ -86,6 +87,19 @@ describe("togglePin order behavior", () => {
     expect(isPinned("b")).toBe(true);
   });
 
+  it("re-pinning a corrupt/stale entry appends fresh instead of reviving its stale position", () => {
+    // Membership ["a"] (a is a real member) but a corrupt order ["b"] holds a
+    // STALE entry for b (b absent from membership). Re-pinning b must drop the
+    // stale b position and append b AFTER the true membership (a), not revive
+    // b before a. Without the reconcile-then-append fix, raw pinnedOrder() keeps
+    // b first and reconciliation appends a after it → ["b","a"].
+    localStorage.setItem("vh.pinned.v1", JSON.stringify({ v: 1, data: ["a"] }));
+    localStorage.setItem("vh.pinned-order.v1", JSON.stringify({ v: 1, data: ["b"] }));
+    __resetPinnedForTest();
+    togglePin("b");
+    expect(reconciledPinnedOrder()).toEqual(["a", "b"]);
+  });
+
   it("toggle (pin then unpin) leaves a clean empty state", () => {
     togglePin("a");
     togglePin("a");
@@ -122,5 +136,40 @@ describe("movePinnedTo (drag reorder)", () => {
     // __resetPinnedForTest re-reading the (still-populated) store.
     __resetPinnedForTest();
     expect(reconciledPinnedOrder()).toEqual(["c", "a", "b"]);
+  });
+});
+
+// movePinnedByOffset is the keyboard/a11y reorder path (the context-menu "Move
+// up / Move down" items). It clamps at the ends (no-op when already at the
+// boundary being pushed past) and swaps one slot toward a neighbor otherwise.
+describe("movePinnedByOffset (keyboard reorder)", () => {
+  it("is a no-op when moving the first item up (clamped at the top)", () => {
+    ["a", "b", "c"].forEach(togglePin); // [a, b, c]
+    movePinnedByOffset("a", -1);
+    expect(reconciledPinnedOrder()).toEqual(["a", "b", "c"]);
+  });
+
+  it("is a no-op when moving the last item down (clamped at the bottom)", () => {
+    ["a", "b", "c"].forEach(togglePin);
+    movePinnedByOffset("c", 1);
+    expect(reconciledPinnedOrder()).toEqual(["a", "b", "c"]);
+  });
+
+  it("moves an item up one slot (swaps with the previous neighbor)", () => {
+    ["a", "b", "c"].forEach(togglePin); // [a, b, c]
+    movePinnedByOffset("b", -1); // b before a → [b, a, c]
+    expect(reconciledPinnedOrder()).toEqual(["b", "a", "c"]);
+  });
+
+  it("moves an item down one slot (swaps with the next neighbor)", () => {
+    ["a", "b", "c"].forEach(togglePin); // [a, b, c]
+    movePinnedByOffset("b", 1); // b after c → [a, c, b]
+    expect(reconciledPinnedOrder()).toEqual(["a", "c", "b"]);
+  });
+
+  it("is a no-op when the id is absent from the order", () => {
+    ["a", "b"].forEach(togglePin);
+    movePinnedByOffset("zzz", -1);
+    expect(reconciledPinnedOrder()).toEqual(["a", "b"]);
   });
 });

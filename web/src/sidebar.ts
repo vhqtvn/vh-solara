@@ -53,7 +53,16 @@ export function togglePin(id: string) {
     const nextSet = new Set(cur);
     nextSet.add(id);
     persistPinned(nextSet);
-    if (!pinnedOrder().includes(id)) persistOrder([...pinnedOrder(), id]);
+    // Reconcile-then-append: ALWAYS drop any entry for id, then re-append it
+    // last. This is unconditional (no `includes` guard) precisely so a
+    // corrupt/stale store — id present in the order array while absent from
+    // membership, which normal use can't produce but a hand-edited/older store
+    // can — does NOT revive id's stale position on re-pin. Safe because this
+    // else-branch only runs when id is NOT a member, so the filter can only
+    // strip a stale entry — never a live position. Using reconciledPinnedOrder()
+    // (not the raw pinnedOrder()) also folds in any members absent from the
+    // order array, so id lands after the true current membership.
+    persistOrder([...reconciledPinnedOrder().filter((x) => x !== id), id]);
   }
 }
 
@@ -91,6 +100,21 @@ export function movePinnedTo(draggedId: string, targetId: string, pos: "before" 
   const next = reorderRelative(order, draggedId, targetId, pos);
   const changed = next.length !== order.length || next.some((id, i) => id !== order[i]);
   if (changed) persistOrder(next);
+}
+
+// Keyboard-accessible reorder for pinned ROOT sessions — the a11y fallback for
+// the pointer-only drag handle. Move `id` one slot toward a neighbor: up (-1)
+// lands it BEFORE the previous entry, down (+1) lands it AFTER the next one.
+// Inert at the boundary being pushed past (first item moving up / last moving
+// down) and when id is absent from the order — the context menu disables those
+// buttons, but the function is also safe to call directly.
+export function movePinnedByOffset(id: string, delta: -1 | 1) {
+  const order = reconciledPinnedOrder();
+  const i = order.indexOf(id);
+  if (i < 0) return;
+  const neighbor = order[i + delta];
+  if (!neighbor) return; // clamped at the boundary
+  movePinnedTo(id, neighbor, delta < 0 ? "before" : "after");
 }
 
 // Test-only: reset the module-level signals from localStorage so cases don't
