@@ -20,14 +20,23 @@ import { heartbeat, type DeviceScope } from "./alertsApi";
 let getSelectedId: () => string | null = () => null;
 let getRoot: (id: string) => string = (id) => id;
 let getTitle: (id: string) => string | undefined = () => undefined;
+// Display-name resolver, injected the same way as the accessors above. alerts
+// must NOT import projectSettings directly: projectSettings imports projectDir
+// from sync, so alerts→projectSettings would pull sync back in and reopen the
+// cycle these accessors exist to break. Identity default = raw title untouched.
+let displayOf: (raw: string) => string = (s) => s;
 export function bindAlertsContext(ctx: {
   selectedId: () => string | null;
   rootOf: (id: string) => string;
   sessionTitle: (id: string) => string | undefined;
+  displayOf?: (raw: string) => string;
 }) {
   getSelectedId = ctx.selectedId;
   getRoot = ctx.rootOf;
   getTitle = ctx.sessionTitle;
+  // Always overwrite (like the accessors above) so a rebind that omits
+  // displayOf falls back to identity instead of inheriting a stale resolver.
+  displayOf = ctx.displayOf ?? ((s) => s);
 }
 
 // --- device identity --------------------------------------------------------
@@ -180,7 +189,7 @@ export function handleNotice(raw: unknown) {
   if (!n || !n.type || !LABEL[n.type]) return;
   if (!deliverable(n)) return;
 
-  const name = n.title || getTitle(n.sessionID) || n.sessionID.slice(0, 8);
+  const name = displayOf(n.title || getTitle(n.sessionID) || n.sessionID.slice(0, 8));
   const { emoji, verb } = LABEL[n.type];
   const headline = `${emoji} ${name} ${verb}`;
 

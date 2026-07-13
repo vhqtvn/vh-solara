@@ -76,6 +76,40 @@ it never re-gates the declared processes, and it is read without a trust prompt.
 { "notes": true, "processes": [ /* … */ ] }
 ```
 
+### Session names (`nameReplacements`)
+
+Show session titles the way *you* want to read them, without changing the real
+title. Each rule is a regex text replacement applied to the raw title at
+**display leaves only** — the session tree, tooltips, command palette,
+inspector header, and notification list. Everything that must stay canonical
+keeps the **raw** title: search filters, copy buffers, the rename input, export
+headings/filenames, archive targets, and terminal binding.
+
+```jsonc
+{
+  "nameReplacements": [
+    { "pattern": "\\[\\[IMPORTANT\\]\\]", "replacement": "❗", "flags": "g" },
+    { "pattern": "^WIP:\\s*", "replacement": "" }
+  ]
+}
+```
+
+- **`pattern`** — a JS regex *source* string. Escape metacharacters you want to
+  match literally (e.g. `\\[\\[` for `[[`).
+- **`replacement`** — a JS replacement string; `$&`, `$1`, and named captures
+  are supported. An intentionally empty result is valid (it just trims).
+- **`flags`** — JS regex flags, e.g. `g` to replace every match; omit it for a
+  single (first) replacement.
+
+Rules apply **sequentially** — rule *n* sees rule *n*−1's output — so you can
+chain a normalization step before a substitution. Each rule compiles
+**fail-soft**: an invalid pattern or flags is skipped (and flagged per-row in
+the editor) so a later valid rule still applies; a bad rule never breaks
+rendering. Like `agentStyles`, this is display-only — **not** part of the trust
+hash — and it is edited on the **Preferences** screen (project menu →
+Preferences), which writes it to the gitignored
+`.vh-solara/preferences.local.jsonc` overlay alongside your `agentStyles`.
+
 ### Agent styles (`agentStyles`)
 
 Give specific agents a distinct look so, say, a supervisor stands apart from the
@@ -108,7 +142,7 @@ sanitized client-side (no arbitrary color or CSS reaches the page).
 #### Where it's saved — `project.jsonc` vs `preferences.local.jsonc`
 
 `agentStyles` is a **personal UI preference**, not a repo declaration. The
-in-product editor (Settings → Agent styles) writes it to a **gitignored local
+in-product editor (project menu → **Preferences**) writes it to a **gitignored local
 overlay** at `.vh-solara/preferences.local.jsonc`, so styling your agents never
 dirties `git status` and never conflicts on a `git pull`. The editor and the
 agent chips read a merge of two files:
@@ -116,7 +150,8 @@ agent chips read a merge of two files:
 - **`.vh-solara/preferences.local.jsonc`** (local, **gitignored**) — where the
   editor saves. If it declares `agentStyles`, that map **fully replaces** the
   base (a whole-map overwrite, not a per-agent merge). Absent, or present without
-  the key → the base is used as-is. Nothing else lives here today.
+  the key → the base is used as-is. Your `nameReplacements` rules live here too
+  (see [Session names](#session-names-namereplacements)).
 - **`.vh-solara/project.jsonc`** (committed) — **declarative-only** (processes,
   views, `notes`). It no longer holds `agentStyles` in steady state: on project
   open, any `agentStyles` found here is **auto-migrated** into the local overlay
@@ -133,8 +168,8 @@ no-op once the steady state is reached.
 
 `notes` stays a `project.jsonc` declaration: it has no UI writer, so set it by
 hand (see above). In practice, then, `project.jsonc` is **declarative-only**
-(processes, views, `notes`), while each operator's personal `agentStyles` lives
-in the ignored overlay.
+(processes, views, `notes`), while each operator's personal `agentStyles` and
+`nameReplacements` live in the ignored overlay.
 
 ## Trust
 

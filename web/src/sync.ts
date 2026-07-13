@@ -13,6 +13,7 @@
 //   actions       — selection/project/draft/create + server round-trips
 import { createRoot, createEffect, on } from "solid-js";
 import { bindAlertsContext } from "./alerts";
+import { displayName } from "./projectSettings";
 import {
   state,
   setState,
@@ -39,10 +40,17 @@ import { setSelectedId, switchProject, openSession } from "./sync/actions";
 
 // Inject the session-store accessors alerts needs (instead of alerts importing
 // from sync — that was a cycle). Bound at load, before any heartbeat/notice runs.
+// displayOf is wired the same way for the same reason: alerts must NOT import
+// projectSettings directly (projectSettings imports projectDir from this module,
+// so alerts→projectSettings would pull sync back in and reopen the cycle). sync
+// → projectSettings is the benign direction: projectSettings uses projectDir
+// only lazily inside functions, so the ESM live-binding handles the depth-first
+// eval order without a TDZ crash.
 bindAlertsContext({
   selectedId,
   rootOf,
   sessionTitle: (id) => state.sessions[id]?.title,
+  displayOf: displayName,
 });
 
 export function startSync() {
