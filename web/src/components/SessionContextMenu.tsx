@@ -151,22 +151,29 @@ export default function SessionContextMenu() {
             Disabled at the ends so the first item's "Move up" and last item's
             "Move down" read as inert rather than firing a no-op. */}
         <Show when={isPinned(props.id) && !state.sessions[props.id]?.parentID}>
-          <button
-            type="button"
-            class="ctxm-item"
-            disabled={reconciledPinnedOrder()[0] === props.id}
-            onClick={() => (movePinnedByOffset(props.id, -1), closeSessionMenu())}
-          >
-            <Icon name="arrowUp" size={14} /> Move up
-          </button>
-          <button
-            type="button"
-            class="ctxm-item"
-            disabled={reconciledPinnedOrder()[reconciledPinnedOrder().length - 1] === props.id}
-            onClick={() => (movePinnedByOffset(props.id, 1), closeSessionMenu())}
-          >
-            <Icon name="arrowDown" size={14} /> Move down
-          </button>
+          {(() => {
+            const order = reconciledPinnedOrder();
+            return (
+              <>
+                <button
+                  type="button"
+                  class="ctxm-item"
+                  disabled={order[0] === props.id}
+                  onClick={() => (movePinnedByOffset(props.id, -1), closeSessionMenu())}
+                >
+                  <Icon name="arrowUp" size={14} /> Move up
+                </button>
+                <button
+                  type="button"
+                  class="ctxm-item"
+                  disabled={order[order.length - 1] === props.id}
+                  onClick={() => (movePinnedByOffset(props.id, 1), closeSessionMenu())}
+                >
+                  <Icon name="arrowDown" size={14} /> Move down
+                </button>
+              </>
+            );
+          })()}
         </Show>
         <button type="button" class="ctxm-item" onClick={() => rename(props.id, props.title)}>
           <Icon name="edit" size={14} /> Rename…

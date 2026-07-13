@@ -162,12 +162,11 @@ describe("startPinnedDrag gesture (pointer lifecycle)", () => {
   });
 
   // (3) pointercancel on an ENGAGED drag (dragId WAS set, body cursor WAS
-  // grabbing) resets the gesture and commits nothing. A single pinned root is
-  // used so computeDrop has no candidate → dropTarget stays null → finish()'s
-  // `if (drop)` guard skips the commit on the shared up/cancel path. (This
-  // meaningfully covers cancel of an engaged drag + cleanup; the latent case
-  // where cancel WOULD commit against a hovered target in a multi-root list is
-  // noted as a residual follow-up since phase 1 forbids production changes.)
+  // grabbing) resets the gesture and commits nothing. The cancel path is now
+  // distinct (cancel() → cleanup() with no movePinnedTo); this case stages a
+  // single pinned root so it additionally exercises cancel hygiene when no drop
+  // target exists (computeDrop → null). The multi-root case — cancel over a
+  // hovered target — is covered by case (5) below.
   it("pointercancel resets an engaged drag with no commit", async () => {
     putSession({ id: "solo", title: "Solo", time: { updated: 1 } });
     seedVersioned("vh.pinned.v1", ["solo"]);
