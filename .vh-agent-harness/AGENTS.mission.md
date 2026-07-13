@@ -51,6 +51,12 @@ It lets an operator:
   `go run ./tools/fixtureserver`, so go must be on PATH). The e2e suite is serial
   and shares fixture state.
 - Go e2e harness: `tests/e2e/` (`e2e.StartCluster()`).
+- **CSS architecture (AI-first):** component styles are co-located CSS Modules
+  (`Component.module.css` beside `Component.tsx`); global tokens/theme/z-index
+  live in `web/src/styles/foundation/`; `legacy.css` is a transitional remainder
+  being carved down. See
+  [`docs/ai/web-css-architecture.md`](../docs/ai/web-css-architecture.md) for the
+  migration rules and conventions before adding or moving component CSS.
 
 ## Web frontend performance — Firefox/WebRender GPU gotchas
 
