@@ -62,6 +62,22 @@ See [PROMOTER_RUNBOOK.md](PROMOTER_RUNBOOK.md) for the promoter procedure,
 the eventual-consistency pass, conflict resolution, and the Definition of
 Ready.
 
+## Record Lifecycle
+
+The harness keeps records in a few distinct tiers, each with a different
+durability and a different rule for what survives. This section is descriptive
+of existing practice; it is not a new state machine, tombstone system, or
+promotion engine.
+
+| Surface | Role while active | Durability / truth status | Promotion / retention rule | Cleanup / archive path |
+| --- | --- | --- | --- | --- |
+| `docs/planning/backlog.md` | Canonical task-status ledger | Committed source of truth (eventually-consistent; hybrid split-commit keeps a backlog edit from blocking a code commit) | Agents edit freely; one backlog commit per cycle; DEFER / p2 candidates promote in only after trigger + Definition of Ready | `done` / `cancelled` rows move to `docs/planning/archive/` via `/backlog-cleanup` |
+| `docs/checkpoints/` | Durable decisions, blockers, closeouts | Committed truth — reopen later | Commit only snapshots worth reopening; nothing auto-promotes out | None — durable by design; older checkpoints are retained for retrieval |
+| `.opencode/state/sessions/`, `.opencode/state/workstreams/` | Resumable working state (task contracts, checkpoints, workstream briefs) | Local, gitignored — resumable across compaction but **not** truth | Keep small durable state here; bulky outputs go to `tmp/` | Compaction prunes; `/workstream-clear` stops carrying a theme; `/job-cleanup` clears run-scoped artifacts |
+| `.local/coordinator/tasks/` | Conditional candidate holding area | Gitignored **transport, not truth** — unpromoted candidates may be lost (intentionally) | Curated into `backlog.md` by the promoter only after trigger + Definition of Ready | Manual / lossy by design |
+| `tmp/` (run-scoped scratch, `tmp/agent-runs/<alias>/`) | Disposable run artifacts | Gitignored — never truth, never committed | Keep transient outputs here, never under `docs/` | `/job-cleanup` when the task completes |
+| `docs/planning/archive/` | Retrieval-only history of moved-out rows | Committed (archived) | Populated by the normalizer on completion / cancellation | Terminal tier |
+
 ## Coordination Planes
 
 Use three distinct planes instead of one overloaded coordinator:
@@ -157,6 +173,23 @@ invoke it:
 | OpenCode subagents | `.opencode/agents/` | Delegated specialists such as `project-coordinator`, `researcher`, `debate`, `commit-message`, `commit-reviewer`, and `ship-review`. |
 | Copilot path instructions | `.github/instructions/` | File-scoped GitHub/Copilot guidance that mirrors boundary-specific review rules. |
 | Copilot prompt files | `.github/prompts/` | Reusable IDE prompt entrypoints for coordination and file-list review. |
+
+## Review roles
+
+Two distinct review shapes travel under the word "review"; keeping them
+separate prevents a deliberation from being mistaken for an authorization:
+
+- **Approval** — a permit / reject / defer decision that **gates** a
+  transition. It is an authorization event: the transition does not proceed
+  until the approval is granted. Commit, task-promotion, and task-review gates
+  are approvals.
+- **Panel** — structured deliberation that **informs** a later decision but
+  carries no direct transition authority. Its output is a recommendation or
+  synthesis, not a permit. Research, debate, planning, and ship-review
+  deliberation are panels.
+
+Both can feed an approval, but neither **is** the approval: a panel may
+recommend "approve," but the approval still has to fire through its own gate.
 
 ## Default Flow
 

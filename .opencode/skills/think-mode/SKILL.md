@@ -41,6 +41,40 @@ Apply in order; stop at the first match:
    - **Yes, framing is settled** → one-shot `/solution-brief`. Output: single `brief.md` (decision-frame table + recommendation + execution plan).
    - **No, framing might shift (stakeholder reframe likely, architectural, contentious)** → **phased**: separate `researcher` → `debate` → `solution-brief` sessions producing `research.md` → `debate.md` → `brief.md`, with operator-review bail-out gates between each phase.
 
+## framing_confidence (advisory signal)
+
+After applying the decision tree, emit a `framing_confidence` field that makes
+the confidence behind the 90-minute check (step 5) visible as metadata. The
+routing decision itself is unchanged — this only exposes the underlying
+confidence.
+
+- `framing_confidence`: `high | fluid | unknown`
+  - `high` — objective, constraints, and stakeholders are settled; no active
+    reframe pressure; the 90-min answer is a confident "yes"
+  - `fluid` — a stakeholder reframe is in flight, the objective is contested,
+    or a constraint conflict is visible; the 90-min answer is "no"
+  - `unknown` — insufficient signal to tell (new domain, thin packet, operator
+    intent ambiguous)
+- `reason_codes`: zero or more of
+  - `objective_ambiguous`
+  - `constraint_conflict`
+  - `stakeholder_frame_unsettled`
+  - `solution_presupposed`
+
+## framing_confidence is advisory, not authoritative
+
+- `high` → continue on the chosen path; no extra step
+- `fluid` → the chosen pattern is still respected, BUT recommend phased work
+  (matches step-5 "No" branch) and flag for operator review
+- `unknown` → recommend a short researcher pass or operator clarification
+  before committing to one-shot
+- `framing_confidence` MUST be preserved in the scaffolded prompt metadata so
+  downstream stages (debate, planner) MAY see it, but they are NOT obligated
+  to act on it
+- `framing_confidence` is advisory routing metadata only: it NEVER triggers a
+  reframe, NEVER adds a call, and NEVER overrides the operator gate. It is
+  non-authoritative by construction.
+
 ## Output shape
 
 Return a short structured answer:
@@ -53,6 +87,7 @@ Return a short structured answer:
    - **Process** — launch the chosen workflow now using the scaffolded prompt verbatim.
    - **Refine: <what to change>** — adjust scope / decisions / shape, then re-present and re-ask.
    Do NOT auto-launch. Wait for the operator's reply.
+6. **framing_confidence** — `high|fluid|unknown` with `reason_codes`, included in the scaffolded prompt's metadata block so it travels into the debate/solution-brief packet. Advisory only; does not change the operator gate.
 
 ## Operator gate protocol
 

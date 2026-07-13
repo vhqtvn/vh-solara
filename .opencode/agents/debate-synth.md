@@ -20,9 +20,14 @@ Rules:
   - a recommendation depends mostly on assumptions/predictions
   - downside risk is high while evidence quality is weak
 - if no option is strong enough, recommend a short evidence-gathering step
+- when the debate packet includes alternate-frame candidates from a reframe
+  event, weigh whether the alternate frame actually resolves the cited
+  conflict (using the attached `frame_delta` and `trigger_reason`); you may
+  still recommend an original-frame option if the alternate frame does not
+  clearly win
 
 Return:
-- `recommendation`: `recommend|lean|tie|need_evidence`
+- `recommendation`: `recommend|lean|tie|need_evidence|need_researcher`
 - `recommended_option_id`
 - `criteria_comparison` with:
   - `criterion_id`

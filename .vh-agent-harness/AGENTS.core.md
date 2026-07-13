@@ -107,6 +107,20 @@ add-an-agent / add-command / add-skill recipe and the overlay anatomy.
 
 <!-- PROJECT: add project-specific engineering defaults (language stack, model/dataset license rules, etc.). -->
 
+## Safety invariant: model output is a candidate, never transition authority
+
+Model and subagent output may **inform** a later decision, but an executor,
+policy, or gate applies every transition and side effect. This is why the
+harness can let agents propose freely while guaranteeing that nothing a model
+emits — a file write, a status change, a release, a deletion — takes effect just
+because the model said so. It is enforced by the kinds of guard already present
+in this repo: **capability policy** (which operations an agent is allowed to
+attempt), **ownership classification** (which files a plain render may overwrite
+vs. must preserve), and **gate-controlled side effects** (commits, promotions,
+and other state transitions that pass through a reviewer or gate before they
+land). Treat any model-produced artifact as a proposal to be checked and
+applied, not as an authority that acts on its own.
+
 ## Shell, container, and workspace hygiene
 
 - Run project commands through `harness`. Do not rely on host-level `python`, `pytest`, `npm`, `pnpm`, `yarn`, or `docker compose`.

@@ -107,6 +107,20 @@ add-an-agent / add-command / add-skill recipe and the overlay anatomy.
 
 <!-- PROJECT: add project-specific engineering defaults (language stack, model/dataset license rules, etc.). -->
 
+## Safety invariant: model output is a candidate, never transition authority
+
+Model and subagent output may **inform** a later decision, but an executor,
+policy, or gate applies every transition and side effect. This is why the
+harness can let agents propose freely while guaranteeing that nothing a model
+emits — a file write, a status change, a release, a deletion — takes effect just
+because the model said so. It is enforced by the kinds of guard already present
+in this repo: **capability policy** (which operations an agent is allowed to
+attempt), **ownership classification** (which files a plain render may overwrite
+vs. must preserve), and **gate-controlled side effects** (commits, promotions,
+and other state transitions that pass through a reviewer or gate before they
+land). Treat any model-produced artifact as a proposal to be checked and
+applied, not as an authority that acts on its own.
+
 ## Shell, container, and workspace hygiene
 
 - Run project commands through `harness`. Do not rely on host-level `python`, `pytest`, `npm`, `pnpm`, `yarn`, or `docker compose`.
@@ -407,12 +421,6 @@ It lets an operator:
   `go run ./tools/fixtureserver`, so go must be on PATH). The e2e suite is serial
   and shares fixture state.
 - Go e2e harness: `tests/e2e/` (`e2e.StartCluster()`).
-- **CSS architecture (AI-first):** component styles are co-located CSS Modules
-  (`Component.module.css` beside `Component.tsx`); global tokens/theme/z-index
-  live in `web/src/styles/foundation/`; `legacy.css` is a transitional remainder
-  being carved down. See
-  [`docs/ai/web-css-architecture.md`](../docs/ai/web-css-architecture.md) for the
-  migration rules and conventions before adding or moving component CSS.
 
 ## Web frontend performance — Firefox/WebRender GPU gotchas
 

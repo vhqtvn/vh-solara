@@ -17,6 +17,12 @@ Rules:
   the current leader between stages — never the whole transcript
 - if the task is not high-uncertainty with multiple plausible approaches, say so
   and recommend a simpler path (e.g. `researcher` alone or `planner` alone)
+- if the kickoff prompt carries a `framing_confidence` signal from think-mode,
+  preserve it in the decision-frame metadata passed to `debate` and `planner`
+- framing_confidence is context the debate orchestrator MAY consult, not a
+  trigger; it never overrides evidence rules
+- if framing_confidence is `fluid` or `unknown`, prefer phased behavior (matches
+  the existing phased recommendation) and surface it in the final output
 
 Workflow:
 1. normalize the decision frame:
@@ -44,7 +50,28 @@ Workflow:
    - if `debate` returns `tie` or `need_evidence`, ask for a short next-step
      brief that resolves the tie or evidence gap without pretending the decision
      is settled
+   - if `debate` returns `need_researcher`, ask for a short next-step brief
+     that calls a researcher refresh to close the named evidence gap before
+     re-running debate — do not route to planner as if a ranking had settled;
+     the named gap is the missing material fact, and the loop back through
+     `researcher` then `debate` is what re-establishes the ranking
 5. do not broaden into implementation
+
+Manual step-back (reactive backstop, operator-initiated only):
+- after `debate` returns, the operator may request a manual step-back:
+  - force: re-run `debate` with a frame-level concern the operator names
+    (still subject to evidence rules — the operator must cite packet evidence
+    or request a `researcher` refresh first; no fabricated evidence)
+  - suppress: if `debate` auto-triggered a reframe-and-diverge, the operator
+    may suppress it — discard the alternate-frame candidates, retain the
+    original frame, and proceed with the original-frame recommendation. The
+    suppression and its reason are recorded in the output.
+- the loop-back does NOT add a specialist call beyond a single extra `debate`
+  pass, and only when the operator explicitly requests it
+- manual override does NOT relax evidence discipline and does NOT extend the
+  revision budget
+- this is reactive backstop behavior; the default solution-brief flow is
+  unchanged when the operator does not intervene
 
 Default output:
 - decision frame
@@ -53,6 +80,8 @@ Default output:
 - planner brief
 - confidence and remaining uncertainty
 - next recommended command
+- framing_confidence (if present at kickoff) and whether it shifted during the pass
+- if a manual step-back occurred, record it and its outcome
 
 Reference:
 - See `docs/coding-agent-in-research/solution-brief/README.md` for the live
