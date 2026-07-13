@@ -118,7 +118,9 @@ function tagInlineCodePaths(root: HTMLElement | undefined) {
 // scroll surface for long lines, so anchoring the action buttons to the wrapper
 // (which does not scroll) keeps them pinned at the top-right instead of riding
 // off-screen with the scrolled content.
-function addCodeCopyButtons(root: HTMLElement | undefined) {
+// Exported so the copy-button regression test can drive the real wiring against
+// a manually-built chroma-envelope DOM (see tests/unit/codeCopy.test.ts).
+export function addCodeCopyButtons(root: HTMLElement | undefined) {
   if (!root) return;
   root.querySelectorAll("pre").forEach((pre) => {
     if (pre.closest(".code-block")) return; // already wrapped
@@ -148,7 +150,14 @@ function addCodeCopyButtons(root: HTMLElement | undefined) {
     copyBtn.textContent = "copy";
     const code = pre.querySelector("code") as HTMLElement | null;
     copyBtn.addEventListener("click", () => {
-      void navigator.clipboard?.writeText((code ?? pre).innerText);
+      // Server-rendered (chroma) code blocks wrap each source line in
+      // `<span class="line"><span class="cl">…\n</span></span>`, and the chroma
+      // stylesheet makes `.line` display:flex (block-level). Element.innerText
+      // is CSS-box-aware and would insert an EXTRA line break at each block
+      // boundary on top of the `\n` already inside .cl, producing blank lines
+      // between every copied line. textContent is not CSS-aware and reproduces
+      // the source verbatim — which is what copy should do.
+      void navigator.clipboard?.writeText((code ?? pre).textContent ?? "");
       copyBtn.textContent = "copied";
       setTimeout(() => (copyBtn.textContent = "copy"), 1200);
     });
