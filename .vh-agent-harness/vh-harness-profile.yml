@@ -1,8 +1,5 @@
 profile: supervised
-modules: []
 features:
     backlog: false
 overlays:
     - release
-policy_packs: []
-capabilities: []

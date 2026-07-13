@@ -784,6 +784,8 @@ function defaultCoordinationTaskPayload(taskID = "") {
         review_paths: [],
         latest_report: null,
         next_action: "",
+        predicted_impact: null,
+        measured_outcome: null,
         last_review: null,
         history: [],
         created_at: null,
@@ -1549,6 +1551,8 @@ function normalizeCoordinationTaskRecord(payload, taskID = "") {
                   }
                 : null,
         next_action: String(source.next_action || "").trim(),
+        predicted_impact: normalizeOptionalText(source.predicted_impact),
+        measured_outcome: normalizeOptionalText(source.measured_outcome),
         last_review: normalizeStoredCoordinationReview(
             source.last_review,
             uniqueStrings(
@@ -1805,6 +1809,7 @@ const TASK_METADATA_UPDATE_PRE_EXECUTION_FIELD_NAMES = [
     "dependencies",
     "owner_notes",
     "next_action",
+    "predicted_impact",
 ];
 
 const TASK_METADATA_UPDATE_WORKING_FIELD_NAMES = [
@@ -1815,6 +1820,7 @@ const TASK_METADATA_UPDATE_WORKING_FIELD_NAMES = [
 const TASK_METADATA_UPDATE_FOLLOW_UP_FIELD_NAMES = [
     "owner_notes",
     "next_action",
+    "measured_outcome",
 ];
 
 function missingResearchContractFields(task) {
@@ -4105,6 +4111,10 @@ function readyCoordinationTask(sessionID, taskIDRaw, input = {}, options = {}) {
                 payload.owner_notes !== undefined
                     ? normalizeStringList(payload.owner_notes)
                     : current.owner_notes,
+            predicted_impact:
+                payload.predicted_impact !== undefined
+                    ? normalizeOptionalText(payload.predicted_impact)
+                    : current.predicted_impact,
             status: "ready",
             next_action:
                 explicitNextAction !== null
@@ -4310,6 +4320,14 @@ function updateCoordinationTaskMetadata(
             payload.owner_notes !== undefined
                 ? normalizeStringList(payload.owner_notes)
                 : current.owner_notes,
+        predicted_impact:
+            payload.predicted_impact !== undefined
+                ? normalizeOptionalText(payload.predicted_impact)
+                : current.predicted_impact,
+        measured_outcome:
+            payload.measured_outcome !== undefined
+                ? normalizeOptionalText(payload.measured_outcome)
+                : current.measured_outcome,
         next_action:
             explicitNextAction !== null
                 ? explicitNextAction
@@ -4507,6 +4525,10 @@ function saveCoordinationTaskCloseout(sessionID, taskIDRaw, options = {}) {
         options.nextAction !== undefined
             ? String(options.nextAction || "").trim()
             : null;
+    const measuredOutcome =
+        options.measuredOutcome !== undefined
+            ? normalizeOptionalText(options.measuredOutcome)
+            : null;
     const saved = updateCoordinationTask(loaded.payload.task_id, (current) => ({
         ...current,
         status: taskStatus,
@@ -4533,6 +4555,10 @@ function saveCoordinationTaskCloseout(sessionID, taskIDRaw, options = {}) {
             explicitNextAction !== null
                 ? explicitNextAction
                 : defaultCoordinationTaskNextAction(current.task_id, taskStatus),
+        measured_outcome:
+            measuredOutcome !== null
+                ? measuredOutcome
+                : current.measured_outcome,
         history: [
             ...(current.history || []),
             {

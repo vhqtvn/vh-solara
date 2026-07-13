@@ -141,6 +141,13 @@ UUID=$(.opencode/scripts/readonly-scripts.sh gen-uuid)
 .opencode/scripts/commit-gate.sh acquire --paths '<JSON>' --message-file tmp/commit-gate-message/msg-${UUID} --session-alias ALIAS
 ```
 
+**Path staging:** `--paths` accepts literal file paths and directory pathspecs.
+Each entry is tested by literal existence: a literal file path is staged via
+`git add -- "$p"`; an existing directory stages every tracked file under that
+prefix; a deleted directory is staged recursively via `git rm --cached -r -- "$p"`,
+so a whole deleted directory can be acquired with a single `--paths '["somedir"]'`
+entry.
+
 **Blessed one-liner (commit):**
 ```
 .opencode/scripts/commit-gate.sh commit --uuid UUID --tree-hash HASH --message-file tmp/commit-gate-message/msg-${UUID}

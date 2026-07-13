@@ -217,6 +217,12 @@
     "next_action": {
       "type": "string"
     },
+    "predicted_impact": {
+      "type": ["string", "null"]
+    },
+    "measured_outcome": {
+      "type": ["string", "null"]
+    },
     "last_review": {
       "type": ["object", "null"],
       "required": [

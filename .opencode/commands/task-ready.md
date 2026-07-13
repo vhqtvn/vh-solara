@@ -29,6 +29,7 @@ Workflow:
   - `desired_artifact_type`
   - `target_artifact_path`
   - optional updates to `constraints`, `non_goals`, `dependencies`, `owner_notes`, or `next_action`
+  - optional `predicted_impact`: a one-line prediction of the slice's expected impact, captured here at ready-time (skip for routine slices)
 - preserve refinement context such as `rough_scope`, `open_questions`, and `ready_criteria`; do not discard it just because the task is now ready
 - call `plan_state` with:
   - `operation: ready_coordination_task`

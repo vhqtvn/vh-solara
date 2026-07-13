@@ -38,10 +38,6 @@
 # NOTE: SKIP_COMMIT_GATE acquire path still uses `git add -A`.
 #       The gated cmd_acquire path stages via private index (GIT_INDEX_FILE).
 #       Verification commands should scope to cmd_acquire only.
-#
-# Design: researches/decisions/2026-06-09-concurrent-commit-gate-design.md
-# Spec: researches/decisions/2026-06-03-gated-commit-brief.md §§5-7
-
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
@@ -751,7 +747,7 @@ print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))
         # Missing from disk — check if it's a tracked-file deletion
         if [[ -n "$head_at_acquire" ]] && git ls-tree -r --name-only "$head_at_acquire" -- "$p" 2>/dev/null | grep -q .; then
           # Tracked file deleted from working tree — stage the removal
-          if ! GIT_INDEX_FILE="$private_index" git rm --cached -- "$p" 2>/dev/null; then
+          if ! GIT_INDEX_FILE="$private_index" git rm --cached -r -- "$p" 2>/dev/null; then
             rm -f "$private_index" 2>/dev/null || true
             rm -f "$(_session_meta_path "$uuid")" 2>/dev/null || true
             json_out "{\"status\":\"path_error\",\"reason\":\"stage_remove_failed\",\"file\":$(json_encode "$p")}"
@@ -1434,8 +1430,7 @@ _validate_in_repo_path() {
 # operator-only SKIP_COMMIT_GATE=1 escape hatch: it unblocks a session whose
 # working-tree edits collided with a concurrent committer.
 #
-# Design: researches/decisions/2026-06-09-concurrent-commit-gate-design.md
-#   revert is a pre-acquire / post-FAIL working-tree op — NO lock, NO CAS,
+# revert is a pre-acquire / post-FAIL working-tree op — NO lock, NO CAS,
 #   NO private index.  Option B (a `revert)` case in the SKIP_COMMIT_GATE
 #   switch in main()) is explicitly REJECTED: revert IS the sanctioned path
 #   and must not piggyback the operator-only escape hatch.
@@ -1758,8 +1753,7 @@ main() {
       # switch. revert is the sanctioned alternative to the escape hatch (a
       # no-lock / no-CAS working-tree restore) and routes through the normal
       # gated dispatch above. Option B (a `revert)` case here piggybacking
-      # the skip-gate branch) is explicitly REJECTED per
-      # researches/decisions/2026-06-09-concurrent-commit-gate-design.md.
+      # the skip-gate branch) is explicitly REJECTED.
       *)
         json_out "{\"status\":\"error\",\"reason\":\"unknown_subcommand\",\"subcommand\":\"${subcmd}\"}"
         return 1

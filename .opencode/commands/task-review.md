@@ -23,6 +23,7 @@ Workflow:
   - validation plan
   - remaining blockers
   - whether any durable backlog/checkpoint promotion is still needed
+  - if the card carries both `predicted_impact` and `measured_outcome`, note whether the measured outcome matched the prediction
 - choose the next lifecycle state explicitly:
   - `ready` when follow-up implementation or study is required
   - `reported` when the report is acceptable but a manual promotion/decision still remains

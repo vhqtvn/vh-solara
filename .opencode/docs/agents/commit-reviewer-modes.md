@@ -1,6 +1,6 @@
 # Commit Reviewer Modes
 
-The `review_mode` field in `commit-review-result.v1` is a taxonomy/context label. It does not change review behavior. It is set by the caller (not auto-detected) and forwarded through the orchestrator to all leaves across all active tiers.
+The `review_mode` field in `commit-review-result.v2` is a taxonomy/context label. It does not change review behavior. It is set by the caller (not auto-detected) and forwarded through the orchestrator to all leaves across all active tiers.
 
 ## Valid modes
 

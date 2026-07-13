@@ -326,6 +326,12 @@ trigger fires AND the promoter applies the promotion Definition of Ready:
 - **Holding area is transport, not truth.** Unpromoted candidates may be lost —
   this is intentionally fine, because they are not trusted work yet. Do not
   create a parallel committed ledger for them.
+- **Fog vs ticket (triage test).** A finding is **ticket-ready** when you can
+  state the question precisely now — even if blocked. A finding is **fog** when
+  you cannot yet phrase it that sharply: in-scope, but not yet specifiable. Fog
+  belongs in `.local/coordinator/tasks/` (transport, not truth); it
+  becomes a backlog row only once it sharpens to a precise question AND its
+  trigger has fired AND the promotion DoR below is met.
 - **Promotion Definition of Ready (DoR):** a candidate reaches `backlog.md`
   only if ALL of: trigger has fired (or operator override) + concrete area +
   file scope + validation plan + clear slice + provenance Notes. Run the

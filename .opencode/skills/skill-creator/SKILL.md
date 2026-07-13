@@ -37,6 +37,7 @@ corpus on every `vh-agent-harness update`, so any skill you drop at
 
 ## What a good repo skill does
 
+- **reproduces the same process every run, not the same output** — this predictability is the root virtue of a skill (`references/skill-design-vocabulary.md`)
 - captures a repeated engineering workflow, review pattern, or repo-specific convention
 - reduces rediscovery cost without duplicating obvious general knowledge
 - makes trigger conditions explicit enough that the `skill` tool can choose it reliably
@@ -105,6 +106,8 @@ Rationale distilled from `researches/decisions/2026-06-22-skillopt-applicability
 
 - keep `name` lowercase, hyphenated, and matched to the directory name
 - make `description` explicit about trigger phrases such as "use this when..."
+- keep `description` tight because a model-invoked skill pays its token cost every turn — the two-loads framing in `references/skill-design-vocabulary.md` is the *why*
+- each numbered step ends on a checkable completion criterion, not a verb (`references/skill-design-vocabulary.md`)
 - include `compatibility: opencode`
 - add `When not to use` sections when adjacent skills might overlap
 - prefer short output sections that tell the agent what shape to return
@@ -142,4 +145,6 @@ When you create or update a skill in this repo:
 - `references/workflows.md` for workflow shapes
 - `references/output-patterns.md` for concise output sections
 - `references/sample-prompts.md` for repo-oriented skill requests
+- `references/skill-design-vocabulary.md` for named skill-design concepts (predictability, two loads, ladder, failure modes, pruning)
+- `references/skill-lifecycle.md` for the localization-split and pilot-then-promote rules
 - `references/rejected.md` for approaches tried and dropped (revision-history analog)

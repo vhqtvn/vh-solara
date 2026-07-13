@@ -299,6 +299,12 @@ export const planStateTool = tool({
             .describe(
                 "Next recommended action for coordination-task closeout or review.",
             ),
+        measured_outcome: tool.schema
+            .string()
+            .optional()
+            .describe(
+                "Optional measured-outcome narrative for coordination-task closeout (the actual result, captured at closeout-time).",
+            ),
         force_takeover: tool.schema
             .boolean()
             .optional()
@@ -667,6 +673,7 @@ export const planStateTool = tool({
                                 promotionRecommended:
                                     args.promotion_recommended,
                                 nextAction: args.next_action,
+                                measuredOutcome: args.measured_outcome,
                             },
                         ),
                     );

@@ -32,7 +32,14 @@ Follow this state machine exactly. Do NOT deviate or exercise independent judgme
      c. If ALL files match:
         - Select one leaf agent according to `leaf_selector`:
           - "first": use the first leaf from the first active (non-disabled) tier.
-        - Invoke ONLY that single leaf with the full review context.
+        - Obtain and forward the active task contract per the "Task-contract
+          injection" section below (contract body if a session is bound, or
+          `task_contract: null` with the documented no-contract Spec fallback
+          if not). The lightweight path is a leaf invocation, NOT a
+          contract-free shortcut — it MUST use the same bound-session/null
+          logic as normal tier leaves.
+        - Invoke ONLY that single leaf with the full review context (including
+          the task contract).
         - Return that leaf's verdict directly as the cascade result.
         - Skip the entire tier cascade (Steps 1-8 below).
      d. If ANY file does NOT match, proceed with the normal tier cascade (Steps 1-8).
@@ -67,7 +74,7 @@ Follow this state machine exactly. Do NOT deviate or exercise independent judgme
       - No BLOCK findings, but any leaf returns "split" → tier verdict = "split"
       - No BLOCK findings, no split → tier verdict = "approve"
    h. Merge this tier's findings into combined_findings:
-      - findings: append all findings from all leaves (deduplicate by id + location)
+       - findings: append all findings from all leaves (deduplicate by axis + id + location; never collapse a Standards finding with a Spec finding that shares id+location)
       - blocking_issues: append IDs of BLOCK findings after disagreement resolution
       - deferred_findings: append IDs of DEFER findings
       - dropped_findings: append IDs of DROP findings
@@ -112,6 +119,30 @@ Forward the following context to every leaf:
 - Any lane defaults or assumptions the command has already stated
 - If a tree_hash is available from the commit-gate acquire step: pass the tree_hash value to each leaf so it can read the diff via `git diff HEAD <tree_hash>`
 - The changed-file list (for lightweight_review matching and scope reference)
+- The active task-contract body (the Spec-axis input), obtained per "Task-contract injection" below; forward `task_contract: null` when no session is bound
+
+### Task-contract injection (Spec axis input)
+
+Before ANY leaf invocation — the lightweight Step 0 path OR any tier leaf —
+obtain the active task contract for the Spec axis. This is the single
+authoritative rule; both the lightweight path (Step 0c) and the tier cascade
+(Step 4b) obtain and forward the contract here:
+
+1. Call the `plan_state` MCP tool with `operation: current_session` to
+   determine whether a session is bound (and learn its alias).
+2. If a session IS bound, call `plan_state` with
+   `operation: read_task_contract, include_body: true` to obtain the contract
+   body and source identity (the session alias). Forward the full contract
+   body to every leaf as the Spec-axis input.
+3. If `current_session` returns no bound session, OR `read_task_contract`
+   returns nothing — forward `task_contract: null` to every leaf. This is the
+   no-contract fallback (Decision 1): leaves then emit the Spec axis as
+   `not_evaluated` and routing derives from the Standards axis alone. This is
+   graceful, NOT an error — do not block or fail-closed on a missing contract.
+
+Ad-hoc commits without a bound session are legitimate; the Spec axis is simply
+not evaluated with explicit disclosure. Do not synthesize a contract from the
+feature summary or the diff.
 
 ### HARD RULE: Never inline diff content in task parameters
 
@@ -133,6 +164,13 @@ Each leaf returns a v2 schema with a `findings[]` array. Each finding has a `dis
 3. If a leaf's JSON does not contain findings[] or disposition fields (legacy v1 output):
    - Treat as v1 fallback: all items in blocking_issues[] → disposition=block, all items in followups[] → disposition=drop
    - Log a validation note: "Leaf {key} returned v1 schema (legacy fallback applied)"
+4. Leaf `verdict` normalization — a leaf's top-level `verdict` is one of
+   `approve`, `blocked`, or `split`. All three are PERMITTED leaf values; do
+   NOT reject `split` as malformed. The leaf `verdict` is informational. The
+   tier verdict is derived from findings dispositions (BLOCK > split > approve)
+   per the within-tier aggregation rules, NOT by echoing leaf verdicts. A leaf
+   emitting `verdict: "split"` with a populated `split_reason` is the canonical
+   source for a tier-level `split` verdict.
 
 ## Cross-leaf DISAGREEMENT resolution
 
@@ -177,7 +215,7 @@ After all leaves in a tier return, apply these rules **without exercising indepe
 
 4. **Tier reviewed files:** union of all tier leaves' reviewed_files lists (deduplicated, sorted)
 
-5. **Tier findings:** merge all tier leaves' findings[] arrays. Deduplicate by (id + location). Preserve all disposition values.
+5. **Tier findings:** merge all tier leaves' findings[] arrays. Deduplicate by (axis + id + location) — same axis AND id AND location still collapses, but a Standards finding and a Spec finding sharing id+location stay distinct (no cross-axis collapse). Preserve all disposition values.
 
 6. **Tier blocking issues:** IDs of findings with disposition=block that survived disagreement resolution.
 
@@ -188,6 +226,11 @@ After all leaves in a tier return, apply these rules **without exercising indepe
 9. **Tier split reason:** if tier verdict is `split`, concatenate all tier leaves' split_reason values. Otherwise null.
 
 10. **Tier validation notes:** concatenate all tier leaves' validation_notes, labeled by leaf. Include disagreement resolution notes.
+11. **Cross-axis disclosure (verbatim):** if any leaf in the tier carries a
+    non-null `axis_conflict` object, copy it VERBATIM (leaf key + the object)
+    into the tier's `axis_disclosures[]` list. Do not merge, rerank, re-judge,
+    or dedupe across axes or across leaves. `axis_conflict` is disclosure only
+    and never changes the tier verdict (still blocked > split > approve).
 
 ## Output format
 
@@ -205,6 +248,7 @@ Emit a single aggregated JSON code block using `commit-review-result.v2` schema,
   "findings": [
     {
       "id": "F1",
+      "axis": "standards",
       "severity": "...",
       "category": "...",
       "disposition": "block|defer|drop",
@@ -221,6 +265,9 @@ Emit a single aggregated JSON code block using `commit-review-result.v2` schema,
   "split_reason": null,
   "validation_notes": "...",
   "resolved_categories": { "correctness": 1 },
+  "axis_disclosures": [
+    { "leaf": "tier1_a", "standards": "approve", "spec": "split", "driving_axis": "spec", "reason": "..." }
+  ],
   "tiers_executed": ["free"],
   "tiers_skipped": ["premium"],
   "leaf_results": {
@@ -237,6 +284,16 @@ After the JSON block, provide a brief human-readable summary:
 - Deferred findings with triggers (if any)
 - Notable dropped findings
 - Whether leaves within each tier agreed or disagreed (and disagreement resolution outcome)
+
+### Cross-axis disclosure (when present)
+
+If any leaf emitted a non-null `axis_conflict`, render a "Cross-axis disclosure"
+section listing each conflict VERBATIM from the leaf — name the leaf, the
+Standards status, the Spec status, the driving axis, and the reason. Copy the
+reason text as-is; do not merge or rerank conflicts across axes or leaves. This
+section is informational; the single top-level verdict is already final (blocked
+> split > approve) and is not altered by the disclosure. Omit this section
+entirely when no leaf emitted an `axis_conflict`.
 
 ## Leaf verdict handoff
 
@@ -270,6 +327,7 @@ After retry exhaustion (or for non-retryable failures), treat the leaf as having
 - Set overall confidence to `low` if any leaf required retry.
 - Add a BLOCK finding with:
   - `id`: auto-generated (e.g., "ERR-1")
+  - `axis`: `standards`
   - `category`: `correctness`
   - `disposition`: `block`
   - `location`: `orchestrator`
@@ -286,7 +344,8 @@ NEVER silently proceed past a failed leaf. ALWAYS surface the failure in the out
 Before invoking any tier, inspect the exact file list. If it contains
 `docs/planning/backlog.md` AND any other file, return verdict `split`
 immediately (do NOT run the cascade). Emit a finding with
-`disposition: "block"`, `category: "process"`, and this issue text:
+`axis: "standards"`, `disposition: "block"`, `category: "process"`, and this
+issue text:
 
 > docs/planning/backlog.md must be committed separately from code/docs changes
 > (W1 conflict-prevention policy). Split: commit code first (without the

@@ -42,6 +42,9 @@ Workflow:
     - `dependencies`
     - `owner_notes`
     - `next_action`
+  - optional assessment fields (both skip-for-routine-slices):
+    - `predicted_impact` (draft | ready only)
+    - `measured_outcome` (reported | blocked only)
   - for `task_type: research`, optional research metadata:
     - `research_question`
     - `source_policy`

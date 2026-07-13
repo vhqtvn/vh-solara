@@ -33,6 +33,7 @@ Workflow:
   - blockers or remaining risks
   - next action
   - whether promotion into backlog/checkpoints is recommended later
+  - optional `measured_outcome`: the actual result (vs any `predicted_impact` recorded at ready-time), captured here at closeout-time (skip for routine slices)
 - call `plan_state` with:
   - `operation: save_coordination_task_closeout`
   - `task_id: $ARGUMENTS`
@@ -42,6 +43,7 @@ Workflow:
   - `report_envelope`
   - `promotion_recommended`
   - `next_action`
+  - `measured_outcome` (optional)
 - call `plan_state` with:
   - `operation: save_checkpoint`
   - `slug: task-closeout`

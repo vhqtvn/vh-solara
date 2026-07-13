@@ -43,11 +43,17 @@ state that assumption in the review output.
 
 The `commit-reviewer` agent is a tiered cascade commit reviewer. It will:
 1. Load tier configuration from `.opencode/config/review-tiers.json`.
-2. For each active tier, invoke its leaf reviewers in parallel.
-3. Pass the full review context (feature summary, file list, inspection
-   commands below, lane defaults, and all user-provided context) to all leaves
-   in each tier.
-4. Mechanically aggregate leaf results using strict consensus within each tier,
+2. Obtain the active task contract via the `plan_state` MCP tool
+   (`operation: current_session` then `operation: read_task_contract,
+   include_body: true`) BEFORE invoking any tier, so it can be forwarded as the
+   Spec-axis input to every leaf. When no session is bound, it forwards
+   `task_contract: null` and the leaves evaluate the Standards axis only
+   (no-contract fallback, graceful).
+3. For each active tier, invoke its leaf reviewers in parallel.
+4. Pass the full review context (feature summary, file list, inspection
+   commands below, lane defaults, the task contract from step 2, and all
+   user-provided context) to all leaves in each tier.
+5. Mechanically aggregate leaf results using strict consensus within each tier,
    then combine across tiers with fail-fast escalation.
 
 The orchestrator does NOT perform independent review. It only invokes leaves
@@ -101,7 +107,7 @@ Review for:
 ## Output contract
 
 The orchestrator will emit a single aggregated JSON code block using
-`commit-review-result.v1` schema with `tiers_executed`, `tiers_skipped`, and
+`commit-review-result.v2` schema with `tiers_executed`, `tiers_skipped`, and
 `leaf_results` sub-object (keyed by tier+leaf letter, e.g. `tier1_b`), followed by a
 brief human-readable summary covering:
 - Overall verdict and confidence
