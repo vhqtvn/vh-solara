@@ -267,4 +267,46 @@ describe("startPinnedDrag gesture (pointer lifecycle)", () => {
     });
     expect(document.body.style.cursor).toBe("");
   });
+
+  // (6) Class-separation invariant the new source visual grammar depends on:
+  // while a drag is engaged, the SOURCE row carries `.dragging` and never a
+  // `.drop-before`/`.drop-after` marker (computeDrop skips id === sessionId),
+  // and pointercancel clears `.dragging` with no commit. Locks the CSS rule's
+  // assumption that source and target styling never collide on the same cell.
+  // Asserts classes/DOM only — jsdom does not render color/opacity.
+  it("source row carries dragging but neither drop class while hovered over itself; pointercancel clears it with no commit", async () => {
+    putSession({ id: "a", title: "A", time: { updated: 1 } });
+    putSession({ id: "c", title: "C", time: { updated: 3 } });
+    seedVersioned("vh.pinned.v1", ["a", "c"]);
+    seedVersioned("vh.pinned-order.v1", ["a", "c"]);
+    __resetPinnedForTest();
+
+    const { container } = render(() => <SessionTree />);
+    await waitFor(() => {
+      expect(container.querySelectorAll(".tree-drag").length).toBe(2);
+    });
+    stageRects({
+      a: { top: 0, height: 40 },
+      c: { top: 80, height: 40 },
+    });
+
+    const handle = handleFor(container as unknown as HTMLElement, "a");
+    firePointer(handle, "pointerdown", 20); // grab row a
+    firePointer(handle, "pointermove", 25); // past the 4px threshold, still over a itself
+
+    await waitFor(() => {
+      const aRow = container.querySelector('.tree-row[data-pinned-id="a"]');
+      expect(aRow?.classList.contains("dragging")).toBe(true);
+      // The source is excluded from its own hit-test: no directional marker on a.
+      expect(aRow?.classList.contains("drop-before")).toBe(false);
+      expect(aRow?.classList.contains("drop-after")).toBe(false);
+    });
+
+    // pointercancel — no commit, `.dragging` cleared.
+    firePointer(handle, "pointercancel", 25);
+    expect(readOrderStore()).toEqual(["a", "c"]); // unchanged — no commit
+    await waitFor(() => {
+      expect(container.querySelector('.tree-row[data-pinned-id="a"]')?.classList.contains("dragging")).toBe(false);
+    });
+  });
 });
