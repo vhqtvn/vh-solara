@@ -92,6 +92,7 @@ async function openDemo(page: import("@playwright/test").Page) {
   // deterministic and detach-proof — same proven pattern test 5 below uses and
   // chat-controls-gating.spec test 1. (The scroll-subsystem quirk itself is out
   // of scope for this regression fix.)
+  await waitForReady(page); // ensure startup restore (maybeRestore) is done so onScrolled won't drop our scroll
   await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
     el.scrollTop = el.scrollHeight;
   });
@@ -105,6 +106,21 @@ async function setScrollTop(page: import("@playwright/test").Page, value: number
   await page.locator(".chat-scroll").evaluate((el: HTMLElement, v) => {
     el.scrollTop = v;
   }, value);
+}
+
+// Wait for the app's startup scroll-restore to complete before issuing any
+// scroll command. The app gates onScrolled on `ready()` (set true by
+// maybeRestore once the scroll container is bound + content positioned); while
+// ready()=false, onScrolled early-returns and silently DROPS the scroll event.
+// A test that issues setScrollTop during that ~100-200ms startup window
+// (beforeAll's .msg-visible + .working-text-absent checks pass, but maybeRestore
+// hasn't finished) sees its scroll-up classified nowhere — following stays true,
+// button.jump never appears, and the test fails. `.chat-content.ready` is the
+// app's own reactive signal (`revealed()` = ready() && delivered()) that restore
+// is done AND content is delivered. Waiting here eliminates the race between the
+// test's programmatic scroll and maybeRestore's completion.
+async function waitForReady(page: import("@playwright/test").Page) {
+  await page.locator(".chat-content.ready").waitFor({ state: "visible", timeout: 10000 });
 }
 
 // Toggle the composer Focus-mode button. In focus mode the expanded composer
@@ -255,6 +271,7 @@ test("mid-stream scroll up still surfaces the Latest button", async ({ page }) =
 test("focus mode hides the Latest button (focus gate reactivity)", async ({ page }) => {
   // beforeEach loaded demo (VP + absorbed any leaked stall goroutine).
   // Glue to the tail deterministically (see NOTE above).
+  await waitForReady(page); // ensure startup restore is done so onScrolled won't drop our scroll
   await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
     el.scrollTop = el.scrollHeight;
   });
@@ -311,6 +328,7 @@ test("scrolling back to the bottom flips Latest → Live", async ({ page }) => {
   // Glue to the tail deterministically. The RO path pins while following=true,
   // arming pinnedGeom.scrollTop to this bottom clamp; capture it so the scroll-back below
   // lands on the exact value pin() wrote.
+  await waitForReady(page); // ensure startup restore is done so onScrolled won't drop our scroll
   const bottomClamp = await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
     el.scrollTop = el.scrollHeight;
     return el.scrollTop;
