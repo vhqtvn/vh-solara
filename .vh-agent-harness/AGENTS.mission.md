@@ -85,6 +85,80 @@ reasoning body):
   list) vs `Grouper`/`GetBlobItemData` (blob raster). Headless browsers do not
   GPU-rasterize, so they cannot reproduce the heat.
 
+## Testing rules (this repo)
+
+> The core `## Testing rules` section above is generic harness boilerplate
+> (pytest, `tests/unit/`) that **does not apply to this repo**. This section is
+> the authoritative testing reference.
+
+Every meaningful change should add or update tests. This repo has two test
+trees (Go and web) and four runner families across six lanes. There is **no
+`tests/unit/` directory** — Go unit tests are co-located in `pkg/`. There is
+**no pytest** anywhere in this repo.
+
+> **Go PATH note:** `go` may not be on `PATH`. Prefix Go commands with
+> `export PATH=$PATH:/usr/local/go/bin` (or use the harness equivalent:
+> `vh-agent-harness exec bash -c 'export PATH=$PATH:/usr/local/go/bin && go ...'`).
+
+### The six lanes
+
+1. **Go co-located unit** — `pkg/*/*_test.go` beside the source under test.
+   Runner: `go test ./pkg/<pkg>/` (whole tree: `go test ./pkg/...`).
+
+2. **Go integration** — `tests/integration/` (e.g. `opencode_lifecycle_test.go`).
+   Runner: `go test ./tests/integration/`.
+
+3. **Go e2e (in-process)** — `tests/e2e/`. Real controller daemon + real worker
+   over an actual yamux tunnel + fake OpenCode (`pkg/fixtures`). No docker, no
+   real opencode binary, no LLM. Entry helper `StartCluster()` at
+   `tests/e2e/harness.go:47`.
+   Runner: `go test ./tests/e2e/`.
+
+4. **Go e2e (docker gold)** — `tests/e2e-docker/run.sh`. Real opencode + fake
+   LLM through the real aggregator/web, in docker. The `assert*.py` files
+   (`assert.py`, `assert_sub.py`, `assert_tool.py`, `assert_perm.py`,
+   `assert_perm_done.py`) are JSON assertion helpers invoked by `run.sh` —
+   they read JSON on stdin and check fields, then print `OK`/`WAIT` and exit
+   0. They are **not** a python test framework (there is no pytest, no test
+   runner, no collection).
+   Runner: `bash tests/e2e-docker/run.sh` (docker-gated).
+
+5. **Web unit** — `web/tests/unit/*.test.{ts,tsx}` (Vitest). Component tests use
+   `@solidjs/testing-library`. `vitest.config.ts` default environment is **node**
+   (`environment: "node"` at line 10); jsdom is a per-file opt-in via the
+   `// @vitest-environment jsdom` docblock (36 of 52 test files opt in; the
+   remaining 16 are pure-logic tests that stay in node).
+   Runner: `npm --prefix web run test:unit`.
+   Typecheck: `npm --prefix web run typecheck`.
+
+6. **Web e2e** — `web/tests/e2e/*.spec.ts` (Playwright). Runs **serially** by
+   design (`web/playwright.config.ts`: `fullyParallel: false` at line 30,
+   `workers: 1` at line 33, `retries: process.env.CI ? 2 : 0` at line 34) — one
+   shared mutable fixture backend (`pkg/fixtures/opencode.go`). The `webServer`
+   config runs `scripts/fixture-web.sh` which builds the SPA and starts
+   `go run ./tools/fixtureserver`, so go must be on PATH.
+   Runner: `npm --prefix web run test:e2e`.
+
+Execution examples:
+
+```bash
+# Go co-located unit (whole tree):
+vh-agent-harness exec bash -c 'export PATH=$PATH:/usr/local/go/bin && go test ./pkg/...'
+# Go integration:
+vh-agent-harness exec bash -c 'export PATH=$PATH:/usr/local/go/bin && go test ./tests/integration/'
+# Go in-process e2e:
+vh-agent-harness exec bash -c 'export PATH=$PATH:/usr/local/go/bin && go test ./tests/e2e/'
+# Go docker gold (docker-gated):
+vh-agent-harness exec bash tests/e2e-docker/run.sh
+# Web unit + typecheck:
+vh-agent-harness exec npm --prefix web run test:unit
+vh-agent-harness exec npm --prefix web run typecheck
+# Web e2e (serial; go must be on PATH for the fixtureserver):
+vh-agent-harness exec bash -c 'export PATH=$PATH:/usr/local/go/bin && npm --prefix web run test:e2e'
+```
+
+For any substantial boundary change, also update the relevant docs.
+
 ## Conventions
 
 - State-changing `/vh/*` requests require the `X-VH-CSRF: 1` header (the SPA's
