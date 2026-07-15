@@ -62,7 +62,7 @@ A config is optional — no file means nothing is managed for the project.
 > instead, so personalizing your UI never dirties `git status`. On project open,
 > any `agentStyles` left in `project.jsonc` is **auto-migrated** to that local
 > overlay (one-time, idempotent), and a `.vh-solara/.gitignore` is auto-created to
-> keep the overlay out of `git status`. See
+> keep the overlay **and** vh-solara's runtime data out of `git status`. See
 > [Agent styles](#agent-styles-agentstyles).
 
 ### UI settings (`notes`)
@@ -160,11 +160,16 @@ agent chips read a merge of two files:
   operator's first open adopts as their personal default — but it then lives in
   their ignored overlay, never written back into `project.jsonc`.
 
-The first open of a project also auto-creates a `.vh-solara/.gitignore` (with
-`*.local` / `*.local.jsonc`) if one is not already present, so the local overlay
-stays out of `git status` without each operator having to add it by hand. Both
-the migration and the `.gitignore` step are idempotent — re-running them is a
-no-op once the steady state is reached.
+The first open of a managed project also auto-creates a `.vh-solara/.gitignore`
+(when one is not already present) that keeps both the local overlay and
+vh-solara's runtime data out of `git status`: `*.local` / `*.local.jsonc` for the
+overlay, and `/sessions/` (message attachments + the per-session queue) and
+`/run/` (adopter-declared sockets/logs) for runtime data. The same file is
+ensured for **any** project the moment vh-solara first writes runtime data into
+it — an attachment upload or a queued message — not only managed projects, so a
+non-managed project's `.vh-solara/sessions/…` is ignored too. Both the migration
+and the `.gitignore` step are idempotent — re-running them is a no-op once the
+steady state is reached.
 
 `notes` stays a `project.jsonc` declaration: it has no UI writer, so set it by
 hand (see above). In practice, then, `project.jsonc` is **declarative-only**

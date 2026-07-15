@@ -30,6 +30,9 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/vhqtvn/vh-solara/pkg/projectcfg"
+	"github.com/vhqtvn/vh-solara/pkg/vhlog"
 )
 
 // QueueItemState is the lifecycle state of a queue item.
@@ -191,6 +194,12 @@ func (s *sessionQueueStore) save() error {
 	}
 	if err := os.MkdirAll(filepath.Dir(s.path), 0o755); err != nil {
 		return fmt.Errorf("queue: mkdir: %w", err)
+	}
+	// Ensure .vh-solara/.gitignore covers runtime data. Non-managed projects
+	// (no project.jsonc) never reach EnsureLocalSetup, so this is their entry
+	// point. Best-effort: a failure is logged and never blocks the queue save.
+	if err := projectcfg.EnsureRuntimeGitignore(vhSolaraDir(s.path)); err != nil {
+		vhlog.Warn("queue: ensure .vh-solara/.gitignore failed", "err", err)
 	}
 	return writeQueueAtomic(s.path, data, 0o644)
 }
@@ -374,6 +383,14 @@ func newQueueRegistry() *queueRegistry {
 // .vh-solara runtime dir (peer to attachments/).
 func queuePath(root, sessionID string) string {
 	return filepath.Join(root, ".vh-solara", "sessions", sessionID, "queue.json")
+}
+
+// vhSolaraDir returns the .vh-solara directory that owns a queue path
+// (<root>/.vh-solara/sessions/<sid>/queue.json → <root>/.vh-solara). Used by
+// save() to ensure that project's .vh-solara/.gitignore without needing the
+// project root stored on the store (the store only carries s.path).
+func vhSolaraDir(p string) string {
+	return filepath.Dir(filepath.Dir(filepath.Dir(p)))
 }
 
 func storeKey(root, sessionID string) string {

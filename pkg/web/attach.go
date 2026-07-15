@@ -10,6 +10,9 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/vhqtvn/vh-solara/pkg/projectcfg"
+	"github.com/vhqtvn/vh-solara/pkg/vhlog"
 )
 
 // Attachments are stored under the project's own tree so OpenCode (which reads
@@ -67,6 +70,12 @@ func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+	// Ensure .vh-solara/.gitignore covers runtime data. Non-managed projects
+	// (no project.jsonc) never reach EnsureLocalSetup, so this is their entry
+	// point. Best-effort: a failure is logged and never blocks the upload.
+	if err := projectcfg.EnsureRuntimeGitignore(filepath.Join(root, ".vh-solara")); err != nil {
+		vhlog.Warn("attach: ensure .vh-solara/.gitignore failed", "dir", root, "err", err)
 	}
 
 	name := filepath.Base(hdr.Filename)

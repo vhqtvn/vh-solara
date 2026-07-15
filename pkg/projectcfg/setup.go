@@ -18,13 +18,19 @@ import (
 var LocalSetupMu sync.Mutex
 
 // localGitignoreGlobs is the exact content ensured at .vh-solara/.gitignore for
-// every adopting project: a one-line header + the two local-ignore globs. Order
-// matters only for the create-from-scratch case; the append-missing path checks
-// each line for membership independently.
+// every project vh-solara writes into: a header + the local-preferences globs +
+// the runtime-data globs. Order matters only for the create-from-scratch case;
+// the append-missing path checks each line for membership independently, so a
+// partially-present file (e.g. one an older vh-solara wrote with only the prefs
+// globs) gets the missing runtime lines appended without disturbing the rest.
 var localGitignoreGlobs = []string{
-	"# Local vh-solara files — not committed (preferences, per-machine state).",
+	"# vh-solara local files — not committed (local preferences + runtime data).",
 	"*.local",
 	"*.local.jsonc",
+	"# Runtime data vh-solara writes for any project (attachments, queue,",
+	"# adopter-declared sockets/logs):",
+	"/sessions/",
+	"/run/",
 }
 
 // EnsureLocalSetup performs the one-time, idempotent local-preferences setup for
@@ -41,12 +47,12 @@ var localGitignoreGlobs = []string{
 //     agentStyles does NOT change the trust hash — canonical() serializes only
 //     Processes+Views (see projectcfg.go), so the trust grant stays valid.
 //
-//  2. ENSURE .vh-solara/.gitignore exists with the two local-ignore globs
-//     (*.local, *.local.jsonc): create it if absent, or append any missing glob
-//     (no duplicates, comments preserved) if it already exists.
+//  2. ENSURE .vh-solara/.gitignore exists with the local-preferences + runtime-
+//     data globs (see localGitignoreGlobs): create it if absent, or append any
+//     missing line (no duplicates, comments preserved) if it already exists.
 //
 // It is a no-op when project.jsonc lacks agentStyles and the gitignore already
-// carries both globs, so it is safe to call on every project open. Errors are
+// carries every glob, so it is safe to call on every project open. Errors are
 // returned but should never block project open — callers log and continue.
 func EnsureLocalSetup(root, override string) error {
 	LocalSetupMu.Lock()
@@ -56,8 +62,10 @@ func EnsureLocalSetup(root, override string) error {
 	if err != nil {
 		return err
 	}
-	// Non-managed project (no project.jsonc) → nothing to migrate and no
-	// .vh-solara/ dir to drop a gitignore into. Bail before creating anything.
+	// Non-managed project (no project.jsonc) → nothing to migrate. The
+	// migration step bails here; the runtime-gitignore ensure for non-managed
+	// projects is handled separately by EnsureRuntimeGitignore at the
+	// attachment/queue write paths (see pkg/web/attach.go, pkg/web/queue.go).
 	if _, err := os.Stat(cfgPath); err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -73,6 +81,27 @@ func EnsureLocalSetup(root, override string) error {
 		return err
 	}
 	return ensureLocalGitignore(filepath.Dir(cfgPath))
+}
+
+// EnsureRuntimeGitignore is the standalone entry point for the runtime write
+// paths (attachments upload in pkg/web/attach.go, queue save in
+// pkg/web/queue.go) that create a project's .vh-solara/ tree for ANY project —
+// managed or not. It ensures .vh-solara/.gitignore (dir = the .vh-solara
+// directory, which MUST already exist — callers MkdirAll it first) carries the
+// local-preferences + runtime-data ignore globs, so a non-managed project whose
+// first .vh-solara/ write is an attachment upload or a queued message also gets
+// the safety net without going through EnsureLocalSetup (which bails on a
+// missing project.jsonc).
+//
+// It is independent of project.jsonc and never touches it. Idempotent:
+// create-from-scratch or append-missing, comments preserved. Acquires
+// LocalSetupMu so it cannot interleave with EnsureLocalSetup's gitignore step or
+// a concurrent preferences PUT. Errors are returned but callers should log and
+// continue — never block an upload or a queue save.
+func EnsureRuntimeGitignore(dir string) error {
+	LocalSetupMu.Lock()
+	defer LocalSetupMu.Unlock()
+	return ensureLocalGitignore(dir)
 }
 
 // migrateAgentStyles moves a top-level agentStyles from project.jsonc (cfgPath)

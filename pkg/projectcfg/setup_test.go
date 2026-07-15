@@ -71,9 +71,9 @@ func TestEnsureLocalSetup_MigratesAgentStyles(t *testing.T) {
 	if styles["build"].Label != "BLD" || styles["build"].Color != "warn" {
 		t.Fatalf("migrated value wrong: %+v", styles)
 	}
-	// .vh-solara/.gitignore created with both globs.
+	// .vh-solara/.gitignore created with the prefs + runtime globs.
 	gi := read(t, filepath.Join(root, ".vh-solara", ".gitignore"))
-	for _, want := range []string{"*.local", "*.local.jsonc", "Local vh-solara files"} {
+	for _, want := range []string{"*.local", "*.local.jsonc", "vh-solara local files", "/sessions/", "/run/"} {
 		if !strings.Contains(string(gi), want) {
 			t.Fatalf("gitignore missing %q:\n%s", want, gi)
 		}
@@ -227,7 +227,13 @@ func TestEnsureLocalSetup_GitignoreCreate(t *testing.T) {
 		t.Fatalf("EnsureLocalSetup: %v", err)
 	}
 	gi := read(t, filepath.Join(root, ".vh-solara", ".gitignore"))
-	want := "# Local vh-solara files — not committed (preferences, per-machine state).\n*.local\n*.local.jsonc\n"
+	want := "# vh-solara local files — not committed (local preferences + runtime data).\n" +
+		"*.local\n" +
+		"*.local.jsonc\n" +
+		"# Runtime data vh-solara writes for any project (attachments, queue,\n" +
+		"# adopter-declared sockets/logs):\n" +
+		"/sessions/\n" +
+		"/run/\n"
 	if string(gi) != want {
 		t.Fatalf("gitignore content mismatch:\nwant: %q\ngot:  %q", want, string(gi))
 	}
@@ -255,6 +261,12 @@ func TestEnsureLocalSetup_GitignoreAppendMissing(t *testing.T) {
 	if !strings.Contains(string(got), "*.local.jsonc") {
 		t.Fatalf("missing glob not appended:\n%s", got)
 	}
+	// The new runtime-data globs are appended alongside the prefs globs.
+	for _, want := range []string{"/sessions/", "/run/"} {
+		if !strings.Contains(string(got), want) {
+			t.Fatalf("runtime glob not appended: %q\n%s", want, got)
+		}
+	}
 	// *.local must not be duplicated.
 	if strings.Count(string(got), "*.local\n") != 1 {
 		t.Fatalf("*.local duplicated:\n%s", got)
@@ -265,7 +277,13 @@ func TestEnsureLocalSetup_GitignoreAppendMissing(t *testing.T) {
 // nothing is appended (idempotent).
 func TestEnsureLocalSetup_GitignoreNoDuplicate(t *testing.T) {
 	root, _, _ := writeCfg(t, `{ "notes": true }`)
-	full := "# Local vh-solara files — not committed (preferences, per-machine state).\n*.local\n*.local.jsonc\n"
+	full := "# vh-solara local files — not committed (local preferences + runtime data).\n" +
+		"*.local\n" +
+		"*.local.jsonc\n" +
+		"# Runtime data vh-solara writes for any project (attachments, queue,\n" +
+		"# adopter-declared sockets/logs):\n" +
+		"/sessions/\n" +
+		"/run/\n"
 	giPath := filepath.Join(root, ".vh-solara", ".gitignore")
 	if err := os.WriteFile(giPath, []byte(full), 0o644); err != nil {
 		t.Fatal(err)
@@ -275,6 +293,73 @@ func TestEnsureLocalSetup_GitignoreNoDuplicate(t *testing.T) {
 	}
 	got := read(t, giPath)
 	if string(got) != full {
-		t.Fatalf("gitignore changed despite already-complete content:\nwant: %s\ngot:  %s", full, got)
+		t.Fatalf("gitignore changed despite already-complete content:\nwant: %s\ngot: %s", full, got)
+	}
+}
+
+// TestEnsureRuntimeGitignore_WorksWithoutProjectConfig: the standalone runtime
+// entry point creates .vh-solara/.gitignore for a NON-managed project (no
+// project.jsonc present) — the gap EnsureLocalSetup leaves open, since
+// EnsureLocalSetup bails on a missing project.jsonc. Ensures the full prefs +
+// runtime body, and is idempotent (a second run is byte-identical).
+func TestEnsureRuntimeGitignore_WorksWithoutProjectConfig(t *testing.T) {
+	root := t.TempDir()
+	vhDir := filepath.Join(root, ".vh-solara")
+	if err := os.MkdirAll(vhDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Sanity: this is a non-managed project (no project.jsonc).
+	if _, err := os.Stat(filepath.Join(vhDir, "project.jsonc")); !os.IsNotExist(err) {
+		t.Fatalf("precondition: project.jsonc should not exist")
+	}
+
+	if err := EnsureRuntimeGitignore(vhDir); err != nil {
+		t.Fatalf("EnsureRuntimeGitignore: %v", err)
+	}
+	giPath := filepath.Join(vhDir, ".gitignore")
+	gi := read(t, giPath)
+	want := strings.Join(localGitignoreGlobs, "\n") + "\n"
+	if string(gi) != want {
+		t.Fatalf("gitignore content mismatch:\nwant: %q\ngot:  %q", want, string(gi))
+	}
+	// No project.jsonc created as a side effect.
+	if _, err := os.Stat(filepath.Join(vhDir, "project.jsonc")); !os.IsNotExist(err) {
+		t.Fatalf("EnsureRuntimeGitignore must not create project.jsonc")
+	}
+
+	// Idempotent: a second run leaves the file byte-identical.
+	if err := EnsureRuntimeGitignore(vhDir); err != nil {
+		t.Fatalf("second EnsureRuntimeGitignore: %v", err)
+	}
+	if gi2 := read(t, giPath); string(gi2) != string(gi) {
+		t.Fatalf("second run changed the gitignore:\n1: %s\n2: %s", gi, gi2)
+	}
+}
+
+// TestEnsureRuntimeGitignore_AppendsMissing: an existing .vh-solara/.gitignore
+// with user content + some (but not all) globs gets the missing runtime lines
+// appended, preserving everything already there.
+func TestEnsureRuntimeGitignore_AppendsMissing(t *testing.T) {
+	root := t.TempDir()
+	vhDir := filepath.Join(root, ".vh-solara")
+	if err := os.MkdirAll(vhDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	giPath := filepath.Join(vhDir, ".gitignore")
+	existing := "# my stuff\nbuild/\n*.local\n*.local.jsonc\n"
+	if err := os.WriteFile(giPath, []byte(existing), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureRuntimeGitignore(vhDir); err != nil {
+		t.Fatalf("EnsureRuntimeGitignore: %v", err)
+	}
+	got := read(t, giPath)
+	for _, want := range []string{"# my stuff", "build/", "*.local", "*.local.jsonc", "/sessions/", "/run/"} {
+		if !strings.Contains(string(got), want) {
+			t.Fatalf("missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Count(string(got), "*.local\n") != 1 {
+		t.Fatalf("*.local duplicated:\n%s", got)
 	}
 }
