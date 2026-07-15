@@ -132,6 +132,18 @@ func (d *Daemon) buildRootHandler() http.Handler {
 		}
 	}
 
+	// CSRF defense-in-depth: require the X-VH-CSRF custom header on the
+	// browser-facing mutating endpoints (POST/PUT/PATCH/DELETE under /api/), so a
+	// forged cross-site request can't drive the dashboard's worker-management
+	// verbs even if a SameSite=Lax cookie were to ride along. Mirrors the worker's
+	// pkg/web csrfGuard (same header name + non-empty check + unsafe-method
+	// gating) and sits INSIDE Auth.Middleware (like the worker's chain), so the
+	// 403 only fires for authenticated browser requests; GET/HEAD/OPTIONS and
+	// non-/api/ paths pass through untouched. The bearer-gated coordination API
+	// (coordFront, outside auth) and the worker tunnel listener are not routed
+	// through here.
+	rootHandler = csrfGuard(rootHandler)
+
 	// Auth gates the entire user edge — the dashboard and every proxied worker
 	// subdomain — outside the host interceptor. The worker registration listener
 	// (DaemonAddr) is separate and intentionally not covered here. nil = no-op.
@@ -142,6 +154,40 @@ func (d *Daemon) buildRootHandler() http.Handler {
 	rootHandler = d.coordFront(coordMux, rootHandler)
 
 	return rootHandler
+}
+
+// csrfHeader is the custom header a same-origin browser client sends on mutating
+// requests to prove it is not a forged cross-site request. A cross-site page
+// cannot set a custom header without a CORS preflight, which the controller
+// never approves, so only same-origin dashboard JS reaches the mutating
+// endpoints. Mirrors pkg/web's const of the same name; header value "1" is the
+// convention used by the worker SPA's installCsrf (web/src/csrf.ts) and the
+// coordination-API proxy (coordapi.go).
+const csrfHeader = "X-VH-CSRF"
+
+// csrfGuard mirrors pkg/web's csrfGuard for the controller's browser-facing
+// mutating endpoints. It requires the X-VH-CSRF header on POST/PUT/PATCH/DELETE
+// to /api/* (the dashboard's worker-management verbs), returning 403 when it is
+// missing; GET/HEAD/OPTIONS and non-/api/ paths pass through. This is
+// defense-in-depth on top of the SameSite=Lax session cookie
+// (pkg/auth/auth.go:99) — the cookie alone is not relied on. The bearer-gated
+// coordination API (matched by coordFront BEFORE Auth.Middleware) and the worker
+// registration listener (DaemonAddr) are NOT routed through this guard, so
+// neither is affected.
+func csrfGuard(next http.Handler) http.Handler {
+	unsafe := map[string]bool{
+		http.MethodPost:   true,
+		http.MethodPut:    true,
+		http.MethodPatch:  true,
+		http.MethodDelete: true,
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if unsafe[r.Method] && strings.HasPrefix(r.URL.Path, "/api/") && r.Header.Get(csrfHeader) == "" {
+			http.Error(w, "missing "+csrfHeader+" header (CSRF protection)", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // handleHealthz is the auth-exempt liveness probe for the controller edge, so
@@ -544,15 +590,23 @@ func (d *Daemon) handleUIPage(w http.ResponseWriter, r *http.Request) {
 			localStorage.setItem('theme', isLight ? 'light' : 'dark');
 		}
 
+		// X-VH-CSRF is required by the server on mutating requests (defense-in-depth
+		// against CSRF; the SameSite=Lax session cookie alone is not relied on). A
+		// cross-site page cannot set a custom header without a CORS preflight the
+		// server never grants, so only this same-origin dashboard can pass it.
+		function csrfHeaders() {
+			return { 'X-VH-CSRF': '1' };
+		}
+
 		async function killWorker(id) {
 			if(confirm("Terminate this OpenCode session?")) {
-				await fetch('/api/workers/' + encodeURIComponent(id) + '/kill', {method: 'POST'});
+				await fetch('/api/workers/' + encodeURIComponent(id) + '/kill', {method: 'POST', headers: csrfHeaders()});
 				fetchWorkers();
 			}
 		}
 
 		async function cleanupWorkers() {
-			await fetch('/api/workers', {method: 'DELETE'});
+			await fetch('/api/workers', {method: 'DELETE', headers: csrfHeaders()});
 			fetchWorkers();
 		}
 
