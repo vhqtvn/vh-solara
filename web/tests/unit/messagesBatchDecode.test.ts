@@ -97,4 +97,31 @@ describe("decodeMessagesBatch (gzip+base64 cold-load payload)", () => {
     expect(decoded.sessionID).toBe("");
     expect(decoded.messages).toHaveLength(1);
   });
+
+  it("returns the safe empty envelope when the decompressed payload is non-JSON (P1-WEB-043)", async () => {
+    // A corrupt/garbled batch whose gzip64-decoded bytes are not valid JSON must
+    // not throw. The helper returns the same safe envelope callers already
+    // handle for the DecompressionStream-unavailable case ({sessionID, messages:
+    // []}) so the listener never sees the throw.
+    const garbled = Buffer.from(gzipSync(Buffer.from("not json at all"))).toString("base64");
+    const decoded = await decodeMessagesBatch({ sessionID: "g1", encoding: "gzip64", data: garbled });
+    expect(decoded.sessionID).toBe("g1");
+    expect(decoded.messages).toEqual([]);
+  });
+
+  it("falls back to inline messages when decompress fails AND inline messages are present", async () => {
+    // The malformed-path envelope is {sessionID, messages: payload.messages||[]},
+    // so a payload that ALSO carries inline messages (a non-conforming server
+    // mixing shapes) keeps them rather than dropping to a hard empty.
+    const garbled = Buffer.from(gzipSync(Buffer.from("{bad"))).toString("base64");
+    const inline = [{ info: { id: "inline1" }, parts: [] }];
+    const decoded = await decodeMessagesBatch({
+      sessionID: "g2",
+      encoding: "gzip64",
+      data: garbled,
+      messages: inline,
+    });
+    expect(decoded.sessionID).toBe("g2");
+    expect(decoded.messages).toBe(inline);
+  });
 });

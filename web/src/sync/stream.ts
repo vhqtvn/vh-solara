@@ -473,6 +473,38 @@ function advanceCursor(seq: number) {
   }
 }
 
+// applyTreeFrame — hardens a Stream-1 (tree) event frame against a malformed
+// MessageEvent.data payload. Parses raw, and on a malformed parse advances the
+// resume cursor (so a permanently-bad frame the server keeps resending from the
+// saved cursor can't wedge reconnect in an infinite replay loop) then returns
+// WITHOUT mutating the store. On a well-formed parse it dispatches to the
+// supplied apply fn, which advances the cursor itself (applySessionEvent /
+// applyMessageEvent via trackCursor). The gate-active early-return
+// (advanceCursor + markBusyDirty) stays in the listener — this only owns the
+// parse + the malformed-cursor contract. Exported so the malformed-frame
+// no-throw + cursor-advance contract is unit-testable without an EventSource,
+// mirroring the applySessionSnapshot extraction precedent.
+export function applyTreeFrame(
+  kind: string,
+  seq: number,
+  raw: string,
+  apply: (kind: string, seq: number, payload: any) => void,
+) {
+  let payload: any;
+  try {
+    payload = JSON.parse(raw);
+  } catch (err) {
+    log.warn("sync", "malformed tree frame", { kind, seq, err });
+    // Account for the RECEIVED frame so resume skips it — a malformed frame will
+    // always be malformed, so replaying it on reconnect (the server resends
+    // events with seq > cursor) would throw forever. Mirrors the gate-active
+    // path's advanceCursor(seq) at the listener call sites.
+    advanceCursor(seq);
+    return;
+  }
+  apply(kind, seq, payload);
+}
+
 // === Stream 1: tree + notifications (persistent) ============================
 // Structural (session/activity/status) + notification (permission/question)
 // events for ALL sessions. The server omits message/part events here
@@ -703,7 +735,19 @@ export function connect(fresh = false) {
   log.debug("sync", "tree stream connect", { cursor: fresh ? "fresh" : state.cursor, dir: projectDir() });
   es.addEventListener("snapshot", (e) => {
     markSeen();
-    const snap = JSON.parse((e as MessageEvent).data);
+    let snap: Snapshot;
+    try {
+      snap = JSON.parse((e as MessageEvent).data);
+    } catch (err) {
+      // A malformed snapshot carries an UNREADABLE seq (it lives in the JSON
+      // body, not the SSE id field), so the resume cursor can't be advanced from
+      // the body. But a snapshot is a fresh FULL-STATE reconciliation (not a
+      // per-seq replay frame), so dropping it is safe: live tree events keep
+      // advancing the cursor meanwhile, and the next snapshot (a watchdog
+      // reconnect / server re-snapshot) reconciles everything authoritatively.
+      log.warn("sync", "malformed tree snapshot frame", { err });
+      return;
+    }
     if (isGateActive() && !expectTreeSnap) {
       // Deferred tree snapshot during a busy scope — advance the resume cursor
       // (Stream 1) but do NOT mutate the store or run refreshOpenSessions.
@@ -736,7 +780,7 @@ export function connect(fresh = false) {
         markBusyDirty();
         return;
       }
-      applySessionEvent(kind, seq, JSON.parse(ev.data));
+      applyTreeFrame(kind, seq, ev.data, applySessionEvent);
     });
   }
   for (const kind of TREE_STREAM_KINDS) {
@@ -750,7 +794,7 @@ export function connect(fresh = false) {
         markBusyDirty();
         return;
       }
-      applyMessageEvent(kind, seq, JSON.parse(ev.data));
+      applyTreeFrame(kind, seq, ev.data, applyMessageEvent);
     });
   }
   // Daemon-detected alerts (transient; no cursor advance). In-app + OS delivery.
@@ -924,7 +968,20 @@ export async function decodeMessagesBatch(payload: {
     log.warn("sync", "DecompressionStream unavailable; messages.batch undecodable", { id: sessionID });
     return { sessionID, messages: payload.messages || [] };
   }
-  const inner = JSON.parse(text);
+  let inner: { messages?: any[] };
+  try {
+    inner = JSON.parse(text);
+  } catch (err) {
+    // Decompressed to non-JSON (corrupt/garbled batch payload). Return the same
+    // safe empty envelope callers already handle for the DecompressionStream-
+    // unavailable case above (empty messages array) instead of propagating the
+    // throw to the listener.
+    log.warn("sync", "malformed messages.batch payload (non-JSON after decompress)", {
+      id: sessionID,
+      err,
+    });
+    return { sessionID, messages: payload.messages || [] };
+  }
   return { sessionID, messages: inner.messages || [] };
 }
 
@@ -942,7 +999,19 @@ export async function decodeSnapshot<T = unknown>(payload: {
 }): Promise<T> {
   if (payload.encoding === "gzip64" && payload.data) {
     const text = await decodeGzip64(payload.data);
-    if (text) return JSON.parse(text) as T;
+    if (text) {
+      try {
+        return JSON.parse(text) as T;
+      } catch (err) {
+        // Decompressed to non-JSON (corrupt/garbled snapshot). Return a safe
+        // empty snapshot ({}) — applySessionSnapshot treats {} as a delivered-
+        // empty session (snap.messages?.[id] → undefined → buildMessages([]),
+        // snap.gate?.[id] → undefined → delivered path) — instead of
+        // propagating the throw to the listener.
+        log.warn("sync", "malformed snapshot payload (non-JSON after decompress)", { err });
+        return {} as T;
+      }
+    }
     log.warn("sync", "DecompressionStream unavailable; snapshot undecodable");
   }
   return payload as unknown as T;
@@ -984,7 +1053,19 @@ export function openSessionStream(id: string, force = false) {
     log.debug("sync", "session stream connect", { id });
     ses.addEventListener("snapshot", (e) => {
       markSeen();
-      const raw = JSON.parse((e as MessageEvent).data);
+      let raw: any;
+      try {
+        raw = JSON.parse((e as MessageEvent).data);
+      } catch (err) {
+        // Stream-2 never advances the shared resume cursor (trackCursor:false),
+        // so a malformed session snapshot is a clean log + drop. The connection
+        // stays open; the per-session refresh indicator and reconcile overlay
+        // (expectSessionSnap) self-heal via the next well-formed snapshot or the
+        // 15s reconcile safety timeout — resolving them here would be dispatch/
+        // state-machine surgery, out of scope for parse hardening.
+        log.warn("sync", "malformed session snapshot frame", { err });
+        return;
+      }
       // L1 t2: stamp `snap` on FRAME ARRIVAL, before any decode. The window
       // measures pure transport (server compute + serialize + tunnel) — the
       // bottleneck this feature targets. Including the client-side gzip64 decode
@@ -1098,7 +1179,19 @@ export function openSessionStream(id: string, force = false) {
         // Parse the payload once (was inline at applyMessageEvent); reused for
         // the split-timing read below. trackCursor:false — Stream 2 must not
         // advance Stream 1's resume cursor.
-        const data = JSON.parse(ev.data);
+        let data: any;
+        try {
+          data = JSON.parse(ev.data);
+        } catch (err) {
+          // Stream-2 never advances the shared cursor; a malformed message/part
+          // frame is a clean log + drop. No pendingBatch entry was registered
+          // for this frame (it's set up downstream, only for messages.batch
+          // AFTER a successful parse), so a later messages.loaded for this
+          // session finds no pending decode and opens the reveal gate without
+          // wedging.
+          log.warn("sync", "malformed session frame", { kind, err });
+          return;
+        }
         const sid: string | undefined = data?.sessionID;
         // Capture the gate epoch at entry so post-await application points can
         // detect that the gate activated during an await (snapshot decode or

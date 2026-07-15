@@ -91,4 +91,15 @@ describe("decodeSnapshot (gzip+base64 snapshot payload)", () => {
     const decoded = await decodeSnapshot({ encoding: "gzip64" });
     expect(decoded).toEqual({ encoding: "gzip64" });
   });
+
+  it("returns a safe empty snapshot when the decompressed payload is non-JSON (P1-WEB-043)", async () => {
+    // A corrupt/garbled snapshot whose gzip64-decoded bytes are not valid JSON
+    // must not throw. The helper returns {} — applySessionSnapshot treats {} as
+    // a delivered-empty session (snap.messages?.[id] → undefined →
+    // buildMessages([]); snap.gate?.[id] → undefined → delivered path) — so the
+    // listener's apply path never sees the throw.
+    const garbled = Buffer.from(gzipSync(Buffer.from("not json at all"))).toString("base64");
+    const decoded = await decodeSnapshot({ encoding: "gzip64", data: garbled });
+    expect(decoded).toEqual({});
+  });
 });
