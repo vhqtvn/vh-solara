@@ -6,6 +6,7 @@ import { codeStyle, setCodeStyle, codeWrap, setCodeWrap, codeShowIgnored, setCod
 import Icon from "./Icon";
 import Select from "./Select";
 import Spinner from "./Spinner";
+import TextPromptDialog from "./TextPromptDialog";
 
 // Read-only codebase view: lazy file tree + git-grep search on the left, a
 // server-highlighted file on the right. Heavy work (tree, search, highlight) is
@@ -99,6 +100,10 @@ export default function CodeView() {
   const [focusRoot, setFocusRoot] = createSignal("");
   const [ctxMenu, setCtxMenu] = createSignal<{ x: number; y: number; path: string } | null>(null);
   const [filterOpen, setFilterOpen] = createSignal(false);
+  // Go-to-line dialog (replaces window.prompt). Driven open by the arrowDown
+  // action button; on confirm the parsed line number drives the scroll/highlight
+  // effect below (same setTargetLine force-retrigger the prompt path used).
+  const [gotoOpen, setGotoOpen] = createSignal(false);
   let paneEl: HTMLDivElement | undefined;
 
   // Tree root reloads when the project, focus folder, or flatten pref changes.
@@ -221,10 +226,9 @@ export default function CodeView() {
   });
 
   const copy = (text: string) => void navigator.clipboard?.writeText(text);
-  const gotoLine = () => {
-    const n = Number(prompt("Go to line"));
-    if (n > 0) setTargetLine(undefined), setTargetLine(n);
-  };
+  // Open the go-to-line dialog; the actual line parse + scroll happens in the
+  // dialog's onConfirm (see <TextPromptDialog> below).
+  const gotoLine = () => setGotoOpen(true);
 
   return (
     <Show when={projectDir()} fallback={<div class="code-empty">Open a project (not the default) to browse its code.</div>}>
@@ -457,6 +461,27 @@ export default function CodeView() {
           )}
         </Show>
       </div>
+      {/* Go-to-line: a DOM dialog replacing window.prompt. The parsed line
+          reuses the same setTargetLine force-retrigger (undefined then n) the
+          old prompt path used, so the scroll/highlight effect re-runs even when
+          the same line is requested twice. TextPromptDialog only calls
+          onConfirm with a non-empty value, so Cancel/empty behave like before;
+          non-numeric input → Number(v) is NaN → NaN > 0 is false → no scroll. */}
+      <TextPromptDialog
+        open={gotoOpen()}
+        title="Go to line"
+        placeholder="Line number"
+        confirmText="Go"
+        onCancel={() => setGotoOpen(false)}
+        onConfirm={(v) => {
+          const n = Number(v);
+          if (n > 0) {
+            setTargetLine(undefined);
+            setTargetLine(n);
+          }
+          setGotoOpen(false);
+        }}
+      />
     </Show>
   );
 }

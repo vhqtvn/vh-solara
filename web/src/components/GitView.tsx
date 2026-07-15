@@ -55,6 +55,10 @@ function StagingPanel(props: { onChanged: () => void }) {
   const [status, { refetch }] = createResource(() => projectDir(), (dir) => (dir ? gitStatus() : Promise.resolve(null)));
   const [message, setMessage] = createSignal("");
   const [busy, setBusy] = createSignal(false);
+  // Pending discard target for the in-app confirm (replaces window.confirm).
+  // Holds the file path; null → dialog closed. Mirrors the archive-confirm
+  // pattern in SessionContextMenu (signal + .dialog.confirm overlay).
+  const [discardFile, setDiscardFile] = createSignal<string | null>(null);
   const files = () => status()?.files ?? [];
   const staged = () => files().filter(isStaged);
   const reload = () => { void refetch(); props.onChanged(); };
@@ -98,7 +102,7 @@ function StagingPanel(props: { onChanged: () => void }) {
                   <button type="button" class="git-mini" disabled={busy()} data-tip="Unstage" aria-label="Unstage" onClick={() => void act(() => gitUnstage([f.file]))}>−</button>
                 </Show>
                 <button type="button" class="git-mini danger" disabled={busy()} data-tip="Discard changes" aria-label="Discard changes"
-                  onClick={() => { if (confirm(`Discard changes to ${f.file}? This cannot be undone.`)) void act(() => gitDiscard([f.file])); }}>
+                  onClick={() => setDiscardFile(f.file)}>
                   <Icon name="x" size={12} />
                 </button>
               </div>
@@ -121,6 +125,45 @@ function StagingPanel(props: { onChanged: () => void }) {
             </div>
           </div>
         </div>
+      </Show>
+      {/* Discard confirmation (replaces window.confirm). Same overlay/classes
+          as the archive confirm in SessionContextMenu: signal-driven .dialog
+          .confirm with the shared global confirm CSS. Confirm fires the same
+          gitDiscard([file]) the old confirm(...) guard gated; Cancel clears. */}
+      <Show when={discardFile()}>
+        {(file) => (
+          <div class="dialog-overlay" onClick={() => setDiscardFile(null)}>
+            <div class="dialog confirm" role="dialog" aria-label="Confirm discard" onClick={(e) => e.stopPropagation()}>
+              <div class="dialog-head">
+                <span class="dialog-title">Discard changes</span>
+                <button type="button" class="icon-btn" aria-label="Close" onClick={() => setDiscardFile(null)}>
+                  <Icon name="x" />
+                </button>
+              </div>
+              <div class="dialog-body">
+                <p class="confirm-lead">
+                  Discard changes to <strong>{file()}</strong>? This cannot be undone.
+                </p>
+              </div>
+              <div class="confirm-actions">
+                <button type="button" class="confirm-cancel" onClick={() => setDiscardFile(null)}>
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  class="confirm-go"
+                  disabled={busy()}
+                  onClick={() => {
+                    void act(() => gitDiscard([file()]));
+                    setDiscardFile(null);
+                  }}
+                >
+                  Discard
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
       </Show>
     </Show>
   );
