@@ -117,13 +117,18 @@ defenses close this **only if** they hold end-to-end:
 ## Config surface
 
 ```
---auth-mode           none | oidc | passphrase | trust-proxy   (none allowed on loopback only)
---auth-oidc-issuer    https://accounts.google.com
---auth-oidc-client-id / --auth-oidc-client-secret
---auth-allowed-emails / --auth-allowed-domains
---auth-passphrase     (or env; never logged)
---auth-cookie-domain  empty = host-only; .example.com = shared across workers
---auth-trust-proxy    header name to trust (requires private bind)
+--auth-mode                      none | oidc | passphrase | trust-proxy   (none allowed on loopback only)
+--auth-oidc-issuer               (oidc) Issuer URL, e.g. https://accounts.google.com   (default "")
+--auth-oidc-client-id            (oidc) OAuth client ID   (default "")
+--auth-oidc-client-secret        (oidc) OAuth client secret (prefer the VH_AUTH_OIDC_CLIENT_SECRET env var; never logged)   (default "")
+--auth-oidc-redirect-url         (oidc) Absolute callback URL, e.g. https://app.example.com/auth/callback   (default "")
+--auth-allowed-emails            (oidc) Allowed email address (repeatable / comma-separated)   (default unset)
+--auth-allowed-domains           (oidc) Allowed email domain (repeatable / comma-separated)   (default unset)
+--auth-passphrase                (passphrase) Shared passphrase (prefer the VH_AUTH_PASSPHRASE env var; never logged)   (default "")
+--auth-trust-proxy               (trust-proxy) Identity header set by a fronting proxy, e.g. X-Forwarded-Email (requires private bind)   (default "")
+--auth-cookie-domain             Session cookie domain; empty = host-only, .example.com = shared across worker subdomains   (default "")
+--auth-cookie-secure             Set the Secure flag on the session cookie (disable only for plain-HTTP local testing)   (default true)
+--auth-require-verified-email    (oidc) Require the IdP to assert email_verified even when the email matches the allow-list   (default false; env: VH_AUTH_REQUIRE_VERIFIED_EMAIL)
 ```
 
 Secrets come from env by preference; never logged. Empty `--auth-mode` on a public bind is
