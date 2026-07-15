@@ -107,9 +107,8 @@ docker compose --profile demo up ui-demo
 ```
 
 > The runtime image contains only the binary + CA certs. The `client-daemon`
-> needs an `opencode` binary (and, for namespace isolation, `ip`) available at
-> runtime — provide those in a derived image or bind-mount when running the
-> daemon in a container.
+> needs an `opencode` binary available at runtime — provide it in a derived
+> image or bind-mount when running the daemon in a container.
 
 ## Usage
 
@@ -132,8 +131,14 @@ Start the central server on a trusted machine (or via Nginx reverse proxy):
 
 ```bash
 ./vh-solara server --addr :8080 --daemon-addr :8081 --host-pattern '$ID.mysite.com' \
-    --worker-secret "$VH_WORKER_SECRET"     # workers must present a matching --controller-secret
+    --worker-secret "$VH_WORKER_SECRET" \
+    --api-token "$VH_API_TOKEN"
 ```
+
+`--worker-secret` is the shared secret that workers must match with their own
+`--controller-secret`. `--api-token` is the bearer token for the headless
+`/api/workers/{id}/*` coordination API (or set it via the `VH_API_TOKEN` env
+var).
 
 Access the UI at `http://localhost:8080` to view and manage active workers.
 Add authentication (`--auth-mode oidc|passphrase|trust-proxy`) per
@@ -192,7 +197,7 @@ the session survives. On shutdown vh leaves it running (to reconnect next time).
 ```bash
 ./vh-solara client-daemon --web vh --opencode-detached \
     --controller ws://server:8081/vh-solara/ws --id my-dev-01
-# pidfile + log live under $XDG_CONFIG_HOME/vh-solara/opencode/<project>.{json,log}
+# pidfile + log live under the state dir (see "State & files"); <project> is sha1(cwd)
 ```
 
 Alternatively, run OpenCode as its **own** service and point vh at it
@@ -256,7 +261,6 @@ in the vh unit so a self-update's exit is picked up.
     --controller-secret "$VH_CONTROLLER_SECRET" \  # must match the controller's --worker-secret
     --id my-dev-01 \
     --name "My Local Desktop" \
-    --bin /usr/local/bin/opencode \
     --chamber 'cd /opt/openchamber && bun run node_modules/@openchamber/web/server/index.js'
 ```
 
@@ -271,7 +275,7 @@ management:
 ```bash
 vh-solara kill          # stop ALL local vh daemons + the OpenCode they own (global)
 vh-solara kill --force  # SIGKILL instead of SIGTERM
-vh-solara health        # print local health/debug info
+vh-solara health        # placeholder; prints a fixed "Health OK" line
 ```
 
 ### 4. Access the Web UI
@@ -279,7 +283,7 @@ vh-solara health        # print local health/debug info
 With wildcard DNS and Nginx routing `*.mysite.com` to the server's `--addr`:
 
 1. Developer agent `my-dev-01` connects to the server.
-2. Browse to `https://my-dev-01-<uuid>.mysite.com`.
+2. Browse to `https://my-dev-01.mysite.com`.
 3. The server proxies your browser session through the tunnel to the worker's local web UI (the built-in `vh` UI with `--web=vh`, OpenCode Web by default, or OpenChamber with `--web=openchamber`).
 4. Visit `http://localhost:8080` for the management dashboard.
 
@@ -307,13 +311,13 @@ See **[SECURITY.md](SECURITY.md)** for the model and how to configure it, and
 | `local-server` | Serve the `vh` UI locally — no controller/tunnel (single-host) |
 | `client-daemon` | Run the persistent client daemon (connects to a controller) |
 | `server` | Run the central controller server |
-| `kit` | Provision template kits into a repo (engine + overlay layers) |
-| `skill` | Emit/install the version-synced client skill for driving vh-solara |
+| `kit` | Parent for `kit install`, `kit status` (provision template kits into a repo) |
+| `skill` | Parent for `skill emit`, `skill install` (version-synced client skill for driving vh-solara) |
 | `kill` | Stop **all** local vh daemons + the OpenCode instances they own (global) |
-| `netns` | Inspect/create/debug the private network namespace |
-| `mcp` | Run an MCP (stdio) facade over the cross-worker coordination API |
-| `health` | Print local health/debug info |
-| `version` | Print version/build info |
+| `netns` | Debug placeholder (network-namespace tooling is not yet implemented) |
+| `mcp` | Run an MCP (stdio) facade over the cross-worker coordination API (bearer-gated on the controller — see [`docs/architecture/coordination-api.md`](docs/architecture/coordination-api.md); `mcp --local`/`--sock` drives a worker directly and needs no token) |
+| `health` | Placeholder — prints a fixed "Health OK" line (no real diagnostics yet) |
+| `version` | Print the version string |
 | `update` | Download + install the latest release binary, verified by SHA256 |
 
 `vh-solara kill` stops every vh daemon registered on this machine and any
@@ -340,3 +344,22 @@ OpenCode is updated in **its own environment** (so an nvm/PATH wrapper is
 honoured). By default it runs `<opencode-bin> upgrade`; override with
 `--opencode-update-cmd` on the client daemon for custom setups, e.g.
 `--opencode-update-cmd 'bash -lc "nvm use 20 && npm i -g opencode-ai@latest"'`.
+
+## State & files
+
+vh-solara keeps its small per-project state under one base dir. Each project is
+identified by `sha1(cwd)` of the daemon's working directory (so two daemons in
+two different repos never collide), and `VH_STATE_DIR` overrides the whole base.
+The default base is `os.UserConfigDir()/vh-solara` (on Linux that resolves to
+`$XDG_CONFIG_HOME/vh-solara`, or `~/.config/vh-solara` when `XDG_CONFIG_HOME` is
+unset; it only falls back to the OS temp dir if that can't be resolved).
+
+| Path | Contents |
+|------|----------|
+| `<base>/opencode/<sha1(cwd)>.json` | Detached-OpenCode pidfile (`{pid,port}`) — written by `--opencode-detached` so a vh restart reconnects to it |
+| `<base>/opencode/<sha1(cwd)>.log`  | That detached OpenCode's accumulated stdout/stderr log |
+| `<base>/daemons/<sha1(cwd)>.json`  | vh daemon registry entry (pid + cwd) — how `vh-solara kill` finds running daemons |
+| `<base>/notes/<sha1(cwd)>.json`    | Per-project Notes + todos (shared across devices, survives reconnects) |
+| `<base>/alerts.jsonc`              | Host-level notification config (channels/profiles/detector thresholds) |
+
+Sources: `cmd/opencode_detached.go`, `pkg/web/notes.go`, `pkg/alerts/config.go`.

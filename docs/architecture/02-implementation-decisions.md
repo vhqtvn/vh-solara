@@ -12,10 +12,15 @@ To seamlessly intercept HTTP/REST/SSE calls to an OpenCode runner located secure
 3. We serialize HTTP calls using a base message definition (with `BodyBase64`) encapsulated strictly within JSON frames.
 4. The router uses `sync.Map` to dynamically allocate and cleanup in-memory correlation channels (binding an internally generated `uuid` back to the incoming `http.Request`). Wait times are hardcoded to 30s to simulate timeout semantics transparently.
 
-## 3. Sandboxing & Local Environment Access (`ip netns`)
-We are utilizing the underlying host `/usr/local/bin/ip` namespace binaries programmatically via standard `os/exec`. This is simple without needing massive dependencies.
-- It is critical that the **agent** needs to run as `root` for default deployment to properly configure and drop into a `tmpfs` namespace utilizing the `lo` loopback hardware. 
-- However, we provided a fallback inside `opencode.go` to explicitly skip namespace mounting if `--netns=""` is initialized for graceful local testing workflows.
+## 3. Sandboxing & Local Environment Access (`netns`)
+Network-namespace isolation is **not implemented**. The `netns` subcommand is a
+debug placeholder (`cmd/netns.go`) that only prints a status line — there is no
+namespace setup, no `ip netns` invocation, no `setns`, and no `--netns` flag.
+There is no `ip` dependency and the agent does not need to run as `root`.
+
+This section documents the intended direction for future per-worker network
+sandboxing. Until such a capability is built, workers reach OpenCode over plain
+loopback and the controller tunnel, with no host namespace isolation.
 
 ## 4. UI Pinning & Persistent State
 By dropping an explicit HTTP-Only `vh_session` cookie directly mapping to `worker_id` pinning via the main lightweight selector HTTP router `GET /`, the design easily accommodates multiple different user sessions against the same Controller multiplexing multiple separate backend `devboxes`. It stores the mapping utilizing `sync.RWMutex`. In the future, this mapping string key value schema maps exactly perfectly to SQLite/Postgres schemas if required.
