@@ -11,6 +11,7 @@ import { openSession, projectDir, sessionNeedsInput, sessionWorking, setSelected
 import type { CurrentVerb } from "../sync";
 import { openFileAt } from "../code/frame";
 import { looksLikePath } from "../lib/pathlike";
+import { onActionKey } from "../lib/a11y";
 import { toolLabel, toolSubject } from "../lib/toolLabel";
 import type { Part } from "../types";
 import Icon from "./Icon";
@@ -529,6 +530,7 @@ function ToolPart(props: { part: Part; tail?: boolean }) {
             data-tip="Open in code view"
             aria-label="Open in code view"
             onClick={(e) => { e.stopPropagation(); openFileAt(openableFile()); }}
+            onKeyDown={onActionKey(() => openFileAt(openableFile()))}
           >
             <Icon name="layers" size={13} />
           </span>
@@ -568,6 +570,7 @@ function ToolPart(props: { part: Part; tail?: boolean }) {
               e.stopPropagation();
               jump();
             }}
+            onKeyDown={onActionKey(jump)}
           >
             <Icon name="fork" size={13} />
           </span>

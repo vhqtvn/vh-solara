@@ -6,6 +6,31 @@
 // click closing is left to each dialog (they already handle it).
 import { createSignal, onCleanup } from "solid-js";
 
+// --- Keyboard activation for role="button" affordances ----------------------
+//
+// `onActionKey` wraps an action so an element posing as a button via
+// `role="button" tabindex="0"` (a span/div that can't be a real <button>, e.g.
+// the tool-row open-file / open-subsession affordances) fires on BOTH Enter and
+// Space. The WAI-ARIA Authoring Practices require a `role="button"` to activate
+// on Enter AND Space; a bare onClick leaves it keyboard-inoperable (WCAG 2.1.1).
+//
+// - Enter / " " (Space) / "Spacebar" (legacy IE) → run the action.
+// - preventDefault: stops Space from scrolling the page (and Enter from any
+//   default action), mirroring a real <button>'s activation.
+// - stopPropagation: mirrors these affordances' onClick handlers so firing the
+//   action doesn't also bubble to a parent control (e.g. the tool-row toggle).
+// - any other key → no-op (let it navigate/bubble normally).
+export function onActionKey(handler: () => void): (e: KeyboardEvent) => void {
+  return (e) => {
+    if (e.key !== "Enter" && e.key !== " " && e.key !== "Spacebar") return;
+    e.preventDefault();
+    e.stopPropagation();
+    handler();
+  };
+}
+
+// --- Modal surfaces ---------------------------------------------------------
+//
 // Count of open modal dialogs (anything using the `modal` directive). Lets
 // global hotkeys/menus stand down while a dialog owns the keyboard.
 const [modalCount, setModalCount] = createSignal(0);
