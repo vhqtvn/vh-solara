@@ -26,6 +26,8 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
 
       - name: Build web UI (embedded into the binary)
         # `npm run build` stages the SPA into the gitignored web/dist-build/
@@ -48,7 +50,7 @@ jobs:
           mkdir -p dist
           TAG="${GITHUB_REF#refs/tags/}"
           LDFLAGS="-s -w -X github.com/vhqtvn/vh-solara/cmd.Version=${TAG}"
-          build() { GOOS=$1 GOARCH=$2 go build -trimpath -ldflags "$LDFLAGS" -o "dist/$3" .; }
+          build() { CGO_ENABLED=0 GOOS=$1 GOARCH=$2 go build -trimpath -ldflags "$LDFLAGS" -o "dist/$3" .; }
 
           build linux   amd64 vh-solara-linux-amd64
           build linux   arm64 vh-solara-linux-arm64
