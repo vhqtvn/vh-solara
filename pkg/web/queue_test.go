@@ -974,3 +974,41 @@ func TestQueueArchivedStoreConcurrentNoResurrection(t *testing.T) {
 		}
 	}
 }
+
+// TestQueuePath_vhSolaraDirInvariant locks the structural relationship between
+// queuePath and vhSolaraDir: for any session ID that can reach queuePath,
+// vhSolaraDir(queuePath(root, sid)) must resolve to root/.vh-solara. If
+// queuePath's layout ever gains/loses a path level (or vhSolaraDir's nested
+// filepath.Dir count drifts), this fails loudly instead of vhSolaraDir silently
+// targeting the wrong dir (and save() writing the project's .gitignore into the
+// wrong place via EnsureRuntimeGitignore).
+//
+// Session IDs reaching queuePath are always pre-sanitized by safeID
+// (attach.go: `[^A-Za-z0-9_.-]` → ""), which strips '/' among others, at every
+// entry point (queue_http.go:28, archive.go:94). The cases below cover the full
+// safeID-allowed character set; multi-segment slash-bearing IDs are intentionally
+// NOT tested here because they cannot reach queuePath in production. (Caveat:
+// vhSolaraDir's three-nested-filepath.Dir derivation is therefore correct by
+// construction ONLY because of that sanitization — if a future caller bypasses
+// safeID, the invariant would break for slash-bearing IDs. That is a latent
+// fragility worth a follow-up, not in scope for this hardening slice.)
+func TestQueuePath_vhSolaraDirInvariant(t *testing.T) {
+	root := t.TempDir()
+	// Representative IDs spanning the safeID-allowed character set
+	// ([A-Za-z0-9_.-]); these are the only shapes that can reach queuePath.
+	for _, sid := range []string{
+		"s1",                 // simple lowercase+digit (the common shape)
+		"a",                  // single char
+		"01HQ7X9KF2VEXAMPLE", // ULID-style (realistic opencode shape)
+		"with_underscore",    // underscore
+		"with-hyphen",        // hyphen
+		"with.dot",           // dot
+		"MIXED_Case-123.xyz", // mixed allowed chars
+	} {
+		got := vhSolaraDir(queuePath(root, sid))
+		want := filepath.Join(root, ".vh-solara")
+		if got != want {
+			t.Fatalf("vhSolaraDir(queuePath(%q,%q)) = %q, want %q", root, sid, got, want)
+		}
+	}
+}
