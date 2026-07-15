@@ -10,6 +10,7 @@ import {
   setReadAnchor,
 } from "../lib/scroll";
 import type { ScrollGeometry } from "../lib/scroll";
+import { createReadCursorStash } from "../lib/readCursorStash";
 import { highlightInput } from "../lib/composerHighlight";
 import { chooseVariant, findModel, loadModels, models, selectionFor } from "../models";
 import { loadVersioned, saveVersioned } from "../lib/store";
@@ -632,20 +633,25 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // unmount. localStorage is written at most once per idle period — never per
   // frame (Firefox/WebRender perf: see AGENTS.md "Web frontend performance").
   let readCursorTimer: number | undefined;
-  let armedCand: { sid: string; cand: string } | undefined; // P1-WEB-004: throttled arm-time stash for the switch flush
-  let lastArmMs = 0; // P1-WEB-004
+  // P1-WEB-004: throttled arm-time stash for the read-cursor switch flush.
+  // Extracted to lib/readCursorStash (pure: clock + read producer injected) so
+  // the throttle / capture / flush-on-switch state machine is unit-tested. The
+  // 400ms debounce + all side effects (setReadAnchor) stay here in the component.
+  const readStash = createReadCursorStash();
   function scheduleReadCursor() {
     // P1-WEB-004: throttled arm-time capture so the session-switch flush has the
     // OUTGOING session's last-known read position (leading-edge: first arm fires
-    // immediately, making the <400ms switch case deterministic). At 5/sec this is
-    // a CPU layout-read (bottommostReadFromDom is reads-only, one flush), idle
-    // during streaming — not the GPU re-raster heat-saga class.
-    const now = Date.now();
-    if (!props.draft && scrollEl && now - lastArmMs >= 200) {
-      lastArmMs = now;
-      const cand = bottommostReadFromDom();
-      if (cand) armedCand = { sid: props.sessionId, cand };
-    }
+    // immediately, making the <400ms switch case deterministic). The pure
+    // throttle / capture state lives in lib/readCursorStash; bottommostReadFromDom
+    // is the injected read producer (reads-only, one flush), idle during
+    // streaming — not the GPU re-raster heat-saga class.
+    readStash.arm({
+      now: Date.now(),
+      draft: !!props.draft,
+      hasViewport: !!scrollEl,
+      sessionId: props.sessionId,
+      read: bottommostReadFromDom,
+    });
     clearTimeout(readCursorTimer);
     readCursorTimer = window.setTimeout(() => flushReadCursor(props.sessionId), 400);
   }
@@ -658,7 +664,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     if (props.draft || !scrollEl || !sid) return;
     if (nearBottom()) {
       clearReadAnchor(sid);
-      if (armedCand?.sid === sid) armedCand = undefined;
+      readStash.invalidateIfSession(sid);
       return;
     }
     const cand = bottommostReadFromDom();
@@ -815,12 +821,18 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
         // P1-WEB-004: flush the arm-time stash for the OUTGOING session before the
         // debounce is cancelled. Monotonic guard against the outgoing session's order
         // (NOT sm()?.order — that's the entering session at this point).
-        if (prevId && armedCand && armedCand.sid === prevId) {
+        // P1-WEB-004: flush the arm-time stash for the OUTGOING session before the
+        // debounce is cancelled. Monotonic guard against the outgoing session's order
+        // (NOT sm()?.order — that's the entering session at this point). The peek
+        // guard defers the anchor/order reads to the matching-stash path, matching
+        // the inlined original (both reads are pure; on() untracks this body too).
+        const stashed = readStash.peek();
+        if (prevId && stashed && stashed.sid === prevId) {
           const order = state.messages[prevId]?.order ?? [];
-          if (orderAhead(armedCand.cand, getReadAnchor(prevId), order)) setReadAnchor(prevId, armedCand.cand);
+          const decision = readStash.flushForOutgoing(prevId, getReadAnchor(prevId), order);
+          if (decision.write && decision.cand) setReadAnchor(prevId, decision.cand);
         }
-        armedCand = undefined; // consumed; entering session re-arms on its own scroll
-        lastArmMs = 0;
+        readStash.consume(); // consumed; entering session re-arms on its own scroll
         if (prevId) clearTimeout(readCursorTimer);
         // Reset the geometry baseline: it's stale from the leaving session, and
         // an anchor restore doesn't pin to refresh it — so without this reset the
@@ -1018,7 +1030,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       setUserScrolledUp(false);
       if (!props.draft) {
         clearReadAnchor(props.sessionId);
-        if (armedCand?.sid === props.sessionId) armedCand = undefined;
+        readStash.invalidateIfSession(props.sessionId);
         ackSession(props.sessionId);
       }
     } else if (d.intent === "user-scroll-up" || d.intent === "user-scroll-down") {
