@@ -82,7 +82,26 @@ func (d *Daemon) Start() error {
 	}()
 
 	// 2. Main API & UI endpoints (User Mux)
+	log.Printf("Starting vh-solara user UI server on %s", d.Addr)
+	return http.ListenAndServe(d.Addr, d.buildRootHandler())
+}
+
+// buildRootHandler constructs the served HTTP handler for the user edge: the
+// userMux routes (liveness probe, dashboard, machine management), optional
+// wildcard-host interception, the auth gate, and the bearer-gated coordination
+// front (matched before session auth). The worker-tunnel listener (DaemonAddr)
+// is separate and built in Start. Extracted so the edge handler chain is
+// unit-testable without standing up a real listener.
+func (d *Daemon) buildRootHandler() http.Handler {
 	userMux := http.NewServeMux()
+
+	// Liveness probe — auth-exempt so health checks work pre-login. It rides
+	// Auth.Middleware's top-of-middleware /vh/healthz exemption (see
+	// pkg/auth/auth.go), which applies to EVERY gated mode (passphrase / oidc /
+	// trust-proxy) for BOTH controller and worker — so a credential-less
+	// Docker/compose healthcheck always gets 200. A request with no
+	// cookie/bearer/header must still get 200.
+	userMux.HandleFunc("GET /vh/healthz", d.handleHealthz)
 
 	// Machine management API
 	userMux.HandleFunc("GET /api/workers", d.handleListWorkers)
@@ -122,8 +141,14 @@ func (d *Daemon) Start() error {
 	// headless coordinator reaches it without a browser session.
 	rootHandler = d.coordFront(coordMux, rootHandler)
 
-	log.Printf("Starting vh-solara user UI server on %s", d.Addr)
-	return http.ListenAndServe(d.Addr, rootHandler)
+	return rootHandler
+}
+
+// handleHealthz is the auth-exempt liveness probe for the controller edge, so
+// /vh/healthz is a real cross-binary contract served by BOTH the controller
+// (pkg/server) and the worker (pkg/web). Body mirrors pkg/web/server.go.
+func (d *Daemon) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	w.Write([]byte("ok"))
 }
 
 func (d *Daemon) hostInterceptor(pattern *regexp.Regexp, next http.Handler) http.HandlerFunc {

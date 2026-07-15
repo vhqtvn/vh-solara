@@ -15,6 +15,12 @@ services:
       - "8080:8080" # dashboard + browser/UI reverse proxy
       - "8081:8081" # client-daemon WebSocket tunnel ingestion
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/vh/healthz"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
 
   # Zero-dependency demo of the vh web UI: runs the real aggregator + web server
   # against fake OpenCode fixtures (no `opencode` binary needed). Browse :8099.
@@ -29,3 +35,9 @@ services:
       - "8099:8099"
     profiles: ["demo"]
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8099/vh/healthz"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s

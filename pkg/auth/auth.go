@@ -136,49 +136,72 @@ func New(ctx context.Context, cfg Config) (*Authenticator, error) {
 	return a, nil
 }
 
-// Middleware wraps next with session loading, the /auth/* routes, and the gate.
-// In ModeNone it is a passthrough. It is meant to be the outermost wrapper of the
-// served handler so an unauthenticated request never reaches application code.
+// Middleware wraps next with session loading, the /auth/* routes, the gate, and
+// the cross-binary /vh/healthz liveness exemption. In ModeNone it is a
+// passthrough. It is meant to be the outermost wrapper of the served handler so
+// an unauthenticated request never reaches application code.
 func (a *Authenticator) Middleware(next http.Handler) http.Handler {
 	if a == nil || a.cfg.Mode == ModeNone {
 		return next
 	}
+
+	// modeGate is the mode-specific auth gate. It is written assuming every
+	// request needs real auth — the /vh/healthz liveness exemption is applied
+	// uniformly at the very top of the returned handler (below) so modeGate
+	// never sees a /vh/healthz request.
+	var modeGate http.Handler
 	if a.cfg.Mode == ModeTrustProxy {
 		// No session needed: identity is the proxy-set header on every request.
 		// A missing header means the fronting proxy didn't authenticate this
 		// request — 401 directly (there is no in-app login to redirect to).
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		modeGate = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.Header.Get(a.cfg.TrustProxyHeader) != "" {
 				next.ServeHTTP(w, r)
 				return
 			}
 			http.Error(w, "authentication required (proxy did not provide identity)", http.StatusUnauthorized)
 		})
+	} else {
+		// passphrase / oidc: session-backed gate plus the /auth/* routes.
+		gated := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/auth/login":
+				a.handleLogin(w, r)
+				return
+			case "/auth/callback":
+				a.handleCallback(w, r)
+				return
+			case "/auth/logout":
+				a.handleLogout(w, r)
+				return
+			}
+			if a.sessions.GetString(r.Context(), sessUserKey) != "" {
+				next.ServeHTTP(w, r)
+				return
+			}
+			a.challenge(w, r)
+		})
+		modeGate = a.sessions.LoadAndSave(gated)
 	}
 
-	gated := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/auth/login":
-			a.handleLogin(w, r)
-			return
-		case "/auth/callback":
-			a.handleCallback(w, r)
-			return
-		case "/auth/logout":
-			a.handleLogout(w, r)
-			return
-		case "/vh/healthz":
-			// Liveness probe — always public so health checks work pre-login.
+	// /vh/healthz is the cross-binary liveness contract served by BOTH the
+	// controller (pkg/server) and the worker (pkg/web). It must answer 200
+	// with NO credentials under EVERY gated mode (passphrase, oidc,
+	// trust-proxy): a Docker/compose healthcheck sends no cookie/bearer/
+	// identity header, and a 401 there marks a healthy binary unhealthy (the
+	// latent trust-proxy gap — the missing-header 401 below fired before the
+	// old passphrase/OIDC-only exemption could run). Exempt it as the very
+	// first check, before any mode logic, so no mode-specific 401 or challenge
+	// can fire on it. Exact-path match: both binaries register /vh/healthz
+	// verbatim with no sub-paths, so a string-equal comparison is both
+	// necessary and sufficient.
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/vh/healthz" {
 			next.ServeHTTP(w, r)
 			return
 		}
-		if a.sessions.GetString(r.Context(), sessUserKey) != "" {
-			next.ServeHTTP(w, r)
-			return
-		}
-		a.challenge(w, r)
+		modeGate.ServeHTTP(w, r)
 	})
-	return a.sessions.LoadAndSave(gated)
 }
 
 // challenge rejects an unauthenticated request: a 401 for API/XHR callers (so the
