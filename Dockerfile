@@ -3,7 +3,7 @@
 # 1) Build the SolidJS SPA. It is embedded into the Go binary, so it must exist
 #    before `go build`. Output lands at /app/web/dist-build (vite outDir); the
 #    stage below copies it into pkg/web/dist where //go:embed reads it.
-FROM node:20-alpine AS webbuild
+FROM node:24-alpine AS webbuild
 WORKDIR /app
 COPY web/package.json web/package-lock.json ./web/
 RUN cd web && npm ci

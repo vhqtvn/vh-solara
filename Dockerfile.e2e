@@ -3,7 +3,7 @@
 # vh-solara aggregator + web server. Used by tests/e2e-docker/run.sh.
 
 # 1) Build the SPA (embedded into the Go e2e server).
-FROM node:20-alpine AS webbuild
+FROM node:24-alpine AS webbuild
 WORKDIR /app
 COPY web/package.json web/package-lock.json ./web/
 RUN cd web && npm ci
