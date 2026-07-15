@@ -126,7 +126,10 @@ applied, not as an authority that acts on its own.
 - Run project commands through `harness`. Do not rely on host-level `python`, `pytest`, `npm`, `pnpm`, `yarn`, or `docker compose`.
 - The `shell-guard` plugin refuses a list of high-risk patterns (Docker socket access, ad-hoc apt installs, host-key bypass, scp deploys, cloud-provider lifecycle on Terraform-managed resources, raw database writes against protected identity/auth tables, project JWT secrets on the command line). See `docs/ai/shell-execution.md` → "Forbidden patterns". If a deny fires, do not paraphrase the command to evade it — read the rule's `why` and pick the canonical alternative, or surface the situation to the operator.
 - For agent-driven shell work, prefer `vh-agent-harness exec <cmd>` and avoid interactive `vh-agent-harness shell` unless a human explicitly asks for it.
+- The execution verbs are an intentionally distinct **exec family** — `exec` (run inside the project runtime), `exec-ro` (read-only, prompt-free), `exec-sandbox` (host-local; kernel-enforced only when its sandbox is active — `--sandbox=off|best-effort|strict`, default best-effort), and `shell` (interactive). Do NOT unify or alias these: opencode permission matching is verb-based, so collapsing them would break `exec-ro`'s prompt-free guarantee and `exec-sandbox`'s host-local guarantee. Pick the narrowest verb that fits the work. See `README.agent.md` → exec-family for the full per-verb contract.
 - For long-running detached work that may outlive one shell call/session, name the relevant skill explicitly: `bgshell-job` for non-GPU shell jobs (see `vh-agent-harness docs opencode-skills`).
+- **Skill visibility & restart caveat:** `vh-agent-harness skill list` and `vh-agent-harness skill validate [dir]` inspect installed OpenCode skills (core, overlay-pack, and rendered) and validate their SKILL.md frontmatter without python. These reads are always fresh — they walk the embed/rendered trees directly. However, opencode caches the discovered skill list per-process (a module-closure map cleared only on process death), so a **running** opencode session will NOT see skills that `vh-agent-harness update` just added or changed under `.opencode/skills/` until the session is restarted. `update` prints a one-line restart hint whenever it writes skill files. `doctor`'s `skills` check lints every rendered skill's frontmatter as part of health.
+- **Glossary — "seam":** in this harness, a *seam* is an internal render/apply pipeline stage (the classify → plan → per-class apply → lineage flow that turns templates into rendered files) — it is **not** a command you run. This is distinct from the "repository testing seam" mentioned in the Testing section below, which refers to where a test attaches to a code boundary.
 - Ensure the dev environment is running before containerized commands when required.
 - Put transient artifacts under repo-scoped `./tmp/`, never system-level temp paths such as `/tmp`.
 - Delete temporary scripts, logs, downloads, and harnesses you created when the task is complete.
@@ -175,32 +178,21 @@ Follow these rules to stay on the parsed, sanctioned path:
 
 ## Testing rules
 
-Every meaningful change should add or update tests.
+Every meaningful behavior change should add or update appropriate verification.
 
-The `tests/` folder is explicitly organized into three categories. Do not create test files directly in the root `tests/` directory except for shared utilities.
+Repository-specific test locations, runners, commands, seam classes, and
+acceptance signals must come from the repository's verified testing seam
+localization, not from generic defaults in this managed core.
 
-1. **`tests/unit/`**
-   - Pure, fast tests mocking external dependencies.
-   - Organized by package/boundary.
-   - Minimum expected coverage: domain/core, contracts, and the primary business logic.
-
-2. **`tests/integration/`**
-   - Tests that verify infrastructure integration or layer handoffs without booting the entire stack.
-   - Example: storage materialization, queue handoff.
-
-3. **`tests/e2e/`**
-   - Full-stack tests that boot the app's entrypoints and exercise the real service stack.
-   - Example: end-to-end request → handler → response flow, endpoint validation.
-
-Execution examples:
-
-```bash
-vh-agent-harness exec pytest tests/unit/
-vh-agent-harness exec pytest tests/integration/
-vh-agent-harness exec pytest tests/e2e/
-```
-
-For any substantial boundary change, also update the relevant docs.
+- Begin with the narrowest verified repository seam that covers the behavior.
+- Do not invent test directories, runners, or commands that are not supported
+  by the current repository.
+- If the required testing seam localization does not exist, establish and
+  verify it from the repository's actual structure and commands before
+  prescribing test placement or execution.
+- Keep project-specific AGENTS.md testing guidance synchronized with that
+  localization and make it defer to the localization rather than declaring a
+  competing test taxonomy.
 
 ## Output expectations for agents
 
