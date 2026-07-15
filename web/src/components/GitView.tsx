@@ -93,11 +93,11 @@ function StagingPanel(props: { onChanged: () => void }) {
                 </span>
                 <span class="git-stage-name"><FileBadge path={f.file} /> {f.file}</span>
                 <Show when={isStaged(f)} fallback={
-                  <button type="button" class="git-mini" disabled={busy()} data-tip="Stage" onClick={() => void act(() => gitStage([f.file]))}>+</button>
+                  <button type="button" class="git-mini" disabled={busy()} data-tip="Stage" aria-label="Stage" onClick={() => void act(() => gitStage([f.file]))}>+</button>
                 }>
-                  <button type="button" class="git-mini" disabled={busy()} data-tip="Unstage" onClick={() => void act(() => gitUnstage([f.file]))}>−</button>
+                  <button type="button" class="git-mini" disabled={busy()} data-tip="Unstage" aria-label="Unstage" onClick={() => void act(() => gitUnstage([f.file]))}>−</button>
                 </Show>
-                <button type="button" class="git-mini danger" disabled={busy()} data-tip="Discard changes"
+                <button type="button" class="git-mini danger" disabled={busy()} data-tip="Discard changes" aria-label="Discard changes"
                   onClick={() => { if (confirm(`Discard changes to ${f.file}? This cannot be undone.`)) void act(() => gitDiscard([f.file])); }}>
                   <Icon name="x" size={12} />
                 </button>
@@ -160,7 +160,7 @@ export default function GitView() {
             Split
           </button>
         </div>
-        <button type="button" class="git-refresh" onClick={() => refetch()}>
+        <button type="button" class="git-refresh" data-tip="Refresh" aria-label="Refresh" onClick={() => refetch()}>
           ↻
         </button>
       </div>

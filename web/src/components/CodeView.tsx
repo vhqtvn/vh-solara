@@ -409,10 +409,10 @@ export default function CodeView() {
                         <div class="code-image"><img src={codeRawUrl(f.path)} alt={f.path} /></div>
                       </Match>
                       <Match when={f.kind === "binary"}>
-                        <div class="code-empty">Binary file ({fmtSize(f.size)}) — <a href={codeRawUrl(f.path)} target="_blank" rel="noreferrer">download</a></div>
+                        <div class="code-empty">Binary file ({fmtSize(f.size)}) — <a href={codeRawUrl(f.path)} target="_blank" rel="noopener noreferrer">download</a></div>
                       </Match>
                       <Match when={f.kind === "toolarge"}>
-                        <div class="code-empty">File too large to preview ({fmtSize(f.size)}) — <a href={codeRawUrl(f.path)} target="_blank" rel="noreferrer">download</a></div>
+                        <div class="code-empty">File too large to preview ({fmtSize(f.size)}) — <a href={codeRawUrl(f.path)} target="_blank" rel="noopener noreferrer">download</a></div>
                       </Match>
                       <Match when={f.kind === "markdown"}>
                         <div class="code-md md" innerHTML={f.html} />
