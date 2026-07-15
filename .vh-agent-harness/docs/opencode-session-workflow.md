@@ -216,3 +216,5 @@ marks the slice blocked or recommends split, do not proceed to `git commit`
 until the blocking issues are resolved or the slice is re-scoped.
 
 When a prompt uses explicit phases, checkpoint at the phase boundaries that change the durable story: a gate definition, a protocol decision, a promotion/rollback recommendation, or a pre-closeout state change. Do not checkpoint every trivial substep.
+
+When a checkpoint records a material decision in the decision log, that entry should cross-reference the Verification-table row that grounded it and name the downstream artifact or checkpoint it authorizes — this carries the dependency link as prose, since the `episodic` record type already covers such remembered decisions and no new record type is introduced.

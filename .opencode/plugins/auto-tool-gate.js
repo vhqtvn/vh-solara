@@ -324,7 +324,8 @@ function repoRoot() {
 // ({...readConfig(), ...readLlmConfig()}) so downstream decideLive /
 // classifyLive / resolveSystemPrompt see a single config as before. The audit
 // and enforce branches only need readConfig() (plugin behavior). Each of those
-// readers already returns the fully three-level-merged result for its type.
+// readers already returns the fully-merged result (defaults < user < committed-
+// project < project-local) for its type.
 // ---------------------------------------------------------------------------
 
 // Plugin-config PROJECT-level path, repo-relative. The `repo-configs/` dir is
@@ -363,6 +364,28 @@ function userConfigDir() {
 // relationship is obvious (same file, user-level base, project-level override).
 const USER_CONFIG_PATH = path.join(userConfigDir(), "auto-gate-config.json");
 const USER_LLM_CONFIG_PATH = path.join(userConfigDir(), "auto-gate-llm.json");
+
+// PROJECT-LOCAL paths — the optional gitignored shallow-override companion to
+// each committed project file. This realizes the repo-wide `.local.json`
+// convention: committed `X.json` is the optionally-shared base, gitignored
+// `X.local.json` is an OPTIONAL field-override that shallowly wins per field.
+// A `.local.json` file is the FINAL project layer (project-local > committed-
+// project > user > defaults); it is absent by default and its absence is the
+// legacy single-file behavior (no behavioral change). Only a PRESENT-but-
+// invalid local file emits an audit line, labeled with the level. These files
+// are gitignored by the scoped wildcard `.opencode/repo-configs/*.local.json`.
+const LOCAL_CONFIG_PATH = path.resolve(
+    repoRoot(),
+    ".opencode",
+    "repo-configs",
+    "auto-gate-config.local.json",
+);
+const LOCAL_LLM_CONFIG_PATH = path.resolve(
+    repoRoot(),
+    ".opencode",
+    "repo-configs",
+    "auto-gate-llm.local.json",
+);
 
 // Plugin-behavior fail-safe defaults (auto-gate-config.json). `enabled` is the
 // master live kill-switch; `mode` is the behavior selector (`audit` = Phase 1
@@ -416,10 +439,12 @@ const DEFAULT_LLM_CONFIG = Object.freeze({
 // transition (missing -> present -> invalid) re-warns once. Module-level on
 // purpose — survives across hook invocations within one server process.
 //
-// THREE-LEVEL LAYERED LOADING needs to track BOTH files (user + project) per
-// config type. The cache is therefore split into:
+// FOUR-LEVEL LAYERED LOADING needs to track THREE physical behavior-config
+// files per type (user + committed-project + project-local `.local.json`),
+// where project-local shallowly wins per field. The cache is therefore split
+// into:
 //
-//   - per-(level × type) SINGLE-FILE sub-caches (4 total): each owns the mtime
+//   - per-(level × type) SINGLE-FILE sub-caches (6 total): each owns the mtime
 //     cache + deduped fallback latch for ONE file, and is the cache argument
 //     to _readRawJsonConfig (contract: {mtime, rawParsed, fallbackReason}).
 //     The cached value is the RAW parsed object (NOT normalized) so the
@@ -427,13 +452,14 @@ const DEFAULT_LLM_CONFIG = Object.freeze({
 //     The per-file fallback latch lives here so a failure state transition
 //     re-warns independently per file (e.g. user file invalid warns once with
 //     label "plugin/user"; project file missing warns once with label
-//     "plugin/project").
+//     "plugin/project"; project-local file invalid warns once with label
+//     "plugin/local").
 //   - per-type TOP-LEVEL MERGE caches (2 total): hold the last-merged result +
-//     the last-seen mtimes for BOTH levels, so the steady-state fast path
-//     (both files unchanged) returns the cached merged object after just two
+//     the last-seen mtimes for ALL THREE levels, so the steady-state fast path
+//     (all files unchanged) returns the cached merged object after just three
 //     statSyncs, with no re-read / re-parse / re-merge.
 //
-// All six are held as MUTABLE const objects (properties reassigned, never the
+// All eight are held as MUTABLE const objects (properties reassigned, never the
 // binding) so the readers can update them without rebinding module-level
 // `let`s.
 const pluginUserConfigCache = {
@@ -442,6 +468,11 @@ const pluginUserConfigCache = {
     fallbackReason: null,
 };
 const pluginProjectConfigCache = {
+    mtime: null,
+    rawParsed: null,
+    fallbackReason: null,
+};
+const pluginLocalConfigCache = {
     mtime: null,
     rawParsed: null,
     fallbackReason: null,
@@ -456,18 +487,27 @@ const llmProjectConfigCache = {
     rawParsed: null,
     fallbackReason: null,
 };
+const llmLocalConfigCache = {
+    mtime: null,
+    rawParsed: null,
+    fallbackReason: null,
+};
 
 // Top-level merge caches. `merged` is null until the first successful merge.
-// `userMtime` / `projectMtime` are the mtimeMs seen at the last merge (null if
-// that file was missing); both matching the current stat is the fast-path hit.
+// `userMtime` / `projectMtime` / `localMtime` are the mtimeMs seen at the last
+// merge (null if that file was missing); ALL matching the current stat is the
+// fast-path hit. `localMtime` stays null when the local layer is skipped
+// (localPath omitted by the caller — legacy 3-file behavior).
 const pluginConfigCache = {
     userMtime: null,
     projectMtime: null,
+    localMtime: null,
     merged: null,
 };
 const llmConfigCache = {
     userMtime: null,
     projectMtime: null,
+    localMtime: null,
     merged: null,
 };
 
@@ -702,48 +742,65 @@ function _statMtime(targetPath) {
     }
 }
 
-// _readLayeredConfig — the three-level merge core shared by readConfig /
-// readLlmConfig. Reads the user-level file and the project-level file (each via
-// the raw-reading core _readRawJsonConfig, with its OWN per-file sub-cache +
-// deduped audit latch), then merges RAW field-by-field and normalizes ONCE at
-// the end. Precedence: project > user > default. The merge is SHALLOW (both
-// config objects are flat key→value; a `leaves` array is a single key whose
-// value is replaced wholesale by the project array, not concatenated).
+// _readLayeredConfig — the four-level merge core shared by readConfig /
+// readLlmConfig. Reads the user-level file, the committed project-level file,
+// and (optionally) the project-local `.local.json` override (each via the raw-
+// reading core _readRawJsonConfig, with its OWN per-file sub-cache + deduped
+// audit latch), then merges RAW field-by-field and normalizes ONCE at the end.
+// Precedence: project-local > committed-project > user > default. The merge is
+// SHALLOW (all config objects are flat key→value; a `leaves` array is a single
+// key whose value is replaced wholesale by the higher layer's array, not
+// concatenated).
+//
+// The LOCAL layer is OPTIONAL: when `localPath` is null/undefined the local
+// stat/read/merge is SKIPPED entirely and the function behaves EXACTLY as the
+// legacy three-level reader (project > user > default). This keeps the
+// existing two-positional-arg call sites (and the self-tests that inject only
+// project + user paths) deterministic and unchanged — a developer's real
+// gitignored `.local.json` can never leak into them. Production callers pass
+// `localPath` explicitly to opt into the four-level model.
 //
 // SEMANTICS (the critical correctness property): this is a TRUE field-by-field
 // merge of the RAW parsed objects, NOT an all-or-nothing-per-file merge.
 //   - Each layer contributes ONLY the fields its file actually specifies. A
 //     missing/invalid file contributes NO fields (null → spread of `{}` → no
 //     keys). A present-but-PARTIAL file contributes only its specified keys.
-//   - Precedence is per FIELD: a field the project file specifies → project
-//     wins; a field only the user file specifies → user wins; a field neither
-//     specifies → default (filled by the single final normalize over defaults).
+//   - Precedence is per FIELD: a field the local file specifies → local wins;
+//     else a field the committed-project file specifies → project wins; else a
+//     field only the user file specifies → user wins; a field none specifies →
+//     default (filled by the single final normalize over defaults).
 //   - The reference-identity trick the OLD all-or-nothing merge used (returning
 //     `defaults` from the reader and testing `!== defaults`) is GONE: it was
 //     both unnecessary and the source of the wrong semantics, because a
 //     successfully-parsed-but-normalized object carried ALL keys (default-
 //     filled) and so overrode the other layer on every field.
-// This makes the feature's PRIMARY use case correct: an operator sets the LLM
+// This makes the feature's PRIMARY use cases correct: an operator sets the LLM
 // endpoint/key ONCE at user level, and a project specializes just the model;
-// the user's endpoint/key survive a partial project file.
+// the user's endpoint/key survive a partial project file; and an individual
+// developer's `.local.json` can flip just `mode` without touching anyone else.
 //
-// Top-level fast path: statSync both files; if BOTH mtimes match the cached
-// mtimes (the last successful merge), return the cached merged object without
-// re-reading or re-merging. A missing file has mtime null; a transition
+// Top-level fast path: statSync the files in play; if ALL mtimes match the
+// cached mtimes (the last successful merge), return the cached merged object
+// without re-reading or re-merging. A missing file has mtime null; a transition
 // present↔missing changes the mtime (number↔null), so the cache invalidates
-// correctly on file creation/deletion too.
+// correctly on file creation/deletion too. When the local layer is skipped
+// (localPath null) localMtime is null and the fast path compares against the
+// cached null (stable).
 //
 // Audit / silent rules (per the layered model):
 //   - USER-level file missing → SILENT (its absence is the normal case; most
 //     operators have only project-level config). Only a PRESENT-but-invalid
 //     user file emits an audit line, labeled with the level (e.g. "plugin/user").
+//   - PROJECT-LOCAL file — ALWAYS silent on missing (absent = legacy single-
+//     file behavior); a present-but-invalid local file emits an audit line
+//     labeled with the level (e.g. "plugin/local").
 //   - PROJECT-level file — same silentOnMissing flag the caller supplies, so
 //     the project-level plugin file keeps its existing "missing warns once"
 //     behavior and the project-level LLM file keeps its existing "silent on
 //     missing" behavior.
-// This makes both-missing for a type behave EXACTLY as the old single-file
-// model: plugin both-missing → one project-level "missing" line + defaults
-// (user silent); LLM both-missing → fully silent + defaults.
+// This makes both/three-missing for a type behave EXACTLY as the old single-
+// file model: plugin all-missing → one project-level "missing" line + defaults
+// (user + local silent); LLM all-missing → fully silent + defaults.
 function _readLayeredConfig(
     projectPath,
     userPath,
@@ -755,24 +812,31 @@ function _readLayeredConfig(
     projectSilentOnMissing,
     projectLabel,
     userLabel,
+    localPath,
+    localCache,
+    localLabel,
 ) {
-    // Steady-state fast path: both mtimes unchanged → return cached merged.
+    // Steady-state fast path: all-in-play mtimes unchanged → return cached merged.
     const userMtime = _statMtime(userPath);
     const projectMtime = _statMtime(projectPath);
+    const localMtime = localPath ? _statMtime(localPath) : null;
+    const localInUse = Boolean(localPath);
     if (
         mergeCache.merged !== null &&
         mergeCache.userMtime === userMtime &&
-        mergeCache.projectMtime === projectMtime
+        mergeCache.projectMtime === projectMtime &&
+        mergeCache.localMtime === localMtime &&
+        mergeCache.localWasInUse === localInUse
     ) {
         return mergeCache.merged;
     }
 
-    // At least one file changed (or first read). Read both RAW (each handles its
-    // own mtime sub-cache + deduped audit latch). The user-level file is ALWAYS
-    // silent on missing (optional layer); the project-level file inherits the
-    // caller's silentOnMissing so existing per-type behavior is preserved
-    // exactly. Each read returns the RAW parsed object (null on missing /
-    // unreadable / invalid).
+    // At least one file changed (or first read). Read all-in-play RAW (each
+    // handles its own mtime sub-cache + deduped audit latch). The user-level
+    // and project-local files are ALWAYS silent on missing (optional layers);
+    // the committed-project file inherits the caller's silentOnMissing so
+    // existing per-type behavior is preserved exactly. Each read returns the
+    // RAW parsed object (null on missing / unreadable / invalid).
     const userRaw = _readRawJsonConfig(
         userPath,
         userCache,
@@ -785,35 +849,56 @@ function _readLayeredConfig(
         projectSilentOnMissing,
         projectLabel,
     );
+    const localRaw = localPath
+        ? _readRawJsonConfig(
+              localPath,
+              localCache,
+              true, // project-local-missing is ALWAYS silent (absent = legacy)
+              localLabel,
+          )
+        : null;
 
-    // TRUE field-by-field merge of the RAW objects: project keys win per-key,
-    // user keys fill the rest, a missing/invalid layer (null) contributes NO
-    // keys (spread of `{}`). Then normalize ONCE, over defaults so fields
-    // absent from BOTH layers take their default. No reference-identity test
-    // is needed — null spreads to nothing, so a missing file can never clobber
-    // the other layer's values.
-    const mergedRaw = { ...(userRaw || {}), ...(projectRaw || {}) };
+    // TRUE field-by-field merge of the RAW objects: local keys win per-key,
+    // then committed-project keys, then user keys, then defaults; a
+    // missing/invalid layer (null) contributes NO keys (spread of `{}`). Then
+    // normalize ONCE, over defaults so fields absent from ALL layers take their
+    // default. No reference-identity test is needed — null spreads to nothing,
+    // so a missing file can never clobber another layer's values.
+    const mergedRaw = {
+        ...(userRaw || {}),
+        ...(projectRaw || {}),
+        ...(localRaw || {}),
+    };
     const merged = normalize({ ...defaults, ...mergedRaw });
 
     mergeCache.userMtime = userMtime;
     mergeCache.projectMtime = projectMtime;
+    mergeCache.localMtime = localMtime;
+    mergeCache.localWasInUse = localInUse;
     mergeCache.merged = merged;
     return merged;
 }
 
-// Read the PLUGIN-BEHAVIOR config with three-level merge (project > user >
-// default). Returns {enabled, mode, stubVerdict, promptFile, replyMode,
-// onUncertain} on every call — never throws. Emits one console.error audit
-// line per failure-state transition per file (user-level failures are labeled
-// "plugin/user"; project-level failures are labeled "plugin/project"). LLM
-// fields in either file are IGNORED.
+// Read the PLUGIN-BEHAVIOR config with four-level merge (project-local >
+// committed-project > user > default). Returns {enabled, mode, stubVerdict,
+// promptFile, replyMode, onUncertain, harnessContext, guides} on every call —
+// never throws. Emits one console.error audit line per failure-state
+// transition per file (user-level failures are labeled "plugin/user";
+// committed-project failures "plugin/project"; project-local failures
+// "plugin/local"). LLM fields in any file are IGNORED.
 //
 // `projectPath` / `userPath` are injectable for the self-test; production
 // callers omit them (they default to the repo-configs path and the
-// <XDG_CONFIG_HOME>/vh-agent-harness path respectively). Existing call sites
-// that pass one positional arg pass the PROJECT path (backward-compatible
-// signature extension).
-export function readConfig(projectPath = CONFIG_PATH, userPath = USER_CONFIG_PATH) {
+// <XDG_CONFIG_HOME>/vh-agent-harness path respectively). `localPath` is the
+// OPTIONAL project-local override path: when omitted (null) the local layer is
+// SKIPPED, reproducing the legacy three-level behavior exactly. Production
+// callers (the server hooks) pass `localConfigPath` explicitly to opt into the
+// four-level model.
+export function readConfig(
+    projectPath = CONFIG_PATH,
+    userPath = USER_CONFIG_PATH,
+    localPath = null,
+) {
     return _readLayeredConfig(
         projectPath,
         userPath,
@@ -822,25 +907,31 @@ export function readConfig(projectPath = CONFIG_PATH, userPath = USER_CONFIG_PAT
         pluginConfigCache,
         DEFAULT_PLUGIN_CONFIG,
         normalizePluginConfig,
-        false, // project-missing is NOT silent (existing behavior: warns once)
+        false, // committed-project-missing is NOT silent (existing behavior: warns once)
         "plugin/project",
         "plugin/user",
+        localPath,
+        pluginLocalConfigCache,
+        "plugin/local",
     );
 }
 
-// Read the LLM config with three-level merge (project > user > default).
-// Returns {modelEndpoint, modelEndpointEnv, model, apiKey, apiKeyEnv, timeoutMs,
-// maxRetries, retryDelayMs, leaves} on every call — never throws. A MISSING
-// file at EITHER level is SILENT (no audit spam) — it is the normal case when
-// live mode is not set up; audit/enforce modes must NOT fail because the LLM
-// file is absent. Only a PRESENT-but-invalid file emits an audit line, labeled
-// with the level ("llm/project", "llm/user").
+// Read the LLM config with four-level merge (project-local > committed-project
+// > user > default). Returns {modelEndpoint, modelEndpointEnv, model, apiKey,
+// apiKeyEnv, timeoutMs, maxRetries, retryDelayMs, leaves} on every call —
+// never throws. A MISSING file at ANY level is SILENT (no audit spam) — it is
+// the normal case when live mode is not set up; audit/enforce modes must NOT
+// fail because the LLM file is absent. Only a PRESENT-but-invalid file emits
+// an audit line, labeled with the level ("llm/project", "llm/user",
+// "llm/local").
 //
 // `projectPath` / `userPath` are injectable for the self-test; production
-// callers omit them.
+// callers omit them. `localPath` follows the same optional/skip rule as
+// readConfig.
 export function readLlmConfig(
     projectPath = LLM_CONFIG_PATH,
     userPath = USER_LLM_CONFIG_PATH,
+    localPath = null,
 ) {
     return _readLayeredConfig(
         projectPath,
@@ -850,13 +941,16 @@ export function readLlmConfig(
         llmConfigCache,
         DEFAULT_LLM_CONFIG,
         normalizeLlmConfig,
-        true, // project-missing is SILENT (existing behavior: no live setup = no spam)
+        true, // committed-project-missing is SILENT (existing behavior: no live setup = no spam)
         "llm/project",
         "llm/user",
+        localPath,
+        llmLocalConfigCache,
+        "llm/local",
     );
 }
 
-// Test-only: reset ALL config caches (4 per-file raw sub-caches + 2 top-level
+// Test-only: reset ALL config caches (6 per-file raw sub-caches + 2 top-level
 // merge caches) so the self-test's filesystem tests are isolated from each
 // other and from any prior production read. Mirrors the
 // __resetCachedBinaryPrompt helper pattern in auto-gate-live.js.
@@ -864,8 +958,10 @@ export function __resetConfigCaches() {
     for (const c of [
         pluginUserConfigCache,
         pluginProjectConfigCache,
+        pluginLocalConfigCache,
         llmUserConfigCache,
         llmProjectConfigCache,
+        llmLocalConfigCache,
     ]) {
         c.mtime = null;
         c.rawParsed = null;
@@ -874,6 +970,8 @@ export function __resetConfigCaches() {
     for (const c of [pluginConfigCache, llmConfigCache]) {
         c.userMtime = null;
         c.projectMtime = null;
+        c.localMtime = null;
+        c.localWasInUse = null;
         c.merged = null;
     }
 }
@@ -887,14 +985,18 @@ export function __resetConfigCaches() {
 // enforce branches never touch either.
 //
 // `configPath` / `llmConfigPath` are optional test-injection points for the
-// PROJECT-level files: production callers omit them (the hooks default to the
-// production repo-configs paths). `userConfigPath` / `userLlmConfigPath` are
-// the optional test-injection points for the USER-level files: production
-// callers omit them too (they default to the <XDG_CONFIG_HOME>/vh-agent-harness
-// paths). The self-tests pass temp-file paths under tmp/ for ALL four to
-// isolate the filesystem (the user-level paths point at non-existent temp
-// files so the silent user-missing path is exercised deterministically,
-// independent of the dev machine's real user config).
+// committed PROJECT-level files: production callers omit them (the hooks
+// default to the production repo-configs paths). `userConfigPath` /
+// `userLlmConfigPath` are the optional test-injection points for the USER-level
+// files: production callers omit them too (they default to the
+// <XDG_CONFIG_HOME>/vh-agent-harness paths). `localConfigPath` /
+// `localLlmConfigPath` are the optional test-injection points for the
+// PROJECT-LOCAL `.local.json` override files: production callers omit them too
+// (they default to the production repo-configs `.local.json` paths). The
+// self-tests pass temp-file paths under tmp/ for all six to isolate the
+// filesystem (the user-level + local-level paths point at non-existent temp
+// files so the silent optional-missing path is exercised deterministically,
+// independent of the dev machine's real configs).
 export const server = async ({
     client,
     directory,
@@ -902,6 +1004,8 @@ export const server = async ({
     llmConfigPath,
     userConfigPath = USER_CONFIG_PATH,
     userLlmConfigPath = USER_LLM_CONFIG_PATH,
+    localConfigPath = LOCAL_CONFIG_PATH,
+    localLlmConfigPath = LOCAL_LLM_CONFIG_PATH,
 } = {}) => {
     return {
         "tool.execute.before": async (input, output) => {
@@ -909,7 +1013,7 @@ export const server = async ({
             // in steady state). The operator can live-disable the plugin by
             // setting `enabled: false` in the config file; no OpenCode
             // restart, no re-render required.
-            const config = readConfig(configPath, userConfigPath);
+            const config = readConfig(configPath, userConfigPath, localConfigPath);
             if (config.enabled === false) {
                 // Operator kill-switch: the plugin is fully inert (no audit,
                 // no behavior change). This is the only branch that short-
@@ -950,7 +1054,7 @@ export const server = async ({
             // a RESERVE in case upstream wires permission.ask in a future
             // release — do NOT rely on it, but keep the investment intact.
             // Live config — read on every call (mtime-cached).
-            const config = readConfig(configPath, userConfigPath);
+            const config = readConfig(configPath, userConfigPath, localConfigPath);
             if (config.enabled === false) {
                 // Operator kill-switch: fully inert, no audit, no behavior
                 // change. output.status is left at its default so opencode's
@@ -1037,7 +1141,7 @@ export const server = async ({
                 // straight into the fail-closed validation below. Downstream
                 // decideLive / classifyLive / resolveSystemPrompt see a single
                 // merged object exactly as before the two-file split.
-                const liveConfig = { ...config, ...readLlmConfig(llmConfigPath, userLlmConfigPath) };
+                const liveConfig = { ...config, ...readLlmConfig(llmConfigPath, userLlmConfigPath, localLlmConfigPath) };
 
                 // (1) Validate live config up front so a misconfigured live
                 // mode fail-closes to deny with a CLEAR audit line instead of a
@@ -1186,7 +1290,7 @@ export const server = async ({
             if (!req || !req.id || !req.sessionID) return;
 
             // Kill-switch: same live-disable as the other two hooks.
-            const config = readConfig(configPath, userConfigPath);
+            const config = readConfig(configPath, userConfigPath, localConfigPath);
             if (config.enabled === false) return;
 
             // Scrubbed audit summary of the event payload. `patterns` and
@@ -1390,7 +1494,7 @@ export const server = async ({
                     `[auto-gate] permission.asked type=${permType} ` +
                     `mode=live (deciding)`,
                 );
-                const liveConfig = { ...config, ...readLlmConfig(llmConfigPath, userLlmConfigPath) };
+                const liveConfig = { ...config, ...readLlmConfig(llmConfigPath, userLlmConfigPath, localLlmConfigPath) };
 
                 // (1) Validate live config — missing endpoint/model fail-closes.
                 // Dual-form endpoint: either a literal modelEndpoint OR a
@@ -1502,7 +1606,7 @@ export const server = async ({
                     `[auto-gate] permission.asked type=${permType} ` +
                     `mode=live-tiered (deciding consensus)`,
                 );
-                const llmConfig = readLlmConfig(llmConfigPath, userLlmConfigPath);
+                const llmConfig = readLlmConfig(llmConfigPath, userLlmConfigPath, localLlmConfigPath);
 
                 // (1) Validate the leaves array. A well-formed leaf provides a
                 // model AND at least one endpoint form — a literal modelEndpoint
@@ -1862,6 +1966,12 @@ if (__isMain) {
     // production default USER_*_PATH would otherwise read).
     const NO_USER_PLUGIN = testConfigPath("no-such-user-plugin.json");
     const NO_USER_LLM = testConfigPath("no-such-user-llm.json");
+    // PROJECT-LOCAL `.local.json` sentinels — non-existent temp paths so the
+    // "local absent" path is exercised deterministically, independent of the
+    // dev machine's real gitignored `.local.json`. Tests that exercise the
+    // local layer write real temp files and pass those paths instead.
+    const NO_LOCAL_PLUGIN = testConfigPath("no-such-local-plugin.json");
+    const NO_LOCAL_LLM = testConfigPath("no-such-local-llm.json");
 
     // Ensure the test dir exists for the reader tests below (idempotent).
     fs.mkdirSync(TEST_CONFIG_DIR, { recursive: true });
@@ -2660,6 +2770,218 @@ if (__isMain) {
     });
 
     // ===================================================================
+    // FOUR-LEVEL LOCAL OVERRIDE (.local.json) — the project-local layer.
+    //
+    // These exercise the OPTIONAL project-local override path passed as the
+    // THIRD positional arg to readConfig / readLlmConfig. When omitted (null)
+    // the local layer is SKIPPED and legacy three-level behavior is reproduced
+    // exactly (covered by the tests above, which pass only two args). When
+    // provided, project-local is the HIGHEST layer (local > committed-project
+    // > user > defaults) and wins per field.
+    //
+    // These MIRROR the Go doctor test fixtures (TestAutoGateConfig_Local* in
+    // internal/cli/doctor_test.go) so JS and Go precedence are proven against
+    // IDENTICAL discriminating shapes.
+    // ===================================================================
+
+    test("local-absent (3-arg with non-existent local) == legacy three-level behavior", () => {
+        // A non-existent local path must behave EXACTLY as the 2-arg call.
+        __resetConfigCaches();
+        writeTestConfig("local-absent-proj.json", { mode: "enforce" });
+        const withLocal = readConfig(
+            testConfigPath("local-absent-proj.json"),
+            NO_USER_PLUGIN,
+            NO_LOCAL_PLUGIN,
+        );
+        assert.equal(withLocal.mode, "enforce", "committed-project mode survives with local absent");
+        assert.equal(withLocal.enabled, true, "default enabled survives");
+        // Every default field is present (local-absent does not drop fields).
+        assert.equal(withLocal.stubVerdict, "block");
+        assert.equal(withLocal.replyMode, "once");
+        assert.equal(withLocal.onUncertain, "reject");
+        assert.equal(withLocal.harnessContext, true);
+        assert.equal(withLocal.guides, true);
+    });
+
+    test("local HIGHEST precedence: user=audit, committed-project=enforce, local=live-tiered -> live-tiered", () => {
+        // DISCRIMINATING fixture — IDENTICAL to the Go doctor
+        // LocalOverridesCommittedAndUser test: only the highest layer's mode
+        // survives. Fails if any lower layer wins or if local is ignored.
+        __resetConfigCaches();
+        writeTestConfig("prec-user.json", { mode: "audit" });
+        writeTestConfig("prec-proj.json", { mode: "enforce" });
+        writeTestConfig("prec-local.json", { mode: "live-tiered" });
+        const cfg = readConfig(
+            testConfigPath("prec-proj.json"),
+            testConfigPath("prec-user.json"),
+            testConfigPath("prec-local.json"),
+        );
+        assert.equal(cfg.mode, "live-tiered", "project-local must override BOTH user and committed-project");
+    });
+
+    test("local PARTIAL merge: only supplied field overrides, unrelated fields inherit lower layers", () => {
+        // local sets ONLY mode; committed-project's stubVerdict survives;
+        // user's promptFile survives; defaults fill the rest.
+        __resetConfigCaches();
+        writeTestConfig("part-user.json", { promptFile: "/from-user" });
+        writeTestConfig("part-proj.json", { stubVerdict: "allow" });
+        writeTestConfig("part-local.json", { mode: "live" }); // ONLY mode
+        const cfg = readConfig(
+            testConfigPath("part-proj.json"),
+            testConfigPath("part-user.json"),
+            testConfigPath("part-local.json"),
+        );
+        assert.equal(cfg.mode, "live", "local mode must win");
+        assert.equal(cfg.stubVerdict, "allow", "committed-project stubVerdict must survive (local did not set it)");
+        assert.equal(cfg.promptFile, "/from-user", "user promptFile must survive (neither higher layer set it)");
+        assert.equal(cfg.enabled, true, "default enabled survives");
+        assert.equal(cfg.guides, true, "default guides survives");
+    });
+
+    test("local explicit values (false/empty) are NOT mistaken for absence", () => {
+        // local sets enabled=false and promptFile="" — these are EXPLICIT and
+        // must override lower layers' values (a present key with a falsy value
+        // is a real override, NOT a missing field). Fails if the merge used a
+        // truthiness/absence test instead of a key-presence test.
+        __resetConfigCaches();
+        writeTestConfig("explicit-user.json", { enabled: true, promptFile: "/from-user" });
+        writeTestConfig("explicit-local.json", { enabled: false, promptFile: "" });
+        const cfg = readConfig(
+            testConfigPath("no-such-proj-explicit.json"),
+            testConfigPath("explicit-user.json"),
+            testConfigPath("explicit-local.json"),
+        );
+        assert.equal(cfg.enabled, false, "local enabled=false must override user enabled=true");
+        assert.equal(cfg.promptFile, "", "local promptFile='' must override user promptFile='/from-user'");
+    });
+
+    test("local INVALID file: handled safely + identifies the layer (label plugin/local)", () => {
+        // A present-but-invalid local file must fail-safe to defaults (like an
+        // invalid user/project file) AND emit an audit line identifying the
+        // LOCAL layer ("plugin/local"), so an operator can locate the bad file.
+        __resetConfigCaches();
+        writeTestConfig("inv-proj.json", { mode: "enforce" });
+        writeTestConfig("inv-local.json", "{ not valid json");
+        let captured = null;
+        captureErrors((errors) => {
+            const cfg = readConfig(
+                testConfigPath("inv-proj.json"),
+                NO_USER_PLUGIN,
+                testConfigPath("inv-local.json"),
+            );
+            // Fail-safe: committed-project mode survives (local contributed
+            // nothing because it was invalid).
+            assert.equal(cfg.mode, "enforce", "committed-project mode survives an invalid local");
+            captured = errors;
+        });
+        assert.ok(
+            Array.isArray(captured) && captured.some((e) => typeof e === "string" && e.includes("plugin/local")),
+            "invalid local must emit an audit line labeled 'plugin/local'",
+        );
+    });
+
+    test("local cache-hit: unchanged 3-file mtimes reuse the cached merged object", () => {
+        __resetConfigCaches();
+        writeTestConfig("cache-user.json", { mode: "audit" });
+        writeTestConfig("cache-proj.json", { mode: "enforce" });
+        writeTestConfig("cache-local.json", { mode: "live-tiered" });
+        const a = readConfig(
+            testConfigPath("cache-proj.json"),
+            testConfigPath("cache-user.json"),
+            testConfigPath("cache-local.json"),
+        );
+        const b = readConfig(
+            testConfigPath("cache-proj.json"),
+            testConfigPath("cache-user.json"),
+            testConfigPath("cache-local.json"),
+        );
+        assert.equal(a.mode, "live-tiered", "initial read resolves local mode");
+        assert.equal(
+            a,
+            b,
+            "all three files unchanged -> SAME cached merged object (reference-equal)",
+        );
+    });
+
+    test("local MODIFICATION invalidates the cache and re-reads", (t, done) => {
+        __resetConfigCaches();
+        writeTestConfig("mut-user.json", { mode: "audit" });
+        writeTestConfig("mut-proj.json", { mode: "enforce" });
+        writeTestConfig("mut-local.json", { mode: "live" });
+        const a = readConfig(
+            testConfigPath("mut-proj.json"),
+            testConfigPath("mut-user.json"),
+            testConfigPath("mut-local.json"),
+        );
+        assert.equal(a.mode, "live", "initial: local mode=live");
+        setTimeout(() => {
+            writeTestConfig("mut-local.json", { mode: "audit" }); // local mode flips
+            const b = readConfig(
+                testConfigPath("mut-proj.json"),
+                testConfigPath("mut-user.json"),
+                testConfigPath("mut-local.json"),
+            );
+            assert.notEqual(a, b, "local mtime change -> cache invalidated -> new merged object");
+            assert.equal(b.mode, "audit", "re-read picks up the new local mode");
+            done();
+        }, 20);
+    });
+
+    test("local CREATION invalidates the cache and changes the result", (t, done) => {
+        __resetConfigCaches();
+        writeTestConfig("create-user.json", { mode: "audit" });
+        writeTestConfig("create-proj.json", { mode: "enforce" });
+        const LOCAL = testConfigPath("create-local.json");
+        // First read: no local file yet (committed-project mode=enforce wins).
+        const a = readConfig(
+            testConfigPath("create-proj.json"),
+            testConfigPath("create-user.json"),
+            LOCAL,
+        );
+        assert.equal(a.mode, "enforce", "before creation: committed-project mode=enforce");
+        setTimeout(() => {
+            writeTestConfig("create-local.json", { mode: "audit" }); // local appears
+            const b = readConfig(
+                testConfigPath("create-proj.json"),
+                testConfigPath("create-user.json"),
+                LOCAL,
+            );
+            assert.notEqual(a, b, "local mtime null->number -> cache invalidated");
+            assert.equal(b.mode, "audit", "after creation: local mode=audit overrides committed-project");
+            done();
+        }, 20);
+    });
+
+    test("local DELETION invalidates the cache and restores lower-layer behavior", (t, done) => {
+        __resetConfigCaches();
+        writeTestConfig("del-user.json", { mode: "audit" });
+        writeTestConfig("del-proj.json", { mode: "enforce" });
+        const LOCAL = testConfigPath("del-local.json");
+        writeTestConfig("del-local.json", { mode: "live-tiered" });
+        const a = readConfig(
+            testConfigPath("del-proj.json"),
+            testConfigPath("del-user.json"),
+            LOCAL,
+        );
+        assert.equal(a.mode, "live-tiered", "before deletion: local mode=live-tiered wins");
+        setTimeout(() => {
+            try { fs.unlinkSync(LOCAL); } catch (_) { /* already gone */ }
+            const b = readConfig(
+                testConfigPath("del-proj.json"),
+                testConfigPath("del-user.json"),
+                LOCAL,
+            );
+            assert.notEqual(a, b, "local mtime number->null -> cache invalidated");
+            assert.equal(
+                b.mode,
+                "enforce",
+                "after deletion: committed-project mode=enforce restored (local gone)",
+            );
+            done();
+        }, 20);
+    });
+
+    // ===================================================================
     // EVENT HOOK TESTS — the PRIMARY enforcement surface.
     //
     // Each test builds hooks via server({client, directory, configPath,
@@ -2774,6 +3096,8 @@ if (__isMain) {
             // (user-missing is silent → only the project path above applies).
             userConfigPath: NO_USER_PLUGIN,
             userLlmConfigPath: NO_USER_LLM,
+            localConfigPath: NO_LOCAL_PLUGIN, // non-existent local → deterministic 3-level behavior
+            localLlmConfigPath: NO_LOCAL_LLM,
         });
         return { hooks, replies: holder.replies };
     }
@@ -3080,6 +3404,8 @@ if (__isMain) {
             llmConfigPath: testConfigPath("no-such-llm.json"),
             userConfigPath: NO_USER_PLUGIN,
             userLlmConfigPath: NO_USER_LLM,
+            localConfigPath: NO_LOCAL_PLUGIN, // non-existent local → deterministic 3-level behavior
+            localLlmConfigPath: NO_LOCAL_LLM,
         });
         await hooks["event"]({
             event: makeAskedEvent({ id: "req-v2-1" }),
@@ -3127,6 +3453,8 @@ if (__isMain) {
             llmConfigPath: testConfigPath("no-such-llm.json"),
             userConfigPath: NO_USER_PLUGIN,
             userLlmConfigPath: NO_USER_LLM,
+            localConfigPath: NO_LOCAL_PLUGIN, // non-existent local → deterministic 3-level behavior
+            localLlmConfigPath: NO_LOCAL_LLM,
         });
         await hooks["event"]({ event: makeAskedEvent() });
         assert.equal(
@@ -3174,6 +3502,8 @@ if (__isMain) {
             llmConfigPath: testConfigPath("no-such-llm.json"),
             userConfigPath: NO_USER_PLUGIN,
             userLlmConfigPath: NO_USER_LLM,
+            localConfigPath: NO_LOCAL_PLUGIN, // non-existent local → deterministic 3-level behavior
+            localLlmConfigPath: NO_LOCAL_LLM,
         });
         await hooks["event"]({ event: makeAskedEvent() });
         assert.equal(v1Calls.length, 1, "allow must hit v1 once");
@@ -3219,6 +3549,8 @@ if (__isMain) {
             llmConfigPath: testConfigPath("no-such-llm.json"),
             userConfigPath: NO_USER_PLUGIN,
             userLlmConfigPath: NO_USER_LLM,
+            localConfigPath: NO_LOCAL_PLUGIN, // non-existent local → deterministic 3-level behavior
+            localLlmConfigPath: NO_LOCAL_LLM,
         });
         await hooks["event"]({ event: makeAskedEvent() });
         assert.equal(
@@ -3272,6 +3604,8 @@ if (__isMain) {
             llmConfigPath: testConfigPath("no-such-llm.json"),
             userConfigPath: NO_USER_PLUGIN,
             userLlmConfigPath: NO_USER_LLM,
+            localConfigPath: NO_LOCAL_PLUGIN, // non-existent local → deterministic 3-level behavior
+            localLlmConfigPath: NO_LOCAL_LLM,
         });
         // The hook MUST resolve normally (no rejection thrown to the caller).
         await hooks["event"]({ event: makeAskedEvent() });
@@ -3310,6 +3644,8 @@ if (__isMain) {
             llmConfigPath: testConfigPath("no-such-llm.json"),
             userConfigPath: NO_USER_PLUGIN,
             userLlmConfigPath: NO_USER_LLM,
+            localConfigPath: NO_LOCAL_PLUGIN, // non-existent local → deterministic 3-level behavior
+            localLlmConfigPath: NO_LOCAL_LLM,
         });
         await hooks["event"]({ event: makeAskedEvent() });
         assert.equal(
@@ -3558,6 +3894,8 @@ if (__isMain) {
             llmConfigPath: testConfigPath("no-such-llm.json"),
             userConfigPath: NO_USER_PLUGIN,
             userLlmConfigPath: NO_USER_LLM,
+            localConfigPath: NO_LOCAL_PLUGIN, // non-existent local → deterministic 3-level behavior
+            localLlmConfigPath: NO_LOCAL_LLM,
         });
         const errors = [];
         const orig = console.error;
@@ -3593,6 +3931,8 @@ if (__isMain) {
             llmConfigPath: testConfigPath("no-such-llm.json"),
             userConfigPath: NO_USER_PLUGIN,
             userLlmConfigPath: NO_USER_LLM,
+            localConfigPath: NO_LOCAL_PLUGIN, // non-existent local → deterministic 3-level behavior
+            localLlmConfigPath: NO_LOCAL_LLM,
         });
         const errors = [];
         const orig = console.error;
@@ -3861,6 +4201,8 @@ if (__isMain) {
             llmConfigPath: testConfigPath(lName),
             userConfigPath: NO_USER_PLUGIN,
             userLlmConfigPath: NO_USER_LLM,
+            localConfigPath: NO_LOCAL_PLUGIN, // non-existent local → deterministic 3-level behavior
+            localLlmConfigPath: NO_LOCAL_LLM,
         });
         const restore = mockFetchByEndpoint({
             "leaf-a-endpoint": "<block>no</block>",

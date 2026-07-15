@@ -6,7 +6,7 @@ the overlay (or by the user on first run). The core skill never hardcodes repo
 hotpaths; this file does.
 
 This file instantiates the **S1 localization-split pattern** defined in
-`templates/core/.opencode/skills/skill-creator/references/skill-lifecycle.md`
+`.opencode/skills/skill-creator/references/skill-lifecycle.md`
 (`## S1 — Localization split as a first-class pattern`): the core skill holds
 the discipline domain-free, and this file holds the repo-specific map.
 

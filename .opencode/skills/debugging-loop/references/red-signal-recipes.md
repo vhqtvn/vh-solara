@@ -23,9 +23,11 @@ keystone — fix it or go to the Downgrade section in `SKILL.md`.
     **reproducible count** — the aggregate verdict repeats across runs (same
     direction, same approximate count), not a one-off; **no cheaper seam** — the
     isolation seam is green, so faster seams provably cannot go red (the runtime
-    is necessary, not lazy); **bgshell-hosted** — the long runtime runs under
-    `bgshell-job`, not blocking one shell call. Shape: cross-test contamination
-    where isolation is green and only the serial aggregate goes red.
+    is necessary, not lazy); if the isolation seam itself goes red, the
+    exception does not apply — the red signal is already fast at the cheaper
+    seam; **bgshell-hosted** — the long runtime runs under `bgshell-job`, not
+    blocking one shell call. Shape: cross-test contamination where isolation is
+    green and only the serial aggregate goes red.
 - **Agent-runnable** — invocable as one named command or procedure with no human
   in the loop (no clicking, no typing into a prompt, no "look at the screen and
   tell me if it is wrong").
@@ -58,6 +60,17 @@ one, stop and rebuild.
 - **Flaky** — fails only sometimes (wall-clock dependent, order dependent,
   network dependent). Fails *deterministic*. Tighten by pinning the varying
   input; if it cannot be pinned, the signal may belong in the Downgrade.
+- **Environment-sensitive** — deterministic inside one timing envelope but
+  vanishes in another (faster vs slower CI, container vs host, warm vs cold
+  cache). Looks solid under a long repeat run, then flakes when the envelope
+  shifts — a frequent cause of premature closeout. Fails *deterministic*: the
+  environment is an unpinned input. The minimise step is the critical turn — a
+  defensive wait or slow path can mask the race entirely (the test passes green
+  while a real failure hides behind it). **Mitigation:** always strip defensive
+  waits and slow paths when minimising — the red signal is the *fastest* path
+  through the test, not a comfortable one; if the red only appears under one
+  timing, note the envelope dependency rather than declaring it
+  environment-independent.
 - **Slow** — takes minutes or needs a cold start. Fails *fast*. Move work out of
   the path, or drop to a cheaper seam. **Exception:** if the slow red is a
   predeclared-aggregate (isolation green, serial red, bgshell-hosted — see the
