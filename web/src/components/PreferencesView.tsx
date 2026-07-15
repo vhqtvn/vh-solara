@@ -12,7 +12,7 @@
 // sections send their payload together on save (the PUT is key-presence-aware,
 // so a combined write is safe); dirty-editor protection against an SSE nudge
 // keeps unsaved edits per-section.
-import { createEffect, createMemo, createSignal, For, on, onMount, Show } from "solid-js";
+import { createEffect, createMemo, createSignal, For, Index, on, onMount, Show } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
 import { agents } from "../agents";
 import { state } from "../sync";
@@ -290,38 +290,38 @@ export default function PreferencesView() {
           <span>{/* actions */}</span>
           <span>{/* error */}</span>
         </div>
-        <For each={nameRules()}>
+        <Index each={nameRules()}>
           {(rule, i) => (
-            <div class={styles.ruleRow} classList={{ [styles.ruleInvalid]: !!nameErrors()[i()] }}>
+            <div class={styles.ruleRow} classList={{ [styles.ruleInvalid]: !!nameErrors()[i] }}>
               <input
                 class={styles.rulePattern}
                 type="text"
                 placeholder="\[\[IMPORTANT\]\]"
-                value={rule.pattern ?? ""}
-                onInput={(e) => updateRule(i(), "pattern", e.currentTarget.value)}
+                value={rule().pattern ?? ""}
+                onInput={(e) => updateRule(i, "pattern", e.currentTarget.value)}
                 spellcheck={false}
               />
               <input
                 class={styles.ruleReplacement}
                 type="text"
                 placeholder="❗"
-                value={rule.replacement ?? ""}
-                onInput={(e) => updateRule(i(), "replacement", e.currentTarget.value)}
+                value={rule().replacement ?? ""}
+                onInput={(e) => updateRule(i, "replacement", e.currentTarget.value)}
               />
               <input
                 class={styles.ruleFlags}
                 type="text"
                 placeholder="g"
-                value={rule.flags ?? ""}
-                onInput={(e) => updateRule(i(), "flags", e.currentTarget.value)}
+                value={rule().flags ?? ""}
+                onInput={(e) => updateRule(i, "flags", e.currentTarget.value)}
                 spellcheck={false}
               />
               <span class={styles.ruleActions}>
                 <button
                   type="button"
                   class={styles.ruleBtn}
-                  onClick={() => moveRule(i(), -1)}
-                  disabled={i() === 0}
+                  onClick={() => moveRule(i, -1)}
+                  disabled={i === 0}
                   aria-label="Move rule up"
                   title="Move up"
                 >
@@ -330,8 +330,8 @@ export default function PreferencesView() {
                 <button
                   type="button"
                   class={styles.ruleBtn}
-                  onClick={() => moveRule(i(), 1)}
-                  disabled={i() === nameRules().length - 1}
+                  onClick={() => moveRule(i, 1)}
+                  disabled={i === nameRules().length - 1}
                   aria-label="Move rule down"
                   title="Move down"
                 >
@@ -340,21 +340,21 @@ export default function PreferencesView() {
                 <button
                   type="button"
                   class={styles.ruleBtn}
-                  onClick={() => removeRule(i())}
+                  onClick={() => removeRule(i)}
                   aria-label="Remove rule"
                   title="Remove"
                 >
                   <Icon name="x" size={14} />
                 </button>
               </span>
-              <Show when={nameErrors()[i()]}>
+              <Show when={nameErrors()[i]}>
                 <span class={styles.ruleError}>
-                  ⚠ {nameErrors()[i()]} — Ignored until fixed
+                  ⚠ {nameErrors()[i]} — Ignored until fixed
                 </span>
               </Show>
             </div>
           )}
-        </For>
+        </Index>
         <button type="button" class={styles.addRule} onClick={addRule}>
           <Icon name="plus" size={14} /> Add rule
         </button>

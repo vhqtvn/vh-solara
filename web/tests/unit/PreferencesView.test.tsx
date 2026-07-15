@@ -116,6 +116,39 @@ describe("PreferencesView", () => {
     await waitFor(() => expect(patternInputs(container).length).toBe(0));
   });
 
+  it("retains focus on a rule input across keystrokes (no remount per edit)", async () => {
+    // Regression: with <For> (keyed by reference), editing a row produced a
+    // fresh row object + fresh array identity, so <For> treated the edited row
+    // as removed+added, destroyed its <input>, and lost focus every keystroke.
+    // With <Index> (keyed by position) the same DOM node is updated in place.
+    installFetch({
+      getSettings: { nameReplacements: [{ pattern: "foo", replacement: "bar" }] },
+    });
+    const { container } = render(() => <PreferencesView />);
+    await waitFor(() => expect(patternInputs(container).length).toBe(1));
+
+    const pat = patternInputs(container)[0];
+    pat.focus();
+    expect(document.activeElement).toBe(pat);
+
+    // First keystroke.
+    pat.value = "foox";
+    pat.dispatchEvent(new Event("input", { bubbles: true }));
+
+    // The SAME node must still be the focused element and hold the new value.
+    expect(document.activeElement).toBe(pat);
+    expect(pat.value).toBe("foox");
+    // ...and it must still be attached (not replaced by a new node).
+    expect(container.contains(pat)).toBe(true);
+
+    // Second keystroke — assert focus survives a second in-place edit too.
+    pat.value = "fooxy";
+    pat.dispatchEvent(new Event("input", { bubbles: true }));
+    expect(document.activeElement).toBe(pat);
+    expect(pat.value).toBe("fooxy");
+    expect(container.contains(pat)).toBe(true);
+  });
+
   it("reorders rules with move up/down and the preview reflects the new order", async () => {
     installFetch({
       getSettings: {
