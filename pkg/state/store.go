@@ -678,16 +678,18 @@ func (s *Store) SetActivityFromStatuses(statuses map[string]json.RawMessage) {
 	// Clear everything else. Known sessions and loaded sessions are set idle;
 	// never-busy sessions with no entry already render idle, so they're skipped
 	// to avoid a churn of no-op events on large session lists.
-	clear := func(sid string) {
+	// clearActivity idles any session no longer reported busy. Named to avoid
+	// shadowing the Go 1.21+ builtin clear (this repo is Go 1.25).
+	clearActivity := func(sid string) {
 		if !busy[sid] {
 			s.setActivityLocked(sid, ActivityIdle)
 		}
 	}
 	for sid := range s.sessions {
-		clear(sid)
+		clearActivity(sid)
 	}
 	for sid := range s.messages {
-		clear(sid)
+		clearActivity(sid)
 	}
 }
 

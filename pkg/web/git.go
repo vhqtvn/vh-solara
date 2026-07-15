@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -93,6 +94,28 @@ func decodeGitBody(w http.ResponseWriter, r *http.Request, v any) bool {
 	return true
 }
 
+// confineGitFiles validates client-supplied file pathspecs against the repo
+// root, rejecting any that traverse ".." or escape via a symlink. On success it
+// returns the paths normalized to repo-relative (slash) form suitable for
+// `git <cmd> -- <path>...`; on any escape it returns ok=false so the caller
+// rejects the whole request before git runs. Mirrors pkg/web/code.go's safeJoin
+// confinement (rejects ".." AND symlink escape via EvalSymlinks).
+func confineGitFiles(dir string, files []string) ([]string, bool) {
+	out := make([]string, 0, len(files))
+	for _, f := range files {
+		abs, ok := safeJoin(dir, f)
+		if !ok {
+			return nil, false
+		}
+		rel, err := filepath.Rel(dir, abs)
+		if err != nil {
+			return nil, false
+		}
+		out = append(out, filepath.ToSlash(rel))
+	}
+	return out, true
+}
+
 func (s *Server) gitAction(w http.ResponseWriter, r *http.Request, build func(b gitFilesBody) [][]string) {
 	dir, ok := gitRepoDir(r)
 	if !ok {
@@ -102,6 +125,20 @@ func (s *Server) gitAction(w http.ResponseWriter, r *http.Request, build func(b 
 	var b gitFilesBody
 	if !decodeGitBody(w, r, &b) {
 		return
+	}
+	// Confine per-file pathspecs to the repo (reject ".." traversal and symlinks
+	// that escape) before they reach git. git is invoked argv-only (no shell)
+	// and the build closures always emit a "--" separator, so this is
+	// defense-in-depth parity with the code view's safeJoin (code.go), not a fix
+	// for a present shell-injection hole. b.All operates tree-wide (add -A /
+	// reset) and carries no per-file pathspec to confine.
+	if !b.All {
+		confined, ok := confineGitFiles(dir, b.Files)
+		if !ok {
+			http.Error(w, "file path escapes repository", http.StatusBadRequest)
+			return
+		}
+		b.Files = confined
 	}
 	for _, args := range build(b) {
 		if out, err := runGit(r.Context(), dir, args...); err != nil {

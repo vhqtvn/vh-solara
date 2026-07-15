@@ -59,6 +59,13 @@ type Server struct {
 	cssOnce sync.Once
 	css     string
 
+	// staticPaths is the set of embedded static file paths, built lazily on the
+	// first handleStatic call so the real-asset-vs-SPA-route probe is a cheap
+	// map lookup instead of an embed Open+Close that http.FileServer then
+	// repeats on the same path.
+	staticPathsOnce sync.Once
+	staticPaths     map[string]bool
+
 	quotaMu    sync.Mutex
 	quotaCache *quota.Report
 	quotaAt    time.Time
@@ -1266,11 +1273,29 @@ func (s *Server) handlePassthrough(w http.ResponseWriter, r *http.Request) {
 	s.proxy.ServeHTTP(w, r)
 }
 
+// knownStatic reports whether p is a real embedded static file path. It builds
+// the path set lazily on first use (walking the immutable embed FS once) so
+// handleStatic's real-asset-vs-SPA-route decision is a map lookup rather than an
+// Open+Close that http.FileServer then repeats on the same path.
+func (s *Server) knownStatic(p string) bool {
+	s.staticPathsOnce.Do(func() {
+		s.staticPaths = map[string]bool{}
+		_ = fs.WalkDir(s.staticFS, ".", func(path string, d fs.DirEntry, err error) error {
+			if err != nil || d.IsDir() {
+				return nil
+			}
+			s.staticPaths[path] = true
+			return nil
+		})
+	})
+	return s.staticPaths[p]
+}
+
 // handleStatic serves embedded static files. Real assets (hashed bundles,
 // sw.js, manifest, icons) are served by http.FileServer. For the root path and
 // unknown client routes (SPA history fallback) it serves embedded index.html
 // when a real SPA build is materialized, otherwise the self-contained
-// placeholder.html — the only tracked file under dist/ — so a cold
+// placeholder.html—​the only tracked file under dist/—​so a cold
 // `go build`/`go test` with no frontend build serves a banner page instead of a
 // directory listing. This explicitly does NOT rely on http.FileServer's
 // directory-index/listing semantics, which would list the directory when
@@ -1278,13 +1303,11 @@ func (s *Server) handlePassthrough(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 	p := strings.TrimPrefix(r.URL.Path, "/")
 	// Serve an existing embedded static file directly (real assets, sw.js,
-	// manifest, icons, etc.).
-	if p != "" {
-		if f, err := s.staticFS.Open(p); err == nil {
-			f.Close()
-			s.static.ServeHTTP(w, r)
-			return
-		}
+	// manifest, icons, etc.). knownStatic is a lazy map lookup over the embed
+	// FS so this does not Open+Close a file that http.FileServer re-opens below.
+	if p != "" && s.knownStatic(p) {
+		s.static.ServeHTTP(w, r)
+		return
 	}
 	// Root or SPA-history fallback: prefer index.html (the real SPA shell,
 	// present only after an embed-producing target materialized a build); fall

@@ -66,6 +66,10 @@ func newStaticTestServer(t *testing.T, staticFS fs.FS) *httptest.Server {
 		t.Fatal(err)
 	}
 	srv.staticFS = staticFS
+	// Rebuild the FileServer over the swapped FS so static-asset requests in
+	// tests serve from the test FS (handleStatic delegates real-asset paths to
+	// srv.static). Without this, staticFS and static would disagree after swap.
+	srv.static = http.FileServer(http.FS(staticFS))
 	return httptest.NewServer(srv.Handler())
 }
 
@@ -139,5 +143,51 @@ func TestServesIndexOverPlaceholder(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestStaticServesKnownAssetAndSPAFallback locks handleStatic's two branches:
+// a path that is a real embedded static file is served by http.FileServer, and
+// any other non-empty path (an unknown client route) falls through to the SPA
+// (index.html). The lazy path set (knownStatic) is the existence probe that
+// replaced the Open+Close+re-open, so this also pins that a real asset path is
+// recognized by the map lookup.
+func TestStaticServesKnownAssetAndSPAFallback(t *testing.T) {
+	indexHTML := "<!doctype html><html><head><title>VHSolara</title></head>" +
+		"<body><div id=\"root\"></div></body></html>"
+	asset := "// asset body abc"
+	mapFS := fstest.MapFS{
+		"index.html":    {Data: []byte(indexHTML)},
+		"assets/app.js": {Data: []byte(asset)},
+	}
+	ws := newStaticTestServer(t, mapFS)
+	defer ws.Close()
+
+	// Known asset path → served by http.FileServer (200, body is the asset).
+	resp, err := http.Get(ws.URL + "/assets/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("asset status = %d, want 200", resp.StatusCode)
+	}
+	if string(body) != asset {
+		t.Errorf("asset body = %q, want %q", string(body), asset)
+	}
+
+	// Unknown client route → SPA fallback (index.html), not a 404.
+	resp2, err := http.Get(ws.URL + "/session/whatever")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body2, _ := io.ReadAll(resp2.Body)
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("fallback status = %d, want 200", resp2.StatusCode)
+	}
+	if !strings.Contains(string(body2), `<div id="root">`) {
+		t.Errorf("fallback did not serve index.html: %s", body2)
 	}
 }
