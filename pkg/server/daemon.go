@@ -575,15 +575,62 @@ func (d *Daemon) handleUIPage(w http.ResponseWriter, r *http.Request) {
 						tr.style.opacity = '';
 					}
 
+					// SECURITY: build the row with DOM APIs (createElement / textContent /
+					// addEventListener / property assignment). The /api/workers payload is
+					// already safely JSON-parsed; the ONLY XSS sink was this innerHTML
+					// concatenation, which let a worker-controlled name/id/status/url inject
+					// markup, forge an event-handler attribute, or break out of the onclick
+					// JS string. Never assign worker-controlled text to innerHTML or inline
+					// handlers.
+					while (tr.firstChild) { tr.removeChild(tr.firstChild); }
+
 					const shortId = w.id.length > 20 ? w.id.substring(0, 20) + '...' : w.id;
-					const urlLink = w.url ? '<a href="' + w.url + '" target="_blank" style="color: var(--primary); text-decoration: none; font-size: 0.8rem;">Open Web ↗</a>' : '';
-					
-					tr.innerHTML = 
-						'<td class="name-col"><div class="name-text">' + w.name + '</div><div class="text-gray text-sm">' + shortId + '</div>' + urlLink + '</td>' +
-						'<td><span class="badge ' + w.status + '">' + w.status + '</span></td>' +
-						'<td style="text-align: right;"><div class="action-buttons" style="justify-content: flex-end;">' +
-						(w.status !== 'offline' ? '<button class="danger" onclick="killWorker(\'' + w.id + '\')">Kill</button>' : '') +
-						'</div></td>';
+
+					const nameTd = document.createElement('td');
+					nameTd.className = 'name-col';
+					const nameDiv = document.createElement('div');
+					nameDiv.className = 'name-text';
+					nameDiv.textContent = w.name;
+					const idDiv = document.createElement('div');
+					idDiv.className = 'text-gray text-sm';
+					idDiv.textContent = shortId;
+					nameTd.appendChild(nameDiv);
+					nameTd.appendChild(idDiv);
+					if (w.url) {
+						const urlA = document.createElement('a');
+						urlA.href = w.url;
+						urlA.target = '_blank';
+						urlA.style.color = 'var(--primary)';
+						urlA.style.textDecoration = 'none';
+						urlA.style.fontSize = '0.8rem';
+						urlA.textContent = 'Open Web ↗';
+						nameTd.appendChild(urlA);
+					}
+
+					const statusTd = document.createElement('td');
+					const badge = document.createElement('span');
+					badge.className = 'badge ' + w.status;
+					badge.textContent = w.status;
+					statusTd.appendChild(badge);
+
+					const actionsTd = document.createElement('td');
+					actionsTd.style.textAlign = 'right';
+					const actionsDiv = document.createElement('div');
+					actionsDiv.className = 'action-buttons';
+					actionsDiv.style.justifyContent = 'flex-end';
+					if (w.status !== 'offline') {
+						const killBtn = document.createElement('button');
+						killBtn.className = 'danger';
+						killBtn.type = 'button';
+						killBtn.textContent = 'Kill';
+						killBtn.addEventListener('click', () => killWorker(w.id));
+						actionsDiv.appendChild(killBtn);
+					}
+					actionsTd.appendChild(actionsDiv);
+
+					tr.appendChild(nameTd);
+					tr.appendChild(statusTd);
+					tr.appendChild(actionsTd);
 				});
 
 				// Remove rows for workers that no longer exist
