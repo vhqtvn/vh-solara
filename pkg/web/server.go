@@ -905,7 +905,15 @@ func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 	filter := messageFilter(r)
 	s.ensureMessages(r.Context(), agg, filter)
 	snap := agg.Store().Snapshot(filter)
-	b, _ := json.Marshal(snap)
+	b, err := json.Marshal(snap)
+	if err != nil {
+		// snap is a well-typed *state.Snapshot, so this cannot fail today; but a
+		// silent discard would mask a future regression. Surface it as a 500
+		// instead of writing a nil slice (which would emit "null" as the body).
+		vhlog.Error("snapshot: marshal failed", "dir", reqDir(r), "err", err)
+		http.Error(w, "snapshot marshal failed", http.StatusInternalServerError)
+		return
+	}
 	// gzip64-wrap on the same opt-in (z=1) + threshold as the stream snapshot.
 	// fetchSessionMessages (refreshOpenSessions) pulls these on a tree reconnect
 	// for every open session — each was shipping a full uncompressed transcript
@@ -1066,15 +1074,23 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		// subscribed above) so no completion event slips through the gap.
 		s.triggerMessageLoad(agg, filter)
 		snap := store.Snapshot(filter)
-		b, _ := json.Marshal(snap)
-		// gzip64-wrap the snapshot when the client opted in (z=1) AND it is large
-		// enough to benefit (a warm open of a loaded session — the megabyte-scale
-		// transcript inlined at snap.Messages[sid]). Small/cold/messageless
-		// snapshots fall under the threshold and ship raw. The envelope mirrors
-		// the cold-load messages.batch gzip64 shape so the client decodes via the
-		// same path; this is what cuts a warm open's end-to-end `snap` transport
-		// ~3.4x (the controller tunnel does not compress at any lower layer).
-		writeRaw(w, snap.Seq, "snapshot", maybeCompressSnapshot(b, wantsCompress(r)))
+		b, err := json.Marshal(snap)
+		if err != nil {
+			// Cannot fail for a well-typed *state.Snapshot today; log and skip
+			// the malformed snapshot write rather than emitting a nil/"null"
+			// frame. baseline still advances to snap.Seq so the live tail does
+			// not replay events already covered by the (would-be) snapshot.
+			vhlog.Warn("stream snapshot: marshal failed, skipping snapshot write", "err", err)
+		} else {
+			// gzip64-wrap the snapshot when the client opted in (z=1) AND it is large
+			// enough to benefit (a warm open of a loaded session — the megabyte-scale
+			// transcript inlined at snap.Messages[sid]). Small/cold/messageless
+			// snapshots fall under the threshold and ship raw. The envelope mirrors
+			// the cold-load messages.batch gzip64 shape so the client decodes via the
+			// same path; this is what cuts a warm open's end-to-end `snap` transport
+			// ~3.4x (the controller tunnel does not compress at any lower layer).
+			writeRaw(w, snap.Seq, "snapshot", maybeCompressSnapshot(b, wantsCompress(r)))
+		}
 		baseline = snap.Seq
 	}
 	flusher.Flush()
@@ -1166,11 +1182,23 @@ func maybeCompressSnapshot(raw []byte, compress bool) []byte {
 	var buf bytes.Buffer
 	gw := gzip.NewWriter(&buf)
 	_, _ = gw.Write(raw) // gzip.Writer.Write does not return a meaningful error mid-stream
-	_ = gw.Close()
-	out, _ := json.Marshal(struct {
+	if err := gw.Close(); err != nil {
+		// gzip.Close flushes the trailer; on failure buf holds an incomplete
+		// gzip stream. The *bytes.Buffer backing writer cannot fail today, but a
+		// silent discard would mask a future regression — fall back to the raw
+		// JSON (the client's decode helper is pass-through when encoding is
+		// absent, so this degrades gracefully rather than shipping corrupt bytes).
+		vhlog.Warn("snapshot: gzip close failed, sending raw", "err", err)
+		return raw
+	}
+	out, err := json.Marshal(struct {
 		Encoding string `json:"encoding"`
 		Data     string `json:"data"`
 	}{Encoding: "gzip64", Data: base64.StdEncoding.EncodeToString(buf.Bytes())})
+	if err != nil {
+		vhlog.Warn("snapshot: marshal gzip64 envelope failed, sending raw", "err", err)
+		return raw
+	}
 	return out
 }
 

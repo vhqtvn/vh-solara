@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/vhqtvn/vh-solara/pkg/opencode"
+	"github.com/vhqtvn/vh-solara/pkg/vhlog"
 )
 
 // Client-facing event kinds. The payload is the raw OpenCode payload, untouched.
@@ -2230,9 +2231,16 @@ func (s *Store) emitMessagesBatchLocked(sid string) {
 		}
 		list = append(list, MessageWithParts{Info: me.info, Parts: parts})
 	}
-	inner, _ := json.Marshal(struct {
+	inner, err := json.Marshal(struct {
 		Messages []MessageWithParts `json:"messages"`
 	}{Messages: list})
+	if err != nil {
+		// Cannot fail for this well-typed anonymous struct today, but a silent
+		// discard would mask a future regression (e.g. a non-marshalable field
+		// added to MessageWithParts). Bail rather than emit a malformed batch.
+		vhlog.Warn("messages.batch: marshal inner failed", "sessionID", sid, "err", err)
+		return
+	}
 	// gzip the inner messages JSON, then base64-encode so the bytes survive
 	// SSE's text/UTF-8 data: framing. Default compression level: the batch is
 	// emitted under s.mu and only on cold-load, so the marginal CPU is fine and
@@ -2240,12 +2248,24 @@ func (s *Store) emitMessagesBatchLocked(sid string) {
 	var buf bytes.Buffer
 	gw := gzip.NewWriter(&buf)
 	_, _ = gw.Write(inner) // gzip.Writer.Write does not return a meaningful error mid-stream
-	_ = gw.Close()
-	payload, _ := json.Marshal(struct {
+	if err := gw.Close(); err != nil {
+		// gzip.Close flushes the trailer; on failure buf holds an incomplete
+		// gzip stream whose base64 would be undecodable on the client. The
+		// *bytes.Buffer backing writer cannot fail today, but do not silently
+		// swallow a future regression — fall back to emitting nothing (the
+		// client re-fetches on the next cold load) instead of corrupt bytes.
+		vhlog.Warn("messages.batch: gzip close failed", "sessionID", sid, "err", err)
+		return
+	}
+	payload, err := json.Marshal(struct {
 		SessionID string `json:"sessionID"`
 		Encoding  string `json:"encoding"`
 		Data      string `json:"data"`
 	}{SessionID: sid, Encoding: "gzip64", Data: base64.StdEncoding.EncodeToString(buf.Bytes())})
+	if err != nil {
+		vhlog.Warn("messages.batch: marshal payload failed", "sessionID", sid, "err", err)
+		return
+	}
 	s.emit(KindMessagesBatch, payload)
 }
 
