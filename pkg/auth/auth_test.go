@@ -234,3 +234,61 @@ func TestAbsURLForwardedProto(t *testing.T) {
 
 // guard against url import being dropped if the test evolves
 var _ = url.Parse
+
+func TestRandToken(t *testing.T) {
+	// Regression baseline for the OAuth state token: it must be non-empty and
+	// differ across calls. A constant/predictable value (e.g. the all-zero bytes
+	// that crypto/rand leaves on failure) would defeat the anti-CSRF state check
+	// in handleCallback.
+	//
+	// The crypto/rand.Read failure path is not exercised here: rand.Read is a
+	// package-level func (not a reassignable var), so injecting a failure would
+	// require an invasive indirection. The path is verified by code inspection —
+	// randToken now propagates the error and its only caller (startOIDC) renders
+	// HTTP 500 instead of proceeding with a predictable token.
+	tok1, err := randToken()
+	if err != nil {
+		t.Fatalf("randToken #1: %v", err)
+	}
+	tok2, err := randToken()
+	if err != nil {
+		t.Fatalf("randToken #2: %v", err)
+	}
+	if tok1 == "" || tok2 == "" {
+		t.Fatal("randToken must return a non-empty token")
+	}
+	if tok1 == tok2 {
+		t.Fatal("randToken must not be deterministic across calls")
+	}
+}
+
+func TestGrantOIDC(t *testing.T) {
+	// Table-driven test of the OIDC session-grant rule (grantOIDC), which
+	// handleCallback mirrors inline. allow-list first (cheap fast-fail), then
+	// the opt-in verified-email gate.
+	cases := []struct {
+		name          string
+		allowListOK   bool
+		emailVerified bool
+		require       bool
+		want          bool
+	}{
+		{"verified + allowed", true, true, false, true},
+		{"verified + allowed + require", true, true, true, true},
+		{"unverified + allowed, gate off → granted", true, false, false, true},
+		{"unverified + allowed, gate on → denied", true, false, true, false},
+		{"verified + disallowed → denied", false, true, false, false},
+		{"verified + disallowed + require → denied", false, true, true, false},
+		{"unverified + disallowed → denied", false, false, false, false},
+		{"unverified + disallowed + require → denied", false, false, true, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cfg := Config{RequireVerifiedEmail: c.require}
+			if got := grantOIDC(c.allowListOK, c.emailVerified, cfg); got != c.want {
+				t.Errorf("grantOIDC(allow=%v, verified=%v, require=%v) = %v, want %v",
+					c.allowListOK, c.emailVerified, c.require, got, c.want)
+			}
+		})
+	}
+}

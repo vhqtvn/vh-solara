@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -13,17 +14,18 @@ import (
 // authFlags holds the --auth-* flag values shared by the public-edge commands
 // (controller, local-server, client-daemon). See docs/architecture/06-auth.md.
 type authFlags struct {
-	mode             string
-	oidcIssuer       string
-	oidcClientID     string
-	oidcClientSecret string
-	oidcRedirectURL  string
-	allowedEmails    []string
-	allowedDomains   []string
-	passphrase       string
-	trustProxyHeader string
-	cookieDomain     string
-	cookieSecure     bool
+	mode                 string
+	oidcIssuer           string
+	oidcClientID         string
+	oidcClientSecret     string
+	oidcRedirectURL      string
+	allowedEmails        []string
+	allowedDomains       []string
+	passphrase           string
+	trustProxyHeader     string
+	cookieDomain         string
+	cookieSecure         bool
+	requireVerifiedEmail bool
 }
 
 // registerAuthFlags adds the --auth-* flags to a command.
@@ -39,6 +41,7 @@ func registerAuthFlags(cmd *cobra.Command, f *authFlags) {
 	cmd.Flags().StringVar(&f.trustProxyHeader, "auth-trust-proxy", "", "(trust-proxy) Identity header set by a fronting proxy, e.g. X-Forwarded-Email")
 	cmd.Flags().StringVar(&f.cookieDomain, "auth-cookie-domain", "", "Session cookie domain; empty = host-only, .example.com = shared across worker subdomains")
 	cmd.Flags().BoolVar(&f.cookieSecure, "auth-cookie-secure", true, "Set the Secure flag on the session cookie (disable only for plain-HTTP local testing)")
+	cmd.Flags().BoolVar(&f.requireVerifiedEmail, "auth-require-verified-email", false, "(oidc) Require the provider to assert email_verified even when the email matches the allow-list (env: VH_AUTH_REQUIRE_VERIFIED_EMAIL)")
 }
 
 // config assembles an auth.Config, preferring env vars for secrets.
@@ -51,18 +54,28 @@ func (f *authFlags) config() auth.Config {
 	if v := os.Getenv("VH_AUTH_PASSPHRASE"); v != "" {
 		pass = v
 	}
+	// Bool env: an explicit VH_AUTH_REQUIRE_VERIFIED_EMAIL overrides the flag
+	// default (unset/empty → keep the flag value). Accepts strconv.ParseBool
+	// values (true/false/1/0/T/F/...); an unparseable value is ignored.
+	requireVerified := f.requireVerifiedEmail
+	if v := os.Getenv("VH_AUTH_REQUIRE_VERIFIED_EMAIL"); v != "" {
+		if parsed, err := strconv.ParseBool(v); err == nil {
+			requireVerified = parsed
+		}
+	}
 	return auth.Config{
-		Mode:             auth.Mode(f.mode),
-		OIDCIssuer:       f.oidcIssuer,
-		OIDCClientID:     f.oidcClientID,
-		OIDCClientSecret: secret,
-		OIDCRedirectURL:  f.oidcRedirectURL,
-		AllowedEmails:    f.allowedEmails,
-		AllowedDomains:   f.allowedDomains,
-		Passphrase:       pass,
-		TrustProxyHeader: f.trustProxyHeader,
-		CookieDomain:     f.cookieDomain,
-		Secure:           f.cookieSecure,
+		Mode:                 auth.Mode(f.mode),
+		OIDCIssuer:           f.oidcIssuer,
+		OIDCClientID:         f.oidcClientID,
+		OIDCClientSecret:     secret,
+		OIDCRedirectURL:      f.oidcRedirectURL,
+		AllowedEmails:        f.allowedEmails,
+		AllowedDomains:       f.allowedDomains,
+		Passphrase:           pass,
+		TrustProxyHeader:     f.trustProxyHeader,
+		CookieDomain:         f.cookieDomain,
+		Secure:               f.cookieSecure,
+		RequireVerifiedEmail: requireVerified,
 	}
 }
 

@@ -31,7 +31,13 @@ func (a *Authenticator) handleLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *Authenticator) startOIDC(w http.ResponseWriter, r *http.Request) {
-	state := randToken()
+	state, err := randToken()
+	if err != nil {
+		// The system CSPRNG is unavailable: do NOT fall back to a weak token — a
+		// predictable OAuth state would defeat the CSRF check in handleCallback.
+		http.Error(w, "could not generate secure OAuth state token", http.StatusInternalServerError)
+		return
+	}
 	verifier := oauth2.GenerateVerifier()
 	a.sessions.Put(r.Context(), sessStateKey, state)
 	a.sessions.Put(r.Context(), sessVerifierKey, verifier)
@@ -81,6 +87,13 @@ func (a *Authenticator) handleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 	if !a.emailAllowed(claims.Email) {
 		a.serveLoginPage(w, "Account "+html.EscapeString(claims.Email)+" is not allowed.")
+		return
+	}
+	// Opt-in verified-email gate (mirrors grantOIDC): when enabled, an identity
+	// that passed the allow-list is still denied unless the provider asserts the
+	// email is verified. Default off preserves historical behaviour.
+	if a.cfg.RequireVerifiedEmail && !claims.EmailVerified {
+		a.serveLoginPage(w, "Account "+html.EscapeString(claims.Email)+" email is not verified by the provider.")
 		return
 	}
 
@@ -190,11 +203,16 @@ func (a *Authenticator) serveLoginPage(w http.ResponseWriter, msg string) {
 </form></body></html>`))
 }
 
-// randToken returns a URL-safe 256-bit random string for the OAuth state.
-func randToken() string {
+// randToken returns a URL-safe 256-bit random string for the OAuth state. A
+// non-nil error means the system CSPRNG is unavailable; callers MUST propagate
+// it and must not fall back to a weak token (a predictable OAuth state defeats
+// the anti-CSRF check in handleCallback).
+func randToken() (string, error) {
 	b := make([]byte, 32)
-	_, _ = rand.Read(b)
-	return base64.RawURLEncoding.EncodeToString(b)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
 }
 
 // sameOrigin reports whether an Origin header's host matches the request Host.

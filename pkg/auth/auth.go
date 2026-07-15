@@ -56,6 +56,12 @@ type Config struct {
 	// SSO across workers). Secure should be true whenever traffic is TLS.
 	CookieDomain string
 	Secure       bool
+
+	// RequireVerifiedEmail (oidc, opt-in): when true, an identity whose email
+	// passes the allow-list is still denied unless the OIDC provider asserts
+	// email_verified. Default false preserves historical behaviour (allow-list
+	// alone grants a session). See grantOIDC / handleCallback.
+	RequireVerifiedEmail bool
 }
 
 // Authenticator holds the live auth state: the session manager and, for OIDC,
@@ -225,6 +231,22 @@ func (a *Authenticator) emailAllowed(email string) bool {
 		}
 	}
 	return false
+}
+
+// grantOIDC encodes the OIDC session-grant rule and exists to be unit-tested in
+// isolation: an identity must pass the allow-list, and — when RequireVerifiedEmail
+// is set — must additionally carry a provider-verified email. allowListOK is the
+// precomputed result of emailAllowed(email) so callers keep one allow-list pass.
+// handleCallback mirrors this rule inline (allow-list first, then the verified
+// gate) so it can render distinct user-facing messages.
+func grantOIDC(allowListOK, emailVerified bool, cfg Config) bool {
+	if !allowListOK {
+		return false
+	}
+	if cfg.RequireVerifiedEmail && !emailVerified {
+		return false
+	}
+	return true
 }
 
 // checkPassphrase compares in constant time so a wrong guess can't be timed.
