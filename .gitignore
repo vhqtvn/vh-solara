@@ -84,6 +84,16 @@ pkg/web/dist/*
 .opencode/plans/
 .opencode/runs/
 .opencode/scripts/__pycache__/
+
+# Harness repo-configs project-local overrides (NOT committed). `*.local.json`
+# is the project-local override surface for the v0.10.0 harness 4-level config
+# precedence; `auto-gate-llm.json` is the auto-tool-gate / auto-classifier-pilot
+# config kept local. The committed harness-generated configs under
+# .opencode/repo-configs/ (allowed-commands.js, forbidden-patterns*.js,
+# repo-recon-data.yml) match none of these and stay tracked.
+.opencode/repo-configs/*.local.json
+.opencode/repo-configs/auto-gate-llm.json
+
 .git/commit-gate/
 __pycache__/
 .pytest_cache/
