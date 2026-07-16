@@ -51,8 +51,8 @@ func applyDelta(s *Store, sessionID, messageID, partID, field, delta string) {
 // accumulated length (full unmarshal + string copy + full marshal per char);
 // with the native accumulator it is amortized O(n). The throttle window is
 // stretched to an hour so all but the first delta land in the buffer and the
-// final Snapshot() is what materializes them — proving the accumulator, not
-// per-delta flushes, holds the truth.
+// final Snapshot() projection (projectPartLocked overlay) is what materializes
+// them — proving the accumulator, not per-delta flushes, holds the truth.
 func TestDeltaCoalesce_ExactTextLongStream(t *testing.T) {
 	withFlushInterval(t, time.Hour)
 
@@ -88,7 +88,8 @@ func TestDeltaCoalesce_AuthoritativeReconciliation(t *testing.T) {
 	s.Apply(ev("message.updated", `{"info":{"id":"m1","sessionID":"sess","role":"assistant"}}`))
 	s.Apply(ev("message.part.updated", `{"part":{"id":"p1","sessionID":"sess","messageID":"m1","type":"text","text":""}}`))
 
-	// Stream some text, then materialize it via Snapshot (forces a flush).
+	// Stream some text, then materialize it via Snapshot projection (overlay
+	// of the buffered deltaBuf onto a fresh part copy).
 	applyDelta(s, "sess", "m1", "p1", "text", "abc")
 	if got := partText(s.Snapshot(nil), "sess", "p1"); got != "abc" {
 		t.Fatalf("pre-snapshot text: want %q got %q", "abc", got)
@@ -171,7 +172,8 @@ func TestDeltaCoalesce_ThrottleBoundedEmits(t *testing.T) {
 		t.Fatalf("throttle failed: want exactly 1 part.upsert emit for %d deltas in one window, got %d", n, emits)
 	}
 
-	// Final text must still be exactly correct (Snapshot forces the buffered flush).
+	// Final text must still be exactly correct (Snapshot projects the buffered
+	// deltaBuf onto the returned part; the live-tail contract holds under throttle).
 	if got := partText(s.Snapshot(nil), "sess", "p1"); got != want.String() {
 		t.Fatalf("final text wrong despite throttle: want len %d, got len %d", want.Len(), len(got))
 	}
@@ -224,8 +226,9 @@ func TestDeltaCoalesce_ConcurrentNoRace(t *testing.T) {
 		s.Apply(ev("session.created", `{"info":{"id":"structural"}}`))
 	}()
 
-	// A concurrent Snapshot reader (exercises the Snapshot→flush path racing
-	// against the delta appends).
+	// A concurrent Snapshot reader (exercises the read-side projection path —
+	// projectPartLocked overlay of deltaBuf onto fresh part copies — racing
+	// against the delta appends, under RLock).
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -322,9 +325,12 @@ func TestDeltaCoalesce_ColdLoadPreservesUnflushedDeltaBuf(t *testing.T) {
 		Parts: []json.RawMessage{json.RawMessage(`{"id":"p1","sessionID":"sess","messageID":"m1","type":"text","text":"fetched-stale"}`)},
 	}})
 
-	// Snapshot forces a flush of the (surviving) deltaBuf → the FULL live-
-	// accumulated text "live-tail" must be present: not the stale "fetched-stale"
-	// (part-body guard) and not just the flushed prefix "live-" (deltaBuf guard).
+	// Snapshot projects the (surviving) deltaBuf onto the output via
+	// projectPartLocked — the FULL live-accumulated text "live-tail" must be
+	// present: not the stale "fetched-stale" (part-body guard) and not just the
+	// flushed prefix "live-" (deltaBuf guard). (Pre-purity Snapshot did this via
+	// a flush back into me.parts; the output contract is unchanged — only the
+	// mechanism switched to a read-only projection overlay.)
 	if got := partText(s.Snapshot(nil), "sess", "p1"); got != "live-tail" {
 		t.Fatalf("unflushed deltaBuf lost across cold-load reconcile: want %q, got %q "+
 			"(store.go:2090 guard failed — only the flushed prefix survived)", "live-tail", got)

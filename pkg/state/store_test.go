@@ -186,6 +186,21 @@ func partText(snap Snapshot, sid, partID string) string {
 	return ""
 }
 
+// partTextFromRaw decodes a single part json.RawMessage (as stored in
+// me.parts[partID]) and returns its "text" field. Used by purity assertions
+// that inspect the STORE's internal me.parts (not a Snapshot projection, which
+// overlays buffered deltas) to prove Snapshot did not write back into me.parts.
+func partTextFromRaw(t *testing.T, raw json.RawMessage) string {
+	t.Helper()
+	var p struct {
+		Text string
+	}
+	if err := json.Unmarshal(raw, &p); err != nil {
+		t.Fatalf("partTextFromRaw unmarshal %q: %v", string(raw), err)
+	}
+	return p.Text
+}
+
 func TestPartDeltaAccumulatesStreaming(t *testing.T) {
 	s := New(100)
 	s.Apply(ev("message.updated", `{"info":{"id":"m1","sessionID":"a","role":"assistant"}}`))
@@ -1553,26 +1568,39 @@ func seedOnePartSession(s *Store, sid, text string) {
 	s.Apply(ev("message.part.updated", `{"part":{"id":"p1","sessionID":"`+sid+`","messageID":"m1","type":"text","text":"`+text+`"}}`))
 }
 
-// TestColdBatchSnapshotFlushBumpsRev is the proving test for Finding 1: a
-// Snapshot-driven flushPartDeltasLocked that rewrites me.parts MUST bump the
-// owning session's message revision, otherwise a concurrently-packaging cold
-// batch validates against the SAME (pre-Snapshot) revision and emits the OLD
-// captured projection OVER the freshly-flushed newer text.
+// TestSnapshotDoesNotMutateColdBatchCapture is the proving test for the
+// Snapshot purity invariant (sub-phase 2.2): Snapshot is a PURE READ
+// PROJECTION — it must NOT mutate me.parts and must NOT bump the per-session
+// message revision, otherwise it would invalidate a concurrently-packaging
+// cold batch's captured (revision, projection) pair.
+//
+// Pre-purity behavior (the OLD code this test replaces): Snapshot called
+// flushPartDeltasLocked(s, false), which REWROTE me.parts from "BASEA" to
+// "BASEAB" and bumped the revision; that forced a mid-package cold batch to be
+// discarded+retried. TestColdBatchSnapshotFlushBumpsRev (the test this one
+// replaces) asserted the OLD behavior: exactly one batch carrying "BASEAB".
+//
+// Post-purity behavior (the NEW invariant this test asserts): Snapshot overlays
+// buffered deltas onto a FRESHLY-ALLOCATED copy (projectPartLocked) without
+// touching me.parts, and does not bump the revision. So a cold batch captured
+// mid-package with text "BASEA" + token T validates (T==T) and emits "BASEA"
+// unchanged — no discard, no retry, exactly one batch.
 //
 // Reproduction (via coldBatchAfterCaptureHook + a large deltaFlushInterval):
 //  1. Seed part p1 text "BASE"; apply delta "A" (first delta flushes → me.parts
 //     "BASEA") and delta "B" immediately (throttled → stays in deltaBuf, so
 //     me.parts lags at "BASEA" while the accumulator holds "BASEAB").
 //  2. publishColdBatch captures me.parts ("BASEA") + token T, blocks in the hook.
-//  3. Snapshot({sid}) flushes deltaBuf → me.parts "BASEAB". WITH the fix this
-//     bumps the token to T+1; WITHOUT the fix the token stays T.
-//  4. Release: publishColdBatch re-reads the token. WITH the fix T+1≠T →
-//     discard, retry captures "BASEAB", emit. WITHOUT the fix T==T → emit
-//     "BASEA" (the pre-Snapshot text leaks through over the flushed state).
+//  3. Snapshot({sid}) must NOT mutate me.parts ("BASEA") NOR bump the token.
+//     (Its OUTPUT still reflects "BASEAB" via projectPartLocked — verified
+//     separately below — but the STORE is untouched.)
+//  4. Release: publishColdBatch re-reads the token. T==T → emit "BASEA"
+//     unchanged, no retry.
 //
-// Assert: exactly ONE batch carrying "BASEAB" (both deltas applied), never
-// "BASEA". Fails without the Finding 1 fix (Snapshot flush would not bump).
-func TestColdBatchSnapshotFlushBumpsRev(t *testing.T) {
+// Assert: exactly ONE batch carrying "BASEA" (the captured text, unchanged).
+// Fails if Snapshot regresses to mutating me.parts / bumping the revision
+// (which would instead produce a discard+retry emitting "BASEAB").
+func TestSnapshotDoesNotMutateColdBatchCapture(t *testing.T) {
 	// Force throttling so the second delta stays buffered (deterministic,
 	// independent of host scheduling jitter).
 	prevInterval := deltaFlushInterval
@@ -1587,11 +1615,23 @@ func TestColdBatchSnapshotFlushBumpsRev(t *testing.T) {
 	// me.parts still "BASEA" but the accumulator holds "BASEAB".
 	s.Apply(ev("message.part.delta", `{"sessionID":"snap","messageID":"m1","partID":"p1","field":"text","delta":"B"}`))
 
+	// Sanity: confirm the projection contract holds BEFORE the cold-batch dance —
+	// Snapshot's OUTPUT must reflect the buffered "B" via overlay, even though
+	// me.parts lags at "BASEA". This proves the snapshot still carries the live
+	// accumulated text without flushing it into the store.
+	if got := partText(s.Snapshot(map[string]bool{"snap": true}), "snap", "p1"); got != "BASEAB" {
+		t.Fatalf("snapshot output pre-batch: want BASEAB (projection overlay), got %q", got)
+	}
+
 	ch, unsub := s.Subscribe(256)
 	defer unsub()
 	drainAll(ch)
 
 	capturedCh, releaseCh := startBlockedColdBatch(t, "snap")
+
+	// Record the pre-Snapshot revision token so we can assert Snapshot left it
+	// untouched.
+	preRev := s.msgRev["snap"]
 
 	done := make(chan struct{})
 	go func() {
@@ -1603,20 +1643,33 @@ func TestColdBatchSnapshotFlushBumpsRev(t *testing.T) {
 	}()
 	<-capturedCh
 
-	// Snapshot flushes deltaBuf → me.parts "BASEAB". With the Finding 1 fix it
-	// ALSO bumps the revision token; without the fix it does not (the bug).
+	// Snapshot must be a pure read here: NO mutation of me.parts, NO rev bump.
 	s.Snapshot(map[string]bool{"snap": true})
+
+	// Purity assertion 1: the revision token is unchanged by Snapshot.
+	if postRev := s.msgRev["snap"]; postRev != preRev {
+		t.Fatalf("Snapshot mutated msgRev: pre=%d post=%d (purity violated)", preRev, postRev)
+	}
+	// Purity assertion 2: me.parts still holds the pre-Snapshot "BASEA" (the
+	// buffered "B" was NOT flushed back into the store).
+	s.mu.RLock()
+	me := s.messages["snap"].byID["m1"]
+	gotStored := partTextFromRaw(t, me.parts["p1"])
+	s.mu.RUnlock()
+	if gotStored != "BASEA" {
+		t.Fatalf("Snapshot mutated me.parts: want BASEA (pure read), got %q", gotStored)
+	}
 
 	close(releaseCh)
 	<-done
 
 	batches := collectBatches(t, ch)
 	if len(batches) != 1 {
-		t.Fatalf("want exactly 1 batch, got %d", len(batches))
+		t.Fatalf("want exactly 1 batch (no discard/retry — Snapshot is pure), got %d", len(batches))
 	}
 	got := partTextFromBatch(t, batches[0].Payload, "snap", "m1", "p1")
-	if got != "BASEAB" {
-		t.Fatalf("batch text: want BASEAB (post-Snapshot flush), got %q (pre-Snapshot text leaked through)", got)
+	if got != "BASEA" {
+		t.Fatalf("batch text: want BASEA (captured text, unchanged by pure Snapshot), got %q", got)
 	}
 }
 
@@ -2142,14 +2195,18 @@ func TestSnapshotScopedOmitsUnselected(t *testing.T) {
 	}
 }
 
-// TestSnapshotScopedFlushConverges proves the delta-flush scoping invariant: a
-// scoped Snapshot flushes ONLY the selected sessions' streaming accumulators,
-// and an unselected session's BUFFERED (unflushed) deltas stay intact in
-// deltaBuf and converge on the next full Snapshot(nil) — no data loss. The
-// throttle window is stretched to an hour so all deltas after the first land
-// (and stay) in the buffer; only a Snapshot flush materializes them. (The other
-// half of the invariant — deltaBuf ownership is strictly per messageEntry with
-// no cross-session state — is structural; see flushPartDeltasLocked.)
+// TestSnapshotScopedFlushConverges proves the scoping invariant for the
+// read-side projection: a scoped Snapshot PROJECTS (overlays onto fresh
+// copies) ONLY the selected sessions' buffered streaming accumulators, and an
+// unselected session's BUFFERED deltas stay intact in deltaBuf and converge on
+// the next full Snapshot(nil) — no data loss. The throttle window is stretched
+// to an hour so all deltas after the first land (and stay) in the buffer; only
+// a Snapshot projection materializes them (the live-tail contract). Note the
+// projection does NOT write back into me.parts (Snapshot is observationally
+// pure — see TestSnapshotIsObservationallyPure); it overlays onto the returned
+// copy. (The other half of the invariant — deltaBuf ownership is strictly per
+// messageEntry with no cross-session state — is structural; see
+// flushPartDeltasLocked, the write-side path.)
 func TestSnapshotScopedFlushConverges(t *testing.T) {
 	withFlushInterval(t, time.Hour)
 
@@ -2169,19 +2226,407 @@ func TestSnapshotScopedFlushConverges(t *testing.T) {
 	// (correctly) omitted from messages.
 	scoped := s.Snapshot(map[string]bool{"a": true})
 	if got := partText(scoped, "a", "p_a"); got != "A1A2" {
-		t.Fatalf(`scoped snapshot must flush selected "a"'s buffered deltas, want A1A2, got %q`, got)
+		t.Fatalf(`scoped snapshot must project selected "a"'s buffered deltas, want A1A2, got %q`, got)
 	}
 	if _, ok := scoped.Messages["b"]; ok {
 		t.Fatal(`scoped snapshot must NOT ship unselected "b"'s messages`)
 	}
 
 	// Full snapshot must converge "b"'s still-buffered deltas (B1B2) — proving
-	// the scoped flush did not drop them.
+	// the scoped projection did not drop them (deltaBuf is untouched by the
+	// read-side projection; the writer's accumulator survives).
 	full := s.Snapshot(nil)
 	if got := partText(full, "b", "p_b"); got != "B1B2" {
 		t.Fatalf(`full Snapshot(nil) must converge unselected "b"'s buffered deltas (no data loss), want B1B2, got %q`, got)
 	}
 	if got := partText(full, "a", "p_a"); got != "A1A2" {
 		t.Fatalf(`full Snapshot(nil) must retain "a"'s materialized text, want A1A2, got %q`, got)
+	}
+}
+
+// messageInternalsSnapshot captures the subset of a messageEntry's mutable
+// internal state that a PURE Snapshot must NOT disturb: the me.parts byte
+// slices, the deltaBuf accumulator contents (per key, the Builder's current
+// text), deltaLastEmit, and the partOrder. Used by
+// TestSnapshotIsObservationallyPure to prove Snapshot leaves the store's
+// internals byte-identical.
+type messageInternalsSnapshot struct {
+	parts           map[string][]byte
+	deltaBufText    map[string]string
+	deltaLastEmit   time.Time
+	liveTouchedBody bool
+	partOrder       []string
+}
+
+// storeInternalsSnapshot is the store-wide aggregate captured by
+// captureStoreInternals: every messageEntry's internals plus the Store-level
+// mutable counters (seq, ring head/count, subscriber id counter, subscriber
+// count). A pure Snapshot leaves ALL of these byte-identical.
+type storeInternalsSnapshot struct {
+	parts     map[string]map[string]messageInternalsSnapshot
+	seq       uint64
+	ringHead  int
+	ringCount int
+	nextSub   int
+	numSubs   int
+}
+
+func captureMessageInternals(me *messageEntry) messageInternalsSnapshot {
+	out := messageInternalsSnapshot{
+		parts:           make(map[string][]byte, len(me.parts)),
+		deltaBufText:    make(map[string]string, len(me.deltaBuf)),
+		deltaLastEmit:   me.deltaLastEmit,
+		liveTouchedBody: me.liveTouchedBody,
+		partOrder:       append([]string(nil), me.partOrder...),
+	}
+	for k, v := range me.parts {
+		out.parts[k] = append([]byte(nil), v...)
+	}
+	for k, b := range me.deltaBuf {
+		if b != nil {
+			out.deltaBufText[k] = b.String()
+		}
+	}
+	return out
+}
+
+// TestSnapshotIsObservationallyPure is the headline purity gate for sub-phase
+// 2.2: Snapshot must be a PURE READ PROJECTION that mutates NO store state. It
+// builds a store with buffered streaming deltas (some flushed into me.parts,
+// some still in deltaBuf), captures the per-messageEntry internal fields a
+// write-back would disturb, calls Snapshot TWICE (once full firehose, once
+// scoped), then re-captures and asserts byte-identical internals. It also
+// asserts both snapshots produce identical OUTPUT for an in-scope session (a
+// pure read over unchanged state is deterministic).
+//
+// SCOPE OF CAPTURE: it captures me.parts, me.deltaBuf (Builder text),
+// me.deltaLastEmit, me.liveTouchedBody, me.partOrder, plus Store-level seq /
+// ring head+count / subscriber id+count. It does NOT capture Store-level
+// msgRev / nextMsgRev (those are bumped ONLY on the Apply write path and are
+// NOT touched by a read-only Snapshot — asserting them here would be
+// redundant with the "Snapshot never calls bumpMsgRev" contract) nor the
+// per-part liveTouchedParts map (only set while a cold GET is in flight, which
+// this test never triggers). The capture is the set of fields a HISTORICAL
+// flush-back would have mutated, not an exhaustive dump of every Store field.
+//
+// Fails if Snapshot regresses to the HISTORICAL mutating path (calling the
+// write-side flushPartDeltasLocked, which would rewrite me.parts, bump nothing
+// here, but still mutate me.parts and the deltaBuf-adjacent state) or to
+// mutating ANY captured field.
+func TestSnapshotIsObservationallyPure(t *testing.T) {
+	// Stretch the throttle window so deltas after the first stay buffered —
+	// this is what gives Snapshot something to project (deltaBuf non-empty).
+	withFlushInterval(t, time.Hour)
+
+	s := New(100)
+	for _, sid := range []string{"a", "b"} {
+		s.Apply(ev("session.created", `{"info":{"id":"`+sid+`"}}`))
+		s.Apply(ev("message.updated", `{"info":{"id":"m_`+sid+`","sessionID":"`+sid+`","role":"assistant"}}`))
+		s.Apply(ev("message.part.updated", `{"part":{"id":"p_`+sid+`","sessionID":"`+sid+`","messageID":"m_`+sid+`","type":"text","text":""}}`))
+	}
+	// First delta of a burst always flushes → me.parts "A1"/"B1"; the second
+	// delta buffers (deltaFlushInterval=time.Hour) → deltaBuf non-empty, me.parts
+	// lags. This is exactly the state whose projection overlay a flush would
+	// disturb.
+	applyDelta(s, "a", "m_a", "p_a", "text", "A1")
+	applyDelta(s, "a", "m_a", "p_a", "text", "A2") // buffered
+	applyDelta(s, "b", "m_b", "p_b", "text", "B1")
+	applyDelta(s, "b", "m_b", "p_b", "text", "B2") // buffered
+
+	// Subscribe so the subscriber-side state (s.subs, s.next) is also in scope
+	// for purity: a pure Snapshot must not add/remove subscribers.
+	ch, unsub := s.Subscribe(8)
+	defer unsub()
+	drainAll(ch)
+
+	// Capture the full set of internal fields a flush or emit would touch.
+	captureStoreInternals := func() storeInternalsSnapshot {
+		out := storeInternalsSnapshot{
+			parts: map[string]map[string]messageInternalsSnapshot{},
+		}
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		for sid, sm := range s.messages {
+			out.parts[sid] = map[string]messageInternalsSnapshot{}
+			for mid, me := range sm.byID {
+				out.parts[sid][mid] = captureMessageInternals(me)
+			}
+		}
+		out.seq = s.seq
+		if s.ring != nil {
+			out.ringHead = s.ring.head
+			out.ringCount = s.ring.count
+		}
+		out.nextSub = s.next
+		out.numSubs = len(s.subs)
+		return out
+	}
+
+	before := captureStoreInternals()
+
+	// Two snapshots back-to-back: full firehose + scoped. A pure read leaves
+	// the store byte-identical and produces deterministic in-scope output.
+	fullSnap := s.Snapshot(nil)
+	scopedSnap := s.Snapshot(map[string]bool{"a": true})
+
+	after := captureStoreInternals()
+
+	// Purity assertion 1: every captured internal field is byte-identical.
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("Snapshot mutated store internals:\nbefore=%+v\nafter =%+v", before, after)
+	}
+
+	// Purity assertion 2: the in-scope session "a" produces identical output in
+	// the full and scoped snapshots (a pure read over unchanged state is
+	// deterministic — and the scoped path overlays deltaBuf exactly like the
+	// full path).
+	if gotFull, gotScoped := partText(fullSnap, "a", "p_a"), partText(scopedSnap, "a", "p_a"); gotFull != gotScoped {
+		t.Fatalf("in-scope output drifted between full and scoped snapshots: full=%q scoped=%q", gotFull, gotScoped)
+	}
+	// And the projection overlay itself still works — the buffered "A2" must
+	// appear in the snapshot OUTPUT even though me.parts["p_a"] still holds
+	// only "A1" (proven by the deep-equal assertion above).
+	if got := partText(scopedSnap, "a", "p_a"); got != "A1A2" {
+		t.Fatalf("scoped snapshot projection must overlay buffered A2, want A1A2, got %q", got)
+	}
+}
+
+// TestSnapshotConcurrentWithApply is the headline race/deadlock gate for the
+// Snapshot RLock move (sub-phase 2.3): multiple goroutines take snapshots
+// (full firehose AND scoped) while a writer concurrently applies part deltas
+// and message upserts. Under -race this must report no data race; the
+// goroutines must all complete (no deadlock from RLock/Lock interaction).
+//
+// The signal is race-clean + completion within the test timeout — NOT a
+// precise wall-clock overlap assertion (RLock-vs-Lock scheduling is host-
+// dependent). The store's existing single-writer serialization still holds:
+// Apply takes s.mu (write), Snapshot takes s.mu.RLock (read); concurrent
+// Snapshots overlap with each other and serialize only against the writer.
+func TestSnapshotConcurrentWithApply(t *testing.T) {
+	s := New(64)
+	for _, sid := range []string{"x", "y"} {
+		s.Apply(ev("session.created", `{"info":{"id":"`+sid+`"}}`))
+		s.Apply(ev("message.updated", `{"info":{"id":"m_`+sid+`","sessionID":"`+sid+`","role":"assistant"}}`))
+		s.Apply(ev("message.part.updated", `{"part":{"id":"p_`+sid+`","sessionID":"`+sid+`","messageID":"m_`+sid+`","type":"text","text":""}}`))
+	}
+
+	const mutations = 300
+	const snapsFull = 150
+	const snapsScoped = 150
+	var wg sync.WaitGroup
+
+	// Writer: rapidly applies part deltas (which append to deltaBuf and may
+	// trigger a throttled flush rewriting me.parts) and occasional authoritative
+	// message.part.updated upserts. This exercises both the deltaBuf path and
+	// the direct me.parts-replace path against concurrent Snapshot readers.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < mutations; i++ {
+			sid := "x"
+			if i%2 == 0 {
+				sid = "y"
+			}
+			s.Apply(ev("message.part.delta",
+				`{"sessionID":"`+sid+`","messageID":"m_`+sid+`","partID":"p_`+sid+`","field":"text","delta":"d`+strconv.Itoa(i)+`"}`))
+			// Every 7th iteration, an authoritative overwrite resets the part
+			// text and discards the buffered accumulator — exercises the
+			// me.parts replace path under concurrent readers.
+			if i%7 == 0 {
+				s.Apply(ev("message.part.updated",
+					`{"part":{"id":"p_`+sid+`","sessionID":"`+sid+`","messageID":"m_`+sid+`","type":"text","text":"reset`+strconv.Itoa(i)+`"}}`))
+			}
+		}
+	}()
+
+	// Reader A: full firehose snapshots.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < snapsFull; i++ {
+			snap := s.Snapshot(nil)
+			// Smoke-check the shape so a non-deterministic panic (e.g. nil-map
+			// access from a torn read) surfaces here rather than silently.
+			_ = snap.Seq
+			_ = len(snap.Messages)
+			_ = len(snap.Sessions)
+		}
+	}()
+
+	// Reader B: scoped snapshots. Two concurrent scoped readers + the full
+	// reader above prove RLock overlap among readers.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < snapsScoped; i++ {
+			snap := s.Snapshot(map[string]bool{"x": true})
+			_ = snap.Seq
+			// "x" is in scope; "y" must be absent from the scoped messages map
+			// (shape contract — verify it doesn't drift under concurrency).
+			if _, ok := snap.Messages["x"]; !ok {
+				// "x" is being mutated concurrently; it always exists in
+				// s.sessions, so its messages entry should always ship. A miss
+				// would indicate a torn read.
+				t.Errorf("scoped snapshot missing in-scope session x messages")
+				return
+			}
+			// The UNSELECTED session "y" must NEVER leak into a snapshot scoped
+			// to {"x": true} — not into messages, nor any per-session map. This
+			// is the scope-leak guard; a regression that dropped the inScope
+			// gate on any field would surface here under the concurrent writer.
+			if _, ok := snap.Messages["y"]; ok {
+				t.Errorf("scoped snapshot leaked unselected session y into messages")
+				return
+			}
+			if _, ok := snap.Gate["y"]; ok {
+				t.Errorf("scoped snapshot leaked unselected session y into gate")
+				return
+			}
+			if _, ok := snap.Activity["y"]; ok {
+				t.Errorf("scoped snapshot leaked unselected session y into activity")
+				return
+			}
+		}
+	}()
+
+	wg.Wait()
+}
+
+// TestSnapshotCopiesAllRawMessageBytes is the proving test for the Snapshot
+// copy invariant (Finding 1): EVERY json.RawMessage byte that escapes the RLock
+// must be a FRESH copy, never aliasing a store-owned backing array. It builds a
+// store with every RawMessage-bearing snapshot field populated (gate tokens,
+// currentVerb state, session info, message info + parts, todos, permissions,
+// questions, statuses), takes a snapshot, OVERWRITES every byte of every
+// returned RawMessage slice in-place with a sentinel, then takes a SECOND
+// snapshot and asserts the second snapshot's bytes are UNCHANGED (the store was
+// not corrupted).
+//
+// On the PRE-FIX code, mutating snap.Gate[sid].Tokens and
+// snap.CurrentVerbs[sid].State corrupted se.lastTokens / se.currentVerb.State
+// (the snapshot slices aliased the store-owned backing arrays), so the second
+// snapshot read the corrupted bytes and this test FAILED. After the copy fix
+// (append([]byte(nil), ...) for Tokens; a fresh VerbFacet with copied State for
+// CurrentVerbs) it PASSES. The remaining fields (Sessions/Messages/Todos/etc.)
+// were ALREADY copied via projectPartLocked / append([]byte(nil), ...); their
+// rows here are regression guards that catch any future revert of those copies.
+func TestSnapshotCopiesAllRawMessageBytes(t *testing.T) {
+	s := New(100)
+	s.Apply(ev("session.created", `{"info":{"id":"a","title":"root"}}`))
+	// A completed assistant turn with token usage → populates se.lastTokens.
+	s.Apply(ev("message.updated", `{"info":{"id":"m1","sessionID":"a","role":"assistant","time":{"created":1,"completed":2},"finish":"stop","tokens":{"input":10,"output":20,"total":30}}}`))
+	// A running tool part → populates se.currentVerb (Tool + State).
+	s.Apply(ev("message.part.updated", `{"part":{"id":"p1","sessionID":"a","messageID":"m1","type":"tool","tool":"read","state":{"status":"running","input":{"filePath":"src/parser.go"},"time":{"start":4000}}}}`))
+	// A text part → makes Messages[].Parts non-empty with a real base to copy.
+	s.Apply(ev("message.part.updated", `{"part":{"id":"p2","sessionID":"a","messageID":"m1","type":"text","text":"hello"}}`))
+	// The remaining RawMessage-bearing snapshot fields.
+	s.Apply(ev("todo.updated", `{"sessionID":"a","todos":[{"content":"ship it"}]}`))
+	s.Apply(ev("permission.asked", `{"id":"per_1","sessionID":"a","permission":"bash","title":"run x"}`))
+	s.Apply(ev("question.asked", `{"id":"q_1","sessionID":"a"}`))
+	s.Apply(ev("session.status", `{"sessionID":"a","status":{"type":"busy","message":"working"}}`))
+
+	snap1 := s.Snapshot(nil)
+
+	// saveAndCorrupt returns a pristine COPY of b and then OVERWRITES every byte
+	// of b's backing array in place. If b aliases a store-owned backing array,
+	// the in-place write corrupts the store (caught by the second snapshot).
+	saveAndCorrupt := func(b json.RawMessage) []byte {
+		pristine := append([]byte(nil), b...)
+		for i := range b {
+			b[i] = 0x01 // invalid-in-JSON sentinel
+		}
+		return pristine
+	}
+
+	// Headline (Finding 1): gate tokens + current-verb state.
+	wantTokens := saveAndCorrupt(snap1.Gate["a"].Tokens)
+	verb := snap1.CurrentVerbs["a"]
+	wantVerbState := saveAndCorrupt(verb.State)
+
+	// Regression guards for every OTHER RawMessage-bearing snapshot field.
+	wantSessionInfo := saveAndCorrupt(snap1.Sessions[0])
+	var wantMsgInfo []byte
+	var wantMsgParts [][]byte
+	for _, m := range snap1.Messages["a"] {
+		wantMsgInfo = saveAndCorrupt(m.Info)
+		for _, p := range m.Parts {
+			wantMsgParts = append(wantMsgParts, saveAndCorrupt(p))
+		}
+	}
+	wantTodo := saveAndCorrupt(snap1.Todos["a"])
+	wantStatus := saveAndCorrupt(snap1.Statuses["a"])
+	var wantPerms, wantQuestions [][]byte
+	for _, p := range snap1.Permissions["a"] {
+		wantPerms = append(wantPerms, saveAndCorrupt(p))
+	}
+	for _, q := range snap1.Questions["a"] {
+		wantQuestions = append(wantQuestions, saveAndCorrupt(q))
+	}
+
+	// Sanity: every corruption target must be non-empty, else the test proves
+	// nothing (an empty slice has no bytes to alias).
+	if len(wantTokens) == 0 {
+		t.Fatal("Gate tokens empty — setup did not populate se.lastTokens")
+	}
+	if len(wantVerbState) == 0 {
+		t.Fatal("CurrentVerbs state empty — setup did not populate se.currentVerb.State")
+	}
+	if len(wantSessionInfo) == 0 || len(wantMsgInfo) == 0 || len(wantMsgParts) == 0 ||
+		len(wantTodo) == 0 || len(wantStatus) == 0 || len(wantPerms) == 0 || len(wantQuestions) == 0 {
+		t.Fatalf("a RawMessage-bearing snapshot field is empty — setup incomplete: info=%d msgInfo=%d parts=%d todo=%d status=%d perms=%d questions=%d",
+			len(wantSessionInfo), len(wantMsgInfo), len(wantMsgParts), len(wantTodo), len(wantStatus), len(wantPerms), len(wantQuestions))
+	}
+
+	// Second snapshot: the store must be UNAFFECTED by the in-place corruption
+	// of snap1's bytes (no aliasing). Each field must match its pristine copy.
+	snap2 := s.Snapshot(nil)
+
+	if got := snap2.Gate["a"].Tokens; !bytes.Equal(got, wantTokens) {
+		t.Fatalf("Gate tokens aliased store bytes: in-place mutation corrupted se.lastTokens.\nwant %s\n got %s", wantTokens, got)
+	}
+	if got := snap2.CurrentVerbs["a"].State; !bytes.Equal(got, wantVerbState) {
+		t.Fatalf("CurrentVerbs state aliased store bytes: in-place mutation corrupted se.currentVerb.State.\nwant %s\n got %s", wantVerbState, got)
+	}
+	if got := snap2.Sessions[0]; !bytes.Equal(got, wantSessionInfo) {
+		t.Fatalf("Sessions info aliased store bytes.\nwant %s\n got %s", wantSessionInfo, got)
+	}
+	msgs := snap2.Messages["a"]
+	if len(msgs) != 1 {
+		t.Fatalf("want 1 message in snap2, got %d", len(msgs))
+	}
+	if got := msgs[0].Info; !bytes.Equal(got, wantMsgInfo) {
+		t.Fatalf("Message info aliased store bytes.\nwant %s\n got %s", wantMsgInfo, got)
+	}
+	if len(msgs[0].Parts) != len(wantMsgParts) {
+		t.Fatalf("want %d parts in snap2 message, got %d", len(wantMsgParts), len(msgs[0].Parts))
+	}
+	for i, want := range wantMsgParts {
+		if got := msgs[0].Parts[i]; !bytes.Equal(got, want) {
+			t.Fatalf("Message part %d aliased store bytes.\nwant %s\n got %s", i, want, got)
+		}
+	}
+	if got := snap2.Todos["a"]; !bytes.Equal(got, wantTodo) {
+		t.Fatalf("Todos aliased store bytes.\nwant %s\n got %s", wantTodo, got)
+	}
+	if got := snap2.Statuses["a"]; !bytes.Equal(got, wantStatus) {
+		t.Fatalf("Statuses aliased store bytes.\nwant %s\n got %s", wantStatus, got)
+	}
+	perms2 := snap2.Permissions["a"]
+	if len(perms2) != len(wantPerms) {
+		t.Fatalf("want %d permissions in snap2, got %d", len(wantPerms), len(perms2))
+	}
+	for i, want := range wantPerms {
+		if got := perms2[i]; !bytes.Equal(got, want) {
+			t.Fatalf("Permission %d aliased store bytes.\nwant %s\n got %s", i, want, got)
+		}
+	}
+	questions2 := snap2.Questions["a"]
+	if len(questions2) != len(wantQuestions) {
+		t.Fatalf("want %d questions in snap2, got %d", len(wantQuestions), len(questions2))
+	}
+	for i, want := range wantQuestions {
+		if got := questions2[i]; !bytes.Equal(got, want) {
+			t.Fatalf("Question %d aliased store bytes.\nwant %s\n got %s", i, want, got)
+		}
 	}
 }

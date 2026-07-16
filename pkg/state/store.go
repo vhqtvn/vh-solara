@@ -397,8 +397,10 @@ type Store struct {
 	// msgRev is a per-session message revision TOKEN bumped under s.mu for
 	// EVERY mutation capable of changing that session's cold-batch/snapshot
 	// message output (message/part upsert+delete, streaming part-delta append
-	// — including the Snapshot-driven delta flush, history reconcile). It
-	// backs the stale-batch guard: cold-load messages.batch packaging (JSON
+	// via appendPartDeltaLocked's write-side throttle flush into me.parts,
+	// history reconcile). Snapshot is NOT on this list — it is a pure read
+	// projection under RLock and never bumps the token. It backs the
+	// stale-batch guard: cold-load messages.batch packaging (JSON
 	// marshal + gzip + base64) runs OUTSIDE s.mu (mirroring the SSE snapshot
 	// precedent in pkg/web/server.go), so a live mutation landing during
 	// packaging would otherwise let a STALE prepared batch overwrite newer
@@ -491,10 +493,13 @@ func New(ringCapacity int) *Store {
 // bumpMsgRev advances the Store-wide monotonic token and assigns it to the
 // owning session's msgRev[sid]. Called under s.mu for EVERY mutation capable
 // of changing a session's cold-batch/snapshot message projection (message/part
-// upsert+delete, streaming part-delta append, Snapshot delta flush, history
-// reconcile). Store-wide (not per-session) so the token is globally
-// non-repeating: a deleted-then-recreated session can never reuse an old
-// in-flight batch's token (the ABA fix). Exactly one bump per logical change.
+// upsert+delete, streaming part-delta append + its write-side throttle flush
+// into me.parts, history reconcile). Snapshot never calls this: it is a pure
+// read projection under RLock that overlays buffered deltas onto fresh copies
+// via projectPartLocked with no writeback. Store-wide (not per-session) so
+// the token is globally non-repeating: a deleted-then-recreated session can
+// never reuse an old in-flight batch's token (the ABA fix). Exactly one bump
+// per logical change.
 func (s *Store) bumpMsgRev(sid string) {
 	s.nextMsgRev++
 	s.msgRev[sid] = s.nextMsgRev
@@ -1069,17 +1074,20 @@ func (s *Store) SetPendingPermissions(requests []json.RawMessage) {
 // PendingPermissions returns a copy of the pending-permission set under a READ
 // lock. It exists so callers that only need permissions (e.g. the 2s reconcile
 // backstop) do not pay for a full Snapshot: Snapshot materializes every
-// message/part of every loaded session (an O(n) tree walk), flushes streaming
-// accumulators, and builds the whole materialized view under the store's WRITE
-// lock — blocking incoming OpenCode events and client-connect Snapshots the
-// whole time. The reconcile loop reads only permissions, so a read-locked
-// perms-only read is the proportional cost.
+// message/part of every loaded session (an O(n) tree walk) and projects
+// buffered streaming deltas onto fresh copies — but it still runs under the
+// store lock and builds the whole materialized view. The reconcile loop reads
+// only permissions, so a read-locked perms-only read is the proportional cost.
 //
-// The return shape (map[sessionID][]json.RawMessage) and copy semantics match
-// Snapshot.Permissions exactly: the outer map and each per-session slice are
-// fresh allocations, while the underlying json.RawMessage byte arrays are shared
-// with the store (callers treat returned permission payloads as read-only, as
-// they already do for Snapshot.Permissions).
+// The return shape (map[sessionID][]json.RawMessage) matches Snapshot.Permissions
+// in structure, but the COPY semantics here are NARROWER than Snapshot's:
+// Snapshot conservatively copies every escaping json.RawMessage byte (so the
+// snapshot never aliases a store-owned backing array), whereas this method
+// copies only the outer map and each per-session slice and SHARES the underlying
+// permission byte arrays with the store. That is safe for its sole caller (the
+// reconcile backstop, which treats the payloads as read-only and drops them
+// before re-locking); callers that retain the bytes past another writer must
+// copy them explicitly.
 func (s *Store) PendingPermissions() map[string][]json.RawMessage {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -1449,8 +1457,12 @@ var deltaFlushInterval = 30 * time.Millisecond
 // always appended to the accumulator (cheap); the expensive rebuild+emit fires
 // at most once per deltaFlushInterval. A later message.part.updated snapshot
 // overwrites the part authoritatively and resets the accumulator (see
-// upsertPartLocked); Snapshot flushes unflushed accumulators so a point-in-time
-// read reflects the live accumulated text.
+// upsertPartLocked). This is the WRITE-SIDE throttle flush into me.parts (the
+// per-message emit path), distinct from the READ-SIDE projection: a Snapshot
+// under RLock overlays the unflushed accumulator onto a fresh part copy via
+// projectPartLocked WITHOUT writing back into me.parts, so a point-in-time read
+// reflects the live accumulated text while the accumulator stays intact for the
+// writer.
 func (s *Store) appendPartDeltaLocked(sessionID, messageID, partID, field, delta string) {
 	if field == "" {
 		field = "text"
@@ -1538,21 +1550,17 @@ func (s *Store) appendPartDeltaLocked(sessionID, messageID, partID, field, delta
 // flushPartDeltasLocked rebuilds me.parts from any unflushed deltaBuf entries
 // and, when emit is true, emits a part.upsert for each changed part. Called at
 // the throttle boundary in appendPartDeltaLocked (emit=true, under Apply's
-// lock) and from Snapshot (emit=false, a point-in-time read). The accumulators
-// are KEPT across the flush (not deleted): subsequent deltas keep appending to
-// the same Builder, and the next flush SETS the field from the full accumulated
-// text (never appends), so there is no double-application. Reset happens only
-// on authoritative overwrite (upsertPartLocked / reconcileMessagesLocked) or
-// part deletion. Caller holds s.mu.
+// lock). The accumulators are KEPT across the flush (not deleted): subsequent
+// deltas keep appending to the same Builder, and the next flush SETS the field
+// from the full accumulated text (never appends), so there is no
+// double-application. Reset happens only on authoritative overwrite
+// (upsertPartLocked / reconcileMessagesLocked) or part deletion. Caller holds
+// s.mu in WRITE mode (this method mutates me.parts and may emit).
 //
-// Returns changed=true iff at least one part's me.parts entry was rewritten.
-// This lets the Snapshot caller (emit=false) bump the owning session's message
-// revision EXACTLY ONCE per logical change, covering the Snapshot-driven flush
-// path (Finding 1: a Snapshot flush that rewrites me.parts without a rev bump
-// would let a stale cold batch validate against the SAME rev and overwrite the
-// freshly-flushed text). The appendPartDeltaLocked caller ignores the return:
-// it bumps unconditionally (its own logic already covers the delta append).
-func (me *messageEntry) flushPartDeltasLocked(s *Store, emit bool) (changed bool) {
+// Snapshot does NOT call this method — it uses projectPartLocked, a pure
+// projection that overlays the buffered deltas onto a freshly-allocated copy
+// without writing back to me.parts, so Snapshot can run under RLock.
+func (me *messageEntry) flushPartDeltasLocked(s *Store, emit bool) {
 	for key, buf := range me.deltaBuf {
 		partID, field, ok := strings.Cut(key, "\x00")
 		if !ok {
@@ -1568,13 +1576,64 @@ func (me *messageEntry) flushPartDeltasLocked(s *Store, emit bool) (changed bool
 		part[field] = buf.String()
 		if updated, err := json.Marshal(part); err == nil {
 			me.parts[partID] = updated
-			changed = true
 			if emit {
 				s.emit(KindPartUpsert, updated)
 			}
 		}
 	}
-	return changed
+}
+
+// projectPartLocked is the PURE READ projection of a single part: it returns a
+// freshly-allocated copy of me.parts[partID] with any buffered deltaBuf entries
+// for that partID overlaid. Unlike flushPartDeltasLocked, it does NOT mutate
+// me.parts, me.deltaBuf, me.deltaLastEmit, the ring, or subscribers, and emits
+// NO events. This is what makes Snapshot a pure projection that can run under
+// RLock and overlap with concurrent Snapshot calls.
+//
+// The returned bytes are always a fresh allocation (never alias store-owned
+// backing arrays), so they are safe to retain past RUnlock even if a later
+// writer replaces me.parts[partID]. If the part has no buffered deltaBuf
+// entries, the result is just a byte copy of me.parts[partID]. Caller holds
+// s.mu (read or write).
+func (me *messageEntry) projectPartLocked(partID string) json.RawMessage {
+	base := me.parts[partID]
+	// Fast path: no accumulators at all, or none for this partID — copy bytes.
+	if len(me.deltaBuf) == 0 {
+		return append([]byte(nil), base...)
+	}
+	// Scan deltaBuf for any entry targeting this partID. The keys are
+	// "<partID>\x00<field>"; if none matches, fall through to the byte copy.
+	var hasMatch bool
+	for k := range me.deltaBuf {
+		if pid, _, ok := strings.Cut(k, "\x00"); ok && pid == partID {
+			hasMatch = true
+			break
+		}
+	}
+	if !hasMatch {
+		return append([]byte(nil), base...)
+	}
+	// Overlay path: decode base into a fresh map, apply every matching buffer,
+	// re-marshal. On any marshal error, fall back to the byte copy so the
+	// snapshot never produces malformed output.
+	var part map[string]any
+	if len(base) > 0 {
+		_ = json.Unmarshal(base, &part)
+	}
+	if part == nil {
+		part = map[string]any{"id": partID, "type": "text"}
+	}
+	for key, buf := range me.deltaBuf {
+		pid, field, ok := strings.Cut(key, "\x00")
+		if !ok || pid != partID {
+			continue
+		}
+		part[field] = buf.String()
+	}
+	if updated, err := json.Marshal(part); err == nil {
+		return updated
+	}
+	return append([]byte(nil), base...)
 }
 
 // discardPartDeltaLocked drops every streaming accumulator entry whose partID
@@ -1642,9 +1701,26 @@ func (s *Store) deletePartLocked(sessionID, messageID, partID string) {
 //     every "open one session" request.
 //
 // scopeSelected gates ONLY the len > 0 case; nil and empty-{} are UNCHANGED.
+//
+// Snapshot is a PURE READ PROJECTION: it runs under s.mu.RLock and mutates NO
+// store state. Unflushed streaming deltas are overlaid onto freshly-allocated
+// part copies via projectPartLocked (NOT flushed back into me.parts), so a
+// snapshot reflects the live accumulated text without disturbing the store.
+// This lets multiple client snapshots overlap (RLock is shared) and lets
+// Snapshot run while a reader holds the lock for a long time. Apply (the
+// writer) still waits for readers — that is expected and fine; this method
+// does not claim to eliminate writer blocking, only Snapshot-side mutation and
+// read/read serialization. The monotonic msgRev machinery (bumpMsgRev) stays
+// on the Apply/flush path; Snapshot never bumps it.
+//
+// All json.RawMessage bytes that escape the RLock are conservatively COPIED so
+// they never alias store-owned backing arrays (a later writer under the write
+// lock would otherwise be free to replace, though not in-place-mutate, those
+// slices — copying keeps the snapshot safe under the race detector and against
+// any future in-place mutation).
 func (s *Store) Snapshot(messagesFor map[string]bool) Snapshot {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
 	scopeSelected := messagesFor != nil && len(messagesFor) > 0
 	// inScope reports whether a session's per-session structural rows should
@@ -1655,56 +1731,6 @@ func (s *Store) Snapshot(messagesFor map[string]bool) Snapshot {
 			return true
 		}
 		return messagesFor[sid]
-	}
-
-	// Flush any unflushed streaming accumulators first so the snapshot reflects
-	// the live accumulated text, not the last throttle-window flush (a
-	// reconnecting client must converge on the exact current field text). Under
-	// the WRITE lock because flushing mutates me.parts; Snapshot is infrequent
-	// (per client connect/reconnect) so this adds no contention beyond Apply's
-	// existing single-writer serialization. emit=false: this is a point-in-time
-	// read — the live tail gets its part.upsert emits from the throttle flush in
-	// appendPartDeltaLocked, so a silent flush here sends no duplicate event.
-	//
-	// When scopeSelected, only the selected sessions are flushed. This is safe:
-	// deltaBuf is owned strictly per messageEntry (per session/message) and a
-	// flush touches only that entry's own me.parts (no cross-session invariant),
-	// and flushPartDeltasLocked KEEPS the accumulators — so an unselected
-	// session's buffered deltas stay intact and converge on the next full
-	// Snapshot(nil)/Snapshot({}) or the throttle flush in appendPartDeltaLocked.
-	// No data loss.
-	//
-	// Finding 1: a Snapshot-driven flush that rewrites me.parts WITHOUT bumping
-	// the owning session's message revision would let a concurrently-packaging
-	// cold batch validate against the SAME (pre-Snapshot) revision and emit the
-	// OLD captured projection OVER the freshly-flushed newer text. So track
-	// which sessions a flush actually changed and bump each one's revision
-	// EXACTLY ONCE (via bumpMsgRev) after the flush loops. appendPartDeltaLocked
-	// already bumps unconditionally for its own delta append, so this Snapshot
-	// bump never double-counts a logical change — it covers only the flush path
-	// that appendPartDeltaLocked's bump does not.
-	changedSessions := map[string]bool{}
-	if scopeSelected {
-		for sid := range messagesFor {
-			if sm := s.messages[sid]; sm != nil {
-				for _, me := range sm.byID {
-					if me.flushPartDeltasLocked(s, false) {
-						changedSessions[sid] = true
-					}
-				}
-			}
-		}
-	} else {
-		for sid, sm := range s.messages {
-			for _, me := range sm.byID {
-				if me.flushPartDeltasLocked(s, false) {
-					changedSessions[sid] = true
-				}
-			}
-		}
-	}
-	for sid := range changedSessions {
-		s.bumpMsgRev(sid)
 	}
 
 	snap := Snapshot{
@@ -1753,7 +1779,11 @@ func (s *Store) Snapshot(messagesFor map[string]bool) Snapshot {
 			PendingQuestion:        len(s.questions[sid]) > 0,
 			PendingPermission:      len(s.perms[sid]) > 0,
 			PermissionBlocked:      s.permBlocked[sid],
-			Tokens:                 se.lastTokens,
+			// Copy the token-usage bytes so the snapshot never aliases the
+			// store-owned se.lastTokens backing array (Snapshot escapes the
+			// RLock; a later writer is free to replace it). See the Snapshot
+			// doc comment's copy invariant.
+			Tokens: append([]byte(nil), se.lastTokens...),
 		}
 		if se.lastAgent != "" {
 			snap.LastAgents[sid] = se.lastAgent
@@ -1762,7 +1792,15 @@ func (s *Store) Snapshot(messagesFor map[string]bool) Snapshot {
 		// tool carry one) so a client renders the rich verb for an UNOPENED
 		// subagent straight from the tree-only snapshot.
 		if se.currentVerb.Tool != "" {
-			snap.CurrentVerbs[sid] = se.currentVerb
+			// Copy the facet (and its State bytes) so the snapshot never
+			// aliases se.currentVerb.State — Snapshot escapes the RLock and a
+			// later writer may replace se.currentVerb. The struct copy alone
+			// would share the State backing array; copying the bytes keeps the
+			// snapshot self-contained (see the Snapshot copy invariant).
+			snap.CurrentVerbs[sid] = VerbFacet{
+				Tool:  se.currentVerb.Tool,
+				State: append([]byte(nil), se.currentVerb.State...),
+			}
 		}
 	}
 	for sid, m := range s.questions {
@@ -1770,7 +1808,7 @@ func (s *Store) Snapshot(messagesFor map[string]bool) Snapshot {
 			continue
 		}
 		for _, q := range m {
-			snap.Questions[sid] = append(snap.Questions[sid], q)
+			snap.Questions[sid] = append(snap.Questions[sid], append([]byte(nil), q...))
 		}
 	}
 	for sid, st := range s.activity {
@@ -1788,7 +1826,7 @@ func (s *Store) Snapshot(messagesFor map[string]bool) Snapshot {
 		if !inScope(sid) {
 			continue
 		}
-		snap.Sessions = append(snap.Sessions, se.info)
+		snap.Sessions = append(snap.Sessions, append([]byte(nil), se.info...))
 	}
 	for sid, sm := range s.messages {
 		if messagesFor != nil && !messagesFor[sid] {
@@ -1802,9 +1840,15 @@ func (s *Store) Snapshot(messagesFor map[string]bool) Snapshot {
 			}
 			parts := make([]json.RawMessage, 0, len(me.partOrder))
 			for _, pid := range me.partOrder {
-				parts = append(parts, me.parts[pid])
+				// Pure projection: overlay buffered deltas onto a fresh copy
+				// without mutating me.parts. This is what keeps Snapshot a pure
+				// read that can run under RLock.
+				parts = append(parts, me.projectPartLocked(pid))
 			}
-			list = append(list, MessageWithParts{Info: me.info, Parts: parts})
+			list = append(list, MessageWithParts{
+				Info:  append([]byte(nil), me.info...),
+				Parts: parts,
+			})
 		}
 		snap.Messages[sid] = list
 	}
@@ -1812,21 +1856,21 @@ func (s *Store) Snapshot(messagesFor map[string]bool) Snapshot {
 		if !inScope(sid) {
 			continue
 		}
-		snap.Todos[sid] = t
+		snap.Todos[sid] = append([]byte(nil), t...)
 	}
 	for sid, m := range s.perms {
 		if !inScope(sid) {
 			continue
 		}
 		for _, perm := range m {
-			snap.Permissions[sid] = append(snap.Permissions[sid], perm)
+			snap.Permissions[sid] = append(snap.Permissions[sid], append([]byte(nil), perm...))
 		}
 	}
 	for sid, st := range s.statuses {
 		if !inScope(sid) {
 			continue
 		}
-		snap.Statuses[sid] = st
+		snap.Statuses[sid] = append([]byte(nil), st...)
 	}
 	return snap
 }
