@@ -404,7 +404,23 @@ export async function refreshOpenSessions() {
 }
 
 let es: EventSource | null = null;
-let lastSeen = 0; // ms of the last byte/event from the server (incl. pings)
+// Two INDEPENDENT liveness clocks — the dead-but-OPEN Stream2 bug (a frozen
+// transcript with the `updating` pulse lit and no reconnect) came from a single
+// shared `lastSeen` that Stream1's 15s server ping kept fresh forever, so the
+// watchdog's `Date.now() - lastSeen > STALE_MS` could NEVER age out for a dead
+// Stream2 while the tree was healthy. Each stream now owns its own clock and the
+// watchdog evaluates each independently.
+//   treeLastSeen    — Stream1 (tree: sessions/activity/permissions/...). Backs
+//                     the global `isStale()` indicator (the status dot = global
+//                     connection health) and the tree-stream watchdog branch.
+//   sessionLastSeen — Stream2 (active-session messages). Drives the Stream2
+//                     stale-but-OPEN watchdog branch → forced fresh-snapshot
+//                     reconnect. 0 = "never seen / just reset" → treated as
+//                     not-stale (like the old code's `lastSeen > 0` guard), so a
+//                     not-yet-open or just-reconnected Stream2 gets a fresh
+//                     deadline instead of inheriting a stale timestamp.
+let treeLastSeen = 0;
+let sessionLastSeen = 0;
 let reconnectTimer: number | undefined;
 let backoff = 1000; // grows on repeated failures, reset on a healthy open
 let everOpened = false; // first stream open is the initial load; later opens are reconnects
@@ -413,33 +429,47 @@ export const STALE_MS = 45_000; // ~3 missed 15s pings → assume the stream is 
 // --- Feature 1: staleness (S1) ---------------------------------------------
 // healthNow is a coarse tick (bumped by the watchdog) so staleness re-evaluates
 // over wall-clock time even with no store writes. isStale reads the
-// NON-reactive module `lastSeen` (plain var → no per-event subscription), so
+// NON-reactive module `treeLastSeen` (plain var → no per-event subscription), so
 // consumers of isStale only re-run on healthNow / state.status changes, not on
 // every SSE byte. This keeps the stale indicator off the per-token hot path.
 const [healthNow, setHealthNow] = createSignal(0);
 // tickHealth advances the coarse health tick WITHOUT touching the watchdog's
 // reconnect logic. Called on a faster cadence than the 10s watchdog (see
-// startSync) so a stale-but-open socket surfaces the stale indicator BEFORE
-// the watchdog reconnects it — otherwise isStale() could never render (the
+// startSync) so a stale-but-open socket surfaces the stale indicator BEFORE the
+// watchdog reconnects it — otherwise isStale() could never render (the
 // watchdog flips status to "reconnecting" in the same tick it detects staleness).
 export function tickHealth() {
   setHealthNow((n) => n + 1);
 }
 export function isStale(): boolean {
   healthNow(); // subscribe to the coarse tick
-  return state.status === "live" && lastSeen > 0 && Date.now() - lastSeen > STALE_MS;
+  // Reads the TREE clock only: the status dot represents GLOBAL connection
+  // health. A dead-but-OPEN Stream2 (selected-session messages) does NOT flip
+  // the global status to stale/disconnected — it surfaces via the per-session
+  // `refreshing[id]` dot and is healed by the Stream2 watchdog branch below.
+  return state.status === "live" && treeLastSeen > 0 && Date.now() - treeLastSeen > STALE_MS;
 }
-// lastSeenStateWritten throttles the mirror into the reactive store: markSeen
-// fires on every SSE byte, but writing state.lastSeen that often would notify
-// the debug surfaces per-token. Bound it to ~1 write/sec.
+// lastSeenStateWritten throttles the mirror into the reactive store: the mark*
+// helpers fire on every SSE byte, but writing state.lastSeen that often would
+// notify the debug surfaces per-token. Bound it to ~1 write/sec. The mirror now
+// tracks treeLastSeen (the value the global status dot represents); it is a
+// debug-only field — isStale() reads the unthrottled module var, not state.
 let lastSeenStateWritten = 0;
-function markSeen() {
-  lastSeen = Date.now();
-  const now = lastSeen;
+// markTreeSeen updates Stream1's liveness clock and (throttled) the reactive
+// mirror consumed by debug surfaces. Called from every Stream1 listener.
+function markTreeSeen() {
+  treeLastSeen = Date.now();
+  const now = treeLastSeen;
   if (now - lastSeenStateWritten >= 1000) {
     lastSeenStateWritten = now;
     setState("lastSeen", now);
   }
+}
+// markSessionSeen updates Stream2's liveness clock ONLY. No reactive mirror —
+// Stream2 health surfaces through `refreshing[id]` and the watchdog, not the
+// global status dot. Called from every Stream2 listener (gen-guarded).
+function markSessionSeen() {
+  sessionLastSeen = Date.now();
 }
 
 // --- Feature 2: anti-spam "updating" indicator (U3 debounce) ---------------
@@ -653,7 +683,8 @@ export const TREE_STREAM_KINDS = [
 
 // --- Global busy-scope gate (archive/unarchive) -----------------------------
 // While a global busy scope is active (see ../busy.ts), stream frames are
-// deferred: markSeen runs (watchdog health), but store mutation is suppressed.
+// deferred: markTreeSeen/markSessionSeen run (watchdog health), but store
+// mutation is suppressed.
 // On the outermost release, reconcileBusy() requests fresh authoritative
 // snapshots. expectTreeSnap / expectSessionSnap identify the ONE expected fresh
 // snapshot per stream (from connect(true) / openSessionStream); all other frames
@@ -731,10 +762,10 @@ export function connect(fresh = false) {
   treeT1 = 0;
   treeSnapDone = false;
   es = new EventSource(`/vh/stream?${cursorParam}sessions=&dir=${encodeURIComponent(projectDir())}`);
-  markSeen();
+  markTreeSeen();
   log.debug("sync", "tree stream connect", { cursor: fresh ? "fresh" : state.cursor, dir: projectDir() });
   es.addEventListener("snapshot", (e) => {
-    markSeen();
+    markTreeSeen();
     let snap: Snapshot;
     try {
       snap = JSON.parse((e as MessageEvent).data);
@@ -768,10 +799,10 @@ export function connect(fresh = false) {
     setState("status", "live");
     void refreshOpenSessions();
   });
-  es.addEventListener("ping", () => markSeen()); // heartbeat for the watchdog
+  es.addEventListener("ping", () => markTreeSeen()); // heartbeat for the watchdog
   for (const kind of ["session.upsert", "session.delete"]) {
     es.addEventListener(kind, (e) => {
-      markSeen();
+      markTreeSeen();
       const ev = e as MessageEvent;
       const seq = Number(ev.lastEventId);
       if (isGateActive()) {
@@ -785,7 +816,7 @@ export function connect(fresh = false) {
   }
   for (const kind of TREE_STREAM_KINDS) {
     es.addEventListener(kind, (e) => {
-      markSeen();
+      markTreeSeen();
       const ev = e as MessageEvent;
       const seq = Number(ev.lastEventId);
       if (isGateActive()) {
@@ -799,7 +830,7 @@ export function connect(fresh = false) {
   }
   // Daemon-detected alerts (transient; no cursor advance). In-app + OS delivery.
   es.addEventListener("notice", (e) => {
-    markSeen();
+    markTreeSeen();
     try {
       handleNotice(JSON.parse((e as MessageEvent).data));
     } catch {
@@ -807,7 +838,7 @@ export function connect(fresh = false) {
     }
   });
   es.onopen = () => {
-    markSeen();
+    markTreeSeen();
     // L1 t1: socket established → pure connection-latency delta.
     treeT1 = performance.now();
     if (treeT0) recordLatency("tree", "open", treeT1 - treeT0);
@@ -839,9 +870,23 @@ export function connect(fresh = false) {
 let ses: EventSource | null = null;
 let sesId = "";
 let sesRetry: number | undefined;
+// sesGen: Stream2 connection-generation token. Incremented on EVERY open /
+// reopen / close / selection-switch. Captured in every Stream2 listener so a
+// callback from a SUPERSEDED connection (closed, replaced, switched-away — or a
+// slow decode whose source connection was torn down) is ignored: it must NOT
+// refresh the replacement's sessionLastSeen clock or run state effects. This is
+// what prevents a dead-but-closing Stream2's in-flight frames from masking the
+// freshly-constructed replacement's liveness. The captured value is compared
+// against the live sesGen at listener ENTRY (synchronous, before markSessionSeen
+// or any store write).
+let sesGen = 0;
 
 export function closeSessionStream() {
   clearTimeout(sesRetry);
+  // Invalidate any in-flight listeners from the outgoing connection: bump the
+  // generation so a stale callback (e.g. a late frame already queued before
+  // close() propagated) can't refresh sessionLastSeen or mutate the store.
+  sesGen++;
   ses?.close();
   ses = null;
   // Drop the warm silent-swap indicator for the session being closed: if we
@@ -850,13 +895,19 @@ export function closeSessionStream() {
   // leaking a permanent dot on the row.
   if (sesId) setState("refreshing", sesId, false);
   sesId = "";
+  // Reset Stream2's liveness clock: a not-yet-open / about-to-be-replaced
+  // Stream2 must NOT inherit a stale timestamp and be classified stale before
+  // it has had a chance to fire. 0 = "never seen" → watchdog treats it as
+  // not-stale (gives the next open() a fresh deadline).
+  sessionLastSeen = 0;
 }
 
 // applySessionSnapshot applies a Stream-2 (active-session) snapshot to the store.
 // Extracted from the EventSource `snapshot` closure so the Slice C partial-
 // snapshot contract — a hydrating snapshot (gate.messagesLoaded===false) must NOT
 // mark the session delivered — is unit-testable. The connection-side bookkeeping
-// (markSeen, latency) stays in the listener; this is the pure reconciliation.
+// (markSessionSeen + gen guard, latency) stays in the listener; this is the pure
+// reconciliation.
 export function applySessionSnapshot(id: string, snap: Snapshot) {
   setState("messages", id, buildMessages((snap.messages?.[id] as any[]) || []));
   // Mark delivered ONLY when the snapshot's gate says the daemon has the FULL
@@ -1035,6 +1086,14 @@ export function openSessionStream(id: string, force = false) {
   sesId = id;
   const open = () => {
     if (sesId !== id) return;
+    // Bump the connection generation so listeners captured by any prior open()
+    // of THIS selection (a retry) or a superseded selection are ignored. The
+    // captured `gen` is checked at every listener ENTRY — a stale callback from
+    // a closed/replaced Stream2 must NOT refresh sessionLastSeen or run state
+    // effects (the dead-but-OPEN masking bug). closeSessionStream() already
+    // bumped for the switch/force path; this bump covers the retry path (where
+    // open() runs directly from the sesRetry timer, not via openSessionStream).
+    const gen = ++sesGen;
     ses?.close();
     sesT0 = performance.now(); // L1 t0: session-stream connection attempt
     sesT1 = 0;
@@ -1050,9 +1109,19 @@ export function openSessionStream(id: string, force = false) {
     // reconnect retry re-arms it.
     setState("refreshing", id, true);
     ses = new EventSource(`/vh/stream?sessions=${encodeURIComponent(id)}&dir=${encodeURIComponent(projectDir())}&z=1`);
+    // Seed Stream2's liveness deadline from construction (mirrors Stream1's
+    // markTreeSeen() right after `new EventSource`): a connection that NEVER
+    // fires any event (silent from the start) must still be aged out after
+    // STALE_MS rather than hang forever. A connection that does fire refreshes
+    // this via markSessionSeen() in its listeners. closeSessionStream() reset
+    // this to 0; open() gives it a fresh "now" baseline so it is NOT stale.
+    markSessionSeen();
     log.debug("sync", "session stream connect", { id });
     ses.addEventListener("snapshot", (e) => {
-      markSeen();
+      // Gen guard: ignore frames from a superseded connection BEFORE touching
+      // the clock or the store.
+      if (gen !== sesGen) return;
+      markSessionSeen();
       let raw: any;
       try {
         raw = JSON.parse((e as MessageEvent).data);
@@ -1138,6 +1207,15 @@ export function openSessionStream(id: string, force = false) {
         sesSnapshotDecode = (async () => {
           try {
             const snap = await decodeSnapshot<Snapshot>(raw);
+            // Generation re-check (finding #3): the snapshot decode AWAITED, so
+            // the connection may have been replaced (sesGen bumped in
+            // closeSessionStream/open) while we were decoding. The entry guard
+            // cannot catch this — it ran before the await. A superseded decode
+            // must NOT apply its snapshot, clear the refresh indicator, or run
+            // latency effects: the replacement connection owns the session
+            // state now. Supplements (does not replace) the epoch guard below,
+            // which separately handles a busy-gate activation mid-await.
+            if (gen !== sesGen) return;
             if (ep === currentGateEpoch()) {
               applySnap(snap);
             } else if (isGateActive()) {
@@ -1157,18 +1235,25 @@ export function openSessionStream(id: string, force = false) {
         if (wasExpected) maybeResolveReconcile();
       }
     });
-    ses.addEventListener("ping", () => markSeen());
+    ses.addEventListener("ping", () => {
+      if (gen !== sesGen) return;
+      markSessionSeen();
+    });
     // L1 t1: socket established → pure connection-latency delta. Stream 2 had
     // no explicit onopen before; added for the latency diagnostic (and parity
     // with Stream 1's connect/backoff semantics).
     ses.onopen = () => {
-      markSeen();
+      if (gen !== sesGen) return;
+      markSessionSeen();
       sesT1 = performance.now();
       if (sesT0) recordLatency("session", "open", sesT1 - sesT0);
     };
     for (const kind of ["message.upsert", "message.delete", "part.upsert", "part.delete", "messages.loaded", "messages.error", "messages.batch"]) {
       ses!.addEventListener(kind, async (e) => {
-        markSeen();
+        // Gen guard: ignore frames from a superseded connection BEFORE touching
+        // the clock or the store.
+        if (gen !== sesGen) return;
+        markSessionSeen();
         if (isGateActive()) {
           // Deferred Stream-2 frame — neither mutate the store nor advance the
           // shared cursor. Latch dirty so the coalesced refresh catches up.
@@ -1206,6 +1291,13 @@ export function openSessionStream(id: string, force = false) {
         // the fast path so message.upsert/part.upsert floods keep zero microtask
         // latency. Connect-time only (a snapshot decode is ms-scale).
         if (sesSnapshotDecoding) await sesSnapshotDecode;
+        // Generation re-check (finding #3): we just awaited the in-flight
+        // snapshot decode — the connection may have been replaced (sesGen
+        // bumped) during that wait. The entry guard ran before the await, so
+        // drop the stale continuation here before any state effect. Supplements
+        // the epoch guard below (which handles a busy-gate activation, not a
+        // connection replacement — a sesGen bump does not change the epoch).
+        if (gen !== sesGen) return;
         // Epoch guard: the gate may have activated during the snapshot-decode wait.
         if (ep !== currentGateEpoch()) {
           if (isGateActive()) markBusyDirty();
@@ -1231,6 +1323,11 @@ export function openSessionStream(id: string, force = false) {
         if (kind === "messages.batch") {
           const p = (async () => {
             const decoded = await decodeMessagesBatch(data);
+            // Generation re-check (finding #3): the batch decode AWAITED — the
+            // connection may have been replaced (sesGen bumped) while decoding.
+            // The entry guard ran before the await. A superseded decode must not
+            // stage its batch into the store; supplements the epoch guard below.
+            if (gen !== sesGen) return;
             // Epoch guard: the gate may have activated during the batch decode.
             if (ep === currentGateEpoch()) {
               applyMessageEvent("messages.batch", Number(ev.lastEventId), decoded, false);
@@ -1254,6 +1351,12 @@ export function openSessionStream(id: string, force = false) {
         if (sid && pendingBatch.has(sid)) {
           await pendingBatch.get(sid);
         }
+        // Generation re-check (finding #3): we just awaited a pending batch
+        // decode — the connection may have been replaced (sesGen bumped) during
+        // that wait. The entry guard ran before the await. Drop the stale
+        // continuation before the latency/reveal stamps and the messages.loaded
+        // application below; supplements the epoch guard.
+        if (gen !== sesGen) return;
         // Epoch guard: the gate may have activated during the batch-decode wait.
         if (ep !== currentGateEpoch()) {
           if (isGateActive()) markBusyDirty();
@@ -1285,6 +1388,10 @@ export function openSessionStream(id: string, force = false) {
       });
     }
     ses.onerror = () => {
+      // Gen guard: a superseded connection's error must not arm a retry on
+      // behalf of the new (current) connection — the current connection owns
+      // its own retry scheduling via its own onerror.
+      if (gen !== sesGen) return;
       if (ses && ses.readyState === EventSource.CLOSED && sesId === id) {
         clearTimeout(sesRetry);
         sesRetry = window.setTimeout(open, 1500);
@@ -1294,9 +1401,12 @@ export function openSessionStream(id: string, force = false) {
   open();
 }
 
-// Force a reconnect when the tree stream has gone silent past the heartbeat
-// window (a dead-but-open socket EventSource won't surface as an error) or was
-// closed. Runs while the tab is visible.
+// Force a reconnect when a stream has gone silent past the heartbeat window
+// (a dead-but-OPEN EventSource won't surface as an error) or was closed. Each
+// stream is evaluated against its OWN liveness clock — the original bug was a
+// single shared `lastSeen` that Stream1's 15s server ping kept fresh forever,
+// so a dead-but-OPEN Stream2 could never age out while the tree was healthy.
+// Runs while the tab is visible.
 export function watchdogTick() {
   if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
   // No project selected: never (re)connect the cwd bridge. The watchdog just
@@ -1308,15 +1418,38 @@ export function watchdogTick() {
   // Feature 1: re-evaluate staleness over wall-clock time (no store write on
   // a silent-but-open socket). Coarse tick only — safe on the per-frame budget.
   setHealthNow((n) => n + 1);
+  // --- Stream 1 (tree) liveness: drives the GLOBAL connection status. ---
   if (!es || es.readyState === EventSource.CLOSED) {
     connect();
-  } else if (lastSeen && Date.now() - lastSeen > STALE_MS) {
-    log.warn("sync", "stream stale → forcing reconnect", { silentMs: Date.now() - lastSeen });
+  } else if (treeLastSeen && Date.now() - treeLastSeen > STALE_MS) {
+    log.warn("sync", "tree stream stale → forcing reconnect", {
+      silentMs: Date.now() - treeLastSeen,
+    });
     setState("status", "reconnecting");
     connect();
   }
-  // The session stream self-retries on error; reopen if it died silently.
-  if (sesId && (!ses || ses.readyState === EventSource.CLOSED)) openSessionStream(sesId);
+  // --- Stream 2 (selected-session messages) liveness: INDEPENDENT clock. ---
+  // A dead-but-OPEN Stream2 must be detected even while Stream1's 15s server
+  // pings keep the tree healthy (the original masking bug). A stale/closed
+  // Stream2 is reconnected via the existing forced fresh-snapshot path
+  // (openSessionStream(id, true)): it bypasses the healthy/open early return,
+  // closes the old EventSource, bumps sesGen (invalidating the stale
+  // connection's listeners), and constructs a cursorless one starting with an
+  // authoritative snapshot. A not-yet-open / just-(re)connected Stream2 has
+  // sessionLastSeen seeded to "now" by open() → not stale → gets a fresh
+  // deadline (no tight construction/close loop). Reconnecting ONLY Stream2
+  // does NOT flip global status to disconnected (that follows the tree above).
+  if (sesId) {
+    if (!ses || ses.readyState === EventSource.CLOSED) {
+      openSessionStream(sesId);
+    } else if (sessionLastSeen && Date.now() - sessionLastSeen > STALE_MS) {
+      log.warn("sync", "session stream stale → forcing reconnect", {
+        id: sesId,
+        silentMs: Date.now() - sessionLastSeen,
+      });
+      openSessionStream(sesId, true);
+    }
+  }
 }
 
 export function maybeReconnect() {
