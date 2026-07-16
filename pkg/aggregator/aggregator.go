@@ -276,12 +276,20 @@ func (a *Aggregator) EnsureMessages(ctx context.Context, sessionID string) error
 		}
 		fetchMs := time.Since(t0).Milliseconds()
 		tR := time.Now()
-		a.store.SetSessionMessages(sessionID, decodeMessages(items))
+		status := a.store.SetSessionMessages(sessionID, decodeMessages(items))
 		reconcileMs := time.Since(tR).Milliseconds()
-		// Signal completion to any async caller deduped against this sync winner
-		// (unconditional, mirroring EnsureMessagesAsync, so the client exits the
-		// loading state even when the fetch returned zero/unchanged messages).
-		a.store.EmitMessagesLoaded(sessionID, fetchMs, reconcileMs)
+		// Emit completion ONLY when a batch was published (cold) or it was a
+		// genuine warm reconcile (no batch required). When the session
+		// disappeared (deleted between reconcile and capture) or packaging
+		// failed, SetSessionMessages published NO batch — emitting loaded here
+		// would deliver messages.loaded with no preceding messages.batch,
+		// breaking the one-batch-before-loaded ordering the client relies on,
+		// and emitting an empty batch to satisfy ordering would reintroduce
+		// state after session.delete (Finding 3). The session is gone; the
+		// client tears it down on session.deleted.
+		if status == state.ColdBatchEmitted || status == state.ColdBatchWarmReconcile {
+			a.store.EmitMessagesLoaded(sessionID, fetchMs, reconcileMs)
+		}
 		return nil
 	}
 }
@@ -402,13 +410,21 @@ func (a *Aggregator) EnsureMessagesAsync(ctx context.Context, sessionID string) 
 		}
 		fetchMs := time.Since(t0).Milliseconds()
 		tR := time.Now()
-		a.store.SetSessionMessages(sessionID, decodeMessages(items))
+		status := a.store.SetSessionMessages(sessionID, decodeMessages(items))
 		reconcileMs := time.Since(tR).Milliseconds()
-		// ALWAYS emit completion — even when the fetch returned zero or unchanged
-		// messages (SetSessionMessages emitted no message.* delta in those
-		// cases). Without this a client would wedge on the loading state forever
-		// waiting for a delta that never arrives.
-		a.store.EmitMessagesLoaded(sessionID, fetchMs, reconcileMs)
+		// Emit completion ONLY when a batch was published (cold) or it was a
+		// genuine warm reconcile (no batch required). A cold fetch for a session
+		// that was deleted between reconcile and capture, or a packaging
+		// failure, publishes NO batch — emitting loaded here would deliver
+		// messages.loaded with no preceding messages.batch (one-batch-before-
+		// loaded ordering), and emitting an empty batch to satisfy ordering
+		// would reintroduce state after session.delete. When the session is
+		// gone the client tears it down on session.deleted (Finding 3). On a
+		// successful warm reconcile with zero changed deltas the loaded event is
+		// still emitted so the client exits the loading state.
+		if status == state.ColdBatchEmitted || status == state.ColdBatchWarmReconcile {
+			a.store.EmitMessagesLoaded(sessionID, fetchMs, reconcileMs)
+		}
 	}()
 }
 

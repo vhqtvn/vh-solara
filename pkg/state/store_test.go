@@ -8,6 +8,8 @@ import (
 	"io"
 	"reflect"
 	"sort"
+	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -1241,6 +1243,725 @@ func TestColdLoadEmitsSingleMessagesBatch(t *testing.T) {
 	}
 	if warmUpsert == 0 {
 		t.Fatalf("warm reconcile must emit individual upserts (incremental), got 0")
+	}
+}
+
+// partTextFromBatch decodes a KindMessagesBatch payload
+// ({sessionID,encoding:"gzip64",data:base64(gzip({"messages":[...]}))}) and
+// returns the .text of the named (sessionID,messageID,partID) part. Used by the
+// cold-batch staleness tests to assert which body a batch carried.
+func partTextFromBatch(t *testing.T, payload json.RawMessage, sid, mid, pid string) string {
+	t.Helper()
+	var env struct {
+		SessionID string `json:"sessionID"`
+		Encoding  string `json:"encoding"`
+		Data      string `json:"data"`
+	}
+	if err := json.Unmarshal(payload, &env); err != nil {
+		t.Fatalf("batch payload unmarshal: %v", err)
+	}
+	// Assert the envelope is for THIS session and uses the gzip64 encoding
+	// (packageMessagesBatch contract). A misrouted batch or a changed encoding
+	// would otherwise silently pass these staleness assertions.
+	if env.SessionID != sid {
+		t.Fatalf("batch sessionID: want %q, got %q", sid, env.SessionID)
+	}
+	if env.Encoding != "gzip64" {
+		t.Fatalf("batch encoding: want gzip64, got %q", env.Encoding)
+	}
+	raw, err := base64.StdEncoding.DecodeString(env.Data)
+	if err != nil {
+		t.Fatalf("batch base64 decode: %v", err)
+	}
+	gr, err := gzip.NewReader(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatalf("batch gzip reader: %v", err)
+	}
+	inner, err := io.ReadAll(gr)
+	if err != nil {
+		t.Fatalf("batch gunzip: %v", err)
+	}
+	// Closing the reader verifies the gzip trailer flushed correctly (a
+	// truncated/corrupt stream would error here even when io.ReadAll succeeded
+	// on a partial read).
+	if err := gr.Close(); err != nil {
+		t.Fatalf("batch gzip close: %v", err)
+	}
+	var p struct {
+		Messages []MessageWithParts `json:"messages"`
+	}
+	if err := json.Unmarshal(inner, &p); err != nil {
+		t.Fatalf("batch inner unmarshal: %v", err)
+	}
+	for _, m := range p.Messages {
+		var me struct {
+			ID string `json:"id"`
+		}
+		_ = json.Unmarshal(m.Info, &me)
+		if me.ID != mid {
+			continue
+		}
+		for _, part := range m.Parts {
+			var pe struct {
+				ID   string `json:"id"`
+				Text string `json:"text"`
+			}
+			_ = json.Unmarshal(part, &pe)
+			if pe.ID == pid {
+				return pe.Text
+			}
+		}
+	}
+	t.Fatalf("part %s/%s/%s not found in batch", sid, mid, pid)
+	return ""
+}
+
+// TestColdBatchDiscardsStaleAfterConcurrentMutation is the proving test for the
+// revision-validation correctness of the unlocked cold-batch packaging path
+// (publishColdBatch). It deterministically reproduces the race this slice
+// eliminates: a stale prepared batch MUST NOT overwrite a newer live delta on
+// the client (which treats messages.batch as a wholesale replacement —
+// stream.ts:201-217).
+//
+// Mechanism, via the coldBatchAfterCaptureHook test seam:
+//  1. SetSessionMessages(OLD) runs in a goroutine; publishColdBatch captures the
+//     OLD projection under the lock, releases the lock, and BLOCKS in the hook
+//     before packaging.
+//  2. The main test goroutine — while packaging is blocked — applies a NEWER
+//     authoritative message.part.updated for the SAME part. upsertPartLocked
+//     bumps the session's revision token via bumpMsgRev under the lock.
+//  3. The hook is released; publishColdBatch's validation re-reads the revision,
+//     sees it changed, and DISCARDS the OLD payload, then retries and captures
+//     the NEW state, which validates and is emitted.
+//
+// Assertions: exactly ONE batch is emitted (the discarded one never lands); it
+// carries the NEW text, never OLD; messages.loaded follows the valid batch.
+func TestColdBatchDiscardsStaleAfterConcurrentMutation(t *testing.T) {
+	s := New(100)
+	s.Apply(ev("session.created", `{"info":{"id":"stale"}}`))
+	ch, unsub := s.Subscribe(256) // firehose: see every message-class event
+	defer unsub()
+	drainAll(ch) // drop subscribe-time backlog
+
+	// OLD cold-fetch result: one message + one part with text "OLD".
+	oldList := []MessageWithParts{
+		{Info: json.RawMessage(`{"id":"m1","sessionID":"stale","role":"assistant","time":{"created":1}}`),
+			Parts: []json.RawMessage{json.RawMessage(`{"id":"p1","sessionID":"stale","messageID":"m1","type":"text","text":"OLD"}`)}},
+	}
+
+	// Coordination via the test seam: the hook signals it has captured the OLD
+	// projection, then blocks until the test applies the newer mutation and
+	// releases it. capturedOnce guards the close (the retry re-enters the hook);
+	// a closed releaseCh returns immediately on re-entry so the retry does not
+	// re-block.
+	capturedCh := make(chan struct{})
+	releaseCh := make(chan struct{})
+	var capturedOnce sync.Once
+	coldBatchAfterCaptureHook = func(sid string) {
+		if sid != "stale" {
+			return
+		}
+		capturedOnce.Do(func() { close(capturedCh) })
+		<-releaseCh // block until released (instant no-op after close)
+	}
+	t.Cleanup(func() { coldBatchAfterCaptureHook = nil })
+
+	// Run the cold load in a goroutine: it blocks inside publishColdBatch's hook
+	// after capturing OLD.
+	done := make(chan struct{})
+	go func() {
+		s.SetSessionMessages("stale", oldList)
+		close(done)
+	}()
+
+	// Wait until the OLD projection has been captured (and packaging is blocked).
+	<-capturedCh
+
+	// While packaging is blocked, apply a NEWER authoritative part body for the
+	// same part. upsertPartLocked bumps the session's revision token via
+	// bumpMsgRev → the validation step MUST discard the captured (OLD) batch and
+	// retry. (The event shape wraps the part under "part": — that is what the
+	// Apply dispatch expects.)
+	s.Apply(ev("message.part.updated", `{"part":{"id":"p1","sessionID":"stale","messageID":"m1","type":"text","text":"NEW"}}`))
+
+	// Release packaging; the retry captures NEW and emits a revision-valid batch.
+	close(releaseCh)
+	<-done // SetSessionMessages returned → a valid batch was published
+
+	// Mirror the aggregator ordering: SetSessionMessages THEN EmitMessagesLoaded.
+	s.EmitMessagesLoaded("stale", 1, 1)
+
+	// Collect message-class events in arrival order.
+	var batches []ClientEvent
+	var seq []string
+	for _, e := range drainAll(ch) {
+		switch e.Kind {
+		case KindMessagesBatch, KindMessagesLoaded:
+			seq = append(seq, e.Kind)
+			if e.Kind == KindMessagesBatch {
+				batches = append(batches, e)
+			}
+		}
+	}
+
+	// Exactly ONE batch (the retry's valid one; the OLD capture was discarded).
+	if len(batches) != 1 {
+		t.Fatalf("want exactly 1 batch (stale discarded), got %d", len(batches))
+	}
+	// The batch must precede messages.loaded (the reveal-gate ordering contract).
+	wantSeq := []string{KindMessagesBatch, KindMessagesLoaded}
+	if !reflect.DeepEqual(seq, wantSeq) {
+		t.Fatalf("event sequence: want %v, got %v", wantSeq, seq)
+	}
+	// The batch must carry the NEW text, never the OLD text.
+	gotText := partTextFromBatch(t, batches[0].Payload, "stale", "m1", "p1")
+	if gotText != "NEW" {
+		t.Fatalf("batch part text: want NEW (stale OLD discarded), got %q", gotText)
+	}
+}
+
+// TestColdBatchPublishesConcurrentWithConcurrentApply is the race-detector
+// companion: it runs Apply (live mutations) on one goroutine while a cold-load
+// SetSessionMessages (publishColdBatch packaging) runs on another, repeatedly,
+// under -race. The -race flag is the real assertion here: the byte-copy in
+// captureMessagesBatchLocked must keep packaging (which reads those bytes
+// outside s.mu) race-free vs concurrent Apply mutations of the same session.
+//
+// NOTE: this test deliberately does NOT subscribe/drain. The store's nonblocking
+// fanout CLOSES a subscriber's channel on overflow; a closed channel would make
+// drainAll's select-with-default spin forever (it always receives zero values).
+// The race detector — not event inspection — is the assertion.
+func TestColdBatchPublishesConcurrentWithConcurrentApply(t *testing.T) {
+	s := New(100)
+	s.Apply(ev("session.created", `{"info":{"id":"race"}}`))
+
+	const mutations = 400
+	const reloads = 30
+	var wg sync.WaitGroup
+
+	// Mutator goroutine: rapidly upserts part bodies for the same session so the
+	// per-session revision churns continuously during cold-batch packaging.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < mutations; i++ {
+			s.Apply(ev("message.part.updated",
+				`{"part":{"id":"p1","sessionID":"race","messageID":"m1","type":"text","text":"v`+strconv.Itoa(i)+`"}}`))
+		}
+	}()
+
+	// Loader goroutine: repeatedly marks the session as not-loaded and re-runs a
+	// cold load, exercising publishColdBatch's capture/package/validate loop
+	// against the concurrent mutator. delete-under-lock mirrors a fresh session.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < reloads; i++ {
+			s.mu.Lock()
+			delete(s.msgLoaded, "race")
+			s.mu.Unlock()
+			s.SetSessionMessages("race", []MessageWithParts{
+				{Info: json.RawMessage(`{"id":"m1","sessionID":"race","role":"assistant","time":{"created":1}}`),
+					Parts: []json.RawMessage{json.RawMessage(`{"id":"p1","sessionID":"race","messageID":"m1","type":"text","text":"cold"}`)}},
+			})
+		}
+	}()
+
+	wg.Wait()
+}
+
+// startBlockedColdBatch installs a coldBatchAfterCaptureHook for sid that
+// signals capturedCh ONCE (on first capture) and then blocks on releaseCh
+// (returning immediately once releaseCh is closed). Returns the two channels;
+// the hook is cleared via t.Cleanup. This is the shared coordination primitive
+// for the cold-batch staleness proving tests: it lets a test deterministically
+// race a same-session mutation in the gap between capture and validation.
+func startBlockedColdBatch(t *testing.T, sid string) (capturedCh, releaseCh chan struct{}) {
+	t.Helper()
+	capturedCh = make(chan struct{})
+	releaseCh = make(chan struct{})
+	var once sync.Once
+	coldBatchAfterCaptureHook = func(s string) {
+		if s != sid {
+			return
+		}
+		once.Do(func() { close(capturedCh) })
+		<-releaseCh // block until released (instant no-op after close)
+	}
+	t.Cleanup(func() { coldBatchAfterCaptureHook = nil })
+	return capturedCh, releaseCh
+}
+
+// decodeBatchMessages decodes a KindMessagesBatch payload
+// ({sessionID,encoding:"gzip64",data:base64(gzip({"messages":[...]}))}) into the
+// message list, asserting the envelope + gzip integrity. Used by the
+// cold-batch tests that need to inspect message/part COUNTS (not just one part's
+// text, which partTextFromBatch covers).
+func decodeBatchMessages(t *testing.T, payload json.RawMessage) []MessageWithParts {
+	t.Helper()
+	var env struct {
+		SessionID string `json:"sessionID"`
+		Encoding  string `json:"encoding"`
+		Data      string `json:"data"`
+	}
+	if err := json.Unmarshal(payload, &env); err != nil {
+		t.Fatalf("batch payload unmarshal: %v", err)
+	}
+	raw, err := base64.StdEncoding.DecodeString(env.Data)
+	if err != nil {
+		t.Fatalf("batch base64 decode: %v", err)
+	}
+	gr, err := gzip.NewReader(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatalf("batch gzip reader: %v", err)
+	}
+	inner, err := io.ReadAll(gr)
+	if err != nil {
+		t.Fatalf("batch gunzip: %v", err)
+	}
+	if err := gr.Close(); err != nil {
+		t.Fatalf("batch gzip close: %v", err)
+	}
+	var p struct {
+		Messages []MessageWithParts `json:"messages"`
+	}
+	if err := json.Unmarshal(inner, &p); err != nil {
+		t.Fatalf("batch inner unmarshal: %v", err)
+	}
+	return p.Messages
+}
+
+// collectBatches drains the subscriber channel and returns the
+// KindMessagesBatch events in arrival order.
+func collectBatches(t *testing.T, ch <-chan ClientEvent) []ClientEvent {
+	t.Helper()
+	var out []ClientEvent
+	for _, e := range drainAll(ch) {
+		if e.Kind == KindMessagesBatch {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// seedOnePartSession builds a session <sid> with one assistant message m1 and
+// one text part p1 carrying <text>, returning nothing (state is in the store).
+// Used by the cold-batch staleness tests' common setup.
+func seedOnePartSession(s *Store, sid, text string) {
+	s.Apply(ev("session.created", `{"info":{"id":"`+sid+`"}}`))
+	s.Apply(ev("message.updated", `{"info":{"id":"m1","sessionID":"`+sid+`","role":"assistant","time":{"created":1}}}`))
+	s.Apply(ev("message.part.updated", `{"part":{"id":"p1","sessionID":"`+sid+`","messageID":"m1","type":"text","text":"`+text+`"}}`))
+}
+
+// TestColdBatchSnapshotFlushBumpsRev is the proving test for Finding 1: a
+// Snapshot-driven flushPartDeltasLocked that rewrites me.parts MUST bump the
+// owning session's message revision, otherwise a concurrently-packaging cold
+// batch validates against the SAME (pre-Snapshot) revision and emits the OLD
+// captured projection OVER the freshly-flushed newer text.
+//
+// Reproduction (via coldBatchAfterCaptureHook + a large deltaFlushInterval):
+//  1. Seed part p1 text "BASE"; apply delta "A" (first delta flushes → me.parts
+//     "BASEA") and delta "B" immediately (throttled → stays in deltaBuf, so
+//     me.parts lags at "BASEA" while the accumulator holds "BASEAB").
+//  2. publishColdBatch captures me.parts ("BASEA") + token T, blocks in the hook.
+//  3. Snapshot({sid}) flushes deltaBuf → me.parts "BASEAB". WITH the fix this
+//     bumps the token to T+1; WITHOUT the fix the token stays T.
+//  4. Release: publishColdBatch re-reads the token. WITH the fix T+1≠T →
+//     discard, retry captures "BASEAB", emit. WITHOUT the fix T==T → emit
+//     "BASEA" (the pre-Snapshot text leaks through over the flushed state).
+//
+// Assert: exactly ONE batch carrying "BASEAB" (both deltas applied), never
+// "BASEA". Fails without the Finding 1 fix (Snapshot flush would not bump).
+func TestColdBatchSnapshotFlushBumpsRev(t *testing.T) {
+	// Force throttling so the second delta stays buffered (deterministic,
+	// independent of host scheduling jitter).
+	prevInterval := deltaFlushInterval
+	deltaFlushInterval = time.Hour
+	t.Cleanup(func() { deltaFlushInterval = prevInterval })
+
+	s := New(100)
+	seedOnePartSession(s, "snap", "BASE")
+	// delta "A": first delta always flushes (deltaLastEmit zero) → me.parts "BASEA".
+	s.Apply(ev("message.part.delta", `{"sessionID":"snap","messageID":"m1","partID":"p1","field":"text","delta":"A"}`))
+	// delta "B": throttled (deltaFlushInterval=time.Hour) → stays in deltaBuf;
+	// me.parts still "BASEA" but the accumulator holds "BASEAB".
+	s.Apply(ev("message.part.delta", `{"sessionID":"snap","messageID":"m1","partID":"p1","field":"text","delta":"B"}`))
+
+	ch, unsub := s.Subscribe(256)
+	defer unsub()
+	drainAll(ch)
+
+	capturedCh, releaseCh := startBlockedColdBatch(t, "snap")
+
+	done := make(chan struct{})
+	go func() {
+		// Cold-load publication directly (msgLoaded["snap"] is false). Calling
+		// publishColdBatch instead of SetSessionMessages avoids reconcile
+		// overwriting the carefully-built deltaBuf accumulator.
+		s.publishColdBatch("snap")
+		close(done)
+	}()
+	<-capturedCh
+
+	// Snapshot flushes deltaBuf → me.parts "BASEAB". With the Finding 1 fix it
+	// ALSO bumps the revision token; without the fix it does not (the bug).
+	s.Snapshot(map[string]bool{"snap": true})
+
+	close(releaseCh)
+	<-done
+
+	batches := collectBatches(t, ch)
+	if len(batches) != 1 {
+		t.Fatalf("want exactly 1 batch, got %d", len(batches))
+	}
+	got := partTextFromBatch(t, batches[0].Payload, "snap", "m1", "p1")
+	if got != "BASEAB" {
+		t.Fatalf("batch text: want BASEAB (post-Snapshot flush), got %q (pre-Snapshot text leaked through)", got)
+	}
+}
+
+// TestColdBatchRecreatedSessionDoesNotReuseOldToken is the proving test for
+// Finding 2 (ABA): a per-session revision counter that resets on delete lets a
+// recreated session REUSE an old in-flight batch's captured token, so the stale
+// publication validates token==token and emits the OLD session's wholesale batch
+// over the NEW state. The Store-wide monotonic counter (bumpMsgRev via
+// nextMsgRev) guarantees a recreated session always gets a strictly-greater
+// token than any in-flight batch could have captured.
+//
+// Reproduction (via coldBatchAfterCaptureHook):
+//  1. Build session "aba" with m1/p1 text "OLD" (2 revision bumps).
+//  2. publishColdBatch captures "OLD" + token T, blocks in the hook.
+//  3. session.deleted "aba" (clears msgRev); session.created "aba"; re-apply the
+//     SAME 2 mutations with text "NEW". Under a per-session counter this
+//     reproduces token T (2 bumps from 0); under the Store-wide monotonic
+//     counter the token is T+2 (> T, never equal).
+//  4. Release: publishColdBatch re-reads the token. With the fix T+2≠T →
+//     discard, retry captures "NEW", emit. Without the fix T==T → emit "OLD"
+//     (the deleted session's stale batch over the recreated state).
+//
+// Assert: exactly ONE batch carrying "NEW" (the recreated state), never "OLD".
+func TestColdBatchRecreatedSessionDoesNotReuseOldToken(t *testing.T) {
+	s := New(100)
+	seedOnePartSession(s, "aba", "OLD") // 2 revision bumps → token T (under either scheme)
+
+	ch, unsub := s.Subscribe(256)
+	defer unsub()
+	drainAll(ch)
+
+	capturedCh, releaseCh := startBlockedColdBatch(t, "aba")
+
+	done := make(chan struct{})
+	go func() {
+		s.publishColdBatch("aba") // captures "OLD" + token T, blocks
+		close(done)
+	}()
+	<-capturedCh
+
+	// Delete + recreate the SAME session id, re-applying the SAME mutation
+	// sequence (2 bumps) with NEW text. Per-session counter: reproduces token T.
+	// Store-wide monotonic: token T+2 (strictly greater).
+	s.Apply(ev("session.deleted", `{"info":{"id":"aba"}}`))
+	s.Apply(ev("session.created", `{"info":{"id":"aba"}}`))
+	s.Apply(ev("message.updated", `{"info":{"id":"m1","sessionID":"aba","role":"assistant","time":{"created":1}}}`))
+	s.Apply(ev("message.part.updated", `{"part":{"id":"p1","sessionID":"aba","messageID":"m1","type":"text","text":"NEW"}}`))
+
+	close(releaseCh)
+	<-done
+
+	batches := collectBatches(t, ch)
+	if len(batches) != 1 {
+		t.Fatalf("want exactly 1 batch, got %d", len(batches))
+	}
+	got := partTextFromBatch(t, batches[0].Payload, "aba", "m1", "p1")
+	if got != "NEW" {
+		t.Fatalf("batch text: want NEW (recreated session), got %q (old session's stale batch leaked through — ABA)", got)
+	}
+}
+
+// TestSetSessionMessagesReturnsSessionGoneWhenDeletedDuringCapture is the proving
+// test for Finding 3: messages.loaded must NEVER fire without a preceding valid
+// messages.batch. publishColdBatch returns a ColdBatchStatus that distinguishes
+// "valid batch published" (Emitted / WarmReconcile) from "no batch published"
+// (SessionGone / PackagingFailed); the aggregator gates EmitMessagesLoaded on
+// Emitted|WarmReconcile ONLY.
+//
+// This test forces the SessionGone path deterministically: a session.deleted
+// landing in the capture→validation window makes capture return nil on the
+// retry, so publishColdBatch returns ColdBatchSessionGone and emits NO batch.
+// The test then MIRRORS the aggregator's gating and asserts no batch AND no
+// messages.loaded. Without the Finding 3 fix SetSessionMessages has no return
+// value (the status cannot exist), so this test cannot even be written.
+//
+// (The SessionGone status is only reachable via the narrow reconcile→capture
+// window; the coldBatchAfterCaptureHook is the deterministic injection point.
+// The happy-path regression guard — that a successful cold/zero-message load
+// DOES emit messages.loaded — is TestEnsureMessagesAsyncSuccessEmitsCompletion
+// in pkg/aggregator.)
+func TestSetSessionMessagesReturnsSessionGoneWhenDeletedDuringCapture(t *testing.T) {
+	s := New(100)
+	seedOnePartSession(s, "gone", "OLD")
+
+	ch, unsub := s.Subscribe(256)
+	defer unsub()
+	drainAll(ch)
+
+	// The hook deletes the session ON THE FIRST CAPTURE, so attempt 0's
+	// validation sees a changed token (delete cleared msgRev → 0 ≠ T) and
+	// discards; attempt 1's capture then reads s.messages["gone"]==nil → returns
+	// nil → ColdBatchSessionGone. No batch is ever emitted.
+	capturedCh := make(chan struct{})
+	releaseCh := make(chan struct{})
+	var once sync.Once
+	coldBatchAfterCaptureHook = func(sid string) {
+		if sid != "gone" {
+			return
+		}
+		once.Do(func() {
+			// Simulate a live session.deleted landing between capture and
+			// validation. deleteSessionLocked clears msgRev + s.messages.
+			s.mu.Lock()
+			s.deleteSessionLocked("gone")
+			s.mu.Unlock()
+			close(capturedCh)
+		})
+		<-releaseCh // subsequent attempts (the nil-capture retry) pass through
+	}
+	t.Cleanup(func() { coldBatchAfterCaptureHook = nil })
+
+	oldList := []MessageWithParts{
+		{Info: json.RawMessage(`{"id":"m1","sessionID":"gone","role":"assistant","time":{"created":1}}`),
+			Parts: []json.RawMessage{json.RawMessage(`{"id":"p1","sessionID":"gone","messageID":"m1","type":"text","text":"OLD"}`)}},
+	}
+
+	var status ColdBatchStatus
+	done := make(chan struct{})
+	go func() {
+		status = s.SetSessionMessages("gone", oldList)
+		close(done)
+	}()
+	<-capturedCh
+	close(releaseCh)
+	<-done
+
+	// The status MUST be SessionGone (capture returned nil on the retry).
+	if status != ColdBatchSessionGone {
+		t.Fatalf("SetSessionMessages status: want ColdBatchSessionGone, got %v", status)
+	}
+
+	// Mirror the aggregator's Finding-3 gating: loaded is emitted ONLY for
+	// Emitted|WarmReconcile. For SessionGone it MUST NOT be emitted.
+	if status == ColdBatchEmitted || status == ColdBatchWarmReconcile {
+		s.EmitMessagesLoaded("gone", 1, 1)
+	}
+
+	// Assert NO messages.batch and NO messages.loaded for the gone session.
+	for _, e := range drainAll(ch) {
+		if e.Kind == KindMessagesBatch || e.Kind == KindMessagesLoaded {
+			t.Fatalf("unexpected event for gone session: %s (loaded must not fire without a preceding valid batch)", e.Kind)
+		}
+	}
+}
+
+// TestColdBatchInvalidatedByMessageRemoved is a nice-to-have covering the
+// message.removed revision path: a live message deletion during packaging MUST
+// invalidate the captured batch so the retry reflects the deletion (0 messages),
+// never the deleted message. Without the delete bump the stale batch would carry
+// the deleted message.
+func TestColdBatchInvalidatedByMessageRemoved(t *testing.T) {
+	s := New(100)
+	seedOnePartSession(s, "mr", "OLD")
+	ch, unsub := s.Subscribe(256)
+	defer unsub()
+	drainAll(ch)
+
+	capturedCh, releaseCh := startBlockedColdBatch(t, "mr")
+	done := make(chan struct{})
+	go func() {
+		s.publishColdBatch("mr")
+		close(done)
+	}()
+	<-capturedCh
+	s.Apply(ev("message.removed", `{"sessionID":"mr","messageID":"m1"}`))
+	close(releaseCh)
+	<-done
+
+	batches := collectBatches(t, ch)
+	if len(batches) != 1 {
+		t.Fatalf("want exactly 1 batch, got %d", len(batches))
+	}
+	msgs := decodeBatchMessages(t, batches[0].Payload)
+	if len(msgs) != 0 {
+		t.Fatalf("want 0 messages (m1 deleted before emit), got %d", len(msgs))
+	}
+}
+
+// TestColdBatchInvalidatedByPartRemoved covers the message.part.removed revision
+// path: a live part deletion during packaging MUST invalidate the captured batch
+// so the retry reflects the deletion (part gone), never the deleted part.
+func TestColdBatchInvalidatedByPartRemoved(t *testing.T) {
+	s := New(100)
+	seedOnePartSession(s, "pr", "OLD")
+	ch, unsub := s.Subscribe(256)
+	defer unsub()
+	drainAll(ch)
+
+	capturedCh, releaseCh := startBlockedColdBatch(t, "pr")
+	done := make(chan struct{})
+	go func() {
+		s.publishColdBatch("pr")
+		close(done)
+	}()
+	<-capturedCh
+	s.Apply(ev("message.part.removed", `{"sessionID":"pr","messageID":"m1","partID":"p1"}`))
+	close(releaseCh)
+	<-done
+
+	batches := collectBatches(t, ch)
+	if len(batches) != 1 {
+		t.Fatalf("want exactly 1 batch, got %d", len(batches))
+	}
+	msgs := decodeBatchMessages(t, batches[0].Payload)
+	if len(msgs) != 1 {
+		t.Fatalf("want 1 message (m1 still present), got %d", len(msgs))
+	}
+	// The part must be GONE in the emitted batch (deleted before emit). Without
+	// the part-delete bump the stale batch would still carry p1.
+	var partCount int
+	for _, part := range msgs[0].Parts {
+		var pe struct {
+			ID string `json:"id"`
+		}
+		_ = json.Unmarshal(part, &pe)
+		if pe.ID == "p1" {
+			partCount++
+		}
+	}
+	if partCount != 0 {
+		t.Fatalf("want p1 absent (deleted before emit), still present %d time(s)", partCount)
+	}
+}
+
+// TestColdBatchInvalidatedByMessageUpdated covers the message.updated revision
+// path: a live message body change during packaging MUST invalidate the captured
+// batch so the retry carries the updated body. Asserted via the role field
+// (assistant→user) so the proof is content-based, not just batch-count.
+func TestColdBatchInvalidatedByMessageUpdated(t *testing.T) {
+	s := New(100)
+	seedOnePartSession(s, "mu", "OLD")
+	ch, unsub := s.Subscribe(256)
+	defer unsub()
+	drainAll(ch)
+
+	capturedCh, releaseCh := startBlockedColdBatch(t, "mu")
+	done := make(chan struct{})
+	go func() {
+		s.publishColdBatch("mu")
+		close(done)
+	}()
+	<-capturedCh
+	// Change the message body (role assistant→user) during packaging.
+	s.Apply(ev("message.updated", `{"info":{"id":"m1","sessionID":"mu","role":"user","time":{"created":1}}}`))
+	close(releaseCh)
+	<-done
+
+	batches := collectBatches(t, ch)
+	if len(batches) != 1 {
+		t.Fatalf("want exactly 1 batch, got %d", len(batches))
+	}
+	msgs := decodeBatchMessages(t, batches[0].Payload)
+	if len(msgs) != 1 {
+		t.Fatalf("want 1 message, got %d", len(msgs))
+	}
+	var info struct {
+		ID   string `json:"id"`
+		Role string `json:"role"`
+	}
+	if err := json.Unmarshal(msgs[0].Info, &info); err != nil {
+		t.Fatalf("unmarshal message info: %v", err)
+	}
+	if info.Role != "user" {
+		t.Fatalf("want role user (updated before emit), got %q (stale assistant leaked through)", info.Role)
+	}
+}
+
+// TestColdBatchInvalidatedByWarmReconcile covers the warm-reconcile revision
+// path: a warm re-fetch (msgLoaded already true) of a session while a prior cold
+// batch is mid-packaging MUST invalidate that batch. reconcileMessagesLocked
+// bumps the token on BOTH cold and warm paths.
+func TestColdBatchInvalidatedByWarmReconcile(t *testing.T) {
+	s := New(100)
+	seedOnePartSession(s, "wr", "OLD")
+	// Pretend the session is already loaded so the SetSessionMessages below is a
+	// WARM reconcile (coldLoad==false) — it emits deltas + bumps the token but
+	// does NOT itself call publishColdBatch.
+	s.mu.Lock()
+	s.msgLoaded["wr"] = true
+	s.mu.Unlock()
+
+	ch, unsub := s.Subscribe(256)
+	defer unsub()
+	drainAll(ch)
+
+	capturedCh, releaseCh := startBlockedColdBatch(t, "wr")
+	done := make(chan struct{})
+	go func() {
+		s.publishColdBatch("wr") // captures "OLD", blocks
+		close(done)
+	}()
+	<-capturedCh
+	// Warm reconcile with NEWER text. Bumps the token → invalidates the captured
+	// "OLD" batch; the release then makes publishColdBatch retry + capture "WARM".
+	s.SetSessionMessages("wr", []MessageWithParts{
+		{Info: json.RawMessage(`{"id":"m1","sessionID":"wr","role":"assistant","time":{"created":1}}`),
+			Parts: []json.RawMessage{json.RawMessage(`{"id":"p1","sessionID":"wr","messageID":"m1","type":"text","text":"WARM"}`)}},
+	})
+	close(releaseCh)
+	<-done
+
+	batches := collectBatches(t, ch)
+	if len(batches) != 1 {
+		t.Fatalf("want exactly 1 batch, got %d", len(batches))
+	}
+	got := partTextFromBatch(t, batches[0].Payload, "wr", "m1", "p1")
+	if got != "WARM" {
+		t.Fatalf("batch text: want WARM (warm-reconciled), got %q (pre-reconcile stale leaked through)", got)
+	}
+}
+
+// TestPublishColdBatchRetryExhaustionFallsBackToLocked covers the bounded-retry
+// FAIL-SAFE: a session changing so fast that every capture validates stale
+// (revision churns on every attempt) must NOT give up without delivering a valid
+// batch. After maxColdBatchRetries the last resort repackages ONCE UNDER s.mu so
+// the emitted batch is current at emit time. Asserts exactly ONE batch carrying
+// the final state (no stale emit, no skip).
+func TestPublishColdBatchRetryExhaustionFallsBackToLocked(t *testing.T) {
+	s := New(100)
+	seedOnePartSession(s, "ex", "OLD")
+	ch, unsub := s.Subscribe(256)
+	defer unsub()
+	drainAll(ch)
+
+	// The hook applies a part.updated on EVERY capture (including retries), so
+	// the token churns on every attempt and the retry loop never converges →
+	// forces the fail-safe locked repackage. Text is fixed ("LOCKED") so the
+	// fallback's locked capture reads a stable value.
+	coldBatchAfterCaptureHook = func(sid string) {
+		if sid != "ex" {
+			return
+		}
+		s.Apply(ev("message.part.updated", `{"part":{"id":"p1","sessionID":"ex","messageID":"m1","type":"text","text":"LOCKED"}}`))
+	}
+	t.Cleanup(func() { coldBatchAfterCaptureHook = nil })
+
+	s.publishColdBatch("ex")
+
+	batches := collectBatches(t, ch)
+	if len(batches) != 1 {
+		t.Fatalf("want exactly 1 batch (the fail-safe locked repackage), got %d", len(batches))
+	}
+	got := partTextFromBatch(t, batches[0].Payload, "ex", "m1", "p1")
+	if got != "LOCKED" {
+		t.Fatalf("batch text: want LOCKED (fail-safe current capture), got %q", got)
 	}
 }
 

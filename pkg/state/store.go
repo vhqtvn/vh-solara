@@ -394,6 +394,41 @@ type Store struct {
 	// are hydrated lazily (on first open) so startup doesn't fetch every
 	// session's history — critical with thousands of sessions.
 	msgLoaded map[string]bool
+	// msgRev is a per-session message revision TOKEN bumped under s.mu for
+	// EVERY mutation capable of changing that session's cold-batch/snapshot
+	// message output (message/part upsert+delete, streaming part-delta append
+	// — including the Snapshot-driven delta flush, history reconcile). It
+	// backs the stale-batch guard: cold-load messages.batch packaging (JSON
+	// marshal + gzip + base64) runs OUTSIDE s.mu (mirroring the SSE snapshot
+	// precedent in pkg/web/server.go), so a live mutation landing during
+	// packaging would otherwise let a STALE prepared batch overwrite newer
+	// live deltas on the client — and the client treats messages.batch as a
+	// WHOLESALE REPLACEMENT (web/src/sync/stream.ts). publishColdBatch
+	// captures the token at capture time and, after packaging, re-acquires
+	// the lock and emits the batch ONLY if the token is unchanged —
+	// discarding + retrying when a mutation invalidated the captured
+	// projection.
+	//
+	// The token is drawn from nextMsgRev (Store-wide monotonic) via
+	// bumpMsgRev, NOT a per-session counter, so it is GLOBALLY NON-REPEATING.
+	// A per-session counter that resets on delete would be vulnerable to an
+	// ABA race: old session cold-batch captures at token N; session deleted;
+	// same ID recreated; one mutation reproduces token N; the stale
+	// publication validates N==N and emits the OLD session's wholesale batch
+	// over the NEW state. The Store-wide counter guarantees a recreated
+	// session always gets a strictly-greater token than any in-flight batch
+	// could have captured. Cleared in deleteSessionLocked alongside the other
+	// per-session maps (the map entry is dropped — no leak of deleted session
+	// IDs — but nextMsgRev keeps climbing). A never-bumped session reads as 0
+	// (Go map zero value), which is a valid baseline.
+	msgRev map[string]uint64
+	// nextMsgRev is the Store-wide monotonic source of per-session message
+	// revision tokens. bumpMsgRev advances it (++ once per logical mutation)
+	// and assigns the new value to the owning session's msgRev[sid]. See the
+	// msgRev comment for why it is Store-wide (non-repeating) rather than
+	// per-session (ABA-vulnerable). Zero is never handed out: the first bump
+	// yields 1, so 0 remains a safe "never mutated" sentinel.
+	nextMsgRev uint64
 	// coldFetchActive marks sessions whose background full-history GET
 	// (EnsureMessagesAsync) is in flight. Live events that arrive while this
 	// flag is set tag their entries (liveTouchedBody / liveTouchedParts) so
@@ -445,11 +480,24 @@ func New(ringCapacity int) *Store {
 		unread:          map[string]bool{},
 		busyCount:       map[string]int{},
 		msgLoaded:       map[string]bool{},
+		msgRev:          map[string]uint64{},
 		coldFetchActive: map[string]bool{},
 		seeded:          map[string]bool{},
 		ring:            newRingBuffer(ringCapacity),
 		subs:            map[int]*subscriber{},
 	}
+}
+
+// bumpMsgRev advances the Store-wide monotonic token and assigns it to the
+// owning session's msgRev[sid]. Called under s.mu for EVERY mutation capable
+// of changing a session's cold-batch/snapshot message projection (message/part
+// upsert+delete, streaming part-delta append, Snapshot delta flush, history
+// reconcile). Store-wide (not per-session) so the token is globally
+// non-repeating: a deleted-then-recreated session can never reuse an old
+// in-flight batch's token (the ABA fix). Exactly one bump per logical change.
+func (s *Store) bumpMsgRev(sid string) {
+	s.nextMsgRev++
+	s.msgRev[sid] = s.nextMsgRev
 }
 
 // emit stamps, records, and fans out a client event. Caller must hold s.mu.
@@ -888,6 +936,7 @@ func (s *Store) deleteSessionLocked(id string) {
 	delete(s.sessions, id)
 	delete(s.messages, id)
 	delete(s.msgLoaded, id)
+	delete(s.msgRev, id)
 	delete(s.coldFetchActive, id)
 	// Drop the cold-seed memo so a session recreated under the same id (live
 	// session.deleted then session.created, an archive/un-archive, or a hydrate
@@ -1089,6 +1138,11 @@ func (s *Store) upsertMessageLocked(info json.RawMessage) {
 			sm.byID[env.ID].liveTouchedBody = true
 		}
 	}
+	// Any change to this session's message body/order changes its cold-batch
+	// projection, so bump the per-session message revision token under the
+	// lock. This is what lets publishColdBatch discard a stale prepared batch
+	// when a live mutation lands during (unlocked) packaging.
+	s.bumpMsgRev(env.SessionID)
 	s.emit(KindMessageUpsert, info)
 	if env.Role == "assistant" {
 		s.recomputeLastAssistantLocked(env.SessionID)
@@ -1320,6 +1374,10 @@ func (s *Store) deleteMessageLocked(sessionID, messageID string) {
 		}
 	}
 	s.recomputeLastAssistantLocked(sessionID)
+	// A message deletion changes this session's cold-batch projection; bump the
+	// per-session message revision token so a concurrently-packaging cold batch
+	// is discarded as stale.
+	s.bumpMsgRev(sessionID)
 	s.emit(KindMessageDelete, rawObj(map[string]interface{}{"sessionID": sessionID, "messageID": messageID}))
 }
 
@@ -1355,6 +1413,10 @@ func (s *Store) upsertPartLocked(part json.RawMessage) {
 		}
 		me.liveTouchedParts[env.ID] = true
 	}
+	// An authoritative part snapshot changes this session's cold-batch
+	// projection; bump the per-session message revision token so a concurrently-
+	// packaging cold batch is discarded as stale.
+	s.bumpMsgRev(env.SessionID)
 	s.emit(KindPartUpsert, part)
 	// Authoritative snapshot: discard any unflushed streaming accumulator for
 	// this part — the snapshot supersedes buffered deltas (never let stale
@@ -1457,6 +1519,12 @@ func (s *Store) appendPartDeltaLocked(sessionID, messageID, partID, field, delta
 		me.deltaLastEmit = now
 	}
 
+	// A streaming delta (and its throttled flush, which rewrites me.parts
+	// directly without going through upsertPartLocked) changes this session's
+	// cold-batch projection; bump the per-session message revision token so a
+	// concurrently-packaging cold batch is discarded as stale.
+	s.bumpMsgRev(sessionID)
+
 	// Streaming deltas mean the turn is actively generating right now — assert
 	// busy (cheap no-op once set) even when this delta was buffered. Cleared
 	// when the assistant message completes (upsertMessageLocked) or on
@@ -1476,7 +1544,15 @@ func (s *Store) appendPartDeltaLocked(sessionID, messageID, partID, field, delta
 // text (never appends), so there is no double-application. Reset happens only
 // on authoritative overwrite (upsertPartLocked / reconcileMessagesLocked) or
 // part deletion. Caller holds s.mu.
-func (me *messageEntry) flushPartDeltasLocked(s *Store, emit bool) {
+//
+// Returns changed=true iff at least one part's me.parts entry was rewritten.
+// This lets the Snapshot caller (emit=false) bump the owning session's message
+// revision EXACTLY ONCE per logical change, covering the Snapshot-driven flush
+// path (Finding 1: a Snapshot flush that rewrites me.parts without a rev bump
+// would let a stale cold batch validate against the SAME rev and overwrite the
+// freshly-flushed text). The appendPartDeltaLocked caller ignores the return:
+// it bumps unconditionally (its own logic already covers the delta append).
+func (me *messageEntry) flushPartDeltasLocked(s *Store, emit bool) (changed bool) {
 	for key, buf := range me.deltaBuf {
 		partID, field, ok := strings.Cut(key, "\x00")
 		if !ok {
@@ -1492,11 +1568,13 @@ func (me *messageEntry) flushPartDeltasLocked(s *Store, emit bool) {
 		part[field] = buf.String()
 		if updated, err := json.Marshal(part); err == nil {
 			me.parts[partID] = updated
+			changed = true
 			if emit {
 				s.emit(KindPartUpsert, updated)
 			}
 		}
 	}
+	return changed
 }
 
 // discardPartDeltaLocked drops every streaming accumulator entry whose partID
@@ -1537,6 +1615,10 @@ func (s *Store) deletePartLocked(sessionID, messageID, partID string) {
 			discardPartDeltaLocked(me, partID)
 		}
 	}
+	// A part deletion changes this session's cold-batch projection; bump the
+	// per-session message revision token so a concurrently-packaging cold batch
+	// is discarded as stale.
+	s.bumpMsgRev(sessionID)
 	s.emit(KindPartDelete, rawObj(map[string]interface{}{
 		"sessionID": sessionID, "messageID": messageID, "partID": partID,
 	}))
@@ -1591,20 +1673,38 @@ func (s *Store) Snapshot(messagesFor map[string]bool) Snapshot {
 	// session's buffered deltas stay intact and converge on the next full
 	// Snapshot(nil)/Snapshot({}) or the throttle flush in appendPartDeltaLocked.
 	// No data loss.
+	//
+	// Finding 1: a Snapshot-driven flush that rewrites me.parts WITHOUT bumping
+	// the owning session's message revision would let a concurrently-packaging
+	// cold batch validate against the SAME (pre-Snapshot) revision and emit the
+	// OLD captured projection OVER the freshly-flushed newer text. So track
+	// which sessions a flush actually changed and bump each one's revision
+	// EXACTLY ONCE (via bumpMsgRev) after the flush loops. appendPartDeltaLocked
+	// already bumps unconditionally for its own delta append, so this Snapshot
+	// bump never double-counts a logical change — it covers only the flush path
+	// that appendPartDeltaLocked's bump does not.
+	changedSessions := map[string]bool{}
 	if scopeSelected {
 		for sid := range messagesFor {
 			if sm := s.messages[sid]; sm != nil {
 				for _, me := range sm.byID {
-					me.flushPartDeltasLocked(s, false)
+					if me.flushPartDeltasLocked(s, false) {
+						changedSessions[sid] = true
+					}
 				}
 			}
 		}
 	} else {
-		for _, sm := range s.messages {
+		for sid, sm := range s.messages {
 			for _, me := range sm.byID {
-				me.flushPartDeltasLocked(s, false)
+				if me.flushPartDeltasLocked(s, false) {
+					changedSessions[sid] = true
+				}
 			}
 		}
+	}
+	for sid := range changedSessions {
+		s.bumpMsgRev(sid)
 	}
 
 	snap := Snapshot{
@@ -2007,9 +2107,15 @@ func (s *Store) Replay(cursor uint64) (events []ClientEvent, head uint64, ok boo
 // gone — so connected clients reconcile incrementally without re-receiving
 // unchanged history. Used on the daemon's own (re)connect to OpenCode, whose
 // event stream has no replay. Byte comparison decides "changed".
+//
+// The session reconcile + message reconcile run under s.mu, then the lock is
+// released BEFORE the cold-batch packaging loop: marshal+gzip+base64 is too
+// expensive to hold the global lock for (it blocks all Apply ingestion). Each
+// cold batch is published via publishColdBatch, which re-validates the per-
+// session revision before emitting so a stale batch can never overwrite newer
+// live deltas.
 func (s *Store) Hydrate(sessions []json.RawMessage, messages map[string][]MessageWithParts) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	// --- sessions ---
 	seen := make(map[string]bool, len(sessions))
@@ -2035,31 +2141,61 @@ func (s *Store) Hydrate(sessions []json.RawMessage, messages map[string][]Messag
 
 	// --- messages + parts (only for the sessions provided; lazy hydration
 	// means this is empty on first connect and just the opened sessions on
-	// reconnect, instead of every session) ---
+	// reconnect, instead of every session). Reconcile under the lock; collect
+	// the cold-load sessions so their (expensive) batch packaging runs OUTSIDE
+	// s.mu via publishColdBatch (marshal+gzip+base64 must not hold the global
+	// lock — it blocks all Apply ingestion during compression). ---
+	var coldBatched []string
 	for sid, list := range messages {
-		s.reconcileMessagesLocked(sid, list)
+		if s.reconcileMessagesLocked(sid, list) {
+			coldBatched = append(coldBatched, sid)
+		}
+	}
+	s.mu.Unlock()
+
+	// Package each cold batch outside the lock. Per-session revision validation
+	// (inside publishColdBatch) guarantees each emitted batch is current for its
+	// own session; inter-session order is not significant since each batch
+	// carries its own sessionID. Hydrate does not emit messages.loaded — that is
+	// the aggregator's per-session completion signal, not part of bulk hydrate
+	// (reconnect replays via snapshots, not loaded events).
+	for _, sid := range coldBatched {
+		_ = s.publishColdBatch(sid)
 	}
 }
 
 // reconcileMessagesLocked diffs one session's full message list into the store,
 // emitting upsert/delete events for changes, and marks the session's messages
-// as loaded. Caller must hold s.mu.
+// as loaded. Caller must hold s.mu. It returns coldLoad=true when this was the
+// session's first load (!s.msgLoaded[sid] at entry); in that case the caller is
+// responsible for packaging the wholesale KindMessagesBatch OUTSIDE s.mu via
+// publishColdBatch (marshal+gzip+base64 is too expensive to hold the global
+// lock for — it blocks all event ingestion). On the warm/incremental path it
+// returns false and no batch is produced (individual upserts are emitted here).
 //
 // Cold-load batching: when the session was NOT previously loaded
 // (s.msgLoaded[sid] false at entry — the SetSessionMessages lazy-hydration path,
 // or a Hydrate on a fresh daemon with no connected clients), the per-message
 // message.upsert + per-part part.upsert emits are SUPPRESSED and a SINGLE
-// KindMessagesBatch is emitted instead, carrying the entire reconciled
-// message+part list as one wholesale payload. This collapses the cold-load
-// N-event fan-out (over the controller tunnel each event becomes a yamux frame
-// + WebSocket message + flow-control round-trip — the root cause of the
-// session-switch cold-load stall) into a single event the client ingests in one
-// mutation. The warm/incremental path (msgLoaded already true — a daemon
-// OpenCode-stream reconnect for an already-loaded session) keeps emitting
+// KindMessagesBatch is emitted instead (by publishColdBatch, outside the lock),
+// carrying the entire reconciled message+part list as one wholesale payload. This
+// collapses the cold-load N-event fan-out (over the controller tunnel each event
+// becomes a yamux frame + WebSocket message + flow-control round-trip — the root
+// cause of the session-switch cold-load stall) into a single event the client
+// ingests in one mutation. The warm/incremental path (msgLoaded already true — a
+// daemon OpenCode-stream reconnect for an already-loaded session) keeps emitting
 // individual upserts so a connected client reconciles only the diffs.
-func (s *Store) reconcileMessagesLocked(sid string, list []MessageWithParts) {
-	coldLoad := !s.msgLoaded[sid] // detect BEFORE setting it true (msgLoaded lifecycle is unchanged)
+func (s *Store) reconcileMessagesLocked(sid string, list []MessageWithParts) (coldLoad bool) {
+	coldLoad = !s.msgLoaded[sid] // detect BEFORE setting it true (msgLoaded lifecycle is unchanged)
 	s.msgLoaded[sid] = true
+	// The authoritative history reconcile rewrites this session's message/part
+	// state (info, parts, order, and — on the warm path — absence deletions),
+	// so bump the per-session message revision token under the lock. This is
+	// what lets publishColdBatch discard a stale prepared batch whose capture
+	// point predates this reconcile. Covers BOTH cold and warm reconciles: a
+	// warm re-fetch of an already-loaded session while a prior cold batch is
+	// still mid-packaging must also invalidate that batch.
+	s.bumpMsgRev(sid)
 	sm := s.messages[sid]
 	if sm == nil {
 		sm = &sessionMessages{byID: map[string]*messageEntry{}}
@@ -2184,25 +2320,60 @@ func (s *Store) reconcileMessagesLocked(sid string, list []MessageWithParts) {
 			me.liveTouchedParts = nil
 		}
 		delete(s.coldFetchActive, sid)
-		// Collapse the cold-load N-event fan-out into ONE wholesale event. The
-		// payload mirrors the snapshot's message serialization (MessageWithParts
-		// {Info, Parts}) so the client ingests it identically. Built from the
-		// reconciled state (post-diff), so it reflects whatever live events may
-		// have arrived pre-fetch too. Emitted here (last) so the caller's
-		// EmitMessagesLoaded remains the back-of-channel completion signal.
-		s.emitMessagesBatchLocked(sid)
+		// NOTE: the wholesale KindMessagesBatch is NOT emitted here. It is
+		// packaged OUTSIDE s.mu by publishColdBatch (the caller), because the
+		// marshal+gzip+base64 pipeline is too expensive to hold the global
+		// lock for (it blocks all Apply ingestion during compression). The
+		// caller re-validates the per-session message revision before emitting
+		// so a stale prepared batch can never overwrite newer live deltas.
 	}
+	return coldLoad
 }
 
-// emitMessagesBatchLocked emits a single KindMessagesBatch carrying a session's
-// entire reconciled message+part list as ONE wholesale payload. Caller must hold
-// s.mu. The message shape (MessageWithParts{Info, Parts}) and ordering mirror
-// the Snapshot message serialization exactly, so the client ingests the batch
-// via the same buildMessages path a warm-session snapshot uses.
+// captureMessagesBatchLocked builds the wholesale-batch projection for one
+// session (the same MessageWithParts {Info, Parts} shape, in sm.order /
+// me.partOrder order, that the snapshot serialization uses) and returns it
+// together with the current per-session message revision. Caller must hold s.mu.
 //
-// The payload is APPLICATION-COMPRESSED to cut cold-load hydrate latency over
-// the controller tunnel (text compresses ~5-10x; the transport — SSE over
-// yamux/WebSocket through nginx — does NOT compress). shape:
+// Every json.RawMessage whose backing bytes escape the lock (me.info and each
+// me.parts[pid]) is COPIED. Message/part mutations today REPLACE map values
+// (they never mutate a backing array in place), so the copy is defensive; but it
+// is required for the -race detector (packaging reads these bytes outside s.mu)
+// and bulletproofs any future in-place mutation. Returns a nil list when there
+// is no message state (e.g. an empty cold fetch, or the session was deleted
+// between reconcile and capture) — the caller treats nil as "nothing to emit".
+func (s *Store) captureMessagesBatchLocked(sid string) ([]MessageWithParts, uint64) {
+	sm := s.messages[sid]
+	if sm == nil {
+		return nil, s.msgRev[sid] // defensive: no message state (empty fetch / deleted)
+	}
+	list := make([]MessageWithParts, 0, len(sm.order))
+	for _, mid := range sm.order {
+		me := sm.byID[mid]
+		if me == nil {
+			continue
+		}
+		parts := make([]json.RawMessage, 0, len(me.partOrder))
+		for _, pid := range me.partOrder {
+			parts = append(parts, append([]byte(nil), me.parts[pid]...))
+		}
+		list = append(list, MessageWithParts{
+			Info:  append([]byte(nil), me.info...),
+			Parts: parts,
+		})
+	}
+	return list, s.msgRev[sid]
+}
+
+// packageMessagesBatch performs the APPLICATION-COMPRESSED encoding of a
+// captured message projection into a KindMessagesBatch payload. It is PURE: no
+// store access, no lock, no s.mu — this is the work that was previously done
+// under the write lock (the root cause of the cold-load contention) and now runs
+// outside it. Returns nil on any marshal/gzip error (already logged) so the
+// caller can skip emitting a malformed batch.
+//
+// The payload shape (mirroring the SSE snapshot precedent at server.go:1075-1093,
+// which also marshals/compresses AFTER returning from the store lock):
 //
 //	{"sessionID": sid, "encoding":"gzip64", "data":"<base64-gzip>"}
 //
@@ -2214,22 +2385,9 @@ func (s *Store) reconcileMessagesLocked(sid string, list []MessageWithParts) {
 // SSE data: fields are text/UTF-8 and raw gzip bytes are not valid UTF-8.
 // Always-compress policy (the batch only fires for cold-loads, which are
 // non-trivial by nature, so there is no small-payload case worth a threshold).
-func (s *Store) emitMessagesBatchLocked(sid string) {
-	sm := s.messages[sid]
-	if sm == nil {
-		return // defensive: no message state (e.g. an empty cold fetch)
-	}
-	list := make([]MessageWithParts, 0, len(sm.order))
-	for _, mid := range sm.order {
-		me := sm.byID[mid]
-		if me == nil {
-			continue
-		}
-		parts := make([]json.RawMessage, 0, len(me.partOrder))
-		for _, pid := range me.partOrder {
-			parts = append(parts, me.parts[pid])
-		}
-		list = append(list, MessageWithParts{Info: me.info, Parts: parts})
+func packageMessagesBatch(sid string, list []MessageWithParts) json.RawMessage {
+	if list == nil {
+		return nil
 	}
 	inner, err := json.Marshal(struct {
 		Messages []MessageWithParts `json:"messages"`
@@ -2239,12 +2397,12 @@ func (s *Store) emitMessagesBatchLocked(sid string) {
 		// discard would mask a future regression (e.g. a non-marshalable field
 		// added to MessageWithParts). Bail rather than emit a malformed batch.
 		vhlog.Warn("messages.batch: marshal inner failed", "sessionID", sid, "err", err)
-		return
+		return nil
 	}
 	// gzip the inner messages JSON, then base64-encode so the bytes survive
 	// SSE's text/UTF-8 data: framing. Default compression level: the batch is
-	// emitted under s.mu and only on cold-load, so the marginal CPU is fine and
-	// gzip's default (DefaultCompression) gives the best size/speed tradeoff.
+	// only emitted on cold-load, so the marginal CPU is fine and gzip's default
+	// (DefaultCompression) gives the best size/speed tradeoff.
 	var buf bytes.Buffer
 	gw := gzip.NewWriter(&buf)
 	_, _ = gw.Write(inner) // gzip.Writer.Write does not return a meaningful error mid-stream
@@ -2252,10 +2410,10 @@ func (s *Store) emitMessagesBatchLocked(sid string) {
 		// gzip.Close flushes the trailer; on failure buf holds an incomplete
 		// gzip stream whose base64 would be undecodable on the client. The
 		// *bytes.Buffer backing writer cannot fail today, but do not silently
-		// swallow a future regression — fall back to emitting nothing (the
-		// client re-fetches on the next cold load) instead of corrupt bytes.
+		// swallow a future regression — skip emitting (the client re-fetches on
+		// the next cold load) instead of corrupt bytes.
 		vhlog.Warn("messages.batch: gzip close failed", "sessionID", sid, "err", err)
-		return
+		return nil
 	}
 	payload, err := json.Marshal(struct {
 		SessionID string `json:"sessionID"`
@@ -2264,9 +2422,144 @@ func (s *Store) emitMessagesBatchLocked(sid string) {
 	}{SessionID: sid, Encoding: "gzip64", Data: base64.StdEncoding.EncodeToString(buf.Bytes())})
 	if err != nil {
 		vhlog.Warn("messages.batch: marshal payload failed", "sessionID", sid, "err", err)
-		return
+		return nil
+	}
+	return payload
+}
+
+// coldBatchAfterCaptureHook is a test-only seam. When non-nil, publishColdBatch
+// invokes it AFTER capturing the projection under the lock and releasing the
+// lock, BEFORE packaging. A test sets it to block (e.g. on a channel) so it can
+// apply a concurrent same-session mutation between capture and publish, then
+// assert the stale prepared batch is discarded and the retry emits the newer
+// state. Nil in production.
+var coldBatchAfterCaptureHook func(sid string)
+
+// ColdBatchStatus is the outcome of a cold-load messages.batch publication
+// (publishColdBatch / SetSessionMessages). It makes publication success
+// EXPLICIT so the aggregator callers can gate EmitMessagesLoaded correctly:
+// messages.loaded must follow a valid messages.batch, and must NOT fire when
+// the session disappeared or packaging failed (Finding 3 — without this the
+// aggregator UNCONDITIONALLY called EmitMessagesLoaded, so messages.loaded
+// could be delivered with no preceding messages.batch, breaking the
+// one-batch-before-loaded ordering contract the client relies on).
+type ColdBatchStatus int
+
+const (
+	// ColdBatchEmitted: a revision-VALID KindMessagesBatch was published. The
+	// caller SHOULD follow with EmitMessagesLoaded (one-batch-then-loaded).
+	ColdBatchEmitted ColdBatchStatus = iota
+	// ColdBatchWarmReconcile: reconcileMessagesLocked ran the WARM path (the
+	// session was already loaded — a daemon reconnect), so no wholesale batch
+	// is emitted (individual upserts/deletes were emitted inside reconcile).
+	// The caller SHOULD follow with EmitMessagesLoaded (the client needs the
+	// completion signal to exit the loading state).
+	ColdBatchWarmReconcile
+	// ColdBatchSessionGone: there was no message state to emit — the session
+	// was deleted between reconcile and capture, or the fetch returned an empty
+	// result for a now-gone session. The caller MUST NOT call
+	// EmitMessagesLoaded: the session is gone, and emitting loaded (or an empty
+	// batch to satisfy ordering) would reintroduce state after session.delete.
+	ColdBatchSessionGone
+	// ColdBatchPackagingFailed: marshal/gzip failed (already logged). No batch
+	// was emitted. The caller MUST NOT call EmitMessagesLoaded; the client
+	// re-fetches on the next cold load.
+	ColdBatchPackagingFailed
+)
+
+// publishColdBatch packages and emits a session's cold-load KindMessagesBatch
+// with the marshal+gzip+base64 pipeline performed OUTSIDE s.mu, while
+// GUARANTEEING a stale prepared batch can never overwrite newer live deltas.
+// This is the unlocked-packaging counterpart to reconcileMessagesLocked: that
+// mutates under the lock and returns coldLoad=true; the caller then invokes this.
+//
+// The risk it mitigates: the client treats messages.batch as a WHOLESALE
+// REPLACEMENT (stream.ts:201-217). If the projection were captured under the
+// lock, the lock released, compressed outside, and then emitted under a NEW
+// sequence number, a live part/message delta that landed during compression
+// would be OVERWRITTEN by the stale batch on the client. The per-session message
+// revision (bumped by every message/part mutation + reconcile) is the staleness
+// gate.
+//
+// Three-phase loop:
+//  1. Under s.mu.Lock(): capture the reconciled ordered projection (copying the
+//     escaping json.RawMessage bytes) + the current revision; release the lock.
+//  2. Outside the lock: marshal {messages:[...]}, gzip, base64, envelope. (This
+//     is the work that previously blocked all Apply ingestion for a large
+//     transcript.)
+//  3. Under s.mu.Lock() again: re-read the revision. If UNCHANGED, the captured
+//     projection is still current → emit. If CHANGED, a live mutation (message/
+//     part upsert/delete, a buffered part-delta append, or another reconcile)
+//     landed during packaging → DISCARD the prepared payload and retry.
+//
+// Bounded retry with FAIL-SAFE: after maxColdBatchRetries capture/repackage
+// cycles all detect a changed revision (a session changing so fast it never
+// converges), the last resort repackages ONCE UNDER s.mu so the emitted batch is
+// guaranteed current at emit time. This trades a single locked compression (the
+// old behavior, for this rare case only) for correctness — it never emits
+// knowingly-stale data and never gives up without delivering a valid batch.
+//
+// Returns a ColdBatchStatus so the caller can gate EmitMessagesLoaded: a loaded
+// event is correct ONLY after ColdBatchEmitted (or a genuine warm reconcile
+// handled by the caller, ColdBatchWarmReconcile). SessionGone / PackagingFailed
+// MUST NOT trigger a loaded event (Finding 3).
+func (s *Store) publishColdBatch(sid string) ColdBatchStatus {
+	const maxColdBatchRetries = 8
+	for attempt := 0; attempt < maxColdBatchRetries; attempt++ {
+		s.mu.Lock()
+		list, rev := s.captureMessagesBatchLocked(sid)
+		s.mu.Unlock()
+
+		// Test seam: block here so a test can race a same-session mutation in
+		// the gap between capture and validation. Nil in production (zero cost).
+		if coldBatchAfterCaptureHook != nil {
+			coldBatchAfterCaptureHook(sid)
+		}
+
+		if list == nil {
+			// No message state (e.g. an empty cold fetch, or the session was
+			// deleted between reconcile and capture): nothing to emit. The
+			// session is still marked loaded; the client renders an empty
+			// transcript. (Matches the old emitMessagesBatchLocked no-op.) The
+			// caller must NOT follow with messages.loaded when the session is
+			// gone (Finding 3).
+			return ColdBatchSessionGone
+		}
+		payload := packageMessagesBatch(sid, list)
+		if payload == nil {
+			// Marshal/gzip failed (already logged). Do not emit a malformed
+			// batch; the client re-fetches on the next cold load.
+			return ColdBatchPackagingFailed
+		}
+
+		s.mu.Lock()
+		unchanged := s.msgRev[sid] == rev
+		if unchanged {
+			s.emit(KindMessagesBatch, payload)
+			s.mu.Unlock()
+			return ColdBatchEmitted // delivered a revision-VALID batch
+		}
+		s.mu.Unlock()
+		// Revision changed during packaging → the captured projection is stale.
+		// Discard the payload and retry from the current state (bounded by
+		// maxColdBatchRetries, then the fail-safe locked repackage below).
+	}
+	// Pathological fast-changing session: retry never converged. FAIL SAFE by
+	// repackaging ONCE under s.mu so the emitted batch is current at emit time
+	// (reverting to the old locked-compression behavior for this rare case
+	// rather than emitting knowingly-stale data or skipping the batch).
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	list, _ := s.captureMessagesBatchLocked(sid)
+	if list == nil {
+		return ColdBatchSessionGone
+	}
+	payload := packageMessagesBatch(sid, list)
+	if payload == nil {
+		return ColdBatchPackagingFailed
 	}
 	s.emit(KindMessagesBatch, payload)
+	return ColdBatchEmitted
 }
 
 // IsMessagesLoaded reports whether a session's history has been fetched.
@@ -2331,11 +2624,35 @@ func (s *Store) ClearColdFetchActive(sessionID string) {
 }
 
 // SetSessionMessages installs a freshly-fetched message list for one session
-// (used by lazy hydration when a client first opens it).
-func (s *Store) SetSessionMessages(sid string, list []MessageWithParts) {
+// (used by lazy hydration when a client first opens it). On the COLD path
+// (session not previously loaded) it does NOT return until a revision-valid
+// cold batch has been published.
+//
+// Returns a ColdBatchStatus the aggregator uses to gate EmitMessagesLoaded
+// (Finding 3): Emitted means a valid messages.batch was published (caller SHOULD
+// emit loaded); WarmReconcile means the session was already loaded and the
+// incremental upsert/delete events were emitted inside reconcile (caller SHOULD
+// emit loaded — the client needs the completion signal); SessionGone /
+// PackagingFailed mean NO batch was published and the caller MUST NOT emit
+// loaded (the session is gone or the batch failed — emitting loaded without a
+// preceding batch would break the one-batch-before-loaded ordering, and
+// emitting an empty batch to satisfy ordering would reintroduce state after
+// session.delete).
+func (s *Store) SetSessionMessages(sid string, list []MessageWithParts) ColdBatchStatus {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.reconcileMessagesLocked(sid, list)
+	cold := s.reconcileMessagesLocked(sid, list)
+	s.mu.Unlock()
+	if cold {
+		// marshal+gzip+base64 happens OUTSIDE s.mu; the per-session revision is
+		// re-validated before emit so a stale batch is discarded + retried.
+		return s.publishColdBatch(sid)
+	}
+	// Warm path: reconcileMessagesLocked already emitted the incremental
+	// upsert/delete deltas under the lock. No wholesale batch is needed; the
+	// caller should still emit messages.loaded (the client exits the loading
+	// state on the loaded event, not on a batch — a warm reconnect may emit
+	// zero deltas if nothing changed).
+	return ColdBatchWarmReconcile
 }
 
 // SetLastAgents cold-seeds the agent name of each session's most recent
