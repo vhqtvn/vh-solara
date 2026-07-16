@@ -47,8 +47,11 @@ export interface DrainDeps {
   claim: (id: string) => Promise<QueuedMessage | null>;
   // Dispatch the claimed item (POST prompt_async) and classify the outcome.
   // Must NOT throw on a definitive rejection — return {state:"failed"} instead
-  // so the item reaches a terminal state via resolve.
-  dispatch: (id: string, item: QueuedMessage) => Promise<DrainOutcome>;
+  // so the item reaches a terminal state via resolve. The AbortSignal fires after
+  // dispatchTimeoutMs (see createQueueDrainer): the dispatch implementation MUST
+  // treat an aborted signal as the "unknown" outcome (the POST may have reached
+  // OpenCode — never repend, never auto-retry).
+  dispatch: (id: string, item: QueuedMessage, signal: AbortSignal) => Promise<DrainOutcome>;
   // Record the terminal outcome (can never repend).
   resolve: (id: string, itemId: string, state: DrainOutcome["state"], detail: string) => Promise<void>;
   // Sending-guard lifecycle (wraps sync/store setSending).
@@ -68,10 +71,23 @@ export interface QueueDrainer {
   isDraining: () => boolean;
 }
 
+// Default bounded timeout for a claimed-item prompt_async dispatch. Mirrors the
+// 12s AbortController precedent at web/src/code/api.ts:9-25. A hung socket MUST
+// NOT hold a dispatching item forever: after this elapses the AbortController
+// fires, the dispatch classifies "unknown", and the item persists visibly. We
+// NEVER auto-retry — abort/timeout is ambiguous (the POST may have reached
+// OpenCode), so the operator must decide whether to resend.
+const DEFAULT_DISPATCH_TIMEOUT_MS = 12000;
+
 // createQueueDrainer builds a single-flight drain state machine. One drainer
 // per ChatView instance owns the `draining` flag; the sending guard is owned by
-// the injected deps (per-session keyed in sync/store).
-export function createQueueDrainer(deps: DrainDeps): QueueDrainer {
+// the injected deps (per-session keyed in sync/store). `dispatchTimeoutMs`
+// bounds a single dispatch attempt; on timeout the AbortController passed to
+// deps.dispatch fires so the implementation can classify "unknown".
+export function createQueueDrainer(
+  deps: DrainDeps,
+  dispatchTimeoutMs: number = DEFAULT_DISPATCH_TIMEOUT_MS,
+): QueueDrainer {
   let draining = false;
   return {
     drain: async () => {
@@ -84,7 +100,18 @@ export function createQueueDrainer(deps: DrainDeps): QueueDrainer {
         const claimed = await deps.claim(id);
         if (!claimed) return;
         deps.setSending(id, true);
-        const outcome = await deps.dispatch(id, claimed);
+        // Bound the dispatch so a hung socket cannot hold a dispatching item
+        // forever. The AbortController is passed to deps.dispatch; on timeout
+        // the fetch rejects with AbortError and the dispatch classifies
+        // "unknown". We never repend — the POST may have reached OpenCode.
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), dispatchTimeoutMs);
+        let outcome: DrainOutcome;
+        try {
+          outcome = await deps.dispatch(id, claimed, ctrl.signal);
+        } finally {
+          clearTimeout(timer);
+        }
         // Record the terminal outcome (can never repend).
         await deps.resolve(id, claimed.id, outcome.state, outcome.detail);
         deps.onResolved?.(id);

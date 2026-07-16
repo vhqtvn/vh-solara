@@ -18,7 +18,7 @@
 // the oldest pending item to dispatching (one winner), resolve records a
 // terminal outcome that never repends, and dispatch (the /oc/session/:id/prompt_async
 // POST) is mocked to classify the outcome.
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createQueueDrainer, type DrainDeps } from "../../src/queueDrain";
 import type { QueuedMessage } from "../../src/queue";
 
@@ -344,5 +344,143 @@ describe("createQueueDrainer — no re-dispatch when resolve write fails (F1 inv
     // A later drain (item is dispatching) does NOT re-dispatch.
     await drainer.drain();
     expect(dispatches).toEqual(["q-1"]);
+  });
+});
+
+// Bounded dispatch timeout: a hung socket (prompt_async never responds) MUST NOT
+// hold a dispatching item forever. The drainer arms an AbortController that
+// fires after dispatchTimeoutMs; the dispatch implementation MUST classify the
+// resulting abort as "unknown" (the POST may have reached OpenCode — never
+// repend, never auto-retry). The item then resolves to a PERSISTENT visible
+// `unknown` state with the text + attachment metadata retained, and the sending
+// guard releases so the next pending item can advance (FIFO).
+describe("createQueueDrainer — bounded dispatch timeout (hung-socket send-loss guard)", () => {
+  it("aborts a hung dispatch after dispatchTimeoutMs and classifies unknown; guard released; signal observed aborted", async () => {
+    const store = fakeStore(["stuck-on-the-wire"]);
+    const dispatches: string[] = [];
+    const sending: Record<string, boolean> = {};
+    let observedSignal: AbortSignal | null = null;
+
+    const deps: DrainDeps = {
+      canDrain: () => true,
+      getId: () => "s-hung",
+      claim: async (id) => {
+        void id;
+        const it = store.items.find((m) => m.state === "pending");
+        if (!it) return null;
+        it.state = "dispatching";
+        return { ...it };
+      },
+      // Simulate the real dispatchQueuedItem: the POST hangs until the signal
+      // aborts, then the catch classifies "unknown" (mirrors ChatView's
+      // `aborted = signal.aborted || AbortError` branch).
+      dispatch: async (id, item, signal) => {
+        void id;
+        observedSignal = signal;
+        dispatches.push(item.id);
+        return new Promise<{ state: "sent" | "failed" | "unknown"; detail: string }>((resolve) => {
+          signal.addEventListener("abort", () => {
+            resolve({ state: "unknown", detail: "dispatch timed out" });
+          });
+          // Safety: never hang the test if the abort never fires.
+          setTimeout(() => resolve({ state: "sent", detail: "" }), 2000);
+        });
+      },
+      resolve: async (id, itemId, state, detail) => {
+        void id;
+        const it = store.items.find((m) => m.id === itemId);
+        if (it) {
+          it.state = state;
+          it.detail = detail;
+          it.resolvedAt = 2;
+        }
+      },
+      setSending: (id, v) => {
+        sending[id] = v;
+      },
+      isSending: (id) => !!sending[id],
+    };
+    const drainer = createQueueDrainer(deps, 50); // 50ms dispatch timeout
+
+    await drainer.drain();
+
+    // Exactly one dispatch (no auto-retry on abort — the POST may have reached
+    // OpenCode, so a re-dispatch risks a duplicate).
+    expect(dispatches).toEqual(["q-1"]);
+    // The dispatch received a signal that actually aborted (the drainer armed it).
+    expect(observedSignal).not.toBeNull();
+    expect(observedSignal!.aborted).toBe(true);
+    // The hung item resolved to a PERSISTENT visible `unknown`, NOT `sent`.
+    expect(store.items[0].state).toBe("unknown");
+    expect(store.items[0].detail).toBe("dispatch timed out");
+    // The text is retained on the item (recovery path: operator dismisses).
+    expect(store.items[0].text).toBe("stuck-on-the-wire");
+    // Guard released so the next pending item can advance (FIFO preserved).
+    expect(sending["s-hung"]).toBe(false);
+  });
+
+  it("uses a 12s default dispatch timeout when none is passed (regression: bounded by default)", async () => {
+    // Pin the DEFAULT dispatch timeout to 12s by observing the abort signal
+    // handed to dispatch: it must NOT abort before 12000ms and MUST abort at the
+    // 12000ms boundary. The prior weak form only asserted `drain` was a function
+    // and left the actual default bound to the e2e suite; this makes the bound a
+    // fast unit assertion. (N1: fake-timer boundary around 11_999/12_000 ms.)
+    const store = fakeStore(["only"]);
+    const sending: Record<string, boolean> = {};
+    let observedSignal: AbortSignal | null = null;
+    const deps: DrainDeps = {
+      canDrain: () => true,
+      getId: () => "s-default-to",
+      claim: async () => {
+        const it = store.items.find((m) => m.state === "pending");
+        if (!it) return null;
+        it.state = "dispatching";
+        return { ...it };
+      },
+      // Hang until the signal aborts (mirrors the hung-dispatch test): resolves
+      // `unknown` on abort so we can observe the drainer's timeout arming.
+      dispatch: async (_id, item, signal) => {
+        observedSignal = signal;
+        return new Promise<{ state: "sent" | "failed" | "unknown"; detail: string }>((resolve) => {
+          signal.addEventListener("abort", () => resolve({ state: "unknown", detail: "dispatch timed out" }));
+        });
+      },
+      resolve: async (_id, itemId, state, detail) => {
+        const it = store.items.find((m) => m.id === itemId);
+        if (it) {
+          it.state = state;
+          it.detail = detail;
+          it.resolvedAt = 2;
+        }
+      },
+      setSending: (id, v) => {
+        sending[id] = v;
+      },
+      isSending: (id) => !!sending[id],
+    };
+    const drainer = createQueueDrainer(deps); // NO timeout arg → default 12s
+    expect(typeof drainer.drain).toBe("function");
+    expect(drainer.isDraining()).toBe(false);
+
+    vi.useFakeTimers();
+    try {
+      const drainP = drainer.drain();
+      // Let the async claim→dispatch microtasks run so dispatch receives its
+      // signal and the 12s abort timer is armed before we assert timing.
+      await vi.advanceTimersByTimeAsync(0);
+      expect(observedSignal).not.toBeNull();
+      expect(observedSignal!.aborted).toBe(false);
+      // Just under the 12s bound: the dispatch is still pending.
+      await vi.advanceTimersByTimeAsync(11999);
+      expect(observedSignal!.aborted).toBe(false);
+      // At the 12000ms boundary: the default dispatch timeout fires the abort.
+      await vi.advanceTimersByTimeAsync(1);
+      expect(observedSignal!.aborted).toBe(true);
+      await drainP;
+      // The hung dispatch classified `unknown` (visible + retained; never auto-sent).
+      expect(store.items[0].state).toBe("unknown");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

@@ -144,15 +144,42 @@ export async function fetchQueue(sessionId: string): Promise<QueuedMessage[]> {
   return reconciled;
 }
 
+// Bounded timeout for the enqueue POST. The backend enqueue is fast (atomic
+// temp-write + fsync + rename, milliseconds), so 12s is a very generous upper
+// bound. If the enqueue response never arrives (hung socket / slow drop), the
+// abort throws and the caller (sendText) preserves the composer text +
+// attachments — no silent loss. A retry may produce a visible duplicate (the
+// POST may have reached the backend and persisted the item), which is preferred
+// over silent loss per operator policy. Mirrors the 12s AbortController
+// precedent at web/src/code/api.ts:9-25.
+const ENQUEUE_TIMEOUT_MS = 12000;
+
 // enqueue POSTs a new message; the backend issues the id + monotonic order.
-// Returns the created item. Throws on non-2xx so the caller can preserve the
-// composed text (no silent loss).
+// Returns the created item. Throws on non-2xx, on a hung/timed-out response,
+// or on a 2xx-without-item ambiguous response so the caller can preserve the
+// composed text (no silent loss). Throwing on timeout means the caller NEVER
+// clears the composer until durable custody is confirmed.
 export async function enqueue(sessionId: string, input: QueueInput): Promise<QueuedMessage> {
-  const res = await fetch(queueUrl(sessionId), {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "X-VH-CSRF": "1" },
-    body: JSON.stringify(input),
-  });
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ENQUEUE_TIMEOUT_MS);
+  let res: Response;
+  try {
+    res = await fetch(queueUrl(sessionId), {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-VH-CSRF": "1" },
+      body: JSON.stringify(input),
+      signal: ctrl.signal,
+    });
+  } catch (e) {
+    clearTimeout(timer);
+    // Network error OR abort/timeout. Either way the response never confirmed
+    // durable custody, so throw — the caller preserves the composer. The POST
+    // may have reached the backend (ambiguous), so a retry can produce a
+    // visible duplicate, which is preferred over silent loss.
+    const aborted = ctrl.signal.aborted || (e instanceof DOMException && e.name === "AbortError");
+    throw new Error(aborted ? "enqueue timed out" : `enqueue failed (${String(e)})`);
+  }
+  clearTimeout(timer);
   if (!res.ok) {
     throw new Error(`enqueue failed (${res.status})`);
   }

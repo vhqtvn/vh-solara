@@ -155,6 +155,45 @@ describe("enqueue — backend issues id/order; sendConfig preserved", () => {
   });
 });
 
+describe("enqueue — bounded enqueue timeout (hung-POST send-loss guard)", () => {
+  // N2: the existing enqueue tests cover non-2xx and 2xx-without-item but not an
+  // aborted/timed-out enqueue. enqueue arms a 12s AbortController; if the POST
+  // hangs, it must abort, throw "enqueue timed out", and NOT cache anything (no
+  // silent duplicate state). Asserted with fake timers around the 12s boundary.
+  it("aborts a hung POST after 12s, throws 'enqueue timed out', and caches nothing (no silent loss)", async () => {
+    const sid = "s-enq-timeout";
+    touched.push(sid);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((_url: string, init?: any) =>
+        // Mirror native fetch: never resolves on its own, and rejects with an
+        // AbortError when the caller's signal aborts.
+        new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+        }),
+      ),
+    );
+
+    vi.useFakeTimers();
+    try {
+      const p = enqueue(sid, { text: "stuck on the wire", attachments: [] });
+      // Attach a no-op handler up front so the rejection (which fires inside
+      // advanceTimersByTimeAsync below) is never flagged as unhandled before the
+      // assertion consumes it.
+      p.catch(() => {});
+      // Before the 12s timeout: the enqueue is still pending (no premature abort).
+      await vi.advanceTimersByTimeAsync(11999);
+      // At 12000ms: the AbortController fires, fetch rejects, enqueue throws.
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(p).rejects.toThrow("enqueue timed out");
+      // Nothing was confirmed durable: the cache stays empty.
+      expect(queueFor(sid)).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe("fetchQueue — authoritative refresh (open/focus/reconnect)", () => {
   it("replaces the cache for a session with the backend list", async () => {
     const sid = "s-fetch-1";

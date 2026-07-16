@@ -1404,41 +1404,54 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // Build + POST a prompt with explicit parts and send config (shared by direct
   // sends and queued auto-sends). prompt_async forks the turn and returns 204 at
   // once, so a send can never hang — the reply/failure arrive via the event feed.
-  function sendParts(key: string, id: string, parts: any[], config: QueueConfig): Promise<boolean> {
-    const body: any = { parts };
-    if (config.agent) body.agent = config.agent; // only a live, enabled agent
-    if (config.providerID && config.modelID) {
-      body.model = { providerID: config.providerID, modelID: config.modelID };
-      if (config.variant) body.variant = config.variant; // PromptInput.variant is top-level
-    }
-    // Only re-glue to the tail when the user is already following it. If they
-    // deliberately scrolled up to read history (userScrolledUp armed), preserve
-    // their read position — the "↓ Latest" pill offers a manual jump back. An
-    // unconditional yank here cleared the intent latch synchronously at send and
-    // defeated it (bug 10b). Mirrors the busy-edge self-heal's !userScrolledUp()
-    // gate so send-time and turn-start agree on intent.
-    if (!userScrolledUp()) jumpToLatest();
-    return dispatchSend(key, id, `/oc/session/${encodeURIComponent(id)}/prompt_async`, body, "Message failed to send");
-  }
+  // NOTE: normal prompts are now enqueued first (sendText) and dispatched by the
+  // drainer via dispatchQueuedItem; only shell still uses dispatchSend directly.
 
+  // Send a normal prompt via the backend-authoritative durable queue
+  // (enqueue-first). This function ONLY acquires durable custody: it enqueues
+  // (bounded wait) and returns true on confirmation, false on failure. It MUST
+  // NOT clear the composer — clearing is the caller's responsibility, subject to
+  // an ownership guard. This separation fixes two reachable bugs:
+  //   (1) retry() reuses sendText() to resend an OLD message; if sendText
+  //       cleared the composer it would erase a NEW draft the operator is
+  //       typing. retry()'s caller does not own the composer, so it simply
+  //       does not clear.
+  //   (2) A slow enqueue (up to 12s) leaves the composer editable; if sendText
+  //       unconditionally cleared after the await it could erase text/attachments
+  //       entered AFTER Send was pressed. send() captures an ownership snapshot
+  //       before calling and clears ONLY if the composer still holds that exact
+  //       state (see send()).
+  // The drainer (createQueueDrainer below) later claims + dispatches the
+  // enqueued item through dispatchQueuedItem and owns the `isSending` guard for
+  // the duration of that dispatch — so this function MUST NOT touch setSending
+  // here (setting it during enqueue would block the drain effect, stalling the
+  // just-enqueued item in `pending` until a later queueFor/working transition
+  // re-arms the drain). Double-enqueue on a rapid double-click is acceptable: a
+  // visible duplicate is always preferred over any chance of silent loss
+  // (operator policy).
   async function sendText(text: string, id: string): Promise<boolean> {
-    const key = props.sessionId || "draft"; // guard keyed to this view, not the turn
     const atts = attachments();
-    if ((!text && atts.length === 0) || !id || isSending(key)) return false;
-    setSending(key, true);
-    const parts = buildParts(text, atts);
-    // Always send a model. OpenCode rejects a prompt with no model (brand-new
-    // sessions with no model history). If models haven't loaded, fetch once.
+    if ((!text && atts.length === 0) || !id) return false;
+    // Always capture a model. OpenCode rejects a prompt with no model. If models
+    // haven't loaded, fetch once before enqueue so the persisted queue item
+    // carries a valid sendConfig.
     if (!selectionFor(id) && models().length === 0) await loadModels();
-    const s = selectionFor(id);
-    const config: QueueConfig = {
-      providerID: s?.providerID || models()[0]?.providerID,
-      modelID: s?.modelID || models()[0]?.modelID,
-      variant: s?.variant,
-      agent: activeAgent(props.sessionId) || undefined,
-    };
-    setAttachments([]);
-    return sendParts(key, id, parts, config);
+    const config = captureConfig(id);
+    try {
+      await enqueue(id, { text, attachments: atts, sendConfig: config });
+    } catch (e) {
+      // Enqueue failed (offline / non-2xx / ambiguous 2xx-without-item) —
+      // preserve the composed text + attachments (no silent loss) and warn.
+      // Nothing was persisted, so a reconnect must NOT auto-send: there is no
+      // pending item for the drainer to pick up. The operator re-presses Send.
+      log.error("send", "enqueue failed", { id, err: String(e) });
+      pushNotification({ kind: "error", sessionID: id, title: "Could not queue message", detail: text.slice(0, 120) });
+      return false;
+    }
+    // Durable custody confirmed. The caller decides whether to clear the
+    // composer (and only if it still owns the submitted state). This function
+    // does not touch setInput/setAttachments.
+    return true;
   }
 
   // Auto-drain the queue: when the session is idle and has queued messages,
@@ -1459,6 +1472,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     attachments: { url: string; filename: string; mime: string }[],
     config: QueueConfig,
     itemId: string,
+    signal: AbortSignal,
   ): Promise<{ state: "sent" | "failed" | "unknown"; detail: string }> {
     const body: any = { parts: buildParts(text, attachments) };
     if (config.agent) body.agent = config.agent;
@@ -1472,6 +1486,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
+        signal,
       });
       if (res.ok) return { state: "sent", detail: "" };
       // Definitive rejection (non-2xx) — failed, never re-enqueue.
@@ -1482,10 +1497,17 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       pushNotification({ kind: "error", sessionID: id, title: "Queued message failed to send", detail: msg });
       return { state: "failed", detail: msg };
     } catch (e) {
-      // Network error / interruption — ambiguous, never repend.
-      const msg = String(e);
-      log.error("send", "queued POST threw", { id, itemId, err: msg });
-      pushNotification({ kind: "error", sessionID: id, title: "Queued message send interrupted", detail: msg });
+      // Abort/timeout or network interruption — ambiguous, NEVER repend. The
+      // POST may have reached OpenCode (a late/non-response socket looks
+      // identical to one that never accepted the bytes), so re-dispatch risks
+      // a duplicate and is explicitly forbidden by the operator's no-retry
+      // policy. Classify as `unknown`; the queue chip persists the text +
+      // attachment metadata until the operator dismisses it.
+      const aborted = signal.aborted || (e instanceof DOMException && e.name === "AbortError");
+      const msg = aborted ? "dispatch timed out" : String(e);
+      const title = aborted ? "Queued message send timed out" : "Queued message send interrupted";
+      log.error("send", "queued POST threw", { id, itemId, aborted, err: msg });
+      pushNotification({ kind: "error", sessionID: id, title, detail: msg });
       return { state: "unknown", detail: msg };
     }
   }
@@ -1496,11 +1518,11 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     canDrain: () => !props.draft && !working(),
     getId: () => props.sessionId,
     claim: claimQueued,
-    dispatch: (id, claimed) => {
+    dispatch: (id, claimed, signal) => {
       const config = claimed.sendConfig?.providerID && claimed.sendConfig?.modelID
         ? (claimed.sendConfig as QueueConfig)
         : captureConfig(id);
-      return dispatchQueuedItem(id, claimed.text, claimed.attachments, config, claimed.id);
+      return dispatchQueuedItem(id, claimed.text, claimed.attachments, config, claimed.id, signal);
     },
     resolve: resolveQueued,
     setSending,
@@ -1653,28 +1675,23 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       pushNotification({ kind: "info", sessionID: props.sessionId, title: "Still loading…" });
       return;
     }
-    if (text) pushHistory(text); // recall with Up/Down later
-    histIdx = -1;
-    // Queue instead of sending while the session is busy — OpenCode rejects a
-    // concurrent prompt, so we hold it and auto-send when the turn finishes.
-    // (Shell/undo/redo aren't queueable — they only run against a live session.)
-    if (queueMode() && !props.draft && props.sessionId && working() && !text.startsWith("!") && text !== "/undo" && text !== "/redo") {
-      const sid = props.sessionId;
-      try {
-        await enqueue(sid, { text, attachments: attachments(), sendConfig: captureConfig(sid) });
-      } catch {
-        // Enqueue failed — preserve the composed text (no silent loss) and warn.
-        pushNotification({ kind: "error", sessionID: sid, title: "Could not queue message", detail: text.slice(0, 120) });
-        return;
-      }
-      setInput("");
-      setAttachments([]);
+    // Honor the "Queue messages while busy" setting (finding #4). When the
+    // session is busy AND the operator has disabled busy-queuing, pressing
+    // Enter (or clicking a stale Send button) must NOT enqueue — it is
+    // rejected and the text is preserved, matching the setting's contract:
+    // "Off: sending while busy is rejected." The Queue button only renders
+    // when queueMode() is on, so this gate primarily catches the Enter-key
+    // path that bypasses the button's visibility. With the setting On, a
+    // busy send enqueues (the Queue button's purpose) and falls through.
+    if (working() && !queueMode()) {
+      pushNotification({ kind: "info", sessionID: props.sessionId, title: "Busy — turn in progress" });
       return;
     }
-    setInput("");
+    if (text) pushHistory(text); // recall with Up/Down later
+    histIdx = -1;
     // /undo /redo only make sense for an existing session.
-    if (!props.draft && text === "/undo") return void undo();
-    if (!props.draft && text === "/redo") return void redo();
+    if (!props.draft && text === "/undo") { setInput(""); return void undo(); }
+    if (!props.draft && text === "/redo") { setInput(""); return void redo(); }
     const id = await ensureSession();
     if (!id) {
       setInput(text); // session creation failed; keep the text for retry
@@ -1683,12 +1700,43 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     // A draft may have queued attachments locally (no session existed at paste
     // time). Now that we have an id, upload them so buildParts sees real urls.
     await flushPendingAttachments(id);
-    // On failure, restore the composer text so a silent noop never loses what
-    // the user typed (they can edit/retry instead of re-typing).
-    const ok = text.startsWith("!")
-      ? await runShell(text.slice(1).trim(), id)
-      : await sendText(text, id);
-    if (!ok) setInput(text);
+    // Shell commands (leading "!") dispatch directly against the live session —
+    // they are NOT enqueued (they only make sense against a live shell). Clear
+    // the composer text; on failure restore it so a silent noop never loses what
+    // the user typed. (Out of scope for the send-loss fix — dispatchSend's
+    // accepted-by-time race stays for shell only.)
+    if (text.startsWith("!")) {
+      setInput("");
+      const ok = await runShell(text.slice(1).trim(), id);
+      if (!ok) setInput(text);
+      return;
+    }
+    // Normal prompt: enqueue-first for durability. sendText acquires durable
+    // custody (bounded wait) and returns true on confirmation, false on failure
+    // — it does NOT clear the composer. Clearing is this caller's job, gated on
+    // an ownership snapshot so a slow enqueue can never erase state entered
+    // AFTER Send was pressed (finding #2): the enqueue can take up to 12s, and
+    // the composer stays editable during that window. We capture the exact text
+    // + attachment array right before enqueue and clear ONLY if the composer
+    // still holds that identical state when custody confirms. Reference
+    // identity on the array catches any add/remove (setAttachments always
+    // produces a new array); value equality on text catches any keystroke. On
+    // enqueue failure the text + attachments are preserved and the operator
+    // can re-press Send.
+    const snapText = input();
+    const snapAtts = attachments();
+    const ok = await sendText(text, id);
+    if (!ok) {
+      setInput(text);
+      return;
+    }
+    // Durable custody confirmed. Clear the composer ONLY if it still owns the
+    // submitted snapshot. If the operator typed a new draft or changed
+    // attachments during the enqueue wait, that newer state survives.
+    if (input() === snapText && attachments() === snapAtts) {
+      setInput("");
+      setAttachments([]);
+    }
   }
 
   // Concatenate a message's text/reasoning parts (the copyable/retryable text).
