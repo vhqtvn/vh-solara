@@ -3,7 +3,7 @@ import { CUSTOM_FIELDS, customTheme, exportCustomTheme, importCustomTheme, reset
 import ThemePicker from "./ThemePicker";
 import { customFont, font, FONTS, monoFont, MONO_FONTS, setCustomFont, setFontId, setMonoFontId } from "../font";
 import { hideBuiltin, setHideBuiltin } from "../models";
-import { setStreamLive, streamLive, treeDensity, setTreeDensity, uiScale, setUiScale, orientation, setOrientation, MIN_SCALE, MAX_SCALE, chatWidth, setChatWidth, chatBubbles, setChatBubbles, notesEnabled, setNotesEnabled, tabStyle, setTabStyle, type ChatWidth, type TabStyle } from "../prefs";
+import { setStreamLive, streamLive, treeDensity, setTreeDensity, uiScale, setUiScale, orientation, setOrientation, MIN_SCALE, MAX_SCALE, chatWidth, setChatWidth, chatBubbles, setChatBubbles, notesEnabled, setNotesEnabled, tabStyle, setTabStyle, perfDiagEnabled, setPerfDiagEnabled, type ChatWidth, type TabStyle } from "../prefs";
 import { queueMode, setQueueMode } from "../queue";
 import { canInstall, installed, isIosSafari, promptInstall } from "../pwa-install";
 import { killTerm, listTerms } from "../termApi";
@@ -378,6 +378,24 @@ export default function SettingsDialog(props: { onClose: () => void }) {
               <p class="setting-hint">
                 On: sending while a turn is running queues the message and auto-sends it when the
                 turn finishes. Off: sending while busy is rejected.
+              </p>
+              <div class="setting-row">
+                <label>Show performance diagnostics</label>
+                <input
+                  type="checkbox"
+                  aria-label="Show performance diagnostics"
+                  checked={perfDiagEnabled()}
+                  onChange={(e) => setPerfDiagEnabled(e.currentTarget.checked)}
+                />
+              </div>
+              <p class="setting-hint">
+                Off by default. When on, adds a "Performance" entry to the server-admin menu
+                (right-click / long-press Settings → Diagnostics) that shows the always-on server
+                latency probes (ingest, emit, stream, yamux, websocket write) and lets you copy
+                them for reporting. Collection is always on and low-overhead (most hot paths are
+                atomic/lock-free; the tunnel write path samples a lock-free global active-stream
+                gauge per write and defers its only per-session yamux read to threshold-gated
+                slow-write incidents); this only adds the viewer.
               </p>
             </Show>
 

@@ -1,0 +1,179 @@
+/* Performance diagnostics dialog — opt-in viewer for the always-on
+ * GET /vh/diag/latency probes (reached from the server-admin menu's
+ * Diagnostics section when the user enabled it in Settings → General).
+ *
+ * Scoped; consumes foundation tokens only (see web/src/styles/foundation/
+ * tokens.css). The dialog chrome (.dialog / .dialog-head / .dialog-body) is the
+ * shared global base; this module owns only the perf-viewer internals.
+ *
+ * PERF (AGENTS.md → "Web frontend performance — Firefox/WebRender"): the body
+ * is a scroll container. The following patterns pin WebRender to ~99°C on a
+ * scrolling surface and are DELIBERATELY absent here:
+ *   - NO mask-image / -webkit-mask
+ *   - NO backdrop-filter: blur
+ *   - NO contain: paint / content-visibility: auto
+ * The snapshot is small and point-in-time; a re-render on manual refresh is
+ * cheap. The dialog does not poll by default.
+ */
+
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+.spacer {
+  flex: 1 1 auto;
+}
+.toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--fg);
+  cursor: pointer;
+  user-select: none;
+}
+.toggle input {
+  width: 15px;
+  height: 15px;
+  accent-color: var(--accent);
+}
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--fg);
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 3px 8px;
+  cursor: pointer;
+}
+.btn:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+.btn:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+.copied {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 11px;
+  color: var(--ok, var(--accent));
+  font-weight: 600;
+}
+.loading,
+.err {
+  font-size: 12.5px;
+  color: var(--fg-dim);
+  padding: 8px 2px;
+  line-height: 1.5;
+}
+.err {
+  color: var(--warn);
+}
+.retryInline {
+  font: inherit;
+  font-size: 12.5px;
+  color: var(--accent);
+  background: none;
+  border: none;
+  cursor: pointer;
+  text-decoration: underline;
+  padding: 0;
+}
+
+/* Body — the scroll container. Plain overflow:auto. NO mask-image, NO
+ * backdrop-filter, NO contain/content-visibility (each pins WebRender to
+ * ~99°C on a scrolling surface). Bounded by max-height so the dialog stays
+ * within the viewport on mobile. */
+.body {
+  max-height: 68vh;
+  overflow: auto;
+  padding: 2px;
+}
+
+.section {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px 9px;
+  margin-bottom: 8px;
+  background: var(--bg);
+}
+.sectionTitle {
+  margin: 0 0 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fg-strong);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.subhead {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--fg-dim);
+  margin: 4px 0 2px;
+}
+.sub {
+  margin-top: 4px;
+  padding-left: 8px;
+  border-left: 2px solid var(--border);
+}
+.sublabel {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--fg);
+  margin-bottom: 2px;
+}
+
+.stat {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  margin-right: 12px;
+}
+.statLabel {
+  font-size: 11px;
+  color: var(--fg-dim);
+}
+.statValue {
+  font-size: 12.5px;
+  color: var(--fg);
+  font-weight: 600;
+}
+.rowline {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 12px;
+  padding: 1px 0;
+}
+.mono {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--fg);
+  word-break: break-word;
+}
+
+/* The readonly textarea used as the clipboard-fallback source + the verbatim
+ * JSON copy buffer. Kept visually off-screen but interactive so .select()
+ * works on browsers without navigator.clipboard. NOT display:none (that
+ * disables selection). Positioned with negative indent + tiny size. */
+.rawarea {
+  position: fixed;
+  top: 0;
+  left: -9999px;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+  font-size: 1px;
+  border: 0;
+  padding: 0;
+}

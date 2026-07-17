@@ -24,6 +24,11 @@ export const [diagLogOpen, setDiagLogOpen] = createSignal(false);
 // OpenCode process-logs viewer (always-accessible ring tail). Reached from the
 // server-admin menu's Diagnostics section, sibling to the diagnostic log.
 export const [ocLogsOpen, setOcLogsOpen] = createSignal(false);
+// Performance diagnostics viewer (opt-in via Settings → General). Reached from
+// the server-admin menu's Diagnostics section, only when perfDiagEnabled is on.
+// Reads the always-on GET /vh/diag/latency probes on demand (open → fetch →
+// render; close). No polling by default.
+export const [perfDiagOpen, setPerfDiagOpen] = createSignal(false);
 export const [paletteOpen, setPaletteOpen] = createSignal(false);
 // Project switcher dialog open-flag, lifted global so the no-project empty
 // state's CTA can open the switcher from outside the ProjectSwitcher component

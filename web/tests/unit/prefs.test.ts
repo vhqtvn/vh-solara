@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { applyScale, setUiScale } from "../../src/prefs";
 
 // Pinch-zoom is intentionally disabled (it shrank visualViewport.height and broke
@@ -50,5 +50,25 @@ describe("setViewportScale disables pinch-zoom", () => {
     expect(c).toContain("minimum-scale=2.00");
     expect(c).toContain("maximum-scale=2.00");
     expect(c).toContain("user-scalable=no");
+  });
+});
+
+// The Performance diagnostics viewer must be DEFAULT-OFF so a normal user never
+// sees the surface. The AdminMenu gating test calls setPerfDiagEnabled(false)
+// before asserting (which doesn't prove the from-storage default); this block
+// starts from CLEARED storage and asserts the persisted signal hydrates false
+// without any prior set. It re-imports the module fresh so the signal's initial
+// hydration runs against an empty store.
+describe("perfDiagEnabled defaults to OFF from cleared storage", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    vi.resetModules();
+  });
+
+  it("hydrates false when storage has no prior value", async () => {
+    const { perfDiagEnabled } = await import("../../src/prefs");
+    expect(perfDiagEnabled()).toBe(false);
+    // And nothing was written to storage on read.
+    expect(localStorage.getItem("vh.prefs.perfDiagEnabled.v1")).toBeNull();
   });
 });

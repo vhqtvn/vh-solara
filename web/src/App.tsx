@@ -31,6 +31,7 @@ import ViewFrame from "./components/ViewFrame";
 import ManagedPanel from "./components/ManagedPanel";
 import DiagLogDialog from "./components/DiagLogDialog";
 import OpenCodeLogsDialog from "./components/OpenCodeLogsDialog";
+import PerformanceDialog from "./components/PerformanceDialog";
 import Icon from "./components/Icon";
 import { menuTriggers } from "./sessionMenu";
 import { isDesktop, sidebarCollapsed, sidebarWidth, toggleSidebar } from "./layout";
@@ -42,7 +43,7 @@ import { displayName, notesVisible, refreshProjectSettings, watchProjectSettings
 import { pushNotification } from "./notify";
 import { broadcastTheme, postThemeTo } from "./themeTokens";
 import { customTheme, theme } from "./theme";
-import { adminOpen, diagLogOpen, embeddedViewId, isEmbeddedView, ocLogsOpen, setAdminOpen, setDiagLogOpen, setOcLogsOpen, setPaletteOpen, setSettingsOpen, setTermOpen, setView, settingsOpen, termOpen, view, VIEW_PREFIX } from "./ui";
+import { adminOpen, diagLogOpen, embeddedViewId, isEmbeddedView, ocLogsOpen, perfDiagOpen, setAdminOpen, setDiagLogOpen, setOcLogsOpen, setPaletteOpen, setPerfDiagOpen, setSettingsOpen, setTermOpen, setView, settingsOpen, termOpen, view, VIEW_PREFIX } from "./ui";
 import { projectDir } from "./sync";
 
 export default function App() {
@@ -391,6 +392,9 @@ export default function App() {
       </Show>
       <Show when={ocLogsOpen()}>
         <OpenCodeLogsDialog onClose={() => setOcLogsOpen(false)} />
+      </Show>
+      <Show when={perfDiagOpen()}>
+        <PerformanceDialog onClose={() => setPerfDiagOpen(false)} />
       </Show>
       <PathSelectionAction />
       <SessionContextMenu />

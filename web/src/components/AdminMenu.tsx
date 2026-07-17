@@ -1,7 +1,8 @@
 import { createResource, createSignal, Show } from "solid-js";
 import { forceReload, resetLocalStorage, restartVhServer } from "../admin";
 import { dismiss } from "../lib/a11y";
-import { setDiagLogOpen, setOcLogsOpen } from "../ui";
+import { perfDiagEnabled } from "../prefs";
+import { setDiagLogOpen, setOcLogsOpen, setPerfDiagOpen } from "../ui";
 import Icon from "./Icon";
 import OpenCodeUpdateDialog from "./OpenCodeUpdateDialog";
 import RestartOpenCodeDialog from "./RestartOpenCodeDialog";
@@ -121,6 +122,15 @@ export default function AdminMenu(props: { onClose: () => void }) {
       <button type="button" class="admin-btn" onClick={() => (props.onClose(), setDiagLogOpen(true))}>
         <Icon name="info" size={14} /> Diagnostic log
       </button>
+      {/* Performance diagnostics viewer — opt-in (Settings → General). Hidden
+          by default so a normal user sees zero UI; when enabled, surfaces the
+          always-on /vh/diag/latency probes for read + copy. No new probes,
+          no polling — the dialog is on-demand only. */}
+      <Show when={perfDiagEnabled()}>
+        <button type="button" class="admin-btn" onClick={() => (props.onClose(), setPerfDiagOpen(true))}>
+          <Icon name="cpu" size={14} /> Performance
+        </button>
+      </Show>
 
       {/* Reset local storage (corruption recovery) — kept as the inline confirm
           (self-contained, low-risk; a third centered dialog is not warranted). */}

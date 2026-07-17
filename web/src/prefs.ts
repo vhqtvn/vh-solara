@@ -199,6 +199,23 @@ export const [notesEnabled, setNotesEnabled] = persistedSignal<boolean>(
   boolMigrate(false),
 );
 
+// Performance diagnostics viewer: opt-in surface that shows the always-on
+// server-side latency probes (GET /vh/diag/latency) in a dialog the operator
+// can read and copy. Default OFF so a normal user sees zero UI for it; the
+// probes themselves are always collected (low-overhead aggregations — most hot
+// paths are atomic/lock-free; the tunnel write path samples a lock-free global
+// active-stream gauge per write and defers its only per-session yamux
+// NumStreams() read to threshold-gated ≥100ms slow-write incidents; see
+// pkg/diagnostics and pkg/tunnel/websocket.go). Enabling only adds a
+// "Performance" entry to the server-admin menu's Diagnostics section; it does
+// NOT change collection.
+export const [perfDiagEnabled, setPerfDiagEnabled] = persistedSignal<boolean>(
+  "vh.prefs.perfDiagEnabled.v1",
+  1,
+  false,
+  boolMigrate(false),
+);
+
 // Apply the DOM-affecting prefs reactively: each render-effect runs once now
 // (synchronous initial apply, before first paint) and again whenever its signal
 // changes. Replaces the manual apply() calls in setters + the boot list in

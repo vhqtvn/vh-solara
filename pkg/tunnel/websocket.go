@@ -29,11 +29,31 @@ type wsRWC struct {
 	// worker-client. Set at construction so every Write attributes into the
 	// correct per-side accumulator.
 	side int
-	// session holds the yamux.Session created on top of this wsRWC, set via
-	// setSession immediately after yamux.Server/Client returns. Sampled (via
-	// NumStreams) on each Write so "slow Write while N streams active" is
-	// visible. atomic.Pointer so the Write path needs no lock to read it.
-	session atomic.Pointer[yamux.Session]
+	// sampler holds the yamux.Session (wrapped as a streamSampler) so the SLOW
+	// write path can read per-session NumStreams() for incident correlation.
+	// The hot Write path does NOT touch it: the per-write active-streams
+	// histogram is sourced from the lock-free global gauge
+	// (diag.Default.Yamux.ActiveStreams) instead, because yamux's NumStreams()
+	// acquires the session streamLock and the operator required the tunnel
+	// write path to stay lock-free. atomic.Pointer so the slow path needs no
+	// lock to read it.
+	sampler atomic.Pointer[samplerHolder]
+}
+
+// streamSampler is the per-session stream-count surface the SLOW write path
+// reads for incident correlation. *yamux.Session satisfies it (NumStreams()).
+// Kept as an interface so the hot-path test (websocket_hotpath_test.go) can
+// substitute a counting sampler and prove NumStreams() is never invoked on a
+// fast write.
+type streamSampler interface {
+	NumStreams() int
+}
+
+// samplerHolder boxes the streamSampler interface behind a concrete pointer
+// type so atomic.Pointer stays monomorphic (atomic.Pointer[T] cannot store an
+// interface directly without a concrete boxing type).
+type samplerHolder struct {
+	s streamSampler
 }
 
 func newWSRWC(conn *websocket.Conn, side int) *wsRWC {
@@ -41,8 +61,9 @@ func newWSRWC(conn *websocket.Conn, side int) *wsRWC {
 }
 
 // setSession records the yamux session created on top of this wsRWC so the
-// Write probe can sample NumStreams. Called once, right after session creation.
-func (w *wsRWC) setSession(s *yamux.Session) { w.session.Store(s) }
+// threshold-gated slow-write path can sample per-session NumStreams() for
+// incident correlation. Called once, right after session creation.
+func (w *wsRWC) setSession(s streamSampler) { w.sampler.Store(&samplerHolder{s: s}) }
 
 func (w *wsRWC) Read(p []byte) (int, error) {
 	for {
@@ -90,16 +111,28 @@ func (w *wsRWC) Write(p []byte) (int, error) {
 	stats.MutexWaitDur.Observe(int64(mutexWait))
 	stats.WriteMsgDur.Observe(int64(writeMsgDur))
 	stats.TotalDur.Observe(int64(mutexWait + writeMsgDur))
-	var aux int64
-	if s := w.session.Load(); s != nil {
-		aux = int64(s.NumStreams())
-		stats.ActiveStreamsAtWrite.Observe(aux)
-	}
+	// Active-streams histogram: sample the LOCK-FREE global gauge
+	// (diag.Default.Yamux.ActiveStreams — an atomic.Int64 inc/dec'd on proxy
+	// stream open/close in pkg/server/proxy.go), NOT yamux.Session.NumStreams(),
+	// which acquires the session's streamLock (yamux@v0.1.2/session.go). The
+	// hot write path must stay lock-free; the only per-session NumStreams()
+	// read is threshold-gated to ≥SlowWSWriteNs below, where its lock cost is
+	// negligible relative to the slow write itself.
+	stats.ActiveStreamsAtWrite.Observe(diag.Default.Yamux.ActiveStreams.Load())
 	if err != nil {
 		stats.Errors.Inc()
 		return 0, err
 	}
 	if int64(mutexWait+writeMsgDur) >= diag.SlowWSWriteNs {
+		// Slow incident (≥100ms): per-session NumStreams() correlation is worth
+		// the streamLock acquisition here — the write already cost ≥100ms, so a
+		// mutex sample is noise. Aux carries that per-session count so the
+		// operator can see "slow write while N streams were active in THIS
+		// session" (the global gauge can't give per-session granularity).
+		var aux int64
+		if h := w.sampler.Load(); h != nil {
+			aux = int64(h.s.NumStreams())
+		}
 		stats.SlowWriteIncidents.Push(diag.Incident{
 			At:     writeStart.UnixNano(),
 			Kind:   "ws_write",
@@ -166,7 +199,7 @@ func NewMuxTransportServer(conn *websocket.Conn) (*MuxTransport, error) {
 	if err != nil {
 		return nil, fmt.Errorf("yamux server init: %w", err)
 	}
-	rwc.setSession(session) // Probe 5: wire NumStreams sampling
+	rwc.setSession(session) // Probe 5: wire per-session sampler for slow-write incidents
 
 	return &MuxTransport{Session: session, wsConn: conn}, nil
 }
@@ -187,7 +220,7 @@ func NewMuxTransportClient(conn *websocket.Conn) (*MuxTransport, error) {
 	if err != nil {
 		return nil, fmt.Errorf("yamux client init: %w", err)
 	}
-	rwc.setSession(session) // Probe 5: wire NumStreams sampling
+	rwc.setSession(session) // Probe 5: wire per-session sampler for slow-write incidents
 
 	return &MuxTransport{Session: session, wsConn: conn}, nil
 }

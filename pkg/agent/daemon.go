@@ -212,6 +212,20 @@ func (d *Daemon) handleStream(stream *tunnel.Stream, sess *yamux.Session) {
 // NumStreams() sampling on the response-direction slow-write path; it is never
 // used for behavior. May be nil (sampling is skipped).
 func (d *Daemon) handleRawProxy(stream *tunnel.Stream, req *tunnel.RawProxyMessage, sess *yamux.Session) {
+	// PROBE 4 / B-F1: maintain the process-local active-stream gauge for the
+	// lifetime of this accepted proxy stream, symmetric with the controller's
+	// pkg/server/proxy.go handleRawProxy (which does ActiveStreams.Add(+1/-1)
+	// around its controller-side OpenStream). The worker-side wsRWC.Write
+	// samples this gauge into worker_client active_streams_at_write (see
+	// pkg/tunnel/websocket.go Write); without this inc/dec the worker-process
+	// gauge stays at 0 forever (nothing else on the worker touches it) and the
+	// histogram records misleading always-zero data in the very Performance
+	// diagnostics dialog this slice adds. atomic.Int64 inc/dec — lock-free,
+	// identical to the controller leg. The defer covers every return path
+	// (port==0 reject, dial failure, copy completion).
+	diag.Default.Yamux.ActiveStreams.Add(1)
+	defer diag.Default.Yamux.ActiveStreams.Add(-1)
+
 	port := req.Port
 	if port == 0 {
 		port = d.Proxy.WebPort

@@ -314,9 +314,15 @@ type WSWriteStats struct {
 	WriteMsgDur Histogram
 	// Total Write-call duration (mutex-wait + WriteMessage + tiny overhead).
 	TotalDur Histogram
-	// Active yamux session stream count sampled at each Write (cheap; sourced
-	// from yamux.Session.NumStreams()). Reported as a histogram so the
-	// "write was slow while N streams were active" correlation is visible.
+	// Active proxy-stream count sampled at each wsRWC.Write. Sourced from the
+	// lock-free process-local gauge Yamux.ActiveStreams (atomic.Int64), NOT
+	// yamux.Session.NumStreams() — NumStreams() acquires the session streamLock
+	// and is reserved for the threshold-gated slow-write incident's Aux only
+	// (see pkg/tunnel/websocket.go Write). The gauge is inc/dec'd around each
+	// proxy stream's lifetime on BOTH tunnel endpoints: controller side in
+	// pkg/server/proxy.go handleRawProxy, worker side in pkg/agent/daemon.go
+	// handleRawProxy. Reported as a histogram so the "write was slow while N
+	// streams were active" correlation is visible on each process independently.
 	ActiveStreamsAtWrite Histogram
 	// Slow Write incidents (bounded ring; Detail = mutex-wait, Aux = active streams).
 	SlowWriteIncidents IncidentRing

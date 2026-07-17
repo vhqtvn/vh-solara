@@ -12,6 +12,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, waitFor } from "@solidjs/testing-library";
 
 import AdminMenu from "../../src/components/AdminMenu";
+import { setPerfDiagEnabled } from "../../src/prefs";
 
 const OC_VER_IDLE = {
   installed: "0.2.0",
@@ -122,5 +123,36 @@ describe("AdminMenu — three sections, Update/Reinstall by state, centered Rest
     // with no second entry-button click inside the dialog.
     restart.click();
     await waitFor(() => expect(document.querySelector(".ocu-confirm")).toBeTruthy());
+  });
+});
+
+describe("AdminMenu — Performance entry gated on perfDiagEnabled (default off)", () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+    localStorage.clear();
+    setPerfDiagEnabled(false);
+  });
+
+  it("hides the Performance entry when perfDiagEnabled is off (the default)", async () => {
+    setPerfDiagEnabled(false);
+    stubVersions(OC_VER_IDLE);
+    render(() => <AdminMenu onClose={() => {}} />);
+
+    await waitFor(() => expect(menuBtn("Reinstall")).toBeTruthy());
+    expect(menuBtn("Performance")).toBeUndefined();
+  });
+
+  it("shows the Performance entry when perfDiagEnabled is on", async () => {
+    setPerfDiagEnabled(true);
+    stubVersions(OC_VER_IDLE);
+    render(() => <AdminMenu onClose={() => {}} />);
+
+    const perf = await waitFor(() => {
+      const b = menuBtn("Performance");
+      expect(b).toBeTruthy();
+      return b!;
+    });
+    expect(perf.classList.contains("admin-btn")).toBe(true);
   });
 });
