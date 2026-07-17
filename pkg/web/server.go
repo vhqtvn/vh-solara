@@ -28,6 +28,7 @@ import (
 
 	"github.com/vhqtvn/vh-solara/pkg/aggregator"
 	"github.com/vhqtvn/vh-solara/pkg/auth"
+	diag "github.com/vhqtvn/vh-solara/pkg/diagnostics"
 	"github.com/vhqtvn/vh-solara/pkg/oclife"
 	"github.com/vhqtvn/vh-solara/pkg/opencode"
 	"github.com/vhqtvn/vh-solara/pkg/procmgr"
@@ -532,6 +533,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/vh/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok"))
 	})
+	// PROBE diagnostic exposure: read-only GET, auth-gated like every other
+	// /vh/* route (Auth.Middleware wraps the whole mux). GET-only so NO
+	// X-VH-CSRF exception is needed (CSRF defense applies to unsafe methods
+	// only). Emits bounded aggregates only — no raw transcript/session/URL.
+	mux.HandleFunc("/vh/diag/latency", diag.Handler().ServeHTTP)
 	mux.HandleFunc("/vh/skill/emit", s.handleSkillEmit)
 	mux.HandleFunc("/vh/version", func(w http.ResponseWriter, r *http.Request) {
 		writeJSONResp(w, map[string]string{"version": s.version()})
@@ -987,6 +993,25 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
 		return
 	}
+
+	// PROBE 3 (latency diagnostics): wrap the ResponseWriter with a
+	// counting/timing writer that preserves http.Flusher. Per-class (tree /
+	// selected-session / firehose — NOT per-session-id) aggregates feed the
+	// bounded diagnostics registry: bytes, writes, write/flush duration,
+	// inter-arrival gap, ping duration, snapshot-vs-replay path, and
+	// disconnect reason. IMPORTANT CAVEAT: a successful Write here only means
+	// bytes reached local TCP buffering; correlate with yamux (Probe 4),
+	// tunnel ws (Probe 5), and controller io.Copy (Probe 6) for full
+	// attribution. The wrapper adds pure-atomic overhead on Write/Flush and a
+	// scoped-mutex IncidentRing push ONLY when a slow threshold is crossed.
+	streamClass := diag.ClassifyStream(messageFilter(r))
+	sw := diag.NewStreamStatsWriter(w, streamClass)
+	w = sw
+	flusher = sw // route Flush through the probe (sw implements http.Flusher)
+	sw.RecordOpen()
+	var discReason int = diag.DiscRequestCtxClosed // default: browser closed
+	defer func() { sw.RecordDisconnect(discReason) }()
+
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
 	h.Set("Cache-Control", "no-cache, no-transform")
@@ -1065,6 +1090,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		baseline = head
+		sw.RecordReplayPath() // PROBE 3: cursor-replay baseline branch
 	} else {
 		// Fresh client or cursor too old: send a full snapshot, then live-tail.
 		// NON-BLOCKING hydration: kick the upstream fetch off in the background
@@ -1090,6 +1116,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			// same path; this is what cuts a warm open's end-to-end `snap` transport
 			// ~3.4x (the controller tunnel does not compress at any lower layer).
 			writeRaw(w, snap.Seq, "snapshot", maybeCompressSnapshot(b, wantsCompress(r)))
+			sw.RecordSnapshotPath(len(b)) // PROBE 3: snapshot baseline branch + wire bytes
 		}
 		baseline = snap.Seq
 	}
@@ -1103,7 +1130,8 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			return
 		case ev, ok := <-ch:
 			if !ok {
-				return // dropped as a slow consumer; client will reconnect + resume
+				discReason = diag.DiscSubscriberChannelClosed // PROBE 3
+				return                                        // dropped as a slow consumer; client will reconnect + resume
 			}
 			if ev.Kind == "notice" {
 				// Transient alert (state.KindNotice): not part of the replayable
@@ -1128,8 +1156,10 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			// it — EventSource hides comments, so the client uses these pings to
 			// detect a dead-but-open connection and force a reconnect. No id line,
 			// so Last-Event-ID (the resume cursor) is untouched.
+			pingStart := time.Now() // PROBE 3: ping write+flush duration sentinel
 			io.WriteString(w, "event: ping\ndata: {}\n\n")
 			flusher.Flush()
+			sw.RecordPing(time.Since(pingStart))
 		}
 	}
 }

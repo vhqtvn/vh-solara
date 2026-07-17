@@ -15,6 +15,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	diag "github.com/vhqtvn/vh-solara/pkg/diagnostics"
 )
 
 // Client talks to a local opencode server (from `opencode serve`).
@@ -365,6 +367,18 @@ type Event struct {
 	ID         string          `json:"id"`
 	Type       string          `json:"type"`
 	Properties json.RawMessage `json:"properties"`
+
+	// IngestNano is DIAGNOSTIC-ONLY metadata stamped by SubscribeEvents the
+	// instant the envelope is decoded (Probe 1 of the latency-budget
+	// instrumentation). It carries a local monotonic-derived ingest t0 (via
+	// diag.MonoNow(), NOT wall-clock UnixNano) down to the store so Probe 2
+	// can measure ingest→emit age. Monotonic-derived so clock adjustments
+	// (NTP jumps, manual date changes) cannot make the recorded age negative
+	// or falsely large. It is NEVER serialized (json:"-"), so the wire shape,
+	// the existing id:/Seq semantics, and the store's ClientEvent JSON are all
+	// bit-for-bit unchanged. Zero means "no ingest t0 carried" (hydrate /
+	// daemon-generated events, which bypass the SubscribeEvents boundary).
+	IngestNano int64 `json:"-"`
 }
 
 // idleTimeout is how long SubscribeEvents tolerates receiving NO data before
@@ -428,7 +442,28 @@ func (c *Client) SubscribeEvents(ctx context.Context, handler func(Event) error)
 		if err := json.Unmarshal([]byte(raw), &ev); err != nil {
 			return nil // skip malformed frame, keep streaming
 		}
-		return handler(ev)
+		// PROBE 1 (latency diagnostics): ingest boundary. Stamp a
+		// monotonic-derived ingest t0 the instant the envelope is decoded and
+		// BEFORE any handler/store processing begins. This is the first
+		// trustworthy local t0; the store's emit (Probe 2) measures
+		// ingest→emit age from it. Source class is always opencode_live here —
+		// hydrate / daemon-generated events bypass this boundary and are
+		// attributed at emit instead. Counters are pure atomics into the shared
+		// diagnostics registry; no allocation, no lock, no log line per frame.
+		// ev.IngestNano is json:"-" so the wire payload is untouched.
+		//
+		// Finding 7: uses diag.MonoNow() (monotonic-clock-derived, immune to
+		// NTP/wall-clock jumps) instead of time.Now().UnixNano() (wall-clock,
+		// which discards Go's monotonic component and can make recorded ages
+		// negative or falsely large when the system clock moves).
+		ingestNs := diag.MonoNow()
+		ev.IngestNano = ingestNs
+		diag.Default.Ingest.Events.Inc()
+		diag.Default.Ingest.Bytes.Add(uint64(len(ev.Properties)))
+		diag.Default.Ingest.BytesHist.Observe(int64(len(ev.Properties)))
+		err := handler(ev)
+		diag.Default.Ingest.DispatchDur.Observe(diag.MonoNow() - ingestNs)
+		return err
 	}
 
 	// A single line read result delivered from the reader goroutine.

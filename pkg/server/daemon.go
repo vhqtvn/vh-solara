@@ -13,6 +13,7 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/vhqtvn/vh-solara/pkg/auth"
+	diag "github.com/vhqtvn/vh-solara/pkg/diagnostics"
 	"github.com/vhqtvn/vh-solara/pkg/tunnel"
 )
 
@@ -108,6 +109,13 @@ func (d *Daemon) buildRootHandler() http.Handler {
 	userMux.HandleFunc("DELETE /api/workers", d.handleCleanupWorkers)
 	userMux.HandleFunc("POST /api/workers/{id}/kill", d.handleKillWorker)
 	userMux.HandleFunc("GET /{$}", d.handleUIPage)
+
+	// Latency diagnostics (Probes 4/5-server/6 on the controller edge).
+	// GET-only read-only JSON snapshot — mirrors pkg/web's /vh/diag/latency.
+	// Auth-gated by Auth.Middleware (the whole userMux chain is wrapped at the
+	// bottom of buildRootHandler). GET-only so NO X-VH-CSRF exception is needed
+	// (csrfGuard below only enforces the header on unsafe methods under /api/).
+	userMux.HandleFunc("GET /vh/diag/latency", diag.Handler().ServeHTTP)
 
 	// Cross-worker coordination API (A3) — its own mux, gated by a bearer token
 	// and matched BEFORE session auth (headless, non-browser client).

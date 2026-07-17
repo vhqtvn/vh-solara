@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	diag "github.com/vhqtvn/vh-solara/pkg/diagnostics"
 	"github.com/vhqtvn/vh-solara/pkg/opencode"
 	"github.com/vhqtvn/vh-solara/pkg/vhlog"
 )
@@ -117,6 +118,17 @@ type ClientEvent struct {
 	Seq     uint64          `json:"seq"`
 	Kind    string          `json:"kind"`
 	Payload json.RawMessage `json:"payload"`
+
+	// ingestNano is DIAGNOSTIC-ONLY: the local ingest t0 (monotonic-derived
+	// nanoseconds elapsed since process start, via diag.MonoNow()) carried
+	// from the opencode.SubscribeEvents boundary (Probe 1), used by Probe 2 to
+	// measure ingest→emit age. Monotonic-derived — NOT wall-clock UnixNano —
+	// so clock adjustments (NTP jumps, manual date changes) cannot make the
+	// recorded age negative or falsely large. It is UNEXPORTED so json.Marshal
+	// never emits it — the wire shape (seq/kind/payload) is bit-for-bit
+	// unchanged, the ring stores it transparently, and writeEvent/replay
+	// ignore it. Zero means "no ingest t0" (hydrate/daemon events).
+	ingestNano int64
 }
 
 // Snapshot is the full current view plus the head seq a client resumes from.
@@ -454,6 +466,18 @@ type Store struct {
 	ring *ringBuffer
 	subs map[int]*subscriber
 	next int
+
+	// curEmitIngest / curEmitSource carry the provenance of the event(s)
+	// about-to-be-emitted by s.emit, for Probe 2 attribution. They are PLAIN
+	// fields (no atomic) accessed ONLY under s.mu — every emit-path caller
+	// holds s.mu. Apply sets curEmitIngest = ev.ingestNano (monotonic-derived)
+	// + curEmitSource = live and defers a reset to daemon; Hydrate sets
+	// hydrate and defers a reset; all other emit-path methods
+	// (EmitMessagesLoaded/Error, publishColdBatch, SetSessionMessages,
+	// RemoveSessions, etc.) inherit the daemon default (initialized in New).
+	// Zero ingest = "no upstream t0 carried".
+	curEmitIngest int64
+	curEmitSource uint8
 }
 
 // newEpoch returns a random per-lifetime store id. crypto/rand is used so it's
@@ -487,6 +511,12 @@ func New(ringCapacity int) *Store {
 		seeded:          map[string]bool{},
 		ring:            newRingBuffer(ringCapacity),
 		subs:            map[int]*subscriber{},
+		// Finding 4: SourceOpencodeLive is the iota zero value. Without an
+		// explicit init here, ordinary daemon-originated emissions (messages
+		// .loaded/error, activity, etc.) would be misattributed as
+		// opencode_live in Probe 2's SourceCount. Daemon-generated is the safe
+		// default for every emit path that does NOT set it explicitly.
+		curEmitSource: diag.SourceDaemonGenerated,
 	}
 }
 
@@ -519,11 +549,38 @@ func (s *Store) bumpMsgRev(sid string) {
 // closes+removes that subscriber, never blocking the producer.
 func (s *Store) emit(kind string, payload json.RawMessage) {
 	s.seq++
-	ev := ClientEvent{Seq: s.seq, Kind: kind, Payload: payload}
+	ev := ClientEvent{Seq: s.seq, Kind: kind, Payload: payload, ingestNano: s.curEmitIngest}
 	s.ring.push(ev)
 	sid := ""
 	if isMessageClassKind(kind) {
 		sid = payloadSessionID(payload)
+	}
+	// PROBE 2 (latency diagnostics): emit-boundary aggregates. PURE ATOMICS
+	// only — no mutex, no channel, no allocation, no blocking — because this
+	// runs under s.mu on every event. Records per-class count/bytes (fixed 5
+	// classes), per-source count (live/hydrate/daemon — fixed 3), ingest→emit
+	// age histogram when an ingest t0 was carried, and subscriber drops (the
+	// existing backpressure sentinel — the drop itself is unchanged, only
+	// counted). The fan-out loop below is byte-for-byte unchanged.
+	//
+	// Finding 2: the slow-emit IncidentRing capture was REMOVED from this
+	// boundary. The ring's scoped mutex (IncidentRing.mu) and the dynamic
+	// "emit_age:"+kind label allocation violated the hard lock-free / no-alloc
+	// invariant for code that runs under s.mu. The atomic-CAS EmitAge
+	// histogram stays (it is pure atomics) and still attributes slow emits in
+	// aggregate; per-incident detail for this boundary is simply not recorded.
+	// Slow-incident capture is retained on the SSE/yamux/ws boundaries (their
+	// mutex acquire happens OUTSIDE any held store lock).
+	emitMono := diag.MonoNow()
+	cls := diag.ClassifyEmitKind(kind)
+	diag.Default.Emit.ClassCount[cls].Inc()
+	diag.Default.Emit.ClassBytes[cls].Add(uint64(len(payload)))
+	diag.Default.Emit.SourceCount[s.curEmitSource].Inc()
+	if s.curEmitIngest > 0 {
+		age := emitMono - s.curEmitIngest
+		if age >= 0 {
+			diag.Default.Emit.EmitAge.Observe(age)
+		}
 	}
 	for id, sub := range s.subs {
 		if !sub.interest.wants(kind, sid) {
@@ -533,6 +590,8 @@ func (s *Store) emit(kind string, payload json.RawMessage) {
 		case sub.ch <- ev:
 		default:
 			// Slow consumer: drop it. The client will reconnect and re-snapshot.
+			// PROBE 2: count the existing drop (the backpressure sentinel).
+			diag.Default.Emit.SubscriberDrops.Inc()
 			close(sub.ch)
 			delete(s.subs, id)
 		}
@@ -546,6 +605,16 @@ func (s *Store) emit(kind string, payload json.RawMessage) {
 func (s *Store) EmitNotice(payload json.RawMessage) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Finding 4: EmitNotice deliberately bypasses s.emit (it must NOT record to
+	// the ring or advance seq — a notice is transient). But it still reports
+	// into Probe 2's atomic class/source counters so notice events are
+	// accounted. Class is structural (ClassifyEmitKind maps "notice" →
+	// structural), source is daemon-generated (the default). PURE ATOMICS
+	// only — consistent with the emit() boundary invariant.
+	cls := diag.ClassifyEmitKind(KindNotice)
+	diag.Default.Emit.ClassCount[cls].Inc()
+	diag.Default.Emit.ClassBytes[cls].Add(uint64(len(payload)))
+	diag.Default.Emit.SourceCount[diag.SourceDaemonGenerated].Inc()
 	// Fan out WITHOUT recording to the ring or advancing seq: a notice is a live
 	// alert, not part of the replayable view. Reusing the current head seq keeps
 	// resume cursors monotonic (no gap, no duplicate-advance).
@@ -554,6 +623,8 @@ func (s *Store) EmitNotice(payload json.RawMessage) {
 		select {
 		case sub.ch <- ev:
 		default:
+			// Slow consumer: drop it. PROBE 2: count the existing drop.
+			diag.Default.Emit.SubscriberDrops.Inc()
 			close(sub.ch)
 			delete(s.subs, id)
 		}
@@ -753,6 +824,14 @@ func (s *Store) SetActivityFromStatuses(statuses map[string]json.RawMessage) {
 func (s *Store) Apply(ev opencode.Event) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// PROBE 2: attribute emits inside this Apply to the live upstream source
+	// and carry the ingest t0 (Probe 1) so emit can measure ingest→emit age.
+	// Reset on exit so the next emit-path caller (which re-acquires s.mu) sees
+	// the daemon default unless it sets otherwise.
+	s.curEmitIngest = ev.IngestNano
+	s.curEmitSource = diag.SourceOpencodeLive
+	defer func() { s.curEmitIngest = 0; s.curEmitSource = diag.SourceDaemonGenerated }()
 
 	switch ev.Type {
 	case "session.created", "session.updated", "session.compacted":
@@ -2401,6 +2480,12 @@ func (s *Store) Replay(cursor uint64) (events []ClientEvent, head uint64, ok boo
 func (s *Store) Hydrate(sessions []json.RawMessage, messages map[string][]MessageWithParts) {
 	s.mu.Lock()
 
+	// PROBE 2: attribute emits inside this Hydrate to the hydrate source
+	// (reconstructed state — no upstream ingest t0 carried). Reset BEFORE
+	// s.mu.Unlock() below (NOT via defer) so the write stays under the lock —
+	// otherwise the deferred reset races with Apply's writes to the same field.
+	s.curEmitSource = diag.SourceHydrate
+
 	// --- sessions ---
 	seen := make(map[string]bool, len(sessions))
 	for _, info := range sessions {
@@ -2435,6 +2520,7 @@ func (s *Store) Hydrate(sessions []json.RawMessage, messages map[string][]Messag
 			coldBatched = append(coldBatched, sid)
 		}
 	}
+	s.curEmitSource = diag.SourceDaemonGenerated // PROBE 2: reset (under lock) before cold-batch
 	s.mu.Unlock()
 
 	// Package each cold batch outside the lock. Per-session revision validation

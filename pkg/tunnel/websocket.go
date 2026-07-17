@@ -6,10 +6,12 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/hashicorp/yamux"
+	diag "github.com/vhqtvn/vh-solara/pkg/diagnostics"
 )
 
 // wsRWC adapts a gorilla/websocket.Conn into a net.Conn-like interface
@@ -22,11 +24,25 @@ type wsRWC struct {
 	conn   *websocket.Conn
 	mu     sync.Mutex // protects writes
 	reader io.Reader  // current in-progress message reader
+
+	// side identifies which wsRWC role this is (Probe 5): controller-server or
+	// worker-client. Set at construction so every Write attributes into the
+	// correct per-side accumulator.
+	side int
+	// session holds the yamux.Session created on top of this wsRWC, set via
+	// setSession immediately after yamux.Server/Client returns. Sampled (via
+	// NumStreams) on each Write so "slow Write while N streams active" is
+	// visible. atomic.Pointer so the Write path needs no lock to read it.
+	session atomic.Pointer[yamux.Session]
 }
 
-func newWSRWC(conn *websocket.Conn) *wsRWC {
-	return &wsRWC{conn: conn}
+func newWSRWC(conn *websocket.Conn, side int) *wsRWC {
+	return &wsRWC{conn: conn, side: side}
 }
+
+// setSession records the yamux session created on top of this wsRWC so the
+// Write probe can sample NumStreams. Called once, right after session creation.
+func (w *wsRWC) setSession(s *yamux.Session) { w.session.Store(s) }
 
 func (w *wsRWC) Read(p []byte) (int, error) {
 	for {
@@ -51,12 +67,47 @@ func (w *wsRWC) Read(p []byte) (int, error) {
 }
 
 func (w *wsRWC) Write(p []byte) (int, error) {
+	// PROBE 5 (latency diagnostics): record mutex-wait and WriteMessage
+	// duration SEPARATELY. mutex-wait ALONE is NOT a sufficient saturation
+	// metric — yamux serializes its own sender, so head-of-line delay may
+	// appear as stream-Write wait (Probe 4) rather than wsRWC.mu contention.
+	// Recording both signals independently lets the operator distinguish the
+	// two. The lock scope is byte-for-bit identical to the original
+	// (Lock + defer Unlock); the recording is pure atomics inside the locked
+	// region, adding only a handful of atomic adds.
+	waitStart := time.Now()
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	mutexWait := time.Since(waitStart)
 
+	writeStart := time.Now()
 	err := w.conn.WriteMessage(websocket.BinaryMessage, p)
+	writeMsgDur := time.Since(writeStart)
+
+	stats := &diag.Default.WSWrite[w.side]
+	stats.Bytes.Add(uint64(len(p)))
+	stats.Writes.Inc()
+	stats.MutexWaitDur.Observe(int64(mutexWait))
+	stats.WriteMsgDur.Observe(int64(writeMsgDur))
+	stats.TotalDur.Observe(int64(mutexWait + writeMsgDur))
+	var aux int64
+	if s := w.session.Load(); s != nil {
+		aux = int64(s.NumStreams())
+		stats.ActiveStreamsAtWrite.Observe(aux)
+	}
 	if err != nil {
+		stats.Errors.Inc()
 		return 0, err
+	}
+	if int64(mutexWait+writeMsgDur) >= diag.SlowWSWriteNs {
+		stats.SlowWriteIncidents.Push(diag.Incident{
+			At:     writeStart.UnixNano(),
+			Kind:   "ws_write",
+			Bytes:  uint64(len(p)),
+			Dur:    int64(mutexWait + writeMsgDur),
+			Detail: int64(mutexWait),
+			Aux:    aux,
+		})
 	}
 	return len(p), nil
 }
@@ -103,7 +154,7 @@ type MuxTransport struct {
 // The "server" in yamux terminology is the side that calls AcceptStream().
 // In our architecture, the vh-solara server is the yamux server.
 func NewMuxTransportServer(conn *websocket.Conn) (*MuxTransport, error) {
-	rwc := newWSRWC(conn)
+	rwc := newWSRWC(conn, diag.SideServer)
 
 	cfg := yamux.DefaultConfig()
 	cfg.EnableKeepAlive = true
@@ -115,6 +166,7 @@ func NewMuxTransportServer(conn *websocket.Conn) (*MuxTransport, error) {
 	if err != nil {
 		return nil, fmt.Errorf("yamux server init: %w", err)
 	}
+	rwc.setSession(session) // Probe 5: wire NumStreams sampling
 
 	return &MuxTransport{Session: session, wsConn: conn}, nil
 }
@@ -123,7 +175,7 @@ func NewMuxTransportServer(conn *websocket.Conn) (*MuxTransport, error) {
 // The "client" in yamux terminology is the side that calls OpenStream().
 // In our architecture, the agent/client-daemon is the yamux client.
 func NewMuxTransportClient(conn *websocket.Conn) (*MuxTransport, error) {
-	rwc := newWSRWC(conn)
+	rwc := newWSRWC(conn, diag.SideClient)
 
 	cfg := yamux.DefaultConfig()
 	cfg.EnableKeepAlive = true
@@ -135,6 +187,7 @@ func NewMuxTransportClient(conn *websocket.Conn) (*MuxTransport, error) {
 	if err != nil {
 		return nil, fmt.Errorf("yamux client init: %w", err)
 	}
+	rwc.setSession(session) // Probe 5: wire NumStreams sampling
 
 	return &MuxTransport{Session: session, wsConn: conn}, nil
 }

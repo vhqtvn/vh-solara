@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/hashicorp/yamux"
+	diag "github.com/vhqtvn/vh-solara/pkg/diagnostics"
 	"github.com/vhqtvn/vh-solara/pkg/tunnel"
 )
 
@@ -166,11 +168,11 @@ func (d *Daemon) handleTunnel(conn *websocket.Conn) {
 			break
 		}
 
-		go d.handleStream(stream)
+		go d.handleStream(stream, mux.Session)
 	}
 }
 
-func (d *Daemon) handleStream(stream *tunnel.Stream) {
+func (d *Daemon) handleStream(stream *tunnel.Stream, sess *yamux.Session) {
 	defer stream.Close()
 
 	var base tunnel.BaseMessage
@@ -196,7 +198,7 @@ func (d *Daemon) handleStream(stream *tunnel.Stream) {
 		// Re-parse from base — we only need the port
 		req.Port = 0 // default
 		// Don't close stream via defer — handleRawProxy manages its lifecycle
-		d.handleRawProxy(stream, &req)
+		d.handleRawProxy(stream, &req, sess)
 		return // skip the deferred stream.Close()
 
 	default:
@@ -206,7 +208,10 @@ func (d *Daemon) handleStream(stream *tunnel.Stream) {
 
 // handleRawProxy connects to a local port and does bidirectional byte copying
 // between the yamux stream and the local connection (for WebSocket proxying).
-func (d *Daemon) handleRawProxy(stream *tunnel.Stream, req *tunnel.RawProxyMessage) {
+// sess is the worker's yamux.Session, used ONLY for Probe 4 per-incident
+// NumStreams() sampling on the response-direction slow-write path; it is never
+// used for behavior. May be nil (sampling is skipped).
+func (d *Daemon) handleRawProxy(stream *tunnel.Stream, req *tunnel.RawProxyMessage, sess *yamux.Session) {
 	port := req.Port
 	if port == 0 {
 		port = d.Proxy.WebPort
@@ -263,7 +268,18 @@ func (d *Daemon) handleRawProxy(stream *tunnel.Stream, req *tunnel.RawProxyMessa
 	}
 	// log.Printf("[AgentRawProxy] ACK sent, starting bidirectional copy")
 
-	// Bidirectional copy
+	// Bidirectional copy.
+	//
+	// PROBE 4 (Finding 1): the local-service → yamux write leg is the PRIMARY
+	// egress signal — it is where yamux flow-control / send-window backpressure
+	// accumulates (a stalled controller drain shows up as a blocked Write here,
+	// not as a slow Read on the other leg). Wrapping stream.Raw() with a
+	// YamuxWriteMonitor in the YamuxWriteResponse direction captures per-write
+	// timing into YamuxStats.WriteByDir[Response]. yamux.Stream does not
+	// implement io.WriterTo / io.ReaderFrom, so wrapping does not change
+	// io.Copy's generic buffered loop — pure observation. The yamux→local-
+	// service leg is left unwrapped: a Read on it blocks when there's nothing
+	// to read (idle), so timing it would record idle time, not backpressure.
 	var wg sync.WaitGroup
 	wg.Add(2)
 
@@ -277,10 +293,11 @@ func (d *Daemon) handleRawProxy(stream *tunnel.Stream, req *tunnel.RawProxyMessa
 		localConn.Close()
 	}()
 
-	// local service → yamux stream
+	// local service → yamux stream (response direction — primary egress signal)
 	go func() {
 		defer wg.Done()
-		_, err := io.Copy(stream.Raw(), localConn)
+		respW := diag.NewYamuxWriteMonitor(stream.Raw(), diag.YamuxWriteResponse).WithSession(sess)
+		_, err := io.Copy(respW, localConn)
 		if err != nil {
 			// ignore copy errors
 		}
