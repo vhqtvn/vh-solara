@@ -41,6 +41,7 @@ import RelTime from "./RelTime";
 import Select from "./Select";
 import { agentDisplay } from "../projectSettings";
 import { fmtTurnStats, turnStats } from "../usage";
+import { msgTextOnly, msgTextWithThinking } from "../lib/msgText";
 import type { MessageView } from "../types";
 
 const draftKey = (sid: string) => "vh.draft." + sid;
@@ -1739,17 +1740,14 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     }
   }
 
-  // Concatenate a message's text/reasoning parts (the copyable/retryable text).
-  function msgText(m: { partOrder: string[]; parts: Record<string, any> }) {
-    return m.partOrder
-      .map((pid) => m.parts[pid])
-      .filter((p) => p && (p.type === "text" || p.type === "reasoning"))
-      .map((p) => p.text || "")
-      .join("\n")
-      .trim();
-  }
-  const copyMessage = (m: any) => void navigator.clipboard?.writeText(msgText(m));
-  const retry = (m: any) => void sendText(msgText(m), props.sessionId);
+  // Copy / Retry text extraction lives in ../lib/msgText (pure, unit-tested).
+  // Left-click Copy and Retry use msgTextOnly (text only — thinking is never
+  // valid to re-send as a user prompt). Right-click Copy uses
+  // msgTextWithThinking (wraps each contiguous reasoning run in <think>…</think>).
+  const copyMessage = (m: any) => void navigator.clipboard?.writeText(msgTextOnly(m));
+  const copyMessageWithThinking = (m: any) =>
+    void navigator.clipboard?.writeText(msgTextWithThinking(m));
+  const retry = (m: any) => void sendText(msgTextOnly(m), props.sessionId);
 
   // Inspect: tokens / cost / raw message JSON.
   const [inspectId, setInspectId] = createSignal<string | null>(null);
@@ -1875,7 +1873,16 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
                     <MsgPerf m={m} />
                   </Show>
                   <div class="msg-actions">
-                    <button type="button" data-tip="Copy" aria-label="Copy" onClick={() => copyMessage(m)}>
+                    <button
+                      type="button"
+                      data-tip="Copy · right-click for thinking"
+                      aria-label="Copy message text; right-click to include reasoning"
+                      onClick={() => copyMessage(m)}
+                      onContextMenu={(e) => {
+                        e.preventDefault();
+                        copyMessageWithThinking(m);
+                      }}
+                    >
                       <Icon name="copy" size={14} />
                     </button>
                     <button type="button" data-tip="Inspect" aria-label="Inspect" onClick={() => toggleInspect(m.id)}>
