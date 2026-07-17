@@ -1187,20 +1187,26 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   }
 
   // Tap vs hold on the paste button: a plain tap replaces the whole composer; a
-  // long-press (>=450ms between pointerdown and click) inserts at the caret.
-  // Classification is by elapsed wall-clock hold time, NOT by whether a timer
-  // callback raced the click handler — the previous timer+flag scheme
-  // misclassified as "replace" when main-thread jank stalled the event loop
-  // past 450ms (CI load, throttled devices). The insert runs in the click
-  // handler, which is still inside the transient-activation window opened by
-  // pointerdown (lasts several seconds), so clipboard read works.
+  // long-press (>=HOLD_THRESHOLD_MS between pointerdown and click) inserts at
+  // the caret. Classification goes through the shared classifyHold helper
+  // (../lib/copyHold, same one the Copy button uses), so the two hold
+  // affordances share one threshold and one load-independent rationale: a
+  // previous timer+flag scheme misclassified as "replace" when main-thread jank
+  // stalled the event loop past the threshold (CI load, throttled devices),
+  // because the timer callback raced the click handler. classifyHold also
+  // returns "tap" for keyboard activation (Enter/Space on the focused button
+  // fires click with no preceding pointerdown → pasteDownAt stays 0 → the
+  // downAt===0 sentinel), giving keyboard users the documented "replaces all"
+  // default instead of the hold branch. The insert runs in the click handler,
+  // which is still inside the transient-activation window opened by pointerdown
+  // (lasts several seconds), so clipboard read works.
   let pasteDownAt = 0;
   const onPasteDown = () => {
     pasteDownAt = Date.now();
   };
   const onPasteUp = () => {}; // no-op; elapsed check on click makes hold load-independent
   const onPasteClick = () => {
-    if (Date.now() - pasteDownAt >= 450) {
+    if (classifyHold(pasteDownAt, Date.now()) === "hold") {
       void pasteFromClipboard("insert");
       return;
     }
