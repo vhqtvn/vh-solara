@@ -17,10 +17,24 @@ export const HOLD_THRESHOLD_MS = 450;
 
 export type HoldClassification = "tap" | "hold";
 
+// Classify a press as tap vs hold by elapsed wall-clock time between
+// pointerdown and the click that follows.
+//
+// Keyboard sentinel: when no pointerdown precedes the click — keyboard
+// activation (Enter or Space on a focused Copy button) or any programmatic
+// `.click()` — the caller's `downAt` stays at its initial `0`, because
+// `onPointerDown` never ran for that gesture. (Date.now() never returns 0 in
+// practice, so `0` is a reliable sentinel.) Keyboard/programmatic activation
+// carries no hold intent, and the module-level precondition "a click always
+// follows its pointerdown" does not hold for it, so classify it as the
+// least-surprising default — `"tap"` (text-only) — rather than running the
+// elapsed comparison, which would otherwise always yield `"hold"` because
+// `Date.now() - 0 >= 450` is always true.
 export function classifyHold(
   downAt: number,
   nowMs: number,
 ): HoldClassification {
+  if (downAt === 0) return "tap";
   return nowMs - downAt >= HOLD_THRESHOLD_MS ? "hold" : "tap";
 }
 
