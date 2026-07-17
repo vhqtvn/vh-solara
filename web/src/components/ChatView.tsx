@@ -1200,6 +1200,23 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // default instead of the hold branch. The insert runs in the click handler,
   // which is still inside the transient-activation window opened by pointerdown
   // (lasts several seconds), so clipboard read works.
+  //
+  // SolidJS no-rerender note: SolidJS is NOT React — component bodies and JSX
+  // run once at mount, so this `let pasteDownAt` closure persists for the whole
+  // ChatView instance lifetime (it even survives session switches via the
+  // non-keyed <Show when={selectedId()}> at App.tsx:367). Without an explicit
+  // reset, a single pointer gesture (downAt set to a real timestamp T) would
+  // leave the closure stale, and a LATER keyboard activation of the same
+  // focused button would classify as "hold" (T is old → elapsed >= threshold)
+  // → wrong branch. We close this edge two ways: (1) onBlur resets pasteDownAt
+  // to 0 when focus leaves the button (focus leaving = gesture context ended;
+  // pointer→click→blur ordering means the click already ran with the correct
+  // timestamp, so blur-side reset does not break pointer-hold detection); and
+  // (2) the click handler resets pasteDownAt to 0 AFTER classifyHold consumed
+  // it, closing the narrow residual "pointer-press then immediate Enter on the
+  // same focused button without focus moving away" hole. Both resets return
+  // the closure to the downAt===0 sentinel so the next activation (pointer or
+  // keyboard) starts clean.
   let pasteDownAt = 0;
   const onPasteDown = () => {
     pasteDownAt = Date.now();
@@ -1207,9 +1224,13 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   const onPasteUp = () => {}; // no-op; elapsed check on click makes hold load-independent
   const onPasteClick = () => {
     if (classifyHold(pasteDownAt, Date.now()) === "hold") {
+      pasteDownAt = 0; // reset AFTER classifyHold consumed it — closes the
+                       // "pointer then immediate Enter on the same focused
+                       // button" residual (see comment above).
       void pasteFromClipboard("insert");
       return;
     }
+    pasteDownAt = 0; // same reset on the tap branch.
     void pasteFromClipboard("replace");
   };
 
@@ -1749,10 +1770,12 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
 
   // Copy / Retry text extraction lives in ../lib/msgText (pure, unit-tested).
   // Retry uses msgTextOnly (thinking is never valid to re-send as a user
-  // prompt). Copy has THREE coexisting paths: a tap (<450ms) copies text-only
-  // (msgTextOnly); a long-press (>=450ms) and a right-click both copy
-  // msgTextWithThinking (wraps each contiguous reasoning run in <think>…</think>).
-  // The tap-vs-hold classifier is in ../lib/copyHold (pure, unit-tested).
+  // prompt). Copy has THREE coexisting paths: a tap (elapsed < HOLD_THRESHOLD_MS)
+  // copies text-only (msgTextOnly); a long-press (elapsed >= HOLD_THRESHOLD_MS)
+  // and a right-click both copy msgTextWithThinking (wraps each contiguous
+  // reasoning run in <think>…</think>). The tap-vs-hold classifier is in
+  // ../lib/copyHold (classifyHold, pure, unit-tested) — the single threshold
+  // source of truth shared with the paste button.
   const copyMessage = (m: any) => void navigator.clipboard?.writeText(msgTextOnly(m));
   const copyMessageWithThinking = (m: any) =>
     void navigator.clipboard?.writeText(msgTextWithThinking(m));
@@ -1868,13 +1891,37 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
           <For each={messages()}>
             {(m, i) => {
               // Per-message hold state for the Copy button: a long-press
-              // (>=450ms) copies thinking, a tap copies text-only, right-click
-              // copies thinking. State is per-row (captured in this For
-              // closure) so two messages' gestures can't race a shared
+              // (>=HOLD_THRESHOLD_MS) copies thinking, a tap copies text-only,
+              // right-click copies thinking. State is per-row (captured in this
+              // For closure) so two messages' gestures can't race a shared
               // timestamp; only one button is pressed at a time anyway.
               // thinkingJustCopied dedupes the Android-Chrome touch
               // double-fire (contextmenu then a synthesized click) — see
               // shouldSkipAfterContextmenu in ../lib/copyHold.
+              //
+              // SolidJS no-rerender note (same as the paste button): SolidJS
+              // is NOT React — the <For> row callback runs ONCE per row at
+              // mount, so these `let`s persist for the whole ChatView lifetime
+              // (closure even survives session switches via the non-keyed
+              // <Show when={selectedId()}> at App.tsx:367). Without an explicit
+              // reset, a single pointer gesture (copyDownAt set to a real
+              // timestamp T) would leave the closure stale, and a LATER
+              // keyboard activation of the same focused Copy button would
+              // classify as "hold" → wrong branch (thinking-or-skip instead of
+              // text-only). We close this edge two ways: (1) onBlur resets
+              // copyDownAt (and thinkingJustCopied, defensively) to their
+              // initial values when focus leaves the button (focus leaving =
+              // gesture context ended; pointer→click→blur ordering means the
+              // click already ran with the correct timestamp, so blur-side
+              // reset does not break pointer-hold detection); and (2) the
+              // click handler resets copyDownAt to 0 AFTER classifyHold
+              // consumed it, closing the narrow residual "pointer-press then
+              // immediate Enter on the same focused button without focus
+              // moving away" hole. Note: when copyDownAt===0, classifyHold
+              // returns "tap", and shouldSkipAfterContextmenu is short-circuited
+              // because it requires cls==="hold" — so a lingering stale
+              // thinkingJustCopied=true cannot suppress a keyboard tap;
+              // resetting it anyway is harmless and keeps state clean.
               let copyDownAt = 0;
               let thinkingJustCopied = false;
               return (
@@ -1908,6 +1955,14 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
                       }}
                       onClick={() => {
                         const cls = classifyHold(copyDownAt, Date.now());
+                        // Reset AFTER classifyHold consumed the value — closes
+                        // the narrow residual "pointer-press then immediate
+                        // Enter on the same focused button without focus
+                        // moving away" hole (see the SolidJS no-rerender note
+                        // above). Safe because classifyHold already read the
+                        // value; the next pointerdown of a fresh gesture will
+                        // set it again.
+                        copyDownAt = 0;
                         if (cls === "hold") {
                           // Android-Chrome touch long-press synthesizes a click
                           // AFTER the contextmenu that already copied thinking;
@@ -1930,6 +1985,21 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
                         // guaranteed to precede the click).
                         thinkingJustCopied = true;
                         copyMessageWithThinking(m);
+                      }}
+                      onBlur={() => {
+                        // Focus leaving the button = gesture context ended.
+                        // Return the per-row closure to its initial state so
+                        // the NEXT keyboard activation (Enter/Space on this
+                        // focused Copy button) classifies as "tap" (text-only)
+                        // instead of misclassifying from a stale pointer
+                        // timestamp. See the SolidJS no-rerender note above
+                        // the per-row classifier. Resetting copyDownAt alone
+                        // is sufficient for keyboard parity (a downAt===0
+                        // classifyHold result is "tap", which bypasses
+                        // shouldSkipAfterContextmenu entirely); we reset
+                        // thinkingJustCopied too for cleanliness/symmetry.
+                        copyDownAt = 0;
+                        thinkingJustCopied = false;
                       }}
                     >
                       <Icon name="copy" size={14} />
@@ -2386,6 +2456,15 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
               onPointerUp={onPasteUp}
               onPointerLeave={onPasteUp}
               onPointerCancel={onPasteUp}
+              onBlur={() => {
+                // Focus leaving the button = gesture context ended. Return
+                // the closure to the downAt===0 sentinel so the NEXT keyboard
+                // activation (Enter/Space on this focused button) classifies
+                // as "tap" (documented "replaces all" default) instead of
+                // misclassifying from a stale pointer timestamp. See the
+                // SolidJS no-rerender note above the paste classifier.
+                pasteDownAt = 0;
+              }}
             >
               <Icon name="clipboard" />
             </button>
