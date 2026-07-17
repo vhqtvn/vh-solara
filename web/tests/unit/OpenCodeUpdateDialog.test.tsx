@@ -264,3 +264,181 @@ describe("OpenCodeUpdateDialog — restart-offer gating + extracted RestartConfi
     ).toBeUndefined();
   });
 });
+
+// Changelog ("What's new") panel — a collapsible, lazily-fetched aid that must
+// NEVER block the update button. CSS-module classes are hashed, so we query by
+// semantic text (the repo convention; see OpenCodeHealthPanel.test.tsx).
+const CL_DATA = {
+  available: true,
+  from: "0.1.0",
+  to: "0.2.0",
+  releases: [
+    {
+      tag: "v0.2.0",
+      name: "v0.2.0",
+      date: "2026-07-10T00:00:00Z",
+      url: "https://example.com/v0.2.0",
+      highlights: [],
+      // Desktop deliberately BEFORE Core in source order: the CLIENT must
+      // re-sort so Core/SDK/Extensions render first (section-priority grouping).
+      sections: [
+        {
+          title: "Desktop",
+          // A Desktop item whose text matches a migration token: the SERVER
+          // must NOT flag it (heuristic is gated to Core/SDK/Extensions), so
+          // mayAffectYou is false here — no badge should render.
+          items: [{ text: "Migration of the settings folder layout", mayAffectYou: false }],
+        },
+        {
+          title: "Core",
+          items: [
+            { text: "Removed the legacy --old-flag config switch", mayAffectYou: true },
+            { text: "Added a model-specific temperature override", mayAffectYou: false },
+          ],
+        },
+      ],
+    },
+  ],
+};
+
+// The "What's new" toggle button (text contains "new (since"). The panel is
+// collapsed by default; clicking it lazily fetches the changelog.
+function changelogToggle(): HTMLButtonElement | undefined {
+  return Array.from(document.querySelectorAll("button")).find((b) =>
+    /new \(since/.test(b.textContent || ""),
+  ) as HTMLButtonElement | undefined;
+}
+
+// The panel container is the toggle button's parent (the .panel div). Used to
+// scope text-order assertions (Core before Desktop) without depending on the
+// hashed CSS-module class.
+function changelogPanel(): HTMLElement | null {
+  const t = changelogToggle();
+  return t ? t.parentElement : null;
+}
+
+describe("OpenCodeUpdateDialog — changelog (What's new) panel", () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+    streamOpenCodeUpdate.mockReset();
+  });
+
+  it("is collapsed by default, opens on toggle, and closes on toggle again", async () => {
+    vi.stubGlobal(
+      "fetch",
+      withFetch({
+        "/vh/opencode-version": VER_UPDATE,
+        "/vh/opencode-changelog": CL_DATA,
+      }),
+    );
+    render(() => <OpenCodeUpdateDialog onClose={() => {}} />);
+
+    // Wait for the version readout to resolve so the panel toggle renders.
+    const toggle = await waitFor(() => {
+      const t = changelogToggle();
+      expect(t).toBeTruthy();
+      return t!;
+    });
+    // Collapsed by default: no changelog body content (no release tag, no
+    // loading line) is present, and no changelog fetch has fired yet.
+    expect(document.body.textContent).not.toContain("Loading changelog");
+    expect(document.body.textContent).not.toContain("v0.2.0");
+
+    // Open the panel → lazy fetch fires → release content appears.
+    toggle.click();
+    await waitFor(() => expect(document.body.textContent).toContain("v0.2.0"));
+
+    // Close the panel → body content is removed again.
+    toggle.click();
+    await waitFor(() => expect(document.body.textContent).not.toContain("v0.2.0"));
+  });
+
+  it("groups Core/SDK/Extensions BEFORE Desktop/TUI (section priority)", async () => {
+    vi.stubGlobal(
+      "fetch",
+      withFetch({
+        "/vh/opencode-version": VER_UPDATE,
+        "/vh/opencode-changelog": CL_DATA,
+      }),
+    );
+    render(() => <OpenCodeUpdateDialog onClose={() => {}} />);
+
+    const toggle = await waitFor(() => {
+      const t = changelogToggle();
+      expect(t).toBeTruthy();
+      return t!;
+    });
+    toggle.click();
+
+    // Wait for the Core section title to render, then assert document order:
+    // Core (high priority) renders BEFORE Desktop (de-emphasized) even though
+    // the source fixture lists Desktop first.
+    await waitFor(() => expect(changelogPanel()?.textContent).toContain("Core"));
+    const txt = changelogPanel()!.textContent || "";
+    expect(txt.indexOf("Core")).toBeGreaterThanOrEqual(0);
+    expect(txt.indexOf("Desktop")).toBeGreaterThanOrEqual(0);
+    expect(txt.indexOf("Core")).toBeLessThan(txt.indexOf("Desktop"));
+  });
+
+  it("renders the '⚠ may affect you' badge only on flagged Core items, not on Desktop items", async () => {
+    vi.stubGlobal(
+      "fetch",
+      withFetch({
+        "/vh/opencode-version": VER_UPDATE,
+        "/vh/opencode-changelog": CL_DATA,
+      }),
+    );
+    render(() => <OpenCodeUpdateDialog onClose={() => {}} />);
+
+    const toggle = await waitFor(() => {
+      const t = changelogToggle();
+      expect(t).toBeTruthy();
+      return t!;
+    });
+    toggle.click();
+    await waitFor(() => expect(changelogPanel()?.textContent).toContain("Core"));
+
+    // Exactly one badge overall (the Core "Removed …" item). The Desktop item,
+    // despite matching a migration token, is NOT flagged by the server.
+    const badgeMatches = (document.body.textContent || "").match(/may affect you/g) || [];
+    expect(badgeMatches.length).toBe(1);
+
+    // Per-item precision: inspect each <li> in the panel (highlights are empty
+    // in this fixture, so every <li> is a section item).
+    const items = Array.from(changelogPanel()!.querySelectorAll("li"));
+    const desktopItem = items.find((li) => /Migration of the settings folder/.test(li.textContent || ""));
+    const coreFlagged = items.find((li) => /Removed the legacy/.test(li.textContent || ""));
+    expect(desktopItem).toBeTruthy();
+    expect(coreFlagged).toBeTruthy();
+    expect(desktopItem!.textContent).not.toMatch(/may affect you/);
+    expect(coreFlagged!.textContent).toMatch(/may affect you/);
+  });
+
+  it("degrades to a quiet 'Changelog unavailable' line on fetch failure and leaves the update button usable", async () => {
+    // Changelog fetch returns unavailable; version still resolves normally.
+    vi.stubGlobal(
+      "fetch",
+      withFetch({
+        "/vh/opencode-version": VER_UPDATE,
+        "/vh/opencode-changelog": { available: false, error: "changelog unavailable" },
+      }),
+    );
+    render(() => <OpenCodeUpdateDialog onClose={() => {}} />);
+
+    const toggle = await waitFor(() => {
+      const t = changelogToggle();
+      expect(t).toBeTruthy();
+      return t!;
+    });
+    toggle.click();
+    await waitFor(() => expect(document.body.textContent).toContain("Changelog unavailable"));
+
+    // The update button is STILL rendered and usable — the changelog failure is
+    // NOT a gate. (Confirms the core "never block the update button" invariant.)
+    const actionBtn = document.querySelector(".ocu-action-slot button") as HTMLButtonElement;
+    expect(actionBtn).toBeTruthy();
+    expect(actionBtn.textContent).toContain("Update to 0.2.0");
+    expect(actionBtn.disabled).toBe(false);
+  });
+});

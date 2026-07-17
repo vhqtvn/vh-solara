@@ -83,7 +83,8 @@ type Server struct {
 	restartServer func()
 	ocVersionFn   func(context.Context) (installed, running, latest string, err error)
 	ocUpdateFn    func(ctx context.Context, w io.Writer) error
-	appVersion    string // this vh-solara build's version (set by the daemon)
+	ocChangelogFn OpenCodeChangelogFn // optional; nil → /vh/opencode-changelog returns available=false
+	appVersion    string              // this vh-solara build's version (set by the daemon)
 
 	// ocLifecycle is the worker-local OpenCode lifecycle, exposed at
 	// /vh/opencode/status. nil on servers that don't manage an OpenCode (e.g.
@@ -603,6 +604,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/vh/code/langs", s.handleCodeLangs)
 	mux.HandleFunc("/vh/code/highlight.css", s.handleCodeHighlightCSS)
 	mux.HandleFunc("/vh/opencode-version", s.handleOpenCodeVersion)
+	mux.HandleFunc("/vh/opencode-changelog", s.handleOpenCodeChangelog)
 	mux.HandleFunc("/vh/update-opencode", s.handleUpdateOpenCode)
 	// OpenCode lifecycle snapshot (owned/detached/external topology + state +
 	// capabilities). GET-only; auth-gated like the other /vh/* routes. This is

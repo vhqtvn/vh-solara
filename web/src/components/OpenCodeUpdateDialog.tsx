@@ -1,8 +1,9 @@
-import { createResource, createSignal, onCleanup, onMount, Show } from "solid-js";
+import { createResource, createSignal, onCleanup, onMount, Show, For } from "solid-js";
 import { Portal } from "solid-js/web";
 import { streamOpenCodeUpdate } from "../admin";
 import Icon from "./Icon";
 import RestartOpenCode from "./RestartOpenCode";
+import styles from "./OpenCodeUpdateDialog.module.css";
 
 type Versions = {
   installed: string;
@@ -11,6 +12,45 @@ type Versions = {
   updateAvailable: boolean;
   restartNeeded: boolean;
 };
+
+// Changelog ("What's new") shapes mirror GET /vh/opencode-changelog. The server
+// applies the "may affect you" heuristic (Core/SDK/Extensions items whose text
+// matches a breaking/migration token); the client only RENDERS those flags and
+// does the section-priority grouping (Core/SDK/Extensions first).
+type CLItem = { text: string; mayAffectYou: boolean };
+type CLSection = { title: string; items: CLItem[] };
+type CLRelease = {
+  tag: string;
+  name: string;
+  date?: string;
+  url?: string;
+  highlights?: string[];
+  sections?: CLSection[];
+};
+type CLResp = {
+  available: boolean;
+  from?: string;
+  to?: string;
+  releases?: CLRelease[];
+  error?: string;
+};
+
+// For a vh-solara operator (driving OpenCode over its HTTP/SSE surface), Core /
+// SDK / Extensions are what matter; Desktop / TUI are noise and get de-emphasized.
+// Priority 0 = high, 1 = normal-but-deemphasized; stable within a tier by title.
+const HIGH_PRIORITY_SECTIONS = new Set(["core", "sdk", "extensions"]);
+function sectionPriority(title: string): number {
+  return HIGH_PRIORITY_SECTIONS.has(title.toLowerCase().trim()) ? 0 : 1;
+}
+function sortedSections(sections: CLSection[] | undefined): CLSection[] {
+  if (!sections || sections.length === 0) return [];
+  return [...sections].sort((a, b) => {
+    const pa = sectionPriority(a.title);
+    const pb = sectionPriority(b.title);
+    if (pa !== pb) return pa - pb;
+    return a.title.localeCompare(b.title);
+  });
+}
 
 // The OpenCode update flow as a focused dialog. The layout is split into two
 // stable zones so nothing jumps as npm version data resolves or the install
@@ -33,6 +73,29 @@ export default function OpenCodeUpdateDialog(props: { onClose: () => void }) {
   const [ver, { refetch }] = createResource<Versions | null>(() =>
     fetch("/vh/opencode-version").then((r) => (r.ok ? r.json() : null)).catch(() => null),
   );
+
+  // Changelog ("What's new") is a NICE-TO-HAVE aid, never a gate. It has its OWN
+  // resource so a changelog fetch/parse failure can NEVER block the version
+  // createResource above or the update button. It is lazy: the fetch only fires
+  // when the operator expands the panel (clOpen flips true), so we don't hit
+  // opencode.ai on every dialog open. On any failure (network, non-OK, parse) it
+  // resolves to {available:false} and the panel shows a quiet "Changelog
+  // unavailable" line; the update button stays fully usable.
+  const [clOpen, setClOpen] = createSignal(false);
+  const [cl] = createResource<CLResp | null, boolean>(clOpen, async (open) => {
+    if (!open) return null;
+    try {
+      const v = ver();
+      const params = new URLSearchParams();
+      if (v?.installed) params.set("from", v.installed);
+      if (v?.latest) params.set("to", v.latest);
+      const r = await fetch(`/vh/opencode-changelog?${params.toString()}`);
+      if (!r.ok) return { available: false } as CLResp;
+      return (await r.json()) as CLResp;
+    } catch {
+      return { available: false } as CLResp;
+    }
+  });
 
   type Phase = "idle" | "updating" | "done" | "failed";
   const [phase, setPhase] = createSignal<Phase>("idle");
@@ -134,6 +197,88 @@ export default function OpenCodeUpdateDialog(props: { onClose: () => void }) {
               <button type="button" class="ocu-log-toggle" onClick={() => setShowLog((v) => !v)}>
                 {showLog() ? "Hide install log" : "Show install log"}
               </button>
+            </div>
+          </Show>
+
+          {/* Changelog ("What's new since {installed}") — a collapsible, lazily
+              fetched aid. Best-effort: a fetch failure degrades to a quiet
+              "Changelog unavailable" line and NEVER blocks the update button.
+              Hidden entirely until the version readout resolves so the "since"
+              label is always meaningful. */}
+          <Show when={ver()}>
+            <div class={styles.panel}>
+              <button
+                type="button"
+                class={styles.toggle}
+                aria-expanded={clOpen()}
+                onClick={() => setClOpen((v) => !v)}
+              >
+                <span class={styles.caret} classList={{ [styles.caretOpen]: clOpen() }}>▶</span>
+                <span class={styles.toggleLabel}>What’s new (since {ver()!.installed})</span>
+              </button>
+              <Show when={clOpen()}>
+                <div class={styles.body}>
+                  <Show
+                    when={!cl.loading}
+                    fallback={<div class={styles.loading}>Loading changelog…</div>}
+                  >
+                    <Show
+                      when={cl()?.available}
+                      fallback={<div class={styles.unavailable}>Changelog unavailable.</div>}
+                    >
+                      <Show
+                        when={(cl()?.releases?.length ?? 0) > 0}
+                        fallback={<div class={styles.empty}>No changes in this range.</div>}
+                      >
+                        <For each={cl()?.releases}>
+                          {(rel) => (
+                            <div class={styles.release}>
+                              <div class={styles.releaseHead}>
+                                <span class={styles.tag}>{rel.name || rel.tag}</span>
+                                <Show when={rel.date}>
+                                  <span class={styles.date}>{rel.date!.slice(0, 10)}</span>
+                                </Show>
+                                <Show when={rel.url}>
+                                  <a class={styles.releaseUrl} href={rel.url} target="_blank" rel="noreferrer">notes</a>
+                                </Show>
+                              </div>
+                              <Show when={rel.highlights && rel.highlights.length > 0}>
+                                <ul class={styles.highlights}>
+                                  <For each={rel.highlights}>
+                                    {(h) => <li class={styles.highlightsLi}>{h}</li>}
+                                  </For>
+                                </ul>
+                              </Show>
+                              <For each={sortedSections(rel.sections)}>
+                                {(sec) => {
+                                  const high = sectionPriority(sec.title) === 0;
+                                  return (
+                                    <div class={styles.section} classList={{ [styles.deemphasized]: !high }}>
+                                      <p class={styles.sectionTitle}>{sec.title}</p>
+                                      <ul class={styles.items}>
+                                        <For each={sec.items}>
+                                          {(it) => (
+                                            <li class={styles.item}>
+                                              {it.text}
+                                              <Show when={it.mayAffectYou}>
+                                                <span class={styles.mayAffect}>⚠ may affect you</span>
+                                              </Show>
+                                            </li>
+                                          )}
+                                        </For>
+                                      </ul>
+                                    </div>
+                                  );
+                                }}
+                              </For>
+                            </div>
+                          )}
+                        </For>
+                      </Show>
+                    </Show>
+                  </Show>
+                </div>
+              </Show>
             </div>
           </Show>
 

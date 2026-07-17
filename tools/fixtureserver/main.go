@@ -112,6 +112,10 @@ func main() {
 	})
 	srv.SetRestartOpenCode(func(context.Context) error { return nil })
 	srv.SetRestartServer(func() { log.Printf("(fixture) restart-server requested — no-op") })
+	// Canned changelog so the dialog's "What's new (since 0.1.0)" panel is
+	// demoable in dev/e2e without hitting opencode.ai. Uses the same
+	// best-effort heuristic as the real fetcher.
+	srv.SetOpencodeChangelog(fixtureChangelog)
 
 	// Wire managed projects (repo-declared processes + views). The fixture
 	// project dir (our cwd) carries a config pointing one view at the fake
@@ -154,4 +158,36 @@ func seedManagedFixture(dir, upstream string) {
   ]
 }`
 	_ = os.WriteFile(filepath.Join(dir, ".vh-solara", "project.jsonc"), []byte(cfg), 0o644)
+}
+
+// fixtureChangelog returns canned changelog releases spanning the fixture's
+// installed→latest range (0.1.0 → 0.2.0), showcasing all three highlight
+// behaviors: a Core item the heuristic flags (breaking token), a Core item it
+// does NOT, and a de-emphasized Desktop section. Lets the dialog's "What's new"
+// panel render meaningfully in dev/e2e without hitting opencode.ai.
+func fixtureChangelog(_ context.Context, _, _ string) ([]web.ChangelogRelease, error) {
+	return []web.ChangelogRelease{
+		{
+			Tag:        "v0.2.0",
+			Name:       "v0.2.0",
+			Date:       "2026-07-10T00:00:00Z",
+			URL:        "https://example.invalid/opencode/releases/tag/v0.2.0",
+			Highlights: []string{},
+			Sections: []web.ChangelogSection{
+				{
+					Title: "Desktop",
+					Items: []web.ChangelogItem{
+						{Text: "Migration of the settings folder layout", MayAffectYou: false},
+					},
+				},
+				{
+					Title: "Core",
+					Items: []web.ChangelogItem{
+						{Text: "Removed the legacy --old-flag config switch", MayAffectYou: true},
+						{Text: "Added a model-specific temperature override", MayAffectYou: false},
+					},
+				},
+			},
+		},
+	}, nil
 }

@@ -215,6 +215,8 @@ with --opencode-url, or spawn a survivable detached instance with
 			defer opencodeMu.Unlock()
 			return runOpencodeUpdate(ctx, localOpenCodeBin, localOpenCodeUpdate, cwd, w)
 		})
+		// Best-effort changelog fetcher; never blocks the update/version flow.
+		srv.SetOpencodeChangelog(OpencodeChangelog)
 
 		var vhCtx context.Context
 		vhCtx, vhCancel = context.WithCancel(context.Background())

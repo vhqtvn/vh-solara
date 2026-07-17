@@ -484,6 +484,10 @@ var clientDaemonCmd = &cobra.Command{
 				defer opencodeMu.Unlock()
 				return runOpencodeUpdate(ctx, daemonOpenCodeBin, daemonOpenCodeUpdate, cwd, w)
 			})
+			// Best-effort changelog fetcher (opencode.ai/changelog.json, short
+			// in-memory cache). Never blocks the update/version flow — the handler
+			// degrades to "Changelog unavailable" on any failure.
+			srv.SetOpencodeChangelog(OpencodeChangelog)
 
 			var vhCtx context.Context
 			vhCtx, vhCancel = context.WithCancel(context.Background())
