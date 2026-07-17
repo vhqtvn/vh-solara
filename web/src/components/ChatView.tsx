@@ -42,6 +42,7 @@ import Select from "./Select";
 import { agentDisplay } from "../projectSettings";
 import { fmtTurnStats, turnStats } from "../usage";
 import { msgTextOnly, msgTextWithThinking } from "../lib/msgText";
+import { classifyHold, shouldSkipAfterContextmenu } from "../lib/copyHold";
 import type { MessageView } from "../types";
 
 const draftKey = (sid: string) => "vh.draft." + sid;
@@ -1741,9 +1742,11 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   }
 
   // Copy / Retry text extraction lives in ../lib/msgText (pure, unit-tested).
-  // Left-click Copy and Retry use msgTextOnly (text only — thinking is never
-  // valid to re-send as a user prompt). Right-click Copy uses
+  // Retry uses msgTextOnly (thinking is never valid to re-send as a user
+  // prompt). Copy has THREE coexisting paths: a tap (<450ms) copies text-only
+  // (msgTextOnly); a long-press (>=450ms) and a right-click both copy
   // msgTextWithThinking (wraps each contiguous reasoning run in <think>…</think>).
+  // The tap-vs-hold classifier is in ../lib/copyHold (pure, unit-tested).
   const copyMessage = (m: any) => void navigator.clipboard?.writeText(msgTextOnly(m));
   const copyMessageWithThinking = (m: any) =>
     void navigator.clipboard?.writeText(msgTextWithThinking(m));
@@ -1857,7 +1860,18 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       <div class="chat-scroll" ref={scrollEl} onScroll={onScrolled}>
         <div class="chat-content" ref={contentEl} classList={{ ready: revealed() }}>
           <For each={messages()}>
-            {(m, i) => (
+            {(m, i) => {
+              // Per-message hold state for the Copy button: a long-press
+              // (>=450ms) copies thinking, a tap copies text-only, right-click
+              // copies thinking. State is per-row (captured in this For
+              // closure) so two messages' gestures can't race a shared
+              // timestamp; only one button is pressed at a time anyway.
+              // thinkingJustCopied dedupes the Android-Chrome touch
+              // double-fire (contextmenu then a synthesized click) — see
+              // shouldSkipAfterContextmenu in ../lib/copyHold.
+              let copyDownAt = 0;
+              let thinkingJustCopied = false;
+              return (
               <div class="msg" data-mid={m.id} classList={{ user: m.info.role === "user", assistant: m.info.role === "assistant" }}>
                 <div class="msg-head">
                   <span class="msg-role">{roleLabel(m.info.role)}</span>
@@ -1875,11 +1889,40 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
                   <div class="msg-actions">
                     <button
                       type="button"
-                      data-tip="Copy · right-click for thinking"
-                      aria-label="Copy message text; right-click to include reasoning"
-                      onClick={() => copyMessage(m)}
+                      class="msg-copy"
+                      data-tip="Copy · hold or right-click for thinking"
+                      aria-label="Copy message text; hold or right-click to include reasoning"
+                      onPointerDown={() => {
+                        // Fresh gesture: record the press time (mouse-hold and
+                        // touch-hold unified via Pointer Events, same reasoning
+                        // as the paste button) and clear the contextmenu-dedupe
+                        // flag for a new cycle.
+                        copyDownAt = Date.now();
+                        thinkingJustCopied = false;
+                      }}
+                      onClick={() => {
+                        const cls = classifyHold(copyDownAt, Date.now());
+                        if (cls === "hold") {
+                          // Android-Chrome touch long-press synthesizes a click
+                          // AFTER the contextmenu that already copied thinking;
+                          // skip the duplicate. Mouse-hold and iOS (no touch
+                          // contextmenu) copy thinking here.
+                          if (shouldSkipAfterContextmenu(thinkingJustCopied, cls)) {
+                            thinkingJustCopied = false;
+                            return;
+                          }
+                          copyMessageWithThinking(m);
+                        } else {
+                          copyMessage(m);
+                        }
+                      }}
                       onContextMenu={(e) => {
                         e.preventDefault();
+                        // Flag that thinking was already copied so the
+                        // synthesized click in the same touch long-press
+                        // gesture is deduped (deterministic: contextmenu is
+                        // guaranteed to precede the click).
+                        thinkingJustCopied = true;
                         copyMessageWithThinking(m);
                       }}
                     >
@@ -1917,7 +1960,8 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
                   <pre class="msg-inspect">{inspectText(m)}</pre>
                 </Show>
               </div>
-            )}
+              );
+            }}
           </For>
           {/* Transcript-level states: a loading hint while the first snapshot
               is in flight (slot reserved but not yet delivered), an empty hint

@@ -223,6 +223,19 @@
   font-size: 12px;
 }
 .msg-actions button:hover { color: var(--fg); background: color-mix(in srgb, var(--fg) 8%, transparent); }
+/* The Copy button (.msg-copy) supports a long-press (>=450ms) to copy thinking
+   in addition to tap (text-only) and right-click (thinking). A bare long-press
+   on touch surfaces the native iOS callout / text selection / Android context
+   menu, so suppress those on this one button only — the message body stays
+   selectable (see .md / .msg-parts re-enable in 00-app-globals.css). The .app
+   root already sets these globally; reasserting here follows the established
+   per-component defensive pattern (e.g. session-tree, chat-overlays) so the
+   affordance stays correct if markup or the cascade restructures. */
+.msg-actions button.msg-copy {
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
 
 /* The wrapper owns the code block's vertical rhythm (matching the UA <pre>
    default of 1em 0 that .md pre does not override) and the pre's margin is
