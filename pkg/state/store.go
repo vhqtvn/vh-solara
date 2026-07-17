@@ -495,8 +495,9 @@ func New(ringCapacity int) *Store {
 // of changing a session's cold-batch/snapshot message projection (message/part
 // upsert+delete, streaming part-delta append + its write-side throttle flush
 // into me.parts, history reconcile). Snapshot never calls this: it is a pure
-// read projection under RLock that overlays buffered deltas onto fresh copies
-// via projectPartLocked with no writeback. Store-wide (not per-session) so
+// read projection under RLock that captures the buffered deltas onto fresh
+// copies and overlays them during a lock-free materialization (see
+// projectPartCaptured) with no writeback. Store-wide (not per-session) so
 // the token is globally non-repeating: a deleted-then-recreated session can
 // never reuse an old in-flight batch's token (the ABA fix). Exactly one bump
 // per logical change.
@@ -1459,10 +1460,11 @@ var deltaFlushInterval = 30 * time.Millisecond
 // overwrites the part authoritatively and resets the accumulator (see
 // upsertPartLocked). This is the WRITE-SIDE throttle flush into me.parts (the
 // per-message emit path), distinct from the READ-SIDE projection: a Snapshot
-// under RLock overlays the unflushed accumulator onto a fresh part copy via
-// projectPartLocked WITHOUT writing back into me.parts, so a point-in-time read
-// reflects the live accumulated text while the accumulator stays intact for the
-// writer.
+// captures the unflushed accumulator (per partID) under RLock into a private
+// copy, then overlays it onto a fresh part copy during lock-free
+// materialization (projectPartCaptured) WITHOUT writing back into me.parts, so
+// a point-in-time read reflects the live accumulated text while the
+// accumulator stays intact for the writer.
 func (s *Store) appendPartDeltaLocked(sessionID, messageID, partID, field, delta string) {
 	if field == "" {
 		field = "text"
@@ -1557,9 +1559,10 @@ func (s *Store) appendPartDeltaLocked(sessionID, messageID, partID, field, delta
 // (upsertPartLocked / reconcileMessagesLocked) or part deletion. Caller holds
 // s.mu in WRITE mode (this method mutates me.parts and may emit).
 //
-// Snapshot does NOT call this method — it uses projectPartLocked, a pure
-// projection that overlays the buffered deltas onto a freshly-allocated copy
-// without writing back to me.parts, so Snapshot can run under RLock.
+// Snapshot does NOT call this method — it captures the buffered deltas onto
+// fresh copies under RLock and overlays them during a lock-free materialization
+// (projectPartCaptured) without writing back to me.parts, so Snapshot can run
+// under RLock and its heavy projection can run after RUnlock.
 func (me *messageEntry) flushPartDeltasLocked(s *Store, emit bool) {
 	for key, buf := range me.deltaBuf {
 		partID, field, ok := strings.Cut(key, "\x00")
@@ -1583,57 +1586,103 @@ func (me *messageEntry) flushPartDeltasLocked(s *Store, emit bool) {
 	}
 }
 
-// projectPartLocked is the PURE READ projection of a single part: it returns a
-// freshly-allocated copy of me.parts[partID] with any buffered deltaBuf entries
-// for that partID overlaid. Unlike flushPartDeltasLocked, it does NOT mutate
-// me.parts, me.deltaBuf, me.deltaLastEmit, the ring, or subscribers, and emits
-// NO events. This is what makes Snapshot a pure projection that can run under
-// RLock and overlap with concurrent Snapshot calls.
+// --- Snapshot capture types ---
 //
-// The returned bytes are always a fresh allocation (never alias store-owned
-// backing arrays), so they are safe to retain past RUnlock even if a later
-// writer replaces me.parts[partID]. If the part has no buffered deltaBuf
-// entries, the result is just a byte copy of me.parts[partID]. Caller holds
-// s.mu (read or write).
-func (me *messageEntry) projectPartLocked(partID string) json.RawMessage {
-	base := me.parts[partID]
-	// Fast path: no accumulators at all, or none for this partID — copy bytes.
-	if len(me.deltaBuf) == 0 {
-		return append([]byte(nil), base...)
+// These are PRIVATE copies of the mutable store fields read during Snapshot's
+// materialization. They are populated under s.mu.RLock (the CAPTURE phase) so
+// the MATERIALIZATION phase can run after s.mu.RUnlock without aliasing any
+// store-owned memory. See the ownership audit in the Snapshot doc comment:
+// every store map (sessions/messages/todos/perms/questions/statuses/activity/
+// unread) is mutated in place by writers; sessionEntry scalars are mutated in
+// place by recomputeLastAssistantLocked / setCurrentVerbLocked; messageEntry
+// fields (parts map, partOrder slice, deltaBuf strings.Builders) are mutated in
+// place. NOTHING read after RUnlock may alias store memory, so each field here
+// that came from a byte slice or map is a fresh copy taken under the lock.
+
+// snapSessionCap holds the per-session scalar facts the Gate / LastAgents /
+// CurrentVerbs / Sessions projection reads. Every json.RawMessage field is a
+// private byte copy captured under the lock.
+type snapSessionCap struct {
+	info              json.RawMessage // copy of se.info
+	hasAssistant      bool
+	lastAsstCompleted bool
+	lastAsstEmpty     bool
+	lastFinish        string
+	lastTokens        json.RawMessage // copy of se.lastTokens
+	lastAgent         string
+	currentVerbTool   string
+	currentVerbState  json.RawMessage // copy of se.currentVerb.State
+	// Existence facts read from store-level maps.
+	msgLoaded    bool   // s.msgLoaded[sid]
+	hasMessages  bool   // s.messages[sid] != nil
+	hasQuestions bool   // len(s.questions[sid]) > 0
+	hasPerms     bool   // len(s.perms[sid]) > 0
+	permBlocked  bool   // s.permBlocked[sid]
+	activity     string // s.activity[sid] ("" if absent)
+}
+
+// snapPartCap holds one captured part: a private byte copy of its base plus the
+// per-field buffered delta text (if any) for this partID. deltas is nil when the
+// part has no buffered deltaBuf entries (the common case), in which case
+// projectPartCaptured returns base unchanged.
+type snapPartCap struct {
+	id     string
+	base   json.RawMessage   // copy of me.parts[partID]
+	deltas map[string]string // field -> cloned builder text for matching partID; nil if none
+}
+
+// snapMessageCap holds one captured message: a private byte copy of its info and
+// its parts in partOrder, each pre-projected into a snapPartCap.
+type snapMessageCap struct {
+	info  json.RawMessage // copy of me.info
+	parts []snapPartCap   // in me.partOrder
+}
+
+// captureDeltaText returns an OWNERSHIP-INDEPENDENT copy of buf's current
+// accumulated text for the Snapshot capture phase. strings.Clone is REQUIRED
+// here: in Go 1.25, (*strings.Builder).String() is implemented as
+// unsafe.String(unsafe.SliceData(b.buf), len(b.buf)) — it does NOT copy, so a
+// bare buf.String() would alias the builder's mutable backing array and survive
+// past RUnlock as a live reference into store-owned memory (violating the
+// Snapshot capture invariant that nothing read after RUnlock may alias store
+// memory). strings.Clone allocates a fresh backing array the builder can never
+// reach. Extracted as a named helper so the ownership property is testable
+// directly (the full Snapshot path re-marshals the delta into fresh JSON bytes,
+// which would mask the aliasing). Pinned by
+// TestSnapshotDeltaCaptureIsOwnershipIndependent.
+func captureDeltaText(buf *strings.Builder) string {
+	return strings.Clone(buf.String())
+}
+
+// projectPartCaptured replicates the former projectPartLocked overlay logic but
+// operates on a captured part (snapPartCap) so it can run OUTSIDE s.mu. The
+// input bytes (base) and the delta strings are already private copies taken
+// under the lock, so the returned slice never aliases store memory and is safe
+// to retain past RUnlock. Called only by Snapshot's materialize phase.
+//
+// Mirrors the prior method byte-for-byte: no deltas -> return base as-is;
+// overlay path decodes base into a fresh map, applies each buffered field,
+// re-marshals, and falls back to base on a marshal error. The id is carried on
+// the capture only to seed the defensive empty-base placeholder, matching the
+// prior behavior exactly.
+func projectPartCaptured(pc snapPartCap) json.RawMessage {
+	if len(pc.deltas) == 0 {
+		return pc.base
 	}
-	// Scan deltaBuf for any entry targeting this partID. The keys are
-	// "<partID>\x00<field>"; if none matches, fall through to the byte copy.
-	var hasMatch bool
-	for k := range me.deltaBuf {
-		if pid, _, ok := strings.Cut(k, "\x00"); ok && pid == partID {
-			hasMatch = true
-			break
-		}
-	}
-	if !hasMatch {
-		return append([]byte(nil), base...)
-	}
-	// Overlay path: decode base into a fresh map, apply every matching buffer,
-	// re-marshal. On any marshal error, fall back to the byte copy so the
-	// snapshot never produces malformed output.
 	var part map[string]any
-	if len(base) > 0 {
-		_ = json.Unmarshal(base, &part)
+	if len(pc.base) > 0 {
+		_ = json.Unmarshal(pc.base, &part)
 	}
 	if part == nil {
-		part = map[string]any{"id": partID, "type": "text"}
+		part = map[string]any{"id": pc.id, "type": "text"}
 	}
-	for key, buf := range me.deltaBuf {
-		pid, field, ok := strings.Cut(key, "\x00")
-		if !ok || pid != partID {
-			continue
-		}
-		part[field] = buf.String()
+	for field, txt := range pc.deltas {
+		part[field] = txt
 	}
 	if updated, err := json.Marshal(part); err == nil {
 		return updated
 	}
-	return append([]byte(nil), base...)
+	return pc.base
 }
 
 // discardPartDeltaLocked drops every streaming accumulator entry whose partID
@@ -1702,25 +1751,62 @@ func (s *Store) deletePartLocked(sessionID, messageID, partID string) {
 //
 // scopeSelected gates ONLY the len > 0 case; nil and empty-{} are UNCHANGED.
 //
-// Snapshot is a PURE READ PROJECTION: it runs under s.mu.RLock and mutates NO
-// store state. Unflushed streaming deltas are overlaid onto freshly-allocated
-// part copies via projectPartLocked (NOT flushed back into me.parts), so a
-// snapshot reflects the live accumulated text without disturbing the store.
-// This lets multiple client snapshots overlap (RLock is shared) and lets
-// Snapshot run while a reader holds the lock for a long time. Apply (the
-// writer) still waits for readers — that is expected and fine; this method
-// does not claim to eliminate writer blocking, only Snapshot-side mutation and
-// read/read serialization. The monotonic msgRev machinery (bumpMsgRev) stays
-// on the Apply/flush path; Snapshot never bumps it.
+// Snapshot is a PURE READ PROJECTION: it mutates NO store state. It runs in two
+// phases so a writer (Apply, which holds s.mu for write) is NOT blocked behind
+// the heavy part of the work:
 //
-// All json.RawMessage bytes that escape the RLock are conservatively COPIED so
-// they never alias store-owned backing arrays (a later writer under the write
-// lock would otherwise be free to replace, though not in-place-mutate, those
-// slices — copying keeps the snapshot safe under the race detector and against
-// any future in-place mutation).
+//  1. CAPTURE under s.mu.RLock: copy every mutable field the materialization
+//     will read into locals (snapSessionCap / snapPartCap / snapMessageCap plus
+//     the per-session byte-slice maps). All json.RawMessage bytes are COPIED so
+//     the locals never alias store-owned backing arrays. This is the ONLY span
+//     that holds the read lock. computeSubtreeBusyLocked also runs here; its
+//     self-contained result map is kept whole.
+//
+//  2. MATERIALIZE after s.mu.RUnlock: build the Snapshot struct purely from the
+//     captured locals, calling projectPartCaptured per part. The expensive JSON
+//     unmarshal+marshal for parts with buffered deltas happens HERE, outside the
+//     lock. No field of s.* / se.* / me.* is read after RUnlock.
+//
+// The narrowing is real for parts WITH buffered deltas (active streaming): the
+// unmarshal+marshal moves out of the reader window, so a concurrent Apply no
+// longer waits on it. For parts WITHOUT deltas (the common, static case) the
+// capture does the same single byte-copy of the base that the old fast path did,
+// then materialize assigns it directly — so the lock-window work for those parts
+// is unchanged; the win is targeted at the streaming-contention case (large
+// transcripts with active part-delta ingestion), not the static-snapshot case.
+//
+// Apply (the writer) still waits for the CAPTURE of any in-flight Snapshot —
+// that is expected and fine; this method narrows the reader window from
+// "capture+project+materialize+copy" to "capture", it does not eliminate writer
+// blocking. The monotonic msgRev machinery (bumpMsgRev) stays on the Apply/flush
+// path; Snapshot never bumps it.
+//
+// All json.RawMessage bytes that escape RLock are conservatively COPIED so they
+// never alias store-owned backing arrays (a later writer under the write lock
+// would otherwise be free to replace those slices — copying keeps the snapshot
+// safe under the race detector and against any future in-place mutation).
+//
+// OWNERSHIP AUDIT (why each capture copies what it does):
+//   - Store maps (sessions/messages/todos/perms/questions/statuses/activity/
+//     unread/permBlocked/msgLoaded) are all mutated IN PLACE by writers (delete
+//     keys, set keys) → captured by value, scoped under the lock.
+//   - sessionEntry pointers are replaced wholesale by upsertSessionLocked, AND
+//     their scalar fields are mutated in place by recomputeLastAssistantLocked
+//     and setCurrentVerbLocked → all scalar facts + the info/lastTokens/
+//     currentVerb.State bytes are copied into snapSessionCap; no *sessionEntry
+//     is retained past RUnlock.
+//   - messageEntry fields are mutated in place: upsertMessageLocked replaces
+//     info/role/etc; upsertPartLocked does me.parts[id]=... and reassigns
+//     me.partOrder; appendPartDeltaLocked mutates a strings.Builder VALUE in
+//     place (the dangerous one) and reassigns me.deltaBuf[key] → info, the
+//     partOrder slice, the parts bytes, and each matching deltaBuf entry's
+//     builder text are all copied into snapMessageCap / snapPartCap; the
+//     deltaBuf builders are snapshotted via captureDeltaText (strings.Clone of
+//     the builder text at capture time), so the captured strings never alias
+//     the builder's mutable backing array — a bare .String() would NOT suffice
+//     in Go 1.25 (it returns unsafe.String over the builder's buffer, no copy).
 func (s *Store) Snapshot(messagesFor map[string]bool) Snapshot {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
 
 	scopeSelected := messagesFor != nil && len(messagesFor) > 0
 	// inScope reports whether a session's per-session structural rows should
@@ -1733,9 +1819,177 @@ func (s *Store) Snapshot(messagesFor map[string]bool) Snapshot {
 		return messagesFor[sid]
 	}
 
+	// --- CAPTURE PHASE (under s.mu.RLock) ---
+	// Copy every mutable field the materialization will read into locals. After
+	// RUnlock NOTHING may alias store-owned memory — see the ownership audit in
+	// the doc comment. Scoping (inScope / messagesFor) is applied HERE so the
+	// materialize phase is a straight assembly.
+
+	epoch := s.epoch
+	seq := s.seq
+	// subtreeBusy is a self-contained map[string]bool from computeSubtreeBusyLocked
+	// (it allocates its own maps internally and returns a fresh one); safe to keep
+	// whole and read post-RUnlock. The walk is ALWAYS global even when scoped: a
+	// selected session's subtree_busy depends on its descendants, which may be
+	// unselected.
+	subtreeBusy := s.computeSubtreeBusyLocked()
+
+	// Per-session scalar facts (Gate / LastAgents / CurrentVerbs / Sessions).
+	sessions := make(map[string]snapSessionCap, len(s.sessions))
+	for sid, se := range s.sessions {
+		if !inScope(sid) {
+			continue
+		}
+		sessions[sid] = snapSessionCap{
+			info:              append([]byte(nil), se.info...),
+			hasAssistant:      se.hasAssistant,
+			lastAsstCompleted: se.lastAsstCompleted,
+			lastAsstEmpty:     se.lastAsstEmpty,
+			lastFinish:        se.lastFinish,
+			lastTokens:        append([]byte(nil), se.lastTokens...),
+			lastAgent:         se.lastAgent,
+			currentVerbTool:   se.currentVerb.Tool,
+			currentVerbState:  append([]byte(nil), se.currentVerb.State...),
+			msgLoaded:         s.msgLoaded[sid],
+			hasMessages:       s.messages[sid] != nil,
+			hasQuestions:      len(s.questions[sid]) > 0,
+			hasPerms:          len(s.perms[sid]) > 0,
+			permBlocked:       s.permBlocked[sid],
+			activity:          s.activity[sid],
+		}
+	}
+
+	// Questions: per in-scope session, bytes copied. s.questions is a nested
+	// map (sessionID -> questionID -> bytes); iteration order is nondeterministic
+	// here exactly as in the prior append loop, so parity is set-equality.
+	questions := map[string][][]byte{}
+	for sid, m := range s.questions {
+		if !inScope(sid) {
+			continue
+		}
+		var qs [][]byte
+		for _, q := range m {
+			qs = append(qs, append([]byte(nil), q...))
+		}
+		questions[sid] = qs
+	}
+	// Activity: per in-scope session.
+	activity := map[string]string{}
+	for sid, st := range s.activity {
+		if !inScope(sid) {
+			continue
+		}
+		activity[sid] = st
+	}
+	// Unread: in-scope ids.
+	unread := make([]string, 0, len(s.unread))
+	for id := range s.unread {
+		if inScope(id) {
+			unread = append(unread, id)
+		}
+	}
+	// Todos: per in-scope session, bytes copied.
+	todos := map[string][]byte{}
+	for sid, t := range s.todos {
+		if !inScope(sid) {
+			continue
+		}
+		todos[sid] = append([]byte(nil), t...)
+	}
+	// Permissions: per in-scope session, bytes copied. s.perms is a nested
+	// map (sessionID -> permID -> bytes); iteration order is nondeterministic
+	// here exactly as in the prior append loop.
+	perms := map[string][][]byte{}
+	for sid, m := range s.perms {
+		if !inScope(sid) {
+			continue
+		}
+		var ps [][]byte
+		for _, perm := range m {
+			ps = append(ps, append([]byte(nil), perm...))
+		}
+		perms[sid] = ps
+	}
+	// Statuses: per in-scope session, bytes copied.
+	statuses := map[string][]byte{}
+	for sid, st := range s.statuses {
+		if !inScope(sid) {
+			continue
+		}
+		statuses[sid] = append([]byte(nil), st...)
+	}
+	// Messages: ordered per session, with per-part capture (base bytes + the
+	// matching deltaBuf entries snapshotted as field→text). Gated by messagesFor
+	// (nil=all ship; empty=none ship; non-empty=only listed) — a SEPARATE gate
+	// from inScope, identical to the prior code.
+	messages := map[string][]snapMessageCap{}
+	for sid, sm := range s.messages {
+		if messagesFor != nil && !messagesFor[sid] {
+			continue
+		}
+		list := make([]snapMessageCap, 0, len(sm.order))
+		for _, mid := range sm.order {
+			me := sm.byID[mid]
+			if me == nil {
+				continue
+			}
+			mc := snapMessageCap{
+				info: append([]byte(nil), me.info...),
+			}
+			mc.parts = make([]snapPartCap, 0, len(me.partOrder))
+			for _, pid := range me.partOrder {
+				pc := snapPartCap{
+					id:   pid,
+					base: append([]byte(nil), me.parts[pid]...),
+				}
+				// Snapshot any buffered deltaBuf entries targeting this partID
+				// as field→accumulated-text. Mirrors the former
+				// projectPartLocked key scan; captureDeltaText returns an
+				// OWNERSHIP-INDEPENDENT copy of the builder's current text. A
+				// bare buf.String() is NOT enough here: in Go 1.25 it is
+				// unsafe.String over the builder's mutable backing array (no
+				// copy), so it would alias store-owned memory and survive past
+				// RUnlock — violating the capture invariant that nothing read
+				// after RUnlock aliases store memory. Proven by
+				// TestSnapshotDeltaCaptureIsOwnershipIndependent.
+				if len(me.deltaBuf) > 0 {
+					for k, buf := range me.deltaBuf {
+						dpid, field, ok := strings.Cut(k, "\x00")
+						if !ok || dpid != pid {
+							continue
+						}
+						if pc.deltas == nil {
+							pc.deltas = map[string]string{}
+						}
+						pc.deltas[field] = captureDeltaText(buf)
+					}
+				}
+				mc.parts = append(mc.parts, pc)
+			}
+			list = append(list, mc)
+		}
+		messages[sid] = list
+	}
+
+	s.mu.RUnlock()
+
+	// --- MATERIALIZATION PHASE (NO LOCK) ---
+	// Build the Snapshot purely from the captured locals. The captured byte
+	// slices are already private copies, so they are assigned directly to the
+	// output (no double-copy); the no-aliasing invariant holds because every
+	// output slice is a fresh capture-time copy of store bytes. The JSON
+	// unmarshal+marshal for parts with buffered deltas happens here.
+	//
+	// Test seam: fires after RUnlock, before materialization. nil in production;
+	// a test sets it to prove materialization runs outside the lock (an Apply
+	// that needs the write lock completes while Snapshot blocks here).
+	if snapshotMaterializeHook != nil {
+		snapshotMaterializeHook()
+	}
+
 	snap := Snapshot{
-		Epoch:        s.epoch,
-		Seq:          s.seq,
+		Epoch:        epoch,
+		Seq:          seq,
 		Messages:     map[string][]MessageWithParts{},
 		Todos:        map[string]json.RawMessage{},
 		Permissions:  map[string][]json.RawMessage{},
@@ -1746,134 +2000,120 @@ func (s *Store) Snapshot(messagesFor map[string]bool) Snapshot {
 		LastAgents:   map[string]string{},
 		CurrentVerbs: map[string]VerbFacet{},
 	}
-	// Per-session gate facts (denormalized; see GateFacts). subtree_busy needs a
-	// tree walk, so compute it once here in O(n) and index per session. The walk
-	// is ALWAYS global even when scopeSelected: a selected session's subtree_busy
-	// depends on its descendants, which may themselves be unselected. Only the
-	// per-session READ into snap.Gate below is scoped by inScope.
-	subtreeBusy := s.computeSubtreeBusyLocked()
-	for sid, se := range s.sessions {
-		if !inScope(sid) {
-			continue
-		}
-		act := s.activity[sid]
+
+	// Per-session gate facts + facets. Iterating the captured `sessions` map
+	// (not s.sessions) — order is nondeterministic here exactly as it was in the
+	// prior map iteration; parity is set-equality of elements.
+	for sid, sc := range sessions {
+		act := sc.activity
 		if act == "" {
 			act = ActivityIdle // a never-touched session renders idle
 		}
 		snap.Gate[sid] = GateFacts{
 			Activity: act,
-			// We have message state (live events OR a history hydrate) iff msgLoaded or
-			// a messages entry exists. When false, the message-derived fields below are
-			// "not yet known", which a cold/un-opened session after a restart can't be
-			// distinguished from in-flight without this.
-			Hydrated: s.msgLoaded[sid] || s.messages[sid] != nil,
-			// MessagesLoaded is the STRICT "full history fetched" memo (msgLoaded),
-			// independent of whether live message.* events have populated a partial
-			// messages[sid] entry. See the GateFacts.MessagesLoaded doc for why it is
-			// distinct from Hydrated.
-			MessagesLoaded:         s.msgLoaded[sid],
-			LastAssistantCompleted: se.hasAssistant && se.lastAsstCompleted,
-			LastAssistantEmpty:     se.lastAsstEmpty,
-			FinishReason:           se.lastFinish,
+			// We have message state (live events OR a history hydrate) iff
+			// msgLoaded or a messages entry exists. When false, the message-
+			// derived fields below are "not yet known", which a cold/un-opened
+			// session after a restart can't be distinguished from in-flight
+			// without this.
+			Hydrated: sc.msgLoaded || sc.hasMessages,
+			// MessagesLoaded is the STRICT "full history fetched" memo
+			// (msgLoaded), independent of whether live message.* events have
+			// populated a partial messages[sid] entry. See the
+			// GateFacts.MessagesLoaded doc for why it is distinct from Hydrated.
+			MessagesLoaded:         sc.msgLoaded,
+			LastAssistantCompleted: sc.hasAssistant && sc.lastAsstCompleted,
+			LastAssistantEmpty:     sc.lastAsstEmpty,
+			FinishReason:           sc.lastFinish,
 			SubtreeBusy:            subtreeBusy[sid],
-			PendingQuestion:        len(s.questions[sid]) > 0,
-			PendingPermission:      len(s.perms[sid]) > 0,
-			PermissionBlocked:      s.permBlocked[sid],
-			// Copy the token-usage bytes so the snapshot never aliases the
-			// store-owned se.lastTokens backing array (Snapshot escapes the
-			// RLock; a later writer is free to replace it). See the Snapshot
-			// doc comment's copy invariant.
-			Tokens: append([]byte(nil), se.lastTokens...),
+			PendingQuestion:        sc.hasQuestions,
+			PendingPermission:      sc.hasPerms,
+			PermissionBlocked:      sc.permBlocked,
+			// Tokens is the private byte copy captured above — assigned directly
+			// (no aliasing; see the doc comment's copy invariant).
+			Tokens: sc.lastTokens,
 		}
-		if se.lastAgent != "" {
-			snap.LastAgents[sid] = se.lastAgent
+		if sc.lastAgent != "" {
+			snap.LastAgents[sid] = sc.lastAgent
 		}
 		// Surface the live current-activity facet (only sessions with a running
 		// tool carry one) so a client renders the rich verb for an UNOPENED
-		// subagent straight from the tree-only snapshot.
-		if se.currentVerb.Tool != "" {
-			// Copy the facet (and its State bytes) so the snapshot never
-			// aliases se.currentVerb.State — Snapshot escapes the RLock and a
-			// later writer may replace se.currentVerb. The struct copy alone
-			// would share the State backing array; copying the bytes keeps the
-			// snapshot self-contained (see the Snapshot copy invariant).
+		// subagent straight from the tree-only snapshot. State is the private
+		// byte copy captured above.
+		if sc.currentVerbTool != "" {
 			snap.CurrentVerbs[sid] = VerbFacet{
-				Tool:  se.currentVerb.Tool,
-				State: append([]byte(nil), se.currentVerb.State...),
+				Tool:  sc.currentVerbTool,
+				State: sc.currentVerbState,
 			}
 		}
+		// Sessions slice: append each captured info bytes (already a copy).
+		snap.Sessions = append(snap.Sessions, sc.info)
 	}
-	for sid, m := range s.questions {
-		if !inScope(sid) {
+	for sid, qs := range questions {
+		// Preserve the original's omit-empty semantics: a session whose inner
+		// map is empty must NOT appear in snap.Questions at all (the lazy-append
+		// in the prior code never set the key when the inner loop body never
+		// ran). Skipping an empty captured slice reproduces that exactly.
+		if len(qs) == 0 {
 			continue
 		}
-		for _, q := range m {
-			snap.Questions[sid] = append(snap.Questions[sid], append([]byte(nil), q...))
+		out := make([]json.RawMessage, len(qs))
+		for i, q := range qs {
+			out[i] = q // captured copy
 		}
+		snap.Questions[sid] = out
 	}
-	for sid, st := range s.activity {
-		if !inScope(sid) {
-			continue
-		}
+	for sid, st := range activity {
 		snap.Activity[sid] = st
 	}
-	for id := range s.unread {
-		if inScope(id) {
-			snap.Unread = append(snap.Unread, id)
-		}
+	snap.Unread = unread
+	for sid, t := range todos {
+		snap.Todos[sid] = t // captured copy
 	}
-	for sid, se := range s.sessions {
-		if !inScope(sid) {
+	for sid, ps := range perms {
+		// Preserve the original's omit-empty semantics: a session whose inner
+		// map is empty must NOT appear in snap.Permissions (TestPendingPermissions-
+		// OmitsEmptyInnerMap). See the Questions loop above.
+		if len(ps) == 0 {
 			continue
 		}
-		snap.Sessions = append(snap.Sessions, append([]byte(nil), se.info...))
-	}
-	for sid, sm := range s.messages {
-		if messagesFor != nil && !messagesFor[sid] {
-			continue
+		out := make([]json.RawMessage, len(ps))
+		for i, p := range ps {
+			out[i] = p // captured copy
 		}
-		list := make([]MessageWithParts, 0, len(sm.order))
-		for _, mid := range sm.order {
-			me := sm.byID[mid]
-			if me == nil {
-				continue
+		snap.Permissions[sid] = out
+	}
+	for sid, st := range statuses {
+		snap.Statuses[sid] = st // captured copy
+	}
+	for sid, list := range messages {
+		out := make([]MessageWithParts, 0, len(list))
+		for _, mc := range list {
+			parts := make([]json.RawMessage, 0, len(mc.parts))
+			for _, pc := range mc.parts {
+				// Pure projection on the captured part: overlay the captured
+				// buffered deltas onto the captured base without touching the
+				// store. This is the lock-free part of the old work.
+				parts = append(parts, projectPartCaptured(pc))
 			}
-			parts := make([]json.RawMessage, 0, len(me.partOrder))
-			for _, pid := range me.partOrder {
-				// Pure projection: overlay buffered deltas onto a fresh copy
-				// without mutating me.parts. This is what keeps Snapshot a pure
-				// read that can run under RLock.
-				parts = append(parts, me.projectPartLocked(pid))
-			}
-			list = append(list, MessageWithParts{
-				Info:  append([]byte(nil), me.info...),
+			out = append(out, MessageWithParts{
+				Info:  mc.info, // captured copy
 				Parts: parts,
 			})
 		}
-		snap.Messages[sid] = list
-	}
-	for sid, t := range s.todos {
-		if !inScope(sid) {
-			continue
-		}
-		snap.Todos[sid] = append([]byte(nil), t...)
-	}
-	for sid, m := range s.perms {
-		if !inScope(sid) {
-			continue
-		}
-		for _, perm := range m {
-			snap.Permissions[sid] = append(snap.Permissions[sid], append([]byte(nil), perm...))
-		}
-	}
-	for sid, st := range s.statuses {
-		if !inScope(sid) {
-			continue
-		}
-		snap.Statuses[sid] = append([]byte(nil), st...)
+		snap.Messages[sid] = out
 	}
 	return snap
 }
+
+// snapshotMaterializeHook is a test seam fired after Snapshot releases s.mu and
+// before it materializes the result from captured locals. A test sets it to
+// block (e.g. on a channel) so it can drive a concurrent Apply (which needs the
+// write lock) to completion while a Snapshot is parked in its lock-free
+// materialization phase — proving the reader window was narrowed to the capture.
+// Nil in production. See coldBatchAfterCaptureHook for the same pattern on the
+// cold-batch path.
+var snapshotMaterializeHook func()
 
 // computeSubtreeBusyLocked returns, for every session, whether any session in its
 // subtree (including itself) is busy or retry — the gate's "no busy descendant"
