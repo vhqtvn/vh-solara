@@ -12,9 +12,11 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	diag "github.com/vhqtvn/vh-solara/pkg/diagnostics"
 	"github.com/vhqtvn/vh-solara/pkg/opencode"
@@ -301,6 +303,13 @@ type messageEntry struct {
 	// message.part.updated snapshot supersedes buffered deltas) and on
 	// reconcileMessagesLocked (a history fetch is authoritative).
 	deltaBuf map[string]*strings.Builder
+	// sealedFields tracks (partID+"\x00"+field) entries whose accumulated text
+	// has crossed partTextCap and been truncated. Once sealed, further streaming
+	// deltas to that (partID, field) are DROPPED — the part is "frozen" at the
+	// cap with the truncation marker. Cleared alongside deltaBuf (a fresh
+	// authoritative snapshot or a reconcile reseeds the accumulator from a new
+	// base, re-evaluating the cap).
+	sealedFields map[string]bool
 	// deltaLastEmit bounds the part.upsert emit rate for THIS message's streaming
 	// field: a delta appends to deltaBuf unconditionally, but the (O(part size)
 	// marshal + emit + ring push) only fires when time.Since(deltaLastEmit) >=
@@ -1489,6 +1498,12 @@ func (s *Store) upsertPartLocked(part json.RawMessage) {
 	if _, ok := me.parts[env.ID]; !ok {
 		me.partOrder = append(me.partOrder, env.ID)
 	}
+	// Apply the per-part text cap (P1-AGG-006) on the wholesale path: a single
+	// part.upsert carrying a huge payload (or a history-fetch entry) is bounded
+	// here. capPartJSON is a no-op for parts under the cap. discardPartDelta
+	// below reseeds the accumulator from this capped authoritative text, so the
+	// next streaming delta appends onto a cap-respecting base.
+	part = capPartJSON(part)
 	me.parts[env.ID] = part
 	// Mark live-touched so a concurrent cold-load reconcile does NOT clobber
 	// this newer live part body with the stale fetched one (C-F2). Only tagged
@@ -1530,6 +1545,132 @@ func (s *Store) upsertPartLocked(part json.RawMessage) {
 // markdown to ~5fps in components/Part.tsx / lib/streamMd.ts), while cutting
 // the per-char marshal+emit+ring-push cost to ~1× per window.
 var deltaFlushInterval = 30 * time.Millisecond
+
+// partTextCap bounds the accumulated length of a single part's text field, in
+// bytes. External latency analysis (17.8k sessions / 13 GB) found one bash
+// `tool` part whose unbounded stdout grew to 100 MB — a single pathological
+// part dominated snapshot/transport/client cost. This cap (1 MiB, generous for
+// any realistic tool output) bounds the store's per-part memory regardless of
+// upstream volume: once a (partID, field) accumulator crosses the cap, the
+// text is truncated to (cap - marker) and a visible marker recording the
+// omitted byte count is appended; further deltas to that sealed (partID, field)
+// are dropped. Applies to ALL part types uniformly (no tool special-casing).
+//
+// A package-level var (not const) for the same reason as deltaFlushInterval:
+// tests can shrink it to a few bytes for deterministic truncation assertions.
+// The cap is a STOPGAP guardrail; a larger transcript-windowing fix will
+// follow separately and is intentionally out of scope here.
+var partTextCap = 1 << 20 // 1 MiB
+
+// truncatedMarker returns the visible cap-reached marker that gets appended to
+// a sealed part field. omitted is the number of original output bytes that were
+// dropped (len(original) - partTextCap). The marker is deterministic given N,
+// so a part sealed twice from the same input produces byte-identical text —
+// this is what preserves the monotonic revision validation contract under
+// truncation (no false staleness discard).
+func truncatedMarker(omitted int) string {
+	return "\n…[output truncated: " + strconv.Itoa(omitted) + " further bytes omitted]…"
+}
+
+// applyCapToString bounds s to partTextCap bytes, appending truncatedMarker if
+// truncation occurred. Returns the (possibly truncated) string and a flag
+// indicating whether truncation was applied. The cap lands on a UTF-8 rune
+// boundary so the result is always valid UTF-8 (a mid-rune cut would otherwise
+// be re-marshal'd by encoding/json as U+FFFD, lossy and nondeterministic under
+// some decoders). Same input → same output (deterministic).
+//
+// Returns s unchanged if len(s) <= partTextCap.
+func applyCapToString(s string) (string, bool) {
+	if len(s) <= partTextCap {
+		return s, false
+	}
+	omitted := len(s) - partTextCap
+	marker := truncatedMarker(omitted)
+	cut := partTextCap - len(marker)
+	if cut < 0 {
+		cut = 0
+	}
+	// Back up to the largest rune boundary <= cut so we don't end mid-codepoint.
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + marker, true
+}
+
+// capPartJSON applies partTextCap to every string field of the part JSON
+// uniformly, RECURSING into nested objects and arrays. Only fields OVER the
+// cap are touched (so short metadata strings like id/type pass through
+// byte-identical); any field that crosses the cap is replaced with its
+// applyCapToString form. This is what bounds the motivating pathological case:
+// a bash `tool` part whose unbounded stdout lives at part.state.output
+// (nested two levels deep), not at any top-level field — a top-level-only
+// walk would miss it entirely. Returns part unchanged if no field needed
+// truncation or if the input is malformed JSON. Used on the wholesale upsert
+// paths (upsertPartLocked, reconcileMessagesLocked) so a single huge
+// part.upsert or history-fetch payload is bounded — the streaming delta path
+// is bounded separately in appendPartDeltaLocked.
+//
+// Determinism: Go randomizes map iteration order, but applyCapToString is
+// pure and encoding/json Marshal sorts map keys alphabetically, so the
+// marshaled output is identical regardless of traversal order — this is what
+// preserves the monotonic revision validation contract under truncation.
+func capPartJSON(part json.RawMessage) json.RawMessage {
+	if len(part) <= partTextCap {
+		// Fast path: the entire JSON envelope is under the cap, so no string
+		// field at any depth can be over it either. Avoids an unmarshal+marshal
+		// pair on every wholesale upsert.
+		return part
+	}
+	var p map[string]any
+	if json.Unmarshal(part, &p) != nil {
+		return part
+	}
+	if !capStringsInPlace(p) {
+		return part
+	}
+	if updated, err := json.Marshal(p); err == nil {
+		return updated
+	}
+	return part
+}
+
+// capStringsInPlace walks v recursively and applies applyCapToString to every
+// string at any depth, mutating maps/arrays in place. Returns whether any
+// string was truncated. Used by capPartJSON; the recursion is what lets the
+// cap reach nested tool-output paths like state.output / state.error.
+func capStringsInPlace(v any) bool {
+	switch x := v.(type) {
+	case map[string]any:
+		changed := false
+		for k, item := range x {
+			if s, ok := item.(string); ok {
+				if capped, truncated := applyCapToString(s); truncated {
+					x[k] = capped
+					changed = true
+				}
+			} else if capStringsInPlace(item) {
+				changed = true
+			}
+		}
+		return changed
+	case []any:
+		changed := false
+		for i, item := range x {
+			if s, ok := item.(string); ok {
+				if capped, truncated := applyCapToString(s); truncated {
+					x[i] = capped
+					changed = true
+				}
+			} else if capStringsInPlace(item) {
+				changed = true
+			}
+		}
+		return changed
+	default:
+		// Numbers, bools, json.Number, nil — no string to cap.
+		return false
+	}
+}
 
 // appendPartDeltaLocked applies a streaming text delta to a part using a NATIVE
 // accumulator (strings.Builder) + a lazy time-throttled emit, instead of the
@@ -1600,7 +1741,29 @@ func (s *Store) appendPartDeltaLocked(sessionID, messageID, partID, field, delta
 		}
 		me.deltaBuf[key] = buf
 	}
-	buf.WriteString(delta)
+	// Per-part text cap (P1-AGG-006 guardrail): if this (partID, field) is
+	// already sealed at the cap, drop the delta — the part's text is frozen
+	// at the cap with the truncation marker. Otherwise append and re-check
+	// the cap; if the accumulated text crossed it, truncate to (cap - marker)
+	// and append a visible marker recording the omitted byte count, then seal
+	// so further deltas are dropped. Bounds store memory regardless of upstream
+	// output volume (a 100 MB bash stdout stays at the cap). The throttle flush
+	// below persists the sealed text into me.parts naturally. Sealing is
+	// deterministic: same input → same truncated text + marker → revision
+	// validation is not falsely invalidated.
+	if me.sealedFields == nil || !me.sealedFields[key] {
+		buf.WriteString(delta)
+		if buf.Len() > partTextCap {
+			// strings.Builder has no truncate-in-place; rebuild.
+			capped, _ := applyCapToString(buf.String())
+			buf.Reset()
+			buf.WriteString(capped)
+			if me.sealedFields == nil {
+				me.sealedFields = map[string]bool{}
+			}
+			me.sealedFields[key] = true
+		}
+	}
 
 	// Time-throttled flush (lazy, no goroutine): rebuild the part JSON from the
 	// native accumulator + emit part.upsert at most ~1× per deltaFlushInterval.
@@ -1767,14 +1930,24 @@ func projectPartCaptured(pc snapPartCap) json.RawMessage {
 // discardPartDeltaLocked drops every streaming accumulator entry whose partID
 // matches — used when an authoritative snapshot (message.part.updated) or a
 // history-fetch reconcile supersedes buffered deltas, and on part deletion.
-// Caller holds s.mu.
+// Also clears the matching sealed-fields entries: a fresh authoritative base
+// re-evaluates the cap from scratch. Caller holds s.mu.
 func discardPartDeltaLocked(me *messageEntry, partID string) {
-	if me == nil || me.deltaBuf == nil {
+	if me == nil {
 		return
 	}
-	for k := range me.deltaBuf {
-		if pid, _, ok := strings.Cut(k, "\x00"); ok && pid == partID {
-			delete(me.deltaBuf, k)
+	if me.deltaBuf != nil {
+		for k := range me.deltaBuf {
+			if pid, _, ok := strings.Cut(k, "\x00"); ok && pid == partID {
+				delete(me.deltaBuf, k)
+			}
+		}
+	}
+	if me.sealedFields != nil {
+		for k := range me.sealedFields {
+			if pid, _, ok := strings.Cut(k, "\x00"); ok && pid == partID {
+				delete(me.sealedFields, k)
+			}
 		}
 	}
 }
@@ -2614,10 +2787,12 @@ func (s *Store) reconcileMessagesLocked(sid string, list []MessageWithParts) (co
 		// during the fetch window, in which case the accumulators hold newer
 		// live text the stale fetch must not discard (C-F2). (A non-empty
 		// deltaBuf implies at least one live-touched part, so this check also
-		// covers unflushed streaming text.)
+		// covers unflushed streaming text.) sealedFields is cleared in the same
+		// branch: a fresh authoritative base re-evaluates the cap from scratch.
 		if !(coldLoad && len(me.liveTouchedParts) > 0) {
 			me.deltaBuf = nil
 			me.deltaLastEmit = time.Time{}
+			me.sealedFields = nil
 		}
 
 		seenPart := make(map[string]bool, len(mwp.Parts))
@@ -2627,6 +2802,12 @@ func (s *Store) reconcileMessagesLocked(sid string, list []MessageWithParts) (co
 				continue
 			}
 			seenPart[pe.ID] = true
+			// Apply the per-part text cap (P1-AGG-006) on the history-fetch
+			// path: a fetched part carrying pathological text is bounded here
+			// (the wholesale upsert path caps via upsertPartLocked; this path
+			// writes me.parts directly so it must cap independently). capPartJSON
+			// is a no-op for parts under the cap.
+			part = capPartJSON(part)
 			if old, ok := me.parts[pe.ID]; !ok {
 				me.parts[pe.ID] = part
 				me.partOrder = append(me.partOrder, pe.ID)
