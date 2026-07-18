@@ -151,3 +151,6 @@ export type { SyncState } from "./sync/store";
 // diagnostic surface.
 export { isStale, isUpdating } from "./sync/stream";
 export { STALE_MS, UPDATING_DEBOUNCE_MS } from "./sync/stream";
+// Phase 4 — historical-page load-older action (called from ChatView's
+// IntersectionObserver top sentinel + "Load older" button).
+export { loadOlder } from "./sync/stream";

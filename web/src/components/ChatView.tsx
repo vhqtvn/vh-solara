@@ -1,6 +1,6 @@
 import { createEffect, createMemo, createSignal, For, Match, on, onCleanup, onMount, Show, Switch, untrack } from "solid-js";
 import { Portal } from "solid-js/web";
-import { ackSession, createSession, currentVerb, isSending, markSessionIdle, openSession, rootOf, sessionTodoCounts, sessionTodos, sessionWorking, setSelectedId, setSending, state } from "../sync";
+import { ackSession, createSession, currentVerb, isSending, loadOlder, markSessionIdle, openSession, rootOf, sessionTodoCounts, sessionTodos, sessionWorking, setSelectedId, setSending, state } from "../sync";
 import {
   bottommostRead,
   classifyScrollDelta,
@@ -201,6 +201,12 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   let scrollEl: HTMLDivElement | undefined;
   let contentEl: HTMLDivElement | undefined;
   let chatMainEl: HTMLDivElement | undefined;
+  // Phase-4 load-older UI: a top sentinel observed by an IntersectionObserver
+  // (root: scrollEl) + a "Load older" button fallback. The IO is created in
+  // onMount; refs fire before onMount, so the sentinel uses a ref callback that
+  // observes itself if the IO already exists. See `onLoadOlder`.
+  let topSentinelEl: HTMLDivElement | undefined;
+  let loadMoreObserver: IntersectionObserver | undefined;
   const [following, setFollowing] = createSignal(true);
   // Intent latch for the auto-follow self-heal. `following()` flips false for
   // several reasons — a genuine user scroll-up (drop Live, show "↓ Latest"), a
@@ -622,6 +628,44 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     setFollowing(true);
     setUserScrolledUp(false); // user explicitly chose to follow again
     pin();
+  }
+
+  // ── Phase-4 load-older (historical page prepend) ─────────────────────────
+  // The server (Phase 1-3) ships only a bounded recent tail of a session's
+  // transcript; an older page is fetched on demand from
+  // GET /vh/session/{id}/messages?before=<oldestResidentID>. The merge happens
+  // via insert-if-not-present in `prependMessagesIfAbsent` (reduce.ts); the
+  // Contract-B response gate (sesGen/epoch/dirty-retry) lives in `loadOlder`
+  // (stream.ts). This view's only responsibilities are: (a) render a Load-
+  // older affordance at the top of `.chat-content` when the server says there
+  // is older content (`hasOlder`); (b) fire `loadOlder` on click OR on a
+  // top-sentinel IntersectionObserver trip (one page per signal — `loadingOlder`
+  // prevents chaining); (c) preserve the visible anchor through the prepend by
+  // capturing `restoredAnchorId`/`restoredAnchorOffset` BEFORE the fetch so the
+  // existing read-mode ResizeObserver branch (line ~940) corrects scrollTop
+  // mechanically via `anchorDelta` — NO new scroll code here.
+  const win = () => state.messageWindows[props.sessionId];
+  const hasOlder = () => !!win()?.hasOlder;
+  const loadingOlder = () => !!win()?.loadingOlder;
+  // Capture the visible logical anchor before a prepend. If we're following
+  // (tail mode), there is no anchor to preserve — the prepend lands above the
+  // viewport and the user stays at the tail. If we're reading up, capture the
+  // current top-visible message (or the first resident as a fallback) so the
+  // RO's anchorDelta branch keeps it in view through the prepend.
+  function captureAnchorBeforeLoadOlder() {
+    if (!scrollEl) return;
+    if (following()) return; // tail mode: nothing to preserve
+    const cand = bottommostReadFromDom() || messages()[0]?.id;
+    if (!cand) return;
+    const el = scrollEl.querySelector(`[data-mid="${cssEsc(cand)}"]`) as HTMLElement | null;
+    if (!el) return;
+    restoredAnchorId = cand;
+    restoredAnchorOffset = anchorContentOffset(el);
+  }
+  async function onLoadOlder() {
+    if (loadingOlder()) return; // single-flight guard (mirrors pageInFlight)
+    captureAnchorBeforeLoadOlder();
+    await loadOlder(props.sessionId);
   }
 
   // Scroll restore: reopening a session returns to its read-up-to anchor (the
@@ -1073,6 +1117,30 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   const onFocusComposer = () => taRef?.focus();
   onMount(() => window.addEventListener("vh:focus-composer", onFocusComposer));
   onCleanup(() => window.removeEventListener("vh:focus-composer", onFocusComposer));
+
+  // Phase-4 load-older IntersectionObserver: when the top sentinel scrolls
+  // within `rootMargin` of the viewport AND there's no page in flight, fire
+  // `onLoadOlder()`. The `loadingOlder()` signal is the single-flight guard
+  // (mirrors `pageInFlight` in stream.ts) so one page lands per intersection
+  // signal — no auto-chaining. The sentinel is observed via a ref callback
+  // (refs fire before onMount) so a remount when `hasOlder` flips back to true
+  // after eviction re-observes correctly.
+  onMount(() => {
+    if (!scrollEl) return;
+    loadMoreObserver = new IntersectionObserver(
+      (entries) => {
+        if (loadingOlder()) return;
+        if (entries.some((e) => e.isIntersecting)) void onLoadOlder();
+      },
+      { root: scrollEl, rootMargin: "600px 0px 0px 0px" }
+    );
+    if (topSentinelEl) loadMoreObserver.observe(topSentinelEl);
+  });
+  onCleanup(() => {
+    loadMoreObserver?.disconnect();
+    loadMoreObserver = undefined;
+    topSentinelEl = undefined;
+  });
 
   // --- composer autocomplete (@file / @agent / /command) ---------------------
   const [caret, setCaret] = createSignal(0);
@@ -1888,6 +1956,37 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       <div class="chat-main" ref={chatMainEl}>
       <div class="chat-scroll" ref={scrollEl} onScroll={onScrolled}>
         <div class="chat-content" ref={contentEl} classList={{ ready: revealed() }}>
+          {/* Phase-4 load-older affordance. Rendered only when the server says
+              older messages exist (`hasOlder`) AND a resident transcript is
+              present AND this is not a draft. The top sentinel is observed by
+              `loadMoreObserver` (IntersectionObserver, root: scrollEl). The
+              "Load older" button is a manual fallback for touch / no-IO-support
+              / when the user prefers an explicit signal. NO mask-image /
+              backdrop-filter / contain / content-visibility on this surface
+              (WebRender heat risk on always-present scroll containers). */}
+          <Show when={hasOlder() && messages().length > 0 && !props.draft}>
+            <div class="load-more-top">
+              <Show when={loadingOlder()}>
+                <span class="load-more-spinner"><Spinner size={14} /></span>
+              </Show>
+              <button
+                type="button"
+                class="load-more-btn"
+                onClick={() => void onLoadOlder()}
+                disabled={loadingOlder()}
+              >
+                {loadingOlder() ? "Loading…" : "Load older"}
+              </button>
+              <div
+                ref={(el: HTMLDivElement) => {
+                  topSentinelEl = el;
+                  if (loadMoreObserver) loadMoreObserver.observe(el);
+                }}
+                class="load-more-sentinel"
+                aria-hidden="true"
+              />
+            </div>
+          </Show>
           <For each={messages()}>
             {(m, i) => {
               // Per-message hold state for the Copy button: a long-press

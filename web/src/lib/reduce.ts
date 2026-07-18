@@ -131,3 +131,71 @@ export function buildMessages(items: any[]): SessionMessages {
   sortMessages(sm);
   return sm;
 }
+
+// Phase 4 — historical-page merge primitive. Merges a page of older messages
+// into a resident SessionMessages by INSERT-IF-NOT-PRESENT only. NEVER touches
+// an existing byId entry — live always wins (a page snapshot is a stale
+// point-in-time read; a live delta that landed during the page flight must not
+// be overwritten by the stale snapshot copy). Returns the count of messages
+// actually inserted (callers use this to decide whether to update oldestResident
+// and whether to update the hasOlder signal). The final sortMessages handles
+// prepend ordering naturally — the new ids slot into their creation-time
+// position relative to the existing tail.
+export function prependMessagesIfAbsent(sm: SessionMessages, items: any[]): number {
+  let added = 0;
+  for (const it of items) {
+    const info = it.info as MessageInfo;
+    if (!info || sm.byId[info.id]) continue; // live always wins — NEVER touch existing
+    const parts: Record<string, Part> = {};
+    const partOrder: string[] = [];
+    for (const p of it.parts || []) {
+      parts[p.id] = p;
+      partOrder.push(p.id);
+    }
+    sm.byId[info.id] = { id: info.id, info, partOrder, parts };
+    sm.order.push(info.id);
+    added++;
+  }
+  if (added) sortMessages(sm);
+  return added;
+}
+
+// Phase 4 — resident-cache eviction from the OLDEST end (top of order). Used
+// after a page merge to keep resident message count + approximate bytes under
+// the operator-tunable cap. Evicting from the oldest end preserves the live
+// tail (newest messages, at the bottom of order) which is what an active
+// session streams into. Returns the count actually removed. Does NOT touch
+// the last `protectTail` messages (default 1) so an in-flight assistant turn
+// at the tail is never yanked. Bidirectional eviction (tail-end when reading
+// history) is a documented follow-up — this minimal cut covers the OOM risk
+// for the common live-session case.
+export function deleteMessagesFromTop(sm: SessionMessages, count: number, protectTail = 1): number {
+  if (count <= 0) return 0;
+  const removable = sm.order.length - protectTail;
+  if (removable <= 0) return 0;
+  const n = Math.min(count, removable);
+  const removed = sm.order.slice(0, n);
+  sm.order = sm.order.slice(n);
+  for (const id of removed) delete sm.byId[id];
+  return n;
+}
+
+// Phase 4 — approximate resident serialized bytes. Sums JSON.stringify length
+// over each message's info + parts. Approximate (omits wire envelope framing)
+// but deterministic and cheap enough to run after each page merge. Used by the
+// eviction gate alongside MAX_RESIDENT_MESSAGES. Mirrors the server's
+// messageSerializedBytes() rationale (per-part 1 MiB cap is the hard OOM
+// guardrail; the aggregate cap is an approximate content budget).
+export function approxResidentBytes(sm: SessionMessages): number {
+  let total = 0;
+  for (const id of sm.order) {
+    const msg = sm.byId[id];
+    if (!msg) continue;
+    total += msg.info ? JSON.stringify(msg.info).length : 0;
+    for (const pid of msg.partOrder) {
+      const p = msg.parts[pid];
+      if (p) total += JSON.stringify(p).length;
+    }
+  }
+  return total;
+}

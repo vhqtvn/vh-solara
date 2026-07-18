@@ -62,20 +62,40 @@ export function urlDir(): string | null {
 const initialDir =
   urlDir() ?? loadVersioned<string>(LS_PROJECT, 1, "", (o) => (typeof o === "string" ? o : ""));
 
-// Per-session resident-window state (Phase 3 — client initial-window semantics).
-// Derived from the server's MessageWindowMeta whenever a bounded tail lands
-// (messages.batch, applySessionSnapshot, refreshOpenSessions). Purely additive:
-// no existing field changed semantics. Phase 4 extends this with gap markers,
-// eviction ranges, and the pageInFlight cursor — those live in this same map
-// keyed by sessionID.
+// Per-session resident-window state (Phase 3 — client initial-window semantics;
+// Phase 4 — historical-page load-older). Derived from the server's
+// MessageWindowMeta whenever a bounded tail lands (messages.batch,
+// applySessionSnapshot, refreshOpenSessions). Purely additive: no existing
+// field changed semantics. Phase 4 adds the load-older transport flag
+// (loadingOlder) + the sticky eviction flag (evictedHistory) — gap-marker /
+// eviction-range tracking is intentionally minimal in this cut (eviction ORs
+// a persistent evictedHistory into hasOlder so the Load-older button stays
+// visible after eviction even if a later page reports has_older=false;
+// bidirectional eviction is a documented follow-up).
 export interface MessageWindowState {
   // Server says older messages exist beyond the resident tail. Drives the
-  // "Load older" affordance. False (or absent) for an unbounded server.
+  // "Load older" affordance. False (or absent) for an unbounded server. This
+  // is the OR of the server's per-page has_older signal AND the eviction
+  // signal (once we've evicted messages that are still on the server).
   hasOlder: boolean;
   // Oldest message id currently resident (top of the tail). Acts as the prepend
   // cursor for the Phase-4 historical-page fetch. Undefined when no messages
   // are resident (empty cold fetch) — the Phase-4 button is hidden in that case.
   oldestResidentID?: string;
+  // Phase 4: a historical page request is in flight for this session. Drives
+  // the button spinner + the IntersectionObserver guard (one page per signal).
+  // Transport state surfaced through the store ONLY so the UI can react; the
+  // authoritative single-flight state lives in stream.ts's pageInFlight map.
+  loadingOlder?: boolean;
+  // Phase 4: sticky eviction flag. Set true the first time evictIfOverCap
+  // yanks messages from the oldest end, and never reset within the session
+  // (cleared on session.delete/switchProject via the whole-window reset).
+  // Forces hasOlder=true persistently because the evicted messages remain on
+  // the server and re-fetchable — without this, a later end-of-history page
+  // (has_older=false) would hide the Load-older button even though evicted
+  // messages are still available. Reset only when the whole window state is
+  // rebuilt (cold load, session switch, project switch).
+  evictedHistory?: boolean;
 }
 
 export interface SyncState {

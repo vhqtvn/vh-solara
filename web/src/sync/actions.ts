@@ -21,7 +21,7 @@ import {
   LS_PROJECT,
 } from "./store";
 import { syncUrl } from "./url";
-import { closeSessionStream, connect } from "./stream";
+import { closeSessionStream, connect, resetPageInFlight } from "./stream";
 import { invalidateChildrenIndex } from "./selectors";
 
 // Selecting any real session leaves draft mode.
@@ -44,6 +44,11 @@ export function switchProject(dir: string, fromUrl = false) {
   setSelectedIdRaw(null);
   setDraft(false);
   if (!fromUrl) syncUrl(null);
+  // Phase 4: clear all in-flight historical-page requests on project switch.
+  // A page in flight belongs to the outgoing project's session; it must not
+  // land into the new project's session (id-reuse across projects is possible).
+  // Mirrors the messageWindows={} reset below.
+  resetPageInFlight();
   setState(
     produce((s) => {
       s.sessions = loadSessions(dir);
