@@ -124,4 +124,38 @@ describe("decodeMessagesBatch (gzip+base64 cold-load payload)", () => {
     expect(decoded.sessionID).toBe("g2");
     expect(decoded.messages).toBe(inline);
   });
+
+  it("passes the outer payload's window field through untouched (Phase 3)", async () => {
+    // Phase 1 added `window` to the outer batch payload (sibling to
+    // encoding/data) carrying has_older/oldest_loaded_id so the client can read
+    // windowing metadata WITHOUT decompressing the gzip'd messages array. Phase
+    // 3 extended decodeMessagesBatch's return to carry that field through. This
+    // pins the contract: window is never decoded (it's plain JSON alongside
+    // encoding/data), only passed through.
+    const window = {
+      oldest_loaded_id: "m1",
+      has_older: true,
+      message_count: 2,
+      serialized_bytes: 2048,
+      count_limited: false,
+      bytes_limited: true,
+    };
+    const decoded = await decodeMessagesBatch({
+      sessionID: "s1",
+      encoding: "gzip64",
+      data: encodeForTest([{ info: { id: "m1" }, parts: [] }, { info: { id: "m2" }, parts: [] }]),
+      window,
+    });
+    expect(decoded.window).toEqual(window);
+  });
+
+  it("returns undefined window when the payload omits it (pre-Phase-1 server)", async () => {
+    const decoded = await decodeMessagesBatch({
+      sessionID: "old",
+      encoding: "gzip64",
+      data: encodeForTest([{ info: { id: "x" }, parts: [] }]),
+      // no window field
+    });
+    expect(decoded.window).toBeUndefined();
+  });
 });

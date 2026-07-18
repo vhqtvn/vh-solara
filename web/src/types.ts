@@ -53,6 +53,14 @@ export interface Snapshot {
   gate?: Record<string, GateFacts>;
   sessions: Session[];
   messages?: Record<string, unknown[]>;
+  // Per-session bounded-window metadata (Phase 1 server-side projection). When
+  // present, each entry describes the tail that was shipped in `messages[id]`:
+  // whether older messages exist beyond the window (`has_older`), the oldest
+  // resident id (`oldest_loaded_id`), and the dual-bound that stopped the
+  // projection (`count_limited`/`bytes_limited`). Older servers (pre-Phase-1)
+  // omit this map AND ship the whole transcript, so absence is treated as
+  // has_older=false (nothing to fetch). See MessageWindowMeta.
+  messageWindows?: Record<string, MessageWindowMeta>;
   statuses?: Record<string, unknown>;
   activity?: Record<string, string>;
   permissions?: Record<string, Permission[]>;
@@ -178,5 +186,32 @@ export interface MessageView {
 export interface SessionMessages {
   order: string[];
   byId: Record<string, MessageView>;
+}
+
+// Server-side bounded-window metadata — mirrors Go's `state.WindowMeta` wire
+// shape (pkg/state/store.go Phase 1). Carried alongside the bounded message
+// tail in two places: (1) `Snapshot.messageWindows[id]` for the cold-load
+// wholesale-replace path, and (2) the outer `messages.batch` payload's `window`
+// field for the SSE cold-batch path. Every field is optional because older
+// servers (pre-Phase-1) emit neither the map nor the field — the client treats
+// absence as "unbounded server, nothing older to fetch" (has_older=false).
+export interface MessageWindowMeta {
+  // Oldest message id resident in the shipped window (top of the tail). Empty
+  // when no messages shipped.
+  oldest_loaded_id?: string;
+  // Server reports there are STRICTLY OLDER messages beyond the window. Drives
+  // the client's "Load older" affordance. False for an unbounded server.
+  has_older?: boolean;
+  // Diagnostic counts — present when a bound was hit, useful for telemetry /
+  // operator-facing diagnostics.
+  message_count?: number;
+  serialized_bytes?: number;
+  count_limited?: boolean;
+  bytes_limited?: boolean;
+  // Oversized-anchor diagnostics — set ONLY when a single message exceeded the
+  // byte budget and was returned alone (the atomic-message guarantee).
+  oversized_item?: boolean;
+  actual_bytes?: number;
+  budget_bytes?: number;
 }
 

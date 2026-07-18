@@ -48,6 +48,11 @@ export function switchProject(dir: string, fromUrl = false) {
     produce((s) => {
       s.sessions = loadSessions(dir);
       s.messages = {};
+      // Phase 3: clear the per-session bounded-window map alongside the other
+      // per-session maps (messagesLoaded/messagesError). A previous project's
+      // window state (hasOlder / oldestResidentID) must not leak across the
+      // switch — the new project's snapshot repopulates it from scratch.
+      s.messageWindows = {};
       s.messagesLoaded = {};
       s.messagesError = {};
       s.activity = loadActivity(dir);

@@ -4,7 +4,7 @@
 // and store reconciliation; notification policy lives in ./orchestration.
 import { produce } from "solid-js/store";
 import { createSignal } from "solid-js";
-import type { Snapshot } from "../types";
+import type { MessageWindowMeta, Snapshot } from "../types";
 import {
   buildMessages,
   deleteMessage,
@@ -43,6 +43,34 @@ export function mergeLastAgents(
     if (name && !out[id]) out[id] = name; // keep FE cache when the snapshot omits it
   }
   return out;
+}
+
+// deriveMessageWindow — pure helper that projects the server-side window meta
+// (Phase 1's WindowMeta wire shape) into the client's resident MessageWindowState
+// (Phase 3). Used by the three wholesale-replace paths (messages.batch,
+// applySessionSnapshot, refreshOpenSessions) so they all populate the window
+// state consistently. Pure + exported for unit testing.
+//
+// Back-compat: a pre-Phase-1 server ships the WHOLE transcript and omits the
+// window meta — that yields {hasOlder:false, oldestResidentID:<derived from
+// items[0]>}, which is the correct "unbounded server, nothing older to fetch"
+// state. The derived oldestResidentID lets Phase 4 (the prepend path) read a
+// stable cursor even against an old server (though it would have nothing to
+// fetch in that case — hasOlder:false hides the button).
+export function deriveMessageWindow(
+  items: any[],
+  serverWindow?: MessageWindowMeta,
+): { hasOlder: boolean; oldestResidentID?: string } {
+  const hasOlder = !!(serverWindow && serverWindow.has_older);
+  // Prefer the server's declared oldest_loaded_id (authoritative — it survives
+  // even when an oversized-anchor item ships alone with older messages still
+  // beyond it). Fall back to the first resident item's info.id for back-compat
+  // with an unbounded server that omitted the meta. Items arrive in creation
+  // order (oldest first), so items[0] is the oldest.
+  const oldestResidentID =
+    (serverWindow && serverWindow.oldest_loaded_id) ||
+    (items.length ? (items[0] as any)?.info?.id : undefined);
+  return { hasOlder, oldestResidentID };
 }
 
 // epochChanged — pure epoch-transition detector. True only when we already had
@@ -138,8 +166,11 @@ export function applySessionEvent(kind: string, seq: number, payload: any) {
         // is the open-session delivery flag, cleared here to stay consistent with
         // the session's removal. (s.messages is owned by the Stream-2 / openSession
         // lifecycle and reconciled separately, so it is NOT pruned here — see
-        // SyncState.messagesLoaded.)
+        // SyncState.messagesLoaded.) Phase 3: messageWindows is pruned for the
+        // same reason — a stale window state (hasOlder/oldestResidentID) must not
+        // resurrect on id-reuse.
         delete s.lastAgents[payload.id];
+        delete s.messageWindows[payload.id];
         delete s.messagesLoaded[payload.id];
         delete s.messagesError[payload.id];
         delete s.refreshing[payload.id];
@@ -215,8 +246,19 @@ export function applyMessageEvent(kind: string, seq: number, payload: any, track
           // flips messagesLoaded so the gate opens. The batch MAY arrive before
           // messages.loaded — that is the whole point (content staged, then the
           // gate flips). Live message.upsert/part.upsert are unchanged.
+          //
+          // Phase 3 (transcript windowing): after Phase 1's server-side bounded
+          // projection, the batch carries the recent TAIL only (default 100 msgs
+          // / 1 MiB), and the OUTER payload carries a `window` field (sibling to
+          // encoding/data) with has_older/oldest_loaded_id metadata. Populate
+          // messageWindows[sid] so the Phase-4 "Load older" path knows whether
+          // older messages exist and where the resident tail starts. Back-compat:
+          // a pre-Phase-1 server omits `window` → deriveMessageWindow yields
+          // {hasOlder:false} (unbounded server, nothing older to fetch).
           if (payload.sessionID) {
-            s.messages[payload.sessionID] = buildMessages(payload.messages || []);
+            const items = payload.messages || [];
+            s.messages[payload.sessionID] = buildMessages(items);
+            s.messageWindows[payload.sessionID] = deriveMessageWindow(items, payload.window);
           }
           break;
         }
@@ -330,7 +372,9 @@ export function applyMessageEvent(kind: string, seq: number, payload: any, track
   persist();
 }
 
-async function fetchSessionMessages(id: string): Promise<any[]> {
+async function fetchSessionMessages(
+  id: string,
+): Promise<{ items: any[]; window?: MessageWindowMeta }> {
   // z=1 opts into gzip64 snapshot encoding (server maybeCompressSnapshot) so the
   // full transcript ships compressed through the controller tunnel — the same
   // win as the Stream-2 snapshot. refreshOpenSessions fans one of these out per
@@ -338,11 +382,17 @@ async function fetchSessionMessages(id: string): Promise<any[]> {
   // uncompressed transcript and they contend the tunnel. decodeSnapshot is a
   // pass-through when the response carries no `encoding` (old server / small
   // snapshot under the threshold), so an old server keeps working.
+  //
+  // Phase 3: also surface snap.messageWindows?.[id] (Phase-1 server-side
+  // bounded projection meta) so refreshOpenSessions can populate the resident
+  // window state alongside the messages — without it the warm-refresh path
+  // would lose hasOlder/oldestResidentID and the Phase-4 "Load older" button
+  // would never appear after a tree reconnect.
   const res = await fetch(
     `/vh/snapshot?sessions=${encodeURIComponent(id)}&dir=${encodeURIComponent(projectDir())}&z=1`,
   );
   const snap: Snapshot = await decodeSnapshot<Snapshot>(await res.json());
-  return (snap.messages?.[id] as any[]) || [];
+  return { items: (snap.messages?.[id] as any[]) || [], window: snap.messageWindows?.[id] };
 }
 
 // Bounds tunnel pressure from the warm-open refresh fan-out. Each open session
@@ -398,9 +448,14 @@ export async function refreshOpenSessions() {
   await runWithConcurrency(Object.keys(state.messages), REFRESH_CONCURRENCY, async (id) => {
     if (id === active) return;
     try {
-      const items = await fetchSessionMessages(id);
+      const { items, window } = await fetchSessionMessages(id);
       setState("messages", id, buildMessages(items));
       setState("messagesLoaded", id, true);
+      // Phase 3: populate the resident-window state alongside the messages so
+      // the Phase-4 "Load older" affordance works after a tree reconnect (not
+      // just after the cold-load batch / a Stream-2 snapshot). Mirrors what
+      // applySessionSnapshot does on the warm path.
+      setState("messageWindows", id, deriveMessageWindow(items, window));
     } catch {
       /* keep stale; reopening re-snapshots */
     }
@@ -913,7 +968,17 @@ export function closeSessionStream() {
 // (markSessionSeen + gen guard, latency) stays in the listener; this is the pure
 // reconciliation.
 export function applySessionSnapshot(id: string, snap: Snapshot) {
-  setState("messages", id, buildMessages((snap.messages?.[id] as any[]) || []));
+  const items = (snap.messages?.[id] as any[]) || [];
+  setState("messages", id, buildMessages(items));
+  // Phase 3 (transcript windowing): populate the resident-window state from the
+  // server's bounded-projection meta. This is the Stream-2 (active-session)
+  // wholesale-replace path, so it must populate messageWindows[id] just like the
+  // messages.batch case and refreshOpenSessions do — without it the Phase-4
+  // "Load older" button would never appear for the active session after a warm
+  // snapshot. Back-compat: a pre-Phase-1 server omits snap.messageWindows AND
+  // ships the whole transcript → deriveMessageWindow yields {hasOlder:false}
+  // (correct: unbounded server, nothing older to fetch).
+  setState("messageWindows", id, deriveMessageWindow(items, snap.messageWindows?.[id]));
   // Mark delivered ONLY when the snapshot's gate says the daemon has the FULL
   // history (messagesLoaded !== false). Slice C async hydration sends a PARTIAL
   // snapshot immediately (before the upstream fetch completes) with
@@ -994,26 +1059,31 @@ async function decodeGzip64(data: string): Promise<string> {
 
 // decodeMessagesBatch reverses the server's application-level compression of
 // the cold-load messages.batch payload. The server emits {sessionID, encoding,
-// data} where data = base64( gzip( {"messages":[...]} ) ). sessionID stays
-// PLAIN TEXT so the store/web interest filters (payloadSessionID / sendable)
-// keep extracting it — replacing the whole payload with a base64 blob would
-// silently drop the batch for Stream-2 (open-session) subscribers; only the
-// heavy messages array is compressed. This helper returns {sessionID,
-// messages} in the exact shape applyMessageEvent's "messages.batch" case
-// already consumes, so that case is UNCHANGED by compression. Exported for
-// unit testing.
+// data, window?} where data = base64( gzip( {"messages":[...]} ) ) and `window`
+// (Phase 1 server-side bounded projection meta) travels SIBLING to `encoding`
+// / `data` so the client can read has_older/oldest_loaded_id WITHOUT
+// decompressing the messages array. sessionID stays PLAIN TEXT so the
+// store/web interest filters (payloadSessionID / sendable) keep extracting it
+// — replacing the whole payload with a base64 blob would silently drop the
+// batch for Stream-2 (open-session) subscribers; only the heavy messages
+// array is compressed. This helper returns {sessionID, messages, window?} in
+// the exact shape applyMessageEvent's "messages.batch" case already consumes
+// (plus the new window field), so that case is UNCHANGED in mechanism by
+// compression. Exported for unit testing.
 export async function decodeMessagesBatch(payload: {
   sessionID?: string;
   encoding?: string;
   data?: string;
   messages?: any[];
-}): Promise<{ sessionID: string; messages: any[] }> {
+  window?: MessageWindowMeta;
+}): Promise<{ sessionID: string; messages: any[]; window?: MessageWindowMeta }> {
   const sessionID = payload.sessionID || "";
+  const window = payload.window;
   // Pass-through for a non-compressed payload (a non-conforming server, or a
   // future threshold policy that emits raw JSON below a size cutoff). Keeps the
   // helper a total function.
   if (payload.encoding !== "gzip64" || !payload.data) {
-    return { sessionID, messages: payload.messages || [] };
+    return { sessionID, messages: payload.messages || [], window };
   }
   const text = await decodeGzip64(payload.data);
   if (!text) {
@@ -1021,7 +1091,7 @@ export async function decodeMessagesBatch(payload: {
     // whatever inline messages arrived (likely empty) and log — the server
     // always compresses today, so this only matters for an old client.
     log.warn("sync", "DecompressionStream unavailable; messages.batch undecodable", { id: sessionID });
-    return { sessionID, messages: payload.messages || [] };
+    return { sessionID, messages: payload.messages || [], window };
   }
   let inner: { messages?: any[] };
   try {
@@ -1035,9 +1105,9 @@ export async function decodeMessagesBatch(payload: {
       id: sessionID,
       err,
     });
-    return { sessionID, messages: payload.messages || [] };
+    return { sessionID, messages: payload.messages || [], window };
   }
-  return { sessionID, messages: inner.messages || [] };
+  return { sessionID, messages: inner.messages || [], window };
 }
 
 // decodeSnapshot reverses the server's gzip64 snapshot compression

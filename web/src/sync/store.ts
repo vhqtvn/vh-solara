@@ -62,13 +62,52 @@ export function urlDir(): string | null {
 const initialDir =
   urlDir() ?? loadVersioned<string>(LS_PROJECT, 1, "", (o) => (typeof o === "string" ? o : ""));
 
+// Per-session resident-window state (Phase 3 — client initial-window semantics).
+// Derived from the server's MessageWindowMeta whenever a bounded tail lands
+// (messages.batch, applySessionSnapshot, refreshOpenSessions). Purely additive:
+// no existing field changed semantics. Phase 4 extends this with gap markers,
+// eviction ranges, and the pageInFlight cursor — those live in this same map
+// keyed by sessionID.
+export interface MessageWindowState {
+  // Server says older messages exist beyond the resident tail. Drives the
+  // "Load older" affordance. False (or absent) for an unbounded server.
+  hasOlder: boolean;
+  // Oldest message id currently resident (top of the tail). Acts as the prepend
+  // cursor for the Phase-4 historical-page fetch. Undefined when no messages
+  // are resident (empty cold fetch) — the Phase-4 button is hidden in that case.
+  oldestResidentID?: string;
+}
+
 export interface SyncState {
   sessions: Record<string, Session>;
   // Messages are held only for opened sessions, to bound memory.
   messages: Record<string, SessionMessages>;
+  // Per-session bounded-window metadata (Phase 3 — client initial-window
+  // semantics). Mirrors the server's window projection so the client knows
+  // whether older messages exist beyond the resident tail (the "Load older"
+  // affordance) and the oldest resident id (the prepend cursor). Populated by
+  // the three wholesale-replace paths (messages.batch, applySessionSnapshot,
+  // refreshOpenSessions) when a bounded tail lands; pruned on session.delete;
+  // reset on switchProject. See MessageWindowState.
+  //
+  // DISTINCT from messagesLoaded (the boolean "initial window delivered" gate):
+  // messagesLoaded tells the UI the transcript is ready to REVEAL;
+  // messageWindows[id].hasOlder tells the UI a "Load older" button should SHOW.
+  // The split lets the reveal gate and the windowing affordance evolve
+  // independently (a warm reopen reveals instantly from cache while the window
+  // state is re-asserted from the fresh snapshot).
+  messageWindows: Record<string, MessageWindowState>;
   // Per-session flag: true once the active-session message snapshot (Stream 2)
-  // or a refreshOpenSessions fetch has delivered the real message list. Why this
-  // exists: openSession() pre-reserves a truthy-but-empty {order:[],byId:{}}
+  // or a refreshOpenSessions fetch has delivered the real message list. NOTE
+  // (Phase 3): after server-side transcript windowing (Phase 1), this means
+  // "the initial BOUNDED window delivered" — NOT "the whole transcript is
+  // resident". A bounded server ships only the recent tail (default 100 msgs /
+  // 1 MiB) and reports via `messageWindows[id].hasOlder` whether older
+  // messages exist; older pages are lazy-loaded by the Phase-4 prepend path.
+  // No existing consumer assumed whole-transcript-residency (the audit found
+  // only boolean reveal gates: ChatView, SessionTree dots), so the semantic
+  // shift is back-compat. See SyncState.messageWindows for the windowing map.
+  // Why this exists: openSession() pre-reserves a truthy-but-empty {order:[],byId:{}}
   // slot the INSTANT a session is selected, so messages[id] is truthy BEFORE the
   // real snapshot arrives. Gating the transcript empty/loading state on that
   // truthiness shows "No messages" during the gap. This flag separates
@@ -172,6 +211,7 @@ export interface SyncState {
 export const [state, setState] = createStore<SyncState>({
   sessions: loadSessions(initialDir),
   messages: {},
+  messageWindows: {},
   messagesLoaded: {},
   messagesError: {},
   refreshing: {},
