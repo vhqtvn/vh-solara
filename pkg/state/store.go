@@ -139,15 +139,21 @@ type Snapshot struct {
 	// restarts (the view is in-memory, not durable), so a resume cursor is only
 	// valid within one (epoch). A coordinator keys cursors by (worker, epoch, seq)
 	// and re-snapshots when the epoch it sees changes.
-	Epoch       string                        `json:"epoch"`
-	Seq         uint64                        `json:"seq"`
-	Sessions    []json.RawMessage             `json:"sessions"`
-	Messages    map[string][]MessageWithParts `json:"messages"`
-	Todos       map[string]json.RawMessage    `json:"todos,omitempty"`
-	Permissions map[string][]json.RawMessage  `json:"permissions,omitempty"`
-	Questions   map[string][]json.RawMessage  `json:"questions,omitempty"`
-	Statuses    map[string]json.RawMessage    `json:"statuses,omitempty"`
-	Activity    map[string]string             `json:"activity,omitempty"`
+	Epoch    string                        `json:"epoch"`
+	Seq      uint64                        `json:"seq"`
+	Sessions []json.RawMessage             `json:"sessions"`
+	Messages map[string][]MessageWithParts `json:"messages"`
+	// MessageWindows carries the per-session bounded-window metadata for every
+	// session in Messages. A client reads has_older / count / limits WITHOUT
+	// decoding the message array, so it can render a "Load older" affordance
+	// and reason about completeness from the cold snapshot alone. Keyed by
+	// sessionID; omitted entirely when no sessions carry messages (tree-only).
+	MessageWindows map[string]WindowMeta        `json:"messageWindows,omitempty"`
+	Todos          map[string]json.RawMessage   `json:"todos,omitempty"`
+	Permissions    map[string][]json.RawMessage `json:"permissions,omitempty"`
+	Questions      map[string][]json.RawMessage `json:"questions,omitempty"`
+	Statuses       map[string]json.RawMessage   `json:"statuses,omitempty"`
+	Activity       map[string]string            `json:"activity,omitempty"`
 	// LastAgents carries the agent name of each session's most recent assistant
 	// turn, so the tree can render per-agent chips on a COLD snapshot — before any
 	// session's message history is hydrated. Like Activity, this is a snapshot-only
@@ -236,6 +242,187 @@ type GateFacts struct {
 type MessageWithParts struct {
 	Info  json.RawMessage   `json:"info"`
 	Parts []json.RawMessage `json:"parts"`
+}
+
+// WindowMeta describes a bounded message-window projection: the metadata that
+// travels ALONGSIDE a bounded []MessageWithParts so a client knows whether the
+// window is complete, whether older messages exist beyond it, and WHY the
+// projection stopped. Distinct from the message array itself: the client reads
+// has_older / count / limits WITHOUT decoding the (potentially gzip+base64)
+// messages payload.
+//
+// Fields are designed for the transcript-windowing protocol (Phase 1+):
+//   - The initial cold-load window (Snapshot messages + cold messages.batch)
+//     carries this so the client renders a "Load older" affordance when
+//     has_older is set, and so it never assumes the window == the whole
+//     transcript.
+//   - oversized_item is the diagnostic case: when even the single newest
+//     message exceeds the byte budget, the projector returns it ALONE (always
+//     include at least one) and signals the overflow so a client can explain
+//     the single-item window without a freeze or a silent gap.
+type WindowMeta struct {
+	// OldestLoadedID is the message id of the OLDEST message in the window.
+	// Empty when the window is empty. The client uses this as the `?before=`
+	// cursor for the next historical page fetch.
+	OldestLoadedID string `json:"oldest_loaded_id,omitempty"`
+	// HasOlder is true when older messages exist beyond this window (the
+	// projection stopped before exhausting the ordered list). This is the
+	// "show a Load-older affordance" bit. False means the window IS the whole
+	// transcript.
+	HasOlder bool `json:"has_older"`
+	// MessageCount is the number of messages in the window (len of the
+	// accompanying message array).
+	MessageCount int `json:"message_count"`
+	// SerializedBytes is the sum of len(Info)+sum(len(Parts)) across the
+	// window — the raw wire payload size. A client uses this to reason about
+	// memory pressure and to decide whether to evict far pages.
+	SerializedBytes int `json:"serialized_bytes"`
+	// CountLimited is true when the projection stopped because it hit the
+	// message-count budget (more messages existed within the byte budget).
+	CountLimited bool `json:"count_limited"`
+	// BytesLimited is true when the projection stopped because adding the next
+	// message would have exceeded the byte budget.
+	BytesLimited bool `json:"bytes_limited"`
+	// OversizedItem, ActualBytes, BudgetBytes are set ONLY in the oversized
+	// case: the single newest message alone exceeds the byte budget. The
+	// projector returns it alone (always include at least one) + these
+	// diagnostics. A client renders the item but flags that the window could
+	// not include any neighbors.
+	OversizedItem bool `json:"oversized_item,omitempty"`
+	ActualBytes   int  `json:"actual_bytes,omitempty"`
+	BudgetBytes   int  `json:"budget_bytes,omitempty"`
+}
+
+// windowMaxCount and windowMaxBytes are the operator-tunable bounds for the
+// initial message-window projection (the cold-load tail). Package-level VARS
+// (not consts) precisely so tests can shrink them for deterministic window
+// assertions — the same escape-hatch pattern as partTextCap. The defaults
+// (100 messages / 1 MiB) are the operator-recommended dual bound: whichever
+// hits first stops the window. The projector always includes at least the
+// newest complete message even when the byte budget is exceeded (the
+// oversized_item case).
+var (
+	windowMaxCount = 100
+	windowMaxBytes = 1 << 20 // 1 MiB
+)
+
+// messageSerializedBytes returns the raw message-value byte size of a
+// projection: len(Info) + sum(len(Parts)). This is the size measure the window
+// projector budgets against. It is an APPROXIMATE content budget: it omits the
+// marshaled-JSON envelope framing (the {"info":...,"parts":[...]} object/array
+// keys, commas, braces the wire payload adds per message), so a window accepted
+// at exactly maxBytes produces a decompressed wire payload slightly ABOVE
+// maxBytes. The framing overhead is small and bounded per message; the per-part
+// 1 MiB text cap (commit 516186b) is the hard OOM guardrail, and this aggregate
+// cap delivers the order-of-magnitude bound the slice targets. Pure: no
+// allocation, no store access.
+func messageSerializedBytes(m MessageWithParts) int {
+	n := len(m.Info)
+	for _, p := range m.Parts {
+		n += len(p)
+	}
+	return n
+}
+
+// messageIDFromInfo extracts the envelope id from a message info JSON blob. Used
+// by the window projector to populate OldestLoadedID (the historical-page
+// cursor). Returns "" on parse failure (the projector treats this as "no id
+// available" — the client falls back to its own oldest-known id).
+func messageIDFromInfo(info json.RawMessage) string {
+	var env messageInfoEnvelope
+	if json.Unmarshal(info, &env) == nil {
+		return env.ID
+	}
+	return ""
+}
+
+// projectMessageWindow bounds a session's message list (creation-ordered, oldest
+// first) to a recent tail of at most maxCount messages whose aggregate
+// serialized size does not exceed maxBytes. Messages stay atomic: a message is
+// NEVER split or truncated for windowing (the per-part text cap is a separate,
+// earlier guardrail). The newest message is ALWAYS included, even if it alone
+// exceeds the byte budget (the oversized case — the projector returns it alone
+// and signals oversized_item + actual_bytes/budget_bytes so a client can render
+// a diagnostic without a freeze).
+//
+// PURE and DETERMINISTIC: same input list → same bounded list + same WindowMeta.
+// This is what preserves the monotonic revision-validation contract under
+// windowing (no false staleness discard): the same captured state always
+// projects to the same bytes, so publishColdBatch's msgRev equality check is
+// sound. The projector performs NO store access and NO lock acquisition — it
+// operates on an already-captured []MessageWithParts.
+//
+// The result preserves creation order (oldest first), matching the wire shape
+// the client expects for prepend-on-load-more.
+func projectMessageWindow(list []MessageWithParts, maxCount, maxBytes int) ([]MessageWithParts, WindowMeta) {
+	meta := WindowMeta{}
+	n := len(list)
+	if n == 0 {
+		// Empty (but PRESENT) session transcript. Return a non-nil empty slice
+		// (NOT nil) so the caller can distinguish "0-message session, emit an
+		// empty batch so the client knows it loaded as empty" from "session
+		// gone (sm==nil), emit nothing." This matches the pre-windowing
+		// behavior where captureMessagesBatchLocked returned make([]MessageWithParts, 0, ...).
+		return []MessageWithParts{}, meta
+	}
+	if maxCount < 1 {
+		maxCount = 1 // always include at least the newest
+	}
+	// The newest message is ALWAYS in the window (even if oversized). Walk
+	// older messages newest-to-oldest, stopping at the first bound hit.
+	newest := list[n-1]
+	newestSize := messageSerializedBytes(newest)
+	accCap := maxCount
+	if n < accCap {
+		accCap = n
+	}
+	tail := make([]MessageWithParts, 0, accCap)
+	tail = append(tail, newest)
+	accumulated := newestSize
+	oldestID := messageIDFromInfo(newest.Info)
+
+	if newestSize > maxBytes {
+		// Oversized newest: return it ALONE. has_older reflects whether older
+		// messages exist beyond this one. The diagnostics let a client explain
+		// WHY it sees a single oversized item instead of the expected window.
+		meta.MessageCount = 1
+		meta.SerializedBytes = newestSize
+		meta.OldestLoadedID = oldestID
+		meta.HasOlder = n > 1
+		meta.OversizedItem = true
+		meta.ActualBytes = newestSize
+		meta.BudgetBytes = maxBytes
+		return tail, meta
+	}
+
+	countLimited := false
+	bytesLimited := false
+	for i := n - 2; i >= 0; i-- {
+		m := list[i]
+		size := messageSerializedBytes(m)
+		if len(tail)+1 > maxCount {
+			countLimited = true
+			break
+		}
+		if accumulated+size > maxBytes {
+			bytesLimited = true
+			break
+		}
+		tail = append(tail, m)
+		accumulated += size
+		oldestID = messageIDFromInfo(m.Info)
+	}
+	meta.MessageCount = len(tail)
+	meta.SerializedBytes = accumulated
+	meta.OldestLoadedID = oldestID
+	meta.HasOlder = countLimited || bytesLimited
+	meta.CountLimited = countLimited
+	meta.BytesLimited = bytesLimited
+	// tail was built newest-first; reverse to creation order (oldest first).
+	for i, j := 0, len(tail)-1; i < j; i, j = i+1, j-1 {
+		tail[i], tail[j] = tail[j], tail[i]
+	}
+	return tail, meta
 }
 
 // VerbFacet is the RAW current-activity primitive for a session — the tool name
@@ -2240,17 +2427,18 @@ func (s *Store) Snapshot(messagesFor map[string]bool) Snapshot {
 	}
 
 	snap := Snapshot{
-		Epoch:        epoch,
-		Seq:          seq,
-		Messages:     map[string][]MessageWithParts{},
-		Todos:        map[string]json.RawMessage{},
-		Permissions:  map[string][]json.RawMessage{},
-		Questions:    map[string][]json.RawMessage{},
-		Statuses:     map[string]json.RawMessage{},
-		Activity:     map[string]string{},
-		Gate:         map[string]GateFacts{},
-		LastAgents:   map[string]string{},
-		CurrentVerbs: map[string]VerbFacet{},
+		Epoch:          epoch,
+		Seq:            seq,
+		Messages:       map[string][]MessageWithParts{},
+		MessageWindows: map[string]WindowMeta{},
+		Todos:          map[string]json.RawMessage{},
+		Permissions:    map[string][]json.RawMessage{},
+		Questions:      map[string][]json.RawMessage{},
+		Statuses:       map[string]json.RawMessage{},
+		Activity:       map[string]string{},
+		Gate:           map[string]GateFacts{},
+		LastAgents:     map[string]string{},
+		CurrentVerbs:   map[string]VerbFacet{},
 	}
 
 	// Per-session gate facts + facets. Iterating the captured `sessions` map
@@ -2353,7 +2541,17 @@ func (s *Store) Snapshot(messagesFor map[string]bool) Snapshot {
 				Parts: parts,
 			})
 		}
-		snap.Messages[sid] = out
+		// Bound the per-session message list to the recent-window tail. Pure:
+		// operates on the already-materialized `out` (a private copy), no store
+		// access. Deterministic: same captured state → same bounded list + same
+		// WindowMeta, which is what preserves the pure-projection invariant
+		// (Snapshot never bumps msgRev, and the window adds no nondeterminism).
+		// The full list is materialized first (this is the status quo — the
+		// capture loop walks sm.order in full); the window bound is a WIRE/
+		// browser-memory fix, not a store-memory optimization.
+		bounded, meta := projectMessageWindow(out, windowMaxCount, windowMaxBytes)
+		snap.Messages[sid] = bounded
+		snap.MessageWindows[sid] = meta
 	}
 	return snap
 }
@@ -2893,12 +3091,19 @@ func (s *Store) reconcileMessagesLocked(sid string, list []MessageWithParts) (co
 // and bulletproofs any future in-place mutation. Returns a nil list when there
 // is no message state (e.g. an empty cold fetch, or the session was deleted
 // between reconcile and capture) — the caller treats nil as "nothing to emit".
-func (s *Store) captureMessagesBatchLocked(sid string) ([]MessageWithParts, uint64) {
+// The returned list is the BOUNDED recent-window tail (projectMessageWindow),
+// not the full transcript: the cold-load messages.batch ships only the initial
+// window, and older messages arrive via the historical HTTP page endpoint. The
+// returned WindowMeta describes the window (has_older, limits, oversized) so
+// packageMessagesBatch can carry it in the outer payload without decompression.
+// The revision token is still the FULL-state msgRev[sid] (the bound is pure and
+// deterministic, so the revision gate's equality check remains sound).
+func (s *Store) captureMessagesBatchLocked(sid string) ([]MessageWithParts, uint64, WindowMeta) {
 	sm := s.messages[sid]
 	if sm == nil {
-		return nil, s.msgRev[sid] // defensive: no message state (empty fetch / deleted)
+		return nil, s.msgRev[sid], WindowMeta{} // defensive: no message state (empty fetch / deleted)
 	}
-	list := make([]MessageWithParts, 0, len(sm.order))
+	full := make([]MessageWithParts, 0, len(sm.order))
 	for _, mid := range sm.order {
 		me := sm.byID[mid]
 		if me == nil {
@@ -2908,12 +3113,13 @@ func (s *Store) captureMessagesBatchLocked(sid string) ([]MessageWithParts, uint
 		for _, pid := range me.partOrder {
 			parts = append(parts, append([]byte(nil), me.parts[pid]...))
 		}
-		list = append(list, MessageWithParts{
+		full = append(full, MessageWithParts{
 			Info:  append([]byte(nil), me.info...),
 			Parts: parts,
 		})
 	}
-	return list, s.msgRev[sid]
+	bounded, meta := projectMessageWindow(full, windowMaxCount, windowMaxBytes)
+	return bounded, s.msgRev[sid], meta
 }
 
 // packageMessagesBatch performs the APPLICATION-COMPRESSED encoding of a
@@ -2926,7 +3132,7 @@ func (s *Store) captureMessagesBatchLocked(sid string) ([]MessageWithParts, uint
 // The payload shape (mirroring the SSE snapshot precedent at server.go:1075-1093,
 // which also marshals/compresses AFTER returning from the store lock):
 //
-//	{"sessionID": sid, "encoding":"gzip64", "data":"<base64-gzip>"}
+//	{"sessionID": sid, "encoding":"gzip64", "data":"<base64-gzip>", "window": {...}}
 //
 // sessionID stays PLAIN TEXT so payloadSessionID (store interest filter) and
 // sendable() (web egress filter) keep extracting it — replacing the whole
@@ -2936,7 +3142,11 @@ func (s *Store) captureMessagesBatchLocked(sid string) ([]MessageWithParts, uint
 // SSE data: fields are text/UTF-8 and raw gzip bytes are not valid UTF-8.
 // Always-compress policy (the batch only fires for cold-loads, which are
 // non-trivial by nature, so there is no small-payload case worth a threshold).
-func packageMessagesBatch(sid string, list []MessageWithParts) json.RawMessage {
+//
+// "window" carries the WindowMeta ALONGSIDE sessionID/encoding/data so a client
+// reads has_older / count / limits WITHOUT decompressing the gzip'd messages
+// array (decompression is the expensive step the window is meant to defer).
+func packageMessagesBatch(sid string, list []MessageWithParts, window WindowMeta) json.RawMessage {
 	if list == nil {
 		return nil
 	}
@@ -2967,10 +3177,11 @@ func packageMessagesBatch(sid string, list []MessageWithParts) json.RawMessage {
 		return nil
 	}
 	payload, err := json.Marshal(struct {
-		SessionID string `json:"sessionID"`
-		Encoding  string `json:"encoding"`
-		Data      string `json:"data"`
-	}{SessionID: sid, Encoding: "gzip64", Data: base64.StdEncoding.EncodeToString(buf.Bytes())})
+		SessionID string     `json:"sessionID"`
+		Encoding  string     `json:"encoding"`
+		Data      string     `json:"data"`
+		Window    WindowMeta `json:"window"`
+	}{SessionID: sid, Encoding: "gzip64", Data: base64.StdEncoding.EncodeToString(buf.Bytes()), Window: window})
 	if err != nil {
 		vhlog.Warn("messages.batch: marshal payload failed", "sessionID", sid, "err", err)
 		return nil
@@ -3058,7 +3269,7 @@ func (s *Store) publishColdBatch(sid string) ColdBatchStatus {
 	const maxColdBatchRetries = 8
 	for attempt := 0; attempt < maxColdBatchRetries; attempt++ {
 		s.mu.Lock()
-		list, rev := s.captureMessagesBatchLocked(sid)
+		list, rev, window := s.captureMessagesBatchLocked(sid)
 		s.mu.Unlock()
 
 		// Test seam: block here so a test can race a same-session mutation in
@@ -3076,7 +3287,7 @@ func (s *Store) publishColdBatch(sid string) ColdBatchStatus {
 			// gone (Finding 3).
 			return ColdBatchSessionGone
 		}
-		payload := packageMessagesBatch(sid, list)
+		payload := packageMessagesBatch(sid, list, window)
 		if payload == nil {
 			// Marshal/gzip failed (already logged). Do not emit a malformed
 			// batch; the client re-fetches on the next cold load.
@@ -3101,11 +3312,11 @@ func (s *Store) publishColdBatch(sid string) ColdBatchStatus {
 	// rather than emitting knowingly-stale data or skipping the batch).
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	list, _ := s.captureMessagesBatchLocked(sid)
+	list, _, window := s.captureMessagesBatchLocked(sid)
 	if list == nil {
 		return ColdBatchSessionGone
 	}
-	payload := packageMessagesBatch(sid, list)
+	payload := packageMessagesBatch(sid, list, window)
 	if payload == nil {
 		return ColdBatchPackagingFailed
 	}
