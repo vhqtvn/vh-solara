@@ -1,14 +1,19 @@
 import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { Portal } from "solid-js/web";
 import {
+  buildAggregatedSummary,
   buildSummary,
   fmtBytes,
   fmtBytesPctiles,
   fmtCountStats,
   fmtNum,
   fmtPctiles,
+  parseDiagView,
+  type AggregatedDiag,
   type DiagSnapshot,
+  type DiagView,
   type Histogram,
+  type WorkerInfo,
 } from "../lib/perfFormat";
 import { modal } from "../lib/a11y";
 import Icon from "./Icon";
@@ -33,12 +38,32 @@ import styles from "./PerformanceDialog.module.css";
 // per-dialog "auto-refresh 2s" toggle exists for live diagnosis, OFF on open.
 // Closing the dialog tears down the timer. No work happens in the streaming
 // path because of this dialog.
+//
+// TOPOLOGY: the dialog is project-decoupled — it lives at the app root via
+// the global perfDiagOpen signal (ui.ts) so switching projects never re-fetches
+// or re-mounts it. The single /vh/diag/latency endpoint serves two shapes
+// depending on which process the browser is talking to:
+//   • Controller topology: GET returns an AGGREGATED envelope — the
+//     controller's own snapshot + one snapshot per connected worker (keyed by
+//     worker ID), plus a failures map for workers that errored/timed out
+//     during fan-out, plus worker_info for human labels. The route is
+//     served by the controller's own aggregator even on per-worker
+//     subdomains (hostInterceptor carve-out — see pkg/server/daemon.go).
+//   • Direct topology (browser → worker, no controller): the worker serves
+//     its own snapshot in the LEGACY single-entity shape (started_at_ns +
+//     probes). The dialog detects the shape via the `workers` key (see
+//     isAggregated in perfFormat) and renders the single-entity view as a
+//     fallback — exactly the pre-aggregation behavior, so a direct-worker
+//     deployment is unchanged.
 
 const ENDPOINT = "/vh/diag/latency";
 const AUTO_REFRESH_MS = 2000;
 
 export default function PerformanceDialog(props: { onClose: () => void }) {
-  const [snap, setSnap] = createSignal<DiagSnapshot | null>(null);
+  // view() holds the parsed topology-aware view-model. The discriminant
+  // `kind` selects the rendering branch — "single" (direct topology) renders
+  // one entity; "aggregated" (controller) renders controller + per-worker.
+  const [view, setView] = createSignal<DiagView | null>(null);
   const [raw, setRaw] = createSignal<string>("");
   const [loading, setLoading] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
@@ -61,18 +86,23 @@ export default function PerformanceDialog(props: { onClose: () => void }) {
       const r = await fetch(ENDPOINT, { headers: { "X-VH-CSRF": "1" } });
       if (!r.ok) {
         setError(`HTTP ${r.status}`);
+        setView(null);
         return;
       }
       const text = await r.text();
       setRaw(text);
       try {
-        setSnap(JSON.parse(text) as DiagSnapshot);
+        // parseDiagView sniffs the response shape (aggregated envelope vs
+        // single snapshot) and returns the matching view-model. Throws on
+        // invalid JSON or unrecognized shape → "invalid JSON response" error.
+        setView(parseDiagView(text));
       } catch {
         setError("invalid JSON response");
-        setSnap(null);
+        setView(null);
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+      setView(null);
     } finally {
       setLoading(false);
     }
@@ -140,14 +170,17 @@ export default function PerformanceDialog(props: { onClose: () => void }) {
     }
   }
 
-  // Copy summary: the compact human-readable digest built by perfFormat. Falls
-  // back to the readonly textarea. The summary is staged into fallbackText —
-  // NOT raw() — so the verbatim server response (the source of truth for a
-  // later "Copy JSON") stays intact.
+  // Copy summary: the compact human-readable digest built by perfFormat. For
+  // the aggregated topology this spans controller + every worker; for the
+  // single topology it is the original single-snapshot digest. Falls back to
+  // the readonly textarea. The summary is staged into fallbackText — NOT
+  // raw() — so the verbatim server response (the source of truth for a later
+  // "Copy JSON") stays intact (the F1 invariant).
   async function copySummary() {
-    const s = snap();
-    if (!s) return;
-    const text = buildSummary(s);
+    const v = view();
+    if (!v) return;
+    const text =
+      v.kind === "aggregated" ? buildAggregatedSummary(v.agg) : buildSummary(v.snap);
     try {
       await navigator.clipboard.writeText(text);
       flash("summary");
@@ -208,7 +241,7 @@ export default function PerformanceDialog(props: { onClose: () => void }) {
                 type="button"
                 class={styles.btn}
                 onClick={copySummary}
-                disabled={!snap()}
+                disabled={!view()}
                 title="Copy a compact human-readable digest"
               >
                 <Icon name="clipboard" size={13} />
@@ -234,8 +267,8 @@ export default function PerformanceDialog(props: { onClose: () => void }) {
             <Show
               when={error()}
               fallback={
-                <Show when={snap()} fallback={<div class={styles.loading}>{loading() ? "Loading…" : "(no data)"}</div>}>
-                  {(s) => <Body snap={s()} />}
+                <Show when={view()} fallback={<div class={styles.loading}>{loading() ? "Loading…" : "(no data)"}</div>}>
+                  {(v) => <Body view={v()} />}
                 </Show>
               }
             >
@@ -272,11 +305,102 @@ export default function PerformanceDialog(props: { onClose: () => void }) {
 // labeled p50/p95/p99, and the latency-attribution discriminators the operator
 // cares about (yamux write-by-direction, ws_write mutex_wait vs write_msg) are
 // given their own rows rather than collapsed into a generic histogram table.
+//
+// Topology dispatch: Body takes the topology-aware view-model and renders
+// either a single SnapshotBody (direct topology) or an AggregatedBody
+// (controller topology). The diagnostic VALUE of the aggregated view is
+// per-worker detail — we deliberately DO NOT collapse workers into sums,
+// because "which worker is slow" is the question the operator is asking.
 
-function Body(props: { snap: DiagSnapshot }) {
-  const p = props.snap.probes;
+function Body(props: { view: DiagView }) {
+  // Plain if-branch: the parent <Show when={view()}>{(v) => <Body view={v()} />}</Show>
+  // uses the keyed-callback form, which re-creates Body whenever view() changes
+  // by reference (every refresh). So this discriminant read is re-evaluated
+  // fresh each refresh — no stale-branch risk. (Routing through <Show> here
+  // would lose TS's flow-narrowing of the discriminated union.)
+  if (props.view.kind === "single") {
+    return <SnapshotBody snap={props.view.snap} />;
+  }
+  return <AggregatedBody agg={props.view.agg} />;
+}
+
+// AggregatedBody renders the controller section first, then one section per
+// worker (in stable ID-sorted order so two successive snapshots diff cleanly).
+// Failures are surfaced as a small reason list near the top so a worker that
+// errored or timed out during fan-out is visible without scrolling through
+// every healthy worker's body. The aggregated body does NOT collapse worker
+// data — each worker keeps its full SnapshotBody so the operator can compare
+// per-worker latency attribution.
+function AggregatedBody(props: { agg: AggregatedDiag }) {
+  const workerIds = () => Object.keys(props.agg.workers ?? {}).sort();
+  const failureEntries = () => Object.entries(props.agg.failures ?? {});
   return (
     <div class={styles.body}>
+      <Show when={failureEntries().length > 0}>
+        <section class={`${styles.section} ${styles.failSection}`}>
+          <h3 class={styles.sectionTitle}>
+            Unreachable workers · {failureEntries().length}
+          </h3>
+          <For each={failureEntries()}>
+            {([id, reason]) => (
+              <div class={styles.rowline}>
+                <span class={styles.statLabel}>{id}</span>
+                <span class={styles.mono}>{reason}</span>
+              </div>
+            )}
+          </For>
+        </section>
+      </Show>
+
+      <Show
+        when={props.agg.controller}
+        fallback={
+          <section class={styles.section}>
+            <h3 class={styles.sectionTitle}>Controller</h3>
+            <div class={styles.rowline}>
+              <span class={styles.mono}>(controller snapshot unavailable)</span>
+            </div>
+          </section>
+        }
+      >
+        <EntityGroup title="Controller" snap={props.agg.controller as DiagSnapshot} />
+      </Show>
+
+      <For each={workerIds()}>
+        {(id) => (
+          <EntityGroup
+            title={entityTitle("Worker", id, props.agg.worker_info?.[id])}
+            snap={props.agg.workers[id]}
+          />
+        )}
+      </For>
+    </div>
+  );
+}
+
+// EntityGroup wraps one entity's SnapshotBody with a clear visual header so
+// the operator sees entity boundaries when scanning the dialog. The header
+// surfaces the worker name + id when available (worker_info); the SnapshotBody
+// renders the full per-probe card stack.
+function EntityGroup(props: { title: string; snap: DiagSnapshot }) {
+  return (
+    <div class={styles.entityGroup}>
+      <h3 class={styles.entityTitle}>{props.title}</h3>
+      <SnapshotBody snap={props.snap} />
+    </div>
+  );
+}
+
+function entityTitle(label: string, id?: string, info?: WorkerInfo): string {
+  if (info?.name && id) return `${label} · ${info.name} (${id})`;
+  if (id) return `${label} (${id})`;
+  return label;
+}
+
+function SnapshotBody(props: { snap: DiagSnapshot }) {
+  const p = props.snap.probes;
+  return (
+    <>
       <Section title="Ingest">
         <Stat label="events" value={fmtNum(props.snap.probes.ingest.events)} />
         <Stat label="bytes" value={fmtBytes(props.snap.probes.ingest.bytes)} />
@@ -369,7 +493,7 @@ function Body(props: { snap: DiagSnapshot }) {
           </Section>
         )}
       </For>
-    </div>
+    </>
   );
 }
 

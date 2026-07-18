@@ -2,6 +2,7 @@ package server
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -251,3 +252,106 @@ func (p *Proxy) runBidirectionalCopy(clientConn net.Conn, clientBuf *bufio.ReadW
 // Ensure bufio.ReadWriter satisfies io.Reader for io.Copy
 var _ io.Reader = (*bufio.ReadWriter)(nil)
 var _ net.Conn = (net.Conn)(nil)
+
+// FetchWorkerSnapshot fetches ONE worker's full /vh/diag/latency JSON through
+// the yamux tunnel, returning the verbatim body bytes. This is the production
+// per-worker fetcher for the controller's aggregated /vh/diag/latency handler
+// (see pkg/server/diag_aggregate.go).
+//
+// Unlike handleRawProxy (which HIJACKS the browser's ResponseWriter for chunk-
+// by-chunk streaming), this method does a clean buffered HTTP request/response
+// round-trip: open stream → RawProxy handshake → write HTTP GET → read full
+// HTTP response → return body. The worker's handleRawProxy (pkg/agent/daemon.go)
+// does the matching bidirectional copy between this yamux stream and its local
+// web server, so a complete request/response exchange works exactly as if the
+// controller had dialed the worker's web port directly.
+//
+// The ctx bounds the fetch; cancellation (e.g. the aggregator's per-worker
+// timeout) propagates through the yamux write/read to abort the round-trip. The
+// caller's per-worker timeout caps how long this can hold the global response.
+//
+// Returns:
+//   - body bytes (the worker's diag JSON) on HTTP 200
+//   - an error wrapping the worker ID + step + HTTP status / underlying cause
+//     otherwise (non-200, stream error, transport closed, ACK error)
+//
+// Probe accounting is DELIBERATELY omitted here: the aggregator is on-demand
+// only (no hot-path cost), and the existing handleRawProxy already attributes
+// stream-open / copy accounting to real user-driven requests. Adding the same
+// probes here would conflate operator-driven diag fan-out with real traffic in
+// Probe 4's histograms. The per-worker fetch's own latency surfaces as a
+// `failures` reason string if it times out, which is the right diagnostic.
+func (p *Proxy) FetchWorkerSnapshot(ctx context.Context, worker *Worker) ([]byte, error) {
+	if worker == nil {
+		return nil, fmt.Errorf("nil worker")
+	}
+	if worker.Transport == nil || worker.Transport.IsClosed() {
+		return nil, fmt.Errorf("worker %s: transport closed", worker.ID)
+	}
+
+	// Respect ctx before we even open a stream — covers the global-deadline
+	// branch in the aggregator when the fleet queues past the global timeout.
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("worker %s: %w", worker.ID, err)
+	}
+
+	stream, err := worker.Transport.OpenStream()
+	if err != nil {
+		return nil, fmt.Errorf("worker %s: open stream: %w", worker.ID, err)
+	}
+	defer stream.Close()
+
+	// RawProxy handshake — identical to handleRawProxy. Port=0 → worker's web
+	// port on the agent side (see pkg/agent/daemon.go handleRawProxy).
+	rawReq := tunnel.RawProxyMessage{
+		BaseMessage: tunnel.BaseMessage{Type: tunnel.TypeRawProxy},
+		Port:        0,
+	}
+	if err := stream.WriteJSON(rawReq); err != nil {
+		return nil, fmt.Errorf("worker %s: send raw-proxy: %w", worker.ID, err)
+	}
+	var ack tunnel.BaseMessage
+	if err := stream.ReadJSON(&ack); err != nil {
+		return nil, fmt.Errorf("worker %s: read ack: %w", worker.ID, err)
+	}
+	if ack.Type == tunnel.TypeError {
+		return nil, fmt.Errorf("worker %s: agent cannot proxy to local web port", worker.ID)
+	}
+
+	// Abort the write side if ctx elapses mid-request. yamux.Stream writes are
+	// not context-aware, so a goroutine closes the stream on ctx.Done to unblock
+	// a stuck write. The defer-Stop() below stops the watcher on normal return.
+	ctxStop := make(chan struct{})
+	defer close(ctxStop)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = stream.Close()
+		case <-ctxStop:
+		}
+	}()
+
+	// Write the HTTP request as raw bytes onto the stream. Connection: close so
+	// the worker's local web server closes the response after sending it, which
+	// lets http.ReadResponse terminate cleanly without a Content-Length sniff.
+	raw := stream.Raw()
+	reqLine := "GET /vh/diag/latency HTTP/1.1\r\nHost: " + worker.ID + "\r\nConnection: close\r\n\r\n"
+	if _, err := raw.Write([]byte(reqLine)); err != nil {
+		return nil, fmt.Errorf("worker %s: write request: %w", worker.ID, err)
+	}
+
+	br := bufio.NewReader(raw)
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		return nil, fmt.Errorf("worker %s: read response: %w", worker.ID, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("worker %s: HTTP %d", worker.ID, resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("worker %s: read body: %w", worker.ID, err)
+	}
+	return body, nil
+}

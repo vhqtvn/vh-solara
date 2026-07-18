@@ -413,4 +413,189 @@ describe("PerformanceDialog", () => {
       vi.useRealTimers();
     }
   });
+
+  // ── Global aggregated view (controller topology) ──────────────────────────
+  //
+  // When the controller serves /vh/diag/latency it returns an AGGREGATED
+  // envelope: controller's own snapshot + one snapshot per connected worker
+  // (keyed by worker ID) + failures + worker_info. The dialog must render a
+  // controller section AND a per-worker section so the operator can attribute
+  // latency to a specific worker (the diagnostic value — we deliberately do
+  // NOT collapse workers into sums). Failures surface as a visible block.
+
+  // A small per-entity snapshot with a distinctive started_at_ns so we can
+  // tell the bodies apart in the rendered DOM.
+  function miniSnap(startedAt: number, streamClass: string): any {
+    return {
+      started_at_ns: startedAt,
+      probes: {
+        ingest: { events: startedAt, bytes: 100, dispatch_dur: { count: 1, sum_ns: 1000, min_ns: 1000, max_ns: 1000, p50_ns: 1000, p95_ns: 1000, p99_ns: 1000, avg_ns: 1000 }, bytes_hist: { count: 1, sum_ns: 100, min_ns: 100, max_ns: 100, p50_ns: 100, p95_ns: 100, p99_ns: 100, avg_ns: 100 } },
+        emit: { class_count: {}, class_bytes: {}, source_count: {}, emit_age: { count: 0, sum_ns: 0, min_ns: 0, max_ns: 0, p50_ns: 0, p95_ns: 0, p99_ns: 0, avg_ns: 0 }, subscriber_drops: 0 },
+        stream: [{ class: streamClass, opens: 1, bytes: 10, writes: 1, flushes: 1, write_errors: 0, write_dur: { count: 1, sum_ns: 1000, min_ns: 1000, max_ns: 1000, p50_ns: 1000, p95_ns: 1000, p99_ns: 1000, avg_ns: 1000 }, flush_dur: { count: 0, sum_ns: 0, min_ns: 0, max_ns: 0, p50_ns: 0, p95_ns: 0, p99_ns: 0, avg_ns: 0 }, interarrival: { count: 0, sum_ns: 0, min_ns: 0, max_ns: 0, p50_ns: 0, p95_ns: 0, p99_ns: 0, avg_ns: 0 }, ping_dur: { count: 0, sum_ns: 0, min_ns: 0, max_ns: 0, p50_ns: 0, p95_ns: 0, p99_ns: 0, avg_ns: 0 }, snapshot_path: 0, replay_path: 0, snapshot_bytes: 0, disc_reason: {}, slow_writes: [], slow_flushes: [] }],
+        yamux: { streams_opened: 1, stream_open_fails: 0, active_streams: 0, open_dur: { count: 1, sum_ns: 1000, min_ns: 1000, max_ns: 1000, p50_ns: 1000, p95_ns: 1000, p99_ns: 1000, avg_ns: 1000 }, bytes_read: 100, write_by_dir: [], close_reason: {} },
+        ws_write: [],
+        copy: [],
+      },
+    };
+  }
+
+  it("renders the aggregated envelope (controller + per-worker, no collapse)", async () => {
+    const env = {
+      controller: miniSnap(111, "controller_tree"),
+      workers: {
+        w_east: miniSnap(222, "tree_east"),
+        w_west: miniSnap(333, "tree_west"),
+      },
+      failures: {},
+      worker_info: {
+        w_east: { name: "node-east", status: "online", version: "v1.0.0" },
+        w_west: { name: "node-west", status: "online" },
+      },
+    };
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(respJson(env))));
+
+    render(() => <PerformanceDialog onClose={() => {}} />);
+
+    // Entity titles render at the entity-group level. Controller has no id;
+    // workers carry "<name> (<id>)".
+    await waitFor(() => {
+      expect(document.body.textContent).toContain("Controller");
+      expect(document.body.textContent).toContain("Worker · node-east (w_east)");
+      expect(document.body.textContent).toContain("Worker · node-west (w_west)");
+    });
+
+    // Bodies are NOT collapsed — each entity's per-probe sections render
+    // independently so the operator can attribute latency to the right worker.
+    // The distinct stream classes prove each entity kept its own body.
+    expect(document.body.textContent).toContain("controller_tree");
+    expect(document.body.textContent).toContain("tree_east");
+    expect(document.body.textContent).toContain("tree_west");
+
+    // The distinct ingest event counts (= our started_at_ns placeholder) prove
+    // the bodies didn't get cross-wired or summed.
+    expect(document.body.textContent).toContain("111");
+    expect(document.body.textContent).toContain("222");
+    expect(document.body.textContent).toContain("333");
+  });
+
+  it("surfaces failures as an unreachable-workers block (no body for failed workers)", async () => {
+    const env = {
+      controller: miniSnap(111, "controller_tree"),
+      workers: { w_ok: miniSnap(222, "tree_ok") },
+      failures: { w_dead: "context deadline exceeded", w_gone: "transport closed" },
+      worker_info: { w_ok: { name: "alive", status: "online" }, w_dead: { name: "dead", status: "offline" } },
+    };
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(respJson(env))));
+
+    render(() => <PerformanceDialog onClose={() => {}} />);
+
+    await waitFor(() => {
+      // Failure block header names the count.
+      expect(document.body.textContent).toContain("Unreachable workers · 2");
+      // Each failure ID + reason is visible.
+      expect(document.body.textContent).toContain("w_dead");
+      expect(document.body.textContent).toContain("context deadline exceeded");
+      expect(document.body.textContent).toContain("w_gone");
+      expect(document.body.textContent).toContain("transport closed");
+    });
+
+    // The dead workers do NOT get a per-worker body section (they aren't in
+    // `workers`). Only the controller + the one healthy worker do.
+    expect(document.body.textContent).toContain("Worker · alive (w_ok)");
+    expect(document.body.textContent).not.toContain("Worker · dead (w_dead)");
+  });
+
+  it("Copy JSON copies the verbatim aggregated envelope (F1 across topologies)", async () => {
+    const writeText = vi.fn(async () => undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText },
+      configurable: true,
+      writable: true,
+    });
+    const env = {
+      controller: miniSnap(111, "controller_tree"),
+      workers: { w1: miniSnap(222, "tree_w1") },
+      failures: {},
+    };
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(respJson(env))));
+
+    render(() => <PerformanceDialog onClose={() => {}} />);
+    await waitFor(() => expect(document.body.textContent).toContain("Controller"));
+
+    const copyJsonBtn = Array.from(document.querySelectorAll("button")).find((b) =>
+      (b.textContent || "").includes("Copy JSON"),
+    );
+    copyJsonBtn!.click();
+    await waitFor(() => expect(writeText).toHaveBeenCalled());
+    // The verbatim envelope is copied — exact equality, no re-serialization or
+    // summary corruption (the F1 invariant must hold for the aggregated shape
+    // just as it did for the single shape).
+    expect(writeText.mock.calls[0][0]).toBe(JSON.stringify(env));
+  });
+
+  it("Copy summary builds the aggregated digest (controller + per-worker sections)", async () => {
+    const writeText = vi.fn(async () => undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText },
+      configurable: true,
+      writable: true,
+    });
+    const env = {
+      controller: miniSnap(111, "controller_tree"),
+      workers: { w1: miniSnap(222, "tree_w1") },
+      failures: { w2: "transport closed" },
+      worker_info: { w1: { name: "node-1", status: "online" } },
+    };
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(respJson(env))));
+
+    render(() => <PerformanceDialog onClose={() => {}} />);
+    await waitFor(() => expect(document.body.textContent).toContain("Controller"));
+
+    const copySummaryBtn = Array.from(document.querySelectorAll("button")).find((b) =>
+      (b.textContent || "").includes("Copy summary"),
+    );
+    copySummaryBtn!.click();
+    await waitFor(() => expect(writeText).toHaveBeenCalled());
+    const copied = writeText.mock.calls[0][0] as string;
+    // Aggregated digest markers — header, failure line, per-entity sections.
+    expect(copied).toContain("vh-solara latency diagnostics (aggregated)");
+    expect(copied).toContain("workers: 1 ok · 1 failed");
+    expect(copied).toContain("FAILED w2: transport closed");
+    expect(copied).toContain("=== controller ===");
+    expect(copied).toContain("=== worker === · node-1 (w1)");
+  });
+
+  it("renders the single-entity view when the response is NOT aggregated (direct-topology fallback)", async () => {
+    // The DIRECT topology (browser → worker, no controller) serves the LEGACY
+    // single-entity shape. The dialog MUST detect this and render the original
+    // single-entity view — same UX as pre-aggregation, no regression.
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(respJson(SNAP))));
+
+    render(() => <PerformanceDialog onClose={() => {}} />);
+
+    await waitFor(() => {
+      // The single-entity sections render — NO controller/worker grouping.
+      expect(document.body.textContent).toContain("Ingest");
+      expect(document.body.textContent).toContain("Stream · tree");
+    });
+    // No aggregated-view-only markers.
+    expect(document.body.textContent).not.toContain("Controller");
+    expect(document.body.textContent).not.toContain("Unreachable workers");
+    // No bare "Worker" entity title either.
+    expect(document.body.textContent).not.toMatch(/Worker\s+·|Worker\s+\(/);
+  });
+
+  it("treats an empty aggregated envelope as the aggregated view (not the fallback)", async () => {
+    // A controller with NO connected workers still serves the aggregated SHAPE
+    // — the topology is controller; the empty workers map is meaningful. The
+    // dialog must NOT confuse this for the direct-topology single shape.
+    const env = { controller: miniSnap(111, "controller_tree"), workers: {}, failures: {} };
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(respJson(env))));
+
+    render(() => <PerformanceDialog onClose={() => {}} />);
+    await waitFor(() => expect(document.body.textContent).toContain("Controller"));
+    // No worker sections (the map is empty), but the controller section + the
+    // aggregated rendering branch are still active.
+    expect(document.body.textContent).not.toContain("Worker (");
+  });
 });

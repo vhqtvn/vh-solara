@@ -114,6 +114,70 @@ export interface DiagSnapshot {
   };
 }
 
+// ── Aggregated wire types (mirror pkg/server/diag_aggregate.go) ──────────────
+//
+// When the dialog talks to the CONTROLLER, /vh/diag/latency returns an
+// aggregated envelope (controller's own snapshot + every connected worker's
+// snapshot, keyed by stable worker ID, plus a failures map for workers that
+// errored or timed out during fan-out, plus worker_info for human labels).
+// When the dialog talks to a DIRECT worker (no controller), /vh/diag/latency
+// returns the single-entity DiagSnapshot shape — the topology fallback.
+
+export interface WorkerInfo {
+  name: string;
+  status: string;
+  version?: string;
+}
+
+export interface AggregatedDiag {
+  // The controller's own diag snapshot. Null only if the controller itself
+  // failed to produce a snapshot (shouldn't happen in practice but defended).
+  controller: DiagSnapshot | null;
+  // Per-worker snapshots, keyed by stable worker ID. Workers that errored or
+  // timed out are NOT in this map — they are in `failures`.
+  workers: Record<string, DiagSnapshot>;
+  // Per-worker failure reasons (timeout, transport closed, bad HTTP status,
+  // etc). MUST NOT block the whole response — the aggregator serves 200 with
+  // whatever it collected.
+  failures: Record<string, string>;
+  // Optional human label info per worker ID (name, status, version). The
+  // dialog uses this to render "<name> (<id>)" instead of bare IDs. A worker
+  // may appear in worker_info WITHOUT appearing in workers (e.g. it was
+  // enumerated for fan-out but failed) — that's the normal case for failures.
+  worker_info?: Record<string, WorkerInfo>;
+}
+
+// Topology-aware view model. The dialog's `view()` signal holds one of these,
+// derived from JSON.parse of the raw response. `kind` discriminates the
+// rendering path so the Body never has to re-sniff the wire shape.
+export type DiagView =
+  | { kind: "single"; snap: DiagSnapshot }
+  | { kind: "aggregated"; agg: AggregatedDiag };
+
+// Detect the aggregated envelope by the `workers` key (the most reliable
+// marker — `controller` can be null and `failures` can be empty, but `workers`
+// is ALWAYS present in the aggregated shape, even if empty). Used to drive
+// the topology-detection branch in the dialog.
+export function isAggregated(x: unknown): x is AggregatedDiag {
+  if (!x || typeof x !== "object") return false;
+  return "workers" in (x as Record<string, unknown>);
+}
+
+// Parse a raw response string into a DiagView. Throws on invalid JSON or on
+// a shape that matches neither (so the caller can surface "invalid response"
+// exactly like the previous single-shape path). The single-shape branch is
+// the topology fallback — a direct-worker response renders as one entity.
+export function parseDiagView(text: string): DiagView {
+  const obj = JSON.parse(text);
+  if (isAggregated(obj)) return { kind: "aggregated", agg: obj };
+  // Single-shape: must look like a DiagSnapshot (have probes). If not, throw
+  // so the caller shows the existing "invalid JSON response" error row.
+  if (!obj || typeof obj !== "object" || !("probes" in obj)) {
+    throw new Error("unrecognized diagnostics response shape");
+  }
+  return { kind: "single", snap: obj as DiagSnapshot };
+}
+
 // ── Scalar formatters ────────────────────────────────────────────────────────
 
 // Nanoseconds → a tight human string. Picks the largest unit whose value is
@@ -312,6 +376,68 @@ export function buildSummary(snap: DiagSnapshot): string {
     push(`  bytes ${fmtBytes(c.bytes)}`);
     push(`  ${pctLine("dur", c.dur)}`);
     push(`  ${mapLine("term", c.term)}`);
+    push("");
+  }
+
+  return lines.join("\n").trimEnd();
+}
+
+// ── Aggregated "Copy summary" digest ─────────────────────────────────────────
+//
+// One digest spanning every entity (controller + each connected worker). Each
+// entity's section is rendered with a clear header so a reader scanning the
+// pasted text can attribute slowness to the right entity. Failures are
+// surfaced as a short list at the top so they aren't buried under all the
+// entity bodies. An empty fleet still names the controller so the digest is
+// self-describing about its topology.
+
+function entityHeader(label: string, id?: string, info?: WorkerInfo): string {
+  // "<label>" or "<label> · <name> (<id>)" when we have a human-friendly name.
+  // The id is always included (it's the stable identity the operator uses to
+  // drill into a specific worker).
+  if (info?.name && id) return `${label} · ${info.name} (${id})`;
+  if (id) return `${label} (${id})`;
+  return label;
+}
+
+export function buildAggregatedSummary(agg: AggregatedDiag): string {
+  if (!agg) return "(no diagnostics data)";
+  const lines: string[] = [];
+  const push = (s: string) => lines.push(s);
+
+  push("vh-solara latency diagnostics (aggregated)");
+  const widCount = Object.keys(agg.workers ?? {}).length;
+  const failCount = Object.keys(agg.failures ?? {}).length;
+  push(`workers: ${widCount} ok · ${failCount} failed`);
+  if (failCount > 0) {
+    for (const [id, reason] of Object.entries(agg.failures)) {
+      push(`  FAILED ${id}: ${reason}`);
+    }
+  }
+  push("");
+
+  // Controller section. Null controller is unusual but defended — surface a
+  // short marker instead of trying to render a non-existent snapshot.
+  if (agg.controller) {
+    push(entityHeader("=== controller ==="));
+    push(buildSummary(agg.controller));
+    push("");
+  } else {
+    push("=== controller ===");
+    push("(controller snapshot unavailable)");
+    push("");
+  }
+
+  // Per-worker sections in a STABLE order (sorted by worker ID) so two
+  // successive digests diff cleanly. Each worker that succeeded gets a full
+  // body; workers in worker_info that aren't in `workers` either failed
+  // (already listed at the top) or weren't reached — we don't double-print.
+  const ids = Object.keys(agg.workers ?? {}).sort();
+  for (const id of ids) {
+    const snap = agg.workers[id];
+    if (!snap) continue;
+    push(entityHeader("=== worker ===", id, agg.worker_info?.[id]));
+    push(buildSummary(snap));
     push("");
   }
 

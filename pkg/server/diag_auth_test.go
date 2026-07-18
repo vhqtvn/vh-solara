@@ -16,7 +16,10 @@ import (
 //
 //   - an UNAUTHENTICATED GET is rejected (the /vh/* path is an API request, so
 //     passphrase-mode issues a 401, not a login redirect);
-//   - an AUTHENTICATED GET returns 200 with a JSON diagnostic snapshot;
+//   - an AUTHENTICATED GET returns 200 with an AGGREGATED JSON envelope (the
+//     global view: controller snapshot + per-worker map + failures map); the
+//     controller's own snapshot is now nested under "controller" rather than
+//     at the top level (see pkg/server/diag_aggregate.go);
 //   - an unsafe method (POST) — even authenticated — is rejected with 405
 //     (the route is registered GET-only via Go 1.22 method patterns);
 //   - the ONLY auth exemption on the edge remains /vh/healthz (cross-checked
@@ -33,6 +36,12 @@ func TestDiagLatencyRouteAuthChainController(t *testing.T) {
 		t.Fatalf("auth.New: %v", err)
 	}
 	d.Auth = a
+	// Inject a no-op fetcher so the aggregator does not try to reach the
+	// (non-existent) yamux transport; this test pins auth/method semantics, not
+	// the fan-out merge shape (that lives in diag_aggregate_test.go).
+	d.fetchWorkerDiag = func(ctx context.Context, worker *Worker) ([]byte, error) {
+		return nil, nil
+	}
 	h := d.buildRootHandler()
 	session := loginPassphrase(t, h, "secret")
 
@@ -47,7 +56,11 @@ func TestDiagLatencyRouteAuthChainController(t *testing.T) {
 		t.Fatalf("unauthenticated GET /vh/diag/latency: want 401 (API path challenge), got %d", rec.Code)
 	}
 
-	// 2. Authenticated GET → 200 JSON snapshot.
+	// 2. Authenticated GET → 200 aggregated envelope. The controller's own
+	// snapshot is nested under "controller" with its own "probes" key; the
+	// "workers" and "failures" maps are present (possibly empty when no workers
+	// are connected). Verifying this nested shape guards against accidental
+	// reversion to the legacy single-snapshot response.
 	rec2 := httptest.NewRecorder()
 	req2 := httptest.NewRequest(http.MethodGet, "/vh/diag/latency", nil)
 	req2.AddCookie(session)
@@ -58,12 +71,22 @@ func TestDiagLatencyRouteAuthChainController(t *testing.T) {
 	if ct := rec2.Header().Get("Content-Type"); ct != "application/json" {
 		t.Fatalf("authenticated GET /vh/diag/latency: want Content-Type application/json, got %q", ct)
 	}
-	var snap map[string]any
-	if err := json.Unmarshal(rec2.Body.Bytes(), &snap); err != nil {
+	var env map[string]any
+	if err := json.Unmarshal(rec2.Body.Bytes(), &env); err != nil {
 		t.Fatalf("authenticated GET /vh/diag/latency: body is not valid JSON: %v (body=%q)", err, rec2.Body.String())
 	}
-	if _, ok := snap["probes"]; !ok {
-		t.Fatalf("authenticated GET /vh/diag/latency: JSON missing top-level \"probes\" field (body=%q)", rec2.Body.String())
+	controller, ok := env["controller"].(map[string]any)
+	if !ok {
+		t.Fatalf("authenticated GET /vh/diag/latency: JSON missing nested \"controller\" object (body=%q)", rec2.Body.String())
+	}
+	if _, ok := controller["probes"]; !ok {
+		t.Fatalf("authenticated GET /vh/diag/latency: controller object missing \"probes\" field (body=%q)", rec2.Body.String())
+	}
+	if _, ok := env["workers"]; !ok {
+		t.Fatalf("authenticated GET /vh/diag/latency: aggregated envelope missing \"workers\" field (body=%q)", rec2.Body.String())
+	}
+	if _, ok := env["failures"]; !ok {
+		t.Fatalf("authenticated GET /vh/diag/latency: aggregated envelope missing \"failures\" field (body=%q)", rec2.Body.String())
 	}
 
 	// 3. Unsafe method (POST) — even authenticated — → 405. The route is

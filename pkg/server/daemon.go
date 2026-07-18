@@ -13,7 +13,6 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/vhqtvn/vh-solara/pkg/auth"
-	diag "github.com/vhqtvn/vh-solara/pkg/diagnostics"
 	"github.com/vhqtvn/vh-solara/pkg/tunnel"
 )
 
@@ -45,6 +44,12 @@ type Daemon struct {
 
 	updateMu  sync.Mutex
 	updateLog strings.Builder
+
+	// fetchWorkerDiag, when non-nil, overrides the production per-worker diag
+	// fetcher used by handleDiagAggregate. Tests set this to inject a fake
+	// (no real yamux session required). nil in production — handleDiagAggregate
+	// then falls back to d.Proxy.FetchWorkerSnapshot.
+	fetchWorkerDiag workerDiagFetcher
 }
 
 // NewDaemon initialises a new server daemon.
@@ -110,12 +115,19 @@ func (d *Daemon) buildRootHandler() http.Handler {
 	userMux.HandleFunc("POST /api/workers/{id}/kill", d.handleKillWorker)
 	userMux.HandleFunc("GET /{$}", d.handleUIPage)
 
-	// Latency diagnostics (Probes 4/5-server/6 on the controller edge).
-	// GET-only read-only JSON snapshot — mirrors pkg/web's /vh/diag/latency.
+	// Latency diagnostics — AGGREGATED global view. The controller merges its
+	// own probes (diag.Default) with every connected worker's snapshot fetched
+	// through the yamux tunnel, returning one envelope so the SPA's Performance
+	// dialog shows the whole fleet from any host (controller dashboard or any
+	// worker subdomain). See pkg/server/diag_aggregate.go for the schema,
+	// bounded fan-out, and per-worker timeout invariants.
+	//
 	// Auth-gated by Auth.Middleware (the whole userMux chain is wrapped at the
 	// bottom of buildRootHandler). GET-only so NO X-VH-CSRF exception is needed
 	// (csrfGuard below only enforces the header on unsafe methods under /api/).
-	userMux.HandleFunc("GET /vh/diag/latency", diag.Handler().ServeHTTP)
+	// hostInterceptor special-cases this path to fall through to userMux even on
+	// a worker subdomain, so the aggregator wins over the per-worker proxy.
+	userMux.HandleFunc("GET /vh/diag/latency", d.handleDiagAggregate)
 
 	// Cross-worker coordination API (A3) — its own mux, gated by a bearer token
 	// and matched BEFORE session auth (headless, non-browser client).
@@ -211,6 +223,21 @@ func (d *Daemon) hostInterceptor(pattern *regexp.Regexp, next http.Handler) http
 		// Strip port if present
 		if idx := strings.Index(host, ":"); idx != -1 {
 			host = host[:idx]
+		}
+
+		// Route precedence: the aggregated /vh/diag/latency is CONTROLLER-OWNED
+		// and must be served by the aggregator even when the browser's host is a
+		// per-worker subdomain (e.g. "workerID.controller.example.com"). Without
+		// this carve-out the hostInterceptor would proxy the request down to that
+		// worker, returning a single-worker snapshot and forcing the operator to
+		// re-fetch per project. Falling through to `next` (the userMux chain)
+		// serves the global aggregator regardless of host. Per-worker
+		// /vh/diag/latency remains reachable on the worker for the aggregator's
+		// own fan-out (which goes through the tunnel via Proxy.FetchWorkerSnapshot,
+		// not through this hostInterceptor).
+		if r.URL.Path == "/vh/diag/latency" {
+			next.ServeHTTP(w, r)
+			return
 		}
 
 		matches := pattern.FindStringSubmatch(host)

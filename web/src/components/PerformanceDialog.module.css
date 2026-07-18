@@ -99,6 +99,37 @@
   padding: 2px;
 }
 
+/* Entity group: when the dialog renders the aggregated view (controller +
+ * per-worker), each entity is wrapped in one of these so the operator sees
+ * a clear visual boundary between the controller body and each worker body.
+ * The body is the scroll container; this wrapper is plain block layout with
+ * NO mask-image/backdrop-filter/contain/content-visibility (see the WebRender
+ * note at the top of this file — adding them here pins the GPU on scroll). */
+.entityGroup {
+  margin-bottom: 14px;
+  padding: 4px 2px 2px;
+  border-top: 1px solid var(--border);
+}
+.entityGroup:first-child {
+  border-top: none;
+  padding-top: 0;
+}
+.entityTitle {
+  margin: 0 0 6px;
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--fg-strong);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+/* Unreachable-workers block (the aggregated `failures` map). Kept visually
+ * distinct from the per-entity cards (warn-tinted border) so the operator can
+ * see at a glance which workers errored or timed out during fan-out. */
+.failSection {
+  border-color: var(--warn, var(--border));
+}
+
 .section {
   border: 1px solid var(--border);
   border-radius: 8px;

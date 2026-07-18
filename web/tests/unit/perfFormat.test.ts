@@ -1,6 +1,7 @@
 // Unit tests for perfFormat (pure functions; node env, no jsdom needed).
 import { describe, expect, it } from "vitest";
 import {
+  buildAggregatedSummary,
   buildSummary,
   fmtBytes,
   fmtBytesPctiles,
@@ -10,6 +11,9 @@ import {
   fmtNum,
   fmtPctiles,
   histEmpty,
+  isAggregated,
+  parseDiagView,
+  type AggregatedDiag,
   type DiagSnapshot,
   type Histogram,
 } from "../../src/lib/perfFormat";
@@ -265,5 +269,162 @@ describe("buildSummary", () => {
     // count=500 sum=1500 min=1 max=8 → avg=3.
     expect(out).toContain("active_streams_at_write: n=500 min=1 max=8 avg=3");
     expect(out).not.toMatch(/active_streams_at_write:[^\n]*(ns|µs|ms|p50|p95|p99)/);
+  });
+});
+
+// ── Aggregated wire-shape helpers (isAggregated + parseDiagView + buildAggregatedSummary) ──
+
+describe("isAggregated + parseDiagView (topology detection)", () => {
+  it("recognizes the aggregated envelope by the `workers` key", () => {
+    expect(isAggregated({ controller: null, workers: {}, failures: {} })).toBe(true);
+    expect(isAggregated({ controller: { started_at_ns: 1, probes: {} }, workers: { w1: {} }, failures: {} })).toBe(true);
+    // Empty `workers` map still counts as aggregated (the topology marker is
+    // the field's presence, not its contents — a controller with no workers
+    // still serves the aggregated shape).
+    expect(isAggregated({ controller: null, workers: {}, failures: {}, worker_info: {} })).toBe(true);
+  });
+
+  it("rejects the single-shape (direct topology) and garbage inputs", () => {
+    expect(isAggregated({ started_at_ns: 1, probes: {} })).toBe(false);
+    expect(isAggregated(null)).toBe(false);
+    expect(isAggregated(undefined)).toBe(false);
+    expect(isAggregated("not an object")).toBe(false);
+    expect(isAggregated({})).toBe(false);
+  });
+
+  it("parseDiagView routes the aggregated envelope to kind=aggregated", () => {
+    const env = {
+      controller: { started_at_ns: 1, probes: {} },
+      workers: { w1: { started_at_ns: 2, probes: {} } },
+      failures: { w2: "transport closed" },
+      worker_info: { w1: { name: "node-1", status: "online", version: "v1.0.0" } },
+    };
+    const v = parseDiagView(JSON.stringify(env));
+    expect(v.kind).toBe("aggregated");
+    if (v.kind === "aggregated") {
+      expect(v.agg.workers.w1.started_at_ns).toBe(2);
+      expect(v.agg.failures.w2).toBe("transport closed");
+      expect(v.agg.worker_info?.w1.name).toBe("node-1");
+    }
+  });
+
+  it("parseDiagView routes the single-shape (direct topology) to kind=single", () => {
+    const v = parseDiagView(JSON.stringify({ started_at_ns: 99, probes: {} }));
+    expect(v.kind).toBe("single");
+    if (v.kind === "single") {
+      expect(v.snap.started_at_ns).toBe(99);
+    }
+  });
+
+  it("parseDiagView throws on invalid JSON", () => {
+    expect(() => parseDiagView("not json")).toThrow();
+  });
+
+  it("parseDiagView throws on an unrecognized shape (neither aggregated nor single)", () => {
+    // An object without `workers` AND without `probes` — neither topology.
+    expect(() => parseDiagView(JSON.stringify({ foo: "bar" }))).toThrow();
+  });
+});
+
+describe("buildAggregatedSummary", () => {
+  function miniSnap(startedAt: number, events: number): DiagSnapshot {
+    return {
+      started_at_ns: startedAt,
+      probes: {
+        ingest: {
+          events,
+          bytes: 4096,
+          dispatch_dur: hist({ count: events }),
+          bytes_hist: hist({ count: events }),
+        },
+        emit: {
+          class_count: {}, class_bytes: {}, source_count: {},
+          emit_age: hist(), subscriber_drops: 0,
+        },
+        stream: [],
+        yamux: {
+          streams_opened: 0, stream_open_fails: 0, active_streams: 0,
+          open_dur: hist(), bytes_read: 0, write_by_dir: [], close_reason: {},
+        },
+        ws_write: [],
+        copy: [],
+      },
+    };
+  }
+
+  it("returns a placeholder for null input", () => {
+    expect(buildAggregatedSummary(null as unknown as AggregatedDiag)).toBe("(no diagnostics data)");
+  });
+
+  it("emits the aggregated header with worker/failure counts", () => {
+    const agg: AggregatedDiag = {
+      controller: miniSnap(100, 10),
+      workers: { w1: miniSnap(200, 20), w2: miniSnap(300, 30) },
+      failures: { w3: "context deadline exceeded" },
+    };
+    const out = buildAggregatedSummary(agg);
+    expect(out).toContain("vh-solara latency diagnostics (aggregated)");
+    expect(out).toContain("workers: 2 ok · 1 failed");
+    expect(out).toContain("FAILED w3: context deadline exceeded");
+  });
+
+  it("renders a section per entity (controller + each worker) with full bodies", () => {
+    const agg: AggregatedDiag = {
+      controller: miniSnap(100, 10),
+      workers: { w1: miniSnap(200, 20), w2: miniSnap(300, 30) },
+      failures: {},
+      worker_info: {
+        w1: { name: "node-east", status: "online", version: "v1.0.0" },
+        w2: { name: "node-west", status: "online" },
+      },
+    };
+    const out = buildAggregatedSummary(agg);
+
+    // Controller section.
+    expect(out).toContain("=== controller ===");
+    expect(out).toContain("started_at_ns: 100");
+
+    // Worker sections — sorted by ID (w1 before w2). Each section carries the
+    // human name + the stable ID so an operator can attribute latency.
+    const w1Idx = out.indexOf("=== worker === · node-east (w1)");
+    const w2Idx = out.indexOf("=== worker === · node-west (w2)");
+    expect(w1Idx).toBeGreaterThan(-1);
+    expect(w2Idx).toBeGreaterThan(-1);
+    expect(w1Idx).toBeLessThan(w2Idx); // stable sort by worker ID
+    expect(out).toContain("started_at_ns: 200");
+    expect(out).toContain("started_at_ns: 300");
+  });
+
+  it("falls back to bare IDs when worker_info is missing", () => {
+    const agg: AggregatedDiag = {
+      controller: miniSnap(100, 10),
+      workers: { lonely: miniSnap(200, 20) },
+      failures: {},
+    };
+    const out = buildAggregatedSummary(agg);
+    expect(out).toContain("=== worker === (lonely)");
+  });
+
+  it("handles a null controller (rare but defended) without crashing", () => {
+    const agg: AggregatedDiag = {
+      controller: null,
+      workers: { w1: miniSnap(200, 20) },
+      failures: {},
+    };
+    const out = buildAggregatedSummary(agg);
+    expect(out).toContain("=== controller ===");
+    expect(out).toContain("(controller snapshot unavailable)");
+    expect(out).toContain("=== worker === (w1)");
+  });
+
+  it("handles an empty fleet (controller only, no workers, no failures)", () => {
+    const agg: AggregatedDiag = {
+      controller: miniSnap(100, 10),
+      workers: {},
+      failures: {},
+    };
+    const out = buildAggregatedSummary(agg);
+    expect(out).toContain("workers: 0 ok · 0 failed");
+    expect(out).toContain("=== controller ===");
   });
 });
