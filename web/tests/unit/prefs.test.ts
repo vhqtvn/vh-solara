@@ -72,3 +72,65 @@ describe("perfDiagEnabled defaults to OFF from cleared storage", () => {
     expect(localStorage.getItem("vh.prefs.perfDiagEnabled.v1")).toBeNull();
   });
 });
+
+// The operator's intent for perfDiagEnabled is "diagnostic logs should be global,
+// not per project" — the setting MUST survive both a browser process restart
+// AND a project switch. These tests lock in that contract: the storage key is a
+// fixed global constant (not derived from any project), the value re-hydrates
+// from localStorage on module re-init (browser restart analog), and the signal
+// is a module-level singleton so an in-app project switch — which never
+// re-imports the prefs module — cannot reset it.
+describe("perfDiagEnabled is global and durable", () => {
+  const KEY = "vh.prefs.perfDiagEnabled.v1";
+
+  beforeEach(() => {
+    localStorage.clear();
+    vi.resetModules();
+  });
+
+  it("writes to a fixed (non-project-scoped) localStorage key on enable", async () => {
+    const { setPerfDiagEnabled } = await import("../../src/prefs");
+    setPerfDiagEnabled(true);
+    // The key must be a constant global string — it must NOT embed a project
+    // directory/id that would change when the user selects a different project.
+    expect(localStorage.getItem(KEY)).toBe(JSON.stringify({ v: 1, data: true }));
+    // And it is the ONLY vh.prefs key written for this pref (no project-suffixed
+    // variant exists alongside it).
+    const allKeys = Object.keys(localStorage).filter((k) => k.startsWith("vh.prefs."));
+    expect(allKeys).toContain(KEY);
+    expect(allKeys.filter((k) => k.includes("perfDiag"))).toEqual([KEY]);
+  });
+
+  it("survives a browser restart (module re-import re-hydrates from storage)", async () => {
+    const { setPerfDiagEnabled } = await import("../../src/prefs");
+    setPerfDiagEnabled(true);
+    // Simulate a browser process restart: drop the module cache so the signal's
+    // initial hydration runs again against the persisted localStorage value.
+    // localStorage persists across page loads (same origin); only the in-memory
+    // JS module state is gone.
+    vi.resetModules();
+    const fresh = await import("../../src/prefs");
+    expect(fresh.perfDiagEnabled()).toBe(true);
+  });
+
+  it("survives a project switch (the signal is a module-level singleton, not re-hydrated per project)", async () => {
+    // Enable the setting while "project A" is active.
+    const mod1 = await import("../../src/prefs");
+    mod1.setPerfDiagEnabled(true);
+    expect(mod1.perfDiagEnabled()).toBe(true);
+
+    // A project switch in the app is an in-app SPA navigation — it does NOT
+    // reload the page and does NOT re-import the prefs module (ESM caches it).
+    // So the same in-memory signal is still in scope. Simulate that by importing
+    // the module a second time WITHOUT resetModules: ESM returns the cached
+    // module namespace, so both import sites share one signal.
+    const mod2 = await import("../../src/prefs");
+    expect(mod2.perfDiagEnabled()).toBe(true);
+    // Prove they are the same signal: toggling via one site is visible at the
+    // other, and the underlying storage key is unchanged (still no project
+    // component).
+    mod2.setPerfDiagEnabled(false);
+    expect(mod1.perfDiagEnabled()).toBe(false);
+    expect(localStorage.getItem(KEY)).toBe(JSON.stringify({ v: 1, data: false }));
+  });
+});
