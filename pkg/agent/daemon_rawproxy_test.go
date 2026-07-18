@@ -103,7 +103,7 @@ func workerClientActiveStreamsAtWrite(t *testing.T) (count, max int64) {
 	var snap struct {
 		Probes struct {
 			WSWrite []struct {
-				Side string `json:"side"`
+				Side                 string `json:"side"`
 				ActiveStreamsAtWrite struct {
 					Count int64 `json:"count"`
 					Max   int64 `json:"max_ns"`
