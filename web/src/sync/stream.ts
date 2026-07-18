@@ -89,8 +89,12 @@ export function epochChanged(prevEpoch: string, incomingEpoch: string): boolean 
 // endpoint (Phase 2). Single-flight per session (one in-flight page at a time,
 // mirroring aggregator.msgInflight); Contract-B conditional-freshness via the
 // `dirty` mirror flag (client-side analog of the server's
-// me.liveTouchedBody/me.liveTouchedParts) — discard-and-refetch on ANY session
-// mutation during the page flight. Live state always wins.
+// me.liveTouchedBody/me.liveTouchedParts) — discard-and-refetch ONLY for
+// resurrection-class mutations during the page flight (deletions + wholesale
+// cache replace). Live state always wins. The dirty trigger is NARROW — see
+// isPageDirtyingKind for the rationale (live upserts cannot resurrect a stale
+// page because the merge is insert-if-not-present, so they are deliberately
+// excluded to keep Load-older usable on actively-streaming sessions).
 
 // pageInFlight: per-session in-flight historical-page request. Module-level
 // (transport state, NOT store state — the store carries only the
@@ -111,15 +115,15 @@ const pageInFlight = new Map<
 // request (per-request fallback — no unbounded memory, no resurrection). The
 // user can click Load-older again to re-issue.
 //
-// Known limitation under active streaming: for a session whose assistant turn
-// is emitting part.upsert at a high rate (typical assistant response), each
-// mutation during a page flight marks the page dirty. With MAX_PAGE_RETRIES=3
-// the Load-older request will typically exhaust its retry budget and abandon
-// with no merge — the user sees the spinner cycle ~3 fetch-roundtrips then
-// disappear. This is a deliberate consequence of the "live always wins"
-// contract: a page snapshot that raced N consecutive mutations is stale and
-// must not be applied. The user should wait for the turn to finish and click
-// Load older again. Not a correctness bug — the cap bounds fetch amplification.
+// The dirty trigger fires ONLY for resurrection-class mutations
+// (message.delete / part.delete / messages.batch — see isPageDirtyingKind).
+// Live token streaming (part.upsert floods during an assistant turn) does NOT
+// mark the page dirty, because prependMessagesIfAbsent's insert-if-not-present
+// merge makes live always wins without discarding the page. Abandonment under
+// active streaming was the pre-narrowing bug — it is now unreachable on the
+// streaming hot path; the cap bounds fetch amplification only in the rare
+// genuine concurrent-deletion-during-flight case (rapid message churn while the
+// user clicks Load older), which is the intended safety bound.
 const MAX_PAGE_RETRIES = 3;
 
 // Resident-cache soft caps. After each page merge, if EITHER cap is exceeded,
@@ -225,8 +229,9 @@ export async function loadOlder(sid: string): Promise<void> {
   //     invalidate a per-session historical page; an explicit cursor check
   //     would spuriously discard valid pages. The Contract-B anti-clobber
   //     mechanism for cursor-advancing mutations on THIS session is the
-  //     markPageDirty hook (set on every Stream2 message.*/part.*/messages.batch
-  //     event for the session — step 3 of the gate). Retained on the flight
+  //     markPageDirty hook (set on Stream2 resurrection-class events only —
+  //     message.delete / part.delete / messages.batch — see
+  //     isPageDirtyingKind; step 3 of the gate). Retained on the flight
   //     object per the mission spec (`pageInFlight = { requestSeq: s.cursor,
   //     dirty: boolean }`) for diagnostics + future cursor-based prefetch.
   const flight = {
@@ -285,11 +290,13 @@ async function runPageFetchLoop(
       return;
     }
     // Step 3: discard + bounded retry if dirty. The dirty flag is set by the
-    // Stream2 listener hook (markPageDirty) on ANY message.*/part.*/messages.*
-    // event for this session while the page was in flight. This is the
-    // Contract-B client mirror of the server's me.liveTouchedBody/Parts — live
-    // state always wins, so a page that raced a mutation is stale and must be
-    // refetched.
+    // Stream2 listener hook (markPageDirty) ONLY for resurrection-class
+    // mutation events (message.delete / part.delete / messages.batch) for this
+    // session while the page was in flight — see isPageDirtyingKind for the
+    // rationale (live upserts cannot resurrect a stale page because the merge
+    // is insert-if-not-present). This is the Contract-B client mirror of the
+    // server's me.liveTouchedBody/Parts — live state always wins, so a page
+    // that raced a resurrection-class mutation is stale and must be refetched.
     if (flight.dirty) {
       if (flight.retries < MAX_PAGE_RETRIES) {
         flight.retries++;
@@ -313,20 +320,59 @@ async function runPageFetchLoop(
   }
 }
 
-// markPageDirty — the Stream2 listener hook calls this on a MUTATION event for
-// a session that has a page in flight: kind ∈ {message.upsert, message.delete,
-// part.upsert, part.delete, messages.batch}. messages.loaded/messages.error
-// are NOT mutations (don't change messages[sid] content) so they are excluded
-// — see the hook site at the Stream2 listener body for the kind filter.
-// Mirrors the server's me.liveTouchedBody/me.liveTouchedParts
-// (pkg/state/store.go): a mutation during the flight invalidates the page's
-// point-in-time snapshot, so the response gate discards + retries.
+// markPageDirty — the Stream2 listener hook calls this on a resurrection-class
+// mutation event for a session that has a page in flight (see
+// isPageDirtyingKind for the kind filter). Mirrors the server's
+// me.liveTouchedBody/me.liveTouchedParts (pkg/state/store.go): a resurrection-
+// class mutation during the flight invalidates the page's point-in-time
+// snapshot, so the response gate discards + retries.
+//
 // Exported for testability — the production caller is the Stream2 listener
-// hook in this file; tests call it directly to simulate a concurrent mutation
-// without a full SSE setup.
+// hook in this file (gated by isPageDirtyingKind); tests call it directly to
+// simulate a concurrent mutation without a full SSE setup.
 export function markPageDirty(sid: string) {
   const f = pageInFlight.get(sid);
   if (f) f.dirty = true;
+}
+
+// isPageDirtyingKind — the narrow resurrection-class kind filter for the
+// Stream2 listener's markPageDirty hook. Returns true ONLY for mutation kinds
+// that could make a stale in-flight page resurrect a message the live state
+// has removed:
+//
+//   - message.delete: a page captured before the delete would re-insert the
+//     deleted message by ID (prependMessagesIfAbsent inserts absent ids).
+//   - part.delete:    a page captured before the part delete would re-insert
+//     the message with the deleted part still present.
+//   - messages.batch: wholesale-replaces the resident cache; a stale page
+//     merged after the replace could resurrect messages the batch removed.
+//
+// The kinds FALSE here are safe to skip because the merge is INSERT-IF-NOT-
+// PRESENT (live always wins, never overwrites):
+//
+//   - message.upsert (NEW tail): newer than the `before` cursor → NOT in the
+//     page range. The page cannot contain it. Live delta already applied.
+//   - message.upsert (EXISTING): prependMessagesIfAbsent skips resident ids.
+//   - part.upsert (EXISTING — token streaming): upsertPart Object.assigns into
+//     the live part; the page merge skips the resident parent message.
+//   - part.upsert (NEW tail placeholder): newer than `before` → NOT in page
+//     range.
+//   - messages.loaded / messages.error: reveal-gate flips + cold-batch error
+//     reports — do NOT change messages[sid] content; marking dirty would waste
+//     a retry cycle.
+//
+// The narrow filter is what makes Load-older usable on actively-streaming
+// sessions: a part.upsert flood (one event per streamed token) used to mark
+// the page dirty on every token, exhaust MAX_PAGE_RETRIES, and abandon with no
+// merge + no user feedback. With the narrow filter, abandonment is unreachable
+// on the streaming hot path and fires only on the rare genuine concurrent-
+// deletion-during-flight case (the intended safety bound).
+//
+// Exported for testability — the production caller is the Stream2 listener
+// hook in this file; tests assert the kind filter directly + simulate the
+// listener call site's pattern (if (isPageDirtyingKind(kind)) markPageDirty(sid)).
+export function isPageDirtyingKind(kind: string): boolean {
+  return kind === "message.delete" || kind === "part.delete" || kind === "messages.batch";
 }
 
 // applyPageMerge — the clean-response merge. Inserts page messages that are NOT
@@ -1740,27 +1786,32 @@ export function openSessionStream(id: string, force = false) {
           return;
         }
 
-        // Phase 4 — historical-page dirty-mirror hook. Any MUTATION event
-        // (message.upsert/message.delete/part.upsert/part.delete/messages.batch)
-        // for a session with an in-flight historical page marks that page dirty
-        // so the response gate (runPageFetchLoop) discards + retries. This is
-        // the client mirror of the server's me.liveTouchedBody/me.liveTouchedParts
-        // (pkg/state/store.go) — live state always wins, so a page snapshot that
-        // raced a mutation is stale. messages.loaded/messages.error are NOT
-        // mutations (they're reveal-gate flips + cold-batch error reports) and
-        // are excluded — marking dirty on them would waste a retry cycle for an
-        // event that did not change messages[sid] content. Placed AFTER the
-        // gen+epoch re-checks so a superseded connection or a gate activation
-        // during the snapshot-decode await does NOT mark a page dirty for a
-        // connection/gate the page no longer belongs to.
-        if (
-          sid &&
-          (kind === "message.upsert" ||
-            kind === "message.delete" ||
-            kind === "part.upsert" ||
-            kind === "part.delete" ||
-            kind === "messages.batch")
-        ) {
+        // Phase 4 — historical-page dirty-mirror hook. Mark the in-flight
+        // historical page dirty ONLY for resurrection-class mutations
+        // (message.delete / part.delete / messages.batch — see
+        // isPageDirtyingKind) so the response gate (runPageFetchLoop) discards
+        // + retries. This is the client mirror of the server's
+        // me.liveTouchedBody/me.liveTouchedParts (pkg/state/store.go) — live
+        // state always wins, so a page snapshot that raced a resurrection-class
+        // mutation is stale.
+        //
+        // NARROW FILTER: the filter deliberately EXCLUDES message.upsert and
+        // part.upsert. The merge is insert-if-not-present (live always wins),
+        // so a live upsert CANNOT make a stale page resurrect anything:
+        //   - upsert for a NEW tail message: newer than the `before` cursor →
+        //     NOT in the page range.
+        //   - upsert for an EXISTING message / part: prependMessagesIfAbsent
+        //     and upsertPart both leave the live entry untouched.
+        // Excluding upserts is what keeps Load-older usable on actively-
+        // streaming sessions (a part.upsert flood per streamed token would
+        // otherwise exhaust MAX_PAGE_RETRIES and abandon with no merge).
+        // messages.loaded/messages.error are also excluded (reveal-gate flips,
+        // not content mutations).
+        //
+        // Placed AFTER the gen+epoch re-checks so a superseded connection or a
+        // gate activation during the snapshot-decode await does NOT mark a page
+        // dirty for a connection/gate the page no longer belongs to.
+        if (sid && isPageDirtyingKind(kind)) {
           markPageDirty(sid);
         }
 

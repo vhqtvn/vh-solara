@@ -24,6 +24,7 @@ import { reconcile } from "solid-js/store";
 import {
   MAX_RESIDENT_MESSAGES,
   closeSessionStream,
+  isPageDirtyingKind,
   loadOlder,
   markPageDirty,
   resetPageInFlight,
@@ -479,5 +480,218 @@ describe("loadOlder state machine", () => {
     // Prior eviction signal preserved.
     expect(state.messageWindows.s1?.hasOlder).toBe(true);
     expect(state.messageWindows.s1?.evictedHistory).toBe(true);
+  });
+});
+
+// ── Phase-4 dirty-mirror kind filter (isPageDirtyingKind) ===================
+//
+// These tests pin the NARROW dirty trigger that fixed the "Load older does not
+// work on active sessions" bug. The pre-fix listener hook called markPageDirty
+// on every message.*/part.*/messages.batch event; on a session actively
+// streaming tokens (one part.upsert per token) the dirty flag flipped on every
+// token, exhausted MAX_PAGE_RETRIES, and abandoned with no merge + no UI
+// feedback. The fix narrows the trigger to resurrection-class kinds ONLY
+// (message.delete / part.delete / messages.batch): live upserts cannot
+// resurrect a stale page because the merge is insert-if-not-present.
+//
+// The filter has two test surfaces:
+//   1. Pure unit: isPageDirtyingKind returns true/false per kind.
+//   2. Integration: the listener call-site pattern
+//      `if (isPageDirtyingKind(kind)) markPageDirty(sid);` — a non-dirtying
+//      kind during a live loadOlder flight must NOT abandon, must merge; a
+//      dirtying kind during flight MUST still discard + retry (Contract-B
+//      safety preservation).
+
+describe("isPageDirtyingKind (pure unit)", () => {
+  it("returns true for resurrection-class kinds (delete + wholesale replace)", () => {
+    expect(isPageDirtyingKind("message.delete")).toBe(true);
+    expect(isPageDirtyingKind("part.delete")).toBe(true);
+    expect(isPageDirtyingKind("messages.batch")).toBe(true);
+  });
+
+  it("returns false for live-upsert kinds (the bug-fix set)", () => {
+    // These are the kinds that used to mark dirty and caused abandonment on
+    // active sessions. They MUST be excluded so live token streaming does not
+    // abandon Load-older.
+    expect(isPageDirtyingKind("message.upsert")).toBe(false);
+    expect(isPageDirtyingKind("part.upsert")).toBe(false);
+  });
+
+  it("returns false for non-mutation kinds (reveal-gate flips + errors)", () => {
+    expect(isPageDirtyingKind("messages.loaded")).toBe(false);
+    expect(isPageDirtyingKind("messages.error")).toBe(false);
+  });
+
+  it("returns false for unrelated / unknown kinds", () => {
+    expect(isPageDirtyingKind("session.upsert")).toBe(false);
+    expect(isPageDirtyingKind("")).toBe(false);
+    expect(isPageDirtyingKind("anything-else")).toBe(false);
+  });
+});
+
+describe("dirty-mirror listener call-site (integration)", () => {
+  // Helper that mirrors the production listener hook pattern exactly:
+  //   if (sid && isPageDirtyingKind(kind)) markPageDirty(sid);
+  // Tests use this to prove the narrow filter's behavior end-to-end through
+  // the loadOlder state machine.
+  function listenerMarkDirty(sid: string, kind: string) {
+    if (sid && isPageDirtyingKind(kind)) markPageDirty(sid);
+  }
+
+  // ── The bug-fix proving tests (non-dirtying kinds must NOT abandon) ──
+
+  it("BUG FIX: part.upsert during flight (token streaming) → NO abandon, page merges", async () => {
+    // This is THE regression test for the operator-reported bug. On an active
+    // session, every streamed token fires a part.upsert. Pre-fix, each one
+    // marked the page dirty → 4 fetches → abandon → no merge. Post-fix, the
+    // narrow filter excludes part.upsert → single fetch → clean merge.
+    const sm = buildMessages([item("m5", 50)]);
+    seedSession(sm, "m5");
+    let fetchCount = 0;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+      fetchCount++;
+      // Simulate the listener firing part.upsert for the live tail message
+      // (m5) during the fetch — exactly one token streaming event.
+      listenerMarkDirty("s1", "part.upsert");
+      return makeResponse(pageResponse([item("m3", 30), item("m4", 40)], { oldest_id: "m3", has_older: true }));
+    });
+    await loadOlder("s1");
+    // Single fetch — no dirty-retry, no abandonment.
+    expect(fetchCount).toBe(1);
+    // Page merged — Load older WORKS on an active session.
+    expect(state.messages.s1?.order).toEqual(["m3", "m4", "m5"]);
+    expect(state.messageWindows.s1?.oldestResidentID).toBe("m3");
+    expect(state.messageWindows.s1?.loadingOlder).toBeFalsy();
+  });
+
+  it("BUG FIX: many part.upsert events during flight (token flood) → still single fetch + merge", async () => {
+    // A token flood is the realistic shape of an assistant turn. Pre-fix this
+    // hit MAX_PAGE_RETRIES=3 and abandoned. Post-fix the page lands cleanly.
+    const sm = buildMessages([item("m5", 50)]);
+    seedSession(sm, "m5");
+    let fetchCount = 0;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+      fetchCount++;
+      // Simulate 50 streamed tokens landing during the fetch flight.
+      for (let i = 0; i < 50; i++) listenerMarkDirty("s1", "part.upsert");
+      return makeResponse(pageResponse([item("m4", 40)], { oldest_id: "m4", has_older: true }));
+    });
+    await loadOlder("s1");
+    expect(fetchCount).toBe(1);
+    expect(state.messages.s1?.order).toEqual(["m4", "m5"]);
+    expect(state.messageWindows.s1?.loadingOlder).toBeFalsy();
+  });
+
+  it("message.upsert for new tail during flight → NO abandon, page merges", async () => {
+    // A new tail message arriving during the flight is also a non-dirtying
+    // kind: it is NEWER than the `before` cursor, so it cannot be in the page
+    // range, and prependMessagesIfAbsent skips resident ids anyway.
+    const sm = buildMessages([item("m5", 50)]);
+    seedSession(sm, "m5");
+    let fetchCount = 0;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+      fetchCount++;
+      listenerMarkDirty("s1", "message.upsert");
+      return makeResponse(pageResponse([item("m4", 40)], { oldest_id: "m4", has_older: true }));
+    });
+    await loadOlder("s1");
+    expect(fetchCount).toBe(1);
+    expect(state.messages.s1?.order).toEqual(["m4", "m5"]);
+  });
+
+  it("messages.loaded during flight (reveal-gate flip) → NO abandon, page merges", async () => {
+    // messages.loaded is a reveal-gate flip, not a content mutation. Marking
+    // dirty on it would waste a retry cycle for an event that did not change
+    // messages[sid] content.
+    const sm = buildMessages([item("m5", 50)]);
+    seedSession(sm, "m5");
+    let fetchCount = 0;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+      fetchCount++;
+      listenerMarkDirty("s1", "messages.loaded");
+      return makeResponse(pageResponse([item("m4", 40)], { oldest_id: "m4", has_older: true }));
+    });
+    await loadOlder("s1");
+    expect(fetchCount).toBe(1);
+    expect(state.messages.s1?.order).toEqual(["m4", "m5"]);
+  });
+
+  // ── Contract-B safety preservation (dirtying kinds MUST still discard) ──
+  //
+  // These pin that the narrow filter did NOT weaken the resurrection defense.
+  // The deletion-during-flight case is what makes resurrection impossible;
+  // each of these kinds MUST still flip dirty and trigger discard + retry.
+
+  it("SAFETY: message.delete during flight → STILL discards + retries", async () => {
+    const sm = buildMessages([item("m5", 50)]);
+    seedSession(sm, "m5");
+    let fetchCount = 0;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+      fetchCount++;
+      if (fetchCount === 1) {
+        // A page-range message deletion during the first flight.
+        listenerMarkDirty("s1", "message.delete");
+      }
+      return makeResponse(pageResponse([item("m4", 40)], { oldest_id: "m4", has_older: true }));
+    });
+    await loadOlder("s1");
+    // First discarded (dirty), second merged.
+    expect(fetchCount).toBe(2);
+    expect(state.messages.s1?.order).toEqual(["m4", "m5"]);
+    expect(state.messageWindows.s1?.oldestResidentID).toBe("m4");
+  });
+
+  it("SAFETY: part.delete during flight → STILL discards + retries", async () => {
+    const sm = buildMessages([item("m5", 50)]);
+    seedSession(sm, "m5");
+    let fetchCount = 0;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+      fetchCount++;
+      if (fetchCount === 1) {
+        listenerMarkDirty("s1", "part.delete");
+      }
+      return makeResponse(pageResponse([item("m4", 40)], { oldest_id: "m4", has_older: true }));
+    });
+    await loadOlder("s1");
+    expect(fetchCount).toBe(2);
+    expect(state.messages.s1?.order).toEqual(["m4", "m5"]);
+  });
+
+  it("SAFETY: messages.batch during flight → STILL discards + retries", async () => {
+    // messages.batch wholesale-replaces the resident cache; a stale page merged
+    // after a batch could resurrect messages the batch removed.
+    const sm = buildMessages([item("m5", 50)]);
+    seedSession(sm, "m5");
+    let fetchCount = 0;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+      fetchCount++;
+      if (fetchCount === 1) {
+        listenerMarkDirty("s1", "messages.batch");
+      }
+      return makeResponse(pageResponse([item("m4", 40)], { oldest_id: "m4", has_older: true }));
+    });
+    await loadOlder("s1");
+    expect(fetchCount).toBe(2);
+    expect(state.messages.s1?.order).toEqual(["m4", "m5"]);
+  });
+
+  it("SAFETY: every response dirty (rapid message.delete churn) → still abandons at MAX_PAGE_RETRIES", async () => {
+    // The abandonment cap still bounds fetch amplification on the rare genuine
+    // concurrent-deletion-during-flight case. With the narrow filter, this is
+    // unreachable on the streaming hot path; this test pins it for the
+    // rapid-delete-churn edge case.
+    const sm = buildMessages([item("m5", 50)]);
+    seedSession(sm, "m5");
+    let fetchCount = 0;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+      fetchCount++;
+      listenerMarkDirty("s1", "message.delete"); // every response dirty
+      return makeResponse(pageResponse([item("m4", 40)], { oldest_id: "m4", has_older: true }));
+    });
+    await loadOlder("s1");
+    // MAX_PAGE_RETRIES = 3 → first attempt + 3 retries = 4 fetches, then abandon.
+    expect(fetchCount).toBe(4);
+    expect(state.messages.s1?.order).toEqual(["m5"]); // no merge
+    expect(state.messageWindows.s1?.loadingOlder).toBeFalsy();
   });
 });
