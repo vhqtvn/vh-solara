@@ -22,6 +22,7 @@ import {
 } from "./store";
 import { syncUrl } from "./url";
 import { closeSessionStream, connect } from "./stream";
+import { invalidateChildrenIndex } from "./selectors";
 
 // Selecting any real session leaves draft mode.
 export function setSelectedId(id: string | null) {
@@ -64,6 +65,8 @@ export function switchProject(dir: string, fromUrl = false) {
       s.status = "connecting";
     }),
   );
+  // Wholesale session-set replacement invalidates the parent→children index.
+  invalidateChildrenIndex();
   if (!dir) {
     // No-project state: tear down both streams so nothing keeps bridging the old
     // project (or cwd). connect() would no-op too, but closing the session

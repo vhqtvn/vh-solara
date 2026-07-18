@@ -17,7 +17,7 @@ import { handleNotice } from "../alerts";
 import { checkVersionNow } from "../pwa";
 import { log } from "../lib/log";
 import { state, setState, projectDir, selectedId, persist } from "./store";
-import { normalizeTodos } from "./selectors";
+import { invalidateChildrenIndex, normalizeTodos } from "./selectors";
 import { notifyFromMessage, maybeNotifyRootDone, maybeClearWaiting } from "./orchestration";
 import { isGateActive, currentGateEpoch, markBusyDirty, setReconcileFn } from "../busy";
 
@@ -119,6 +119,8 @@ export function applySnapshot(snap: Snapshot) {
       s.cursor = snap.seq;
     }),
   );
+  // Wholesale session-set replacement invalidates the parent→children index.
+  invalidateChildrenIndex();
   persist();
 }
 
@@ -145,6 +147,8 @@ export function applySessionEvent(kind: string, seq: number, payload: any) {
       if (seq) s.cursor = seq;
     }),
   );
+  // session.upsert / session.delete change the parent→children topology.
+  invalidateChildrenIndex();
   persist();
 }
 

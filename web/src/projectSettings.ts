@@ -225,8 +225,33 @@ export function nameReplacementErrors(): (string | undefined)[] {
 // displayName applies the saved sequential fail-soft replacement pipeline to a
 // raw session title for DISPLAY ONLY. Never throws; invalid rules are skipped +
 // flagged, never fatal. Do NOT trim/normalize the result.
+//
+// Per-title memo: a session title is rendered in MULTIPLE leaves per paint
+// (SessionTree data-tip + title span, command palette, context menu, archived
+// dialog, …) and ~100 SessionTree Nodes mount at cold mount. Without this
+// cache, each render re-ran the regex pipeline for every title; WITH the
+// cache, each unique title computes once and reuses on re-render. The cache
+// invalidates wholesale when the compiled ruleset identity changes (a
+// refreshProjectSettings reload), so a stale rule never leaks through.
+//
+// This is a defensive fix: a prior read-only investigation ranked the
+// children-index O(N²) walk as the primary cold-mount freeze culprit and this
+// regex layer as candidate #2 — only expensive IF the operator configured
+// nameReplacements rules (default is identity pass-through, free). Memoizing
+// kills candidate #2 unconditionally without changing observable output.
+let displayNameMemoSet: CompiledNameReplacements | null = null;
+const displayNameMemoCache = new Map<string, string>();
 export function displayName(rawTitle: string): string {
-  return applyNameReplacements(compiledNameReplacements(), rawTitle);
+  const set = compiledNameReplacements();
+  if (set !== displayNameMemoSet) {
+    displayNameMemoSet = set;
+    displayNameMemoCache.clear();
+  }
+  const cached = displayNameMemoCache.get(rawTitle);
+  if (cached !== undefined) return cached;
+  const v = applyNameReplacements(set, rawTitle);
+  displayNameMemoCache.set(rawTitle, v);
+  return v;
 }
 
 // notesVisible is the effective Notes-tab visibility: a per-project declaration

@@ -3,7 +3,6 @@
 // All pure reads of `state` (no mutation, no I/O), so they sit just above the
 // store in the dependency graph and everything else can read through them.
 import type { Part, SessionMessages, TodoItem } from "../types";
-import { anyDescendantWorking } from "../lib/reduce";
 import { toolSubject, toolVerb } from "../lib/toolLabel";
 import { state } from "./store";
 
@@ -126,7 +125,26 @@ export function rootSessionCount(): number {
 }
 
 function descendantWorking(sessionID: string): boolean {
-  return anyDescendantWorking(state.sessions, state.activity, sessionID, isActivityWorking);
+  // O(subtree) walk over the cached parent→children index (was O(stack × all
+  // sessions) via anyDescendantWorking). `seen` preserves the cycle-safety
+  // the old anyDescendantWorking carried — never trips on a tree, but kept as
+  // a guard against malformed parent loops.
+  const idx = childrenIndex();
+  const stack = [sessionID];
+  const seen = new Set<string>([sessionID]);
+  while (stack.length) {
+    const id = stack.pop()!;
+    const kids = idx[id];
+    if (!kids) continue;
+    for (let i = 0; i < kids.length; i++) {
+      const c = kids[i];
+      if (seen.has(c)) continue;
+      seen.add(c);
+      if (isActivityWorking(state.activity[c])) return true;
+      stack.push(c);
+    }
+  }
+  return false;
 }
 
 // What the agent is doing right now, surfaced as the Working pill's verb + an
@@ -241,20 +259,79 @@ export function normalizeTodos(v: any): TodoItem[] {
 // All session ids in a subtree (the session + descendant subagents). Tasks roll
 // up like running state does, so a parent's indicator surfaces the todos its
 // subagents are working — without having to open each subsession.
+//
+// Uses the cached parent→children index (see childrenIndex /
+// invalidateChildrenIndex below) so the per-call cost is O(subtree), not
+// O(all-sessions). At cold mount (~100 sessions × ~100 SessionTree Nodes
+// calling sessionNeedsInput) this is the difference between ~10,000
+// synchronous ops and ~100.
 function subtreeSessionIds(rootID: string): string[] {
-  const childrenOf: Record<string, string[]> = {};
-  for (const id of Object.keys(state.sessions)) {
-    const p = state.sessions[id]?.parentID;
-    if (p) (childrenOf[p] ||= []).push(id);
-  }
+  const idx = childrenIndex();
   const out: string[] = [];
   const stack = [rootID];
   while (stack.length) {
     const id = stack.pop()!;
     out.push(id);
-    for (const c of childrenOf[id] || []) stack.push(c);
+    const kids = idx[id];
+    if (kids) for (let i = 0; i < kids.length; i++) stack.push(kids[i]);
   }
   return out;
+}
+
+// --- Parent→children index (Fix A: kills the O(N²) cold-mount freeze) -------
+//
+// subtreeSessionIds / descendantWorking USED to rebuild a `childrenOf` index by
+// walking ALL sessions on EVERY call. With ~100 sessions at cold mount and
+// ~100 Node components each calling sessionNeedsInput() once, that was ~10,000
+// ops in a single synchronous render — the main-thread freeze on Android
+// Chrome the operator reported ("page completely freezes until all loading
+// finished").
+//
+// The index is now built lazily on first read after a mutation and reused
+// across all subsequent selector calls until invalidated. The THREE production
+// mutation sites — applySnapshot (wholesale replace), applySessionEvent
+// (session.upsert / session.delete), and switchProject (wholesale replace on
+// project switch) — all call invalidateChildrenIndex() after the store update.
+// Tests that mutate state.sessions directly must call it too (mirrors the
+// existing reconcile({}) reset convention).
+//
+// Correctness under live updates: the index is a pure function of
+// state.sessions keyed on parentID. An orphan child (parentID pointing to a
+// session absent from the store) is grouped under the missing parent's ID,
+// NOT under "" — so it never appears in a real root's subtree (matches the
+// pre-fix subtreeSessionIds semantics exactly).
+let cachedChildrenIndex: Record<string, string[]> | null = null;
+
+// Test-only build counter. Used by the perf-correctness test to assert the
+// index is built O(1) across many selector calls, not O(N) per call. Cheap to
+// maintain (one increment per build).
+let childrenIndexBuildCount = 0;
+export function __childrenIndexBuildCountForTest(): number {
+  return childrenIndexBuildCount;
+}
+export function __resetChildrenIndexBuildCountForTest(): void {
+  childrenIndexBuildCount = 0;
+}
+
+/** Invalidate the cached parent→children index. Call after ANY state.sessions
+ *  mutation (upsert / delete / wholesale replace). O(1). */
+export function invalidateChildrenIndex(): void {
+  cachedChildrenIndex = null;
+}
+
+// Lazily build (or return the cached) parent→children index. Keyed on
+// parentID; sessions with no parentID are NOT in the index (matches the
+// pre-fix semantics — they're roots, never someone's child).
+function childrenIndex(): Record<string, string[]> {
+  if (cachedChildrenIndex) return cachedChildrenIndex;
+  const idx: Record<string, string[]> = {};
+  for (const id of Object.keys(state.sessions)) {
+    const p = state.sessions[id]?.parentID;
+    if (p) (idx[p] ||= []).push(id);
+  }
+  cachedChildrenIndex = idx;
+  childrenIndexBuildCount++;
+  return idx;
 }
 
 // sessionTodos returns the agent todos (OpenCode TodoWrite) for a session AND
