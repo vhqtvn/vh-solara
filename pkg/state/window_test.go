@@ -29,12 +29,12 @@ import (
 // t.Parallel — none of the window tests parallelize.
 func withWindowBounds(t *testing.T, maxCount, maxBytes int) {
 	t.Helper()
-	prevCount, prevBytes := windowMaxCount, windowMaxBytes
-	windowMaxCount = maxCount
-	windowMaxBytes = maxBytes
+	prevCount, prevBytes := WindowMaxCount, WindowMaxBytes
+	WindowMaxCount = maxCount
+	WindowMaxBytes = maxBytes
 	t.Cleanup(func() {
-		windowMaxCount = prevCount
-		windowMaxBytes = prevBytes
+		WindowMaxCount = prevCount
+		WindowMaxBytes = prevBytes
 	})
 }
 
@@ -309,7 +309,7 @@ func TestWindow_SnapshotBoundsMessages(t *testing.T) {
 	// Selected-session snapshot: bounded.
 	scoped := s.Snapshot(map[string]bool{"sess": true})
 	if got := scoped.Messages["sess"]; len(got) != 2 {
-		t.Fatalf("scoped snapshot messages: want 2 (windowMaxCount), got %d", len(got))
+		t.Fatalf("scoped snapshot messages: want 2 (WindowMaxCount), got %d", len(got))
 	}
 	meta, ok := scoped.MessageWindows["sess"]
 	if !ok {
@@ -388,7 +388,7 @@ func TestWindow_ColdBatchCarriesWindowMeta(t *testing.T) {
 	}
 	msgs := decodeBatchMessages(t, batches[0].Payload)
 	if len(msgs) != 2 {
-		t.Fatalf("batch messages: want 2 (windowMaxCount), got %d", len(msgs))
+		t.Fatalf("batch messages: want 2 (WindowMaxCount), got %d", len(msgs))
 	}
 	meta := decodeBatchWindow(t, batches[0].Payload)
 	if meta.MessageCount != 2 {
@@ -435,7 +435,7 @@ func TestWindow_ColdBatchRevisionValidationHoldsUnderBound(t *testing.T) {
 	}
 	msgs := decodeBatchMessages(t, batches[0].Payload)
 	if len(msgs) != 3 {
-		t.Fatalf("batch messages: want 3 (windowMaxCount), got %d", len(msgs))
+		t.Fatalf("batch messages: want 3 (WindowMaxCount), got %d", len(msgs))
 	}
 }
 

@@ -293,17 +293,20 @@ type WindowMeta struct {
 	BudgetBytes   int  `json:"budget_bytes,omitempty"`
 }
 
-// windowMaxCount and windowMaxBytes are the operator-tunable bounds for the
-// initial message-window projection (the cold-load tail). Package-level VARS
-// (not consts) precisely so tests can shrink them for deterministic window
-// assertions — the same escape-hatch pattern as partTextCap. The defaults
-// (100 messages / 1 MiB) are the operator-recommended dual bound: whichever
-// hits first stops the window. The projector always includes at least the
-// newest complete message even when the byte budget is exceeded (the
-// oversized_item case).
+// WindowMaxCount and WindowMaxBytes are the operator-tunable bounds for the
+// initial message-window projection (the cold-load tail) AND the historical
+// page endpoint. Package-level VARS (not consts) precisely so tests can shrink
+// them for deterministic window assertions — the same escape-hatch pattern as
+// partTextCap. The defaults (100 messages / 1 MiB) are the operator-recommended
+// dual bound: whichever hits first stops the window. The projector always
+// includes at least the newest complete message even when the byte budget is
+// exceeded (the oversized_item case). Exported so the HTTP layer (pkg/web) can
+// clamp ?limit= / ?max_bytes= query params to the same canonical ceiling a
+// historical page must not exceed (a single page must not carry more than the
+// initial window's footprint).
 var (
-	windowMaxCount = 100
-	windowMaxBytes = 1 << 20 // 1 MiB
+	WindowMaxCount = 100
+	WindowMaxBytes = 1 << 20 // 1 MiB
 )
 
 // messageSerializedBytes returns the raw message-value byte size of a
@@ -423,6 +426,256 @@ func projectMessageWindow(list []MessageWithParts, maxCount, maxBytes int) ([]Me
 		tail[i], tail[j] = tail[j], tail[i]
 	}
 	return tail, meta
+}
+
+// MessagePageResult is the response envelope for the historical-page endpoint
+// (GET /vh/session/{sessionId}/messages?before=...). It is DISTINCT from the
+// cold-load messages.batch envelope: the client treats the items[] as a
+// PREPEND/MERGE-BY-ID source (NEVER a wholesale replace) and MUST NOT confuse
+// this response with a messages.batch or messages.loaded event. The endpoint
+// never emits SSE events of any kind — it is a one-shot HTTP read.
+//
+// The fields mirror the bounded-window metadata contract (WindowMeta) but add
+// the page-specific cursor echoes (request_before, newest_id, boundary_found)
+// the prepend path needs. session_id / daemon_epoch / baseline_seq travel on
+// the envelope so a client can correlate the page with a snapshot cursor. The
+// stampMeta middleware stamps X-VH-Seq / X-VH-Epoch response headers at
+// REQUEST ENTRY (before the handler runs); BaselineSeq below is captured at the
+// actual SnapshotMessagesPage RLock (inside the handler). On a quiescent warm
+// session the two seq values match; under a concurrent mutation during the
+// request they can diverge (BaselineSeq is the more accurate capture cursor).
+// The Contract-B freshness check (Phase 4 client) uses BaselineSeq — NOT
+// X-VH-Seq — as the authoritative page-capture watermark and discards a page
+// whose capture raced with a session mutation.
+type MessagePageResult struct {
+	// SessionID is the session this page belongs to. Always set on the wire.
+	SessionID string `json:"session_id"`
+	// ProjectID is the project directory (reqDir / ?dir=) the request resolved
+	// to. Empty for the default project (the SPA fills it client-side).
+	ProjectID string `json:"project_id,omitempty"`
+	// DaemonEpoch is the store epoch at capture, so a client detects a daemon
+	// restart (epoch change) that invalidates all historical cursors.
+	DaemonEpoch string `json:"daemon_epoch"`
+	// RequestBefore echoes the ?before=<id> cursor the client sent. Empty when
+	// the client sent no cursor (the projector returns an empty page in that
+	// case, since the initial-window path is the documented source of the
+	// first cursor).
+	RequestBefore string `json:"request_before,omitempty"`
+	// BaselineSeq is the store seq captured under RLock at the moment
+	// SnapshotMessagesPage read the transcript — the authoritative page-capture
+	// watermark for Contract-B. The X-VH-Seq response header is stamped
+	// earlier (at request entry by the stampMeta middleware); the two match on
+	// a quiescent warm session but can diverge under concurrent mutation
+	// (BaselineSeq is the more accurate cursor). The Phase 4 client compares
+	// BaselineSeq against its connection cursor to discard stale pages.
+	BaselineSeq uint64 `json:"baseline_seq"`
+	// Items is the page, creation-ordered (oldest first) so the client can
+	// prepend the slice verbatim after a one-item overlap dedup. ALWAYS non-nil
+	// (empty [] when the page is empty) so the client distinguishes "empty
+	// page" from "missing field".
+	Items []MessageWithParts `json:"items"`
+	// BoundaryFound is true when RequestBefore was located in the ordered
+	// transcript at capture time. False means the cursor is stale (the message
+	// was deleted, or the client sent a cursor it never received) — the client
+	// refetches from a known-good cursor. Distinct from HasOlder: an oldest
+	// message with no older neighbors has BoundaryFound=true, HasOlder=false.
+	BoundaryFound bool `json:"boundary_found"`
+	// OldestID is the message id of the OLDEST item in the page (the new
+	// ?before= cursor for the NEXT historical page). Empty when the page is
+	// empty.
+	OldestID string `json:"oldest_id,omitempty"`
+	// NewestID is the message id of the NEWEST item in the page (= RequestBefore
+	// when boundary_found, since the boundary message is the page overlap).
+	// Empty when the page is empty.
+	NewestID string `json:"newest_id,omitempty"`
+	// HasOlder is true when older messages exist beyond this page. The client
+	// uses this (NOT boundary_found) to decide whether to render a "Load older"
+	// affordance below the prepended page.
+	HasOlder bool `json:"has_older"`
+	// MessageCount is len(Items); carried explicitly so a client reads it
+	// without decoding the items array.
+	MessageCount int `json:"message_count"`
+	// SerializedBytes is the sum of len(Info)+sum(len(Parts)) across the page
+	// — same raw-value size measure as WindowMeta.SerializedBytes. A client
+	// uses this to decide whether to evict far pages under the resident cache
+	// byte budget.
+	SerializedBytes int `json:"serialized_bytes"`
+	// CountLimited / BytesLimited signal WHY the page stopped, mirroring
+	// WindowMeta. A "Load older" affordance is meaningful iff HasOlder (which
+	// is set when either limit fires AND older messages exist).
+	CountLimited bool `json:"count_limited"`
+	BytesLimited bool `json:"bytes_limited"`
+	// OversizedItem / ActualBytes / BudgetBytes mirror WindowMeta: set ONLY in
+	// the oversized-anchor case (the ?before= message alone exceeds the byte
+	// budget). The page returns the anchor alone so the client never sees a
+	// silent gap, and signals the overflow so it can explain the single-item
+	// page.
+	OversizedItem bool `json:"oversized_item,omitempty"`
+	ActualBytes   int  `json:"actual_bytes,omitempty"`
+	BudgetBytes   int  `json:"budget_bytes,omitempty"`
+}
+
+// projectMessagePage paginates a session's FULL message list (creation-ordered,
+// oldest first) into a single historical page anchored at the `before` cursor.
+// The page is INCLUSIVE of `before` as a one-item OVERLAP (the newest item in
+// the page), followed by strictly-older messages bounded by (maxCount, maxBytes)
+// — mirroring projectMessageWindow's dual bound. The overlap lets a client
+// robustly dedup against its resident window (it prepends items whose ids are
+// NOT already present), so continuity is preserved even if the resident cache
+// evicted the boundary message.
+//
+// Contract:
+//   - `before` is REQUIRED. An empty cursor returns an empty page with
+//     boundary_found=false (the initial window is the documented source of the
+//     first cursor; a missing cursor is a client bug or a stale-cache fetch).
+//   - `before` not found in the list returns an empty page with
+//     boundary_found=false (the client refetches from a known-good cursor;
+//     Contract-B's dirty-flag is the primary guard against resurrecting a
+//     deleted-then-recreated message).
+//   - If the anchor (`before`) alone exceeds maxBytes, the page returns it
+//     ALONE with oversized_item + actual_bytes/budget_bytes (the same
+//     atomic-message guarantee as projectMessageWindow).
+//   - `limit` bounds TOTAL page size (overlap + older), matching
+//     projectMessageWindow's maxCount semantics.
+//
+// PURE and DETERMINISTIC: same input list + cursor → same page + same metadata.
+// This is what makes the page a point-in-time Contract-B snapshot the client can
+// validate against its cursor (no server-side retry loop needed; the GET is a
+// read). No store access, no lock.
+//
+// The result preserves creation order (oldest first) so the client can prepend
+// the slice verbatim.
+func projectMessagePage(list []MessageWithParts, before string, maxCount, maxBytes int) MessagePageResult {
+	res := MessagePageResult{Items: []MessageWithParts{}, RequestBefore: before}
+	if before == "" || len(list) == 0 {
+		return res // boundary_found stays false
+	}
+	if maxCount < 1 {
+		maxCount = 1 // always include at least the anchor
+	}
+	if maxBytes < 1 {
+		maxBytes = 1 // avoid the oversized short-circuit firing on any non-empty anchor
+	}
+	// Find the anchor index (linear scan; list is creation-ordered oldest-first,
+	// so the scan is stable across message id reuse — the FIRST match wins, and
+	// ids are unique within a session's lifetime).
+	anchorIdx := -1
+	for i := range list {
+		if messageIDFromInfo(list[i].Info) == before {
+			anchorIdx = i
+			break
+		}
+	}
+	if anchorIdx < 0 {
+		return res // before not found; boundary_found stays false
+	}
+	res.BoundaryFound = true
+	// The anchor is the page's newest item (the overlap). Walk older messages
+	// newest-to-oldest from index < anchorIdx, dual-bounded.
+	anchor := list[anchorIdx]
+	anchorSize := messageSerializedBytes(anchor)
+	page := make([]MessageWithParts, 0, maxCount)
+	page = append(page, anchor)
+	res.NewestID = before
+	res.OldestID = before
+	res.SerializedBytes = anchorSize
+
+	if anchorSize > maxBytes {
+		// Oversized anchor: return it ALONE. has_older reflects whether older
+		// messages exist beyond the anchor (i.e. anchorIdx > 0).
+		res.Items = page
+		res.HasOlder = anchorIdx > 0
+		res.OversizedItem = true
+		res.ActualBytes = anchorSize
+		res.BudgetBytes = maxBytes
+		res.MessageCount = 1
+		return res
+	}
+
+	countLimited := false
+	bytesLimited := false
+	for i := anchorIdx - 1; i >= 0; i-- {
+		m := list[i]
+		size := messageSerializedBytes(m)
+		if len(page)+1 > maxCount {
+			countLimited = true
+			break
+		}
+		if res.SerializedBytes+size > maxBytes {
+			bytesLimited = true
+			break
+		}
+		page = append(page, m)
+		res.SerializedBytes += size
+		res.OldestID = messageIDFromInfo(m.Info)
+	}
+	res.HasOlder = countLimited || bytesLimited
+	res.CountLimited = countLimited
+	res.BytesLimited = bytesLimited
+	// page was built newest-first (anchor, older, older...); reverse to
+	// creation order (oldest first) for the client's verbatim prepend.
+	for i, j := 0, len(page)-1; i < j; i, j = i+1, j-1 {
+		page[i], page[j] = page[j], page[i]
+	}
+	res.Items = page
+	res.MessageCount = len(page)
+	return res
+}
+
+// SnapshotMessagesPage is the Store accessor backing the historical-page HTTP
+// endpoint (GET /vh/session/{sessionId}/messages?before=...). It captures the
+// FULL per-session message list under a read lock (a point-in-time consistent
+// view, NOT the bounded window Snapshot carries), paginates it via
+// projectMessagePage outside the lock, and stamps the envelope with the session
+// id + daemon epoch + baseline seq so the client can correlate the page with a
+// snapshot cursor and run its Contract-B freshness check.
+//
+// Pure read: performs NO writeback and bumps NO msgRev (mirrors Snapshot). The
+// Contract-B freshness contract is enforced CLIENT-SIDE (Phase 4): the server
+// stamps X-VH-Seq / X-VH-Epoch via the stampMeta middleware at request entry,
+// and the client discards the page if the session mutated during the flight
+// (the dirty-flag mechanism, NOT a server-side retry loop).
+//
+// limit / maxBytes <= 0 fall back to the package WindowMaxCount / WindowMaxBytes
+// defaults so the endpoint is safe to call with no query params beyond `before`.
+func (s *Store) SnapshotMessagesPage(sid, before string, limit, maxBytes int) MessagePageResult {
+	if limit <= 0 {
+		limit = WindowMaxCount
+	}
+	if maxBytes <= 0 {
+		maxBytes = WindowMaxBytes
+	}
+	s.mu.RLock()
+	sm := s.messages[sid]
+	epoch := s.epoch
+	seq := s.seq
+	var full []MessageWithParts
+	if sm != nil {
+		// Defensive copy of info + each part, exactly as captureMessagesBatchLocked
+		// does — the slice escapes the lock and is read during pagination, so a
+		// concurrent writer must not observe in-place mutation.
+		full = make([]MessageWithParts, 0, len(sm.order))
+		for _, mid := range sm.order {
+			me := sm.byID[mid]
+			if me == nil {
+				continue
+			}
+			parts := make([]json.RawMessage, 0, len(me.partOrder))
+			for _, pid := range me.partOrder {
+				parts = append(parts, append([]byte(nil), me.parts[pid]...))
+			}
+			full = append(full, MessageWithParts{
+				Info:  append([]byte(nil), me.info...),
+				Parts: parts,
+			})
+		}
+	}
+	s.mu.RUnlock()
+	res := projectMessagePage(full, before, limit, maxBytes)
+	res.SessionID = sid
+	res.DaemonEpoch = epoch
+	res.BaselineSeq = seq
+	return res
 }
 
 // VerbFacet is the RAW current-activity primitive for a session — the tool name
@@ -2549,7 +2802,7 @@ func (s *Store) Snapshot(messagesFor map[string]bool) Snapshot {
 		// The full list is materialized first (this is the status quo — the
 		// capture loop walks sm.order in full); the window bound is a WIRE/
 		// browser-memory fix, not a store-memory optimization.
-		bounded, meta := projectMessageWindow(out, windowMaxCount, windowMaxBytes)
+		bounded, meta := projectMessageWindow(out, WindowMaxCount, WindowMaxBytes)
 		snap.Messages[sid] = bounded
 		snap.MessageWindows[sid] = meta
 	}
@@ -3118,7 +3371,7 @@ func (s *Store) captureMessagesBatchLocked(sid string) ([]MessageWithParts, uint
 			Parts: parts,
 		})
 	}
-	bounded, meta := projectMessageWindow(full, windowMaxCount, windowMaxBytes)
+	bounded, meta := projectMessageWindow(full, WindowMaxCount, WindowMaxBytes)
 	return bounded, s.msgRev[sid], meta
 }
 

@@ -569,6 +569,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /vh/session/{sessionId}/queue/{itemId}", s.handleQueueRemove)
 	mux.HandleFunc("POST /vh/session/{sessionId}/queue/claim", s.handleQueueClaim)
 	mux.HandleFunc("POST /vh/session/{sessionId}/queue/{itemId}/resolve", s.handleQueueResolve)
+	// Transcript-windowing historical-page endpoint (Phase 2). GET-only: serves
+	// one bounded page of OLDER messages (?before=<id>) for prepend/merge-by-id
+	// on the client. Distinct from the cold-load messages.batch SSE path: this
+	// emits NO events and NO messages.batch/messages.loaded — only a one-shot
+	// MessagePageResult JSON envelope. csrfGuard exempts GET, so no CSRF
+	// exception is needed. See pkg/web/messages_http.go for the contract.
+	mux.HandleFunc("GET /vh/session/{sessionId}/messages", s.handleSessionMessages)
 	// Feature modules (B) — the coordination write verbs (A1) are the first one.
 	s.mountFeatures(mux)
 	mux.HandleFunc("/vh/ack", s.handleAck)
