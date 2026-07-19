@@ -69,17 +69,28 @@ type QueueSendConfig struct {
 // QueueItem is one queued message. ID and Order are backend-issued; Order is the
 // monotonic FIFO commit sequence. OriginClientID is diagnostics-only and MUST
 // NOT affect ordering, visibility, or dispatch eligibility.
+//
+// DispatchStartedAt records when Claim() transitioned the item to `dispatching`.
+// It is the timestamp stale-dispatch recovery (recoverStaleDispatchingLocked)
+// uses to detect abandoned dispatches after a network failure, browser crash,
+// or vh-solara restart. CreatedAt is UNSAFE for that purpose because an item
+// can sit `pending` for a long time before being claimed. The `omitempty` tag
+// keeps on-disk backwards compatibility: a legacy queue.json written before
+// this field existed deserializes with DispatchStartedAt==0, which recovery
+// treats as "legacy item, recover immediately" — exactly the operator's
+// restart-recovery case.
 type QueueItem struct {
-	ID             string            `json:"id"`
-	Order          uint64            `json:"order"`
-	State          QueueItemState    `json:"state"`
-	Text           string            `json:"text"`
-	Attachments    []QueueAttachment `json:"attachments"`
-	SendConfig     QueueSendConfig   `json:"sendConfig,omitempty"`
-	OriginClientID string            `json:"originClientId,omitempty"`
-	CreatedAt      int64             `json:"createdAt"`
-	ResolvedAt     int64             `json:"resolvedAt,omitempty"`
-	Detail         string            `json:"detail,omitempty"`
+	ID                string            `json:"id"`
+	Order             uint64            `json:"order"`
+	State             QueueItemState    `json:"state"`
+	Text              string            `json:"text"`
+	Attachments       []QueueAttachment `json:"attachments"`
+	SendConfig        QueueSendConfig   `json:"sendConfig,omitempty"`
+	OriginClientID    string            `json:"originClientId,omitempty"`
+	CreatedAt         int64             `json:"createdAt"`
+	DispatchStartedAt int64             `json:"dispatchStartedAt,omitempty"`
+	ResolvedAt        int64             `json:"resolvedAt,omitempty"`
+	Detail            string            `json:"detail,omitempty"`
 }
 
 // queueFile is the on-disk shape. Order is persisted so the monotonic commit
@@ -204,12 +215,96 @@ func (s *sessionQueueStore) save() error {
 	return writeQueueAtomic(s.path, data, 0o644)
 }
 
-// List returns a copy of all items in FIFO (order) order.
+// staleDispatchThreshold is the maximum time a queue item may remain in the
+// `dispatching` state before recovery treats it as abandoned. Must exceed the
+// frontend dispatch timeout (12s in web/src/queueDrain.ts) to avoid recovering
+// in-flight dispatches; 30s leaves a comfortable margin.
+const staleDispatchThreshold = 30 * time.Second
+
+// staleDispatchRecoveryDetail is the operator-facing diagnostic text recorded
+// on any item recovered to `unknown` by stale-dispatch recovery. It explains
+// why the item left `dispatching` without a confirmed outcome and warns against
+// blind re-send: after transport failure it is impossible to know whether
+// OpenCode received the POST, so resending may duplicate work (duplicated
+// prompts, duplicated tool side-effects, duplicated file edits).
+const staleDispatchRecoveryDetail = "Recovery: dispatch was interrupted and could not be confirmed. The prompt may have reached OpenCode; sending it again may duplicate work."
+
+// recoverStaleDispatchingLocked transitions abandoned `dispatching` items to
+// terminal `unknown`. Called under the store mutex by List() after disk load.
+// NEVER produces `pending`. NEVER dispatches. NEVER re-issues the prompt POST.
+// Returns changed=true if any item was recovered.
+//
+// The caller (List()) is responsible for persisting the recovery via the
+// atomic save path when changed==true, and for rolling back ALL in-memory
+// mutations if that save fails (mirrors the Resolve/Claim rollback pattern).
+//
+// Recovery rules:
+//   - dispatching && DispatchStartedAt > 0 && now - DispatchStartedAt > threshold → unknown
+//   - dispatching && DispatchStartedAt == 0 (legacy item, pre-this-fix on-disk
+//     shape) → unknown (this is the restart-recovery case: an item stuck
+//     dispatching across a vh-solara restart, with no timestamp to age)
+//   - all other states: unchanged
+//
+// On recovery, sets ResolvedAt = now.UnixMilli() and Detail to the diagnostic
+// text. The `now` parameter is injected so tests can drive the clock without
+// wall-clock sleeps.
+func (s *sessionQueueStore) recoverStaleDispatchingLocked(now time.Time) (changed bool, err error) {
+	nowMs := now.UnixMilli()
+	thresholdMs := int64(staleDispatchThreshold / time.Millisecond)
+	for i := range s.items {
+		if s.items[i].State != QueueDispatching {
+			continue
+		}
+		startedAt := s.items[i].DispatchStartedAt
+		if startedAt > 0 && nowMs-startedAt <= thresholdMs {
+			// In-flight (within threshold) — leave alone.
+			continue
+		}
+		// Either stale (startedAt > 0 && elapsed > threshold) or legacy
+		// (startedAt == 0, pre-this-fix on-disk item). Recover to terminal
+		// unknown. NEVER pending. NEVER re-dispatch.
+		s.items[i].State = QueueUnknown
+		s.items[i].ResolvedAt = nowMs
+		s.items[i].Detail = staleDispatchRecoveryDetail
+		changed = true
+	}
+	return changed, nil
+}
+
+// List returns a copy of all items in FIFO (order) order. It is the single
+// chokepoint for stale-dispatch recovery: the SPA fetches the queue on session
+// open, stream reconnect, focus/visibility, polling, and at vh-solara restart
+// — so every entry path that would surface a stuck item first runs recovery.
+// Recovery transitions abandoned `dispatching` items to terminal `unknown`
+// (never `pending`, never re-dispatched) and persists the change atomically.
 func (s *sessionQueueStore) List() ([]QueueItem, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.load(); err != nil {
 		return nil, err
+	}
+	// Snapshot the pre-recovery items so a save failure during recovery
+	// persistence rolls back ALL in-memory mutations (mirrors Resolve/Claim
+	// rollback). Without this, a save failure would leave recovered items as
+	// `unknown` in memory while disk still has them as `dispatching`, and a
+	// later successful mutation would persist the recovered state — silently
+	// losing the dispatching item. The shallow struct copy is sufficient
+	// because recovery only mutates scalar fields (State/ResolvedAt/Detail),
+	// never the Attachments slice.
+	preRecovery := make([]QueueItem, len(s.items))
+	copy(preRecovery, s.items)
+	changed, err := s.recoverStaleDispatchingLocked(time.Now())
+	if err != nil {
+		return nil, err
+	}
+	if changed {
+		if err := s.save(); err != nil {
+			// Roll back ALL in-memory mutations from recovery so the store
+			// stays consistent with disk (the recoveries were never durably
+			// committed).
+			s.items = preRecovery
+			return nil, err
+		}
 	}
 	out := make([]QueueItem, len(s.items))
 	copy(out, s.items)
@@ -313,9 +408,18 @@ func (s *sessionQueueStore) Claim() (QueueItem, bool, error) {
 	}
 	for i := range s.items {
 		if s.items[i].State == QueuePending {
+			// Record the dispatch-start timestamp in the SAME in-memory
+			// mutation + atomic save as the pending→dispatching transition, so
+			// a crash after Claim returns but before dispatch leaves a
+			// recoverable timestamp on disk (recoverStaleDispatchingLocked
+			// uses it to detect abandoned dispatches).
 			s.items[i].State = QueueDispatching
+			s.items[i].DispatchStartedAt = time.Now().UnixMilli()
 			if err := s.save(); err != nil {
+				// Roll back BOTH the state and the timestamp so the store
+				// stays consistent with disk (neither was durably committed).
 				s.items[i].State = QueuePending
+				s.items[i].DispatchStartedAt = 0
 				return QueueItem{}, false, err
 			}
 			item := s.items[i]

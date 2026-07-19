@@ -13,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/vhqtvn/vh-solara/pkg/aggregator"
 )
@@ -1010,5 +1011,398 @@ func TestQueuePath_vhSolaraDirInvariant(t *testing.T) {
 		if got != want {
 			t.Fatalf("vhSolaraDir(queuePath(%q,%q)) = %q, want %q", root, sid, got, want)
 		}
+	}
+}
+
+// --- Stale-dispatch recovery (FIX-QUEUE-STUCK-1) ----------------------------
+//
+// Recovery transitions abandoned `dispatching` items to terminal `unknown` on
+// every List() load. NEVER to `pending`. NEVER re-dispatched. The 11 cases
+// below pin the full state machine: durability, the stale/fresh/legacy
+// recovery rules, rollback on save failure, restart-recovery (the operator's
+// original bug), non-dispatching states untouched, and that a recovered-unknown
+// is still upgradable to sent by a later Resolve (the existing terminal→
+// terminal transition).
+
+// seedDispatchingItem writes a dispatching item directly into the store with the
+// given DispatchStartedAt, bypassing Claim() (which stamps time.Now()). This
+// lets recovery tests simulate stale/fresh/legacy dispatching items
+// deterministically without wall-clock sleeps. The item is persisted durably
+// so a fresh sessionQueueStore pointing at the same path observes it.
+func seedDispatchingItem(t *testing.T, s *sessionQueueStore, id, text string, dispatchStartedAt int64) QueueItem {
+	t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.load(); err != nil {
+		t.Fatalf("seedDispatchingItem load: %v", err)
+	}
+	s.order++
+	it := QueueItem{
+		ID:                id,
+		Order:             s.order,
+		State:             QueueDispatching,
+		Text:              text,
+		Attachments:       []QueueAttachment{},
+		CreatedAt:         time.Now().UnixMilli(),
+		DispatchStartedAt: dispatchStartedAt,
+	}
+	s.items = append(s.items, it)
+	if err := s.save(); err != nil {
+		t.Fatalf("seedDispatchingItem save: %v", err)
+	}
+	return it
+}
+
+// 1. Claim durably records both state and DispatchStartedAt in one save.
+// After Claim, reload the store from disk and assert both State==dispatching
+// and DispatchStartedAt > 0 survived the round-trip (so recovery has a
+// timestamp to age).
+func TestQueueClaimRecordsDispatchStartedAtDurably(t *testing.T) {
+	s, root := newTestStore(t, "s1")
+	mustEnqueue(t, s, "only")
+	it, won, err := s.Claim()
+	if err != nil || !won {
+		t.Fatalf("claim: won=%v err=%v", won, err)
+	}
+	if it.State != QueueDispatching {
+		t.Fatalf("claimed item state = %s, want dispatching", it.State)
+	}
+	if it.DispatchStartedAt <= 0 {
+		t.Fatalf("claimed item DispatchStartedAt = %d, want > 0", it.DispatchStartedAt)
+	}
+	// Reload from disk via a FRESH store: both the state and the timestamp
+	// must be durable. (List() runs recovery, but a just-claimed item is
+	// non-stale, so it stays dispatching.)
+	s2 := &sessionQueueStore{path: queuePath(root, "s1")}
+	got, err := s2.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("reload: got %d items, want 1", len(got))
+	}
+	if got[0].State != QueueDispatching {
+		t.Fatalf("reload: state = %s, want dispatching (durable)", got[0].State)
+	}
+	if got[0].DispatchStartedAt != it.DispatchStartedAt {
+		t.Fatalf("reload: DispatchStartedAt = %d, want %d (durable)", got[0].DispatchStartedAt, it.DispatchStartedAt)
+	}
+}
+
+// 2. Non-stale dispatching stays dispatching after List().
+func TestQueueRecoveryLeavesNonStaleDispatchingAlone(t *testing.T) {
+	s, _ := newTestStore(t, "s1")
+	now := time.Now()
+	seedDispatchingItem(t, s, "q-fresh", "fresh", now.UnixMilli())
+	got, err := s.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].State != QueueDispatching {
+		t.Fatalf("non-stale dispatching recovered: got %+v, want dispatching", got)
+	}
+	if got[0].ResolvedAt != 0 {
+		t.Fatalf("non-stale dispatching got ResolvedAt = %d, want 0 (untouched)", got[0].ResolvedAt)
+	}
+	if got[0].Detail != "" {
+		t.Fatalf("non-stale dispatching got Detail = %q, want empty (untouched)", got[0].Detail)
+	}
+}
+
+// 3. Stale dispatching becomes unknown after List().
+func TestQueueRecoveryRecoversStaleDispatchingToUnknown(t *testing.T) {
+	s, _ := newTestStore(t, "s1")
+	now := time.Now()
+	staleStartedAt := now.Add(-staleDispatchThreshold - time.Second).UnixMilli()
+	seedDispatchingItem(t, s, "q-stale", "stale", staleStartedAt)
+	got, err := s.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].State != QueueUnknown {
+		t.Fatalf("stale dispatching not recovered: got state=%s, want unknown", got[0].State)
+	}
+}
+
+// 4. Recovered item has ResolvedAt + diagnostic Detail.
+func TestQueueRecoverySetsResolvedAtAndDetail(t *testing.T) {
+	s, _ := newTestStore(t, "s1")
+	now := time.Now()
+	staleStartedAt := now.Add(-staleDispatchThreshold - time.Second).UnixMilli()
+	seedDispatchingItem(t, s, "q-stale", "stale", staleStartedAt)
+	got, err := s.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d items, want 1", len(got))
+	}
+	if got[0].State != QueueUnknown {
+		t.Fatalf("state = %s, want unknown", got[0].State)
+	}
+	if got[0].ResolvedAt <= 0 {
+		t.Fatalf("recovered item ResolvedAt = %d, want > 0", got[0].ResolvedAt)
+	}
+	if got[0].Detail != staleDispatchRecoveryDetail {
+		t.Fatalf("recovered item Detail = %q, want exact diagnostic text", got[0].Detail)
+	}
+}
+
+// 5. Recovery is durable across a fresh store reload.
+func TestQueueRecoveryDurableAcrossReload(t *testing.T) {
+	s, root := newTestStore(t, "s1")
+	now := time.Now()
+	staleStartedAt := now.Add(-staleDispatchThreshold - time.Second).UnixMilli()
+	seedDispatchingItem(t, s, "q-stale", "stale", staleStartedAt)
+	// First List() triggers recovery + persistence.
+	first, err := s.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first[0].State != QueueUnknown {
+		t.Fatalf("precondition: want unknown after first List, got %s", first[0].State)
+	}
+	// Fresh store reload: the recovery must be durable on disk.
+	s2 := &sessionQueueStore{path: queuePath(root, "s1")}
+	got, err := s2.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].State != QueueUnknown {
+		t.Fatalf("recovery not durable: got state=%s, want unknown", got[0].State)
+	}
+	if got[0].ResolvedAt != first[0].ResolvedAt {
+		t.Fatalf("recovery ResolvedAt drifted: first=%d reload=%d", first[0].ResolvedAt, got[0].ResolvedAt)
+	}
+	if got[0].Detail != staleDispatchRecoveryDetail {
+		t.Fatalf("recovery Detail not durable: got %q", got[0].Detail)
+	}
+}
+
+// 6. Recovery never makes an item claimable. After recovery to unknown, Claim()
+// must return (zero, false, nil) — no item to claim. Recovery produces terminal
+// `unknown`, never `pending`.
+func TestQueueRecoveryNeverMakesItemClaimable(t *testing.T) {
+	s, _ := newTestStore(t, "s1")
+	now := time.Now()
+	staleStartedAt := now.Add(-staleDispatchThreshold - time.Second).UnixMilli()
+	seedDispatchingItem(t, s, "q-stale", "stale", staleStartedAt)
+	if _, err := s.List(); err != nil {
+		t.Fatal(err)
+	}
+	it, won, err := s.Claim()
+	if err != nil {
+		t.Fatalf("claim after recovery: err=%v", err)
+	}
+	if won {
+		t.Fatalf("claim after recovery: won=true item=%+v, want (zero,false,nil) — recovery must never produce a claimable (pending) item", it)
+	}
+}
+
+// 7. Multiple stale items recovered in one atomic save.
+func TestQueueRecoveryMultipleStaleItemsOneSave(t *testing.T) {
+	s, _ := newTestStore(t, "s1")
+	now := time.Now()
+	staleStartedAt := now.Add(-staleDispatchThreshold - time.Second).UnixMilli()
+	seedDispatchingItem(t, s, "q-a", "a", staleStartedAt)
+	seedDispatchingItem(t, s, "q-b", "b", staleStartedAt)
+	seedDispatchingItem(t, s, "q-c", "c", staleStartedAt)
+	got, err := s.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("got %d items, want 3", len(got))
+	}
+	for _, it := range got {
+		if it.State != QueueUnknown {
+			t.Fatalf("item %q state = %s, want unknown (all stale items recovered in one save)", it.ID, it.State)
+		}
+		if it.Detail != staleDispatchRecoveryDetail {
+			t.Fatalf("item %q Detail = %q, want diagnostic text", it.ID, it.Detail)
+		}
+	}
+}
+
+// 8. Save failure during recovery rolls back ALL in-memory mutations. The
+// in-memory state must be fully restored to pre-recovery (item still
+// dispatching, ResolvedAt=0, Detail="") so a later successful mutation does not
+// persist a silently-recovered item.
+func TestQueueRecoveryRollsBackOnSaveFailure(t *testing.T) {
+	s, _ := newTestStore(t, "s1")
+	now := time.Now()
+	staleStartedAt := now.Add(-staleDispatchThreshold - time.Second).UnixMilli()
+	seedDispatchingItem(t, s, "q-stale", "stale", staleStartedAt)
+
+	// Block save() by replacing the queue path's parent dir with a file so
+	// writeQueueAtomic's MkdirAll fails (same mechanism as the Resolve/Remove
+	// rollback tests above).
+	parent := filepath.Dir(s.path)
+	if err := os.RemoveAll(parent); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(parent, []byte("blocker"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// List() must fail (save error during recovery persistence) and roll back
+	// the in-memory recovery so the item is still dispatching.
+	if _, err := s.List(); err == nil {
+		t.Fatal("List: want save error from blocked parent dir, got nil")
+	}
+
+	// Inspect the in-memory state directly (List returned an error, so we
+	// cannot use it to re-inspect). The item must be fully rolled back to
+	// its pre-recovery dispatching shape.
+	s.mu.Lock()
+	items := make([]QueueItem, len(s.items))
+	copy(items, s.items)
+	s.mu.Unlock()
+	if len(items) != 1 {
+		t.Fatalf("rollback: want 1 item in memory, got %d", len(items))
+	}
+	if items[0].State != QueueDispatching {
+		t.Fatalf("rollback failed: state = %s, want dispatching", items[0].State)
+	}
+	if items[0].ResolvedAt != 0 {
+		t.Fatalf("rollback failed: ResolvedAt = %d, want 0 (pre-recovery)", items[0].ResolvedAt)
+	}
+	if items[0].Detail != "" {
+		t.Fatalf("rollback failed: Detail = %q, want empty (pre-recovery)", items[0].Detail)
+	}
+}
+
+// 9. Legacy dispatching with DispatchStartedAt==0 becomes unknown on first
+// List(). This is the RESTART-RECOVERY case the operator observed: an item
+// stuck dispatching across a vh-solara restart, persisted by a pre-this-fix
+// binary that wrote no dispatchStartedAt field. Loading such a file must
+// recover the item to terminal unknown.
+func TestQueueRecoveryLegacyDispatchingBecomesUnknown(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, ".vh-solara", "sessions", "s1")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Legacy on-disk item: dispatching state, NO dispatchStartedAt field (the
+	// pre-this-fix shape). Matches the queueFile envelope load() reads.
+	legacy := []byte(`{"order":1,"items":[` +
+		`{"id":"q-legacy","order":1,"state":"dispatching","text":"legacy-stuck","createdAt":1700000000000,"attachments":[]}` +
+		`]}`)
+	if err := os.WriteFile(queuePath(root, "s1"), legacy, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Fresh store re-reads the seeded file via load() (no in-memory cache).
+	s := &sessionQueueStore{path: queuePath(root, "s1")}
+	got, err := s.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(got) != 1 || got[0].State != QueueUnknown {
+		t.Fatalf("legacy dispatching not recovered: got state=%s, want unknown", got[0].State)
+	}
+	if got[0].DispatchStartedAt != 0 {
+		t.Fatalf("legacy recovery mutated DispatchStartedAt = %d, want 0 preserved", got[0].DispatchStartedAt)
+	}
+	if got[0].Detail != staleDispatchRecoveryDetail {
+		t.Fatalf("legacy recovery Detail = %q, want diagnostic text", got[0].Detail)
+	}
+	if got[0].ResolvedAt <= 0 {
+		t.Fatalf("legacy recovery ResolvedAt = %d, want > 0", got[0].ResolvedAt)
+	}
+}
+
+// 10. pending/sent/failed/existing-unknown items unchanged by recovery. Only
+// dispatching items are ever recovered; every other state is left alone.
+func TestQueueRecoveryLeavesNonDispatchingStatesUnchanged(t *testing.T) {
+	s, _ := newTestStore(t, "s1")
+	// Order so Claim drains the three terminal-destined items first (FIFO),
+	// leaving the last one pending.
+	sent := mustEnqueue(t, s, "to-sent")
+	failed := mustEnqueue(t, s, "to-failed")
+	unknown := mustEnqueue(t, s, "to-unknown")
+	pending := mustEnqueue(t, s, "stays-pending")
+
+	// Claim+resolve each terminal-destined item in FIFO order.
+	claimed, won, err := s.Claim()
+	if err != nil || !won || claimed.ID != sent.ID {
+		t.Fatalf("claim sent-destined: won=%v err=%v got=%q want=%q", won, err, claimed.ID, sent.ID)
+	}
+	if _, err := s.Resolve(claimed.ID, QueueSent, "sent-detail"); err != nil {
+		t.Fatalf("resolve sent: %v", err)
+	}
+	claimed, won, err = s.Claim()
+	if err != nil || !won || claimed.ID != failed.ID {
+		t.Fatalf("claim failed-destined: won=%v err=%v got=%q want=%q", won, err, claimed.ID, failed.ID)
+	}
+	if _, err := s.Resolve(claimed.ID, QueueFailed, "failed-detail"); err != nil {
+		t.Fatalf("resolve failed: %v", err)
+	}
+	claimed, won, err = s.Claim()
+	if err != nil || !won || claimed.ID != unknown.ID {
+		t.Fatalf("claim unknown-destined: won=%v err=%v got=%q want=%q", won, err, claimed.ID, unknown.ID)
+	}
+	if _, err := s.Resolve(claimed.ID, QueueUnknown, "unknown-detail"); err != nil {
+		t.Fatalf("resolve unknown: %v", err)
+	}
+	// pending stays pending (never claimed).
+
+	// List() triggers recovery. None of the items are dispatching, so recovery
+	// must be a no-op: every item retains its pre-List state and detail.
+	got, err := s.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := map[string]QueueItem{}
+	for _, it := range got {
+		byID[it.ID] = it
+	}
+	checkState := func(id string, wantState QueueItemState, wantDetail string) {
+		t.Helper()
+		it, ok := byID[id]
+		if !ok {
+			t.Fatalf("item %q missing from List result", id)
+		}
+		if it.State != wantState {
+			t.Errorf("item %q state = %s, want %s (recovery mutated a non-dispatching item)", id, it.State, wantState)
+		}
+		if wantDetail != "" && it.Detail != wantDetail {
+			t.Errorf("item %q detail = %q, want %q", id, it.Detail, wantDetail)
+		}
+	}
+	checkState(sent.ID, QueueSent, "sent-detail")
+	checkState(failed.ID, QueueFailed, "failed-detail")
+	checkState(unknown.ID, QueueUnknown, "unknown-detail")
+	checkState(pending.ID, QueuePending, "")
+}
+
+// 11. A later Resolve(id, QueueSent, ...) can upgrade a recovery-produced
+// unknown to sent. This confirms the existing terminal→terminal transition
+// still works on recovered items: recovery's `unknown` is a real terminal
+// state, and a delayed confirmation (e.g., a late OpenCode ack arriving) can
+// refine it without any special-case code.
+func TestQueueRecoveredUnknownCanBeResolvedToSent(t *testing.T) {
+	s, _ := newTestStore(t, "s1")
+	now := time.Now()
+	staleStartedAt := now.Add(-staleDispatchThreshold - time.Second).UnixMilli()
+	seedDispatchingItem(t, s, "q-stale", "stale", staleStartedAt)
+	// Recovery → unknown.
+	got, err := s.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].State != QueueUnknown {
+		t.Fatalf("precondition: want unknown after recovery, got %+v", got)
+	}
+	// A later resolve to sent must succeed (terminal→terminal transition).
+	resolved, err := s.Resolve(got[0].ID, QueueSent, "late-confirmation")
+	if err != nil {
+		t.Fatalf("resolve recovered-unknown to sent: %v", err)
+	}
+	if resolved.State != QueueSent || resolved.Detail != "late-confirmation" {
+		t.Fatalf("resolve result: got state=%s detail=%q, want sent/late-confirmation", resolved.State, resolved.Detail)
+	}
+	after, _ := s.List()
+	if len(after) != 1 || after[0].State != QueueSent || after[0].Detail != "late-confirmation" {
+		t.Fatalf("after resolve: got state=%s detail=%q, want sent/late-confirmation", after[0].State, after[0].Detail)
 	}
 }
