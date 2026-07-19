@@ -48,24 +48,52 @@ func DemoDir() string {
 
 // FakeOpenCode implements the subset of OpenCode's HTTP API the daemon uses.
 type FakeOpenCode struct {
-	mu          sync.Mutex
-	sessions    []map[string]any
-	messages    map[string][]messageWithParts // sessionID -> ordered messages
-	subs        map[int]chan string
-	nextSub     int
-	counter     int
-	pendingQ    map[string]string             // questionID -> sessionID
-	pendingQReq map[string]map[string]any     // questionID -> full question request
-	pendingP    map[string]map[string]any     // permissionID -> full permission request
-	archived    map[string]bool               // sessionID -> archived (native time.archived)
-	busy        map[string]string             // sessionID -> status type (busy/retry); mirrors /session/status
-	baseline    map[string][]messageWithParts // sessionID -> seeded message list snapshot for /fixture/reset
+	mu              sync.Mutex
+	sessions        []map[string]any
+	messages        map[string][]messageWithParts // sessionID -> ordered messages
+	subs            map[int]chan string
+	nextSub         int
+	counter         int
+	pendingQ        map[string]string             // questionID -> sessionID
+	pendingQReq     map[string]map[string]any     // questionID -> full question request
+	pendingP        map[string]map[string]any     // permissionID -> full permission request
+	archived        map[string]bool               // sessionID -> archived (native time.archived)
+	busy            map[string]string             // sessionID -> status type (busy/retry); mirrors /session/status
+	baseline        map[string][]messageWithParts // sessionID -> seeded message list snapshot for /fixture/reset
+	promptAsyncMode PromptAsyncMode               // test-only; default PromptAsyncNormal (see PromptAsyncMode doc)
 }
 
 type messageWithParts struct {
 	Info  map[string]any   `json:"info"`
 	Parts []map[string]any `json:"parts"`
 }
+
+// PromptAsyncMode selects how the fake's /session/{id}/prompt_async handler
+// responds. It models the ambiguous-receipt window the queue recovery contract
+// (FIX-QUEUE-STUCK-1) targets: production prompt_async persists the user message
+// BEFORE returning 204, so a response loss leaves the queue item stuck in
+// `dispatching` with no way to resolve. Test-only: production never switches
+// mode (the default PromptAsyncNormal is the faithful path).
+type PromptAsyncMode int
+
+const (
+	// PromptAsyncNormal is the faithful path: fork the turn, persist the user
+	// message via simulatePrompt, and return 204 immediately. The assistant
+	// reply arrives over the event stream.
+	PromptAsyncNormal PromptAsyncMode = iota
+	// PromptAsyncCommitThenDropResponse persists the user message, then DROPS the
+	// HTTP response (hijacks + closes the connection without writing a 204). The
+	// worker's reverse proxy sees a backend error (not 204), so the browser/queue
+	// can never resolve the item. Used by the in-process e2e queue-recovery test
+	// (tests/e2e) to prove FIX-QUEUE-STUCK-1's recovery contract end-to-end:
+	// after the stale threshold the queue item recovers to terminal `unknown` on
+	// the next List(), with NO redispatch (exactly one committed user message).
+	PromptAsyncCommitThenDropResponse
+	// PromptAsyncRejectBeforeCommit returns an error WITHOUT persisting the user
+	// message — the clean-rejection path (OpenCode never received the prompt).
+	// Defined for completeness/future tests; not exercised by the recovery slice.
+	PromptAsyncRejectBeforeCommit
+)
 
 // New returns a FakeOpenCode seeded with a small, deterministic dataset: two
 // root sessions, one subsession, and a session with a rendered-markdown text
@@ -289,6 +317,86 @@ func textPart(msgID, sessionID, partID, text string, t float64) map[string]any {
 		"id": partID, "sessionID": sessionID, "messageID": msgID, "type": "text",
 		"text": text, "time": map[string]any{"start": t, "end": t},
 	}
+}
+
+// SetPromptAsyncMode overrides the prompt_async response mode. TEST-ONLY: the
+// shared fixture defaults to PromptAsyncNormal (the faithful path). The e2e
+// queue-recovery test (tests/e2e) switches to CommitThenDropResponse to model
+// the ambiguous-receipt window. The fixture is concurrent, so the mode is
+// mutex-guarded.
+func (f *FakeOpenCode) SetPromptAsyncMode(mode PromptAsyncMode) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.promptAsyncMode = mode
+}
+
+// PromptAsyncMode returns the current prompt_async response mode.
+func (f *FakeOpenCode) PromptAsyncModeNow() PromptAsyncMode {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.promptAsyncMode
+}
+
+// UserMessageCount returns the number of committed user messages for a session.
+// It reads the fake's in-memory message store (the same store simulatePrompt
+// and commitUserMessage append to), so it reflects what OpenCode has durably
+// recorded regardless of whether any HTTP response reached the caller. Used by
+// the e2e queue-recovery test to prove NO redispatch occurred (recovery must
+// never re-issue the prompt, so exactly one user message is committed).
+func (f *FakeOpenCode) UserMessageCount(sessionID string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, m := range f.messages[sessionID] {
+		if role, _ := m.Info["role"].(string); role == "user" {
+			n++
+		}
+	}
+	return n
+}
+
+// commitUserMessage persists a single user message for a session and returns
+// the allocated counter. It is the "commit" half of the
+// CommitThenDropResponse mode: the user turn is durably recorded (exactly what
+// real OpenCode does before returning 204), but the caller never sees a
+// response. Single lock acquisition makes the commit atomic with the counter
+// allocation. Does NOT emit events or start an assistant turn — the dispatch is
+// considered lost, so no assistant reply streams.
+func (f *FakeOpenCode) commitUserMessage(sessionID, text string) int {
+	now := float64(time.Now().UnixMilli())
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.counter++
+	n := f.counter
+	userID := fmt.Sprintf("u%d", n)
+	upID := fmt.Sprintf("up%d", n)
+	userInfo := map[string]any{"id": userID, "sessionID": sessionID, "role": "user",
+		"time": map[string]any{"created": now, "completed": now}}
+	userPart := textPart(userID, sessionID, upID, text, now)
+	f.messages[sessionID] = append(f.messages[sessionID],
+		messageWithParts{Info: userInfo, Parts: []map[string]any{userPart}})
+	return n
+}
+
+// dropResponse simulates a lost HTTP response by hijacking and immediately
+// closing the underlying connection WITHOUT writing a valid status line. The
+// worker's reverse proxy then observes a backend error (not 204), modeling the
+// network-drop / browser-crash / timeout scenario the queue recovery contract
+// targets. If the response writer is not hijackable, it falls back to a 502 so
+// the caller still observes an error outcome (never 204).
+func (f *FakeOpenCode) dropResponse(w http.ResponseWriter) {
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "fixture: response dropped (no hijack)", http.StatusBadGateway)
+		return
+	}
+	conn, _, err := hj.Hijack()
+	if err != nil {
+		http.Error(w, "fixture: hijack failed", http.StatusInternalServerError)
+		return
+	}
+	// Closing without writing a status line forces the proxy's read to error.
+	_ = conn.Close()
 }
 
 // Handler returns the HTTP handler for the fake OpenCode API.
@@ -668,13 +776,38 @@ func (f *FakeOpenCode) handleSession(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]any{"ok": true})
 		return
 	case action == "prompt_async" && r.Method == http.MethodPost:
-		// Mirror real OpenCode: fork the turn and return 204 immediately; the
-		// reply arrives over the event stream.
+		// Mirror real OpenCode: persist the user message and return 204
+		// immediately; the reply arrives over the event stream. The response
+		// MODE is test-controllable (SetPromptAsyncMode) so the e2e
+		// queue-recovery test can model the ambiguous-receipt window
+		// (commit-then-drop) that FIX-QUEUE-STUCK-1's recovery targets.
 		body := map[string]any{}
 		_ = json.NewDecoder(r.Body).Decode(&body)
-		go f.simulatePrompt(id, promptText(body))
-		w.WriteHeader(http.StatusNoContent)
-		return
+		text := promptText(body)
+		f.mu.Lock()
+		mode := f.promptAsyncMode
+		f.mu.Unlock()
+		switch mode {
+		case PromptAsyncCommitThenDropResponse:
+			// Commit the user message FIRST (real OpenCode persists before
+			// responding), THEN drop the response. The queue item is now stuck
+			// in `dispatching`: OpenCode recorded the turn but the caller never
+			// got the 204, so it can never resolve to sent/failed. No assistant
+			// turn is started — the dispatch is considered lost.
+			f.commitUserMessage(id, text)
+			f.dropResponse(w)
+			return
+		case PromptAsyncRejectBeforeCommit:
+			// Clean rejection: NO user message persisted (OpenCode never
+			// received the prompt). Not exercised by the recovery slice.
+			http.Error(w, "fixture: rejected before commit", http.StatusBadGateway)
+			return
+		default:
+			// PromptAsyncNormal: the faithful path.
+			go f.simulatePrompt(id, text)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 	}
 
 	// Slow-hydration fixture mode (e2e reveal-gate coverage): hold the "slow"

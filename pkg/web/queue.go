@@ -29,6 +29,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/vhqtvn/vh-solara/pkg/projectcfg"
@@ -221,6 +222,42 @@ func (s *sessionQueueStore) save() error {
 // in-flight dispatches; 30s leaves a comfortable margin.
 const staleDispatchThreshold = 30 * time.Second
 
+// staleDispatchThresholdOverride is a TEST-ONLY override for the stale-dispatch
+// threshold. The production default is the const above; this atomic is 0 in
+// normal operation (and in any production deployment, which never calls
+// SetStaleDispatchThresholdForTest). The in-process e2e queue-recovery test
+// (tests/e2e) sets it to a small value (e.g. 200ms) via
+// SetStaleDispatchThresholdForTest so the recovery contract can be exercised
+// through the real HTTP stack without a 30-second wall-clock wait. It MUST
+// remain an atomic (not a plain var) so the test-time write and the List()-time
+// read can never race under `go test -race`.
+var staleDispatchThresholdOverride atomic.Int64 // milliseconds; 0 = use const default
+
+// currentStaleThreshold returns the effective stale-dispatch threshold: the
+// test override if one is set, otherwise the production const. Used at the
+// single recovery read site (recoverStaleDispatchingLocked) so the override is
+// consulted on every List().
+func currentStaleThreshold() time.Duration {
+	if ms := staleDispatchThresholdOverride.Load(); ms > 0 {
+		return time.Duration(ms) * time.Millisecond
+	}
+	return staleDispatchThreshold
+}
+
+// SetStaleDispatchThresholdForTest overrides the stale-dispatch threshold for
+// the in-process e2e suite. TEST-ONLY: production code MUST NOT call this — the
+// 30s default is a deliberate margin over the frontend's 12s dispatch timeout,
+// and shortening it in production would recover genuinely in-flight dispatches.
+// Pass d <= 0 (e.g. 0) to restore the default. Callers SHOULD defer-restore
+// the default when done. Race-free (backed by sync/atomic).
+func SetStaleDispatchThresholdForTest(d time.Duration) {
+	if d <= 0 {
+		staleDispatchThresholdOverride.Store(0)
+		return
+	}
+	staleDispatchThresholdOverride.Store(int64(d / time.Millisecond))
+}
+
 // staleDispatchRecoveryDetail is the operator-facing diagnostic text recorded
 // on any item recovered to `unknown` by stale-dispatch recovery. It explains
 // why the item left `dispatching` without a confirmed outcome and warns against
@@ -250,7 +287,7 @@ const staleDispatchRecoveryDetail = "Recovery: dispatch was interrupted and coul
 // wall-clock sleeps.
 func (s *sessionQueueStore) recoverStaleDispatchingLocked(now time.Time) (changed bool, err error) {
 	nowMs := now.UnixMilli()
-	thresholdMs := int64(staleDispatchThreshold / time.Millisecond)
+	thresholdMs := int64(currentStaleThreshold() / time.Millisecond)
 	for i := range s.items {
 		if s.items[i].State != QueueDispatching {
 			continue
