@@ -34,9 +34,17 @@ export interface ColdOpenEntry {
   ts: number;
   /** The session whose Stream-2 open completed. */
   sessionId: string;
-  /** Stream-2 onopen → first event (ms). */
+  /**
+   * EventSource construction → onopen (ms). PURE TRANSPORT (DNS/TCP/TLS/
+   * handshake through the controller tunnel) — NOT total session-open time.
+   * The server flushes `: hello\n\n` immediately at handler entry precisely
+   * so this stays pure-transport. For total user-perceived open time see
+   * `total` on the rendered entryLine (= open + snap + hydrate when cold).
+   * Named `open` on the persisted shape for back-compat; rendered as `conn`
+   * in the diag log line and ServersPanel to match its actual meaning.
+   */
   open?: number;
-  /** Stream-2 onopen → first snapshot (ms). */
+  /** Stream-2 onopen → first snapshot frame arrival (ms). */
   snap?: number;
   /** First snapshot → messages.loaded (ms). A finite number = a cold open. */
   hydrate?: number;
@@ -46,6 +54,51 @@ export interface ColdOpenEntry {
   reconcileMs?: number;
 }
 export type DiagEntry = ColdOpenEntry;
+
+// --- entryLine rendering ----------------------------------------------------
+// One entry -> a single copy-friendly line. The label `conn` (not the persisted
+// field name `open`) is intentional: `open` was misread as "total session-open
+// time" when in fact it is pure transport (see ColdOpenEntry.open doc). The
+// rendered line leads with `total` (= open + snap + hydrate for a cold open) so
+// a future operator can read the user-perceived wait at a glance without
+// mistaking the transport-only field for it.
+//
+// `switch (kind)` is the extension point: a new entry kind adds a case here.
+// With a single union member TS knows the switch is exhaustive; adding a kind
+// makes it non-exhaustive → compile error nudges the renderer to grow alongside
+// the type (no runtime guard needed).
+// Number.isFinite (not typeof === "number") so a malformed/non-finite timing
+// value renders as `—` rather than `NaN` — defensive, since real captured
+// entries always carry finite numbers but the formatter is pure and may be
+// exercised with arbitrary inputs by future kinds/tests.
+const fmtMs = (v: number | undefined): string => (Number.isFinite(v) ? `${v}` : "—");
+
+const iso = (ts: number): string => {
+  try {
+    return new Date(ts).toISOString();
+  } catch {
+    return String(ts);
+  }
+};
+
+// Total user-perceived cold-open time = transport + snapshot transit + cold
+// fetch. Defensive: if any leg is missing or non-finite (e.g. an older client
+// that didn't stamp all three), `total` renders as "—" rather than a misleading
+// partial sum. Warm sessions are never captured (the reactive trigger requires
+// a finite hydrate), so hydrate is always a number on a real entry.
+function coldOpenTotal(e: ColdOpenEntry): number | undefined {
+  if (!Number.isFinite(e.open) || !Number.isFinite(e.snap) || !Number.isFinite(e.hydrate)) {
+    return undefined;
+  }
+  return e.open! + e.snap! + e.hydrate!;
+}
+
+export function entryLine(e: DiagEntry): string {
+  switch (e.kind) {
+    case "cold-open":
+      return `${iso(e.ts)} cold-open sess=${e.sessionId} total=${fmtMs(coldOpenTotal(e))} conn=${fmtMs(e.open)} snap=${fmtMs(e.snap)} hydrate=${fmtMs(e.hydrate)} fetch=${fmtMs(e.fetchMs)} recon=${fmtMs(e.reconcileMs)}`;
+  }
+}
 
 // --- Persistence keys (project-scoped, versioned) --------------------------
 const lsOn = (dir: string) => `vh.diaglog.on:${dir}`;

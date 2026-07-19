@@ -9,6 +9,7 @@ import {
   diagLogEnabled,
   diagLogOn,
   enforceCaps,
+  entryLine,
   setDiagLogOn,
   type ColdOpenEntry,
 } from "../../src/sync/diaglog";
@@ -139,5 +140,87 @@ describe("diaglog — foreign / migrated persisted payload recovery", () => {
     localStorage.setItem("vh.diaglog.entries:", JSON.stringify({ notOurShape: true }));
     _resetDiagForTest();
     expect(diagEntries()).toEqual([]);
+  });
+});
+
+// entryLine renders the operator-facing diag log line. The previous shape used
+// `open=` for the pure-transport field, which read as "total session-open time"
+// and sent investigations down the wrong path (16.5s transport was mistaken for
+// 16.5s total). The line now leads with `total=` (sum of conn+snap+hydrate for
+// cold opens) and labels the transport field `conn=` to match ServersPanel.
+describe("diaglog — entryLine rendering", () => {
+  it("renders total + conn (not open) and the breakdown fields", () => {
+    const line = entryLine({
+      kind: "cold-open",
+      ts: Date.UTC(2026, 6, 18, 14, 36, 0, 808),
+      sessionId: "ses_092bcefffffettkRlJjenuBUOX",
+      open: 16540,
+      snap: 1,
+      hydrate: 4969,
+      fetchMs: 4900,
+      reconcileMs: 60,
+    });
+    // total is the sum (16540 + 1 + 4969 = 21510), NOT the misread 16540.
+    expect(line).toContain("total=21510");
+    // Transport-only field is labeled `conn`, matching ServersPanel; the old
+    // `open=` label is GONE so future operators can't misread it as total.
+    expect(line).toContain("conn=16540");
+    expect(line).not.toMatch(/\bopen=/);
+    expect(line).toContain("snap=1");
+    expect(line).toContain("hydrate=4969");
+    expect(line).toContain("fetch=4900");
+    expect(line).toContain("recon=60");
+    expect(line).toContain("sess=ses_092bcefffffettkRlJjenuBUOX");
+  });
+
+  it("renders — for missing optional fields and omits total when not computable", () => {
+    // hydrate missing → total can't be summed (defensive against partial
+    // captures); the breakdown fields still render so the operator sees what
+    // IS measured.
+    const line = entryLine({
+      kind: "cold-open",
+      ts: 1000,
+      sessionId: "s1",
+      open: 50,
+      snap: 5,
+    });
+    expect(line).toContain("total=—");
+    expect(line).toContain("conn=50");
+    expect(line).toContain("hydrate=—");
+    expect(line).toContain("fetch=—");
+    expect(line).toContain("recon=—");
+  });
+
+  it("renders — across the board for a near-empty entry", () => {
+    const line = entryLine({ kind: "cold-open", ts: 1, sessionId: "s" });
+    expect(line).toContain("total=—");
+    expect(line).toContain("conn=—");
+    expect(line).toContain("snap=—");
+    expect(line).toContain("hydrate=—");
+    expect(line).toContain("fetch=—");
+    expect(line).toContain("recon=—");
+  });
+
+  it("renders — for non-finite numbers (NaN/Infinity), not 'NaN'", () => {
+    // A malformed timing value must not leak through as "NaN"/"Infinity" — the
+    // operator reads "—" as "no signal", and "NaN" reads as garbage. Guards
+    // against typeof === "number" returning true for NaN.
+    const line = entryLine({
+      kind: "cold-open",
+      ts: 1,
+      sessionId: "s",
+      open: Number.NaN,
+      snap: Number.POSITIVE_INFINITY,
+      hydrate: -42, // finite but the other legs aren't → total undefinable
+      fetchMs: Number.NaN,
+      reconcileMs: 5,
+    });
+    expect(line).toContain("conn=—");
+    expect(line).toContain("snap=—");
+    expect(line).toContain("total=—"); // NaN + Infinity + (-42) → not finite → —
+    expect(line).toContain("fetch=—");
+    expect(line).toContain("recon=5"); // finite reconcile still renders
+    expect(line).not.toMatch(/\bNaN\b/);
+    expect(line).not.toMatch(/\bInfinity\b/);
   });
 });

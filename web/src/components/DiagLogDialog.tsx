@@ -2,10 +2,10 @@ import { createMemo, For, onCleanup, onMount, Show } from "solid-js";
 import {
   diagEntries,
   diagLogEnabled,
+  entryLine,
   MAX_DIAG_AGE_MS,
   MAX_DIAG_ENTRIES,
   setDiagLogOn,
-  type DiagEntry,
 } from "../sync/diaglog";
 import { projectDir } from "../sync";
 import Icon from "./Icon";
@@ -16,25 +16,6 @@ import styles from "./DiagLogDialog.module.css";
 // Settings button). Lets the operator select/copy one or all entries. The caps
 // and the default-off toggle are shown in-app so the "must not log too much"
 // guarantee is visible, not magic.
-const ms = (v: number | undefined): string => (typeof v === "number" ? `${v}` : "—");
-const iso = (ts: number): string => {
-  try {
-    return new Date(ts).toISOString();
-  } catch {
-    return String(ts);
-  }
-};
-
-// One entry -> a single copy-friendly line. `switch (kind)` is the extension
-// point: a new entry kind adds a case here. With a single union member TS knows
-// the switch is exhaustive; adding a kind makes it non-exhaustive → compile
-// error nudges the renderer to grow alongside the type (no runtime guard needed).
-function entryLine(e: DiagEntry): string {
-  switch (e.kind) {
-    case "cold-open":
-      return `${iso(e.ts)} cold-open sess=${e.sessionId} open=${ms(e.open)} snap=${ms(e.snap)} hydrate=${ms(e.hydrate)} fetch=${ms(e.fetchMs)} recon=${ms(e.reconcileMs)}`;
-  }
-}
 
 const mins = (msVal: number) => `${Math.round(msVal / 60000)} min`;
 
@@ -82,8 +63,10 @@ export default function DiagLogDialog(props: { onClose: () => void }) {
           </label>
           <p class={styles.help}>
             Off by default. When off, nothing is recorded. When on, each cold session open appends one
-            entry (session id + timestamp + open/snap/hydrate/fetchMs/reconcileMs). Older entries age
-            out automatically.
+            entry (session id + timestamp + total/conn/snap/hydrate/fetchMs/reconcileMs).
+            <code>total</code> = user-perceived cold-open time (conn + snap + hydrate);
+            <code>conn</code> = pure transport (EventSource construction → onopen) — NOT total time.
+            Older entries age out automatically.
           </p>
 
           <div class={styles.caps}>
