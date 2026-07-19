@@ -45,8 +45,32 @@ hand-write overlay specialists here — declare them in the overlay pack's snipp
   - `commit-reviewer`
   - `ship-review`
   - `solution-brief`
+  - `media-perception` (opt-in via the `core/media-perception` capability;
+    not in any profile preset)
 - Editable specialists (core):
   - `docs-steward`
+
+## Opt-in perception routing
+
+`media-perception` is a single read-only perception specialist with
+`task: { "*": "deny" }`. It is rendered ONLY when the project selects the
+`core/media-perception` capability in `vh-harness-profile.yml`; when
+unselected, the agent block is absent and the inbound edges below are
+dropped by the permission emitter's present-agent filter.
+
+Four baseline callers may delegate to it (`media-perception: allow`):
+
+- `build`
+- `coordination`
+- `project-coordinator`
+- `researcher` (single outbound edge on an otherwise read-only leaf, so a
+  researcher holding a media locator can hand off perception)
+
+Callers hand the specialist a `path:` or `url:` locator plus a modality hint
+and the full question set; the specialist returns one consolidated report
+with `capability_status: available | unavailable | uncertain`. See the
+`media-perception` skill for the caller-facing two-path routing guidance
+(in-context perception vs single-delegation).
 
 ## Internal cluster pattern
 

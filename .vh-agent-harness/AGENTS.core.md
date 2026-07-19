@@ -233,6 +233,7 @@ When making changes:
   - `commit-message` for reviewed, file-list-scoped commit message drafting without running `git commit`
   - `commit-reviewer` for tiered cascade review of a change slice (config-driven tiered cascade with fail-fast escalation)
   - `ship-review` for final whole-change read-only review before merge or promotion
+  - `media-perception` (opt-in via the `core/media-perception` capability) for perceiving media handed over as a `path:` or `url:` locator when no compatible capability is exposed to the caller — read-only leaf, returns one consolidated report with `capability_status: available | unavailable | uncertain`, never fabricates observations
   <!-- PROJECT: add project-specific specialists here (e.g. domain auditors, builder roles, runtime/registry guardians, deployment roles). -->
 - Agent usage guidance:
   - use `researcher` when the task depends on facts: existing patterns, docs, API behavior, version constraints, prior decisions, or contradictions
