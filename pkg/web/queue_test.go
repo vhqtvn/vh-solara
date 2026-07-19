@@ -249,12 +249,14 @@ func TestQueueConcurrentEnqueuesPreserved(t *testing.T) {
 	}
 }
 
-func TestQueueRemoveOnlyPending(t *testing.T) {
+func TestQueueRemoveRejectsDispatchingAcceptsPending(t *testing.T) {
 	s, _ := newTestStore(t, "s1")
 	a := mustEnqueue(t, s, "a")
 	b := mustEnqueue(t, s, "b")
 
-	// Claim b's predecessor a → a is now dispatching, not removable.
+	// Claim b's predecessor a → a is now dispatching, not removable (the
+	// active-dispatch safety guard: the state machine must own its transition
+	// to terminal first).
 	if _, won, err := s.Claim(); err != nil || !won {
 		t.Fatalf("claim: won=%v err=%v", won, err)
 	}
@@ -272,6 +274,84 @@ func TestQueueRemoveOnlyPending(t *testing.T) {
 	// Missing item → not-found.
 	if err := s.Remove("q-does-not-exist"); !errors.Is(err, errQueueNotFound) {
 		t.Fatalf("remove missing: err=%v, want errQueueNotFound", err)
+	}
+}
+
+// TestQueueRemoveAcceptsTerminalStates pins FIX-QUEUE-GC-4: operators may
+// explicitly dismiss terminal items (sent/failed/unknown) that today accumulate
+// forever. The docstring at queue.go:19-21 promises terminal items "persist
+// until explicit operator dismissal" — this test pins the missing dismissal
+// path. For each terminal state: setup the item, remove it, assert success,
+// assert the survivors persisted, and assert a fresh store on the same path
+// sees the survivors (atomic persistence contract).
+func TestQueueRemoveAcceptsTerminalStates(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		state QueueItemState
+	}{
+		{"sent", QueueSent},
+		{"failed", QueueFailed},
+		{"unknown", QueueUnknown},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, root := newTestStore(t, "s1")
+			// Enqueue two items; claim+resolve the first to the target terminal
+			// state, leaving the second pending as a survivor we can verify
+			// persisted across the removal.
+			target := mustEnqueue(t, s, "to-"+tc.name)
+			survivor := mustEnqueue(t, s, "survivor")
+			if _, won, err := s.Claim(); err != nil || !won {
+				t.Fatalf("claim: won=%v err=%v", won, err)
+			}
+			if _, err := s.Resolve(target.ID, tc.state, "detail-"+tc.name); err != nil {
+				t.Fatalf("resolve to %s: %v", tc.name, err)
+			}
+
+			// Remove the terminal item — must succeed (the new dismissal path).
+			if err := s.Remove(target.ID); err != nil {
+				t.Fatalf("remove terminal %s item: %v", tc.name, err)
+			}
+
+			// Survivors persisted in memory: only the pending survivor remains.
+			got, err := s.List()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(got) != 1 || got[0].ID != survivor.ID {
+				t.Fatalf("%s: after remove, got %+v, want only [survivor]", tc.name, got)
+			}
+
+			// Atomic persistence: a fresh store on the same path sees the
+			// survivors, not the removed item. Pins the temp-file + fsync +
+			// rename contract used by save() — never a half-written queue.json.
+			s2 := &sessionQueueStore{path: queuePath(root, "s1")}
+			got2, err := s2.List()
+			if err != nil {
+				t.Fatalf("reload: %v", err)
+			}
+			if len(got2) != 1 || got2[0].ID != survivor.ID {
+				t.Fatalf("%s: reload lost survivor or resurrected removed item: %+v", tc.name, got2)
+			}
+		})
+	}
+}
+
+// TestQueueRemoveIsIdempotentAfterRemoval pins the idempotent re-removal
+// contract: a second Remove() of an already-removed id returns errQueueNotFound
+// (graceful missing-item handling), NOT a silent ok and NOT a panic. This
+// matters for stale-id retries from the FE (network blip → re-DELETE) and for
+// concurrent dismissal attempts across browser tabs.
+func TestQueueRemoveIsIdempotentAfterRemoval(t *testing.T) {
+	s, _ := newTestStore(t, "s1")
+	a := mustEnqueue(t, s, "a")
+	if err := s.Remove(a.ID); err != nil {
+		t.Fatalf("first remove: %v", err)
+	}
+	// Second remove of the same id: item is gone → errQueueNotFound (NOT a
+	// silent ok, so the caller can distinguish "removed just now" from "was
+	// already gone").
+	if err := s.Remove(a.ID); !errors.Is(err, errQueueNotFound) {
+		t.Fatalf("second remove: err=%v, want errQueueNotFound", err)
 	}
 }
 
@@ -558,8 +638,10 @@ func TestQueueHTTPEndpointRoundTrip(t *testing.T) {
 		t.Fatalf("resolve to pending: got %d, want 400", rrBad.StatusCode)
 	}
 
-	// Remove a dispatching item → 409.
-	req, _ := http.NewRequest(http.MethodDelete, web.URL+"/vh/session/"+sid+"/queue/"+claim.Item.ID, nil)
+	// Remove a dispatching item (claim2 = "second", still in flight) → 409.
+	// The active-dispatch safety guard: the state machine must own the
+	// transition to terminal first.
+	req, _ := http.NewRequest(http.MethodDelete, web.URL+"/vh/session/"+sid+"/queue/"+claim2.Item.ID, nil)
 	req.Header.Set(csrfHeader, "1")
 	dr, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -568,6 +650,20 @@ func TestQueueHTTPEndpointRoundTrip(t *testing.T) {
 	dr.Body.Close()
 	if dr.StatusCode != http.StatusConflict {
 		t.Fatalf("remove dispatching: got %d, want 409", dr.StatusCode)
+	}
+
+	// Remove a TERMINAL item (claim = "first", resolved to failed above) → 200.
+	// This is the FIX-QUEUE-GC-4 dismissal path: operators may explicitly clear
+	// recovered/failed items from view.
+	req2, _ := http.NewRequest(http.MethodDelete, web.URL+"/vh/session/"+sid+"/queue/"+claim.Item.ID, nil)
+	req2.Header.Set(csrfHeader, "1")
+	dr2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dr2.Body.Close()
+	if dr2.StatusCode != 200 {
+		t.Fatalf("remove terminal failed: got %d, want 200", dr2.StatusCode)
 	}
 
 	// The queue file is durable on disk (archive cleanup is exercised at the

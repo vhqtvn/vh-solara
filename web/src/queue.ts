@@ -197,8 +197,11 @@ export async function enqueue(sessionId: string, input: QueueInput): Promise<Que
   return item;
 }
 
-// removeQueued deletes a PENDING item. The backend rejects non-pending removal
-// (409); on that, refresh the cache so the UI reflects the real state.
+// removeQueued deletes an item. The backend accepts removal of `pending`
+// (cancel before dispatch) and terminal `sent`/`failed`/`unknown` (explicit
+// dismissal — FIX-QUEUE-GC-4); a `dispatching` item is rejected (409) because
+// the dispatch may be in flight. On 409, refresh the cache so the UI reflects
+// the real (still-dispatching) state.
 export async function removeQueued(sessionId: string, id: string): Promise<void> {
   const res = await fetch(queueUrl(sessionId, `/${encodeURIComponent(id)}`), {
     method: "DELETE",
@@ -212,7 +215,8 @@ export async function removeQueued(sessionId: string, id: string): Promise<void>
   }
   if (res.status === 404) return; // already gone — reflect nothing
   if (res.status === 409) {
-    // Item is no longer pending (dispatching/terminal) — refresh to show truth.
+    // Item is dispatching (in flight) — the state machine must own the
+    // transition to terminal first. Refresh to show the real state.
     await fetchQueue(sessionId);
     return;
   }

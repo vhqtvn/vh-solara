@@ -17,6 +17,15 @@ import Icon from "./Icon";
 // data-tip tooltip — so the operator sees the duplicate-risk warning at a
 // glance. No resend/retry button is ever rendered for terminal items (recovery
 // means the operator creates a NEW message, never reviving this one).
+//
+// Dismissal (FIX-QUEUE-GC-4): the remove (x) button is shown for `pending`
+// (cancel before dispatch) and for terminal `failed`/`unknown` (explicit
+// operator dismissal — clears the chip from view). It is NEVER shown for
+// `dispatching` (the dispatch may be in flight; the state machine must own the
+// transition to terminal first). `sent` is filtered from the visible queue
+// upstream (queueFor), so no dismiss surface is needed for it. The same button
+// + label ("Remove queued message") is used for all dismissable states — the
+// operator's intent is the same ("clear this chip") regardless of state.
 export function QueueChip(props: {
   q: QueuedMessage;
   sessionId: string;
@@ -48,7 +57,7 @@ export function QueueChip(props: {
           <span class="queue-state">{label()}</span>
         </Show>
         <span class="queue-text">{props.q.text || "(attachment)"}</span>
-        <Show when={props.q.state === "pending"}>
+        <Show when={props.q.state === "pending" || props.q.state === "failed" || props.q.state === "unknown"}>
           <button
             type="button"
             aria-label="Remove queued message"

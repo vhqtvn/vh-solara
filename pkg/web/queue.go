@@ -104,7 +104,7 @@ type queueFile struct {
 // Sentinel errors for the store. The HTTP layer maps these to status codes.
 var (
 	errQueueNotFound     = errors.New("queue item not found")
-	errQueueNotRemovable = errors.New("only pending items are removable")
+	errQueueNotRemovable = errors.New("dispatching items cannot be removed while in flight")
 	errQueueNotClaimed   = errors.New("item is not dispatching (claim first)")
 	errQueueCannotRepend = errors.New("resolve cannot return an item to pending")
 	// errQueueArchived signals that the sessionQueueStore has been tombstoned by
@@ -354,9 +354,14 @@ func (s *sessionQueueStore) Enqueue(text string, attachments []QueueAttachment, 
 	return item, nil
 }
 
-// Remove deletes a pending item. Only pending items are removable; a
-// dispatching/terminal item reflects a send that already happened (or failed)
-// and must stay visible until explicit dismissal.
+// Remove deletes an item by id. Operators may dismiss any item that is not
+// actively in flight: `pending` (cancel before dispatch), and terminal states
+// `sent`/`failed`/`unknown` (clear a recovered or completed item from view).
+// `dispatching` is the sole non-removable state — the dispatch may be in
+// flight, so the state machine must own its transition to a terminal state
+// first. Survivor persistence is atomic (temp-file + fsync + rename via
+// save()); on save failure the in-memory slice rolls back so the store stays
+// consistent with disk.
 func (s *sessionQueueStore) Remove(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -368,7 +373,7 @@ func (s *sessionQueueStore) Remove(id string) error {
 	}
 	for i, it := range s.items {
 		if it.ID == id {
-			if it.State != QueuePending {
+			if it.State == QueueDispatching {
 				return errQueueNotRemovable
 			}
 			// Snapshot the pre-remove slice so a save failure rolls the in-memory

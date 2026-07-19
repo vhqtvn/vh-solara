@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
 //
 // QueueChip — rendering of the composer queue pill, focused on the recovery
-// detail surfacing for recovered `unknown` items (FIX-QUEUE-STUCK-2).
+// detail surfacing for recovered `unknown` items (FIX-QUEUE-STUCK-2) and the
+// terminal-item dismissal button (FIX-QUEUE-GC-4).
 //
 // The backend (pkg/web/queue.go: recoverStaleDispatchingLocked) transitions
 // abandoned `dispatching` items to terminal `unknown` on List() load and sets
@@ -10,7 +11,10 @@
 // the detail is surfaced VISIBLELY (not only in the data-tip tooltip) for
 // `unknown` items, that its absence is graceful, that other terminal states do
 // NOT show the recovery note, and that no resend/retry button is ever rendered
-// for terminal items (recovery = operator composes a NEW message).
+// for terminal items (recovery = operator composes a NEW message). The GC-4
+// dismissal coverage pins that the dismiss (x) button shows for pending and
+// terminal failed/unknown (never dispatching), and that clicking it calls
+// onRemove with the correct item id.
 //
 // The data-layer contract (cache, resolve, claim) is pinned in queue.test.ts.
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -90,9 +94,16 @@ describe("QueueChip — recovered `unknown` detail surfacing", () => {
   });
 });
 
-describe("QueueChip — no resend/retry button for terminal items", () => {
-  it("renders a remove (x) button ONLY for pending items — never for terminal unknown/failed", () => {
-    // pending: the one removable state — has a remove button.
+describe("QueueChip — dismiss button visibility + click handler (FIX-QUEUE-GC-4)", () => {
+  // FIX-QUEUE-GC-4: operators may explicitly dismiss terminal items
+  // (failed/unknown) that would otherwise accumulate forever. The dismiss
+  // (remove x) button shows for `pending` (cancel) and terminal
+  // `failed`/`unknown` (dismiss); it is NEVER shown for `dispatching` (the
+  // dispatch may be in flight — the state machine must own the terminal
+  // transition first). `sent` is filtered from the visible queue upstream
+  // (queueFor), so no dismiss surface is needed for it.
+  it("renders a dismiss (x) button for pending, failed, unknown — NOT for dispatching", () => {
+    // pending: dismissable (cancel before dispatch).
     const r1 = render(() => (
       <QueueChip q={item({ state: "pending" })} sessionId="s1" onRemove={vi.fn()} />
     ));
@@ -100,26 +111,35 @@ describe("QueueChip — no resend/retry button for terminal items", () => {
     expect(r1.container.querySelector(".queue-chip button")!.getAttribute("aria-label")).toBe("Remove queued message");
     r1.unmount();
 
-    // unknown (terminal): NO remove button, NO resend button.
+    // failed (terminal): dismissable — clears the failed chip from view.
     const r2 = render(() => (
-      <QueueChip q={item({ state: "unknown", detail: RECOVERY_DETAIL })} sessionId="s1" onRemove={vi.fn()} />
+      <QueueChip q={item({ state: "failed", detail: "500 upstream" })} sessionId="s1" onRemove={vi.fn()} />
     ));
-    expect(r2.container.querySelectorAll(".queue-chip button").length).toBe(0);
-    // No "resend"/"retry" affordance anywhere in the rendered output.
-    const txt = r2.container.textContent!.toLowerCase();
-    expect(txt).not.toContain("resend");
-    expect(txt).not.toContain("retry");
+    expect(r2.container.querySelectorAll(".queue-chip button").length).toBe(1);
     r2.unmount();
 
-    // failed (terminal): NO remove button, NO resend button.
+    // unknown (terminal): dismissable — clears the recovered chip from view.
     const r3 = render(() => (
-      <QueueChip q={item({ state: "failed", detail: "x" })} sessionId="s1" onRemove={vi.fn()} />
+      <QueueChip q={item({ state: "unknown", detail: RECOVERY_DETAIL })} sessionId="s1" onRemove={vi.fn()} />
     ));
-    expect(r3.container.querySelectorAll(".queue-chip button").length).toBe(0);
+    expect(r3.container.querySelectorAll(".queue-chip button").length).toBe(1);
+    // No "resend"/"retry" affordance anywhere in the rendered output — the
+    // only button is the dismiss (x), never a resend.
+    const txt = r3.container.textContent!.toLowerCase();
+    expect(txt).not.toContain("resend");
+    expect(txt).not.toContain("retry");
     r3.unmount();
+
+    // dispatching: NOT dismissable — the dispatch may be in flight; the state
+    // machine must own the transition to terminal first.
+    const r4 = render(() => (
+      <QueueChip q={item({ state: "dispatching" })} sessionId="s1" onRemove={vi.fn()} />
+    ));
+    expect(r4.container.querySelectorAll(".queue-chip button").length).toBe(0);
+    r4.unmount();
   });
 
-  it("the remove button on a pending item calls onRemove with the item id (no re-enqueue)", () => {
+  it("clicking dismiss on a pending item calls onRemove with the item id", () => {
     const onRemove = vi.fn();
     const { container } = render(() => (
       <QueueChip q={item({ id: "q-42", state: "pending" })} sessionId="s1" onRemove={onRemove} />
@@ -127,5 +147,25 @@ describe("QueueChip — no resend/retry button for terminal items", () => {
     container.querySelector(".queue-chip button")!.click();
     expect(onRemove).toHaveBeenCalledTimes(1);
     expect(onRemove).toHaveBeenCalledWith("q-42");
+  });
+
+  it("clicking dismiss on a failed item calls onRemove with the item id (terminal dismissal)", () => {
+    const onRemove = vi.fn();
+    const { container } = render(() => (
+      <QueueChip q={item({ id: "q-failed-1", state: "failed", detail: "500 upstream" })} sessionId="s1" onRemove={onRemove} />
+    ));
+    container.querySelector(".queue-chip button")!.click();
+    expect(onRemove).toHaveBeenCalledTimes(1);
+    expect(onRemove).toHaveBeenCalledWith("q-failed-1");
+  });
+
+  it("clicking dismiss on an unknown item calls onRemove with the item id (recovered-item dismissal)", () => {
+    const onRemove = vi.fn();
+    const { container } = render(() => (
+      <QueueChip q={item({ id: "q-unknown-1", state: "unknown", detail: RECOVERY_DETAIL })} sessionId="s1" onRemove={onRemove} />
+    ));
+    container.querySelector(".queue-chip button")!.click();
+    expect(onRemove).toHaveBeenCalledTimes(1);
+    expect(onRemove).toHaveBeenCalledWith("q-unknown-1");
   });
 });

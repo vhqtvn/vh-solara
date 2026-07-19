@@ -9,7 +9,7 @@ package web
 //
 //	GET    /vh/session/{sessionId}/queue              — list
 //	POST   /vh/session/{sessionId}/queue              — enqueue (backend issues id+order)
-//	DELETE /vh/session/{sessionId}/queue/{itemId}     — remove (pending only)
+//	DELETE /vh/session/{sessionId}/queue/{itemId}     — remove (pending + terminal; not dispatching)
 //	POST   /vh/session/{sessionId}/queue/claim        — atomically claim oldest pending
 //	POST   /vh/session/{sessionId}/queue/{itemId}/resolve — record sent/failed/unknown
 //
@@ -106,9 +106,12 @@ func (s *Server) handleQueueEnqueue(w http.ResponseWriter, r *http.Request) {
 	writeJSONResp(w, map[string]any{"item": item})
 }
 
-// DELETE /vh/session/{sessionId}/queue/{itemId} — remove a PENDING item. A
-// dispatching/terminal item reflects a send already attempted and must stay
-// visible (409). Missing item → 404.
+// DELETE /vh/session/{sessionId}/queue/{itemId} — remove an item. Operators
+// may dismiss any item that is not actively in flight: `pending` (cancel
+// before dispatch) and terminal `sent`/`failed`/`unknown` (clear a recovered
+// or completed item from view — FIX-QUEUE-GC-4). A `dispatching` item is
+// rejected (409): the dispatch may be in flight, so the state machine must own
+// the transition to terminal first. Missing item → 404.
 func (s *Server) handleQueueRemove(w http.ResponseWriter, r *http.Request) {
 	sid, root, ok := s.resolveQueueCtx(w, r)
 	if !ok {
