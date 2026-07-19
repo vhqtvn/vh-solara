@@ -40,13 +40,25 @@ func (p *Proxy) handleRawProxy(worker *Worker, w http.ResponseWriter, r *http.Re
 	// log.Printf("[RawProxy] Starting raw proxy for %s %s", r.Method, r.URL.Path)
 
 	if worker.Transport == nil || worker.Transport.IsClosed() {
+		// PROBE 4 (Phase 4): record the controller-side fast-fail. This 502 is
+		// served when the worker tunnel is down (nil/closed transport) AT
+		// REQUEST TIME — distinct from StreamOpenFails (which fires after the
+		// nil/closed check passes but OpenStream errors). A non-zero rate here
+		// while the browser's EventSource auto-retries is the signature of
+		// "operator hit the controller while the worker tunnel was down".
+		diag.Default.Yamux.TunnelDownRejections.Inc()
 		log.Printf("[RawProxy] Worker transport is nil or closed")
 		http.Error(w, "Worker transport is closed", http.StatusBadGateway)
 		return
 	}
 
 	// log.Printf("[RawProxy] Opening yamux stream...")
-	openStart := time.Now()
+	// setupStart brackets the FULL request-setup handshake (open → req write →
+	// ACK read). Recorded as SetupDur — the operator-felt "conn" leg before the
+	// SSE starts streaming. openStart (OpenDur) is the in-process OpenStream
+	// sub-duration only.
+	setupStart := time.Now()
+	openStart := setupStart
 	stream, err := worker.Transport.OpenStream()
 	if err != nil {
 		// PROBE 4: record open failure.
@@ -75,7 +87,20 @@ func (p *Proxy) handleRawProxy(worker *Worker, w http.ResponseWriter, r *http.Re
 	// failures); upgraded to StreamCloseAck once past hijack, and to
 	// StreamCloseCopyError if a copy leg errors.
 	closeReason := diag.StreamCloseSetup
+	// setupRecorded guards the deferred SetupDur observation so it fires once
+	// per call no matter which return path executes. Each setup-failure return
+	// below records SetupDur before stream.Close; the success path records it
+	// right after the ACK is accepted, before the copy phase begins.
+	setupRecorded := false
+	recordSetup := func() {
+		if setupRecorded {
+			return
+		}
+		setupRecorded = true
+		diag.Default.Yamux.SetupDur.Observe(int64(time.Since(setupStart)))
+	}
 	defer func() {
+		recordSetup()
 		diag.Default.Yamux.CloseReason[closeReason].Inc()
 		diag.Default.Yamux.ActiveStreams.Add(-1)
 	}()
@@ -89,18 +114,38 @@ func (p *Proxy) handleRawProxy(worker *Worker, w http.ResponseWriter, r *http.Re
 		Port: 0, // 0 means use the worker's web port on the agent side
 	}
 	// log.Printf("[RawProxy] Sending RawProxyMessage...")
+	// PROBE 4 (Phase 4): ReqWriteDur brackets the WriteJSON call. For a healthy
+	// tunnel this is sub-millisecond (it's a tiny JSON frame written into the
+	// local yamux send buffer); a tail here implies send-window backpressure
+	// from an un-acked prior stream — rare and worth flagging separately from
+	// AckDur (which is where a silently-dead tunnel blocks until yamux's
+	// keepalive/connection-write timeout fires).
+	reqWriteStart := time.Now()
 	if err := stream.WriteJSON(rawReq); err != nil {
+		diag.Default.Yamux.ReqWriteDur.Observe(int64(time.Since(reqWriteStart)))
 		log.Printf("[RawProxy] Failed to send raw proxy request: %v", err)
 		http.Error(w, "Failed to setup raw proxy", http.StatusBadGateway)
 		stream.Close()
 		return
 	}
+	diag.Default.Yamux.ReqWriteDur.Observe(int64(time.Since(reqWriteStart)))
 
 	// Wait for the client to confirm the connection is established
 	// log.Printf("[RawProxy] Waiting for ACK from agent...")
+	// PROBE 4 (Phase 4): AckDur brackets the ReadJSON wait. This is the
+	// PRIMARY "silently-dead-but-online tunnel" signal — if the worker is
+	// registered but its tunnel is actually dead, OpenStream succeeds (no
+	// round-trip), WriteJSON succeeds (data sits in the local send buffer),
+	// and ReadJSON blocks until yamux's keepalive miss (~10s) +
+	// ConnectionWriteTimeout (~10s) fire and tear the session down. A tail
+	// in AckDur p99/max near 10-20s is the signature of the freeze this slice
+	// is built to capture.
 	var ack tunnel.BaseMessage
-	if err := stream.ReadJSON(&ack); err != nil {
-		log.Printf("[RawProxy] ACK read failed: %v", err)
+	ackReadStart := time.Now()
+	readErr := stream.ReadJSON(&ack)
+	diag.Default.Yamux.AckDur.Observe(int64(time.Since(ackReadStart)))
+	if readErr != nil {
+		log.Printf("[RawProxy] ACK read failed: %v", readErr)
 		http.Error(w, "Worker failed to connect to local service", http.StatusBadGateway)
 		stream.Close()
 		return
@@ -112,6 +157,11 @@ func (p *Proxy) handleRawProxy(worker *Worker, w http.ResponseWriter, r *http.Re
 		stream.Close()
 		return
 	}
+	// ACK accepted — record the full setup duration NOW (before any body /
+	// hijack work) so SetupDur is the clean operator-felt "time from request
+	// arrive to tunnel-setup done" without contamination from request-body
+	// reading or the post-hijack copy phase.
+	recordSetup()
 
 	// Read the request body BEFORE hijacking (Go forbids reading r.Body after Hijack)
 	// log.Printf("[RawProxy] Reading request body before hijack...")

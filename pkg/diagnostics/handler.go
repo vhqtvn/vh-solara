@@ -18,6 +18,7 @@ type snapshotJSON struct {
 		Yamux   yamuxJSON     `json:"yamux"`
 		WSWrite []wsWriteJSON `json:"ws_write"`
 		Copy    []copyJSON    `json:"copy"`
+		Tunnel  tunnelJSON    `json:"tunnel"`
 	} `json:"probes"`
 }
 
@@ -56,13 +57,17 @@ type streamJSON struct {
 }
 
 type yamuxJSON struct {
-	StreamsOpened   uint64            `json:"streams_opened"`
-	StreamOpenFails uint64            `json:"stream_open_fails"`
-	ActiveStreams   int64             `json:"active_streams"`
-	OpenDur         histogramSnapshot `json:"open_dur"`
-	BytesRead       uint64            `json:"bytes_read"`
-	WriteByDir      []yamuxWriteJSON  `json:"write_by_dir"`
-	CloseReason     map[string]uint64 `json:"close_reason"`
+	StreamsOpened        uint64            `json:"streams_opened"`
+	StreamOpenFails      uint64            `json:"stream_open_fails"`
+	ActiveStreams        int64             `json:"active_streams"`
+	OpenDur              histogramSnapshot `json:"open_dur"`
+	BytesRead            uint64            `json:"bytes_read"`
+	WriteByDir           []yamuxWriteJSON  `json:"write_by_dir"`
+	CloseReason          map[string]uint64 `json:"close_reason"`
+	ReqWriteDur          histogramSnapshot `json:"req_write_dur"`
+	AckDur               histogramSnapshot `json:"ack_dur"`
+	SetupDur             histogramSnapshot `json:"setup_dur"`
+	TunnelDownRejections uint64            `json:"tunnel_down_rejections"`
 }
 
 type yamuxWriteJSON struct {
@@ -90,6 +95,21 @@ type copyJSON struct {
 	Bytes uint64            `json:"bytes"`
 	Dur   histogramSnapshot `json:"dur"`
 	Term  map[string]uint64 `json:"term"`
+}
+
+// tunnelJSON is the worker-side tunnel-lifecycle probe's wire shape. On the
+// controller process these fields stay zero (the worker is the only writer);
+// the aggregator fan-out pulls per-worker values through FetchWorkerSnapshot.
+type tunnelJSON struct {
+	DialAttempts       uint64 `json:"dial_attempts"`
+	DialFailures       uint64 `json:"dial_failures"`
+	Connected          uint64 `json:"connected"`
+	Disconnects        uint64 `json:"disconnects"`
+	IdleResets         uint64 `json:"idle_resets"`
+	LastBackoffNs      int64  `json:"last_backoff_ns"`
+	LastConnectedAtNs  int64  `json:"last_connected_at_ns"`
+	LastDisconnectAtNs int64  `json:"last_disconnect_at_ns"`
+	CurrentState       string `json:"current_state"`
 }
 
 // Snapshot returns a JSON-serializable snapshot of every probe accumulator.
@@ -150,13 +170,17 @@ func Snapshot() snapshotJSON {
 
 	y := &r.Yamux
 	out.Probes.Yamux = yamuxJSON{
-		StreamsOpened:   y.StreamsOpened.Load(),
-		StreamOpenFails: y.StreamOpenFails.Load(),
-		ActiveStreams:   y.ActiveStreams.Load(),
-		OpenDur:         y.OpenDur.snapshot(),
-		BytesRead:       y.BytesRead.Load(),
-		WriteByDir:      make([]yamuxWriteJSON, 0, numYamuxWriteDirs),
-		CloseReason:     map[string]uint64{},
+		StreamsOpened:        y.StreamsOpened.Load(),
+		StreamOpenFails:      y.StreamOpenFails.Load(),
+		ActiveStreams:        y.ActiveStreams.Load(),
+		OpenDur:              y.OpenDur.snapshot(),
+		BytesRead:            y.BytesRead.Load(),
+		WriteByDir:           make([]yamuxWriteJSON, 0, numYamuxWriteDirs),
+		CloseReason:          map[string]uint64{},
+		ReqWriteDur:          y.ReqWriteDur.snapshot(),
+		AckDur:               y.AckDur.snapshot(),
+		SetupDur:             y.SetupDur.snapshot(),
+		TunnelDownRejections: y.TunnelDownRejections.Load(),
 	}
 	for i := 0; i < numYamuxWriteDirs; i++ {
 		wd := &y.WriteByDir[i]
@@ -201,6 +225,26 @@ func Snapshot() snapshotJSON {
 			entry.Term[copyTermName[j]] = c.Term[j].Load()
 		}
 		out.Probes.Copy = append(out.Probes.Copy, entry)
+	}
+
+	// Probe 7: worker-side tunnel lifecycle. On the controller process every
+	// counter stays zero (the worker is the only writer); the aggregator
+	// fan-out pulls per-worker values through FetchWorkerSnapshot.
+	t := &r.Tunnel
+	stateIdx := int(t.CurrentState.Load())
+	if stateIdx < 0 || stateIdx >= numTunnelStates {
+		stateIdx = 0
+	}
+	out.Probes.Tunnel = tunnelJSON{
+		DialAttempts:       t.DialAttempts.Load(),
+		DialFailures:       t.DialFailures.Load(),
+		Connected:          t.Connected.Load(),
+		Disconnects:        t.Disconnects.Load(),
+		IdleResets:         t.IdleResets.Load(),
+		LastBackoffNs:      t.LastBackoffNs.Load(),
+		LastConnectedAtNs:  t.LastConnectedAtNs.Load(),
+		LastDisconnectAtNs: t.LastDisconnectAtNs.Load(),
+		CurrentState:       tunnelStateName[stateIdx],
 	}
 
 	return out

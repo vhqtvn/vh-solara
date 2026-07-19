@@ -249,6 +249,17 @@ type StreamStats struct {
 // per-session correlation on a slow write, the slow-incident's Aux field
 // carries the relevant session's NumStreams() sampled at THAT incident only
 // (see YamuxWriteMonitor.WithSession).
+//
+// Setup-phase histograms (ReqWriteDur / AckDur / SetupDur) cover the
+// connection-establishment leg that OpenDur alone does NOT — OpenDur measures
+// only the in-process OpenStream() call (microseconds for a healthy tunnel),
+// while SetupDur covers openStart → ACK received, which is what the operator
+// experiences as SSE "conn time" when a tunnel is silently dead or the worker
+// is mid-reconnect. AckDur isolates the ReadJSON wait (where a silently-dead
+// yamux session blocks until the keepalive/connection-write timeout, ~10-20s).
+// TunnelDownRejections counts the controller's fast-fail 502s served when a
+// worker's transport is nil/closed — a non-zero rate here means the operator
+// is hitting the controller while the worker tunnel is down.
 type YamuxStats struct {
 	// Streams opened (controller→worker OpenStream attempts).
 	StreamsOpened Counter
@@ -273,6 +284,27 @@ type YamuxStats struct {
 	WriteByDir [numYamuxWriteDirs]YamuxWriteStats
 	// Close-reason counts.
 	CloseReason [numStreamCloseReasons]Counter
+	// Setup-phase histograms (Phase 4 connection-attribution probe). Each is
+	// recorded ONCE per proxy stream on the controller; together they cover
+	// the gap between OpenStream (already in OpenDur) and the ACK that
+	// completes the request-setup handshake. See handleRawProxy in
+	// pkg/server/proxy.go for the wrapping. All three stay in the steady-state
+	// fast-path: OpenDur microseconds / ReqWriteDur sub-millisecond /
+	// AckDur single-digit-millisecond for a healthy tunnel; a tail in AckDur
+	// or SetupDur is the signature of a silently-dead worker tunnel.
+	ReqWriteDur Histogram // stream.WriteJSON(rawReq) duration
+	AckDur      Histogram // stream.ReadJSON(&ack) duration (where a dead tunnel blocks)
+	SetupDur    Histogram // openStart → ACK received (the operator-felt "conn" leg)
+	// TunnelDownRejections counts controller-side 502s served because the
+	// worker transport was nil/closed at request time (proxy.go handleRawProxy
+	// and daemon.go hostInterceptor offline/not-found branch). Distinct from
+	// StreamOpenFails (which counts OpenStream errors after the transport
+	// passed the nil/closed check). A non-zero rate here means the browser is
+	// hitting the controller while the worker tunnel is down — the operator
+	// can attribute a "first session-open after overnight idle" freeze to this
+	// counter rising while the browser's EventSource auto-retry eventually
+	// catches the worker's reconnect.
+	TunnelDownRejections Counter
 }
 
 // YamuxWriteStats is one yamux write-direction's accumulator (response or
@@ -343,11 +375,73 @@ type CopyStats struct {
 	Term [numCopyTerms]Counter
 }
 
+// --- Probe 7: worker-side tunnel lifecycle -----------------------------------
+
+// TunnelState is the fixed enum for TunnelStats.CurrentState. Mirrors what the
+// worker reports about its OWN tunnel (the controller has its own view via
+// Worker.Status, but the worker is the source of truth for "am I currently
+// connected and how hard am I trying").
+const (
+	TunnelStateDisconnected = iota // 0 — between sessions (dialing / sleeping backoff)
+	TunnelStateConnected           // 1 — handleTunnel is running, yamux session is up
+	numTunnelStates
+)
+
+var tunnelStateName = [numTunnelStates]string{"disconnected", "connected"}
+
+// TunnelStats is the worker-side tunnel-lifecycle probe. Reports into the same
+// diag.Default singleton as the rest of the probes — the WORKER process is the
+// only writer here (the controller never reports into these fields), so on the
+// controller these stay zero and the aggregator surfaces them per-worker via
+// FetchWorkerSnapshot. Exposed via /vh/diag/latency so an operator can
+// attribute a "first session-open after overnight idle" freeze to "worker
+// tunnel was disconnected N seconds ago and is mid-reconnect" without per-event
+// logging. All fields are atomic (Counter / atomic.Int64 / atomic.Int32) so the
+// snapshot read is race-free against the worker's Start loop writing them.
+type TunnelStats struct {
+	// DialAttempts: total WS dial attempts in daemon.Start (success+failure).
+	DialAttempts Counter
+	// DialFailures: dial attempts that returned an error (controller
+	// unreachable, TLS failure, refused, etc.).
+	DialFailures Counter
+	// Connected: successful dials that entered handleTunnel (yamux session up).
+	Connected Counter
+	// Disconnects: tunnel sessions that ended (any reason — yamux error, WS
+	// close, controller-initiated shutdown). Distinct from DialFailures (which
+	// is dial-time) — this counts sessions that ran and then stopped.
+	Disconnects Counter
+	// IdleResets: number of times the idle-detection logic snapped backoff to
+	// the floor because the current disconnect streak exceeded
+	// reconnectIdleResetThreshold. A non-zero value here while the operator is
+	// hitting the app is direct evidence the worker was in an extended failure
+	// streak (e.g., overnight) and is now actively retrying at the floor —
+	// exactly the "user just returned" recovery path.
+	IdleResets Counter
+	// LastBackoffNs: the most recent backoff the worker slept through before
+	// the next dial attempt (either dial-failure sleep or post-close sleep).
+	// Nano-second wall reading so an operator can see "the worker was at the
+	// 5s cap when the operator hit the app". Stamped AFTER any idle-reset, so
+	// it reflects the value actually used (post-reset).
+	LastBackoffNs atomic.Int64
+	// LastConnectedAtNs: unix-nano of the most recent successful dial. Used to
+	// compute "time since the worker last had a tunnel" — the smoking gun for
+	// overnight idle.
+	LastConnectedAtNs atomic.Int64
+	// LastDisconnectAtNs: unix-nano of the most recent tunnel-session end OR
+	// process start (initialized to process-start time so the "disconnected
+	// for" computation is meaningful even before the first successful dial).
+	LastDisconnectAtNs atomic.Int64
+	// CurrentState: 0=disconnected, 1=connected (see TunnelState). atomic so a
+	// snapshot read is consistent with the worker's actual state.
+	CurrentState atomic.Int32
+}
+
 // --- Registry ---------------------------------------------------------------
 
 // Registry holds every probe's accumulators. The package-level Default is the
-// singleton all probes report into; both the worker (probes 1-3, 5-client) and
-// the controller (probes 4, 5-server, 6) import and write to it.
+// singleton all probes report into; both the worker (probes 1-3, 5-client, 7)
+// and the controller (probes 4, 5-server, 6, 7-controller-zero) import and
+// write to it.
 type Registry struct {
 	Ingest  IngestStats
 	Emit    EmitStats
@@ -355,6 +449,7 @@ type Registry struct {
 	Yamux   YamuxStats
 	WSWrite [numSides]WSWriteStats
 	Copy    [numCopyDirs]CopyStats
+	Tunnel  TunnelStats
 
 	// startedAt is the process/registry creation time, reported in the snapshot
 	// so a consumer can compute rates per second since start.
@@ -387,6 +482,7 @@ func ResetForTest() {
 	for i := range r.Copy {
 		r.Copy[i] = CopyStats{}
 	}
+	r.Tunnel = TunnelStats{}
 	r.startedAt = nowNano()
 	r.initSentinels()
 }

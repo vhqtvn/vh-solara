@@ -338,6 +338,9 @@ func (r *Registry) initSentinels() {
 		mark(&r.Stream[i].PingDur)
 	}
 	mark(&r.Yamux.OpenDur)
+	mark(&r.Yamux.ReqWriteDur)
+	mark(&r.Yamux.AckDur)
+	mark(&r.Yamux.SetupDur)
 	for i := range r.Yamux.WriteByDir {
 		mark(&r.Yamux.WriteByDir[i].Dur)
 	}

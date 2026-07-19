@@ -208,8 +208,21 @@ func TestSnapshotJSONShape(t *testing.T) {
 	Default.Emit.SourceCount[SourceOpencodeLive].Inc()
 	Default.Stream[StreamClassTree].Opens.Inc()
 	Default.Yamux.StreamsOpened.Inc()
+	Default.Yamux.TunnelDownRejections.Inc()
+	Default.Yamux.SetupDur.Observe(1_000_000)
+	Default.Yamux.ReqWriteDur.Observe(500_000)
+	Default.Yamux.AckDur.Observe(2_000_000)
 	Default.WSWrite[SideServer].Writes.Inc()
 	Default.Copy[CopyYamuxToBrowser].Bytes.Add(100)
+	Default.Tunnel.DialAttempts.Inc()
+	Default.Tunnel.DialFailures.Inc()
+	Default.Tunnel.Connected.Inc()
+	Default.Tunnel.Disconnects.Inc()
+	Default.Tunnel.IdleResets.Inc()
+	Default.Tunnel.LastBackoffNs.Store(int64(5 * time.Second))
+	Default.Tunnel.LastConnectedAtNs.Store(1_700_000_000_000_000_000)
+	Default.Tunnel.LastDisconnectAtNs.Store(1_700_000_060_000_000_000)
+	Default.Tunnel.CurrentState.Store(int32(TunnelStateConnected))
 
 	snap := Snapshot()
 	data, err := json.Marshal(snap)
@@ -227,11 +240,25 @@ func TestSnapshotJSONShape(t *testing.T) {
 		`"yamux"`,
 		`"ws_write"`,
 		`"copy"`,
+		`"tunnel"`,
 		`"events":1`,
 		`"bytes":42`,
 		`"streams_opened":1`,
 		`"opens":1`,
 		`"yamux_to_browser"`,
+		// Phase 4 setup-probe fields (must appear in the JSON output):
+		`"req_write_dur"`,
+		`"ack_dur"`,
+		`"setup_dur"`,
+		`"tunnel_down_rejections":1`,
+		// Probe 7 tunnel-lifecycle fields:
+		`"dial_attempts":1`,
+		`"dial_failures":1`,
+		`"connected":1`,
+		`"disconnects":1`,
+		`"idle_resets":1`,
+		`"last_backoff_ns":5000000000`,
+		`"current_state":"connected"`,
 	}
 	for _, key := range required {
 		if !strings.Contains(jsonStr, key) {
@@ -493,4 +520,174 @@ func (f *fakeRW) Flush() {
 	if f.flusher {
 		f.flushed = true
 	}
+}
+
+// --- Phase 4: connection-setup attribution -----------------------------------
+//
+// The 16.5s overnight-freeze investigation (post-a58b2f3 corrected diagnostic)
+// narrowed the freeze to the SSE "conn" leg — between `new EventSource()` and
+// `ses.onopen`. The pre-Phase-4 probe set could attribute steady-state write
+// latency (Probe 4 per-direction) and stream-open duration (Probe 4 OpenDur)
+// but NOT the full request-setup handshake (openStart → ACK) nor the worker-
+// down fast-fail 502s the controller serves while the worker tunnel is mid-
+// reconnect. The Phase 4 additions close that gap:
+//
+//   - Yamux.SetupDur / ReqWriteDur / AckDur  — controller-side setup histograms
+//   - Yamux.TunnelDownRejections             — controller-side worker-down 502 counter
+//   - TunnelStats                            — worker-side tunnel lifecycle
+//
+// This test demonstrates that the probe set can DISTINGUISH three different
+// setup-leg failure signatures using ONLY the recorded metrics:
+//
+//	A. silently-dead tunnel: SetupDur / AckDur tail is large; TunnelDownRejections=0
+//	   (transport still appears open at request time; the freeze is in ReadJSON).
+//	B. worker tunnel down:   TunnelDownRejections > 0; SetupDur empty (request
+//	   never made it past the nil/closed check); worker Tunnel.DialFailures /
+//	   Disconnects > 0 on the worker process.
+//	C. healthy tunnel:       SetupDur/AckDur fast; TunnelDownRejections=0; worker
+//	   Tunnel.CurrentState="connected".
+//
+// This is the focused proving test required by the mission's "Add connection-
+// setup probes" deliverable.
+
+func TestConnectionSetupAttributionSilentlyDeadTunnel(t *testing.T) {
+	resetAndRestore(t)
+	// Signature A: the worker's transport is registered & "online" but the
+	// underlying tunnel is silently dead. OpenStream succeeds instantly (no
+	// round-trip), WriteJSON succeeds instantly (data sits in local send
+	// buffer), but ReadJSON blocks until yamux's keepalive miss (~10s) +
+	// ConnectionWriteTimeout (~10s) fire and tear the session down — ~16-20s
+	// total, which matches the operator's reported 16.5s freeze.
+	Default.Yamux.OpenDur.Observe(50_000)        // 50µs (in-process OpenStream)
+	Default.Yamux.ReqWriteDur.Observe(200_000)   // 200µs (WriteJSON into local buffer)
+	Default.Yamux.AckDur.Observe(16_500_000_000) // 16.5s ReadJSON block (the freeze)
+	Default.Yamux.SetupDur.Observe(16_500_500_000)
+	Default.Yamux.TunnelDownRejections = Counter{} // explicitly zero — transport looked open
+
+	snap := Snapshot()
+	y := snap.Probes.Yamux
+
+	// The AckDur tail IS the freeze signature. p99 / max should be ~16.5s.
+	if y.AckDur.Max < 10_000_000_000 {
+		t.Errorf("[silent-dead] AckDur max %dns = %v, want >= 10s (yamux write-timeout window)",
+			y.AckDur.Max, time.Duration(y.AckDur.Max))
+	}
+	if y.SetupDur.Max < 10_000_000_000 {
+		t.Errorf("[silent-dead] SetupDur max %dns = %v, want >= 10s (full handshake froze)",
+			y.SetupDur.Max, time.Duration(y.SetupDur.Max))
+	}
+	// Critical: TunnelDownRejections stays ZERO because the controller did not
+	// fast-fail — the transport appeared open at request time. This is what
+	// DISTINGUISHES the silent-death case from the worker-down case below.
+	if y.TunnelDownRejections != 0 {
+		t.Errorf("[silent-dead] TunnelDownRejections = %d, want 0 (transport was not nil/closed)",
+			y.TunnelDownRejections)
+	}
+	// OpenDur is microseconds — proving the freeze is NOT in OpenStream itself.
+	if y.OpenDur.Max > 1_000_000 {
+		t.Errorf("[silent-dead] OpenDur max %dns, want < 1ms (OpenStream is in-process)",
+			y.OpenDur.Max)
+	}
+}
+
+func TestConnectionSetupAttributionWorkerTunnelDown(t *testing.T) {
+	resetAndRestore(t)
+	// Signature B: the worker tunnel has dropped and the worker is in the
+	// backoff loop. The controller serves 502 on EVERY browser SSE attempt
+	// (transport nil/closed); the browser's EventSource auto-retries until
+	// the worker reconnects. No setup histograms recorded because the request
+	// never reached OpenStream.
+	Default.Yamux.TunnelDownRejections.Inc()
+	Default.Yamux.TunnelDownRejections.Inc()
+	Default.Yamux.TunnelDownRejections.Inc() // 3 browser retries while worker reconnects
+	// Worker-side (would be reported into the per-worker snapshot):
+	Default.Tunnel.DialAttempts.Inc()
+	Default.Tunnel.DialFailures.Inc()
+	Default.Tunnel.Disconnects.Inc()
+	Default.Tunnel.LastBackoffNs.Store(int64(5 * time.Second))
+	Default.Tunnel.CurrentState.Store(int32(TunnelStateDisconnected))
+
+	snap := Snapshot()
+	y := snap.Probes.Yamux
+	tr := snap.Probes.Tunnel
+
+	// Controller-side: 3 fast-fails, no setup histograms (OpenStream never ran).
+	if y.TunnelDownRejections != 3 {
+		t.Errorf("[worker-down] TunnelDownRejections = %d, want 3", y.TunnelDownRejections)
+	}
+	if y.SetupDur.Count != 0 {
+		t.Errorf("[worker-down] SetupDur count = %d, want 0 (request never reached OpenStream)",
+			y.SetupDur.Count)
+	}
+	// Worker-side: confirms the worker is in the backoff loop.
+	if tr.DialFailures != 1 {
+		t.Errorf("[worker-down] Tunnel.DialFailures = %d, want 1", tr.DialFailures)
+	}
+	if tr.CurrentState != "disconnected" {
+		t.Errorf("[worker-down] Tunnel.CurrentState = %q, want \"disconnected\"", tr.CurrentState)
+	}
+	if tr.LastBackoffNs != int64(5*time.Second) {
+		t.Errorf("[worker-down] Tunnel.LastBackoffNs = %d, want 5s",
+			tr.LastBackoffNs)
+	}
+}
+
+func TestConnectionSetupAttributionHealthyTunnel(t *testing.T) {
+	resetAndRestore(t)
+	// Signature C: healthy steady-state. SetupDur / AckDur are fast;
+	// TunnelDownRejections stays zero; worker reports connected.
+	Default.Yamux.OpenDur.Observe(40_000)      // 40µs
+	Default.Yamux.ReqWriteDur.Observe(150_000) // 150µs
+	Default.Yamux.AckDur.Observe(800_000)      // 0.8ms (worker dials local web port)
+	Default.Yamux.SetupDur.Observe(1_000_000)  // 1ms total setup
+	Default.Tunnel.CurrentState.Store(int32(TunnelStateConnected))
+	Default.Tunnel.Connected.Inc()
+	Default.Tunnel.LastConnectedAtNs.Store(time.Now().Add(-2 * time.Second).UnixNano())
+
+	snap := Snapshot()
+	y := snap.Probes.Yamux
+	tr := snap.Probes.Tunnel
+
+	if y.SetupDur.Max > 50_000_000 {
+		t.Errorf("[healthy] SetupDur max %dns, want < 50ms", y.SetupDur.Max)
+	}
+	if y.AckDur.Max > 50_000_000 {
+		t.Errorf("[healthy] AckDur max %dns, want < 50ms", y.AckDur.Max)
+	}
+	if y.TunnelDownRejections != 0 {
+		t.Errorf("[healthy] TunnelDownRejections = %d, want 0", y.TunnelDownRejections)
+	}
+	if tr.CurrentState != "connected" {
+		t.Errorf("[healthy] Tunnel.CurrentState = %q, want \"connected\"", tr.CurrentState)
+	}
+}
+
+// TestTunnelStatsAtomicity proves the TunnelStats fields are safe to read
+// concurrently with the worker Start loop writing them — the snapshot path
+// (which the operator-facing /vh/diag/latency hits) must never race the worker.
+// Run under `go test -race` (the canonical Phase-4 verify block does).
+func TestTunnelStatsAtomicity(t *testing.T) {
+	resetAndRestore(t)
+	var wg sync.WaitGroup
+	// Writer: simulates the worker Start loop stamping tunnel state.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 200; i++ {
+			Default.Tunnel.DialAttempts.Inc()
+			Default.Tunnel.DialFailures.Inc()
+			Default.Tunnel.Connected.Inc()
+			Default.Tunnel.Disconnects.Inc()
+			Default.Tunnel.LastBackoffNs.Store(int64(time.Duration(i) * time.Second))
+			Default.Tunnel.LastConnectedAtNs.Store(time.Now().UnixNano())
+			Default.Tunnel.LastDisconnectAtNs.Store(time.Now().UnixNano())
+			Default.Tunnel.CurrentState.Store(int32(TunnelStateConnected))
+		}
+	}()
+	// Reader: simulates Snapshot() running concurrently (the operator hits the
+	// diag endpoint). Must not race.
+	for i := 0; i < 50; i++ {
+		_ = Snapshot()
+	}
+	wg.Wait()
 }

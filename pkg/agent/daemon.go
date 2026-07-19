@@ -48,9 +48,43 @@ func NewDaemon(controller string, id string, name string, version string, header
 	}
 }
 
+// Worker→controller reconnect tuning. See the mission investigation for the
+// 16.5s overnight-freeze attribution: the previous cap (30s) means a worker
+// that had a tunnel drop in the night sits at the cap when the operator
+// returns, so the next dial attempt is up to 30s away. We lower the cap to
+// 5s (single-worker reconnect-storm risk is acceptable — one TCP attempt per
+// attempt is trivial load) AND add a time-based idle reset so a worker that
+// has been disconnected for a long time (≥ reconnectIdleResetThreshold) snaps
+// back to the floor for its next attempt, instead of waiting for the cap.
+//
+// Values:
+//   - reconnectFloor        = 1s   (initial backoff; unchanged)
+//   - reconnectCap          = 5s   (was 30s — see above)
+//   - reconnectIdleResetThreshold = 60s  (well above the cap, so a normal
+//     transient blip uses the doubling schedule; only an extended disconnect
+//     triggers the floor reset)
+//
+// reconnectFloor / reconnectCap are const (production-invariant). The idle
+// threshold is a var so the unit tests can lower it (we can't wait 60s in a
+// test) — this mirrors the existing pkg/diagnostics slow*Ns override pattern
+// for time-based thresholds.
+const (
+	reconnectFloor = 1 * time.Second
+	reconnectCap   = 5 * time.Second
+)
+
+var reconnectIdleResetThreshold = 60 * time.Second
+
 // Start begins the reconnect and proxying loop.
 func (d *Daemon) Start() {
-	var backoff = time.Second * 1
+	var backoff = reconnectFloor
+	// disconnectedAt brackets the current "no tunnel up" period. Initialized
+	// to process start so the idle-reset check is meaningful before the first
+	// successful dial. Reset to time.Now() each time a tunnel session ends so
+	// the NEXT failure streak starts a fresh window.
+	disconnectedAt := time.Now()
+	diag.Default.Tunnel.LastDisconnectAtNs.Store(disconnectedAt.UnixNano())
+	diag.Default.Tunnel.CurrentState.Store(diag.TunnelStateDisconnected)
 
 	for {
 		select {
@@ -74,22 +108,74 @@ func (d *Daemon) Start() {
 			ReadBufferSize:  256 * 1024,
 			WriteBufferSize: 256 * 1024,
 		}
+		// PROBE 7: stamp dial attempt BEFORE the call so the snapshot can
+		// attribute a freeze to "worker is currently mid-dial" regardless of
+		// whether this attempt succeeds.
+		diag.Default.Tunnel.DialAttempts.Inc()
 		conn, _, err := dialer.Dial(d.ControllerURL, dialHeaders)
 		if err != nil {
-			log.Printf("Dial failed: %v", err)
-			time.Sleep(backoff)
-			if backoff < time.Second*30 {
-				backoff *= 2
+			// PROBE 7: record the failure + the backoff we're about to sleep.
+			diag.Default.Tunnel.DialFailures.Inc()
+			// B2 (idle reset): if it has been a long time since we entered the
+			// current disconnected period, snap backoff to the floor. Handles
+			// the overnight-idle case where backoff had previously climbed to
+			// the cap during an active failure streak and the operator just
+			// returned. Without this the worker would keep sleeping at the cap
+			// (5s) for as long as failures continue; with it the next attempt
+			// is at the floor (1s) once the threshold has elapsed.
+			//
+			// The check fires on EVERY failure once the threshold has elapsed,
+			// so a worker that's been failing for hours effectively retries at
+			// ~1Hz — acceptable for a single worker (one TCP dial per second).
+			if time.Since(disconnectedAt) >= reconnectIdleResetThreshold && backoff > reconnectFloor {
+				log.Printf("Tunnel disconnected for %v; resetting backoff %v → %v",
+					time.Since(disconnectedAt).Round(time.Second), backoff, reconnectFloor)
+				backoff = reconnectFloor
+				// PROBE 7: count the reset so an operator hitting the app
+				// while the worker recovers can attribute it. LastBackoffNs
+				// (stamped below) reports the post-reset value actually used.
+				diag.Default.Tunnel.IdleResets.Inc()
+			}
+			diag.Default.Tunnel.LastBackoffNs.Store(int64(backoff))
+			log.Printf("Dial failed: %v (sleeping %v)", err, backoff)
+			select {
+			case <-time.After(backoff):
+			case <-d.ctx.Done():
+				log.Printf("Daemon context cancelled during dial-failure backoff.")
+				return
+			}
+			// B1 (lower cap): doubling stays, but bounded by reconnectCap.
+			// Sequence after 4 consecutive failures: 1→2→4→5(capped). With the
+			// idle-reset above, this cap is only reached during SHORT blips
+			// (under the threshold) — for long disconnects the floor reset
+			// keeps attempts at ~1Hz.
+			backoff *= 2
+			if backoff > reconnectCap {
+				backoff = reconnectCap
 			}
 			continue
 		}
 
 		log.Printf("Connected successfully.")
-		backoff = time.Second * 1 // reset backoff
+		// PROBE 7: dial succeeded — stamp the connected state + reset backoff.
+		backoff = reconnectFloor
+		diag.Default.Tunnel.Connected.Inc()
+		now := time.Now()
+		diag.Default.Tunnel.LastConnectedAtNs.Store(now.UnixNano())
+		diag.Default.Tunnel.CurrentState.Store(diag.TunnelStateConnected)
 
 		d.handleTunnel(conn)
 
-		log.Printf("Tunnel closed, scheduling reconnect...")
+		// PROBE 7: tunnel session ended — stamp disconnect state + reset the
+		// disconnected-period window for the next failure-streak idle check.
+		disconnectedAt = time.Now()
+		diag.Default.Tunnel.Disconnects.Inc()
+		diag.Default.Tunnel.LastDisconnectAtNs.Store(disconnectedAt.UnixNano())
+		diag.Default.Tunnel.CurrentState.Store(diag.TunnelStateDisconnected)
+		// LastBackoffNs is also stamped on the post-close sleep below so the
+		// snapshot can read "the worker is in the post-close reconnect sleep".
+		diag.Default.Tunnel.LastBackoffNs.Store(int64(backoff))
+		log.Printf("Tunnel closed, scheduling reconnect (sleeping %v)...", backoff)
 		select {
 		case <-time.After(backoff):
 			// continue loop

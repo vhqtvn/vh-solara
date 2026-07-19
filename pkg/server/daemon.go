@@ -13,6 +13,7 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/vhqtvn/vh-solara/pkg/auth"
+	diag "github.com/vhqtvn/vh-solara/pkg/diagnostics"
 	"github.com/vhqtvn/vh-solara/pkg/tunnel"
 )
 
@@ -251,6 +252,13 @@ func (d *Daemon) hostInterceptor(pattern *regexp.Regexp, next http.Handler) http
 			// the worker ID verbatim.
 			worker, ok := d.Registry.GetWorker(workerID)
 			if !ok || worker.Status == "offline" {
+				// PROBE 4 (Phase 4): record the controller-side fast-fail for
+				// the "worker not found / offline" case (parallel to the
+				// nil/closed-transport branch in pkg/server/proxy.go). A
+				// non-zero rate here while the browser's EventSource retries
+				// is the signature of "operator hit the controller while the
+				// worker tunnel was down".
+				diag.Default.Yamux.TunnelDownRejections.Inc()
 				log.Printf("[HostInterceptor] Worker %s not found or offline", workerID)
 				http.Error(w, fmt.Sprintf("Worker %s not found or offline", workerID), http.StatusBadGateway)
 				return

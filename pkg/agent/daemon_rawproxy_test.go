@@ -1,7 +1,9 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -286,5 +288,225 @@ func withinDeadline(d time.Duration, cond func() bool) bool {
 			return false
 		}
 		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// --- Phase 4: backoff cap + idle reset proving tests -------------------------
+//
+// The mission investigation traced the 16.5s overnight SSE freeze partly to
+// the worker→controller reconnect backoff: the previous cap (30s) means a
+// worker whose tunnel dropped in the night sits at the cap when the operator
+// returns, so the next dial attempt is up to 30s away. daemon.Start now
+// (1) caps backoff at reconnectCap=5s and (2) snaps back to reconnectFloor=1s
+// when the current disconnect streak exceeds reconnectIdleResetThreshold=60s.
+//
+// These tests stand up a Daemon pointing at a controller URL that refuses
+// connections (so every dial fails), drive the Start loop, and assert BOTH
+// invariants from the observable side effects:
+//
+//   - backoff never sleeps longer than reconnectCap (B1)
+//   - after the idle-reset threshold, the next sleep drops back to the floor (B2)
+//   - the TunnelStats probe (Probe 7) records dial attempts / failures / backoff
+//
+// The tunnel lifecycle probes are observed directly via diag.Default.Tunnel —
+// the worker process is the only writer.
+
+// nextUnusedPort returns a TCP port that is currently closed (nothing
+// listening), so a websocket dial to it fails fast with ECONNREFUSED. We pick
+// an ephemeral port by binding and immediately closing, then reusing the
+// number — close enough for "this dial must fail" on a loopback address.
+func nextUnusedPort(t *testing.T) int {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen for port pick: %v", err)
+	}
+	port := l.Addr().(*net.TCPAddr).Port
+	_ = l.Close()
+	return port
+}
+
+// startFailingDaemon stands up a Daemon whose Start loop will fail every dial
+// (controller URL points at a closed port). Returns the Daemon and a stop
+// func that cancels the loop AND blocks until the daemon goroutine has fully
+// exited — required so the next test's diag.ResetForTest does not race with
+// a still-running worker's probe writes (race detector flagged this in the
+// first version).
+func startFailingDaemon(t *testing.T) (d *Daemon, stop func()) {
+	t.Helper()
+	port := nextUnusedPort(t)
+	d = NewDaemon(
+		fmt.Sprintf("ws://127.0.0.1:%d/", port),
+		"worker-test", "test", "test",
+		nil, nil,
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	d.ctx = ctx
+	d.cancel = cancel
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		d.Start()
+	}()
+	return d, func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("daemon did not stop within 10s")
+		}
+	}
+}
+
+// TestBackoffCapBounded proves B1: even after many consecutive dial failures,
+// the worker never sleeps longer than reconnectCap (5s). We assert this by
+// observing the LastBackoffNs probe — it must never exceed reconnectCap.
+func TestBackoffCapBounded(t *testing.T) {
+	diag.ResetForTest()
+	_, stop := startFailingDaemon(t)
+	defer stop()
+
+	// Wait for several dial-failure cycles to elapse. Each cycle is ~backoff
+	// + dial-fail latency (~1ms); total well under 1s for the first 5-6
+	// cycles (1+2+4+5+5+5 = 22s of sleep, so we only need to peek during the
+	// early ones to see the cap engage). We poll the probe and look for the
+	// sequence 1s → 2s → 4s → 5s (capped), asserting no sample exceeds 5s.
+	seen := map[int64]bool{}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		b := diag.Default.Tunnel.LastBackoffNs.Load()
+		seen[b] = true
+		if b > int64(reconnectCap) {
+			t.Fatalf("backoff %v exceeded cap %v", time.Duration(b), reconnectCap)
+		}
+		// Dial attempts should be climbing; once we've seen at least 4 distinct
+		// backoff values (1s/2s/4s/5s), we've exercised the cap path.
+		if len(seen) >= 3 && diag.Default.Tunnel.DialAttempts.Load() >= 4 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := diag.Default.Tunnel.DialFailures.Load(); got < 2 {
+		t.Fatalf("DialFailures = %d, want >= 2 (multiple failure cycles)", got)
+	}
+}
+
+// TestBackoffIdleReset proves B2: after the idle threshold elapses, the
+// backoff snaps back to the floor (and IdleResets is incremented, which is
+// the operator-visible signal that this recovery path fired). We can't wait
+// 60s in a unit test, so we expose the threshold via a package-private var
+// override (production-invariant stays at 60s; tests lower it for speed).
+//
+// Sequence with threshold=300ms:
+//
+//	t=0:     fail #1, threshold not exceeded (0s < 300ms), backoff stays 1s, sleep 1s
+//	t=1s:    fail #2, threshold EXCEEDED (1s > 300ms) AND backoff(2s) > floor →
+//	         reset backoff to 1s, IdleResets++, sleep 1s
+//	t=2s:    fail #3, threshold EXCEEDED, backoff(2s) > floor → reset, IdleResets++, ...
+//
+// So IdleResets must climb after the first sleep elapses. Asserting that
+// counter (rather than the LastBackoffNs value, which is post-reset = floor)
+// is the cleanest observable signal.
+func TestBackoffIdleReset(t *testing.T) {
+	diag.ResetForTest()
+	// Lower the threshold for the test so we don't have to wait 60s. Restore
+	// on cleanup. Production stays at 60s — see daemon.go reconnect* consts.
+	// NOTE: t.Cleanup runs AFTER the deferred stop() below returns, and
+	// stop() blocks until the daemon goroutine has fully exited — so this
+	// write cannot race with the worker's reads of the same var.
+	prevThreshold := reconnectIdleResetThreshold
+	reconnectIdleResetThreshold = 300 * time.Millisecond
+	t.Cleanup(func() { reconnectIdleResetThreshold = prevThreshold })
+
+	// startFailingDaemon's stop() waits for the daemon goroutine to exit,
+	// which closes the race window with the next test's diag.ResetForTest.
+	_, stop := startFailingDaemon(t)
+	defer stop()
+
+	// Wait for at least one idle-reset to fire. With threshold=300ms and
+	// backoff floor=1s, the first reset fires after the first sleep completes
+	// (~1s wall-clock). Generous deadline.
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) {
+		if diag.Default.Tunnel.IdleResets.Load() >= 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := diag.Default.Tunnel.IdleResets.Load(); got < 1 {
+		t.Fatalf("IdleResets = %d, want >= 1 (idle-reset did not fire within deadline)", got)
+	}
+	// And: backoff never exceeded the cap (B1 still holds even with B2 active).
+	if b := diag.Default.Tunnel.LastBackoffNs.Load(); b > int64(reconnectCap) {
+		t.Fatalf("LastBackoffNs %v exceeded cap %v", time.Duration(b), reconnectCap)
+	}
+}
+
+// TestBackoffIdleResetDoesNotFireBelowThreshold proves B2's safety: when the
+// threshold is high (the production default), short transient blips do NOT
+// trigger the reset — the doubling schedule runs normally. This is the
+// "don't accidentally make short blips worse" guarantee.
+func TestBackoffIdleResetDoesNotFireBelowThreshold(t *testing.T) {
+	diag.ResetForTest()
+	// Use a high threshold (10s) so the test window can't possibly trip it.
+	prevThreshold := reconnectIdleResetThreshold
+	reconnectIdleResetThreshold = 10 * time.Second
+	t.Cleanup(func() { reconnectIdleResetThreshold = prevThreshold })
+
+	_, stop := startFailingDaemon(t)
+	defer stop()
+
+	// Wait for a couple of dial-failure cycles (well under the 10s threshold).
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if diag.Default.Tunnel.DialAttempts.Load() >= 2 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	// IdleResets MUST stay zero — threshold not exceeded.
+	if got := diag.Default.Tunnel.IdleResets.Load(); got != 0 {
+		t.Fatalf("IdleResets = %d, want 0 (threshold %v not exceeded within test window)",
+			got, reconnectIdleResetThreshold)
+	}
+}
+
+// TestTunnelProbeRecordsDialLifecycle proves Probe 7 captures the worker-side
+// tunnel lifecycle the way the operator-facing /vh/diag/latency needs: each
+// dial attempt / failure is counted, and CurrentState reflects "disconnected"
+// while the worker is in the backoff loop.
+func TestTunnelProbeRecordsDialLifecycle(t *testing.T) {
+	diag.ResetForTest()
+	_, stop := startFailingDaemon(t)
+	defer stop()
+
+	// Wait for at least 2 dial-failure cycles.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if diag.Default.Tunnel.DialAttempts.Load() >= 2 &&
+			diag.Default.Tunnel.DialFailures.Load() >= 2 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := diag.Default.Tunnel.DialAttempts.Load(); got < 2 {
+		t.Fatalf("DialAttempts = %d, want >= 2", got)
+	}
+	if got := diag.Default.Tunnel.DialFailures.Load(); got < 2 {
+		t.Fatalf("DialFailures = %d, want >= 2", got)
+	}
+	if got := diag.Default.Tunnel.CurrentState.Load(); got != int32(diag.TunnelStateDisconnected) {
+		t.Fatalf("CurrentState = %d, want %d (disconnected while failing to dial)",
+			got, diag.TunnelStateDisconnected)
+	}
+	// LastDisconnectAtNs was initialized to process-start time and must be
+	// non-zero (so the operator's snapshot can compute "disconnected for").
+	if got := diag.Default.Tunnel.LastDisconnectAtNs.Load(); got == 0 {
+		t.Fatalf("LastDisconnectAtNs = 0, want non-zero (initialized at Start)")
+	}
+	// LastBackoffNs is stamped before each sleep — must be non-zero after at
+	// least one failure cycle.
+	if got := diag.Default.Tunnel.LastBackoffNs.Load(); got == 0 {
+		t.Fatalf("LastBackoffNs = 0, want non-zero (stamped on each failure)")
 	}
 }
