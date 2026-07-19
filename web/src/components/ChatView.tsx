@@ -31,6 +31,7 @@ const EAGER_TAIL = 30;
 import QuestionCard from "./QuestionCard";
 import PermissionCard from "./PermissionCard";
 import PendingInput from "./PendingInput";
+import { QueueChip } from "./QueueChip";
 import Icon from "./Icon";
 import Spinner from "./Spinner";
 import { isDesktop } from "../layout";
@@ -2413,46 +2414,13 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
                 Queued
               </span>
               <For each={queueFor(props.sessionId)}>
-                {(q) => {
-                  const tip = (): string => {
-                    if (q.state === "failed" || q.state === "unknown") {
-                      return q.detail
-                        ? `${q.state === "failed" ? "Failed" : "Interrupted"}: ${q.detail}`
-                        : q.state === "failed"
-                          ? "Failed to send"
-                          : "Send was interrupted";
-                    }
-                    if (q.state === "dispatching") return "Sending…";
-                    return q.text;
-                  };
-                  const label = (): string => {
-                    if (q.state === "dispatching") return "Sending…";
-                    if (q.state === "failed") return "Failed";
-                    if (q.state === "unknown") return "Unknown";
-                    return "";
-                  };
-                  return (
-                    <span
-                      class="queue-chip"
-                      data-state={q.state}
-                      data-tip={tip()}
-                    >
-                      <Show when={label()}>
-                        <span class="queue-state">{label()}</span>
-                      </Show>
-                      <span class="queue-text">{q.text || "(attachment)"}</span>
-                      <Show when={q.state === "pending"}>
-                        <button
-                          type="button"
-                          aria-label="Remove queued message"
-                          onClick={() => void removeQueued(props.sessionId, q.id)}
-                        >
-                          <Icon name="x" size={11} />
-                        </button>
-                      </Show>
-                    </span>
-                  );
-                }}
+                {(q) => (
+                  <QueueChip
+                    q={q}
+                    sessionId={props.sessionId}
+                    onRemove={(id) => void removeQueued(props.sessionId, id)}
+                  />
+                )}
               </For>
             </div>
           </Show>

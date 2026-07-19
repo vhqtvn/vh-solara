@@ -217,6 +217,21 @@
   background: transparent; color: var(--fg-dim); cursor: pointer;
 }
 .queue-chip button:hover { color: var(--fg); background: var(--bg); }
+/* Recovery detail note for recovered `unknown` items (FIX-QUEUE-STUCK-2): a
+   backend-set explanation + duplicate-risk warning. Surfaced VISIBLELY (not in
+   the data-tip tooltip) so the operator sees it at a glance. Full-width under
+   its chip via flex-basis:100% inside the wrapping .queue-row. Warning color
+   distinguishes it from normal chip text; `--warn` is defined on :root and
+   inherited/overridden by every shipped theme. */
+.queue-detail-note {
+  flex-basis: 100%;
+  width: 100%;
+  margin: 2px 0 0;
+  padding: 0 2px;
+  font-size: 11.5px;
+  line-height: 1.4;
+  color: var(--warn);
+}
 
 /* --- segmented control (header view toggle, git mode) --- */
 .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 7px; overflow-x: auto; margin-left: auto; max-width: min(58vw, 460px); scrollbar-width: none; }
