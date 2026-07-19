@@ -138,6 +138,21 @@ type Server struct {
 	watcherOn     map[string]bool
 	watcherCancel map[string]context.CancelFunc
 
+	// queueGCMu + queueGCOn guard the one-time, per-dir installation of the
+	// queue-GC session.delete subscriber (FIX-QUEUE-GC-2). The subscriber is
+	// installed from aggFor for the default project AND every lazily-created
+	// per-dir aggregator, and must run exactly once per (dir, aggregator)
+	// pair: aggFor("") returns s.agg on every default-project request and
+	// would otherwise spawn a fresh goroutine + channel per call.
+	//
+	// Lifecycle: the goroutine exits naturally when the store closes its
+	// subscriber channels — store.Close() is called from a.Stop() during
+	// handleReloadProject (per-dir teardown) and at process exit (default).
+	// The returned unsubscribe func is intentionally discarded: store.Close
+	// clears the subs entry itself, so there is no goroutine/channel leak.
+	queueGCMu sync.Mutex
+	queueGCOn map[string]bool
+
 	// features are the capability modules mounted at startup (B). The
 	// coordination verbs are the first one (dogfood).
 	features []Feature
@@ -278,6 +293,7 @@ func NewServer(agg *aggregator.Aggregator, opencodeURL string, ringCapacity int)
 		failFast:      map[string]struct{}{},
 		watcherOn:     map[string]bool{},
 		watcherCancel: map[string]context.CancelFunc{},
+		queueGCOn:     map[string]bool{},
 	}
 	return srv, nil
 }
@@ -297,6 +313,7 @@ func (s *Server) aggFor(dir string) *aggregator.Aggregator {
 			s.aggHook("", s.agg)
 		}
 		s.ensurePermissionWatcher("", s.agg)
+		s.installQueueGCCleanup("", s.agg)
 		return s.agg
 	}
 	s.aggMu.Lock()
@@ -325,6 +342,7 @@ func (s *Server) aggFor(dir string) *aggregator.Aggregator {
 		s.aggHook(dir, a)
 	}
 	s.ensurePermissionWatcher(dir, a)
+	s.installQueueGCCleanup(dir, a)
 	// Run under a context the aggregator itself can cancel via Stop(), so
 	// handleReloadProject can drop ONE project (a.Stop()) without disturbing the
 	// default or any other project. RunManaged derives the cancellable child and
@@ -412,6 +430,107 @@ func (s *Server) ensurePermissionWatcher(dir string, a *aggregator.Aggregator) {
 	s.watcherMu.Unlock()
 
 	go s.runPermissionReconcile(ctx, a)
+}
+
+// queueGCSubscribeBuffer is the per-subscriber channel buffer for the queue-GC
+// session.delete subscriber. session.delete is a STRUCTURAL event (not
+// message-class), so the subscriber passes Interest{MessageSessions: empty{}} to
+// drop ALL message-class events at fanout — only session.* / activity / status /
+// permission / question / notice / unread events reach the channel. These are
+// low-frequency compared to the message/part token-delta flood, so 128 slots is
+// ample headroom against realistic bursts.
+//
+// IMPORTANT non-durability caveat (mirrors ensurePermissionWatcher's doc): the
+// store's emit() does NONBLOCKING fanout — on channel-overflow the channel is
+// CLOSED and the subscriber is silently DROPPED. If that happens this goroutine
+// exits and queue cleanup stops firing on session.delete for this aggregator
+// until process restart (default aggregator) or Reload-project (per-dir
+// aggregator) rebuilds it. This is INTENTIONAL and accepted: queue cleanup is
+// also driven DIRECTLY by the /vh/archive handler (so archive correctness never
+// depends on subscriber delivery), and the deferred GC-3 slice will add
+// authoritative filesystem reconciliation as a periodic backstop that catches
+// orphans regardless of subscriber state. Per Settled Assumption #8 the
+// subscriber is best-effort only.
+const queueGCSubscribeBuffer = 128
+
+// installQueueGCCleanup arms the queue-GC session.delete subscriber on a's
+// store, once per (dir, aggregator) pair (idempotent, guarded by queueGCOn).
+// It is called from aggFor so it runs for the default project AND every
+// lazily-created per-dir aggregator, before any HTTP request can observe a
+// queue-owning session that has already been deleted upstream.
+//
+// Why a live-tail subscriber is acceptable here but NOT for the fail-closed
+// permission watcher (ensurePermissionWatcher, which uses a deterministic
+// reconcile sweep): the permission watcher enforces a SAFETY guarantee that
+// MUST fire on every match — a silently-dropped subscriber would let an
+// unattended prompt hang with no signal. Queue GC is a CLEANUP optimization:
+// the /vh/archive path already deletes the queue DIRECTLY (so operator-driven
+// archive is correct even with zero subscriber delivery), and a missed
+// session.delete just leaves an orphan queue.json that GC-3 will eventually
+// reap. Idempotent cleanup means the direct path + subscriber path compose
+// without harm.
+//
+// Async delivery (verified in pkg/state/store.go emit/Subscribe): emit() does a
+// nonblocking send under the store lock; the consumer reads from the channel in
+// its OWN goroutine, so CleanupSession's filesystem os.Remove never holds the
+// store lock. No buffered-channel/worker indirection is needed.
+//
+// Lifecycle: the goroutine ranges over the channel until the store closes it.
+// store.Close() (called from aggregator.Stop() during handleReloadProject and
+// at process exit) closes every subscriber channel and clears the subs map, so
+// this goroutine exits cleanly with no leak. The unsubscribe func returned by
+// Subscribe is intentionally discarded — store.Close already removes the subs
+// entry, so there is nothing to leak. queueGCOn[dir] stays true across a
+// Reload-project cycle: the dir's aggregator is deleted from s.aggs so the NEXT
+// aggFor(dir) builds a FRESH aggregator (new store, new subs map), and
+// installQueueGCCleanup sees queueGCOn[dir]==true and skips. That is the WRONG
+// behavior (the new aggregator's store is never subscribed) — so
+// handleReloadProject resets queueGCOn[dir] after tearing down the old
+// aggregator. See the call site there.
+func (s *Server) installQueueGCCleanup(dir string, a *aggregator.Aggregator) {
+	s.queueGCMu.Lock()
+	if s.queueGCOn[dir] {
+		s.queueGCMu.Unlock()
+		return
+	}
+	s.queueGCOn[dir] = true
+	s.queueGCMu.Unlock()
+
+	root, err := projectRoot(dir)
+	if err != nil {
+		// projectRoot only fails if os.Getwd (default dir) or filepath.Abs
+		// (per-dir) fails — both effectively never. If it somehow does, leave
+		// queueGCOn[dir]==true so we don't retry uselessly on every request,
+		// and rely on /vh/archive's direct cleanup + GC-3 backstop.
+		vhlog.Error("queue-GC subscriber not installed: projectRoot failed", "dir", dir, "err", err)
+		return
+	}
+	store := a.Store()
+	// Drop ALL message-class events at fanout — we only care about the
+	// structural session.delete event. An empty (non-nil) MessageSessions map
+	// means "deliver message-class events only for sessions in the set", and an
+	// empty set drops them all (see state.Interest.wants).
+	ch, _ := store.SubscribeWith(queueGCSubscribeBuffer, state.Interest{MessageSessions: map[string]bool{}})
+	go func() {
+		for ev := range ch {
+			if ev.Kind != state.KindSessionDelete {
+				continue
+			}
+			var p struct {
+				ID string `json:"id"`
+			}
+			if json.Unmarshal(ev.Payload, &p) != nil || p.ID == "" {
+				continue
+			}
+			// Sanitize the id the same way /vh/archive does (safeID strips
+			// anything that could escape the session directory on disk).
+			sid := safeID.ReplaceAllString(p.ID, "")
+			if sid == "" {
+				continue
+			}
+			s.queues.CleanupSession(root, sid)
+		}
+	}()
 }
 
 // permReconcileInterval is the period of the per-directory fail-closed

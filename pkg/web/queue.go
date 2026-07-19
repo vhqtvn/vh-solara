@@ -595,6 +595,27 @@ func (qr *queueRegistry) deleteStore(root, sessionID string) {
 	st.mu.Unlock()
 }
 
+// CleanupSession is the public web-owned cleanup helper for one session's
+// queue. It is the single web-layer entry point that both the direct /vh/archive
+// handler and the session.delete event subscriber call so that queue cleanup
+// runs regardless of which path removed the session (operator archive click,
+// external-client archive via time.archived, OpenCode live session.deleted, or
+// hydrate prune). It is a thin pass-through to the idempotent deleteStore
+// primitive (FIX-QUEUE-GC-1).
+//
+// GC-2 contract:
+//   - The /vh/archive handler calls this DIRECTLY (archive correctness must not
+//     depend on best-effort event delivery — see Settled Assumption #5).
+//   - The session.delete subscriber installed in aggFor also calls this. The
+//     two calls compose: deleteStore is idempotent, so a direct+event pair for
+//     the same session is a benign no-op the second time.
+//   - Keep this wrapper as the single name callers route through, so future
+//     GC slices (orphan reconciliation, terminal-item dismissal, compaction)
+//     have one obvious hook.
+func (qr *queueRegistry) CleanupSession(root, sessionID string) {
+	qr.deleteStore(root, sessionID)
+}
+
 // newQueueID issues a backend-owned queue item id. crypto/rand gives global
 // uniqueness for diagnostics; the monotonic Order (not the id) governs FIFO.
 func newQueueID() string {

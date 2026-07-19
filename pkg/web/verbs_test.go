@@ -30,6 +30,7 @@ type fakeOC struct {
 	qStatus         int  // if non-zero, /question reply returns this status (no record)
 	createStatus    int  // if non-zero, POST /session returns this status (create failure)
 	promptStatus    int  // if non-zero, /session/:id/prompt_async returns this status (prompt failure)
+	archiveStatus   int  // if non-zero, PATCH /session/:id (SetArchived) returns this status (archive failure)
 }
 
 func (f *fakeOC) handler() http.Handler {
@@ -68,6 +69,13 @@ func (f *fakeOC) handler() http.Handler {
 		case contains(p, "/permissions/"):
 			b, _ := readAll(r)
 			f.permissions = append(f.permissions, "legacy:"+b)
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPatch:
+			// SetArchived (PATCH /session/:id time.archived). Used by /vh/archive.
+			if f.archiveStatus != 0 {
+				w.WriteHeader(f.archiveStatus)
+				return
+			}
 			w.WriteHeader(http.StatusOK)
 		default:
 			w.WriteHeader(http.StatusOK)

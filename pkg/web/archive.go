@@ -87,11 +87,16 @@ func (s *Server) handleArchive(w http.ResponseWriter, r *http.Request) {
 		// Archive clears the queue: a successful archive deletes that session's
 		// queue state (matches the prior FE-only behavior and the operator's
 		// confirmed policy). Done AFTER the archive commits so a failed archive
-		// never loses queued messages.
+		// never loses queued messages. Routed through the same CleanupSession
+		// wrapper the session.delete subscriber uses (FIX-QUEUE-GC-2): archive
+		// correctness must NOT depend on best-effort subscriber delivery, so the
+		// direct call is retained here even though RemoveSessions above also
+		// fires KindSessionDelete → subscriber → CleanupSession. The two calls
+		// compose idempotently (the second is a no-op).
 		root, err := projectRoot(dir)
 		if err == nil {
 			for _, id := range affected {
-				s.queues.deleteStore(root, safeID.ReplaceAllString(id, ""))
+				s.queues.CleanupSession(root, safeID.ReplaceAllString(id, ""))
 			}
 		}
 	}
@@ -245,6 +250,12 @@ func (s *Server) handleReloadProject(w http.ResponseWriter, r *http.Request) {
 			s.stopPermissionWatcher(dir)
 			a.Stop()
 			delete(s.aggs, dir)
+			// Reset queueGCOn so the next aggFor(dir) rebuilds the queue-GC
+			// subscriber on the new aggregator's store. Lock order matches
+			// stopPermissionWatcher: queueGCMu nested inside aggMu.
+			s.queueGCMu.Lock()
+			delete(s.queueGCOn, dir)
+			s.queueGCMu.Unlock()
 		}
 		s.aggMu.Unlock()
 	}
