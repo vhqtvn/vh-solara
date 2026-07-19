@@ -169,6 +169,20 @@ func (s *Server) handleSessionsCloseout(w http.ResponseWriter, r *http.Request) 
 
 	closeouts := make(map[string]sessionCloseout, len(ids))
 	for _, id := range ids {
+		// Project-isolation guard: a request from project B carrying a session
+		// id that belongs to project A must NOT trigger an upstream Messages
+		// fetch (OpenCode's /session/<id>/message endpoint is project-blind).
+		// Silent-drop: foreign id → present:false (indistinguishable from an
+		// unknown id), no 400, no upstream GET. Mirrors projectScopedFilter on
+		// the snapshot/stream path. ShouldServeSession encapsulates the
+		// armed-gate (production enforces HasSession; bare-test aggregators
+		// permit any id — see its doc comment) so this guard stays compatible
+		// with the hermetic closeout tests that exercise Client() directly on
+		// an unseeded store.
+		if !agg.ShouldServeSession(id) {
+			closeouts[id] = sessionCloseout{Present: false, Text: nil}
+			continue
+		}
 		present := false
 		var text string
 		if items, err := agg.Client().Messages(ctx, id); err == nil {

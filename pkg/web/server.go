@@ -305,6 +305,15 @@ func (s *Server) aggFor(dir string) *aggregator.Aggregator {
 		return a
 	}
 	a := aggregator.NewForDirectory(s.opencodeURL, dir, s.ringCap)
+	// Arm synchronously BEFORE storing / returning, so no HTTP request can
+	// observe an unarmed production aggregator. Without this, a GET
+	// /vh/sessions/closeout?dir=<fresh-project>&id=<foreign-id> that wins the
+	// race against the RunManaged goroutine below would see
+	// ShouldServeSession==true (fail-open) and leak the foreign project's
+	// messages via the project-blind Client().Messages upstream. Run's later
+	// a.armed = true is a redundant no-op for per-dir aggregators. See the
+	// armed field doc in pkg/aggregator/aggregator.go for the full model.
+	a.Arm()
 	s.aggs[dir] = a
 	// Managed-project hook: discover .vh-solara/project.jsonc, gate on trust, and
 	// (if trusted) start declared processes + register views. Non-blocking; nil
@@ -918,6 +927,7 @@ func (s *Server) handleRunningSessions(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 	agg := s.aggFor(reqDir(r))
 	filter := messageFilter(r)
+	filter = s.projectScopedFilter(agg, filter)
 	s.ensureMessages(r.Context(), agg, filter)
 	snap := agg.Store().Snapshot(filter)
 	b, err := json.Marshal(snap)
@@ -952,6 +962,26 @@ func (s *Server) ensureMessages(ctx context.Context, agg *aggregator.Aggregator,
 	for id := range filter {
 		_ = agg.EnsureMessages(ctx, id)
 	}
+}
+
+// projectScopedFilter returns a filter containing only the IDs that are members
+// of agg's project-scoped store. A nil filter ("all" request) passes through
+// unchanged — the SAFE branch at the call site already iterates SessionIDs(),
+// which is project-scoped by construction. This is the project-isolation guard
+// at the HTTP boundary: without it, a request from project B carrying a session
+// ID that belongs to project A would hydrate project A's messages into project
+// B's store (OpenCode's /session/<id>/message endpoint is project-blind).
+func (s *Server) projectScopedFilter(agg *aggregator.Aggregator, filter map[string]bool) map[string]bool {
+	if filter == nil {
+		return nil
+	}
+	scoped := make(map[string]bool, len(filter))
+	for id := range filter {
+		if agg.Store().HasSession(id) {
+			scoped[id] = true
+		}
+	}
+	return scoped
 }
 
 // triggerMessageLoad is the NON-BLOCKING counterpart of ensureMessages used on
@@ -1059,6 +1089,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	// with background subagent token-deltas. ?sessions=all opts back into the
 	// full firehose.
 	filter := messageFilter(r)
+	filter = s.projectScopedFilter(agg, filter)
 	sendable := func(kind string, payload []byte) bool {
 		if filter == nil { // "all"
 			return true

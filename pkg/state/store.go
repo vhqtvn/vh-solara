@@ -3595,6 +3595,17 @@ func (s *Store) SessionIDs() []string {
 	return out
 }
 
+// HasSession reports whether sid is a member of this store's project scope.
+// Cheap O(1) RLock + map lookup. Used for project-isolation guards at the HTTP
+// boundary and as a defense-in-depth backstop in the aggregator. Distinct from
+// SessionIDs (O(n) alloc + copy) because per-filter-ID checks need O(1).
+func (s *Store) HasSession(sid string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	_, ok := s.sessions[sid]
+	return ok
+}
+
 // LoadedSessions returns the ids whose messages have been hydrated — the set to
 // re-fetch on reconnect (instead of every session).
 func (s *Store) LoadedSessions() []string {
