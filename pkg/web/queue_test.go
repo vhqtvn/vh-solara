@@ -1406,3 +1406,270 @@ func TestQueueRecoveredUnknownCanBeResolvedToSent(t *testing.T) {
 		t.Fatalf("after resolve: got state=%s detail=%q, want sent/late-confirmation", after[0].State, after[0].Detail)
 	}
 }
+
+// --- Session queue cleanup primitive (FIX-QUEUE-GC-1) -----------------------
+//
+// deleteStore is generalized into an idempotent web-owned cleanup: it removes
+// queue.json AND attempts empty-only rmdir of the parent session directory.
+// NEVER os.RemoveAll — the attachment lifecycle (peer attachments/ subdir) is
+// unproven against retained OpenCode transcript file:// references, so the
+// directory survives whenever attachments/, an atomic-write temp file, or
+// anything else is present. The 10 cases below pin the full cleanup contract
+// that GC-2 (event subscription), GC-3 (orphan reconciliation), GC-4 (terminal
+// dismissal), and GC-5 (automatic compaction) will build on.
+
+// 1. Registered store is tombstoned (BLK-1) and removed from the registry map.
+// The retained pointer's archived flag must be true so a retained store cannot
+// resurrect via save() — the load-bearing contract every mutation relies on.
+func TestQueueCleanupTombstonesRegisteredStore(t *testing.T) {
+	root := t.TempDir()
+	qr := newQueueRegistry()
+	sid := "s1"
+	st := qr.store(root, sid)
+	mustEnqueue(t, st, "a")
+	qr.deleteStore(root, sid)
+	// The store must no longer be in the registry map.
+	qr.mu.Lock()
+	_, present := qr.stores[storeKey(root, sid)]
+	qr.mu.Unlock()
+	if present {
+		t.Fatal("deleteStore: store still present in registry map")
+	}
+	// The retained pointer's tombstone flag must be set under its own mutex
+	// so a retained pointer cannot resurrect via save() (BLK-1).
+	st.mu.Lock()
+	archived := st.archived
+	st.mu.Unlock()
+	if !archived {
+		t.Fatal("deleteStore: retained store pointer archived=false, want true (BLK-1 tombstone)")
+	}
+}
+
+// 2. Queue file on disk is removed.
+func TestQueueCleanupRemovesQueueFile(t *testing.T) {
+	root := t.TempDir()
+	qr := newQueueRegistry()
+	sid := "s1"
+	mustEnqueue(t, qr.store(root, sid), "a")
+	if _, err := os.Stat(queuePath(root, sid)); err != nil {
+		t.Fatalf("precondition: queue.json should exist: %v", err)
+	}
+	qr.deleteStore(root, sid)
+	if _, err := os.Stat(queuePath(root, sid)); !os.IsNotExist(err) {
+		t.Fatalf("after deleteStore: want not-exist, got %v", err)
+	}
+}
+
+// 3. Idempotent: queue file already absent → no panic. deleteStore has no
+// error return; this asserts the ENOENT path is swallowed and the registry is
+// left in a usable state (a subsequent store()+Enqueue works).
+func TestQueueCleanupIdempotentNoFile(t *testing.T) {
+	root := t.TempDir()
+	qr := newQueueRegistry()
+	sid := "never-existed"
+	// No file on disk, no store in registry. deleteStore must not panic.
+	qr.deleteStore(root, sid)
+	// Registry must still be usable: a subsequent store()+Enqueue works.
+	st := qr.store(root, sid)
+	mustEnqueue(t, st, "post-cleanup")
+}
+
+// 4. Empty parent session directory is removed after queue.json removal. This
+// is the "empty-directory litter" orphan scenario from the GC-2/3 solution
+// brief: a session whose queue.json is the only artifact should leave no
+// .vh-solara/sessions/<id>/ litter behind.
+func TestQueueCleanupRemovesEmptyParentDir(t *testing.T) {
+	root := t.TempDir()
+	qr := newQueueRegistry()
+	sid := "s1"
+	mustEnqueue(t, qr.store(root, sid), "a")
+	dir := filepath.Dir(queuePath(root, sid))
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("precondition: session dir should exist: %v", err)
+	}
+	qr.deleteStore(root, sid)
+	// queue.json gone (verified in case 2); the empty parent dir must also
+	// be gone.
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("after deleteStore: empty session dir should be gone, got %v", err)
+	}
+}
+
+// 5. Parent containing attachments/ subdir → directory survives. The
+// attachment lifecycle is unproven (OpenCode transcripts may retain file://
+// references to attachment URLs), so the queue GC MUST NOT remove a directory
+// that still holds attachment data. Only queue.json is removed. This is the
+// reason we use os.Remove (empty-only) instead of os.RemoveAll.
+func TestQueueCleanupPreservesDirWithAttachments(t *testing.T) {
+	root := t.TempDir()
+	qr := newQueueRegistry()
+	sid := "s1"
+	mustEnqueue(t, qr.store(root, sid), "a")
+	dir := filepath.Dir(queuePath(root, sid))
+	attachDir := filepath.Join(dir, "attachments")
+	if err := os.MkdirAll(attachDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dummy := filepath.Join(attachDir, "image.png")
+	if err := os.WriteFile(dummy, []byte("png-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	qr.deleteStore(root, sid)
+	// queue.json gone.
+	if _, err := os.Stat(queuePath(root, sid)); !os.IsNotExist(err) {
+		t.Fatalf("after deleteStore: queue.json should be gone, got %v", err)
+	}
+	// Session directory + attachments/ + dummy file MUST survive.
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("session dir should survive (has attachments/): %v", err)
+	}
+	if _, err := os.Stat(attachDir); err != nil {
+		t.Fatalf("attachments/ should survive: %v", err)
+	}
+	if _, err := os.Stat(dummy); err != nil {
+		t.Fatalf("attachment file should survive: %v", err)
+	}
+}
+
+// 6. Parent containing an atomic-write temp file → directory survives. Models
+// a racing writeQueueAtomic temp file (".queue.json.tmp-*") that hasn't been
+// cleaned up yet. The temp must not be silently lost; the directory pins until
+// the next save() cycle completes its own temp cleanup. Pinning on a temp is
+// correct: an in-flight atomic write must not be silently lost.
+func TestQueueCleanupPreservesDirWithAtomicTempFile(t *testing.T) {
+	root := t.TempDir()
+	qr := newQueueRegistry()
+	sid := "s1"
+	mustEnqueue(t, qr.store(root, sid), "a")
+	dir := filepath.Dir(queuePath(root, sid))
+	// Simulate a writeQueueAtomic temp file: same prefix pattern
+	// ("." + base + ".tmp-*"). See writeQueueAtomic in queue.go.
+	tmp := filepath.Join(dir, ".queue.json.tmp-fakeRace123")
+	if err := os.WriteFile(tmp, []byte("partial"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	qr.deleteStore(root, sid)
+	// queue.json gone.
+	if _, err := os.Stat(queuePath(root, sid)); !os.IsNotExist(err) {
+		t.Fatalf("after deleteStore: queue.json should be gone, got %v", err)
+	}
+	// Session directory + temp file MUST survive (the directory is non-empty
+	// so empty-only rmdir fails and is swallowed — the safe behavior).
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("session dir should survive (has temp file): %v", err)
+	}
+	if _, err := os.Stat(tmp); err != nil {
+		t.Fatalf("atomic-write temp file should survive: %v", err)
+	}
+}
+
+// 7. Idempotent: parent directory already missing → no panic. deleteStore on
+// a session whose directory was already removed (e.g., by a previous cleanup
+// call, or by an external janitor) must not panic and must leave the registry
+// in a usable state.
+func TestQueueCleanupIdempotentNoDir(t *testing.T) {
+	root := t.TempDir()
+	qr := newQueueRegistry()
+	sid := "s1"
+	// No file on disk, no directory on disk, no store in registry. deleteStore
+	// must not panic on the double-ENOENT (path + dir).
+	qr.deleteStore(root, sid)
+	// Registry still usable: a subsequent store()+Enqueue works (save() does
+	// MkdirAll, recreating the directory).
+	st := qr.store(root, sid)
+	mustEnqueue(t, st, "post-cleanup")
+}
+
+// 8. Concurrent retained store pointer cannot recreate the deleted store.
+// Mirrors the BLK-1 invariant (TestQueueArchivedStoreRejectsRetainedPointer)
+// but exercises the cleanup-primitive generalization directly: a retained
+// *sessionQueueStore obtained before cleanup calls save() — the only path that
+// writes queue.json — and must observe errQueueArchived, leaving no queue.json
+// on disk. This is the load-bearing concurrency guarantee GC-2/3/4/5 depend on
+// for safe invocation from event listeners / reconciliation sweeps.
+//
+// st.mu is held around save() to mirror the happens-before discipline every
+// production caller follows (e.g. Enqueue/Claim/Resolve/Remove and the
+// seedDispatchingItem helper at L1032): save() reads s.archived at queue.go:198
+// relying on the caller's lock, and deleteStore writes st.archived under st.mu
+// at queue.go:585. Without the test-side lock the read would race with that
+// write under `go test -race`.
+func TestQueueCleanupRetainedPointerCannotRecreate(t *testing.T) {
+	root := t.TempDir()
+	qr := newQueueRegistry()
+	sid := "s1"
+	st := qr.store(root, sid)
+	mustEnqueue(t, st, "seed")
+	// Retained pointer held across cleanup.
+	qr.deleteStore(root, sid)
+	// save() on the retained pointer must return errQueueArchived (the
+	// tombstone contract: BLK-1 last-resort guard inside save()). Hold st.mu
+	// around the call to match the production happens-before discipline.
+	st.mu.Lock()
+	err := st.save()
+	st.mu.Unlock()
+	if !errors.Is(err, errQueueArchived) {
+		t.Fatalf("retained save() after cleanup: err=%v, want errQueueArchived", err)
+	}
+	// queue.json MUST NOT exist on disk — no resurrection.
+	if _, err := os.Stat(queuePath(root, sid)); !os.IsNotExist(err) {
+		t.Fatalf("retained save() recreated queue.json (BLK-1 regression): %v", err)
+	}
+}
+
+// 9. Repeated cleanup is idempotent: a second call produces no filesystem side
+// effects and no panic. After the first call has removed queue.json and the
+// empty parent directory, the second call's ENOENT-on-both paths must be
+// swallowed cleanly.
+func TestQueueCleanupRepeatedIsIdempotent(t *testing.T) {
+	root := t.TempDir()
+	qr := newQueueRegistry()
+	sid := "s1"
+	mustEnqueue(t, qr.store(root, sid), "a")
+	dir := filepath.Dir(queuePath(root, sid))
+	qr.deleteStore(root, sid)
+	// First call removed queue.json + empty parent dir.
+	if _, err := os.Stat(queuePath(root, sid)); !os.IsNotExist(err) {
+		t.Fatalf("first deleteStore: queue.json should be gone, got %v", err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("first deleteStore: empty session dir should be gone, got %v", err)
+	}
+	// Second call must be a no-op (no panic, both ENOENT paths swallowed).
+	qr.deleteStore(root, sid)
+	// State unchanged.
+	if _, err := os.Stat(queuePath(root, sid)); !os.IsNotExist(err) {
+		t.Fatalf("second deleteStore: queue.json should still be gone, got %v", err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("second deleteStore: session dir should still be gone, got %v", err)
+	}
+}
+
+// 10. Cleanup discovers on-disk queue.json even without a registered store.
+// The no-store branch must still attempt filesystem cleanup so a hand-seeded
+// queue.json (e.g., from a previous binary's persistence, or a restart hydrate
+// prune that left a stale file) gets removed and the empty parent dir is
+// cleaned up. This is the foundation for GC-3 (orphan reconciliation).
+func TestQueueCleanupRemovesOrphanedFileOnDisk(t *testing.T) {
+	root := t.TempDir()
+	qr := newQueueRegistry()
+	sid := "s1"
+	// Seed queue.json directly on disk, bypassing the registry entirely.
+	dir := filepath.Dir(queuePath(root, sid))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(queuePath(root, sid), []byte(`{"order":0,"items":[]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Cleanup hits the no-store branch and must still remove the file + the
+	// now-empty parent dir.
+	qr.deleteStore(root, sid)
+	if _, err := os.Stat(queuePath(root, sid)); !os.IsNotExist(err) {
+		t.Fatalf("no-store branch: queue.json should be gone, got %v", err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("no-store branch: empty session dir should be gone, got %v", err)
+	}
+}

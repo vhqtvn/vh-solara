@@ -514,10 +514,31 @@ func (qr *queueRegistry) store(root, sessionID string) *sessionQueueStore {
 	return st
 }
 
-// deleteStore drops the in-memory store for (root, sessionID) and removes its
-// queue.json. Used by the archive lifecycle: a successful archive clears that
-// session's queue state (matches prior FE-only behavior). Best-effort file
-// removal: even if no store was ever loaded, the file is removed.
+// deleteStore is the idempotent web-owned cleanup primitive for one session's
+// queue. It drops the in-memory store for (root, sessionID), tombstones it
+// (BLK-1), removes its queue.json, AND attempts empty-only rmdir of the parent
+// session directory (.vh-solara/sessions/<id>/). Today the sole caller is the
+// archive lifecycle (archive.go); FIX-QUEUE-GC slices 2-5 will route additional
+// cleanup paths (session.delete events, orphan reconciliation, terminal
+// dismissal, automatic compaction) through this same primitive.
+//
+// Cleanup contract (FIX-QUEUE-GC-1):
+//   - Idempotent: a missing queue.json, a missing session directory, or a
+//     missing registry entry are all valid starting states. Repeated calls are
+//     no-ops. Neither os.Remove error (ENOENT, non-empty dir, etc.) is surfaced
+//     — the contract is "best-effort: queue.json is gone; session directory is
+//     gone IF empty".
+//   - Empty-only rmdir: if the parent session directory still holds anything
+//     (attachments/ subdir, an atomic-write temp file from writeQueueAtomic,
+//     or any other peer artifact), os.Remove fails on every platform and the
+//     directory survives. That failure is intentionally swallowed.
+//   - NEVER os.RemoveAll: the attachment lifecycle (peer attachments/ subdir)
+//     is unproven to be free of retained OpenCode transcript file://
+//     references, so recursively deleting the session directory could orphan
+//     live attachment data. Queue GC is scoped to queue files only.
+//   - Filesystem cleanup runs even when no store is registered (mirrors the
+//     original best-effort file-removal contract) so a hand-seeded queue.json
+//     from a pre-startup persistence state still gets removed.
 //
 // The REGISTRY lock is held across BOTH the map-removal AND the os.Remove so a
 // concurrent store()/Enqueue (which needs the registry lock to create a new
@@ -536,7 +557,7 @@ func (qr *queueRegistry) store(root, sessionID string) *sessionQueueStore {
 // the old store (obtained via an earlier store() call, before archive) still
 // points at this object. Its mutations acquire only st.mu (not qr.mu), so once
 // deleteStore releases st.mu, the retained pointer's Enqueue/Claim/Resolve/
-// Remove observes archived==true and returns errQueueArchived WITHOUT appending,
+// Remove observe archived==true and return errQueueArchived WITHOUT appending,
 // mutating, or save()ing — so it cannot write queue.json back into existence
 // (which would resurrect the archived-away messages). A fresh store() lookup
 // AFTER deleteStore creates a brand-new sessionQueueStore (archived==false,
@@ -544,22 +565,33 @@ func (qr *queueRegistry) store(root, sessionID string) *sessionQueueStore {
 func (qr *queueRegistry) deleteStore(root, sessionID string) {
 	key := storeKey(root, sessionID)
 	path := queuePath(root, sessionID)
+	dir := filepath.Dir(path)
 	qr.mu.Lock()
 	defer qr.mu.Unlock()
 	st := qr.stores[key]
 	if st == nil {
-		// No in-memory store to tombstone; just ensure the file is gone.
+		// No in-memory store to tombstone; just ensure the file is gone and
+		// attempt empty-only rmdir of the parent session directory.
 		_ = os.Remove(path)
+		_ = os.Remove(dir)
 		return
 	}
-	// Hold st.mu across the tombstone set, map removal, AND os.Remove so any
-	// retained pointer to this store observes archived==true before it can
-	// mutate/save. qr.mu is already held, so a concurrent store() cannot
-	// create a new entry until this whole block completes (B2).
+	// Hold st.mu across the tombstone set, map removal, AND both os.Remove
+	// calls so any retained pointer to this store observes archived==true
+	// before it can mutate/save. qr.mu is already held, so a concurrent
+	// store() cannot create a new entry until this whole block completes
+	// (B2).
 	st.mu.Lock()
 	st.archived = true
 	delete(qr.stores, key)
 	_ = os.Remove(path)
+	// Empty-only rmdir of the parent session directory. If attachments/,
+	// an atomic-write temp file from writeQueueAtomic, or anything else is
+	// present, os.Remove fails and the directory survives — that is the
+	// correct, safe behavior. The error is intentionally swallowed: this is
+	// best-effort cleanup, NEVER os.RemoveAll (attachment lifecycle is
+	// unproven against retained OpenCode transcript file:// references).
+	_ = os.Remove(dir)
 	st.mu.Unlock()
 }
 
