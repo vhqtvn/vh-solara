@@ -262,3 +262,59 @@ func TestQueueGC_HydratePruneRemovesQueue(t *testing.T) {
 	}, nil)
 	waitForQueueGone(t, root, "s1", "hydrate prune")
 }
+
+// 8. Reload-project reinstalls the queue-GC subscriber on the fresh aggregator.
+//
+//	GC-2 advisory F1: handleReloadProject tears down the per-dir aggregator
+//	(a.Stop()), removes it from s.aggs, and resets queueGCOn[dir] so the next
+//	aggFor(dir) rebuilds a FRESH aggregator. That fresh aggFor MUST also
+//	re-install the queue-GC subscriber — otherwise session.delete events on
+//	the new store silently leak their queue.json files (the exact leak the
+//	subscriber exists to prevent). This test pins the re-install invariant:
+//	after reload, a session.delete on the FRESH aggregator's store still
+//	reaches CleanupSession.
+//
+//	Harness: newReloadServer (not queueLifecycleServer) because reload needs
+//	fakeOpenCode's /instance/dispose handler. dirB is t.TempDir() so
+//	projectRoot(dirB) resolves cleanly and the test auto-cleans.
+func TestQueueGC_ReloadProjectReinstallsSubscriber(t *testing.T) {
+	srv, _, _, web := newReloadServer(t)
+
+	dirB := t.TempDir() // absolute; projectRoot(dirB) == dirB
+
+	// (1) Materialize a per-dir aggregator. aggFor arms it, installs the
+	//     queue-GC subscriber, and starts RunManaged.
+	aB1 := srv.aggFor(dirB)
+
+	// (2) Sanity: the subscriber is live on aB1. Seed a queue + session,
+	//     fire session.deleted, confirm the queue.json is removed.
+	seedQueueFile(t, dirB, "s1")
+	aB1.Store().Apply(ev("session.created", `{"info":{"id":"s1"}}`))
+	aB1.Store().Apply(ev("session.deleted", `{"info":{"id":"s1"}}`))
+	waitForQueueGone(t, dirB, "s1", "pre-reload subscriber cleanup")
+
+	// (3) Reload dirB: disposes the OpenCode instance, Stops aB1, drops it
+	//     from s.aggs, and resets queueGCOn[dirB] (so the next aggFor
+	//     re-installs a fresh subscriber instead of skipping).
+	resp := doReloadProject(t, web.URL, dirB)
+	if sc := resp.StatusCode; sc != 200 {
+		t.Fatalf("reload-project status: want 200, got %d", sc)
+	}
+	resp.Body.Close()
+
+	// (4) Re-materialize. Must be a FRESH aggregator (not aB1).
+	aB2 := srv.aggFor(dirB)
+	if aB2 == aB1 {
+		t.Fatal("aggFor(dirB) returned the SAME aggregator after reload — not rebuilt")
+	}
+
+	// (5) THE CONTRACT: the subscriber was re-installed on aB2. Seed a fresh
+	//     queue + session, fire session.deleted on aB2's store, confirm the
+	//     queue.json is removed. If the subscriber had NOT been re-installed
+	//     (the GC-2 F1 bug), the queue.json for s2 would persist and
+	//     waitForQueueGone would fatal.
+	seedQueueFile(t, dirB, "s2")
+	aB2.Store().Apply(ev("session.created", `{"info":{"id":"s2"}}`))
+	aB2.Store().Apply(ev("session.deleted", `{"info":{"id":"s2"}}`))
+	waitForQueueGone(t, dirB, "s2", "post-reload subscriber cleanup on fresh aggregator")
+}

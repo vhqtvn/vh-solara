@@ -90,7 +90,9 @@ func newIsolationServer(t *testing.T) (
 	// fake.messages is project-blind — the same content is served for ANY
 	// /session/leakMe/message GET regardless of dir. An unguarded handler
 	// would return this; a guarded one must not issue the GET.
-	fake.messages["leakMe"] = leakMessageContent
+	// setMessage (not bare assignment) because the aggregator's poll loop is
+	// already running and the handler reads f.messages under f.mu.
+	fake.setMessage("leakMe", leakMessageContent)
 
 	// Materialize dirB. Its aggregator polls /session, gets the empty list
 	// (fake.sessions is empty), and never knows about leakMe — so its store's
@@ -144,7 +146,7 @@ func TestSnapshotProjectIsolation(t *testing.T) {
 		t.Fatalf("snapshot must NOT carry leakMe under dirB (foreign id); got messages[leakMe]=%s",
 			string(snap.Messages["leakMe"]))
 	}
-	if got := fake.msgGets["leakMe"]; got != 0 {
+	if got := fake.msgGetsCount("leakMe"); got != 0 {
 		t.Fatalf("upstream /session/leakMe/message GET count: want 0 (guarded), got %d", got)
 	}
 }
@@ -201,7 +203,7 @@ func TestStreamProjectIsolation(t *testing.T) {
 	for {
 		ev, data := readSSEFrameSilent(reader)
 		if ev == "" {
-			if got := fake.msgGets["leakMe"]; got != 0 {
+			if got := fake.msgGetsCount("leakMe"); got != 0 {
 				t.Fatalf("upstream GET count: want 0 (guarded), got %d", got)
 			}
 			return
@@ -297,7 +299,7 @@ func TestCloseoutProjectIsolation(t *testing.T) {
 	if c.Text != nil {
 		t.Fatalf("closeouts[leakMe].text: want null (foreign id), got %q", *c.Text)
 	}
-	if got := fake.msgGets["leakMe"]; got != 0 {
+	if got := fake.msgGetsCount("leakMe"); got != 0 {
 		t.Fatalf("upstream GET count: want 0 (guarded), got %d", got)
 	}
 }
@@ -338,7 +340,7 @@ func TestSessionMessagesNoColdFetchRegression(t *testing.T) {
 	if len(items) != 0 {
 		t.Fatalf("items: want empty (foreign id), got %d item(s)", len(items))
 	}
-	if got := fake.msgGets["leakMe"]; got != 0 {
+	if got := fake.msgGetsCount("leakMe"); got != 0 {
 		t.Fatalf("upstream GET count: want 0 (no hydrate on page path), got %d", got)
 	}
 }
@@ -355,7 +357,7 @@ func TestEnsureMessagesRejectsForeignSession(t *testing.T) {
 	if err := dirBAgg.EnsureMessages(context.Background(), "leakMe"); err != nil {
 		t.Fatalf("EnsureMessages on foreign id: want nil error, got %v", err)
 	}
-	if got := fake.msgGets["leakMe"]; got != 0 {
+	if got := fake.msgGetsCount("leakMe"); got != 0 {
 		t.Fatalf("upstream GET count: want 0 (backstop), got %d", got)
 	}
 	// And the same backstop must NOT have marked the session as loaded —
@@ -389,8 +391,9 @@ func TestCloseoutFirstRequestNoRace(t *testing.T) {
 	_, fake, _, web := newReloadServer(t)
 
 	// Project-blind content for "leakMe". An unguarded closeout would fetch
-	// this regardless of dir.
-	fake.messages["leakMe"] = leakMessageContent
+	// this regardless of dir. setMessage (not bare assignment) because the
+	// server is already serving and the handler reads f.messages under f.mu.
+	fake.setMessage("leakMe", leakMessageContent)
 
 	// A directory never before opened. aggFor inside the handler materializes
 	// the aggregator on this request; the fix requires armed=true to hold
@@ -426,7 +429,7 @@ func TestCloseoutFirstRequestNoRace(t *testing.T) {
 	if c.Text != nil {
 		t.Fatalf("closeouts[leakMe].text: want null (first-request race leaked foreign content), got %q", *c.Text)
 	}
-	if got := fake.msgGets["leakMe"]; got != 0 {
+	if got := fake.msgGetsCount("leakMe"); got != 0 {
 		t.Fatalf("first-request closeout issued upstream GET (race window open); "+
 			"fake.msgGets[leakMe]: want 0, got %d", got)
 	}

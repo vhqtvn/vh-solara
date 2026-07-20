@@ -178,6 +178,35 @@ func (f *fakeOpenCode) disposedDirs() []string {
 	return out
 }
 
+// msgGetsCount and msgFullGetsCount are race-safe accessors over the hit-count
+// maps. The HTTP handler writes these maps from a separate goroutine (server-
+// side, under f.mu), so a test reading them bare (`fake.msgGets[id]`) races
+// under `-race`. Tests MUST go through these accessors (or take f.mu
+// explicitly) — see the disposedDirs() precedent.
+func (f *fakeOpenCode) msgGetsCount(id string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.msgGets[id]
+}
+
+func (f *fakeOpenCode) msgFullGetsCount(id string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.msgFullGets[id]
+}
+
+// setMessage is the race-safe way to inject/replace a session's message body
+// AFTER the fake's HTTP server is already serving. The handler reads f.messages
+// under f.mu (integration_test.go:123), so a bare `fake.messages[id] = ...`
+// write from the test goroutine races under `-race` once the aggregator's
+// hydrate/poll loop is running. Setup-time writes (before httptest.NewServer)
+// are safe bare; post-start writes MUST go through here.
+func (f *fakeOpenCode) setMessage(id, body string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.messages[id] = body
+}
+
 func waitFor(t *testing.T, cond func() bool, msg string) {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
