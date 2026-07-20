@@ -496,6 +496,23 @@ func (s *Server) installQueueGCCleanup(dir string, a *aggregator.Aggregator) {
 	s.queueGCOn[dir] = true
 	s.queueGCMu.Unlock()
 
+	// FIX-QUEUE-GC-3: install the orphan-queue reconciliation callback on this
+	// aggregator. The callback fires from hydrate's goroutine at the end of
+	// every successful hydrate (startup, reconnect, post-reload) and dispatches
+	// the actual scan+cleanup to a fresh goroutine so hydrate is never blocked.
+	// This wiring shares installQueueGCCleanup's queueGCOn guard lifecycle:
+	// installed once per (dir, aggregator), and handleReloadProject resets
+	// queueGCOn[dir] when it tears down the old aggregator so the fresh
+	// aggregator built by aggFor gets a fresh callback. The immediate-run
+	// branch covers the default aggregator, which is started (and hydrated) by
+	// the daemon BEFORE the first HTTP request reaches aggFor("") — without it,
+	// the default dir's orphans would only be cleaned after the NEXT hydrate
+	// (i.e. the next reconnect), not the one that already happened at boot.
+	a.SetOnHydrate(func() { go s.reconcileQueuesForAgg(dir, a) })
+	if a.HydratedOnce() {
+		go s.reconcileQueuesForAgg(dir, a)
+	}
+
 	root, err := projectRoot(dir)
 	if err != nil {
 		// projectRoot only fails if os.Getwd (default dir) or filepath.Abs
@@ -531,6 +548,56 @@ func (s *Server) installQueueGCCleanup(dir string, a *aggregator.Aggregator) {
 			s.queues.CleanupSession(root, sid)
 		}
 	}()
+}
+
+// reconcileQueuesForAgg is the per-aggregator driver for FIX-QUEUE-GC-3
+// orphan-queue reconciliation. It is the glue between the aggregator's
+// post-hydrate signal (SetOnHydrate / HydratedOnce, installed in
+// installQueueGCCleanup) and the queueRegistry's reconcileOrphanQueues scan.
+//
+// FAIL-CLOSED gate: if a.HydratedOnce() is false, the aggregator has not yet
+// produced an authoritative active-session set, so this function returns
+// WITHOUT deleting anything. The empty active-set case (hydrate succeeded with
+// zero sessions) is the OPPOSITE: HydratedOnce is true, SessionIDs returns an
+// empty slice, reconcileOrphanQueues receives an empty non-nil map, and every
+// on-disk queue is correctly treated as an orphan. This is the distinction
+// GC-3 exists to enforce — see the field doc on Aggregator.hydratedOnce.
+//
+// Active-set source: a.Store().SessionIDs() returns the store's current session
+// IDs under RLock. This is the SAME authoritative set store.Hydrate just
+// installed (hydrate calls store.Hydrate BEFORE firing onHydrate, and
+// SessionIDs reads the map Hydrate writes). Calling it AFTER the HydratedOnce
+// gate guarantees we read a set produced by a completed hydrate, not a
+// stale/pre-hydrate map.
+//
+// Root derivation: projectRoot(dir), matching installQueueGCCleanup's GC-2
+// subscriber. A root-resolution failure logs and returns (no deletion) —
+// projectRoot only fails if os.Getwd/filepath.Abs fail, which is effectively
+// never in practice.
+//
+// Concurrency: dispatched to a fresh goroutine by the onHydrate callback (so
+// hydrate's goroutine is never blocked) and by the immediate-run branch in
+// installQueueGCCleanup (default-aggregator boot case). Multiple concurrent
+// invocations for the same dir are safe — reconcileOrphanQueues serializes its
+// per-session work through queueRegistry.mu, and CleanupSession is idempotent.
+func (s *Server) reconcileQueuesForAgg(dir string, a *aggregator.Aggregator) {
+	// FAIL-CLOSED: no authoritative set yet → delete nothing.
+	if !a.HydratedOnce() {
+		return
+	}
+	root, err := projectRoot(dir)
+	if err != nil {
+		vhlog.Error("queue reconcile: projectRoot failed", "dir", dir, "err", err)
+		return
+	}
+	ids := a.Store().SessionIDs()
+	active := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		active[id] = true
+	}
+	if err := s.queues.reconcileOrphanQueues(root, active); err != nil {
+		vhlog.Error("queue reconcile failed", "dir", dir, "root", root, "err", err)
+	}
 }
 
 // permReconcileInterval is the period of the per-directory fail-closed

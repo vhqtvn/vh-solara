@@ -658,6 +658,102 @@ func (qr *queueRegistry) CleanupSession(root, sessionID string) {
 	qr.deleteStore(root, sessionID)
 }
 
+// reconcileOrphanQueues is the durable backstop (FIX-QUEUE-GC-3) for GC-2's
+// best-effort session.delete event subscriber. GC-2 fires CleanupSession inline
+// as session.delete events stream in, but store.emit()'s fan-out is
+// nonblocking and drops events on a full subscriber buffer — so an event can
+// be lost, leaving an orphan queue.json on disk whose session ID is no longer
+// in the authoritative active set. This function scans the filesystem (NOT the
+// loaded queueRegistry entries — orphans by definition aren't loaded) and
+// removes every queue.json whose session ID is NOT in activeSessions.
+//
+// FAIL-CLOSED contract (the single most important rule):
+//   - If activeSessions == nil, this returns nil immediately and deletes
+//     NOTHING. A nil map means "the caller could not obtain an authoritative
+//     active-session set" (hydrate failed, store unavailable, or any other
+//     uncertainty). Deleting against an incomplete set would murder live
+//     sessions' queues. The empty non-nil map (map with zero entries) is the
+//     OPPOSITE case — "hydrate succeeded and reported zero active sessions" —
+//     and correctly results in every on-disk queue being treated as an orphan.
+//   - The caller (reconcileQueuesForAgg in server.go) is responsible for
+//     producing activeSessions ONLY from a successful post-hydrate
+//     store.SessionIDs() call and for gating on HydratedOnce() before calling.
+//     The nil-check here is the second line of defense.
+//
+// Scan discipline:
+//   - os.ReadDir of <root>/.vh-solara/sessions. If the directory does not
+//     exist, there is nothing to reconcile — return nil. Any other scan error
+//     is returned to the caller (who logs it); no deletion happens on scan
+//     failure because the loop body never runs.
+//   - For each entry that is a directory, the entry name IS the session ID
+//     (queuePath = .../sessions/<id>/queue.json). Non-directory entries
+//     (stray files at the sessions/ level) are ignored.
+//   - For a session ID NOT in activeSessions, stat its queue.json. If the
+//     queue.json does not exist (e.g. an attachments-only directory — GC-3
+//     does not own attachment lifecycle), skip without error. Only
+//     directories that actually contain a queue.json are reconciled.
+//   - CleanupSession is idempotent and race-safe with concurrent Enqueue/
+//     Claim/Resolve/Remove and with atomic writes (see deleteStore): it takes
+//     qr.mu, tombstones any loaded store, removes the file, and attempts an
+//     empty-only rmdir. A concurrent mutator on a retained store pointer
+//     observes archived==true and refuses to re-save, so the orphan cannot be
+//     resurrected. A file that vanishes between stat and CleanupSession is
+//     not an error (deleteStore's os.Remove is best-effort).
+//
+// Idempotent: a second reconciliation pass finds nothing to do. Safe to call
+// from multiple goroutines (qr.mu serializes the per-session work); the
+// production caller dispatches each pass to a fresh goroutine so hydrate's
+// goroutine is never blocked.
+func (qr *queueRegistry) reconcileOrphanQueues(root string, activeSessions map[string]bool) error {
+	// FAIL-CLOSED: a nil active set means "no authoritative inventory." Delete
+	// nothing. The empty non-nil map (len==0) intentionally falls through and
+	// deletes every on-disk queue — that is the "hydrate succeeded with zero
+	// sessions" case, which is safe and correct.
+	if activeSessions == nil {
+		return nil
+	}
+	sessionsDir := filepath.Join(root, ".vh-solara", "sessions")
+	entries, err := os.ReadDir(sessionsDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// No sessions directory at all — nothing to reconcile. Not an error.
+			return nil
+		}
+		return fmt.Errorf("queue reconcile: scan %s: %w", sessionsDir, err)
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			// Stray file at the sessions/ level (not a session directory) —
+			// ignore. GC-3 owns only <id>/queue.json reconciliation.
+			continue
+		}
+		sid := e.Name()
+		if activeSessions[sid] {
+			// Live session — its queue.json must survive.
+			continue
+		}
+		// Candidate orphan. Stat its queue.json before cleanup: a session
+		// directory may legitimately contain only attachments/ (no queue.json
+		// was ever written, or it was already cleaned up). GC-3 must not touch
+		// attachment-only directories.
+		qPath := queuePath(root, sid)
+		if _, statErr := os.Stat(qPath); statErr != nil {
+			if os.IsNotExist(statErr) {
+				continue
+			}
+			// A non-NotExist stat error is unexpected but not fatal to the
+			// whole pass — skip this entry and continue with the rest. Log
+			// for observability; do not return (the other orphans still need
+			// cleaning, and a transient permission error on one entry should
+			// not block the whole reconciliation).
+			vhlog.Warn("queue reconcile: stat skipped", "path", qPath, "err", statErr)
+			continue
+		}
+		qr.CleanupSession(root, sid)
+	}
+	return nil
+}
+
 // newQueueID issues a backend-owned queue item id. crypto/rand gives global
 // uniqueness for diagnostics; the monotonic Order (not the id) governs FIFO.
 func newQueueID() string {

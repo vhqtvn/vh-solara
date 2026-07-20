@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/vhqtvn/vh-solara/pkg/opencode"
@@ -80,6 +81,27 @@ type Aggregator struct {
 	// cancelled.
 	seedMu   sync.Mutex
 	seedDone chan struct{}
+
+	// onHydrate, when non-nil, is invoked at the end of every SUCCESSFUL hydrate
+	// (after store.Hydrate + cold-seed + best-effort fan-out have completed). It
+	// is guarded by seedMu (same lock Run/hydrate already take). The web layer
+	// uses it (FIX-QUEUE-GC-3) to run authoritative orphan-queue reconciliation
+	// against the freshly-installed active-session set. Fired from the same
+	// goroutine that ran hydrate — recipients MUST NOT block on store/registry
+	// locks held by hydrate; the production callback dispatches its work to a
+	// fresh goroutine.
+	onHydrate func()
+
+	// hydratedOnce is a sticky flag set true at the end of the first successful
+	// hydrate and never reset (Stop/close do not clear it — it records "this
+	// aggregator has produced at least one authoritative session set"). The web
+	// layer reads it via HydratedOnce() to distinguish "0 active sessions after
+	// a successful hydrate" (all on-disk queues are orphans — safe to delete)
+	// from "not yet hydrated at all" (no authoritative set yet — delete NOTHING,
+	// fail-closed). atomic because hydrate writes it (OUTSIDE seedMu — the
+	// callback dispatch must not hold the lock) while HydratedOnce() callers on
+	// the request path (e.g. aggFor) read it lock-free.
+	hydratedOnce atomic.Bool
 
 	// msgMu guards msgInflight. msgInflight[sid] is non-nil (open) while a cold
 	// message-history fetch is in flight for that session — registered by EITHER
@@ -230,6 +252,28 @@ func (a *Aggregator) RunManaged(ctx context.Context) {
 // clobber). Nil (the default) is a no-op; production code never sets it. Not
 // lock-guarded — install once before any concurrent call.
 func (a *Aggregator) SetMsgGateHook(fn func(sessionID string)) { a.msgGateHook = fn }
+
+// SetOnHydrate installs a callback fired at the end of every successful hydrate
+// (see the onHydrate field doc for the exact timing and constraints). Production
+// code installs ONE callback per aggregator, inside the queueGCOn-guarded block
+// of installQueueGCCleanup (pkg/web/server.go), so it shares that guard's
+// lifecycle: installed once per (dir, aggregator) and reset on project reload
+// (handleReloadProject drops the aggregator and aggFor builds a fresh one).
+// Guarded by seedMu to match the read side in hydrate; safe to install before
+// or after the first hydrate (the immediate-run branch in installQueueGCCleanup
+// covers the "installed after first hydrate" case for the default aggregator).
+func (a *Aggregator) SetOnHydrate(fn func()) {
+	a.seedMu.Lock()
+	a.onHydrate = fn
+	a.seedMu.Unlock()
+}
+
+// HydratedOnce reports whether this aggregator has completed at least one
+// successful hydrate. Used by the web layer's reconcileQueuesForAgg as the
+// fail-closed gate: if false, the authoritative active-session set is not yet
+// populated and reconciliation MUST delete nothing. Lock-free atomic read —
+// safe to call on the request path (aggFor) without taking seedMu.
+func (a *Aggregator) HydratedOnce() bool { return a.hydratedOnce.Load() }
 
 func decodeMessages(items []json.RawMessage) []state.MessageWithParts {
 	mwp := make([]state.MessageWithParts, 0, len(items))
@@ -737,6 +781,24 @@ func (a *Aggregator) hydrate(ctx context.Context) error {
 		return nil
 	})
 	wg.Wait()
+
+	// Successful hydrate complete: the store now holds the authoritative active-
+	// session set. Record stickiness (HydratedOnce) and fire the onHydrate
+	// callback (FIX-QUEUE-GC-3 orphan-queue reconciliation) so the web layer can
+	// delete on-disk queue.json files whose session IDs are NOT in this set.
+	// The callback is read under seedMu and invoked OUTSIDE the lock; production
+	// callbacks dispatch to a fresh goroutine so they never block hydrate's
+	// goroutine or risk a lock-order inversion against store/registry mutexes.
+	// This fire-site is reached ONLY on hydrate success — every error path above
+	// returns early before this point, so a failed/partial hydrate leaves
+	// hydratedOnce=false and fires nothing (fail-closed for reconciliation).
+	a.hydratedOnce.Store(true)
+	a.seedMu.Lock()
+	cb := a.onHydrate
+	a.seedMu.Unlock()
+	if cb != nil {
+		cb()
+	}
 	return nil
 }
 
