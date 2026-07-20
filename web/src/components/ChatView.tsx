@@ -2421,7 +2421,6 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
                 {(q) => (
                   <QueueChip
                     q={q}
-                    sessionId={props.sessionId}
                     onRemove={(id) => void removeQueued(props.sessionId, id)}
                   />
                 )}

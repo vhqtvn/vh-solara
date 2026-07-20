@@ -50,7 +50,7 @@ describe("QueueChip — recovered `unknown` detail surfacing", () => {
   it("renders the backend detail visibly for an `unknown` item with detail", () => {
     const onRemove = vi.fn();
     const { container } = render(() => (
-      <QueueChip q={item({ state: "unknown", detail: RECOVERY_DETAIL })} sessionId="s1" onRemove={onRemove} />
+      <QueueChip q={item({ state: "unknown", detail: RECOVERY_DETAIL })} onRemove={onRemove} />
     ));
     // The detail text is present in the rendered DOM (not only in data-tip).
     const note = container.querySelector(".queue-detail-note");
@@ -62,7 +62,7 @@ describe("QueueChip — recovered `unknown` detail surfacing", () => {
 
   it("renders gracefully when an `unknown` item has NO detail (edge case: pre-STUCK-1 or recovery without detail)", () => {
     const { container } = render(() => (
-      <QueueChip q={item({ state: "unknown", detail: "" })} sessionId="s1" onRemove={vi.fn()} />
+      <QueueChip q={item({ state: "unknown", detail: "" })} onRemove={vi.fn()} />
     ));
     // No detail note rendered; no crash; the chip still shows the state label.
     expect(container.querySelector(".queue-detail-note")).toBeNull();
@@ -78,7 +78,7 @@ describe("QueueChip — recovered `unknown` detail surfacing", () => {
     // NOT the recovery note and is out of scope for STUCK-2: failed detail stays
     // in the data-tip tooltip only. The visible recovery note must not appear.
     const { container } = render(() => (
-      <QueueChip q={item({ state: "failed", detail: "500 upstream" })} sessionId="s1" onRemove={vi.fn()} />
+      <QueueChip q={item({ state: "failed", detail: "500 upstream" })} onRemove={vi.fn()} />
     ));
     expect(container.querySelector(".queue-detail-note")).toBeNull();
     expect(container.textContent).not.toContain("Recovery:");
@@ -88,7 +88,7 @@ describe("QueueChip — recovered `unknown` detail surfacing", () => {
     // `sent` is filtered from the visible queue upstream (queueFor), so the
     // realistic non-terminal here is `dispatching`. No recovery note renders.
     const { container } = render(() => (
-      <QueueChip q={item({ state: "dispatching" })} sessionId="s1" onRemove={vi.fn()} />
+      <QueueChip q={item({ state: "dispatching" })} onRemove={vi.fn()} />
     ));
     expect(container.querySelector(".queue-detail-note")).toBeNull();
   });
@@ -105,7 +105,7 @@ describe("QueueChip — dismiss button visibility + click handler (FIX-QUEUE-GC-
   it("renders a dismiss (x) button for pending, failed, unknown — NOT for dispatching", () => {
     // pending: dismissable (cancel before dispatch).
     const r1 = render(() => (
-      <QueueChip q={item({ state: "pending" })} sessionId="s1" onRemove={vi.fn()} />
+      <QueueChip q={item({ state: "pending" })} onRemove={vi.fn()} />
     ));
     expect(r1.container.querySelectorAll(".queue-chip button").length).toBe(1);
     expect(r1.container.querySelector(".queue-chip button")!.getAttribute("aria-label")).toBe("Remove queued message");
@@ -113,14 +113,14 @@ describe("QueueChip — dismiss button visibility + click handler (FIX-QUEUE-GC-
 
     // failed (terminal): dismissable — clears the failed chip from view.
     const r2 = render(() => (
-      <QueueChip q={item({ state: "failed", detail: "500 upstream" })} sessionId="s1" onRemove={vi.fn()} />
+      <QueueChip q={item({ state: "failed", detail: "500 upstream" })} onRemove={vi.fn()} />
     ));
     expect(r2.container.querySelectorAll(".queue-chip button").length).toBe(1);
     r2.unmount();
 
     // unknown (terminal): dismissable — clears the recovered chip from view.
     const r3 = render(() => (
-      <QueueChip q={item({ state: "unknown", detail: RECOVERY_DETAIL })} sessionId="s1" onRemove={vi.fn()} />
+      <QueueChip q={item({ state: "unknown", detail: RECOVERY_DETAIL })} onRemove={vi.fn()} />
     ));
     expect(r3.container.querySelectorAll(".queue-chip button").length).toBe(1);
     // No "resend"/"retry" affordance anywhere in the rendered output — the
@@ -133,7 +133,7 @@ describe("QueueChip — dismiss button visibility + click handler (FIX-QUEUE-GC-
     // dispatching: NOT dismissable — the dispatch may be in flight; the state
     // machine must own the transition to terminal first.
     const r4 = render(() => (
-      <QueueChip q={item({ state: "dispatching" })} sessionId="s1" onRemove={vi.fn()} />
+      <QueueChip q={item({ state: "dispatching" })} onRemove={vi.fn()} />
     ));
     expect(r4.container.querySelectorAll(".queue-chip button").length).toBe(0);
     r4.unmount();
@@ -142,7 +142,7 @@ describe("QueueChip — dismiss button visibility + click handler (FIX-QUEUE-GC-
   it("clicking dismiss on a pending item calls onRemove with the item id", () => {
     const onRemove = vi.fn();
     const { container } = render(() => (
-      <QueueChip q={item({ id: "q-42", state: "pending" })} sessionId="s1" onRemove={onRemove} />
+      <QueueChip q={item({ id: "q-42", state: "pending" })} onRemove={onRemove} />
     ));
     container.querySelector(".queue-chip button")!.click();
     expect(onRemove).toHaveBeenCalledTimes(1);
@@ -152,7 +152,7 @@ describe("QueueChip — dismiss button visibility + click handler (FIX-QUEUE-GC-
   it("clicking dismiss on a failed item calls onRemove with the item id (terminal dismissal)", () => {
     const onRemove = vi.fn();
     const { container } = render(() => (
-      <QueueChip q={item({ id: "q-failed-1", state: "failed", detail: "500 upstream" })} sessionId="s1" onRemove={onRemove} />
+      <QueueChip q={item({ id: "q-failed-1", state: "failed", detail: "500 upstream" })} onRemove={onRemove} />
     ));
     container.querySelector(".queue-chip button")!.click();
     expect(onRemove).toHaveBeenCalledTimes(1);
@@ -162,7 +162,7 @@ describe("QueueChip — dismiss button visibility + click handler (FIX-QUEUE-GC-
   it("clicking dismiss on an unknown item calls onRemove with the item id (recovered-item dismissal)", () => {
     const onRemove = vi.fn();
     const { container } = render(() => (
-      <QueueChip q={item({ id: "q-unknown-1", state: "unknown", detail: RECOVERY_DETAIL })} sessionId="s1" onRemove={onRemove} />
+      <QueueChip q={item({ id: "q-unknown-1", state: "unknown", detail: RECOVERY_DETAIL })} onRemove={onRemove} />
     ));
     container.querySelector(".queue-chip button")!.click();
     expect(onRemove).toHaveBeenCalledTimes(1);

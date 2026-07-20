@@ -28,7 +28,6 @@ import Icon from "./Icon";
 // operator's intent is the same ("clear this chip") regardless of state.
 export function QueueChip(props: {
   q: QueuedMessage;
-  sessionId: string;
   onRemove: (id: string) => void;
 }) {
   const tip = (): string => {
