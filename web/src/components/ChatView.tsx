@@ -2405,9 +2405,13 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
             </Portal>
           </Show>
           {/* Queue chips reflect the backend-authoritative per-session queue.
-              pending → removable; dispatching → in flight; failed/unknown →
-              terminal, retained until the operator archives the session (DELETE
-              is pending-only on the backend, so terminal chips have no remove). */}
+              pending → removable (cancel before dispatch); dispatching → in
+              flight, NOT removable (the state machine owns the transition to
+              terminal); terminal `failed`/`unknown` → dismissable
+              (FIX-QUEUE-GC-4 flipped DELETE from pending-only to "pending +
+              terminal; not dispatching"). `sent` is filtered from the visible
+              queue upstream (queueFor), so it needs no dismiss surface. See
+              QueueChip.tsx for the per-state dismissal wiring. */}
           <Show when={!props.draft && queueFor(props.sessionId).length > 0}>
             <div class="queue-row">
               <span class="queue-label" data-tip="Sent automatically when the current turn finishes">

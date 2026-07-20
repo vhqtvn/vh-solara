@@ -3584,7 +3584,15 @@ func (s *Store) IsMessagesLoaded(sid string) bool {
 	return s.msgLoaded[sid]
 }
 
-// SessionIDs returns all known (incl. archived) session ids.
+// SessionIDs returns the ids of the LIVE (active) sessions in this store's
+// project scope. Archived sessions are excluded: archive via time.archived
+// funnels through deleteSessionLocked and removes them from s.sessions, so
+// only currently-active ids appear here. This live-only set is the
+// authoritative input to queue orphan reconciliation (reconcileQueuesForAgg),
+// which relies on archived ids being ABSENT to treat their leftover
+// queue.json files as orphans that get cleaned up — returning archived ids
+// here would silently retain those files forever. Distinct from HasSession's
+// per-id O(1) check.
 func (s *Store) SessionIDs() []string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
