@@ -1708,7 +1708,7 @@ func isMessageClassSSE(event string) bool {
 	switch event {
 	case "message.upsert", "message.delete",
 		"part.upsert", "part.delete",
-		"messages.loaded", "messages.error":
+		"messages.batch", "messages.loaded", "messages.error":
 		return true
 	}
 	return false
