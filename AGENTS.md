@@ -456,9 +456,11 @@ reasoning body):
 
 ## Testing rules (this repo)
 
-> The core `## Testing rules` section above is generic harness boilerplate
-> (pytest, `tests/unit/`) that **does not apply to this repo**. This section is
-> the authoritative testing reference.
+> The core `## Testing rules` section above states the principle — derive test
+> placement, runners, and seam choices from the repository's own verified testing
+> seam localization rather than generic harness defaults — but is deliberately
+> generic about what that localization IS. This section is this repo's actual
+> localization: the six lanes, their runners, commands, and acceptance signals.
 
 Every meaningful change should add or update tests. This repo has two test
 trees (Go and web) and four runner families across six lanes. There is **no
