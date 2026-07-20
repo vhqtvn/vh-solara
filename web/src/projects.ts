@@ -213,9 +213,18 @@ export function buildProjectLink(base: string, dir: string): string {
 
 // Fetch both activity endpoints (coalesced via Promise.all). Never throws: on
 // any failure returns empty maps so the dialog still renders with names alone.
+//
+// cache:'no-store' opts out of the browser HTTP cache: the dialog refreshes
+// counts on every open (ProjectSwitcher's open() createEffect calls this on the
+// rising edge), so a stale heuristic-cached GET would defeat the refresh — the
+// server also emits Cache-Control:no-store on both endpoints, but the client
+// flag is a belt-and-suspenders guard against intermediaries that ignore it.
 export async function fetchProjectActivity(): Promise<ActivityMaps> {
   try {
-    const [pr, rs] = await Promise.all([fetch("/vh/projects"), fetch("/vh/running-sessions")]);
+    const [pr, rs] = await Promise.all([
+      fetch("/vh/projects", { cache: "no-store" }),
+      fetch("/vh/running-sessions", { cache: "no-store" }),
+    ]);
     const projects: unknown = pr.ok ? await pr.json() : [];
     const running: unknown = rs.ok ? await rs.json() : null;
     return buildActivityMaps(

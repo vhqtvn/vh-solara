@@ -157,7 +157,12 @@ export function RestartConfirm(props: {
 }) {
   const [state, setState] = createSignal<ConfirmState>({ status: "loading" });
   onMount(() => {
-    fetch("/vh/running-sessions")
+    // cache:'no-store' — the count of running sessions across ALL workspaces
+    // is the gate that decides whether the Restart button is "safe to restart"
+    // vs "will interrupt N sessions". A stale browser-cached response here
+    // would under- or over-report the interrupt impact at exactly the moment
+    // the user is deciding. Server also emits Cache-Control:no-store.
+    fetch("/vh/running-sessions", { cache: "no-store" })
       .then((r) => (r.ok ? r.json() : null))
       .then((d: RunningSessions | null) =>
         setState(d ? { status: "known", data: d } : { status: "unknown" }),

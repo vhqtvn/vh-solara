@@ -1091,6 +1091,13 @@ func (s *Server) handleProjects(w http.ResponseWriter, r *http.Request) {
 		out = append(out, projectInfo{Dir: e.dir, Epoch: st.Epoch(), Seq: st.Head(), Roots: st.RootCount()})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Dir < out[j].Dir })
+	// State-like GET: the response is computed fresh on every call from live
+	// aggregator state (root count, head seq, epoch) — a stale browser/intermediary
+	// cache hit would defeat the entire point of the endpoint (cross-project
+	// discovery + counts). Mark it uncachable so a dialog re-open never paints
+	// pre-change counts. (Client fetches also pass cache:'no-store' as a belt-
+	// and-suspenders guard against intermediaries that ignore Cache-Control.)
+	w.Header().Set("Cache-Control", "no-store")
 	writeJSONResp(w, out)
 }
 
@@ -1132,6 +1139,10 @@ func (s *Server) handleRunningSessions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	sort.Slice(resp.Workspaces, func(i, j int) bool { return resp.Workspaces[i].Dir < resp.Workspaces[j].Dir })
+	// State-like GET: same rationale as handleProjects — the count is recomputed
+	// live on every call (sum of per-aggregator RunningRoots), and a cached
+	// response would lie about how many sessions a restart would interrupt.
+	w.Header().Set("Cache-Control", "no-store")
 	writeJSONResp(w, resp)
 }
 

@@ -454,4 +454,47 @@ describe("OpenCodeHealthPanel", () => {
       vi.useRealTimers();
     }
   });
+
+  // ─────────────────────────────────────────────────────────────────────
+  // Cross-project count-staleness fix — cache:'no-store' on the
+  // running-sessions fetch performed by the panel's inline restart-confirm.
+  // Same rationale as RestartOpenCode: the restart-interrupt warning must
+  // reflect CURRENT cross-workspace counts, not a stale browser cache.
+  // ─────────────────────────────────────────────────────────────────────
+
+  it("staleness fix: panel restart-confirm fetches /vh/running-sessions with cache:'no-store'", async () => {
+    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+      if (url.includes("/vh/opencode/status"))
+        return Promise.resolve(resp(OWNED_FAILED));
+      if (url.includes("/vh/opencode/logs"))
+        return Promise.resolve(resp(null, true, 200, ""));
+      if (url.includes("/vh/running-sessions")) {
+        // Inline assertion at the call site: dropping the option is caught at
+        // the exact fetch that would regress.
+        expect((init as RequestInit | undefined)?.cache).toBe("no-store");
+        return Promise.resolve(resp({ count: 0, workspaces: [] }));
+      }
+      return Promise.resolve(resp({}, false, 404));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const { store, Panel } = await fresh();
+    await store.refreshOpenCodeLifecycle();
+    render(() => <Panel />);
+
+    await waitFor(() =>
+      expect(document.body.textContent).toContain("OpenCode failed to start"),
+    );
+
+    // Enter the inline confirm gate — this is what triggers the running-sessions
+    // fetch in OpenCodeHealthPanel (via enterConfirm).
+    findRestartBtn().click();
+
+    // Wait for the fetch (and its inline assertion) to run.
+    await waitFor(() => {
+      const rsCall = fetchMock.mock.calls.find(
+        ([u]) => (u as string).includes("/vh/running-sessions"),
+      );
+      expect(rsCall).toBeDefined();
+    });
+  });
 });

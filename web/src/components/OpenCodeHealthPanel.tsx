@@ -164,7 +164,11 @@ export default function OpenCodeHealthPanel() {
     setRestartErr(false);
     setSessionState("loading");
     try {
-      const res = await fetch("/vh/running-sessions");
+      // cache:'no-store' — the running-session count is the basis of the
+      // restart-interrupt warning; a stale cached response would lie about
+      // how many sessions a restart would interrupt. Server also emits
+      // Cache-Control:no-store on this endpoint.
+      const res = await fetch("/vh/running-sessions", { cache: "no-store" });
       if (!res.ok) {
         setSessionState("unknown");
         return;

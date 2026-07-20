@@ -544,4 +544,37 @@ describe("RestartOpenCode — owns the restart operation", () => {
     unmount();
     expect(onActiveChange).not.toHaveBeenCalled();
   });
+
+  // ─────────────────────────────────────────────────────────────────────
+  // Cross-project count-staleness fix — cache:'no-store' on the
+  // running-sessions fetch. The restart-interrupt warning must reflect
+  // CURRENT cross-workspace session counts at the moment the user opens the
+  // confirm gate; a stale browser-cached response would under- or over-report
+  // the interrupt impact. Server emits Cache-Control:no-store on the endpoint;
+  // the client cache:'no-store' flag is the belt-and-suspenders guard.
+  // ─────────────────────────────────────────────────────────────────────
+
+  it("staleness fix: RestartConfirm fetches /vh/running-sessions with cache:'no-store'", async () => {
+    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+      if (url.includes("/vh/running-sessions")) {
+        // Inline assertion at the call site so dropping the option is caught
+        // exactly where the regression would land.
+        expect((init as RequestInit | undefined)?.cache).toBe("no-store");
+        return Promise.resolve(jsonResp(RUNNING));
+      }
+      return Promise.resolve(jsonResp(null, false, 500));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(() => <RestartOpenCode />);
+    (document.querySelector("button.admin-btn") as HTMLButtonElement).click();
+    await waitFor(() => expect(document.querySelector(".ocu-confirm")).toBeTruthy());
+
+    // The running-sessions fetch happened with cache:'no-store' (inline expect
+    // above). Sanity-check it actually fired so the test can't silently pass.
+    const rsCall = fetchMock.mock.calls.find(
+      ([u]) => (u as string).includes("/vh/running-sessions"),
+    );
+    expect(rsCall).toBeDefined();
+  });
 });
