@@ -62,23 +62,32 @@ type Aggregator struct {
 
 	// cancel stops the aggregator's Run loop (and everything that derives from
 	// runCtx: the event tail, hydrate, cold-seed, async message fetches). It is
-	// the cancellation half of a project reload (POST /vh/reload-project): the
-	// web layer sets it under aggMu before starting Run, and handleReloadProject
-	// invokes Stop() under aggMu to drop a per-project aggregator without
-	// disturbing the default or any other project. nil for the default
-	// aggregator (process-lifetime, started outside aggFor) and until aggFor
-	// arms it — Stop() nil-checks it.
+	// the cancellation half of a project reload (POST /vh/reload-project):
+	// RunManaged arms it and handleReloadProject invokes Stop() to drop a
+	// per-project aggregator without disturbing the default or any other
+	// project. nil for the default aggregator (process-lifetime, started outside
+	// aggFor) and until RunManaged arms it — Stop() nil-checks it.
+	//
+	// Guarded by seedMu (same lock Run/hydrate already take). The web layer
+	// launches RunManaged via `go a.RunManaged(ctx)` from aggFor; that goroutine
+	// is the one that writes a.cancel, OUTSIDE the caller's aggMu. A concurrent
+	// Stop() (called from handleReloadProject under the web layer's aggMu) reads
+	// a.cancel — there is no happens-before edge between the two via aggMu
+	// (aggMu only orders the goroutine launch, not its subsequent body), so the
+	// field MUST be guarded by its own lock. seedMu is reused because cancel is
+	// conceptually part of the same lifecycle group as runCtx/armed/onHydrate
+	// (all set up around Run) and Stop's read is brief and non-blocking.
 	cancel context.CancelFunc
 
-	// seedMu guards seedDone (and runCtx). seedDone is non-nil (and open) while
-	// a background cold-seed goroutine is in flight, nil when none is running.
-	// The cold-seed runs OFF the hydrate hot path (it no longer blocks
-	// reconnect/snapshot), so at most one is allowed at a time: a hydrate that
-	// finds one in flight skips starting another — the running seed already
-	// covers un-seeded sessions, and the next hydrate's seed picks up anything
-	// that became un-seeded meanwhile (e.g. a just-added session). Self-healing,
-	// no leak: the goroutine exits when its fetches finish or its ctx is
-	// cancelled.
+	// seedMu guards the aggregator's lifecycle fields: runCtx, armed, cancel,
+	// onHydrate, and seedDone. seedDone is non-nil (and open) while a background
+	// cold-seed goroutine is in flight, nil when none is running. The cold-seed
+	// runs OFF the hydrate hot path (it no longer blocks reconnect/snapshot), so
+	// at most one is allowed at a time: a hydrate that finds one in flight skips
+	// starting another — the running seed already covers un-seeded sessions, and
+	// the next hydrate's seed picks up anything that became un-seeded meanwhile
+	// (e.g. a just-added session). Self-healing, no leak: the goroutine exits
+	// when its fetches finish or its ctx is cancelled.
 	seedMu   sync.Mutex
 	seedDone chan struct{}
 
@@ -215,16 +224,22 @@ func (a *Aggregator) Arm() {
 // against a fresh aggregator). It is the teardown half of a project reload
 // (POST /vh/reload-project).
 //
-// cancel is armed by aggFor under aggMu before Run starts, so the happens-before
-// edge from a concurrent Stop() (also under aggMu) is established. The default
-// aggregator's cancel is nil (it is started outside aggFor as process-lifetime);
-// Stop() nil-checks it and still closes the store, but the default aggregator is
-// never dropped from the map — see handleReloadProject. Safe to call more than
-// once: a second close of an already-closed channel is avoided because Store.Close
-// clears its subscriber map under the store lock (idempotent).
+// cancel is read under seedMu (the lock RunManaged writes it under) so a
+// concurrent RunManaged goroutine scheduling the write races no longer. The
+// cancel() call itself happens OUTSIDE the lock to avoid holding seedMu across
+// a context cancellation that downstream goroutines may be waiting on. The
+// default aggregator's cancel is nil (started outside aggFor as
+// process-lifetime); the nil-check still closes the store, but the default
+// aggregator is never dropped from the map — see handleReloadProject. Safe to
+// call more than once: a second close of an already-closed channel is avoided
+// because Store.Close clears its subscriber map under the store lock
+// (idempotent), and a nil cancel is a no-op.
 func (a *Aggregator) Stop() {
-	if a.cancel != nil {
-		a.cancel()
+	a.seedMu.Lock()
+	cancel := a.cancel
+	a.seedMu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
 	if a.store != nil {
 		a.store.Close()
@@ -236,9 +251,15 @@ func (a *Aggregator) Stop() {
 // later end via Stop() (POST /vh/reload-project) without the web package having
 // to touch the unexported cancel field. The default aggregator is started by the
 // daemon with plain Run (no cancel) — it is process-lifetime and never dropped.
+//
+// a.cancel is written under seedMu so a concurrent Stop() (which reads it under
+// the same lock) sees a consistent value. Released before Run is called so the
+// subsequent seedMu acquisition inside Run does not re-enter the lock.
 func (a *Aggregator) RunManaged(ctx context.Context) {
 	managed, cancel := context.WithCancel(ctx)
+	a.seedMu.Lock()
 	a.cancel = cancel
+	a.seedMu.Unlock()
 	a.Run(managed)
 }
 
