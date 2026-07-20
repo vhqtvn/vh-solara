@@ -3134,3 +3134,59 @@ func TestSnapshotDeltaCaptureIsOwnershipIndependent(t *testing.T) {
 		t.Fatalf("builder text perturbed by capture: got %q want %q", got, want)
 	}
 }
+
+// TestRunningRoots covers Store.RunningRoots() — the count of root subtrees
+// with at least one busy/retry session (busyCount[root] > 0). It backs the
+// /vh/running-sessions aggregate and the SPA's per-workspace running badge.
+// Unlike RootCount (total live roots), RunningRoots counts only roots whose
+// subtree is actively in flight, and counts each root AT MOST ONCE regardless
+// of how many of its descendants are busy simultaneously.
+func TestRunningRoots(t *testing.T) {
+	s := New(100)
+
+	// Empty store → 0 running roots.
+	if got := s.RunningRoots(); got != 0 {
+		t.Fatalf("empty store: want 0 running, got %d", got)
+	}
+
+	// A single busy root → 1.
+	s.Apply(ev("session.created", `{"info":{"id":"a"}}`))
+	s.Apply(ev("session.status", `{"sessionID":"a","status":{"type":"busy"}}`))
+	if got := s.RunningRoots(); got != 1 {
+		t.Fatalf("one busy root: want 1 running, got %d", got)
+	}
+
+	// A second busy root → 2.
+	s.Apply(ev("session.created", `{"info":{"id":"b"}}`))
+	s.Apply(ev("session.status", `{"sessionID":"b","status":{"type":"busy"}}`))
+	if got := s.RunningRoots(); got != 2 {
+		t.Fatalf("two busy roots: want 2 running, got %d", got)
+	}
+
+	// One root idles → back to 1.
+	s.Apply(ev("session.idle", `{"sessionID":"b"}`))
+	if got := s.RunningRoots(); got != 1 {
+		t.Fatalf("after b idles: want 1 running, got %d", got)
+	}
+
+	// Root dedup: two busy sessions in the SAME subtree count the root once.
+	// c is a child of a; making c busy bumps busyCount[a] but RunningRoots
+	// must still report 1 (root a), not 2.
+	s.Apply(ev("session.created", `{"info":{"id":"c","parentID":"a"}}`))
+	s.Apply(ev("session.status", `{"sessionID":"c","status":{"type":"busy"}}`))
+	if got := s.RunningRoots(); got != 1 {
+		t.Fatalf("two busy sessions under root a: want 1 running (root dedup), got %d", got)
+	}
+
+	// Child idles → root a still busy (a itself is busy) → still 1.
+	s.Apply(ev("session.idle", `{"sessionID":"c"}`))
+	if got := s.RunningRoots(); got != 1 {
+		t.Fatalf("after child c idles (root a still busy): want 1 running, got %d", got)
+	}
+
+	// Last busy session idles → 0.
+	s.Apply(ev("session.idle", `{"sessionID":"a"}`))
+	if got := s.RunningRoots(); got != 0 {
+		t.Fatalf("after all idle: want 0 running, got %d", got)
+	}
+}

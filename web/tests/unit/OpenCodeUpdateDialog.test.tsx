@@ -184,6 +184,59 @@ describe("OpenCodeUpdateDialog — restart-offer gating + extracted RestartConfi
     expect(footerRestartBtns().length).toBe(1);
   });
 
+  it("offers restart after a FAILED install (failed branch of offerRestart)", async () => {
+    vi.stubGlobal("fetch", withFetch({ "/vh/opencode-version": VER_UPDATE }));
+    // The server marks a failed install with the trailing sentinel line; the
+    // dialog detects it and flips phase to "failed". offerRestart's failed
+    // branch must still surface the restart entry so the operator can retry.
+    streamOpenCodeUpdate.mockImplementation(async (append: (s: string) => void) => {
+      append("[vh] update failed\n");
+    });
+    render(() => <OpenCodeUpdateDialog onClose={() => {}} />);
+
+    const installBtn = await waitFor(() => {
+      const b = document.querySelector(".ocu-action-slot button") as HTMLButtonElement;
+      expect(b).toBeTruthy();
+      return b;
+    });
+    installBtn.click();
+
+    // Failed: the error result line renders AND offerRestart() is true (failed
+    // branch) — the footer restart entry shows despite the install failing.
+    await waitFor(() => expect(document.querySelector(".ocu-err")).toBeTruthy());
+    expect(footerRestartBtns().length).toBe(1);
+  });
+
+  it("does NOT offer restart while an install is mid-flight (updating)", async () => {
+    vi.stubGlobal("fetch", withFetch({ "/vh/opencode-version": VER_UPDATE }));
+    // Stream appends a progress line then NEVER completes — phase stays
+    // "updating" (runUpdate is blocked awaiting the stream).
+    streamOpenCodeUpdate.mockImplementation(async (append: (s: string) => void) => {
+      append("[vh] installing…\n");
+      await new Promise(() => {});
+    });
+    render(() => <OpenCodeUpdateDialog onClose={() => {}} />);
+
+    const installBtn = await waitFor(() => {
+      const b = document.querySelector(".ocu-action-slot button") as HTMLButtonElement;
+      expect(b).toBeTruthy();
+      return b;
+    });
+    installBtn.click();
+
+    // Updating: the live log streams AND the install button is disabled, but
+    // offerRestart() excludes the updating phase — no footer restart entry.
+    await waitFor(() =>
+      expect(document.querySelector(".ocu-log")?.textContent).toContain("installing"),
+    );
+    expect(
+      (document.querySelector(".ocu-action-slot button") as HTMLButtonElement).disabled,
+    ).toBe(true);
+    expect(footerRestartBtns().length).toBe(0);
+    // Close is also hidden during updating (focus-lock invariant).
+    expect(footerCloseBtn()).toBeNull();
+  });
+
   it("activating the footer restart entry traverses RestartConfirm before any POST", async () => {
     // /vh/running-sessions is fetched by RestartConfirm on mount; wire it so the
     // warning resolves. The restart POST itself is left unreachable (Cancel).
