@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -308,38 +309,269 @@ func (s *sessionQueueStore) recoverStaleDispatchingLocked(now time.Time) (change
 	return changed, nil
 }
 
+// Compaction retention (FIX-QUEUE-GC-5). Per-status TTL (measured from
+// ResolvedAt — the terminal-state arrival time, NEVER CreatedAt) and per-
+// status count cap. Retention order preserves ambiguous-recovery evidence
+// (STUCK-1's recovered `unknown` items) the longest:
+//
+//	unknown (30d / 200) > failed (7d / 100) > sent (1h / 50)
+//
+// pending and dispatching are NEVER purged by compaction — they represent
+// unsent work or active dispatch that the state machine must own.
+const (
+	sentItemTTL    = 1 * time.Hour
+	sentItemCap    = 50
+	failedItemTTL  = 7 * 24 * time.Hour
+	failedItemCap  = 100
+	unknownItemTTL = 30 * 24 * time.Hour
+	unknownItemCap = 200
+)
+
+// Compaction TTL overrides — TEST-ONLY. Zero (the default) means "use the
+// const default." Atomic (not a plain var) so the test-time write and the
+// compaction-time read can never race under `go test -race` — mirrors
+// staleDispatchThresholdOverride. Production code MUST NOT call
+// SetCompactionTTLsForTest; the 1h/7d/30d defaults are the deliberate
+// retention policy.
+var (
+	sentTTLOverride    atomic.Int64 // nanoseconds; 0 = use const default
+	failedTTLOverride  atomic.Int64
+	unknownTTLOverride atomic.Int64
+)
+
+func currentSentTTL() time.Duration {
+	if ns := sentTTLOverride.Load(); ns > 0 {
+		return time.Duration(ns)
+	}
+	return sentItemTTL
+}
+
+func currentFailedTTL() time.Duration {
+	if ns := failedTTLOverride.Load(); ns > 0 {
+		return time.Duration(ns)
+	}
+	return failedItemTTL
+}
+
+func currentUnknownTTL() time.Duration {
+	if ns := unknownTTLOverride.Load(); ns > 0 {
+		return time.Duration(ns)
+	}
+	return unknownItemTTL
+}
+
+// SetCompactionTTLsForTest overrides the per-status compaction TTLs for the
+// duration of a test, so the retention contract can be exercised without
+// 1h/7d/30d wall-clock waits. TEST-ONLY. Pass d <= 0 for a given status to
+// restore its default. Callers SHOULD defer-restore the defaults when done
+// (e.g. `defer SetCompactionTTLsForTest(0, 0, 0)`). Race-free (sync/atomic).
+func SetCompactionTTLsForTest(sentTTL, failedTTL, unknownTTL time.Duration) {
+	if sentTTL <= 0 {
+		sentTTLOverride.Store(0)
+	} else {
+		sentTTLOverride.Store(int64(sentTTL))
+	}
+	if failedTTL <= 0 {
+		failedTTLOverride.Store(0)
+	} else {
+		failedTTLOverride.Store(int64(failedTTL))
+	}
+	if unknownTTL <= 0 {
+		unknownTTLOverride.Store(0)
+	} else {
+		unknownTTLOverride.Store(int64(unknownTTL))
+	}
+}
+
+// compactTerminalItemsLocked removes expired and excess TERMINAL items
+// (sent/failed/unknown) from s.items. It NEVER touches pending or
+// dispatching — those represent unsent work or active dispatch that the
+// state machine must own. Called under s.mu by List() (after stale-dispatch
+// recovery) and Resolve() (after the terminal transition). The compaction
+// scan is O(n) where n is bounded by the caps (~200 max); the brief
+// explicitly forbids a dedicated high-frequency ticker.
+//
+// Returns changed=true if any item was removed.
+//
+// Two passes per status, applied independently (an item has exactly one
+// State, so the per-status passes operate on disjoint item sets — map
+// iteration order is irrelevant):
+//
+//  1. TTL pass: a terminal item with ResolvedAt > 0 whose age
+//     (`now - ResolvedAt`) strictly exceeds the status TTL is marked for
+//     removal. Items with ResolvedAt <= 0 (legacy/migration artifact with
+//     no valid terminal timestamp) are CONSERVATIVE — they survive the TTL
+//     pass. Purging them by an unreliable age would lose evidence. Future
+//     ResolvedAt (clock skew) also survives.
+//
+//  2. Count-cap pass: if the survivors exceed the cap, the OLDEST are
+//     removed. Ordered by (effective-time asc, Order asc). Items with
+//     missing ResolvedAt are treated as fresh (`now`) for the sort so the
+//     cap removes them LAST (conservative), with Order as the deterministic
+//     tiebreaker within that group.
+//
+// The `now` parameter is injected so tests can drive the clock without
+// wall-clock sleeps.
+func (s *sessionQueueStore) compactTerminalItemsLocked(now time.Time) (changed bool) {
+	nowMs := now.UnixMilli()
+	type statusCfg struct {
+		ttl time.Duration
+		cap int
+	}
+	configs := map[QueueItemState]statusCfg{
+		QueueSent:    {currentSentTTL(), sentItemCap},
+		QueueFailed:  {currentFailedTTL(), failedItemCap},
+		QueueUnknown: {currentUnknownTTL(), unknownItemCap},
+	}
+	// Removal set keyed by index into the ORIGINAL s.items slice. We can't
+	// shrink s.items during iteration without invalidating later indices, so
+	// we collect removals and rebuild the slice in one pass at the end.
+	remove := make(map[int]bool)
+	for status, cfg := range configs {
+		ttlMs := int64(cfg.ttl / time.Millisecond)
+		// Phase 1 — TTL pass. Mark expired items of this status. Conservative
+		// on missing ResolvedAt (<= 0 survives) and on clock skew (future
+		// ResolvedAt survives).
+		for i, it := range s.items {
+			if it.State != status {
+				continue
+			}
+			if it.ResolvedAt <= 0 {
+				continue
+			}
+			if nowMs-it.ResolvedAt > ttlMs {
+				remove[i] = true
+			}
+		}
+		// Phase 2 — count-cap pass. Collect survivors of this status, ordered
+		// oldest-first, and mark the excess for removal.
+		type idxEntry struct {
+			i   int
+			key int64 // ResolvedAt if > 0, else nowMs (conservative: fresh)
+			ord uint64
+		}
+		var survivors []idxEntry
+		for i, it := range s.items {
+			if it.State != status || remove[i] {
+				continue
+			}
+			key := it.ResolvedAt
+			if key <= 0 {
+				key = nowMs // conservative: treat as fresh so cap removes last
+			}
+			survivors = append(survivors, idxEntry{i, key, it.Order})
+		}
+		if len(survivors) <= cfg.cap {
+			continue
+		}
+		sort.Slice(survivors, func(a, b int) bool {
+			if survivors[a].key != survivors[b].key {
+				return survivors[a].key < survivors[b].key
+			}
+			return survivors[a].ord < survivors[b].ord
+		})
+		excess := len(survivors) - cfg.cap
+		for k := 0; k < excess; k++ {
+			remove[survivors[k].i] = true
+		}
+	}
+	if len(remove) == 0 {
+		return false
+	}
+	kept := make([]QueueItem, 0, len(s.items)-len(remove))
+	for i, it := range s.items {
+		if !remove[i] {
+			kept = append(kept, it)
+		}
+	}
+	s.items = kept
+	return true
+}
+
+// persistAfterCompaction persists the current in-memory state after a
+// recovery+compaction cycle. When compaction emptied the queue, it deletes
+// queue.json instead of writing an empty-items document — matching the
+// lazy-creation pattern where a queue that never had items has no file. An
+// empty-items file is harmless, but deleting it is cleaner and keeps the
+// on-disk footprint minimal. Idempotent on removal: a missing file is the
+// target state, not an error. Caller MUST hold s.mu.
+//
+// The archived guard on the remove branch is defense-in-depth mirroring
+// save()'s last-resort guard: even if a future mutation path forgets the
+// entry-time archived check, an archived store must NEVER os.Remove a
+// queue.json that a fresh post-archive store at the same path may own (the
+// two stores hold different mutexes; the removal would not be serialized
+// against the fresh store's writes — silent data loss). Returns
+// errQueueArchived (not nil) so a future missing entry guard surfaces as a
+// loud error rather than silent success — matches save()'s pattern.
+func (s *sessionQueueStore) persistAfterCompaction(compactChanged bool) error {
+	if compactChanged && len(s.items) == 0 {
+		if s.archived {
+			// Tombstoned store: a fresh store may have already written
+			// queue.json at this path post-archive. Removing it would be
+			// silent data loss. Surface as errQueueArchived so a future
+			// missing entry guard is loud, not silent.
+			return errQueueArchived
+		}
+		if err := os.Remove(s.path); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("queue: remove emptied %s: %w", s.path, err)
+		}
+		return nil
+	}
+	return s.save()
+}
+
 // List returns a copy of all items in FIFO (order) order. It is the single
-// chokepoint for stale-dispatch recovery: the SPA fetches the queue on session
-// open, stream reconnect, focus/visibility, polling, and at vh-solara restart
-// — so every entry path that would surface a stuck item first runs recovery.
-// Recovery transitions abandoned `dispatching` items to terminal `unknown`
-// (never `pending`, never re-dispatched) and persists the change atomically.
+// chokepoint for stale-dispatch recovery AND terminal-item compaction: the
+// SPA fetches the queue on session open, stream reconnect, focus/visibility,
+// polling, and at vh-solara restart — so every entry path that would surface
+// a stuck item first runs recovery, then compaction bounds disk growth from
+// accumulated terminal items. Recovery transitions abandoned `dispatching`
+// items to terminal `unknown` (never `pending`, never re-dispatched);
+// compaction purges expired/excess `sent`/`failed`/`unknown` items (never
+// `pending`/`dispatching`). Both are persisted atomically.
 func (s *sessionQueueStore) List() ([]QueueItem, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.archived {
+		// BLK-1 / GC-5: List() now persists recovery+compaction, so it is a
+		// mutating op and needs the same tombstone guard as Enqueue/Remove/
+		// Claim/Resolve. A retained pointer to a store whose deleteStore
+		// (archive) has completed must NOT run compaction persistence —
+		// especially the empty-queue os.Remove branch, which could delete a
+		// queue.json that a FRESH post-archive store at the same path has
+		// written (the two stores hold different mutexes, so the removal is
+		// not serialized against the fresh store's writes). A fresh store()
+		// lookup AFTER deleteStore creates a brand-new sessionQueueStore with
+		// archived==false; the tombstone only applies to retained pre-archive
+		// pointers.
+		return nil, errQueueArchived
+	}
 	if err := s.load(); err != nil {
 		return nil, err
 	}
-	// Snapshot the pre-recovery items so a save failure during recovery
-	// persistence rolls back ALL in-memory mutations (mirrors Resolve/Claim
-	// rollback). Without this, a save failure would leave recovered items as
-	// `unknown` in memory while disk still has them as `dispatching`, and a
-	// later successful mutation would persist the recovered state — silently
-	// losing the dispatching item. The shallow struct copy is sufficient
-	// because recovery only mutates scalar fields (State/ResolvedAt/Detail),
-	// never the Attachments slice.
-	preRecovery := make([]QueueItem, len(s.items))
-	copy(preRecovery, s.items)
-	changed, err := s.recoverStaleDispatchingLocked(time.Now())
+	// Snapshot the pre-mutation items so a save failure during recovery OR
+	// compaction persistence rolls back ALL in-memory mutations (mirrors
+	// Resolve/Claim rollback, extended to cover compaction's slice shrink).
+	// Without this, a save failure would leave recovered/compacted state in
+	// memory while disk still has the pre-mutation state, and a later
+	// successful mutation would persist the mutated state — silently
+	// committing transitions whose persistence failed. The shallow struct
+	// copy is sufficient: recovery+compaction only mutate scalar fields or
+	// drop entries, never the Attachments slice.
+	preMutation := make([]QueueItem, len(s.items))
+	copy(preMutation, s.items)
+	recoverChanged, err := s.recoverStaleDispatchingLocked(time.Now())
 	if err != nil {
 		return nil, err
 	}
-	if changed {
-		if err := s.save(); err != nil {
-			// Roll back ALL in-memory mutations from recovery so the store
-			// stays consistent with disk (the recoveries were never durably
+	compactChanged := s.compactTerminalItemsLocked(time.Now())
+	if recoverChanged || compactChanged {
+		if err := s.persistAfterCompaction(compactChanged); err != nil {
+			// Roll back ALL in-memory mutations from recovery AND compaction
+			// so the store stays consistent with disk (neither was durably
 			// committed).
-			s.items = preRecovery
+			s.items = preMutation
 			return nil, err
 		}
 	}
@@ -475,7 +707,9 @@ func (s *sessionQueueStore) Claim() (QueueItem, bool, error) {
 // never repend: the target MUST be terminal, and a pending item must be claimed
 // first (a resolve on pending is a logic error — the item was never dispatched).
 // Resolving an already-terminal item is allowed (idempotent re-report after a
-// network blip) and updates the state/detail.
+// network blip) and updates the state/detail. After the terminal transition,
+// compactTerminalItemsLocked runs so a freshly-terminal item that pushes the
+// queue over a cap is trimmed in the same atomic save.
 func (s *sessionQueueStore) Resolve(id string, target QueueItemState, detail string) (QueueItem, error) {
 	if !isTerminalState(target) {
 		return QueueItem{}, errQueueCannotRepend
@@ -493,21 +727,26 @@ func (s *sessionQueueStore) Resolve(id string, target QueueItemState, detail str
 			if s.items[i].State == QueuePending {
 				return QueueItem{}, errQueueNotClaimed
 			}
-			// Snapshot the prior terminal state so a save failure restores the
-			// pre-resolve in-memory view (mirrors Enqueue/Claim rollback): the
-			// new target was never durably committed, so the store must not
-			// reflect it. This keeps memory consistent with disk.
-			prevState, prevDetail, prevResolvedAt := s.items[i].State, s.items[i].Detail, s.items[i].ResolvedAt
+			// Snapshot BEFORE any mutation so a save/remove failure restores
+			// the pre-resolve in-memory view across BOTH the terminal
+			// transition AND any compaction removals (mirrors the existing
+			// rollback, extended to cover compaction's slice shrink). Without
+			// this, a save failure would leave the new terminal state in
+			// memory while disk still has the prior state, and a later
+			// successful mutation would persist the resolved state — silently
+			// committing a transition whose persistence failed.
+			preSnapshot := make([]QueueItem, len(s.items))
+			copy(preSnapshot, s.items)
 			s.items[i].State = target
 			s.items[i].Detail = detail
 			s.items[i].ResolvedAt = time.Now().UnixMilli()
-			if err := s.save(); err != nil {
-				s.items[i].State = prevState
-				s.items[i].Detail = prevDetail
-				s.items[i].ResolvedAt = prevResolvedAt
+			resolved := s.items[i] // capture before compaction may shrink s.items
+			compactChanged := s.compactTerminalItemsLocked(time.Now())
+			if err := s.persistAfterCompaction(compactChanged); err != nil {
+				s.items = preSnapshot
 				return QueueItem{}, err
 			}
-			return s.items[i], nil
+			return resolved, nil
 		}
 	}
 	return QueueItem{}, errQueueNotFound
