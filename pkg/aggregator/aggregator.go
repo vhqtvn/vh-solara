@@ -49,12 +49,15 @@ type Aggregator struct {
 	//      ShouldServeSession would return true (fail-open) for any foreign
 	//      id on the very first request to a newly-opened project.
 	//
-	//   2. Inside Run(), for the daemon's DEFAULT aggregator (constructed in
-	//      cmd/client-daemon.go / cmd/local-server.go and started with plain
-	//      `go agg.Run(vhCtx)` — does NOT go through aggFor). By the time the
-	//      HTTP server is listening, Run has set armed=true. Redundant for
-	//      per-dir aggregators (Arm() already set it) but harmless: same
-	//      value, same lock.
+	//   2. Inside Run(), as a REDUNDANT no-op for the DEFAULT aggregator. The
+	//      default aggregator is armed synchronously by web.NewServer before
+	//      the server can serve any HTTP request (closing the same
+	//      first-request TOCTOU aggFor closes for per-dir aggregators). Run's
+	//      a.armed = true writes the same value under the same lock — harmless
+	//      for both the default (already armed by NewServer) and per-dir
+	//      (already armed by aggFor) aggregators. It remains in Run so a
+	//      bare-test aggregator that goes through Run (without NewServer or
+	//      aggFor) still arms for the duration of that test.
 	//
 	// Bare-test aggregators built via New() / NewForDirectory() without
 	// aggFor or Run stay unarmed. Guarded by seedMu.
@@ -176,14 +179,14 @@ func (a *Aggregator) Client() *opencode.Client { return a.client }
 // flag's existence.
 //
 // Returns true unconditionally when the aggregator has NOT been armed (created
-// via New() / NewForDirectory() without aggFor or Run): this preserves the
-// bare-test contract documented at aggregator_test.go:350-351 ("issues the
-// fetch regardless of tree presence") — tests that exercise Client().Messages
-// directly on an unseeded aggregator (e.g. newSessionsTestServer in
-// sessions_test.go) must not have their ids silently dropped. Once armed
-// (Arm() called synchronously by aggFor for per-dir aggregators, OR Run() at
-// daemon startup for the default — see the armed field doc), returns
-// HasSession(sid) so a foreign id is silent-dropped.
+// via New() / NewForDirectory() without aggFor, NewServer, or Run): this
+// preserves the bare-test contract documented at aggregator_test.go:350-351
+// ("issues the fetch regardless of tree presence") — tests that exercise
+// Client().Messages directly on an unseeded aggregator (e.g.
+// newSessionsTestServer in sessions_test.go) must not have their ids silently
+// dropped. Once armed (Arm() called synchronously by aggFor for per-dir
+// aggregators AND by web.NewServer for the default aggregator — see the armed
+// field doc), returns HasSession(sid) so a foreign id is silent-dropped.
 func (a *Aggregator) ShouldServeSession(sid string) bool {
 	a.seedMu.Lock()
 	armed := a.armed
@@ -197,11 +200,17 @@ func (a *Aggregator) ShouldServeSession(sid string) bool {
 // Arm marks this aggregator as having entered the production lifecycle, so
 // the project-isolation backstop in EnsureMessages / EnsureMessagesAsync and
 // the HTTP-boundary guard in handleSessionsCloseout (via ShouldServeSession)
-// activate. It is called SYNCHRONOUSLY by the production server's aggFor
-// (pkg/web/server.go) BEFORE the freshly-built per-directory aggregator is
-// stored in s.aggs or returned to the caller — closing the first-request
-// TOCTOU where a request to a newly-opened project would otherwise race
-// RunManaged's goroutine scheduling and observe armed=false (fail-open).
+// activate. It is called SYNCHRONOUSLY in TWO production sites, BOTH before
+// the aggregator can observe any HTTP request:
+//
+//   - web.NewServer arms the DEFAULT aggregator before returning the server
+//     to the daemon (cmd/local-server.go / cmd/client-daemon.go), closing
+//     the first-request TOCTOU where the HTTP listener would otherwise win
+//     the race against `go agg.Run(...)` and observe armed=false (fail-open).
+//
+//   - web.Server.aggFor arms each freshly-built PER-DIRECTORY aggregator
+//     before storing it in s.aggs / returning it, closing the same TOCTOU
+//     against RunManaged's goroutine scheduling.
 //
 // Idempotent: a subsequent a.armed = true inside Run() (the default
 // aggregator's path, or a redundant re-set for per-dir aggregators) writes
@@ -357,9 +366,11 @@ func (a *Aggregator) EnsureMessages(ctx context.Context, sessionID string) error
 	// Gated on armed: in production every aggregator is armed BEFORE the HTTP
 	// layer routes a request to it — per-directory aggregators via the
 	// synchronous Arm() call inside aggFor (closing the first-request TOCTOU),
-	// the default aggregator via Run at daemon startup. So the backstop fires
-	// for every real caller. Bare aggregator unit tests that call EnsureMessages
-	// directly without Run / aggFor (e.g.
+	// the default aggregator via the synchronous Arm() call inside
+	// web.NewServer (closing the same TOCTOU at server-construction time, so
+	// the HTTP listener cannot win the race against `go agg.Run(...)`). So the
+	// backstop fires for every real caller. Bare aggregator unit tests that
+	// call EnsureMessages directly without Run / aggFor (e.g.
 	// TestEnsureMessagesAsyncSuccessEmitsCompletion) intentionally rely on the
 	// documented "issues the fetch regardless of tree presence" behavior;
 	// gating on armed (NOT runCtx!=nil) preserves that contract even for
@@ -505,10 +516,11 @@ func (a *Aggregator) EnsureMessagesAsync(ctx context.Context, sessionID string) 
 	// aggregator_test.go:350-351 ("issues the fetch regardless of tree
 	// presence") for tests that call EnsureMessagesAsync without Run / aggFor;
 	// every production aggregator is armed (synchronously inside aggFor for
-	// per-dir aggregators, inside Run for the default) before any HTTP request
-	// reaches it, so the backstop fires for every real caller. armed (NOT
-	// runCtx!=nil) is the gate because TestEnsureMessagesAsyncShutdownCancels
-	// manually sets runCtx without calling Run.
+	// per-dir aggregators, inside web.NewServer for the default) before any
+	// HTTP request reaches it, so the backstop fires for every real caller.
+	// armed (NOT runCtx!=nil) is the gate because
+	// TestEnsureMessagesAsyncShutdownCancels manually sets runCtx without
+	// calling Run.
 	a.seedMu.Lock()
 	armed := a.armed
 	a.seedMu.Unlock()
@@ -649,11 +661,13 @@ func (a *Aggregator) Run(ctx context.Context) {
 	// Capture the aggregator's lifetime ctx so background work (the cold-seed)
 	// can derive from it instead of a short-lived request ctx. Done once, under
 	// seedMu, before the first hydrate so startColdSeed observes it. armed is
-	// set here too: this is the DEFAULT aggregator's arming path (it is
-	// started with plain Run by the daemon, NOT via aggFor — see the armed
-	// field doc). Per-directory aggregators are already armed by aggFor's
-	// synchronous Arm() call before Run's goroutine schedules, so this write
-	// is a redundant no-op for them; same value, same lock, harmless.
+	// set here too as a REDUNDANT no-op for production aggregators: the default
+	// aggregator is armed synchronously by web.NewServer before Run's goroutine
+	// schedules, and per-directory aggregators are armed synchronously by
+	// aggFor. This write keeps bare-test aggregators that go through Run
+	// (without NewServer / aggFor) armed for the duration of the test; for
+	// production aggregators it writes the same value under the same lock —
+	// harmless. See the armed field doc.
 	a.seedMu.Lock()
 	a.runCtx = ctx
 	a.armed = true

@@ -11,12 +11,21 @@ import (
 )
 
 // newSessionsTestServer wires a Server whose aggregator points at a fake
-// opencode (reusing newFake from integration_test.go) and PRE-REGISTERS that
-// aggregator under "/proj" in srv.aggs. Pre-registering means aggFor("/proj")
-// returns it without lazy-creating a new aggregator or starting its background
-// Run loop — the verbs under test only use agg.Client() directly (never the
-// store), so this keeps the tests hermetic and leak-free while still exercising
-// the real opencode client against the fake.
+// opencode (reusing newFake from integration_test.go) and PRE-REGISTERS a
+// SEPARATE bare-test aggregator under "/proj" in srv.aggs. Pre-registering
+// means aggFor("/proj") returns it without lazy-creating a new aggregator or
+// starting its background Run loop — the verbs under test only use agg.Client()
+// directly (never the store), so this keeps the tests hermetic and leak-free
+// while still exercising the real opencode client against the fake.
+//
+// The /proj aggregator is a DISTINCT, UNARMED instance from the default
+// (s.agg): NewServer arms the default synchronously (the production arming
+// site), so reusing it for /proj would arm /proj too, and ShouldServeSession
+// would gate on HasSession — silent-dropping every unseeded id and breaking
+// the closeout content-shape tests below (which rely on the bare-test contract:
+// ShouldServeSession returns true for any id so the handler fetches content
+// for shape verification). A separate unarmed aggregator preserves that
+// contract under /proj.
 func newSessionsTestServer(t *testing.T, fake *fakeOpenCode) (*httptest.Server, *fakeOpenCode) {
 	t.Helper()
 	ocSrv := httptest.NewServer(fake.handler())
@@ -26,7 +35,10 @@ func newSessionsTestServer(t *testing.T, fake *fakeOpenCode) (*httptest.Server, 
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv.aggs["/proj"] = agg // pre-register → aggFor("/proj") returns it, no Run loop
+	// Distinct unarmed aggregator so /proj keeps the bare-test contract even
+	// though NewServer armed the default (s.agg).
+	projAgg := aggregator.New(ocSrv.URL, 1000)
+	srv.aggs["/proj"] = projAgg // pre-register → aggFor("/proj") returns it, no Run loop
 	web := httptest.NewServer(srv.Handler())
 	t.Cleanup(web.Close)
 	return web, fake

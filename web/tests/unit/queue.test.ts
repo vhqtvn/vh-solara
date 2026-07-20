@@ -444,7 +444,7 @@ describe("resolveQueued — resolve-write failure (F1: no misleading dispatching
   });
 });
 
-describe("removeQueued — pending-only removal", () => {
+describe("removeQueued — pending + terminal dismissal (not dispatching)", () => {
   it("removes the item from the cache on a successful DELETE", async () => {
     const sid = "s-rm-1";
     touched.push(sid);
@@ -481,7 +481,7 @@ describe("removeQueued — pending-only removal", () => {
     expect(queueFor(sid).map((m) => m.id)).toEqual(["a"]); // unchanged
   });
 
-  it("409 (no longer pending) triggers an authoritative refresh", async () => {
+  it("409 (dispatching, still in flight) triggers an authoritative refresh", async () => {
     const sid = "s-rm-3";
     touched.push(sid);
     // First populate with a pending item.

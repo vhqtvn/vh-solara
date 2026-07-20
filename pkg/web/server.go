@@ -295,6 +295,20 @@ func NewServer(agg *aggregator.Aggregator, opencodeURL string, ringCapacity int)
 		watcherCancel: map[string]context.CancelFunc{},
 		queueGCOn:     map[string]bool{},
 	}
+	// Arm the DEFAULT aggregator synchronously, BEFORE the server can serve
+	// any HTTP request. The default aggregator is created in the daemon
+	// (cmd/local-server.go / cmd/client-daemon.go) and started with plain
+	// `go agg.Run(vhCtx)`; without this synchronous arm there is no
+	// happens-before guarantee that Run sets armed=true before the HTTP
+	// listener accepts its first request. In that window the defense-in-depth
+	// backstop in EnsureMessages/EnsureMessagesAsync (project-isolation:
+	// armed && !HasSession → silent no-op) would be disabled on the default
+	// project, and ShouldServeSession would return true (fail-open) for any
+	// foreign id. Mirrors the synchronous a.Arm() inside aggFor for
+	// per-directory aggregators. Run's later a.armed = true is a redundant
+	// no-op (Arm is idempotent — same value, same lock). See the armed field
+	// doc in pkg/aggregator/aggregator.go for the full model.
+	agg.Arm()
 	return srv, nil
 }
 
@@ -327,9 +341,10 @@ func (s *Server) aggFor(dir string) *aggregator.Aggregator {
 	// /vh/sessions/closeout?dir=<fresh-project>&id=<foreign-id> that wins the
 	// race against the RunManaged goroutine below would see
 	// ShouldServeSession==true (fail-open) and leak the foreign project's
-	// messages via the project-blind Client().Messages upstream. Run's later
-	// a.armed = true is a redundant no-op for per-dir aggregators. See the
-	// armed field doc in pkg/aggregator/aggregator.go for the full model.
+	// messages via the project-blind Client().Messages upstream. The DEFAULT
+	// aggregator is armed analogously by NewServer; Run's later a.armed = true
+	// is a redundant no-op for both paths. See the armed field doc in
+	// pkg/aggregator/aggregator.go for the full model.
 	a.Arm()
 	s.aggs[dir] = a
 	// Managed-project hook: discover .vh-solara/project.jsonc, gate on trust, and

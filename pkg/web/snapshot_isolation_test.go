@@ -434,3 +434,85 @@ func TestCloseoutFirstRequestNoRace(t *testing.T) {
 			"fake.msgGets[leakMe]: want 0, got %d", got)
 	}
 }
+
+// TestDefaultAggregatorArmedBeforeHTTPServe is the regression test for the
+// DEFAULT aggregator's synchronous arming. The per-directory first-request
+// TOCTOU is pinned by TestCloseoutFirstRequestNoRace above (aggFor arms
+// synchronously); the DEFAULT aggregator (s.agg) is NOT created via aggFor —
+// it is built in the daemon and started with plain `go agg.Run(vhCtx)`. Before
+// the fix, NewServer stored the unarmed aggregator and Run's a.armed=true was
+// the only arming site, with no happens-before guarantee that it lands before
+// the HTTP listener accepts its first request. In that startup window the
+// defense-in-depth backstop in EnsureMessages/EnsureMessagesAsync was disabled
+// on the default project (armed gate fail-open) and ShouldServeSession returned
+// true for any foreign id.
+//
+// The fix moved default-aggregator arming into NewServer (s.agg.Arm() before
+// the constructor returns). This test exercises the pre-Run window directly:
+// it builds a Server via NewServer WITHOUT ever calling Run on the default
+// aggregator (mirroring newSessionsTestServer's no-Run harness), then asserts
+// both (a) the armed-state probe and (b) the EnsureMessages backstop on the
+// default aggregator. Under the bug (arming only inside Run) both assertions
+// fail — the aggregator is unarmed, the probe returns true, and EnsureMessages
+// issues the upstream GET.
+//
+// Why a coupling test and not an HTTP test: handleSessionsCloseout requires
+// ?dir= (rejects the default project with 400), so the closeout path never
+// reaches the default aggregator; the snapshot/stream paths' primary guard is
+// projectScopedFilter (HasSession-based), which masks the armed gate. The
+// default aggregator's armed gate is reachable in production only through the
+// EnsureMessages/EnsureMessagesAsync backstop, so this test exercises that
+// coupling directly — the precise surface the fix protects.
+func TestDefaultAggregatorArmedBeforeHTTPServe(t *testing.T) {
+	fake := newFake()
+	ocSrv := httptest.NewServer(fake.handler())
+	t.Cleanup(ocSrv.Close)
+
+	// Build the default aggregator via the production constructor (unarmed),
+	// then the Server via NewServer. The fix: NewServer calls agg.Arm()
+	// synchronously before returning. We deliberately do NOT call agg.Run —
+	// this keeps the test inside the pre-Run startup window where the bug
+	// lived.
+	agg := aggregator.New(ocSrv.URL, 1000)
+	srv, err := NewServer(agg, ocSrv.URL, 1000)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	web := httptest.NewServer(srv.Handler())
+	t.Cleanup(web.Close)
+
+	// Project-blind content for a foreign id. An unguarded EnsureMessages
+	// would issue a GET regardless of project; a guarded (armed) one must
+	// not. setMessage (not bare assignment) so the handler reads under f.mu.
+	fake.setMessage("leakMe", leakMessageContent)
+
+	// (a) Armed-state probe: ShouldServeSession returns true for ANY id while
+	// unarmed (the bare-test contract), and HasSession(id) once armed. A probe
+	// id guaranteed-not-in-the-empty-default-store distinguishes the two:
+	// armed → false, unarmed → true. Under the bug (NewServer did not arm),
+	// this assertion fails.
+	const armProbe = "__default_arm_probe_not_a_real_session__"
+	if agg.ShouldServeSession(armProbe) {
+		t.Fatal("default aggregator must be armed by NewServer before HTTP serve; " +
+			"ShouldServeSession returned true for a foreign probe (unarmed = fail-open)")
+	}
+
+	// (b) Backstop coupling: EnsureMessages on a foreign id must return nil
+	// WITHOUT issuing an upstream GET. Under the bug (unarmed), the backstop
+	// is disabled and the GET leaks. This is the precise surface the fix
+	// protects — the default aggregator's defense-in-depth layer.
+	if err := agg.EnsureMessages(context.Background(), "leakMe"); err != nil {
+		t.Fatalf("EnsureMessages on foreign id: want nil error, got %v", err)
+	}
+	if got := fake.msgGetsCount("leakMe"); got != 0 {
+		t.Fatalf("default aggregator EnsureMessages issued upstream GET for foreign id "+
+			"(backstop disabled — armed gate open in pre-Run window); "+
+			"fake.msgGets[leakMe]: want 0, got %d", got)
+	}
+	// And the backstop must NOT have marked the session as loaded — silent
+	// no-op, not a fake-success.
+	if agg.Store().IsMessagesLoaded("leakMe") {
+		t.Fatal("default aggregator backstop must NOT mark a foreign id as loaded " +
+			"(would mask future real hydration)")
+	}
+}
