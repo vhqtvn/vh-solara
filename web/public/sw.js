@@ -98,7 +98,7 @@ self.addEventListener("fetch", (e) => {
       if (cached) return cached;
       try {
         const res = await fetch(req);
-        if (res.ok && (url.pathname.startsWith("/assets/") || url.pathname.startsWith("/icon"))) {
+        if (res.ok && (url.pathname.startsWith("/assets/") || url.pathname.startsWith("/icon") || url.pathname.startsWith("/screenshots/"))) {
           cache.put(req, res.clone());
         }
         return res;

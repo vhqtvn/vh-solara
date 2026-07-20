@@ -1,0 +1,57 @@
+/* Protocol-confirm dialog body styling. Co-located per the CSS architecture
+   rule (web/src/styles/foundation/ holds only global tokens; component CSS
+   lives beside the component). The outer .dialog/.dialog-overlay/.confirm-*
+   classes are global (legacy dialog shell shared across dialogs). */
+.proto-dialog {
+  max-width: 520px;
+}
+
+.proto-lede {
+  margin: 0 0 10px;
+  color: var(--fg-dim);
+  font-size: var(--text-sm);
+  line-height: 1.45;
+}
+
+.proto-scheme {
+  margin: 0 0 6px;
+  font-size: var(--text-sm);
+  color: var(--fg-dim);
+}
+
+.proto-scheme code {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  color: var(--fg);
+}
+
+/* The raw payload is the trust anchor the user inspects — wrap+scroll so a long
+   `web+vhsolara:...` URL stays legible without overflowing the dialog. */
+.proto-payload {
+  margin: 0 0 10px;
+  padding: 10px 12px;
+  background: var(--bg-input, #0d1117);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--fg);
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: var(--text-sm);
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 180px;
+  overflow: auto;
+}
+
+.proto-warn {
+  margin: 0 0 4px;
+  padding: 8px 10px;
+  border: 1px solid var(--warn, #d97706);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--warn, #d97706) 12%, transparent);
+  color: var(--fg);
+  font-size: var(--text-sm);
+  line-height: 1.4;
+}
+
+.proto-warn code {
+  font-family: var(--font-mono, ui-monospace, monospace);
+}

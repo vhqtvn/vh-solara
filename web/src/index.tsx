@@ -10,6 +10,7 @@ import { applyTheme } from "./theme";
 import { applyFont, applyMonoFont } from "./font";
 import "./prefs"; // import for side effect: DOM-affecting prefs apply reactively on load
 import { registerServiceWorker, startVersionCheck } from "./pwa";
+import { initProtocolHandler } from "./protocol";
 import { initPwaInstall } from "./pwa-install";
 import { installCsrf } from "./csrf";
 import { installViewport } from "./viewport";
@@ -117,6 +118,10 @@ if (standalone === "code") {
   registerServiceWorker();
   startVersionCheck();
   initPwaInstall();
+  // Stage (do NOT act on) an inbound web+vhsolara: payload from the launched
+  // URL. The confirm prompt (components/ProtocolConfirm.tsx) is the only act
+  // path. See web/src/protocol.ts.
+  initProtocolHandler();
   startPresence();
   render(() => <App />, root);
   installScrollEdges();

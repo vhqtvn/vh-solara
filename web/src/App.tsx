@@ -32,6 +32,7 @@ import ManagedPanel from "./components/ManagedPanel";
 import DiagLogDialog from "./components/DiagLogDialog";
 import OpenCodeLogsDialog from "./components/OpenCodeLogsDialog";
 import PerformanceDialog from "./components/PerformanceDialog";
+import ProtocolConfirm from "./components/ProtocolConfirm";
 import Icon from "./components/Icon";
 import { menuTriggers } from "./sessionMenu";
 import { isDesktop, sidebarCollapsed, sidebarWidth, toggleSidebar } from "./layout";
@@ -405,6 +406,7 @@ export default function App() {
       <RestartOverlay />
       <WorkingOverlay />
       <CommandPalette />
+      <ProtocolConfirm />
     </div>
   );
 }
