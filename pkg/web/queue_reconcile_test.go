@@ -48,7 +48,7 @@ func TestQueueReconcile_OrphanRemovedAfterSuccessfulInventory(t *testing.T) {
 	seedQueueFile(t, root, "orphan")
 
 	active := map[string]bool{"live": true}
-	if err := srv.queues.reconcileOrphanQueues(root, active); err != nil {
+	if err := srv.queues.reconcileOrphanQueues(root, active, nil); err != nil {
 		t.Fatalf("reconcileOrphanQueues: %v", err)
 	}
 
@@ -79,7 +79,7 @@ func TestQueueReconcile_LiveSessionQueueItemsPreserved(t *testing.T) {
 	}
 
 	active := map[string]bool{"live": true}
-	if err := srv.queues.reconcileOrphanQueues(root, active); err != nil {
+	if err := srv.queues.reconcileOrphanQueues(root, active, nil); err != nil {
 		t.Fatalf("reconcileOrphanQueues: %v", err)
 	}
 
@@ -112,7 +112,7 @@ func TestQueueReconcile_NilInventoryRemovesNothing(t *testing.T) {
 	seedQueueFile(t, root, "s3")
 
 	// nil active map = "no authoritative set." Must delete nothing.
-	if err := srv.queues.reconcileOrphanQueues(root, nil); err != nil {
+	if err := srv.queues.reconcileOrphanQueues(root, nil, nil); err != nil {
 		t.Fatalf("reconcileOrphanQueues(nil) returned error: %v (must be nil)", err)
 	}
 
@@ -137,7 +137,7 @@ func TestQueueReconcile_EmptyNonNilInventoryDeletesAll(t *testing.T) {
 	// Empty NON-nil map = "hydrate succeeded with zero sessions." All on-disk
 	// queues are orphans → all deleted.
 	active := map[string]bool{}
-	if err := srv.queues.reconcileOrphanQueues(root, active); err != nil {
+	if err := srv.queues.reconcileOrphanQueues(root, active, nil); err != nil {
 		t.Fatalf("reconcileOrphanQueues(empty): %v", err)
 	}
 
@@ -201,7 +201,7 @@ func TestQueueReconcile_DiscoversFilesystemOnlyOrphans(t *testing.T) {
 	}
 
 	active := map[string]bool{"some-other-session": true}
-	if err := srv.queues.reconcileOrphanQueues(root, active); err != nil {
+	if err := srv.queues.reconcileOrphanQueues(root, active, nil); err != nil {
 		t.Fatalf("reconcileOrphanQueues: %v", err)
 	}
 
@@ -233,7 +233,7 @@ func TestQueueReconcile_AttachmentBearingOrphanKeepsAttachmentsDir(t *testing.T)
 	}
 
 	active := map[string]bool{}
-	if err := srv.queues.reconcileOrphanQueues(root, active); err != nil {
+	if err := srv.queues.reconcileOrphanQueues(root, active, nil); err != nil {
 		t.Fatalf("reconcileOrphanQueues: %v", err)
 	}
 
@@ -318,7 +318,7 @@ func TestQueueReconcile_ConcurrentMutationIsRaceSafe(t *testing.T) {
 		defer wg.Done()
 		active := map[string]bool{"live": true}
 		for i := 0; i < 50; i++ {
-			if err := srv.queues.reconcileOrphanQueues(root, active); err != nil {
+			if err := srv.queues.reconcileOrphanQueues(root, active, nil); err != nil {
 				panic(err)
 			}
 		}
@@ -368,7 +368,7 @@ func TestQueueReconcile_ToleratesDisappearingFiles(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			active := map[string]bool{}
-			if err := srv.queues.reconcileOrphanQueues(root, active); err != nil {
+			if err := srv.queues.reconcileOrphanQueues(root, active, nil); err != nil {
 				errs <- err
 			}
 		}()
@@ -385,5 +385,76 @@ func TestQueueReconcile_ToleratesDisappearingFiles(t *testing.T) {
 		if queueFileExists(root, sid) {
 			t.Errorf("orphan %q survived concurrent reconciliation; must be removed", sid)
 		}
+	}
+}
+
+// 9. Revalidate callback saves a fresh session created between T1 and T2
+// (THE test for FIX-QUEUE-GC-3-RACE — the T2 recheck closure).
+//
+//		The GC-3 race being closed: activeSessions is captured at T1
+//		(SessionIDs()), the filesystem is scanned at T2; a session created in
+//		the (T1, T2) window appears as an orphan at T2 because it is absent
+//		from the T1 snapshot, even though it is NOW live. Pre-fix, its fresh
+//		queue.json was deleted — murdering a brand-new session's queue. The
+//		revalidate callback re-checks liveness at T2: if it returns true, the
+//		deletion is skipped.
+//
+//	Test design:
+//	  - activeSessions is EMPTY — the T1 snapshot was taken BEFORE either
+//	    session existed. Without revalidate, both on-disk queues would be
+//	    deleted as orphans (this is the case-4a contract).
+//	  - revalidate returns true ONLY for "fresh" — simulating the session
+//	    being active at T2 (created between T1 and T2). This is the T2
+//	    recheck that closes GC-3.
+//	  - "real-orphan" is a session revalidate reports as inactive — it MUST
+//	    still be deleted, proving the recheck doesn't accidentally skip all
+//	    deletions.
+//	  - Assert: "fresh" queue.json survives (the recheck saved it); "real
+//	    orphan" queue.json is gone (revalidate=false still deletes).
+func TestQueueReconcile_RevalidateSavesFreshSession(t *testing.T) {
+	_, _, srv, root := queueLifecycleServer(t, &fakeOC{})
+	seedQueueFile(t, root, "fresh")       // created between T1 and T2 — must survive
+	seedQueueFile(t, root, "real-orphan") // genuinely gone — must be deleted
+
+	// activeSessions is EMPTY — T1 snapshot taken BEFORE either session
+	// existed. Without revalidate, both queues would be deleted.
+	active := map[string]bool{}
+	// revalidate returns true ONLY for "fresh" — the session is now active
+	// at T2 (created between T1 and T2). This is the T2 recheck that closes
+	// GC-3. Production wiring passes store.HasSession; this stub simulates
+	// the same liveness signal deterministically.
+	revalidate := func(sid string) bool { return sid == "fresh" }
+
+	if err := srv.queues.reconcileOrphanQueues(root, active, revalidate); err != nil {
+		t.Fatalf("reconcileOrphanQueues with revalidate: %v", err)
+	}
+
+	if !queueFileExists(root, "fresh") {
+		t.Errorf("fresh-session queue.json was deleted; T2 recheck must save a session created between T1 and T2 (GC-3 race closure)")
+	}
+	if queueFileExists(root, "real-orphan") {
+		t.Errorf("real-orphan queue.json survived; revalidate must only save sessions it reports as active")
+	}
+}
+
+// 10. Nil revalidate callback preserves the pre-fix behavior (orphans still
+// deleted when absent from activeSessions).
+//
+//	The new `revalidate` parameter is backward-compatible: nil means "no
+//	re-validation." This test pins that contract so a future refactor cannot
+//	accidentally crash on nil or skip deletion when nil is passed. It mirrors
+//	case-4a (empty-non-nil inventory deletes all) but with the explicit nil
+//	revalidate argument — the two-arg call shape pre-FIX-QUEUE-GC-3-RACE.
+func TestQueueReconcile_RevalidateNilDoesNotCrash(t *testing.T) {
+	_, _, srv, root := queueLifecycleServer(t, &fakeOC{})
+	seedQueueFile(t, root, "orphan")
+
+	active := map[string]bool{}
+	if err := srv.queues.reconcileOrphanQueues(root, active, nil); err != nil {
+		t.Fatalf("reconcileOrphanQueues with nil revalidate returned error: %v", err)
+	}
+
+	if queueFileExists(root, "orphan") {
+		t.Errorf("orphan queue.json survived; nil revalidate must preserve pre-fix behavior (delete orphans not in activeSessions)")
 	}
 }

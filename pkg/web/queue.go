@@ -939,11 +939,58 @@ func (qr *queueRegistry) CleanupSession(root, sessionID string) {
 //     resurrected. A file that vanishes between stat and CleanupSession is
 //     not an error (deleteStore's os.Remove is best-effort).
 //
+// GC-3 stale-inventory race — CLOSED by the T2 recheck (FIX-QUEUE-GC-3-RACE).
+//   - T1: the caller captures the active-session set (SessionIDs()) at one
+//     instant.
+//   - T2: this function scans the filesystem at a later instant.
+//   - If a session is created in the (T1, T2) window, its fresh queue.json
+//     appears as an orphan at T2 even though the session is now live.
+//     Pre-fix, such a fresh queue.json was deleted — murdering a brand-new
+//     session's queue.
+//   - The `revalidate` callback re-checks session liveness AT T2, in the same
+//     loop and immediately before each deletion. If revalidate(sid) returns
+//     true (the session is now active), the deletion is skipped. This narrows
+//     the race window from T1→T2 (the entire scan) to T2.recheck→T2.delete
+//     (the brief instant between the recheck and the os.Remove), which is the
+//     GC-2 pattern.
+//   - The recheck is a callback (not a direct Store reference) so production
+//     wiring can pass store.HasSession while tests can pass a deterministic
+//     stub. nil means "no re-validation" (preserves the pre-fix behavior for
+//     callers that opt out — and for the test harness).
+//
+// GC-2 hazard — OPEN (will-not-fix-now; requires architecture change).
+//   - GC-2 is a DIFFERENT race that the T2 recheck above does NOT close: a
+//     buffered session.delete event for a session that was deleted and then
+//     RECREATED with the same ID can arrive after recreation and delete the
+//     fresh queue. This is the "delayed session.delete ABA" hazard.
+//   - GC-2 cannot be closed without an enqueue fence (a monotonic generation
+//     / epoch that the cleanup path checks against the live store). The
+//     current architecture has no such fence — queue.json carries no
+//     lifecycle identity, and the GC-1 cleanup primitive is intentionally
+//     identity-free for simplicity. The debate verdict (operator-approved)
+//     is "lean — ship O6 (T2 recheck) for GC-3; scoped will-not-fix for
+//     GC-2." Rejected alternatives O1 (lifecycle identity) and O2 (item
+//     stamps) are blocked by the same missing enqueue fence (G1); extending
+//     nextMsgRev to queue GC was rejected as precedent-not-proof.
+//   - Exposure is LOW: it requires session-ID reuse (OpenCode IDs are
+//     globally unique and sqlite FK-enforced, so reuse only happens across
+//     separate databases or after a manual ID collision).
+//   - Revisit triggers for GC-2 (any one warrants re-evaluation):
+//     1. A production or test incident demonstrates a fresh queue being
+//     deleted after same-ID recreation.
+//     2. Queue enqueue gains lifecycle state access or a shared
+//     linearization point (lowers the cost of a full fix).
+//     3. A revision/generation protocol is designed with explicit
+//     enqueue/cleanup/persistence/lock-order proofs.
+//     4. Queue identity/generation is added for another feature (the
+//     marginal cost of a full lifecycle fix drops to the cleanup-side
+//     check alone).
+//
 // Idempotent: a second reconciliation pass finds nothing to do. Safe to call
 // from multiple goroutines (qr.mu serializes the per-session work); the
 // production caller dispatches each pass to a fresh goroutine so hydrate's
 // goroutine is never blocked.
-func (qr *queueRegistry) reconcileOrphanQueues(root string, activeSessions map[string]bool) error {
+func (qr *queueRegistry) reconcileOrphanQueues(root string, activeSessions map[string]bool, revalidate func(string) bool) error {
 	// FAIL-CLOSED: a nil active set means "no authoritative inventory." Delete
 	// nothing. The empty non-nil map (len==0) intentionally falls through and
 	// deletes every on-disk queue — that is the "hydrate succeeded with zero
@@ -986,6 +1033,15 @@ func (qr *queueRegistry) reconcileOrphanQueues(root string, activeSessions map[s
 			// cleaning, and a transient permission error on one entry should
 			// not block the whole reconciliation).
 			vhlog.Warn("queue reconcile: stat skipped", "path", qPath, "err", statErr)
+			continue
+		}
+		if revalidate != nil && revalidate(sid) {
+			// GC-3 race closure (FIX-QUEUE-GC-3-RACE): the session became
+			// active between the T1 inventory snapshot (caller's
+			// SessionIDs()) and this T2 scan. Skip deletion — this narrows
+			// the race window from T1→T2 to T2.recheck→T2.delete, which is
+			// the GC-2 pattern (a different, accepted hazard — see the
+			// "GC-2 hazard — OPEN" block in the doc comment above).
 			continue
 		}
 		qr.CleanupSession(root, sid)

@@ -605,12 +605,22 @@ func (s *Server) reconcileQueuesForAgg(dir string, a *aggregator.Aggregator) {
 		vhlog.Error("queue reconcile: projectRoot failed", "dir", dir, "err", err)
 		return
 	}
-	ids := a.Store().SessionIDs()
+	store := a.Store()
+	ids := store.SessionIDs()
 	active := make(map[string]bool, len(ids))
 	for _, id := range ids {
 		active[id] = true
 	}
-	if err := s.queues.reconcileOrphanQueues(root, active); err != nil {
+	// GC-3 race closure (FIX-QUEUE-GC-3-RACE): re-validate each orphan
+	// candidate at T2 (immediately before deletion) against the live store.
+	// A session created between the T1 inventory snapshot above (SessionIDs)
+	// and this T2 scan would otherwise have its fresh queue.json deleted as
+	// an orphan. The recheck narrows the race window to T2.recheck→T2.delete,
+	// which is the GC-2 pattern (a different, accepted hazard — see the
+	// "GC-2 hazard — OPEN" block in reconcileOrphanQueues's doc comment).
+	if err := s.queues.reconcileOrphanQueues(root, active, func(sid string) bool {
+		return store.HasSession(sid)
+	}); err != nil {
 		vhlog.Error("queue reconcile failed", "dir", dir, "root", root, "err", err)
 	}
 }
