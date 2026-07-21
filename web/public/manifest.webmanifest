@@ -32,5 +32,8 @@
   ],
   "protocol_handlers": [
     { "protocol": "web+vhsolara", "url": "/?proto=%s" }
+  ],
+  "related_applications": [
+    { "platform": "webapp", "url": "/", "id": "/" }
   ]
 }

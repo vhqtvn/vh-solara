@@ -6,6 +6,7 @@ import { hideBuiltin, setHideBuiltin } from "../models";
 import { setStreamLive, streamLive, treeDensity, setTreeDensity, uiScale, setUiScale, orientation, setOrientation, MIN_SCALE, MAX_SCALE, chatWidth, setChatWidth, chatBubbles, setChatBubbles, notesEnabled, setNotesEnabled, tabStyle, setTabStyle, perfDiagEnabled, setPerfDiagEnabled, type ChatWidth, type TabStyle } from "../prefs";
 import { queueMode, setQueueMode } from "../queue";
 import { canInstall, installed, isIosSafari, promptInstall } from "../pwa-install";
+import { runDiagnostics, chipLabel, type DiagnosticsResult } from "../pwa-diagnostics";
 import { killTerm, listTerms } from "../termApi";
 import { agents, selectedAgent, setSelectedAgent } from "../agents";
 import { displayName } from "../projectSettings";
@@ -66,6 +67,13 @@ export default function SettingsDialog(props: { onClose: () => void }) {
   };
   // Terminal sessions (fetched when the Terminals tab is open).
   const [terms, { refetch: refetchTerms }] = createResource(sec, (s) => (s === "terminals" ? listTerms() : Promise.resolve([])));
+  // PWA install diagnostics (computed when the App tab is open). Read-only; no
+  // CSRF header needed (it only fetches /manifest.webmanifest). Re-runs on a
+  // manual Refresh and whenever the App tab is re-entered. Mirrors the terms
+  // resource pattern (source accessor + fetcher, no explicit generic).
+  const [diag, { refetch: refetchDiag }] = createResource(sec, (s) =>
+    s === "app" ? runDiagnostics() : Promise.resolve<DiagnosticsResult | null>(null),
+  );
 
   const onKey = (e: KeyboardEvent) => {
     if (e.key === "Escape") props.onClose();
@@ -421,6 +429,49 @@ export default function SettingsDialog(props: { onClose: () => void }) {
               <p class="setting-hint">
                 The orientation control is under Appearance — it takes effect once installed.
               </p>
+
+              {/* Install diagnostics panel — renders BELOW the install button.
+                  Pure read-only observability: every signal JS can see is shown
+                  as a row, then a single likely-cause interpretation, then the
+                  honest "cannot be checked from JS" callouts. See
+                  web/src/pwa-diagnostics.ts for the computation. */}
+              <div class={styles["pwa-diag"]}>
+                <div class={styles["pwa-diag-head"]}>
+                  <strong class={styles["pwa-diag-title"]}>Install diagnostics</strong>
+                  <button type="button" class={styles["pwa-diag-refresh"]} onClick={() => refetchDiag()}>Refresh</button>
+                </div>
+                <Show when={!diag() && diag.loading}>
+                  <p class="setting-hint">Gathering install signals…</p>
+                </Show>
+                <Show when={diag()}>
+                  {(d) => (
+                    <>
+                      <For each={d().signals}>
+                        {(row) => (
+                          <div class={styles["pwa-diag-row"]}>
+                            <span class={styles["pwa-diag-label"]}>{row.label}</span>
+                            <span class={styles["pwa-diag-chip"]} data-status={row.status}>{chipLabel(row.status)}</span>
+                            <span class={styles["pwa-diag-value"]}>
+                              {row.value}
+                              <Show when={row.detail}><span class={styles["pwa-diag-detail"]}> · {row.detail}</span></Show>
+                            </span>
+                          </div>
+                        )}
+                      </For>
+                      <div class={styles["pwa-diag-cause"]}>
+                        <strong>Likely cause: </strong>{d().likelyCause}
+                      </div>
+                      <div class={styles["pwa-diag-callouts"]}>
+                        <strong>Cannot be checked from JS:</strong>
+                        <ul>
+                          <For each={d().cannotObserve}>{(c) => <li>{c}</li>}</For>
+                        </ul>
+                      </div>
+                      <p class={styles["pwa-diag-note"]}>{d().webapkNote}</p>
+                    </>
+                  )}
+                </Show>
+              </div>
             </Show>
 
             <Show when={sec() === "terminals"}>
