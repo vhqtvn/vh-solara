@@ -839,3 +839,93 @@ describe("applySnapshot — Phase 4 stubs merge/replace/prune", () => {
     expect(state.branchStubs.existing).toBeDefined(); // preserved (merge)
   });
 });
+
+describe("applySnapshot — Phase 6 cutoff tracking", () => {
+  const EPOCH = "ep6";
+
+  it("applies projected snapshot with cutoff fields without error", () => {
+    setState("epoch", EPOCH);
+    applySnapshot({
+      seq: 1,
+      epoch: EPOCH,
+      sessions: [{ id: "a" }],
+      projected: true,
+      cause: "initial",
+      structuralRevision: 1,
+      cutoffVersion: 1,
+      cutoffMs: 600000,
+      stubs: [],
+    });
+    expect(state.sessions.a).toBeDefined();
+  });
+
+  it("applies projected snapshot with changed cutoffVersion", () => {
+    setState("epoch", EPOCH);
+    // First snapshot with cutoffVersion 1.
+    applySnapshot({
+      seq: 1,
+      epoch: EPOCH,
+      sessions: [{ id: "a" }],
+      projected: true,
+      cause: "initial",
+      structuralRevision: 1,
+      cutoffVersion: 1,
+      cutoffMs: 600000,
+    });
+    // Second snapshot with bumped cutoffVersion + different cutoffMs.
+    applySnapshot({
+      seq: 2,
+      epoch: EPOCH,
+      sessions: [{ id: "a" }, { id: "b" }],
+      projected: true,
+      cause: "promotion",
+      structuralRevision: 2,
+      cutoffVersion: 2,
+      cutoffMs: 300000, // 5min instead of 10min
+    });
+    // The cutoff change should NOT block the apply — the structuralRevision
+    // guard handles ordering; cutoffVersion is diagnostic tracking only.
+    expect(state.sessions.b).toBeDefined();
+  });
+
+  it("resets cutoff tracking on epoch change", () => {
+    setState("epoch", "oldEpoch");
+    // Seed with cutoffVersion 5.
+    applySnapshot({
+      seq: 10,
+      epoch: "oldEpoch",
+      sessions: [{ id: "a" }],
+      projected: true,
+      structuralRevision: 10,
+      cutoffVersion: 5,
+      cutoffMs: 600000,
+    });
+    // Epoch change: cutoffVersion 1 from the new server should apply
+    // (lower than 5, but epoch change resets the guard).
+    applySnapshot({
+      seq: 1,
+      epoch: "newEpoch",
+      sessions: [{ id: "a" }, { id: "c" }],
+      projected: true,
+      structuralRevision: 1,
+      cutoffVersion: 1,
+      cutoffMs: 600000,
+    });
+    expect(state.sessions.c).toBeDefined(); // applied despite lower revision
+  });
+
+  it("applies projected snapshot without cutoff fields (old server)", () => {
+    setState("epoch", EPOCH);
+    // A projected snapshot from an old server that doesn't stamp cutoff
+    // fields should still apply correctly (backward compatible).
+    applySnapshot({
+      seq: 1,
+      epoch: EPOCH,
+      sessions: [{ id: "a" }],
+      projected: true,
+      structuralRevision: 1,
+      // cutoffVersion + cutoffMs absent
+    });
+    expect(state.sessions.a).toBeDefined();
+  });
+});

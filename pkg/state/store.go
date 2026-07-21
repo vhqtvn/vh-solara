@@ -210,6 +210,26 @@ type Snapshot struct {
 	// triggers a lazy-fetch to the branch endpoint. Absent in AUTHORITY_COMPLETE
 	// snapshots (projected=false).
 	Stubs []CollapsedBranchStub `json:"stubs,omitempty"`
+	// CutoffVersion + CutoffMs (Phase 6 Gate E) carry the projection cutoff
+	// that was active when this snapshot was constructed. CutoffVersion is a
+	// monotonic version that bumps when the server changes the cutoff policy
+	// (so the client can detect a boundary change). CutoffMs is the cutoff
+	// duration in milliseconds (default 600000 = 10 minutes). A session whose
+	// newest activity is older than (now - cutoffMs) is considered idle and
+	// collapsed into a frontier stub.
+	//
+	// Anti-thrash guarantee (Gate E): demotion happens ONLY at snapshot
+	// construction time (initial/promotion/reconnect) — there are NO timer-
+	// driven demotion events. The 15s ping ticker stays ping-only. This means
+	// a session active every 9:59 (just under the 10min cutoff) never gets
+	// demoted between activity bursts, because no snapshot is constructed
+	// between bursts.
+	//
+	// Absent in AUTHORITY_COMPLETE snapshots (projected=false). Omitted when
+	// CutoffVersion is 0 (fresh store, never stamped — treated as "no cutoff
+	// info" by the client).
+	CutoffVersion uint32 `json:"cutoffVersion,omitempty"`
+	CutoffMs      uint64 `json:"cutoffMs,omitempty"`
 }
 
 // GateFacts is the denormalized "is this session safe to act on" summary for one

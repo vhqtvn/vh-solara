@@ -55,9 +55,31 @@ type CollapsedBranchStub struct {
 // defaultProjectionCutoff is the activity-recency threshold below which a
 // session is considered "idle" for projection purposes. Sessions whose subtree
 // newest activity is older than (now - cutoff) AND are not busy/retry/pending-
-// input are collapsed into frontier stubs. Phase 6 makes this versioned and
-// tunable via the cutoffVersion/cutoffMs envelope fields.
+// input are collapsed into frontier stubs.
+//
+// Phase 6 (Gate E): this is the tunable cutoff value. The cutoffVersion package
+// var identifies the policy generation — bump it when changing the cutoff so
+// the client can detect a boundary change. Both are stamped in every projected
+// snapshot via projectionCutoff().
+//
+// Anti-thrash: demotion happens ONLY at snapshot construction (NOT on a timer).
+// The 15s ping ticker in handleStream stays ping-only — it does NOT trigger
+// re-projection. This is the anti-thrash guarantee: a session active every
+// 9:59 (just under 10min) never gets demoted between bursts because no snapshot
+// is constructed between them.
 var defaultProjectionCutoff = 10 * time.Minute
+
+// projectionCutoffVersion is the monotonic version of the cutoff policy. Bump
+// it whenever the cutoff duration changes (or the policy logic changes). The
+// client uses this to detect a boundary change between snapshots.
+var projectionCutoffVersion uint32 = 1
+
+// projectionCutoff returns the current cutoff policy: (version, duration).
+// Centralized here so SnapshotProjected and SnapshotBranch stamp the same
+// values, and tests can change the package vars and see the change reflected.
+func projectionCutoff() (uint32, time.Duration) {
+	return projectionCutoffVersion, defaultProjectionCutoff
+}
 
 // structuralKinds is the set of event kinds that affect the projection
 // boundary (session topology, activity state, or pending input). When a proj=1
@@ -247,7 +269,8 @@ func (s *Store) buildStubLocked(id string, cutoff time.Time, rev uint64) Collaps
 func (s *Store) SnapshotProjected(messagesFor map[string]bool, cause string) Snapshot {
 	s.mu.RLock()
 
-	cutoff := time.Now().Add(-defaultProjectionCutoff)
+	cutoffVersion, cutoffDuration := projectionCutoff()
+	cutoff := time.Now().Add(-cutoffDuration)
 	active := s.computeActiveClosureLocked(cutoff)
 
 	// Determine which sessions get messages. messagesFor nil → all active.
@@ -429,6 +452,8 @@ func (s *Store) SnapshotProjected(messagesFor map[string]bool, cause string) Sna
 		Projected:          true,
 		Cause:              cause,
 		Stubs:              stubs,
+		CutoffVersion:      cutoffVersion,
+		CutoffMs:           uint64(cutoffDuration.Milliseconds()),
 		Messages:           map[string][]MessageWithParts{},
 		MessageWindows:     map[string]WindowMeta{},
 		Todos:              map[string]json.RawMessage{},
@@ -543,7 +568,8 @@ func (s *Store) SnapshotBranch(parentID string, cursor string, limit int) (Snaps
 	}
 	s.mu.RLock()
 
-	cutoff := time.Now().Add(-defaultProjectionCutoff)
+	cutoffVersion, cutoffDuration := projectionCutoff()
+	cutoff := time.Now().Add(-cutoffDuration)
 	allChildren := s.children[parentID]
 
 	// Find the starting position from the cursor.
@@ -682,6 +708,8 @@ func (s *Store) SnapshotBranch(parentID string, cursor string, limit int) (Snaps
 		Projected:          true,
 		Cause:              "lazy-expand",
 		Stubs:              stubs,
+		CutoffVersion:      cutoffVersion,
+		CutoffMs:           uint64(cutoffDuration.Milliseconds()),
 		Messages:           map[string][]MessageWithParts{},
 		MessageWindows:     map[string]WindowMeta{},
 		Todos:              map[string]json.RawMessage{},

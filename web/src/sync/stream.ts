@@ -151,6 +151,7 @@ export function resetPageInFlight(sid?: string) {
 // to isolate structuralRevision guard tests from prior test state.
 export function resetTreeStreamStateForTesting() {
   lastAppliedStructuralRevision = undefined;
+  lastCutoffVersion = undefined;
 }
 
 // fetchMessagePage — GET /vh/session/{sid}/messages?before=<id>&z=1. Mirrors
@@ -495,6 +496,7 @@ export function applySnapshot(snap: Snapshot) {
   const incomingEpoch = snap.epoch || "";
   if (epochChanged(state.epoch, incomingEpoch)) {
     lastAppliedStructuralRevision = undefined;
+    lastCutoffVersion = undefined;
   } else if (
     snap.structuralRevision !== undefined &&
     lastAppliedStructuralRevision !== undefined
@@ -513,6 +515,12 @@ export function applySnapshot(snap: Snapshot) {
     applyProjectedSnapshot(snap);
     if (snap.structuralRevision !== undefined)
       lastAppliedStructuralRevision = snap.structuralRevision;
+    // Phase 6 Gate E: record the projection cutoff version so a policy change
+    // is detectable. No cache invalidation needed — the merge path handles
+    // cutoff-driven boundary changes naturally (sessions materialized under
+    // the new cutoff are upserted; demoted sessions become stubs).
+    if (snap.cutoffVersion !== undefined)
+      lastCutoffVersion = snap.cutoffVersion;
     return;
   }
   const changed = epochChanged(state.epoch, incomingEpoch);
@@ -1228,6 +1236,13 @@ let treeGen = 0;
 // (>). Reset to undefined on epoch change (a new epoch starts fresh). When
 // either side is undefined (old server or fresh client), always apply.
 let lastAppliedStructuralRevision: number | undefined = undefined;
+// Phase 6 Gate E: last-seen projection cutoff version. When the server changes
+// its cutoff policy (bumps cutoffVersion), the client records the new version
+// and the new cutoffMs. This is diagnostic-only for now (no client-side cache
+// to invalidate — lazy-expand always re-fetches fresh; the merge path handles
+// cutoff-driven boundary changes naturally). Reset on epoch change / fresh
+// connect. Undefined = never seen a projected snapshot with cutoff info.
+let lastCutoffVersion: number | undefined = undefined;
 // In-flight gzip64 snapshot decode for the CURRENT tree connection. A warm
 // tree snapshot ships compressed (server maybeCompressSnapshot when z=1); the
 // decode is ASYNC (native DecompressionStream). applySnapshot
@@ -1393,7 +1408,10 @@ export function connect(fresh = false) {
   // means the next snapshot comes from a potentially different Store whose
   // structuralRevision counter is independent. Reset so the guard always
   // applies the incoming snapshot instead of comparing across Stores.
-  if (fresh) lastAppliedStructuralRevision = undefined;
+  if (fresh) {
+    lastAppliedStructuralRevision = undefined;
+    lastCutoffVersion = undefined;
+  }
   // Reset the in-flight decode gate so a live tree event landing on the new
   // connection doesn't await a stale decode from the prior connection.
   treeSnapshotDecode = Promise.resolve();

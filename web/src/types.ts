@@ -101,10 +101,18 @@ export interface Snapshot {
   // server → client treats absent as "always apply".
   structuralRevision?: number;
   // Stubs (Phase 4): collapsed-branch stubs for idle subtrees. Each stub
-  // represents a subtree that exists on the server but is NOT materialized as
-  // a full session — the client renders it as a collapsed row. Absent in
+  // represents a subtree that exists on the server but is NOT materialized
+  // as a full session — the client renders it as a collapsed row. Absent in
   // AUTHORITY_COMPLETE snapshots.
   stubs?: CollapsedBranchStub[];
+  // CutoffVersion + CutoffMs (Phase 6 Gate E): the projection cutoff that was
+  // active when this projected snapshot was constructed. CutoffVersion is a
+  // monotonic policy version — it bumps when the server changes the cutoff.
+  // CutoffMs is the cutoff duration in milliseconds (default 600000 = 10min).
+  // The client tracks lastCutoffVersion to detect a boundary change. Absent
+  // in AUTHORITY_COMPLETE snapshots.
+  cutoffVersion?: number;
+  cutoffMs?: number;
 }
 
 // CollapsedBranchStub (Phase 4) is the wire representation of a collapsed idle
