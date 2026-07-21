@@ -203,6 +203,10 @@ func (s *Store) notePendingInputChangeLocked(id string) {
 	delta := want - prev
 	s.subtreePendingInput[id] += delta
 	s.adjustAncestorChainSumLocked(se.parentID, delta, s.subtreePendingInput)
+	// Phase 3 (Gate B): a session entering/exiting the pending-input closure
+	// changes the projection boundary — bump the structural revision so the
+	// client's stale-response guard and idempotent-skip logic fire correctly.
+	s.bumpStructuralRevisionLocked()
 }
 
 // maintainSubtreePendingInputOnSessionUpsertLocked maintains subtreePendingInput

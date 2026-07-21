@@ -2,7 +2,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { reconcile } from "solid-js/store";
 import { gzipSync } from "node:zlib";
-import { applySnapshot, applySessionEvent, applySessionSnapshot, applyMessageEvent, decodeMessagesBatch } from "../../src/sync/stream";
+import { applySnapshot, applySessionEvent, applySessionSnapshot, applyMessageEvent, decodeMessagesBatch, resetTreeStreamStateForTesting } from "../../src/sync/stream";
 import { state, setState } from "../../src/sync/store";
 import { sessionLastAgent } from "../../src/sync/selectors";
 import type { Snapshot } from "../../src/types";
@@ -33,6 +33,7 @@ beforeEach(() => {
   setState("epoch", "");
   setState("epochChanged", false);
   setState("cursor", 0);
+  resetTreeStreamStateForTesting();
 });
 
 describe("applySnapshot — B2a resync-window lastAgents gating", () => {
@@ -619,5 +620,97 @@ describe("applySnapshot — Phase 2 Gate A projected merge path", () => {
     expect(state.sessions.s2).toBeDefined(); // hidden, not deleted
     expect(state.messagesLoaded.s2).toBe(true); // transcript delivery flag intact
     expect(state.messages.s2).toBeDefined(); // transcript data intact
+  });
+});
+
+// Phase 3 Gate B — structuralRevision monotonicity guard. The client tracks
+// lastAppliedStructuralRevision: < → discard stale, == → idempotent skip,
+// > → apply. Reset on epoch change. Undefined (old server / fresh client) →
+// always apply. These tests exercise the AUTHORITY_COMPLETE path (projected
+// absent) since structuralRevision is stamped on BOTH paths.
+describe("applySnapshot — Phase 3 structuralRevision guard", () => {
+  const EPOCH = "struct-rev-test-epoch";
+
+  // Helper: build a minimal complete snapshot with the given revision + sessions.
+  function snap(rev: number | undefined, sessions: { id: string }[], seq = 1): Snapshot {
+    return {
+      seq,
+      epoch: EPOCH,
+      sessions,
+      structuralRevision: rev,
+    };
+  }
+
+  it("applies when revision is undefined (old server / fresh client)", () => {
+    setState("epoch", EPOCH);
+    applySnapshot(snap(undefined, [{ id: "a" }, { id: "b" }]));
+    expect(state.sessions.a).toBeDefined();
+    expect(state.sessions.b).toBeDefined();
+  });
+
+  it("applies when revision > lastApplied (> newer)", () => {
+    setState("epoch", EPOCH);
+    applySnapshot(snap(1, [{ id: "a" }]));
+    applySnapshot(snap(2, [{ id: "a" }, { id: "b" }]));
+    expect(state.sessions.a).toBeDefined();
+    expect(state.sessions.b).toBeDefined();
+  });
+
+  it("skips when revision === lastApplied (== idempotent)", () => {
+    setState("epoch", EPOCH);
+    applySnapshot(snap(1, [{ id: "a" }]));
+    // Apply a second snapshot with same revision but different sessions.
+    // The guard should skip it (idempotent) — state unchanged.
+    applySnapshot(snap(1, [{ id: "a" }, { id: "b" }]));
+    expect(state.sessions.a).toBeDefined();
+    expect(state.sessions.b).toBeUndefined(); // NOT applied — idempotent skip
+  });
+
+  it("discards when revision < lastApplied (< stale)", () => {
+    setState("epoch", EPOCH);
+    applySnapshot(snap(5, [{ id: "a" }]));
+    // A stale response with a lower revision must be discarded.
+    applySnapshot(snap(3, [{ id: "a" }, { id: "b" }]));
+    expect(state.sessions.a).toBeDefined();
+    expect(state.sessions.b).toBeUndefined(); // NOT applied — stale discard
+  });
+
+  it("resets on epoch change (new epoch → always apply)", () => {
+    setState("epoch", EPOCH);
+    applySnapshot(snap(10, [{ id: "a" }]));
+    // Epoch change → lastAppliedStructuralRevision resets → always apply,
+    // even if the incoming revision is lower.
+    applySnapshot({
+      seq: 2,
+      epoch: "new-epoch",
+      sessions: [{ id: "a" }, { id: "c" }],
+      structuralRevision: 1, // lower than 10, but epoch changed → apply
+    });
+    expect(state.sessions.a).toBeDefined();
+    expect(state.sessions.c).toBeDefined(); // applied despite lower revision
+  });
+
+  it("guards projected snapshots too (projected path records revision)", () => {
+    setState("epoch", EPOCH);
+    // First: seed with a complete snapshot at revision 1.
+    applySnapshot(snap(1, [{ id: "a" }]));
+    // Second: a projected snapshot at revision 1 (==) — should be skipped.
+    applySnapshot({
+      seq: 2,
+      epoch: EPOCH,
+      sessions: [{ id: "a" }, { id: "b" }],
+      projected: true,
+      structuralRevision: 1, // same → idempotent skip
+    });
+    expect(state.sessions.b).toBeUndefined(); // NOT applied
+    // Third: a projected snapshot at revision 2 (>) — should be applied.
+    applySnapshot({
+      seq: 3,
+      epoch: EPOCH,
+      sessions: [{ id: "a" }, { id: "c" }],
+      projected: true,
+      structuralRevision: 2, // newer → apply
+    });
+    expect(state.sessions.c).toBeDefined(); // applied
   });
 });

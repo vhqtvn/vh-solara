@@ -94,6 +94,12 @@ export interface Snapshot {
   // "initial" | "reconnect" | "promotion" | "lazy-expand" | "resync".
   // Absent in AUTHORITY_COMPLETE.
   cause?: string;
+  // StructuralRevision: Store-wide monotonic per-epoch counter (Phase 3 Gate B).
+  // Stamped in every snapshot (projected and complete). The client tracks
+  // lastAppliedStructuralRevision: < → discard stale, == → idempotent skip,
+  // > → apply. Undefined (omitempty) on a fresh store or absent from an old
+  // server → client treats absent as "always apply".
+  structuralRevision?: number;
 }
 
 // Tier-A "current verb" facet: the RAW tool part primitive the daemon emits so

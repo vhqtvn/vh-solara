@@ -196,6 +196,13 @@ type Snapshot struct {
 	//   "resync"      — epoch-change forced re-snapshot
 	// Absent in AUTHORITY_COMPLETE. Populated by the projection path (Phase 4+).
 	Cause string `json:"cause,omitempty"`
+	// StructuralRevision (Phase 3 Gate B) is the Store-wide monotonic per-epoch
+	// counter stamped in every snapshot envelope. The client tracks
+	// lastAppliedStructuralRevision: < → discard stale, == → idempotent skip,
+	// > → apply. Absent (omitempty) when 0 = fresh store with no mutations — the
+	// client treats an absent field as "always apply" (also protects against old
+	// servers that don't stamp it). See Store.structuralRevision.
+	StructuralRevision uint64 `json:"structuralRevision,omitempty"`
 }
 
 // GateFacts is the denormalized "is this session safe to act on" summary for one
@@ -974,6 +981,19 @@ type Store struct {
 	// per-session (ABA-vulnerable). Zero is never handed out: the first bump
 	// yields 1, so 0 remains a safe "never mutated" sentinel.
 	nextMsgRev uint64
+	// structuralRevision is the Store-wide monotonic per-epoch counter for the
+	// collapsed-frontier projection (Phase 3, Gate B). It is bumped under s.mu
+	// on every projection-affecting mutation (session create/delete/reparent,
+	// activity change, permission/question asked/replied). Stamped in every
+	// Snapshot envelope so the client can discard stale responses (<), skip
+	// idempotent re-applies (==), and apply fresh state (>). Modeled EXACTLY on
+	// nextMsgRev: Store-wide (not per-session), zero is never handed out via bump
+	// (first bump yields 1), and 0 = "fresh store, no mutations" — emitted via
+	// omitempty so the client treats an absent field as "old server, always
+	// apply". Not reset within a single Store lifetime (epoch is per-process:
+	// newEpoch at New, never reassigned), so the counter is monotonic per-epoch
+	// by construction; a new Store (new process/epoch) starts fresh at 0.
+	structuralRevision uint64
 	// coldFetchActive marks sessions whose background full-history GET
 	// (EnsureMessagesAsync) is in flight. Live events that arrive while this
 	// flag is set tag their entries (liveTouchedBody / liveTouchedParts) so
@@ -1077,6 +1097,17 @@ func New(ringCapacity int) *Store {
 func (s *Store) bumpMsgRev(sid string) {
 	s.nextMsgRev++
 	s.msgRev[sid] = s.nextMsgRev
+}
+
+// bumpStructuralRevisionLocked advances the Store-wide structural revision
+// counter for the collapsed-frontier projection (Phase 3 Gate B). Caller must
+// hold s.mu. Exactly one bump per projection-affecting mutation — the client
+// uses the stamped value to discard stale snapshot responses (<), skip
+// idempotent re-applies (==), and apply fresh state (>). Zero is never handed
+// out: the first bump yields 1, so 0 remains a safe "fresh store, never
+// mutated" sentinel (omitted from JSON via omitempty).
+func (s *Store) bumpStructuralRevisionLocked() {
+	s.structuralRevision++
 }
 
 // emit stamps, records, and fans out a client event. Caller must hold s.mu.
@@ -1258,6 +1289,9 @@ func (s *Store) setActivityLocked(sessionID, st string) {
 	s.maintainSubtreeRetryOnActivityLocked(sessionID, prev, st)
 	s.touchActivityTimeLocked(sessionID, now)
 	s.touchRecentBucketLocked(sessionID, now)
+	// Phase 3 (Gate B): every real activity transition (including busy-neutral
+	// busy↔retry, error→idle) is a projection-affecting structural change.
+	s.bumpStructuralRevisionLocked()
 
 	// Track the root subtree's busy count to detect "finished" (busy -> idle).
 	wasBusy := prev == ActivityBusy || prev == ActivityRetry
@@ -1728,6 +1762,9 @@ func (s *Store) upsertSessionLocked(props json.RawMessage) {
 	s.maintainSubtreePendingInputOnSessionUpsertLocked(env.ID, prev, env.ParentID)
 	s.maintainSubtreeDescendantOnSessionUpsertLocked(env.ID, prev, env.ParentID)
 	s.maintainNewestActivityOnSessionUpsertLocked(env.ID, prev, env.ParentID)
+	// Phase 3 (Gate B): session create / reparent is a projection-affecting
+	// structural change (tree topology or a session's info bytes changed).
+	s.bumpStructuralRevisionLocked()
 	// A session.updated replaces the entry, so repopulate the denormalized
 	// last-assistant summary from the (persisted) message view.
 	s.recomputeLastAssistantLocked(env.ID)
@@ -1754,6 +1791,9 @@ func (s *Store) deleteSessionLocked(id string) {
 	if se := s.sessions[id]; se != nil {
 		s.maintainIndexesOnDeleteLocked(id, se)
 	}
+	// Phase 3 (Gate B): session deletion is a projection-affecting structural
+	// change (the tree loses a node; descendants may be orphaned to roots).
+	s.bumpStructuralRevisionLocked()
 	delete(s.sessions, id)
 	delete(s.messages, id)
 	delete(s.msgLoaded, id)
@@ -2828,6 +2868,9 @@ func (s *Store) Snapshot(messagesFor map[string]bool) Snapshot {
 
 	epoch := s.epoch
 	seq := s.seq
+	// Phase 3 (Gate B): capture the structural revision under the read lock so
+	// the stamped value is consistent with the captured state.
+	structuralRevision := s.structuralRevision
 	// subtreeBusy is a self-contained map[string]bool from computeSubtreeBusyLocked
 	// (it allocates its own maps internally and returns a fresh one); safe to keep
 	// whole and read post-RUnlock. The walk is ALWAYS global even when scoped: a
@@ -2989,18 +3032,19 @@ func (s *Store) Snapshot(messagesFor map[string]bool) Snapshot {
 	}
 
 	snap := Snapshot{
-		Epoch:          epoch,
-		Seq:            seq,
-		Messages:       map[string][]MessageWithParts{},
-		MessageWindows: map[string]WindowMeta{},
-		Todos:          map[string]json.RawMessage{},
-		Permissions:    map[string][]json.RawMessage{},
-		Questions:      map[string][]json.RawMessage{},
-		Statuses:       map[string]json.RawMessage{},
-		Activity:       map[string]string{},
-		Gate:           map[string]GateFacts{},
-		LastAgents:     map[string]string{},
-		CurrentVerbs:   map[string]VerbFacet{},
+		Epoch:              epoch,
+		Seq:                seq,
+		StructuralRevision: structuralRevision,
+		Messages:           map[string][]MessageWithParts{},
+		MessageWindows:     map[string]WindowMeta{},
+		Todos:              map[string]json.RawMessage{},
+		Permissions:        map[string][]json.RawMessage{},
+		Questions:          map[string][]json.RawMessage{},
+		Statuses:           map[string]json.RawMessage{},
+		Activity:           map[string]string{},
+		Gate:               map[string]GateFacts{},
+		LastAgents:         map[string]string{},
+		CurrentVerbs:       map[string]VerbFacet{},
 	}
 
 	// Per-session gate facts + facets. Iterating the captured `sessions` map
@@ -3455,6 +3499,9 @@ func (s *Store) Hydrate(sessions []json.RawMessage, messages map[string][]Messag
 			s.maintainSubtreePendingInputOnSessionUpsertLocked(env.ID, old, env.ParentID)
 			s.maintainSubtreeDescendantOnSessionUpsertLocked(env.ID, old, env.ParentID)
 			s.maintainNewestActivityOnSessionUpsertLocked(env.ID, old, env.ParentID)
+			// Phase 3 (Gate B): hydrate create/reparent is a projection-affecting
+			// structural change.
+			s.bumpStructuralRevisionLocked()
 			s.emit(KindSessionUpsert, info)
 		}
 	}

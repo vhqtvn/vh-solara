@@ -146,6 +146,13 @@ export function resetPageInFlight(sid?: string) {
   else pageInFlight.clear();
 }
 
+// resetTreeStreamStateForTesting resets module-level tree-stream state that
+// persists across applySnapshot calls. Used by unit tests (applySnapshot.test.ts)
+// to isolate structuralRevision guard tests from prior test state.
+export function resetTreeStreamStateForTesting() {
+  lastAppliedStructuralRevision = undefined;
+}
+
 // fetchMessagePage — GET /vh/session/{sid}/messages?before=<id>&z=1. Mirrors
 // fetchSessionMessages but hits the Phase-2 historical-page endpoint (NOT the
 // bounded /vh/snapshot — that path returns only the recent tail after Phase 1).
@@ -481,6 +488,20 @@ function evictIfOverCap(s: any, sid: string): boolean {
 // the singleton store, so the tests drive it directly and assert on `state`.
 export function applySnapshot(snap: Snapshot) {
   bumpUpdating();
+  // Phase 3 Gate B: structuralRevision monotonicity guard. Discard stale (<),
+  // skip idempotent (==), apply (>). Reset on epoch change (new epoch starts
+  // fresh at revision 0). When either revision is undefined (old server omits
+  // the field, or this is the first snapshot for a fresh client), always apply.
+  const incomingEpoch = snap.epoch || "";
+  if (epochChanged(state.epoch, incomingEpoch)) {
+    lastAppliedStructuralRevision = undefined;
+  } else if (
+    snap.structuralRevision !== undefined &&
+    lastAppliedStructuralRevision !== undefined
+  ) {
+    if (snap.structuralRevision < lastAppliedStructuralRevision) return;
+    if (snap.structuralRevision === lastAppliedStructuralRevision) return;
+  }
   // Phase 2 Gate A: projected snapshots use MERGE semantics — sessions absent
   // from the array are PRESERVED as hidden, NOT deleted. Only an explicit
   // session.delete event removes a session. AUTHORITY_COMPLETE (projected
@@ -490,9 +511,10 @@ export function applySnapshot(snap: Snapshot) {
   // new client falls back to wholesale-replace transparently.
   if (snap.projected) {
     applyProjectedSnapshot(snap);
+    if (snap.structuralRevision !== undefined)
+      lastAppliedStructuralRevision = snap.structuralRevision;
     return;
   }
-  const incomingEpoch = snap.epoch || "";
   const changed = epochChanged(state.epoch, incomingEpoch);
   // B2a resync window: mergeLastAgents is ONLY correct while the server is
   // re-aggregating after a restart. Outside that window a complete AUTHORITATIVE
@@ -558,6 +580,9 @@ export function applySnapshot(snap: Snapshot) {
   // Wholesale session-set replacement invalidates the parent→children index.
   invalidateChildrenIndex();
   persist();
+  // Phase 3 Gate B: record the applied revision (complete path).
+  if (snap.structuralRevision !== undefined)
+    lastAppliedStructuralRevision = snap.structuralRevision;
 }
 
 // applyProjectedSnapshot — Phase 2 Gate A merge path. When `snap.projected` is
@@ -1182,6 +1207,11 @@ let treeSnapDone = false;
 // and again after the await. Without this, a stale decode from a superseded
 // connection would clobber the replacement's fresh state with a stale snapshot.
 let treeGen = 0;
+// Phase 3 Gate B: last-applied structural revision. Used to discard stale
+// snapshot responses (<), skip idempotent re-applies (==), and apply newer
+// (>). Reset to undefined on epoch change (a new epoch starts fresh). When
+// either side is undefined (old server or fresh client), always apply.
+let lastAppliedStructuralRevision: number | undefined = undefined;
 // In-flight gzip64 snapshot decode for the CURRENT tree connection. A warm
 // tree snapshot ships compressed (server maybeCompressSnapshot when z=1); the
 // decode is ASYNC (native DecompressionStream). applySnapshot
@@ -1343,6 +1373,11 @@ export function connect(fresh = false) {
   // ses?.close()); the prior Stream-1 order (close THEN bump) left a stale-
   // decode hazard on the empty-dir path.
   treeGen++;
+  // Phase 3 Gate B: a fresh connect (project switch or explicit tree refresh)
+  // means the next snapshot comes from a potentially different Store whose
+  // structuralRevision counter is independent. Reset so the guard always
+  // applies the incoming snapshot instead of comparing across Stores.
+  if (fresh) lastAppliedStructuralRevision = undefined;
   // Reset the in-flight decode gate so a live tree event landing on the new
   // connection doesn't await a stale decode from the prior connection.
   treeSnapshotDecode = Promise.resolve();
