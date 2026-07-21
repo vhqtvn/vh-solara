@@ -870,6 +870,49 @@ type Store struct {
 	// sessionIDs do NOT create entries, matching computeSubtreeBusyLocked's
 	// iteration over s.sessions. Guarded by s.mu (same as busyCount).
 	subtreeBusyCount map[string]int
+	// Phase 1 (Gate C extension): the remaining 7 incremental subtree indexes
+	// the collapsed-frontier projection (O1) reads to build roots + active
+	// closure + frontier stubs in O(|roots|+|closure|×depth+|frontier|) instead
+	// of O(n). ADDITIVE in Phase 1: the snapshot path
+	// (computeSubtreeBusyLocked / Snapshot / SendableNow / busyCount[root]) is
+	// UNCHANGED — these indexes coexist with the prototype and are proven
+	// equivalent to an independent O(n) recompute by TestSubtreeIndexesProperty.
+	// See subtree_indexes.go for the per-index invariants + maintenance sites.
+	//
+	// Topology: children[parentID] = ordered live direct-child ids; children[""]
+	// is kept in sync with rootIDs (both list the live roots). rootIDs is the
+	// ordered list of live roots (orphan-inclusive: a child whose parentID
+	// points at a deleted id is effectively a root, per effectiveParentOfLocked
+	// / rootOfLocked). subtreeDescendantCount[id] = number of live nodes in
+	// id's subtree including id itself (stub wire field "descendantCount").
+	// subtreeRetryCount / subtreePendingInput[id] = the count of retry /
+	// pending-input sessions in id's subtree incl id (sum-class aggregates, same
+	// shape as subtreeBusyCount; pendingInputSelf is the per-session 0/1 shadow
+	// so notePendingInputChangeLocked can resolve a delta without re-deriving
+	// the prior self from the already-mutated perms/questions maps).
+	children               map[string][]string // parentID→ordered child ids; ""=roots (in sync with rootIDs)
+	rootIDs                []string            // ordered live roots (orphans included)
+	subtreeRetryCount      map[string]int
+	subtreePendingInput    map[string]int
+	pendingInputSelf       map[string]int // per-session own (0/1); delta-resolution shadow for subtreePendingInput
+	subtreeDescendantCount map[string]int // live nodes in subtree incl self
+	// MAX class — subtreeNewestActivity. lastActivityAt[id] = id's own last
+	// real activity time (zero = never; bumped ONLY in setActivityLocked on a
+	// real transition, NOT on create — a newly-created session has zero activity
+	// time and collapses as a frontier stub until its first activity change).
+	// subtreeNewestActivity[id] = MAX(lastActivityAt[id], MAX over live children
+	// of subtreeNewestActivity[child]). Zero when no node in the subtree has
+	// ever recorded activity. Drives the projection's "recent" cutoff window.
+	lastActivityAt        map[string]time.Time
+	subtreeNewestActivity map[string]time.Time
+	// BUCKET class — recentBucket. A session lives in at most ONE minute bucket
+	// (Unix/60) — the one for its last-activity minute. recentBucketKeys is the
+	// sorted ascending list of bucket minutes, so the projection's cutoff
+	// window walk is O(buckets-in-window). recentBucketRetentionMinutes bounds
+	// the number of buckets retained (memory-bounded; generous vs the default
+	// 10-min projection cutoff in Phase 6).
+	recentBucket     map[int64][]string // unix-minute → session ids
+	recentBucketKeys []int64            // sorted ascending bucket minutes
 	// msgLoaded marks sessions whose message history has been fetched. Messages
 	// are hydrated lazily (on first open) so startup doesn't fetch every
 	// session's history — critical with thousands of sessions.
@@ -974,12 +1017,23 @@ func New(ringCapacity int) *Store {
 		unread:           map[string]bool{},
 		busyCount:        map[string]int{},
 		subtreeBusyCount: map[string]int{},
-		msgLoaded:        map[string]bool{},
-		msgRev:           map[string]uint64{},
-		coldFetchActive:  map[string]bool{},
-		seeded:           map[string]bool{},
-		ring:             newRingBuffer(ringCapacity),
-		subs:             map[int]*subscriber{},
+		// Phase 1 (Gate C extension): the remaining 7 incremental subtree
+		// indexes. Maps are non-nil; rootIDs / recentBucketKeys start nil and
+		// are grown by rootsAppendLocked / insertRecentBucketKeyLocked.
+		children:               map[string][]string{},
+		subtreeRetryCount:      map[string]int{},
+		subtreePendingInput:    map[string]int{},
+		pendingInputSelf:       map[string]int{},
+		subtreeDescendantCount: map[string]int{},
+		lastActivityAt:         map[string]time.Time{},
+		subtreeNewestActivity:  map[string]time.Time{},
+		recentBucket:           map[int64][]string{},
+		msgLoaded:              map[string]bool{},
+		msgRev:                 map[string]uint64{},
+		coldFetchActive:        map[string]bool{},
+		seeded:                 map[string]bool{},
+		ring:                   newRingBuffer(ringCapacity),
+		subs:                   map[int]*subscriber{},
 		// Finding 4: SourceOpencodeLive is the iota zero value. Without an
 		// explicit init here, ordinary daemon-originated emissions (messages
 		// .loaded/error, activity, etc.) would be misattributed as
@@ -1171,6 +1225,19 @@ func (s *Store) setActivityLocked(sessionID, st string) {
 	if st != ActivityBusy && st != ActivityRetry {
 		s.setCurrentVerbLocked(sessionID, VerbFacet{})
 	}
+
+	// Phase 1 (Gate C extension): maintain the 7 remaining incremental subtree
+	// indexes at every REAL activity transition. retry-count, activity-time,
+	// and the recent bucket must update on busy-neutral transitions too
+	// (busy↔retry, error→idle), so this block runs BEFORE the wasBusy==isBusy
+	// early-return below. Each helper is phantom-guarded (no-op when sessionID
+	// is not yet in the live tree — the contribution is seeded on create via
+	// the upsert maintainers). now is captured once so the activity time and
+	// the bucket minute agree.
+	now := time.Now()
+	s.maintainSubtreeRetryOnActivityLocked(sessionID, prev, st)
+	s.touchActivityTimeLocked(sessionID, now)
+	s.touchRecentBucketLocked(sessionID, now)
 
 	// Track the root subtree's busy count to detect "finished" (busy -> idle).
 	wasBusy := prev == ActivityBusy || prev == ActivityRetry
@@ -1525,6 +1592,10 @@ func (s *Store) Apply(ev opencode.Event) {
 				s.perms[p.SessionID] = map[string]json.RawMessage{}
 			}
 			s.perms[p.SessionID][p.ID] = ev.Properties
+			// Phase 1 (Gate C extension): pending-input chokepoint. Phantom-
+			// guarded (no-op when SessionID is not yet live; the contribution
+			// is seeded on create via maintainSubtreePendingInputOnSessionUpsertLocked).
+			s.notePendingInputChangeLocked(p.SessionID)
 			s.emit(KindPermissionSet, ev.Properties)
 		}
 	case "permission.replied":
@@ -1544,6 +1615,8 @@ func (s *Store) Apply(ev opencode.Event) {
 			if m := s.perms[p.SessionID]; m != nil {
 				delete(m, id)
 			}
+			// Phase 1 (Gate C extension): pending-input chokepoint.
+			s.notePendingInputChangeLocked(p.SessionID)
 			s.emit(KindPermissionClear, rawObj(map[string]interface{}{
 				"sessionID": p.SessionID, "permissionID": id,
 			}))
@@ -1558,6 +1631,8 @@ func (s *Store) Apply(ev opencode.Event) {
 				s.questions[p.SessionID] = map[string]json.RawMessage{}
 			}
 			s.questions[p.SessionID][p.ID] = ev.Properties
+			// Phase 1 (Gate C extension): pending-input chokepoint.
+			s.notePendingInputChangeLocked(p.SessionID)
 			s.emit(KindQuestionSet, ev.Properties)
 		}
 	case "question.replied", "question.rejected":
@@ -1569,6 +1644,8 @@ func (s *Store) Apply(ev opencode.Event) {
 			if m := s.questions[p.SessionID]; m != nil {
 				delete(m, p.RequestID)
 			}
+			// Phase 1 (Gate C extension): pending-input chokepoint.
+			s.notePendingInputChangeLocked(p.SessionID)
 			s.emit(KindQuestionClear, rawObj(map[string]interface{}{
 				"sessionID": p.SessionID, "questionID": p.RequestID,
 			}))
@@ -1618,6 +1695,19 @@ func (s *Store) upsertSessionLocked(props json.RawMessage) {
 	// emit so a concurrent Snapshot reader (under RLock) never observes a
 	// half-updated index. See maintainSubtreeBusyOnSessionUpsertLocked.
 	s.maintainSubtreeBusyOnSessionUpsertLocked(env.ID, prev, env.ParentID)
+	// Phase 1 (Gate C extension): maintain the 7 remaining indexes. ORDER
+	// MATTERS: topology (children) first so the newest-activity local-max
+	// recompute reads a consistent children[id]; sums (retry / pendingInput /
+	// descendant) in any order (each scans s.sessions independently for the
+	// fresh-create orphan reabsorption, matching the prototype); newestActivity
+	// last (reads s.children[id]). All no-ops on the same-effective-parent
+	// fast path; all under s.mu, before the emit so a concurrent Snapshot
+	// reader never observes a half-updated index.
+	s.maintainChildrenOnSessionUpsertLocked(env.ID, prev, env.ParentID)
+	s.maintainSubtreeRetryOnSessionUpsertLocked(env.ID, prev, env.ParentID)
+	s.maintainSubtreePendingInputOnSessionUpsertLocked(env.ID, prev, env.ParentID)
+	s.maintainSubtreeDescendantOnSessionUpsertLocked(env.ID, prev, env.ParentID)
+	s.maintainNewestActivityOnSessionUpsertLocked(env.ID, prev, env.ParentID)
 	// A session.updated replaces the entry, so repopulate the denormalized
 	// last-assistant summary from the (persisted) message view.
 	s.recomputeLastAssistantLocked(env.ID)
@@ -1635,6 +1725,14 @@ func (s *Store) deleteSessionLocked(id string) {
 		if se := s.sessions[id]; se != nil {
 			s.adjustAncestorChainFromLocked(se.parentID, -sub)
 		}
+	}
+	// Phase 1 (Gate C extension): maintain the 7 remaining indexes. Same shape
+	// as the prototype busy-delete block above, but unified in one helper
+	// (sum-class propagation, topology orphaning + unlink, max-class chain
+	// recompute, bucket removal). Must run BEFORE the per-session delete(...)
+	// calls — we read se.parentID + the index entries to resolve subtrees.
+	if se := s.sessions[id]; se != nil {
+		s.maintainIndexesOnDeleteLocked(id, se)
 	}
 	delete(s.sessions, id)
 	delete(s.messages, id)
@@ -1654,6 +1752,14 @@ func (s *Store) deleteSessionLocked(id string) {
 	delete(s.unread, id)
 	delete(s.busyCount, id)
 	delete(s.subtreeBusyCount, id) // Gate C de-risk prototype index
+	// Phase 1 (Gate C extension): drop id's own entries from each new index.
+	delete(s.children, id) // direct-child list (already emptied by orphaning)
+	delete(s.subtreeRetryCount, id)
+	delete(s.subtreePendingInput, id)
+	delete(s.pendingInputSelf, id)
+	delete(s.subtreeDescendantCount, id)
+	delete(s.lastActivityAt, id)
+	delete(s.subtreeNewestActivity, id)
 	// Clear the automated-spawn permission-blocked fact on termination. This is
 	// the single session-removal chokepoint (live session.deleted, archive via
 	// time.archived, and hydrate prune all funnel here), so one delete covers
@@ -1729,12 +1835,16 @@ func (s *Store) SetPendingQuestions(requests []json.RawMessage) {
 			s.questions[e.SessionID] = map[string]json.RawMessage{}
 		}
 		s.questions[e.SessionID][e.ID] = raw
+		// Phase 1 (Gate C extension): pending-input chokepoint (per add).
+		s.notePendingInputChangeLocked(e.SessionID)
 		s.emit(KindQuestionSet, raw)
 	}
 	for sid, m := range s.questions {
 		for id := range m {
 			if !seen[sid+"\x00"+id] {
 				delete(m, id)
+				// Phase 1 (Gate C extension): pending-input chokepoint (per delete).
+				s.notePendingInputChangeLocked(sid)
 				s.emit(KindQuestionClear, rawObj(map[string]interface{}{"sessionID": sid, "questionID": id}))
 			}
 		}
@@ -1758,12 +1868,16 @@ func (s *Store) SetPendingPermissions(requests []json.RawMessage) {
 			s.perms[e.SessionID] = map[string]json.RawMessage{}
 		}
 		s.perms[e.SessionID][e.ID] = raw
+		// Phase 1 (Gate C extension): pending-input chokepoint (per add).
+		s.notePendingInputChangeLocked(e.SessionID)
 		s.emit(KindPermissionSet, raw)
 	}
 	for sid, m := range s.perms {
 		for id := range m {
 			if !seen[sid+"\x00"+id] {
 				delete(m, id)
+				// Phase 1 (Gate C extension): pending-input chokepoint (per delete).
+				s.notePendingInputChangeLocked(sid)
 				s.emit(KindPermissionClear, rawObj(map[string]interface{}{"sessionID": sid, "permissionID": id}))
 			}
 		}
@@ -3312,6 +3426,15 @@ func (s *Store) Hydrate(sessions []json.RawMessage, messages map[string][]Messag
 			// `old` is the prev entry (nil for a fresh create). Covers the same
 			// create / same-parent / reparent cases as upsertSessionLocked.
 			s.maintainSubtreeBusyOnSessionUpsertLocked(env.ID, old, env.ParentID)
+			// Phase 1 (Gate C extension): same 5 maintainers as
+			// upsertSessionLocked (Hydrate assigns s.sessions directly,
+			// bypassing upsertSessionLocked, so it must maintain every index).
+			// Order: topology → sums → newestActivity. See upsertSessionLocked.
+			s.maintainChildrenOnSessionUpsertLocked(env.ID, old, env.ParentID)
+			s.maintainSubtreeRetryOnSessionUpsertLocked(env.ID, old, env.ParentID)
+			s.maintainSubtreePendingInputOnSessionUpsertLocked(env.ID, old, env.ParentID)
+			s.maintainSubtreeDescendantOnSessionUpsertLocked(env.ID, old, env.ParentID)
+			s.maintainNewestActivityOnSessionUpsertLocked(env.ID, old, env.ParentID)
 			s.emit(KindSessionUpsert, info)
 		}
 	}
