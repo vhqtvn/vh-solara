@@ -11,6 +11,7 @@ import {
   projects,
   removeProject,
   selectProject,
+  withActiveProject,
 } from "../projects";
 import { dismiss, modal } from "../lib/a11y";
 import "./ProjectSwitcher.css";
@@ -47,10 +48,25 @@ export default function ProjectSwitcher() {
       });
   }
 
+  // The pinned list WITH the active project injected when it isn't pinned. The
+  // active project can be set (via a ?dir= deep link or LS_PROJECT persistence)
+  // without being pinned — switchProject never pins, only addProject does. The
+  // trigger (current()) and the dialog rows both derive from this so a unpinned
+  // active project is visible in its own switcher instead of silently dropping
+  // out (regression after the synthetic DEFAULT was removed). When projectDir()
+  // is empty (no-project state) this returns projects() unchanged.
+  const pinnedWithActive = createMemo(() => withActiveProject(projects(), projectDir()));
+  // The set of dirs that are ACTUALLY pinned (excludes the synthesized active
+  // entry). Used to gate row-affordances that only make sense for pinned rows
+  // (the Remove button — there is nothing to unpin for a synthesized row).
+  const pinnedDirs = createMemo(() => new Set(projects().map((p) => p.directory)));
+
   // The active project, or undefined when no project is selected (the daemon's
-  // cwd is not a meaningful project, so nothing is pinned by default). The
-  // trigger renders a "Select project" placeholder in that case.
-  const current = () => projects().find((p) => p.directory === projectDir());
+  // cwd is not a meaningful project, so nothing is pinned by default). Looks up
+  // in pinnedWithActive() so a unpinned active dir resolves to its synthesized
+  // entry (name = basename(dir)) and the trigger shows it. The trigger renders a
+  // "Select project" placeholder only when projectDir() is genuinely empty.
+  const current = () => pinnedWithActive().find((p) => p.directory === projectDir());
 
   // Inline remove-confirm state (Slice 3): clicking a pinned row's remove
   // button does NOT unpin immediately — instead that row enters a confirm
@@ -178,10 +194,13 @@ export default function ProjectSwitcher() {
   // Enriched + sorted rows (running-first, then case-insensitive name). The
   // active project uses live store counts (runningSessionCount() + rootSession
   // count); others use the endpoint activity data. Both counts are ROOT-ONLY
-  // (children/archived excluded), so idle = roots − running is meaningful.
+  // (children/archived excluded), so idle = roots − running is meaningful. The
+  // active project is injected into the list when it isn't pinned (see
+  // pinnedWithActive) so it shows up as a row marked active; its counts come
+  // from the live store like any active project would.
   const rows = createMemo(() =>
     mergeProjectActivity(
-      projects(),
+      pinnedWithActive(),
       activity() ?? { roots: new Map(), running: new Map() },
       projectDir(),
       runningSessionCount(),
@@ -286,15 +305,21 @@ export default function ProjectSwitcher() {
                         fallback={
                           <span class="proj-actions">
                             <CopyLinkButton directory={p.directory} name={p.name} />
-                            <button
-                              type="button"
-                              class="proj-remove"
-                              aria-label={`Remove ${p.name}`}
-                              data-tip="Remove from list"
-                              onClick={(e) => (e.stopPropagation(), startRemove(p.directory))}
-                            >
-                              <Icon name="x" size={13} />
-                            </button>
+                            {/* Remove is only meaningful for ACTUALLY pinned rows.
+                                A synthesized active-but-unpinned row has nothing
+                                to unpin (it isn't in the persisted list), so the
+                                affordance is hidden there. */}
+                            <Show when={pinnedDirs().has(p.directory)}>
+                              <button
+                                type="button"
+                                class="proj-remove"
+                                aria-label={`Remove ${p.name}`}
+                                data-tip="Remove from list"
+                                onClick={(e) => (e.stopPropagation(), startRemove(p.directory))}
+                              >
+                                <Icon name="x" size={13} />
+                              </button>
+                            </Show>
                           </span>
                         }
                       >

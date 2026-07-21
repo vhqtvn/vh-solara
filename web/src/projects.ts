@@ -28,9 +28,39 @@ function save() {
   saveVersioned(LS_PROJECTS, 1, projects().filter((p) => p.directory));
 }
 
-function basename(path: string): string {
+export function basename(path: string): string {
   const parts = path.replace(/\/+$/, "").split("/").filter(Boolean);
   return parts[parts.length - 1] || path;
+}
+
+// Inject the active project into the pinned list when it isn't already pinned.
+// The switcher trigger + dialog both derive from the pinned list, but the active
+// project can be set (via a ?dir= deep link or LS_PROJECT persistence) WITHOUT
+// being pinned — switchProject(dir) sets projectDir + persists to LS_PROJECT but
+// never pins; only addProject() pins. Without this injection, the trigger would
+// show "Select project" and the dialog would hide the active project from its
+// own switcher whenever the active dir isn't pinned (a regression introduced when
+// the synthetic DEFAULT project was removed: the old code fell back to
+// `|| projects()[0]`, which always resolved because the synthetic default sat at
+// index 0; removing it left current() undefined for unpinned active dirs).
+//
+// Returns `pinned` unchanged when activeDir is empty (the no-project state keeps
+// rendering "Select project" — no synthetic cwd bridge) or when activeDir is
+// already in pinned (no duplicate row). The synthesized entry's name is
+// basename(activeDir) (trailing slashes stripped for the NAME only), matching
+// how addProject / fetchRecentProjects name a project from its directory when no
+// explicit name is known. The DIRECTORY is preserved exactly as given so the
+// downstream `current()` lookup (`p.directory === projectDir()`) and
+// `mergeProjectActivity`'s active-marker (`p.directory === activeDir`) still
+// match — this helper does NOT normalize the dir (callers' normalize step, or
+// the absence of one, is honored as-is).
+//
+// Pure (no DOM, no signals) so it can be unit-tested in isolation, mirroring
+// mergeProjectActivity / filterProjectRows / buildProjectLink.
+export function withActiveProject(pinned: Project[], activeDir: string): Project[] {
+  if (!activeDir) return pinned;
+  if (pinned.some((p) => p.directory === activeDir)) return pinned;
+  return [...pinned, { directory: activeDir, name: basename(activeDir) }];
 }
 
 export function addProject(rawPath: string) {
