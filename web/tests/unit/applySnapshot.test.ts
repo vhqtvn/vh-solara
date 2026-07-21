@@ -25,6 +25,11 @@ beforeEach(() => {
   setState("messagesLoaded", reconcile({}));
   setState("messagesError", reconcile({})); // F5: was leaking across tests
   setState("refreshing", reconcile({}));
+  setState("activity", reconcile({}));
+  setState("permissions", reconcile({}));
+  setState("questions", reconcile({}));
+  setState("currentVerbs", reconcile({}));
+  setState("expandedBranches", reconcile({}));
   setState("epoch", "");
   setState("epochChanged", false);
   setState("cursor", 0);
@@ -414,5 +419,205 @@ describe("applyMessageEvent — lastAgent.set cold-seed live patch (tree chip)",
     // the live assistant turn's agent, NOT the stale/seeded value.
     expect(state.lastAgents.live).toBe("seeded");
     expect(sessionLastAgent("live")).toBe("real");
+  });
+});
+
+// Phase 2 Gate A — projected snapshot merge path. When snap.projected is true,
+// applySnapshot takes the MERGE branch: sessions absent from the array are
+// PRESERVED as hidden (NOT deleted). Only an explicit session.delete event
+// removes a session. This is the core contract of the collapsed-frontier
+// projection: the server ships only roots + active closure + frontier stubs,
+// and the client must not infer deletion from omission.
+//
+// Capability matrix (old↔new × query params):
+//   old client (no proj param) → new server: AUTHORITY_COMPLETE → wholesale-replace
+//   new client (proj=1)        → old server (ignores proj=1): AUTHORITY_COMPLETE (no `projected` field) → wholesale-replace
+//   new client (proj=1)        → new server (Phase 4+): projected:true → merge
+// Phase 2 server still emits AUTHORITY_COMPLETE regardless of proj=1; the merge
+// path is exercised here with synthetic projected snapshots.
+describe("applySnapshot — Phase 2 Gate A projected merge path", () => {
+  it("PRESERVES absent sessions when projected:true (hidden !== deleted)", () => {
+    // Seed two sessions via AUTHORITY_COMPLETE (the existing wholesale-replace path).
+    applySnapshot({
+      seq: 1,
+      epoch: "e1",
+      sessions: [{ id: "s1", title: "A" }, { id: "s2", title: "B" }],
+    });
+    expect(state.sessions.s1).toBeDefined();
+    expect(state.sessions.s2).toBeDefined();
+
+    // A PROJECTED snapshot carries ONLY s1 (s2 is collapsed behind a frontier
+    // stub on the server). s2 must be PRESERVED on the client.
+    applySnapshot({
+      seq: 2,
+      epoch: "e1",
+      projected: true,
+      sessions: [{ id: "s1", title: "A-updated" }],
+    });
+    expect(state.sessions.s1).toEqual({ id: "s1", title: "A-updated" }); // upserted
+    expect(state.sessions.s2).toBeDefined(); // PRESERVED — not deleted
+    expect((state.sessions.s2 as any).title).toBe("B"); // unchanged
+  });
+
+  it("DELETES absent sessions when projected is absent (AUTHORITY_COMPLETE regression guard)", () => {
+    // Seed two sessions.
+    applySnapshot({
+      seq: 1,
+      epoch: "e1",
+      sessions: [{ id: "s1" }, { id: "s2" }],
+    });
+    expect(state.sessions.s1).toBeDefined();
+    expect(state.sessions.s2).toBeDefined();
+
+    // AUTHORITY_COMPLETE (no projected field) with only s1 → s2 is DELETED.
+    applySnapshot({
+      seq: 2,
+      epoch: "e1",
+      sessions: [{ id: "s1" }],
+    });
+    expect(state.sessions.s1).toBeDefined();
+    expect(state.sessions.s2).toBeUndefined(); // DELETED — wholesale-replace
+  });
+
+  it("only session.delete removes a session in projected mode", () => {
+    // Seed via AUTHORITY_COMPLETE.
+    applySnapshot({
+      seq: 1,
+      epoch: "e1",
+      sessions: [{ id: "s1" }, { id: "s2" }],
+    });
+    // Projected snapshot omits s2 — it's preserved.
+    applySnapshot({
+      seq: 2,
+      epoch: "e1",
+      projected: true,
+      sessions: [{ id: "s1" }],
+    });
+    expect(state.sessions.s2).toBeDefined(); // still there
+    // An explicit session.delete event removes s2 — even in projected mode.
+    applySessionEvent("session.delete", 3, { id: "s2" });
+    expect(state.sessions.s2).toBeUndefined(); // now deleted
+    expect(state.sessions.s1).toBeDefined(); // untouched
+  });
+
+  it("merges activity (upsert incoming, preserve absent)", () => {
+    setState("activity", "s1", "busy");
+    setState("activity", "s2", "idle");
+    applySnapshot({
+      seq: 1,
+      epoch: "e1",
+      projected: true,
+      sessions: [{ id: "s1" }],
+      activity: { s1: "idle" }, // s1 changed busy→idle; s2 absent
+    });
+    expect(state.activity.s1).toBe("idle"); // updated
+    expect(state.activity.s2).toBe("idle"); // preserved (hidden, still idle)
+  });
+
+  it("merges lastAgents (incoming non-empty wins, absent preserved)", () => {
+    setState("lastAgents", "s1", "build");
+    setState("lastAgents", "s2", "plan");
+    applySnapshot({
+      seq: 1,
+      epoch: "e1",
+      projected: true,
+      sessions: [{ id: "s1" }],
+      lastAgents: { s1: "ship" }, // s1 updated; s2 absent
+    });
+    expect(state.lastAgents.s1).toBe("ship"); // updated
+    expect(state.lastAgents.s2).toBe("plan"); // preserved
+  });
+
+  it("replaces permissions per-session for included sessions, preserves absent", () => {
+    setState("permissions", "s1", { p1: { id: "p1" } as any });
+    setState("permissions", "s2", { p2: { id: "p2" } as any });
+    applySnapshot({
+      seq: 1,
+      epoch: "e1",
+      projected: true,
+      sessions: [{ id: "s1" }],
+      permissions: { s1: [{ id: "p3" }] }, // s1 perms replaced; s2 absent
+    });
+    expect(state.permissions.s1).toEqual({ p3: { id: "p3" } }); // replaced
+    expect(state.permissions.s2).toEqual({ p2: { id: "p2" } }); // preserved
+  });
+
+  it("clears expandedBranches on epoch change in projected mode", () => {
+    setState("epoch", "oldEpoch");
+    setState("expandedBranches", "branch1", true);
+    setState("expandedBranches", "branch2", true);
+    applySnapshot({
+      seq: 1,
+      epoch: "newEpoch", // epoch transition
+      projected: true,
+      sessions: [],
+    });
+    expect(state.epochChanged).toBe(true);
+    expect(state.epoch).toBe("newEpoch");
+    expect(Object.keys(state.expandedBranches)).toHaveLength(0); // cleared
+  });
+
+  it("preserves expandedBranches when epoch is stable in projected mode", () => {
+    setState("epoch", "stable");
+    setState("expandedBranches", "branch1", true);
+    applySnapshot({
+      seq: 1,
+      epoch: "stable", // no epoch change
+      projected: true,
+      sessions: [],
+    });
+    expect(state.expandedBranches.branch1).toBe(true); // preserved
+  });
+
+  it("advances cursor in projected mode", () => {
+    setState("cursor", 5);
+    applySnapshot({
+      seq: 10,
+      epoch: "e1",
+      projected: true,
+      sessions: [],
+    });
+    expect(state.cursor).toBe(10);
+  });
+
+  it("capability matrix: old server (no projected field) → wholesale-replace even with proj=1 on the wire", () => {
+    // Simulates a new client (sends proj=1) talking to an OLD server that
+    // ignores proj=1 and emits AUTHORITY_COMPLETE (no `projected` field).
+    // The client must fall back to wholesale-replace.
+    applySnapshot({
+      seq: 1,
+      epoch: "e1",
+      sessions: [{ id: "s1" }, { id: "s2" }],
+    });
+    // Old server sends a complete snapshot without `projected` — s2 absent → deleted.
+    applySnapshot({
+      seq: 2,
+      epoch: "e1",
+      sessions: [{ id: "s1" }], // no projected field
+    });
+    expect(state.sessions.s2).toBeUndefined(); // wholesale-replace deleted it
+  });
+
+  it("does NOT touch messages/messagesLoaded (transcript orthogonality — Gate F)", () => {
+    // Seed s2 as a session + its message stream (simulating an opened session
+    // with loaded msgs).
+    applySnapshot({
+      seq: 0,
+      epoch: "e1",
+      sessions: [{ id: "s1" }, { id: "s2" }],
+    });
+    setState("messages", "s2", { order: ["m1"], byId: { m1: { id: "m1" } } });
+    setState("messagesLoaded", "s2", true);
+    // A projected snapshot that omits s2 entirely.
+    applySnapshot({
+      seq: 1,
+      epoch: "e1",
+      projected: true,
+      sessions: [{ id: "s1" }],
+    });
+    // s2's session is preserved (hidden), and its TRANSCRIPT is also untouched.
+    expect(state.sessions.s2).toBeDefined(); // hidden, not deleted
+    expect(state.messagesLoaded.s2).toBe(true); // transcript delivery flag intact
+    expect(state.messages.s2).toBeDefined(); // transcript data intact
   });
 });

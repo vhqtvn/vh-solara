@@ -1460,6 +1460,21 @@ func wantsCompress(r *http.Request) bool {
 	return r.URL.Query().Get("z") == "1"
 }
 
+// wantsProject reports whether the client opted into projected (collapsed-
+// frontier) snapshot mode via the `proj=1` query flag. Mirrors wantsCompress:
+// EventSource cannot set custom request headers, so the opt-in is a query param.
+// An absent flag keeps the legacy AUTHORITY_COMPLETE wire shape — this protects
+// a stale cached PWA (old client) against a new server that would otherwise
+// emit a projected snapshot it cannot render. Combined with the `projected`
+// envelope field on the Snapshot itself, it also protects a new client against
+// an old server that ignores proj=1 (the client falls back to wholesale-replace
+// when `projected` is absent). Phase 2: the flag is acknowledged (read) but the
+// projection path is not yet built — the server still emits AUTHORITY_COMPLETE
+// regardless of this flag. Phase 4 wires the actual projection when proj=1.
+func wantsProject(r *http.Request) bool {
+	return r.URL.Query().Get("proj") == "1"
+}
+
 // maybeCompressSnapshot gzip64-wraps a marshaled snapshot payload when compress
 // is requested AND the payload is large enough to benefit. The envelope mirrors
 // the cold-load messages.batch convention exactly:

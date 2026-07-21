@@ -75,6 +75,37 @@ func TestWantsCompress(t *testing.T) {
 	}
 }
 
+// TestWantsProject pins the proj=1 query opt-in (Phase 2 Gate A). Mirrors
+// TestWantsCompress exactly: absent / proj=0 / garbage must stay false so an old
+// client that does not opt in gets the legacy AUTHORITY_COMPLETE wire shape.
+// Only the literal "1" opts in. Phase 2 does not wire the projection path yet;
+// this test pins the capability-detection helper that Phase 4 consumes.
+func TestWantsProject(t *testing.T) {
+	cases := map[string]bool{
+		"":     false,
+		"0":    false,
+		"1":    true,
+		"true": false, // only the literal "1" opts in
+		"2":    false,
+	}
+	for q, want := range cases {
+		r := mustReq("GET", "/vh/stream?sessions=a&proj="+q, nil)
+		if got := wantsProject(r); got != want {
+			t.Errorf("proj=%q: want %v, got %v", q, want, got)
+		}
+	}
+	// No proj param at all → false (protects a stale client).
+	r := mustReq("GET", "/vh/stream?sessions=a", nil)
+	if wantsProject(r) {
+		t.Error("absent proj param must NOT opt into projected mode")
+	}
+	// proj=1 rides alongside z=1 on the same URL — both are independent opt-ins.
+	r2 := mustReq("GET", "/vh/stream?sessions=a&z=1&proj=1", nil)
+	if !wantsProject(r2) || !wantsCompress(r2) {
+		t.Error("proj=1 and z=1 must be independently detectable on the same URL")
+	}
+}
+
 // TestMaybeCompressSnapshot pins the helper's three-way decision: threshold,
 // compress flag, and lossless round-trip.
 func TestMaybeCompressSnapshot(t *testing.T) {

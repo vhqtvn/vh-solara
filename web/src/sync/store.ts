@@ -179,6 +179,16 @@ export interface SyncState {
   // Root sessions that finished and haven't been acknowledged (server-tracked,
   // cross-device) — drives the "finished/unread" indicator in the tree.
   unread: Record<string, boolean>;
+  // Expanded branch IDs (Phase 2+ Gate A — collapsed-frontier projection): the
+  // set of collapsed-branch stub IDs the user has manually expanded via lazy-
+  // fetch. Tracked SEPARATELY from `sessions` (a stub is NOT a full session
+  // object — it carries aggregateState/descendantCount, not model/directory).
+  // Preserved across projected snapshots so an expansion survives re-projection;
+  // cleared on epoch change (server restart invalidates all stubs) or project
+  // switch. Ephemeral — NOT persisted (a reload re-projects from scratch, and a
+  // stale expanded-set referencing dead stubs would be misleading). Populated
+  // by Phase 4/5 (lazy-expand endpoint + Node branch-awareness); empty in Phase 2.
+  expandedBranches: Record<string, boolean>;
   status: ConnStatus;
   cursor: number;
   // --- Connection-health diagnostics (FE-only) -----------------------------
@@ -242,6 +252,7 @@ export const [state, setState] = createStore<SyncState>({
   questions: {},
   todos: {},
   unread: {},
+  expandedBranches: {},
   status: "connecting",
   cursor: loadCursor(initialDir),
   lastSeen: 0,

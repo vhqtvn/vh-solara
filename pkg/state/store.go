@@ -176,6 +176,26 @@ type Snapshot struct {
 	// been acknowledged yet — surfaced as an "unread/finished" indicator. Cleared
 	// via Ack (the client scrolling that session to the bottom).
 	Unread []string `json:"unread,omitempty"`
+	// Projected (Phase 2 Gate A — collapsed-frontier projection): when true, this
+	// snapshot uses MERGE semantics — sessions absent from Sessions are PRESERVED
+	// on the client as hidden (collapsed behind a frontier stub), NOT deleted.
+	// Only an explicit session.delete event removes a session. Absent or false
+	// means AUTHORITY_COMPLETE — the classic wholesale-replace where omission ===
+	// deleted (legacy behavior). The dual capability negotiation protects both
+	// directions: `?proj=1` query param (protects old clients that don't send it)
+	// + this `projected` envelope field (protects new clients against old servers
+	// that ignore proj=1 and emit AUTHORITY_COMPLETE). Phase 2: the field exists
+	// for capability negotiation but is NOT populated — the server still emits
+	// complete snapshots. Phase 4 wires the actual projection.
+	Projected bool `json:"projected,omitempty"`
+	// Cause identifies why a projected snapshot was emitted:
+	//   "initial"     — first open (fresh client, no valid cursor)
+	//   "reconnect"   — cursor too old to replay
+	//   "promotion"   — hidden→active atomic promotion (live activity on a stubbed session)
+	//   "lazy-expand" — branch expand endpoint response
+	//   "resync"      — epoch-change forced re-snapshot
+	// Absent in AUTHORITY_COMPLETE. Populated by the projection path (Phase 4+).
+	Cause string `json:"cause,omitempty"`
 }
 
 // GateFacts is the denormalized "is this session safe to act on" summary for one

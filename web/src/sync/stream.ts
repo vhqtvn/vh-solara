@@ -481,6 +481,17 @@ function evictIfOverCap(s: any, sid: string): boolean {
 // the singleton store, so the tests drive it directly and assert on `state`.
 export function applySnapshot(snap: Snapshot) {
   bumpUpdating();
+  // Phase 2 Gate A: projected snapshots use MERGE semantics — sessions absent
+  // from the array are PRESERVED as hidden, NOT deleted. Only an explicit
+  // session.delete event removes a session. AUTHORITY_COMPLETE (projected
+  // absent/false) keeps the legacy wholesale-replace where omission === deleted.
+  // The capability is dual-negotiated: `?proj=1` (query param) + `projected:true`
+  // (envelope). An old server ignoring proj=1 emits no `projected` field, so a
+  // new client falls back to wholesale-replace transparently.
+  if (snap.projected) {
+    applyProjectedSnapshot(snap);
+    return;
+  }
   const incomingEpoch = snap.epoch || "";
   const changed = epochChanged(state.epoch, incomingEpoch);
   // B2a resync window: mergeLastAgents is ONLY correct while the server is
@@ -545,6 +556,83 @@ export function applySnapshot(snap: Snapshot) {
     }),
   );
   // Wholesale session-set replacement invalidates the parent→children index.
+  invalidateChildrenIndex();
+  persist();
+}
+
+// applyProjectedSnapshot — Phase 2 Gate A merge path. When `snap.projected` is
+// true, the snapshot carries only the ACTIVE CLOSURE + frontier stubs (Phase 4
+// builds the projection; Phase 2 just wires the merge machinery). Sessions
+// ABSENT from the array are PRESERVED as hidden — they are collapsed behind a
+// frontier stub on the server and will be lazy-expanded on demand. Only an
+// explicit `session.delete` event removes a session (Gate A core rule:
+// projected snapshots MAY NOT infer deletion from omission).
+//
+// Merge semantics per slice:
+//   - sessions:       UPSERT incoming; PRESERVE absent (hidden !== deleted).
+//   - activity:       UPSERT incoming; PRESERVE absent.
+//   - lastAgents:     MERGE (incoming non-empty wins; FE entries the snapshot
+//                     omits are kept — same as the resync-window path).
+//   - currentVerbs:   UPSERT incoming; PRESERVE absent.
+//   - permissions:    REPLACE per-session for sessions present in snap; PRESERVE
+//                     sessions absent (their perms are still live — a hidden
+//                     session can still have a pending permission).
+//   - questions:      Same as permissions.
+//   - todos:          Same as permissions.
+//   - unread:         MERGE (incoming non-empty wins; absent roots preserved).
+//   - epoch/cursor:   Always update (projected snapshots advance the cursor).
+//
+// Transcript orthogonality (Gate F): this function touches NONE of
+// messages/messagesLoaded/messageWindows/Stream-2/msgRev. Those are owned by
+// the open-session lifecycle and are orthogonal to the tree projection.
+function applyProjectedSnapshot(snap: Snapshot) {
+  const incomingEpoch = snap.epoch || "";
+  const changed = epochChanged(state.epoch, incomingEpoch);
+  setState(
+    produce((s) => {
+      // Sessions: upsert incoming, PRESERVE absent. This is the core Gate A
+      // rule — a session omitted from a projected snapshot is hidden, not
+      // deleted. Only session.delete removes it.
+      for (const sess of snap.sessions || []) s.sessions[sess.id] = sess;
+      // Activity: upsert incoming, preserve absent.
+      if (snap.activity) {
+        for (const [id, act] of Object.entries(snap.activity)) s.activity[id] = act;
+      }
+      // lastAgents: merge (same semantics as the resync-window path — incoming
+      // non-empty wins, absent preserved). A projected snapshot may omit labels
+      // for sessions it didn't materialize; keep the FE cache.
+      s.lastAgents = mergeLastAgents(s.lastAgents, snap.lastAgents || {});
+      // currentVerbs: upsert incoming, preserve absent.
+      if (snap.currentVerbs) {
+        for (const [id, v] of Object.entries(snap.currentVerbs)) s.currentVerbs[id] = v;
+      }
+      // Permissions: replace per-session for sessions present in the snapshot;
+      // preserve absent sessions (their pending permissions are still live).
+      for (const [sid, perms] of Object.entries(snap.permissions || {})) {
+        s.permissions[sid] = {};
+        for (const p of perms) s.permissions[sid][p.id] = p;
+      }
+      // Questions: same as permissions.
+      for (const [sid, qs] of Object.entries(snap.questions || {})) {
+        s.questions[sid] = {};
+        for (const q of qs) s.questions[sid][q.id] = q;
+      }
+      // Todos: replace per-session for sessions present; preserve absent.
+      for (const [sid, v] of Object.entries(snap.todos || {})) s.todos[sid] = normalizeTodos(v);
+      // Unread: merge (incoming wins, absent preserved — a hidden root can still
+      // be unread).
+      for (const id of snap.unread || []) s.unread[id] = true;
+      // Epoch transition: latch for the connection-health toast. On epoch
+      // change, clear expandedBranches (server restart invalidates all stubs).
+      if (changed) {
+        s.epochChanged = true;
+        s.expandedBranches = {};
+      }
+      if (incomingEpoch) s.epoch = incomingEpoch;
+      s.cursor = snap.seq;
+    }),
+  );
+  // The merge may have added/changed sessions — invalidate the children cache.
   invalidateChildrenIndex();
   persist();
 }
@@ -1278,14 +1366,20 @@ export function connect(fresh = false) {
   const gen = treeGen;
   // Stream 1 (tree) opts into the server's gzip64 snapshot compression with
   // `&z=1`, mirroring Stream 2's session stream. The tree snapshot for a real
-  // project is ~760 KiB–1.1 MiB of highly-repetitive JSON (one project, one
+  // project is ~760 KiB–1.1 MiB of highly repetitive JSON (one project, one
   // directory, a handful of agents/models) and ships UNCOMPRESSED through the
   // controller tunnel without this flag (the tunnel does not compress at any
   // lower layer). gzip cuts it to ~150–200 KiB on the wire — ~5–7x smaller.
   // The server's maybeCompressSnapshot only wraps payloads ≥ 2 KiB AND only
   // when z=1 is set, so small/raw responses (an old server, or an edge-case
   // tiny tree) still ship raw and the listener handles both shapes.
-  es = new EventSource(`/vh/stream?${cursorParam}sessions=&dir=${encodeURIComponent(projectDir())}&z=1`);
+  // `&proj=1` (Phase 2 Gate A): opts into projected (collapsed-frontier)
+  // snapshot mode. The server reads this via wantsProject(); when it supports
+  // projection (Phase 4+), it emits `projected:true` on the envelope and the
+  // client takes the merge path. An old server ignores proj=1 and emits
+  // AUTHORITY_COMPLETE (no `projected` field), so the client transparently
+  // falls back to wholesale-replace. Independent from z=1.
+  es = new EventSource(`/vh/stream?${cursorParam}sessions=&dir=${encodeURIComponent(projectDir())}&z=1&proj=1`);
   markTreeSeen();
   log.debug("sync", "tree stream connect", { cursor: fresh ? "fresh" : state.cursor, dir: projectDir() });
   es.addEventListener("snapshot", (e) => {

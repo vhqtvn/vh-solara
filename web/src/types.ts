@@ -84,6 +84,16 @@ export interface Snapshot {
   // toolVerb/toolSubject (Path B2 — Go does not replicate the per-tool target
   // picker). Empty tool = no active facet for that session.
   currentVerbs?: Record<string, VerbFacet>;
+  // Projected (Phase 2 Gate A — collapsed-frontier projection): when true, this
+  // snapshot uses MERGE semantics — sessions absent from the array are PRESERVED
+  // as hidden on the client, NOT deleted. Only an explicit session.delete event
+  // removes a session. Absent/false means AUTHORITY_COMPLETE (wholesale-replace;
+  // omission === deleted). See Go's Snapshot.Projected (pkg/state/store.go).
+  projected?: boolean;
+  // Cause: why this projected snapshot was emitted. See Go's Snapshot.Cause.
+  // "initial" | "reconnect" | "promotion" | "lazy-expand" | "resync".
+  // Absent in AUTHORITY_COMPLETE.
+  cause?: string;
 }
 
 // Tier-A "current verb" facet: the RAW tool part primitive the daemon emits so
