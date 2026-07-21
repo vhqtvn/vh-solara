@@ -3295,3 +3295,76 @@ func TestRunningRoots(t *testing.T) {
 		t.Fatalf("after all idle: want 0 running, got %d", got)
 	}
 }
+
+// TestSetActivityFromStatusesHealsStaleBusyRoot is the regression test for the
+// periodic /session/status reconcile ticker. If the aggregator ever misses a
+// session.idle (dropped tunnel / reconnect gap / a turn that ended without
+// OpenCode emitting idle), a busy root stays busy in-memory forever and renders
+// as RUNNING in the SPA; worse, its whole subtree ships full instead of
+// collapsing to a frontier stub (the O1 collapsed-frontier projection).
+// SetActivityFromStatuses({}) — exactly what the reconcile ticker calls when
+// OpenCode reports nothing busy — must clear the stale flag by routing through
+// setActivityLocked, so busyCount, subtreeBusyCount, AND the seven O1 subtree
+// indexes all self-heal together. It must also NOT clear a root OpenCode still
+// reports busy (no false-clear).
+func TestSetActivityFromStatusesHealsStaleBusyRoot(t *testing.T) {
+	s := New(100)
+
+	// Seed a stale-busy subtree: root a + child c, both busy. busyCount[a]==2,
+	// subtreeBusyCount[a]==2 (a itself + c descendant), subtreeBusyCount[c]==1.
+	s.Apply(ev("session.created", `{"info":{"id":"a"}}`))
+	s.Apply(ev("session.created", `{"info":{"id":"c","parentID":"a"}}`))
+	s.Apply(ev("session.status", `{"sessionID":"a","status":{"type":"busy"}}`))
+	s.Apply(ev("session.status", `{"sessionID":"c","status":{"type":"busy"}}`))
+
+	// Preconditions: the subtree is observably busy.
+	if got := s.RunningRoots(); got != 1 {
+		t.Fatalf("precondition: stale-busy subtree, want 1 running root, got %d", got)
+	}
+	if diff := subtreeBusyCountDiff(s); diff != "" {
+		t.Fatalf("precondition: incremental index mismatch vs reference: %s", diff)
+	}
+	preSb := copySubtreeBusyCount(s)
+	if preSb["a"] != 2 || preSb["c"] != 1 {
+		t.Fatalf("precondition: want subtreeBusyCount a=2 c=1, got a=%d c=%d", preSb["a"], preSb["c"])
+	}
+
+	// Reconcile with an EMPTY status map: OpenCode reports nothing busy → both
+	// must clear. This is exactly what the periodic ticker does on heal, and it
+	// MUST route through setActivityLocked so all subtree indexes stay consistent.
+	s.SetActivityFromStatuses(map[string]json.RawMessage{})
+
+	// RunningRoots() (derived from busyCount[root]) drops the stale root.
+	if got := s.RunningRoots(); got != 0 {
+		t.Fatalf("after reconcile({}): stale-busy root must drop, want 0 running, got %d", got)
+	}
+	// The incremental subtreeBusyCount index self-heals through the same path.
+	if diff := subtreeBusyCountDiff(s); diff != "" {
+		t.Fatalf("after reconcile({}): subtree index did not self-heal: %s", diff)
+	}
+	healedSb := copySubtreeBusyCount(s)
+	if healedSb["a"] != 0 || healedSb["c"] != 0 {
+		t.Fatalf("after reconcile({}): want subtreeBusyCount a=0 c=0 (O1 self-heal), got a=%d c=%d", healedSb["a"], healedSb["c"])
+	}
+	// Activity is idle; the snapshot-path SubtreeBusy flag (independent of the
+	// incremental index) agrees.
+	snap := s.Snapshot(nil)
+	if snap.Activity["a"] != ActivityIdle || snap.Activity["c"] != ActivityIdle {
+		t.Fatalf("after reconcile({}): want both idle, got a=%s c=%s", snap.Activity["a"], snap.Activity["c"])
+	}
+	if snap.Gate["a"].SubtreeBusy || snap.Gate["c"].SubtreeBusy {
+		t.Fatalf("after reconcile({}): want SubtreeBusy false for both, got a=%v c=%v", snap.Gate["a"].SubtreeBusy, snap.Gate["c"].SubtreeBusy)
+	}
+
+	// False-clear guard: a root OpenCode DOES report busy must stay counted.
+	s.SetActivityFromStatuses(map[string]json.RawMessage{
+		"a": json.RawMessage(`{"type":"busy"}`),
+	})
+	if got := s.RunningRoots(); got != 1 {
+		t.Fatalf("false-clear guard: busy root must stay counted, want 1 running, got %d", got)
+	}
+	guardSb := copySubtreeBusyCount(s)
+	if guardSb["a"] != 1 {
+		t.Fatalf("false-clear guard: want subtreeBusyCount a=1, got %d", guardSb["a"])
+	}
+}

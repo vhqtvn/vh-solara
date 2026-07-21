@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/vhqtvn/vh-solara/pkg/fixtures"
+	"github.com/vhqtvn/vh-solara/pkg/opencode"
 )
 
 // A daemon restart rebuilds the store from a fresh hydrate. Pending questions
@@ -1066,5 +1067,105 @@ func TestStopNilCancelIsSafe(t *testing.T) {
 	case <-done:
 	case <-time.After(3 * time.Second):
 		t.Fatal("default Run did not exit after parent cancel")
+	}
+}
+
+// TestRunStatusReconcileHealsStaleBusy is the FAIL-without / PASS-with proof for
+// the periodic /session/status reconcile ticker wired into Run.
+//
+// Scenario: a root goes busy via a session.status event that the aggregator
+// applied, but OpenCode later finishes the turn and the matching session.idle
+// is LOST (dropped tunnel / reconnect gap / a turn that ended without emitting
+// idle). OpenCode's /session/status authoritatively reports {} (nothing busy).
+// The reconcile ticker must re-fetch it and clear the stale flag by routing
+// through store.SetActivityFromStatuses -> setActivityLocked.
+//
+// To isolate the ticker as the ONLY heal source, the /event stream is held open
+// by a hanging handler so NO reconnect / re-hydrate fires within the test
+// window (SubscribeEvents's idle timeout is 45s, far longer than the test). The
+// status reconcile interval is shrunk to ~5ms.
+//
+// WITHOUT the `go a.runStatusReconcile(ctx)` line in Run, RunningRoots() stays
+// 1 for the whole window → the heal-poll times out → FAIL.
+// WITH the ticker, the stale root is cleared within a few ticks → PASS.
+func TestRunStatusReconcileHealsStaleBusy(t *testing.T) {
+	// Shrink the reconcile interval so the heal fires within the test window.
+	prevInterval := StatusReconcileInterval
+	StatusReconcileInterval = 5 * time.Millisecond
+	t.Cleanup(func() { StatusReconcileInterval = prevInterval })
+
+	mux := http.NewServeMux()
+	// Empty session list: hydrate finds nothing to load.
+	mux.HandleFunc("/session", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte("[]"))
+	})
+	// Authoritative: nothing is busy. This is what clears the stale flag.
+	mux.HandleFunc("/session/status", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte("{}"))
+	})
+	// Hold the event stream open WITHOUT sending data so SubscribeEvents blocks
+	// in its read goroutine and NO reconnect/re-hydrate fires within the test
+	// (idleTimeout = 45s >> test deadline). This isolates the ticker as the only
+	// heal source.
+	mux.HandleFunc("/event", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if fl, ok := w.(http.Flusher); ok {
+			fl.Flush()
+		}
+		<-r.Context().Done()
+	})
+	// Delegate everything else (cold-seed tails, etc.) to the fixture handler.
+	mux.Handle("/", fixtures.New().Handler())
+
+	oc := httptest.NewServer(mux)
+	defer oc.Close()
+
+	agg := New(oc.URL, 100)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go agg.RunManaged(ctx)
+
+	// Wait for the one-shot hydrate reconcile to run against the empty store so
+	// the later stale-busy seed is not coincidentally cleared by hydrate.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && !agg.HydratedOnce() {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if !agg.HydratedOnce() {
+		t.Fatal("aggregator never completed initial hydrate")
+	}
+	agg.waitColdSeed()
+
+	// NOW seed a stale-busy root AFTER hydrate, simulating a session.status the
+	// aggregator applied but whose session.idle was lost.
+	store := agg.Store()
+	applyEvent := func(typ, props string) {
+		store.Apply(opencode.Event{Type: typ, Properties: json.RawMessage(props)})
+	}
+	applyEvent("session.created", `{"info":{"id":"ghost"}}`)
+	applyEvent("session.status", `{"sessionID":"ghost","status":{"type":"busy"}}`)
+	if got := store.RunningRoots(); got != 1 {
+		t.Fatalf("post-seed: want stale ghost counted as 1 running, got %d", got)
+	}
+
+	// Poll for the ticker to heal it. Without the ticker this times out → FAIL.
+	healDeadline := time.Now().Add(1 * time.Second)
+	for time.Now().Before(healDeadline) && store.RunningRoots() != 0 {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if got := store.RunningRoots(); got != 0 {
+		t.Fatalf("reconcile ticker did not heal stale-busy root within 1s: RunningRoots=%d (want 0)", got)
+	}
+
+	// The snapshot path agrees: ghost is no longer busy / subtree-busy.
+	gate := store.Snapshot(nil).Gate["ghost"]
+	if gate.Activity != "idle" {
+		t.Fatalf("after heal: want ghost Activity idle, got %q", gate.Activity)
+	}
+	if gate.SubtreeBusy {
+		t.Fatal("after heal: want ghost SubtreeBusy false")
 	}
 }

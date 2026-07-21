@@ -673,6 +673,12 @@ func (a *Aggregator) Run(ctx context.Context) {
 	a.armed = true
 	a.seedMu.Unlock()
 
+	// Periodic /session/status reconcile self-heals a stale "busy" flag left
+	// behind by a missed session.idle (dropped tunnel / reconnect gap / a turn
+	// that ended without OpenCode emitting idle). See StatusReconcileInterval.
+	// Bound to Run's ctx so it stops on aggregator shutdown.
+	go a.runStatusReconcile(ctx)
+
 	backoff := time.Second
 	for {
 		if ctx.Err() != nil {
@@ -722,6 +728,38 @@ func (a *Aggregator) Run(ctx context.Context) {
 		if backoff < 30*time.Second {
 			backoff *= 2
 		}
+	}
+}
+
+// runStatusReconcile periodically re-derives busy-state from OpenCode's
+// /session/status and reconciles it into the store. It is the self-heal path
+// for a stale "busy" flag: the event stream owns busy-state in the common
+// case, but if a session.idle is ever missed the in-memory flag would stick
+// forever. This ticker clears anything OpenCode no longer reports busy by
+// routing through store.SetActivityFromStatuses -> setActivityLocked, which is
+// the single chokepoint that also keeps busyCount, subtreeBusyCount, and the
+// seven O1 subtree indexes consistent. It is best-effort: a fetch error is
+// logged and retried on the next tick. It never clears busyCount directly.
+// Blocks until ctx is cancelled.
+func (a *Aggregator) runStatusReconcile(ctx context.Context) {
+	ticker := time.NewTicker(StatusReconcileInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		statuses, err := a.client.SessionStatuses(ctx)
+		if err != nil {
+			// Silent on shutdown; otherwise log and try again next tick.
+			if ctx.Err() != nil {
+				return
+			}
+			log.Printf("[aggregator] status reconcile fetch failed: %v", err)
+			continue
+		}
+		a.store.SetActivityFromStatuses(statuses)
 	}
 }
 
@@ -841,6 +879,24 @@ func (a *Aggregator) hydrate(ctx context.Context) error {
 // to derive its lastAgent for the tree chips. It only needs to be large enough
 // to typically contain the most recent assistant turn.
 const coldTailLimit = 10
+
+// StatusReconcileInterval is how often runStatusReconcile polls OpenCode's
+// /session/status to self-heal a stale "busy" flag. The event stream drives
+// busy-state in the common case (session.status busy / session.idle), but if
+// the aggregator ever misses a session.idle — a dropped tunnel, a reconnect
+// gap, or a turn that ended without OpenCode emitting idle — busyCount[root]
+// stays > 0 forever and the finished session renders as RUNNING in the SPA.
+// A stale-busy root also defeats the O1 collapsed-frontier projection: it
+// stays in the active closure, so its whole subtree ships full instead of
+// collapsing to a frontier stub.
+//
+// This ticker is the authoritative safety net: it periodically re-derives
+// busy-state from /session/status and clears anything OpenCode no longer
+// reports busy, routing through store.SetActivityFromStatuses -> setActivityLocked
+// so busyCount, subtreeBusyCount, and all seven O1 subtree indexes stay
+// consistent. It is a var (not const) so tests can shrink it; it mirrors the
+// deltaFlushInterval / partTextCap tuning-var precedent.
+var StatusReconcileInterval = 60 * time.Second
 
 // startColdSeed launches seedColdLastAgents on a background goroutine (off the
 // hydrate hot path) unless one is already running. At most one cold-seed is in
