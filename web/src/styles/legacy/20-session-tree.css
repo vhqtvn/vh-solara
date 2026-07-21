@@ -402,3 +402,22 @@
   line-height: 1.5;
 }
 
+/* Phase 5: collapsed-branch stubs. A stub represents an idle/recent subtree
+   the server collapsed — it's NOT a live session, so it gets a muted, slightly
+   italic appearance to distinguish it from materialized sessions. The
+   descendant-count badge uses a distinct tint so it reads as "N hidden" rather
+   than the live kid count of a session. */
+.tree-stub .tree-stub-node:not(.running) .tree-stub-title {
+  color: var(--fg-dim);
+  font-style: italic;
+  opacity: 0.8;
+}
+.tree-stub .tree-stub-count {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  color: var(--fg-dim);
+}
+.tree-stub .tree-stub-node.running .tree-stub-title {
+  font-style: normal;
+  opacity: 1;
+}
+

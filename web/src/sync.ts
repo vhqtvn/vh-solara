@@ -154,3 +154,6 @@ export { STALE_MS, UPDATING_DEBOUNCE_MS } from "./sync/stream";
 // Phase 4 — historical-page load-older action (called from ChatView's
 // IntersectionObserver top sentinel + "Load older" button).
 export { loadOlder } from "./sync/stream";
+// Phase 5 — collapsed-branch lazy-expand / collapse actions (called from
+// StubNode's twisty in SessionTree).
+export { lazyExpandBranch, collapseBranch } from "./sync/stream";

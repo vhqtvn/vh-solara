@@ -2279,3 +2279,107 @@ export function maybeReconnect() {
   if (!es || es.readyState === EventSource.CLOSED) connect();
   else watchdogTick();
 }
+
+// ─── Phase 5: lazy-expand branch ────────────────────────────────────────────
+//
+// The lazy-expand endpoint is GET /vh/sessions/branch?id=<frontier-id>&cursor=.
+// It's a point-in-time READ, not a Stream1 event — so its response MUST NOT
+// update s.cursor or lastAppliedStructuralRevision (those are Stream1 concepts
+// tied to the SSE seq-ordered delivery). The dedicated applyLazyExpandMerge
+// below handles this: it merges sessions/stubs/activity/etc. but leaves cursor
+// and structuralRevision untouched. This preserves the Stream1 cursor's
+// authority over tree liveness and the structuralRevision's monotonicity guard.
+const branchExpandInFlight = new Set<string>();
+
+// Merge a lazy-expand response WITHOUT touching cursor or structuralRevision.
+// Mirrors applyProjectedSnapshot's merge semantics but skips the Stream1-only
+// fields. Gate F (transcript orthogonality) holds: lazy-expand carries only
+// metadata, not messages.
+function applyLazyExpandMerge(snap: Snapshot) {
+  setState(
+    produce((s) => {
+      for (const sess of snap.sessions || []) s.sessions[sess.id] = sess;
+      if (snap.activity) {
+        for (const [id, act] of Object.entries(snap.activity)) s.activity[id] = act;
+      }
+      s.lastAgents = mergeLastAgents(s.lastAgents, snap.lastAgents || {});
+      if (snap.currentVerbs) {
+        for (const [id, v] of Object.entries(snap.currentVerbs)) s.currentVerbs[id] = v;
+      }
+      for (const [sid, perms] of Object.entries(snap.permissions || {})) {
+        s.permissions[sid] = {};
+        for (const p of perms) s.permissions[sid][p.id] = p;
+      }
+      for (const [sid, qs] of Object.entries(snap.questions || {})) {
+        s.questions[sid] = {};
+        for (const q of qs) s.questions[sid][q.id] = q;
+      }
+      for (const [sid, v] of Object.entries(snap.todos || {})) s.todos[sid] = normalizeTodos(v);
+      for (const id of snap.unread || []) s.unread[id] = true;
+      // Stubs: merge (lazy-expand adds branch-specific stubs — grandchildren —
+      // without removing existing frontier stubs from other branches).
+      for (const stub of snap.stubs || []) s.branchStubs[stub.id] = stub;
+    }),
+  );
+  invalidateChildrenIndex();
+  persist();
+}
+
+// Lazy-expand a collapsed-branch stub: fetch the branch's children from the
+// server, merge them into state, and mark the branch as expanded. Single-flight
+// via branchExpandInFlight. Anti-clobber via treeGen + epoch (a tree reconnect
+// or project switch invalidates an in-flight fetch). Pagination via the
+// X-VH-Branch-Cursor header (continuation-based).
+export async function lazyExpandBranch(branchID: string): Promise<void> {
+  if (!branchID) return;
+  if (branchExpandInFlight.has(branchID)) return; // single-flight
+  const gen = treeGen;
+  const epoch = state.epoch;
+  branchExpandInFlight.add(branchID);
+  setState("expandedBranches", branchID, true);
+  bumpUpdating();
+  try {
+    let cursor = "";
+    for (;;) {
+      if (gen !== treeGen || epochChanged(epoch, state.epoch)) return; // anti-clobber
+      const params = new URLSearchParams({
+        id: branchID,
+        dir: projectDir(),
+        z: "1",
+      });
+      if (cursor) params.set("cursor", cursor);
+      const res = await fetch(`/vh/sessions/branch?${params}`);
+      if (!res.ok) {
+        log.warn("sync", "lazy-expand fetch failed", {
+          branchID,
+          status: res.status,
+        });
+        return;
+      }
+      if (gen !== treeGen || epochChanged(epoch, state.epoch)) return; // anti-clobber
+      const raw = await res.json();
+      const snap = await decodeSnapshot<Snapshot>(raw);
+      // Anti-clobber: branch root may have been deleted/reparented during fetch.
+      // If the branch no longer exists as a stub OR as a session, discard.
+      if (!state.branchStubs[branchID] && !state.sessions[branchID]) {
+        log.debug("sync", "lazy-expand discarded (branch gone)", { branchID });
+        return;
+      }
+      applyLazyExpandMerge(snap);
+      cursor = res.headers.get("X-VH-Branch-Cursor") || "";
+      if (!cursor) break; // no more pages
+    }
+  } catch (err) {
+    log.warn("sync", "lazy-expand error", { branchID, err: String(err) });
+  } finally {
+    branchExpandInFlight.delete(branchID);
+  }
+}
+
+// Collapse an expanded branch: mark it collapsed. The children stay in state
+// (they're still valid sessions/stubs) but the UI hides them. The next expand
+// re-fetches from the server (the frontier may have changed).
+export function collapseBranch(branchID: string): void {
+  if (!branchID) return;
+  setState("expandedBranches", branchID, false);
+}

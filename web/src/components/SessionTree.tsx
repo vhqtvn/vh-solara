@@ -20,6 +20,10 @@ import Spinner from "./Spinner";
 import { loadVersioned, saveVersioned } from "../lib/store";
 import RelTime from "./RelTime";
 import { formatDuration } from "../lib/time";
+// Phase 5: StubNode renders collapsed-branch stubs. Imported for type + render
+// of stub children inside Node (idle frontier under an active ancestor).
+import StubNode from "./StubNode";
+import type { CollapsedBranchStub } from "../types";
 
 // --- per-node expand state ----------------------------------------------------
 // Persisted state, cycled by clicking the twisty:
@@ -122,6 +126,20 @@ function buildWorkingSet(): Set<string> {
     const act = state.activity[id];
     if (act === "busy" || act === "retry") set.add(id);
   }
+  // Phase 5: a collapsed-branch stub with busy/retry aggregate state represents
+  // a subtree with active work underneath. Its parent chain must be in the
+  // working set so the auto-tidy effect doesn't collapse the branch (hiding the
+  // busy stub in filtered mode). Propagate the stub's parent up the chain,
+  // mirroring the session-activity propagation below.
+  for (const stub of Object.values(state.branchStubs)) {
+    if (stub.aggregateState === "busy" || stub.aggregateState === "retry") {
+      let cur = stub.parentID;
+      while (cur && !set.has(cur)) {
+        set.add(cur);
+        cur = state.sessions[cur]?.parentID;
+      }
+    }
+  }
   for (const id of [...set]) {
     let cur = state.sessions[id]?.parentID;
     while (cur && !set.has(cur)) {
@@ -152,7 +170,11 @@ function AgentChip(props: { sessionID: string }) {
   );
 }
 
-function Node(props: {
+// Exported for StubNode.tsx (Phase 5): stubs delegate materialized session
+// children to this Node component. The circular import (StubNode → SessionTree
+// → StubNode) is broken by ESM live-binding: Node is only CALLED at render
+// time, never at module-eval time, so the TDZ is never hit.
+export function Node(props: {
   session: Session;
   depth: number;
   prefix: boolean[];
@@ -170,6 +192,30 @@ function Node(props: {
   };
 }) {
   const kids = () => props.index()[props.session.id] || [];
+  // Phase 5: stub children — collapsed-branch stubs whose parent is this
+  // session (the idle frontier under an active ancestor). These are NOT in
+  // the session index (they're in state.branchStubs), so they need a separate
+  // accessor. Display-mode filtering applies to them too: a filtered node
+  // shows only stubs with active work underneath (busy/retry/needs-input).
+  const stubKids = (): CollapsedBranchStub[] =>
+    Object.values(state.branchStubs).filter((s) => s.parentID === props.session.id);
+  const visibleStubKids = (): CollapsedBranchStub[] => {
+    switch (display()) {
+      case "collapsed":
+        return [];
+      case "filtered":
+        return stubKids().filter(
+          (s) =>
+            s.aggregateState === "busy" ||
+            s.aggregateState === "retry" ||
+            s.aggregateState === "needs-input",
+        );
+      case "temp":
+        return []; // path goes through sessions only — can't select a stub
+      default:
+        return stubKids(); // expanded: all stubs
+    }
+  };
   const activity = () => state.activity[props.session.id] || "idle";
   const busy = () => props.working(props.session.id);
   // Subtree has a pending permission/question awaiting a typed reply. Reactive —
@@ -275,7 +321,7 @@ function Node(props: {
         <button
           type="button"
           class="tree-twisty"
-          classList={{ leaf: kids().length === 0 }}
+          classList={{ leaf: kids().length === 0 && stubKids().length === 0 }}
           aria-label={`Subtree: ${display()} (click to cycle)`}
           data-tip={`Subtree: ${display()}`}
           onClick={(e) => {
@@ -424,6 +470,25 @@ function Node(props: {
         )}
       </For>
 
+      {/* Phase 5: collapsed-branch stub children (the idle frontier under an
+          active ancestor). Rendered after session children; display-mode
+          filtered (collapsed/temp hide them; filtered shows busy/retry/
+          needs-input stubs; expanded shows all). Each StubNode handles its
+          own expand/collapse + lazy-fetch. */}
+      <For each={visibleStubKids()}>
+        {(stub) => (
+          <StubNode
+            stub={stub}
+            depth={props.depth + 1}
+            prefix={childPrefix()}
+            isLast={true}
+            index={props.index}
+            ancestors={props.ancestors}
+            working={props.working}
+          />
+        )}
+      </For>
+
       {/* Footer: what's hidden here (running/idle of direct children). */}
       <Show when={hasFooter()}>
         <div class="tree-row tree-footer-row">
@@ -452,6 +517,14 @@ export default function SessionTree() {
   const working = createMemo(() => buildWorkingSet());
   const index = createMemo(() => buildChildrenIndex(state.sessions, (s) => working().has(s.id)));
   const roots = () => index()[""] || [];
+  // Phase 5: stub roots — collapsed-branch stubs whose parent is absent or not
+  // materialized (they're roots in the projected tree, even though the server
+  // collapsed their entire subtree into a single stub). These render alongside
+  // session roots, sorted by recency.
+  const stubRoots = () =>
+    Object.values(state.branchStubs).filter(
+      (s) => !s.parentID || !state.sessions[s.parentID],
+    );
   const ancestors = createMemo(() => selectedAncestors());
   const isWorking = (id: string) => working().has(id);
   // Selecting a different session reverts temporary auto-expansions: clear the
@@ -685,7 +758,10 @@ export default function SessionTree() {
           </Show>
         }
       >
-        <Show when={roots().length > 0} fallback={<div class="tree-empty">No sessions yet</div>}>
+        <Show
+          when={roots().length > 0 || stubRoots().length > 0}
+          fallback={<div class="tree-empty">No sessions yet</div>}
+        >
           <Show when={pinnedRoots().length > 0}>
             <div class="tree-pinned" ref={(el) => (pinnedContainer = el)}>
               <For each={pinnedRoots()}>
@@ -707,7 +783,7 @@ export default function SessionTree() {
                 )}
               </For>
             </div>
-            <Show when={unpinnedRoots().length > 0}>
+            <Show when={unpinnedRoots().length > 0 || stubRoots().length > 0}>
               <div class="tree-pin-sep" aria-hidden="true" />
             </Show>
           </Show>
@@ -718,6 +794,22 @@ export default function SessionTree() {
                 depth={0}
                 prefix={[]}
                 isLast={i() === unpinnedRoots().length - 1}
+                index={index}
+                ancestors={ancestors}
+                working={isWorking}
+              />
+            )}
+          </For>
+          {/* Phase 5: collapsed-branch stub roots (idle subtrees the server
+              collapsed into a single stub). Rendered after unpinned session
+              roots. Each StubNode handles its own expand/collapse + lazy-fetch. */}
+          <For each={stubRoots()}>
+            {(stub) => (
+              <StubNode
+                stub={stub}
+                depth={0}
+                prefix={[]}
+                isLast={true}
                 index={index}
                 ancestors={ancestors}
                 working={isWorking}
