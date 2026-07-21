@@ -851,6 +851,25 @@ type Store struct {
 	unread         map[string]bool
 	busyCount      map[string]int
 	suppressUnread bool
+	// subtreeBusyCount is the INCREMENTAL per-node busy aggregate (Gate C
+	// de-risking prototype). subtreeBusyCount[id] = the number of busy/retry
+	// sessions in id's subtree, INCLUDING id itself when it is busy/retry. It is
+	// the count generalization of computeSubtreeBusyLocked's per-node bool (bool
+	// = count > 0); maintaining the stricter count invariant proves the
+	// incremental-index pattern for the remaining 7 collapsed-frontier indexes.
+	//
+	// Maintained incrementally at every mutation site that can change it —
+	// setActivityLocked (busy-state chokepoint), upsertSessionLocked +
+	// Hydrate's direct assign (create/reparent), deleteSessionLocked (delete) —
+	// so a Snapshot/SendableNow read is O(1) per node instead of the O(n)
+	// computeSubtreeBusyLocked recompute. ADDITIVE prototype: the snapshot path
+	// still calls computeSubtreeBusyLocked unchanged; this index coexists and is
+	// proven equivalent by TestSubtreeBusyCountProperty (random-mutation
+	// differential vs an independent O(n) recompute). Entries exist ONLY for
+	// live sessions (sessions in s.sessions); phantom status events for unknown
+	// sessionIDs do NOT create entries, matching computeSubtreeBusyLocked's
+	// iteration over s.sessions. Guarded by s.mu (same as busyCount).
+	subtreeBusyCount map[string]int
 	// msgLoaded marks sessions whose message history has been fetched. Messages
 	// are hydrated lazily (on first open) so startup doesn't fetch every
 	// session's history — critical with thousands of sessions.
@@ -942,24 +961,25 @@ func newEpoch() string {
 // New returns an empty store with an event ring of the given capacity.
 func New(ringCapacity int) *Store {
 	return &Store{
-		epoch:           newEpoch(),
-		sessions:        map[string]*sessionEntry{},
-		messages:        map[string]*sessionMessages{},
-		todos:           map[string]json.RawMessage{},
-		perms:           map[string]map[string]json.RawMessage{},
-		questions:       map[string]map[string]json.RawMessage{},
-		permBlocked:     map[string]bool{},
-		statuses:        map[string]json.RawMessage{},
-		activity:        map[string]string{},
-		activitySeq:     map[string]uint64{},
-		unread:          map[string]bool{},
-		busyCount:       map[string]int{},
-		msgLoaded:       map[string]bool{},
-		msgRev:          map[string]uint64{},
-		coldFetchActive: map[string]bool{},
-		seeded:          map[string]bool{},
-		ring:            newRingBuffer(ringCapacity),
-		subs:            map[int]*subscriber{},
+		epoch:            newEpoch(),
+		sessions:         map[string]*sessionEntry{},
+		messages:         map[string]*sessionMessages{},
+		todos:            map[string]json.RawMessage{},
+		perms:            map[string]map[string]json.RawMessage{},
+		questions:        map[string]map[string]json.RawMessage{},
+		permBlocked:      map[string]bool{},
+		statuses:         map[string]json.RawMessage{},
+		activity:         map[string]string{},
+		activitySeq:      map[string]uint64{},
+		unread:           map[string]bool{},
+		busyCount:        map[string]int{},
+		subtreeBusyCount: map[string]int{},
+		msgLoaded:        map[string]bool{},
+		msgRev:           map[string]uint64{},
+		coldFetchActive:  map[string]bool{},
+		seeded:           map[string]bool{},
+		ring:             newRingBuffer(ringCapacity),
+		subs:             map[int]*subscriber{},
 		// Finding 4: SourceOpencodeLive is the iota zero value. Without an
 		// explicit init here, ordinary daemon-originated emissions (messages
 		// .loaded/error, activity, etc.) would be misattributed as
@@ -1158,6 +1178,23 @@ func (s *Store) setActivityLocked(sessionID, st string) {
 	if wasBusy == isBusy {
 		return
 	}
+
+	// Incremental subtreeBusyCount maintenance (Gate C de-risk prototype).
+	// A real busy↔non-busy flip changes id's own contribution by ±1 and every
+	// live ancestor's aggregate by ±1. Guarded on live-tree membership: a
+	// phantom status event for an unknown sessionID must NOT create an index
+	// entry (computeSubtreeBusyLocked iterates s.sessions only); the own-
+	// contribution for a phantom-busy-then-created session is seeded in
+	// upsertSessionLocked / Hydrate when it enters the live tree.
+	if s.sessions[sessionID] != nil {
+		delta := 1
+		if !isBusy {
+			delta = -1
+		}
+		s.subtreeBusyCount[sessionID] += delta
+		s.adjustAncestorSubtreeBusyLocked(sessionID, delta)
+	}
+
 	root := s.rootOfLocked(sessionID)
 	if isBusy {
 		if s.busyCount[root] == 0 {
@@ -1186,6 +1223,121 @@ func (s *Store) rootOfLocked(id string) string {
 	}
 	return cur
 }
+
+// --- incremental subtreeBusyCount maintenance (Gate C de-risk prototype) ---
+//
+// These helpers maintain s.subtreeBusyCount incrementally. The reference is
+// computeSubtreeBusyLocked (O(n) recompute, UNCHANGED — the snapshot path still
+// calls it). The invariant each helper preserves:
+//
+//	subtreeBusyCount[id] == (1 if activity[id] is busy/retry else 0)
+//	                     + Σ subtreeBusyCount[child] for each live child of id
+//
+// for every id in s.sessions. Three sites mutate it:
+//   - setActivityLocked: own-contribution ±1 + propagate to ancestors
+//   - upsertSessionLocked + Hydrate direct-assign: create/reparent
+//   - deleteSessionLocked: remove + propagate to ancestors
+//
+// All callers hold s.mu (the index lives under the same lock as busyCount).
+
+// subtreeBusySelfLocked returns id's OWN contribution to its subtree busy
+// count: 1 when its activity is busy/retry, else 0. Caller holds s.mu.
+func (s *Store) subtreeBusySelfLocked(id string) int {
+	a := s.activity[id]
+	if a == ActivityBusy || a == ActivityRetry {
+		return 1
+	}
+	return 0
+}
+
+// adjustAncestorChainFromLocked adds delta to subtreeBusyCount[firstParentID]
+// and every live strict ancestor above it, walking parentID up while the parent
+// exists in s.sessions. Stops at an empty parentID or a parent absent from the
+// live tree — the SAME orphan-inclusive root definition as rootOfLocked, so an
+// orphaned child's chain terminates at itself. firstParentID is the PARENT of
+// the session whose subtree changed (not the session itself): callers propagate
+// a subtree delta up from a session's parent without touching the session's own
+// entry. Caller holds s.mu.
+func (s *Store) adjustAncestorChainFromLocked(firstParentID string, delta int) {
+	cur := firstParentID
+	for i := 0; i < 100000; i++ { // bound vs a malformed cyclic parent link
+		if cur == "" {
+			return
+		}
+		se := s.sessions[cur]
+		if se == nil {
+			return // parent absent from live tree → orphan root, stop
+		}
+		s.subtreeBusyCount[cur] += delta
+		cur = se.parentID
+	}
+}
+
+// adjustAncestorSubtreeBusyLocked adds delta to every strict ancestor of id
+// (walking id's parentID up). id's OWN entry is NOT touched. No-op when id is
+// absent from the live tree (phantom). Caller holds s.mu.
+func (s *Store) adjustAncestorSubtreeBusyLocked(id string, delta int) {
+	se := s.sessions[id]
+	if se == nil {
+		return
+	}
+	s.adjustAncestorChainFromLocked(se.parentID, delta)
+}
+
+// maintainSubtreeBusyOnSessionUpsertLocked updates the incremental index after
+// a session entry was just created or replaced (potentially reparented). prev is
+// the prior *sessionEntry (nil for a fresh create); newParentID is the entry's
+// new parentID. The caller must have ALREADY written s.sessions[id] with the new
+// entry. Caller holds s.mu.
+//
+// Three cases:
+//   - Fresh create (prev == nil): seed id's own contribution from its CURRENT
+//     activity (which may have been set by a phantom status event that landed
+//     before session.created — setActivityLocked is guarded on live-tree
+//     membership, so the seeding happens here). A brand-new session has no
+//     descendants, so the subtree count equals the self-contribution.
+//   - Same parent (prev.parentID == newParentID): no topology change and upsert
+//     does not touch activity → index already correct. No-op.
+//   - Reparent: id's whole-subtree contribution (subtreeBusyCount[id], which
+//     the move does not alter) is subtracted from the OLD ancestor chain and
+//     added to the NEW ancestor chain. id's own entry is unchanged.
+func (s *Store) maintainSubtreeBusyOnSessionUpsertLocked(id string, prev *sessionEntry, newParentID string) {
+	switch {
+	case prev == nil:
+		// Fresh create (or recreate of a previously-deleted id). id's subtree
+		// count = own busy contribution + the sum of subtreeBusyCount over any
+		// live direct children. The recreate-with-orphaned-descendants case is
+		// real in production: a parent's session.deleted orphans its children
+		// (deleteSessionLocked does not cascade), and a later session.created /
+		// archive-un-archive / hydrate-prune-then-reappear for the same id
+		// must reabsorb those still-live descendants (their own subtree counts
+		// are self-contained and correct). This scan is O(n) in live sessions,
+		// but fresh create is the cold path — reparent, status, and activity
+		// transitions are the hot O(depth) paths — and matches
+		// computeSubtreeBusyLocked, which rebuilds children every call.
+		total := s.subtreeBusySelfLocked(id)
+		for cid, ce := range s.sessions {
+			if ce.parentID == id {
+				total += s.subtreeBusyCount[cid]
+			}
+		}
+		if total != 0 {
+			s.subtreeBusyCount[id] = total
+			s.adjustAncestorChainFromLocked(newParentID, total)
+		}
+	case prev.parentID == newParentID:
+		// No topology change; activity is untouched by upsert. No-op.
+	default:
+		// Reparent. id's own subtree count is unchanged by the move; only its
+		// ancestors' aggregates shift.
+		if sub := s.subtreeBusyCount[id]; sub != 0 {
+			s.adjustAncestorChainFromLocked(prev.parentID, -sub)
+			s.adjustAncestorChainFromLocked(newParentID, +sub)
+		}
+	}
+}
+
+// --- end incremental subtreeBusyCount maintenance ---
 
 func (s *Store) markUnreadLocked(id string) {
 	if s.sessions[id] == nil || s.unread[id] {
@@ -1460,6 +1612,12 @@ func (s *Store) upsertSessionLocked(props json.RawMessage) {
 		// wipe "Reading parser.go" for a running subagent.
 		s.sessions[env.ID].currentVerb = prev.currentVerb
 	}
+	// Incremental subtreeBusyCount maintenance (Gate C de-risk prototype):
+	// create / reparent. Must run AFTER s.sessions[env.ID] is written (the
+	// helper reads the live entry for the same-parent fast path) and BEFORE the
+	// emit so a concurrent Snapshot reader (under RLock) never observes a
+	// half-updated index. See maintainSubtreeBusyOnSessionUpsertLocked.
+	s.maintainSubtreeBusyOnSessionUpsertLocked(env.ID, prev, env.ParentID)
 	// A session.updated replaces the entry, so repopulate the denormalized
 	// last-assistant summary from the (persisted) message view.
 	s.recomputeLastAssistantLocked(env.ID)
@@ -1467,6 +1625,17 @@ func (s *Store) upsertSessionLocked(props json.RawMessage) {
 }
 
 func (s *Store) deleteSessionLocked(id string) {
+	// Incremental subtreeBusyCount maintenance (Gate C de-risk prototype):
+	// propagate id's whole-subtree contribution out of every live ancestor
+	// BEFORE unlinking (we need the entry to read id's parentID and the index
+	// entry to read the subtree count). Descendants become orphaned roots on
+	// delete; their own subtreeBusyCount values are self-contained (X was their
+	// parent, not child) and need no adjustment, matching computeSubtreeBusyLocked.
+	if sub := s.subtreeBusyCount[id]; sub != 0 {
+		if se := s.sessions[id]; se != nil {
+			s.adjustAncestorChainFromLocked(se.parentID, -sub)
+		}
+	}
 	delete(s.sessions, id)
 	delete(s.messages, id)
 	delete(s.msgLoaded, id)
@@ -1484,6 +1653,7 @@ func (s *Store) deleteSessionLocked(id string) {
 	delete(s.activitySeq, id)
 	delete(s.unread, id)
 	delete(s.busyCount, id)
+	delete(s.subtreeBusyCount, id) // Gate C de-risk prototype index
 	// Clear the automated-spawn permission-blocked fact on termination. This is
 	// the single session-removal chokepoint (live session.deleted, archive via
 	// time.archived, and hydrate prune all funnel here), so one delete covers
@@ -3136,6 +3306,12 @@ func (s *Store) Hydrate(sessions []json.RawMessage, messages map[string][]Messag
 		seen[env.ID] = true
 		if old := s.sessions[env.ID]; old == nil || !bytes.Equal(old.info, info) {
 			s.sessions[env.ID] = &sessionEntry{id: env.ID, parentID: env.ParentID, info: info}
+			// Incremental subtreeBusyCount maintenance (Gate C de-risk
+			// prototype): Hydrate assigns s.sessions directly (bypassing
+			// upsertSessionLocked), so it must maintain the index here too.
+			// `old` is the prev entry (nil for a fresh create). Covers the same
+			// create / same-parent / reparent cases as upsertSessionLocked.
+			s.maintainSubtreeBusyOnSessionUpsertLocked(env.ID, old, env.ParentID)
 			s.emit(KindSessionUpsert, info)
 		}
 	}
