@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { reconcile } from "solid-js/store";
 import { gzipSync } from "node:zlib";
 import { applySnapshot, applySessionEvent, applySessionSnapshot, applyMessageEvent, decodeMessagesBatch, resetTreeStreamStateForTesting } from "../../src/sync/stream";
-import { state, setState } from "../../src/sync/store";
+import { state, setState, setSelectedIdRaw } from "../../src/sync/store";
 import { sessionLastAgent } from "../../src/sync/selectors";
 import type { Snapshot } from "../../src/types";
 
@@ -34,6 +34,9 @@ beforeEach(() => {
   setState("epoch", "");
   setState("epochChanged", false);
   setState("cursor", 0);
+  // Reset the open-session signal so a prior test's selection can't exempt a
+  // session from the stub-demotion reconcile (isolates the reconcile cases).
+  setSelectedIdRaw(null);
   resetTreeStreamStateForTesting();
 });
 
@@ -927,5 +930,161 @@ describe("applySnapshot — Phase 6 cutoff tracking", () => {
       // cutoffVersion + cutoffMs absent
     });
     expect(state.sessions.a).toBeDefined();
+  });
+});
+
+// Stub-demotion reconcile. When a session goes idle the server demotes it from
+// the active closure: the next FULL projected snapshot (cause=initial/promotion/
+// reconnect/resync, or an epoch change) emits it as a CollapsedBranchStub in
+// snap.stubs AND omits it from snap.sessions. The client rebuilds branchStubs
+// wholesale but the session preserve-absent rule left its stale payload in
+// state.sessions — so both coexisted for the same id (the render-layer guard
+// already hid the duplicate row). These cases pin the reconcile that prunes the
+// stale state.sessions entry on the full-rebuild paths only, never on
+// lazy-expand, never for an absent-but-not-stub session (Gate A), never for the
+// open session, and never the per-session metadata maps (collapsed ≠ deleted).
+describe("applySnapshot — stub-demotion reconcile prunes stale state.sessions", () => {
+  // Minimal valid CollapsedBranchStub for a demoted session (matches the wire
+  // shape from src/types.ts; parentID omitted since these are root stubs).
+  const demoted = (id: string) => ({
+    id,
+    kind: "collapsed-branch" as const,
+    hasChildren: true,
+    descendantCount: 1,
+    aggregateState: "idle" as const,
+  });
+
+  it("prunes a session the server demoted to a stub on a promotion snapshot", () => {
+    const EPOCH = "stub-prune-ep1";
+    setState("epoch", EPOCH);
+    setState("sessions", "s1", { id: "s1" });
+    setState("sessions", "s2", { id: "s2" }); // s2 will be demoted to a stub
+    applySnapshot({
+      seq: 2,
+      epoch: EPOCH,
+      projected: true,
+      cause: "promotion",
+      structuralRevision: 2,
+      sessions: [{ id: "s1" }], // s2 omitted from the active closure
+      stubs: [demoted("s2")], // ...and emitted as a stub (demoted)
+    });
+    // s2 pruned from state.sessions — no stale materialized payload lingering
+    // alongside its stub (the merge-layer invariant now matches the server).
+    expect(state.sessions.s2).toBeUndefined();
+    expect(state.sessions.s1).toBeDefined(); // active survivor remains
+    expect(state.branchStubs.s2).toBeDefined(); // the demotion is recorded
+  });
+
+  it("does NOT prune on lazy-expand (partial branch expansion keeps stale sessions)", () => {
+    const EPOCH = "stub-prune-ep2";
+    setState("epoch", EPOCH);
+    setState("sessions", "s1", { id: "s1" });
+    setState("sessions", "s2", { id: "s2" });
+    applySnapshot({
+      seq: 3,
+      epoch: EPOCH,
+      projected: true,
+      cause: "lazy-expand", // partial expansion — NOT a full rebuild
+      structuralRevision: 3,
+      sessions: [{ id: "s1" }],
+      stubs: [demoted("s2")],
+    });
+    // s2 preserved — reconcile must NOT fire on lazy-expand (a partial snapshot
+    // legitimately omits still-active sessions materialized elsewhere).
+    expect(state.sessions.s2).toBeDefined();
+    // The stub is still merged into the stub map.
+    expect(state.branchStubs.s2).toBeDefined();
+  });
+
+  it("preserves a session that is absent from the snapshot but NOT a stub (Gate A intact)", () => {
+    const EPOCH = "stub-prune-ep3";
+    setState("epoch", EPOCH);
+    setState("sessions", "s1", { id: "s1" });
+    setState("sessions", "s2", { id: "s2" }); // demoted → pruned
+    setState("sessions", "s3", { id: "s3" }); // absent but NOT a stub → preserved
+    applySnapshot({
+      seq: 2,
+      epoch: EPOCH,
+      projected: true,
+      cause: "promotion",
+      structuralRevision: 2,
+      sessions: [{ id: "s1" }],
+      stubs: [demoted("s2")], // only s2 demoted; s3 is simply not materialized
+    });
+    expect(state.sessions.s2).toBeUndefined(); // demoted (stub present) → pruned
+    expect(state.sessions.s3).toBeDefined(); // absent-but-not-stub → preserved (Gate A)
+    expect(state.sessions.s1).toBeDefined();
+  });
+
+  it("preserves the currently-open session even when it is demoted to a stub", () => {
+    const EPOCH = "stub-prune-ep4";
+    setState("epoch", EPOCH);
+    setState("sessions", "s1", { id: "s1" });
+    setState("sessions", "s2", { id: "s2" });
+    setSelectedIdRaw("s2"); // s2 is the viewed session — exempt from the prune
+    try {
+      applySnapshot({
+        seq: 2,
+        epoch: EPOCH,
+        projected: true,
+        cause: "promotion",
+        structuralRevision: 2,
+        sessions: [{ id: "s1" }],
+        stubs: [demoted("s2")],
+      });
+      // s2 stays materialized — dropping its payload would blank
+      // SessionInspector/ChatView mid-view. The render-layer guard already
+      // hides its stub, so skipping the prune loses nothing.
+      expect(state.sessions.s2).toBeDefined();
+      expect(state.branchStubs.s2).toBeDefined(); // stub still recorded
+    } finally {
+      setSelectedIdRaw(null); // don't leak the selection into other tests
+    }
+  });
+
+  it("does NOT prune per-session metadata when a session is demoted to a stub", () => {
+    const EPOCH = "stub-prune-ep5";
+    setState("epoch", EPOCH);
+    setState("sessions", "s1", { id: "s1" });
+    setState("sessions", "s2", { id: "s2" });
+    setState("lastAgents", "s2", "build");
+    setState("activity", "s2", "idle");
+    setState("permissions", "s2", { p1: { id: "p1" } as any });
+    applySnapshot({
+      seq: 2,
+      epoch: EPOCH,
+      projected: true,
+      cause: "promotion",
+      structuralRevision: 2,
+      sessions: [{ id: "s1" }],
+      stubs: [demoted("s2")],
+    });
+    // s2 pruned from sessions (collapsed into a stub), but its metadata
+    // SURVIVES — the session is NOT deleted and may be re-materialized on a
+    // later lazy-expand (this is the key difference from session.delete, which
+    // DOES prune these maps; see applySessionEvent above).
+    expect(state.sessions.s2).toBeUndefined();
+    expect(state.lastAgents.s2).toBe("build");
+    expect(state.activity.s2).toBe("idle");
+    expect(state.permissions.s2).toEqual({ p1: { id: "p1" } });
+  });
+
+  it("prunes a demoted session on an epoch-change full rebuild too", () => {
+    setState("epoch", "oldEpoch");
+    setState("sessions", "s1", { id: "s1" });
+    setState("sessions", "s2", { id: "s2" });
+    applySnapshot({
+      seq: 1,
+      epoch: "newEpoch", // epoch transition → full rebuild (changed === true)
+      projected: true,
+      structuralRevision: 1,
+      sessions: [{ id: "s1" }],
+      stubs: [demoted("s2")],
+    });
+    // The reconcile fires on the epoch-change full-rebuild path as well.
+    expect(state.sessions.s2).toBeUndefined();
+    expect(state.sessions.s1).toBeDefined();
+    expect(state.branchStubs.s2).toBeDefined();
+    expect(state.epochChanged).toBe(true); // epoch transition latched
   });
 });

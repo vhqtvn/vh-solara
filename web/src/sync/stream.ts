@@ -621,6 +621,13 @@ export function applySnapshot(snap: Snapshot) {
 function applyProjectedSnapshot(snap: Snapshot) {
   const incomingEpoch = snap.epoch || "";
   const changed = epochChanged(state.epoch, incomingEpoch);
+  // Capture the open/selected session BEFORE the produce block: a session the
+  // server demoted to a stub on a full-rebuild snapshot is pruned from
+  // state.sessions below — but the viewed session is exempt, since dropping its
+  // payload would blank SessionInspector/ChatView mid-view. The render-layer
+  // guard (!state.sessions[s.id]) already hides that one session's stub, so
+  // skipping the prune is correct and loses nothing.
+  const openId = selectedId();
   setState(
     produce((s) => {
       // Sessions: upsert incoming, PRESERVE absent. This is the core Gate A
@@ -656,18 +663,43 @@ function applyProjectedSnapshot(snap: Snapshot) {
       // be unread).
       for (const id of snap.unread || []) s.unread[id] = true;
       // Stubs (Phase 4): upsert incoming stubs. Replace the stub map entirely
-      // when cause="initial" or "promotion" (the server re-projects the full
-      // frontier); merge for "lazy-expand" (partial branch expansion). On epoch
-      // change, clear all stubs first (server restart invalidates them), then
-      // upsert the incoming stubs (they're from the NEW server).
-      if (changed) {
+      // when cause="initial"/"promotion"/"reconnect"/"resync" (the server
+      // re-projects the full frontier) or on epoch change (server restart
+      // invalidates them); merge for "lazy-expand" (partial branch expansion).
+      // The full-rebuild paths (changed || fullCause) ALSO reconcile
+      // state.sessions against the rebuilt stub map — see below.
+      const fullCause =
+        snap.cause === "initial" ||
+        snap.cause === "promotion" ||
+        snap.cause === "reconnect" ||
+        snap.cause === "resync";
+      if (changed || fullCause) {
         s.branchStubs = {};
         for (const stub of snap.stubs || []) s.branchStubs[stub.id] = stub;
-      } else if (snap.cause === "initial" || snap.cause === "promotion" || snap.cause === "reconnect" || snap.cause === "resync") {
-        s.branchStubs = {};
-        for (const stub of snap.stubs || []) s.branchStubs[stub.id] = stub;
+        // Reconcile: a session the server demoted to a stub (present in stubs,
+        // absent from snap.sessions) must leave state.sessions — else its stale
+        // materialized payload lingers alongside the stub, violating the
+        // server's session-XOR-stub invariant within one snapshot. This
+        // reconciles an EXPLICIT demotion (stub present), NOT an inferred
+        // deletion from omission, so Gate A (preserve-absent) is intact. The
+        // open session is exempt: the render-layer guard already hides its
+        // stub, and dropping its payload would blank the chat/inspector
+        // mid-view. Per-session metadata maps (activity/lastAgents/permissions/
+        // questions/currentVerbs/todos/unread) are intentionally NOT pruned —
+        // the session is collapsed into a stub, not deleted, and may be
+        // re-materialized on lazy-expand (unlike session.delete, which DOES
+        // prune those). Transcript state (messages/messagesLoaded/...) is
+        // orthogonal (Gate F) and likewise untouched.
+        const snapSessionIds = new Set((snap.sessions || []).map((sess) => sess.id));
+        for (const id of Object.keys(s.sessions)) {
+          if (s.branchStubs[id] && !snapSessionIds.has(id) && id !== openId) {
+            delete s.sessions[id];
+          }
+        }
       } else {
-        // lazy-expand or cause absent: merge
+        // lazy-expand or cause absent: merge (NO reconcile — a partial snapshot
+        // legitimately omits still-active sessions materialized in other
+        // branches; pruning them here would delete live data).
         for (const stub of snap.stubs || []) s.branchStubs[stub.id] = stub;
       }
       // Epoch transition: latch for the connection-health toast. On epoch
