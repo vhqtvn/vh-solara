@@ -30,6 +30,7 @@ beforeEach(() => {
   setState("questions", reconcile({}));
   setState("currentVerbs", reconcile({}));
   setState("expandedBranches", reconcile({}));
+  setState("branchStubs", reconcile({}));
   setState("epoch", "");
   setState("epochChanged", false);
   setState("cursor", 0);
@@ -712,5 +713,129 @@ describe("applySnapshot — Phase 3 structuralRevision guard", () => {
       structuralRevision: 2, // newer → apply
     });
     expect(state.sessions.c).toBeDefined(); // applied
+  });
+});
+
+describe("applySnapshot — Phase 4 stubs merge/replace/prune", () => {
+  const EPOCH = "ep4";
+  const stub = (id: string, over: Partial<Record<string, unknown>> = {}) => ({
+    id,
+    kind: "collapsed-branch" as const,
+    hasChildren: true,
+    descendantCount: 5,
+    aggregateState: "idle" as const,
+    ...over,
+  });
+
+  it("upserts stubs on initial projected snapshot (full replace)", () => {
+    setState("epoch", EPOCH);
+    setState("branchStubs", { stale: stub("stale") });
+    applySnapshot({
+      seq: 1,
+      epoch: EPOCH,
+      sessions: [{ id: "active" }],
+      projected: true,
+      cause: "initial",
+      structuralRevision: 1,
+      stubs: [stub("r1"), stub("r2")],
+    });
+    expect(state.branchStubs.r1).toBeDefined();
+    expect(state.branchStubs.r2).toBeDefined();
+    // "stale" was cleared by the full replace.
+    expect(state.branchStubs.stale).toBeUndefined();
+  });
+
+  it("replaces stubs on promotion (server re-projects full frontier)", () => {
+    setState("epoch", EPOCH);
+    // Seed stubs.
+    setState("branchStubs", {
+      old1: stub("old1"),
+      old2: stub("old2"),
+    });
+    applySnapshot({
+      seq: 2,
+      epoch: EPOCH,
+      sessions: [{ id: "promoted" }],
+      projected: true,
+      cause: "promotion",
+      structuralRevision: 2,
+      stubs: [stub("new1")],
+    });
+    // Promotion replaces the entire stub map.
+    expect(state.branchStubs.new1).toBeDefined();
+    expect(state.branchStubs.old1).toBeUndefined();
+    expect(state.branchStubs.old2).toBeUndefined();
+  });
+
+  it("merges stubs on lazy-expand (partial branch expansion)", () => {
+    setState("epoch", EPOCH);
+    // Seed stubs from initial projection.
+    setState("branchStubs", {
+      root1: stub("root1"),
+      root2: stub("root2"),
+    });
+    applySnapshot({
+      seq: 3,
+      epoch: EPOCH,
+      sessions: [{ id: "child1" }, { id: "child2" }],
+      projected: true,
+      cause: "lazy-expand",
+      structuralRevision: 3,
+      stubs: [stub("grand1"), stub("grand2")],
+    });
+    // Merge: new stubs added, existing stubs preserved.
+    expect(state.branchStubs.grand1).toBeDefined();
+    expect(state.branchStubs.grand2).toBeDefined();
+    expect(state.branchStubs.root1).toBeDefined(); // preserved
+    expect(state.branchStubs.root2).toBeDefined(); // preserved
+  });
+
+  it("clears stubs on epoch change (server restart invalidates them)", () => {
+    setState("epoch", "oldEpoch");
+    setState("branchStubs", {
+      r1: stub("r1"),
+      r2: stub("r2"),
+    });
+    applySnapshot({
+      seq: 5,
+      epoch: "newEpoch",
+      sessions: [{ id: "a" }],
+      projected: true,
+      structuralRevision: 1,
+      stubs: [stub("r3")],
+    });
+    // Epoch change clears the stub map first, then upserts incoming.
+    expect(state.branchStubs.r3).toBeDefined();
+    expect(state.branchStubs.r1).toBeUndefined(); // cleared by epoch change
+    expect(state.branchStubs.r2).toBeUndefined();
+  });
+
+  it("prunes stub on session.delete event", () => {
+    setState("epoch", EPOCH);
+    setState("branchStubs", {
+      doomed: stub("doomed"),
+      survivor: stub("survivor"),
+    });
+    applySessionEvent("session.delete", 10, { id: "doomed" });
+    expect(state.branchStubs.doomed).toBeUndefined();
+    expect(state.branchStubs.survivor).toBeDefined();
+  });
+
+  it("merges stubs when cause is absent (backward compatible)", () => {
+    setState("epoch", EPOCH);
+    setState("branchStubs", {
+      existing: stub("existing"),
+    });
+    applySnapshot({
+      seq: 7,
+      epoch: EPOCH,
+      sessions: [{ id: "a" }],
+      projected: true,
+      structuralRevision: 7,
+      stubs: [stub("added")],
+      // cause absent → merge path
+    });
+    expect(state.branchStubs.added).toBeDefined();
+    expect(state.branchStubs.existing).toBeDefined(); // preserved (merge)
   });
 });

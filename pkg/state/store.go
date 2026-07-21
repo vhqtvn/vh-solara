@@ -203,6 +203,13 @@ type Snapshot struct {
 	// client treats an absent field as "always apply" (also protects against old
 	// servers that don't stamp it). See Store.structuralRevision.
 	StructuralRevision uint64 `json:"structuralRevision,omitempty"`
+	// Stubs (Phase 4) carries collapsed-branch stubs for idle subtrees in a
+	// projected snapshot. Each stub represents a subtree that exists on the
+	// server but is NOT materialized as full sessions — the client renders it
+	// as a collapsed row with a descendant-count badge. Expanding a stub
+	// triggers a lazy-fetch to the branch endpoint. Absent in AUTHORITY_COMPLETE
+	// snapshots (projected=false).
+	Stubs []CollapsedBranchStub `json:"stubs,omitempty"`
 }
 
 // GateFacts is the denormalized "is this session safe to act on" summary for one
@@ -1106,6 +1113,11 @@ func (s *Store) bumpMsgRev(sid string) {
 // idempotent re-applies (==), and apply fresh state (>). Zero is never handed
 // out: the first bump yields 1, so 0 remains a safe "fresh store, never
 // mutated" sentinel (omitted from JSON via omitempty).
+//
+// Phase 4: the stream handler detects structural-change by inspecting the
+// event KIND (isStructuralKind), NOT via a separate KindStructuralChange event.
+// This avoids doubling the event volume on every mutation. See
+// isStructuralKind for the complete list.
 func (s *Store) bumpStructuralRevisionLocked() {
 	s.structuralRevision++
 }

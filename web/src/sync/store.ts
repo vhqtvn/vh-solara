@@ -5,7 +5,7 @@
 // without a cycle. State is reconciled by id, never nuked.
 import { createStore } from "solid-js/store";
 import { createSignal } from "solid-js";
-import type { ConnStatus, Permission, Question, Session, SessionMessages, TodoItem, VerbFacet } from "../types";
+import type { CollapsedBranchStub, ConnStatus, Permission, Question, Session, SessionMessages, TodoItem, VerbFacet } from "../types";
 import { loadVersioned, saveVersioned } from "../lib/store";
 
 const LS_SESSIONS = "vh.sessions.v1";
@@ -189,6 +189,12 @@ export interface SyncState {
   // stale expanded-set referencing dead stubs would be misleading). Populated
   // by Phase 4/5 (lazy-expand endpoint + Node branch-awareness); empty in Phase 2.
   expandedBranches: Record<string, boolean>;
+  // branchStubs (Phase 4): the collapsed-branch stubs from the latest projected
+  // snapshot. Keyed by stub ID. The SessionTree Node component reads this to
+  // render collapsed rows with aggregate state + descendant count. Updated on
+  // every projected snapshot (merge: upsert incoming, prune absent+deleted).
+  // Ephemeral — NOT persisted. Empty in AUTHORITY_COMPLETE mode.
+  branchStubs: Record<string, CollapsedBranchStub>;
   status: ConnStatus;
   cursor: number;
   // --- Connection-health diagnostics (FE-only) -----------------------------
@@ -253,6 +259,7 @@ export const [state, setState] = createStore<SyncState>({
   todos: {},
   unread: {},
   expandedBranches: {},
+  branchStubs: {},
   status: "connecting",
   cursor: loadCursor(initialDir),
   lastSeen: 0,

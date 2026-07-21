@@ -796,6 +796,13 @@ func (s *Server) Handler() http.Handler {
 	// MessagePageResult JSON envelope. csrfGuard exempts GET, so no CSRF
 	// exception is needed. See pkg/web/messages_http.go for the contract.
 	mux.HandleFunc("GET /vh/session/{sessionId}/messages", s.handleSessionMessages)
+	// Phase 4 lazy-expand endpoint: GET → no CSRF. Returns a projected snapshot
+	// (cause:"lazy-expand") with the children of the given frontier stub
+	// materialized as full sessions, plus stubs for the grandchildren. The
+	// client merges it via the projected merge path (upsert sessions + stubs).
+	// Continuation-based pagination via ?cursor=<last-child-id>; the next
+	// cursor (if more children remain) is returned as X-VH-Branch-Cursor.
+	mux.HandleFunc("GET /vh/sessions/branch", s.handleBranch)
 	// Feature modules (B) — the coordination write verbs (A1) are the first one.
 	s.mountFeatures(mux)
 	mux.HandleFunc("/vh/ack", s.handleAck)
@@ -1186,6 +1193,46 @@ func (s *Server) ensureMessages(ctx context.Context, agg *aggregator.Aggregator,
 	}
 }
 
+// handleBranch serves the lazy-expand endpoint (Phase 4): GET /vh/sessions/
+// branch?id=<frontier-id>&cursor=<last-child-id>. Returns a projected snapshot
+// with the children of the given frontier stub materialized as full sessions,
+// plus stubs for their idle descendants. Continuation-based: the next cursor
+// (if more children remain) is returned as X-VH-Branch-Cursor. GET → no CSRF.
+// Pure read — no state mutation, no message hydration (the client fetches
+// messages on demand for individual sessions).
+func (s *Server) handleBranch(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		http.Error(w, "missing id", http.StatusBadRequest)
+		return
+	}
+	agg := s.aggFor(reqDir(r))
+	if agg == nil {
+		http.Error(w, "project not found", http.StatusNotFound)
+		return
+	}
+	cursor := r.URL.Query().Get("cursor")
+	limitStr := r.URL.Query().Get("limit")
+	limit := 0 // 0 → defaultBranchExpandLimit
+	if limitStr != "" {
+		if n, err := strconv.Atoi(limitStr); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	snap, nextCursor := agg.Store().SnapshotBranch(id, cursor, limit)
+	b, err := json.Marshal(snap)
+	if err != nil {
+		vhlog.Error("branch: marshal failed", "dir", reqDir(r), "err", err)
+		http.Error(w, "branch marshal failed", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if nextCursor != "" {
+		w.Header().Set("X-VH-Branch-Cursor", nextCursor)
+	}
+	w.Write(maybeCompressSnapshot(b, wantsCompress(r)))
+}
+
 // projectScopedFilter returns a filter containing only the IDs that are members
 // of agg's project-scoped store. A nil filter ("all" request) passes through
 // unchanged — the SAFE branch at the call site already iterates SessionIDs(),
@@ -1361,7 +1408,16 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		// the fetch reconciles. Subscribe-before-trigger is preserved (we
 		// subscribed above) so no completion event slips through the gap.
 		s.triggerMessageLoad(agg, filter)
-		snap := store.Snapshot(filter)
+		// Phase 4: when proj=1, use the projected snapshot (roots + active
+		// closure + frontier stubs) instead of the wholesale AUTHORITY_COMPLETE
+		// snapshot. This is what cuts the ~1016-session payload to ~100 nodes
+		// for an idle-heavy workload.
+		var snap state.Snapshot
+		if wantsProject(r) {
+			snap = store.SnapshotProjected(filter, "initial")
+		} else {
+			snap = store.Snapshot(filter)
+		}
 		b, err := json.Marshal(snap)
 		if err != nil {
 			// Cannot fail for a well-typed *state.Snapshot today; log and skip
@@ -1412,6 +1468,26 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 				continue // background message/part for an unsubscribed session
 			}
 			writeEvent(w, ev.Seq, ev.Kind, ev.Payload)
+			// Phase 4: for proj=1 clients, re-snapshot after structural events
+			// (session/activity/permission/question changes) so the collapsed-
+			// frontier view stays in sync. A hidden session that becomes busy
+			// is promoted to the active closure; an active session that goes
+			// idle may be demoted to a stub. The structuralRevision guard on
+			// the client discards stale/duplicate re-snapshots. This rides the
+			// same Seq-ordered snapshot path (NOT the notice path).
+			if wantsProject(r) && state.IsStructuralKind(ev.Kind) {
+				// Pass `filter` (not nil) so promotion respects the same message
+				// scoping as the initial snapshot — otherwise every structural
+				// event re-ships transcripts for the entire active closure.
+				promoSnap := store.SnapshotProjected(filter, "promotion")
+				if pb, err := json.Marshal(promoSnap); err == nil {
+					writeRaw(w, promoSnap.Seq, "snapshot", maybeCompressSnapshot(pb, wantsCompress(r)))
+					// Advance baseline so buffered events already covered by the
+					// promotion snapshot are not re-emitted (mirrors the initial
+					// snapshot baseline bump at the snapshot send site above).
+					baseline = promoSnap.Seq
+				}
+			}
 			flusher.Flush()
 		case <-ticker.C:
 			// A NAMED ping event (not an SSE ` : comment`) so the client can observe

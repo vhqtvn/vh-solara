@@ -647,6 +647,21 @@ function applyProjectedSnapshot(snap: Snapshot) {
       // Unread: merge (incoming wins, absent preserved — a hidden root can still
       // be unread).
       for (const id of snap.unread || []) s.unread[id] = true;
+      // Stubs (Phase 4): upsert incoming stubs. Replace the stub map entirely
+      // when cause="initial" or "promotion" (the server re-projects the full
+      // frontier); merge for "lazy-expand" (partial branch expansion). On epoch
+      // change, clear all stubs first (server restart invalidates them), then
+      // upsert the incoming stubs (they're from the NEW server).
+      if (changed) {
+        s.branchStubs = {};
+        for (const stub of snap.stubs || []) s.branchStubs[stub.id] = stub;
+      } else if (snap.cause === "initial" || snap.cause === "promotion" || snap.cause === "reconnect" || snap.cause === "resync") {
+        s.branchStubs = {};
+        for (const stub of snap.stubs || []) s.branchStubs[stub.id] = stub;
+      } else {
+        // lazy-expand or cause absent: merge
+        for (const stub of snap.stubs || []) s.branchStubs[stub.id] = stub;
+      }
       // Epoch transition: latch for the connection-health toast. On epoch
       // change, clear expandedBranches (server restart invalidates all stubs).
       if (changed) {
@@ -686,6 +701,7 @@ export function applySessionEvent(kind: string, seq: number, payload: any) {
         delete s.messagesLoaded[payload.id];
         delete s.messagesError[payload.id];
         delete s.refreshing[payload.id];
+        delete s.branchStubs[payload.id]; // Phase 4: prune collapsed stub
         resetPageInFlight(payload.id);
       }
       if (seq) s.cursor = seq;

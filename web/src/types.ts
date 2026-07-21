@@ -100,6 +100,25 @@ export interface Snapshot {
   // > → apply. Undefined (omitempty) on a fresh store or absent from an old
   // server → client treats absent as "always apply".
   structuralRevision?: number;
+  // Stubs (Phase 4): collapsed-branch stubs for idle subtrees. Each stub
+  // represents a subtree that exists on the server but is NOT materialized as
+  // a full session — the client renders it as a collapsed row. Absent in
+  // AUTHORITY_COMPLETE snapshots.
+  stubs?: CollapsedBranchStub[];
+}
+
+// CollapsedBranchStub (Phase 4) is the wire representation of a collapsed idle
+// subtree. See Go's CollapsedBranchStub (pkg/state/projection.go).
+export interface CollapsedBranchStub {
+  id: string;
+  parentID?: string;
+  title?: string;
+  kind: "collapsed-branch";
+  hasChildren: boolean;
+  descendantCount: number;
+  newestActivityAt?: number; // unix millis, absent = never active
+  aggregateState: "idle" | "recent" | "busy" | "retry" | "needs-input";
+  structuralRevision?: number;
 }
 
 // Tier-A "current verb" facet: the RAW tool part primitive the daemon emits so
