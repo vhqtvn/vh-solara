@@ -1807,6 +1807,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       setInput("");
       const ok = await runShell(text.slice(1).trim(), id);
       if (!ok) setInput(text);
+      else if (props.draft) localStorage.removeItem(draftKey("__new__"));
       return;
     }
     // Normal prompt: enqueue-first for durability. sendText acquires durable
@@ -1835,6 +1836,13 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       setInput("");
       setAttachments([]);
     }
+    // For a draft, the draft->live transition (ensureSession -> createSession
+    // -> setSelectedId) unmounts this ChatView in App.tsx, which disposes the
+    // draft-save createEffect above BEFORE the setInput("") just fired can
+    // re-run it — so the persisted vh.draft.__new__ slot would survive and
+    // re-inflate the composer on the next New session. Clear it explicitly at
+    // the moment of success, before the unmount races it.
+    if (props.draft) localStorage.removeItem(draftKey("__new__"));
   }
 
   // Copy / Retry text extraction lives in ../lib/msgText (pure, unit-tested).
