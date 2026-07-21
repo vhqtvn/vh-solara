@@ -1400,6 +1400,33 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		}
 		baseline = head
 		sw.RecordReplayPath() // PROBE 3: cursor-replay baseline branch
+		// Finding #2 / DEFER #5: a projected Stream1 resume must RE-ESTABLISH
+		// projection state even on a successful replay. branchStubs and
+		// expandedBranches are EPHEMERAL (never persisted — store.ts persist()
+		// saves only sessions/cursor/activity/lastAgents), so after a page
+		// reload with a valid cursor the replay succeeds but the frontier stubs
+		// are never reconstructed until the next structural event — the client
+		// renders the stale full tree (defeating O1) or a pruned cache with
+		// stubs missing. Emit a projected `cause:"reconnect"` snapshot AFTER the
+		// replayed events so applyProjectedSnapshot rebuilds branchStubs
+		// (reconnect is a fullCause → wholesale stub replace + reconcile). The
+		// client's Finding #1 guard treats cause=reconnect as a fullRebuild →
+		// exempt from the same-revision idempotency skip, so it applies even
+		// when the replay already advanced the cursor to head. baseline is
+		// pinned to the snapshot's seq so the replayed events (seq<=head) are
+		// not re-forwarded by the live tail and the snapshot's coverage is not
+		// duplicated. Legacy (non-projected) replay keeps the replay-only path:
+		// a resumed legacy client already carries the wholesale authoritative
+		// set from its first cold-load snapshot and reconciles via live events.
+		if wantsProject(r) {
+			rcSnap := store.SnapshotProjected(filter, "reconnect")
+			if rb, err := json.Marshal(rcSnap); err == nil {
+				writeRaw(w, rcSnap.Seq, "snapshot", maybeCompressSnapshot(rb, wantsCompress(r)))
+				baseline = rcSnap.Seq
+			} else {
+				vhlog.Warn("stream reconnect snapshot: marshal failed, skipping", "err", err)
+			}
+		}
 	} else {
 		// Fresh client or cursor too old: send a full snapshot, then live-tail.
 		// NON-BLOCKING hydration: kick the upstream fetch off in the background

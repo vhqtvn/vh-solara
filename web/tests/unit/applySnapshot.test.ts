@@ -698,15 +698,16 @@ describe("applySnapshot — Phase 3 structuralRevision guard", () => {
     setState("epoch", EPOCH);
     // First: seed with a complete snapshot at revision 1.
     applySnapshot(snap(1, [{ id: "a" }]));
-    // Second: a projected snapshot at revision 1 (==) — should be skipped.
+    // A projected snapshot at revision 1 with the SAME seq is a genuine
+    // duplicate → idempotent skip (caught-up seq, not a full-rebuild cause).
     applySnapshot({
-      seq: 2,
+      seq: 1,
       epoch: EPOCH,
       sessions: [{ id: "a" }, { id: "b" }],
       projected: true,
-      structuralRevision: 1, // same → idempotent skip
+      structuralRevision: 1, // same rev, same seq → genuine dup → skip
     });
-    expect(state.sessions.b).toBeUndefined(); // NOT applied
+    expect(state.sessions.b).toBeUndefined(); // NOT applied — idempotent skip
     // Third: a projected snapshot at revision 2 (>) — should be applied.
     applySnapshot({
       seq: 3,
@@ -996,12 +997,17 @@ describe("applySnapshot — stub-demotion reconcile prunes stale state.sessions"
     expect(state.branchStubs.s2).toBeDefined();
   });
 
-  it("preserves a session that is absent from the snapshot but NOT a stub (Gate A intact)", () => {
+  it("preserves a deep idle child collapsed under a stub (Gate A intact)", () => {
     const EPOCH = "stub-prune-ep3";
     setState("epoch", EPOCH);
     setState("sessions", "s1", { id: "s1" });
-    setState("sessions", "s2", { id: "s2" }); // demoted → pruned
-    setState("sessions", "s3", { id: "s3" }); // absent but NOT a stub → preserved
+    setState("sessions", "s2", { id: "s2" }); // root, demoted → pruned
+    // s3 is a DEEP child of s2 (parentID="s2"). When s2 is collapsed into a
+    // stub, s3's subtree is NOT enumerated by the server frontier — the
+    // frontier is exhaustive only one level deep under a MATERIALIZED (active)
+    // parent. s2 is a stub (not materialized), so s3 must be PRESERVED (Gate A:
+    // omission ≠ deletion where the frontier is not authoritative). [DEFER #1]
+    setState("sessions", "s3", { id: "s3", parentID: "s2" });
     applySnapshot({
       seq: 2,
       epoch: EPOCH,
@@ -1009,10 +1015,10 @@ describe("applySnapshot — stub-demotion reconcile prunes stale state.sessions"
       cause: "promotion",
       structuralRevision: 2,
       sessions: [{ id: "s1" }],
-      stubs: [demoted("s2")], // only s2 demoted; s3 is simply not materialized
+      stubs: [demoted("s2")], // only s2 demoted; s3 hidden under s2's stub
     });
     expect(state.sessions.s2).toBeUndefined(); // demoted (stub present) → pruned
-    expect(state.sessions.s3).toBeDefined(); // absent-but-not-stub → preserved (Gate A)
+    expect(state.sessions.s3).toBeDefined(); // deep idle child → preserved (Gate A)
     expect(state.sessions.s1).toBeDefined();
   });
 
@@ -1086,5 +1092,242 @@ describe("applySnapshot — stub-demotion reconcile prunes stale state.sessions"
     expect(state.sessions.s1).toBeDefined();
     expect(state.branchStubs.s2).toBeDefined();
     expect(state.epochChanged).toBe(true); // epoch transition latched
+  });
+});
+
+// Theme 1 — reconnect/replay authority. Finding #1 (ring-gap snapshot at the
+// SAME structuralRevision discarded wholesale → stale facets + cursor stall),
+// Finding #2 / DEFER #5 (cursor-replay must re-establish the projected
+// frontier), and DEFER #1 (ghost sessions after localStorage hydration).
+describe("applySnapshot — Theme 1 reconnect/replay authority", () => {
+  const demoted = (id: string) => ({
+    id,
+    kind: "collapsed-branch" as const,
+    hasChildren: false,
+    descendantCount: 0,
+    aggregateState: "idle" as const,
+  });
+
+  // Finding #1 (CRITICAL): a ring-gap (4096 missed NON-structural events) →
+  // reconnect → server sends a fresh snapshot at the SAME structuralRevision
+  // (topology unchanged) but a newer seq with reconciled facets. The old guard
+  // discarded it wholesale (== → skip), leaving stale facets AND a stalled
+  // cursor while the server had advanced its baseline. Now: same-rev + newer-seq
+  // merges authoritative facets + advances the cursor; topology is not regressed
+  // (same rev ⟹ same topology ⟹ merge is non-regressing).
+  it("Finding #1: same-revision newer-seq reconnect reconciles facets + advances cursor", () => {
+    const EPOCH = "ring-gap-ep";
+    setState("epoch", EPOCH);
+    // Seed a projected full-rebuild at rev=10, seq=100 with stale facets.
+    applySnapshot({
+      seq: 100,
+      epoch: EPOCH,
+      projected: true,
+      cause: "promotion",
+      structuralRevision: 10,
+      sessions: [{ id: "a" }],
+      activity: { a: "busy" },
+      permissions: { a: [{ id: "p1" }] },
+      stubs: [demoted("b")],
+    });
+    expect(state.activity.a).toBe("busy");
+    expect(state.permissions.a).toEqual({ p1: { id: "p1" } });
+    expect(state.cursor).toBe(100);
+
+    // Ring-gap reconnect: same rev (topology unchanged), newer seq, reconciled
+    // facets (a went idle, perms cleared, b still a stub).
+    applySnapshot({
+      seq: 5000,
+      epoch: EPOCH,
+      projected: true,
+      cause: "reconnect",
+      structuralRevision: 10, // SAME revision
+      sessions: [{ id: "a" }],
+      activity: { a: "idle" }, // busy → idle
+      permissions: { a: [] }, // cleared
+      stubs: [demoted("b")], // topology unchanged
+    });
+    // Facets reconciled (NOT wholesale-skipped):
+    expect(state.activity.a).toBe("idle"); // would stay "busy" without the fix
+    expect(state.permissions.a).toEqual({}); // would stay {p1} without the fix
+    // Cursor advanced to the reconnect seq:
+    expect(state.cursor).toBe(5000); // would stay 100 without the fix
+    // Topology not regressed: a still materialized, b still a stub.
+    expect(state.sessions.a).toBeDefined();
+    expect(state.branchStubs.b).toBeDefined();
+  });
+
+  // Finding #2 / DEFER #5 (client half): a cause=reconnect snapshot MUST apply
+  // even when its seq is already caught up (seq <= cursor) — this is what
+  // reconstructs the ephemeral frontier stubs after a page reload where the
+  // server's cursor-replay succeeded (no events to catch up) but the stubs were
+  // lost (branchStubs is never persisted). Without the fullRebuild exemption the
+  // caught-up idempotency skip would leave the stubs missing.
+  it("Finding #2: cause=reconnect rebuilds frontier stubs even at a caught-up seq", () => {
+    const EPOCH = "reconnect-stubs-ep";
+    setState("epoch", EPOCH);
+    // Initial projection establishes the frontier: a active, b a stub.
+    applySnapshot({
+      seq: 100,
+      epoch: EPOCH,
+      projected: true,
+      cause: "initial",
+      structuralRevision: 7,
+      sessions: [{ id: "a" }],
+      stubs: [demoted("b")],
+    });
+    expect(state.branchStubs.b).toBeDefined();
+    expect(state.cursor).toBe(100);
+
+    // Simulate a page reload: ephemeral branchStubs are lost (never persisted),
+    // but cursor survives in localStorage.
+    setState("branchStubs", reconcile({}));
+    expect(state.branchStubs.b).toBeUndefined();
+
+    // Server replay succeeds (no events to catch up) then emits a reconnect
+    // snapshot at the SAME seq/rev to re-establish the frontier.
+    applySnapshot({
+      seq: 100, // caught-up seq (<= cursor)
+      epoch: EPOCH,
+      projected: true,
+      cause: "reconnect", // fullRebuild → exempt from the caught-up skip
+      structuralRevision: 7, // same revision
+      sessions: [{ id: "a" }],
+      stubs: [demoted("b")],
+    });
+    // Frontier stubs reconstructed (would stay missing without the exemption):
+    expect(state.branchStubs.b).toBeDefined();
+  });
+
+  // DEFER #1: a ghost ROOT — a client root that's absent from BOTH snap.sessions
+  // and stubs under a full-rebuild was deleted server-side (every server root is
+  // either active-in-snap or an idle stub). It must be pruned so it doesn't
+  // render after localStorage hydration when its session.delete fell outside the
+  // replay ring.
+  it("DEFER #1: prunes a ghost root absent from snap.sessions and stubs on full rebuild", () => {
+    const EPOCH = "ghost-root-ep";
+    setState("epoch", EPOCH);
+    // Client state after hydration: alive root + a ghost root (server-deleted,
+    // session.delete missed outside the replay ring).
+    setState("sessions", "alive", { id: "alive" });
+    setState("sessions", "ghost", { id: "ghost" });
+    // Full-rebuild promotion: alive materialized; ghost absent from BOTH.
+    applySnapshot({
+      seq: 2,
+      epoch: EPOCH,
+      projected: true,
+      cause: "promotion",
+      structuralRevision: 2,
+      sessions: [{ id: "alive" }],
+      stubs: [], // ghost is NOT a stub → it's a ghost
+    });
+    expect(state.sessions.alive).toBeDefined();
+    expect(state.sessions.ghost).toBeUndefined(); // ghost root pruned
+  });
+
+  // DEFER #1: a ghost CHILD of a materialized parent. Under an active parent
+  // the frontier is exhaustive one level deep — every non-active child is a
+  // stub — so a child absent from both snap.sessions and stubs was deleted.
+  it("DEFER #1: prunes a ghost child of a materialized parent", () => {
+    const EPOCH = "ghost-child-ep";
+    setState("epoch", EPOCH);
+    // parent is active (materialized); ghostchild was deleted server-side.
+    setState("sessions", "parent", { id: "parent" });
+    setState("sessions", "ghostchild", { id: "ghostchild", parentID: "parent" });
+    applySnapshot({
+      seq: 2,
+      epoch: EPOCH,
+      projected: true,
+      cause: "promotion",
+      structuralRevision: 2,
+      sessions: [{ id: "parent" }],
+      stubs: [], // ghostchild NOT a stub → ghost (parent materialized)
+    });
+    expect(state.sessions.parent).toBeDefined();
+    expect(state.sessions.ghostchild).toBeUndefined(); // ghost child pruned
+  });
+
+  // DEFER #1: the open/viewed session is exempt from the ghost prune (dropping
+  // its payload would blank the inspector mid-view; the render-layer guard hides
+  // its stub). Mirrors the demotion-reconcile open-session exemption.
+  it("DEFER #1: does NOT prune the open session even if it is a ghost", () => {
+    const EPOCH = "ghost-open-ep";
+    setState("epoch", EPOCH);
+    setState("sessions", "alive", { id: "alive" });
+    setState("sessions", "ghostopen", { id: "ghostopen" });
+    setSelectedIdRaw("ghostopen"); // viewed → exempt
+    try {
+      applySnapshot({
+        seq: 2,
+        epoch: EPOCH,
+        projected: true,
+        cause: "promotion",
+        structuralRevision: 2,
+        sessions: [{ id: "alive" }],
+        stubs: [],
+      });
+      expect(state.sessions.ghostopen).toBeDefined(); // exempt — still materialized
+    } finally {
+      setSelectedIdRaw(null);
+    }
+  });
+
+  // DEFER #1: a child whose parent is itself hidden (a stub, not materialized)
+  // is PRESERVED — the frontier is not authoritative there (deep idle subtree).
+  // (Companion to the deep-child case in the stub-demotion describe block.)
+  it("DEFER #1: preserves a child whose parent is a collapsed stub (not materialized)", () => {
+    const EPOCH = "ghost-deep-ep";
+    setState("epoch", EPOCH);
+    setState("sessions", "root", { id: "root" });
+    setState("sessions", "collapsed", { id: "collapsed", parentID: "root" }); // demoted → stub
+    setState("sessions", "deep", { id: "deep", parentID: "collapsed" }); // under collapsed stub
+    applySnapshot({
+      seq: 2,
+      epoch: EPOCH,
+      projected: true,
+      cause: "promotion",
+      structuralRevision: 2,
+      sessions: [{ id: "root" }],
+      stubs: [demoted("collapsed")], // collapsed is a stub, not materialized
+    });
+    expect(state.sessions.collapsed).toBeUndefined(); // demoted (stub present)
+    expect(state.sessions.deep).toBeDefined(); // preserved — parent hidden, frontier not authoritative
+  });
+
+  // F1 advisory (commit-review 3-leaf consensus): isolate the PURE ring-gap
+  // fall-through — same-rev + newer-seq + NO fullRebuild cause. The guard has
+  // two independent escape hatches from the caught-up idempotency skip:
+  // (a) fullRebuild cause set, (b) seq newer than cursor (caughtUp=false). This
+  // locks branch (b) so a regression that dropped fullRebuild OR broke the seq
+  // comparison is caught. (In production a projected snapshot reaching this
+  // function always carries a fullRebuild cause; this is a guard-logic unit.)
+  it("Finding #1: same-revision newer-seq merges even without a fullRebuild cause", () => {
+    const EPOCH = "ring-gap-nocause-ep";
+    setState("epoch", EPOCH);
+    applySnapshot({
+      seq: 100,
+      epoch: EPOCH,
+      projected: true,
+      cause: "promotion",
+      structuralRevision: 10,
+      sessions: [{ id: "a" }],
+      activity: { a: "busy" },
+    });
+    expect(state.activity.a).toBe("busy");
+    expect(state.cursor).toBe(100);
+
+    // Same rev, newer seq, NO fullRebuild cause (cause absent → fullRebuild=false).
+    // caughtUp is false (seq 5000 > cursor 100) → falls through via branch (b).
+    applySnapshot({
+      seq: 5000,
+      epoch: EPOCH,
+      projected: true,
+      // cause intentionally absent → fullRebuild=false
+      structuralRevision: 10, // SAME revision
+      sessions: [{ id: "a" }],
+      activity: { a: "idle" },
+    });
+    expect(state.activity.a).toBe("idle"); // merged, not wholesale-skipped
+    expect(state.cursor).toBe(5000); // cursor advanced
   });
 });

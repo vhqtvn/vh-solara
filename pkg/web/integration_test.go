@@ -422,6 +422,122 @@ func TestStreamResumeReplaysFromCursor(t *testing.T) {
 	}
 }
 
+// readSSEFrameWithTimeout reads one SSE frame (event+data) with a deadline so a
+// MISSING frame (a regression) fails the test fast instead of hanging on the
+// blocking live-tail read. Mirrors readSSEEventWithTimeout.
+func readSSEFrameWithTimeout(t *testing.T, r *bufio.Reader, d time.Duration) (event, data string) {
+	t.Helper()
+	type res struct {
+		ev  string
+		d   string
+		err error
+	}
+	c := make(chan res, 1)
+	go func() {
+		ev, d, err := readSSEFrameErr(r)
+		c <- res{ev, d, err}
+	}()
+	select {
+	case got := <-c:
+		if got.err != nil {
+			t.Fatalf("read stream: %v", got.err)
+		}
+		return got.ev, got.d
+	case <-time.After(d):
+		t.Fatalf("timed out reading SSE frame after %v", d)
+		return "", ""
+	}
+}
+
+// readSSEFrameErr is readSSEFrame but returns the error instead of fataling, so
+// it can run in the timeout goroutine above.
+func readSSEFrameErr(r *bufio.Reader) (event, data string, err error) {
+	for {
+		line, e := r.ReadString('\n')
+		if e != nil {
+			return "", "", e
+		}
+		line = strings.TrimRight(line, "\r\n")
+		if line == "" {
+			if event != "" {
+				return event, data, nil
+			}
+			continue
+		}
+		if strings.HasPrefix(line, "event:") {
+			event = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+		} else if strings.HasPrefix(line, "data:") {
+			data = strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		}
+	}
+}
+
+// TestStreamProjectedReconnectSnapshot (Theme 1 Finding #2 / DEFER #5): a
+// projected Stream1 client that resumes from a VALID cursor must STILL receive a
+// projected snapshot (cause:"reconnect") AFTER the replayed events, so it can
+// rebuild its ephemeral frontier stubs (branchStubs/expandedBranches are never
+// persisted by the client — only sessions/cursor/activity/lastAgents survive a
+// reload). Before the fix the replay path emitted ONLY replayed events and no
+// snapshot, so a page reload left the collapsed-frontier stubs missing until the
+// next structural event (rendering the stale full tree — defeating O1 — or a
+// pruned cache with holes). The reconnect snapshot's baseline is pinned to its
+// own seq so the replayed events are not re-forwarded by the live tail.
+func TestStreamProjectedReconnectSnapshot(t *testing.T) {
+	fake := newFake()
+	fake.sessions = []string{`{"id":"a","title":"A","time":{"updated":1}}`}
+	ocSrv := httptest.NewServer(fake.handler())
+	defer ocSrv.Close()
+
+	agg := aggregator.New(ocSrv.URL, 1000)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go agg.Run(ctx)
+	waitFor(t, func() bool { return len(agg.Store().Snapshot(nil).Sessions) == 1 }, "hydrate")
+
+	head := agg.Store().Snapshot(nil).Seq
+
+	srv, _ := NewServer(agg, ocSrv.URL, 1000)
+	web := httptest.NewServer(srv.Handler())
+	defer web.Close()
+
+	// Resume from the current head with proj=1 (projected Stream1). The cursor
+	// is valid (within the replay ring) and at head, so NO events replay — but a
+	// projected client must still get a reconnect snapshot to rebuild stubs.
+	resp, err := http.Get(web.URL + "/vh/stream?cursor=" + fmt.Sprintf("%d", head) + "&proj=1&sessions=")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	reader := bufio.NewReader(resp.Body)
+
+	// The leading `: hello` comment has no event: line and is skipped by the
+	// frame reader; the reconnect snapshot is flushed immediately after the
+	// (empty) replay. Read up to a few frames to find it (regression = none).
+	var gotSnapshot bool
+	for i := 0; i < 8; i++ {
+		ev, data := readSSEFrameWithTimeout(t, reader, 2*time.Second)
+		if ev == "snapshot" {
+			gotSnapshot = true
+			var snap map[string]any
+			if err := json.Unmarshal([]byte(data), &snap); err != nil {
+				t.Fatalf("reconnect snapshot not valid JSON: %v (data=%s)", err, data)
+			}
+			if snap["projected"] != true {
+				t.Fatalf("reconnect snapshot must be projected:true, got %v", snap["projected"])
+			}
+			if snap["cause"] != "reconnect" {
+				t.Fatalf("reconnect snapshot must have cause:\"reconnect\", got %v", snap["cause"])
+			}
+			break
+		}
+		// Any other event (e.g. a replayed session.upsert if head advanced) is
+		// fine — keep reading for the snapshot that follows.
+	}
+	if !gotSnapshot {
+		t.Fatal("projected cursor-replay must emit a cause:reconnect snapshot after replay (Finding #2); got none")
+	}
+}
+
 // TestLazyHydration verifies messages are NOT fetched per-session at startup,
 // only when a client opens a session (GET /vh/snapshot?sessions=id).
 func TestLazyHydration(t *testing.T) {

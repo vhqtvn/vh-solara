@@ -502,7 +502,37 @@ export function applySnapshot(snap: Snapshot) {
     lastAppliedStructuralRevision !== undefined
   ) {
     if (snap.structuralRevision < lastAppliedStructuralRevision) return;
-    if (snap.structuralRevision === lastAppliedStructuralRevision) return;
+    if (snap.structuralRevision === lastAppliedStructuralRevision) {
+      // Finding #1: structuralRevision versions ONLY projection topology/stubs.
+      // Non-structural facets (lastAgents, currentVerbs, todos, statuses,
+      // unread) are NOT covered by it. A ring-gap (4096 missed NON-structural
+      // events) → reconnect → server sends a fresh snapshot at the SAME
+      // revision → the old client discarded it wholesale → stale facets
+      // persisted AND the resume cursor never advanced, while the server had
+      // already moved its baseline forward (direct sibling of stale-busy). Now:
+      // same-revision idempotency-skips ONLY a genuine duplicate (caught-up seq
+      // AND not a frontier-rebuild cause). A same-rev snapshot with a NEWER seq
+      // (ring-gap fill — topology unchanged, authoritative facets advanced) OR a
+      // full-rebuild cause (initial/promotion/reconnect/resync — re-establishes
+      // the frontier even at a caught-up seq, needed by Finding #2) MUST fall
+      // through so authoritative facets reconcile and the cursor advances. Since
+      // structuralRevision guards topology only, a same-rev merge is by
+      // construction non-regressing on topology (no stub resurrected, no node
+      // demoted wrongly) — projected merges preserve-absent for sessions, and
+      // the complete path's wholesale replace is authoritative at that revision.
+      const fullRebuild =
+        !!snap.projected &&
+        (snap.cause === "initial" ||
+          snap.cause === "promotion" ||
+          snap.cause === "reconnect" ||
+          snap.cause === "resync");
+      const caughtUp =
+        snap.seq !== undefined &&
+        state.cursor !== undefined &&
+        snap.seq <= state.cursor;
+      if (caughtUp && !fullRebuild) return; // genuine duplicate → idempotent skip
+      // else: same rev + newer seq (ring-gap) OR full-rebuild → fall through
+    }
   }
   // Phase 2 Gate A: projected snapshots use MERGE semantics — sessions absent
   // from the array are PRESERVED as hidden, NOT deleted. Only an explicit
@@ -599,7 +629,13 @@ export function applySnapshot(snap: Snapshot) {
 // ABSENT from the array are PRESERVED as hidden — they are collapsed behind a
 // frontier stub on the server and will be lazy-expanded on demand. Only an
 // explicit `session.delete` event removes a session (Gate A core rule:
-// projected snapshots MAY NOT infer deletion from omission).
+// projected snapshots MAY NOT infer deletion from omission). The ONE
+// exception is a full-rebuild snapshot (cause initial|promotion|reconnect|
+// resync): the frontier is then authoritative for roots + one level under
+// each materialized parent, so a client session absent from BOTH snap.sessions
+// and snap.stubs there is a ghost (deleted server-side, e.g. its session.delete
+// fell outside the replay ring) and is pruned. Deep idle subtrees whose parent
+// is itself a collapsed stub stay preserved (frontier not authoritative there).
 //
 // Merge semantics per slice:
 //   - sessions:       UPSERT incoming; PRESERVE absent (hidden !== deleted).
@@ -690,9 +726,58 @@ function applyProjectedSnapshot(snap: Snapshot) {
         // re-materialized on lazy-expand (unlike session.delete, which DOES
         // prune those). Transcript state (messages/messagesLoaded/...) is
         // orthogonal (Gate F) and likewise untouched.
+        // Full-rebuild reconcile: walk every client session and prune those the
+        // server no longer materializes. Two cases (both exclude openId — the
+        // viewed session's payload is never dropped mid-view; its render-layer
+        // stub guard hides it):
+        //   (a) EXPLICIT DEMOTION — a stub exists for this id (the server
+        //       collapsed it behind the frontier). Prune the stale materialized
+        //       payload so it doesn't linger alongside its stub (the original
+        //       duplicate-session fix). NOT a deletion — per-session metadata is
+        //       preserved (the session may re-materialize on lazy-expand).
+        //   (b) GHOST (DEFER #1) — NO stub exists either, i.e. the id is absent
+        //       from BOTH snap.sessions and stubs. Under a full-rebuild snapshot
+        //       this means server-deleted — but ONLY conclude that where the
+        //       frontier is AUTHORITATIVE: a ROOT (every server root is either
+        //       active-in-snap or an idle stub, so a client root that's neither
+        //       was deleted) or a child of a MATERIALIZED parent (the frontier
+        //       is exhaustive one level deep under an active parent — every
+        //       non-active child is emitted as a stub, so absence = deleted).
+        //       Deeper idle subtrees whose parent is itself hidden are NOT
+        //       authoritative — preserve them (Gate A: omission ≠ deletion).
+        //       Ghosts are progressively cleaned as the user navigates and
+        //       lazy-expand materializes the next level. Per-session metadata is
+        //       intentionally NOT pruned here (consistent with the demotion
+        //       case); the authoritative metadata prune is the session.delete
+        //       event path. This fixes the ghost-RENDERING risk (a deleted
+        //       session appearing in the tree after localStorage hydration when
+        //       its session.delete fell outside the replay ring).
         const snapSessionIds = new Set((snap.sessions || []).map((sess) => sess.id));
+        const stubIds = new Set(Object.keys(s.branchStubs));
         for (const id of Object.keys(s.sessions)) {
-          if (s.branchStubs[id] && !snapSessionIds.has(id) && id !== openId) {
+          if (id === openId) continue;
+          if (snapSessionIds.has(id)) continue; // server materialized it → keep
+          if (stubIds.has(id)) {
+            // (a) explicit demotion: stub present → collapse the materialized
+            //     payload into the stub row.
+            delete s.sessions[id];
+            continue;
+          }
+          // (b) ghost: absent from both snap.sessions and stubs.
+          const parentID = s.sessions[id]?.parentID || "";
+          // A TRUE root (no parentID): every server root is either active
+          // (in snap.sessions) or an idle stub, so a client root absent from
+          // both was deleted. NOTE: do NOT treat an orphan (parentID set but
+          // parent missing from state.sessions) as a ghost root — its parent
+          // may be collapsed behind a stub (preserved here) and orphan cleanup
+          // is a separate concern (orphans.ts). Cascading a demotion prune into
+          // a child ghost-prune would wrongly delete deep idle subtrees.
+          const ghostRoot = !parentID;
+          // A child of a MATERIALIZED parent: the frontier is exhaustive one
+          // level deep under an active parent, so a child absent from both the
+          // active set and the stub set was deleted.
+          const ghostChild = !!parentID && snapSessionIds.has(parentID);
+          if (ghostRoot || ghostChild) {
             delete s.sessions[id];
           }
         }

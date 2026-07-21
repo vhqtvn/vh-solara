@@ -190,7 +190,9 @@ type Snapshot struct {
 	Projected bool `json:"projected,omitempty"`
 	// Cause identifies why a projected snapshot was emitted:
 	//   "initial"     — first open (fresh client, no valid cursor)
-	//   "reconnect"   — cursor too old to replay
+	//   "reconnect"   — projected resume: re-project the frontier after cursor
+	//                   replay succeeds (rebuilds the ephemeral stubs a reloaded
+	//                   client lost); also used when the cursor is too old to replay
 	//   "promotion"   — hidden→active atomic promotion (live activity on a stubbed session)
 	//   "lazy-expand" — branch expand endpoint response
 	//   "resync"      — epoch-change forced re-snapshot
