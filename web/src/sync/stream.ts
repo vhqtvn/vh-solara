@@ -1085,6 +1085,31 @@ function recordSessionFetchSplit(fetchMs: number | undefined, reconcileMs: numbe
 let treeT0 = 0;
 let treeT1 = 0;
 let treeSnapDone = false;
+// treeGen is the tree-stream connection generation. Bumped at every connect()
+// so an async gzip64 snapshot decode captured by a PRIOR (now-closed)
+// connection can detect it was superseded and refuse to mutate the store.
+// Mirrors Stream 2's sesGen: a sync listener is naturally bounded by es.close()
+// (pending events are dropped), but the gzip64 snapshot decode AWAITs, so the
+// close can land mid-decode. The captured `gen` is checked at listener entry
+// and again after the await. Without this, a stale decode from a superseded
+// connection would clobber the replacement's fresh state with a stale snapshot.
+let treeGen = 0;
+// In-flight gzip64 snapshot decode for the CURRENT tree connection. A warm
+// tree snapshot ships compressed (server maybeCompressSnapshot when z=1); the
+// decode is ASYNC (native DecompressionStream). applySnapshot
+// WHOLESALE-REPLACES state.sessions AND unconditionally sets
+// state.cursor=snap.seq, so a session.upsert/session.delete/TREE_STREAM_KINDS
+// frame landing in the decode window would have its store mutation clobbered
+// AND the cursor REGRESSED from the live event's higher seq back to the
+// snapshot's seq when the stale-but-now-decoded snapshot lands. Promise-gate
+// exactly like sesSnapshotDecode: the tree live-event listeners await this
+// before processing ANY frame for the stream. Connect-time only (a snapshot
+// decode is ms-scale) and bounded to one (the current connection's). Reset on
+// each (re)open. treeSnapshotDecoding is the cheap boolean the fast path
+// checks to avoid a microtask when no decode is in flight (tree event floods
+// must stay zero-latency).
+let treeSnapshotDecode: Promise<void> = Promise.resolve();
+let treeSnapshotDecoding = false;
 let sesT0 = 0;
 let sesT1 = 0;
 let sesSnapDone = false;
@@ -1205,8 +1230,35 @@ function reconcileBusy(): Promise<void> {
 // the reference is valid even though they're textually defined below.
 setReconcileFn(reconcileBusy);
 
+// isTreeSnapshotDecoding — test-only peek at the module-private decode flag.
+// DecompressionStream's internal pipeline chains multiple microtasks; tests
+// using fake timers loop flushes until this flips false so the flush count is
+// deterministic regardless of suite load (a fixed flush count is fragile).
+export function isTreeSnapshotDecoding(): boolean {
+  return treeSnapshotDecoding;
+}
+
+// getTreeSnapshotDecode — test-only accessor for the in-flight decode promise.
+// Lets tests await the decode directly (deterministic) instead of pumping fake
+// timers (which is fragile with native DecompressionStream under load).
+export function getTreeSnapshotDecode(): Promise<void> {
+  return treeSnapshotDecode;
+}
+
 export function connect(fresh = false) {
   clearTimeout(reconnectTimer);
+  // Invalidate any in-flight async gzip64 snapshot decode captured by a PRIOR
+  // connection BEFORE we close it. Bumping the generation first means a stale
+  // decode's post-await gen check fails and it refuses to mutate the store,
+  // even on the empty-projectDir early-return path (switchProject("") →
+  // connect()). Mirrors Stream 2's closeSessionStream order (sesGen++ BEFORE
+  // ses?.close()); the prior Stream-1 order (close THEN bump) left a stale-
+  // decode hazard on the empty-dir path.
+  treeGen++;
+  // Reset the in-flight decode gate so a live tree event landing on the new
+  // connection doesn't await a stale decode from the prior connection.
+  treeSnapshotDecode = Promise.resolve();
+  treeSnapshotDecoding = false;
   es?.close();
   // No project selected (daemon cwd is not a meaningful project): do NOT open
   // a tree stream. The watchdog/maybeReconnect also no-op while projectDir is
@@ -1220,14 +1272,36 @@ export function connect(fresh = false) {
   treeT0 = performance.now(); // L1 t0: connection attempt begins
   treeT1 = 0;
   treeSnapDone = false;
-  es = new EventSource(`/vh/stream?${cursorParam}sessions=&dir=${encodeURIComponent(projectDir())}`);
+  // Capture the generation for THIS connection's listeners. The bump above
+  // already invalidated any prior decode; this `gen` is checked at listener
+  // entry and after every await in the snapshot listener.
+  const gen = treeGen;
+  // Stream 1 (tree) opts into the server's gzip64 snapshot compression with
+  // `&z=1`, mirroring Stream 2's session stream. The tree snapshot for a real
+  // project is ~760 KiB–1.1 MiB of highly-repetitive JSON (one project, one
+  // directory, a handful of agents/models) and ships UNCOMPRESSED through the
+  // controller tunnel without this flag (the tunnel does not compress at any
+  // lower layer). gzip cuts it to ~150–200 KiB on the wire — ~5–7x smaller.
+  // The server's maybeCompressSnapshot only wraps payloads ≥ 2 KiB AND only
+  // when z=1 is set, so small/raw responses (an old server, or an edge-case
+  // tiny tree) still ship raw and the listener handles both shapes.
+  es = new EventSource(`/vh/stream?${cursorParam}sessions=&dir=${encodeURIComponent(projectDir())}&z=1`);
   markTreeSeen();
   log.debug("sync", "tree stream connect", { cursor: fresh ? "fresh" : state.cursor, dir: projectDir() });
   es.addEventListener("snapshot", (e) => {
+    // Generation guard: ignore frames from a superseded connection BEFORE
+    // touching the clock or the store. The gzip64 path awaits, so this same
+    // guard is re-checked after the await — a stale decode must NOT mutate the
+    // store or clear state. Mirrors Stream 2's sesGen guard.
+    if (gen !== treeGen) return;
     markTreeSeen();
-    let snap: Snapshot;
+    // Parse the outer envelope ONCE. The server emits either the raw snapshot
+    // JSON (small/legacy) OR {encoding:"gzip64", data:base64(gzip(snapshot))}
+    // when z=1 AND the payload exceeds the threshold. The decode helper is a
+    // total function (pass-through when no envelope), so both shapes work.
+    let raw: any;
     try {
-      snap = JSON.parse((e as MessageEvent).data);
+      raw = JSON.parse((e as MessageEvent).data);
     } catch (err) {
       // A malformed snapshot carries an UNREADABLE seq (it lives in the JSON
       // body, not the SSE id field), so the resume cursor can't be advanced from
@@ -1238,29 +1312,84 @@ export function connect(fresh = false) {
       log.warn("sync", "malformed tree snapshot frame", { err });
       return;
     }
-    if (isGateActive() && !expectTreeSnap) {
-      // Deferred tree snapshot during a busy scope — advance the resume cursor
-      // (Stream 1) but do NOT mutate the store or run refreshOpenSessions.
-      advanceCursor(snap.seq);
-      markBusyDirty();
-      return;
+    // applySnap owns the full post-decode state transition (gate short-circuit,
+    // expectTreeSnap resolution, wholesale apply, latency, status, refresh).
+    // Defined as a closure so BOTH the compressed IIFE and the synchronous raw
+    // path run the exact same logic — no divergence between the two shapes.
+    const applySnap = (snap: Snapshot) => {
+      if (isGateActive() && !expectTreeSnap) {
+        // Deferred tree snapshot during a busy scope — advance the resume cursor
+        // (Stream 1) but do NOT mutate the store or run refreshOpenSessions.
+        advanceCursor(snap.seq);
+        markBusyDirty();
+        return;
+      }
+      if (expectTreeSnap) {
+        expectTreeSnap = false;
+        maybeResolveReconcile();
+      }
+      applySnapshot(snap);
+      // L1 t2: first snapshot of this connection → server-processing delta.
+      if (!treeSnapDone) {
+        treeSnapDone = true;
+        if (treeT1) recordLatency("tree", "snap", performance.now() - treeT1);
+      }
+      setState("status", "live");
+      void refreshOpenSessions();
+    };
+    // Compressed path: async decode, gated behind treeSnapshotDecode so live
+    // session.upsert/session.delete/TREE_STREAM_KINDS frames in the decode
+    // window serialize behind it (the shared tree listeners await it) —
+    // applySnapshot WHOLESALE-REPLACES state.sessions and unconditionally sets
+    // state.cursor=snap.seq, so a live event applied mid-decode would have its
+    // store mutation clobbered AND the cursor REGRESSED from the live event's
+    // higher seq back to the snapshot's seq when the stale-but-now-decoded
+    // snapshot lands. Until applySnap runs the PRIOR tree state stays in place
+    // → no flash-of-empty through the decode window. Raw path: synchronous
+    // apply, exactly the legacy behavior (cold small trees, zero decode
+    // latency). Mirrors Stream 2's sesSnapshotDecode pattern verbatim.
+    if (raw.encoding === "gzip64") {
+      treeSnapshotDecoding = true;
+      treeSnapshotDecode = (async () => {
+        try {
+          let snap: Snapshot;
+          try {
+            snap = await decodeSnapshot<Snapshot>(raw);
+          } catch (err) {
+            // decodeSnapshot is a total function (returns {} on malformed), so
+            // this catch is defensive — but never let a decode throw propagate
+            // to an unhandled promise rejection. Drop the frame; live events +
+            // the next snapshot reconcile.
+            log.warn("sync", "tree snapshot gzip64 decode failed", { err });
+            return;
+          }
+          // Generation re-check (mirrors Stream 2's post-await sesGen check):
+          // the connection may have been replaced while we were decoding. A
+          // superseded decode must NOT mutate the store, advance the cursor, or
+          // run latency effects: the replacement connection owns the tree state.
+          if (gen !== treeGen) return;
+          applySnap(snap);
+        } finally {
+          // Ownership-aware clear: only the CURRENT generation owns the flag.
+          // A superseded connection's decode must NOT clear treeSnapshotDecoding
+          // while the replacement's decode is still in flight — doing so would
+          // re-open the decode-window race across reconnects: the replacement's
+          // live-event listeners would take their synchronous fast path (boolean
+          // short-circuits to false), apply ahead of the replacement snapshot,
+          // and applySnapshot would then wholesale-replace + cursor-regress.
+          // The post-await gen check above prevents a stale APPLY; this guard
+          // prevents a stale CLEAR. Without it the flag-reset race re-introduces
+          // the exact anti-clobber failure the serialize gate exists to close.
+          if (gen === treeGen) treeSnapshotDecoding = false;
+        }
+      })();
+    } else {
+      applySnap(raw as Snapshot);
     }
-    if (expectTreeSnap) {
-      expectTreeSnap = false;
-      maybeResolveReconcile();
-    }
-    applySnapshot(snap);
-    // L1 t2: first snapshot of this connection → server-processing delta.
-    if (!treeSnapDone) {
-      treeSnapDone = true;
-      if (treeT1) recordLatency("tree", "snap", performance.now() - treeT1);
-    }
-    setState("status", "live");
-    void refreshOpenSessions();
   });
   es.addEventListener("ping", () => markTreeSeen()); // heartbeat for the watchdog
   for (const kind of ["session.upsert", "session.delete"]) {
-    es.addEventListener(kind, (e) => {
+    es.addEventListener(kind, async (e) => {
       markTreeSeen();
       const ev = e as MessageEvent;
       const seq = Number(ev.lastEventId);
@@ -1270,16 +1399,45 @@ export function connect(fresh = false) {
         markBusyDirty();
         return;
       }
+      // Serialize against an in-flight gzip64 snapshot decode for this
+      // connection. applySnapshot WHOLESALE-REPLACES state.sessions and sets
+      // state.cursor=snap.seq; a live session event applied during the decode
+      // window would be clobbered and the cursor REGRESSED when the stale-but-
+      // now-decoded snapshot lands. Wait ONLY when a decode is actually in
+      // flight — the boolean check is a no-op on the fast path so session
+      // event floods keep zero microtask latency. Connect-time only. Mirrors
+      // Stream 2's sesSnapshotDecoding gate.
+      if (treeSnapshotDecoding) await treeSnapshotDecode;
+      // Generation re-check: the connection may have been replaced during the
+      // wait. The entry guard ran before the await, so drop the stale
+      // continuation here before any state effect.
+      if (gen !== treeGen) return;
+      // The busy gate may have activated during the wait — defer the same way
+      // the synchronous entry path does (advance cursor, latch dirty).
+      if (isGateActive()) {
+        advanceCursor(seq);
+        markBusyDirty();
+        return;
+      }
       applyTreeFrame(kind, seq, ev.data, applySessionEvent);
     });
   }
   for (const kind of TREE_STREAM_KINDS) {
-    es.addEventListener(kind, (e) => {
+    es.addEventListener(kind, async (e) => {
       markTreeSeen();
       const ev = e as MessageEvent;
       const seq = Number(ev.lastEventId);
       if (isGateActive()) {
         // Deferred — Stream 1 advances the resume cursor but does not mutate.
+        advanceCursor(seq);
+        markBusyDirty();
+        return;
+      }
+      // Serialize against an in-flight gzip64 snapshot decode (see the
+      // session.upsert listener above for the full rationale).
+      if (treeSnapshotDecoding) await treeSnapshotDecode;
+      if (gen !== treeGen) return;
+      if (isGateActive()) {
         advanceCursor(seq);
         markBusyDirty();
         return;
@@ -1704,7 +1862,13 @@ export function openSessionStream(id: string, force = false) {
               markBusyDirty();
             }
           } finally {
-            sesSnapshotDecoding = false;
+            // Ownership-aware clear: only the CURRENT generation owns the flag.
+            // A superseded connection's decode must NOT clear sesSnapshotDecoding
+            // while the replacement's decode is still in flight — same cross-
+            // reconnect flag-reset race as the tree stream's treeSnapshotDecoding
+            // gate. The post-await gen check above prevents a stale APPLY; this
+            // guard prevents a stale CLEAR.
+            if (gen === sesGen) sesSnapshotDecoding = false;
           }
         })();
         // Resolve after the decode lands (or is queued via microtask for the

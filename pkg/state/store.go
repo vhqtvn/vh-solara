@@ -1630,6 +1630,11 @@ func (s *Store) PendingPermissions() map[string][]json.RawMessage {
 		for _, perm := range m {
 			list = append(list, perm)
 		}
+		// Collapse byte-identical duplicates to match Snapshot.Permissions
+		// exactly (TestPendingPermissionsMatchesSnapshot pins the two paths to
+		// the same set). See dedupRawMessages for the lossless / order-
+		// preserving contract.
+		list = dedupRawMessages(list)
 		out[sid] = list
 	}
 	return out
@@ -2774,6 +2779,14 @@ func (s *Store) Snapshot(messagesFor map[string]bool) Snapshot {
 		for i, p := range ps {
 			out[i] = p // captured copy
 		}
+		// Collapse byte-identical duplicates (the permission-array bloat fix).
+		// LOSSLESS and order-preserving; see dedupRawMessages. Applied here at
+		// the materialization phase so the wire payload is the authoritative
+		// deduped set without touching s.perms (the store's source of truth
+		// keeps every entry keyed by its permID — a future permission.delete
+		// for any one id still clears correctly through PendingPermissions /
+		// the live emit path).
+		out = dedupRawMessages(out)
 		snap.Permissions[sid] = out
 	}
 	for sid, st := range statuses {
@@ -3765,4 +3778,47 @@ func removeString(xs []string, x string) []string {
 		}
 	}
 	return xs
+}
+
+// dedupRawMessages returns subslice of in containing only the first occurrence
+// of each byte-identical entry (order preserved; later duplicates dropped). It
+// is the wire-volume fix for the permission-array bloat observed on the live
+// controller topology: 937/1016 sessions carried arrays with byte-identical
+// entries repeated (e.g. {todowrite,*,deny} 3×). The map keyed by permID keeps
+// distinct IDs distinct, so byte-identical VALUES across distinct keys is the
+// degenerate case this collapses.
+//
+// LOSSLESS: byte-identical entries carry zero information — the client already
+// keys its permission map by payload.id, so duplicate ids collapse on the
+// client anyway; byte-identical entries (same id, somehow landed under multiple
+// map keys via the rehydrate path) render one card either way. Dropping the
+// redundant copies changes ONLY the wire byte count, never the rendered set.
+//
+// ORDER-PRESERVING (first-occurrence wins) so the snapshot is deterministic
+// within a single call — matters for revision validation / diff stability
+// (a later snapshot of the same store state must not reshuffle the array on
+// the dedup boundary). The input order comes from Go map iteration, which is
+// nondeterministic across runs, so the dedup itself is stable within one call
+// but the output is not byte-stable across calls. Revision validation keys on
+// Snapshot.Seq, so cross-call nondeterminism is correct.
+// Returned slice aliases the input backing array (via in[:0]) — the caller
+// MUST NOT retain a separate view of `in` after calling, since the compaction
+// overwrites the prefix of the backing array. The output slice reuses the
+// backing array with zero extra allocation; the `seen` map IS allocated
+// unconditionally for len(in) ≥ 2.
+func dedupRawMessages(in []json.RawMessage) []json.RawMessage {
+	if len(in) < 2 {
+		return in
+	}
+	seen := make(map[string]struct{}, len(in))
+	out := in[:0] // reuse the backing array in place
+	for _, p := range in {
+		key := string(p)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, p)
+	}
+	return out
 }

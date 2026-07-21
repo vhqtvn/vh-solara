@@ -1436,12 +1436,16 @@ func writeRaw(w io.Writer, seq uint64, event string, data []byte) {
 
 // snapshotCompressThreshold is the minimum marshaled-snapshot size above which
 // maybeCompressSnapshot will gzip64-wrap the payload. Below it the raw JSON is
-// sent as-is: small payloads (cold/messageless partial snapshots, the tree-only
-// snapshot) gain nothing from gzip and base64 inflates them, and keeping them
-// raw lets the client ingest them on the synchronous fast path (no async
-// DecompressionStream round-trip). The warm open of a loaded session is the only
-// snapshot that exceeds this (a full transcript — megabytes), which is exactly
-// the case the compression targets.
+// sent as-is: small payloads (cold/messageless partial snapshots, a tiny tree)
+// gain nothing from gzip and base64 inflates them, and keeping them raw lets
+// the client ingest them on the synchronous fast path (no async
+// DecompressionStream round-trip). Above the threshold, two payloads benefit:
+// (1) the warm open of a loaded session (a full transcript — megabytes), and
+// (2) the tree-only snapshot for a real project (~760 KiB–1.1 MiB of highly
+// repetitive JSON — one directory/projectID/model/agent set repeated across
+// ~1k sessions). Both clients opt in via `z=1`; the tree stream was wired to
+// `z=1` after a live study found the tree reconnect cadence (~60/hr) was
+// shipping ~40–68 MiB/hr of uncompressed tree snapshots through the tunnel.
 const snapshotCompressThreshold = 2048
 
 // wantsCompress reports whether the client opted into gzip64 snapshot encoding

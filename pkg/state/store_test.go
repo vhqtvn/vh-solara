@@ -383,6 +383,111 @@ func TestPendingPermissionsReturnsIndependentCopies(t *testing.T) {
 	}
 }
 
+// TestSnapshotDedupsByteIdenticalPermissions pins the permission-array wire-
+// volume fix. A live study of the controller topology found 937/1016 sessions
+// carrying permission arrays with byte-identical entries repeated 3× (e.g.
+// {todowrite,*,deny}). The store's permission.asked handler keys s.perms by
+// payload.id, so this state is reachable when opencode re-emits the same
+// permission content under different ids, or when the rehydrate path
+// (SetPendingPermissions) lands the same bytes under multiple keys.
+// dedupRawMessages collapses byte-identical values at the Snapshot projection
+// and PendingPermissions read — LOSSLESSLY (the client keys its permission map
+// by payload.id, so duplicate copies render one card either way) and ORDER-
+// PRESERVING (first occurrence wins, for diff stability across captures).
+func TestSnapshotDedupsByteIdenticalPermissions(t *testing.T) {
+	s := New(100)
+	// Simulate the live bug shape: three map keys whose VALUES are byte-
+	// identical (separate slices, same content — the realistic case where each
+	// event landed a fresh []byte copy). Using distinct keys (not the same
+	// pointer) proves the dedup is content-based, not identity-based.
+	permBytes := []byte(`{"id":"x","sessionID":"a","permission":"todowrite","scope":"*","rule":"deny"}`)
+	s.mu.Lock()
+	if s.perms == nil {
+		s.perms = map[string]map[string]json.RawMessage{}
+	}
+	s.perms["a"] = map[string]json.RawMessage{
+		"k1": append([]byte(nil), permBytes...),
+		"k2": append([]byte(nil), permBytes...),
+		"k3": append([]byte(nil), permBytes...),
+	}
+	s.mu.Unlock()
+
+	// Snapshot.Permissions must collapse the three byte-identical entries to
+	// exactly one. The client keys its permission map by payload.id, so the
+	// three copies would have rendered one card anyway — this only changes the
+	// wire byte count.
+	snapPerms := s.Snapshot(nil).Permissions["a"]
+	if len(snapPerms) != 1 {
+		t.Fatalf("Snapshot.Permissions must dedup 3 byte-identical entries to 1, got %d: %s", len(snapPerms), snapPerms)
+	}
+	// PendingPermissions must agree (TestPendingPermissionsMatchesSnapshot pins
+	// the two paths to the same set; the dedup must not break that parity).
+	pendingPerms := s.PendingPermissions()["a"]
+	if len(pendingPerms) != 1 {
+		t.Fatalf("PendingPermissions must dedup 3 byte-identical entries to 1, got %d: %s", len(pendingPerms), pendingPerms)
+	}
+}
+
+// TestSnapshotPreservesDistinctPermissions is the negative case for the dedup:
+// distinct permission entries (different bytes) must ALL survive. Guards
+// against an over-aggressive dedup that could drop legitimately distinct
+// permissions (e.g. deduping on a prefix instead of full bytes).
+func TestSnapshotPreservesDistinctPermissions(t *testing.T) {
+	s := New(100)
+	s.SetPendingPermissions([]json.RawMessage{
+		json.RawMessage(`{"id":"p1","sessionID":"a","permission":"bash"}`),
+		json.RawMessage(`{"id":"p2","sessionID":"a","permission":"edit"}`),
+		json.RawMessage(`{"id":"p3","sessionID":"a","permission":"web"}`),
+	})
+	snapPerms := s.Snapshot(nil).Permissions["a"]
+	if len(snapPerms) != 3 {
+		t.Fatalf("Snapshot.Permissions must keep 3 distinct entries, got %d: %s", len(snapPerms), snapPerms)
+	}
+	pendingPerms := s.PendingPermissions()["a"]
+	if len(pendingPerms) != 3 {
+		t.Fatalf("PendingPermissions must keep 3 distinct entries, got %d: %s", len(pendingPerms), pendingPerms)
+	}
+}
+
+// TestSnapshotDedupPermissionsMixed pins the order-preserving + mixed case:
+// when a session's permission array interleaves byte-identical and distinct
+// entries, the dedup keeps the first occurrence of each distinct value (in
+// captured order) and drops only the exact-duplicate copies.
+func TestSnapshotDedupPermissionsMixed(t *testing.T) {
+	s := New(100)
+	aBytes := []byte(`{"id":"a","sessionID":"s","permission":"bash"}`)
+	bBytes := []byte(`{"id":"b","sessionID":"s","permission":"edit"}`)
+	s.mu.Lock()
+	if s.perms == nil {
+		s.perms = map[string]map[string]json.RawMessage{}
+	}
+	// Map iteration order is nondeterministic, but the dedup is stable within
+	// one call: the output contains exactly the set {a, b}, regardless of which
+	// duplicate copy survives as the "first occurrence".
+	s.perms["s"] = map[string]json.RawMessage{
+		"a1": append([]byte(nil), aBytes...),
+		"b1": append([]byte(nil), bBytes...),
+		"a2": append([]byte(nil), aBytes...),
+		"b2": append([]byte(nil), bBytes...),
+		"a3": append([]byte(nil), aBytes...),
+	}
+	s.mu.Unlock()
+
+	got := s.Snapshot(nil).Permissions["s"]
+	if len(got) != 2 {
+		t.Fatalf("Snapshot.Permissions must dedup 5 entries (3×a + 2×b) to 2 distinct, got %d: %s", len(got), got)
+	}
+	// The two survivors must be the distinct values {a, b} (set equality; order
+	// is nondeterministic upstream because map iteration is).
+	seen := map[string]bool{}
+	for _, p := range got {
+		seen[string(p)] = true
+	}
+	if !seen[string(aBytes)] || !seen[string(bBytes)] {
+		t.Fatalf("dedup output must contain both distinct values, got set %v", seen)
+	}
+}
+
 func TestSetActivityFromStatuses(t *testing.T) {
 	s := New(100)
 	ch, unsub := s.Subscribe(8)
