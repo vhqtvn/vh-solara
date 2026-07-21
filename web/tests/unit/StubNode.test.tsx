@@ -193,3 +193,57 @@ describe("StubNode as child of session", () => {
     expect(container.querySelector(`[data-stub-id="idleKid"]`)).toBeNull();
   });
 });
+
+// Regression: stub-vs-session dedup invariant. When a session is demoted to a
+// collapsed-branch stub, the merge layer (applyProjectedSnapshot) clears+rebuilds
+// state.branchStubs on a full snapshot but never removes the now-stale
+// state.sessions[id] (preserve-absent is load-bearing for lazy-expand). That
+// leaves BOTH maps holding the same id. The materialized <Node> (data-session-id)
+// must win and the stale <StubNode> (data-stub-id) must be suppressed at EVERY
+// tree depth: root, visible session child, and nested stub child.
+describe("StubNode dedup invariant (stub-vs-session coexist)", () => {
+  // Asserts S renders EXACTLY ONCE as a <Node> and NOT as a <StubNode>.
+  function assertSingleRenderAsNode(container: HTMLElement, id: string): void {
+    const sessionNode = container.querySelectorAll(`[data-session-id="${id}"]`);
+    const stubNode = container.querySelector(`[data-stub-id="${id}"]`);
+    expect(sessionNode.length, `session <Node> for ${id} should render exactly once`).toBe(1);
+    expect(stubNode, `stub <StubNode> for ${id} must be suppressed when a live session exists`).toBeNull();
+  }
+
+  it("suppresses a stub ROOT whose own id is a live session", () => {
+    // Coexist condition: same id "dupRoot" is BOTH a materialized root session
+    // AND a projected stub root.
+    setState("sessions", "dupRoot", { id: "dupRoot", title: "Dup Root" });
+    putStub(baseStub({ id: "dupRoot", title: "Dup Root Stub" }));
+    const { container } = render(() => <SessionTree />);
+    assertSingleRenderAsNode(container as unknown as HTMLElement, "dupRoot");
+  });
+
+  it("suppresses a stub CHILD (of a session) whose own id is a live session", () => {
+    // Parent session in expanded mode so its stub children would render.
+    setState("sessions", "root", { id: "root", title: "Root" });
+    localStorage.setItem("vh.tree.mode.v2", JSON.stringify({ v: 1, data: { root: "expanded" } }));
+    __resetTreeForTest();
+    // Coexist: "dupChild" is BOTH a materialized child of root AND a stub child.
+    setState("sessions", "dupChild", { id: "dupChild", parentID: "root", title: "Dup Child" });
+    putStub(baseStub({ id: "dupChild", parentID: "root", title: "Dup Child Stub" }));
+    const { container } = render(() => <SessionTree />);
+    assertSingleRenderAsNode(container as unknown as HTMLElement, "dupChild");
+  });
+
+  it("suppresses a NESTED stub child (under an expanded stub) whose own id is a live session", () => {
+    // root (expanded) → outerStub (a real stub, expanded) → dupNested.
+    setState("sessions", "root", { id: "root", title: "Root" });
+    localStorage.setItem("vh.tree.mode.v2", JSON.stringify({ v: 1, data: { root: "expanded" } }));
+    __resetTreeForTest();
+    putStub(baseStub({ id: "outerStub", parentID: "root", title: "Outer Stub" }));
+    // Expand the outer stub so its session + stub children render.
+    setState("expandedBranches", "outerStub", true);
+    // Coexist: "dupNested" is BOTH a materialized child of outerStub AND a
+    // nested stub child of outerStub.
+    setState("sessions", "dupNested", { id: "dupNested", parentID: "outerStub", title: "Dup Nested" });
+    putStub(baseStub({ id: "dupNested", parentID: "outerStub", title: "Dup Nested Stub" }));
+    const { container } = render(() => <SessionTree />);
+    assertSingleRenderAsNode(container as unknown as HTMLElement, "dupNested");
+  });
+});

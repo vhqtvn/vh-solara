@@ -52,8 +52,13 @@ function StubNode(props: {
   const sessionKids = () => props.index()[props.stub.id] || [];
   // Nested stub children (grandchildren that are themselves collapsed). These
   // come from state.branchStubs, not state.sessions.
+  // Dedup invariant (stub-vs-session): suppress a stub whose own id is a live,
+  // materialized session — see the matching guard in SessionTree. The
+  // materialized <Node> always wins.
   const stubKids = () =>
-    Object.values(state.branchStubs).filter((s) => s.parentID === props.stub.id);
+    Object.values(state.branchStubs).filter(
+      (s) => s.parentID === props.stub.id && !state.sessions[s.id],
+    );
 
   const totalKids = () => sessionKids().length + stubKids().length;
 

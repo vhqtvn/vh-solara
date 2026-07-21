@@ -197,8 +197,19 @@ export function Node(props: {
   // the session index (they're in state.branchStubs), so they need a separate
   // accessor. Display-mode filtering applies to them too: a filtered node
   // shows only stubs with active work underneath (busy/retry/needs-input).
+  // Dedup invariant (stub-vs-session): a stub whose OWN id is a live,
+  // materialized session must NOT render. When a session is demoted to a stub
+  // the merge layer (applyProjectedSnapshot) clears+rebuilds state.branchStubs
+  // but never removes the now-stale state.sessions[id] (preserve-absent is
+  // load-bearing for lazy-expand / partial snapshots). That leaves both maps
+  // holding the same id. The materialized <Node> always wins — it carries the
+  // full payload — so the stale stub is suppressed here at the source. This
+  // single guard covers both visibleStubKids() (the render path) and the
+  // twisty leaf-check (stubKids().length === 0).
   const stubKids = (): CollapsedBranchStub[] =>
-    Object.values(state.branchStubs).filter((s) => s.parentID === props.session.id);
+    Object.values(state.branchStubs).filter(
+      (s) => s.parentID === props.session.id && !state.sessions[s.id],
+    );
   const visibleStubKids = (): CollapsedBranchStub[] => {
     switch (display()) {
       case "collapsed":
@@ -521,9 +532,12 @@ export default function SessionTree() {
   // materialized (they're roots in the projected tree, even though the server
   // collapsed their entire subtree into a single stub). These render alongside
   // session roots, sorted by recency.
+  // Dedup invariant (stub-vs-session): suppress a stub whose own id is a live,
+  // materialized session — see the matching guard on Node.stubKids(). The
+  // materialized <Node> (rendered via the session index / roots) always wins.
   const stubRoots = () =>
     Object.values(state.branchStubs).filter(
-      (s) => !s.parentID || !state.sessions[s.parentID],
+      (s) => (!s.parentID || !state.sessions[s.parentID]) && !state.sessions[s.id],
     );
   const ancestors = createMemo(() => selectedAncestors());
   const isWorking = (id: string) => working().has(id);
