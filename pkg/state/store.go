@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -131,6 +132,16 @@ type ClientEvent struct {
 	// unchanged, the ring stores it transparently, and writeEvent/replay
 	// ignore it. Zero means "no ingest t0" (hydrate/daemon events).
 	ingestNano int64
+
+	// FrontierChanged (Phase 2 finding B) is true when THIS specific event
+	// changed the collapsed-frontier membership (session create/delete/reparent,
+	// pending-input boundary change, or the FIRST activity of a previously-
+	// inactive session). The stream handler gates the promotion coalesce arm on
+	// this per-event flag instead of comparing a global counter against a
+	// snapshot-stamped value (which races with the aggregator's concurrent
+	// poll-loop re-applies). json:"-" keeps it off the wire (the wire shape is
+	// bit-for-bit unchanged — seq/kind/payload only).
+	FrontierChanged bool `json:"-"`
 }
 
 // Snapshot is the full current view plus the head seq a client resumes from.
@@ -205,6 +216,12 @@ type Snapshot struct {
 	// client treats an absent field as "always apply" (also protects against old
 	// servers that don't stamp it). See Store.structuralRevision.
 	StructuralRevision uint64 `json:"structuralRevision,omitempty"`
+	// FrontierSeq (Phase 2 finding B) is the frontier-membership counter
+	// captured under RLock at snapshot construction time. NEVER serialized
+	// (json:"-"). DIAGNOSTICS-ONLY: retained for observability (not yet wired
+	// to the /vh/diag/latency endpoint). The stream handler does NOT read it
+	// gate uses the per-event ClientEvent.FrontierChanged flag instead.
+	FrontierSeq uint64 `json:"-"`
 	// Stubs (Phase 4) carries collapsed-branch stubs for idle subtrees in a
 	// projected snapshot. Each stub represents a subtree that exists on the
 	// server but is NOT materialized as full sessions — the client renders it
@@ -1052,6 +1069,32 @@ type Store struct {
 	// newEpoch at New, never reassigned), so the counter is monotonic per-epoch
 	// by construction; a new Store (new process/epoch) starts fresh at 0.
 	structuralRevision uint64
+	// frontierSeq (Phase 2 tunnel-amp finding B) is the DIAGNOSTICS-ONLY
+	// monotonic counter for collapsed-frontier membership changes. It mirrors
+	// the same predicate as the per-event ClientEvent.FrontierChanged flag
+	// (retained for observability — not yet wired to /vh/diag/latency). The
+	// stream handler's promotion-coalesce arm gates on FrontierChanged, NOT on
+	// this counter.
+	//
+	// BUMPED on: session create/reparent (upsertSessionLocked, hydrate);
+	// delete (deleteSessionLocked); pending-input boundary change
+	// (notePendingInputChangeLocked); the FIRST activity of a previously-
+	// inactive (>cutoff) session (setActivityLocked). NOT bumped on busy↔retry
+	// flips, metadata-only session.updated, or any activity transition of an
+	// already-selfActive session.
+	//
+	// DISTINCT from structuralRevision: structuralRevision bumps on EVERY
+	// activity transition + every upsert (the client uses it for staleness/
+	// idempotency guards and MUST stay coarse). frontierSeq is the narrower
+	// signal. atomic.Uint64 so the diagnostics reader is lock-free via
+	// FrontierSeq().
+	frontierSeq atomic.Uint64
+	// curFrontierChanged (Phase 2 finding B) is set to true by the frontier
+	// bump sites BEFORE the accompanying emit() call, so emit() can stamp
+	// ClientEvent.FrontierChanged. emit() resets it to false after stamping.
+	// The stream handler gates the promotion coalesce arm on this per-event
+	// flag (wantsProject(r) && ev.FrontierChanged).
+	curFrontierChanged bool
 	// coldFetchActive marks sessions whose background full-history GET
 	// (EnsureMessagesAsync) is in flight. Live events that arrive while this
 	// flag is set tag their entries (liveTouchedBody / liveTouchedParts) so
@@ -1173,6 +1216,22 @@ func (s *Store) bumpStructuralRevisionLocked() {
 	s.structuralRevision++
 }
 
+// bumpFrontierSeqLocked advances the collapsed-frontier-membership counter
+// (Phase 2 finding B). Caller must hold s.mu. Bumped only at genuine
+// frontier-change sites (create/delete/reparent, pending-input boundary,
+// first activity of a previously-inactive session). See Store.frontierSeq.
+func (s *Store) bumpFrontierSeqLocked() {
+	s.frontierSeq.Add(1)
+}
+
+// FrontierSeq returns the current frontier-membership counter. Lock-free
+// (atomic load). DIAGNOSTICS-ONLY: retained for observability (not yet wired
+// to the /vh/diag/latency endpoint). The stream handler does NOT call this —
+// the promotion-arm gate uses the per-event ClientEvent.FrontierChanged flag.
+func (s *Store) FrontierSeq() uint64 {
+	return s.frontierSeq.Load()
+}
+
 // emit stamps, records, and fans out a client event. Caller must hold s.mu.
 //
 // Interest filtering is applied HERE (upstream of the channel) so a
@@ -1186,7 +1245,8 @@ func (s *Store) bumpStructuralRevisionLocked() {
 // closes+removes that subscriber, never blocking the producer.
 func (s *Store) emit(kind string, payload json.RawMessage) {
 	s.seq++
-	ev := ClientEvent{Seq: s.seq, Kind: kind, Payload: payload, ingestNano: s.curEmitIngest}
+	ev := ClientEvent{Seq: s.seq, Kind: kind, Payload: payload, ingestNano: s.curEmitIngest, FrontierChanged: s.curFrontierChanged}
+	s.curFrontierChanged = false
 	s.ring.push(ev)
 	sid := ""
 	if isMessageClassKind(kind) {
@@ -1328,6 +1388,36 @@ func (s *Store) setActivityLocked(sessionID, st string) {
 	if prev == st {
 		return
 	}
+	// Phase 2 (finding B): compute whether this is a genuine promotion BEFORE
+	// the emit, so the event's FrontierChanged flag is deterministic (the
+	// earlier global-counter gate raced with the aggregator's concurrent
+	// poll-loop re-applies). A genuine promotion (inactive stub → busy) changes
+	// frontier membership; an activity flip of a session that was ALREADY
+	// selfActive does NOT (it stays materialized regardless of busy↔retry /
+	// busy→idle). Uses `prev` activity + the OLD lastActivityAt
+	// (touchActivityTimeLocked below overwrites it to `now`). now is captured
+	// once so the activity time and the bucket minute agree, and is reused by
+	// the subtree maintainers below.
+	now := time.Now()
+	_, cutoffDuration := projectionCutoff()
+	wasCutoff := now.Add(-cutoffDuration)
+	wasSelfActive := prev == ActivityBusy || prev == ActivityRetry ||
+		s.pendingInputSelf[sessionID] > 0
+	if !wasSelfActive {
+		if t := s.lastActivityAt[sessionID]; !t.IsZero() && t.After(wasCutoff) {
+			wasSelfActive = true
+		}
+	}
+	// Phase 2 (finding B): curFrontierChanged (stamped onto the emitted event)
+	// and frontierSeq (retained diagnostics counter) MUST advance from the same
+	// predicate so the two never diverge. Both bump here, before the
+	// wasBusy==isBusy early-return below — a non-busy transition of a cold
+	// session (e.g. session.error) is still a genuine promotion that must bump
+	// both, even though wasBusy==isBusy would skip the subtreeBusyCount block.
+	if !wasSelfActive && s.sessions[sessionID] != nil {
+		s.curFrontierChanged = true
+		s.bumpFrontierSeqLocked()
+	}
 	s.activity[sessionID] = st
 	s.emit(KindActivity, rawObj(map[string]interface{}{"sessionID": sessionID, "state": st}))
 	s.activitySeq[sessionID] = s.seq // the seq of the activity event just emitted
@@ -1346,9 +1436,7 @@ func (s *Store) setActivityLocked(sessionID, st string) {
 	// (busy↔retry, error→idle), so this block runs BEFORE the wasBusy==isBusy
 	// early-return below. Each helper is phantom-guarded (no-op when sessionID
 	// is not yet in the live tree — the contribution is seeded on create via
-	// the upsert maintainers). now is captured once so the activity time and
-	// the bucket minute agree.
-	now := time.Now()
+	// the upsert maintainers).
 	s.maintainSubtreeRetryOnActivityLocked(sessionID, prev, st)
 	s.touchActivityTimeLocked(sessionID, now)
 	s.touchRecentBucketLocked(sessionID, now)
@@ -1828,9 +1916,20 @@ func (s *Store) upsertSessionLocked(props json.RawMessage) {
 	// Phase 3 (Gate B): session create / reparent is a projection-affecting
 	// structural change (tree topology or a session's info bytes changed).
 	s.bumpStructuralRevisionLocked()
+	// Phase 2 (finding B): only a genuine frontier change bumps the counter.
+	// Create (prev==nil) or reparent (parent changed) changes which sessions
+	// are materialized vs collapsed; a metadata-only session.updated (same
+	// effective parent) does NOT and must not arm a promotion re-snapshot.
+	frontierChanged := prev == nil || prev.parentID != env.ParentID
+	if frontierChanged {
+		s.bumpFrontierSeqLocked()
+	}
 	// A session.updated replaces the entry, so repopulate the denormalized
 	// last-assistant summary from the (persisted) message view.
 	s.recomputeLastAssistantLocked(env.ID)
+	if frontierChanged {
+		s.curFrontierChanged = true
+	}
 	s.emit(KindSessionUpsert, p.Info)
 }
 
@@ -1857,6 +1956,8 @@ func (s *Store) deleteSessionLocked(id string) {
 	// Phase 3 (Gate B): session deletion is a projection-affecting structural
 	// change (the tree loses a node; descendants may be orphaned to roots).
 	s.bumpStructuralRevisionLocked()
+	// Phase 2 (finding B): deletion changes the frontier membership.
+	s.bumpFrontierSeqLocked()
 	delete(s.sessions, id)
 	delete(s.messages, id)
 	delete(s.msgLoaded, id)
@@ -1889,6 +1990,7 @@ func (s *Store) deleteSessionLocked(id string) {
 	// every termination cause. Caller accounting keyed on permission_blocked
 	// observes it while the session is alive; once gone, the gate is gone too.
 	delete(s.permBlocked, id)
+	s.curFrontierChanged = true
 	s.emit(KindSessionDelete, rawObj(map[string]interface{}{"id": id}))
 }
 
@@ -3565,6 +3667,14 @@ func (s *Store) Hydrate(sessions []json.RawMessage, messages map[string][]Messag
 			// Phase 3 (Gate B): hydrate create/reparent is a projection-affecting
 			// structural change.
 			s.bumpStructuralRevisionLocked()
+			// Phase 2 (finding B): only a genuine frontier change (create or
+			// reparent) bumps the counter — mirrors upsertSessionLocked. A
+			// metadata-only hydrate refresh (same effective parent) does NOT
+			// change frontier membership.
+			if old == nil || old.parentID != env.ParentID {
+				s.bumpFrontierSeqLocked()
+				s.curFrontierChanged = true
+			}
 			s.emit(KindSessionUpsert, info)
 		}
 	}

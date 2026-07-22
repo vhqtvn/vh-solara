@@ -25,12 +25,43 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
+	"github.com/vhqtvn/vh-solara/pkg/aggregator"
 	"github.com/vhqtvn/vh-solara/pkg/diagnostics"
 	"github.com/vhqtvn/vh-solara/pkg/opencode"
 )
+
+// newNoPollServer builds a web Server backed by a fresh store with NO
+// aggregator poll loop running. The promotion coalesce tests apply events
+// directly to the store (store.Apply), so they don't need the aggregator's
+// concurrent /events tail — and that tail is the source of nondeterministic
+// interference (re-hydration re-applies, event bursts that fill subscriber
+// channels, timing-dependent subscriber drops). Without the poll loop, these
+// tests are fully deterministic.
+func newNoPollServer(t *testing.T) (*Server, *httptest.Server) {
+	t.Helper()
+	agg := aggregator.New("http://unused.local", 100)
+	srv, err := NewServer(agg, "http://unused.local", 1000)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	web := httptest.NewServer(srv.Handler())
+	t.Cleanup(func() {
+		web.CloseClientConnections()
+		web.Close()
+	})
+	return srv, web
+}
+
+// seedSessionDirect applies a session.created event directly to the store
+// (synchronous, no aggregator poll loop needed). Used with newNoPollServer.
+func seedSessionDirect(t *testing.T, srv *Server, id string) {
+	t.Helper()
+	srv.agg.Store().Apply(sessionCreatedEvent(id))
+}
 
 // withPromotionCoalesce temporarily overrides the package-level
 // promotionCoalesceInterval (mirrors the deltaFlushInterval override pattern in
@@ -89,6 +120,18 @@ func drainSnapshotCauses(t *testing.T, r *bufio.Reader) []string {
 	}
 }
 
+// statusRetryEvent builds a session.status retry opencode.Event. retry↔busy is
+// a wasBusy==isBusy transition (both count as "busy" for subtreeBusyCount), so
+// it is the exact amplifier case: before the Phase-2 frontier gate it armed a
+// full re-snapshot on every flip of an already-active session; after the gate
+// it must NOT arm (frontierSeq is unchanged by busy↔retry).
+func statusRetryEvent(id string) opencode.Event {
+	return opencode.Event{
+		Type:       "session.status",
+		Properties: json.RawMessage(fmt.Sprintf(`{"sessionID":%q,"status":{"type":"retry"}}`, id)),
+	}
+}
+
 // statusBusyEvent builds a session.status busy opencode.Event for a direct
 // store.Apply (synchronous, deterministic — bypasses the fake.events poll loop
 // so a burst of N events lands in the subscriber channel within microseconds,
@@ -100,12 +143,9 @@ func statusBusyEvent(id string) opencode.Event {
 	}
 }
 
-// sessionCreatedEvent builds a session.created opencode.Event for direct store
-// seeding. newReloadServer hydrates fake.sessions ONCE at aggregator startup, so
-// appending after the server is built is too late — applying session.created
-// directly to the store is synchronous and immediate (mirrors the seeding in
-// snapshot_isolation_test.go). The session is then present for HasSession + the
-// subsequent status-burst.
+// sessionCreatedEvent builds a session.created opencode.Event for direct
+// store seeding via seedSessionDirect (used with newNoPollServer, which has
+// no aggregator poll loop and no fake backend).
 func sessionCreatedEvent(id string) opencode.Event {
 	return opencode.Event{
 		Type:       "session.created",
@@ -119,15 +159,15 @@ func sessionCreatedEvent(id string) opencode.Event {
 func TestPromotionCoalesce_BurstShipsOneSnapshot(t *testing.T) {
 	withPromotionCoalesce(t, 80*time.Millisecond)
 
-	srv, fake, _, web := newReloadServer(t)
-	_ = fake
-	// Seed 5 root sessions via direct store.Apply (newReloadServer hydrates
-	// fake.sessions once at startup, so post-build append is too late).
+	srv, web := newNoPollServer(t)
+	// Seed 5 root sessions directly to the store (no aggregator poll loop →
+	// deterministic: no re-hydration interference, no subscriber drops).
 	for i := 0; i < 5; i++ {
-		srv.agg.Store().Apply(sessionCreatedEvent(fmt.Sprintf("s%d", i)))
+		seedSessionDirect(t, srv, fmt.Sprintf("s%d", i))
 	}
-	waitFor(t, func() bool { return srv.agg.Store().HasSession("s4") },
-		"seed 5 root sessions")
+	if !srv.agg.Store().HasSession("s4") {
+		t.Fatal("seed 5 root sessions: s4 missing")
+	}
 
 	reader, _ := openProjectedStream(t, web.URL, 600*time.Millisecond)
 	// Consume the initial snapshot frame (cause:"initial").
@@ -175,11 +215,11 @@ func TestPromotionCoalesce_QuietPeriodFlushesWithinWindow(t *testing.T) {
 	const window = 90 * time.Millisecond
 	withPromotionCoalesce(t, window)
 
-	srv, fake, _, web := newReloadServer(t)
-	_ = fake
-	srv.agg.Store().Apply(sessionCreatedEvent("only"))
-	waitFor(t, func() bool { return srv.agg.Store().HasSession("only") },
-		"seed 1 root session")
+	srv, web := newNoPollServer(t)
+	seedSessionDirect(t, srv, "only")
+	if !srv.agg.Store().HasSession("only") {
+		t.Fatal("seed 1 root session: only missing")
+	}
 
 	reader, _ := openProjectedStream(t, web.URL, 700*time.Millisecond)
 	initEv, _ := readSSEFrameSilent(reader)
@@ -225,11 +265,11 @@ func TestPromotionCoalesce_QuietPeriodFlushesWithinWindow(t *testing.T) {
 func TestPromotionCoalesce_DiagnosticCounterIncrements(t *testing.T) {
 	withPromotionCoalesce(t, 60*time.Millisecond)
 
-	srv, fake, _, web := newReloadServer(t)
-	_ = fake
-	srv.agg.Store().Apply(sessionCreatedEvent("x"))
-	waitFor(t, func() bool { return srv.agg.Store().HasSession("x") },
-		"seed 1 root session")
+	srv, web := newNoPollServer(t)
+	seedSessionDirect(t, srv, "x")
+	if !srv.agg.Store().HasSession("x") {
+		t.Fatal("seed 1 root session: x missing")
+	}
 
 	reader, _ := openProjectedStream(t, web.URL, 500*time.Millisecond)
 	initEv, _ := readSSEFrameSilent(reader)
@@ -246,5 +286,93 @@ func TestPromotionCoalesce_DiagnosticCounterIncrements(t *testing.T) {
 	if delta := counterAfter - counterBefore; delta < 1 {
 		t.Fatalf("SnapshotPath counter did NOT increment on promotion path: before=%d after=%d (undercount bug present)",
 			counterBefore, counterAfter)
+	}
+}
+
+// TestPromotionCoalesce_ActivityFlipOfActiveSessionDoesNotResnapshot is THE
+// proving test for the Phase-2 finding-B fix (frontier-membership gate). The
+// amplifier the gate kills: EVERY activity flip of an already-materialized
+// session — including the high-frequency busy↔retry churn of running subagents
+// — used to arm promoCoalesce and re-ship a full ~74KB tree snapshot (because
+// IsStructuralKind includes KindActivity). The frontier gate narrows the arm
+// to genuine frontier changes only, so busy↔retry of an active session must
+// NOT arm.
+//
+// Shape: seed one session, open a projected stream, drive ONE genuine
+// promotion (idle → busy) and observe exactly one promotion snapshot; then
+// drive a busy↔retry flip of that now-active session and observe ZERO further
+// promotion snapshots. FAIL-without (frontier gate absent → retry arms a
+// second snapshot) / PASS-with.
+func TestPromotionCoalesce_ActivityFlipOfActiveSessionDoesNotResnapshot(t *testing.T) {
+	const window = 70 * time.Millisecond
+	withPromotionCoalesce(t, window)
+
+	srv, web := newNoPollServer(t)
+	seedSessionDirect(t, srv, "flip")
+	if !srv.agg.Store().HasSession("flip") {
+		t.Fatal("seed 1 root session: flip missing")
+	}
+
+	reader, _ := openProjectedStream(t, web.URL, 900*time.Millisecond)
+	// Consume the initial snapshot frame (cause:"initial").
+	if initEv, _ := readSSEFrameSilent(reader); initEv != "snapshot" {
+		t.Fatalf("first frame want snapshot, got %q", initEv)
+	}
+
+	// --- Phase A: a genuine promotion (idle → busy) MUST ship one snapshot. ---
+	promoBefore := diagnostics.Default.Stream[diagnostics.StreamClassTree].SnapshotPath.Load()
+	srv.agg.Store().Apply(statusBusyEvent("flip"))
+
+	// Read frames until the promotion snapshot lands. The activity delta frame
+	// (event:"activity") may precede it; skip non-snapshot frames.
+	var promotionSeen int
+	deadlineA := time.Now().Add(window + 600*time.Millisecond)
+	for time.Now().Before(deadlineA) {
+		ev, data := readSSEFrameSilent(reader)
+		if ev == "" {
+			break
+		}
+		if ev == "snapshot" {
+			var snap struct {
+				Cause string `json:"cause"`
+			}
+			_ = json.Unmarshal([]byte(data), &snap)
+			if snap.Cause == "promotion" {
+				promotionSeen++
+			}
+		}
+		if promotionSeen >= 1 {
+			break
+		}
+	}
+	if promotionSeen != 1 {
+		t.Fatalf("Phase A (genuine promotion): want exactly 1 promotion snapshot, got %d", promotionSeen)
+	}
+	promoAfterBusy := diagnostics.Default.Stream[diagnostics.StreamClassTree].SnapshotPath.Load()
+	if got := promoAfterBusy - promoBefore; got != 1 {
+		t.Fatalf("Phase A counter: want 1 promotion, got %d", got)
+	}
+
+	// --- Phase B: a busy↔retry flip of the NOW-active session must NOT arm. ---
+	// The promotion timer has fired and promoPending cleared. busy→retry does
+	// not set FrontierChanged (wasSelfActive=true for an already-active
+	// session), so the gate must be false. Drain to the ctx deadline:
+	// no further "promotion" snapshot may appear.
+	counterBeforeRetry := diagnostics.Default.Stream[diagnostics.StreamClassTree].SnapshotPath.Load()
+	srv.agg.Store().Apply(statusRetryEvent("flip"))
+	causes := drainSnapshotCauses(t, reader)
+	promoRetry := 0
+	for _, c := range causes {
+		if c == "promotion" {
+			promoRetry++
+		}
+	}
+	counterAfterRetry := diagnostics.Default.Stream[diagnostics.StreamClassTree].SnapshotPath.Load()
+	if promoRetry != 0 {
+		t.Fatalf("Phase B (busy↔retry of active session): want 0 promotion snapshots, got %d (causes=%v) — frontier gate is NOT narrowing the amplifier",
+			promoRetry, causes)
+	}
+	if got := counterAfterRetry - counterBeforeRetry; got != 0 {
+		t.Fatalf("Phase B counter: want 0 (frontier gate killed the re-snapshot), got %d", got)
 	}
 }

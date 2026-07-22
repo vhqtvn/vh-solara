@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -78,8 +79,52 @@ var projectionCutoffVersion uint32 = 1
 // projectionCutoff returns the current cutoff policy: (version, duration).
 // Centralized here so SnapshotProjected and SnapshotBranch stamp the same
 // values, and tests can change the package vars and see the change reflected.
+//
+// Test-only override: when SetProjectionCutoffForTest has armed the atomic
+// overrides (non-zero), they take precedence over the plain package vars. Both
+// overrides default to zero, so production behavior is byte-for-byte unchanged.
+// This mirrors the accepted web.SetStaleDispatchThresholdForTest precedent.
 func projectionCutoff() (uint32, time.Duration) {
-	return projectionCutoffVersion, defaultProjectionCutoff
+	ver := projectionCutoffVersion
+	if v := projectionCutoffVersionOverride.Load(); v != 0 {
+		ver = v
+	}
+	dur := defaultProjectionCutoff
+	if ns := projectionCutoffDurationOverride.Load(); ns > 0 {
+		dur = time.Duration(ns)
+	}
+	return ver, dur
+}
+
+// projectionCutoffDurationOverride and projectionCutoffVersionOverride are
+// TEST-ONLY atomic overrides for the projection cutoff policy. Both default to
+// their zero value, which projectionCutoff reads as "use the plain package vars
+// above" — so production behavior is unchanged. Only SetProjectionCutoffForTest
+// (called from package e2e) ever stores a non-zero value. Backed by sync/atomic
+// so the override is race-free under `go test -race` even though the live
+// aggregator/store goroutines read the policy concurrently. Mirrors the
+// web.SetStaleDispatchThresholdForTest precedent (pkg/web/queue.go).
+var (
+	projectionCutoffDurationOverride atomic.Int64  // nanoseconds; 0 = defaultProjectionCutoff
+	projectionCutoffVersionOverride  atomic.Uint32 // 0 = projectionCutoffVersion
+)
+
+// SetProjectionCutoffForTest is a test-only hook that shrinks the projection
+// cutoff so e2e tests can observe idle demotion without waiting 10m; production
+// code never calls this. d is the new cutoff duration; v is the cutoff policy
+// version (bump it so a client can detect the boundary change). Pass d=0 (or
+// v=0) to restore the production default (10m / version 1) and clear the
+// override — the shared e2e cluster MUST do this in a t.Cleanup so the tiny
+// cutoff does not leak into other tests in the same `go test` run. Race-safe:
+// backed by sync/atomic.
+func SetProjectionCutoffForTest(d time.Duration, v uint32) {
+	if d <= 0 || v == 0 {
+		projectionCutoffDurationOverride.Store(0)
+		projectionCutoffVersionOverride.Store(0)
+		return
+	}
+	projectionCutoffDurationOverride.Store(int64(d))
+	projectionCutoffVersionOverride.Store(v)
 }
 
 // structuralKinds is the set of event kinds that affect the projection
@@ -301,6 +346,11 @@ func (s *Store) SnapshotProjected(messagesFor map[string]bool, cause string, hoi
 	epoch := s.epoch
 	seq := s.seq
 	structuralRevision := s.structuralRevision
+	// Phase 2 (finding B): capture the frontier-membership counter under RLock
+	// for the Snapshot.FrontierSeq diagnostics field. Read atomically
+	// (frontierSeq is atomic.Uint64). DIAGNOSTICS-ONLY — the stream handler
+	// does NOT use it; the promotion-arm gate uses ClientEvent.FrontierChanged.
+	frontierSeq := s.frontierSeq.Load()
 
 	// Per-session scalar facts for active sessions only.
 	sessions := make(map[string]snapSessionCap, len(active))
@@ -465,6 +515,7 @@ func (s *Store) SnapshotProjected(messagesFor map[string]bool, cause string, hoi
 		Epoch:              epoch,
 		Seq:                seq,
 		StructuralRevision: structuralRevision,
+		FrontierSeq:        frontierSeq,
 		Projected:          true,
 		Cause:              cause,
 		Stubs:              stubs,

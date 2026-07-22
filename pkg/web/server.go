@@ -1403,6 +1403,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	defer unsub()
 
 	var baseline uint64
+
 	events, head, replayOK := store.Replay(cursor)
 	if hasCursor && replayOK {
 		for _, ev := range events {
@@ -1572,10 +1573,27 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			// the client discards stale/duplicate re-snapshots. This rides the
 			// same Seq-ordered snapshot path (NOT the notice path).
 			//
-			// Coalesced (see promoCoalesce above): arm the timer on the first
-			// structural event in a burst; absorb subsequent ones into a single
-			// flush so the burst re-ships ONE promotion snapshot, not N.
-			if wantsProject(r) && state.IsStructuralKind(ev.Kind) {
+			// Phase 2 (finding B) — per-event frontier-membership gate: arm the
+			// promotion coalesce ONLY when THIS specific structural event
+			// changed the frontier (ev.FrontierChanged, stamped at emit time).
+			// Before this gate, every IsStructuralKind event — including every
+			// KindActivity busy↔retry / idle→busy flip of an ALREADY-materialized
+			// session — re-shipped a full ~74KB tree snapshot (~16.6 MB/hr with
+			// one flapping session). The per-event flag is set ONLY on
+			// create/delete/reparent, pending-input boundary change, and the
+			// FIRST activity of a previously >cutoff-idle session (a genuine
+			// idle-stub → active promotion). So:
+			//   - busy↔retry of an active session: FrontierChanged=false → no arm.
+			//   - idle→busy of a >10min-idle stub: FrontierChanged=true → arm
+			//     (the genuine promotion that still must fire — the live
+			//     session.busy event carries only activity state, not the
+			//     materialization payload, so the client cannot self-promote a
+			//     stub).
+			//   - create/delete/perm/question: FrontierChanged=true → arm.
+			// The per-event flag replaced an earlier global-counter gate
+			// (store.FrontierSeq() > lastFrontier) which raced with the
+			// aggregator's concurrent poll-loop re-applies.
+			if wantsProject(r) && ev.FrontierChanged {
 				if !promoPending {
 					promoPending = true
 					promoCoalesce.Reset(promotionCoalesceInterval)
