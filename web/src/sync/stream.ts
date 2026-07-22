@@ -2576,6 +2576,52 @@ export function maybeReconnect() {
   else watchdogTick();
 }
 
+// === Issue 2: periodic / on-focus tree resync (drift self-heal) =============
+//
+// The O1 collapsed-frontier optimization removed the frequent full
+// re-projections that used to CONTINUOUSLY self-heal client/daemon state, so a
+// long-lived stream now accumulates drift (ghost sessions, stale demotions /
+// stubs, demotion-sweep signals missed by other concurrent streams — Issue 3)
+// until the next restart/reconnect. A bounded low-frequency tree reconnect
+// (connect(true)) requests ONE fresh projected snapshot; the server responds
+// with cause "initial" then "reconnect" after replay — both fullRebuild causes
+// — so applyProjectedSnapshot's full-rebuild reconcile (stream.ts ~773) walks
+// the client session set, collapses explicit demotions into stubs, and prunes
+// root / child-of-materialized ghosts; per-session facets reconcile; the open
+// session stays exempt (the openId skip at the reconcile walk). This is the
+// existing full-rebuild reconcile path — reused, not a new primitive.
+//
+// This is NOT the promotion amplifier: it is ONE snapshot per interval, not a
+// per-activity full re-snapshot. Cost ≈ 88 KB compressed × (3600 / interval)
+// per hour; at the default 90s that is ~3.5 MB/hr through the at-rest tunnel.
+//
+// Tunable: TREE_RESYNC_INTERVAL_MS (the periodic cadence, wired in sync.ts) and
+// TREE_RESYNC_MIN_GAP_MS (the dedup window shared by the periodic + focus
+// triggers, so a focus burst right after a periodic tick can't reconnect twice).
+export const TREE_RESYNC_INTERVAL_MS = 90_000;
+export const TREE_RESYNC_MIN_GAP_MS = 30_000;
+let lastTreeResync = 0;
+export function resyncTree() {
+  // No project selected → nothing to resync (connect(true) would no-op anyway).
+  if (!projectDir()) return;
+  // Let the watchdog own recovery of a closed/stale stream; a resync here would
+  // only race it (maybeReconnect already reconnects a CLOSED tree). The value
+  // of a resync is healing a HEALTHY-but-drifted tree, which is exactly the
+  // closed-but-stale-by-sweep / missed-event case the optimization created.
+  if (!es || es.readyState === EventSource.CLOSED) return;
+  const now = Date.now();
+  if (now - lastTreeResync < TREE_RESYNC_MIN_GAP_MS) return;
+  lastTreeResync = now;
+  connect(true);
+}
+// Test-only: reset the resync throttle gate so the min-gap window is
+// deterministic across tests in one file (the module-level lastTreeResync would
+// otherwise carry over). Mirrors the isTreeSnapshotDecoding / getTreeSnapshotDecode
+// test-export pattern.
+export function _resetResyncGateForTest(): void {
+  lastTreeResync = 0;
+}
+
 // ─── Phase 5: lazy-expand branch ────────────────────────────────────────────
 //
 // The lazy-expand endpoint is GET /vh/sessions/branch?id=<frontier-id>&cursor=.
