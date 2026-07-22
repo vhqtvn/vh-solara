@@ -113,6 +113,14 @@ export interface Snapshot {
   // in AUTHORITY_COMPLETE snapshots.
   cutoffVersion?: number;
   cutoffMs?: number;
+  // StaleCursor (Theme 3 / Finding A): set ONLY by the lazy-expand (branch)
+  // endpoint when a non-empty pagination cursor child was deleted/reparented
+  // between page requests. lazyExpandBranch reads this to restart the branch
+  // expansion ONCE from page 0 under a fresh branch structural generation,
+  // rather than treating the empty batch as terminal pagination completion
+  // (which would permanently omit the siblings after the deleted cursor).
+  // Absent on every other path.
+  staleCursor?: boolean;
 }
 
 // CollapsedBranchStub (Phase 4) is the wire representation of a collapsed idle

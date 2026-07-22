@@ -612,11 +612,15 @@ func TestSnapshotProjected_ConcurrentWithApply(t *testing.T) {
 	<-done
 }
 
-// TestSnapshotBranch_StaleCursorTerminates (Theme 3 / Finding #6): when the
+// TestSnapshotBranch_StaleCursorSignals (Theme 3 / Finding A): when the
 // pagination cursor child was deleted/reparented between page requests, the
-// server must NOT silently restart at page 0 (which replays page 1 and lets the
-// client loop). It terminates cleanly: empty batch + no next cursor.
-func TestSnapshotBranch_StaleCursorTerminates(t *testing.T) {
+// server MUST NOT silently terminate (empty batch + no cursor + no signal —
+// that made the client conclude pagination completed and permanently omit the
+// siblings after the deleted cursor) and MUST NOT rewind to page 0 (which
+// replays page 1 and lets the client loop). Instead it returns StaleCursor=true
+// with an empty body and empty next cursor, so the client restarts the
+// expansion ONCE from page 0.
+func TestSnapshotBranch_StaleCursorSignals(t *testing.T) {
 	s := New(64)
 	s.Apply(ev("session.created", `{"info":{"id":"parent","title":"P"}}`))
 	for i := 0; i < 5; i++ {
@@ -632,20 +636,42 @@ func TestSnapshotBranch_StaleCursorTerminates(t *testing.T) {
 	if next1 != "c1" {
 		t.Fatalf("page 1 nextCursor = %q, want c1", next1)
 	}
+	if snap1.StaleCursor {
+		t.Fatalf("page 1: StaleCursor must be false on a clean page")
+	}
 
 	// Delete the cursor child c1 between page requests (simulates a child
 	// deleted/reparented while the client paginates).
 	s.Apply(ev("session.deleted", `{"info":{"id":"c1"}}`))
 
-	// Page 2: cursor="c1" (stale). Without the fix, c1 is not found in
-	// allChildren → start stays 0 → returns page 1 again (c0,c2) with
-	// nextCursor="c2" → client loops/restarts. With the fix, start=len →
-	// empty batch + empty nextCursor → client terminates.
+	// Page 2: cursor="c1" (stale). The old "terminate" fix set
+	// start=len(allChildren) → empty batch + empty nextCursor + no signal, which
+	// the client read as "done" (data loss: c2,c3,c4 permanently omitted). The
+	// old "rewind" bug set start=0 → replayed page 1 (loop). The correct signal
+	// is StaleCursor=true + empty body + empty next cursor.
 	snap2, next2 := s.SnapshotBranch("parent", "c1", 2)
+	if !snap2.StaleCursor {
+		t.Fatalf("stale cursor: StaleCursor = false, want true (client must restart)")
+	}
 	if next2 != "" {
-		t.Fatalf("stale cursor: nextCursor = %q, want empty (terminate)", next2)
+		t.Fatalf("stale cursor: nextCursor = %q, want empty", next2)
 	}
 	if len(snap2.Sessions) != 0 {
-		t.Fatalf("stale cursor: expected 0 sessions (terminate), got %d", len(snap2.Sessions))
+		t.Fatalf("stale cursor: expected empty body (client discards), got %d sessions", len(snap2.Sessions))
 	}
+	if !snap2.Projected || snap2.Cause != "lazy-expand" {
+		t.Fatalf("stale cursor: envelope must stay Projected/lazy-expand, got projected=%v cause=%q", snap2.Projected, snap2.Cause)
+	}
+
+	// After the client restarts from page 0, the remaining children (c0,c2,c3,c4)
+	// are served normally. This proves the branch is NOT truncated.
+	snap3, next3 := s.SnapshotBranch("parent", "", 2)
+	full3 := sessionIDsFromProjected(t, snap3)
+	if len(full3) != 2 || !full3["c0"] || !full3["c2"] {
+		t.Fatalf("restart page 1: expected c0+c2 (c1 gone), got %v", sortedKeys(full3))
+	}
+	if snap3.StaleCursor {
+		t.Fatalf("restart page 1: StaleCursor must be false")
+	}
+	_ = next3
 }

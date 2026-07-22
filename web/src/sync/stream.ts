@@ -2579,12 +2579,25 @@ function applyLazyExpandMerge(snap: Snapshot) {
 // landing between fetch-start and response-apply means the response contents may
 // reference a child deleted/reparented mid-flight — merging would resurrect it.
 // On a dirty generation the expansion restarts from page 1 under the fresh gen
-// (bounded: abandon on continuous structural churn; the next promotion rebuilds
-// the frontier anyway).
+// (bounded: collapse on continuous structural churn — Finding B).
 //
-// Theme 3 / Finding #6 (no-loop): the server terminates pagination cleanly when
-// the cursor child was deleted/reparented (empty nextCursor). The client ALSO
-// guards against a no-progress page (same cursor twice) to terminate defensively.
+// Theme 3 / Finding A (stale cursor): when the server returns StaleCursor=true
+// (the non-empty cursor child was deleted/reparented between page requests), the
+// client restarts the expansion ONCE from page 0 under a fresh branchRequestGen
+// so the siblings after the deleted cursor are materialized. A second stale
+// signal within one expansion collapses the branch (bounded — no infinite loop).
+// Without this, an empty terminal page (the old "terminate" behavior) would make
+// the client conclude pagination completed and permanently omit later siblings.
+//
+// Theme 3 / Finding #6 (no-loop backstop): the client ALSO guards against a
+// no-progress page (same cursor twice) to terminate defensively even if the
+// server signal is absent.
+//
+// Finding B (collapse-on-abandon): when the bounded retry gives up (4
+// consecutive structural-generation mismatches OR two stale-cursor signals), the
+// branch is collapsed via collapseBranch so the UI returns to the collapsed-stub
+// state and a subsequent expand click retries normally — rather than leaving the
+// branch falsely expanded with stale materialized children.
 export async function lazyExpandBranch(branchID: string): Promise<void> {
   if (!branchID) return;
   if (branchExpandInFlight.has(branchID)) return; // single-flight
@@ -2597,6 +2610,7 @@ export async function lazyExpandBranch(branchID: string): Promise<void> {
     let cursor = "";
     let prevCursor = ""; // Finding #6: no-progress detection
     let structuralRetries = 0; // Finding #3: bounded retry on structural churn
+    let staleCursorRestarts = 0; // Finding A: bounded restart on stale cursor
     for (;;) {
       if (gen !== treeGen || epochChanged(epoch, state.epoch)) return; // anti-clobber
       // Finding #3: capture the structural generation before the fetch. A
@@ -2620,18 +2634,53 @@ export async function lazyExpandBranch(branchID: string): Promise<void> {
       if (gen !== treeGen || epochChanged(epoch, state.epoch)) return; // anti-clobber
       const raw = await res.json();
       const snap = await decodeSnapshot<Snapshot>(raw);
+      // Finding A (stale cursor): the server signalled that the non-empty
+      // cursor child was deleted/reparented between page requests. Remaining
+      // siblings after the deleted cursor would be permanently omitted if we
+      // treated the empty batch as terminal pagination. Restart the expansion
+      // ONCE from page 0; the next iteration captures a fresh startGen so a
+      // mid-restart mutation is caught by the #3 guard. The body is empty by
+      // construction so there is nothing to merge. Checked BEFORE the #3 guard:
+      // a stale-cursor response carries no sessions to resurrect, and this is
+      // the server's authoritative "cursor gone" signal. A second stale signal
+      // within one expansion means continuous topology churn → collapse (Finding
+      // B) rather than loop forever.
+      if (snap.staleCursor) {
+        staleCursorRestarts++;
+        if (staleCursorRestarts > 1) {
+          log.warn("sync", "lazy-expand collapsed (stale cursor twice)", {
+            branchID,
+            restarts: staleCursorRestarts,
+          });
+          collapseBranch(branchID);
+          return;
+        }
+        log.debug("sync", "lazy-expand restarted (stale cursor)", {
+          branchID,
+          restart: staleCursorRestarts,
+        });
+        cursor = ""; // restart from page 0
+        prevCursor = "";
+        continue;
+      }
       // Finding #3: anti-resurrection. If a structural mutation landed between
       // fetch-start and now, the response contents may reference a child that
       // was deleted/reparented mid-flight. Restart from page 1 under the fresh
       // generation so the server re-serves the current frontier (bounded —
-      // abandon on continuous churn; the next promotion rebuilds the frontier).
+      // collapse on continuous churn; the next promotion rebuilds the frontier).
       if (startGen !== branchRequestGen) {
         structuralRetries++;
         if (structuralRetries > 3) {
-          log.warn("sync", "lazy-expand abandoned (structural churn)", {
+          // Finding B: bounded retry exhausted — collapse the branch so the UI
+          // returns to the collapsed-stub state and a subsequent expand click
+          // retries normally. Previously this returned without collapsing,
+          // leaving the branch falsely expanded with stale materialized
+          // children (the next click collapsed instead of retrying).
+          log.warn("sync", "lazy-expand collapsed (structural churn)", {
             branchID,
             retries: structuralRetries,
           });
+          collapseBranch(branchID);
           return;
         }
         log.debug("sync", "lazy-expand restarted (structural change)", {
@@ -2651,9 +2700,7 @@ export async function lazyExpandBranch(branchID: string): Promise<void> {
       applyLazyExpandMerge(snap);
       cursor = res.headers.get("X-VH-Branch-Cursor") || "";
       // Finding #6: no-progress guard. If the server returns the same cursor
-      // (or no cursor), terminate to avoid a loop. The server also returns an
-      // empty next-cursor when the pagination cursor child was deleted/
-      // reparented (clean termination — see SnapshotBranch).
+      // (or no cursor), terminate to avoid a loop.
       if (!cursor || cursor === prevCursor) break;
       prevCursor = cursor;
       // Reset the structural-retry counter after a clean apply so only truly

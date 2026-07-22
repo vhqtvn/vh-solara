@@ -232,6 +232,14 @@ type Snapshot struct {
 	// info" by the client).
 	CutoffVersion uint32 `json:"cutoffVersion,omitempty"`
 	CutoffMs      uint64 `json:"cutoffMs,omitempty"`
+	// StaleCursor (Theme 3 / Finding A): set ONLY by SnapshotBranch when a
+	// non-empty pagination cursor child was deleted/reparented between page
+	// requests (cursor not found under parentID). The client reads this to
+	// restart the branch expansion ONCE from page 0 under a fresh branch
+	// structural generation, rather than treating the empty batch as terminal
+	// pagination completion — which would permanently omit the siblings after
+	// the deleted cursor. Absent on every other path (omitempty).
+	StaleCursor bool `json:"staleCursor,omitempty"`
 }
 
 // GateFacts is the denormalized "is this session safe to act on" summary for one

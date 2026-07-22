@@ -1656,4 +1656,202 @@ describe("Theme 3 anti-resurrection (branchRequestGen)", () => {
     // With it, the second response's cursor === prevCursor → break.
     expect(callCount).toBe(2);
   });
+
+  // Finding A (stale cursor): on a StaleCursor=true response (the non-empty
+  // cursor child was deleted/reparented between page requests), the client must
+  // restart the expansion ONCE from page 0 so the siblings after the deleted
+  // cursor are materialized — not treat the empty batch as terminal pagination
+  // completion (which would permanently omit them).
+  it("lazyExpandBranch restarts once from page 0 on a stale-cursor signal (Finding A)", async () => {
+    setState("sessions", { B: { id: "B" } });
+    setState("branchStubs", {
+      B: { id: "B", kind: "collapsed-branch", parentID: "", title: "B", hasChildren: true },
+    });
+
+    // call 1 (cursor=""): page 1 → c0,c1 + cursor c1.
+    const page1 = JSON.stringify({
+      seq: 100,
+      projected: true,
+      cause: "lazy-expand",
+      sessions: [{ id: "c0", parentID: "B" }, { id: "c1", parentID: "B" }],
+      stubs: [],
+    });
+    // call 2 (cursor="c1"): stale cursor (c1 deleted/reparented server-side).
+    // Empty body + staleCursor=true. The client must NOT treat this as terminal.
+    const stale = JSON.stringify({
+      seq: 101,
+      projected: true,
+      cause: "lazy-expand",
+      sessions: [],
+      stubs: [],
+      staleCursor: true,
+    });
+    // call 3 (cursor="" restart): c1 gone, remaining children materialized.
+    const restart = JSON.stringify({
+      seq: 102,
+      projected: true,
+      cause: "lazy-expand",
+      sessions: [
+        { id: "c0", parentID: "B" },
+        { id: "c2", parentID: "B" },
+        { id: "c3", parentID: "B" },
+        { id: "c4", parentID: "B" },
+      ],
+      stubs: [],
+    });
+
+    let callCount = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => {
+        callCount++;
+        if (callCount === 1) {
+          return Promise.resolve(
+            new Response(page1, { status: 200, headers: { "X-VH-Branch-Cursor": "c1" } }),
+          );
+        }
+        if (callCount === 2) {
+          return Promise.resolve(new Response(stale, { status: 200, headers: {} }));
+        }
+        return Promise.resolve(new Response(restart, { status: 200, headers: {} }));
+      }),
+    );
+
+    await lazyExpandBranch("B");
+
+    // The client restarted from page 0 after the stale signal and materialized
+    // the siblings after the deleted cursor (c2,c3,c4). Without the fix, the
+    // empty terminal page would have terminated pagination and c2,c3,c4 would
+    // never be fetched. callCount===3 proves it did NOT loop and did NOT
+    // silently terminate at 2.
+    expect(callCount).toBe(3);
+    expect(state.sessions.c0).toBeDefined();
+    expect(state.sessions.c2).toBeDefined();
+    expect(state.sessions.c3).toBeDefined();
+    expect(state.sessions.c4).toBeDefined();
+    expect(state.expandedBranches.B).toBe(true); // still expanded (success)
+  });
+
+  // Finding A bound: a second stale-cursor signal within one expansion means
+  // continuous topology churn. The client must collapse (not loop forever).
+  it("lazyExpandBranch collapses on a second stale-cursor signal (Finding A bound)", async () => {
+    setState("sessions", { B: { id: "B" } });
+    setState("branchStubs", {
+      B: { id: "B", kind: "collapsed-branch", parentID: "", title: "B", hasChildren: true },
+    });
+
+    const page1 = JSON.stringify({
+      seq: 100,
+      projected: true,
+      cause: "lazy-expand",
+      sessions: [{ id: "c0", parentID: "B" }, { id: "c1", parentID: "B" }],
+      stubs: [],
+    });
+    const stale = JSON.stringify({
+      seq: 101,
+      projected: true,
+      cause: "lazy-expand",
+      sessions: [],
+      stubs: [],
+      staleCursor: true,
+    });
+
+    let callCount = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => {
+        callCount++;
+        if (callCount === 1) {
+          return Promise.resolve(
+            new Response(page1, { status: 200, headers: { "X-VH-Branch-Cursor": "c1" } }),
+          );
+        }
+        // calls 2 (cursor=c1) and 3 (cursor="" restart) both go stale.
+        return Promise.resolve(new Response(stale, { status: 200, headers: {} }));
+      }),
+    );
+
+    await lazyExpandBranch("B");
+
+    // Bounded: page 1 → stale (restart once) → stale again → collapse. Exactly
+    // 3 fetches; branch collapsed, not looping.
+    expect(callCount).toBe(3);
+    expect(state.expandedBranches.B).toBe(false);
+  });
+
+  // Finding B (collapse-on-abandon): 4 consecutive structural-generation
+  // mismatches must collapse the branch (bounded retry then collapse), not leave
+  // it falsely expanded. No dirty response is merged; a subsequent expand
+  // retries normally.
+  it("lazyExpandBranch collapses after 4 consecutive structural mismatches and retries on next expand (Finding B)", async () => {
+    setState("sessions", { B: { id: "B" } });
+    setState("branchStubs", {
+      B: { id: "B", kind: "collapsed-branch", parentID: "", title: "B", hasChildren: true },
+    });
+
+    const dirtyBody = JSON.stringify({
+      seq: 100,
+      projected: true,
+      cause: "lazy-expand",
+      sessions: [{ id: "DIRTY", parentID: "B" }], // must NEVER be merged
+      stubs: [],
+    });
+
+    let callCount = 0;
+    const pending = new Map<number, (r: Response) => void>();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => {
+        const idx = callCount++;
+        return new Promise<Response>((resolve) => {
+          pending.set(idx, resolve);
+        });
+      }),
+    );
+
+    const p = lazyExpandBranch("B");
+
+    // Drive 4 consecutive dirty-generation responses. For each: wait for the
+    // fetch to be issued (resolver registered), bump branchRequestGen so the
+    // response is rejected by the #3 anti-resurrection guard, then resolve the
+    // dirty body. The bounded retry gives up after the 4th mismatch.
+    for (let i = 0; i < 4; i++) {
+      await vi.waitFor(() => expect(pending.get(i)).toBeDefined());
+      applySessionEvent("session.upsert", 100 + i, { id: `bump${i}`, parentID: "B" });
+      pending.get(i)!(new Response(dirtyBody, { status: 200, headers: {} }));
+      // Let the continuation run so it either restarts (issues the next fetch)
+      // or collapses and returns.
+      await new Promise((r) => setTimeout(r, 0));
+    }
+
+    await p;
+
+    expect(callCount).toBe(4); // exactly the bounded number of requests
+    expect(state.expandedBranches.B).toBe(false); // collapsed (Finding B)
+    expect(state.sessions.DIRTY).toBeUndefined(); // no dirty response merged
+
+    // Subsequent expansion retries normally (collapse, not permanent failure).
+    vi.unstubAllGlobals();
+    const freshBody = JSON.stringify({
+      seq: 200,
+      projected: true,
+      cause: "lazy-expand",
+      sessions: [{ id: "fresh", parentID: "B" }],
+      stubs: [],
+    });
+    let retryCount = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => {
+        retryCount++;
+        return Promise.resolve(new Response(freshBody, { status: 200, headers: {} }));
+      }),
+    );
+
+    await lazyExpandBranch("B");
+
+    expect(retryCount).toBe(1);
+    expect(state.expandedBranches.B).toBe(true); // expanded again
+    expect(state.sessions.fresh).toBeDefined(); // merged cleanly
+  });
 });

@@ -556,6 +556,14 @@ func (s *Store) SnapshotProjected(messagesFor map[string]bool, cause string) Sna
 // is the next cursor (empty if this is the last page) — the HTTP handler
 // surfaces it as an X-VH-Branch-Cursor response header.
 //
+// Stale cursor (Theme 3 / Finding A): when a non-empty cursor is no longer a
+// child of parentID (deleted/reparented between page requests), the returned
+// Snapshot carries StaleCursor=true with an empty body and an empty next
+// cursor. This is distinct from normal pagination completion (empty next
+// cursor, StaleCursor absent): the client restarts the expansion ONCE from
+// page 0 so the siblings after the deleted cursor are still materialized,
+// rather than treating the empty batch as terminal.
+//
 // Pure read under RLock. The snapshot carries Projected=true, Cause="lazy-expand".
 // The client merges it via the projected merge path (upsert sessions + stubs).
 func (s *Store) SnapshotBranch(parentID string, cursor string, limit int) (Snapshot, string) {
@@ -583,13 +591,41 @@ func (s *Store) SnapshotBranch(parentID string, cursor string, limit int) (Snaps
 				break
 			}
 		}
-		// Theme 3 / Finding #6: if the cursor child was deleted or reparented
-		// (no longer under parentID), do NOT silently restart at page 0 — that
-		// would replay page 1 and let the client loop indefinitely. Terminate
-		// the pagination cleanly: setting start past the end yields an empty
-		// batch and an empty nextCursor, which the client reads as "done".
+		// Theme 3 / Finding A (stale cursor): a non-empty cursor that is no
+		// longer a child of parentID was deleted or reparented between page
+		// requests. Terminating here (empty batch + no next cursor) would make
+		// the client conclude pagination completed, permanently omitting the
+		// siblings after the deleted cursor. Silently rewinding to page 0 would
+		// replay page 1 and let the client loop indefinitely. Instead, signal
+		// the client via StaleCursor=true so it restarts the expansion ONCE
+		// from page 0 under a fresh branch structural generation (the client's
+		// branchRequestGen machinery bounds the restart). The body is empty by
+		// construction — the client discards it and re-requests page 0.
 		if !found {
-			start = len(allChildren)
+			epoch := s.epoch
+			seq := s.seq
+			structuralRevision := s.structuralRevision
+			s.mu.RUnlock()
+			return Snapshot{
+				Epoch:              epoch,
+				Seq:                seq,
+				StructuralRevision: structuralRevision,
+				Projected:          true,
+				Cause:              "lazy-expand",
+				StaleCursor:        true,
+				CutoffVersion:      cutoffVersion,
+				CutoffMs:           uint64(cutoffDuration.Milliseconds()),
+				Messages:           map[string][]MessageWithParts{},
+				MessageWindows:     map[string]WindowMeta{},
+				Todos:              map[string]json.RawMessage{},
+				Permissions:        map[string][]json.RawMessage{},
+				Questions:          map[string][]json.RawMessage{},
+				Statuses:           map[string]json.RawMessage{},
+				Activity:           map[string]string{},
+				Gate:               map[string]GateFacts{},
+				LastAgents:         map[string]string{},
+				CurrentVerbs:       map[string]VerbFacet{},
+			}, ""
 		}
 	}
 	end := start + limit
