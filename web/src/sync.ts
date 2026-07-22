@@ -125,6 +125,7 @@ export {
 export {
   sessionNeedsInput,
   sessionModel,
+  sessionProjectID,
   lastUserMessageModel,
   sessionLastAgent,
   sessionWorking,

@@ -71,6 +71,10 @@ export function switchProject(dir: string, fromUrl = false) {
       s.questions = {};
       s.todos = {};
       s.unread = {};
+      // Phase 3 snapshot trim: clear the hoisted project constants so a stale
+      // fallback from the outgoing project doesn't linger before the new
+      // project's first projected snapshot repopulates it.
+      s.projectConstants = undefined;
       s.cursor = loadCursor(dir);
       s.status = "connecting";
     }),

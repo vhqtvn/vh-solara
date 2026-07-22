@@ -240,6 +240,27 @@ type Snapshot struct {
 	// pagination completion — which would permanently omit the siblings after
 	// the deleted cursor. Absent on every other path (omitempty).
 	StaleCursor bool `json:"staleCursor,omitempty"`
+	// ProjectConstants (Phase 3 trim): when the client opts into hoisted
+	// constants via ?hoist=1, the server extracts per-session fields that are
+	// identical across all sessions in a project (model, projectID, directory)
+	// and emits them ONCE at snapshot level. Sessions whose value matches the
+	// hoisted constant have that field stripped from their info JSON; sessions
+	// with a per-session override keep the inline field. The client resolves:
+	// session.field || projectConstants.field.
+	//
+	// Absent when hoist is not requested (old clients) or when no sessions are
+	// active (omitempty). ADDITIVE — old clients that don't know about it simply
+	// ignore it and read per-session fields (which are still present for them).
+	ProjectConstants *ProjectConstants `json:"projectConstants,omitempty"`
+}
+
+// ProjectConstants carries project-level constants hoisted out of per-session
+// info JSON to avoid repeating them N× (440 sessions × ~60 bytes = ~26 KB
+// savings in the study's representative snapshot). See Snapshot.ProjectConstants.
+type ProjectConstants struct {
+	Model     json.RawMessage `json:"model,omitempty"`
+	ProjectID string          `json:"projectID,omitempty"`
+	Directory string          `json:"directory,omitempty"`
 }
 
 // GateFacts is the denormalized "is this session safe to act on" summary for one

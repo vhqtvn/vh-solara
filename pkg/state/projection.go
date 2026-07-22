@@ -1,6 +1,7 @@
 package state
 
 import (
+	"bytes"
 	"encoding/json"
 	"strings"
 	"time"
@@ -266,7 +267,14 @@ func (s *Store) buildStubLocked(id string, cutoff time.Time, rev uint64) Collaps
 //
 // Cost: O(|roots| + |active_closure| × depth + |frontier|), NOT O(n). The
 // 8 incremental indexes (Phase 1) make every per-node read O(1).
-func (s *Store) SnapshotProjected(messagesFor map[string]bool, cause string) Snapshot {
+//
+// Phase 3 (trim): when hoist=true, per-session constants (model, projectID,
+// directory) that are identical across all active sessions are extracted ONCE
+// into Snapshot.ProjectConstants and stripped from each session's info JSON.
+// Additionally, GateFacts.Tokens is always omitted in the projected path (the
+// web client never reads gate.tokens — it derives token usage from message
+// info), saving ~112 KB on a representative 440-session snapshot.
+func (s *Store) SnapshotProjected(messagesFor map[string]bool, cause string, hoist bool) Snapshot {
 	s.mu.RLock()
 
 	cutoffVersion, cutoffDuration := projectionCutoff()
@@ -445,6 +453,14 @@ func (s *Store) SnapshotProjected(messagesFor map[string]bool, cause string) Sna
 		snapshotMaterializeHook()
 	}
 
+	// Phase 3: hoist per-session constants. pc accumulates the project-level
+	// model/projectID/directory as sessions are iterated; stripHoistedFields
+	// populates pc from the first session that carries each field, then strips
+	// the field from subsequent sessions whose value matches. Sessions with a
+	// per-session override (different model) keep the inline field.
+	var pc ProjectConstants
+	pcInitialized := false
+
 	snap := Snapshot{
 		Epoch:              epoch,
 		Seq:                seq,
@@ -482,7 +498,11 @@ func (s *Store) SnapshotProjected(messagesFor map[string]bool, cause string) Sna
 			PendingQuestion:        sc.hasQuestions,
 			PendingPermission:      sc.hasPerms,
 			PermissionBlocked:      sc.permBlocked,
-			Tokens:                 sc.lastTokens,
+			// Phase 3: Tokens omitted in the projected path. The web client
+			// derives token usage from message info (usage.ts contextUsage
+			// walks messages), never from gate.tokens. Stripping it here saves
+			// ~112 KB on a 440-session snapshot. The legacy Snapshot() path
+			// still populates Tokens for old clients.
 		}
 		if sc.lastAgent != "" {
 			snap.LastAgents[sid] = sc.lastAgent
@@ -493,7 +513,11 @@ func (s *Store) SnapshotProjected(messagesFor map[string]bool, cause string) Sna
 				State: sc.currentVerbState,
 			}
 		}
-		snap.Sessions = append(snap.Sessions, sc.info)
+		info := sc.info
+		if hoist {
+			info = stripHoistedFields(info, &pc, &pcInitialized)
+		}
+		snap.Sessions = append(snap.Sessions, info)
 	}
 	for sid, qs := range questions {
 		if len(qs) == 0 {
@@ -542,7 +566,86 @@ func (s *Store) SnapshotProjected(messagesFor map[string]bool, cause string) Sna
 		snap.Messages[sid] = bounded
 		snap.MessageWindows[sid] = meta
 	}
+	if hoist && pcInitialized {
+		snap.ProjectConstants = &pc
+	}
 	return snap
+}
+
+// stripHoistedFields parses raw session info JSON, extracts model/projectID/
+// directory into pc (initializing from the first session that carries each
+// field), and strips matching fields from the returned info. If a session's
+// value DIFFERS from the hoisted constant, the inline field is preserved
+// (per-session override). This runs in the lock-free materialization phase.
+//
+// The parse uses map[string]json.RawMessage to avoid recursive unmarshal of
+// nested objects — only top-level keys are inspected. If parse fails, the
+// original info is returned unchanged (defensive: malformed JSON should never
+// reach here, but we never want to corrupt a snapshot).
+func stripHoistedFields(info json.RawMessage, pc *ProjectConstants, initialized *bool) json.RawMessage {
+	if len(info) == 0 {
+		return info
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(info, &fields); err != nil {
+		return info
+	}
+	modified := false
+
+	// model: JSON object (e.g., {"providerID":"anthropic","id":"claude-sonnet-4"})
+	if raw, ok := fields["model"]; ok && len(raw) > 0 && raw[0] == '{' {
+		if !*initialized {
+			pc.Model = append([]byte(nil), raw...)
+			*initialized = true
+			delete(fields, "model")
+			modified = true
+		} else if bytes.Equal(raw, pc.Model) {
+			delete(fields, "model")
+			modified = true
+		}
+		// else: per-session override — keep inline
+	}
+
+	// projectID: JSON string — use json.Unmarshal to handle escapes correctly.
+	if raw, ok := fields["projectID"]; ok && len(raw) > 2 && raw[0] == '"' {
+		var val string
+		if err := json.Unmarshal(raw, &val); err == nil {
+			if pc.ProjectID == "" {
+				pc.ProjectID = val
+				*initialized = true
+				delete(fields, "projectID")
+				modified = true
+			} else if val == pc.ProjectID {
+				delete(fields, "projectID")
+				modified = true
+			}
+		}
+	}
+
+	// directory: JSON string — same unmarshal approach.
+	if raw, ok := fields["directory"]; ok && len(raw) > 2 && raw[0] == '"' {
+		var val string
+		if err := json.Unmarshal(raw, &val); err == nil {
+			if pc.Directory == "" {
+				pc.Directory = val
+				*initialized = true
+				delete(fields, "directory")
+				modified = true
+			} else if val == pc.Directory {
+				delete(fields, "directory")
+				modified = true
+			}
+		}
+	}
+
+	if !modified {
+		return info
+	}
+	out, err := json.Marshal(fields)
+	if err != nil {
+		return info // defensive: never corrupt
+	}
+	return out
 }
 
 // SnapshotBranch returns a projected snapshot for a lazy-expand request:

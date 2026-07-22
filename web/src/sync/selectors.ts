@@ -22,10 +22,25 @@ export type ModelRefLite = { providerID: string; modelID: string; variant?: stri
 // Read-only per-session model selectors, so the models module depends on these
 // views rather than reaching into the store's shape directly. session.model uses
 // `id`, message.model uses `modelID` — accept either.
+//
+// Phase 3 snapshot trim: when the server hoists model/projectID/directory into
+// a snapshot-level map (?hoist=1), the per-session model field is stripped from
+// most sessions. Fall back to the hoisted project constant so a cold tree still
+// resolves the model for every row. The per-session value (when present) always
+// wins — a session may carry an inline override (a different model than the
+// project default).
 export function sessionModel(id: string): ModelRefLite | undefined {
-  const m = state.sessions[id]?.model;
+  const m = state.sessions[id]?.model ?? state.projectConstants?.model;
   const modelID = m?.modelID ?? m?.id;
   return m?.providerID && modelID ? { providerID: m.providerID, modelID, variant: m.variant } : undefined;
+}
+
+// Phase 3 snapshot trim: like sessionModel, projectID is hoisted into
+// projectConstants under ?hoist=1. Fall back to the hoisted constant so
+// features that read it (e.g. suggestTitle → "Regenerate name") work on
+// hoisted sessions whose per-session projectID was stripped.
+export function sessionProjectID(id: string): string | undefined {
+  return state.sessions[id]?.projectID ?? state.projectConstants?.projectID;
 }
 
 // The model on the session's most recent user message.

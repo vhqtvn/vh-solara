@@ -24,7 +24,7 @@ func TestSnapshotProjected_StampsCutoff(t *testing.T) {
 	s := New(64)
 	s.Apply(ev("session.created", `{"info":{"id":"root","title":"r"}}`))
 
-	snap := s.SnapshotProjected(nil, "initial")
+	snap := s.SnapshotProjected(nil, "initial", false)
 	if !snap.Projected {
 		t.Fatal("SnapshotProjected should set Projected=true")
 	}
@@ -101,7 +101,7 @@ func TestProjection_NoThrash_RecentStaysActive(t *testing.T) {
 	// Each snapshot recomputes cutoff from time.Now(); within the 10min window,
 	// the session's lastActivityAt is After(cutoff) → "recent" → stays active.
 	for i := 0; i < 3; i++ {
-		snap := s.SnapshotProjected(nil, "promotion")
+		snap := s.SnapshotProjected(nil, "promotion", false)
 		materialized := sessionIDsFromProjected(t, snap)
 		if !materialized["root"] {
 			t.Fatalf("snapshot %d: root should be materialized (recent activity within cutoff), got stub", i)
@@ -136,7 +136,7 @@ func TestProjection_CutoffBoundaryDemotesIdle(t *testing.T) {
 	// With the default 10min cutoff: session is recent → materialized.
 	defaultProjectionCutoff = 10 * time.Minute
 	projectionCutoffVersion = 1
-	snap1 := s.SnapshotProjected(nil, "initial")
+	snap1 := s.SnapshotProjected(nil, "initial", false)
 	materialized1 := sessionIDsFromProjected(t, snap1)
 	if !materialized1["root"] {
 		t.Fatal("with 10min cutoff: root should be materialized (activity is recent)")
@@ -148,7 +148,7 @@ func TestProjection_CutoffBoundaryDemotesIdle(t *testing.T) {
 	time.Sleep(2 * time.Millisecond)
 
 	// Next snapshot: root is now idle (activity past cutoff) → demoted to stub.
-	snap2 := s.SnapshotProjected(nil, "promotion")
+	snap2 := s.SnapshotProjected(nil, "promotion", false)
 	materialized2 := sessionIDsFromProjected(t, snap2)
 	if materialized2["root"] {
 		t.Fatal("with 1ms cutoff after 2ms: root should be demoted to stub (activity past cutoff)")
@@ -186,7 +186,7 @@ func TestProjection_CutoffChangeReflectedInSnapshot(t *testing.T) {
 	// Initial cutoff: version 1, 10min.
 	projectionCutoffVersion = 1
 	defaultProjectionCutoff = 10 * time.Minute
-	snap1 := s.SnapshotProjected(nil, "initial")
+	snap1 := s.SnapshotProjected(nil, "initial", false)
 	if snap1.CutoffVersion != 1 {
 		t.Errorf("snap1 CutoffVersion = %d, want 1", snap1.CutoffVersion)
 	}
@@ -197,7 +197,7 @@ func TestProjection_CutoffChangeReflectedInSnapshot(t *testing.T) {
 	// Change cutoff: version 2, 5min.
 	projectionCutoffVersion = 2
 	defaultProjectionCutoff = 5 * time.Minute
-	snap2 := s.SnapshotProjected(nil, "promotion")
+	snap2 := s.SnapshotProjected(nil, "promotion", false)
 	if snap2.CutoffVersion != 2 {
 		t.Errorf("snap2 CutoffVersion = %d, want 2 (changed)", snap2.CutoffVersion)
 	}
@@ -215,7 +215,7 @@ func TestSnapshotProjected_CutoffJSONShape(t *testing.T) {
 	s.Apply(ev("session.created", `{"info":{"id":"root","title":"r"}}`))
 
 	// Projected snapshot: cutoffVersion + cutoffMs present.
-	psnap := s.SnapshotProjected(nil, "initial")
+	psnap := s.SnapshotProjected(nil, "initial", false)
 	pdata, _ := json.Marshal(psnap)
 	var pmap map[string]any
 	json.Unmarshal(pdata, &pmap)

@@ -1419,7 +1419,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		// a resumed legacy client already carries the wholesale authoritative
 		// set from its first cold-load snapshot and reconciles via live events.
 		if wantsProject(r) {
-			rcSnap := store.SnapshotProjected(filter, "reconnect")
+			rcSnap := store.SnapshotProjected(filter, "reconnect", wantsHoist(r))
 			if rb, err := json.Marshal(rcSnap); err == nil {
 				writeRaw(w, rcSnap.Seq, "snapshot", maybeCompressSnapshot(rb, wantsCompress(r)))
 				baseline = rcSnap.Seq
@@ -1441,7 +1441,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		// for an idle-heavy workload.
 		var snap state.Snapshot
 		if wantsProject(r) {
-			snap = store.SnapshotProjected(filter, "initial")
+			snap = store.SnapshotProjected(filter, "initial", wantsHoist(r))
 		} else {
 			snap = store.Snapshot(filter)
 		}
@@ -1502,7 +1502,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	// only on the initial-snapshot branch.
 	flushPromotion := func() {
 		promoPending = false
-		promoSnap := store.SnapshotProjected(filter, "promotion")
+		promoSnap := store.SnapshotProjected(filter, "promotion", wantsHoist(r))
 		if pb, err := json.Marshal(promoSnap); err == nil {
 			// Pass `filter` (not nil) so promotion respects the same message
 			// scoping as the initial snapshot — otherwise every promotion
@@ -1650,6 +1650,15 @@ var promotionCoalesceInterval = 150 * time.Millisecond
 // regardless of this flag. Phase 4 wires the actual projection when proj=1.
 func wantsProject(r *http.Request) bool {
 	return r.URL.Query().Get("proj") == "1"
+}
+
+// wantsHoist reports whether the client opted into hoisted per-session
+// constants (Phase 3 trim) via the `hoist=1` query flag. Only meaningful when
+// wantsProject(r) is also true (hoist is a modifier on the projected path).
+// Old clients that don't send hoist=1 get legacy per-session fields; new
+// clients send hoist=1 and get projectConstants + stripped sessions.
+func wantsHoist(r *http.Request) bool {
+	return r.URL.Query().Get("hoist") == "1"
 }
 
 // maybeCompressSnapshot gzip64-wraps a marshaled snapshot payload when compress

@@ -1,5 +1,5 @@
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
-import { abortSession, sessionWorking, state } from "../sync";
+import { abortSession, sessionProjectID, sessionWorking, state } from "../sync";
 import { suggestTitle } from "../sessionTitle";
 import { isPinned, togglePin, movePinnedByOffset, reconciledPinnedOrder } from "../sidebar";
 import { exportSessionMarkdown } from "../export";
@@ -120,7 +120,7 @@ export default function SessionContextMenu() {
   async function regenerate(id: string) {
     closeSessionMenu();
     pushNotification({ kind: "info", sessionID: id, title: "Generating a name…" });
-    const suggestion = await suggestTitle(id, state.sessions[id]?.projectID);
+    const suggestion = await suggestTitle(id, sessionProjectID(id));
     if (!suggestion) {
       pushNotification({
         kind: "error",

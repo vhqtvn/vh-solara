@@ -155,7 +155,7 @@ func TestSnapshotProjected_CollapsesIdleTree(t *testing.T) {
 	s.Apply(ev("session.created", `{"info":{"id":"grand","parentID":"idleChild","title":"Grand"}}`))
 	s.Apply(ev("session.status", evStatus("busyChild", "busy")))
 
-	snap := s.SnapshotProjected(nil, "initial")
+	snap := s.SnapshotProjected(nil, "initial", false)
 
 	if !snap.Projected {
 		t.Fatal("SnapshotProjected must set Projected=true")
@@ -203,7 +203,7 @@ func TestSnapshotProjected_IdleRootBecomesStub(t *testing.T) {
 	s.Apply(ev("session.created", `{"info":{"id":"idleChild","parentID":"idleRoot","title":"IC"}}`))
 	s.Apply(ev("session.status", evStatus("active", "busy")))
 
-	snap := s.SnapshotProjected(nil, "initial")
+	snap := s.SnapshotProjected(nil, "initial", false)
 	fullIDs := sessionIDsFromProjected(t, snap)
 	stubIDs := stubIDsFromProjected(t, snap)
 
@@ -232,7 +232,7 @@ func TestSnapshotProjected_ActiveClosureIncludesAncestors(t *testing.T) {
 	s.Apply(ev("session.created", `{"info":{"id":"leaf","parentID":"mid","title":"L"}}`))
 	s.Apply(ev("session.status", evStatus("leaf", "busy")))
 
-	snap := s.SnapshotProjected(nil, "initial")
+	snap := s.SnapshotProjected(nil, "initial", false)
 	fullIDs := sessionIDsFromProjected(t, snap)
 
 	for _, id := range []string{"root", "mid", "leaf"} {
@@ -253,7 +253,7 @@ func TestSnapshotProjected_TranscriptOrthogonal(t *testing.T) {
 	s.Apply(ev("session.status", evStatus("active", "busy")))
 
 	// messagesFor nil → all active sessions get messages. "hidden" is NOT active.
-	snap := s.SnapshotProjected(nil, "initial")
+	snap := s.SnapshotProjected(nil, "initial", false)
 	if _, ok := snap.Messages["active"]; !ok {
 		t.Fatal("active session should carry messages")
 	}
@@ -262,7 +262,7 @@ func TestSnapshotProjected_TranscriptOrthogonal(t *testing.T) {
 	}
 
 	// messagesFor scoped to active only — hidden never included.
-	snap2 := s.SnapshotProjected(map[string]bool{"active": true}, "initial")
+	snap2 := s.SnapshotProjected(map[string]bool{"active": true}, "initial", false)
 	if _, ok := snap2.Messages["active"]; !ok {
 		t.Fatal("active session should carry messages when in messagesFor")
 	}
@@ -278,7 +278,7 @@ func TestSnapshotProjected_PromotionReflectsLatest(t *testing.T) {
 	s.Apply(ev("session.created", `{"info":{"id":"a","title":"A"}}`))
 	s.Apply(ev("session.created", `{"info":{"id":"b","title":"B"}}`))
 
-	snap1 := s.SnapshotProjected(nil, "initial")
+	snap1 := s.SnapshotProjected(nil, "initial", false)
 	rev1 := snap1.StructuralRevision
 	full1 := sessionIDsFromProjected(t, snap1)
 	// Both idle, no activity → both are idle root stubs, no full sessions.
@@ -288,7 +288,7 @@ func TestSnapshotProjected_PromotionReflectsLatest(t *testing.T) {
 
 	// Promote "a" to busy.
 	s.Apply(ev("session.status", evStatus("a", "busy")))
-	snap2 := s.SnapshotProjected(nil, "promotion")
+	snap2 := s.SnapshotProjected(nil, "promotion", false)
 	if snap2.Cause != "promotion" {
 		t.Fatalf("Cause = %q, want promotion", snap2.Cause)
 	}
@@ -339,7 +339,7 @@ func TestSnapshotProjected_CostModel(t *testing.T) {
 	// Promote exactly one leaf deep in root0 to busy.
 	s.Apply(ev("session.status", evStatus("root0_sub0_leaf0", "busy")))
 
-	snap := s.SnapshotProjected(nil, "initial")
+	snap := s.SnapshotProjected(nil, "initial", false)
 	fullIDs := sessionIDsFromProjected(t, snap)
 	stubIDs := stubIDsFromProjected(t, snap)
 
@@ -547,7 +547,7 @@ func TestSnapshotProjected_StubFields(t *testing.T) {
 	s.Apply(ev("session.created", `{"info":{"id":"g1","parentID":"child1"}}`))
 	s.Apply(ev("session.created", `{"info":{"id":"g2","parentID":"child1"}}`))
 
-	snap := s.SnapshotProjected(nil, "initial")
+	snap := s.SnapshotProjected(nil, "initial", false)
 
 	// root is an idle root → single stub with DescendantCount=4 (root+child1+child2+g1+g2 minus root itself... wait).
 	// subtreeDescendantCount includes self. root's subtree = {root, child1, child2, g1, g2} = 5.
@@ -607,7 +607,7 @@ func TestSnapshotProjected_ConcurrentWithApply(t *testing.T) {
 
 	// Concurrent projections — must not race or panic.
 	for i := 0; i < 50; i++ {
-		_ = s.SnapshotProjected(nil, "promotion")
+		_ = s.SnapshotProjected(nil, "promotion", false)
 	}
 	<-done
 }

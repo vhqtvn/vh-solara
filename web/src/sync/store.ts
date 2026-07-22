@@ -5,7 +5,7 @@
 // without a cycle. State is reconciled by id, never nuked.
 import { createStore } from "solid-js/store";
 import { createSignal } from "solid-js";
-import type { CollapsedBranchStub, ConnStatus, Permission, Question, Session, SessionMessages, TodoItem, VerbFacet } from "../types";
+import type { CollapsedBranchStub, ConnStatus, Permission, ProjectConstants, Question, Session, SessionMessages, TodoItem, VerbFacet } from "../types";
 import { loadVersioned, saveVersioned } from "../lib/store";
 
 const LS_SESSIONS = "vh.sessions.v1";
@@ -195,6 +195,14 @@ export interface SyncState {
   // every projected snapshot (merge: upsert incoming, prune absent+deleted).
   // Ephemeral — NOT persisted. Empty in AUTHORITY_COMPLETE mode.
   branchStubs: Record<string, CollapsedBranchStub>;
+  // ProjectConstants (Phase 3 snapshot trim): the hoisted per-session
+  // model/projectID/directory from a projected snapshot emitted under
+  // ?hoist=1. Absent/undefined when the server didn't hoist (old client,
+  // legacy Snapshot path, or an old daemon). Ephemeral — NOT persisted (it's
+  // re-derived on every projected snapshot). Cleared implicitly on project
+  // switch (the fresh tree snapshot re-populates it for the new project). See
+  // ProjectConstants (types.ts) and selectors.sessionModel (fallback).
+  projectConstants?: ProjectConstants;
   status: ConnStatus;
   cursor: number;
   // --- Connection-health diagnostics (FE-only) -----------------------------

@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { reconcile } from "solid-js/store";
 import { setState } from "../../src/sync/store";
-import { currentVerb, sessionLastAgent } from "../../src/sync/selectors";
+import { currentVerb, sessionLastAgent, sessionModel, sessionProjectID } from "../../src/sync/selectors";
 import type { Part } from "../../src/types";
 
 // The Working pill's verb selector. `currentVerb` is a pure read of `state`, so
@@ -48,6 +48,79 @@ beforeEach(() => {
   setState("todos", reconcile({}));
   setState("lastAgents", reconcile({}));
   setState("currentVerbs", reconcile({}));
+});
+
+// sessionModel (Phase 3 snapshot trim): when the server hoists the per-session
+// model into a snapshot-level projectConstants map (?hoist=1), most sessions'
+// info has model stripped. The selector falls back to projectConstants.model.
+// A per-session inline override (a session with a DIFFERENT model than the
+// project default) always wins.
+describe("sessionModel (projectConstants hoist fallback)", () => {
+  const HOISTED_MODEL = { providerID: "anthropic", id: "claude-sonnet-4" };
+  const OVERRIDE_MODEL = { providerID: "openai", id: "gpt-5" };
+
+  beforeEach(() => {
+    setState("sessions", reconcile({}));
+    setState("projectConstants", undefined);
+  });
+
+  it("falls back to projectConstants.model when session.model is absent", () => {
+    setState("sessions", "s1", { id: "s1" });
+    setState("projectConstants", { model: HOISTED_MODEL });
+    expect(sessionModel("s1")).toEqual({
+      providerID: "anthropic",
+      modelID: "claude-sonnet-4",
+    });
+  });
+
+  it("prefers the per-session model (inline override) over projectConstants", () => {
+    setState("sessions", "s2", { id: "s2", model: OVERRIDE_MODEL });
+    setState("projectConstants", { model: HOISTED_MODEL });
+    expect(sessionModel("s2")).toEqual({
+      providerID: "openai",
+      modelID: "gpt-5",
+    });
+  });
+
+  it("returns undefined when neither per-session nor projectConstants is set", () => {
+    setState("sessions", "s3", { id: "s3" });
+    expect(sessionModel("s3")).toBeUndefined();
+  });
+
+  it("returns undefined when projectConstants is absent (old server / non-hoisted)", () => {
+    // Back-compat: a non-hoisted snapshot has per-session model fields present,
+    // so the fallback never fires; but if neither is set, undefined is correct.
+    setState("sessions", "s4", { id: "s4" });
+    expect(sessionModel("s4")).toBeUndefined();
+  });
+});
+
+// sessionProjectID (Phase 3 snapshot trim): mirrors sessionModel's fallback.
+// Used by SessionContextMenu → suggestTitle ("Regenerate name") which requires
+// a non-empty projectID. Without the fallback, every hoisted session's
+// "Regenerate name" would silently fail.
+describe("sessionProjectID (projectConstants hoist fallback)", () => {
+  beforeEach(() => {
+    setState("sessions", reconcile({}));
+    setState("projectConstants", undefined);
+  });
+
+  it("falls back to projectConstants.projectID when session.projectID is absent", () => {
+    setState("sessions", "s1", { id: "s1" });
+    setState("projectConstants", { projectID: "proj-123" });
+    expect(sessionProjectID("s1")).toBe("proj-123");
+  });
+
+  it("prefers the per-session projectID over projectConstants", () => {
+    setState("sessions", "s2", { id: "s2", projectID: "override-456" });
+    setState("projectConstants", { projectID: "proj-123" });
+    expect(sessionProjectID("s2")).toBe("override-456");
+  });
+
+  it("returns undefined when neither per-session nor projectConstants is set", () => {
+    setState("sessions", "s3", { id: "s3" });
+    expect(sessionProjectID("s3")).toBeUndefined();
+  });
 });
 
 describe("currentVerb (Working pill)", () => {

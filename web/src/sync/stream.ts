@@ -621,6 +621,12 @@ export function applySnapshot(snap: Snapshot) {
       if (changed) s.epochChanged = true;
       if (incomingEpoch) s.epoch = incomingEpoch;
       s.cursor = snap.seq;
+      // Phase 3 snapshot trim: the AUTHORITY_COMPLETE path never hoists (the
+      // legacy Snapshot() path keeps per-session fields), so snap.projectConstants
+      // is undefined here. Clear any stale value from a prior projected snapshot
+      // so a project switch on a legacy daemon doesn't leave the old project's
+      // fallback in place. Harmless: session.model is always present on this path.
+      s.projectConstants = snap.projectConstants;
     }),
   );
   // Wholesale session-set replacement invalidates the parent→children index.
@@ -849,6 +855,13 @@ function applyProjectedSnapshot(snap: Snapshot) {
       }
       if (incomingEpoch) s.epoch = incomingEpoch;
       s.cursor = snap.seq;
+      // Phase 3 snapshot trim: apply the hoisted project constants. Overwrite
+      // (the server is authoritative for the project's model/projectID/
+      // directory on every projected snapshot). When the snapshot didn't hoist
+      // (old daemon, or an edge path), snap.projectConstants is undefined → we
+      // preserve the prior value so a one-off non-hoisted snapshot doesn't
+      // blank the fallback a prior snapshot established.
+      if (snap.projectConstants) s.projectConstants = snap.projectConstants;
     }),
   );
   // The merge may have added/changed sessions — invalidate the children cache.
@@ -1651,7 +1664,13 @@ export function connect(fresh = false) {
   // client takes the merge path. An old server ignores proj=1 and emits
   // AUTHORITY_COMPLETE (no `projected` field), so the client transparently
   // falls back to wholesale-replace. Independent from z=1.
-  es = new EventSource(`/vh/stream?${cursorParam}sessions=&dir=${encodeURIComponent(projectDir())}&z=1&proj=1`);
+  // `&hoist=1` (Phase 3 snapshot trim): opts into hoisting the per-session
+  // model/projectID/directory constants into a snapshot-level projectConstants
+  // map. The server strips them from each session's info and emits the map;
+  // selectors.sessionModel falls back to the map. An old server ignores hoist=1
+  // and always sends per-session fields, so the client works unchanged. Only
+  // meaningful alongside proj=1 (the hoist path lives in SnapshotProjected).
+  es = new EventSource(`/vh/stream?${cursorParam}sessions=&dir=${encodeURIComponent(projectDir())}&z=1&proj=1&hoist=1`);
   markTreeSeen();
   log.debug("sync", "tree stream connect", { cursor: fresh ? "fresh" : state.cursor, dir: projectDir() });
   es.addEventListener("snapshot", (e) => {

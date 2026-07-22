@@ -41,6 +41,22 @@ export interface GateFacts {
   [k: string]: unknown;
 }
 
+// ProjectConstants (Phase 3 snapshot trim): when the client opts in via
+// `?hoist=1`, the server strips the per-session model/projectID/directory
+// fields (which are constant across all sessions in one project) and hoists
+// them into this snapshot-level map. The client resolves a session's model
+// via selectors.sessionModel, which falls back to projectConstants.model when
+// the per-session field is absent. ADDITIVE/back-compat: old clients never
+// send hoist=1, so they always get the per-session fields and never see this
+// map; new clients send hoist=1 and read the map. All fields optional because
+// the server only populates what it could hoist (and older daemons omit the
+// map entirely). `model` mirrors Session.model's shape (a JSON object).
+export interface ProjectConstants {
+  model?: { providerID: string; id?: string; modelID?: string; variant?: string };
+  projectID?: string;
+  directory?: string;
+}
+
 export interface Snapshot {
   seq: number;
   // Daemon generation (pkg/state/store.go Snapshot.Epoch). Stable for the life
@@ -121,6 +137,14 @@ export interface Snapshot {
   // (which would permanently omit the siblings after the deleted cursor).
   // Absent on every other path.
   staleCursor?: boolean;
+  // ProjectConstants (Phase 3 snapshot trim): present when the client opts
+  // into `?hoist=1`. The server hoists the per-session model/projectID/
+  // directory (constant across all sessions in a project) into this map and
+  // strips them from each session's info. The client resolves via
+  // selectors.sessionModel (fallback to projectConstants.model). Absent on
+  // non-hoisted snapshots (old clients, legacy Snapshot path). See
+  // ProjectConstants.
+  projectConstants?: ProjectConstants;
 }
 
 // CollapsedBranchStub (Phase 4) is the wire representation of a collapsed idle
