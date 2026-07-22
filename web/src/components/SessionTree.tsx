@@ -6,7 +6,10 @@ import { setView } from "../ui";
 
 // Picking a session always shows its chat — even re-clicking the already-open
 // one while on another tab (Code/Changes) jumps you back to the conversation.
-const openSessionChat = (id: string) => {
+// Exported so StubNode's row button can open a collapsed-branch stub's chat
+// (idle-root-unopenable fix): a stub's row click routes here exactly like a
+// materialized Node row, while the separate twisty stays the expand/collapse path.
+export const openSessionChat = (id: string) => {
   setSelectedId(id);
   setView("chat");
 };

@@ -1,5 +1,5 @@
 import { For, Show } from "solid-js";
-import { state } from "../sync";
+import { selectedId, state } from "../sync";
 import { lazyExpandBranch, collapseBranch } from "../sync";
 import { displayName } from "../projectSettings";
 import type { CollapsedBranchStub, Session } from "../types";
@@ -7,11 +7,13 @@ import Icon from "./Icon";
 import Spinner from "./Spinner";
 import RelTime from "./RelTime";
 
-// Lazy import of Node breaks the circular import (SessionTree imports StubNode,
-// StubNode imports Node). In ESM with SolidJS, this is safe: the `Node` binding
-// is a function declaration resolved by live-binding, and it's only CALLED at
-// render time (inside JSX), never at module-eval time, so there's no TDZ.
-import { Node } from "./SessionTree";
+// Lazy import of Node + openSessionChat from SessionTree breaks the circular
+// import (SessionTree imports StubNode, StubNode imports back from SessionTree).
+// In ESM with SolidJS, this is safe: both bindings are function references
+// resolved by live-binding, and they are only CALLED at render/event time
+// (inside JSX / an onClick), never at module-eval time, so there's no TDZ. This
+// mirrors the existing Node import precedent; openSessionChat follows it.
+import { Node, openSessionChat } from "./SessionTree";
 
 // StubNode — renders a collapsed-branch stub from the Phase 4 projection.
 //
@@ -101,13 +103,14 @@ function StubNode(props: {
           classList={{
             sub: props.depth > 0,
             running: isBusy(),
+            selected: selectedId() === props.stub.id,
           }}
           onClick={(e) => {
             e.stopPropagation();
-            onTwisty();
+            openSessionChat(props.stub.id);
           }}
           data-stub-id={props.stub.id}
-          data-tip={displayName(props.stub.title || props.stub.id)}
+          data-tip={"Open: " + displayName(props.stub.title || props.stub.id)}
         >
           <span class="tree-line1">
             <Show when={isBusy()}>

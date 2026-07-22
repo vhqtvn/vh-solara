@@ -2,7 +2,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render } from "@solidjs/testing-library";
 import { reconcile } from "solid-js/store";
-import { setState, setSelectedIdRaw } from "../../src/sync/store";
+import { selectedId, setState, setSelectedIdRaw, state } from "../../src/sync/store";
+import { view } from "../../src/ui";
 import type { CollapsedBranchStub } from "../../src/types";
 import SessionTree, { __resetTreeForTest } from "../../src/components/SessionTree";
 import { __resetPinnedForTest } from "../../src/sidebar";
@@ -245,5 +246,40 @@ describe("StubNode dedup invariant (stub-vs-session coexist)", () => {
     putStub(baseStub({ id: "dupNested", parentID: "outerStub", title: "Dup Nested Stub" }));
     const { container } = render(() => <SessionTree />);
     assertSingleRenderAsNode(container as unknown as HTMLElement, "dupNested");
+  });
+});
+
+// Regression: idle-root-unopenable. When a session's whole subtree goes idle
+// past the projection cutoff, it surfaces as a collapsed-branch stub whose row
+// button USED to call onTwisty() (expand/collapse) — so clicking the row never
+// OPENED the session's chat. The fix routes the row click to openSessionChat
+// (exactly like a materialized Node row), keeps the separate twisty as the sole
+// expand/collapse path, and adds a `selected` highlight.
+describe("StubNode row opens the session (idle-root-unopenable fix)", () => {
+  it("row click opens the session (root stub)", () => {
+    putStub(baseStub({ id: "openRoot", title: "Open Root" }));
+    const { container } = render(() => <SessionTree />);
+    const row = stubRow(container as unknown as HTMLElement, "openRoot");
+    row.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    expect(selectedId()).toBe("openRoot");
+    expect(view()).toBe("chat");
+  });
+
+  it("row click does not change expandedBranches", () => {
+    putStub(baseStub({ id: "openRoot", title: "Open Root" }));
+    const { container } = render(() => <SessionTree />);
+    const row = stubRow(container as unknown as HTMLElement, "openRoot");
+    row.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    // The row is no longer the expand/collapse path (the twisty remains sole);
+    // a row click must not flip expandedBranches.
+    expect(state.expandedBranches["openRoot"]).toBeFalsy();
+  });
+
+  it("row gains the selected class when selectedId===stub.id", () => {
+    setSelectedIdRaw("openRoot");
+    putStub(baseStub({ id: "openRoot", title: "Open Root" }));
+    const { container } = render(() => <SessionTree />);
+    const row = stubRow(container as unknown as HTMLElement, "openRoot");
+    expect(row.classList.contains("selected")).toBe(true);
   });
 });
