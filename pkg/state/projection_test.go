@@ -611,3 +611,41 @@ func TestSnapshotProjected_ConcurrentWithApply(t *testing.T) {
 	}
 	<-done
 }
+
+// TestSnapshotBranch_StaleCursorTerminates (Theme 3 / Finding #6): when the
+// pagination cursor child was deleted/reparented between page requests, the
+// server must NOT silently restart at page 0 (which replays page 1 and lets the
+// client loop). It terminates cleanly: empty batch + no next cursor.
+func TestSnapshotBranch_StaleCursorTerminates(t *testing.T) {
+	s := New(64)
+	s.Apply(ev("session.created", `{"info":{"id":"parent","title":"P"}}`))
+	for i := 0; i < 5; i++ {
+		childID := fmt.Sprintf("c%d", i)
+		s.Apply(ev("session.created", fmt.Sprintf(`{"info":{"id":%q,"parentID":"parent"}}`, childID)))
+	}
+
+	// Page 1: cursor="" → returns c0,c1. nextCursor="c1".
+	snap1, next1 := s.SnapshotBranch("parent", "", 2)
+	if len(snap1.Sessions) != 2 {
+		t.Fatalf("page 1: expected 2 sessions, got %d", len(snap1.Sessions))
+	}
+	if next1 != "c1" {
+		t.Fatalf("page 1 nextCursor = %q, want c1", next1)
+	}
+
+	// Delete the cursor child c1 between page requests (simulates a child
+	// deleted/reparented while the client paginates).
+	s.Apply(ev("session.deleted", `{"info":{"id":"c1"}}`))
+
+	// Page 2: cursor="c1" (stale). Without the fix, c1 is not found in
+	// allChildren → start stays 0 → returns page 1 again (c0,c2) with
+	// nextCursor="c2" → client loops/restarts. With the fix, start=len →
+	// empty batch + empty nextCursor → client terminates.
+	snap2, next2 := s.SnapshotBranch("parent", "c1", 2)
+	if next2 != "" {
+		t.Fatalf("stale cursor: nextCursor = %q, want empty (terminate)", next2)
+	}
+	if len(snap2.Sessions) != 0 {
+		t.Fatalf("stale cursor: expected 0 sessions (terminate), got %d", len(snap2.Sessions))
+	}
+}

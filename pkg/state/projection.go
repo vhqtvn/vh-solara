@@ -575,11 +575,21 @@ func (s *Store) SnapshotBranch(parentID string, cursor string, limit int) (Snaps
 	// Find the starting position from the cursor.
 	start := 0
 	if cursor != "" {
+		found := false
 		for i, c := range allChildren {
 			if c == cursor {
 				start = i + 1
+				found = true
 				break
 			}
+		}
+		// Theme 3 / Finding #6: if the cursor child was deleted or reparented
+		// (no longer under parentID), do NOT silently restart at page 0 — that
+		// would replay page 1 and let the client loop indefinitely. Terminate
+		// the pagination cleanly: setting start past the end yields an empty
+		// batch and an empty nextCursor, which the client reads as "done".
+		if !found {
+			start = len(allChildren)
 		}
 	}
 	end := start + limit

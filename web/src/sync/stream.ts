@@ -152,6 +152,14 @@ export function resetPageInFlight(sid?: string) {
 export function resetTreeStreamStateForTesting() {
   lastAppliedStructuralRevision = undefined;
   lastCutoffVersion = undefined;
+  branchRequestGen = 0;
+}
+
+// getBranchRequestGenForTesting exposes the structural-generation counter for
+// unit tests (Theme 3). Production code never reads it directly — only
+// lazyExpandBranch captures and compares it.
+export function getBranchRequestGenForTesting(): number {
+  return branchRequestGen;
 }
 
 // fetchMessagePage — GET /vh/session/{sid}/messages?before=<id>&z=1. Mirrors
@@ -618,6 +626,9 @@ export function applySnapshot(snap: Snapshot) {
   // Wholesale session-set replacement invalidates the parent→children index.
   invalidateChildrenIndex();
   persist();
+  // Theme 3: AUTHORITY_COMPLETE wholesale-replaces the sessions set → topology
+  // changed. Bump so an in-flight lazy-expand detects the structural shift.
+  bumpBranchStructuralGen();
   // Phase 3 Gate B: record the applied revision (complete path).
   if (snap.structuralRevision !== undefined)
     lastAppliedStructuralRevision = snap.structuralRevision;
@@ -843,6 +854,17 @@ function applyProjectedSnapshot(snap: Snapshot) {
   // The merge may have added/changed sessions — invalidate the children cache.
   invalidateChildrenIndex();
   persist();
+  // Theme 3: a full-rebuild (changed || fullCause) wholesale-replaces the stub
+  // map and prunes ghosts/demotions → topology changed. Bump so an in-flight
+  // lazy-expand detects the structural shift and retries/aborts rather than
+  // merging a response whose contents are now stale. lazy-expand cause does
+  // NOT bump (it is a partial point-in-time read, not a topology mutation).
+  const fullCauseSnap =
+    snap.cause === "initial" ||
+    snap.cause === "promotion" ||
+    snap.cause === "reconnect" ||
+    snap.cause === "resync";
+  if (changed || fullCauseSnap) bumpBranchStructuralGen();
 }
 
 // Exported for integration tests (tests/unit/applySnapshot.test.ts).
@@ -878,6 +900,12 @@ export function applySessionEvent(kind: string, seq: number, payload: any) {
   // session.upsert / session.delete change the parent→children topology.
   invalidateChildrenIndex();
   persist();
+  // Theme 3: session.upsert/delete change parent→children topology. Bump so an
+  // in-flight lazy-expand detects the shift (a deleted/reparented child in the
+  // response would otherwise resurrect via merge).
+  if (kind === "session.upsert" || kind === "session.delete") {
+    bumpBranchStructuralGen();
+  }
 }
 
 // Message/part events are applied only for opened sessions (those present in
@@ -1391,6 +1419,21 @@ let treeSnapDone = false;
 // and again after the await. Without this, a stale decode from a superseded
 // connection would clobber the replacement's fresh state with a stale snapshot.
 let treeGen = 0;
+// branchRequestGen (Theme 3 / Finding #3) is a client-side structural-generation
+// counter bumped on every applied Stream1 TOPOLOGY change (session.upsert,
+// session.delete, projected full-rebuild stub replacement, AUTHORITY_COMPLETE
+// wholesale sessions replace). lazyExpandBranch captures it at fetch start and
+// rejects a response that lands after a structural mutation — the response
+// contents could reference a child deleted/reparented mid-flight, which merge
+// would resurrect (the same class as duplicate-session). Unlike treeGen (bumped
+// only on reconnect), this tracks in-session structural churn so a lazy-expand
+// is retried/aborted rather than applying stale topology. applyLazyExpandMerge
+// does NOT bump it (it materializes existing server-authoritative frontier, not
+// a topology mutation — bumping would self-abort the very expansion in flight).
+let branchRequestGen = 0;
+function bumpBranchStructuralGen(): void {
+  branchRequestGen++;
+}
 // Phase 3 Gate B: last-applied structural revision. Used to discard stale
 // snapshot responses (<), skip idempotent re-applies (==), and apply newer
 // (>). Reset to undefined on epoch change (a new epoch starts fresh). When
@@ -2530,6 +2573,18 @@ function applyLazyExpandMerge(snap: Snapshot) {
 // via branchExpandInFlight. Anti-clobber via treeGen + epoch (a tree reconnect
 // or project switch invalidates an in-flight fetch). Pagination via the
 // X-VH-Branch-Cursor header (continuation-based).
+//
+// Theme 3 / Finding #3 (anti-resurrection): captures branchRequestGen at each
+// fetch start. A structural mutation (session.upsert/delete, promotion snapshot)
+// landing between fetch-start and response-apply means the response contents may
+// reference a child deleted/reparented mid-flight — merging would resurrect it.
+// On a dirty generation the expansion restarts from page 1 under the fresh gen
+// (bounded: abandon on continuous structural churn; the next promotion rebuilds
+// the frontier anyway).
+//
+// Theme 3 / Finding #6 (no-loop): the server terminates pagination cleanly when
+// the cursor child was deleted/reparented (empty nextCursor). The client ALSO
+// guards against a no-progress page (same cursor twice) to terminate defensively.
 export async function lazyExpandBranch(branchID: string): Promise<void> {
   if (!branchID) return;
   if (branchExpandInFlight.has(branchID)) return; // single-flight
@@ -2540,8 +2595,14 @@ export async function lazyExpandBranch(branchID: string): Promise<void> {
   bumpUpdating();
   try {
     let cursor = "";
+    let prevCursor = ""; // Finding #6: no-progress detection
+    let structuralRetries = 0; // Finding #3: bounded retry on structural churn
     for (;;) {
       if (gen !== treeGen || epochChanged(epoch, state.epoch)) return; // anti-clobber
+      // Finding #3: capture the structural generation before the fetch. A
+      // structural mutation landing between fetch-start and response-apply means
+      // the response contents are stale w.r.t. the client's current topology.
+      const startGen = branchRequestGen;
       const params = new URLSearchParams({
         id: branchID,
         dir: projectDir(),
@@ -2559,6 +2620,28 @@ export async function lazyExpandBranch(branchID: string): Promise<void> {
       if (gen !== treeGen || epochChanged(epoch, state.epoch)) return; // anti-clobber
       const raw = await res.json();
       const snap = await decodeSnapshot<Snapshot>(raw);
+      // Finding #3: anti-resurrection. If a structural mutation landed between
+      // fetch-start and now, the response contents may reference a child that
+      // was deleted/reparented mid-flight. Restart from page 1 under the fresh
+      // generation so the server re-serves the current frontier (bounded —
+      // abandon on continuous churn; the next promotion rebuilds the frontier).
+      if (startGen !== branchRequestGen) {
+        structuralRetries++;
+        if (structuralRetries > 3) {
+          log.warn("sync", "lazy-expand abandoned (structural churn)", {
+            branchID,
+            retries: structuralRetries,
+          });
+          return;
+        }
+        log.debug("sync", "lazy-expand restarted (structural change)", {
+          branchID,
+          retry: structuralRetries,
+        });
+        cursor = ""; // restart from page 1
+        prevCursor = "";
+        continue;
+      }
       // Anti-clobber: branch root may have been deleted/reparented during fetch.
       // If the branch no longer exists as a stub OR as a session, discard.
       if (!state.branchStubs[branchID] && !state.sessions[branchID]) {
@@ -2567,7 +2650,16 @@ export async function lazyExpandBranch(branchID: string): Promise<void> {
       }
       applyLazyExpandMerge(snap);
       cursor = res.headers.get("X-VH-Branch-Cursor") || "";
-      if (!cursor) break; // no more pages
+      // Finding #6: no-progress guard. If the server returns the same cursor
+      // (or no cursor), terminate to avoid a loop. The server also returns an
+      // empty next-cursor when the pagination cursor child was deleted/
+      // reparented (clean termination — see SnapshotBranch).
+      if (!cursor || cursor === prevCursor) break;
+      prevCursor = cursor;
+      // Reset the structural-retry counter after a clean apply so only truly
+      // continuous churn (back-to-back gen mismatches with no successful page
+      // between them) triggers abandonment, not spread-out mutations.
+      structuralRetries = 0;
     }
   } catch (err) {
     log.warn("sync", "lazy-expand error", { branchID, err: String(err) });

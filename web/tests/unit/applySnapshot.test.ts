@@ -1,8 +1,8 @@
 // @vitest-environment jsdom
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { reconcile } from "solid-js/store";
 import { gzipSync } from "node:zlib";
-import { applySnapshot, applySessionEvent, applySessionSnapshot, applyMessageEvent, decodeMessagesBatch, resetTreeStreamStateForTesting } from "../../src/sync/stream";
+import { applySnapshot, applySessionEvent, applySessionSnapshot, applyMessageEvent, decodeMessagesBatch, resetTreeStreamStateForTesting, getBranchRequestGenForTesting, lazyExpandBranch } from "../../src/sync/stream";
 import { state, setState, setSelectedIdRaw } from "../../src/sync/store";
 import { sessionLastAgent } from "../../src/sync/selectors";
 import type { Snapshot } from "../../src/types";
@@ -1496,5 +1496,164 @@ describe("applySnapshot — Theme 2 projected-clear facets", () => {
     expect(state.unread.a).toBeUndefined();
     expect(state.currentVerbs.a).toBeUndefined();
     expect(state.lastAgents.a).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Theme 3: anti-resurrection (branchRequestGen guard) + no-loop pagination.
+// Finding #3: lazyExpandBranch must NOT resurrect a child deleted/reparented
+//   while a branch-expand fetch was in flight.
+// Finding #6: branch pagination must terminate (not restart at page 0 / loop)
+//   when the cursor child was deleted/reparented.
+// ---------------------------------------------------------------------------
+describe("Theme 3 anti-resurrection (branchRequestGen)", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("bumps branchRequestGen on session.delete", () => {
+    const gen0 = getBranchRequestGenForTesting();
+    applySessionEvent("session.delete", 1, { id: "x" });
+    expect(getBranchRequestGenForTesting()).toBe(gen0 + 1);
+  });
+
+  it("bumps branchRequestGen on session.upsert", () => {
+    const gen0 = getBranchRequestGenForTesting();
+    applySessionEvent("session.upsert", 1, { id: "y", parentID: "p" });
+    expect(getBranchRequestGenForTesting()).toBe(gen0 + 1);
+  });
+
+  it("bumps branchRequestGen on a projected full-rebuild snapshot (promotion)", () => {
+    const gen0 = getBranchRequestGenForTesting();
+    applySnapshot({
+      seq: 1,
+      epoch: "e1",
+      projected: true,
+      cause: "promotion",
+      structuralRevision: 1,
+      sessions: [{ id: "a" }],
+    });
+    expect(getBranchRequestGenForTesting()).toBe(gen0 + 1);
+  });
+
+  it("bumps branchRequestGen on AUTHORITY_COMPLETE (non-projected) snapshot", () => {
+    const gen0 = getBranchRequestGenForTesting();
+    applySnapshot({ seq: 1, sessions: [{ id: "a" }] });
+    expect(getBranchRequestGenForTesting()).toBe(gen0 + 1);
+  });
+
+  it("does NOT bump branchRequestGen on a lazy-expand cause snapshot", () => {
+    const gen0 = getBranchRequestGenForTesting();
+    applySnapshot({
+      seq: 1,
+      epoch: "e1",
+      projected: true,
+      cause: "lazy-expand",
+      structuralRevision: 1,
+      sessions: [{ id: "a" }],
+    });
+    expect(getBranchRequestGenForTesting()).toBe(gen0);
+  });
+
+  it("lazyExpandBranch does NOT resurrect a session deleted mid-fetch (Finding #3)", async () => {
+    // Seed: branch stub "B" with child session "a".
+    setState("sessions", { B: { id: "B" }, a: { id: "a", parentID: "B" } });
+    setState("branchStubs", {
+      B: { id: "B", kind: "collapsed-branch", parentID: "", title: "B", hasChildren: true },
+    });
+
+    // Fetch mock: first call returns STALE data (includes deleted "a"); second
+    // call (the retry under fresh gen) returns CLEAN data (no "a").
+    const staleBody = JSON.stringify({
+      seq: 100,
+      projected: true,
+      cause: "lazy-expand",
+      sessions: [{ id: "a", parentID: "B" }],
+      stubs: [],
+    });
+    const cleanBody = JSON.stringify({
+      seq: 101,
+      projected: true,
+      cause: "lazy-expand",
+      sessions: [],
+      stubs: [],
+    });
+
+    let callCount = 0;
+    let resolveFirst!: (r: Response) => void;
+    const firstPromise = new Promise<Response>((resolve) => {
+      resolveFirst = resolve;
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => {
+        callCount++;
+        if (callCount === 1) return firstPromise;
+        return Promise.resolve(
+          new Response(cleanBody, {
+            status: 200,
+            headers: { "X-VH-Branch-Cursor": "" },
+          }),
+        );
+      }),
+    );
+
+    // Start lazy-expand (async — runs up to the first await fetch, then yields).
+    const p = lazyExpandBranch("B");
+
+    // Apply session.delete("a") BEFORE the stale response resolves. This bumps
+    // branchRequestGen, so when the stale response lands it will be rejected.
+    applySessionEvent("session.delete", 99, { id: "a" });
+    expect(state.sessions.a).toBeUndefined(); // confirmed deleted
+
+    // Resolve the stale fetch (contains the now-deleted "a").
+    resolveFirst(
+      new Response(staleBody, {
+        status: 200,
+        headers: { "X-VH-Branch-Cursor": "" },
+      }),
+    );
+    await p;
+
+    // "a" must NOT be resurrected: the stale response was rejected, the retry
+    // fetched clean data. Without the branchRequestGen guard, "a" would be
+    // merged back from the stale response (callCount would be 1, not 2).
+    expect(state.sessions.a).toBeUndefined();
+    expect(callCount).toBe(2);
+  });
+
+  it("lazyExpandBranch terminates on no cursor progress (Finding #6 client guard)", async () => {
+    setState("sessions", { B: { id: "B" } });
+    setState("branchStubs", {
+      B: { id: "B", kind: "collapsed-branch", parentID: "", title: "B", hasChildren: true },
+    });
+
+    // Simulate a server stuck returning the same nextCursor (the old cursor-
+    // not-found bug restarted at page 0 → same cursor forever). The no-progress
+    // guard must break the loop instead of fetching indefinitely.
+    const body = JSON.stringify({
+      seq: 100,
+      projected: true,
+      cause: "lazy-expand",
+      sessions: [{ id: "c1", parentID: "B" }],
+      stubs: [],
+    });
+    let callCount = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => {
+        callCount++;
+        return Promise.resolve(
+          new Response(body, {
+            status: 200,
+            headers: { "X-VH-Branch-Cursor": "c1" }, // same cursor forever
+          }),
+        );
+      }),
+    );
+
+    await lazyExpandBranch("B");
+
+    // Without the no-progress guard this would loop forever (test timeout).
+    // With it, the second response's cursor === prevCursor → break.
+    expect(callCount).toBe(2);
   });
 });
