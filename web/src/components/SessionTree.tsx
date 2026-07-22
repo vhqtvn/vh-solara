@@ -210,6 +210,14 @@ export function Node(props: {
     Object.values(state.branchStubs).filter(
       (s) => s.parentID === props.session.id && !state.sessions[s.id],
     );
+  // A materialized node may have ONLY stub children (the common O1 workload:
+  // an active root whose direct descendants are idle subagents collapsed into
+  // frontier stubs). The twisty — leaf state, click handler, chevron, count —
+  // must treat stub children as real children, otherwise the twisty is an inert
+  // blank square: leaf=false (the leaf check already counts stubKids) but no
+  // chevron renders and the click is a no-op, so the idle stubs stay hidden
+  // forever. hasAnyChildren unifies both kinds for every UI affordance.
+  const hasAnyChildren = () => kids().length > 0 || stubKids().length > 0;
   const visibleStubKids = (): CollapsedBranchStub[] => {
     switch (display()) {
       case "collapsed":
@@ -309,7 +317,7 @@ export function Node(props: {
   // In detailed density the node's own second line already shows the
   // running/idle counts, so the separate footer row would just duplicate them.
   const hasFooter = () =>
-    treeDensity() !== "detailed" && kids().length > 0 && hidden().running + hidden().idle > 0;
+    treeDensity() !== "detailed" && hasAnyChildren() && hidden().running + hidden().idle > 0;
 
   return (
     <>
@@ -332,15 +340,15 @@ export function Node(props: {
         <button
           type="button"
           class="tree-twisty"
-          classList={{ leaf: kids().length === 0 && stubKids().length === 0 }}
+          classList={{ leaf: !hasAnyChildren() }}
           aria-label={`Subtree: ${display()} (click to cycle)`}
           data-tip={`Subtree: ${display()}`}
           onClick={(e) => {
             e.stopPropagation();
-            if (kids().length > 0) onTwisty(props.session.id, display());
+            if (hasAnyChildren()) onTwisty(props.session.id, display());
           }}
         >
-          <Show when={kids().length > 0}>
+          <Show when={hasAnyChildren()}>
             {/* expanded=chevron-down, collapsed=chevron-right (rotated),
                 filtered=funnel, temp=eye. */}
             <Switch>
@@ -417,8 +425,8 @@ export function Node(props: {
               {displayName(props.session.title || props.session.id)}
             </span>
             <span class="tree-meta">
-              <Show when={kids().length > 0}>
-                <span class="tree-count">{kids().length}</span>
+              <Show when={hasAnyChildren()}>
+                <span class="tree-count">{kids().length + stubKids().length}</span>
               </Show>
               <RelTime class="tree-time" ms={props.session.time?.updated || props.session.time?.created} />
             </span>

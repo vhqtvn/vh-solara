@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { cleanup, fireEvent, render, waitFor } from "@solidjs/testing-library";
 import { reconcile } from "solid-js/store";
 import { setState, setSelectedIdRaw } from "../../src/sync/store";
-import type { Session } from "../../src/types";
+import type { Session, CollapsedBranchStub } from "../../src/types";
 import SessionTree, { __resetTreeForTest } from "../../src/components/SessionTree";
 import { __resetPinnedForTest, setSearchQuery } from "../../src/sidebar";
 import { setNameReplacements } from "../../src/projectSettings";
@@ -20,6 +20,9 @@ beforeEach(() => {
   setState("sessions", reconcile({}));
   setState("activity", reconcile({}));
   setState("unread", reconcile({}));
+  // Phase 5: branchStubs (collapsed-branch frontier) is ephemeral and starts
+  // empty; reset so a prior test's stubs don't leak into the next render.
+  setState("branchStubs", reconcile({}));
   // selectedId is a module-level singleton signal; reset it so a prior test's
   // selection doesn't leak into the next render.
   setSelectedIdRaw(null);
@@ -385,5 +388,83 @@ describe("displayName boundary", () => {
       expect(searchNode).toBeTruthy();
       expect(searchNode?.querySelector(".tree-title")?.textContent).toBe("Y test");
     });
+  });
+});
+
+// Phase 5 / Finding #5: a materialized node whose ONLY direct descendants are
+// collapsed-branch stubs (the common O1 workload: an active root with idle
+// subagent children) must have a FUNCTIONAL twisty — chevron present, click
+// cycles display, and expanding reveals the idle stubs. Before the fix the
+// leaf/click/chevron/count affordances keyed off kids() (full sessions only),
+// leaving an inert blank twisty that hid the idle stubs permanently.
+function putStub(
+  id: string,
+  parentID: string,
+  over: Partial<CollapsedBranchStub> = {},
+): void {
+  setState("branchStubs", id, {
+    id,
+    parentID,
+    title: id,
+    kind: "collapsed-branch",
+    hasChildren: false,
+    descendantCount: 0,
+    aggregateState: "idle",
+    ...over,
+  } as CollapsedBranchStub);
+}
+
+describe("SessionTree stub-only twisty (Finding #5)", () => {
+  it("renders a functional chevron for a node whose only children are stubs", () => {
+    // Busy root (stays filtered — auto-tidy won't collapse a working node) with
+    // one IDLE stub child and NO full-session children.
+    putSession({ id: "root", title: "Root" });
+    setState("activity", "root", "busy");
+    putStub("stub1", "root", { title: "Sub", aggregateState: "idle" });
+
+    const { container } = render(() => <SessionTree />);
+    const twisty = twistyFor(container as unknown as HTMLElement, "root");
+
+    // WITHOUT the fix: kids().length===0 → <Show when={kids().length>0}> hides
+    // the chevron AND the click handler is a no-op. WITH the fix:
+    // hasAnyChildren() (stub kid present) → chevron renders + not a leaf.
+    expect(twisty.classList.contains("leaf")).toBe(false);
+    expect(twisty.querySelector("svg.icon")).not.toBeNull();
+  });
+
+  it("clicking the twisty cycles filtered→expanded and reveals the idle stub", async () => {
+    putSession({ id: "root", title: "Root" });
+    setState("activity", "root", "busy");
+    putStub("stub1", "root", { title: "Sub", aggregateState: "idle" });
+
+    const { container } = render(() => <SessionTree />);
+    const twisty = twistyFor(container as unknown as HTMLElement, "root");
+
+    // Idle stub is hidden in filtered mode (the default).
+    expect(container.querySelector('[data-stub-id="stub1"]')).toBeNull();
+
+    // Click cycles filtered → expanded. WITHOUT the fix the click handler's
+    // `if (kids().length > 0)` guard skips onTwisty, so the mode never changes
+    // and the idle stub stays permanently hidden.
+    fireEvent.click(twisty);
+    await waitFor(() => {
+      expect(readMode("root")).toBe("expanded");
+    });
+    // Expanded mode shows ALL stub children — the idle stub is now visible.
+    expect(container.querySelector('[data-stub-id="stub1"]')).not.toBeNull();
+  });
+
+  it("shows a child-count badge that includes stub children", () => {
+    // One full child + one stub child → badge reads "2" (was "1" before, which
+    // under-counted by ignoring the stub child entirely).
+    putSession({ id: "root", title: "Root" });
+    setState("activity", "root", "busy");
+    putSession({ id: "full1", title: "Full", parentID: "root" });
+    putStub("stub1", "root", { title: "Sub", aggregateState: "idle" });
+
+    const { container } = render(() => <SessionTree />);
+    const node = container.querySelector('.tree-node[data-session-id="root"]');
+    const count = node?.querySelector(".tree-count");
+    expect(count?.textContent).toBe("2");
   });
 });
