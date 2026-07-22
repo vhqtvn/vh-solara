@@ -20,7 +20,7 @@ import { handleNotice } from "../alerts";
 import { checkVersionNow } from "../pwa";
 import { log } from "../lib/log";
 import { state, setState, projectDir, selectedId, persist } from "./store";
-import { invalidateChildrenIndex, normalizeTodos } from "./selectors";
+import { invalidateChildrenIndex, normalizeTodos, descendantSessionIds } from "./selectors";
 import { notifyFromMessage, maybeNotifyRootDone, maybeClearWaiting } from "./orchestration";
 import { isGateActive, currentGateEpoch, markBusyDirty, setReconcileFn } from "../busy";
 
@@ -2774,10 +2774,49 @@ export async function lazyExpandBranch(branchID: string): Promise<void> {
   }
 }
 
-// Collapse an expanded branch: mark it collapsed. The children stay in state
-// (they're still valid sessions/stubs) but the UI hides them. The next expand
-// re-fetches from the server (the frontier may have changed).
+// Collapse an expanded branch back to its stub-only state. In addition to
+// marking the branch collapsed, REMOVE the materialized descendants the
+// expansion fetched, restoring the frontier invariant (a materialized child's
+// DIRECT parent is always in state.sessions OR state.branchStubs).
+//
+// The old behavior only flipped expandedBranches[branchID]=false and left the
+// descendants sitting in state.sessions (the comment below used to claim they
+// "stay in state ... but the UI hides them"). That was the root cause of a
+// destructive false-positive: orphanSessions() scans state.sessions FLAT and
+// cannot tell collapse-hidden descendants from genuine orphans. When a later
+// full-rebuild snapshot (cause=initial/promotion/reconnect/resync) wiped
+// branchStubs and re-emitted only the one-level frontier — dropping this
+// branch's parent stub because its ancestor was demoted off the frontier —
+// those still-materialized descendants became false orphans and were offered
+// for the destructive bulk-archive. Removing them here returns to the
+// pre-expand state so the invariant holds; the next expand re-fetches from the
+// server (the frontier may have changed), and any genuinely-active descendant
+// is re-materialized with proper ancestor stubs by the next server projected
+// snapshot — so this is self-healing and loses nothing.
+//
+// The viewed/open session (selectedId) is exempt: dropping its payload would
+// blank ChatView/SessionInspector mid-view (mirrors the openId exemption in
+// applyProjectedSnapshot's reconcile). branchID itself is NEVER removed — it
+// stays as its stub or materialized session. All three trigger paths
+// (lazyExpandBranch stale-cursor-twice / structural-churn-exhausted, and the
+// manual twisty in StubNode) route through here, so this single fix covers all.
 export function collapseBranch(branchID: string): void {
   if (!branchID) return;
-  setState("expandedBranches", branchID, false);
+  const openId = selectedId();
+  const ids = descendantSessionIds(branchID);
+  const toRemove = ids.filter((id) => id !== openId);
+  setState(
+    produce((s) => {
+      for (const id of toRemove) {
+        delete s.sessions[id];
+        // Drop descendant stubs the expansion added (grandchildren), and clear
+        // nested-expand flags so a re-expand starts clean.
+        delete s.branchStubs[id];
+        delete s.expandedBranches[id];
+      }
+      s.expandedBranches[branchID] = false;
+    }),
+  );
+  if (toRemove.length) invalidateChildrenIndex();
+  persist();
 }

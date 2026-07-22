@@ -293,6 +293,15 @@ function subtreeSessionIds(rootID: string): string[] {
   return out;
 }
 
+// Descendants of rootID EXCLUDING rootID itself. The exported collapse helper
+// (stream.ts collapseBranch) uses this to walk a branch's materialized subtree
+// without re-implementing the parent→children walk. Reuses the cached index (so
+// the cost is O(subtree), not O(all-sessions)) and is invalidated alongside it
+// at every state.sessions mutation site.
+export function descendantSessionIds(rootID: string): string[] {
+  return subtreeSessionIds(rootID).filter((id) => id !== rootID);
+}
+
 // --- Parent→children index (Fix A: kills the O(N²) cold-mount freeze) -------
 //
 // subtreeSessionIds / descendantWorking USED to rebuild a `childrenOf` index by
