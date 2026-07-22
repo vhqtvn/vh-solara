@@ -188,25 +188,27 @@ func (s *Store) SweepInterval() time.Duration {
 	return d
 }
 
-// ConsumeTimeFrontierChange atomically claims a pending time-driven demotion
-// signal. Returns true if this caller was the first to observe the signal (and
-// resets it); false otherwise. The CompareAndSwap guarantees that exactly ONE
-// handleStream consumer wins the arm even under many concurrent projected
-// streams, so the demotion snapshot ships once (then the coalesce path dedupes
-// any further bursts within the 150ms window). This is a SEPARATE signal from
-// the event-driven curFrontierChanged / frontierSeq amplifier gate, which stays
-// exactly as-is.
+// DemotionGen returns the current demotion-sweep generation. The sweep bumps
+// this monotonic counter (via demotionGen.Add(1)) ONLY when it detects the
+// active closure has SHRUNK since the last notification (a session aged past
+// the projection cutoff with no accompanying event). Each handleStream tracks
+// its own last-seen value and arms the promotion-coalesce path when
+// DemotionGen() has advanced past it — so EVERY concurrent proj=1 stream ships
+// the demotion snapshot, mirroring how the per-event ev.FrontierChanged flag
+// fans out to every stream.
 //
-// Single-consumer fan-out note: the signal is a single store-wide consuming
-// atomic, so under 2+ concurrent projected (proj=1) streams only ONE ships the
-// demotion snapshot; the others retain the stale materialized session until
-// their next ev.FrontierChanged flush or a reconnect re-projects (eventual
-// consistency). Production is typically a single projected viewer (one operator
-// tab); no contract promises demotion delivery to all open projected streams.
-// If multi-viewer projected-stream support becomes a real surface, replace the
-// consuming CAS with per-stream "last consumed sweep seq" tracking.
-func (s *Store) ConsumeTimeFrontierChange() bool {
-	return s.timeFrontierChanged.CompareAndSwap(true, false)
+// This replaces the earlier store-global consuming CAS
+// (ConsumeTimeFrontierChange), which under 2+ concurrent projected streams let
+// exactly ONE claim the signal and left the others with the stale materialized
+// session until their next event-driven flush or reconnect.
+//
+// This is a SEPARATE signal from the event-driven curFrontierChanged /
+// frontierSeq amplifier gate, which stays exactly as-is. A reader that has not
+// advanced past its last-seen value observes nothing — no spurious arm, no
+// amplifier (the shrink-only sweep gate and the per-stream last-seen check
+// together bound the snapshot rate to the genuine demotion cadence).
+func (s *Store) DemotionGen() uint64 {
+	return s.demotionGen.Load()
 }
 
 // RunDemotionSweep is the ctx-bound goroutine that catches TIME-DRIVEN
@@ -218,11 +220,12 @@ func (s *Store) ConsumeTimeFrontierChange() bool {
 //
 // The sweep closes that gap. Every SweepInterval, under s.mu RLock, it
 // recomputes the active closure and compares it against lastNotifiedClosure
-// (the baseline of "what clients have been told"). It signals (sets
-// timeFrontierChanged) ONLY on a genuine SHRINK — a session that was in the
-// baseline but is no longer in the active closure (it aged past cutoff). A
-// consuming handleStream arm then CAS-claims the signal and re-projects via
-// the existing promotion-coalesce path (no second snapshot path).
+// (the baseline of "what clients have been told"). It signals (bumps
+// demotionGen) ONLY on a genuine SHRINK — a session that was in the baseline
+// but is no longer in the active closure (it aged past cutoff). Each
+// handleStream independently observes the bumped gen on its next sweepTicker
+// poll and re-projects via the existing promotion-coalesce path (no second
+// snapshot path).
 //
 // Shrink-only is correct because stub→active-by-time is impossible: a stub
 // becomes active only when a NEW event touches it, which already arms via
@@ -316,7 +319,12 @@ func (s *Store) sweepOnce() {
 	s.lastNotifiedClosure.Store(&active)
 	s.mu.RUnlock()
 	if shrunk {
-		s.timeFrontierChanged.Store(true)
+		// Bump the per-stream fanout generation: every handleStream that has
+		// not yet seen this value arms its promotion path on its next
+		// sweepTicker poll. Replaces the old store-global consuming CAS
+		// (timeFrontierChanged) which delivered the demotion to exactly ONE
+		// stream under concurrent viewers.
+		s.demotionGen.Add(1)
 	}
 }
 

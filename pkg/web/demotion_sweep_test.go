@@ -23,6 +23,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -177,5 +178,78 @@ func TestDemotionSweep_RecentActivityNotDemoted(t *testing.T) {
 	if promoCount := countPromotions(causes); promoCount != 0 {
 		t.Fatalf("anti-thrash: recently-touched recency-gated session demoted by sweep: want 0 promotion snapshots over %v (sweepInterval=%v, cutoff=%v), got %d (causes=%v) — sweep is demoting a session still within the cutoff",
 			deadline, sweepInterval, cutoff, promoCount, causes)
+	}
+}
+
+// TestDemotionSweep_PerStreamFanout_BothStreamsReceive proves the demotion
+// signal fans out to EVERY concurrent proj=1 stream, not just one. Under the
+// old store-global consuming CAS (ConsumeTimeFrontierChange), exactly ONE of N
+// open projected streams would ship the demotion snapshot; the others kept the
+// session materialized until an unrelated frontier change or reconnect. With
+// the per-stream demotionGen signal, each handleStream independently detects
+// the gen has advanced since its last-seen value and arms the promotion path.
+//
+// FAIL-without (old CAS): only one of the two streams receives a promotion.
+// PASS-with (per-stream gen): BOTH streams receive ≥1 promotion.
+func TestDemotionSweep_PerStreamFanout_BothStreamsReceive(t *testing.T) {
+	withPromotionCoalesce(t, 50*time.Millisecond)
+
+	srv, web := newNoPollServer(t)
+	seedSessionDirect(t, srv, "dem1")
+	// Drive dem1 BUSY so it is self-active (busy sessions are always in the
+	// active closure) at stream-open time. busy→idle is applied AFTER both
+	// initial snapshots are read so both streams see dem1 as active initially;
+	// busy→idle does NOT arm FrontierChanged (wasSelfActive=true), so no
+	// event-driven promotion fires — the only snapshot after initial is the
+	// sweep-driven demotion.
+	srv.agg.Store().Apply(statusBusyEvent("dem1"))
+
+	const cutoff = 300 * time.Millisecond
+	state.SetProjectionCutoffForTest(cutoff, 2)
+	t.Cleanup(func() { state.SetProjectionCutoffForTest(0, 0) })
+
+	sweepInterval := srv.agg.Store().SweepInterval()
+
+	startDemotionSweep(t, srv)
+
+	// Deadline covers: two stream opens + initial reads, then busy→idle apply,
+	// then cutoff aging, then one sweep tick (shrink detection) + one
+	// sweepTicker poll per stream + the coalesce window, plus margin.
+	deadline := cutoff + 8*sweepInterval + 300*time.Millisecond
+
+	r1, _ := openProjectedStream(t, web.URL, deadline)
+	r2, _ := openProjectedStream(t, web.URL, deadline)
+
+	// Consume each initial snapshot (cause:"initial") so the only remaining
+	// snapshots are the sweep-driven demotion promotions.
+	if initEv, _ := readSSEFrameSilent(r1); initEv != "snapshot" {
+		t.Fatalf("stream1 first frame want snapshot, got %q", initEv)
+	}
+	if initEv, _ := readSSEFrameSilent(r2); initEv != "snapshot" {
+		t.Fatalf("stream2 first frame want snapshot, got %q", initEv)
+	}
+
+	// busy→idle: dem1 becomes recency-gated (self-active only while
+	// lastActivityAt stays within the cutoff). No FrontierChanged → no
+	// event-driven promotion. dem1 then ages past the cutoff → the sweep
+	// detects the shrink and bumps demotionGen.
+	srv.agg.Store().Apply(statusIdleEvent("dem1"))
+
+	// Drain BOTH streams concurrently. A sequential drain (r1 then r2) would
+	// stop reading r2 while blocked on r1's EOF; r2's server-side flush would
+	// then block on a full TCP buffer and freeze its select loop before the
+	// sweepTicker could arm. Concurrent draining keeps both connections flowing.
+	var causes1, causes2 []string
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); causes1 = drainSnapshotCauses(t, r1) }()
+	go func() { defer wg.Done(); causes2 = drainSnapshotCauses(t, r2) }()
+	wg.Wait()
+
+	if c1 := countPromotions(causes1); c1 < 1 {
+		t.Fatalf("stream1: per-stream demotion fanout failed: want ≥1 promotion (demotion), got %d (causes=%v) — under the old store-global CAS only one stream claimed the signal", c1, causes1)
+	}
+	if c2 := countPromotions(causes2); c2 < 1 {
+		t.Fatalf("stream2: per-stream demotion fanout failed: want ≥1 promotion (demotion), got %d (causes=%v) — under the old store-global CAS only one stream claimed the signal", c2, causes2)
 	}
 }

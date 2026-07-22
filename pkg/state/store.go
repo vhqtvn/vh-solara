@@ -1095,16 +1095,20 @@ type Store struct {
 	// The stream handler gates the promotion coalesce arm on this per-event
 	// flag (wantsProject(r) && ev.FrontierChanged).
 	curFrontierChanged bool
-	// timeFrontierChanged (Phase 2 demotion sweep) is a SEPARATE atomic signal
-	// from curFrontierChanged / frontierSeq. The event-driven amplifier gate
+	// demotionGen (Phase 2 demotion sweep) is a SEPARATE atomic signal from
+	// curFrontierChanged / frontierSeq. The event-driven amplifier gate
 	// (ev.FrontierChanged) stays exactly as-is; this signal carries ONLY
 	// time-driven demotion (a session aging past the projection cutoff with no
-	// accompanying event). The sweep goroutine (RunDemotionSweep) sets it to
-	// true when it detects the active closure has SHRUNK since the last
-	// notification. Each consuming handleStream arm CAS-resets it to false via
-	// ConsumeTimeFrontierChange so exactly ONE stream ships the demotion
-	// snapshot (then the 150ms coalesce path dedupes further bursts).
-	timeFrontierChanged atomic.Bool
+	// accompanying event). The sweep goroutine (RunDemotionSweep) Add(1)s it
+	// when it detects the active closure has SHRUNK since the last
+	// notification. Each handleStream independently compares it to its own
+	// last-seen value (via DemotionGen) and arms the promotion path when it has
+	// advanced — so EVERY concurrent proj=1 stream ships the demotion snapshot
+	// (mirroring how ev.FrontierChanged fans out per-event), not just one. The
+	// earlier store-global consuming CAS (timeFrontierChanged /
+	// ConsumeTimeFrontierChange) delivered to exactly ONE stream and lost
+	// demotions across multi-tab viewers.
+	demotionGen atomic.Uint64
 	// lastNotifiedClosure (Phase 2 demotion sweep) is the baseline active-closure
 	// the sweep compares against to detect time-driven SHRINK. It mirrors "what
 	// clients currently see" — updated both by SnapshotProjected (the authority

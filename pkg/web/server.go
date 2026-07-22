@@ -1524,6 +1524,14 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	// only the activity state, not the materialization payload, so the client
 	// cannot self-promote a stub. Narrowing the trigger set would drop genuine
 	// promotions.
+	// lastDemotionGen is this stream's last-seen demotion-sweep generation. It
+	// is initialized AFTER the initial/reconnect snapshot ships (so a demotion
+	// the snapshot already reflects is not re-armed), refreshed in flushPromotion
+	// (so an event-driven promotion that already reflects a demotion is not
+	// re-armed by the next sweepTicker poll), and compared on every sweepTicker
+	// tick. This per-stream value is what fans the demotion out to EVERY
+	// concurrent proj=1 viewer (replacing the old store-global consuming CAS).
+	lastDemotionGen := store.DemotionGen()
 	promoCoalesce := time.NewTimer(promotionCoalesceInterval)
 	promoCoalesce.Stop() // armed on first structural event, not at stream open
 	defer promoCoalesce.Stop()
@@ -1550,6 +1558,10 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			// promotion snapshot are not re-emitted (mirrors the initial
 			// snapshot baseline bump at the snapshot send site above).
 			baseline = promoSnap.Seq
+			// SnapshotProjected updated lastNotifiedClosure (the sweep baseline),
+			// so a demotion this promotion already reflects must not re-arm on
+			// the next sweepTicker poll — advance this stream's last-seen gen.
+			lastDemotionGen = store.DemotionGen()
 		}
 	}
 
@@ -1557,13 +1569,14 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	defer ticker.Stop()
 	// sweepTicker drives the time-driven demotion re-projection: when the
 	// store's demotion sweep detects a session has aged past the projection
-	// cutoff (a wall-clock transition no event fires for), it sets
-	// timeFrontierChanged. This ticker polls that signal at SweepInterval
-	// (derived from the cutoff) and, if set, CAS-claims it and arms the SAME
-	// promotion-coalesce path as ev.FrontierChanged — no second snapshot path.
-	// The CAS guarantees exactly ONE consumer wins the arm under many
-	// concurrent streams. Identical arm shape to the ev.FrontierChanged case
-	// below (gated on wantsProject).
+	// cutoff (a wall-clock transition no event fires for), it bumps demotionGen.
+	// This ticker polls DemotionGen() at SweepInterval (derived from the cutoff)
+	// and, when it has advanced past this stream's last-seen value, arms the
+	// SAME promotion-coalesce path as ev.FrontierChanged — no second snapshot
+	// path. Each stream tracks its own last-seen value (lastDemotionGen) so
+	// EVERY concurrent proj=1 viewer ships the demotion (mirroring the
+	// ev.FrontierChanged per-event fanout), not just one. Identical arm shape
+	// to the ev.FrontierChanged case below (gated on wantsProject).
 	sweepTicker := time.NewTicker(store.SweepInterval())
 	defer sweepTicker.Stop()
 	for {
@@ -1640,14 +1653,20 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		case <-sweepTicker.C:
 			// Time-driven demotion: the store's sweep detected a session aged
 			// past the projection cutoff (a wall-clock crossing no event fires
-			// for). CAS-claim the signal so exactly ONE stream ships the
-			// demotion snapshot; then arm the IDENTICAL promotion-coalesce path
-			// as ev.FrontierChanged above (same timer, same flushPromotion — no
-			// second snapshot path). Non-projected streams (wantsProject=false)
-			// short-circuit before the CAS so they never steal the signal.
-			if wantsProject(r) && store.ConsumeTimeFrontierChange() && !promoPending {
-				promoPending = true
-				promoCoalesce.Reset(promotionCoalesceInterval)
+			// for). Arm when the per-stream demotionGen has advanced past
+			// lastDemotionGen, then record the new value — so EVERY concurrent
+			// proj=1 stream ships the demotion (per-stream fanout, mirroring
+			// ev.FrontierChanged), not just one. Then arm the IDENTICAL
+			// promotion-coalesce path as ev.FrontierChanged above (same timer,
+			// same flushPromotion — no second snapshot path). Non-projected
+			// streams (wantsProject=false) short-circuit so they never observe
+			// the gen.
+			if wantsProject(r) && !promoPending {
+				if gen := store.DemotionGen(); gen > lastDemotionGen {
+					lastDemotionGen = gen
+					promoPending = true
+					promoCoalesce.Reset(promotionCoalesceInterval)
+				}
 			}
 		case <-ticker.C:
 			// A NAMED ping event (not an SSE ` : comment`) so the client can observe
