@@ -1154,6 +1154,7 @@ func (s *Server) handleRunningSessions(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
+	w = diag.NewHandlerBytesWriter(w, diag.ProxyPathSnapshot) // PROBE 8: attribute non-stream tunnel bytes
 	agg := s.aggFor(reqDir(r))
 	filter := messageFilter(r)
 	filter = s.projectScopedFilter(agg, filter)
@@ -1201,6 +1202,7 @@ func (s *Server) ensureMessages(ctx context.Context, agg *aggregator.Aggregator,
 // Pure read — no state mutation, no message hydration (the client fetches
 // messages on demand for individual sessions).
 func (s *Server) handleBranch(w http.ResponseWriter, r *http.Request) {
+	w = diag.NewHandlerBytesWriter(w, diag.ProxyPathBranch) // PROBE 8: attribute non-stream tunnel bytes
 	id := r.URL.Query().Get("id")
 	if id == "" {
 		http.Error(w, "missing id", http.StatusBadRequest)
@@ -1439,6 +1441,14 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		// Fresh client or cursor too old: send a full snapshot, then live-tail.
+		// PROBE 8: when the client HAD a cursor but the shared replay ring
+		// evicted it (hasCursor && !replayOK), this is a silent fallback to a
+		// fresh snapshot — the exact signal that reveals whether the single
+		// 4096-event shared ring is evicting Stream2 cursors under multi-
+		// session load (the deferred per-session-ring finding).
+		if hasCursor && !replayOK {
+			diag.IncStream2ReplayFallback()
+		}
 		// NON-BLOCKING hydration: kick the upstream fetch off in the background
 		// (EnsureMessagesAsync) so the snapshot sends immediately, then forward
 		// message.*/part.* deltas + messages.loaded over this same connection as
@@ -1729,6 +1739,7 @@ type renderResult struct {
 }
 
 func (s *Server) handleRender(w http.ResponseWriter, r *http.Request) {
+	w = diag.NewHandlerBytesWriter(w, diag.ProxyPathRender) // PROBE 8: attribute non-stream tunnel bytes
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -1801,6 +1812,7 @@ func (s *Server) handleHighlightCSS(w http.ResponseWriter, r *http.Request) {
 
 // handlePassthrough strips the /oc prefix and reverse-proxies to OpenCode.
 func (s *Server) handlePassthrough(w http.ResponseWriter, r *http.Request) {
+	w = diag.NewHandlerBytesWriter(w, diag.ProxyPathPassthrough) // PROBE 8: attribute non-stream tunnel bytes
 	r.URL.Path = strings.TrimPrefix(r.URL.Path, "/oc")
 	if r.URL.Path == "" {
 		r.URL.Path = "/"

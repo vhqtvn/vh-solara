@@ -19,6 +19,15 @@ type snapshotJSON struct {
 		WSWrite []wsWriteJSON `json:"ws_write"`
 		Copy    []copyJSON    `json:"copy"`
 		Tunnel  tunnelJSON    `json:"tunnel"`
+		// Probe 8: per-path-class byte counters for the non-stream tunnel legs.
+		// See handler_bytes.go. The sum of these + sum(stream.bytes) reconciles
+		// with the aggregate ws_write / yamux totals (the previously blind raw-
+		// proxy traffic is now attributed).
+		HandlerBytes []handlerBytesJSON `json:"handler_bytes"`
+		// Stream2ReplayFallback: projected /vh/stream resumes that fell back to
+		// a fresh snapshot (ring evicted the cursor). Non-zero under multi-
+		// session load flags the deferred per-session-ring finding.
+		Stream2ReplayFallback uint64 `json:"stream2_replay_fallback"`
 	} `json:"probes"`
 }
 
@@ -95,6 +104,15 @@ type copyJSON struct {
 	Bytes uint64            `json:"bytes"`
 	Dur   histogramSnapshot `json:"dur"`
 	Term  map[string]uint64 `json:"term"`
+}
+
+// handlerBytesJSON is the wire shape of Probe 8 (per-path-class non-stream
+// tunnel-leg byte counter). Mirrors the fixed path-class enumeration in
+// handler_bytes.go — no per-URL/per-session labels.
+type handlerBytesJSON struct {
+	Class  string `json:"class"`
+	Bytes  uint64 `json:"bytes"`
+	Writes uint64 `json:"writes"`
 }
 
 // tunnelJSON is the worker-side tunnel-lifecycle probe's wire shape. On the
@@ -246,6 +264,18 @@ func Snapshot() snapshotJSON {
 		LastDisconnectAtNs: t.LastDisconnectAtNs.Load(),
 		CurrentState:       tunnelStateName[stateIdx],
 	}
+
+	// Probe 8: per-path-class non-stream tunnel-leg byte counters.
+	out.Probes.HandlerBytes = make([]handlerBytesJSON, 0, numProxyPathClasses)
+	for i := 0; i < numProxyPathClasses; i++ {
+		hb := &r.HandlerBytes[i]
+		out.Probes.HandlerBytes = append(out.Probes.HandlerBytes, handlerBytesJSON{
+			Class:  proxyPathClassName[i],
+			Bytes:  hb.Bytes.Load(),
+			Writes: hb.Writes.Load(),
+		})
+	}
+	out.Probes.Stream2ReplayFallback = r.Stream2ReplayFallback.Load()
 
 	return out
 }

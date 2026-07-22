@@ -40,12 +40,14 @@ import (
 	"net/http"
 	"strconv"
 
+	diag "github.com/vhqtvn/vh-solara/pkg/diagnostics"
 	"github.com/vhqtvn/vh-solara/pkg/state"
 )
 
 // handleSessionMessages serves a single historical-message page for a session.
 // See messages_http.go file doc for the full contract.
 func (s *Server) handleSessionMessages(w http.ResponseWriter, r *http.Request) {
+	w = diag.NewHandlerBytesWriter(w, diag.ProxyPathMessages) // PROBE 8: attribute non-stream tunnel bytes
 	sid := safeID.ReplaceAllString(r.PathValue("sessionId"), "")
 	if sid == "" {
 		http.Error(w, "session required", http.StatusBadRequest)

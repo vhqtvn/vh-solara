@@ -450,6 +450,14 @@ type Registry struct {
 	WSWrite [numSides]WSWriteStats
 	Copy    [numCopyDirs]CopyStats
 	Tunnel  TunnelStats
+	// HandlerBytes is the per-path-class byte counter for the non-stream
+	// tunnel legs (Probe 8). See handler_bytes.go for the fixed path-class
+	// enumeration. Counter-only — no initSentinels entry needed.
+	HandlerBytes [numProxyPathClasses]HandlerBytesStats
+	// Stream2ReplayFallback counts projected /vh/stream resumes that fell back
+	// to a fresh snapshot because the shared replay ring evicted the cursor
+	// (Replay ok=false with hasCursor). See handler_bytes.go.
+	Stream2ReplayFallback Counter
 
 	// startedAt is the process/registry creation time, reported in the snapshot
 	// so a consumer can compute rates per second since start.
@@ -483,6 +491,10 @@ func ResetForTest() {
 		r.Copy[i] = CopyStats{}
 	}
 	r.Tunnel = TunnelStats{}
+	for i := range r.HandlerBytes {
+		r.HandlerBytes[i] = HandlerBytesStats{}
+	}
+	r.Stream2ReplayFallback = Counter{}
 	r.startedAt = nowNano()
 	r.initSentinels()
 }

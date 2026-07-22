@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	diag "github.com/vhqtvn/vh-solara/pkg/diagnostics"
 	"github.com/vhqtvn/vh-solara/pkg/vhlog"
 )
 
@@ -465,10 +466,14 @@ func insertAfterTag(body, ins []byte) []byte {
 func (s *Server) dispatchView(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if v := s.views.match(r.URL.Path); v != nil {
-			h := w.Header()
+			// PROBE 8: attribute managed-view reverse-proxy bytes. Wrap before
+			// ServeHTTP so the streamed body (FlushInterval=-1) is counted; the
+			// wrapper preserves http.Flusher so streaming keeps working.
+			vw := diag.NewHandlerBytesWriter(w, diag.ProxyPathView)
+			h := vw.Header()
 			h.Del("Content-Security-Policy")
 			h.Del("X-Frame-Options")
-			v.proxy.ServeHTTP(w, r)
+			v.proxy.ServeHTTP(vw, r)
 			return
 		}
 		next.ServeHTTP(w, r)

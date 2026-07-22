@@ -12,6 +12,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	diag "github.com/vhqtvn/vh-solara/pkg/diagnostics"
 	"github.com/vhqtvn/vh-solara/pkg/render"
 )
 
@@ -205,6 +206,7 @@ var imageExt = map[string]bool{
 
 // GET /vh/code/file?path=<rel>&view=raw|rendered — one file's content.
 func (s *Server) handleCodeFile(w http.ResponseWriter, r *http.Request) {
+	w = diag.NewHandlerBytesWriter(w, diag.ProxyPathCodeFile) // PROBE 8: attribute non-stream tunnel bytes
 	dir, ok := codeDir(r)
 	if !ok {
 		http.Error(w, "open a project directory", http.StatusBadRequest)

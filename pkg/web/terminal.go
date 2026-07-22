@@ -14,6 +14,7 @@ import (
 
 	"github.com/creack/pty"
 	"github.com/gorilla/websocket"
+	diag "github.com/vhqtvn/vh-solara/pkg/diagnostics"
 )
 
 // In-browser terminal: a real PTY (so vim/less and width-aware tools work)
@@ -469,13 +470,16 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 				if conn.WriteMessage(websocket.BinaryMessage, b) != nil {
 					return
 				}
+				diag.RecordHandlerBytes(diag.ProxyPathTerminal, len(b)) // PROBE 8: attribute terminal egress
 			case <-ka.C:
 				// TEXT control frame; the client ignores its content but updates
 				// its last-seen-traffic timestamp.
+				kaFrame := []byte(`{"ka":1}`)
 				_ = conn.SetWriteDeadline(time.Now().Add(writeWait))
-				if conn.WriteMessage(websocket.TextMessage, []byte(`{"ka":1}`)) != nil {
+				if conn.WriteMessage(websocket.TextMessage, kaFrame) != nil {
 					return
 				}
+				diag.RecordHandlerBytes(diag.ProxyPathTerminal, len(kaFrame)) // PROBE 8: keepalive frame
 			case <-ticker.C:
 				if conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(writeWait)) != nil {
 					return
