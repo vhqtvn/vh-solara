@@ -66,9 +66,10 @@ describe("turnStats", () => {
     expect(s.ttftMs).toBe(500);
   });
 
-  // 4. Reasoning exclusion: a reasoning part's own time interval is excluded
-  //    from the decode denominator (only TEXT parts count).
-  it("excludes reasoning-part time from the decode denominator", () => {
+  // 4. Reasoning INCLUDED: a reasoning part's own time interval now enters the
+  //    decode denominator alongside text (was excluded — caused impossible tok/s
+  //    for models that stream reasoning as a separate pre-text block).
+  it("includes reasoning-part time in the decode denominator", () => {
     const m = mk(
       [
         { id: "r1", type: "reasoning", text: "thinking", time: { start: 1_000_300, end: 1_002_000 } },
@@ -77,9 +78,48 @@ describe("turnStats", () => {
       { time: { created: 1_000_000, completed: 1_005_000 }, tokens: { output: 200 } },
     );
     const s = turnStats(m)!;
-    // reasoning 1700ms excluded → text 2000ms only → 100 tok/s
-    expect(s.tokPerSec).toBe(100);
+    // reasoning 1700ms + text 2000ms are disjoint → union 3700ms → 200 / 3.7s
+    // ≈ 54.05 tok/s (old text-only behavior would have been 200 / 2s = 100)
+    expect(s.tokPerSec).toBe(200 / 3.7);
     expect(s.ttftMs).toBe(300); // TTFT still derived from reasoning start
+  });
+
+  // 4a. Sequential reasoning (glm-5.2-high shape): a long reasoning block runs
+  //     FULLY BEFORE a disjoint, short text answer. The rate must divide output
+  //     by the reasoning+text UNION — the old text-only denominator inflated it
+  //     ~10x (e.g. 497 tok/s instead of ~31).
+  it("divides by the reasoning+text union when reasoning runs before text", () => {
+    const m = mk(
+      [
+        { id: "r1", type: "reasoning", text: "thinking", time: { start: 1_000_300, end: 1_005_300 } },
+        { id: "x1", type: "text", text: "hi", time: { start: 1_005_400, end: 1_005_900 } },
+      ],
+      { time: { created: 1_000_000, completed: 1_006_000 }, tokens: { output: 110 } },
+    );
+    const s = turnStats(m)!;
+    // reasoning 5000ms + text 500ms (disjoint) = 5500ms union → 110 / 5.5s = 20 tok/s.
+    // The pre-fix text-only denominator (500ms) would have yielded 110 / 0.5s = 220.
+    expect(s.tokPerSec).toBe(20);
+    expect(s.tokPerSec).not.toBe(220); // guard against the text-only regression
+    expect(s.ttftMs).toBe(300);
+  });
+
+  // 4b. Nested reasoning (kiro/Claude shape): the reasoning interval sits INSIDE
+  //     the text interval, so the text∪reasoning union equals the text interval
+  //     itself — the rate is unchanged vs the old text-only behavior.
+  it("leaves tok/s unchanged when reasoning is nested inside the text interval", () => {
+    const m = mk(
+      [
+        { id: "x1", type: "text", text: "hi", time: { start: 1_000_500, end: 1_004_500 } },
+        { id: "r1", type: "reasoning", text: "thinking", time: { start: 1_001_000, end: 1_003_000 } },
+      ],
+      { time: { created: 1_000_000, completed: 1_005_000 }, tokens: { output: 200 } },
+    );
+    const s = turnStats(m)!;
+    // text 4000ms contains reasoning 2000ms → union = 4000ms (text) → 200 / 4s = 50.
+    // Same rate the old text-only denominator produced — nested merge is a no-op.
+    expect(s.tokPerSec).toBe(50);
+    expect(s.ttftMs).toBe(500); // text starts first
   });
 
   // 5. Multi-step turn: two text parts separated by a tool. The tool gap between
@@ -146,13 +186,11 @@ describe("turnStats", () => {
     expect(s.ttftMs).toBeNull();
   });
 
-  // 9. Anthropic numerator caveat (informational): for providers that don't
-  //    break out reasoning, wire tokens.output is reasoning-INCLUSIVE, so the
-  //    rate is overstated relative to true visible output. This is a numerator
-  //    problem only — the DENOMINATOR is still the pure text decode window, and
-  //    the rate is computed normally. Not fixable from the wire alone.
-  it("computes rate from text intervals even when output is reasoning-inclusive (Anthropic)", () => {
-    // Anthropic-like: reasoning 150 tokens NOT subtracted from output(400).
+  // 9. Reasoning-inclusive numerator (informational): wire tokens.output is
+  //    reasoning-inclusive for providers that stream reasoning as a separate
+  //    block, so output covers both the reasoning and the visible answer. The
+  //    denominator now mirrors that by spanning the reasoning+text union.
+  it("divides reasoning-inclusive output by the reasoning+text union", () => {
     const m = mk(
       [
         { id: "r1", type: "reasoning", text: "thinking", time: { start: 1_000_300, end: 1_003_300 } },
@@ -161,9 +199,8 @@ describe("turnStats", () => {
       { time: { created: 1_000_000, completed: 1_006_000 }, tokens: { output: 400 } },
     );
     const s = turnStats(m)!;
-    // denominator = text 2000ms (reasoning 3000ms excluded); numerator 400 is
-    // reasoning-inclusive → 400 / 2s = 200 tok/s, overstated vs true visible.
-    expect(s.tokPerSec).toBe(200);
+    // reasoning 3000ms + text 2000ms (disjoint) = 5000ms union → 400 / 5s = 80 tok/s.
+    expect(s.tokPerSec).toBe(80);
     expect(s.output).toBe(400);
   });
 
@@ -176,14 +213,16 @@ describe("turnStats", () => {
     expect(turnStats(m)).toBeNull();
   });
 
-  it("derives TTFT from a reasoning part when no text part is present (tok/s null)", () => {
+  it("derives TTFT from a reasoning part when no text part is present", () => {
     const m = mk(
       [{ id: "p1", type: "reasoning", text: "thinking", time: { start: 1_000_300, end: 1_002_000 } }],
       { time: { created: 1_000_000, completed: 1_006_000 }, tokens: { output: 60 } },
     );
     const s = turnStats(m)!;
     expect(s.ttftMs).toBe(300);
-    expect(s.tokPerSec).toBeNull(); // no text part → no decode interval
+    // reasoning now counts as a decode interval → 60 tokens / 1.7s ≈ 35.29 tok/s
+    // (was null before reasoning was admitted to the denominator).
+    expect(s.tokPerSec).toBe(60 / 1.7);
   });
 
   it("ignores tool parts when finding the earliest text/reasoning start", () => {

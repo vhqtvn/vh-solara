@@ -45,8 +45,9 @@ export function fmtTok(n: number): string {
 // forwards the raw JSON untouched (pkg/state/store.go), so TextPart/ReasoningPart
 // time.start/.end and info.tokens.output arrive live even though our typed
 // envelope doesn't name them. tok/s is the PURE decode rate = output tokens over
-// the union of text-part [time.start,time.end] intervals (excludes TTFT, tools,
-// shell, subagents, and reasoning time). Returns null for non-assistant or
+// the union of text AND reasoning [time.start,time.end] intervals (excludes
+// TTFT, tools, shell, subagents; INCLUDES reasoning time). Returns null for
+// non-assistant or
 // in-flight (no time.completed) turns — call this ONLY for settled assistant
 // messages so it never touches the streaming hot loop.
 export interface TurnStats {
@@ -74,26 +75,26 @@ export function turnStats(m: MessageView): TurnStats | null {
   }
   const ttftMs = firstStart !== null ? Math.max(0, firstStart - created) : null;
 
-  // Pure output decode rate = tokens.output / (union of TEXT-part decode
-  // intervals [time.start, time.end]). Upstream sets TextPart.time.start/.end
-  // via live AI-SDK stream events (packages/opencode/src/session/processor.ts),
-  // bracketing first→last decoded token — the only decode-proximate timing on
-  // the wire (no provider-level decode-duration field exists). The union (merge
-  // of overlapping intervals) EXCLUDES TTFT, tool/shell/subagent state.time, and
-  // reasoning-part time: only actual output decoding counts.
-  //
-  // NUMERATOR CAVEAT: wire tokens.output is already visible-only upstream
-  // (reasoning subtracted in getUsage) EXCEPT for providers that don't break
-  // out reasoning (e.g. Anthropic), where output is reasoning-inclusive and
-  // cannot be separated from the wire alone — documented here, not fixable.
+  // Pure output decode rate = tokens.output / (union of TEXT AND REASONING-part
+  // decode intervals [time.start, time.end]). Upstream sets TextPart.time and
+  // ReasoningPart.time .start/.end via live AI-SDK stream events
+  // (packages/opencode/src/session/processor.ts), bracketing first→last decoded
+  // token — the only decode-proximate timing on the wire (no provider-level
+  // decode-duration field exists). The union (merge of overlapping intervals)
+  // EXCLUDES TTFT and tool/shell/subagent state.time, but INCLUDES reasoning
+  // time on purpose: the numerator tokens.output is reasoning-inclusive for
+  // providers that stream reasoning as a separate block (e.g. glm-5.2-high), so
+  // the decode window must span reasoning+text to keep numerator and denominator
+  // in the same scope. Nested reasoning⊂text merges cleanly, so turns whose
+  // reasoning runs INSIDE the text interval (e.g. kiro/Claude) are unaffected.
   const output = info.tokens?.output;
   let tokPerSec: number | null = null;
   if (typeof output === "number" && output > 0) {
     const intervals: Array<[number, number]> = [];
-    let incomplete = false; // a text part has start but no end → decode not finalized
+    let incomplete = false; // a text/reasoning part has start but no end → decode not finalized
     for (const pid of m.partOrder) {
       const p = m.parts[pid] as any;
-      if (!p || p.type !== "text") continue;
+      if (!p || (p.type !== "text" && p.type !== "reasoning")) continue;
       const s = p.time?.start;
       const e = p.time?.end;
       if (typeof s !== "number") continue; // no timing → not a decode interval
