@@ -1467,6 +1467,55 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	}
 	flusher.Flush()
 
+	// Promotion coalescing (tunnel-volume amplifier #1 fix). Before this, EVERY
+	// structural event re-snapshotted + re-shipped the whole active-closure
+	// projection synchronously inside the event case. With 373 active children
+	// flipping activity, that dominated tunnel volume (~150 MB/hr at rest in the
+	// live study). The design:
+	//   - On the FIRST structural event in a burst, arm promoCoalesce; subsequent
+	//     events see promoPending and are absorbed (the timer is already armed).
+	//   - When the timer fires, take ONE SnapshotProjected (reflects the LATEST
+	//     store state, so every event in the window is covered; none is lost),
+	//     write it, bump baseline to its Seq, and clear promoPending.
+	//   - Arm-on-first-event (NOT reset-on-every-event) bounds the flush rate to
+	//     ~1/window under continuous churn; a real timer (not a lazy time-check)
+	//     guarantees a final event flushes even when no further events arrive.
+	// Ordering/baseline: promoSnap.Seq at flush time is >= every event seq
+	// already written in this window, so baseline jumps forward correctly and no
+	// event is double-shipped (writeEvent guards on ev.Seq > baseline).
+	// Not-lost: SnapshotProjected reads live store state, so any event applied
+	// during the window is in the flushed snapshot.
+	// KindActivity stays in the trigger set: a stub going busy needs its full
+	// payload (info/gate/perms) shipped — the live session.busy event carries
+	// only the activity state, not the materialization payload, so the client
+	// cannot self-promote a stub. Narrowing the trigger set would drop genuine
+	// promotions.
+	promoCoalesce := time.NewTimer(promotionCoalesceInterval)
+	promoCoalesce.Stop() // armed on first structural event, not at stream open
+	defer promoCoalesce.Stop()
+	promoPending := false
+	// flushPromotion materializes + ships ONE promotion snapshot for the current
+	// store state and records the diagnostic counter at the write site. Recording
+	// here (not just on the initial branch) stops the snapshot_path/snapshot_bytes
+	// diagnostic from undercounting promotion volume — the live study showed the
+	// tree counter "calm" while 150 MB/hr shipped, because RecordSnapshotPath was
+	// only on the initial-snapshot branch.
+	flushPromotion := func() {
+		promoPending = false
+		promoSnap := store.SnapshotProjected(filter, "promotion")
+		if pb, err := json.Marshal(promoSnap); err == nil {
+			// Pass `filter` (not nil) so promotion respects the same message
+			// scoping as the initial snapshot — otherwise every promotion
+			// re-ships transcripts for the entire active closure.
+			writeRaw(w, promoSnap.Seq, "snapshot", maybeCompressSnapshot(pb, wantsCompress(r)))
+			sw.RecordSnapshotPath(len(pb)) // PROBE 3: stop undercounting promotion bytes
+			// Advance baseline so buffered events already covered by the
+			// promotion snapshot are not re-emitted (mirrors the initial
+			// snapshot baseline bump at the snapshot send site above).
+			baseline = promoSnap.Seq
+		}
+	}
+
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -1502,20 +1551,27 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			// idle may be demoted to a stub. The structuralRevision guard on
 			// the client discards stale/duplicate re-snapshots. This rides the
 			// same Seq-ordered snapshot path (NOT the notice path).
+			//
+			// Coalesced (see promoCoalesce above): arm the timer on the first
+			// structural event in a burst; absorb subsequent ones into a single
+			// flush so the burst re-ships ONE promotion snapshot, not N.
 			if wantsProject(r) && state.IsStructuralKind(ev.Kind) {
-				// Pass `filter` (not nil) so promotion respects the same message
-				// scoping as the initial snapshot — otherwise every structural
-				// event re-ships transcripts for the entire active closure.
-				promoSnap := store.SnapshotProjected(filter, "promotion")
-				if pb, err := json.Marshal(promoSnap); err == nil {
-					writeRaw(w, promoSnap.Seq, "snapshot", maybeCompressSnapshot(pb, wantsCompress(r)))
-					// Advance baseline so buffered events already covered by the
-					// promotion snapshot are not re-emitted (mirrors the initial
-					// snapshot baseline bump at the snapshot send site above).
-					baseline = promoSnap.Seq
+				if !promoPending {
+					promoPending = true
+					promoCoalesce.Reset(promotionCoalesceInterval)
 				}
+				// else: timer already armed — the flush will reflect this event.
 			}
 			flusher.Flush()
+		case <-promoCoalesce.C:
+			// Coalesce window elapsed: flush ONE promotion snapshot for the
+			// latest state (covers every structural event armed in this window).
+			// promoPending is false on a stray fire (shouldn't happen given the
+			// arm-on-first-event logic, but the guard keeps it a no-op).
+			if promoPending {
+				flushPromotion()
+				flusher.Flush()
+			}
 		case <-ticker.C:
 			// A NAMED ping event (not an SSE ` : comment`) so the client can observe
 			// it — EventSource hides comments, so the client uses these pings to
@@ -1562,6 +1618,24 @@ const snapshotCompressThreshold = 2048
 func wantsCompress(r *http.Request) bool {
 	return r.URL.Query().Get("z") == "1"
 }
+
+// promotionCoalesceInterval bounds how long the promotion path waits before
+// re-shipping a projected snapshot after the FIRST structural event in a burst.
+// A burst of structural events (e.g. 373 active children flipping busy/idle in
+// the live study) re-ships ONE promotion snapshot per window, not N — the
+// un-throttled path re-marshalled + re-shipped the whole active-closure
+// projection on every flip and was the dominant tunnel volume (~150 MB/hr at
+// rest). The snapshot taken at flush reflects the LATEST store state, so every
+// event that arrived during the window is reflected; none is lost.
+//
+// A real time.Timer (NOT the deltaFlushInterval lazy-check pattern) is required
+// so a final structural event followed by a quiet period still flushes within
+// this window — the lazy pattern would strand the last state until the next
+// event arrived. The window bounds promotion latency: the operator sees a
+// stub→active promotion within this delay, which is well inside the ~300ms
+// "UI feels live" budget at 150ms. A package var (not const) so tests can shrink
+// it to a deterministic value (mirrors deltaFlushInterval).
+var promotionCoalesceInterval = 150 * time.Millisecond
 
 // wantsProject reports whether the client opted into projected (collapsed-
 // frontier) snapshot mode via the `proj=1` query flag. Mirrors wantsCompress:
