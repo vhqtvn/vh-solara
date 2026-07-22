@@ -357,6 +357,29 @@ is defense-in-depth that fails the worker faster and avoids a wasted gate
 round. The one exception — `docs/planning/backlog.md` ALONE in the file list —
 is a legitimate backlog-only commit and MUST proceed through the normal cascade.
 
+**The backlog normalizer does NOT create a second exception.** A normalizer
+run (`vh-agent-harness exec node .opencode/scripts/normalize-backlog.js`, or
+`/backlog-cleanup`) may change `docs/planning/backlog.md` together with
+companion paths under `docs/planning/archive/` (managed archive files like
+`backlog-archive-<period>.md` and `archive/index.md`, including creates /
+removes). This is **not** an ordinary code/docs mix: it is one deterministic
+transaction, and the archive companions are **not** "code/docs changes" in
+the sense the issue text above names. The split verdict above still applies —
+the gate would refuse the mixed `acquire` anyway, with no archive-companion
+carveout — so a normalizer transaction MUST arrive as **two separate review
+requests**:
+
+1. A backlog-only review of `docs/planning/backlog.md` alone.
+2. A separate archive-companion review of only the changed, created, or
+   removed `docs/planning/archive/**` paths.
+
+Do not stop, hand off, close out, or report the normalization complete
+between the two reviews. Run the normalizer check over the complete working
+tree before the first review and again after the second. If a `cas_conflict`
+occurs, re-read the ledger, rerun the normalizer, and recompute both exact
+path sets before retrying. See the `backlog` skill and the `committer` agent
+for the matching two-commit protocol.
+
 ## CGD Phase-1 notes
 
 This orchestrator implements Phase 1 of the Commit-Gate Disposition (CGD) system:

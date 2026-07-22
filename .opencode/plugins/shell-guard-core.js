@@ -80,6 +80,228 @@ export function shouldSuppressForbidden(command, forbiddenId) {
     return false;
 }
 
+// === G4: inert-literal classifier for rg/grep pattern operands ============
+//
+// The raw forbidden-pattern scanner sees forbidden literals (e.g. `/tmp`
+// matching `system-tmp-access`) ANYWHERE in the command string, including
+// inside search-pattern operands of `rg`/`grep`. `rg -F '/tmp' docs` is a
+// literal-string SEARCH, not a filesystem access — but the raw scanner cannot
+// tell. This bounded classifier proves — using the EXISTING bash parser —
+// that a forbidden regex match appears ONLY in the search-pattern operand of
+// a single simple `rg`/`grep` command, and ONLY then may the match be
+// disregarded. Everything else fails closed: the original deny stands.
+//
+// Safety invariants (load-bearing):
+//   1. Does NOT replace raw scanning. evaluate() still runs
+//      denyByForbiddenPatterns() FIRST; this helper only consults on whether
+//      a CONFIRMED match applies.
+//   2. Fail closed. If the parser is unavailable, parsing fails, OR the
+//      command shape is anything other than the closed grammar below, return
+//      false → the original deny stands.
+//   3. Single simple command ONLY. Pipelines, chains, redirections,
+//      substitution, control flow, executor wrappers, variable assignments,
+//      and ANY node type outside the closed allow-set fail closed.
+//   4. Closed command registry: `rg` and `grep` ONLY. No other families.
+//   5. Closed flag whitelist: `-F` and `--fixed-strings` ONLY (no-value flags
+//      common to both tools). Combined short flags (`-Fi`) and value-taking
+//      flags (`-e`, `-A`, `-f`) fail closed because classifying them would
+//      require a growing option parser.
+//   6. The forbidden regex must match the PATTERN token's text AND must NOT
+//      match the command name, any flag, or any path operand. This prevents
+//      `rg /tmp /tmp` (real /tmp access on the path operand) from being
+//      suppressed.
+//
+// Grammar (closed, no growing parser):
+//   <rg|grep> <flag>* [--] PATTERN PATH+
+//     command_name : exactly "rg" or "grep"
+//     flag         : word with text in {"-F", "--fixed-strings"}
+//     --           : optional POSIX options terminator (word with text "--")
+//     PATTERN      : first positional operand (word | raw_string | string)
+//     PATH+        : one or more path operands after PATTERN
+//                    (word | raw_string | string)
+//
+// Allowed named node types (across all descendants):
+//   {program, command, command_name, word, raw_string, string, string_content}
+// Any other named node type ANYWHERE → fail closed. This single rule rejects
+// redirection, command_substitution, process_substitution, subshell,
+// simple_expansion, concatenation, variable_assignment, pipeline, list, and
+// all control-flow / compound-statement forms.
+const INERT_COMMAND_NAMES = new Set(["rg", "grep"]);
+const INERT_FLAG_WHITELIST = new Set(["-F", "--fixed-strings"]);
+const INERT_ALLOWED_NODE_TYPES = new Set([
+    "program",
+    "command",
+    "command_name",
+    "word",
+    "raw_string",
+    "string",
+    "string_content",
+]);
+
+// tryGetBashParser returns the lazy bash parser or null on unavailable. It is
+// DISTINCT from parseCommands(): parseCommands swallows the load error and
+// falls back to a naive tokenizer (correct for allowlist matching, unsafe for
+// inert-literal proof). The inert classifier MUST refuse to suppress when the
+// parser is unavailable; it must NOT consult the fallback tokenizer.
+async function tryGetBashParser() {
+    try {
+        return await getBashParser();
+    } catch {
+        return null;
+    }
+}
+
+// hasOnlyAllowedNamedNodes walks a SyntaxNode's named descendants and returns
+// false if ANY named node's type is outside the closed allow-set. Anonymous
+// punctuation (`"`, `'`, `$`, `(`, ...) is intentionally ignored — those do
+// not change the structural shape.
+function hasOnlyAllowedNamedNodes(root) {
+    const stack = [root];
+    while (stack.length > 0) {
+        const node = stack.pop();
+        if (!node || !INERT_ALLOWED_NODE_TYPES.has(node.type)) {
+            return false;
+        }
+        for (let i = 0; i < node.namedChildCount; i++) {
+            stack.push(node.namedChild(i));
+        }
+    }
+    return true;
+}
+
+// classifyCommandTokens walks a `command` node's named children and returns an
+// ordered list of {text, type} tokens for the structural types only. Any
+// other named child type (e.g. variable_assignment, file_redirect) → null.
+function classifyCommandTokens(commandNode) {
+    const tokens = [];
+    for (let i = 0; i < commandNode.namedChildCount; i++) {
+        const child = commandNode.namedChild(i);
+        if (!child) continue;
+        const t = child.type;
+        if (
+            t !== "command_name" &&
+            t !== "word" &&
+            t !== "raw_string" &&
+            t !== "string"
+        ) {
+            return null;
+        }
+        tokens.push({ text: child.text, type: t });
+    }
+    return tokens;
+}
+
+// parseInertRgGrepShape takes the token list (after the root/structure/node-
+// type checks have passed) and returns the pattern token text plus arrays of
+// flag texts and path texts. Returns null on any deviation from the closed
+// grammar (unknown flag, missing pattern, missing path, ambiguous layout).
+function parseInertRgGrepShape(tokens) {
+    if (tokens.length === 0) return null;
+    // tokens[0] is command_name (verified by the caller); the structural
+    // walk below treats tokens[1..] as the option/operand sequence.
+    const rest = tokens.slice(1);
+    const flags = [];
+    let i = 0;
+
+    // Optional whitelist flags (must all be in INERT_FLAG_WHITELIST) and an
+    // optional `--` terminator. A `--` ends option parsing.
+    for (; i < rest.length; i++) {
+        const tok = rest[i];
+        if (tok.type !== "word") break;
+        if (tok.text === "--") {
+            // POSIX options terminator: positional operands follow.
+            i++;
+            break;
+        }
+        if (INERT_FLAG_WHITELIST.has(tok.text)) {
+            flags.push(tok.text);
+            continue;
+        }
+        // Unknown flag (e.g. -Fi, -e, -A, --foo) → fail closed. Classifying
+        // value-bearing or combined-short flags would require a growing
+        // option parser, which the design explicitly forbids.
+        return null;
+    }
+
+    // Positional operands from here on. Need at least PATTERN PATH: a bare
+    // `rg PATTERN` reading stdin is rejected as ambiguous (no way to prove
+    // pattern vs path role).
+    const positionals = rest.slice(i);
+    if (positionals.length < 2) {
+        return null;
+    }
+
+    // First positional = PATTERN, rest = PATH+. Types are already restricted
+    // to {word, raw_string, string} by classifyCommandTokens.
+    const patternToken = positionals[0];
+    const pathTokens = positionals.slice(1);
+
+    return {
+        flags,
+        pattern: patternToken.text,
+        paths: pathTokens.map((t) => t.text),
+        commandName: tokens[0].text,
+    };
+}
+
+// isInertRgGrepMatch returns true ONLY when the parser can PROVE that the
+// forbidden regex match appears in the search-pattern operand of a single
+// simple rg/grep command and nowhere else (command name, flags, paths). On
+// any doubt (parser unavailable, parse failure, non-rg/grep command, complex
+// shell construct, ambiguous operand layout), it returns false so the
+// original deny stands. Exported for test reuse.
+export async function isInertRgGrepMatch(command, forbiddenRule) {
+    // Defensive: this helper must never throw — fail closed on any fault.
+    try {
+        const parser = await tryGetBashParser();
+        if (!parser) return false;
+
+        const tree = parser.parse(command);
+        if (!tree) return false;
+        const root = tree.rootNode;
+        if (!root) return false;
+
+        // Root structure: program > command (exactly one command, no list /
+        // pipeline / redirected_statement / subshell / control-flow).
+        if (root.type !== "program") return false;
+        if (root.namedChildCount !== 1) return false;
+        const commandNode = root.namedChild(0);
+        if (!commandNode || commandNode.type !== "command") return false;
+
+        // Closed allow-set check across ALL named descendants. Rejects any
+        // redirection / substitution / expansion / assignment / compound form.
+        if (!hasOnlyAllowedNamedNodes(root)) return false;
+
+        // Collect structural tokens; any non-{command_name, word, raw_string,
+        // string} named child of the command → fail closed.
+        const tokens = classifyCommandTokens(commandNode);
+        if (!tokens || tokens.length === 0) return false;
+        if (tokens[0].type !== "command_name") return false;
+        if (!INERT_COMMAND_NAMES.has(tokens[0].text)) return false;
+
+        // Classify operand roles per the closed grammar.
+        const shape = parseInertRgGrepShape(tokens);
+        if (!shape) return false;
+
+        // Per-token regex test. The forbidden regex is non-global (stateless
+        // .test). It MUST match the pattern token and MUST NOT match the
+        // command name, any flag, or any path operand.
+        const re = forbiddenRule && forbiddenRule.re;
+        if (!re) return false;
+        if (!re.test(shape.pattern)) return false;
+        if (re.test(shape.commandName)) return false;
+        for (const f of shape.flags) {
+            if (re.test(f)) return false;
+        }
+        for (const p of shape.paths) {
+            if (re.test(p)) return false;
+        }
+        return true;
+    } catch {
+        return false;
+    }
+}
+
 function trimEndStar(cmd) {
     return cmd.replace(/\s*\*?$/, "");
 }
@@ -754,10 +976,18 @@ export async function evaluate(command, commandCwd) {
 
     const forbidden = denyByForbiddenPatterns(command);
     if (forbidden) {
-        // shouldSuppressForbidden is a hard deny (always false).
-        // The operator escape hatch is handled at the gate-script
-        // level; shell-guard never suppresses forbidden patterns.
-        if (!shouldSuppressForbidden(command, forbidden.id)) {
+        // G4: a confirmed forbidden match may be disregarded ONLY when the
+        // bash parser proves the match appears in the search-pattern operand
+        // of a single simple rg/grep command (and nowhere else). The
+        // classifier fails closed: parser unavailable, parse failure, any
+        // complex shell construct, or any ambiguous operand layout keeps the
+        // deny. Raw deny-before-allowlist scanning is preserved — this only
+        // consults on whether a CONFIRMED match applies; it never replaces
+        // the raw safety backstop.
+        const suppress =
+            shouldSuppressForbidden(command, forbidden.id) ||
+            (await isInertRgGrepMatch(command, forbidden));
+        if (!suppress) {
             return {
                 action: "deny",
                 reason:
@@ -767,6 +997,10 @@ export async function evaluate(command, commandCwd) {
                     " command to the operator instead of working around it.)",
             };
         }
+        // else: classifier proved the match is in an rg/grep search-pattern
+        // operand. Fall through to the allowlist check unchanged. An
+        // allowlist entry never overrides a real deny; it merely authorizes
+        // the (now-inert-pattern) rg/grep form.
     }
 
     // Reject host-shell env-var prefixes before vh-agent-harness exec. They set vars on

@@ -112,7 +112,7 @@ It is the only agent that stages, commits, and manages session lifecycle on beha
      - On error: release lock, report error
 
    IF commit-reviewer returns BLOCKED or SPLIT:
-       → .opencode/scripts/commit-gate.sh release --uuid "<UUID>"
+       → .opencode/scripts/commit-gate.sh release --uuid "<UUID>" --message-file tmp/commit-gate-message/msg-${UUID}
       - Report reviewer findings to A
       - A must address findings before retrying
 
@@ -188,6 +188,13 @@ The review MUST be treated as BLOCKED (release lock, report failure to A) if ANY
 7. **Preserve the commit message.** Use the message provided by A. Do not rewrite it.
 8. **Report machine-parseable results.** All outputs from the wrapper are JSON. Parse and relay the relevant fields to A.
 9. **Commit `docs/planning/backlog.md` ALONE.** The shared task-status ledger must NEVER travel in the same commit as code/docs changes — the commit-gate O1 preflight refuses an `acquire` whose `--paths` mixes `docs/planning/backlog.md` with any other path (status `path_error` / `backlog_must_commit_separately`). If a worker hands you a mixed path set, do NOT attempt to stage it: tell the worker to load the `backlog` skill and split — commit code first (without the ledger), then re-read `docs/planning/backlog.md` from disk and commit the backlog alone (backlog-only acquire). This is the W2/split-commit enforcement that keeps a concurrent backlog edit from `cas_conflict`-ing a clean code commit.
+   - **The backlog normalizer is the one case where `backlog.md` and a set of companion paths change together as one transaction.** A normalizer run (`vh-agent-harness exec node .opencode/scripts/normalize-backlog.js`, or `/backlog-cleanup`) writes `docs/planning/backlog.md` together with companion paths under `docs/planning/archive/` (managed archive files like `backlog-archive-<period>.md` and `archive/index.md`, including creates / removes). **This is NOT an exception to the rule above — there is no carveout in `commit-gate.sh`, no privileged archive path class, and the normalizer-managed archive companions are NOT ordinary "code/docs" changes.** The generic "commit code first" instruction above applies to a code + backlog mix handed to you by a worker; for a backlog + archive mix from a normalizer run, follow the two-commit protocol below instead. See the `backlog` skill for the full version.
+   - **Two-commit normalizer protocol (treat the output as one transaction):**
+     1. Commit `docs/planning/backlog.md` alone (backlog-only acquire).
+     2. Immediately commit only the changed, created, or removed `docs/planning/archive/**` companions as one archive-companion commit.
+     - Run `node .opencode/scripts/normalize-backlog.js --check` over the complete working tree **before the first commit and again after the second**.
+     - **Do not stop, hand off, close out, or report the normalization complete between the two commits** — they are one logical transaction.
+     - If a `cas_conflict` occurs, re-read the ledger, rerun the normalizer over the complete working tree, and recompute both exact path sets before retrying. Do NOT revert the archive companions to unblock.
 
 ## Input from A
 

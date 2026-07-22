@@ -73,6 +73,7 @@
                     "docs-steward": "allow",
                     "debate": "allow",
                     "solution-brief": "allow",
+                    "media-perception": "allow",
                     "releaser": "allow"
                 },
                 "webfetch": "allow"
@@ -672,6 +673,7 @@
                     "committer": "allow",
                     "debate": "allow",
                     "solution-brief": "allow",
+                    "media-perception": "allow",
                     "releaser": "allow"
                 },
                 "webfetch": "deny"
@@ -1050,6 +1052,81 @@
             },
             "prompt": "{file:.opencode/agents/docs-steward.md}"
         },
+        "media-perception": {
+            "color": "secondary",
+            "description": "Read-only perception specialist that inspects media via whatever capability-class tools the session exposes",
+            "mode": "subagent",
+            "model": "{file:./.local/config/agent-model/media-perception}",
+            "permission": {
+                "bash": {
+                    "*": "deny",
+                    "jq *": "allow",
+                    "ls *": "allow",
+                    "rg *": "allow",
+                    "wc *": "allow",
+                    "cat *": "allow",
+                    "cut *": "allow",
+                    "date *": "allow",
+                    "echo *": "allow",
+                    "find *": "allow",
+                    "grep *": "allow",
+                    "head *": "allow",
+                    "sort *": "allow",
+                    "tail *": "allow",
+                    "true *": "allow",
+                    "uniq *": "allow",
+                    "sleep *": "allow",
+                    "uuidgen": "deny",
+                    "printf *": "allow",
+                    "sed -n *": "allow",
+                    "git log *": "allow",
+                    "git diff *": "allow",
+                    "git grep *": "allow",
+                    "git show *": "allow",
+                    "git blame *": "allow",
+                    "git status *": "allow",
+                    "git ls-tree *": "allow",
+                    "git cat-file *": "allow",
+                    "git ls-files *": "allow",
+                    "git show-ref *": "allow",
+                    "git rev-parse *": "allow",
+                    "git check-ignore *": "allow",
+                    "git --no-pager log *": "allow",
+                    "git --no-pager diff *": "allow",
+                    "git --no-pager grep *": "allow",
+                    "git --no-pager show *": "allow",
+                    "git --no-pager blame *": "allow",
+                    "git --no-pager status *": "allow",
+                    "git --no-pager ls-tree *": "allow",
+                    "git --no-pager cat-file *": "allow",
+                    "git --no-pager ls-files *": "allow",
+                    "git --no-pager show-ref *": "allow",
+                    "git --no-pager rev-parse *": "allow",
+                    "vh-agent-harness exec-ro *": "allow",
+                    "git --no-pager check-ignore *": "allow",
+                    ".opencode/scripts/commit-gate.sh status": "allow",
+                    ".opencode/scripts/readonly-scripts.sh *": "allow",
+                    ".opencode/scripts/commit-gate.sh commit *": "deny",
+                    ".opencode/scripts/commit-gate.sh revert *": "deny",
+                    ".opencode/scripts/commit-gate.sh acquire *": "deny",
+                    ".opencode/scripts/commit-gate.sh release *": "deny",
+                    ".opencode/scripts/commit-gate.sh heartbeat *": "deny",
+                    ".opencode/scripts/commit-gate.sh stage-message *": "deny",
+                    "vh-agent-harness *": "allow"
+                },
+                "edit": {
+                    "*": "deny",
+                    "tmp/**": "allow"
+                },
+                "task": {
+                    "*": "deny"
+                },
+                "webfetch": "deny"
+            },
+            "prompt": "{file:.opencode/agents/media-perception.md}",
+            "steps": 30,
+            "temperature": 0.1
+        },
         "plan": {
             "color": "info",
             "description": "Dormant subagent — disabled as primary mode; use planner instead.",
@@ -1271,6 +1348,7 @@
                     "committer": "allow",
                     "debate": "allow",
                     "solution-brief": "allow",
+                    "media-perception": "allow",
                     "releaser": "allow"
                 },
                 "webfetch": "deny"
@@ -1488,7 +1566,8 @@
                     "tmp/**": "allow"
                 },
                 "task": {
-                    "*": "deny"
+                    "*": "deny",
+                    "media-perception": "allow"
                 },
                 "webfetch": "allow"
             },

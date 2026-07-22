@@ -66,11 +66,29 @@ Four baseline callers may delegate to it (`media-perception: allow`):
 - `researcher` (single outbound edge on an otherwise read-only leaf, so a
   researcher holding a media locator can hand off perception)
 
-Callers hand the specialist a `path:` or `url:` locator plus a modality hint
-and the full question set; the specialist returns one consolidated report
-with `capability_status: available | unavailable | uncertain`. See the
+Callers hand the specialist a locator plus a modality hint and the full
+question set; the specialist returns one consolidated report with
+`capability_status: available | unavailable | uncertain`. See the
 `media-perception` skill for the caller-facing two-path routing guidance
 (in-context perception vs single-delegation).
+
+**Attachment propagation:** parent-session attachments do NOT automatically
+propagate into a task child's context. For local media, the caller MUST pass
+BOTH `@file <path>` (so the specialist receives the bytes) AND an explicit
+`path: <repo-relative path>` (so the specialist has a locator to hand its
+capability). For remote media, pass `url: <accessible URL>` (no `@file`
+needed — the capability fetches the URL itself). If only a parent attachment
+is available without a locator, the caller must request an accessible path or
+URL rather than inventing one.
+
+**Caller prompt gating:** each of the four callers carries a conditional block
+in its rendered prompt (`*.md.tmpl` → `{{ if .capabilities.media_perception }}`).
+When the capability IS selected, the ENABLED branch instructs the caller to
+load the skill, make ONE bounded delegation, and use the dual-channel handoff.
+When NOT selected, the DISABLED branch instructs the caller to NOT load the
+skill, NOT delegate or probe, and to state honestly that media understanding
+is unavailable in the current configuration. This ensures callers know whether
+the specialist exists without discovering it through trial calls.
 
 ## Internal cluster pattern
 

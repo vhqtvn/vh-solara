@@ -4,3 +4,5 @@ features:
 overlays:
     - auto-classifier-pilot
     - release
+capabilities:
+    - core/media-perception

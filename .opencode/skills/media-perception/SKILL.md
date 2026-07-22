@@ -66,19 +66,34 @@ Use Path B when ANY of:
   paginated doc) and a dedicated specialist is cheaper
 - you find yourself about to refuse a perception task
 
-### Handoff contract
+### Handoff contract (dual-channel for local)
 
-Delegate ONCE with:
+Parent-session attachments do NOT automatically propagate into a task child's
+context. A delegated request must be self-contained. Delegate ONCE with:
 
-- a **locator** the specialist can reach: `path: <repo-relative or accessible
-  path>` or `url: <accessible URL>`
+- a **locator** the specialist can reach — for local media, use BOTH channels
+  (see below); for remote media, use `url:` only
 - a **modality hint** (image | diagram | chart | video | document | audio |
   unknown) when known
 - the **full question set** the perception must answer — do not hold back
   questions for later round-trips
+- only material context the specialist needs (not the whole session)
 
-Do not assume attachments auto-propagate into the specialist’s context. Pass
-the locator explicitly.
+**Local media — dual-channel handoff (required).** Pass BOTH:
+
+- `@file <path>` — so the specialist receives the file bytes in its prompt
+- `path: <repo-relative or accessible path>` — so the specialist has an
+  explicit locator it can hand to a perception capability
+
+`@file` alone gives the specialist bytes but no filesystem locator for a tool.
+`path:` alone gives a locator but the bytes may not reach the child. Both are
+required for local media.
+
+**Remote media.** Pass `url: <accessible URL>` — no `@file` needed; the
+capability fetches the resource itself.
+
+If you only have a pasted or parent attachment without a locator, do NOT invent
+a filesystem path. Request an accessible path or URL from the operator first.
 
 ### What to expect back
 
@@ -114,6 +129,33 @@ modality hint, expose a missing capability class) — not a re-run.
 
 Never fabricate observations to fill a `unavailable` or `uncertain` gap. Say
 the gap plainly.
+
+## Structured failure classes
+
+When a delegation does not produce grounded observations, classify the failure
+and map it into the report's `capability_status`, `limitations`, and
+`next_action`:
+
+| Class | Trigger | `capability_status` | `next_action` |
+|---|---|---|---|
+| `missing_locator` | no `path:` or `url:` provided | `uncertain` | request an accessible locator |
+| `inaccessible_local` | `path:` provided but file unreadable (permissions, missing, outside sandbox) | `uncertain` | request a readable path or `url:` |
+| `inaccessible_remote` | `url:` provided but fetch failed (DNS, 4xx/5xx, timeout) | `uncertain` | request an accessible URL or a local `path:` |
+| `unavailable_capability` | no compatible perception capability exposed | `unavailable` | expose a compatible capability via overlay or operator config |
+| `timeout` | capability invoked but did not return in time | `uncertain` | retry once with a narrower question set or a different capability |
+| `transient_transport` | invocation failed with a retriable error (network blip, rate limit) | `uncertain` | retry once or request a different locator |
+| `invocation_failure` | capability rejected the input (wrong format, corrupt media, unsupported modality) | `unavailable` or `uncertain` | different modality hint or capability class |
+| `unusable_output` | capability returned something with no usable signal (empty, garbled, low confidence) | `uncertain` | different capability or locator |
+
+Record the failure class and the concrete error reason in `limitations`.
+
+### Retry boundary (no unbounded ladder)
+
+Retry is NOT automatic and must NOT become an unbounded ladder. A single
+explicit retry is acceptable ONLY for `timeout` and `transient_transport`, and
+only when the caller's question set is not yet exhausted. All other classes
+return immediately with an honest report. Do not loop on retries — surface the
+gap and let the caller decide.
 
 ## When NOT to delegate
 

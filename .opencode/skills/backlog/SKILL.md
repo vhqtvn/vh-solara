@@ -105,6 +105,49 @@ it as the source of truth for shape; this skill only summarizes. Run
 `/backlog-cleanup` after any batch edit so `Now` / `Next` / `Later` stay
 active-only and history archives under `docs/planning/archive/`.
 
+### Two-commit normalizer protocol
+
+A normalizer run (`vh-agent-harness exec node .opencode/scripts/normalize-backlog.js`,
+or `/backlog-cleanup`) may change `docs/planning/backlog.md` **together with**
+files under `docs/planning/archive/` — managed archive files like
+`backlog-archive-<period>.md` and `archive/index.md`, including created,
+updated, or removed files. **This does not create an exception to the
+backlog-only commit rule.** The commit-gate's `O1 backlog_must_commit_separately`
+preflight refuses any `acquire` whose `--paths` mixes `docs/planning/backlog.md`
+with another path (status `path_error` / `backlog_must_commit_separately`),
+there is no archive-companion carveout, and the normalizer's archive companions
+are NOT ordinary "code/docs" changes that could ride alongside unrelated work.
+
+Treat the normalizer output as **one work-cycle transaction** landed through
+**two reviewed commits, back to back**:
+
+1. **Commit `docs/planning/backlog.md` alone** — a backlog-only acquire; no
+   other path may travel in the same commit.
+2. **Immediately commit only the changed, created, or removed
+   `docs/planning/archive/**` companions** as one archive-companion commit.
+
+Neither commit may contain unrelated paths. **Do not stop, hand off, close
+out, or report the normalization complete between the two commits** — they
+are one logical transaction, and any session that resumes your work must see
+them as a pair, not as a half-finished normalization.
+
+Run the normalizer check over the complete working tree (not just the ledger)
+**before the first commit and again after the archive-companion commit**:
+
+```
+node .opencode/scripts/normalize-backlog.js --check
+```
+
+If the check fails on either pass, rerun the normalizer (without `--check`)
+and recompute both exact path sets before committing.
+
+If the ledger changes concurrently or a `cas_conflict` occurs on the
+backlog-only commit, apply the normal `cas_conflict` recovery (re-read from
+the new HEAD, re-apply, retry) — but because the normalizer is deterministic
+over the ledger + archives, the safer path is to re-read the ledger, rerun
+the normalizer over the complete working tree, and recompute both exact path
+sets before retrying. Do NOT revert the archive companions to unblock.
+
 ## Curation routing (DEFER / p2 / follow-up)
 
 ### Holding area = `.local/coordinator/tasks/`

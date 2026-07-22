@@ -157,6 +157,21 @@ export function scrubCredentials(text) {
     //    non-backslash char OR a backslash-escaped pair (any char following a
     //    backslash, including `\"` / `\\`).
     //
+    //    BARE-VALUE NEGATIVE LOOKAHEAD (bare alternative ONLY): the bare
+    //    alternative is `(?!-{1,2})\S+` — a negative lookahead that REJECTS a
+    //    bare value beginning with `-` or `--`. Without it, a bare `\S+` would
+    //    happily consume the NEXT flag as though it were the preceding flag's
+    //    value: `--token --api-key sk_live_abc` would eat `--api-key` as
+    //    `--token`'s value, leaving `sk_live_abc` UNREDACTED (the `sk_` form
+    //    is not matched by the standalone sk-/AKIA/blob rules below because it
+    //    uses an underscore, not a dash). With the lookahead, the bare match
+    //    fails at `--api-key`, the regex moves on, and `--api-key` is then
+    //    recognized as a flag in its own right with `sk_live_abc` redacted as
+    //    its value. CRITICAL: the lookahead is confined to the bare alternative
+    //    ONLY — it is NOT placed ahead of the quoted alternatives, so a quoted
+    //    value that legitimately begins with dashes (e.g. `--token
+    //    "--dashed-value"`) is still redacted by the quoted branch.
+    //
     //    The `--?` (one or two dashes) is wrapped in a non-capturing group
     //    with the name alternation so it applies to EVERY alternative —
     //    without it, alternation precedence would bind `--?` only to
@@ -172,7 +187,7 @@ export function scrubCredentials(text) {
     //    (flag name survives) rather than being reduced to a bare `[redacted]`
     //    by the blob rules.
     out = out.replace(
-        /(--?(?:password|pass|passwd|pwd|token|api[_-]?key|apikey|secret|secret[_-]?key|access[_-]?key|auth|authorization|credential|private[_-]?key|p))\s+("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\S+)/gi,
+        /(--?(?:password|pass|passwd|pwd|token|api[_-]?key|apikey|secret|secret[_-]?key|access[_-]?key|auth|authorization|credential|private[_-]?key|p))\s+("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|(?!-{1,2})\S+)/gi,
         "$1 [redacted]",
     );
 
@@ -372,6 +387,62 @@ if (__isMain) {
         assert.equal(out, "--verbose output.txt");
     });
 
+    // ===== scrubCredentials: bare-value negative lookahead (consecutive flags) =====
+    //
+    // The bare-value alternative carries `(?!-{1,2})` so a following flag is NOT
+    // mis-consumed as the preceding flag's value (which would leak the real
+    // value). These cases pin that behavior.
+
+    test("scrub: consecutive long secret flags -- next flag not consumed as value", () => {
+        // Without the bare-value negative lookahead, `--api-key` would be eaten
+        // as `--token`'s value, leaving `sk_live_abc` UNREDACTED (the `sk_`
+        // underscore form is not matched by the standalone sk-/AKIA/blob rules
+        // below).
+        const out = scrubCredentials("--token --api-key sk_live_abc");
+        assert.match(out, /--api-key \[redacted\]/);
+        assert.equal(out.includes("sk_live_abc"), false);
+    });
+
+    test("scrub: consecutive short/long flags -- next flag not consumed as value", () => {
+        // `-p --password hunter2`: `--password` must NOT be consumed as `-p`'s
+        // value; `hunter2` must be redacted.
+        const out = scrubCredentials("-p --password hunter2");
+        assert.match(out, /--password \[redacted\]/);
+        assert.equal(out.includes("hunter2"), false);
+    });
+
+    test("scrub: multiple secret flags with ordinary values (regression control)", () => {
+        // `--token plain --api-key sk_live_abc`: both values redacted as before.
+        const out = scrubCredentials("--token plain --api-key sk_live_abc");
+        assert.match(out, /--token \[redacted\]/);
+        assert.match(out, /--api-key \[redacted\]/);
+        assert.equal(out.includes("plain"), false);
+        assert.equal(out.includes("sk_live_abc"), false);
+    });
+
+    test("scrub: quoted dashed value still redacted (lookahead is bare-only)", () => {
+        // The negative lookahead lives on the BARE alternative ONLY; a quoted
+        // value that legitimately begins with dashes MUST still be redacted by
+        // the quoted branch.
+        const out = scrubCredentials('--token "--dashed-value"');
+        assert.match(out, /--token \[redacted\]/);
+        assert.equal(out.includes("--dashed-value"), false);
+    });
+
+    test("scrub: consecutive-flag scrubbing is idempotent", () => {
+        const inputs = [
+            "--token --api-key sk_live_abc",
+            "-p --password hunter2",
+            "--token plain --api-key sk_live_abc",
+            '--token "--dashed-value"',
+        ];
+        for (const input of inputs) {
+            const once = scrubCredentials(input);
+            const twice = scrubCredentials(once);
+            assert.equal(once, twice, "must be idempotent for: " + input);
+        }
+    });
+
     test("scrub: flag-form rules are idempotent and pure (input not mutated)", () => {
         const inputs = [
             "curl --password hunter2 https://x",
@@ -380,6 +451,10 @@ if (__isMain) {
             "-p secret123",
             "--password 0123456789abcdef0123456789abcdef01234567",
             "--verbose output.txt",
+            "--token --api-key sk_live_abc",
+            "-p --password hunter2",
+            "--token plain --api-key sk_live_abc",
+            '--token "--dashed-value"',
         ];
         for (const input of inputs) {
             const snapshot = input; // strings are immutable; capture for clarity

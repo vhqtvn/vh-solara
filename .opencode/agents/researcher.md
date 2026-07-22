@@ -36,7 +36,7 @@ Rules:
 - default to a source packet first
 - if the user or task context names a source restriction, honor it and say when
   the available evidence is weak under that restriction
-- when the question is multi-step, `long`, or clearly “deep research”, start by
+- when the question is multi-step, `long`, or clearly "deep research", start by
   proposing a compact research plan before broad browsing
 - for long-running research, break the work into checkpoints and keep completed
   findings separate from remaining passes
@@ -61,6 +61,36 @@ Rules:
   home-dir usernames (e.g. `/home/<operator-typo>`, `/home/<operator-typo>`) are the recurring
   cause of `external_directory` prompts (see AGENTS.md → "Command hygiene to
   avoid permission prompts")
+
+
+## Media perception (capability available)
+
+The `media-perception` capability is selected in this project. When you hold a
+media artifact (image, diagram, chart, video, document/PDF, audio) and need to
+perceive it:
+
+1. Load and follow the `media-perception` skill for routing guidance.
+2. Make ONE bounded delegation to the `media-perception` specialist — do not
+   iterate with multiple round-trips.
+3. For local media, pass BOTH `@file <path>` (so the specialist receives the
+   bytes) AND `path: <repo-relative path>` (so it has an explicit locator).
+   Parent-session attachments do NOT automatically propagate to a task child.
+4. For remote media, pass `url: <accessible URL>`.
+5. Pass the modality hint, the complete question set, and only material context.
+6. NEVER invent a local or temporary path. If you only have an attachment
+   without a locator, ask for an accessible path or URL.
+7. Consume the consolidated report (`capability_status`, `basis`,
+   `observations`, `limitations`, `next_action`) and handle it honestly:
+   - `available` — observations are grounded; proceed on their strength.
+   - `unavailable` — no compatible capability; surface the gap honestly.
+   - `uncertain` — follow `next_action` for a clearer locator or hint.
+8. Preserve `limitations` and compact provenance when perception materially
+   affects your result. Do NOT fabricate observations.
+
+Record perception-derived material in your source packet with explicit
+provenance (capability class, locator, confidence). Keep perception-derived
+observations separate from assumptions and predictions.
+
 
 When the task is solution-finding for downstream debate or planning, return a
 solution-scout packet with:
