@@ -31,6 +31,16 @@ type fakeOC struct {
 	createStatus    int  // if non-zero, POST /session returns this status (create failure)
 	promptStatus    int  // if non-zero, /session/:id/prompt_async returns this status (prompt failure)
 	archiveStatus   int  // if non-zero, PATCH /session/:id (SetArchived) returns this status (archive failure)
+
+	// archivedPATCHes records the ids of every PATCH /session/:id (SetArchived)
+	// call, in order — used by the archive re-assert test to assert a re-PATCH.
+	archivedPATCHes []string
+
+	// listSessionsReply is the body returned by GET /session (ListSessions).
+	// Defaults to nil → "[]" (no sessions). Used by the archive re-assert test
+	// to fake OpenCode reporting an affected id with archived=null (didn't
+	// stick because a busy subagent clobbered it).
+	listSessionsReply []byte
 }
 
 func (f *fakeOC) handler() http.Handler {
@@ -48,7 +58,18 @@ func (f *fakeOC) handler() http.Handler {
 			w.Write([]byte(`{"id":"new_sess","title":"t"}`))
 			return
 		}
-		w.Write([]byte("[]"))
+		// GET /session (ListSessions / ListArchivedSessions — both hit this
+		// path; the archived=true query param is ignored by the handler, the
+		// caller filters server-side). Return the configured reply, defaulting
+		// to an empty list.
+		f.mu.Lock()
+		reply := f.listSessionsReply
+		f.mu.Unlock()
+		if reply == nil {
+			reply = []byte("[]")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(reply)
 	})
 	mux.HandleFunc("/session/", func(w http.ResponseWriter, r *http.Request) {
 		p := r.URL.Path
@@ -71,7 +92,18 @@ func (f *fakeOC) handler() http.Handler {
 			f.permissions = append(f.permissions, "legacy:"+b)
 			w.WriteHeader(http.StatusOK)
 		case r.Method == http.MethodPatch:
-			// SetArchived (PATCH /session/:id time.archived). Used by /vh/archive.
+			// SetArchived (PATCH /session/:id time.archived). Used by /vh/archive
+			// and by the re-assert goroutine. Record the id (strip the
+			// "/session/" prefix; ignore any sub-resource suffix). The handler's
+			// outer f.mu.Lock()/defer Unlock() (above) already serializes this
+			// append against the archivedPATCHes read helper, so no inner lock.
+			id := strings.TrimPrefix(p, "/session/")
+			if i := strings.IndexByte(id, '/'); i >= 0 {
+				id = id[:i]
+			}
+			if id != "" {
+				f.archivedPATCHes = append(f.archivedPATCHes, id)
+			}
 			if f.archiveStatus != 0 {
 				w.WriteHeader(f.archiveStatus)
 				return

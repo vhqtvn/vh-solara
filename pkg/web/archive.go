@@ -1,7 +1,9 @@
 package web
 
 import (
+	"context"
 	"encoding/json"
+	"log"
 	"net/http"
 	"sort"
 	"strconv"
@@ -9,6 +11,17 @@ import (
 
 	"github.com/vhqtvn/vh-solara/pkg/opencode"
 )
+
+// archiveReassertDelay is the wait before the post-archive re-assert goroutine
+// re-reads OpenCode and re-PATCHes any affected id whose time.archived was
+// clobbered by a still-running busy/compacting subagent (OpenCode rewrites the
+// full session record from a pre-PATCH snapshot → archived back to null). The
+// PATCH itself returned 200 — the clobber is invisible to handleArchive — so
+// the re-assert is what makes the archive actually persist once the busy write
+// settles. The store-side tombstone (set by RemoveSessions) holds the live
+// tree during this window; this goroutine is defense-in-depth for OpenCode's
+// own state. Var (not const) so tests can shrink it.
+var archiveReassertDelay = 1 * time.Second
 
 // Archiving uses OpenCode's NATIVE archive (PATCH /session/:id time.archived):
 // it persists in OpenCode and is visible to every client. Archiving cascades to
@@ -68,6 +81,14 @@ func (s *Server) handleArchive(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
+		// The direct-DB unarchive cleared time_archived in OpenCode. Clear the
+		// store tombstone for these ids so the imminent Rehydrate re-inserts
+		// them (without this, Hydrate's and upsertSessionLocked's tombstone
+		// guards would keep them absent). This is the ONLY place tombstones are
+		// cleared: the generic Hydrate deliberately does not, because it can't
+		// distinguish a genuine unarchive from a stale clobber (both carry
+		// archived=null) during the re-assert window.
+		agg.Store().ClearArchiveTombstones(affected)
 		// Re-hydrate so the restored sessions re-enter the live tree. The direct
 		// DB write emits no session.updated event, so the local store would
 		// otherwise still consider these sessions archived until a refresh.
@@ -99,6 +120,64 @@ func (s *Server) handleArchive(w http.ResponseWriter, r *http.Request) {
 				s.queues.CleanupSession(root, safeID.ReplaceAllString(id, ""))
 			}
 		}
+		// (A) Re-assert against OpenCode clobber. A busy/compacting subagent
+		// still running when we PATCHed can cause OpenCode to rewrite the full
+		// session record from a pre-PATCH snapshot, reverting time.archived to
+		// null. The PATCH itself returned 200 — no error visible here — but the
+		// persisted value didn't stick for that descendant. The store-side
+		// tombstone (set by RemoveSessions above) holds the live tree during
+		// the window; this goroutine closes the gap in OpenCode itself by
+		// re-reading the authoritative list after the busy write settles and
+		// re-PATCHing any affected id where archived didn't stick. Best-effort
+		// (logs on error); the tombstone is the hard guarantee. Runs in a
+		// goroutine so it never delays the archive response.
+		go func(affected []string) {
+			time.Sleep(archiveReassertDelay)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			sessions, err := agg.Client().ListSessions(ctx)
+			if err != nil {
+				log.Printf("[archive] re-assert ListSessions(%s): %v", body.SessionID, err)
+				return
+			}
+			// Build the set of ids OpenCode reports as genuinely archived
+			// (time.archived set to a non-zero value). Mirrors
+			// sessionEnvelope.archivedAt() in pkg/state/store.go.
+			archivePersisted := make(map[string]bool, len(sessions))
+			for _, raw := range sessions {
+				var env struct {
+					ID   string `json:"id"`
+					Time struct {
+						Archived *float64 `json:"archived"`
+					} `json:"time"`
+				}
+				if json.Unmarshal(raw, &env) != nil || env.ID == "" {
+					continue
+				}
+				if env.Time.Archived != nil && *env.Time.Archived != 0 {
+					archivePersisted[env.ID] = true
+				}
+			}
+			ts := time.Now().UnixMilli()
+			for _, id := range affected {
+				if archivePersisted[id] {
+					continue // archive persisted for this id
+				}
+				// Don't re-PATCH if the tombstone is gone — either the TTL
+				// expired (archive is long-settled, OpenCode is consistent) or
+				// the id was explicitly unarchived
+				// (ClearArchiveTombstones). Re-PATCHing in that window would
+				// undo a legitimate unarchive. The tombstone is the re-assert's
+				// signal that the archive intent still holds (re-assert fires
+				// at archiveReassertDelay, well inside recentArchiveTTL).
+				if !agg.Store().IsRecentlyArchived(id) {
+					continue
+				}
+				if err := agg.Client().SetArchived(ctx, id, ts); err != nil {
+					log.Printf("[archive] re-assert SetArchived(%s): %v", id, err)
+				}
+			}
+		}(append(affected[:0:0], affected...))
 	}
 	writeJSONResp(w, map[string]any{"ok": true, "affected": affected})
 }

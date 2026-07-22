@@ -1139,6 +1139,15 @@ type Store struct {
 	// lastAgent authoritatively from the full history; seeded only suppresses
 	// the lightweight tail re-fetch for un-opened sessions.
 	seeded map[string]bool
+	// recentlyArchived is the short-TTL tombstone set by RemoveSessions (the
+	// archive path). It prevents a stale session.updated / session.compacted
+	// arriving with archived=null (because OpenCode rewrote the record from a
+	// pre-PATCH snapshot on a busy/compacting descendant) from RESURRECTING an
+	// archived session back into the live tree. Guarded by s.mu; lazily
+	// GC'd on read (isRecentlyArchivedLocked). Cleared by Hydrate for a
+	// genuinely active session (the authoritative reconcile — e.g. unarchive).
+	// See recentArchiveTTL.
+	recentlyArchived map[string]time.Time
 
 	ring *ringBuffer
 	subs map[int]*subscriber
@@ -1198,6 +1207,7 @@ func New(ringCapacity int) *Store {
 		msgRev:                 map[string]uint64{},
 		coldFetchActive:        map[string]bool{},
 		seeded:                 map[string]bool{},
+		recentlyArchived:       map[string]time.Time{},
 		ring:                   newRingBuffer(ringCapacity),
 		subs:                   map[int]*subscriber{},
 		// Finding 4: SourceOpencodeLive is the iota zero value. Without an
@@ -1409,6 +1419,16 @@ func normalizeActivity(statusType string) string {
 // setActivityLocked records a session's activity and emits a client event only
 // when it changes. Caller must hold s.mu.
 func (s *Store) setActivityLocked(sessionID, st string) {
+	// Archive tombstone (Issue 4 B-i): a busy status for a recently-archived
+	// id (the subagent is still running) must NOT record activity or emit for
+	// it — otherwise the periodic status reconcile re-marks it busy →
+	// re-promotes it back into the active closure. The tombstone suppresses
+	// this; upsertSessionLocked already blocks the session from re-entering
+	// s.sessions, so this guard additionally prevents a phantom activity
+	// emit. Expires per recentArchiveTTL; Hydrate clears for genuinely active.
+	if s.isRecentlyArchivedLocked(sessionID) {
+		return
+	}
 	prev := s.activity[sessionID]
 	if prev == st {
 		return
@@ -1904,6 +1924,17 @@ func (s *Store) upsertSessionLocked(props json.RawMessage) {
 		}
 		return
 	}
+	// Archive tombstone (Issue 4 B-i): a session.updated / session.compacted
+	// arriving with archived=null for an id that was recently archived (via
+	// RemoveSessions) is the transient clobber — OpenCode rewrote the record
+	// from a pre-PATCH snapshot while a busy/compacting descendant was still
+	// running. Suppress the resurrection; the live tree stays clean until the
+	// tombstone expires or Hydrate confirms the session is genuinely active
+	// (unarchive). Without this the session re-enters s.sessions and the next
+	// busy status re-promotes it.
+	if s.isRecentlyArchivedLocked(env.ID) {
+		return
+	}
 	// Preserve the cold-seeded lastAgent (set by SetLastAgents during hydrate)
 	// across a session.updated that replaces the entry. Without this, a
 	// metadata/title update for an un-opened session would wipe its cold-seeded
@@ -2051,17 +2082,71 @@ func (s *Store) Descendants(id string) []string {
 	return s.descendantsLocked(id)
 }
 
+// isRecentlyArchivedLocked reports whether id is within the archive tombstone
+// window (set by RemoveSessions). Lazily GCs expired entries. Caller must hold
+// s.mu. Returns false (and cleans up) once the TTL has elapsed so a genuine
+// re-creation or a long-delayed event is processed normally.
+func (s *Store) isRecentlyArchivedLocked(id string) bool {
+	if exp, ok := s.recentlyArchived[id]; ok {
+		if time.Now().Before(exp) {
+			return true
+		}
+		delete(s.recentlyArchived, id)
+	}
+	return false
+}
+
 // RemoveSessions drops sessions from the live view and emits session.delete for
 // each, so connected clients prune them immediately (e.g. right after they were
 // archived in OpenCode). A subsequent re-hydrate keeps things consistent.
+//
+// It also arms a short-TTL tombstone (recentlyArchived) per id: this is the
+// archive path, and OpenCode can transiently revert time.archived by rewriting
+// the full record from a pre-PATCH snapshot while a busy/compacting descendant
+// is still running. The tombstone blocks that stale session.updated /
+// session.compacted (archived=null) from resurrecting the id via
+// upsertSessionLocked, and blocks a busy status from re-promoting it via
+// setActivityLocked. Cleared ONLY by ClearArchiveTombstones (the explicit
+// unarchive flow) or by TTL expiry. Hydrate deliberately does NOT clear it —
+// see recentArchiveTTL.
 func (s *Store) RemoveSessions(ids []string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	expiry := time.Now().Add(recentArchiveTTL)
 	for _, id := range ids {
 		if _, ok := s.sessions[id]; ok {
 			s.deleteSessionLocked(id)
 		}
+		s.recentlyArchived[id] = expiry
 	}
+}
+
+// ClearArchiveTombstones removes the archive-resurrection tombstone for each
+// given id. This is the EXPLICIT unarchive path: it is called by the unarchive
+// handler (handleArchive's /vh/unarchive branch) after the direct-SQLite
+// unarchive succeeds and before Rehydrate, so the restored sessions re-enter
+// the live tree (without this, Hydrate's and upsertSessionLocked's tombstone
+// guards would keep them absent). Callers outside the unarchive flow must NOT
+// call this — let the tombstone expire via recentArchiveTTL so the stale-clobber
+// window stays protected.
+func (s *Store) ClearArchiveTombstones(ids []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, id := range ids {
+		delete(s.recentlyArchived, id)
+	}
+}
+
+// IsRecentlyArchived reports whether id is within the archive-resurrection
+// tombstone window. It is the public (lock-acquiring) read used by the archive
+// re-assert goroutine to decide whether to re-PATCH an id: if the tombstone is
+// gone (explicit unarchive via ClearArchiveTombstones, or TTL expiry) the
+// archive intent no longer holds and re-PATCHing would undo a legitimate
+// unarchive.
+func (s *Store) IsRecentlyArchived(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.isRecentlyArchivedLocked(id)
 }
 
 // SetPendingQuestions reconciles the pending-question set to exactly the given
@@ -2524,6 +2609,19 @@ func (s *Store) upsertPartLocked(part json.RawMessage) {
 // markdown to ~5fps in components/Part.tsx / lib/streamMd.ts), while cutting
 // the per-char marshal+emit+ring-push cost to ~1× per window.
 var deltaFlushInterval = 30 * time.Millisecond
+
+// recentArchiveTTL is how long RemoveSessions' tombstone suppresses
+// resurrection of an archived session by a stale session.updated /
+// session.compacted arriving with archived=null (OpenCode can rewrite the
+// full record from a pre-PATCH snapshot while a busy/compacting descendant
+// is still running). A package-level var (not const) so tests can shrink it
+// for deterministic expiry assertions. The TTL must cover the transient
+// clobber window; the web layer's archive re-assert (handleArchive) and the
+// periodic resync provide additional self-heal. The tombstone is cleared only
+// by the explicit unarchive flow (ClearArchiveTombstones); Hydrate does NOT
+// clear it, because a hydrate can't tell a genuine unarchive from a stale
+// clobber (both carry archived=null).
+var recentArchiveTTL = 30 * time.Second
 
 // partTextCap bounds the accumulated length of a single part's text field, in
 // bytes. External latency analysis (17.8k sessions / 13 GB) found one bash
@@ -3670,6 +3768,20 @@ func (s *Store) Hydrate(sessions []json.RawMessage, messages map[string][]Messag
 		}
 		if env.archivedAt() {
 			continue // archived sessions are not part of the live tree
+		}
+		// Skip tombstoned ids. A hydrate cannot distinguish a GENUINE unarchive
+		// (archived=null because the operator restored it) from a STALE CLOBBER
+		// (archived=null because OpenCode rewrote the record from a pre-PATCH
+		// snapshot while a busy descendant was still running) — both look
+		// identical here. Re-inserting would defeat the tombstone precisely
+		// during the re-assert window it protects. The tombstone is cleared
+		// ONLY by the explicit unarchive flow (ClearArchiveTombstones, called
+		// by handleArchive after the direct-SQLite unarchive succeeds); it also
+		// expires via recentArchiveTTL. Hydrate assigns s.sessions directly
+		// (bypassing upsertSessionLocked, whose own guard would otherwise fire),
+		// so this skip must live HERE.
+		if s.isRecentlyArchivedLocked(env.ID) {
+			continue
 		}
 		seen[env.ID] = true
 		if old := s.sessions[env.ID]; old == nil || !bytes.Equal(old.info, info) {
