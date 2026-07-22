@@ -1866,12 +1866,25 @@ export function connect(fresh = false) {
 }
 
 // === Stream 2: active-session messages ======================================
-// message/part events for ONLY the open session. Always snapshots fresh (no
-// cursor) so switching sessions can't miss/skip deltas; reopened on switch,
-// closed when nothing is open. Self-retries on error.
+// message/part events for ONLY the open session. The FIRST open of a session
+// takes the fresh-snapshot path (no cursor) so the initial state + cold fetch
+// land; subsequent RETRIES (same session, same selection) pass a local cursor
+// (sesCursor) so the server replays missed deltas from the ring instead of
+// re-shipping the full transcript — this is what kills the reopen re-ship
+// amplifier (10 reconnects/3min → +5MB in the live study). Switching sessions
+// resets sesCursor (via closeSessionStream) so a NEW session always gets a
+// fresh snapshot. Self-retries on error.
 let ses: EventSource | null = null;
 let sesId = "";
 let sesRetry: number | undefined;
+// sesCursor: the last-received event seq on the CURRENT session stream. Passed
+// as cursor= on retry so the server takes the replay branch (deltas from the
+// ring) instead of the fresh-snapshot branch (full transcript re-ship). This
+// is a Stream2-LOCAL cursor — it is NOT state.cursor (the SHARED cursor Stream1
+// uses for its resume). trackCursor:false still holds: Stream2 never writes
+// state.cursor. Reset to 0 in closeSessionStream (session switch / close) so a
+// new session always starts fresh; preserved across retries (same session).
+let sesCursor = 0;
 // sesGen: Stream2 connection-generation token. Incremented on EVERY open /
 // reopen / close / selection-switch. Captured in every Stream2 listener so a
 // callback from a SUPERSEDED connection (closed, replaced, switched-away — or a
@@ -1897,6 +1910,11 @@ export function closeSessionStream() {
   // leaking a permanent dot on the row.
   if (sesId) setState("refreshing", sesId, false);
   sesId = "";
+  // Reset Stream2's local resume cursor: a session switch (or close) must start
+  // fresh (no cursor → server takes the snapshot branch). Preserved across
+  // retries of the SAME session (the retry path calls open() directly, not
+  // closeSessionStream, so sesCursor survives and enables replay-based resume).
+  sesCursor = 0;
   // Phase 4: clear ALL in-flight historical-page requests on connection
   // teardown. A page in flight belongs to the outgoing connection (its
   // flight.gen was captured against THIS sesGen); after the bump above those
@@ -2133,7 +2151,15 @@ export function openSessionStream(id: string, force = false) {
     // closeSessionStream clears it on switch-away). Set per (re)open so a
     // reconnect retry re-arms it.
     setState("refreshing", id, true);
-    ses = new EventSource(`/vh/stream?sessions=${encodeURIComponent(id)}&dir=${encodeURIComponent(projectDir())}&z=1`);
+    // Cursor-based resume: on a retry (same session, sesCursor > 0), pass the
+    // last-received seq as cursor= so the server replays missed deltas from the
+    // ring instead of re-shipping the full transcript. On the first open of a
+    // session (sesCursor === 0, just reset by closeSessionStream), no cursor is
+    // sent → the server takes the fresh-snapshot branch. This mirrors Stream1's
+    // cursorParam construction. The cursor is sesCursor (Stream2-local), NOT
+    // state.cursor (the shared cursor Stream1 owns).
+    const cursorParam = sesCursor > 0 ? `cursor=${sesCursor}&` : "";
+    ses = new EventSource(`/vh/stream?${cursorParam}sessions=${encodeURIComponent(id)}&dir=${encodeURIComponent(projectDir())}&z=1`);
     // Seed Stream2's liveness deadline from construction (mirrors Stream1's
     // markTreeSeen() right after `new EventSource`): a connection that NEVER
     // fires any event (silent from the start) must still be aged out after
@@ -2147,6 +2173,12 @@ export function openSessionStream(id: string, force = false) {
       // the clock or the store.
       if (gen !== sesGen) return;
       markSessionSeen();
+      // Track Stream2's local cursor from the SSE id field so the next retry
+      // can pass cursor= for replay-based resume. The snapshot's seq is stamped
+      // by writeRaw as the SSE id. Using max guards against any out-of-order
+      // delivery (shouldn't happen, but defensive).
+      const seq = Number((e as MessageEvent).lastEventId);
+      if (seq > sesCursor) sesCursor = seq;
       let raw: any;
       try {
         raw = JSON.parse((e as MessageEvent).data);
@@ -2285,6 +2317,14 @@ export function openSessionStream(id: string, force = false) {
         // the clock or the store.
         if (gen !== sesGen) return;
         markSessionSeen();
+        // Track Stream2's local cursor from the SSE id field (mirrors the
+        // snapshot listener). Done BEFORE the gate check so even a deferred
+        // (busy-gated) frame advances sesCursor — the event WAS received, so a
+        // retry after the gate releases must not replay it.
+        {
+          const seq = Number((e as MessageEvent).lastEventId);
+          if (seq > sesCursor) sesCursor = seq;
+        }
         if (isGateActive()) {
           // Deferred Stream-2 frame — neither mutate the store nor advance the
           // shared cursor. Latch dirty so the coalesced refresh catches up.

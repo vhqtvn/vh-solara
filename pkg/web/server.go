@@ -1335,7 +1335,17 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	// forces the headers out, making `conn` transport-only (DNS/TCP/tunnel-
 	// setup/slot-queuing) and letting subsequent server compute show up honestly
 	// in `server/snap`. Do NOT move/remove the existing snapshot flush below.
-	fmt.Fprintf(w, ": hello\n\n")
+	//
+	// SSE retry hint: tells the browser's native EventSource auto-reconnect (the
+	// CONNECTING state on a transient drop) to wait 2s before reconnecting. This
+	// is what lets a session stream (Stream2) absorb a transient tunnel blip via
+	// native auto-reconnect — which sends Last-Event-ID → the server's replay
+	// branch → missed deltas are caught up WITHOUT a fresh snapshot. A fatal
+	// CLOSED (non-retryable) still falls to the client's manual retry path,
+	// which passes cursor= explicitly. The hint is harmless for Stream1 (its
+	// onerror only acts on CLOSED; in CONNECTING the same EventSource auto-
+	// reconnects with no JS-level new connection).
+	fmt.Fprintf(w, ": hello\nretry: 2000\n\n")
 	flusher.Flush()
 
 	// Prefer the Last-Event-ID header (sent automatically by EventSource on
