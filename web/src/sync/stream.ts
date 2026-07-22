@@ -1877,6 +1877,12 @@ export function connect(fresh = false) {
 let ses: EventSource | null = null;
 let sesId = "";
 let sesRetry: number | undefined;
+// sesBackoff: exponential backoff for Stream2's manual CLOSED-reopen, mirroring
+// Stream1's backoff (stream.ts ~1862). The native EventSource does NOT honor
+// `retry:` on a fatal CLOSED — that governs only the internal CONNECTING retry —
+// so a CLOSED storm would otherwise reopen every 1500ms (Phase 3-F). Doubles per
+// consecutive CLOSED failure, capped at 15s, reset to 1500ms on a healthy open.
+let sesBackoff = 1500;
 // sesCursor: the last-received event seq on the CURRENT session stream. Passed
 // as cursor= on retry so the server takes the replay branch (deltas from the
 // ring) instead of the fresh-snapshot branch (full transcript re-ship). This
@@ -1928,6 +1934,9 @@ export function closeSessionStream() {
   // it has had a chance to fire. 0 = "never seen" → watchdog treats it as
   // not-stale (gives the next open() a fresh deadline).
   sessionLastSeen = 0;
+  // Phase 3-F: a session switch starts the next session's CLOSED-reopen backoff
+  // fresh (per-session backoff does not carry across session switches).
+  sesBackoff = 1500;
 }
 
 // applySessionSnapshot applies a Stream-2 (active-session) snapshot to the store.
@@ -2310,6 +2319,7 @@ export function openSessionStream(id: string, force = false) {
       markSessionSeen();
       sesT1 = performance.now();
       if (sesT0) recordLatency("session", "open", sesT1 - sesT0);
+      sesBackoff = 1500; // Phase 3-F: healthy open resets the CLOSED-reopen backoff
     };
     for (const kind of ["message.upsert", "message.delete", "part.upsert", "part.delete", "messages.loaded", "messages.error", "messages.batch"]) {
       ses!.addEventListener(kind, async (e) => {
@@ -2493,8 +2503,14 @@ export function openSessionStream(id: string, force = false) {
       // its own retry scheduling via its own onerror.
       if (gen !== sesGen) return;
       if (ses && ses.readyState === EventSource.CLOSED && sesId === id) {
+        // Phase 3-F: exponential backoff (mirrors Stream1 stream.ts ~1862) so a
+        // genuine CLOSED storm cannot reopen every 1500ms. Doubles per failure,
+        // capped at 15s, reset on a healthy open (ses.onopen). sesCursor resume
+        // (f54ffff4) is preserved — backoff gates the REOPEN cadence, not the
+        // cursor logic.
         clearTimeout(sesRetry);
-        sesRetry = window.setTimeout(open, 1500);
+        sesRetry = window.setTimeout(open, sesBackoff);
+        sesBackoff = Math.min(sesBackoff * 2, 15_000);
       }
     };
   };

@@ -1434,7 +1434,15 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		if wantsProject(r) {
 			rcSnap := store.SnapshotProjected(filter, "reconnect", wantsHoist(r))
 			if rb, err := json.Marshal(rcSnap); err == nil {
-				writeRaw(w, rcSnap.Seq, "snapshot", maybeCompressSnapshot(rb, wantsCompress(r)))
+				// Compute the wire payload once and record its length so
+				// snapshot_bytes reflects true wire bytes (Phase 3-D: was
+				// len(rb), overstating ~3x by recording the pre-compression
+				// marshaled length). Phase 3-C: RecordSnapshotPath was MISSING
+				// here entirely (unlike the initial/promotion sites), hiding
+				// the reconnect snapshot from snapshot_path/snapshot_bytes.
+				wire := maybeCompressSnapshot(rb, wantsCompress(r))
+				writeRaw(w, rcSnap.Seq, "snapshot", wire)
+				sw.RecordSnapshotPath(len(wire)) // PROBE 3: reconnect branch + wire bytes
 				baseline = rcSnap.Seq
 			} else {
 				vhlog.Warn("stream reconnect snapshot: marshal failed, skipping", "err", err)
@@ -1481,8 +1489,13 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			// the cold-load messages.batch gzip64 shape so the client decodes via the
 			// same path; this is what cuts a warm open's end-to-end `snap` transport
 			// ~3.4x (the controller tunnel does not compress at any lower layer).
-			writeRaw(w, snap.Seq, "snapshot", maybeCompressSnapshot(b, wantsCompress(r)))
-			sw.RecordSnapshotPath(len(b)) // PROBE 3: snapshot baseline branch + wire bytes
+			// Phase 3-D: record true wire bytes (was len(b), the pre-compression
+			// marshaled length — overstated ~3x). snapshot_bytes now reflects the
+			// actual bytes written, keeping the diag self-consistent with Phase-1
+			// per-path wire counters.
+			wire := maybeCompressSnapshot(b, wantsCompress(r))
+			writeRaw(w, snap.Seq, "snapshot", wire)
+			sw.RecordSnapshotPath(len(wire)) // PROBE 3: initial snapshot branch + wire bytes
 		}
 		baseline = snap.Seq
 	}
@@ -1528,8 +1541,11 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			// Pass `filter` (not nil) so promotion respects the same message
 			// scoping as the initial snapshot — otherwise every promotion
 			// re-ships transcripts for the entire active closure.
-			writeRaw(w, promoSnap.Seq, "snapshot", maybeCompressSnapshot(pb, wantsCompress(r)))
-			sw.RecordSnapshotPath(len(pb)) // PROBE 3: stop undercounting promotion bytes
+			// Phase 3-D: record true wire bytes (was len(pb), the pre-compression
+			// marshaled length — overstated ~3x).
+			wire := maybeCompressSnapshot(pb, wantsCompress(r))
+			writeRaw(w, promoSnap.Seq, "snapshot", wire)
+			sw.RecordSnapshotPath(len(wire)) // PROBE 3: promotion wire bytes
 			// Advance baseline so buffered events already covered by the
 			// promotion snapshot are not re-emitted (mirrors the initial
 			// snapshot baseline bump at the snapshot send site above).
