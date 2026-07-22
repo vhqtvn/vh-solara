@@ -637,18 +637,27 @@ export function applySnapshot(snap: Snapshot) {
 // fell outside the replay ring) and is pruned. Deep idle subtrees whose parent
 // is itself a collapsed stub stay preserved (frontier not authoritative there).
 //
-// Merge semantics per slice:
+// Merge semantics per slice (the preserve-absent rules below protect HIDDEN
+// sessions — those behind a stub; Gate A. For MATERIALIZED sessions the
+// reconcile block further down is AUTHORITATIVE: a facet absent from a
+// present facet-map means CLEARED server-side, so any stale client value is
+// deleted. A facet map entirely absent on the wire is an omitempty-dropped
+// empty map (projected snapshots always build every map server-side), so it
+// clears all materialized sessions):
 //   - sessions:       UPSERT incoming; PRESERVE absent (hidden !== deleted).
 //   - activity:       UPSERT incoming; PRESERVE absent.
 //   - lastAgents:     MERGE (incoming non-empty wins; FE entries the snapshot
-//                     omits are kept — same as the resync-window path).
-//   - currentVerbs:   UPSERT incoming; PRESERVE absent.
+//                     omits are kept for hidden sessions — same as the
+//                     resync-window path). Cleared for materialized sessions.
+//   - currentVerbs:   UPSERT incoming; PRESERVE absent (hidden). Cleared for
+//                     materialized sessions absent from the map.
 //   - permissions:    REPLACE per-session for sessions present in snap; PRESERVE
-//                     sessions absent (their perms are still live — a hidden
-//                     session can still have a pending permission).
+//                     sessions absent (hidden — their perms are still live).
+//                     Cleared for materialized sessions absent from the map.
 //   - questions:      Same as permissions.
-//   - todos:          Same as permissions.
-//   - unread:         MERGE (incoming non-empty wins; absent roots preserved).
+//   - todos:          REPLACE per-session present; PRESERVE absent (hidden).
+//   - unread:         MERGE (incoming wins; absent roots preserved for hidden).
+//                     Cleared for materialized sessions not in the unread list.
 //   - epoch/cursor:   Always update (projected snapshots advance the cursor).
 //
 // Transcript orthogonality (Gate F): this function touches NONE of
@@ -664,6 +673,10 @@ function applyProjectedSnapshot(snap: Snapshot) {
   // guard (!state.sessions[s.id]) already hides that one session's stub, so
   // skipping the prune is correct and loses nothing.
   const openId = selectedId();
+  // The set of sessions the server MATERIALIZED (the active closure). For these
+  // the server is authoritative on every per-session facet — see the reconcile
+  // below. Also reused by the full-rebuild ghost/demotion reconcile.
+  const materializedIds = new Set((snap.sessions || []).map((x) => x.id));
   setState(
     produce((s) => {
       // Sessions: upsert incoming, PRESERVE absent. This is the core Gate A
@@ -698,6 +711,37 @@ function applyProjectedSnapshot(snap: Snapshot) {
       // Unread: merge (incoming wins, absent preserved — a hidden root can still
       // be unread).
       for (const id of snap.unread || []) s.unread[id] = true;
+      // Projected facet reconcile (Finding #4 / DEFER #4): the snapshot's
+      // `sessions` array is the active closure the server MATERIALIZED — for
+      // those sessions the server is authoritative on every per-session facet.
+      // A materialized session ABSENT from a facet-map (permissions/questions/
+      // lastAgents/currentVerbs/unread) means CLEARED server-side, so clear any
+      // stale client value. Sessions NOT materialized (hidden behind a stub) are
+      // untouched — their facets stay preserved (Gate A: omission ≠ deletion for
+      // hidden sessions; only materialized sessions get facet authority). This
+      // closes the same stale-facet class as stale-busy: a missed
+      // permission.delete / question.delete / unread.clear / activity-verb-clear
+      // no longer leaves a stale "needs input" / permission / verb lingering.
+      //
+      // A projected snapshot ALWAYS builds all facet maps server-side
+      // (SnapshotProjected / SnapshotBranch initialize every map non-nil), so a
+      // map ABSENT on the wire is an omitempty-dropped EMPTY map, not "not spoken
+      // for." Without treating absent-as-empty, a scenario where every
+      // materialized session clears a facet simultaneously (e.g. a bulk
+      // permission.clear) would leave an empty map that Go's omitempty drops,
+      // and the stale facet would persist indefinitely.
+      const la = snap.lastAgents || {};
+      const cv = snap.currentVerbs || {};
+      const pm = snap.permissions || {};
+      const qs = snap.questions || {};
+      const ur = new Set(snap.unread || []);
+      for (const id of materializedIds) {
+        if (!(id in la)) delete s.lastAgents[id];
+        if (!(id in cv)) delete s.currentVerbs[id];
+        if (!(id in pm)) delete s.permissions[id];
+        if (!(id in qs)) delete s.questions[id];
+        if (!ur.has(id)) delete s.unread[id];
+      }
       // Stubs (Phase 4): upsert incoming stubs. Replace the stub map entirely
       // when cause="initial"/"promotion"/"reconnect"/"resync" (the server
       // re-projects the full frontier) or on epoch change (server restart
@@ -752,11 +796,10 @@ function applyProjectedSnapshot(snap: Snapshot) {
         //       event path. This fixes the ghost-RENDERING risk (a deleted
         //       session appearing in the tree after localStorage hydration when
         //       its session.delete fell outside the replay ring).
-        const snapSessionIds = new Set((snap.sessions || []).map((sess) => sess.id));
         const stubIds = new Set(Object.keys(s.branchStubs));
         for (const id of Object.keys(s.sessions)) {
           if (id === openId) continue;
-          if (snapSessionIds.has(id)) continue; // server materialized it → keep
+          if (materializedIds.has(id)) continue; // server materialized it → keep
           if (stubIds.has(id)) {
             // (a) explicit demotion: stub present → collapse the materialized
             //     payload into the stub row.
@@ -776,7 +819,7 @@ function applyProjectedSnapshot(snap: Snapshot) {
           // A child of a MATERIALIZED parent: the frontier is exhaustive one
           // level deep under an active parent, so a child absent from both the
           // active set and the stub set was deleted.
-          const ghostChild = !!parentID && snapSessionIds.has(parentID);
+          const ghostChild = !!parentID && materializedIds.has(parentID);
           if (ghostRoot || ghostChild) {
             delete s.sessions[id];
           }
@@ -2431,6 +2474,7 @@ const branchExpandInFlight = new Set<string>();
 // fields. Gate F (transcript orthogonality) holds: lazy-expand carries only
 // metadata, not messages.
 function applyLazyExpandMerge(snap: Snapshot) {
+  const materializedIds = new Set((snap.sessions || []).map((x) => x.id));
   setState(
     produce((s) => {
       for (const sess of snap.sessions || []) s.sessions[sess.id] = sess;
@@ -2451,6 +2495,27 @@ function applyLazyExpandMerge(snap: Snapshot) {
       }
       for (const [sid, v] of Object.entries(snap.todos || {})) s.todos[sid] = normalizeTodos(v);
       for (const id of snap.unread || []) s.unread[id] = true;
+      // Projected facet reconcile (Finding #4 / DEFER #4) — same authority as
+      // applyProjectedSnapshot: a materialized session absent from a facet-map
+      // is CLEARED server-side. Both SnapshotProjected and SnapshotBranch (the
+      // lazy-expand response builder) always build every facet map server-side,
+      // so an ABSENT map on the wire is an omitempty-dropped empty map (treated
+      // as "all cleared"), not "not spoken for." A lazy-expand snapshot is a
+      // partial point-in-time read of ONE branch's children, but the facet-map
+      // invariant holds for the materialized children it carries. Hidden
+      // sessions stay preserved (Gate A).
+      const la = snap.lastAgents || {};
+      const cv = snap.currentVerbs || {};
+      const pm = snap.permissions || {};
+      const qs = snap.questions || {};
+      const ur = new Set(snap.unread || []);
+      for (const id of materializedIds) {
+        if (!(id in la)) delete s.lastAgents[id];
+        if (!(id in cv)) delete s.currentVerbs[id];
+        if (!(id in pm)) delete s.permissions[id];
+        if (!(id in qs)) delete s.questions[id];
+        if (!ur.has(id)) delete s.unread[id];
+      }
       // Stubs: merge (lazy-expand adds branch-specific stubs — grandchildren —
       // without removing existing frontier stubs from other branches).
       for (const stub of snap.stubs || []) s.branchStubs[stub.id] = stub;

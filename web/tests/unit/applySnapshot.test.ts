@@ -1331,3 +1331,170 @@ describe("applySnapshot — Theme 1 reconnect/replay authority", () => {
     expect(state.cursor).toBe(5000); // cursor advanced
   });
 });
+
+describe("applySnapshot — Theme 2 projected-clear facets", () => {
+  // Finding #4 / DEFER #4: a projected snapshot's `sessions` array is the
+  // active closure the server MATERIALIZED. For those sessions the server is
+  // authoritative on every per-session facet — a facet ABSENT from a PRESENT
+  // facet-map means CLEARED server-side, so a stale client value must clear.
+  // This closes the same stale-facet class as stale-busy: a missed
+  // permission.delete / question.delete / unread.clear / activity-verb-clear no
+  // longer leaves a stale "needs input"/permission/verb lingering on a
+  // materialized session. Hidden sessions (behind a stub) stay preserved (Gate A).
+  const demoted = (id: string, parentID = "") => ({
+    id,
+    parentID,
+    kind: "collapsed-branch" as const,
+    hasChildren: false,
+    descendantCount: 0,
+    aggregateState: "idle" as const,
+  });
+  // A minimal projected snapshot materializing exactly `ids` with every facet
+  // map PRESENT-but-empty (mirrors SnapshotProjected, which inits each map).
+  // An absent facet here ⇒ cleared on the client for each materialized id.
+  const projectedClear = (ids: string[], stubs: ReturnType<typeof demoted>[] = []) => ({
+    seq: 2,
+    epoch: state.epoch,
+    projected: true as const,
+    cause: "promotion" as const,
+    structuralRevision: 2,
+    sessions: ids.map((id) => ({ id })),
+    stubs,
+    permissions: {},
+    questions: {},
+    lastAgents: {},
+    currentVerbs: {},
+    unread: [],
+  });
+
+  it("Finding #4: clears stale permissions on a materialized session", () => {
+    const EPOCH = "perm-clear-ep";
+    setState("epoch", EPOCH);
+    setState("sessions", "a", { id: "a" });
+    setState("permissions", "a", { p1: { id: "p1" } });
+    expect(state.permissions.a).toEqual({ p1: { id: "p1" } });
+    applySnapshot(projectedClear(["a"]));
+    expect(state.permissions.a).toBeUndefined(); // cleared (would stay {p1} without the fix)
+  });
+
+  it("Finding #4: clears stale questions on a materialized session", () => {
+    const EPOCH = "q-clear-ep";
+    setState("epoch", EPOCH);
+    setState("sessions", "a", { id: "a" });
+    setState("questions", "a", { q1: { id: "q1" } });
+    applySnapshot(projectedClear(["a"]));
+    expect(state.questions.a).toBeUndefined(); // cleared
+  });
+
+  it("DEFER #4: clears stale unread on a materialized session", () => {
+    const EPOCH = "unread-clear-ep";
+    setState("epoch", EPOCH);
+    setState("sessions", "a", { id: "a" });
+    setState("unread", "a", true);
+    expect(state.unread.a).toBe(true);
+    applySnapshot(projectedClear(["a"]));
+    expect(state.unread.a).toBeUndefined(); // cleared (would stay true without the fix)
+  });
+
+  it("Finding #4: clears stale currentVerbs on a materialized session", () => {
+    const EPOCH = "verb-clear-ep";
+    setState("epoch", EPOCH);
+    setState("sessions", "a", { id: "a" });
+    setState("currentVerbs", "a", { tool: "bash", state: "running" });
+    applySnapshot(projectedClear(["a"]));
+    expect(state.currentVerbs.a).toBeUndefined(); // cleared
+  });
+
+  it("Finding #4: clears stale lastAgents on a materialized session", () => {
+    const EPOCH = "agent-clear-ep";
+    setState("epoch", EPOCH);
+    setState("sessions", "a", { id: "a" });
+    setState("lastAgents", "a", "Claude");
+    applySnapshot(projectedClear(["a"]));
+    expect(state.lastAgents.a).toBeUndefined(); // cleared
+  });
+
+  it("Finding #4: preserves facets on a HIDDEN session behind a stub (Gate A)", () => {
+    const EPOCH = "hidden-preserve-ep";
+    setState("epoch", EPOCH);
+    // a is materialized; b is a child collapsed behind a stub (hidden, not
+    // materialized). Seed stale facets on b — they must survive because b is
+    // NOT in the materialized set (the server didn't speak for b's facets).
+    setState("sessions", "a", { id: "a" });
+    setState("sessions", "b", { id: "b", parentID: "a" });
+    setState("permissions", "b", { p1: { id: "p1" } });
+    setState("questions", "b", { q1: { id: "q1" } });
+    setState("unread", "b", true);
+    setState("currentVerbs", "b", { tool: "bash", state: "running" });
+    setState("lastAgents", "b", "Claude");
+    // Materialize ONLY a; b is demoted to a stub.
+    applySnapshot(projectedClear(["a"], [demoted("b", "a")]));
+    // b's facets preserved (would be cleared by an over-aggressive fix):
+    expect(state.permissions.b).toEqual({ p1: { id: "p1" } });
+    expect(state.questions.b).toEqual({ q1: { id: "q1" } });
+    expect(state.unread.b).toBe(true);
+    expect(state.currentVerbs.b).toEqual({ tool: "bash", state: "running" });
+    expect(state.lastAgents.b).toBe("Claude");
+  });
+
+  it("Finding #4: an ABSENT facet map (omitempty-dropped empty) clears materialized facets", () => {
+    // A projected snapshot ALWAYS builds all facet maps server-side. When every
+    // materialized session clears a facet, the map is empty → Go's omitempty
+    // drops it on the wire → the client sees `undefined`. Treating absent-as-
+    // empty (cleared) closes this gap; the old "defensive preserve" let the
+    // stale facet linger indefinitely.
+    const EPOCH = "absent-map-ep";
+    setState("epoch", EPOCH);
+    setState("sessions", "a", { id: "a" });
+    setState("lastAgents", "a", "Claude");
+    setState("permissions", "a", { p1: { id: "p1" } });
+    setState("currentVerbs", "a", { tool: "bash", state: "running" });
+    // Snapshot materializes a but carries NO lastAgents / permissions /
+    // currentVerbs fields at all (simulating omitempty dropping empty maps).
+    applySnapshot({
+      seq: 2,
+      epoch: EPOCH,
+      projected: true,
+      cause: "promotion",
+      structuralRevision: 2,
+      sessions: [{ id: "a" }],
+      questions: {},
+      unread: [],
+      // lastAgents / permissions / currentVerbs intentionally omitted entirely
+    });
+    expect(state.lastAgents.a).toBeUndefined(); // cleared (absent = omitempty-dropped empty)
+    expect(state.permissions.a).toBeUndefined(); // cleared
+    expect(state.currentVerbs.a).toBeUndefined(); // cleared
+  });
+
+  it("Finding #4: ALL facet maps absent simultaneously (bulk-clear) clears everything", () => {
+    // The all-empty-map edge case: when the server clears every facet for every
+    // materialized session, ALL maps are empty → ALL dropped by omitempty → the
+    // client sees a snapshot with NO facet fields at all. Without treating
+    // absent-as-empty, ALL stale facets would persist — the exact stale-facet
+    // class this theme closes.
+    const EPOCH = "bulk-clear-ep";
+    setState("epoch", EPOCH);
+    setState("sessions", "a", { id: "a" });
+    setState("permissions", "a", { p1: { id: "p1" } });
+    setState("questions", "a", { q1: { id: "q1" } });
+    setState("unread", "a", true);
+    setState("currentVerbs", "a", { tool: "bash", state: "running" });
+    setState("lastAgents", "a", "Claude");
+    // Snapshot materializes a but carries NO facet maps at all.
+    applySnapshot({
+      seq: 2,
+      epoch: EPOCH,
+      projected: true,
+      cause: "promotion",
+      structuralRevision: 2,
+      sessions: [{ id: "a" }],
+      // ALL facet maps intentionally omitted (omitempty simulation)
+    });
+    expect(state.permissions.a).toBeUndefined();
+    expect(state.questions.a).toBeUndefined();
+    expect(state.unread.a).toBeUndefined();
+    expect(state.currentVerbs.a).toBeUndefined();
+    expect(state.lastAgents.a).toBeUndefined();
+  });
+});
