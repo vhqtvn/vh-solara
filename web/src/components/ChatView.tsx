@@ -320,11 +320,28 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // `ready()` semantics are intentionally left UNTOUCHED (it still drives
   // scroll-restore, self-heal, and ack timing); `revealed` is a separate,
   // purely-visual gate layered on top.
-  const revealed = createMemo(() => ready() && (delivered() || messageFailed()));
   const messages = createMemo(() => {
     const s = sm();
     return s ? s.order.map((id) => s.byId[id]) : [];
   });
+  // P1-WEB reveal-gate latch (O1 collapsed-frontier): once a session has
+  // LEGITIMATELY revealed (positioned + delivered/failed), keep it revealed
+  // while it stays positioned and populated even if delivered() transiently
+  // drops — which happens when a resync/reconnect re-snapshots the session
+  // (applySessionSnapshot sets messagesLoaded=false on a cold re-snapshot). The
+  // base gate below is what FIRST reveals; the latch only prevents a transient
+  // delivered drop from re-stranding an already-shown transcript behind the
+  // opacity:0 overlay. It is per-session (set only when base fires for THIS sid)
+  // and gated on ready() AND a non-empty order, so it never fires during the
+  // slow-session partial-hydration window the reveal-gate.spec e2e guards
+  // (there the base gate is false for ~900ms → the latch stays empty → the
+  // overlay stays up). Armed by the latch effect near the switch effect.
+  const [revealedOnce, setRevealedOnce] = createSignal<string>("");
+  const revealed = createMemo(
+    () =>
+      (ready() && (delivered() || messageFailed())) ||
+      (revealedOnce() === props.sessionId && ready() && messages().length > 0),
+  );
   // Chat navigator: a faint strip of markers (one per user turn) on the right
   // edge — click to jump. Cheap: just markers + a tooltip, no rendered minimap.
   // (Defined after `messages` — createMemo runs eagerly, so it must not read it
@@ -901,13 +918,39 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       },
     ),
   );
-  // Drive the switch → ready loading overlay (above). Reads `revealed()` + the
-  // draft flag; writes `showLoading`. The write never becomes a dependency (this
-  // effect never reads showLoading), so there's no re-trigger loop. `revealed`
-  // (not bare `ready()`) is the right gate here: the overlay must stay up for
-  // the WHOLE partial-hydration window (messagesLoaded=false → deltas →
-  // loaded), not just the positioning window, so the transcript never visibly
-  // populates behind a transparent overlay.
+  // P1-WEB reveal-gate self-heal (O1 collapsed-frontier): the cold-stub load
+  // delivers a session in TWO SSE frames — messages.batch grows the DOM (a
+  // content ResizeObserver fires maybeRestore, but if the user's stored read
+  // anchor isn't in the partial order yet, maybeRestore defers at ~:792 WITHOUT
+  // setting ready), then messages.loaded flips delivered()=true but adds NO DOM
+  // → the ResizeObserver does NOT re-fire → maybeRestore never runs again →
+  // ready stays false → revealed() false → the transcript is stuck at
+  // opacity:0 forever (switch-away+back worked because on the 2nd visit the
+  // messages were resident AND delivered, so the ~:792 defer was bypassed). This
+  // effect re-runs maybeRestore precisely when delivered()/messageFailed()
+  // flip: with delivered() now true the ~:792 defer condition is false, so
+  // maybeRestore proceeds and sets ready. Safe + idempotent: maybeRestore
+  // early-returns once restoredFor===sid (set exactly when ready flips true), so
+  // this is a no-op once the view is restored. `on(...)` limits re-runs to the
+  // delivered/messageFailed signals only — NOT to the many reads inside
+  // maybeRestore (order, geometry) — so this can't hot-loop on streaming.
+  createEffect(
+    on(
+      () => delivered() || messageFailed(),
+      () => {
+        if (!ready()) maybeRestore();
+      },
+    ),
+  );
+  // P1-WEB reveal-gate latch arming: whenever the BASE reveal condition
+  // (positioned + delivered/failed) becomes true for THIS session — via ANY
+  // maybeRestore entry path (ResizeObserver, the rAF fallback, or the
+  // delivered-flip self-heal above) — record the session id in the latch so a
+  // later transient delivered() drop can't re-strand the shown transcript. Reads
+  // only reactive signals (no DOM), so it re-runs exactly on those flips.
+  createEffect(() => {
+    if (ready() && (delivered() || messageFailed())) setRevealedOnce(props.sessionId);
+  });
   createEffect(() => {
     const hidden = !props.draft && !revealed();
     if (!hidden) {
