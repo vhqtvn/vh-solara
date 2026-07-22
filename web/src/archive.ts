@@ -2,7 +2,7 @@
 // they're browsed on demand (paginated + lazy by subtree) so a project with
 // thousands of archived sessions never overloads the browser.
 import type { Session } from "./types";
-import { openSession, selectedId, setSelectedId } from "./sync";
+import { openSession, selectedId, setSelectedId, pruneSessionDeleted } from "./sync";
 import { clearReadAnchors } from "./lib/scroll";
 import { clearQueueCache } from "./queue";
 import { markRead } from "./notify";
@@ -45,6 +45,13 @@ export async function archiveSession(id: string): Promise<string[]> {
     // Archived sessions are gone from the live tree — ack any notifications for
     // them (finished, waiting, etc.) so they don't linger as unread.
     markRead((n) => affected.includes(n.sessionID || ""));
+    // Eagerly prune the affected sessions from the client tree. The server's
+    // RemoveSessions emits session.delete events that drive this normally, but
+    // a session that isn't in the server's live store (e.g. an orphan pruned
+    // server-side by a prior cascade or demotion) generates no delete event —
+    // so the client must prune it here based on the authoritative archive
+    // response. Idempotent: a later session.delete for the same id is a no-op.
+    for (const id of affected) pruneSessionDeleted(id);
   }
   if (selectedId() && affected.includes(selectedId()!)) setSelectedId(null);
   return affected;

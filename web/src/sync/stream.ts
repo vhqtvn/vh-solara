@@ -921,6 +921,34 @@ export function applySessionEvent(kind: string, seq: number, payload: any) {
   }
 }
 
+// pruneSessionDeleted removes a session from the client store as if a
+// session.delete event had arrived for it. Called eagerly from archive.ts
+// after a successful archive so the UI prunes immediately even when the
+// server did NOT emit a delete event — which happens when the archived
+// session was already absent from vh-solara's server-side live store (e.g.
+// an orphan pruned by a prior cascade or demotion), so RemoveSessions found
+// nothing to delete. Idempotent: a later session.delete for the same id is a
+// harmless re-delete of an already-absent key. Mirrors the session.delete
+// handler in applySessionEvent exactly (minus the cursor bump, which is an
+// event-seq concern the archive path doesn't carry).
+export function pruneSessionDeleted(id: string) {
+  setState(
+    produce((s) => {
+      delete s.sessions[id];
+      delete s.lastAgents[id];
+      delete s.messageWindows[id];
+      delete s.messagesLoaded[id];
+      delete s.messagesError[id];
+      delete s.refreshing[id];
+      delete s.branchStubs[id];
+    }),
+  );
+  resetPageInFlight(id);
+  invalidateChildrenIndex();
+  persist();
+  bumpBranchStructuralGen();
+}
+
 // Message/part events are applied only for opened sessions (those present in
 // state.messages) to bound memory. The mutation logic lives in ./lib/reduce.
 // trackCursor: whether this event should advance the persisted resume cursor.

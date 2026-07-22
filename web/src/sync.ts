@@ -179,3 +179,7 @@ export { loadOlder } from "./sync/stream";
 // Phase 5 — collapsed-branch lazy-expand / collapse actions (called from
 // StubNode's twisty in SessionTree).
 export { lazyExpandBranch, collapseBranch } from "./sync/stream";
+// Issue 5 — eagerly prune an archived session from the client tree even when
+// the server emits no delete event (the session was already absent from the
+// server-side live store). Called from archive.ts after a successful archive.
+export { pruneSessionDeleted } from "./sync/stream";

@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"sort"
@@ -96,9 +97,40 @@ func (s *Server) handleArchive(w http.ResponseWriter, r *http.Request) {
 	} else {
 		// The subtree is live, so cascade is computed from the store.
 		affected = agg.Store().Descendants(body.SessionID)
+		// Fallback: if the requested session isn't in the live store (e.g. an
+		// orphan whose parent was archived server-side — the orphan banner
+		// surfaces such sessions from the CLIENT store, but vh-solara's store
+		// may have already pruned it via a prior archive cascade or a demotion
+		// sweep), archive at least the requested id directly so OpenCode marks
+		// it archived and the client receives it in the affected list to prune.
+		if len(affected) == 0 {
+			affected = []string{body.SessionID}
+		}
 		ts := time.Now().UnixMilli()
 		for _, id := range affected {
 			if err := agg.Client().SetArchived(r.Context(), id, ts); err != nil {
+				// Distinguish "session is gone" (404/410) from everything else.
+				//
+				// 404/410 — the session doesn't exist in OpenCode (a ghost: the
+				// orphan banner surfaces sessions from the CLIENT store, but
+				// vh-solara's server store may have already pruned it, and
+				// OpenCode may have already cascade-deleted it when its ancestor
+				// was archived). The archive intent is satisfied — the session is
+				// verifiably gone — so tolerate: log, continue, and let
+				// RemoveSessions prune the tree below.
+				//
+				// All other statuses (400 schema rejection, 401/403 auth, 409
+				// conflict, 429 rate-limited, 5xx, network) mean the session IS
+				// still live in OpenCode or the server is broken. Abort so the
+				// archive does NOT reach RemoveSessions (which would fire
+				// KindSessionDelete → CleanupSession and delete the session's
+				// queue state). A failed archive must preserve the queue — the
+				// session may still be active. Return 502.
+				var ocErr *opencode.Error
+				if errors.As(err, &ocErr) && (ocErr.Status == http.StatusNotFound || ocErr.Status == http.StatusGone) {
+					log.Printf("[archive] SetArchived(%s): %v (session gone)", id, err)
+					continue
+				}
 				http.Error(w, err.Error(), http.StatusBadGateway)
 				return
 			}

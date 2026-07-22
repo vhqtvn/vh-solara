@@ -160,7 +160,7 @@ func (c *Client) SetArchived(ctx context.Context, id string, ts int64) error {
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
-		return fmt.Errorf("PATCH /session/%s: status %d: %s", id, resp.StatusCode, strings.TrimSpace(string(b)))
+		return statusErr("PATCH /session/"+id, resp.StatusCode, b)
 	}
 	return nil
 }
