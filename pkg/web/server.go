@@ -1555,6 +1555,17 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
+	// sweepTicker drives the time-driven demotion re-projection: when the
+	// store's demotion sweep detects a session has aged past the projection
+	// cutoff (a wall-clock transition no event fires for), it sets
+	// timeFrontierChanged. This ticker polls that signal at SweepInterval
+	// (derived from the cutoff) and, if set, CAS-claims it and arms the SAME
+	// promotion-coalesce path as ev.FrontierChanged — no second snapshot path.
+	// The CAS guarantees exactly ONE consumer wins the arm under many
+	// concurrent streams. Identical arm shape to the ev.FrontierChanged case
+	// below (gated on wantsProject).
+	sweepTicker := time.NewTicker(store.SweepInterval())
+	defer sweepTicker.Stop()
 	for {
 		select {
 		case <-r.Context().Done():
@@ -1625,6 +1636,18 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			if promoPending {
 				flushPromotion()
 				flusher.Flush()
+			}
+		case <-sweepTicker.C:
+			// Time-driven demotion: the store's sweep detected a session aged
+			// past the projection cutoff (a wall-clock crossing no event fires
+			// for). CAS-claim the signal so exactly ONE stream ships the
+			// demotion snapshot; then arm the IDENTICAL promotion-coalesce path
+			// as ev.FrontierChanged above (same timer, same flushPromotion — no
+			// second snapshot path). Non-projected streams (wantsProject=false)
+			// short-circuit before the CAS so they never steal the signal.
+			if wantsProject(r) && store.ConsumeTimeFrontierChange() && !promoPending {
+				promoPending = true
+				promoCoalesce.Reset(promotionCoalesceInterval)
 			}
 		case <-ticker.C:
 			// A NAMED ping event (not an SSE ` : comment`) so the client can observe

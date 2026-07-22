@@ -1095,6 +1095,27 @@ type Store struct {
 	// The stream handler gates the promotion coalesce arm on this per-event
 	// flag (wantsProject(r) && ev.FrontierChanged).
 	curFrontierChanged bool
+	// timeFrontierChanged (Phase 2 demotion sweep) is a SEPARATE atomic signal
+	// from curFrontierChanged / frontierSeq. The event-driven amplifier gate
+	// (ev.FrontierChanged) stays exactly as-is; this signal carries ONLY
+	// time-driven demotion (a session aging past the projection cutoff with no
+	// accompanying event). The sweep goroutine (RunDemotionSweep) sets it to
+	// true when it detects the active closure has SHRUNK since the last
+	// notification. Each consuming handleStream arm CAS-resets it to false via
+	// ConsumeTimeFrontierChange so exactly ONE stream ships the demotion
+	// snapshot (then the 150ms coalesce path dedupes further bursts).
+	timeFrontierChanged atomic.Bool
+	// lastNotifiedClosure (Phase 2 demotion sweep) is the baseline active-closure
+	// the sweep compares against to detect time-driven SHRINK. It mirrors "what
+	// clients currently see" — updated both by SnapshotProjected (the authority
+	// for the client's view) and by the sweep itself (so its baseline advances).
+	// Stored as an atomic.Pointer[map[string]bool] so concurrent RLock holders
+	// (multiple projected streams flushing promotions) can update it race-free
+	// without upgrading to the write lock. The pointed-to map is treated as
+	// immutable after store (computeActiveClosureLocked returns a fresh map each
+	// call). Nil (zero value) on a fresh store → the first sweep tick
+	// initializes it WITHOUT signaling (first-tick safety).
+	lastNotifiedClosure atomic.Pointer[map[string]bool]
 	// coldFetchActive marks sessions whose background full-history GET
 	// (EnsureMessagesAsync) is in flight. Live events that arrive while this
 	// flag is set tag their entries (liveTouchedBody / liveTouchedParts) so

@@ -2,6 +2,7 @@ package state
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"strings"
 	"sync/atomic"
@@ -64,11 +65,27 @@ type CollapsedBranchStub struct {
 // the client can detect a boundary change. Both are stamped in every projected
 // snapshot via projectionCutoff().
 //
-// Anti-thrash: demotion happens ONLY at snapshot construction (NOT on a timer).
-// The 15s ping ticker in handleStream stays ping-only — it does NOT trigger
-// re-projection. This is the anti-thrash guarantee: a session active every
-// 9:59 (just under 10min) never gets demoted between bursts because no snapshot
-// is constructed between them.
+// Anti-thrash: there are TWO distinct mechanisms, and only ONE constructs a
+// snapshot. The distinction is timer-driven-THRASH (forbidden) vs time-driven-
+// SWEEP (allowed).
+//
+//   - SNAPSHOT CONSTRUCTION is the only place a session actually demotes. A
+//     session active every 9:59 (just under 10min) never gets demoted between
+//     bursts because its lastActivityAt stays within the cutoff at every
+//     snapshot construction — it is never stub-eligible. No snapshot is
+//     constructed "between" bursts just because a timer fired.
+//
+//   - The 15s ping ticker in handleStream stays ping-only — it does NOT trigger
+//     re-projection (no timer-driven thrash).
+//
+//   - The demotion SWEEP (Store.RunDemotionSweep) is a SEPARATE, coarser signal.
+//     It ticks at SweepInterval (cutoff/10) and arms a re-projection ONLY when
+//     the active closure has genuinely SHRUNK since the last snapshot a client
+//     saw — i.e. a session aged PAST the cutoff (lastActivityAt + cutoff < now)
+//     with no accompanying event. A session touched within the cutoff is never
+//     stub-eligible, so the sweep never signals it. This preserves the
+//     anti-thrash guarantee: the sweep catches genuine aging, never timer-driven
+//     thrash. See RunDemotionSweep for the shrink-only rationale.
 var defaultProjectionCutoff = 10 * time.Minute
 
 // projectionCutoffVersion is the monotonic version of the cutoff policy. Bump
@@ -116,15 +133,191 @@ var (
 // v=0) to restore the production default (10m / version 1) and clear the
 // override — the shared e2e cluster MUST do this in a t.Cleanup so the tiny
 // cutoff does not leak into other tests in the same `go test` run. Race-safe:
-// backed by sync/atomic.
+// backed by sync/atomic. Also pokes the demotion-sweep goroutine so it
+// immediately re-derives SweepInterval (which derives from the cutoff) instead
+// of waiting for its possibly-1-minute-in-production next tick.
 func SetProjectionCutoffForTest(d time.Duration, v uint32) {
 	if d <= 0 || v == 0 {
 		projectionCutoffDurationOverride.Store(0)
 		projectionCutoffVersionOverride.Store(0)
+		notifyProjectionCutoffChanged()
 		return
 	}
 	projectionCutoffDurationOverride.Store(int64(d))
 	projectionCutoffVersionOverride.Store(v)
+	notifyProjectionCutoffChanged()
+}
+
+// projectionCutoffChanged is a non-blocking signal poked by
+// SetProjectionCutoffForTest so the demotion-sweep goroutine immediately
+// re-derives its ticker interval instead of waiting for the next (possibly
+// 1-minute-in-production) tick. Production never calls SetProjectionCutoffForTest,
+// so this is never signaled outside tests. Buffered (cap 1) so a poke never
+// blocks even if no sweep goroutine is listening (or has already exited on
+// ctx shutdown).
+var projectionCutoffChanged = make(chan struct{}, 1)
+
+// notifyProjectionCutoffChanged pokes the demotion-sweep goroutine without
+// blocking. Safe to call from any goroutine (used only by SetProjectionCutoffForTest).
+func notifyProjectionCutoffChanged() {
+	select {
+	case projectionCutoffChanged <- struct{}{}:
+	default:
+	}
+}
+
+// projectionCutoffDuration returns just the duration half of projectionCutoff.
+// Used by SweepInterval so the sweep cadence derives from the same policy a
+// snapshot uses (and SetProjectionCutoffForTest therefore shrinks both).
+func projectionCutoffDuration() time.Duration {
+	_, d := projectionCutoff()
+	return d
+}
+
+// SweepInterval is the period of the demotion-sweep ticker. It derives from the
+// projection cutoff (cutoff/10) so SetProjectionCutoffForTest shrinks it in
+// lockstep: a 250ms test cutoff → 25ms sweep; the 10m production default → 1m.
+// The 1ms floor guards against a cutoff/10 < 1ms pathologically-small override.
+// One sweep tick is a single RLock + closure recompute, so even a fast test
+// sweep is cheap; production ticks once per minute.
+func (s *Store) SweepInterval() time.Duration {
+	d := projectionCutoffDuration() / 10
+	if d < time.Millisecond {
+		d = time.Millisecond
+	}
+	return d
+}
+
+// ConsumeTimeFrontierChange atomically claims a pending time-driven demotion
+// signal. Returns true if this caller was the first to observe the signal (and
+// resets it); false otherwise. The CompareAndSwap guarantees that exactly ONE
+// handleStream consumer wins the arm even under many concurrent projected
+// streams, so the demotion snapshot ships once (then the coalesce path dedupes
+// any further bursts within the 150ms window). This is a SEPARATE signal from
+// the event-driven curFrontierChanged / frontierSeq amplifier gate, which stays
+// exactly as-is.
+//
+// Single-consumer fan-out note: the signal is a single store-wide consuming
+// atomic, so under 2+ concurrent projected (proj=1) streams only ONE ships the
+// demotion snapshot; the others retain the stale materialized session until
+// their next ev.FrontierChanged flush or a reconnect re-projects (eventual
+// consistency). Production is typically a single projected viewer (one operator
+// tab); no contract promises demotion delivery to all open projected streams.
+// If multi-viewer projected-stream support becomes a real surface, replace the
+// consuming CAS with per-stream "last consumed sweep seq" tracking.
+func (s *Store) ConsumeTimeFrontierChange() bool {
+	return s.timeFrontierChanged.CompareAndSwap(true, false)
+}
+
+// RunDemotionSweep is the ctx-bound goroutine that catches TIME-DRIVEN
+// demotion: a session that went idle at T becomes stub-eligible at T+cutoff,
+// but NO event fires at that crossing (setActivityLocked arms the event-driven
+// FrontierChanged flag only on idle→busy PROMOTION, not busy→idle). On a
+// long-lived already-open proj=1 stream, such a session would linger
+// materialized until an unrelated frontier change or a reconnect re-projects.
+//
+// The sweep closes that gap. Every SweepInterval, under s.mu RLock, it
+// recomputes the active closure and compares it against lastNotifiedClosure
+// (the baseline of "what clients have been told"). It signals (sets
+// timeFrontierChanged) ONLY on a genuine SHRINK — a session that was in the
+// baseline but is no longer in the active closure (it aged past cutoff). A
+// consuming handleStream arm then CAS-claims the signal and re-projects via
+// the existing promotion-coalesce path (no second snapshot path).
+//
+// Shrink-only is correct because stub→active-by-time is impossible: a stub
+// becomes active only when a NEW event touches it, which already arms via
+// ev.FrontierChanged. The sweep never needs to catch growth.
+//
+// Anti-thrash guarantee (preserved): a session whose lastActivityAt stays
+// within the cutoff is never stub-eligible → never leaves the active closure →
+// the sweep never signals it. A session touched every 9:59 (just under 10m)
+// stays in the closure across every tick. The sweep signals ONLY genuine aging
+// past the cutoff, never timer-driven thrash.
+//
+// The earliestRecencyExpiry advisory early-out described in the Phase-2 design
+// is intentionally OMITTED: maintaining it incrementally across every mutation
+// site (create/delete/reparent/activity) would replicate the
+// subtreeNewestActivity index's maintenance complexity for a negligible gain
+// (the sweep is one cheap RLock read + closure recompute, at most once per
+// SweepInterval). Correctness over the optimization: always recompute.
+//
+// First-tick safety: lastNotifiedClosure starts nil. The first tick
+// initializes it from the first active closure WITHOUT signaling (growth from
+// empty never fires a demotion).
+//
+// The ticker is re-derived when the cutoff policy changes (test override via
+// SetProjectionCutoffForTest) so the sweep cadence tracks the shrunk cutoff
+// without restarting the goroutine. Production never changes the cutoff, so
+// this branch is dead code in prod.
+//
+// Zero subscribers: the goroutine still ticks (one RLock read + one atomic
+// store when due) but no handleStream consumes → harmless. One goroutine per
+// store, bound to ctx → no leak.
+func (s *Store) RunDemotionSweep(ctx context.Context) {
+	interval := s.SweepInterval()
+	ticker := time.NewTicker(interval)
+	defer func() { ticker.Stop() }()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.sweepOnce()
+		case <-projectionCutoffChanged:
+			// The cutoff policy changed (test override). Re-derive the sweep
+			// cadence and sweep immediately — the new cutoff may have already
+			// crossed a demotion boundary. Production never signals here.
+			ni := s.SweepInterval()
+			if ni != interval {
+				ticker.Stop()
+				ticker = time.NewTicker(ni)
+				interval = ni
+			}
+			s.sweepOnce()
+		}
+	}
+}
+
+// sweepOnce performs one demotion-sweep tick. Factored out of RunDemotionSweep
+// so it is independently understandable. Caller does NOT hold s.mu.
+//
+// Race model: the sweep is a SINGLE goroutine, but SnapshotProjected (holding
+// RLock) also writes lastNotifiedClosure concurrently. lastNotifiedClosure is
+// an atomic.Pointer so both writers are race-free; the pointed-to map is
+// treated as immutable after store (computeActiveClosureLocked returns a fresh
+// map each call). A lost update (sweep stores, then a concurrent snapshot
+// stores a different map) is benign: the next tick re-derives from current
+// state, and the worst case is a demotion detected one tick late (within
+// SweepInterval).
+func (s *Store) sweepOnce() {
+	cutoff := time.Now().Add(-projectionCutoffDuration())
+	s.mu.RLock()
+	active := s.computeActiveClosureLocked(cutoff)
+	// Load the baseline (nil on the first tick → first-tick safety).
+	var baseline map[string]bool
+	if p := s.lastNotifiedClosure.Load(); p != nil {
+		baseline = *p
+	}
+	shrunk := false
+	if baseline != nil {
+		// Signal ONLY on shrink: an id present in the baseline but absent in
+		// the new active closure (a previously-materialized session that has
+		// aged past the cutoff and is now stub-eligible).
+		for id := range baseline {
+			if !active[id] {
+				shrunk = true
+				break
+			}
+		}
+	}
+	// Advance the baseline so the sweep only re-signals on FURTHER time-driven
+	// change. Mirrors SnapshotProjected's update. Both updates are race-free
+	// via the atomic.Pointer.
+	s.lastNotifiedClosure.Store(&active)
+	s.mu.RUnlock()
+	if shrunk {
+		s.timeFrontierChanged.Store(true)
+	}
 }
 
 // structuralKinds is the set of event kinds that affect the projection
@@ -325,6 +518,15 @@ func (s *Store) SnapshotProjected(messagesFor map[string]bool, cause string, hoi
 	cutoffVersion, cutoffDuration := projectionCutoff()
 	cutoff := time.Now().Add(-cutoffDuration)
 	active := s.computeActiveClosureLocked(cutoff)
+
+	// Phase 2 demotion sweep: the snapshot is the authority for "what clients
+	// now see". Mirror the active closure into lastNotifiedClosure so the
+	// sweep's shrink-detection baseline advances in lockstep — the sweep then
+	// only re-signals FURTHER time-driven change, not the promotion this
+	// snapshot just shipped. atomic.Pointer so concurrent RLock holders
+	// (multiple projected streams flushing promotions) update race-free. The
+	// pointed-to map is read-only for the rest of this function.
+	s.lastNotifiedClosure.Store(&active)
 
 	// Determine which sessions get messages. messagesFor nil → all active.
 	// messagesFor non-nil → only active sessions in messagesFor.
