@@ -218,3 +218,44 @@ until the blocking issues are resolved or the slice is re-scoped.
 When a prompt uses explicit phases, checkpoint at the phase boundaries that change the durable story: a gate definition, a protocol decision, a promotion/rollback recommendation, or a pre-closeout state change. Do not checkpoint every trivial substep.
 
 When a checkpoint records a material decision in the decision log, that entry should cross-reference the Verification-table row that grounded it and name the downstream artifact or checkpoint it authorizes — this carries the dependency link as prose, since the `episodic` record type already covers such remembered decisions and no new record type is introduced.
+
+## Premise-recheck protocol (load-bearing premises across boundaries)
+
+A **load-bearing premise** is a mutable fact a downstream step will act on as if
+true — e.g. "the profile does not select X", "the gate already passed", "the
+file exists at path P". When such a premise crosses a lossy boundary (handoff →
+specialist dispatch → `/resume-task` → post-compression re-entry), storing it as
+bare truth invites the stale-premise failure: a premise re-asserted after the
+fact it rested on has changed.
+
+Store every load-bearing premise as the **4-tuple**, not as a bare assertion:
+
+```
+(value, source, re_derivation_command, observed_at)
+```
+
+- `value` — the premise as asserted (e.g. "profile does not select X").
+- `source` — where the value came from (a parent summary, a prior session, a
+  handoff packet).
+- `re_derivation_command` — a cheap, side-effect-free command that reproduces
+  `value` from current ground truth (e.g. `grep capabilities <profile file>`,
+  a read-only `doctor` run, an `ls` / `test -f`).
+- `observed_at` — when `value` was last confirmed.
+
+Before acting on a load-bearing premise received across a boundary, run its
+`re_derivation_command`. If re-derivation disagrees with `value`, the premise is
+**stale** and must be **re-adjudicated** (re-read ground truth and update the
+tuple), never silently re-asserted.
+
+**This is a discipline, not a gate.** It is a required practice at the seams, not
+a mechanically-enforced check — no release-boundary or commit gate can see inside
+a session's own context, and the coordinator's own context — the compression
+boundary, where "at time T, X" quietly becomes "X" — is the structurally-hardest
+lossy surface of all. The protocol reduces stale-premise re-assertion in
+frequency; it does not eliminate it, and it depends entirely on the receiving
+session actually running the re-derivation rather than trusting the sender's
+summary.
+
+This applies at every handoff/dispatch/resume boundary: encode load-bearing
+premises as the 4-tuple when you send them (see `/handoff-save`), and re-derive
+the cheap ones when you receive them (see `/resume-task`).

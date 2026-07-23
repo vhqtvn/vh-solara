@@ -39,6 +39,7 @@ Workflow:
   - files in scope
   - current next action
   - report envelope required at closeout
+- before acting on any load-bearing premise carried in the resumed task card or its prior handoff, re-derive it: each such premise should be stored as the 4-tuple `(value, source, re_derivation_command, observed_at)`, so run its `re_derivation_command` (a cheap, side-effect-free command that reproduces `value` from current ground truth). If re-derivation disagrees with the stored `value`, the premise is stale — re-read ground truth and re-adjudicate instead of silently re-asserting it. This is the receiving-side premise-recheck discipline; it is a discipline, not a gate, and it depends on this session actually running the re-derivation.
 - consult `docs/ai/codebase-operational-primitives.md` for canonical paths, helper functions, container names, env conventions, and API response shapes before acting — do not rediscover these from scratch.
 - git mutations must flow through the `committer` agent via the gated-commit protocol. Load the `gated-commit` skill for details.
 - before raising any previously-blocked topic, check `.local/cleared-assumptions.yaml` for this workspace. At this point in the workflow the task contract may not yet have been refreshed for the resumed session, so use the cleared-assumptions ledger directly. If the operator has already cleared an assumption (for example, a license concern, a dependency constraint, or a tooling limitation), do not re-raise it as a new blocker.

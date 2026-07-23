@@ -36,10 +36,12 @@
 //     - Fail-closed: missing/malformed manifest, unsupported schema_version,
 //       unknown enum values, duplicate IDs, unsorted records, handshake
 //       mismatch (evaluated_commit/manifest_parent_commit/HEAD^,
-//       evaluated_tree/HEAD^{tree}, diff != [manifest path only]), wrong
-//       release_base, empty records without reconciliation.zero_records_confirmed,
-//       and any disposition-matrix refusal ALL produce blocker or
-//       evaluator-error. The handshake (sacred — do not weaken) prevents the
+//       evaluated_tree/HEAD^{tree}, diff != [manifest path only]),
+//       release_base kind=tag with no reachable prior tag (release_base.value
+//       is DERIVED on read from git and is authoritative; a stale attested
+//       value is a non-fatal advisory, not fail-closed), empty records without
+//       reconciliation.zero_records_confirmed, and any disposition-matrix
+//       refusal ALL produce blocker or evaluator-error. The handshake (sacred — do not weaken) prevents the
 //       manifest from being weakened after its claimed evaluation.
 //     - TWO distinct failure classes (the wrapper surfaces both explicitly):
 //       (a) The manifest itself is missing/malformed/stale → evaluator-error
@@ -478,15 +480,16 @@ function gitDiffHeadRange() {
     }
 }
 
-// The most recent reachable tag, or null if none exists. Used to validate
-// release_base.kind=tag against the discovered prior tag.
+// The most recent reachable tag, or null if none exists. Used to DERIVE the
+// authoritative release_base.value (kind=tag) on read. The manifest's attested
+// release_base.value is advisory; this derived value is authoritative.
 //
 // When `excludeVersion` is supplied (CI post-tag recheck forwards the just-cut
 // release tag via --release-version), that exact version is excluded from the
-// lookup so the function returns the PRIOR tag — the one the manifest's
-// release_base.value names. The wrapper's pre-tag invocation also forwards
-// --release-version, but the new tag does not exist yet at that point, so the
-// exclusion is a no-op there and the bare describe path remains equivalent.
+// lookup so the function returns the PRIOR tag. The wrapper's pre-tag
+// invocation also forwards --release-version, but the new tag does not exist
+// yet at that point, so the exclusion is a no-op there and the bare describe
+// path remains equivalent.
 function gitLatestTag(excludeVersion) {
     try {
         if (excludeVersion) {
@@ -497,13 +500,12 @@ function gitLatestTag(excludeVersion) {
             // Without it, a maintenance-branch release (e.g. v1.0.2 declaring
             // release_base v1.0.0) would incorrectly select an unrelated
             // higher mainline tag (v1.1.0 on main, unreachable from the
-            // maintenance branch HEAD), emit release_base mismatch, and CI's
-            // set -e would block GoReleaser publication. `--sort=-v:refname`
-            // is version-aware so v0.10.0 > v0.9.0 as expected. This handles
-            // both the linear CI post-tag case (the just-cut release tag is
-            // now the most recent reachable tag and the manifest's
-            // release_base names the prior reachable release) and the branched
-            // maintenance-release case.
+            // maintenance branch HEAD) and DERIVE the wrong release base.
+            // `--sort=-v:refname` is version-aware so v0.10.0 > v0.9.0 as
+            // expected. This handles both the linear CI post-tag case (the
+            // just-cut release tag is now the most recent reachable tag and
+            // release_base must resolve to the prior reachable release) and the
+            // branched maintenance-release case.
             const out = execFileSync(
                 "git", ["tag", "--merged", "HEAD", "--sort=-v:refname"],
                 { cwd: repoRoot(), encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
@@ -548,7 +550,9 @@ function validateOverrideObject(o, idx) {
 }
 
 // Validate the parsed manifest object against schema v1. Returns {ok:true} or
-// {ok:false,error:"..."}. Checks schema_version, release_base, evaluated_*,
+// {ok:false,error:"..."}. Checks schema_version, release_base SHAPE (kind +
+// well-formed value; the value is ADVISORY for kind=tag and is re-derived
+// authoritatively later in mainRelease step 6), evaluated_*,
 // manifest_parent_commit, reconciliation, per-record shape + enums + sort +
 // duplicate IDs + empty-records rule.
 function validateReleaseManifest(obj) {
@@ -761,6 +765,7 @@ function mainRelease(options) {
         blocking_ids: [],
         disclose_ids: [],
         evaluator_error_ids: [],
+        advisories: [],
         classification: "evaluator-error",
         error: null,
     };
@@ -857,20 +862,49 @@ function mainRelease(options) {
         return;
     }
 
-    // 6. Release base validation.
+    // 6. Release base: DERIVE-ON-READ (authoritative). release_base.value (when
+    //    kind=tag) is the last reachable tag — a mechanically-derivable fact the
+    //    evaluator already computes — so the DERIVED value is authoritative and
+    //    the manifest's attested value is ADVISORY. If the attested value
+    //    disagrees with the derived value, a non-fatal advisory is recorded (so
+    //    the operator can refresh the cosmetic field) but the release is NOT
+    //    blocked: the field can never go stale in a load-bearing way and
+    //    self-heals the current stale state with NO manifest write. kind
+    //    (root|tag) stays operator-attested (a genuine first-release vs
+    //    incremental-arc judgment); for kind=root no value is derived (whole
+    //    history is in scope regardless). This preserves INVARIANT #2 (the
+    //    evaluator is read-only — it writes nothing).
+    const advisories = [];
     if (obj.release_base.kind === "tag") {
         // When --release-version is supplied (CI post-tag recheck), exclude
-        // the just-cut release tag from the lookup so release_base is
-        // validated against the PRIOR tag the manifest names. Pre-tag
-        // wrapper invocations also forward --release-version, but the new
-        // tag does not exist yet so the exclusion is a no-op there.
-        const latest = gitLatestTag(releaseVersion);
-        if (latest !== obj.release_base.value) {
-            envelope.error = `release_base mismatch: manifest declares tag=${obj.release_base.value}; prior-tag lookup yields ${latest || "<none>"}`;
+        // the just-cut release tag from the lookup so release_base resolves to
+        // the PRIOR tag. Pre-tag wrapper invocations also forward
+        // --release-version, but the new tag does not exist yet so the
+        // exclusion is a no-op there.
+        const derived = gitLatestTag(releaseVersion);
+        if (derived === null) {
+            // kind=tag declares a prior-tag release, but no tag is reachable
+            // from HEAD (after excluding the release version). That is a
+            // genuine malformed-manifest state (a tag release with no prior
+            // tag), NOT a stale value — fail closed.
+            envelope.error = `release_base kind=tag but no prior tag reachable from HEAD (release_version=${releaseVersion || "<none>"}); a tag release requires a discoverable prior tag`;
             emitReleaseResult(envelope);
             return;
         }
+        // The DERIVED value is authoritative; echo it in the envelope so
+        // consumers see the truth, not the (possibly stale) attested field.
+        envelope.release_base = { kind: "tag", value: derived };
+        if (derived !== obj.release_base.value) {
+            advisories.push({
+                field: "release_base.value",
+                severity: "advisory",
+                attested: obj.release_base.value,
+                derived: derived,
+                note: "attested release_base.value is stale; evaluator derived the authoritative prior tag from git on read. The field is advisory (cannot block release); refresh it for cleanliness.",
+            });
+        }
     }
+    envelope.advisories = advisories;
     // kind=root: first release. Whole history is in scope; the manifest attests
     // relevance for that whole-history arc. No HEAD~32 fallback in manifest mode.
 

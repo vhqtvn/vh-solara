@@ -20,6 +20,7 @@ Workflow:
   - current status
   - exact files or outputs that matter
   - constraints and non-goals from the task contract
+  - any load-bearing premise the receiver will act on, encoded as the 4-tuple `(value, source, re_derivation_command, observed_at)` — NOT as bare truth. `re_derivation_command` is a cheap, side-effect-free command the receiver runs to reproduce `value` from current ground truth; on disagreement the premise is stale and must be re-adjudicated. This is a sender-side discipline, not a gate — it only helps if the receiver actually re-derives (see `/resume-task`).
   - the active workstream name and next-slice context when relevant
   - what should not be re-done
   - the immediate next step

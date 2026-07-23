@@ -67,6 +67,52 @@ other edit decision stays denied (findLast — last match wins).
 
 Adjust the `vh-agent-harness exec ...` allowlist to exact repo-safe commands only.
 
+## 3a) Read-only harness specialist template
+
+For a specialist that may invoke `vh-agent-harness` only through its safe
+read-only surface, set `"harnessPolicy": "read_only"` in the
+permission-pack. The Go emitter renders the deny-first + canonical-allows-after
+shape below automatically — do not hand-write the bash entries, because the
+canonical verb list is Go-owned and may grow in future releases.
+
+Permission-pack input (`.vh-agent-harness/overlays/<pack>/permission-pack.jsonc`):
+
+```jsonc
+{
+  "agents": {
+    "my-auditor": {
+      "harnessPolicy": "read_only"
+    }
+  }
+}
+```
+
+Rendered `opencode.jsonc` bash block (abbreviated — the full canonical list
+has ~28 verbs):
+
+```jsonc
+{
+  "bash": {
+    "*": "deny",
+    "ls *": "allow",
+    "rg *": "allow",
+    "git status *": "allow",
+    "vh-agent-harness *": "deny",
+    "vh-agent-harness exec-ro *": "allow",
+    "vh-agent-harness doctor": "allow",
+    "vh-agent-harness doctor *": "allow",
+    "vh-agent-harness status": "allow",
+    "vh-agent-harness docs *": "allow"
+  }
+}
+```
+
+The trailing `"vh-agent-harness *": "deny"` catches every non-canonical verb
+(mutation, artifact, unknown); the specific `allow` entries after it win under
+findLast. Mutation verbs (`exec`, `shell`, `update`, …) and broad wildcards
+(`skill *`, `overlay *`) are excluded and stay denied. The legacy `harness` and
+`devSh` keys also accept `"read_only"` for backward compatibility.
+
 ## 3) Editable specialist template
 
 ```jsonc
