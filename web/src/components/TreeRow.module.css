@@ -1,0 +1,16 @@
+/* TreeRow — server-owned session tree node row.
+   docs/design/server-owned-tree.md §3.
+   The row reuses the legacy GLOBAL `tree-*` classes (legacy.css) so it visually
+   matches the existing sidebar tree without a full CSS-module migration. This
+   co-located module holds ONLY styles new to TreeRow: the "▸ N" descendant-count
+   badge on a collapsed (loaded:false) node. See
+   docs/ai/web-css-architecture.md for the module-vs-global convention. */
+
+/* The ▸ glyph + count come from the text content; tree-count supplies the pill.
+   This badge marks a COLLAPSED-subtree count (not a loaded-children count), so
+   it is non-interactive and not selectable — clicking it must not read as a
+   title/row interaction. */
+.descendantBadge {
+  cursor: default;
+  user-select: none;
+}
