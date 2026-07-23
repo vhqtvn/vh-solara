@@ -1,11 +1,4 @@
-# Server-Owned Session Tree — Phase 1 Design
-
-> **PLACEMENT NOTE:** This is the Phase 1 deliverable intended for
-> `docs/design/server-owned-tree.md`. The researcher subagent that produced it
-> is read-only (edit access limited to `tmp/**`), so it was written here. A
-> write-capable agent (e.g. `docs-steward`/`build`) or the operator should move
-> it to `docs/design/server-owned-tree.md` (creating the `docs/design/` dir)
-> during review.
+# Server-Owned Session Tree — Phase 1 Design (rev. 1 — post-review)
 
 **Status:** Phase 1 DESIGN DOC ONLY. Read-only research + design. No code.
 **Baseline HEAD:** `52a3fd0` (verified `git rev-parse --short HEAD`).
@@ -18,6 +11,32 @@ are unrelated to this design and were not touched by this read-only task.
 **Hard keep-out:** `web/src/lib/streamMd.ts` and `web/src/components/Part.tsx`
 must NEVER be modified by this effort (WebRender / GPU stability — see
 AGENTS.md → "Web frontend performance"). Phase 2/3/4 MUST route around them.
+
+> **Revision 1 (post-review) — what changed.** v1 (commit `4e06e16`) was
+> approved in direction; this revision closes the 4 gaps the reviewer found
+> before Phase 2 may start:
+> - **R1 (§5 reworked):** TRUE lazy frontier. Cold load is now
+>   `O(roots + active-path depth + direct-children-of-loaded)`, NOT
+>   `O(total sessions)`. Deep idle subtrees are no longer pre-shipped.
+> - **R2 (§5.4 new):** per-stream loaded-set — the server-tracked
+>   expanded-set that makes true-lazy drift-proof.
+> - **R3 (§5.5 new):** reconnect / op-replay — monotonic `seq` on the delta
+>   envelope, bounded-ring replay on stream drop, snapshot fallback on a
+>   ring-gap.
+> - **R4 (§6.2 new):** server reconcile vs OpenCode's authoritative `/session`
+>   list — corrective `node.remove`/`node.upsert`/archive re-assert that
+>   absorbs OpenCode's flakiness in one server-side place; folds the existing
+>   archive re-assert + resurrection tombstone into one loop.
+> - **Node schema:** `descendantCount?` added (D1 refined); the one allowed
+>   subtree-aggregate badge `flags.subtreeNeedsInput` added (Q2 resolved).
+> - **R3 (§6.1, elevated):** parent-before-child op ordering is now a HARD
+>   emitter invariant, not a Phase-2 detail.
+> - **Open questions:** Q1–Q5 resolved; O1 resolved and removed (verified
+>   citation `aggregator.go:773`/`:848`).
+>
+> Two reviewer code citations were verified against the tree before being
+> baked in; one (the "no children endpoint" claim) was corrected — see §6.2
+> and the closeout summary.
 
 ---
 
@@ -280,15 +299,34 @@ its own row, agent chip, flags, and pin eligibility.
     }
   },
   "childCount": 3,                  // DIRECT children count (len(children[id])).
+                                    //   STRUCTURAL — what an expand fetches.
                                     //   NOT total descendants. 0 = leaf.
+  "descendantCount": 533,           // OPTIONAL. TOTAL descendants (the whole
+                                    //   subtree below this node). Populated by
+                                    //   the server for COLLAPSED/unloaded nodes
+                                    //   so a collapsed root can render "▸ 533"
+                                    //   without loading its subtree. Absent (or
+                                    //   equal to childCount-derived) once the
+                                    //   subtree is loaded/expanded — the client
+                                    //   then derives the badge from the loaded
+                                    //   flat map. Source: subtreeDescendantCount
+                                    //   index (subtree_indexes.go). See D1.
   "loaded": false,                  // SERVER sets true ONLY in an initial
                                     //   snapshot for nodes whose children are
                                     //   also shipped (active path) or in a
                                     //   node.children op. Client may flip
                                     //   false on collapse (§8).
   "flags": {
-    "pendingInput": false,          // question set and unanswered (subtreePendingInput-aware).
-    "permission":   false,          // permissions[id] non-empty.
+    "pendingInput": false,          // SELF: question set and unanswered for THIS node.
+    "subtreeNeedsInput": false,     // SUBTREE aggregate (the ONE allowed — Q2).
+                                    //   SERVER-COMPUTED from subtreePendingInput
+                                    //   index (subtree_indexes.go): true iff THIS
+                                    //   node OR any descendant has pendingInput.
+                                    //   Propagated up the ancestor chain so an
+                                    //   ancestor shows a single "needs-input" dot
+                                    //   without the client walking the tree.
+                                    //   Client never sets; only displays the dot.
+    "permission":   false,          // SELF: permissions[id] non-empty.
     "archived":     false,          // session archived facet (pkg/web/archive.go).
     "orphan":       false           // SERVER-COMPUTED ONLY (§9). Client never sets.
   },
@@ -307,23 +345,46 @@ loaded, flags, updatedMs}`. Fields added here, each grounded in existing data:
   already exists (`currentVerbs` snapshot field, `types.ts:102`/`:170`, and the
   live `activity.verb` event). Omitting it would regress the current
   subagent-activity UX, so it is a first-class Node field.
+- **`descendantCount`** (optional). The true-lazy frontier (R1/§5) ships a
+  collapsed root WITHOUT its subtree; the row still needs a "▸ 533 sessions"
+  affordance so the user knows the subtree is large. `childCount` alone (direct
+  children) would show "▸ 4" for a root that has 4 direct children but 533
+  descendants — a UX regression. `descendantCount` is the total-descendants
+  badge, sourced from the already-maintained `subtreeDescendantCount` index
+  (`subtree_indexes.go`). It is populated for collapsed/unloaded nodes and may
+  be omitted once the subtree is loaded. See decision D1.
 - **`flags.pendingInput` / `flags.permission` / `flags.archived`** as discrete
   booleans rather than a free map. These are the exact facets the current
   branch-stub `aggregateState:"needs-input"` encoded opaquely
   (`projection.go:21`). Making them explicit booleans is what lets a collapsed
   node render its own pins/badges (kills bug #5).
+- **`flags.subtreeNeedsInput`** (Q2 resolved). The ONE subtree-aggregate badge
+  retained. It lets a collapsed ancestor show a "needs-input" dot (the user's
+  most actionable subtree signal) without the client walking a subtree it has
+  not loaded. All other subtree aggregation is dropped — the client never
+  classifies; the server surfaces this single flag up the ancestor chain.
 
 ### 3.2 Fields deliberately NOT on the Node
 
 - **`model`** — constant per project; stays in the hoisted `projectConstants`
   (`types.ts:54`), resolved via `selectors.sessionModel`. Not tree display data.
-- **`aggregateState` / `descendantCount`** — these were `CollapsedBranchStub`
-  fields (`projection.go:21`). `descendantCount` (total) is dropped in favor of
-  `childCount` (direct), which is what an expander needs. No subtree aggregate
-  state: the client does not classify; the server surfaces the meaningful
-  facets via the discrete `flags.*` booleans + `activity`.
+- **`aggregateState`** — the opaque `CollapsedBranchStub` field
+  (`projection.go:21`) is dropped. It is replaced by the explicit discrete
+  `flags.*` booleans + `activity` + the single `flags.subtreeNeedsInput`
+  subtree dot (Q2). No free-form subtree "state": the client does not classify.
 - **`structuralRevision` / `cutoffVersion`** — projection-layer bookkeeping
   (`types.ts:113`/`:124`), deleted with the projection.
+
+> **Decision D1 (revised — supersedes the v1 "drop descendantCount" stance).**
+> The Node carries BOTH `childCount` (DIRECT children — structural, drives the
+> expand) AND `descendantCount` (TOTAL descendants — the "▸ N" badge, populated
+> for collapsed/unloaded nodes). v1 dropped `descendantCount` in favor of
+> `childCount` alone; review found that a collapsed root showing "4 direct
+> children" instead of "533 sessions" is a UX regression that undersells a
+> large idle subtree. `childCount` stays exact-direct; `descendantCount` is the
+> separate badge field sourced from `subtreeDescendantCount`. (Q2's "drop all
+> subtree aggregation" is likewise refined: exactly ONE aggregate —
+> `subtreeNeedsInput` — is kept; `descendantCount` is a count, not a state.)
 
 ### 3.3 Consistency guarantee
 
@@ -347,6 +408,13 @@ All ops are wrapped in a single envelope that carries scope.
 {
   "dir": "/home/op/repo",   // project directory scope (reqDir). Optional on a
                             //   stream already scoped to one dir.
+  "seq": 1042,              // monotonic per-stream op sequence (R3/§5.5).
+                            //   Strictly increasing within one (epoch). The
+                            //   client persists the last applied seq as its
+                            //   resume cursor; on reconnect the server replays
+                            //   ops with seq > cursor from a bounded ring.
+                            //   Mirrors the existing ClientEvent.Seq +
+                            //   ringBuffer mechanism (store.go:121, ring.go).
   "sessionId": null,        // OPTIONAL: the session this op is most relevant to
                             //   (e.g. the child for node.upsert). UI hint only;
                             //   structural authority is the op fields below.
@@ -425,57 +493,250 @@ A bandwidth-friendly variant of `node.upsert` for the high-frequency facets
 partial merge and `upsert` as a full replace of the Node. All fields in `data`
 except `id` are optional.
 
+### 4.7 Emitter invariants (HARD — enforced at emit, not "Phase 2 detail")
+
+The emitter MUST guarantee both invariants below on every flush. They are the
+linchpin of the core-principle-1 promise ("the client never guesses / the
+server owns structure"). A violation is a bug, not a tuning choice.
+
+- **INV-A — monotonic `seq`.** Every op carries a `seq` strictly greater than
+  the previous op on the same stream. `seq` is assigned at emit time, under
+  the same lock that produces the op, so concurrent producers cannot interleave
+  out of order. (R3/§5.5 relies on this for replay.)
+- **INV-B — parent-before-child, within a flush.** Within any single flush, a
+  parent's `node.upsert`/`node.children` MUST precede any child op that
+  references that parent (`node.upsert`/`node.move`/`node.children` whose
+  `parentId`/`newParentId` is the just-introduced parent). Rationale: a child
+  arriving before its parent would force the client to either **guess** a
+  placeholder parent or **drop** the child until the parent appears — and both
+  are exactly the dual-ownership derivation the rewrite exists to kill. The
+  client apply logic (§7.2) is written assuming this holds: a `node.upsert`/
+  `node.move` whose parent is absent is a programming error on the server side,
+  not a recoverable client state. This elevates v1's §6.1-R3 risk note ("state
+  explicitly in Phase 2") to a hard, testable emit-time invariant. Phase 2
+  implements an emitter unit test that asserts INV-B across every event in the
+  §6 table (driven through `Apply`) and every §6.2 reconcile flush.
+
+  The one permitted relaxation: a parent may be shipped as a collapsed
+  placeholder (`loaded:false`, carrying `descendantCount`) in the same flush
+  that ships its children — the placeholder IS the parent, so the child's
+  `parentId` resolves. What is forbidden is the child preceding the *first*
+  appearance of its parent on that client.
+
 ---
 
-## 5. Initial snapshot composition
+## 5. Initial snapshot composition (TRUE LAZY FRONTIER — R1)
 
-On cold load (a new `tree=2` stream connection), the server emits a single
-snapshot consisting of **three categories** of nodes:
+> **R1 rework (post-review).** v1's §5 shipped a self-contained placeholder for
+> EVERY known node, so cold load was still `O(total sessions)` (~1047 nodes for
+> the `deep-fake-detection` project; ~1 MB). That missed the entire motivation
+> of the rewrite: idle sessions accumulate without bound, and a cold load that
+> touches every one of them re-introduces the "ship the whole tree" cost the
+> server-owned model was meant to kill. This section is reworked so cold load is
+> `O(visible frontier)`, independent of total session count.
+
+On cold load (a new `tree=2` stream connection), the server emits a snapshot
+consisting of **exactly three categories** of nodes — and NOTHING else:
 
 1. **All roots** — every node with `effectiveParentOfLocked == ""`
-   (`subtree_indexes.go:267`): `parentId:null`, `loaded` per category 3 below.
-2. **The active path(s) to running sessions** — for every session whose SELF
-   activity is non-idle (`activity != "idle"`, i.e. `busy`/`retry`/`error`) OR
-   that has an open permission/question (`flags.permission`/`pendingInput`),
-   the server emits that session **and every ancestor up to its root**, each as
-   a full Node with `loaded:true`. This replaces the active-closure descent
-   (`projection.go:432`/`:444`) with a deterministic, *fully-loaded* path rather
-   than a stub frontier.
-3. **Collapsed placeholders for every other known node** — every node not in
-   categories 1–2 is emitted as a full Node (self-contained, §3) with
-   `loaded:false` and an accurate `childCount`. The client renders it as a row
-   with a `▸ N` expander; expanding triggers §8.
+   (`subtree_indexes.go:267`), emitted as collapsed placeholders (`loaded:false`)
+   carrying their `childCount` and `descendantCount` (the "▸ N" affordance, D1).
+   A root is shipped because the user always sees the top level; its deep
+   subtree is NOT.
+2. **The active path(s) to running sessions, fully loaded.** For every session
+   `S` on an active path (§5.1), the server emits `S` **and every ancestor up to
+   its root**, each as a full Node with `loaded:true`. This replaces the
+   active-closure descent (`projection.go:432`/`:444`) with a deterministic,
+   fully-loaded path rather than a stub frontier.
+3. **ONLY the DIRECT children of every loaded node, as collapsed placeholders.**
+   For each node shipped in categories 1–2 that is `loaded:true`, the server
+   emits its DIRECT children (one level down) as collapsed placeholders
+   (`loaded:false`, carrying their own `childCount`/`descendantCount`). This is
+   what lets the user expand any visible row one level without a round-trip for
+   the immediate next layer. The direct children's OWN subtrees are NOT shipped.
 
-### 5.1 "Active path" — precise definition
+**Deep idle subtrees are NOT shipped on cold load.** A collapsed root with 533
+descendants ships as ONE node rendering "▸ 533" (via `descendantCount`); its
+entire subtree is fetched on expand (§8), not on cold load. This is the
+contrast with v1, which shipped all 533 as placeholders.
+
+### 5.0 Cold-load complexity (explicit)
+
+The cold-load snapshot size is:
+
+```
+O( roots + (active-path nodes) + (direct children of every loaded node) )
+```
+
+It is **NOT** `O(total sessions)`. Concretely it is bounded by
+`roots + Σ(depth of each active path) + Σ(childCount of each loaded node)`. The
+two sums depend on how many sessions are *currently live* and how wide the
+loaded nodes are — NOT on how many idle sessions have accumulated historically.
+A project with 10 live sessions and 50 000 archived/idle ancestors pays for
+~10 active paths + their direct children, NOT 50 000 nodes. Idle-session growth
+does NOT make cold load larger, slower, or heavier — which is the whole point.
+
+> **UX tradeoff vs v1 (acknowledged, accepted).** Under v1 every node was
+> pre-shipped, so opening an old, idle subagent result was instant. Under
+> true-lazy, expanding a collapsed idle subtree costs one round-trip (§8). This
+> is the correct tradeoff: the user rarely opens old subagent results, and
+> paying one expand round-trip on the rare open is far cheaper than paying
+> `O(total sessions)` on EVERY cold load/reload/reconnect. The always-visible
+> surfaces (roots, live work, one level of expand affordance) remain instant.
+
+### 5.1 "Active path" — precise definition (Q1 resolved)
 
 A session `S` is on an active path iff `S.activity ∈ {busy,retry,error}` OR
 `S.flags.permission` OR `S.flags.pendingInput`. The active path *of* `S` is
-`[S, parent(S), parent(parent(S)), … root]`. The union of all active paths,
-plus all roots, plus all other nodes as collapsed placeholders, is the initial
-snapshot.
+`[S, parent(S), parent(parent(S)), … root]`. **An archived session NEVER seeds
+an active path** (Q1) — even if it is nominally busy in `/session/status`, an
+archived root is stale-by-definition and must not pull its subtree into the
+loaded frontier. The union of all (non-archived) active paths, plus all roots
+(category 1), plus the direct-children placeholders (category 3), is the cold
+snapshot. Everything else is absent until expanded.
 
-### 5.2 `loaded` in the initial set
+### 5.2 `loaded` in the initial set (re-derived for true-lazy)
 
-- `loaded:true` for every node in categories 1–2 **whose own children are also
-  in the snapshot** — i.e. roots and active-path nodes whose children sit on an
-  active path. (A root with active children has those children present, so the
-  root is `loaded:true`.)
-- `loaded:false` for every placeholder in category 3, and for any category-1/2
-  node whose children are NOT in the snapshot (a leaf active session with
-  unloaded siblings).
+- `loaded:true` for every node in category 2 **whose own direct children are
+  also shipped** — i.e. an active-path node whose children are themselves on an
+  active path (category 2) OR are shipped as the direct-children placeholders
+  (category 3). A root on an active path whose children are shipped as category
+  3 is therefore `loaded:true`.
+- `loaded:false` for: every root placeholder (category 1, unless it is also on
+  an active path and has shipped children); every category-3 direct-child
+  placeholder; and any active-path leaf whose children are NOT shipped.
+- The `loaded` bit is exactly "does this client currently hold this node's
+  direct children?" — and the server's per-stream record of that answer is the
+  subject of §5.4.
 
-> **Design decision for review (Q1):** is "active path = non-idle OR
-> permission OR pendingInput" the right frontier? It is broader than today's
-> `computeActiveClosureLocked` (which uses the cutoff), which is the point —
-> we want the live-interest frontier fully loaded with no stubs. Reviewer
-> should confirm the activity predicate and whether `archived` sessions should
-> ever seed an active path (default: no).
+### 5.3 Composition rule + no-flatten guarantee
 
-### 5.3 No flatten risk
+**Composition rule:** the snapshot is the minimal set that makes the
+always-visible surfaces (top level + live work + one expand level) render
+without a round-trip, and NOTHING more. Because there are no ephemeral
+`branchStubs` (§11), no "materialized vs stub" concept (§3), and every shipped
+node is self-contained, a reload simply re-fetches this small snapshot. The
+flatten-on-load bug (#2) is structurally impossible: there is no large
+materialized tree to lose and re-derive.
 
-Because there are no ephemeral `branchStubs` (§11) and every node is
-self-contained, a reload simply re-fetches this snapshot. The flatten-on-load
-bug (#2) is structurally impossible.
+### 5.4 Per-stream loaded set — true-lazy bookkeeping (R2, NEW)
+
+> True lazy forces the server to know, per connection, which nodes that client
+> has expanded — because that is exactly what decides "push the real child ops"
+> vs. "just bump the parent's aggregate counts." This per-stream state is
+> PRECISELY where new drift could re-creep (the thing this rewrite kills), so it
+> gets a dedicated, drift-proof specification.
+
+**Model chosen — Option A (server-tracked expanded-set; client never echoes
+structure).** The server maintains, per `tree=2` stream connection, an
+**expanded-set** `E_c ⊆ ids` — the set of nodes that connection has loaded the
+direct children of. It is populated in exactly two ways:
+
+1. **Initial snapshot (§5):** `E_c` is seeded to the set of nodes shipped
+   `loaded:true` (category-2 active-path nodes whose children are present).
+2. **Explicit expand (§8):** when connection `c` completes a `node.children`
+   terminal batch (`hasMore:false`) for parent `P`, the server adds `P` to
+   `E_c`. A collapse (client-only, §8.4) is reported back as a `loaded:false`
+   hint but the server may keep `P ∈ E_c` briefly; the correctness does NOT
+   depend on the client echoing collapse.
+
+Given `E_c`, the emit rule on ANY structural change to a parent `P` is
+deterministic and has NO client-guess surface:
+
+- **If `P ∈ E_c` (loaded on this connection):** emit the REAL child op —
+  `node.children` (for a new-child batch) or `node.upsert`/`node.move`/
+  `node.remove` for the individual child — so the client's loaded subtree stays
+  exact. Also bump `P`'s `childCount`/`descendantCount` via `node.facet`/`
+  node.upsert` if they changed.
+- **If `P ∉ E_c` (collapsed on this connection):** emit ONLY a `node.facet` (or
+  the count fields of a `node.upsert`) on `P` — i.e. `childCount` and
+  `descendantCount` adjust, and `flags.subtreeNeedsInput` (Q2) propagates — but
+  NO child `node.upsert`/`node.children`/`node.move` for `P`'s children is sent.
+  The client's collapsed row simply re-renders "▸ N±1".
+
+**Why this cannot diverge (justification against core principle 1).** The
+client NEVER decides whether a child op applies; it NEVER echoes its loaded-set
+as structural authority (Option B was rejected precisely because a client-echoed
+set is a second source of structure truth). Structure authority flows one way:
+the server's `E_c` decides what is pushed, and `E_c` itself is built only from
+server-observed events (the §5 seed and the §8 expand requests the server
+received). The client's only inputs are: apply every op verbatim (§7), and send
+expand requests (§8). There is no code path by which the client can observe a
+structure the server did not intend: a child op is sent iff the server believes
+this connection has the parent loaded, and that belief is set by the server's
+own record of what it shipped / what expand it served.
+
+**Reconnect interaction (R3/§5.5).** `E_c` is per-CONNECTION, not persisted
+across reconnects. On a stream drop+resume, the resume cursor (§5.5) replays
+missed ops, and the reconnect baseline is re-established from the §5 snapshot
+seed (which re-derives `E_c`) on a ring-gap. So a reconnect can never leave
+`E_c` stale relative to what the client actually holds: either the ring replay
+covers the gap (and `E_c` is unchanged, matching the client's unchanged loaded
+set), or a fresh snapshot re-seeds both the flat map AND `E_c` together. The two
+never disagree.
+
+**Phase 2 implementation note.** `E_c` lives in the per-connection stream state
+beside the existing subscriber channel (`server.go` `handleStream` per-conn
+state). It is updated under the same emit lock that enforces INV-A/INV-B (§4.7),
+so "add P to E_c" and "emit the children batch" are atomic w.r.t. concurrent
+structural events. Phase 2 adds an emitter unit test that, for each event in the
+§6 table, asserts the correct branch (real child op vs. count-only facet) was
+taken for both `P ∈ E_c` and `P ∉ E_c`.
+
+### 5.5 Reconnect / op-replay (R3, NEW)
+
+> §5.0–5.4 cover cold load. NOTHING in v1 covered the stream DROPPING and
+> reopening — which is frequent (tunnel blip, browser sleep, EventSource
+> auto-reconnect) and which silently clobbered a model selection in production.
+> This section makes resume a first-class part of the protocol. It mirrors the
+> existing Stream1 cursor/replay semantics already in the tree (cited below) so
+> Phase 2 reuses rather than reinvents.
+
+**Protocol.**
+
+1. **Monotonic `seq` (INV-A, §4.7).** Every tree=2 op envelope carries a `seq`
+   strictly increasing within one daemon epoch. The client persists the last
+   APPLIED `seq` as its resume `cursor` (alongside the existing Stream1
+   `state.cursor`, `web/src/sync/stream.ts:106`). On a tree=2 stream the
+   `cursor` is the tree-op cursor specifically.
+2. **Resume from cursor.** When the `tree=2` EventSource reconnects, the client
+   sends its last tree `cursor` (query param, mirroring the existing
+   `?cursor=`/`Last-Event-ID` resume in `pkg/web/server.go:1404-1417`). The
+   server **replays missed ops with `seq > cursor` from a bounded ring** —
+   exactly the existing `ringBuffer.since(cursor, head)` mechanism
+   (`pkg/state/ring.go:55`, used today via `store.Replay(cursor)` at
+   `pkg/web/server.go:1467`). The tree=2 op stream gets its own ring (or a
+   filtered view of the existing one); the semantics are identical: returns the
+   ops strictly after `cursor` in insertion order, plus the current `head`, plus
+   an `ok` flag.
+3. **Ring-gap fallback.** If `cursor` is too old (older than the oldest retained
+   op — `ring.since` returns `ok=false`, `ring.go:63-65`), the server falls back
+   to a FRESH §5 snapshot (cause `"reconnect"`) and the client re-seeds its flat
+   map + `E_c` from scratch. This mirrors today's `hasCursor && !replayOK`
+   silent-snapshot fallback (`pkg/web/server.go:1513-1518`). A reconnect MUST
+   NOT re-ship the whole tree by default — only on a ring-gap, which is rare
+   (ring is sized for the blip/sleep window).
+4. **Subscribe-before-baseline.** The server subscribes the new connection to
+   the live tail BEFORE resolving the replay baseline, so no op slips through
+   the gap between replay and live (mirrors `pkg/web/server.go:1448-1449`).
+5. **Corrective ops flow through replay too.** The §6.2 server-reconcile
+   corrective ops carry `seq` like any other op, so a reconnect that spans a
+   reconcile tick replays them — no special-case reconnect handling for
+   reconcile.
+
+**What is reused (cite-back for Phase 2).** The entire cursor/replay
+substructure already exists for Stream1 and the message layer: the bounded
+`ringBuffer` (`pkg/state/ring.go:10-76`), `ClientEvent.Seq`
+(`pkg/state/store.go:121`), the `(epoch, seq)` resume-key semantics
+(`Snapshot.Epoch`/`Seq` `pkg/state/store.go:153-154` — seq resets per daemon
+restart, so a cursor is valid only within one epoch), `store.Replay(cursor)`
+(call site `pkg/web/server.go:1467`), the cursor/`Last-Event-ID` resume wiring
+(`pkg/web/server.go:1404-1417`), the ring-gap snapshot fallback
+(`pkg/web/server.go:1513-1518`), and the client cursor advance on snapshot +
+event (`web/src/sync/stream.ts:623`/`:857` snapshot, `:910`/`:1128` event, with
+the `trackCursor` discipline at `:954-961`). Phase 2's tree=2 work is to route
+tree ops through the SAME ring + cursor plumbing with a `tree=2`-scoped
+subscriber interest, NOT to build a new replay system.
 
 ---
 
@@ -487,10 +748,10 @@ re-derives structure.
 
 | Store / internal event | Emitted delta op(s) | Notes |
 |---|---|---|
-| Session created (`KindSessionUpsert`, new id) | `node.upsert{node}` for the new session; **plus** `node.children` push to its parent if the parent is `loaded:true` on a connected client (server tracks per-stream loaded set); **plus** a `node.facet{childCount:+1}` or `node.upsert` on the parent to bump its `childCount`. | `maintainChildrenOnSessionUpsertLocked` (`subtree_indexes.go:325`) already reabsorbs orphaned children — if the new session re-parents existing orphans, emit `node.move` for each reabsorbed child. |
+| Session created (`KindSessionUpsert`, new id) | `node.upsert{node}` for the new session; **plus**, per-connection per §5.4: if the parent `P ∈ E_c` (loaded on this connection), a `node.children` push carrying the new child AND a `node.facet{childCount:+1}` (and `descendantCount:+1` up the ancestor chain) on `P`; if `P ∉ E_c`, ONLY a `node.facet{childCount:+1, descendantCount:+1}` on `P` and its ancestors (no child op — the client's collapsed row just re-renders "▸ N±1"). | `maintainChildrenOnSessionUpsertLocked` (`subtree_indexes.go:325`) already reabsorbs orphaned children — if the new session re-parents existing orphans, emit `node.move` for each reabsorbed child. |
 | Session title/agent/activity/verb updated (`KindActivity`, or `KindSessionUpsert` with changed fields) | `node.facet{id, activity?, verb?}` (high-frequency path) OR `node.upsert{node}` if title/agent changed. | Stop stamping `activity=now` on hydrate/status-reconcile (see §note A) — seed recency from the session's real `Session.time.updated`. |
-| Session gains `pendingInput` (`KindQuestionSet`) | `node.facet{id, flags:{pendingInput:true}}`. | Also bumps ancestor `subtreePendingInput`; ancestors do NOT need an op unless the client displays a subtree badge (decision Q2). |
-| Session loses `pendingInput` (`KindQuestionClear`) | `node.facet{id, flags:{pendingInput:false}}`. | |
+| Session gains `pendingInput` (`KindQuestionSet`) | `node.facet{id, flags:{pendingInput:true}}` on the session; **plus** Q2 — when `subtreeNeedsInput` flips on an ancestor, `node.facet{id, flags:{subtreeNeedsInput:true}}` for each ancestor whose flag changes (the ONE retained subtree-aggregate badge; propagates up to root). | The ancestor dot is cheap (a partial facet, no subtree walk on the client). |
+| Session loses `pendingInput` (`KindQuestionClear`) | `node.facet{id, flags:{pendingInput:false}}`; plus, for each ancestor whose subtree now has no needs-input descendant, `node.facet{id, flags:{subtreeNeedsInput:false}}`. | Computed from `subtreePendingInput` index (subtree_indexes.go); the flip is exact. |
 | Permission requested (`KindPermissionSet`) | `node.facet{id, flags:{permission:true}}`. | |
 | Permission resolved (`KindPermissionClear`) | `node.facet{id, flags:{permission:false}}`. | |
 | Session archived (archive flag set on upsert) | `node.upsert{node, flags:{archived:true}}`. | If archiving the root of subsessions makes them orphans, also emit `node.facet{flags:{orphan:true}}` for each (§9). |
@@ -499,34 +760,154 @@ re-derives structure.
 | Parent reparented (effective parent changed via create/delete cascade) | `node.move{id, newParentId}`. | See "Session created" + "Session deleted" rows — `move` is the carrier whenever `effectiveParentOfLocked` flips. |
 | Subtree loaded on expand (client `GET /vh/tree/children`) | HTTP response is a `node.children` payload (not an SSE op); same shape. | §8. Pagination via `cursor`/`hasMore`. |
 
-**§note A — stop stamping `activity=now` on hydrate/reconcile:** today the
-hydrate / status-reconcile path stamps `activity=now`, which forces a full load
-after restart and seeds the demotion churn. The new model seeds a node's
-`activity`/`updatedMs` from the session's real last-activity
-(`Session.time.updated` / `subtreeNewestActivity`). Locate the stamping site in
-the hydrate path during Phase 2 and remove it; cite it here when found (open
-item O1).
+**§note A — stop stamping `activity=now` on hydrate/reconcile (O1 RESOLVED):**
+today the hydrate / status-reconcile path stamps `activity=now`, which forces a
+full load after restart and seeds the demotion churn. The new model seeds a
+node's `activity`/`updatedMs` from the session's real last-activity
+(`Session.time.updated` / `subtreeNewestActivity`). The stamping site is now
+verified: `pkg/aggregator/aggregator.go:773`
+(`runStatusReconcile` periodic tick → `a.store.SetActivityFromStatuses`) and
+`:848` (the `hydrate` path → `a.store.SetActivityFromStatuses`, inside the
+`run("SessionStatuses", ...)` goroutine at `:843`). That call descends to
+`store.SetActivityFromStatuses` (`pkg/state/store.go:1703`) → per-session
+`setActivityLocked` (`pkg/state/store.go:1421`), which captures
+`now := time.Now()` (`store.go:1446`) and writes `lastActivityAt[sessionID]=now`
+via `touchActivityTimeLocked` (the comment at `store.go:1443` notes the
+override-to-now). Note this is the activity TIME stamp, not the busy/idle
+*state* (state comes from `status.type`); the now-time-stamp is the churn seed.
+There is also a tombstone guard at `setActivityLocked` (`store.go:1429`,
+`isRecentlyArchivedLocked`) that suppresses the stamp for recently-archived ids.
+Phase 2 removes the now-stamp in favor of real `Session.time.updated` recency.
+O1 is therefore resolved and removed from the open-questions section (§14).
 
 ### 6.1 Non-obvious mappings (the riskiest — flagged for review)
 
 - **R1 — Ancestor `childCount`/badge propagation on create/delete.** When a
-  child is added/removed, the parent's `childCount` changes and (if the client
-  shows subtree badges) ancestor sum change. The table emits a parent
+  child is added/removed, the parent's `childCount` changes and the ancestor's
+  `descendantCount` changes (D1). The table emits a parent
   `node.upsert`/`facet`. *Risk:* if the server forgets an ancestor, the client
   shows a stale `▸ N`. Mitigation: derive `childCount` directly from
-  `len(children[id])` at emit time so it is always exact.
+  `len(children[id])` and `descendantCount` from `subtreeDescendantCount` at emit
+  time so both are always exact. Whether the real child op OR only the count
+  facet is emitted is decided per-connection by §5.4 (`P ∈ E_c`).
 - **R2 — Orphan-on-delete cascade vs. orphan-on-archive.** Delete reparents
   children to root (`maintainIndexesOnDeleteLocked`); archive does NOT delete.
   A subsession whose *root* is archived becomes an orphan only if the cascade
   missed it (§9). *Risk:* emitting `orphan:true` for a live-rooted session
   (the original false-orphan bug). Mitigation: the orphan rule in §9 explicitly
   excludes any session whose root is live.
-- **R3 — `move` ordering vs. `upsert`.** If a parent is re-created
-  (`maintainChildrenOnSessionUpsertLocked` reabsorbs), the server must emit the
-  parent `upsert` BEFORE the children's `move`, else the client briefly sees
-  children parented to a missing node. *Risk:* a transient render glitch.
-  Mitigation: per-stream op ordering guarantee (parent-before-child on the same
-  flush) — state explicitly in Phase 2.
+- **R3 — `move`/`upsert` ordering vs. `parent-before-child` (NOW A HARD
+  INVARIANT).** If a parent is re-created
+  (`maintainChildrenOnSessionUpsertLocked` reabsorbs), the server emits the
+  parent `upsert` BEFORE the children's `move`. This is no longer a "state
+  explicitly in Phase 2" risk note — it is enforced emit-time invariant INV-B
+  (§4.7). The client apply logic (§7.2) assumes it holds; a violation is a
+  server bug, not a recoverable client state. Phase 2 adds an emitter unit test
+  that asserts INV-B across every event in this table and every §6.2 reconcile
+  flush.
+
+### 6.2 Server reconcile vs OpenCode's authoritative list (R4, NEW)
+
+> §6 (reactive) maps OpenCode's `/event` stream → ops. But `/event` is
+> **unreliable in the exact ways that caused our bugs**: it can MISS deletes
+> (→ resurrection/ghosts) and CLOBBER-revert archives on busy sessions. A
+> dropped delete means the server never emits `node.remove` and the client ghosts
+> — the same dual-ownership bug, one layer down. This section adds a first-class
+> SERVER RECONCILE that absorbs OpenCode's flakiness in ONE server-side place,
+> leaving the client a dumb applier. It also FOLDS the existing archive
+> re-assert + resurrection tombstone INTO the same loop so Phase 2 merges rather
+> than duplicates them.
+
+**(a) The daemon holds ALL sessions in memory; "lazy" is client-facing ONLY.**
+
+OpenCode's API is FLAT. `pkg/opencode/client.go` exposes only `GET /session`
+(flat list, `ListSessions` at `client.go:86` → `listSessionsAdaptive` at `:94`,
+which starts at `limit=2000` and doubles while the page is full up to a 1M
+bound; the comment at `:80-85` notes 1.17.x has no backward pagination, so this
+effectively returns ALL non-archived sessions), `GET /session/status`
+(`SessionStatuses` at `:319`), and `GET /event` SSE (`SubscribeEvents` at
+`:411`, no replay — the caller owns reconnect). Native archive is
+`PATCH /session/:id` `time.archived` (`SetArchived` at `:149`). There is no
+hierarchy, no children endpoint that the daemon uses, and no subtree
+pagination.
+
+Consequently the daemon builds the tree ENTIRELY from the flat `/session` list +
+`parentID`: the aggregator's `hydrate` (`pkg/aggregator/aggregator.go:779-798`)
+calls `store.Hydrate(sessions, messages)`, which builds the
+`children[parentID]` map from each session's `env.ParentID` via
+`maintainChildrenOnSessionUpsertLocked` (`subtree_indexes.go:325`; call sites
+`store.go:1967`, `:3799`). So:
+
+- **"Lazy" is client-facing ONLY.** The server always answers an expand (§8)
+  from its OWN in-memory store INSTANTLY — it does NOT call OpenCode per-expand.
+- **Nobody should try to lazy-load from OpenCode per-node — it is impossible.**
+  There is no `/session/:id/children` endpoint the daemon consumes.
+
+> **Citation correction (verified).** The review brief described OpenCode as
+> having "no children endpoint." There IS a `Children` method
+> (`pkg/opencode/client.go:327-334` → `GET /session/:id/children`), but `grep`
+> for `\.Children\(` across all `.go` files returns ZERO callers — it is dead
+> code, never invoked. The daemon never uses it; the tree is built from the flat
+> list + parentID as described above. The reviewer's FUNCTIONAL claim is correct;
+> this doc states it precisely and notes Phase 2 MUST NOT rely on the dead
+> `Children` method (OpenCode 1.17.x semantics for it are unverified and it is
+> unmaintained in this codebase).
+
+**(b) The reconcile loop.** The server runs a periodic reconcile tick that
+DIFFS its in-memory store against OpenCode's authoritative `/session` list
+(`ListSessions`) and emits CORRECTIVE ops for any drift. The client never
+re-derives anything; it just applies these ops like any other. The corrective
+ops are:
+
+- **`node.remove`** for any session the server has in its store but that is GONE
+  from the authoritative `/session` list. This is what kills ghosts/resurrection:
+  if `/event` dropped a delete, the store still holds a stale node, and this
+  reconcile `node.remove` evicts it deterministically rather than waiting for a
+  reload.
+- **`node.upsert`** (with refreshed `flags.archived`, and any other drifted
+  facet) for sessions whose archive STATE in `/session` disagrees with the
+  store. This handles the clobber-revert-archive case (a busy session whose
+  archive was reverted by a late `/event`) by re-asserting the authoritative
+  state.
+- **Re-assert `PATCH time.archived`** for archives the server owns but that
+  OpenCode's list shows as un-archived (the clobber case) — i.e. the server
+  re-applies the archive to OpenCode to restore its intended state, then emits
+  the matching `node.upsert{flags:{archived:true}}`.
+
+**Cadence.** The tick runs on the same kind of periodic-ticker as
+`runStatusReconcile` (`pkg/aggregator/aggregator.go:755`; the existing
+`/session/status` reconcile at `:773`). A conservative default cadence (e.g.
+a few seconds) bounds the worst-case ghost/window visibility; the tick is cheap
+(a flat-list diff against an in-memory map), so it can run frequently. Every
+corrective op carries a `seq` (§4.1/INV-A) and therefore flows through the
+reconnect/replay ring (§5.5) — a client that drops and resumes across a
+reconcile tick replays the corrections, no special-case reconnect handling.
+
+**Fold existing mechanisms INTO this loop (do not duplicate).** Two
+already-shipped server-side corrections must merge into the reconcile tick
+rather than live as separate code paths:
+
+- **Archive re-assert** — `pkg/web/archive.go`: `reassertArchive` (func at
+  `:197`, "Server-owned post-archive re-assert / Issue A"), the launching
+  goroutine `go s.reassertArchive(...)` at `:181`, `defaultReassertDelay=1s`
+  (`:27`), and the server seams `reassertDelay` (`pkg/web/server.go:190`),
+  `reassertReadyCh`/`reassertBlockCh` (`:198-199`), `SetReassertDelay` (`:351`).
+  This is the SAME class of correction (re-assert an archive OpenCode lost);
+  Phase 2 moves it under the reconcile tick's archive branch.
+- **Resurrection tombstone** — `pkg/state/store.go`: `RemoveSessions` (`:2112`,
+  sets the `recentlyArchived` tombstone at `:1142`), `ClearArchiveTombstones`
+  (`:2132`), `isRecentlyArchivedLocked` (`:2089`), `recentArchiveTTL=30s`
+  (`:2624`). The tombstone suppresses resurrection (the guard in
+  `upsertSessionLocked` at `:1935`, and in `setActivityLocked` at `:1429`). The
+  reconcile's `node.upsert`-refresh branch must respect the SAME tombstone (a
+  recently-archived id is not blindly re-revived by a stale `/session` entry),
+  so the tombstone logic is reused, not re-implemented.
+
+**Net effect.** OpenCode's `/event` flakiness is absorbed in exactly ONE
+server-side place (the reconcile tick). The client remains a dumb op-applier
+that never has to detect or repair ghosts/archives itself — which preserves the
+core principle ("the server owns structure; the client never guesses") even in
+the face of an unreliable event source.
 
 ---
 
@@ -691,6 +1072,12 @@ both behind `tree=2`):
    archived state; if it was a subsession whose chain root was just deleted, it
    is now a root and not an orphan).
 
+> **Q5 RESOLVED:** the delete-time orphan check re-checks ONLY the newly-rooted
+> children. It does NOT re-check the deleted node's *siblings*. Sibling orphan
+> status is unaffected by a delete (a sibling's root chain is unchanged), so a
+> sibling sweep would be dead work. Any sibling drift is caught by the §6.2
+> reconcile tick instead.
+
 ### 9.3 What is emitted
 
 A `node.facet{id, flags:{orphan:true|false}}` for each affected node. The
@@ -773,18 +1160,34 @@ per-symbol detail.
 **ADD (new files):**
 - `pkg/state/tree_emitter.go` — the frontier+placeholders snapshot composer
   (§5) and the structural-delta emitter (§6).
+- `pkg/state/tree_reconcile.go` — the periodic §6.2 reconcile tick (diffs the
+  store vs OpenCode's authoritative `/session` list, emits corrective
+  `node.remove`/`node.upsert`/archive re-assert; folds `archive.go`
+  `reassertArchive` + the store resurrection tombstone under one loop).
 - `pkg/web/tree_children.go` — the `GET /vh/tree/children` handler (§8),
   beside `handleBranch`.
 - `pkg/state/tree_node.go` — the `Node`/delta-op Go types (§3, §4) + JSON tags.
 
 **MODIFY:**
 - `pkg/web/server.go` — add `wantsTree2`, branch in `handleStream`
-  (`:1360`); register `/vh/tree/children` route.
-- `pkg/web/archive.go` — invoke the orphan check (§9) on archive/un-archive.
+  (`:1360`); register `/vh/tree/children` route; route tree=2 ops through the
+  existing ring + cursor/replay plumbing (`:1404-1518`) with a tree=2-scoped
+  subscriber interest (§5.5); add per-connection expanded-set `E_c` state beside
+  the subscriber channel (§5.4).
+- `pkg/web/archive.go` — invoke the orphan check (§9) on archive/un-archive;
+  MOVE `reassertArchive` (`:197`, launch `:181`) under the §6.2 reconcile tick's
+  archive branch (merge, not duplicate).
 - `pkg/state/subtree_indexes.go` — add an orphan-flagging hook in
   `maintainIndexesOnDeleteLocked` (`:620`) (additive; no index shape change).
-- (Open O1) the hydrate/status-reconcile path that stamps `activity=now` —
-  remove the stamp.
+- `pkg/state/store.go` — the resurrect-tombstone guard (`isRecentlyArchivedLocked`
+  `:2089`/`upsertSessionLocked` `:1935`/`setActivityLocked` `:1429`) is REUSED by
+  the §6.2 reconcile `node.upsert`-refresh branch (do not re-implement).
+- (O1 RESOLVED — was "Open O1") `pkg/aggregator/aggregator.go:773` (status
+  reconcile tick) and `:848` (hydrate) → `pkg/state/store.go:1703`
+  `SetActivityFromStatuses` → `:1421` `setActivityLocked` captures
+  `now := time.Now()` (`:1446`) and writes `lastActivityAt[id]=now`
+  (`touchActivityTimeLocked`). Remove the now-stamp in favor of real
+  `Session.time.updated` recency.
 
 **REUSE (no change):** `pkg/state/store.go` Store/indexes/event kinds/`Apply`
 (§2.1, §2.6).
@@ -846,10 +1249,30 @@ Repo test lanes (AGENTS.md): Go co-located unit in `pkg/`, Go integration in
 - **Emitter unit tests** (`pkg/state/tree_emitter_test.go`):
   - Initial snapshot composition: given a synthetic store with roots + active
     + idle subtrees, assert the §5 three categories and `loaded` flags.
+  - **R1 cold-load size invariant:** assert the cold snapshot node count equals
+    `roots + active-path nodes + direct-children-of-loaded`, and is INDEPENDENT
+    of total idle-session count (add 1000 idle ancestors → snapshot unchanged).
+  - **R2 per-stream loaded-set:** for a structural child event on parent `P`,
+    assert a connection with `P ∈ E_c` gets the real child op, and a connection
+    with `P ∉ E_c` gets ONLY a count facet (no child op). Assert `E_c` is seeded
+    from the §5 snapshot and grown on a terminal `node.children` expand.
+  - **R3 reconnect/replay:** drop+resume with a recent cursor → assert the
+    missed ops replay from the ring in seq order; resume with a stale cursor
+    past the ring → assert the fresh-snapshot fallback re-seeds the flat map +
+    `E_c`. Assert corrective ops (§6.2) replay too.
+  - **INV-B (parent-before-child) emission:** for every event in the §6 table
+    (incl. parent-re-creates-orphan-absorption) and every §6.2 reconcile flush,
+    assert no child op precedes its parent in the same flush.
   - Per-event delta: drive each event in the §6 table through `Apply`, assert
     the emitted op(s) match the table exactly.
   - Orphan rule (§9): archive a root with subsessions → assert `flags.orphan`
     on descendants; un-archive → cleared; live-rooted → never orphaned.
+- **Reconcile unit tests** (`pkg/state/tree_reconcile_test.go`): a session
+  present in the store but GONE from the authoritative `/session` list →
+  corrective `node.remove` (ghost kill); an archive state disagreement →
+  corrective `node.upsert{flags:{archived}}` + archive re-assert; assert the
+  resurrect tombstone suppresses re-revival of a recently-archived id; assert
+  every corrective op carries a `seq`.
 - **Expand handler test** (`pkg/web/tree_children_test.go`): pagination
   `hasMore`/`cursor`, stale-cursor restart.
 - Lane: `vh-agent-harness exec bash -c 'export PATH=$PATH:/usr/local/go/bin && go test ./pkg/state/ ./pkg/web/'`.
@@ -881,27 +1304,37 @@ Repo test lanes (AGENTS.md): Go co-located unit in `pkg/`, Go integration in
 
 ## 14. Open questions for review
 
-- **Q1 (§5.2):** Is the active-path predicate "non-idle OR permission OR
-  pendingInput" the right frontier? Should `archived` sessions ever seed an
-  active path (default: no)?
-- **Q2 (§6):** Does the client display subtree-aggregate badges (e.g. ancestor
-  "needs input")? If yes, ancestor ops must propagate; if no, only the leaf
-  `node.facet` is needed (simpler, less traffic). Current stubs encoded
-  `aggregateState`; the new Node drops it — confirm the UX regression is
-  acceptable or specify which subtree badges to keep.
-- **Q3 (§4.6 vs §4.2):** Confirm the split between `node.facet` (partial merge)
-  and `node.upsert` (full replace) is worth the complexity, vs. always emitting
-  full `node.upsert`. Nodes are small; `facet` is a bandwidth optimization.
-- **Q4 (§8.3):** Stale-cursor restart — keep it (mirrors today's
-  `lazyExpandBranch` `stream.ts:2797`), or simplify and accept a one-shot
-  re-expand from page 0 unconditionally on any empty batch?
-- **Q5 (§9.2):** Orphan check on delete currently only re-checks newly-rooted
-  children. Should it also re-check the deleted node's *siblings*? (Probably
-  no — they keep their root — but confirm.)
-- **O1 (§6 §note A):** The hydrate/status-reconcile path that stamps
-  `activity=now` was identified as a root cause but its exact file:line was not
-  pinned in this recon pass. Phase 2 must locate and remove it; cite back here.
+> **Revision 1:** all open questions from v1 are now RESOLVED and baked into the
+> doc above. They are retained here (as resolutions) for review traceability.
+> O1 is removed (resolved + cited).
+
+- **Q1 — RESOLVED (§5.1).** Active path = `activity ∈ {busy,retry,error}` OR
+  `flags.permission` OR `flags.pendingInput`. **An archived session NEVER seeds
+  an active path**, even if nominally busy in `/session/status`. A non-archived
+  active session pulls its full ancestor chain to root as loaded nodes.
+- **Q2 — RESOLVED (§3, §6).** Keep exactly ONE subtree-aggregate badge: an
+  ancestor **"needs-input" dot** (`flags.subtreeNeedsInput`), propagated up the
+  ancestor chain when a subtree `pendingInput` flips. ALL other subtree
+  aggregation is dropped. (This refines any earlier "drop all subtree
+  aggregation" stance — exactly one flag survives.)
+- **Q3 — RESOLVED (§4.2/§4.6).** Keep the `node.facet` / `node.upsert` split:
+  `node.facet` for high-frequency activity/verb/flag updates (partial merge,
+  bandwidth-friendly); `node.upsert` for full-Node replaces (structural/title/
+  agent changes).
+- **Q4 — RESOLVED (§8.3).** Keep the stale-cursor restart behavior (mirrors
+  today's `lazyExpandBranch` `stream.ts:2797`).
+- **Q5 — RESOLVED (§9.2).** No sibling re-check on delete. The delete-time
+  orphan check re-checks ONLY the newly-rooted children; sibling orphan status
+  is unaffected by a delete, and any drift is caught by the §6.2 reconcile tick.
+- **O1 — RESOLVED & REMOVED (§6 §note A).** The `activity=now` stamp site is
+  verified: `pkg/aggregator/aggregator.go:773` (`runStatusReconcile`) and
+  `:848` (`hydrate`) → `pkg/state/store.go:1703` `SetActivityFromStatuses` →
+  `:1421` `setActivityLocked` captures `now := time.Now()` (`:1446`) and writes
+  `lastActivityAt[id]=now` via `touchActivityTimeLocked`. Phase 2 replaces the
+  now-stamp with real `Session.time.updated` recency. (The reviewer's "stamps
+  activity=now" refers to the activity TIME stamp, not the busy/idle state.)
 
 ---
 
-**End of Phase 1 design. No code written. Awaiting human review before Phase 2.**
+**End of Phase 1 design (rev. 1 — post-review). No code written. Awaiting
+human re-review before Phase 2.**
