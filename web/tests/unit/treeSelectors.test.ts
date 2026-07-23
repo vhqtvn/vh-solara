@@ -90,8 +90,43 @@ describe("selectPinnedNodes (flat-map, depth-agnostic)", () => {
   });
 
   it("preserves the pinned order verbatim and drops stale (missing) ids", () => {
-    const out = selectPinnedNodes(deepMap(), ["C", "missing", "R", "A"]).map((n) => n.id);
-    expect(out).toEqual(["C", "R", "A"]);
+    // SIBLING roots (no ancestor relationship) so the d_F1 nested-pin dedup does
+    // not apply — this isolates the order-preservation + stale-drop intent.
+    const siblings = seedTree([
+      node({ id: "R1", title: "Root1", updatedMs: 10 }),
+      node({ id: "R2", title: "Root2", updatedMs: 20 }),
+      node({ id: "R3", title: "Root3", updatedMs: 30 }),
+    ]);
+    const out = selectPinnedNodes(siblings, ["R3", "missing", "R1", "R2"]).map((n) => n.id);
+    expect(out).toEqual(["R3", "R1", "R2"]);
+  });
+
+  // CRUX d_F1 (nested-pin double render): pinning BOTH an ancestor AND a
+  // descendant must render the descendant EXACTLY ONCE. The pinned-group
+  // TreeBranch recurses with an empty dedup set, so a pinned descendant would
+  // render TWICE — once nested under its pinned ancestor's recursion, once as a
+  // top-level pinned row. The fix: selectPinnedNodes EXCLUDES any pinned id that
+  // has a pinned ancestor (it renders nested under that ancestor instead).
+  it("excludes a pinned descendant of another pinned node — no double render (d_F1)", () => {
+    // deepMap chain: R → A → B → C. Pin ancestor R + deep descendant C.
+    // C is nested under R in the pinned group, so it must NOT also appear at the
+    // top level. Only R (the top-most pinned ancestor) surfaces.
+    const out = selectPinnedNodes(deepMap(), ["R", "C"]).map((n) => n.id);
+    expect(out).toEqual(["R"]);
+
+    // Pin a MID ancestor (A) + its descendant (C): only A surfaces (C is nested
+    // under A; R is not pinned so it does not appear).
+    const out2 = selectPinnedNodes(deepMap(), ["A", "C"]).map((n) => n.id);
+    expect(out2).toEqual(["A"]);
+
+    // Order-independent: even if the descendant is listed FIRST, it is still
+    // excluded (the dedup considers the full pinned membership).
+    const out3 = selectPinnedNodes(deepMap(), ["C", "R"]).map((n) => n.id);
+    expect(out3).toEqual(["R"]);
+
+    // The crux — each pinned id appears EXACTLY ONCE in the returned list (no
+    // duplicate top-level rows), and the excluded descendant is absent.
+    expect(new Set(out).size).toBe(out.length);
   });
 });
 

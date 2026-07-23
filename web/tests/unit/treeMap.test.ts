@@ -19,6 +19,7 @@ import {
   loadedDescendants,
   rootNodes,
   seedTree,
+  toggleDecision,
 } from "../../src/sync/treeMap";
 import type { TreeNode, TreeOp, TreeFlatMap } from "../../src/sync/treeMap";
 
@@ -386,5 +387,56 @@ describe("collapseNode — §8.4 client-only collapse", () => {
     // Non-protected descendants are still dropped as before.
     expect(m.has("c1")).toBe(false);
     expect(m.has("c2")).toBe(false);
+  });
+});
+
+// ---- §8.5 toggle decision (c_F1: stuck re-expand) --------------------------
+// onToggle must decide expand vs collapse from the node's `loaded` flag, NOT
+// from whether children happen to be resident in the flat map. The protectedIds
+// pin-parity hook keeps a pinned descendant RESIDENT through an ancestor
+// collapse, so a presence-based guard would ALWAYS see "has children" and
+// ALWAYS collapse — the user could collapse but never re-expand (bug c_F1).
+// Keying off `loaded` (collapse flips it false; false means "expand / fetch")
+// makes re-expand reachable. This is the pure, unit-testable core of the fix.
+describe("toggleDecision — expand/collapse keyed off loaded (c_F1)", () => {
+  it("collapse when the node IS loaded", () => {
+    const n = node({ id: "p", loaded: true, childCount: 2, descendantCount: 3 });
+    expect(toggleDecision(n)).toBe("collapse");
+  });
+
+  it("expand when the node is NOT loaded but has structural descendants", () => {
+    const n = node({ id: "p", loaded: false, childCount: 2, descendantCount: 3 });
+    expect(toggleDecision(n)).toBe("expand");
+  });
+
+  it("none for a structural leaf with nothing to toggle", () => {
+    const n = node({ id: "leaf", loaded: false, childCount: 0, descendantCount: 0 });
+    expect(toggleDecision(n)).toBe("none");
+  });
+
+  // CRUX (c_F1): a parent with a PINNED DIRECT CHILD. Collapse protects the
+  // pinned child (it stays resident), so the flat map STILL reports it as a
+  // direct child of p — a presence-based decision would re-collapse forever
+  // (stuck). Keying off `loaded`: collapse flipped loaded:false, so the NEXT
+  // toggle decision is EXPAND (re-expand is reachable).
+  it("re-expand is reachable after collapsing a parent with a pinned direct child", () => {
+    const m = seedTree([
+      node({ id: "p", loaded: true, childCount: 2, descendantCount: 2 }),
+      node({ id: "c1", parentId: "p" }), // dropped on collapse
+      node({ id: "pin", parentId: "p" }), // PINNED direct child — protected
+    ]);
+    // Before collapse: loaded → collapse.
+    expect(toggleDecision(m.get("p")!)).toBe("collapse");
+
+    // Collapse p, protecting the pinned direct child.
+    collapseNode(m, "p", new Set(["pin"]));
+    const p2 = m.get("p")!;
+    // The protected pinned child stays resident AND is still a direct child of p.
+    expect(childrenIndex(m).get("p")?.map((n) => n.id)).toEqual(["pin"]);
+    // loaded was flipped false...
+    expect(p2.loaded).toBe(false);
+    // ...so the toggle decision is now EXPAND, not collapse — re-expand works.
+    // (A presence-based rule would see "pin" resident and re-collapse → stuck.)
+    expect(toggleDecision(p2)).toBe("expand");
   });
 });

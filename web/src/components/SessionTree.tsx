@@ -6,6 +6,7 @@ import { selectPinnedNodes, selectSearchResults } from "../sync/treeSelectors";
 import { searchQuery, reconciledPinnedOrder, isPinned } from "../sidebar";
 import { menuTriggers } from "../sessionMenu";
 import TreeRow from "./TreeRow";
+import { toggleDecision } from "../sync/treeMap";
 import type { TreeNode } from "../sync/treeMap";
 
 // Picking a session always shows its chat — even re-clicking the already-open
@@ -90,9 +91,25 @@ function TreeStateView() {
   // children expands. Leaf nodes (childCount===0) toggle is a no-op via TreeRow's
   // own isLeaf guard. On collapse, the pinned membership is passed through so a
   // pinned descendant is NOT dropped (it stays resident for the Pinned group).
+  //
+  // c_F1: the expand/collapse decision keys off the node's `loaded` flag (via the
+  // pure toggleDecision helper), NOT off whether resident children happen to be
+  // present in the flat map. The protectedIds pin-parity hook keeps a pinned
+  // descendant resident through an ancestor collapse, so a presence-based rule
+  // ("has resident children → collapse") would ALWAYS collapse and the user could
+  // NEVER re-expand a parent that has a pinned descendant (stuck). Keying off
+  // `loaded` is correct: a collapsed node is loaded:false; expanding means it IS
+  // loaded / should fetch its direct children.
   const onToggle = (n: TreeNode) => {
-    if (treeChildrenOf(n.id).length > 0) collapseTreeNode(n.id, pinnedIds());
-    else if ((n.descendantCount ?? 0) > 0 || n.childCount > 0) void expandTreeNode(n.id);
+    switch (toggleDecision(n)) {
+      case "collapse":
+        collapseTreeNode(n.id, pinnedIds());
+        break;
+      case "expand":
+        void expandTreeNode(n.id);
+        break;
+      // "none": a leaf or a node with no descendants — no-op.
+    }
   };
 
   const roots = () => treeRoots().filter((n) => !pinnedIds().has(n.id));

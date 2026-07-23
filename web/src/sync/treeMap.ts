@@ -185,6 +185,22 @@ export function collapseNode(map: TreeFlatMap, id: string, protectedIds?: Readon
   map.set(id, { ...node, loaded: false });
 }
 
+// ---- §8 expand/collapse decision -------------------------------------------
+// Pure expand-vs-collapse decision for a node, factored out of the TreeStateView
+// onToggle so it is unit-testable. The CORRECT rule keys off `loaded`: a
+// collapsed node is loaded:false, and expanding means it IS loaded / should
+// fetch its direct children. See toggleDecision tests + bug c_F1.
+export type ToggleAction = "expand" | "collapse" | "none";
+export function toggleDecision(node: TreeNode): ToggleAction {
+  // A collapsed node is loaded:false; expanding means it IS loaded / should
+  // fetch its direct children. Keying off `loaded` (NOT resident children)
+  // because a pinned descendant is protected through a collapse and stays
+  // resident — a presence-based rule would never re-expand (bug c_F1).
+  if (node.loaded) return "collapse";
+  if ((node.descendantCount ?? 0) > 0 || node.childCount > 0) return "expand";
+  return "none";
+}
+
 // ---- render helpers (group the flat map on parentId) -----------------------
 // The tree renders by grouping the flat map on parentId. The server is the sole
 // authority for parentId (§7.3); the client never promotes an orphan to a root.

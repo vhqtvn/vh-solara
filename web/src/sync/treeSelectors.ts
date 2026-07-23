@@ -22,13 +22,35 @@ import type { TreeNode, TreeFlatMap } from "./treeMap";
 // Dedup: the caller (TreeStateView) uses this list to render the pinned group
 // AND filters these same ids OUT of the normal tree walk, so a pinned node
 // appears exactly once (hoisted), mirroring the old client's approach.
+//
+// d_F1 (nested-pin double render): the pinned-group TreeBranch recurses with an
+// EMPTY dedup set (the pinned group renders its rows' descendant trees too), so
+// if BOTH an ancestor and a descendant are pinned, the descendant would render
+// TWICE — once nested under the pinned ancestor's recursion, once as a top-level
+// pinned row. To prevent that, a pinned id that has a PINNED ANCESTOR is
+// excluded here: it already renders nested under that ancestor in the group.
 export function selectPinnedNodes(map: TreeFlatMap, pinnedOrder: string[]): TreeNode[] {
+  const pinnedSet = new Set(pinnedOrder);
   const out: TreeNode[] = [];
   for (const id of pinnedOrder) {
     const n = map.get(id);
-    if (n) out.push(n);
+    if (!n) continue;
+    if (hasPinnedAncestor(map, id, pinnedSet)) continue; // d_F1: nested, not top-level
+    out.push(n);
   }
   return out;
+}
+
+// Walk the parentId chain from `id` upward; return true iff any ancestor is also
+// pinned. The server guarantees a DAG (parentId is server-assigned, never
+// client-inferred), but a depth cap guards against a corrupt cycle defensively.
+function hasPinnedAncestor(map: TreeFlatMap, id: string, pinnedSet: Set<string>): boolean {
+  let cur = map.get(id)?.parentId;
+  for (let i = 0; i < 10000 && cur != null; i++) {
+    if (pinnedSet.has(cur)) return true;
+    cur = map.get(cur)?.parentId;
+  }
+  return false;
 }
 
 // Flatten-to-matches search. Returns `null` when search is inactive (empty/
