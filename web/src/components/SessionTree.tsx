@@ -572,6 +572,7 @@ function TreeBranch(props: {
         expanded={expanded().length > 0}
         onSelect={() => openSessionChat(props.node.id)}
         onToggle={() => props.onToggle(props.node)}
+        menuProps={menuTriggers(() => props.node.id, () => props.node.title || props.node.id)}
       />
       <For each={expanded()}>
         {(child) => (

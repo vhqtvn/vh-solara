@@ -1836,11 +1836,23 @@ export function connect(fresh = false) {
     }
   });
   // === Phase 3 Step A (COEXIST): tree=2 server-owned tree stream =============
-  // These listeners are registered unconditionally but only FIRE in tree=2 mode:
-  // the server (server.go) suppresses every legacy frame (snapshot/session.*/the
-  // TREE_STREAM_KINDS set) when the tree emitter is engaged, and emits ONLY
-  // tree.snapshot + tree.op. In proj=1 mode the server never emits tree.* frames,
-  // so these are inert no-ops. Both paths therefore coexist with zero double-apply.
+  // These listeners are registered unconditionally but only FIRE in tree=2 mode
+  // (the server emits tree.* frames only when the tree emitter is engaged). In
+  // proj=1 mode the server never emits tree.* frames, so these are inert no-ops.
+  //
+  // Coexistence is double-apply-safe because the two projections write
+  // DISJOINT state: the tree.* listeners populate treeMap/treeState (the
+  // structural tree), while the legacy detail listeners populate the detail
+  // maps (state.sessions / state.permissions / state.questions / state.todos /
+  // etc.). As of Step A.5 GAP 3 the server emits BOTH projections in tree=2
+  // mode — tree.snapshot + tree.op for STRUCTURE, and a legacy detail snapshot
+  // + legacy detail events (snapshot, permission.*, question.*, todo, status,
+  // activity.*, lastAgent.set, unread.*) for SESSION DETAIL. Only the
+  // server-internal tree.orphan kind is suppressed on the legacy wire (it is
+  // translated into node facets inside the tree projection). session.upsert /
+  // session.delete are emitted on BOTH wires: structurally via tree.op (so the
+  // treeMap reflects creates/deletes) and as legacy events (so state.sessions
+  // detail stays current); these are also disjoint (treeMap vs state.sessions).
   //
   // F4 (carry-forward, CRITICAL): the SSE `id` field / Last-Event-ID carries the
   // STORE seq for BOTH tree.snapshot (server.go writeRaw(w, treeSnap.Seq,...)) and
@@ -1867,10 +1879,22 @@ export function connect(fresh = false) {
     // scope we advance the resume cursor (so reconnect replays this seq) but do
     // NOT seed the store. The next non-deferred snapshot reconciles authoritatively.
     const applyTreeSnap = (decoded: unknown) => {
-      if (isGateActive()) {
+      // Gate-aware deferral + expectTreeSnap handshake, mirroring the proj=1
+      // snapshot listener's applySnap closure (line ~1768). During a reconcile-
+      // busy scope, a snapshot we DIDN'T request (expectTreeSnap false) is
+      // deferred (cursor advanced, store untouched); a snapshot we DID request
+      // (expectTreeSnap true, from connect(true) in reconcileBusy) is applied
+      // authoritatively AND clears expectTreeSnap + calls
+      // maybeResolveReconcile so the busy scope releases promptly instead of
+      // waiting the 15s safety timeout (Step A.5 GAP 1).
+      if (isGateActive() && !expectTreeSnap) {
         advanceCursor(seq);
         markBusyDirty();
         return;
+      }
+      if (expectTreeSnap) {
+        expectTreeSnap = false;
+        maybeResolveReconcile();
       }
       const snap = decodeTreeSnapshot(decoded);
       if (!snap) {

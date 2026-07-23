@@ -1490,6 +1490,17 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 							writeRaw(w, ev.Seq, "tree.op", b)
 						}
 					}
+					// Phase 3 Step A.5 (GAP 3): emit the legacy detail frame
+					// alongside tree.op so cross-session detail consumers
+					// (NotificationCenter, selectors) stay populated. tree=2
+					// replaces only the STRUCTURE projection (snapshot);
+					// session-detail (permissions/questions/todos/session
+					// metadata/activity/lastAgent/unread) is orthogonal (§10).
+					// tree.orphan is server-internal (translated to node.facet
+					// above; no client listener) — skip it.
+					if ev.Kind != state.KindTreeOrphanCheck {
+						writeEvent(w, ev.Seq, ev.Kind, ev.Payload)
+					}
 				} else {
 					writeEvent(w, ev.Seq, ev.Kind, ev.Payload)
 				}
@@ -1567,6 +1578,29 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 				sw.RecordSnapshotPath(len(wire))
 			} else {
 				vhlog.Warn("tree snapshot: marshal failed", "err", err)
+			}
+			// Phase 3 Step A.5 (GAP 3): ALSO emit a legacy detail snapshot to
+			// bootstrap the client's detail maps (state.sessions/permissions/
+			// questions/todos/lastAgents/currentVerbs/unread). tree=2 replaces
+			// the STRUCTURE projection only; session-detail is orthogonal (§10).
+			// The legacy snapshot for a tree-only Stream 1 client (filter={}
+			// from sessions=) carries all sessions' detail but NO messages
+			// (Snapshot skips messages when messagesFor is non-nil and empty).
+			// Shipped RAW (not gzip64) so it does NOT race the tree.snapshot's
+			// gzip64 decode on the shared treeSnapshotDecoding flag — the legacy
+			// snapshot listener runs synchronously while tree.snapshot's async
+			// decode proceeds in parallel; both populate different stores
+			// (state.sessions vs treeMap) so there is no clobber.
+			var detailSnap state.Snapshot
+			if wantsProject(r) {
+				detailSnap = store.SnapshotProjected(filter, cause, wantsHoist(r))
+			} else {
+				detailSnap = store.Snapshot(filter)
+			}
+			if db, err := json.Marshal(detailSnap); err == nil {
+				writeRaw(w, detailSnap.Seq, "snapshot", db)
+			} else {
+				vhlog.Warn("tree=2 detail snapshot: marshal failed", "err", err)
 			}
 			baseline = store.Head()
 		} else {
@@ -1723,6 +1757,13 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 					if b, err := json.Marshal(op); err == nil {
 						writeRaw(w, ev.Seq, "tree.op", b)
 					}
+				}
+				// Phase 3 Step A.5 (GAP 3): emit the legacy detail frame
+				// alongside tree.op (see replay-loop comment above for full
+				// rationale). tree.orphan is server-internal (no client
+				// listener) — skip.
+				if ev.Kind != state.KindTreeOrphanCheck {
+					writeEvent(w, ev.Seq, ev.Kind, ev.Payload)
 				}
 				flusher.Flush()
 				continue
