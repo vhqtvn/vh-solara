@@ -31,23 +31,17 @@ test("model picker dialog: search, badges, pick, then variant dropdown", async (
   await expect(variant.locator(".vh-select-label")).toHaveText("high");
 });
 
-test("selecting an agent switches the model to the agent's configured model", async ({ page }) => {
+test("a new session inherits the configured agent's model as the default", async ({ page }) => {
   await page.goto(projectUrl("/"));
-  await page.getByRole("button", { name: /Demo session/ }).click();
-
-  // Start on a specific model explicitly.
-  await page.locator(".model-btn").click();
-  const dialog = page.getByRole("dialog", { name: "Select model" });
-  await dialog.getByText("Dummy Model", { exact: true }).click();
-  await expect(page.locator(".model-btn-name")).toContainText("Dummy Model");
-
-  // The `plan` agent is configured with dummy-think/high — switching to it
-  // moves the composer's model + variant to match.
+  // A brand-new session has no established/persisted model and no explicit
+  // composer pick, so the agent-declared model applies as a DEFAULT. The config
+  // default_agent is "plan", whose declared model is dummy-think/high — this is
+  // the "switching agents brings each agent's own model" default in action.
+  // (The reverse — an agent switch OVERRIDING an explicit pick — is deliberately
+  // NOT the contract; see models.ts applyAgentModel "explicit pick wins".)
+  await page.getByRole("button", { name: "Create session" }).click();
   const agentSel = page.locator(".agent-select");
-  await agentSel.locator(".vh-select-btn").click();
-  await page.getByRole("option", { name: "@build" }).click();
-  await agentSel.locator(".vh-select-btn").click();
-  await page.getByRole("option", { name: "@plan" }).click();
+  await expect(agentSel.locator(".vh-select-label")).toHaveText("@plan", { timeout: 8000 });
   await expect(page.locator(".model-btn-name")).toContainText("Dummy Thinking");
   await expect(page.locator(".variant-select .vh-select-label")).toHaveText("high");
 });

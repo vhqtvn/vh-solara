@@ -45,6 +45,11 @@ export interface TreeRowProps {
   onSelect: (id: string) => void;
   onToggle: (id: string) => void;
   menuProps?: TreeRowMenuProps;
+  // True when this session finished while not selected and the server marked it
+  // unread. The unread store (state.unread[id]) is a legacy sync store still
+  // populated under tree=2 (unread.set/unread.clear events + snapshot unread
+  // list). Passed in (not read from the store) so TreeRow stays presentational.
+  unread?: boolean;
 }
 
 export function TreeRow(props: TreeRowProps) {
@@ -86,6 +91,8 @@ export function TreeRow(props: TreeRowProps) {
           </span>
         </Show>
       </button>
+      {/* data-session-id mirrors the legacy proj=1 attribute (node ID == session
+          ID in tree=2) so e2e specs that target a row by session ID work here. */}
       <button
         type="button"
         class="tree-node"
@@ -95,6 +102,7 @@ export function TreeRow(props: TreeRowProps) {
           selected: props.selected,
         }}
         data-node-id={node().id}
+        data-session-id={node().id}
         data-tip={"Open: " + displayName(node().title || node().id)}
         onClick={(e) => {
           e.stopPropagation();
@@ -115,6 +123,9 @@ export function TreeRow(props: TreeRowProps) {
           </Show>
           <Show when={needsInput()}>
             <span class="dot needs-input" data-tip="needs your input — reply to continue" />
+          </Show>
+          <Show when={!isBusy() && !needsInput() && props.unread}>
+            <span class="dot unread" data-tip="finished — not yet viewed" />
           </Show>
           {/* EVERY node carries its own agent (§3) — so a collapsed (loaded:false)
               node STILL shows its chip. This is bug fix #5: the legacy StubNode

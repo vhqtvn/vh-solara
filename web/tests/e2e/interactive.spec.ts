@@ -148,8 +148,12 @@ test("archive removes a session from the tree and lists it in the Archived brows
   // pkg/opencode/db_test.go (positive, negative, and schema-drift cases).
 });
 
+// PINNED to ?tree=1: sidebar search + pinning are proj=1-only features. The
+// tree=2 TreeStateView has no search input and no pinned-session group (the
+// server-owned tree renders roots/children only). Old-path-only behavior slated
+// for Phase 3 Step C deletion.
 test("sidebar search filters sessions and pinning floats one to the top", async ({ page }) => {
-  await page.goto(projectUrl("/"));
+  await page.goto(projectUrl("/?tree=1"));
   await expect(page.locator(".tree-node", { hasText: "Demo session" })).toBeVisible();
 
   // Search is collapsed by default — reveal it via the header toggle first.

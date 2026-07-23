@@ -102,6 +102,22 @@ export function collapseTreeNode(id: string): void {
   bump();
 }
 
+// Cold-seed gap fill: the server's async seedColdLastAgents goroutine
+// (aggregator.go) usually completes AFTER the client's first tree snapshot
+// landed, so SnapshotFrontier shipped nodes with agent:"" for sessions whose
+// message tail hadn't been fetched yet. The server emits a lastAgent.set event
+// to fill this gap, but that event only updates the legacy lastAgents map — NOT
+// the tree node. This mutator patches the tree node's agent so the chip renders
+// on collapsed nodes without an expand/open round-trip. It only fills an EMPTY
+// agent (never overwrites an authoritative one set by a tree op); the next
+// node.upsert/expand fetch replaces it with the server's authoritative value.
+export function patchTreeAgent(id: string, agent: string): void {
+  const n = map.get(id);
+  if (!n || n.agent) return; // unknown node, or already has authoritative agent
+  map.set(id, { ...n, agent });
+  bump();
+}
+
 // Clear the whole tree (project switch / epoch change / test reset).
 export function resetTreeStore(): void {
   map = new Map();

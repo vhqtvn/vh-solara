@@ -11,12 +11,17 @@ test("session tree filters idle subsessions by default and expands to show them"
   // Wait for the shared fixture to settle (no running sessions) so the tree
   // isn't re-sorting/auto-tidying under the click.
   await expect(page.locator(".tree-spinner")).toHaveCount(0, { timeout: 10000 });
-  // Default is "filtered": the idle subsession is hidden behind a footer count.
+  // tree=2 default: the cold frontier snapshot ships ONLY roots (loaded:false),
+  // so the idle subsession is NOT resident yet — and the collapsed parent
+  // advertises its branch with a "▸ N" descendant badge (the tree=2 analogue of
+  // the old proj=1 ".tree-footer-idle" filtered-mode count).
   await expect(page.locator(".tree-node", { hasText: "Subagent: search" })).toHaveCount(0);
-  await expect(page.locator(".tree-footer-idle")).toContainText("1 idle");
-  // Cycling the parent's twisty (filtered -> expanded) reveals it. Retry the
-  // click+check to tolerate any tree re-render under the shared fixture.
-  const twisty = page.locator(".tree-row", { hasText: "Demo session" }).locator(".tree-twisty");
+  const demoRow = page.locator(".tree-row", { hasText: "Demo session" });
+  await expect(demoRow.locator(".tree-count")).toContainText(/▸\s*[1-9]/);
+  // Cycling the parent's twisty (collapsed -> expanded) fetches the children and
+  // reveals the subsession. Retry the click+check to tolerate any tree re-render
+  // under the shared fixture.
+  const twisty = demoRow.locator(".tree-twisty");
   await expect(async () => {
     await twisty.click();
     await expect(page.locator(".tree-node", { hasText: "Subagent: search" })).toBeVisible({ timeout: 800 });

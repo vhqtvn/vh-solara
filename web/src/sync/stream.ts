@@ -36,7 +36,7 @@ import {
   type TreeFetcher,
   type ChildrenResponse,
 } from "./treeOps";
-import { seedTreeStore, applyTreeOpStore, resetTreeStore } from "./treeState";
+import { seedTreeStore, applyTreeOpStore, resetTreeStore, patchTreeAgent } from "./treeState";
 
 // mergeLastAgents — the agent-label fix (S3). During a server restart the
 // daemon serves HTTP while still aggregating session tails, so a mid-hydrate
@@ -1119,8 +1119,13 @@ export function applyMessageEvent(kind: string, seq: number, payload: any, track
           // so this only fills the cold gap. Mirrors activity.verb's pattern
           // (a snapshot-only facet pushed live).
           if (payload.sessionID) {
-            if (payload.agent) s.lastAgents[payload.sessionID] = payload.agent;
-            else delete s.lastAgents[payload.sessionID];
+            if (payload.agent) {
+              s.lastAgents[payload.sessionID] = payload.agent;
+              // tree=2 gap fill: also patch the tree node so the chip renders on
+              // collapsed nodes without an expand round-trip. No-op for tree=1
+              // (tree store unseeded) or nodes that already have their agent.
+              patchTreeAgent(payload.sessionID, payload.agent);
+            } else delete s.lastAgents[payload.sessionID];
           }
           break;
         case "status":
