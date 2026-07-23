@@ -5,10 +5,9 @@
 // without a cycle. State is reconciled by id, never nuked.
 import { createStore } from "solid-js/store";
 import { createSignal } from "solid-js";
-import type { CollapsedBranchStub, ConnStatus, Permission, ProjectConstants, Question, Session, SessionMessages, TodoItem, VerbFacet } from "../types";
+import type { ConnStatus, Permission, ProjectConstants, Question, Session, SessionMessages, TodoItem, VerbFacet } from "../types";
 import { loadVersioned, saveVersioned } from "../lib/store";
 
-const LS_SESSIONS = "vh.sessions.v1";
 const LS_CURSOR = "vh.cursor.v1";
 const LS_ACTIVITY = "vh.activity.v1";
 const LS_LASTAGENTS = "vh.lastagents.v1";
@@ -16,16 +15,14 @@ export const LS_PROJECT = "vh.project.dir";
 
 // Persistence is keyed per project directory so each project hydrates its own
 // tree instantly on switch. "" is the default project (OpenCode serve cwd).
-export const lsSessions = (dir: string) => `${LS_SESSIONS}:${dir}`;
+// §11 (docs/design/server-owned-tree.md): the session TREE STRUCTURE is NEVER
+// persisted to localStorage — that caused flatten-on-load (tree=2 re-fetches
+// the frontier via tree.snapshot on connect). Only chat fast-path data
+// (cursor/activity/lastAgents) and UI state (LS_PROJECT) are persisted.
 export const lsCursor = (dir: string) => `${LS_CURSOR}:${dir}`;
 export const lsActivity = (dir: string) => `${LS_ACTIVITY}:${dir}`;
 export const lsLastAgents = (dir: string) => `${LS_LASTAGENTS}:${dir}`;
 
-export function loadSessions(dir: string): Record<string, Session> {
-  return loadVersioned<Record<string, Session>>(lsSessions(dir), 1, {}, (o) =>
-    o && typeof o === "object" ? (o as Record<string, Session>) : {},
-  );
-}
 export const loadCursor = (dir: string) =>
   loadVersioned<number>(lsCursor(dir), 1, 0, (o) => Number(o) || 0);
 // Activity is persisted alongside sessions so a reload hydrates running state
@@ -179,22 +176,6 @@ export interface SyncState {
   // Root sessions that finished and haven't been acknowledged (server-tracked,
   // cross-device) — drives the "finished/unread" indicator in the tree.
   unread: Record<string, boolean>;
-  // Expanded branch IDs (Phase 2+ Gate A — collapsed-frontier projection): the
-  // set of collapsed-branch stub IDs the user has manually expanded via lazy-
-  // fetch. Tracked SEPARATELY from `sessions` (a stub is NOT a full session
-  // object — it carries aggregateState/descendantCount, not model/directory).
-  // Preserved across projected snapshots so an expansion survives re-projection;
-  // cleared on epoch change (server restart invalidates all stubs) or project
-  // switch. Ephemeral — NOT persisted (a reload re-projects from scratch, and a
-  // stale expanded-set referencing dead stubs would be misleading). Populated
-  // by Phase 4/5 (lazy-expand endpoint + Node branch-awareness); empty in Phase 2.
-  expandedBranches: Record<string, boolean>;
-  // branchStubs (Phase 4): the collapsed-branch stubs from the latest projected
-  // snapshot. Keyed by stub ID. The SessionTree Node component reads this to
-  // render collapsed rows with aggregate state + descendant count. Updated on
-  // every projected snapshot (merge: upsert incoming, prune absent+deleted).
-  // Ephemeral — NOT persisted. Empty in AUTHORITY_COMPLETE mode.
-  branchStubs: Record<string, CollapsedBranchStub>;
   // ProjectConstants (Phase 3 snapshot trim): the hoisted per-session
   // model/projectID/directory from a projected snapshot emitted under
   // ?hoist=1. Absent/undefined when the server didn't hoist (old client,
@@ -253,7 +234,7 @@ export interface SyncState {
 }
 
 export const [state, setState] = createStore<SyncState>({
-  sessions: loadSessions(initialDir),
+  sessions: {}, // §11: tree structure never persisted (tree=2 re-fetches on connect)
   messages: {},
   messageWindows: {},
   messagesLoaded: {},
@@ -266,8 +247,6 @@ export const [state, setState] = createStore<SyncState>({
   questions: {},
   todos: {},
   unread: {},
-  expandedBranches: {},
-  branchStubs: {},
   status: "connecting",
   cursor: loadCursor(initialDir),
   lastSeen: 0,
@@ -306,7 +285,6 @@ export function persist() {
   clearTimeout(persistTimer);
   persistTimer = window.setTimeout(() => {
     const dir = projectDir();
-    saveVersioned(lsSessions(dir), 1, state.sessions);
     saveVersioned(lsCursor(dir), 1, state.cursor);
     saveVersioned(lsActivity(dir), 1, state.activity);
     saveVersioned(lsLastAgents(dir), 1, state.lastAgents);

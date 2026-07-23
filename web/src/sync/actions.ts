@@ -14,7 +14,6 @@ import {
   setProjectDirRaw,
   setSelectedIdRaw,
   setDraft,
-  loadSessions,
   loadActivity,
   loadLastAgents,
   loadCursor,
@@ -31,12 +30,12 @@ export function setSelectedId(id: string | null) {
   syncUrl(id);
 }
 
-// Switch the active project directory: reset to that project's persisted tree
-// and reconnect the stream scoped to it. `fromUrl` is set by popstate (don't
-// re-push history). The dir is mirrored to both localStorage (fallback) and the
-// URL (source of truth, per-tab). `dir === ""` lands the app on the no-project
-// empty state: the daemon's cwd is not a meaningful project, so we close the
-// streams and clear per-project state instead of bridging cwd.
+// Switch the active project directory: reset state and reconnect the stream
+// scoped to it. `fromUrl` is set by popstate (don't re-push history). The dir is
+// mirrored to both localStorage (fallback) and the URL (source of truth,
+// per-tab). `dir === ""` lands the app on the no-project empty state: the
+// daemon's cwd is not a meaningful project, so we close the streams and clear
+// per-project state instead of bridging cwd.
 export function switchProject(dir: string, fromUrl = false) {
   if (dir === projectDir()) return;
   saveVersioned(LS_PROJECT, 1, dir);
@@ -51,7 +50,9 @@ export function switchProject(dir: string, fromUrl = false) {
   resetPageInFlight();
   setState(
     produce((s) => {
-      s.sessions = loadSessions(dir);
+      // §11: sessions are NOT persisted to localStorage (caused flatten-on-load).
+      // Start empty; the server snapshot repopulates via connect(true) below.
+      s.sessions = {};
       s.messages = {};
       // Phase 3: clear the per-session bounded-window map alongside the other
       // per-session maps (messagesLoaded/messagesError). A previous project's

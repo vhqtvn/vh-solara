@@ -100,43 +100,6 @@ export interface Snapshot {
   // toolVerb/toolSubject (Path B2 — Go does not replicate the per-tool target
   // picker). Empty tool = no active facet for that session.
   currentVerbs?: Record<string, VerbFacet>;
-  // Projected (Phase 2 Gate A — collapsed-frontier projection): when true, this
-  // snapshot uses MERGE semantics — sessions absent from the array are PRESERVED
-  // as hidden on the client, NOT deleted. Only an explicit session.delete event
-  // removes a session. Absent/false means AUTHORITY_COMPLETE (wholesale-replace;
-  // omission === deleted). See Go's Snapshot.Projected (pkg/state/store.go).
-  projected?: boolean;
-  // Cause: why this projected snapshot was emitted. See Go's Snapshot.Cause.
-  // "initial" | "reconnect" | "promotion" | "lazy-expand" | "resync".
-  // Absent in AUTHORITY_COMPLETE.
-  cause?: string;
-  // StructuralRevision: Store-wide monotonic per-epoch counter (Phase 3 Gate B).
-  // Stamped in every snapshot (projected and complete). The client tracks
-  // lastAppliedStructuralRevision: < → discard stale, == → idempotent skip,
-  // > → apply. Undefined (omitempty) on a fresh store or absent from an old
-  // server → client treats absent as "always apply".
-  structuralRevision?: number;
-  // Stubs (Phase 4): collapsed-branch stubs for idle subtrees. Each stub
-  // represents a subtree that exists on the server but is NOT materialized
-  // as a full session — the client renders it as a collapsed row. Absent in
-  // AUTHORITY_COMPLETE snapshots.
-  stubs?: CollapsedBranchStub[];
-  // CutoffVersion + CutoffMs (Phase 6 Gate E): the projection cutoff that was
-  // active when this projected snapshot was constructed. CutoffVersion is a
-  // monotonic policy version — it bumps when the server changes the cutoff.
-  // CutoffMs is the cutoff duration in milliseconds (default 600000 = 10min).
-  // The client tracks lastCutoffVersion to detect a boundary change. Absent
-  // in AUTHORITY_COMPLETE snapshots.
-  cutoffVersion?: number;
-  cutoffMs?: number;
-  // StaleCursor (Theme 3 / Finding A): set ONLY by the lazy-expand (branch)
-  // endpoint when a non-empty pagination cursor child was deleted/reparented
-  // between page requests. lazyExpandBranch reads this to restart the branch
-  // expansion ONCE from page 0 under a fresh branch structural generation,
-  // rather than treating the empty batch as terminal pagination completion
-  // (which would permanently omit the siblings after the deleted cursor).
-  // Absent on every other path.
-  staleCursor?: boolean;
   // ProjectConstants (Phase 3 snapshot trim): present when the client opts
   // into `?hoist=1`. The server hoists the per-session model/projectID/
   // directory (constant across all sessions in a project) into this map and
@@ -145,20 +108,6 @@ export interface Snapshot {
   // non-hoisted snapshots (old clients, legacy Snapshot path). See
   // ProjectConstants.
   projectConstants?: ProjectConstants;
-}
-
-// CollapsedBranchStub (Phase 4) is the wire representation of a collapsed idle
-// subtree. See Go's CollapsedBranchStub (pkg/state/projection.go).
-export interface CollapsedBranchStub {
-  id: string;
-  parentID?: string;
-  title?: string;
-  kind: "collapsed-branch";
-  hasChildren: boolean;
-  descendantCount: number;
-  newestActivityAt?: number; // unix millis, absent = never active
-  aggregateState: "idle" | "recent" | "busy" | "retry" | "needs-input";
-  structuralRevision?: number;
 }
 
 // Tier-A "current verb" facet: the RAW tool part primitive the daemon emits so

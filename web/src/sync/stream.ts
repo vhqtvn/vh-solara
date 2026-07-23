@@ -20,15 +20,9 @@ import { handleNotice } from "../alerts";
 import { checkVersionNow } from "../pwa";
 import { log } from "../lib/log";
 import { state, setState, projectDir, selectedId, persist } from "./store";
-import { invalidateChildrenIndex, normalizeTodos, descendantSessionIds } from "./selectors";
+import { invalidateChildrenIndex, normalizeTodos } from "./selectors";
 import { notifyFromMessage, maybeNotifyRootDone, maybeClearWaiting } from "./orchestration";
 import { isGateActive, currentGateEpoch, markBusyDirty, setReconcileFn } from "../busy";
-// Phase 3 Step A (COEXIST): the tree=2 render path lives alongside the proj=1
-// projection path. When tree2Enabled() is true, Stream 1 sends &tree=2 (drops
-// proj=1/hoist=1) and routes the tree.* events into the flat-map op-applier
-// (treeState) instead of the projection applySnapshot path. The OLD path and
-// ALL its symbols stay intact for flag-OFF (proj=1) — no deletes this slice.
-import { tree2Enabled } from "./url";
 import {
   decodeTreeSnapshot,
   decodeTreeOp,
@@ -158,22 +152,6 @@ export const MAX_RESIDENT_BYTES = 5 * 1024 * 1024; // 5 MiB
 export function resetPageInFlight(sid?: string) {
   if (sid) pageInFlight.delete(sid);
   else pageInFlight.clear();
-}
-
-// resetTreeStreamStateForTesting resets module-level tree-stream state that
-// persists across applySnapshot calls. Used by unit tests (applySnapshot.test.ts)
-// to isolate structuralRevision guard tests from prior test state.
-export function resetTreeStreamStateForTesting() {
-  lastAppliedStructuralRevision = undefined;
-  lastCutoffVersion = undefined;
-  branchRequestGen = 0;
-}
-
-// getBranchRequestGenForTesting exposes the structural-generation counter for
-// unit tests (Theme 3). Production code never reads it directly — only
-// lazyExpandBranch captures and compares it.
-export function getBranchRequestGenForTesting(): number {
-  return branchRequestGen;
 }
 
 // fetchMessagePage — GET /vh/session/{sid}/messages?before=<id>&z=1. Mirrors
@@ -511,70 +489,7 @@ function evictIfOverCap(s: any, sid: string): boolean {
 // the singleton store, so the tests drive it directly and assert on `state`.
 export function applySnapshot(snap: Snapshot) {
   bumpUpdating();
-  // Phase 3 Gate B: structuralRevision monotonicity guard. Discard stale (<),
-  // skip idempotent (==), apply (>). Reset on epoch change (new epoch starts
-  // fresh at revision 0). When either revision is undefined (old server omits
-  // the field, or this is the first snapshot for a fresh client), always apply.
   const incomingEpoch = snap.epoch || "";
-  if (epochChanged(state.epoch, incomingEpoch)) {
-    lastAppliedStructuralRevision = undefined;
-    lastCutoffVersion = undefined;
-  } else if (
-    snap.structuralRevision !== undefined &&
-    lastAppliedStructuralRevision !== undefined
-  ) {
-    if (snap.structuralRevision < lastAppliedStructuralRevision) return;
-    if (snap.structuralRevision === lastAppliedStructuralRevision) {
-      // Finding #1: structuralRevision versions ONLY projection topology/stubs.
-      // Non-structural facets (lastAgents, currentVerbs, todos, statuses,
-      // unread) are NOT covered by it. A ring-gap (4096 missed NON-structural
-      // events) → reconnect → server sends a fresh snapshot at the SAME
-      // revision → the old client discarded it wholesale → stale facets
-      // persisted AND the resume cursor never advanced, while the server had
-      // already moved its baseline forward (direct sibling of stale-busy). Now:
-      // same-revision idempotency-skips ONLY a genuine duplicate (caught-up seq
-      // AND not a frontier-rebuild cause). A same-rev snapshot with a NEWER seq
-      // (ring-gap fill — topology unchanged, authoritative facets advanced) OR a
-      // full-rebuild cause (initial/promotion/reconnect/resync — re-establishes
-      // the frontier even at a caught-up seq, needed by Finding #2) MUST fall
-      // through so authoritative facets reconcile and the cursor advances. Since
-      // structuralRevision guards topology only, a same-rev merge is by
-      // construction non-regressing on topology (no stub resurrected, no node
-      // demoted wrongly) — projected merges preserve-absent for sessions, and
-      // the complete path's wholesale replace is authoritative at that revision.
-      const fullRebuild =
-        !!snap.projected &&
-        (snap.cause === "initial" ||
-          snap.cause === "promotion" ||
-          snap.cause === "reconnect" ||
-          snap.cause === "resync");
-      const caughtUp =
-        snap.seq !== undefined &&
-        state.cursor !== undefined &&
-        snap.seq <= state.cursor;
-      if (caughtUp && !fullRebuild) return; // genuine duplicate → idempotent skip
-      // else: same rev + newer seq (ring-gap) OR full-rebuild → fall through
-    }
-  }
-  // Phase 2 Gate A: projected snapshots use MERGE semantics — sessions absent
-  // from the array are PRESERVED as hidden, NOT deleted. Only an explicit
-  // session.delete event removes a session. AUTHORITY_COMPLETE (projected
-  // absent/false) keeps the legacy wholesale-replace where omission === deleted.
-  // The capability is dual-negotiated: `?proj=1` (query param) + `projected:true`
-  // (envelope). An old server ignoring proj=1 emits no `projected` field, so a
-  // new client falls back to wholesale-replace transparently.
-  if (snap.projected) {
-    applyProjectedSnapshot(snap);
-    if (snap.structuralRevision !== undefined)
-      lastAppliedStructuralRevision = snap.structuralRevision;
-    // Phase 6 Gate E: record the projection cutoff version so a policy change
-    // is detectable. No cache invalidation needed — the merge path handles
-    // cutoff-driven boundary changes naturally (sessions materialized under
-    // the new cutoff are upserted; demoted sessions become stubs).
-    if (snap.cutoffVersion !== undefined)
-      lastCutoffVersion = snap.cutoffVersion;
-    return;
-  }
   const changed = epochChanged(state.epoch, incomingEpoch);
   // B2a resync window: mergeLastAgents is ONLY correct while the server is
   // re-aggregating after a restart. Outside that window a complete AUTHORITATIVE
@@ -646,252 +561,6 @@ export function applySnapshot(snap: Snapshot) {
   // Wholesale session-set replacement invalidates the parent→children index.
   invalidateChildrenIndex();
   persist();
-  // Theme 3: AUTHORITY_COMPLETE wholesale-replaces the sessions set → topology
-  // changed. Bump so an in-flight lazy-expand detects the structural shift.
-  bumpBranchStructuralGen();
-  // Phase 3 Gate B: record the applied revision (complete path).
-  if (snap.structuralRevision !== undefined)
-    lastAppliedStructuralRevision = snap.structuralRevision;
-}
-
-// applyProjectedSnapshot — Phase 2 Gate A merge path. When `snap.projected` is
-// true, the snapshot carries only the ACTIVE CLOSURE + frontier stubs (Phase 4
-// builds the projection; Phase 2 just wires the merge machinery). Sessions
-// ABSENT from the array are PRESERVED as hidden — they are collapsed behind a
-// frontier stub on the server and will be lazy-expanded on demand. Only an
-// explicit `session.delete` event removes a session (Gate A core rule:
-// projected snapshots MAY NOT infer deletion from omission). The ONE
-// exception is a full-rebuild snapshot (cause initial|promotion|reconnect|
-// resync): the frontier is then authoritative for roots + one level under
-// each materialized parent, so a client session absent from BOTH snap.sessions
-// and snap.stubs there is a ghost (deleted server-side, e.g. its session.delete
-// fell outside the replay ring) and is pruned. Deep idle subtrees whose parent
-// is itself a collapsed stub stay preserved (frontier not authoritative there).
-//
-// Merge semantics per slice (the preserve-absent rules below protect HIDDEN
-// sessions — those behind a stub; Gate A. For MATERIALIZED sessions the
-// reconcile block further down is AUTHORITATIVE: a facet absent from a
-// present facet-map means CLEARED server-side, so any stale client value is
-// deleted. A facet map entirely absent on the wire is an omitempty-dropped
-// empty map (projected snapshots always build every map server-side), so it
-// clears all materialized sessions):
-//   - sessions:       UPSERT incoming; PRESERVE absent (hidden !== deleted).
-//   - activity:       UPSERT incoming; PRESERVE absent.
-//   - lastAgents:     MERGE (incoming non-empty wins; FE entries the snapshot
-//                     omits are kept for hidden sessions — same as the
-//                     resync-window path). Cleared for materialized sessions.
-//   - currentVerbs:   UPSERT incoming; PRESERVE absent (hidden). Cleared for
-//                     materialized sessions absent from the map.
-//   - permissions:    REPLACE per-session for sessions present in snap; PRESERVE
-//                     sessions absent (hidden — their perms are still live).
-//                     Cleared for materialized sessions absent from the map.
-//   - questions:      Same as permissions.
-//   - todos:          REPLACE per-session present; PRESERVE absent (hidden).
-//   - unread:         MERGE (incoming wins; absent roots preserved for hidden).
-//                     Cleared for materialized sessions not in the unread list.
-//   - epoch/cursor:   Always update (projected snapshots advance the cursor).
-//
-// Transcript orthogonality (Gate F): this function touches NONE of
-// messages/messagesLoaded/messageWindows/Stream-2/msgRev. Those are owned by
-// the open-session lifecycle and are orthogonal to the tree projection.
-function applyProjectedSnapshot(snap: Snapshot) {
-  const incomingEpoch = snap.epoch || "";
-  const changed = epochChanged(state.epoch, incomingEpoch);
-  // Capture the open/selected session BEFORE the produce block: a session the
-  // server demoted to a stub on a full-rebuild snapshot is pruned from
-  // state.sessions below — but the viewed session is exempt, since dropping its
-  // payload would blank SessionInspector/ChatView mid-view. The render-layer
-  // guard (!state.sessions[s.id]) already hides that one session's stub, so
-  // skipping the prune is correct and loses nothing.
-  const openId = selectedId();
-  // The set of sessions the server MATERIALIZED (the active closure). For these
-  // the server is authoritative on every per-session facet — see the reconcile
-  // below. Also reused by the full-rebuild ghost/demotion reconcile.
-  const materializedIds = new Set((snap.sessions || []).map((x) => x.id));
-  setState(
-    produce((s) => {
-      // Sessions: upsert incoming, PRESERVE absent. This is the core Gate A
-      // rule — a session omitted from a projected snapshot is hidden, not
-      // deleted. Only session.delete removes it.
-      for (const sess of snap.sessions || []) s.sessions[sess.id] = sess;
-      // Activity: upsert incoming, preserve absent.
-      if (snap.activity) {
-        for (const [id, act] of Object.entries(snap.activity)) s.activity[id] = act;
-      }
-      // lastAgents: merge (same semantics as the resync-window path — incoming
-      // non-empty wins, absent preserved). A projected snapshot may omit labels
-      // for sessions it didn't materialize; keep the FE cache.
-      s.lastAgents = mergeLastAgents(s.lastAgents, snap.lastAgents || {});
-      // currentVerbs: upsert incoming, preserve absent.
-      if (snap.currentVerbs) {
-        for (const [id, v] of Object.entries(snap.currentVerbs)) s.currentVerbs[id] = v;
-      }
-      // Permissions: replace per-session for sessions present in the snapshot;
-      // preserve absent sessions (their pending permissions are still live).
-      for (const [sid, perms] of Object.entries(snap.permissions || {})) {
-        s.permissions[sid] = {};
-        for (const p of perms) s.permissions[sid][p.id] = p;
-      }
-      // Questions: same as permissions.
-      for (const [sid, qs] of Object.entries(snap.questions || {})) {
-        s.questions[sid] = {};
-        for (const q of qs) s.questions[sid][q.id] = q;
-      }
-      // Todos: replace per-session for sessions present; preserve absent.
-      for (const [sid, v] of Object.entries(snap.todos || {})) s.todos[sid] = normalizeTodos(v);
-      // Unread: merge (incoming wins, absent preserved — a hidden root can still
-      // be unread).
-      for (const id of snap.unread || []) s.unread[id] = true;
-      // Projected facet reconcile (Finding #4 / DEFER #4): the snapshot's
-      // `sessions` array is the active closure the server MATERIALIZED — for
-      // those sessions the server is authoritative on every per-session facet.
-      // A materialized session ABSENT from a facet-map (permissions/questions/
-      // lastAgents/currentVerbs/unread) means CLEARED server-side, so clear any
-      // stale client value. Sessions NOT materialized (hidden behind a stub) are
-      // untouched — their facets stay preserved (Gate A: omission ≠ deletion for
-      // hidden sessions; only materialized sessions get facet authority). This
-      // closes the same stale-facet class as stale-busy: a missed
-      // permission.delete / question.delete / unread.clear / activity-verb-clear
-      // no longer leaves a stale "needs input" / permission / verb lingering.
-      //
-      // A projected snapshot ALWAYS builds all facet maps server-side
-      // (SnapshotProjected / SnapshotBranch initialize every map non-nil), so a
-      // map ABSENT on the wire is an omitempty-dropped EMPTY map, not "not spoken
-      // for." Without treating absent-as-empty, a scenario where every
-      // materialized session clears a facet simultaneously (e.g. a bulk
-      // permission.clear) would leave an empty map that Go's omitempty drops,
-      // and the stale facet would persist indefinitely.
-      const la = snap.lastAgents || {};
-      const cv = snap.currentVerbs || {};
-      const pm = snap.permissions || {};
-      const qs = snap.questions || {};
-      const ur = new Set(snap.unread || []);
-      for (const id of materializedIds) {
-        if (!(id in la)) delete s.lastAgents[id];
-        if (!(id in cv)) delete s.currentVerbs[id];
-        if (!(id in pm)) delete s.permissions[id];
-        if (!(id in qs)) delete s.questions[id];
-        if (!ur.has(id)) delete s.unread[id];
-      }
-      // Stubs (Phase 4): upsert incoming stubs. Replace the stub map entirely
-      // when cause="initial"/"promotion"/"reconnect"/"resync" (the server
-      // re-projects the full frontier) or on epoch change (server restart
-      // invalidates them); merge for "lazy-expand" (partial branch expansion).
-      // The full-rebuild paths (changed || fullCause) ALSO reconcile
-      // state.sessions against the rebuilt stub map — see below.
-      const fullCause =
-        snap.cause === "initial" ||
-        snap.cause === "promotion" ||
-        snap.cause === "reconnect" ||
-        snap.cause === "resync";
-      if (changed || fullCause) {
-        s.branchStubs = {};
-        for (const stub of snap.stubs || []) s.branchStubs[stub.id] = stub;
-        // Reconcile: a session the server demoted to a stub (present in stubs,
-        // absent from snap.sessions) must leave state.sessions — else its stale
-        // materialized payload lingers alongside the stub, violating the
-        // server's session-XOR-stub invariant within one snapshot. This
-        // reconciles an EXPLICIT demotion (stub present), NOT an inferred
-        // deletion from omission, so Gate A (preserve-absent) is intact. The
-        // open session is exempt: the render-layer guard already hides its
-        // stub, and dropping its payload would blank the chat/inspector
-        // mid-view. Per-session metadata maps (activity/lastAgents/permissions/
-        // questions/currentVerbs/todos/unread) are intentionally NOT pruned —
-        // the session is collapsed into a stub, not deleted, and may be
-        // re-materialized on lazy-expand (unlike session.delete, which DOES
-        // prune those). Transcript state (messages/messagesLoaded/...) is
-        // orthogonal (Gate F) and likewise untouched.
-        // Full-rebuild reconcile: walk every client session and prune those the
-        // server no longer materializes. Two cases (both exclude openId — the
-        // viewed session's payload is never dropped mid-view; its render-layer
-        // stub guard hides it):
-        //   (a) EXPLICIT DEMOTION — a stub exists for this id (the server
-        //       collapsed it behind the frontier). Prune the stale materialized
-        //       payload so it doesn't linger alongside its stub (the original
-        //       duplicate-session fix). NOT a deletion — per-session metadata is
-        //       preserved (the session may re-materialize on lazy-expand).
-        //   (b) GHOST (DEFER #1) — NO stub exists either, i.e. the id is absent
-        //       from BOTH snap.sessions and stubs. Under a full-rebuild snapshot
-        //       this means server-deleted — but ONLY conclude that where the
-        //       frontier is AUTHORITATIVE: a ROOT (every server root is either
-        //       active-in-snap or an idle stub, so a client root that's neither
-        //       was deleted) or a child of a MATERIALIZED parent (the frontier
-        //       is exhaustive one level deep under an active parent — every
-        //       non-active child is emitted as a stub, so absence = deleted).
-        //       Deeper idle subtrees whose parent is itself hidden are NOT
-        //       authoritative — preserve them (Gate A: omission ≠ deletion).
-        //       Ghosts are progressively cleaned as the user navigates and
-        //       lazy-expand materializes the next level. Per-session metadata is
-        //       intentionally NOT pruned here (consistent with the demotion
-        //       case); the authoritative metadata prune is the session.delete
-        //       event path. This fixes the ghost-RENDERING risk (a deleted
-        //       session appearing in the tree after localStorage hydration when
-        //       its session.delete fell outside the replay ring).
-        const stubIds = new Set(Object.keys(s.branchStubs));
-        for (const id of Object.keys(s.sessions)) {
-          if (id === openId) continue;
-          if (materializedIds.has(id)) continue; // server materialized it → keep
-          if (stubIds.has(id)) {
-            // (a) explicit demotion: stub present → collapse the materialized
-            //     payload into the stub row.
-            delete s.sessions[id];
-            continue;
-          }
-          // (b) ghost: absent from both snap.sessions and stubs.
-          const parentID = s.sessions[id]?.parentID || "";
-          // A TRUE root (no parentID): every server root is either active
-          // (in snap.sessions) or an idle stub, so a client root absent from
-          // both was deleted. NOTE: do NOT treat an orphan (parentID set but
-          // parent missing from state.sessions) as a ghost root — its parent
-          // may be collapsed behind a stub (preserved here) and orphan cleanup
-          // is a separate concern (orphans.ts). Cascading a demotion prune into
-          // a child ghost-prune would wrongly delete deep idle subtrees.
-          const ghostRoot = !parentID;
-          // A child of a MATERIALIZED parent: the frontier is exhaustive one
-          // level deep under an active parent, so a child absent from both the
-          // active set and the stub set was deleted.
-          const ghostChild = !!parentID && materializedIds.has(parentID);
-          if (ghostRoot || ghostChild) {
-            delete s.sessions[id];
-          }
-        }
-      } else {
-        // lazy-expand or cause absent: merge (NO reconcile — a partial snapshot
-        // legitimately omits still-active sessions materialized in other
-        // branches; pruning them here would delete live data).
-        for (const stub of snap.stubs || []) s.branchStubs[stub.id] = stub;
-      }
-      // Epoch transition: latch for the connection-health toast. On epoch
-      // change, clear expandedBranches (server restart invalidates all stubs).
-      if (changed) {
-        s.epochChanged = true;
-        s.expandedBranches = {};
-      }
-      if (incomingEpoch) s.epoch = incomingEpoch;
-      s.cursor = snap.seq;
-      // Phase 3 snapshot trim: apply the hoisted project constants. Overwrite
-      // (the server is authoritative for the project's model/projectID/
-      // directory on every projected snapshot). When the snapshot didn't hoist
-      // (old daemon, or an edge path), snap.projectConstants is undefined → we
-      // preserve the prior value so a one-off non-hoisted snapshot doesn't
-      // blank the fallback a prior snapshot established.
-      if (snap.projectConstants) s.projectConstants = snap.projectConstants;
-    }),
-  );
-  // The merge may have added/changed sessions — invalidate the children cache.
-  invalidateChildrenIndex();
-  persist();
-  // Theme 3: a full-rebuild (changed || fullCause) wholesale-replaces the stub
-  // map and prunes ghosts/demotions → topology changed. Bump so an in-flight
-  // lazy-expand detects the structural shift and retries/aborts rather than
-  // merging a response whose contents are now stale. lazy-expand cause does
-  // NOT bump (it is a partial point-in-time read, not a topology mutation).
-  const fullCauseSnap =
-    snap.cause === "initial" ||
-    snap.cause === "promotion" ||
-    snap.cause === "reconnect" ||
-    snap.cause === "resync";
-  if (changed || fullCauseSnap) bumpBranchStructuralGen();
 }
 
 // Exported for integration tests (tests/unit/applySnapshot.test.ts).
@@ -918,7 +587,6 @@ export function applySessionEvent(kind: string, seq: number, payload: any) {
         delete s.messagesLoaded[payload.id];
         delete s.messagesError[payload.id];
         delete s.refreshing[payload.id];
-        delete s.branchStubs[payload.id]; // Phase 4: prune collapsed stub
         resetPageInFlight(payload.id);
       }
       if (seq) s.cursor = seq;
@@ -927,12 +595,6 @@ export function applySessionEvent(kind: string, seq: number, payload: any) {
   // session.upsert / session.delete change the parent→children topology.
   invalidateChildrenIndex();
   persist();
-  // Theme 3: session.upsert/delete change parent→children topology. Bump so an
-  // in-flight lazy-expand detects the shift (a deleted/reparented child in the
-  // response would otherwise resurrect via merge).
-  if (kind === "session.upsert" || kind === "session.delete") {
-    bumpBranchStructuralGen();
-  }
 }
 
 // pruneSessionDeleted removes a session from the client store as if a
@@ -954,13 +616,11 @@ export function pruneSessionDeleted(id: string) {
       delete s.messagesLoaded[id];
       delete s.messagesError[id];
       delete s.refreshing[id];
-      delete s.branchStubs[id];
     }),
   );
   resetPageInFlight(id);
   invalidateChildrenIndex();
   persist();
-  bumpBranchStructuralGen();
 }
 
 // Message/part events are applied only for opened sessions (those present in
@@ -1122,8 +782,8 @@ export function applyMessageEvent(kind: string, seq: number, payload: any, track
             if (payload.agent) {
               s.lastAgents[payload.sessionID] = payload.agent;
               // tree=2 gap fill: also patch the tree node so the chip renders on
-              // collapsed nodes without an expand round-trip. No-op for tree=1
-              // (tree store unseeded) or nodes that already have their agent.
+              // collapsed nodes without an expand round-trip. No-op for nodes
+              // that already have their agent.
               patchTreeAgent(payload.sessionID, payload.agent);
             } else delete s.lastAgents[payload.sessionID];
           }
@@ -1479,33 +1139,6 @@ let treeSnapDone = false;
 // and again after the await. Without this, a stale decode from a superseded
 // connection would clobber the replacement's fresh state with a stale snapshot.
 let treeGen = 0;
-// branchRequestGen (Theme 3 / Finding #3) is a client-side structural-generation
-// counter bumped on every applied Stream1 TOPOLOGY change (session.upsert,
-// session.delete, projected full-rebuild stub replacement, AUTHORITY_COMPLETE
-// wholesale sessions replace). lazyExpandBranch captures it at fetch start and
-// rejects a response that lands after a structural mutation — the response
-// contents could reference a child deleted/reparented mid-flight, which merge
-// would resurrect (the same class as duplicate-session). Unlike treeGen (bumped
-// only on reconnect), this tracks in-session structural churn so a lazy-expand
-// is retried/aborted rather than applying stale topology. applyLazyExpandMerge
-// does NOT bump it (it materializes existing server-authoritative frontier, not
-// a topology mutation — bumping would self-abort the very expansion in flight).
-let branchRequestGen = 0;
-function bumpBranchStructuralGen(): void {
-  branchRequestGen++;
-}
-// Phase 3 Gate B: last-applied structural revision. Used to discard stale
-// snapshot responses (<), skip idempotent re-applies (==), and apply newer
-// (>). Reset to undefined on epoch change (a new epoch starts fresh). When
-// either side is undefined (old server or fresh client), always apply.
-let lastAppliedStructuralRevision: number | undefined = undefined;
-// Phase 6 Gate E: last-seen projection cutoff version. When the server changes
-// its cutoff policy (bumps cutoffVersion), the client records the new version
-// and the new cutoffMs. This is diagnostic-only for now (no client-side cache
-// to invalidate — lazy-expand always re-fetches fresh; the merge path handles
-// cutoff-driven boundary changes naturally). Reset on epoch change / fresh
-// connect. Undefined = never seen a projected snapshot with cutoff info.
-let lastCutoffVersion: number | undefined = undefined;
 // In-flight gzip64 snapshot decode for the CURRENT tree connection. A warm
 // tree snapshot ships compressed (server maybeCompressSnapshot when z=1); the
 // decode is ASYNC (native DecompressionStream). applySnapshot
@@ -1667,14 +1300,6 @@ export function connect(fresh = false) {
   // ses?.close()); the prior Stream-1 order (close THEN bump) left a stale-
   // decode hazard on the empty-dir path.
   treeGen++;
-  // Phase 3 Gate B: a fresh connect (project switch or explicit tree refresh)
-  // means the next snapshot comes from a potentially different Store whose
-  // structuralRevision counter is independent. Reset so the guard always
-  // applies the incoming snapshot instead of comparing across Stores.
-  if (fresh) {
-    lastAppliedStructuralRevision = undefined;
-    lastCutoffVersion = undefined;
-  }
   // Reset the in-flight decode gate so a live tree event landing on the new
   // connection doesn't await a stale decode from the prior connection.
   treeSnapshotDecode = Promise.resolve();
@@ -1696,17 +1321,11 @@ export function connect(fresh = false) {
   // already invalidated any prior decode; this `gen` is checked at listener
   // entry and after every await in the snapshot listener.
   const gen = treeGen;
-  // Phase 3 Step A (COEXIST): when ?tree=2 is present, Stream 1 negotiates the
-  // new server-owned tree stream and routes events into the flat-map
-  // op-applier (treeState). When absent, the EXACT existing proj=1 projection
-  // path runs unchanged. The flag is read once per connection (capability held
-  // for the connection's life per §10); both branches stay compiled + reachable.
-  const useTree2 = tree2Enabled();
-  // On a FRESH tree=2 connect (project switch or explicit refresh), clear the
-  // flat map so a stale map from a different Store can't bleed into the new
-  // snapshot. On a tree=2 RESUME (reconnect with cursor) the map is preserved
-  // so delta ops replay cleanly onto the prior state.
-  if (useTree2 && fresh) resetTreeStore();
+  // On a FRESH connect (project switch or explicit refresh), clear the flat
+  // map so a stale map from a different Store can't bleed into the new
+  // snapshot. On a RESUME (reconnect with cursor) the map is preserved so
+  // delta ops replay cleanly onto the prior state.
+  if (fresh) resetTreeStore();
   // Stream 1 (tree) opts into the server's gzip64 snapshot compression with
   // `&z=1`, mirroring Stream 2's session stream. The tree snapshot for a real
   // project is ~760 KiB–1.1 MiB of highly repetitive JSON (one project, one
@@ -1716,28 +1335,14 @@ export function connect(fresh = false) {
   // The server's maybeCompressSnapshot only wraps payloads ≥ 2 KiB AND only
   // when z=1 is set, so small/raw responses (an old server, or an edge-case
   // tiny tree) still ship raw and the listener handles both shapes.
-  // `&proj=1` (Phase 2 Gate A): opts into projected (collapsed-frontier)
-  // snapshot mode. The server reads this via wantsProject(); when it supports
-  // projection (Phase 4+), it emits `projected:true` on the envelope and the
-  // client takes the merge path. An old server ignores proj=1 and emits
-  // AUTHORITY_COMPLETE (no `projected` field), so the client transparently
-  // falls back to wholesale-replace. Independent from z=1.
-  // `&hoist=1` (Phase 3 snapshot trim): opts into hoisting the per-session
-  // model/projectID/directory constants into a snapshot-level projectConstants
-  // map. The server strips them from each session's info and emits the map;
-  // selectors.sessionModel falls back to the map. An old server ignores hoist=1
-  // and always sends per-session fields, so the client works unchanged. Only
-  // meaningful alongside proj=1 (the hoist path lives in SnapshotProjected).
   //
-  // tree=2 branch (§10): when useTree2 is set we negotiate the server-owned
-  // tree stream instead — drop proj=1/hoist=1 (the projection path is dormant
-  // server-side when the tree emitter is engaged) and send &tree=2. The shared
-  // resume cursor (state.cursor, store-seq space, see F4 below) is identical
-  // for both modes, so cursorParam above applies unchanged.
+  // `&tree=2` (§10): negotiate the server-owned tree stream. The server emits
+  // tree.* frames (structure → treeState flat map) AND the legacy detail
+  // frames (snapshot/session.*/permission.*/etc → the detail layer). The
+  // shared resume cursor (state.cursor, store-seq space, see F4 below) is
+  // identical for both projections, so cursorParam above applies unchanged.
   es = new EventSource(
-    useTree2
-      ? `/vh/stream?${cursorParam}sessions=&dir=${encodeURIComponent(projectDir())}&z=1&tree=2`
-      : `/vh/stream?${cursorParam}sessions=&dir=${encodeURIComponent(projectDir())}&z=1&proj=1&hoist=1`,
+    `/vh/stream?${cursorParam}sessions=&dir=${encodeURIComponent(projectDir())}&z=1&tree=2`,
   );
   markTreeSeen();
   log.debug("sync", "tree stream connect", { cursor: fresh ? "fresh" : state.cursor, dir: projectDir() });
@@ -2773,16 +2378,11 @@ export function maybeReconnect() {
 //
 // The O1 collapsed-frontier optimization removed the frequent full
 // re-projections that used to CONTINUOUSLY self-heal client/daemon state, so a
-// long-lived stream now accumulates drift (ghost sessions, stale demotions /
-// stubs, demotion-sweep signals missed by other concurrent streams — Issue 3)
-// until the next restart/reconnect. A bounded low-frequency tree reconnect
-// (connect(true)) requests ONE fresh projected snapshot; the server responds
-// with cause "initial" then "reconnect" after replay — both fullRebuild causes
-// — so applyProjectedSnapshot's full-rebuild reconcile (stream.ts ~773) walks
-// the client session set, collapses explicit demotions into stubs, and prunes
-// root / child-of-materialized ghosts; per-session facets reconcile; the open
-// session stays exempt (the openId skip at the reconcile walk). This is the
-// existing full-rebuild reconcile path — reused, not a new primitive.
+// long-lived stream now accumulates drift until the next restart/reconnect. A
+// bounded low-frequency tree reconnect (connect(true)) requests ONE fresh
+// snapshot so applySnapshot wholesale-replaces the detail layer and the tree.*
+// frames re-seed the flat map; the open session stays exempt. This is the
+// existing snapshot reconcile path — reused, not a new primitive.
 //
 // This is NOT the promotion amplifier: it is ONE snapshot per interval, not a
 // per-activity full re-snapshot. Cost ≈ 88 KB compressed × (3600 / interval)
@@ -2815,278 +2415,15 @@ export function _resetResyncGateForTest(): void {
   lastTreeResync = 0;
 }
 
-// ─── Phase 5: lazy-expand branch ────────────────────────────────────────────
-//
-// The lazy-expand endpoint is GET /vh/sessions/branch?id=<frontier-id>&cursor=.
-// It's a point-in-time READ, not a Stream1 event — so its response MUST NOT
-// update s.cursor or lastAppliedStructuralRevision (those are Stream1 concepts
-// tied to the SSE seq-ordered delivery). The dedicated applyLazyExpandMerge
-// below handles this: it merges sessions/stubs/activity/etc. but leaves cursor
-// and structuralRevision untouched. This preserves the Stream1 cursor's
-// authority over tree liveness and the structuralRevision's monotonicity guard.
-const branchExpandInFlight = new Set<string>();
-
-// Merge a lazy-expand response WITHOUT touching cursor or structuralRevision.
-// Mirrors applyProjectedSnapshot's merge semantics but skips the Stream1-only
-// fields. Gate F (transcript orthogonality) holds: lazy-expand carries only
-// metadata, not messages.
-function applyLazyExpandMerge(snap: Snapshot) {
-  const materializedIds = new Set((snap.sessions || []).map((x) => x.id));
-  setState(
-    produce((s) => {
-      for (const sess of snap.sessions || []) s.sessions[sess.id] = sess;
-      if (snap.activity) {
-        for (const [id, act] of Object.entries(snap.activity)) s.activity[id] = act;
-      }
-      s.lastAgents = mergeLastAgents(s.lastAgents, snap.lastAgents || {});
-      if (snap.currentVerbs) {
-        for (const [id, v] of Object.entries(snap.currentVerbs)) s.currentVerbs[id] = v;
-      }
-      for (const [sid, perms] of Object.entries(snap.permissions || {})) {
-        s.permissions[sid] = {};
-        for (const p of perms) s.permissions[sid][p.id] = p;
-      }
-      for (const [sid, qs] of Object.entries(snap.questions || {})) {
-        s.questions[sid] = {};
-        for (const q of qs) s.questions[sid][q.id] = q;
-      }
-      for (const [sid, v] of Object.entries(snap.todos || {})) s.todos[sid] = normalizeTodos(v);
-      for (const id of snap.unread || []) s.unread[id] = true;
-      // Projected facet reconcile (Finding #4 / DEFER #4) — same authority as
-      // applyProjectedSnapshot: a materialized session absent from a facet-map
-      // is CLEARED server-side. Both SnapshotProjected and SnapshotBranch (the
-      // lazy-expand response builder) always build every facet map server-side,
-      // so an ABSENT map on the wire is an omitempty-dropped empty map (treated
-      // as "all cleared"), not "not spoken for." A lazy-expand snapshot is a
-      // partial point-in-time read of ONE branch's children, but the facet-map
-      // invariant holds for the materialized children it carries. Hidden
-      // sessions stay preserved (Gate A).
-      const la = snap.lastAgents || {};
-      const cv = snap.currentVerbs || {};
-      const pm = snap.permissions || {};
-      const qs = snap.questions || {};
-      const ur = new Set(snap.unread || []);
-      for (const id of materializedIds) {
-        if (!(id in la)) delete s.lastAgents[id];
-        if (!(id in cv)) delete s.currentVerbs[id];
-        if (!(id in pm)) delete s.permissions[id];
-        if (!(id in qs)) delete s.questions[id];
-        if (!ur.has(id)) delete s.unread[id];
-      }
-      // Stubs: merge (lazy-expand adds branch-specific stubs — grandchildren —
-      // without removing existing frontier stubs from other branches).
-      for (const stub of snap.stubs || []) s.branchStubs[stub.id] = stub;
-    }),
-  );
-  invalidateChildrenIndex();
-  persist();
-}
-
-// Lazy-expand a collapsed-branch stub: fetch the branch's children from the
-// server, merge them into state, and mark the branch as expanded. Single-flight
-// via branchExpandInFlight. Anti-clobber via treeGen + epoch (a tree reconnect
-// or project switch invalidates an in-flight fetch). Pagination via the
-// X-VH-Branch-Cursor header (continuation-based).
-//
-// Theme 3 / Finding #3 (anti-resurrection): captures branchRequestGen at each
-// fetch start. A structural mutation (session.upsert/delete, promotion snapshot)
-// landing between fetch-start and response-apply means the response contents may
-// reference a child deleted/reparented mid-flight — merging would resurrect it.
-// On a dirty generation the expansion restarts from page 1 under the fresh gen
-// (bounded: collapse on continuous structural churn — Finding B).
-//
-// Theme 3 / Finding A (stale cursor): when the server returns StaleCursor=true
-// (the non-empty cursor child was deleted/reparented between page requests), the
-// client restarts the expansion ONCE from page 0 under a fresh branchRequestGen
-// so the siblings after the deleted cursor are materialized. A second stale
-// signal within one expansion collapses the branch (bounded — no infinite loop).
-// Without this, an empty terminal page (the old "terminate" behavior) would make
-// the client conclude pagination completed and permanently omit later siblings.
-//
-// Theme 3 / Finding #6 (no-loop backstop): the client ALSO guards against a
-// no-progress page (same cursor twice) to terminate defensively even if the
-// server signal is absent.
-//
-// Finding B (collapse-on-abandon): when the bounded retry gives up (4
-// consecutive structural-generation mismatches OR two stale-cursor signals), the
-// branch is collapsed via collapseBranch so the UI returns to the collapsed-stub
-// state and a subsequent expand click retries normally — rather than leaving the
-// branch falsely expanded with stale materialized children.
-export async function lazyExpandBranch(branchID: string): Promise<void> {
-  if (!branchID) return;
-  if (branchExpandInFlight.has(branchID)) return; // single-flight
-  const gen = treeGen;
-  const epoch = state.epoch;
-  branchExpandInFlight.add(branchID);
-  setState("expandedBranches", branchID, true);
-  bumpUpdating();
-  try {
-    let cursor = "";
-    let prevCursor = ""; // Finding #6: no-progress detection
-    let structuralRetries = 0; // Finding #3: bounded retry on structural churn
-    let staleCursorRestarts = 0; // Finding A: bounded restart on stale cursor
-    for (;;) {
-      if (gen !== treeGen || epochChanged(epoch, state.epoch)) return; // anti-clobber
-      // Finding #3: capture the structural generation before the fetch. A
-      // structural mutation landing between fetch-start and response-apply means
-      // the response contents are stale w.r.t. the client's current topology.
-      const startGen = branchRequestGen;
-      const params = new URLSearchParams({
-        id: branchID,
-        dir: projectDir(),
-        z: "1",
-      });
-      if (cursor) params.set("cursor", cursor);
-      const res = await fetch(`/vh/sessions/branch?${params}`);
-      if (!res.ok) {
-        log.warn("sync", "lazy-expand fetch failed", {
-          branchID,
-          status: res.status,
-        });
-        return;
-      }
-      if (gen !== treeGen || epochChanged(epoch, state.epoch)) return; // anti-clobber
-      const raw = await res.json();
-      const snap = await decodeSnapshot<Snapshot>(raw);
-      // Finding A (stale cursor): the server signalled that the non-empty
-      // cursor child was deleted/reparented between page requests. Remaining
-      // siblings after the deleted cursor would be permanently omitted if we
-      // treated the empty batch as terminal pagination. Restart the expansion
-      // ONCE from page 0; the next iteration captures a fresh startGen so a
-      // mid-restart mutation is caught by the #3 guard. The body is empty by
-      // construction so there is nothing to merge. Checked BEFORE the #3 guard:
-      // a stale-cursor response carries no sessions to resurrect, and this is
-      // the server's authoritative "cursor gone" signal. A second stale signal
-      // within one expansion means continuous topology churn → collapse (Finding
-      // B) rather than loop forever.
-      if (snap.staleCursor) {
-        staleCursorRestarts++;
-        if (staleCursorRestarts > 1) {
-          log.warn("sync", "lazy-expand collapsed (stale cursor twice)", {
-            branchID,
-            restarts: staleCursorRestarts,
-          });
-          collapseBranch(branchID);
-          return;
-        }
-        log.debug("sync", "lazy-expand restarted (stale cursor)", {
-          branchID,
-          restart: staleCursorRestarts,
-        });
-        cursor = ""; // restart from page 0
-        prevCursor = "";
-        continue;
-      }
-      // Finding #3: anti-resurrection. If a structural mutation landed between
-      // fetch-start and now, the response contents may reference a child that
-      // was deleted/reparented mid-flight. Restart from page 1 under the fresh
-      // generation so the server re-serves the current frontier (bounded —
-      // collapse on continuous churn; the next promotion rebuilds the frontier).
-      if (startGen !== branchRequestGen) {
-        structuralRetries++;
-        if (structuralRetries > 3) {
-          // Finding B: bounded retry exhausted — collapse the branch so the UI
-          // returns to the collapsed-stub state and a subsequent expand click
-          // retries normally. Previously this returned without collapsing,
-          // leaving the branch falsely expanded with stale materialized
-          // children (the next click collapsed instead of retrying).
-          log.warn("sync", "lazy-expand collapsed (structural churn)", {
-            branchID,
-            retries: structuralRetries,
-          });
-          collapseBranch(branchID);
-          return;
-        }
-        log.debug("sync", "lazy-expand restarted (structural change)", {
-          branchID,
-          retry: structuralRetries,
-        });
-        cursor = ""; // restart from page 1
-        prevCursor = "";
-        continue;
-      }
-      // Anti-clobber: branch root may have been deleted/reparented during fetch.
-      // If the branch no longer exists as a stub OR as a session, discard.
-      if (!state.branchStubs[branchID] && !state.sessions[branchID]) {
-        log.debug("sync", "lazy-expand discarded (branch gone)", { branchID });
-        return;
-      }
-      applyLazyExpandMerge(snap);
-      cursor = res.headers.get("X-VH-Branch-Cursor") || "";
-      // Finding #6: no-progress guard. If the server returns the same cursor
-      // (or no cursor), terminate to avoid a loop.
-      if (!cursor || cursor === prevCursor) break;
-      prevCursor = cursor;
-      // Reset the structural-retry counter after a clean apply so only truly
-      // continuous churn (back-to-back gen mismatches with no successful page
-      // between them) triggers abandonment, not spread-out mutations.
-      structuralRetries = 0;
-    }
-  } catch (err) {
-    log.warn("sync", "lazy-expand error", { branchID, err: String(err) });
-  } finally {
-    branchExpandInFlight.delete(branchID);
-  }
-}
-
-// Collapse an expanded branch back to its stub-only state. In addition to
-// marking the branch collapsed, REMOVE the materialized descendants the
-// expansion fetched, restoring the frontier invariant (a materialized child's
-// DIRECT parent is always in state.sessions OR state.branchStubs).
-//
-// The old behavior only flipped expandedBranches[branchID]=false and left the
-// descendants sitting in state.sessions (the comment below used to claim they
-// "stay in state ... but the UI hides them"). That was the root cause of a
-// destructive false-positive: orphanSessions() scans state.sessions FLAT and
-// cannot tell collapse-hidden descendants from genuine orphans. When a later
-// full-rebuild snapshot (cause=initial/promotion/reconnect/resync) wiped
-// branchStubs and re-emitted only the one-level frontier — dropping this
-// branch's parent stub because its ancestor was demoted off the frontier —
-// those still-materialized descendants became false orphans and were offered
-// for the destructive bulk-archive. Removing them here returns to the
-// pre-expand state so the invariant holds; the next expand re-fetches from the
-// server (the frontier may have changed), and any genuinely-active descendant
-// is re-materialized with proper ancestor stubs by the next server projected
-// snapshot — so this is self-healing and loses nothing.
-//
-// The viewed/open session (selectedId) is exempt: dropping its payload would
-// blank ChatView/SessionInspector mid-view (mirrors the openId exemption in
-// applyProjectedSnapshot's reconcile). branchID itself is NEVER removed — it
-// stays as its stub or materialized session. All three trigger paths
-// (lazyExpandBranch stale-cursor-twice / structural-churn-exhausted, and the
-// manual twisty in StubNode) route through here, so this single fix covers all.
-export function collapseBranch(branchID: string): void {
-  if (!branchID) return;
-  const openId = selectedId();
-  const ids = descendantSessionIds(branchID);
-  const toRemove = ids.filter((id) => id !== openId);
-  setState(
-    produce((s) => {
-      for (const id of toRemove) {
-        delete s.sessions[id];
-        // Drop descendant stubs the expansion added (grandchildren), and clear
-        // nested-expand flags so a re-expand starts clean.
-        delete s.branchStubs[id];
-        delete s.expandedBranches[id];
-      }
-      s.expandedBranches[branchID] = false;
-    }),
-  );
-  if (toRemove.length) invalidateChildrenIndex();
-  persist();
-}
-
-// === Phase 3 Step A (COEXIST): tree=2 expand (§8) ===========================
+// === tree=2 expand (§8) =====================================================
 // Expand a node in the server-owned flat map: fetch all pages of its direct
 // children from GET /vh/tree/children, emitting a `node.children` op per page
 // (the terminal page flips the parent's `loaded` flag, §7.2). The stale-cursor
 // restart (§8.3) and the F1 fix (drop obsolete residents before restart) live
 // in treeOps.fetchChildren; this is just the real-network wiring of the injected
-// TreeFetcher. Single-flight per node id to match lazyExpandBranch's discipline.
+// TreeFetcher. Single-flight per node id.
 //
-// COEXIST: this is reached ONLY from the tree=2 render path (SessionTree's
-// TreeStateView onToggle). The proj=1 lazyExpandBranch above stays intact and is
-// reached from the flag-OFF render path. Collapse is client-only
+// Reached from the TreeStateView onToggle. Collapse is client-only
 // (treeState.collapseTreeNode drops loaded descendants, keeps the placeholder,
 // flips loaded:false per §8.4) — no network.
 const treeExpandInFlight = new Set<string>();

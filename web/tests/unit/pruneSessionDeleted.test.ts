@@ -7,8 +7,8 @@ import { invalidateChildrenIndex } from "../../src/sync/selectors";
 
 // pruneSessionDeleted mirrors the session.delete event handler's pruning: it
 // removes a session from every client-side store slice (sessions, lastAgents,
-// messageWindows, messagesLoaded, messagesError, refreshing, branchStubs) and
-// resets derived caches (pageInFlight, childrenIndex, persist, branchStructuralGen).
+// messageWindows, messagesLoaded, messagesError, refreshing) and resets derived
+// caches (pageInFlight, childrenIndex, persist).
 // It is called by archiveSession after a successful /vh/archive so that an
 // orphan whose server-side delete event never arrives (the session wasn't in
 // the server store → no KindSessionDelete emitted) is still removed from the
@@ -16,7 +16,6 @@ import { invalidateChildrenIndex } from "../../src/sync/selectors";
 
 beforeEach(() => {
   setState("sessions", reconcile({}));
-  setState("branchStubs", reconcile({}));
   setState("lastAgents", reconcile({}));
   setState("messageWindows", reconcile({}));
   setState("messagesLoaded", reconcile({}));
@@ -35,10 +34,6 @@ describe("pruneSessionDeleted", () => {
       parentID: "deadroot",
       title: "an orphan",
     } as any);
-    setState("branchStubs", "ghost", {
-      id: "ghost",
-      parentID: "deadroot",
-    } as any);
     setState("lastAgents", "ghost", "Claude Sonnet");
     setState("messageWindows", "ghost", { hasMore: false, ids: ["m1"] } as any);
     setState("messagesLoaded", "ghost", true);
@@ -46,7 +41,6 @@ describe("pruneSessionDeleted", () => {
     setState("refreshing", "ghost", true);
 
     expect(state.sessions["ghost"]).toBeDefined();
-    expect(state.branchStubs["ghost"]).toBeDefined();
     expect(state.lastAgents["ghost"]).toBe("Claude Sonnet");
     expect(state.messagesLoaded["ghost"]).toBe(true);
 
@@ -54,7 +48,6 @@ describe("pruneSessionDeleted", () => {
 
     // The session is gone from every slice — the banner can no longer find it.
     expect(state.sessions["ghost"]).toBeUndefined();
-    expect(state.branchStubs["ghost"]).toBeUndefined();
     expect(state.lastAgents["ghost"]).toBeUndefined();
     expect(state.messageWindows["ghost"]).toBeUndefined();
     expect(state.messagesLoaded["ghost"]).toBeUndefined();

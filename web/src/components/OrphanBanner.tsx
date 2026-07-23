@@ -1,47 +1,26 @@
 import { createMemo, createSignal, For, Show } from "solid-js";
-import { orphanSessions, rootInfoFor, archiveEligibleOrphans, type RootInfo } from "../orphans";
+import { treeMap } from "../sync/treeState";
 import { archiveSession } from "../archive";
 import { withGlobalBusy } from "../busy";
 import { displayName } from "../projectSettings";
-import type { Session } from "../types";
 import Icon from "./Icon";
 import styles from "./OrphanBanner.module.css";
 
-// A banner that surfaces orphaned sessions (parent root archived) so they're
-// known, plus a confirmed bulk-archive that shows each orphan's root and whether
-// that root is archived.
+// A banner that surfaces orphaned sessions. In tree=2 the SERVER marks a node
+// Node.flags.orphan=true when its root is archived but the cascade-archive
+// missed it — there is NO client-side orphan classification or root resolution.
+// All orphan-flagged nodes are server-confirmed eligible for archive.
 export default function OrphanBanner() {
-  const orphans = createMemo(() => orphanSessions());
+  const orphans = createMemo(() =>
+    Array.from(treeMap().values()).filter((n) => n.flags.orphan),
+  );
   const [open, setOpen] = createSignal(false);
-  const [rows, setRows] = createSignal<{ orphan: Session; root: RootInfo | null }[]>([]);
   const [busy, setBusy] = createSignal(false);
-  // Defense-in-depth gate (FIX 2): only orphans whose server-resolved root is
-  // CONFIRMED archived are eligible for the destructive bulk action. A live
-  // (ACTIVE) root or an unresolved root (fetch pending/failed) is excluded — it
-  // may be a client projection artifact (collapsed/stranded behind the
-  // frontier), not a genuine orphan. Re-derived from rows() so it updates as
-  // roots resolve in the background.
-  const eligible = createMemo(() => archiveEligibleOrphans(rows()));
-
-  async function openDialog() {
-    setRows(orphans().map((o) => ({ orphan: o, root: null })));
-    setOpen(true);
-    // Resolve each orphan's root info (cached by ancestor) in the background.
-    const resolved = await Promise.all(
-      orphans().map(async (o) => ({ orphan: o, root: await rootInfoFor(o.parentID!) })),
-    );
-    setRows(resolved);
-  }
 
   async function confirm() {
     setBusy(true);
     try {
-      // Archive ONLY the eligible subset (root CONFIRMED archived). Re-read
-      // eligible() so the latest resolved roots gate the action. Sequential to
-      // be gentle on the server when there are many. ONE outer global-busy
-      // scope around the whole loop (not per-iteration) so the overlay stays
-      // continuously visible and reconciliation runs once at the end.
-      const targets = eligible();
+      const targets = orphans();
       await withGlobalBusy(async () => {
         for (const o of targets) await archiveSession(o.id);
         setOpen(false);
@@ -58,7 +37,7 @@ export default function OrphanBanner() {
           <Icon name="help" size={13} /> {orphans().length} orphaned{" "}
           {orphans().length === 1 ? "session" : "sessions"}
         </span>
-        <button type="button" class={styles["orphan-banner-btn"]} onClick={() => void openDialog()}>
+        <button type="button" class={styles["orphan-banner-btn"]} onClick={() => setOpen(true)}>
           Archive orphans
         </button>
       </div>
@@ -74,31 +53,18 @@ export default function OrphanBanner() {
             </div>
             <div class="dialog-body">
               <p class="confirm-lead">
-                These subsessions have no live parent in the tree. Their root may
-                be active, archived, or the cascade-archive may have missed them.{" "}
-                <Show
-                  when={eligible().length > 0}
-                  fallback={
-                    <strong>
-                      None have a confirmed-archived root yet — nothing will be archived.
-                    </strong>
-                  }
-                >
-                  Archiving <strong>{eligible().length}</strong>{" "}
-                  {eligible().length === 1 ? "session" : "sessions"} (those whose root is
-                  confirmed archived) removes them (and any of their own subsessions) from the
-                  tree:
-                </Show>
+                These subsessions are orphaned (their root is archived but the
+                cascade-archive missed them). Archiving{" "}
+                <strong>{orphans().length}</strong>{" "}
+                {orphans().length === 1 ? "session" : "sessions"} removes them (and
+                any of their own subsessions) from the tree:
               </p>
               <ul class="confirm-list">
-                <For each={rows()}>
-                  {(r) => (
+                <For each={orphans()}>
+                  {(o) => (
                     <li>
-                      <span class="confirm-title">{displayName(r.orphan.title || r.orphan.id)}</span>
-                      <span class={styles["orphan-root"]} classList={{ [styles["orphan-root-active"]]: !!r.root && !r.root.archived }}>
-                        root: {r.root ? displayName(r.root.title) : "resolving…"}
-                        {r.root ? (r.root.archived ? " · archived" : " · ACTIVE") : ""}
-                      </span>
+                      <span class="confirm-title">{displayName(o.title || o.id)}</span>
+                      <span class="confirm-id">{o.id}</span>
                     </li>
                   )}
                 </For>
@@ -111,14 +77,12 @@ export default function OrphanBanner() {
               <button
                 type="button"
                 class="confirm-go"
-                disabled={busy() || eligible().length === 0}
+                disabled={busy()}
                 onClick={() => void confirm()}
               >
                 {busy()
                   ? "Archiving…"
-                  : eligible().length === 0
-                    ? "No archived-root orphans"
-                    : `Archive ${eligible().length > 1 ? `${eligible().length} sessions` : "session"}`}
+                  : `Archive ${orphans().length > 1 ? `${orphans().length} sessions` : "session"}`}
               </button>
             </div>
           </div>

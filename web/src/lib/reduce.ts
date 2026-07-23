@@ -1,62 +1,8 @@
-// Pure, browser-free reducers for the session tree and per-session message
-// state. Kept separate from sync.ts (which owns the store, SSE, and storage) so
-// the core logic is unit-testable. These functions mutate the plain objects
-// passed in — sync.ts calls them inside Solid produce() drafts.
-import type { MessageInfo, Part, Session, SessionMessages } from "../types";
-
-// Group sessions by parentID ("" = roots), each list sorted newest-updated
-// first. The subsession tree derives entirely from Session.parentID.
-// `surfaceOrphan` decides whether a subsession whose parent is absent from the
-// set (e.g. the parent root is archived but the child isn't) should be promoted
-// to a root so it stays visible. Default: keep it hidden — promoting ALL such
-// orphans floods the tree with stale leftovers. Callers pass a predicate (e.g.
-// "is it running") to surface only the ones that matter.
-export function buildChildrenIndex(
-  sessions: Record<string, Session>,
-  surfaceOrphan?: (s: Session) => boolean,
-): Record<string, Session[]> {
-  const byParent: Record<string, Session[]> = {};
-  for (const s of Object.values(sessions)) {
-    let key = s.parentID || "";
-    if (s.parentID && !sessions[s.parentID]) {
-      // Orphan (parent not in the tree). Surface as a root only if asked;
-      // otherwise leave it grouped under the missing parent, where it won't
-      // render (no node for that parent).
-      key = surfaceOrphan && surfaceOrphan(s) ? "" : s.parentID;
-    }
-    (byParent[key] ||= []).push(s);
-  }
-  for (const key in byParent) {
-    byParent[key].sort((a, b) => (b.time?.updated || 0) - (a.time?.updated || 0));
-  }
-  return byParent;
-}
-
-// True if any descendant (child, grandchild, …) of `sessionID` satisfies
-// `isWorking`. Keeps a parent/root node spinning while its subagent (delegate)
-// session is still generating — opencode's /session/status marks only the child
-// busy, so the parent would otherwise look idle. `seen` guards against cycles.
-export function anyDescendantWorking(
-  sessions: Record<string, Session>,
-  activity: Record<string, string>,
-  sessionID: string,
-  isWorking: (act?: string) => boolean,
-): boolean {
-  const stack = [sessionID];
-  const seen = new Set<string>([sessionID]);
-  const all = Object.values(sessions);
-  while (stack.length) {
-    const id = stack.pop()!;
-    for (const s of all) {
-      if (s.parentID === id && !seen.has(s.id)) {
-        if (isWorking(activity[s.id])) return true;
-        seen.add(s.id);
-        stack.push(s.id);
-      }
-    }
-  }
-  return false;
-}
+// Pure, browser-free reducers for per-session message state. Kept separate
+// from sync.ts (which owns the store, SSE, and storage) so the core logic is
+// unit-testable. These functions mutate the plain objects passed in — sync.ts
+// calls them inside Solid produce() drafts.
+import type { MessageInfo, Part, SessionMessages } from "../types";
 
 export function sortMessages(sm: SessionMessages): void {
   sm.order.sort(

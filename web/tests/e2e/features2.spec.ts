@@ -87,26 +87,6 @@ test("settings appearance has a configurable display font", async ({ page }) => 
   expect(fam).toContain("Inter");
 });
 
-// PINNED to ?tree=1: "detailed density" (a secondary .tree-sub line per row)
-// is a proj=1-only render mode. The tree=2 TreeRow is presentational and has
-// no detailed-density variant. Old-path-only behavior slated for Phase 3 Step C
-// deletion.
-test("session list detailed density adds a second line per session", async ({ page }) => {
-  await page.goto(projectUrl("/?tree=1"));
-  // No second line in the default (compact) density.
-  await expect(page.locator(".tree-sub")).toHaveCount(0);
-  await page.getByRole("button", { name: "Settings" }).click();
-  const dialog = page.getByRole("dialog", { name: "Settings" });
-  await dialog.getByRole("button", { name: "Appearance" }).click();
-  const densSel = dialog.getByLabel("Session list density");
-  await densSel.click();
-  await page.getByRole("option", { name: /Detailed/ }).click();
-  // Close settings.
-  await page.keyboard.press("Escape");
-  // Each session row now has a secondary line.
-  await expect(page.locator(".tree-sub").first()).toBeVisible();
-});
-
 test("composer autocompletes @file, @agent and /command", async ({ page }) => {
   await page.goto(projectUrl("/"));
   await page.getByRole("button", { name: /Demo session/ }).click();

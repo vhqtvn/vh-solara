@@ -1,7 +1,5 @@
 import { describe, expect, it } from "vitest";
 import {
-  anyDescendantWorking,
-  buildChildrenIndex,
   buildMessages,
   deleteMessage,
   deletePart,
@@ -11,62 +9,6 @@ import {
 import type { SessionMessages } from "../../src/types";
 
 const empty = (): SessionMessages => ({ order: [], byId: {} });
-
-describe("buildChildrenIndex", () => {
-  it("groups by parentID and sorts roots newest-first", () => {
-    const idx = buildChildrenIndex({
-      a: { id: "a", time: { updated: 1 } },
-      b: { id: "b", time: { updated: 3 } },
-      c: { id: "c", parentID: "a", time: { updated: 2 } },
-    });
-    expect(idx[""].map((s) => s.id)).toEqual(["b", "a"]); // newest root first
-    expect(idx["a"].map((s) => s.id)).toEqual(["c"]); // subsession under a
-  });
-
-  it("hides an orphan (parent absent) by default but surfaces it when the predicate allows", () => {
-    const sessions = {
-      a: { id: "a", time: { updated: 1 } },
-      c: { id: "c", parentID: "gone", time: { updated: 2 } },
-    };
-    // Default: orphan 'c' stays hidden (grouped under the missing parent).
-    const hidden = buildChildrenIndex(sessions);
-    expect(hidden[""].map((s) => s.id)).toEqual(["a"]);
-    expect(hidden["gone"].map((s) => s.id)).toEqual(["c"]); // hidden, not rendered
-
-    // With a predicate (e.g. "is running"), the orphan surfaces as a root.
-    const shown = buildChildrenIndex(sessions, (s) => s.id === "c");
-    expect(shown[""].map((s) => s.id)).toEqual(["c", "a"]);
-    expect(shown["gone"]).toBeUndefined();
-  });
-});
-
-describe("anyDescendantWorking", () => {
-  const busy = (a?: string) => a === "busy" || a === "retry";
-  const sessions = {
-    root: { id: "root" },
-    child: { id: "child", parentID: "root" },
-    grand: { id: "grand", parentID: "child" },
-    other: { id: "other" },
-  };
-
-  it("is true when a direct child is busy", () => {
-    expect(anyDescendantWorking(sessions, { child: "busy" }, "root", busy)).toBe(true);
-  });
-
-  it("is true when a grandchild (delegate's delegate) is busy", () => {
-    expect(anyDescendantWorking(sessions, { grand: "retry" }, "root", busy)).toBe(true);
-  });
-
-  it("is false when no descendant is busy", () => {
-    expect(anyDescendantWorking(sessions, { other: "busy" }, "root", busy)).toBe(false);
-    expect(anyDescendantWorking(sessions, { child: "idle" }, "root", busy)).toBe(false);
-  });
-
-  it("does not loop forever on a parentID cycle", () => {
-    const cyclic = { a: { id: "a", parentID: "b" }, b: { id: "b", parentID: "a" } };
-    expect(anyDescendantWorking(cyclic, {}, "a", busy)).toBe(false);
-  });
-});
 
 describe("message reducers", () => {
   it("upserts messages in creation order and updates in place", () => {

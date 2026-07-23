@@ -9,16 +9,16 @@
 // menu. The fix wires menuProps={menuTriggers(...)} in TreeBranch, mirroring the
 // legacy Node component (SessionTree.tsx ~line 391).
 //
-// This test renders the REAL <SessionTree/> in tree=2 mode (which early-returns
-// TreeStateView → TreeBranch) with a seeded collapsed node, dispatches a
-// contextmenu event on the collapsed row, and asserts the session context-menu
-// signal (menuTarget) opens with the correct id + title.
+// This test renders the REAL <SessionTree/> (which renders TreeStateView →
+// TreeBranch) with a seeded collapsed node, dispatches a contextmenu event on
+// the collapsed row, and asserts the session context-menu signal (menuTarget)
+// opens with the correct id + title.
 //
 // RED (pre-fix): TreeBranch rendered <TreeRow> without menuProps → the row had no
 // onContextMenu handler → dispatching contextmenu left menuTarget() null.
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { cleanup, render } from "@solidjs/testing-library";
-import SessionTree, { __resetTreeForTest } from "../../src/components/SessionTree";
+import SessionTree from "../../src/components/SessionTree";
 import { seedTreeStore, resetTreeStore } from "../../src/sync/treeState";
 import { menuTarget, closeSessionMenu } from "../../src/sessionMenu";
 import { setSelectedIdRaw } from "../../src/sync/store";
@@ -52,11 +52,8 @@ function rowButton(container: HTMLElement, id: string): HTMLElement {
 }
 
 beforeEach(() => {
-  // Enable tree=2 so SessionTree early-returns TreeStateView → TreeBranch.
-  window.history.replaceState({}, "", "/?tree=2");
   resetTreeStore();
   setSelectedIdRaw(null);
-  __resetTreeForTest();
   closeSessionMenu();
 });
 

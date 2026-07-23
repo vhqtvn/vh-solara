@@ -4,7 +4,9 @@ import { suggestTitle } from "../sessionTitle";
 import { isPinned, togglePin, movePinnedByOffset, reconciledPinnedOrder } from "../sidebar";
 import { exportSessionMarkdown } from "../export";
 import { pushNotification } from "../notify";
-import { buildChildrenIndex } from "../lib/reduce";
+import { treeMap } from "../sync/treeState";
+import { childrenIndex } from "../sync/treeMap";
+import type { TreeNode } from "../sync/treeMap";
 import { archiveSession } from "../archive";
 import { withGlobalBusy } from "../busy";
 import {
@@ -14,7 +16,6 @@ import {
   menuTarget,
   openArchiveConfirm,
 } from "../sessionMenu";
-import type { Session } from "../types";
 import { displayName } from "../projectSettings";
 import Icon from "./Icon";
 import TextPromptDialog from "./TextPromptDialog";
@@ -32,13 +33,16 @@ async function setSessionTitle(id: string, title: string) {
 }
 
 // Collect a session plus all its descendants (the sessions an archive affects).
-function relatedSessions(rootId: string): Session[] {
-  const index = buildChildrenIndex(state.sessions);
-  const out: Session[] = [];
+// Walks the server-owned tree flat map (treeState) — no client-side parent
+// inference. Orphans come from the server (Node.flags.orphan), never classified.
+function relatedSessions(rootId: string): TreeNode[] {
+  const map = treeMap();
+  const index = childrenIndex(map);
+  const out: TreeNode[] = [];
   const walk = (id: string) => {
-    const s = state.sessions[id];
-    if (s) out.push(s);
-    for (const c of index[id] || []) walk(c.id);
+    const n = map.get(id);
+    if (n) out.push(n);
+    for (const c of index.get(id) || []) walk(c.id);
   };
   walk(rootId);
   return out;
