@@ -15,7 +15,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -140,16 +139,6 @@ type ClientEvent struct {
 	// unchanged, the ring stores it transparently, and writeEvent/replay
 	// ignore it. Zero means "no ingest t0" (hydrate/daemon events).
 	ingestNano int64
-
-	// FrontierChanged (Phase 2 finding B) is true when THIS specific event
-	// changed the collapsed-frontier membership (session create/delete/reparent,
-	// pending-input boundary change, or the FIRST activity of a previously-
-	// inactive session). The stream handler gates the promotion coalesce arm on
-	// this per-event flag instead of comparing a global counter against a
-	// snapshot-stamped value (which races with the aggregator's concurrent
-	// poll-loop re-applies). json:"-" keeps it off the wire (the wire shape is
-	// bit-for-bit unchanged — seq/kind/payload only).
-	FrontierChanged bool `json:"-"`
 }
 
 // Snapshot is the full current view plus the head seq a client resumes from.
@@ -195,97 +184,6 @@ type Snapshot struct {
 	// been acknowledged yet — surfaced as an "unread/finished" indicator. Cleared
 	// via Ack (the client scrolling that session to the bottom).
 	Unread []string `json:"unread,omitempty"`
-	// Projected (Phase 2 Gate A — collapsed-frontier projection): when true, this
-	// snapshot uses MERGE semantics — sessions absent from Sessions are PRESERVED
-	// on the client as hidden (collapsed behind a frontier stub), NOT deleted.
-	// Only an explicit session.delete event removes a session. Absent or false
-	// means AUTHORITY_COMPLETE — the classic wholesale-replace where omission ===
-	// deleted (legacy behavior). The dual capability negotiation protects both
-	// directions: `?proj=1` query param (protects old clients that don't send it)
-	// + this `projected` envelope field (protects new clients against old servers
-	// that ignore proj=1 and emit AUTHORITY_COMPLETE). Phase 2: the field exists
-	// for capability negotiation but is NOT populated — the server still emits
-	// complete snapshots. Phase 4 wires the actual projection.
-	Projected bool `json:"projected,omitempty"`
-	// Cause identifies why a projected snapshot was emitted:
-	//   "initial"     — first open (fresh client, no valid cursor)
-	//   "reconnect"   — projected resume: re-project the frontier after cursor
-	//                   replay succeeds (rebuilds the ephemeral stubs a reloaded
-	//                   client lost); also used when the cursor is too old to replay
-	//   "promotion"   — hidden→active atomic promotion (live activity on a stubbed session)
-	//   "lazy-expand" — branch expand endpoint response
-	//   "resync"      — epoch-change forced re-snapshot
-	// Absent in AUTHORITY_COMPLETE. Populated by the projection path (Phase 4+).
-	Cause string `json:"cause,omitempty"`
-	// StructuralRevision (Phase 3 Gate B) is the Store-wide monotonic per-epoch
-	// counter stamped in every snapshot envelope. The client tracks
-	// lastAppliedStructuralRevision: < → discard stale, == → idempotent skip,
-	// > → apply. Absent (omitempty) when 0 = fresh store with no mutations — the
-	// client treats an absent field as "always apply" (also protects against old
-	// servers that don't stamp it). See Store.structuralRevision.
-	StructuralRevision uint64 `json:"structuralRevision,omitempty"`
-	// FrontierSeq (Phase 2 finding B) is the frontier-membership counter
-	// captured under RLock at snapshot construction time. NEVER serialized
-	// (json:"-"). DIAGNOSTICS-ONLY: retained for observability (not yet wired
-	// to the /vh/diag/latency endpoint). The stream handler does NOT read it
-	// gate uses the per-event ClientEvent.FrontierChanged flag instead.
-	FrontierSeq uint64 `json:"-"`
-	// Stubs (Phase 4) carries collapsed-branch stubs for idle subtrees in a
-	// projected snapshot. Each stub represents a subtree that exists on the
-	// server but is NOT materialized as full sessions — the client renders it
-	// as a collapsed row with a descendant-count badge. Expanding a stub
-	// triggers a lazy-fetch to the branch endpoint. Absent in AUTHORITY_COMPLETE
-	// snapshots (projected=false).
-	Stubs []CollapsedBranchStub `json:"stubs,omitempty"`
-	// CutoffVersion + CutoffMs (Phase 6 Gate E) carry the projection cutoff
-	// that was active when this snapshot was constructed. CutoffVersion is a
-	// monotonic version that bumps when the server changes the cutoff policy
-	// (so the client can detect a boundary change). CutoffMs is the cutoff
-	// duration in milliseconds (default 600000 = 10 minutes). A session whose
-	// newest activity is older than (now - cutoffMs) is considered idle and
-	// collapsed into a frontier stub.
-	//
-	// Anti-thrash guarantee (Gate E): demotion happens ONLY at snapshot
-	// construction time (initial/promotion/reconnect) — there are NO timer-
-	// driven demotion events. The 15s ping ticker stays ping-only. This means
-	// a session active every 9:59 (just under the 10min cutoff) never gets
-	// demoted between activity bursts, because no snapshot is constructed
-	// between bursts.
-	//
-	// Absent in AUTHORITY_COMPLETE snapshots (projected=false). Omitted when
-	// CutoffVersion is 0 (fresh store, never stamped — treated as "no cutoff
-	// info" by the client).
-	CutoffVersion uint32 `json:"cutoffVersion,omitempty"`
-	CutoffMs      uint64 `json:"cutoffMs,omitempty"`
-	// StaleCursor (Theme 3 / Finding A): set ONLY by SnapshotBranch when a
-	// non-empty pagination cursor child was deleted/reparented between page
-	// requests (cursor not found under parentID). The client reads this to
-	// restart the branch expansion ONCE from page 0 under a fresh branch
-	// structural generation, rather than treating the empty batch as terminal
-	// pagination completion — which would permanently omit the siblings after
-	// the deleted cursor. Absent on every other path (omitempty).
-	StaleCursor bool `json:"staleCursor,omitempty"`
-	// ProjectConstants (Phase 3 trim): when the client opts into hoisted
-	// constants via ?hoist=1, the server extracts per-session fields that are
-	// identical across all sessions in a project (model, projectID, directory)
-	// and emits them ONCE at snapshot level. Sessions whose value matches the
-	// hoisted constant have that field stripped from their info JSON; sessions
-	// with a per-session override keep the inline field. The client resolves:
-	// session.field || projectConstants.field.
-	//
-	// Absent when hoist is not requested (old clients) or when no sessions are
-	// active (omitempty). ADDITIVE — old clients that don't know about it simply
-	// ignore it and read per-session fields (which are still present for them).
-	ProjectConstants *ProjectConstants `json:"projectConstants,omitempty"`
-}
-
-// ProjectConstants carries project-level constants hoisted out of per-session
-// info JSON to avoid repeating them N× (440 sessions × ~60 bytes = ~26 KB
-// savings in the study's representative snapshot). See Snapshot.ProjectConstants.
-type ProjectConstants struct {
-	Model     json.RawMessage `json:"model,omitempty"`
-	ProjectID string          `json:"projectID,omitempty"`
-	Directory string          `json:"directory,omitempty"`
 }
 
 // GateFacts is the denormalized "is this session safe to act on" summary for one
@@ -1064,70 +962,6 @@ type Store struct {
 	// per-session (ABA-vulnerable). Zero is never handed out: the first bump
 	// yields 1, so 0 remains a safe "never mutated" sentinel.
 	nextMsgRev uint64
-	// structuralRevision is the Store-wide monotonic per-epoch counter for the
-	// collapsed-frontier projection (Phase 3, Gate B). It is bumped under s.mu
-	// on every projection-affecting mutation (session create/delete/reparent,
-	// activity change, permission/question asked/replied). Stamped in every
-	// Snapshot envelope so the client can discard stale responses (<), skip
-	// idempotent re-applies (==), and apply fresh state (>). Modeled EXACTLY on
-	// nextMsgRev: Store-wide (not per-session), zero is never handed out via bump
-	// (first bump yields 1), and 0 = "fresh store, no mutations" — emitted via
-	// omitempty so the client treats an absent field as "old server, always
-	// apply". Not reset within a single Store lifetime (epoch is per-process:
-	// newEpoch at New, never reassigned), so the counter is monotonic per-epoch
-	// by construction; a new Store (new process/epoch) starts fresh at 0.
-	structuralRevision uint64
-	// frontierSeq (Phase 2 tunnel-amp finding B) is the DIAGNOSTICS-ONLY
-	// monotonic counter for collapsed-frontier membership changes. It mirrors
-	// the same predicate as the per-event ClientEvent.FrontierChanged flag
-	// (retained for observability — not yet wired to /vh/diag/latency). The
-	// stream handler's promotion-coalesce arm gates on FrontierChanged, NOT on
-	// this counter.
-	//
-	// BUMPED on: session create/reparent (upsertSessionLocked, hydrate);
-	// delete (deleteSessionLocked); pending-input boundary change
-	// (notePendingInputChangeLocked); the FIRST activity of a previously-
-	// inactive (>cutoff) session (setActivityLocked). NOT bumped on busy↔retry
-	// flips, metadata-only session.updated, or any activity transition of an
-	// already-selfActive session.
-	//
-	// DISTINCT from structuralRevision: structuralRevision bumps on EVERY
-	// activity transition + every upsert (the client uses it for staleness/
-	// idempotency guards and MUST stay coarse). frontierSeq is the narrower
-	// signal. atomic.Uint64 so the diagnostics reader is lock-free via
-	// FrontierSeq().
-	frontierSeq atomic.Uint64
-	// curFrontierChanged (Phase 2 finding B) is set to true by the frontier
-	// bump sites BEFORE the accompanying emit() call, so emit() can stamp
-	// ClientEvent.FrontierChanged. emit() resets it to false after stamping.
-	// The stream handler gates the promotion coalesce arm on this per-event
-	// flag (wantsProject(r) && ev.FrontierChanged).
-	curFrontierChanged bool
-	// demotionGen (Phase 2 demotion sweep) is a SEPARATE atomic signal from
-	// curFrontierChanged / frontierSeq. The event-driven amplifier gate
-	// (ev.FrontierChanged) stays exactly as-is; this signal carries ONLY
-	// time-driven demotion (a session aging past the projection cutoff with no
-	// accompanying event). The sweep goroutine (RunDemotionSweep) Add(1)s it
-	// when it detects the active closure has SHRUNK since the last
-	// notification. Each handleStream independently compares it to its own
-	// last-seen value (via DemotionGen) and arms the promotion path when it has
-	// advanced — so EVERY concurrent proj=1 stream ships the demotion snapshot
-	// (mirroring how ev.FrontierChanged fans out per-event), not just one. The
-	// earlier store-global consuming CAS (timeFrontierChanged /
-	// ConsumeTimeFrontierChange) delivered to exactly ONE stream and lost
-	// demotions across multi-tab viewers.
-	demotionGen atomic.Uint64
-	// lastNotifiedClosure (Phase 2 demotion sweep) is the baseline active-closure
-	// the sweep compares against to detect time-driven SHRINK. It mirrors "what
-	// clients currently see" — updated both by SnapshotProjected (the authority
-	// for the client's view) and by the sweep itself (so its baseline advances).
-	// Stored as an atomic.Pointer[map[string]bool] so concurrent RLock holders
-	// (multiple projected streams flushing promotions) can update it race-free
-	// without upgrading to the write lock. The pointed-to map is treated as
-	// immutable after store (computeActiveClosureLocked returns a fresh map each
-	// call). Nil (zero value) on a fresh store → the first sweep tick
-	// initializes it WITHOUT signaling (first-tick safety).
-	lastNotifiedClosure atomic.Pointer[map[string]bool]
 	// coldFetchActive marks sessions whose background full-history GET
 	// (EnsureMessagesAsync) is in flight. Live events that arrive while this
 	// flag is set tag their entries (liveTouchedBody / liveTouchedParts) so
@@ -1243,38 +1077,6 @@ func (s *Store) bumpMsgRev(sid string) {
 	s.msgRev[sid] = s.nextMsgRev
 }
 
-// bumpStructuralRevisionLocked advances the Store-wide structural revision
-// counter for the collapsed-frontier projection (Phase 3 Gate B). Caller must
-// hold s.mu. Exactly one bump per projection-affecting mutation — the client
-// uses the stamped value to discard stale snapshot responses (<), skip
-// idempotent re-applies (==), and apply fresh state (>). Zero is never handed
-// out: the first bump yields 1, so 0 remains a safe "fresh store, never
-// mutated" sentinel (omitted from JSON via omitempty).
-//
-// Phase 4: the stream handler detects structural-change by inspecting the
-// event KIND (isStructuralKind), NOT via a separate KindStructuralChange event.
-// This avoids doubling the event volume on every mutation. See
-// isStructuralKind for the complete list.
-func (s *Store) bumpStructuralRevisionLocked() {
-	s.structuralRevision++
-}
-
-// bumpFrontierSeqLocked advances the collapsed-frontier-membership counter
-// (Phase 2 finding B). Caller must hold s.mu. Bumped only at genuine
-// frontier-change sites (create/delete/reparent, pending-input boundary,
-// first activity of a previously-inactive session). See Store.frontierSeq.
-func (s *Store) bumpFrontierSeqLocked() {
-	s.frontierSeq.Add(1)
-}
-
-// FrontierSeq returns the current frontier-membership counter. Lock-free
-// (atomic load). DIAGNOSTICS-ONLY: retained for observability (not yet wired
-// to the /vh/diag/latency endpoint). The stream handler does NOT call this —
-// the promotion-arm gate uses the per-event ClientEvent.FrontierChanged flag.
-func (s *Store) FrontierSeq() uint64 {
-	return s.frontierSeq.Load()
-}
-
 // emit stamps, records, and fans out a client event. Caller must hold s.mu.
 //
 // Interest filtering is applied HERE (upstream of the channel) so a
@@ -1288,8 +1090,7 @@ func (s *Store) FrontierSeq() uint64 {
 // closes+removes that subscriber, never blocking the producer.
 func (s *Store) emit(kind string, payload json.RawMessage) {
 	s.seq++
-	ev := ClientEvent{Seq: s.seq, Kind: kind, Payload: payload, ingestNano: s.curEmitIngest, FrontierChanged: s.curFrontierChanged}
-	s.curFrontierChanged = false
+	ev := ClientEvent{Seq: s.seq, Kind: kind, Payload: payload, ingestNano: s.curEmitIngest}
 	s.ring.push(ev)
 	sid := ""
 	if isMessageClassKind(kind) {
@@ -1481,25 +1282,6 @@ func (s *Store) setActivityAtLocked(sessionID, st string, at time.Time) {
 	if stampTime.IsZero() {
 		stampTime = now
 	}
-	_, cutoffDuration := projectionCutoff()
-	wasCutoff := now.Add(-cutoffDuration)
-	wasSelfActive := prev == ActivityBusy || prev == ActivityRetry ||
-		s.pendingInputSelf[sessionID] > 0
-	if !wasSelfActive {
-		if t := s.lastActivityAt[sessionID]; !t.IsZero() && t.After(wasCutoff) {
-			wasSelfActive = true
-		}
-	}
-	// Phase 2 (finding B): curFrontierChanged (stamped onto the emitted event)
-	// and frontierSeq (retained diagnostics counter) MUST advance from the same
-	// predicate so the two never diverge. Both bump here, before the
-	// wasBusy==isBusy early-return below — a non-busy transition of a cold
-	// session (e.g. session.error) is still a genuine promotion that must bump
-	// both, even though wasBusy==isBusy would skip the subtreeBusyCount block.
-	if !wasSelfActive && s.sessions[sessionID] != nil {
-		s.curFrontierChanged = true
-		s.bumpFrontierSeqLocked()
-	}
 	s.activity[sessionID] = st
 	s.emit(KindActivity, rawObj(map[string]interface{}{"sessionID": sessionID, "state": st}))
 	s.activitySeq[sessionID] = s.seq // the seq of the activity event just emitted
@@ -1522,9 +1304,6 @@ func (s *Store) setActivityAtLocked(sessionID, st string, at time.Time) {
 	s.maintainSubtreeRetryOnActivityLocked(sessionID, prev, st)
 	s.touchActivityTimeLocked(sessionID, stampTime)
 	s.touchRecentBucketLocked(sessionID, stampTime)
-	// Phase 3 (Gate B): every real activity transition (including busy-neutral
-	// busy↔retry, error→idle) is a projection-affecting structural change.
-	s.bumpStructuralRevisionLocked()
 
 	// Track the root subtree's busy count to detect "finished" (busy -> idle).
 	wasBusy := prev == ActivityBusy || prev == ActivityRetry
@@ -2033,23 +1812,9 @@ func (s *Store) upsertSessionLocked(props json.RawMessage) {
 	s.maintainSubtreePendingInputOnSessionUpsertLocked(env.ID, prev, env.ParentID)
 	s.maintainSubtreeDescendantOnSessionUpsertLocked(env.ID, prev, env.ParentID)
 	s.maintainNewestActivityOnSessionUpsertLocked(env.ID, prev, env.ParentID)
-	// Phase 3 (Gate B): session create / reparent is a projection-affecting
-	// structural change (tree topology or a session's info bytes changed).
-	s.bumpStructuralRevisionLocked()
-	// Phase 2 (finding B): only a genuine frontier change bumps the counter.
-	// Create (prev==nil) or reparent (parent changed) changes which sessions
-	// are materialized vs collapsed; a metadata-only session.updated (same
-	// effective parent) does NOT and must not arm a promotion re-snapshot.
-	frontierChanged := prev == nil || prev.parentID != env.ParentID
-	if frontierChanged {
-		s.bumpFrontierSeqLocked()
-	}
 	// A session.updated replaces the entry, so repopulate the denormalized
 	// last-assistant summary from the (persisted) message view.
 	s.recomputeLastAssistantLocked(env.ID)
-	if frontierChanged {
-		s.curFrontierChanged = true
-	}
 	s.emit(KindSessionUpsert, p.Info)
 }
 
@@ -2079,11 +1844,6 @@ func (s *Store) deleteSessionLocked(id string) {
 		reparentedChildren = append(reparentedChildren, s.children[id]...)
 		s.maintainIndexesOnDeleteLocked(id, se)
 	}
-	// Phase 3 (Gate B): session deletion is a projection-affecting structural
-	// change (the tree loses a node; descendants may be orphaned to roots).
-	s.bumpStructuralRevisionLocked()
-	// Phase 2 (finding B): deletion changes the frontier membership.
-	s.bumpFrontierSeqLocked()
 	delete(s.sessions, id)
 	delete(s.messages, id)
 	delete(s.msgLoaded, id)
@@ -2116,7 +1876,6 @@ func (s *Store) deleteSessionLocked(id string) {
 	// every termination cause. Caller accounting keyed on permission_blocked
 	// observes it while the session is alive; once gone, the gate is gone too.
 	delete(s.permBlocked, id)
-	s.curFrontierChanged = true
 	s.emit(KindSessionDelete, rawObj(map[string]interface{}{"id": id}))
 	// Phase 2 §9.2: after the topology change is fully applied (s.sessions[id]
 	// deleted, KindSessionDelete emitted), emit orphan-check for each newly-
@@ -3257,9 +3016,6 @@ func (s *Store) Snapshot(messagesFor map[string]bool) Snapshot {
 
 	epoch := s.epoch
 	seq := s.seq
-	// Phase 3 (Gate B): capture the structural revision under the read lock so
-	// the stamped value is consistent with the captured state.
-	structuralRevision := s.structuralRevision
 	// subtreeBusy is a self-contained map[string]bool from computeSubtreeBusyLocked
 	// (it allocates its own maps internally and returns a fresh one); safe to keep
 	// whole and read post-RUnlock. The walk is ALWAYS global even when scoped: a
@@ -3421,19 +3177,18 @@ func (s *Store) Snapshot(messagesFor map[string]bool) Snapshot {
 	}
 
 	snap := Snapshot{
-		Epoch:              epoch,
-		Seq:                seq,
-		StructuralRevision: structuralRevision,
-		Messages:           map[string][]MessageWithParts{},
-		MessageWindows:     map[string]WindowMeta{},
-		Todos:              map[string]json.RawMessage{},
-		Permissions:        map[string][]json.RawMessage{},
-		Questions:          map[string][]json.RawMessage{},
-		Statuses:           map[string]json.RawMessage{},
-		Activity:           map[string]string{},
-		Gate:               map[string]GateFacts{},
-		LastAgents:         map[string]string{},
-		CurrentVerbs:       map[string]VerbFacet{},
+		Epoch:          epoch,
+		Seq:            seq,
+		Messages:       map[string][]MessageWithParts{},
+		MessageWindows: map[string]WindowMeta{},
+		Todos:          map[string]json.RawMessage{},
+		Permissions:    map[string][]json.RawMessage{},
+		Questions:      map[string][]json.RawMessage{},
+		Statuses:       map[string]json.RawMessage{},
+		Activity:       map[string]string{},
+		Gate:           map[string]GateFacts{},
+		LastAgents:     map[string]string{},
+		CurrentVerbs:   map[string]VerbFacet{},
 	}
 
 	// Per-session gate facts + facets. Iterating the captured `sessions` map
@@ -3902,17 +3657,6 @@ func (s *Store) Hydrate(sessions []json.RawMessage, messages map[string][]Messag
 			s.maintainSubtreePendingInputOnSessionUpsertLocked(env.ID, old, env.ParentID)
 			s.maintainSubtreeDescendantOnSessionUpsertLocked(env.ID, old, env.ParentID)
 			s.maintainNewestActivityOnSessionUpsertLocked(env.ID, old, env.ParentID)
-			// Phase 3 (Gate B): hydrate create/reparent is a projection-affecting
-			// structural change.
-			s.bumpStructuralRevisionLocked()
-			// Phase 2 (finding B): only a genuine frontier change (create or
-			// reparent) bumps the counter — mirrors upsertSessionLocked. A
-			// metadata-only hydrate refresh (same effective parent) does NOT
-			// change frontier membership.
-			if old == nil || old.parentID != env.ParentID {
-				s.bumpFrontierSeqLocked()
-				s.curFrontierChanged = true
-			}
 			s.emit(KindSessionUpsert, info)
 		}
 	}

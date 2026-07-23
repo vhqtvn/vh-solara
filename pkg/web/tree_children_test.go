@@ -174,8 +174,8 @@ func TestTreeChildren_NoCSRF(t *testing.T) {
 // Group 7 — tree=2 flag routing (wantsTree2 + handleStream SSE routing)
 // ---------------------------------------------------------------------------
 
-// TestWantsTree2 pins the tree=2 capability-detection helper (mirrors
-// TestWantsProject). Only the literal "2" opts in.
+// TestWantsTree2 pins the tree=2 capability-detection helper. Only the literal
+// "2" opts in.
 func TestWantsTree2(t *testing.T) {
 	cases := map[string]bool{
 		"":     false,
@@ -194,12 +194,6 @@ func TestWantsTree2(t *testing.T) {
 	r := mustReq("GET", "/vh/stream?sessions=a", nil)
 	if wantsTree2(r) {
 		t.Error("absent tree param must NOT opt into tree=2")
-	}
-	// tree=2 is independent of proj=1 — both can coexist on the same URL, but
-	// tree=2 takes precedence in handleStream (checked first).
-	r2 := mustReq("GET", "/vh/stream?sessions=a&tree=2&proj=1", nil)
-	if !wantsTree2(r2) || !wantsProject(r2) {
-		t.Error("tree=2 and proj=1 must be independently detectable")
 	}
 }
 

@@ -1,19 +1,26 @@
 #!/usr/bin/env python3
-"""Assert reconnect at the head cursor does NOT re-ship (behavior D-i).
+"""Assert reconnect at the head cursor does NOT DUPLICATE re-ship (behavior D).
 
 Reads the RAW SSE text captured from `GET /vh/stream?tree=2` with
 `Last-Event-ID` set to the head seq (the store seq the prior connection
-reached) on stdin. argv[1] is that head seq. On a clean cursor-replay
-reconnect the server:
+reached) on stdin. argv[1] is that head seq.
 
-  - does NOT re-ship a tree.snapshot (the cursor is valid -> no ring-gap), and
-  - replays only store events with seq strictly greater than the cursor.
-    A replayed op whose seq is <= the head cursor would be a DUPLICATE re-ship
-    (a regression of the cursor-replay path). Genuinely-new ops (seq > head)
+Per C-F1 (Phase 3 Step B, commit 3903b131), the tree=2 reconnect path ALWAYS
+emits exactly 1 tree.snapshot (cause "reconnect") as a frontier re-seed +
+1 legacy detail "snapshot" AFTER any replayed deltas — even on a head
+reconnect where the cursor == head (no ring-gap). This re-seeds the client's
+empty in-memory tree/detail maps (e.g. after a page reload that auto-
+reconnects EventSource with a valid Last-Event-ID). So 1 tree.snapshot is
+EXPECTED and correct on every reconnect path.
+
+The regression we catch here is DUPLICATE re-ship:
+  - more than 1 tree.snapshot (double-emit bug), and
+  - tree.op events with seq <= the head cursor (cursor-replay path replaying
+    events the client already processed). Genuinely-new ops (seq > head)
     landing in the tiny window between capture and reconnect are correct
     behavior, not a violation, so they are tolerated.
 
-So the assertion is: zero tree.snapshot, AND no tree.op with seq <= head.
+So the assertion is: at most 1 tree.snapshot, AND no tree.op with seq <= head.
 
 The ring-gap fallback half (tree.snapshot cause:"reconnect" after the head
 advances past the 4096-entry ring window) is documented as infeasible in this
@@ -65,8 +72,8 @@ def main():
                 new_ops += 1
 
     reasons = []
-    if snapshots != 0:
-        reasons.append("tree.snapshot re-shipped on head reconnect: %d (want 0 -- no ring-gap)" % snapshots)
+    if snapshots > 1:
+        reasons.append("tree.snapshot re-shipped on head reconnect: %d (want <=1 -- 1 is the C-F1 frontier re-seed; more = duplicate re-ship)" % snapshots)
     if dup_ops != 0:
         reasons.append("DUPLICATE tree.op re-shipped (seq <= head %s): %s"
                        % (HEAD, ", ".join(dup_details)))

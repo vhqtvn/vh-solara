@@ -12,10 +12,10 @@ import (
 // applies ops literally, so the JSON field names, optionality, and shapes MUST
 // match the design doc exactly.
 //
-// The types are self-contained: they carry no projection-layer bookkeeping
-// (no model, aggregateState, structuralRevision, cutoffVersion — §3.2). The
-// emitter (tree_emitter.go) populates them from the existing store + subtree
-// indexes; it does NOT rebuild the tree.
+// The types are self-contained: they carry no legacy projection-layer
+// bookkeeping (the Node schema is independent of how rows are aggregated or
+// projected — §3.2). The emitter (tree_emitter.go) populates them from the
+// existing store + subtree indexes; it does NOT rebuild the tree.
 
 // VerbFacet (defined in store.go:790) is reused as the Node.verb shape —
 // {tool, state?}. A nil *VerbFacet on Node means "no active tool facet" (omitted

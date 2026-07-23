@@ -219,6 +219,25 @@ func waitFor(t *testing.T, cond func() bool, msg string) {
 	t.Fatalf("timeout waiting for: %s", msg)
 }
 
+// statusBusyEvent builds a session.status busy opencode.Event for a direct
+// store.Apply (synchronous, deterministic — bypasses the fake.events poll loop
+// so a burst of N events lands in the subscriber channel within microseconds).
+func statusBusyEvent(id string) opencode.Event {
+	return opencode.Event{
+		Type:       "session.status",
+		Properties: json.RawMessage(fmt.Sprintf(`{"sessionID":%q,"status":{"type":"busy"}}`, id)),
+	}
+}
+
+// sessionCreatedEvent builds a session.created opencode.Event for direct store
+// seeding (synchronous — no aggregator poll loop / fake backend needed).
+func sessionCreatedEvent(id string) opencode.Event {
+	return opencode.Event{
+		Type:       "session.created",
+		Properties: json.RawMessage(fmt.Sprintf(`{"info":{"id":%q,"title":%q}}`, id, id)),
+	}
+}
+
 func TestEndToEndAggregateAndServe(t *testing.T) {
 	fake := newFake()
 	fake.sessions = []string{
@@ -469,72 +488,6 @@ func readSSEFrameErr(r *bufio.Reader) (event, data string, err error) {
 		} else if strings.HasPrefix(line, "data:") {
 			data = strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		}
-	}
-}
-
-// TestStreamProjectedReconnectSnapshot (Theme 1 Finding #2 / DEFER #5): a
-// projected Stream1 client that resumes from a VALID cursor must STILL receive a
-// projected snapshot (cause:"reconnect") AFTER the replayed events, so it can
-// rebuild its ephemeral frontier stubs (branchStubs/expandedBranches are never
-// persisted by the client — only sessions/cursor/activity/lastAgents survive a
-// reload). Before the fix the replay path emitted ONLY replayed events and no
-// snapshot, so a page reload left the collapsed-frontier stubs missing until the
-// next structural event (rendering the stale full tree — defeating O1 — or a
-// pruned cache with holes). The reconnect snapshot's baseline is pinned to its
-// own seq so the replayed events are not re-forwarded by the live tail.
-func TestStreamProjectedReconnectSnapshot(t *testing.T) {
-	fake := newFake()
-	fake.sessions = []string{`{"id":"a","title":"A","time":{"updated":1}}`}
-	ocSrv := httptest.NewServer(fake.handler())
-	defer ocSrv.Close()
-
-	agg := aggregator.New(ocSrv.URL, 1000)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go agg.Run(ctx)
-	waitFor(t, func() bool { return len(agg.Store().Snapshot(nil).Sessions) == 1 }, "hydrate")
-
-	head := agg.Store().Snapshot(nil).Seq
-
-	srv, _ := NewServer(agg, ocSrv.URL, 1000)
-	web := httptest.NewServer(srv.Handler())
-	defer web.Close()
-
-	// Resume from the current head with proj=1 (projected Stream1). The cursor
-	// is valid (within the replay ring) and at head, so NO events replay — but a
-	// projected client must still get a reconnect snapshot to rebuild stubs.
-	resp, err := http.Get(web.URL + "/vh/stream?cursor=" + fmt.Sprintf("%d", head) + "&proj=1&sessions=")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	reader := bufio.NewReader(resp.Body)
-
-	// The leading `: hello` comment has no event: line and is skipped by the
-	// frame reader; the reconnect snapshot is flushed immediately after the
-	// (empty) replay. Read up to a few frames to find it (regression = none).
-	var gotSnapshot bool
-	for i := 0; i < 8; i++ {
-		ev, data := readSSEFrameWithTimeout(t, reader, 2*time.Second)
-		if ev == "snapshot" {
-			gotSnapshot = true
-			var snap map[string]any
-			if err := json.Unmarshal([]byte(data), &snap); err != nil {
-				t.Fatalf("reconnect snapshot not valid JSON: %v (data=%s)", err, data)
-			}
-			if snap["projected"] != true {
-				t.Fatalf("reconnect snapshot must be projected:true, got %v", snap["projected"])
-			}
-			if snap["cause"] != "reconnect" {
-				t.Fatalf("reconnect snapshot must have cause:\"reconnect\", got %v", snap["cause"])
-			}
-			break
-		}
-		// Any other event (e.g. a replayed session.upsert if head advanced) is
-		// fine — keep reading for the snapshot that follows.
-	}
-	if !gotSnapshot {
-		t.Fatal("projected cursor-replay must emit a cause:reconnect snapshot after replay (Finding #2); got none")
 	}
 }
 

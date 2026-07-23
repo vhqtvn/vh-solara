@@ -115,6 +115,16 @@ func updatedMsFromInfo(info json.RawMessage) int64 {
 	return int64(*partial.Time.Updated)
 }
 
+// titleFromInfo extracts the session title from a session info payload. Returns
+// "" when absent/malformed. Used by the tree emitter to populate Node.Title.
+func titleFromInfo(info json.RawMessage) string {
+	var partial struct {
+		Title string `json:"title"`
+	}
+	_ = json.Unmarshal(info, &partial)
+	return partial.Title
+}
+
 // isArchivedLocked reports whether id's session info carries time.archived.
 func isArchivedLocked(s *Store, id string) bool {
 	se := s.sessions[id]

@@ -47,11 +47,11 @@ func (s *Server) handleTreeChildren(w http.ResponseWriter, r *http.Request) {
 			limit = n
 		}
 	}
-	// Phase 2a: the emitter is transient per-request (stateless, like
-	// handleBranch calls SnapshotBranch). The per-connection E_c that survives
-	// across requests lives in the handleStream per-conn state (Group 7 wiring).
-	// For the contract, ExpandChildren on a transient emitter still computes the
-	// correct page and MarkLoads on the terminal batch.
+	// Phase 2a: the emitter is transient per-request (stateless). The
+	// per-connection E_c that survives across requests lives in the handleStream
+	// per-conn state (Group 7 wiring). For the contract, ExpandChildren on a
+	// transient emitter still computes the correct page and MarkLoads on the
+	// terminal batch.
 	emitter := state.NewTreeEmitter(agg.Store(), reqDir(r))
 	nodes, hasMore, nextCursor, stale := emitter.ExpandChildren(id, cursor, limit)
 	resp := treeChildrenResponse{

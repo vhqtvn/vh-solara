@@ -203,16 +203,6 @@ func (s *Store) notePendingInputChangeLocked(id string) {
 	delta := want - prev
 	s.subtreePendingInput[id] += delta
 	s.adjustAncestorChainSumLocked(se.parentID, delta, s.subtreePendingInput)
-	// Phase 3 (Gate B): a session entering/exiting the pending-input closure
-	// changes the projection boundary — bump the structural revision so the
-	// client's stale-response guard and idempotent-skip logic fire correctly.
-	s.bumpStructuralRevisionLocked()
-	// Phase 2 (finding B): pending-input boundary change alters frontier
-	// membership (a session with pending input is always materialized). Set
-	// curFrontierChanged so the accompanying emit (in Apply, after this
-	// returns) stamps the event's FrontierChanged flag.
-	s.bumpFrontierSeqLocked()
-	s.curFrontierChanged = true
 }
 
 // maintainSubtreePendingInputOnSessionUpsertLocked maintains subtreePendingInput

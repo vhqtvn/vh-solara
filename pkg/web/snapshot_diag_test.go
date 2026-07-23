@@ -18,7 +18,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -61,38 +60,6 @@ func readUntilSnapshot(t *testing.T, r *bufio.Reader) string {
 	}
 	t.Fatal("read 30 frames without finding a snapshot")
 	return ""
-}
-
-// TestSnapshotDiag_ReconnectIncrementsSnapshotPath proves Phase 3-C: a projected
-// stream with a VALID cursor takes the replay branch, then fires a reconnect
-// snapshot (cause:"reconnect"). Before the fix, that reconnect snapshot was NOT
-// recorded by RecordSnapshotPath — it was invisible to snapshot_path/
-// snapshot_bytes. After the fix, SnapshotPath MUST increment.
-//
-// FAIL-without (RecordSnapshotPath missing on reconnect): delta == 0.
-// PASS-with: delta >= 1.
-func TestSnapshotDiag_ReconnectIncrementsSnapshotPath(t *testing.T) {
-	srv, web := newNoPollServer(t)
-	seedSessionDirect(t, srv, "s1")
-
-	// Record a cursor AFTER seeding so replay has a valid resume point.
-	cursor := srv.agg.Store().Head()
-
-	// Apply an event with seq > cursor so the replay ships a delta.
-	srv.agg.Store().Apply(statusBusyEvent("s1"))
-
-	// Open a PROJECTED session stream with the valid cursor. The server takes:
-	//   hasCursor && replayOK → replay branch → reconnect snapshot (proj=1).
-	before := diagnostics.Default.Stream[diagnostics.StreamClassSelected].SnapshotPath.Load()
-	reader := openDiagStreamReq(t, web.URL, "sessions=s1&cursor="+strconv.FormatUint(cursor, 10)+"&proj=1", 1*time.Second)
-
-	// Drain frames until the reconnect snapshot arrives.
-	_ = readUntilSnapshot(t, reader)
-
-	after := diagnostics.Default.Stream[diagnostics.StreamClassSelected].SnapshotPath.Load()
-	if after <= before {
-		t.Fatalf("reconnect path did NOT increment SnapshotPath: before=%d after=%d (Phase 3-C bug: RecordSnapshotPath missing on reconnect branch)", before, after)
-	}
 }
 
 // TestSnapshotDiag_BytesReflectWire proves Phase 3-D: with z=1 compression

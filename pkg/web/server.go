@@ -856,14 +856,7 @@ func (s *Server) Handler() http.Handler {
 	// MessagePageResult JSON envelope. csrfGuard exempts GET, so no CSRF
 	// exception is needed. See pkg/web/messages_http.go for the contract.
 	mux.HandleFunc("GET /vh/session/{sessionId}/messages", s.handleSessionMessages)
-	// Phase 4 lazy-expand endpoint: GET → no CSRF. Returns a projected snapshot
-	// (cause:"lazy-expand") with the children of the given frontier stub
-	// materialized as full sessions, plus stubs for the grandchildren. The
-	// client merges it via the projected merge path (upsert sessions + stubs).
-	// Continuation-based pagination via ?cursor=<last-child-id>; the next
-	// cursor (if more children remain) is returned as X-VH-Branch-Cursor.
-	mux.HandleFunc("GET /vh/sessions/branch", s.handleBranch)
-	// Phase 2 tree=2 expand endpoint: GET → no CSRF (mirrors handleBranch).
+	// Phase 2 tree=2 expand endpoint: GET → no CSRF.
 	// Returns a node.children page for lazy-loading direct children of a
 	// collapsed frontier node. See pkg/web/tree_children.go for the contract.
 	mux.HandleFunc("GET /vh/tree/children", s.handleTreeChildren)
@@ -1258,47 +1251,6 @@ func (s *Server) ensureMessages(ctx context.Context, agg *aggregator.Aggregator,
 	}
 }
 
-// handleBranch serves the lazy-expand endpoint (Phase 4): GET /vh/sessions/
-// branch?id=<frontier-id>&cursor=<last-child-id>. Returns a projected snapshot
-// with the children of the given frontier stub materialized as full sessions,
-// plus stubs for their idle descendants. Continuation-based: the next cursor
-// (if more children remain) is returned as X-VH-Branch-Cursor. GET → no CSRF.
-// Pure read — no state mutation, no message hydration (the client fetches
-// messages on demand for individual sessions).
-func (s *Server) handleBranch(w http.ResponseWriter, r *http.Request) {
-	w = diag.NewHandlerBytesWriter(w, diag.ProxyPathBranch) // PROBE 8: attribute non-stream tunnel bytes
-	id := r.URL.Query().Get("id")
-	if id == "" {
-		http.Error(w, "missing id", http.StatusBadRequest)
-		return
-	}
-	agg := s.aggFor(reqDir(r))
-	if agg == nil {
-		http.Error(w, "project not found", http.StatusNotFound)
-		return
-	}
-	cursor := r.URL.Query().Get("cursor")
-	limitStr := r.URL.Query().Get("limit")
-	limit := 0 // 0 → defaultBranchExpandLimit
-	if limitStr != "" {
-		if n, err := strconv.Atoi(limitStr); err == nil && n > 0 {
-			limit = n
-		}
-	}
-	snap, nextCursor := agg.Store().SnapshotBranch(id, cursor, limit)
-	b, err := json.Marshal(snap)
-	if err != nil {
-		vhlog.Error("branch: marshal failed", "dir", reqDir(r), "err", err)
-		http.Error(w, "branch marshal failed", http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	if nextCursor != "" {
-		w.Header().Set("X-VH-Branch-Cursor", nextCursor)
-	}
-	w.Write(maybeCompressSnapshot(b, wantsCompress(r)))
-}
-
 // projectScopedFilter returns a filter containing only the IDs that are members
 // of agg's project-scoped store. A nil filter ("all" request) passes through
 // unchanged — the SAFE branch at the call site already iterates SessionIDs(),
@@ -1536,53 +1488,13 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			// Legacy detail snapshot, shipped RAW (not gzip64) so it does NOT
 			// race tree.snapshot's async gzip64 decode on the client's shared
 			// treeSnapshotDecoding flag (same rationale as fresh-connect).
-			var detailSnap state.Snapshot
-			if wantsProject(r) {
-				detailSnap = store.SnapshotProjected(filter, "reconnect", wantsHoist(r))
-			} else {
-				detailSnap = store.Snapshot(filter)
-			}
+			detailSnap := store.Snapshot(filter)
 			if db, err := json.Marshal(detailSnap); err == nil {
 				writeRaw(w, detailSnap.Seq, "snapshot", db)
 			} else {
 				vhlog.Warn("tree=2 resume detail snapshot: marshal failed", "err", err)
 			}
 			baseline = store.Head()
-		}
-		// Finding #2 / DEFER #5: a projected Stream1 resume must RE-ESTABLISH
-		// projection state even on a successful replay. branchStubs and
-		// expandedBranches are EPHEMERAL (never persisted — store.ts persist()
-		// saves only sessions/cursor/activity/lastAgents), so after a page
-		// reload with a valid cursor the replay succeeds but the frontier stubs
-		// are never reconstructed until the next structural event — the client
-		// renders the stale full tree (defeating O1) or a pruned cache with
-		// stubs missing. Emit a projected `cause:"reconnect"` snapshot AFTER the
-		// replayed events so applyProjectedSnapshot rebuilds branchStubs
-		// (reconnect is a fullCause → wholesale stub replace + reconcile). The
-		// client's Finding #1 guard treats cause=reconnect as a fullRebuild →
-		// exempt from the same-revision idempotency skip, so it applies even
-		// when the replay already advanced the cursor to head. baseline is
-		// pinned to the snapshot's seq so the replayed events (seq<=head) are
-		// not re-forwarded by the live tail and the snapshot's coverage is not
-		// duplicated. Legacy (non-projected) replay keeps the replay-only path:
-		// a resumed legacy client already carries the wholesale authoritative
-		// set from its first cold-load snapshot and reconciles via live events.
-		if wantsProject(r) {
-			rcSnap := store.SnapshotProjected(filter, "reconnect", wantsHoist(r))
-			if rb, err := json.Marshal(rcSnap); err == nil {
-				// Compute the wire payload once and record its length so
-				// snapshot_bytes reflects true wire bytes (Phase 3-D: was
-				// len(rb), overstating ~3x by recording the pre-compression
-				// marshaled length). Phase 3-C: RecordSnapshotPath was MISSING
-				// here entirely (unlike the initial/promotion sites), hiding
-				// the reconnect snapshot from snapshot_path/snapshot_bytes.
-				wire := maybeCompressSnapshot(rb, wantsCompress(r))
-				writeRaw(w, rcSnap.Seq, "snapshot", wire)
-				sw.RecordSnapshotPath(len(wire)) // PROBE 3: reconnect branch + wire bytes
-				baseline = rcSnap.Seq
-			} else {
-				vhlog.Warn("stream reconnect snapshot: marshal failed, skipping", "err", err)
-			}
 		}
 	} else {
 		// Fresh client or cursor too old: send a full snapshot, then live-tail.
@@ -1632,12 +1544,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			// snapshot listener runs synchronously while tree.snapshot's async
 			// decode proceeds in parallel; both populate different stores
 			// (state.sessions vs treeMap) so there is no clobber.
-			var detailSnap state.Snapshot
-			if wantsProject(r) {
-				detailSnap = store.SnapshotProjected(filter, cause, wantsHoist(r))
-			} else {
-				detailSnap = store.Snapshot(filter)
-			}
+			detailSnap := store.Snapshot(filter)
 			if db, err := json.Marshal(detailSnap); err == nil {
 				writeRaw(w, detailSnap.Seq, "snapshot", db)
 			} else {
@@ -1645,16 +1552,8 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			}
 			baseline = store.Head()
 		} else {
-			// Phase 4: when proj=1, use the projected snapshot (roots + active
-			// closure + frontier stubs) instead of the wholesale AUTHORITY_COMPLETE
-			// snapshot. This is what cuts the ~1016-session payload to ~100 nodes
-			// for an idle-heavy workload.
-			var snap state.Snapshot
-			if wantsProject(r) {
-				snap = store.SnapshotProjected(filter, "initial", wantsHoist(r))
-			} else {
-				snap = store.Snapshot(filter)
-			}
+			// Legacy (non-tree) clients: send the full wholesale snapshot.
+			snap := store.Snapshot(filter)
 			b, err := json.Marshal(snap)
 			if err != nil {
 				// Cannot fail for a well-typed *state.Snapshot today; log and skip
@@ -1683,84 +1582,10 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	}
 	flusher.Flush()
 
-	// Promotion coalescing (tunnel-volume amplifier #1 fix). Before this, EVERY
-	// structural event re-snapshotted + re-shipped the whole active-closure
-	// projection synchronously inside the event case. With 373 active children
-	// flipping activity, that dominated tunnel volume (~150 MB/hr at rest in the
-	// live study). The design:
-	//   - On the FIRST structural event in a burst, arm promoCoalesce; subsequent
-	//     events see promoPending and are absorbed (the timer is already armed).
-	//   - When the timer fires, take ONE SnapshotProjected (reflects the LATEST
-	//     store state, so every event in the window is covered; none is lost),
-	//     write it, bump baseline to its Seq, and clear promoPending.
-	//   - Arm-on-first-event (NOT reset-on-every-event) bounds the flush rate to
-	//     ~1/window under continuous churn; a real timer (not a lazy time-check)
-	//     guarantees a final event flushes even when no further events arrive.
-	// Ordering/baseline: promoSnap.Seq at flush time is >= every event seq
-	// already written in this window, so baseline jumps forward correctly and no
-	// event is double-shipped (writeEvent guards on ev.Seq > baseline).
-	// Not-lost: SnapshotProjected reads live store state, so any event applied
-	// during the window is in the flushed snapshot.
-	// KindActivity stays in the trigger set: a stub going busy needs its full
-	// payload (info/gate/perms) shipped — the live session.busy event carries
-	// only the activity state, not the materialization payload, so the client
-	// cannot self-promote a stub. Narrowing the trigger set would drop genuine
-	// promotions.
-	// lastDemotionGen is this stream's last-seen demotion-sweep generation. It
-	// is initialized AFTER the initial/reconnect snapshot ships (so a demotion
-	// the snapshot already reflects is not re-armed), refreshed in flushPromotion
-	// (so an event-driven promotion that already reflects a demotion is not
-	// re-armed by the next sweepTicker poll), and compared on every sweepTicker
-	// tick. This per-stream value is what fans the demotion out to EVERY
-	// concurrent proj=1 viewer (replacing the old store-global consuming CAS).
-	lastDemotionGen := store.DemotionGen()
-	promoCoalesce := time.NewTimer(promotionCoalesceInterval)
-	promoCoalesce.Stop() // armed on first structural event, not at stream open
-	defer promoCoalesce.Stop()
-	promoPending := false
-	// flushPromotion materializes + ships ONE promotion snapshot for the current
-	// store state and records the diagnostic counter at the write site. Recording
-	// here (not just on the initial branch) stops the snapshot_path/snapshot_bytes
-	// diagnostic from undercounting promotion volume — the live study showed the
-	// tree counter "calm" while 150 MB/hr shipped, because RecordSnapshotPath was
-	// only on the initial-snapshot branch.
-	flushPromotion := func() {
-		promoPending = false
-		promoSnap := store.SnapshotProjected(filter, "promotion", wantsHoist(r))
-		if pb, err := json.Marshal(promoSnap); err == nil {
-			// Pass `filter` (not nil) so promotion respects the same message
-			// scoping as the initial snapshot — otherwise every promotion
-			// re-ships transcripts for the entire active closure.
-			// Phase 3-D: record true wire bytes (was len(pb), the pre-compression
-			// marshaled length — overstated ~3x).
-			wire := maybeCompressSnapshot(pb, wantsCompress(r))
-			writeRaw(w, promoSnap.Seq, "snapshot", wire)
-			sw.RecordSnapshotPath(len(wire)) // PROBE 3: promotion wire bytes
-			// Advance baseline so buffered events already covered by the
-			// promotion snapshot are not re-emitted (mirrors the initial
-			// snapshot baseline bump at the snapshot send site above).
-			baseline = promoSnap.Seq
-			// SnapshotProjected updated lastNotifiedClosure (the sweep baseline),
-			// so a demotion this promotion already reflects must not re-arm on
-			// the next sweepTicker poll — advance this stream's last-seen gen.
-			lastDemotionGen = store.DemotionGen()
-		}
-	}
-
+	// 15s keepalive ping ticker. A NAMED ping event (not an SSE `:` comment) so
+	// an EventSource client can observe it and detect a dead-but-open connection.
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
-	// sweepTicker drives the time-driven demotion re-projection: when the
-	// store's demotion sweep detects a session has aged past the projection
-	// cutoff (a wall-clock transition no event fires for), it bumps demotionGen.
-	// This ticker polls DemotionGen() at SweepInterval (derived from the cutoff)
-	// and, when it has advanced past this stream's last-seen value, arms the
-	// SAME promotion-coalesce path as ev.FrontierChanged — no second snapshot
-	// path. Each stream tracks its own last-seen value (lastDemotionGen) so
-	// EVERY concurrent proj=1 viewer ships the demotion (mirroring the
-	// ev.FrontierChanged per-event fanout), not just one. Identical arm shape
-	// to the ev.FrontierChanged case below (gated on wantsProject).
-	sweepTicker := time.NewTicker(store.SweepInterval())
-	defer sweepTicker.Stop()
 	for {
 		select {
 		case <-r.Context().Done():
@@ -1810,69 +1635,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			writeEvent(w, ev.Seq, ev.Kind, ev.Payload)
-			// Phase 4: for proj=1 clients, re-snapshot after structural events
-			// (session/activity/permission/question changes) so the collapsed-
-			// frontier view stays in sync. A hidden session that becomes busy
-			// is promoted to the active closure; an active session that goes
-			// idle may be demoted to a stub. The structuralRevision guard on
-			// the client discards stale/duplicate re-snapshots. This rides the
-			// same Seq-ordered snapshot path (NOT the notice path).
-			//
-			// Phase 2 (finding B) — per-event frontier-membership gate: arm the
-			// promotion coalesce ONLY when THIS specific structural event
-			// changed the frontier (ev.FrontierChanged, stamped at emit time).
-			// Before this gate, every IsStructuralKind event — including every
-			// KindActivity busy↔retry / idle→busy flip of an ALREADY-materialized
-			// session — re-shipped a full ~74KB tree snapshot (~16.6 MB/hr with
-			// one flapping session). The per-event flag is set ONLY on
-			// create/delete/reparent, pending-input boundary change, and the
-			// FIRST activity of a previously >cutoff-idle session (a genuine
-			// idle-stub → active promotion). So:
-			//   - busy↔retry of an active session: FrontierChanged=false → no arm.
-			//   - idle→busy of a >10min-idle stub: FrontierChanged=true → arm
-			//     (the genuine promotion that still must fire — the live
-			//     session.busy event carries only activity state, not the
-			//     materialization payload, so the client cannot self-promote a
-			//     stub).
-			//   - create/delete/perm/question: FrontierChanged=true → arm.
-			// The per-event flag replaced an earlier global-counter gate
-			// (store.FrontierSeq() > lastFrontier) which raced with the
-			// aggregator's concurrent poll-loop re-applies.
-			if wantsProject(r) && ev.FrontierChanged {
-				if !promoPending {
-					promoPending = true
-					promoCoalesce.Reset(promotionCoalesceInterval)
-				}
-				// else: timer already armed — the flush will reflect this event.
-			}
 			flusher.Flush()
-		case <-promoCoalesce.C:
-			// Coalesce window elapsed: flush ONE promotion snapshot for the
-			// latest state (covers every structural event armed in this window).
-			// promoPending is false on a stray fire (shouldn't happen given the
-			// arm-on-first-event logic, but the guard keeps it a no-op).
-			if promoPending {
-				flushPromotion()
-				flusher.Flush()
-			}
-		case <-sweepTicker.C:
-			// Time-driven demotion: the store's sweep detected a session aged
-			// past the projection cutoff (a wall-clock crossing no event fires
-			// for). Arm when the per-stream demotionGen has advanced past
-			// lastDemotionGen, then record the new value — so EVERY concurrent
-			// proj=1 stream ships the demotion (per-stream fanout, mirroring
-			// ev.FrontierChanged), not just one. Then arm the IDENTICAL
-			// promotion-coalesce path as ev.FrontierChanged above (same timer,
-			// same flushPromotion — no second snapshot path). Non-projected
-			// streams (wantsProject=false) short-circuit so they never observe
-			// the gen.
-			if wantsProject(r) && !promoPending {
-				if gen := store.DemotionGen(); gen > lastDemotionGen {
-					lastDemotionGen = gen
-					promoPending = true
-					promoCoalesce.Reset(promotionCoalesceInterval)
-				}
-			}
 		case <-ticker.C:
 			// A NAMED ping event (not an SSE ` : comment`) so the client can observe
 			// it — EventSource hides comments, so the client uses these pings to
@@ -1920,59 +1683,17 @@ func wantsCompress(r *http.Request) bool {
 	return r.URL.Query().Get("z") == "1"
 }
 
-// promotionCoalesceInterval bounds how long the promotion path waits before
-// re-shipping a projected snapshot after the FIRST structural event in a burst.
-// A burst of structural events (e.g. 373 active children flipping busy/idle in
-// the live study) re-ships ONE promotion snapshot per window, not N — the
-// un-throttled path re-marshalled + re-shipped the whole active-closure
-// projection on every flip and was the dominant tunnel volume (~150 MB/hr at
-// rest). The snapshot taken at flush reflects the LATEST store state, so every
-// event that arrived during the window is reflected; none is lost.
-//
-// A real time.Timer (NOT the deltaFlushInterval lazy-check pattern) is required
-// so a final structural event followed by a quiet period still flushes within
-// this window — the lazy pattern would strand the last state until the next
-// event arrived. The window bounds promotion latency: the operator sees a
-// stub→active promotion within this delay, which is well inside the ~300ms
-// "UI feels live" budget at 150ms. A package var (not const) so tests can shrink
-// it to a deterministic value (mirrors deltaFlushInterval).
-var promotionCoalesceInterval = 150 * time.Millisecond
-
-// wantsProject reports whether the client opted into projected (collapsed-
-// frontier) snapshot mode via the `proj=1` query flag. Mirrors wantsCompress:
-// EventSource cannot set custom request headers, so the opt-in is a query param.
-// An absent flag keeps the legacy AUTHORITY_COMPLETE wire shape — this protects
-// a stale cached PWA (old client) against a new server that would otherwise
-// emit a projected snapshot it cannot render. Combined with the `projected`
-// envelope field on the Snapshot itself, it also protects a new client against
-// an old server that ignores proj=1 (the client falls back to wholesale-replace
-// when `projected` is absent). Phase 2: the flag is acknowledged (read) but the
-// projection path is not yet built — the server still emits AUTHORITY_COMPLETE
-// regardless of this flag. Phase 4 wires the actual projection when proj=1.
-func wantsProject(r *http.Request) bool {
-	return r.URL.Query().Get("proj") == "1"
-}
-
 // wantsTree2 reports whether the client opted into the server-owned session
 // tree (Phase 2: tree=2) via the `tree=2` query flag. When true, handleStream
 // emits a tree.snapshot (frontier) instead of the legacy wholesale snapshot,
 // and live structural events are translated to tree delta ops
 // (node.upsert/remove/move/children/facet) via state.TreeEmitter. The
 // GET /vh/tree/children expand endpoint (handleTreeChildren) is the lazy-load
-// counterpart. Old clients that don't send tree=2 get the legacy (or proj=1)
-// path unchanged — both emitters coexist off the same store events during the
-// transition (Phase 4 deletes the projection path).
+// counterpart. This is the sole structure-emission path (Phase 4 deleted the
+// proj=1 projected path); old clients that don't send tree=2 get the flat
+// wholesale snapshot on the non-tree branch.
 func wantsTree2(r *http.Request) bool {
 	return r.URL.Query().Get("tree") == "2"
-}
-
-// wantsHoist reports whether the client opted into hoisted per-session
-// constants (Phase 3 trim) via the `hoist=1` query flag. Only meaningful when
-// wantsProject(r) is also true (hoist is a modifier on the projected path).
-// Old clients that don't send hoist=1 get legacy per-session fields; new
-// clients send hoist=1 and get projectConstants + stripped sessions.
-func wantsHoist(r *http.Request) bool {
-	return r.URL.Query().Get("hoist") == "1"
 }
 
 // maybeCompressSnapshot gzip64-wraps a marshaled snapshot payload when compress

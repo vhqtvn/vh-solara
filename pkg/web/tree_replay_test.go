@@ -148,10 +148,17 @@ func TestTreeReplay_SnapshotIdIsStoreHead(t *testing.T) {
 }
 
 // TestTreeReplay_ReconnectReplaysDelta asserts a reconnect with a valid cursor
-// (Last-Event-ID = store head from the initial snapshot) replays ONLY the delta
-// events, NOT a full tree.snapshot. Before the fix, the snapshot id was 0
-// (emitter seq), so store.Replay(0) replayed EVERYTHING and a spurious
-// tree.snapshot was also emitted on every valid replay.
+// (Last-Event-ID = the initial tree.snapshot's SSE id = store head) replays the
+// delta FIRST — the tree.op for the session created after the initial snapshot.
+// Before the cursor-id fix, the snapshot id was 0 (emitter seq), so
+// store.Replay(0) replayed EVERYTHING and a spurious tree.snapshot was emitted
+// as the first event.
+//
+// Per C-F1 (Phase 3 Step B), the reconnect path ALSO emits tree.snapshot + the
+// legacy detail snapshot AFTER the replayed deltas to re-seed a client that
+// reconnected with empty in-memory detail/frontier (see tree_resume_detail_test.go).
+// This test checks only that the delta is the FIRST event — the C-F1 bootstrap
+// is asserted separately there.
 func TestTreeReplay_ReconnectReplaysDelta(t *testing.T) {
 	srv, agg := treeReplayServer(t)
 	store := agg.Store()
@@ -187,10 +194,12 @@ func TestTreeReplay_ReconnectReplaysDelta(t *testing.T) {
 	}
 	defer resp2.Body.Close()
 
-	// 4. First event should be tree.op for C2, NOT tree.snapshot.
+	// 4. First event should be tree.op for C2, NOT tree.snapshot. (Per C-F1 a
+	//    tree.snapshot + legacy detail snapshot also follow AFTER the deltas to
+	//    re-seed the frontier; here we only assert the delta comes first.)
 	ev2 := readFirstEvent(t, resp2.Body, 3*time.Second)
 	if ev2.event == "tree.snapshot" {
-		t.Fatalf("reconnect with valid cursor emitted tree.snapshot (should replay delta only); id=%q data=%.200s", ev2.id, ev2.data)
+		t.Fatalf("reconnect with valid cursor emitted tree.snapshot as the FIRST event (delta should come first); id=%q data=%.200s", ev2.id, ev2.data)
 	}
 	if ev2.event != "tree.op" {
 		t.Fatalf("reconnect: first event got %q, want tree.op", ev2.event)

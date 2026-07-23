@@ -687,17 +687,6 @@ func (a *Aggregator) Run(ctx context.Context) {
 	// shutdown. See TreeReconcileInterval.
 	go a.runTreeReconcile(ctx)
 
-	// Periodic demotion sweep catches TIME-DRIVEN demotion: a session that
-	// aged past the projection cutoff with no accompanying event. The
-	// event-driven frontier gate (ev.FrontierChanged) arms only on
-	// idle→busy PROMOTION, so a busy→idle transition that later crosses the
-	// cutoff would linger materialized on an already-open proj=1 stream until
-	// an unrelated frontier change. The sweep closes that gap by re-snapshotting
-	// via the existing promotion-coalesce path when the active closure shrinks.
-	// Bound to Run's ctx so it stops on aggregator shutdown. See
-	// Store.RunDemotionSweep.
-	go a.store.RunDemotionSweep(ctx)
-
 	backoff := time.Second
 	for {
 		if ctx.Err() != nil {
