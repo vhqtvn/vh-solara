@@ -24,7 +24,7 @@ RUN go build -trimpath -o /out/e2eserver ./tools/e2eserver \
 # 3) Runtime with the real opencode binary (glibc/bun).
 FROM debian:bookworm-slim
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl git tar \
+ && apt-get install -y --no-install-recommends ca-certificates curl git tar sqlite3 \
  && rm -rf /var/lib/apt/lists/*
 # Install the real opencode CLI.
 RUN curl -fsSL https://opencode.ai/install | bash
