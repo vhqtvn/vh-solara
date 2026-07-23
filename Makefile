@@ -3,7 +3,7 @@
 # gitignored staging dir (web/dist-build); embed-producing targets materialize
 # (copy) the staged bundle into pkg/web/dist right before `go build`.
 
-.PHONY: web web-materialize build build-debug install test test-unit test-web fmt fmt-check vet typecheck e2e e2e-keep docker fixtures bench clean-web-embed
+.PHONY: web web-materialize build build-debug install install-local test test-unit test-web fmt fmt-check vet typecheck e2e e2e-keep docker fixtures bench clean-web-embed
 
 web: ## Build the SolidJS UI into the staging dir web/dist-build (gitignored, NOT pkg/web/dist)
 	cd web && npm ci && npm run build
@@ -19,6 +19,33 @@ build-debug: web-materialize ## Build a local debug binary: debug logging forced
 
 install: web-materialize ## Build the UI then `go install` the single embedded binary into GOBIN
 	go install .
+
+install-local: build ## Build vh-solara and atomically install it over the existing binary on PATH (sudo/chown adapts to destination owner)
+	@set -e; \
+	ME=$$(id -u); \
+	if DEST=$$(command -v vh-solara 2>/dev/null); then :; else DEST=/usr/local/bin/vh-solara; fi; \
+	USE_SUDO=0; \
+	CHOWN_ME=0; \
+	if [ ! -e "$$DEST" ]; then \
+		USE_SUDO=1; \
+	else \
+		DEST_OWNER=$$(stat -c %u "$$DEST" 2>/dev/null || echo ""); \
+		if [ "$$DEST_OWNER" = "$$ME" ]; then :; \
+		elif [ "$$DEST_OWNER" = "0" ]; then USE_SUDO=1; \
+		else USE_SUDO=1; CHOWN_ME=1; \
+		fi; \
+	fi; \
+	TMP=$$(mktemp -t vh-solara.XXXXXX); \
+	trap 'rc=$$?; [ -n "$$TMP" ] && [ -e "$$TMP" ] && { if [ "$$USE_SUDO" = "1" ]; then sudo rm -f "$$TMP"; else rm -f "$$TMP"; fi; } 2>/dev/null || true; exit $$rc' EXIT; \
+	if [ "$$USE_SUDO" = "1" ]; then \
+		sudo install -m 0755 ./vh-solara "$$TMP"; \
+		sudo mv -f "$$TMP" "$$DEST"; \
+		if [ "$$CHOWN_ME" = "1" ]; then sudo chown "$$ME" "$$DEST"; fi; \
+	else \
+		install -m 0755 ./vh-solara "$$TMP"; \
+		mv -f "$$TMP" "$$DEST"; \
+	fi; \
+	echo "installed vh-solara -> $$DEST"
 
 test: ## Run all Go tests (mirrors CI's `go test ./...`)
 	go test ./...
