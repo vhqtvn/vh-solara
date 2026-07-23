@@ -172,6 +172,31 @@ type Server struct {
 	// managedDefaultOnce guards the one-time managed-project open of the default
 	// project (daemon cwd), triggered by the first request that touches it.
 	managedDefaultOnce sync.Once
+
+	// Background-task lifecycle. The post-archive re-assert goroutine
+	// (handleArchive) is owned by the Server, not the HTTP request: it derives
+	// its context from bgCtx (so Shutdown cancels it) and registers with bgWG
+	// (so Shutdown awaits it). This replaces the prior fire-and-forget
+	// goroutine that read a mutable package-level delay — a cross-test data
+	// race under -race. bgCtx/bgCancel are created once in NewServer and never
+	// reassigned; bgCancel is idempotent (safe for Shutdown to call repeatedly).
+	// bgMu guards reassertDelay (a test seam): the re-assert goroutine captures
+	// the delay + bgCtx under bgMu BEFORE launch and passes them as args, so it
+	// never reads shared mutable state after dispatch — eliminating the race.
+	bgMu          sync.Mutex
+	bgCtx         context.Context
+	bgCancel      context.CancelFunc
+	bgWG          sync.WaitGroup
+	reassertDelay time.Duration
+	// Test-only seams for the Issue-A ownership test (nil in production).
+	// reassertReadyCh, if set, is closed once when reassertArchive reaches its
+	// post-delay block point. reassertBlockCh, if set, makes reassertArchive
+	// block on a pure (ctx-independent) receive from it — so a test can hold
+	// the goroutine in a spot Shutdown's bgCancel CANNOT reach, proving the
+	// only way Shutdown returns is by awaiting bgWG. Guarded by bgMu for the
+	// one-shot close of reassertReadyCh.
+	reassertReadyCh chan struct{}
+	reassertBlockCh chan struct{}
 }
 
 // RegisterFeature adds a capability module to be mounted by Handler(). Call
@@ -273,8 +298,10 @@ func NewServer(agg *aggregator.Aggregator, opencodeURL string, ringCapacity int)
 	// default mime table has no .webmanifest entry).
 	_ = mime.AddExtensionType(".webmanifest", "application/manifest+json")
 
+	bgCtx, bgCancel := context.WithCancel(context.Background())
 	sub, err := fs.Sub(distFS, "dist")
 	if err != nil {
+		bgCancel()
 		return nil, err
 	}
 	srv := &Server{
@@ -294,6 +321,9 @@ func NewServer(agg *aggregator.Aggregator, opencodeURL string, ringCapacity int)
 		watcherOn:     map[string]bool{},
 		watcherCancel: map[string]context.CancelFunc{},
 		queueGCOn:     map[string]bool{},
+		bgCtx:         bgCtx,
+		bgCancel:      bgCancel,
+		reassertDelay: defaultReassertDelay,
 	}
 	// Arm the DEFAULT aggregator synchronously, BEFORE the server can serve
 	// any HTTP request. The default aggregator is created in the daemon
@@ -310,6 +340,36 @@ func NewServer(agg *aggregator.Aggregator, opencodeURL string, ringCapacity int)
 	// doc in pkg/aggregator/aggregator.go for the full model.
 	agg.Arm()
 	return srv, nil
+}
+
+// SetReassertDelay overrides the per-Server re-assert delay (a test seam that
+// replaces the prior mutable package global). Must be called before the archive
+// request whose re-assert it should affect; the delay is captured under bgMu at
+// goroutine-launch time, so the launched goroutine never reads shared mutable
+// state. No-op-safe with concurrent reads because both the read (at launch) and
+// this write are under bgMu.
+func (s *Server) SetReassertDelay(d time.Duration) {
+	s.bgMu.Lock()
+	s.reassertDelay = d
+	s.bgMu.Unlock()
+}
+
+// Shutdown cancels the Server's background-task lifetime (bgCtx) and awaits
+// outstanding background work (bgWG), bounded by ctx. It is idempotent: bgCancel
+// is safe to call repeatedly. The daemon's restart and KillFunc paths call this
+// so a re-assert goroutine in flight is cancelled (its ListSessions ctx is a
+// child of bgCtx) and awaited before the process exits — no detached goroutine
+// outlives the Server. Returns ctx.Err() if the await is bounded by ctx.
+func (s *Server) Shutdown(ctx context.Context) error {
+	s.bgCancel() // idempotent; never reassigned after NewServer
+	waitDone := make(chan struct{})
+	go func() { s.bgWG.Wait(); close(waitDone) }()
+	select {
+	case <-waitDone:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // aggFor returns the aggregator for a project directory, creating and starting
@@ -803,6 +863,10 @@ func (s *Server) Handler() http.Handler {
 	// Continuation-based pagination via ?cursor=<last-child-id>; the next
 	// cursor (if more children remain) is returned as X-VH-Branch-Cursor.
 	mux.HandleFunc("GET /vh/sessions/branch", s.handleBranch)
+	// Phase 2 tree=2 expand endpoint: GET → no CSRF (mirrors handleBranch).
+	// Returns a node.children page for lazy-loading direct children of a
+	// collapsed frontier node. See pkg/web/tree_children.go for the contract.
+	mux.HandleFunc("GET /vh/tree/children", s.handleTreeChildren)
 	// Feature modules (B) — the coordination write verbs (A1) are the first one.
 	s.mountFeatures(mux)
 	mux.HandleFunc("/vh/ack", s.handleAck)
@@ -1404,11 +1468,28 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 
 	var baseline uint64
 
+	// Phase 2 tree=2: per-connection emitter for the server-owned session tree.
+	// Non-nil only when wantsTree2(r). Created once and reused for the replay,
+	// reconnect-snapshot, and live-tail Translate paths below (carries E_c + seq).
+	var treeEmitter *state.TreeEmitter
+	if wantsTree2(r) {
+		treeEmitter = state.NewTreeEmitter(store, reqDir(r))
+	}
+
 	events, head, replayOK := store.Replay(cursor)
 	if hasCursor && replayOK {
 		for _, ev := range events {
 			if sendable(ev.Kind, ev.Payload) {
-				writeEvent(w, ev.Seq, ev.Kind, ev.Payload)
+				if treeEmitter != nil {
+					// tree=2 replay: translate each event to tree delta ops.
+					for _, op := range treeEmitter.Translate(ev) {
+						if b, err := json.Marshal(op); err == nil {
+							writeRaw(w, op.Seq(), "tree.op", b)
+						}
+					}
+				} else {
+					writeEvent(w, ev.Seq, ev.Kind, ev.Payload)
+				}
 			}
 		}
 		baseline = head
@@ -1448,6 +1529,16 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 				vhlog.Warn("stream reconnect snapshot: marshal failed, skipping", "err", err)
 			}
 		}
+		if wantsTree2(r) {
+			// tree=2 reconnect: re-seed the frontier from a fresh §5 snapshot.
+			rcTreeSnap := treeEmitter.SnapshotFrontier("reconnect")
+			if rb, err := json.Marshal(rcTreeSnap); err == nil {
+				wire := maybeCompressSnapshot(rb, wantsCompress(r))
+				writeRaw(w, rcTreeSnap.Seq, "tree.snapshot", wire)
+				sw.RecordSnapshotPath(len(wire))
+				baseline = store.Head()
+			}
+		}
 	} else {
 		// Fresh client or cursor too old: send a full snapshot, then live-tail.
 		// PROBE 8: when the client HAD a cursor but the shared replay ring
@@ -1464,40 +1555,55 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		// the fetch reconciles. Subscribe-before-trigger is preserved (we
 		// subscribed above) so no completion event slips through the gap.
 		s.triggerMessageLoad(agg, filter)
-		// Phase 4: when proj=1, use the projected snapshot (roots + active
-		// closure + frontier stubs) instead of the wholesale AUTHORITY_COMPLETE
-		// snapshot. This is what cuts the ~1016-session payload to ~100 nodes
-		// for an idle-heavy workload.
-		var snap state.Snapshot
-		if wantsProject(r) {
-			snap = store.SnapshotProjected(filter, "initial", wantsHoist(r))
+		if wantsTree2(r) {
+			// Phase 2 tree=2: emit a frontier snapshot (roots + active-path +
+			// direct-children-of-loaded placeholders) instead of the legacy
+			// wholesale/projected snapshot. treeEmitter was created above.
+			treeSnap := treeEmitter.SnapshotFrontier("initial")
+			if rb, err := json.Marshal(treeSnap); err == nil {
+				wire := maybeCompressSnapshot(rb, wantsCompress(r))
+				writeRaw(w, treeSnap.Seq, "tree.snapshot", wire)
+				sw.RecordSnapshotPath(len(wire))
+			} else {
+				vhlog.Warn("tree snapshot: marshal failed", "err", err)
+			}
+			baseline = store.Head()
 		} else {
-			snap = store.Snapshot(filter)
+			// Phase 4: when proj=1, use the projected snapshot (roots + active
+			// closure + frontier stubs) instead of the wholesale AUTHORITY_COMPLETE
+			// snapshot. This is what cuts the ~1016-session payload to ~100 nodes
+			// for an idle-heavy workload.
+			var snap state.Snapshot
+			if wantsProject(r) {
+				snap = store.SnapshotProjected(filter, "initial", wantsHoist(r))
+			} else {
+				snap = store.Snapshot(filter)
+			}
+			b, err := json.Marshal(snap)
+			if err != nil {
+				// Cannot fail for a well-typed *state.Snapshot today; log and skip
+				// the malformed snapshot write rather than emitting a nil/"null"
+				// frame. baseline still advances to snap.Seq so the live tail does
+				// not replay events already covered by the (would-be) snapshot.
+				vhlog.Warn("stream snapshot: marshal failed, skipping snapshot write", "err", err)
+			} else {
+				// gzip64-wrap the snapshot when the client opted in (z=1) AND it is large
+				// enough to benefit (a warm open of a loaded session — the megabyte-scale
+				// transcript inlined at snap.Messages[sid]). Small/cold/messageless
+				// snapshots fall under the threshold and ship raw. The envelope mirrors
+				// the cold-load messages.batch gzip64 shape so the client decodes via the
+				// same path; this is what cuts a warm open's end-to-end `snap` transport
+				// ~3.4x (the controller tunnel does not compress at any lower layer).
+				// Phase 3-D: record true wire bytes (was len(b), the pre-compression
+				// marshaled length — overstated ~3x). snapshot_bytes now reflects the
+				// actual bytes written, keeping the diag self-consistent with Phase-1
+				// per-path wire counters.
+				wire := maybeCompressSnapshot(b, wantsCompress(r))
+				writeRaw(w, snap.Seq, "snapshot", wire)
+				sw.RecordSnapshotPath(len(wire)) // PROBE 3: initial snapshot branch + wire bytes
+			}
+			baseline = snap.Seq
 		}
-		b, err := json.Marshal(snap)
-		if err != nil {
-			// Cannot fail for a well-typed *state.Snapshot today; log and skip
-			// the malformed snapshot write rather than emitting a nil/"null"
-			// frame. baseline still advances to snap.Seq so the live tail does
-			// not replay events already covered by the (would-be) snapshot.
-			vhlog.Warn("stream snapshot: marshal failed, skipping snapshot write", "err", err)
-		} else {
-			// gzip64-wrap the snapshot when the client opted in (z=1) AND it is large
-			// enough to benefit (a warm open of a loaded session — the megabyte-scale
-			// transcript inlined at snap.Messages[sid]). Small/cold/messageless
-			// snapshots fall under the threshold and ship raw. The envelope mirrors
-			// the cold-load messages.batch gzip64 shape so the client decodes via the
-			// same path; this is what cuts a warm open's end-to-end `snap` transport
-			// ~3.4x (the controller tunnel does not compress at any lower layer).
-			// Phase 3-D: record true wire bytes (was len(b), the pre-compression
-			// marshaled length — overstated ~3x). snapshot_bytes now reflects the
-			// actual bytes written, keeping the diag self-consistent with Phase-1
-			// per-path wire counters.
-			wire := maybeCompressSnapshot(b, wantsCompress(r))
-			writeRaw(w, snap.Seq, "snapshot", wire)
-			sw.RecordSnapshotPath(len(wire)) // PROBE 3: initial snapshot branch + wire bytes
-		}
-		baseline = snap.Seq
 	}
 	flusher.Flush()
 
@@ -1603,6 +1709,20 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			baseline = ev.Seq
 			if !sendable(ev.Kind, ev.Payload) {
 				continue // background message/part for an unsubscribed session
+			}
+			if treeEmitter != nil {
+				// Phase 2 tree=2: translate the raw store event to tree delta
+				// ops (node.upsert/remove/move/children/facet) and emit each as
+				// a tree.op SSE event. The emitter's per-connection E_c decides
+				// whether a child op or only a count facet is shipped (§5.4).
+				ops := treeEmitter.Translate(ev)
+				for _, op := range ops {
+					if b, err := json.Marshal(op); err == nil {
+						writeRaw(w, op.Seq(), "tree.op", b)
+					}
+				}
+				flusher.Flush()
+				continue
 			}
 			writeEvent(w, ev.Seq, ev.Kind, ev.Payload)
 			// Phase 4: for proj=1 clients, re-snapshot after structural events
@@ -1746,6 +1866,19 @@ var promotionCoalesceInterval = 150 * time.Millisecond
 // regardless of this flag. Phase 4 wires the actual projection when proj=1.
 func wantsProject(r *http.Request) bool {
 	return r.URL.Query().Get("proj") == "1"
+}
+
+// wantsTree2 reports whether the client opted into the server-owned session
+// tree (Phase 2: tree=2) via the `tree=2` query flag. When true, handleStream
+// emits a tree.snapshot (frontier) instead of the legacy wholesale snapshot,
+// and live structural events are translated to tree delta ops
+// (node.upsert/remove/move/children/facet) via state.TreeEmitter. The
+// GET /vh/tree/children expand endpoint (handleTreeChildren) is the lazy-load
+// counterpart. Old clients that don't send tree=2 get the legacy (or proj=1)
+// path unchanged — both emitters coexist off the same store events during the
+// transition (Phase 4 deletes the projection path).
+func wantsTree2(r *http.Request) bool {
+	return r.URL.Query().Get("tree") == "2"
 }
 
 // wantsHoist reports whether the client opted into hoisted per-session
