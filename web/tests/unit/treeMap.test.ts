@@ -363,4 +363,28 @@ describe("collapseNode — §8.4 client-only collapse", () => {
     collapseNode(m, "ghost");
     expect(m.size).toBe(0);
   });
+
+  // Parity fix: a PINNED descendant must survive an ancestor collapse. The flat
+  // map normally drops loaded descendants on collapse (§8.4) to save memory, but
+  // a pinned node is hoisted into the Pinned group and must stay resident so the
+  // pinned group keeps rendering it after the parent collapses. `protectedIds`
+  // is the pinned membership; protected descendants are skipped by the drop.
+  it("keeps protected (pinned) descendants when collapsing a parent", () => {
+    const m = seedTree([
+      node({ id: "p", loaded: true, childCount: 2, descendantCount: 5 }),
+      node({ id: "c1", parentId: "p" }),
+      node({ id: "c1a", parentId: "c1" }),
+      node({ id: "c2", parentId: "p" }),
+    ]);
+    // Pin c1a (a deep descendant). Collapse p with c1a protected.
+    collapseNode(m, "p", new Set(["c1a"]));
+    expect(m.has("p")).toBe(true); // placeholder kept
+    expect(m.get("p")?.loaded).toBe(false); // flipped
+    // The protected descendant stays resident (the pinned group can still resolve it).
+    expect(m.has("c1a")).toBe(true);
+    expect(m.get("c1a")?.id).toBe("c1a"); // own data intact
+    // Non-protected descendants are still dropped as before.
+    expect(m.has("c1")).toBe(false);
+    expect(m.has("c2")).toBe(false);
+  });
 });

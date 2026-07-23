@@ -97,8 +97,12 @@ export function removeTreeNode(id: string): void {
 // §8.4 client-only collapse: drop the loaded descendants from view, keep the
 // placeholder node (which still carries its own display data, §3), flip
 // loaded:false. Does NOT round-trip to the server.
-export function collapseTreeNode(id: string): void {
-  collapseNode(map, id);
+//
+// `protectedIds` (optional): pinned-node membership — pinned descendants are
+// kept resident so the Pinned group keeps rendering them after an ancestor
+// collapse (pin-parity fix). Passed through to the pure collapseNode.
+export function collapseTreeNode(id: string, protectedIds?: ReadonlySet<string>): void {
+  collapseNode(map, id, protectedIds);
   bump();
 }
 

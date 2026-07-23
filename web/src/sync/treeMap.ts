@@ -165,13 +165,23 @@ export function loadedDescendants(map: TreeFlatMap, id: string): string[] {
 // loaded:false). The placeholder keeps its own display data (self-contained,
 // §3), so collapsing never loses the node's own row/agent/badge. Does NOT
 // round-trip to the server.
-export function collapseNode(map: TreeFlatMap, id: string): void {
+//
+// `protectedIds` (optional): ids that must NOT be dropped even though they are
+// loaded descendants of `id`. This is the PIN-parity hook: a pinned descendant
+// is hoisted into the Pinned group and must stay resident when an ancestor
+// collapses, otherwise the pinned group would lose it (the flat map is the
+// pinned group's only source). Callers pass the current pinned membership
+// (sidebar.ts); absent it, all descendants drop as before (unchanged §8.4).
+export function collapseNode(map: TreeFlatMap, id: string, protectedIds?: ReadonlySet<string>): void {
   const node = map.get(id);
   if (!node) return;
   const [first, ...rest] = loadedDescendants(map, id);
   // `first` === id; drop only the descendants, keep the placeholder.
   void first;
-  for (const desc of rest) map.delete(desc);
+  for (const desc of rest) {
+    if (protectedIds?.has(desc)) continue; // pinned node stays resident
+    map.delete(desc);
+  }
   map.set(id, { ...node, loaded: false });
 }
 
