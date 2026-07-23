@@ -105,6 +105,14 @@ const (
 	// materialized view — it's a transient fan-out, not stored in any snapshot —
 	// so a resuming client only sees notices emitted after it connects.
 	KindNotice = "notice"
+	// KindTreeOrphanCheck is a server-internal event (Phase 2 §9) emitted when a
+	// session's root archive status may have changed — on delete reparenting
+	// (deleteSessionLocked re-roots children → their chain root changed) or on
+	// archive/un-archive. The tree emitter translates it to a
+	// node.facet{flags:{orphan}} for each known node whose orphan status
+	// changed. Payload {"id":id}. NOT prefixed session./message./part. so the
+	// web layer's sendable() always-streams it on the tree-only Stream 1.
+	KindTreeOrphanCheck = "tree.orphan"
 )
 
 // Per-session activity states surfaced to clients (sidebar status).
@@ -2057,12 +2065,18 @@ func (s *Store) deleteSessionLocked(id string) {
 			s.adjustAncestorChainFromLocked(se.parentID, -sub)
 		}
 	}
+	// Phase 2 §9.2: capture the direct children BEFORE maintainIndexesOnDeleteLocked
+	// re-roots them and deletes s.children[id]. We emit orphan-check for each
+	// newly-rooted child's subtree AFTER the delete is fully applied (below) so
+	// effectiveParentOfLocked returns "" for the reparented children.
+	var reparentedChildren []string
 	// Phase 1 (Gate C extension): maintain the 7 remaining indexes. Same shape
 	// as the prototype busy-delete block above, but unified in one helper
 	// (sum-class propagation, topology orphaning + unlink, max-class chain
 	// recompute, bucket removal). Must run BEFORE the per-session delete(...)
 	// calls — we read se.parentID + the index entries to resolve subtrees.
 	if se := s.sessions[id]; se != nil {
+		reparentedChildren = append(reparentedChildren, s.children[id]...)
 		s.maintainIndexesOnDeleteLocked(id, se)
 	}
 	// Phase 3 (Gate B): session deletion is a projection-affecting structural
@@ -2104,6 +2118,16 @@ func (s *Store) deleteSessionLocked(id string) {
 	delete(s.permBlocked, id)
 	s.curFrontierChanged = true
 	s.emit(KindSessionDelete, rawObj(map[string]interface{}{"id": id}))
+	// Phase 2 §9.2: after the topology change is fully applied (s.sessions[id]
+	// deleted, KindSessionDelete emitted), emit orphan-check for each newly-
+	// rooted child's subtree. The chain root changed from the deleted node to
+	// the child itself (now a root) → orphan=false for the child and descendants.
+	// Q5: ONLY newly-rooted children are checked — no sibling sweep.
+	for _, cid := range reparentedChildren {
+		for _, did := range s.descendantsLocked(cid) {
+			s.emit(KindTreeOrphanCheck, rawObj(map[string]interface{}{"id": did}))
+		}
+	}
 }
 
 // --- archive (OpenCode-native: time.archived is the source of truth) ---
@@ -2203,6 +2227,27 @@ func (s *Store) IsRecentlyArchived(id string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.isRecentlyArchivedLocked(id)
+}
+
+// EmitOrphanCheck emits a KindTreeOrphanCheck event for each id (Phase 2 §9.2),
+// prompting the tree emitter to recompute the orphan facet and emit a
+// node.facet{flags:{orphan}} for each known connection node whose status
+// changed. Used by the archive handler after archive/un-archive (when a root's
+// archive state flips and descendants may become/clear orphan). Under the
+// cascade-delete model, descendants are already gone after archive → this is a
+// no-op for the archive path, but correct for the unarchive path where
+// descendants re-enter via Rehydrate and for any future archive-keep path.
+func (s *Store) EmitOrphanCheck(ids []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.emitOrphanCheckLocked(ids)
+}
+
+// emitOrphanCheckLocked is the locked variant. Caller holds s.mu (write).
+func (s *Store) emitOrphanCheckLocked(ids []string) {
+	for _, id := range ids {
+		s.emit(KindTreeOrphanCheck, rawObj(map[string]interface{}{"id": id}))
+	}
 }
 
 // SetPendingQuestions reconciles the pending-question set to exactly the given

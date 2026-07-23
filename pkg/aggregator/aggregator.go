@@ -679,6 +679,14 @@ func (a *Aggregator) Run(ctx context.Context) {
 	// Bound to Run's ctx so it stops on aggregator shutdown.
 	go a.runStatusReconcile(ctx)
 
+	// Periodic tree reconcile (Phase 2 §6.2): diffs the store against
+	// OpenCode's authoritative /session list to catch ghosts (missed deletes)
+	// and clobber-reverted archives. Folds in the existing archive re-assert
+	// (reassertArchive) and the resurrection tombstone so Phase 2 merges rather
+	// than duplicates them. Bound to Run's ctx so it stops on aggregator
+	// shutdown. See TreeReconcileInterval.
+	go a.runTreeReconcile(ctx)
+
 	// Periodic demotion sweep catches TIME-DRIVEN demotion: a session that
 	// aged past the projection cutoff with no accompanying event. The
 	// event-driven frontier gate (ev.FrontierChanged) arms only on

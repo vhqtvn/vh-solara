@@ -521,6 +521,7 @@ func (f *FakeOpenCode) Handler() http.Handler {
 	})
 	mux.HandleFunc("/fixture/reset", f.handleFixtureReset)
 	mux.HandleFunc("/fixture/busy", f.handleFixtureBusy)
+	mux.HandleFunc("/fixture/delete", f.handleFixtureDelete)
 	mux.HandleFunc("/question/", f.handleQuestion)
 	mux.HandleFunc("/question", func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
@@ -1184,6 +1185,37 @@ func (f *FakeOpenCode) handleFixtureBusy(w http.ResponseWriter, r *http.Request)
 		"status":    map[string]any{"type": "busy"},
 	})
 	writeJSON(w, map[string]any{"busy": session})
+}
+
+// handleFixtureDelete removes a session entirely from the fake's in-memory
+// dataset: deletes it from f.sessions, f.archived, f.busy, and f.messages. This
+// simulates a mid-stream DB delete (session gone from /session) so the
+// server-side tree reconcile tick (§6.2) can be exercised end-to-end. After the
+// delete, GET /session no longer returns the id, and the aggregator's reconcile
+// tick will emit a corrective node.remove. Test-only infrastructure.
+func (f *FakeOpenCode) handleFixtureDelete(w http.ResponseWriter, r *http.Request) {
+	session := r.URL.Query().Get("session")
+	if session == "" {
+		http.Error(w, "missing session", http.StatusBadRequest)
+		return
+	}
+	f.mu.Lock()
+	filtered := f.sessions[:0]
+	for _, s := range f.sessions {
+		if id, _ := s["id"].(string); id != session {
+			filtered = append(filtered, s)
+		}
+	}
+	f.sessions = filtered
+	delete(f.archived, session)
+	delete(f.busy, session)
+	delete(f.messages, session)
+	f.mu.Unlock()
+	// Emit a session.deleted event so the aggregator's event subscriber drops it
+	// immediately too (not just on the next reconcile tick). Real OpenCode emits
+	// this when a session is hard-deleted.
+	f.emit("session.deleted", map[string]any{"sessionID": session})
+	writeJSON(w, map[string]any{"deleted": session})
 }
 
 func (f *FakeOpenCode) appendMessage(sessionID string, m messageWithParts) {

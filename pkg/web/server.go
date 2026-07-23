@@ -1482,9 +1482,12 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			if sendable(ev.Kind, ev.Payload) {
 				if treeEmitter != nil {
 					// tree=2 replay: translate each event to tree delta ops.
+					// The SSE id (Last-Event-ID) uses ev.Seq (STORE seq) — NOT
+					// op.Seq() (emitter seq) — so store.Replay(cursor) works in
+					// the same number space on the next reconnect (§5.5).
 					for _, op := range treeEmitter.Translate(ev) {
 						if b, err := json.Marshal(op); err == nil {
-							writeRaw(w, op.Seq(), "tree.op", b)
+							writeRaw(w, ev.Seq, "tree.op", b)
 						}
 					}
 				} else {
@@ -1529,16 +1532,6 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 				vhlog.Warn("stream reconnect snapshot: marshal failed, skipping", "err", err)
 			}
 		}
-		if wantsTree2(r) {
-			// tree=2 reconnect: re-seed the frontier from a fresh §5 snapshot.
-			rcTreeSnap := treeEmitter.SnapshotFrontier("reconnect")
-			if rb, err := json.Marshal(rcTreeSnap); err == nil {
-				wire := maybeCompressSnapshot(rb, wantsCompress(r))
-				writeRaw(w, rcTreeSnap.Seq, "tree.snapshot", wire)
-				sw.RecordSnapshotPath(len(wire))
-				baseline = store.Head()
-			}
-		}
 	} else {
 		// Fresh client or cursor too old: send a full snapshot, then live-tail.
 		// PROBE 8: when the client HAD a cursor but the shared replay ring
@@ -1559,7 +1552,15 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			// Phase 2 tree=2: emit a frontier snapshot (roots + active-path +
 			// direct-children-of-loaded placeholders) instead of the legacy
 			// wholesale/projected snapshot. treeEmitter was created above.
-			treeSnap := treeEmitter.SnapshotFrontier("initial")
+			// When the client HAD a cursor but the ring evicted it
+			// (hasCursor && !replayOK), this is a ring-gap reconnect → cause
+			// "reconnect" so the client knows to wholesale-replace its tree
+			// (§5.5). A fresh client (no cursor) gets cause "initial".
+			cause := "initial"
+			if hasCursor && !replayOK {
+				cause = "reconnect"
+			}
+			treeSnap := treeEmitter.SnapshotFrontier(cause)
 			if rb, err := json.Marshal(treeSnap); err == nil {
 				wire := maybeCompressSnapshot(rb, wantsCompress(r))
 				writeRaw(w, treeSnap.Seq, "tree.snapshot", wire)
@@ -1715,10 +1716,12 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 				// ops (node.upsert/remove/move/children/facet) and emit each as
 				// a tree.op SSE event. The emitter's per-connection E_c decides
 				// whether a child op or only a count facet is shipped (§5.4).
+				// The SSE id (Last-Event-ID) uses ev.Seq (STORE seq) so the
+				// client's cursor matches store.Replay on reconnect (§5.5).
 				ops := treeEmitter.Translate(ev)
 				for _, op := range ops {
 					if b, err := json.Marshal(op); err == nil {
-						writeRaw(w, op.Seq(), "tree.op", b)
+						writeRaw(w, ev.Seq, "tree.op", b)
 					}
 				}
 				flusher.Flush()

@@ -271,7 +271,12 @@ func (e *TreeEmitter) SnapshotFrontier(cause string) *TreeSnapshot {
 		e.emitSnapshotNode(out, id, false)
 	}
 
-	out.Seq = e.seq
+	// out.Seq is the resume cursor the client sends back as Last-Event-ID on
+	// reconnect. It MUST be the STORE head seq (s.seq), NOT the emitter's
+	// per-connection seq counter — store.Replay(cursor) compares against the
+	// store/ring seq space. Using the emitter seq (starts at 0) would make
+	// store.Replay(0) replay every event on every reconnect (design §5.5).
+	out.Seq = s.seq
 	return out
 }
 
@@ -360,6 +365,8 @@ func (e *TreeEmitter) Translate(ev ClientEvent) []TreeOp {
 		ops = e.onQuestionLocked(ev, true)
 	case KindQuestionClear:
 		ops = e.onQuestionLocked(ev, false)
+	case KindTreeOrphanCheck:
+		ops = e.onOrphanCheckLocked(ev)
 	}
 	for _, op := range ops {
 		op.assignSeq(e.nextSeq())
@@ -568,6 +575,29 @@ func (e *TreeEmitter) onQuestionLocked(ev ClientEvent, set bool) []TreeOp {
 		cur = s.effectiveParentOfLocked(s.sessions[cur].parentID)
 	}
 	return ops
+}
+
+// onOrphanCheckLocked emits node.facet{flags:{orphan}} for the node id with its
+// recomputed orphan status (§9.2 + §9.3). Skipped if the node is not known to
+// this connection (the client doesn't hold it → no facet needed) or is gone
+// from the store.
+func (e *TreeEmitter) onOrphanCheckLocked(ev ClientEvent) []TreeOp {
+	var p struct {
+		ID string `json:"id"`
+	}
+	if json.Unmarshal(ev.Payload, &p) != nil || p.ID == "" {
+		return nil
+	}
+	if !e.known[p.ID] {
+		return nil
+	}
+	s := e.store
+	if s.sessions[p.ID] == nil {
+		return nil // gone from store
+	}
+	op := NodeFacetOp(p.ID, FacetData{Flags: map[string]bool{"orphan": isOrphanLocked(s, p.ID)}})
+	e.stamp(op, p.ID)
+	return []TreeOp{op}
 }
 
 // ----------------------------------------------------------------------------
