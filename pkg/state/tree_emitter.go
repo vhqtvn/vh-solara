@@ -563,7 +563,18 @@ func (e *TreeEmitter) onQuestionLocked(ev ClientEvent, set bool) []TreeOp {
 	}
 	// Walk ancestors; emit subtreeNeedsInput facet where the index flips.
 	s := e.store
-	cur := s.effectiveParentOfLocked(s.sessions[p.SessionID].parentID)
+	// Nil-guard: e.known LAGS the store, so a session can already be deleted
+	// from s.sessions while a lagging connection still holds e.known[id]==true
+	// (it has not yet processed the KindSessionDelete). The pendingInput facet
+	// above is harmless on the stale client node (a node.remove follows once the
+	// delete is processed), but the ancestor walk MUST NOT dereference the gone
+	// session — capture and bail before the walk. (tree=2 is the default client
+	// path, so this nil deref was live-hitting users.)
+	sess := s.sessions[p.SessionID]
+	if sess == nil {
+		return ops // node gone from store; no ancestors to walk.
+	}
+	cur := s.effectiveParentOfLocked(sess.parentID)
 	for cur != "" && s.sessions[cur] != nil {
 		if !e.known[cur] {
 			break
