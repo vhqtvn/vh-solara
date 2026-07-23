@@ -2,6 +2,7 @@ package web
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/vhqtvn/vh-solara/pkg/aggregator"
 	"github.com/vhqtvn/vh-solara/pkg/opencode"
@@ -178,6 +180,12 @@ func newVerbServerSrv(t *testing.T, f *fakeOC) (*httptest.Server, *aggregator.Ag
 	}
 	web := httptest.NewServer(srv.Handler())
 	t.Cleanup(web.Close)
+	// Issue A: await the Server's owned background goroutines at test end.
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	})
 	return web, agg, srv
 }
 

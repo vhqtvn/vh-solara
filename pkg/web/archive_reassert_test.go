@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"testing"
 	"time"
 )
@@ -16,6 +17,15 @@ import (
 // They drive the full /vh/archive HTTP path with a fakeOC that records PATCH
 // ids and serves a configurable GET /session reply, so we can assert the
 // re-assert fires (or not) based on whether OpenCode reports the id as archived.
+//
+// LIFECYCLE (Issue A): the re-assert goroutine is OWNED by the Server. Its
+// delay is per-Server (srv.SetReassertDelay), not a mutable package global (the
+// global was a -race data race: the goroutine read it while another test wrote
+// it). The goroutine registers with the Server's bgWG so Shutdown awaits it;
+// its RPC ctx derives from the Server's bgCtx so Shutdown cancels it. Every
+// test deterministically awaits the goroutine via srv.Shutdown (the test
+// helpers queueLifecycleServer/newVerbServerSrv install a Shutdown cleanup) —
+// no leaked goroutine outlives a test, no sleeps used to mask races.
 
 // archivedPATCHes returns a snapshot copy of the ids PATCHed via SetArchived.
 func archivedPATCHes(f *fakeOC) []string {
@@ -36,25 +46,16 @@ func countID(ids []string, id string) int {
 	return n
 }
 
-// withReassertDelay shrinks the package-level archiveReassertDelay for the
-// lifetime of the test (save/restore; the suite is not parallel).
-func withReassertDelay(t *testing.T, d time.Duration) {
-	t.Helper()
-	old := archiveReassertDelay
-	archiveReassertDelay = d
-	t.Cleanup(func() { archiveReassertDelay = old })
-}
-
 // TestArchiveReassert_ReparchesClobberedID: the initial PATCHes all return 200
 // but OpenCode's authoritative list reports the id with archived=null (busy
 // subagent clobbered it). The re-assert goroutine must re-PATCH that id.
 func TestArchiveReassert_ReparchesClobberedID(t *testing.T) {
-	withReassertDelay(t, 5*time.Millisecond)
 	// OpenCode reports s1 with archived=null → the re-assert sees it as
 	// not-stuck and re-PATCHes.
 	list := []byte(`[{"id":"s1","parentID":"","time":{"archived":null}}]`)
 	f := &fakeOC{listSessionsReply: list}
-	web, agg, _, _ := queueLifecycleServer(t, f)
+	web, agg, srv, _ := queueLifecycleServer(t, f)
+	srv.SetReassertDelay(5 * time.Millisecond)
 	agg.Store().Apply(ev("session.created", `{"info":{"id":"s1"}}`))
 
 	resp := csrfPost(t, web.URL+"/vh/archive", map[string]any{"sessionID": "s1"})
@@ -83,12 +84,12 @@ func TestArchiveReassert_ReparchesClobberedID(t *testing.T) {
 // authoritative list reports the id with archived set). The re-assert goroutine
 // must NOT re-PATCH.
 func TestArchiveReassert_SkipsWhenStuck(t *testing.T) {
-	withReassertDelay(t, 5*time.Millisecond)
 	// OpenCode reports s1 with archived=<ts> → the re-assert sees it as stuck
 	// and skips.
 	list := []byte(`[{"id":"s1","parentID":"","time":{"archived":1700000000000}}]`)
 	f := &fakeOC{listSessionsReply: list}
-	web, agg, _, _ := queueLifecycleServer(t, f)
+	web, agg, srv, _ := queueLifecycleServer(t, f)
+	srv.SetReassertDelay(5 * time.Millisecond)
 	agg.Store().Apply(ev("session.created", `{"info":{"id":"s1"}}`))
 
 	resp := csrfPost(t, web.URL+"/vh/archive", map[string]any{"sessionID": "s1"})
@@ -113,13 +114,13 @@ func TestArchiveReassert_SkipsWhenStuck(t *testing.T) {
 // still holds: once ClearArchiveTombstones runs (the explicit unarchive flow),
 // the id is no longer expected to be archived.
 func TestArchiveReassert_SkipsRepatchAfterTombstoneCleared(t *testing.T) {
-	withReassertDelay(t, 30*time.Millisecond) // window to clear the tombstone first
 	// OpenCode reports s1 with archived=null (the clobber shape). Without the
 	// IsRecentlyArchived guard the re-assert would re-PATCH; with it, the
 	// cleared tombstone makes the goroutine skip.
 	list := []byte(`[{"id":"s1","parentID":"","time":{"archived":null}}]`)
 	f := &fakeOC{listSessionsReply: list}
-	web, agg, _, _ := queueLifecycleServer(t, f)
+	web, agg, srv, _ := queueLifecycleServer(t, f)
+	srv.SetReassertDelay(30 * time.Millisecond) // window to clear the tombstone first
 	agg.Store().Apply(ev("session.created", `{"info":{"id":"s1"}}`))
 
 	resp := csrfPost(t, web.URL+"/vh/archive", map[string]any{"sessionID": "s1"})
@@ -163,5 +164,86 @@ func TestArchiveReassert_ResponseNotBlocked(t *testing.T) {
 	// (the rest of the handler is sub-millisecond).
 	if elapsed > 500*time.Millisecond {
 		t.Fatalf("archive response blocked on re-assert goroutine: %v (want <500ms)", elapsed)
+	}
+}
+
+// TestArchiveReassert_ShutdownOwnsOutstandingWork proves the Issue-A lifecycle
+// fix: the Server OWNS the re-assert goroutine (it is registered with bgWG),
+// so Shutdown does NOT return while that goroutine is still in-flight.
+//
+// Why a test seam (reassertBlockCh) and not a fake ListSessions hang: the http
+// CLIENT aborts an in-flight request the instant its context cancels, so once
+// Shutdown cancels bgCtx the re-assert goroutine's ListSessions returns
+// immediately regardless of what the server-side fake does. That makes
+// Shutdown's bgWG.Wait unobservable via timing on the real code path. The seam
+// places the goroutine in a pure (ctx-independent) channel receive — the ONE
+// spot bgCancel cannot reach — so the goroutine provably cannot exit until the
+// test releases it. If Shutdown returns during that window, it did NOT await
+// bgWG (a regression to fire-and-forget would fail here).
+func TestArchiveReassert_ShutdownOwnsOutstandingWork(t *testing.T) {
+	f := &fakeOC{listSessionsReply: []byte(`[]`)}
+	web, agg, srv, _ := queueLifecycleServer(t, f)
+	// NOTE: queueLifecycleServer installs a t.Cleanup(srv.Shutdown). Shutdown
+	// is idempotent, so the explicit call below (mid-test, for the await
+	// assertion) and the cleanup call (at test end) compose harmlessly.
+	agg.Store().Apply(ev("session.created", `{"info":{"id":"s1"}}`))
+	srv.SetReassertDelay(1 * time.Millisecond) // pass the delay fast, reach the block
+
+	// Install the test seam: signal when the goroutine reaches its post-delay
+	// block point, then hold it there on a pure channel receive.
+	ready := make(chan struct{})
+	block := make(chan struct{})
+	srv.reassertReadyCh = ready
+	srv.reassertBlockCh = block
+
+	// POST /vh/archive — returns immediately (goroutine dispatched async).
+	resp := csrfPost(t, web.URL+"/vh/archive", map[string]any{"sessionID": "s1"})
+	if resp.StatusCode != 200 {
+		resp.Body.Close()
+		t.Fatalf("/vh/archive: got %d, want 200", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// Wait until the re-assert goroutine has reached its block point.
+	select {
+	case <-ready:
+	case <-time.After(2 * time.Second):
+		t.Fatal("re-assert goroutine never reached its post-delay block point")
+	}
+
+	// Shutdown in a goroutine: bgCancel (cannot reach the pure channel block)
+	// then bgWG.Wait (blocks — goroutine is still alive at the block).
+	shutdownDone := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		shutdownDone <- srv.Shutdown(ctx)
+	}()
+	// Fail-fast poll: prove Shutdown does NOT return while the goroutine is
+	// held at the block. The goroutine CANNOT exit until `block` closes (pure
+	// receive, bgCancel doesn't touch it), so Shutdown returning here means it
+	// did NOT await bgWG.
+	deadline := time.Now().Add(120 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		select {
+		case err := <-shutdownDone:
+			t.Fatalf("Shutdown returned while the re-assert goroutine was still "+
+				"blocked: %v (Server must own + await outstanding tracked work)", err)
+		default:
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	// Release the goroutine: the pure block completes → the goroutine proceeds
+	// to ListSessions whose ctx is a child of the (now-cancelled) bgCtx →
+	// ListSessions returns immediately → the goroutine exits → bgWG.Done →
+	// Shutdown's Wait returns.
+	close(block)
+	select {
+	case err := <-shutdownDone:
+		if err != nil {
+			t.Fatalf("Shutdown returned error after release: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Shutdown never returned after the goroutine was released (not awaited)")
 	}
 }

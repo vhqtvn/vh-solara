@@ -2,6 +2,7 @@ package web
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -504,6 +505,12 @@ func newQueueTestServer(t *testing.T) (*httptest.Server, string) {
 	t.Chdir(root)
 	web := httptest.NewServer(srv.Handler())
 	t.Cleanup(web.Close)
+	// Issue A: await the Server's owned background goroutines at test end.
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	})
 	return web, root
 }
 

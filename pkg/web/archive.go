@@ -10,10 +10,11 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/vhqtvn/vh-solara/pkg/aggregator"
 	"github.com/vhqtvn/vh-solara/pkg/opencode"
 )
 
-// archiveReassertDelay is the wait before the post-archive re-assert goroutine
+// defaultReassertDelay is the wait before the post-archive re-assert goroutine
 // re-reads OpenCode and re-PATCHes any affected id whose time.archived was
 // clobbered by a still-running busy/compacting subagent (OpenCode rewrites the
 // full session record from a pre-PATCH snapshot → archived back to null). The
@@ -21,8 +22,9 @@ import (
 // the re-assert is what makes the archive actually persist once the busy write
 // settles. The store-side tombstone (set by RemoveSessions) holds the live
 // tree during this window; this goroutine is defense-in-depth for OpenCode's
-// own state. Var (not const) so tests can shrink it.
-var archiveReassertDelay = 1 * time.Second
+// own state. The per-Server delay (Server.reassertDelay) defaults to this;
+// tests override it via SetReassertDelay.
+const defaultReassertDelay = 1 * time.Second
 
 // Archiving uses OpenCode's NATIVE archive (PATCH /session/:id time.archived):
 // it persists in OpenCode and is visible to every client. Archiving cascades to
@@ -161,57 +163,109 @@ func (s *Server) handleArchive(w http.ResponseWriter, r *http.Request) {
 		// the window; this goroutine closes the gap in OpenCode itself by
 		// re-reading the authoritative list after the busy write settles and
 		// re-PATCHing any affected id where archived didn't stick. Best-effort
-		// (logs on error); the tombstone is the hard guarantee. Runs in a
-		// goroutine so it never delays the archive response.
-		go func(affected []string) {
-			time.Sleep(archiveReassertDelay)
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			sessions, err := agg.Client().ListSessions(ctx)
-			if err != nil {
-				log.Printf("[archive] re-assert ListSessions(%s): %v", body.SessionID, err)
-				return
-			}
-			// Build the set of ids OpenCode reports as genuinely archived
-			// (time.archived set to a non-zero value). Mirrors
-			// sessionEnvelope.archivedAt() in pkg/state/store.go.
-			archivePersisted := make(map[string]bool, len(sessions))
-			for _, raw := range sessions {
-				var env struct {
-					ID   string `json:"id"`
-					Time struct {
-						Archived *float64 `json:"archived"`
-					} `json:"time"`
-				}
-				if json.Unmarshal(raw, &env) != nil || env.ID == "" {
-					continue
-				}
-				if env.Time.Archived != nil && *env.Time.Archived != 0 {
-					archivePersisted[env.ID] = true
-				}
-			}
-			ts := time.Now().UnixMilli()
-			for _, id := range affected {
-				if archivePersisted[id] {
-					continue // archive persisted for this id
-				}
-				// Don't re-PATCH if the tombstone is gone — either the TTL
-				// expired (archive is long-settled, OpenCode is consistent) or
-				// the id was explicitly unarchived
-				// (ClearArchiveTombstones). Re-PATCHing in that window would
-				// undo a legitimate unarchive. The tombstone is the re-assert's
-				// signal that the archive intent still holds (re-assert fires
-				// at archiveReassertDelay, well inside recentArchiveTTL).
-				if !agg.Store().IsRecentlyArchived(id) {
-					continue
-				}
-				if err := agg.Client().SetArchived(ctx, id, ts); err != nil {
-					log.Printf("[archive] re-assert SetArchived(%s): %v", id, err)
-				}
-			}
-		}(append(affected[:0:0], affected...))
+		// (logs on error); the tombstone is the hard guarantee.
+		//
+		// LIFECYCLE (Issue A): this goroutine is OWNED by the Server, not the
+		// request. It captures its delay + bgCtx under bgMu BEFORE launch (so
+		// it never reads shared mutable state after dispatch — the prior read of
+		// a package global was a -race data race across tests), registers with
+		// bgWG so Server.Shutdown can await it, derives its RPC context from
+		// bgCtx (so Shutdown cancels it), and waits via a cancellable
+		// select on bgCtx.Done() instead of a bare time.Sleep. Dispatched
+		// async so it never delays the archive response.
+		s.bgMu.Lock()
+		delay := s.reassertDelay
+		bgCtx := s.bgCtx
+		s.bgWG.Add(1)
+		s.bgMu.Unlock()
+		go s.reassertArchive(bgCtx, delay, agg, affected, body.SessionID)
 	}
 	writeJSONResp(w, map[string]any{"ok": true, "affected": affected})
+}
+
+// reassertArchive is the Server-owned post-archive re-assert (Issue A). It is
+// dispatched as a tracked goroutine (bgWG) by handleArchive; bgCtx is the
+// Server's background lifetime so Shutdown cancels and awaits it. delay is the
+// captured per-Server re-assert wait (read under bgMu at launch). srcID is the
+// originating session id, used only for logging.
+//
+// The delay wait is a cancellable select on bgCtx.Done() (not a bare
+// time.Sleep): if Shutdown runs during the delay window, the goroutine exits
+// promptly instead of running a full delay against a server that is already
+// shutting down. The RPC context is a timeout child of bgCtx, so the same
+// Shutdown cancellation propagates to an in-flight ListSessions/SetArchived.
+func (s *Server) reassertArchive(bgCtx context.Context, delay time.Duration, agg *aggregator.Aggregator, affected []string, srcID string) {
+	defer s.bgWG.Done()
+	select {
+	case <-time.After(delay):
+	case <-bgCtx.Done():
+		return
+	}
+	// Test-only seam (Issue A ownership test; nil in production). Signal
+	// readiness, then optionally block on a pure (ctx-independent) channel
+	// receive. Everything else this goroutine does is ctx-bound, so bgCancel
+	// frees it immediately — which makes Shutdown's bgWG.Wait unobservable via
+	// timing. The pure block here is the one spot bgCancel CANNOT reach, so a
+	// test can hold the goroutine and prove the ONLY way Shutdown returns is by
+	// awaiting bgWG (cancel alone leaves it blocked here). Guarded by bgMu for
+	// the one-shot close of reassertReadyCh.
+	s.bgMu.Lock()
+	ready := s.reassertReadyCh
+	block := s.reassertBlockCh
+	if ready != nil {
+		select {
+		case <-ready:
+		default:
+			close(ready)
+		}
+	}
+	s.bgMu.Unlock()
+	if block != nil {
+		<-block
+	}
+	ctx, cancel := context.WithTimeout(bgCtx, 10*time.Second)
+	defer cancel()
+	sessions, err := agg.Client().ListSessions(ctx)
+	if err != nil {
+		log.Printf("[archive] re-assert ListSessions(%s): %v", srcID, err)
+		return
+	}
+	// Build the set of ids OpenCode reports as genuinely archived
+	// (time.archived set to a non-zero value). Mirrors
+	// sessionEnvelope.archivedAt() in pkg/state/store.go.
+	archivePersisted := make(map[string]bool, len(sessions))
+	for _, raw := range sessions {
+		var env struct {
+			ID   string `json:"id"`
+			Time struct {
+				Archived *float64 `json:"archived"`
+			} `json:"time"`
+		}
+		if json.Unmarshal(raw, &env) != nil || env.ID == "" {
+			continue
+		}
+		if env.Time.Archived != nil && *env.Time.Archived != 0 {
+			archivePersisted[env.ID] = true
+		}
+	}
+	ts := time.Now().UnixMilli()
+	for _, id := range affected {
+		if archivePersisted[id] {
+			continue // archive persisted for this id
+		}
+		// Don't re-PATCH if the tombstone is gone — either the TTL
+		// expired (archive is long-settled, OpenCode is consistent) or the id
+		// was explicitly unarchived (ClearArchiveTombstones). Re-PATCHing in
+		// that window would undo a legitimate unarchive. The tombstone is the
+		// re-assert's signal that the archive intent still holds (re-assert
+		// fires at the captured delay, well inside recentArchiveTTL).
+		if !agg.Store().IsRecentlyArchived(id) {
+			continue
+		}
+		if err := agg.Client().SetArchived(ctx, id, ts); err != nil {
+			log.Printf("[archive] re-assert SetArchived(%s): %v", id, err)
+		}
+	}
 }
 
 // archivedDescendants returns id plus every genuinely archived session

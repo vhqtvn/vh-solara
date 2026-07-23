@@ -107,9 +107,9 @@ func TestArchiveOrphan_NotInStoreFallback(t *testing.T) {
 // abort — it logs the error, continues, and RemoveSessions still fires so the
 // tree is pruned and the tombstone is set. 410 (Gone) is treated the same.
 func TestArchiveOrphan_ToleratesGoneStatus(t *testing.T) {
-	withReassertDelay(t, 5*time.Millisecond) // shrink so the goroutine settles fast
 	f := &fakeOC{archiveStatus: http.StatusNotFound}
-	web, agg, _, _ := queueLifecycleServer(t, f)
+	web, agg, srv, _ := queueLifecycleServer(t, f)
+	srv.SetReassertDelay(5 * time.Millisecond) // shrink so the goroutine settles fast
 	agg.Store().Apply(ev("session.created", `{"info":{"id":"orphan","parentID":"root"}}`))
 	if agg.Store().Descendants("orphan") == nil {
 		t.Fatal("precondition: orphan must be in the live store")
@@ -145,9 +145,9 @@ func TestArchiveOrphan_ToleratesGoneStatus(t *testing.T) {
 // the boundary: only 404/410 are tolerated; everything else preserves the
 // queue state. Same expectation for 400/401/403/429/5xx/network.
 func TestArchiveOrphan_NonGoneStatusAborts(t *testing.T) {
-	withReassertDelay(t, 5*time.Millisecond)
 	f := &fakeOC{archiveStatus: http.StatusConflict} // 409
-	web, agg, _, root := queueLifecycleServer(t, f)
+	web, agg, srv, root := queueLifecycleServer(t, f)
+	srv.SetReassertDelay(5 * time.Millisecond)
 	seedQueueFile(t, root, "orphan")
 	agg.Store().Apply(ev("session.created", `{"info":{"id":"orphan","parentID":"root"}}`))
 

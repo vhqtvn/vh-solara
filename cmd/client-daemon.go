@@ -112,6 +112,10 @@ var clientDaemonCmd = &cobra.Command{
 		var ocLife *oclife.Lifecycle
 		var vhCancel context.CancelFunc
 		var vhHTTP *http.Server
+		// vhSrv is the vh web Server (set only in the WebOpenChamber case where
+		// the daemon builds it). Hoisted to this scope so daemon.KillFunc (after
+		// the switch) can cancel + await its owned background goroutines.
+		var vhSrv *web.Server
 		// Managed-project process manager (torn down alongside OpenCode).
 		var procMgr *procmgr.Manager
 		var procCtxCancel context.CancelFunc
@@ -308,12 +312,13 @@ var clientDaemonCmd = &cobra.Command{
 
 			agg := aggregator.New(opencodeURL, vhEventRingCapacity)
 
-			// Build the web server first — it seeds the archived-session overlay
-			// into the store before the aggregator hydrates.
-			srv, err := web.NewServer(agg, opencodeURL, vhEventRingCapacity)
-			if err != nil {
-				log.Fatalf("Failed to build vh web server: %v", err)
-			}
+		// Build the web server first — it seeds the archived-session overlay
+		// into the store before the aggregator hydrates.
+		srv, err := web.NewServer(agg, opencodeURL, vhEventRingCapacity)
+		if err != nil {
+			log.Fatalf("Failed to build vh web server: %v", err)
+		}
+		vhSrv = srv
 			// Record whether OpenCode is attached externally (--opencode-url) so
 			// the direct-DB unarchive guard can refuse fast in that topology (the
 			// local DB may not be the remote instance's). See pkg/opencode/db.go.
@@ -449,6 +454,14 @@ var clientDaemonCmd = &cobra.Command{
 					_ = vhHTTP.Shutdown(ctx)
 					cancel()
 				}
+				// Issue A: cancel + await the Server's owned background
+				// goroutines (post-archive re-assert) so no detached goroutine
+				// outlives the daemon. Bounded by the same 2s window.
+				{
+					ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+					_ = srv.Shutdown(ctx)
+					cancel()
+				}
 				if vhCancel != nil {
 					vhCancel()
 				}
@@ -548,6 +561,15 @@ var clientDaemonCmd = &cobra.Command{
 			if vhHTTP != nil {
 				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 				_ = vhHTTP.Shutdown(ctx)
+				cancel()
+			}
+			// Issue A: cancel + await the Server's owned background goroutines
+			// (post-archive re-assert) so no detached goroutine outlives the
+			// daemon at the controller-tunnel teardown path. vhSrv is set only
+			// in the WebOpenChamber case; nil in the others (no web.Server).
+			if vhSrv != nil {
+				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				_ = vhSrv.Shutdown(ctx)
 				cancel()
 			}
 			// In detached mode we deliberately leave OpenCode running so a vh

@@ -190,6 +190,14 @@ with --opencode-url, or spawn a survivable detached instance with
 				_ = vhHTTP.Shutdown(ctx)
 				cancel()
 			}
+			// Issue A: cancel + await the Server's owned background goroutines
+			// (post-archive re-assert) so no detached goroutine outlives the
+			// daemon. Bounded by the same 2s window as the HTTP shutdown.
+			{
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				_ = srv.Shutdown(ctx)
+				cancel()
+			}
 			if vhCancel != nil {
 				vhCancel()
 			}

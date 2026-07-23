@@ -1418,7 +1418,26 @@ func normalizeActivity(statusType string) string {
 
 // setActivityLocked records a session's activity and emits a client event only
 // when it changes. Caller must hold s.mu.
+// setActivityLocked records an activity transition using the REAL wall-clock
+// now (the live Apply path). It is the original entry point; the at-parameterized
+// variant below is the O1 fix path used by status-reconcile/hydrate.
 func (s *Store) setActivityLocked(sessionID, st string) {
+	s.setActivityAtLocked(sessionID, st, time.Now())
+}
+
+// setActivityAtLocked is setActivityLocked with an explicit activity timestamp
+// `at` (O1 fix): the status-reconcile/hydrate path seeds `at` from the
+// session's own time.updated so a reconcile does NOT stamp now and spuriously
+// promote a long-idle session into the recent-activity window. `now` is still
+// captured separately for the cutoff boundary (the "within the activity window"
+// check must use real wall-clock now). Both touchActivityTimeLocked and
+// touchRecentBucketLocked use the SAME stampTime so the two indexes never
+// disagree: refRecentBucket derives bucket membership from lastActivityAt (set
+// by touchActivityTimeLocked), so the bucket MUST use the same timestamp.
+// stampTime is `at` when it carries upstream recency (non-zero), else real now
+// (original behavior for the live Apply path, which passes time.Now(), and for
+// sessions whose info lacks time.updated).
+func (s *Store) setActivityAtLocked(sessionID, st string, at time.Time) {
 	// Archive tombstone (Issue 4 B-i): a busy status for a recently-archived
 	// id (the subagent is still running) must NOT record activity or emit for
 	// it — otherwise the periodic status reconcile re-marks it busy →
@@ -1440,10 +1459,20 @@ func (s *Store) setActivityLocked(sessionID, st string) {
 	// frontier membership; an activity flip of a session that was ALREADY
 	// selfActive does NOT (it stays materialized regardless of busy↔retry /
 	// busy→idle). Uses `prev` activity + the OLD lastActivityAt
-	// (touchActivityTimeLocked below overwrites it to `now`). now is captured
-	// once so the activity time and the bucket minute agree, and is reused by
-	// the subtree maintainers below.
+	// (touchActivityTimeLocked below overwrites it to stampTime). `now` (real
+	// wall-clock) drives only the cutoff boundary; stampTime drives the activity
+	// time + bucket so a status-reconcile can seed recency from time.updated
+	// without spuriously promoting a long-idle session (O1 fix).
 	now := time.Now()
+	// O1 fix: stampTime is the single timestamp both touchActivityTimeLocked and
+	// touchRecentBucketLocked use — they MUST agree because refRecentBucket
+	// derives bucket membership from lastActivityAt. stampTime is `at` (upstream
+	// session.time.updated) when non-zero, else real now (live Apply path +
+	// sessions lacking time.updated keep original behavior).
+	stampTime := at
+	if stampTime.IsZero() {
+		stampTime = now
+	}
 	_, cutoffDuration := projectionCutoff()
 	wasCutoff := now.Add(-cutoffDuration)
 	wasSelfActive := prev == ActivityBusy || prev == ActivityRetry ||
@@ -1483,8 +1512,8 @@ func (s *Store) setActivityLocked(sessionID, st string) {
 	// is not yet in the live tree — the contribution is seeded on create via
 	// the upsert maintainers).
 	s.maintainSubtreeRetryOnActivityLocked(sessionID, prev, st)
-	s.touchActivityTimeLocked(sessionID, now)
-	s.touchRecentBucketLocked(sessionID, now)
+	s.touchActivityTimeLocked(sessionID, stampTime)
+	s.touchRecentBucketLocked(sessionID, stampTime)
 	// Phase 3 (Gate B): every real activity transition (including busy-neutral
 	// busy↔retry, error→idle) is a projection-affecting structural change.
 	s.bumpStructuralRevisionLocked()
@@ -1714,7 +1743,13 @@ func (s *Store) SetActivityFromStatuses(statuses map[string]json.RawMessage) {
 		}
 		_ = json.Unmarshal(raw, &st)
 		a := normalizeActivity(st.Type)
-		s.setActivityLocked(sid, a)
+		// O1 fix: seed the activity timestamp from the session's OWN time.updated
+		// (reconstructed state), NOT wall-clock now. A status reconcile/hydrate
+		// stamps real activity recency so a long-idle session is not spuriously
+		// promoted into the recent-activity window. Falls back to now when the
+		// session or its time.updated is absent/zero.
+		at := activityTimeFromSessionLocked(s, sid)
+		s.setActivityAtLocked(sid, a, at)
 		if a != ActivityIdle {
 			busy[sid] = true
 		}
@@ -1726,7 +1761,7 @@ func (s *Store) SetActivityFromStatuses(statuses map[string]json.RawMessage) {
 	// shadowing the Go 1.21+ builtin clear (this repo is Go 1.25).
 	clearActivity := func(sid string) {
 		if !busy[sid] {
-			s.setActivityLocked(sid, ActivityIdle)
+			s.setActivityAtLocked(sid, ActivityIdle, activityTimeFromSessionLocked(s, sid))
 		}
 	}
 	for sid := range s.sessions {
@@ -1735,6 +1770,27 @@ func (s *Store) SetActivityFromStatuses(statuses map[string]json.RawMessage) {
 	for sid := range s.messages {
 		clearActivity(sid)
 	}
+}
+
+// activityTimeFromSessionLocked extracts the session's time.updated (unix ms)
+// as a time.Time for the O1 status-reconcile recency seed. Returns the zero
+// time.Time (→ setActivityAtLocked falls back to the cutoff `now` boundary and
+// touchActivityTimeLocked skips the monotonic-advance when zero) when the
+// session or its time.updated is absent. Caller holds s.mu.
+func activityTimeFromSessionLocked(s *Store, sid string) time.Time {
+	se := s.sessions[sid]
+	if se == nil {
+		return time.Time{}
+	}
+	var partial struct {
+		Time struct {
+			Updated *float64 `json:"updated"`
+		} `json:"time"`
+	}
+	if json.Unmarshal(se.info, &partial) != nil || partial.Time.Updated == nil {
+		return time.Time{}
+	}
+	return time.UnixMilli(int64(*partial.Time.Updated))
 }
 
 // Apply reduces a single live OpenCode event into the view and emits the

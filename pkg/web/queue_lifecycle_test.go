@@ -2,6 +2,7 @@ package web
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -72,6 +73,15 @@ func queueLifecycleServer(t *testing.T, f *fakeOC) (*httptest.Server, *aggregato
 	// call. Trigger it so subsequent direct store mutations reach the
 	// subscriber's channel before the test asserts.
 	_ = srv.aggFor("")
+	// Issue A: the Server owns the post-archive re-assert goroutine (bgWG).
+	// Await it at test end so no detached goroutine outlives the test (the
+	// prior fire-and-forget goroutine leaked and raced a mutable global).
+	// Idempotent with any explicit Shutdown a test drives mid-run.
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	})
 	return web, agg, srv, root
 }
 
