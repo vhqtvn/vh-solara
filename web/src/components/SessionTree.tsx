@@ -27,6 +27,16 @@ import { formatDuration } from "../lib/time";
 // of stub children inside Node (idle frontier under an active ancestor).
 import StubNode from "./StubNode";
 import type { CollapsedBranchStub } from "../types";
+// Phase 3 Step A (COEXIST): tree=2 render path. When tree2Enabled() is true the
+// tree renders from the server-owned flat map (treeState) via TreeRow instead of
+// the projection path (state.sessions + Node/StubNode). The flag-OFF body below
+// is byte-for-byte unchanged; these imports are only consumed by the TreeStateView
+// branch at the top of SessionTree().
+import { tree2Enabled } from "../sync/url";
+import { treeRoots, treeChildrenOf, collapseTreeNode } from "../sync/treeState";
+import { expandTreeNode } from "../sync";
+import TreeRow from "./TreeRow";
+import type { TreeNode } from "../sync/treeMap";
 
 // --- per-node expand state ----------------------------------------------------
 // Persisted state, cycled by clicking the twisty:
@@ -535,7 +545,73 @@ export function Node(props: {
   );
 }
 
+// === Phase 3 Step A (COEXIST): tree=2 render path ===========================
+// TreeStateView renders the tree from the server-owned flat map (treeState)
+// instead of the projection layer (state.sessions). Every node is self-contained
+// (title, agent chip, activity/flags, descendantCount) — there is NO client-side
+// orphan classification, parent inference, or reconcile logic. Collapsed nodes
+// (loaded:false with descendants) still render via TreeRow with their chip +
+// "▸ N" badge and are right-clickable; expansion fetches direct children from
+// the server (§8); collapse is client-only (§8.4). COEXIST: the flag-OFF path
+// (the original SessionTree body below) is untouched.
+function TreeBranch(props: {
+  node: TreeNode;
+  depth: number;
+  onToggle: (n: TreeNode) => void;
+}) {
+  // expanded mirrors the node's loaded flag (§3: loaded is a render attribute,
+  // not a node kind). Reads the reactive treeState accessor so a collapse (which
+  // drops loaded descendants + flips loaded:false) re-renders this branch closed.
+  const expanded = () => treeChildrenOf(props.node.id);
+  return (
+    <>
+      <TreeRow
+        node={props.node}
+        depth={props.depth}
+        selected={selectedId() === props.node.id}
+        expanded={expanded().length > 0}
+        onSelect={() => openSessionChat(props.node.id)}
+        onToggle={() => props.onToggle(props.node)}
+      />
+      <For each={expanded()}>
+        {(child) => (
+          <TreeBranch node={child} depth={props.depth + 1} onToggle={props.onToggle} />
+        )}
+      </For>
+    </>
+  );
+}
+function TreeStateView() {
+  // §8: expand = fetch direct children (treeOps.fetchChildren via stream's
+  // expandTreeNode, single-flight + F1 staleCursor fix); collapse = client-only
+  // drop of loaded descendants keeping the placeholder (treeState.collapseTreeNode).
+  // A node with loaded children collapses; a node with descendants but no loaded
+  // children expands. Leaf nodes (childCount===0) toggle is a no-op via TreeRow's
+  // own isLeaf guard.
+  const onToggle = (n: TreeNode) => {
+    if (treeChildrenOf(n.id).length > 0) collapseTreeNode(n.id);
+    else if ((n.descendantCount ?? 0) > 0 || n.childCount > 0) void expandTreeNode(n.id);
+  };
+  const roots = () => treeRoots();
+  return (
+    <div class="tree tree2">
+      <Show
+        when={roots().length > 0}
+        fallback={<div class="tree-empty">No sessions yet</div>}
+      >
+        <For each={roots()}>{(n) => <TreeBranch node={n} depth={0} onToggle={onToggle} />}</For>
+      </Show>
+    </div>
+  );
+}
+
 export default function SessionTree() {
+  // Phase 3 Step A (COEXIST): early-return the tree=2 render path BEFORE any of
+  // the proj=1 memo/signal setup, so the entire flag-OFF body below runs
+  // unchanged. The capability is read once per render pass (cheap; the §10 flag
+  // is a plain URL query, no caching needed). Removing ?tree=2 and reloading
+  // restores the exact original path.
+  if (tree2Enabled()) return <TreeStateView />;
   const working = createMemo(() => buildWorkingSet());
   const index = createMemo(() => buildChildrenIndex(state.sessions, (s) => working().has(s.id)));
   const roots = () => index()[""] || [];

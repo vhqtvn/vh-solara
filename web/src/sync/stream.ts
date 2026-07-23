@@ -23,6 +23,20 @@ import { state, setState, projectDir, selectedId, persist } from "./store";
 import { invalidateChildrenIndex, normalizeTodos, descendantSessionIds } from "./selectors";
 import { notifyFromMessage, maybeNotifyRootDone, maybeClearWaiting } from "./orchestration";
 import { isGateActive, currentGateEpoch, markBusyDirty, setReconcileFn } from "../busy";
+// Phase 3 Step A (COEXIST): the tree=2 render path lives alongside the proj=1
+// projection path. When tree2Enabled() is true, Stream 1 sends &tree=2 (drops
+// proj=1/hoist=1) and routes the tree.* events into the flat-map op-applier
+// (treeState) instead of the projection applySnapshot path. The OLD path and
+// ALL its symbols stay intact for flag-OFF (proj=1) — no deletes this slice.
+import { tree2Enabled } from "./url";
+import {
+  decodeTreeSnapshot,
+  decodeTreeOp,
+  fetchChildren,
+  type TreeFetcher,
+  type ChildrenResponse,
+} from "./treeOps";
+import { seedTreeStore, applyTreeOpStore, resetTreeStore } from "./treeState";
 
 // mergeLastAgents — the agent-label fix (S3). During a server restart the
 // daemon serves HTTP while still aggregating session tails, so a mid-hydrate
@@ -1677,6 +1691,17 @@ export function connect(fresh = false) {
   // already invalidated any prior decode; this `gen` is checked at listener
   // entry and after every await in the snapshot listener.
   const gen = treeGen;
+  // Phase 3 Step A (COEXIST): when ?tree=2 is present, Stream 1 negotiates the
+  // new server-owned tree stream and routes events into the flat-map
+  // op-applier (treeState). When absent, the EXACT existing proj=1 projection
+  // path runs unchanged. The flag is read once per connection (capability held
+  // for the connection's life per §10); both branches stay compiled + reachable.
+  const useTree2 = tree2Enabled();
+  // On a FRESH tree=2 connect (project switch or explicit refresh), clear the
+  // flat map so a stale map from a different Store can't bleed into the new
+  // snapshot. On a tree=2 RESUME (reconnect with cursor) the map is preserved
+  // so delta ops replay cleanly onto the prior state.
+  if (useTree2 && fresh) resetTreeStore();
   // Stream 1 (tree) opts into the server's gzip64 snapshot compression with
   // `&z=1`, mirroring Stream 2's session stream. The tree snapshot for a real
   // project is ~760 KiB–1.1 MiB of highly repetitive JSON (one project, one
@@ -1698,7 +1723,17 @@ export function connect(fresh = false) {
   // selectors.sessionModel falls back to the map. An old server ignores hoist=1
   // and always sends per-session fields, so the client works unchanged. Only
   // meaningful alongside proj=1 (the hoist path lives in SnapshotProjected).
-  es = new EventSource(`/vh/stream?${cursorParam}sessions=&dir=${encodeURIComponent(projectDir())}&z=1&proj=1&hoist=1`);
+  //
+  // tree=2 branch (§10): when useTree2 is set we negotiate the server-owned
+  // tree stream instead — drop proj=1/hoist=1 (the projection path is dormant
+  // server-side when the tree emitter is engaged) and send &tree=2. The shared
+  // resume cursor (state.cursor, store-seq space, see F4 below) is identical
+  // for both modes, so cursorParam above applies unchanged.
+  es = new EventSource(
+    useTree2
+      ? `/vh/stream?${cursorParam}sessions=&dir=${encodeURIComponent(projectDir())}&z=1&tree=2`
+      : `/vh/stream?${cursorParam}sessions=&dir=${encodeURIComponent(projectDir())}&z=1&proj=1&hoist=1`,
+  );
   markTreeSeen();
   log.debug("sync", "tree stream connect", { cursor: fresh ? "fresh" : state.cursor, dir: projectDir() });
   es.addEventListener("snapshot", (e) => {
@@ -1798,6 +1833,107 @@ export function connect(fresh = false) {
       })();
     } else {
       applySnap(raw as Snapshot);
+    }
+  });
+  // === Phase 3 Step A (COEXIST): tree=2 server-owned tree stream =============
+  // These listeners are registered unconditionally but only FIRE in tree=2 mode:
+  // the server (server.go) suppresses every legacy frame (snapshot/session.*/the
+  // TREE_STREAM_KINDS set) when the tree emitter is engaged, and emits ONLY
+  // tree.snapshot + tree.op. In proj=1 mode the server never emits tree.* frames,
+  // so these are inert no-ops. Both paths therefore coexist with zero double-apply.
+  //
+  // F4 (carry-forward, CRITICAL): the SSE `id` field / Last-Event-ID carries the
+  // STORE seq for BOTH tree.snapshot (server.go writeRaw(w, treeSnap.Seq,...)) and
+  // tree.op (server.go writeRaw(w, ev.Seq,...)). The envelope BODY `seq` field is
+  // a per-connection emitter counter (tree_emitter.go e.seq++) that DIFFERS from
+  // the store seq. Resume/reconnect MUST key on Number(ev.lastEventId) (the store
+  // seq) via advanceCursor — NEVER on the body seq. Keying on the wrong one breaks
+  // resume. The store-seq space is shared with proj=1 (same store ring), so
+  // advanceCursor(state.cursor) is correct for both modes.
+  es.addEventListener("tree.snapshot", (e) => {
+    if (gen !== treeGen) return;
+    markTreeSeen();
+    const ev = e as MessageEvent;
+    // F4: store seq from the SSE id, not the body.
+    const seq = Number(ev.lastEventId);
+    let raw: any;
+    try {
+      raw = JSON.parse(ev.data);
+    } catch (err) {
+      log.warn("sync", "malformed tree.snapshot frame", { err });
+      return;
+    }
+    // Gate-aware deferral, mirroring the proj=1 snapshot listener: during a busy
+    // scope we advance the resume cursor (so reconnect replays this seq) but do
+    // NOT seed the store. The next non-deferred snapshot reconciles authoritatively.
+    const applyTreeSnap = (decoded: unknown) => {
+      if (isGateActive()) {
+        advanceCursor(seq);
+        markBusyDirty();
+        return;
+      }
+      const snap = decodeTreeSnapshot(decoded);
+      if (!snap) {
+        log.warn("sync", "tree.snapshot decoded to null", { seq });
+        return;
+      }
+      seedTreeStore(snap.nodes);
+      if (!treeSnapDone) {
+        treeSnapDone = true;
+        if (treeT1) recordLatency("tree", "snap", performance.now() - treeT1);
+      }
+      advanceCursor(seq);
+      setState("status", "live");
+    };
+    if (raw.encoding === "gzip64") {
+      treeSnapshotDecoding = true;
+      treeSnapshotDecode = (async () => {
+        try {
+          let decoded: unknown;
+          try {
+            decoded = await decodeSnapshot<unknown>(raw);
+          } catch (err) {
+            log.warn("sync", "tree.snapshot gzip64 decode failed", { err });
+            return;
+          }
+          if (gen !== treeGen) return;
+          applyTreeSnap(decoded);
+        } finally {
+          if (gen === treeGen) treeSnapshotDecoding = false;
+        }
+      })();
+    } else {
+      applyTreeSnap(raw);
+    }
+  });
+  es.addEventListener("tree.op", async (e) => {
+    markTreeSeen();
+    const ev = e as MessageEvent;
+    // F4: store seq from the SSE id, not the envelope body seq.
+    const seq = Number(ev.lastEventId);
+    if (isGateActive()) {
+      advanceCursor(seq);
+      markBusyDirty();
+      return;
+    }
+    // Serialize against an in-flight tree.snapshot gzip64 decode (mirrors the
+    // proj=1 session listeners): a delta op applied mid-decode would be seeded-
+    // over when the stale-but-now-decoded snapshot lands.
+    if (treeSnapshotDecoding) await treeSnapshotDecode;
+    if (gen !== treeGen) return;
+    if (isGateActive()) {
+      advanceCursor(seq);
+      markBusyDirty();
+      return;
+    }
+    try {
+      const op = decodeTreeOp(JSON.parse(ev.data));
+      if (op) {
+        applyTreeOpStore(op);
+        advanceCursor(seq);
+      }
+    } catch (err) {
+      log.warn("sync", "malformed tree.op frame", { err, seq });
     }
   });
   es.addEventListener("ping", () => markTreeSeen()); // heartbeat for the watchdog
@@ -2909,4 +3045,69 @@ export function collapseBranch(branchID: string): void {
   );
   if (toRemove.length) invalidateChildrenIndex();
   persist();
+}
+
+// === Phase 3 Step A (COEXIST): tree=2 expand (§8) ===========================
+// Expand a node in the server-owned flat map: fetch all pages of its direct
+// children from GET /vh/tree/children, emitting a `node.children` op per page
+// (the terminal page flips the parent's `loaded` flag, §7.2). The stale-cursor
+// restart (§8.3) and the F1 fix (drop obsolete residents before restart) live
+// in treeOps.fetchChildren; this is just the real-network wiring of the injected
+// TreeFetcher. Single-flight per node id to match lazyExpandBranch's discipline.
+//
+// COEXIST: this is reached ONLY from the tree=2 render path (SessionTree's
+// TreeStateView onToggle). The proj=1 lazyExpandBranch above stays intact and is
+// reached from the flag-OFF render path. Collapse is client-only
+// (treeState.collapseTreeNode drops loaded descendants, keeps the placeholder,
+// flips loaded:false per §8.4) — no network.
+const treeExpandInFlight = new Set<string>();
+export async function expandTreeNode(id: string): Promise<void> {
+  if (!id) return;
+  if (treeExpandInFlight.has(id)) return; // single-flight
+  treeExpandInFlight.add(id);
+  try {
+    const dir = projectDir();
+    // Real TreeFetcher: GET /vh/tree/children?dir=&id=&cursor=, gzip64-decode
+    // (server maybeCompressSnapshot wraps payloads ≥ 2 KiB when z=1), map to the
+    // treeOps ChildrenResponse shape.
+    const fetcher: TreeFetcher = async (_dir, nodeId, cursor) => {
+      const params = new URLSearchParams({
+        dir,
+        id: nodeId,
+        z: "1",
+      });
+      if (cursor) params.set("cursor", cursor);
+      const res = await fetch(`/vh/tree/children?${params}`);
+      if (!res.ok) {
+        log.warn("sync", "tree=2 children fetch failed", {
+          id: nodeId,
+          status: res.status,
+        });
+        // Treat a transport failure as an empty terminal page so fetchChildren
+        // stops cleanly; the parent's loaded flag is NOT flipped (hasMore stays
+        // false but no nodes). A subsequent toggle retries.
+        return { parentId: nodeId, nodes: [], hasMore: false };
+      }
+      const raw = await res.json();
+      const decoded = await decodeSnapshot<{
+        parentId?: string;
+        nodes?: unknown[];
+        hasMore?: boolean;
+        cursor?: string | null;
+        staleCursor?: boolean;
+      }>(raw);
+      return {
+        parentId: decoded.parentId ?? nodeId,
+        nodes: (decoded.nodes ?? []) as any[],
+        hasMore: !!decoded.hasMore,
+        cursor: decoded.cursor ?? null,
+        staleCursor: !!decoded.staleCursor,
+      } satisfies ChildrenResponse;
+    };
+    await fetchChildren(applyTreeOpStore, fetcher, dir, id);
+  } catch (err) {
+    log.warn("sync", "tree=2 expand error", { id, err: String(err) });
+  } finally {
+    treeExpandInFlight.delete(id);
+  }
 }

@@ -180,6 +180,10 @@ export { loadOlder } from "./sync/stream";
 // Phase 5 — collapsed-branch lazy-expand / collapse actions (called from
 // StubNode's twisty in SessionTree).
 export { lazyExpandBranch, collapseBranch } from "./sync/stream";
+// Phase 3 Step A (COEXIST) — tree=2 server-owned tree expand action (called from
+// SessionTree's TreeStateView onToggle when ?tree=2 is active). Collapse is
+// client-only (treeState.collapseTreeNode), so no export needed for it here.
+export { expandTreeNode } from "./sync/stream";
 // Issue 5 — eagerly prune an archived session from the client tree even when
 // the server emits no delete event (the session was already absent from the
 // server-side live store). Called from archive.ts after a successful archive.

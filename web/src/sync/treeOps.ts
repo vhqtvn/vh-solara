@@ -150,6 +150,16 @@ export type TreeFetcher = (
 // `staleCursor:true` response, restarts ONCE from page 0 rather than treating
 // the empty batch as terminal pagination (which would permanently omit later
 // siblings).
+//
+// F1 (carry-forward, fixed here): the previous implementation applied the
+// stale-cursor batch BEFORE detecting staleCursor and restarting. Because
+// `node.children` MERGES (never removes), a child introduced on an earlier page
+// that was deleted server-side before the stale page lingered as an obsolete
+// resident node through the restart's fresh page-0 merge. The fix detects
+// staleCursor BEFORE applying the (unreliable) batch, drops the in-progress
+// loaded subtree (the direct children THIS expand has applied so far, via
+// `node.remove` — which also drops each removed child's own loaded descendants),
+// and THEN restarts from page 0 so the fresh batch re-seeds the correct set.
 export async function fetchChildren(
   apply: (op: TreeOp) => void,
   fetcher: TreeFetcher,
@@ -158,8 +168,26 @@ export async function fetchChildren(
 ): Promise<void> {
   let cursor: string | null = null;
   let restarted = false;
+  // F1: direct-child ids THIS expand has applied so far. On a staleCursor
+  // restart we emit `node.remove` for each so they don't merge-linger as
+  // obsolete residents under the fresh page-0 re-apply.
+  let appliedIds: Set<string> = new Set();
   for (;;) {
     const res = await fetcher(dir, id, cursor);
+    // F1 fix: detect staleCursor BEFORE applying the batch. The stale batch is
+    // unreliable (the cursor child vanished mid-pagination); applying it first
+    // would either merge obsolete nodes or, on the restart, leave earlier-page
+    // children lingering. Instead drop what THIS expand loaded so far and
+    // restart from page 0.
+    if (res.staleCursor && !restarted) {
+      for (const childId of appliedIds) {
+        apply({ op: "node.remove", data: { id: childId } });
+      }
+      appliedIds = new Set();
+      restarted = true;
+      cursor = null;
+      continue;
+    }
     apply({
       op: "node.children",
       data: {
@@ -169,12 +197,7 @@ export async function fetchChildren(
         cursor: typeof res.cursor === "string" ? res.cursor : null,
       },
     });
-    if (res.staleCursor && !restarted) {
-      // §8.3: the cursor child vanished mid-pagination — restart from page 0.
-      restarted = true;
-      cursor = null;
-      continue;
-    }
+    for (const child of res.nodes) appliedIds.add(child.id);
     if (!res.hasMore) return;
     if (typeof res.cursor !== "string") {
       // Defensive: server said hasMore but gave no cursor — stop to avoid a

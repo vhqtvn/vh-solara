@@ -11,7 +11,7 @@ import {
   fetchChildren,
 } from "../../src/sync/treeOps";
 import type { ChildrenResponse, TreeFetcher } from "../../src/sync/treeOps";
-import type { TreeOp } from "../../src/sync/treeMap";
+import { applyOp, seedTree, type TreeNode, type TreeOp, type TreeFlatMap } from "../../src/sync/treeMap";
 
 const baseNode = {
   parentId: null,
@@ -174,7 +174,42 @@ describe("fetchChildren — §8 expand fetch", () => {
     const f: TreeFetcher = async () => queue.shift()!;
     const applied: TreeOp[] = [];
     await expect(fetchChildren((op) => applied.push(op), f, "/repo", "p")).resolves.toBeUndefined();
-    // exactly two fetches (initial + one restart), no infinite loop
-    expect(applied.length).toBe(2);
+    // exactly two fetches (initial + one restart), no infinite loop. After the
+    // F1 fix only the SECOND (post-restart) response is applied — the first
+    // stale batch is detected BEFORE apply and triggers the restart instead —
+    // so applied.length is 1 (was 2 before the fix).
+    expect(applied.length).toBe(1);
+  });
+
+  // F1 regression (carry-forward): a stale-cursor restart must NOT leave
+  // obsolete resident nodes. Scenario (§8.3): page 0 introduces children
+  // [A, B]; page 1 comes back staleCursor (B was deleted server-side between
+  // pages); the restart re-fetches page 0 → [A] (B gone). Because node.children
+  // MERGES (never removes), the pre-fix code — which applied the stale batch
+  // BEFORE detecting staleCursor and restarting — left B lingering as an
+  // obsolete resident under the fresh page-0 merge. The fix detects staleCursor
+  // BEFORE applying the batch, drops the in-progress loaded subtree (A, B) via
+  // node.remove, then restarts so the fresh page 0 re-seeds [A] cleanly. This
+  // test exercises the REAL apply layer (applyOp over a real flat map), so it
+  // proves the bug at the integration boundary, not just the op sequence.
+  it("F1: a stale-cursor restart drops obsolete resident nodes (no lingering)", async () => {
+    const mk = (id: string): TreeNode => ({ id, ...baseNode, parentId: "p" } as TreeNode);
+    const queue: ChildrenResponse[] = [
+      { parentId: "p", nodes: [mk("A"), mk("B")], hasMore: true, cursor: "p1" },
+      // stale mid-pagination: cursor child B vanished server-side.
+      { parentId: "p", nodes: [], hasMore: false, cursor: null, staleCursor: true },
+      // restart from page 0 returns the fresh set (B deleted), terminal.
+      { parentId: "p", nodes: [mk("A")], hasMore: false, cursor: null },
+    ];
+    const f: TreeFetcher = async () => queue.shift()!;
+    // Real flat map + real apply — the merge-linger bug lives at the apply layer.
+    const map: TreeFlatMap = seedTree([{ id: "p", ...baseNode } as TreeNode]);
+    const apply = (op: TreeOp) => applyOp(map, op);
+    await fetchChildren(apply, f, "/repo", "p");
+    // A survives (re-seeded on the restart); B is GONE (was the F1 linger bug);
+    // p flipped loaded:true by the terminal batch.
+    expect(map.has("A")).toBe(true);
+    expect(map.has("B")).toBe(false); // ← RED before the fix (B lingered), GREEN after
+    expect((map.get("p") as TreeNode).loaded).toBe(true);
   });
 });
