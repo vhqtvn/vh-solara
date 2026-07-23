@@ -61,6 +61,9 @@ beforeEach(() => {
   setState("unread", reconcile({}));
   setSelectedIdRaw(null);
   localStorage.clear();
+  // Step B flip: tree=2 is now the default; pin ?tree=1 to keep these proj=1
+  // pinned-drag tests on the OLD path until Step C deletes it.
+  window.history.replaceState({}, "", "?tree=1");
   __resetTreeForTest();
   __resetPinnedForTest();
 });

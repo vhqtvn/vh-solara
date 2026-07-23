@@ -29,6 +29,9 @@ beforeEach(() => {
   // treeMode persists to localStorage; clear it so each test starts with the
   // default "filtered" mode for every node.
   localStorage.clear();
+  // Step B flip: tree=2 is now the default; pin ?tree=1 to keep these proj=1
+  // render tests on the OLD path until Step C deletes it.
+  window.history.replaceState({}, "", "?tree=1");
   // The module-level treeMode/userToggled signals are initialized once at first
   // import; localStorage.clear() above wipes their persisted backing store but
   // NOT the in-memory signal, so reset them explicitly (after the clear, so

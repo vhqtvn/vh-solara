@@ -1508,6 +1508,47 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		}
 		baseline = head
 		sw.RecordReplayPath() // PROBE 3: cursor-replay baseline branch
+		// Phase 3 Step B (C-F1): tree=2 resume/reconnect must ALSO bootstrap
+		// the full session-detail snapshot and re-seed the tree frontier,
+		// mirroring the fresh-connect path (GAP 3, committed 3903b131). The
+		// tree flat map is NEVER persisted (§11) and detail maps are not
+		// persisted, so a client reconnecting with a valid cursor but EMPTY
+		// in-memory detail (e.g. native EventSource auto-reconnect after a
+		// page reload, or any path that resumes with a valid cursor) would
+		// otherwise receive only ring deltas — leaving structure + detail
+		// unpopulated. Emit tree.snapshot (frontier re-seed, cause "reconnect")
+		// + the raw legacy detail snapshot AFTER the replayed deltas so both
+		// projections flow on every tree=2 connect path (fresh, replay,
+		// ring-gap). The replayed tree.op/detail events above (seq N+1..head)
+		// are superseded by these authoritative snapshots at head; the live-tail
+		// baseline guard (ev.Seq > baseline) prevents re-forwarding. Mirrors the
+		// fresh-connect block at ~1562-1605; the proj=1 reconnect snapshot
+		// below runs only when wantsProject(r) (false for tree=2).
+		if treeEmitter != nil {
+			treeSnap := treeEmitter.SnapshotFrontier("reconnect")
+			if rb, err := json.Marshal(treeSnap); err == nil {
+				wire := maybeCompressSnapshot(rb, wantsCompress(r))
+				writeRaw(w, treeSnap.Seq, "tree.snapshot", wire)
+				sw.RecordSnapshotPath(len(wire))
+			} else {
+				vhlog.Warn("tree=2 resume tree.snapshot: marshal failed", "err", err)
+			}
+			// Legacy detail snapshot, shipped RAW (not gzip64) so it does NOT
+			// race tree.snapshot's async gzip64 decode on the client's shared
+			// treeSnapshotDecoding flag (same rationale as fresh-connect).
+			var detailSnap state.Snapshot
+			if wantsProject(r) {
+				detailSnap = store.SnapshotProjected(filter, "reconnect", wantsHoist(r))
+			} else {
+				detailSnap = store.Snapshot(filter)
+			}
+			if db, err := json.Marshal(detailSnap); err == nil {
+				writeRaw(w, detailSnap.Seq, "snapshot", db)
+			} else {
+				vhlog.Warn("tree=2 resume detail snapshot: marshal failed", "err", err)
+			}
+			baseline = store.Head()
+		}
 		// Finding #2 / DEFER #5: a projected Stream1 resume must RE-ESTABLISH
 		// projection state even on a successful replay. branchStubs and
 		// expandedBranches are EPHEMERAL (never persisted — store.ts persist()
