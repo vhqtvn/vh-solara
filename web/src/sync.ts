@@ -146,6 +146,7 @@ export {
 export {
   sessionNeedsInput,
   sessionModel,
+  inlineSessionModel,
   sessionProjectID,
   lastUserMessageModel,
   sessionLastAgent,

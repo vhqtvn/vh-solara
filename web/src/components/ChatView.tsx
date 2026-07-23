@@ -12,7 +12,7 @@ import {
 import type { ScrollGeometry } from "../lib/scroll";
 import { createReadCursorStash } from "../lib/readCursorStash";
 import { highlightInput } from "../lib/composerHighlight";
-import { chooseVariant, findModel, loadModels, models, selectionFor } from "../models";
+import { chooseVariant, findModel, loadModels, migrateModelPick, models, selectionFor } from "../models";
 import { loadVersioned, saveVersioned } from "../lib/store";
 import { activeAgent, agentForSession, agents, selectAgentForSession, selectedAgent } from "../agents";
 import { claimQueued, enqueue, fetchQueue, hasQueueState, migrateLegacyQueue, queueFor, queueMode, removeQueued, resolveQueued } from "../queue";
@@ -1838,6 +1838,13 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       setInput(text); // session creation failed; keep the text for retry
       return;
     }
+    // A draft is materialized into a real session on first send. The composer's
+    // explicit model/variant pick was made under the draft key (props.sessionId
+    // ""), but captureConfig/sendText below read the live id — carry the pick
+    // (and its explicit-pick intent) over so it isn't lost and an agent-declared
+    // model can't override it post-migration. No-op for a non-draft send
+    // (props.sessionId === id).
+    migrateModelPick(props.sessionId, id);
     // A draft may have queued attachments locally (no session existed at paste
     // time). Now that we have an id, upload them so buildParts sees real urls.
     await flushPendingAttachments(id);

@@ -35,6 +35,23 @@ export function sessionModel(id: string): ModelRefLite | undefined {
   return m?.providerID && modelID ? { providerID: m.providerID, modelID, variant: m.variant } : undefined;
 }
 
+// Server model present on THIS session record ONLY. Unlike sessionModel(), this
+// deliberately does NOT fall back to projectConstants.model. projectConstants.model
+// is a snapshot-compression/display value: the backend hoists the common value
+// from active captured sessions and strips matching inline fields under ?hoist=1
+// (pkg/state/projection.go). It is NOT per-session user intent, so it is the
+// wrong signal for the agent-write guard (applyAgentModel), which must only
+// treat a session as "established" when THIS session's record carries its own
+// server model. selectionFor() still resolves display through sessionModel()
+// (hoist-aware); this selector is the narrower, faithful per-session provenance
+// read for the write guard. Mirrors sessionModel's field-read logic verbatim
+// (modelID ?? id, variant passthrough) — only WITHOUT the projectConstants ?? .
+export function inlineSessionModel(id: string): ModelRefLite | undefined {
+  const m = state.sessions[id]?.model;
+  const modelID = m?.modelID ?? m?.id;
+  return m?.providerID && modelID ? { providerID: m.providerID, modelID, variant: m.variant } : undefined;
+}
+
 // Phase 3 snapshot trim: like sessionModel, projectID is hoisted into
 // projectConstants under ?hoist=1. Fall back to the hoisted constant so
 // features that read it (e.g. suggestTitle → "Regenerate name") work on

@@ -58,7 +58,7 @@ import { Show } from "solid-js";
 // and therefore in scope inside the factories). The (...args) => fn(...args)
 // trampoline form is the established pattern (see QuestionCard.test.tsx).
 
-const { createSessionMock, enqueueMock } = vi.hoisted(() => ({
+const { createSessionMock, enqueueMock, modelsState } = vi.hoisted(() => ({
   // Drives the real setSelectedId against the live sync store so the
   // draft->live signal flip happens exactly as in production. The <Show>
   // wrapper in the test render reacts to this flip and unmounts the draft
@@ -70,35 +70,81 @@ const { createSessionMock, enqueueMock } = vi.hoisted(() => ({
     return id;
   }),
   enqueueMock: vi.fn(async () => "fake-item-id"),
+  // A minimal, faithful model of the models.ts selection state for the
+  // draft-migration test (c). selectionFor returns the per-session pick ONLY
+  // (no global-default fallback), so the ONLY way the real session id resolves
+  // to the explicit draft pick is via migrateModelPick — i.e. the test cannot
+  // pass by accident (returning GLM for every id).
+  modelsState: {
+    bySession: {} as Record<string, { providerID: string; modelID: string; variant?: string }>,
+    explicit: new Set<string>(),
+  },
 }));
 
 // agents: ChatView's readyToSend memo requires agents() non-empty. Provide one.
+// The fixture agent declares a GPT model + variant — the scenario where, without
+// the explicit-pick-wins fix, the agent's model would override the composer pick.
 vi.mock("../../src/agents", () => ({
-  agents: () => [{ name: "build", description: "build agent", mode: "primary" }],
-  selectedAgent: () => "build",
-  agentForSession: () => "build",
-  activeAgent: () => "build",
+  agents: () => [{
+    name: GPT_AGENT_NAME,
+    description: "gpt agent",
+    mode: "primary",
+    model: { providerID: "openai", modelID: "gpt-4" },
+    variant: "high",
+  }],
+  selectedAgent: () => GPT_AGENT_NAME,
+  agentForSession: () => GPT_AGENT_NAME,
+  activeAgent: () => GPT_AGENT_NAME,
   selectAgentForSession: vi.fn(),
   loadAgents: vi.fn(),
   setSelectedAgent: vi.fn(),
 }));
 
 // models: readyToSend requires models() non-empty for a draft (no per-session
-// selection yet). Provide one model; selectionFor("") returns null (no pick).
+// selection yet). The selection state is modeled faithfully (see modelsState
+// above): chooseModel/chooseVariant mark a session explicit; applyAgentModel
+// respects an explicit pick; migrateModelPick moves a pick across ids. There is
+// NO global-default fallback in selectionFor, so a real session id resolves to
+// the explicit draft pick ONLY through migration.
 vi.mock("../../src/models", () => ({
   models: () => [{
-    providerID: "test",
-    modelID: "m1",
-    provider: "Test",
-    name: "M1",
-    label: "Test / M1",
-    variants: [],
+    providerID: "openai",
+    modelID: "gpt-4",
+    provider: "OpenAI",
+    name: "GPT-4",
+    label: "OpenAI / GPT-4",
+    variants: ["high"],
   }],
-  selectionFor: () => null,
-  findModel: () => undefined,
-  chooseVariant: vi.fn(),
-  chooseModel: vi.fn(),
+  selectionFor: (id: string) => modelsState.bySession[id] ?? null,
+  findModel: (p: string, m: string) =>
+    p === "openai" && m === "gpt-4"
+      ? { providerID: "openai", modelID: "gpt-4", variants: ["high"] }
+      : undefined,
+  chooseModel: (id: string, p: string, m: string) => {
+    modelsState.bySession[id] = { providerID: p, modelID: m };
+    modelsState.explicit.add(id);
+  },
+  chooseVariant: (id: string, variant: string | undefined) => {
+    const cur = modelsState.bySession[id];
+    if (cur) modelsState.bySession[id] = { ...cur, variant };
+    modelsState.explicit.add(id);
+  },
   applyModel: vi.fn(),
+  applyAgentModel: (id: string, p: string, m: string, variant?: string) => {
+    if (modelsState.explicit.has(id)) return;
+    modelsState.bySession[id] = { providerID: p, modelID: m, variant };
+  },
+  migrateModelPick: (from: string, to: string) => {
+    if (from === to) return;
+    if (modelsState.bySession[from]) {
+      modelsState.bySession[to] = modelsState.bySession[from];
+      delete modelsState.bySession[from];
+    }
+    if (modelsState.explicit.has(from)) {
+      modelsState.explicit.add(to);
+      modelsState.explicit.delete(from);
+    }
+  },
   loadModels: vi.fn(),
 }));
 
@@ -169,6 +215,12 @@ import {
 // the raw "vh.draft.__new__".
 const DRAFT_KEY = "vh.draft.__new__";
 
+// Fixtures for the model/agent draft-migration test (c).
+const GPT_AGENT_NAME = "gpt-build"; // fixture agent declares an OpenAI/GPT model
+const GLM_PROVIDER = "zai"; // the explicit composer pick
+const GLM_MODEL = "glm-5";
+const GLM_VARIANT = "fast";
+
 describe("ChatView draft send — persisted draft cleared on success", () => {
   afterEach(() => {
     cleanup();
@@ -178,6 +230,10 @@ describe("ChatView draft send — persisted draft cleared on success", () => {
     // Reset the shared sync signals so each test starts in the draft hero
     // state (selectedId=null, draft=true).
     realNewSession();
+    // Reset the faithful model-selection state so the migration test can't leak
+    // a pick across tests.
+    modelsState.bySession = {};
+    modelsState.explicit.clear();
   });
 
   it("clears the persisted vh.draft.__new__ slot so the next draft mount starts empty", async () => {
@@ -319,5 +375,75 @@ describe("ChatView draft send — persisted draft cleared on success", () => {
     // the shell branch, not the normal-send branch.
     expect(createSessionMock).toHaveBeenCalledTimes(1);
     expect(enqueueMock).not.toHaveBeenCalled();
+  });
+
+  it("(c) explicit model pick survives draft -> live (proven via the real-id enqueued sendConfig)", async () => {
+    // Regression test for the draft->live model-migration gap. An explicit
+    // composer model pick is captured under the draft id "" (the composer's
+    // props.sessionId while in the New-session hero). On first send,
+    // createSession() produces a REAL session id; the pick must migrate to it
+    // so captureConfig(realId) — and thus the enqueued sendConfig — carries the
+    // user's explicit GLM pick. Asserted on the REAL-ID enqueued payload (NOT a
+    // helper-invocation check), so it proves the observable send behavior.
+    //
+    // RED before the fix: ChatView never migrated the draft-keyed pick to the
+    // live id, so captureConfig(realId) read an empty real-id selection and the
+    // enqueued sendConfig carried no GLM model.
+    const { chooseModel, chooseVariant } = await import("../../src/models");
+
+    // Start in draft mode (selectedId=null, draft=true) — mirrors the App.tsx
+    // hero state that mounts <ChatView sessionId="" draft />.
+    realNewSession();
+    expect(realSelectedId()).toBeNull();
+
+    const { container } = render(() => (
+      <Show when={!realSelectedId()}>
+        <ChatView sessionId="" draft />
+      </Show>
+    ));
+
+    // Explicit composer pick under the draft id "": GLM + a variant. Made while
+    // the GPT-declaring agent is the selected agent (the fixture above).
+    chooseModel("", GLM_PROVIDER, GLM_MODEL);
+    chooseVariant("", GLM_VARIANT);
+
+    // Type into the composer and send.
+    const textarea = container.querySelector(
+      "textarea.composer-text",
+    ) as HTMLTextAreaElement;
+    expect(textarea).toBeTruthy();
+    fireEvent.input(textarea, { target: { value: "hello" } });
+    expect(textarea.value).toBe("hello");
+
+    const sendBtn = container.querySelector(
+      'button[aria-label="Send"]',
+    ) as HTMLButtonElement;
+    expect(sendBtn).toBeTruthy();
+    await waitFor(() => expect(sendBtn.disabled).toBe(false));
+    fireEvent.click(sendBtn);
+
+    // The enqueue must have happened against the REAL session id (not the
+    // draft "" key).
+    await waitFor(() => expect(enqueueMock).toHaveBeenCalledTimes(1));
+    const [enqueuedId, payload] = enqueueMock.mock.calls[0] as [
+      string,
+      {
+        text: string;
+        sendConfig?: { providerID?: string; modelID?: string; variant?: string; agent?: string };
+      },
+    ];
+    expect(enqueuedId).toBe("new-session-id");
+    expect(payload.text).toBe("hello");
+
+    // The explicit GLM pick (provider + model + variant) must survive into the
+    // real-id sendConfig — the observable proof that draft->live migration ran.
+    expect(payload.sendConfig).toBeTruthy();
+    expect(payload.sendConfig!.providerID).toBe(GLM_PROVIDER);
+    expect(payload.sendConfig!.modelID).toBe(GLM_MODEL);
+    expect(payload.sendConfig!.variant).toBe(GLM_VARIANT);
+
+    // Agent selection still travels with the message (model precedence is
+    // independent of agent selection).
+    expect(payload.sendConfig!.agent).toBe(GPT_AGENT_NAME);
   });
 });

@@ -3,7 +3,7 @@
 import { createSignal } from "solid-js";
 import { createStore } from "solid-js/store";
 import { oc } from "./api";
-import { applyModel } from "./models";
+import { applyAgentModel } from "./models";
 import { sessionLastAgent } from "./sync";
 import { loadVersioned, saveVersioned } from "./lib/store";
 
@@ -49,6 +49,12 @@ export function agentForSession(sessionID: string): string {
 // Select an agent for a session and, if the agent declares a model, switch the
 // session's model to it (OpenCode ties a model+variant to each agent). Pass ""
 // as sessionID for a draft so the new session inherits the agent's model.
+//
+// CONTRACT: an agent-declared model is a DEFAULT. It must NOT override an
+// explicit composer model/variant pick the user made for this session.
+// applyAgentModel enforces that — it no-ops once the user has chosen a model for
+// the session — so switching agents only changes the model when the user hasn't
+// explicitly picked one.
 export function selectAgentForSession(sessionID: string, name: string) {
   setSessionAgentSel(sessionID, name); // remember the pick for THIS session
   // Only a draft pick (sessionID === "") updates the GLOBAL default that new
@@ -58,7 +64,7 @@ export function selectAgentForSession(sessionID: string, name: string) {
   if (sessionID === "") setSelectedAgent(name);
   const a = agents().find((x) => x.name === name);
   if (a?.model?.providerID && a.model.modelID) {
-    applyModel(sessionID, a.model.providerID, a.model.modelID, a.variant);
+    applyAgentModel(sessionID, a.model.providerID, a.model.modelID, a.variant);
   }
 }
 
