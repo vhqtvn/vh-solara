@@ -5,6 +5,7 @@ import { customFont, font, FONTS, monoFont, MONO_FONTS, setCustomFont, setFontId
 import { hideBuiltin, setHideBuiltin } from "../models";
 import { setStreamLive, streamLive, treeDensity, setTreeDensity, uiScale, setUiScale, orientation, setOrientation, MIN_SCALE, MAX_SCALE, chatWidth, setChatWidth, chatBubbles, setChatBubbles, notesEnabled, setNotesEnabled, tabStyle, setTabStyle, perfDiagEnabled, setPerfDiagEnabled, type ChatWidth, type TabStyle } from "../prefs";
 import { queueMode, setQueueMode } from "../queue";
+import { inlineAttachForced, setInlineAttachForced } from "../lib/inlineAttach";
 import { canInstall, installed, isIosSafari, promptInstall } from "../pwa-install";
 import { runDiagnostics, chipLabel, type DiagnosticsResult } from "../pwa-diagnostics";
 import { killTerm, listTerms } from "../termApi";
@@ -391,6 +392,20 @@ export default function SettingsDialog(props: { onClose: () => void }) {
               <p class="setting-hint">
                 On: sending while a turn is running queues the message and auto-sends it when the
                 turn finishes. Off: sending while busy is rejected.
+              </p>
+              <div class="setting-row">
+                <label>Force inline attachments for vision models</label>
+                <input
+                  type="checkbox"
+                  aria-label="Force inline attachments for vision models"
+                  checked={inlineAttachForced()}
+                  onChange={(e) => setInlineAttachForced(e.currentTarget.checked)}
+                />
+              </div>
+              <p class="setting-hint">
+                Off by default. Non-vision models always inline attachments. Vision models keep the
+                current chip-to-image behavior unless this is on, which forces inline attachments
+                even for them.
               </p>
               <div class="setting-row">
                 <label>Show performance diagnostics</label>
