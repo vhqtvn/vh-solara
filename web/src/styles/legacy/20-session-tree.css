@@ -48,6 +48,10 @@
 @keyframes spin-pulse-dim { 0%, 100% { opacity: 0.15; } 50% { opacity: 0.35; } }
 @media (prefers-reduced-motion: reduce) {
   [data-component="spinner"] rect { animation: none !important; }
+  /* The twisty's pulsing funnel (activated for busy expandable nodes) must
+     also respect reduced-motion — a11y. `!important` wins over the later
+     .twisty-running rule below (same source-order pattern as the spinner). */
+  .tree-twisty span.twisty-running { animation: none !important; }
 }
 .tree-twisty {
   flex: none;

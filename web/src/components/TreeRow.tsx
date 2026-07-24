@@ -129,7 +129,20 @@ export function TreeRow(props: TreeRowProps) {
           // Tree-mode leaf: the `noChild` dash-dot terminal marker. The button
           // carries the `leaf` class (above) so CSS dims it as a quiet terminal
           // cue. Bare render (no span) keeps it clear of the chevron rotation.
+          // A busy LEAF still shows noChild — the funnel below is for EXPANDABLE
+          // nodes only (this branch precedes the isBusy funnel).
           <Icon name="noChild" size={13} />
+        ) : isBusy() ? (
+          // Busy expandable node: the pulsing accent funnel (the `filter` glyph
+          // in a `.twisty-running` span). Ports the old proj=1 twisty's running
+          // state verbatim — the CSS rule (legacy/20-session-tree.css) already
+          // tints it --accent + pulses it, and `transform: none` there keeps the
+          // funnel upright (it overrides the chevron's span:not(.open) rotate).
+          // onClick is UNCHANGED: this is a glyph swap, not a new affordance —
+          // the guard above still fires onToggle for any expandable node.
+          <span class="twisty-running">
+            <Icon name="filter" size={12} />
+          </span>
         ) : (
           // Expandable tree node: the chevron, wrapped in the open/not-open span
           // whose `.tree-twisty span:not(.open)` rule rotates it to point right

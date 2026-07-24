@@ -506,6 +506,55 @@ describe("TreeRow subtreeBusy spinner (P1-B, tree=2 UI parity)", () => {
   });
 });
 
+// ── tree=2 UI parity: twisty "running" funnel (P1, port from proj=1) ─────────
+// The old proj=1 client showed a pulsing accent funnel (.twisty-running) on a
+// busy EXPANDABLE node's twisty instead of the chevron. It was dropped in the
+// tree=2 rewrite even though its CSS rule (legacy/20-session-tree.css) survived
+// unused. These pin the 4-way twisty precedence (flat > leaf > busy > chevron):
+// a busy expandable node renders the funnel; an idle expandable node renders the
+// chevron; clicking a busy expandable node's funnel still toggles (the funnel is
+// a glyph swap, not a new affordance).
+describe("TreeRow twisty running funnel (P1, port from proj=1)", () => {
+  it("renders the funnel (.twisty-running > filter icon) for a busy EXPANDABLE node", () => {
+    const { container } = render(() => (
+      <TreeRow node={baseNode({ activity: "busy", childCount: 2 })} depth={0} selected={false} expanded={false} onSelect={() => {}} onToggle={() => {}} />
+    ));
+    const t = twisty(container as unknown as HTMLElement);
+    const running = t.querySelector("span.twisty-running");
+    expect(running).not.toBeNull();
+    // The funnel glyph is the `filter` icon — pin its exact path so a wrong
+    // icon can't pass as "some svg inside the span".
+    const path = running?.querySelector("svg.icon path");
+    expect(path?.getAttribute("d")).toBe("M4 5h16l-6 8v6l-4-2v-4z");
+    // The twisty must NOT carry the dimmed `leaf` class (funnel renders at full
+    // --accent, not dimmed like the noChild terminal marker).
+    expect(t.classList.contains("leaf")).toBe(false);
+  });
+
+  it("renders the chevron (NOT the funnel) for an IDLE expandable node", () => {
+    const { container } = render(() => (
+      <TreeRow node={baseNode({ activity: "idle", childCount: 2 })} depth={0} selected={false} expanded={false} onSelect={() => {}} onToggle={() => {}} />
+    ));
+    const t = twisty(container as unknown as HTMLElement);
+    // Idle expandable falls through to the chevron branch: no funnel span.
+    expect(t.querySelector("span.twisty-running")).toBeNull();
+    // The chevron branch renders a bare <span> (classList open/no-class) holding
+    // the chevronDown icon — present for an idle expandable node.
+    expect(t.querySelector("span")).not.toBeNull();
+  });
+
+  it("still fires onToggle when a busy expandable node's funnel twisty is clicked (glyph swap, not a new affordance)", () => {
+    const onToggle = vi.fn();
+    const { container } = render(() => (
+      <TreeRow node={baseNode({ id: "busy-tog", activity: "busy", childCount: 2 })} depth={0} selected={false} expanded={false} onSelect={() => {}} onToggle={onToggle} />
+    ));
+    twisty(container as unknown as HTMLElement).dispatchEvent(
+      new MouseEvent("click", { bubbles: true }),
+    );
+    expect(onToggle).toHaveBeenCalledWith("busy-tog");
+  });
+});
+
 // ── tree=2 UI parity: selected-row highlight on .tree-row (P0-B) ──────────────
 // The `.tree-row` div had NO `selected` class even though CSS `.tree-row.selected`
 // exists to paint the accent highlight. The `selected` prop was already applied
