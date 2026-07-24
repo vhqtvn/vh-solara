@@ -25,6 +25,13 @@ import {
   inlineAttachUrl,
   VH_ATTACH_URL_PREFIX,
   INLINE_LOCALID_PREFIX,
+  scanInlineTokens,
+  substituteInlineTokens,
+  isInlineChipUrl,
+  selectInlineImageParts,
+  resolveInlineAttachments,
+  type ResolvedAttachment,
+  type InlineUploader,
 } from "../../src/lib/inlineAttach";
 
 // In-memory localStorage for the node test env (matches store.test.ts /
@@ -230,5 +237,295 @@ describe("insertAtCaret — pure textarea splice + caret advance (jsdom)", () =>
     expect(ta.value).toBe("abc");
     expect(ta.selectionStart).toBe(1);
     expect(ta.selectionEnd).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S4: send-resolve pure helpers + lazy-upload orchestration.
+//
+// scanInlineTokens / substituteInlineTokens / isInlineChipUrl /
+// selectInlineImageParts are pure. resolveInlineAttachments composes them and
+// is async only because it awaits a supplied uploader (mockable -> deterministic
+// lazy-upload / vision-gate / graceful-fallback tests with no server).
+
+function mkFile(name: string, mime: string, size = 8): File {
+  const f = new File([new Uint8Array(size)], name, { type: mime });
+  return f;
+}
+
+function mkResolved(name: string, mime: string, path: string, url = `file:///p/${path}`): ResolvedAttachment {
+  return { url, filename: name, mime, path };
+}
+
+describe("scanInlineTokens — present localIds in stable dedup order", () => {
+  it("returns the localId from a single image ref", () => {
+    expect(scanInlineTokens("see ![f](vh-attach:inl3) here")).toEqual(["inl3"]);
+  });
+
+  it("returns the localId from a non-image ref", () => {
+    expect(scanInlineTokens("[doc.pdf](vh-attach:inl7)")).toEqual(["inl7"]);
+  });
+
+  it("returns multiple distinct localIds in order of first appearance", () => {
+    expect(
+      scanInlineTokens("![a](vh-attach:inl1) x ![b](vh-attach:inl2) y [c](vh-attach:inl3)"),
+    ).toEqual(["inl1", "inl2", "inl3"]);
+  });
+
+  it("dedupes a token referenced more than once", () => {
+    expect(scanInlineTokens("![a](vh-attach:inl1) and again ![a2](vh-attach:inl1)")).toEqual(["inl1"]);
+  });
+
+  it("returns an EMPTY array when no inline token is present (non-inline text)", () => {
+    expect(scanInlineTokens("just a normal message")).toEqual([]);
+  });
+
+  it("does NOT match a bare vh-attach: prefix with no id", () => {
+    // "vh-attach:" alone (no localId chars) must not produce a phantom id.
+    expect(scanInlineTokens("see vh-attach: end")).toEqual([]);
+  });
+
+  it("does NOT capture the trailing markdown ')' as part of the id", () => {
+    expect(scanInlineTokens("![f](vh-attach:inl9)")).toEqual(["inl9"]);
+  });
+});
+
+describe("substituteInlineTokens — splice token -> real path, keep ref structure", () => {
+  it("substitutes an image-ref token with the bare real path", () => {
+    expect(substituteInlineTokens("![f](vh-attach:inl3)", { inl3: ".vh-solara/sessions/s/attachments/x.png" }))
+      .toBe("![f](.vh-solara/sessions/s/attachments/x.png)");
+  });
+
+  it("substitutes a non-image-ref token", () => {
+    expect(substituteInlineTokens("[doc.pdf](vh-attach:inl7)", { inl7: ".vh-solara/sessions/s/attachments/d.pdf" }))
+      .toBe("[doc.pdf](.vh-solara/sessions/s/attachments/d.pdf)");
+  });
+
+  it("substitutes multiple distinct tokens in one pass", () => {
+    const text = "![a](vh-attach:inl1) [b](vh-attach:inl2)";
+    expect(substituteInlineTokens(text, { inl1: "p/a.png", inl2: "p/b.txt" }))
+      .toBe("![a](p/a.png) [b](p/b.txt)");
+  });
+
+  it("substitutes ALL occurrences of a repeated token", () => {
+    expect(substituteInlineTokens("![a](vh-attach:inl1) ![a2](vh-attach:inl1)", { inl1: "p/a.png" }))
+      .toBe("![a](p/a.png) ![a2](p/a.png)");
+  });
+
+  it("LEAVES a token verbatim when it has no resolved path (graceful, no crash)", () => {
+    // Upload failed / older backend -> no entry -> token stays visible (no silent drop).
+    expect(substituteInlineTokens("![a](vh-attach:inl1)", {})).toBe("![a](vh-attach:inl1)");
+  });
+
+  it("substitutes mapped tokens while leaving unmapped ones in place", () => {
+    expect(substituteInlineTokens("![a](vh-attach:inl1) [b](vh-attach:inl2)", { inl1: "p/a.png" }))
+      .toBe("![a](p/a.png) [b](vh-attach:inl2)");
+  });
+
+  it("preserves surrounding text exactly", () => {
+    expect(substituteInlineTokens("before ![f](vh-attach:inl3) after", { inl3: "p.png" }))
+      .toBe("before ![f](p.png) after");
+  });
+
+  it("does not emit a literal @file anywhere", () => {
+    const out = substituteInlineTokens("![f](vh-attach:inl3)", { inl3: ".vh-solara/x.png" });
+    expect(out).not.toContain("@file");
+  });
+});
+
+describe("isInlineChipUrl — synthetic inline chip predicate (buildParts exclusion)", () => {
+  it("true for a synthetic inline chip url", () => {
+    expect(isInlineChipUrl("vh-attach:inl3")).toBe(true);
+  });
+
+  it("true for the bare prefix form too", () => {
+    expect(isInlineChipUrl("vh-attach:")).toBe(true);
+  });
+
+  it("false for a real file:// uploaded attachment url", () => {
+    expect(isInlineChipUrl("file:///proj/.vh-solara/sessions/s/attachments/x.png")).toBe(false);
+  });
+
+  it("false for empty / undefined-ish input", () => {
+    expect(isInlineChipUrl("")).toBe(false);
+  });
+
+  it("false for an http url (never collides with the synthetic scheme)", () => {
+    expect(isInlineChipUrl("https://example.com/x.png")).toBe(false);
+  });
+});
+
+describe("selectInlineImageParts — vision-gated image file-part selector", () => {
+  const img = mkResolved("a.png", "image/png", "p/a.png");
+  const img2 = mkResolved("b.jpg", "image/jpeg", "p/b.jpg");
+  const pdf = mkResolved("d.pdf", "application/pdf", "p/d.pdf");
+  const txt = mkResolved("t.txt", "text/plain", "p/t.txt");
+
+  it("vision ON -> returns only the IMAGE uploads", () => {
+    expect(selectInlineImageParts([img, pdf, img2, txt], true)).toEqual([img, img2]);
+  });
+
+  it("vision ON, no images -> empty", () => {
+    expect(selectInlineImageParts([pdf, txt], true)).toEqual([]);
+  });
+
+  it("vision OFF -> ALWAYS empty (text only, even for images)", () => {
+    expect(selectInlineImageParts([img, img2], false)).toEqual([]);
+  });
+
+  it("vision ON ignores uploads whose mime is absent", () => {
+    const noMime = { url: "file:///p/x", filename: "x", mime: "" } as ResolvedAttachment;
+    expect(selectInlineImageParts([noMime, img], true)).toEqual([img]);
+  });
+
+  it("vision ON treats only mime.startsWith('image/') as image", () => {
+    // 'application/image-icon' must NOT match (startsWith image/ is the rule).
+    const fake = mkResolved("x", "application/image-thing", "p/x");
+    expect(selectInlineImageParts([fake, img], true)).toEqual([img]);
+  });
+});
+
+// Mock uploader harness: records every File it is called with (in call order)
+// and resolves each via the per-filename table. A name absent from the table
+// simulates a failed upload (returns null). This lets the lazy-upload tests
+// assert EXACTLY which Files were uploaded.
+function mockUploader(table: Record<string, ResolvedAttachment | null>) {
+  const calls: File[] = [];
+  const uploader: InlineUploader = (file) => {
+    calls.push(file);
+    const r = table[file.name];
+    return Promise.resolve(r === undefined ? null : r);
+  };
+  return { uploader, calls };
+}
+
+describe("resolveInlineAttachments — lazy upload + substitute + vision gate", () => {
+  it("uploads ONLY a token still present in the text (lazy upload)", async () => {
+    const f = mkFile("a.png", "image/png");
+    const files = new Map([["inl1", f]]);
+    const { uploader, calls } = mockUploader({ "a.png": mkResolved("a.png", "image/png", "p/a.png") });
+    const r = await resolveInlineAttachments("![a](vh-attach:inl1)", files, uploader, false);
+    expect(calls).toEqual([f]); // the held File WAS uploaded
+    expect(r.uploadedIds).toEqual(["inl1"]);
+    expect(r.resolvedText).toBe("![a](p/a.png)");
+  });
+
+  it("NEVER uploads a token whose markdown ref was deleted (absent from text)", async () => {
+    // inl1 is held in the Map but its ref was removed from the text by the user.
+    const f = mkFile("a.png", "image/png");
+    const files = new Map([["inl1", f]]);
+    const { uploader, calls } = mockUploader({ "a.png": mkResolved("a.png", "image/png", "p/a.png") });
+    const r = await resolveInlineAttachments("no refs here", files, uploader, false);
+    expect(calls).toEqual([]); // uploader never invoked for the deleted ref
+    expect(r.uploadedIds).toEqual([]);
+    expect(r.failedIds).toEqual([]);
+    expect(r.resolvedText).toBe("no refs here");
+  });
+
+  it("uploads the present token and skips the absent one in the SAME text", async () => {
+    const f1 = mkFile("a.png", "image/png");
+    const f2 = mkFile("b.png", "image/png");
+    const files = new Map([["inl1", f1], ["inl2", f2]]);
+    const { uploader, calls } = mockUploader({
+      "a.png": mkResolved("a.png", "image/png", "p/a.png"),
+      "b.png": mkResolved("b.png", "image/png", "p/b.png"),
+    });
+    // Only inl1 referenced; inl2 held but not referenced.
+    const r = await resolveInlineAttachments("![a](vh-attach:inl1)", files, uploader, false);
+    expect(calls.map((f) => f.name)).toEqual(["a.png"]);
+    expect(r.uploadedIds).toEqual(["inl1"]);
+  });
+
+  it("vision ON + referenced IMAGE -> exactly one image file part", async () => {
+    const f = mkFile("a.png", "image/png");
+    const files = new Map([["inl1", f]]);
+    const { uploader } = mockUploader({ "a.png": mkResolved("a.png", "image/png", "p/a.png") });
+    const r = await resolveInlineAttachments("![a](vh-attach:inl1)", files, uploader, true);
+    expect(r.imageParts).toEqual([mkResolved("a.png", "image/png", "p/a.png")]);
+    expect(r.resolvedText).toBe("![a](p/a.png)"); // text also substituted
+  });
+
+  it("vision ON + referenced NON-IMAGE -> NO image file part (path still substituted)", async () => {
+    const f = mkFile("d.pdf", "application/pdf");
+    const files = new Map([["inl1", f]]);
+    const { uploader } = mockUploader({ "d.pdf": mkResolved("d.pdf", "application/pdf", "p/d.pdf") });
+    const r = await resolveInlineAttachments("[d](vh-attach:inl1)", files, uploader, true);
+    expect(r.imageParts).toEqual([]);
+    expect(r.resolvedText).toBe("[d](p/d.pdf)");
+  });
+
+  it("vision OFF -> ZERO image file parts even for referenced images (text only)", async () => {
+    const f = mkFile("a.png", "image/png");
+    const files = new Map([["inl1", f]]);
+    const { uploader } = mockUploader({ "a.png": mkResolved("a.png", "image/png", "p/a.png") });
+    const r = await resolveInlineAttachments("![a](vh-attach:inl1)", files, uploader, false);
+    expect(r.imageParts).toEqual([]);
+    expect(r.resolvedText).toBe("![a](p/a.png)");
+  });
+
+  it("graceful: upload returns no `path` -> falls back to `url` for substitution (no throw)", async () => {
+    const f = mkFile("a.png", "image/png");
+    const files = new Map([["inl1", f]]);
+    // Older backend / transient: path absent, only a url came back.
+    const { uploader } = mockUploader({
+      "a.png": { url: "file:///proj/.vh-solara/x.png", filename: "a.png", mime: "image/png" },
+    });
+    const r = await resolveInlineAttachments("![a](vh-attach:inl1)", files, uploader, false);
+    expect(r.resolvedText).toBe("![a](file:///proj/.vh-solara/x.png)");
+    expect(r.failedIds).toEqual([]);
+  });
+
+  it("graceful: a FAILED upload (null) leaves the token verbatim, no throw, no silent drop", async () => {
+    const f = mkFile("a.png", "image/png");
+    const files = new Map([["inl1", f]]);
+    const { uploader } = mockUploader({ "a.png": null }); // upload fails
+    const r = await resolveInlineAttachments("![a](vh-attach:inl1)", files, uploader, false);
+    expect(r.resolvedText).toBe("![a](vh-attach:inl1)"); // token remains (visible, not dropped)
+    expect(r.uploadedIds).toEqual([]);
+    expect(r.failedIds).toEqual(["inl1"]);
+    expect(r.imageParts).toEqual([]);
+  });
+
+  it("graceful: present token with no held File leaves the token (no crash)", async () => {
+    const files = new Map<string, File>(); // localId not held
+    const { uploader, calls } = mockUploader({});
+    const r = await resolveInlineAttachments("![a](vh-attach:inl1)", files, uploader, false);
+    expect(calls).toEqual([]);
+    expect(r.resolvedText).toBe("![a](vh-attach:inl1)");
+    expect(r.failedIds).toEqual(["inl1"]);
+  });
+
+  it("mixed: one image + one non-image, vision ON -> one image part, both paths substituted", async () => {
+    const fImg = mkFile("a.png", "image/png");
+    const fPdf = mkFile("d.pdf", "application/pdf");
+    const files = new Map([["inl1", fImg], ["inl2", fPdf]]);
+    const { uploader } = mockUploader({
+      "a.png": mkResolved("a.png", "image/png", "p/a.png"),
+      "d.pdf": mkResolved("d.pdf", "application/pdf", "p/d.pdf"),
+    });
+    const r = await resolveInlineAttachments("![a](vh-attach:inl1) [d](vh-attach:inl2)", files, uploader, true);
+    expect(r.imageParts).toEqual([mkResolved("a.png", "image/png", "p/a.png")]);
+    expect(r.resolvedText).toBe("![a](p/a.png) [d](p/d.pdf)");
+  });
+
+  it("uploads in stable first-appearance order", async () => {
+    const f1 = mkFile("a.png", "image/png");
+    const f2 = mkFile("b.png", "image/png");
+    const f3 = mkFile("c.png", "image/png");
+    const files = new Map([["inl3", f3], ["inl1", f1], ["inl2", f2]]);
+    const { uploader, calls } = mockUploader({
+      "a.png": mkResolved("a.png", "image/png", "p/a.png"),
+      "b.png": mkResolved("b.png", "image/png", "p/b.png"),
+      "c.png": mkResolved("c.png", "image/png", "p/c.png"),
+    });
+    // Text references in order inl2, inl3, inl1 (Map insertion order differs).
+    const r = await resolveInlineAttachments(
+      "![b](vh-attach:inl2) ![c](vh-attach:inl3) ![a](vh-attach:inl1)",
+      files,
+      uploader,
+      false,
+    );
+    expect(calls.map((f) => f.name)).toEqual(["b.png", "c.png", "a.png"]);
+    expect(r.uploadedIds).toEqual(["inl2", "inl3", "inl1"]);
   });
 });

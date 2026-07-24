@@ -107,12 +107,24 @@ func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request) {
 		mimeType = "application/octet-stream"
 	}
 
+	// Normalize the attachment path to PROJECT-RELATIVE (e.g.
+	// .vh-solara/sessions/<id>/attachments/<file>) so downstream consumers get a
+	// readable, portable path: the FE substitutes it into the inline-mode
+	// markdown ref at send, and it is threaded into queue metadata. The absolute
+	// `dst` is only used above to build the file:// url and to write the file;
+	// `path` carries the relative form. filepath.Rel cannot fail here (both root
+	// and dst are absolute and dst is always under root), but on any error fall
+	// back to dst so the field is never empty (graceful — no silent drop).
+	rel, relErr := filepath.Rel(root, dst)
+	if relErr != nil {
+		rel = dst
+	}
 	writeJSONResp(w, map[string]any{
 		"type":     "file",
 		"url":      fileURL(dst),
 		"filename": name,
 		"mime":     mimeType,
-		"path":     dst,
+		"path":     filepath.ToSlash(rel),
 	})
 }
 

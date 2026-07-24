@@ -139,3 +139,156 @@ export function insertAtCaret(ta: HTMLTextAreaElement, text: string): void {
   ta.selectionStart = pos;
   ta.selectionEnd = pos;
 }
+
+// --- S4: send-resolve (token scan + path substitute + vision file parts) ----
+//
+// At send time the inline-mode markdown refs in the composer text are the
+// SOURCE OF TRUTH for which attachments still exist: a ref the user deleted is
+// gone and its held File MUST NOT be uploaded (lazy upload). These helpers turn
+// that contract into data:
+//
+//   1. scanInlineTokens(text)       -> which vh-attach:<localId> are still present
+//   2. resolveInlineAttachments(...) -> upload ONLY those, build id->path, pick
+//      the image file parts (vision only)
+//   3. substituteInlineTokens(...)   -> splice each token -> real path in text
+//
+// All three are framework-free. The orchestration (resolveInlineAttachments) is
+// async only because it awaits the supplied uploader; pass a mock to unit-test
+// the lazy-upload / vision-gate / graceful-fallback behavior without a server.
+
+// A resolved (server-backed) inline attachment: same shape as ChatView's
+// Attachment minus the raw `file` (the bytes are gone once uploaded).
+// `path` is the project-relative path from attach.go; it MAY be absent on older
+// backends / transient responses — callers fall back to `url` in that case.
+export interface ResolvedAttachment {
+  url: string;
+  filename: string;
+  mime: string;
+  path?: string;
+}
+
+// The uploader dependency: given the held File, return the server-backed
+// resolved attachment, or null on failure. Injected so resolveInlineAttachments
+// is unit-testable with a mock and has no fetch/global coupling.
+export type InlineUploader = (file: File) => Promise<ResolvedAttachment | null>;
+
+// Matches a vh-attach:<localId> token and captures the localId. localId chars
+// are [A-Za-z0-9_-] (the INLINE_LOCALID_PREFIX "inl" + a monotonic counter, but
+// the class is general so any safe localId round-trips). The trailing context
+// (e.g. the ")" of a markdown ref) is NOT part of the capture. Global, so it
+// finds every occurrence; callers reset lastIndex via String.replace / matchAll.
+const INLINE_TOKEN_RE = /vh-attach:([A-Za-z0-9_-]+)/g;
+
+// Pure: return the deduped localIds whose vh-attach:<localId> token is still
+// present in `text`, in order of first appearance (stable). Tokens absent from
+// the text (the user deleted the markdown ref) are NOT returned, so callers
+// never upload them. An empty array means no inline attachments remain.
+export function scanInlineTokens(text: string): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const m of text.matchAll(INLINE_TOKEN_RE)) {
+    const id = m[1];
+    if (id && !seen.has(id)) {
+      seen.add(id);
+      out.push(id);
+    }
+  }
+  return out;
+}
+
+// Pure: replace each vh-attach:<localId> token in `text` with idToPath[localId].
+// The surrounding markdown ref structure is preserved (only the token is
+// substituted): `![f](vh-attach:inl3)` -> `![f](.vh-solara/.../x.png)`. If a
+// token has no entry in idToPath (upload failed / older backend returned no
+// path AND no url fallback), the token is LEFT VERBATIM — this is the graceful
+// no-silent-drop fallback: the unresolved token stays visible in the outgoing
+// text rather than vanishing or crashing.
+export function substituteInlineTokens(text: string, idToPath: Record<string, string>): string {
+  return text.replace(INLINE_TOKEN_RE, (m, id: string) => idToPath[id] ?? m);
+}
+
+// Pure: a synthetic inline-chip url (the chip form set in S3's addFiles inline
+// branch). buildParts uses this to EXCLUDE inline chips from the normal
+// chip->{type:"file"} path — inline chips are represented in the text, not as
+// file parts. Real uploaded attachments have file:// urls and never match.
+export function isInlineChipUrl(url: string): boolean {
+  return url.startsWith(VH_ATTACH_URL_PREFIX);
+}
+
+// Pure selector: given the uploaded inline attachments, return the subset that
+// becomes IMAGE file parts. Vision models receive image bytes as a file part
+// (in addition to the text markdown ref); non-vision models get text only, so
+// `vision=false` always yields []. A non-image upload (e.g. a PDF) is NEVER
+// emitted as a file part here regardless of vision — it is referenced via its
+// path in the text only. Image = mime startsWith "image/".
+export function selectInlineImageParts(
+  uploads: ResolvedAttachment[],
+  vision: boolean,
+): ResolvedAttachment[] {
+  if (!vision) return [];
+  return uploads.filter((u) => typeof u.mime === "string" && u.mime.startsWith("image/"));
+}
+
+// Result of resolving inline attachments at send. `resolvedText` has every
+// present token substituted with its real path (absent/unmapped tokens left).
+// `imageParts` are the uploaded image attachments to emit as file parts (vision
+// only); they carry real file:// urls so buildParts includes them. `uploadedIds`
+// / `failedIds` are diagnostics for which held Files were consumed / dropped.
+export interface InlineResolveResult {
+  resolvedText: string;
+  idToPath: Record<string, string>;
+  imageParts: ResolvedAttachment[];
+  uploadedIds: string[];
+  failedIds: string[];
+}
+
+// Impure-in-shape (awaits `uploader`) but deterministic under a mock uploader.
+// Implements the lazy-upload + substitute + vision-gate contract:
+//   - Only localIds PRESENT in `text` are uploaded (scanInlineTokens); a held
+//     File whose markdown ref was deleted is never passed to `uploader`.
+//   - Each successful upload's path is threaded into idToPath; if the backend
+//     returned no `path` (older backend / transient), fall back to `url` so the
+//     substitution never crashes and the attachment is still referenced.
+//   - A failed upload (uploader returned null) is recorded in failedIds and its
+//     token is LEFT in the text (no silent drop, no throw).
+//   - `vision` selects image file parts (selectInlineImageParts).
+// `files` is the ChatView-local Map<localId, File> (S3); a present token whose
+// localId is not in `files` (should not happen in normal flow) is skipped — its
+// token is left verbatim by substituteInlineTokens (idToPath has no entry).
+export async function resolveInlineAttachments(
+  text: string,
+  files: Map<string, File>,
+  uploader: InlineUploader,
+  vision: boolean,
+): Promise<InlineResolveResult> {
+  const presentIds = scanInlineTokens(text);
+  const idToPath: Record<string, string> = {};
+  const uploads: ResolvedAttachment[] = [];
+  const uploadedIds: string[] = [];
+  const failedIds: string[] = [];
+  for (const localId of presentIds) {
+    const file = files.get(localId);
+    if (!file) {
+      // Token present in text but no held File: leave the token (no mapping).
+      failedIds.push(localId);
+      continue;
+    }
+    const uploaded = await uploader(file);
+    if (!uploaded) {
+      failedIds.push(localId);
+      continue;
+    }
+    // Graceful path fallback: prefer the project-relative `path`; if the backend
+    // returned none, use the file:// url so the ref still resolves to the file.
+    idToPath[localId] = uploaded.path || uploaded.url;
+    uploads.push(uploaded);
+    uploadedIds.push(localId);
+  }
+  return {
+    resolvedText: substituteInlineTokens(text, idToPath),
+    idToPath,
+    imageParts: selectInlineImageParts(uploads, vision),
+    uploadedIds,
+    failedIds,
+  };
+}

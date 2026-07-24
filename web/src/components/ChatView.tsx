@@ -28,6 +28,8 @@ import {
   insertAtCaret,
   inlineAttachUrl,
   INLINE_LOCALID_PREFIX,
+  isInlineChipUrl,
+  resolveInlineAttachments,
 } from "../lib/inlineAttach";
 import { IGNORED, isSendInFlight, runSendSingleFlight } from "../lib/sendSingleFlight";
 import ModelDialog from "./ModelDialog";
@@ -1634,7 +1636,16 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     // rejects the drain's dispatch promise and strands the item at `dispatching`.
     const parts: any[] = [];
     if (text) parts.push({ type: "text", text });
-    for (const a of atts ?? []) parts.push({ type: "file", url: a.url, filename: a.filename, mime: a.mime });
+    for (const a of atts ?? []) {
+      // S4: EXCLUDE synthetic inline chips (url = vh-attach:<localId>). Inline
+      // attachments are represented in the TEXT (their token was substituted
+      // with the real path at send); emitting them here would double-send a
+      // bogus file part whose url is not a real file:// path. Real uploaded
+      // inline images (vision mode) were added to attachments() at send with
+      // real file:// urls, so they pass this guard and become file parts.
+      if (isInlineChipUrl(a.url)) continue;
+      parts.push({ type: "file", url: a.url, filename: a.filename, mime: a.mime });
+    }
     return parts;
   }
 
@@ -2023,10 +2034,36 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     // during the enqueue is dropped. The guard releases in finally on BOTH
     // success and failure so a genuine retry still works after a timeout.
     // Distinct from `sending` (the dispatch guard) — see lib/sendSingleFlight.ts.
+    // S4: resolve inline-mode attachment tokens in the composer text into real
+    // server paths. In inline mode (non-vision model, OR vision + user-forced
+    // pref) the text holds markdown refs whose link target is a synthetic
+    // vh-attach:<localId> token. Upload ONLY tokens still present (a ref the
+    // user deleted -> its held File is NEVER uploaded: lazy upload), substitute
+    // each token with its real project-relative path, and (vision only) add one
+    // image file part per referenced IMAGE attachment. Non-inline mode skips
+    // this block entirely — byte-for-byte unchanged. NEVER emits literal
+    // "@file <path>": substitution is the bare path inside the markdown ref.
+    // Original `text` is preserved for the failure-restore setInput(text); only
+    // the ENQUEUED text uses resolvedText.
+    let resolvedText = text;
+    if (effectiveInline(modelHasVision(curModel()), inlineAttachForced())) {
+      const r = await resolveInlineAttachments(
+        text,
+        inlineFiles,
+        (f) => uploadFile(f, id),
+        modelHasVision(curModel()),
+      );
+      resolvedText = r.resolvedText;
+      // Vision-only image file parts carry real file:// urls; add them to the
+      // chip list BEFORE the ownership snapshot below so buildParts (at dispatch)
+      // emits them and the success-clear still fires. The synthetic vh-attach:
+      // chips already in the list are excluded by buildParts (isInlineChipUrl).
+      if (r.imageParts.length > 0) setAttachments((a) => [...a, ...r.imageParts]);
+    }
     await runSendSingleFlight(id, async () => {
       const snapText = input();
       const snapAtts = attachments();
-      const ok = await sendText(text, id);
+      const ok = await sendText(resolvedText, id);
       if (!ok) {
         setInput(text);
         return;
