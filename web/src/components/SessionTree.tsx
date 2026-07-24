@@ -1,12 +1,11 @@
 import { For, Show, createMemo } from "solid-js";
 import { selectedId, setSelectedId, state, expandTreeNode } from "../sync";
 import { setView } from "../ui";
-import { treeMap, treeRoots, treeChildrenOf, collapseTreeNode } from "../sync/treeState";
+import { treeMap, treeRoots, treeChildrenOf, isNodeExpanded, setUserNodeExpanded } from "../sync/treeState";
 import { selectPinnedNodes, selectSearchResults } from "../sync/treeSelectors";
 import { searchQuery, reconciledPinnedOrder, isPinned } from "../sidebar";
 import { menuTriggers } from "../sessionMenu";
 import TreeRow from "./TreeRow";
-import { toggleDecision } from "../sync/treeMap";
 import type { TreeNode } from "../sync/treeMap";
 
 // Picking a session always shows its chat — even re-clicking the already-open
@@ -38,25 +37,26 @@ function TreeBranch(props: {
   // hoisted pinned row. Empty set in search mode (no dedup there).
   pinnedIds: () => Set<string>;
 }) {
-  // expanded mirrors the node's loaded flag (§3: loaded is a render attribute,
-  // not a node kind). Reads the reactive treeState accessor so a collapse (which
-  // drops loaded descendants + flips loaded:false) re-renders this branch closed.
-  // Pinned children are filtered out here — they are hoisted to the pinned group,
-  // never duplicated in their natural tree position.
-  const expanded = () => treeChildrenOf(props.node.id).filter((c) => !props.pinnedIds().has(c.id));
+  // Flood fix: SEPARATE UI expand-state from map-presence. `children` are the
+  // node's resident direct children (recency-sorted, pinned-dedup'd) — they
+  // STAY in the flat map regardless of expand state. `renderOpen` is the new
+  // render gate: children only RENDER when the node is on the active path (auto)
+  // or the user expanded it. A loaded parent no longer dumps all its children.
+  const children = () => treeChildrenOf(props.node.id).filter((c) => !props.pinnedIds().has(c.id));
+  const renderOpen = () => isNodeExpanded(props.node.id);
   return (
     <>
       <TreeRow
         node={props.node}
         depth={props.depth}
         selected={selectedId() === props.node.id}
-        expanded={expanded().length > 0}
+        expanded={renderOpen() && children().length > 0}
         unread={!!state.unread[props.node.id]}
         onSelect={() => openSessionChat(props.node.id)}
         onToggle={() => props.onToggle(props.node)}
         menuProps={menuTriggers(() => props.node.id, () => props.node.title || props.node.id)}
       />
-      <For each={expanded()}>
+      <For each={renderOpen() ? children() : []}>
         {(child) => (
           <TreeBranch node={child} depth={props.depth + 1} onToggle={props.onToggle} pinnedIds={props.pinnedIds} />
         )}
@@ -84,31 +84,21 @@ function TreeStateView() {
   // no matches (render the empty state).
   const results = createMemo(() => selectSearchResults(treeMap(), searchQuery(), isPinned));
 
-  // §8: expand = fetch direct children (treeOps.fetchChildren via stream's
-  // expandTreeNode, single-flight + F1 staleCursor fix); collapse = client-only
-  // drop of loaded descendants keeping the placeholder (treeState.collapseTreeNode).
-  // A node with loaded children collapses; a node with descendants but no loaded
-  // children expands. Leaf nodes (childCount===0) toggle is a no-op via TreeRow's
-  // own isLeaf guard. On collapse, the pinned membership is passed through so a
-  // pinned descendant is NOT dropped (it stays resident for the Pinned group).
-  //
-  // c_F1: the expand/collapse decision keys off the node's `loaded` flag (via the
-  // pure toggleDecision helper), NOT off whether resident children happen to be
-  // present in the flat map. The protectedIds pin-parity hook keeps a pinned
-  // descendant resident through an ancestor collapse, so a presence-based rule
-  // ("has resident children → collapse") would ALWAYS collapse and the user could
-  // NEVER re-expand a parent that has a pinned descendant (stuck). Keying off
-  // `loaded` is correct: a collapsed node is loaded:false; expanding means it IS
-  // loaded / should fetch its direct children.
+  // Flood fix: toggle the UI expand-state, NOT the map. Collapsing a node hides
+  // its resident children from the RENDER but keeps them in the flat map (no
+  // fetch on re-expand). Expanding a node whose children are ALREADY resident
+  // shows them with NO server round-trip; only a genuinely-unloaded node
+  // (no resident children but it has descendants to fetch) calls expandTreeNode.
+  // An active-path node stays expanded (live work visible) — collapsing it is a
+  // benign no-op render-wise.
   const onToggle = (n: TreeNode) => {
-    switch (toggleDecision(n)) {
-      case "collapse":
-        collapseTreeNode(n.id, pinnedIds());
-        break;
-      case "expand":
-        void expandTreeNode(n.id);
-        break;
-      // "none": a leaf or a node with no descendants — no-op.
+    if (isNodeExpanded(n.id)) {
+      setUserNodeExpanded(n.id, false);
+      return;
+    }
+    setUserNodeExpanded(n.id, true);
+    if (treeChildrenOf(n.id).length === 0 && ((n.descendantCount ?? 0) > 0 || n.childCount > 0)) {
+      void expandTreeNode(n.id);
     }
   };
 

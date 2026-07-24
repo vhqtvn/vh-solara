@@ -67,7 +67,11 @@ export function TreeRow(props: TreeRowProps) {
   // NOT a leaf — it shows a chevron + the "▸ N" badge.
   const isLeaf = () => node().childCount === 0;
   const hasDescendants = () => (node().descendantCount ?? 0) > 0;
-  const collapsed = () => !node().loaded && hasDescendants();
+  // Flood fix: the "▸ N" badge keys off the RENDER-expanded prop (are children
+  // currently rendered?), NOT `node.loaded` (are children resident in the map?).
+  // Under the render-gate model a node can be loaded:true but UI-collapsed — it
+  // MUST still show the badge so the user sees it has hidden children to open.
+  const collapsed = () => !props.expanded && hasDescendants();
   const chip = () => agentDisplay(node().agent);
 
   return (

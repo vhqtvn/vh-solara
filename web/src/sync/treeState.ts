@@ -27,6 +27,7 @@ import {
   type TreeFlatMap,
   type TreeOp,
 } from "./treeMap";
+import { activePathIds } from "./treeSelectors";
 
 // Module-authority flat map. Mutated IN PLACE by the mutators; the `version`
 // signal is what notifies Solid (the "mutable + version" pattern). Readers MUST
@@ -39,6 +40,58 @@ const [version, setVersion] = createSignal(0);
 const bump = (): void => {
   setVersion((v) => (v + 1) & 0x3fffffff);
 };
+
+// ---- user expand-state (IN-MEMORY UI toggle) — flood fix --------------------
+// Separate UI expand-state from map-presence: a node's children STAY in the
+// flat map (instant expand, no round-trip) but only RENDER when (a) the node is
+// on an ACTIVE PATH (auto-expanded via activePathIds), or (b) the user explicitly
+// expanded it (this `userExpanded` set).
+//
+// This is IN-MEMORY session state, NOT persisted to localStorage. The design doc
+// (§11) allows persisting UI state like expand toggles, but persistence clashes
+// with the cold-load frontier (§5): on reload the server ships a node COLLAPSED
+// (its children not resident), yet a persisted "expanded" toggle would claim it
+// open. That half-state (expanded toggle, no resident children) inverts the
+// toggle's meaning on the first post-reload click (the reload-does-not-flatten
+// symptom d contract). Keeping userExpanded in-memory means a fresh load starts
+// collapsed except active paths — the desired default. Within a session the
+// toggle survives every tree mutation (it is a separate signal); only a full
+// reload clears it (re-seeded to collapsed by the server frontier).
+const [userExpanded, setUserExpandedSig] = createSignal<Set<string>>(new Set());
+
+// Version-keyed cache: activePathIds scans the whole map, so memoize it per tree
+// version (once per mutation) rather than recomputing on every isNodeExpanded()
+// call across all rendered rows. Reading `version()` inside isNodeExpanded
+// subscribes the caller's reactive scope to tree mutations — the same
+// tracked-accessor pattern as treeMap()/treeNode() (which also `void version()`).
+let activePathCache: { v: number; set: Set<string> } | null = null;
+
+// Reactive: is `id` currently expanded in the RENDER (children rendered)?
+// True iff on the active path OR user-expanded. Collapsing an active-path node
+// is a benign no-op here (it stays expanded) — live work must stay visible.
+export function isNodeExpanded(id: string): boolean {
+  const v = version();
+  if (activePathCache === null || activePathCache.v !== v) {
+    activePathCache = { v, set: activePathIds(map) };
+  }
+  return activePathCache.set.has(id) || userExpanded().has(id);
+}
+
+// User toggled a node open/closed. Adds/removes from the in-memory UI set; does
+// NOT touch the flat map and does NOT flip `loaded` (that is the §8.4
+// fetch-collapse's job, a different mechanism).
+export function setUserNodeExpanded(id: string, open: boolean): void {
+  const next = new Set(userExpanded());
+  if (open) next.add(id);
+  else next.delete(id);
+  setUserExpandedSig(next);
+}
+
+// Test reset: clear the in-memory toggle (mirrors the fresh-load default).
+export function resetExpandedForTest(): void {
+  setUserExpandedSig(new Set<string>());
+  activePathCache = null;
+}
 
 // ---- tracked accessors ------------------------------------------------------
 // Each reads `version()` first to subscribe, then reads the live map. Because
@@ -111,6 +164,12 @@ export function removeTreeNode(id: string): void {
 // placeholder node (which still carries its own display data, §3), flip
 // loaded:false. Does NOT round-trip to the server.
 //
+// NOTE: this is the FETCH-collapse primitive (§8.4), a DIFFERENT mechanism from
+// the user expand/collapse render gate (isNodeExpanded/setUserNodeExpanded
+// above). The UI onToggle no longer routes through here — it toggles the
+// `userExpanded` UI state and the render gate decides whether children render.
+// This fn stays as the library primitive (e.g. server-driven collapse, tests).
+//
 // `protectedIds` (optional): pinned-node membership — pinned descendants are
 // kept resident so the Pinned group keeps rendering them after an ancestor
 // collapse (pin-parity fix). Passed through to the pure collapseNode.
@@ -135,8 +194,15 @@ export function patchTreeAgent(id: string, agent: string): void {
   bump();
 }
 
-// Clear the whole tree (project switch / epoch change / test reset).
+// Clear the whole tree (project switch / epoch change / test reset). Also
+// clears the in-memory expand state so a project switch does NOT carry stale
+// user toggles forward and tests do not bleed across cases (reviewer advisory
+// tier1_a-F1/tier1_c-F2): `userExpanded` is IN-MEMORY only (not persisted), so a
+// plain reset restores the fresh-load collapsed default; the activePath memo is
+// invalidated so the next isNodeExpanded() read recomputes against the new map.
 export function resetTreeStore(): void {
   map = new Map();
+  setUserExpandedSig(new Set<string>());
+  activePathCache = null;
   bump();
 }

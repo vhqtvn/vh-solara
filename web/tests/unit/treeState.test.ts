@@ -17,6 +17,9 @@ import {
   treeChildrenOf,
   treeNode,
   treeRoots,
+  isNodeExpanded,
+  setUserNodeExpanded,
+  resetExpandedForTest,
 } from "../../src/sync/treeState";
 import type { TreeNode } from "../../src/sync/treeMap";
 
@@ -239,5 +242,154 @@ describe("treeState recency ordering (newest updatedMs first) — P0-WEB-001", (
     expect(treeRoots().map((n) => n.id)).toEqual(["b", "a"]);
     applyTreeOpStore({ op: "node.upsert", data: { node: node({ id: "a", updatedMs: 300 }) } });
     expect(treeRoots().map((n) => n.id)).toEqual(["a", "b"]);
+  });
+});
+
+// isNodeExpanded — the reactive render-gate accessor (flood fix). A node renders
+// its resident children iff it is on the ACTIVE PATH (busy/pendingInput
+// descendant) OR explicitly user-expanded. Children STAY in the flat map either
+// way (instant expand, no round-trip); this only gates RENDER. node env (no
+// localStorage) — persistence is covered by the jsdom render-gate test.
+describe("treeState isNodeExpanded — reactive active-path ∪ userExpanded (flood fix)", () => {
+  beforeEach(() => {
+    resetTreeStore();
+    resetExpandedForTest();
+  });
+
+  it("default: a freshly-seeded idle tree is fully collapsed (no node expanded)", () => {
+    seedTreeStore([
+      node({ id: "root", childCount: 2, descendantCount: 2 }),
+      node({ id: "c1", parentId: "root" }),
+      node({ id: "c2", parentId: "root" }),
+    ]);
+    expect(isNodeExpanded("root")).toBe(false);
+    expect(isNodeExpanded("c1")).toBe(false);
+  });
+
+  it("a node on the active path (busy descendant) IS expanded; idle siblings are NOT", () => {
+    seedTreeStore([
+      node({ id: "R", childCount: 3, descendantCount: 3 }),
+      node({ id: "A", parentId: "R" }),
+      node({ id: "BUSY", parentId: "A", activity: "busy" }),
+      node({ id: "SIB", parentId: "R" }),
+    ]);
+    expect(isNodeExpanded("R")).toBe(true); // ancestor of BUSY
+    expect(isNodeExpanded("A")).toBe(true); // ancestor of BUSY
+    expect(isNodeExpanded("BUSY")).toBe(true); // active itself (it has no children but the gate is inclusive)
+    expect(isNodeExpanded("SIB")).toBe(false); // idle sibling, not on the chain
+  });
+
+  it("a pendingInput descendant puts its ancestor chain on the active path", () => {
+    seedTreeStore([
+      node({ id: "R" }),
+      node({ id: "X", parentId: "R" }),
+      node({ id: "PIN", parentId: "X", flags: { ...node().flags, pendingInput: true } }),
+    ]);
+    expect(isNodeExpanded("R")).toBe(true);
+    expect(isNodeExpanded("X")).toBe(true);
+  });
+
+  it("setUserNodeExpanded(true) opens an idle node; (false) closes it again", () => {
+    seedTreeStore([
+      node({ id: "root", childCount: 2, descendantCount: 2 }),
+      node({ id: "c1", parentId: "root" }),
+      node({ id: "c2", parentId: "root" }),
+    ]);
+    expect(isNodeExpanded("root")).toBe(false);
+    setUserNodeExpanded("root", true);
+    expect(isNodeExpanded("root")).toBe(true);
+    setUserNodeExpanded("root", false);
+    expect(isNodeExpanded("root")).toBe(false);
+  });
+
+  // CRUX (render gate, not map drop): collapsing an idle node via
+  // setUserNodeExpanded(false) must NOT drop its children from the flat map.
+  // (The OLD fetch-collapse did; the new UI toggle must not.) The children stay
+  // resident so a re-expand is instant.
+  it("user-collapse keeps resident children in the flat map (render gate, not map drop)", () => {
+    seedTreeStore([
+      node({ id: "root", childCount: 1, loaded: true }),
+      node({ id: "child", parentId: "root" }),
+    ]);
+    setUserNodeExpanded("root", true);
+    expect(isNodeExpanded("root")).toBe(true);
+    expect(treeChildrenOf("root").map((n) => n.id)).toEqual(["child"]);
+
+    setUserNodeExpanded("root", false);
+    expect(isNodeExpanded("root")).toBe(false); // render-collapsed
+    // But the child is STILL resident — the map was not touched.
+    expect(treeNode("child")).toBeDefined();
+    expect(treeChildrenOf("root").map((n) => n.id)).toEqual(["child"]);
+  });
+
+  // A node on the active path stays expanded even if the user "collapses" it:
+  // collapsing an active-path node is a benign no-op render-wise (live work
+  // stays visible). setUserNodeExpanded(false) removes the user toggle, but the
+  // active-path union keeps it open.
+  it("collapsing an active-path node is a benign no-op (stays expanded)", () => {
+    seedTreeStore([
+      node({ id: "R" }),
+      node({ id: "BUSY", parentId: "R", activity: "busy" }),
+    ]);
+    expect(isNodeExpanded("R")).toBe(true); // active path
+    setUserNodeExpanded("R", false); // user tries to collapse
+    expect(isNodeExpanded("R")).toBe(true); // still expanded (active path wins)
+  });
+
+  it("reactivity: a memo over isNodeExpanded recomputes when the user toggles", () => {
+    const dispose = createRoot((dispose) => {
+      seedTreeStore([node({ id: "root", childCount: 1 }), node({ id: "c", parentId: "root" })]);
+      const open = createMemo(() => isNodeExpanded("root"));
+      expect(open()).toBe(false);
+      setUserNodeExpanded("root", true);
+      expect(open()).toBe(true);
+      setUserNodeExpanded("root", false);
+      expect(open()).toBe(false);
+      return dispose;
+    });
+    dispose();
+  });
+
+  it("reactivity: a memo recomputes when a facet flips a descendant busy (active path appears)", () => {
+    const dispose = createRoot((dispose) => {
+      seedTreeStore([
+        node({ id: "R", childCount: 1 }),
+        node({ id: "C", parentId: "R", activity: "idle" }),
+      ]);
+      const open = createMemo(() => isNodeExpanded("R"));
+      expect(open()).toBe(false); // idle
+      applyTreeOpStore({ op: "node.facet", data: { id: "C", activity: "busy" } });
+      expect(open()).toBe(true); // C now busy → R on active path
+      return dispose;
+    });
+    dispose();
+  });
+
+  // CONFORMANCE (reviewer advisory tier1_a-F1/tier1_c-F2): resetTreeStore (project
+  // switch / epoch change / test reset) MUST clear the in-memory userExpanded
+  // toggle and invalidate the activePath memo, so a project switch does not carry
+  // stale expand toggles and tests do not bleed. Before the fix, resetTreeStore
+  // only wiped the map and left userExpanded intact, so a re-seed of the SAME
+  // idle tree would still render the stale user toggle as expanded.
+  it("resetTreeStore clears user expand state (no bleed across project switch / tests)", () => {
+    // A non-active (idle) tree: only a USER toggle would expand root.
+    seedTreeStore([
+      node({ id: "root", childCount: 1 }),
+      node({ id: "c", parentId: "root" }),
+    ]);
+    setUserNodeExpanded("root", true);
+    expect(isNodeExpanded("root")).toBe(true); // user-expanded
+
+    resetTreeStore(); // project switch / epoch change
+
+    // resetTreeStore wipes the map, so re-seed the SAME minimal non-active tree
+    // to probe the expand signal in isolation. The user toggle must NOT survive
+    // the reset — root is idle (no active path) and the user toggle is gone, so
+    // isNodeExpanded("root") is false again (the fresh-load collapsed default).
+    seedTreeStore([
+      node({ id: "root", childCount: 1 }),
+      node({ id: "c", parentId: "root" }),
+    ]);
+    expect(isNodeExpanded("root")).toBe(false);
   });
 });

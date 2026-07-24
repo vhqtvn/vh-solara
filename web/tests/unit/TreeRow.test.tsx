@@ -245,6 +245,30 @@ describe("TreeRow '▸ N' descendant badge (§3 descendantCount)", () => {
     ));
     expect(nodeButton(container as unknown as HTMLElement).querySelector(".tree-count")).toBeNull();
   });
+
+  // FLOOD FIX: the badge must key off the RENDER-expanded prop, NOT node.loaded.
+  // Under the new render-gate model a node can be loaded:true (children resident
+  // in the flat map) but render-COLLAPSED (not on the active path, not user-
+  // expanded). Such a node MUST still show the "▸ N" twisty badge so the user
+  // knows it has children to expand. The old `!node.loaded` rule hid the badge
+  // for every loaded node — which is exactly why a loaded coordinator flooded the
+  // sidebar with its children instead of showing a collapsed badge.
+  it("shows the badge on a LOADED node when expanded={false} (render-collapsed) [flood fix]", () => {
+    const { container } = render(() => (
+      <TreeRow node={baseNode({ loaded: true, childCount: 3, descendantCount: 9 })} depth={0} selected={false} expanded={false} onSelect={() => {}} onToggle={() => {}} />
+    ));
+    const badge = nodeButton(container as unknown as HTMLElement).querySelector(".tree-count");
+    expect(badge).not.toBeNull();
+    expect(badge?.textContent).toContain("▸");
+    expect(badge?.textContent).toContain("9");
+  });
+
+  it("does NOT show the badge on a LOADED node when expanded={true} (children rendered)", () => {
+    const { container } = render(() => (
+      <TreeRow node={baseNode({ loaded: true, childCount: 3, descendantCount: 9 })} depth={0} selected={false} expanded={true} onSelect={() => {}} onToggle={() => {}} />
+    ));
+    expect(nodeButton(container as unknown as HTMLElement).querySelector(".tree-count")).toBeNull();
+  });
 });
 
 describe("TreeRow interactions (callbacks, no store)", () => {

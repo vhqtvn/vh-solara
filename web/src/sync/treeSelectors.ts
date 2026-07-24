@@ -84,3 +84,54 @@ export function selectSearchResults(
   });
   return matches;
 }
+
+// Active-path render gate (flood fix). Returns the set of node ids that are on
+// an ACTIVE PATH: the inclusive ancestor chain (root → ... → node) of ANY node
+// that is itself active — per §5.1 (the precise active-path definition), which
+// the server's authoritative `isActiveLocked` implements at
+// pkg/state/tree_emitter.go:200-212. Such nodes are auto-expanded by the render
+// gate so live work / pending-input branches stay visible WITHOUT requiring a
+// user toggle (and WITHOUT a server fetch — §5 guarantees the active path ships
+// resident).
+//
+// A node with no active descendant (and not itself active) is NOT in the set, so
+// an idle many-child parent collapses to its "▸ N" twisty even though its
+// children stay resident in the flat map — this is exactly the flood fix.
+//
+// PURE: takes the map, returns a fresh Set. Depth-capped defensively against a
+// corrupt parentId cycle (mirrors hasPinnedAncestor's guard). A node with no
+// active descendant is never added; idle siblings of the active chain are not.
+
+// §5.1 active-path seed — MIRRORS the server's authoritative isActiveLocked
+// (pkg/state/tree_emitter.go:200-212) line-for-line. NOTE: `flags.permission` is
+// currently REDUNDANT in live data (Permission:true ⟹ PendingInput:true because
+// pendingInputSelfLocked counts perms — pkg/state/subtree_indexes.go:178-183),
+// and archived nodes are not resident client-side today (cascade-deleted server-
+// side + eagerly dropped), so both arms produce ZERO behavior change against
+// current data. Mirroring the server predicate exactly removes any client↔server
+// divergence surface and future-proofs both cases (commit-reviewer tier1_b-F1).
+function nodeSeedsActivePath(n: TreeNode): boolean {
+  if (n.flags.archived) return false; // §5.1 Q1: archived NEVER seeds
+  return (
+    n.activity !== "idle" || // busy | retry | error (Activity has no 5th state)
+    n.flags.permission ||
+    n.flags.pendingInput
+  );
+}
+
+export function activePathIds(map: TreeFlatMap): Set<string> {
+  const out = new Set<string>();
+  for (const n of map.values()) {
+    if (nodeSeedsActivePath(n)) {
+      // Walk the parentId chain upward from the active node, adding every
+      // ancestor inclusive. Depth-capped: a corrupt cycle terminates instead of
+      // looping forever (cur becomes undefined when the id is not in the map).
+      let cur: string | undefined = n.id;
+      for (let i = 0; i < 10000 && cur != null; i++) {
+        out.add(cur);
+        cur = map.get(cur)?.parentId ?? undefined;
+      }
+    }
+  }
+  return out;
+}
