@@ -766,7 +766,7 @@ func (e *TreeEmitter) onQuestionLocked(ev ClientEvent, set bool) []TreeOp {
 	// return — the shipped node.upserts carry the correct pendingInput /
 	// subtreeNeedsInput flags, so the ancestor walk below is redundant for this
 	// case. Gated on !e.known so the known-node facet + ancestor-walk path
-	// (including the 4751c11 unmaterialized-intermediate semantics) is unchanged,
+	// (including the 4751c71 unmaterialized-intermediate semantics) is unchanged,
 	// and an unknown-node clear still falls through to the original ancestor
 	// walk (keeping known ancestors' subtreeNeedsInput fresh on clear).
 	if !e.known[p.SessionID] && set && isActiveLocked(s, p.SessionID) {
