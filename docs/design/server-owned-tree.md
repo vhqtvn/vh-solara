@@ -1,5 +1,14 @@
 # Server-Owned Session Tree — Phase 1 Design (rev. 1 — post-review)
 
+> **STATUS: SHIPPED.** Phases 1–4 are complete (HEAD `a0e825c`); `tree=2` is the
+> sole client+server path. The `proj=1` projection described in this document is
+> **DELETED** — server side in Phase 4 commit `a0e825c`, client side in Phase 3
+> Step C commit `4b04999`. This spec is retained as the **historical design
+> record** for the server-owned-tree model; the `proj=1`/projection machinery
+> described in §2 and the per-phase delete inventories (§10.3, §12) describe code
+> that no longer exists, not live code. The design reasoning is kept intact as
+> the record.
+
 **Status:** Phase 1 DESIGN DOC ONLY. Read-only research + design. No code.
 **Baseline HEAD:** `52a3fd0` (verified `git rev-parse --short HEAD`).
 **Working tree note:** at baseline the tree was NOT clean — 9 pre-existing
@@ -109,6 +118,12 @@ entirely, so these cannot recur.
 ---
 
 ## 2. Current-path reconnaissance
+
+> **HISTORICAL — describes the baseline (`52a3fd0`) state.** The projection,
+> demotion, and `proj=1` machinery mapped here was deleted in Phases 3–4
+> (commits `4b04999` / `a0e825c`); none of it exists in the shipped `tree=2`
+> code. This section is the as-written recon of the pre-rewrite tree, kept as
+> the record that motivated the delete.
 
 The precise map of what exists today. (Phase 4 delete targets are flagged
 **[DELETE-P4]**; Phase 3 client delete targets **[DELETE-P3]**.)
@@ -1116,6 +1131,10 @@ never computes orphan status (§7.3).
 
 ### 10.3 Phase 4 cutover / delete plan
 
+> **DONE — executed in Phase 4 (commit `a0e825c`).** `tree=2` is now the sole
+> path; the `proj=1`/projection machinery targeted below was deleted. The items
+> below are the historical delete plan as executed, not a pending TODO.
+
 Once all deployed clients send `tree=2`:
 
 1. Remove `wantsProject` and the `SnapshotProjected`/`SnapshotBranch` call sites
@@ -1224,6 +1243,10 @@ reveal-gate fix, pins/selection/search, `web/src/lib/streamMd.ts` and
 `web/src/components/Part.tsx` (**permanent keep-out**, §top).
 
 ### 12.3 Phase 4 — delete old projection/materialization
+
+> **DONE — executed in Phase 4 (commit `a0e825c`).** Every deletion listed below
+> was carried out; the files/symbols named no longer exist in the tree. Retained
+> as the executed delete inventory (the historical record), not a pending TODO.
 
 **DELETE [DELETE-P4]:**
 - `pkg/state/projection.go` (whole file — §2.2).
