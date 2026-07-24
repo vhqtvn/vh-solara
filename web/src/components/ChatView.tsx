@@ -20,7 +20,7 @@ import { createQueueDrainer } from "../queueDrain";
 import { historyAt, historyLen, pushHistory } from "../history";
 import { type AcItem, commandSuggestions, fileSuggestions } from "../lib/complete";
 import { harvestPastedFiles } from "../lib/paste";
-import { isSendInFlight, runSendSingleFlight } from "../lib/sendSingleFlight";
+import { IGNORED, isSendInFlight, runSendSingleFlight } from "../lib/sendSingleFlight";
 import ModelDialog from "./ModelDialog";
 import PartView, { ActivityGroup } from "./Part";
 import { Deferred } from "./Deferred";
@@ -263,11 +263,17 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // POST for this session is pending (up to 12s on a slow/hung network), NOT
   // while an agent turn or queue dispatch is running. Drives the Send button's
   // `disabled` + the sending animation so the operator sees the tap register
-  // immediately and re-taps are dropped (per-session single-flight). Keyed by
-  // the live session id (the guard in send() engages under the id returned by
-  // ensureSession, which for a live session === props.sessionId). See
-  // lib/sendSingleFlight.ts — sendText must NOT touch the sync store's
-  // setSending (it would stall the drain effect), so this is a separate signal.
+  // immediately and re-taps are dropped (per-session single-flight).
+  //
+  // Keying: for a LIVE session the memo reads the live id (=== props.sessionId)
+  // and the guard in send() engages that same id. For a DRAFT (props.sessionId
+  // === "") the memo reads "draft" — and because the live id isn't known until
+  // ensureSession() resolves, send() ALSO engages "draft" synchronously at tap
+  // time (wrapping ensureSession in runSendSingleFlight("draft", …)) so the
+  // draft button pulses the INSTANT Send is tapped, then transitions to the
+  // live id for the enqueue (see send()). See lib/sendSingleFlight.ts —
+  // sendText must NOT touch the sync store's setSending (it would stall the
+  // drain effect), so this is a separate signal.
   const sendInFlight = createMemo(() => isSendInFlight(props.sessionId || "draft"));
   // Whether send() can resolve an agent + model right now — the single hinge for
   // the disabled Send button AND the send() guard. agents() must be loaded
@@ -1849,7 +1855,34 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     // /undo /redo only make sense for an existing session.
     if (!props.draft && text === "/undo") { setInput(""); return void undo(); }
     if (!props.draft && text === "/redo") { setInput(""); return void redo(); }
-    const id = await ensureSession();
+    // Resolve the target session id. For a DRAFT this is the createSession POST,
+    // which can lag — and the draft composer's sendInFlight memo reads
+    // isSendInFlight("draft") (props.sessionId is ""), NOT the live id the
+    // enqueue below engages. Without engaging "draft" here the draft Send button
+    // shows no feedback during that lag (the bug: pulse/disabled only appeared
+    // once the live id was known, i.e. after the draft→live unmount). So for a
+    // draft, wrap ensureSession in a "draft"-keyed single-flight:
+    //   (a) the guard marks "draft" in-flight SYNCHRONOUSLY, before the await —
+    //       the draft button pulses + disables on the same tap, before the live
+    //       id is known / before backend custody;
+    //   (b) a re-tap during the createSession POST is dropped here (IGNORED)
+    //       instead of spawning a parallel createSession.
+    // The guard releases "draft" in finally as soon as ensureSession resolves —
+    // by then the draft ChatView is unmounting (createSession → setSelectedId)
+    // and the live view's memo reads the live id, so holding "draft" longer
+    // would only risk a NEW draft inheriting this send's in-flight state
+    // (per-session invariant). The enqueue tail below then engages the LIVE id
+    // via runSendSingleFlight(id, …), which the live view's memo reads. For a
+    // LIVE session ensureSession returns props.sessionId synchronously — no
+    // draft-key wrapper needed (the memo already reads that id).
+    let id: string | null;
+    if (props.draft) {
+      const r = await runSendSingleFlight("draft", ensureSession);
+      if (r === IGNORED) return; // re-tap during createSession dropped; in-flight send owns the composer
+      id = r; // string | null (null = createSession failed)
+    } else {
+      id = await ensureSession();
+    }
     if (!id) {
       setInput(text); // session creation failed; keep the text for retry
       return;
@@ -1895,11 +1928,16 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     // feedback and re-taps Send, each re-tap spawning a PARALLEL enqueue that
     // lands as a duplicate once the network settles. runSendSingleFlight drops
     // re-taps while one enqueue is in-flight for this session (keyed by the
-    // live session id) and engages SYNCHRONOUSLY here so the Send button
-    // disables + the sending animation shows IMMEDIATELY (before backend
-    // custody confirms). The guard releases in finally on BOTH success and
-    // failure so a genuine retry still works after a timeout. Distinct from
-    // `sending` (the dispatch guard) — see lib/sendSingleFlight.ts.
+    // live session id). For a LIVE session this is ALSO the synchronous tap-time
+    // engagement (the memo reads this id, so the Send button disables + the
+    // animation shows IMMEDIATELY, before backend custody confirms). For a DRAFT
+    // the tap-time pulse is already provided by the "draft"-keyed wrapper above
+    // (the live id isn't known until ensureSession resolves); this inner guard
+    // then engages the live id so the LIVE ChatView — mounted after the
+    // draft→live transition — keeps showing the sending state, and a re-tap
+    // during the enqueue is dropped. The guard releases in finally on BOTH
+    // success and failure so a genuine retry still works after a timeout.
+    // Distinct from `sending` (the dispatch guard) — see lib/sendSingleFlight.ts.
     await runSendSingleFlight(id, async () => {
       const snapText = input();
       const snapAtts = attachments();
