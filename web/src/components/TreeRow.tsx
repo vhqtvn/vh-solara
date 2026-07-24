@@ -141,7 +141,7 @@ export function TreeRow(props: TreeRowProps) {
           // onClick is UNCHANGED: this is a glyph swap, not a new affordance —
           // the guard above still fires onToggle for any expandable node.
           <span class="twisty-running">
-            <Icon name="filter" size={12} />
+            <Icon name="filtered" size={12} />
           </span>
         ) : (
           // Expandable tree node: the chevron, wrapped in the open/not-open span

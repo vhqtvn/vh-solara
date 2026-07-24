@@ -515,17 +515,17 @@ describe("TreeRow subtreeBusy spinner (P1-B, tree=2 UI parity)", () => {
 // chevron; clicking a busy expandable node's funnel still toggles (the funnel is
 // a glyph swap, not a new affordance).
 describe("TreeRow twisty running funnel (P1, port from proj=1)", () => {
-  it("renders the funnel (.twisty-running > filter icon) for a busy EXPANDABLE node", () => {
+  it("renders the running marker (.twisty-running > filtered icon) for a busy EXPANDABLE node", () => {
     const { container } = render(() => (
       <TreeRow node={baseNode({ activity: "busy", childCount: 2 })} depth={0} selected={false} expanded={false} onSelect={() => {}} onToggle={() => {}} />
     ));
     const t = twisty(container as unknown as HTMLElement);
     const running = t.querySelector("span.twisty-running");
     expect(running).not.toBeNull();
-    // The funnel glyph is the `filter` icon — pin its exact path so a wrong
+    // The running marker glyph is the `filtered` icon — pin its exact path so a wrong
     // icon can't pass as "some svg inside the span".
     const path = running?.querySelector("svg.icon path");
-    expect(path?.getAttribute("d")).toBe("M4 5h16l-6 8v6l-4-2v-4z");
+    expect(path?.getAttribute("d")).toBe("M6 5v14M6 8h11M6 12h5M6 16h11");
     // The twisty must NOT carry the dimmed `leaf` class (funnel renders at full
     // --accent, not dimmed like the noChild terminal marker).
     expect(t.classList.contains("leaf")).toBe(false);

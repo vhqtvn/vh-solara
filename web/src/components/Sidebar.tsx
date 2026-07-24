@@ -124,7 +124,7 @@ export default function Sidebar(props: { open: boolean; onClose: () => void }) {
           aria-label="Search sessions"
           aria-pressed={searchOpen() || !!searchQuery()}
         >
-          <Icon name="filter" />
+          <Icon name="filtered" />
         </button>
         <button type="button" class="icon-btn" onClick={() => void newSession()} data-tip="New session" aria-label="Create session">
           <Icon name="plus" />
@@ -184,7 +184,7 @@ export default function Sidebar(props: { open: boolean; onClose: () => void }) {
       </div>
       <Show when={searchOpen() || searchQuery()}>
         <div class="session-search">
-          <Icon name="filter" size={13} />
+          <Icon name="filtered" size={13} />
           <input
             type="text"
             class="session-search-input"
