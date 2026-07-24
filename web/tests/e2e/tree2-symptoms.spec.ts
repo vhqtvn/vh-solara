@@ -17,12 +17,14 @@ import { projectUrl } from "./util";
 //  (e) an archived session does NOT ghost (disappears via node.remove)
 
 // Helper: wait for the shared fixture to settle. At cold start there are NO
-// spinners (no sessions are busy), so checking spinner-count alone would pass
-// before the tree snapshot even arrives via SSE. First wait for the tree to
-// populate (at least one .tree-row), THEN check for no running sessions.
+// busy sessions, so checking busy-count alone would pass before the tree snapshot
+// even arrives via SSE. First wait for the tree to populate (at least one
+// .tree-row), THEN check for no running sessions. The shimmering .tree-spinner is
+// gone (proj=1 4-state model); the sole busy signal is now the pulsing ring
+// (.tree-twisty.running), so that is the "settled" signal we wait on.
 async function waitForTreeSettled(page: import("@playwright/test").Page) {
   await expect(page.locator(".tree-row").first()).toBeVisible({ timeout: 15000 });
-  await expect(page.locator(".tree-spinner")).toHaveCount(0, { timeout: 10000 });
+  await expect(page.locator(".tree-twisty.running")).toHaveCount(0, { timeout: 10000 });
 }
 
 // ─── (a) ─────────────────────────────────────────────────────────────────────
@@ -34,13 +36,13 @@ test("(a) first-click an idle collapsed session loads its transcript immediately
   await page.goto(projectUrl("/"));
   await waitForTreeSettled(page);
 
-  // demo is a collapsed root at cold start (loaded:false, has children).
+  // demo is a filtered root at cold start (default mode, has children).
   const demoRow = page.locator(".tree-row", { hasText: "Demo session" });
   await expect(demoRow).toBeVisible();
   // Confirm it has children → the twisty is an "Expand" button (not a leaf).
   await expect(demoRow.locator(".tree-twisty[aria-label='Expand']")).toBeVisible();
-  // Confirm it is idle (no spinner — the symptom is about IDLE collapsed sessions).
-  await expect(demoRow.locator(".tree-spinner")).toHaveCount(0);
+  // Confirm it is idle (no running ring — the symptom is about IDLE sessions).
+  await expect(demoRow.locator(".tree-twisty.running")).toHaveCount(0);
 
   // Click the row body (NOT the twisty) — this opens the chat, not the tree.
   await demoRow.locator(".tree-node").click();
@@ -129,19 +131,23 @@ test("(c) a collapsed node shows its agent chip and is right-clickable", async (
 // server re-ships the frontier snapshot on reconnect; the client re-applies it.
 // Structure is always authoritative from the server, never re-inferred locally.
 //
-// P1-A (commit 9a6dd97) STRENGTHENED this contract: the user's EXPAND state is
-// now persisted to localStorage (vh.tree.expanded.v1) and rehydrated on load, so
-// an expanded node STAYS expanded across reload (the directive: "expand a node,
-// reload → it stays expanded; tree structure still re-fetched"). This test was
-// updated from the old "demo collapses on reload → Expand twisty" assertion to
-// the new stronger one: reload preserves BOTH structure AND user expansion.
+// P1-A (commit 9a6dd97) STRENGTHENED this contract: the user's expand state is
+// persisted to localStorage and rehydrated on load, so an expanded node STAYS
+// expanded across reload (the directive: "expand a node, reload → it stays
+// expanded; tree structure still re-fetched"). proj=1 4-state model (commit
+// a7f1f93) re-expressed that as a per-node persisted MODE under
+// `vh.tree.mode.v2` (collapsed | filtered | expanded); the legacy
+// `vh.tree.expanded.v1` Set is retained read-only for one-time migration only.
+// This test asserts the same stronger contract: reload preserves BOTH structure
+// AND the user's expanded mode.
 //
 // The core NO-FLATTEN invariant is guarded by the inverted assertion below: if
-// persistence broke (demo collapsed), `sub` would NOT be visible post-reload and
-// the `toBeVisible` would fail. And `sub` must NEVER appear as a flat root
-// (`:not(.sub)` count 0) — the structure is server-owned, never re-inferred. The
-// dedicated unit test tree2NoFlatten.test.ts pins that the structure MAP is
-// never persisted (only userExpanded is), so a reload can't flatten the tree.
+// persistence broke (demo reloaded to the default filtered), `sub` would NOT be
+// visible post-reload and the `toBeVisible` would fail. And `sub` must NEVER
+// appear as a flat root (`:not(.sub)` count 0) — the structure is server-owned,
+// never re-inferred. The dedicated unit test tree2NoFlatten.test.ts pins that the
+// structure MAP is never persisted (only the per-node MODE is), so a reload can't
+// flatten the tree.
 test("(d) reload does not flatten the tree — structure preserved from the frontier", async ({ page }) => {
   await page.goto(projectUrl("/"));
   await waitForTreeSettled(page);
@@ -151,13 +157,16 @@ test("(d) reload does not flatten the tree — structure preserved from the fron
   await demoRow.locator(".tree-twisty").click();
   await expect(page.locator(`.tree-node.sub[data-session-id="sub"]`)).toBeVisible({ timeout: 8000 });
 
-  // Reload. P1-A persists userExpanded → demo STAYS expanded, so sub STAYS
-  // visible as a child. This is the inverted no-flatten guard: if persistence
-  // were broken (demo collapsed), sub would disappear and this would fail.
+  // Reload. The persisted mode (vh.tree.mode.v2) rehydrates demo as "expanded",
+  // so sub STAYS visible as a child. This is the inverted no-flatten guard: if
+  // persistence were broken (demo reloaded to the default filtered), sub would
+  // disappear and this would fail. (The cold frontier ships demo loaded:false; a
+  // persisted-expanded node is BACKFILLED — its children re-fetched after the
+  // seed — so sub re-lands via a node.children op within the wait below.)
   await page.reload();
   await waitForTreeSettled(page);
 
-  // demo is still a root and still EXPANDED (Collapse twisty = persistence held).
+  // demo is still a root and still EXPANDED (Collapse twisty = mode rehydrated).
   const demoRowAfter = page.locator(".tree-row", { hasText: "Demo session" });
   await expect(demoRowAfter).toBeVisible();
   await expect(demoRowAfter.locator(".tree-twisty[aria-label='Collapse']")).toBeVisible();

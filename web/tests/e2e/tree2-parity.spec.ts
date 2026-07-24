@@ -18,10 +18,12 @@ import { projectUrl } from "./util";
 // fixture state the other specs rely on.
 
 // Mirrors tree2-symptoms.spec.ts: wait for the tree to populate (at least one
-// .tree-row) and for no spinners (no busy sessions) before asserting.
+// .tree-row) and for no busy sessions before asserting. The shimmering
+// .tree-spinner is gone (proj=1 4-state model); the sole busy signal is now the
+// pulsing ring (.tree-twisty.running), so that is the "settled" signal we wait on.
 async function waitForTreeSettled(page: import("@playwright/test").Page) {
   await expect(page.locator(".tree-row").first()).toBeVisible({ timeout: 15000 });
-  await expect(page.locator(".tree-spinner")).toHaveCount(0, { timeout: 10000 });
+  await expect(page.locator(".tree-twisty.running")).toHaveCount(0, { timeout: 10000 });
 }
 
 // ─── pins ────────────────────────────────────────────────────────────────────
@@ -60,40 +62,43 @@ test("(pins) a pinned NON-ROOT session is hoisted to the pinned group and dedup'
   await expect(page.locator(`.tree-node[data-session-id="sub"]:not(.tree-pinned *)`)).toHaveCount(0);
 });
 
-// ─── pins re-expand (c_F1, re-expressed under the render-gate model) ──────────
+// ─── pins re-expand (c_F1, re-expressed under the proj=1 4-state model) ───────
 // Bug c_F1 (the protectedIds pin-parity hook): collapsing a parent that has a
 // PINNED descendant kept the descendant resident in the flat map, and the OLD
 // onToggle ("has resident children → collapse") was ALWAYS true → the user could
 // collapse but could NEVER re-expand (stuck). The OLD test asserted a re-expand
 // FIRED GET /vh/tree/children?id=demo (proving the expand branch ran at all).
 //
-// NEW MODEL (render gate, flood fix): collapse no longer drops descendants or
-// flips loaded:false — it only hides them from RENDER (a UI toggle). So the
-// pinned descendant STAYS resident, and re-expanding is INSTANT with NO server
-// round-trip. The crux therefore FLIPS: a re-expand must NOT fire a fetch (the
-// child is already in the map). The first expand (cold: child not resident)
-// DOES fetch; the re-expand (child resident) does NOT — that contrast is the
-// proof that the new model is a render gate, not a fetch-collapse.
+// proj=1 4-state MODEL (commit a7f1f93): a mode toggle (collapsed/filtered/
+// expanded) never drops descendants from the flat map — it only gates RENDER. So
+// the pinned descendant STAYS resident, and re-expanding is INSTANT with NO
+// server round-trip. The crux therefore FLIPS: a re-expand must NOT fire a fetch
+// (the child is already in the map). The cold-load LAZY FRONTIER is the one (and
+// only) fetch — a filtered root auto-fetches its children once on mount — so the
+// contrast is "lazy frontier fetched, but collapse→filtered→expanded adds 0".
 test("(pins) re-expanding a parent with a resident pinned descendant does NOT refetch (c_F1, render-gate)", async ({ page }) => {
-  await page.goto(projectUrl("/"));
-  await waitForTreeSettled(page);
-
-  // Count /vh/tree/children?id=demo requests across the whole test.
+  // Attach the listener BEFORE navigation so we capture the cold-load LAZY-
+  // FRONTIER fetch (a filtered root auto-fetches its children once on mount).
   const childrenReqs: string[] = [];
   page.on("request", (req) => {
     const url = req.url();
     if (url.includes("/vh/tree/children") && url.includes("id=demo")) childrenReqs.push(url);
   });
 
+  await page.goto(projectUrl("/"));
+  await waitForTreeSettled(page);
+
   const demoRow = page.locator(".tree-row", { hasText: "Demo session" });
 
-  // FIRST expand: demo's child `sub` is NOT resident at cold load (demo is a
-  // collapsed root), so this MUST fetch. sub arrives and renders in the body.
+  // The lazy frontier fetched demo's child `sub` at cold load (demo is a filtered
+  // root), so sub is already RESIDENT. Expanding demo (filtered → expanded)
+  // reveals sub in the body WITHOUT a new fetch — the first (and only) fetch was
+  // the lazy one captured above.
   await demoRow.locator(".tree-twisty").click();
   const subInTree = page.locator(`.tree-node.sub[data-session-id="sub"]`);
   await expect(subInTree).toBeVisible({ timeout: 8000 });
-  await expect.poll(() => childrenReqs.length).toBeGreaterThan(0); // cold expand fetched
-  const firstExpandReqs = childrenReqs.length;
+  await expect.poll(() => childrenReqs.length).toBeGreaterThan(0); // lazy frontier fetched
+  const baselineReqs = childrenReqs.length;
 
   // Pin sub → hoisted into .tree-pinned (built from the flat map), dedup'd
   // from the tree body.
@@ -103,21 +108,26 @@ test("(pins) re-expanding a parent with a resident pinned descendant does NOT re
   const pinnedSub = page.locator(`.tree-pinned .tree-node[data-session-id="sub"]`);
   await expect(pinnedSub).toBeVisible({ timeout: 5000 });
 
-  // COLLAPSE demo. Under the render-gate model this is setUserNodeExpanded
-  // (UI state) ONLY — sub STAYS resident in the flat map and STAYS hoisted in
-  // .tree-pinned (the c_F1 pin-survives-collapse invariant).
+  // COLLAPSE demo: expanded → collapsed. This is a MODE toggle ONLY — sub STAYS
+  // resident in the flat map and STAYS hoisted in .tree-pinned (the c_F1 pin-
+  // survives-collapse invariant), because the pinned group is built from the flat
+  // map independent of any parent's mode.
   await demoRow.locator(".tree-twisty").click(); // collapse
   await expect(pinnedSub).toBeVisible(); // protected descendant survives
 
-  // RE-EXPAND demo. CRUX: sub is ALREADY resident (the collapse was render-
-  // only), so NO /vh/tree/children fetch fires. (Under the OLD fetch-collapse
-  // model, collapse dropped sub + flipped loaded:false, so re-expand HAD to
-  // refetch — that is what the old test asserted.) Contrast: firstExpandReqs>0
-  // but the re-expand adds 0.
-  await demoRow.locator(".tree-twisty").click(); // re-expand (the crux)
+  // RE-OPEN demo: collapsed → filtered (a revealing mode). CRUX: sub is ALREADY
+  // resident (mode toggles never drop the flat map), so NO /vh/tree/children fetch
+  // fires. (Under the OLD fetch-collapse model, collapse dropped sub + flipped
+  // loaded:false, so re-expand HAD to refetch — that is what the old test
+  // asserted.) pinnedSub stays visible regardless of demo's mode: it is hoisted
+  // into .tree-pinned (built from the flat map, independent of any parent's mode)
+  // and dedup'd from the tree body — so it is the right thing to assert here, not
+  // sub's tree-body row (which is gone while pinned). Contrast: baselineReqs>0 but
+  // the collapse→re-open round-trip adds 0.
+  await demoRow.locator(".tree-twisty").click(); // re-open (collapsed → filtered)
   // Give a buggy refetch a window to fire, then assert none did.
   await page.waitForTimeout(1500);
-  expect(childrenReqs.length).toBe(firstExpandReqs); // NO new fetch
+  expect(childrenReqs.length).toBe(baselineReqs); // NO new fetch
 
   // sub remains pinned (and still hoisted) after the round-trip.
   await expect(pinnedSub).toBeVisible();
