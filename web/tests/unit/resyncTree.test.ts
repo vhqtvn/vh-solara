@@ -21,6 +21,15 @@ import {
   TREE_RESYNC_MIN_GAP_MS,
 } from "../../src/sync/stream";
 import { setProjectDirRaw } from "../../src/sync/store";
+import {
+  seedTreeStore,
+  setUserNodeExpanded,
+  isUserExpanded,
+  treeMap,
+  resetTreeStore,
+} from "../../src/sync/treeState";
+import { switchProject } from "../../src/sync/actions";
+import type { TreeNode } from "../../src/sync/treeMap";
 
 // --- Mock EventSource (mirrors reconcileBusy.test.ts) ---
 // jsdom doesn't implement EventSource. Track construction so we can assert a
@@ -74,6 +83,10 @@ beforeEach(() => {
   (globalThis as unknown as { EventSource: unknown }).EventSource = MockEventSource;
   setProjectDirRaw("/test");
   _resetResyncGateForTest();
+  // The P0-E tests below seed treeState directly; start each test from a clean
+  // flat map + userExpanded so a prior test's seed can't leak (mirrors
+  // treeState.test.ts). The existing EventSource-only tests don't read treeState.
+  resetTreeStore();
 });
 
 afterEach(() => {
@@ -151,5 +164,83 @@ describe("resyncTree — Issue 2 periodic/on-focus tree resync", () => {
     // watchdog). treeESes() still has the one closed instance.
     expect(treeESes()).toHaveLength(1);
     expect(treeESes()[0]).toBe(first);
+  });
+});
+
+// P0-E — resync flash + lost expand state.
+//
+// On every tab-return (visibilitychange) and (formerly) on a 90s periodic timer,
+// resyncTree() → connect(true) used to call resetTreeStore() BEFORE the new
+// snapshot arrived. That WIPED the flat map (empty-frame flash between wipe and
+// the snapshot landing) AND wiped the in-memory userExpanded set (every manual
+// expansion collapsed on each tab-return). The fix: a same-project fresh resync
+// swaps the snapshot ATOMICALLY — seedTreeStore replaces the map in one step
+// (no empty frame) and never touches userExpanded. Only a TRUE project switch
+// (switchProject) clears explicitly.
+describe("resyncTree — P0-E atomic swap (no empty frame, preserve userExpanded)", () => {
+  // Full TreeNode seed (type-safe; mirrors treeState.test.ts node() helper).
+  function node(overrides: Partial<TreeNode> = {}): TreeNode {
+    return {
+      id: "a",
+      parentId: null,
+      title: "A",
+      activity: "idle",
+      childCount: 0,
+      loaded: true,
+      flags: {
+        pendingInput: false,
+        subtreeNeedsInput: false,
+        permission: false,
+        archived: false,
+        orphan: false,
+      },
+      updatedMs: 1,
+      ...overrides,
+    };
+  }
+
+  it("P0-E-1: connect(true) does NOT wipe the flat map (old snapshot survives until the new one lands)", () => {
+    // Pre-seed the store with the prior snapshot's state.
+    seedTreeStore([node({ id: "a" })]);
+    expect(treeMap().size).toBe(1);
+
+    // A same-project fresh resync (connect(true), as resyncTree fires on tab
+    // return) must swap ATOMICALLY: the old map stays visible until the new
+    // tree.snapshot lands via seedTreeStore.
+    connect(true);
+
+    // OLD (buggy): resetTreeStore() wiped the map → size 0 (empty-frame flash
+    // between the wipe and the snapshot arriving). NEW: the map survives
+    // connect(true); only the arriving snapshot replaces it.
+    expect(treeMap().size).toBeGreaterThan(0);
+  });
+
+  it("P0-E-2: connect(true) preserves the in-memory userExpanded set", () => {
+    seedTreeStore([node({ id: "a" })]);
+    setUserNodeExpanded("a", true);
+    expect(isUserExpanded("a")).toBe(true);
+
+    connect(true);
+
+    // OLD (buggy): resetTreeStore() wiped userExpanded → all manual expansions
+    // collapsed on every tab-return / resync. NEW: userExpanded survives; only
+    // a true project switch clears it.
+    expect(isUserExpanded("a")).toBe(true);
+  });
+
+  it("P0-E-3: a TRUE project switch still clears the map + userExpanded (regression guard)", () => {
+    seedTreeStore([node({ id: "a" })]);
+    setUserNodeExpanded("a", true);
+    expect(treeMap().size).toBe(1);
+    expect(isUserExpanded("a")).toBe(true);
+
+    // switchProject early-returns when dir === projectDir(), so use a DIFFERENT
+    // dir than the beforeEach "/test". After the fix switchProject itself calls
+    // resetTreeStore() explicitly (project switch clears; same-project resync
+    // does NOT — atomic swap preserves userExpanded). GREEN on both old and new.
+    switchProject("/other-dir");
+
+    expect(treeMap().size).toBe(0);
+    expect(isUserExpanded("a")).toBe(false);
   });
 });

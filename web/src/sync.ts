@@ -36,7 +36,6 @@ import {
   maybeReconnect,
   tickHealth,
   resyncTree,
-  TREE_RESYNC_INTERVAL_MS,
 } from "./sync/stream";
 import { setSelectedId, switchProject, openSession } from "./sync/actions";
 
@@ -77,14 +76,6 @@ export function startSync() {
   });
   window.addEventListener("online", maybeReconnect);
   window.addEventListener("offline", () => setState("status", "reconnecting"));
-  // Issue 2: periodic tree resync — request a fresh projected snapshot on a
-  // bounded interval so a long-lived tab self-heals drift (ghosts, stale
-  // demotions/stubs, demotion-sweep signals missed by other concurrent streams)
-  // without a manual reload. Cheap (~88 KB compressed; ~3.5 MB/hr at-rest at the
-  // default 90s). resyncTree self-throttles (TREE_RESYNC_MIN_GAP_MS) so this and
-  // the focus trigger below can't burst. This is the existing full-rebuild
-  // reconcile path, NOT the promotion amplifier (one snapshot per interval).
-  window.setInterval(resyncTree, TREE_RESYNC_INTERVAL_MS);
   // Issue 2: on focus return (a backgrounded tab resumes — iOS suspends
   // background sockets → drift accumulates while the watchdog can't run),
   // request a fresh snapshot too. visibilitychange is preferred over window.focus
@@ -92,7 +83,12 @@ export function startSync() {
   // Separate from the maybeReconnect listener above: that reconnects a
   // closed/stale stream; this forces a fresh snapshot when the tree is HEALTHY
   // but drifted (the exact drift class this fix targets). Throttled inside
-  // resyncTree so rapid focus changes can't reconnect repeatedly.
+  // resyncTree so rapid focus changes can't reconnect repeatedly. Non-
+  // destructive: connect(true) no longer pre-clears the map (atomic swap via
+  // seedTreeStore), so this heals drift without an empty-frame flash and without
+  // collapsing manual expansions. The 90s PERIODIC resync was dropped — the
+  // server reconcile §6.2 + cursor-resume already heal steady-state drift, and
+  // the periodic fresh-snapshot was the source of the periodic flashes.
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") resyncTree();
   });

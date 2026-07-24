@@ -30,7 +30,7 @@ import {
   type TreeFetcher,
   type ChildrenResponse,
 } from "./treeOps";
-import { seedTreeStore, applyTreeOpStore, resetTreeStore, patchTreeAgent } from "./treeState";
+import { seedTreeStore, applyTreeOpStore, patchTreeAgent } from "./treeState";
 
 // mergeLastAgents — the agent-label fix (S3). During a server restart the
 // daemon serves HTTP while still aggregating session tails, so a mid-hydrate
@@ -1321,11 +1321,14 @@ export function connect(fresh = false) {
   // already invalidated any prior decode; this `gen` is checked at listener
   // entry and after every await in the snapshot listener.
   const gen = treeGen;
-  // On a FRESH connect (project switch or explicit refresh), clear the flat
-  // map so a stale map from a different Store can't bleed into the new
-  // snapshot. On a RESUME (reconnect with cursor) the map is preserved so
-  // delta ops replay cleanly onto the prior state.
-  if (fresh) resetTreeStore();
+  // The map-clear is CALLER-OWNED, not driven by `fresh`. A same-project fresh
+  // resync (resyncTree / reconcileBusy / on-focus) must swap the snapshot
+  // ATOMICALLY: seedTreeStore (tree.snapshot listener, below) replaces the map
+  // in one step and never touches userExpanded, so the old map stays visible
+  // until the new one lands (no empty-frame flash) and manual expansions
+  // survive. Only a TRUE project switch (switchProject) clears explicitly by
+  // calling resetTreeStore() itself. `fresh` now ONLY controls the cursor:
+  // fresh = no cursor = request an authoritative full snapshot.
   // Stream 1 (tree) opts into the server's gzip64 snapshot compression with
   // `&z=1`, mirroring Stream 2's session stream. The tree snapshot for a real
   // project is ~760 KiB–1.1 MiB of highly repetitive JSON (one project, one

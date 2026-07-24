@@ -22,6 +22,7 @@ import {
 import { syncUrl } from "./url";
 import { closeSessionStream, connect, resetPageInFlight } from "./stream";
 import { invalidateChildrenIndex } from "./selectors";
+import { resetTreeStore } from "./treeState";
 
 // Selecting any real session leaves draft mode.
 export function setSelectedId(id: string | null) {
@@ -82,6 +83,12 @@ export function switchProject(dir: string, fromUrl = false) {
   );
   // Wholesale session-set replacement invalidates the parent→children index.
   invalidateChildrenIndex();
+  // Project switch clears the tree (flat map + in-memory userExpanded). A
+  // same-project resync does NOT clear — connect(true) swaps the snapshot
+  // atomically (seedTreeStore) and preserves userExpanded; only a true project
+  // switch discards the outgoing project's tree. This sits BEFORE the if(!dir)
+  // split so BOTH the no-dir teardown and the project-switch reconnect clear.
+  resetTreeStore();
   if (!dir) {
     // No-project state: tear down both streams so nothing keeps bridging the old
     // project (or cwd). connect() would no-op too, but closing the session
