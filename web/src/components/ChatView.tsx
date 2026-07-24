@@ -803,7 +803,17 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       // (sync/actions.ts) pre-initializes the message slot to a truthy-but-empty
       // {order:[],byId:{}} the instant a session is selected, so sm() is truthy
       // BEFORE the real snapshot arrives; an empty order means "not delivered yet".
-      if (!sm()?.order?.length) return false;
+      //
+      // delivered() gate (pre-select-hydration race fix): if messagesLoaded has
+      // already flipped true while the order is STILL empty, there is nothing
+      // left to wait for — either the session is genuinely empty (the stale-
+      // anchor branch below pins to bottom + setReady, revealing the empty
+      // state), or the batch already staged before the gate flip (pendingBatch
+      // coordination in stream.ts guarantees messagesLoaded flips AFTER the batch
+      // resolves). Without this gate the empty-order defer returned false
+      // FOREVER for a stored anchor → ready() never set → revealed() false →
+      // the pre-selected session stayed blank until a manual switch-away+back.
+      if (!sm()?.order?.length && !delivered() && !messageFailed()) return false;
       // Defer until the seeded ANCHOR specifically has arrived — not just any
       // message. The length guard above only blocks the empty-order window. Lazy
       // hydration then streams a PARTIAL snapshot: the store's
@@ -824,7 +834,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       // below. restoredFor is set only AFTER this check so a no-op deferral
       // never locks out retries.
       const order = sm()?.order ?? [];
-      if (!order.includes(anchor) && !delivered()) return false;
+      if (!order.includes(anchor) && !delivered() && !messageFailed()) return false;
       restoredFor = props.sessionId;
       // Position the anchor at the top of the viewport (instant — no smooth
       // flash on restore). The message ROW ([data-mid]) always exists in the

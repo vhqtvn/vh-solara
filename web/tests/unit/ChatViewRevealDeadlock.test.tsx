@@ -183,6 +183,70 @@ describe("ChatView reveal-gate — O1 cold-stub deadlock self-heal", () => {
     });
   });
 
+  it("reveals when delivery reports loaded (messagesLoaded=true) but the message order is still empty + a stored anchor exists", async () => {
+    // The cold/edge strand: messagesLoaded flips true (the daemon's gate says
+    // "fully delivered") while state.messages[sid].order is EMPTY — e.g. a
+    // session the daemon marks warm/loaded but whose message batch hasn't
+    // staged into the resident order yet, or a genuinely-empty session with a
+    // STALE stored anchor from a prior incarnation. With a stored anchor,
+    // maybeRestore()'s empty-order defer (~:806) returned false WITHOUT
+    // consulting delivered(), so the delivered-flip self-heal effect could
+    // never advance ready() → revealed() stayed false forever (rows=0, stuck
+    // until a manual switch-away-and-back re-opened the stream). delivered=true
+    // MUST bypass the empty-order defer (there is nothing left to wait for:
+    // either the session is genuinely empty, or the batch already staged
+    // before the gate flip per the pendingBatch coordination).
+    setReadAnchor("s1", "m4");
+    const { container } = render(() => <ChatView sessionId="s1" />);
+    // openSession reserves a cold empty slot {order:[],byId:{}}.
+    await waitFor(() => expect(state.messages["s1"]).toBeTruthy());
+    expect(state.messages["s1"].order).toEqual([]);
+
+    // delivered flips true, but the order is STILL empty.
+    setState("messagesLoaded", "s1", true);
+    // The gate must open (stale-anchor branch pins to bottom + setReady).
+    await waitFor(() => {
+      expect(readyClass(container)).toMatch(/\bready\b/);
+    });
+  });
+
+  it("reveals when hydration errors (messagesError=true) while the stored anchor is absent from the partial batch", async () => {
+    // Sibling strand of the B case, on the ERROR terminal: hydration errors out
+    // (messagesError flips true → messageFailed=true, delivered stays false)
+    // while the seeded read anchor is still absent from the partial streamed
+    // batch. Before the fix both maybeRestore() deferral guards checked
+    // !delivered() but NOT !messageFailed(), so the gate stayed closed forever
+    // — contradicting the documented purpose of messageFailed (stream.ts + the
+    // `revealed()` memo): it exists "so the reveal gate can fall back to showing
+    // partial content instead of wedging on blank". The error flip MUST bypass
+    // the anchor-absent defer exactly as the loaded flip bypasses it.
+    setReadAnchor("s1", "m4");
+    const { container } = render(() => <ChatView sessionId="s1" />);
+    // openSession reserves a cold empty slot.
+    await waitFor(() => expect(state.messages["s1"]).toBeTruthy());
+
+    // Partial batch: order grows but the seeded anchor m4 is absent. (This is
+    // the SECOND deferral guard — the empty-order case is covered by the B
+    // test above; this one targets the anchor-absent-after-partial-batch case.)
+    setState("messages", "s1", {
+      order: ["m1", "m2", "m3"],
+      byId: { m1: mkMsg("m1"), m2: mkMsg("m2"), m3: mkMsg("m3") },
+    });
+    // Drain microtask + rAF so the switch-effect rAF fallback fires and defers
+    // (anchor absent + delivered=false). Gate stays closed.
+    await new Promise((r) => setTimeout(r, 30));
+    expect(readyClass(container)).not.toMatch(/\bready\b/);
+
+    // Hydration ERRORS (not loaded): messageFailed flips true, delivered stays
+    // false. The delivered||messageFailed self-heal effect re-runs maybeRestore;
+    // with the !messageFailed() guard it now proceeds → stale-anchor pin →
+    // setReady(true) → revealed() → .ready, showing the partial content.
+    setState("messagesError", "s1", true);
+    await waitFor(() => {
+      expect(readyClass(container)).toMatch(/\bready\b/);
+    });
+  });
+
   it("latch keeps a revealed transcript shown across a transient delivered() drop (resync re-snapshot)", async () => {
     // Anchor IS present in the batch — first reveal takes the normal path.
     setReadAnchor("s2", "m1");
