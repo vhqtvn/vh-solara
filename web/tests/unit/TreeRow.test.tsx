@@ -430,6 +430,82 @@ describe("TreeRow depth-based tree guides (P0-A, tree=2 UI parity)", () => {
   });
 });
 
+// ── tree=2 UI parity: subtreeBusy collapsed-ancestor spinner (P1-B) ───────────
+// A collapsed ancestor of a running subagent previously showed NO spinner
+// because its OWN activity was idle. The server now ships a `subtreeBusy` flag
+// (rolled up like subtreeNeedsInput); the client OR's it into isBusy so the
+// collapsed ancestor of a busy descendant renders the busy spinner.
+describe("TreeRow subtreeBusy spinner (P1-B, tree=2 UI parity)", () => {
+  // CRUX: collapsed ancestor of a busy descendant shows the spinner even though
+  // the ancestor's own activity is idle.
+  it("shows the busy spinner when flags.subtreeBusy is true and activity is idle", () => {
+    const { container } = render(() => (
+      <TreeRow
+        node={baseNode({ activity: "idle", flags: { ...baseNode().flags, subtreeBusy: true } })}
+        depth={0}
+        selected={false}
+        expanded={false}
+        onSelect={() => {}}
+        onToggle={() => {}}
+      />
+    ));
+    expect(nodeButton(container as unknown as HTMLElement).querySelector(".tree-spinner")).not.toBeNull();
+  });
+
+  it("does NOT show the busy spinner when subtreeBusy is false and activity is idle", () => {
+    const { container } = render(() => (
+      <TreeRow
+        node={baseNode({ activity: "idle", flags: { ...baseNode().flags, subtreeBusy: false } })}
+        depth={0}
+        selected={false}
+        expanded={false}
+        onSelect={() => {}}
+        onToggle={() => {}}
+      />
+    ));
+    expect(nodeButton(container as unknown as HTMLElement).querySelector(".tree-spinner")).toBeNull();
+  });
+
+  it("does NOT show the busy spinner when subtreeBusy is absent (undefined is falsy)", () => {
+    const { container } = render(() => (
+      <TreeRow node={baseNode({ activity: "idle" })} depth={0} selected={false} expanded={false} onSelect={() => {}} onToggle={() => {}} />
+    ));
+    expect(nodeButton(container as unknown as HTMLElement).querySelector(".tree-spinner")).toBeNull();
+  });
+
+  // Regression guard: the OR did not break the self-busy path. A node whose own
+  // activity is busy still shows the spinner regardless of subtreeBusy.
+  it("still shows the busy spinner when activity is busy and subtreeBusy is false (self-busy path intact)", () => {
+    const { container } = render(() => (
+      <TreeRow
+        node={baseNode({ activity: "busy", flags: { ...baseNode().flags, subtreeBusy: false } })}
+        depth={0}
+        selected={false}
+        expanded={false}
+        onSelect={() => {}}
+        onToggle={() => {}}
+      />
+    ));
+    expect(nodeButton(container as unknown as HTMLElement).querySelector(".tree-spinner")).not.toBeNull();
+  });
+
+  // The `running` class on .tree-node keys off isBusy; it must also be applied
+  // for the subtree-busy case (consistent styling with the self-busy spinner).
+  it("applies the running class when flags.subtreeBusy is true (activity idle)", () => {
+    const { container } = render(() => (
+      <TreeRow
+        node={baseNode({ activity: "idle", flags: { ...baseNode().flags, subtreeBusy: true } })}
+        depth={0}
+        selected={false}
+        expanded={false}
+        onSelect={() => {}}
+        onToggle={() => {}}
+      />
+    ));
+    expect(nodeButton(container as unknown as HTMLElement).classList.contains("running")).toBe(true);
+  });
+});
+
 // ── tree=2 UI parity: selected-row highlight on .tree-row (P0-B) ──────────────
 // The `.tree-row` div had NO `selected` class even though CSS `.tree-row.selected`
 // exists to paint the accent highlight. The `selected` prop was already applied

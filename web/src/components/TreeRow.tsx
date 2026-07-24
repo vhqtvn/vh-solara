@@ -66,8 +66,10 @@ export function TreeRow(props: TreeRowProps) {
 
   // All indicators derive from the SELF-CONTAINED node (§3). No parent walk,
   // no activity-map lookup, no branchStubs — the server pre-computes every
-  // aggregate the UI needs (subtreeNeedsInput is the one retained subtree roll-up).
-  const isBusy = () => node().activity === "busy";
+  // aggregate the UI needs (subtreeNeedsInput is the one retained subtree roll-up;
+  // subtreeBusy rolls up busy/retry so a collapsed ancestor of a busy descendant
+  // spins — OR'd in here alongside the node's own activity).
+  const isBusy = () => node().activity === "busy" || !!node().flags.subtreeBusy;
   const isError = () => node().activity === "error";
   const isRetry = () => node().activity === "retry";
   const needsInput = () => node().flags.pendingInput || node().flags.subtreeNeedsInput;

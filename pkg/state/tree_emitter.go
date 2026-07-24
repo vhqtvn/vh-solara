@@ -159,6 +159,7 @@ func (e *TreeEmitter) buildNodeLocked(id string, loaded bool) (Node, bool) {
 		Flags: NodeFlags{
 			PendingInput:      s.pendingInputSelf[id] > 0,
 			SubtreeNeedsInput: s.subtreePendingInput[id] > 0,
+			SubtreeBusy:       s.subtreeBusyCount[id] > 0,
 			Permission:        len(s.perms[id]) > 0,
 			Archived:          env.archivedAt(),
 			Orphan:            isOrphanLocked(s, id),
@@ -499,7 +500,14 @@ func (e *TreeEmitter) onSessionDeleteLocked(ev ClientEvent) []TreeOp {
 	return ops
 }
 
-// onActivityLocked emits node.facet{activity} (§6 activity row).
+// onActivityLocked emits node.facet{activity} (§6 activity row), and rolls
+// SubtreeBusy up the ancestor chain: for each KNOWN ancestor it emits
+// node.facet{flags:{subtreeBusy}} with the CURRENT value, so a busy↔idle
+// transition live-updates collapsed ancestors' spinner. This mirrors
+// onQuestionLocked's subtreeNeedsInput walk. busy↔retry is busy-neutral
+// (subtreeBusyCount unchanged) so those ancestor facets are idempotent no-ops —
+// that's fine and matches onQuestionLocked's "emit current value for every
+// ancestor" pattern.
 func (e *TreeEmitter) onActivityLocked(ev ClientEvent) []TreeOp {
 	var p struct {
 		SessionID string `json:"sessionID"`
@@ -514,7 +522,34 @@ func (e *TreeEmitter) onActivityLocked(ev ClientEvent) []TreeOp {
 	st := p.State
 	op := NodeFacetOp(p.SessionID, FacetData{Activity: &st})
 	e.stamp(op, p.SessionID)
-	return []TreeOp{op}
+	ops := []TreeOp{op}
+	// Walk ancestors; emit subtreeBusy facet for each known ancestor with the
+	// CURRENT value (post-transition subtreeBusyCount). This is the busy analog
+	// of onQuestionLocked's subtreeNeedsInput walk so a collapsed ancestor of a
+	// busy descendant renders busy (spinner) on the live activity transition.
+	s := e.store
+	// Nil-guard: e.known LAGS the store, so a session can already be deleted
+	// from s.sessions while a lagging connection still holds e.known[id]==true
+	// (it has not yet processed the KindSessionDelete). The activity facet
+	// above is harmless on the stale client node (a node.remove follows once the
+	// delete is processed), but the ancestor walk MUST NOT dereference the gone
+	// session — capture and bail before the walk. (Mirrors onQuestionLocked.)
+	sess := s.sessions[p.SessionID]
+	if sess == nil {
+		return ops // node gone from store; no ancestors to walk.
+	}
+	cur := s.effectiveParentOfLocked(sess.parentID)
+	for cur != "" && s.sessions[cur] != nil {
+		if !e.known[cur] {
+			break
+		}
+		want := s.subtreeBusyCount[cur] > 0
+		aop := NodeFacetOp(cur, FacetData{Flags: map[string]bool{"subtreeBusy": want}})
+		e.stamp(aop, p.SessionID)
+		ops = append(ops, aop)
+		cur = s.effectiveParentOfLocked(s.sessions[cur].parentID)
+	}
+	return ops
 }
 
 // onActivityVerbLocked emits node.facet{verb} (set or clear).

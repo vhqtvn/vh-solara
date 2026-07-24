@@ -45,6 +45,7 @@ type Node struct {
 type NodeFlags struct {
 	PendingInput      bool `json:"pendingInput"`      // SELF: question set + unanswered.
 	SubtreeNeedsInput bool `json:"subtreeNeedsInput"` // SUBTREE aggregate (the ONE retained badge, Q2).
+	SubtreeBusy       bool `json:"subtreeBusy"`       // SUBTREE aggregate: self OR any descendant is busy/retry (drives the collapsed-ancestor spinner).
 	Permission        bool `json:"permission"`        // SELF: permissions[id] non-empty.
 	Archived          bool `json:"archived"`          // session archived facet.
 	Orphan            bool `json:"orphan"`            // SERVER-COMPUTED ONLY (§9).

@@ -105,14 +105,14 @@ func TestNode_JSON_OptionalPresent(t *testing.T) {
 
 // TestNodeFlags_JSON_Shape verifies flags is an object with exactly the §3 keys.
 func TestNodeFlags_JSON_Shape(t *testing.T) {
-	f := NodeFlags{PendingInput: true, SubtreeNeedsInput: true, Permission: false, Archived: false, Orphan: false}
+	f := NodeFlags{PendingInput: true, SubtreeNeedsInput: true, SubtreeBusy: false, Permission: false, Archived: false, Orphan: false}
 	raw, err := json.Marshal(f)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
 	got := jsonFields(t, raw)
 	want := map[string]bool{
-		"pendingInput": true, "subtreeNeedsInput": true,
+		"pendingInput": true, "subtreeNeedsInput": true, "subtreeBusy": true,
 		"permission": true, "archived": true, "orphan": true,
 	}
 	for k := range want {

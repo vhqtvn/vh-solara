@@ -20,6 +20,11 @@ export interface TreeNodeFlags {
   // The ONE retained subtree-aggregate (§3 Q2): true iff this node OR any
   // descendant has pendingInput. SERVER-COMPUTED; the client only displays it.
   subtreeNeedsInput: boolean;
+  // SERVER-COMPUTED subtree aggregate: self OR any descendant is busy/retry.
+  // OR'd into TreeRow.isBusy so a collapsed ancestor of a busy descendant spins.
+  // Optional so nodes constructed without it (existing tests) still typecheck;
+  // undefined is falsy.
+  subtreeBusy?: boolean;
   permission: boolean;
   archived: boolean;
   // SERVER-COMPUTED ONLY (§9). The client never sets this.
