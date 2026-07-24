@@ -128,6 +128,20 @@ test("(c) a collapsed node shows its agent chip and is right-clickable", async (
 // or a stale partial list, losing the parent/child structure. tree=2 FIX: the
 // server re-ships the frontier snapshot on reconnect; the client re-applies it.
 // Structure is always authoritative from the server, never re-inferred locally.
+//
+// P1-A (commit 9a6dd97) STRENGTHENED this contract: the user's EXPAND state is
+// now persisted to localStorage (vh.tree.expanded.v1) and rehydrated on load, so
+// an expanded node STAYS expanded across reload (the directive: "expand a node,
+// reload → it stays expanded; tree structure still re-fetched"). This test was
+// updated from the old "demo collapses on reload → Expand twisty" assertion to
+// the new stronger one: reload preserves BOTH structure AND user expansion.
+//
+// The core NO-FLATTEN invariant is guarded by the inverted assertion below: if
+// persistence broke (demo collapsed), `sub` would NOT be visible post-reload and
+// the `toBeVisible` would fail. And `sub` must NEVER appear as a flat root
+// (`:not(.sub)` count 0) — the structure is server-owned, never re-inferred. The
+// dedicated unit test tree2NoFlatten.test.ts pins that the structure MAP is
+// never persisted (only userExpanded is), so a reload can't flatten the tree.
 test("(d) reload does not flatten the tree — structure preserved from the frontier", async ({ page }) => {
   await page.goto(projectUrl("/"));
   await waitForTreeSettled(page);
@@ -137,23 +151,22 @@ test("(d) reload does not flatten the tree — structure preserved from the fron
   await demoRow.locator(".tree-twisty").click();
   await expect(page.locator(`.tree-node.sub[data-session-id="sub"]`)).toBeVisible({ timeout: 8000 });
 
-  // Reload — the cold snapshot ships roots only (collapsed). The child should
-  // disappear (collapsed under demo) but NOT flatten to root level.
+  // Reload. P1-A persists userExpanded → demo STAYS expanded, so sub STAYS
+  // visible as a child. This is the inverted no-flatten guard: if persistence
+  // were broken (demo collapsed), sub would disappear and this would fail.
   await page.reload();
   await waitForTreeSettled(page);
 
-  // demo is still a root with children (Expand twisty present = has descendants).
+  // demo is still a root and still EXPANDED (Collapse twisty = persistence held).
   const demoRowAfter = page.locator(".tree-row", { hasText: "Demo session" });
   await expect(demoRowAfter).toBeVisible();
-  await expect(demoRowAfter.locator(".tree-twisty[aria-label='Expand']")).toBeVisible();
+  await expect(demoRowAfter.locator(".tree-twisty[aria-label='Collapse']")).toBeVisible();
 
-  // sub must NOT be visible (collapsed) and must NOT appear as a root.
-  await expect(page.locator(`.tree-node[data-session-id="sub"]`)).toHaveCount(0);
-  await expect(page.locator(`.tree-node[data-session-id="sub"]:not(.sub)`)).toHaveCount(0);
-
-  // Re-expand demo → sub reappears as a child (re-fetched from the frontier).
-  await demoRowAfter.locator(".tree-twisty").click();
+  // sub STAYS visible as a child of demo (expansion persisted = no flatten), and
+  // must NEVER appear as a flat root (:not(.sub) count 0 — structure is
+  // server-owned, never re-inferred locally).
   await expect(page.locator(`.tree-node.sub[data-session-id="sub"]`)).toBeVisible({ timeout: 8000 });
+  await expect(page.locator(`.tree-node[data-session-id="sub"]:not(.sub)`)).toHaveCount(0);
 });
 
 // ─── (e) ─────────────────────────────────────────────────────────────────────
