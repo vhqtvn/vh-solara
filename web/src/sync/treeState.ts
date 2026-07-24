@@ -28,6 +28,7 @@ import {
   type TreeOp,
 } from "./treeMap";
 import { activePathIds } from "./treeSelectors";
+import { loadVersioned, saveVersioned } from "../lib/store";
 
 // Module-authority flat map. Mutated IN PLACE by the mutators; the `version`
 // signal is what notifies Solid (the "mutable + version" pattern). Readers MUST
@@ -41,23 +42,44 @@ const bump = (): void => {
   setVersion((v) => (v + 1) & 0x3fffffff);
 };
 
-// ---- user expand-state (IN-MEMORY UI toggle) — flood fix --------------------
+// ---- user expand-state (persisted UI toggle) — P1-A -------------------------
 // Separate UI expand-state from map-presence: a node's children STAY in the
 // flat map (instant expand, no round-trip) but only RENDER when (a) the node is
 // on an ACTIVE PATH (auto-expanded via activePathIds), or (b) the user explicitly
 // expanded it (this `userExpanded` set).
 //
-// This is IN-MEMORY session state, NOT persisted to localStorage. The design doc
-// (§11) allows persisting UI state like expand toggles, but persistence clashes
-// with the cold-load frontier (§5): on reload the server ships a node COLLAPSED
-// (its children not resident), yet a persisted "expanded" toggle would claim it
-// open. That half-state (expanded toggle, no resident children) inverts the
-// toggle's meaning on the first post-reload click (the reload-does-not-flatten
-// symptom d contract). Keeping userExpanded in-memory means a fresh load starts
-// collapsed except active paths — the desired default. Within a session the
-// toggle survives every tree mutation (it is a separate signal); only a full
-// reload clears it (re-seeded to collapsed by the server frontier).
-const [userExpanded, setUserExpandedSig] = createSignal<Set<string>>(new Set());
+// P1-A: persisted to localStorage (UI state only, §11-sanctioned) so a page
+// reload keeps manual expansions. The flat tree MAP is NEVER persisted (§11 keeps
+// structure unpersisted — that is what keeps "reload does not flatten" true:
+// seedTreeStore REPLACES the whole map on every tree.snapshot, so the structure
+// is always re-fetched from the server). Only this `userExpanded` Set of node
+// ids is persisted, rehydrated on load, and backfilled after the frontier seed.
+//
+// The half-state trap (why persistence needs BACKFILL): on a cold reload the §5
+// frontier ships an idle user-expanded node COLLAPSED — its children are NOT
+// resident (the server's per-connection expanded-set resets). A persisted
+// `userExpanded={X}` whose children aren't resident would be a confusing
+// half-state (isUserExpanded true but nothing renders; the first twisty click
+// inverts to collapse). The fix is PERSISTENCE + BACKFILL: stream.ts reads
+// `expandedButUnloadedIds()` right after the frontier seed and fires
+// expandTreeNode for each, so a persisted-expanded node's children are fetched
+// and land via subsequent node.children ops (the TreeRow's
+// `expanded={open() && children().length>0}` shows the collapsed ▸N badge until
+// the fetch lands, then flips open — a clean transition, no half-state).
+//
+// Single global key (mirrors the deleted proj=1 client's `vh.tree.mode.v2`
+// precedent). Stale non-resident ids are harmless: rehydrate, render, and
+// expandedButUnloadedIds all skip ids not present in the map.
+const LS_EXPANDED = "vh.tree.expanded.v1";
+
+// Rehydrate at module init (page load). The very first signal value is seeded
+// from localStorage so a reload starts with the persisted expansions. coerce is
+// a safety net for legacy/foreign payloads (a version-matched read returns the
+// stored array directly without invoking it).
+const initialExpanded = new Set<string>(
+  loadVersioned<string[]>(LS_EXPANDED, 1, [], (o) => (Array.isArray(o) ? o : [])),
+);
+const [userExpanded, setUserExpandedSig] = createSignal<Set<string>>(initialExpanded);
 
 // Version-keyed cache: activePathIds scans the whole map, so memoize it per tree
 // version (once per mutation) rather than recomputing on every isNodeExpanded()
@@ -92,20 +114,61 @@ export function isUserExpanded(id: string): boolean {
   return userExpanded().has(id);
 }
 
-// User toggled a node open/closed. Adds/removes from the in-memory UI set; does
-// NOT touch the flat map and does NOT flip `loaded` (that is the §8.4
-// fetch-collapse's job, a different mechanism).
+// User toggled a node open/closed. Adds/removes from the UI set; does NOT touch
+// the flat map and does NOT flip `loaded` (that is the §8.4 fetch-collapse's job,
+// a different mechanism). P1-A: also persists the new set to localStorage so the
+// toggle survives a reload.
 export function setUserNodeExpanded(id: string, open: boolean): void {
   const next = new Set(userExpanded());
   if (open) next.add(id);
   else next.delete(id);
   setUserExpandedSig(next);
+  saveVersioned(LS_EXPANDED, 1, [...next]);
 }
 
-// Test reset: clear the in-memory toggle (mirrors the fresh-load default).
+// Pure helper (P1-A backfill source): the ids in `userExpanded` that are
+// RESIDENT but have NO resident direct children AND still have descendants to
+// fetch — i.e. persisted-expanded nodes the cold-load frontier left collapsed.
+// stream.ts fires expandTreeNode for each after the frontier seed so their
+// children land via subsequent node.children ops (resolving the half-state
+// trap). Reads `version()` so a caller in a reactive scope subscribes to tree
+// mutations (harmless when called imperatively post-seed).
+//
+// - skip ids not in the map (non-resident — stale persisted id, never seeded);
+// - skip ids whose direct children are already resident (nothing to fetch);
+// - skip ids with nothing to fetch (childCount 0 AND descendantCount 0).
+export function expandedButUnloadedIds(): string[] {
+  void version();
+  const idx = childrenIndex(map);
+  const out: string[] = [];
+  for (const id of userExpanded()) {
+    const n = map.get(id);
+    if (!n) continue; // non-resident
+    if ((idx.get(id)?.length ?? 0) > 0) continue; // resident children present
+    if (n.childCount === 0 && (n.descendantCount ?? 0) === 0) continue; // nothing to fetch
+    out.push(id);
+  }
+  return out;
+}
+
+// Test reset: clear the in-memory toggle (mirrors the fresh-load default). P1-A:
+// clears in-memory ONLY — persisted localStorage is left untouched so this doubles
+// as the "simulate page reload" primitive (a reload loses the Solid signals but
+// keeps persisted UI state; rehydrateExpandedForTest then re-seeds from disk).
+// resetTreeStore (true project switch) clears BOTH.
 export function resetExpandedForTest(): void {
   setUserExpandedSig(new Set<string>());
   activePathCache = null;
+}
+
+// Test helper: re-run the module-init loadVersioned seed against the current
+// localStorage. Lets a unit test exercise the rehydrate path without a real
+// module reload (the module initializes once per test file).
+export function rehydrateExpandedForTest(): void {
+  const stored = loadVersioned<string[]>(LS_EXPANDED, 1, [], (o) =>
+    Array.isArray(o) ? o : [],
+  );
+  setUserExpandedSig(new Set(stored));
 }
 
 // ---- tracked accessors ------------------------------------------------------
@@ -212,12 +275,15 @@ export function patchTreeAgent(id: string, agent: string): void {
 // Clear the whole tree (project switch / epoch change / test reset). Also
 // clears the in-memory expand state so a project switch does NOT carry stale
 // user toggles forward and tests do not bleed across cases (reviewer advisory
-// tier1_a-F1/tier1_c-F2): `userExpanded` is IN-MEMORY only (not persisted), so a
-// plain reset restores the fresh-load collapsed default; the activePath memo is
-// invalidated so the next isNodeExpanded() read recomputes against the new map.
+// tier1_a-F1/tier1_c-F2): `userExpanded` is now persisted (P1-A), so a plain
+// reset of in-memory is NOT enough on a true project switch — the persisted key
+// is cleared too so the next reload of the new project does not rehydrate the
+// old project's expansions. The activePath memo is invalidated so the next
+// isNodeExpanded() read recomputes against the new map.
 export function resetTreeStore(): void {
   map = new Map();
   setUserExpandedSig(new Set<string>());
+  saveVersioned(LS_EXPANDED, 1, []);
   activePathCache = null;
   bump();
 }

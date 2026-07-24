@@ -30,7 +30,7 @@ import {
   type TreeFetcher,
   type ChildrenResponse,
 } from "./treeOps";
-import { seedTreeStore, applyTreeOpStore, patchTreeAgent } from "./treeState";
+import { seedTreeStore, applyTreeOpStore, patchTreeAgent, expandedButUnloadedIds } from "./treeState";
 
 // mergeLastAgents — the agent-label fix (S3). During a server restart the
 // daemon serves HTTP while still aggregating session tails, so a mid-hydrate
@@ -1515,6 +1515,17 @@ export function connect(fresh = false) {
         return;
       }
       seedTreeStore(snap.nodes);
+      // P1-A backfill: a persisted-expanded node whose children the cold-load
+      // frontier left non-resident (expandedButUnloadedIds) would be a
+      // half-state (isUserExpanded true, nothing rendered). Fire expandTreeNode
+      // for each so their children are fetched and land via subsequent
+      // node.children ops. expandTreeNode is single-flight (treeExpandInFlight),
+      // so a node already being expanded (or with resident children now) is a
+      // no-op — this loop is idempotent across re-seeds.
+      const backfill = expandedButUnloadedIds();
+      if (backfill.length > 0) {
+        for (const id of backfill) void expandTreeNode(id);
+      }
       if (!treeSnapDone) {
         treeSnapDone = true;
         if (treeT1) recordLatency("tree", "snap", performance.now() - treeT1);
