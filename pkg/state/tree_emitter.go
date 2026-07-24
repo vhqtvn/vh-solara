@@ -480,6 +480,7 @@ func (e *TreeEmitter) onSessionDeleteLocked(ev ClientEvent) []TreeOp {
 		return nil
 	}
 	id := p.ID
+	s := e.store
 	var ops []TreeOp
 	// Re-root moves for every child we told the client was under id.
 	for c, pc := range e.parentCache {
@@ -489,6 +490,14 @@ func (e *TreeEmitter) onSessionDeleteLocked(ev ClientEvent) []TreeOp {
 			ops = append(ops, mv)
 		}
 	}
+	// Capture the deleted node's parent BEFORE clearing parentCache[id] below, so
+	// we can seed the ancestor walk. The store has already removed id from
+	// s.sessions (deleteSessionLocked runs before emitting KindSessionDelete), so
+	// s.sessions[id].parentID is unreadable — e.parentCache[id] holds the parent
+	// this connection was told about. It is "" when id never shipped to this
+	// connection, in which case effectiveParentOfLocked("")=="" and the walk is a
+	// safe no-op.
+	seedParent := e.parentCache[id]
 	if e.known[id] {
 		rm := NodeRemoveOp(id)
 		e.stamp(rm, id)
@@ -496,6 +505,30 @@ func (e *TreeEmitter) onSessionDeleteLocked(ev ClientEvent) []TreeOp {
 		delete(e.known, id)
 		delete(e.parentCache, id)
 		delete(e.ec, id)
+	}
+	// Bug d-F1 (CAUSE 2): a busy/needs-input descendant DELETED on completion
+	// decrements subtreeBusyCount / subtreePendingInput on every ancestor in the
+	// store (deleteSessionLocked → adjustAncestorChainFromLocked +
+	// maintainIndexesOnDeleteLocked run BEFORE the emit). Before this fix no
+	// facet was emitted on the delete path, so a collapsed-but-KNOWN ancestor
+	// kept its stale busy/needs-input flag until a full reload (buildNodeLocked /
+	// F5). Walk the chain now and emit the CURRENT (post-delete) aggregates for
+	// each KNOWN ancestor, mirroring the onActivity/onQuestion facet shape. Skip
+	// unknown intermediates but keep walking (same continue-not-break shape as
+	// the activity/question walks).
+	cur := s.effectiveParentOfLocked(seedParent)
+	for cur != "" && s.sessions[cur] != nil {
+		if e.known[cur] {
+			busy := s.subtreeBusyCount[cur] > 0
+			bop := NodeFacetOp(cur, FacetData{Flags: map[string]bool{"subtreeBusy": busy}})
+			e.stamp(bop, id)
+			ops = append(ops, bop)
+			wantInput := s.subtreePendingInput[cur] > 0
+			iop := NodeFacetOp(cur, FacetData{Flags: map[string]bool{"subtreeNeedsInput": wantInput}})
+			e.stamp(iop, id)
+			ops = append(ops, iop)
+		}
+		cur = s.effectiveParentOfLocked(s.sessions[cur].parentID)
 	}
 	return ops
 }
@@ -552,13 +585,18 @@ func (e *TreeEmitter) onActivityLocked(ev ClientEvent) []TreeOp {
 	}
 	cur := s.effectiveParentOfLocked(sess.parentID)
 	for cur != "" && s.sessions[cur] != nil {
-		if !e.known[cur] {
-			break
+		// SKIP an intermediate ancestor this connection does not hold
+		// (!e.known[cur]) but KEEP walking up — a KNOWN ancestor above an
+		// unmaterialized intermediate must still receive the subtreeBusy facet
+		// live. The advance runs OUTSIDE the gate so the walk cannot stall on
+		// the skipped node (a bare break here truncated propagation, leaving a
+		// collapsed known ancestor stale until a full reload / F5 — bug d-F1).
+		if e.known[cur] {
+			want := s.subtreeBusyCount[cur] > 0
+			aop := NodeFacetOp(cur, FacetData{Flags: map[string]bool{"subtreeBusy": want}})
+			e.stamp(aop, p.SessionID)
+			ops = append(ops, aop)
 		}
-		want := s.subtreeBusyCount[cur] > 0
-		aop := NodeFacetOp(cur, FacetData{Flags: map[string]bool{"subtreeBusy": want}})
-		e.stamp(aop, p.SessionID)
-		ops = append(ops, aop)
 		cur = s.effectiveParentOfLocked(s.sessions[cur].parentID)
 	}
 	return ops
@@ -633,13 +671,18 @@ func (e *TreeEmitter) onQuestionLocked(ev ClientEvent, set bool) []TreeOp {
 	}
 	cur := s.effectiveParentOfLocked(sess.parentID)
 	for cur != "" && s.sessions[cur] != nil {
-		if !e.known[cur] {
-			break
+		// SKIP an intermediate ancestor this connection does not hold
+		// (!e.known[cur]) but KEEP walking up — a KNOWN ancestor above an
+		// unmaterialized intermediate must still receive the subtreeNeedsInput
+		// facet live. The advance runs OUTSIDE the gate so the walk cannot stall
+		// on the skipped node (a bare break here truncated propagation, leaving a
+		// collapsed known ancestor stale until a full reload / F5 — bug d-F1).
+		if e.known[cur] {
+			want := s.subtreePendingInput[cur] > 0
+			op := NodeFacetOp(cur, FacetData{Flags: map[string]bool{"subtreeNeedsInput": want}})
+			e.stamp(op, p.SessionID)
+			ops = append(ops, op)
 		}
-		want := s.subtreePendingInput[cur] > 0
-		op := NodeFacetOp(cur, FacetData{Flags: map[string]bool{"subtreeNeedsInput": want}})
-		e.stamp(op, p.SessionID)
-		ops = append(ops, op)
 		cur = s.effectiveParentOfLocked(s.sessions[cur].parentID)
 	}
 	return ops
