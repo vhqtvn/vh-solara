@@ -13,6 +13,15 @@ export const [streamLive, setStreamLive] = persistedSignal<boolean>("vh.prefs.st
 // Session-list density: "compact" (single line per session, the original) or
 // "detailed" (two lines — title row + a secondary line with direct-children
 // running/idle counts, falling back to started-at when there are none).
+//
+// NOTE: currently INERT under tree=2. The only functional consumer was the
+// deleted proj=1 `Node` render; the tree=2 `TreeRow` does NOT read
+// `treeDensity()`, so the Settings→Appearance "Detailed" option has no effect
+// today. The pref (and its Settings control) is RETAINED as the placeholder for
+// a future tree=2 detailed-density variant (an explicitly-deferred feature,
+// out of scope here) — removing it would delete a user-visible Settings control
+// (a minor UX/behavior change) while the feature remains planned. Do NOT
+// half-implement density without wiring TreeRow to read this signal.
 export const [treeDensity, setTreeDensity] = persistedSignal<"compact" | "detailed">(
   "vh.prefs.treeDensity.v1",
   1,

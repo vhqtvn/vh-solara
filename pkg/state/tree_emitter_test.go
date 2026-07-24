@@ -502,8 +502,9 @@ func TestInvariant_MonotonicSeqAndOrder(t *testing.T) {
 
 // ---------------------------------------------------------------------------
 // Group 7 — tree=2 flag routing — see pkg/web/tree_children_test.go (server
-// wiring is exercised at the HTTP layer; the emitter selection is additive in
-// server.go alongside wantsProject).
+// wiring is exercised at the HTTP layer; the emitter selection was originally
+// additive alongside the proj=1 wantsProject gate, which was deleted in Phase 4
+// commit a0e825c — tree=2 is now the sole path).
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------

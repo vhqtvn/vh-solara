@@ -235,6 +235,11 @@ export default function SettingsDialog(props: { onClose: () => void }) {
                 Detailed adds a second line per session: running/idle child counts, or — when there are
                 none — when it started.
               </p>
+              <p class="setting-hint">
+                <em>Note:</em> under tree=2 this density control is currently inert (no effect) — the
+                detailed variant for the tree=2 row is a planned, deferred feature. The setting is kept
+                as a placeholder.
+              </p>
               <div class="setting-row">
                 <label>Display font</label>
                 <Select

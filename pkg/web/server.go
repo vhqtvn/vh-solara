@@ -1474,8 +1474,11 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		// ring-gap). The replayed tree.op/detail events above (seq N+1..head)
 		// are superseded by these authoritative snapshots at head; the live-tail
 		// baseline guard (ev.Seq > baseline) prevents re-forwarding. Mirrors the
-		// fresh-connect block at ~1562-1605; the proj=1 reconnect snapshot
-		// below runs only when wantsProject(r) (false for tree=2).
+		// fresh-connect block at ~1562-1605. Under tree=2 this reconnect block
+		// runs whenever a treeEmitter is attached (the `if treeEmitter != nil`
+		// guard below); the proj=1 reconnect snapshot that earlier revisions
+		// gated on wantsProject(r) was deleted in Phase 4 (commit a0e825c), so
+		// there is no proj=1 path here.
 		if treeEmitter != nil {
 			treeSnap := treeEmitter.SnapshotFrontier("reconnect")
 			if rb, err := json.Marshal(treeSnap); err == nil {

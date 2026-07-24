@@ -20,14 +20,14 @@ type treeChildrenResponse struct {
 }
 
 // handleTreeChildren implements GET /vh/tree/children (§8 expand protocol).
-// It is the tree=2 counterpart of handleBranch (the proj=1 expand endpoint):
-// stateless GET that reads the direct children of ?id=<parentId> from the
-// project's store, honors ?cursor pagination, and returns a node.children JSON
-// payload. On a terminal batch (hasMore:false) it adds parentId to the
-// connection's E_c (§5.4) — the emitter tracks this internally. A stale cursor
-// (child was reparented/deleted) returns an empty terminal batch with
-// staleCursor:true so the client restarts from page 0 (§8.3). GET → no CSRF
-// (mirrors handleBranch).
+// It is the tree=2 expand endpoint, succeeding the deleted proj=1 handleBranch
+// endpoint (removed in Phase 4 commit a0e825c): a stateless GET that reads the
+// direct children of ?id=<parentId> from the project's store, honors ?cursor
+// pagination, and returns a node.children JSON payload. On a terminal batch
+// (hasMore:false) it adds parentId to the connection's E_c (§5.4) — the emitter
+// tracks this internally. A stale cursor (child was reparented/deleted) returns
+// an empty terminal batch with staleCursor:true so the client restarts from
+// page 0 (§8.3). GET → no CSRF (as the deleted handleBranch did).
 func (s *Server) handleTreeChildren(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("id")
 	if id == "" {

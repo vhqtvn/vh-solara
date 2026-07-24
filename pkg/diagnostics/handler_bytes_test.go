@@ -63,7 +63,7 @@ func TestHandlerBytesFlusherPreservation(t *testing.T) {
 func TestHandlerBytesMultipleClasses(t *testing.T) {
 	resetAndRestore(t)
 
-	for _, class := range []int{ProxyPathPassthrough, ProxyPathView, ProxyPathCodeFile, ProxyPathRender, ProxyPathSnapshot, ProxyPathBranch, ProxyPathMessages} {
+	for _, class := range []int{ProxyPathPassthrough, ProxyPathView, ProxyPathCodeFile, ProxyPathRender, ProxyPathSnapshot, ProxyPathMessages} {
 		rw := httptest.NewRecorder()
 		w := NewHandlerBytesWriter(rw, class)
 		_, _ = w.Write([]byte{0xAB, 0xCD, 0xEF, 0x01}) // 4 bytes per class
@@ -72,7 +72,7 @@ func TestHandlerBytesMultipleClasses(t *testing.T) {
 	for class := 0; class < numProxyPathClasses; class++ {
 		got := Default.HandlerBytes[class].Bytes.Load()
 		var want uint64
-		if class < ProxyPathTerminal { // 0-6 were written above
+		if class < ProxyPathTerminal { // 0..Terminal-1 were written above
 			want = 4
 		}
 		if got != want {

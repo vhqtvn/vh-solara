@@ -6,7 +6,7 @@ import "net/http"
 // bytes cross the tunnel but were NOT attributed by Probe 3 (which wraps only
 // the /vh/stream SSE pump via StreamStatsWriter). Before this probe, every
 // non-stream tunnel byte — passthrough /oc/*, embedded views, code files,
-// renders, one-shot snapshots, branch expands, message pages, and the terminal
+// renders, one-shot snapshots, message pages, and the terminal
 // websocket pump — showed up ONLY in the aggregate ws_write / yamux totals
 // (a live re-measurement found ~97-99% of a 1806 MB/hr tunnel burst was this
 // uninstrumented raw-proxy traffic). Each such handler now reports its egress
@@ -21,9 +21,8 @@ const (
 	ProxyPathCodeFile           // 2 — /vh/code/file (one file's content)
 	ProxyPathRender             // 3 — /vh/render (batched markdown/diff/patch render)
 	ProxyPathSnapshot           // 4 — /vh/snapshot (one-shot full/projected snapshot)
-	ProxyPathBranch             // 5 — /vh/sessions/branch (lazy-expand projected page)
-	ProxyPathMessages           // 6 — /vh/session/{id}/messages (historical message page)
-	ProxyPathTerminal           // 7 — /vh/term/ws websocket pump (terminal PTY egress)
+	ProxyPathMessages           // 5 — /vh/session/{id}/messages (historical message page)
+	ProxyPathTerminal           // 6 — /vh/term/ws websocket pump (terminal PTY egress)
 	numProxyPathClasses
 )
 
@@ -34,7 +33,6 @@ var proxyPathClassName = [numProxyPathClasses]string{
 	"code_file",
 	"render",
 	"snapshot",
-	"branch",
 	"messages",
 	"terminal",
 }
