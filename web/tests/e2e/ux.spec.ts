@@ -3,19 +3,19 @@ import { projectUrl } from "./util";
 
 // Fixture-backed tests for the parallel-session / permission UX.
 
-test("sending a prompt shows a working spinner that returns to idle", async ({ page }) => {
+test("sending a prompt shows a working indicator (running ring) that returns to idle", async ({ page }) => {
   await page.goto(projectUrl("/"));
   await page.getByRole("button", { name: /Demo session/ }).click();
   await page.getByPlaceholder("Message…").fill("hello");
   await page.keyboard.press("Enter");
-  // The session's sidebar shows the opencode-style working spinner during the
-  // streamed turn (replacing the old blinking dot)...
-  await expect(page.locator(".tree-node .tree-spinner").first()).toBeVisible({ timeout: 5000 });
+  // The session's sidebar shows the running ring on the twisty during the
+  // streamed turn (the sole busy signal, replacing the old spinner)...
+  await expect(page.locator(".tree-twisty.running").first()).toBeVisible({ timeout: 5000 });
   // ...and the chat shows the "Working…" shimmer (driven by the busy activity
   // signal, not just an in-flight assistant message)...
   await expect(page.locator(".working-text")).toBeVisible();
   // ...and both settle when the turn completes.
-  await expect(page.locator(".tree-node .tree-spinner")).toHaveCount(0, { timeout: 8000 });
+  await expect(page.locator(".tree-twisty.running")).toHaveCount(0, { timeout: 8000 });
   await expect(page.locator(".working-text")).toHaveCount(0, { timeout: 8000 });
 });
 
@@ -71,7 +71,7 @@ test("Stop clears the working indicator immediately (abort)", async ({ page }) =
   // once and STAY gone (a reconnect snapshot can't re-arm a stopped turn).
   await page.locator(".send-btn.stop").click();
   await expect(page.locator(".working-text")).toHaveCount(0, { timeout: 2000 });
-  await expect(page.locator(".tree-node .tree-spinner")).toHaveCount(0, { timeout: 2000 });
+  await expect(page.locator(".tree-twisty.running")).toHaveCount(0, { timeout: 2000 });
 });
 
 test("New session defers creation until the first message is sent", async ({ page }) => {

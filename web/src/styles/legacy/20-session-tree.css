@@ -41,19 +41,22 @@
   width: 7px;
   border-top: 1px solid var(--border);
 }
-.tree-spinner { flex: 0 0 auto; width: 11px; height: 11px; color: var(--accent); }
-/* Per-cell shimmer (each square fades on its own randomized phase — the original
-   opencode look). */
+/* Per-cell shimmer for the shared Spinner component (each square fades on its
+   own randomized phase — the original opencode look). Used by CodeView /
+   ChatView / Part; the tree no longer renders a Spinner (busy signal is the
+   twisty running ring below). */
 @keyframes spin-pulse { 0%, 100% { opacity: 0.4; } 50% { opacity: 1; } }
 @keyframes spin-pulse-dim { 0%, 100% { opacity: 0.15; } 50% { opacity: 0.35; } }
 @media (prefers-reduced-motion: reduce) {
   [data-component="spinner"] rect { animation: none !important; }
-  /* The twisty's pulsing funnel (activated for busy expandable nodes) must
-     also respect reduced-motion — a11y. `!important` wins over the later
-     .twisty-running rule below (same source-order pattern as the spinner). */
-  .tree-twisty span.twisty-running { animation: none !important; }
+  /* The twisty's pulsing running ring (layered around a busy row's glyph via
+     .tree-twisty.running::after below) must also respect reduced-motion — a11y.
+     `!important` wins over the ring rule (same source-order pattern as the
+     shared spinner above). */
+  .tree-twisty.running::after { animation: none !important; }
 }
 .tree-twisty {
+  position: relative; /* positioning context for the .running::after ring overlay */
   flex: none;
   width: 18px;
   height: 30px;
@@ -74,12 +77,29 @@
    twisty color — so this dimming is leaf-only.) */
 .tree-twisty.leaf .icon { opacity: 0.5; }
 .tree-twisty span { display: inline-flex; transition: transform 0.12s var(--ease, ease); }
-/* closed = chevron pointing right; open = chevron down. The running-only state
-   uses a distinct funnel glyph (.twisty-running), tinted + pulsing. */
+/* closed = chevron pointing right; open = chevron down. A busy row keeps its
+   normal glyph (chevron / eye / noChild) and gains a pulsing accent ring around
+   it — the ring is layered via .tree-twisty.running::after (below), orthogonal
+   to the glyph so the glyph stays solid while only the ring pulses. */
 .tree-twisty span:not(.open) { transform: rotate(-90deg); }
-.tree-twisty span.twisty-running { transform: none; color: var(--accent); animation: pulse 1.4s ease-in-out infinite; }
 /* temp = auto-revealed ancestor of the open session (eye glyph), dimmed. */
 .tree-twisty span.twisty-temp { transform: none; color: var(--fg-dim); }
+/* The SOLE busy signal: a pulsing accent ring drawn around the twisty glyph.
+   Orthogonal to the glyph — the chevron / eye / noChild / filtered icon renders
+   normally at full opacity; only this ring's opacity pulses. The ring is a
+   button-level ::after (NOT on the <svg> — pseudo-elements don't render on svg)
+   inset to hug the ~13px icon centered in the 18×30 click target. Covers busy
+   LEAVES too (which previously had no twisty busy-signal at all). */
+@keyframes running-outline { 0%, 100% { opacity: 0.1; } 50% { opacity: 0.7; } }
+.tree-twisty.running::after {
+  content: "";
+  position: absolute;
+  inset: 7px 1px; /* 16×16 ring centered on the 13px glyph inside the 18×30 button */
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  animation: running-outline 1.4s ease-in-out infinite;
+  pointer-events: none;
+}
 .tree-node {
   display: flex;
   flex-direction: column;

@@ -134,11 +134,14 @@ describe("TreeRow rendering (self-contained node, §3)", () => {
     expect(chip?.textContent).toContain("Cl");
   });
 
-  it("shows a busy spinner when activity is busy", () => {
+  it("marks the twisty running (ring) and renders NO tree-spinner when activity is busy", () => {
     const { container } = render(() => (
       <TreeRow node={baseNode({ activity: "busy" })} depth={0} selected={false} expanded={false} onSelect={() => {}} onToggle={() => {}} />
     ));
-    expect(nodeButton(container as unknown as HTMLElement).querySelector(".tree-spinner")).not.toBeNull();
+    // The shimmering spinner block was removed from the label area — the twisty
+    // running ring is now the sole busy signal.
+    expect(nodeButton(container as unknown as HTMLElement).querySelector(".tree-spinner")).toBeNull();
+    expect(twisty(container as unknown as HTMLElement).classList.contains("running")).toBe(true);
   });
 
   it("shows an error dot when activity is error", () => {
@@ -169,12 +172,11 @@ describe("TreeRow rendering (self-contained node, §3)", () => {
     expect(nodeButton(container as unknown as HTMLElement).querySelector(".dot.needs-input")).not.toBeNull();
   });
 
-  it("does NOT show a busy spinner AND an error dot at once (busy wins)", () => {
+  it("does NOT show an error dot when activity is busy (busy suppresses priority dots)", () => {
     const { container } = render(() => (
       <TreeRow node={baseNode({ activity: "busy" })} depth={0} selected={false} expanded={false} onSelect={() => {}} onToggle={() => {}} />
     ));
     const btn = nodeButton(container as unknown as HTMLElement);
-    expect(btn.querySelector(".tree-spinner")).not.toBeNull();
     expect(btn.querySelector(".dot.error")).toBeNull();
   });
 
@@ -430,15 +432,15 @@ describe("TreeRow depth-based tree guides (P0-A, tree=2 UI parity)", () => {
   });
 });
 
-// ── tree=2 UI parity: subtreeBusy collapsed-ancestor spinner (P1-B) ───────────
-// A collapsed ancestor of a running subagent previously showed NO spinner
+// ── tree=2 UI parity: subtreeBusy collapsed-ancestor running ring (P1-B) ──────
+// A collapsed ancestor of a running subagent previously showed NO busy signal
 // because its OWN activity was idle. The server now ships a `subtreeBusy` flag
 // (rolled up like subtreeNeedsInput); the client OR's it into isBusy so the
-// collapsed ancestor of a busy descendant renders the busy spinner.
-describe("TreeRow subtreeBusy spinner (P1-B, tree=2 UI parity)", () => {
-  // CRUX: collapsed ancestor of a busy descendant shows the spinner even though
-  // the ancestor's own activity is idle.
-  it("shows the busy spinner when flags.subtreeBusy is true and activity is idle", () => {
+// collapsed ancestor of a busy descendant renders the twisty running ring.
+describe("TreeRow subtreeBusy running ring (P1-B, tree=2 UI parity)", () => {
+  // CRUX: collapsed ancestor of a busy descendant shows the running ring even
+  // though the ancestor's own activity is idle.
+  it("applies the twisty running ring when flags.subtreeBusy is true and activity is idle", () => {
     const { container } = render(() => (
       <TreeRow
         node={baseNode({ activity: "idle", flags: { ...baseNode().flags, subtreeBusy: true } })}
@@ -449,10 +451,10 @@ describe("TreeRow subtreeBusy spinner (P1-B, tree=2 UI parity)", () => {
         onToggle={() => {}}
       />
     ));
-    expect(nodeButton(container as unknown as HTMLElement).querySelector(".tree-spinner")).not.toBeNull();
+    expect(twisty(container as unknown as HTMLElement).classList.contains("running")).toBe(true);
   });
 
-  it("does NOT show the busy spinner when subtreeBusy is false and activity is idle", () => {
+  it("does NOT apply the twisty running ring when subtreeBusy is false and activity is idle", () => {
     const { container } = render(() => (
       <TreeRow
         node={baseNode({ activity: "idle", flags: { ...baseNode().flags, subtreeBusy: false } })}
@@ -463,19 +465,19 @@ describe("TreeRow subtreeBusy spinner (P1-B, tree=2 UI parity)", () => {
         onToggle={() => {}}
       />
     ));
-    expect(nodeButton(container as unknown as HTMLElement).querySelector(".tree-spinner")).toBeNull();
+    expect(twisty(container as unknown as HTMLElement).classList.contains("running")).toBe(false);
   });
 
-  it("does NOT show the busy spinner when subtreeBusy is absent (undefined is falsy)", () => {
+  it("does NOT apply the twisty running ring when subtreeBusy is absent (activity idle)", () => {
     const { container } = render(() => (
       <TreeRow node={baseNode({ activity: "idle" })} depth={0} selected={false} expanded={false} onSelect={() => {}} onToggle={() => {}} />
     ));
-    expect(nodeButton(container as unknown as HTMLElement).querySelector(".tree-spinner")).toBeNull();
+    expect(twisty(container as unknown as HTMLElement).classList.contains("running")).toBe(false);
   });
 
   // Regression guard: the OR did not break the self-busy path. A node whose own
-  // activity is busy still shows the spinner regardless of subtreeBusy.
-  it("still shows the busy spinner when activity is busy and subtreeBusy is false (self-busy path intact)", () => {
+  // activity is busy still shows the running ring regardless of subtreeBusy.
+  it("still applies the twisty running ring when activity is busy and subtreeBusy is false (self-busy path intact)", () => {
     const { container } = render(() => (
       <TreeRow
         node={baseNode({ activity: "busy", flags: { ...baseNode().flags, subtreeBusy: false } })}
@@ -486,7 +488,7 @@ describe("TreeRow subtreeBusy spinner (P1-B, tree=2 UI parity)", () => {
         onToggle={() => {}}
       />
     ));
-    expect(nodeButton(container as unknown as HTMLElement).querySelector(".tree-spinner")).not.toBeNull();
+    expect(twisty(container as unknown as HTMLElement).classList.contains("running")).toBe(true);
   });
 
   // The `running` class on .tree-node keys off isBusy; it must also be applied
@@ -506,44 +508,66 @@ describe("TreeRow subtreeBusy spinner (P1-B, tree=2 UI parity)", () => {
   });
 });
 
-// ── tree=2 UI parity: twisty "running" funnel (P1, port from proj=1) ─────────
-// The old proj=1 client showed a pulsing accent funnel (.twisty-running) on a
-// busy EXPANDABLE node's twisty instead of the chevron. It was dropped in the
-// tree=2 rewrite even though its CSS rule (legacy/20-session-tree.css) survived
-// unused. These pin the 4-way twisty precedence (flat > leaf > busy > chevron):
-// a busy expandable node renders the funnel; an idle expandable node renders the
-// chevron; clicking a busy expandable node's funnel still toggles (the funnel is
-// a glyph swap, not a new affordance).
-describe("TreeRow twisty running funnel (P1, port from proj=1)", () => {
-  it("renders the running marker (.twisty-running > filtered icon) for a busy EXPANDABLE node", () => {
+// ── tree=2 UI parity: twisty "running" ring (P1) ─────────────────────────────
+// The busy signal on a tree row is a pulsing accent ring layered around the
+// twisty glyph via .tree-twisty.running::after (legacy/20-session-tree.css) —
+// ORTHOGONAL to the glyph: a busy row keeps its normal glyph (chevron / eye /
+// noChild) and the ring's opacity pulses while the glyph stays solid. This
+// finally covers busy LEAVES too (which previously had no twisty busy-signal).
+// The glyph precedence is 4-way: flat > leaf > revealed(eye) > chevron; isBusy
+// no longer picks the glyph — it only toggles the `running` class on the button.
+describe("TreeRow twisty running ring (P1)", () => {
+  it("renders the chevron glyph AND the running class for a busy EXPANDABLE node (ring around the chevron)", () => {
     const { container } = render(() => (
       <TreeRow node={baseNode({ activity: "busy", childCount: 2 })} depth={0} selected={false} expanded={false} onSelect={() => {}} onToggle={() => {}} />
     ));
     const t = twisty(container as unknown as HTMLElement);
-    const running = t.querySelector("span.twisty-running");
-    expect(running).not.toBeNull();
-    // The running marker glyph is the `filtered` icon — pin its exact path so a wrong
-    // icon can't pass as "some svg inside the span".
-    const path = running?.querySelector("svg.icon path");
-    expect(path?.getAttribute("d")).toBe("M6 5v14M6 8h11M6 12h5M6 16h11");
-    // The twisty must NOT carry the dimmed `leaf` class (funnel renders at full
-    // --accent, not dimmed like the noChild terminal marker).
+    // The ring is the sole busy signal: the twisty button carries `running`.
+    expect(t.classList.contains("running")).toBe(true);
+    // The glyph swap is GONE — no .twisty-running span, and no shimmering
+    // .tree-spinner in the row.
+    expect(t.querySelector("span.twisty-running")).toBeNull();
+    expect(nodeButton(container as unknown as HTMLElement).querySelector(".tree-spinner")).toBeNull();
+    // A busy expandable node renders its NORMAL glyph — the chevron. Pin the
+    // exact chevronDown path so a wrong icon can't pass as "some svg".
+    const path = t.querySelector("svg.icon path");
+    expect(path?.getAttribute("d")).toBe("m6 9 6 6 6-6");
+    // The twisty must NOT carry the dimmed `leaf` class (chevron renders at full
+    // tone on an expandable node, not dimmed like the noChild terminal marker).
     expect(t.classList.contains("leaf")).toBe(false);
   });
 
-  it("renders the chevron (NOT the funnel) for an IDLE expandable node", () => {
+  it("renders the noChild glyph AND the running class for a busy LEAF node (busy leaves finally get a signal)", () => {
+    const { container } = render(() => (
+      <TreeRow node={baseNode({ activity: "busy", childCount: 0 })} depth={0} selected={false} expanded={false} onSelect={() => {}} onToggle={() => {}} />
+    ));
+    const t = twisty(container as unknown as HTMLElement);
+    // A busy leaf carries BOTH the leaf class (noChild terminal marker) AND the
+    // running class (the pulsing ring around it).
+    expect(t.classList.contains("leaf")).toBe(true);
+    expect(t.classList.contains("running")).toBe(true);
+    // The glyph is the noChild terminal marker — pin its exact path.
+    const path = t.querySelector("svg.icon path");
+    expect(path?.getAttribute("d")).toBe("M6 12h8M17 12h.01");
+    // No glyph swap, no spinner.
+    expect(t.querySelector("span.twisty-running")).toBeNull();
+    expect(nodeButton(container as unknown as HTMLElement).querySelector(".tree-spinner")).toBeNull();
+  });
+
+  it("renders the chevron with NO running ring for an IDLE expandable node", () => {
     const { container } = render(() => (
       <TreeRow node={baseNode({ activity: "idle", childCount: 2 })} depth={0} selected={false} expanded={false} onSelect={() => {}} onToggle={() => {}} />
     ));
     const t = twisty(container as unknown as HTMLElement);
-    // Idle expandable falls through to the chevron branch: no funnel span.
-    expect(t.querySelector("span.twisty-running")).toBeNull();
+    // Idle expandable: no running ring (the `running` class is busy-only).
+    expect(t.classList.contains("running")).toBe(false);
     // The chevron branch renders a bare <span> (classList open/no-class) holding
     // the chevronDown icon — present for an idle expandable node.
     expect(t.querySelector("span")).not.toBeNull();
+    expect(t.querySelector("span.twisty-running")).toBeNull();
   });
 
-  it("still fires onToggle when a busy expandable node's funnel twisty is clicked (glyph swap, not a new affordance)", () => {
+  it("still fires onToggle when a busy expandable node's twisty is clicked (the ring is a glyph-orthogonal overlay, not a new affordance)", () => {
     const onToggle = vi.fn();
     const { container } = render(() => (
       <TreeRow node={baseNode({ id: "busy-tog", activity: "busy", childCount: 2 })} depth={0} selected={false} expanded={false} onSelect={() => {}} onToggle={onToggle} />
@@ -563,8 +587,9 @@ describe("TreeRow twisty running funnel (P1, port from proj=1)", () => {
 // unused. These pin the eye variant directly via the `revealed` prop: TreeRow
 // takes `revealed` as a plain boolean (SessionTree computes it from the STRICT
 // selectedPathIds set ∩ !isUserExpanded ∩ id !== selectedId), so the eye is
-// testable without SessionTree plumbing. The precedence is flat > leaf >
-// revealed(eye) > busy(funnel) > chevron — so these also guard that the eye
+// testable without SessionTree plumbing. The glyph precedence is flat > leaf >
+// revealed(eye) > chevron — busy no longer picks the glyph (it toggles the
+// `running` ring on the button instead) — so these also guard that the eye
 // does NOT clobber the leaf terminal marker.
 describe("TreeRow twisty temp eye (P1, port from proj=1)", () => {
   it("renders the eye glyph (.twisty-temp) for a revealed (temp) node", () => {

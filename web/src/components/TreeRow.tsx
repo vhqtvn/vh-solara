@@ -16,7 +16,6 @@
 // expand/collapse wiring (treeOps fetch + collapseNode) and selection.
 import { For, Show } from "solid-js";
 import Icon from "./Icon";
-import Spinner from "./Spinner";
 import RelTime from "./RelTime";
 import { agentDisplay, displayName } from "../projectSettings";
 import type { TreeNode } from "../sync/treeMap";
@@ -120,7 +119,7 @@ export function TreeRow(props: TreeRowProps) {
       <button
         type="button"
         class="tree-twisty"
-        classList={{ leaf: !props.flat && isLeaf() }}
+        classList={{ leaf: !props.flat && isLeaf(), running: !props.flat && isBusy() }}
         aria-label={props.expanded ? "Collapse" : "Expand"}
         data-tip={props.expanded ? "Collapse" : "Expand"}
         onClick={(e) => {
@@ -141,8 +140,9 @@ export function TreeRow(props: TreeRowProps) {
           // Tree-mode leaf: the `noChild` dash-dot terminal marker. The button
           // carries the `leaf` class (above) so CSS dims it as a quiet terminal
           // cue. Bare render (no span) keeps it clear of the chevron rotation.
-          // A busy LEAF still shows noChild — the funnel below is for EXPANDABLE
-          // nodes only (this branch precedes the isBusy funnel).
+          // A busy LEAF still shows noChild — busy does not swap the glyph; it
+          // toggles the `running` class on this button (above), so a busy leaf
+          // gains a pulsing accent ring around its terminal marker.
           <Icon name="noChild" size={13} />
         ) : props.revealed ? (
           // Auto-revealed ancestor of the selected session: the dimmed `eye`
@@ -154,21 +154,13 @@ export function TreeRow(props: TreeRowProps) {
           // above still fires onToggle — clicking the eye promotes it to a
           // user-expanded node (chevron), matching proj=1 temp→filtered.
           <span class="twisty-temp"><Icon name="eye" size={13} /></span>
-        ) : isBusy() ? (
-          // Busy expandable node: the pulsing accent funnel (the `filter` glyph
-          // in a `.twisty-running` span). Ports the old proj=1 twisty's running
-          // state verbatim — the CSS rule (legacy/20-session-tree.css) already
-          // tints it --accent + pulses it, and `transform: none` there keeps the
-          // funnel upright (it overrides the chevron's span:not(.open) rotate).
-          // onClick is UNCHANGED: this is a glyph swap, not a new affordance —
-          // the guard above still fires onToggle for any expandable node.
-          <span class="twisty-running">
-            <Icon name="filtered" size={12} />
-          </span>
         ) : (
           // Expandable tree node: the chevron, wrapped in the open/not-open span
           // whose `.tree-twisty span:not(.open)` rule rotates it to point right
-          // when collapsed. Unchanged from the original wiring.
+          // when collapsed. A BUSY expandable node still renders this chevron —
+          // busy no longer swaps the glyph; it toggles the `running` class on
+          // this button (above), which CSS layers as a pulsing accent ring over
+          // the glyph (legacy/20-session-tree.css .tree-twisty.running::after).
           <span classList={{ open: props.expanded }}>
             <Icon name="chevronDown" size={13} />
           </span>
@@ -194,10 +186,9 @@ export function TreeRow(props: TreeRowProps) {
         {...(props.menuProps ?? {})}
       >
         <span class="tree-line1">
-          <Show when={isBusy()}>
-            <Spinner class="tree-spinner" />
-          </Show>
-          {/* Priority indicators (mutually exclusive with the busy spinner). */}
+          {/* Priority indicators (suppressed while busy — the `running` ring on
+              the twisty button is the sole busy signal, so no shimmering block
+              renders beside the title). */}
           <Show when={!isBusy() && isError()}>
             <span class="dot error" data-tip="error" />
           </Show>
