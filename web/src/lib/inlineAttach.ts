@@ -292,3 +292,43 @@ export async function resolveInlineAttachments(
     failedIds,
   };
 }
+
+// --- S5: orphan indicator + localId extraction -----------------------------
+//
+// The inline-mode markdown ref in the composer text is the SOURCE OF TRUTH for
+// "this attachment exists" (S3/S4). A chip whose token the user deleted from
+// the text (while the chip persists) is an ORPHAN: its held File will NOT be
+// uploaded at send (lazy upload skips absent tokens) and the chip is shown
+// dimmed with a "won't be uploaded / sent" affordance plus a re-insert control
+// that splices the markdown ref back at the textarea caret. These pure helpers
+// extract localId from a chip url and decide orphan status from the present-
+// token set, so the orphan UI is a thin reactive wrapper over
+// scanInlineTokens(input()) (S4) + isInlineChipOrphan (here). Framework-free
+// so they are unit-testable in jsdom without mounting ChatView.
+
+// Pure: extract the localId from a synthetic inline-chip url, or null if the
+// url is not a vh-attach: url (a real uploaded file:// attachment, an http url,
+// etc.) or is the bare prefix form with no id. Inverse of inlineAttachUrl.
+//   inlineLocalIdFromUrl("vh-attach:inl3") -> "inl3"
+//   inlineLocalIdFromUrl("file:///x.png")  -> null   (non-inline, N/A)
+//   inlineLocalIdFromUrl("vh-attach:")     -> null   (bare prefix, no id)
+export function inlineLocalIdFromUrl(url: string): string | null {
+  if (!isInlineChipUrl(url)) return null;
+  const localId = url.slice(VH_ATTACH_URL_PREFIX.length);
+  return localId.length > 0 ? localId : null;
+}
+
+// Pure: is an inline chip ORPHANED? An orphan is a vh-attach:<localId> chip
+// whose localId is NOT in `presentIds` — the set of localIds whose markdown ref
+// is still present in the composer text (derived reactively in ChatView from
+// scanInlineTokens(input())). Non-inline urls (real file:// uploads, http, "")
+// are NEVER orphans: they represent attachments that exist independent of the
+// composer text. The orphan concept applies ONLY to inline chips.
+//   isInlineChipOrphan("vh-attach:inl3", Set(["inl3"])) -> false (present)
+//   isInlineChipOrphan("vh-attach:inl3", Set())         -> true  (absent)
+//   isInlineChipOrphan("file:///x.png", Set(["inl3"]))  -> false (non-inline)
+export function isInlineChipOrphan(chipUrl: string, presentIds: Set<string>): boolean {
+  const localId = inlineLocalIdFromUrl(chipUrl);
+  if (localId === null) return false; // non-inline / degenerate -> never orphan
+  return !presentIds.has(localId);
+}

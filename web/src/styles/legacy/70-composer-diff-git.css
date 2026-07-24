@@ -87,6 +87,23 @@
   color: var(--fg-dim);
 }
 .attach-chip.uploading { color: var(--fg-dim); font-style: italic; }
+/* S5: an inline chip whose markdown ref was deleted from the composer text.
+   Its held File will NOT be uploaded/sent (lazy upload skips absent tokens).
+   Dim it and badge it so the operator sees the ref is gone; a re-insert control
+   (the retry arrow button) restores the token at the caret. Non-inline chips are
+   never orphaned. Opacity (not a color swap) keeps it legible while clearly
+   de-emphasized vs. a live chip. */
+.attach-chip.orphan { opacity: 0.55; }
+.attach-orphan-badge {
+  font-size: 10px;
+  line-height: 1;
+  padding: 2px 4px;
+  border-radius: 4px;
+  color: var(--fg-dim);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  white-space: nowrap;
+}
 .attach-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg); }
 .attach-chip button {
   display: inline-flex;

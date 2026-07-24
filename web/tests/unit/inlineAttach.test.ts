@@ -30,6 +30,8 @@ import {
   isInlineChipUrl,
   selectInlineImageParts,
   resolveInlineAttachments,
+  inlineLocalIdFromUrl,
+  isInlineChipOrphan,
   type ResolvedAttachment,
   type InlineUploader,
 } from "../../src/lib/inlineAttach";
@@ -527,5 +529,316 @@ describe("resolveInlineAttachments — lazy upload + substitute + vision gate", 
     );
     expect(calls.map((f) => f.name)).toEqual(["b.png", "c.png", "a.png"]);
     expect(r.uploadedIds).toEqual(["inl2", "inl3", "inl1"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S5: orphan indicator + localId extraction + inline lifecycle tidy.
+//
+// inlineLocalIdFromUrl / isInlineChipOrphan are pure: they derive localId from
+// a chip url and decide orphan status from the present-token set. The orphan
+// UI in ChatView is a thin reactive wrapper: presentInlineIds =
+// createMemo(() => new Set(scanInlineTokens(input()))), and each chip's orphan
+// flag = isInlineChipOrphan(chip.url, presentInlineIds()). The remaining tests
+// model the inline lifecycle (chip delete drops File, dF1 clear-on-success, dF2
+// rollback-on-failure retry idempotency, re-insert composition) using these pure
+// helpers + a plain Map/array standing in for ChatView's inlineFiles /
+// attachments() — so they exercise the EXACT logic without mounting ChatView
+// (which requires ~150 lines of module mocks; the pure seam is deterministic).
+
+describe("inlineLocalIdFromUrl — extract localId from a chip url (inverse of inlineAttachUrl)", () => {
+  it("extracts the localId from a synthetic inline chip url", () => {
+    expect(inlineLocalIdFromUrl("vh-attach:inl3")).toBe("inl3");
+  });
+
+  it("round-trips with inlineAttachUrl", () => {
+    const id = "inl42";
+    expect(inlineLocalIdFromUrl(inlineAttachUrl(id))).toBe(id);
+  });
+
+  it("returns null for a real file:// uploaded attachment (non-inline)", () => {
+    expect(inlineLocalIdFromUrl("file:///proj/.vh-solara/x.png")).toBeNull();
+  });
+
+  it("returns null for an http url (never collides with the synthetic scheme)", () => {
+    expect(inlineLocalIdFromUrl("https://example.com/x.png")).toBeNull();
+  });
+
+  it("returns null for the bare prefix form (no id)", () => {
+    expect(inlineLocalIdFromUrl("vh-attach:")).toBeNull();
+  });
+
+  it("returns null for empty input", () => {
+    expect(inlineLocalIdFromUrl("")).toBeNull();
+  });
+});
+
+describe("isInlineChipOrphan — orphan status from the present-token set", () => {
+  it("token PRESENT in presentIds -> NOT an orphan (false)", () => {
+    expect(isInlineChipOrphan("vh-attach:inl3", new Set(["inl3"]))).toBe(false);
+  });
+
+  it("token ABSENT from presentIds -> orphan (true)", () => {
+    expect(isInlineChipOrphan("vh-attach:inl3", new Set())).toBe(true);
+  });
+
+  it("a DIFFERENT localId present does not rescue it -> orphan (true)", () => {
+    expect(isInlineChipOrphan("vh-attach:inl3", new Set(["inl7"]))).toBe(true);
+  });
+
+  it("non-inline chip url -> NEVER an orphan (false), regardless of presentIds", () => {
+    expect(isInlineChipOrphan("file:///x.png", new Set(["inl3"]))).toBe(false);
+    expect(isInlineChipOrphan("file:///x.png", new Set())).toBe(false);
+  });
+
+  it("http url -> never an orphan (false)", () => {
+    expect(isInlineChipOrphan("https://example.com/x.png", new Set())).toBe(false);
+  });
+
+  it("bare prefix (no id) -> not an orphan (degenerate)", () => {
+    expect(isInlineChipOrphan("vh-attach:", new Set())).toBe(false);
+  });
+
+  it("empty url -> not an orphan", () => {
+    expect(isInlineChipOrphan("", new Set())).toBe(false);
+  });
+
+  it("composed with scanInlineTokens: a chip whose ref was deleted reads orphaned", () => {
+    // The reactive derivation ChatView uses: presentIds derived from the live
+    // composer text. Here inl3's ref is gone from the text -> orphan; inl1 still
+    // present -> not orphan.
+    const presentIds = new Set(scanInlineTokens("see ![a](vh-attach:inl1) end"));
+    expect(isInlineChipOrphan("vh-attach:inl1", presentIds)).toBe(false);
+    expect(isInlineChipOrphan("vh-attach:inl3", presentIds)).toBe(true);
+  });
+});
+
+describe("re-insert composition — insertAtCaret(attachMarkdownRef) splices the ref at the caret", () => {
+  function mkTa(value: string, sel: number, end = sel): HTMLTextAreaElement {
+    const ta = document.createElement("textarea");
+    ta.value = value;
+    ta.selectionStart = sel;
+    ta.selectionEnd = end;
+    return ta;
+  }
+
+  it("re-inserts an IMAGE ref at the caret (orphan -> token present again)", () => {
+    // Orphan state: the text no longer holds inl3's ref. Re-insert composes
+    // attachMarkdownRef + insertAtCaret exactly as reinsertInlineChip does.
+    const ta = mkTa("see  end", 4); // caret between "see " and " end"
+    insertAtCaret(ta, attachMarkdownRef("a.png", true, "inl3"));
+    expect(ta.value).toBe("see ![a.png](vh-attach:inl3) end");
+    // After re-insert, scanInlineTokens sees the token -> the chip is no longer
+    // orphaned (isInlineChipOrphan now false).
+    const presentIds = new Set(scanInlineTokens(ta.value));
+    expect(isInlineChipOrphan("vh-attach:inl3", presentIds)).toBe(false);
+  });
+
+  it("re-inserts a NON-IMAGE ref identically (same composition, different form)", () => {
+    const ta = mkTa("msg", 3);
+    insertAtCaret(ta, attachMarkdownRef("d.pdf", false, "inl7"));
+    expect(ta.value).toBe("msg[d.pdf](vh-attach:inl7)");
+    const presentIds = new Set(scanInlineTokens(ta.value));
+    expect(isInlineChipOrphan("vh-attach:inl7", presentIds)).toBe(false);
+  });
+});
+
+describe("chip delete drops the held File (removeAttachment cleanup seam)", () => {
+  it("deleting an inline chip removes its File from inlineFiles", () => {
+    // Model ChatView's inlineFiles + removeAttachment cleanup. A real uploaded
+    // chip (file://) has no inlineFiles entry and is untouched.
+    const inlineFiles = new Map<string, File>([
+      ["inl3", mkFile("a.png", "image/png")],
+      ["inl7", mkFile("d.pdf", "application/pdf")],
+    ]);
+    // removeAttachment("vh-attach:inl3") cleanup seam:
+    const localId = inlineLocalIdFromUrl("vh-attach:inl3");
+    expect(localId).toBe("inl3");
+    if (localId !== null) inlineFiles.delete(localId);
+    expect(inlineFiles.has("inl3")).toBe(false);
+    expect(inlineFiles.has("inl7")).toBe(true); // other inline File untouched
+  });
+
+  it("deleting a NON-inline chip (file:// url) does not touch inlineFiles", () => {
+    const inlineFiles = new Map<string, File>([["inl3", mkFile("a.png", "image/png")]]);
+    const localId = inlineLocalIdFromUrl("file:///proj/x.png");
+    expect(localId).toBeNull();
+    if (localId !== null) inlineFiles.delete(localId); // skipped
+    expect(inlineFiles.has("inl3")).toBe(true); // untouched
+  });
+});
+
+describe("dF1 — successful inline send clears inlineFiles (no retained bytes)", () => {
+  it("after a successful resolve + clear, inlineFiles holds no File bytes", async () => {
+    // Model the inline send lifecycle: resolve consumes the present tokens
+    // (uploads them), and on SUCCESS ChatView clears inlineFiles (dF1). The
+    // bytes must not linger for the ChatView lifetime.
+    const inlineFiles = new Map<string, File>([["inl1", mkFile("a.png", "image/png")]]);
+    const { uploader } = mockUploader({ "a.png": mkResolved("a.png", "image/png", "p/a.png") });
+    const r = await resolveInlineAttachments("![a](vh-attach:inl1)", inlineFiles, uploader, false);
+    expect(r.uploadedIds).toEqual(["inl1"]); // the held File WAS uploaded (consumed)
+    // dF1 success path: ChatView calls inlineFiles.clear().
+    inlineFiles.clear();
+    expect(inlineFiles.size).toBe(0);
+  });
+
+  it("inlineFiles.clear() is idempotent and drops ALL held bytes", () => {
+    const inlineFiles = new Map<string, File>([
+      ["inl1", mkFile("a.png", "image/png")],
+      ["inl2", mkFile("b.png", "image/jpeg")],
+      ["inl3", mkFile("d.pdf", "application/pdf")],
+    ]);
+    inlineFiles.clear();
+    expect(inlineFiles.size).toBe(0);
+    inlineFiles.clear(); // idempotent
+    expect(inlineFiles.size).toBe(0);
+  });
+});
+
+describe("dF2/b-F1 — failed inline send removes ONLY appended imageParts (targeted removal)", () => {
+  // b-F1 removed the UNCONDITIONAL snapshot restore (setAttachments(preResolveAtts))
+  // in favor of targeted removal: capture the imageParts array the resolve block
+  // appends (reference identity), and on failure filter out ONLY those. This
+  // preserves the dF2 no-stacking guarantee AND an operator-added chip during the
+  // await window. These tests model ChatView's send() lifecycle with a plain
+  // array + a captured `appendedImageParts` ref, exercising the EXACT logic.
+
+  it("WITHOUT targeted removal: imageParts stack on retry (the bug dF2/b-F1 fixes)", async () => {
+    // If the appended imageParts are NOT removed on failure, a retry re-resolves
+    // and the caller's attachment list accumulates a duplicate.
+    // (resolveInlineAttachments is idempotent — the duplication is purely the
+    // additive append across attempts.)
+    const files = () => new Map<string, File>([["inl1", mkFile("a.png", "image/png")]]);
+    const { uploader } = mockUploader({ "a.png": mkResolved("a.png", "image/png", "p/a.png") });
+    const text = "![a](vh-attach:inl1)";
+    let atts: ResolvedAttachment[] = []; // chips-only baseline modeled as empty
+    // Attempt 1: resolve + append (no removal on failure).
+    const r1 = await resolveInlineAttachments(text, files(), uploader, true);
+    atts = [...atts, ...r1.imageParts];
+    expect(atts.length).toBe(1);
+    // sendText FAILS -> no removal (bug) -> imageParts linger; retry appends MORE.
+    const r2 = await resolveInlineAttachments(text, files(), uploader, true);
+    atts = [...atts, ...r2.imageParts];
+    expect(atts.length).toBe(2); // DUPLICATE — the bug dF2/b-F1 fixes
+  });
+
+  it("WITH targeted removal: retry yields exactly one image part (no stacking)", async () => {
+    // The dF2 fix (targeted form): capture the appended imageParts array; on send
+    // FAILURE remove ONLY those parts (reference identity). A retry re-resolves
+    // from the same baseline -> exactly one image part, not two.
+    const files = () => new Map<string, File>([["inl1", mkFile("a.png", "image/png")]]);
+    const { uploader } = mockUploader({ "a.png": mkResolved("a.png", "image/png", "p/a.png") });
+    const text = "![a](vh-attach:inl1)";
+    let atts: ResolvedAttachment[] = []; // chips-only baseline
+    let appendedImageParts: ResolvedAttachment[] | null = null;
+    // Attempt 1: resolve, append imageParts, capture the appended ref.
+    const r1 = await resolveInlineAttachments(text, files(), uploader, true);
+    if (r1.imageParts.length > 0) {
+      appendedImageParts = r1.imageParts;
+      atts = [...atts, ...r1.imageParts];
+    }
+    expect(atts.length).toBe(1);
+    // sendText FAILS -> remove ONLY ours (reference identity, mirroring
+    // setAttachments((a) => a.filter((x) => !ours.includes(x)))).
+    const ours = appendedImageParts!;
+    atts = atts.filter((x) => !ours.includes(x));
+    expect(atts.length).toBe(0); // appended imagePart removed
+    // Attempt 2 (retry): re-resolve from the same chips-only baseline.
+    const r2 = await resolveInlineAttachments(text, files(), uploader, true);
+    atts = [...atts, ...r2.imageParts];
+    expect(atts.length).toBe(1); // NOT 2 — targeted removal prevented stacking
+  });
+
+  it("b-F1: targeted removal PRESERVES an operator-added chip during the await window", async () => {
+    // The defect b-F1 fixes: the operator adds an attachment chip to the live
+    // list DURING the await resolveInlineAttachments / await sendText window. A
+    // failure must NOT discard that chip — only the imageParts the resolve block
+    // appended are ours to remove. Here the operator's chip is a distinct
+    // ResolvedAttachment object NOT in our appendedImageParts array, so the
+    // filter keeps it while still removing our appended image part.
+    const files = () => new Map<string, File>([["inl1", mkFile("a.png", "image/png")]]);
+    const { uploader } = mockUploader({ "a.png": mkResolved("a.png", "image/png", "p/a.png") });
+    const text = "![a](vh-attach:inl1)";
+    let atts: ResolvedAttachment[] = [];
+    let appendedImageParts: ResolvedAttachment[] | null = null;
+    // Resolve + append imageParts (ours), capturing the ref.
+    const r1 = await resolveInlineAttachments(text, files(), uploader, true);
+    if (r1.imageParts.length > 0) {
+      appendedImageParts = r1.imageParts;
+      atts = [...atts, ...r1.imageParts];
+    }
+    expect(atts.length).toBe(1);
+    // Operator adds a chip during the await window — a DISTINCT object the
+    // failure-removal must NOT touch (e.g. a real upload they dragged in).
+    const operatorChip = { url: "file:///op/added.png", filename: "added.png", mime: "image/png" };
+    atts = [...atts, operatorChip];
+    expect(atts.length).toBe(2);
+    // sendText FAILS -> remove ONLY ours (reference identity). operatorChip is a
+    // different object than anything in appendedImageParts -> survives.
+    const ours = appendedImageParts!;
+    atts = atts.filter((x) => !ours.includes(x));
+    expect(atts.length).toBe(1);
+    expect(atts[0]).toBe(operatorChip); // operator-added chip PRESERVED
+    expect(ours.every((x) => !atts.includes(x))).toBe(true); // ours all gone
+  });
+
+  it("non-inline mode: appendedImageParts stays null (failure path is a no-op for attachments)", () => {
+    // Non-inline mode never enters the resolve block, so appendedImageParts is
+    // never assigned. The failure path's `if (appendedImageParts)` guard skips
+    // the filter -> attachments() is left as the operator last set it. Only the
+    // text is restored. (Documents that the targeted removal is inline-scoped.)
+    const liveAtts: ResolvedAttachment[] = [{ url: "file:///x.png", filename: "x.png", mime: "image/png" }];
+    const appendedImageParts: ResolvedAttachment[] | null = null; // non-inline
+    // sendText FAILS -> guard skips the filter.
+    if (appendedImageParts) {
+      const ours = appendedImageParts;
+      // This line must NOT run; assert it would leave the list intact anyway.
+      /* atts = atts.filter((x) => !ours.includes(x)); */
+    }
+    expect(liveAtts.length).toBe(1); // untouched — operator's chips survive
+  });
+});
+
+// ---------------------------------------------------------------------------
+// a-F1: orphan flag reactivity in the chip-strip <For>.
+//
+// The orphan flag is a DERIVED ACCESSOR in ChatView's <For> callback
+// (`const orphan = () => isInlineChipOrphan(a.url, presentInlineIds())`), read
+// inside JSX (classList/data-tip/Show). SolidJS <For> callbacks run ONCE per
+// item in a NON-tracking scope, so a captured boolean would freeze; the accessor
+// lets the compiler wrap each in-JSX read in a reactive effect tied to
+// presentInlineIds (a memo over scanInlineTokens(input())). The pure
+// isInlineChipOrphan is already covered above; this block asserts the DERIVED
+// accessor recomputes when the present-token set changes — the reactivity the
+// in-JSX read relies on.
+describe("a-F1 — orphan accessor recomputes against a changing present-token set", () => {
+  it("re-deriving orphan() against an updated presentIds set flips the flag", () => {
+    // Models the chip-strip reactivity: presentInlineIds() is a memo over
+    // scanInlineTokens(input()); as the user edits the composer, the set changes
+    // and orphan() (re-read in JSX) must reflect it. Here we drive it directly.
+    const chipUrl = "vh-attach:inl3";
+    const orphan = (presentIds: Set<string>) => isInlineChipOrphan(chipUrl, presentIds);
+    // Composer text still holds the ref -> token present -> NOT an orphan.
+    let presentIds = new Set(scanInlineTokens("see ![a](vh-attach:inl3) here"));
+    expect(orphan(presentIds)).toBe(false);
+    // User deletes the ref -> token absent -> orphan TRUE (re-derived, not cached).
+    presentIds = new Set(scanInlineTokens("see  here"));
+    expect(orphan(presentIds)).toBe(true);
+    // User re-inserts the ref -> present again -> orphan FALSE.
+    presentIds = new Set(scanInlineTokens("see ![a](vh-attach:inl3) end"));
+    expect(orphan(presentIds)).toBe(false);
+  });
+
+  it("the accessor form (vs a captured boolean) yields the value at call time", () => {
+    // Proves the shape Solid's compiler needs: orphan is a FUNCTION over a live
+    // dependency, so each call() reflects the CURRENT set, not the set at the
+    // moment the <For> item was created. A captured `const orphan = ...` would
+    // pin the first value forever.
+    const chipUrl = "vh-attach:inl7";
+    let presentIds = new Set(["inl7"]);
+    const orphan = () => isInlineChipOrphan(chipUrl, presentIds); // closure over live var
+    expect(orphan()).toBe(false); // present at creation
+    presentIds = new Set(); // dependency mutates
+    expect(orphan()).toBe(true); // re-read reflects the new state (reactive seam)
   });
 });

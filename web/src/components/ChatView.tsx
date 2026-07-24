@@ -30,6 +30,10 @@ import {
   INLINE_LOCALID_PREFIX,
   isInlineChipUrl,
   resolveInlineAttachments,
+  scanInlineTokens,
+  inlineLocalIdFromUrl,
+  isInlineChipOrphan,
+  type ResolvedAttachment,
 } from "../lib/inlineAttach";
 import { IGNORED, isSendInFlight, runSendSingleFlight } from "../lib/sendSingleFlight";
 import ModelDialog from "./ModelDialog";
@@ -1532,6 +1536,15 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   const inlineFiles = new Map<string, File>();
   const nextInlineLocalId = () => `${INLINE_LOCALID_PREFIX}${++pendingSeq}`;
 
+  // S5: the set of inline localIds whose markdown ref is STILL PRESENT in the
+  // composer text. Reactive over input(): when the user types/deletes, this set
+  // recomputes and each inline chip's orphan flag (its token absent from the
+  // text) updates. This makes the markdown ref the visible source of truth in
+  // the chip strip: a chip whose ref was deleted is shown as an orphan (dimmed,
+  // "won't be sent", with a re-insert control). Non-inline chips are unaffected
+  // (isInlineChipOrphan returns false for non vh-attach: urls).
+  const presentInlineIds = createMemo(() => new Set(scanInlineTokens(input())));
+
   // Upload any draft-queued (pending) attachments now that a session exists,
   // replacing their synthetic keys with real server urls. Called right after
   // createSession() in send(). A no-op for live sessions, whose attachments
@@ -1627,7 +1640,43 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       setUploading(false);
     }
   }
-  const removeAttachment = (url: string) => setAttachments((a) => a.filter((x) => x.url !== url));
+  const removeAttachment = (url: string) => {
+    // S5: deleting an inline chip (vh-attach:<localId>) must ALSO drop its held
+    // File from inlineFiles — otherwise the bytes linger for the ChatView
+    // lifetime even though the chip (and its token) are gone. Non-inline chips
+    // (real file:// uploads) have no inlineFiles entry; inlineLocalIdFromUrl
+    // returns null and the delete is skipped.
+    const localId = inlineLocalIdFromUrl(url);
+    if (localId !== null) inlineFiles.delete(localId);
+    setAttachments((a) => a.filter((x) => x.url !== url));
+  };
+
+  // S5: re-insert an orphaned inline chip's markdown ref back into the composer
+  // at the textarea caret, restoring its token so the chip returns to normal
+  // (no longer orphaned — the lazy upload will pick it up at send). Mirrors the
+  // addFiles inline insert path (insertAtCaret + attachMarkdownRef + mirror into
+  // input()). No-op for a non-inline chip (no localId to re-insert).
+  const reinsertInlineChip = (a: Attachment) => {
+    const localId = inlineLocalIdFromUrl(a.url);
+    if (localId === null) return;
+    const ta = taRef;
+    const ref = attachMarkdownRef(a.filename, a.mime.startsWith("image/"), localId);
+    if (ta) {
+      ta.focus();
+      insertAtCaret(ta, ref);
+      // Mirror the helper's DOM mutation into input() so the controlled
+      // value={input()} stays in sync (assigning the identical string is a DOM
+      // no-op, so the caret the helper advanced persists — same property the
+      // addFiles inline insert path relies on).
+      setInput(ta.value);
+      setCaret(ta.selectionStart ?? 0);
+    } else {
+      // No textarea ref (should not happen in the composer): append to the
+      // signal so the token is at least present (caret positioning best-effort).
+      setInput(input() + ref);
+    }
+    histIdx = -1;
+  };
 
   function buildParts(text: string, atts?: Attachment[]): any[] {
     // `atts` is optional in practice: the backend serializes QueueItem.Attachments
@@ -2046,6 +2095,17 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     // Original `text` is preserved for the failure-restore setInput(text); only
     // the ENQUEUED text uses resolvedText.
     let resolvedText = text;
+    // S5 dF2 (b-F1 targeted removal): track the imageParts the resolve block
+    // appends so a send FAILURE removes ONLY those parts — NOT the whole list.
+    // The prior UNCONDITIONAL snapshot restore (setAttachments(preResolveAtts))
+    // would silently discard an operator-added chip (or real upload) appended to
+    // the live list during the await resolveInlineAttachments / await sendText
+    // window. resolveInlineAttachments returns a FRESH imageParts array per call
+    // (selectInlineImageParts .filter), so reference identity (`includes`)
+    // isolates exactly ours, and a failed-then-retried inline send still yields
+    // NO duplicate image parts (the dF2 guarantee). Non-inline mode leaves this
+    // null, so the failure path only restores the text.
+    let appendedImageParts: ResolvedAttachment[] | null = null;
     if (effectiveInline(modelHasVision(curModel()), inlineAttachForced())) {
       const r = await resolveInlineAttachments(
         text,
@@ -2058,7 +2118,10 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       // chip list BEFORE the ownership snapshot below so buildParts (at dispatch)
       // emits them and the success-clear still fires. The synthetic vh-attach:
       // chips already in the list are excluded by buildParts (isInlineChipUrl).
-      if (r.imageParts.length > 0) setAttachments((a) => [...a, ...r.imageParts]);
+      if (r.imageParts.length > 0) {
+        appendedImageParts = r.imageParts;
+        setAttachments((a) => [...a, ...r.imageParts]);
+      }
     }
     await runSendSingleFlight(id, async () => {
       const snapText = input();
@@ -2066,6 +2129,15 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       const ok = await sendText(resolvedText, id);
       if (!ok) {
         setInput(text);
+        // dF2/b-F1: remove ONLY the imageParts the resolve block appended so a
+        // retry re-resolves from the same baseline (no stacking) WITHOUT
+        // discarding an operator-added chip during the await window. Reference
+        // identity (includes) isolates exactly our parts; everything else in the
+        // live attachments() list is preserved. Non-inline -> no-op.
+        if (appendedImageParts) {
+          const ours = appendedImageParts;
+          setAttachments((a) => a.filter((x) => !ours.includes(x)));
+        }
         return;
       }
       // Durable custody confirmed. Clear the composer ONLY if it still owns the
@@ -2074,6 +2146,12 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       if (input() === snapText && attachments() === snapAtts) {
         setInput("");
         setAttachments([]);
+        // S5 dF1: a successful inline send consumed every held File (lazy
+        // upload resolved all present tokens, and the chips are now cleared).
+        // Clear inlineFiles so the raw bytes do not linger for the ChatView
+        // lifetime. Inside the snapshot guard so a composer the operator changed
+        // during the wait keeps its (new) chips and their held bytes intact.
+        inlineFiles.clear();
       }
       // For a draft, the draft->live transition (ensureSession -> createSession
       // -> setSelectedId) unmounts this ChatView in App.tsx, which disposes the
@@ -2681,15 +2759,57 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
           <Show when={attachments().length > 0 || uploading()}>
             <div class="attach-row">
               <For each={attachments()}>
-                {(a) => (
-                  <span class="attach-chip" data-tip={a.filename}>
-                    <Icon name="paperclip" size={12} />
-                    <span class="attach-name">{a.filename}</span>
-                    <button type="button" aria-label="Remove attachment" onClick={() => removeAttachment(a.url)}>
-                      <Icon name="x" size={11} />
-                    </button>
-                  </span>
-                )}
+                {(a) => {
+                  // S5: an inline chip (vh-attach:<localId>) is an ORPHAN when
+                  // its token is absent from the composer text (the user deleted
+                  // the markdown ref). Its held File will NOT be uploaded at
+                  // send (lazy upload skips absent tokens); show it dimmed with
+                  // a "won't be sent" badge + a re-insert control that splices
+                  // the ref back at the caret. Non-inline chips (real file://
+                  // uploads) are never orphans. presentInlineIds is a memo over
+                  // scanInlineTokens(input()) so this re-evaluates on every
+                  // keystroke.
+                  //
+                  // a-F1: orphan is a DERIVED ACCESSOR, not a captured boolean.
+                  // SolidJS <For> callbacks run ONCE per item in a NON-tracking
+                  // scope, so a captured `const orphan = isInlineChipOrphan(...)`
+                  // would freeze at item-creation and never react to
+                  // presentInlineIds() changes — the dim/badge/re-insert button
+                  // would NOT appear/disappear as the user edits the composer
+                  // text, defeating S5. Reading orphan() inside JSX props/class
+                  // /Show lets the Solid compiler wrap each read in a reactive
+                  // effect so the orphan UI tracks the live present-token set.
+                  const orphan = () => isInlineChipOrphan(a.url, presentInlineIds());
+                  return (
+                    <span
+                      class="attach-chip"
+                      classList={{ orphan: orphan() }}
+                      data-tip={orphan() ? `${a.filename} (ref removed — won't be sent)` : a.filename}
+                    >
+                      <Icon name="paperclip" size={12} />
+                      <span class="attach-name">{a.filename}</span>
+                      <Show when={orphan()}>
+                        <span
+                          class="attach-orphan-badge"
+                          title="Reference removed from message — won't be uploaded or sent. Re-insert to restore."
+                        >
+                          ref removed
+                        </span>
+                        <button
+                          type="button"
+                          aria-label={`Re-insert ${a.filename} into message`}
+                          title="Re-insert into message"
+                          onClick={() => reinsertInlineChip(a)}
+                        >
+                          <Icon name="retry" size={11} />
+                        </button>
+                      </Show>
+                      <button type="button" aria-label="Remove attachment" onClick={() => removeAttachment(a.url)}>
+                        <Icon name="x" size={11} />
+                      </button>
+                    </span>
+                  );
+                }}
               </For>
               <Show when={uploading()}>
                 <span class="attach-chip uploading">Uploading…</span>
