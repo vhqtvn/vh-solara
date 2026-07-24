@@ -3,7 +3,7 @@
 # gitignored staging dir (web/dist-build); embed-producing targets materialize
 # (copy) the staged bundle into pkg/web/dist right before `go build`.
 
-.PHONY: web web-materialize build build-debug install install-local test test-unit test-web fmt fmt-check vet typecheck e2e e2e-keep docker fixtures bench clean-web-embed
+.PHONY: web web-materialize build build-debug install install-local test test-unit test-web verify fmt fmt-check vet typecheck e2e e2e-keep docker fixtures bench clean-web-embed
 
 web: ## Build the SolidJS UI into the staging dir web/dist-build (gitignored, NOT pkg/web/dist)
 	cd web && npm ci && npm run build
@@ -67,6 +67,8 @@ vet: ## Run go vet on all packages (mirrors CI's `go vet ./...`)
 
 typecheck: ## Typecheck the web SPA (mirrors CI's `npm run typecheck`)
 	cd web && npm run typecheck
+
+verify: fmt-check vet test typecheck ## Local end-of-impl/release verification gate (mirrors CI: gofmt -> vet -> test -> typecheck). Run before any release or declaring implementation done.
 
 fixtures: web-materialize ## Run the fixture-backed web stack locally on :8099 (no opencode needed)
 	go run ./tools/fixtureserver -addr 127.0.0.1:8099
