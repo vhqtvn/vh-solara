@@ -378,3 +378,79 @@ describe("TreeRow context-menu wiring (bug fix #5: collapsed node right-clickabl
     expect(onSelect).toHaveBeenCalledWith("open-collapsed");
   });
 });
+
+// ── tree=2 UI parity: depth-based tree guides (P0-A) ──────────────────────────
+// The tree renders FLAT because TreeRow drew no depth-based indent. These tests
+// pin the OLD tree-guides markup (whose CSS already exists in
+// legacy/20-session-tree.css lines 22-43): a `.tree-guides` span holds one
+// `.tg-cell` rail per ancestor level (from `prefix: boolean[]`) plus a single
+// `.tg-cell.tg-connector` for the node's own level (only when depth>0). A rail
+// is `.rail` when that ancestor has a following sibling; the connector is `.last`
+// when THIS node is the last child of its parent.
+describe("TreeRow depth-based tree guides (P0-A, tree=2 UI parity)", () => {
+  it("renders MORE .tg-cell elements at depth 2 than at depth 1 (prefix length drives indent)", () => {
+    const { container: deepC } = render(() => (
+      <TreeRow node={baseNode({ id: "deep" })} depth={2} prefix={[true, false]} isLast={false} selected={false} expanded={false} onSelect={() => {}} onToggle={() => {}} />
+    ));
+    const { container: shallowC } = render(() => (
+      <TreeRow node={baseNode({ id: "shallow" })} depth={1} prefix={[true]} isLast={false} selected={false} expanded={false} onSelect={() => {}} onToggle={() => {}} />
+    ));
+    const deepCount = (deepC as unknown as HTMLElement).querySelectorAll(".tg-cell").length;
+    const shallowCount = (shallowC as unknown as HTMLElement).querySelectorAll(".tg-cell").length;
+    // depth-2 prefix [true,false] -> 2 rail cells + connector = 3;
+    // depth-1 prefix [true]       -> 1 rail cell  + connector = 2.
+    expect(deepCount).toBe(3);
+    expect(shallowCount).toBe(2);
+    expect(deepCount).toBeGreaterThan(shallowCount);
+  });
+
+  it("renders ZERO .tg-cell at depth 0 (no guides on roots)", () => {
+    const { container } = render(() => (
+      <TreeRow node={baseNode({})} depth={0} prefix={[]} isLast={false} selected={false} expanded={false} onSelect={() => {}} onToggle={() => {}} />
+    ));
+    expect((container as unknown as HTMLElement).querySelectorAll(".tg-cell").length).toBe(0);
+  });
+
+  it("marks the connector .last when the node is the last child (isLast=true)", () => {
+    const { container } = render(() => (
+      <TreeRow node={baseNode({ id: "last" })} depth={1} prefix={[true]} isLast={true} selected={false} expanded={false} onSelect={() => {}} onToggle={() => {}} />
+    ));
+    const conn = (container as unknown as HTMLElement).querySelector(".tg-connector");
+    expect(conn).not.toBeNull();
+    expect(conn?.classList.contains("last")).toBe(true);
+  });
+
+  it("does NOT mark the connector .last when the node is not the last child (isLast=false)", () => {
+    const { container } = render(() => (
+      <TreeRow node={baseNode({ id: "mid" })} depth={1} prefix={[true]} isLast={false} selected={false} expanded={false} onSelect={() => {}} onToggle={() => {}} />
+    ));
+    const conn = (container as unknown as HTMLElement).querySelector(".tg-connector");
+    expect(conn).not.toBeNull();
+    expect(conn?.classList.contains("last")).toBe(false);
+  });
+});
+
+// ── tree=2 UI parity: selected-row highlight on .tree-row (P0-B) ──────────────
+// The `.tree-row` div had NO `selected` class even though CSS `.tree-row.selected`
+// exists to paint the accent highlight. The `selected` prop was already applied
+// to the inner `.tree-node` button, but the row-level highlight (which paints the
+// whole row's background) was missing — these pin it on `.tree-row` itself.
+describe("TreeRow selected-row highlight on .tree-row (P0-B, tree=2 UI parity)", () => {
+  it("adds the `selected` class to the .tree-row element when selected (CSS .tree-row.selected target)", () => {
+    const { container } = render(() => (
+      <TreeRow node={baseNode({})} depth={0} selected={true} expanded={false} onSelect={() => {}} onToggle={() => {}} />
+    ));
+    const row = (container as unknown as HTMLElement).querySelector(".tree-row");
+    expect(row).not.toBeNull();
+    expect(row?.classList.contains("selected")).toBe(true);
+  });
+
+  it("does NOT add the `selected` class to the .tree-row element when not selected", () => {
+    const { container } = render(() => (
+      <TreeRow node={baseNode({})} depth={0} selected={false} expanded={false} onSelect={() => {}} onToggle={() => {}} />
+    ));
+    const row = (container as unknown as HTMLElement).querySelector(".tree-row");
+    expect(row).not.toBeNull();
+    expect(row?.classList.contains("selected")).toBe(false);
+  });
+});

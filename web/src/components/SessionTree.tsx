@@ -31,6 +31,13 @@ export const openSessionChat = (id: string) => {
 function TreeBranch(props: {
   node: TreeNode;
   depth: number;
+  // Tree guides (P0-A): `prefix` is one boolean per ancestor level (true when
+  // that ancestor has a following sibling → its rail continues past this row);
+  // `isLast` is whether THIS node is the last child of its parent (elbow └ vs
+  // tee ├). Roots pass `prefix={[]}` so they render no guides. Both feed the
+  // presentational TreeRow verbatim — no inference here.
+  prefix: boolean[];
+  isLast: boolean;
   onToggle: (n: TreeNode) => void;
   // Membership of the pinned group, as a reactive accessor. Children that are
   // pinned are skipped in THIS branch's recursion so they don't duplicate the
@@ -49,6 +56,8 @@ function TreeBranch(props: {
       <TreeRow
         node={props.node}
         depth={props.depth}
+        prefix={props.prefix}
+        isLast={props.isLast}
         selected={selectedId() === props.node.id}
         expanded={renderOpen() && children().length > 0}
         unread={!!state.unread[props.node.id]}
@@ -57,9 +66,17 @@ function TreeBranch(props: {
         menuProps={menuTriggers(() => props.node.id, () => props.node.title || props.node.id)}
       />
       <For each={renderOpen() ? children() : []}>
-        {(child) => (
-          <TreeBranch node={child} depth={props.depth + 1} onToggle={props.onToggle} pinnedIds={props.pinnedIds} />
-        )}
+        {(child, i) => {
+          // childPrefix extends the parent's prefix with whether the PARENT has
+          // a following sibling (its rail continues past this child). A root
+          // (depth 0) contributes no rail to its children, so its children start
+          // from [] — their OWN connector is the first indent column.
+          const childPrefix = props.depth === 0 ? [] : [...props.prefix, !props.isLast];
+          const childIsLast = i() === children().length - 1;
+          return (
+            <TreeBranch node={child} depth={props.depth + 1} prefix={childPrefix} isLast={childIsLast} onToggle={props.onToggle} pinnedIds={props.pinnedIds} />
+          );
+        }}
       </For>
     </>
   );
@@ -137,7 +154,7 @@ function TreeStateView() {
           <Show when={pinnedNodes().length > 0}>
             <div class="tree-pinned">
               <For each={pinnedNodes()}>
-                {(n) => <TreeBranch node={n} depth={0} onToggle={onToggle} pinnedIds={emptyPinnedIds} />}
+                {(n, i) => <TreeBranch node={n} depth={0} prefix={[]} isLast={i() === pinnedNodes().length - 1} onToggle={onToggle} pinnedIds={emptyPinnedIds} />}
               </For>
             </div>
           </Show>
@@ -147,7 +164,7 @@ function TreeStateView() {
           <Show when={pinnedNodes().length > 0 && roots().length > 0}>
             <div class="tree-pin-sep" />
           </Show>
-          <For each={roots()}>{(n) => <TreeBranch node={n} depth={0} onToggle={onToggle} pinnedIds={pinnedIds} />}</For>
+          <For each={roots()}>{(n, i) => <TreeBranch node={n} depth={0} prefix={[]} isLast={i() === roots().length - 1} onToggle={onToggle} pinnedIds={pinnedIds} />}</For>
         </Show>
       </Show>
     </div>

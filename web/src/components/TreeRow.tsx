@@ -14,7 +14,7 @@
 // alone (no store, no selectors, no inference) and reports user intent via the
 // injected `onSelect` / `onToggle` callbacks + `menuProps`. The caller owns
 // expand/collapse wiring (treeOps fetch + collapseNode) and selection.
-import { Show } from "solid-js";
+import { For, Show } from "solid-js";
 import Icon from "./Icon";
 import Spinner from "./Spinner";
 import RelTime from "./RelTime";
@@ -38,6 +38,15 @@ export interface TreeRowProps {
   node: TreeNode;
   depth: number;
   selected: boolean;
+  // Tree guides (tree=2 UI parity, P0-A): `prefix` is one boolean per ANCESTOR
+  // level — true when that ancestor has a FOLLOWING sibling (so its vertical
+  // rail continues past this row). `isLast` is whether THIS node is the last
+  // child of its parent (draws the elbow └ instead of the tee ├). Both are
+  // computed by the TreeBranch recursion in SessionTree and default to the
+  // depth-0/empty state so the flat search-results list and existing unit tests
+  // (which don't pass them) render no guides — roots and flat rows stay unindented.
+  prefix?: boolean[];
+  isLast?: boolean;
   // UI expand state (are this node's direct children currently rendered?).
   // Distinct from `node.loaded` (are the children RESIDENT in the flat map):
   // a node can be loaded:true but UI-collapsed, or mid-fetch.
@@ -75,7 +84,20 @@ export function TreeRow(props: TreeRowProps) {
   const chip = () => agentDisplay(node().agent);
 
   return (
-    <div class="tree-row">
+    <div class="tree-row" classList={{ selected: props.selected }}>
+      {/* Depth-based tree guides (P0-A): one 16px rail cell per ancestor level
+          (from `prefix`), then this node's own connector — a tee (├) or, when
+          `isLast`, an elbow (└). Roots (depth 0) render no cells. The CSS for
+          .tree-guides/.tg-cell/.tg-connector already exists unchanged in
+          legacy/20-session-tree.css (lines 22-43); this markup ports the old
+          SessionTree's guide rendering verbatim. Order matches the old client:
+          guides → twisty → node. */}
+      <span class="tree-guides" aria-hidden="true">
+        <For each={props.prefix ?? []}>{(rail) => <span class="tg-cell" classList={{ rail }} />}</For>
+        <Show when={props.depth > 0}>
+          <span class="tg-cell tg-connector" classList={{ last: props.isLast ?? false }} />
+        </Show>
+      </span>
       <button
         type="button"
         class="tree-twisty"
