@@ -175,6 +175,7 @@ function TreeStateView() {
                 <TreeRow
                   node={node}
                   depth={0}
+                  flat={true}
                   selected={selectedId() === node.id}
                   expanded={false}
                   onSelect={() => openSessionChat(node.id)}

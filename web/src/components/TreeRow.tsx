@@ -53,6 +53,11 @@ export interface TreeRowProps {
   expanded: boolean;
   onSelect: (id: string) => void;
   onToggle: (id: string) => void;
+  // Flat (filtered search-results) mode: every row shows the uniform `filtered`
+  // twisty glyph and the twisty is a NON-interactive no-op (never fires
+  // onToggle). Defaults falsy → normal tree mode (existing call sites that omit
+  // it are unaffected). Set ONLY by SessionTree's filtered-results render path.
+  flat?: boolean;
   menuProps?: TreeRowMenuProps;
   // True when this session finished while not selected and the server marked it
   // unread. The unread store (state.unread[id]) is a legacy sync store still
@@ -103,21 +108,36 @@ export function TreeRow(props: TreeRowProps) {
       <button
         type="button"
         class="tree-twisty"
-        classList={{ leaf: isLeaf() }}
+        classList={{ leaf: !props.flat && isLeaf() }}
         aria-label={props.expanded ? "Collapse" : "Expand"}
         data-tip={props.expanded ? "Collapse" : "Expand"}
         onClick={(e) => {
           e.stopPropagation();
-          // A structural leaf has nothing to toggle; never fire onToggle for it
-          // (keeps the twisty a no-op affordance rather than a false signal).
-          if (!isLeaf()) props.onToggle(node().id);
+          // Only an expandable TREE node fires onToggle. Flat (search-results)
+          // rows and structural leaves are no-op affordances — never a real
+          // toggle signal (their glyph is visual only).
+          if (!props.flat && !isLeaf()) props.onToggle(node().id);
         }}
       >
-        <Show when={!isLeaf()}>
+        {props.flat ? (
+          // Flat mode: the uniform `filtered` glyph on every row. Rendered bare
+          // (no span wrapper) so the chevron's `.tree-twisty span:not(.open)`
+          // rotate rule cannot catch it; non-interactive (the onClick guard
+          // above no-ops when flat).
+          <Icon name="filtered" size={13} />
+        ) : isLeaf() ? (
+          // Tree-mode leaf: the `noChild` dash-dot terminal marker. The button
+          // carries the `leaf` class (above) so CSS dims it as a quiet terminal
+          // cue. Bare render (no span) keeps it clear of the chevron rotation.
+          <Icon name="noChild" size={13} />
+        ) : (
+          // Expandable tree node: the chevron, wrapped in the open/not-open span
+          // whose `.tree-twisty span:not(.open)` rule rotates it to point right
+          // when collapsed. Unchanged from the original wiring.
           <span classList={{ open: props.expanded }}>
             <Icon name="chevronDown" size={13} />
           </span>
-        </Show>
+        )}
       </button>
       {/* data-session-id mirrors the legacy proj=1 attribute (node ID == session
           ID in tree=2) so e2e specs that target a row by session ID work here. */}

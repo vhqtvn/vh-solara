@@ -63,6 +63,12 @@
   padding: 0;
 }
 .tree-twisty.leaf { cursor: default; }
+/* Tree-mode leaf rows show the `noChild` dash-dot glyph as a quiet terminal
+   marker. Dim it a touch below the chevron's muted tone so it reads as
+   "nothing to expand here" rather than a clickable affordance. (Flat-mode
+   rows never carry .leaf — they render the `filtered` glyph at the default
+   twisty color — so this dimming is leaf-only.) */
+.tree-twisty.leaf .icon { opacity: 0.5; }
 .tree-twisty span { display: inline-flex; transition: transform 0.12s var(--ease, ease); }
 /* closed = chevron pointing right; open = chevron down. The running-only state
    uses a distinct funnel glyph (.twisty-running), tinted + pulsing. */

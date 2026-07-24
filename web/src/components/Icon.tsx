@@ -63,10 +63,18 @@ const PATHS: Record<string, () => JSX.Element> = {
   // Eye — the tree's "temporarily revealed to show the open session" state.
   eye: () => (
     <>
-      <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z" />
+      <path d="M2 12s3.5-7 10-7 10 7-10 7-10-7-10-7z" />
       <circle cx="12" cy="12" r="3" />
     </>
   ),
+  // Terminal/leaf marker for the session-tree twisty: a dash followed by a round
+  // dot (the h.01 zero-length-subpath renders a round dot, same trick as `rows`).
+  // Tree-mode rows with no children show this instead of an empty twisty cell.
+  noChild: () => <path d="M6 12h8M17 12h.01" />,
+  // Bracketed flat-list marker for the session-tree twisty in filtered/search
+  // results mode: a left vertical rail with three horizontal bars (long/short/
+  // long). Uniform on every flat row to set flat mode apart from the tree.
+  filtered: () => <path d="M6 5v14M6 8h11M6 12h5M6 16h11" />,
   wrap: () => (
     <>
       <path d="M3 6h18M3 12h13a3 3 0 0 1 0 6h-4M3 18h3" />
