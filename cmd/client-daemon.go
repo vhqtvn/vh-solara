@@ -312,13 +312,13 @@ var clientDaemonCmd = &cobra.Command{
 
 			agg := aggregator.New(opencodeURL, vhEventRingCapacity)
 
-		// Build the web server first — it seeds the archived-session overlay
-		// into the store before the aggregator hydrates.
-		srv, err := web.NewServer(agg, opencodeURL, vhEventRingCapacity)
-		if err != nil {
-			log.Fatalf("Failed to build vh web server: %v", err)
-		}
-		vhSrv = srv
+			// Build the web server first — it seeds the archived-session overlay
+			// into the store before the aggregator hydrates.
+			srv, err := web.NewServer(agg, opencodeURL, vhEventRingCapacity)
+			if err != nil {
+				log.Fatalf("Failed to build vh web server: %v", err)
+			}
+			vhSrv = srv
 			// Record whether OpenCode is attached externally (--opencode-url) so
 			// the direct-DB unarchive guard can refuse fast in that topology (the
 			// local DB may not be the remote instance's). See pkg/opencode/db.go.
