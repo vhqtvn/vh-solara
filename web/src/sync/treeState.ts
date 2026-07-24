@@ -8,7 +8,7 @@
 //   - MUTATORS (`seedTreeStore`, `applyTreeOpStore`, `removeTreeNode`,
 //     `collapseTreeNode`, `resetTreeStore`) that apply a server op (or a
 //     client-only collapse/archive) via the pure `treeMap.ts` fns and then bump
-//     a version signal so every tracked reader re-runs.
+//   a version signal so every tracked reader re-runs.
 //
 // The flat map is the SOLE tree-structure source in tree=2 mode. The client
 // NEVER infers parent→child, classifies orphans, or reconciles ghosts (§7.3):
@@ -27,7 +27,6 @@ import {
   type TreeFlatMap,
   type TreeOp,
 } from "./treeMap";
-import { activePathIds } from "./treeSelectors";
 import { loadVersioned, saveVersioned } from "../lib/store";
 
 // Module-authority flat map. Mutated IN PLACE by the mutators; the `version`
@@ -42,106 +41,185 @@ const bump = (): void => {
   setVersion((v) => (v + 1) & 0x3fffffff);
 };
 
-// ---- user expand-state (persisted UI toggle) — P1-A -------------------------
-// Separate UI expand-state from map-presence: a node's children STAY in the
-// flat map (instant expand, no round-trip) but only RENDER when (a) the node is
-// on an ACTIVE PATH (auto-expanded via activePathIds), or (b) the user explicitly
-// expanded it (this `userExpanded` set).
+// ---- tree mode (persisted) — collapsed | filtered | expanded ----------------
+// Restores the proj=1 4-state twisty MODEL (not the old glyphs): three PERSISTED
+// modes plus a transient "temp" overlay computed at render time
+// (treeSelectors.effectiveTreeMode). The implicit default is "filtered": a node
+// never touched renders its WORKING children only, so a cold-load hides idle
+// children behind the twisty. The modes:
+//   collapsed — renders no children (even working ones).
+//   filtered  — renders only working children (the default).
+//   expanded  — renders ALL children, working-first (stable partition).
+// "temp" is NEVER persisted: it is the effective overlay applied to a non-
+// expanded strict ancestor of the selected session (revealing exactly ONE path
+// child) so a selected idle nested node is reachable without a manual expand.
 //
-// P1-A: persisted to localStorage (UI state only, §11-sanctioned) so a page
-// reload keeps manual expansions. The flat tree MAP is NEVER persisted (§11 keeps
-// structure unpersisted — that is what keeps "reload does not flatten" true:
-// seedTreeStore REPLACES the whole map on every tree.snapshot, so the structure
-// is always re-fetched from the server). Only this `userExpanded` Set of node
-// ids is persisted, rehydrated on load, and backfilled after the frontier seed.
+// PERSISTENCE: the mode map is persisted to localStorage (UI state, §11-
+// sanctioned) so a reload keeps manual mode changes. The flat tree MAP is NEVER
+// persisted (§11 keeps structure unpersisted — that is what keeps "reload does
+// not flatten" true: seedTreeStore REPLACES the whole map on every tree.snapshot,
+// so structure is always re-fetched from the server). Only this mode map is
+// persisted, rehydrated on load, and backfilled after the frontier seed.
 //
 // The half-state trap (why persistence needs BACKFILL): on a cold reload the §5
-// frontier ships an idle user-expanded node COLLAPSED — its children are NOT
-// resident (the server's per-connection expanded-set resets). A persisted
-// `userExpanded={X}` whose children aren't resident would be a confusing
-// half-state (isUserExpanded true but nothing renders; the first twisty click
-// inverts to collapse). The fix is PERSISTENCE + BACKFILL: stream.ts reads
-// `expandedButUnloadedIds()` right after the frontier seed and fires
+// frontier ships an idle persisted-EXPANDED node COLLAPSED — its children are
+// NOT resident (the server's per-connection expanded-set resets). A persisted
+// mode "expanded" whose children aren't resident would be a confusing half-state
+// (expanded but nothing renders). The fix is PERSISTENCE + BACKFILL: stream.ts
+// reads `expandedButUnloadedIds()` right after the frontier seed and fires
 // expandTreeNode for each, so a persisted-expanded node's children are fetched
-// and land via subsequent node.children ops (the TreeRow's
-// `expanded={open() && children().length>0}` shows the collapsed ▸N badge until
-// the fetch lands, then flips open — a clean transition, no half-state).
+// and land via subsequent node.children ops.
 //
-// Single global key (mirrors the deleted proj=1 client's `vh.tree.mode.v2`
-// precedent). Stale non-resident ids are harmless: rehydrate, render, and
-// expandedButUnloadedIds all skip ids not present in the map.
-const LS_EXPANDED = "vh.tree.expanded.v1";
+// Persistence key: `vh.tree.mode.v2` (the deleted proj=1 client's precedent key,
+// unused in tree=2 until now — NO collision with the legacy `vh.tree.expanded.v1`
+// Set<string>, which is retained read-only for one-time migration + rollback).
+export type TreeMode = "collapsed" | "filtered" | "expanded";
+export type TreeModeMap = Record<string, TreeMode>;
 
-// Rehydrate at module init (page load). The very first signal value is seeded
-// from localStorage so a reload starts with the persisted expansions. coerce is
-// a safety net for legacy/foreign payloads (a version-matched read returns the
-// stored array directly without invoking it).
-const initialExpanded = new Set<string>(
-  loadVersioned<string[]>(LS_EXPANDED, 1, [], (o) => (Array.isArray(o) ? o : [])),
-);
-const [userExpanded, setUserExpandedSig] = createSignal<Set<string>>(initialExpanded);
+const LS_MODE = "vh.tree.mode.v2";
+const LS_EXPANDED_LEGACY = "vh.tree.expanded.v1"; // pre-mode Set<string> (retained for rollback)
 
-// Version-keyed cache: activePathIds scans the whole map, so memoize it per tree
-// version (once per mutation) rather than recomputing on every isNodeExpanded()
-// call across all rendered rows. Reading `version()` inside isNodeExpanded
-// subscribes the caller's reactive scope to tree mutations — the same
-// tracked-accessor pattern as treeMap()/treeNode() (which also `void version()`).
-let activePathCache: { v: number; set: Set<string> } | null = null;
+function isValidMode(v: unknown): v is TreeMode {
+  return v === "collapsed" || v === "filtered" || v === "expanded";
+}
 
-// Reactive: is `id` currently expanded in the RENDER (children rendered)?
-// True iff on the active path OR user-expanded. Collapsing an active-path node
-// is a benign no-op here (it stays expanded) — live work must stay visible.
-//
-// @deprecated for the RENDER gate — SessionTree.TreeBranch now uses the per-child
-// gate (`visiblePathIds` ∪ per-child filter + `isUserExpanded`). This fn is
-// retained because the unit suite (treeState.test.ts) asserts its active-path ∪
-// userExpanded contract directly; new render code should NOT call it.
-export function isNodeExpanded(id: string): boolean {
-  const v = version();
-  if (activePathCache === null || activePathCache.v !== v) {
-    activePathCache = { v, set: activePathIds(map) };
+// Coerce an unknown persisted payload into a clean mode map: keep ONLY
+// {nonEmptyStringId: validMode} entries. Malformed keys/values are dropped.
+function coerceModeMap(o: unknown): TreeModeMap {
+  if (!o || typeof o !== "object") return {};
+  const src = o as Record<string, unknown>;
+  const out: TreeModeMap = {};
+  for (const [k, v] of Object.entries(src)) {
+    if (typeof k === "string" && k.length > 0 && isValidMode(v)) out[k] = v;
   }
-  return activePathCache.set.has(id) || userExpanded().has(id);
+  return out;
 }
 
-// Reactive: is `id` explicitly USER-expanded (the IN-MEMORY UI toggle ONLY)?
-// This is just the user toggle — it does NOT include the active-path auto-expand.
-// The per-child render gate (SessionTree.TreeBranch) reads this to decide
-// whether a parent renders ALL its children (user-expanded) vs only the
-// keep-visible-path ones (visiblePathIds). Reading the `userExpanded` signal
-// subscribes the caller's reactive scope to user toggles.
-export function isUserExpanded(id: string): boolean {
-  return userExpanded().has(id);
+// Migrate the legacy vh.tree.expanded.v1 (a Set<string> serialized as string[])
+// into a mode map: every VALID legacy expanded id → "expanded". Absent ids
+// resolve via modeOf() to the implicit "filtered" default, so they are NOT
+// manufactured here. Malformed (non-string/empty) entries are skipped.
+function migrateFromExpandedSet(arr: unknown): TreeModeMap {
+  const out: TreeModeMap = {};
+  if (!Array.isArray(arr)) return out;
+  for (const id of arr) {
+    if (typeof id === "string" && id.length > 0) out[id] = "expanded";
+  }
+  return out;
 }
 
-// User toggled a node open/closed. Adds/removes from the UI set; does NOT touch
-// the flat map and does NOT flip `loaded` (that is the §8.4 fetch-collapse's job,
-// a different mechanism). P1-A: also persists the new set to localStorage so the
-// toggle survives a reload.
-export function setUserNodeExpanded(id: string, open: boolean): void {
-  const next = new Set(userExpanded());
-  if (open) next.add(id);
-  else next.delete(id);
-  setUserExpandedSig(next);
-  saveVersioned(LS_EXPANDED, 1, [...next]);
+// Module-init load (runs once at first import):
+//   1. If LS_MODE holds ANY value (even an empty map) → coerce + use it; do NOT
+//      re-migrate (an empty v2 is a valid "everything filtered" state).
+//   2. Else (LS_MODE absent) read the LEGACY LS_EXPANDED_LEGACY Set → migrate to
+//      "expanded" modes, persist the result under LS_MODE.
+//   3. The legacy key is RETAINED (never deleted) for rollback safety.
+// `treeModeMap` reads `localStorage.getItem` directly first to distinguish
+// "key absent" (→ migrate) from "key present but empty" (→ use as-is), which a
+// bare `loadVersioned` fallback cannot tell apart.
+function loadInitialTreeModes(): TreeModeMap {
+  let raw: string | null = null;
+  try {
+    raw = localStorage.getItem(LS_MODE);
+  } catch {
+    raw = null;
+  }
+  if (raw != null) {
+    const loaded = loadVersioned<unknown>(LS_MODE, 1, {}, (o) => o);
+    return coerceModeMap(loaded);
+  }
+  const legacy = loadVersioned<string[]>(LS_EXPANDED_LEGACY, 1, [], (o) =>
+    Array.isArray(o) ? o : [],
+  );
+  const migrated = migrateFromExpandedSet(legacy);
+  saveVersioned(LS_MODE, 1, migrated);
+  return migrated;
 }
 
-// Pure helper (P1-A backfill source): the ids in `userExpanded` that are
-// RESIDENT but have NO resident direct children AND still have descendants to
+const [treeModeMap, setTreeModeMap] = createSignal<TreeModeMap>(loadInitialTreeModes());
+
+// Read-only signal accessor (tests + internal backfill). The controlled setters
+// below are the only writers.
+export function treeModeMapSignal(): TreeModeMap {
+  return treeModeMap();
+}
+
+// Implicit default "filtered": a node with no persisted entry renders its
+// working children only. Reading `treeModeMap()` subscribes a caller's reactive
+// scope to mode changes.
+export function modeOf(id: string): TreeMode {
+  return treeModeMap()[id] ?? "filtered";
+}
+
+// Single-node mode set: ONE immutable signal update + ONE localStorage write.
+export function setNodeMode(id: string, mode: TreeMode): void {
+  const next = { ...treeModeMap(), [id]: mode };
+  setTreeModeMap(next);
+  saveVersioned(LS_MODE, 1, next);
+}
+
+// BATCHED multi-node mode set: accumulates into ONE new map, ONE signal update,
+// ONE localStorage write. Used by cascadeFiltered (resident subtree → "filtered").
+// Do NOT call setNodeMode in a loop here — that would cause N writes + N signal
+// emissions per cascade. The invariant: one immutable update + one write per call.
+export function setNodesMode(ids: Iterable<string>, mode: TreeMode): void {
+  const next = { ...treeModeMap() };
+  for (const id of ids) next[id] = mode;
+  setTreeModeMap(next);
+  saveVersioned(LS_MODE, 1, next);
+}
+
+// ---- transient userToggled (NOT persisted) ----------------------------------
+// The set of node ids the user CLICKED (the twisty) since the last real
+// selection change. It suppresses the "temp" overlay on a clicked ancestor so a
+// manual twisty click on a selected-session ancestor promotes it from temp to
+// its persisted mode (proj=1 temp→filtered transition) instead of re-clamping
+// to temp. Cleared synchronously in the canonical selection setter when the id
+// actually changes (actions.setSelectedId), in the project/tree reset, and in
+// the test reset helper — NEVER in a delayed effect (that would race a twisty
+// click that leaves selection unchanged).
+const [userToggled, setUserToggled] = createSignal<ReadonlySet<string>>(new Set<string>());
+
+export function userToggledSignal(): ReadonlySet<string> {
+  return userToggled();
+}
+export function hasUserToggled(id: string): boolean {
+  return userToggled().has(id);
+}
+// Mark ONLY the clicked node (NOT its descendants — cascadeFiltered marks their
+// MODES, not their toggled state, so a later selection change still clears the
+// overlay uniformly).
+export function markUserToggled(id: string): void {
+  const next = new Set<string>(userToggled());
+  next.add(id);
+  setUserToggled(next);
+}
+export function clearUserToggled(): void {
+  setUserToggled(new Set<string>());
+}
+
+// Pure helper (backfill source): the ids explicitly persisted as "expanded" that
+// are RESIDENT but have NO resident direct children AND still have descendants to
 // fetch — i.e. persisted-expanded nodes the cold-load frontier left collapsed.
 // stream.ts fires expandTreeNode for each after the frontier seed so their
 // children land via subsequent node.children ops (resolving the half-state
 // trap). Reads `version()` so a caller in a reactive scope subscribes to tree
 // mutations (harmless when called imperatively post-seed).
 //
-// - skip ids not in the map (non-resident — stale persisted id, never seeded);
-// - skip ids whose direct children are already resident (nothing to fetch);
-// - skip ids with nothing to fetch (childCount 0 AND descendantCount 0).
+// Enumerates ONLY explicitly-persisted-expanded ids (mode === "expanded") with
+// known descendants that are unloaded — NOT default-filtered ids (mounted
+// filtered/temp branches are handled by the render-time lazy-frontier effect in
+// SessionTree, not this backfill).
+//
+//   - skip ids not in the map (non-resident — stale persisted id, never seeded);
+//   - skip ids whose direct children are already resident (nothing to fetch);
+//   - skip ids with nothing to fetch (childCount 0 AND descendantCount 0).
 export function expandedButUnloadedIds(): string[] {
   void version();
   const idx = childrenIndex(map);
   const out: string[] = [];
-  for (const id of userExpanded()) {
+  for (const [id, mode] of Object.entries(treeModeMap())) {
+    if (mode !== "expanded") continue;
     const n = map.get(id);
     if (!n) continue; // non-resident
     if ((idx.get(id)?.length ?? 0) > 0) continue; // resident children present
@@ -151,24 +229,21 @@ export function expandedButUnloadedIds(): string[] {
   return out;
 }
 
-// Test reset: clear the in-memory toggle (mirrors the fresh-load default). P1-A:
-// clears in-memory ONLY — persisted localStorage is left untouched so this doubles
-// as the "simulate page reload" primitive (a reload loses the Solid signals but
+// Test reset: clear the in-memory mode map + userToggled (mirrors the fresh-load
+// default). Persists NOTHING — localStorage is left untouched so this doubles as
+// the "simulate page reload" primitive (a reload loses the Solid signals but
 // keeps persisted UI state; rehydrateExpandedForTest then re-seeds from disk).
 // resetTreeStore (true project switch) clears BOTH.
 export function resetExpandedForTest(): void {
-  setUserExpandedSig(new Set<string>());
-  activePathCache = null;
+  setTreeModeMap({});
+  setUserToggled(new Set<string>());
 }
 
-// Test helper: re-run the module-init loadVersioned seed against the current
-// localStorage. Lets a unit test exercise the rehydrate path without a real
-// module reload (the module initializes once per test file).
+// Test helper: re-run the module-init load against the current localStorage.
+// Lets a unit test exercise the rehydrate/migrate path without a real module
+// reload (the module initializes once per test file).
 export function rehydrateExpandedForTest(): void {
-  const stored = loadVersioned<string[]>(LS_EXPANDED, 1, [], (o) =>
-    Array.isArray(o) ? o : [],
-  );
-  setUserExpandedSig(new Set(stored));
+  setTreeModeMap(loadInitialTreeModes());
 }
 
 // ---- tracked accessors ------------------------------------------------------
@@ -196,7 +271,7 @@ export function treeRoots(): TreeNode[] {
   // reduce.ts was removed. Re-implement it here on the reactive accessor so the
   // sidebar renders newest-first. The pure `rootNodes`/`childrenIndex` in
   // treeMap.ts keep their order-preserving (insertion/emit) contract so any
-  // future caller can still get emit order; the recency sort lives in these
+  // future caller can still get emit order; the recency sort lives here in these
   // shell accessors only. rootNodes() returns a fresh array each call, so this
   // sorts in place without mutating the map. updatedMs is on every TreeNode
   // (treeMap.ts:40). Stable sort: ties keep emit/insertion order.
@@ -208,7 +283,7 @@ export function treeChildrenOf(parentId: string): TreeNode[] {
   void version();
   // Newest-first — see treeRoots() above (P0-WEB-001). childrenIndex() builds a
   // fresh array per call, so sorting it in place is safe. Pinned children are
-  // filtered out by the caller (SessionTree.tsx:46) before render, so this does
+  // filtered out by the caller (SessionTree.tsx) before render, so this does
   // NOT touch pin order (pins come from selectPinnedNodes, not this accessor).
   return (childrenIndex(map).get(parentId) ?? []).sort((a, b) => b.updatedMs - a.updatedMs);
 }
@@ -243,10 +318,9 @@ export function removeTreeNode(id: string): void {
 // loaded:false. Does NOT round-trip to the server.
 //
 // NOTE: this is the FETCH-collapse primitive (§8.4), a DIFFERENT mechanism from
-// the user expand/collapse render gate (isNodeExpanded/setUserNodeExpanded
-// above). The UI onToggle no longer routes through here — it toggles the
-// `userExpanded` UI state and the render gate decides whether children render.
-// This fn stays as the library primitive (e.g. server-driven collapse, tests).
+// the user mode toggle (modeOf/setNodeMode above). The UI onToggle flips the
+// persisted MODE; the render gate decides whether children render. This fn stays
+// as the library primitive (e.g. server-driven collapse, tests).
 //
 // `protectedIds` (optional): pinned-node membership — pinned descendants are
 // kept resident so the Pinned group keeps rendering them after an ancestor
@@ -273,17 +347,17 @@ export function patchTreeAgent(id: string, agent: string): void {
 }
 
 // Clear the whole tree (project switch / epoch change / test reset). Also
-// clears the in-memory expand state so a project switch does NOT carry stale
-// user toggles forward and tests do not bleed across cases (reviewer advisory
-// tier1_a-F1/tier1_c-F2): `userExpanded` is now persisted (P1-A), so a plain
-// reset of in-memory is NOT enough on a true project switch — the persisted key
-// is cleared too so the next reload of the new project does not rehydrate the
-// old project's expansions. The activePath memo is invalidated so the next
-// isNodeExpanded() read recomputes against the new map.
+// clears the in-memory mode map + userToggled AND the persisted mode key so a
+// project switch does NOT carry stale mode toggles forward and tests do not
+// bleed across cases (reviewer advisory tier1_a-F1/tier1_c-F2): the mode map is
+// persisted, so a plain reset of in-memory is NOT enough on a true project
+// switch — the persisted key is cleared too so the next reload of the new
+// project does not rehydrate the old project's modes. The legacy v1 key is left
+// untouched (dead after first v2 write; retained for rollback).
 export function resetTreeStore(): void {
   map = new Map();
-  setUserExpandedSig(new Set<string>());
-  saveVersioned(LS_EXPANDED, 1, []);
-  activePathCache = null;
+  setTreeModeMap({});
+  saveVersioned(LS_MODE, 1, {});
+  setUserToggled(new Set<string>());
   bump();
 }

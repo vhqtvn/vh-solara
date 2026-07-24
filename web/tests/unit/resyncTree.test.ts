@@ -23,8 +23,8 @@ import {
 import { setProjectDirRaw } from "../../src/sync/store";
 import {
   seedTreeStore,
-  setUserNodeExpanded,
-  isUserExpanded,
+  setNodeMode,
+  modeOf,
   treeMap,
   resetTreeStore,
 } from "../../src/sync/treeState";
@@ -215,32 +215,32 @@ describe("resyncTree — P0-E atomic swap (no empty frame, preserve userExpanded
     expect(treeMap().size).toBeGreaterThan(0);
   });
 
-  it("P0-E-2: connect(true) preserves the in-memory userExpanded set", () => {
+  it("P0-E-2: connect(true) preserves the in-memory mode map (user expand modes)", () => {
     seedTreeStore([node({ id: "a" })]);
-    setUserNodeExpanded("a", true);
-    expect(isUserExpanded("a")).toBe(true);
+    setNodeMode("a", "expanded");
+    expect(modeOf("a")).toBe("expanded");
 
     connect(true);
 
-    // OLD (buggy): resetTreeStore() wiped userExpanded → all manual expansions
-    // collapsed on every tab-return / resync. NEW: userExpanded survives; only
-    // a true project switch clears it.
-    expect(isUserExpanded("a")).toBe(true);
+    // OLD (buggy): resetTreeStore() wiped the modes → all manual expansions
+    // collapsed on every tab-return / resync. NEW: modes survive; only a true
+    // project switch clears them.
+    expect(modeOf("a")).toBe("expanded");
   });
 
-  it("P0-E-3: a TRUE project switch still clears the map + userExpanded (regression guard)", () => {
+  it("P0-E-3: a TRUE project switch still clears the map + mode map (regression guard)", () => {
     seedTreeStore([node({ id: "a" })]);
-    setUserNodeExpanded("a", true);
+    setNodeMode("a", "expanded");
     expect(treeMap().size).toBe(1);
-    expect(isUserExpanded("a")).toBe(true);
+    expect(modeOf("a")).toBe("expanded");
 
     // switchProject early-returns when dir === projectDir(), so use a DIFFERENT
     // dir than the beforeEach "/test". After the fix switchProject itself calls
     // resetTreeStore() explicitly (project switch clears; same-project resync
-    // does NOT — atomic swap preserves userExpanded). GREEN on both old and new.
+    // does NOT — atomic swap preserves modes). GREEN on both old and new.
     switchProject("/other-dir");
 
     expect(treeMap().size).toBe(0);
-    expect(isUserExpanded("a")).toBe(false);
+    expect(modeOf("a")).toBe("filtered");
   });
 });

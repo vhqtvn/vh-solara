@@ -1515,9 +1515,9 @@ export function connect(fresh = false) {
         return;
       }
       seedTreeStore(snap.nodes);
-      // P1-A backfill: a persisted-expanded node whose children the cold-load
-      // frontier left non-resident (expandedButUnloadedIds) would be a
-      // half-state (isUserExpanded true, nothing rendered). Fire expandTreeNode
+      // P1-A backfill: a node persisted as mode "expanded" whose children the
+      // cold-load frontier left non-resident (expandedButUnloadedIds) would be a
+      // half-state (expanded mode but nothing rendered). Fire expandTreeNode
       // for each so their children are fetched and land via subsequent
       // node.children ops. expandTreeNode is single-flight (treeExpandInFlight),
       // so a node already being expanded (or with resident children now) is a

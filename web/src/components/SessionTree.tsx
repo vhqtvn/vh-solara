@@ -1,8 +1,27 @@
-import { For, Show, createMemo } from "solid-js";
+import { For, Show, createMemo, createEffect } from "solid-js";
 import { selectedId, setSelectedId, state, expandTreeNode } from "../sync";
 import { setView } from "../ui";
-import { treeMap, treeRoots, treeChildrenOf, isUserExpanded, setUserNodeExpanded } from "../sync/treeState";
-import { selectPinnedNodes, selectSearchResults, selectedPathIds, visiblePathIds } from "../sync/treeSelectors";
+import {
+  treeMap,
+  treeRoots,
+  treeChildrenOf,
+  treeNode,
+  modeOf,
+  setNodeMode,
+  setNodesMode,
+  markUserToggled,
+  userToggledSignal,
+} from "../sync/treeState";
+import {
+  selectPinnedNodes,
+  selectSearchResults,
+  selectedPathIds,
+  strictAncestors,
+  effectiveTreeMode,
+  working,
+  hasKnownDescendants,
+} from "../sync/treeSelectors";
+import { childrenIndex } from "../sync/treeMap";
 import { searchQuery, reconciledPinnedOrder, isPinned } from "../sidebar";
 import { menuTriggers } from "../sessionMenu";
 import TreeRow from "./TreeRow";
@@ -15,19 +34,13 @@ export const openSessionChat = (id: string) => {
   setView("chat");
 };
 
-// tree=2: render from the server-owned flat map (treeState). Every node is
-// self-contained (title, agent chip, activity/flags, descendantCount) — there
-// is NO client-side orphan classification, parent inference, or reconcile
-// logic. Collapsed nodes (loaded:false with descendants) still render via
-// TreeRow with their chip + "▸ N" badge and are right-clickable; expansion
-// fetches direct children from the server (§8); collapse is client-only (§8.4).
-//
-// PINS (parity restored): a pinned node is hoisted into a Pinned group built
-// from the FLAT map (selectPinnedNodes), so a pinned node surfaces REGARDLESS
-// of depth or collapse state — the old proj=1 client only pinned roots. To
-// avoid a pinned node rendering twice (once hoisted, once in its tree spot),
-// `pinnedIds` is threaded through the tree walk and both the root list and
-// each branch's children drop pinned ids.
+// tree=2 (4-state twisty model): render from the server-owned flat map
+// (treeState). Every node is self-contained (title, agent chip, activity/flags,
+// descendantCount) — there is NO client-side orphan classification, parent
+// inference, or reconcile logic. The twisty reflects an EFFECTIVE display mode
+// (collapsed | filtered | expanded | temp) derived from the node's persisted
+// mode + the selection path + the transient userToggled overlay. Roots render
+// regardless of their mode (the top-level list always shows every root row).
 function TreeBranch(props: {
   node: TreeNode;
   depth: number;
@@ -43,42 +56,71 @@ function TreeBranch(props: {
   // pinned are skipped in THIS branch's recursion so they don't duplicate the
   // hoisted pinned row. Empty set in search mode (no dedup there).
   pinnedIds: () => Set<string>;
-  // The "keep-visible" set (activePathIds ∪ selectedPathIds), as a reactive
-  // accessor. The per-child render gate: under THIS parent, a child renders
-  // iff it is in this set OR the parent is user-expanded. Threaded from
-  // TreeStateView so activity + selection changes re-run the gate reactively.
-  pathIds: () => Set<string>;
-  // The STRICT selected-ancestor set (selectedPathIds only, NOT the visiblePathIds
-  // union). Threaded into TreeRow's `revealed` prop: an auto-revealed ancestor
-  // of the selected session (one the user did NOT manually expand and that is
-  // not the selected leaf itself) shows the dimmed `eye` twisty glyph instead
-  // of the chevron. Reactive accessor so the eye tracks selection live. The
-  // STRICT form (not the union) ensures no eye shows when nothing is selected,
-  // and busy-chain ancestors unrelated to the selection do NOT get the eye.
+  // The INCLUSIVE selected-path set (selectedPathIds), reactive. Drives the
+  // "temp" branch's single-child reveal (the one path child under a temp node).
+  selectedPath: () => Set<string>;
+  // The STRICT selected-ancestor set (selected node excluded), reactive. Drives
+  // effectiveTreeMode's "temp" overlay so a selected nested session's ancestors
+  // reveal exactly one path child without a manual expand.
   selectedAncestors: () => Set<string>;
 }) {
   // Resident direct children (recency-sorted, pinned-dedup'd) — these STAY in
-  // the flat map regardless of expand state (instant re-expand, no round-trip).
-  const children = () => treeChildrenOf(props.node.id).filter((c) => !props.pinnedIds().has(c.id));
-  // Per-child render gate (P0-C flood fix + P0-D selection reveal):
-  //   - user-expanded → render ALL children (the user asked to see everything);
-  //   - otherwise → render only children on the keep-visible path (busy/active
-  //     chains + the selected node's ancestor chain). Idle siblings of the path
-  //     stay collapsed behind the parent's "▸ N" twisty. So an active parent
-  //     with 1 busy + N idle children auto-shows ONLY the busy branch.
-  const visibleChildren = () => {
-    const all = children();
-    if (isUserExpanded(props.node.id)) return all;
-    const ids = props.pathIds();
-    return all.filter((c) => ids.has(c.id));
+  // the flat map regardless of display mode (instant re-expand, no round-trip).
+  const residentChildren = () =>
+    treeChildrenOf(props.node.id).filter((c) => !props.pinnedIds().has(c.id));
+
+  const persistedMode = () => modeOf(props.node.id);
+  const displayState = () =>
+    effectiveTreeMode(
+      props.node.id,
+      persistedMode(),
+      props.selectedAncestors(),
+      userToggledSignal(),
+    );
+
+  // visibleKids — EXACTLY four branches (proj=1 model). Children STAY resident
+  // in the flat map; this only gates RENDER:
+  //   collapsed — renders nothing (even working children).
+  //   filtered  — renders only working children (the default).
+  //   temp      — renders exactly ONE child: the next step toward the selection.
+  //   expanded  — renders ALL children, working-first (stable partition within
+  //               each group; sibling order preserved).
+  const visibleKids = (): TreeNode[] => {
+    switch (displayState()) {
+      case "collapsed":
+        return [];
+      case "filtered":
+        return residentChildren().filter(working);
+      case "temp": {
+        const p = props.selectedPath();
+        const c = residentChildren().find((k) => p.has(k.id));
+        return c ? [c] : [];
+      }
+      case "expanded": {
+        const active: TreeNode[] = [];
+        const idle: TreeNode[] = [];
+        for (const c of residentChildren()) (working(c) ? active : idle).push(c);
+        return [...active, ...idle];
+      }
+    }
   };
-  // Is P open (does it render its children loop at all)? open(P) = user-expanded
-  // OR it has at least one keep-visible child. Drives the children loop and the
-  // twisty's `expanded` prop. The `&& children().length > 0` guard preserves
-  // the unloaded-expand edge (a user-expanded node with no RESIDENT children
-  // still shows "Expand"/▸ N while its fetch is in flight — it has nothing to
-  // collapse yet).
-  const open = () => isUserExpanded(props.node.id) || visibleChildren().length > 0;
+
+  // Lazy frontier: when this branch is mounted in a REVEALING mode (filtered /
+  // expanded / temp) AND the node is unloaded AND it has known descendants,
+  // fetch its direct children once. Reading treeNode(id) reactively re-runs the
+  // effect when `loaded` flips true, which STOPS further fetches. Collapsed /
+  // leaf / loaded never fetch. expandTreeNode's per-id single-flight
+  // (treeExpandInFlight) is the dedup authority — no extra guard needed here.
+  createEffect(() => {
+    const n = treeNode(props.node.id);
+    if (!n) return;
+    if (n.loaded) return;
+    if (!hasKnownDescendants(n)) return;
+    const ds = displayState();
+    if (ds === "collapsed") return; // collapsed never fetches
+    void expandTreeNode(n.id);
+  });
+
   return (
     <>
       <TreeRow
@@ -87,29 +129,33 @@ function TreeBranch(props: {
         prefix={props.prefix}
         isLast={props.isLast}
         selected={selectedId() === props.node.id}
-        expanded={open() && children().length > 0}
+        displayState={displayState()}
         unread={!!state.unread[props.node.id]}
         onSelect={() => openSessionChat(props.node.id)}
         onToggle={() => props.onToggle(props.node)}
         menuProps={menuTriggers(() => props.node.id, () => props.node.title || props.node.id)}
-        revealed={
-          !isUserExpanded(props.node.id) &&
-          props.node.id !== selectedId() &&
-          props.selectedAncestors().has(props.node.id)
-        }
       />
-      <For each={visibleChildren()}>
+      <For each={visibleKids()}>
         {(child, i) => {
           // childPrefix extends the parent's prefix with whether the PARENT has
           // a following sibling (its rail continues past this child). A root
           // (depth 0) contributes no rail to its children, so its children start
           // from [] — their OWN connector is the first indent column. The
-          // index/isLast are computed over visibleChildren() (the actually-
-          // rendered rows) so the connectors reflect what is on screen.
+          // index/isLast are computed over visibleKids() (the actually-rendered
+          // rows) so the connectors reflect what is on screen.
           const childPrefix = props.depth === 0 ? [] : [...props.prefix, !props.isLast];
-          const childIsLast = i() === visibleChildren().length - 1;
+          const childIsLast = i() === visibleKids().length - 1;
           return (
-            <TreeBranch node={child} depth={props.depth + 1} prefix={childPrefix} isLast={childIsLast} onToggle={props.onToggle} pinnedIds={props.pinnedIds} pathIds={props.pathIds} selectedAncestors={props.selectedAncestors} />
+            <TreeBranch
+              node={child}
+              depth={props.depth + 1}
+              prefix={childPrefix}
+              isLast={childIsLast}
+              onToggle={props.onToggle}
+              pinnedIds={props.pinnedIds}
+              selectedPath={props.selectedPath}
+              selectedAncestors={props.selectedAncestors}
+            />
           );
         }}
       </For>
@@ -117,14 +163,28 @@ function TreeBranch(props: {
   );
 }
 
+// Resident-only DFS over current child edges (reuses the pure childrenIndex).
+// Includes the root; marks non-resident descendants with NOTHING (they default
+// "filtered" on later fetch). Performs NO fetch. Used by cascadeFiltered.
+function residentSubtreeIds(rootId: string): string[] {
+  const idx = childrenIndex(treeMap());
+  const out: string[] = [];
+  const stack: string[] = [rootId];
+  while (stack.length) {
+    const cur = stack.pop()!;
+    out.push(cur);
+    const kids = idx.get(cur);
+    if (kids) for (const k of kids) stack.push(k.id);
+  }
+  return out;
+}
+
 function TreeStateView() {
   // PINS — the pinned group. Built from the FLAT map via selectPinnedNodes, so
   // a pinned node hoists here regardless of depth/collapse. `reconciledPinnedOrder`
   // is the membership+drag-order source (sidebar.ts, persisted vh.pinned.v1 +
   // vh.pinned-order.v1). `pinnedIds` is the dedup set threaded through the tree
-  // walk so a hoisted node doesn't also render in its natural spot, AND the
-  // protected set handed to collapse so a pinned descendant survives an
-  // ancestor collapse (pin-parity fix).
+  // walk so a hoisted node doesn't also render in its natural spot.
   const pinnedOrder = () => reconciledPinnedOrder();
   const pinnedIds = createMemo(() => new Set(pinnedOrder()));
   const pinnedNodes = createMemo(() => selectPinnedNodes(treeMap(), pinnedOrder()));
@@ -136,45 +196,41 @@ function TreeStateView() {
   // no matches (render the empty state).
   const results = createMemo(() => selectSearchResults(treeMap(), searchQuery(), isPinned));
 
-  // The keep-visible set (P0-C flood + P0-D selection reveal): activePathIds ∪
-  // selectedPathIds. Threaded into TreeBranch as a reactive accessor so the
-  // per-child render gate re-runs when activity OR the selection changes.
-  // Reading both `treeMap()` and `selectedId()` here subscribes this memo to
-  // tree mutations and selection (selection is the P0-D reactive trigger —
-  // activePathIds alone never seeded on selectedId).
-  const pathIds = createMemo(() => visiblePathIds(treeMap(), selectedId()));
+  // The two memos threaded into TreeBranch as accessors (parallel to the old
+  // pathIds/selectedAncestors threading). Reading both `treeMap()` and
+  // `selectedId()` subscribes each memo to tree mutations and selection.
+  const selectedPath = createMemo(() => selectedPathIds(treeMap(), selectedId()));
+  const selectedAncestors = createMemo(() => strictAncestors(treeMap(), selectedId()));
 
-  // The STRICT selected-ancestor set (P0-D "temp" eye port): selectedPathIds is
-  // inclusive (the selected node + every parentId up to a root) and ancestor-
-  // closed, but it does NOT fold in the active-path union the way `pathIds`
-  // does. Drives TreeRow's `revealed` (eye) predicate so an auto-revealed
-  // ancestor — one the user did NOT manually expand and that is not the selected
-  // leaf itself — shows the dimmed `eye` twisty instead of the chevron. Reads
-  // the same accessors as `pathIds` (treeMap + selectedId) so it tracks both
-  // tree mutations and selection. Empty when nothing is selected → no eye.
-  const selectedAncestors = createMemo(() => selectedPathIds(treeMap(), selectedId()));
-
-  // Flood fix: toggle the UI expand-state, NOT the map. Collapsing a node hides
-  // its resident children from the RENDER but keeps them in the flat map (no
-  // fetch on re-expand). Expanding a node whose children are ALREADY resident
-  // shows them with NO server round-trip; only a genuinely-unloaded node
-  // (no resident children but it has descendants to fetch) calls expandTreeNode.
+  // onToggle — the proj=1 4-state transition table. Capture the effective state
+  // at click BEFORE markUserToggled (so a temp node's click sees it as temp, not
+  // promoted). Every click marks the CLICKED id in userToggled (the clicked id
+  // ONLY — cascade marks descendants' MODES, not their toggled state). The
+  // transition does NOT depend on visibleKids().length.
   //
-  // The gate reads `isUserExpanded` (the UI toggle ONLY), not the old
-  // active-path-∪-user `isNodeExpanded`. Effect: the twisty always reflects the
-  // user's explicit intent — clicking an active-path node flips between "show
-  // only my busy branch" and "show all my children" (idle siblings toggle in/
-  // out), rather than being a no-op on the active path. The active-path auto-
-  // reveal of the busy branch is handled by the per-child gate (visiblePathIds),
-  // independent of this toggle.
+  //   collapsed/temp → filtered + cascadeFiltered(id)   (promote + open subtree)
+  //   filtered       → expanded                          (show all, working-first)
+  //   expanded       → collapsed                         (hide all)
   const onToggle = (n: TreeNode) => {
-    if (isUserExpanded(n.id)) {
-      setUserNodeExpanded(n.id, false);
-      return;
-    }
-    setUserNodeExpanded(n.id, true);
-    if (treeChildrenOf(n.id).length === 0 && ((n.descendantCount ?? 0) > 0 || n.childCount > 0)) {
-      void expandTreeNode(n.id);
+    const stateAtClick = effectiveTreeMode(
+      n.id,
+      modeOf(n.id),
+      selectedAncestors(),
+      userToggledSignal(),
+    );
+    markUserToggled(n.id);
+    switch (stateAtClick) {
+      case "collapsed":
+      case "temp":
+        setNodeMode(n.id, "filtered");
+        setNodesMode(residentSubtreeIds(n.id), "filtered"); // cascade: resident subtree → filtered
+        return;
+      case "filtered":
+        setNodeMode(n.id, "expanded");
+        return;
+      case "expanded":
+        setNodeMode(n.id, "collapsed");
+        return;
     }
   };
 
@@ -200,7 +256,6 @@ function TreeStateView() {
                   depth={0}
                   flat={true}
                   selected={selectedId() === node.id}
-                  expanded={false}
                   onSelect={() => openSessionChat(node.id)}
                   onToggle={() => onToggle(node)}
                   menuProps={menuTriggers(() => node.id, () => node.title || node.id)}
@@ -214,7 +269,18 @@ function TreeStateView() {
           <Show when={pinnedNodes().length > 0}>
             <div class="tree-pinned">
               <For each={pinnedNodes()}>
-                {(n, i) => <TreeBranch node={n} depth={0} prefix={[]} isLast={i() === pinnedNodes().length - 1} onToggle={onToggle} pinnedIds={emptyPinnedIds} pathIds={pathIds} selectedAncestors={selectedAncestors} />}
+                {(n, i) => (
+                  <TreeBranch
+                    node={n}
+                    depth={0}
+                    prefix={[]}
+                    isLast={i() === pinnedNodes().length - 1}
+                    onToggle={onToggle}
+                    pinnedIds={emptyPinnedIds}
+                    selectedPath={selectedPath}
+                    selectedAncestors={selectedAncestors}
+                  />
+                )}
               </For>
             </div>
           </Show>
@@ -224,7 +290,20 @@ function TreeStateView() {
           <Show when={pinnedNodes().length > 0 && roots().length > 0}>
             <div class="tree-pin-sep" />
           </Show>
-          <For each={roots()}>{(n, i) => <TreeBranch node={n} depth={0} prefix={[]} isLast={i() === roots().length - 1} onToggle={onToggle} pinnedIds={pinnedIds} pathIds={pathIds} selectedAncestors={selectedAncestors} />}</For>
+          <For each={roots()}>
+            {(n, i) => (
+              <TreeBranch
+                node={n}
+                depth={0}
+                prefix={[]}
+                isLast={i() === roots().length - 1}
+                onToggle={onToggle}
+                pinnedIds={pinnedIds}
+                selectedPath={selectedPath}
+                selectedAncestors={selectedAncestors}
+              />
+            )}
+          </For>
         </Show>
       </Show>
     </div>

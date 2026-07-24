@@ -73,7 +73,7 @@ async function seedAgentStyles(styles: Record<string, unknown>): Promise<void> {
 describe("TreeRow rendering (self-contained node, §3)", () => {
   it("renders the title via displayName", () => {
     const { container } = render(() => (
-      <TreeRow node={baseNode({ title: "Hello World" })} depth={0} selected={false} expanded={false} onSelect={() => {}} onToggle={() => {}} />
+      <TreeRow node={baseNode({ title: "Hello World" })} depth={0} selected={false} displayState="filtered" onSelect={() => {}} onToggle={() => {}} />
     ));
     expect(nodeButton(container as unknown as HTMLElement).textContent).toContain("Hello World");
   });
@@ -82,7 +82,7 @@ describe("TreeRow rendering (self-contained node, §3)", () => {
     // Seed a replacement rule that strips a [[TAG]] prefix for display.
     setNameReplacements([{ pattern: "^\\[\\[TAG\\]\\]\\s*", replacement: "", flags: "" }]);
     const { container } = render(() => (
-      <TreeRow node={baseNode({ title: "[[TAG]] Real Title" })} depth={0} selected={false} expanded={false} onSelect={() => {}} onToggle={() => {}} />
+      <TreeRow node={baseNode({ title: "[[TAG]] Real Title" })} depth={0} selected={false} displayState="filtered" onSelect={() => {}} onToggle={() => {}} />
     ));
     expect(nodeButton(container as unknown as HTMLElement).textContent).toContain("Real Title");
     expect(nodeButton(container as unknown as HTMLElement).textContent).not.toContain("[[TAG]]");
@@ -90,14 +90,14 @@ describe("TreeRow rendering (self-contained node, §3)", () => {
 
   it("renders NO agent chip when agent is absent", () => {
     const { container } = render(() => (
-      <TreeRow node={baseNode({})} depth={0} selected={false} expanded={false} onSelect={() => {}} onToggle={() => {}} />
+      <TreeRow node={baseNode({})} depth={0} selected={false} displayState="filtered" onSelect={() => {}} onToggle={() => {}} />
     ));
     expect(nodeButton(container as unknown as HTMLElement).querySelector(".tree-agent")).toBeNull();
   });
 
   it("renders NO agent chip when agent is present but undeclared in project styles", () => {
     const { container } = render(() => (
-      <TreeRow node={baseNode({ agent: "unknown" })} depth={0} selected={false} expanded={false} onSelect={() => {}} onToggle={() => {}} />
+      <TreeRow node={baseNode({ agent: "unknown" })} depth={0} selected={false} displayState="filtered" onSelect={() => {}} onToggle={() => {}} />
     ));
     expect(nodeButton(container as unknown as HTMLElement).querySelector(".tree-agent")).toBeNull();
   });
@@ -105,7 +105,7 @@ describe("TreeRow rendering (self-contained node, §3)", () => {
   it("renders an agent chip when agent + project style are present", async () => {
     await seedAgentStyles({ claude: { label: "Cl", color: "accent", style: "soft" } });
     const { container } = render(() => (
-      <TreeRow node={baseNode({ agent: "claude" })} depth={0} selected={false} expanded={false} onSelect={() => {}} onToggle={() => {}} />
+      <TreeRow node={baseNode({ agent: "claude" })} depth={0} selected={false} displayState="filtered" onSelect={() => {}} onToggle={() => {}} />
     ));
     const chip = nodeButton(container as unknown as HTMLElement).querySelector(".tree-agent");
     expect(chip).not.toBeNull();
@@ -124,7 +124,7 @@ describe("TreeRow rendering (self-contained node, §3)", () => {
         node={baseNode({ agent: "claude", loaded: false, childCount: 3, descendantCount: 9 })}
         depth={0}
         selected={false}
-        expanded={false}
+        displayState="filtered"
         onSelect={() => {}}
         onToggle={() => {}}
       />
@@ -136,7 +136,7 @@ describe("TreeRow rendering (self-contained node, §3)", () => {
 
   it("marks the twisty running (ring) and renders NO tree-spinner when activity is busy", () => {
     const { container } = render(() => (
-      <TreeRow node={baseNode({ activity: "busy" })} depth={0} selected={false} expanded={false} onSelect={() => {}} onToggle={() => {}} />
+      <TreeRow node={baseNode({ activity: "busy" })} depth={0} selected={false} displayState="filtered" onSelect={() => {}} onToggle={() => {}} />
     ));
     // The shimmering spinner block was removed from the label area — the twisty
     // running ring is now the sole busy signal.
@@ -146,35 +146,38 @@ describe("TreeRow rendering (self-contained node, §3)", () => {
 
   it("shows an error dot when activity is error", () => {
     const { container } = render(() => (
-      <TreeRow node={baseNode({ activity: "error" })} depth={0} selected={false} expanded={false} onSelect={() => {}} onToggle={() => {}} />
+      <TreeRow node={baseNode({ activity: "error" })} depth={0} selected={false} displayState="filtered" onSelect={() => {}} onToggle={() => {}} />
     ));
     expect(nodeButton(container as unknown as HTMLElement).querySelector(".dot.error")).not.toBeNull();
   });
 
-  it("shows a retry dot when activity is retry", () => {
+  it("marks the twisty running (ring) and renders NO retry dot when activity is retry (working signal)", () => {
     const { container } = render(() => (
-      <TreeRow node={baseNode({ activity: "retry" })} depth={0} selected={false} expanded={false} onSelect={() => {}} onToggle={() => {}} />
+      <TreeRow node={baseNode({ activity: "retry" })} depth={0} selected={false} displayState="filtered" onSelect={() => {}} onToggle={() => {}} />
     ));
-    expect(nodeButton(container as unknown as HTMLElement).querySelector(".dot.retry")).not.toBeNull();
+    // retry is now part of `working()` → the ring is the signal, and the retry
+    // dot is suppressed (working suppresses redundant priority dots).
+    expect(twisty(container as unknown as HTMLElement).classList.contains("running")).toBe(true);
+    expect(nodeButton(container as unknown as HTMLElement).querySelector(".dot.retry")).toBeNull();
   });
 
   it("shows a needs-input dot when flags.pendingInput is true", () => {
     const { container } = render(() => (
-      <TreeRow node={baseNode({ flags: { ...baseNode().flags, pendingInput: true } })} depth={0} selected={false} expanded={false} onSelect={() => {}} onToggle={() => {}} />
+      <TreeRow node={baseNode({ flags: { ...baseNode().flags, pendingInput: true } })} depth={0} selected={false} displayState="filtered" onSelect={() => {}} onToggle={() => {}} />
     ));
     expect(nodeButton(container as unknown as HTMLElement).querySelector(".dot.needs-input")).not.toBeNull();
   });
 
   it("shows a needs-input dot when flags.subtreeNeedsInput is true (server subtree roll-up)", () => {
     const { container } = render(() => (
-      <TreeRow node={baseNode({ flags: { ...baseNode().flags, subtreeNeedsInput: true } })} depth={0} selected={false} expanded={false} onSelect={() => {}} onToggle={() => {}} />
+      <TreeRow node={baseNode({ flags: { ...baseNode().flags, subtreeNeedsInput: true } })} depth={0} selected={false} displayState="filtered" onSelect={() => {}} onToggle={() => {}} />
     ));
     expect(nodeButton(container as unknown as HTMLElement).querySelector(".dot.needs-input")).not.toBeNull();
   });
 
   it("does NOT show an error dot when activity is busy (busy suppresses priority dots)", () => {
     const { container } = render(() => (
-      <TreeRow node={baseNode({ activity: "busy" })} depth={0} selected={false} expanded={false} onSelect={() => {}} onToggle={() => {}} />
+      <TreeRow node={baseNode({ activity: "busy" })} depth={0} selected={false} displayState="filtered" onSelect={() => {}} onToggle={() => {}} />
     ));
     const btn = nodeButton(container as unknown as HTMLElement);
     expect(btn.querySelector(".dot.error")).toBeNull();
@@ -182,35 +185,35 @@ describe("TreeRow rendering (self-contained node, §3)", () => {
 
   it("marks the twisty as a leaf when childCount===0", () => {
     const { container } = render(() => (
-      <TreeRow node={baseNode({ childCount: 0 })} depth={0} selected={false} expanded={false} onSelect={() => {}} onToggle={() => {}} />
+      <TreeRow node={baseNode({ childCount: 0 })} depth={0} selected={false} displayState="filtered" onSelect={() => {}} onToggle={() => {}} />
     ));
     expect(twisty(container as unknown as HTMLElement).classList.contains("leaf")).toBe(true);
   });
 
   it("does NOT mark the twisty as a leaf when childCount>0 (even if loaded:false)", () => {
     const { container } = render(() => (
-      <TreeRow node={baseNode({ childCount: 3, loaded: false })} depth={0} selected={false} expanded={false} onSelect={() => {}} onToggle={() => {}} />
+      <TreeRow node={baseNode({ childCount: 3, loaded: false })} depth={0} selected={false} displayState="filtered" onSelect={() => {}} onToggle={() => {}} />
     ));
     expect(twisty(container as unknown as HTMLElement).classList.contains("leaf")).toBe(false);
   });
 
   it("applies the selected class when selected", () => {
     const { container } = render(() => (
-      <TreeRow node={baseNode({})} depth={0} selected={true} expanded={false} onSelect={() => {}} onToggle={() => {}} />
+      <TreeRow node={baseNode({})} depth={0} selected={true} displayState="filtered" onSelect={() => {}} onToggle={() => {}} />
     ));
     expect(nodeButton(container as unknown as HTMLElement).classList.contains("selected")).toBe(true);
   });
 
   it("applies the sub class when depth>0", () => {
     const { container } = render(() => (
-      <TreeRow node={baseNode({})} depth={2} selected={false} expanded={false} onSelect={() => {}} onToggle={() => {}} />
+      <TreeRow node={baseNode({})} depth={2} selected={false} displayState="filtered" onSelect={() => {}} onToggle={() => {}} />
     ));
     expect(nodeButton(container as unknown as HTMLElement).classList.contains("sub")).toBe(true);
   });
 
   it("applies the running class when activity is busy", () => {
     const { container } = render(() => (
-      <TreeRow node={baseNode({ activity: "busy" })} depth={0} selected={false} expanded={false} onSelect={() => {}} onToggle={() => {}} />
+      <TreeRow node={baseNode({ activity: "busy" })} depth={0} selected={false} displayState="filtered" onSelect={() => {}} onToggle={() => {}} />
     ));
     expect(nodeButton(container as unknown as HTMLElement).classList.contains("running")).toBe(true);
   });
@@ -219,7 +222,7 @@ describe("TreeRow rendering (self-contained node, §3)", () => {
 describe("TreeRow '▸ N' descendant badge (§3 descendantCount)", () => {
   it("shows the badge when collapsed (!loaded) with descendants", () => {
     const { container } = render(() => (
-      <TreeRow node={baseNode({ loaded: false, childCount: 3, descendantCount: 9 })} depth={0} selected={false} expanded={false} onSelect={() => {}} onToggle={() => {}} />
+      <TreeRow node={baseNode({ loaded: false, childCount: 3, descendantCount: 9 })} depth={0} selected={false} displayState="filtered" onSelect={() => {}} onToggle={() => {}} />
     ));
     const badge = nodeButton(container as unknown as HTMLElement).querySelector(".tree-count");
     expect(badge).not.toBeNull();
@@ -229,21 +232,21 @@ describe("TreeRow '▸ N' descendant badge (§3 descendantCount)", () => {
 
   it("does NOT show the badge when loaded (children are rendered below)", () => {
     const { container } = render(() => (
-      <TreeRow node={baseNode({ loaded: true, childCount: 3, descendantCount: 9 })} depth={0} selected={false} expanded={true} onSelect={() => {}} onToggle={() => {}} />
+      <TreeRow node={baseNode({ loaded: true, childCount: 3, descendantCount: 9 })} depth={0} selected={false} displayState="expanded" onSelect={() => {}} onToggle={() => {}} />
     ));
     expect(nodeButton(container as unknown as HTMLElement).querySelector(".tree-count")).toBeNull();
   });
 
   it("does NOT show the badge when descendantCount is 0", () => {
     const { container } = render(() => (
-      <TreeRow node={baseNode({ loaded: false, childCount: 0, descendantCount: 0 })} depth={0} selected={false} expanded={false} onSelect={() => {}} onToggle={() => {}} />
+      <TreeRow node={baseNode({ loaded: false, childCount: 0, descendantCount: 0 })} depth={0} selected={false} displayState="filtered" onSelect={() => {}} onToggle={() => {}} />
     ));
     expect(nodeButton(container as unknown as HTMLElement).querySelector(".tree-count")).toBeNull();
   });
 
   it("does NOT show the badge when descendantCount is absent", () => {
     const { container } = render(() => (
-      <TreeRow node={baseNode({ loaded: false, childCount: 0 })} depth={0} selected={false} expanded={false} onSelect={() => {}} onToggle={() => {}} />
+      <TreeRow node={baseNode({ loaded: false, childCount: 0 })} depth={0} selected={false} displayState="filtered" onSelect={() => {}} onToggle={() => {}} />
     ));
     expect(nodeButton(container as unknown as HTMLElement).querySelector(".tree-count")).toBeNull();
   });
@@ -255,9 +258,9 @@ describe("TreeRow '▸ N' descendant badge (§3 descendantCount)", () => {
   // knows it has children to expand. The old `!node.loaded` rule hid the badge
   // for every loaded node — which is exactly why a loaded coordinator flooded the
   // sidebar with its children instead of showing a collapsed badge.
-  it("shows the badge on a LOADED node when expanded={false} (render-collapsed) [flood fix]", () => {
+  it("shows the badge on a LOADED node when displayState=filtered (render-collapsed) [flood fix]", () => {
     const { container } = render(() => (
-      <TreeRow node={baseNode({ loaded: true, childCount: 3, descendantCount: 9 })} depth={0} selected={false} expanded={false} onSelect={() => {}} onToggle={() => {}} />
+      <TreeRow node={baseNode({ loaded: true, childCount: 3, descendantCount: 9 })} depth={0} selected={false} displayState="filtered" onSelect={() => {}} onToggle={() => {}} />
     ));
     const badge = nodeButton(container as unknown as HTMLElement).querySelector(".tree-count");
     expect(badge).not.toBeNull();
@@ -265,9 +268,9 @@ describe("TreeRow '▸ N' descendant badge (§3 descendantCount)", () => {
     expect(badge?.textContent).toContain("9");
   });
 
-  it("does NOT show the badge on a LOADED node when expanded={true} (children rendered)", () => {
+  it("does NOT show the badge on a LOADED node when displayState=expanded (children rendered)", () => {
     const { container } = render(() => (
-      <TreeRow node={baseNode({ loaded: true, childCount: 3, descendantCount: 9 })} depth={0} selected={false} expanded={true} onSelect={() => {}} onToggle={() => {}} />
+      <TreeRow node={baseNode({ loaded: true, childCount: 3, descendantCount: 9 })} depth={0} selected={false} displayState="expanded" onSelect={() => {}} onToggle={() => {}} />
     ));
     expect(nodeButton(container as unknown as HTMLElement).querySelector(".tree-count")).toBeNull();
   });
@@ -277,7 +280,7 @@ describe("TreeRow interactions (callbacks, no store)", () => {
   it("fires onSelect with the node id on row click", () => {
     const onSelect = vi.fn();
     const { container } = render(() => (
-      <TreeRow node={baseNode({ id: "pick" })} depth={0} selected={false} expanded={false} onSelect={onSelect} onToggle={() => {}} />
+      <TreeRow node={baseNode({ id: "pick" })} depth={0} selected={false} displayState="filtered" onSelect={onSelect} onToggle={() => {}} />
     ));
     nodeButton(container as unknown as HTMLElement, "pick").dispatchEvent(
       new MouseEvent("click", { bubbles: true }),
@@ -288,7 +291,7 @@ describe("TreeRow interactions (callbacks, no store)", () => {
   it("fires onToggle with the node id on twisty click", () => {
     const onToggle = vi.fn();
     const { container } = render(() => (
-      <TreeRow node={baseNode({ id: "tog", childCount: 2 })} depth={0} selected={false} expanded={false} onSelect={() => {}} onToggle={onToggle} />
+      <TreeRow node={baseNode({ id: "tog", childCount: 2 })} depth={0} selected={false} displayState="filtered" onSelect={() => {}} onToggle={onToggle} />
     ));
     twisty(container as unknown as HTMLElement).dispatchEvent(
       new MouseEvent("click", { bubbles: true }),
@@ -300,7 +303,7 @@ describe("TreeRow interactions (callbacks, no store)", () => {
     const onSelect = vi.fn();
     const onToggle = vi.fn();
     const { container } = render(() => (
-      <TreeRow node={baseNode({ childCount: 2 })} depth={0} selected={false} expanded={false} onSelect={onSelect} onToggle={onToggle} />
+      <TreeRow node={baseNode({ childCount: 2 })} depth={0} selected={false} displayState="filtered" onSelect={onSelect} onToggle={onToggle} />
     ));
     twisty(container as unknown as HTMLElement).dispatchEvent(
       new MouseEvent("click", { bubbles: true }),
@@ -313,7 +316,7 @@ describe("TreeRow interactions (callbacks, no store)", () => {
     const onSelect = vi.fn();
     const onToggle = vi.fn();
     const { container } = render(() => (
-      <TreeRow node={baseNode({ childCount: 2 })} depth={0} selected={false} expanded={false} onSelect={onSelect} onToggle={onToggle} />
+      <TreeRow node={baseNode({ childCount: 2 })} depth={0} selected={false} displayState="filtered" onSelect={onSelect} onToggle={onToggle} />
     ));
     nodeButton(container as unknown as HTMLElement).dispatchEvent(
       new MouseEvent("click", { bubbles: true }),
@@ -325,7 +328,7 @@ describe("TreeRow interactions (callbacks, no store)", () => {
   it("does NOT fire onToggle for a structural leaf (childCount===0)", () => {
     const onToggle = vi.fn();
     const { container } = render(() => (
-      <TreeRow node={baseNode({ childCount: 0 })} depth={0} selected={false} expanded={false} onSelect={() => {}} onToggle={onToggle} />
+      <TreeRow node={baseNode({ childCount: 0 })} depth={0} selected={false} displayState="filtered" onSelect={() => {}} onToggle={onToggle} />
     ));
     twisty(container as unknown as HTMLElement).dispatchEvent(
       new MouseEvent("click", { bubbles: true }),
@@ -350,7 +353,7 @@ describe("TreeRow context-menu wiring (bug fix #5: collapsed node right-clickabl
         node={baseNode({ id: "rc", loaded: false, childCount: 3, descendantCount: 9 })}
         depth={0}
         selected={false}
-        expanded={false}
+        displayState="filtered"
         onSelect={() => {}}
         onToggle={() => {}}
         menuProps={menuProps}
@@ -363,7 +366,7 @@ describe("TreeRow context-menu wiring (bug fix #5: collapsed node right-clickabl
 
   it("a collapsed node carries data-node-id (right-clickable target exists)", () => {
     const { container } = render(() => (
-      <TreeRow node={baseNode({ id: "collapsed-target", loaded: false, childCount: 3, descendantCount: 9 })} depth={0} selected={false} expanded={false} onSelect={() => {}} onToggle={() => {}} />
+      <TreeRow node={baseNode({ id: "collapsed-target", loaded: false, childCount: 3, descendantCount: 9 })} depth={0} selected={false} displayState="filtered" onSelect={() => {}} onToggle={() => {}} />
     ));
     const btn = container.querySelector('[data-node-id="collapsed-target"]');
     expect(btn).not.toBeNull();
@@ -372,7 +375,7 @@ describe("TreeRow context-menu wiring (bug fix #5: collapsed node right-clickabl
   it("still opens the chat on row click when collapsed (not a different node type)", () => {
     const onSelect = vi.fn();
     const { container } = render(() => (
-      <TreeRow node={baseNode({ id: "open-collapsed", loaded: false, childCount: 3, descendantCount: 9 })} depth={0} selected={false} expanded={false} onSelect={onSelect} onToggle={() => {}} />
+      <TreeRow node={baseNode({ id: "open-collapsed", loaded: false, childCount: 3, descendantCount: 9 })} depth={0} selected={false} displayState="filtered" onSelect={onSelect} onToggle={() => {}} />
     ));
     nodeButton(container as unknown as HTMLElement, "open-collapsed").dispatchEvent(
       new MouseEvent("click", { bubbles: true }),
@@ -392,10 +395,10 @@ describe("TreeRow context-menu wiring (bug fix #5: collapsed node right-clickabl
 describe("TreeRow depth-based tree guides (P0-A, tree=2 UI parity)", () => {
   it("renders MORE .tg-cell elements at depth 2 than at depth 1 (prefix length drives indent)", () => {
     const { container: deepC } = render(() => (
-      <TreeRow node={baseNode({ id: "deep" })} depth={2} prefix={[true, false]} isLast={false} selected={false} expanded={false} onSelect={() => {}} onToggle={() => {}} />
+      <TreeRow node={baseNode({ id: "deep" })} depth={2} prefix={[true, false]} isLast={false} selected={false} displayState="filtered" onSelect={() => {}} onToggle={() => {}} />
     ));
     const { container: shallowC } = render(() => (
-      <TreeRow node={baseNode({ id: "shallow" })} depth={1} prefix={[true]} isLast={false} selected={false} expanded={false} onSelect={() => {}} onToggle={() => {}} />
+      <TreeRow node={baseNode({ id: "shallow" })} depth={1} prefix={[true]} isLast={false} selected={false} displayState="filtered" onSelect={() => {}} onToggle={() => {}} />
     ));
     const deepCount = (deepC as unknown as HTMLElement).querySelectorAll(".tg-cell").length;
     const shallowCount = (shallowC as unknown as HTMLElement).querySelectorAll(".tg-cell").length;
@@ -408,14 +411,14 @@ describe("TreeRow depth-based tree guides (P0-A, tree=2 UI parity)", () => {
 
   it("renders ZERO .tg-cell at depth 0 (no guides on roots)", () => {
     const { container } = render(() => (
-      <TreeRow node={baseNode({})} depth={0} prefix={[]} isLast={false} selected={false} expanded={false} onSelect={() => {}} onToggle={() => {}} />
+      <TreeRow node={baseNode({})} depth={0} prefix={[]} isLast={false} selected={false} displayState="filtered" onSelect={() => {}} onToggle={() => {}} />
     ));
     expect((container as unknown as HTMLElement).querySelectorAll(".tg-cell").length).toBe(0);
   });
 
   it("marks the connector .last when the node is the last child (isLast=true)", () => {
     const { container } = render(() => (
-      <TreeRow node={baseNode({ id: "last" })} depth={1} prefix={[true]} isLast={true} selected={false} expanded={false} onSelect={() => {}} onToggle={() => {}} />
+      <TreeRow node={baseNode({ id: "last" })} depth={1} prefix={[true]} isLast={true} selected={false} displayState="filtered" onSelect={() => {}} onToggle={() => {}} />
     ));
     const conn = (container as unknown as HTMLElement).querySelector(".tg-connector");
     expect(conn).not.toBeNull();
@@ -424,7 +427,7 @@ describe("TreeRow depth-based tree guides (P0-A, tree=2 UI parity)", () => {
 
   it("does NOT mark the connector .last when the node is not the last child (isLast=false)", () => {
     const { container } = render(() => (
-      <TreeRow node={baseNode({ id: "mid" })} depth={1} prefix={[true]} isLast={false} selected={false} expanded={false} onSelect={() => {}} onToggle={() => {}} />
+      <TreeRow node={baseNode({ id: "mid" })} depth={1} prefix={[true]} isLast={false} selected={false} displayState="filtered" onSelect={() => {}} onToggle={() => {}} />
     ));
     const conn = (container as unknown as HTMLElement).querySelector(".tg-connector");
     expect(conn).not.toBeNull();
@@ -446,7 +449,7 @@ describe("TreeRow subtreeBusy running ring (P1-B, tree=2 UI parity)", () => {
         node={baseNode({ activity: "idle", flags: { ...baseNode().flags, subtreeBusy: true } })}
         depth={0}
         selected={false}
-        expanded={false}
+        displayState="filtered"
         onSelect={() => {}}
         onToggle={() => {}}
       />
@@ -460,7 +463,7 @@ describe("TreeRow subtreeBusy running ring (P1-B, tree=2 UI parity)", () => {
         node={baseNode({ activity: "idle", flags: { ...baseNode().flags, subtreeBusy: false } })}
         depth={0}
         selected={false}
-        expanded={false}
+        displayState="filtered"
         onSelect={() => {}}
         onToggle={() => {}}
       />
@@ -470,7 +473,7 @@ describe("TreeRow subtreeBusy running ring (P1-B, tree=2 UI parity)", () => {
 
   it("does NOT apply the twisty running ring when subtreeBusy is absent (activity idle)", () => {
     const { container } = render(() => (
-      <TreeRow node={baseNode({ activity: "idle" })} depth={0} selected={false} expanded={false} onSelect={() => {}} onToggle={() => {}} />
+      <TreeRow node={baseNode({ activity: "idle" })} depth={0} selected={false} displayState="filtered" onSelect={() => {}} onToggle={() => {}} />
     ));
     expect(twisty(container as unknown as HTMLElement).classList.contains("running")).toBe(false);
   });
@@ -483,7 +486,7 @@ describe("TreeRow subtreeBusy running ring (P1-B, tree=2 UI parity)", () => {
         node={baseNode({ activity: "busy", flags: { ...baseNode().flags, subtreeBusy: false } })}
         depth={0}
         selected={false}
-        expanded={false}
+        displayState="filtered"
         onSelect={() => {}}
         onToggle={() => {}}
       />
@@ -499,7 +502,7 @@ describe("TreeRow subtreeBusy running ring (P1-B, tree=2 UI parity)", () => {
         node={baseNode({ activity: "idle", flags: { ...baseNode().flags, subtreeBusy: true } })}
         depth={0}
         selected={false}
-        expanded={false}
+        displayState="filtered"
         onSelect={() => {}}
         onToggle={() => {}}
       />
@@ -519,7 +522,7 @@ describe("TreeRow subtreeBusy running ring (P1-B, tree=2 UI parity)", () => {
 describe("TreeRow twisty running ring (P1)", () => {
   it("renders the chevron glyph AND the running class for a busy EXPANDABLE node (ring around the chevron)", () => {
     const { container } = render(() => (
-      <TreeRow node={baseNode({ activity: "busy", childCount: 2 })} depth={0} selected={false} expanded={false} onSelect={() => {}} onToggle={() => {}} />
+      <TreeRow node={baseNode({ activity: "busy", childCount: 2 })} depth={0} selected={false} displayState="filtered" onSelect={() => {}} onToggle={() => {}} />
     ));
     const t = twisty(container as unknown as HTMLElement);
     // The ring is the sole busy signal: the twisty button carries `running`.
@@ -539,7 +542,7 @@ describe("TreeRow twisty running ring (P1)", () => {
 
   it("renders the noChild glyph AND the running class for a busy LEAF node (busy leaves finally get a signal)", () => {
     const { container } = render(() => (
-      <TreeRow node={baseNode({ activity: "busy", childCount: 0 })} depth={0} selected={false} expanded={false} onSelect={() => {}} onToggle={() => {}} />
+      <TreeRow node={baseNode({ activity: "busy", childCount: 0 })} depth={0} selected={false} displayState="filtered" onSelect={() => {}} onToggle={() => {}} />
     ));
     const t = twisty(container as unknown as HTMLElement);
     // A busy leaf carries BOTH the leaf class (noChild terminal marker) AND the
@@ -556,7 +559,7 @@ describe("TreeRow twisty running ring (P1)", () => {
 
   it("renders the chevron with NO running ring for an IDLE expandable node", () => {
     const { container } = render(() => (
-      <TreeRow node={baseNode({ activity: "idle", childCount: 2 })} depth={0} selected={false} expanded={false} onSelect={() => {}} onToggle={() => {}} />
+      <TreeRow node={baseNode({ activity: "idle", childCount: 2 })} depth={0} selected={false} displayState="filtered" onSelect={() => {}} onToggle={() => {}} />
     ));
     const t = twisty(container as unknown as HTMLElement);
     // Idle expandable: no running ring (the `running` class is busy-only).
@@ -570,7 +573,7 @@ describe("TreeRow twisty running ring (P1)", () => {
   it("still fires onToggle when a busy expandable node's twisty is clicked (the ring is a glyph-orthogonal overlay, not a new affordance)", () => {
     const onToggle = vi.fn();
     const { container } = render(() => (
-      <TreeRow node={baseNode({ id: "busy-tog", activity: "busy", childCount: 2 })} depth={0} selected={false} expanded={false} onSelect={() => {}} onToggle={onToggle} />
+      <TreeRow node={baseNode({ id: "busy-tog", activity: "busy", childCount: 2 })} depth={0} selected={false} displayState="filtered" onSelect={() => {}} onToggle={onToggle} />
     ));
     twisty(container as unknown as HTMLElement).dispatchEvent(
       new MouseEvent("click", { bubbles: true }),
@@ -594,7 +597,7 @@ describe("TreeRow twisty running ring (P1)", () => {
 describe("TreeRow twisty temp eye (P1, port from proj=1)", () => {
   it("renders the eye glyph (.twisty-temp) for a revealed (temp) node", () => {
     const { container } = render(() => (
-      <TreeRow node={baseNode({ activity: "idle", childCount: 2 })} depth={0} selected={false} expanded={false} revealed={true} onSelect={() => {}} onToggle={() => {}} />
+      <TreeRow node={baseNode({ activity: "idle", childCount: 2 })} depth={0} selected={false} displayState="temp" onSelect={() => {}} onToggle={() => {}} />
     ));
     const t = twisty(container as unknown as HTMLElement);
     const temp = t.querySelector("span.twisty-temp");
@@ -611,7 +614,7 @@ describe("TreeRow twisty temp eye (P1, port from proj=1)", () => {
   it("still fires onToggle when a revealed node's twisty is clicked (revealed stays expandable)", () => {
     const onToggle = vi.fn();
     const { container } = render(() => (
-      <TreeRow node={baseNode({ id: "temp-tog", activity: "idle", childCount: 2 })} depth={0} selected={false} expanded={false} revealed={true} onSelect={() => {}} onToggle={onToggle} />
+      <TreeRow node={baseNode({ id: "temp-tog", activity: "idle", childCount: 2 })} depth={0} selected={false} displayState="temp" onSelect={() => {}} onToggle={onToggle} />
     ));
     twisty(container as unknown as HTMLElement).dispatchEvent(
       new MouseEvent("click", { bubbles: true }),
@@ -628,7 +631,7 @@ describe("TreeRow twisty temp eye (P1, port from proj=1)", () => {
 describe("TreeRow selected-row highlight on .tree-row (P0-B, tree=2 UI parity)", () => {
   it("adds the `selected` class to the .tree-row element when selected (CSS .tree-row.selected target)", () => {
     const { container } = render(() => (
-      <TreeRow node={baseNode({})} depth={0} selected={true} expanded={false} onSelect={() => {}} onToggle={() => {}} />
+      <TreeRow node={baseNode({})} depth={0} selected={true} displayState="filtered" onSelect={() => {}} onToggle={() => {}} />
     ));
     const row = (container as unknown as HTMLElement).querySelector(".tree-row");
     expect(row).not.toBeNull();
@@ -637,7 +640,7 @@ describe("TreeRow selected-row highlight on .tree-row (P0-B, tree=2 UI parity)",
 
   it("does NOT add the `selected` class to the .tree-row element when not selected", () => {
     const { container } = render(() => (
-      <TreeRow node={baseNode({})} depth={0} selected={false} expanded={false} onSelect={() => {}} onToggle={() => {}} />
+      <TreeRow node={baseNode({})} depth={0} selected={false} displayState="filtered" onSelect={() => {}} onToggle={() => {}} />
     ));
     const row = (container as unknown as HTMLElement).querySelector(".tree-row");
     expect(row).not.toBeNull();

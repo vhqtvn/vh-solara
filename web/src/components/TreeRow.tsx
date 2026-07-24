@@ -4,20 +4,21 @@
 // Unlike the legacy StubNode (which represented a server-omitted collapsed
 // subtree and could NOT show an agent chip or be right-clicked), EVERY TreeRow
 // node carries its own display data (§3): title, agent, activity, flags,
-// descendantCount. "Collapsed" is just `loaded:false` — a render attribute, NOT
-// a different node type. So a collapsed node still renders its agent chip, is
-// right-clickable, and opens its chat on row click. Those three are the core of
-// the Phase 3 bug fixes (blank agent chip / no right-click / subagent-as-root /
-// flatten-on-load / archived ghosts).
+// descendantCount. "Collapsed" is just a render attribute (the effective
+// displayState), NOT a different node type. So a collapsed node still renders
+// its agent chip, is right-clickable, and opens its chat on row click. Those
+// three are the core of the Phase 3 bug fixes (blank agent chip / no right-
+// click / subagent-as-root / flatten-on-load / archived ghosts).
 //
 // This component is PRESENTATIONAL: it derives every indicator from `node`
-// alone (no store, no selectors, no inference) and reports user intent via the
+// alone (plus the injected `displayState`) and reports user intent via the
 // injected `onSelect` / `onToggle` callbacks + `menuProps`. The caller owns
-// expand/collapse wiring (treeOps fetch + collapseNode) and selection.
+// mode wiring (treeState mode store + treeOps fetch) and selection.
 import { For, Show } from "solid-js";
 import Icon from "./Icon";
 import RelTime from "./RelTime";
 import { agentDisplay, displayName } from "../projectSettings";
+import { working, type EffectiveTreeMode } from "../sync/treeSelectors";
 import type { TreeNode } from "../sync/treeMap";
 import styles from "./TreeRow.module.css";
 
@@ -46,10 +47,12 @@ export interface TreeRowProps {
   // (which don't pass them) render no guides — roots and flat rows stay unindented.
   prefix?: boolean[];
   isLast?: boolean;
-  // UI expand state (are this node's direct children currently rendered?).
-  // Distinct from `node.loaded` (are the children RESIDENT in the flat map):
-  // a node can be loaded:true but UI-collapsed, or mid-fetch.
-  expanded: boolean;
+  // Effective display mode (proj=1 4-state twisty model): collapsed | filtered |
+  // expanded | temp. Required for tree rows; omitted (undefined) by the flat
+  // search-results caller. Drives the twisty glyph + ring + descendant badge.
+  // Distinct from `node.loaded` (are the children RESIDENT in the flat map): a
+  // node can be loaded:true but display-collapsed, or mid-fetch.
+  displayState?: EffectiveTreeMode;
   onSelect: (id: string) => void;
   onToggle: (id: string) => void;
   // Flat (filtered search-results) mode: every row shows the uniform `filtered`
@@ -57,18 +60,6 @@ export interface TreeRowProps {
   // onToggle). Defaults falsy → normal tree mode (existing call sites that omit
   // it are unaffected). Set ONLY by SessionTree's filtered-results render path.
   flat?: boolean;
-  // Auto-revealed ancestor of the selected session (proj=1 "temp" eye). True on
-  // a node that is open ONLY because the selected session lives inside it — the
-  // user did NOT manually expand it (isUserExpanded false), and it is NOT the
-  // selected node itself. Computed by SessionTree from the STRICT
-  // selectedPathIds set (NOT the visiblePathIds union). When true, the twisty
-  // column shows a dimmed `eye` glyph (.twisty-temp) instead of the chevron,
-  // signalling "I'm open only because your selection is inside me." Defaults
-  // falsy → no behavior change for existing call sites (flat rows never pass
-  // it). onClick is UNCHANGED: a revealed node is still expandable, so the
-  // guard above still fires onToggle — clicking the eye promotes it to a
-  // user-expanded node (chevron), matching proj=1 temp→filtered.
-  revealed?: boolean;
   menuProps?: TreeRowMenuProps;
   // True when this session finished while not selected and the server marked it
   // unread. The unread store (state.unread[id]) is a legacy sync store still
@@ -80,12 +71,12 @@ export interface TreeRowProps {
 export function TreeRow(props: TreeRowProps) {
   const node = () => props.node;
 
-  // All indicators derive from the SELF-CONTAINED node (§3). No parent walk,
-  // no activity-map lookup, no branchStubs — the server pre-computes every
-  // aggregate the UI needs (subtreeNeedsInput is the one retained subtree roll-up;
-  // subtreeBusy rolls up busy/retry so a collapsed ancestor of a busy descendant
-  // spins — OR'd in here alongside the node's own activity).
-  const isBusy = () => node().activity === "busy" || !!node().flags.subtreeBusy;
+  // All indicators derive from the SELF-CONTAINED node (§3) + displayState. No
+  // parent walk, no activity-map lookup, no branchStubs — the server pre-computes
+  // every aggregate the UI needs. `working` is the SINGLE working predicate
+  // (busy/retry/subtreeBusy/subtreeNeedsInput) shared by the ring + dot
+  // suppression so "working" semantics never diverge within one row.
+  const isWorking = () => working(node());
   const isError = () => node().activity === "error";
   const isRetry = () => node().activity === "retry";
   const needsInput = () => node().flags.pendingInput || node().flags.subtreeNeedsInput;
@@ -93,12 +84,14 @@ export function TreeRow(props: TreeRowProps) {
   // not resident-count). A collapsed node (loaded:false) with childCount>0 is
   // NOT a leaf — it shows a chevron + the "▸ N" badge.
   const isLeaf = () => node().childCount === 0;
-  const hasDescendants = () => (node().descendantCount ?? 0) > 0;
-  // Flood fix: the "▸ N" badge keys off the RENDER-expanded prop (are children
-  // currently rendered?), NOT `node.loaded` (are children resident in the map?).
-  // Under the render-gate model a node can be loaded:true but UI-collapsed — it
-  // MUST still show the badge so the user sees it has hidden children to open.
-  const collapsed = () => !props.expanded && hasDescendants();
+  // Display-mode derived flags. displayState may be undefined for flat rows.
+  const isTemp = () => props.displayState === "temp";
+  const isExpanded = () => props.displayState === "expanded";
+  // The "▸ N" descendant badge appears ONLY on a non-flat, non-leaf node in a
+  // COLLAPSED or FILTERED display state (children hidden / partially hidden).
+  // Hidden in expanded (children rendered) and temp (one child rendered).
+  const showDescendantBadge = () =>
+    !props.flat && !isLeaf() && (props.displayState === "collapsed" || props.displayState === "filtered");
   const chip = () => agentDisplay(node().agent);
 
   return (
@@ -119,9 +112,9 @@ export function TreeRow(props: TreeRowProps) {
       <button
         type="button"
         class="tree-twisty"
-        classList={{ leaf: !props.flat && isLeaf(), running: !props.flat && isBusy() }}
-        aria-label={props.expanded ? "Collapse" : "Expand"}
-        data-tip={props.expanded ? "Collapse" : "Expand"}
+        classList={{ leaf: !props.flat && isLeaf(), running: !props.flat && isWorking() }}
+        aria-label={isExpanded() ? "Collapse" : "Expand"}
+        data-tip={isExpanded() ? "Collapse" : "Expand"}
         onClick={(e) => {
           e.stopPropagation();
           // Only an expandable TREE node fires onToggle. Flat (search-results)
@@ -140,28 +133,29 @@ export function TreeRow(props: TreeRowProps) {
           // Tree-mode leaf: the `noChild` dash-dot terminal marker. The button
           // carries the `leaf` class (above) so CSS dims it as a quiet terminal
           // cue. Bare render (no span) keeps it clear of the chevron rotation.
-          // A busy LEAF still shows noChild — busy does not swap the glyph; it
-          // toggles the `running` class on this button (above), so a busy leaf
-          // gains a pulsing accent ring around its terminal marker.
+          // A working LEAF still shows noChild — working does not swap the glyph;
+          // it toggles the `running` class on this button (above), so a working
+          // leaf gains a pulsing accent ring around its terminal marker.
           <Icon name="noChild" size={13} />
-        ) : props.revealed ? (
-          // Auto-revealed ancestor of the selected session: the dimmed `eye`
-          // glyph (proj=1 "temp"). Ports the old twisty-temp — a node open ONLY
-          // because the selected session lives inside it (user did not expand
-          // it). .twisty-temp CSS dims it (var(--fg-dim)) and keeps it upright
-          // (transform:none), overriding the chevron's span:not(.open) rotate.
-          // onClick is UNCHANGED: revealed nodes are expandable, so the guard
-          // above still fires onToggle — clicking the eye promotes it to a
-          // user-expanded node (chevron), matching proj=1 temp→filtered.
+        ) : isTemp() ? (
+          // "temp" display state (auto-revealed ancestor of the selected
+          // session): the dimmed `eye` glyph (.twisty-temp). A node open ONLY
+          // because the selected session lives inside it (the user did NOT
+          // click it into this state). .twisty-temp CSS dims it (var(--fg-dim))
+          // and keeps it upright (transform:none), overriding the chevron's
+          // span:not(.open) rotate. onClick is UNCHANGED: a temp node is still
+          // expandable, so the guard above still fires onToggle — clicking the
+          // eye promotes it to "filtered" + cascades (proj=1 temp→filtered).
           <span class="twisty-temp"><Icon name="eye" size={13} /></span>
         ) : (
-          // Expandable tree node: the chevron, wrapped in the open/not-open span
-          // whose `.tree-twisty span:not(.open)` rule rotates it to point right
-          // when collapsed. A BUSY expandable node still renders this chevron —
-          // busy no longer swaps the glyph; it toggles the `running` class on
-          // this button (above), which CSS layers as a pulsing accent ring over
-          // the glyph (legacy/20-session-tree.css .tree-twisty.running::after).
-          <span classList={{ open: props.expanded }}>
+          // Expandable tree node (collapsed/filtered/expanded): the chevron,
+          // wrapped in the open/not-open span whose `.tree-twisty span:not(.open)`
+          // rule rotates it to point right when collapsed/filtered. A WORKING
+          // expandable node still renders this chevron — working no longer swaps
+          // the glyph; it toggles the `running` class on this button (above),
+          // which CSS layers as a pulsing accent ring over the glyph
+          // (legacy/20-session-tree.css .tree-twisty.running::after).
+          <span classList={{ open: isExpanded() }}>
             <Icon name="chevronDown" size={13} />
           </span>
         )}
@@ -173,7 +167,7 @@ export function TreeRow(props: TreeRowProps) {
         class="tree-node"
         classList={{
           sub: props.depth > 0,
-          running: isBusy(),
+          running: isWorking(),
           selected: props.selected,
         }}
         data-node-id={node().id}
@@ -186,19 +180,21 @@ export function TreeRow(props: TreeRowProps) {
         {...(props.menuProps ?? {})}
       >
         <span class="tree-line1">
-          {/* Priority indicators (suppressed while busy — the `running` ring on
-              the twisty button is the sole busy signal, so no shimmering block
-              renders beside the title). */}
-          <Show when={!isBusy() && isError()}>
+          {/* Priority indicators (suppressed while WORKING — the `running` ring
+              on the twisty button is the sole working signal, so no shimmering
+              block or redundant dot renders beside the title). needsInput is the
+              one exception: it stays visible even on a working subtree-needs-input
+              ancestor so the operator still sees "reply needed". */}
+          <Show when={!isWorking() && isError()}>
             <span class="dot error" data-tip="error" />
           </Show>
-          <Show when={!isBusy() && isRetry()}>
+          <Show when={!isWorking() && isRetry()}>
             <span class="dot retry" data-tip="retrying" />
           </Show>
           <Show when={needsInput()}>
             <span class="dot needs-input" data-tip="needs your input — reply to continue" />
           </Show>
-          <Show when={!isBusy() && !needsInput() && props.unread}>
+          <Show when={!isWorking() && !needsInput() && props.unread}>
             <span class="dot unread" data-tip="finished — not yet viewed" />
           </Show>
           {/* EVERY node carries its own agent (§3) — so a collapsed (loaded:false)
@@ -218,10 +214,10 @@ export function TreeRow(props: TreeRowProps) {
           </Show>
           <span class="tree-title">{displayName(node().title || node().id)}</span>
           <span class="tree-meta">
-            {/* The "▸ N" badge appears ONLY on a collapsed node with descendants
-                (§3: descendantCount drives it). When loaded, the children are
-                rendered below, so a count would be redundant. */}
-            <Show when={collapsed()}>
+            {/* The "▸ N" badge appears ONLY on a non-flat, non-leaf node in a
+                collapsed/filtered display state (§3: descendantCount drives the
+                count). Hidden in expanded/temp (children are rendered). */}
+            <Show when={showDescendantBadge()}>
               <span
                 class={`tree-count ${styles.descendantBadge}`}
                 data-tip={`${node().descendantCount} sessions in this collapsed branch`}

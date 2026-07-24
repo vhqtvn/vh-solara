@@ -1,17 +1,21 @@
-// treeSelectors — pure pinned/search selectors over the tree=2 flat map.
+// treeSelectors — pure pinned/search/mode selectors over the tree=2 flat map.
 //
 // This module restores the parity the deleted proj=1 client had (PINS + SEARCH)
-// but implemented against the NEW flat `Map<id,TreeNode>` (treeMap.ts), NOT the
-// old `buildChildrenIndex`/root-walk. The key fix: the old client built the
-// pinned group from ROOTS only, so a pinned deep/collapsed node vanished.
-// Because every TreeNode in the flat map carries its own display data (title,
-// agent chip, descendantCount), a pinned node is hoisted into the pinned group
-// regardless of depth or `loaded` state — it stays actionable + chip-rendered.
+// plus the 4-state twisty MODEL helpers (working / strictAncestors /
+// effectiveTreeMode / hasKnownDescendants), all implemented against the NEW flat
+// `Map<id,TreeNode>` (treeMap.ts), NOT the old `buildChildrenIndex`/root-walk.
 //
-// PURE: no Solid, no store, no network. Takes the map (and the pinned
-// order/membership) as arguments so it is trivially unit-testable and reusable
-// from both the reactive shell (treeState) and tests.
+// PURE: no Solid, no store, no network, no localStorage, no lifecycle. Takes the
+// map (and selected-ancestor/toggle sets) as arguments so it is trivially unit-
+// testable and reusable from both the reactive shell (treeState) and tests.
 import type { TreeNode, TreeFlatMap } from "./treeMap";
+import type { TreeMode } from "./treeState";
+
+// The effective display mode: the three persisted modes plus the transient
+// "temp" overlay (a non-expanded strict ancestor of the selected session that
+// the user has NOT clicked, revealing exactly one path child). "temp" is never
+// persisted — it is computed at render time by effectiveTreeMode.
+export type EffectiveTreeMode = TreeMode | "temp";
 
 // The pinned group: iterate the reconciled pinned ORDER (membership + drag
 // order, supplied by sidebar.reconciledPinnedOrder), resolve each id against
@@ -85,65 +89,11 @@ export function selectSearchResults(
   return matches;
 }
 
-// Active-path render gate (flood fix). Returns the set of node ids that are on
-// an ACTIVE PATH: the inclusive ancestor chain (root → ... → node) of ANY node
-// that is itself active — per §5.1 (the precise active-path definition), which
-// the server's authoritative `isActiveLocked` implements at
-// pkg/state/tree_emitter.go:200-212. Such nodes are auto-expanded by the render
-// gate so live work / pending-input branches stay visible WITHOUT requiring a
-// user toggle (and WITHOUT a server fetch — §5 guarantees the active path ships
-// resident).
-//
-// A node with no active descendant (and not itself active) is NOT in the set, so
-// an idle many-child parent collapses to its "▸ N" twisty even though its
-// children stay resident in the flat map — this is exactly the flood fix.
-//
-// PURE: takes the map, returns a fresh Set. Depth-capped defensively against a
-// corrupt parentId cycle (mirrors hasPinnedAncestor's guard). A node with no
-// active descendant is never added; idle siblings of the active chain are not.
-
-// §5.1 active-path seed — MIRRORS the server's authoritative isActiveLocked
-// (pkg/state/tree_emitter.go:200-212) line-for-line. NOTE: `flags.permission` is
-// currently REDUNDANT in live data (Permission:true ⟹ PendingInput:true because
-// pendingInputSelfLocked counts perms — pkg/state/subtree_indexes.go:178-183),
-// and archived nodes are not resident client-side today (cascade-deleted server-
-// side + eagerly dropped), so both arms produce ZERO behavior change against
-// current data. Mirroring the server predicate exactly removes any client↔server
-// divergence surface and future-proofs both cases (commit-reviewer tier1_b-F1).
-function nodeSeedsActivePath(n: TreeNode): boolean {
-  if (n.flags.archived) return false; // §5.1 Q1: archived NEVER seeds
-  return (
-    n.activity !== "idle" || // busy | retry | error (Activity has no 5th state)
-    n.flags.permission ||
-    n.flags.pendingInput
-  );
-}
-
-export function activePathIds(map: TreeFlatMap): Set<string> {
-  const out = new Set<string>();
-  for (const n of map.values()) {
-    if (nodeSeedsActivePath(n)) {
-      // Walk the parentId chain upward from the active node, adding every
-      // ancestor inclusive. Depth-capped: a corrupt cycle terminates instead of
-      // looping forever (cur becomes undefined when the id is not in the map).
-      let cur: string | undefined = n.id;
-      for (let i = 0; i < 10000 && cur != null; i++) {
-        out.add(cur);
-        cur = map.get(cur)?.parentId ?? undefined;
-      }
-    }
-  }
-  return out;
-}
-
-// selectedPathIds — the SELECTION reveal set (P0-D). activePathIds seeds ONLY
-// on activity/permission/pendingInput, so selecting or deep-linking an idle
-// NESTED session left its row hidden inside a collapsed parent. selectedPathIds
-// fills that gap: it returns the INCLUSIVE ancestor chain of `selectedId` (the
-// selected node + every parentId up to a root), ancestor-closed. Combined with
-// activePathIds into visiblePathIds (below), this drives the per-child render
-// gate so a selected idle nested node is rendered even when its parent is
-// collapsed by default.
+// selectedPathIds — the SELECTION reveal set (P0-D). Returns the INCLUSIVE
+// ancestor chain of `selectedId` (the selected node + every parentId up to a
+// root), ancestor-closed. Drives the "temp" overlay: a selected idle nested
+// session's ancestors become "temp" (revealing exactly one path child) so the
+// selected leaf is reachable even when its parent is collapsed/filtered.
 //
 // `selectedId` may be null/empty (no selection) or point at a node NOT resident
 // in the map (a stale deep link): both yield an empty set (nothing to reveal —
@@ -151,8 +101,7 @@ export function activePathIds(map: TreeFlatMap): Set<string> {
 // chain are NOT added (only the selected node's own ancestor chain opens).
 //
 // PURE: takes the map + selectedId, returns a fresh Set. Depth-capped
-// defensively against a corrupt parentId cycle (mirrors activePathIds' /
-// hasPinnedAncestor's 10000 guard).
+// defensively against a corrupt parentId cycle.
 export function selectedPathIds(map: TreeFlatMap, selectedId: string | null): Set<string> {
   const out = new Set<string>();
   if (!selectedId) return out;
@@ -168,18 +117,60 @@ export function selectedPathIds(map: TreeFlatMap, selectedId: string | null): Se
   return out;
 }
 
-// visiblePathIds — the ONE "keep-visible" set driving the per-child render gate
-// (P0-C flood + P0-D selection reveal). A child C renders under parent P iff
-// C ∈ visiblePathIds (on the active OR selected path) OR P is user-expanded
-// (the user-expand branch is handled in SessionTree.TreeBranch). This is the
-// UNION of activePathIds (live-work chains) and selectedPathIds (the selected
-// node's chain); ancestor-closed because both operands are. Idle siblings of
-// either path are NOT in the set → an active parent shows only its busy branch,
-// and a selected idle nested node is revealed by opening only its own chain.
+// working — the SINGLE working predicate (proj=1 model restore). Leans on the
+// SERVER-COMPUTED rollups (flags.subtreeBusy / flags.subtreeNeedsInput) + the
+// node's own activity — NO client-side subtree walk, NO full-map projection. The
+// "balance with server computing" is satisfied by reading these rollups (already
+// on the node) rather than recursing. Used for THREE things in the tree:
+//   1. filtered-mode child inclusion (only working children render),
+//   2. expanded-mode working-first stable ordering,
+//   3. the non-flat ring (.tree-twisty/.tree-node .running).
+// Input-ancestry is represented by the subtreeNeedsInput rollup — error /
+// permission are NOT added independently (Permission:true ⟹ PendingInput today,
+// and the rollup carries input-ancestry for collapsed ancestors).
+export function working(node: TreeNode): boolean {
+  return (
+    node.activity === "busy" ||
+    node.activity === "retry" ||
+    !!node.flags.subtreeBusy ||
+    !!node.flags.subtreeNeedsInput
+  );
+}
+
+// strictAncestors — the selected node's ancestors EXCLUDING the selected node
+// itself. Copies selectedPathIds (which may be shared/cached) before deleting
+// the leaf so the caller's set is not mutated. Drives the "temp" overlay: a
+// non-expanded strict ancestor that the user has not clicked becomes "temp".
+// Empty when selectedId is null/empty/non-resident.
+export function strictAncestors(map: TreeFlatMap, selectedId: string | null): Set<string> {
+  const ids = new Set(selectedPathIds(map, selectedId));
+  if (selectedId) ids.delete(selectedId);
+  return ids;
+}
+
+// effectiveTreeMode — the per-node display mode state machine. A node is "temp"
+// iff ALL of: its persisted mode is NOT "expanded", it is a STRICT ancestor of
+// the selected session, and the user has NOT clicked it (userToggled) since the
+// last real selection change. Otherwise it reflects its persisted mode (which
+// defaults to "filtered" via treeState.modeOf for an absent entry).
 //
-// PURE: union of two pure sets; returns a fresh Set.
-export function visiblePathIds(map: TreeFlatMap, selectedId: string | null): Set<string> {
-  const out = activePathIds(map);
-  for (const id of selectedPathIds(map, selectedId)) out.add(id);
-  return out;
+// The userToggled suppression is the proj=1 temp→filtered transition: clicking
+// a temp ancestor promotes it to its persisted mode (filtered) instead of
+// re-clamping to temp, and the click also flips the persisted mode (handled by
+// SessionTree.onToggle).
+export function effectiveTreeMode(
+  id: string,
+  persistedMode: TreeMode,
+  selectedAncestors: ReadonlySet<string>,
+  toggled: ReadonlySet<string>,
+): EffectiveTreeMode {
+  if (persistedMode !== "expanded" && selectedAncestors.has(id) && !toggled.has(id)) return "temp";
+  return persistedMode;
+}
+
+// hasKnownDescendants — does this node have ANY known descendants (structural OR
+// resident)? A structural leaf (childCount 0 + no descendantCount) never has
+// children to fetch, so the lazy frontier never fires for it.
+export function hasKnownDescendants(node: TreeNode): boolean {
+  return node.childCount > 0 || (node.descendantCount ?? 0) > 0;
 }

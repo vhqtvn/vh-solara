@@ -1,23 +1,17 @@
 // @vitest-environment jsdom
-// tree2VisiblePath — the per-child render gate crux for P0-C (active-parent
-// flood) + P0-D (select/deep-link ancestor reveal).
+// tree2VisiblePath — the per-mode visibility matrix + the P0-D selection reveal
+// (temp overlay) for the proj=1 4-state twisty model.
 //
-// P0-C: under the OLD render gate, once a parent was on the active path it
-// dumped ALL its resident children (busy AND idle) — the flood, just limited to
-// active-path parents. The NEW per-child gate renders under a parent P:
-//   - ALL children when the user expanded P; else
-//   - ONLY children on the keep-visible path (activePathIds ∪ selectedPathIds).
-// So an active parent with 1 busy + N idle children auto-shows ONLY the busy
-// branch; idle siblings stay collapsed behind `▸ N`. User-expanding P shows all.
+// visibleKids has EXACTLY four branches:
+//   collapsed — renders no children (even working ones).
+//   filtered  — renders only working children (busy/retry/subtreeBusy/
+//               subtreeNeedsInput). This is the DEFAULT.
+//   temp      — renders exactly ONE child: the next step toward the selection.
+//   expanded  — renders ALL children, working-first (stable partition).
+// Roots render regardless of their mode (the top-level list always shows roots).
 //
-// P0-D: activePathIds seeded only on activity/permission/pendingInput, so
-// selecting or deep-linking an idle NESTED session left its row hidden inside a
-// collapsed parent. The NEW selectedPathIds (visiblePathIds union) opens the
-// selected node's ancestor chain, so selecting an idle nested session reveals it.
-//
-// These mount the REAL <SessionTree/> and drive the flat map + selection
-// directly (deterministic — no SSE timing). expandTreeNode (the fetch
-// entrypoint) is mocked so we assert no stray fetch fires on the reveal path.
+// These mount the REAL <SessionTree/> and drive the flat map + selection + modes
+// directly (deterministic — no SSE timing). expandTreeNode is mocked.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render } from "@solidjs/testing-library";
 import SessionTree from "../../src/components/SessionTree";
@@ -25,14 +19,13 @@ import {
   seedTreeStore,
   resetTreeStore,
   resetExpandedForTest,
-  setUserNodeExpanded,
+  modeOf,
+  setNodeMode,
 } from "../../src/sync/treeState";
-import { selectedId as selectedIdSig, setSelectedIdRaw } from "../../src/sync/store";
+import { setSelectedIdRaw } from "../../src/sync/store";
+import { setSelectedId } from "../../src/sync/actions";
 import type { TreeNode } from "../../src/sync/treeMap";
 
-// Mock ONLY expandTreeNode (the fetch entrypoint) on the barrel; everything else
-// (selectedId/state, the real treeState store, selectors) stays live. Mirrors
-// tree2Flood.test.tsx so the assert-no-fetch guarantee holds.
 const { expandSpy } = vi.hoisted(() => ({ expandSpy: vi.fn() }));
 vi.mock("../../src/sync", async (importActual) => {
   const actual = await importActual();
@@ -50,6 +43,7 @@ function node(overrides: Partial<TreeNode> = {}): TreeNode {
     flags: {
       pendingInput: false,
       subtreeNeedsInput: false,
+      subtreeBusy: false,
       permission: false,
       archived: false,
       orphan: false,
@@ -65,11 +59,23 @@ function renderedIds(container: HTMLElement): string[] {
   );
 }
 
+function twistyFor(container: HTMLElement, id: string): HTMLElement {
+  const nodeEl = container.querySelector(`.tree-node[data-session-id="${id}"]`);
+  if (!nodeEl) throw new Error(`no rendered node for ${id}`);
+  const row = nodeEl.closest(".tree-row");
+  const tw = row?.querySelector(".tree-twisty");
+  if (!tw) throw new Error(`no twisty for ${id}`);
+  return tw as HTMLElement;
+}
+
+function clickTwisty(container: HTMLElement, id: string): void {
+  twistyFor(container, id).dispatchEvent(new MouseEvent("click", { bubbles: true }));
+}
+
 beforeEach(() => {
   localStorage.clear();
   resetTreeStore();
   resetExpandedForTest();
-  // Clear any selection left by a prior case so the reveal signal is clean.
   setSelectedIdRaw(null);
   expandSpy.mockClear();
 });
@@ -78,76 +84,99 @@ afterEach(() => {
   cleanup();
 });
 
-describe("P0-C — active parent renders only its busy child (per-child gate, not the flood)", () => {
-  //   ROOT (idle, root)              ← on active path (has busy grandchild)
-  //   └─ PARENT (idle)               ← ACTIVE-PARENT CRUX: on active path (has busy child)
-  //      ├─ BUSY (activity busy)     ← the one active descendant (seeds the path)
-  //      ├─ IDLE1 (idle)             ← idle sibling of the busy branch
-  //      └─ IDLE2 (idle)             ← idle sibling of the busy branch
-  // PARENT is on the active path (BUSY is its descendant). Under the OLD gate
-  // PARENT dumped ALL 3 children (the flood). Under the per-child gate only BUSY
-  // renders; IDLE1/IDLE2 stay collapsed behind PARENT's `▸ N`.
-  function activeParentMap(): TreeNode[] {
+describe("visibleKids — per-mode visibility matrix", () => {
+  //   PARENT (the node under test)
+  //   ├─ BUSY   (activity busy)            ← working
+  //   ├─ RETRY  (activity retry)           ← working
+  //   ├─ SUBBUSY (subtreeBusy)             ← working
+  //   ├─ IDLE1  (idle)                     ← not working
+  //   └─ IDLE2  (idle)                     ← not working
+  function parentWithMix(): TreeNode[] {
     return [
-      node({ id: "ROOT", title: "root", childCount: 1, descendantCount: 4 }),
-      node({
-        id: "PARENT",
-        parentId: "ROOT",
-        title: "parent",
-        childCount: 3,
-        descendantCount: 3,
-      }),
-      node({ id: "BUSY", parentId: "PARENT", title: "busy", activity: "busy", updatedMs: 30 }),
+      node({ id: "PARENT", title: "parent", childCount: 5, descendantCount: 5, loaded: true }),
+      node({ id: "BUSY", parentId: "PARENT", title: "busy", activity: "busy", updatedMs: 50 }),
+      node({ id: "RETRY", parentId: "PARENT", title: "retry", activity: "retry", updatedMs: 40 }),
+      node({ id: "SUBBUSY", parentId: "PARENT", title: "subbusy", flags: { ...node().flags, subtreeBusy: true }, updatedMs: 30 }),
       node({ id: "IDLE1", parentId: "PARENT", title: "idle1", updatedMs: 20 }),
       node({ id: "IDLE2", parentId: "PARENT", title: "idle2", updatedMs: 10 }),
     ];
   }
 
-  it("an active parent with 1 busy + 2 idle children renders ONLY the busy child (P0-C)", () => {
-    seedTreeStore(activeParentMap());
+  it("collapsed → renders NO children (even working ones)", () => {
+    seedTreeStore(parentWithMix());
+    setNodeMode("PARENT", "collapsed");
     const { container } = render(() => <SessionTree />);
-
-    const ids = renderedIds(container as unknown as HTMLElement);
-    // The active chain (ROOT → PARENT → BUSY) renders.
-    expect(ids).toContain("ROOT");
-    expect(ids).toContain("PARENT");
-    expect(ids).toContain("BUSY");
-    // CRUX: the idle siblings of the busy branch do NOT render — the flood is
-    // gated per-child, not just per-parent.
-    expect(ids).not.toContain("IDLE1");
-    expect(ids).not.toContain("IDLE2");
-    // No fetch: the active path is already resident (§5 guarantees it).
-    expect(expandSpy).not.toHaveBeenCalled();
+    expect(renderedIds(container as unknown as HTMLElement)).toEqual(["PARENT"]);
   });
 
-  it("user-expanding the active parent shows ALL its children (idle siblings included)", () => {
-    seedTreeStore(activeParentMap());
+  it("filtered → renders ONLY working children (busy/retry/subtreeBusy)", () => {
+    seedTreeStore(parentWithMix());
+    // filtered is the default, but set it explicitly for clarity.
+    setNodeMode("PARENT", "filtered");
     const { container } = render(() => <SessionTree />);
-
-    // Before the user toggle: only BUSY renders (per the previous case).
-    let ids = renderedIds(container as unknown as HTMLElement);
+    const ids = renderedIds(container as unknown as HTMLElement);
+    expect(ids).toContain("PARENT");
+    expect(ids).toContain("BUSY");
+    expect(ids).toContain("RETRY");
+    expect(ids).toContain("SUBBUSY");
     expect(ids).not.toContain("IDLE1");
     expect(ids).not.toContain("IDLE2");
+  });
 
-    // User expands PARENT explicitly → the per-child gate shows ALL children.
-    setUserNodeExpanded("PARENT", true);
-
-    ids = renderedIds(container as unknown as HTMLElement);
+  it("expanded → renders ALL children, working-first (stable partition)", () => {
+    seedTreeStore(parentWithMix());
+    setNodeMode("PARENT", "expanded");
+    const { container } = render(() => <SessionTree />);
+    const ids = renderedIds(container as unknown as HTMLElement);
+    expect(ids).toContain("PARENT");
+    // All five children render.
     expect(ids).toContain("BUSY");
-    expect(ids).toContain("IDLE1"); // now visible
-    expect(ids).toContain("IDLE2"); // now visible
-    // Still no fetch: the children were already resident.
-    expect(expandSpy).not.toHaveBeenCalled();
+    expect(ids).toContain("RETRY");
+    expect(ids).toContain("SUBBUSY");
+    expect(ids).toContain("IDLE1");
+    expect(ids).toContain("IDLE2");
+    // Working-first ordering: BUSY/RETRY/SUBBUSY precede IDLE1/IDLE2. Sibling
+    // order is preserved within each group (recency: RETRY before SUBBUSY? no —
+    // recency is the resident-child sort, applied BEFORE the partition, so the
+    // working group keeps recency order among themselves).
+    const workingGroup = ids.slice(ids.indexOf("PARENT") + 1, ids.indexOf("PARENT") + 1 + 3);
+    const idleGroup = ids.slice(ids.indexOf("PARENT") + 1 + 3);
+    expect(new Set(workingGroup)).toEqual(new Set(["BUSY", "RETRY", "SUBBUSY"]));
+    expect(new Set(idleGroup)).toEqual(new Set(["IDLE1", "IDLE2"]));
+  });
+
+  it("temp → renders EXACTLY ONE child: the next step toward the selection", () => {
+    // Make PARENT a strict ancestor of a selected node. Select RETRY (a direct
+    // child of PARENT) — PARENT becomes temp and reveals exactly RETRY.
+    seedTreeStore(parentWithMix());
+    setSelectedIdRaw("RETRY");
+    const { container } = render(() => <SessionTree />);
+    const ids = renderedIds(container as unknown as HTMLElement);
+    expect(ids).toContain("PARENT");
+    expect(ids).toContain("RETRY"); // the one path child
+    // The other children (working OR idle) do NOT render under temp — temp
+    // reveals exactly ONE path child, not all working children.
+    expect(ids).not.toContain("BUSY");
+    expect(ids).not.toContain("SUBBUSY");
+    expect(ids).not.toContain("IDLE1");
+    expect(ids).not.toContain("IDLE2");
+  });
+
+  it("roots render regardless of their mode (collapsed root still shows its row)", () => {
+    seedTreeStore(parentWithMix());
+    setNodeMode("PARENT", "collapsed");
+    const { container } = render(() => <SessionTree />);
+    // PARENT is a root and renders even though collapsed.
+    expect(renderedIds(container as unknown as HTMLElement)).toContain("PARENT");
   });
 });
 
-describe("P0-D — selecting an idle nested session reveals it (ancestor chain opens)", () => {
+describe("P0-D — selecting an idle nested session reveals it (temp ancestor chain)", () => {
   //   ROOT (idle, root)
   //   └─ MID (idle)
   //      └─ LEAF (idle)   ← selected
-  // Nothing is active. Under the OLD gate neither MID nor LEAF rendered (ROOT
-  // collapsed by default; selection never seeded the reveal path). Selecting
-  // LEAF must open ROOT → MID so LEAF's row is visible.
+  // Nothing is working. Under filtered mode nothing renders its children. The
+  // temp overlay opens the selected chain so LEAF is reachable.
   function idleChainMap(): TreeNode[] {
     return [
       node({ id: "ROOT", title: "root", childCount: 1, descendantCount: 2 }),
@@ -156,34 +185,89 @@ describe("P0-D — selecting an idle nested session reveals it (ancestor chain o
     ];
   }
 
-  it("selecting an idle nested leaf reveals it (collapsed ancestors open) even with NOTHING active (P0-D)", () => {
+  it("selecting an idle nested leaf reveals it (temp ancestors open) even with NOTHING working", () => {
     seedTreeStore(idleChainMap());
-    // Sanity: with no selection, only the collapsed root renders.
+    // Sanity: with no selection, only the root renders (filtered, no working).
     let { container } = render(() => <SessionTree />);
     expect(renderedIds(container as unknown as HTMLElement)).toEqual(["ROOT"]);
+    cleanup();
 
-    // Select the idle nested leaf. This must open ROOT → MID so LEAF renders.
+    // Select the idle nested leaf → ROOT and MID become temp, revealing LEAF.
     setSelectedIdRaw("LEAF");
-
-    const ids = renderedIds(container as unknown as HTMLElement);
+    container = render(() => <SessionTree />).container as unknown as HTMLElement;
+    const ids = renderedIds(container);
     expect(ids).toContain("ROOT");
-    expect(ids).toContain("MID"); // ancestor opened to reveal the selection
-    expect(ids).toContain("LEAF"); // the selected leaf is now visible
-    // No fetch: the chain was already resident; this is a render-gate reveal.
-    expect(expandSpy).not.toHaveBeenCalled();
+    expect(ids).toContain("MID"); // temp → reveals LEAF
+    expect(ids).toContain("LEAF");
+    expect(expandSpy).not.toHaveBeenCalled(); // chain already resident
   });
 
   it("clearing the selection collapses the revealed idle chain back to the root", () => {
     seedTreeStore(idleChainMap());
-    const { container } = render(() => <SessionTree />);
-
     setSelectedIdRaw("LEAF");
+    const { container } = render(() => <SessionTree />);
     expect(renderedIds(container as unknown as HTMLElement)).toContain("LEAF");
 
-    // Clear the selection → the idle chain is no longer on any keep-visible
-    // path, so it collapses back to just the root (mirrors the un-selected
-    // default; nothing is active to keep it open).
     setSelectedIdRaw(null);
+    // No selection → no temp overlay → filtered shows no working children → root only.
     expect(renderedIds(container as unknown as HTMLElement)).toEqual(["ROOT"]);
+  });
+
+  it("temp ancestors show the eye glyph (.twisty-temp)", () => {
+    seedTreeStore(idleChainMap());
+    setSelectedIdRaw("LEAF");
+    const { container } = render(() => <SessionTree />);
+    // ROOT and MID are temp (strict ancestors of LEAF) → eye glyph.
+    expect(twistyFor(container as unknown as HTMLElement, "ROOT").querySelector("span.twisty-temp")).not.toBeNull();
+    expect(twistyFor(container as unknown as HTMLElement, "MID").querySelector("span.twisty-temp")).not.toBeNull();
+    // LEAF is the selected node itself (not a strict ancestor) → NOT temp.
+    expect(twistyFor(container as unknown as HTMLElement, "LEAF").querySelector("span.twisty-temp")).toBeNull();
+  });
+});
+
+describe("userToggled — clicking a temp ancestor promotes it (temp → filtered)", () => {
+  //   ROOT (filtered default) ← ancestor of selection → temp
+  //   └─ LEAF ← selected
+  it("a temp ancestor clicked becomes persisted-filtered + toggled (no longer temp)", () => {
+    seedTreeStore([
+      node({ id: "ROOT", title: "root", childCount: 1, descendantCount: 1, loaded: true }),
+      node({ id: "LEAF", parentId: "ROOT", title: "leaf" }),
+    ]);
+    setSelectedIdRaw("LEAF");
+    let { container } = render(() => <SessionTree />);
+    // Before click: ROOT is temp (eye glyph).
+    expect(twistyFor(container as unknown as HTMLElement, "ROOT").querySelector("span.twisty-temp")).not.toBeNull();
+    expect(modeOf("ROOT")).toBe("filtered"); // persisted unchanged
+
+    clickTwisty(container as unknown as HTMLElement, "ROOT");
+
+    // After click: ROOT is persisted-filtered (unchanged value) BUT now toggled,
+    // so effectiveTreeMode returns the persisted "filtered" instead of temp → the
+    // eye is gone (chevron renders). The persisted mode survived; the overlay was
+    // promoted by the click.
+    expect(modeOf("ROOT")).toBe("filtered");
+    expect(twistyFor(container as unknown as HTMLElement, "ROOT").querySelector("span.twisty-temp")).toBeNull();
+    cleanup();
+  });
+
+  it("a real selection change clears userToggled so a temp node re-evaluates from scratch", () => {
+    seedTreeStore([
+      node({ id: "ROOT", title: "root", childCount: 1, descendantCount: 2, loaded: true }),
+      node({ id: "MID", parentId: "ROOT", title: "mid", childCount: 1 }),
+      node({ id: "LEAF", parentId: "MID", title: "leaf" }),
+      node({ id: "OTHER", title: "other" }),
+    ]);
+    setSelectedIdRaw("LEAF");
+    const { container } = render(() => <SessionTree />);
+    // ROOT is temp (eye). Click it → promoted (toggled, no longer temp).
+    clickTwisty(container as unknown as HTMLElement, "ROOT");
+    expect(twistyFor(container as unknown as HTMLElement, "ROOT").querySelector("span.twisty-temp")).toBeNull();
+
+    // A real selection change via the CANONICAL setter (setSelectedId) clears
+    // userToggled synchronously. Re-select LEAF → ROOT is again a strict
+    // ancestor, not toggled → temp returns (eye reappears).
+    setSelectedId("OTHER");
+    setSelectedId("LEAF");
+    expect(twistyFor(container as unknown as HTMLElement, "ROOT").querySelector("span.twisty-temp")).not.toBeNull();
   });
 });

@@ -1,25 +1,24 @@
 // @vitest-environment jsdom
 //
-// P1-A — expand-state persistence (tree=2 UI-parity batch).
+// tree mode persistence + migration + backfill (proj=1 4-state twisty model).
 //
-// The user expand-state (`userExpanded`) is the IN-MEMORY UI toggle that decides
-// whether a node renders its resident children. Before P1-A it lived only in a
-// Solid signal: every page reload collapsed the tree to the active path. P1-A
-// persists it to localStorage (versioned envelope) and rehydrates on load, plus
-// backfills any persisted-expanded node whose children aren't resident yet (the
-// cold-load frontier ships an idle user-expanded node COLLAPSED — its children
-// are not resident — so a naive persistence would leave a half-state).
-//
-// These tests pin: (1) persist/rehydrate round-trip, (2) the pure
-// expandedButUnloadedIds helper, (3) the stream backfill actually firing a
-// children fetch after the frontier seed, and (4) the "reload does not flatten"
-// invariant is NOT regressed (the flat map is still replaced by the server
-// snapshot while userExpanded survives).
+// The persisted mode map (vh.tree.mode.v2, Record<id, "collapsed"|"filtered"|
+// "expanded">) replaces the legacy binary expanded Set (vh.tree.expanded.v1).
+// These pin: (1) persist/rehydrate round-trip, (2) v1→v2 migration (members→
+// expanded, non-members→filtered default, malformed ignored, existing valid v2
+// wins over legacy, v1 key retained), (3) setNodesMode does ONE localStorage
+// write, (4) expandedButUnloadedIds reads mode==="expanded", (5) the stream
+// backfill fires a children fetch for a persisted-expanded unloaded node, (6)
+// reload does NOT flatten the tree (map re-fetched, modes survive), and (7)
+// clearUserToggled is wired into setSelectedId only on a real id change.
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import {
   seedTreeStore,
-  setUserNodeExpanded,
-  isUserExpanded,
+  setNodeMode,
+  setNodesMode,
+  modeOf,
+  hasUserToggled,
+  markUserToggled,
   resetExpandedForTest,
   resetTreeStore,
   treeMap,
@@ -27,8 +26,13 @@ import {
   rehydrateExpandedForTest,
 } from "../../src/sync/treeState";
 import { connect, closeSessionStream } from "../../src/sync/stream";
-import { setProjectDirRaw } from "../../src/sync/store";
+import { setProjectDirRaw, setSelectedIdRaw } from "../../src/sync/store";
+import { setSelectedId } from "../../src/sync/actions";
+import { saveVersioned } from "../../src/lib/store";
 import type { TreeNode } from "../../src/sync/treeMap";
+
+const LS_MODE = "vh.tree.mode.v2";
+const LS_LEGACY = "vh.tree.expanded.v1";
 
 // Full TreeNode seed (type-safe; mirrors treeState.test.ts node() helper).
 function node(overrides: Partial<TreeNode> = {}): TreeNode {
@@ -52,60 +56,140 @@ function node(overrides: Partial<TreeNode> = {}): TreeNode {
 }
 
 // ---------------------------------------------------------------------------
-// P1-A-1 / P1-A-2 / P1-A-4 — pure store + persistence (no EventSource).
+// persist/rehydrate round-trip + setNodesMode one-write.
 // ---------------------------------------------------------------------------
-describe("P1-A-1 userExpanded persist/rehydrate round-trip", () => {
+describe("mode map persist/rehydrate round-trip (vh.tree.mode.v2)", () => {
   beforeEach(() => {
     localStorage.clear();
     resetTreeStore();
     resetExpandedForTest();
   });
 
-  it("setUserNodeExpanded(true) persists the id to localStorage (vh.tree.expanded.v1)", () => {
-    setUserNodeExpanded("X", true);
-    const raw = localStorage.getItem("vh.tree.expanded.v1");
+  it("setNodeMode persists the mode to localStorage (vh.tree.mode.v2)", () => {
+    setNodeMode("X", "expanded");
+    const raw = localStorage.getItem(LS_MODE);
     expect(raw).not.toBeNull();
-    const env = JSON.parse(raw as string) as { v: number; data: string[] };
+    const env = JSON.parse(raw as string) as { v: number; data: Record<string, string> };
     expect(env.v).toBe(1);
-    expect(env.data).toContain("X");
+    expect(env.data.X).toBe("expanded");
   });
 
-  it("setUserNodeExpanded(false) removes the id from localStorage", () => {
-    setUserNodeExpanded("X", true);
-    setUserNodeExpanded("X", false);
-    const raw = localStorage.getItem("vh.tree.expanded.v1") as string;
-    const env = JSON.parse(raw) as { data: string[] };
-    expect(env.data).not.toContain("X");
+  it("setNodeMode overwrite persists the new mode", () => {
+    setNodeMode("X", "expanded");
+    setNodeMode("X", "collapsed");
+    const env = JSON.parse(localStorage.getItem(LS_MODE) as string) as { data: Record<string, string> };
+    expect(env.data.X).toBe("collapsed");
   });
 
-  it("rehydrateExpandedForTest restores the in-memory set from localStorage after in-memory is cleared (reload simulation)", () => {
-    setUserNodeExpanded("X", true);
-    expect(isUserExpanded("X")).toBe(true);
-
-    // Simulate a page reload: in-memory signal is cleared, but localStorage
-    // survives (resetExpandedForTest clears in-memory only — a reload loses the
-    // session's Solid signals but keeps persisted UI state).
+  it("rehydrateExpandedForTest restores modes from localStorage after in-memory clear (reload sim)", () => {
+    setNodeMode("X", "expanded");
+    expect(modeOf("X")).toBe("expanded");
     resetExpandedForTest();
-    expect(isUserExpanded("X")).toBe(false);
-
-    // Rehydrate from localStorage: the persisted toggle comes back.
+    expect(modeOf("X")).toBe("filtered"); // in-memory cleared
     rehydrateExpandedForTest();
-    expect(isUserExpanded("X")).toBe(true);
+    expect(modeOf("X")).toBe("expanded"); // rehydrated from disk
   });
 
-  it("resetTreeStore (true project switch / epoch change) clears the persisted key", () => {
-    setUserNodeExpanded("X", true);
-    expect(localStorage.getItem("vh.tree.expanded.v1")).toContain("X");
+  it("resetTreeStore (project switch) clears the persisted mode key", () => {
+    setNodeMode("X", "expanded");
+    expect(localStorage.getItem(LS_MODE)).toContain("expanded");
     resetTreeStore();
-    const raw = localStorage.getItem("vh.tree.expanded.v1");
-    expect(raw).not.toBeNull();
-    const env = JSON.parse(raw as string) as { data: string[] };
-    expect(env.data).toEqual([]);
-    expect(isUserExpanded("X")).toBe(false);
+    const env = JSON.parse(localStorage.getItem(LS_MODE) as string) as { data: Record<string, string> };
+    expect(env.data).toEqual({});
+    expect(modeOf("X")).toBe("filtered");
+  });
+
+  it("setNodesMode does ONE localStorage write per call (batched, not N)", () => {
+    const setItemSpy = vi.spyOn(Storage.prototype, "setItem");
+    setNodesMode(["a", "b", "c"], "expanded");
+    // A loop of setNodeMode would call setItem 3× for LS_MODE; the batched
+    // setNodesMode accumulates then writes ONCE.
+    const modeWrites = setItemSpy.mock.calls.filter((c) => c[0] === LS_MODE);
+    expect(modeWrites).toHaveLength(1);
+    setItemSpy.mockRestore();
+  });
+
+  it("setNodeMode does exactly one localStorage write per call", () => {
+    const setItemSpy = vi.spyOn(Storage.prototype, "setItem");
+    setNodeMode("solo", "expanded");
+    const modeWrites = setItemSpy.mock.calls.filter((c) => c[0] === LS_MODE);
+    expect(modeWrites).toHaveLength(1);
+    setItemSpy.mockRestore();
   });
 });
 
-describe("P1-A-2 expandedButUnloadedIds (pure)", () => {
+// ---------------------------------------------------------------------------
+// v1 → v2 migration (legacy expanded Set → mode map).
+// ---------------------------------------------------------------------------
+describe("v1 → v2 migration (vh.tree.expanded.v1 → vh.tree.mode.v2)", () => {
+  beforeEach(() => {
+    // resetTreeStore writes an empty v2 map (its persisted-key clear). Clear
+    // localStorage AFTER it so the migration tests start with v2 ABSENT —
+    // otherwise loadInitialTreeModes sees an (empty) v2 key and skips migration.
+    resetTreeStore();
+    resetExpandedForTest();
+    localStorage.clear();
+  });
+
+  it("legacy expanded-set members → 'expanded'; absent ids → default 'filtered'", () => {
+    saveVersioned(LS_LEGACY, 1, ["A", "B"]);
+    rehydrateExpandedForTest();
+    expect(modeOf("A")).toBe("expanded");
+    expect(modeOf("B")).toBe("expanded");
+    expect(modeOf("C")).toBe("filtered"); // absent → default
+  });
+
+  it("malformed legacy entries (non-string / empty) are ignored", () => {
+    saveVersioned(LS_LEGACY, 1, ["A", "", 123, null] as unknown as string[]);
+    rehydrateExpandedForTest();
+    expect(modeOf("A")).toBe("expanded");
+    expect(modeOf("")).toBe("filtered"); // empty string skipped
+    // numbers / nulls skipped (no crash, no manufactured entry)
+  });
+
+  it("an existing VALID v2 map wins over legacy migration (v2 not re-migrated)", () => {
+    saveVersioned(LS_MODE, 1, { X: "collapsed" }); // v2 present
+    saveVersioned(LS_LEGACY, 1, ["A"]); // legacy present
+    rehydrateExpandedForTest();
+    expect(modeOf("X")).toBe("collapsed"); // v2 content used
+    expect(modeOf("A")).toBe("filtered"); // legacy IGNORED (v2 already present)
+  });
+
+  it("an EMPTY v2 map (present but {}) is used as-is — no re-migration from legacy", () => {
+    saveVersioned(LS_MODE, 1, {}); // v2 present, empty
+    saveVersioned(LS_LEGACY, 1, ["A"]);
+    rehydrateExpandedForTest();
+    expect(modeOf("A")).toBe("filtered"); // not migrated (v2 present)
+  });
+
+  it("the legacy v1 key is RETAINED after migration (rollback safety)", () => {
+    saveVersioned(LS_LEGACY, 1, ["A"]);
+    rehydrateExpandedForTest();
+    expect(localStorage.getItem(LS_LEGACY)).not.toBeNull(); // retained
+    expect(localStorage.getItem(LS_MODE)).not.toBeNull(); // v2 written
+  });
+
+  it("migration persists the result under v2 so the next load is a direct hit", () => {
+    saveVersioned(LS_LEGACY, 1, ["A"]);
+    rehydrateExpandedForTest(); // migrates + persists v2
+    // Second rehydrate: v2 now present → direct read, legacy untouched.
+    rehydrateExpandedForTest();
+    expect(modeOf("A")).toBe("expanded");
+  });
+
+  it("a corrupted v2 payload is coerced to a clean map (invalid modes dropped)", () => {
+    saveVersioned(LS_MODE, 1, { A: "expanded", B: "junk", C: 42 } as unknown as Record<string, never>);
+    rehydrateExpandedForTest();
+    expect(modeOf("A")).toBe("expanded");
+    expect(modeOf("B")).toBe("filtered"); // invalid mode dropped
+    expect(modeOf("C")).toBe("filtered"); // non-string dropped
+  });
+});
+
+// ---------------------------------------------------------------------------
+// expandedButUnloadedIds — backfill source (reads mode === "expanded").
+// ---------------------------------------------------------------------------
+describe("expandedButUnloadedIds (mode === 'expanded')", () => {
   beforeEach(() => {
     localStorage.clear();
     resetTreeStore();
@@ -114,7 +198,7 @@ describe("P1-A-2 expandedButUnloadedIds (pure)", () => {
 
   it("resident node with unloaded children + descendants to fetch → included", () => {
     seedTreeStore([node({ id: "A", childCount: 2, descendantCount: 2, loaded: false })]);
-    setUserNodeExpanded("A", true);
+    setNodeMode("A", "expanded");
     expect(expandedButUnloadedIds()).toEqual(["A"]);
   });
 
@@ -123,59 +207,105 @@ describe("P1-A-2 expandedButUnloadedIds (pure)", () => {
       node({ id: "A", childCount: 1, descendantCount: 1, loaded: true }),
       node({ id: "c", parentId: "A" }),
     ]);
-    setUserNodeExpanded("A", true);
+    setNodeMode("A", "expanded");
     expect(expandedButUnloadedIds()).toEqual([]);
   });
 
-  it("a non-resident id in userExpanded (not in map) → excluded", () => {
-    setUserNodeExpanded("GHOST", true); // never seeded into the map
+  it("a non-resident id persisted as expanded (not in map) → excluded", () => {
+    setNodeMode("GHOST", "expanded"); // never seeded into the map
     seedTreeStore([node({ id: "A", childCount: 2, descendantCount: 2, loaded: false })]);
-    setUserNodeExpanded("A", true);
+    setNodeMode("A", "expanded");
     expect(expandedButUnloadedIds()).toEqual(["A"]); // GHOST absent
   });
 
-  it("resident node with NO descendants (childCount 0, descendantCount 0) → excluded (nothing to fetch)", () => {
-    seedTreeStore([node({ id: "A", childCount: 0, descendantCount: 0, loaded: false })]);
-    setUserNodeExpanded("A", true);
+  it("a node persisted as 'filtered' or 'collapsed' → excluded (only expanded is backfilled)", () => {
+    seedTreeStore([node({ id: "A", childCount: 2, descendantCount: 2, loaded: false })]);
+    setNodeMode("A", "filtered");
+    expect(expandedButUnloadedIds()).toEqual([]);
+    setNodeMode("A", "collapsed");
     expect(expandedButUnloadedIds()).toEqual([]);
   });
 
-  it("empty when nothing is user-expanded", () => {
+  it("resident node with NO descendants (childCount 0, descendantCount 0) → excluded", () => {
+    seedTreeStore([node({ id: "A", childCount: 0, descendantCount: 0, loaded: false })]);
+    setNodeMode("A", "expanded");
+    expect(expandedButUnloadedIds()).toEqual([]);
+  });
+
+  it("empty when nothing is persisted-expanded", () => {
     seedTreeStore([node({ id: "A", childCount: 2, descendantCount: 2, loaded: false })]);
     expect(expandedButUnloadedIds()).toEqual([]);
   });
 });
 
-describe("P1-A-4 reload does NOT flatten the tree (regression guard)", () => {
+// ---------------------------------------------------------------------------
+// reload does NOT flatten the tree (regression guard).
+// ---------------------------------------------------------------------------
+describe("reload does NOT flatten the tree (regression guard)", () => {
   beforeEach(() => {
     localStorage.clear();
     resetTreeStore();
     resetExpandedForTest();
   });
 
-  it("reseed replaces the flat map (structure re-fetched) while userExpanded survives", () => {
+  it("reseed replaces the flat map (structure re-fetched) while modes survive", () => {
     seedTreeStore([node({ id: "X", childCount: 1, loaded: true }), node({ id: "c1", parentId: "X" })]);
-    setUserNodeExpanded("X", true);
+    setNodeMode("X", "expanded");
     const mapBefore = treeMap();
-    expect(isUserExpanded("X")).toBe(true);
+    expect(modeOf("X")).toBe("expanded");
 
     // The server snapshot REPLACES the whole map on every tree.snapshot
     // (seedTreeStore → map = seedTree(...)). This is what keeps "reload does not
-    // flatten" true: the map is always re-fetched from the server, never
-    // persisted-and-stale.
+    // flatten" true: the map is always re-fetched, never persisted-and-stale.
     seedTreeStore([node({ id: "X", childCount: 1, loaded: true }), node({ id: "c2", parentId: "X" })]);
     const mapAfter = treeMap();
 
     expect(mapAfter).not.toBe(mapBefore); // a NEW map object (structure re-fetched)
-    expect(isUserExpanded("X")).toBe(true); // but the user toggle survived
+    expect(modeOf("X")).toBe("expanded"); // but the mode survived
   });
 });
 
 // ---------------------------------------------------------------------------
-// P1-A-3 — stream backfill fires a children fetch after the frontier seed.
-// Mock EventSource (mirrors resyncTree.test.ts), drive a tree.snapshot for a
-// node that is user-expanded + resident-but-no-resident-children + has
-// descendants, and assert GET /vh/tree/children?id=<that node> is observed.
+// clearUserToggled wiring into setSelectedId (only on a real id change).
+// ---------------------------------------------------------------------------
+describe("clearUserToggled wired into the canonical selection setter", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    resetTreeStore();
+    resetExpandedForTest();
+    setSelectedIdRaw(null);
+  });
+
+  it("a twisty click (markUserToggled) survives a SAME-id re-select", () => {
+    setSelectedIdRaw("A"); // baseline selection
+    markUserToggled("X");
+    expect(hasUserToggled("X")).toBe(true);
+    setSelectedId("A"); // same id → no clear
+    expect(hasUserToggled("X")).toBe(true);
+  });
+
+  it("a real selection CHANGE clears userToggled synchronously", () => {
+    setSelectedIdRaw("A");
+    markUserToggled("X");
+    setSelectedId("B"); // different id → clear
+    expect(hasUserToggled("X")).toBe(false);
+  });
+
+  it("persisted modes survive the selection-change clear", () => {
+    setSelectedIdRaw("A");
+    setNodeMode("Y", "expanded");
+    markUserToggled("Y");
+    setSelectedId("C"); // clears userToggled...
+    expect(hasUserToggled("Y")).toBe(false);
+    expect(modeOf("Y")).toBe("expanded"); // ...but the mode survived
+  });
+});
+
+// ---------------------------------------------------------------------------
+// stream backfill fires a children fetch after the frontier seed.
+// Mock EventSource (mirrors the original P1-A-3 suite), drive a tree.snapshot
+// for a node that is persisted-expanded + resident-but-no-resident-children +
+// has descendants, and assert GET /vh/tree/children?id=<that node> is observed.
 // ---------------------------------------------------------------------------
 const CONNECTING = 0;
 const OPEN = 1;
@@ -226,7 +356,7 @@ let instances: MockEventSource[] = [];
 const treeESes = (): MockEventSource[] =>
   instances.filter((e) => !/sessions=[^&]/.test(e.url));
 
-describe("P1-A-3 stream backfill fires GET /vh/tree/children after the frontier seed", () => {
+describe("stream backfill fires GET /vh/tree/children after the frontier seed", () => {
   let fetchMock: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
@@ -250,27 +380,17 @@ describe("P1-A-3 stream backfill fires GET /vh/tree/children after the frontier 
   });
 
   it("a persisted-expanded node with unloaded children is backfilled (fetch fires)", async () => {
-    // The node X is user-expanded, resident (in the snapshot), has descendants
-    // but NO resident direct children — exactly the cold-load half-state the
-    // backfill resolves.
-    setUserNodeExpanded("X", true);
-
+    setNodeMode("X", "expanded");
     connect(true);
     expect(treeESes()).toHaveLength(1);
     treeESes()[0].simulateOpen();
 
-    // Dispatch the frontier tree.snapshot. The applyTreeSnap closure seeds the
-    // store, then (NEW) backfills expandedButUnloadedIds() by firing
-    // expandTreeNode for each → GET /vh/tree/children?id=X.
     treeESes()[0].simulateMessage("tree.snapshot", {
       nodes: [node({ id: "X", childCount: 2, descendantCount: 2, loaded: false })],
     });
 
-    // expandTreeNode is async (await fetch); let the microtask queue drain.
     await new Promise((r) => setTimeout(r, 0));
 
-    // connect() also calls GET /vh/version (PWA update check); scope the
-    // assertion to the tree-children endpoint — that is the backfill signal.
     const treeFetches = fetchMock.mock.calls
       .map((c) => String(c[0]))
       .filter((u) => u.includes("/vh/tree/children"));
@@ -278,10 +398,9 @@ describe("P1-A-3 stream backfill fires GET /vh/tree/children after the frontier 
     expect(treeFetches[0]).toContain("id=X");
   });
 
-  it("a node NOT user-expanded does NOT trigger a backfill fetch", async () => {
+  it("a node NOT persisted-expanded does NOT trigger a backfill fetch", async () => {
     connect(true);
     treeESes()[0].simulateOpen();
-    // X is resident with unloaded children but NOT user-expanded → no backfill.
     treeESes()[0].simulateMessage("tree.snapshot", {
       nodes: [node({ id: "X", childCount: 2, descendantCount: 2, loaded: false })],
     });
@@ -292,8 +411,8 @@ describe("P1-A-3 stream backfill fires GET /vh/tree/children after the frontier 
     expect(treeFetches).toHaveLength(0);
   });
 
-  it("a user-expanded node that already HAS resident children does NOT trigger a backfill", async () => {
-    setUserNodeExpanded("X", true);
+  it("a persisted-expanded node that already HAS resident children does NOT backfill", async () => {
+    setNodeMode("X", "expanded");
     connect(true);
     treeESes()[0].simulateOpen();
     treeESes()[0].simulateMessage("tree.snapshot", {

@@ -11,6 +11,7 @@ import {
   state,
   setState,
   projectDir,
+  selectedId,
   setProjectDirRaw,
   setSelectedIdRaw,
   setDraft,
@@ -22,10 +23,20 @@ import {
 import { syncUrl } from "./url";
 import { closeSessionStream, connect, resetPageInFlight } from "./stream";
 import { invalidateChildrenIndex } from "./selectors";
-import { resetTreeStore } from "./treeState";
+import { resetTreeStore, clearUserToggled } from "./treeState";
 
 // Selecting any real session leaves draft mode.
+//
+// userToggled clear: the transient twisty-click overlay is cleared SYNCHRONOUSLY
+// here, but ONLY when the id actually changes. This avoids the race where a
+// twisty click (which does NOT change selection) would lose its overlay before
+// the persisted mode change lands. A real selection change (different id) resets
+// the overlay so the new selection's ancestor chain re-evaluates temp from
+// scratch; a same-id re-select (re-clicking the open session to jump back to
+// chat) leaves the overlay intact. Done in the setter, NOT a delayed effect, so
+// persisted mode changes from a just-prior twisty click survive the clear.
 export function setSelectedId(id: string | null) {
+  if (id !== selectedId()) clearUserToggled();
   if (id) setDraft(false);
   setSelectedIdRaw(id);
   syncUrl(id);
