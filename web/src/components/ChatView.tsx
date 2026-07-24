@@ -289,7 +289,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // `file` is set ONLY for draft-queued attachments (no server session yet):
   // the raw File is held locally and uploaded at send time, then `file` is
   // dropped and a real `url` takes its place (see flushPendingAttachments).
-  interface Attachment { url: string; filename: string; mime: string; file?: File }
+  interface Attachment { url: string; filename: string; mime: string; file?: File; path?: string }
   const [attachments, setAttachments] = createSignal<Attachment[]>([]);
   const [uploading, setUploading] = createSignal(false);
   let fileInputRef: HTMLInputElement | undefined;
@@ -1486,7 +1486,11 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     if (!res.ok) return null;
     const part = await res.json();
     if (!part?.url) return null;
-    return { url: part.url, filename: part.filename, mime: part.mime };
+    // Thread the project-relative attachment path returned by attach.go through
+    // into the FE Attachment (and onward into the queue via QueuedAttachment).
+    // S1 only carries the field; it is not yet used to build the dispatched
+    // part (buildParts). `path` may be absent on older backends → undefined.
+    return { url: part.url, filename: part.filename, mime: part.mime, path: part.path };
   }
 
   // Synthetic key for a draft-queued attachment (no server session yet). Real

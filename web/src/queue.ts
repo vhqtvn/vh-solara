@@ -27,6 +27,12 @@ export interface QueuedAttachment {
   url: string;
   filename: string;
   mime: string;
+  // Project-relative attachment path threaded from attach.go's upload response
+  // (".vh-solara/sessions/<id>/attachments/<file>"). Optional for backward
+  // compat: legacy queued items persisted without a path round-trip with path
+  // simply absent/undefined. S1 only threads the field; it is not yet consumed
+  // by the dispatch path.
+  path?: string;
 }
 export type QueueItemState = "pending" | "dispatching" | "sent" | "failed" | "unknown";
 export interface QueuedMessage {

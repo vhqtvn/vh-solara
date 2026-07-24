@@ -1776,3 +1776,121 @@ func TestQueueCleanupRemovesOrphanedFileOnDisk(t *testing.T) {
 		t.Fatalf("no-store branch: empty session dir should be gone, got %v", err)
 	}
 }
+
+// --- Attachment path threading (S1) -----------------------------------------
+//
+// These pin the no-loss invariant for the new optional QueueAttachment.Path
+// field (json:"path,omitempty"): an attachment carrying a path round-trips
+// through marshal/unmarshal with the path intact, AND a legacy attachment
+// persisted WITHOUT a path field unmarshals cleanly (survives, not dropped, not
+// errored) with Path=="". The field is omitempty so old on-disk items without
+// `path` never trip a decode error and simply read back as Path=="". This is
+// the queue backward-compat half of the S1 path-threading slice; the
+// Attachments-always-array contract (TestQueueAttachmentsAlwaysArrayOnWire /
+// TestQueueLegacyReloadAttachmentsAlwaysArray) is untouched.
+
+// TestQueueAttachmentPathRoundTrip pins the S1 wire contract for
+// QueueAttachment.Path: set Path -> json.Marshal -> json.Unmarshal -> the path
+// survives byte-for-byte alongside the existing url/filename/mime fields.
+func TestQueueAttachmentPathRoundTrip(t *testing.T) {
+	in := QueueAttachment{
+		URL:      "file:///proj/.vh-solara/sessions/s1/attachments/20240101-120000_x.png",
+		Filename: "x.png",
+		Mime:     "image/png",
+		Path:     ".vh-solara/sessions/s1/attachments/20240101-120000_x.png",
+	}
+	raw, err := json.Marshal(in)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	// The path MUST be present on the wire (omitempty drops only the empty case).
+	if !bytes.Contains(raw, []byte(`"path":`)) {
+		t.Fatalf("wire: path field missing from marshaled attachment: %s", raw)
+	}
+	var back QueueAttachment
+	if err := json.Unmarshal(raw, &back); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if back != in {
+		t.Fatalf("round-trip lost data: got %+v, want %+v", back, in)
+	}
+}
+
+// TestQueueAttachmentLegacyNoPathSurvives pins the no-loss invariant for the
+// Path field's omitempty tag: a legacy attachment persisted WITHOUT a `path`
+// key (the pre-S1 on-disk shape) MUST unmarshal cleanly — the attachment
+// SURVIVES (not dropped from the slice) with Path=="" (not errored). This is
+// the migration guarantee: existing queue.json files round-trip through a
+// binary that now knows about Path without losing or rejecting any attachment.
+func TestQueueAttachmentLegacyNoPathSurvives(t *testing.T) {
+	// Legacy wire shape: url/filename/mime only, NO path key.
+	legacy := []byte(`[` +
+		`{"url":"file:///p/a.png","filename":"a.png","mime":"image/png"},` +
+		`{"url":"file:///p/b.txt","filename":"b.txt","mime":"text/plain"}` +
+		`]`)
+	var atts []QueueAttachment
+	if err := json.Unmarshal(legacy, &atts); err != nil {
+		t.Fatalf("legacy Unmarshal errored (no-loss invariant broken): %v", err)
+	}
+	if len(atts) != 2 {
+		t.Fatalf("legacy attachments dropped: got %d, want 2 (no-loss invariant)", len(atts))
+	}
+	for i, a := range atts {
+		if a.Path != "" {
+			t.Fatalf("atts[%d].Path = %q, want empty (legacy item had no path)", i, a.Path)
+		}
+		if a.URL == "" || a.Filename == "" || a.Mime == "" {
+			t.Fatalf("atts[%d] lost an existing field: %+v", i, a)
+		}
+	}
+	// Re-marshaling a legacy (path-less) attachment MUST omit the path key
+	// (omitempty) so the wire shape stays stable for any consumer that does
+	// not understand path yet.
+	reRaw, err := json.Marshal(atts)
+	if err != nil {
+		t.Fatalf("re-Marshal: %v", err)
+	}
+	if bytes.Contains(reRaw, []byte(`"path"`)) {
+		t.Fatalf("legacy re-marshal emitted a path key (omitempty broken): %s", reRaw)
+	}
+}
+
+// TestQueueAttachmentPathDurableThroughEnqueueReload pins the store-level
+// no-loss invariant end-to-end: an item enqueued with a path-bearing
+// attachment persists Path to disk and a fresh store reload observes it. This
+// confirms the path is carried by the real Enqueue->save->load round-trip
+// (not just the type-level marshal in TestQueueAttachmentPathRoundTrip).
+func TestQueueAttachmentPathDurableThroughEnqueueReload(t *testing.T) {
+	s, root := newTestStore(t, "s1")
+	att := QueueAttachment{
+		URL:      "file:///proj/.vh-solara/sessions/s1/attachments/20240101-120000_x.png",
+		Filename: "x.png",
+		Mime:     "image/png",
+		Path:     ".vh-solara/sessions/s1/attachments/20240101-120000_x.png",
+	}
+	it, err := s.Enqueue("with-att", []QueueAttachment{att}, QueueSendConfig{}, "")
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if len(it.Attachments) != 1 || it.Attachments[0].Path != att.Path {
+		t.Fatalf("enqueued item lost path: got %+v", it.Attachments)
+	}
+	// In-memory List() preserves the path.
+	got, err := s.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(got) != 1 || len(got[0].Attachments) != 1 || got[0].Attachments[0].Path != att.Path {
+		t.Fatalf("List lost path: got %+v", got[0].Attachments)
+	}
+	// Fresh store reload (bypasses the in-memory cache): path must be durable
+	// on disk — the no-loss invariant for the real persistence path.
+	s2 := &sessionQueueStore{path: queuePath(root, "s1")}
+	got2, err := s2.List()
+	if err != nil {
+		t.Fatalf("reload List: %v", err)
+	}
+	if len(got2) != 1 || len(got2[0].Attachments) != 1 || got2[0].Attachments[0].Path != att.Path {
+		t.Fatalf("reload lost path (not durable on disk): got %+v", got2[0].Attachments)
+	}
+}

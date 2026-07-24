@@ -53,10 +53,18 @@ func isTerminalState(s QueueItemState) bool {
 }
 
 // QueueAttachment mirrors the FE attachment shape (file:// url + meta).
+//
+// Path carries the project-relative attachment path threaded from attach.go's
+// upload response (".vh-solara/sessions/<id>/attachments/<file>"). It is
+// omitempty so legacy queue.json items persisted WITHOUT a path key unmarshal
+// cleanly (Path=="") rather than being dropped or erroring — the queue
+// backward-compat no-loss invariant. S1 only threads the field end-to-end; it
+// is not yet consumed by the dispatch path (buildParts).
 type QueueAttachment struct {
 	URL      string `json:"url"`
 	Filename string `json:"filename"`
 	Mime     string `json:"mime"`
+	Path     string `json:"path,omitempty"`
 }
 
 // QueueSendConfig captures the model/agent/variant a message was composed with,

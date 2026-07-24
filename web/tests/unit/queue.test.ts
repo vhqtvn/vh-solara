@@ -194,6 +194,102 @@ describe("enqueue — bounded enqueue timeout (hung-POST send-loss guard)", () =
   });
 });
 
+describe("QueuedAttachment.path — threaded through enqueue + cache (S1)", () => {
+  // Pins the FE half of the S1 path-threading slice: an attachment carrying a
+  // project-relative `path` (from attach.go's upload response) is preserved in
+  // the enqueue POST body and in the cached item, and a legacy attachment
+  // WITHOUT path still enqueues cleanly (backward-compat no-loss invariant).
+  // The Attachments->QueuedAttachment conversion happens structurally at the
+  // enqueue call site (sendText passes Attachment[] as QueueInput.attachments);
+  // these tests pin the queue module's wire shape directly.
+
+  it("preserves attachment.path in the enqueue POST body and the cached item", async () => {
+    const sid = "s-path-1";
+    touched.push(sid);
+    let captured: any;
+    const att = {
+      url: "file:///proj/.vh-solara/sessions/s1/attachments/x.png",
+      filename: "x.png",
+      mime: "image/png",
+      path: ".vh-solara/sessions/s1/attachments/x.png",
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string, init?: any) => {
+        if (url.endsWith(`/vh/session/${sid}/queue`) && init?.method === "POST") {
+          captured = JSON.parse(init.body);
+          // Backend echoes the item with the attachment path intact.
+          return Promise.resolve(
+            res(200, {
+              item: { id: "q-1", order: 1, state: "pending", text: captured.text, attachments: [att], createdAt: 1 },
+            }),
+          );
+        }
+        return Promise.resolve(res(404, {}));
+      }),
+    );
+
+    const got = await enqueue(sid, { text: "see-this", attachments: [att] });
+    // The POST body carried the path through to the backend.
+    expect(captured.attachments[0].path).toBe(att.path);
+    // The cached item (backend echo) preserves the path.
+    expect(got.attachments[0].path).toBe(att.path);
+    expect(queueFor(sid)[0].attachments[0].path).toBe(att.path);
+  });
+
+  it("a legacy attachment without path still enqueues cleanly (no-loss)", async () => {
+    const sid = "s-path-2";
+    touched.push(sid);
+    let captured: any;
+    const legacyAtt = { url: "file:///p/a.png", filename: "a.png", mime: "image/png" };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string, init?: any) => {
+        if (url.endsWith(`/vh/session/${sid}/queue`) && init?.method === "POST") {
+          captured = JSON.parse(init.body);
+          return Promise.resolve(
+            res(200, {
+              item: { id: "q-1", order: 1, state: "pending", text: captured.text, attachments: [legacyAtt], createdAt: 1 },
+            }),
+          );
+        }
+        return Promise.resolve(res(404, {}));
+      }),
+    );
+    const got = await enqueue(sid, { text: "legacy", attachments: [legacyAtt] });
+    // No path on the input; the POST body simply omits it (no error).
+    expect(captured.attachments[0].path).toBeUndefined();
+    // Cached item: path is absent/undefined (not dropped, not errored).
+    expect(got.attachments[0].path).toBeUndefined();
+    expect(queueFor(sid)[0].attachments[0].path).toBeUndefined();
+  });
+
+  it("fetchQueue preserves attachment.path from the backend list", async () => {
+    const sid = "s-path-3";
+    touched.push(sid);
+    const att = {
+      url: "file:///p/b.png",
+      filename: "b.png",
+      mime: "image/png",
+      path: ".vh-solara/sessions/s2/attachments/b.png",
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() =>
+        Promise.resolve(
+          res(200, {
+            items: [
+              { id: "q-9", order: 1, state: "pending", text: "t", attachments: [att], createdAt: 1 },
+            ],
+          }),
+        ),
+      ),
+    );
+    await fetchQueue(sid);
+    expect(queueFor(sid)[0].attachments[0].path).toBe(att.path);
+  });
+});
+
 describe("fetchQueue — authoritative refresh (open/focus/reconnect)", () => {
   it("replaces the cache for a session with the backend list", async () => {
     const sid = "s-fetch-1";
