@@ -101,6 +101,24 @@ describe("selectPinnedNodes (flat-map, depth-agnostic)", () => {
     expect(out).toEqual(["R3", "R1", "R2"]);
   });
 
+  // REGRESSION guard for P0-WEB-001: the pinned group must NEVER be recency-
+  // sorted. It renders from selectPinnedNodes (SessionTree.tsx:78), which does
+  // NOT call treeRoots()/treeChildrenOf() (the accessors that now sort newest-
+  // first). Construct a pinnedOrder that is the EXACT REVERSE of recency and
+  // assert it is preserved — this pins the invariant even as the treeState
+  // accessors gain a recency sort.
+  it("never recency-sorts pins: a pinned order that is the REVERSE of recency is preserved", () => {
+    const siblings = seedTree([
+      node({ id: "old", title: "Old", updatedMs: 10 }),
+      node({ id: "mid", title: "Mid", updatedMs: 20 }),
+      node({ id: "new", title: "New", updatedMs: 30 }),
+    ]);
+    // Recency would be [new, mid, old]. Pin in the EXACT reverse so any leak of
+    // the treeState recency sort into pins would flip the assertion.
+    const out = selectPinnedNodes(siblings, ["old", "mid", "new"]).map((n) => n.id);
+    expect(out).toEqual(["old", "mid", "new"]);
+  });
+
   // CRUX d_F1 (nested-pin double render): pinning BOTH an ancestor AND a
   // descendant must render the descendant EXACTLY ONCE. The pinned-group
   // TreeBranch recurses with an empty dedup set, so a pinned descendant would

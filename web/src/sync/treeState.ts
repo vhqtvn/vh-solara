@@ -60,13 +60,26 @@ export function treeNode(id: string): TreeNode | undefined {
 
 export function treeRoots(): TreeNode[] {
   void version();
-  return rootNodes(map);
+  // Newest-first (P0-WEB-001): the deleted proj=1 client sorted every group by
+  // time.updated DESC in reduce.ts buildChildrenIndex; that sort was lost when
+  // reduce.ts was removed. Re-implement it here on the reactive accessor so the
+  // sidebar renders newest-first. The pure `rootNodes`/`childrenIndex` in
+  // treeMap.ts keep their order-preserving (insertion/emit) contract so any
+  // future caller can still get emit order; the recency sort lives in these
+  // shell accessors only. rootNodes() returns a fresh array each call, so this
+  // sorts in place without mutating the map. updatedMs is on every TreeNode
+  // (treeMap.ts:40). Stable sort: ties keep emit/insertion order.
+  return rootNodes(map).sort((a, b) => b.updatedMs - a.updatedMs);
 }
 
 // Direct children of `parentId` (grouped by parentId, §7.3 render grouping).
 export function treeChildrenOf(parentId: string): TreeNode[] {
   void version();
-  return childrenIndex(map).get(parentId) ?? [];
+  // Newest-first — see treeRoots() above (P0-WEB-001). childrenIndex() builds a
+  // fresh array per call, so sorting it in place is safe. Pinned children are
+  // filtered out by the caller (SessionTree.tsx:46) before render, so this does
+  // NOT touch pin order (pins come from selectPinnedNodes, not this accessor).
+  return (childrenIndex(map).get(parentId) ?? []).sort((a, b) => b.updatedMs - a.updatedMs);
 }
 
 // ---- mutators ---------------------------------------------------------------
