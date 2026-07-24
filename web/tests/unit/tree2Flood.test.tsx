@@ -187,9 +187,14 @@ describe("tree2 flood fix — render gate over the resident flat map", () => {
   // Active-path auto-expand: a root with a busy descendant renders expanded
   // (the chain to live work stays visible) WITHOUT the user toggling anything,
   // and WITHOUT a fetch (§5 guarantees the active path is shipped resident).
-  // Idle SIBLINGS of the chain render as collapsed rows; idle GRANDCHILDREN of
-  // those idle siblings do NOT render (the flood stops at idle subtrees).
-  it("active path auto-expands the chain to a busy descendant; idle subtrees stay collapsed", () => {
+  //
+  // BEHAVIOR (P0-C per-child gate): an active-path parent renders ONLY its
+  // keep-visible children (the busy branch). Idle SIBLINGS of the chain (b, c)
+  // do NOT render either — they collapse behind the active root's "▸ N" twisty.
+  // (Under the OLD per-parent gate an active root dumped ALL its direct children
+  // as collapsed rows; the per-child gate stops the flood at idle siblings too,
+  // not just idle subtrees.) User-expanding the root would show b + c as well.
+  it("active path auto-expands the chain to a busy descendant; idle siblings + subtrees stay collapsed", () => {
     seedTreeStore([
       node({ id: "root", title: "Root", childCount: 3, descendantCount: 5, loaded: true }),
       // active chain branch
@@ -204,17 +209,23 @@ describe("tree2 flood fix — render gate over the resident flat map", () => {
     const { container } = render(() => <SessionTree />);
 
     const ids = renderedIds(container as unknown as HTMLElement);
-    // root + a + busy1 (active chain) + b + c (direct children of the expanded
-    // root, each rendered as a collapsed row).
+    // root + a + busy1: the active chain. The per-child gate renders ONLY the
+    // busy branch under the active-path root.
     expect(ids).toContain("root");
     expect(ids).toContain("a");
     expect(ids).toContain("busy1");
-    expect(ids).toContain("b");
-    expect(ids).toContain("c");
-    // CRUX: `deepb` is resident but NOT rendered — b is idle (not on the active
-    // path), so its children stay collapsed. This is where the flood is stopped.
+    // P0-C CRUX: b and c (idle DIRECT children of the active root) are off the
+    // keep-visible path and root is NOT user-expanded → they do NOT render.
+    // They collapse behind root's "▸ N" twisty (the flood stops at idle
+    // siblings, not just idle subtrees).
+    expect(ids).not.toContain("b");
+    expect(ids).not.toContain("c");
+    // deepb is resident but NOT rendered — b (its parent) does not even render.
     expect(ids).not.toContain("deepb");
-    expect(treeNode("deepb")).toBeDefined(); // ...but it IS still resident.
+    // All three idle nodes ARE still resident in the flat map (render-only gate).
+    expect(treeNode("b")).toBeDefined();
+    expect(treeNode("c")).toBeDefined();
+    expect(treeNode("deepb")).toBeDefined();
     // No fetch fired (the active path is already resident).
     expect(expandSpy).not.toHaveBeenCalled();
   });

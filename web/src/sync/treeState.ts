@@ -69,12 +69,27 @@ let activePathCache: { v: number; set: Set<string> } | null = null;
 // Reactive: is `id` currently expanded in the RENDER (children rendered)?
 // True iff on the active path OR user-expanded. Collapsing an active-path node
 // is a benign no-op here (it stays expanded) — live work must stay visible.
+//
+// @deprecated for the RENDER gate — SessionTree.TreeBranch now uses the per-child
+// gate (`visiblePathIds` ∪ per-child filter + `isUserExpanded`). This fn is
+// retained because the unit suite (treeState.test.ts) asserts its active-path ∪
+// userExpanded contract directly; new render code should NOT call it.
 export function isNodeExpanded(id: string): boolean {
   const v = version();
   if (activePathCache === null || activePathCache.v !== v) {
     activePathCache = { v, set: activePathIds(map) };
   }
   return activePathCache.set.has(id) || userExpanded().has(id);
+}
+
+// Reactive: is `id` explicitly USER-expanded (the IN-MEMORY UI toggle ONLY)?
+// This is just the user toggle — it does NOT include the active-path auto-expand.
+// The per-child render gate (SessionTree.TreeBranch) reads this to decide
+// whether a parent renders ALL its children (user-expanded) vs only the
+// keep-visible-path ones (visiblePathIds). Reading the `userExpanded` signal
+// subscribes the caller's reactive scope to user toggles.
+export function isUserExpanded(id: string): boolean {
+  return userExpanded().has(id);
 }
 
 // User toggled a node open/closed. Adds/removes from the in-memory UI set; does

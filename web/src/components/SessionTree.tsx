@@ -1,8 +1,8 @@
 import { For, Show, createMemo } from "solid-js";
 import { selectedId, setSelectedId, state, expandTreeNode } from "../sync";
 import { setView } from "../ui";
-import { treeMap, treeRoots, treeChildrenOf, isNodeExpanded, setUserNodeExpanded } from "../sync/treeState";
-import { selectPinnedNodes, selectSearchResults } from "../sync/treeSelectors";
+import { treeMap, treeRoots, treeChildrenOf, isUserExpanded, setUserNodeExpanded } from "../sync/treeState";
+import { selectPinnedNodes, selectSearchResults, visiblePathIds } from "../sync/treeSelectors";
 import { searchQuery, reconciledPinnedOrder, isPinned } from "../sidebar";
 import { menuTriggers } from "../sessionMenu";
 import TreeRow from "./TreeRow";
@@ -43,14 +43,34 @@ function TreeBranch(props: {
   // pinned are skipped in THIS branch's recursion so they don't duplicate the
   // hoisted pinned row. Empty set in search mode (no dedup there).
   pinnedIds: () => Set<string>;
+  // The "keep-visible" set (activePathIds ∪ selectedPathIds), as a reactive
+  // accessor. The per-child render gate: under THIS parent, a child renders
+  // iff it is in this set OR the parent is user-expanded. Threaded from
+  // TreeStateView so activity + selection changes re-run the gate reactively.
+  pathIds: () => Set<string>;
 }) {
-  // Flood fix: SEPARATE UI expand-state from map-presence. `children` are the
-  // node's resident direct children (recency-sorted, pinned-dedup'd) — they
-  // STAY in the flat map regardless of expand state. `renderOpen` is the new
-  // render gate: children only RENDER when the node is on the active path (auto)
-  // or the user expanded it. A loaded parent no longer dumps all its children.
+  // Resident direct children (recency-sorted, pinned-dedup'd) — these STAY in
+  // the flat map regardless of expand state (instant re-expand, no round-trip).
   const children = () => treeChildrenOf(props.node.id).filter((c) => !props.pinnedIds().has(c.id));
-  const renderOpen = () => isNodeExpanded(props.node.id);
+  // Per-child render gate (P0-C flood fix + P0-D selection reveal):
+  //   - user-expanded → render ALL children (the user asked to see everything);
+  //   - otherwise → render only children on the keep-visible path (busy/active
+  //     chains + the selected node's ancestor chain). Idle siblings of the path
+  //     stay collapsed behind the parent's "▸ N" twisty. So an active parent
+  //     with 1 busy + N idle children auto-shows ONLY the busy branch.
+  const visibleChildren = () => {
+    const all = children();
+    if (isUserExpanded(props.node.id)) return all;
+    const ids = props.pathIds();
+    return all.filter((c) => ids.has(c.id));
+  };
+  // Is P open (does it render its children loop at all)? open(P) = user-expanded
+  // OR it has at least one keep-visible child. Drives the children loop and the
+  // twisty's `expanded` prop. The `&& children().length > 0` guard preserves
+  // the unloaded-expand edge (a user-expanded node with no RESIDENT children
+  // still shows "Expand"/▸ N while its fetch is in flight — it has nothing to
+  // collapse yet).
+  const open = () => isUserExpanded(props.node.id) || visibleChildren().length > 0;
   return (
     <>
       <TreeRow
@@ -59,22 +79,24 @@ function TreeBranch(props: {
         prefix={props.prefix}
         isLast={props.isLast}
         selected={selectedId() === props.node.id}
-        expanded={renderOpen() && children().length > 0}
+        expanded={open() && children().length > 0}
         unread={!!state.unread[props.node.id]}
         onSelect={() => openSessionChat(props.node.id)}
         onToggle={() => props.onToggle(props.node)}
         menuProps={menuTriggers(() => props.node.id, () => props.node.title || props.node.id)}
       />
-      <For each={renderOpen() ? children() : []}>
+      <For each={visibleChildren()}>
         {(child, i) => {
           // childPrefix extends the parent's prefix with whether the PARENT has
           // a following sibling (its rail continues past this child). A root
           // (depth 0) contributes no rail to its children, so its children start
-          // from [] — their OWN connector is the first indent column.
+          // from [] — their OWN connector is the first indent column. The
+          // index/isLast are computed over visibleChildren() (the actually-
+          // rendered rows) so the connectors reflect what is on screen.
           const childPrefix = props.depth === 0 ? [] : [...props.prefix, !props.isLast];
-          const childIsLast = i() === children().length - 1;
+          const childIsLast = i() === visibleChildren().length - 1;
           return (
-            <TreeBranch node={child} depth={props.depth + 1} prefix={childPrefix} isLast={childIsLast} onToggle={props.onToggle} pinnedIds={props.pinnedIds} />
+            <TreeBranch node={child} depth={props.depth + 1} prefix={childPrefix} isLast={childIsLast} onToggle={props.onToggle} pinnedIds={props.pinnedIds} pathIds={props.pathIds} />
           );
         }}
       </For>
@@ -101,15 +123,29 @@ function TreeStateView() {
   // no matches (render the empty state).
   const results = createMemo(() => selectSearchResults(treeMap(), searchQuery(), isPinned));
 
+  // The keep-visible set (P0-C flood + P0-D selection reveal): activePathIds ∪
+  // selectedPathIds. Threaded into TreeBranch as a reactive accessor so the
+  // per-child render gate re-runs when activity OR the selection changes.
+  // Reading both `treeMap()` and `selectedId()` here subscribes this memo to
+  // tree mutations and selection (selection is the P0-D reactive trigger —
+  // activePathIds alone never seeded on selectedId).
+  const pathIds = createMemo(() => visiblePathIds(treeMap(), selectedId()));
+
   // Flood fix: toggle the UI expand-state, NOT the map. Collapsing a node hides
   // its resident children from the RENDER but keeps them in the flat map (no
   // fetch on re-expand). Expanding a node whose children are ALREADY resident
   // shows them with NO server round-trip; only a genuinely-unloaded node
   // (no resident children but it has descendants to fetch) calls expandTreeNode.
-  // An active-path node stays expanded (live work visible) — collapsing it is a
-  // benign no-op render-wise.
+  //
+  // The gate reads `isUserExpanded` (the UI toggle ONLY), not the old
+  // active-path-∪-user `isNodeExpanded`. Effect: the twisty always reflects the
+  // user's explicit intent — clicking an active-path node flips between "show
+  // only my busy branch" and "show all my children" (idle siblings toggle in/
+  // out), rather than being a no-op on the active path. The active-path auto-
+  // reveal of the busy branch is handled by the per-child gate (visiblePathIds),
+  // independent of this toggle.
   const onToggle = (n: TreeNode) => {
-    if (isNodeExpanded(n.id)) {
+    if (isUserExpanded(n.id)) {
       setUserNodeExpanded(n.id, false);
       return;
     }
@@ -154,7 +190,7 @@ function TreeStateView() {
           <Show when={pinnedNodes().length > 0}>
             <div class="tree-pinned">
               <For each={pinnedNodes()}>
-                {(n, i) => <TreeBranch node={n} depth={0} prefix={[]} isLast={i() === pinnedNodes().length - 1} onToggle={onToggle} pinnedIds={emptyPinnedIds} />}
+                {(n, i) => <TreeBranch node={n} depth={0} prefix={[]} isLast={i() === pinnedNodes().length - 1} onToggle={onToggle} pinnedIds={emptyPinnedIds} pathIds={pathIds} />}
               </For>
             </div>
           </Show>
@@ -164,7 +200,7 @@ function TreeStateView() {
           <Show when={pinnedNodes().length > 0 && roots().length > 0}>
             <div class="tree-pin-sep" />
           </Show>
-          <For each={roots()}>{(n, i) => <TreeBranch node={n} depth={0} prefix={[]} isLast={i() === roots().length - 1} onToggle={onToggle} pinnedIds={pinnedIds} />}</For>
+          <For each={roots()}>{(n, i) => <TreeBranch node={n} depth={0} prefix={[]} isLast={i() === roots().length - 1} onToggle={onToggle} pinnedIds={pinnedIds} pathIds={pathIds} />}</For>
         </Show>
       </Show>
     </div>

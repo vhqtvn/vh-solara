@@ -11,7 +11,13 @@
 import { describe, expect, it } from "vitest";
 import { seedTree } from "../../src/sync/treeMap";
 import type { TreeNode, TreeFlatMap } from "../../src/sync/treeMap";
-import { selectPinnedNodes, selectSearchResults, activePathIds } from "../../src/sync/treeSelectors";
+import {
+  selectPinnedNodes,
+  selectSearchResults,
+  activePathIds,
+  selectedPathIds,
+  visiblePathIds,
+} from "../../src/sync/treeSelectors";
 
 function node(overrides: Partial<TreeNode> = {}): TreeNode {
   return {
@@ -353,5 +359,144 @@ describe("activePathIds — client-side active-path render gate (flood fix)", ()
     const set = activePathIds(map);
     expect(set.has("cyc1")).toBe(true); // active itself
     expect(set.has("cyc2")).toBe(true); // ancestor of cyc1 via the cycle
+  });
+});
+
+// selectedPathIds — the selection-path reveal set (P0-D). Selecting or deep-
+// linking an idle nested session must reveal it: its collapsed ancestors auto-
+// expand to show it. activePathIds seeds ONLY on activity/permission/pendingInput,
+// so an idle nested selected node is NOT in activePathIds — selectedPathIds is
+// the missing piece. It returns the inclusive ancestor chain of the selected id
+// (the node + every parentId up to a root), ancestor-closed.
+describe("selectedPathIds — inclusive ancestor chain of the selected node (P0-D)", () => {
+  it("includes a selected IDLE node + all its ancestors even when NOTHING is active", () => {
+    //   R (root, idle)
+    //   └─ MID (child, idle)
+    //      └─ LEAF (grandchild, idle) ← selected
+    // Nothing is active (activePathIds would be empty). selectedPathIds must
+    // still open the whole chain R → MID → LEAF so the selected leaf renders.
+    const map = seedTree([
+      node({ id: "R", title: "r", updatedMs: 10 }),
+      node({ id: "MID", parentId: "R", title: "mid", updatedMs: 20 }),
+      node({ id: "LEAF", parentId: "MID", title: "leaf", updatedMs: 30 }),
+    ]);
+    const set = selectedPathIds(map, "LEAF");
+    expect(set.has("LEAF")).toBe(true); // inclusive of the selected node
+    expect(set.has("MID")).toBe(true); // ancestor
+    expect(set.has("R")).toBe(true); // ancestor (chain to root)
+  });
+
+  it("is empty when selectedId is null (no selection → nothing to reveal)", () => {
+    const map = seedTree([node({ id: "R", title: "r" }), node({ id: "C", parentId: "R" })]);
+    expect(selectedPathIds(map, null).size).toBe(0);
+    // An empty-string selection is treated as no selection too.
+    expect(selectedPathIds(map, "").size).toBe(0);
+  });
+
+  it("is empty when the selected id is not resident in the map (stale deep link)", () => {
+    const map = seedTree([node({ id: "R", title: "r" })]);
+    // A selection pointing at a node the client does not hold reveals nothing
+    // (no chain to walk). Defensive: never add an id that is not in the map.
+    const set = selectedPathIds(map, "ghost");
+    expect(set.size).toBe(0);
+  });
+
+  // The selected node's IDLE SIBLINGS must NOT be revealed — only the selected
+  // node's own ancestor chain opens. This is the per-child gate crux.
+  it("does NOT include idle siblings of the selected chain", () => {
+    //   R
+    //   ├─ MID
+    //   │   └─ LEAF ← selected
+    //   └─ SIB (idle sibling of MID)
+    const map = seedTree([
+      node({ id: "R", title: "r" }),
+      node({ id: "MID", parentId: "R" }),
+      node({ id: "LEAF", parentId: "MID" }),
+      node({ id: "SIB", parentId: "R" }),
+    ]);
+    const set = selectedPathIds(map, "LEAF");
+    expect(set.has("SIB")).toBe(false); // idle sibling, not on the selected chain
+  });
+
+  it("does not infinite-loop on a corrupt parentId cycle (depth-capped)", () => {
+    const map = seedTree([
+      node({ id: "cyc1", parentId: "cyc2", title: "c1", updatedMs: 1 }),
+      node({ id: "cyc2", parentId: "cyc1", title: "c2", updatedMs: 2 }),
+    ]);
+    // Should return (not hang). The cap stops the cycle walk.
+    const set = selectedPathIds(map, "cyc1");
+    expect(set.has("cyc1")).toBe(true);
+    expect(set.has("cyc2")).toBe(true);
+  });
+});
+
+// visiblePathIds — the ONE "keep-visible" set driving the per-child render gate
+// (P0-C flood + P0-D selection reveal). It is the UNION of activePathIds (live-
+// work chains) and selectedPathIds (the selected node's chain), so a child
+// renders under a parent iff it is in this set OR the parent is user-expanded.
+// Ancestor-closed because both operands are. Idle siblings of either path stay
+// out → an active parent shows only its busy branch; a selected idle nested
+// node is revealed by opening only its own chain.
+describe("visiblePathIds — activePathIds ∪ selectedPathIds (the keep-visible set)", () => {
+  it("includes the active path even with NO selection", () => {
+    //   R
+    //   └─ BUSY (activity busy) ← active
+    const map = seedTree([
+      node({ id: "R", title: "r" }),
+      node({ id: "BUSY", parentId: "R", activity: "busy" }),
+    ]);
+    const set = visiblePathIds(map, null);
+    expect(set.has("R")).toBe(true);
+    expect(set.has("BUSY")).toBe(true);
+  });
+
+  it("includes a selected idle node + its ancestors even when NOTHING is active", () => {
+    //   R (idle)
+    //   └─ MID (idle)
+    //      └─ LEAF (idle) ← selected
+    const map = seedTree([
+      node({ id: "R", title: "r" }),
+      node({ id: "MID", parentId: "R" }),
+      node({ id: "LEAF", parentId: "MID" }),
+    ]);
+    const set = visiblePathIds(map, "LEAF");
+    expect(set.has("R")).toBe(true);
+    expect(set.has("MID")).toBe(true);
+    expect(set.has("LEAF")).toBe(true);
+  });
+
+  // CRUX: the union. A tree that has BOTH an active chain AND a (separate)
+  // selected idle chain must keep-visible BOTH chains, while idle siblings of
+  // each stay out.
+  it("is the UNION of active and selected paths (active ∪ selected)", () => {
+    //   ROOT
+    //   ├─ A
+    //   │   └─ BUSY   ← active (active path: ROOT, A, BUSY)
+    //   └─ B
+    //       └─ SEL    ← selected, idle (selected path: ROOT, B, SEL)
+    //   IDLE_SIB (idle sibling of A under ROOT, on neither path)
+    const map = seedTree([
+      node({ id: "ROOT", title: "root", childCount: 3 }),
+      node({ id: "A", parentId: "ROOT", title: "a" }),
+      node({ id: "BUSY", parentId: "A", title: "busy", activity: "busy" }),
+      node({ id: "B", parentId: "ROOT", title: "b" }),
+      node({ id: "SEL", parentId: "B", title: "sel" }),
+      node({ id: "IDLE_SIB", parentId: "ROOT", title: "idle-sib" }),
+    ]);
+    const set = visiblePathIds(map, "SEL");
+    // Active path members.
+    expect(set.has("ROOT")).toBe(true);
+    expect(set.has("A")).toBe(true);
+    expect(set.has("BUSY")).toBe(true);
+    // Selected path members (ROOT already present via active).
+    expect(set.has("B")).toBe(true);
+    expect(set.has("SEL")).toBe(true);
+    // Idle sibling of both paths stays OUT (no flood).
+    expect(set.has("IDLE_SIB")).toBe(false);
+  });
+
+  it("returns an empty set when nothing is active and nothing is selected", () => {
+    const map = seedTree([node({ id: "R", title: "r" }), node({ id: "C", parentId: "R" })]);
+    expect(visiblePathIds(map, null).size).toBe(0);
   });
 });

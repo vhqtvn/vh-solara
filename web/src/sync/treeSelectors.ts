@@ -135,3 +135,51 @@ export function activePathIds(map: TreeFlatMap): Set<string> {
   }
   return out;
 }
+
+// selectedPathIds — the SELECTION reveal set (P0-D). activePathIds seeds ONLY
+// on activity/permission/pendingInput, so selecting or deep-linking an idle
+// NESTED session left its row hidden inside a collapsed parent. selectedPathIds
+// fills that gap: it returns the INCLUSIVE ancestor chain of `selectedId` (the
+// selected node + every parentId up to a root), ancestor-closed. Combined with
+// activePathIds into visiblePathIds (below), this drives the per-child render
+// gate so a selected idle nested node is rendered even when its parent is
+// collapsed by default.
+//
+// `selectedId` may be null/empty (no selection) or point at a node NOT resident
+// in the map (a stale deep link): both yield an empty set (nothing to reveal —
+// never add an id the client does not hold). The idle SIBLINGS of the selected
+// chain are NOT added (only the selected node's own ancestor chain opens).
+//
+// PURE: takes the map + selectedId, returns a fresh Set. Depth-capped
+// defensively against a corrupt parentId cycle (mirrors activePathIds' /
+// hasPinnedAncestor's 10000 guard).
+export function selectedPathIds(map: TreeFlatMap, selectedId: string | null): Set<string> {
+  const out = new Set<string>();
+  if (!selectedId) return out;
+  // A selection pointing at a node the client does not hold reveals nothing:
+  // start the walk only if the selected id is resident. (Also guards against
+  // adding a bare non-resident id at the loop's first iteration.)
+  if (!map.has(selectedId)) return out;
+  let cur: string | undefined = selectedId;
+  for (let i = 0; i < 10000 && cur != null; i++) {
+    out.add(cur);
+    cur = map.get(cur)?.parentId ?? undefined;
+  }
+  return out;
+}
+
+// visiblePathIds — the ONE "keep-visible" set driving the per-child render gate
+// (P0-C flood + P0-D selection reveal). A child C renders under parent P iff
+// C ∈ visiblePathIds (on the active OR selected path) OR P is user-expanded
+// (the user-expand branch is handled in SessionTree.TreeBranch). This is the
+// UNION of activePathIds (live-work chains) and selectedPathIds (the selected
+// node's chain); ancestor-closed because both operands are. Idle siblings of
+// either path are NOT in the set → an active parent shows only its busy branch,
+// and a selected idle nested node is revealed by opening only its own chain.
+//
+// PURE: union of two pure sets; returns a fresh Set.
+export function visiblePathIds(map: TreeFlatMap, selectedId: string | null): Set<string> {
+  const out = activePathIds(map);
+  for (const id of selectedPathIds(map, selectedId)) out.add(id);
+  return out;
+}
