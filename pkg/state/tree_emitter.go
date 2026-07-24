@@ -520,16 +520,28 @@ func (e *TreeEmitter) onActivityLocked(ev ClientEvent) []TreeOp {
 		return nil
 	}
 	st := p.State
-	op := NodeFacetOp(p.SessionID, FacetData{Activity: &st})
+	s := e.store
+	// Emit the node's OWN current subtreeBusy alongside the activity facet,
+	// mirroring buildNodeLocked (SubtreeBusy: s.subtreeBusyCount[id] > 0).
+	// subtreeBusyCount[id] INCLUDES the node's own busy contribution, so during a
+	// busy turn a node.upsert ships the node with SubtreeBusy=true; when the node
+	// later goes idle this self facet is the clearing moment — and for a ROOT
+	// (no ancestors) it is the ONLY clearing path. Without it a stale client
+	// flags.subtreeBusy=true survives the idle transition and the spinner
+	// persists after /vh/abort (web/tests/e2e/ux.spec.ts:59 "Stop clears the
+	// working indicator"). busy↔retry is busy-neutral (subtreeBusyCount
+	// unchanged) so the emitted value is correct in both directions.
+	op := NodeFacetOp(p.SessionID, FacetData{
+		Activity: &st,
+		Flags:    map[string]bool{"subtreeBusy": s.subtreeBusyCount[p.SessionID] > 0},
+	})
 	e.stamp(op, p.SessionID)
 	ops := []TreeOp{op}
 	// Walk ancestors; emit subtreeBusy facet for each known ancestor with the
 	// CURRENT value (post-transition subtreeBusyCount). This is the busy analog
 	// of onQuestionLocked's subtreeNeedsInput walk so a collapsed ancestor of a
 	// busy descendant renders busy (spinner) on the live activity transition.
-	s := e.store
 	// Nil-guard: e.known LAGS the store, so a session can already be deleted
-	// from s.sessions while a lagging connection still holds e.known[id]==true
 	// (it has not yet processed the KindSessionDelete). The activity facet
 	// above is harmless on the stale client node (a node.remove follows once the
 	// delete is processed), but the ancestor walk MUST NOT dereference the gone

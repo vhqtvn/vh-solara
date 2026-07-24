@@ -198,6 +198,78 @@ func TestSubtreeBusy_ActivityAncestorFacetWalk(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// T3 — onActivityLocked SELF facet must re-emit the node's OWN subtreeBusy
+// ---------------------------------------------------------------------------
+
+// TestSubtreeBusy_ActivitySelfFacetClearsOwnStaleFlag is the regression test for
+// the /vh/abort stale-spinner bug (web/tests/e2e/ux.spec.ts:59 "Stop clears the
+// working indicator immediately"). A ROOT node (no ancestors) whose own activity
+// flips busy→idle must have its OWN current subtreeBusy value re-emitted on the
+// activity facet, mirroring buildNodeLocked.
+//
+// Why this matters: subtreeBusyCount[id] INCLUDES the node's own busy
+// contribution, so during a busy turn a node.upsert (buildNodeLocked) ships the
+// node with Flags.SubtreeBusy=true. When the node later goes idle the activity
+// event is the natural clearing moment — but for a ROOT there is no ancestor
+// walk, so the ONLY way to clear a stale client flags.subtreeBusy=true is the
+// node's own self facet. Before the fix onActivityLocked emitted only
+// FacetData{Activity:&st} for the node, never its own subtreeBusy, so the
+// spinner persisted after Stop.
+func TestSubtreeBusy_ActivitySelfFacetClearsOwnStaleFlag(t *testing.T) {
+	s := New(64)
+	applySeq(t, s,
+		[2]string{"session.created", evSessionCreated("R", "")},
+		[2]string{"session.status", evStatus("R", "busy")}, // seeds active path → R known/resident
+	)
+	e := NewTreeEmitter(s, "/proj")
+	_ = e.SnapshotFrontier("cold") // e.known[R] = true
+
+	// --- Direction 1: R goes idle → self facet must carry subtreeBusy:false. ---
+	applySeq(t, s, [2]string{"session.idle", evIdle("R")})
+	idleEv := lastEventOfKind(t, s, KindActivity)
+	ops := e.Translate(idleEv)
+
+	idleSelf, idleHas := facetSubtreeBusy(ops, "R")
+	if !idleHas {
+		t.Fatalf("idle direction: expected self facet on R to carry flags.subtreeBusy (the only clearing path for a root); ops=%v", opKinds(ops))
+	}
+	if idleSelf {
+		t.Errorf("idle direction: self facet flags.subtreeBusy = true, want false (R now idle, no busy descendants)")
+	}
+
+	// --- Direction 2: R goes busy again → self facet must carry subtreeBusy:true. ---
+	applySeq(t, s, [2]string{"session.status", evStatus("R", "busy")})
+	busyEv := lastEventOfKind(t, s, KindActivity)
+	ops2 := e.Translate(busyEv)
+
+	busySelf, busyHas := facetSubtreeBusy(ops2, "R")
+	if !busyHas {
+		t.Fatalf("busy direction: expected self facet on R to carry flags.subtreeBusy; ops=%v", opKinds(ops2))
+	}
+	if !busySelf {
+		t.Errorf("busy direction: self facet flags.subtreeBusy = false, want true (R is busy)")
+	}
+}
+
+// facetSubtreeBusy scans the emitted ops for the NodeFacet whose Data.ID == id
+// and returns (value, found) for its Flags.subtreeBusy entry. A node may have at
+// most one self facet per activity event.
+func facetSubtreeBusy(ops []TreeOp, id string) (bool, bool) {
+	for _, op := range ops {
+		f, ok := op.(*NodeFacet)
+		if !ok {
+			continue
+		}
+		if f.Data.ID == id {
+			if v, has := f.Data.Flags["subtreeBusy"]; has {
+				return v, true
+			}
+		}
+	}
+	return false, false
+}
+
 // TestSubtreeBusy_ActivityNilGuardForDeletedSession mirrors the
 // subtreeNeedsInput nil-guard regression: a KindActivity event for a session
 // that is still in e.known but already deleted from the store MUST NOT panic in
@@ -224,11 +296,18 @@ func TestSubtreeBusy_ActivityNilGuardForDeletedSession(t *testing.T) {
 	// Must not panic.
 	ops := e.Translate(busyEv)
 
-	// The ancestor walk must be skipped for a gone node → no subtreeBusy facets.
+	// The ancestor walk must be skipped for a gone node → no subtreeBusy facets
+	// on the ANCESTORS (R, A). The self facet on C (the gone node) is still
+	// emitted — including its own subtreeBusy now (mirroring the activity self
+	// facet, already emitted for a known-but-gone node) — but that is harmless: a
+	// node.remove follows once the delete is processed.
 	for _, op := range ops {
 		f, ok := op.(*NodeFacet)
 		if !ok {
 			continue
+		}
+		if f.Data.ID == "C" {
+			continue // self facet on the gone node is harmless (node.remove follows)
 		}
 		if _, has := f.Data.Flags["subtreeBusy"]; has {
 			t.Errorf("nil-guard: expected no subtreeBusy facet for gone node's ancestors; got %v", opKinds(ops))
