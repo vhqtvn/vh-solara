@@ -66,3 +66,76 @@ export function setInlineAttachForced(on: boolean) {
   saveVersioned(LS_INLINE_ATTACH, 1, on);
 }
 export { inlineAttachForced };
+
+// --- S3: inline-mode markdown ref + caret-insert helpers -------------------
+//
+// PURE, framework-free helpers used by ChatView's inline-attachment branch
+// (S3). They own the markdown-ref string shape and the textarea splice+caret
+// math so both are unit-testable in jsdom without mounting ChatView. They do
+// NOT touch upload, buildParts, send-resolve, or orphan UI (S4/S5).
+//
+// Token <-> File <-> text mapping (deliverable #1):
+//   localId           = INLINE_LOCALID_PREFIX + <N>  (e.g. "inl3"); <N> comes
+//                       from ChatView's shared pendingSeq counter so inline
+//                       localIds never collide with pending:N draft keys.
+//   held-File lookup  = a ChatView-local Map<string, File> keyed by localId.
+//                       Survives until send; NOT cleared by flushPendingAttachments
+//                       (inline chips set file: undefined, so that existing path
+//                       skips them — S4 adds a separate text-scan resolver).
+//   markdown ref      = attachMarkdownRef(filename, isImage, localId), which
+//                       embeds inlineAttachUrl(localId) as the link target.
+//   chip url          = inlineAttachUrl(localId) = "vh-attach:<localId>", so
+//                       removeAttachment (keys on url) still works on the chip.
+
+// The synthetic attachment url scheme for inline-mode attachments. Appears in
+// BOTH the chip's Attachment.url AND the markdown ref's link target, so S4 can
+// scan the textarea text for vh-attach:<localId> tokens and resolve each to a
+// held File. Distinct from the draft-lazy pending:N scheme (no collision).
+export const VH_ATTACH_URL_PREFIX = "vh-attach:";
+
+// The localId prefix for inline-mode attachments (e.g. "inl3"). Paired with a
+// shared monotonic counter in ChatView (pendingSeq) so inline localIds never
+// collide with pending:N draft keys nor with each other.
+export const INLINE_LOCALID_PREFIX = "inl";
+
+// Pure: build the synthetic attachment url for an inline localId.
+//   inlineAttachUrl("inl3") -> "vh-attach:inl3"
+export function inlineAttachUrl(localId: string): string {
+  return VH_ATTACH_URL_PREFIX + localId;
+}
+
+// Pure: build the markdown reference inserted at the textarea caret for an
+// inline-mode attachment. isImage (caller decides via mime.startsWith("image/"))
+// selects the form:
+//   image     -> ![filename](vh-attach:localId)
+//   non-image ->  [filename](vh-attach:localId)   (no leading !)
+// The filename is passed through verbatim (no sanitization) so the visible
+// label matches what the user picked; the ref is parsed by us at send (S4),
+// not rendered as live markdown before then, so injection is not a concern
+// here. Sanitization is deferred to a later slice if it ever matters.
+export function attachMarkdownRef(filename: string, isImage: boolean, localId: string): string {
+  const body = `[${filename}](${inlineAttachUrl(localId)})`;
+  return isImage ? "!" + body : body;
+}
+
+// Pure DOM mutation: insert `text` into the textarea at the current caret
+// (replacing any selection), then advance the caret to JUST AFTER the inserted
+// text. Operates only on ta.value / ta.selectionStart / ta.selectionEnd — no
+// framework imports, no signals — so it is jsdom-testable.
+//
+// ChatView calls this on its taRef for inline-mode attach/paste, then mirrors
+// taRef.value into its input() signal. SolidJS controls value={input()}; since
+// the assigned string is identical to what the helper just wrote, the DOM does
+// not reset the selection (assigning the same value is a no-op at the DOM
+// level), so the advanced caret persists — the same property the existing
+// pasteFromClipboard insert path relies on.
+export function insertAtCaret(ta: HTMLTextAreaElement, text: string): void {
+  const start = ta.selectionStart ?? 0;
+  const end = ta.selectionEnd ?? 0;
+  const before = ta.value.slice(0, start);
+  const after = ta.value.slice(end);
+  ta.value = before + text + after;
+  const pos = start + text.length;
+  ta.selectionStart = pos;
+  ta.selectionEnd = pos;
+}

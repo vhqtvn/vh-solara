@@ -20,6 +20,15 @@ import { createQueueDrainer } from "../queueDrain";
 import { historyAt, historyLen, pushHistory } from "../history";
 import { type AcItem, commandSuggestions, fileSuggestions } from "../lib/complete";
 import { harvestPastedFiles } from "../lib/paste";
+import {
+  effectiveInline,
+  modelHasVision,
+  inlineAttachForced,
+  attachMarkdownRef,
+  insertAtCaret,
+  inlineAttachUrl,
+  INLINE_LOCALID_PREFIX,
+} from "../lib/inlineAttach";
 import { IGNORED, isSendInFlight, runSendSingleFlight } from "../lib/sendSingleFlight";
 import ModelDialog from "./ModelDialog";
 import PartView, { ActivityGroup } from "./Part";
@@ -1499,6 +1508,28 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   let pendingSeq = 0;
   const pendingKey = () => `pending:${++pendingSeq}`;
 
+  // --- S3: inline-mode attachment token <-> File <-> text --------------------
+  //
+  // When effectiveInline(...) is ON (non-vision model, OR vision + user-forced
+  // pref), an attached/pasted file is NOT uploaded. Instead we hold the raw
+  // File locally keyed by a stable localId, set a synthetic chip whose url is
+  // vh-attach:<localId>, and insert a markdown reference at the textarea caret.
+  // The markdown ref in the textarea text is the SOURCE OF TRUTH for "this
+  // attachment exists"; the chip is a secondary UI affordance for removal.
+  //
+  // localId shape: INLINE_LOCALID_PREFIX + <N> (e.g. "inl3"), where <N> draws
+  // from the SAME pendingSeq counter above so inline localIds never collide
+  // with pending:N draft keys. The url is built by the pure inlineAttachUrl().
+  //
+  // The held File lives in `inlineFiles` (a Map<localId, File>), NOT on
+  // Attachment.file. flushPendingAttachments (the existing draft-lazy seam
+  // below) filters attachments by `.file` and would double-handle inline chips
+  // if they carried it; inline chips set file: undefined, so that existing path
+  // skips them untouched. `inlineFiles` survives until send (S4 will scan the
+  // textarea text for vh-attach:<localId> tokens and resolve each via this Map).
+  const inlineFiles = new Map<string, File>();
+  const nextInlineLocalId = () => `${INLINE_LOCALID_PREFIX}${++pendingSeq}`;
+
   // Upload any draft-queued (pending) attachments now that a session exists,
   // replacing their synthetic keys with real server urls. Called right after
   // createSession() in send(). A no-op for live sessions, whose attachments
@@ -1536,6 +1567,46 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     // the input, so it was never affected.)
     const arr = Array.from(files);
     if (fileInputRef) fileInputRef.value = "";
+    // S3: inline mode (non-vision model, OR vision model + user-forced pref)
+    // — DO NOT upload. Hold the raw File keyed by localId in `inlineFiles`,
+    // set a synthetic chip whose url is vh-attach:<localId>, and insert a
+    // markdown ref at the textarea caret. The text ref is the SOURCE OF TRUTH
+    // for "this attachment exists"; the chip is a secondary removal affordance.
+    // Applies to BOTH draft and live sessions — inline mode is orthogonal to
+    // session lifecycle (it is about whether we upload at all). The non-inline
+    // path below (draft pending-key / live eager upload) is byte-for-byte
+    // unchanged.
+    if (effectiveInline(modelHasVision(curModel()), inlineAttachForced())) {
+      const ta = taRef;
+      if (ta) ta.focus();
+      for (const file of arr) {
+        const localId = nextInlineLocalId();
+        inlineFiles.set(localId, file);
+        // Chip: url is the synthetic vh-attach:<localId> (so removeAttachment,
+        // which keys on url, still works). file: is deliberately UNSET — see
+        // the inlineFiles comment above (flushPendingAttachments filters by
+        // .file and must skip inline chips).
+        setAttachments((a) => [
+          ...a,
+          { url: inlineAttachUrl(localId), filename: file.name, mime: file.type },
+        ]);
+        if (ta) {
+          insertAtCaret(
+            ta,
+            attachMarkdownRef(file.name, file.type.startsWith("image/"), localId),
+          );
+          // Mirror the helper's DOM mutation into the input() signal so
+          // SolidJS's controlled value={input()} stays in sync. Assigning the
+          // identical string is a DOM no-op, so the caret the helper just
+          // advanced persists (no microtask needed, unlike pasteFromClipboard
+          // which computes the splice on the signal and must wait for render).
+          setInput(ta.value);
+          setCaret(ta.selectionStart ?? 0);
+        }
+      }
+      histIdx = -1;
+      return;
+    }
     if (props.draft) {
       for (const file of arr) {
         setAttachments((a) => [...a, { url: pendingKey(), filename: file.name, mime: file.type, file }]);
