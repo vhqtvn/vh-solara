@@ -58,6 +58,18 @@ export interface TreeRowProps {
   // onToggle). Defaults falsy → normal tree mode (existing call sites that omit
   // it are unaffected). Set ONLY by SessionTree's filtered-results render path.
   flat?: boolean;
+  // Auto-revealed ancestor of the selected session (proj=1 "temp" eye). True on
+  // a node that is open ONLY because the selected session lives inside it — the
+  // user did NOT manually expand it (isUserExpanded false), and it is NOT the
+  // selected node itself. Computed by SessionTree from the STRICT
+  // selectedPathIds set (NOT the visiblePathIds union). When true, the twisty
+  // column shows a dimmed `eye` glyph (.twisty-temp) instead of the chevron,
+  // signalling "I'm open only because your selection is inside me." Defaults
+  // falsy → no behavior change for existing call sites (flat rows never pass
+  // it). onClick is UNCHANGED: a revealed node is still expandable, so the
+  // guard above still fires onToggle — clicking the eye promotes it to a
+  // user-expanded node (chevron), matching proj=1 temp→filtered.
+  revealed?: boolean;
   menuProps?: TreeRowMenuProps;
   // True when this session finished while not selected and the server marked it
   // unread. The unread store (state.unread[id]) is a legacy sync store still
@@ -132,6 +144,16 @@ export function TreeRow(props: TreeRowProps) {
           // A busy LEAF still shows noChild — the funnel below is for EXPANDABLE
           // nodes only (this branch precedes the isBusy funnel).
           <Icon name="noChild" size={13} />
+        ) : props.revealed ? (
+          // Auto-revealed ancestor of the selected session: the dimmed `eye`
+          // glyph (proj=1 "temp"). Ports the old twisty-temp — a node open ONLY
+          // because the selected session lives inside it (user did not expand
+          // it). .twisty-temp CSS dims it (var(--fg-dim)) and keeps it upright
+          // (transform:none), overriding the chevron's span:not(.open) rotate.
+          // onClick is UNCHANGED: revealed nodes are expandable, so the guard
+          // above still fires onToggle — clicking the eye promotes it to a
+          // user-expanded node (chevron), matching proj=1 temp→filtered.
+          <span class="twisty-temp"><Icon name="eye" size={13} /></span>
         ) : isBusy() ? (
           // Busy expandable node: the pulsing accent funnel (the `filter` glyph
           // in a `.twisty-running` span). Ports the old proj=1 twisty's running

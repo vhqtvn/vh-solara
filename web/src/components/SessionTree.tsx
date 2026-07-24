@@ -2,7 +2,7 @@ import { For, Show, createMemo } from "solid-js";
 import { selectedId, setSelectedId, state, expandTreeNode } from "../sync";
 import { setView } from "../ui";
 import { treeMap, treeRoots, treeChildrenOf, isUserExpanded, setUserNodeExpanded } from "../sync/treeState";
-import { selectPinnedNodes, selectSearchResults, visiblePathIds } from "../sync/treeSelectors";
+import { selectPinnedNodes, selectSearchResults, selectedPathIds, visiblePathIds } from "../sync/treeSelectors";
 import { searchQuery, reconciledPinnedOrder, isPinned } from "../sidebar";
 import { menuTriggers } from "../sessionMenu";
 import TreeRow from "./TreeRow";
@@ -48,6 +48,14 @@ function TreeBranch(props: {
   // iff it is in this set OR the parent is user-expanded. Threaded from
   // TreeStateView so activity + selection changes re-run the gate reactively.
   pathIds: () => Set<string>;
+  // The STRICT selected-ancestor set (selectedPathIds only, NOT the visiblePathIds
+  // union). Threaded into TreeRow's `revealed` prop: an auto-revealed ancestor
+  // of the selected session (one the user did NOT manually expand and that is
+  // not the selected leaf itself) shows the dimmed `eye` twisty glyph instead
+  // of the chevron. Reactive accessor so the eye tracks selection live. The
+  // STRICT form (not the union) ensures no eye shows when nothing is selected,
+  // and busy-chain ancestors unrelated to the selection do NOT get the eye.
+  selectedAncestors: () => Set<string>;
 }) {
   // Resident direct children (recency-sorted, pinned-dedup'd) — these STAY in
   // the flat map regardless of expand state (instant re-expand, no round-trip).
@@ -84,6 +92,11 @@ function TreeBranch(props: {
         onSelect={() => openSessionChat(props.node.id)}
         onToggle={() => props.onToggle(props.node)}
         menuProps={menuTriggers(() => props.node.id, () => props.node.title || props.node.id)}
+        revealed={
+          !isUserExpanded(props.node.id) &&
+          props.node.id !== selectedId() &&
+          props.selectedAncestors().has(props.node.id)
+        }
       />
       <For each={visibleChildren()}>
         {(child, i) => {
@@ -96,7 +109,7 @@ function TreeBranch(props: {
           const childPrefix = props.depth === 0 ? [] : [...props.prefix, !props.isLast];
           const childIsLast = i() === visibleChildren().length - 1;
           return (
-            <TreeBranch node={child} depth={props.depth + 1} prefix={childPrefix} isLast={childIsLast} onToggle={props.onToggle} pinnedIds={props.pinnedIds} pathIds={props.pathIds} />
+            <TreeBranch node={child} depth={props.depth + 1} prefix={childPrefix} isLast={childIsLast} onToggle={props.onToggle} pinnedIds={props.pinnedIds} pathIds={props.pathIds} selectedAncestors={props.selectedAncestors} />
           );
         }}
       </For>
@@ -130,6 +143,16 @@ function TreeStateView() {
   // tree mutations and selection (selection is the P0-D reactive trigger —
   // activePathIds alone never seeded on selectedId).
   const pathIds = createMemo(() => visiblePathIds(treeMap(), selectedId()));
+
+  // The STRICT selected-ancestor set (P0-D "temp" eye port): selectedPathIds is
+  // inclusive (the selected node + every parentId up to a root) and ancestor-
+  // closed, but it does NOT fold in the active-path union the way `pathIds`
+  // does. Drives TreeRow's `revealed` (eye) predicate so an auto-revealed
+  // ancestor — one the user did NOT manually expand and that is not the selected
+  // leaf itself — shows the dimmed `eye` twisty instead of the chevron. Reads
+  // the same accessors as `pathIds` (treeMap + selectedId) so it tracks both
+  // tree mutations and selection. Empty when nothing is selected → no eye.
+  const selectedAncestors = createMemo(() => selectedPathIds(treeMap(), selectedId()));
 
   // Flood fix: toggle the UI expand-state, NOT the map. Collapsing a node hides
   // its resident children from the RENDER but keeps them in the flat map (no
@@ -191,7 +214,7 @@ function TreeStateView() {
           <Show when={pinnedNodes().length > 0}>
             <div class="tree-pinned">
               <For each={pinnedNodes()}>
-                {(n, i) => <TreeBranch node={n} depth={0} prefix={[]} isLast={i() === pinnedNodes().length - 1} onToggle={onToggle} pinnedIds={emptyPinnedIds} pathIds={pathIds} />}
+                {(n, i) => <TreeBranch node={n} depth={0} prefix={[]} isLast={i() === pinnedNodes().length - 1} onToggle={onToggle} pinnedIds={emptyPinnedIds} pathIds={pathIds} selectedAncestors={selectedAncestors} />}
               </For>
             </div>
           </Show>
@@ -201,7 +224,7 @@ function TreeStateView() {
           <Show when={pinnedNodes().length > 0 && roots().length > 0}>
             <div class="tree-pin-sep" />
           </Show>
-          <For each={roots()}>{(n, i) => <TreeBranch node={n} depth={0} prefix={[]} isLast={i() === roots().length - 1} onToggle={onToggle} pinnedIds={pinnedIds} pathIds={pathIds} />}</For>
+          <For each={roots()}>{(n, i) => <TreeBranch node={n} depth={0} prefix={[]} isLast={i() === roots().length - 1} onToggle={onToggle} pinnedIds={pinnedIds} pathIds={pathIds} selectedAncestors={selectedAncestors} />}</For>
         </Show>
       </Show>
     </div>

@@ -555,6 +555,46 @@ describe("TreeRow twisty running funnel (P1, port from proj=1)", () => {
   });
 });
 
+// ── tree=2 UI parity: twisty "temp" eye (P1, port from proj=1) ────────────────
+// The old proj=1 client showed a dimmed `eye` glyph (.twisty-temp) on an AUTO-
+// REVEALED ancestor's twisty — a node open ONLY because the selected session
+// lives inside it (the user did NOT manually expand it). It was dropped in the
+// tree=2 rewrite even though its CSS rule (legacy/20-session-tree.css) survived
+// unused. These pin the eye variant directly via the `revealed` prop: TreeRow
+// takes `revealed` as a plain boolean (SessionTree computes it from the STRICT
+// selectedPathIds set ∩ !isUserExpanded ∩ id !== selectedId), so the eye is
+// testable without SessionTree plumbing. The precedence is flat > leaf >
+// revealed(eye) > busy(funnel) > chevron — so these also guard that the eye
+// does NOT clobber the leaf terminal marker.
+describe("TreeRow twisty temp eye (P1, port from proj=1)", () => {
+  it("renders the eye glyph (.twisty-temp) for a revealed (temp) node", () => {
+    const { container } = render(() => (
+      <TreeRow node={baseNode({ activity: "idle", childCount: 2 })} depth={0} selected={false} expanded={false} revealed={true} onSelect={() => {}} onToggle={() => {}} />
+    ));
+    const t = twisty(container as unknown as HTMLElement);
+    const temp = t.querySelector("span.twisty-temp");
+    expect(temp).not.toBeNull();
+    // The eye glyph's outline path — pin it exactly so a wrong icon can't pass
+    // as "some svg inside the span" (matches Icon.tsx `eye` path[0]).
+    const path = temp?.querySelector("svg.icon path");
+    expect(path?.getAttribute("d")).toBe("M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z");
+    // The twisty must NOT carry the dimmed `leaf` class (the eye is on an
+    // EXPANDABLE node, not a structural terminal marker).
+    expect(t.classList.contains("leaf")).toBe(false);
+  });
+
+  it("still fires onToggle when a revealed node's twisty is clicked (revealed stays expandable)", () => {
+    const onToggle = vi.fn();
+    const { container } = render(() => (
+      <TreeRow node={baseNode({ id: "temp-tog", activity: "idle", childCount: 2 })} depth={0} selected={false} expanded={false} revealed={true} onSelect={() => {}} onToggle={onToggle} />
+    ));
+    twisty(container as unknown as HTMLElement).dispatchEvent(
+      new MouseEvent("click", { bubbles: true }),
+    );
+    expect(onToggle).toHaveBeenCalledWith("temp-tog");
+  });
+});
+
 // ── tree=2 UI parity: selected-row highlight on .tree-row (P0-B) ──────────────
 // The `.tree-row` div had NO `selected` class even though CSS `.tree-row.selected`
 // exists to paint the accent highlight. The `selected` prop was already applied
