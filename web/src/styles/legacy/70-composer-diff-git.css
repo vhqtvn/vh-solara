@@ -176,6 +176,19 @@
 /* Queue button (sits next to Stop while busy): accent outline, not filled, to
    read as secondary to the primary Stop. */
 .send-btn.queue { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
+/* Sending animation (single-flight enqueue feedback): while an enqueue POST is
+   in-flight for this session (up to 12s on a slow/hung network), the Send /
+   Queue button is :disabled (re-taps are dropped) but kept at full opacity and
+   its icon pulses so the operator sees the tap registered immediately — instead
+   of the former no-feedback window that caused re-taps and duplicate enqueues.
+   Uses the shared global `pulse` keyframe (opacity 1↔0.25) — GPU-cheap: it
+   animates opacity only, with NO mask-image, NO backdrop-filter, and NO
+   per-element contain/content-visibility (the Firefox/WebRender heat
+   guardrails — see AGENTS.md). The :disabled rule's 0.45 opacity would bury
+   the pulse, so .sending overrides it back to 1 (later in source order → wins
+   the equal-specificicity tie). */
+.send-btn.sending { opacity: 1; }
+.send-btn.sending .icon { animation: pulse 1s ease-in-out infinite; }
 
 /* Composer autocomplete popup (@file / @agent / /command). */
 .composer { position: relative; }

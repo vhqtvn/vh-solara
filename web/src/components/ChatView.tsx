@@ -20,6 +20,7 @@ import { createQueueDrainer } from "../queueDrain";
 import { historyAt, historyLen, pushHistory } from "../history";
 import { type AcItem, commandSuggestions, fileSuggestions } from "../lib/complete";
 import { harvestPastedFiles } from "../lib/paste";
+import { isSendInFlight, runSendSingleFlight } from "../lib/sendSingleFlight";
 import ModelDialog from "./ModelDialog";
 import PartView, { ActivityGroup } from "./Part";
 import { Deferred } from "./Deferred";
@@ -257,6 +258,17 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // Per-session in-flight guard (lives in the sync store, not this reused
   // component) so a send that hangs on one session never blocks another.
   const sending = createMemo(() => isSending(props.sessionId || "draft"));
+  // Enqueue-in-flight guard — DISTINCT from `sending` above (the DISPATCH guard
+  // in the sync store, owned by queueDrain/shell). True ONLY while the enqueue
+  // POST for this session is pending (up to 12s on a slow/hung network), NOT
+  // while an agent turn or queue dispatch is running. Drives the Send button's
+  // `disabled` + the sending animation so the operator sees the tap register
+  // immediately and re-taps are dropped (per-session single-flight). Keyed by
+  // the live session id (the guard in send() engages under the id returned by
+  // ensureSession, which for a live session === props.sessionId). See
+  // lib/sendSingleFlight.ts — sendText must NOT touch the sync store's
+  // setSending (it would stall the drain effect), so this is a separate signal.
+  const sendInFlight = createMemo(() => isSendInFlight(props.sessionId || "draft"));
   // Whether send() can resolve an agent + model right now — the single hinge for
   // the disabled Send button AND the send() guard. agents() must be loaded
   // (activeAgent falls back to a leak-prone chain when empty), and a model must
@@ -1567,9 +1579,13 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // the duration of that dispatch — so this function MUST NOT touch setSending
   // here (setting it during enqueue would block the drain effect, stalling the
   // just-enqueued item in `pending` until a later queueFor/working transition
-  // re-arms the drain). Double-enqueue on a rapid double-click is acceptable: a
-  // visible duplicate is always preferred over any chance of silent loss
-  // (operator policy).
+  // re-arms the drain). Duplicate enqueue on a rapid re-tap is PREVENTED one
+  // layer up: send() wraps this call in runSendSingleFlight (per-session
+  // single-flight), so a re-tap during the (up to 12s) enqueue window is
+  // dropped instead of spawning a parallel enqueue. The no-loss invariant is
+  // preserved either way — a visible duplicate was always preferred over any
+  // chance of silent loss (operator policy); single-flight removes the
+  // duplicate without ever risking loss.
   async function sendText(text: string, id: string): Promise<boolean> {
     const atts = attachments();
     if ((!text && atts.length === 0) || !id) return false;
@@ -1872,27 +1888,44 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     // produces a new array); value equality on text catches any keystroke. On
     // enqueue failure the text + attachments are preserved and the operator
     // can re-press Send.
-    const snapText = input();
-    const snapAtts = attachments();
-    const ok = await sendText(text, id);
-    if (!ok) {
-      setInput(text);
-      return;
-    }
-    // Durable custody confirmed. Clear the composer ONLY if it still owns the
-    // submitted snapshot. If the operator typed a new draft or changed
-    // attachments during the enqueue wait, that newer state survives.
-    if (input() === snapText && attachments() === snapAtts) {
-      setInput("");
-      setAttachments([]);
-    }
-    // For a draft, the draft->live transition (ensureSession -> createSession
-    // -> setSelectedId) unmounts this ChatView in App.tsx, which disposes the
-    // draft-save createEffect above BEFORE the setInput("") just fired can
-    // re-run it — so the persisted vh.draft.__new__ slot would survive and
-    // re-inflate the composer on the next New session. Clear it explicitly at
-    // the moment of success, before the unmount races it.
-    if (props.draft) localStorage.removeItem(draftKey("__new__"));
+    //
+    // Single-flight (the duplicate-send-on-slow-network bug): on a weak/hung
+    // network the enqueue POST can take up to 12s, during which the composer
+    // text is NOT cleared and no chip appears yet — so the operator sees no
+    // feedback and re-taps Send, each re-tap spawning a PARALLEL enqueue that
+    // lands as a duplicate once the network settles. runSendSingleFlight drops
+    // re-taps while one enqueue is in-flight for this session (keyed by the
+    // live session id) and engages SYNCHRONOUSLY here so the Send button
+    // disables + the sending animation shows IMMEDIATELY (before backend
+    // custody confirms). The guard releases in finally on BOTH success and
+    // failure so a genuine retry still works after a timeout. Distinct from
+    // `sending` (the dispatch guard) — see lib/sendSingleFlight.ts.
+    await runSendSingleFlight(id, async () => {
+      const snapText = input();
+      const snapAtts = attachments();
+      const ok = await sendText(text, id);
+      if (!ok) {
+        setInput(text);
+        return;
+      }
+      // Durable custody confirmed. Clear the composer ONLY if it still owns the
+      // submitted snapshot. If the operator typed a new draft or changed
+      // attachments during the enqueue wait, that newer state survives.
+      if (input() === snapText && attachments() === snapAtts) {
+        setInput("");
+        setAttachments([]);
+      }
+      // For a draft, the draft->live transition (ensureSession -> createSession
+      // -> setSelectedId) unmounts this ChatView in App.tsx, which disposes the
+      // draft-save createEffect above BEFORE the setInput("") just fired can
+      // re-run it — so the persisted vh.draft.__new__ slot would survive and
+      // re-inflate the composer on the next New session. Clear it explicitly at
+      // the moment of success, before the unmount races it.
+      if (props.draft) localStorage.removeItem(draftKey("__new__"));
+    });
+    // A re-tap during the in-flight enqueue returns IGNORED and the body above
+    // never runs — the composer is left untouched, which is correct (the
+    // in-flight send owns clearing on its own success).
   }
 
   // Copy / Retry text extraction lives in ../lib/msgText (pure, unit-tested).
@@ -2618,7 +2651,14 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
             <Show
               when={working()}
               fallback={
-                <button type="button" class="send-btn" aria-label="Send" onClick={send} disabled={sending() || !readyToSend()}>
+                <button
+                  type="button"
+                  class="send-btn"
+                  classList={{ sending: sendInFlight() }}
+                  aria-label={sendInFlight() ? "Sending…" : "Send"}
+                  onClick={send}
+                  disabled={sending() || sendInFlight() || !readyToSend()}
+                >
                   <Icon name="send" />
                 </button>
               }
@@ -2626,7 +2666,15 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
               {/* Busy: Stop aborts the running turn; a Queue button appears once
                   you've typed something (Enter queues too). */}
               <Show when={queueMode() && input().trim().length > 0}>
-                <button type="button" class="send-btn queue" aria-label="Queue" data-tip="Queue — sends when the current turn finishes" disabled={!readyToSend()} onClick={send}>
+                <button
+                  type="button"
+                  class="send-btn queue"
+                  classList={{ sending: sendInFlight() }}
+                  aria-label={sendInFlight() ? "Queueing…" : "Queue"}
+                  data-tip="Queue — sends when the current turn finishes"
+                  disabled={sendInFlight() || !readyToSend()}
+                  onClick={send}
+                >
                   <Icon name="plus" />
                 </button>
               </Show>
