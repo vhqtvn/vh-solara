@@ -113,6 +113,25 @@ findLast. Mutation verbs (`exec`, `shell`, `update`, …) and broad wildcards
 (`skill *`, `overlay *`) are excluded and stay denied. The legacy `harness` and
 `devSh` keys also accept `"read_only"` for backward compatibility.
 
+**Family read-only admission rule (`verb` + `verb *`).** Each admitted verb
+appears as BOTH the scalar (`vh-agent-harness doctor`) and the wildcard
+(`vh-agent-harness doctor *`) only because its ENTIRE family is currently
+read-only — inspection flags, no mutating subcommands. `doctor`, `docs`,
+`status`, `guide`, `proposals`, `version`, `example`, `sys-prompt`, `help`,
+`diff`, and `preflight` all follow this shape. This is distinct from the
+`skill *` / `overlay *` exclusion: those are withheld because they already
+carry mutating verbs (`overlay new`; future skill verbs), so a family-wide
+wildcard would leak a mutation to read-only specialists.
+
+**Fail-open caveat.** Because the wildcard form is used, the matrix does NOT
+deny a future subcommand of an admitted verb while `verb *` stays — a future
+mutating `doctor <subcommand>` (e.g. a repair/write/network/secret-sensitive
+path) would inherit the allow unless the family is re-audited. Admission of
+`verb *` therefore carries a standing re-audit obligation; if the family gains
+a mutator, narrow the wildcard to an explicit read-only subcommand allowlist
+or move the mutating subcommand under a separate denied verb. Pre-emptive
+narrowing while no mutator exists is hardening (parked), not a defect fix.
+
 ## 3) Editable specialist template
 
 ```jsonc
