@@ -212,6 +212,75 @@ func isActiveLocked(s *Store, id string) bool {
 	return false
 }
 
+// promoteActiveFrontierLocked mirrors SnapshotFrontier's activePath seeding
+// LIVE: when a node becomes active (isActiveLocked) on a create/activity/
+// permission/question event, it promotes the node's inclusive ancestor chain
+// into the loaded-set E_c and ships the previously-unshipped chain nodes as
+// loaded:true node.upserts, parent-before-child (INV-B).
+//
+// WHY this exists (the tree=2 live frontier gap): E_c was only ever grown by
+// SnapshotFrontier (cold) and MarkLoaded (explicit expand). Once a connection
+// drifted into the gap state — the client shows a parent EXPANDED but the
+// emitter's e.ec[parent]=false after a non-destructive resync — every new
+// active child was suppressed as a count-only facet (onSessionUpsertLocked's
+// collapsed-parent gate) until a full reload (F5 / SnapshotFrontier recomputing
+// the active path WITH the new child). This helper closes that gap by
+// re-aligning the emitter's E_c model with the client the moment a node goes
+// active, so the active child and its ancestor chain appear without a
+// re-snapshot.
+//
+// Semantics (caller holds s.mu):
+//  1. !isActiveLocked → nil (active gate; preserves lazy-frontier for idle nodes).
+//  2. Collect the inclusive ancestor chain id→root; reverse to root→id (INV-B).
+//  3. For each chain node: if it was collapsed (!e.ec) flip e.ec=true; if it was
+//     unknown OR just-flipped, ship node.upsert(loaded:true) and record
+//     parentCache/known. Already-known + already-expanded → skip (idempotent).
+//
+// Chain-only: a promoted ancestor's OTHER pre-existing idle children are NOT
+// re-shipped as collapsed placeholders (SnapshotFrontier category-3 would).
+// This is a deliberate, noted gap — the active child appears and the ancestor
+// flips expanded, which resolves the reported symptom; lazy-frontier is
+// preserved. (Re-shipping idle siblings would expand scope and risks shipping
+// nodes the client never asked for.)
+func (e *TreeEmitter) promoteActiveFrontierLocked(id string) []TreeOp {
+	s := e.store
+	if !isActiveLocked(s, id) {
+		return nil
+	}
+	// Inclusive ancestor chain: id → ... → root. The loop condition bounds the
+	// walk at a missing/gone session, so a stale-activity-after-delete id (where
+	// isActiveLocked still reports true but s.sessions[id]==nil) yields an empty
+	// chain and a nil return — safe.
+	chain := make([]string, 0, 4)
+	cur := id
+	for cur != "" && s.sessions[cur] != nil {
+		chain = append(chain, cur)
+		cur = s.effectiveParentOfLocked(s.sessions[cur].parentID)
+	}
+	var ops []TreeOp
+	// root→id (parent-before-child, INV-B).
+	for i := len(chain) - 1; i >= 0; i-- {
+		n := chain[i]
+		wasCollapsed := !e.ec[n]
+		if wasCollapsed {
+			e.ec[n] = true
+		}
+		if e.known[n] && !wasCollapsed {
+			continue // already promoted (loaded + expanded); idempotent no-op.
+		}
+		node, ok := e.buildNodeLocked(n, true)
+		if !ok {
+			continue
+		}
+		up := NodeUpsertOp(node)
+		e.stamp(up, n)
+		ops = append(ops, up)
+		e.parentCache[n] = s.effectiveParentOfLocked(s.sessions[n].parentID)
+		e.known[n] = true
+	}
+	return ops
+}
+
 // SnapshotFrontier computes the §5 cold-load snapshot: all roots + active paths
 // (loaded:true) + direct children of loaded nodes (collapsed placeholders).
 // Cold-load size is O(roots + active-path-nodes + direct-children-of-loaded),
@@ -436,6 +505,21 @@ func (e *TreeEmitter) onSessionUpsertLocked(ev ClientEvent) []TreeOp {
 		// Parent is a collapsed placeholder on this connection → count-only facet.
 		shipChild = false
 	}
+	// Defensive live-frontier promotion (tree=2 gap fix). If the upserted
+	// session is ALREADY active at upsert time (a session.updated on a node that
+	// went busy/perms/question earlier) AND would be suppressed (collapsed/
+	// drifted parent), promote the chain so it ships loaded:true instead of a
+	// count-only facet. Only short-circuits the SUPPRESSED branch: a normal
+	// upsert for an active node whose parent IS in E_c still runs the shipChild
+	// block below, so metadata/title updates for active nodes land. The
+	// realistic appearance path is onActivityLocked (a created session is idle);
+	// this mirrors isActiveLocked's full definition for the upsert-time-active
+	// case. Promotion ships id + ancestors loaded:true with exact counts, so the
+	// parent-count facet below is intentionally skipped.
+	if !shipChild && isActiveLocked(s, id) {
+		ops = append(ops, e.promoteActiveFrontierLocked(id)...)
+		return ops
+	}
 	if shipChild {
 		n, ok := e.buildNodeLocked(id, false)
 		if ok {
@@ -549,11 +633,27 @@ func (e *TreeEmitter) onActivityLocked(ev ClientEvent) []TreeOp {
 	if json.Unmarshal(ev.Payload, &p) != nil || p.SessionID == "" {
 		return nil
 	}
-	if !e.known[p.SessionID] {
-		return nil
-	}
 	st := p.State
 	s := e.store
+
+	// PRIMARY live-frontier promotion (tree=2 gap fix). A node this connection
+	// does NOT yet hold is normally a no-op here. BUT if the activity made it
+	// active, promote its inclusive ancestor chain into loaded/E_c so the node
+	// (and any unshipped ancestors) ship NOW as real nodes — mirroring
+	// SnapshotFrontier's activePath seeding live. This is the load-bearing fix
+	// for "new active subsession doesn't appear until F5": a node that became
+	// active while still unknown (suppressed on create under a collapsed/drifted
+	// parent) ships here. The realistic appearance moment is here (NOT
+	// onSessionUpsertLocked) because a created session is idle at create time —
+	// activity is set only by a subsequent status/escalation. Gating on
+	// !e.known keeps the known-node path below (self facet + ancestor walk)
+	// byte-for-byte unchanged, so the 4751c71 ancestor walks are preserved.
+	if !e.known[p.SessionID] {
+		if isActiveLocked(s, p.SessionID) {
+			return e.promoteActiveFrontierLocked(p.SessionID)
+		}
+		return nil
+	}
 	// Emit the node's OWN current subtreeBusy alongside the activity facet,
 	// mirroring buildNodeLocked (SubtreeBusy: s.subtreeBusyCount[id] > 0).
 	// subtreeBusyCount[id] INCLUDES the node's own busy contribution, so during a
@@ -632,7 +732,16 @@ func (e *TreeEmitter) onPermissionLocked(ev ClientEvent, set bool) []TreeOp {
 	if json.Unmarshal(ev.Payload, &p) != nil || p.SessionID == "" {
 		return nil
 	}
+	s := e.store
+	// Live-frontier promotion (tree=2 gap fix): a node this connection does not
+	// yet hold, if a pending permission just made it active, ships now via
+	// promoteActiveFrontierLocked (mirrors onActivityLocked). Only on set
+	// (asked), not clear — a clear is never the "appearance" moment. The
+	// known-node facet path below is unchanged.
 	if !e.known[p.SessionID] {
+		if set && isActiveLocked(s, p.SessionID) {
+			return e.promoteActiveFrontierLocked(p.SessionID)
+		}
 		return nil
 	}
 	op := NodeFacetOp(p.SessionID, FacetData{Flags: map[string]bool{"permission": set}})
@@ -650,6 +759,19 @@ func (e *TreeEmitter) onQuestionLocked(ev ClientEvent, set bool) []TreeOp {
 	if json.Unmarshal(ev.Payload, &p) != nil || p.SessionID == "" {
 		return nil
 	}
+	s := e.store
+	// Live-frontier promotion (tree=2 gap fix): if this connection does NOT hold
+	// the node AND a question was just asked (making it active via pendingInput),
+	// ship it + its unshipped ancestor chain now (mirrors onActivityLocked) and
+	// return — the shipped node.upserts carry the correct pendingInput /
+	// subtreeNeedsInput flags, so the ancestor walk below is redundant for this
+	// case. Gated on !e.known so the known-node facet + ancestor-walk path
+	// (including the 4751c11 unmaterialized-intermediate semantics) is unchanged,
+	// and an unknown-node clear still falls through to the original ancestor
+	// walk (keeping known ancestors' subtreeNeedsInput fresh on clear).
+	if !e.known[p.SessionID] && set && isActiveLocked(s, p.SessionID) {
+		return e.promoteActiveFrontierLocked(p.SessionID)
+	}
 	var ops []TreeOp
 	if e.known[p.SessionID] {
 		op := NodeFacetOp(p.SessionID, FacetData{Flags: map[string]bool{"pendingInput": set}})
@@ -657,7 +779,6 @@ func (e *TreeEmitter) onQuestionLocked(ev ClientEvent, set bool) []TreeOp {
 		ops = append(ops, op)
 	}
 	// Walk ancestors; emit subtreeNeedsInput facet where the index flips.
-	s := e.store
 	// Nil-guard: e.known LAGS the store, so a session can already be deleted
 	// from s.sessions while a lagging connection still holds e.known[id]==true
 	// (it has not yet processed the KindSessionDelete). The pendingInput facet
