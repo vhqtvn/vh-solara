@@ -142,14 +142,28 @@ type Aggregator struct {
 	// the exact schedule the under-lock IsMessagesLoaded re-check must close.
 	// NOT guarded by a lock — install it once before any concurrent call.
 	msgGateHook func(sessionID string)
+
+	// statusReconcileInterval is how often runStatusReconcile polls OpenCode's
+	// /session/status to self-heal a stale "busy" flag (see the doc block on
+	// runStatusReconcile for the full rationale). It defaults to 60s, set at
+	// construction in New / NewForDirectory. It is a PER-INSTANCE field — NOT a
+	// package global — so a test can shrink it on the instance under test
+	// (e.g. agg.statusReconcileInterval = 5*time.Millisecond) without racing a
+	// lingering runStatusReconcile goroutine from another aggregator / a prior
+	// -count iteration. It is read once at the top of runStatusReconcile (the
+	// only reader) before that goroutine's ticker loop; set it before calling
+	// Run / RunManaged so the goroutine launch establishes the happens-before
+	// edge to the read.
+	statusReconcileInterval time.Duration
 }
 
 // New builds an aggregator targeting an opencode server base URL.
 func New(baseURL string, ringCapacity int) *Aggregator {
 	return &Aggregator{
-		client:      opencode.New(baseURL),
-		store:       state.New(ringCapacity),
-		msgInflight: map[string]chan struct{}{},
+		client:                  opencode.New(baseURL),
+		store:                   state.New(ringCapacity),
+		msgInflight:             map[string]chan struct{}{},
+		statusReconcileInterval: 60 * time.Second,
 	}
 }
 
@@ -158,7 +172,12 @@ func New(baseURL string, ringCapacity int) *Aggregator {
 func NewForDirectory(baseURL, directory string, ringCapacity int) *Aggregator {
 	c := opencode.New(baseURL)
 	c.Directory = directory
-	return &Aggregator{client: c, store: state.New(ringCapacity), msgInflight: map[string]chan struct{}{}}
+	return &Aggregator{
+		client:                  c,
+		store:                   state.New(ringCapacity),
+		msgInflight:             map[string]chan struct{}{},
+		statusReconcileInterval: 60 * time.Second,
+	}
 }
 
 // Directory returns the project directory this aggregator is scoped to ("" =
@@ -675,7 +694,7 @@ func (a *Aggregator) Run(ctx context.Context) {
 
 	// Periodic /session/status reconcile self-heals a stale "busy" flag left
 	// behind by a missed session.idle (dropped tunnel / reconnect gap / a turn
-	// that ended without OpenCode emitting idle). See StatusReconcileInterval.
+	// that ended without OpenCode emitting idle). See a.statusReconcileInterval.
 	// Bound to Run's ctx so it stops on aggregator shutdown.
 	go a.runStatusReconcile(ctx)
 
@@ -749,8 +768,16 @@ func (a *Aggregator) Run(ctx context.Context) {
 // seven O1 subtree indexes consistent. It is best-effort: a fetch error is
 // logged and retried on the next tick. It never clears busyCount directly.
 // Blocks until ctx is cancelled.
+//
+// The poll interval is the per-instance field a.statusReconcileInterval
+// (default 60s, set in New / NewForDirectory). A test shrinks it on the
+// instance under test (e.g. agg.statusReconcileInterval = 5*time.Millisecond)
+// rather than mutating a package global: a global written by one test's
+// goroutine would race a lingering runStatusReconcile goroutine from another
+// aggregator (or a prior -count iteration) that reads it once at the top of
+// this function. The instance field removes that race entirely.
 func (a *Aggregator) runStatusReconcile(ctx context.Context) {
-	ticker := time.NewTicker(StatusReconcileInterval)
+	ticker := time.NewTicker(a.statusReconcileInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -887,24 +914,6 @@ func (a *Aggregator) hydrate(ctx context.Context) error {
 // to derive its lastAgent for the tree chips. It only needs to be large enough
 // to typically contain the most recent assistant turn.
 const coldTailLimit = 10
-
-// StatusReconcileInterval is how often runStatusReconcile polls OpenCode's
-// /session/status to self-heal a stale "busy" flag. The event stream drives
-// busy-state in the common case (session.status busy / session.idle), but if
-// the aggregator ever misses a session.idle — a dropped tunnel, a reconnect
-// gap, or a turn that ended without OpenCode emitting idle — busyCount[root]
-// stays > 0 forever and the finished session renders as RUNNING in the SPA.
-// A stale-busy root also defeats the O1 collapsed-frontier projection: it
-// stays in the active closure, so its whole subtree ships full instead of
-// collapsing to a frontier stub.
-//
-// This ticker is the authoritative safety net: it periodically re-derives
-// busy-state from /session/status and clears anything OpenCode no longer
-// reports busy, routing through store.SetActivityFromStatuses -> setActivityLocked
-// so busyCount, subtreeBusyCount, and all seven O1 subtree indexes stay
-// consistent. It is a var (not const) so tests can shrink it; it mirrors the
-// deltaFlushInterval / partTextCap tuning-var precedent.
-var StatusReconcileInterval = 60 * time.Second
 
 // startColdSeed launches seedColdLastAgents on a background goroutine (off the
 // hydrate hot path) unless one is already running. At most one cold-seed is in

@@ -17,7 +17,13 @@ import (
 // TreeReconcileInterval is how often runTreeReconcile polls OpenCode's /session
 // list to detect ghosts and clobbered archives. The tick is cheap (a flat-list
 // diff against an in-memory map), so it can run frequently. A var (not const)
-// so tests can shrink it; mirrors the StatusReconcileInterval precedent.
+// so tests can shrink it. (StatusReconcileInterval used to be the same kind of
+// package-global tuning var but was moved to a per-instance Aggregator field —
+// statusReconcileInterval — because a test mutated that global while a lingering
+// runStatusReconcile goroutine read it, a data race. TreeReconcileInterval is
+// left as a global only because no test mutates it; if a test ever needs to
+// shrink it, prefer a per-instance field on Aggregator from the start rather
+// than reintroducing the global-written-by-test pattern.)
 var TreeReconcileInterval = 5 * time.Second
 
 // runTreeReconcile periodically diffs the store against OpenCode's

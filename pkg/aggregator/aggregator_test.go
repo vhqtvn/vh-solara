@@ -1089,11 +1089,6 @@ func TestStopNilCancelIsSafe(t *testing.T) {
 // 1 for the whole window → the heal-poll times out → FAIL.
 // WITH the ticker, the stale root is cleared within a few ticks → PASS.
 func TestRunStatusReconcileHealsStaleBusy(t *testing.T) {
-	// Shrink the reconcile interval so the heal fires within the test window.
-	prevInterval := StatusReconcileInterval
-	StatusReconcileInterval = 5 * time.Millisecond
-	t.Cleanup(func() { StatusReconcileInterval = prevInterval })
-
 	mux := http.NewServeMux()
 	// Empty session list: hydrate finds nothing to load.
 	mux.HandleFunc("/session", func(w http.ResponseWriter, r *http.Request) {
@@ -1124,6 +1119,12 @@ func TestRunStatusReconcileHealsStaleBusy(t *testing.T) {
 	defer oc.Close()
 
 	agg := New(oc.URL, 100)
+	// Shrink the reconcile interval on THIS instance (not a package global,
+	// which would race a lingering runStatusReconcile goroutine from another
+	// aggregator / a prior -count iteration) so the heal fires within the
+	// test window. Set before RunManaged so the goroutine launch establishes
+	// the happens-before edge to runStatusReconcile's single read of it.
+	agg.statusReconcileInterval = 5 * time.Millisecond
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go agg.RunManaged(ctx)
