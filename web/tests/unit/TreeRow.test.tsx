@@ -512,15 +512,16 @@ describe("TreeRow subtreeBusy running ring (P1-B, tree=2 UI parity)", () => {
 });
 
 // ── tree=2 UI parity: twisty "running" ring (P1) ─────────────────────────────
-// The busy signal on a tree row is a pulsing accent ring layered around the
-// twisty glyph via .tree-twisty.running::after (legacy/20-session-tree.css) —
-// ORTHOGONAL to the glyph: a busy row keeps its normal glyph (chevron / eye /
-// noChild) and the ring's opacity pulses while the glyph stays solid. This
-// finally covers busy LEAVES too (which previously had no twisty busy-signal).
-// The glyph precedence is 4-way: flat > leaf > revealed(eye) > chevron; isBusy
-// no longer picks the glyph — it only toggles the `running` class on the button.
+// The busy signal on a tree row is a pulsing accent stripe layered at the left
+// edge of the twisty cell via .tree-twisty.running::after
+// (legacy/20-session-tree.css) — ORTHOGONAL to the glyph: a busy row keeps its
+// normal glyph (chevron / eye / noChild / filtered) and the stripe's opacity
+// pulses while the glyph stays solid. This finally covers busy LEAVES too
+// (which previously had no twisty busy-signal). The glyph precedence is 5-way:
+// flat > leaf > temp(eye) > filtered(rail-and-bars) > chevron; isBusy no longer
+// picks the glyph — it only toggles the `running` class on the button.
 describe("TreeRow twisty running ring (P1)", () => {
-  it("renders the chevron glyph AND the running class for a busy EXPANDABLE node (ring around the chevron)", () => {
+  it("renders the filtered glyph AND the running class for a busy EXPANDABLE node (busy signal is glyph-orthogonal)", () => {
     const { container } = render(() => (
       <TreeRow node={baseNode({ activity: "busy", childCount: 2 })} depth={0} selected={false} displayState="filtered" onSelect={() => {}} onToggle={() => {}} />
     ));
@@ -531,12 +532,14 @@ describe("TreeRow twisty running ring (P1)", () => {
     // .tree-spinner in the row.
     expect(t.querySelector("span.twisty-running")).toBeNull();
     expect(nodeButton(container as unknown as HTMLElement).querySelector(".tree-spinner")).toBeNull();
-    // A busy expandable node renders its NORMAL glyph — the chevron. Pin the
-    // exact chevronDown path so a wrong icon can't pass as "some svg".
+    // A busy expandable node renders its NORMAL glyph — for the "filtered"
+    // display state that is the rail-and-bars `filtered` glyph (rendered bare,
+    // no span, so the chevron rotate rule cannot catch it). Pin its exact path
+    // so a wrong icon can't pass as "some svg".
     const path = t.querySelector("svg.icon path");
-    expect(path?.getAttribute("d")).toBe("m6 9 6 6 6-6");
-    // The twisty must NOT carry the dimmed `leaf` class (chevron renders at full
-    // tone on an expandable node, not dimmed like the noChild terminal marker).
+    expect(path?.getAttribute("d")).toBe("M6 5v14M6 8h11M6 12h5M6 16h11");
+    // The twisty must NOT carry the dimmed `leaf` class (the glyph renders at
+    // full tone on an expandable node, not dimmed like the noChild terminal).
     expect(t.classList.contains("leaf")).toBe(false);
   });
 
@@ -557,16 +560,18 @@ describe("TreeRow twisty running ring (P1)", () => {
     expect(nodeButton(container as unknown as HTMLElement).querySelector(".tree-spinner")).toBeNull();
   });
 
-  it("renders the chevron with NO running ring for an IDLE expandable node", () => {
+  it("renders the filtered glyph with NO running ring for an IDLE expandable node", () => {
     const { container } = render(() => (
       <TreeRow node={baseNode({ activity: "idle", childCount: 2 })} depth={0} selected={false} displayState="filtered" onSelect={() => {}} onToggle={() => {}} />
     ));
     const t = twisty(container as unknown as HTMLElement);
     // Idle expandable: no running ring (the `running` class is busy-only).
     expect(t.classList.contains("running")).toBe(false);
-    // The chevron branch renders a bare <span> (classList open/no-class) holding
-    // the chevronDown icon — present for an idle expandable node.
-    expect(t.querySelector("span")).not.toBeNull();
+    // The "filtered" display state renders the rail-and-bars `filtered` glyph
+    // BARE (no span wrapper) so the chevron rotate rule cannot catch it. Pin
+    // its exact path so a wrong icon can't pass as "some svg".
+    const path = t.querySelector("svg.icon path");
+    expect(path?.getAttribute("d")).toBe("M6 5v14M6 8h11M6 12h5M6 16h11");
     expect(t.querySelector("span.twisty-running")).toBeNull();
   });
 

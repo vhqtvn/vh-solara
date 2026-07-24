@@ -84,20 +84,21 @@
 .tree-twisty span:not(.open) { transform: rotate(-90deg); }
 /* temp = auto-revealed ancestor of the open session (eye glyph), dimmed. */
 .tree-twisty span.twisty-temp { transform: none; color: var(--fg-dim); }
-/* The SOLE busy signal: a pulsing accent ring drawn around the twisty glyph.
-   Orthogonal to the glyph — the chevron / eye / noChild / filtered icon renders
-   normally at full opacity; only this ring's opacity pulses. The ring is a
-   button-level ::after (NOT on the <svg> — pseudo-elements don't render on svg)
-   inset to hug the ~13px icon centered in the 18×30 click target. Covers busy
-   LEAVES too (which previously had no twisty busy-signal at all). */
+/* The SOLE busy signal: a weighted left accent stripe at the left edge of the
+   twisty cell, opacity-pulsing. Orthogonal to the glyph — the chevron / eye /
+   noChild / filtered icon renders normally at full opacity; only this stripe's
+   opacity pulses. The stripe is a button-level ::after (NOT on the <svg> —
+   pseudo-elements don't render on svg) pinned to the button's left edge.
+   Covers busy LEAVES too (which previously had no twisty busy-signal at all). */
 @keyframes running-outline { 0%, 100% { opacity: 0.1; } 50% { opacity: 0.7; } }
 .tree-twisty.running::after {
   content: "";
   position: absolute;
-  inset: 7px 1px; /* 16×16 ring centered on the 13px glyph inside the 18×30 button */
-  border: 1px solid var(--accent);
-  border-radius: 4px;
-  animation: running-outline 1.4s ease-in-out infinite;
+  left: 0;
+  top: 3px;
+  bottom: 3px;
+  border-left: 2px solid var(--accent); /* weighted left accent stripe (not a full box) */
+  animation: running-outline 2.4s ease-in-out infinite;
   pointer-events: none;
 }
 .tree-node {

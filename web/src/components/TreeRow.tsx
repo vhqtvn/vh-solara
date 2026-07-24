@@ -87,6 +87,7 @@ export function TreeRow(props: TreeRowProps) {
   // Display-mode derived flags. displayState may be undefined for flat rows.
   const isTemp = () => props.displayState === "temp";
   const isExpanded = () => props.displayState === "expanded";
+  const isFiltered = () => props.displayState === "filtered";
   // The "▸ N" descendant badge appears ONLY on a non-flat, non-leaf node in a
   // COLLAPSED or FILTERED display state (children hidden / partially hidden).
   // Hidden in expanded (children rendered) and temp (one child rendered).
@@ -146,14 +147,20 @@ export function TreeRow(props: TreeRowProps) {
           // span:not(.open) rotate. onClick is UNCHANGED: a temp node is still
           // expandable, so the guard above still fires onToggle — clicking the
           // eye promotes it to "filtered" + cascades (proj=1 temp→filtered).
-          <span class="twisty-temp"><Icon name="eye" size={13} /></span>
+          <span class="twisty-temp"><Icon name="eye" size={11} /></span>
+        ) : isFiltered() ? (
+          // "filtered" display state: the rail-and-bars `filtered` glyph (same
+          // glyph as flat mode — both mean "a filtered view"). Rendered BARE
+          // (no span) so the chevron's `.tree-twisty span:not(.open)` rotate
+          // rule cannot catch it.
+          <Icon name="filtered" size={13} />
         ) : (
-          // Expandable tree node (collapsed/filtered/expanded): the chevron,
-          // wrapped in the open/not-open span whose `.tree-twisty span:not(.open)`
-          // rule rotates it to point right when collapsed/filtered. A WORKING
-          // expandable node still renders this chevron — working no longer swaps
-          // the glyph; it toggles the `running` class on this button (above),
-          // which CSS layers as a pulsing accent ring over the glyph
+          // Expandable tree node (collapsed/expanded): the chevron, wrapped in
+          // the open/not-open span whose `.tree-twisty span:not(.open)` rule
+          // rotates it to point right when collapsed. A WORKING expandable node
+          // still renders this chevron — working no longer swaps the glyph; it
+          // toggles the `running` class on this button (above), which CSS
+          // layers as a pulsing accent ring over the glyph
           // (legacy/20-session-tree.css .tree-twisty.running::after).
           <span classList={{ open: isExpanded() }}>
             <Icon name="chevronDown" size={13} />
