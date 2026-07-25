@@ -1,5 +1,7 @@
 // Shared e2e helpers.
 
+import type { APIRequestContext } from "@playwright/test";
+
 // demoDir is the single consolidated project directory under which ALL real
 // fixture sessions live (pkg/fixtures/opencode.go seeds demo/sub/other/slow and
 // any opt-in bench session with this directory). The fixture's /session handler
@@ -33,4 +35,47 @@ export function projectUrl(pathOrQuery: string): string {
   const params = new URLSearchParams(query);
   params.set("dir", demoDir);
   return "/?" + params.toString();
+}
+
+// resetPins clears the worker's durable pin doc to initialized+empty via the
+// real /vh/pins API (GET to read the current revision, then a CSRF-bearing PUT
+// with an empty orderedSessionIds list). The Playwright e2e suite is SERIAL
+// (workers:1, fullyParallel:false) over ONE shared fixtureserver process, so
+// server-side pin state persists across specs within a suite run — and a pin is
+// a SERVER concern now (Phase 4+), not a client-local one. Any spec that pins a
+// session MUST bracket itself with beforeEach/afterEach resetPins, otherwise it
+// leaks pinned state into sibling specs: a pinned session is hoisted into the
+// .tree-pinned group and dedup'd OUT of the tree body, which silently breaks
+// tree-body assertions elsewhere (this is exactly what broke tree2-parity test 2
+// once pins became server-managed).
+//
+// Uses the bare `request` fixture (NOT page.request): in beforeEach the page has
+// not navigated yet, so page.request would resolve the relative URL against
+// about:blank and silently no-op (see scroll-follow.spec.ts for the same
+// rationale). The fixture server enforces no auth; only the CSRF guard applies,
+// which GET is exempt from and PUT satisfies via the X-VH-CSRF header.
+//
+// Clears to initialized=true/empty rather than to an uninitialized doc so a
+// freshly-loaded browser does NOT fire its one-shot legacy migration PUT (which
+// would otherwise race the next test's assertions). Retries on 409: a concurrent
+// revision advance is unlikely in the serial suite, but a just-closed browser's
+// in-flight migration could in principle race a fast reset — re-read and retry
+// rather than fail the setup.
+export async function resetPins(request: APIRequestContext): Promise<void> {
+  const csrf = { "X-VH-CSRF": "1" };
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const cur = await request.get("/vh/pins");
+    if (!cur.ok()) {
+      throw new Error(`resetPins: GET /vh/pins -> ${cur.status()} ${cur.statusText()}`);
+    }
+    const baseRevision = (await cur.json()).revision as number;
+    const put = await request.put("/vh/pins", {
+      headers: csrf,
+      data: { baseRevision, orderedSessionIds: [] },
+    });
+    if (put.ok()) return;
+    if (put.status() === 409) continue; // revision advanced under us; re-read + retry
+    throw new Error(`resetPins: PUT /vh/pins -> ${put.status()} ${put.statusText()}`);
+  }
+  throw new Error("resetPins: exhausted retries on repeated 409 (revision kept advancing)");
 }

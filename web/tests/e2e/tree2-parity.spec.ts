@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import { projectUrl } from "./util";
+import { projectUrl, resetPins } from "./util";
 
 // Phase 3 parity — PINS + SEARCH restored on the tree=2 thin client.
 //
@@ -13,9 +13,26 @@ import { projectUrl } from "./util";
 //   (search) the search input filters the rendered tree to a flat match list;
 //            a non-matching root disappears, and the empty state renders.
 //
-// Pin is a CLIENT preference (sidebar.ts localStorage vh.pinned.v1) — it never
-// touches the server fixture, so these tests do not perturb the shared serial
-// fixture state the other specs rely on.
+// Pin is now SERVER-MANAGED (Phase 4+): the worker owns a durable pin doc at
+// /vh/pins (PUT/GET, SSE pins.snapshot/pins.updated) that is synced across every
+// browser viewing the worker. These specs DO mutate fixture pin state (test 1
+// pins `sub` and never unpins it), so each test resets the pin doc before AND
+// after via resetPins — otherwise test 1's pinned `sub` leaks into test 2
+// (hoisted out of the tree body, so the expand-demo-then-find-sub-in-tree-body
+// assertion at line ~104 finds nothing) and into sibling serial specs. (The
+// client localStorage vh.pinned.v1 key is now a legacy one-shot migration seed
+// only; it no longer drives the render, and its removal is a separate
+// release-bound slice, not this one.)
+
+// resetPins runs through the real /vh/pins API (Node-side `request` fixture,
+// which resolves the relative URL against baseURL even before any page.goto —
+// page.request would resolve against about:blank and silently no-op here).
+test.beforeEach(async ({ request }) => {
+  await resetPins(request);
+});
+test.afterEach(async ({ request }) => {
+  await resetPins(request);
+});
 
 // Mirrors tree2-symptoms.spec.ts: wait for the tree to populate (at least one
 // .tree-row) and for no busy sessions before asserting. The shimmering
