@@ -3368,3 +3368,117 @@ func TestSetActivityFromStatusesHealsStaleBusyRoot(t *testing.T) {
 		t.Fatalf("false-clear guard: want subtreeBusyCount a=1, got %d", guardSb["a"])
 	}
 }
+
+// TestRunningRootsStaleAfterBusyChildArchived is the deterministic red signal
+// for the stale "running" count reported in ProjectSwitcher.tsx and
+// RestartOpenCode.tsx. Both surfaces read backend counts
+// (Store.RunningRoots() via /vh/running-sessions and RootCount() via
+// /vh/projects); the bug is in the backend counting, not the fetch layer.
+//
+// Bug shape: busyCount is keyed by ROOT, but the only site that mutates it is
+// setActivityAtLocked (busy↔non-busy flip). deleteSessionLocked only does
+// `delete(s.busyCount, id)` for the deleted session's OWN id — it never
+// decrements busyCount[root]. So when a BUSY NON-ROOT session is archived
+// (RemoveSessions) or pruned by Hydrate, busyCount[root] is left stuck high
+// forever. Worse, the runStatusReconcile heal ticker (which clears stale-busy
+// sessions a la TestRunStatusReconcileHealsStaleBusy) iterates s.sessions —
+// the archived child is GONE, so the heal cannot clear it. busyCount[root]
+// sticks at 1 indefinitely and RunningRoots() reports a phantom running root.
+//
+// Probe: at the moment the count looks stale, compare
+//  1. Store.RunningRoots()           — derived from busyCount[]
+//  2. the live tree snapshot's notion of busy roots (Snapshot + Gate.SubtreeBusy)
+//
+// Divergence between (1) and (2) localizes the bug to the store's busyCount
+// index, not the verb or frontend layer.
+func TestRunningRootsStaleAfterBusyChildArchived(t *testing.T) {
+	s := New(100)
+
+	// Build a root "a" with a child "c".
+	s.Apply(ev("session.created", `{"info":{"id":"a"}}`))
+	s.Apply(ev("session.created", `{"info":{"id":"c","parentID":"a"}}`))
+
+	// Child c goes busy. busyCount["a"]++  → 1. RunningRoots reports 1.
+	s.Apply(ev("session.status", `{"sessionID":"c","status":{"type":"busy"}}`))
+	if got := s.RunningRoots(); got != 1 {
+		t.Fatalf("precondition: busy child, want 1 running, got %d", got)
+	}
+
+	// Now archive the busy child (the canonical "sub-session finishes and gets
+	// archived" path). The child leaves the live tree.
+	s.RemoveSessions([]string{"c"})
+
+	// PROBE 1 — Store.RunningRoots(): the suspect count.
+	storeCount := s.RunningRoots()
+
+	// PROBE 2 — live tree snapshot's notion of busy roots. A root counts as
+	// busy iff any session in its subtree is observably busy (activity busy/
+	// retry OR Gate.SubtreeBusy). After archiving the only busy session,
+	// the live tree has NO busy session anywhere.
+	snap := s.Snapshot(nil)
+	// Build id→parentID index over the live snapshot, mirroring RootCount's
+	// orphan-inclusive root definition (a session is a root when its parentID
+	// is empty OR its parentID is absent from the live set).
+	parentOf := map[string]string{}
+	live := map[string]bool{}
+	for _, raw := range snap.Sessions {
+		var env sessionEnvelope
+		if json.Unmarshal(raw, &env) == nil && env.ID != "" {
+			parentOf[env.ID] = env.ParentID
+			live[env.ID] = true
+		}
+	}
+	liveBusyRoots := 0
+	for id := range live {
+		if p := parentOf[id]; p != "" && live[p] {
+			continue // not a root
+		}
+		gate := snap.Gate[id]
+		if gate.SubtreeBusy || snap.Activity[id] == ActivityBusy || snap.Activity[id] == ActivityRetry {
+			liveBusyRoots++
+		}
+	}
+
+	if storeCount != liveBusyRoots {
+		t.Fatalf("DIVERGENCE: RunningRoots()=%d but live snapshot reports %d busy roots "+
+			"(busyCount index is stale; archived busy child left a phantom count on root \"a\"). "+
+			"snapshot gate=%v activity=%v",
+			storeCount, liveBusyRoots, snap.Gate, snap.Activity)
+	}
+
+	// The expected post-archive steady state: no busy session anywhere → 0.
+	if want := 0; storeCount != want {
+		t.Fatalf("post-archive: want %d running roots, got %d (busyCount[root] not decremented "+
+			"by deleteSessionLocked on the archived busy child)", want, storeCount)
+	}
+
+	// HEAL ATTEMPT — the runStatusReconcile path. OpenCode's /session/status
+	// reports nothing busy (the canonical heal input, exactly what
+	// TestRunStatusReconcileHealsStaleBusy drives). This MUST clear the stale
+	// count, but it CANNOT: the archived child is no longer in s.sessions,
+	// so SetActivityFromStatuses never touches busyCount[root].
+	s.SetActivityFromStatuses(map[string]json.RawMessage{})
+	if got := s.RunningRoots(); got != 0 {
+		t.Fatalf("post-reconcile heal: stale count persists across the /session/status reconcile. "+
+			"want 0 running roots, got %d (heal iterates s.sessions; archived busy child is invisible to it)", got)
+	}
+}
+
+// TestRunningRootsBusyRootArchivedCleared is the asymmetry companion to
+// TestRunningRootsStaleAfterBusyChildArchived: archiving a busy ROOT session
+// (root.id == root) must also clear the count. This case was already correct
+// pre-fix — `delete(s.busyCount, id)` in deleteSessionLocked clears the root's
+// own entry — and pins the contract on both sides of the asymmetry so the
+// non-root fix does not regress it.
+func TestRunningRootsBusyRootArchivedCleared(t *testing.T) {
+	s := New(100)
+	s.Apply(ev("session.created", `{"info":{"id":"a"}}`))
+	s.Apply(ev("session.status", `{"sessionID":"a","status":{"type":"busy"}}`))
+	if got := s.RunningRoots(); got != 1 {
+		t.Fatalf("precondition: busy root, want 1 running, got %d", got)
+	}
+	s.RemoveSessions([]string{"a"})
+	if got := s.RunningRoots(); got != 0 {
+		t.Fatalf("post-archive busy root: want 0 running, got %d", got)
+	}
+}

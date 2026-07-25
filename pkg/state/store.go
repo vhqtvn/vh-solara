@@ -856,6 +856,15 @@ type Store struct {
 	// Finished-unread tracking. busyCount[root] = number of busy/retry sessions in
 	// the root's subtree; when it falls to 0 the root is marked unread (a finished
 	// task awaiting acknowledgement). suppressUnread guards the hydrate reconcile.
+	//
+	// Maintained incrementally at two mutation sites:
+	//   - setActivityAtLocked (the busy↔non-busy chokepoint: busyCount[root]++/--)
+	//   - deleteSessionLocked (a busy non-root being archived/pruned must
+	//     decrement its OLD root's count; the runStatusReconcile heal iterates
+	//     s.sessions and cannot see an already-deleted id, so without this the
+	//     phantom count would persist and RunningRoots() would over-report).
+	// `delete(s.busyCount, id)` in deleteSessionLocked covers the case where id
+	// IS its own root; the explicit decrement covers the non-root case.
 	unread         map[string]bool
 	busyCount      map[string]int
 	suppressUnread bool
@@ -1876,6 +1885,33 @@ func (s *Store) deleteSessionLocked(id string) {
 	if se := s.sessions[id]; se != nil {
 		reparentedChildren = append(reparentedChildren, s.children[id]...)
 		s.maintainIndexesOnDeleteLocked(id, se)
+	}
+	// Maintain busyCount[root] for a deleted BUSY non-root session. The
+	// chokepoint for busy↔non-busy transitions is setActivityAtLocked
+	// (busyCount[root]++/--), but the DELETE path bypasses it: a sub-session
+	// that was busy when it was archived (time.archived via upsertSessionLocked
+	// → deleteSessionLocked, RemoveSessions, or a Hydrate prune) leaves
+	// busyCount[root] stuck at its pre-archive value because the only other
+	// site that touches this map is `delete(s.busyCount, id)` below — which
+	// clears id's OWN entry (correct when id IS its own root) but not the
+	// root's. The runStatusReconcile heal ticker cannot recover this either:
+	// it iterates s.sessions, and the archived id is already gone, so the
+	// phantom count persists indefinitely and RunningRoots() over-reports
+	// (surfaced via /vh/running-sessions and /vh/projects in the SPA's project
+	// switcher badge and restart-confirmation dialog). Mirror the decrement
+	// half of setActivityAtLocked's busy→non-busy branch: only id's OWN
+	// contribution (±1) — cascade deletes of busy descendants each funnels
+	// through here separately. No markUnread: the session is being removed,
+	// so a "finished-unread" indicator would be meaningless. rootOfLocked
+	// walks s.sessions, which is still intact here (the delete(...) calls
+	// below haven't run yet), so it resolves the OLD root correctly.
+	if a := s.activity[id]; a == ActivityBusy || a == ActivityRetry {
+		root := s.rootOfLocked(id)
+		if root != id { // root == id is cleared by `delete(s.busyCount, id)` below
+			if s.busyCount[root] > 0 {
+				s.busyCount[root]--
+			}
+		}
 	}
 	delete(s.sessions, id)
 	delete(s.messages, id)
