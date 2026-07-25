@@ -732,7 +732,39 @@ export function applyMessageEvent(kind: string, seq: number, payload: any, track
           break;
         }
         case "activity":
-          if (payload.sessionID) s.activity[payload.sessionID] = payload.state;
+          if (payload.sessionID) {
+            s.activity[payload.sessionID] = payload.state;
+            // Cross-stream completion bridge: activity=idle arrives on the TREE
+            // stream (Stream 1), while the message.upsert carrying
+            // time.completed arrives on the SESSION stream (Stream 2). They are
+            // independent connections whose delivery order is NOT guaranteed —
+            // when Stream 1 wins, .working-text unmounts (working() reads
+            // activity[id]) BEFORE Stream 2's completed upsert has flipped
+            // `settled`, so the streaming view (.md-stream) briefly outlives the
+            // busy indicator (the session-completion flake). Stamping
+            // time.completed on the last assistant message HERE, in the SAME
+            // produce() draft that clears activity, makes `settled` flip in the
+            // SAME reactive flush that unmounts .working-text — so whichever
+            // stream wins, the streaming view never outlives the busy indicator.
+            // The real message.upsert(completed) (whenever it lands) is then a
+            // no-op: reduce.ts upsertMessage does existing.info = info, but
+            // settled() only reads time.completed, which is already set. Mirrors
+            // markSessionIdle (the optimistic idle path used on abort,
+            // actions.ts). Scoped to idle: busy/retry are mid-turn (the last
+            // assistant is genuinely in-flight) and must NOT be stamped.
+            if (payload.state === "idle") {
+              const sm = s.messages[payload.sessionID];
+              if (sm && sm.order.length) {
+                const last = sm.byId[sm.order[sm.order.length - 1]];
+                if (last && last.info.role === "assistant" && !last.info.time?.completed) {
+                  last.info = {
+                    ...last.info,
+                    time: { ...(last.info.time || {}), completed: Date.now() },
+                  };
+                }
+              }
+            }
+          }
           // The completion ping is decided AFTER the store updates (below), at
           // the root level — not per-session — so a finished root pings once and
           // noisy subsession completions don't.

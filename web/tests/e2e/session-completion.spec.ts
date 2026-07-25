@@ -263,6 +263,175 @@ test("PLAIN completion on small session (other) — tail present at completion i
   );
 });
 
+// === CROSS-STREAM completion race (deterministic red + regression guard) =========
+//
+// ROOT CAUSE of Test A's flake (confirmed by instrumentation): the `settled`
+// flip and the `.working-text` removal are driven by events on TWO DIFFERENT
+// SSE streams:
+//   - `message.upsert` carrying `time.completed` arrives on the SESSION stream
+//     (Stream 2 — the per-session `sessions=<sid>` EventSource). This is what
+//     flips `settled()` (ChatView.tsx:175 reads props.m.info.time.completed).
+//   - `activity=idle` arrives on the TREE stream (Stream 1 — see
+//     TREE_STREAM_KINDS in sync/stream.ts). This is what unmounts
+//     `.working-text` (working() reads state.activity[id]).
+// The two streams are independent TCP connections whose delivery order is NOT
+// guaranteed. When Stream 1 wins (idle lands before the completed upsert), the
+// completion-instant capture fires (working-text gone) with `settled` still
+// false → `.md-stream` still mounted → Test A's `streamViewsMounted === 0`
+// assertion fails.
+//
+// FIX (sync/stream.ts, case "activity"): when activity=idle is applied, stamp
+// time.completed on the last assistant message in the SAME produce() draft that
+// clears activity — so `settled` flips in the SAME reactive flush that unmounts
+// .working-text. Whichever stream wins, the streaming view never outlives the
+// busy indicator. The real message.upsert(completed) is then a no-op.
+//
+// This test makes the race DETERMINISTIC by delaying EVERY event on the
+// session stream (Stream 2) so the tree stream's activity=idle ALWAYS lands
+// first. It pins the settled-flip guarantee directly: streamViewsMounted MUST
+// be 0 at the completion instant even though Stream 2's completion events have
+// not landed. (The full text-presence assertion is covered by Test A's
+// realistic race — under this artificial full-stream delay the final part.upsert
+// is also delayed, so text presence is a transport concern, not the settled
+// flip this guard targets.)
+const CROSS_STREAM_RACE_DELAY_MS = 150;
+
+async function installCaptureWithStreamRace(page: Page, session: string) {
+  await page.addInitScript(({ sid, delay }) => {
+    (window as any).__vhSSE = [];
+    const OrigES = (window as any).EventSource;
+    function LoggingES(url: string, opts?: any) {
+      const es = opts !== undefined ? new OrigES(url, opts) : new OrigES(url);
+      const isSession = typeof url === "string" && url.indexOf("sessions=" + sid) !== -1;
+      const origAdd = es.addEventListener.bind(es);
+      es.addEventListener = function (type: string, listener: any, options?: any) {
+        return origAdd(
+          type,
+          (ev: MessageEvent) => {
+            try {
+              const d = typeof ev.data === "string" ? ev.data.slice(0, 200) : "";
+              (window as any).__vhSSE.push({ type, dataPreview: d, t: performance.now() });
+            } catch {
+              /* ignore */
+            }
+            const dispatch = () => {
+              if (typeof listener === "function") listener(ev);
+              else if (listener) listener.handleEvent(ev);
+            };
+            // RACE INJECTION: delay EVERY event on the SESSION stream (Stream 2)
+            // by CROSS_STREAM_RACE_DELAY_MS so the TREE stream (Stream 1:
+            // activity=idle, undelayed) always wins the race. At .working-text
+            // removal (Stream 1 idle), Stream 2's completion events (final
+            // part.upsert + message.upsert(completed)) have NOT landed → without
+            // the fix, settled is still false and .md-stream is still mounted.
+            if (isSession) {
+              setTimeout(dispatch, delay);
+              return;
+            }
+            dispatch();
+          },
+          options,
+        );
+      };
+      return es;
+    }
+    LoggingES.prototype = OrigES.prototype;
+    (LoggingES as any).CLOSED = OrigES.CLOSED;
+    (LoggingES as any).OPEN = OrigES.OPEN;
+    (LoggingES as any).CONNECTING = OrigES.CONNECTING;
+    (window as any).EventSource = LoggingES;
+
+    // --- Completion-instant DOM snapshot (identical to installCapture) ---
+    (window as any).__vhCompletionSnap = null;
+    (window as any).__vhCompletionTook = 0;
+    (window as any).__vhSeenBusy = false;
+    const t0 = performance.now();
+    const capture = () => {
+      const wt = document.querySelectorAll(".working-text");
+      if (wt.length > 0) {
+        (window as any).__vhSeenBusy = true;
+        return;
+      }
+      if (!(window as any).__vhSeenBusy) return;
+      if ((window as any).__vhCompletionSnap) return;
+      const msgs = Array.from(document.querySelectorAll(".msg[data-mid]"));
+      const last = msgs[msgs.length - 1] as HTMLElement | undefined;
+      const snap: any = {
+        t: performance.now(),
+        elapsedSinceBoot: performance.now() - t0,
+        msgCount: msgs.length,
+        lastMid: last?.dataset.mid ?? null,
+        streamViewsMounted: document.querySelectorAll(".md-stream").length,
+        settledMdMounted: document.querySelectorAll(".md:not(.md-stream)").length,
+        lastRowText: last ? (last.textContent || "").trim() : null,
+        lastRowHasFinal: last ? !!(last.textContent || "").includes("added a test") : false,
+      };
+      (window as any).__vhCompletionSnap = snap;
+      (window as any).__vhCompletionTook = performance.now() - t0;
+    };
+    const obs = new MutationObserver(() => capture());
+    const start = () => {
+      if (!document.body) {
+        setTimeout(start, 16);
+        return;
+      }
+      obs.observe(document.body, { childList: true, subtree: true });
+      const interval = setInterval(() => {
+        capture();
+        if ((window as any).__vhCompletionSnap) clearInterval(interval);
+      }, 20);
+    };
+    start();
+  }, { sid: session, delay: CROSS_STREAM_RACE_DELAY_MS });
+}
+
+// Deterministic regression guard for the cross-stream completion race. With the
+// session stream deliberately lagging the tree stream, the streaming view MUST
+// still have unmounted at the completion instant — the idle transition settles
+// the last assistant message regardless of which stream wins.
+test("CROSS-STREAM RACE: session stream lags tree stream (activity=idle) — settled still flips at completion instant", async ({ page }) => {
+  await page.setViewportSize(VP);
+  await installCaptureWithStreamRace(page, "other");
+  await page.goto(projectUrl("/?session=other"));
+  await expect(page.locator(".chat-scroll")).toBeVisible({ timeout: 10000 });
+
+  await promptAndComplete(page, "other", "cross-stream-race probe");
+  await expect(page.locator(".working-text")).toBeVisible({ timeout: 8000 });
+  await expect(page.locator(".working-text")).toHaveCount(0, { timeout: 12000 });
+  // Same grace as Test A: lets the MutationObserver callback settle. NOT an
+  // auto-wait on the assertion — the capture is a single synchronous read.
+  await page.waitForTimeout(50);
+
+  const cap = await readCapture(page);
+  const sse = cap.sse || [];
+
+  expect(
+    cap.snap,
+    `completion snapshot never captured (sse events: ${sse.length}; last 5: ${JSON.stringify(sse.slice(-5))})`,
+  ).not.toBeNull();
+  // RED SIGNAL / REGRESSION GUARD: at the completion instant (working-text just
+  // unmounted via the tree stream's activity=idle), the streaming view MUST
+  // already have unmounted too — even though the session stream's completion
+  // events were intentionally delayed by CROSS_STREAM_RACE_DELAY_MS. Pins the
+  // guarantee that an idle transition settles the last assistant message
+  // regardless of cross-stream ordering.
+  expect(
+    cap.snap.streamViewsMounted,
+    `BUG: cross-stream race — .md-stream still mounted at completion instant because the session stream (Stream 2) lost the race to activity=idle (Stream 1); the idle transition did not settle the last assistant message. snap=${JSON.stringify(cap.snap)}`,
+  ).toBe(0);
+
+  console.log(
+    "[cross-stream-race] sse events=" +
+      sse.length +
+      " completionAt=" +
+      (cap.took?.toFixed(0) ?? "?") +
+      "ms streamViews=" +
+      cap.snap.streamViewsMounted +
+      " snap=" +
+      JSON.stringify(cap.snap),
+  );
+});
+
 // === S1 conditions forced: reconnect-during-completion + decode latency + epoch bump ===
 //
 // Mission hypothesis (the "pinned suspect S1 residual"): stream.ts:2186-2198 —
