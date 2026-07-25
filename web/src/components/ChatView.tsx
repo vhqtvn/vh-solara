@@ -1498,13 +1498,27 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       },
     ),
   );
-  // Persist the draft per session as it changes.
-  createEffect(() => {
-    const v = input();
+  // Persist the draft per session as the buffer changes.
+  //
+  // WHY this effect keys off input() ONLY (via on(input, ...)) and NOT
+  // props.sessionId: the draft-restore effect above reloads the target
+  // session's draft into input() on a session switch. If THIS save effect
+  // also depended on props.sessionId, a bare session-switch would re-run it
+  // with the STALE buffer (the previous session's text, before the restore
+  // effect's setInput has taken effect for the new id) under the NEW key —
+  // clobbering the target session's persisted draft with the previous
+  // session's text. On a rapid switch sequence (A->B->A->B, or any browser
+  // timing that interleaves restore-across-sid-changes with save) this
+  // corrupts both slots so neither session's draft restores. Keying off
+  // input() alone means save only fires when the buffer ACTUALLY changes,
+  // by which point restore has already set it to the current session's
+  // draft — so every write lands under the correct, current key. (Regression
+  // test: web/tests/unit/ChatViewDraftPerSession.test.tsx.)
+  createEffect(on(input, (v) => {
     const sid = props.sessionId || "__new__";
     if (v) saveVersioned(draftKey(sid), 1, v);
     else localStorage.removeItem(draftKey(sid));
-  });
+  }));
 
   // In draft mode, materialize the server session on first send; otherwise use
   // the current session id.
