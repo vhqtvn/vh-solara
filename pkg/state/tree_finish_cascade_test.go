@@ -366,3 +366,154 @@ func TestFinishCascade_ErrorTerminalActivityBeforeDelete(t *testing.T) {
 		t.Errorf("ORDER (error): terminal KindActivity seq=%d must precede KindSessionDelete seq=%d", actSeq, delSeq)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// BUSY-SIBLING carve-out guard — the error-delete branch MUST NOT touch
+// busyCount[root]. Dedicated regression guard for the F2 deferred-fix
+// carve-out: the deliberate SEPARATE else-if at store.go:1938-1964, NOT a
+// widening of the outer `if a == ActivityBusy || a == ActivityRetry` at
+// store.go:1908. Error never contributed to busyCount — the
+// setActivityAtLocked chokepoint at store.go:1351-1352 only flags
+// {Busy, Retry} (an idle→error transition has wasBusy=false AND isBusy=false,
+// a busy-neutral no-op on busyCount) — so decrementing on an error delete
+// would corrupt the count for a busy sibling sharing the root and
+// under-report RunningRoots().
+//
+// The realistic regression this guards: someone widens line 1908 to
+// `|| a == ActivityError` and drops the separate else-if emit → an error
+// delete wrongly decrements busyCount[root] of a busy sibling. That
+// regression is ONLY observable when a busy sibling exists under the same
+// root — the existing error-delete tests above use a single error child
+// whose busyCount was already 0, so the `>0` floor at store.go:1911 absorbs
+// any spurious decrement and they would NOT catch it.
+// ---------------------------------------------------------------------------
+
+// TestFinishCascade_ErrorDeletePreservesBusySiblingRootCount guards the
+// load-bearing invariant that an ERROR subsession delete does NOT touch
+// busyCount[root]. Setup: root R has TWO children — a BUSY child B (so
+// busyCount["R"]==1 via the setActivityAtLocked chokepoint) and an ERROR
+// child C (seeded via session.error; NOT session.status type:"error", which
+// normalizeActivity maps to idle). Deleting C must:
+//  1. leave busyCount["R"] at 1 (and RunningRoots()==1) — the error branch
+//     is a separate else-if precisely so it skips the busyCount decrement;
+//     a widening of the outer if to `|| a == ActivityError` would wrongly
+//     drop busyCount["R"] to 0 here.
+//  2. still emit exactly one terminal KindActivity(C, idle) preceding
+//     KindSessionDelete(C) — re-confirms the G1 fix holds in the
+//     busy-sibling scenario.
+//
+// This test FAILS if the outer if at store.go:1908 is widened to
+// `|| a == ActivityError` and the separate else-if emit is dropped:
+// assertion (1) would then observe busyCount["R"]==0 (the busy sibling's
+// count stolen by the errored sibling's delete).
+func TestFinishCascade_ErrorDeletePreservesBusySiblingRootCount(t *testing.T) {
+	s := New(100)
+	// Root R with a BUSY child B and an ERROR child C. B going busy drives
+	// busyCount["R"] to 1 through the setActivityAtLocked chokepoint; C's
+	// idle→error transition is busy-neutral (error not in {Busy, Retry}).
+	applySeq(t, s,
+		[2]string{"session.created", evSessionCreated("R", "")},
+		[2]string{"session.created", evSessionCreated("B", "R")},
+		[2]string{"session.created", evSessionCreated("C", "R")},
+		[2]string{"session.status", evStatus("B", "busy")},
+		[2]string{"session.error", evError("C")},
+	)
+
+	// Sanity: the seeded activities and the pre-delete busyCount.
+	s.mu.RLock()
+	bAct := s.activity["B"]
+	cAct := s.activity["C"]
+	preBusy := s.busyCount["R"]
+	s.mu.RUnlock()
+	if bAct != ActivityBusy {
+		t.Fatalf("setup invariant: s.activity[B]=%q, want %q", bAct, ActivityBusy)
+	}
+	if cAct != ActivityError {
+		t.Fatalf("setup invariant: s.activity[C]=%q, want %q", cAct, ActivityError)
+	}
+	if preBusy != 1 {
+		t.Fatalf("setup invariant: s.busyCount[R]=%d, want 1 (busy sibling B)", preBusy)
+	}
+	if got := s.RunningRoots(); got != 1 {
+		t.Fatalf("setup invariant: RunningRoots()=%d, want 1", got)
+	}
+
+	ch, unsub := s.Subscribe(256)
+	defer unsub()
+	drainAll(ch)
+
+	// The load-bearing moment: archive/remove the ERROR child while a BUSY
+	// sibling B lives under the same root R.
+	s.RemoveSessions([]string{"C"})
+
+	// (1) busyCount["R"] MUST still be 1. This is the carve-out's whole
+	// purpose: error never contributed to busyCount on entry (the
+	// setActivityAtLocked chokepoint only flags {Busy, Retry}), so it must
+	// not decrement on exit. A widening of the outer if to
+	// `|| a == ActivityError` would steal the busy sibling's count here
+	// (busyCount["R"]==0) and RunningRoots() would under-report R as idle.
+	s.mu.RLock()
+	postBusy := s.busyCount["R"]
+	postBAct := s.activity["B"]
+	_, cStillPresent := s.activity["C"]
+	s.mu.RUnlock()
+	if postBusy != 1 {
+		t.Errorf("CARVE-OUT: error delete of C must NOT decrement busyCount[R]; "+
+			"got %d, want 1 (busy sibling B still running). A widening of the outer "+
+			"if at store.go:1908 to `|| a == ActivityError` corrupts the busy "+
+			"sibling's count and under-reports RunningRoots().", postBusy)
+	}
+	if postBAct != ActivityBusy {
+		t.Errorf("CARVE-OUT: busy sibling B must be undisturbed; s.activity[B]=%q, want %q", postBAct, ActivityBusy)
+	}
+	if cStillPresent {
+		t.Errorf("CARVE-OUT: s.activity[C] must be deleted (C is gone)")
+	}
+	if got := s.RunningRoots(); got != 1 {
+		t.Errorf("CARVE-OUT: RunningRoots()=%d, want 1 (busy sibling B keeps R running)", got)
+	}
+
+	// (2) Cheap re-confirmation of the G1 fix in the busy-sibling scenario:
+	// exactly one terminal KindActivity(C, idle) and it precedes
+	// KindSessionDelete(C) in seq order.
+	all := drainAll(ch)
+	var actSeq, delSeq uint64
+	var actFound, delFound bool
+	var actCount int
+	for _, ev := range all {
+		switch ev.Kind {
+		case KindActivity:
+			var p struct {
+				SessionID string `json:"sessionID"`
+				State     string `json:"state"`
+			}
+			if json.Unmarshal(ev.Payload, &p) != nil || p.SessionID != "C" {
+				continue
+			}
+			actCount++
+			actSeq = ev.Seq
+			actFound = true
+			if p.State != ActivityIdle {
+				t.Errorf("CARVE-OUT: terminal KindActivity(C) state=%q, want %q (idle)", p.State, ActivityIdle)
+			}
+		case KindSessionDelete:
+			var p struct {
+				ID string `json:"id"`
+			}
+			if json.Unmarshal(ev.Payload, &p) != nil || p.ID != "C" {
+				continue
+			}
+			delSeq = ev.Seq
+			delFound = true
+		}
+	}
+	if actCount != 1 {
+		t.Errorf("CARVE-OUT: expected exactly one terminal KindActivity for C; got %d (events=%v)", actCount, all)
+	}
+	if !delFound {
+		t.Errorf("CARVE-OUT: KindSessionDelete for C must still emit (node pruned from tree); events=%v", all)
+	}
+	if actFound && delFound && actSeq >= delSeq {
+		t.Errorf("CARVE-OUT: terminal KindActivity(C) seq=%d must precede KindSessionDelete(C) seq=%d", actSeq, delSeq)
+	}
+}
