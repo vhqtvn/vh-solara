@@ -27,6 +27,8 @@ import {
   modeOf,
   treeMap,
   resetTreeStore,
+  applyTreeOpStore,
+  treeModeMapSignal,
 } from "../../src/sync/treeState";
 import { switchProject } from "../../src/sync/actions";
 import type { TreeNode } from "../../src/sync/treeMap";
@@ -242,5 +244,119 @@ describe("resyncTree — P0-E atomic swap (no empty frame, preserve userExpanded
 
     expect(treeMap().size).toBe(0);
     expect(modeOf("a")).toBe("filtered");
+  });
+});
+
+// P0-F — auto-mutation across same-project snapshot resync.
+//
+// seedTreeStore replaces the whole flat map on every tree.snapshot (the resync
+// path). For ids present in BOTH the old and new resident maps, the old→new
+// working() transition drives the auto-mutation (collapsed+idle→working promoted
+// to filtered; filtered+working→idle demoted to collapsed). First-appearance
+// ids are baselines (no edge). Ids absent from the replacement are not mutated.
+// A project reset clears the map so the next seed does NOT compare against the
+// previous project. And a pending pre-resync op candidate is invalidated
+// (generation bump) so it cannot overwrite the post-resync state.
+describe("resyncTree — auto-mutation across snapshot replacement", () => {
+  function node(overrides: Partial<TreeNode> = {}): TreeNode {
+    return {
+      id: "a",
+      parentId: null,
+      title: "A",
+      activity: "idle",
+      childCount: 0,
+      loaded: true,
+      flags: {
+        pendingInput: false,
+        subtreeNeedsInput: false,
+        permission: false,
+        archived: false,
+        orphan: false,
+      },
+      updatedMs: 1,
+      ...overrides,
+    };
+  }
+
+  it("same-project resync promotes a collapsed+idle node that became working (false→true)", () => {
+    // First snapshot: a is idle → cold-normalized to explicit collapsed.
+    seedTreeStore([node({ id: "a" })]);
+    expect(modeOf("a")).toBe("collapsed");
+    // Resync snapshot: a is now working (subtreeBusy rollup). a was resident in
+    // the old map → the false→true edge fires against its persisted collapsed →
+    // promoted to filtered, synchronously (before the version is exposed).
+    seedTreeStore([node({ id: "a", flags: { ...node().flags, subtreeBusy: true } })]);
+    expect(modeOf("a")).toBe("filtered");
+  });
+
+  it("same-project resync collapses a filtered+working node that became idle (true→false)", () => {
+    // First snapshot: a is working; set explicit filtered so the demotion edge
+    // can fire against it.
+    seedTreeStore([node({ id: "a", flags: { ...node().flags, subtreeBusy: true } })]);
+    setNodeMode("a", "filtered");
+    expect(modeOf("a")).toBe("filtered");
+    // Resync snapshot: a is now idle. a was resident → true→false edge on
+    // persisted filtered → demoted to collapsed.
+    seedTreeStore([node({ id: "a" })]);
+    expect(modeOf("a")).toBe("collapsed");
+  });
+
+  it("first-appearance ids in the replacement are baselines (no transition)", () => {
+    // First snapshot: only a.
+    seedTreeStore([node({ id: "a" })]);
+    // Resync introduces a NEW working id "b" (not in the old map). It is a
+    // baseline → no false→true edge fires → left absent (working+absent stays
+    // absent so modeOf returns the filtered fallback, NOT an explicit entry).
+    seedTreeStore([
+      node({ id: "a" }),
+      node({ id: "b", flags: { ...node().flags, subtreeBusy: true } }),
+    ]);
+    expect(modeOf("b")).toBe("filtered"); // absent-fallback, not an explicit write
+    expect(Object.prototype.hasOwnProperty.call(treeModeMapSignal(), "b")).toBe(false);
+  });
+
+  it("ids absent from the replacement are not mutated (persisted entry survives)", () => {
+    // a and b both resident; give b an explicit persisted entry.
+    seedTreeStore([node({ id: "a" }), node({ id: "b" })]);
+    setNodeMode("b", "expanded");
+    // Resync snapshot drops b (not resident in the replacement). b's persisted
+    // expanded entry is NOT mutated — non-resident entries are ignored by the
+    // resync (preserved for when b reappears).
+    seedTreeStore([node({ id: "a" })]);
+    expect(modeOf("b")).toBe("expanded");
+  });
+
+  it("a project reset does NOT compare nodes against the previous project", () => {
+    // Project A: "shared" is idle → collapsed, then manually promoted to filtered.
+    seedTreeStore([node({ id: "shared" })]);
+    expect(modeOf("shared")).toBe("collapsed");
+    setNodeMode("shared", "filtered");
+    // Project switch: resetTreeStore clears the map + modes + invalidates the
+    // queue (generation bump).
+    resetTreeStore();
+    // Project B: re-introduce "shared" as WORKING. Because the map was cleared,
+    // "shared" is NOT in oldMap → baseline (no transition). It is left absent
+    // (filtered fallback), NOT auto-promoted from the prior project's filtered.
+    seedTreeStore([node({ id: "shared", flags: { ...node().flags, subtreeBusy: true } })]);
+    expect(Object.prototype.hasOwnProperty.call(treeModeMapSignal(), "shared")).toBe(false);
+    expect(modeOf("shared")).toBe("filtered"); // absent-fallback, not a write
+  });
+
+  it("a pending pre-resync op candidate cannot overwrite the post-resync state", async () => {
+    // Snapshot: a idle → collapsed.
+    seedTreeStore([node({ id: "a" })]);
+    expect(modeOf("a")).toBe("collapsed");
+    // An op flips a working false→true → enqueues a candidate (a: collapsed→
+    // filtered) at generation G. The microtask flush is pending.
+    applyTreeOpStore({ op: "node.facet", data: { id: "a", flags: { subtreeBusy: true } } });
+    // Resync with a snapshot where a is IDLE: seedTreeStore invalidates the queue
+    // (bumps generation to G+1, clears the candidate map) and, since a was busy
+    // in oldMap but idle in the replacement (true→false on persisted collapsed is
+    // a no-op), produces no change for a.
+    seedTreeStore([node({ id: "a" })]);
+    // Let the pending microtask run: the candidate map is empty (cleared by the
+    // invalidate) → flush writes nothing → the stale candidate does NOT promote a.
+    await Promise.resolve();
+    expect(modeOf("a")).toBe("collapsed");
   });
 });

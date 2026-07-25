@@ -21,6 +21,8 @@ import {
   resetExpandedForTest,
   modeOf,
   setNodeMode,
+  applyTreeOpStore,
+  hasUserToggled,
 } from "../../src/sync/treeState";
 import { setSelectedIdRaw } from "../../src/sync/store";
 import { setSelectedId } from "../../src/sync/actions";
@@ -235,16 +237,18 @@ describe("userToggled — clicking a temp ancestor promotes it (temp → filtere
     ]);
     setSelectedIdRaw("LEAF");
     let { container } = render(() => <SessionTree />);
-    // Before click: ROOT is temp (eye glyph).
+    // Before click: ROOT is temp (eye glyph). Its persisted mode is cold-normalized
+    // to collapsed (idle root, no explicit entry); the temp overlay is computed
+    // from the selection path and shows the eye regardless of the persisted mode.
     expect(twistyFor(container as unknown as HTMLElement, "ROOT").querySelector("span.twisty-temp")).not.toBeNull();
-    expect(modeOf("ROOT")).toBe("filtered"); // persisted unchanged
+    expect(modeOf("ROOT")).toBe("collapsed"); // cold-norm materialized the idle root
 
     clickTwisty(container as unknown as HTMLElement, "ROOT");
 
-    // After click: ROOT is persisted-filtered (unchanged value) BUT now toggled,
-    // so effectiveTreeMode returns the persisted "filtered" instead of temp → the
-    // eye is gone (chevron renders). The persisted mode survived; the overlay was
-    // promoted by the click.
+    // After click: a temp-node click promotes it (temp → filtered + cascade).
+    // ROOT's persisted mode goes collapsed → filtered; the click also marks it
+    // toggled, so effectiveTreeMode returns the persisted "filtered" instead of
+    // temp → the eye is gone (chevron renders).
     expect(modeOf("ROOT")).toBe("filtered");
     expect(twistyFor(container as unknown as HTMLElement, "ROOT").querySelector("span.twisty-temp")).toBeNull();
     cleanup();
@@ -269,5 +273,130 @@ describe("userToggled — clicking a temp ancestor promotes it (temp → filtere
     setSelectedId("OTHER");
     setSelectedId("LEAF");
     expect(twistyFor(container as unknown as HTMLElement, "ROOT").querySelector("span.twisty-temp")).not.toBeNull();
+  });
+});
+
+// auto-mutation — temp/userToggled independence.
+//
+// Auto-mutation touches ONLY the persisted mode. A finishing selected-ancestor
+// keeps showing temp/eye (overlay) until selection changes — auto-demoting its
+// persisted filtered→collapsed does NOT collapse the eye, because temp is
+// computed from the selection path, not the persisted mode. userToggled is never
+// marked/cleared by auto-mutation. After selection changes, the new persisted
+// collapsed becomes visible. A manually user-toggled ancestor follows the
+// existing overlay rules independently of auto-mutation.
+describe("auto-mutation — temp/userToggled independence", () => {
+  //   ROOT (root, idle) — set explicit expanded so A renders even after the
+  //   │     selection leaves A's subtree (otherwise ROOT collapses and A's row
+  //   │     disappears, making the glyph unobservable).
+  //   └─ A (starts WORKING + explicit filtered; the ancestor under test)
+  //      └─ LEAF ← selected (A is a strict ancestor → A is effectively temp)
+  //   OTHER (a separate root; the selection-change target)
+  function ancestorChain(): TreeNode[] {
+    return [
+      node({ id: "ROOT", title: "root", childCount: 1, descendantCount: 2, loaded: true }),
+      node({
+        id: "A",
+        parentId: "ROOT",
+        title: "a",
+        childCount: 1,
+        descendantCount: 1,
+        loaded: true,
+        activity: "busy",
+      }),
+      node({ id: "LEAF", parentId: "A", title: "leaf" }),
+      node({ id: "OTHER", title: "other", childCount: 0, loaded: true }),
+    ];
+  }
+
+  it("a selected ancestor is effectively temp (eye) while working", () => {
+    seedTreeStore(ancestorChain());
+    // A starts working (busy); cold-norm leaves it absent (filtered fallback).
+    // Set explicit filtered so the later demotion edge can fire against it.
+    setNodeMode("ROOT", "expanded");
+    setNodeMode("A", "filtered");
+    setSelectedIdRaw("LEAF");
+    const { container } = render(() => <SessionTree />);
+    // A is a strict ancestor of LEAF, persisted filtered, not toggled → temp.
+    expect(twistyFor(container as unknown as HTMLElement, "A").querySelector("span.twisty-temp")).not.toBeNull();
+    expect(modeOf("A")).toBe("filtered");
+  });
+
+  it("a working→idle edge demotes persisted filtered→collapsed but the effective state stays temp (eye)", async () => {
+    seedTreeStore(ancestorChain());
+    setNodeMode("ROOT", "expanded");
+    setNodeMode("A", "filtered");
+    setSelectedIdRaw("LEAF");
+    const { container } = render(() => <SessionTree />);
+    // A is temp (eye) while working + filtered.
+    expect(twistyFor(container as unknown as HTMLElement, "A").querySelector("span.twisty-temp")).not.toBeNull();
+
+    // Store ingestion: A flips working true→false (activity busy→idle).
+    applyTreeOpStore({ op: "node.facet", data: { id: "A", activity: "idle" } });
+    await new Promise((r) => setTimeout(r, 0)); // flush the candidate
+
+    // Persisted mode auto-demoted filtered→collapsed.
+    expect(modeOf("A")).toBe("collapsed");
+    // BUT A is still a strict ancestor of the selected LEAF → effectiveTreeMode
+    // returns temp regardless of the persisted collapse. The eye stays (no flicker).
+    expect(twistyFor(container as unknown as HTMLElement, "A").querySelector("span.twisty-temp")).not.toBeNull();
+  });
+
+  it("auto-mutation does NOT add/remove/clear userToggled", async () => {
+    seedTreeStore(ancestorChain());
+    setNodeMode("ROOT", "expanded");
+    setNodeMode("A", "filtered");
+    setSelectedIdRaw("LEAF");
+    render(() => <SessionTree />);
+    expect(hasUserToggled("A")).toBe(false);
+
+    applyTreeOpStore({ op: "node.facet", data: { id: "A", activity: "idle" } });
+    await new Promise((r) => setTimeout(r, 0));
+
+    // The auto-demote touched ONLY the persisted mode — userToggled is untouched.
+    expect(hasUserToggled("A")).toBe(false);
+    expect(modeOf("A")).toBe("collapsed");
+  });
+
+  it("after selection changes, the new persisted collapsed becomes visible (eye gone)", async () => {
+    seedTreeStore(ancestorChain());
+    setNodeMode("ROOT", "expanded");
+    setNodeMode("A", "filtered");
+    setSelectedIdRaw("LEAF");
+    const { container } = render(() => <SessionTree />);
+    applyTreeOpStore({ op: "node.facet", data: { id: "A", activity: "idle" } });
+    await new Promise((r) => setTimeout(r, 0));
+    // While LEAF is selected, A is temp (eye) despite persisted collapsed.
+    expect(twistyFor(container as unknown as HTMLElement, "A").querySelector("span.twisty-temp")).not.toBeNull();
+
+    // Select a node NOT under A (OTHER is a separate root). A is no longer a
+    // strict ancestor → effective = persisted collapsed → the eye is gone
+    // (collapsed chevron). ROOT is expanded (persisted) so A's row still renders.
+    setSelectedId("OTHER");
+    expect(twistyFor(container as unknown as HTMLElement, "A").querySelector("span.twisty-temp")).toBeNull();
+    expect(modeOf("A")).toBe("collapsed");
+  });
+
+  it("a manually user-toggled ancestor follows the existing overlay rules (auto-mutation independent)", async () => {
+    seedTreeStore(ancestorChain());
+    setNodeMode("ROOT", "expanded");
+    setNodeMode("A", "filtered");
+    setSelectedIdRaw("LEAF");
+    const { container } = render(() => <SessionTree />);
+    // Click A → temp→filtered+cascade; A is now toggled, so effective reflects
+    // the persisted filtered (chevron), not temp (eye).
+    clickTwisty(container as unknown as HTMLElement, "A");
+    expect(hasUserToggled("A")).toBe(true);
+    expect(modeOf("A")).toBe("filtered");
+    expect(twistyFor(container as unknown as HTMLElement, "A").querySelector("span.twisty-temp")).toBeNull();
+
+    // Now flip A working→idle. Persisted filtered→collapsed (auto-demote). The
+    // toggled state survives (auto-mutation never clears it); effective reflects
+    // the persisted collapsed (not temp).
+    applyTreeOpStore({ op: "node.facet", data: { id: "A", activity: "idle" } });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(modeOf("A")).toBe("collapsed");
+    expect(hasUserToggled("A")).toBe(true); // survived the auto-demote
+    expect(twistyFor(container as unknown as HTMLElement, "A").querySelector("span.twisty-temp")).toBeNull();
   });
 });

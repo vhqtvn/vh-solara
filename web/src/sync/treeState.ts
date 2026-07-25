@@ -28,6 +28,11 @@ import {
   type TreeOp,
 } from "./treeMap";
 import { loadVersioned, saveVersioned } from "../lib/store";
+// VALUE imports from treeSelectors are SAFE here: treeSelectors imports from
+// treeState only as TYPE (`import type { TreeMode }`), so there is no runtime
+// circular dependency. We pull the single working() predicate + the pure
+// transition helper so ingestion can detect working edges.
+import { working, autoTreeModeForWorkingTransition } from "./treeSelectors";
 
 // Module-authority flat map. Mutated IN PLACE by the mutators; the `version`
 // signal is what notifies Solid (the "mutable + version" pattern). Readers MUST
@@ -169,6 +174,39 @@ export function setNodesMode(ids: Iterable<string>, mode: TreeMode): void {
   saveVersioned(LS_MODE, 1, next);
 }
 
+// MIXED-MODE multi-node set: like setNodesMode but each id carries its OWN target
+// mode. This is the primitive for the auto-mutation flush + the cold-load
+// normalization merge, where one batch may set some ids to "collapsed" and others
+// to "filtered" in a SINGLE immutable replacement. Starts from the current record,
+// applies every non-stale actual change (skips an id already holding the requested
+// explicit value), and — if at least one id actually changed — performs ONE
+// setTreeModeMap + ONE saveVersioned. If nothing changed, it neither writes the
+// signal NOR localStorage (no-op batch produces no persistence write).
+//
+// Do NOT loop over setNodeMode here — that would be N writes + N signal emissions.
+// This is the ONE-write primitive the auto-mutation flush routes through.
+export function setNodeModes(changes: ReadonlyMap<string, TreeMode>): void {
+  if (changes.size === 0) return;
+  const cur = treeModeMap();
+  let next: TreeModeMap | null = null;
+  for (const [id, mode] of changes) {
+    if (cur[id] === mode) continue; // already holds the explicit value — stale
+    if (!next) next = { ...cur };
+    next[id] = mode;
+  }
+  if (!next) return; // every entry was already current — no write, no notify
+  setTreeModeMap(next);
+  saveVersioned(LS_MODE, 1, next);
+}
+
+// Is `id` carrying an EXPLICIT persisted mode entry (as opposed to falling back
+// to the implicit "filtered" default via modeOf())? Cold-load normalization keys
+// on OWN-entry presence — NOT on modeOf(id)==="filtered", which conflates an
+// explicit filtered choice with the absent-fallback.
+function hasExplicitMode(id: string): boolean {
+  return Object.prototype.hasOwnProperty.call(treeModeMap(), id);
+}
+
 // ---- transient userToggled (NOT persisted) ----------------------------------
 // The set of node ids the user CLICKED (the twisty) since the last real
 // selection change. It suppresses the "temp" overlay on a clicked ancestor so a
@@ -229,6 +267,91 @@ export function expandedButUnloadedIds(): string[] {
   return out;
 }
 
+// ---- auto-mutation candidate queue (guarded microtask aggregator) ------------
+// Tree-op application enqueues GENUINE working() edges here instead of mutating
+// modes inline. The flush is deferred to a single microtask so that:
+//   - a batch of ops in one stream tick coalesces into ONE setNodeModes call
+//     (ONE signal update + ONE localStorage write, regardless of candidate count);
+//   - rapid reversals (false→true→false in one tick) dedupe to the LATEST
+//     validated candidate per id (Map keyed by id, last write wins); and
+//   - a manual click / opposite edge / reset / removal that lands BETWEEN queue
+//     and flush can INVALIDATE a stale candidate at revalidation time.
+//
+// GENERATION: a monotonic counter bumped by every seed/reset (snapshot
+// replacement or project switch). A candidate records the generation it was
+// enqueued under; flush drops any candidate whose generation no longer matches
+// the current store generation, so an op queued against a stale snapshot can
+// never mutate the replacement snapshot.
+interface AutoModeCandidate {
+  id: string;
+  expectedSourceMode: TreeMode; // the persisted mode the decision was based on
+  expectedWorking: boolean; // the destination working() state it must still hold
+  targetMode: TreeMode; // the auto-mutation target ("filtered" | "collapsed")
+  generation: number; // store generation at enqueue time
+}
+let queueGeneration = 0;
+let pendingCandidates = new Map<string, AutoModeCandidate>();
+let flushScheduled = false;
+
+// Bump generation + clear the candidate map. Leaves `flushScheduled` as-is: an
+// already-scheduled microtask becomes a harmless no-op (it sees an empty map at
+// the bumped generation and writes nothing), while new post-invalidation
+// candidates reuse the scheduled flush. Called by seedTreeStore (snapshot
+// replacement) and the reset hooks (project switch / test reset) so a stale
+// queued op can never mutate a fresh snapshot / a different project's tree.
+function invalidateAutoQueue(): void {
+  queueGeneration = (queueGeneration + 1) & 0x3fffffff;
+  pendingCandidates = new Map();
+}
+
+// Enqueue (or replace) a candidate keyed by id. The Map keeps the LATEST entry
+// per id, so a rapid false→true→false in one tick reduces to the final validated
+// state (never applies a stale first edge). Schedules a single microtask flush
+// if one is not already pending. Revalidation happens at flush time, so enqueuing
+// is unconditional — a candidate that will be stale by flush is dropped there.
+function enqueueAutoModeCandidate(
+  id: string,
+  expectedSourceMode: TreeMode,
+  expectedWorking: boolean,
+  targetMode: TreeMode,
+): void {
+  pendingCandidates.set(id, {
+    id,
+    expectedSourceMode,
+    expectedWorking,
+    targetMode,
+    generation: queueGeneration,
+  });
+  if (!flushScheduled) {
+    flushScheduled = true;
+    queueMicrotask(flushAutoModeQueue);
+  }
+}
+
+// Flush: revalidate every candidate against current ground truth, then route
+// survivors through ONE setNodeModes. A candidate is dropped if ANY of:
+//   - its generation no longer matches (a seed/reset replaced the snapshot);
+//   - the node is no longer resident (a remove/archive landed between queue+flush);
+//   - working(node) no longer equals expectedWorking (the edge reversed again, or
+//     a subsequent op changed the rollup);
+//   - the persisted mode no longer equals expectedSourceMode (a manual click or
+//     an opposite-edge flush already changed it).
+function flushAutoModeQueue(): void {
+  flushScheduled = false;
+  const gen = queueGeneration;
+  const survivors = new Map<string, TreeMode>();
+  for (const c of pendingCandidates.values()) {
+    if (c.generation !== gen) continue; // stale snapshot
+    const node = map.get(c.id);
+    if (!node) continue; // removed between queue+flush
+    if (working(node) !== c.expectedWorking) continue; // edge reversed / changed
+    if (treeModeMap()[c.id] !== c.expectedSourceMode) continue; // manual click / opp edge
+    survivors.set(c.id, c.targetMode);
+  }
+  pendingCandidates = new Map();
+  if (survivors.size > 0) setNodeModes(survivors);
+}
+
 // Test reset: clear the in-memory mode map + userToggled (mirrors the fresh-load
 // default). Persists NOTHING — localStorage is left untouched so this doubles as
 // the "simulate page reload" primitive (a reload loses the Solid signals but
@@ -237,6 +360,7 @@ export function expandedButUnloadedIds(): string[] {
 export function resetExpandedForTest(): void {
   setTreeModeMap({});
   setUserToggled(new Set<string>());
+  invalidateAutoQueue();
 }
 
 // Test helper: re-run the module-init load against the current localStorage.
@@ -293,15 +417,112 @@ export function treeChildrenOf(parentId: string): TreeNode[] {
 // version so tracked readers re-run. No inference, no reconciliation.
 
 // §7.1 seed from the initial snapshot: replace the whole map.
+//
+// COLD-LOAD NORMALIZATION + TRANSITION-DRIVEN AUTO-MUTATION (merged into ONE
+// synchronous mixed-mode update BEFORE the tree version is exposed — no first-
+// paint flash). For each resident node in the INCOMING snapshot:
+//   - if the id was RESIDENT in the PREVIOUS map (a known node), compute the old
+//     →new working() transition against its CURRENT persisted mode and collect
+//     the qualifying edge decision (false→true+collapsed→filtered, or
+//     true→false+filtered→collapsed); any other combination is a no-op.
+//   - if the id is NEW (not in the previous map → a baseline, no edge fires) and
+//     has NO explicit persisted mode entry: an idle node is materialized as
+//     explicit "collapsed" (so a fresh idle branch renders collapsed by default);
+//     a working node is left ABSENT so modeOf() returns the implicit "filtered"
+//     fallback (so its working children reveal immediately).
+// Explicit persisted entries (collapsed/filtered/expanded) are always preserved,
+// subject only to a genuine transition edge. IDs persisted but not resident in
+// the snapshot are ignored. The complete change set is applied via ONE
+// setNodeModes (ONE signal update + ONE localStorage write) BEFORE bump().
+//
+// Same-project resync compares against the retained pre-snapshot resident map
+// (oldMap). The queue is invalidated (generation bumped + candidates cleared) so
+// a pending pre-seed op candidate cannot mutate the replacement snapshot.
 export function seedTreeStore(nodes: TreeNode[]): void {
-  map = seedTree(nodes);
+  const oldMap = map;
+  const newMap = seedTree(nodes);
+  const changes = new Map<string, TreeMode>();
+  for (const [id, newNode] of newMap) {
+    const oldNode = oldMap.get(id);
+    if (oldNode) {
+      // Already-known node: genuine transition edge (may be undefined → no-op).
+      const prevWorking = working(oldNode);
+      const curWorking = working(newNode);
+      const persisted = modeOf(id);
+      const target = autoTreeModeForWorkingTransition(prevWorking, curWorking, persisted);
+      if (target) changes.set(id, target);
+    } else {
+      // New id (baseline): cold-normalize absent idle → explicit collapsed.
+      // Working + absent stays absent (implicit filtered fallback).
+      if (!hasExplicitMode(id) && !working(newNode)) changes.set(id, "collapsed");
+    }
+  }
+  map = newMap;
+  setNodeModes(changes); // no-op (no write, no notify) if changes is empty
+  invalidateAutoQueue();
   bump();
 }
 
 // §7.2 apply a single server op verbatim (upsert/remove/move/children/facet).
+//
+// TRANSITION-DRIVEN AUTO-MUTATION (enqueued, not inline): after applying the op,
+// for each id it INTRODUCED/CHANGED (the op payload boundary — NOT a whole-map
+// scan), compare before/after working() for ids present on BOTH sides and enqueue
+// a genuine edge decision through the guarded microtask aggregator (which
+// coalesces, dedupes, revalidates, and flushes in ONE setNodeModes per tick).
+// Newly-introduced ids are baselines: absent+idle → explicit collapsed (cold
+// rule, applied synchronously here, not queued); absent+working → implicit
+// filtered (left absent); no transition.
+//
+// affectedIdsOfOp extracts the op payload boundary: upsert→[node.id];
+// remove→[] (removed ids drop, no transition possible — descendants removed by
+// node.remove's loadedDescendants drop are also gone); move→[id];
+// children→[parentId, ...child ids]; facet→[id]. A multi-node children op thus
+// inspects the parent (loaded flip) AND each merged child.
 export function applyTreeOpStore(op: TreeOp): void {
+  const affectedIds = affectedIdsOfOp(op);
+  const before = new Map<string, TreeNode | undefined>();
+  for (const id of affectedIds) before.set(id, map.get(id));
   applyOp(map, op);
+  const coldChanges = new Map<string, TreeMode>();
+  for (const id of affectedIds) {
+    const after = map.get(id);
+    if (!after) continue; // removed by the op (e.g. node.remove) — no transition
+    const prev = before.get(id);
+    if (prev) {
+      const prevWorking = working(prev);
+      const curWorking = working(after);
+      if (prevWorking === curWorking) continue; // no edge
+      const persisted = modeOf(id);
+      const target = autoTreeModeForWorkingTransition(prevWorking, curWorking, persisted);
+      if (target) {
+        enqueueAutoModeCandidate(id, persisted, curWorking, target);
+      }
+    } else {
+      // Newly-introduced id (baseline): absent idle → explicit collapsed.
+      if (!hasExplicitMode(id) && !working(after)) coldChanges.set(id, "collapsed");
+    }
+  }
+  if (coldChanges.size > 0) setNodeModes(coldChanges);
   bump();
+}
+
+// The ids an op INTRODUCES/CHANGES — the minimal set applyTreeOpStore must
+// inspect for a working() transition or cold-normalization. Derived purely from
+// the op payload shape (no map walk).
+function affectedIdsOfOp(op: TreeOp): string[] {
+  switch (op.op) {
+    case "node.upsert":
+      return [op.data.node.id];
+    case "node.remove":
+      return []; // removed ids (and their loaded descendants) drop — no transition
+    case "node.move":
+      return [op.data.id];
+    case "node.children":
+      return [op.data.parentId, ...op.data.nodes.map((n) => n.id)];
+    case "node.facet":
+      return [op.data.id];
+  }
 }
 
 // Eager client-side archive drop: remove a node + its loaded descendants BEFORE
@@ -359,5 +580,6 @@ export function resetTreeStore(): void {
   setTreeModeMap({});
   saveVersioned(LS_MODE, 1, {});
   setUserToggled(new Set<string>());
+  invalidateAutoQueue(); // drop any candidates from the prior project/session-tree
   bump();
 }

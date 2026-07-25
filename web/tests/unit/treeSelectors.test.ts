@@ -18,6 +18,7 @@ import {
   working,
   effectiveTreeMode,
   hasKnownDescendants,
+  autoTreeModeForWorkingTransition,
 } from "../../src/sync/treeSelectors";
 
 function node(overrides: Partial<TreeNode> = {}): TreeNode {
@@ -322,5 +323,46 @@ describe("hasKnownDescendants — lazy-frontier fetch gate", () => {
     const n = node({ childCount: 0 });
     delete (n as Partial<TreeNode>).descendantCount;
     expect(hasKnownDescendants(n)).toBe(false);
+  });
+});
+
+// autoTreeModeForWorkingTransition — the qualified auto-mutation decision. PURE:
+// takes only the transition + current PERSISTED mode, returns the target mode for
+// the two qualifying edges or undefined (no-op) for everything else.
+describe("autoTreeModeForWorkingTransition — qualified transition table", () => {
+  // The two QUALIFYING edges (the only cases that auto-mutate the persisted mode):
+  it("false→true on collapsed → 'filtered' (running reveals working children)", () => {
+    expect(autoTreeModeForWorkingTransition(false, true, "collapsed")).toBe("filtered");
+  });
+  it("true→false on filtered → 'collapsed' (finished hides now-idle children)", () => {
+    expect(autoTreeModeForWorkingTransition(true, false, "filtered")).toBe("collapsed");
+  });
+
+  // The SIX no-op combinations (return undefined):
+  it("false→false on collapsed → undefined (steady idle, no edge)", () => {
+    expect(autoTreeModeForWorkingTransition(false, false, "collapsed")).toBeUndefined();
+  });
+  it("false→false on filtered → undefined (manual filtered stays filtered)", () => {
+    expect(autoTreeModeForWorkingTransition(false, false, "filtered")).toBeUndefined();
+  });
+  it("true→true on collapsed → undefined (already-stale, not an edge; explicit collapsed held)", () => {
+    expect(autoTreeModeForWorkingTransition(true, true, "collapsed")).toBeUndefined();
+  });
+  it("true→true on filtered → undefined (steady working, no edge)", () => {
+    expect(autoTreeModeForWorkingTransition(true, true, "filtered")).toBeUndefined();
+  });
+  it("false→true on filtered → undefined (already filtered, do not double-set)", () => {
+    expect(autoTreeModeForWorkingTransition(false, true, "filtered")).toBeUndefined();
+  });
+  it("true→false on collapsed → undefined (already collapsed, do not double-set)", () => {
+    expect(autoTreeModeForWorkingTransition(true, false, "collapsed")).toBeUndefined();
+  });
+
+  // expanded is NEVER auto-changed — every expanded combination returns undefined:
+  it("expanded is NEVER auto-mutated (all four working transitions)", () => {
+    expect(autoTreeModeForWorkingTransition(false, true, "expanded")).toBeUndefined();
+    expect(autoTreeModeForWorkingTransition(true, false, "expanded")).toBeUndefined();
+    expect(autoTreeModeForWorkingTransition(false, false, "expanded")).toBeUndefined();
+    expect(autoTreeModeForWorkingTransition(true, true, "expanded")).toBeUndefined();
   });
 });

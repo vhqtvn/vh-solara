@@ -24,9 +24,15 @@ import {
   setNodeMode,
   hasUserToggled,
   treeNode,
+  applyTreeOpStore,
+  treeModeMapSignal,
 } from "../../src/sync/treeState";
 import { setSelectedIdRaw } from "../../src/sync/store";
-import type { TreeNode } from "../../src/sync/treeMap";
+import type { TreeNode, TreeOp } from "../../src/sync/treeMap";
+
+// The persisted tree-mode localStorage key (mirrors treeState.ts). Used by the
+// auto-mutation tests to count mode-write side effects.
+const LS_MODE = "vh.tree.mode.v2";
 
 // Mock ONLY expandTreeNode (the fetch entrypoint) on the barrel; everything else
 // (selectedId/state, the real treeState store, selectors) stays live.
@@ -166,8 +172,13 @@ describe("flood fix — filtered default hides idle children (render gate over t
 describe("click transitions — the proj=1 4-state table", () => {
   // Every click marks the CLICKED id in userToggled; the transition does NOT
   // depend on visibleKids().length.
-  it("filtered (default) → click → expanded (no fetch, children already resident)", () => {
+  it("explicit filtered → click → expanded (no fetch, children already resident)", () => {
     seedTreeStore(manyChildRoot(3));
+    // Cold-load normalization now materializes an idle absent node as explicit
+    // "collapsed" (the default is no longer the absent→filtered fallback). To
+    // exercise the filtered→expanded click transition, set demo to filtered
+    // explicitly — a manual mode, preserved by cold-norm.
+    setNodeMode("demo", "filtered");
     const { container } = render(() => <SessionTree />);
     expect(modeOf("demo")).toBe("filtered");
 
@@ -297,6 +308,10 @@ describe("lazy frontier — fetch trigger matrix", () => {
   // authority (the mock does not implement it, so each render is one call).
   it("filtered + unloaded + descendants → fetch fires on mount", () => {
     seedTreeStore([node({ id: "x", title: "X", childCount: 2, descendantCount: 2, loaded: false })]);
+    // Cold-norm materializes the idle absent node as collapsed; collapsed never
+    // fetches (the frontier effect early-returns on ds==="collapsed"). Set
+    // filtered explicitly to exercise the filtered+unloaded frontier.
+    setNodeMode("x", "filtered");
     render(() => <SessionTree />);
     expect(expandSpy).toHaveBeenCalledWith("x");
   });
@@ -351,5 +366,110 @@ describe("lazy frontier — fetch trigger matrix", () => {
     setSelectedIdRaw("LEAF");
     render(() => <SessionTree />);
     expect(expandSpy).toHaveBeenCalledWith("R");
+  });
+});
+
+// auto-mutation — component integration + guarded-queue race/reversal.
+//
+// These mount the REAL <SessionTree/>, drive working() transitions via
+// applyTreeOpStore (the store-ingestion path), flush the microtask queue, and
+// assert: (1) a false→true ingestion auto-promotes collapsed→filtered, which
+// unlocks the existing lazy-frontier effect to fetch the now-revealed unloaded
+// node; (2) repeated unchanged working updates write nothing; (3) a manual mode
+// change between queue and flush drops the stale candidate (manual wins); and
+// (4) a rapid false→true→false reversal in one tick resolves to the final
+// validated state, not queue order.
+describe("auto-mutation — component integration + queue race/reversal", () => {
+  // A collapsed, mounted, unloaded node with known descendants. Cold-norm
+  // materializes it collapsed (idle absent), so the lazy frontier does NOT fire
+  // on mount (collapsed never fetches). The promotion to filtered is what unlocks
+  // the frontier — that is the integration under test.
+  function unloadedDescendant(): TreeNode[] {
+    return [node({ id: "x", title: "X", childCount: 2, descendantCount: 2, loaded: false })];
+  }
+
+  it("a false→true ingestion promotes collapsed→filtered and fires the lazy frontier", async () => {
+    seedTreeStore(unloadedDescendant());
+    render(() => <SessionTree />);
+    // On mount: x is collapsed (cold-norm) + unloaded + has descendants → the
+    // lazy frontier does NOT fire (collapsed never fetches).
+    expect(modeOf("x")).toBe("collapsed");
+    expect(expandSpy).not.toHaveBeenCalled();
+
+    // Store ingestion: x flips working false→true (subtreeBusy rollup).
+    const op: TreeOp = { op: "node.facet", data: { id: "x", flags: { subtreeBusy: true } } };
+    applyTreeOpStore(op);
+    // Flush the candidate microtask + let Solid re-run the frontier effect.
+    await new Promise((r) => setTimeout(r, 0));
+
+    // Persisted mode auto-promoted collapsed→filtered (now an explicit entry).
+    expect(modeOf("x")).toBe("filtered");
+    expect(Object.prototype.hasOwnProperty.call(treeModeMapSignal(), "x")).toBe(true);
+    // The existing lazy-frontier effect observed the mode change (collapsed→
+    // filtered) and fired expandTreeNode for the now-revealed unloaded node.
+    expect(expandSpy).toHaveBeenCalledWith("x");
+  });
+
+  it("repeated unchanged working updates generate NO extra auto mode writes", async () => {
+    seedTreeStore(unloadedDescendant());
+    // First ingestion promotes collapsed→filtered (establishes working=true).
+    applyTreeOpStore({ op: "node.facet", data: { id: "x", flags: { subtreeBusy: true } } });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(modeOf("x")).toBe("filtered");
+
+    // Spy on localStorage writes AFTER the promotion. Re-applying the SAME
+    // working state (subtreeBusy:true again) is a no-edge (prevWorking==curWorking)
+    // → no candidate enqueued → no setNodeModes → no LS mode write.
+    const setItemSpy = vi.spyOn(Storage.prototype, "setItem");
+    applyTreeOpStore({ op: "node.facet", data: { id: "x", flags: { subtreeBusy: true } } });
+    await new Promise((r) => setTimeout(r, 0));
+    const modeWrites = setItemSpy.mock.calls.filter((c) => c[0] === LS_MODE);
+    expect(modeWrites).toHaveLength(0);
+    expect(modeOf("x")).toBe("filtered"); // unchanged
+    setItemSpy.mockRestore();
+  });
+
+  it("MANUAL RACE: a manual mode change after a candidate is queued but before flush drops the stale candidate (manual wins)", async () => {
+    // A loaded node (no frontier involvement) so the test isolates the queue race.
+    seedTreeStore([node({ id: "x", title: "X", childCount: 1, loaded: true }), node({ id: "c", parentId: "x", title: "C" })]);
+    expect(modeOf("x")).toBe("collapsed");
+
+    // Enqueue a candidate (x: collapsed→filtered, expectedSourceMode collapsed).
+    applyTreeOpStore({ op: "node.facet", data: { id: "x", flags: { subtreeBusy: true } } });
+    // BEFORE the flush: a manual click sets x to expanded (a different persisted
+    // mode). This is synchronous, so it lands before the microtask runs.
+    setNodeMode("x", "expanded");
+    await new Promise((r) => setTimeout(r, 0)); // flush
+
+    // The candidate's expectedSourceMode was "collapsed"; the persisted mode is
+    // now "expanded" → revalidation drops it. The manual choice wins.
+    expect(modeOf("x")).toBe("expanded");
+  });
+
+  it("RAPID REVERSAL: false→true→false in one window resolves to the final validated state (not queue order)", async () => {
+    // A loaded node so the frontier doesn't fire on the transient filtered.
+    seedTreeStore([node({ id: "x", title: "X", childCount: 1, loaded: true }), node({ id: "c", parentId: "x", title: "C" })]);
+    expect(modeOf("x")).toBe("collapsed");
+
+    // Spy BEFORE the ops so we can prove NO mode write lands (the candidate is
+    // dropped at flush, not applied-then-reverted).
+    const setItemSpy = vi.spyOn(Storage.prototype, "setItem");
+
+    // Two ops in one synchronous window (no flush between them):
+    //   Op1: false→true (subtreeBusy on) → candidate collapsed→filtered.
+    //   Op2: true→false (subtreeBusy off) → persisted is STILL collapsed (Op1's
+    //        candidate has not flushed) → true→false+collapsed is a no-op → no
+    //        candidate enqueued for Op2.
+    applyTreeOpStore({ op: "node.facet", data: { id: "x", flags: { subtreeBusy: true } } });
+    applyTreeOpStore({ op: "node.facet", data: { id: "x", flags: { subtreeBusy: false } } });
+    await new Promise((r) => setTimeout(r, 0)); // flush
+
+    // The only candidate (Op1) is revalidated: working(x) is now false but its
+    // expectedWorking was true → DROPPED. Final state = the validated idle state
+    // (collapsed), NOT the stale first edge (filtered).
+    expect(modeOf("x")).toBe("collapsed");
+    const modeWrites = setItemSpy.mock.calls.filter((c) => c[0] === LS_MODE);
+    expect(modeWrites).toHaveLength(0); // candidate dropped → no write at all
+    setItemSpy.mockRestore();
   });
 });

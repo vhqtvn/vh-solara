@@ -137,6 +137,36 @@ export function working(node: TreeNode): boolean {
   );
 }
 
+// autoTreeModeForWorkingTransition — the QUALIFIED auto-mutation decision for a
+// persisted tree mode given a node's working() transition (previousWorking →
+// currentWorking). Encodes ONLY the two edges that auto-mutate the persisted
+// mode; every other combination (including any involvement of "expanded", the
+// already-matching target, and the no-edge same-state cases) returns undefined
+// (no-op). PURE: takes only the transition + the current PERSISTED mode, never
+// reads the map, signals, selection, temp overlay, or userToggled.
+//
+// Transition table (the qualified, not absolute, invariant):
+//   prev    cur     persistedMode  → result
+//   false   true    collapsed      → "filtered"   (running → reveal working kids)
+//   true    false   filtered       → "collapsed"  (finished → hide the now-idle kids)
+//   any     any     expanded       → undefined    (expanded is NEVER auto-changed)
+//   any other combination          → undefined    (no qualifying edge)
+//
+// The "qualified" qualifier: a manually-clicked collapsed→filtered on an idle
+// node stays filtered (that is NOT a transition — prev==cur==false); only a
+// GENUINE working edge auto-mutates. Likewise a false→true on an already-filtered
+// node does nothing (undefined), so a node the user already revealed keeps that
+// choice. Auto-mutation is TRANSITION-DRIVEN; it never fires for a steady state.
+export function autoTreeModeForWorkingTransition(
+  previousWorking: boolean,
+  currentWorking: boolean,
+  persistedMode: TreeMode,
+): TreeMode | undefined {
+  if (!previousWorking && currentWorking && persistedMode === "collapsed") return "filtered";
+  if (previousWorking && !currentWorking && persistedMode === "filtered") return "collapsed";
+  return undefined;
+}
+
 // strictAncestors — the selected node's ancestors EXCLUDING the selected node
 // itself. Copies selectedPathIds (which may be shared/cached) before deleting
 // the leaf so the caller's set is not mutated. Drives the "temp" overlay: a

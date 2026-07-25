@@ -22,6 +22,8 @@ import {
   resetExpandedForTest,
   resetTreeStore,
   treeMap,
+  treeModeMapSignal,
+  applyTreeOpStore,
   expandedButUnloadedIds,
   rehydrateExpandedForTest,
 } from "../../src/sync/treeState";
@@ -426,5 +428,95 @@ describe("stream backfill fires GET /vh/tree/children after the frontier seed", 
       .map((c) => String(c[0]))
       .filter((u) => u.includes("/vh/tree/children"));
     expect(treeFetches).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// auto-mutation cold-load normalization + write coalescing (persistence).
+// Pins: (1) modeOf stays "filtered" for a genuinely-absent id; (2) cold
+// normalization materializes collapsed ONLY for resident absent-idle ids;
+// (3) nonresident persisted entries are ignored by cold-norm (preserved, not
+// dropped); (4) explicit filtered-idle is preserved; (5) ONE localStorage write
+// per seed regardless of how many mixed (cold + edge) target changes; (6) ONE
+// write per microtask flush regardless of candidate count; (7) a no-op seed
+// writes ZERO times.
+// ---------------------------------------------------------------------------
+describe("auto-mutation cold-load normalization + write coalescing", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    resetTreeStore();
+    resetExpandedForTest();
+  });
+
+  it("modeOf returns 'filtered' for a genuinely-absent (never-seen) id", () => {
+    seedTreeStore([node({ id: "A" })]);
+    expect(modeOf("never-seen")).toBe("filtered");
+  });
+
+  it("cold normalization materializes collapsed ONLY for resident absent-idle ids", () => {
+    seedTreeStore([
+      node({ id: "idleA" }), // resident + idle + absent → collapsed
+      node({ id: "busyB", activity: "busy" }), // resident + working + absent → stays implicit filtered
+    ]);
+    expect(modeOf("idleA")).toBe("collapsed");
+    expect(modeOf("busyB")).toBe("filtered");
+    expect(Object.prototype.hasOwnProperty.call(treeModeMapSignal(), "busyB")).toBe(false);
+  });
+
+  it("a NONRESIDENT persisted entry is ignored by cold-norm (preserved, not dropped)", () => {
+    setNodeMode("GHOST", "expanded"); // persisted but never resident
+    seedTreeStore([node({ id: "A" })]);
+    expect(modeOf("A")).toBe("collapsed"); // resident absent-idle cold-normalized
+    expect(modeOf("GHOST")).toBe("expanded"); // nonresident entry preserved untouched
+  });
+
+  it("an explicit 'filtered'-idle resident id is preserved (not cold-overridden)", () => {
+    setNodeMode("A", "filtered");
+    seedTreeStore([node({ id: "A" })]);
+    expect(modeOf("A")).toBe("filtered");
+  });
+
+  it("ONE localStorage write per seed regardless of mixed cold + edge target changes", () => {
+    // Establish a known node "k" first (cold → collapsed) BEFORE spying.
+    seedTreeStore([node({ id: "k" })]);
+    expect(modeOf("k")).toBe("collapsed");
+
+    const setItemSpy = vi.spyOn(Storage.prototype, "setItem");
+    // Re-seed: k goes idle→busy (known collapsed → filtered edge) AND a new idle
+    // node "n" is cold-normalized to collapsed. Two DIFFERENT target modes, but
+    // ONE synchronous setNodeModes call → ONE LS_MODE write.
+    seedTreeStore([node({ id: "k", activity: "busy" }), node({ id: "n" })]);
+    const modeWrites = setItemSpy.mock.calls.filter((c) => c[0] === LS_MODE);
+    expect(modeWrites).toHaveLength(1);
+    expect(modeOf("k")).toBe("filtered");
+    expect(modeOf("n")).toBe("collapsed");
+    setItemSpy.mockRestore();
+  });
+
+  it("ONE localStorage write per microtask flush regardless of candidate count", async () => {
+    seedTreeStore([node({ id: "a" }), node({ id: "b" }), node({ id: "c" })]); // all cold → collapsed
+    const setItemSpy = vi.spyOn(Storage.prototype, "setItem");
+    // Three independent facets → three candidates enqueued, ONE scheduled flush.
+    applyTreeOpStore({ op: "node.facet", data: { id: "a", activity: "busy" } });
+    applyTreeOpStore({ op: "node.facet", data: { id: "b", activity: "busy" } });
+    applyTreeOpStore({ op: "node.facet", data: { id: "c", activity: "busy" } });
+    await new Promise((r) => setTimeout(r, 0)); // flush
+    const modeWrites = setItemSpy.mock.calls.filter((c) => c[0] === LS_MODE);
+    expect(modeWrites).toHaveLength(1); // ONE write for all three survivors
+    expect(modeOf("a")).toBe("filtered");
+    expect(modeOf("b")).toBe("filtered");
+    expect(modeOf("c")).toBe("filtered");
+    setItemSpy.mockRestore();
+  });
+
+  it("a no-op seed (no qualifying changes) writes ZERO times to LS_MODE", () => {
+    seedTreeStore([node({ id: "k" })]); // cold → collapsed
+    const setItemSpy = vi.spyOn(Storage.prototype, "setItem");
+    // Re-seed the SAME idle node: known + idle→idle (no edge) + already explicit
+    // collapsed (no cold change) → empty change set → setNodeModes early-returns.
+    seedTreeStore([node({ id: "k" })]);
+    const modeWrites = setItemSpy.mock.calls.filter((c) => c[0] === LS_MODE);
+    expect(modeWrites).toHaveLength(0);
+    setItemSpy.mockRestore();
   });
 });
