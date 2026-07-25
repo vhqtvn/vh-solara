@@ -31,6 +31,7 @@ import {
   type ChildrenResponse,
 } from "./treeOps";
 import { seedTreeStore, applyTreeOpStore, patchTreeAgent, expandedButUnloadedIds } from "./treeState";
+import { applyPinsSnapshot, applyPinsUpdated } from "../sidebar";
 
 // mergeLastAgents — the agent-label fix (S3). During a server restart the
 // daemon serves HTTP while still aggregating session tails, so a mid-hydrate
@@ -1600,6 +1601,41 @@ export function connect(fresh = false) {
     } catch (err) {
       log.warn("sync", "malformed tree.op frame", { err, seq });
     }
+  });
+  // === Phase 5: server-backed pins (pins.snapshot / pins.updated) =============
+  // Both frames are emitted on this Stream-1 (tree) connection. They carry NO
+  // SSE `id:` line (both transient — reconnect catches up via pins.snapshot),
+  // so there is no cursor to advance and no shared-resume interaction. They are
+  // disjoint from tree/detail state (the sidebar facade owns the pin signals),
+  // so they are NOT subject to treeSnapshotDecoding serialization or the busy
+  // gate: a pins frame during an archive or a tree decode still applies (pins
+  // are worker-wide, independent of any one project's archive scope). Only the
+  // connection-generation guard (ignore frames from a superseded connection) and
+  // the liveness clock apply — mirroring the discipline of the other listeners.
+  // Validation + the revision-monotonicity guard live inside the facade.
+  es.addEventListener("pins.snapshot", (e) => {
+    if (gen !== treeGen) return;
+    markTreeSeen();
+    let raw: unknown;
+    try {
+      raw = JSON.parse((e as MessageEvent).data);
+    } catch (err) {
+      log.warn("sync", "malformed pins.snapshot frame", { err });
+      return;
+    }
+    applyPinsSnapshot(raw);
+  });
+  es.addEventListener("pins.updated", (e) => {
+    if (gen !== treeGen) return;
+    markTreeSeen();
+    let raw: unknown;
+    try {
+      raw = JSON.parse((e as MessageEvent).data);
+    } catch (err) {
+      log.warn("sync", "malformed pins.updated frame", { err });
+      return;
+    }
+    applyPinsUpdated(raw);
   });
   es.addEventListener("ping", () => markTreeSeen()); // heartbeat for the watchdog
   for (const kind of ["session.upsert", "session.delete"]) {
