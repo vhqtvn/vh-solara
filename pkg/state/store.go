@@ -1935,6 +1935,32 @@ func (s *Store) deleteSessionLocked(id string) {
 		// — maintainIndexesOnDelete + the prototype block + the busyCount
 		// decrement) and fire a spurious markUnread on a session being removed.
 		s.emit(KindActivity, rawObj(map[string]interface{}{"sessionID": id, "state": ActivityIdle}))
+	} else if a == ActivityError {
+		// Finish-cascade (error mirror): emit a terminal KindActivity(idle)
+		// for a session that was observably in the ERROR state so every
+		// observer (chat + tree) drops the error signal in the same
+		// transition. isActiveLocked (tree_emitter.go:201-213) treats
+		// ActivityError as active (a client that held activity[id]="error"
+		// has an observable active signal), so the symmetric finish-side
+		// cascade must cover it too — otherwise deleting an errored
+		// subsession leaves the chat-side syncState.activity[id]="error"
+		// stale on a session that no longer exists (cosmetic: error is
+		// terminal so isActivityWorking("error") is false → no spinner/heat,
+		// but the red dot persists on the parent's task row).
+		//
+		// SUBTLETY (load-bearing): error MUST NOT touch busyCount. The
+		// busyCount[root]++/-- chokepoint is setActivityAtLocked, whose
+		// wasBusy/isBusy flags only {Busy, Retry} (error never incremented
+		// busyCount on entry, so decrementing on exit would corrupt the
+		// count and under-report RunningRoots). That is why this is a
+		// SEPARATE else-if and NOT a widening of the outer `if` to
+		// `|| a == ActivityError`. No setActivityLocked call either: that
+		// would re-run maintenance already done above and fire a spurious
+		// markUnread on a session being removed (same reasoning as the
+		// busy/retry branch). The emit must precede the KindSessionDelete
+		// below so a client applying events in seq order clears the chat
+		// activity map before the structural prune lands.
+		s.emit(KindActivity, rawObj(map[string]interface{}{"sessionID": id, "state": ActivityIdle}))
 	}
 	delete(s.sessions, id)
 	delete(s.messages, id)
