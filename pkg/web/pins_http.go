@@ -35,6 +35,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/vhqtvn/vh-solara/pkg/aggregator"
 	"github.com/vhqtvn/vh-solara/pkg/state"
@@ -90,6 +91,41 @@ type putPinsReq struct {
 	OrderedSessionIDs []string `json:"orderedSessionIds"`
 	InitializeOnly    bool     `json:"initializeOnly,omitempty"`
 	MigrationID       string   `json:"migrationId,omitempty"`
+}
+
+// pinsUnknownSessionResp is the MACHINE-READABLE 400 body emitted when a PUT
+// adds IDs that are not active on this worker. The client parses unknownIds to
+// self-heal: drop those ids from its local serverOrder and retry the PUT once
+// (bounded) against the cleaned order. Collecting ALL offending new ids (not
+// just the first) lets the client's single bounded retry drop them all in one
+// shot. Message is a human-readable summary (also surfaced to operators).
+//
+// Contract (LOCKED):
+//
+//	{ "error": "unknown_session",
+//	  "message": "unknown session id (not active on this worker): <id1>, <id2>",
+//	  "unknownIds": ["<id1>","<id2>"] }
+//
+// Clients MUST parse the structured `unknownIds` array to self-heal; `message`
+// is display-only (human-readable) and MUST NOT be regex-parsed for ids.
+// Retained ids (already in the server doc) are NEVER included here — they skip
+// validation, so only newly-added non-active ids are collected.
+type pinsUnknownSessionResp struct {
+	Error      string   `json:"error"`
+	Message    string   `json:"message"`
+	UnknownIDs []string `json:"unknownIds"`
+}
+
+// newPinsUnknownSessionResp builds the structured 400 body. ids MUST be non-
+// empty (the caller only builds this when at least one new id failed
+// anti-resurrection). Order is preserved from the request so the client log
+// reads in input order.
+func newPinsUnknownSessionResp(ids []string) pinsUnknownSessionResp {
+	return pinsUnknownSessionResp{
+		Error:      "unknown_session",
+		Message:    "unknown session id (not active on this worker): " + strings.Join(ids, ", "),
+		UnknownIDs: ids,
+	}
 }
 
 // handlePins serves GET (read) and PUT (compare-and-swap replace) for the
@@ -168,20 +204,33 @@ func (s *Server) handlePinsPut(w http.ResponseWriter, r *http.Request) {
 	// 4. Anti-resurrection validation. Every newly-added ID (not already in
 	//    the current server doc) must be present in the worker's authoritative
 	//    active-session set. Retained IDs are NOT re-validated.
+	//
+	//    Collect ALL offending new IDs (not just the first) and reject with a
+	//    MACHINE-READABLE structured 400 (Content-Type: application/json,
+	//    body: pinsUnknownSessionResp) so the client can parse unknownIds and
+	//    drop them all in a single bounded retry. The guard semantics are
+	//    unchanged: retained ids still skip validation, newly-added ids must
+	//    still be active — only the wire shape + collect-all behavior changed.
 	currentDoc := s.pins.Snapshot()
 	retained := make(map[string]bool, len(currentDoc.OrderedSessionIDs))
 	for _, id := range currentDoc.OrderedSessionIDs {
 		retained[id] = true
 	}
 	activeProjects := s.activeSessionProjects()
+	var unknown []string
 	for _, id := range req.OrderedSessionIDs {
 		if retained[id] {
 			continue
 		}
 		if _, ok := activeProjects[id]; !ok {
-			http.Error(w, "unknown session id (not active on this worker): "+id, http.StatusBadRequest)
-			return
+			unknown = append(unknown, id)
 		}
+	}
+	if len(unknown) > 0 {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(newPinsUnknownSessionResp(unknown))
+		return
 	}
 
 	// 5. advisory migrationId — accepted, not stored (no idempotency store in

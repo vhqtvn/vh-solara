@@ -115,6 +115,26 @@ func decodePinsResp(t *testing.T, body io.Reader) pinsPublicResp {
 	return r
 }
 
+// pinsUnknownSessionBody mirrors the structured 400 contract the server emits
+// when a PUT adds IDs that are not active on this worker. The client parses
+// unknownIds to self-heal (drop them and retry once).
+type pinsUnknownSessionBody struct {
+	Error      string   `json:"error"`
+	Message    string   `json:"message"`
+	UnknownIDs []string `json:"unknownIds"`
+}
+
+// decodePinsUnknownSession decodes the structured 400 body. Fatals on a body
+// that is not valid JSON so a text/plain regression is caught loudly.
+func decodePinsUnknownSession(t *testing.T, body io.Reader) pinsUnknownSessionBody {
+	t.Helper()
+	var r pinsUnknownSessionBody
+	if err := json.NewDecoder(body).Decode(&r); err != nil {
+		t.Fatalf("decode pinsUnknownSessionBody: %v", err)
+	}
+	return r
+}
+
 // --- GET /vh/pins -----------------------------------------------------------
 
 // TestPinsHTTPGetShape verifies the GET response is the public shape: has
@@ -335,6 +355,117 @@ func TestPinsHTTPPut400(t *testing.T) {
 			t.Fatalf("unknown new id: status = %d, want 400", resp.StatusCode)
 		}
 	})
+
+	// unknown_new_id_structured: the 400 is machine-readable. Content-Type is
+	// application/json and the body decodes to the confirmed contract:
+	// {error:"unknown_session", message:"...", unknownIds:[<that id>]}.
+	t.Run("unknown_new_id_structured", func(t *testing.T) {
+		_, web := newPinsTestServer(t)
+		resp := pinsPut(t, web.URL+"/vh/pins", map[string]any{
+			"baseRevision":      0,
+			"orderedSessionIds": []string{"ghost"},
+		})
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("unknown new id: status = %d, want 400", resp.StatusCode)
+		}
+		if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+			t.Fatalf("Content-Type = %q, want application/json (machine-readable 400)", ct)
+		}
+		e := decodePinsUnknownSession(t, resp.Body)
+		if e.Error != "unknown_session" {
+			t.Fatalf("error = %q, want unknown_session", e.Error)
+		}
+		if len(e.UnknownIDs) != 1 || e.UnknownIDs[0] != "ghost" {
+			t.Fatalf("unknownIds = %v, want [ghost]", e.UnknownIDs)
+		}
+		if !strings.Contains(e.Message, "ghost") {
+			t.Fatalf("message = %q, want it to contain the offending id", e.Message)
+		}
+	})
+
+	// unknown_multiple_ids_collect_all: the server collects ALL non-active
+	// newly-added ids before rejecting (not just the first), so the client's
+	// single bounded retry can drop them all. Order matches the request order.
+	t.Run("unknown_multiple_ids_collect_all", func(t *testing.T) {
+		_, web := newPinsTestServer(t)
+		resp := pinsPut(t, web.URL+"/vh/pins", map[string]any{
+			"baseRevision":      0,
+			"orderedSessionIds": []string{"ghost1", "ghost2"},
+		})
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400", resp.StatusCode)
+		}
+		if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+			t.Fatalf("Content-Type = %q, want application/json (machine-readable 400)", ct)
+		}
+		e := decodePinsUnknownSession(t, resp.Body)
+		if e.Error != "unknown_session" {
+			t.Fatalf("error = %q, want unknown_session", e.Error)
+		}
+		if len(e.UnknownIDs) != 2 {
+			t.Fatalf("unknownIds len = %d, want 2 (collect-all, not first-only)", len(e.UnknownIDs))
+		}
+		if e.UnknownIDs[0] != "ghost1" || e.UnknownIDs[1] != "ghost2" {
+			t.Fatalf("unknownIds = %v, want [ghost1 ghost2] (request order)", e.UnknownIDs)
+		}
+	})
+}
+
+// --- retained-skip regression in the collect-all world ----------------------
+
+// TestPinsHTTPPut400RetainedNotCollected is the key anti-resurrection guarantee
+// under the structured collect-all 400: a retained pin whose owning project is
+// NO LONGER OPEN (absent from s.aggs and thus from the active-session set) is
+// NOT reported in unknownIds. Only NEWLY-ADDED ids are validated; retained ids
+// skip validation (the guard semantics are unchanged by the collect-all change).
+//
+// Setup: pin a session from /proj2, then drop /proj2 from s.aggs (its session
+// is now absent from every active set). A subsequent PUT that RETAINS that pin
+// AND ADDS an unknown "ghost" must 400 with unknownIds=[ghost] only — the
+// retained /proj2 session must NOT appear.
+func TestPinsHTTPPut400RetainedNotCollected(t *testing.T) {
+	srv, web := newPinsTestServer(t)
+
+	// Open a second project and seed a session under it.
+	const deadURL = "http://127.0.0.1:1"
+	proj2 := aggregator.New(deadURL, 100)
+	srv.aggs["/proj2"] = proj2
+	seedPinSession(t, proj2, "proj2-sess")
+
+	// Initialize the pin doc with the /proj2 session.
+	resp := pinsPut(t, web.URL+"/vh/pins", map[string]any{
+		"baseRevision":      0,
+		"orderedSessionIds": []string{"proj2-sess"},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("init PUT: status %d, want 200. body: %s", resp.StatusCode, b)
+	}
+
+	// Drop /proj2 from s.aggs — its session is now absent from every active set.
+	delete(srv.aggs, "/proj2")
+
+	// PUT that RETAINS "proj2-sess" (must skip validation — already in the doc)
+	// AND ADDS "ghost" (new + not active → collected). The 400 must report ONLY
+	// "ghost"; "proj2-sess" must NOT appear in unknownIds.
+	resp2 := pinsPut(t, web.URL+"/vh/pins", map[string]any{
+		"baseRevision":      1,
+		"orderedSessionIds": []string{"proj2-sess", "ghost"},
+	})
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusBadRequest {
+		t.Fatalf("PUT: status %d, want 400 (ghost is unknown)", resp2.StatusCode)
+	}
+	e := decodePinsUnknownSession(t, resp2.Body)
+	if e.Error != "unknown_session" {
+		t.Fatalf("error = %q, want unknown_session", e.Error)
+	}
+	if len(e.UnknownIDs) != 1 || e.UnknownIDs[0] != "ghost" {
+		t.Fatalf("unknownIds = %v, want [ghost] only (retained proj2-sess must NOT be collected)", e.UnknownIDs)
+	}
 }
 
 // --- 409: CAS / init mismatch -----------------------------------------------
