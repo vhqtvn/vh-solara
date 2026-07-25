@@ -1,7 +1,7 @@
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { abortSession, sessionProjectID, sessionWorking, state } from "../sync";
 import { suggestTitle } from "../sessionTitle";
-import { isPinned, togglePin, movePinnedByOffset, reconciledPinnedOrder } from "../sidebar";
+import { isPinned, togglePin, movePinnedByOffset, reconciledPinnedOrder, pinsPending, pinsLastError, clearPinsError } from "../sidebar";
 import { exportSessionMarkdown } from "../export";
 import { pushNotification } from "../notify";
 import { treeMap } from "../sync/treeState";
@@ -21,6 +21,22 @@ import Icon from "./Icon";
 import TextPromptDialog from "./TextPromptDialog";
 
 const copy = (text: string) => void navigator.clipboard?.writeText(text);
+
+// Pin sync error → human label for the menu's retry hint. The action buttons
+// below (Pin/Unpin, Move up/down) double as the retry affordance: re-clicking
+// re-issues the mutation against the current authoritative state.
+function pinErrorLabel(): string {
+  switch (pinsLastError()) {
+    case "pin-conflict":
+      return "Pin sync conflict — retry";
+    case "pin-network":
+      return "Pin sync failed — offline";
+    case "pin-error":
+      return "Pin sync failed";
+    default:
+      return "";
+  }
+}
 
 // Update a session's title in OpenCode (PATCH /session/:id). The change comes
 // back as a session.updated event, so the tree refreshes itself.
@@ -147,14 +163,40 @@ export default function SessionContextMenu() {
     const line = () => `${props.title} (${props.id})`;
     return (
       <>
-        <button type="button" class="ctxm-item" onClick={() => (togglePin(props.id), closeSessionMenu())}>
+        {/* Pin sync error hint (dismissible). The mutation resolves AFTER the
+            menu closes (async PUT), so this surfaces a lingering error when the
+            menu is re-opened — the action buttons below serve as retry. */}
+        <Show when={pinsLastError()}>
+          <div class="ctxm-pinerr" role="status">
+            <span class="ctxm-pinerr-text">{pinErrorLabel()}</span>
+            <button
+              type="button"
+              class="icon-btn ctxm-pinerr-x"
+              aria-label="Dismiss pin sync error"
+              onClick={clearPinsError}
+            >
+              <Icon name="x" size={12} />
+            </button>
+          </div>
+        </Show>
+        <button
+          type="button"
+          class="ctxm-item"
+          disabled={pinsPending()}
+          onClick={() => {
+            void togglePin(props.id);
+            closeSessionMenu();
+          }}
+        >
           <Icon name="layers" size={14} /> {isPinned(props.id) ? "Unpin" : "Pin to top"}
         </button>
         {/* Keyboard reorder for pinned ROOT sessions only (the pointer drag
             handle has no keyboard affordance). The scope fence matches the
             drag feature: subsessions and unpinned rows never show these.
             Disabled at the ends so the first item's "Move up" and last item's
-            "Move down" read as inert rather than firing a no-op. */}
+            "Move down" read as inert rather than firing a no-op. Also disabled
+            while a pin mutation is in flight (pinsPending) so a conflicting
+            reorder cannot stack on an unresolved PUT. */}
         <Show when={isPinned(props.id) && !state.sessions[props.id]?.parentID}>
           {(() => {
             const order = reconciledPinnedOrder();
@@ -163,16 +205,22 @@ export default function SessionContextMenu() {
                 <button
                   type="button"
                   class="ctxm-item"
-                  disabled={order[0] === props.id}
-                  onClick={() => (movePinnedByOffset(props.id, -1), closeSessionMenu())}
+                  disabled={pinsPending() || order[0] === props.id}
+                  onClick={() => {
+                    void movePinnedByOffset(props.id, -1);
+                    closeSessionMenu();
+                  }}
                 >
                   <Icon name="arrowUp" size={14} /> Move up
                 </button>
                 <button
                   type="button"
                   class="ctxm-item"
-                  disabled={order[order.length - 1] === props.id}
-                  onClick={() => (movePinnedByOffset(props.id, 1), closeSessionMenu())}
+                  disabled={pinsPending() || order[order.length - 1] === props.id}
+                  onClick={() => {
+                    void movePinnedByOffset(props.id, 1);
+                    closeSessionMenu();
+                  }}
                 >
                   <Icon name="arrowDown" size={14} /> Move down
                 </button>

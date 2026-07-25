@@ -1,6 +1,6 @@
 import { createSignal, createMemo, Show } from "solid-js";
 import { newSession, state, isStale, isUpdating, STALE_MS, projectDir } from "../sync";
-import { searchQuery, setSearchQuery } from "../sidebar";
+import { searchQuery, setSearchQuery, pinsLastError, clearPinsError } from "../sidebar";
 import { setSidebarWidth } from "../layout";
 import SessionTree from "./SessionTree";
 import ArchivedDialog from "./ArchivedDialog";
@@ -12,6 +12,21 @@ import Icon from "./Icon";
 import { setView } from "../ui";
 import { dismiss } from "../lib/a11y";
 import styles from "./Sidebar.module.css";
+
+// Pin sync error → human label for the sidebar's dismissible banner. Slightly
+// more descriptive than the session menu's terse hint (this has room to breathe).
+function pinSyncErrorLabel(): string {
+  switch (pinsLastError()) {
+    case "pin-conflict":
+      return "Pins changed elsewhere — retry your pin or reorder.";
+    case "pin-network":
+      return "Pin sync failed — check your connection.";
+    case "pin-error":
+      return "Pin sync failed.";
+    default:
+      return "";
+  }
+}
 
 export default function Sidebar(props: { open: boolean; onClose: () => void }) {
   const [archivedOpen, setArchivedOpen] = createSignal(false);
@@ -202,6 +217,25 @@ export default function Sidebar(props: { open: boolean; onClose: () => void }) {
         </div>
       </Show>
       <OrphanBanner />
+      {/* Pin sync error (dismissible). Surfaces pinsLastError() from the
+          server-backed pin facade: a 409 the retry could not resolve, or a
+          network/other PUT failure. Self-clears on the next successful mutation
+          or pins.snapshot; the user can also dismiss it here. Lives in the
+          sidebar (always visible) rather than the transient session menu. */}
+      <Show when={pinsLastError()}>
+        <div class={styles.pinErr} role="status">
+          <Icon name="retry" size={13} />
+          <span class={styles.pinErrText}>{pinSyncErrorLabel()}</span>
+          <button
+            type="button"
+            class={styles.pinErrBtn}
+            aria-label="Dismiss pin sync error"
+            onClick={clearPinsError}
+          >
+            Dismiss
+          </button>
+        </div>
+      </Show>
       <Show when={projectDir()}>
         <SessionTree />
       </Show>

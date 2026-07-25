@@ -227,6 +227,40 @@ function applyServerOrder(order: string[]): void {
   setServerOrder(order);
 }
 
+// adoptPutResponse — adopt a confirmed PUT-response doc (200 success or 409
+// conflict), gated by the SAME revision-monotonicity guard as applyPinsUpdated
+// (F1, Phase 3 review). A pins.updated frame adopted between the optimistic
+// write and the response landing could otherwise regress client order/revision
+// to the (older) response. Equal revision is allowed through (idempotent
+// re-adopt). Self-corrects on the next frame. Mirrors applyPinsUpdated's guard;
+// pins.snapshot stays EXEMPT — it is the bootstrap reset handled by
+// applyPinsSnapshot directly. (p5-defer-put-success-adopt-race.)
+function adoptPutResponse(doc: PinDoc): void {
+  if (doc.revision < serverRevision()) {
+    log.warn("pins", "dropping stale PUT response (revision regression)", {
+      got: doc.revision,
+      have: serverRevision(),
+    });
+    return;
+  }
+  adoptServerDoc(doc);
+}
+
+// rollbackOrderIfUnchanged — roll an optimistic order write back to a captured
+// baseline, but ONLY if no fresher authoritative frame landed during the PUT
+// round-trip. A pins.updated / pins.snapshot adopted in that window bumped
+// serverRevision + serverOrder; rolling back to the stale baseline would
+// overwrite the fresher frame's order while leaving serverRevision at the
+// frame's value — a (stale order, fresh revision) split that can lost-update on
+// the next mutation (the next PUT would ship the stale order against a
+// now-matching revision and the frame's pins silently drop). When the revision
+// moved, the fresher frame's order wins and is left intact; the advisory error
+// is still surfaced. (p5-defer-retry-rollback-race.)
+function rollbackOrderIfUnchanged(baseline: string[], issueRevision: number): void {
+  if (serverRevision() !== issueRevision) return; // fresher frame landed — don't clobber
+  applyServerOrder(baseline);
+}
+
 // putPins — the PUT /vh/pins CAS call. X-VH-CSRF is added automatically by the
 // SPA's installCsrf() (web/src/csrf.ts wraps window.fetch); tests that stub
 // global fetch do not need to set it. 200 and 409 both carry the full public
@@ -331,7 +365,7 @@ async function runMigration(seed: string[]): Promise<void> {
   try {
     const res = await putPins(0, seed, { initializeOnly: true });
     if ((res.status === 200 || res.status === 409) && res.doc) {
-      adoptServerDoc(res.doc);
+      adoptPutResponse(res.doc);
       return;
     }
     setPinsErrorSig(res.status === 0 ? "pin-network" : "pin-error");
@@ -359,41 +393,45 @@ function applyMembershipIntent(intent: MembershipIntent, order: string[]): strin
 async function performMembershipMutation(intent: MembershipIntent): Promise<void> {
   incPending();
   const baseOrder = serverOrder();
+  const baseRev = serverRevision(); // rollback guard baseline for the first attempt
   try {
     const target = applyMembershipIntent(intent, baseOrder);
     if (sameList(target, baseOrder)) return; // already satisfied
     clearPinsErrorSig();
     applyServerOrder(target); // optimistic
-    let res = await putPins(serverRevision(), target);
+    let res = await putPins(baseRev, target);
     if (res.status === 200 && res.doc) {
-      adoptServerDoc(res.doc);
+      adoptPutResponse(res.doc);
       return;
     }
     if (res.status === 409 && res.doc) {
       // Adopt authoritative; this is the rollback baseline for the retry.
-      adoptServerDoc(res.doc);
+      adoptPutResponse(res.doc);
       const adoptedOrder = serverOrder();
       const retryTarget = applyMembershipIntent(intent, adoptedOrder);
       if (sameList(retryTarget, adoptedOrder)) return; // already satisfied post-adopt
+      const retryRev = serverRevision(); // rollback guard baseline for the retry
       applyServerOrder(retryTarget); // optimistic retry
-      res = await putPins(serverRevision(), retryTarget);
+      res = await putPins(retryRev, retryTarget);
       if (res.status === 200 && res.doc) {
-        adoptServerDoc(res.doc);
+        adoptPutResponse(res.doc);
         return;
       }
       if (res.status === 409 && res.doc) {
         // Second 409 — stop, surface. Authoritative is already adopted.
-        adoptServerDoc(res.doc);
+        adoptPutResponse(res.doc);
         setPinsErrorSig("pin-conflict");
         return;
       }
-      // Retry failed (non-409): roll back to the adopted authoritative.
-      applyServerOrder(adoptedOrder);
+      // Retry failed (non-409): roll back to the adopted authoritative, but
+      // only if no fresher frame landed during the retry round-trip.
+      rollbackOrderIfUnchanged(adoptedOrder, retryRev);
       setPinsErrorSig(res.status === 0 ? "pin-network" : "pin-error");
       return;
     }
-    // First attempt non-409 failure: roll back the optimistic to the pre-state.
-    applyServerOrder(baseOrder);
+    // First attempt non-409 failure: roll back the optimistic to the pre-state,
+    // but only if no fresher frame landed during the first PUT round-trip.
+    rollbackOrderIfUnchanged(baseOrder, baseRev);
     setPinsErrorSig(res.status === 0 ? "pin-network" : "pin-error");
   } finally {
     decPending();
@@ -409,24 +447,26 @@ async function performReorder(
 ): Promise<void> {
   incPending();
   const baseOrder = serverOrder();
+  const baseRev = serverRevision(); // rollback guard baseline
   try {
     const target = reorderRelative(baseOrder, draggedId, targetId, pos);
     if (sameList(target, baseOrder)) return; // no-op (e.g. dragged === target)
     clearPinsErrorSig();
     applyServerOrder(target); // optimistic
-    const res = await putPins(serverRevision(), target);
+    const res = await putPins(baseRev, target);
     if (res.status === 200 && res.doc) {
-      adoptServerDoc(res.doc);
+      adoptPutResponse(res.doc);
       return;
     }
     if (res.status === 409 && res.doc) {
       // Discard optimistic, adopt authoritative. No auto-replay.
-      adoptServerDoc(res.doc);
+      adoptPutResponse(res.doc);
       setPinsErrorSig("pin-conflict");
       return;
     }
-    // Network/other: roll back the optimistic to the pre-state.
-    applyServerOrder(baseOrder);
+    // Network/other: roll back the optimistic to the pre-state, but only if no
+    // fresher frame landed during the PUT round-trip.
+    rollbackOrderIfUnchanged(baseOrder, baseRev);
     setPinsErrorSig(res.status === 0 ? "pin-network" : "pin-error");
   } finally {
     decPending();

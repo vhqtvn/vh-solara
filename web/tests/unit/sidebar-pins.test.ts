@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   applyPinsSnapshot,
   applyPinsUpdated,
+  clearPinsError,
   coercePinDoc,
   isPinned,
   movePinnedTo,
@@ -361,5 +362,150 @@ describe("pinsPending — reflects in-flight PUTs", () => {
     resolveFetch(jsonRes(pinDoc(2, true, ["a"])));
     await p;
     expect(pinsPending()).toBe(false);
+  });
+});
+
+// Phase 6: concurrency convergence + the two correctness DEFER regressions
+// (p5-defer-retry-rollback-race, p5-defer-put-success-adopt-race). These exercise
+// the retry/rollback path's revision-monotonicity guards that were missing in
+// the initial Phase 5 facade.
+describe("Phase 6 — concurrency + DEFER regressions", () => {
+  it("concurrent pin of different IDs converges (both present after retry)", async () => {
+    applyPinsSnapshot(pinDoc(1, true, []));
+    // Realistic CAS sequencing. togglePin("a") and togglePin("b") are fired
+    // back-to-back (both capture the same pre-mutation snapshot). "a"'s PUT wins
+    // (200, rev2); "b"'s PUT is now stale (baseRev1) → 409, the facade adopts
+    // ["a"], recomputes "pin b" against it → ["a","b"], retries (200, rev3).
+    const seq = [
+      jsonRes(pinDoc(2, true, ["a"]), 200), // togglePin("a") PUT ["a"]
+      jsonRes(pinDoc(2, true, ["a"]), 409), // togglePin("b") PUT ["b"] → stale base
+      jsonRes(pinDoc(3, true, ["a", "b"]), 200), // togglePin("b") retry ["a","b"]
+    ];
+    let i = 0;
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(seq[i++])));
+
+    const pa = togglePin("a");
+    const pb = togglePin("b");
+    await pa;
+    await pb;
+
+    expect(reconciledPinnedOrder()).toEqual(["a", "b"]);
+    expect(isPinned("a")).toBe(true);
+    expect(isPinned("b")).toBe(true);
+    expect(pinsLastError()).toBeNull();
+  });
+
+  it("same-ID pin then unpin follows accepted server write order", async () => {
+    applyPinsSnapshot(pinDoc(1, true, []));
+    const seq = [
+      jsonRes(pinDoc(2, true, ["a"]), 200), // pin a
+      jsonRes(pinDoc(3, true, []), 200), // unpin a
+    ];
+    let i = 0;
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(seq[i++])));
+
+    await togglePin("a");
+    expect(isPinned("a")).toBe(true);
+    expect(reconciledPinnedOrder()).toEqual(["a"]);
+
+    await togglePin("a");
+    expect(isPinned("a")).toBe(false);
+    expect(reconciledPinnedOrder()).toEqual([]);
+    expect(pinsRevision()).toBe(3);
+  });
+
+  it("stale reorder is NOT silently replayed — on 409 adopts the server doc verbatim", async () => {
+    applyPinsSnapshot(pinDoc(1, true, ["a", "b", "c"]));
+    // User reorders c→before a (optimistic [c,a,b]); server 409s with a doc whose
+    // order DIFFERS (a concurrent change appended "d", rev2). The new
+    // adoptPutResponse guard adopts it (2 >= 1) and the client must NOT re-apply
+    // the stale [c,a,b] permutation. Reorder never retries.
+    const fetchMock = vi.fn(() =>
+      Promise.resolve(jsonRes(pinDoc(2, true, ["a", "b", "c", "d"]), 409)),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await movePinnedTo("c", "a", "before");
+
+    expect(fetchMock).toHaveBeenCalledTimes(1); // NO retry for reorder
+    expect(reconciledPinnedOrder()).toEqual(["a", "b", "c", "d"]); // server doc, NOT [c,a,b]
+    expect(pinsLastError()).toBe("pin-conflict");
+  });
+
+  it("clearPinsError clears a surfaced pin error", async () => {
+    applyPinsSnapshot(pinDoc(1, true, ["x"]));
+    vi.stubGlobal("fetch", vi.fn(() => Promise.reject(new Error("net"))));
+
+    await togglePin("y"); // fails → pin-network error
+    expect(pinsLastError()).toBe("pin-network");
+
+    clearPinsError();
+    expect(pinsLastError()).toBeNull();
+  });
+
+  // p5-defer-retry-rollback-race: a stale captured rollback baseline must not
+  // clobber a fresher server state adopted via an interleaved pins.updated frame
+  // during the retry round-trip.
+  it("DEFER1: stale-snapshot rollback does NOT clobber a fresher revision", async () => {
+    applyPinsSnapshot(pinDoc(1, true, []));
+    // togglePin("a"): first PUT 409s (adopts docA=["b"], rev1). The retry PUT is
+    // issued at rev1 and held pending. A pins.updated frame (docB=["b","c"],
+    // rev5) lands DURING the retry round-trip and is adopted. The retry then
+    // fails non-409 (network). Before the fix, applyServerOrder(["b"]) would
+    // clobber docB while leaving revision at 5. After the fix, the rollback is
+    // gated on revision-equality (5 !== retry-issue 1) and docB is left intact.
+    let callCount = 0;
+    let rejectRetry!: (e: unknown) => void;
+    const fetchMock = vi.fn(() => {
+      callCount++;
+      if (callCount === 1) {
+        return Promise.resolve(jsonRes(pinDoc(1, true, ["b"]), 409)); // docA
+      }
+      return new Promise<Response>((_, rej) => (rejectRetry = rej)); // retry, pending
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const p = togglePin("a");
+    await flush(); // first PUT (409 docA) resolves + retry PUT issued (pending)
+    expect(callCount).toBe(2);
+
+    // Fresher frame lands during the retry round-trip.
+    applyPinsUpdated(pinDoc(5, true, ["b", "c"])); // docB
+    expect(pinsRevision()).toBe(5);
+    expect(reconciledPinnedOrder()).toEqual(["b", "c"]);
+
+    rejectRetry(new Error("net")); // retry fails non-409
+    await p;
+
+    expect(reconciledPinnedOrder()).toEqual(["b", "c"]); // NOT rolled back to ["b"]
+    expect(pinsRevision()).toBe(5);
+    expect(pinsLastError()).toBe("pin-network");
+  });
+
+  // p5-defer-put-success-adopt-race: the 200-PUT success-adopt path must honor
+  // the same revision-monotonicity guard as applyPinsUpdated (F1).
+  it("DEFER2: a 200-PUT response older than the held revision is dropped", async () => {
+    applyPinsSnapshot(pinDoc(1, true, []));
+    // togglePin("a") issues a PUT (baseRev1). DURING the round-trip, a
+    // pins.updated frame (docB=["z"], rev5) lands and is adopted. The PUT's 200
+    // response then returns with an OLDER revision (docA=["a"], rev2). Before the
+    // fix, adoptServerDoc would regress client order/revision to ["a"]/2. After
+    // the fix, adoptPutResponse drops it (2 < 5), leaving docB intact.
+    let resolvePut!: (v: Response) => void;
+    vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>((r) => (resolvePut = r))));
+
+    const p = togglePin("a");
+    await flush(); // PUT issued, pending
+
+    applyPinsUpdated(pinDoc(5, true, ["z"])); // docB fresher
+    expect(reconciledPinnedOrder()).toEqual(["z"]);
+    expect(pinsRevision()).toBe(5);
+
+    resolvePut(jsonRes(pinDoc(2, true, ["a"]), 200)); // stale 200 response
+    await p;
+
+    expect(reconciledPinnedOrder()).toEqual(["z"]); // NOT regressed to ["a"]
+    expect(pinsRevision()).toBe(5);
+    expect(pinsLastError()).toBeNull();
   });
 });

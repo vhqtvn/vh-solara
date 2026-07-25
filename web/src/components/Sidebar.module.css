@@ -64,3 +64,33 @@
     transform: rotate(360deg);
   }
 }
+
+/* Pin sync error banner — the always-visible companion to the session-menu
+   hint. Surfaces a pinsLastError() from the server-backed pin facade (a 409 the
+   retry could not resolve, or a network/other PUT failure). Mirrors the
+   OrphanBanner shape (tokens, padding, radius) but danger-tinted. Solid colors
+   only — GPU-cheap (no mask/backdrop/contain). */
+.pinErr {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 4px 8px;
+  padding: 6px 10px;
+  border: 1px solid color-mix(in srgb, var(--danger) 45%, var(--border));
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  border-radius: 8px;
+  font-size: var(--text-sm);
+  color: var(--danger-fg);
+}
+.pinErrText { flex: 1; min-width: 0; }
+.pinErrBtn {
+  flex: none;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--fg);
+  border-radius: 6px;
+  padding: 3px 10px;
+  cursor: pointer;
+  font: inherit;
+}
+.pinErrBtn:hover { background: color-mix(in srgb, var(--fg) 10%, transparent); }

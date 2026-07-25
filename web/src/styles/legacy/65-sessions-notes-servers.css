@@ -90,6 +90,26 @@
 .ctxm-item:disabled:hover { background: transparent; }
 .ctxm-sep { height: 1px; background: var(--border); margin: 5px 4px; }
 
+/* Pin sync error hint (dismissible). Surfaces a lingering pinsLastError() when
+   the session menu is re-opened; the Pin/Unpin + Move buttons below double as
+   the retry affordance. Solid colors only — GPU-cheap (no mask/backdrop/contain). */
+.ctxm-pinerr {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 4px 4px 2px;
+  padding: 5px 8px;
+  border-radius: 7px;
+  border: 1px solid color-mix(in srgb, var(--danger) 40%, transparent);
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  color: var(--danger-fg);
+  font-size: 12px;
+}
+.ctxm-pinerr-text { flex: 1; min-width: 0; }
+/* The dismiss (×) rides the shared global .icon-btn; inherit the danger color. */
+.ctxm-pinerr-x { flex: none; color: inherit; }
+.ctxm-pinerr-x:hover { background: color-mix(in srgb, var(--danger) 22%, transparent); }
+
 .dialog.confirm { max-width: 440px; }
 .confirm-lead { margin: 0 4px 10px; line-height: 1.5; }
 .confirm-list {

@@ -116,6 +116,17 @@ describe("selectPinnedNodes (flat-map, depth-agnostic)", () => {
     expect(out3).toEqual(["R"]);
     expect(new Set(out).size).toBe(out.length);
   });
+
+  // Phase 6 guard: selectPinnedNodes feeds the SessionTree's pinned-group render
+  // directly from reconciledPinnedOrder(). The render path must NOT mutate the
+  // facade's array (a mutation could corrupt the next mutation's base order).
+  // The selector stays render-only / pure.
+  it("does not mutate its pinnedOrder input (render-only / pure)", () => {
+    const order = ["R", "C", "missing"];
+    const snapshot = [...order];
+    selectPinnedNodes(deepMap(), order);
+    expect(order).toEqual(snapshot);
+  });
 });
 
 describe("selectSearchResults (flatten-to-matches)", () => {
