@@ -294,6 +294,39 @@ describe("applySessionSnapshot / applyMessageEvent — Slice C async hydration",
     expect(state.messagesError.s1).toBeUndefined();
   });
 
+  it("a stale snapshot MERGES — a resident live tail is NOT clobbered (379d172 regression guard)", () => {
+    // Live tail already in the store (e.g. a message.upsert/part.upsert stream
+    // that landed before a reconnect/reconcile snapshot).
+    setState("messages", "s1", {
+      order: ["live"],
+      byId: {
+        live: {
+          id: "live",
+          info: { id: "live", sessionID: "s1", role: "assistant", time: { created: 5 } },
+          partOrder: [],
+          parts: {},
+        },
+      },
+    });
+    // A stale reconnect snapshot carries a DIFFERENT (older / pre-tail) item set.
+    const snap: Snapshot = {
+      seq: 1,
+      sessions: [{ id: "s1" }],
+      gate: { s1: { messagesLoaded: true } },
+      messages: {
+        s1: [
+          { info: { id: "snap-only", sessionID: "s1", role: "user", time: { created: 1 } }, parts: [] },
+        ],
+      },
+    };
+    applySessionSnapshot("s1", snap);
+    // live is preserved (merge-if-absent: never overwrites a resident entry)
+    expect(state.messages.s1.order).toContain("live");
+    expect(state.messages.s1.byId["live"].info.role).toBe("assistant");
+    // snap-only was inserted (absent → prepended), both sorted by created
+    expect(state.messages.s1.order).toEqual(["snap-only", "live"]);
+  });
+
   it("message.upsert arriving BEFORE completion is applied without claiming loaded", () => {
     // Stream 2 forwards reconciled deltas on the same connection as the fetch;
     // they can land before messages.loaded. They must populate the transcript

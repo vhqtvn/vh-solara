@@ -542,10 +542,10 @@ test("PLAIN completion on large session (demo, gzip64 snapshot) — tail present
 // clobber is purely applySnap's wholesale replace). A real reload (new
 // navigation) bypasses the injection and recovers, matching the symptom.
 //
-// This red is GREEN once applySessionSnapshot stops unconditionally clobbering
-// live data (e.g. a seq/revision guard, or a merge-if-newer). See the report's
-// fix recommendation.
-test("RED: stale reconnect snapshot clobbers the settled tail via applySessionSnapshot wholesale-replace", async ({ page }) => {
+// Regression guard for the session-finish tail-drop bug: applySessionSnapshot
+// now merges via prependMessagesIfAbsent (live always wins), so a stale
+// reconnect snapshot must NOT drop a tail that already appeared.
+test("regression: stale reconnect snapshot must not clobber the settled tail (merge-if-absent)", async ({ page }) => {
   test.setTimeout(60_000);
   await page.setViewportSize(VP);
   await resetSession(page, "demo");
@@ -583,8 +583,8 @@ test("RED: stale reconnect snapshot clobbers the settled tail via applySessionSn
   // Phase 2: FORCE A RECONNECT by switching to `other` then back to `demo`. The
   // selectedId effect (sync.ts:66) calls openSessionStream → demo's stream closes
   // + reopens → a new `snapshot` frame arrives → the SSE wrapper INJECTS the
-  // captured stale baseline (no tail) → applySessionSnapshot wholesale-replaces
-  // messages[demo] → the settled tail is CLOBBERED.
+  // captured stale baseline (no tail); applySessionSnapshot must MERGE
+  // (prependMessagesIfAbsent), leaving the settled tail intact.
   await page.evaluate(() => {
     const u = new URL(location.href);
     u.searchParams.set("session", "other");
@@ -642,10 +642,10 @@ test("RED: stale reconnect snapshot clobbers the settled tail via applySessionSn
   //Appear === "YES". Whether the drop then PERSISTS (run-variant: msgCount:0,
   // tail gone at END) or SELF-HEALS (live events replay on the new connection)
   // is timing-dependent — but the CLOBBER itself is deterministic and is the
-  // bug. GREEN once applySessionSnapshot stops clobbering live data.
+  // bug. Fixed in 379d172 (merge-if-absent); this test guards against regression.
   const parsed = JSON.parse(summary);
   expect(
     parsed.tailEverDroppedAfterFirstAppear,
-    `BUG REPRODUCED (deterministic): stale reconnect snapshot clobbered the settled tail via applySessionSnapshot wholesale-replace. The tail dropped after first appearing. transitions=${JSON.stringify(parsed.transitions)} after=${JSON.stringify(after)}`,
+    `REGRESSION FAILED: stale reconnect snapshot dropped the settled tail (applySessionSnapshot merge-if-absent regressed). transitions=${JSON.stringify(parsed.transitions)} after=${JSON.stringify(after)}`,
   ).toBe("no");
 });

@@ -552,9 +552,10 @@ describe("I — stale async decode", () => {
 
       // NOW complete the OLD connection's suspended decode. Before the fix the
       // post-await code only ran the epoch guard (unchanged by a sesGen bump),
-      // so applySnap would run and applySessionSnapshot would wholesale-replace
-      // messages[s1] with [m-stale] — clobbering m-fresh and re-asserting the
-      // stale snapshot's gate. After the fix the gen re-check after the await
+      // so applySnap would run and applySessionSnapshot would merge [m-stale]
+      // via prependMessagesIfAbsent (m-fresh's body survives either way) but
+      // wholesale-reset messageWindows[s1] + re-assert the stale delivered flag.
+      // After the fix the gen re-check after the await
       // drops the superseded continuation with no state effect.
       resolveFirstRead({ done: false, value: staleBytes });
       await flush();

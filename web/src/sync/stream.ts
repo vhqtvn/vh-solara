@@ -1189,9 +1189,13 @@ const pendingBatch = new Map<string, Promise<void>>();
 // In-flight gzip64 snapshot decode for the CURRENT session connection. A warm
 // open ships the transcript compressed (server maybeCompressSnapshot); the
 // decode is ASYNC (native DecompressionStream). applySessionSnapshot
-// WHOLESALE-REPLACES messages[id], so a message.upsert/part.upsert landing in
-// the decode window would be applied then silently clobbered by the stale-but-
-// now-decoded snapshot. Promise-gate exactly like pendingBatch: the shared
+// MERGES snapshot items via prependMessagesIfAbsent (live always wins —
+// never overwrites a resident entry), so a mid-decode message.upsert/
+// part.upsert is NOT clobbered in body. The gate stays load-bearing for
+// the non-merge side-effects: messageWindows[id] is wholesale-set, the
+// delivered flag flips, and messages[id] is lazily inited — those must
+// still serialize behind the decode for deterministic ordering.
+// Promise-gate exactly like pendingBatch: the shared
 // message-kind listener awaits this before processing ANY live event for the
 // session. Connect-time only (a snapshot decode is ms-scale) and bounded to one
 // (the current connection's). Reset on each (re)open. sesSnapshotDecoding is
@@ -2100,9 +2104,11 @@ export function openSessionStream(id: string, force = false) {
       };
       // Compressed path: async decode, gated behind sesSnapshotDecode so live
       // message/part events in the decode window serialize behind it (the
-      // shared listener awaits it) — applySessionSnapshot WHOLESALE-REPLACES
-      // messages[id], so a live event applied mid-decode would be clobbered
-      // when the stale-but-now-decoded snapshot lands. Until applySnap runs the
+      // shared listener awaits it) — applySessionSnapshot MERGES message bodies
+      // via prependMessagesIfAbsent (a mid-decode live event is NOT clobbered in
+      // body) but wholesale-sets messageWindows[id] + the delivered flag and
+      // lazily inits messages[id], so those side-effects must serialize behind
+      // the decode. Until applySnap runs the
       // PRIOR messages stay in the store → no flash-of-empty through the decode
       // window (the reveal gate stays faithful). Raw path: synchronous apply,
       // exactly the legacy behavior (cold small snapshots, zero decode latency).
@@ -2210,9 +2216,11 @@ export function openSessionStream(id: string, force = false) {
         const ep = currentGateEpoch();
 
         // Serialize against an in-flight gzip64 snapshot decode for this
-        // connection. applySessionSnapshot WHOLESALE-REPLACES messages[id]; a
-        // live message/part event applied during the decode window would be
-        // clobbered when the (stale-but-now-decoded) snapshot lands. Wait ONLY
+        // connection. applySessionSnapshot MERGES message bodies via
+        // prependMessagesIfAbsent (a mid-decode live event is NOT clobbered in
+        // body), but wholesale-sets messageWindows[id] + the delivered flag and
+        // lazily inits messages[id] — those side-effects must serialize behind
+        // the decode. Wait ONLY
         // when a decode is actually in flight — the boolean check is a no-op on
         // the fast path so message.upsert/part.upsert floods keep zero microtask
         // latency. Connect-time only (a snapshot decode is ms-scale).
