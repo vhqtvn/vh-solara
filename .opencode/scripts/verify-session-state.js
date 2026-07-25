@@ -29,12 +29,23 @@ import {
     writeWorkstreamFile,
     bindSessionName,
     saveDraft,
+    computePlanDesignDigest,
 } from "./state-lib.js";
 
 function runForSession(sessionID, sessionName, slug, body) {
     ensureSessionBinding(sessionID, { cwd: "/verification" });
     bindSessionName(sessionID, sessionName, { cwd: "/verification" });
-    const draft = saveDraft(sessionID, slug, body, "");
+    // F3 explicit-empty envelope (the design author surveyed the plan and named
+    // no ownership hazard). Required at the draft-plan -> approved crossing
+    // post-F3; omission fails closed.
+    const designDigest = computePlanDesignDigest(body);
+    const draft = saveDraft(sessionID, slug, body, "", {
+        cwd: "/verification",
+        f3DesignReadiness: {
+            design_digest: designDigest,
+            ownership_hazards: [],
+        },
+    });
     const saved = approveDraft(sessionID, slug, { cwd: "/verification" });
     const taskContract = saveTaskContract(
         sessionID,

@@ -26,6 +26,7 @@ Rules:
 After saving:
 - report the draft slug and path
 - report the active session name
+- note: before `/approve-plan`, an F3 design-readiness envelope (`f3_design_readiness` frontmatter key) will be required — see `/task-ready` for the envelope shape + authority discipline
 - recommend `/approve-plan <slug>` when the draft is ready
 
 For git operations, follow `.opencode/docs/git-execution-routing.md`.

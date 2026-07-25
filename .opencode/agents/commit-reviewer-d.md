@@ -125,6 +125,18 @@ All other findings default to DROP. This includes but is not limited to:
   edge cases, style-adjacent improvements, naming preferences
 - style, formatting, naming: aesthetic preferences
 
+**Never DROP a behavioral-coverage / crux-not-covered finding.** A finding that
+a load-bearing path was NOT exercised end-to-end (forms: "behavioral coverage
+not exercised", "crux not covered", "load-bearing path not exercised", a
+`verdict: proven` without a demonstrated crux, or a behavior change whose
+behavioral-completion cannot be confirmed) is NEVER DROP. It MUST be DEFER with
+a trigger (typically `always_before` — before the behavior is claimed complete —
+or `path_touched` on the cited path) so the coverage gap survives in
+`.local/coordinator/tasks/` instead of being silently dropped. The
+absence of a test today does not make a behavioral-coverage gap "quality debt";
+it makes it an open coverage obligation. If you cannot express a trigger, defer
+to the orchestrator rather than DROPping.
+
 Record the finding for the audit trail. Do NOT gate the commit on it.
 
 ## Assessment axes and verdict collapse

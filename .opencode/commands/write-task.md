@@ -44,6 +44,7 @@ Workflow:
   - for existing research cards, use `/task-update` for broader metadata edits or `/task-repair` for incomplete research-contract fields
 - for `draft` tasks, require meaningful refinement material (`rough_scope`, `open_questions`, or `ready_criteria`)
 - for `ready` tasks, require a real file scope and a real validation plan; do not save a vague execution card
+- note: if this task will cross BUILD-READY (`draft → ready` via `/task-ready`), an F3 design-readiness envelope will be required at promotion — begin gathering provenance-bearing evidence for the ownership-hazards survey now (fabricated evidence is prohibited; the envelope binds to the current design via `design_digest`)
 - call `plan_state` with:
   - `operation: save_coordination_task`
   - `task_payload`: a JSON object with the task-card fields

@@ -4,6 +4,7 @@ import {
     StateError,
     activateCoordinationTask,
     bindSessionName,
+    computeTaskDesignDigest,
     listCoordinationTasks,
     repairCoordinationTask,
     readyCoordinationTask,
@@ -188,6 +189,29 @@ function main() {
                 "Expected /task-update to persist broader metadata changes.",
             );
         }
+        // F3 dispatch backstop (Slice 4): stamp an explicit-empty envelope so
+        // the create-as-ready task can pass the ready -> working freshness
+        // re-check. Placed AFTER updateCoordinationTaskMetadata (which changes
+        // constraints — a design-digest field) so the digest reflects the
+        // final design state. saveCoordinationTask defaults new tasks to
+        // "ready" without going through readyCoordinationTask's primary F3
+        // gate; the dispatch backstop catches the bypass unless an envelope is
+        // present. Explicit-empty = "author surveyed, named nothing."
+        const primaryReloaded = readCoordinationTask(
+            coordinatorSessionID,
+            primary.task.task_id,
+            { cwd: "/verification" },
+        );
+        const primaryDigest = computeTaskDesignDigest(primaryReloaded.task, {});
+        const primaryPath = taskCardPath(primary.task.task_id);
+        const primaryData = JSON.parse(
+            fs.readFileSync(primaryPath, "utf8"),
+        );
+        primaryData.f3_design_readiness = {
+            ownership_hazards: [],
+            design_digest: primaryDigest,
+        };
+        fs.writeFileSync(primaryPath, JSON.stringify(primaryData, null, 2));
 
         expectStateError(
             () =>
@@ -413,22 +437,27 @@ function main() {
             "Use /task-ready for drafts",
         );
 
+        const readyPayload = {
+            files_in_scope: [
+                "tests/fixtures/example-pkg/",
+                "docs/planning/backlog.md",
+            ],
+            success_criteria: [
+                "Draft task can be promoted into execution-ready state.",
+            ],
+            validation_plan: [
+                "Run verify-task-registry.js end to end.",
+            ],
+            next_action: "Resume the promoted task in a subagent session.",
+        };
+        readyPayload.f3_design_readiness = {
+            ownership_hazards: [],
+            design_digest: computeTaskDesignDigest(draft.task, readyPayload),
+        };
         const readied = readyCoordinationTask(
             coordinatorSessionID,
             draft.task.task_id,
-            {
-                files_in_scope: [
-                    "tests/fixtures/example-pkg/",
-                    "docs/planning/backlog.md",
-                ],
-                success_criteria: [
-                    "Draft task can be promoted into execution-ready state.",
-                ],
-                validation_plan: [
-                    "Run verify-task-registry.js end to end.",
-                ],
-                next_action: "Resume the promoted task in a subagent session.",
-            },
+            readyPayload,
             {
                 cwd: "/verification",
             },
@@ -877,6 +906,16 @@ function main() {
         legacyResearchPayload.source_policy = null;
         legacyResearchPayload.desired_artifact_type = null;
         delete legacyResearchPayload.target_artifact_path;
+        // F3 dispatch backstop (Slice 4): stamp an explicit-empty envelope so
+        // the create-as-ready legacy task can pass the ready -> working
+        // freshness re-check after repair restores its research contract
+        // fields. The digest covers design fields only (research_question
+        // etc. are NOT design-digest scope), so the envelope survives the
+        // contract mutation + repair without going stale.
+        legacyResearchPayload.f3_design_readiness = {
+            ownership_hazards: [],
+            design_digest: computeTaskDesignDigest(legacyResearchPayload, {}),
+        };
         fs.writeFileSync(
             legacyResearchPath,
             JSON.stringify(legacyResearchPayload, null, 2),

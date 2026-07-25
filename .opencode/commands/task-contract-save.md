@@ -25,6 +25,8 @@ Workflow:
   - completion checklist
   - files likely to change (from user or inferred)
   - durable vs tmp output rules
+  - the task's stated motivation, when one is given (a user-given reason or success motivation): capture it so the closeout can state whether it was satisfied. This is an advisory motivation check — a DISTINCT property from any behavioral verdict/crux gate; never blend the two into a combined "closure passed" verdict.
+  - when the task touches a load-bearing path whose outcome the verified seam may not be able to observe (fixture too small, no prior surface, no real scale, no render): capture that the closeout must declare `result: not-demonstrable` (→ `verdict: inconclusive`), which routes to defer rather than `completed`. This is the crux verifier-infeasible discipline — distinct from the advisory motivation check above; never let an honest infeasibility record land as `proven` or `completed`.
 - preserve the user's requested closeout headings, numbering, and item wording when they materially constrain the final answer
 - do not copy volatile progress notes into the contract
 - do not add a skill requirement unless the user asked for it or the workflow clearly depends on it for correctness, cost control, or operational safety

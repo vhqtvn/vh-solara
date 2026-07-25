@@ -34,6 +34,8 @@ Workflow:
   - next action
   - whether promotion into backlog/checkpoints is recommended later
   - optional `measured_outcome`: the actual result (vs any `predicted_impact` recorded at ready-time), captured here at closeout-time (skip for routine slices)
+  - when the task touched a load-bearing path (a codepath whose end-to-end execution is the actual proof the behavior works): a `behavioral-closure` declaration — `verdict` (proven | inconclusive | failed | abandoned) and `result` (proven | skipped | not-demonstrable, the crux outcome), plus the crux path/verifier/command. `verdict: proven` is honest only when the crux `result: proven`; otherwise the verdict MUST be inconclusive/failed/abandoned. The declaration is honest and non-droppable; it does NOT prove the path executed (that needs the repo-specific live verification). When the verified seam cannot observe the load-bearing outcome (fixture too small, no prior surface, no real scale, no render), the result MUST be `not-demonstrable` (→ `verdict: inconclusive`), which blocks `completed` and routes to defer — never record the infeasibility as silent prose, and never claim `proven` for an outcome the seam could not observe. Omit the declaration for routine slices that touch no load-bearing path.
+  - when the task was driven by a stated motivation (a user-given reason or success motivation): whether that motivation is now satisfied (advisory — distinct from the verdict/crux gate). Record the motivation and the satisfaction verdict in plain prose; this never blends into the behavioral-closure token.
 - call `plan_state` with:
   - `operation: save_coordination_task_closeout`
   - `task_id: $ARGUMENTS`

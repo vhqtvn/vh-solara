@@ -399,6 +399,14 @@ export const planStateTool = tool({
                         args.selector || "",
                         {
                             cwd: context.directory,
+                            // Slice 4 F3 dispatch backstop: when an agent
+                            // resolves a plan to execute it (include_body or
+                            // not), the dispatch-freshness re-check fires for
+                            // approved plans. This is the BACKSTOP — the
+                            // primary gate is at approve_draft. Informational
+                            // reads from the session-context builder call
+                            // resolvePlan directly without this flag.
+                            dispatchFreshnessCheck: true,
                         },
                     );
                     if (!args.include_body) {

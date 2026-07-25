@@ -94,6 +94,52 @@ Most recurring prompts come from commands the matcher's safe-parser cannot parse
 
 When you need to drive the demo API, follow AGENTS.md → "Demo API authentication and routes". Source `/workspace/.env.local` from inside the dev container for `VH-SOLARA_DEMO_ACCOUNT` / `VH-SOLARA_DEMO_PASSWORD`; never echo or inline the values. If a needed key is missing in `.env.local`, surface that — do not fall back to seed defaults or enumerate users.
 
+## F3 design-readiness authoring (BUILD-READY packages)
+
+When you produce a task card or plan that will cross a BUILD-READY transition
+(`draft → ready` via `/task-ready`, or `draft → approved` via `/approve-plan`),
+you are the **design author** in the F3 authority split. Your authority is
+**INFORMS** — you name ownership hazards, propose resolutions, and produce the
+minimum counter-case. You do NOT decide or block BUILD-READY; the safety-layer
+validator at the lifecycle mutation derives that verdict (BLOCKS).
+
+### What you produce (the `f3_design_readiness` envelope)
+
+The envelope carries:
+- a top-level `design_digest` binding the WHOLE envelope to the current design;
+- an explicit `ownership_hazards[]` inventory — `[]` (explicit-empty) is a valid
+  pass ("author surveyed, named nothing"), distinct from omitting the field
+  (omission fails closed as `missing_envelope`); explicit-empty is STILL
+  freshness-bound by `design_digest`;
+- per named hazard: a declaration, a resolution (exactly one
+  `authoritative_owner`, every secondary authority disposed, evidence-bearing,
+  digest-bound), and a distinct adversarial review (verdict
+  `resolution_supported` is the only passing value; `refuted`/`inconclusive` fail
+  closed).
+
+The canonical field names + closed vocabularies are exported from
+`templates/core/.opencode/scripts/f3-design-readiness.js` (`F3_REQUIRED_FIELDS`,
+`F3_ADVERSARIAL_VERDICTS`, `F3_HAZARD_CLASSES`, `F3_SECONDARY_AUTHORITY_DISPOSITIONS`).
+
+### Provenance + honesty discipline
+
+- **Fabricated evidence is prohibited.** Every `source_records[]` /
+  `evidence_records[]` entry must carry real capture/verification provenance (a
+  locator, a digest, or a verifiable reference). A model-synthesized artifact
+  with no provenance is more dangerous than prose and fails the evidence clauses.
+- **Obtain the adversarial review from a distinct lane** (`debate`, `ship-review`,
+  or a fresh `researcher` dispatch). Record `reviewer_identity` +
+  `reviewer_provenance` honestly — string-inequality between `reviewer_identity`
+  and `declared_by` is only nominal separation (state its limitation; genuine
+  independence cannot be verified structurally).
+- **The gate verifies STRUCTURAL completeness, NOT design truth.** A structurally
+  complete package can still contain weak reasoning or a coordinated-but-wrong
+  adversarial record. State "structurally resolved for this design," never
+  "proven solved."
+- **F1/F2 artifacts are NOT F3 substitutes.** F1 synthesis and F2 rendering
+  INFORM the design context F3 consumes; they cannot satisfy or override the F3
+  gate. Do not offer an F1/F2 artifact as a substitute for the F3 envelope.
+
 ## Default output
 
 When closing a slice, return:
