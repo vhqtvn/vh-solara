@@ -1610,6 +1610,28 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			baseline = snap.Seq
 		}
 	}
+	// Phase 3: bootstrap the worker-wide pinned-sessions view on EVERY fresh
+	// /vh/stream connect (both the replay/reconnect branch above and the fresh
+	// branch). Pins are a SEPARATE store from this connection's state.Store:
+	// they are worker-wide (one pins.json under stateBaseDir), not per-project,
+	// and they are NOT carried in the replay ring. So a reconnecting client
+	// cannot catch up on pins via state replay — this pins.snapshot frame IS
+	// the catch-up (live pin mutations arrive later as transient pins.updated
+	// frames, which are also not replayed). Emitted with NO id line (orthogonal
+	// to the state-store resume cursor) AFTER the state bootstrap block and
+	// BEFORE the live-tail loop drains the subscribe channel (SubscribeWith at
+	// ~L1445 already created `ch`, so a mutation landing between this snapshot
+	// read and the live-tail drain is covered EITHER by this snapshot OR by the
+	// queued live pins.updated frame already waiting in `ch`). The payload is
+	// the public pin projection ({revision, initialized, orderedSessionIds});
+	// projectBySessionId is
+	// intentionally omitted (server-internal routing map). Phase 5's stream.ts
+	// listener will dispatch on event "pins.snapshot".
+	if pb, err := json.Marshal(pinsPublicRespFromDoc(s.pins.Snapshot())); err == nil {
+		writeRawNoID(w, "pins.snapshot", pb)
+	} else {
+		vhlog.Warn("pins.snapshot bootstrap: marshal failed, skipping pins frame", "err", err)
+	}
 	flusher.Flush()
 
 	// 15s keepalive ping ticker. A NAMED ping event (not an SSE `:` comment) so
@@ -1625,12 +1647,17 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 				discReason = diag.DiscSubscriberChannelClosed // PROBE 3
 				return                                        // dropped as a slow consumer; client will reconnect + resume
 			}
-			if ev.Kind == "notice" {
-				// Transient alert (state.KindNotice): not part of the replayable
-				// view and it reuses the current head seq, so forward it WITHOUT the
-				// seq-baseline guard and WITHOUT an id line (don't move the resume
-				// cursor). A resuming client never replays it.
-				fmt.Fprintf(w, "event: notice\ndata: %s\n\n", ev.Payload)
+			if ev.Kind == state.KindNotice || ev.Kind == kindPinsUpdated {
+				// Transient fan-out (state.KindNotice or the Phase 3
+				// pins.updated full-state frame): not part of the replayable
+				// view and it reuses the current head seq, so forward it
+				// WITHOUT the seq-baseline guard and WITHOUT an id line (don't
+				// move the resume cursor). A resuming client never replays it —
+				// pins catch up via the pins.snapshot bootstrap frame emitted
+				// above on connect. The SSE event name is ev.Kind itself, so a
+				// notice stays "notice" and a pins.updated becomes
+				// "pins.updated" — Phase 5's stream.ts dispatches on the name.
+				writeRawNoID(w, ev.Kind, ev.Payload)
 				flusher.Flush()
 				continue
 			}
@@ -1685,6 +1712,17 @@ func writeEvent(w io.Writer, seq uint64, kind string, payload []byte) {
 
 func writeRaw(w io.Writer, seq uint64, event string, data []byte) {
 	fmt.Fprintf(w, "id: %d\nevent: %s\ndata: %s\n\n", seq, event, data)
+}
+
+// writeRawNoID writes an SSE frame WITHOUT an `id:` line, so the event does not
+// move the client's Last-Event-ID resume cursor. Used for transient fan-out
+// (notice, pins.updated) and bootstrap frames that are orthogonal to the state
+// store's seq space (pins.snapshot) — events that are NOT part of the
+// replayable ring and must never become a resume point. Mirrors writeRaw minus
+// the id line. The browser listeners (stream.ts) dispatch on the `event:` name
+// and ignore the absence of an id (existing notice/ping frames already omit it).
+func writeRawNoID(w io.Writer, event string, data []byte) {
+	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, data)
 }
 
 // snapshotCompressThreshold is the minimum marshaled-snapshot size above which

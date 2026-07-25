@@ -1,18 +1,23 @@
 package web
 
-// Server-managed pinned sessions — Phase 2: the HTTP API on top of the Phase 1
-// PinStore (commit 89db96e).
+// Server-managed pinned sessions — Phase 2 (HTTP API) + Phase 3 (SSE fan-out).
 //
-// This slice adds GET/PUT /vh/pins handlers, the active-session-projects
-// builder (the authoritative active-session set across all s.aggs), and the
-// strict input-validation helpers. It wires the PinStore into the Server
-// struct (server.go: NewServer constructs it once at startup from
-// filepath.Join(stateBaseDir(), "pins.json")).
+// Phase 2 (commit abc3351) added GET/PUT /vh/pins handlers, the
+// active-session-projects builder (the authoritative active-session set across
+// all s.aggs), and the strict input-validation helpers. It wired the PinStore
+// into the Server struct (server.go: NewServer constructs it once at startup
+// from filepath.Join(stateBaseDir(), "pins.json")).
 //
-// Non-goals (later phases): /vh/stream SSE frames (pins.snapshot /
-// pins.updated), broadcast/fan-out on mutation (Phase 3); handleArchive
-// cleanup hook + session.delete subscriber + reconcile backstop (Phase 4);
-// web/UI changes (Phases 5-6).
+// Phase 3 (this slice) adds the worker-wide broadcast after a committed PUT:
+// FanOutPinsUpdate fans the committed public doc to EVERY s.aggs project store's
+// live subscribers via state.Store.EmitTransient(kindPinsUpdated, …), and the
+// live-tail loop in server.go forwards it as a transient `pins.updated` SSE
+// frame (no id line, not replayed — reconnecting clients catch up via the
+// pins.snapshot bootstrap frame also added in Phase 3).
+//
+// Non-goals (later phases): handleArchive cleanup hook + session.delete
+// subscriber + reconcile backstop (Phase 4); web/UI stream.ts listener (Phases
+// 5-6).
 //
 // Public wire shape: GET and PUT-200/409 responses share pinsPublicResp, which
 // OMITS projectBySessionId (that is internal cleanup metadata — Phase 1's
@@ -32,6 +37,7 @@ import (
 	"strconv"
 
 	"github.com/vhqtvn/vh-solara/pkg/aggregator"
+	"github.com/vhqtvn/vh-solara/pkg/state"
 	"github.com/vhqtvn/vh-solara/pkg/vhlog"
 )
 
@@ -40,6 +46,15 @@ import (
 // accepts any plausible ID format while rejecting pathological/abusive input
 // before it reaches the store. Documented for clients; enforced in handlePinsPut.
 const maxPinIDLen = 256
+
+// kindPinsUpdated is the SSE event name carried on the wire for a transient
+// pin-mutation fan-out (Phase 3). It is pushed via state.Store.EmitTransient,
+// which carries it as ClientEvent.Kind; the live-tail loop in handleStream
+// forwards it with this exact string as the SSE `event:` name (no id line, not
+// replayed). Phase 5's stream.ts listener dispatches on addEventListener(name).
+// A distinct name (rather than a notice sub-kind) keeps it cleanly separable
+// from the established "notice" channel on the wire.
+const kindPinsUpdated = "pins.updated"
 
 // pinsPublicResp is the wire shape for GET /vh/pins and the success/conflict
 // body of PUT /vh/pins. It deliberately OMITS projectBySessionId (internal
@@ -195,7 +210,14 @@ func (s *Server) handlePinsPut(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(pinsPublicRespFromDoc(cur))
 		return
 	}
-	// Success — full committed public doc (same shape as GET).
+	// Success — full committed public doc (same shape as GET). Fan out the
+	// committed state to ALL project stores' live subscribers BEFORE writing
+	// the HTTP response, so a concurrent SSE listener observes the update no
+	// later than the PUT caller receives its 200. cur is the post-write
+	// snapshot returned by Replace, so this emits committed state without an
+	// extra Snapshot() read. Transient (not replayed); reconnect catches up
+	// via the pins.snapshot bootstrap frame.
+	s.FanOutPinsUpdate(cur)
 	writeJSONResp(w, pinsPublicRespFromDoc(cur))
 }
 
@@ -242,4 +264,47 @@ func (s *Server) activeSessionProjects() map[string]string {
 		}
 	}
 	return out
+}
+
+// FanOutPinsUpdate pushes a transient pins.updated full-state frame carrying the
+// committed pin doc to the LIVE subscribers of EVERY active project store
+// (s.aggs). Pins are worker-wide, but /vh/stream is backed by PER-PROJECT
+// state.Store instances — a pin mutation that happened while the operator was
+// viewing project A must still reach a subscriber currently on project B's
+// stream, so the fan-out iterates every aggregator's store, not just the
+// default/active one. Mirrors the activeSessionProjects/handleProjects pattern:
+// s.aggMu is held only to snapshot the dir→aggregator entries; each store's
+// EmitTransient is then called outside the lock.
+//
+// The payload is marshaled ONCE (the public projection, identical to the GET /
+// PUT-200 body) and reused for every store — EmitTransient does not mutate it.
+// EmitTransient (pkg/state) pushes a transient event: it is NOT recorded to the
+// replay ring and does NOT advance seq, so a reconnecting client never replays
+// it (the pins.snapshot bootstrap frame in handleStream is the catch-up). Safe
+// to call from any goroutine (the PUT handler's success path).
+func (s *Server) FanOutPinsUpdate(doc PinsDoc) {
+	raw, err := json.Marshal(pinsPublicRespFromDoc(doc))
+	if err != nil {
+		// Cannot fail for a well-typed pinsPublicResp today; log and skip the
+		// fan-out rather than emitting a nil/"null" frame. The PUT still
+		// returned 200 + the committed doc to the caller — only the live
+		// notification is lost (clients self-correct on next GET/reconnect).
+		vhlog.Warn("pins.updated fan-out: marshal failed, skipping broadcast", "err", err)
+		return
+	}
+	// Snapshot s.aggs under aggMu, then emit outside the lock so a slow
+	// EmitTransient cannot extend the critical section. Only the store is
+	// needed (the fan-out is worker-wide, not per-dir). aggMu acquisition
+	// matches handleProjects/activeSessionProjects even though the test
+	// fixtures mutate s.aggs without the lock (FanOutPinsUpdate is the only
+	// production caller of the locked read).
+	s.aggMu.Lock()
+	live := make([]*state.Store, 0, len(s.aggs))
+	for _, a := range s.aggs {
+		live = append(live, a.Store())
+	}
+	s.aggMu.Unlock()
+	for _, st := range live {
+		st.EmitTransient(kindPinsUpdated, raw)
+	}
 }

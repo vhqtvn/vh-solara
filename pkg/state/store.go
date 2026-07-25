@@ -1143,23 +1143,56 @@ func (s *Store) emit(kind string, payload json.RawMessage) {
 // view events, a notice is not recorded into any snapshot — it is delivered only
 // to currently-connected clients (resuming clients won't replay it). Safe to
 // call from any goroutine.
+//
+// This is the notice-specific form of the generic EmitTransient (which takes a
+// caller-supplied kind): EmitNotice hardcodes KindNotice for the established
+// "notice" wire channel. New full-state transient fan-outs that need their OWN
+// SSE event name (e.g. the web layer's pins.updated) call EmitTransient with
+// their kind, and that kind becomes the SSE `event:` name on the wire (the web
+// loop forwards transient events with no `id:` line, so the resume cursor is
+// untouched).
 func (s *Store) EmitNotice(payload json.RawMessage) {
+	s.EmitTransient(KindNotice, payload)
+}
+
+// EmitTransient fans out a transient event of the given kind to live
+// subscribers. It is the generic, kind-parameterized form of EmitNotice. Like
+// EmitNotice it:
+//   - does NOT record to the replay ring (a resuming client never replays it —
+//     it catches up via a fresh bootstrap snapshot in the relevant domain);
+//   - does NOT advance seq (reuses the current head seq, so resume cursors stay
+//     monotonic — no gap, no duplicate-advance);
+//   - bypasses the per-subscriber Interest filter (a transient event reaches
+//     every LIVE subscriber unconditionally, mirroring EmitNotice — Interest is
+//     a message-class flood filter, irrelevant to a worker-wide full-state
+//     fan-out).
+//
+// The caller-supplied kind is carried as ClientEvent.Kind and becomes the SSE
+// `event:` name on the wire. Callers that need a REPLAYABLE event must use
+// emit() (recorded, seq-stamped) — NOT this. EmitTransient is for full-state,
+// transient fan-out where a fresh bootstrap snapshot is the catch-up (e.g. the
+// web layer's pins.updated, caught up by the pins.snapshot bootstrap frame on
+// reconnect). Safe to call from any goroutine.
+func (s *Store) EmitTransient(kind string, payload json.RawMessage) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// Finding 4: EmitNotice deliberately bypasses s.emit (it must NOT record to
-	// the ring or advance seq — a notice is transient). But it still reports
-	// into Probe 2's atomic class/source counters so notice events are
-	// accounted. Class is structural (ClassifyEmitKind maps "notice" →
-	// structural), source is daemon-generated (the default). PURE ATOMICS
-	// only — consistent with the emit() boundary invariant.
-	cls := diag.ClassifyEmitKind(KindNotice)
+	// Finding 4 (generalized from EmitNotice): EmitTransient deliberately
+	// bypasses s.emit (it must NOT record to the ring or advance seq — it is
+	// transient). But it still reports into Probe 2's atomic class/source
+	// counters so transient events are accounted. Class is derived from the
+	// kind via ClassifyEmitKind (notice → structural; an unknown kind such as
+	// "pins.updated" → EmitClassOther — best-effort, never panics). Source is
+	// daemon-generated (the default). PURE ATOMICS only — consistent with the
+	// emit() boundary invariant (this runs under s.mu).
+	cls := diag.ClassifyEmitKind(kind)
 	diag.Default.Emit.ClassCount[cls].Inc()
 	diag.Default.Emit.ClassBytes[cls].Add(uint64(len(payload)))
 	diag.Default.Emit.SourceCount[diag.SourceDaemonGenerated].Inc()
-	// Fan out WITHOUT recording to the ring or advancing seq: a notice is a live
-	// alert, not part of the replayable view. Reusing the current head seq keeps
-	// resume cursors monotonic (no gap, no duplicate-advance).
-	ev := ClientEvent{Seq: s.seq, Kind: KindNotice, Payload: payload}
+	// Fan out WITHOUT recording to the ring or advancing seq: a transient
+	// event is a live alert, not part of the replayable view. Reusing the
+	// current head seq keeps resume cursors monotonic (no gap, no
+	// duplicate-advance).
+	ev := ClientEvent{Seq: s.seq, Kind: kind, Payload: payload}
 	for id, sub := range s.subs {
 		select {
 		case sub.ch <- ev:
