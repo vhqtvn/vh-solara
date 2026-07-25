@@ -179,6 +179,19 @@ func (s *Server) handleArchive(w http.ResponseWriter, r *http.Request) {
 		s.bgWG.Add(1)
 		s.bgMu.Unlock()
 		go s.reassertArchive(bgCtx, delay, agg, affected, body.SessionID)
+		// Phase 4 Layer 1 — direct archive hook: a successfully-archived session
+		// (and its cascaded subtree in `affected`) is no longer active, so unpin
+		// it from the worker-wide PinStore and broadcast. This runs ONLY on the
+		// archive success path (SetArchived returned 200, or 404/410 for a
+		// session verifiably gone from OpenCode) — a failed archive returned 502
+		// above, before reaching here, so a still-active session is never
+		// unpinned by a failed archive. removePinsAndBroadcast is idempotent
+		// (RemoveIDs is a no-op when none of the ids are present, so IDs already
+		// absent from the live store — or already cleaned by the L2 subscriber
+		// that RemoveSessions' KindSessionDelete fires just above — cost nothing)
+		// and follows the uniform cleanup→broadcast rule. The unarchive branch
+		// above intentionally does NOT unpin: unarchive RESTORES a session.
+		s.removePinsAndBroadcast(affected)
 	}
 	writeJSONResp(w, map[string]any{"ok": true, "affected": affected})
 }
@@ -421,6 +434,13 @@ func (s *Server) handleReloadProject(w http.ResponseWriter, r *http.Request) {
 			s.queueGCMu.Lock()
 			delete(s.queueGCOn, dir)
 			s.queueGCMu.Unlock()
+			// Reset pinsGCOn for the same reason: the next aggFor(dir) builds a
+			// FRESH aggregator (new store, new subs map), and the L2 pins
+			// subscriber must be rebuilt on it. Mirrors the queueGCOn reset
+			// above; pinsGCMu nested inside aggMu (same lock order).
+			s.pinsGCMu.Lock()
+			delete(s.pinsGCOn, dir)
+			s.pinsGCMu.Unlock()
 		}
 		s.aggMu.Unlock()
 	}

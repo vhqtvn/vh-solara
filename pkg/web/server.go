@@ -161,6 +161,18 @@ type Server struct {
 	queueGCMu sync.Mutex
 	queueGCOn map[string]bool
 
+	// pinsGCMu + pinsGCOn guard the one-time, per-dir installation of the L2
+	// session.delete subscriber for pinned-session cleanup (Phase 4). It is the
+	// direct structural mirror of queueGCMu/queueGCOn and shares the exact same
+	// lifecycle: installed from aggFor for the default + every per-dir
+	// aggregator, run exactly once per (dir, aggregator) pair, the goroutine
+	// exits when the store closes its subscriber channels, and
+	// handleReloadProject resets pinsGCOn[dir] when it tears down a per-dir
+	// aggregator so the fresh aggFor(dir) rebuild gets a fresh subscriber. See
+	// installPinsLifecycle (pkg/web/pins_lifecycle.go) for the full rationale.
+	pinsGCMu sync.Mutex
+	pinsGCOn map[string]bool
+
 	// features are the capability modules mounted at startup (B). The
 	// coordination verbs are the first one (dogfood).
 	features []Feature
@@ -343,6 +355,7 @@ func NewServer(agg *aggregator.Aggregator, opencodeURL string, ringCapacity int)
 		watcherOn:     map[string]bool{},
 		watcherCancel: map[string]context.CancelFunc{},
 		queueGCOn:     map[string]bool{},
+		pinsGCOn:      map[string]bool{},
 		bgCtx:         bgCtx,
 		bgCancel:      bgCancel,
 		reassertDelay: defaultReassertDelay,
@@ -410,6 +423,7 @@ func (s *Server) aggFor(dir string) *aggregator.Aggregator {
 		}
 		s.ensurePermissionWatcher("", s.agg)
 		s.installQueueGCCleanup("", s.agg)
+		s.installPinsLifecycle("", s.agg)
 		return s.agg
 	}
 	s.aggMu.Lock()
@@ -440,6 +454,7 @@ func (s *Server) aggFor(dir string) *aggregator.Aggregator {
 	}
 	s.ensurePermissionWatcher(dir, a)
 	s.installQueueGCCleanup(dir, a)
+	s.installPinsLifecycle(dir, a)
 	// Run under a context the aggregator itself can cancel via Stop(), so
 	// handleReloadProject can drop ONE project (a.Stop()) without disturbing the
 	// default or any other project. RunManaged derives the cancellable child and
@@ -605,9 +620,22 @@ func (s *Server) installQueueGCCleanup(dir string, a *aggregator.Aggregator) {
 	// the daemon BEFORE the first HTTP request reaches aggFor("") — without it,
 	// the default dir's orphans would only be cleaned after the NEXT hydrate
 	// (i.e. the next reconnect), not the one that already happened at boot.
-	a.SetOnHydrate(func() { go s.reconcileQueuesForAgg(dir, a) })
+	//
+	// Phase 4 (pins L3 backstop) is COMPOSED INTO this same callback. The
+	// aggregator exposes a SINGLE onHydrate slot (see SetOnHydrate doc:
+	// production installs ONE callback per aggregator, here), so the pins
+	// post-hydrate reconcile piggybacks on it rather than registering a second
+	// callback that would clobber this one. reconcilePinsForAgg is fail-closed
+	// (gated on HydratedOnce, scoped by projectBySessionId) and dispatches to
+	// its own goroutine, so it never blocks hydrate or serializes against the
+	// queue reconcile. See pkg/web/pins_lifecycle.go.
+	a.SetOnHydrate(func() {
+		go s.reconcileQueuesForAgg(dir, a)
+		go s.reconcilePinsForAgg(dir, a)
+	})
 	if a.HydratedOnce() {
 		go s.reconcileQueuesForAgg(dir, a)
+		go s.reconcilePinsForAgg(dir, a)
 	}
 
 	root, err := projectRoot(dir)
