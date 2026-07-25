@@ -591,6 +591,7 @@ func TestPinsL3_PinAddedAfterSnapshotSurvives(t *testing.T) {
 	assertPinsRevision(t, web, docAtT0.Revision+1, "F1: no removal should occur (revision = PUT only)")
 }
 
+// TestPinsL3_ReconcileBroadcastsUpdate confirms the L3 path broadcasts: after a
 // reconcile that removes a pin, a /vh/stream subscriber receives pins.updated.
 func TestPinsL3_ReconcileBroadcastsUpdate(t *testing.T) {
 	srv, web := newPinsTestServer(t)
