@@ -5,7 +5,7 @@ import path from "node:path";
 import { demoDir, projectUrl } from "./util";
 
 // e2e coverage for the composer paste -> attachment wiring, guarding the paste
-// fix that lives (uncommitted) in web/src/lib/paste.ts (harvestPastedFiles) and
+// fix that lives in web/src/lib/paste.ts (harvestPastedFiles) and
 // web/src/components/ChatView.tsx (onPaste / addFiles / flushPendingAttachments).
 //
 // Two regressions this suite exists to catch:
@@ -18,6 +18,29 @@ import { demoDir, projectUrl } from "./util";
 //      addFiles in draft mode now queues the raw File locally (chip shows from
 //      filename) instead of creating a session to upload into; the upload is
 //      deferred to send() -> flushPendingAttachments once a session exists.
+//
+// Test 1 is PARAMETERIZED over the two attachment regimes because addFiles
+// branches on the selected model's vision capability (see ChatView.addFiles and
+// lib/inlineAttach.ts effectiveInline):
+//
+//   NON-VISION (fixture model "dummy", the default; capabilities.attachment =
+//   false): effectiveInline is true, so addFiles takes the INLINE branch. It
+//   does NOT upload; instead it holds the raw File keyed by a synthetic
+//   localId ("inl" + monotonic counter; fresh page -> "inl1"), renders a chip
+//   whose url is vh-attach:<localId>, and INSERTS A MARKDOWN REF at the
+//   textarea caret: ![shot.png](vh-attach:inl1). The composer textarea value
+//   therefore carries the ref text (NOT empty). Upload is deferred to send()
+//   via resolveInlineAttachments (lib/inlineAttach.ts S4).
+//
+//   VISION (fixture model "dummy-think"; capabilities.attachment = true):
+//   effectiveInline is false, so addFiles takes the UPLOAD branch. For a LIVE
+//   session it uploads eagerly via /vh/attach, the chip shows a server-backed
+//   url, and the composer textarea STAYS EMPTY (no text inserted).
+//
+// Both regimes must keep the chip visible (the harvest -> chip wiring is
+// shared). The textarea assertion is what distinguishes them, so the old
+// single toHaveValue("") assertion was STALE for the now-default non-vision
+// path and is replaced by the parameterized pair below.
 //
 // The fixture server is a REAL vh-solara aggregator + web server against a fake
 // OpenCode (tools/fixtureserver). /vh/attach is real and writes the uploaded
@@ -36,7 +59,7 @@ test.use({ permissions: ["clipboard-read", "clipboard-write"] });
 // DataTransfer normally populates BOTH .items AND .files when you items.add() a
 // File, so a naive synthetic paste would attach the file even via the old,
 // files-only code path and never exercise the fix. To reproduce the actual
-// "Ctrl+V does nothing" symptom, we blank clipboardData.files so the file
+// "Ctrl+V does nothing" symptom, we blank ClipboardData.files so the file
 // surfaces ONLY via .items — exactly the condition harvestPastedFiles was added
 // to recover from.
 async function pasteImage(page: Page, filename = "shot.png") {
@@ -58,33 +81,81 @@ async function pasteImage(page: Page, filename = "shot.png") {
   }, filename);
 }
 
-// --- Test 1: existing chat session ------------------------------------------
+// --- Test 1: existing chat session, BOTH attachment regimes ------------------
 // Covers symptom #2 ("does nothing"): pasting a file that surfaces only via
-// .items still attaches it. For a LIVE session addFiles uploads immediately, so
-// the named chip only renders once the /vh/attach round-trip succeeds.
-test("paste into an existing chat session attaches the file (items-only harvest)", async ({
-  page,
-}) => {
-  await page.goto(projectUrl("/"));
-  await page.getByRole("button", { name: /Demo session/ }).click();
-  const ta = page.getByPlaceholder(/Message/);
+// .items still attaches it. The composer-side effect differs by regime (see the
+// header comment), so the pair asserts the regime-specific textarea state in
+// addition to the shared chip-visibility guard.
+//
+// Regime table. `switchModel` mirrors the model-select interaction in
+// features.spec.ts (open .model-btn dialog, pick the row, assert .model-btn-name).
+// `expectInline` selects the textarea assertion: inline regime inserts a
+// markdown ref; upload regime leaves the composer empty.
+const liveSessionRegimes = [
+  {
+    title: "non-vision (dummy) inserts an inline markdown ref",
+    switchModel: false,
+    expectInline: true,
+  },
+  {
+    title: "vision (dummy-think) uploads and leaves the composer empty",
+    switchModel: true,
+    expectInline: false,
+  },
+] as const;
 
-  await pasteImage(page);
+for (const regime of liveSessionRegimes) {
+  test(`paste into an existing chat session attaches the file (items-only harvest) — ${regime.title}`, async ({
+    page,
+  }) => {
+    await page.goto(projectUrl("/"));
+    await page.getByRole("button", { name: /Demo session/ }).click();
+    const ta = page.getByPlaceholder(/Message/);
 
-  // The harvested file becomes an attachment chip showing its filename. For a
-  // live session the chip appears only after uploadFile() completes.
-  const chip = page.locator(".attach-chip", { hasText: "shot.png" });
-  await expect(chip).toBeVisible({ timeout: 8000 });
+    if (regime.switchModel) {
+      // Switch to the vision fixture model so addFiles takes the upload branch.
+      // Mirrors features.spec.ts:8-25 (open dialog, pick row, assert button).
+      await page.locator(".model-btn").click();
+      const dialog = page.getByRole("dialog", { name: "Select model" });
+      await expect(dialog).toBeVisible();
+      await dialog.getByText("Dummy Thinking").click();
+      await expect(page.getByRole("dialog", { name: "Select model" })).toHaveCount(0);
+      // Gate paste on the model actually taking effect before asserting regime.
+      await expect(page.locator(".model-btn-name")).toContainText("Dummy Thinking");
+    } else {
+      // The default selected model on the Demo session is the non-vision
+      // "dummy" fixture (features2.spec.ts:14); confirm it so the inline
+      // branch below is unambiguous.
+      await expect(page.locator(".model-btn-name")).toContainText("Dummy Model");
+    }
 
-  // A harvested file paste calls preventDefault(); no stray text is inserted
-  // into the composer.
-  await expect(ta).toHaveValue("");
-});
+    await pasteImage(page);
+
+    // Shared guard: the harvested file becomes an attachment chip showing its
+    // filename regardless of regime (inline chip uses a synthetic url; upload
+    // chip uses a server-backed url — both carry the filename).
+    const chip = page.locator(".attach-chip", { hasText: "shot.png" });
+    await expect(chip).toBeVisible({ timeout: 8000 });
+
+    if (regime.expectInline) {
+      // Non-vision / inline regime: addFiles inserted a markdown ref at the
+      // caret instead of uploading. Match the pattern (not a hard-coded
+      // localId) so this stays robust as the monotonic counter grows within
+      // a page: ![shot.png](vh-attach:inl<N>).
+      await expect(ta).toHaveValue(/!\[shot\.png\]\(vh-attach:inl\d+\)/);
+    } else {
+      // Vision / upload regime: addFiles uploaded eagerly; no text was
+      // inserted into the composer.
+      await expect(ta).toHaveValue("");
+    }
+  });
+}
 
 // --- Test 2: draft hero attaches WITHOUT navigating away --------------------
 // Covers symptom #1 ("switches to empty session, attachment lost"): pasting into
 // the "Start a new session" draft hero must queue the attachment locally and
-// must NOT create a session / navigate away.
+// must NOT create a session / navigate away. Regime-agnostic for the draft path
+// (both inline and non-inline branches queue locally without navigating).
 test("paste into the draft hero attaches without creating a session", async ({ page }) => {
   await page.goto(projectUrl("/"));
   const treeNew = page.locator(".tree-node", { hasText: "New session" });
