@@ -1196,7 +1196,16 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // Auto-grow the composer up to a cap, then scroll; keep the highlight mirror
   // scrolled in lockstep.
   let taRef: HTMLTextAreaElement | undefined;
-  // Prompt-history navigation: -1 = editing the live draft; >=0 = recalled entry.
+  // Prompt-history navigation. Two recall scopes share one cursor:
+  //   - histMode "session" = plain Up, reads the per-session store (prompts sent
+  //     in THIS session; a fresh draft recalls the "__new__" store).
+  //   - histMode "global"  = Ctrl/Cmd+Up, reads the global store (any session,
+  //     including legacy pre-split data).
+  //   - "none" = editing the live draft. histIdx -1 = live draft; >=0 = recalled
+  //     entry. histDraft is the live-input snapshot captured on the first step
+  //     of a walk, restored when Down steps past zero. Switching scopes
+  //     (Up↔Ctrl+Up) starts a fresh walk so the two stores never share an index.
+  let histMode: "none" | "session" | "global" = "none";
   let histIdx = -1;
   let histDraft = "";
   let mirrorRef: HTMLDivElement | undefined;
@@ -1289,6 +1298,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     setInput(before + item.insert + after);
     const pos = (before + item.insert).length;
     setAcItems([]);
+    histMode = "none";
     histIdx = -1;
     queueMicrotask(() => {
       if (taRef) {
@@ -1331,6 +1341,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       setInput(before + text + cur.slice(end));
       pos = before.length + text.length;
     }
+    histMode = "none";
     histIdx = -1;
     queueMicrotask(() => {
       if (taRef) {
@@ -1464,6 +1475,11 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
         // a stale holdActive could survive. Reset it here alongside the other
         // transient scroll-state resets so a fresh session always starts unheld.
         setHoldActive(false);
+        // Reset prompt-history walk cursors on session switch so an Up/Ctrl+Up
+        // walk started in the previous session doesn't leak its index/mode into
+        // the new session's recall.
+        histMode = "none";
+        histIdx = -1;
         setInput(loadVersioned<string>(draftKey(props.sessionId || "__new__"), 1, "", (o) => (typeof o === "string" ? o : "")));
         // Pin to bottom on the next frame — but only if we're still following.
         // This races the chat-scroll session-switch restore (maybeRestore): if the
@@ -1627,6 +1643,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
           setCaret(ta.selectionStart ?? 0);
         }
       }
+      histMode = "none";
       histIdx = -1;
       return;
     }
@@ -1683,6 +1700,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       // signal so the token is at least present (caret positioning best-effort).
       setInput(input() + ref);
     }
+    histMode = "none";
     histIdx = -1;
   };
 
@@ -2003,7 +2021,8 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       pushNotification({ kind: "info", sessionID: props.sessionId, title: "Busy — turn in progress" });
       return;
     }
-    if (text) pushHistory(text); // recall with Up/Down later
+    if (text) pushHistory(text, props.sessionId || "__new__"); // plain Up (session) + Ctrl+Up (global)
+    histMode = "none";
     histIdx = -1;
     // /undo /redo only make sense for an existing session.
     if (!props.draft && text === "/undo") { setInput(""); return void undo(); }
@@ -2260,22 +2279,51 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       void send();
       return;
     }
-    // Shell-style history recall: Up when the caret is at the very start (so
-    // multi-line editing isn't hijacked); Down steps back toward the live draft.
-    if (e.key === "ArrowUp" && ta && ta.selectionStart === 0 && ta.selectionEnd === 0 && historyLen() > 0) {
-      const next = Math.min(histIdx + 1, historyLen() - 1);
-      const v = historyAt(next);
-      if (v !== undefined) {
-        e.preventDefault();
-        if (histIdx === -1) histDraft = input();
-        histIdx = next;
-        setInput(v);
-        queueMicrotask(() => ta && (ta.selectionStart = ta.selectionEnd = 0));
+    // Shell-style history recall, split by scope:
+    //   - Plain Up with the caret at the very start (so multi-line editing isn't
+    //     hijacked) → walk the PER-SESSION store — only prompts sent in THIS
+    //     session. A fresh draft session (no server id) recalls the shared
+    //     "__new__" store, matching the draft-key convention.
+    //   - Ctrl/Cmd+Up from ANY caret position → walk the GLOBAL store — prompts
+    //     sent in ANY session, including legacy data written before this split.
+    //     The more discoverable global recall skips the caret-start gate.
+    // Down steps back toward the live draft in whichever mode is active. One
+    // index + an active-mode flag: switching scopes (Up↔Ctrl+Up) starts a fresh
+    // walk so the two stores never cross-contaminate by index.
+    const ctrl = e.ctrlKey || e.metaKey;
+    const histSid = props.sessionId || "__new__";
+    if (e.key === "ArrowUp" && ta && (ctrl || (ta.selectionStart === 0 && ta.selectionEnd === 0))) {
+      const mode: "session" | "global" = ctrl ? "global" : "session";
+      const len = mode === "global" ? historyLen() : historyLen(histSid);
+      if (len > 0) {
+        // Capture the live draft exactly once — when starting a walk from the
+        // idle state. Switching scopes mid-walk (Up↔Ctrl+Up) resets the index
+        // but must NOT overwrite the captured draft with a recalled value, or
+        // Down-past-zero would restore the wrong text.
+        const wasIdle = histMode === "none";
+        if (histMode !== mode) {
+          histMode = mode;
+          histIdx = -1;
+        }
+        const next = Math.min(histIdx + 1, len - 1);
+        const v = mode === "global" ? historyAt(next) : historyAt(next, histSid);
+        if (v !== undefined) {
+          e.preventDefault();
+          if (wasIdle && histIdx === -1) histDraft = input();
+          histIdx = next;
+          setInput(v);
+          queueMicrotask(() => ta && (ta.selectionStart = ta.selectionEnd = 0));
+        }
       }
-    } else if (e.key === "ArrowDown" && histIdx >= 0) {
+    } else if (e.key === "ArrowDown" && histMode !== "none" && histIdx >= 0) {
       e.preventDefault();
       histIdx -= 1;
-      setInput(histIdx < 0 ? histDraft : historyAt(histIdx) ?? "");
+      if (histIdx < 0) {
+        histMode = "none";
+        setInput(histDraft);
+      } else {
+        setInput(histMode === "global" ? historyAt(histIdx) ?? "" : historyAt(histIdx, histSid) ?? "");
+      }
     }
   }
 
@@ -2840,7 +2888,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
               ref={taRef}
               class="composer-text"
               value={input()}
-              onInput={(e) => (setInput(e.currentTarget.value), setCaret(e.currentTarget.selectionStart ?? 0), (histIdx = -1))}
+              onInput={(e) => (setInput(e.currentTarget.value), setCaret(e.currentTarget.selectionStart ?? 0), (histMode = "none"), (histIdx = -1))}
               onClick={syncCaret}
               onKeyUp={syncCaret}
               onBlur={() => setTimeout(() => setAcItems([]), 150)}
