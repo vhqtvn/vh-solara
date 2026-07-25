@@ -23,6 +23,7 @@ import {
   setNodeMode,
   applyTreeOpStore,
   hasUserToggled,
+  treeModeMapSignal,
 } from "../../src/sync/treeState";
 import { setSelectedIdRaw } from "../../src/sync/store";
 import { setSelectedId } from "../../src/sync/actions";
@@ -227,10 +228,10 @@ describe("P0-D — selecting an idle nested session reveals it (temp ancestor ch
   });
 });
 
-describe("userToggled — clicking a temp ancestor promotes it (temp → filtered)", () => {
-  //   ROOT (filtered default) ← ancestor of selection → temp
+describe("userToggled — clicking a temp ancestor promotes it (idle temp→expanded, working temp→filtered)", () => {
+  //   ROOT (collapsed, cold-norm) ← ancestor of selection → temp
   //   └─ LEAF ← selected
-  it("a temp ancestor clicked becomes persisted-filtered + toggled (no longer temp)", () => {
+  it("an IDLE temp ancestor clicked becomes persisted-expanded + toggled (temp → expanded, NOT filtered)", () => {
     seedTreeStore([
       node({ id: "ROOT", title: "root", childCount: 1, descendantCount: 1, loaded: true }),
       node({ id: "LEAF", parentId: "ROOT", title: "leaf" }),
@@ -245,31 +246,58 @@ describe("userToggled — clicking a temp ancestor promotes it (temp → filtere
 
     clickTwisty(container as unknown as HTMLElement, "ROOT");
 
-    // After click: a temp-node click promotes it (temp → filtered + cascade).
-    // ROOT's persisted mode goes collapsed → filtered; the click also marks it
-    // toggled, so effectiveTreeMode returns the persisted "filtered" instead of
-    // temp → the eye is gone (chevron renders).
-    expect(modeOf("ROOT")).toBe("filtered");
+    // After click: an idle temp node promotes to EXPANDED (status-sensitive
+    // 2-state cycle — idle never enters "filtered"). ROOT's persisted mode goes
+    // collapsed → expanded; the click also marks it toggled, so effectiveTreeMode
+    // returns the persisted "expanded" instead of temp → the eye is gone.
+    expect(modeOf("ROOT")).toBe("expanded");
     expect(twistyFor(container as unknown as HTMLElement, "ROOT").querySelector("span.twisty-temp")).toBeNull();
     cleanup();
   });
 
-  it("a real selection change clears userToggled so a temp node re-evaluates from scratch", () => {
+  it("a WORKING temp ancestor clicked becomes persisted-filtered + toggled (temp → filtered, 3-state)", () => {
+    // A working node keeps the 3-state cycle: temp → filtered (not expanded).
     seedTreeStore([
-      node({ id: "ROOT", title: "root", childCount: 1, descendantCount: 2, loaded: true }),
+      node({ id: "ROOT", title: "root", childCount: 1, descendantCount: 1, loaded: true, activity: "busy" }),
+      node({ id: "LEAF", parentId: "ROOT", title: "leaf" }),
+    ]);
+    setSelectedIdRaw("LEAF");
+    const { container } = render(() => <SessionTree />);
+    // ROOT is a strict ancestor of LEAF, persisted filtered (absent+working
+    // implicit fallback), not toggled → temp (eye).
+    expect(twistyFor(container as unknown as HTMLElement, "ROOT").querySelector("span.twisty-temp")).not.toBeNull();
+    expect(modeOf("ROOT")).toBe("filtered"); // absent+working → implicit filtered
+
+    clickTwisty(container as unknown as HTMLElement, "ROOT");
+
+    // A working temp click promotes to FILTERED (3-state cycle). ROOT was
+    // implicit-filtered; the click materializes it explicitly + marks toggled.
+    expect(modeOf("ROOT")).toBe("filtered");
+    expect(Object.prototype.hasOwnProperty.call(treeModeMapSignal(), "ROOT")).toBe(true); // now explicit
+    expect(twistyFor(container as unknown as HTMLElement, "ROOT").querySelector("span.twisty-temp")).toBeNull();
+  });
+
+  it("a real selection change clears userToggled so a temp node re-evaluates from scratch", () => {
+    // ROOT must be WORKING so a click promotes temp→filtered (3-state cycle),
+    // keeping the persisted mode non-expanded — temp CAN return after userToggled
+    // clears. Under the absolute invariant, an idle click goes temp→expanded, and
+    // expanded can never be temp again, so this test exercises the working case.
+    seedTreeStore([
+      node({ id: "ROOT", title: "root", childCount: 1, descendantCount: 2, loaded: true, activity: "busy" }),
       node({ id: "MID", parentId: "ROOT", title: "mid", childCount: 1 }),
       node({ id: "LEAF", parentId: "MID", title: "leaf" }),
       node({ id: "OTHER", title: "other" }),
     ]);
     setSelectedIdRaw("LEAF");
     const { container } = render(() => <SessionTree />);
-    // ROOT is temp (eye). Click it → promoted (toggled, no longer temp).
+    // ROOT is temp (eye) — strict ancestor of LEAF, implicit filtered (working),
+    // not toggled. Click it → promoted (working temp→filtered, toggled, no eye).
     clickTwisty(container as unknown as HTMLElement, "ROOT");
     expect(twistyFor(container as unknown as HTMLElement, "ROOT").querySelector("span.twisty-temp")).toBeNull();
 
     // A real selection change via the CANONICAL setter (setSelectedId) clears
     // userToggled synchronously. Re-select LEAF → ROOT is again a strict
-    // ancestor, not toggled → temp returns (eye reappears).
+    // ancestor, not toggled, persisted non-expanded (filtered) → temp returns.
     setSelectedId("OTHER");
     setSelectedId("LEAF");
     expect(twistyFor(container as unknown as HTMLElement, "ROOT").querySelector("span.twisty-temp")).not.toBeNull();
@@ -383,8 +411,8 @@ describe("auto-mutation — temp/userToggled independence", () => {
     setNodeMode("A", "filtered");
     setSelectedIdRaw("LEAF");
     const { container } = render(() => <SessionTree />);
-    // Click A → temp→filtered+cascade; A is now toggled, so effective reflects
-    // the persisted filtered (chevron), not temp (eye).
+    // Click A → temp→filtered (working 3-state); A is now toggled, so effective
+    // reflects the persisted filtered (chevron), not temp (eye).
     clickTwisty(container as unknown as HTMLElement, "A");
     expect(hasUserToggled("A")).toBe(true);
     expect(modeOf("A")).toBe("filtered");

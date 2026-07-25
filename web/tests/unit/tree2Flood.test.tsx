@@ -207,28 +207,32 @@ describe("click transitions — the proj=1 4-state table", () => {
     for (let i = 0; i < 3; i++) expect(treeNode(`c${i}`)).toBeDefined();
   });
 
-  it("collapsed → click → filtered + cascadeFiltered (resident subtree → filtered)", () => {
+  it("idle collapsed → click → expanded (status-sensitive 2-state cycle; NO cascade)", () => {
+    // ABSOLUTE invariant: an idle node is NEVER in "filtered". The idle click
+    // cycle is 2-state: collapsed → expanded (filtered is skipped entirely).
+    // No cascade — each node's mode is toggled independently.
     seedTreeStore([
       node({ id: "root", title: "Root", childCount: 1, descendantCount: 2, loaded: true }),
       node({ id: "mid", parentId: "root", title: "Mid", childCount: 1, loaded: true }),
       node({ id: "leaf", parentId: "mid", title: "Leaf" }),
     ]);
     setNodeMode("root", "collapsed");
-    setNodeMode("mid", "expanded"); // will be overwritten by the cascade
+    setNodeMode("mid", "expanded"); // stays expanded — NO cascade overwrites it
     const { container } = render(() => <SessionTree />);
 
     clickTwisty(container as unknown as HTMLElement, "root");
 
-    expect(modeOf("root")).toBe("filtered");
-    // cascade: the whole resident subtree is now filtered.
-    expect(modeOf("mid")).toBe("filtered");
-    expect(modeOf("leaf")).toBe("filtered");
+    expect(modeOf("root")).toBe("expanded"); // NOT filtered (idle → expanded)
+    // NO cascade: descendants keep their own modes.
+    expect(modeOf("mid")).toBe("expanded"); // unchanged
+    expect(modeOf("leaf")).toBe("collapsed"); // unchanged (cold-norm collapsed)
   });
 
-  it("temp → click → filtered + cascadeFiltered (selected-session ancestor promoted)", () => {
-    //   ROOT (filtered default)
-    //   └─ MID (filtered default)       ← ancestor of the selection → temp
-    //      └─ LEAF (filtered default)   ← selected
+  it("idle temp → click → expanded (status-sensitive; selected-session ancestor promoted to expanded, NO cascade)", () => {
+    //   ROOT (collapsed, cold-norm)       ← ancestor of the selection → temp
+    //   └─ MID (collapsed, cold-norm)     ← ancestor of the selection → temp
+    //      └─ LEAF (collapsed, cold-norm) ← selected
+    // All idle → click is 2-state: temp → expanded (NOT filtered).
     seedTreeStore([
       node({ id: "ROOT", title: "Root", childCount: 1, descendantCount: 2, loaded: true }),
       node({ id: "MID", parentId: "ROOT", title: "Mid", childCount: 1, loaded: true }),
@@ -237,19 +241,34 @@ describe("click transitions — the proj=1 4-state table", () => {
     setSelectedIdRaw("LEAF");
     const { container } = render(() => <SessionTree />);
 
-    // ROOT is a strict ancestor of LEAF, persisted filtered, not toggled → temp.
-    // (Sanity: the eye glyph renders before the click.)
+    // ROOT is a strict ancestor of LEAF, persisted collapsed, not toggled → temp.
     expect(twistyFor(container as unknown as HTMLElement, "ROOT").querySelector("span.twisty-temp")).not.toBeNull();
 
     clickTwisty(container as unknown as HTMLElement, "ROOT");
 
-    expect(modeOf("ROOT")).toBe("filtered");
-    // cascade: resident subtree → filtered.
-    expect(modeOf("MID")).toBe("filtered");
-    expect(modeOf("LEAF")).toBe("filtered");
+    expect(modeOf("ROOT")).toBe("expanded"); // NOT filtered (idle temp → expanded)
+    // NO cascade: descendants keep their own modes (cold-norm collapsed).
+    expect(modeOf("MID")).toBe("collapsed"); // unchanged
+    expect(modeOf("LEAF")).toBe("collapsed"); // unchanged
   });
 
-  it("every click marks ONLY the clicked id in userToggled (cascade marks modes, not toggled)", () => {
+  it("working collapsed → click → filtered (status-sensitive 3-state cycle)", () => {
+    // A WORKING node keeps the 3-state cycle: collapsed → filtered → expanded.
+    seedTreeStore([
+      node({ id: "w", title: "W", childCount: 1, loaded: true, activity: "busy" }),
+      node({ id: "c", parentId: "w", title: "C" }),
+    ]);
+    // w is working+absent → implicit filtered at seed. Set collapsed to exercise
+    // the working collapsed→filtered click edge.
+    setNodeMode("w", "collapsed");
+    const { container } = render(() => <SessionTree />);
+
+    clickTwisty(container as unknown as HTMLElement, "w");
+
+    expect(modeOf("w")).toBe("filtered"); // working collapsed → filtered
+  });
+
+  it("every click marks ONLY the clicked id in userToggled (no subtree marking)", () => {
     seedTreeStore([
       node({ id: "root", title: "Root", childCount: 1, descendantCount: 1, loaded: true }),
       node({ id: "child", parentId: "root", title: "Child" }),
@@ -259,45 +278,60 @@ describe("click transitions — the proj=1 4-state table", () => {
     clickTwisty(container as unknown as HTMLElement, "root");
 
     expect(hasUserToggled("root")).toBe(true);
-    expect(hasUserToggled("child")).toBe(false); // cascade did NOT mark the child
+    expect(hasUserToggled("child")).toBe(false); // only the clicked id is marked
   });
 });
 
-describe("cascade boundaries — resident-only DFS, overwrites persisted, no fetch", () => {
-  it("cascade marks the resident subtree (root + descendants) filtered, overwriting prior modes", () => {
+describe("parent/descendant independence — no cascade, modes are per-node", () => {
+  it("parent enters expanded → descendants keep their own modes (no overwrite)", () => {
+    // The OLD cascade overwrote the entire resident subtree to "filtered" when
+    // the parent was clicked collapsed→filtered. Under the absolute invariant,
+    // there is NO cascade — each node's mode is independent.
     seedTreeStore([
       node({ id: "r", title: "R", childCount: 1, descendantCount: 2, loaded: true }),
       node({ id: "c1", parentId: "r", title: "C1", childCount: 1, loaded: true }),
       node({ id: "c2", parentId: "c1", title: "C2" }),
     ]);
-    // Pre-set conflicting modes to prove the cascade overwrites them.
+    // Pre-set conflicting modes to prove independence.
     setNodeMode("c1", "expanded");
     setNodeMode("c2", "collapsed");
     setNodeMode("r", "collapsed");
     const { container } = render(() => <SessionTree />);
 
-    clickTwisty(container as unknown as HTMLElement, "r"); // collapsed → filtered + cascade
+    clickTwisty(container as unknown as HTMLElement, "r"); // idle collapsed → expanded
 
-    expect(modeOf("r")).toBe("filtered");
-    expect(modeOf("c1")).toBe("filtered"); // overwritten
-    expect(modeOf("c2")).toBe("filtered"); // overwritten
-    // No fetch: cascade performs NO fetch (lazy frontier is separate).
+    expect(modeOf("r")).toBe("expanded");
+    expect(modeOf("c1")).toBe("expanded"); // unchanged — no cascade
+    expect(modeOf("c2")).toBe("collapsed"); // unchanged — no cascade
     expect(expandSpy).not.toHaveBeenCalled();
   });
 
-  it("cascade is resident-only: a non-resident descendant is NOT enumerated (defaults filtered on later fetch)", () => {
-    // r is unloaded (c1 not resident) but has descendants to fetch. Set r
-    // collapsed, then click → filtered + cascade. The cascade enumerates ONLY r
-    // (c1 is not resident). c1's mode is NOT set (absent → default filtered).
-    seedTreeStore([node({ id: "r", title: "R", childCount: 1, descendantCount: 1, loaded: false })]);
+  it("a manually-collapsed WORKING descendant stays collapsed when the parent is clicked (no cascade overwrite)", () => {
+    // This is the key requirement cascade violated: a manually-collapsed-working
+    // descendant should keep its manual choice. Cascade would overwrite it to
+    // "filtered"; independence preserves it.
+    seedTreeStore([
+      node({ id: "r", title: "R", childCount: 1, descendantCount: 2, loaded: true }),
+      node({
+        id: "workingChild",
+        parentId: "r",
+        title: "WorkingChild",
+        childCount: 1,
+        loaded: true,
+        activity: "busy", // working
+      }),
+      node({ id: "gc", parentId: "workingChild", title: "GC" }),
+    ]);
+    // Manually collapse the working descendant (a valid running-collapse choice).
+    setNodeMode("workingChild", "collapsed");
     setNodeMode("r", "collapsed");
     const { container } = render(() => <SessionTree />);
 
-    clickTwisty(container as unknown as HTMLElement, "r");
+    clickTwisty(container as unknown as HTMLElement, "r"); // idle collapsed → expanded
 
-    expect(modeOf("r")).toBe("filtered");
-    // c1 was never resident → not enumerated by the cascade → no mode entry.
-    expect(treeNode("c1")).toBeUndefined();
+    expect(modeOf("r")).toBe("expanded");
+    // The working descendant keeps its manual collapsed mode — cascade is gone.
+    expect(modeOf("workingChild")).toBe("collapsed");
   });
 });
 

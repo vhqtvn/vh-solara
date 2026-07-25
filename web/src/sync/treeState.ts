@@ -164,9 +164,10 @@ export function setNodeMode(id: string, mode: TreeMode): void {
 }
 
 // BATCHED multi-node mode set: accumulates into ONE new map, ONE signal update,
-// ONE localStorage write. Used by cascadeFiltered (resident subtree → "filtered").
-// Do NOT call setNodeMode in a loop here — that would cause N writes + N signal
-// emissions per cascade. The invariant: one immutable update + one write per call.
+// ONE localStorage write. Used by batched callers that need to set many ids to
+// the SAME mode in one immutable replacement. Do NOT call setNodeMode in a loop
+// here — that would cause N writes + N signal emissions. The invariant: one
+// immutable update + one write per call.
 export function setNodesMode(ids: Iterable<string>, mode: TreeMode): void {
   const next = { ...treeModeMap() };
   for (const id of ids) next[id] = mode;
@@ -199,14 +200,6 @@ export function setNodeModes(changes: ReadonlyMap<string, TreeMode>): void {
   saveVersioned(LS_MODE, 1, next);
 }
 
-// Is `id` carrying an EXPLICIT persisted mode entry (as opposed to falling back
-// to the implicit "filtered" default via modeOf())? Cold-load normalization keys
-// on OWN-entry presence — NOT on modeOf(id)==="filtered", which conflates an
-// explicit filtered choice with the absent-fallback.
-function hasExplicitMode(id: string): boolean {
-  return Object.prototype.hasOwnProperty.call(treeModeMap(), id);
-}
-
 // ---- transient userToggled (NOT persisted) ----------------------------------
 // The set of node ids the user CLICKED (the twisty) since the last real
 // selection change. It suppresses the "temp" overlay on a clicked ancestor so a
@@ -224,9 +217,9 @@ export function userToggledSignal(): ReadonlySet<string> {
 export function hasUserToggled(id: string): boolean {
   return userToggled().has(id);
 }
-// Mark ONLY the clicked node (NOT its descendants — cascadeFiltered marks their
-// MODES, not their toggled state, so a later selection change still clears the
-// overlay uniformly).
+// Mark ONLY the clicked node (NOT its descendants — there is no subtree cascade
+// anymore; each node's mode is toggled independently). A later selection change
+// still clears the overlay uniformly.
 export function markUserToggled(id: string): void {
   const next = new Set<string>(userToggled());
   next.add(id);
@@ -425,22 +418,29 @@ export function treeChildrenOf(parentId: string): TreeNode[] {
 
 // §7.1 seed from the initial snapshot: replace the whole map.
 //
-// COLD-LOAD NORMALIZATION + TRANSITION-DRIVEN AUTO-MUTATION (merged into ONE
-// synchronous mixed-mode update BEFORE the tree version is exposed — no first-
-// paint flash). For each resident node in the INCOMING snapshot:
+// COLD-LOAD NORMALIZATION + TRANSITION-DRIVEN AUTO-MUTATION + ABSOLUTE INVARIANT
+// (merged into ONE synchronous mixed-mode update BEFORE the tree version is
+// exposed — no first-paint flash). For each resident node in the INCOMING
+// snapshot:
 //   - if the id was RESIDENT in the PREVIOUS map (a known node), compute the old
 //     →new working() transition against its CURRENT persisted mode and collect
 //     the qualifying edge decision (false→true+collapsed→filtered, or
 //     true→false+filtered→collapsed); any other combination is a no-op.
-//   - if the id is NEW (not in the previous map → a baseline, no edge fires) and
-//     has NO explicit persisted mode entry: an idle node is materialized as
-//     explicit "collapsed" (so a fresh idle branch renders collapsed by default);
+//   - if the id is NEW (not in the previous map → a baseline, no edge fires):
 //     a working node is left ABSENT so modeOf() returns the implicit "filtered"
 //     fallback (so its working children reveal immediately).
-// Explicit persisted entries (collapsed/filtered/expanded) are always preserved,
-// subject only to a genuine transition edge. IDs persisted but not resident in
-// the snapshot are ignored. The complete change set is applied via ONE
-// setNodeModes (ONE signal update + ONE localStorage write) BEFORE bump().
+//   - ABSOLUTE INVARIANT (every resident node, regardless of edge): an idle node
+//     is NEVER in "filtered". Any resident node where !working(node) &&
+//     modeOf(id)==="filtered" (covering BOTH absent-fallback-filtered-idle AND
+//     explicit-persisted-filtered-idle) is materialized/repaired as explicit
+//     "collapsed". This subsumes the former absent-idle→collapsed cold rule AND
+//     repairs stale/reintroduced explicit filtered+idle entries. Working nodes
+//     in "filtered" (absent or explicit) are left as-is (working+filtered valid).
+// Explicit persisted entries are otherwise preserved (collapsed stays collapsed,
+// expanded stays expanded), subject only to a genuine transition edge. IDs
+// persisted but not resident in the snapshot are ignored. The complete change
+// set is applied via ONE setNodeModes (ONE signal update + ONE localStorage
+// write) BEFORE bump().
 //
 // Same-project resync compares against the retained pre-snapshot resident map
 // (oldMap). The queue is invalidated (generation bumped + candidates cleared) so
@@ -450,19 +450,28 @@ export function seedTreeStore(nodes: TreeNode[]): void {
   const newMap = seedTree(nodes);
   const changes = new Map<string, TreeMode>();
   for (const [id, newNode] of newMap) {
-    const oldNode = oldMap.get(id);
-    if (oldNode) {
-      // Already-known node: genuine transition edge (may be undefined → no-op).
-      const prevWorking = working(oldNode);
+    // Compute any genuine working() transition edge target first (may be
+    // undefined for baselines / no-edge / expanded cases).
+    let target: TreeMode | undefined;
+    if (oldMap.has(id)) {
+      const prevWorking = working(oldMap.get(id)!);
       const curWorking = working(newNode);
       const persisted = modeOf(id);
-      const target = autoTreeModeForWorkingTransition(prevWorking, curWorking, persisted);
-      if (target) changes.set(id, target);
-    } else {
-      // New id (baseline): cold-normalize absent idle → explicit collapsed.
-      // Working + absent stays absent (implicit filtered fallback).
-      if (!hasExplicitMode(id) && !working(newNode)) changes.set(id, "collapsed");
+      target = autoTreeModeForWorkingTransition(prevWorking, curWorking, persisted);
     }
+    // The effective mode this node will hold AFTER applying the edge target (or
+    // its current persisted mode / absent-fallback if no edge fires).
+    const effective = target ?? modeOf(id);
+    if (!working(newNode) && effective === "filtered") {
+      // ABSOLUTE invariant: idle + filtered → collapsed. Covers absent-idle
+      // (materialize collapsed) AND explicit-filtered-idle (repair to collapsed).
+      changes.set(id, "collapsed");
+    } else if (target) {
+      // Genuine edge (false→true+collapsed→filtered): apply the promotion.
+      changes.set(id, target);
+    }
+    // else: no edge, not idle+filtered → leave as-is (expanded, collapsed, or
+    // absent+working implicit-filtered).
   }
   map = newMap;
   setNodeModes(changes); // no-op (no write, no notify) if changes is empty
@@ -472,14 +481,24 @@ export function seedTreeStore(nodes: TreeNode[]): void {
 
 // §7.2 apply a single server op verbatim (upsert/remove/move/children/facet).
 //
-// TRANSITION-DRIVEN AUTO-MUTATION (enqueued, not inline): after applying the op,
-// for each id it INTRODUCED/CHANGED (the op payload boundary — NOT a whole-map
-// scan), compare before/after working() for ids present on BOTH sides and enqueue
-// a genuine edge decision through the guarded microtask aggregator (which
-// coalesces, dedupes, revalidates, and flushes in ONE setNodeModes per tick).
-// Newly-introduced ids are baselines: absent+idle → explicit collapsed (cold
-// rule, applied synchronously here, not queued); absent+working → implicit
-// filtered (left absent); no transition.
+// TRANSITION-DRIVEN AUTO-MUTATION + ABSOLUTE INVARIANT (synchronous). After
+// applying the op, for each id it INTRODUCED/CHANGED (the op payload boundary —
+// NOT a whole-map scan):
+//   - compare before/after working() for ids present on BOTH sides; a genuine
+//     PROMOTION edge (false→true+collapsed→filtered) is enqueued through the
+//     guarded microtask aggregator (deferred promotion — coalesces, dedupes,
+//     revalidates, flushes in ONE setNodeModes per tick). The node is now
+//     working, so the synchronous idle-normalization below will NOT touch it
+//     (no conflict between the queued promotion and the sync collapse).
+//   - a DEMOTION edge (true→false+filtered→collapsed) is NOT enqueued: the
+//     synchronous normalization collapses the now-idle node immediately,
+//     avoiding an invalid filtered+idle interval between op application and
+//     microtask flush.
+//   - ABSOLUTE INVARIANT (synchronous, every affected resident node): an idle
+//     node where modeOf(id)==="filtered" (absent-fallback OR explicit persisted)
+//     is collapsed BEFORE callers observe post-op state. This subsumes the
+//     former absent-idle→collapsed cold rule, repairs stale/reintroduced
+//     explicit filtered+idle entries, and applies the demotion edge synchronously.
 //
 // affectedIdsOfOp extracts the op payload boundary: upsert→[node.id];
 // remove→[] (removed ids drop, no transition possible — descendants removed by
@@ -491,7 +510,7 @@ export function applyTreeOpStore(op: TreeOp): void {
   const before = new Map<string, TreeNode | undefined>();
   for (const id of affectedIds) before.set(id, map.get(id));
   applyOp(map, op);
-  const coldChanges = new Map<string, TreeMode>();
+  const syncChanges = new Map<string, TreeMode>();
   for (const id of affectedIds) {
     const after = map.get(id);
     if (!after) continue; // removed by the op (e.g. node.remove) — no transition
@@ -499,18 +518,29 @@ export function applyTreeOpStore(op: TreeOp): void {
     if (prev) {
       const prevWorking = working(prev);
       const curWorking = working(after);
-      if (prevWorking === curWorking) continue; // no edge
-      const persisted = modeOf(id);
-      const target = autoTreeModeForWorkingTransition(prevWorking, curWorking, persisted);
-      if (target) {
-        enqueueAutoModeCandidate(id, persisted, curWorking, target);
+      if (prevWorking !== curWorking) {
+        const persisted = modeOf(id);
+        const target = autoTreeModeForWorkingTransition(prevWorking, curWorking, persisted);
+        // Only PROMOTION edges are queued (deferred, revalidated at flush). A
+        // DEMOTION edge (target==="collapsed") is NOT enqueued — the sync
+        // normalization below collapses the now-idle node before callers observe
+        // an invalid filtered+idle interval.
+        if (target === "filtered") {
+          enqueueAutoModeCandidate(id, persisted, curWorking, target);
+        }
       }
-    } else {
-      // Newly-introduced id (baseline): absent idle → explicit collapsed.
-      if (!hasExplicitMode(id) && !working(after)) coldChanges.set(id, "collapsed");
+    }
+    // ABSOLUTE invariant: an idle resident node is NEVER in "filtered".
+    // Synchronously collapse before callers observe post-op state. Covers
+    // absent+idle (→ explicit collapsed), explicit-filtered+idle (→ repaired),
+    // and the demotion edge (true→false + filtered → collapsed, applied here
+    // rather than via a queued candidate). A promotion candidate enqueued above
+    // is for a WORKING node, so this check does not conflict with it.
+    if (!working(after) && modeOf(id) === "filtered") {
+      syncChanges.set(id, "collapsed");
     }
   }
-  if (coldChanges.size > 0) setNodeModes(coldChanges);
+  if (syncChanges.size > 0) setNodeModes(syncChanges); // ONE signal + ONE LS write
   bump();
 }
 

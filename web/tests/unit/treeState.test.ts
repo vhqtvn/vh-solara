@@ -417,10 +417,14 @@ describe("auto-mutation: cold-load normalization + working edges", () => {
     expect(Object.prototype.hasOwnProperty.call(treeModeMapSignal(), "a")).toBe(false);
   });
 
-  it("(3) explicit 'filtered'-idle survives cold load (explicit preserved)", () => {
+  it("(3) explicit 'filtered'-idle is REPAIRED to 'collapsed' on cold load (absolute invariant)", () => {
+    // Under the ABSOLUTE invariant, an idle node is NEVER in "filtered". A stale
+    // explicit persisted "filtered"+idle entry is repaired to "collapsed" at seed
+    // time (merged into the same batched setNodeModes as the absent-idle rule).
     setNodeMode("a", "filtered");
     seedTreeStore([node({ id: "a" })]);
-    expect(modeOf("a")).toBe("filtered");
+    expect(modeOf("a")).toBe("collapsed");
+    expect(treeModeMapSignal()["a"]).toBe("collapsed"); // materialized explicit
   });
 
   it("(4) explicit 'collapsed'+working on FIRST observation stays collapsed (not an edge)", () => {
@@ -438,29 +442,61 @@ describe("auto-mutation: cold-load normalization + working edges", () => {
     expect(modeOf("a")).toBe("filtered");
   });
 
-  it("(6) known filtered+working → idle becomes 'collapsed' (op-driven edge)", async () => {
+  it("(6) known filtered+working → idle becomes 'collapsed' (op-driven edge, SYNCHRONOUS)", async () => {
     setNodeMode("a", "filtered");
-    seedTreeStore([busyNode({ id: "a" })]); // baseline, explicit filtered preserved
+    seedTreeStore([busyNode({ id: "a" })]); // baseline, explicit filtered preserved (working)
     expect(modeOf("a")).toBe("filtered");
     applyTreeOpStore({ op: "node.facet", data: { id: "a", activity: "idle" } });
-    await flush();
+    // The demotion edge (true→false + filtered) now collapses SYNCHRONOUSLY at
+    // ingestion via the absolute-invariant normalization — no microtask flush
+    // needed. The await is harmless (no candidate was enqueued for the demotion).
     expect(modeOf("a")).toBe("collapsed");
+    await flush();
+    expect(modeOf("a")).toBe("collapsed"); // stays collapsed after flush (no-op)
   });
 
-  it("(6a) IMPLICIT-filtered (absent) working → idle becomes explicit 'collapsed' (op-driven edge)", async () => {
+  it("(6a) IMPLICIT-filtered (absent) working → idle becomes explicit 'collapsed' (op-driven edge, SYNCHRONOUS)", async () => {
     // NO setNodeMode("a", "filtered"): a stays ABSENT, so modeOf("a") ===
     // "filtered" purely via the absent-fallback. This pins the case the op path
     // used to DROP — flush revalidation read raw treeModeMap()[a]===undefined,
     // which !== "filtered" (the expectedSourceMode) and silently dropped the
     // demote candidate, leaking the "no non-running filtered" invariant on the
     // op path while the seed path demoted correctly.
+    //
+    // Under the absolute invariant, the demotion is now SYNCHRONOUS at ingestion
+    // (not enqueued), so it fires regardless of the queue revalidation bug.
     seedTreeStore([busyNode({ id: "a" })]); // baseline: absent+working stays absent
     expect(modeOf("a")).toBe("filtered");
     expect(Object.prototype.hasOwnProperty.call(treeModeMapSignal(), "a")).toBe(false);
     applyTreeOpStore({ op: "node.facet", data: { id: "a", activity: "idle" } });
-    await flush();
-    expect(modeOf("a")).toBe("collapsed");
+    expect(modeOf("a")).toBe("collapsed"); // collapsed SYNCHRONOUSLY, before flush
     expect(treeModeMapSignal()["a"]).toBe("collapsed"); // materialized explicit, NOT left absent
+    await flush();
+    expect(modeOf("a")).toBe("collapsed"); // stays collapsed after flush
+  });
+
+  it("(6c) explicit filtered+idle is repaired SYNCHRONOUSLY on op application (absolute invariant, before flush)", () => {
+    setNodeMode("a", "filtered"); // explicit filtered (valid while working)
+    seedTreeStore([busyNode({ id: "a" })]); // working → filtered preserved
+    expect(modeOf("a")).toBe("filtered");
+    // Facet a → idle. The demotion edge collapses SYNCHRONOUSLY at ingestion —
+    // no invalid filtered+idle interval, no microtask flush needed.
+    applyTreeOpStore({ op: "node.facet", data: { id: "a", activity: "idle" } });
+    expect(modeOf("a")).toBe("collapsed"); // collapsed BEFORE any flush
+  });
+
+  it("(6d) a stale idle+filtered entry is repaired synchronously by ANY op touching the node (no edge needed)", () => {
+    // Simulate a stale v2 re-entry: manually set an invalid idle+filtered state.
+    setNodeMode("a", "filtered");
+    seedTreeStore([node({ id: "a" })]); // cold-load REPAIRS it to collapsed
+    expect(modeOf("a")).toBe("collapsed");
+    // Re-introduce the invalid state (simulating stale localStorage rehydration):
+    setNodeMode("a", "filtered");
+    expect(modeOf("a")).toBe("filtered"); // invalid idle+filtered
+    // A title-only facet (no working change, no edge) still triggers the sync
+    // absolute-invariant normalization on the affected node:
+    applyTreeOpStore({ op: "node.facet", data: { id: "a", title: "x" } });
+    expect(modeOf("a")).toBe("collapsed"); // repaired synchronously
   });
 
   it("(6b) IMPLICIT-filtered (absent) working → idle becomes explicit 'collapsed' (snapshot seed path)", async () => {

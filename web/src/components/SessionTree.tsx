@@ -8,7 +8,6 @@ import {
   treeNode,
   modeOf,
   setNodeMode,
-  setNodesMode,
   markUserToggled,
   userToggledSignal,
 } from "../sync/treeState";
@@ -21,7 +20,6 @@ import {
   working,
   hasKnownDescendants,
 } from "../sync/treeSelectors";
-import { childrenIndex } from "../sync/treeMap";
 import { searchQuery, reconciledPinnedOrder, isPinned } from "../sidebar";
 import { menuTriggers } from "../sessionMenu";
 import TreeRow from "./TreeRow";
@@ -163,21 +161,9 @@ function TreeBranch(props: {
   );
 }
 
-// Resident-only DFS over current child edges (reuses the pure childrenIndex).
-// Includes the root; marks non-resident descendants with NOTHING (they default
-// "filtered" on later fetch). Performs NO fetch. Used by cascadeFiltered.
-function residentSubtreeIds(rootId: string): string[] {
-  const idx = childrenIndex(treeMap());
-  const out: string[] = [];
-  const stack: string[] = [rootId];
-  while (stack.length) {
-    const cur = stack.pop()!;
-    out.push(cur);
-    const kids = idx.get(cur);
-    if (kids) for (const k of kids) stack.push(k.id);
-  }
-  return out;
-}
+// Resident-only DFS over current child edges was REMOVED (cascadeFiltered is
+// gone — the absolute invariant makes cascade redundant for auto-promoted
+// descendants and wrong for manually-collapsed-working ones).
 
 function TreeStateView() {
   // PINS — the pinned group. Built from the FLAT map via selectPinnedNodes, so
@@ -202,15 +188,18 @@ function TreeStateView() {
   const selectedPath = createMemo(() => selectedPathIds(treeMap(), selectedId()));
   const selectedAncestors = createMemo(() => strictAncestors(treeMap(), selectedId()));
 
-  // onToggle — the proj=1 4-state transition table. Capture the effective state
-  // at click BEFORE markUserToggled (so a temp node's click sees it as temp, not
-  // promoted). Every click marks the CLICKED id in userToggled (the clicked id
-  // ONLY — cascade marks descendants' MODES, not their toggled state). The
-  // transition does NOT depend on visibleKids().length.
+  // onToggle — the status-sensitive transition table. Capture the effective
+  // state at click BEFORE markUserToggled (so a temp node's click sees it as
+  // temp, not promoted). Every click marks ONLY the clicked id in userToggled.
+  // The transition depends on working(node), NOT on visibleKids().length.
   //
-  //   collapsed/temp → filtered + cascadeFiltered(id)   (promote + open subtree)
-  //   filtered       → expanded                          (show all, working-first)
-  //   expanded       → collapsed                         (hide all)
+  // ABSOLUTE invariant: an idle node is NEVER in "filtered". So the manual
+  // click cycle is status-sensitive:
+  //   idle:    collapsed|temp → expanded; filtered → expanded (defensive — an
+  //            invalid pre-click state, normally normalized before interaction);
+  //            expanded → collapsed   (2-state: collapsed ↔ expanded)
+  //   working: collapsed|temp → filtered; filtered → expanded;
+  //            expanded → collapsed   (3-state: collapsed → filtered → expanded)
   const onToggle = (n: TreeNode) => {
     const stateAtClick = effectiveTreeMode(
       n.id,
@@ -219,11 +208,11 @@ function TreeStateView() {
       userToggledSignal(),
     );
     markUserToggled(n.id);
+    const isWorking = working(n);
     switch (stateAtClick) {
       case "collapsed":
       case "temp":
-        setNodeMode(n.id, "filtered");
-        setNodesMode(residentSubtreeIds(n.id), "filtered"); // cascade: resident subtree → filtered
+        setNodeMode(n.id, isWorking ? "filtered" : "expanded");
         return;
       case "filtered":
         setNodeMode(n.id, "expanded");

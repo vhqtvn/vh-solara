@@ -436,10 +436,10 @@ describe("stream backfill fires GET /vh/tree/children after the frontier seed", 
 // Pins: (1) modeOf stays "filtered" for a genuinely-absent id; (2) cold
 // normalization materializes collapsed ONLY for resident absent-idle ids;
 // (3) nonresident persisted entries are ignored by cold-norm (preserved, not
-// dropped); (4) explicit filtered-idle is preserved; (5) ONE localStorage write
-// per seed regardless of how many mixed (cold + edge) target changes; (6) ONE
-// write per microtask flush regardless of candidate count; (7) a no-op seed
-// writes ZERO times.
+// dropped); (4) explicit filtered-idle is REPAIRED to collapsed (absolute
+// invariant); (5) ONE localStorage write per seed regardless of how many mixed
+// (cold + edge) target changes; (6) ONE write per microtask flush regardless of
+// candidate count; (7) a no-op seed writes ZERO times.
 // ---------------------------------------------------------------------------
 describe("auto-mutation cold-load normalization + write coalescing", () => {
   beforeEach(() => {
@@ -470,10 +470,13 @@ describe("auto-mutation cold-load normalization + write coalescing", () => {
     expect(modeOf("GHOST")).toBe("expanded"); // nonresident entry preserved untouched
   });
 
-  it("an explicit 'filtered'-idle resident id is preserved (not cold-overridden)", () => {
+  it("an explicit 'filtered'-idle resident id is REPAIRED to 'collapsed' (absolute invariant)", () => {
+    // Under the absolute invariant, an idle node is NEVER in "filtered". A stale
+    // explicit persisted "filtered"+idle entry is repaired to "collapsed" at seed
+    // (merged into the same batched setNodeModes as the absent-idle rule).
     setNodeMode("A", "filtered");
     seedTreeStore([node({ id: "A" })]);
-    expect(modeOf("A")).toBe("filtered");
+    expect(modeOf("A")).toBe("collapsed");
   });
 
   it("ONE localStorage write per seed regardless of mixed cold + edge target changes", () => {
