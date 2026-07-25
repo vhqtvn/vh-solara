@@ -23,7 +23,7 @@ import {
 import { syncUrl } from "./url";
 import { closeSessionStream, connect, resetPageInFlight } from "./stream";
 import { invalidateChildrenIndex } from "./selectors";
-import { resetTreeStore, clearUserToggled } from "./treeState";
+import { resetTreeStore, clearUserToggled, applyTreeOpStore } from "./treeState";
 
 // Selecting any real session leaves draft mode.
 //
@@ -226,6 +226,34 @@ export async function abortSession(sessionID: string) {
 // Optimistically mark a session idle (used right after aborting a turn) so the
 // working indicator clears immediately instead of waiting on server events —
 // OpenCode doesn't always emit an idle event on abort. Later events reconcile.
+//
+// TWO-SLICE CLEAR: there are TWO independent busy indicators driven by TWO
+// different store slices that must both clear synchronously before
+// `markSessionIdle` returns (two store writes sharing one call stack → Solid
+// batches them into one render tick):
+//   1. `.working-text`      ← state.activity[sessionID] (the session-busy map).
+//   2. `.tree-twisty.running` ← working(node) on the tree NODE (node.activity +
+//      node.flags.subtreeBusy), a SEPARATE slice owned by treeState's flat map.
+// Without clearing the tree node, the ring persists until the tree stream
+// delivers a node.facet(idle) op after the /vh/abort round-trip — which can
+// exceed a caller's timeout (the abort e2e flake). Clearing both synchronously
+// here (two store writes in one call stack, batched into one Solid render tick)
+// makes the ring clear with the shimmer, regardless of when the tree stream's
+// idle event later arrives (it becomes a reconciling no-op). Mirrors how the
+// normal-completion path (stream.ts case "activity" idle) stamps time.completed
+// in the same produce() draft that clears activity — the same
+// two-indicators-one-tick intent, here expressed as two synchronous store
+// writes (treeState is a separate store, so it can't share the session-store's
+// produce() draft).
+//
+// RE-ARMING SAFETY: /vh/abort marks the session idle SERVER-SIDE authoritatively,
+// so any post-abort snapshot or facet op the server emits carries idle — the
+// optimistic clear agrees with the authoritative state, never fighting it. A
+// stale pre-abort snapshot is the same risk state.activity already has (and the
+// server's authoritative idle wins on the next frame). subtreeNeedsInput is
+// intentionally NOT cleared: abort kills the busy turn, not a pending input
+// request (an input-waiting session is a different concern the abort test does
+// not exercise); the server reconciles it if the abort also cancelled the input.
 export function markSessionIdle(sessionID: string) {
   setState(
     produce((s) => {
@@ -239,6 +267,18 @@ export function markSessionIdle(sessionID: string) {
       }
     }),
   );
+  // Clear the tree node's working state via the canonical facet path so the
+  // auto-mutation/normalization logic (working→idle demotion edge) runs
+  // consistently with a tree-stream-delivered facet. If the node is not
+  // resident (no tree entry), applyTreeOpStore's facet case is a no-op.
+  applyTreeOpStore({
+    op: "node.facet",
+    data: {
+      id: sessionID,
+      activity: "idle",
+      flags: { subtreeBusy: false },
+    },
+  });
 }
 
 // Clear the latched epoch-transition flag. Set by applySnapshot (stream.ts) when

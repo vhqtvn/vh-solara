@@ -1,7 +1,63 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 import { projectUrl } from "./util";
 
 // Fixture-backed tests for the parallel-session / permission UX.
+
+// === Deterministic red for the abort ring-clear flake (debugging-loop) =========
+//
+// The `.working-text` shimmer and the `.tree-twisty.running` ring read TWO
+// DIFFERENT store slices:
+//   - `.working-text`   ← state.activity[sessionID]  (the session-busy map,
+//                          cleared optimistically by markSessionIdle on abort).
+//   - `.tree-twisty.running` ← working(node)         (the tree NODE's own
+//                          activity + flags.subtreeBusy, a SEPARATE slice updated
+//                          only when the TREE stream delivers a node.facet(idle)
+//                          op after the /vh/abort round-trip).
+//
+// On abort, markSessionIdle cleared state.activity but NOT the tree node. The
+// ring persisted until the tree stream's idle facet landed — a round-trip +
+// delivery that CAN exceed the test's 2s timeout (the "1 flaky" in CI). This
+// harness delays EVERY tree-stream event so the idle facet ALWAYS lags past 2s,
+// turning the flake into a deterministic red (then green after the fix).
+//
+// Tree-stream identification: the tree stream URL has an EMPTY sessions= param
+// (subscribes to ALL sessions); the per-session stream URL has sessions=<id>.
+// The regex /[?&]sessions=(&|$)/ matches the empty-param form.
+const TREE_STREAM_DELAY_MS = 3000;
+
+async function installTreeStreamDelay(page: Page, delayMs: number) {
+  await page.addInitScript((delay) => {
+    const OrigES = (window as any).EventSource;
+    function DelayedES(url: string, opts?: any) {
+      const es = opts !== undefined ? new OrigES(url, opts) : new OrigES(url);
+      // Tree stream = empty sessions= param. Delay EVERY event on it so the
+      // idle facet (node.facet activity:idle via tree.op, or the "activity"
+      // detail event) always arrives past the abort test's 2s assertion timeout.
+      const isTreeStream = typeof url === "string" && /[?&]sessions=(&|$)/.test(url);
+      if (isTreeStream) {
+        const origAdd = es.addEventListener.bind(es);
+        es.addEventListener = function (type: string, listener: any, options?: any) {
+          return origAdd(
+            type,
+            (ev: MessageEvent) => {
+              setTimeout(() => {
+                if (typeof listener === "function") listener(ev);
+                else if (listener) listener.handleEvent(ev);
+              }, delay);
+            },
+            options,
+          );
+        };
+      }
+      return es;
+    }
+    DelayedES.prototype = OrigES.prototype;
+    (DelayedES as any).CLOSED = OrigES.CLOSED;
+    (DelayedES as any).OPEN = OrigES.OPEN;
+    (DelayedES as any).CONNECTING = OrigES.CONNECTING;
+    (window as any).EventSource = DelayedES;
+  }, delayMs);
+}
 
 test("sending a prompt shows a working indicator (running ring) that returns to idle", async ({ page }) => {
   await page.goto(projectUrl("/"));
@@ -57,12 +113,24 @@ test("Up-arrow recalls a previously sent prompt", async ({ page }) => {
 });
 
 test("Stop clears the working indicator immediately (abort)", async ({ page }) => {
+  test.setTimeout(30000); // 3s tree-stream delay absorbs into the indicator waits
+  // Install the tree-stream delay BEFORE goto so the SPA's EventSource is wrapped
+  // before it constructs the tree-stream connection.
+  await installTreeStreamDelay(page, TREE_STREAM_DELAY_MS);
   await page.goto(projectUrl("/"));
   await page.getByRole("button", { name: /Demo session/ }).click();
   // [[stall]] keeps the turn busy server-side for several seconds.
   await page.getByPlaceholder("Message…").fill("[[stall]] hang please");
   await page.keyboard.press("Enter");
-  await expect(page.locator(".working-text")).toBeVisible({ timeout: 5000 });
+  // The tree-stream delay means BOTH indicators (state.activity via the
+  // "activity" SSE event, AND the tree node facet via tree.op) arrive
+  // ~TREE_STREAM_DELAY_MS after the prompt. Wait generously for each.
+  await expect(page.locator(".working-text")).toBeVisible({ timeout: 10000 });
+  // CRITICAL: wait for the RING to appear before clicking Stop. Without this the
+  // assertion below is vacuous — if the ring never mounted, toHaveCount(0) passes
+  // trivially. Waiting here proves the tree node IS busy (working(node)===true)
+  // at the moment Stop is clicked.
+  await expect(page.locator(".tree-twisty.running").first()).toBeVisible({ timeout: 10000 });
 
   // Stop aborts on the server AND clears the local working state right away.
   // The fixture's OpenCode layer emits no idle on abort (like real OpenCode);
@@ -70,7 +138,14 @@ test("Stop clears the working indicator immediately (abort)", async ({ page }) =
   // the client clears optimistically too — so the indicator must be gone at
   // once and STAY gone (a reconnect snapshot can't re-arm a stopped turn).
   await page.locator(".send-btn.stop").click();
+  // .working-text reads state.activity — cleared optimistically by
+  // markSessionIdle (instant, no tree-stream dependency).
   await expect(page.locator(".working-text")).toHaveCount(0, { timeout: 2000 });
+  // .tree-twisty.running reads working(node) — the tree node's state. markSessionIdle
+  // must clear the tree node's activity + flags.subtreeBusy in the SAME flush as
+  // state.activity; otherwise the ring persists until the tree stream delivers
+  // node.facet(idle) — delayed TREE_STREAM_DELAY_MS here, so it would persist
+  // past 2s (RED without the fix). With the fix the ring clears instantly.
   await expect(page.locator(".tree-twisty.running")).toHaveCount(0, { timeout: 2000 });
 });
 
