@@ -5,6 +5,7 @@
 import type { Part, SessionMessages, TodoItem } from "../types";
 import { toolSubject, toolVerb } from "../lib/toolLabel";
 import { state } from "./store";
+import { treeNode } from "./treeState";
 
 // The root of a session (top of the parentID chain that's still in the store).
 export function rootOf(id: string): string {
@@ -96,29 +97,49 @@ export function sessionLastAgent(id: string): string | undefined {
   return state.lastAgents[id];
 }
 
-// True when a session OR any of its subagents has a pending permission/question
-// (a typed reply it's blocked on). Reactive — clears itself when the request is
-// resolved. Surfaced in the session list and used to auto-ack the in-app nudge.
+// True when a session has a pending permission/question (a typed reply it's
+// blocked on) — either its OWN request or a descendant's, rolled up by the
+// server. Reactive — clears itself when the request is resolved. Surfaced in
+// the session list and used to auto-ack the in-app nudge.
+//
+// P1 (C2): trusts the SERVER-COMPUTED flags.subtreeNeedsInput facet on the tree
+// node (the same source TreeRow uses) — NO client-side subtree walk. For a node
+// NOT resident in the tree flat map, falls back to the node's OWN pending
+// permission/question only (Q1 self-only fallback — a passive status lookup
+// must never trigger implicit tree expansion or walk the detail-store topology).
 export function sessionNeedsInput(sessionID: string): boolean {
-  for (const id of subtreeSessionIds(sessionID)) {
-    if (Object.keys(state.permissions[id] || {}).length > 0) return true;
-    if (Object.keys(state.questions[id] || {}).length > 0) return true;
+  const node = treeNode(sessionID);
+  if (node) {
+    return node.flags.pendingInput || !!node.flags.subtreeNeedsInput;
   }
-  return false;
+  return (
+    Object.keys(state.permissions[sessionID] || {}).length > 0 ||
+    Object.keys(state.questions[sessionID] || {}).length > 0
+  );
 }
 
-// Whether a session is actively working. Purely the authoritative activity
-// signal (matches opencode web: status.type !== "idle"), recovered on hydrate
-// from /session/status. No message-based heuristic — a turn terminated
-// mid-generation leaves an incomplete last message but is NOT busy, and must not
-// spin forever.
+// Whether a session is actively working (busy/retry). Matches opencode web:
+// status.type !== "idle". No message-based heuristic — a turn terminated
+// mid-generation leaves an incomplete last message but is NOT busy, and must
+// not spin forever.
+//
+// P1 (C1): trusts the SERVER-COMPUTED flags.subtreeBusy facet on the tree node
+// (the same source treeSelectors.working() uses for the tree row) — NO client-
+// side subtree walk. A running subagent (child) keeps its parent chain "working"
+// because the server rolls busy/retry up into subtreeBusy on every ancestor.
+// For a node NOT resident in the tree flat map, falls back to the node's OWN
+// activity only (Q1 self-only fallback — never walk the detail-store topology).
+//
+// SELF activity is read from state.activity[id] (NOT treeNode().activity) so the
+// reactive flush aligns with the cross-stream completion bridge: that bridge
+// stamps time.completed on the last assistant message in the SAME produce() that
+// updates state.activity[id]. Reading state.activity here keeps .working-text
+// unmounting in the same Solid flush as .md-stream (time.completed → settled),
+// so neither outlives the other regardless of cross-stream event ordering.
 export function sessionWorking(sessionID: string): boolean {
   if (isActivityWorking(state.activity[sessionID])) return true;
-  // A running subagent (child) session keeps its parent chain "working" too.
-  // OpenCode's /session/status marks only the child (delegate) session busy, so
-  // the root/parent would otherwise render idle while its subagent is still
-  // generating. Propagate busy/retry up by checking descendants.
-  return descendantWorking(sessionID);
+  const node = treeNode(sessionID);
+  return !!node?.flags.subtreeBusy;
 }
 
 export function isActivityWorking(act?: string): boolean {
@@ -154,29 +175,6 @@ export function rootSessionCount(): number {
     n++;
   }
   return n;
-}
-
-function descendantWorking(sessionID: string): boolean {
-  // O(subtree) walk over the cached parent→children index (was O(stack × all
-  // sessions) via anyDescendantWorking). `seen` preserves the cycle-safety
-  // the old anyDescendantWorking carried — never trips on a tree, but kept as
-  // a guard against malformed parent loops.
-  const idx = childrenIndex();
-  const stack = [sessionID];
-  const seen = new Set<string>([sessionID]);
-  while (stack.length) {
-    const id = stack.pop()!;
-    const kids = idx[id];
-    if (!kids) continue;
-    for (let i = 0; i < kids.length; i++) {
-      const c = kids[i];
-      if (seen.has(c)) continue;
-      seen.add(c);
-      if (isActivityWorking(state.activity[c])) return true;
-      stack.push(c);
-    }
-  }
-  return false;
 }
 
 // What the agent is doing right now, surfaced as the Working pill's verb + an
@@ -292,11 +290,13 @@ export function normalizeTodos(v: any): TodoItem[] {
 // up like running state does, so a parent's indicator surfaces the todos its
 // subagents are working — without having to open each subsession.
 //
-// Uses the cached parent→children index (see childrenIndex /
-// invalidateChildrenIndex below) so the per-call cost is O(subtree), not
-// O(all-sessions). At cold mount (~100 sessions × ~100 SessionTree Nodes
-// calling sessionNeedsInput) this is the difference between ~10,000
-// synchronous ops and ~100.
+// NOTE: as of P1, sessionWorking/sessionNeedsInput trust the SERVER-COMPUTED
+// tree facets (flags.subtreeBusy / subtreeNeedsInput) and no longer walk this
+// index. This function remains the sole consumer of the cached detail-store
+// parent→children index, used only by sessionTodos/sessionTodoCounts (subtree
+// todo rollup — C5/P5, still a client-side aggregate until a server endpoint
+// ships). It uses the cached index so the per-call cost is O(subtree), not
+// O(all-sessions).
 function subtreeSessionIds(rootID: string): string[] {
   const idx = childrenIndex();
   const out: string[] = [];
@@ -312,20 +312,22 @@ function subtreeSessionIds(rootID: string): string[] {
 
 // --- Parent→children index (Fix A: kills the O(N²) cold-mount freeze) -------
 //
-// subtreeSessionIds / descendantWorking USED to rebuild a `childrenOf` index by
-// walking ALL sessions on EVERY call. With ~100 sessions at cold mount and
-// ~100 Node components each calling sessionNeedsInput() once, that was ~10,000
-// ops in a single synchronous render — the main-thread freeze on Android
-// Chrome the operator reported ("page completely freezes until all loading
-// finished").
+// subtreeSessionIds USED to rebuild a `childrenOf` index by walking ALL sessions
+// on EVERY call. With ~100 sessions at cold mount and ~100 Node components each
+// calling a subtree-walking selector once, that was ~10,000 ops in a single
+// synchronous render — the main-thread freeze on Android Chrome the operator
+// reported ("page completely freezes until all loading finished").
 //
-// The index is now built lazily on first read after a mutation and reused
-// across all subsequent selector calls until invalidated. The THREE production
-// mutation sites — applySnapshot (wholesale replace), applySessionEvent
-// (session.upsert / session.delete), and switchProject (wholesale replace on
-// project switch) — all call invalidateChildrenIndex() after the store update.
-// Tests that mutate state.sessions directly must call it too (mirrors the
-// existing reconcile({}) reset convention).
+// P1 shrank the index's user set: sessionWorking and sessionNeedsInput now trust
+// the SERVER-COMPUTED tree facets (flags.subtreeBusy / subtreeNeedsInput) and no
+// longer touch this index. Only sessionTodos (the subtree-todo rollup, C5/P5)
+// still walks it. The index is built lazily on first read after a mutation and
+// reused across all subsequent sessionTodos calls until invalidated. The THREE
+// production mutation sites — applySnapshot (wholesale replace),
+// applySessionEvent (session.upsert / session.delete), and switchProject
+// (wholesale replace on project switch) — all call invalidateChildrenIndex()
+// after the store update. Tests that mutate state.sessions directly must call
+// it too (mirrors the existing reconcile({}) reset convention).
 //
 // Correctness under live updates: the index is a pure function of
 // state.sessions keyed on parentID. An orphan child (parentID pointing to a

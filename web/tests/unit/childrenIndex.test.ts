@@ -1,21 +1,25 @@
 // @vitest-environment jsdom
 //
 // Correctness + perf tests for the cached parent→children index that backs
-// subtreeSessionIds / descendantWorking (Fix A for the cold-mount freeze).
+// subtreeSessionIds (Fix A for the cold-mount freeze).
 //
-// The index itself is not exported; we exercise it through the public
-// selectors that consume it — sessionNeedsInput, sessionTodos, sessionWorking,
-// runningSessionCount — and assert they (a) match a full recompute of the
-// pre-fix semantics across topologies, (b) stay correct after each mutation
-// kind (upsert / delete / wholesale replace), and (c) build the index O(1)
-// across many selector calls, NOT O(N) per call (the perf-correctness test).
+// The index itself is not exported; we exercise it through the public selectors
+// that consume it. As of P1, sessionWorking/sessionNeedsInput trust the SERVER-
+// COMPUTED tree facets and no longer touch this index — only sessionTodos (the
+// subtree-todo rollup, C5/P5) still walks it. The sessionTodos tests below
+// verify (a) the index matches a full recompute across topologies, (b) stays
+// correct after each mutation kind, and (c) builds O(1) across many calls. The
+// sessionWorking/sessionNeedsInput tests verify facet-trusting + self-only
+// fallback (P1's split-brain collapse).
 //
-// jsdom is required because the selectors read the Solid singleton store and
-// invalidation is wired through stream.ts's apply* helpers (which schedule
-// timers via window.setTimeout).
+// jsdom is required because the selectors read the Solid singleton store, the
+// tree flat-map store, and invalidation is wired through stream.ts's apply*
+// helpers (which schedule timers via window.setTimeout).
 import { beforeEach, describe, expect, it } from "vitest";
 import { produce, reconcile } from "solid-js/store";
 import { setState, state } from "../../src/sync/store";
+import { seedTreeStore, resetTreeStore } from "../../src/sync/treeState";
+import type { TreeNode } from "../../src/sync/treeMap";
 import {
   invalidateChildrenIndex,
   __childrenIndexBuildCountForTest,
@@ -30,6 +34,37 @@ import type { Session, TodoItem } from "../../src/types";
 // A minimal session shape (the selectors only read id + parentID).
 function sess(id: string, parentID?: string): Session {
   return { id, ...(parentID ? { parentID } : {}) } as Session;
+}
+
+// A minimal tree node for facet-trusting tests. Only the fields the selectors
+// read (activity + flags) are parameterised; the rest are inert defaults.
+function tNode(
+  id: string,
+  opts?: {
+    parentId?: string | null;
+    activity?: string;
+    subtreeBusy?: boolean;
+    subtreeNeedsInput?: boolean;
+    pendingInput?: boolean;
+  },
+): TreeNode {
+  return {
+    id,
+    parentId: opts?.parentId ?? null,
+    title: id,
+    activity: (opts?.activity ?? "idle") as TreeNode["activity"],
+    childCount: 0,
+    loaded: false,
+    flags: {
+      pendingInput: opts?.pendingInput ?? false,
+      subtreeNeedsInput: opts?.subtreeNeedsInput ?? false,
+      subtreeBusy: opts?.subtreeBusy,
+      permission: false,
+      archived: false,
+      orphan: false,
+    },
+    updatedMs: 0,
+  };
 }
 
 // Bulk-load sessions into the store and invalidate the index exactly once
@@ -63,6 +98,7 @@ beforeEach(() => {
   setState("todos", reconcile({}));
   invalidateChildrenIndex();
   __resetChildrenIndexBuildCountForTest();
+  resetTreeStore();
 });
 
 describe("childrenIndex correctness — subtreeSessionIds via sessionTodos", () => {
@@ -104,77 +140,105 @@ describe("childrenIndex correctness — subtreeSessionIds via sessionTodos", () 
   });
 });
 
-describe("childrenIndex correctness — descendantWorking via sessionWorking", () => {
-  it("detects a busy descendant (busy propagation up the tree)", () => {
-    loadSessions([sess("root"), sess("child", "root"), sess("grand", "child")]);
-    setState("activity", "grand", "busy");
+describe("sessionWorking — trusts server subtreeBusy facet (+ self-only fallback)", () => {
+  it("returns true when the node's own activity is busy/retry (self via state.activity)", () => {
+    // Self activity is read from state.activity[id] (the detail store), NOT
+    // treeNode().activity — this is what keeps the reactive flush aligned with
+    // the cross-stream completion bridge (see sessionWorking comment).
+    setState("activity", "root", "busy");
     expect(sessionWorking("root")).toBe(true);
-    expect(sessionWorking("child")).toBe(true);
-    expect(sessionWorking("grand")).toBe(true);
+    setState("activity", "root", "retry");
+    expect(sessionWorking("root")).toBe(true);
   });
 
-  it("does NOT propagate busy from a sibling subtree", () => {
-    loadSessions([
-      sess("root"),
-      sess("a", "root"),
-      sess("b", "root"),
-      sess("a1", "a"),
-      sess("b1", "b"),
+  it("returns true when flags.subtreeBusy is set (server rolls up descendants)", () => {
+    // The server sets subtreeBusy on every ancestor of a busy descendant.
+    // The FE must trust it WITHOUT walking its own detail-store topology.
+    seedTreeStore([
+      tNode("root", { subtreeBusy: true }),
+      tNode("child", { parentId: "root" }),
     ]);
-    setState("activity", "b1", "busy");
-    expect(sessionWorking("root")).toBe(true); // b1 is a descendant of root
-    expect(sessionWorking("a")).toBe(false); // a's subtree is idle
-    expect(sessionWorking("b")).toBe(true);
+    expect(sessionWorking("root")).toBe(true);
+    expect(sessionWorking("child")).toBe(false); // child itself is idle
   });
 
-  it("treats 'retry' as working but not 'idle' or 'error'", () => {
-    loadSessions([sess("root"), sess("c", "root")]);
-    setState("activity", "c", "retry");
-    expect(sessionWorking("root")).toBe(true);
-    setState("activity", "c", "idle");
-    expect(sessionWorking("root")).toBe(false);
-    setState("activity", "c", "error");
+  it("returns false for an idle resident node with no subtreeBusy", () => {
+    seedTreeStore([tNode("root", { activity: "idle" })]);
     expect(sessionWorking("root")).toBe(false);
   });
 
-  it("runningSessionCount counts each running subtree ONCE (root-level rollup)", () => {
-    loadSessions([
-      sess("r1"), sess("r1c", "r1"),
-      sess("r2"),
-      sess("r3"), sess("r3c", "r3"),
+  it("does NOT treat 'error' as working", () => {
+    setState("activity", "root", "error");
+    expect(sessionWorking("root")).toBe(false);
+  });
+
+  it("non-resident node: self-only fallback reads state.activity (NO subtree walk)", () => {
+    // Node NOT in the tree flat map — only in the detail store. A busy
+    // DESCENDANT in the detail store must NOT propagate up (P1 collapsed
+    // the split-brain; the subtree aggregate is the server facet's job).
+    loadSessions([sess("root"), sess("child", "root")]);
+    setState("activity", "child", "busy");
+    expect(sessionWorking("root")).toBe(false); // root's own activity is idle
+    expect(sessionWorking("child")).toBe(true); // child's own activity is busy
+  });
+
+  it("runningSessionCount counts resident roots whose subtreeBusy facet is set", () => {
+    // Roots must be in state.sessions (runningSessionCount iterates it); their
+    // working status comes from the tree facet (resident) or self-only fallback.
+    loadSessions([sess("r1"), sess("r1c", "r1"), sess("r2"), sess("r3"), sess("r3c", "r3")]);
+    seedTreeStore([
+      tNode("r1", { subtreeBusy: true }),
+      tNode("r1c", { parentId: "r1", activity: "busy" }),
+      tNode("r2"),
+      tNode("r3"),
+      tNode("r3c", { parentId: "r3" }),
     ]);
-    // Only r1's subtree is working.
-    setState("activity", "r1c", "busy");
-    expect(runningSessionCount()).toBe(1);
-    // r2 itself working.
+    expect(runningSessionCount()).toBe(1); // only r1's subtree is working
+    // r2 becomes busy via its own activity (self-only path).
     setState("activity", "r2", "busy");
-    expect(runningSessionCount()).toBe(2);
-    // r3 idle subtree.
     expect(runningSessionCount()).toBe(2);
   });
 });
 
-describe("childrenIndex correctness — sessionNeedsInput subtree rollup", () => {
-  it("detects a pending permission on a deep descendant", () => {
-    loadSessions([sess("root"), sess("child", "root"), sess("grand", "child")]);
-    setState("permissions", "grand", { p1: { id: "p1", sessionID: "grand" } });
-    expect(sessionNeedsInput("root")).toBe(true);
-    expect(sessionNeedsInput("child")).toBe(true);
-    expect(sessionNeedsInput("grand")).toBe(true);
-  });
-
-  it("detects a pending question (not just permission)", () => {
-    loadSessions([sess("root"), sess("c", "root")]);
-    setState("questions", "c", { q1: { id: "q1", sessionID: "c", questions: [] } });
+describe("sessionNeedsInput — trusts server subtreeNeedsInput facet (+ self-only fallback)", () => {
+  it("returns true when flags.subtreeNeedsInput is set on a resident node", () => {
+    seedTreeStore([tNode("root", { subtreeNeedsInput: true })]);
     expect(sessionNeedsInput("root")).toBe(true);
   });
 
-  it("clears when the descendant's pending request is resolved", () => {
-    loadSessions([sess("root"), sess("c", "root")]);
-    setState("permissions", "c", { p1: { id: "p1", sessionID: "c" } });
+  it("returns true when flags.pendingInput is set on a resident node (self)", () => {
+    seedTreeStore([tNode("root", { pendingInput: true })]);
     expect(sessionNeedsInput("root")).toBe(true);
-    setState("permissions", "c", reconcile({}));
+  });
+
+  it("returns false for a resident node with no pending input flags", () => {
+    seedTreeStore([tNode("root")]);
     expect(sessionNeedsInput("root")).toBe(false);
+  });
+
+  it("resident node: server facet OVERRIDES detail-store permissions (pins authority)", () => {
+    // A RESIDENT node with clear tree flags must return false even if the
+    // detail-store permissions/questions map is non-empty — the server facet
+    // is the authority, not the detail store. This is the inverse of the
+    // non-resident fallback and pins the split-brain collapse.
+    seedTreeStore([tNode("root")]); // no pendingInput / subtreeNeedsInput
+    setState("permissions", "root", { p1: { id: "p1", sessionID: "root" } });
+    expect(sessionNeedsInput("root")).toBe(false);
+  });
+
+  it("non-resident node: self-only fallback reads state.permissions/questions (NO subtree walk)", () => {
+    // Node NOT in the tree flat map. A pending permission on a DESCENDANT in
+    // the detail store must NOT roll up (P1 collapsed the split-brain).
+    loadSessions([sess("root"), sess("child", "root")]);
+    setState("permissions", "child", { p1: { id: "p1", sessionID: "child" } });
+    expect(sessionNeedsInput("root")).toBe(false); // root's own perms are empty
+    expect(sessionNeedsInput("child")).toBe(true); // child's own perm is pending
+  });
+
+  it("non-resident node: self-only fallback detects a pending question", () => {
+    loadSessions([sess("root")]);
+    setState("questions", "root", { q1: { id: "q1", sessionID: "root", questions: [] } });
+    expect(sessionNeedsInput("root")).toBe(true);
   });
 });
 
@@ -273,14 +337,12 @@ describe("childrenIndex correctness — mutation kinds", () => {
   });
 });
 
-describe("childrenIndex perf — O(1) builds across N selector calls", () => {
-  // The cold-mount workload: ~10 roots × ~10 subagents = ~100 sessions, and
-  // ~100 SessionTree Nodes each calling sessionNeedsInput() once on the first
-  // render. The pre-fix code rebuilt a childrenOf index by walking ALL
-  // sessions on EVERY call → O(N²) ≈ 10,000 ops in a single tick. The cached
-  // index must build ONCE and reuse across all selector calls in the same
-  // mutation-stable window.
-  it("builds the index exactly once across 100 sessionNeedsInput calls on 100 sessions", () => {
+describe("childrenIndex perf — O(1) builds across N sessionTodos calls", () => {
+  // P1 shrank the index's user set: sessionWorking/sessionNeedsInput now trust
+  // server facets and no longer touch this index. Only sessionTodos (subtree
+  // todo rollup) walks it. The cold-mount workload that motivated the cache is
+  // lighter now, but the O(1)-build invariant still holds for sessionTodos.
+  it("builds the index exactly once across 100 sessionTodos calls on 100 sessions", () => {
     const ROOTS = 10;
     const CHILDREN_PER_ROOT = 10;
     const sessions: Session[] = [];
@@ -294,29 +356,21 @@ describe("childrenIndex perf — O(1) builds across N selector calls", () => {
     loadSessions(sessions);
     expect(__childrenIndexBuildCountForTest()).toBe(0); // lazy — not built until first selector call
 
-    // Touch every session via a subtree-walking selector — the cold-mount
-    // pattern (each Node calls sessionNeedsInput once).
+    // Touch every session via sessionTodos — 100 selector calls total.
     for (let r = 0; r < ROOTS; r++) {
-      expect(sessionNeedsInput(`r${r}`)).toBe(false);
+      expect(sessionTodos(`r${r}`)).toEqual([]);
     }
-    // Touch each child too — 100 selector calls total.
     for (let r = 0; r < ROOTS; r++) {
       for (let c = 0; c < CHILDREN_PER_ROOT; c++) {
-        expect(sessionNeedsInput(`r${r}.c${c}`)).toBe(false);
+        expect(sessionTodos(`r${r}.c${c}`)).toEqual([]);
       }
     }
     expect(__childrenIndexBuildCountForTest()).toBe(1); // STILL one — cache reused
 
-    // Running a different subtree-walking selector also reuses the cache.
-    for (let r = 0; r < ROOTS; r++) {
-      expect(sessionWorking(`r${r}`)).toBe(false);
-    }
-    expect(__childrenIndexBuildCountForTest()).toBe(1);
-
     // A mutation invalidates; the next selector call rebuilds exactly once.
     upsertSession(sess("r0.newchild", "r0"));
     expect(__childrenIndexBuildCountForTest()).toBe(1); // invalidated but not yet rebuilt
-    expect(sessionNeedsInput("r0")).toBe(false);
+    expect(sessionTodos("r0")).toEqual([]);
     expect(__childrenIndexBuildCountForTest()).toBe(2); // rebuilt once after mutation
   });
 
@@ -338,7 +392,7 @@ describe("childrenIndex perf — O(1) builds across N selector calls", () => {
     // A root with a single-child subtree should produce the same build count
     // as a root with a 10-child subtree: ONE build, then traversal.
     const before = __childrenIndexBuildCountForTest();
-    sessionNeedsInput("r0"); // 11 sessions in this subtree
+    sessionTodos("r0"); // 11 sessions in this subtree
     expect(__childrenIndexBuildCountForTest()).toBe(before + 1);
 
     // Now compare against a forest with 10× the total session count but the
@@ -353,7 +407,7 @@ describe("childrenIndex perf — O(1) builds across N selector calls", () => {
     }
     loadSessions(sessions2); // 10× the sessions, same per-root subtree
     __resetChildrenIndexBuildCountForTest();
-    sessionNeedsInput("R0"); // same 11-session subtree
+    sessionTodos("R0"); // same 11-session subtree
     // Built exactly once for the single selector call — the total store size
     // did not multiply the cost.
     expect(__childrenIndexBuildCountForTest()).toBe(1);

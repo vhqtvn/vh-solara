@@ -456,17 +456,17 @@ function ToolPart(props: { part: Part; tail?: boolean }) {
       void openSession(id);
     }
   };
-  // Depth-1 live status of the spawned subagent, derived purely from Tier-A
-  // store data (activity/permissions/questions are kept for ALL sessions, so the
-  // child need not be opened to read its state). The reads go through the store
-  // proxy directly — syncState.activity[id], and sessionNeedsInput/sessionWorking
-  // reading permissions/questions[id] — so Solid tracks those specific keys and
-  // this memo only re-runs when the child's status TRANSITIONS. Token streaming
-  // mutates state.messages, never these maps, so the indicator stays stable
-  // across tokens (the row itself already persists in place via upsertPart).
-  // Hidden when idle — nothing to flag — mirroring the session tree. (Aliased
-  // `state as syncState` because this module's local `state` is the tool part's
-  // own state accessor at line 369.)
+  // Depth-1 live status of the spawned subagent. For a RESIDENT tree node the
+  // reads trust the server-computed facets (flags.subtreeBusy /
+  // subtreeNeedsInput — the same source the tree row uses); for a non-resident
+  // child the self-only fallback reads syncState.activity[id] and the
+  // permissions/questions maps directly. Either way Solid tracks the specific
+  // signals read, so this memo only re-runs when the child's status TRANSITIONS.
+  // Token streaming mutates state.messages, never these maps, so the indicator
+  // stays stable across tokens (the row itself already persists in place via
+  // upsertPart). Hidden when idle — nothing to flag — mirroring the session
+  // tree. (Aliased `state as syncState` because this module's local `state` is
+  // the tool part's own state accessor at line 369.)
   const childStatus = createMemo<"none" | "error" | "needs-input" | "working" | "idle">(() => {
     const id = subId();
     if (!id) return "none";

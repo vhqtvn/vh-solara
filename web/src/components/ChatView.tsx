@@ -501,7 +501,8 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   });
 
   // "Working" = the session is busy (shared with the sidebar spinner so they
-  // always agree). See sessionWorking() for the activity + last-message logic.
+  // always agree). See sessionWorking() — it trusts the server's subtreeBusy
+  // facet for resident tree nodes, with a self-only activity fallback otherwise.
   const working = createMemo(() => sessionWorking(props.sessionId));
   // Honest verb for the Working pill ("Reading parser.go · 4s", "Thinking · 3s",
   // "Waiting for approval · 8s"). Derived in selectors (currentVerb) so the

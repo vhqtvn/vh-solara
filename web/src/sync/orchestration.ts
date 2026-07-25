@@ -72,7 +72,7 @@ const doneTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const DONE_SETTLE_MS = 4000;
 export function maybeNotifyRootDone(changedSessionID: string) {
   const root = rootOf(changedSessionID);
-  const nowWorking = sessionWorking(root); // folds in descendant activity
+  const nowWorking = sessionWorking(root); // trusts server subtreeBusy facet
   const was = rootWorking.get(root) ?? false;
   rootWorking.set(root, nowWorking);
   if (nowWorking) {
