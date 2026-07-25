@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
@@ -108,6 +109,13 @@ type Server struct {
 	// keyed by (project root, sessionID). One store per session; lazy-loaded;
 	// durable via .vh-solara/sessions/<id>/queue.json. See queue.go.
 	queues *queueRegistry
+
+	// pins is the worker-wide pinned-sessions store (Phase 2 of server-managed
+	// pinned sessions, building on the Phase 1 PinStore from commit 89db96e).
+	// Constructed once at NewServer from filepath.Join(stateBaseDir(),
+	// "pins.json"); serves GET/PUT /vh/pins. See pins.go (Phase 1 store) and
+	// pins_http.go (Phase 2 HTTP layer).
+	pins *PinStore
 
 	// failFast is the set of sessionIDs whose spawn requested the fail-closed
 	// permission policy (unattended/automated spawning): when such a session
@@ -304,6 +312,19 @@ func NewServer(agg *aggregator.Aggregator, opencodeURL string, ringCapacity int)
 		bgCancel()
 		return nil, err
 	}
+	// Worker-wide pinned-sessions store (Phase 2). Constructed ONCE at server
+	// startup — never per-request — grounded at stateBaseDir()/"pins.json"
+	// (same worker-wide flat dir notes.go uses; no worker-id subpath). A
+	// construction failure (permission, etc.) is propagated to the caller,
+	// matching how fs.Sub failure is handled above. A missing file or a
+	// corrupt/schema-mismatched file is NOT an error (NewPinStore returns a
+	// zero doc — see pins.go).
+	pinsPath := filepath.Join(stateBaseDir(), "pins.json")
+	pinStore, err := NewPinStore(pinsPath)
+	if err != nil {
+		bgCancel()
+		return nil, fmt.Errorf("pins: init store: %w", err)
+	}
 	srv := &Server{
 		agg:           agg,
 		proxy:         rp,
@@ -317,6 +338,7 @@ func NewServer(agg *aggregator.Aggregator, opencodeURL string, ringCapacity int)
 		features:      defaultFeatures(),
 		views:         newViewRegistry(),
 		queues:        newQueueRegistry(),
+		pins:          pinStore,
 		failFast:      map[string]struct{}{},
 		watcherOn:     map[string]bool{},
 		watcherCancel: map[string]context.CancelFunc{},
@@ -836,6 +858,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/vh/render", s.handleRender)
 	mux.HandleFunc("/vh/highlight.css", s.handleHighlightCSS)
 	mux.HandleFunc("/vh/notes", s.handleNotes)
+	// Server-managed pinned sessions (Phase 2): GET reads the worker-wide pin
+	// doc, PUT applies a CAS-guarded replace. PUT is state-changing and is
+	// guarded by the csrfGuard middleware wrapping every /vh/* route (no
+	// per-handler CSRF check needed). See pkg/web/pins_http.go.
+	mux.HandleFunc("/vh/pins", s.handlePins)
 	mux.HandleFunc("/vh/attach", s.handleAttach)
 	mux.HandleFunc("/vh/quota", s.handleQuota)
 	mux.HandleFunc("/vh/archive", s.handleArchive)
