@@ -36,7 +36,9 @@ test("(a) first-click an idle collapsed session loads its transcript immediately
   await page.goto(projectUrl("/"));
   await waitForTreeSettled(page);
 
-  // demo is a filtered root at cold start (default mode, has children).
+  // demo is a collapsed root at cold start (idle default — filtered requires
+  // working(), so an idle root with no persisted mode is materialized as explicit
+  // COLLAPSED, commit a6f2ac3; it has children).
   const demoRow = page.locator(".tree-row", { hasText: "Demo session" });
   await expect(demoRow).toBeVisible();
   // Confirm it has children → the twisty is an "Expand" button (not a leaf).
@@ -142,12 +144,12 @@ test("(c) a collapsed node shows its agent chip and is right-clickable", async (
 // AND the user's expanded mode.
 //
 // The core NO-FLATTEN invariant is guarded by the inverted assertion below: if
-// persistence broke (demo reloaded to the default filtered), `sub` would NOT be
-// visible post-reload and the `toBeVisible` would fail. And `sub` must NEVER
-// appear as a flat root (`:not(.sub)` count 0) — the structure is server-owned,
-// never re-inferred. The dedicated unit test tree2NoFlatten.test.ts pins that the
-// structure MAP is never persisted (only the per-node MODE is), so a reload can't
-// flatten the tree.
+// persistence broke (demo reloaded to the idle default collapsed), `sub` would
+// NOT be visible post-reload and the `toBeVisible` would fail. And `sub` must
+// NEVER appear as a flat root (`:not(.sub)` count 0) — the structure is
+// server-owned, never re-inferred. The dedicated unit test tree2NoFlatten.test.ts
+// pins that the structure MAP is never persisted (only the per-node MODE is), so
+// a reload can't flatten the tree.
 test("(d) reload does not flatten the tree — structure preserved from the frontier", async ({ page }) => {
   await page.goto(projectUrl("/"));
   await waitForTreeSettled(page);
@@ -159,8 +161,8 @@ test("(d) reload does not flatten the tree — structure preserved from the fron
 
   // Reload. The persisted mode (vh.tree.mode.v2) rehydrates demo as "expanded",
   // so sub STAYS visible as a child. This is the inverted no-flatten guard: if
-  // persistence were broken (demo reloaded to the default filtered), sub would
-  // disappear and this would fail. (The cold frontier ships demo loaded:false; a
+  // persistence were broken (demo reloaded to the idle default collapsed), sub
+  // would disappear and this would fail. (The cold frontier ships demo loaded:false; a
   // persisted-expanded node is BACKFILLED — its children re-fetched after the
   // seed — so sub re-lands via a node.children op within the wait below.)
   await page.reload();

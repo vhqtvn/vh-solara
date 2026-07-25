@@ -13,13 +13,14 @@ test("session tree filters idle subsessions by default and expands to show them"
   // is gone (proj=1 4-state model); the sole busy signal is now the pulsing ring
   // (.tree-twisty.running), so that is the "settled" signal we wait on.
   await expect(page.locator(".tree-twisty.running")).toHaveCount(0, { timeout: 10000 });
-  // tree=2 default mode is "filtered": an idle root renders its WORKING children
-  // only, so the idle subsession is HIDDEN (the lazy frontier may already have
-  // fetched it into the flat map, but filtered mode still keeps idle kids out of
-  // the render). The filtered non-leaf parent advertises the hidden branch with a
-  // "▸ N" descendant badge (rendered whenever the node has a non-zero childCount;
-  // the count itself is server-supplied descendantCount, which may be empty for an
-  // unloaded root — what matters here is that the badge is present, not its value).
+  // tree=2 idle default mode is "collapsed" (status-sensitive model, commit
+  // a6f2ac3: filtered now requires working(), so an idle root with no persisted
+  // mode is materialized as explicit COLLAPSED at cold load). Collapsed renders
+  // NOTHING — even working children — so the idle subsession is HIDDEN. The
+  // non-leaf parent still advertises the hidden branch with a "▸ N" descendant
+  // badge (rendered whenever the node has a non-zero childCount; the count itself
+  // is server-supplied descendantCount, which may be empty for an unloaded root —
+  // what matters here is that the badge is present, not its value).
   await expect(page.locator(".tree-node", { hasText: "Subagent: search" })).toHaveCount(0);
   const demoRow = page.locator(".tree-row", { hasText: "Demo session" });
   await expect(demoRow.locator(".tree-count")).toBeVisible();
