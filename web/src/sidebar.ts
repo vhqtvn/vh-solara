@@ -264,12 +264,13 @@ function rollbackOrderIfUnchanged(baseline: string[], issueRevision: number): vo
 // putPins — the PUT /vh/pins CAS call. X-VH-CSRF is added automatically by the
 // SPA's installCsrf() (web/src/csrf.ts wraps window.fetch); tests that stub
 // global fetch do not need to set it. 200 and 409 both carry the full public
-// doc; 400/404/other do not. status:0 is a synthetic network-error sentinel.
+// doc; a structured 400 (unknown_session) carries unknownIds so the caller can
+// self-heal; 404/other do not. status:0 is a synthetic network-error sentinel.
 async function putPins(
   baseRevision: number,
   orderedSessionIds: string[],
   opts?: { initializeOnly?: boolean },
-): Promise<{ status: number; doc: PinDoc | null }> {
+): Promise<{ status: number; doc: PinDoc | null; unknownIds?: string[] }> {
   const body: Record<string, unknown> = { baseRevision, orderedSessionIds };
   if (opts?.initializeOnly) body.initializeOnly = true;
   try {
@@ -282,11 +283,34 @@ async function putPins(
       const parsed = await res.json().catch(() => null);
       return { status: res.status, doc: coercePinDoc(parsed) };
     }
+    if (res.status === 400) {
+      // Structured 400: the server reports newly-added ids that are not active
+      // on this worker (error:"unknown_session"). Parse unknownIds so the
+      // caller can self-heal — drop them from the local order and retry once
+      // (bounded). A 400 without unknownIds (other input-validation failures:
+      // malformed/duplicate/oversized/over-cap) yields an empty array; the
+      // caller treats it as a generic pin-error (no self-heal, no retry).
+      const parsed = await res.json().catch(() => null);
+      return { status: 400, doc: null, unknownIds: parseUnknownIds(parsed) };
+    }
     return { status: res.status, doc: null };
   } catch (err) {
     log.warn("pins", "PUT /vh/pins network error", { err: String(err) });
     return { status: 0, doc: null };
   }
+}
+
+// parseUnknownIds — extracts the string[] unknownIds from a structured 400
+// body. Returns [] for a body lacking the unknown_session discriminator or a
+// string-array unknownIds (defensive: a non-conforming or text/plain 400, or
+// an unrelated structured 400, must not trigger local pin eviction + retry).
+// Pure.
+function parseUnknownIds(o: unknown): string[] {
+  if (!o || typeof o !== "object") return [];
+  const obj = o as Record<string, unknown>;
+  if (obj.error !== "unknown_session") return [];
+  if (!Array.isArray(obj.unknownIds)) return [];
+  return obj.unknownIds.filter((x): x is string => typeof x === "string");
 }
 
 function sameList(a: string[], b: string[]): boolean {
@@ -385,11 +409,22 @@ function applyMembershipIntent(intent: MembershipIntent, order: string[]): strin
   return order.filter((x) => x !== intent.id);
 }
 
-// performMembershipMutation — one bounded 409 retry for pin/unpin. On the first
-// 409: adopt the returned authoritative doc, recompute the SAME explicit intent
-// against it, retry once. On a second 409: adopt authoritative, stop, surface.
-// If the post-adopt recomputation shows the intent is already satisfied (e.g. a
-// concurrent change did it), no retry PUT is issued.
+// performMembershipMutation — one bounded 409 retry for pin/unpin, PLUS a
+// one-shot 400 self-heal when the server reports unknown (stale/archived) ids.
+// On the first 409: adopt the returned authoritative doc, recompute the SAME
+// explicit intent against it, retry once. On a second 409: adopt authoritative,
+// stop, surface. If the post-adopt recomputation shows the intent is already
+// satisfied (e.g. a concurrent change did it), no retry PUT is issued.
+//
+// 400 self-heal (stale-pinned-id repro): a stale id left in serverOrder bricks
+// the full Replace. On a 400 carrying unknownIds, drop those ids from the
+// AUTHORITATIVE base (baseOrder minus dropped — NOT the optimistic target, so a
+// pin/unpin whose optimistic write already moved the id is re-applied fresh and
+// actually reaches the server), recompute the SAME intent against the cleaned
+// base, and retry ONCE at the SAME base revision (a 400 did not advance the
+// server doc). On 200 → adopt. On any further failure → roll back to the
+// cleaned base (the stale drop is a permanent local correction; the optimistic
+// intent is what rolls back) + surface. Bounded: exactly one retry.
 async function performMembershipMutation(intent: MembershipIntent): Promise<void> {
   incPending();
   const baseOrder = serverOrder();
@@ -429,8 +464,51 @@ async function performMembershipMutation(intent: MembershipIntent): Promise<void
       setPinsErrorSig(res.status === 0 ? "pin-network" : "pin-error");
       return;
     }
-    // First attempt non-409 failure: roll back the optimistic to the pre-state,
-    // but only if no fresher frame landed during the first PUT round-trip.
+    // 400 self-heal: server reports newly-added ids not active on this worker
+    // (a stale/archived id left in serverOrder). Drop them from the base,
+    // recompute the SAME intent, retry ONCE at the SAME base revision.
+    if (res.status === 400 && res.unknownIds && res.unknownIds.length > 0) {
+      const drop = new Set(res.unknownIds);
+      // Cleaned BASE (not optimistic target): re-apply the intent fresh so a
+      // pin/unpin actually reaches the server instead of looking satisfied.
+      const cleanedBase = baseOrder.filter((id) => !drop.has(id));
+      // The stale-id drop is a DURABLE local correction — shadow it to the
+      // legacy keys (rollback compat) so a reconnect/rollback cannot resurrect
+      // the dropped id, matching dropPinnedSession. The success path below
+      // (adoptPutResponse → adoptServerDoc) overwrites this with the confirmed
+      // doc; the failure path leaves the cleaned shadow in place.
+      if (!sameList(cleanedBase, baseOrder)) writeLegacyShadow(cleanedBase);
+      const retryTarget = applyMembershipIntent(intent, cleanedBase);
+      if (sameList(retryTarget, cleanedBase)) {
+        // Intent is a no-op against the cleaned base (e.g. unpin the stale id
+        // itself). Adopt the cleaned base locally; no retry PUT needed. The
+        // stale drop is the durable correction.
+        applyServerOrder(cleanedBase);
+        return;
+      }
+      applyServerOrder(retryTarget); // optimistic retry (replaces the stale optimistic)
+      const retryRes = await putPins(baseRev, retryTarget); // SAME base rev (400 did not advance)
+      if (retryRes.status === 200 && retryRes.doc) {
+        adoptPutResponse(retryRes.doc);
+        return;
+      }
+      if (retryRes.status === 409 && retryRes.doc) {
+        // Concurrent change won — adopt authoritative, surface conflict.
+        adoptPutResponse(retryRes.doc);
+        setPinsErrorSig("pin-conflict");
+        return;
+      }
+      // Retry failed: roll the optimistic back to the cleaned base (the stale
+      // drop stays — it is a permanent local correction), but only if no
+      // fresher frame landed during the retry round-trip. serverRevision is
+      // still baseRev (a 400 did not advance the doc), so the guard works.
+      rollbackOrderIfUnchanged(cleanedBase, baseRev);
+      setPinsErrorSig(retryRes.status === 0 ? "pin-network" : "pin-error");
+      return;
+    }
+    // First attempt non-200/non-409/non-400-with-unknownIds failure (e.g. a
+    // 400 without unknownIds, or 404/500): roll back the optimistic to the
+    // pre-state, but only if no fresher frame landed during the first PUT.
     rollbackOrderIfUnchanged(baseOrder, baseRev);
     setPinsErrorSig(res.status === 0 ? "pin-network" : "pin-error");
   } finally {
@@ -440,6 +518,10 @@ async function performMembershipMutation(intent: MembershipIntent): Promise<void
 
 // performReorder — reorder intent. On 409: discard the optimistic ordering,
 // adopt the authoritative doc, do NOT auto-replay (require the user to repeat).
+// On a 400 carrying unknownIds (stale/archived id in serverOrder): drop those
+// ids from the base, recompute the SAME reorder against the cleaned base, retry
+// ONCE at the SAME base revision (bounded — mirrors performMembershipMutation's
+// 400 self-heal).
 async function performReorder(
   draggedId: string,
   targetId: string,
@@ -462,6 +544,40 @@ async function performReorder(
       // Discard optimistic, adopt authoritative. No auto-replay.
       adoptPutResponse(res.doc);
       setPinsErrorSig("pin-conflict");
+      return;
+    }
+    // 400 self-heal: drop stale ids, recompute the reorder, retry once.
+    if (res.status === 400 && res.unknownIds && res.unknownIds.length > 0) {
+      const drop = new Set(res.unknownIds);
+      const cleanedBase = baseOrder.filter((id) => !drop.has(id));
+      // Durable local correction — shadow the cleaned order (rollback compat),
+      // matching dropPinnedSession. Success overwrites via adoptPutResponse.
+      if (!sameList(cleanedBase, baseOrder)) writeLegacyShadow(cleanedBase);
+      // If the dragged id itself is stale, the reorder is moot — adopt the
+      // cleaned base and stop (can't reorder a deleted session).
+      if (drop.has(draggedId)) {
+        applyServerOrder(cleanedBase);
+        return;
+      }
+      const retryTarget = reorderRelative(cleanedBase, draggedId, targetId, pos);
+      if (sameList(retryTarget, cleanedBase)) {
+        // targetId was stale (absent from cleanedBase) → reorder is a no-op.
+        applyServerOrder(cleanedBase);
+        return;
+      }
+      applyServerOrder(retryTarget); // optimistic retry
+      const retryRes = await putPins(baseRev, retryTarget); // SAME base rev
+      if (retryRes.status === 200 && retryRes.doc) {
+        adoptPutResponse(retryRes.doc);
+        return;
+      }
+      if (retryRes.status === 409 && retryRes.doc) {
+        adoptPutResponse(retryRes.doc);
+        setPinsErrorSig("pin-conflict");
+        return;
+      }
+      rollbackOrderIfUnchanged(cleanedBase, baseRev);
+      setPinsErrorSig(retryRes.status === 0 ? "pin-network" : "pin-error");
       return;
     }
     // Network/other: roll back the optimistic to the pre-state, but only if no
@@ -513,6 +629,26 @@ function legacyMovePinnedByOffset(id: string, delta: -1 | 1): void {
 }
 
 // === Public async actions (branch on mode) ==================================
+// dropPinnedSession — LOCAL correction called from the session.delete / prune
+// path when a session is archived or deleted. In server mode it removes the id
+// from serverOrder immediately (no PUT — the server's pin-lifecycle removes it
+// from the server doc on archive and fans out pins.updated; this drop is the
+// eager client-side eviction so the stale id does not linger in serverOrder
+// and brick the next pin operation via the anti-resurrection guard). The S2
+// 400 self-heal remains the durable backstop for any path that misses this
+// drop. No-op in legacy mode (the legacy path owns its own removal).
+//
+// Shadows the corrected order to the legacy keys (rollback compat) so a
+// reconnect never resurrects the dropped id via the legacy seed.
+export function dropPinnedSession(id: string): void {
+  if (pinsMode() !== "server") return; // no-op in legacy mode
+  const cur = serverOrder();
+  if (!cur.includes(id)) return; // not pinned — nothing to drop
+  const next = cur.filter((x) => x !== id);
+  applyServerOrder(next);
+  writeLegacyShadow(next);
+}
+
 export async function togglePin(id: string): Promise<void> {
   if (pinsMode() === "server") {
     const currentlyPinned = serverOrder().includes(id);

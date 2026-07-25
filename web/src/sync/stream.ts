@@ -31,7 +31,7 @@ import {
   type ChildrenResponse,
 } from "./treeOps";
 import { seedTreeStore, applyTreeOpStore, patchTreeAgent, expandedButUnloadedIds } from "./treeState";
-import { applyPinsSnapshot, applyPinsUpdated } from "../sidebar";
+import { applyPinsSnapshot, applyPinsUpdated, dropPinnedSession } from "../sidebar";
 
 // mergeLastAgents — the agent-label fix (S3). During a server restart the
 // daemon serves HTTP while still aggregating session tails, so a mid-hydrate
@@ -597,6 +597,13 @@ export function applySessionEvent(kind: string, seq: number, payload: any) {
       if (seq) s.cursor = seq;
     }),
   );
+  // Pins: proactively drop the deleted session from serverOrder OUTSIDE the
+  // store produce() (it mutates the sidebar's own Solid signals, not the stream
+  // store) — mirrors pruneSessionDeleted's placement. A stale pinned id left in
+  // serverOrder would brick the next pin operation via the anti-resurrection
+  // guard. Local correction only (no PUT); the S2 400 self-heal is the durable
+  // backstop. Idempotent.
+  if (kind === "session.delete") dropPinnedSession(payload.id);
   // session.upsert / session.delete change the parent→children topology.
   invalidateChildrenIndex();
   persist();
@@ -624,6 +631,12 @@ export function pruneSessionDeleted(id: string) {
     }),
   );
   resetPageInFlight(id);
+  // Pins: proactively drop the archived/deleted session from serverOrder. The
+  // archive path (archive.ts) reaches this fn for each affected id; a stale
+  // pinned id left in serverOrder would brick the next pin operation via the
+  // anti-resurrection guard. Local correction only (no PUT); the S2 400
+  // self-heal is the durable backstop. Idempotent + no-op in legacy mode.
+  dropPinnedSession(id);
   invalidateChildrenIndex();
   persist();
 }

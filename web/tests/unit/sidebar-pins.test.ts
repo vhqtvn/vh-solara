@@ -11,6 +11,7 @@ import {
   applyPinsUpdated,
   clearPinsError,
   coercePinDoc,
+  dropPinnedSession,
   isPinned,
   movePinnedTo,
   movePinnedByOffset,
@@ -347,6 +348,160 @@ describe("movePinnedTo / movePinnedByOffset (server mode) — reorder, no replay
   });
 });
 
+// === S2: 400 self-heal — the stale-pinned-id repro ============================
+// A stale (archived/deleted) pinned id left in serverOrder used to brick ALL
+// pin operations: the server's anti-resurrection guard 400-rejected the full
+// Replace and the client surfaced a generic pin-error with no self-heal. Now
+// putPins parses the structured 400's unknownIds, performMembershipMutation +
+// performReorder drop those ids from the local order (base minus dropped),
+// recompute the SAME intent against the cleaned base, and retry ONCE at the
+// SAME base revision (a 400 did not advance the server doc). Bounded: a second
+// failure surfaces pin-error (no infinite retry).
+describe("400 self-heal — stale pinned id dropped + one bounded retry", () => {
+  // Structured 400 body helper (mirrors the server contract).
+  function unknownRes(ids: string[]): Response {
+    return jsonRes(
+      {
+        error: "unknown_session",
+        message: "unknown session id (not active on this worker): " + ids.join(", "),
+        unknownIds: ids,
+      },
+      400,
+    );
+  }
+
+  it("REPRO: pin drops the stale id, retries once at the SAME base rev, succeeds", async () => {
+    // serverOrder carries a stale archived id + a live id.
+    applyPinsSnapshot(pinDoc(5, true, ["stale", "live"]));
+    const seq = [
+      unknownRes(["stale"]), // first PUT: server says "stale" is unknown
+      jsonRes(pinDoc(6, true, ["live", "new"]), 200), // retry PUT: cleaned order wins
+    ];
+    let i = 0;
+    const fetchMock = vi.fn(() => Promise.resolve(seq[i++]));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await togglePin("new"); // pin "new"
+
+    expect(fetchMock).toHaveBeenCalledTimes(2); // first 400 + exactly one retry
+    // First PUT shipped the stale base order (full Replace).
+    const firstBody = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect(firstBody).toMatchObject({ baseRevision: 5, orderedSessionIds: ["stale", "live", "new"] });
+    // Retry PUT shipped the CLEANED order (stale dropped) at the SAME base rev
+    // (a 400 did not advance the server doc).
+    const retryBody = JSON.parse((fetchMock.mock.calls[1][1] as RequestInit).body as string);
+    expect(retryBody).toMatchObject({ baseRevision: 5, orderedSessionIds: ["live", "new"] });
+    // Final state: stale dropped, new pinned, sync unbricked, no error.
+    expect(reconciledPinnedOrder()).toEqual(["live", "new"]);
+    expect(isPinned("stale")).toBe(false);
+    expect(isPinned("new")).toBe(true);
+    expect(pinsLastError()).toBeNull();
+    expect(pinsRevision()).toBe(6);
+  });
+
+  it("REPRO: unpin drops the stale id, retries once, succeeds", async () => {
+    applyPinsSnapshot(pinDoc(5, true, ["stale", "live"]));
+    const seq = [unknownRes(["stale"]), jsonRes(pinDoc(6, true, []), 200)];
+    let i = 0;
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(seq[i++])));
+
+    await togglePin("live"); // unpin live
+
+    // First PUT: unpin live from ["stale","live"] → ["stale"] → 400 unknownIds=["stale"].
+    // cleanedBase = ["live"]; retryTarget = unpin live → []. Retry PUT [] → 200.
+    expect(reconciledPinnedOrder()).toEqual([]);
+    expect(isPinned("stale")).toBe(false);
+    expect(isPinned("live")).toBe(false);
+    expect(pinsLastError()).toBeNull();
+  });
+
+  it("REPRO: reorder drops the stale id, recomputes the reorder, retries once", async () => {
+    applyPinsSnapshot(pinDoc(5, true, ["stale", "a", "b"]));
+    const seq = [unknownRes(["stale"]), jsonRes(pinDoc(6, true, ["b", "a"]), 200)];
+    let i = 0;
+    const fetchMock = vi.fn(() => Promise.resolve(seq[i++]));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await movePinnedTo("b", "a", "before"); // move b before a
+
+    // First PUT: reorder ["stale","a","b"] → ["stale","b","a"] → 400 unknownIds=["stale"].
+    // cleanedBase = ["a","b"]; retryTarget = reorder ["a","b"] b-before-a → ["b","a"].
+    const retryBody = JSON.parse((fetchMock.mock.calls[1][1] as RequestInit).body as string);
+    expect(retryBody).toMatchObject({ baseRevision: 5, orderedSessionIds: ["b", "a"] });
+    expect(reconciledPinnedOrder()).toEqual(["b", "a"]);
+    expect(isPinned("stale")).toBe(false);
+    expect(pinsLastError()).toBeNull();
+  });
+
+  it("REPRO: multiple stale ids collected at once are all dropped in the single retry", async () => {
+    applyPinsSnapshot(pinDoc(5, true, ["stale1", "stale2", "live"]));
+    const seq = [
+      unknownRes(["stale1", "stale2"]), // server collected BOTH
+      jsonRes(pinDoc(6, true, ["live", "new"]), 200),
+    ];
+    let i = 0;
+    const fetchMock = vi.fn(() => Promise.resolve(seq[i++]));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await togglePin("new");
+
+    // Retry shipped the cleaned order with BOTH stale ids dropped.
+    const retryBody = JSON.parse((fetchMock.mock.calls[1][1] as RequestInit).body as string);
+    expect(retryBody.orderedSessionIds).toEqual(["live", "new"]);
+    expect(isPinned("stale1")).toBe(false);
+    expect(isPinned("stale2")).toBe(false);
+    expect(reconciledPinnedOrder()).toEqual(["live", "new"]);
+  });
+
+  it("BOUNDED: a retry that also fails surfaces pin-error (no infinite retry)", async () => {
+    applyPinsSnapshot(pinDoc(5, true, ["stale", "live"]));
+    // First 400 drops "stale"; the retry ALSO 400s (e.g. "live" went stale too,
+    // or a transient). Must NOT retry again.
+    const seq = [unknownRes(["stale"]), unknownRes(["live"])];
+    let i = 0;
+    const fetchMock = vi.fn(() => Promise.resolve(seq[i++]));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await togglePin("new");
+
+    expect(fetchMock).toHaveBeenCalledTimes(2); // first 400 + ONE retry, then stop
+    // Rolled back to the cleaned base (["live"] — the second 400's "live" is
+    // NOT dropped; self-heal is bounded to one retry).
+    expect(reconciledPinnedOrder()).toEqual(["live"]);
+    expect(pinsLastError()).toBe("pin-error");
+  });
+
+  it("BOUNDED: a retry that hits a network error surfaces pin-network", async () => {
+    applyPinsSnapshot(pinDoc(5, true, ["stale", "live"]));
+    let call = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((): Promise<Response> => {
+        call++;
+        if (call === 1) return Promise.resolve(unknownRes(["stale"]));
+        return Promise.reject(new Error("net"));
+      }),
+    );
+
+    await togglePin("new");
+
+    expect(reconciledPinnedOrder()).toEqual(["live"]); // rolled back to cleaned base
+    expect(pinsLastError()).toBe("pin-network");
+  });
+
+  it("a 400 WITHOUT unknownIds is a generic pin-error (no self-heal, no retry)", async () => {
+    // e.g. an over-cap or duplicate-id 400 (text/plain or no unknownIds).
+    applyPinsSnapshot(pinDoc(5, true, ["live"]));
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(jsonRes({ error: "other" }, 400))));
+
+    await togglePin("new");
+
+    // No retry — unknownIds absent → generic failure path.
+    expect(reconciledPinnedOrder()).toEqual(["live"]); // optimistic rolled back
+    expect(pinsLastError()).toBe("pin-error");
+  });
+});
+
 describe("pinsPending — reflects in-flight PUTs", () => {
   it("is true while a PUT is in flight, false after it settles", async () => {
     applyPinsSnapshot(pinDoc(1, true, []));
@@ -507,5 +662,93 @@ describe("Phase 6 — concurrency + DEFER regressions", () => {
     expect(reconciledPinnedOrder()).toEqual(["z"]); // NOT regressed to ["a"]
     expect(pinsRevision()).toBe(5);
     expect(pinsLastError()).toBeNull();
+  });
+});
+
+// === S3: proactive drop on archive/delete + audits ============================
+// dropPinnedSession is the LOCAL correction called from the session.delete /
+// prune path when a session is archived or deleted, so a stale pinned id is
+// evicted from serverOrder immediately rather than waiting for (or missing)
+// the server's pins.updated removal. It is a no-op in legacy mode. The S2
+// self-heal remains the durable backstop.
+describe("dropPinnedSession — proactive local drop on archive/delete", () => {
+  it("drops a pinned id from serverOrder in server mode (local correction, no PUT)", () => {
+    applyPinsSnapshot(pinDoc(5, true, ["a", "stale", "b"]));
+    dropPinnedSession("stale");
+    expect(reconciledPinnedOrder()).toEqual(["a", "b"]);
+    expect(isPinned("stale")).toBe(false);
+    expect(pinsRevision()).toBe(5); // revision unchanged — no PUT issued
+  });
+
+  it("is a no-op for an id not in the order", () => {
+    applyPinsSnapshot(pinDoc(5, true, ["a"]));
+    dropPinnedSession("ghost");
+    expect(reconciledPinnedOrder()).toEqual(["a"]);
+    expect(pinsRevision()).toBe(5);
+  });
+
+  it("shadows the corrected order to the legacy keys (rollback compat)", () => {
+    applyPinsSnapshot(pinDoc(5, true, ["a", "stale"]));
+    dropPinnedSession("stale");
+    expect((readLegacyEnv("vh.pinned.v1") as { data: string[] }).data).toEqual(["a"]);
+    expect((readLegacyEnv("vh.pinned-order.v1") as { data: string[] }).data).toEqual(["a"]);
+  });
+
+  it("is a no-op in legacy mode (the legacy path owns its own removal)", () => {
+    localStorage.setItem("vh.pinned.v1", JSON.stringify({ v: 1, data: ["a"] }));
+    localStorage.setItem("vh.pinned-order.v1", JSON.stringify({ v: 1, data: ["a"] }));
+    __resetPinnedForTest();
+    expect(pinsServerMode()).toBe(false);
+    dropPinnedSession("a");
+    expect(isPinned("a")).toBe(true); // legacy mode does not drop
+  });
+});
+
+// Audit: applyPinsUpdated's revision-monotonicity guard (sidebar.ts F1) must
+// NOT drop a removal-only update at rev+1. The guard only drops STRICTLY-older
+// revisions; equal/never are allowed. A server-side pin removal (archive) fans
+// out as pins.updated at rev+1 with the id absent — the client must adopt it
+// and drop the id from serverOrder.
+describe("applyPinsUpdated — removal-only update is NOT dropped by the guard", () => {
+  it("server removes a pinned id at rev+1 → client serverOrder drops it", () => {
+    applyPinsSnapshot(pinDoc(5, true, ["a", "stale", "b"]));
+    applyPinsUpdated(pinDoc(6, true, ["a", "b"])); // rev+1, "stale" removed
+    expect(reconciledPinnedOrder()).toEqual(["a", "b"]);
+    expect(isPinned("stale")).toBe(false);
+    expect(pinsRevision()).toBe(6);
+  });
+});
+
+// Audit: readLegacyReconciledSeed / writeLegacyShadow — a reconnect MUST NOT
+// resurrect an inactive id via the legacy seed. When the server snapshot is
+// initialized:true, serverOrder is set from the server doc unconditionally and
+// the legacy seed is NOT consulted (server authority wins). The seed is only
+// used when initialized:false (the one-shot migration window).
+describe("legacy seed — initialized server wins, stale id NOT resurrected", () => {
+  it("legacy LS has a stale id but server is initialized without it → serverOrder excludes it", () => {
+    localStorage.setItem("vh.pinned.v1", JSON.stringify({ v: 1, data: ["stale", "live"] }));
+    localStorage.setItem("vh.pinned-order.v1", JSON.stringify({ v: 1, data: ["stale", "live"] }));
+    __resetPinnedForTest();
+
+    // Server is initialized with only "live" — "stale" must NOT resurrect.
+    applyPinsSnapshot(pinDoc(3, true, ["live"]));
+
+    expect(reconciledPinnedOrder()).toEqual(["live"]);
+    expect(isPinned("stale")).toBe(false);
+    expect(pinsRevision()).toBe(3);
+  });
+
+  it("a reconnect re-snapshot (initialized) keeps the server order, not the legacy seed", () => {
+    // First connect: server initialized with ["live"].
+    applyPinsSnapshot(pinDoc(3, true, ["live"]));
+    // Legacy keys now shadow ["live"] (writeLegacyShadow in adoptServerDoc).
+    // Plant a stale id back into the legacy keys (simulating a tampered/old
+    // shadow from a rolled-back binary).
+    localStorage.setItem("vh.pinned.v1", JSON.stringify({ v: 1, data: ["stale", "live"] }));
+    localStorage.setItem("vh.pinned-order.v1", JSON.stringify({ v: 1, data: ["stale", "live"] }));
+    // Reconnect: server re-snapshots initialized with ["live"] at the same rev.
+    applyPinsSnapshot(pinDoc(3, true, ["live"]));
+    expect(reconciledPinnedOrder()).toEqual(["live"]);
+    expect(isPinned("stale")).toBe(false);
   });
 });
