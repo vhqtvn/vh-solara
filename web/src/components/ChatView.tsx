@@ -1437,10 +1437,18 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     if (stick) pin();
   }
   // Re-measure after any value change (typing, draft restore, send-clear).
+  // requestAnimationFrame (not queueMicrotask): autosize reads ta.scrollHeight,
+  // which is layout-derived. On a session switch-back the draft-restore
+  // setInput() fires this effect, but a microtask ran BEFORE the browser's
+  // style-recalc/layout phase of the frame, so scrollHeight was stale (the
+  // PREVIOUS session's content) and the composer collapsed toward rows=1 until
+  // the next keystroke re-measured. rAF defers the measure past the layout
+  // flush, so scrollHeight reflects the restored content. (jsdom has no layout
+  // engine; covered by a faithful stale-scrollHeight contract test.)
   createEffect(() => {
     input();
     focusMode();
-    queueMicrotask(autosize);
+    requestAnimationFrame(autosize);
   });
 
   // Reset to bottom + restore this session's saved draft when switching sessions.
