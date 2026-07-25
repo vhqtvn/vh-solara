@@ -345,7 +345,14 @@ function flushAutoModeQueue(): void {
     const node = map.get(c.id);
     if (!node) continue; // removed between queue+flush
     if (working(node) !== c.expectedWorking) continue; // edge reversed / changed
-    if (treeModeMap()[c.id] !== c.expectedSourceMode) continue; // manual click / opp edge
+    // Read source mode via modeOf (absent → "filtered" fallback), NOT raw
+    // treeModeMap()[c.id], so the read MATCHES candidate formation in
+    // applyTreeOpStore (which stored expectedSourceMode from modeOf(id)). A raw
+    // read returns undefined for an absent-mode (implicit filtered) id, which
+    // would fail the !== expectedSourceMode check ("filtered") and DROP a
+    // genuine working→idle demote — leaking the "no non-running filtered"
+    // invariant on the op path. Symmetric with seedTreeStore's modeOf read.
+    if (modeOf(c.id) !== c.expectedSourceMode) continue; // manual click / opp edge
     survivors.set(c.id, c.targetMode);
   }
   pendingCandidates = new Map();

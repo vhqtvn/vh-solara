@@ -447,6 +447,35 @@ describe("auto-mutation: cold-load normalization + working edges", () => {
     expect(modeOf("a")).toBe("collapsed");
   });
 
+  it("(6a) IMPLICIT-filtered (absent) working → idle becomes explicit 'collapsed' (op-driven edge)", async () => {
+    // NO setNodeMode("a", "filtered"): a stays ABSENT, so modeOf("a") ===
+    // "filtered" purely via the absent-fallback. This pins the case the op path
+    // used to DROP — flush revalidation read raw treeModeMap()[a]===undefined,
+    // which !== "filtered" (the expectedSourceMode) and silently dropped the
+    // demote candidate, leaking the "no non-running filtered" invariant on the
+    // op path while the seed path demoted correctly.
+    seedTreeStore([busyNode({ id: "a" })]); // baseline: absent+working stays absent
+    expect(modeOf("a")).toBe("filtered");
+    expect(Object.prototype.hasOwnProperty.call(treeModeMapSignal(), "a")).toBe(false);
+    applyTreeOpStore({ op: "node.facet", data: { id: "a", activity: "idle" } });
+    await flush();
+    expect(modeOf("a")).toBe("collapsed");
+    expect(treeModeMapSignal()["a"]).toBe("collapsed"); // materialized explicit, NOT left absent
+  });
+
+  it("(6b) IMPLICIT-filtered (absent) working → idle becomes explicit 'collapsed' (snapshot seed path)", async () => {
+    // Symmetric pin on seedTreeStore (which already demotes correctly) to lock
+    // cross-path consistency: a working→idle edge on a KNOWN absent-mode node
+    // demotes implicit-filtered → explicit collapsed via the SYNCHRONOUS seed
+    // path (no microtask flush). Pinned so a future change to either path keeps
+    // the two ingestion paths symmetric for the implicit case.
+    seedTreeStore([busyNode({ id: "a" })]); // absent+working baseline
+    expect(Object.prototype.hasOwnProperty.call(treeModeMapSignal(), "a")).toBe(false);
+    seedTreeStore([node({ id: "a" })]); // re-seed: same node now idle (known → edge)
+    expect(modeOf("a")).toBe("collapsed");
+    expect(treeModeMapSignal()["a"]).toBe("collapsed"); // materialized explicit
+  });
+
   it("(7) expanded nodes are NEVER auto-mutated (both working transitions)", async () => {
     setNodeMode("a", "expanded");
     seedTreeStore([node({ id: "a" })]); // idle, explicit expanded
