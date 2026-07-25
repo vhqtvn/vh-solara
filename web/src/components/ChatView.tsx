@@ -353,9 +353,25 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // `ready()` semantics are intentionally left UNTOUCHED (it still drives
   // scroll-restore, self-heal, and ack timing); `revealed` is a separate,
   // purely-visual gate layered on top.
-  const messages = createMemo(() => {
+  // Transient tail-drop guard on the rendered LIST. openSession pre-reserves a
+  // truthy-but-empty messages[id] slot (delivered()=false) the instant a session
+  // is selected, so switching to a never-viewed session makes this memo compute
+  // [] for one frame → the <For> below unmounts the OUTGOING transcript's rows.
+  // That sub-frame empty flash is flagged as a tail "drop" by the
+  // session-completion e2e's strict sampler (it polls every mutation). This is
+  // the SAME cold-open gap the revealedOnce opacity latch above was built for
+  // (messagesLoaded=false during a cold re-snapshot); the latch only protected
+  // the .ready opacity class, not the rendered rows. This extends the same hold
+  // to the <For> list: while the entering session is still cold-opening (not
+  // delivered, not failed) and the computed list is empty, KEEP the previous
+  // transcript mounted instead of flashing to empty. Released the instant the
+  // new session delivers/errors; stays [] for a genuinely-empty settled session
+  // or when there was no prior transcript (first-ever cold-open).
+  const messages = createMemo((prev: any[] | undefined) => {
     const s = sm();
-    return s ? s.order.map((id) => s.byId[id]) : [];
+    const next = s ? s.order.map((id) => s.byId[id]) : [];
+    if (next.length > 0 || delivered() || messageFailed() || !prev?.length) return next;
+    return prev;
   });
   // P1-WEB reveal-gate latch (O1 collapsed-frontier): once a session has
   // LEGITIMATELY revealed (positioned + delivered/failed), keep it revealed

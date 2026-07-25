@@ -58,9 +58,13 @@ export function mergeLastAgents(
 
 // deriveMessageWindow — pure helper that projects the server-side window meta
 // (Phase 1's WindowMeta wire shape) into the client's resident MessageWindowState
-// (Phase 3). Used by the three wholesale-replace paths (messages.batch,
-// applySessionSnapshot, refreshOpenSessions) so they all populate the window
-// state consistently. Pure + exported for unit testing.
+// (Phase 3). Used by the three snapshot/batch paths that derive a window from
+// server items (messages.batch, applySessionSnapshot, refreshOpenSessions) so
+// they all populate the window state consistently. NOTE: only messages.batch
+// and refreshOpenSessions wholesale-replace messages[id]; applySessionSnapshot
+// merge-if-absents message bodies (live always wins — see applySessionSnapshot)
+// but still derives the resident-window cursor from the snapshot's items. Pure
+// + exported for unit testing.
 //
 // Back-compat: a pre-Phase-1 server ships the WHOLE transcript and omits the
 // window meta — that yields {hasOlder:false, oldestResidentID:<derived from
@@ -697,6 +701,15 @@ export function applyMessageEvent(kind: string, seq: number, payload: any, track
           // {hasOlder:false} (unbounded server, nothing older to fetch).
           if (payload.sessionID) {
             const items = payload.messages || [];
+            // COLD-LOAD ESTABLISHMENT (not a reconcile): messages.batch fires once
+            // per cold-hydrate cycle (snapshot → batch → messages.loaded) to seed
+            // the authoritative full-history baseline for a session that was just
+            // opened. Unlike applySessionSnapshot (which can land repeatedly on
+            // reconnects/reconciles and clobber a live tail), the batch arrives on
+            // a freshly-opened stream with no NEWER live data to clobber — any
+            // live deltas that follow are applied via upsertMessage/upsertPart on
+            // TOP of this baseline and are never re-clobbered (the batch does not
+            // re-fire). Hence wholesale-replace is correct here; no merge guard.
             s.messages[payload.sessionID] = buildMessages(items);
             s.messageWindows[payload.sessionID] = deriveMessageWindow(items, payload.window);
           }
@@ -1759,10 +1772,30 @@ export function closeSessionStream() {
 // reconciliation.
 export function applySessionSnapshot(id: string, snap: Snapshot) {
   const items = (snap.messages?.[id] as any[]) || [];
-  setState("messages", id, buildMessages(items));
+  // MERGE-IF-ABSENT (live always wins): a Stream-2 snapshot is a point-in-time
+  // read; a live tail that landed via message.upsert/part.upsert (or a fresher
+  // prior snapshot) must NOT be clobbered when a STALE reconnect/reconcile
+  // snapshot arrives afterward. The decode-window serialization at the listener
+  // (sesSnapshotDecoding, stream.ts:~2186) protects live events landing DURING
+  // the gzip64 decode; THIS guard closes the residual gap — live data ALREADY in
+  // the store when a stale snapshot lands. Reuses prependMessagesIfAbsent (the
+  // Phase-4 historical-page idiom): insert snapshot items that are ABSENT, NEVER
+  // touch an existing byId entry. Cold/warm first hydrate is unaffected —
+  // messages[id] is empty so every item is absent (equivalent to the old
+  // buildMessages wholesale-replace). A seq/revision guard was considered but
+  // rejected: the store tracks no per-session last-applied seq (only the shared
+  // global cursor), and Snapshot.seq is a per-connection emitter counter for the
+  // tree stream (not a session-stream freshness comparable against live
+  // message-event seqs), so insert-if-absent is the minimal surgical fix.
+  setState(
+    produce((s) => {
+      if (!s.messages[id]) s.messages[id] = { order: [], byId: {} };
+      prependMessagesIfAbsent(s.messages[id], items);
+    }),
+  );
   // Phase 3 (transcript windowing): populate the resident-window state from the
   // server's bounded-projection meta. This is the Stream-2 (active-session)
-  // wholesale-replace path, so it must populate messageWindows[id] just like the
+  // snapshot path, so it must populate messageWindows[id] just like the
   // messages.batch case and refreshOpenSessions do — without it the Phase-4
   // "Load older" button would never appear for the active session after a warm
   // snapshot. Back-compat: a pre-Phase-1 server omits snap.messageWindows AND
