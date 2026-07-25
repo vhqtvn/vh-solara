@@ -15,7 +15,6 @@ import {
 } from "../projects";
 import { dismiss, modal } from "../lib/a11y";
 import "./ProjectSwitcher.css";
-import { runningSessionCount, rootSessionCount } from "../sync";
 import { projSwitcherOpen as open, setProjSwitcherOpen as setOpen } from "../ui";
 import Icon from "./Icon";
 import TextPromptDialog from "./TextPromptDialog";
@@ -24,9 +23,9 @@ import TextPromptDialog from "./TextPromptDialog";
 // that OpenCode workspace). Opens as a DIALOG (not an inline dropdown) so the
 // full list + activity badges are reachable on mobile and desktop alike. Pinned
 // projects persist locally; "Recent" comes from OpenCode (GET /project); "Add
-// project…" takes an absolute path. Activity (sessions/running counts) for the
-// NON-active projects comes from GET /vh/projects + /vh/running-sessions; the
-// active project uses the live client store to avoid a round-trip.
+// project…" takes an absolute path. Activity (root/running counts) for EVERY
+// project — including the active one — comes from the server-authoritative
+// GET /vh/projects (refreshed on dialog open).
 export default function ProjectSwitcher() {
   const [query, setQuery] = createSignal("");
   const [recents, { refetch }] = createResource(fetchRecentProjects, { initialValue: [] });
@@ -191,20 +190,19 @@ export default function ProjectSwitcher() {
     return recents().filter((r) => !pinned.has(r.directory) && r.directory !== projectDir());
   });
 
-  // Enriched + sorted rows (running-first, then case-insensitive name). The
-  // active project uses live store counts (runningSessionCount() + rootSession
-  // count); others use the endpoint activity data. Both counts are ROOT-ONLY
+  // Enriched + sorted rows (running-first, then case-insensitive name). EVERY
+  // row — including the active project — reads its root/running counts from the
+  // server-authoritative /vh/projects payload (P2); the active project no longer
+  // re-derives counts from the live client store. Both counts are ROOT-ONLY
   // (children/archived excluded), so idle = roots − running is meaningful. The
   // active project is injected into the list when it isn't pinned (see
   // pinnedWithActive) so it shows up as a row marked active; its counts come
-  // from the live store like any active project would.
+  // from the endpoint like any other row.
   const rows = createMemo(() =>
     mergeProjectActivity(
       pinnedWithActive(),
       activity() ?? { roots: new Map(), running: new Map() },
       projectDir(),
-      runningSessionCount(),
-      rootSessionCount(),
     ),
   );
 

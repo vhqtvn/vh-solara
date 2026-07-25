@@ -122,32 +122,27 @@ export async function fetchRecentProjects(): Promise<Project[]> {
 // --- Project activity (cross-workspace root/running counts) ---
 //
 // The switcher dialog annotates each project row with how many LIVE roots a
-// workspace has and how many are currently running. The ACTIVE project's counts
-// come from the live client store (no round-trip); every other project's come
-// from the worker backend:
-//   GET /vh/projects         -> [{dir, epoch, seq, roots}]  (live ROOT count per bridged dir)
-//   GET /vh/running-sessions -> {count, workspaces:[{dir, count}]}  (dirs with >0 running)
-// Both key by the exact project directory, so they merge into the pinned list
-// by `dir`. Root counts are ROOT-ONLY (children/archived excluded) on both sides,
-// so idle = roots − running is meaningful. The merge + sort below is a PURE
+// workspace has and how many are currently running. BOTH counts are
+// server-authoritative, sourced from a SINGLE endpoint:
+//   GET /vh/projects -> [{dir, epoch, seq, roots, running}]  (live ROOT count +
+//                       running ROOT count per bridged dir)
+// The active project reads its counts from the SAME endpoint as every other
+// project — there is no client-side re-derivation (P2 collapsed the split-brain
+// where the active project previously walked state.sessions). Both key by the
+// exact project directory, so they merge into the pinned list by `dir`. Root
+// counts are ROOT-ONLY (children/archived excluded) on both sides, so
+// idle = roots − running is meaningful. The merge + sort below is a PURE
 // function (no DOM, no fetch) so it can be unit-tested directly.
 
 export interface ProjectEndpointItem {
   dir: string;
   roots: number;
-}
-export interface RunningWorkspaceItem {
-  dir: string;
-  count: number;
-}
-export interface RunningSessionsPayload {
-  count: number;
-  workspaces: RunningWorkspaceItem[];
+  running: number; // running ROOT count (roots whose subtree has ≥1 busy/retry session)
 }
 
 export interface ActivityMaps {
   roots: Map<string, number>; // dir -> LIVE root count (/vh/projects)
-  running: Map<string, number>; // dir -> running root count (/vh/running-sessions)
+  running: Map<string, number>; // dir -> running root count (/vh/projects)
 }
 
 // A row the switcher renders: a project enriched with activity + the active
@@ -160,38 +155,37 @@ export interface ProjectActivityRow {
   active: boolean; // true for projectDir()
 }
 
-// Reduce the two raw endpoint payloads into dir->count lookup maps. Only dirs
-// with count > 0 land in `running` (matches the backend, which omits idle dirs).
-export function buildActivityMaps(
-  projectsEndpoint: ProjectEndpointItem[],
-  runningEndpoint: RunningSessionsPayload,
-): ActivityMaps {
+// Reduce the raw /vh/projects payload into dir->count lookup maps. Only dirs
+// with running > 0 are meaningful for the running badge, but the map keeps every
+// dir's running value verbatim (the server already reports the true count,
+// including 0); callers read it directly. Roots is keyed 1:1 with the payload.
+export function buildActivityMaps(projectsEndpoint: ProjectEndpointItem[]): ActivityMaps {
   const roots = new Map<string, number>();
-  for (const p of Array.isArray(projectsEndpoint) ? projectsEndpoint : []) roots.set(p.dir, p.roots);
   const running = new Map<string, number>();
-  for (const w of runningEndpoint?.workspaces ?? []) if (w.count > 0) running.set(w.dir, w.count);
+  for (const p of Array.isArray(projectsEndpoint) ? projectsEndpoint : []) {
+    roots.set(p.dir, p.roots);
+    running.set(p.dir, p.running);
+  }
   return { roots, running };
 }
 
 // Enrich + sort the pinned project list. Sort order: running projects first,
 // then case-insensitive name. The active project keeps its marker wherever it
-// sorts. The active project's counts come from the LIVE store (activeRunning /
-// activeRoots) to avoid a round-trip; other projects use the endpoint maps.
-// `idle` is derived defensively as max(0, roots − running) so a transient
-// roots < running (data race between the two endpoints) can never render a
-// negative idle count.
+// sorts. EVERY row (active and non-active alike) reads its counts from the
+// server-authoritative `maps` populated from /vh/projects — there is no live-
+// store special-case for the active project (P2). `idle` is derived defensively
+// as max(0, roots − running) so a transient roots < running (an endpoint race
+// between successive GETs) can never render a negative idle count.
 export function mergeProjectActivity(
   pinned: Project[],
   maps: ActivityMaps,
   activeDir: string,
-  activeRunning: number,
-  activeRoots: number,
 ): ProjectActivityRow[] {
   const { roots, running } = maps;
   const rows: ProjectActivityRow[] = pinned.map((p) => {
     const isActive = p.directory === activeDir;
-    const run = isActive ? activeRunning : running.get(p.directory) || 0;
-    const tot = isActive ? activeRoots : roots.get(p.directory) || 0;
+    const run = running.get(p.directory) || 0;
+    const tot = roots.get(p.directory) || 0;
     return {
       directory: p.directory,
       name: p.name,
@@ -241,28 +235,27 @@ export function buildProjectLink(base: string, dir: string): string {
   return `${base}?dir=${encodeURIComponent(dir)}`;
 }
 
-// Fetch both activity endpoints (coalesced via Promise.all). Never throws: on
-// any failure returns empty maps so the dialog still renders with names alone.
+// Fetch the project activity payload. Never throws: on any failure returns
+// empty maps so the dialog still renders with names alone.
+//
+// A SINGLE endpoint (/vh/projects) is the authoritative source for BOTH the
+// per-project root count and the per-project running count (P2). The switcher
+// no longer fetches /vh/running-sessions — that endpoint serves the cross-fleet
+// restart-confirmation warning (RestartOpenCode / OpenCodeHealthPanel) and is
+// not the switcher's concern. /vh/projects reports running per dir for EVERY
+// bridged project including the active one, so the active project's badge reads
+// the same server-authoritative value as every other row.
 //
 // cache:'no-store' opts out of the browser HTTP cache: the dialog refreshes
 // counts on every open (ProjectSwitcher's open() createEffect calls this on the
 // rising edge), so a stale heuristic-cached GET would defeat the refresh — the
-// server also emits Cache-Control:no-store on both endpoints, but the client
+// server also emits Cache-Control:no-store on the endpoint, but the client
 // flag is a belt-and-suspenders guard against intermediaries that ignore it.
 export async function fetchProjectActivity(): Promise<ActivityMaps> {
   try {
-    const [pr, rs] = await Promise.all([
-      fetch("/vh/projects", { cache: "no-store" }),
-      fetch("/vh/running-sessions", { cache: "no-store" }),
-    ]);
-    const projects: unknown = pr.ok ? await pr.json() : [];
-    const running: unknown = rs.ok ? await rs.json() : null;
-    return buildActivityMaps(
-      Array.isArray(projects) ? (projects as ProjectEndpointItem[]) : [],
-      running && Array.isArray((running as RunningSessionsPayload).workspaces)
-        ? (running as RunningSessionsPayload)
-        : { count: 0, workspaces: [] },
-    );
+    const resp = await fetch("/vh/projects", { cache: "no-store" });
+    const projects: unknown = resp.ok ? await resp.json() : [];
+    return buildActivityMaps(Array.isArray(projects) ? (projects as ProjectEndpointItem[]) : []);
   } catch (e) {
     log.warn("projects", "activity fetch failed", e);
     return { roots: new Map(), running: new Map() };

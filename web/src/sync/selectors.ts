@@ -146,37 +146,6 @@ export function isActivityWorking(act?: string): boolean {
   return act === "busy" || act === "retry";
 }
 
-// runningSessionCount counts root sessions whose subtree is currently working —
-// the sessions a restart would interrupt. Subagents fold into their root via
-// sessionWorking(), so each running task counts once.
-export function runningSessionCount(): number {
-  let n = 0;
-  for (const id of Object.keys(state.sessions)) {
-    const s = state.sessions[id];
-    if (s?.parentID && state.sessions[s.parentID]) continue; // count roots only
-    if (sessionWorking(id)) n++;
-  }
-  return n;
-}
-
-// rootSessionCount counts LIVE root sessions — the total that pairs with
-// runningSessionCount() to derive an idle count (roots − running) for the project
-// switcher's "X running, Y idle" badge. Uses the SAME orphan-inclusive root
-// definition as runningSessionCount() (a session is a root when it has no
-// parentID OR its parentID is not in the live store), so a child never counts and
-// an orphaned child becomes its own root. Archived sessions are removed from
-// state.sessions on the session.delete stream event (stream.ts), so they're
-// excluded naturally — the Go RootCount() and this draw from the SAME population.
-export function rootSessionCount(): number {
-  let n = 0;
-  for (const id of Object.keys(state.sessions)) {
-    const s = state.sessions[id];
-    if (s?.parentID && state.sessions[s.parentID]) continue; // count roots only
-    n++;
-  }
-  return n;
-}
-
 // What the agent is doing right now, surfaced as the Working pill's verb + an
 // elapsed-timer base. Pure read of `state` (the caller supplies the ticking
 // clock — consumed by ChatView's working-status memos `verb`, `verbElapsed`,

@@ -27,7 +27,6 @@ import {
   sessionNeedsInput,
   sessionTodos,
   sessionWorking,
-  runningSessionCount,
 } from "../../src/sync/selectors";
 import type { Session, TodoItem } from "../../src/types";
 
@@ -180,23 +179,6 @@ describe("sessionWorking — trusts server subtreeBusy facet (+ self-only fallba
     setState("activity", "child", "busy");
     expect(sessionWorking("root")).toBe(false); // root's own activity is idle
     expect(sessionWorking("child")).toBe(true); // child's own activity is busy
-  });
-
-  it("runningSessionCount counts resident roots whose subtreeBusy facet is set", () => {
-    // Roots must be in state.sessions (runningSessionCount iterates it); their
-    // working status comes from the tree facet (resident) or self-only fallback.
-    loadSessions([sess("r1"), sess("r1c", "r1"), sess("r2"), sess("r3"), sess("r3c", "r3")]);
-    seedTreeStore([
-      tNode("r1", { subtreeBusy: true }),
-      tNode("r1c", { parentId: "r1", activity: "busy" }),
-      tNode("r2"),
-      tNode("r3"),
-      tNode("r3c", { parentId: "r3" }),
-    ]);
-    expect(runningSessionCount()).toBe(1); // only r1's subtree is working
-    // r2 becomes busy via its own activity (self-only path).
-    setState("activity", "r2", "busy");
-    expect(runningSessionCount()).toBe(2);
   });
 });
 

@@ -271,6 +271,76 @@ func TestProjectsEnumeratesInstances(t *testing.T) {
 	if e, _ := got[0]["epoch"].(string); e == "" || e != agg.Store().Epoch() {
 		t.Fatalf("project epoch must match the store epoch, got %v want %q", got[0]["epoch"], agg.Store().Epoch())
 	}
+	// roots + running are server-authoritative counts (P2): they must be present
+	// and equal the store's RootCount()/RunningRoots() even on an empty store
+	// (both 0). The badge no longer re-derives these client-side.
+	if r, _ := got[0]["roots"].(float64); int(r) != agg.Store().RootCount() {
+		t.Fatalf("project roots must match store RootCount, got %v want %d", got[0]["roots"], agg.Store().RootCount())
+	}
+	if r, _ := got[0]["running"].(float64); int(r) != agg.Store().RunningRoots() {
+		t.Fatalf("project running must match store RunningRoots, got %v want %d", got[0]["running"], agg.Store().RunningRoots())
+	}
+}
+
+// TestProjectsReportsRunningCount exercises the per-project Running badge source
+// (P2): /vh/projects must report the SAME authoritative running-root count the
+// store computes via RunningRoots(), so the SPA's project switcher badge stops
+// re-deriving it client-side. Seeds two roots and makes one busy via a child so
+// root-dedup leaves exactly one running root (mirrors TestRunningRoots).
+func TestProjectsReportsRunningCount(t *testing.T) {
+	f := &fakeOC{}
+	web, agg := newVerbServer(t, f)
+	st := agg.Store()
+
+	// Empty store → roots 0, running 0.
+	if got := projectsRunning(t, web.URL); got != 0 {
+		t.Fatalf("empty store: want running 0, got %d", got)
+	}
+
+	// Two roots; a child of root "a" goes busy → 1 running root (root dedup).
+	st.Apply(ev("session.created", `{"info":{"id":"a"}}`))
+	st.Apply(ev("session.created", `{"info":{"id":"b"}}`))
+	st.Apply(ev("session.created", `{"info":{"id":"c","parentID":"a"}}`))
+	st.Apply(ev("session.status", `{"sessionID":"c","status":{"type":"busy"}}`))
+	if want := st.RunningRoots(); want != 1 {
+		t.Fatalf("setup invariant: RunningRoots want 1, got %d", want)
+	}
+	if want := st.RootCount(); want != 2 {
+		t.Fatalf("setup invariant: RootCount want 2, got %d", want)
+	}
+	// The endpoint must agree with the authoritative store counts.
+	if got := projectsRunning(t, web.URL); got != 1 {
+		t.Fatalf("one busy subtree: want running 1, got %d", got)
+	}
+
+	// Child idles → 0 running; roots unchanged.
+	st.Apply(ev("session.idle", `{"sessionID":"c"}`))
+	if got := projectsRunning(t, web.URL); got != 0 {
+		t.Fatalf("after child idles: want running 0, got %d", got)
+	}
+}
+
+// projectsRunning GETs /vh/projects and returns the default project's running
+// count (the single ""-dir entry). Fails the test on any transport/shape error.
+func projectsRunning(t *testing.T, base string) int {
+	t.Helper()
+	resp, err := http.Get(base + "/vh/projects")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var got []map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range got {
+		if p["dir"] == "" {
+			r, _ := p["running"].(float64)
+			return int(r)
+		}
+	}
+	t.Fatalf("default project not enumerated in /vh/projects: %v", got)
+	return 0
 }
 
 func TestSendForwardsPrompt(t *testing.T) {

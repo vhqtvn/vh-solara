@@ -1180,10 +1180,11 @@ func messageFilter(r *http.Request) map[string]bool {
 // projectInfo describes one bridged project instance (a per-directory aggregator)
 // for the discovery endpoint.
 type projectInfo struct {
-	Dir   string `json:"dir"`   // project directory ("" = the worker's default project)
-	Epoch string `json:"epoch"` // store lifetime id (changes on daemon restart)
-	Seq   uint64 `json:"seq"`   // current head seq for this project's store
-	Roots int    `json:"roots"` // live ROOT session count (children/archived excluded)
+	Dir     string `json:"dir"`     // project directory ("" = the worker's default project)
+	Epoch   string `json:"epoch"`   // store lifetime id (changes on daemon restart)
+	Seq     uint64 `json:"seq"`     // current head seq for this project's store
+	Roots   int    `json:"roots"`   // live ROOT session count (children/archived excluded)
+	Running int    `json:"running"` // running ROOT count (roots whose subtree has ≥1 busy/retry session)
 }
 
 // handleProjects lists the project instances this worker currently bridges — one
@@ -1207,7 +1208,7 @@ func (s *Server) handleProjects(w http.ResponseWriter, r *http.Request) {
 	out := make([]projectInfo, 0, len(live))
 	for _, e := range live {
 		st := e.agg.Store()
-		out = append(out, projectInfo{Dir: e.dir, Epoch: st.Epoch(), Seq: st.Head(), Roots: st.RootCount()})
+		out = append(out, projectInfo{Dir: e.dir, Epoch: st.Epoch(), Seq: st.Head(), Roots: st.RootCount(), Running: st.RunningRoots()})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Dir < out[j].Dir })
 	// State-like GET: the response is computed fresh on every call from live
@@ -1223,10 +1224,11 @@ func (s *Server) handleProjects(w http.ResponseWriter, r *http.Request) {
 // handleRunningSessions aggregates how many sessions are currently running ACROSS ALL
 // workspaces the daemon manages — not just the one the SPA is viewing. Restarting
 // OpenCode interrupts every workspace, so the restart-confirmation warning must reflect the
-// whole fleet, and the SPA's per-workspace runningSessionCount() can't see beyond
-// its own projectDir(). Each workspace aggregator shares the single opencodeURL
-// (one OpenCode process we own), and a session belongs to exactly one dir,
-// so summing RunningRoots() across aggregators can't double-count.
+// whole fleet, and /vh/projects reports running PER project only (no fleet-wide
+// sum), so the restart warning needs this dedicated cross-workspace aggregate.
+// Each workspace aggregator shares the single opencodeURL (one OpenCode process
+// we own), and a session belongs to exactly one dir, so summing RunningRoots()
+// across aggregators can't double-count.
 type runningWorkspaceInfo struct {
 	Dir   string `json:"dir"`
 	Count int    `json:"count"`
