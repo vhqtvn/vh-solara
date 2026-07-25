@@ -1912,6 +1912,29 @@ func (s *Store) deleteSessionLocked(id string) {
 				s.busyCount[root]--
 			}
 		}
+		// Finish-cascade: emit a terminal KindActivity(idle) for a session that
+		// was observably busy/retry so every observer (chat + tree) drops the
+		// busy signal in the same transition. deleteSessionLocked deletes
+		// s.activity[id] silently below and emits only KindSessionDelete; a
+		// client that held activity[id]="busy" (snapshot seed or last busy
+		// event) is never told the id transitioned out of busy — node.remove
+		// prunes the TreeRow, but the chat-side syncState.activity[id] (read by
+		// Part.tsx for the parent's task tool status) retains the stale "busy"
+		// indefinitely and the finished subsession keeps looking "running" in
+		// the Part activity timeline. This is the finish-side counterpart to
+		// the frontier-promotion gap fix (tree_emitter.go promoteActiveFrontier
+		// + tree_frontier_promotion_test.go): there, a live promote ships an
+		// active node that became active while unknown; here, a live
+		// terminal-activity cascade clears a busy node that became gone. The
+		// emit must precede the KindSessionDelete emit below so a client
+		// processing events in seq order clears the chat activity map BEFORE
+		// the structural prune lands. The stale "idle" the client retains
+		// after the subsequent session.delete is the correct terminal value
+		// (and is overwritten on id-reuse). No setActivityLocked call: that
+		// would re-run the busyCount/subtree maintenance (already done above
+		// — maintainIndexesOnDelete + the prototype block + the busyCount
+		// decrement) and fire a spurious markUnread on a session being removed.
+		s.emit(KindActivity, rawObj(map[string]interface{}{"sessionID": id, "state": ActivityIdle}))
 	}
 	delete(s.sessions, id)
 	delete(s.messages, id)
