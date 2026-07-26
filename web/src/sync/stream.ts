@@ -1409,11 +1409,22 @@ function ensureOwner(generation: number): PendingCaptureOwner {
 // `generation`, or null for the fast path (no coherent owner pending AND no
 // independent detail decode in flight). Returns the EXACT owner's promise (not
 // a boolean + a separately-replaceable global) so the handler awaits the owner
-// it captured even if pendingOwner is replaced later. A legacy or settled owner
-// yields null (skip the await).
+// it captured even if pendingOwner is replaced later. A SETTLED owner yields
+// null (skip the await).
+//
+// C-F1: a legacy-but-UNSETTLED owner still returns owner.promise. The release
+// from markOwnerLegacy is chained behind pendingTreeDecode (releaseOwner
+// waitForTree=true), so owner.promise resolves AFTER the seed regardless — the
+// B-F1/B-F2 data-loss guard is preserved. Same-gen waiters MUST all await this
+// one promise so their resumption is FIFO in arrival order: routing a post-
+// mismatch waiter onto treeSnapshotDecode (a different promise object) splits
+// the resume lanes and reorders resumption (B before A despite arriving later),
+// which regresses the resume cursor via applySessionEvent's unconditional
+// `s.cursor = seq`. Only a SETTLED legacy owner (install done / already
+// canceled) yields null → fast path or independent-decode-gate path.
 function coveredAwait(generation: number): Promise<void> | null {
   const owner = pendingOwner;
-  if (owner && !owner.legacy && !owner.settled && owner.generation === generation) {
+  if (owner && !owner.settled && owner.generation === generation) {
     return owner.promise;
   }
   if (treeSnapshotDecoding) return treeSnapshotDecode;
@@ -2247,11 +2258,25 @@ export function connect(fresh = false) {
     setState("status", "reconnecting");
     // C4: a transport error on this connection means its coherent capture (if
     // pending) will never complete — cancel the blocked owner immediately so
-    // covered handlers resume and fail their gen check, rather than waiting for
-    // the deferred connect() to do it. (connect()'s treeGen++ also cancels; this
-    // is the prompt, contract-named release path. Safe: a stale owner may settle
-    // itself but never clears a newer owner.)
+    // covered handlers resume, rather than waiting for the deferred connect()
+    // to do it. (connect()'s treeGen++ also cancels; this is the prompt,
+    // contract-named release path. Safe: a stale owner may settle itself but
+    // never clears a newer owner.)
+    //
+    // C-F2: bump treeGen BEFORE canceling. cancelPendingOwner resolves
+    // owner.promise immediately (waitForTree=false); the deferred connect()'s
+    // own treeGen++ lands `backoff` ms later. Without this bump, a suspended
+    // covered waiter resumes with the generation unchanged, PASSES its post-
+    // await gen check, and applies its live reducer on the CLOSED transport's
+    // pre-capture baseline (brief stale-baseline churn before the reconnect
+    // re-baselines — no permanent loss, since the cursor advance suppresses
+    // server replay). Bumping here makes the resumed waiter FAIL its gen check
+    // instead; the live event is then replayed once on the fresh baseline after
+    // the deferred reconnect. es is already CLOSED → no listener fires on the
+    // intermediate gen, so an extra bump outside connect() is harmless (the
+    // counter is purely a listener-invalidation stamp).
     if (es && es.readyState === EventSource.CLOSED) {
+      treeGen++;
       cancelPendingOwner();
       log.warn("sync", "tree stream closed → reconnecting", { backoff });
       clearTimeout(reconnectTimer);

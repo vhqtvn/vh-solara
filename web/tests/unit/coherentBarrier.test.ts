@@ -855,3 +855,118 @@ describe("C4 coherent barrier — Case 13: overlapping capture → resync", () =
     expect(treeState.treeMap().get("c1")).toBeTruthy();
   });
 });
+
+// ===========================================================================
+// C-F1 regression — coveredAwait must NOT split same-gen waiters across resume
+// lanes when the owner is legacy-but-unsettled (post-mismatch, pre-seed). A
+// covered handler captured owner.promise PRE-mismatch; a handler arriving
+// POST-mismatch must NOT be rerouted to treeSnapshotDecode (a different promise
+// object → FIFO violation → cursor regression). Both must await the SAME
+// owner.promise. The B-F1 regression (Case 5's third `it`) captures BOTH
+// handlers pre-mismatch; this test fires B post-mismatch — the uncovered
+// increment.
+// ===========================================================================
+describe("C4 — C-F1: coveredAwait keeps same-gen waiters on one resume lane", () => {
+  it("a covered handler arriving after a mismatch resumes AFTER pre-mismatch handlers (no cursor regression)", async () => {
+    stream.connect();
+    const treeES = treeESes()[0];
+    treeES.simulateOpen();
+
+    // 1. tree.snapshot gzip64 (epoch A, seq 10) — owner created, decode HELD,
+    //    pendingTreeDecode = treeSnapshotDecode = decodeP.
+    treeES.fire("tree.snapshot", JSON.stringify({
+      encoding: "gzip64",
+      data: encodeForTest(treeSnapBody(10, "A", ["base"])),
+    }), "10");
+
+    // 2. detail epoch B (seq 10) → BINDS owner identity {B, 10} (first binding;
+    //    no mismatch yet). Stages detail without installing (tree pending).
+    treeES.fire("snapshot", detailSnap(10, "B", ["base"]), "10");
+
+    // 3. PRE-MISMATCH covered handler A (seq 11) → captures owner.promise
+    //    (owner non-legacy at this instant).
+    treeES.fire("session.upsert", { id: "race", title: "A-first" }, "11");
+
+    // 4. completion epoch A (revision 10) → mismatches bound {B, 10} →
+    //    markOwnerLegacy: legacy=true, stagedDetail flushed independently
+    //    (sessions={base}, cursor=10), release CHAINED behind decodeP (still
+    //    in flight via releaseOwner(owner, true)).
+    treeES.fire("snapshot.complete", { epoch: "A", revision: 10, projections: ["tree", "detail"] }, "10");
+
+    // 5. POST-MISMATCH covered handler B (seq 12, HIGHER than A). Without the
+    //    fix, coveredAwait sees owner.legacy and falls to treeSnapshotDecode
+    //    (decodeP) — a different promise than A is awaiting → resume-lane
+    //    split. With the fix, coveredAwait returns owner.promise for the
+    //    legacy-but-unsettled owner → B shares A's resume lane.
+    treeES.fire("session.upsert", { id: "race", title: "B-second" }, "12");
+
+    // 6. Flush the decode → finishDecode (legacy branch) seeds "base" → the
+    //    chained release fires → both waiters resume.
+    await awaitOwner();
+    await tick(2);
+
+    // Decisive assertion. Without the fix: decodeP's .then queue runs
+    // finish (→ settles owner.promise → schedules A) then B's continuation,
+    // so B resumes before A → reducer order B(12) then A(11) → cursor
+    // regresses to 11. With the fix: both A and B await owner.promise and
+    // resume FIFO (A then B) → cursor monotonic at 12.
+    expect(store.state.cursor).toBe(12);
+    // Corroborating ordering witness: the LATER live event's title wins.
+    expect(store.state.sessions.race).toEqual({ id: "race", title: "B-second" });
+    // Legacy path: no coherent install (readiness stays false).
+    expect(store.state.authoritativeReady).toBe(false);
+    // Baseline survived the seed (markOwnerLegacy's independent detail flush
+    // landed `base`; the late tree seed did not clobber the detail map).
+    expect(store.state.sessions.base).toBeTruthy();
+  });
+});
+
+// ===========================================================================
+// C-F2 regression — onerror CLOSED must bump treeGen BEFORE canceling the
+// pending owner so a suspended covered waiter FAILS its post-await gen check
+// instead of applying a live reducer on the dead transport's pre-capture
+// baseline. The live event is then replayed once on the fresh baseline after
+// the deferred reconnect (the waiter returned before advanceCursor, so the
+// cursor was not advanced).
+// ===========================================================================
+describe("C4 — C-F2: onerror CLOSED bumps gen before cancel", () => {
+  it("a covered waiter suspended on the owner does NOT apply its reducer when the transport closes", async () => {
+    stream.connect();
+    const treeES = treeESes()[0];
+    treeES.simulateOpen();
+    const cursorBefore = store.state.cursor;
+
+    // 1. tree.snapshot gzip64 (epoch e1, seq 50) — owner pending, decode HELD.
+    //    The covered handler below captures owner.promise and suspends.
+    treeES.fire("tree.snapshot", JSON.stringify({
+      encoding: "gzip64",
+      data: encodeForTest(treeSnapBody(50, "e1", ["base"])),
+    }), "50");
+
+    // 2. Covered session.upsert (seq 51) → awaits owner.promise (decode held).
+    treeES.fire("session.upsert", { id: "pendingLive", title: "L" }, "51");
+
+    // 3. Transport gives up (CLOSED) BEFORE the decode flushes → onerror fires.
+    //    Without the fix: cancelPendingOwner resolves owner.promise; the waiter
+    //      resumes with treeGen unchanged → passes gen check → applies the
+    //      reducer → sessions.pendingLive defined, cursor=51 (then the late
+    //      decode's applyTreeIndependent regresses cursor to 50).
+    //    With the fix: treeGen++ first → waiter's gen check fails → skip;
+    //      sessions.pendingLive absent, cursor unchanged.
+    (treeES as any).readyState = MockEventSource.CLOSED;
+    (treeES as any).onerror?.();
+
+    // Await the in-flight decode directly so the close-time invariant has
+    // stabilized (the waiter's continuation has run; the decode's gen-check
+    // early-return has run; the decode-gate flag has cleared). tick(2) then
+    // flushes any trailing microtasks.
+    await awaitOwner();
+    await tick(2);
+
+    // The waiter did NOT apply (failed the post-await gen check).
+    expect(store.state.sessions.pendingLive).toBeUndefined();
+    expect(store.state.cursor).toBe(cursorBefore);
+    // The owner was canceled (not left wedged) and the decode gate cleared.
+    expect(stream.isTreeSnapshotDecoding()).toBe(false);
+  });
+});
