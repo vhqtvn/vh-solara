@@ -3,7 +3,7 @@
 // watchdog, backoff reconnect, foreground/online recovery). It owns transport
 // and store reconciliation; notification policy lives in ./orchestration.
 import { produce } from "solid-js/store";
-import { createSignal } from "solid-js";
+import { batch, createSignal } from "solid-js";
 import type { MessageWindowMeta, Snapshot } from "../types";
 import {
   buildMessages,
@@ -28,8 +28,10 @@ import {
   fetchChildren,
   type TreeFetcher,
   type ChildrenResponse,
+  type TreeSnapshot,
 } from "./treeOps";
 import { seedTreeStore, applyTreeOpStore, patchTreeAgent, expandedButUnloadedIds, treeMap } from "./treeState";
+import type { TreeOp, TreeNode } from "./treeMap";
 import { applyPinsSnapshot, applyPinsUpdated, dropPinnedSession } from "../sidebar";
 
 // mergeLastAgents — the agent-label fix (S3). During a server restart the
@@ -1192,15 +1194,357 @@ let treeGen = 0;
 // state.cursor=snap.seq, so a session.upsert/session.delete/TREE_STREAM_KINDS
 // frame landing in the decode window would have its store mutation clobbered
 // AND the cursor REGRESSED from the live event's higher seq back to the
-// snapshot's seq when the stale-but-now-decoded snapshot lands. Promise-gate
-// exactly like sesSnapshotDecode: the tree live-event listeners await this
-// before processing ANY frame for the stream. Connect-time only (a snapshot
-// decode is ms-scale) and bounded to one (the current connection's). Reset on
-// each (re)open. treeSnapshotDecoding is the cheap boolean the fast path
-// checks to avoid a microtask when no decode is in flight (tree event floods
-// must stay zero-latency).
+// snapshot's seq when the stale-but-now-decoded snapshot lands.
+//
+// C4 (O1-R1): this loose gate is REPLACED for the tree.snapshot coherent path
+// by the generation-owned PendingCaptureOwner (below). treeSnapshotDecoding now
+// gates ONLY the independent detail-snapshot gzip64 path (rare: the server ships
+// the detail snapshot RAW in tree=2 per pkg/web/tree_detail_test.go:221; this
+// path is defensive for proj=1 / older servers where the detail snapshot can
+// arrive gzip64 with no coherent owner). Covered live handlers await the OWNER
+// first (coveredAwait); only when no coherent owner is pending do they fall
+// back to this decode gate.
 let treeSnapshotDecode: Promise<void> = Promise.resolve();
 let treeSnapshotDecoding = false;
+
+// ============================================================================
+// C4 — O1-R1: generation-owned coherent-baseline barrier (PendingCaptureOwner)
+// ============================================================================
+// The server emits tree.snapshot + detail `snapshot` + snapshot.complete from
+// ONE coherent SnapshotWithTree capture, all stamped with the SAME store-lifetime
+// {epoch, seq} (Q5: pkg/state/tree_emitter.go TreeSnapshot + pkg/web/server.go
+// writeSnapshotComplete). C4 makes that truthful boundary enforceable on the FE:
+// a capture becomes authoritative only when its matching detail snapshot,
+// decoded tree snapshot, AND the snapshot.complete boundary are ALL present; the
+// FE then installs BOTH projections atomically (one Solid batch) before
+// releasing newer live events. No server changes.
+//
+// One stream-local owner per active tree generation (the server does not
+// pipeline captures on one open response). The owner may start identity-unbound
+// (it must exist before gzip64 decode yields, while {epoch,seq} is only
+// available after decoding). The SAME object survives identity-bind, staging,
+// install, reconcile, release. Covered live handlers capture the EXACT owner
+// ref and `await` its promise; on settle they recheck the tree generation and
+// run their reducer + cursor effects SYNCHRONOUSLY — no second await between
+// the gen recheck and the reducer (the release-burst ordering proof depends on
+// this; adding one breaks it).
+interface CoherentIdentity {
+  epoch: string;
+  seq: number;
+}
+interface StagedTree {
+  nodes: TreeNode[];
+  identity: CoherentIdentity;
+  focusedSessionId?: string;
+}
+interface StagedDetail {
+  snap: Snapshot;
+  identity: CoherentIdentity;
+}
+interface CompletionLatch {
+  identity: CoherentIdentity;
+  projections: string[];
+}
+interface PendingCaptureOwner {
+  // The tree connection generation this owner belongs to. Covered handlers
+  // capture THIS owner; after settle they recheck treeGen === generation.
+  generation: number;
+  // Identity-unbound until the first baseline participant yields a valid
+  // coherent {epoch, seq}. Once bound, every other participant must match.
+  identity: CoherentIdentity | null;
+  // legacy: the tree projection decoded WITHOUT a valid epoch (pre-Q5 daemon)
+  // or with an identity that mismatches an already-bound owner. A legacy owner
+  // NEVER installs; all participants apply independently (existing behavior,
+  // authoritativeReady stays false). Covered handlers skip awaiting a SETTLED
+  // legacy owner.
+  legacy: boolean;
+  stagedTree: StagedTree | null;
+  stagedDetail: StagedDetail | null;
+  completion: CompletionLatch | null;
+  // pendingTreeDecode: the in-flight tree gzip64 decode promise (null for a RAW
+  // tree.snapshot, or once finishDecode has landed). The owner's promise does
+  // NOT resolve until this decode's tree apply completed, so a covered handler
+  // that captured owner.promise and is then released by markOwnerLegacy (a
+  // mismatch while the decode is in flight) resumes AFTER seedTreeStore — its
+  // reducer is not clobbered by the late wholesale treeMap replace (B-F1/B-F2
+  // data-loss guard). Canceled owners (gen bump) release immediately regardless
+  // — their waiters fail the gen check and never apply.
+  pendingTreeDecode: Promise<void> | null;
+  // The promise covered handlers await. Resolves on install OR cancel OR legacy
+  // (via releaseOwner, which chains behind pendingTreeDecode for the legacy
+  // path); never rejects (a canceled owner resolves so its waiters resume and
+  // fail the gen check rather than hanging forever).
+  promise: Promise<void>;
+  settle: () => void;
+  settled: boolean;
+  installed: boolean;
+}
+
+// The one stream-local owner for the active tree generation. Null when no
+// potentially-coherent capture is in flight.
+let pendingOwner: PendingCaptureOwner | null = null;
+
+function makeOwner(generation: number): PendingCaptureOwner {
+  let resolveFn: () => void = () => {};
+  const promise = new Promise<void>((resolve) => {
+    resolveFn = resolve;
+  });
+  return {
+    generation,
+    identity: null,
+    legacy: false,
+    stagedTree: null,
+    stagedDetail: null,
+    completion: null,
+    pendingTreeDecode: null,
+    promise,
+    settle: () => resolveFn(),
+    settled: false,
+    installed: false,
+  };
+}
+
+// releaseOwner — resolve the owner's promise (so covered handlers resume). When
+// `waitForTree` is true (markOwnerLegacy / tryInstall paths, where same-gen
+// waiters WILL apply their reducers), the resolution is CHAINED behind
+// pendingTreeDecode so it cannot fire until the in-flight tree gzip64 decode's
+// apply (finishDecode → applyTreeIndependent / tryInstall batch) has landed.
+// This preserves the single-await ordering invariant (covered handlers await
+// owner.promise ONCE) while guaranteeing their reducer applies after the
+// baseline seed — closing the B-F1/B-F2 data-loss race. When `waitForTree` is
+// false (cancelPendingOwner: gen bump → waiters fail the gen check and never
+// apply), the release is immediate.
+function releaseOwner(owner: PendingCaptureOwner, waitForTree: boolean): void {
+  if (owner.settled) return;
+  const finish = () => {
+    if (owner.settled) return;
+    if (pendingOwner === owner) pendingOwner = null;
+    owner.settled = true;
+    owner.settle();
+  };
+  if (waitForTree && owner.pendingTreeDecode) {
+    void owner.pendingTreeDecode.then(finish);
+  } else {
+    finish();
+  }
+}
+
+// bindIdentity — bind the owner to the first valid coherent {epoch, seq}, or
+// verify a subsequent participant matches. Returns false on MISMATCH (the
+// participant is rejected). An empty epoch is not a valid coherent identity
+// (the detail Snapshot.epoch is optional for back-compat; correlation requires
+// a real epoch).
+function bindOwnerIdentity(owner: PendingCaptureOwner, epoch: string, seq: number): boolean {
+  if (!epoch) return false;
+  if (owner.identity === null) {
+    owner.identity = { epoch, seq };
+    return true;
+  }
+  return owner.identity.epoch === epoch && owner.identity.seq === seq;
+}
+
+// cancelPendingOwner — detach + release the current owner WITHOUT install. Used
+// on generation change (connect bumps treeGen) and on same-generation overlap
+// (a second capture while the first is still pending → resync). Releases
+// IMMEDIATELY (waitForTree=false): a gen bump means resumed waiters fail their
+// post-await gen check and never apply, so there is no clobber concern. A stale
+// owner may settle itself but NEVER clears a newer owner, installs staged state,
+// sets readiness, or runs current-gen reconcile (tryInstall + the gen guards
+// enforce this).
+function cancelPendingOwner(): void {
+  const old = pendingOwner;
+  if (!old) return;
+  releaseOwner(old, false);
+}
+
+// markOwnerLegacy — declare the pending capture incoherent (a participant's
+// identity mismatched the bound identity, so the coherent install will never
+// fire). Marks the owner legacy and flushes already-staged participants via the
+// independent paths (detail is disjoint; a tree that already decoded is flushed
+// too). The owner's promise release is CHAINED behind pendingTreeDecode via
+// releaseOwner(owner, true): same-gen covered waiters will apply their reducers
+// on resume, so they must resume AFTER the in-flight tree gzip64 decode's
+// applyTreeIndependent (seedTreeStore) lands — otherwise the late wholesale
+// treeMap replace clobbers them (B-F1/B-F2). A participant still in flight (the
+// tree decode) sees owner.legacy when it lands and applies independently.
+// authoritativeReady stays false (no truthful install).
+function markOwnerLegacy(owner: PendingCaptureOwner): void {
+  if (owner.settled) return;
+  owner.legacy = true;
+  // Flush already-staged participants via the independent paths NOW (they are
+  // disjoint from each other; the tree — if its decode is still in flight — is
+  // applied by finishDecode's legacy branch, NOT here).
+  if (owner.stagedDetail) {
+    const snap = owner.stagedDetail.snap;
+    owner.stagedDetail = null;
+    applyDetailIndependent(snap);
+  }
+  if (owner.stagedTree) {
+    const t = owner.stagedTree;
+    owner.stagedTree = null;
+    const snap: TreeSnapshot = { nodes: t.nodes };
+    if (typeof t.focusedSessionId === "string") snap.focusedSessionId = t.focusedSessionId;
+    applyTreeIndependent(snap, t.identity.seq, owner.generation);
+  }
+  // Release same-gen waiters only after the tree apply (if still pending) —
+  // chained behind pendingTreeDecode. For a RAW tree.snapshot or an already-
+  // completed decode, pendingTreeDecode is null → immediate release.
+  releaseOwner(owner, true);
+}
+
+// ensureOwner — get-or-create the pending owner for `generation`. A stale owner
+// from a prior generation (should already have been canceled by connect()'s gen
+// bump, but defended against) is settled + dropped without install.
+function ensureOwner(generation: number): PendingCaptureOwner {
+  if (pendingOwner && pendingOwner.generation === generation && !pendingOwner.settled) {
+    return pendingOwner;
+  }
+  cancelPendingOwner();
+  const owner = makeOwner(generation);
+  pendingOwner = owner;
+  return owner;
+}
+
+// coveredAwait — the promise a covered live handler should await for
+// `generation`, or null for the fast path (no coherent owner pending AND no
+// independent detail decode in flight). Returns the EXACT owner's promise (not
+// a boolean + a separately-replaceable global) so the handler awaits the owner
+// it captured even if pendingOwner is replaced later. A legacy or settled owner
+// yields null (skip the await).
+function coveredAwait(generation: number): Promise<void> | null {
+  const owner = pendingOwner;
+  if (owner && !owner.legacy && !owner.settled && owner.generation === generation) {
+    return owner.promise;
+  }
+  if (treeSnapshotDecoding) return treeSnapshotDecode;
+  return null;
+}
+
+// applyDetailIndependent — the existing detail `snapshot` apply path, extracted
+// so the coherent install and the legacy/independent path run identical logic.
+// Gate deferral, expectTreeSnap handshake, applySnapshot (wholesale-replace +
+// cursor), latency, status, refresh. Does NOT touch authoritativeReady (the
+// independent path leaves it false; the coherent install sets it in its batch).
+function applyDetailIndependent(snap: Snapshot): void {
+  if (isGateActive() && !expectTreeSnap) {
+    advanceCursor(snap.seq);
+    markBusyDirty();
+    return;
+  }
+  if (expectTreeSnap) {
+    expectTreeSnap = false;
+    maybeResolveReconcile();
+  }
+  applySnapshot(snap);
+  if (!treeSnapDone) {
+    treeSnapDone = true;
+    if (treeT1) recordLatency("tree", "snap", performance.now() - treeT1);
+  }
+  setState("status", "live");
+  void refreshOpenSessions();
+}
+
+// applyTreeIndependent — the existing tree.snapshot apply path, extracted so the
+// legacy/independent path runs identical logic to the pre-C4 behavior. Gate
+// deferral, seedTreeStore, P1-A backfill, latency, cursor (F4: SSE id store
+// seq), status, resolvePeriodicDiff. `gen` is the connection's captured
+// treeGen, forwarded to resolvePeriodicDiff for the periodic-slot attribution.
+function applyTreeIndependent(snap: TreeSnapshot, seq: number, gen: number): void {
+  if (isGateActive() && !expectTreeSnap) {
+    advanceCursor(seq);
+    markBusyDirty();
+    return;
+  }
+  if (expectTreeSnap) {
+    expectTreeSnap = false;
+    maybeResolveReconcile();
+  }
+  seedTreeStore(snap.nodes);
+  const backfill = expandedButUnloadedIds();
+  if (backfill.length > 0) {
+    for (const id of backfill) void expandTreeNode(id);
+  }
+  if (!treeSnapDone) {
+    treeSnapDone = true;
+    if (treeT1) recordLatency("tree", "snap", performance.now() - treeT1);
+  }
+  advanceCursor(seq);
+  setState("status", "live");
+  resolvePeriodicDiff(gen);
+}
+
+// tryInstall — VALIDATE all three staged participants against the bound
+// identity and, if every precondition holds, INSTALL BOTH projections in one
+// Solid batch, then detach + settle so deferred handlers resume in arrival
+// order. No-op otherwise: an arbitrary JSON object must NOT mark the baseline
+// authoritative. A legacy or superseded owner never installs.
+function tryInstall(owner: PendingCaptureOwner): void {
+  if (owner.settled || owner.installed) return;
+  if (owner.generation !== treeGen) return; // superseded by a reconnect
+  if (pendingOwner !== owner) return; // not current (overlap resync replaced path)
+  if (owner.legacy) return;
+  const id = owner.identity;
+  if (!id) return;
+  const tree = owner.stagedTree;
+  const detail = owner.stagedDetail;
+  const completion = owner.completion;
+  if (!tree || !detail || !completion) return;
+  // Identity cross-projection validation (VALIDATE step).
+  if (tree.identity.epoch !== id.epoch || tree.identity.seq !== id.seq) return;
+  if (detail.identity.epoch !== id.epoch || detail.identity.seq !== id.seq) return;
+  if (completion.identity.epoch !== id.epoch || completion.identity.seq !== id.seq) return;
+  if (!completion.projections.includes("tree") || !completion.projections.includes("detail")) return;
+  // ALL preconditions hold — INSTALL ATOMICALLY (one Solid batch: no observer
+  // sees a mixed old/new projection pair).
+  owner.installed = true;
+  let backfillIds: string[] = [];
+  batch(() => {
+    // Detail projection (existing applySnapshot path). applySnapshot
+    // wholesale-replaces state.sessions and sets state.cursor = snap.seq; inside
+    // the batch this and the tree seed are ONE reactive flush.
+    applySnapshot(detail.snap);
+    // Tree projection (existing seedTreeStore path). Replaces treeMap in one
+    // signal update; userExpanded preserved.
+    seedTreeStore(tree.nodes);
+    // Tree-dependent effects AFTER the seed exists (Case 9: resolvePeriodicDiff
+    // observes the newly seeded coherent tree, not a mixed pair). Passing the
+    // owner's generation so a superseded periodic slot is dropped cleanly.
+    resolvePeriodicDiff(owner.generation);
+    // P1-A backfill: capture ids here (treeMap is now the seeded coherent map)
+    // and fire the network expands AFTER the batch.
+    backfillIds = expandedButUnloadedIds();
+    // Matching busy/recovery reconcile (Case 8): the expectTreeSnap handshake
+    // clears here, where the authoritative baseline actually landed — not after
+    // only one projection.
+    if (expectTreeSnap) {
+      expectTreeSnap = false;
+      maybeResolveReconcile();
+    }
+    if (!treeSnapDone) {
+      treeSnapDone = true;
+      if (treeT1) recordLatency("tree", "snap", performance.now() - treeT1);
+    }
+    // F4: advance the cursor to the coherent capture's store seq (== both
+    // projections' seq). Inside the batch so observers see cursor + projections
+    // land together.
+    advanceCursor(id.seq);
+    // Truthful readiness ONLY after both projections installed.
+    setState("authoritativeReady", true);
+  });
+  // DETACH before SETTLE: a newly-delivered event joining the barrier finds no
+  // owner and (gen still current) takes its fast path instead of awaiting a
+  // just-settled owner. Then release THIS owner so its captured waiters resume,
+  // recheck gen, and run their synchronous reducers FIFO (release burst).
+  // releaseOwner(owner, true): by this point finishDecode has cleared
+  // pendingTreeDecode (the tree apply ran inside the install batch above), so
+  // the release is immediate.
+  releaseOwner(owner, true);
+  markAuthoritativeRecovery();
+  // Fire-and-forget effects that must NOT be inside the batch (async network).
+  for (const nid of backfillIds) void expandTreeNode(nid);
+  setState("status", "live");
+  void refreshOpenSessions();
+}
 let sesT0 = 0;
 let sesT1 = 0;
 let sesSnapDone = false;
@@ -1324,18 +1668,21 @@ function reconcileBusy(): Promise<void> {
 // the reference is valid even though they're textually defined below.
 setReconcileFn(reconcileBusy);
 
-// isTreeSnapshotDecoding — test-only peek at the module-private decode flag.
-// DecompressionStream's internal pipeline chains multiple microtasks; tests
-// using fake timers loop flushes until this flips false so the flush count is
-// deterministic regardless of suite load (a fixed flush count is fragile).
+// isTreeSnapshotDecoding — test-only peek at whether a coherent capture or an
+// independent detail decode is in flight. C4: the coherent barrier (pending
+// owner) is the primary gate; treeSnapshotDecoding now only covers the rare
+// independent detail-gzip64 path. Either active → true.
 export function isTreeSnapshotDecoding(): boolean {
-  return treeSnapshotDecoding;
+  return treeSnapshotDecoding || (pendingOwner != null && !pendingOwner.settled && !pendingOwner.legacy);
 }
 
-// getTreeSnapshotDecode — test-only accessor for the in-flight decode promise.
-// Lets tests await the decode directly (deterministic) instead of pumping fake
-// timers (which is fragile with native DecompressionStream under load).
+// getTreeSnapshotDecode — test-only accessor for the in-flight barrier/decode
+// promise. C4: returns the pending owner's promise when a coherent capture is
+// in flight (settles on install OR cancel); otherwise the independent detail
+// decode promise. Lets tests await the barrier directly (deterministic) instead
+// of pumping fake timers.
 export function getTreeSnapshotDecode(): Promise<void> {
+  if (pendingOwner && !pendingOwner.settled) return pendingOwner.promise;
   return treeSnapshotDecode;
 }
 
@@ -1349,6 +1696,10 @@ export function connect(fresh = false) {
   // ses?.close()); the prior Stream-1 order (close THEN bump) left a stale-
   // decode hazard on the empty-dir path.
   treeGen++;
+  // C4: cancel any pending coherent owner for the prior generation. Its waiters
+  // (covered handlers that captured it) resume on settle and fail the gen check;
+  // a stale owner must NEVER install staged state or clear a newer owner.
+  cancelPendingOwner();
   // Reset the in-flight decode gate so a live tree event landing on the new
   // connection doesn't await a stale decode from the prior connection.
   treeSnapshotDecode = Promise.resolve();
@@ -1426,42 +1777,40 @@ export function connect(fresh = false) {
       log.warn("sync", "malformed tree snapshot frame", { err });
       return;
     }
-    // applySnap owns the full post-decode state transition (gate short-circuit,
-    // expectTreeSnap resolution, wholesale apply, latency, status, refresh).
-    // Defined as a closure so BOTH the compressed IIFE and the synchronous raw
-    // path run the exact same logic — no divergence between the two shapes.
-    const applySnap = (snap: Snapshot) => {
-      if (isGateActive() && !expectTreeSnap) {
-        // Deferred tree snapshot during a busy scope — advance the resume cursor
-        // (Stream 1) but do NOT mutate the store or run refreshOpenSessions.
-        advanceCursor(snap.seq);
-        markBusyDirty();
-        return;
+    // C4: the detail `snapshot` is a BASELINE PARTICIPANT of the coherent
+    // capture. It stages into the pending owner (if one is pending for this
+    // generation and the identity matches) and is applied atomically with the
+    // tree projection inside tryInstall's batch. A baseline participant NEVER
+    // awaits its own owner. If no coherent owner is pending (proj=1 / legacy /
+    // no tree.snapshot in flight / identity mismatch) it applies independently
+    // — the existing pre-C4 path.
+    const stageDetail = (snap: Snapshot): boolean => {
+      const owner = pendingOwner;
+      if (!owner || owner.legacy || owner.generation !== gen) return false;
+      const epoch = snap.epoch || "";
+      const seq = snap.seq;
+      // A detail with no epoch can't participate coherently → independent apply.
+      if (!epoch) return false;
+      if (!bindOwnerIdentity(owner, epoch, seq)) {
+        // Identity mismatch → the capture is incoherent. Release the barrier so
+        // covered handlers do not hang, then the caller applies this detail
+        // independently.
+        markOwnerLegacy(owner);
+        return false;
       }
-      if (expectTreeSnap) {
-        expectTreeSnap = false;
-        maybeResolveReconcile();
-      }
-      applySnapshot(snap);
-      // L1 t2: first snapshot of this connection → server-processing delta.
-      if (!treeSnapDone) {
-        treeSnapDone = true;
-        if (treeT1) recordLatency("tree", "snap", performance.now() - treeT1);
-      }
-      setState("status", "live");
-      void refreshOpenSessions();
+      // Staging into an already-settled (installed) owner is harmless:
+      // tryInstall no-ops, so a replayed detail from the just-installed capture
+      // is dropped (already applied inside the install batch) rather than
+      // re-applied independently and clobbering the live tail.
+      owner.stagedDetail = { snap, identity: { epoch, seq } };
+      tryInstall(owner);
+      return true;
     };
-    // Compressed path: async decode, gated behind treeSnapshotDecode so live
-    // session.upsert/session.delete/TREE_STREAM_KINDS frames in the decode
-    // window serialize behind it (the shared tree listeners await it) —
-    // applySnapshot WHOLESALE-REPLACES state.sessions and unconditionally sets
-    // state.cursor=snap.seq, so a live event applied mid-decode would have its
-    // store mutation clobbered AND the cursor REGRESSED from the live event's
-    // higher seq back to the snapshot's seq when the stale-but-now-decoded
-    // snapshot lands. Until applySnap runs the PRIOR tree state stays in place
-    // → no flash-of-empty through the decode window. Raw path: synchronous
-    // apply, exactly the legacy behavior (cold small trees, zero decode
-    // latency). Mirrors Stream 2's sesSnapshotDecode pattern verbatim.
+    // Compressed path: async decode. treeSnapshotDecoding gates ONLY the
+    // independent apply (no coherent owner covers a proj=1 / detail-only decode
+    // window); when a coherent owner is pending, covered handlers await the
+    // OWNER, not this flag. After decode, route to coherent-stage or
+    // independent-apply.
     if (raw.encoding === "gzip64") {
       treeSnapshotDecoding = true;
       treeSnapshotDecode = (async () => {
@@ -1478,27 +1827,18 @@ export function connect(fresh = false) {
             return;
           }
           // Generation re-check (mirrors Stream 2's post-await sesGen check):
-          // the connection may have been replaced while we were decoding. A
-          // superseded decode must NOT mutate the store, advance the cursor, or
-          // run latency effects: the replacement connection owns the tree state.
+          // the connection may have been replaced while we were decoding.
           if (gen !== treeGen) return;
-          applySnap(snap);
+          if (stageDetail(snap)) return;
+          applyDetailIndependent(snap);
         } finally {
           // Ownership-aware clear: only the CURRENT generation owns the flag.
-          // A superseded connection's decode must NOT clear treeSnapshotDecoding
-          // while the replacement's decode is still in flight — doing so would
-          // re-open the decode-window race across reconnects: the replacement's
-          // live-event listeners would take their synchronous fast path (boolean
-          // short-circuits to false), apply ahead of the replacement snapshot,
-          // and applySnapshot would then wholesale-replace + cursor-regress.
-          // The post-await gen check above prevents a stale APPLY; this guard
-          // prevents a stale CLEAR. Without it the flag-reset race re-introduces
-          // the exact anti-clobber failure the serialize gate exists to close.
           if (gen === treeGen) treeSnapshotDecoding = false;
         }
       })();
     } else {
-      applySnap(raw as Snapshot);
+      const snap = raw as Snapshot;
+      if (!stageDetail(snap)) applyDetailIndependent(snap);
     }
   });
   // === Phase 3 Step A (COEXIST): tree=2 server-owned tree stream =============
@@ -1541,78 +1881,131 @@ export function connect(fresh = false) {
       log.warn("sync", "malformed tree.snapshot frame", { err });
       return;
     }
-    // Gate-aware deferral, mirroring the proj=1 snapshot listener: during a busy
-    // scope we advance the resume cursor (so reconnect replays this seq) but do
-    // NOT seed the store. The next non-deferred snapshot reconciles authoritatively.
-    const applyTreeSnap = (decoded: unknown) => {
-      // Gate-aware deferral + expectTreeSnap handshake, mirroring the proj=1
-      // snapshot listener's applySnap closure (line ~1768). During a reconcile-
-      // busy scope, a snapshot we DIDN'T request (expectTreeSnap false) is
-      // deferred (cursor advanced, store untouched); a snapshot we DID request
-      // (expectTreeSnap true, from connect(true) in reconcileBusy) is applied
-      // authoritatively AND clears expectTreeSnap + calls
-      // maybeResolveReconcile so the busy scope releases promptly instead of
-      // waiting the 15s safety timeout (Step A.5 GAP 1).
-      if (isGateActive() && !expectTreeSnap) {
-        advanceCursor(seq);
-        markBusyDirty();
-        return;
-      }
-      if (expectTreeSnap) {
-        expectTreeSnap = false;
-        maybeResolveReconcile();
-      }
+    // C4 overlapping-capture policy: a same-generation second capture while a
+    // coherent owner is still pending is NOT a valid in-band state (the server
+    // does not pipeline captures on one open response). In-band replacement is
+    // explicitly forbidden (it would require assigning live events to the
+    // correct baseline interval = journal/rebase semantics). Force a resync:
+    // cancel A without install, bump the generation, and let the watchdog/new
+    // connection obtain one fresh coherent baseline. A's waiters fail their
+    // post-await gen check.
+    if (
+      pendingOwner &&
+      pendingOwner.generation === gen &&
+      !pendingOwner.settled &&
+      !pendingOwner.legacy
+    ) {
+      log.warn("sync", "overlapping tree.snapshot (same-gen capture while pending) → resync");
+      cancelPendingOwner();
+      connect(true);
+      return;
+    }
+    // CREATE the owner BEFORE the first async decode yield. Identity-unbound
+    // until a participant yields a valid coherent {epoch, seq}.
+    const owner = ensureOwner(gen);
+    // finishDecode runs after the (possibly async) decode resolves. It stage the
+    // tree projection, then routes to the coherent install path OR the legacy
+    // independent path based on whether the decoded tree carries a valid epoch
+    // (the Q5 discriminator).
+    const finishDecode = (decoded: unknown) => {
+      if (gen !== treeGen) return; // superseded during decode
+      // The tree gzip64 decode is done — clear the gate so releaseOwner's
+      // chained release (from a prior markOwnerLegacy) fires once this
+      // synchronous finishDecode + the IIFE tail complete (i.e. AFTER the tree
+      // apply below). For a RAW tree.snapshot there was no decode and this is
+      // already null.
+      owner.pendingTreeDecode = null;
       const snap = decodeTreeSnapshot(decoded);
       if (!snap) {
         log.warn("sync", "tree.snapshot decoded to null", { seq });
+        // A null decode (malformed nodes) strands the owner; mark it legacy
+        // (flush staged detail + release — pendingTreeDecode is null so the
+        // release is immediate) so covered handlers don't hang.
+        if (pendingOwner === owner && !owner.settled) markOwnerLegacy(owner);
         return;
       }
-      seedTreeStore(snap.nodes);
-      // P1-A backfill: a node persisted as mode "expanded" whose children the
-      // cold-load frontier left non-resident (expandedButUnloadedIds) would be a
-      // half-state (expanded mode but nothing rendered). Fire expandTreeNode
-      // for each so their children are fetched and land via subsequent
-      // node.children ops. expandTreeNode is single-flight (treeExpandInFlight),
-      // so a node already being expanded (or with resident children now) is a
-      // no-op — this loop is idempotent across re-seeds.
-      const backfill = expandedButUnloadedIds();
-      if (backfill.length > 0) {
-        for (const id of backfill) void expandTreeNode(id);
+      // If a participant already declared this capture incoherent (a mismatch
+      // marked the owner legacy while the tree was decoding), apply the tree
+      // independently. The release from that prior markOwnerLegacy was chained
+      // behind the decode promise and fires AFTER finishDecode returns (so after
+      // this seed) — covered waiters resume on the seeded tree, not clobbered.
+      if (owner.legacy || owner.settled) {
+        applyTreeIndependent(snap, seq, gen);
+        return;
       }
-      if (!treeSnapDone) {
-        treeSnapDone = true;
-        if (treeT1) recordLatency("tree", "snap", performance.now() - treeT1);
+      // C4 legacy discrimination (Case 7): a tree projection WITHOUT a valid
+      // epoch is a pre-Q5 daemon (no coherent correlation possible, and no
+      // snapshot.complete will arrive). Seed the tree FIRST, then mark legacy
+      // (flush staged detail + release). pendingTreeDecode is null → the release
+      // is immediate and AFTER the seed. authoritativeReady stays false.
+      if (!snap.epoch) {
+        applyTreeIndependent(snap, seq, gen);
+        markOwnerLegacy(owner);
+        return;
       }
-      advanceCursor(seq);
-      setState("status", "live");
-      // Q6: resolve the periodic diffs-found-vs-no-op instrumentation now that
-      // seedTreeStore has installed this gen's authoritative tree map. Resolved
-      // HERE (not at snapshot.complete) because tree.snapshot is gzip64-decoded
-      // async — treeMap is only current after this apply, which may run AFTER
-      // snapshot.complete lands; resolving at the boundary would systematically
-      // mis-count real drift as a no-op. No-op unless a periodic resync is
-      // awaiting this gen's result.
-      resolvePeriodicDiff(gen);
+      // Coherent: stage the tree. The store seq is the SSE id (F4); snap.seq
+      // (the Q5 body field) mirrors it. Prefer the body seq when present for
+      // correlation parity with the detail/completion identity.
+      const treeSeq = typeof snap.seq === "number" ? snap.seq : seq;
+      // Identity mismatch vs an already-bound owner (detail/completion bound a
+      // different {epoch, seq}): the capture is not coherent. Seed FIRST, then
+      // mark legacy (flush staged detail + release after the seed).
+      if (!bindOwnerIdentity(owner, snap.epoch, treeSeq)) {
+        applyTreeIndependent(snap, seq, gen);
+        markOwnerLegacy(owner);
+        return;
+      }
+      const staged: StagedTree = {
+        nodes: snap.nodes,
+        identity: { epoch: snap.epoch, seq: treeSeq },
+      };
+      if (typeof snap.focusedSessionId === "string") staged.focusedSessionId = snap.focusedSessionId;
+      owner.stagedTree = staged;
+      tryInstall(owner);
     };
     if (raw.encoding === "gzip64") {
+      // C4: the owner.promise is the PRIMARY gate for covered handlers, but the
+      // tree gzip64 decode ALSO sets treeSnapshotDecoding/treeSnapshotDecode so
+      // a covered tree.op stays serialized against seedTreeStore even if the
+      // owner is released early (markOwnerLegacy on a mismatch, or a cancel)
+      // BEFORE the decode finishes. Without this, markOwnerLegacy would clear
+      // the owner while the tree decode is still in flight → coveredAwait
+      // returns null → a tree.op applies ahead of the late seedTreeStore and
+      // is wholesale-replaced (data loss). The decode gate is cleared in the
+      // IIFE's tail AFTER finishDecode lands (ownership-aware) so the deferred
+      // tree.op resumes only once the tree apply (install or legacy) completed.
       treeSnapshotDecoding = true;
-      treeSnapshotDecode = (async () => {
+      // `decodeP` is referenced inside its own body for the ownership-aware
+      // clear; declare it first with a definite-assignment assertion (assigned
+      // immediately after the IIFE expression evaluates).
+      let decodeP!: Promise<void>;
+      decodeP = (async () => {
+        let decoded: unknown;
         try {
-          let decoded: unknown;
-          try {
-            decoded = await decodeSnapshot<unknown>(raw);
-          } catch (err) {
-            log.warn("sync", "tree.snapshot gzip64 decode failed", { err });
-            return;
-          }
-          if (gen !== treeGen) return;
-          applyTreeSnap(decoded);
-        } finally {
-          if (gen === treeGen) treeSnapshotDecoding = false;
+          decoded = await decodeSnapshot<unknown>(raw);
+        } catch (err) {
+          log.warn("sync", "tree.snapshot gzip64 decode failed", { err });
+          // A failed decode strands the owner; mark it legacy (flush staged
+          // detail + release — pendingTreeDecode is cleared in finishDecode's
+          // null path, but a throw bypasses finishDecode, so clear it here too
+          // so releaseOwner is immediate) so covered handlers don't hang.
+          owner.pendingTreeDecode = null;
+          if (pendingOwner === owner && !owner.settled) markOwnerLegacy(owner);
+          if (treeSnapshotDecode === decodeP) treeSnapshotDecoding = false;
+          return;
         }
+        finishDecode(decoded);
+        // Clear the decode gate AFTER the tree apply (install or legacy) so a
+        // deferred tree.op resumes only once seedTreeStore landed. Ownership-
+        // aware: a newer decode (new owner / reconnect) owns the flag now.
+        if (treeSnapshotDecode === decodeP) treeSnapshotDecoding = false;
       })();
+      treeSnapshotDecode = decodeP;
+      // Register the in-flight decode on the owner so releaseOwner can chain
+      // same-gen waiter release behind it (B-F1/B-F2 data-loss guard).
+      owner.pendingTreeDecode = decodeP;
     } else {
-      applyTreeSnap(raw);
+      finishDecode(raw);
     }
   });
   es.addEventListener("tree.op", async (e) => {
@@ -1625,10 +2018,14 @@ export function connect(fresh = false) {
       markBusyDirty();
       return;
     }
-    // Serialize against an in-flight tree.snapshot gzip64 decode (mirrors the
-    // proj=1 session listeners): a delta op applied mid-decode would be seeded-
-    // over when the stale-but-now-decoded snapshot lands.
-    if (treeSnapshotDecoding) await treeSnapshotDecode;
+    // C4: serialize against a pending coherent owner (capture the EXACT owner
+    // ref via coveredAwait; await it; recheck gen; run the reducer + cursor
+    // SYNCHRONOUSLY). A delta op applied during staging would be wiped by the
+    // coherent seed (seedTreeStore wholesale-replaces treeMap) inside the
+    // install batch; awaiting the owner guarantees the op applies AFTER the
+    // baseline, as the live tail.
+    const wait = coveredAwait(gen);
+    if (wait) await wait;
     if (gen !== treeGen) return;
     if (isGateActive()) {
       advanceCursor(seq);
@@ -1680,19 +2077,52 @@ export function connect(fresh = false) {
       log.warn("sync", "snapshot.complete body is not an object", { body: p });
       return;
     }
-    log.debug("sync", "snapshot.complete boundary", {
-      epoch: p.epoch,
-      revision: p.revision,
+    // C4: stage the completion latch into the coherent owner. The participant
+    // NEVER awaits its own owner. With no coherent owner pending (proj=1 / a
+    // pre-Q5 daemon that nevertheless emits the event / overlap already cleared
+    // / already-installed), there is no truthful install to mark — drop. An
+    // arbitrary JSON object can NOT mark the baseline authoritative: tryInstall
+    // validates identity + projections + that BOTH other participants staged.
+    const owner = pendingOwner;
+    if (!owner || owner.legacy || owner.settled || owner.generation !== gen) {
+      log.debug("sync", "snapshot.complete with no coherent owner pending", {
+        epoch: p.epoch,
+        revision: p.revision,
+      });
+      return;
+    }
+    const epoch = p.epoch || "";
+    const cseq = typeof p.revision === "number" ? p.revision : 0;
+    // A completion with no epoch can't participate coherently → drop (the owner
+    // keeps waiting for a real completion; a missing completion on a Q5 stream
+    // means reconnect/resync, not a guess — no timeout).
+    if (!epoch) {
+      log.debug("sync", "snapshot.complete with no epoch", { revision: p.revision });
+      return;
+    }
+    if (!bindOwnerIdentity(owner, epoch, cseq)) {
+      // Identity mismatch → the capture is incoherent. Release the barrier so
+      // covered handlers do not hang, flushing staged participants.
+      log.warn("sync", "snapshot.complete identity mismatch", {
+        owner: owner.identity,
+        epoch,
+        seq: cseq,
+      });
+      markOwnerLegacy(owner);
+      return;
+    }
+    owner.completion = {
+      identity: { epoch, seq: cseq },
+      projections: Array.isArray(p.projections) ? p.projections.slice() : [],
+    };
+    log.debug("sync", "snapshot.complete boundary staged", {
+      epoch,
+      revision: cseq,
       projections: p.projections,
     });
-    setState("authoritativeReady", true);
-    // Q6: a successful authoritative capture is a recovery boundary — stamp it
-    // so the periodic "no recovery in the previous interval" gate suppresses a
-    // redundant tick and the periodic timer is reset (a focus/watchdog/periodic
-    // recovery pushes the next periodic tick out by a full interval). The
-    // diffs-found-vs-no-op instrumentation is resolved at the tree.snapshot
-    // apply path (after seedTreeStore), NOT here — see that listener.
-    markAuthoritativeRecovery();
+    // tryInstall sets authoritativeReady + marks the recovery boundary inside
+    // its atomic batch when ALL three participants are staged + validated.
+    tryInstall(owner);
   });
   // Both frames are emitted on this Stream-1 (tree) connection. They carry NO
   // SSE `id:` line (both transient — reconnect catches up via pins.snapshot),
@@ -1740,15 +2170,16 @@ export function connect(fresh = false) {
         markBusyDirty();
         return;
       }
-      // Serialize against an in-flight gzip64 snapshot decode for this
-      // connection. applySnapshot WHOLESALE-REPLACES state.sessions and sets
-      // state.cursor=snap.seq; a live session event applied during the decode
-      // window would be clobbered and the cursor REGRESSED when the stale-but-
-      // now-decoded snapshot lands. Wait ONLY when a decode is actually in
-      // flight — the boolean check is a no-op on the fast path so session
-      // event floods keep zero microtask latency. Connect-time only. Mirrors
-      // Stream 2's sesSnapshotDecoding gate.
-      if (treeSnapshotDecoding) await treeSnapshotDecode;
+      // C4: serialize against a pending coherent owner (capture the EXACT owner
+      // ref via coveredAwait; await it; recheck gen; run reducer + cursor
+      // SYNCHRONOUSLY to completion — no second await). applySnapshot (run
+      // inside the coherent install batch) WHOLESALE-REPLACES state.sessions
+      // and sets cursor=seq; a live session event applied during staging would
+      // be clobbered and the cursor regressed when the baseline installs.
+      // coveredAwait returns null on the fast path (no owner + no decode) so
+      // event floods keep zero microtask latency.
+      const wait = coveredAwait(gen);
+      if (wait) await wait;
       // Generation re-check: the connection may have been replaced during the
       // wait. The entry guard ran before the await, so drop the stale
       // continuation here before any state effect.
@@ -1774,9 +2205,11 @@ export function connect(fresh = false) {
         markBusyDirty();
         return;
       }
-      // Serialize against an in-flight gzip64 snapshot decode (see the
-      // session.upsert listener above for the full rationale).
-      if (treeSnapshotDecoding) await treeSnapshotDecode;
+      // C4: serialize against a pending coherent owner (coveredAwait — same
+      // contract as the session.upsert listener above: capture the exact owner,
+      // await, recheck gen, run reducer + cursor synchronously).
+      const wait = coveredAwait(gen);
+      if (wait) await wait;
       if (gen !== treeGen) return;
       if (isGateActive()) {
         advanceCursor(seq);
@@ -1812,7 +2245,14 @@ export function connect(fresh = false) {
     // EventSource auto-retries while CONNECTING; we only step in once it gives
     // up (CLOSED), with backoff, so a flaky network / daemon restart self-heals.
     setState("status", "reconnecting");
+    // C4: a transport error on this connection means its coherent capture (if
+    // pending) will never complete — cancel the blocked owner immediately so
+    // covered handlers resume and fail their gen check, rather than waiting for
+    // the deferred connect() to do it. (connect()'s treeGen++ also cancels; this
+    // is the prompt, contract-named release path. Safe: a stale owner may settle
+    // itself but never clears a newer owner.)
     if (es && es.readyState === EventSource.CLOSED) {
+      cancelPendingOwner();
       log.warn("sync", "tree stream closed → reconnecting", { backoff });
       clearTimeout(reconnectTimer);
       reconnectTimer = window.setTimeout(connect, backoff);
@@ -2705,9 +3145,11 @@ export function periodicResyncShouldRun(): boolean {
   // And HEALTHY (not stale — a stale-but-open stream is the watchdog's signal
   // to force a reconnect, not the periodic's).
   if (!treeLastSeen || Date.now() - treeLastSeen > STALE_MS) return false;
-  // No wholesale snapshot decode in flight — stacking a second connect(true)
-  // would bump treeGen and invalidate the in-flight decode's apply.
-  if (treeSnapshotDecoding) return false;
+  // No wholesale snapshot decode or coherent capture in flight — stacking a
+  // second connect(true) would bump treeGen and invalidate the in-flight
+  // decode/owner's apply. C4: isTreeSnapshotDecoding() covers BOTH the
+  // independent detail decode AND a pending coherent owner.
+  if (isTreeSnapshotDecoding()) return false;
   // No reconcileBusy scope in flight — it already requested fresh snapshots.
   if (expectTreeSnap || expectSessionSnap) return false;
   // No global busy scope (archive/unarchive/baseline install) in flight — the
@@ -2900,7 +3342,37 @@ export async function expandTreeNode(id: string): Promise<void> {
         staleCursor: !!decoded.staleCursor,
       } satisfies ChildrenResponse;
     };
-    await fetchChildren(applyTreeOpStore, fetcher, dir, id);
+    // C4 named async exception — point-HTTP expansion deferral. The HTTP
+    // request proceeds normally; immediately before APPLYING each returned tree
+    // mutation, capture the current coherent owner. If one is pending, defer
+    // the APPLICATION (not the request) until that owner settles, then
+    // revalidate the generation before applying. This prevents a coherent
+    // seedTreeStore (wholesale treeMap replace inside the install batch) from
+    // wiping just-applied expand children; the children land on the seeded
+    // coherent map as the live tail. Deferred applies chain on the SAME owner
+    // promise, so they fire in registration (attach) order — fetchChildren's F1
+    // stale-cursor restart (node.remove for appliedIds, then fresh page-0
+    // children) is preserved. If a coherent seed wipes the parent, the
+    // P1-A backfill (expandedButUnloadedIds) re-expands it; the gen recheck
+    // drops a superseded expand's apply entirely.
+    const ownerAwareApply = (op: TreeOp): void => {
+      const ownerNow = pendingOwner;
+      if (
+        ownerNow &&
+        !ownerNow.legacy &&
+        !ownerNow.settled &&
+        ownerNow.generation === treeGen
+      ) {
+        // Defer the application until the owner settles.
+        void ownerNow.promise.then(() => {
+          if (ownerNow.generation !== treeGen) return; // superseded by reconnect
+          applyTreeOpStore(op);
+        });
+        return;
+      }
+      applyTreeOpStore(op);
+    };
+    await fetchChildren(ownerAwareApply, fetcher, dir, id);
   } catch (err) {
     log.warn("sync", "tree=2 expand error", { id, err: String(err) });
   } finally {

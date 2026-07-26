@@ -90,17 +90,33 @@ export function decodeTreeOp(raw: unknown): TreeOp | null {
 }
 
 // ---- §5/§7.1 snapshot ------------------------------------------------------
+// Q5 (C4): the tree snapshot body carries the SAME store-lifetime {epoch, seq}
+// identity pair the detail Snapshot carries (pkg/state/tree_emitter.go
+// TreeSnapshot). C4 retains epoch+seq through decoding so the FE coherent
+// barrier can correlate the tree projection with the detail snapshot and the
+// snapshot.complete boundary from ONE capture. `epoch` is the discriminator for
+// the legacy fallback (Case 7): a pre-Q5 daemon's tree snapshot body omits
+// epoch → no coherent correlation is possible → independent application.
 export interface TreeSnapshot {
   nodes: TreeNode[];
   focusedSessionId?: string;
+  // Q5 store-lifetime identity (mirrors Snapshot.epoch / Snapshot.seq). Both
+  // optional for back-compat with older decoders that stripped them; C4's
+  // barrier treats a missing epoch as the legacy signal.
+  epoch?: string;
+  seq?: number;
 }
 
 export function decodeTreeSnapshot(raw: unknown): TreeSnapshot | null {
   if (!raw || typeof raw !== "object") return null;
-  const obj = raw as { nodes?: unknown; focusedSessionId?: unknown };
+  const obj = raw as { nodes?: unknown; focusedSessionId?: unknown; epoch?: unknown; seq?: unknown };
   if (!Array.isArray(obj.nodes) || !obj.nodes.every(isTreeNode)) return null;
   const snap: TreeSnapshot = { nodes: obj.nodes as TreeNode[] };
   if (typeof obj.focusedSessionId === "string") snap.focusedSessionId = obj.focusedSessionId;
+  // C4: retain identity for coherent-correlation. A non-string epoch (incl.
+  // omission on a pre-Q5 daemon) is left undefined → the barrier's legacy path.
+  if (typeof obj.epoch === "string" && obj.epoch.length > 0) snap.epoch = obj.epoch;
+  if (typeof obj.seq === "number") snap.seq = obj.seq;
   return snap;
 }
 

@@ -216,9 +216,11 @@ describe("periodicResyncShouldRun — precondition gates", () => {
 
   it("suppresses when a snapshot decode is in flight", async () => {
     establishHealthyStream();
-    // Fire a gzip64 tree.snapshot: the listener sets treeSnapshotDecoding=true
-    // synchronously (before the async decode completes), so the predicate sees
-    // a decode in flight and stands down. Valid gzip → clean decode, no leak.
+    // Fire a gzip64 tree.snapshot: the listener creates the pending coherent
+    // owner synchronously (before the async decode completes), so
+    // isTreeSnapshotDecoding() — which ORs the owner with the decode flag —
+    // sees a capture in flight and the predicate stands down. Valid gzip →
+    // clean decode (or legacy settle), no leak.
     lastTreeES().fire(
       "tree.snapshot",
       { encoding: "gzip64", data: validGzip({ nodes: [] }) },
@@ -317,17 +319,26 @@ describe("periodic resync timer — firing + reset-after-recovery", () => {
     expect(treeESes().length).toBe(countAtFocus + 1);
   });
 
-  it("a snapshot.complete boundary resets the periodic timer", () => {
+  it("a coherent capture boundary resets the periodic timer", () => {
     vi.useFakeTimers();
     pinJitterZero();
     const es = establishHealthyStream();
     startPeriodicResync();
 
-    // Advance most of the interval, then deliver a completion boundary (e.g.
-    // a watchdog reconnect's snapshot landed). snapshot.complete calls
-    // markAuthoritativeRecovery → reschedules the periodic for a full interval.
+    // Advance most of the interval, then deliver a coherent capture boundary
+    // (e.g. a watchdog reconnect's snapshot landed). C4: the boundary is the
+    // atomic install of BOTH projections, which calls markAuthoritativeRecovery
+    // → reschedules the periodic for a full interval. Driving the full capture
+    // (tree.snapshot with epoch + detail snapshot + snapshot.complete) so the
+    // owner installs truthfully.
     vi.advanceTimersByTime(TREE_RESYNC_PERIODIC_INTERVAL_MS - 5_000);
     _markTreeSeenForTest();
+    es.fire(
+      "tree.snapshot",
+      { tree: "2", epoch: "e1", seq: 1, nodes: [node({ id: "a" })] },
+      "1",
+    );
+    es.fire("snapshot", { seq: 1, epoch: "e1", sessions: [{ id: "a" }] }, "1");
     es.fire(
       "snapshot.complete",
       { epoch: "e1", revision: 1, projections: ["tree", "detail"] },
