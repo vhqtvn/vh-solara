@@ -3964,25 +3964,25 @@ func (s *Store) reconcileMessagesLocked(sid string, list []MessageWithParts) (co
 	coldLoad = !s.msgLoaded[sid] // detect BEFORE setting it true (msgLoaded lifecycle is unchanged)
 	s.msgLoaded[sid] = true
 	// The authoritative history reconcile rewrites this session's message/part
-	// state (info, parts, order, and — on the warm path — absence deletions),
-	// so bump the per-session message revision token under the lock. This is
-	// what lets publishColdBatch discard a stale prepared batch whose capture
-	// point predates this reconcile. Covers BOTH cold and warm reconciles: a
-	// warm re-fetch of an already-loaded session while a prior cold batch is
-	// still mid-packaging must also invalidate that batch.
+	// state (info, parts, order), so bump the per-session message revision
+	// token under the lock. This is what lets publishColdBatch discard a stale
+	// prepared batch whose capture point predates this reconcile. Covers BOTH
+	// cold and warm reconciles: a warm re-fetch of an already-loaded session
+	// while a prior cold batch is still mid-packaging must also invalidate that
+	// batch. (Option A: absence from the fetched list no longer deletes — but a
+	// warm reconcile still bumps the token because its present-message
+	// upsert/merge can change the projection.)
 	s.bumpMsgRev(sid)
 	sm := s.messages[sid]
 	if sm == nil {
 		sm = &sessionMessages{byID: map[string]*messageEntry{}}
 		s.messages[sid] = sm
 	}
-	seenMsg := make(map[string]bool, len(list))
 	for _, mwp := range list {
 		var env messageInfoEnvelope
 		if json.Unmarshal(mwp.Info, &env) != nil || env.ID == "" {
 			continue
 		}
-		seenMsg[env.ID] = true
 		me := sm.byID[env.ID]
 		if me == nil {
 			me = &messageEntry{id: env.ID, info: mwp.Info, parts: map[string]json.RawMessage{}}
@@ -4027,13 +4027,11 @@ func (s *Store) reconcileMessagesLocked(sid string, list []MessageWithParts) (co
 			me.sealedFields = nil
 		}
 
-		seenPart := make(map[string]bool, len(mwp.Parts))
 		for _, part := range mwp.Parts {
 			var pe partEnvelope
 			if json.Unmarshal(part, &pe) != nil || pe.ID == "" {
 				continue
 			}
-			seenPart[pe.ID] = true
 			// Apply the per-part text cap (P1-AGG-006) on the history-fetch
 			// path: a fetched part carrying pathological text is bounded here
 			// (the wholesale upsert path caps via upsertPartLocked; this path
@@ -4058,39 +4056,18 @@ func (s *Store) reconcileMessagesLocked(sid string, list []MessageWithParts) (co
 				}
 			}
 		}
-		// Absence-deletion is AUTHORITATIVE-only: skipped on a cold load
-		// (coldLoad==true), where the fetched list can be stale relative to
-		// live message/part events that arrived during the in-flight fetch.
-		// On a cold load the live event tail is the source of truth for "what
-		// exists now"; deleting a store part merely because it's absent from a
-		// stale fetch would clobber newer live state (e.g. a live
-		// message.part.updated for a brand-new part landing mid-fetch).
-		for pid := range me.parts {
-			if !seenPart[pid] && !coldLoad {
-				delete(me.parts, pid)
-				me.partOrder = removeString(me.partOrder, pid)
-				s.emit(KindPartDelete, rawObj(map[string]interface{}{
-					"sessionID": sid, "messageID": env.ID, "partID": pid,
-				}))
-			}
-		}
+		// Option A: absence from a fetched snapshot NEVER deletes a stored
+		// part. The reconnect re-GET can lag OpenCode's event stream and omit a
+		// LIVE part (notably a task-tool Part riding on an assistant message);
+		// inferring deletion from that absence dropped live parts and was the
+		// root cause of the "A_user + A_assistant vanish on reconnect" symptom.
+		// Parts are removed ONLY by the explicit message.part.removed handler
+		// (deletePartLocked) or session deletion.
 	}
-	// Same cold-load gate as the part loop above: on a cold load a fetched
-	// message list can be stale relative to live events, so absence from the
-	// fetch is NOT a reliable deletion signal — only the warm resync path
-	// (reconnect/re-fetch for an already-loaded session, coldLoad==false)
-	// reconciles authoritatively and prunes absent messages. Live deletion
-	// (session.deleted / explicit removal events) is the authoritative prune
-	// path for a cold-loaded session.
-	for mid := range sm.byID {
-		if !seenMsg[mid] && !coldLoad {
-			delete(sm.byID, mid)
-			sm.order = removeString(sm.order, mid)
-			s.emit(KindMessageDelete, rawObj(map[string]interface{}{
-				"sessionID": sid, "messageID": mid,
-			}))
-		}
-	}
+	// Option A (cont.): absence from a fetched snapshot NEVER deletes a stored
+	// message either, for the same lag reason. Messages are removed ONLY by the
+	// explicit message.removed handler (deleteMessageLocked) or session
+	// deletion.
 	s.recomputeLastAssistantLocked(sid)
 
 	if coldLoad {
