@@ -25,7 +25,8 @@
  * Self-contained: does NOT import state-lib.js (so it is not blocked by the
  * render-location guard in that module) and runs from either the SOURCE or
  * RENDERED copy. Repo root is found by walking up from __dirname to the
- * nearest directory containing go.mod.
+ * nearest directory containing `.git` (polyglot: every consumer render is a
+ * git repo, regardless of language; see findRepoRoot).
  *
  * Invoke via the RENDERED copy:
  *   vh-agent-harness exec node .opencode/scripts/verify-no-unrendered-paths.js
@@ -43,14 +44,45 @@ const __dirname = path.dirname(__filename);
 const SKIP_DIRS = new Set([".git", "node_modules"]);
 
 function findRepoRoot(start) {
+    // Polyglot repo-root detection.
+    //
+    // ORIGINAL DEFECT (TA-2, class: source-checkout-only assumption): the walk
+    // anchored on `go.mod` -- a Go-SPECIFIC manifest. A non-Go consumer (Python
+    // or Node) with no go.mod anywhere in the ancestor chain returned null and
+    // the script exited 1. This guard is itself the unrendered-paths guard
+    // (commit 186ba26); it leaked the very class it guards by assuming the
+    // source checkout's own Go layout inside the script meant to catch
+    // source-only paths.
+    //
+    // FIX: anchor on `.git` instead. Every consumer render lives inside a
+    // version-controlled checkout, so `.git` is a language-agnostic anchor that
+    // resolves identically in Go, Python, Node, and mixed consumers, and stops
+    // at the consumer's OWN root rather than walking past it into a parent
+    // repo. `.git` may be a directory (normal clone) or a file (submodule /
+    // worktree gitdir pointer); both count.
+    //
+    // Defensive secondary: if no `.git` is reachable (e.g. an unpacked tarball
+    // that is not a checkout), fall back to the nearest project manifest
+    // (go.mod / pyproject.toml / package.json) so the guard does not exit 1
+    // gratuitously on a manifest-rooted but non-git tree.
+    const MANIFEST_FILES = ["go.mod", "pyproject.toml", "package.json"];
     let dir = start;
+    let manifestRoot = null;
     for (;;) {
-        if (fs.existsSync(path.join(dir, "go.mod"))) {
-            return dir;
+        if (fs.existsSync(path.join(dir, ".git"))) {
+            return dir; // primary anchor: every consumer render is a git repo.
+        }
+        if (manifestRoot === null) {
+            for (const m of MANIFEST_FILES) {
+                if (fs.existsSync(path.join(dir, m))) {
+                    manifestRoot = dir; // secondary: remember nearest manifest.
+                    break;
+                }
+            }
         }
         const parent = path.dirname(dir);
         if (parent === dir) {
-            return null; // filesystem root reached, no go.mod found.
+            return manifestRoot; // filesystem root reached; manifest fallback (maybe null).
         }
         dir = parent;
     }
@@ -103,8 +135,9 @@ function main() {
     const repoRoot = findRepoRoot(__dirname);
     if (!repoRoot) {
         console.error(
-            "FAIL: could not locate repo root (no go.mod found walking up " +
-                `from ${__dirname}).`,
+            "FAIL: could not locate repo root (no `.git` and no project " +
+                "manifest go.mod/pyproject.toml/package.json found walking " +
+                `up from ${__dirname}).`,
         );
         process.exit(1);
     }

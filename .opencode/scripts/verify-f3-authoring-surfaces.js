@@ -10,7 +10,8 @@
 //      the F3 envelope authoring step with the required payload key, the
 //      ownership-hazards inventory, the design-digest freshness binding, and
 //      the closed adversarial-verdict vocabulary.
-//   2. The design-author agent (build.md.tmpl) carries the authority split
+//   2. The design-author agent (build.md.tmpl in the source checkout;
+//      build.md in a consumer render) carries the authority split
 //      (INFORMS, not BLOCKS), the honesty ceiling (structural-not-truth), the
 //      fabricated-evidence prohibition, and the explicit-empty discipline.
 //   3. No authoring surface claims coordinator/reviewer/adversarial-lane
@@ -37,8 +38,16 @@
 // produces stray runtime artifacts in the template tree. state-lib.js refuses
 // to load from an unrendered source copy; this text-contract verifier is
 // read-only but follows the same convention for consistency.
+//
+// CONSUMER-RENDER MODE: in a tree that is NOT the harness source checkout
+// (no corpus.go + templates/core/ at the repo root — i.e. every consumer),
+// the build-agent surface is the resolved `agents/build.md`, NOT the
+// source-tree-only `build.md.tmpl`. This script detects which via the
+// source-checkout identity heuristic (see isHarnessSourceCheckout) and reads
+// the authoritative surface for the tree, so it no longer ENOENT-exits on the
+// .tmpl read in a consumer render (defect TA-1).
 
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import {
@@ -54,6 +63,60 @@ const cmd = (...p) => join(__dirname, "..", "commands", ...p);
 const agent = (...p) => join(__dirname, "..", "agents", ...p);
 const read = (p) => readFileSync(p, "utf8");
 
+// --- Repo root + source-checkout identity (polyglot, no go.mod assumption) ---
+//
+// findRepoRoot anchors on `.git` (every consumer render is a git repo,
+// regardless of language). isHarnessSourceCheckout REUSES the EXACT identity
+// heuristic from internal/cli/corpus_freshness.go::isSourceCheckout (the
+// dev-stale-embed guard): a target is the harness's OWN source checkout iff a
+// REGULAR FILE `corpus.go` AND a DIRECTORY `templates/core/` both sit at the
+// repo root. Do not reinvent this test.
+//
+// Why this matters here: `build.md.tmpl` is a SOURCE-TREE-ONLY artifact. It
+// exists under templates/core/.opencode/agents/ in the source checkout but is
+// NEVER shipped to a consumer render (the render resolves it to `build.md`,
+// dropping the .tmpl suffix). Reading `agents/build.md.tmpl` from a rendered
+// copy therefore ENOENT-exits in every consumer (defect TA-1). We gate the
+// read: source checkout verifies the authoritative .tmpl source; a consumer
+// render verifies the resolved build.md surface -- the F3 contract text is
+// literal in both, so the same assertions apply.
+function findRepoRoot(start) {
+    let dir = start;
+    for (;;) {
+        if (existsSync(join(dir, ".git"))) {
+            return dir;
+        }
+        const parent = dirname(dir);
+        if (parent === dir) {
+            return null;
+        }
+        dir = parent;
+    }
+}
+
+function isHarnessSourceCheckout(repoRoot) {
+    if (!repoRoot) {
+        return false;
+    }
+    // Mirrors corpus_freshness.go: regular-file corpus.go + dir templates/core.
+    let corpusStat = null;
+    try {
+        corpusStat = statSync(join(repoRoot, "corpus.go"));
+    } catch {
+        corpusStat = null;
+    }
+    if (!corpusStat || !corpusStat.isFile()) {
+        return false;
+    }
+    let tmplStat = null;
+    try {
+        tmplStat = statSync(join(repoRoot, "templates", "core"));
+    } catch {
+        tmplStat = null;
+    }
+    return !!tmplStat && tmplStat.isDirectory();
+}
+
 let assertions = 0;
 function expect(condition, label) {
   assertions++;
@@ -67,7 +130,21 @@ const taskReady = read(cmd("task-ready.md"));
 const approvePlan = read(cmd("approve-plan.md"));
 const writeTask = read(cmd("write-task.md"));
 const draftPlan = read(cmd("draft-plan.md"));
-const buildAgent = read(agent("build.md.tmpl"));
+
+// Gate the build-agent surface on the source-checkout identity (see
+// isHarnessSourceCheckout above). `build.md.tmpl` is source-tree-only; a
+// consumer render ships the resolved `build.md`. The F3 contract text being
+// asserted is literal (no {{...}} tokens) in both, so the same assertions hold
+// against whichever surface is authoritative for this tree.
+const repoRoot = findRepoRoot(__dirname);
+const isSourceCheckout = isHarnessSourceCheckout(repoRoot);
+const buildAgentName = isSourceCheckout
+    ? "build.md.tmpl (source checkout)"
+    : "build.md (consumer render)";
+const buildAgentPath = isSourceCheckout
+    ? join(repoRoot, "templates", "core", ".opencode", "agents", "build.md.tmpl")
+    : agent("build.md");
+const buildAgent = read(buildAgentPath);
 
 const crossingCmds = [
   ["task-ready.md", taskReady],
@@ -78,7 +155,7 @@ const allSurfaces = [
   ["approve-plan.md", approvePlan],
   ["write-task.md", writeTask],
   ["draft-plan.md", draftPlan],
-  ["build.md.tmpl", buildAgent],
+  [buildAgentName, buildAgent],
 ];
 
 // =============================================================================
@@ -136,31 +213,31 @@ for (const [name, body] of crossingCmds) {
 // Crux 6: build agent states the INFORMS authority level.
 expect(
   buildAgent.includes("INFORMS"),
-  "build.md.tmpl must state the INFORMS authority level for the design author",
+  `${buildAgentName} must state the INFORMS authority level for the design author`,
 );
 
 // Crux 7: build agent states the structural-not-truth honesty ceiling.
 expect(
   /structural/i.test(buildAgent) && /truth/i.test(buildAgent),
-  "build.md.tmpl must state the structural-not-truth honesty ceiling",
+  `${buildAgentName} must state the structural-not-truth honesty ceiling`,
 );
 
 // Crux 8: build agent prohibits fabricated evidence.
 expect(
   /fabricat/i.test(buildAgent),
-  "build.md.tmpl must prohibit fabricated evidence",
+  `${buildAgentName} must prohibit fabricated evidence`,
 );
 
 // Crux 9: build agent states the explicit-empty discipline.
 expect(
   buildAgent.includes("ownership_hazards") && buildAgent.includes("[]"),
-  "build.md.tmpl must state the explicit-empty discipline",
+  `${buildAgentName} must state the explicit-empty discipline`,
 );
 
 // Crux 10: build agent states the F1/F2-not-substitute rule.
 expect(
   /F1.*F2|F2.*F1/i.test(buildAgent) && /substitute/i.test(buildAgent),
-  "build.md.tmpl must state that F1/F2 artifacts are NOT F3 substitutes",
+  `${buildAgentName} must state that F1/F2 artifacts are NOT F3 substitutes`,
 );
 
 // =============================================================================
@@ -253,7 +330,7 @@ expect(
 expect(
   buildAgent.includes("f3-design-readiness.js") ||
     buildAgent.includes("F3_REQUIRED_FIELDS"),
-  "build.md.tmpl must reference the canonical schema module (f3-design-readiness.js / F3_REQUIRED_FIELDS)",
+  `${buildAgentName} must reference the canonical schema module (f3-design-readiness.js / F3_REQUIRED_FIELDS)`,
 );
 
 console.log(`verification: ok (${assertions} assertions)`);

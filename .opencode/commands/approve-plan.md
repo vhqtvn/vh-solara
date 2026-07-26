@@ -15,7 +15,7 @@ Before approving, author the F3 design-readiness envelope into the draft plan's 
 - top-level `design_digest` binding the WHOLE envelope to the current design (the gate re-derives this digest from the frontmatter-stripped plan body and refuses staleness as `stale_design_digest`)
 - `ownership_hazards[]` — the explicit inventory; `[]` (explicit-empty) passes as "author surveyed, named nothing" and is distinct from omitting the field (omission fails closed as `missing_envelope`). Explicit-empty is STILL freshness-bound by `design_digest`.
 - per named hazard: declaration + resolution (exactly one `authoritative_owner`, every secondary authority disposed) + adversarial review. Only `verdict: resolution_supported` contributes to a pass; `refuted` and `inconclusive` fail closed.
-- the canonical field names + closed vocabularies are exported from `templates/core/.opencode/scripts/f3-design-readiness.js` (`F3_REQUIRED_FIELDS`, `F3_ADVERSARIAL_VERDICTS`, `F3_HAZARD_CLASSES`, `F3_SECONDARY_AUTHORITY_DISPOSITIONS`).
+- the canonical field names + closed vocabularies are exported from `.opencode/scripts/f3-design-readiness.js` (`F3_REQUIRED_FIELDS`, `F3_ADVERSARIAL_VERDICTS`, `F3_HAZARD_CLASSES`, `F3_SECONDARY_AUTHORITY_DISPOSITIONS`).
 - fabricated evidence prohibited; the adversarial review must come from a lane distinct from the resolution producer; the gate verifies STRUCTURAL completeness, NOT design truth; F1/F2 artifacts are NOT F3 substitutes.
 
 Use the `plan_state` tool with:

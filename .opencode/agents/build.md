@@ -118,7 +118,7 @@ The envelope carries:
   closed).
 
 The canonical field names + closed vocabularies are exported from
-`templates/core/.opencode/scripts/f3-design-readiness.js` (`F3_REQUIRED_FIELDS`,
+`.opencode/scripts/f3-design-readiness.js` (`F3_REQUIRED_FIELDS`,
 `F3_ADVERSARIAL_VERDICTS`, `F3_HAZARD_CLASSES`, `F3_SECONDARY_AUTHORITY_DISPOSITIONS`).
 
 ### Provenance + honesty discipline
