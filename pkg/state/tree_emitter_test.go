@@ -592,3 +592,38 @@ func stringsContains(s, sub string) bool {
 	}
 	return false
 }
+
+// ---------------------------------------------------------------------------
+// Group 9 — Q5 capture-correlation: Epoch on TreeSnapshot
+// ---------------------------------------------------------------------------
+//
+// q5-capture-feasibility flagged the asymmetry: the detail Snapshot carries
+// {Epoch, Seq} but TreeSnapshot carried only {Seq}. Without Epoch a client
+// reading only the tree projection cannot detect a daemon restart. These
+// tests pin the additive schema fix (Epoch now populated from the store
+// epoch) and guard against regressions in the existing Seq stamping.
+
+// TestTreeSnapshotCarriesStoreEpoch pins the Q5 additive schema change: the
+// tree projection carries the SAME store-lifetime Epoch the detail Snapshot
+// carries, so a client can detect a daemon restart from the tree projection
+// alone. RED until the Epoch field is added + populated.
+func TestTreeSnapshotCarriesStoreEpoch(t *testing.T) {
+	s := New(64)
+	applySeq(t, s,
+		[2]string{"session.created", evSessionCreated("R", "")},
+		[2]string{"session.created", evSessionCreated("A", "R")},
+		[2]string{"session.status", evStatus("A", "busy")},
+	)
+	snap := treeSnap(t, s, "cold")
+	if snap.Epoch == "" {
+		t.Fatalf("TreeSnapshot.Epoch is empty; the tree projection must carry the store epoch (Q5)")
+	}
+	if snap.Epoch != s.Epoch() {
+		t.Errorf("TreeSnapshot.Epoch = %q, want store epoch %q", snap.Epoch, s.Epoch())
+	}
+	// Regression guard: adding Epoch must not disturb the existing Seq stamping
+	// (the store head seq captured in SnapshotFrontier's lock).
+	if snap.Seq != s.Head() {
+		t.Errorf("TreeSnapshot.Seq = %d, want store head %d", snap.Seq, s.Head())
+	}
+}

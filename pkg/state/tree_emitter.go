@@ -16,10 +16,19 @@ import (
 // TreeSnapshot is the initial cold-load payload (§5): the frontier Node set
 // plus the per-connection loaded-set seed (E_c) and the head seq the client
 // resumes from.
+//
+// Q5 (capture correlation): Epoch mirrors the detail Snapshot.Epoch so BOTH
+// projections carry the SAME store-lifetime {epoch, seq} identity pair. A
+// client reading only the tree projection can now detect a daemon restart
+// (epoch change) without cross-checking the detail snapshot. The {epoch, seq}
+// stamped here is the value captured in SnapshotFrontier's single RLock.
 type TreeSnapshot struct {
-	Dir   string `json:"dir,omitempty"`
-	Tree  string `json:"tree"` // "2" — dual-negotiation marker (§10.1).
-	Seq   uint64 `json:"seq"`  // head op seq (resume cursor, INV-A).
+	Dir  string `json:"dir,omitempty"`
+	Tree string `json:"tree"` // "2" — dual-negotiation marker (§10.1).
+	// Epoch is this store's lifetime id (mirrors Snapshot.Epoch). Populated
+	// from s.epoch under the SnapshotFrontier RLock.
+	Epoch string `json:"epoch"`
+	Seq   uint64 `json:"seq"` // head op seq (resume cursor, INV-A).
 	Nodes []Node `json:"nodes"`
 	Cause string `json:"cause,omitempty"` // "cold" | "reconnect".
 }
@@ -356,6 +365,11 @@ func (e *TreeEmitter) SnapshotFrontier(cause string) *TreeSnapshot {
 	// per-connection seq counter — store.Replay(cursor) compares against the
 	// store/ring seq space. Using the emitter seq (starts at 0) would make
 	// store.Replay(0) replay every event on every reconnect (design §5.5).
+	//
+	// Q5: Epoch is captured in the SAME RLock as Seq (the single capture phase
+	// above), so the tree projection's {epoch, seq} matches the store
+	// generation this frontier was built from.
+	out.Epoch = s.epoch
 	out.Seq = s.seq
 	return out
 }
