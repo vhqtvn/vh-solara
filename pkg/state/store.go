@@ -2039,6 +2039,54 @@ func (s *Store) Descendants(id string) []string {
 	return s.descendantsLocked(id)
 }
 
+// SessionSummary is the per-session projection of the point endpoints that
+// return a server-authoritative affected/descendant set (P4 descendants, P5
+// subtree-todos): id + title + parentID, without the full session info blob.
+type SessionSummary struct {
+	ID       string `json:"id"`
+	Title    string `json:"title"`
+	ParentID string `json:"parentID"`
+}
+
+// DescendantSummaries returns id plus every live session transitively parented
+// by it (as SessionSummary), captured together with the Store's epoch and head
+// seq UNDER THE SAME RLock — so the {epoch, revision} envelope the P4 endpoint
+// emits is a coherent bound on the returned data (no TOCTOU between the walk
+// and the revision read). Returns nil descs when id is unknown to the live
+// store; the handler coerces nil → [] for the wire.
+//
+// Per Q3, revision is advisory (for stale-response suppression / cache
+// validation / diagnostics) and is NOT required to equal the latest live tree
+// revision by the time the client reads it; capturing it under the same lock as
+// the walk simply avoids returning a revision that predates the data.
+func (s *Store) DescendantSummaries(id string) (descs []SessionSummary, epoch string, seq uint64) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	epoch = s.epoch
+	seq = s.seq
+	if s.sessions[id] == nil {
+		return nil, epoch, seq
+	}
+	ids := s.descendantsLocked(id)
+	descs = make([]SessionSummary, 0, len(ids))
+	for _, sid := range ids {
+		se := s.sessions[sid]
+		if se == nil {
+			continue // defensive: descendantsLocked only yields live ids
+		}
+		var t struct {
+			Title string `json:"title"`
+		}
+		_ = json.Unmarshal(se.info, &t) // title is best-effort; missing → ""
+		descs = append(descs, SessionSummary{
+			ID:       se.id,
+			Title:    t.Title,
+			ParentID: se.parentID,
+		})
+	}
+	return descs, epoch, seq
+}
+
 // isRecentlyArchivedLocked reports whether id is within the archive tombstone
 // window (set by RemoveSessions). Lazily GCs expired entries. Caller must hold
 // s.mu. Returns false (and cleans up) once the TTL has elapsed so a genuine

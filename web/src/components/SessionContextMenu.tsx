@@ -4,10 +4,7 @@ import { suggestTitle } from "../sessionTitle";
 import { isPinned, togglePin, movePinnedByOffset, reconciledPinnedOrder, pinsPending, pinsLastError, clearPinsError } from "../sidebar";
 import { exportSessionMarkdown } from "../export";
 import { pushNotification } from "../notify";
-import { treeMap } from "../sync/treeState";
-import { childrenIndex } from "../sync/treeMap";
-import type { TreeNode } from "../sync/treeMap";
-import { archiveSession } from "../archive";
+import { archiveSession, fetchDescendants, type SessionSummary } from "../archive";
 import { withGlobalBusy } from "../busy";
 import {
   archiveTarget,
@@ -46,22 +43,6 @@ async function setSessionTitle(id: string, title: string) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ title }),
   });
-}
-
-// Collect a session plus all its descendants (the sessions an archive affects).
-// Walks the server-owned tree flat map (treeState) — no client-side parent
-// inference. Orphans come from the server (Node.flags.orphan), never classified.
-function relatedSessions(rootId: string): TreeNode[] {
-  const map = treeMap();
-  const index = childrenIndex(map);
-  const out: TreeNode[] = [];
-  const walk = (id: string) => {
-    const n = map.get(id);
-    if (n) out.push(n);
-    for (const c of index.get(id) || []) walk(c.id);
-  };
-  walk(rootId);
-  return out;
 }
 
 // Mounted once at the app root. Renders the right-click/long-press session menu
@@ -116,9 +97,50 @@ export default function SessionContextMenu() {
     });
   });
 
-  const related = createMemo(() => {
+  // Server-authoritative archive-impact descendant list (P4). Replaces the FE
+  // resident-map walk (relatedSessions + childrenIndex), which omitted unloaded
+  // descendants of collapsed frontier nodes. Fetched from
+  // GET /vh/session/:id/descendants when the confirm dialog opens
+  // (archiveTarget set).
+  //
+  // Optimistic seeding: the target itself is ALWAYS in the affected set (an
+  // archive of id cascades to id + its subsessions), so we show [{id, title}]
+  // immediately — no empty-flash while the fetch is in flight. On success the
+  // server list (which includes the target as element 0) replaces it. On
+  // failure we keep the optimistic single-item list (the user can still archive
+  // the one session they acted on; the server's own cascade handles subsessions
+  // regardless of what the preview showed).
+  //
+  // Stale-response suppression: a monotonic request id discards a prior
+  // in-flight response if the target changed (a re-open is rare but possible).
+  // The revision is carried for diagnostics / cache validation per the Q3
+  // envelope; we don't cross-open cache (the dialog is short-lived and the
+  // server walk is a cheap local store read).
+  const [relatedItems, setRelatedItems] = createSignal<SessionSummary[]>([]);
+  let relatedReqId = 0;
+  createEffect(() => {
     const t = archiveTarget();
-    return t ? relatedSessions(t.id) : [];
+    if (!t) {
+      setRelatedItems([]);
+      return;
+    }
+    setRelatedItems([{ id: t.id, title: t.title }]);
+    const myReq = ++relatedReqId;
+    void (async () => {
+      try {
+        const resp = await fetchDescendants(t.id);
+        if (myReq !== relatedReqId) return; // superseded by a later open
+        // A non-empty server list replaces the optimistic seed. An empty list
+        // means the id is unknown to the server's live store (pruned between
+        // the right-click and the fetch) — keep the optimistic [{id, title}]
+        // seed rather than flashing "0 sessions": the target itself is always
+        // in the affected set, and the archive POST tolerates an unknown id.
+        const list = resp.data?.descendants || [];
+        if (list.length) setRelatedItems(list);
+      } catch {
+        // Keep the optimistic single-item list on transport/server failure.
+      }
+    })();
   });
 
   // Rename/autorename use a DOM dialog (not window.prompt). One dialog drives
@@ -322,11 +344,11 @@ export default function SessionContextMenu() {
             </div>
             <div class="dialog-body">
               <p class="confirm-lead">
-                This will archive <strong>{related().length}</strong>{" "}
-                {related().length === 1 ? "session" : "sessions"} (the session and all its subsessions):
+                This will archive <strong>{relatedItems().length}</strong>{" "}
+                {relatedItems().length === 1 ? "session" : "sessions"} (the session and all its subsessions):
               </p>
               <ul class="confirm-list">
-                <For each={related()}>
+                <For each={relatedItems()}>
                   {(s, i) => (
                     <li classList={{ root: i() === 0 }}>
                       <span class="confirm-title">{displayName(s.title || s.id)}</span>
@@ -341,7 +363,7 @@ export default function SessionContextMenu() {
                 Cancel
               </button>
               <button type="button" class="confirm-go" onClick={doArchive}>
-                Archive {related().length > 1 ? `${related().length} sessions` : "session"}
+                Archive {relatedItems().length > 1 ? `${relatedItems().length} sessions` : "session"}
               </button>
             </div>
           </div>

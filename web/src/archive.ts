@@ -2,7 +2,7 @@
 // they're browsed on demand (paginated + lazy by subtree) so a project with
 // thousands of archived sessions never overloads the browser.
 import type { Session } from "./types";
-import { openSession, selectedId, setSelectedId, pruneSessionDeleted } from "./sync";
+import { openSession, selectedId, setSelectedId, pruneSessionDeleted, projectDir } from "./sync";
 import { clearReadAnchors } from "./lib/scroll";
 import { clearQueueCache } from "./queue";
 import { markRead } from "./notify";
@@ -81,6 +81,45 @@ export async function unarchiveSession(id: string): Promise<string[]> {
 export async function fetchArchived(parent = "", offset = 0, limit = 50): Promise<ArchivedLevel> {
   const u = `/vh/archived?parent=${encodeURIComponent(parent)}&offset=${offset}&limit=${limit}`;
   const res = await fetch(u);
+  return res.json();
+}
+
+// SessionSummary is the FE projection of the server's
+// pkg/state.SessionSummary (id + title + parentID) for the archive-impact
+// descendant list. Mirrors the P4 endpoint's data.descendants[] element shape.
+export interface SessionSummary {
+  id: string;
+  title?: string;
+  parentID?: string;
+}
+
+// DescendantsResp is the Q3 revisioned envelope returned by
+// GET /vh/session/:id/descendants. revision is advisory (for stale-response
+// suppression / cache validation); it is NOT required to equal the latest live
+// tree revision. The first element of data.descendants (if any) is always the
+// requested id itself (the affected root).
+export interface DescendantsResp {
+  epoch: string;
+  revision: number;
+  data: { sessionId: string; descendants: SessionSummary[] };
+}
+
+// fetchDescendants reads the server-authoritative descendant list for the
+// archive-impact preview (P4). Replaces the FE resident-map walk
+// (SessionContextMenu.relatedSessions), which omitted unloaded descendants of
+// collapsed frontier nodes. The server walks the authoritative topology.
+// Passes ?dir= mirroring fetchMessagePage (stream.ts) so a multi-project
+// deployment resolves the correct aggregator. Throws on non-2xx so the caller
+// can fall back to an optimistic single-item list (the target itself is always
+// in the affected set).
+export async function fetchDescendants(id: string): Promise<DescendantsResp> {
+  const u =
+    `/vh/session/${encodeURIComponent(id)}/descendants?dir=` +
+    encodeURIComponent(projectDir());
+  const res = await fetch(u);
+  if (!res.ok) {
+    throw new Error(`descendants fetch failed (${res.status})`);
+  }
   return res.json();
 }
 

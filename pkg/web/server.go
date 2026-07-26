@@ -911,6 +911,11 @@ func (s *Server) Handler() http.Handler {
 	// MessagePageResult JSON envelope. csrfGuard exempts GET, so no CSRF
 	// exception is needed. See pkg/web/messages_http.go for the contract.
 	mux.HandleFunc("GET /vh/session/{sessionId}/messages", s.handleSessionMessages)
+	// P4: server-authoritative archive-impact descendant list. GET-only → no
+	// CSRF. Returns {epoch, revision, data:{sessionId, descendants:[{id,title,
+	// parentID}]}}. Replaces the FE resident-map walk that omitted unloaded
+	// descendants of collapsed frontier nodes. See pkg/web/session_subtree_http.go.
+	mux.HandleFunc("GET /vh/session/{sessionId}/descendants", s.handleSessionDescendants)
 	// Phase 2 tree=2 expand endpoint: GET → no CSRF.
 	// Returns a node.children page for lazy-loading direct children of a
 	// collapsed frontier node. See pkg/web/tree_children.go for the contract.
