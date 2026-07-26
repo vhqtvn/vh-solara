@@ -73,6 +73,24 @@ DEFAULT_GC_MAX_AGE=3600
 # committer authors the message here with the Write tool; the gate reclaims
 # msg-${UUID} on success/release/no_changes AND sweeps aged orphans here.
 MSG_SCRATCH_DIR="tmp/commit-gate-message"
+# Durable closeout ledger (JSON-lines, append-only). Survives the per-session
+# meta-*/index-*/msg-*/paths-*/merge-* cleanup — those prefixes are the ONLY
+# files _cleanup_own_scratch / _gate_gc_sweep touch, so closeouts.log is never
+# reclaimed by them. Sub-item 1 (disposition §4.2): records post-commit HEAD
+# alongside the existing per-session head_at_acquire so doctor's HEAD-staleness
+# check (#19) can read the tail for N-flatline detection after the transient
+# session meta is gone. GC: count cap via COMMIT_GATE_CLOSEOUT_LOG_MAX (default
+# DEFAULT_CLOSEOUT_LOG_MAX) — _gate_gc_sweep trims to the tail when exceeded.
+# Lives under .git/ → gitignored by nature, never committed, never under .local/.
+CLOSEOUT_LOG="${GATE_INDEX_DIR}/closeouts.log"
+DEFAULT_CLOSEOUT_LOG_MAX=200
+# Dedicated lockfile serializing closeout-ledger mutation (append + count-cap
+# trim). The commit path is otherwise lock-free after acquire; this narrow,
+# ledger-local flock prevents a concurrent GC trim's tail→tmp→mv from dropping a
+# record appended by another successful committer in the snapshot-to-rename
+# window (a lost closeout could mask the exact HEAD-flatline doctor #19 surfaces).
+# Both _closeout_append and the _gate_gc_sweep trim acquire it exclusively.
+CLOSEOUT_LOCK="${GATE_INDEX_DIR}/closeouts.lock"
 # Persistent session metadata survives the lock-free review phase.
 # Each session stores its metadata at ${GATE_INDEX_DIR}/meta-${UUID}.
 #
@@ -288,6 +306,54 @@ _cleanup_own_scratch() {
   [[ -n "$safe_path" ]] && rm -f "$safe_path" 2>/dev/null || true
 }
 
+# Append a closeout record to the durable ledger ($CLOSEOUT_LOG). This is the
+# substrate sub-item 1 (disposition §4.2) adds: it records post-commit HEAD
+# alongside the existing per-session head_at_acquire, surviving the session-meta
+# cleanup so doctor (#19) can read the tail for N-flatline detection. JSON-lines,
+# append-only, one record per line — each printf >> is a single write under
+# PIPE_BUF so concurrent committers do not interleave records. Best-effort:
+# never returns non-zero, never writes to stdout (call sites run under set -e).
+# Fields: uuid, acquired_at, head_at_acquire (acquire-time HEAD), post_commit_head
+# (branch HEAD after the commit landed), status, branch, ts.
+_closeout_append() {
+  local uuid="$1" acquired_at="$2" head_at_acquire="$3"
+  local post_commit_head="$4" status="$5" branch="$6"
+  # SECURITY: $uuid is caller-influenced (lock_uuid read from session meta, and
+  # session meta is populated from acquire's internal _uuid which is gen-uuid
+  # output — a strict [0-9a-f-]+ subset — but defend as if it could be anything).
+  # Charset-guard before interpolating into the JSON string so a payload cannot
+  # break out. head/post are git SHAs (hex) or empty; status is an internal vocab
+  # token; branch comes from `git branch --show-current` and is json_encode'd.
+  if [[ -z "$uuid" || ! "$uuid" =~ ^[A-Za-z0-9_-]+$ ]]; then
+    return 0
+  fi
+  if [[ ! "$status" =~ ^[A-Za-z0-9_-]+$ ]]; then
+    return 0
+  fi
+  local enc_branch ts
+  enc_branch="$(json_encode "$branch")"
+  ts="$(_iso_now)"
+  # mkdir guards the test/scratch-repo case (GATE_INDEX_DIR may not exist yet).
+  mkdir -p "$GATE_INDEX_DIR" 2>/dev/null || true
+  # Build the record once (printf -v, no subshell), then append under the
+  # ledger-local flock so a concurrent _gate_gc_sweep count-cap trim cannot
+  # drop this record in its snapshot-to-rename window. If flock is unavailable
+  # (non-Linux), append unlocked — concurrent appends are still atomic under
+  # PIPE_BUF, and the trim SKIPS when flock is absent (see _gate_gc_sweep), so
+  # there is no append-vs-trim race to lose a record to.
+  local line
+  printf -v line '{"uuid":"%s","acquired_at":"%s","head_at_acquire":"%s","post_commit_head":"%s","status":"%s","branch":%s,"ts":"%s"}' \
+    "$uuid" "$acquired_at" "$head_at_acquire" "$post_commit_head" "$status" "$enc_branch" "$ts"
+  if command -v flock >/dev/null 2>&1; then
+    (
+      flock -x 9 2>/dev/null || exit 1
+      printf '%s\n' "$line" >> "$CLOSEOUT_LOG" 2>/dev/null
+    ) 9>"$CLOSEOUT_LOCK" 2>/dev/null || true
+  else
+    printf '%s\n' "$line" >> "$CLOSEOUT_LOG" 2>/dev/null || true
+  fi
+}
+
 # Sweep aged orphan scratch files (msg-/paths-/meta-/index-/merge-) from
 # $GATE_INDEX_DIR. Best-effort: never returns non-zero, never writes to stdout
 # (diagnostics suppressed). Two layers protect a live/concurrent session:
@@ -390,6 +456,33 @@ _gate_gc_sweep() {
         rm -f "$f" 2>/dev/null || true
       fi
     done < <(ls -1 "${MSG_SCRATCH_DIR}"/msg-* 2>/dev/null)
+  fi
+
+  # Cap the durable closeout ledger by record count (keep the most recent N),
+  # serialized under the ledger-local flock so the tail→tmp→mv replacement
+  # cannot drop a record appended by a concurrent successful committer. The
+  # count is RE-READ inside the lock (a concurrent append may have grown it
+  # between the outer read and the trim). If flock is unavailable (non-Linux),
+  # SKIP the trim entirely — no trim means no append-vs-trim race, so the ledger
+  # stays correct (just unbounded) rather than risking a lost record. Best-effort:
+  # never fails the sweep.
+  if [[ -f "$CLOSEOUT_LOG" ]] && command -v flock >/dev/null 2>&1; then
+    local log_max="${COMMIT_GATE_CLOSEOUT_LOG_MAX:-$DEFAULT_CLOSEOUT_LOG_MAX}"
+    local _tmp="${CLOSEOUT_LOG}.tmp.$$"
+    (
+      flock -x 9 2>/dev/null || exit 1
+      lc=$(wc -l < "$CLOSEOUT_LOG" 2>/dev/null || echo "0")
+      if [[ "$lc" -gt "$log_max" ]]; then
+        d=$((lc - log_max))
+        if tail -n +"$((d + 1))" "$CLOSEOUT_LOG" > "$_tmp" 2>/dev/null; then
+          mv "$_tmp" "$CLOSEOUT_LOG" 2>/dev/null || rm -f "$_tmp" 2>/dev/null || true
+        else
+          rm -f "$_tmp" 2>/dev/null || true
+        fi
+      else
+        rm -f "$_tmp" 2>/dev/null || true
+      fi
+    ) 9>"$CLOSEOUT_LOCK" 2>/dev/null || true
   fi
 
   return 0
@@ -949,7 +1042,17 @@ cmd_commit() {
       # 3-way merge: base (original HEAD), theirs (new HEAD), ours (reviewed tree)
       if ! GIT_INDEX_FILE="$merge_index" git read-tree -m -i "$base_tree" "$new_head_tree" "$tree_hash" 2>/dev/null; then
         rm -f "$merge_index" 2>/dev/null || true
-        json_out "{\"status\":\"cas_conflict\",\"reason\":\"merge_failed\",\"original_head\":\"${head_at_acquire}\",\"current_head\":\"${current_head}\"}"
+        # Content tangle: the 3-way merge could not reconcile the reviewed tree
+        # with the concurrent winner's HEAD. Distinct from cas_conflict (which is
+        # concurrent HEAD MOVEMENT the retry loop handles) — this is a terminal
+        # could-not-land (disposition §4.2: reason "tangle"). Record it durably
+        # so doctor's stall/flatline surfacing can see it. post_commit_head is
+        # current_head (the branch did not move — no commit landed).
+        _closeout_append "$lock_uuid" \
+          "$(_field_str "$lock_content" "acquired_at")" \
+          "$(_field_str "$lock_content" "head_at_acquire")" \
+          "$current_head" "could_not_land" "$branch"
+        json_out "{\"status\":\"could_not_land\",\"reason\":\"merge_failed\",\"original_head\":\"${head_at_acquire}\",\"current_head\":\"${current_head}\"}"
         return 1
       fi
 
@@ -958,7 +1061,12 @@ cmd_commit() {
       rm -f "$merge_index" 2>/dev/null || true
 
       if [[ -z "$new_tree" ]]; then
-        json_out "{\"status\":\"cas_conflict\",\"reason\":\"write_tree_failed\",\"original_head\":\"${head_at_acquire}\",\"current_head\":\"${current_head}\"}"
+        # Same content-tangle class as merge_failed above (could_not_land).
+        _closeout_append "$lock_uuid" \
+          "$(_field_str "$lock_content" "acquired_at")" \
+          "$(_field_str "$lock_content" "head_at_acquire")" \
+          "$current_head" "could_not_land" "$branch"
+        json_out "{\"status\":\"could_not_land\",\"reason\":\"write_tree_failed\",\"original_head\":\"${head_at_acquire}\",\"current_head\":\"${current_head}\"}"
         return 1
       fi
 
@@ -982,6 +1090,25 @@ cmd_commit() {
     # Update branch ref WITH CAS (old-oid = current_head)
     if [[ -n "$current_head" ]]; then
       if git update-ref "refs/heads/${branch}" "$commit_hash" "$current_head" 2>/dev/null; then
+        # Closeout status (sub-item 3, disposition §4.2): no_head_progress if the
+        # branch did not advance past the reference this commit was built on
+        # (the P3 "pre/post HEAD equal" canary). A normal commit-tree always
+        # produces a new object on top of current_head, so this is structurally
+        # unreachable via the normal acquire→commit flow (the no_changes guard
+        # also blocks no-op trees); it emits on the genuine post==pre edge /
+        # fault condition. Otherwise committed.
+        local closeout_status="committed"
+        if [[ -n "$current_head" && "$commit_hash" == "$current_head" ]]; then
+          closeout_status="no_head_progress"
+        fi
+        # Record post-commit HEAD to the durable closeout ledger (sub-item 1,
+        # disposition §4.2). head_at_acquire from lock_content is the ORIGINAL
+        # acquire-time HEAD (mirrors the per-session field); post_commit_head is
+        # where the branch actually landed.
+        _closeout_append "$lock_uuid" \
+          "$(_field_str "$lock_content" "acquired_at")" \
+          "$(_field_str "$lock_content" "head_at_acquire")" \
+          "$commit_hash" "$closeout_status" "$branch"
         # Success — clean up
         rm -f "$private_index_path" 2>/dev/null || true
         rm -f "$(_session_meta_path "$lock_uuid")" 2>/dev/null || true
@@ -993,7 +1120,7 @@ cmd_commit() {
         if [[ "$tree_hash" != "$original_tree" ]]; then
           rebased_flag=",\"rebased\":true,\"original_tree\":\"${original_tree}\""
         fi
-        json_out "{\"status\":\"committed\",\"commit_hash\":\"${commit_hash}\",\"tree_hash\":\"${tree_hash}\",\"branch\":\"${branch}\",\"cas_attempts\":${cas_attempt}${rebased_flag}}"
+        json_out "{\"status\":\"${closeout_status}\",\"commit_hash\":\"${commit_hash}\",\"tree_hash\":\"${tree_hash}\",\"branch\":\"${branch}\",\"cas_attempts\":${cas_attempt}${rebased_flag}}"
         return 0
       else
         # CAS failed — HEAD moved under us
@@ -1008,6 +1135,11 @@ cmd_commit() {
       # Initial commit (no parent): use zero-old-oid to prevent concurrent
       # initial commits from silently overwriting each other.
       if git update-ref "refs/heads/${branch}" "$commit_hash" "0000000000000000000000000000000000000000" 2>/dev/null; then
+        # Record the initial commit to the durable closeout ledger (sub-item 1).
+        _closeout_append "$lock_uuid" \
+          "$(_field_str "$lock_content" "acquired_at")" \
+          "$(_field_str "$lock_content" "head_at_acquire")" \
+          "$commit_hash" "committed" "$branch"
         rm -f "$private_index_path" 2>/dev/null || true
         rm -f "$(_session_meta_path "$lock_uuid")" 2>/dev/null || true
         _cleanup_own_scratch "$lock_uuid" "$message_file"
