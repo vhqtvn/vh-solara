@@ -1548,7 +1548,13 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		// gated on wantsProject(r) was deleted in Phase 4 (commit a0e825c), so
 		// there is no proj=1 path here.
 		if treeEmitter != nil {
-			treeSnap := treeEmitter.SnapshotFrontier("reconnect")
+			// Q5 capture consolidation: ONE s.mu.RLock derives BOTH the tree
+			// frontier and the detail snapshot with the SAME {epoch, seq}, so
+			// the two projections can no longer diverge across an interleaving
+			// writer (the false-confidence failure that blocked a truthworthy
+			// completion signal). baseline is the captured seq (tree.Seq ==
+			// detail.Seq), dropping the third store.Head() lock.
+			detailSnap, treeSnap := store.SnapshotWithTree(treeEmitter, filter, "reconnect")
 			if rb, err := json.Marshal(treeSnap); err == nil {
 				wire := maybeCompressSnapshot(rb, wantsCompress(r))
 				writeRaw(w, treeSnap.Seq, "tree.snapshot", wire)
@@ -1559,13 +1565,12 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			// Legacy detail snapshot, shipped RAW (not gzip64) so it does NOT
 			// race tree.snapshot's async gzip64 decode on the client's shared
 			// treeSnapshotDecoding flag (same rationale as fresh-connect).
-			detailSnap := store.Snapshot(filter)
 			if db, err := json.Marshal(detailSnap); err == nil {
 				writeRaw(w, detailSnap.Seq, "snapshot", db)
 			} else {
 				vhlog.Warn("tree=2 resume detail snapshot: marshal failed", "err", err)
 			}
-			baseline = store.Head()
+			baseline = treeSnap.Seq
 		}
 	} else {
 		// Fresh client or cursor too old: send a full snapshot, then live-tail.
@@ -1595,7 +1600,12 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			if hasCursor && !replayOK {
 				cause = "reconnect"
 			}
-			treeSnap := treeEmitter.SnapshotFrontier(cause)
+			// Q5 capture consolidation: ONE s.mu.RLock derives BOTH the tree
+			// frontier and the detail snapshot with the SAME {epoch, seq} — the
+			// hard prerequisite for the truthworthy completion signal. baseline
+			// is the captured seq (tree.Seq == detail.Seq), dropping the third
+			// store.Head() lock.
+			detailSnap, treeSnap := store.SnapshotWithTree(treeEmitter, filter, cause)
 			if rb, err := json.Marshal(treeSnap); err == nil {
 				wire := maybeCompressSnapshot(rb, wantsCompress(r))
 				writeRaw(w, treeSnap.Seq, "tree.snapshot", wire)
@@ -1615,13 +1625,12 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			// snapshot listener runs synchronously while tree.snapshot's async
 			// decode proceeds in parallel; both populate different stores
 			// (state.sessions vs treeMap) so there is no clobber.
-			detailSnap := store.Snapshot(filter)
 			if db, err := json.Marshal(detailSnap); err == nil {
 				writeRaw(w, detailSnap.Seq, "snapshot", db)
 			} else {
 				vhlog.Warn("tree=2 detail snapshot: marshal failed", "err", err)
 			}
-			baseline = store.Head()
+			baseline = treeSnap.Seq
 		} else {
 			// Legacy (non-tree) clients: send the full wholesale snapshot.
 			snap := store.Snapshot(filter)

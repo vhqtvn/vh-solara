@@ -299,6 +299,18 @@ func (e *TreeEmitter) SnapshotFrontier(cause string) *TreeSnapshot {
 	s := e.store
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	return e.snapshotFrontierLocked(cause)
+}
+
+// snapshotFrontierLocked is the lock-free body of SnapshotFrontier. Caller
+// MUST hold s.mu (at least RLock). It is extracted verbatim from the former
+// SnapshotFrontier body so the exactly-once emitter side-effects — E_c seeding
+// (e.ec[id]=true), parentCache/known recording via emitSnapshotNode — are
+// PRESERVED UNMODIFIED (Q5 acceptance gate). SnapshotWithTree calls this
+// inside its SINGLE RLock so the tree projection shares one capture with the
+// detail projection.
+func (e *TreeEmitter) snapshotFrontierLocked(cause string) *TreeSnapshot {
+	s := e.store
 
 	// Category 2 first: the union of all active paths (loaded candidates).
 	activePath := map[string]bool{}

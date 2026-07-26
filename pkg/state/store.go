@@ -3245,7 +3245,39 @@ func (s *Store) deletePartLocked(sessionID, messageID, partID string) {
 //     in Go 1.25 (it returns unsafe.String over the builder's buffer, no copy).
 func (s *Store) Snapshot(messagesFor map[string]bool) Snapshot {
 	s.mu.RLock()
+	c := s.captureSnapshotLocked(messagesFor)
+	s.mu.RUnlock()
+	if snapshotMaterializeHook != nil {
+		snapshotMaterializeHook()
+	}
+	return s.materializeSnapshot(c)
+}
 
+// snapshotCapture holds the private copies of every mutable store field the
+// detail Snapshot materialization reads, captured under s.mu (the no-aliasing
+// invariant: nothing read after RUnlock aliases store memory). Extracted from
+// Snapshot so SnapshotWithTree can run the detail capture inside the SAME
+// RLock as the tree computation (Q5 capture consolidation).
+type snapshotCapture struct {
+	epoch       string
+	seq         uint64
+	subtreeBusy map[string]bool
+	sessions    map[string]snapSessionCap
+	questions   map[string][][]byte
+	activity    map[string]string
+	unread      []string
+	todos       map[string][]byte
+	perms       map[string][][]byte
+	statuses    map[string][]byte
+	messages    map[string][]snapMessageCap
+}
+
+// captureSnapshotLocked is the CAPTURE PHASE of Snapshot. Caller MUST hold s.mu
+// (at least RLock). It copies every mutable field into a snapshotCapture
+// (private copies; nothing aliases store memory after return). Extracted
+// verbatim from the former Snapshot capture phase so the no-aliasing invariant
+// is preserved (Q5 acceptance gate: no behavioral change to the capture).
+func (s *Store) captureSnapshotLocked(messagesFor map[string]bool) snapshotCapture {
 	scopeSelected := messagesFor != nil && len(messagesFor) > 0
 	// inScope reports whether a session's per-session structural rows should
 	// ship. When scopeSelected, only the selected sessions ship; nil/{} ship
@@ -3409,7 +3441,38 @@ func (s *Store) Snapshot(messagesFor map[string]bool) Snapshot {
 		messages[sid] = list
 	}
 
-	s.mu.RUnlock()
+	return snapshotCapture{
+		epoch:       epoch,
+		seq:         seq,
+		subtreeBusy: subtreeBusy,
+		sessions:    sessions,
+		questions:   questions,
+		activity:    activity,
+		unread:      unread,
+		todos:       todos,
+		perms:       perms,
+		statuses:    statuses,
+		messages:    messages,
+	}
+}
+
+// materializeSnapshot is the MATERIALIZATION PHASE of Snapshot. It runs WITHOUT
+// holding s.mu, assembling the Snapshot purely from the captured locals (the
+// no-aliasing invariant lets it read them lock-free). The test seam
+// (snapshotMaterializeHook) fires in the thin Snapshot wrapper between RUnlock
+// and the call to this method.
+func (s *Store) materializeSnapshot(c snapshotCapture) Snapshot {
+	epoch := c.epoch
+	seq := c.seq
+	subtreeBusy := c.subtreeBusy
+	sessions := c.sessions
+	questions := c.questions
+	activity := c.activity
+	unread := c.unread
+	todos := c.todos
+	perms := c.perms
+	statuses := c.statuses
+	messages := c.messages
 
 	// --- MATERIALIZATION PHASE (NO LOCK) ---
 	// Build the Snapshot purely from the captured locals. The captured byte
@@ -3417,14 +3480,6 @@ func (s *Store) Snapshot(messagesFor map[string]bool) Snapshot {
 	// output (no double-copy); the no-aliasing invariant holds because every
 	// output slice is a fresh capture-time copy of store bytes. The JSON
 	// unmarshal+marshal for parts with buffered deltas happens here.
-	//
-	// Test seam: fires after RUnlock, before materialization. nil in production;
-	// a test sets it to prove materialization runs outside the lock (an Apply
-	// that needs the write lock completes while Snapshot blocks here).
-	if snapshotMaterializeHook != nil {
-		snapshotMaterializeHook()
-	}
-
 	snap := Snapshot{
 		Epoch:          epoch,
 		Seq:            seq,
@@ -3561,6 +3616,36 @@ func (s *Store) Snapshot(messagesFor map[string]bool) Snapshot {
 		snap.MessageWindows[sid] = meta
 	}
 	return snap
+}
+
+// SnapshotWithTree captures BOTH the detail Snapshot AND the tree TreeSnapshot
+// under a SINGLE s.mu.RLock, stamping both with the SAME {epoch, seq}. This is
+// the Q5 capture-consolidation: previously handleStream acquired the lock twice
+// (SnapshotFrontier then store.Snapshot), so a writer on the Apply path could
+// interleave between the two locks and bump s.seq — making any after-the-fact
+// {epoch, seq} label FALSE CONFIDENCE. The single capture here is the hard
+// prerequisite for the truthfulness of the completion signal shipped in the
+// next step.
+//
+// The tree computation runs the emitter's snapshotFrontierLocked inside this
+// lock, so its exactly-once side-effects (E_c seeding via e.ec, parentCache /
+// known recording via emitSnapshotNode) are applied VERBATIM — identical to a
+// standalone SnapshotFrontier call. The detail capture (captureSnapshotLocked)
+// is the same no-aliasing private copy the thin Snapshot uses.
+//
+// The test seam (snapshotMaterializeHook) fires between RUnlock and the detail
+// materialization, exactly as in Snapshot. baseline == tree.Seq (== detail.Seq)
+// for the live-tail guard, so the caller can drop its third store.Head() lock.
+func (s *Store) SnapshotWithTree(e *TreeEmitter, messagesFor map[string]bool, cause string) (Snapshot, *TreeSnapshot) {
+	s.mu.RLock()
+	c := s.captureSnapshotLocked(messagesFor)
+	treeSnap := e.snapshotFrontierLocked(cause)
+	s.mu.RUnlock()
+	if snapshotMaterializeHook != nil {
+		snapshotMaterializeHook()
+	}
+	detail := s.materializeSnapshot(c)
+	return detail, treeSnap
 }
 
 // snapshotMaterializeHook is a test seam fired after Snapshot releases s.mu and

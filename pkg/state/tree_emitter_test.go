@@ -3,6 +3,8 @@ package state
 import (
 	"encoding/json"
 	"fmt"
+	"reflect"
+	"sync"
 	"testing"
 	"time"
 )
@@ -626,4 +628,180 @@ func TestTreeSnapshotCarriesStoreEpoch(t *testing.T) {
 	if snap.Seq != s.Head() {
 		t.Errorf("TreeSnapshot.Seq = %d, want store head %d", snap.Seq, s.Head())
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Group 10 — Q5 capture consolidation (SnapshotWithTree)
+// ---------------------------------------------------------------------------
+//
+// q5-capture-feasibility established that handleStream captured the tree +
+// detail projections via TWO independent RLock acquisitions, so a shared
+// {epoch, seq} label stamped afterward would be FALSE CONFIDENCE (a writer on
+// the Apply path could interleave between the two locks and bump s.seq).
+// SnapshotWithTree consolidates both captures under ONE RLock. These tests pin
+// the three invariants the consolidation MUST hold:
+//
+//   1. CORRELATION — tree.{Epoch,Seq} == detail.{Epoch,Seq} (same capture).
+//   2. EXACTLY-ONCE emitter side-effects — the consolidation must seed E_c /
+//      parentCache / known IDENTICALLY to SnapshotFrontier (no double-seed, no
+//      skip). This is the ACCEPTANCE GATE for Q5.
+//   3. NO DEADLOCK + correlation under concurrency — the single RLock must not
+//      deadlock against a concurrent writer, and the correlation invariant
+//      must hold even while the store is being mutated.
+
+// treeSnapshotSessionGraph builds a small graph with an active path so the
+// frontier seeds a non-trivial E_c / parentCache / known set (the
+// exactly-once test needs a realistic frontier, not a single root).
+func treeSnapshotSessionGraph(t *testing.T, s *Store) {
+	t.Helper()
+	applySeq(t, s,
+		[2]string{"session.created", evSessionCreated("R", "")},
+		[2]string{"session.created", evSessionCreated("A", "R")},
+		[2]string{"session.created", evSessionCreated("B", "A")},
+		[2]string{"session.created", evSessionCreated("C", "B")},
+		[2]string{"session.created", evSessionCreated("R2", "")},
+		[2]string{"session.created", evSessionCreated("E1", "R2")},
+		[2]string{"session.status", evStatus("B", "busy")},
+		[2]string{"session.created", evSessionCreated("Q1", "A")},
+		[2]string{KindQuestionSet, evQuestionAsked("Q1", "q1")},
+	)
+}
+
+// TestSnapshotWithTreeCorrelatesEpochSeq pins invariant 1 (CORRELATION): after
+// the consolidated capture, the tree and detail projections carry the SAME
+// {epoch, seq}, and both equal the store's current epoch/head. RED until
+// SnapshotWithTree exists.
+func TestSnapshotWithTreeCorrelatesEpochSeq(t *testing.T) {
+	s := New(64)
+	treeSnapshotSessionGraph(t, s)
+	e := NewTreeEmitter(s, "/proj")
+
+	detail, tree := s.SnapshotWithTree(e, nil, "cold")
+	if tree.Epoch != detail.Epoch {
+		t.Errorf("EPOCH MISMATCH (not one capture): tree=%q detail=%q", tree.Epoch, detail.Epoch)
+	}
+	if tree.Seq != detail.Seq {
+		t.Errorf("SEQ MISMATCH (not one capture): tree=%d detail=%d", tree.Seq, detail.Seq)
+	}
+	if tree.Epoch != s.Epoch() {
+		t.Errorf("tree.Epoch=%q != store epoch %q", tree.Epoch, s.Epoch())
+	}
+	// detail.Seq was captured in the SAME lock as tree.Seq, so it equals the
+	// store head AT THAT CAPTURE (store is quiescent here, no concurrent writer).
+	if detail.Seq != s.Head() {
+		t.Errorf("detail.Seq=%d != store head %d", detail.Seq, s.Head())
+	}
+}
+
+// TestSnapshotWithTreePreservesEmitterSideEffects pins invariant 2
+// (EXACTLY-ONCE — the ACCEPTANCE GATE). The consolidated capture must seed the
+// emitter's per-connection state IDENTICALLY to a standalone SnapshotFrontier
+// call on the same store: same E_c (ec), same parentCache, same known set. Any
+// divergence means the consolidation double-seeded, skipped seeding, or
+// reordered the emitter walk. RED until SnapshotWithTree exists.
+func TestSnapshotWithTreePreservesEmitterSideEffects(t *testing.T) {
+	s := New(64)
+	treeSnapshotSessionGraph(t, s)
+
+	// Reference: a standalone SnapshotFrontier on a fresh emitter.
+	eRef := NewTreeEmitter(s, "/proj")
+	ref := eRef.SnapshotFrontier("cold")
+
+	// Under test: SnapshotWithTree on a fresh emitter (same store state).
+	e := NewTreeEmitter(s, "/proj")
+	_, tree := s.SnapshotWithTree(e, nil, "cold")
+
+	// E_c (loaded-set) must match exactly.
+	if !reflect.DeepEqual(e.ec, eRef.ec) {
+		t.Errorf("E_c diverged:\n SnapshotFrontier   = %v\n SnapshotWithTree    = %v", eRef.ec, e.ec)
+	}
+	// parentCache must match exactly (move-detection state).
+	if !reflect.DeepEqual(e.parentCache, eRef.parentCache) {
+		t.Errorf("parentCache diverged:\n SnapshotFrontier   = %v\n SnapshotWithTree    = %v", eRef.parentCache, e.parentCache)
+	}
+	// known set must match exactly (facet/upsert gating).
+	if !reflect.DeepEqual(e.known, eRef.known) {
+		t.Errorf("known diverged:\n SnapshotFrontier   = %v\n SnapshotWithTree    = %v", eRef.known, e.known)
+	}
+	// The emitted node SET (by id) must match too — consolidation must not
+	// drop or duplicate a node. Order is not asserted (the walk order is
+	// deterministic but DeepEqual on the slice is brittle under future
+	// refactors; set-equality is the structural invariant).
+	refIDs := nodeIDs(ref.Nodes)
+	gotIDs := nodeIDs(tree.Nodes)
+	if !reflect.DeepEqual(refIDs, gotIDs) {
+		t.Errorf("tree node set diverged:\n SnapshotFrontier   = %v\n SnapshotWithTree    = %v", refIDs, gotIDs)
+	}
+}
+
+// TestSnapshotWithTreeCorrelationHoldsUnderConcurrency pins invariant 3 (NO
+// DEADLOCK + correlation under contention). A writer goroutine mutates the
+// store (s.Apply, taking the write Lock) while reader goroutines call
+// SnapshotWithTree (taking the RLock). The test COMPLETES only if no deadlock
+// occurs; each reader asserts tree.{Epoch,Seq} == detail.{Epoch,Seq}. A
+// deadlock would hang the test until the framework timeout. RED until
+// SnapshotWithTree exists.
+func TestSnapshotWithTreeCorrelationHoldsUnderConcurrency(t *testing.T) {
+	s := New(64)
+	treeSnapshotSessionGraph(t, s)
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	// One writer goroutine continuously mutating the store (status churn on a
+	// bounded id set). This is what would interleave between two independent
+	// RLocks in the OLD code — the consolidation must keep the pair atomic.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			id := fmt.Sprintf("s%d", i%4)
+			s.Apply(ev("session.created", evSessionCreated(id, "")))
+			s.Apply(ev("session.status", evStatus(id, "busy")))
+		}
+	}()
+
+	// Reader goroutines: each does a consolidated capture and asserts the
+	// correlation invariant. Race detector + the framework timeout surface any
+	// deadlock.
+	const readers = 8
+	const capturesPerReader = 25
+	var rwg sync.WaitGroup
+	rwg.Add(readers)
+	errCh := make(chan error, readers*capturesPerReader)
+	for r := 0; r < readers; r++ {
+		go func() {
+			defer rwg.Done()
+			for i := 0; i < capturesPerReader; i++ {
+				e := NewTreeEmitter(s, "/proj")
+				detail, tree := s.SnapshotWithTree(e, nil, "cold")
+				if tree.Epoch != detail.Epoch || tree.Seq != detail.Seq {
+					errCh <- fmt.Errorf("correlation broken: tree={%s,%d} detail={%s,%d}",
+						tree.Epoch, tree.Seq, detail.Epoch, detail.Seq)
+					return
+				}
+			}
+		}()
+	}
+	rwg.Wait()
+	close(stop)
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Error(err)
+	}
+}
+
+// nodeIDs returns the set of node IDs emitted in a frontier snapshot
+// (order-independent; used to compare node SETS across two captures).
+func nodeIDs(nodes []Node) map[string]bool {
+	out := make(map[string]bool, len(nodes))
+	for _, n := range nodes {
+		out[n.ID] = true
+	}
+	return out
 }
