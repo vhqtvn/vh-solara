@@ -20,7 +20,7 @@ import { handleNotice } from "../alerts";
 import { checkVersionNow } from "../pwa";
 import { log } from "../lib/log";
 import { state, setState, projectDir, selectedId, persist } from "./store";
-import { invalidateChildrenIndex, normalizeTodos } from "./selectors";
+import { normalizeTodos } from "./selectors";
 import { notifyFromMessage, maybeNotifyRootDone, maybeClearWaiting } from "./orchestration";
 import { isGateActive, currentGateEpoch, markBusyDirty, setReconcileFn } from "../busy";
 import {
@@ -563,8 +563,6 @@ export function applySnapshot(snap: Snapshot) {
       s.projectConstants = snap.projectConstants;
     }),
   );
-  // Wholesale session-set replacement invalidates the parent→children index.
-  invalidateChildrenIndex();
   persist();
 }
 
@@ -604,8 +602,6 @@ export function applySessionEvent(kind: string, seq: number, payload: any) {
   // guard. Local correction only (no PUT); the S2 400 self-heal is the durable
   // backstop. Idempotent.
   if (kind === "session.delete") dropPinnedSession(payload.id);
-  // session.upsert / session.delete change the parent→children topology.
-  invalidateChildrenIndex();
   persist();
 }
 
@@ -637,7 +633,6 @@ export function pruneSessionDeleted(id: string) {
   // anti-resurrection guard. Local correction only (no PUT); the S2 400
   // self-heal is the durable backstop. Idempotent + no-op in legacy mode.
   dropPinnedSession(id);
-  invalidateChildrenIndex();
   persist();
 }
 

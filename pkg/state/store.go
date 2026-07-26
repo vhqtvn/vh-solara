@@ -2087,6 +2087,87 @@ func (s *Store) DescendantSummaries(id string) (descs []SessionSummary, epoch st
 	return descs, epoch, seq
 }
 
+// TodoTotals is the subtree-todo summary for the "Tasks N active · M left"
+// indicator: active = in_progress, left = items whose status is neither
+// completed nor cancelled (covers pending, in_progress, and any unknown
+// status — matches the deleted FE sessionTodoCounts exactly), total = all.
+type TodoTotals struct {
+	Active int `json:"active"`
+	Left   int `json:"left"`
+	Total  int `json:"total"`
+}
+
+// SubtreeTodos returns the agent todos (OpenCode TodoWrite) for a session and
+// every transitively-parented descendant, rolled up in subtree order, plus the
+// active/left/total summary — captured together with the Store's epoch and head
+// seq UNDER THE SAME RLock (no TOCTOU between the rollup and the revision read).
+//
+// Each item is returned as raw JSON (json.RawMessage) so the client receives the
+// exact OpenCode todo payload (content/status/priority/…) untouched — the server
+// is a passthrough, not a projection. Totals are computed server-side by reading
+// each item's `status` field, mirroring the FE sessionTodoCounts the P5 endpoint
+// replaces.
+//
+// s.todos[id] holds the RAW todo.updated event properties — either the daemon's
+// `{"sessionID","todos":[…]}` envelope (the form OpenCode always emits and the
+// aggregator always stores) or, defensively, a bare `[…]` array.
+// extractTodoItems normalizes both forms (mirrors the FE normalizeTodos).
+//
+// Returns nil items when id is unknown to the live store; the handler coerces
+// nil → [] for the wire. A known id with no todos returns nil items too (the
+// handler coerces); totals are zero.
+func (s *Store) SubtreeTodos(id string) (items []json.RawMessage, totals TodoTotals, epoch string, seq uint64) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	epoch = s.epoch
+	seq = s.seq
+	if s.sessions[id] == nil {
+		return nil, totals, epoch, seq
+	}
+	for _, sid := range s.descendantsLocked(id) {
+		raw, ok := s.todos[sid]
+		if !ok || len(raw) == 0 {
+			continue
+		}
+		for _, item := range extractTodoItems(raw) {
+			items = append(items, item)
+			var t struct {
+				Status string `json:"status"`
+			}
+			_ = json.Unmarshal(item, &t) // missing status → "" (counts as left, not active)
+			totals.Total++
+			if t.Status == "in_progress" {
+				totals.Active++
+			}
+			if t.Status != "completed" && t.Status != "cancelled" {
+				totals.Left++
+			}
+		}
+	}
+	return items, totals, epoch, seq
+}
+
+// extractTodoItems pulls the todo-item array out of the raw stored payload. The
+// aggregator stores s.todos[id] = ev.Properties verbatim, where Properties is
+// the `{"sessionID":"…","todos":[…]}` envelope OpenCode emits on todo.updated.
+// A bare `[…]` array is also accepted defensively (mirrors the FE
+// normalizeTodos) so a future producer that drops the envelope still works.
+func extractTodoItems(raw json.RawMessage) []json.RawMessage {
+	// Envelope form: {"todos": [...]}.
+	var env struct {
+		Todos []json.RawMessage `json:"todos"`
+	}
+	if json.Unmarshal(raw, &env) == nil && env.Todos != nil {
+		return env.Todos
+	}
+	// Bare-array form: [...].
+	var arr []json.RawMessage
+	if json.Unmarshal(raw, &arr) == nil {
+		return arr
+	}
+	return nil
+}
+
 // isRecentlyArchivedLocked reports whether id is within the archive tombstone
 // window (set by RemoveSessions). Lazily GCs expired entries. Caller must hold
 // s.mu. Returns false (and cleans up) once the TTL has elapsed so a genuine

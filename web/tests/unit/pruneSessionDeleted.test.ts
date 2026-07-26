@@ -3,12 +3,11 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { reconcile } from "solid-js/store";
 import { pruneSessionDeleted } from "../../src/sync/stream";
 import { state, setState } from "../../src/sync/store";
-import { invalidateChildrenIndex } from "../../src/sync/selectors";
 
 // pruneSessionDeleted mirrors the session.delete event handler's pruning: it
 // removes a session from every client-side store slice (sessions, lastAgents,
 // messageWindows, messagesLoaded, messagesError, refreshing) and resets derived
-// caches (pageInFlight, childrenIndex, persist).
+// caches (pageInFlight, persist).
 // It is called by archiveSession after a successful /vh/archive so that an
 // orphan whose server-side delete event never arrives (the session wasn't in
 // the server store → no KindSessionDelete emitted) is still removed from the
@@ -22,7 +21,6 @@ beforeEach(() => {
   setState("messagesError", reconcile({}));
   setState("refreshing", reconcile({}));
   setState("activity", reconcile({}));
-  invalidateChildrenIndex();
 });
 
 describe("pruneSessionDeleted", () => {

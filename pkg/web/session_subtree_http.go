@@ -32,6 +32,7 @@ package web
 // sanitized with safeID before store use (same as messages + queue).
 
 import (
+	"encoding/json"
 	"net/http"
 
 	"github.com/vhqtvn/vh-solara/pkg/state"
@@ -86,4 +87,51 @@ func (s *Server) handleSessionDescendants(w http.ResponseWriter, r *http.Request
 type descendantsData struct {
 	SessionID   string                 `json:"sessionId"`
 	Descendants []state.SessionSummary `json:"descendants"`
+}
+
+// GET /vh/session/{sessionId}/subtree-todos — server-authoritative subtree todo
+// rollup (P5). Replaces the FE resident-map walk (selectors.sessionTodos /
+// sessionTodoCounts), which walked the resident tree map + childrenIndex and
+// omitted unloaded descendants of collapsed frontier nodes.
+//
+// The server walks the authoritative topology (Store.descendantsLocked) and
+// rolls up the per-session todos (s.todos) in subtree order, computing the
+// active/left/total summary. Items are raw JSON passthrough (the exact OpenCode
+// todo payload — content/status/priority/…); totals are computed by reading
+// each item's status. Mirrors the FE rollup semantics exactly.
+//
+// Unknown id → 200 with empty items + zero totals (NOT a 404): same wire
+// contract as the descendants endpoint (a not-yet-hydrated or just-pruned id is
+// a normal transient, not an error). See handleSessionDescendants above for the
+// full rationale.
+func (s *Server) handleSubtreeTodos(w http.ResponseWriter, r *http.Request) {
+	sid := safeID.ReplaceAllString(r.PathValue("sessionId"), "")
+	if sid == "" {
+		http.Error(w, "session required", http.StatusBadRequest)
+		return
+	}
+	st := s.aggFor(reqDir(r)).Store()
+	items, totals, epoch, seq := st.SubtreeTodos(sid)
+	if items == nil {
+		items = []json.RawMessage{}
+	}
+	writeJSONResp(w, revisionedEnvelope[subtreeTodosData]{
+		Epoch:    epoch,
+		Revision: seq,
+		Data: subtreeTodosData{
+			SessionID: sid,
+			Items:     items,
+			Totals:    totals,
+		},
+	})
+}
+
+// subtreeTodosData is the `data` payload of GET /vh/session/:id/subtree-todos.
+// Items is always non-nil (at least []). Each item is the raw OpenCode todo
+// payload (content/status/priority/…), untouched by the server. Totals is the
+// server-computed active/left/total summary.
+type subtreeTodosData struct {
+	SessionID string            `json:"sessionId"`
+	Items     []json.RawMessage `json:"items"`
+	Totals    state.TodoTotals  `json:"totals"`
 }

@@ -1,6 +1,6 @@
 import { createEffect, createMemo, createSignal, For, Match, on, onCleanup, onMount, Show, Switch, untrack } from "solid-js";
 import { Portal } from "solid-js/web";
-import { ackSession, createSession, currentVerb, isSending, loadOlder, markSessionIdle, openSession, rootOf, sessionTodoCounts, sessionTodos, sessionWorking, setSelectedId, setSending, state } from "../sync";
+import { ackSession, createSession, currentVerb, isSending, loadOlder, markSessionIdle, openSession, rootOf, sessionWorking, setSelectedId, setSending, state } from "../sync";
 import {
   bottommostRead,
   classifyScrollDelta,
@@ -17,6 +17,7 @@ import { loadVersioned, saveVersioned } from "../lib/store";
 import { activeAgent, agentForSession, agents, selectAgentForSession, selectedAgent } from "../agents";
 import { claimQueued, enqueue, fetchQueue, hasQueueState, migrateLegacyQueue, queueFor, queueMode, removeQueued, resolveQueued } from "../queue";
 import { createQueueDrainer } from "../queueDrain";
+import { fetchSubtreeTodos, type SubtreeTodosResp } from "../subtreeTodos";
 import { historyAt, historyLen, pushHistory } from "../history";
 import { type AcItem, commandSuggestions, fileSuggestions } from "../lib/complete";
 import { harvestPastedFiles } from "../lib/paste";
@@ -598,8 +599,40 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     return null;
   });
   // Agent todo list (OpenCode TodoWrite) → "Tasks N active · M left" pill.
-  const todoCounts = createMemo(() => sessionTodoCounts(props.sessionId));
-  const todoItems = createMemo(() => sessionTodos(props.sessionId));
+  // Server-authoritative subtree rollup (P5): replaces the FE resident-map walk
+  // (sessionTodos/sessionTodoCounts) which omitted unloaded descendants of
+  // collapsed frontier nodes. Fetched on session change and polled every 5s
+  // while the session is open (mirrors the fetchQueue pattern above) — the
+  // server is authoritative, and a 5s poll catches todo.updated events without
+  // wiring a stream→component refetch signal. Stale responses from a prior
+  // session (or after unmount) are suppressed via a monotonic request id.
+  const [subtreeTodos, setSubtreeTodos] = createSignal<SubtreeTodosResp["data"] | null>(null);
+  let todoPollReq = 0;
+  createEffect(() => {
+    const sid = props.sessionId;
+    if (props.draft || !sid) {
+      setSubtreeTodos(null);
+      return;
+    }
+    const myReq = ++todoPollReq;
+    const poll = async () => {
+      try {
+        const resp = await fetchSubtreeTodos(sid);
+        if (myReq !== todoPollReq) return; // superseded by a later session / unmount
+        setSubtreeTodos(resp.data);
+      } catch {
+        if (myReq === todoPollReq) setSubtreeTodos(null);
+      }
+    };
+    void poll();
+    const timer = setInterval(poll, 5000);
+    onCleanup(() => {
+      clearInterval(timer);
+      todoPollReq++; // suppress any in-flight fetch from this run
+    });
+  });
+  const todoCounts = createMemo(() => subtreeTodos()?.totals ?? { active: 0, left: 0, total: 0 });
+  const todoItems = createMemo(() => subtreeTodos()?.items ?? []);
   const [todosOpen, setTodosOpen] = createSignal(false);
   let tasksBarEl: HTMLDivElement | undefined;
   let tasksPopupEl: HTMLDivElement | undefined;

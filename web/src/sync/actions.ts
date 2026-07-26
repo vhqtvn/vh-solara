@@ -22,7 +22,6 @@ import {
 } from "./store";
 import { syncUrl } from "./url";
 import { closeSessionStream, connect, resetPageInFlight } from "./stream";
-import { invalidateChildrenIndex } from "./selectors";
 import { resetTreeStore, clearUserToggled, applyTreeOpStore } from "./treeState";
 
 // Selecting any real session leaves draft mode.
@@ -92,8 +91,6 @@ export function switchProject(dir: string, fromUrl = false) {
       s.status = "connecting";
     }),
   );
-  // Wholesale session-set replacement invalidates the parent→children index.
-  invalidateChildrenIndex();
   // Project switch clears the tree (flat map + in-memory userExpanded). A
   // same-project resync does NOT clear — connect(true) swaps the snapshot
   // atomically (seedTreeStore) and preserves userExpanded; only a true project

@@ -148,8 +148,6 @@ export {
   sessionLastAgent,
   sessionWorking,
   currentVerb,
-  sessionTodos,
-  sessionTodoCounts,
 } from "./sync/selectors";
 export type { CurrentVerb } from "./sync/selectors";
 export { ackSession } from "./sync/orchestration";

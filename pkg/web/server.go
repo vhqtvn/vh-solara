@@ -916,6 +916,12 @@ func (s *Server) Handler() http.Handler {
 	// parentID}]}}. Replaces the FE resident-map walk that omitted unloaded
 	// descendants of collapsed frontier nodes. See pkg/web/session_subtree_http.go.
 	mux.HandleFunc("GET /vh/session/{sessionId}/descendants", s.handleSessionDescendants)
+	// P5: server-authoritative subtree todo rollup. GET-only → no CSRF.
+	// Returns {epoch, revision, data:{sessionId, items:[TodoItem],
+	// totals:{active,left,total}}}. Replaces the FE resident-map walk
+	// (sessionTodos/sessionTodoCounts) that omitted unloaded descendants.
+	// See pkg/web/session_subtree_http.go.
+	mux.HandleFunc("GET /vh/session/{sessionId}/subtree-todos", s.handleSubtreeTodos)
 	// Phase 2 tree=2 expand endpoint: GET → no CSRF.
 	// Returns a node.children page for lazy-loading direct children of a
 	// collapsed frontier node. See pkg/web/tree_children.go for the contract.
