@@ -122,8 +122,18 @@ test("markdown code blocks use the light syntax sheet on every light theme (not 
   });
   await page.goto(projectUrl("/"));
   await page.getByRole("button", { name: /Demo session/ }).click();
+  // The chroma code block lives in m2 (the first seeded assistant message —
+  // the only one carrying a ```go fence). web/src/components/Deferred.tsx
+  // occlusion-virtualizes each row's heavy content (markdown/chroma) behind an
+  // IntersectionObserver (rootMargin "1200px 0px"): content mounts only when
+  // near the viewport. The serial suite shares one mutable fixture backend +
+  // an append-only aggregator store, so demo's transcript grows across the run
+  // and m2 ends up >1200px from the viewport when the chat opens scrolled to
+  // the tail — its chroma block stays deferred. scrollIntoView trips the
+  // observer so m2 mounts regardless of the contaminated transcript size.
+  await page.locator(".msg.assistant").first().evaluate((el) => el.scrollIntoView());
   const block = page.locator(".md pre.chroma").first();
-  await expect(block).toBeVisible();
+  await expect(block).toBeVisible({ timeout: 8000 });
 
   // The generic light marker is applied, so the scoped light syntax sheet
   // (.theme-light-scoped .chroma) takes effect even for shire-light.

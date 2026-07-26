@@ -54,7 +54,23 @@ test("(a) first-click an idle collapsed session loads its transcript immediately
   await expect(page.locator(".main-title")).toContainText("Demo session");
   await expect(page.locator(".msg.assistant").first()).toBeVisible({ timeout: 8000 });
   // The daemon-rendered code block proves the full transcript was fetched.
-  await expect(page.locator(".md pre.chroma").first()).toBeVisible();
+  //
+  // Scroll m2 (the first assistant row — the ONLY seeded message carrying a
+  // ```go fence, hence the only `.md pre.chroma`) into the viewport before
+  // asserting it. web/src/components/Deferred.tsx occlusion-virtualizes each
+  // row's heavy content (markdown/chroma render) via an IntersectionObserver
+  // with rootMargin "1200px 0px": a row's content mounts only when near the
+  // viewport and never unmounts. In isolation demo's 6 seeded messages all sit
+  // within that margin, so m2 mounts on open. But the serial suite shares ONE
+  // mutable fixture backend + an append-only aggregator store
+  // (pkg/state/store.go reconcileMessagesLocked — "absence never deletes"), so
+  // demo's transcript only GROWS across the run (~30 prompt turns by the time
+  // this spec runs). The chat opens scrolled to the tail, leaving m2 >1200px
+  // away, so its chroma block stays deferred and the bare assertion times out.
+  // scrollIntoView trips the observer so m2's content mounts regardless of how
+  // large the contaminated transcript is.
+  await page.locator(".msg.assistant").first().evaluate((el) => el.scrollIntoView());
+  await expect(page.locator(".md pre.chroma").first()).toBeVisible({ timeout: 8000 });
 });
 
 // ─── (b) ─────────────────────────────────────────────────────────────────────

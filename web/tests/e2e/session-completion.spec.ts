@@ -193,8 +193,16 @@ async function promptAndComplete(page: Page, id: string, text: string) {
 // Reset a session to its seeded baseline so the serial suite's shared fixture
 // state doesn't bleed across specs. Uses Playwright's request context (Node-
 // side) so it works before the page has navigated to a baseURL.
+//
+// Routes through the daemon's /oc/* passthrough (the daemon only proxies /oc/*,
+// server.go handlePassthrough — a bare /fixture/reset silently hits the SPA
+// fallback and no-ops). The X-VH-CSRF header satisfies the shared CSRF guard on
+// /oc/* POSTs. Mirrors scroll-follow.spec.ts:170.
 async function resetSession(page: Page, id: string) {
-  await page.request.post(`/fixture/reset?session=${id}`);
+  const res = await page.request.post(`/oc/fixture/reset?session=${id}`, {
+    headers: { "X-VH-CSRF": "1" },
+  });
+  if (!res.ok()) throw new Error(`resetSession(${id}) -> ${res.status()} ${res.statusText()}`);
 }
 
 // Test A (CONTROL): plain live completion on `other` — small session, RAW
@@ -743,8 +751,9 @@ test("regression: stale reconnect snapshot must not clobber the settled tail (me
   // working phase — the tail is SUPPOSED to be absent from the last row while
   // a new turn generates. Without this reset, firstFinalIdx would catch any
   // pre-existing "added a test" in the baseline (the serial suite's shared
-  // fixture server retains demo's messages across Test B → Test D; /fixture/reset
-  // clears the fixture but not the aggregator's pkg/state store), and Phase 1's
+  // fixture server retains demo's messages across Test B → Test D; the
+  // /oc/fixture/reset call in resetSession clears the fixture but not the
+  // aggregator's pkg/state store), and Phase 1's
   // prompt would be counted as a spurious "drop". The red signal this test
   // guards is the RECONNECT clobber (Phase 2), not prompt-cycle churn.
   await page.evaluate(() => { (window as any).__vhSamples = []; });
