@@ -3881,10 +3881,12 @@ func (s *Store) Head() uint64 {
 }
 
 // RunningRoots returns the number of session roots whose subtree has at least
-// one busy/retry session (busyCount[root] > 0). It mirrors the SPA
-// runningSessionCount() semantics per-workspace: a root counts if any turn is
-// in flight anywhere in its subtree. Used to aggregate a cross-workspace
-// "restart will interrupt N running sessions" count without building snapshots.
+// one busy/retry session (busyCount[root] > 0): a root counts if any turn is
+// in flight anywhere in its subtree. Used by /vh/projects (P2) for the
+// per-project "running" badge and aggregated across workspaces by
+// /vh/running-sessions for the "restart will interrupt N running sessions"
+// warning — both without building full snapshots. roots >= running always
+// holds (see RootCount); idle = roots − running.
 func (s *Store) RunningRoots() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

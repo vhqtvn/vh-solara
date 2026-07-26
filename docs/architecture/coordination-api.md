@@ -56,8 +56,9 @@ per-session `gate` map (keyed by sessionID):
   through raw under the gate key `finish_reason`.
 - It's denormalized onto the session so it rides the **tree-only** list snapshot —
   no message-history hydration, no N+1 detail fetch.
-- `subtree_busy` mirrors the frontend's `sessionWorking`/`descendantWorking`
-  definition of a live session.
+- `subtree_busy` mirrors the frontend's `sessionWorking` definition of a live
+  session — the SPA trusts this server-computed facet directly (P1 removed the
+  old client-side `descendantWorking` subtree walk that re-derived it).
 - **`hydrated`**: after a daemon restart (new `epoch`), an idle, never-opened
   session has no message state yet, so `last_assistant_completed=false` /
   `finish_reason=""` mean **"not yet known", not "in-flight"**. `hydrated=false`
@@ -115,17 +116,75 @@ ack as no-ops against an instance that doesn't own it).
 Discover what's bridged (machine-readable, over the socket too):
 
 ```
-GET /vh/projects → [{ "dir": "", "epoch": "ep-…", "seq": 6, "roots": 3 },
-                    { "dir": "/work/alpha", "epoch": "ep-…", "seq": 2, "roots": 1 }, …]
+GET /vh/projects → [{ "dir": "", "epoch": "ep-…", "seq": 6, "roots": 3, "running": 1 },
+                    { "dir": "/work/alpha", "epoch": "ep-…", "seq": 2, "roots": 1, "running": 0 }, …]
 ```
 
-Each entry is a live per-dir instance with its own `epoch`/`seq`; `roots` counts **root sessions only** (children + archived excluded), so `roots` minus the matching `GET /vh/running-sessions` workspace count is the idle-root count. Cross-machine
+Each entry is a live per-dir instance with its own `epoch`/`seq`; `roots` counts **root sessions only** (children + archived excluded), and `running` (P2, `store.RunningRoots()`) counts roots whose subtree has ≥1 busy/retry session — both server-authoritative, so the idle-root count is `roots − running` directly from this endpoint. Cross-machine
 mirror: `GET /api/workers/{id}/projects`. Resolve your project dir → its entry,
 then pin the watch loop's `(epoch, seq)` cursor to that instance — snapshot+stream
 with that `?dir=` are scoped to that store, and the per-dir `epoch` lets a watcher
 detect (and reject) ever flipping to a different project's instance mid-stream.
 (To enumerate *all* opencode projects, not just the bridged ones, use the
 `/oc/project` passthrough.)
+
+### Stream convergence boundary + client drift self-heal
+
+The tree=2 stream ships two projections of one capture — `tree.snapshot`
+(structure, gzip64/async-decoded) and the legacy `snapshot` (detail, raw/sync).
+Q5 made their `{epoch, seq}` coherent and added a truthful completion boundary;
+Q6 added a bounded client-side drift catch-all that depends on it.
+
+**`snapshot.complete` SSE event** (Q5) — emitted on `GET /vh/stream` ONLY after
+BOTH projections of a single `SnapshotWithTree` capture are written on the wire
+(`treeOK && detailOK`), so a marshal failure that skips a projection does NOT
+produce a false completion claim:
+
+```jsonc
+event: snapshot.complete
+data: { "epoch": "ep-…", "revision": 6, "projections": ["tree","detail"] }
+```
+
+- `revision` == the capture's `seq` (== both projections' `seq` — they share one
+  store RLock, so the pair is a coherent bound). The SSE `id:` is the capture
+  seq (same as both projections' ids), keeping `Last-Event-ID` in the store-seq
+  space.
+- Prerequisite: `SnapshotWithTree` (Q5-B) derives both projections under ONE
+  store RLock with the SAME `{epoch, seq}`. Before that consolidation two
+  independent RLocks could diverge across a writer, so any cross-projection
+  atomicity label would have been false confidence. `Epoch` is now on
+  `TreeSnapshot` too (Q5-A), so a client reading only the tree projection can
+  detect a daemon restart without cross-checking the detail snapshot.
+- The SPA stages tree+detail by `{epoch, revision}` and marks
+  `authoritativeReady` on receipt — the verifiable convergence boundary that
+  `resyncTree`/reconcile needed.
+
+**Conditional periodic tree resync** (Q6, SPA-only — `web/src/sync/stream.ts`) —
+a bounded low-frequency catch-all for drift a continuously-foregrounded tab
+accumulates when its live stream silently misses an event (an emitter gap the
+on-focus trigger can't see, since no `visibilitychange` fires when the tab never
+backgrounded). This is NOT the old unconditional 90s cadence:
+
+- **~10min ± 2min jitter** (`TREE_RESYNC_PERIODIC_INTERVAL_MS` = 10·60·1000,
+  `TREE_RESYNC_PERIODIC_JITTER_MS` = 2·60·1000) — replaced the dead
+  `TREE_RESYNC_INTERVAL_MS=90_000` constant (exported but unused since the
+  periodic caller was dropped).
+- **9-precondition gate** (`periodicResyncShouldRun`): document visible +
+  `navigator.onLine` + `projectDir` set + tree stream OPEN (not CLOSED) + tree
+  stream healthy (not stale) + no wholesale snapshot decode in flight + no
+  `reconcileBusy` scope in flight + no global busy scope (`isGateActive`) + no
+  authoritative recovery within the previous interval. The tick runs ONLY when
+  every precondition holds.
+- **Reset-after-recovery**: `markAuthoritativeRecovery()` (stamped from
+  `snapshot.complete` AND every proceeding `resyncTree()`) reschedules the
+  periodic so the next tick is a full interval out — a focus/watchdog/periodic
+  recovery pushes the next tick back.
+- **Diffs-found vs no-op instrumentation**: the tick captures a pre-resync tree
+  fingerprint; `resolvePeriodicDiff` (at the `tree.snapshot` apply path, AFTER
+  `seedTreeStore` — NOT at `snapshot.complete`, because `tree.snapshot` is
+  gzip64-decoded async and the boundary can fire before the map is current)
+  compares it against the post-snapshot state, bumping a counter + log that
+  distinguishes recoveries that found drift from no-ops.
 
 ### Read inventory verbs (`GET /vh/sessions`, `GET /vh/sessions/closeout`)
 
@@ -198,6 +257,65 @@ GET /vh/sessions/closeout?dir=<dir>&id=a,b&id=c
 > programmatic consumers (shaped schema, server-side filtering). `/vh/archived`
 > is the SPA's **paginated archived-TREE browser** (one level at a time, child
 > counts, raw passthrough). Keep both.
+
+### Revisioned point endpoints (`GET /vh/session/:id/descendants`, `GET /vh/session/:id/subtree-todos`)
+
+Two **server-authoritative** point reads (P4 + P5) for derived session state the
+SPA previously re-derived from its resident tree map — incomplete whenever
+descendants weren't loaded (collapsed frontier, unexpanded roots, pruned
+subtrees). The server holds the full live topology, so these return the complete
+affected/descendant set. They are GET-on-demand (a deliberate user action: open
+the archive-confirm dialog, open the todo rollup), not live facets — carrying
+the full set on every stream tick isn't worth it for an occasionally-read
+aggregate. See `pkg/web/session_subtree_http.go`.
+
+Both share the `revisionedEnvelope[T]` wrapper: `epoch` + `revision` are
+captured under the SAME store RLock as the data, so the pair is a coherent bound
+(no TOCTOU between the walk and the revision read). `revision` is **advisory**
+— for stale-response suppression / cache validation / diagnostics; it is NOT
+required to equal the latest live tree revision by the time the client reads it.
+A client MAY suppress a response whose revision is older than a cursor it holds,
+but MUST NOT reject one merely because a newer revision exists. (`stampMeta`
+additionally stamps `X-VH-Epoch`/`X-VH-Seq` headers — the body carries the same
+values.) `?dir=` selects the project (same as every verb); GET-only → CSRF-exempt.
+
+**`GET /vh/session/:id/descendants?dir=`** (P4) — full affected/descendant set
+for the archive-impact preview:
+
+```
+GET /vh/session/:id/descendants?dir=<dir>
+→ { "epoch": "ep-…", "revision": 6,
+    "data": { "sessionId": "<id>",
+              "descendants": [ {"id":"<sid>","title":"<title>","parentID":"<pid>"}, … ] } }
+```
+
+- `descendants[i]` is `{id, title, parentID}` (`state.SessionSummary`); the first
+  element (if any) is the requested id itself (the affected root).
+- **Unknown id → `200` + empty `descendants:[]`** (NOT `404`): a point read
+  against live state; a not-yet-hydrated or just-pruned id is a normal
+  transient, not an error. The archive mutation (`POST /vh/archive`) is the
+  authority.
+
+**`GET /vh/session/:id/subtree-todos?dir=`** (P5) — subtree todo rollup for the
+"Tasks N active · M left" indicator:
+
+```
+GET /vh/session/:id/subtree-todos?dir=<dir>
+→ { "epoch": "ep-…", "revision": 6,
+    "data": { "sessionId": "<id>",
+              "items": [ {…raw OpenCode todo item…}, … ],
+              "totals": { "active": 1, "left": 3, "total": 4 } } }
+```
+
+- `items[i]` is the **raw OpenCode todo payload** (`json.RawMessage` passthrough —
+  `content`/`status`/`priority`/…, untouched by the server), rolled up in
+  subtree order across the session and every transitively-parented descendant.
+- `totals`: `active` = `status == "in_progress"`; `left` = items whose status is
+  neither `completed` nor `cancelled` (covers `pending`/`in_progress`/any
+  unknown status); `total` = all. Computed server-side by reading each item's
+  `status`.
+- **Unknown id → `200` + empty `items:[]` + zero totals** (same wire contract as
+  descendants).
 
 ## V2 — typed write verbs (worker `/vh/*`)
 
