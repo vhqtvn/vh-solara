@@ -36,6 +36,7 @@ import {
   maybeReconnect,
   tickHealth,
   resyncTree,
+  startPeriodicResync,
 } from "./sync/stream";
 import { setSelectedId, switchProject, openSession } from "./sync/actions";
 
@@ -76,7 +77,7 @@ export function startSync() {
   });
   window.addEventListener("online", maybeReconnect);
   window.addEventListener("offline", () => setState("status", "reconnecting"));
-  // Issue 2: on focus return (a backgrounded tab resumes — iOS suspends
+  // Issue 2 / Q6: on focus return (a backgrounded tab resumes — iOS suspends
   // background sockets → drift accumulates while the watchdog can't run),
   // request a fresh snapshot too. visibilitychange is preferred over window.focus
   // (more reliable on mobile, fires on tab switch back as well as window focus).
@@ -86,12 +87,21 @@ export function startSync() {
   // resyncTree so rapid focus changes can't reconnect repeatedly. Non-
   // destructive: connect(true) no longer pre-clears the map (atomic swap via
   // seedTreeStore), so this heals drift without an empty-frame flash and without
-  // collapsing manual expansions. The 90s PERIODIC resync was dropped — the
-  // server reconcile §6.2 + cursor-resume already heal steady-state drift, and
-  // the periodic fresh-snapshot was the source of the periodic flashes.
+  // collapsing manual expansions.
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") resyncTree();
   });
+  // Q6: a conditional, low-frequency (~10min + jitter) periodic resync as a
+  // bounded catch-all for surviving client drift on a CONTINUOUSLY-foregrounded
+  // tab (the on-focus trigger above can't see it — the tab never backgrounded,
+  // so iOS never suspended its socket, so no visibilitychange fires). NOT the
+  // old unconditional 90s cadence: it runs ONLY when every precondition in
+  // periodicResyncShouldRun() holds (visible + online + healthy/open stream +
+  // no snapshot/reconcile/busy in flight + no recovery in the previous
+  // interval), and resets after any successful authoritative recovery. The
+  // diffs-found-vs-no-op instrumentation keeps recurring emitter gaps visible.
+  // Full contract + preconditions live in web/src/sync/stream.ts (Q6 block).
+  startPeriodicResync();
 
   // Normalize the URL so the tab is self-describing (carries its resolved dir
   // even if it loaded from the localStorage fallback) — replace, don't push.

@@ -30,7 +30,7 @@ import {
   type TreeFetcher,
   type ChildrenResponse,
 } from "./treeOps";
-import { seedTreeStore, applyTreeOpStore, patchTreeAgent, expandedButUnloadedIds } from "./treeState";
+import { seedTreeStore, applyTreeOpStore, patchTreeAgent, expandedButUnloadedIds, treeMap } from "./treeState";
 import { applyPinsSnapshot, applyPinsUpdated, dropPinnedSession } from "../sidebar";
 
 // mergeLastAgents — the agent-label fix (S3). During a server restart the
@@ -1594,6 +1594,14 @@ export function connect(fresh = false) {
       }
       advanceCursor(seq);
       setState("status", "live");
+      // Q6: resolve the periodic diffs-found-vs-no-op instrumentation now that
+      // seedTreeStore has installed this gen's authoritative tree map. Resolved
+      // HERE (not at snapshot.complete) because tree.snapshot is gzip64-decoded
+      // async — treeMap is only current after this apply, which may run AFTER
+      // snapshot.complete lands; resolving at the boundary would systematically
+      // mis-count real drift as a no-op. No-op unless a periodic resync is
+      // awaiting this gen's result.
+      resolvePeriodicDiff(gen);
     };
     if (raw.encoding === "gzip64") {
       treeSnapshotDecoding = true;
@@ -1687,6 +1695,13 @@ export function connect(fresh = false) {
       projections: p.projections,
     });
     setState("authoritativeReady", true);
+    // Q6: a successful authoritative capture is a recovery boundary — stamp it
+    // so the periodic "no recovery in the previous interval" gate suppresses a
+    // redundant tick and the periodic timer is reset (a focus/watchdog/periodic
+    // recovery pushes the next periodic tick out by a full interval). The
+    // diffs-found-vs-no-op instrumentation is resolved at the tree.snapshot
+    // apply path (after seedTreeStore), NOT here — see that listener.
+    markAuthoritativeRecovery();
   });
   // Both frames are emitted on this Stream-1 (tree) connection. They carry NO
   // SSE `id:` line (both transient — reconnect catches up via pins.snapshot),
@@ -2550,25 +2565,43 @@ export function maybeReconnect() {
   else watchdogTick();
 }
 
-// === Issue 2: periodic / on-focus tree resync (drift self-heal) =============
+// === Issue 2 / Q6: on-focus + conditional periodic tree resync (drift self-heal)
+// ===
 //
 // The O1 collapsed-frontier optimization removed the frequent full
 // re-projections that used to CONTINUOUSLY self-heal client/daemon state, so a
-// long-lived stream now accumulates drift until the next restart/reconnect. A
-// bounded low-frequency tree reconnect (connect(true)) requests ONE fresh
-// snapshot so applySnapshot wholesale-replaces the detail layer and the tree.*
-// frames re-seed the flat map; the open session stays exempt. This is the
-// existing snapshot reconcile path — reused, not a new primitive.
+// long-lived stream now accumulates drift until the next restart/reconnect. Two
+// bounded recovery triggers request ONE fresh snapshot via connect(true) (the
+// existing full-rebuild reconcile path) so applySnapshot wholesale-replaces the
+// detail layer and the tree.* frames re-seed the flat map; the open session
+// stays exempt. This is the existing snapshot reconcile path — reused, not a
+// new primitive.
 //
-// This is NOT the promotion amplifier: it is ONE snapshot per interval, not a
-// per-activity full re-snapshot. Cost ≈ 88 KB compressed × (3600 / interval)
-// per hour; at the default 90s that is ~3.5 MB/hr through the at-rest tunnel.
+// Triggers:
+//   1. On-focus (visibilitychange → visible): immediate, heals drift a
+//      backgrounded tab accumulated while iOS suspended its socket. Throttled
+//      by TREE_RESYNC_MIN_GAP_MS so a focus burst can't reconnect repeatedly.
+//   2. Periodic (Q6): a LOW-frequency (~10min + jitter) catch-all for a
+//      CONTINUOUSLY-FOREGROUNDED tab whose live stream silently missed an event
+//      (an emitter gap the on-focus trigger never sees because the tab never
+//      backgrounded). This is NOT the old unconditional 90s cadence — it runs
+//      ONLY when every precondition in periodicResyncShouldRun() holds, and
+//      resets after any successful authoritative recovery. See the Q6 block
+//      below for the full contract.
 //
-// Tunable: TREE_RESYNC_INTERVAL_MS (the periodic cadence, wired in sync.ts) and
-// TREE_RESYNC_MIN_GAP_MS (the dedup window shared by the periodic + focus
-// triggers, so a focus burst right after a periodic tick can't reconnect twice).
-export const TREE_RESYNC_INTERVAL_MS = 90_000;
+// Cost ≈ 88 KB compressed per resync; at the ~10min cadence that is ≈0.5 MB/hr
+// through the at-rest tunnel (vs the old 90s cadence's ~3.5 MB/hr).
+//
+// Tunables:
+//   TREE_RESYNC_MIN_GAP_MS           — dedup window shared by the on-focus +
+//                                      periodic triggers (a periodic tick right
+//                                      after an on-focus can't reconnect twice).
+//   TREE_RESYNC_PERIODIC_INTERVAL_MS — base cadence for the periodic trigger.
+//   TREE_RESYNC_PERIODIC_JITTER_MS   — ±jitter applied at each (re)scheduling,
+//                                      so a fleet of tabs doesn't synchronized-burst.
 export const TREE_RESYNC_MIN_GAP_MS = 30_000;
+export const TREE_RESYNC_PERIODIC_INTERVAL_MS = 10 * 60 * 1000; // 10 min
+export const TREE_RESYNC_PERIODIC_JITTER_MS = 2 * 60 * 1000; // ±2 min
 let lastTreeResync = 0;
 export function resyncTree() {
   // No project selected → nothing to resync (connect(true) would no-op anyway).
@@ -2581,14 +2614,242 @@ export function resyncTree() {
   const now = Date.now();
   if (now - lastTreeResync < TREE_RESYNC_MIN_GAP_MS) return;
   lastTreeResync = now;
+  // A focus/periodic resync IS an equivalent recovery event — stamp the
+  // boundary so the periodic "no recovery in the previous interval" gate
+  // suppresses a redundant tick, and reschedule the periodic timer (push the
+  // next periodic tick out by a full interval).
+  markAuthoritativeRecovery();
   connect(true);
 }
-// Test-only: reset the resync throttle gate so the min-gap window is
-// deterministic across tests in one file (the module-level lastTreeResync would
-// otherwise carry over). Mirrors the isTreeSnapshotDecoding / getTreeSnapshotDecode
-// test-export pattern.
+
+// === Q6 — conditional periodic resync ========================================
+//
+// A bounded catch-all for surviving client drift on a CONTINUOUSLY-
+// foregrounded tab. The on-focus trigger above can't see this drift class —
+// the tab never backgrounded, so iOS never suspended its socket, so no
+// visibilitychange fires. The live tree stream should keep state correct on its
+// own, but a missed tree.op frame (an emitter gap) would otherwise accumulate
+// unbounded until a restart. This periodic trigger bounds that exposure at a
+// low frequency, gated so it ONLY runs when it is safe and likely to be the
+// highest-value action available.
+//
+// Preconditions (ALL must hold — see periodicResyncShouldRun):
+//   - document visible             (only a foregrounded tab accumulates this)
+//   - navigator.onLine             (don't resync over a dead network)
+//   - projectDir() set             (no cwd bridge)
+//   - tree stream OPEN + healthy   (not CLOSED, not stale — stale is the
+//                                   watchdog's job; resyncing a stale stream
+//                                   would only race the watchdog's reconnect)
+//   - no snapshot decode in flight  (don't stack a second wholesale replace)
+//   - no reconcileBusy in flight    (expectTreeSnap/expectSessionSnap clear)
+//   - no global busy scope active   (no archive/baseline install in flight)
+//   - no recovery in the previous   (a focus resync / watchdog reconnect /
+//     interval                       periodic resync / project switch just
+//                                   completed — see lastAuthoritativeRecovery)
+//
+// On any no-op (a gate fails OR the fresh snapshot matched the prior state),
+// the timer is rescheduled for the next interval; the cadence never rises
+// above ~1 resync / 10min regardless of how often the tick callback runs.
+//
+// Reset-after-recovery: markAuthoritativeRecovery() is called on every
+// successful authoritative boundary (snapshot.complete) AND every proceeding
+// resyncTree(), and reschedules the periodic timer so the next tick is a full
+// interval away. This keeps the periodic clearly secondary: any other recovery
+// path pushes it out.
+
+// Timestamp of the last successful authoritative recovery (ms). Stamped on
+// snapshot.complete (the Q5 convergence boundary) and on resyncTree() when it
+// proceeds. Drives both the "no recovery in the previous interval" precondition
+// and the reset-after-recovery rescheduling.
+let lastAuthoritativeRecovery = 0;
+
+// The periodic timer is a self-scheduling setTimeout (NOT setInterval) so each
+// tick recomputes the next delay with fresh jitter and so reset-after-recovery
+// can clear + reschedule cleanly. periodicStarted gates the whole feature: it
+// stays false until startPeriodicResync() arms it (called once from startSync),
+// so resyncTree()/snapshot.complete calls in unit tests that never start the
+// periodic feature have NO timer side effects.
+let periodicTimer: number | undefined;
+let periodicStarted = false;
+
+// markAuthoritativeRecovery — stamp the recovery boundary and (if the periodic
+// feature is armed) reschedule its timer. Called from snapshot.complete (every
+// successful authoritative capture) and from resyncTree() (every proceeding
+// focus/periodic resync).
+function markAuthoritativeRecovery(): void {
+  lastAuthoritativeRecovery = Date.now();
+  schedulePeriodicResync();
+}
+
+// schedulePeriodicResync — (re)arm the periodic timer with a fresh jittered
+// delay. No-op until startPeriodicResync() has armed the feature. Idempotent:
+// clears any pending timer first. Called on start, on every recovery boundary,
+// and after every periodic tick (fire or no-op).
+function schedulePeriodicResync(): void {
+  if (!periodicStarted) return;
+  if (periodicTimer !== undefined) window.clearTimeout(periodicTimer);
+  const jitter = (Math.random() * 2 - 1) * TREE_RESYNC_PERIODIC_JITTER_MS;
+  const delay = Math.max(
+    TREE_RESYNC_MIN_GAP_MS,
+    TREE_RESYNC_PERIODIC_INTERVAL_MS + jitter,
+  );
+  periodicTimer = window.setTimeout(periodicResyncTick, delay);
+}
+
+// periodicResyncShouldRun — the precondition predicate. Returns true ONLY when
+// a periodic resync is safe and likely useful. Pure read of module state +
+// DOM/network conditions; exported for unit testing each gate independently.
+export function periodicResyncShouldRun(): boolean {
+  // Only a foregrounded tab accumulates the "continuously open but drifted"
+  // state this catches; a backgrounded tab is healed on focus return.
+  if (typeof document !== "undefined" && document.visibilityState !== "visible") return false;
+  // Don't resync over a dead network (the connect would just fail and the
+  // watchdog / online listener would take over).
+  if (typeof navigator !== "undefined" && navigator.onLine === false) return false;
+  // No project selected → no tree stream to resync.
+  if (!projectDir()) return false;
+  // Tree stream must be OPEN (not CLOSED — the watchdog owns reconnecting a
+  // closed stream; a resync here would only race it).
+  if (!es || es.readyState === EventSource.CLOSED) return false;
+  // And HEALTHY (not stale — a stale-but-open stream is the watchdog's signal
+  // to force a reconnect, not the periodic's).
+  if (!treeLastSeen || Date.now() - treeLastSeen > STALE_MS) return false;
+  // No wholesale snapshot decode in flight — stacking a second connect(true)
+  // would bump treeGen and invalidate the in-flight decode's apply.
+  if (treeSnapshotDecoding) return false;
+  // No reconcileBusy scope in flight — it already requested fresh snapshots.
+  if (expectTreeSnap || expectSessionSnap) return false;
+  // No global busy scope (archive/unarchive/baseline install) in flight — the
+  // gate suppresses store mutation and its release triggers its own reconcile.
+  if (isGateActive()) return false;
+  // No recovery in the previous interval — a focus resync / watchdog reconnect
+  // / periodic resync / project switch just completed. Bounds the cadence and
+  // keeps the periodic clearly secondary to every other recovery path.
+  if (Date.now() - lastAuthoritativeRecovery < TREE_RESYNC_PERIODIC_INTERVAL_MS) return false;
+  return true;
+}
+
+// Diffs-found vs no-op instrumentation. The periodic trigger's whole purpose is
+// to catch emitter gaps the live stream missed; if it NEVER finds a diff, the
+// live stream is healthy and the periodic is dead weight (signal to reconsider
+// the cadence). If it OFTEN finds diffs, the emitter has a gap worth chasing.
+// At minimum we distinguish the two outcomes in a log + counter so recurring
+// emitter gaps stay visible (Q6 "MEASURE before enabling by default").
+let periodicDiffPending: { beforeFp: string; gen: number } | null = null;
+let periodicResyncNoOps = 0;
+let periodicResyncDiffsFound = 0;
+
+// treeFingerprint — a stable, order-independent digest of the resident tree
+// map's drift-relevant state (id set + activity + facets). Used to compare the
+// pre-resync state against the post-resync authoritative snapshot so a no-op
+// resync (live stream was already correct) is distinguishable from one that
+// found an emitter gap. Deliberately excludes display-only fields (title,
+// updatedMs, loaded, agent, verb) that a fresh snapshot re-stamps without
+// indicating a missed EVENT.
+function treeFingerprint(): string {
+  const m = treeMap();
+  if (m.size === 0) return "";
+  const parts: string[] = [];
+  for (const [, n] of m) {
+    const f = n.flags;
+    parts.push(
+      n.id +
+        "|" +
+        n.activity +
+        "|" +
+        (f.subtreeBusy ? "B" : "b") +
+        (f.subtreeNeedsInput ? "I" : "i") +
+        (f.pendingInput ? "P" : "p") +
+        (f.permission ? "A" : "a") +
+        (f.archived ? "R" : "r"),
+    );
+  }
+  parts.sort();
+  return parts.join("\n");
+}
+
+// periodicResyncTick — the timer callback. Evaluates the preconditions and, if
+// they all hold, requests ONE fresh snapshot (via resyncTree → connect(true))
+// after capturing a before-fingerprint for the diffs-found instrumentation.
+// Always reschedules first so the cadence is bounded regardless of outcome.
+function periodicResyncTick(): void {
+  // Reschedule first so a throw or a failed gate can't drop the timer.
+  schedulePeriodicResync();
+  if (!periodicResyncShouldRun()) return;
+  // Capture the pre-resync fingerprint (old state still in place), then call
+  // resyncTree. connect(true) inside resyncTree bumps treeGen; read it AFTER so
+  // periodicDiffPending.gen is the NEW connection's generation (the one whose
+  // snapshot.complete will resolve the diff check).
+  const beforeFp = treeFingerprint();
+  const genBefore = treeGen;
+  resyncTree();
+  // Only attribute a diff check if resyncTree actually opened a new connection
+  // (bumped treeGen). If it bailed (e.g. throttle — shouldn't happen post-gate,
+  // but defensive), no snapshot is coming from this tick.
+  if (treeGen !== genBefore) {
+    periodicDiffPending = { beforeFp, gen: treeGen };
+  }
+}
+
+// startPeriodicResync — arm the periodic timer. Called once from startSync().
+// Idempotent: a second call while already armed is a no-op.
+export function startPeriodicResync(): void {
+  if (periodicStarted) return;
+  periodicStarted = true;
+  schedulePeriodicResync();
+}
+
+// resolvePeriodicDiff — called from the snapshot.complete listener (the Q5
+// convergence boundary) once both projections of a capture have landed. If a
+// periodic resync is awaiting its result, compare the post-snapshot
+// fingerprint against the captured before-fingerprint and record the outcome.
+// Clears the pending slot regardless (a slot whose requested connection was
+// superseded by a different-gen recovery is dropped without counting).
+function resolvePeriodicDiff(connGen: number): void {
+  if (!periodicDiffPending) return;
+  // Only attribute the diff to a periodic resync whose requested connection is
+  // the one whose snapshot just completed. A focus resync that superseded the
+  // periodic's connection (different gen) drops the slot without counting.
+  if (periodicDiffPending.gen !== connGen) {
+    periodicDiffPending = null;
+    return;
+  }
+  const afterFp = treeFingerprint();
+  if (afterFp === periodicDiffPending.beforeFp) {
+    periodicResyncNoOps++;
+    log.debug("sync", "periodic resync no-op (no drift found)");
+  } else {
+    periodicResyncDiffsFound++;
+    log.info("sync", "periodic resync found drift (emitter gap caught)");
+  }
+  periodicDiffPending = null;
+}
+
+// Test-only accessors (mirror the _resetResyncGateForTest pattern). Prefixed
+// _ and suffixed ForTest so a grep keeps them visually distinct from runtime API.
 export function _resetResyncGateForTest(): void {
   lastTreeResync = 0;
+}
+export function _resetPeriodicStateForTest(): void {
+  if (periodicTimer !== undefined) window.clearTimeout(periodicTimer);
+  periodicTimer = undefined;
+  periodicStarted = false;
+  lastAuthoritativeRecovery = 0;
+  periodicDiffPending = null;
+  periodicResyncNoOps = 0;
+  periodicResyncDiffsFound = 0;
+}
+export function _markTreeSeenForTest(ms?: number): void {
+  treeLastSeen = ms ?? Date.now();
+}
+export function _setLastAuthoritativeRecoveryForTest(ms: number): void {
+  lastAuthoritativeRecovery = ms;
+}
+export function _getPeriodicResyncStatsForTest(): {
+  diffsFound: number;
+  noOps: number;
+} {
+  return { diffsFound: periodicResyncDiffsFound, noOps: periodicResyncNoOps };
 }
 
 // === tree=2 expand (§8) =====================================================
