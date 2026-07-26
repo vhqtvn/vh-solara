@@ -771,8 +771,10 @@ type messageEntry struct {
 	// set by a live event (upsertMessageLocked) during an in-flight cold
 	// full-history GET. On a cold-load reconcile the live body is NEWER than
 	// the stale fetched body, so reconcile must NOT overwrite it. Not checked
-	// on a warm resync (coldLoad==false), where the fetched list IS
-	// authoritative. Cleared after each cold reconcile.
+	// on a warm resync (coldLoad==false), where the fetched list is
+	// authoritative ONLY for PRESENT message/part bodies (overwrite/merge) —
+	// absence never deletes (Option A; see reconcileMessagesLocked). Cleared
+	// after each cold reconcile.
 	liveTouchedBody bool
 	// liveTouchedParts tracks per-part live updates (upsertPartLocked /
 	// appendPartDeltaLocked) during an in-flight cold full-history GET. A
@@ -3842,10 +3844,13 @@ func (s *Store) Replay(cursor uint64) (events []ClientEvent, head uint64, ok boo
 }
 
 // Hydrate replaces the view from a full fetch (sessions + messages per session),
-// emitting upsert/delete client events only for ids that are new, changed, or
-// gone — so connected clients reconcile incrementally without re-receiving
-// unchanged history. Used on the daemon's own (re)connect to OpenCode, whose
-// event stream has no replay. Byte comparison decides "changed".
+// emitting upsert client events for new/changed messages+parts and reconciling
+// session-level presence (a session absent from the fetch is deleted). Per Option
+// A, message/part removal is NOT inferred from fetch absence — only the explicit
+// message.removed / message.part.removed / session.deleted handlers delete
+// messages/parts (see reconcileMessagesLocked). Used on the daemon's own
+// (re)connect to OpenCode, whose event stream has no replay. Byte comparison
+// decides "changed".
 //
 // The session reconcile + message reconcile run under s.mu, then the lock is
 // released BEFORE the cold-batch packaging loop: marshal+gzip+base64 is too
@@ -3940,8 +3945,10 @@ func (s *Store) Hydrate(sessions []json.RawMessage, messages map[string][]Messag
 }
 
 // reconcileMessagesLocked diffs one session's full message list into the store,
-// emitting upsert/delete events for changes, and marks the session's messages
-// as loaded. Caller must hold s.mu. It returns coldLoad=true when this was the
+// emitting upsert events for new/changed messages and parts, and marks the
+// session's messages as loaded. Absence never deletes (Option A); messages/parts
+// are removed only by the explicit message.removed / message.part.removed /
+// session.deleted handlers. Caller must hold s.mu. It returns coldLoad=true when this was the
 // session's first load (!s.msgLoaded[sid] at entry); in that case the caller is
 // responsible for packaging the wholesale KindMessagesBatch OUTSIDE s.mu via
 // publishColdBatch (marshal+gzip+base64 is too expensive to hold the global
