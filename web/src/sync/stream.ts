@@ -3212,7 +3212,8 @@ function periodicResyncTick(): void {
   // Capture the pre-resync fingerprint (old state still in place), then call
   // resyncTree. connect(true) inside resyncTree bumps treeGen; read it AFTER so
   // periodicDiffPending.gen is the NEW connection's generation (the one whose
-  // snapshot.complete will resolve the diff check).
+  // tree.snapshot apply path — after seedTreeStore — will resolve the diff check
+  // via resolvePeriodicDiff; see its docstring).
   const beforeFp = treeFingerprint();
   const genBefore = treeGen;
   resyncTree();
