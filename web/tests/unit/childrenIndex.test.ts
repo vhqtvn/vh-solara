@@ -70,7 +70,6 @@ beforeEach(() => {
   setState("activity", reconcile({}));
   setState("permissions", reconcile({}));
   setState("questions", reconcile({}));
-  setState("todos", reconcile({}));
   resetTreeStore();
 });
 

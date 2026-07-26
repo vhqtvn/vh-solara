@@ -45,7 +45,6 @@ beforeEach(() => {
   setState("activity", reconcile({}));
   setState("permissions", reconcile({}));
   setState("questions", reconcile({}));
-  setState("todos", reconcile({}));
   setState("lastAgents", reconcile({}));
   setState("currentVerbs", reconcile({}));
 });

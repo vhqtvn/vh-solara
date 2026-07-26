@@ -5,7 +5,7 @@
 // without a cycle. State is reconciled by id, never nuked.
 import { createStore } from "solid-js/store";
 import { createSignal } from "solid-js";
-import type { ConnStatus, Permission, ProjectConstants, Question, Session, SessionMessages, TodoItem, VerbFacet } from "../types";
+import type { ConnStatus, Permission, ProjectConstants, Question, Session, SessionMessages, VerbFacet } from "../types";
 import { loadVersioned, saveVersioned } from "../lib/store";
 
 const LS_CURSOR = "vh.cursor.v1";
@@ -170,9 +170,6 @@ export interface SyncState {
   currentVerbs: Record<string, VerbFacet>;
   permissions: Record<string, Record<string, Permission>>;
   questions: Record<string, Record<string, Question>>;
-  // Per-session agent todo list (OpenCode TodoWrite), kept for all sessions so
-  // the "Tasks N active · M left" indicator works without opening them.
-  todos: Record<string, TodoItem[]>;
   // Root sessions that finished and haven't been acknowledged (server-tracked,
   // cross-device) — drives the "finished/unread" indicator in the tree.
   unread: Record<string, boolean>;
@@ -258,7 +255,6 @@ export const [state, setState] = createStore<SyncState>({
   currentVerbs: {},
   permissions: {},
   questions: {},
-  todos: {},
   unread: {},
   status: "connecting",
   cursor: loadCursor(initialDir),

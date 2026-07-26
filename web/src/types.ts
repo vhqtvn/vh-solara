@@ -83,8 +83,10 @@ export interface Snapshot {
   questions?: Record<string, Question[]>;
   unread?: string[];
   // Per-session todos. The daemon stores the raw `todo.updated` properties, so
-  // each value is the ENVELOPE `{ sessionID, todos: [...] }`, not the bare array
-  // (normalized on the client — see normalizeTodos in sync.ts).
+  // each value is the ENVELOPE `{ sessionID, todos: [...] }`, not the bare array.
+  // The FE no longer consumes this stream-side todos map (P5 moved the open
+  // session's todos to GET /vh/session/:id/subtree-todos polling); the field is
+  // retained on the wire shape because the server still emits it.
   todos?: Record<string, unknown>;
   // Per-session agent name (of the most recent assistant turn), seeded by the
   // daemon from a lightweight message tail so the tree can render per-agent

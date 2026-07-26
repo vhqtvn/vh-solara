@@ -1,8 +1,8 @@
 // Read-only derived views over the sync store: the parent/subtree walks, the
-// working-state rollup, todo aggregation, and the per-session model selectors.
+// working-state rollup, and the per-session model selectors.
 // All pure reads of `state` (no mutation, no I/O), so they sit just above the
 // store in the dependency graph and everything else can read through them.
-import type { Part, SessionMessages, TodoItem } from "../types";
+import type { Part, SessionMessages } from "../types";
 import { toolSubject, toolVerb } from "../lib/toolLabel";
 import { state } from "./store";
 import { treeNode } from "./treeState";
@@ -245,14 +245,5 @@ function turnStartMs(sm: SessionMessages | undefined): number {
   if (!sm?.order.length) return 0;
   const last = sm.byId[sm.order[sm.order.length - 1]];
   return (last?.info?.time?.created as number | undefined) || 0;
-}
-
-// normalizeTodos extracts the todo array from either the bare array or the
-// daemon's `{ sessionID, todos }` envelope (snapshot stores the raw properties).
-// Sole remaining consumer: stream.ts (snapshot apply + todo event handler).
-export function normalizeTodos(v: any): TodoItem[] {
-  if (Array.isArray(v)) return v as TodoItem[];
-  if (v && Array.isArray(v.todos)) return v.todos as TodoItem[];
-  return [];
 }
 

@@ -20,7 +20,6 @@ import { handleNotice } from "../alerts";
 import { checkVersionNow } from "../pwa";
 import { log } from "../lib/log";
 import { state, setState, projectDir, selectedId, persist } from "./store";
-import { normalizeTodos } from "./selectors";
 import { notifyFromMessage, maybeNotifyRootDone, maybeClearWaiting } from "./orchestration";
 import { isGateActive, currentGateEpoch, markBusyDirty, setReconcileFn } from "../busy";
 import {
@@ -545,8 +544,6 @@ export function applySnapshot(snap: Snapshot) {
         s.questions[sid] = {};
         for (const q of qs) s.questions[sid][q.id] = q;
       }
-      s.todos = {};
-      for (const [sid, v] of Object.entries(snap.todos || {})) s.todos[sid] = normalizeTodos(v);
       s.unread = {};
       for (const id of snap.unread || []) s.unread[id] = true;
       // S3 epoch transition: latch so the connection-health toast can surface
@@ -805,17 +802,12 @@ export function applyMessageEvent(kind: string, seq: number, payload: any, track
         case "unread.clear":
           if (payload.sessionID) delete s.unread[payload.sessionID];
           break;
-        case "todo":
-          // OpenCode TodoWrite snapshot for a session (full list each time). The
-          // event payload is the `{ sessionID, todos }` envelope.
-          if (payload.sessionID) s.todos[payload.sessionID] = normalizeTodos(payload);
-          break;
         case "activity.verb":
           // Tier-A rich-activity facet for an UNOPENED session: the RAW tool
           // primitive (tool + trimmed state) so the chat row can format
           // "Reading parser.go" via toolVerb/toolSubject without loading Tier-B
           // messages. Empty tool clears it (idle/error/turn-complete). Mirrors
-          // the activity/todo live-patch patterns; Stream-1 always-streams it
+          // the activity live-patch pattern; Stream-1 always-streams it
           // (sendable passes any kind not prefixed message./part.).
           if (payload.sessionID) {
             if (payload.tool) s.currentVerbs[payload.sessionID] = { tool: payload.tool, state: payload.state };
@@ -1265,7 +1257,6 @@ export const TREE_STREAM_KINDS = [
   "question.delete",
   "unread.set",
   "unread.clear",
-  "todo",
 ] as const;
 
 // --- Global busy-scope gate (archive/unarchive) -----------------------------
@@ -1518,7 +1509,7 @@ export function connect(fresh = false) {
   // Coexistence is double-apply-safe because the two projections write
   // DISJOINT state: the tree.* listeners populate treeMap/treeState (the
   // structural tree), while the legacy detail listeners populate the detail
-  // maps (state.sessions / state.permissions / state.questions / state.todos /
+  // maps (state.sessions / state.permissions / state.questions /
   // etc.). As of Step A.5 GAP 3 the server emits BOTH projections in tree=2
   // mode — tree.snapshot + tree.op for STRUCTURE, and a legacy detail snapshot
   // + legacy detail events (snapshot, permission.*, question.*, todo, status,
