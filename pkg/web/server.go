@@ -1555,20 +1555,31 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			// completion signal). baseline is the captured seq (tree.Seq ==
 			// detail.Seq), dropping the third store.Head() lock.
 			detailSnap, treeSnap := store.SnapshotWithTree(treeEmitter, filter, "reconnect")
+			treeOK := false
 			if rb, err := json.Marshal(treeSnap); err == nil {
 				wire := maybeCompressSnapshot(rb, wantsCompress(r))
 				writeRaw(w, treeSnap.Seq, "tree.snapshot", wire)
 				sw.RecordSnapshotPath(len(wire))
+				treeOK = true
 			} else {
 				vhlog.Warn("tree=2 resume tree.snapshot: marshal failed", "err", err)
 			}
 			// Legacy detail snapshot, shipped RAW (not gzip64) so it does NOT
 			// race tree.snapshot's async gzip64 decode on the client's shared
 			// treeSnapshotDecoding flag (same rationale as fresh-connect).
+			detailOK := false
 			if db, err := json.Marshal(detailSnap); err == nil {
 				writeRaw(w, detailSnap.Seq, "snapshot", db)
+				detailOK = true
 			} else {
 				vhlog.Warn("tree=2 resume detail snapshot: marshal failed", "err", err)
+			}
+			// Q5 completion signal: emitted ONLY when BOTH projections were
+			// written — the contract is "both projections of this capture are
+			// on the wire." A marshal failure skips a projection, so the
+			// boundary must NOT fire (no false atomicity claim).
+			if treeOK && detailOK {
+				writeSnapshotComplete(w, treeSnap.Epoch, treeSnap.Seq)
 			}
 			baseline = treeSnap.Seq
 		}
@@ -1606,10 +1617,12 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			// is the captured seq (tree.Seq == detail.Seq), dropping the third
 			// store.Head() lock.
 			detailSnap, treeSnap := store.SnapshotWithTree(treeEmitter, filter, cause)
+			treeOK := false
 			if rb, err := json.Marshal(treeSnap); err == nil {
 				wire := maybeCompressSnapshot(rb, wantsCompress(r))
 				writeRaw(w, treeSnap.Seq, "tree.snapshot", wire)
 				sw.RecordSnapshotPath(len(wire))
+				treeOK = true
 			} else {
 				vhlog.Warn("tree snapshot: marshal failed", "err", err)
 			}
@@ -1625,10 +1638,19 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			// snapshot listener runs synchronously while tree.snapshot's async
 			// decode proceeds in parallel; both populate different stores
 			// (state.sessions vs treeMap) so there is no clobber.
+			detailOK := false
 			if db, err := json.Marshal(detailSnap); err == nil {
 				writeRaw(w, detailSnap.Seq, "snapshot", db)
+				detailOK = true
 			} else {
 				vhlog.Warn("tree=2 detail snapshot: marshal failed", "err", err)
+			}
+			// Q5 completion signal: emitted ONLY when BOTH projections were
+			// written — the contract is "both projections of this capture are
+			// on the wire." A marshal failure skips a projection, so the
+			// boundary must NOT fire (no false atomicity claim).
+			if treeOK && detailOK {
+				writeSnapshotComplete(w, treeSnap.Epoch, treeSnap.Seq)
 			}
 			baseline = treeSnap.Seq
 		} else {
@@ -1773,6 +1795,40 @@ func writeRaw(w io.Writer, seq uint64, event string, data []byte) {
 // and ignore the absence of an id (existing notice/ping frames already omit it).
 func writeRawNoID(w io.Writer, event string, data []byte) {
 	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, data)
+}
+
+// snapshotComplete is the Q5 truthful completion boundary. Emitted on the wire
+// ONLY after BOTH projections of a single SnapshotWithTree capture have been
+// written: tree.snapshot (structure, gzip64/async) and the legacy detail
+// snapshot (raw/sync). Because SnapshotWithTree derived both under ONE store
+// RLock, both carry the SAME {epoch, seq}; this event truthfully asserts that
+// cross-projection atomicity. The FE stages tree+detail by {epoch, revision}
+// and marks authoritativeReady on receipt — the verifiable convergence
+// boundary that resyncTree/reconcile needed. Before the single-capture
+// consolidation (commit B), stamping this label would have been false
+// confidence (two independent RLocks could diverge across a writer).
+type snapshotComplete struct {
+	Epoch       string   `json:"epoch"`
+	Revision    uint64   `json:"revision"`
+	Projections []string `json:"projections"`
+}
+
+// writeSnapshotComplete marshals + writes the snapshot.complete SSE frame,
+// stamped with the capture's {epoch, seq} (revision == seq). The SSE id is the
+// capture seq (same as both projections' ids) so Last-Event-ID stays in the
+// store-seq space. Called once per SnapshotWithTree capture site, AFTER both
+// projection writeRaw calls.
+func writeSnapshotComplete(w io.Writer, epoch string, seq uint64) {
+	cb, err := json.Marshal(snapshotComplete{
+		Epoch:       epoch,
+		Revision:    seq,
+		Projections: []string{"tree", "detail"},
+	})
+	if err != nil {
+		vhlog.Warn("snapshot.complete: marshal failed", "err", err)
+		return
+	}
+	writeRaw(w, seq, "snapshot.complete", cb)
 }
 
 // snapshotCompressThreshold is the minimum marshaled-snapshot size above which
