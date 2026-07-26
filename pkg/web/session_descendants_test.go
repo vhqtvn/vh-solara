@@ -22,6 +22,7 @@ import (
 	"testing"
 
 	"github.com/vhqtvn/vh-solara/pkg/aggregator"
+	"github.com/vhqtvn/vh-solara/pkg/state"
 )
 
 // setupDescendantsTest wires fakeOpenCode + aggregator + web server with the
@@ -65,6 +66,7 @@ func getDescendants(t *testing.T, webURL, sid string) (status int, epochHdr, seq
 			Title    string `json:"title"`
 			ParentID string `json:"parentID"`
 		} `json:"descendants"`
+		Fingerprint string `json:"fingerprint"`
 	} `json:"data"`
 }) {
 	t.Helper()
@@ -139,6 +141,17 @@ func TestDescendantsSubtree(t *testing.T) {
 	// sessionId echoes the request id.
 	if env.Data.SessionID != "root" {
 		t.Errorf("data.sessionId = %q, want root", env.Data.SessionID)
+	}
+	// C5: data.fingerprint is the additive subtree-id-set fingerprint the FE
+	// echoes back on POST /vh/archive. It is always present and must equal
+	// state.FingerprintIDs of the returned descendant id-set (preview↔commit
+	// use the identical pure function).
+	if env.Data.Fingerprint == "" {
+		t.Errorf("data.fingerprint missing; C5 requires it on every descendants response")
+	}
+	ids := []string{"root", "child", "grand"}
+	if want := state.FingerprintIDs(ids); env.Data.Fingerprint != want {
+		t.Errorf("data.fingerprint %q != state.FingerprintIDs(%v) %q", env.Data.Fingerprint, ids, want)
 	}
 	// Q3 envelope: epoch non-empty, revision coherent with the Store head.
 	if env.Epoch == "" {

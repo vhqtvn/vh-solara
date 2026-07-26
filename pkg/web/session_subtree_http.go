@@ -69,7 +69,7 @@ func (s *Server) handleSessionDescendants(w http.ResponseWriter, r *http.Request
 		return
 	}
 	st := s.aggFor(reqDir(r)).Store()
-	descs, epoch, seq := st.DescendantSummaries(sid)
+	descs, fingerprint, epoch, seq := st.DescendantSummaries(sid)
 	if descs == nil {
 		descs = []state.SessionSummary{}
 	}
@@ -79,14 +79,21 @@ func (s *Server) handleSessionDescendants(w http.ResponseWriter, r *http.Request
 		Data: descendantsData{
 			SessionID:   sid,
 			Descendants: descs,
+			Fingerprint: fingerprint,
 		},
 	})
 }
 
 // descendantsData is the `data` payload of GET /vh/session/:id/descendants.
+// Fingerprint is the stateless subtree-id-set fingerprint (C5): the FE echoes
+// it back as expectedFingerprint on POST /vh/archive, and the commit handler
+// 409-rejects when the live affected set's membership changed between preview
+// and commit. Always populated (even for an unknown id — see
+// Store.DescendantSummaries).
 type descendantsData struct {
 	SessionID   string                 `json:"sessionId"`
 	Descendants []state.SessionSummary `json:"descendants"`
+	Fingerprint string                 `json:"fingerprint"`
 }
 
 // GET /vh/session/{sessionId}/subtree-todos — server-authoritative subtree todo

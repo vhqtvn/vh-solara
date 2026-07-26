@@ -4,7 +4,7 @@ import { suggestTitle } from "../sessionTitle";
 import { isPinned, togglePin, movePinnedByOffset, reconciledPinnedOrder, pinsPending, pinsLastError, clearPinsError } from "../sidebar";
 import { exportSessionMarkdown } from "../export";
 import { pushNotification } from "../notify";
-import { archiveSession, fetchDescendants, type SessionSummary } from "../archive";
+import { archiveSession, fetchDescendants, ArchiveDriftError, type SessionSummary } from "../archive";
 import { withGlobalBusy } from "../busy";
 import {
   archiveTarget,
@@ -117,14 +117,23 @@ export default function SessionContextMenu() {
   // envelope; we don't cross-open cache (the dialog is short-lived and the
   // server walk is a cheap local store read).
   const [relatedItems, setRelatedItems] = createSignal<SessionSummary[]>([]);
+  // C5 drift fence: the subtree-id-set fingerprint captured alongside the
+  // descendant list. Echoed back as expectedFingerprint on POST /vh/archive so
+  // the server can 409-reject when the affected set's membership changed
+  // between preview and commit. "" = no fence (preview not yet resolved, or
+  // fetch failed) — archiveSession omits the fingerprint in that case and the
+  // server applies the legacy no-precondition behavior.
+  const [relatedFingerprint, setRelatedFingerprint] = createSignal<string>("");
   let relatedReqId = 0;
   createEffect(() => {
     const t = archiveTarget();
     if (!t) {
       setRelatedItems([]);
+      setRelatedFingerprint("");
       return;
     }
     setRelatedItems([{ id: t.id, title: t.title }]);
+    setRelatedFingerprint(""); // cleared until the fetch resolves
     const myReq = ++relatedReqId;
     void (async () => {
       try {
@@ -137,8 +146,15 @@ export default function SessionContextMenu() {
         // in the affected set, and the archive POST tolerates an unknown id.
         const list = resp.data?.descendants || [];
         if (list.length) setRelatedItems(list);
+        // The fingerprint is always captured (even when the list is empty and
+        // we keep the seed): the server returns FingerprintIDs([id]) for an
+        // unknown id, matching the archive commit's empty-set fallback, so
+        // preview↔commit stay coherent on the orphan/ghost path.
+        setRelatedFingerprint(resp.data?.fingerprint ?? "");
       } catch {
         // Keep the optimistic single-item list on transport/server failure.
+        // Fingerprint stays "" (no fence) — fail-open, matching the existing
+        // behavior where a failed preview does not block the archive.
       }
     })();
   });
@@ -300,8 +316,40 @@ export default function SessionContextMenu() {
     const t = archiveTarget();
     if (!t) return;
     await withGlobalBusy(async () => {
-      await archiveSession(t.id);
-      closeArchiveConfirm();
+      try {
+        await archiveSession(t.id, relatedFingerprint());
+        closeArchiveConfirm();
+      } catch (e) {
+        if (e instanceof ArchiveDriftError) {
+          // C5 drift: the affected set changed between preview and commit. The
+          // server archived NOTHING (409). Re-fetch descendants and re-show
+          // this dialog against the CURRENT set so the operator can re-confirm.
+          // NO auto-retry — the operator consented to the OLD set, not the new
+          // one, and auto-retrying would defeat the fence. Bump relatedReqId
+          // so a concurrent close+reopen (which fires the effect) cannot land
+          // this stale re-fetch's items over a fresher open.
+          const myReq = ++relatedReqId;
+          try {
+            const resp = await fetchDescendants(t.id);
+            if (myReq !== relatedReqId) return; // superseded by a reopen
+            const list = resp.data?.descendants || [];
+            if (list.length) setRelatedItems(list);
+            setRelatedFingerprint(resp.data?.fingerprint ?? "");
+            pushNotification({
+              kind: "info",
+              sessionID: t.id,
+              title: "Affected sessions changed — review and confirm again",
+            });
+          } catch {
+            // Re-fetch failed: leave the dialog on the (now-stale) list. The
+            // operator can close or retry. The consumed fingerprint is already
+            // stale (the 409 fired), so a retry will fence again only if the
+            // set is STILL different — acceptable fail-safe.
+          }
+          return; // do NOT closeArchiveConfirm — re-show for re-consent
+        }
+        throw e; // non-drift errors propagate to withGlobalBusy's caller
+      }
     });
   }
 

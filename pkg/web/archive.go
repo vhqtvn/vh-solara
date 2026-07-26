@@ -12,6 +12,7 @@ import (
 
 	"github.com/vhqtvn/vh-solara/pkg/aggregator"
 	"github.com/vhqtvn/vh-solara/pkg/opencode"
+	"github.com/vhqtvn/vh-solara/pkg/state"
 )
 
 // defaultReassertDelay is the wait before the post-archive re-assert goroutine
@@ -39,7 +40,8 @@ func (s *Server) handleArchive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		SessionID string `json:"sessionID"`
+		SessionID           string `json:"sessionID"`
+		ExpectedFingerprint string `json:"expectedFingerprint,omitempty"`
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 8<<10) // a session id is tiny
 	if json.NewDecoder(r.Body).Decode(&body) != nil || body.SessionID == "" {
@@ -107,6 +109,46 @@ func (s *Server) handleArchive(w http.ResponseWriter, r *http.Request) {
 		// it archived and the client receives it in the affected list to prune.
 		if len(affected) == 0 {
 			affected = []string{body.SessionID}
+		}
+		// C5 — archive-preview drift fence. If the caller carried a preview
+		// fingerprint (the FE's SessionContextMenu threads the one returned by
+		// GET /vh/session/:id/descendants), reject when the live affected set's
+		// MEMBERSHIP changed between preview and commit: a spawn, a delete, or
+		// a reparent in/out of the subtree. 409 Conflict (the established
+		// CAS-failure status in this repo — see verbs.go If-Idle-Seq) and NO
+		// archive is performed (we return before the SetArchived loop). The FE
+		// re-fetches descendants and re-shows the confirmation dialog against
+		// the current set; it does NOT auto-retry (the operator must re-consent
+		// to the new set — that is the entire point of the fence).
+		//
+		// The fingerprint is a pure function of the id-set, so an internal
+		// reparent (an id stays inside the subtree) does NOT reject — only
+		// membership changes do. Absent expectedFingerprint (legacy /
+		// unattended programmatic archives) → current behavior, no fence
+		// (backward-compat, matches the If-Idle-Seq opt-in precedent).
+		//
+		// This is a point-in-time fence over the T0→T1 preview→commit window
+		// (C5's scope). A mutation landing AFTER this check but before the
+		// archive loop completes (below) is a pre-existing race out of C5's
+		// scope; the fingerprint is coherent with the `affected` slice the
+		// loop will archive (both come from the same Descendants return).
+		if body.ExpectedFingerprint != "" {
+			cur := state.FingerprintIDs(affected)
+			if cur != body.ExpectedFingerprint {
+				writeJSON(w, http.StatusConflict, jsonBytes(map[string]any{
+					"ok":    false,
+					"error": "descendants_changed",
+					// The current live set + its fingerprint, so the FE CAN
+					// diff client-side without a second round-trip — though it
+					// re-fetches descendants anyway for the rich title list
+					// (the GET is authoritative, not the 409 body).
+					"current": map[string]any{
+						"fingerprint": cur,
+						"affected":    affected,
+					},
+				}))
+				return
+			}
 		}
 		ts := time.Now().UnixMilli()
 		for _, id := range affected {

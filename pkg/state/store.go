@@ -9,9 +9,11 @@ import (
 	"bytes"
 	"compress/gzip"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -2050,6 +2052,28 @@ type SessionSummary struct {
 	ParentID string `json:"parentID"`
 }
 
+// FingerprintIDs returns a stable, collision-resistant fingerprint of a
+// descendant id-set: hex(sha256("\n".join(sorted(ids)))). Pure; no store
+// access, no mutation of the input slice. Used by the archive-preview drift
+// fence (C5): DescendantSummaries computes it under-lock from the ids slice
+// descendantsLocked already built (preview side), and pkg/web.handleArchive
+// recomputes it from the live affected set (commit side) and 409-rejects on
+// mismatch.
+//
+// Idempotent for a given set; changes iff the set's MEMBERSHIP changes:
+// order-independent (sorted before hashing), and title / parentID-within-set
+// changes do NOT change it. An internal reparent (an id stays inside the
+// subtree) therefore does NOT reject — only spawn / delete / reparent across
+// the subtree boundary do (membership changes). Full 64-char hex (no
+// truncation — simplest, no collision analysis needed).
+func FingerprintIDs(ids []string) string {
+	sorted := make([]string, len(ids))
+	copy(sorted, ids) // do not mutate the caller's slice
+	sort.Strings(sorted)
+	h := sha256.Sum256([]byte(strings.Join(sorted, "\n")))
+	return hex.EncodeToString(h[:])
+}
+
 // DescendantSummaries returns id plus every live session transitively parented
 // by it (as SessionSummary), captured together with the Store's epoch and head
 // seq UNDER THE SAME RLock — so the {epoch, revision} envelope the P4 endpoint
@@ -2061,15 +2085,26 @@ type SessionSummary struct {
 // validation / diagnostics) and is NOT required to equal the latest live tree
 // revision by the time the client reads it; capturing it under the same lock as
 // the walk simply avoids returning a revision that predates the data.
-func (s *Store) DescendantSummaries(id string) (descs []SessionSummary, epoch string, seq uint64) {
+//
+// C5: the returned fingerprint is the stateless subtree-id-set fingerprint
+// (FingerprintIDs) of the walked ids, computed under the same RLock so it is
+// coherent with the returned descs (no TOCTOU between the data and the fence
+// token). The archive commit handler recomputes it from the live affected set
+// and 409-rejects on mismatch. For an unknown id, the fingerprint is computed
+// over the seed set {id} — this matches the archive commit's empty-set
+// fallback (archive.go: len(affected)==0 → [body.SessionID]), keeping
+// preview↔commit coherent on the orphan/ghost path (a fingerprint of the empty
+// set would always mismatch the fallback and stuck-loop the dialog).
+func (s *Store) DescendantSummaries(id string) (descs []SessionSummary, fingerprint, epoch string, seq uint64) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	epoch = s.epoch
 	seq = s.seq
 	if s.sessions[id] == nil {
-		return nil, epoch, seq
+		return nil, FingerprintIDs([]string{id}), epoch, seq
 	}
 	ids := s.descendantsLocked(id)
+	fingerprint = FingerprintIDs(ids)
 	descs = make([]SessionSummary, 0, len(ids))
 	for _, sid := range ids {
 		se := s.sessions[sid]
@@ -2086,7 +2121,7 @@ func (s *Store) DescendantSummaries(id string) (descs []SessionSummary, epoch st
 			ParentID: se.parentID,
 		})
 	}
-	return descs, epoch, seq
+	return descs, fingerprint, epoch, seq
 }
 
 // TodoTotals is the subtree-todo summary for the "Tasks N active · M left"
