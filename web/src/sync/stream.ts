@@ -2799,12 +2799,14 @@ export function startPeriodicResync(): void {
   schedulePeriodicResync();
 }
 
-// resolvePeriodicDiff — called from the snapshot.complete listener (the Q5
-// convergence boundary) once both projections of a capture have landed. If a
-// periodic resync is awaiting its result, compare the post-snapshot
-// fingerprint against the captured before-fingerprint and record the outcome.
-// Clears the pending slot regardless (a slot whose requested connection was
-// superseded by a different-gen recovery is dropped without counting).
+// resolvePeriodicDiff — called from the tree.snapshot apply path (after
+// seedTreeStore installs this gen's authoritative tree map; see the inline
+// comment at the call site for why resolution happens here and not at the
+// snapshot.complete boundary). If a periodic resync is awaiting its result,
+// compare the post-snapshot fingerprint against the captured before-fingerprint
+// and record the outcome. Clears the pending slot regardless (a slot whose
+// requested connection was superseded by a different-gen recovery is dropped
+// without counting).
 function resolvePeriodicDiff(connGen: number): void {
   if (!periodicDiffPending) return;
   // Only attribute the diff to a periodic resync whose requested connection is
