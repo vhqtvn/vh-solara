@@ -1375,6 +1375,10 @@ export function connect(fresh = false) {
   treeT0 = performance.now(); // L1 t0: connection attempt begins
   treeT1 = 0;
   treeSnapDone = false;
+  // Q5 C2: a new connection's projections haven't landed yet — reset the
+  // convergence boundary so consumers see "not yet authoritative" until the
+  // server's snapshot.complete fires for the new connection's first capture.
+  setState("authoritativeReady", false);
   // Capture the generation for THIS connection's listeners. The bump above
   // already invalidated any prior decode; this `gen` is checked at listener
   // entry and after every await in the snapshot listener.
@@ -1642,7 +1646,48 @@ export function connect(fresh = false) {
       log.warn("sync", "malformed tree.op frame", { err, seq });
     }
   });
-  // === Phase 5: server-backed pins (pins.snapshot / pins.updated) =============
+  // === Q5 C2 — truthful completion boundary ===================================
+  // The server (commit C1) emits `snapshot.complete` as a named SSE event AFTER
+  // both projections (tree.snapshot + detail snapshot) of the SAME {epoch, seq}
+  // capture are written, gated on treeOK && detailOK (no false atomicity). This
+  // is the ONLY client-side signal that both projections are coherent from one
+  // authoritative capture — the FE cannot correlate by arrival/decode order
+  // (tree.snapshot is gzip64-decoded async; detail snapshot ships RAW sync).
+  //
+  // authoritativeReady marks the verifiable convergence boundary. It is RESET to
+  // false on every new connection (connect(), above). Old daemons that don't
+  // emit this event leave it false — treeSnapDone / status==="live" remain the
+  // operational ready indicator (backward-compatible degradation).
+  //
+  // The event carries an SSE `id:` == the capture seq (same as both
+  // projections') and a body {epoch, revision, projections:["tree","detail"]}.
+  // We don't advanceCursor here (both projections already advanced it to the
+  // same seq); we only mark the boundary for consumers.
+  es.addEventListener("snapshot.complete", (e) => {
+    if (gen !== treeGen) return;
+    markTreeSeen();
+    let p: { epoch?: string; revision?: number; projections?: string[] };
+    try {
+      p = JSON.parse((e as MessageEvent).data);
+    } catch (err) {
+      log.warn("sync", "malformed snapshot.complete frame", { err });
+      return;
+    }
+    // Guard against a JSON-valid-but-non-object body (null, a primitive, or an
+    // array) — the server contract guarantees an object, but a non-object would
+    // throw on property access below. Drop defensively (authoritativeReady stays
+    // false → the safe degradation).
+    if (!p || typeof p !== "object" || Array.isArray(p)) {
+      log.warn("sync", "snapshot.complete body is not an object", { body: p });
+      return;
+    }
+    log.debug("sync", "snapshot.complete boundary", {
+      epoch: p.epoch,
+      revision: p.revision,
+      projections: p.projections,
+    });
+    setState("authoritativeReady", true);
+  });
   // Both frames are emitted on this Stream-1 (tree) connection. They carry NO
   // SSE `id:` line (both transient — reconnect catches up via pins.snapshot),
   // so there is no cursor to advance and no shared-resume interaction. They are

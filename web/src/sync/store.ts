@@ -186,6 +186,19 @@ export interface SyncState {
   projectConstants?: ProjectConstants;
   status: ConnStatus;
   cursor: number;
+  // authoritativeReady: Q5 convergence boundary. False while the current
+  // connection's most recent tree+detail capture projections are still landing;
+  // flips true when the server's `snapshot.complete` named SSE event arrives
+  // (commit C1, pkg/web/server.go). The boundary is TRUTHFUL: the server emits
+  // it only after BOTH projections of the SAME {epoch, seq} capture were
+  // written (gated on treeOK && detailOK — no false atomicity). The FE cannot
+  // correlate by arrival/decode order (tree.snapshot is gzip64-decoded async;
+  // detail snapshot ships RAW sync), so this is the ONLY coherent-capture
+  // signal. Reset to false on each new connection (connect()). Old daemons that
+  // don't emit snapshot.complete leave this false — the existing
+  // treeSnapDone / status==="live" signals remain the operational ready
+  // indicator (backward-compatible degradation).
+  authoritativeReady: boolean;
   // --- Connection-health diagnostics (FE-only) -----------------------------
   // lastSeen: ms-of-last-SSE-byte, mirrored from the stream's hot-path
   // module var (throttled to ~1 write/sec to avoid per-event reactive churn).
@@ -249,6 +262,7 @@ export const [state, setState] = createStore<SyncState>({
   unread: {},
   status: "connecting",
   cursor: loadCursor(initialDir),
+  authoritativeReady: false,
   lastSeen: 0,
   epoch: "",
   epochChanged: false,
