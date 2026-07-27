@@ -155,6 +155,21 @@ type Aggregator struct {
 	// Run / RunManaged so the goroutine launch establishes the happens-before
 	// edge to the read.
 	statusReconcileInterval time.Duration
+
+	// treeReconcileInterval is how often runTreeReconcile polls OpenCode's
+	// /session list to detect ghosts and clobbered archives (see the doc block
+	// on runTreeReconcile for the full rationale). It defaults to 5s, set at
+	// construction in New / NewForDirectory. It is a PER-INSTANCE field — NOT a
+	// package global — mirroring statusReconcileInterval: the old package-global
+	// TreeReconcileInterval carried the same latent global-mutation race that
+	// bit statusReconcileInterval before it was moved per-instance (a global
+	// written by one test's goroutine would race a lingering runTreeReconcile
+	// goroutine from another aggregator / a prior -count iteration). No test
+	// mutates it today, but the instance field removes the race proactively. It
+	// is read once at the top of runTreeReconcile (the only reader) before that
+	// goroutine's ticker loop; set it before calling Run / RunManaged so the
+	// goroutine launch establishes the happens-before edge to the read.
+	treeReconcileInterval time.Duration
 }
 
 // New builds an aggregator targeting an opencode server base URL.
@@ -164,6 +179,7 @@ func New(baseURL string, ringCapacity int) *Aggregator {
 		store:                   state.New(ringCapacity),
 		msgInflight:             map[string]chan struct{}{},
 		statusReconcileInterval: 60 * time.Second,
+		treeReconcileInterval:   5 * time.Second,
 	}
 }
 
@@ -177,6 +193,7 @@ func NewForDirectory(baseURL, directory string, ringCapacity int) *Aggregator {
 		store:                   state.New(ringCapacity),
 		msgInflight:             map[string]chan struct{}{},
 		statusReconcileInterval: 60 * time.Second,
+		treeReconcileInterval:   5 * time.Second,
 	}
 }
 
@@ -703,7 +720,7 @@ func (a *Aggregator) Run(ctx context.Context) {
 	// and clobber-reverted archives. Folds in the existing archive re-assert
 	// (reassertArchive) and the resurrection tombstone so Phase 2 merges rather
 	// than duplicates them. Bound to Run's ctx so it stops on aggregator
-	// shutdown. See TreeReconcileInterval.
+	// shutdown. See a.treeReconcileInterval.
 	go a.runTreeReconcile(ctx)
 
 	backoff := time.Second
@@ -755,46 +772,6 @@ func (a *Aggregator) Run(ctx context.Context) {
 		if backoff < 30*time.Second {
 			backoff *= 2
 		}
-	}
-}
-
-// runStatusReconcile periodically re-derives busy-state from OpenCode's
-// /session/status and reconciles it into the store. It is the self-heal path
-// for a stale "busy" flag: the event stream owns busy-state in the common
-// case, but if a session.idle is ever missed the in-memory flag would stick
-// forever. This ticker clears anything OpenCode no longer reports busy by
-// routing through store.SetActivityFromStatuses -> setActivityLocked, which is
-// the single chokepoint that also keeps busyCount, subtreeBusyCount, and the
-// seven O1 subtree indexes consistent. It is best-effort: a fetch error is
-// logged and retried on the next tick. It never clears busyCount directly.
-// Blocks until ctx is cancelled.
-//
-// The poll interval is the per-instance field a.statusReconcileInterval
-// (default 60s, set in New / NewForDirectory). A test shrinks it on the
-// instance under test (e.g. agg.statusReconcileInterval = 5*time.Millisecond)
-// rather than mutating a package global: a global written by one test's
-// goroutine would race a lingering runStatusReconcile goroutine from another
-// aggregator (or a prior -count iteration) that reads it once at the top of
-// this function. The instance field removes that race entirely.
-func (a *Aggregator) runStatusReconcile(ctx context.Context) {
-	ticker := time.NewTicker(a.statusReconcileInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
-		statuses, err := a.client.SessionStatuses(ctx)
-		if err != nil {
-			// Silent on shutdown; otherwise log and try again next tick.
-			if ctx.Err() != nil {
-				return
-			}
-			log.Printf("[aggregator] status reconcile fetch failed: %v", err)
-			continue
-		}
-		a.store.SetActivityFromStatuses(statuses)
 	}
 }
 
