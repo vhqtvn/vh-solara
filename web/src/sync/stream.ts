@@ -318,16 +318,24 @@ export function applyMessageEvent(kind: string, seq: number, payload: any, track
           // {hasOlder:false} (unbounded server, nothing older to fetch).
           if (payload.sessionID) {
             const items = payload.messages || [];
-            // COLD-LOAD ESTABLISHMENT (not a reconcile): messages.batch fires once
-            // per cold-hydrate cycle (snapshot → batch → messages.loaded) to seed
-            // the authoritative full-history baseline for a session that was just
-            // opened. Unlike applySessionSnapshot (which can land repeatedly on
-            // reconnects/reconciles and clobber a live tail), the batch arrives on
-            // a freshly-opened stream with no NEWER live data to clobber — any
-            // live deltas that follow are applied via upsertMessage/upsertPart on
-            // TOP of this baseline and are never re-clobbered (the batch does not
-            // re-fire). Hence wholesale-replace is correct here; no merge guard.
-            s.messages[payload.sessionID] = buildMessages(items);
+            // MERGE, not wholesale-replace. A live message.upsert/part.upsert for
+            // this session can land on Stream-2 BEFORE the batch's gzip64 decode
+            // resolves — the snapshot→upsert→batch reload interleaving. The
+            // pendingBatch gate (stream.ts ~2455/2468) only serializes events that
+            // arrive DURING the decode; it CANNOT help when the live upsert
+            // applied BEFORE the batch was even fired (the resident live message
+            // predates the batch decode). A wholesale-replace here would clobber
+            // that resident message. prependMessagesIfAbsent — the same primitive
+            // applySessionSnapshot uses on the warm-snapshot path — inserts batch
+            // items that are ABSENT and NEVER touches an existing byId entry, so
+            // live always wins. Cold-load establishment is preserved: on first
+            // hydrate s.messages[sid] is empty/absent, every item is absent, and
+            // merge ≡ wholesale-replace. Structurally consistent with
+            // applySessionSnapshot (which already merges via the same primitive).
+            if (!s.messages[payload.sessionID]) {
+              s.messages[payload.sessionID] = { order: [], byId: {} };
+            }
+            prependMessagesIfAbsent(s.messages[payload.sessionID], items);
             s.messageWindows[payload.sessionID] = deriveMessageWindow(items, payload.window);
           }
           break;

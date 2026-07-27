@@ -14,7 +14,7 @@
 // WHY THE MID-DECODE TIMING WAS ADJUSTED: the operator's first-pass scenario
 // fired the upsert DURING the batch decode. That race is already CLOSED: the
 // shared session listener unconditionally does `if (pendingBatch.has(sid))
-// await pendingBatch.get(sid)` (stream.ts ~line 2793) for EVERY non-batch kind,
+// await pendingBatch.get(sid)` (stream.ts ~2455/2468) for EVERY non-batch kind,
 // so a message.upsert arriving mid-decode SUSPENDS until the batch resolves,
 // then applies AFTER the wholesale-replace (it survives). The residual gap —
 // and the actual bug — is the wholesale-replace clobbering a live message that
@@ -194,7 +194,7 @@ describe("messages.batch wholesale-replace clobbers a live pre-batch message.ups
     );
 
     // 2. Live message.upsert for the MIDDLE canary m2.5, BEFORE the batch is
-    //    fired (so the pendingBatch gate at stream.ts ~2793 is NOT yet armed —
+    //    fired (so the pendingBatch gate at stream.ts ~2455/2468 is NOT yet armed —
     //    the upsert applies synchronously with no decode to wait on). This
     //    models a live event that lands on the session stream between the
     //    snapshot and the cold-load batch during a reload.
