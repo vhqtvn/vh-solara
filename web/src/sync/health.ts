@@ -14,7 +14,7 @@
 //
 // Cross-module seams (deliberate, minimal — read-only peeks, never mutation):
 //   From ./stream:  connect(fresh?), isTreeClosed(), getTreeLastSeen(),
-//                   markAuthoritativeRecovery(), STALE_MS.
+//                   getTreeContentSeen(), markAuthoritativeRecovery(), STALE_MS.
 //   From ./session-stream: openSessionStream(id, force?), getSesId(),
 //                          isSessionClosed(), getSessionLastSeen(),
 //                          getSessionContentSeen().
@@ -33,6 +33,7 @@ import {
   connect,
   isTreeClosed,
   getTreeLastSeen,
+  getTreeContentSeen,
   markAuthoritativeRecovery,
   STALE_MS,
 } from "./stream";
@@ -104,12 +105,42 @@ export function watchdogTick() {
   // --- Stream 1 (tree) liveness: drives the GLOBAL connection status. ---
   if (isTreeClosed()) {
     connect();
-  } else if (getTreeLastSeen() && Date.now() - getTreeLastSeen() > STALE_MS) {
-    log.warn("sync", "tree stream stale → forcing reconnect", {
-      silentMs: Date.now() - getTreeLastSeen(),
-    });
-    setState("status", "reconnecting");
-    connect();
+  } else {
+    // Two independent stall signals, EITHER trips a forced reconnect (connect()
+    // tears down the old EventSource — treeGen++, es.close() — and rebuilds,
+    // re-seeding BOTH clocks at construction via markTreeSeen so there is no
+    // tight loop). The Stream1 mirror of Lane C's Stream2 dual-clock watchdog
+    // branch — only the TRIGGER set grows; the recovery path is unchanged.
+    //
+    // Transport stall (original path): pings STOPPED → treeLastSeen ages past
+    // STALE_MS. Catches a fully-dead socket. Drives the global "reconnecting"
+    // status (the status dot follows the tree).
+    //
+    // Content stall (Stream1 mirror of Lane C): transport ALIVE (pings flow,
+    // treeLastSeen fresh) but ZERO content delivered → treeContentSeen ages
+    // past CONTENT_STALE_MS. Catches the ping-mask gap on the tree — a socket
+    // that stays OPEN and keeps acknowledging pings but never delivers
+    // snapshot/tree.op/session.*/etc. The operator-visible symptom is a
+    // completed subsession sticking "running" until reload (the stuck-running-
+    // node gap). The conservative CONTENT_STALE_MS keeps legitimate silences
+    // from churning the connection: tree content + the SR60 ≤60s backstop flow
+    // well under the window during normal operation. The recovery path is the
+    // SAME connect() the transport-stall path uses — the server emits a fresh
+    // tree.snapshot on connect (cursored or not), and the C4 coherent barrier
+    // reconciles. No connect(true) special-case is needed: unlike Stream2's
+    // openSessionStream(id, true), the tree's connect() has no "already-open"
+    // guard to bypass, so a plain connect() always rebuilds.
+    const transportStale = !!(getTreeLastSeen() && Date.now() - getTreeLastSeen() > STALE_MS);
+    const contentStale = !!(getTreeContentSeen() && Date.now() - getTreeContentSeen() > CONTENT_STALE_MS);
+    if (transportStale || contentStale) {
+      log.warn("sync", "tree stream stale → forcing reconnect", {
+        silentMs: getTreeLastSeen() ? Date.now() - getTreeLastSeen() : 0,
+        contentSilentMs: getTreeContentSeen() ? Date.now() - getTreeContentSeen() : 0,
+        reason: contentStale && !transportStale ? "content-stall" : "transport-stall",
+      });
+      setState("status", "reconnecting");
+      connect();
+    }
   }
   // --- Stream 2 (selected-session messages) liveness: INDEPENDENT clock. ---
   // A dead-but-OPEN Stream2 must be detected even while Stream1's 15s server

@@ -24,10 +24,14 @@
 // can legitimately silence content for tens of seconds, and a lower threshold
 // would churn the connection during normal deep-reasoning silences.
 //
-// The tree stream is the CONTROL here (ping-only, no tree content clock —
-// Stream1's equivalent conflation is a documented latent gap backstopped by
-// runStatusReconcile; see stream.ts). So tree pings alone keep it healthy and
-// it must NOT reconnect — proving the session detection is isolated.
+// The tree stream is the CONTROL here. Pre-mirror it was ping-only (Stream1
+// had no content clock — a documented latent gap), but the Stream1 content-clock
+// mirror (the deferred half of Lane C; see treeLivenessContentStall.test.ts)
+// closed that gap, so a ping-only tree would now content-stall past
+// CONTENT_STALE_MS exactly like the session under test. To remain a valid
+// "healthy tree" control it now receives flowing content (a snapshot per cycle)
+// so treeContentSeen stays fresh and it must NOT reconnect — proving the session
+// detection is isolated.
 //
 // Self-contained harness (MockEventSource + setupFresh duplicated from
 // sessionLiveness.test.ts because that file does not export its helpers).
@@ -138,6 +142,18 @@ const sessionSnapshot = (seq: number, id = "s1") => ({
   gate: { [id]: { messagesLoaded: true } },
   messages: {},
 });
+// Minimal tree snapshot (RAW detail) to keep the tree CONTROL healthy. After
+// the Stream1 content-clock mirror (the deferred half of Lane C), the tree
+// carries a treeContentSeen clock too, so a ping-only tree control is no longer
+// a valid "healthy tree" — it would content-stall past CONTENT_STALE_MS just
+// like the session under test. A genuinely healthy tree delivers content
+// (tree.snapshot flows constantly in production), so the control fires one per
+// cycle to keep treeContentSeen fresh. See treeLivenessContentStall.test.ts for
+// the mirror (where the tree IS the subject and the session is the control).
+const treeSnapshot = (seq: number, sessionIds: string[] = ["s1"]) => ({
+  seq,
+  sessions: sessionIds.map((id) => ({ id })),
+});
 
 describe("content-stall: pings keep sessionLastSeen fresh but sessionContentSeen ages out → reconnect", () => {
   it("a session with healthy pings but ZERO content past CONTENT_STALE_MS reconnects (content-stall detected)", async () => {
@@ -154,21 +170,26 @@ describe("content-stall: pings keep sessionLastSeen fresh but sessionContentSeen
     sessionESes()[0].fire("snapshot", sessionSnapshot(1), "1");
     await flush();
 
-    // Cycles of ONLY pings (transport alive) with ZERO content events. Both
-    // streams receive a server ping every 15s; the watchdog runs each cycle.
-    // The session ping refreshes sessionLastSeen (transport clock) but NOT
-    // sessionContentSeen (content clock) → the content clock ages out and once
-    // it crosses CONTENT_STALE_MS (120s) the watchdog forces a reconnect.
+    // Cycles of ONLY pings (transport alive) on the SESSION under test, with
+    // ZERO session content events. The watchdog runs each cycle. The session
+    // ping refreshes sessionLastSeen (transport clock) but NOT sessionContentSeen
+    // (content clock) → the content clock ages out and once it crosses
+    // CONTENT_STALE_MS (120s) the watchdog forces a reconnect.
     //
     // 9 cycles × 15s = 135s > CONTENT_STALE_MS(120s) → the reconnect fires at
     // cycle 8 (the first tick where the content clock is > 120s old). The tree
-    // is the CONTROL (ping-only; Stream1 has no content clock) so it stays
-    // healthy throughout and must NOT reconnect.
+    // is the CONTROL: it receives a ping AND a fresh snapshot each cycle (content
+    // FLOWS → treeContentSeen stays fresh) so it stays healthy throughout and
+    // must NOT reconnect. (Pre-mirror, the tree control was ping-only because
+    // Stream1 had no content clock; the Stream1 content-clock mirror closed that
+    // gap, so the control now needs flowing content to remain a valid "healthy
+    // tree" — see treeLivenessContentStall.test.ts.)
     for (let cycle = 0; cycle < 9; cycle++) {
       vi.advanceTimersByTime(15_000);
-      treeESes()[0].fire("ping"); // treeLastSeen fresh (tree control stays healthy)
+      treeESes()[0].fire("ping"); // treeLastSeen fresh (transport)
+      treeESes()[0].fire("snapshot", treeSnapshot(cycle + 2), String(cycle + 2)); // tree content flows → treeContentSeen fresh
       sessionESes()[0].fire("ping"); // sessionLastSeen fresh (transport alive)...
-      // deliberately NO snapshot/message/part → content stall on the session
+      // deliberately NO session snapshot/message/part → content stall on the session
       stream.watchdogTick();
     }
 
@@ -179,8 +200,8 @@ describe("content-stall: pings keep sessionLastSeen fresh but sessionContentSeen
     // The replacement URL is cursorless (force=true re-sync path).
     expect(sessionESes()[1].url).not.toMatch(/cursor=/);
 
-    // Tree ES unchanged (reverse isolation — the tree control was healthy via
-    // its pings; Stream1 has no content clock so it is unaffected).
+    // Tree ES unchanged (reverse isolation — the tree control stayed healthy via
+    // its pings + flowing content; the session content-stall did not affect it).
     expect(treeESes()).toHaveLength(1);
     expect(treeESes()[0].readyState).toBe(OPEN);
 

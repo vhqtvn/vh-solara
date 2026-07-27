@@ -643,6 +643,29 @@ let es: EventSource | null = null;
 //                     not-yet-open or just-reconnected Stream2 gets a fresh
 //                     deadline instead of inheriting a stale timestamp.
 let treeLastSeen = 0;
+// Content-vs-transport split for Stream1 liveness (the Stream1 mirror of Lane
+// C's Stream2 fix — the deferred half called out in Lane C's DESIGN DEBATE).
+// treeLastSeen above is refreshed by BOTH the 15s server ping AND content
+// events, so a dead-but-OPEN Stream1 whose transport stays alive (pings flow)
+// but delivers ZERO content keeps treeLastSeen fresh forever — the watchdog's
+// tree branch never trips and the operator-visible symptom (a completed
+// subsession sticking "running" until reload — the stuck-running-node gap) sits
+// with no recovery signal. treeContentSeen closes that gap: refreshed ONLY by
+// genuine Stream1 content (snapshot / tree.snapshot / tree.op / snapshot.complete
+// / pins.* / session.upsert+delete / TREE_STREAM_KINDS / notice / onopen), NEVER
+// by ping. The watchdog's tree branch (./health) reconnects when EITHER clock
+// ages out. See CONTENT_STALE_MS (in ./health) for the threshold rationale.
+//
+// THRESHOLD: reuses CONTENT_STALE_MS=120s (NO tree-specific threshold). The
+// tree's normal content cadence is HIGHER than Stream2's — tree.snapshot +
+// tree.op + session.upsert + activity.* flow frequently, AND runStatusReconcile
+// (SR60) emits a fresh tree content event every ≤60s as a server-side backstop —
+// so 120s is, if anything, MORE conservative for the tree: a genuine 120s
+// tree-content gap means the live stream AND the SR60 backstop BOTH failed.
+// 120s also keeps every existing tree-liveness test contract green (the longest
+// ping-only content-silence window in sessionLiveness.test.ts is Gate H's 92s,
+// comfortably under the threshold). See the Lane C packet.
+let treeContentSeen = 0;
 // sessionLastSeen / sessionContentSeen + the content-vs-transport split
 // rationale moved to ./session-stream (Stream2 owns its own clocks). The
 // dual-clock design comment above still documents WHY the tree clock is
@@ -663,6 +686,13 @@ export const STALE_MS = 45_000; // ~3 missed 15s pings → assume the stream is 
 export function getTreeLastSeen(): number {
   return treeLastSeen;
 }
+// Content-clock accessor for ./health's watchdogTick tree branch (the Stream1
+// mirror of getSessionContentSeen). Read-only peek; health never mutates the
+// tree lifecycle — it only decides when to (re)connect and delegates to
+// connect().
+export function getTreeContentSeen(): number {
+  return treeContentSeen;
+}
 export function isTreeClosed(): boolean {
   return !es || es.readyState === EventSource.CLOSED;
 }
@@ -672,11 +702,39 @@ export function isTreeClosed(): boolean {
 // tracks treeLastSeen (the value the global status dot represents); it is a
 // debug-only field — isStale() reads the unthrottled module var, not state.
 let lastSeenStateWritten = 0;
-// markTreeSeen updates Stream1's liveness clock and (throttled) the reactive
-// mirror consumed by debug surfaces. Called from every Stream1 listener.
+// markTreeSeen updates Stream1's liveness clocks: BOTH the transport clock
+// (treeLastSeen) AND the content clock (treeContentSeen), plus (throttled) the
+// reactive mirror consumed by debug surfaces. Called from every Stream1 CONTENT
+// listener (snapshot / tree.snapshot / tree.op / snapshot.complete / pins.* /
+// session.upsert+delete / TREE_STREAM_KINDS / notice), es.onopen, and the
+// connect() construction seed. The ping listener calls markTreeTransportSeen
+// instead (transport only) so a content-stall ages out treeContentSeen even
+// while pings keep treeLastSeen fresh. This is the Stream1 mirror of Lane C's
+// Stream2 markSessionSeen split.
 function markTreeSeen() {
-  treeLastSeen = Date.now();
-  const now = treeLastSeen;
+  const now = Date.now();
+  treeLastSeen = now;
+  treeContentSeen = now;
+  maybeMirrorLastSeen(now);
+}
+// markTreeTransportSeen refreshes the transport clock ONLY (the 15s server
+// ping) plus (throttled) the debug mirror — the global status dot represents
+// GLOBAL transport health, so a ping still refreshes it. It deliberately does
+// NOT touch treeContentSeen, so a ping-only stream (transport alive, zero
+// content) lets the content clock age out and the watchdog reconnects via the
+// tree content-stall branch. The Stream1 mirror of Lane C's
+// markSessionTransportSeen.
+function markTreeTransportSeen() {
+  const now = Date.now();
+  treeLastSeen = now;
+  maybeMirrorLastSeen(now);
+}
+// maybeMirrorLastSeen throttles the treeLastSeen mirror into the reactive store
+// to ~1 write/sec (the mark* helpers fire on every SSE byte, but writing
+// state.lastSeen that often would notify debug surfaces per-token). Shared by
+// both mark* helpers so transport AND content events keep the debug field fresh
+// without duplicating the throttle.
+function maybeMirrorLastSeen(now: number) {
   if (now - lastSeenStateWritten >= 1000) {
     lastSeenStateWritten = now;
     setState("lastSeen", now);
@@ -1782,7 +1840,16 @@ export function connect(fresh = false) {
     }
     applyPinsUpdated(raw);
   });
-  es.addEventListener("ping", () => markTreeSeen()); // heartbeat for the watchdog
+  // Transport-only: refresh treeLastSeen (and the debug mirror) but NOT
+  // treeContentSeen, so a ping-only stream (transport alive, zero content) lets
+  // the content clock age out and the watchdog's tree content-stall branch
+  // fires. The Stream1 mirror of Lane C's session ping listener. (No gen guard
+  // here, matching the prior behavior: a ping is a pure transport heartbeat, so
+  // letting a superseded connection's ping refresh the transport clock is
+  // harmless — the replacement seeds a fresh clock at construction, and only
+  // treeContentSeen — refreshed solely by content listeners, which DO gen-guard
+  // — drives the content-stall decision.)
+  es.addEventListener("ping", () => markTreeTransportSeen()); // heartbeat for the watchdog
   for (const kind of ["session.upsert", "session.delete"]) {
     es.addEventListener(kind, async (e) => {
       markTreeSeen();
@@ -2142,7 +2209,13 @@ export function _resetPeriodicStateForTest(): void {
   periodicResyncDiffsFound = 0;
 }
 export function _markTreeSeenForTest(ms?: number): void {
-  treeLastSeen = ms ?? Date.now();
+  // Seed BOTH clocks so a test marking the tree "healthy" gets a realistic
+  // dual-clock state (a content-stall check sees a fresh treeContentSeen, not a
+  // stale/0 placeholder that would either false-positive or false-negative the
+  // watchdog). Mirrors the dual-clock markTreeSeen.
+  const t = ms ?? Date.now();
+  treeLastSeen = t;
+  treeContentSeen = t;
 }
 export function _setLastAuthoritativeRecoveryForTest(ms: number): void {
   lastAuthoritativeRecovery = ms;
