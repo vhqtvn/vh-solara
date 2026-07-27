@@ -69,12 +69,113 @@ func TestCodeBlockChromaEnvelopeForBareAndUnknown(t *testing.T) {
 func TestMarkdownSanitizesXSS(t *testing.T) {
 	r := New()
 	out := r.Markdown("hello <script>alert(1)</script> world")
+	// Raw HTML is ESCAPED as visible literal text (not dropped, not passed through).
 	if strings.Contains(out, "<script>") {
-		t.Fatalf("script tag not stripped: %s", out)
+		t.Fatalf("raw script tag passed through unescaped: %s", out)
+	}
+	// The escaped literal must be visible so the operator sees the syntax.
+	if !strings.Contains(out, "&lt;script&gt;") {
+		t.Fatalf("script tag not escaped as visible literal text: %s", out)
 	}
 	out2 := r.Markdown("[click](javascript:alert(1))")
 	if strings.Contains(out2, "javascript:") {
 		t.Fatalf("javascript: URI not sanitized: %s", out2)
+	}
+}
+
+// TestRawHtmlEscapedAsText verifies that raw HTML tokens render as visible
+// escaped literal text — NOT dropped, NOT passed through. This is the core
+// hardening: a model emitting `<report>` or `<vh-solara>` syntax must show the
+// literal tag in the rendered view, not a silent gap.
+//
+// Each case asserts BOTH conditions:
+//
+//	(a) no source-created HTML element/attribute exists in output, AND
+//	(b) the original syntax is visibly present as escaped literal text.
+func TestRawHtmlEscapedAsText(t *testing.T) {
+	r := New()
+	tests := []struct {
+		name  string
+		input string
+		// rawSubstr must NOT appear literally (it would be an active element).
+		rawSubstr string
+		// escapedSubstr MUST appear (the escaped visible literal text).
+		escapedSubstr string
+	}{
+		// Custom tags — the operator-facing bug: these were silently dropped.
+		{"inline custom tag <report>", "see <report> here", "<report>", "&lt;report&gt;"},
+		{"inline custom tag <vh-solara>", "see <vh-solara> here", "<vh-solara>", "&lt;vh-solara&gt;"},
+		{"inline custom tag closing", "see </report> here", "</report>", "&lt;/report&gt;"},
+
+		// Block-level HTML.
+		{"block div", "<div>content</div>", "<div>", "&lt;div&gt;"},
+		{"block script", "<script>x=1</script>", "<script>", "&lt;script&gt;"},
+		{"block paragraph with attrs", `<p class="evil">text</p>`, `<p class="evil">`, "&lt;p"},
+
+		// Comments / declarations / processing instructions / CDATA.
+		{"comment", "<!-- secret -->", "<!--", "&lt;!--"},
+		{"declaration", "<!DOCTYPE html>", "<!DOCTYPE", "&lt;!DOCTYPE"},
+		{"PI", "<?xml version='1.0'?>", "<?xml", "&lt;?xml"},
+		{"CDATA", "<![CDATA[data]]>", "<![CDATA[", "&lt;![CDATA["},
+
+		// Dangerous tags (the whole tag is escaped as text — onerror/onload
+		// are harmless visible text inside the escaped &lt;...&gt;).
+		{"img onerror", `<img src=x onerror=alert(1)>`, "<img ", "&lt;img"},
+		{"iframe", `<iframe src=evil></iframe>`, "<iframe", "&lt;iframe"},
+		{"svg onload", `<svg onload=alert(1)>`, "<svg ", "&lt;svg"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			out := r.Markdown(tc.input)
+			// (a) No source-created HTML element/attribute in output.
+			if strings.Contains(out, tc.rawSubstr) {
+				t.Fatalf("raw HTML '%s' passed through unescaped: %s", tc.rawSubstr, out)
+			}
+			// (b) The escaped literal text IS visible.
+			if !strings.Contains(out, tc.escapedSubstr) {
+				t.Fatalf("escaped literal '%s' not found in output (dropped?): %s", tc.escapedSubstr, out)
+			}
+		})
+	}
+}
+
+// TestRawHtmlPreservesMarkdownFeatures verifies that the escape renderer does
+// not break legitimate markdown features that contain angle brackets or HTML
+// syntax inside code, autolinks, etc.
+func TestRawHtmlPreservesMarkdownFeatures(t *testing.T) {
+	r := New()
+
+	// Inline code containing HTML syntax: preserved as code, not double-escaped.
+	out := r.Markdown("use `<foo>` syntax")
+	if !strings.Contains(out, "&lt;foo&gt;") {
+		t.Fatalf("inline code with <foo> should contain escaped angle: %s", out)
+	}
+
+	// Fenced code containing HTML: preserved as code.
+	out = r.Markdown("```\n<div>test</div>\n```")
+	if !strings.Contains(out, "&lt;div&gt;") {
+		t.Fatalf("fenced code with <div> should contain escaped angle: %s", out)
+	}
+
+	// Autolink: <https://example.com> should render as a link, NOT escaped.
+	out = r.Markdown("see <https://example.com>")
+	if !strings.Contains(out, "href") {
+		t.Fatalf("autolink <https://...> should render as a link: %s", out)
+	}
+
+	// Email autolink: <user@example.com> should render as a mailto link.
+	out = r.Markdown("contact <user@example.com>")
+	if !strings.Contains(out, "mailto") && !strings.Contains(out, "user@example.com") {
+		t.Fatalf("email autolink should render as a link: %s", out)
+	}
+
+	// Markdown in a list with HTML-like text: list structure preserved.
+	out = r.Markdown("- item <report>\n- item two")
+	if !strings.Contains(out, "&lt;report&gt;") {
+		t.Fatalf("list item with <report> should escape it: %s", out)
+	}
+	if !strings.Contains(out, "<ul") && !strings.Contains(out, "<li") {
+		t.Fatalf("list structure should be preserved: %s", out)
 	}
 }
 

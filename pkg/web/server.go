@@ -885,6 +885,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/vh/stream", s.handleStream)
 	mux.HandleFunc("/vh/render", s.handleRender)
 	mux.HandleFunc("/vh/highlight.css", s.handleHighlightCSS)
+	// Image proxy: GET-only, auth-gated (under /vh/*). Fetches external images
+	// through an SSRF-hardened transport so the SPA never makes a direct
+	// cross-origin image request. See pkg/web/img.go.
+	mux.HandleFunc("/vh/img", s.handleImg)
 	mux.HandleFunc("/vh/notes", s.handleNotes)
 	// Server-managed pinned sessions (Phase 2): GET reads the worker-wide pin
 	// doc, PUT applies a CAS-guarded replace. PUT is state-changing and is

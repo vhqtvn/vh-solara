@@ -12,6 +12,7 @@
 // client fallback, never inside the per-frame streaming path.
 
 import { looksLikePath } from "./pathlike";
+import { classifyImageSrc } from "./messageMarkdown";
 
 // Linkify file paths (containing "/" + an extension, optional :line) in
 // rendered prose so they jump to the file. Skips code/links.
@@ -130,4 +131,39 @@ export function splitMermaid(text: string): { type: "md" | "mermaid"; content: s
   }
   if (last < text.length) out.push({ type: "md", content: text.slice(last) });
   return out;
+}
+
+// Rewrite every <img src> in an HTML STRING through the image-source
+// classifier, BEFORE the string is inserted into the live DOM.
+//
+// Why string-in / string-out (not operate on a mounted root): once an <img>
+// is in the live DOM with a foreign src, the browser fires the fetch
+// immediately — rewriting after insertion is too late. The caller (render.ts)
+// invokes this on the detached /vh/render response before caching or returning
+// it to Part.tsx, so the src the browser eventually sees is already corrected.
+//
+// Safety: parsing uses a <template> element whose content is inert by the HTML
+// spec — no resource loads, no script execution. This is cheaper than DOMParser
+// and sufficient for rewriting attribute values. A fast-path skips parsing
+// entirely when the string has no <img tag.
+export function rewriteImageSrcs(html: string): string {
+  if (!html || !html.includes("<img")) return html;
+  const tpl = document.createElement("template");
+  tpl.innerHTML = html;
+  const imgs = tpl.content.querySelectorAll("img");
+  imgs.forEach((img) => {
+    // getAttribute returns the raw (entity-decoded) attribute value; the
+    // classifier sees the actual URL the browser would fetch.
+    const raw = img.getAttribute("src");
+    if (raw == null) return; // img without src — already neutralized or structural
+    const action = classifyImageSrc(raw);
+    if (action.kind === "keep") return;
+    if (action.kind === "proxy") {
+      img.setAttribute("src", action.url);
+    } else {
+      // neutralize: remove src so no fetch fires. Keep alt for accessibility.
+      img.removeAttribute("src");
+    }
+  });
+  return tpl.innerHTML;
 }

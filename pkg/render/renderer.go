@@ -56,6 +56,9 @@ func New() *Renderer {
 			// goldmark-highlighting extension, whose bare/unknown fallback
 			// emitted plain <pre><code> with no per-line spans.
 			newCodeHighlighter(),
+			// Custom NodeRenderer that ESCAPES raw HTML (inline + block) as
+			// visible literal text instead of dropping it. See rawHTMLRenderer.
+			newRawHTMLRenderer(),
 		),
 	)
 
@@ -115,6 +118,66 @@ func newCodeHighlighter() *codeHighlighter {
 // fenced-code-block HTML renderer.
 func (c *codeHighlighter) Extend(m goldmark.Markdown) {
 	m.Renderer().AddOptions(renderer.WithNodeRenderers(util.Prioritized(c, 200)))
+}
+
+// rawHTMLRenderer is a goldmark NodeRenderer (+ Extender) that emits raw HTML
+// source as ESCAPED visible text instead of passing it through or dropping it.
+//
+// Why this exists: goldmark's default HTML renderer either passes raw HTML
+// through verbatim (when WithUnsafe is set — an XSS vector) or drops it with a
+// "<!-- raw HTML omitted -->" comment (the default). Dropping is wrong for
+// message markdown: a model emitting `<report>` or `<vh-solara>` syntax would
+// produce NOTHING in the rendered view, hiding content from the operator. This
+// renderer escapes the original source bytes so they render as visible literal
+// text (`&lt;report&gt;`).
+//
+// Registered at priority 100 (below the built-in renderer's 1000) so it
+// overrides the default for KindHTMLBlock and KindRawHTML. In goldmark's
+// renderer, NodeRenderers are applied lowest-priority-last (Register overwrites),
+// so lower priority wins.
+type rawHTMLRenderer struct{}
+
+func newRawHTMLRenderer() *rawHTMLRenderer { return &rawHTMLRenderer{} }
+
+// Extend implements goldmark.Extender.
+func (r *rawHTMLRenderer) Extend(m goldmark.Markdown) {
+	m.Renderer().AddOptions(renderer.WithNodeRenderers(util.Prioritized(r, 100)))
+}
+
+// RegisterFuncs implements renderer.NodeRenderer.
+func (r *rawHTMLRenderer) RegisterFuncs(reg renderer.NodeRendererFuncRegisterer) {
+	reg.Register(ast.KindHTMLBlock, r.renderHTMLBlock)
+	reg.Register(ast.KindRawHTML, r.renderRawHTML)
+}
+
+// renderHTMLBlock emits the original source of an HTML block as escaped text.
+// Block content lines are emitted on the entering pass; the closure line (if
+// any) on the exiting pass — mirroring goldmark's own segmentation.
+func (r *rawHTMLRenderer) renderHTMLBlock(w util.BufWriter, source []byte, node ast.Node, entering bool) (ast.WalkStatus, error) {
+	n := node.(*ast.HTMLBlock)
+	if entering {
+		for i := 0; i < n.Lines().Len(); i++ {
+			line := n.Lines().At(i)
+			_, _ = w.WriteString(html.EscapeString(string(line.Value(source))))
+		}
+	} else if n.HasClosure() {
+		closure := n.ClosureLine
+		_, _ = w.WriteString(html.EscapeString(string(closure.Value(source))))
+	}
+	return ast.WalkContinue, nil
+}
+
+// renderRawHTML emits the original source of inline raw HTML as escaped text.
+func (r *rawHTMLRenderer) renderRawHTML(w util.BufWriter, source []byte, node ast.Node, entering bool) (ast.WalkStatus, error) {
+	if !entering {
+		return ast.WalkSkipChildren, nil
+	}
+	n := node.(*ast.RawHTML)
+	for i := 0; i < n.Segments.Len(); i++ {
+		segment := n.Segments.At(i)
+		_, _ = w.WriteString(html.EscapeString(string(segment.Value(source))))
+	}
+	return ast.WalkSkipChildren, nil
 }
 
 // RegisterFuncs implements renderer.NodeRenderer.

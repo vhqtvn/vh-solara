@@ -245,6 +245,35 @@ func New() *FakeOpenCode {
 			Parts: []map[string]any{textPart("sl4", "slow", "slp4", "Rollback is automatic: the canary watches the SLO and reverts to the previous image within 60s.", now-3550)},
 		},
 	}
+	// Markdown-hardening session: a self-contained transcript exercising the
+	// HTML-escape-as-text policy (feature 2) and the image-proxy rewrite
+	// (feature 1). Loaded ONLY by web/tests/e2e/markdown-harden.spec.ts; it is a
+	// separate root session so it does not perturb the demo session tree shape
+	// other specs assert against.
+	f.sessions = append(f.sessions, map[string]any{
+		"id": "mdhard", "projectID": "proj", "title": "Markdown hardening", "directory": demoDir,
+		"model": map[string]any{"providerID": "fake", "id": "dummy", "variant": "default"},
+		"time":  map[string]any{"created": now - 6000, "updated": now - 6000},
+	})
+	f.messages["mdhard"] = []messageWithParts{
+		{
+			Info:  map[string]any{"id": "mh1", "sessionID": "mdhard", "role": "user", "time": map[string]any{"created": now - 6000, "completed": now - 6000}},
+			Parts: []map[string]any{textPart("mh1", "mdhard", "mhp1", "Show me the report tags and an external image.", now-6000)},
+		},
+		{
+			Info: map[string]any{"id": "mh2", "sessionID": "mdhard", "role": "assistant", "agent": "build", "time": map[string]any{"created": now - 5900, "completed": now - 5800},
+				"model": map[string]any{"providerID": "fake", "modelID": "dummy", "variant": "default"}},
+			Parts: []map[string]any{
+				textPart("mh2", "mdhard", "mhp2",
+					"Here is a custom report block and an external diagram:\n\n"+
+						"<report>\nstatus: ok\n</report>\n\n"+
+						"The tag <vh-solara> is also unsupported HTML.\n\n"+
+						"![architecture diagram](https://example.com/diagram.png)\n\n"+
+						"And some normal **bold** text with `inline code`.",
+					now-5900),
+			},
+		},
+	}
 	// Opt-in heavy session for benchmarking: VH_BENCH_MESSAGES=N seeds a "bench"
 	// session with N complex messages (markdown + code + tool calls + diffs).
 	if n, _ := strconv.Atoi(os.Getenv("VH_BENCH_MESSAGES")); n > 0 {

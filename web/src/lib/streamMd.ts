@@ -1,4 +1,4 @@
-import { marked } from "marked";
+import { messageMarked } from "./messageMarkdown";
 import { caretTarget } from "./streamCaret";
 
 // Incremental streaming-markdown renderer for the LIVE preview.
@@ -19,15 +19,26 @@ import { caretTarget } from "./streamCaret";
 //
 // (The settled view still re-renders server-side: highlighting / mermaid.)
 //
-// Same safe config as the one-shot renderer: raw HTML dropped, dangerous URLs
-// neutralized — a streamed reply can't inject markup.
-marked.use({ gfm: true, breaks: true, renderer: { html: () => "" } });
+// Same safe config as the one-shot renderer: the shared policy
+// (messageMarkdown.ts) ESCAPES raw HTML as visible literal text instead of
+// dropping it, and dangerous URLs are neutralized — a streamed reply can't
+// inject markup.
+//
+// CRITICAL: this module MUST call messageMarked.lexer / messageMarked.parser
+// (instance methods), NOT the static marked.lexer / marked.parser. The static
+// functions use the global default renderer, which would silently skip the
+// escape policy on the streaming token-by-token path.
+//
+// ALSO CRITICAL: messageMarked.parser(tokens, opts) uses `opts ?? this.defaults`
+// — it REPLACES, not merges. Passing `{ async: false }` would lose the custom
+// renderer. The parser() method returns `string` (not Promise<string>), so no
+// async flag is needed.
 const URL_SCRUB = /\s(href|src)\s*=\s*("|')\s*(?:javascript|data|vbscript):[^"']*\2/gi;
 
 function tokenHtml(token: unknown): string {
   let html: string;
   try {
-    html = marked.parser([token as never], { async: false }) as string;
+    html = messageMarked.parser([token as never]) as string;
   } catch {
     return "";
   }
@@ -107,7 +118,7 @@ export class StreamMd {
 
     let tokens: { raw: string; type?: string }[];
     try {
-      tokens = marked.lexer(text.slice(this.committedLen)) as { raw: string; type?: string }[];
+      tokens = messageMarked.lexer(text.slice(this.committedLen)) as { raw: string; type?: string }[];
     } catch {
       return;
     }

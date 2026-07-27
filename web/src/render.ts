@@ -3,6 +3,8 @@
 // results by content so each unique block is rendered once. In-flight streaming
 // content is rendered raw by the caller, not here.
 
+import { rewriteImageSrcs } from "./lib/markdownEnhance";
+
 type Kind = "markdown" | "diff" | "patch";
 
 interface PendingReq {
@@ -47,7 +49,11 @@ async function flush() {
     const arr: { id: string; html: string }[] = await res.json();
     const byId = new Map(arr.map((r) => [r.id, r.html]));
     batch.forEach((b, i) => {
-      const html = byId.get(String(i)) ?? "";
+      // Rewrite image srcs BEFORE caching/returning so the browser never
+      // fetches a cross-origin/dangerous URL directly. This runs on the
+      // detached HTML string (before Part.tsx inserts it into the live DOM);
+      // once an <img> is live the external fetch has already fired.
+      const html = rewriteImageSrcs(byId.get(String(i)) ?? "");
       cacheSet(b.key, html);
       b.resolve(html);
     });
