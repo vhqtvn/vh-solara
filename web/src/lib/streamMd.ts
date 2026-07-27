@@ -1,4 +1,4 @@
-import { messageMarked } from "./messageMarkdown";
+import { messageMarked, normalizeAttrs } from "./messageMarkdown";
 import { caretTarget } from "./streamCaret";
 
 // Incremental streaming-markdown renderer for the LIVE preview.
@@ -33,7 +33,6 @@ import { caretTarget } from "./streamCaret";
 // — it REPLACES, not merges. Passing `{ async: false }` would lose the custom
 // renderer. The parser() method returns `string` (not Promise<string>), so no
 // async flag is needed.
-const URL_SCRUB = /\s(href|src)\s*=\s*("|')\s*(?:javascript|data|vbscript):[^"']*\2/gi;
 
 function tokenHtml(token: unknown): string {
   let html: string;
@@ -42,7 +41,12 @@ function tokenHtml(token: unknown): string {
   } catch {
     return "";
   }
-  return html.replace(URL_SCRUB, ' $1="#"');
+  // Defense-in-depth: normalizeAttrs strips javascript:/vbscript: from href/src
+  // and neutralizes non-raster data: schemes, while KEEPING the raster
+  // data:image/* the classifier (classifyImageSrc) intentionally kept. Owned in
+  // ONE place (messageMarkdown.ts) so the streaming path cannot diverge from
+  // the classifier's keep decision. (B1.)
+  return normalizeAttrs(html);
 }
 
 // Time cap for re-parsing the trailing block. A re-parse re-renders that block's

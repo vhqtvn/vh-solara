@@ -11,7 +11,14 @@
 // DROPPING. These tests explicitly check that the escaped text IS present.
 
 import { describe, expect, it } from "vitest";
-import { messageMarked, escapeHtml, classifyImageSrc } from "../../src/lib/messageMarkdown";
+import {
+  messageMarked,
+  escapeHtml,
+  classifyImageSrc,
+  normalizeAttrs,
+  RASTER_DATA_IMG,
+} from "../../src/lib/messageMarkdown";
+import { rewriteImageSrcs } from "../../src/lib/markdownEnhance";
 import { renderStreamMd } from "../../src/lib/md";
 import { StreamMd } from "../../src/lib/streamMd";
 
@@ -319,5 +326,193 @@ describe("renderer.image — classifier applied in render output", () => {
     const streamed = host.innerHTML;
     expect(streamed).toContain("/vh/img?url=");
     expect(streamed).not.toContain('src="https://cdn.example.com');
+  });
+});
+
+// --- B1: streaming/settled raster-data-image parity ------------------------
+// (defer-streaming-data-image-scrub-divergence)
+//
+// Both streaming entry points (renderStreamMd via md.ts, StreamMd.push via
+// streamMd.ts) route rendered HTML through normalizeAttrs, which is keyed on the
+// SAME raster allowlist (RASTER_DATA_IMG) the pre-render classifier
+// (classifyImageSrc) uses. The settled path (rewriteImageSrcs) applies the
+// classifier directly. All three must AGREE: a raster data:image/* the operator
+// kept is NOT neutralized by the streaming post-scrub. The old inline URL_SCRUB
+// neutralized ALL data: schemes and silently undid the keep.
+//
+// Parity matrix pinned here:
+//   - retain <img src="data:image/(png|jpeg|gif|webp|avif);...">;
+//   - neutralize javascript:/vbscript: on BOTH href and src;
+//   - neutralize SVG / non-allowlisted data: on src;
+//   - retain benign href="data:image/png;...";
+//   - neutralize href="data:text/html,...".
+describe("B1 — normalizeAttrs + classifier parity across streaming + settled", () => {
+  // sanity: the exported allowlist matches the classifier's keep set.
+  it("RASTER_DATA_IMG is the single source of truth and matches the allowlist", () => {
+    expect(RASTER_DATA_IMG.test("data:image/png;base64,x")).toBe(true);
+    expect(RASTER_DATA_IMG.test("data:image/jpeg;base64,x")).toBe(true);
+    expect(RASTER_DATA_IMG.test("data:image/gif;base64,x")).toBe(true);
+    expect(RASTER_DATA_IMG.test("data:image/webp;base64,x")).toBe(true);
+    expect(RASTER_DATA_IMG.test("data:image/avif;base64,x")).toBe(true);
+    expect(RASTER_DATA_IMG.test("data:image/svg+xml;base64,x")).toBe(false);
+    expect(RASTER_DATA_IMG.test("data:text/html,<x>")).toBe(false);
+  });
+
+  // Render the same markdown through all three paths. rewriteImageSrcs is
+  // img-src-only (it never touches href), so it is omitted from the href cases.
+  function renderAll(md: string): { oneShot: string; stream: string; settled: string } {
+    const host = document.createElement("div");
+    const s = new StreamMd(host);
+    s.push(md);
+    const stream = host.innerHTML;
+    const oneShot = renderStreamMd(md);
+    // rewriteImageSrcs operates on already-rendered HTML; feed it the one-shot
+    // output (which still carries the classifier-applied img tags).
+    const settled = rewriteImageSrcs(oneShot);
+    return { oneShot, stream, settled };
+  }
+
+  // --- direct unit cases on normalizeAttrs (the streaming scrub, isolated) ---
+  it("normalizeAttrs keeps raster data: img src; neutralizes svg/non-raster src", () => {
+    expect(normalizeAttrs('<img src="data:image/png;base64,AAAA">')).toContain(
+      'src="data:image/png;base64,AAAA"',
+    );
+    expect(normalizeAttrs('<img src="data:image/svg+xml;base64,PHN2">')).toContain('src="#"');
+    expect(normalizeAttrs('<img src="data:text/html,<x>">')).toContain('src="#"');
+  });
+
+  it("normalizeAttrs neutralizes javascript:/vbscript: on BOTH href and src", () => {
+    expect(normalizeAttrs('<a href="javascript:alert(1)">x</a>')).toContain('href="#"');
+    expect(normalizeAttrs('<a href="vbscript:msgbox">x</a>')).toContain('href="#"');
+    expect(normalizeAttrs('<img src="javascript:alert(1)">')).toContain('src="#"');
+    expect(normalizeAttrs('<img src="vbscript:msgbox">')).toContain('src="#"');
+    // and never leaks the scheme text
+    expect(normalizeAttrs('<a href="javascript:alert(1)">x</a>')).not.toContain("javascript:");
+  });
+
+  it("normalizeAttrs keeps benign raster data: href; neutralizes data:text/html href", () => {
+    expect(normalizeAttrs('<a href="data:image/png;base64,iVBOR">x</a>')).toContain(
+      'href="data:image/png;base64,iVBOR"',
+    );
+    expect(normalizeAttrs('<a href="data:image/png;base64,iVBOR">x</a>')).not.toContain('href="#"');
+    expect(normalizeAttrs('<a href="data:text/html,<h1>x</h1>">x</a>')).toContain('href="#"');
+    expect(normalizeAttrs('<a href="data:text/html,<h1>x</h1>">x</a>')).not.toContain("data:text/html");
+  });
+
+  it("normalizeAttrs is case-insensitive on scheme + MIME", () => {
+    expect(normalizeAttrs('<img src="DATA:IMAGE/PNG;base64,x">')).toContain(
+      'src="DATA:IMAGE/PNG;base64,x"',
+    );
+    expect(normalizeAttrs('<a HREF="JavaScript:alert(1)">x</a>')).not.toContain("JavaScript:");
+  });
+
+  it("normalizeAttrs leaves safe attributes untouched", () => {
+    const html = '<a href="/path/x">x</a><img src="/assets/y.png" alt="z">';
+    expect(normalizeAttrs(html)).toBe(html);
+  });
+
+  // --- the load-bearing B1 case, pinned across all three renderers ----------
+  const rasterTypes = [
+    ["png", "data:image/png;base64,iVBOR"],
+    ["jpeg", "data:image/jpeg;base64,/9j/"],
+    ["gif", "data:image/gif;base64,R0lG"],
+    ["webp", "data:image/webp;base64,UklGR"],
+    ["avif", "data:image/avif;base64,"],
+  ] as const;
+
+  for (const [name, dataUrl] of rasterTypes) {
+    it(`retains <img src="${name} raster"> in renderStreamMd, StreamMd.push, AND rewriteImageSrcs`, () => {
+      const md = `![a](${dataUrl})`;
+      const { oneShot, stream, settled } = renderAll(md);
+      const cases: [string, string][] = [
+        ["renderStreamMd", oneShot],
+        ["StreamMd.push", stream],
+        ["rewriteImageSrcs", settled],
+      ];
+      for (const [label, html] of cases) {
+        expect(html, `${label} must keep the raster data src`).toContain(`src="${dataUrl}"`);
+        expect(html, `${label} must NOT neutralize the kept raster src to #`).not.toContain('src="#"');
+        expect(html, `${label} must emit an img`).toContain("<img");
+      }
+    });
+  }
+
+  it("B1 pinned: streamed ![a](data:image/png;base64,AAAA) stays <img> with data src (NOT src=#)", () => {
+    const host = document.createElement("div");
+    const s = new StreamMd(host);
+    s.push("![a](data:image/png;base64,AAAA)");
+    const html = host.innerHTML;
+    expect(html).toContain("<img");
+    expect(html).toContain('src="data:image/png;base64,AAAA"');
+    expect(html).not.toContain('src="#"');
+    // And the one-shot path agrees (the regression was streaming-only before).
+    expect(renderStreamMd("![a](data:image/png;base64,AAAA)")).toContain(
+      'src="data:image/png;base64,AAAA"',
+    );
+  });
+
+  it("neutralizes SVG / non-allowlisted data: on src across all three paths", () => {
+    const md = "![x](data:image/svg+xml;base64,PHN2Zz4=)";
+    const { oneShot, stream, settled } = renderAll(md);
+    const cases: [string, string][] = [
+      ["renderStreamMd", oneShot],
+      ["StreamMd.push", stream],
+      ["rewriteImageSrcs", settled],
+    ];
+    for (const [label, html] of cases) {
+      expect(html, `${label} must not keep svg data src`).not.toContain("data:image/svg");
+      expect(html, `${label} must not carry any data: src`).not.toContain('src="data:');
+    }
+  });
+
+  it("neutralizes javascript: link href in BOTH streaming paths (settled rewriteImageSrcs is img-only, out of scope)", () => {
+    const md = "[click](javascript:alert(1))";
+    const oneShot = renderStreamMd(md);
+    const host = document.createElement("div");
+    const s = new StreamMd(host);
+    s.push(md);
+    const stream = host.innerHTML;
+    for (const [label, html] of [["renderStreamMd", oneShot], ["StreamMd.push", stream]] as const) {
+      expect(html, label).not.toContain("javascript:");
+      expect(html, label).toContain('href="#"');
+    }
+  });
+
+  it("neutralizes vbscript: link href in BOTH streaming paths", () => {
+    const md = "[x](vbscript:msgbox)";
+    const oneShot = renderStreamMd(md);
+    const host = document.createElement("div");
+    const s = new StreamMd(host);
+    s.push(md);
+    const stream = host.innerHTML;
+    for (const [label, html] of [["renderStreamMd", oneShot], ["StreamMd.push", stream]] as const) {
+      expect(html, label).not.toContain("vbscript:");
+      expect(html, label).toContain('href="#"');
+    }
+  });
+
+  it("retains benign raster data: link href; neutralizes data:text/html link href (both streaming paths)", () => {
+    // raster data: href is benign (no script execution from a data:image href) — kept.
+    const pngMd = "[a](data:image/png;base64,iVBOR)";
+    const pngOne = renderStreamMd(pngMd);
+    const pngHost = document.createElement("div");
+    const ps = new StreamMd(pngHost);
+    ps.push(pngMd);
+    const pngStream = pngHost.innerHTML;
+    for (const [label, html] of [["renderStreamMd", pngOne], ["StreamMd.push", pngStream]] as const) {
+      expect(html, label).toContain('href="data:image/png;base64,iVBOR"');
+      expect(html, label).not.toContain('href="#"');
+    }
+    // data:text/html href is dangerous — neutralized.
+    const htmlMd = "[a](data:text/html,<h1>x</h1>)";
+    const htmlOne = renderStreamMd(htmlMd);
+    const htmlHost = document.createElement("div");
+    const hs = new StreamMd(htmlHost);
+    hs.push(htmlMd);
+    const htmlStream = htmlHost.innerHTML;
+    for (const [label, html] of [["renderStreamMd", htmlOne], ["StreamMd.push", htmlStream]] as const) {
+      expect(html, label).not.toContain("data:text/html");
+      expect(html, label).toContain('href="#"');
+    }
   });
 });

@@ -1,4 +1,4 @@
-import { messageMarked } from "./messageMarkdown";
+import { messageMarked, normalizeAttrs } from "./messageMarkdown";
 
 // Client-side markdown for the LIVE streaming preview (the settled view still
 // uses the server's sanitized/highlighted renderer). The shared policy
@@ -13,6 +13,10 @@ export function renderStreamMd(text: string): string {
   } catch {
     return "";
   }
-  // Defense-in-depth: strip javascript:/data:/vbscript: from href/src.
-  return html.replace(/\s(href|src)\s*=\s*("|')\s*(?:javascript|data|vbscript):[^"']*\2/gi, ' $1="#"');
+  // Defense-in-depth: normalizeAttrs strips javascript:/vbscript: from href/src
+  // and neutralizes non-raster data: schemes, while KEEPING the raster
+  // data:image/* the classifier (classifyImageSrc) intentionally kept. Owned
+  // in ONE place (messageMarkdown.ts) so the streaming path cannot diverge
+  // from the classifier's keep decision. (B1.)
+  return normalizeAttrs(html);
 }

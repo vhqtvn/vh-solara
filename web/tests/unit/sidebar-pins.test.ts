@@ -102,11 +102,29 @@ describe("applyPinsSnapshot — initialized server wins unconditionally", () => 
     expect((readLegacyEnv("vh.pinned-order.v1") as { data: string[] }).data).toEqual(["x", "y"]);
   });
 
-  it("clears a prior advisory error on a confirmed doc", () => {
-    // Plant an error state by adopting then erroring is awkward; instead verify
-    // a snapshot after an updated-induced error clears it indirectly via adopt.
-    applyPinsSnapshot(pinDoc(1, true, ["a"]));
+  it("clears a prior advisory error on a confirmed doc (Gap 1)", async () => {
+    // p5-defer-sidebar-pins-test-gaps Gap 1: the prior version never planted
+    // pinsLastError before asserting null — comment admitted "instead verify
+    // indirectly" — so the assertion was trivially green. Drive a REAL error
+    // first so the clear-on-confirmed-doc assertion is load-bearing.
+    //
+    // 1. Seed an initialized server doc.
+    applyPinsSnapshot(pinDoc(1, true, ["x"]));
     expect(pinsLastError()).toBeNull();
+    // 2. Drive an error: a togglePin whose PUT fails on the network. The
+    //    optimistic ["x","y"] rolls back to ["x"] and pinsLastError="pin-network"
+    //    (the load-bearing precondition the old test never set).
+    vi.stubGlobal("fetch", vi.fn(() => Promise.reject(new Error("net"))));
+    await togglePin("y");
+    expect(pinsLastError()).toBe("pin-network");
+    expect(reconciledPinnedOrder()).toEqual(["x"]); // optimistic rolled back
+    expect(pinsRevision()).toBe(1);
+    // 3. A confirmed snapshot (server authority) clears the advisory error via
+    //    adoptServerDoc → clearPinsErrorSig, and adopts the new order/revision.
+    applyPinsSnapshot(pinDoc(2, true, ["x", "y"]));
+    expect(pinsLastError()).toBeNull();
+    expect(reconciledPinnedOrder()).toEqual(["x", "y"]);
+    expect(pinsRevision()).toBe(2);
   });
 });
 
@@ -662,6 +680,46 @@ describe("Phase 6 — concurrency + DEFER regressions", () => {
     expect(reconciledPinnedOrder()).toEqual(["z"]); // NOT regressed to ["a"]
     expect(pinsRevision()).toBe(5);
     expect(pinsLastError()).toBeNull();
+  });
+
+  // p5-defer-sidebar-pins-test-gaps Gap 2: no test exercised the SERVER-DOC
+  // adoption path (applyPinsSnapshot, the bootstrap reset that is EXEMPT from
+  // the revision-monotonicity guard) landing DURING an in-flight PUT. The
+  // snapshot is authoritative and resets the base; a subsequent 200 must then
+  // reconcile via adoptPutResponse's guard without clobbering the snapshot or
+  // regressing revision. (Gap 3 — the 409-retry-rollback race — is covered by
+  // the DEFER1 test above, so it is intentionally NOT duplicated here.)
+  it("Gap 2: a pins.snapshot during an in-flight PUT reconciles without clobber", async () => {
+    applyPinsSnapshot(pinDoc(1, true, []));
+    // Start togglePin("a") with a PUT that stays pending (unresolved).
+    let resolvePut!: (v: Response) => void;
+    vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>((r) => (resolvePut = r))));
+
+    const p = togglePin("a");
+    await flush(); // PUT issued, pending; optimistic ["a"] applied
+    expect(pinsPending()).toBe(true);
+    expect(reconciledPinnedOrder()).toEqual(["a"]); // optimistic
+    expect(pinsRevision()).toBe(1);
+
+    // While the PUT is in flight, a server snapshot lands (e.g. a reconnect
+    // re-bootstrap). The snapshot is authoritative and EXEMPT from the F1 guard,
+    // so it adopts ["b","c"] at rev2 — overwriting the optimistic ["a"].
+    applyPinsSnapshot(pinDoc(2, true, ["b", "c"]));
+    expect(reconciledPinnedOrder()).toEqual(["b", "c"]); // server authority wins
+    expect(pinsRevision()).toBe(2);
+
+    // The PUT now resolves 200 with a doc that reconciles the snapshot + the
+    // pin (server applied our pin on top of the snapshot it sent: rev3,
+    // ["b","c","a"]). adoptPutResponse honors the F1 guard: 3 >= 2 → adopted.
+    resolvePut(jsonRes(pinDoc(3, true, ["b", "c", "a"]), 200));
+    await p;
+
+    // Final state reconciles: no clobber of the snapshot, revision monotonic
+    // (1 → 2 → 3), no advisory error.
+    expect(reconciledPinnedOrder()).toEqual(["b", "c", "a"]);
+    expect(pinsRevision()).toBe(3);
+    expect(pinsLastError()).toBeNull();
+    expect(pinsPending()).toBe(false);
   });
 });
 

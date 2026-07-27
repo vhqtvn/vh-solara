@@ -71,7 +71,13 @@ export type ImageSrcAction =
 
 // Raster image MIME types permitted in data: URLs. SVG is deliberately absent
 // (SVG can carry scripts / external references and is neutralized).
-const RASTER_DATA_IMG = /^data:image\/(?:png|jpeg|gif|webp|avif)\b/i;
+//
+// Exported as the SINGLE source of truth for the raster allowlist: the
+// pre-render classifier (classifyImageSrc) and the streaming post-render scrub
+// (normalizeAttrs) both key off it so a raster data:image/* the operator kept
+// at classification time is NOT re-neutralized by the streaming defense-in-depth
+// pass. (B1 — defer-streaming-data-image-scrub-divergence.)
+export const RASTER_DATA_IMG = /^data:image\/(?:png|jpeg|gif|webp|avif)\b/i;
 
 export function classifyImageSrc(
   src: string | null | undefined,
@@ -164,6 +170,62 @@ export const messageMarked = new Marked({
     }
   },
 });
+
+// normalizeAttrs — the post-render defense-in-depth attribute normalizer for
+// the STREAMING path (one-shot fallback + incremental streaming engine).
+//
+// WHY THIS EXISTS (B1 — defer-streaming-data-image-scrub-divergence): both
+// streaming callers (md.ts renderStreamMd, streamMd.ts tokenHtml) used to run
+// an inline URL_SCRUB regex that neutralized EVERY data: scheme on href/src.
+// That scrubber was added as orthogonal defense-in-depth, but it DIVERGED from
+// the classifier: classifyImageSrc intentionally KEEPS raster data:image/*
+// (operator decision), and the inline scrub silently undid that keep on the
+// streaming path (a streamed ![a](data:image/png;base64,...) became src="#").
+// The settled path (rewriteImageSrcs) applies the classifier with NO scrub, so
+// it was correct — streaming was the lone divergent layer.
+//
+// O3 fix (unify the policy in ONE place, parameterized by the classifier's own
+// raster allowlist). normalizeAttrs mirrors the classifier's keep decision:
+//
+//   javascript: / vbscript:   — fully neutralized on BOTH href and src
+//                               (unchanged from the prior scrub).
+//   data: on src              — neutralized UNLESS it is a raster image
+//                               (RASTER_DATA_IMG); SVG / non-raster data: on
+//                               src still neutralized (matches classifyImageSrc).
+//   data: on href             — neutralized UNLESS it is a raster image
+//                               (a benign href="data:image/png;..." is kept);
+//                               href="data:text/html,..." still neutralized.
+//   everything else           — unchanged.
+//
+// "Neutralize" = rewrite the attribute VALUE to "#", matching the prior scrub's
+// visible behavior so a malformed link still renders as a dead "#" (the value is
+// replaced, the attribute/quote structure is preserved so the tag stays valid).
+// This is defense-in-depth ONLY — the classifier already neutralized dangerous
+// img src at render time; this catches any href or stray attribute the renderer
+// did not own (links have no custom renderer).
+//
+// NOTE: this is a regex scrub, not a full HTML parse. It anchors each match on a
+// preceding whitespace + the literal attr name + `=`, so it cannot match
+// mid-word. This is the SAME surface the prior inline scrub covered; no regression.
+const ATTR_DANGER = /\s(href|src)\s*=\s*("|')\s*(javascript|vbscript|data):([^"']*)\2/gi;
+
+export function normalizeAttrs(html: string): string {
+  if (!html) return html;
+  return html.replace(
+    ATTR_DANGER,
+    (match, attr: string, _quote: string, scheme: string, value: string) => {
+      // A data: URL is kept ONLY when it is a raster image the classifier would
+      // also keep (single source of truth: RASTER_DATA_IMG). Reconstruct the
+      // "data:<value>" form the allowlist regex expects.
+      if (scheme.toLowerCase() === "data" && RASTER_DATA_IMG.test("data:" + value)) {
+        return match; // raster image — leave the attribute exactly as-is
+      }
+      // javascript: / vbscript: on either attr, and non-raster data: (SVG,
+      // text/html, application/*, …) on either attr → neutralize to "#".
+      return ` ${attr}="#"`;
+    },
+  );
+}
 
 // Re-export the Token type alias so callers don't need a separate import.
 type Token = { type?: string };
