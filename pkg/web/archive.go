@@ -127,11 +127,26 @@ func (s *Server) handleArchive(w http.ResponseWriter, r *http.Request) {
 		// unattended programmatic archives) → current behavior, no fence
 		// (backward-compat, matches the If-Idle-Seq opt-in precedent).
 		//
-		// This is a point-in-time fence over the T0→T1 preview→commit window
-		// (C5's scope). A mutation landing AFTER this check but before the
-		// archive loop completes (below) is a pre-existing race out of C5's
-		// scope; the fingerprint is coherent with the `affected` slice the
-		// loop will archive (both come from the same Descendants return).
+		// Point-in-time fence over the T0→T1 preview→commit window (C5's scope).
+		// A mutation landing AFTER this check but before the SetArchived loop
+		// below is a RESIDUAL RACE that is explicitly ACCEPTED here, not a gap
+		// to close: (1) true atomicity is impractical across the OpenCode HTTP
+		// boundary — spawns originate IN OPENCODE (a subagent launch), not in
+		// this store, so a store-level lock cannot keep a new child out of the
+		// subtree while the loop runs; that new id is absent from the `affected`
+		// snapshot (the Descendants call above) and is never archived, though
+		// its parent is. (2) A re-Descendants guard per loop iteration is still
+		// racy per-id (membership can flip between the re-check and SetArchived)
+		// and adds N extra reads without eliminating the window. (3) The race is
+		// ACCEPTED because blast radius is bounded to ONE un-archived straggler
+		// (recoverable), never data loss: the orphan banner surfaces it. The
+		// server recomputes Node.flags.orphan via isOrphanLocked
+		// (pkg/state/tree_emitter.go) when an archived root leaves a resident
+		// descendant; web/src/components/OrphanBanner.tsx renders those nodes as
+		// an "Archive orphans" affordance the operator clicks to re-archive the
+		// straggler (the same recovery path the len(affected)==0 fallback above
+		// relies on). The fingerprint stays coherent with the `affected` slice
+		// the loop archives (both derive from the one Descendants return).
 		if body.ExpectedFingerprint != "" {
 			cur := state.FingerprintIDs(affected)
 			if cur != body.ExpectedFingerprint {

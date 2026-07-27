@@ -25,24 +25,6 @@
 // innerText failure mode.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-// jsdom doesn't implement matchMedia, but importing Part pulls in code/frame →
-// layout, which calls window.matchMedia at module load. Stub it BEFORE the
-// component import is evaluated (vi.hoisted runs ahead of static imports).
-vi.hoisted(() => {
-  const w = globalThis as unknown as { matchMedia?: unknown };
-  if (!w.matchMedia) {
-    w.matchMedia = (query: string) => ({
-      matches: false,
-      media: query,
-      onchange: null,
-      addEventListener: () => {},
-      removeEventListener: () => {},
-      addListener: () => {},
-      removeListener: () => {},
-      dispatchEvent: () => false,
-    });
-  }
-});
 import { addCodeCopyButtons } from "../../src/lib/markdownEnhance";
 
 // Build a DOM matching chroma's real server-rendered output for a two-line
