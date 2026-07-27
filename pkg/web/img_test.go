@@ -2,11 +2,17 @@ package web
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
+	"errors"
+	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
+	"time"
 )
 
 // --- URL validation ------------------------------------------------------
@@ -320,4 +326,343 @@ func TestHandleImgErrorBodyGeneric(t *testing.T) {
 			t.Fatalf("error body leaks %q: %q", secret, body)
 		}
 	}
+}
+
+// ============================================================================
+// CRUX 1 — dial-time IP pinning (imgDialContextWith seam).
+//
+// These tests inject a recording resolver + dial and assert the OUTCOME of the
+// pinned-dial behavior: no public-sibling picking from a mixed list; the dialed
+// address is the validated IP LITERAL (no rebind); the IP-literal fast path
+// validates before dial; production defaults are wired. NO real network/DNS.
+//
+// NOTE on IP choice: the test plan named 203.0.113.1 as the "valid public"
+// target, but 203.0.113.0/24 is TEST-NET-3 and is explicitly forbidden by
+// imgForbiddenV4 (img.go). We use 93.184.216.34 (example.com — genuinely
+// public-global-unicast, already in the allowed list above) instead.
+// ============================================================================
+
+// TestImgDialContext_RejectsMixedAddressList proves the policy "reject if ANY
+// resolved address is forbidden" — a public sibling MUST NOT be dialed when a
+// forbidden address shares the result list.
+func TestImgDialContext_RejectsMixedAddressList(t *testing.T) {
+	dialCalled := false
+	cfg := imgDialConfig{
+		resolver: func(ctx context.Context, host string) ([]net.IPAddr, error) {
+			return []net.IPAddr{
+				{IP: net.ParseIP("93.184.216.34")}, // public-global-unicast
+				{IP: net.ParseIP("10.0.0.1")},      // RFC1918 forbidden
+			}, nil
+		},
+		dial: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			dialCalled = true
+			return nil, errors.New("dial must not be reached")
+		},
+	}
+	_, err := imgDialContextWith(cfg)(context.Background(), "tcp", "example.com:80")
+	if !errors.Is(err, errForbiddenDest) {
+		t.Fatalf("mixed address list: err=%v, want errForbiddenDest (reject if ANY addr forbidden)", err)
+	}
+	if dialCalled {
+		t.Fatal("dial must NOT be called when any resolved address is forbidden — no public-sibling picking")
+	}
+}
+
+// TestImgDialContext_PinsValidatedLiteral_NoRebind is THE crux: it proves the
+// dialed address is the validated IP LITERAL and that no second DNS lookup
+// happens at dial time (closing the rebind/TOCTOU window). A stateful resolver
+// returns a valid public IP on call 1 and a forbidden IP on call 2 (simulated
+// rebind); the recording dial captures the literal it was handed.
+func TestImgDialContext_PinsValidatedLiteral_NoRebind(t *testing.T) {
+	resolverCalls := 0
+	var dialed []string
+	cfg := imgDialConfig{
+		resolver: func(ctx context.Context, host string) ([]net.IPAddr, error) {
+			resolverCalls++
+			if resolverCalls == 1 {
+				return []net.IPAddr{{IP: net.ParseIP("93.184.216.34")}}, nil // valid public
+			}
+			// Call 2 would only happen if dial re-resolved the hostname — a
+			// rebind. It MUST NOT happen.
+			return []net.IPAddr{{IP: net.ParseIP("10.0.0.1")}}, nil // forbidden (the rebind)
+		},
+		dial: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			dialed = append(dialed, addr)
+			return nil, errors.New("sentinel: dial reached")
+		},
+	}
+	_, err := imgDialContextWith(cfg)(context.Background(), "tcp", "example.com:80")
+	// The sentinel error proves dial was actually reached (not short-circuited).
+	if err == nil || !strings.Contains(err.Error(), "sentinel") {
+		t.Fatalf("err=%v, want the sentinel error proving dial was actually reached", err)
+	}
+	if resolverCalls != 1 {
+		t.Fatalf("resolver calls = %d, want exactly 1 (no second lookup at dial time → rebind impossible)", resolverCalls)
+	}
+	want := []string{"93.184.216.34:80"}
+	if len(dialed) != 1 || dialed[0] != want[0] {
+		t.Fatalf("dialed = %v, want %v (the validated IP LITERAL, NOT the hostname)", dialed, want)
+	}
+}
+
+// TestImgDialContext_IPLiteralShortcut proves the IP-literal fast path validates
+// BEFORE any resolution/dial: a forbidden IP literal is rejected without calling
+// resolver or dial, and a valid IP literal is dialed by its literal directly.
+func TestImgDialContext_IPLiteralShortcut(t *testing.T) {
+	// Forbidden IP literal → errForbiddenDest, resolver/dial never called.
+	resolverCalled := false
+	dialCalled := false
+	cfg := imgDialConfig{
+		resolver: func(ctx context.Context, host string) ([]net.IPAddr, error) {
+			resolverCalled = true
+			return nil, errors.New("resolver must not be reached")
+		},
+		dial: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			dialCalled = true
+			return nil, errors.New("dial must not be reached")
+		},
+	}
+	_, err := imgDialContextWith(cfg)(context.Background(), "tcp", "169.254.169.254:80")
+	if !errors.Is(err, errForbiddenDest) {
+		t.Fatalf("169.254.169.254:80 err=%v, want errForbiddenDest", err)
+	}
+	if resolverCalled || dialCalled {
+		t.Fatal("resolver/dial must NOT be called for a forbidden IP literal (validate before dial)")
+	}
+
+	// Valid IP literal → dial called with that literal (no resolution).
+	var dialed string
+	cfg2 := imgDialConfig{
+		resolver: func(ctx context.Context, host string) ([]net.IPAddr, error) {
+			t.Fatal("resolver must not be called for an IP literal")
+			return nil, nil
+		},
+		dial: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			dialed = addr
+			return nil, errors.New("sentinel")
+		},
+	}
+	_, err = imgDialContextWith(cfg2)(context.Background(), "tcp", "93.184.216.34:80")
+	if err == nil || !strings.Contains(err.Error(), "sentinel") {
+		t.Fatalf("93.184.216.34:80 err=%v, want sentinel proving dial was reached", err)
+	}
+	if dialed != "93.184.216.34:80" {
+		t.Fatalf("dialed = %q, want 93.184.216.34:80 (valid IP literal passed straight to dial)", dialed)
+	}
+}
+
+// TestImgDialContext_ProductionDefaultsUnchanged is a regression guard against
+// accidental default rewiring. It asserts imgDialDefaults is wired (non-nil
+// resolver+dial) AND that the production resolver honors the parent ctx — a
+// cancelled ctx must surface as a context error through the production path
+// WITHOUT performing real DNS (the cancelled ctx short-circuits LookupIPAddr).
+func TestImgDialContext_ProductionDefaultsUnchanged(t *testing.T) {
+	if imgDialDefaults.resolver == nil {
+		t.Fatal("imgDialDefaults.resolver must be wired (net.DefaultResolver path)")
+	}
+	if imgDialDefaults.dial == nil {
+		t.Fatal("imgDialDefaults.dial must be wired (net.Dialer path)")
+	}
+	// Behavioral: the production resolver respects the parent ctx. A cancelled
+	// ctx must short-circuit through the timeout wrap into LookupIPAddr and
+	// return a context error. This proves the default resolver is wired to a
+	// ctx-honoring path (not a stub that ignores ctx) — the same observation that
+	// covers the E4 timeout-relocation preservation.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := imgDialDefaults.resolver(ctx, "example.com")
+	if err == nil {
+		t.Fatal("production resolver with cancelled ctx must return an error (ctx propagation through the timeout wrap)")
+	}
+	if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("production resolver err with cancelled ctx = %v, want a context error", err)
+	}
+}
+
+// TestImgDialContext_DNSTimeoutRelocationPreservesCtx is the focused E4
+// preservation test. The DNS-timeout wrapping was relocated from inline in the
+// dial body into imgDialDefaults.resolver. This observes the OUTCOME that the
+// relocation preserved context propagation: a cancelled parent ctx surfaces as a
+// context error PROMPTLY (the wrap neither swallows nor detaches the parent's
+// cancellation, and it does not block for imgDNSTimeout). No real DNS: the
+// cancelled ctx short-circuits LookupIPAddr before any network I/O.
+func TestImgDialContext_DNSTimeoutRelocationPreservesCtx(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	start := time.Now()
+	_, err := imgDialDefaults.resolver(ctx, "example.com")
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("production resolver must surface parent cancellation as an error (timeout wrap preserved ctx propagation)")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("resolver err = %v, want context.Canceled (parent cancellation propagated through the relocated wrap)", err)
+	}
+	// Outcome: cancellation propagated promptly — it did NOT wait imgDNSTimeout
+	// (3s). A generous bound keeps the test robust on a loaded CI box while
+	// still proving the ctx short-circuited rather than timing out.
+	if elapsed > time.Second {
+		t.Fatalf("resolver with cancelled ctx took %v; cancellation did not propagate promptly (expected sub-second)", elapsed)
+	}
+}
+
+// ============================================================================
+// CRUX 2 — redirect-hop re-validation (imgFetch with a stub RoundTripper).
+//
+// These tests build an http.Client whose Transport is a stub RoundTripper and
+// whose CheckRedirect returns http.ErrUseLastResponse (mirroring the production
+// handler at img.go), then drive imgFetch directly. ZERO production change:
+// imgFetch already accepts *http.Client.
+// ============================================================================
+
+// imgStubRT is a function adapter implementing http.RoundTripper.
+type imgStubRT func(*http.Request) (*http.Response, error)
+
+func (f imgStubRT) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+// newStubFetchClient builds an http.Client that never auto-follows redirects
+// (production's CheckRedirect contract) routed through rt.
+func newStubFetchClient(rt http.RoundTripper) *http.Client {
+	return &http.Client{
+		Transport: rt,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}
+
+// imgResp builds a minimal *http.Response for the stub RoundTripper.
+func imgResp(status int, headers map[string]string, body []byte) *http.Response {
+	r := &http.Response{
+		StatusCode: status,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(bytes.NewReader(body)),
+	}
+	for k, v := range headers {
+		r.Header.Set(k, v)
+	}
+	return r
+}
+
+// imgPNG is a minimal valid PNG body (magic bytes + payload).
+var imgPNG = append([]byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A}, []byte("payload")...)
+
+// TestImgFetch_RedirectToForbiddenIPLiteral_RejectedPerHop proves each redirect
+// Location is re-validated through imgValidateURL (img.go) — a 302 to a
+// forbidden IP literal is caught BEFORE any dial.
+func TestImgFetch_RedirectToForbiddenIPLiteral_RejectedPerHop(t *testing.T) {
+	for _, loc := range []string{
+		"http://169.254.169.254/", // cloud metadata / link-local
+		"http://10.0.0.1/",        // RFC1918
+		"http://127.0.0.1/",       // loopback
+	} {
+		u := mustParseURL(t, "http://example.com/x")
+		rt := imgStubRT(func(req *http.Request) (*http.Response, error) {
+			return imgResp(http.StatusFound, map[string]string{"Location": loc}, nil), nil
+		})
+		_, err := imgFetch(newStubFetchClient(rt), u)
+		if !errors.Is(err, errForbiddenDest) {
+			t.Fatalf("redirect to %s: err=%v, want errForbiddenDest (per-hop re-validation)", loc, err)
+		}
+	}
+}
+
+// TestImgFetch_HTTPStoHTTPDowngrade_Rejected proves an HTTPS→HTTP redirect is
+// rejected (no protocol downgrade).
+func TestImgFetch_HTTPStoHTTPDowngrade_Rejected(t *testing.T) {
+	u := mustParseURL(t, "https://target/x")
+	rt := imgStubRT(func(req *http.Request) (*http.Response, error) {
+		return imgResp(http.StatusFound, map[string]string{"Location": "http://target/y"}, nil), nil
+	})
+	_, err := imgFetch(newStubFetchClient(rt), u)
+	if err == nil || !strings.Contains(err.Error(), "downgrade") {
+		t.Fatalf("err=%v, want an https-to-http downgrade rejection", err)
+	}
+}
+
+// TestImgFetch_RedirectLoop_Rejected proves a self-referential redirect is
+// detected as a loop.
+func TestImgFetch_RedirectLoop_Rejected(t *testing.T) {
+	u := mustParseURL(t, "http://example.com/x")
+	rt := imgStubRT(func(req *http.Request) (*http.Response, error) {
+		// Always redirect to the same path → resolves to the same URL as the start.
+		return imgResp(http.StatusFound, map[string]string{"Location": "/x"}, nil), nil
+	})
+	_, err := imgFetch(newStubFetchClient(rt), u)
+	if err == nil || !strings.Contains(err.Error(), "loop") {
+		t.Fatalf("err=%v, want a redirect-loop rejection", err)
+	}
+}
+
+// TestImgFetch_TooManyRedirects_Rejected proves the ≤3-hop cap fires when the
+// upstream keeps issuing fresh redirect Locations.
+func TestImgFetch_TooManyRedirects_Rejected(t *testing.T) {
+	u := mustParseURL(t, "http://example.com/start")
+	calls := 0
+	rt := imgStubRT(func(req *http.Request) (*http.Response, error) {
+		calls++
+		return imgResp(http.StatusFound, map[string]string{"Location": fmt.Sprintf("http://example.com/hop%d", calls)}, nil), nil
+	})
+	_, err := imgFetch(newStubFetchClient(rt), u)
+	if err == nil || !strings.Contains(err.Error(), "too many redirects") {
+		t.Fatalf("err=%v, want a too-many-redirects rejection", err)
+	}
+}
+
+// TestImgFetch_MultiHopLegit_Succeeds proves a legitimate multi-hop chain is
+// followed and the final body is MIME-re-sniffed after the redirect.
+func TestImgFetch_MultiHopLegit_Succeeds(t *testing.T) {
+	u := mustParseURL(t, "http://example.com/x")
+	calls := 0
+	rt := imgStubRT(func(req *http.Request) (*http.Response, error) {
+		calls++
+		if calls == 1 {
+			// http → https upgrade (allowed) to a different host.
+			return imgResp(http.StatusFound, map[string]string{"Location": "https://other/x"}, nil), nil
+		}
+		return imgResp(http.StatusOK, nil, imgPNG), nil
+	})
+	res, err := imgFetch(newStubFetchClient(rt), u)
+	if err != nil {
+		t.Fatalf("err=%v, want nil (legit multi-hop chain should succeed)", err)
+	}
+	if res.mime != "image/png" {
+		t.Fatalf("mime=%q, want image/png (re-sniffed after redirect)", res.mime)
+	}
+	if !bytes.Equal(res.body, imgPNG) {
+		t.Fatalf("body mismatch: got %d bytes, want the stub PNG payload", len(res.body))
+	}
+	if calls != 2 {
+		t.Fatalf("stub calls = %d, want 2 (one redirect hop + one final)", calls)
+	}
+}
+
+// TestImgFetch_NeverForwardsUpstreamCredentials proves imgFetch sends only its
+// fixed minimal headers — no Cookie/Authorization/Range (which would forward
+// operator credentials or ranges upstream).
+func TestImgFetch_NeverForwardsUpstreamCredentials(t *testing.T) {
+	u := mustParseURL(t, "http://example.com/x")
+	var got http.Header
+	rt := imgStubRT(func(req *http.Request) (*http.Response, error) {
+		got = req.Header.Clone()
+		return imgResp(http.StatusOK, nil, imgPNG), nil
+	})
+	if _, err := imgFetch(newStubFetchClient(rt), u); err != nil {
+		t.Fatal(err)
+	}
+	for _, h := range []string{"Cookie", "Authorization", "Range"} {
+		if v := got.Get(h); v != "" {
+			t.Fatalf("request forwarded %s=%q; img proxy must NOT send upstream credentials/range", h, v)
+		}
+	}
+}
+
+// mustParseURL parses raw or fails the test.
+func mustParseURL(t *testing.T, raw string) *url.URL {
+	t.Helper()
+	u, err := url.Parse(raw)
+	if err != nil {
+		t.Fatalf("bad test URL %q: %v", raw, err)
+	}
+	return u
 }

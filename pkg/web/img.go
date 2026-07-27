@@ -184,52 +184,92 @@ func imgValidateURL(raw string) (*url.URL, error) {
 	return u, nil
 }
 
-// --- SSRF pinned-dial ----------------------------------------------------
+// --- SSRF pinned-dial (config + seam) ------------------------------------
 
-// imgDialContext is the custom DialContext for the image proxy transport.
-// It resolves the hostname, validates EVERY address, and dials one validated
-// address directly — preserving the original hostname for TLS (the Transport
-// handles SNI/cert verification using the URL hostname).
-func imgDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
-	host, port, err := net.SplitHostPort(addr)
-	if err != nil {
-		return nil, fmt.Errorf("split host port: %w", err)
-	}
-	// If host is already an IP literal, validate and dial directly.
-	if ip := net.ParseIP(host); ip != nil {
-		if imgAddrForbidden(ip) {
-			return nil, errForbiddenDest
+// imgDialConfig is the injection seam for the pinned-dial path. It exists so
+// regression tests can substitute a recording resolver + dial WITHOUT touching
+// production defaults or the SSRF policy (imgAddrForbidden / imgForbiddenV4).
+// Production wires imgDialDefaults; the policy logic is parameter-free.
+type imgDialConfig struct {
+	resolver func(ctx context.Context, host string) ([]net.IPAddr, error)
+	dial     func(ctx context.Context, network, addr string) (net.Conn, error)
+}
+
+// imgDialDefaults wires production semantics: DNS through net.DefaultResolver
+// capped at imgDNSTimeout, and TCP dial through a shared net.Dialer capped at
+// imgConnTimeout. The DNS-timeout wrapping lives HERE (previously inline in the
+// dial body) — the move is behavior-preserving: the derived context is consumed
+// only by LookupIPAddr, so its earlier cancel (resolver-return vs dial-return)
+// is unobservable, and parent-ctx cancellation propagates identically through
+// the wrap. The shared net.Dialer is immutable after construction and safe for
+// concurrent reuse, so binding its DialContext once is equivalent to the prior
+// per-call construction.
+var imgDialDefaults = imgDialConfig{
+	resolver: func(ctx context.Context, host string) ([]net.IPAddr, error) {
+		rctx, cancel := context.WithTimeout(ctx, imgDNSTimeout)
+		defer cancel()
+		return net.DefaultResolver.LookupIPAddr(rctx, host)
+	},
+	dial: (&net.Dialer{Timeout: imgConnTimeout}).DialContext,
+}
+
+// imgDialContextWith returns the SSRF-hardened pinned-dial function bound to c.
+// It resolves the hostname, validates EVERY returned address, rejects the whole
+// request if ANY address is forbidden (no public-sibling picking), then dials
+// the first validated IP LITERAL directly. The original hostname is preserved
+// for TLS: the http.Transport performs SNI/cert verification against the URL
+// hostname while the TCP connection goes to the validated IP.
+func imgDialContextWith(c imgDialConfig) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, fmt.Errorf("split host port: %w", err)
 		}
-		d := net.Dialer{Timeout: imgConnTimeout}
-		return d.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
-	}
-	// Resolve DNS with a timeout.
-	resolveCtx, cancel := context.WithTimeout(ctx, imgDNSTimeout)
-	defer cancel()
-	resolver := net.DefaultResolver
-	ips, err := resolver.LookupIPAddr(resolveCtx, host)
-	if err != nil {
-		return nil, fmt.Errorf("dns: %w", err)
-	}
-	if len(ips) == 0 {
-		return nil, errors.New("dns: no results")
-	}
-	// Validate EVERY address. If ANY is forbidden, reject the whole request.
-	var validIP net.IP
-	for _, ia := range ips {
-		if imgAddrForbidden(ia.IP) {
-			return nil, errForbiddenDest
+		// If host is already an IP literal, validate and dial directly.
+		if ip := net.ParseIP(host); ip != nil {
+			if imgAddrForbidden(ip) {
+				return nil, errForbiddenDest
+			}
+			return c.dial(ctx, network, net.JoinHostPort(ip.String(), port))
+		}
+		// Resolve via the injected resolver (production = net.DefaultResolver
+		// with the imgDNSTimeout cap, applied inside the imgDialDefaults closure).
+		ips, err := c.resolver(ctx, host)
+		if err != nil {
+			return nil, fmt.Errorf("dns: %w", err)
+		}
+		if len(ips) == 0 {
+			return nil, errors.New("dns: no results")
+		}
+		// Validate EVERY address. If ANY is forbidden, reject the whole request.
+		var validIP net.IP
+		for _, ia := range ips {
+			if imgAddrForbidden(ia.IP) {
+				return nil, errForbiddenDest
+			}
+			if validIP == nil {
+				validIP = ia.IP
+			}
 		}
 		if validIP == nil {
-			validIP = ia.IP
+			return nil, errors.New("dns: no valid address")
 		}
+		// E1 ANTI-REBIND INVARIANT: the dial target is deliberately the
+		// validated IP LITERAL (net.JoinHostPort(validIP.String(), port)), NOT
+		// the hostname. Pinning the literal means a second DNS lookup at dial
+		// time cannot redirect the connection to a different (forbidden)
+		// address — DNS rebinding is structurally impossible here because c.dial
+		// connects by IP, not by name. A future edit MUST NOT swap this for the
+		// hostname; doing so would reopen the TOCTOU/rebind window between
+		// validation and connect.
+		return c.dial(ctx, network, net.JoinHostPort(validIP.String(), port))
 	}
-	if validIP == nil {
-		return nil, errors.New("dns: no valid address")
-	}
-	// Dial the validated IP directly — NO second hostname lookup.
-	d := net.Dialer{Timeout: imgConnTimeout}
-	return d.DialContext(ctx, network, net.JoinHostPort(validIP.String(), port))
+}
+
+// imgDialContext is the production wired-dial entrypoint for the image-proxy
+// transport: the pinned-dial function bound to imgDialDefaults.
+func imgDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	return imgDialContextWith(imgDialDefaults)(ctx, network, addr)
 }
 
 // newImgTransport builds the SSRF-hardened HTTP transport for the image proxy.
