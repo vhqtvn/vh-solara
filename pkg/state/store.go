@@ -872,6 +872,33 @@ type Store struct {
 	unread         map[string]bool
 	busyCount      map[string]int
 	suppressUnread bool
+	// Completion-grace window + completion-authority guard (Lane A fix for the
+	// stale "1 running" strand). When an assistant turn COMPLETES without a
+	// timely session.idle, busyCount[root] would strand at 1 until the ~60s
+	// /session/status reconcile clears it — and if /session/status itself is
+	// stale (reports busy) the strand is permanent. The grace window is the
+	// fast clearer; completionAuthoritative is the permanent guard.
+	//
+	// graceTimers[sid] holds the pending completion-grace timer for sid (absent
+	// when none is armed). It fires after completionGrace, deferring the idle
+	// clear past a multi-step turn's inter-step gap so we do NOT dip the spinner
+	// or fire a spurious "finished" between steps (the upsertMessageLocked
+	// comment constraint). graceGen[sid] is bumped on every grace-canceling
+	// event (new inflight, session.idle, delete, hydrate) so a timer callback
+	// that races a cancel detects the supersede and aborts — time.Timer.Stop
+	// does not guarantee the callback will not run once started.
+	graceTimers map[string]*time.Timer
+	graceGen    map[string]uint64
+	// completionAuthoritative[sid] is set when the turn is AUTHORITATIVELY
+	// over: the grace window fired OR session.idle was observed. While set, a
+	// stale busy from /session/status (the HTTP poll) must NOT re-escalate the
+	// session — message.updated{completed} wins over a stale status snapshot.
+	// Cleared when a NEW assistant message goes inflight (a new turn started).
+	completionAuthoritative map[string]bool
+	// completionGrace is the grace-window duration (default 5s via
+	// defaultCompletionGrace; shrunk in tests). Set on the Store instance in New
+	// so a test can shrink s.completionGrace without a global-mutation race.
+	completionGrace time.Duration
 	// subtreeBusyCount is the INCREMENTAL per-node busy aggregate (Gate C
 	// de-risking prototype). subtreeBusyCount[id] = the number of busy/retry
 	// sessions in id's subtree, INCLUDING id itself when it is busy/retry. It is
@@ -1034,19 +1061,23 @@ func newEpoch() string {
 // New returns an empty store with an event ring of the given capacity.
 func New(ringCapacity int) *Store {
 	return &Store{
-		epoch:            newEpoch(),
-		sessions:         map[string]*sessionEntry{},
-		messages:         map[string]*sessionMessages{},
-		todos:            map[string]json.RawMessage{},
-		perms:            map[string]map[string]json.RawMessage{},
-		questions:        map[string]map[string]json.RawMessage{},
-		permBlocked:      map[string]bool{},
-		statuses:         map[string]json.RawMessage{},
-		activity:         map[string]string{},
-		activitySeq:      map[string]uint64{},
-		unread:           map[string]bool{},
-		busyCount:        map[string]int{},
-		subtreeBusyCount: map[string]int{},
+		epoch:                   newEpoch(),
+		sessions:                map[string]*sessionEntry{},
+		messages:                map[string]*sessionMessages{},
+		todos:                   map[string]json.RawMessage{},
+		perms:                   map[string]map[string]json.RawMessage{},
+		questions:               map[string]map[string]json.RawMessage{},
+		permBlocked:             map[string]bool{},
+		statuses:                map[string]json.RawMessage{},
+		activity:                map[string]string{},
+		activitySeq:             map[string]uint64{},
+		unread:                  map[string]bool{},
+		busyCount:               map[string]int{},
+		graceTimers:             map[string]*time.Timer{},
+		graceGen:                map[string]uint64{},
+		completionAuthoritative: map[string]bool{},
+		completionGrace:         defaultCompletionGrace,
+		subtreeBusyCount:        map[string]int{},
 		// Phase 1 (Gate C extension): the remaining 7 incremental subtree
 		// indexes. Maps are non-nil; rootIDs / recentBucketKeys start nil and
 		// are grown by rootsAppendLocked / insertRecentBucketKeyLocked.
@@ -1554,6 +1585,86 @@ func (s *Store) MarkIdle(sessionID string) {
 	s.mu.Unlock()
 }
 
+// --- completion-grace window + completion-authority guard (Lane A) ---
+//
+// The completion-grace window is the fast clearer for a stranded busyCount when
+// session.idle is missed. The completion-authority guard is the permanent
+// protection: once the turn is authoritatively over (grace fired or session.idle
+// observed), a stale busy from /session/status must not re-strand it. Together
+// they make message.updated{completed} WIN over a stale /session/status snapshot
+// — the authority ordering the Lane A fix requires.
+
+// armGraceLocked arms the completion-grace window for sessionID: after
+// completionGrace with no new activity, the session is authoritatively marked
+// idle (clearing the stranded busyCount entry that session.idle would have
+// cleared) and the completion-authority guard is armed. Caller holds s.mu.
+//
+// A new assistant inflight message (upsertMessageLocked), session.idle, a
+// delete (deleteSessionLocked), or a hydrate cancels it. The timer callback
+// re-checks graceGen so a fire that races a cancel is a no-op: time.Timer.Stop
+// does not guarantee the callback will not run once started, so the generation
+// counter is the authoritative supersede signal.
+func (s *Store) armGraceLocked(sessionID string) {
+	s.graceGen[sessionID]++
+	gen := s.graceGen[sessionID]
+	if prev := s.graceTimers[sessionID]; prev != nil {
+		prev.Stop() // defensive: arm is gated on a completion transition, so a
+		// pending timer for the same session should not normally exist; stop
+		// any straggler before replacing it.
+	}
+	s.graceTimers[sessionID] = time.AfterFunc(s.completionGrace, func() {
+		s.graceFire(sessionID, gen)
+	})
+}
+
+// cancelGraceLocked cancels a pending completion-grace timer for sessionID and
+// bumps graceGen so a callback already in flight (or about to fire) detects the
+// supersede and aborts. Caller holds s.mu.
+func (s *Store) cancelGraceLocked(sessionID string) {
+	s.graceGen[sessionID]++
+	if t := s.graceTimers[sessionID]; t != nil {
+		t.Stop()
+		delete(s.graceTimers, sessionID)
+	}
+}
+
+// cancelAllGraceLocked cancels every pending completion-grace timer (used on
+// hydrate / shutdown). Caller holds s.mu.
+func (s *Store) cancelAllGraceLocked() {
+	for id, t := range s.graceTimers {
+		t.Stop()
+		s.graceGen[id]++
+		delete(s.graceTimers, id)
+	}
+}
+
+// graceFire is the completion-grace timer callback. It runs on a time.AfterFunc
+// goroutine. Under s.mu it re-checks graceGen (abort if superseded by a new
+// turn / cancel / hydrate), then authoritatively marks the session idle and
+// arms the completion-authority guard so a stale /session/status cannot
+// re-strand it.
+func (s *Store) graceFire(sessionID string, gen uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.graceGen[sessionID] != gen {
+		return // superseded: a new inflight, session.idle, delete, or hydrate
+		// bumped graceGen after this timer captured it.
+	}
+	delete(s.graceTimers, sessionID)
+	s.clearOnCompletionLocked(sessionID)
+}
+
+// clearOnCompletionLocked is the authoritative idle-clear on completion (grace
+// fire). It routes through setActivityLocked so busyCount, subtreeBusyCount,
+// the seven O1 subtree indexes, the KindActivity emit, and the (correct,
+// non-spurious) "finished" unread mark all stay consistent — exactly the path
+// session.idle takes. Arms completionAuthoritative so a stale busy from
+// /session/status (the HTTP poll) does not re-escalate. Caller holds s.mu.
+func (s *Store) clearOnCompletionLocked(sessionID string) {
+	s.setActivityLocked(sessionID, ActivityIdle)
+	s.completionAuthoritative[sessionID] = true
+}
+
 // SetActivityFromStatuses seeds activity from a GET /session/status snapshot
 // (sessionID -> SessionStatus). Used by the aggregator on (re)hydrate.
 // SetActivityFromStatuses makes /session/status the authoritative source of
@@ -1576,6 +1687,17 @@ func (s *Store) SetActivityFromStatuses(statuses map[string]json.RawMessage) {
 		}
 		_ = json.Unmarshal(raw, &st)
 		a := normalizeActivity(st.Type)
+		// Completion-authority guard (Lane A): a stale busy/retry from
+		// /session/status must NOT re-escalate a session whose assistant turn
+		// authoritatively completed (the completion-grace window fired, or
+		// session.idle was observed — both set completionAuthoritative).
+		// message.updated{completed} is the authoritative "turn is over"
+		// signal; a stale status snapshot must not override it. Cleared when a
+		// NEW assistant message goes inflight (a new turn started), so a
+		// legitimate future busy is respected.
+		if a != ActivityIdle && s.completionAuthoritative[sid] {
+			a = ActivityIdle
+		}
 		// O1 fix: seed the activity timestamp from the session's OWN time.updated
 		// (reconstructed state), NOT wall-clock now. A status reconcile/hydrate
 		// stamps real activity recency so a long-idle session is not spuriously
@@ -1662,7 +1784,12 @@ func (s *Store) Apply(ev opencode.Event) {
 			s.emit(KindStatus, ev.Properties)
 			switch ev.Type {
 			case "session.idle":
+				// Authoritative turn-end: cancel any pending completion-grace
+				// (redundant now) and arm the completion-authority guard so a
+				// stale busy from /session/status does not re-strand.
+				s.cancelGraceLocked(p.SessionID)
 				s.setActivityLocked(p.SessionID, ActivityIdle)
+				s.completionAuthoritative[p.SessionID] = true
 			case "session.error":
 				s.setActivityLocked(p.SessionID, ActivityError)
 			case "session.status":
@@ -1992,6 +2119,11 @@ func (s *Store) deleteSessionLocked(id string) {
 	delete(s.subtreeDescendantCount, id)
 	delete(s.lastActivityAt, id)
 	delete(s.subtreeNewestActivity, id)
+	// Cancel any pending completion-grace timer and drop the completion-authority
+	// guard: the session is gone, so neither a deferred idle clear nor a stale
+	// busy guard applies to this id (and a recreated id starts fresh).
+	s.cancelGraceLocked(id)
+	delete(s.completionAuthoritative, id)
 	// Clear the automated-spawn permission-blocked fact on termination. This is
 	// the single session-removal chokepoint (live session.deleted, archive via
 	// time.archived, and hydrate prune all funnel here), so one delete covers
@@ -2413,7 +2545,15 @@ func (s *Store) upsertMessageLocked(info json.RawMessage) {
 		sm = &sessionMessages{byID: map[string]*messageEntry{}}
 		s.messages[env.SessionID] = sm
 	}
+	// wasCompleted captures the PRE-update completion state so the escalation
+	// block below can detect a live inflight→completed transition (the only
+	// event that arms the completion-grace window). A cold-load insert of an
+	// already-completed message sets wasCompleted=false too, but it does not
+	// route through this live Apply path's grace arming (gated on the
+	// transition AND !assistantInflightLocked, and cold-load goes via Hydrate).
+	var wasCompleted bool
 	if me := sm.byID[env.ID]; me != nil {
+		wasCompleted = me.completed
 		me.info = info
 		me.role = env.Role
 		me.completed = env.Time.Completed != nil
@@ -2464,15 +2604,48 @@ func (s *Store) upsertMessageLocked(info json.RawMessage) {
 	// spinner for an actively-running session. An in-flight assistant message is
 	// the authoritative "generating" signal.
 	//
-	// We only SET busy here, never idle. A multi-step turn (text → tool → text)
-	// produces several assistant messages, and between two steps there's a gap
-	// where no assistant message is in-flight yet — inferring idle from that gap
-	// flipped the session idle→busy repeatedly within a single logical run, and
-	// each transient idle dip fired a spurious "finished" notification (one per
-	// tool call). Idle is owned by the authoritative session.idle event (which
-	// fires once when the turn truly ends) and by the rehydrate snapshot.
-	if env.Role == "assistant" && s.assistantInflightLocked(env.SessionID) {
-		s.setActivityLocked(env.SessionID, ActivityBusy)
+	// We only SET busy synchronously here, never idle. A multi-step turn
+	// (text → tool → text) produces several assistant messages, and between two
+	// steps there's a gap where no assistant message is in-flight yet —
+	// inferring idle from that gap flipped the session idle→busy repeatedly
+	// within a single logical run, and each transient idle dip fired a spurious
+	// "finished" notification (one per tool call). Synchronous idle is owned by
+	// the authoritative session.idle event (fires once when the turn truly ends)
+	// and by the rehydrate snapshot.
+	//
+	// The MISSED-session.idle case (dropped tunnel / reconnect gap / a turn that
+	// ended without OpenCode emitting idle) left busyCount[root] stranded at 1
+	// until the ~60s /session/status reconcile cleared it — and if
+	// /session/status itself was stale (reported busy) the strand was permanent.
+	// The completion-grace window closes that gap: when an assistant message
+	// transitions inflight→completed AND no assistant message remains
+	// in-flight, arm a short timer (completionGrace, default 5s). If no new
+	// activity arrives within the window the turn is authoritatively over, so
+	// graceFire clears busy (busyCount→0, RunningRoots correct) and arms the
+	// completion-authority guard so a stale /session/status cannot re-strand.
+	// A new inflight message within the window cancels the timer (multi-step
+	// turn — no spinner dip, no spurious "finished"). See armGraceLocked /
+	// graceFire / SetActivityFromStatuses.
+	if env.Role == "assistant" {
+		switch {
+		case s.assistantInflightLocked(env.SessionID):
+			// An in-flight assistant message is generating right now: assert
+			// busy (cheap no-op once set). A NEW inflight also cancels any
+			// pending completion-grace (the turn is continuing, not ending) and
+			// clears the completion-authority guard (a new turn started, so a
+			// prior turn's authority no longer applies).
+			s.cancelGraceLocked(env.SessionID)
+			delete(s.completionAuthoritative, env.SessionID)
+			s.setActivityLocked(env.SessionID, ActivityBusy)
+		case !wasCompleted && env.Time.Completed != nil:
+			// This assistant message just transitioned to completed AND no
+			// assistant message is in-flight: the turn MAY have ended. We
+			// cannot know synchronously whether this is the final completion
+			// (turn over) or a multi-step gap (the next step's inflight message
+			// has not arrived yet), so defer the idle clear past the typical
+			// inter-step gap via the completion-grace window.
+			s.armGraceLocked(env.SessionID)
+		}
 	}
 }
 
@@ -2767,6 +2940,17 @@ var deltaFlushInterval = 30 * time.Millisecond
 // clobber (both carry archived=null).
 var recentArchiveTTL = 30 * time.Second
 
+// defaultCompletionGrace is how long the store waits after an assistant turn
+// completes (with no in-flight assistant message remaining) before
+// authoritatively clearing busy — deferring the idle clear past a multi-step
+// turn's inter-step gap so the spinner does not dip and no spurious "finished"
+// notification fires between steps (text → tool → text). session.idle (when
+// OpenCode emits it) clears immediately and cancels the timer; this window
+// only owns the missed-session.idle case. A package-level var (not const), mirroring
+// deltaFlushInterval / recentArchiveTTL, so tests can shrink s.completionGrace on
+// the instance under test without a global-mutation race.
+var defaultCompletionGrace = 5 * time.Second
+
 // partTextCap bounds the accumulated length of a single part's text field, in
 // bytes. External latency analysis (17.8k sessions / 13 GB) found one bash
 // `tool` part whose unbounded stdout grew to 100 MB — a single pathological
@@ -3004,10 +3188,16 @@ func (s *Store) appendPartDeltaLocked(sessionID, messageID, partID, field, delta
 
 	// Streaming deltas mean the turn is actively generating right now — assert
 	// busy (cheap no-op once set) even when this delta was buffered. Cleared
-	// when the assistant message completes (upsertMessageLocked) or on
-	// session.idle. This makes the running indicator track real token flow even
-	// when OpenCode's session.status lags.
-	if me.role != "user" {
+	// when the assistant message completes (upsertMessageLocked arms the
+	// completion-grace window) or on session.idle. This makes the running
+	// indicator track real token flow even when OpenCode's session.status lags.
+	//
+	// The !me.completed guard closes the message.part.delta ordering race: a
+	// trailing delta arriving AFTER the message's time.completed (an in-connection
+	// reorder — SSE has no cross-reconnect replay) must NOT re-arm busy on an
+	// already-completed message, which would re-strand busyCount past the
+	// completion-grace clear.
+	if me.role != "user" && !me.completed {
 		s.setActivityLocked(sessionID, ActivityBusy)
 	}
 }
@@ -3883,6 +4073,9 @@ func (s *Store) SubscribeWith(buffer int, interest Interest) (<-chan ClientEvent
 func (s *Store) Close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Stop every pending completion-grace timer so no callback fires after
+	// teardown against a torn-down store.
+	s.cancelAllGraceLocked()
 	for id, sub := range s.subs {
 		close(sub.ch)
 		delete(s.subs, id)
@@ -3988,6 +4181,11 @@ func (s *Store) Hydrate(sessions []json.RawMessage, messages map[string][]Messag
 	// s.mu.Unlock() below (NOT via defer) so the write stays under the lock —
 	// otherwise the deferred reset races with Apply's writes to the same field.
 	s.curEmitSource = diag.SourceHydrate
+
+	// Cancel any pending completion-grace timers: a reconnect/rehydrate rebuilds
+	// activity from the snapshot (SetActivityFromStatuses below), so a timer
+	// armed against the pre-reconnect live message stream is stale.
+	s.cancelAllGraceLocked()
 
 	// --- sessions ---
 	seen := make(map[string]bool, len(sessions))
