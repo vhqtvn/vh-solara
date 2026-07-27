@@ -103,7 +103,7 @@ export interface SyncState {
   // semantics). Mirrors the server's window projection so the client knows
   // whether older messages exist beyond the resident tail (the "Load older"
   // affordance) and the oldest resident id (the prepend cursor). Populated by
-  // the three wholesale-replace paths (messages.batch, applySessionSnapshot,
+  // the three tail-landing paths (messages.batch, applySessionSnapshot,
   // refreshOpenSessions) when a bounded tail lands; pruned on session.delete;
   // reset on switchProject. See MessageWindowState.
   //
