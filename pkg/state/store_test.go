@@ -666,6 +666,9 @@ func TestRootCount(t *testing.T) {
 
 func TestGateLastAssistantEmpty(t *testing.T) {
 	s := New(100)
+	// Cancel the completion-grace timer armed below (the 5s default
+	// leaks past the test; Close is the cancelAllGraceLocked entrypoint).
+	defer s.Close()
 	s.Apply(ev("session.created", `{"info":{"id":"a"}}`))
 	// A completed turn that ended with finish=stop but produced NO text (e.g. an
 	// empty stop / tool-only turn) — finish_reason can't distinguish this, the
@@ -713,6 +716,9 @@ func TestGateLastAssistantEmpty(t *testing.T) {
 
 func TestGateHydratedFlag(t *testing.T) {
 	s := New(100)
+	// Cancel the completion-grace timer armed below (the 5s default
+	// leaks past the test; Close is the cancelAllGraceLocked entrypoint).
+	defer s.Close()
 	s.Apply(ev("session.created", `{"info":{"id":"a"}}`))
 	// No message state yet (cold/never-opened) → hydrated=false, so a consumer
 	// knows last_assistant_completed=false means "unknown", not "in-flight".
@@ -1140,6 +1146,9 @@ func TestActivityVerbEmitOnTransitionNotDelta(t *testing.T) {
 // MessagesLoaded.
 func TestGateMessagesLoadedVsHydrated(t *testing.T) {
 	s := New(100)
+	// Cancel the completion-grace timer armed below (the 5s default
+	// leaks past the test; Close is the cancelAllGraceLocked entrypoint).
+	defer s.Close()
 	s.Apply(ev("session.created", `{"info":{"id":"a"}}`))
 	// Cold: no message state at all → both false.
 	if g := s.Snapshot(nil).Gate["a"]; g.Hydrated || g.MessagesLoaded {
@@ -2719,6 +2728,9 @@ func TestSnapshotConcurrentWithApply(t *testing.T) {
 // rows here are regression guards that catch any future revert of those copies.
 func TestSnapshotCopiesAllRawMessageBytes(t *testing.T) {
 	s := New(100)
+	// Cancel the completion-grace timer armed below (the 5s default
+	// leaks past the test; Close is the cancelAllGraceLocked entrypoint).
+	defer s.Close()
 	s.Apply(ev("session.created", `{"info":{"id":"a","title":"root"}}`))
 	// A completed assistant turn with token usage → populates se.lastTokens.
 	s.Apply(ev("message.updated", `{"info":{"id":"m1","sessionID":"a","role":"assistant","time":{"created":1,"completed":2},"finish":"stop","tokens":{"input":10,"output":20,"total":30}}}`))
@@ -2937,6 +2949,9 @@ func TestSnapshotParityFullFixture(t *testing.T) {
 	// Stretch the throttle window so the second delta stays buffered — this is
 	// what gives Snapshot something to project (deltaBuf non-empty).
 	s := New(100)
+	// Cancel the completion-grace timer armed below (the 5s default
+	// leaks past the test; Close is the cancelAllGraceLocked entrypoint).
+	defer s.Close()
 	withFlushInterval(t, s, time.Hour)
 	s.Apply(ev("session.created", `{"info":{"id":"a","title":"root"}}`))
 	s.Apply(ev("session.created", `{"info":{"id":"b","title":"child"}}`))
@@ -3077,6 +3092,9 @@ func mapKeys[K comparable, V any](m map[K]V) []K {
 // snapshot) by proving it against the authoritative store internals directly.
 func TestSnapshotNoAliasingAgainstStoreInternals(t *testing.T) {
 	s := New(100)
+	// Cancel the completion-grace timer armed below (the 5s default
+	// leaks past the test; Close is the cancelAllGraceLocked entrypoint).
+	defer s.Close()
 	withFlushInterval(t, s, time.Hour)
 	s.Apply(ev("session.created", `{"info":{"id":"a"}}`))
 	s.Apply(ev("message.updated", `{"info":{"id":"m1","sessionID":"a","role":"assistant","time":{"created":1,"completed":2},"finish":"stop","tokens":{"input":1,"output":2,"total":3}}}`))
