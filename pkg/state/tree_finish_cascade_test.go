@@ -419,11 +419,11 @@ func TestFinishCascade_ErrorDeletePreservesBusySiblingRootCount(t *testing.T) {
 		[2]string{"session.error", evError("C")},
 	)
 
-	// Sanity: the seeded activities and the pre-delete busyCount.
+	// Sanity: the seeded activities and the pre-delete subtreeBusyCount.
 	s.mu.RLock()
 	bAct := s.activity["B"]
 	cAct := s.activity["C"]
-	preBusy := s.busyCount["R"]
+	preBusy := s.subtreeBusyCount["R"]
 	s.mu.RUnlock()
 	if bAct != ActivityBusy {
 		t.Fatalf("setup invariant: s.activity[B]=%q, want %q", bAct, ActivityBusy)
@@ -432,7 +432,7 @@ func TestFinishCascade_ErrorDeletePreservesBusySiblingRootCount(t *testing.T) {
 		t.Fatalf("setup invariant: s.activity[C]=%q, want %q", cAct, ActivityError)
 	}
 	if preBusy != 1 {
-		t.Fatalf("setup invariant: s.busyCount[R]=%d, want 1 (busy sibling B)", preBusy)
+		t.Fatalf("setup invariant: s.subtreeBusyCount[R]=%d, want 1 (busy sibling B)", preBusy)
 	}
 	if got := s.RunningRoots(); got != 1 {
 		t.Fatalf("setup invariant: RunningRoots()=%d, want 1", got)
@@ -446,21 +446,21 @@ func TestFinishCascade_ErrorDeletePreservesBusySiblingRootCount(t *testing.T) {
 	// sibling B lives under the same root R.
 	s.RemoveSessions([]string{"C"})
 
-	// (1) busyCount["R"] MUST still be 1. This is the carve-out's whole
-	// purpose: error never contributed to busyCount on entry (the
-	// setActivityAtLocked chokepoint only flags {Busy, Retry}), so it must
-	// not decrement on exit. A widening of the outer if to
+	// (1) subtreeBusyCount["R"] MUST still be 1. This is the carve-out's whole
+	// purpose: error never contributed to subtreeBusyCount on entry
+	// (subtreeBusySelfLocked only flags {Busy, Retry}), so it must not
+	// decrement on exit. A widening of the outer if to
 	// `|| a == ActivityError` would steal the busy sibling's count here
-	// (busyCount["R"]==0) and RunningRoots() would under-report R as idle.
+	// (subtreeBusyCount["R"]==0) and RunningRoots() would under-report R as idle.
 	s.mu.RLock()
-	postBusy := s.busyCount["R"]
+	postBusy := s.subtreeBusyCount["R"]
 	postBAct := s.activity["B"]
 	_, cStillPresent := s.activity["C"]
 	s.mu.RUnlock()
 	if postBusy != 1 {
-		t.Errorf("CARVE-OUT: error delete of C must NOT decrement busyCount[R]; "+
+		t.Errorf("CARVE-OUT: error delete of C must NOT decrement subtreeBusyCount[R]; "+
 			"got %d, want 1 (busy sibling B still running). A widening of the outer "+
-			"if at store.go:1908 to `|| a == ActivityError` corrupts the busy "+
+			"if to `|| a == ActivityError` corrupts the busy "+
 			"sibling's count and under-reports RunningRoots().", postBusy)
 	}
 	if postBAct != ActivityBusy {

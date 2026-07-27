@@ -3382,28 +3382,34 @@ func TestSetActivityFromStatusesHealsStaleBusyRoot(t *testing.T) {
 	}
 }
 
-// TestRunningRootsStaleAfterBusyChildArchived is the deterministic red signal
+// TestRunningRootsStaleAfterBusyChildArchived is the deterministic regression
 // for the stale "running" count reported in ProjectSwitcher.tsx and
 // RestartOpenCode.tsx. Both surfaces read backend counts
 // (Store.RunningRoots() via /vh/running-sessions and RootCount() via
-// /vh/projects); the bug is in the backend counting, not the fetch layer.
+// /vh/projects); the bug was in the backend counting, not the fetch layer.
 //
-// Bug shape: busyCount is keyed by ROOT, but the only site that mutates it is
-// setActivityAtLocked (busy↔non-busy flip). deleteSessionLocked only does
+// Historical bug shape: the legacy root-keyed busyCount was the only index
+// RunningRoots() read, but deleteSessionLocked only did
 // `delete(s.busyCount, id)` for the deleted session's OWN id — it never
-// decrements busyCount[root]. So when a BUSY NON-ROOT session is archived
-// (RemoveSessions) or pruned by Hydrate, busyCount[root] is left stuck high
-// forever. Worse, the runStatusReconcile heal ticker (which clears stale-busy
-// sessions a la TestRunStatusReconcileHealsStaleBusy) iterates s.sessions —
-// the archived child is GONE, so the heal cannot clear it. busyCount[root]
-// sticks at 1 indefinitely and RunningRoots() reports a phantom running root.
+// decremented busyCount[root]. So when a BUSY NON-ROOT session was archived
+// (RemoveSessions) or pruned by Hydrate, busyCount[root] was left stuck high
+// forever, and the runStatusReconcile heal ticker (which iterates s.sessions)
+// could not see the archived child to clear it. busyCount[root] stuck at 1
+// indefinitely → phantom running root.
+//
+// Current state: busyCount was RETIRED. RunningRoots() now derives from the
+// incremental subtreeBusyCount index (single source of truth), whose delete
+// maintenance (maintainIndexesOnDeleteLocked) propagates a deleted busy
+// non-root's contribution out of every live ancestor — so the phantom can no
+// longer occur. This test stays as the regression guard proving the archive
+// path keeps RunningRoots correct.
 //
 // Probe: at the moment the count looks stale, compare
-//  1. Store.RunningRoots()           — derived from busyCount[]
+//  1. Store.RunningRoots()           — now derived from subtreeBusyCount[]
 //  2. the live tree snapshot's notion of busy roots (Snapshot + Gate.SubtreeBusy)
 //
-// Divergence between (1) and (2) localizes the bug to the store's busyCount
-// index, not the verb or frontend layer.
+// Divergence between (1) and (2) would localize the bug to the store's busy
+// index; the comprehensive no-divergence guard is TestBusyEquivalence_*.
 func TestRunningRootsStaleAfterBusyChildArchived(t *testing.T) {
 	s := New(100)
 

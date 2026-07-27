@@ -154,34 +154,41 @@ func (s *Store) setActivityAtLocked(sessionID, st string, at time.Time) {
 		return
 	}
 
-	// Incremental subtreeBusyCount maintenance (Gate C de-risk prototype).
-	// A real busy↔non-busy flip changes id's own contribution by ±1 and every
-	// live ancestor's aggregate by ±1. Guarded on live-tree membership: a
-	// phantom status event for an unknown sessionID must NOT create an index
-	// entry (computeSubtreeBusyLocked iterates s.sessions only); the own-
-	// contribution for a phantom-busy-then-created session is seeded in
-	// upsertSessionLocked / Hydrate when it enters the live tree.
+	// Incremental subtreeBusyCount maintenance — and the SINGLE source of truth
+	// for the per-root busy aggregate + the finished-unread trigger. A real
+	// busy↔non-busy flip changes id's own contribution by ±1 and every live
+	// ancestor's aggregate by ±1. Guarded on live-tree membership: a phantom
+	// status event for an unknown sessionID must NOT create an index entry
+	// (computeSubtreeBusyLocked iterates s.sessions only), and must NOT arm a
+	// running root — the own-contribution for a phantom-busy-then-created
+	// session is seeded in upsertSessionLocked / Hydrate when it enters the
+	// live tree. (The retired busyCount ran this block OUTSIDE the guard, which
+	// is how a phantom status created a stray running root.)
+	//
+	// subtreeBusyCount[root] is the count of busy/retry sessions in root's
+	// subtree (incl root). wasZero (captured BEFORE the delta) drives the
+	// "running again — clear the stale finished mark" trigger; the post-delta
+	// value drives the "now fully idle — mark finished-unread" trigger. Both
+	// markUnreadLocked and clearUnreadLocked are themselves no-ops when the id
+	// is absent from s.sessions, so guarding the whole block changes nothing
+	// for phantoms and removes the stray-entry leak.
 	if s.sessions[sessionID] != nil {
+		root := s.rootOfLocked(sessionID)
+		wasZero := s.subtreeBusyCount[root] == 0 // BEFORE the delta
 		delta := 1
 		if !isBusy {
 			delta = -1
 		}
 		s.subtreeBusyCount[sessionID] += delta
 		s.adjustAncestorSubtreeBusyLocked(sessionID, delta)
-	}
-
-	root := s.rootOfLocked(sessionID)
-	if isBusy {
-		if s.busyCount[root] == 0 {
-			s.clearUnreadLocked(root) // running again — no longer a stale "finished"
-		}
-		s.busyCount[root]++
-	} else {
-		if s.busyCount[root] > 0 {
-			s.busyCount[root]--
-		}
-		if s.busyCount[root] == 0 && !s.suppressUnread {
-			s.markUnreadLocked(root)
+		if isBusy {
+			if wasZero {
+				s.clearUnreadLocked(root) // running again — no longer a stale "finished"
+			}
+		} else {
+			if s.subtreeBusyCount[root] == 0 && !s.suppressUnread {
+				s.markUnreadLocked(root) // a finished task awaiting acknowledgement
+			}
 		}
 	}
 }
@@ -234,7 +241,7 @@ func (s *Store) SetActivityFromStatuses(statuses map[string]json.RawMessage) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	// Reconciling activity on (re)hydrate must not spuriously flag sessions as
-	// finished-unread (busyCount still tracks correctly, just don't mark).
+	// finished-unread (subtreeBusyCount still tracks correctly, just don't mark).
 	s.suppressUnread = true
 	defer func() { s.suppressUnread = false }()
 	busy := map[string]bool{}
@@ -574,54 +581,29 @@ func (s *Store) deleteSessionLocked(id string) {
 		reparentedChildren = append(reparentedChildren, s.children[id]...)
 		s.maintainIndexesOnDeleteLocked(id, se)
 	}
-	// Maintain busyCount[root] for a deleted BUSY non-root session. The
-	// chokepoint for busy↔non-busy transitions is setActivityAtLocked
-	// (busyCount[root]++/--), but the DELETE path bypasses it: a sub-session
-	// that was busy when it was archived (time.archived via upsertSessionLocked
-	// → deleteSessionLocked, RemoveSessions, or a Hydrate prune) leaves
-	// busyCount[root] stuck at its pre-archive value because the only other
-	// site that touches this map is `delete(s.busyCount, id)` below — which
-	// clears id's OWN entry (correct when id IS its own root) but not the
-	// root's. The runStatusReconcile heal ticker cannot recover this either:
-	// it iterates s.sessions, and the archived id is already gone, so the
-	// phantom count persists indefinitely and RunningRoots() over-reports
-	// (surfaced via /vh/running-sessions and /vh/projects in the SPA's project
-	// switcher badge and restart-confirmation dialog). Mirror the decrement
-	// half of setActivityAtLocked's busy→non-busy branch: only id's OWN
-	// contribution (±1) — cascade deletes of busy descendants each funnels
-	// through here separately. No markUnread: the session is being removed,
-	// so a "finished-unread" indicator would be meaningless. rootOfLocked
-	// walks s.sessions, which is still intact here (the delete(...) calls
-	// below haven't run yet), so it resolves the OLD root correctly.
+	// Maintain the terminal KindActivity(idle) finish-cascade for a deleted
+	// BUSY/RETRY session. deleteSessionLocked deletes s.activity[id] silently
+	// below and emits only KindSessionDelete; a client that held
+	// activity[id]="busy" (snapshot seed or last busy event) is never told the
+	// id transitioned out of busy — node.remove prunes the TreeRow, but the
+	// chat-side syncState.activity[id] (read by Part.tsx for the parent's task
+	// tool status) retains the stale "busy" indefinitely. This emit (the
+	// finish-side counterpart to the frontier-promotion gap fix) clears it in
+	// the same transition.
+	//
+	// NOTE: the per-root busy COUNT needs no explicit maintenance here. It is
+	// derived from subtreeBusyCount (the single source of truth), whose delete
+	// maintenance ran ABOVE — maintainIndexesOnDeleteLocked + the prototype
+	// block propagate id's whole-subtree contribution out of every live
+	// ancestor, so subtreeBusyCount[root] already reflects the deletion. The
+	// retired busyCount needed a bespoke non-root decrement here because it was
+	// a separate root-keyed index; that asymmetry (and the reparent gap) is why
+	// it was retired. The emit must precede the KindSessionDelete emit below so
+	// a client processing events in seq order clears the chat activity map
+	// BEFORE the structural prune lands. No setActivityLocked call: that would
+	// re-run the subtree maintenance (already done above) and fire a spurious
+	// markUnread on a session being removed.
 	if a := s.activity[id]; a == ActivityBusy || a == ActivityRetry {
-		root := s.rootOfLocked(id)
-		if root != id { // root == id is cleared by `delete(s.busyCount, id)` below
-			if s.busyCount[root] > 0 {
-				s.busyCount[root]--
-			}
-		}
-		// Finish-cascade: emit a terminal KindActivity(idle) for a session that
-		// was observably busy/retry so every observer (chat + tree) drops the
-		// busy signal in the same transition. deleteSessionLocked deletes
-		// s.activity[id] silently below and emits only KindSessionDelete; a
-		// client that held activity[id]="busy" (snapshot seed or last busy
-		// event) is never told the id transitioned out of busy — node.remove
-		// prunes the TreeRow, but the chat-side syncState.activity[id] (read by
-		// Part.tsx for the parent's task tool status) retains the stale "busy"
-		// indefinitely and the finished subsession keeps looking "running" in
-		// the Part activity timeline. This is the finish-side counterpart to
-		// the frontier-promotion gap fix (tree_emitter.go promoteActiveFrontier
-		// + tree_frontier_promotion_test.go): there, a live promote ships an
-		// active node that became active while unknown; here, a live
-		// terminal-activity cascade clears a busy node that became gone. The
-		// emit must precede the KindSessionDelete emit below so a client
-		// processing events in seq order clears the chat activity map BEFORE
-		// the structural prune lands. The stale "idle" the client retains
-		// after the subsequent session.delete is the correct terminal value
-		// (and is overwritten on id-reuse). No setActivityLocked call: that
-		// would re-run the busyCount/subtree maintenance (already done above
-		// — maintainIndexesOnDelete + the prototype block + the busyCount
-		// decrement) and fire a spurious markUnread on a session being removed.
 		s.emit(KindActivity, rawObj(map[string]interface{}{"sessionID": id, "state": ActivityIdle}))
 	} else if a == ActivityError {
 		// Finish-cascade (error mirror): emit a terminal KindActivity(idle)
@@ -636,12 +618,11 @@ func (s *Store) deleteSessionLocked(id string) {
 		// terminal so isActivityWorking("error") is false → no spinner/heat,
 		// but the red dot persists on the parent's task row).
 		//
-		// SUBTLETY (load-bearing): error MUST NOT touch busyCount. The
-		// busyCount[root]++/-- chokepoint is setActivityAtLocked, whose
-		// wasBusy/isBusy flags only {Busy, Retry} (error never incremented
-		// busyCount on entry, so decrementing on exit would corrupt the
-		// count and under-report RunningRoots). That is why this is a
-		// SEPARATE else-if and NOT a widening of the outer `if` to
+		// SUBTLETY (load-bearing): error MUST NOT contribute to the busy count.
+		// subtreeBusySelfLocked flags only {Busy, Retry} (error never
+		// incremented subtreeBusyCount on entry, so decrementing on exit would
+		// corrupt the count and under-report RunningRoots). That is why this is
+		// a SEPARATE else-if and NOT a widening of the outer `if` to
 		// `|| a == ActivityError`. No setActivityLocked call either: that
 		// would re-run maintenance already done above and fire a spurious
 		// markUnread on a session being removed (same reasoning as the
@@ -666,8 +647,7 @@ func (s *Store) deleteSessionLocked(id string) {
 	delete(s.activity, id)
 	delete(s.activitySeq, id)
 	delete(s.unread, id)
-	delete(s.busyCount, id)
-	delete(s.subtreeBusyCount, id) // Gate C de-risk prototype index
+	delete(s.subtreeBusyCount, id) // per-root busy aggregate is derived from this index (single source of truth)
 	// Phase 1 (Gate C extension): drop id's own entries from each new index.
 	delete(s.children, id) // direct-child list (already emptied by orphaning)
 	delete(s.subtreeRetryCount, id)
@@ -849,15 +829,16 @@ func (s *Store) upsertMessageLocked(info json.RawMessage) {
 	// and by the rehydrate snapshot.
 	//
 	// The MISSED-session.idle case (dropped tunnel / reconnect gap / a turn that
-	// ended without OpenCode emitting idle) left busyCount[root] stranded at 1
-	// until the ~60s /session/status reconcile cleared it — and if
+	// ended without OpenCode emitting idle) left subtreeBusyCount[root] stranded
+	// at 1 until the ~60s /session/status reconcile cleared it — and if
 	// /session/status itself was stale (reported busy) the strand was permanent.
 	// The completion-grace window closes that gap: when an assistant message
 	// transitions inflight→completed AND no assistant message remains
 	// in-flight, arm a short timer (completionGrace, default 5s). If no new
 	// activity arrives within the window the turn is authoritatively over, so
-	// graceFire clears busy (busyCount→0, RunningRoots correct) and arms the
-	// completion-authority guard so a stale /session/status cannot re-strand.
+	// graceFire clears busy (subtreeBusyCount→0, RunningRoots correct) and arms
+	// the completion-authority guard so a stale /session/status cannot
+	// re-strand.
 	// A new inflight message within the window cancels the timer (multi-step
 	// turn — no spinner dip, no spurious "finished"). See armGraceLocked /
 	// graceFire / SetActivityFromStatuses.

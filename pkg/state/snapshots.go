@@ -874,19 +874,30 @@ func (s *Store) Head() uint64 {
 }
 
 // RunningRoots returns the number of session roots whose subtree has at least
-// one busy/retry session (busyCount[root] > 0): a root counts if any turn is
-// in flight anywhere in its subtree. Used by /vh/projects (P2) for the
-// per-project "running" badge and aggregated across workspaces by
-// /vh/running-sessions for the "restart will interrupt N running sessions"
-// warning — both without building full snapshots. roots >= running always
-// holds (see RootCount); idle = roots − running.
+// one busy/retry session: a root counts if any turn is in flight anywhere in its
+// subtree. Used by /vh/projects (P2) for the per-project "running" badge and
+// aggregated across workspaces by /vh/running-sessions for the "restart will
+// interrupt N running sessions" warning — both without building full snapshots.
+// roots >= running always holds (see RootCount); idle = roots − running.
+//
+// SINGLE SOURCE OF TRUTH: this derives from the incremental subtreeBusyCount
+// index (proven equivalent to an independent O(n) recompute by
+// TestSubtreeBusyCountProperty), iterating the SAME orphan-inclusive live-root
+// population as RootCount. The legacy root-keyed busyCount was RETIRED — it had
+// asymmetric maintenance (a reparent gap and a phantom-status gap) that let this
+// count diverge from per-session activity and report a phantom "1 running" while
+// every session was idle. Deriving from subtreeBusyCount makes that divergence
+// structurally impossible: the count can only reflect busy/retry sessions that
+// are actually in the live tree under a live root.
 func (s *Store) RunningRoots() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	n := 0
-	for _, c := range s.busyCount {
-		if c > 0 {
-			n++
+	for id, e := range s.sessions {
+		if e.parentID == "" || s.sessions[e.parentID] == nil {
+			if s.subtreeBusyCount[id] > 0 {
+				n++
+			}
 		}
 	}
 	return n
@@ -894,7 +905,7 @@ func (s *Store) RunningRoots() int {
 
 // RootCount returns the number of LIVE session roots — roots among the
 // non-archived sessions in the live tree. It uses the SAME orphan-inclusive root
-// definition as rootOfLocked / busyCount / RunningRoots: a session is a root when
+// definition as rootOfLocked / subtreeBusyCount / RunningRoots: a session is a root when
 // it has no parentID OR its parentID is not present in the live store, so a child
 // never counts even if its parent has been archived (an orphaned child becomes its
 // own root). Archived sessions are already removed from s.sessions (archive via

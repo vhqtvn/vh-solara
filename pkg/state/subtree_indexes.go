@@ -17,7 +17,7 @@
 //   - recentBucket                   (bucket; active-closure seed)
 //
 // ADDITIVE in Phase 1: the snapshot path (computeSubtreeBusyLocked / Snapshot /
-// SendableNow / busyCount[root]) is UNCHANGED. These indexes coexist with the
+// SendableNow) is UNCHANGED. These indexes coexist with the
 // prototype and are proven equivalent to an independent O(n) recompute by
 // TestSubtreeIndexesProperty (random-mutation differential, mirroring
 // subtree_busy_test.go). The projection itself lands in Phase 4.

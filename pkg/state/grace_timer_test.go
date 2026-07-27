@@ -38,8 +38,9 @@ import (
 // no-op'd is observationally identical to a fire that never happened, unless
 // you read graceGen + completionAuthoritative).
 //
-// `rootBusy` is s.busyCount[id], meaningful when id IS a root (all tests here
-// use root sessions). Returns the post-snapshot values; safe to call after
+// `rootBusy` is s.subtreeBusyCount[id] (the single source of truth for the
+// per-root busy aggregate, meaningful when id IS a root — all tests here use
+// root sessions). Returns the post-snapshot values; safe to call after
 // Close() (the mutex survives teardown; only subs are emptied).
 func (s *Store) graceStateSnapshot(id string) (gen uint64, armed bool, authoritative bool, rootBusy int) {
 	s.mu.Lock()
@@ -47,7 +48,7 @@ func (s *Store) graceStateSnapshot(id string) (gen uint64, armed bool, authorita
 	gen = s.graceGen[id]
 	_, armed = s.graceTimers[id]
 	authoritative = s.completionAuthoritative[id]
-	rootBusy = s.busyCount[id]
+	rootBusy = s.subtreeBusyCount[id]
 	return
 }
 

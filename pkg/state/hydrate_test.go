@@ -252,8 +252,8 @@ func TestHydrate_IndexesConsistent(t *testing.T) {
 
 	// Phase D — Hydrate DROPS C entirely (delete-unseen). The prune loop
 	// routes through deleteSessionLocked, which maintains the delete-side
-	// indexes (maintainIndexesOnDeleteLocked) AND busyCount (the non-root
-	// busy-decrement). All subtree indexes must settle to a C-less world.
+	// subtree indexes (maintainIndexesOnDeleteLocked). All subtree indexes
+	// must settle to a C-less world.
 	s.Hydrate(
 		[]json.RawMessage{
 			json.RawMessage(`{"id":"R","title":"root-renamed"}`),
@@ -264,36 +264,25 @@ func TestHydrate_IndexesConsistent(t *testing.T) {
 	assertSubtreeIndexes(t, s, "Hydrate drop C (delete-unseen via deleteSessionLocked)")
 	assertSubtreeBusyCount(t, s, "Hydrate drop C (busy contribution removed)")
 
-	// SURPRISE (GAP-S3 finding worth surfacing to the operator): Hydrate
-	// maintains the 8 SUBTREE indexes (7 Phase-1 + subtreeBusyCount prototype)
-	// on reparent — asserted above, all correct. It does NOT maintain
-	// busyCount[root], and busyCount has a PRE-EXISTING reparent gap that
-	// this sequence exposes:
-	//   - Phase A set C busy under R  → busyCount["R"]++ (=1).
-	//   - Phase C reparented C R→R2   → busyCount UNCHANGED (reparent never
-	//     touches busyCount — true of upsertSessionLocked too, NOT
-	//     Hydrate-specific). busyCount["R"] still 1, busyCount["R2"] still 0.
-	//   - Phase D deleted C           → deleteSessionLocked decrements
-	//     busyCount[rootOf("C")="R2"] (=0, no-op via the >0 guard). The
-	//     original increment to busyCount["R"] is NEVER matched by a
-	//     corresponding decrement → phantom busyCount["R"]=1.
-	// The phantom is NOT healable by SetActivityFromStatuses: R's own
-	// activity was never "busy" (C was), so setActivityAtLocked("R", Idle)
-	// sees wasBusy==isBusy==false and skips the busyCount decrement. Only
-	// the runStatusReconcile heal ticker (or never reparenting a busy
-	// session) can clear it. The subtreeBusyCount index (asserted above) IS
-	// correct — only the legacy busyCount drifts. This is out of scope for
-	// GAP-S3 (a Hydrate-direct-assign gate) but documented so a future
-	// concern split that moves busyCount knows the reparent gap exists.
-	if got := s.RunningRoots(); got != 1 {
-		t.Fatalf("post-drop busyCount characterization: RunningRoots=%d, want 1 (phantom busyCount[R] from the Phase C reparent of a busy session — a pre-existing busyCount gap, not Hydrate-specific)", got)
+	// RESOLVED (was GAP-S3): Hydrate maintains the 8 SUBTREE indexes
+	// (7 Phase-1 + subtreeBusyCount prototype) on reparent — asserted above,
+	// all correct. The legacy busyCount[root] had a PRE-EXISTING reparent gap
+	// (Phase A set C busy under R → busyCount["R"]++; Phase C reparented C
+	// R→R2 leaving busyCount["R"] stranded; Phase D deleted C decrementing
+	// R2 only → phantom busyCount["R"]=1 unhealable by SetActivityFromStatuses
+	// since R's own activity was never busy). That gap is now CLOSED: busyCount
+	// was RETIRED and RunningRoots derives from the subtreeBusyCount index
+	// (single source of truth), which Hydrate maintains correctly on reparent.
+	// The phantom can no longer occur — RunningRoots must read 0.
+	if got := s.RunningRoots(); got != 0 {
+		t.Fatalf("post-drop: RunningRoots=%d, want 0 (busyCount retired; RunningRoots derives from subtreeBusyCount which Hydrate maintains on reparent — no phantom)", got)
 	}
-	// Cross-check: the subtreeBusyCount index (the newer Gate C prototype
-	// that Hydrate DOES maintain) correctly reports ZERO busy sessions,
-	// confirming the subtree index is consistent even though legacy
-	// busyCount drifted. This is the load-bearing GAP-S3 assertion.
+	// Cross-check: the subtreeBusyCount index (the single source of truth
+	// RunningRoots now derives from) correctly reports ZERO busy sessions.
+	// This is the load-bearing GAP-S3 assertion (strengthened: the index and
+	// the derived running count now agree).
 	if diff := subtreeBusyCountDiff(s); diff != "" {
-		t.Fatalf("post-drop subtreeBusyCount mismatch (the Hydrate-maintained index must be correct even though busyCount drifted):\n  %s", diff)
+		t.Fatalf("post-drop subtreeBusyCount mismatch (the index RunningRoots derives from must be correct):\n  %s", diff)
 	}
 }
 

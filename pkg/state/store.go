@@ -465,27 +465,25 @@ type Store struct {
 	// a session sendable at seq N can ask to send "only if nothing changed since
 	// N", so a turn that started-and-finished in the gap can't be double-driven.
 	activitySeq map[string]uint64
-	// Finished-unread tracking. busyCount[root] = number of busy/retry sessions in
-	// the root's subtree; when it falls to 0 the root is marked unread (a finished
-	// task awaiting acknowledgement). suppressUnread guards the hydrate reconcile.
-	//
-	// Maintained incrementally at two mutation sites:
-	//   - setActivityAtLocked (the busy↔non-busy chokepoint: busyCount[root]++/--)
-	//   - deleteSessionLocked (a busy non-root being archived/pruned must
-	//     decrement its OLD root's count; the runStatusReconcile heal iterates
-	//     s.sessions and cannot see an already-deleted id, so without this the
-	//     phantom count would persist and RunningRoots() would over-report).
-	// `delete(s.busyCount, id)` in deleteSessionLocked covers the case where id
-	// IS its own root; the explicit decrement covers the non-root case.
+	// Finished-unread tracking. The per-root busy aggregate is derived from the
+	// incremental subtreeBusyCount index (single source of truth — see
+	// RunningRoots); when a root's subtree goes fully idle the root is marked
+	// unread (a finished task awaiting acknowledgement). suppressUnread guards
+	// the hydrate reconcile. The mark/clear is driven from setActivityAtLocked
+	// (the busy↔non-busy chokepoint), reading subtreeBusyCount[root] before/after
+	// the delta. (The legacy root-keyed busyCount was RETIRED: it had asymmetric
+	// maintenance — a reparent gap and a phantom-status gap — that let
+	// RunningRoots diverge from per-session activity and report a phantom
+	// running root. subtreeBusyCount has neither gap.)
 	unread         map[string]bool
-	busyCount      map[string]int
 	suppressUnread bool
 	// Completion-grace window + completion-authority guard (Lane A fix for the
 	// stale "1 running" strand). When an assistant turn COMPLETES without a
-	// timely session.idle, busyCount[root] would strand at 1 until the ~60s
-	// /session/status reconcile clears it — and if /session/status itself is
-	// stale (reports busy) the strand is permanent. The grace window is the
-	// fast clearer; completionAuthoritative is the permanent guard.
+	// timely session.idle, the root's busy aggregate (subtreeBusyCount[root])
+	// would strand at 1 until the ~60s /session/status reconcile clears it —
+	// and if /session/status itself is stale (reports busy) the strand is
+	// permanent. The grace window is the fast clearer; completionAuthoritative
+	// is the permanent guard.
 	//
 	// graceTimers[sid] holds the pending completion-grace timer for sid (absent
 	// when none is armed). It fires after completionGrace, deferring the idle
@@ -528,32 +526,36 @@ type Store struct {
 	// Promoted off the package global for the same race reason as
 	// deltaFlushInterval.
 	recentArchiveTTL time.Duration
-	// subtreeBusyCount is the INCREMENTAL per-node busy aggregate (Gate C
-	// de-risking prototype). subtreeBusyCount[id] = the number of busy/retry
-	// sessions in id's subtree, INCLUDING id itself when it is busy/retry. It is
-	// the count generalization of computeSubtreeBusyLocked's per-node bool (bool
+	// subtreeBusyCount is the INCREMENTAL per-node busy aggregate and the SINGLE
+	// SOURCE OF TRUTH for the per-root running count (Store.RunningRoots derives
+	// from it). subtreeBusyCount[id] = the number of busy/retry sessions in id's
+	// subtree, INCLUDING id itself when it is busy/retry. It is the count
+	// generalization of computeSubtreeBusyLocked's per-node bool (bool
 	// = count > 0); maintaining the stricter count invariant proves the
 	// incremental-index pattern for the remaining 7 collapsed-frontier indexes.
 	//
 	// Maintained incrementally at every mutation site that can change it —
-	// setActivityLocked (busy-state chokepoint), upsertSessionLocked +
+	// setActivityLocked (busy-state chokepoint, which also derives the
+	// finished-unread trigger from this index), upsertSessionLocked +
 	// Hydrate's direct assign (create/reparent), deleteSessionLocked (delete) —
-	// so a Snapshot/SendableNow read is O(1) per node instead of the O(n)
-	// computeSubtreeBusyLocked recompute. ADDITIVE prototype: the snapshot path
-	// still calls computeSubtreeBusyLocked unchanged; this index coexists and is
-	// proven equivalent by TestSubtreeBusyCountProperty (random-mutation
-	// differential vs an independent O(n) recompute). Entries exist ONLY for
-	// live sessions (sessions in s.sessions); phantom status events for unknown
-	// sessionIDs do NOT create entries, matching computeSubtreeBusyLocked's
-	// iteration over s.sessions. Guarded by s.mu (same as busyCount).
+	// so a Snapshot/SendableNow / RunningRoots read is O(1) per node instead of
+	// an O(n) computeSubtreeBusyLocked recompute. ADDITIVE prototype origin: the
+	// snapshot path still calls computeSubtreeBusyLocked unchanged; this index
+	// is proven equivalent by TestSubtreeBusyCountProperty (random-mutation
+	// differential vs an independent O(n) recompute), and TestBusyEquivalence_*
+	// pins that RunningRoots (derived from it) agrees with per-session activity
+	// across every terminal transition. Entries exist ONLY for live sessions
+	// (sessions in s.sessions); phantom status events for unknown sessionIDs do
+	// NOT create entries, matching computeSubtreeBusyLocked's iteration over
+	// s.sessions. Guarded by s.mu.
 	subtreeBusyCount map[string]int
 	// Phase 1 (Gate C extension): the remaining 7 incremental subtree indexes
 	// the collapsed-frontier projection (O1) reads to build roots + active
 	// closure + frontier stubs in O(|roots|+|closure|×depth+|frontier|) instead
 	// of O(n). ADDITIVE in Phase 1: the snapshot path
-	// (computeSubtreeBusyLocked / Snapshot / SendableNow / busyCount[root]) is
-	// UNCHANGED — these indexes coexist with the prototype and are proven
-	// equivalent to an independent O(n) recompute by TestSubtreeIndexesProperty.
+	// (computeSubtreeBusyLocked / Snapshot / SendableNow) is UNCHANGED — these
+	// indexes coexist with the prototype and are proven equivalent to an
+	// independent O(n) recompute by TestSubtreeIndexesProperty.
 	// See subtree_indexes.go for the per-index invariants + maintenance sites.
 	//
 	// Topology: children[parentID] = ordered live direct-child ids; children[""]
@@ -701,7 +703,6 @@ func New(ringCapacity int) *Store {
 		activity:                map[string]string{},
 		activitySeq:             map[string]uint64{},
 		unread:                  map[string]bool{},
-		busyCount:               map[string]int{},
 		graceTimers:             map[string]*time.Timer{},
 		graceGen:                map[string]uint64{},
 		completionAuthoritative: map[string]bool{},
@@ -776,7 +777,7 @@ func (s *Store) rootOfLocked(id string) string {
 //   - upsertSessionLocked + Hydrate direct-assign: create/reparent
 //   - deleteSessionLocked: remove + propagate to ancestors
 //
-// All callers hold s.mu (the index lives under the same lock as busyCount).
+// All callers hold s.mu (the index lives under the same lock as s.sessions).
 
 // subtreeBusySelfLocked returns id's OWN contribution to its subtree busy
 // count: 1 when its activity is busy/retry, else 0. Caller holds s.mu.

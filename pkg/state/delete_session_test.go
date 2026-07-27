@@ -51,18 +51,19 @@ import (
 // surface for one id, captured under s.mu. It lets these characterization
 // tests assert the full cleanup contract directly — the public API only
 // exposes RunningRoots / Snapshot, which is too coarse to prove the grace
-// timer was disarmed, completionAuthoritative was dropped, or the busyCount
-// entry was removed (vs left at 0). graceStateSnapshot (grace_timer_test.go)
-// covers the root's busyCount; this struct covers the DELETED id's residue.
+// timer was disarmed, completionAuthoritative was dropped, or the
+// subtreeBusyCount entry was removed (vs left at 0). graceStateSnapshot
+// (grace_timer_test.go) covers the root's subtreeBusyCount; this struct
+// covers the DELETED id's residue. (The legacy busyCount was retired;
+// subtreeBusyCount is the single source of truth for the busy aggregate.)
 type deleteCleanupState struct {
-	sessionPresent  bool   // s.sessions[id] != nil
-	activity        string // s.activity[id] ("" when gone)
-	authoritative   bool   // s.completionAuthoritative[id]
-	graceArmed      bool   // s.graceTimers[id] != nil
-	graceGen        uint64 // s.graceGen[id] (cancel bumps past the arm gen)
-	busySelf        int    // s.busyCount[id]
-	busySelfPresent bool   // whether the busyCount[id] MAP ENTRY exists (distinct from value 0)
-	subtreeSelf     int    // s.subtreeBusyCount[id]
+	sessionPresent     bool   // s.sessions[id] != nil
+	activity           string // s.activity[id] ("" when gone)
+	authoritative      bool   // s.completionAuthoritative[id]
+	graceArmed         bool   // s.graceTimers[id] != nil
+	graceGen           uint64 // s.graceGen[id] (cancel bumps past the arm gen)
+	subtreeSelf        int    // s.subtreeBusyCount[id]
+	subtreeSelfPresent bool   // whether the subtreeBusyCount[id] MAP ENTRY exists (distinct from value 0)
 }
 
 // deleteCleanupSnapshot captures the cleanup surface for id under s.mu. Safe
@@ -70,16 +71,15 @@ type deleteCleanupState struct {
 func (s *Store) deleteCleanupSnapshot(id string) deleteCleanupState {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	bs, bsOK := s.busyCount[id]
+	ss, ssOK := s.subtreeBusyCount[id]
 	return deleteCleanupState{
-		sessionPresent:  s.sessions[id] != nil,
-		activity:        s.activity[id],
-		authoritative:   s.completionAuthoritative[id],
-		graceArmed:      s.graceTimers[id] != nil,
-		graceGen:        s.graceGen[id],
-		busySelf:        bs,
-		busySelfPresent: bsOK,
-		subtreeSelf:     s.subtreeBusyCount[id],
+		sessionPresent:     s.sessions[id] != nil,
+		activity:           s.activity[id],
+		authoritative:      s.completionAuthoritative[id],
+		graceArmed:         s.graceTimers[id] != nil,
+		graceGen:           s.graceGen[id],
+		subtreeSelf:        ss,
+		subtreeSelfPresent: ssOK,
 	}
 }
 
@@ -213,27 +213,28 @@ func TestDeleteSession_CancelsArmedGrace(t *testing.T) {
 }
 
 // TestDeleteSession_BusyNonRootDecrementsRootCounter is GAP-S2 case 2 (the
-// non-root busy-delete decrement). A busy non-root session that is archived
-// (time.archived → deleteSessionLocked) or removed leaves busyCount[root]
-// stuck at its pre-archive value if the decrement is skipped: the only other
-// site that touches this map is delete(s.busyCount, id) (store.go:1573), which
-// clears id's OWN entry (correct when id IS its own root) but NOT the root's.
-// The runStatusReconcile heal ticker cannot recover this (it iterates
-// s.sessions, and the archived id is already gone). deleteSessionLocked
-// mirrors the decrement half of setActivityAtLocked's busy→non-busy branch
-// (store.go:1500-1506).
+// non-root busy-delete). A busy non-root session that is archived
+// (time.archived → deleteSessionLocked) or removed must drop its contribution
+// from the root's busy aggregate, or RunningRoots() over-reports a phantom
+// running root. RunningRoots now derives from the subtreeBusyCount index
+// (single source of truth — the legacy busyCount was retired); the delete path
+// maintains it via maintainIndexesOnDeleteLocked, which propagates the
+// deleted busy non-root's whole-subtree contribution out of every live
+// ancestor. The runStatusReconcile heal ticker cannot recover a missed
+// maintenance (it iterates s.sessions, and the archived id is already gone),
+// so the delete-side maintenance is the authoritative fix.
 //
-// Mutation-observability: removing the decrement makes this test FAIL —
-// busyCount[root] stays at 1 and RunningRoots() over-reports (the exact
-// production bug the inline comment at 1481-1499 documents: surfaced via
-// /vh/running-sessions and the SPA's project switcher badge).
+// Mutation-observability: breaking the subtreeBusyCount delete maintenance
+// makes this test FAIL — subtreeBusyCount[root] stays > 0 and RunningRoots()
+// over-reports (the exact production bug surfaced via /vh/running-sessions
+// and the SPA's project switcher badge).
 func TestDeleteSession_BusyNonRootDecrementsRootCounter(t *testing.T) {
 	s := New(100)
 	defer s.Close()
 
 	s.Apply(ev("session.created", evSessionCreated("root", "")))
 	s.Apply(ev("session.created", evSessionCreated("child", "root")))
-	// child busy → busyCount[root]++ (the setActivityAtLocked chokepoint).
+	// child busy → subtreeBusyCount[root]++ (the setActivityAtLocked chokepoint).
 	s.Apply(ev("session.status", evStatus("child", "busy")))
 
 	_, _, _, rootBusy := s.graceStateSnapshot("root")
@@ -244,33 +245,35 @@ func TestDeleteSession_BusyNonRootDecrementsRootCounter(t *testing.T) {
 		t.Fatalf("setup: RunningRoots=%d, want 1", got)
 	}
 
-	// Delete the BUSY NON-ROOT child. The root != id guard at store.go:1502
-	// passes (rootOfLocked(child)==root != child), so busyCount[root]-- fires.
+	// Delete the BUSY NON-ROOT child. The subtreeBusyCount delete maintenance
+	// (maintainIndexesOnDeleteLocked) propagates child's contribution out of
+	// root's aggregate.
 	s.Apply(ev("session.deleted", evSessionDeleted("child")))
 
 	_, _, _, rootBusyAfter := s.graceStateSnapshot("root")
 	if rootBusyAfter != 0 {
-		t.Fatalf("after delete busy non-root child: busyCount[root]=%d, want 0 "+
-			"(deleteSessionLocked must mirror the busy→non-busy decrement at store.go:1503-1505)", rootBusyAfter)
+		t.Fatalf("after delete busy non-root child: subtreeBusyCount[root]=%d, want 0 "+
+			"(deleteSessionLocked's subtree maintenance must drop the busy child's contribution)", rootBusyAfter)
 	}
 	if got := s.RunningRoots(); got != 0 {
 		t.Fatalf("after delete busy non-root child: RunningRoots=%d, want 0 (stranded busyCount would over-report)", got)
 	}
-	// The deleted child's own busyCount entry is also gone (delete at :1573).
-	if st := s.deleteCleanupSnapshot("child"); st.busySelfPresent {
-		t.Fatalf("after delete: busyCount[child] map entry should be absent, got value=%d present", st.busySelf)
+	// The deleted child's own subtreeBusyCount entry is also gone
+	// (delete(s.subtreeBusyCount, id)).
+	if st := s.deleteCleanupSnapshot("child"); st.subtreeSelfPresent {
+		t.Fatalf("after delete: subtreeBusyCount[child] map entry should be absent, got value=%d present", st.subtreeSelf)
 	}
 }
 
 // TestDeleteSession_RetryNonRootDecrementsRootCounter is GAP-S2 case 2 variant:
-// ActivityRetry is also busy-class (setActivityAtLocked's isBusy flag is
-// `st == ActivityBusy || st == ActivityRetry`, store.go:848). The delete-path
-// decrement uses the SAME predicate (store.go:1500). This test pins that
-// retry→delete decrements the root counter, not just busy→delete.
+// ActivityRetry is also busy-class (subtreeBusySelfLocked flags
+// `st == ActivityBusy || st == ActivityRetry`). The delete path's subtreeBusyCount
+// maintenance uses the SAME predicate. This test pins that retry→delete drops
+// the root's aggregate, not just busy→delete.
 //
-// Mutation-observability: widening the decrement predicate to busy-only
-// (dropping the `|| ActivityRetry`) makes this test FAIL — busyCount[root]
-// stays at 1 for a deleted retry child.
+// Mutation-observability: a busy-only maintenance predicate (dropping the
+// `|| ActivityRetry`) makes this test FAIL — subtreeBusyCount[root] stays at 1
+// for a deleted retry child.
 func TestDeleteSession_RetryNonRootDecrementsRootCounter(t *testing.T) {
 	s := New(100)
 	defer s.Close()
@@ -281,36 +284,29 @@ func TestDeleteSession_RetryNonRootDecrementsRootCounter(t *testing.T) {
 
 	_, _, _, rootBusy := s.graceStateSnapshot("root")
 	if rootBusy != 1 {
-		t.Fatalf("setup: busyCount[root]=%d, want 1 (retry is busy-class: setActivityAtLocked counts it)", rootBusy)
+		t.Fatalf("setup: subtreeBusyCount[root]=%d, want 1 (retry is busy-class: setActivityAtLocked counts it)", rootBusy)
 	}
 
 	s.Apply(ev("session.deleted", evSessionDeleted("child")))
 
 	_, _, _, rootBusyAfter := s.graceStateSnapshot("root")
 	if rootBusyAfter != 0 {
-		t.Fatalf("after delete retry non-root child: busyCount[root]=%d, want 0 "+
-			"(delete-path decrement predicate at store.go:1500 must cover ActivityRetry)", rootBusyAfter)
+		t.Fatalf("after delete retry non-root child: subtreeBusyCount[root]=%d, want 0 "+
+			"(delete-path subtree maintenance must cover ActivityRetry)", rootBusyAfter)
 	}
 }
 
 // TestDeleteSession_BusyRootClearsOwnEntryNoNegativeArtifact is GAP-S2 case 3
 // (busy-root self-delete). Deleting a busy ROOT must leave NO negative or
-// zero busyCount artifact for the root's own id, and must not corrupt a
-// SIBLING root's counter. The root==id guard at store.go:1502 deliberately
-// SKIPS the explicit decrement (root's own entry is cleared by
-// delete(s.busyCount, id) at :1573 — decrementing first would be a logically
-// wrong double-attribution even though delete() then removes the entry).
+// residual subtreeBusyCount artifact for the root's own id, and must not
+// corrupt a SIBLING root's aggregate. deleteSessionLocked's
+// delete(s.subtreeBusyCount, id) clears the root's own entry; the subtree
+// maintenance has no ancestor above a root to propagate to.
 //
-// HONESTY NOTE on mutation-observability: the `root != id` guard itself is
-// NOT independently observable through busyCount — delete(s.busyCount, id)
-// at :1573 unconditionally removes the entry, so busyCount[root] is absent
-// whether or not the guard skipped a redundant decrement. This test
-// characterizes the OBSERVABLE CONTRACT around the guard (entry cleanly
-// absent, no negative value, sibling roots unaffected), which WOULD fail if
-// delete(s.busyCount, id) at :1573 were removed (entry would persist at its
-// pre-delete value or at value-1 depending on the guard). The guard is a
-// clarity/correctness-intent statement; the test pins the outcome it
-// cooperates with delete() to produce.
+// HONESTY NOTE on mutation-observability: this test characterizes the
+// OBSERVABLE CONTRACT (entry cleanly absent, no negative value, sibling roots
+// unaffected), which WOULD fail if delete(s.subtreeBusyCount, id) were
+// removed (entry would persist at its pre-delete value).
 func TestDeleteSession_BusyRootClearsOwnEntryNoNegativeArtifact(t *testing.T) {
 	s := New(100)
 	defer s.Close()
@@ -318,35 +314,34 @@ func TestDeleteSession_BusyRootClearsOwnEntryNoNegativeArtifact(t *testing.T) {
 	// Two busy roots so we can prove deleting one does not corrupt the other.
 	s.Apply(ev("session.created", evSessionCreated("r1", "")))
 	s.Apply(ev("session.created", evSessionCreated("r2", "")))
-	// Inflight on each → busyCount[r1]=1, busyCount[r2]=1 (root selves).
+	// Inflight on each → subtreeBusyCount[r1]=1, subtreeBusyCount[r2]=1 (root selves).
 	s.Apply(ev("message.updated", evAssistantInflight("r1", "m1")))
 	s.Apply(ev("message.updated", evAssistantInflight("r2", "m2")))
 
 	_, _, _, r1Busy := s.graceStateSnapshot("r1")
 	_, _, _, r2Busy := s.graceStateSnapshot("r2")
 	if r1Busy != 1 || r2Busy != 1 {
-		t.Fatalf("setup: busyCount r1=%d r2=%d, want both 1", r1Busy, r2Busy)
+		t.Fatalf("setup: subtreeBusyCount r1=%d r2=%d, want both 1", r1Busy, r2Busy)
 	}
 	if got := s.RunningRoots(); got != 2 {
 		t.Fatalf("setup: RunningRoots=%d, want 2", got)
 	}
 
-	// Delete r1 (a busy root). rootOfLocked(r1)==r1 → root==id → guard skips
-	// the explicit decrement; delete(s.busyCount, r1) at :1573 clears the entry.
+	// Delete r1 (a busy root). delete(s.subtreeBusyCount, r1) clears the entry.
 	s.Apply(ev("session.deleted", evSessionDeleted("r1")))
 
 	st := s.deleteCleanupSnapshot("r1")
-	if st.busySelfPresent {
-		t.Fatalf("after delete busy root: busyCount[r1] map entry should be ABSENT (cleared by delete at :1573), got value=%d present", st.busySelf)
+	if st.subtreeSelfPresent {
+		t.Fatalf("after delete busy root: subtreeBusyCount[r1] map entry should be ABSENT (cleared by delete), got value=%d present", st.subtreeSelf)
 	}
-	if st.busySelf < 0 {
-		t.Fatalf("after delete busy root: busyCount[r1]=%d, must not be negative (guard at :1502 prevents a redundant self-decrement)", st.busySelf)
+	if st.subtreeSelf < 0 {
+		t.Fatalf("after delete busy root: subtreeBusyCount[r1]=%d, must not be negative", st.subtreeSelf)
 	}
 	// r2 must be completely untouched (proves the delete was keyed correctly
 	// and no cross-root corruption occurred).
 	_, _, _, r2BusyAfter := s.graceStateSnapshot("r2")
 	if r2BusyAfter != 1 {
-		t.Fatalf("after delete r1: busyCount[r2]=%d, want 1 (sibling root must be unaffected)", r2BusyAfter)
+		t.Fatalf("after delete r1: subtreeBusyCount[r2]=%d, want 1 (sibling root must be unaffected)", r2BusyAfter)
 	}
 	if got := s.RunningRoots(); got != 1 {
 		t.Fatalf("after delete r1: RunningRoots=%d, want 1 (only r2 remains)", got)
