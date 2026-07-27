@@ -582,10 +582,51 @@ let es: EventSource | null = null;
 //                     deadline instead of inheriting a stale timestamp.
 let treeLastSeen = 0;
 let sessionLastSeen = 0;
+// Content-vs-transport split for Stream2 liveness (Lane C). sessionLastSeen
+// above is refreshed by BOTH the 15s server ping AND content events, so a
+// dead-but-OPEN Stream2 whose transport stays alive (pings flow) but delivers
+// ZERO content keeps sessionLastSeen fresh forever — the watchdog never trips
+// and the frozen transcript sits with no recovery signal (the operator's
+// most-hit "reload helps" issue). sessionContentSeen closes that gap: refreshed
+// ONLY by genuine Stream2 content (snapshot / message.* / onopen), NEVER by
+// ping. The watchdog's Stream2 branch reconnects when EITHER clock ages out.
+// See CONTENT_STALE_MS for the threshold rationale.
+//
+// DESIGN DEBATE OUTCOME (broaden-to-both considered, Stream1 deferred):
+// Stream1 (treeLastSeen) has the SAME ping/content conflation (its ping
+// listener calls markTreeSeen), so a content-stall on the tree is also masked.
+// Weighed broadening a content clock to Stream1; concluded Stream1 is DEFERRED
+// as a documented latent gap because (1) the operator's pain is Stream2
+// (frozen transcript) — no tree-freeze reports; (2) Stream1 is backstopped
+// server-side by runStatusReconcile (SR60: re-derives activity and emits a
+// fresh content event on Stream1 every ≤60s) for the common transient-miss
+// mode, while Stream2 message content has NO such backstop (dataflow Q2); (3)
+// the red-test's tree control is intentionally ping-only (mirroring the bug
+// scenario) and would need circular amendment under a Stream1 content clock;
+// (4) keeping the change focused on Stream2 liveness composes cleanly with
+// Lane B's applySessionSnapshot work (no overlapping surface). Mirror this
+// fix (treeContentSeen) if Stream1 freeze symptoms surface. See the Lane C
+// packet + dataflow/holistic-writeup.md.
+let sessionContentSeen = 0;
 let reconnectTimer: number | undefined;
 let backoff = 1000; // grows on repeated failures, reset on a healthy open
 let everOpened = false; // first stream open is the initial load; later opens are reconnects
 export const STALE_MS = 45_000; // ~3 missed 15s pings → assume the stream is dead
+// Content-stall threshold (product policy). Transport staleness (STALE_MS)
+// catches a stream whose pings STOP. CONTENT_STALE_MS catches a stream whose
+// pings KEEP FLOWING but which delivers no content (the ping-mask gap). 120s
+// is deliberately conservative: during active reasoning, tokens stream as
+// message.part.delta (content flows continuously), so a genuine content gap
+// this long is abnormal; but tool execution / between-turn gaps can legitimately
+// silence content for tens of seconds, and a too-aggressive threshold would
+// tear down and re-establish a healthy connection during normal deep-reasoning
+// silences (a false reconnect costs a refresh flash + a re-snapshot round-trip).
+// 120s ≈ 8 missed 15s ping windows of zero content. This value also keeps the
+// existing Gate-C idle-stability test green as-is (its ~106s content-silence
+// window stays under the threshold → no churn). Tunable: lower toward 90s if
+// real-world signal shows 120s feels too slow; do NOT go below ~60s (legitimate
+// tool-execution gaps) or deep-reasoning silences false-reconnect.
+export const CONTENT_STALE_MS = 120_000;
 
 // --- Feature 1: staleness (S1) ---------------------------------------------
 // healthNow is a coarse tick (bumped by the watchdog) so staleness re-evaluates
@@ -626,10 +667,25 @@ function markTreeSeen() {
     setState("lastSeen", now);
   }
 }
-// markSessionSeen updates Stream2's liveness clock ONLY. No reactive mirror —
-// Stream2 health surfaces through `refreshing[id]` and the watchdog, not the
-// global status dot. Called from every Stream2 listener (gen-guarded).
+// markSessionSeen updates Stream2's liveness clocks: BOTH the transport clock
+// (sessionLastSeen) AND the content clock (sessionContentSeen). Called from
+// Stream2's CONTENT listeners (snapshot, message.*, onopen) and the open()
+// construction seed. The ping listener calls markSessionTransportSeen instead
+// (transport only) so a content-stall ages out sessionContentSeen even while
+// pings keep sessionLastSeen fresh. No reactive mirror — Stream2 health
+// surfaces through `refreshing[id]` and the watchdog, not the global status dot.
 function markSessionSeen() {
+  const now = Date.now();
+  sessionLastSeen = now;
+  sessionContentSeen = now;
+}
+// markSessionTransportSeen refreshes the transport clock ONLY (the 15s server
+// ping). It deliberately does NOT touch sessionContentSeen, so a ping-only
+// stream (transport alive, zero content) lets the content clock age out and the
+// watchdog reconnects via the content-stall branch. This is the split that
+// un_masks the dead-but-OPEN Stream2 the operator's single transport+content
+// clock hid.
+function markSessionTransportSeen() {
   sessionLastSeen = Date.now();
 }
 
@@ -1974,8 +2030,11 @@ export function closeSessionStream() {
   // Reset Stream2's liveness clock: a not-yet-open / about-to-be-replaced
   // Stream2 must NOT inherit a stale timestamp and be classified stale before
   // it has had a chance to fire. 0 = "never seen" → watchdog treats it as
-  // not-stale (gives the next open() a fresh deadline).
+  // not-stale (gives the next open() a fresh deadline). Both clocks (transport
+  // AND content) reset together so a replacement connection's content-stall
+  // deadline is seeded fresh by open().
   sessionLastSeen = 0;
+  sessionContentSeen = 0;
   // Phase 3-F: a session switch starts the next session's CLOSED-reopen backoff
   // fresh (per-session backoff does not carry across session switches).
   sesBackoff = 1500;
@@ -2252,7 +2311,10 @@ export function openSessionStream(id: string, force = false) {
     });
     ses.addEventListener("ping", () => {
       if (gen !== sesGen) return;
-      markSessionSeen();
+      // Transport-only: refresh sessionLastSeen but NOT sessionContentSeen, so
+      // a ping-only stream (transport alive, zero content) lets the content
+      // clock age out and the watchdog's content-stall branch fires.
+      markSessionTransportSeen();
     });
     // L1 t1: socket established → pure connection-latency delta. Stream 2 had
     // no explicit onopen before; added for the latency diagnostic (and parity
@@ -2503,12 +2565,35 @@ export function watchdogTick() {
   if (sesId) {
     if (!ses || ses.readyState === EventSource.CLOSED) {
       openSessionStream(sesId);
-    } else if (sessionLastSeen && Date.now() - sessionLastSeen > STALE_MS) {
-      log.warn("sync", "session stream stale → forcing reconnect", {
-        id: sesId,
-        silentMs: Date.now() - sessionLastSeen,
-      });
-      openSessionStream(sesId, true);
+    } else {
+      // Two independent stall signals, EITHER trips the forced fresh-snapshot
+      // reconnect (openSessionStream(id, true) → cursorless → authoritative
+      // snapshot → applySessionSnapshot MERGE). The recovery path is the same
+      // one the original dead-but-OPEN fix established; only the TRIGGER set
+      // grows.
+      //
+      // Transport stall (original path): pings STOPPED → sessionLastSeen ages
+      // past STALE_MS. Catches a fully-dead socket.
+      //
+      // Content stall (Lane C): transport ALIVE (pings flow, sessionLastSeen
+      // fresh) but ZERO content delivered → sessionContentSeen ages past
+      // CONTENT_STALE_MS. Catches the ping-mask gap (operator's "frozen
+      // transcript, reload helps"): a socket that stays OPEN and keeps
+      // acknowledging pings but never delivers snapshot/message/part. The
+      // conservative CONTENT_STALE_MS keeps legitimate deep-reasoning /
+      // tool-execution silences (which stream part deltas well under the
+      // window) from churning the connection.
+      const transportStale = !!(sessionLastSeen && Date.now() - sessionLastSeen > STALE_MS);
+      const contentStale = !!(sessionContentSeen && Date.now() - sessionContentSeen > CONTENT_STALE_MS);
+      if (transportStale || contentStale) {
+        log.warn("sync", "session stream stale → forcing reconnect", {
+          id: sesId,
+          silentMs: sessionLastSeen ? Date.now() - sessionLastSeen : 0,
+          contentSilentMs: sessionContentSeen ? Date.now() - sessionContentSeen : 0,
+          reason: contentStale && !transportStale ? "content-stall" : "transport-stall",
+        });
+        openSessionStream(sesId, true);
+      }
     }
   }
 }
