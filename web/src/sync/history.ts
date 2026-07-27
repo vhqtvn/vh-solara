@@ -61,16 +61,18 @@ import { prependMessagesIfAbsent, deleteMessagesFromTop, approxResidentBytes } f
 import { log } from "../lib/log";
 import { state, setState, projectDir } from "./store";
 import { decodeGzip64 } from "./decode";
-import { getSesGen } from "./stream";
+import { getSesGen } from "./session-stream";
 
 // deriveMessageWindow — pure helper that projects the server-side window meta
 // (Phase 1's WindowMeta wire shape) into the client's resident MessageWindowState
 // (Phase 3). Used by the three snapshot/batch paths that derive a window from
 // server items (messages.batch, applySessionSnapshot, refreshOpenSessions) so
-// they all populate the window state consistently. NOTE: only messages.batch
-// and refreshOpenSessions wholesale-replace messages[id]; applySessionSnapshot
-// merge-if-absents message bodies (live always wins — see applySessionSnapshot)
-// but still derives the resident-window cursor from the snapshot's items. Pure
+// they all populate the window state consistently. NOTE: messages.batch and
+// applySessionSnapshot both merge-if-absent message bodies via
+// prependMessagesIfAbsent (live always wins — see applySessionSnapshot); only
+// refreshOpenSessions wholesale-replaces messages[id] (it skips the active
+// session, so it has no live upserts to clobber). All three still derive the
+// resident-window cursor from their items. Pure
 // + exported for unit testing.
 //
 // Back-compat: a pre-Phase-1 server ships the WHOLE transcript and omits the
@@ -102,8 +104,8 @@ export function deriveMessageWindow(
 // mirroring aggregator.msgInflight); Contract-B conditional-freshness via the
 // `dirty` mirror flag (client-side analog of the server's
 // me.liveTouchedBody/me.liveTouchedParts) — discard-and-refetch ONLY for
-// resurrection-class mutations during the page flight (deletions + wholesale
-// cache replace). Live state always wins. The dirty trigger is NARROW — see
+// the narrow isPageDirtyingKind set (deletions + messages.batch, which
+// resets the resident window). Live state always wins. The dirty trigger is NARROW — see
 // isPageDirtyingKind for the rationale (live upserts cannot resurrect a stale
 // page because the merge is insert-if-not-present, so they are deliberately
 // excluded to keep Load-older usable on actively-streaming sessions).
@@ -347,17 +349,21 @@ export function markPageDirty(sid: string) {
   if (f) f.dirty = true;
 }
 
-// isPageDirtyingKind — the narrow resurrection-class kind filter for the
-// Stream2 listener's markPageDirty hook. Returns true ONLY for mutation kinds
-// that could make a stale in-flight page resurrect a message the live state
-// has removed:
+// isPageDirtyingKind — the narrow kind filter for the Stream2 listener's
+// markPageDirty hook. Returns true ONLY for mutation kinds that could leave a
+// stale in-flight page inconsistent with the live resident state — either
+// resurrecting a message the live state has removed, or clobbering a fresher
+// resident window the batch just reset:
 //
 //   - message.delete: a page captured before the delete would re-insert the
 //     deleted message by ID (prependMessagesIfAbsent inserts absent ids).
 //   - part.delete:    a page captured before the part delete would re-insert
 //     the message with the deleted part still present.
-//   - messages.batch: wholesale-replaces the resident cache; a stale page
-//     merged after the replace could resurrect messages the batch removed.
+//   - messages.batch: after the Lane B merge-guard this merge-if-absents
+//     message bodies (prependMessagesIfAbsent — cannot resurrect removed
+//     messages like the two delete kinds above), but it still wholesale-resets
+//     messageWindows[id]; a stale page merged after the batch could clobber
+//     the batch's fresher window meta, so it remains in the dirty set.
 //
 // The kinds FALSE here are safe to skip because the merge is INSERT-IF-NOT-
 // PRESENT (live always wins, never overwrites):
