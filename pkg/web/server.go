@@ -869,6 +869,11 @@ func (s *Server) Handler() http.Handler {
 	// X-VH-CSRF exception is needed (CSRF defense applies to unsafe methods
 	// only). Emits bounded aggregates only — no raw transcript/session/URL.
 	mux.HandleFunc("/vh/diag/latency", diag.Handler().ServeHTTP)
+	// Busy-indexes diagnostic: read-only GET, auth-gated like every other
+	// /vh/* route. GET-only at the handler too (defense in depth, mirrors
+	// /vh/diag/latency). Dumps per-workspace RunningRoots + subtreeBusy +
+	// per-session activity so a phantom running count is one-query-diagnosable.
+	mux.HandleFunc("/vh/diag/busy", s.handleDiagBusy)
 	mux.HandleFunc("/vh/skill/emit", s.handleSkillEmit)
 	mux.HandleFunc("/vh/version", func(w http.ResponseWriter, r *http.Request) {
 		writeJSONResp(w, map[string]string{"version": s.version()})
