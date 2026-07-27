@@ -1,0 +1,101 @@
+/* Inline mermaid block (migrated from Part.module.css) */
+.mermaidBlock {
+  margin: 0.75em 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px;
+  background: var(--bg-elev, var(--bg));
+}
+.mermaidSvg {
+  overflow-x: auto;
+  text-align: center;
+}
+.mermaidSvg svg {
+  max-width: 100%;
+  height: auto;
+}
+
+/* Action bar (inline) */
+.mermaidActions {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+}
+.mermaidActions button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--fg-dim);
+  border-radius: 4px;
+  padding: 2px 6px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.mermaidActions button:hover {
+  color: var(--fg);
+}
+
+/* Full-viewport overlay.
+ *
+ * CSS heat invariants (Firefox/WebRender): NO backdrop-filter, NO mask-image,
+ * NO -webkit-mask, NO contain:paint, NO content-visibility, NO will-change. The
+ * backdrop is a plain solid color (semi-transparent black). */
+.overlay {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-overlay-full);
+  display: flex;
+  flex-direction: column;
+  background: rgba(0, 0, 0, 0.88);
+  padding: max(8px, env(safe-area-inset-top)) max(8px, env(safe-area-inset-right))
+    max(8px, env(safe-area-inset-bottom)) max(8px, env(safe-area-inset-left));
+  outline: none;
+}
+
+/* Overlay top action bar */
+.overlayActions {
+  display: flex;
+  gap: 8px;
+  padding: 4px 4px 8px 4px;
+}
+.overlayActions button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 44px; /* touch-sized */
+  min-width: 44px;
+  padding: 0 12px;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  color: var(--fg);
+  border-radius: 6px;
+  font-size: 14px;
+  cursor: pointer;
+  justify-content: center;
+}
+.overlayActions button:hover {
+  background: rgba(255, 255, 255, 0.16);
+}
+.overlayActions .close {
+  margin-left: auto; /* persistent close pinned to the trailing edge */
+}
+
+/* SVG host: scrollable viewport, fills remaining space. */
+.viewport {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.viewportSvg {
+  max-width: 100%;
+  max-height: 100%;
+}
+.viewportSvg svg {
+  max-width: 100%;
+  height: auto;
+}

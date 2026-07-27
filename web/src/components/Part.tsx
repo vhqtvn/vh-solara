@@ -4,7 +4,6 @@ import { renderMarkdown } from "../render";
 import { renderStreamMd } from "../lib/md";
 import { StreamMd } from "../lib/streamMd";
 import { placeStreamCaret } from "../lib/streamCaret";
-import { renderMermaid } from "../lib/mermaid";
 import { renderMathIn } from "../lib/math";
 import { streamLive } from "../prefs";
 import { openFileAt } from "../code/frame";
@@ -13,6 +12,7 @@ import { addCodeCopyButtons, linkifyPaths, splitMermaid, tagInlineCodePaths } fr
 import type { Part } from "../types";
 import Icon from "./Icon";
 import { ToolPart } from "./ToolPart";
+import MermaidViewer from "./MermaidViewer";
 import styles from "./Part.module.css";
 
 // Per-part expand state, keyed by part id and held OUTSIDE the components.
@@ -72,38 +72,6 @@ export function MarkdownHtml(props: { text: string; live?: boolean }) {
     >
       <div class="md" ref={ref} innerHTML={html()!} onClick={onClick} />
     </Show>
-  );
-}
-
-function downloadSvg(svg: string, name: string) {
-  const blob = new Blob([svg], { type: "image/svg+xml" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = name;
-  a.click();
-  URL.revokeObjectURL(url);
-}
-
-// Inline mermaid diagram with copy/download actions.
-function Mermaid(props: { src: string }) {
-  const [svg] = createResource(() => props.src, renderMermaid);
-  return (
-    <div class={styles["mermaid-block"]}>
-      <Show when={svg()} fallback={<pre class="md-raw">{props.src}</pre>}>
-        <div class={styles["mermaid-svg"]} innerHTML={svg()!} />
-      </Show>
-      <div class={styles["mermaid-actions"]}>
-        <button type="button" onClick={() => void navigator.clipboard?.writeText(props.src)}>
-          copy
-        </button>
-        <Show when={svg()}>
-          <button type="button" onClick={() => downloadSvg(svg()!, "diagram.svg")}>
-            download
-          </button>
-        </Show>
-      </div>
-    </div>
   );
 }
 
@@ -175,7 +143,7 @@ function Markdown(props: { text: string; settled: boolean; caret?: boolean }) {
   return (
     <Show when={props.settled} fallback={streamingView()}>
       <For each={splitMermaid(props.text)}>
-        {(seg) => (seg.type === "mermaid" ? <Mermaid src={seg.content} /> : <MarkdownHtml text={seg.content} live={live} />)}
+        {(seg) => (seg.type === "mermaid" ? <MermaidViewer src={seg.content} /> : <MarkdownHtml text={seg.content} live={live} />)}
       </For>
     </Show>
   );

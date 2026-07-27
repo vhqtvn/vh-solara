@@ -274,6 +274,32 @@ func New() *FakeOpenCode {
 			},
 		},
 	}
+	// Mermaid session: a self-contained transcript exercising the inline diagram
+	// + full-viewport overlay (MermaidViewer). Loaded ONLY by
+	// web/tests/e2e/mermaid.spec.ts; separate root session so it does not perturb
+	// the demo session tree shape other specs assert against.
+	f.sessions = append(f.sessions, map[string]any{
+		"id": "mermaid", "projectID": "proj", "title": "Mermaid diagrams", "directory": demoDir,
+		"model": map[string]any{"providerID": "fake", "id": "dummy", "variant": "default"},
+		"time":  map[string]any{"created": now - 6100, "updated": now - 6100},
+	})
+	f.messages["mermaid"] = []messageWithParts{
+		{
+			Info:  map[string]any{"id": "mm1", "sessionID": "mermaid", "role": "user", "time": map[string]any{"created": now - 6100, "completed": now - 6100}},
+			Parts: []map[string]any{textPart("mm1", "mermaid", "mmp1", "Show me the deploy flow as a diagram.", now-6100)},
+		},
+		{
+			Info: map[string]any{"id": "mm2", "sessionID": "mermaid", "role": "assistant", "agent": "build", "time": map[string]any{"created": now - 6000, "completed": now - 5900},
+				"model": map[string]any{"providerID": "fake", "modelID": "dummy", "variant": "default"}},
+			Parts: []map[string]any{
+				textPart("mm2", "mermaid", "mmp2",
+					"Here is the deploy flow:\n\n"+
+						"```mermaid\ngraph TD\n    A[Start] --> B{Decision}\n    B -->|Yes| C[Run]\n    B -->|No| D[Skip]\n    C --> E[End]\n    D --> E\n```\n\n"+
+						"That is the deploy flow.",
+					now-6000),
+			},
+		},
+	}
 	// Opt-in heavy session for benchmarking: VH_BENCH_MESSAGES=N seeds a "bench"
 	// session with N complex messages (markdown + code + tool calls + diffs).
 	if n, _ := strconv.Atoi(os.Getenv("VH_BENCH_MESSAGES")); n > 0 {
