@@ -23,7 +23,7 @@ import {
   reconciledPinnedOrder,
   togglePin,
   __resetPinnedForTest,
-} from "../../src/sidebar";
+} from "../../src/pins";
 
 // Minimal Response-like object the fetch mock returns. The facade reads
 // .status and calls .json(); installCsrf is not installed in tests so the raw

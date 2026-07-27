@@ -29,7 +29,7 @@ import {
   closeSessionMenu,
   openArchiveConfirm,
 } from "../../src/sessionMenu";
-import { __resetPinnedForTest } from "../../src/sidebar";
+import { __resetPinnedForTest } from "../../src/pins";
 import type { DescendantsResp } from "../../src/archive";
 
 // fetchDescendants: controlled mock. Hoisted so the factory can reference it.

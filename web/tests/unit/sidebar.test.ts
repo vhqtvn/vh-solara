@@ -7,7 +7,7 @@ import {
   movePinnedTo,
   movePinnedByOffset,
   __resetPinnedForTest,
-} from "../../src/sidebar";
+} from "../../src/pins";
 
 // The pinned order model lives in sidebar.ts alongside the membership set. The
 // set is the source of truth for membership; the order array only governs the

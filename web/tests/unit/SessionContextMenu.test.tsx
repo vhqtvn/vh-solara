@@ -10,7 +10,7 @@ import {
   closeSessionMenu,
   openSessionMenu,
 } from "../../src/sessionMenu";
-import { __resetPinnedForTest } from "../../src/sidebar";
+import { __resetPinnedForTest } from "../../src/pins";
 
 // The "Move up / Move down" context-menu items (keyboard/a11y reorder for
 // pinned ROOT sessions) must appear only under the drag feature's scope fence

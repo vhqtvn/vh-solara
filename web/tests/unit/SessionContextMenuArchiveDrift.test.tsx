@@ -21,7 +21,7 @@ import {
   closeSessionMenu,
   openArchiveConfirm,
 } from "../../src/sessionMenu";
-import { __resetPinnedForTest } from "../../src/sidebar";
+import { __resetPinnedForTest } from "../../src/pins";
 import { ArchiveDriftError } from "../../src/archive";
 import type { DescendantsResp } from "../../src/archive";
 

@@ -17,7 +17,7 @@ import {
   closeSessionMenu,
   openSessionMenu,
 } from "../../src/sessionMenu";
-import { __resetPinnedForTest } from "../../src/sidebar";
+import { __resetPinnedForTest } from "../../src/pins";
 import { setNameReplacements } from "../../src/projectSettings";
 import { exportSessionMarkdown } from "../../src/export";
 
