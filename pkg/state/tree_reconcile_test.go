@@ -124,11 +124,9 @@ func TestReconcile_TombstoneClearedNotClobbered(t *testing.T) {
 }
 
 func TestReconcile_ExpiredTombstoneNotClobbered(t *testing.T) {
-	prev := recentArchiveTTL
-	recentArchiveTTL = 5 * time.Millisecond
-	t.Cleanup(func() { recentArchiveTTL = prev })
-
 	s := New(64)
+	withRecentArchiveTTL(t, s, 5*time.Millisecond)
+
 	applySeq(t, s,
 		[2]string{"session.created", evSessionCreated("R", "")},
 	)

@@ -25,15 +25,17 @@ import (
 	"time"
 )
 
-// withFlushInterval temporarily overrides the package-level deltaFlushInterval
-// (a var precisely so tests can make throttle behavior deterministic) and
-// restores it on cleanup. Not safe under t.Parallel — none of the throttle
-// tests parallelize.
-func withFlushInterval(t *testing.T, d time.Duration) {
+// withFlushInterval temporarily overrides the per-instance s.deltaFlushInterval
+// (promoted off the package global in GAP-S5 precisely so tests can make
+// throttle behavior deterministic without a global-mutation race under
+// -race) and restores it on cleanup. The Store must already be constructed
+// (call after New). Not safe under t.Parallel — none of the throttle tests
+// parallelize.
+func withFlushInterval(t *testing.T, s *Store, d time.Duration) {
 	t.Helper()
-	prev := deltaFlushInterval
-	deltaFlushInterval = d
-	t.Cleanup(func() { deltaFlushInterval = prev })
+	prev := s.deltaFlushInterval
+	s.deltaFlushInterval = d
+	t.Cleanup(func() { s.deltaFlushInterval = prev })
 }
 
 // applyDelta is a tiny local helper: it builds the canonical
@@ -54,9 +56,8 @@ func applyDelta(s *Store, sessionID, messageID, partID, field, delta string) {
 // final Snapshot() projection (projectPartLocked overlay) is what materializes
 // them — proving the accumulator, not per-delta flushes, holds the truth.
 func TestDeltaCoalesce_ExactTextLongStream(t *testing.T) {
-	withFlushInterval(t, time.Hour)
-
 	s := New(1000)
+	withFlushInterval(t, s, time.Hour)
 	s.Apply(ev("session.created", `{"info":{"id":"sess"}}`))
 	s.Apply(ev("message.updated", `{"info":{"id":"m1","sessionID":"sess","role":"assistant"}}`))
 	s.Apply(ev("message.part.updated", `{"part":{"id":"p1","sessionID":"sess","messageID":"m1","type":"text","text":""}}`))
@@ -81,9 +82,8 @@ func TestDeltaCoalesce_ExactTextLongStream(t *testing.T) {
 // even already-flushed) streaming text, and deltas arriving AFTER the snapshot
 // append onto the snapshot's base.
 func TestDeltaCoalesce_AuthoritativeReconciliation(t *testing.T) {
-	withFlushInterval(t, time.Hour)
-
 	s := New(1000)
+	withFlushInterval(t, s, time.Hour)
 	s.Apply(ev("session.created", `{"info":{"id":"sess"}}`))
 	s.Apply(ev("message.updated", `{"info":{"id":"m1","sessionID":"sess","role":"assistant"}}`))
 	s.Apply(ev("message.part.updated", `{"part":{"id":"p1","sessionID":"sess","messageID":"m1","type":"text","text":""}}`))
@@ -116,9 +116,8 @@ func TestDeltaCoalesce_AuthoritativeReconciliation(t *testing.T) {
 // authoritative snapshot arrives must be discarded, not later re-applied on
 // top of the snapshot.
 func TestDeltaCoalesce_AuthoritativeReconciliation_BufferedTextDropped(t *testing.T) {
-	withFlushInterval(t, time.Hour)
-
 	s := New(1000)
+	withFlushInterval(t, s, time.Hour)
 	s.Apply(ev("session.created", `{"info":{"id":"sess"}}`))
 	s.Apply(ev("message.updated", `{"info":{"id":"m1","sessionID":"sess","role":"assistant"}}`))
 	s.Apply(ev("message.part.updated", `{"part":{"id":"p1","sessionID":"sess","messageID":"m1","type":"text","text":"BASE"}}`))
@@ -144,9 +143,8 @@ func TestDeltaCoalesce_AuthoritativeReconciliation_BufferedTextDropped(t *testin
 // part.upsert events (only the first delta flushes), the final text must still
 // be exactly correct, and busy must still be asserted on the token flow.
 func TestDeltaCoalesce_ThrottleBoundedEmits(t *testing.T) {
-	withFlushInterval(t, time.Hour)
-
 	s := New(1000)
+	withFlushInterval(t, s, time.Hour)
 	s.Apply(ev("session.created", `{"info":{"id":"sess"}}`))
 	s.Apply(ev("message.updated", `{"info":{"id":"m1","sessionID":"sess","role":"assistant"}}`))
 	s.Apply(ev("message.part.updated", `{"part":{"id":"p1","sessionID":"sess","messageID":"m1","type":"text","text":""}}`))
@@ -256,9 +254,8 @@ func TestDeltaCoalesce_ConcurrentNoRace(t *testing.T) {
 // resets the accumulator, so deltas re-seed from the fetched (authoritative)
 // parts rather than building on stale live bases.
 func TestDeltaCoalesce_HistoryFetchResetsAccumulator(t *testing.T) {
-	withFlushInterval(t, time.Hour)
-
 	s := New(1000)
+	withFlushInterval(t, s, time.Hour)
 	s.Apply(ev("session.created", `{"info":{"id":"sess"}}`))
 	s.Apply(ev("message.updated", `{"info":{"id":"m1","sessionID":"sess","role":"assistant"}}`))
 	s.Apply(ev("message.part.updated", `{"part":{"id":"p1","sessionID":"sess","messageID":"m1","type":"text","text":""}}`))
@@ -301,9 +298,8 @@ func TestDeltaCoalesce_HistoryFetchResetsAccumulator(t *testing.T) {
 // already-flushed "live-" prefix survives (the part-body guard at 2108 still
 // keeps "live-", so the failure is specifically "live-" ≠ "live-tail").
 func TestDeltaCoalesce_ColdLoadPreservesUnflushedDeltaBuf(t *testing.T) {
-	withFlushInterval(t, time.Hour)
-
 	s := New(1000)
+	withFlushInterval(t, s, time.Hour)
 	s.Apply(ev("session.created", `{"info":{"id":"sess"}}`))
 	s.Apply(ev("message.updated", `{"info":{"id":"m1","sessionID":"sess","role":"assistant"}}`))
 	s.Apply(ev("message.part.updated", `{"part":{"id":"p1","sessionID":"sess","messageID":"m1","type":"text","text":""}}`))
@@ -409,11 +405,13 @@ func TestMessageClassKind_NoDriftFromWebPrefix(t *testing.T) {
 // with the accumulated text length. Compare against the P1-AGG-003 baseline of
 // ~129µs / 53 allocs per single-char delta (on a growing part).
 func BenchmarkApplyPartDeltaFlushEveryDelta(b *testing.B) {
-	prev := deltaFlushInterval
-	deltaFlushInterval = 0
-	defer func() { deltaFlushInterval = prev }()
-
 	s := New(10000)
+	// deltaFlushInterval forced to 0 on the INSTANCE so EVERY delta flushes —
+	// promoted off the package global in GAP-S5 so the bench no longer mutates
+	// a shared global (which would race a prior -count iteration's lingering
+	// goroutine under -race). No cleanup needed: the store is bench-local.
+	s.deltaFlushInterval = 0
+
 	s.Apply(ev("session.created", `{"info":{"id":"s"}}`))
 	s.Apply(ev("message.updated", `{"info":{"id":"m1","sessionID":"s","role":"assistant"}}`))
 	s.Apply(ev("message.part.delta", `{"sessionID":"s","messageID":"m1","partID":"p1","field":"text","delta":"x"}`))

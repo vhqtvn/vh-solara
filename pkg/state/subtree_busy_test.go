@@ -312,6 +312,11 @@ func TestSubtreeBusyCount_TargetedScenarios(t *testing.T) {
 		// (store.go ~1712, ~2235). The incremental index must track them —
 		// and does, because they funnel through setActivityLocked.
 		s := New(100)
+		// Cancel the grace timer armed by evAssistantCompleted below (the
+		// 5s default would otherwise fire during later tests, racing
+		// diag.ResetForTest — same intermittent -count=2 race as
+		// runRandomSequence).
+		defer s.Close()
 		s.Apply(ev("session.created", evSessionCreated("r", "")))
 		s.Apply(ev("session.created", evSessionCreated("c", "r")))
 		assertSubtreeBusyCount(t, s, "setup")
@@ -527,6 +532,12 @@ func runRandomSequence(t *testing.T, seed int64, n int) {
 	t.Helper()
 	rng := rand.New(rand.NewSource(seed))
 	s := New(200)
+	// Cancel any grace timers armed by the assistant-completed mutation (the
+	// 5s default completionGrace would otherwise fire during LATER tests,
+	// racing diag.ResetForTest with a graceFire→emit atomic write — an
+	// intermittent -count=2 data race). The store is throw-away; Close is
+	// the documented cancelAllGraceLocked entrypoint.
+	defer s.Close()
 	env := newTestEnv()
 	var trace strings.Builder
 	flushTrace := func(step int, desc string) {

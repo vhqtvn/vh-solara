@@ -305,15 +305,27 @@ type WindowMeta struct {
 
 // WindowMaxCount and WindowMaxBytes are the operator-tunable bounds for the
 // initial message-window projection (the cold-load tail) AND the historical
-// page endpoint. Package-level VARS (not consts) precisely so tests can shrink
-// them for deterministic window assertions — the same escape-hatch pattern as
-// partTextCap. The defaults (100 messages / 1 MiB) are the operator-recommended
-// dual bound: whichever hits first stops the window. The projector always
-// includes at least the newest complete message even when the byte budget is
-// exceeded (the oversized_item case). Exported so the HTTP layer (pkg/web) can
-// clamp ?limit= / ?max_bytes= query params to the same canonical ceiling a
-// historical page must not exceed (a single page must not carry more than the
-// initial window's footprint).
+// page endpoint. They serve TWO distinct roles after GAP-S5:
+//
+//  1. The DEFAULT per-instance bound: New() copies these into
+//     s.windowMaxCount / s.windowMaxBytes, which are the fields actually read
+//     by the store's projection paths (captureMessagesBatchLocked,
+//     materializeSnapshot, SnapshotMessagesPage). Tests shrink the INSTANCE
+//     field (via withWindowBounds(t, s, ...)), not this global, so a -race run
+//     cannot observe a global mutation racing a lingering goroutine.
+//
+//  2. The cross-package clamp ceiling: pkg/web/messages_http.go reads these
+//     directly to clamp ?limit= / ?max_bytes= query params so a single
+//     historical page never exceeds the initial window's footprint. That path
+//     is a request-entry read of an effectively-constant ceiling — no test
+//     shrinks it (the pkg/state tests that need a smaller bound pass an
+//     explicit limit/maxBytes to the pure projector or set the instance
+//     field), so the global read is race-free in practice.
+//
+// The defaults (100 messages / 1 MiB) are the operator-recommended dual
+// bound: whichever hits first stops the window. The projector always includes
+// at least the newest complete message even when the byte budget is exceeded
+// (the oversized_item case).
 var (
 	WindowMaxCount = 100
 	WindowMaxBytes = 1 << 20 // 1 MiB
@@ -650,10 +662,10 @@ func projectMessagePage(list []MessageWithParts, before string, maxCount, maxByt
 // defaults so the endpoint is safe to call with no query params beyond `before`.
 func (s *Store) SnapshotMessagesPage(sid, before string, limit, maxBytes int) MessagePageResult {
 	if limit <= 0 {
-		limit = WindowMaxCount
+		limit = s.windowMaxCount
 	}
 	if maxBytes <= 0 {
-		maxBytes = WindowMaxBytes
+		maxBytes = s.windowMaxBytes
 	}
 	s.mu.RLock()
 	sm := s.messages[sid]
@@ -899,6 +911,27 @@ type Store struct {
 	// defaultCompletionGrace; shrunk in tests). Set on the Store instance in New
 	// so a test can shrink s.completionGrace without a global-mutation race.
 	completionGrace time.Duration
+	// deltaFlushInterval is the per-instance throttle window for streaming
+	// part-delta flushes (Option C / P1-AGG-004). Promoted off the package
+	// global so tests shrink the instance under test rather than the shared
+	// global (mirrors completionGrace); under -race a global shrink can race
+	// a lingering callback from a prior -count iteration that still reads it.
+	deltaFlushInterval time.Duration
+	// partTextCap is the per-instance accumulated-text cap for a single part
+	// field (P1-AGG-006). Promoted off the package global for the same race
+	// reason as deltaFlushInterval.
+	partTextCap int
+	// windowMaxCount / windowMaxBytes are the per-instance dual bound for the
+	// initial message-window projection. Promoted off the EXPORTED package
+	// globals (which pkg/web still reads as the canonical ?limit=/?max_bytes=
+	// clamp ceiling — distinct concern, no per-instance mutation in prod) so
+	// tests shrink the instance, not the shared global.
+	windowMaxCount int
+	windowMaxBytes int
+	// recentArchiveTTL is the per-instance tombstone TTL for RemoveSessions.
+	// Promoted off the package global for the same race reason as
+	// deltaFlushInterval.
+	recentArchiveTTL time.Duration
 	// subtreeBusyCount is the INCREMENTAL per-node busy aggregate (Gate C
 	// de-risking prototype). subtreeBusyCount[id] = the number of busy/retry
 	// sessions in id's subtree, INCLUDING id itself when it is busy/retry. It is
@@ -1077,7 +1110,17 @@ func New(ringCapacity int) *Store {
 		graceGen:                map[string]uint64{},
 		completionAuthoritative: map[string]bool{},
 		completionGrace:         defaultCompletionGrace,
-		subtreeBusyCount:        map[string]int{},
+		// Tunable defaults promoted per-instance (GAP-S5): each is initialized
+		// from its package-level default var so production behavior is
+		// byte-identical, but tests now shrink the instance field (not the
+		// shared global) — killing the latent -race on a global mutated while
+		// a prior test's lingering goroutine still reads it.
+		deltaFlushInterval: deltaFlushInterval,
+		partTextCap:        partTextCap,
+		windowMaxCount:     WindowMaxCount,
+		windowMaxBytes:     WindowMaxBytes,
+		recentArchiveTTL:   recentArchiveTTL,
+		subtreeBusyCount:   map[string]int{},
 		// Phase 1 (Gate C extension): the remaining 7 incremental subtree
 		// indexes. Maps are non-nil; rootIDs / recentBucketKeys start nil and
 		// are grown by rootsAppendLocked / insertRecentBucketKeyLocked.
@@ -2367,7 +2410,7 @@ func (s *Store) isRecentlyArchivedLocked(id string) bool {
 func (s *Store) RemoveSessions(ids []string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	expiry := time.Now().Add(recentArchiveTTL)
+	expiry := time.Now().Add(s.recentArchiveTTL)
 	for _, id := range ids {
 		if _, ok := s.sessions[id]; ok {
 			s.deleteSessionLocked(id)
@@ -2884,7 +2927,7 @@ func (s *Store) upsertPartLocked(part json.RawMessage) {
 	// here. capPartJSON is a no-op for parts under the cap. discardPartDelta
 	// below reseeds the accumulator from this capped authoritative text, so the
 	// next streaming delta appends onto a cap-respecting base.
-	part = capPartJSON(part)
+	part = capPartJSON(part, s.partTextCap)
 	me.parts[env.ID] = part
 	// Mark live-touched so a concurrent cold-load reconcile does NOT clobber
 	// this newer live part body with the stale fetched one (C-F2). Only tagged
@@ -2919,25 +2962,30 @@ func (s *Store) upsertPartLocked(part json.RawMessage) {
 	s.recomputeCurrentVerbLocked(env.SessionID)
 }
 
-// deltaFlushInterval bounds the part.upsert emit rate during a token-delta
-// burst (Option C / P1-AGG-004). A package-level var (not const) so tests can
-// override it for deterministic throttle assertions. 30ms ≈ 33fps of part
-// events — well within the live-feel budget (the FE coalesces streaming
-// markdown to ~5fps in components/Part.tsx / lib/streamMd.ts), while cutting
-// the per-char marshal+emit+ring-push cost to ~1× per window.
+// deltaFlushInterval is the DEFAULT per-instance value of the part.upsert
+// emit-rate throttle during a token-delta burst (Option C / P1-AGG-004). It is
+// read once at Store construction (New) into s.deltaFlushInterval, which is
+// the field actually read hot under mutation; tests shrink s.deltaFlushInterval
+// on the instance under test, NOT this global, so a -race run cannot observe
+// a global mutation racing a lingering goroutine from a prior -count
+// iteration (GAP-S5). 30ms ≈ 33fps of part events — well within the live-feel
+// budget (the FE coalesces streaming markdown to ~5fps in components/Part.tsx
+// / lib/streamMd.ts), while cutting the per-char marshal+emit+ring-push cost
+// to ~1× per window.
 var deltaFlushInterval = 30 * time.Millisecond
 
-// recentArchiveTTL is how long RemoveSessions' tombstone suppresses
-// resurrection of an archived session by a stale session.updated /
-// session.compacted arriving with archived=null (OpenCode can rewrite the
-// full record from a pre-PATCH snapshot while a busy/compacting descendant
-// is still running). A package-level var (not const) so tests can shrink it
-// for deterministic expiry assertions. The TTL must cover the transient
-// clobber window; the web layer's archive re-assert (handleArchive) and the
-// periodic resync provide additional self-heal. The tombstone is cleared only
-// by the explicit unarchive flow (ClearArchiveTombstones); Hydrate does NOT
-// clear it, because a hydrate can't tell a genuine unarchive from a stale
-// clobber (both carry archived=null).
+// recentArchiveTTL is the DEFAULT per-instance tombstone TTL: how long
+// RemoveSessions' tombstone suppresses resurrection of an archived session by
+// a stale session.updated / session.compacted arriving with archived=null
+// (OpenCode can rewrite the full record from a pre-PATCH snapshot while a
+// busy/compacting descendant is still running). Read once at Store
+// construction into s.recentArchiveTTL; tests shrink the instance field, not
+// this global (GAP-S5). The TTL must cover the transient clobber window; the
+// web layer's archive re-assert (handleArchive) and the periodic resync
+// provide additional self-heal. The tombstone is cleared only by the explicit
+// unarchive flow (ClearArchiveTombstones); Hydrate does NOT clear it, because
+// a hydrate can't tell a genuine unarchive from a stale clobber (both carry
+// archived=null).
 var recentArchiveTTL = 30 * time.Second
 
 // defaultCompletionGrace is how long the store waits after an assistant turn
@@ -2946,9 +2994,10 @@ var recentArchiveTTL = 30 * time.Second
 // turn's inter-step gap so the spinner does not dip and no spurious "finished"
 // notification fires between steps (text → tool → text). session.idle (when
 // OpenCode emits it) clears immediately and cancels the timer; this window
-// only owns the missed-session.idle case. A package-level var (not const), mirroring
-// deltaFlushInterval / recentArchiveTTL, so tests can shrink s.completionGrace on
-// the instance under test without a global-mutation race.
+// only owns the missed-session.idle case. Read once at Store construction
+// into s.completionGrace; tests shrink the instance field, not this global —
+// the same per-instance promotion pattern GAP-S5 extends to the other
+// tunables above.
 var defaultCompletionGrace = 5 * time.Second
 
 // partTextCap bounds the accumulated length of a single part's text field, in
@@ -2961,10 +3010,11 @@ var defaultCompletionGrace = 5 * time.Second
 // omitted byte count is appended; further deltas to that sealed (partID, field)
 // are dropped. Applies to ALL part types uniformly (no tool special-casing).
 //
-// A package-level var (not const) for the same reason as deltaFlushInterval:
-// tests can shrink it to a few bytes for deterministic truncation assertions.
-// The cap is a STOPGAP guardrail; a larger transcript-windowing fix will
-// follow separately and is intentionally out of scope here.
+// This is the DEFAULT per-instance value: read once at Store construction
+// into s.partTextCap (GAP-S5), which is the field the hot paths read; tests
+// shrink the instance field to a few bytes for deterministic truncation
+// assertions. The cap is a STOPGAP guardrail; a larger transcript-windowing
+// fix will follow separately and is intentionally out of scope here.
 var partTextCap = 1 << 20 // 1 MiB
 
 // truncatedMarker returns the visible cap-reached marker that gets appended to
@@ -2977,21 +3027,23 @@ func truncatedMarker(omitted int) string {
 	return "\n…[output truncated: " + strconv.Itoa(omitted) + " further bytes omitted]…"
 }
 
-// applyCapToString bounds s to partTextCap bytes, appending truncatedMarker if
+// applyCapToString bounds s to textCap bytes, appending truncatedMarker if
 // truncation occurred. Returns the (possibly truncated) string and a flag
 // indicating whether truncation was applied. The cap lands on a UTF-8 rune
 // boundary so the result is always valid UTF-8 (a mid-rune cut would otherwise
 // be re-marshal'd by encoding/json as U+FFFD, lossy and nondeterministic under
-// some decoders). Same input → same output (deterministic).
+// some decoders). Same input + cap → same output (deterministic).
 //
-// Returns s unchanged if len(s) <= partTextCap.
-func applyCapToString(s string) (string, bool) {
-	if len(s) <= partTextCap {
+// Returns s unchanged if len(s) <= textCap. Pure: no store access, no lock —
+// the cap is threaded in by the caller (the per-instance s.partTextCap) so a
+// test can shrink the instance without a global-mutation race.
+func applyCapToString(s string, textCap int) (string, bool) {
+	if len(s) <= textCap {
 		return s, false
 	}
-	omitted := len(s) - partTextCap
+	omitted := len(s) - textCap
 	marker := truncatedMarker(omitted)
-	cut := partTextCap - len(marker)
+	cut := textCap - len(marker)
 	if cut < 0 {
 		cut = 0
 	}
@@ -3002,7 +3054,7 @@ func applyCapToString(s string) (string, bool) {
 	return s[:cut] + marker, true
 }
 
-// capPartJSON applies partTextCap to every string field of the part JSON
+// capPartJSON applies the partTextCap to every string field of the part JSON
 // uniformly, RECURSING into nested objects and arrays. Only fields OVER the
 // cap are touched (so short metadata strings like id/type pass through
 // byte-identical); any field that crosses the cap is replaced with its
@@ -3019,8 +3071,11 @@ func applyCapToString(s string) (string, bool) {
 // pure and encoding/json Marshal sorts map keys alphabetically, so the
 // marshaled output is identical regardless of traversal order — this is what
 // preserves the monotonic revision validation contract under truncation.
-func capPartJSON(part json.RawMessage) json.RawMessage {
-	if len(part) <= partTextCap {
+// Pure: no store access, no lock — textCap is threaded in by the caller (the
+// per-instance s.partTextCap) so a test can shrink the instance without a
+// global-mutation race.
+func capPartJSON(part json.RawMessage, textCap int) json.RawMessage {
+	if len(part) <= textCap {
 		// Fast path: the entire JSON envelope is under the cap, so no string
 		// field at any depth can be over it either. Avoids an unmarshal+marshal
 		// pair on every wholesale upsert.
@@ -3030,7 +3085,7 @@ func capPartJSON(part json.RawMessage) json.RawMessage {
 	if json.Unmarshal(part, &p) != nil {
 		return part
 	}
-	if !capStringsInPlace(p) {
+	if !capStringsInPlace(p, textCap) {
 		return part
 	}
 	if updated, err := json.Marshal(p); err == nil {
@@ -3043,17 +3098,17 @@ func capPartJSON(part json.RawMessage) json.RawMessage {
 // string at any depth, mutating maps/arrays in place. Returns whether any
 // string was truncated. Used by capPartJSON; the recursion is what lets the
 // cap reach nested tool-output paths like state.output / state.error.
-func capStringsInPlace(v any) bool {
+func capStringsInPlace(v any, textCap int) bool {
 	switch x := v.(type) {
 	case map[string]any:
 		changed := false
 		for k, item := range x {
 			if s, ok := item.(string); ok {
-				if capped, truncated := applyCapToString(s); truncated {
+				if capped, truncated := applyCapToString(s, textCap); truncated {
 					x[k] = capped
 					changed = true
 				}
-			} else if capStringsInPlace(item) {
+			} else if capStringsInPlace(item, textCap) {
 				changed = true
 			}
 		}
@@ -3062,11 +3117,11 @@ func capStringsInPlace(v any) bool {
 		changed := false
 		for i, item := range x {
 			if s, ok := item.(string); ok {
-				if capped, truncated := applyCapToString(s); truncated {
+				if capped, truncated := applyCapToString(s, textCap); truncated {
 					x[i] = capped
 					changed = true
 				}
-			} else if capStringsInPlace(item) {
+			} else if capStringsInPlace(item, textCap) {
 				changed = true
 			}
 		}
@@ -3158,9 +3213,9 @@ func (s *Store) appendPartDeltaLocked(sessionID, messageID, partID, field, delta
 	// validation is not falsely invalidated.
 	if me.sealedFields == nil || !me.sealedFields[key] {
 		buf.WriteString(delta)
-		if buf.Len() > partTextCap {
+		if buf.Len() > s.partTextCap {
 			// strings.Builder has no truncate-in-place; rebuild.
-			capped, _ := applyCapToString(buf.String())
+			capped, _ := applyCapToString(buf.String(), s.partTextCap)
 			buf.Reset()
 			buf.WriteString(capped)
 			if me.sealedFields == nil {
@@ -3175,7 +3230,7 @@ func (s *Store) appendPartDeltaLocked(sessionID, messageID, partID, field, delta
 	// The first delta of a burst always flushes (deltaLastEmit zero → elapsed
 	// huge) so the first token appears instantly.
 	now := time.Now()
-	if now.Sub(me.deltaLastEmit) >= deltaFlushInterval {
+	if now.Sub(me.deltaLastEmit) >= s.deltaFlushInterval {
 		me.flushPartDeltasLocked(s, true)
 		me.deltaLastEmit = now
 	}
@@ -3836,7 +3891,7 @@ func (s *Store) materializeSnapshot(c snapshotCapture) Snapshot {
 		// The full list is materialized first (this is the status quo — the
 		// capture loop walks sm.order in full); the window bound is a WIRE/
 		// browser-memory fix, not a store-memory optimization.
-		bounded, meta := projectMessageWindow(out, WindowMaxCount, WindowMaxBytes)
+		bounded, meta := projectMessageWindow(out, s.windowMaxCount, s.windowMaxBytes)
 		snap.Messages[sid] = bounded
 		snap.MessageWindows[sid] = meta
 	}
@@ -4364,7 +4419,7 @@ func (s *Store) reconcileMessagesLocked(sid string, list []MessageWithParts) (co
 			// (the wholesale upsert path caps via upsertPartLocked; this path
 			// writes me.parts directly so it must cap independently). capPartJSON
 			// is a no-op for parts under the cap.
-			part = capPartJSON(part)
+			part = capPartJSON(part, s.partTextCap)
 			if old, ok := me.parts[pe.ID]; !ok {
 				me.parts[pe.ID] = part
 				me.partOrder = append(me.partOrder, pe.ID)
@@ -4456,7 +4511,7 @@ func (s *Store) captureMessagesBatchLocked(sid string) ([]MessageWithParts, uint
 			Parts: parts,
 		})
 	}
-	bounded, meta := projectMessageWindow(full, WindowMaxCount, WindowMaxBytes)
+	bounded, meta := projectMessageWindow(full, s.windowMaxCount, s.windowMaxBytes)
 	return bounded, s.msgRev[sid], meta
 }
 

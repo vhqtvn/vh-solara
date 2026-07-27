@@ -18,15 +18,17 @@ import (
 	"unicode/utf8"
 )
 
-// withPartTextCap temporarily overrides the package-level partTextCap (a var
-// precisely so tests can shrink it for deterministic truncation assertions) and
-// restores it on cleanup. Not safe under t.Parallel — none of the cap tests
+// withPartTextCap temporarily overrides the per-instance s.partTextCap
+// (promoted off the package global in GAP-S5 so tests can shrink it for
+// deterministic truncation assertions without a global-mutation race under
+// -race) and restores it on cleanup. The Store must already be constructed
+// (call after New). Not safe under t.Parallel — none of the cap tests
 // parallelize. Mirrors the withFlushInterval helper.
-func withPartTextCap(t *testing.T, n int) {
+func withPartTextCap(t *testing.T, s *Store, n int) {
 	t.Helper()
-	prev := partTextCap
-	partTextCap = n
-	t.Cleanup(func() { partTextCap = prev })
+	prev := s.partTextCap
+	s.partTextCap = n
+	t.Cleanup(func() { s.partTextCap = prev })
 }
 
 // seedCapSession builds a session <sid> with one assistant message m1 and one
@@ -46,10 +48,10 @@ func seedCapSession(s *Store, sid string) {
 // seal: total text length == partTextCap, the tail matches the truncation
 // marker pattern, and the omitted count in the marker equals the overflow.
 func TestPartCap_SealsDeltasAtCap(t *testing.T) {
-	withFlushInterval(t, time.Hour) // hold everything in the accumulator; first delta flushes once
-	withPartTextCap(t, 256)
-
 	s := New(100)
+	withFlushInterval(t, s, time.Hour) // hold everything in the accumulator; first delta flushes once
+	withPartTextCap(t, s, 256)
+
 	seedCapSession(s, "cap")
 
 	// Fill exactly to the cap (no truncation yet). One single-char delta fires
@@ -96,9 +98,9 @@ func TestPartCap_SealsDeltasAtCap(t *testing.T) {
 // text field exceeds the cap is truncated to the cap with the marker. The
 // upsert path (upsertPartLocked → capPartJSON) bounds a single huge payload.
 func TestPartCap_UpsertOverCap(t *testing.T) {
-	withPartTextCap(t, 128)
-
 	s := New(100)
+	withPartTextCap(t, s, 128)
+
 	s.Apply(ev("session.created", `{"info":{"id":"u"}}`))
 	s.Apply(ev("message.updated", `{"info":{"id":"m1","sessionID":"u","role":"assistant"}}`))
 
@@ -135,10 +137,10 @@ func TestPartCap_UpsertOverCap(t *testing.T) {
 // DROPPED — the part is frozen at the cap with the marker. Deltas to a DIFFERENT
 // field of the same part still accumulate normally (the cap is per-field).
 func TestPartCap_DropsPostSealDeltas(t *testing.T) {
-	withFlushInterval(t, time.Hour)
-	withPartTextCap(t, 64)
-
 	s := New(100)
+	withFlushInterval(t, s, time.Hour)
+	withPartTextCap(t, s, 64)
+
 	seedCapSession(s, "d")
 
 	// Seal the "text" field: cross the cap once.
@@ -179,10 +181,10 @@ func TestPartCap_DropsPostSealDeltas(t *testing.T) {
 func TestPartCap_UnderCapByteIdentical(t *testing.T) {
 	// Use the real production cap (1 MiB) so we exercise the default and prove
 	// normal output is untouched at the actual configured threshold.
-	withPartTextCap(t, 1<<20)
-	withFlushInterval(t, time.Hour)
-
 	s := New(100)
+	withPartTextCap(t, s, 1<<20)
+	withFlushInterval(t, s, time.Hour)
+
 	seedCapSession(s, "ok")
 
 	// Streaming path: a handful of small deltas accumulate to "Hello, world".
@@ -242,10 +244,10 @@ func TestPartCap_TruncationDeterministicForRevision(t *testing.T) {
 	// the sealing delta (which truncates the buffer) is reflected in me.parts
 	// immediately. With a large interval the sealing delta would stay buffered
 	// and me.parts would lag at the un-sealed text.
-	withFlushInterval(t, 0)
-	withPartTextCap(t, 100)
-
 	s := New(100)
+	withFlushInterval(t, s, 0)
+	withPartTextCap(t, s, 100)
+
 	s.Apply(ev("session.created", `{"info":{"id":"rev"}}`))
 	s.Apply(ev("message.updated", `{"info":{"id":"m1","sessionID":"rev","role":"assistant","time":{"created":1}}}`))
 	// Cross the cap → me.parts holds the truncated text + marker after the
@@ -309,9 +311,9 @@ func TestPartCap_TruncationDeterministicForRevision(t *testing.T) {
 // the Apply reducer strips the {"part":...} envelope, so me.parts holds the
 // inner object directly.
 func TestPartCap_NestedToolStateOutput(t *testing.T) {
-	withPartTextCap(t, 256)
-
 	s := New(100)
+	withPartTextCap(t, s, 256)
+
 	s.Apply(ev("session.created", `{"info":{"id":"tool"}}`))
 	s.Apply(ev("message.updated", `{"info":{"id":"m1","sessionID":"tool","role":"assistant"}}`))
 
@@ -407,9 +409,9 @@ func TestPartCap_NestedToolStateOutput(t *testing.T) {
 // across decoders. applyCapToString backs the cut up to the largest rune
 // boundary <= cut, so the result is always valid UTF-8.
 func TestPartCap_UTF8RuneBoundary(t *testing.T) {
-	withPartTextCap(t, 100)
-
 	s := New(100)
+	withPartTextCap(t, s, 100)
+
 	seedCapSession(s, "utf8")
 
 	// 17 × '世' (3 bytes each = 51 bytes) followed by 200 ASCII 'X'. Total =

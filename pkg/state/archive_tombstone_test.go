@@ -141,15 +141,27 @@ func TestArchiveTombstone_LiveStatusEventBlocked(t *testing.T) {
 
 // TestArchiveTombstone_ExpiresAndAllowsReinsertion verifies the tombstone has a
 // bounded TTL: after it expires, a session.updated with archived=null is
-// processed normally (so a genuine re-creation or a long-delayed event isn't
-// suppressed forever).
-func TestArchiveTombstone_ExpiresAndAllowsReinsertion(t *testing.T) {
-	// Use a short TTL for the test.
-	prev := recentArchiveTTL
-	recentArchiveTTL = 5 * time.Millisecond
-	t.Cleanup(func() { recentArchiveTTL = prev })
+// withRecentArchiveTTL temporarily overrides the per-instance s.recentArchiveTTL
+// (promoted off the package global in GAP-S5 so tests can shrink it without a
+// global-mutation race under -race) and restores it on cleanup. The Store must
+// already be constructed (call after New). Mirrors withFlushInterval.
+func withRecentArchiveTTL(t *testing.T, s *Store, d time.Duration) {
+	t.Helper()
+	prev := s.recentArchiveTTL
+	s.recentArchiveTTL = d
+	t.Cleanup(func() { s.recentArchiveTTL = prev })
+}
 
+// TestArchiveTombstone_ExpiresAndAllowsReinsertion is the TTL-expiry case: a
+// tombstone older than recentArchiveTTL no longer suppresses, so a later
+// session.updated (carrying archived=null, e.g. after the clobber window
+// passed) is processed normally (so a genuine re-creation or a long-delayed
+// event isn't suppressed forever).
+func TestArchiveTombstone_ExpiresAndAllowsReinsertion(t *testing.T) {
+	// Use a short TTL for the test (on the instance, GAP-S5).
 	s := New(100)
+	withRecentArchiveTTL(t, s, 5*time.Millisecond)
+
 	s.Apply(ev("session.created", `{"info":{"id":"s1","title":"root"}}`))
 	s.RemoveSessions([]string{"s1"})
 
@@ -179,11 +191,9 @@ func TestArchiveTombstone_ExpiresAndAllowsReinsertion(t *testing.T) {
 // and leave it unguarded so the next busy status re-promotes it. The tombstone
 // is cleared ONLY by the explicit unarchive flow (ClearArchiveTombstones).
 func TestArchiveTombstone_HydrateDoesNotClearTombstone(t *testing.T) {
-	prev := recentArchiveTTL
-	recentArchiveTTL = 5 * time.Minute // long enough to not expire during the test
-	t.Cleanup(func() { recentArchiveTTL = prev })
-
 	s := New(100)
+	withRecentArchiveTTL(t, s, 5*time.Minute) // long enough to not expire during the test
+
 	s.Apply(ev("session.created", `{"info":{"id":"s1","title":"root"}}`))
 	s.RemoveSessions([]string{"s1"})
 

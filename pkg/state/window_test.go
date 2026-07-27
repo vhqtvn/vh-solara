@@ -23,18 +23,24 @@ import (
 	"testing"
 )
 
-// withWindowBounds temporarily overrides the package-level window bounds (vars
-// precisely so tests can shrink them for deterministic assertions) and restores
-// them on cleanup. Mirrors withPartTextCap / withFlushInterval. Not safe under
-// t.Parallel — none of the window tests parallelize.
-func withWindowBounds(t *testing.T, maxCount, maxBytes int) {
+// withWindowBounds temporarily overrides the per-instance window bounds
+// (s.windowMaxCount / s.windowMaxBytes, promoted off the package globals in
+// GAP-S5 so tests can shrink them for deterministic assertions without a
+// global-mutation race under -race) and restores them on cleanup. The Store
+// must already be constructed (call after New). Mirrors withPartTextCap /
+// withFlushInterval. Not safe under t.Parallel — none of the window tests
+// parallelize. Tests that exercise the PURE projector (projectMessageWindow)
+// with explicit params do NOT need this — the helper only affects the store
+// read path (SnapshotMessagesPage / captureMessagesBatchLocked /
+// materializeSnapshot).
+func withWindowBounds(t *testing.T, s *Store, maxCount, maxBytes int) {
 	t.Helper()
-	prevCount, prevBytes := WindowMaxCount, WindowMaxBytes
-	WindowMaxCount = maxCount
-	WindowMaxBytes = maxBytes
+	prevCount, prevBytes := s.windowMaxCount, s.windowMaxBytes
+	s.windowMaxCount = maxCount
+	s.windowMaxBytes = maxBytes
 	t.Cleanup(func() {
-		WindowMaxCount = prevCount
-		WindowMaxBytes = prevBytes
+		s.windowMaxCount = prevCount
+		s.windowMaxBytes = prevBytes
 	})
 }
 
@@ -62,7 +68,9 @@ func msgIDs(list []MessageWithParts) []string {
 // count_limited is the binding constraint. Messages stay atomic and ordered
 // (oldest first in the result, matching the wire shape).
 func TestWindow_CountBound(t *testing.T) {
-	withWindowBounds(t, 3, 1<<20) // 3-message cap, generous byte budget
+	// Pure-projector test: passes explicit (maxCount, maxBytes) to
+	// projectMessageWindow, so no store / no instance bound needed (the
+	// withWindowBounds helper exists for the store read path only).
 
 	list := []MessageWithParts{
 		winMsg("m1", 10),
@@ -298,9 +306,9 @@ func TestWindow_OrderingPreserved(t *testing.T) {
 // has_older/count. Tree-only snapshots (messagesFor={}) carry no messages and no
 // windows.
 func TestWindow_SnapshotBoundsMessages(t *testing.T) {
-	withWindowBounds(t, 2, 1<<20)
-
 	s := New(100)
+	withWindowBounds(t, s, 2, 1<<20)
+
 	s.Apply(ev("session.created", `{"info":{"id":"sess"}}`))
 	for i := 1; i <= 5; i++ {
 		s.Apply(ev("message.updated", `{"info":{"id":"m`+itoa(i)+`","sessionID":"sess","role":"user"}}`))
@@ -340,9 +348,9 @@ func TestWindow_SnapshotBoundsMessages(t *testing.T) {
 // an admin ?sessions=all request cannot ship an unbounded transcript per
 // session. Each session with messages gets its own WindowMeta.
 func TestWindow_SnapshotFirehoseBoundsAllSessions(t *testing.T) {
-	withWindowBounds(t, 2, 1<<20)
-
 	s := New(100)
+	withWindowBounds(t, s, 2, 1<<20)
+
 	for _, sid := range []string{"a", "b"} {
 		s.Apply(ev("session.created", `{"info":{"id":"`+sid+`"}}`))
 		for i := 1; i <= 4; i++ {
@@ -371,9 +379,9 @@ func TestWindow_SnapshotFirehoseBoundsAllSessions(t *testing.T) {
 // window meta must reflect the bound applied to the emitted (bounded) message
 // list, not the full transcript.
 func TestWindow_ColdBatchCarriesWindowMeta(t *testing.T) {
-	withWindowBounds(t, 2, 1<<20)
-
 	s := New(100)
+	withWindowBounds(t, s, 2, 1<<20)
+
 	seedFourMessages(t, s, "cb")
 	ch, unsub := s.Subscribe(256)
 	defer unsub()
@@ -418,9 +426,9 @@ func TestWindow_ColdBatchCarriesWindowMeta(t *testing.T) {
 // one batch. A nondeterministic projection would either retry-spam or emit
 // inconsistent windows.
 func TestWindow_ColdBatchRevisionValidationHoldsUnderBound(t *testing.T) {
-	withWindowBounds(t, 3, 1<<20)
-
 	s := New(100)
+	withWindowBounds(t, s, 3, 1<<20)
+
 	seedFourMessages(t, s, "rv")
 	ch, unsub := s.Subscribe(256)
 	defer unsub()

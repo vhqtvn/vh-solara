@@ -1708,12 +1708,12 @@ func seedOnePartSession(s *Store, sid, text string) {
 // (which would instead produce a discard+retry emitting "BASEAB").
 func TestSnapshotDoesNotMutateColdBatchCapture(t *testing.T) {
 	// Force throttling so the second delta stays buffered (deterministic,
-	// independent of host scheduling jitter).
-	prevInterval := deltaFlushInterval
-	deltaFlushInterval = time.Hour
-	t.Cleanup(func() { deltaFlushInterval = prevInterval })
-
+	// independent of host scheduling jitter). Promoted off the package global
+	// (GAP-S5): the shrink is on the instance, so a -race run cannot observe a
+	// global mutation racing a prior -count iteration's lingering goroutine.
 	s := New(100)
+	withFlushInterval(t, s, time.Hour)
+
 	seedOnePartSession(s, "snap", "BASE")
 	// delta "A": first delta always flushes (deltaLastEmit zero) → me.parts "BASEA".
 	s.Apply(ev("message.part.delta", `{"sessionID":"snap","messageID":"m1","partID":"p1","field":"text","delta":"A"}`))
@@ -2314,9 +2314,8 @@ func TestSnapshotScopedOmitsUnselected(t *testing.T) {
 // messageEntry with no cross-session state — is structural; see
 // flushPartDeltasLocked, the write-side path.)
 func TestSnapshotScopedFlushConverges(t *testing.T) {
-	withFlushInterval(t, time.Hour)
-
 	s := New(100)
+	withFlushInterval(t, s, time.Hour)
 	for _, sid := range []string{"a", "b"} {
 		s.Apply(ev("session.created", `{"info":{"id":"`+sid+`"}}`))
 		s.Apply(ev("message.updated", `{"info":{"id":"m_`+sid+`","sessionID":"`+sid+`","role":"assistant"}}`))
@@ -2463,9 +2462,8 @@ func copyBoolMap(m map[string]bool) map[string]bool {
 func TestSnapshotIsObservationallyPure(t *testing.T) {
 	// Stretch the throttle window so deltas after the first stay buffered —
 	// this is what gives Snapshot something to project (deltaBuf non-empty).
-	withFlushInterval(t, time.Hour)
-
 	s := New(100)
+	withFlushInterval(t, s, time.Hour)
 	for _, sid := range []string{"a", "b"} {
 		s.Apply(ev("session.created", `{"info":{"id":"`+sid+`"}}`))
 		s.Apply(ev("message.updated", `{"info":{"id":"m_`+sid+`","sessionID":"`+sid+`","role":"assistant"}}`))
@@ -2938,9 +2936,8 @@ func TestSnapshotMaterializesOutsideLock(t *testing.T) {
 func TestSnapshotParityFullFixture(t *testing.T) {
 	// Stretch the throttle window so the second delta stays buffered — this is
 	// what gives Snapshot something to project (deltaBuf non-empty).
-	withFlushInterval(t, time.Hour)
-
 	s := New(100)
+	withFlushInterval(t, s, time.Hour)
 	s.Apply(ev("session.created", `{"info":{"id":"a","title":"root"}}`))
 	s.Apply(ev("session.created", `{"info":{"id":"b","title":"child"}}`))
 	// Completed assistant turn with token usage on "a" → populates se.lastTokens.
@@ -3079,9 +3076,8 @@ func mapKeys[K comparable, V any](m map[K]V) []K {
 // complements TestSnapshotCopiesAllRawMessageBytes (which proves it via a second
 // snapshot) by proving it against the authoritative store internals directly.
 func TestSnapshotNoAliasingAgainstStoreInternals(t *testing.T) {
-	withFlushInterval(t, time.Hour)
-
 	s := New(100)
+	withFlushInterval(t, s, time.Hour)
 	s.Apply(ev("session.created", `{"info":{"id":"a"}}`))
 	s.Apply(ev("message.updated", `{"info":{"id":"m1","sessionID":"a","role":"assistant","time":{"created":1,"completed":2},"finish":"stop","tokens":{"input":1,"output":2,"total":3}}}`))
 	s.Apply(ev("message.part.updated", `{"part":{"id":"p_tool","sessionID":"a","messageID":"m1","type":"tool","tool":"read","state":{"status":"running"}}}}`))
@@ -3182,9 +3178,8 @@ func TestSnapshotNoAliasingAgainstStoreInternals(t *testing.T) {
 // slipped past -race. The pointer identity check is the deterministic
 // discriminator.)
 func TestSnapshotDeltaCaptureIsOwnershipIndependent(t *testing.T) {
-	withFlushInterval(t, time.Hour)
-
 	s := New(100)
+	withFlushInterval(t, s, time.Hour)
 	s.Apply(ev("session.created", `{"info":{"id":"a"}}`))
 	s.Apply(ev("message.updated", `{"info":{"id":"m1","sessionID":"a","role":"assistant"}}`))
 	s.Apply(ev("message.part.updated", `{"part":{"id":"p1","sessionID":"a","messageID":"m1","type":"text","text":""}}`))
