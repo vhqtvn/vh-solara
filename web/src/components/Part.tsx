@@ -11,6 +11,7 @@ import { openSession, projectDir, sessionNeedsInput, sessionWorking, setSelected
 import type { CurrentVerb } from "../sync";
 import { openFileAt } from "../code/frame";
 import { looksLikePath } from "../lib/pathlike";
+import { addCodeCopyButtons, linkifyPaths, splitMermaid, tagInlineCodePaths } from "../lib/markdownEnhance";
 import { onActionKey } from "../lib/a11y";
 import { toolLabel, toolSubject } from "../lib/toolLabel";
 import type { Part } from "../types";
@@ -64,125 +65,6 @@ function durationText(part: Part): string {
   const secs = Math.max(0, (e - s) / 1000);
   const d = secs < 0.05 ? 0.1 : secs;
   return d < 60 ? `${d.toFixed(1)}s` : `${Math.floor(d / 60)}m ${Math.round(d % 60)}s`;
-}
-
-// Linkify file paths (containing "/" + an extension, optional :line) in
-// rendered prose so they jump to the file. Skips code/links.
-function linkifyPaths(root: HTMLElement | undefined) {
-  if (!root) return;
-  const detect = /[\w.\-]+\/[\w.\-/]*\.[A-Za-z][\w]{0,7}/;
-  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
-    acceptNode(n) {
-      const p = (n as Text).parentElement;
-      if (!p || p.closest("pre,code,a,.filepath")) return NodeFilter.FILTER_REJECT;
-      return detect.test(n.nodeValue || "") ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
-    },
-  });
-  const nodes: Text[] = [];
-  let cur: Node | null;
-  while ((cur = walker.nextNode())) nodes.push(cur as Text);
-  const re = /([\w.\-]+\/[\w.\-/]*\.[A-Za-z][\w]{0,7})(?::(\d+))?/g;
-  for (const node of nodes) {
-    const text = node.nodeValue || "";
-    re.lastIndex = 0;
-    const frag = document.createDocumentFragment();
-    let last = 0;
-    let m: RegExpExecArray | null;
-    while ((m = re.exec(text))) {
-      if (m.index > last) frag.appendChild(document.createTextNode(text.slice(last, m.index)));
-      const span = document.createElement("span");
-      span.className = "filepath";
-      span.textContent = m[0];
-      span.dataset.path = m[1];
-      if (m[2]) span.dataset.line = m[2];
-      frag.appendChild(span);
-      last = m.index + m[0].length;
-    }
-    if (last < text.length) frag.appendChild(document.createTextNode(text.slice(last)));
-    node.parentNode?.replaceChild(frag, node);
-  }
-}
-
-// Tag path-like inline code (`src/foo.ts`) so it can show a go-to affordance
-// while a modifier is held (see the .mod-down rule); ctrl/cmd-click opens it.
-function tagInlineCodePaths(root: HTMLElement | undefined) {
-  if (!root) return;
-  root.querySelectorAll("code").forEach((c) => {
-    if (c.closest("pre") || c.classList.contains("code-pathlike")) return;
-    if (looksLikePath(c.textContent || "")) c.classList.add("code-pathlike");
-  });
-}
-
-// Inject copy + word-wrap buttons into each server-rendered code block
-// (innerHTML, so we enhance the DOM rather than the markup). Each pre is wrapped
-// in a non-scrolling .code-block container: the pre itself is the horizontal
-// scroll surface for long lines, so anchoring the action buttons to the wrapper
-// (which does not scroll) keeps them pinned at the top-right instead of riding
-// off-screen with the scrolled content.
-// Exported so the copy-button regression test can drive the real wiring against
-// a manually-built chroma-envelope DOM (see tests/unit/codeCopy.test.ts).
-export function addCodeCopyButtons(root: HTMLElement | undefined) {
-  if (!root) return;
-  root.querySelectorAll("pre").forEach((pre) => {
-    if (pre.closest(".code-block")) return; // already wrapped
-    const parent = pre.parentElement;
-    if (!parent) return;
-    const block = document.createElement("div");
-    block.className = "code-block";
-    parent.replaceChild(block, pre);
-    block.appendChild(pre);
-
-    const actions = document.createElement("div");
-    actions.className = "code-actions";
-
-    // Word-wrap toggle (renders to the LEFT of copy via the flex container).
-    const wrapBtn = document.createElement("button");
-    wrapBtn.type = "button";
-    wrapBtn.className = "code-wrap";
-    wrapBtn.textContent = "wrap";
-    wrapBtn.addEventListener("click", () => {
-      const on = pre.classList.toggle("wrap");
-      wrapBtn.textContent = on ? "unwrap" : "wrap";
-    });
-
-    const copyBtn = document.createElement("button");
-    copyBtn.type = "button";
-    copyBtn.className = "code-copy";
-    copyBtn.textContent = "copy";
-    const code = pre.querySelector("code") as HTMLElement | null;
-    copyBtn.addEventListener("click", () => {
-      // Server-rendered (chroma) code blocks wrap each source line in
-      // `<span class="line"><span class="cl">…\n</span></span>`, and the chroma
-      // stylesheet makes `.line` display:flex (block-level). Element.innerText
-      // is CSS-box-aware and would insert an EXTRA line break at each block
-      // boundary on top of the `\n` already inside .cl, producing blank lines
-      // between every copied line. textContent is not CSS-aware and reproduces
-      // the source verbatim — which is what copy should do.
-      void navigator.clipboard?.writeText((code ?? pre).textContent ?? "");
-      copyBtn.textContent = "copied";
-      setTimeout(() => (copyBtn.textContent = "copy"), 1200);
-    });
-
-    // DOM order in the flex container = visual order: wrap (left), copy (right).
-    actions.appendChild(wrapBtn);
-    actions.appendChild(copyBtn);
-    block.appendChild(actions);
-  });
-}
-
-// Split markdown into alternating prose / mermaid segments.
-function splitMermaid(text: string): { type: "md" | "mermaid"; content: string }[] {
-  const re = /```mermaid\s*\n([\s\S]*?)```/g;
-  const out: { type: "md" | "mermaid"; content: string }[] = [];
-  let last = 0;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(text))) {
-    if (m.index > last) out.push({ type: "md", content: text.slice(last, m.index) });
-    out.push({ type: "mermaid", content: m[1] });
-    last = m.index + m[0].length;
-  }
-  if (last < text.length) out.push({ type: "md", content: text.slice(last) });
-  return out;
 }
 
 // One prose segment: daemon-rendered, syntax-highlighted HTML with copy buttons

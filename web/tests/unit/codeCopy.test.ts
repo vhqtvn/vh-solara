@@ -43,7 +43,7 @@ vi.hoisted(() => {
     });
   }
 });
-import { addCodeCopyButtons } from "../../src/components/Part";
+import { addCodeCopyButtons } from "../../src/lib/markdownEnhance";
 
 // Build a DOM matching chroma's real server-rendered output for a two-line
 // fenced code block (each line wrapped in <span class=line><span class=cl>…\n),
