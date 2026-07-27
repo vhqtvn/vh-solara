@@ -22,8 +22,215 @@
 #
 # Populate this file via the repo-recon generator skill:
 #   load the `repo-recon` skill and ask it to create / refresh the data.
+#
+# Module: github.com/vhqtvn/vh-solara (Go 1.25). Single Go binary (controller +
+# worker + standalone modes) embedding a SolidJS SPA via //go:embed. Go at
+# /usr/local/go/bin/go (prefix Go commands: export PATH=$PATH:/usr/local/go/bin).
 
-entrypoints: []
-hotspots: []
-packages: {}
-tests: []
+# ─── entrypoints — where execution / request handling begins ───────────────
+entrypoints:
+  - name: binary-main
+    path: main.go
+    note: Process entry; calls cmd.Execute() (cobra). Tiny shim — real wiring in cmd/.
+  - name: cli-root
+    path: cmd/root.go
+    note: cobra root + subcommand registration (server / client-daemon / local-server + ops verbs).
+  - name: controller-server-cmd
+    path: cmd/server.go
+    note: "`server` subcommand → pkg/server.NewDaemon (central controller edge + worker registration)."
+  - name: worker-daemon-cmd
+    path: cmd/client-daemon.go
+    note: "`client-daemon` subcommand → worker daemon; connects to controller via yamux tunnel and serves the local /vh/* web UI. Largest cmd file (~877 LoC)."
+  - name: standalone-local-server-cmd
+    path: cmd/local-server.go
+    note: "`local-server` subcommand → vh web UI + OpenCode backend on this machine with NO controller/proxy connection."
+  - name: controller-daemon-core
+    path: pkg/server/daemon.go
+    note: Controller daemon loop (user edge HTTP + worker registry + cross-worker coord API).
+  - name: web-http-server
+    path: pkg/web/server.go
+    note: HTTP request entry for /vh/* protocol + /oc/* OpenCode passthrough + the embedded SPA (//go:embed dist). The Server struct wires aggregator view → HTTP.
+  - name: spa-mount
+    path: web/src/index.tsx
+    note: Vite SPA entry; mounts App, installs CSRF/viewport/scrollEdges/service-worker, opens the sync stream.
+  - name: spa-root
+    path: web/src/App.tsx
+    note: SolidJS root component; view routing + layout + top-level store wiring.
+  - name: fixture-server
+    path: tools/fixtureserver/main.go
+    note: Fixture-backed stack (real aggregator/web + fake OpenCode) for Playwright e2e and frontend dev. No real opencode/LLM.
+  - name: fake-llm
+    path: tools/fakellm/main.go
+    note: Deterministic OpenAI-compatible LLM for docker e2e; marker-driven ([[write]]/[[task]]/[[bash]]) tool calls.
+  - name: e2e-real-stack
+    path: tools/e2eserver/main.go
+    note: Real vh stack against real `opencode serve` (no controller) for the docker e2e lane.
+  - name: in-process-e2e-harness
+    path: tests/e2e/harness.go
+    note: e2e.StartCluster() — real controller daemon + real worker over yamux + fake OpenCode, in-process (no docker/opencode/LLM).
+
+# ─── hotspots — files most likely to need reading for a change ─────────────
+# LoC verified 2026-07-27 via `wc -l`. Listed biggest / most-coupled per tree.
+hotspots:
+  - name: state-store
+    path: pkg/state/store.go
+    note: 4698 LoC — materialized session/message/tree state machine + event emission. Largest Go file; the AGG core.
+  - name: web-server
+    path: pkg/web/server.go
+    note: 2064 LoC — /vh/* HTTP API core + multi-project aggregator routing + embedded SPA serve.
+  - name: queue-lifecycle
+    path: pkg/web/queue.go
+    note: 1117 LoC — on-disk queue state machine (pending/dispatching/sent/failed/unknown). Most-churned file (queue GC-1..5 + STUCK-1 families).
+  - name: aggregator-core
+    path: pkg/aggregator/aggregator.go
+    note: 1067 LoC — OpenCode polling + state hydration + orphan-queue reconciliation hooks.
+  - name: tree-emitter
+    path: pkg/state/tree_emitter.go
+    note: 921 LoC — session-tree event emission / subtree fan-out / interest filtering.
+  - name: fake-opencode
+    path: pkg/fixtures/opencode.go
+    note: 1230 LoC — single-file fake OpenCode backing ALL test lanes (in-process e2e, Playwright via fixtureserver, docker via e2eserver+fakellm). High coupling point.
+  - name: web-integration-test
+    path: pkg/web/integration_test.go
+    note: 1831 LoC — cross-layer /vh/* integration test hotspot; isMessageClassSSE helper mirrors state kinds.
+  - name: sync-stream-reducer
+    path: web/src/sync/stream.ts
+    note: 3407 LoC — SSE event-stream reducer driving the whole SPA's reactive state. BIGGEST TS file in the repo.
+  - name: chat-view
+    path: web/src/components/ChatView.tsx
+    note: 3094 LoC — chat UI surface (composer, scroll-follow, queue chips, send single-flight). Biggest TSX.
+  - name: part-renderer
+    path: web/src/components/Part.tsx
+    note: 757 LoC — message-part rendering (text/tool/reasoning) + streaming markdown coalescing (~5fps) + reasoning stick-to-bottom.
+  - name: scroll-lib
+    path: web/src/lib/scroll.ts
+    note: 266 LoC — scroll-follow / bottommostRead / nearBottom. Load-bearing for the Firefox/WebRender heat saga; small but high-coupling.
+  - name: stream-md
+    path: web/src/lib/streamMd.ts
+    note: 148 LoC — incremental streaming-markdown appender (text-node append, never rewrites a growing node). Coalesced to ~5fps in Part.tsx.
+
+# ─── packages — logical boundaries, keyed by package name ──────────────────
+# Go: 21 packages under pkg/ + the cmd CLI package. TS: logical web/ boundaries.
+packages:
+  # --- Go CLI + runtime ---
+  cmd:
+    path: cmd
+    role: cobra CLI — server / client-daemon / local-server subcommands + ops verbs (health, kill, update, mcp, skill, kit, netns).
+  pkg-server:
+    path: pkg/server
+    role: central controller daemon — user edge HTTP, worker registry, cross-worker coord API, proxy, CSRF.
+  pkg-web:
+    path: pkg/web
+    role: /vh/* + /oc/* HTTP API + embedded SPA; feature-sliced (queue, pins, messages, archive, tree, git, code, terminal, managed, views, notes, theme). 75 files — largest package.
+  pkg-aggregator:
+    path: pkg/aggregator
+    role: OpenCode polling + state hydration + tree reconciliation + orphan-queue hooks.
+  pkg-state:
+    path: pkg/state
+    role: materialized session/message/tree state store, ring buffer, event emission, subtree indexes.
+  pkg-opencode:
+    path: pkg/opencode
+    role: OpenCode HTTP client + session DB (sqlite) read-through.
+  pkg-tunnel:
+    path: pkg/tunnel
+    role: controller↔worker multiplexed WebSocket tunnel (yamux) + frame types.
+  pkg-agent:
+    path: pkg/agent
+    role: worker-side OpenCode proxy daemon (raw + managed).
+  pkg-auth:
+    path: pkg/auth
+    role: controller auth (OIDC/oauth) + worker enrollment + handlers.
+  pkg-alerts:
+    path: pkg/alerts
+    role: alerts engine — config, presence, push, routing, jsonc editing.
+  pkg-render:
+    path: pkg/render
+    role: goldmark markdown + chroma code highlighting + diff/patch rendering.
+  pkg-procmgr:
+    path: pkg/procmgr
+    role: managed-process lifecycle (unix/windows split).
+  pkg-projectcfg:
+    path: pkg/projectcfg
+    role: per-project .vh-solara/project.jsonc atomic read / edit / setup + preferences.
+  pkg-diagnostics:
+    path: pkg/diagnostics
+    role: diagnostics handler, SSE/yamux writers, findings registry, primitives.
+  pkg-quota:
+    path: pkg/quota
+    role: provider quota fetch + normalize (multi-window).
+  pkg-mcp:
+    path: pkg/mcp
+    role: MCP server surface.
+  pkg-skill:
+    path: pkg/skill
+    role: skill listing / read.
+  pkg-oclife:
+    path: pkg/oclife
+    role: OpenCode lifecycle helpers (spawn / detach / update).
+  pkg-kit:
+    path: pkg/kit
+    role: small shared helpers + testdata.
+  pkg-ringlog:
+    path: pkg/ringlog
+    role: bounded ring buffer (replayable client-event log). No co-located test.
+  pkg-vhlog:
+    path: pkg/vhlog
+    role: structured logging (debug-forced ldflags hook). No co-located test.
+  pkg-fixtures:
+    path: pkg/fixtures
+    role: fake OpenCode (single opencode.go) backing all test lanes.
+
+  # --- TS web SPA ---
+  web:
+    path: web
+    role: SolidJS SPA (Vite + TS), embedded via //go:embed. Build flow — `make web` stages into web/dist-build, then materialize copies into pkg/web/dist.
+  web-src-root:
+    path: web/src
+    role: flat layer of ~49 root .ts modules (api, sync, queue, busy, sidebar, models, prefs, theme, pwa, git, ...) — not deeply nested.
+  web-components:
+    path: web/src/components
+    role: UI components (~50 .tsx) with co-located CSS Modules (*.module.css / *.css). ChatView, Part, SessionTree, GitView, CodeView, etc.
+  web-lib:
+    path: web/src/lib
+    role: pure client helpers — scroll, streamMd, store, reduce, inlineAttach, perfFormat, sendSingleFlight, mermaid, md.
+  web-sync:
+    path: web/src/sync
+    role: SPA reactive state core — stream.ts (SSE reducer), store.ts, treeState.ts, selectors/treeSelectors, actions, orchestration, url.
+  web-styles:
+    path: web/src/styles
+    role: CSS architecture — foundation/ (tokens, z-index, reset, scrollbars, perf-guards) + legacy/ transitional sheets being carved down + main.css entry.
+  web-code:
+    path: web/src/code
+    role: code-view client — api, frame, state.
+
+# ─── tests — where the suites live + how to run them ───────────────────────
+# Six lanes (AGENTS.md → "Testing rules (this repo)"). go must be on PATH.
+tests:
+  - name: go-unit-colocated
+    path: pkg
+    note: Co-located *_test.go beside source. No tests/unit dir.
+    run: vh-agent-harness exec bash -c 'export PATH=$PATH:/usr/local/go/bin && go test ./pkg/...'
+  - name: go-integration
+    path: tests/integration
+    note: Cross-package integration (opencode lifecycle, warm-resync omission).
+    run: vh-agent-harness exec bash -c 'export PATH=$PATH:/usr/local/go/bin && go test ./tests/integration/'
+  - name: go-e2e-in-process
+    path: tests/e2e
+    note: Real controller + real worker over yamux + fake OpenCode, in-process (StartCluster at harness.go:47). No docker/opencode/LLM.
+    run: vh-agent-harness exec bash -c 'export PATH=$PATH:/usr/local/go/bin && go test ./tests/e2e/'
+  - name: go-e2e-docker
+    path: tests/e2e-docker
+    note: Real opencode + fake LLM through real vh stack, in docker. assert*.py are stdin JSON helpers, NOT a pytest framework (no pytest anywhere).
+    run: vh-agent-harness exec bash tests/e2e-docker/run.sh
+  - name: web-unit
+    path: web/tests/unit
+    note: Vitest; ~107 specs. Node env by default, jsdom via // @vitest-environment jsdom docblock per file. Component tests use @solidjs/testing-library.
+    run: vh-agent-harness exec npm --prefix web run test:unit
+  - name: web-typecheck
+    path: web
+    note: tsc --noEmit typecheck gate (mirrors CI).
+    run: vh-agent-harness exec npm --prefix web run typecheck
+  - name: web-e2e
+    path: web/tests/e2e
+    note: Playwright; SERIAL (workers:1, fullyParallel:false) — one shared mutable fixture backend. webServer runs scripts/fixture-web.sh (SPA build + go run ./tools/fixtureserver), so go must be on PATH.
+    run: vh-agent-harness exec bash -c 'export PATH=$PATH:/usr/local/go/bin && npm --prefix web run test:e2e'
