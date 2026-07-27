@@ -84,21 +84,22 @@ let sessionLastSeen = 0;
 // ping. The watchdog's Stream2 branch reconnects when EITHER clock ages out.
 // See CONTENT_STALE_MS (in ./health) for the threshold rationale.
 //
-// DESIGN DEBATE OUTCOME (broaden-to-both considered, Stream1 deferred):
-// Stream1 (treeLastSeen) has the SAME ping/content conflation (its ping
-// listener calls markTreeSeen), so a content-stall on the tree is also masked.
-// Weighed broadening a content clock to Stream1; concluded Stream1 is DEFERRED
-// as a documented latent gap because (1) the operator's pain is Stream2
-// (frozen transcript) — no tree-freeze reports; (2) Stream1 is backstopped
-// server-side by runStatusReconcile (SR60: re-derives activity and emits a
-// fresh content event on Stream1 every ≤60s) for the common transient-miss
-// mode, while Stream2 message content has NO such backstop (dataflow Q2); (3)
-// the red-test's tree control is intentionally ping-only (mirroring the bug
-// scenario) and would need circular amendment under a Stream1 content clock;
-// (4) keeping the change focused on Stream2 liveness composes cleanly with
-// Lane B's applySessionSnapshot work (no overlapping surface). Mirror this
-// fix (treeContentSeen) if Stream1 freeze symptoms surface. See the Lane C
-// packet + dataflow/holistic-writeup.md.
+// DESIGN DEBATE OUTCOME (broaden-to-both — Stream1 SINCE MIRRORED):
+// Stream1 (treeLastSeen) HAD the SAME ping/content conflation (its ping
+// listener calls markTreeSeen), so a content-stall on the tree was also
+// masked. Lane C originally deferred the Stream1 mirror: the operator's pain
+// was Stream2 (frozen transcript — no tree-freeze reports), Stream1 is
+// backstopped server-side by runStatusReconcile (SR60 emits a fresh content
+// event every ≤60s) while Stream2 message content has NO such backstop, and
+// the red-test's tree control was intentionally ping-only. That deferred half
+// has SINCE LANDED (6a00d61 "detect content-stall on the tree stream via a
+// content-only liveness clock"): Stream1 now has its own content-only clock
+// (treeContentSeen — refreshed by snapshot / tree.snapshot / tree.op /
+// snapshot.complete / pins.* / session.upsert+delete / TREE_STREAM_KINDS /
+// notice / onopen, NEVER by ping), and the watchdog's tree branch reconnects
+// when EITHER clock ages out. Both streams now carry a content-only clock;
+// this sessionContentSeen is the Stream2 instance of the symmetric design. See
+// ./stream's treeContentSeen block + the Lane C packet.
 let sessionContentSeen = 0;
 // markSessionSeen updates Stream2's liveness clocks: BOTH the transport clock
 // (sessionLastSeen) AND the content clock (sessionContentSeen). Called from

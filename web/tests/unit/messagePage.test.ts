@@ -503,7 +503,7 @@ describe("loadOlder state machine", () => {
 //      safety preservation).
 
 describe("isPageDirtyingKind (pure unit)", () => {
-  it("returns true for resurrection-class kinds (delete + wholesale replace)", () => {
+  it("returns true for resurrection-class kinds (deletions + messages.batch)", () => {
     expect(isPageDirtyingKind("message.delete")).toBe(true);
     expect(isPageDirtyingKind("part.delete")).toBe(true);
     expect(isPageDirtyingKind("messages.batch")).toBe(true);
@@ -658,8 +658,11 @@ describe("dirty-mirror listener call-site (integration)", () => {
   });
 
   it("SAFETY: messages.batch during flight → STILL discards + retries", async () => {
-    // messages.batch wholesale-replaces the resident cache; a stale page merged
-    // after a batch could resurrect messages the batch removed.
+    // messages.batch merge-if-absents message bodies (prependMessagesIfAbsent —
+    // live upserts survive; cold-load ≡ wholesale-replace when all items
+    // absent), but it still wholesale-RESETS messageWindows[id]; a stale page
+    // merged after the batch could clobber the batch's fresher window meta, so
+    // it stays in the dirty set (see isPageDirtyingKind in ./history).
     const sm = buildMessages([item("m5", 50)]);
     seedSession(sm, "m5");
     let fetchCount = 0;

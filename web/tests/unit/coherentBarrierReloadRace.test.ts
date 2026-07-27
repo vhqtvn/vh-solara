@@ -1,37 +1,41 @@
 // @vitest-environment jsdom
 //
-// C4-EXONERATION PROBE — the definitive test of whether the reload message-drop
-// bug lives in the C4 coherent-snapshot barrier (tree/detail projections) or in
-// the SESSION-stream messages.batch wholesale-replace.
+// REGRESSION GUARD for the Lane B merge-guard fix (14fa446 "merge-guard
+// messages.batch to preserve live pre-batch upserts"). Originated as a
+// C4-exoneration probe — the reload message-drop bug lives in the SESSION-
+// stream messages.batch path, NOT the C4 coherent-snapshot barrier (no
+// tree.snapshot is fired here, the strongest possible exoneration).
 //
 // SCENARIO: during a reload, a live message.upsert for a MIDDLE message lands
 // on the session stream AFTER the snapshot but BEFORE messages.batch. The
 // upsert applies (live tail). Then messages.batch (gzip64) decodes and its
-// applyMessageEvent case runs `s.messages[sid] = buildMessages(items)` — a
-// WHOLESALE-REPLACE with no merge guard — clobbering the live middle message
-// that is absent from the batch's (stale, snapshot-time) item list.
+// applyMessageEvent case runs. Pre-Lane-B that case did
+// `s.messages[sid] = buildMessages(items)` — a WHOLESALE-REPLACE with no merge
+// guard — clobbering the live middle message absent from the batch's (stale,
+// snapshot-time) item list. Lane B switched it to prependMessagesIfAbsent
+// (merge-if-absent: insert batch items that are ABSENT, never touch an
+// existing byId entry — live always wins). Cold-load is unaffected (on first
+// hydrate the slot is empty, every item is absent, merge ≡ wholesale-replace).
 //
 // WHY THE MID-DECODE TIMING WAS ADJUSTED: the operator's first-pass scenario
-// fired the upsert DURING the batch decode. That race is already CLOSED: the
+// fired the upsert DURING the batch decode. That race was already CLOSED: the
 // shared session listener unconditionally does `if (pendingBatch.has(sid))
 // await pendingBatch.get(sid)` (stream.ts ~2455/2468) for EVERY non-batch kind,
 // so a message.upsert arriving mid-decode SUSPENDS until the batch resolves,
-// then applies AFTER the wholesale-replace (it survives). The residual gap —
-// and the actual bug — is the wholesale-replace clobbering a live message that
-// applied BEFORE the batch fired (between snapshot and batch), which the
-// pendingBatch gate cannot help with. This is the fallback timing the operator
-// specified.
+// then applies AFTER the batch (it survives either way). The residual gap —
+// and the original bug — was a live message that applied BEFORE the batch
+// fired (between snapshot and batch), which the pendingBatch gate cannot help
+// with. This is the fallback timing the operator specified, and the one the
+// merge-guard now closes.
 //
-// If this test goes RED at the wholesale-replace, C4 is EXONERATED: the bug is
-// in the session-stream batch path (stream.ts messages.batch case), which has
-// NO merge guard (unlike applySessionSnapshot's prependMessagesIfAbsent). C4's
-// tree/detail barrier is not even invoked here (no tree.snapshot is fired),
-// which is the strongest possible exoneration.
+// This test goes GREEN on the merge-guard: all 6 messages survive incl. the
+// pre-batch m2.5 canary. Reverting messages.batch to a wholesale-replace makes
+// it RED (m2.5 is dropped), so it pins the Lane B invariant.
 //
 // N=5 baseline messages {m1..m5}, all ≪ window (≪100 msgs, ≪1MiB), so the tail
 // window is provably NOT the dropper. The live middle message m2.5 (created
-// between m2 and m3) is the canary: if it survives, no bug; if it is dropped,
-// the wholesale-replace clobbered it.
+// between m2 and m3) is the canary: it survives under the merge-guard; a
+// wholesale-replace would drop it.
 //
 // Self-contained harness (MockEventSource + setupFresh + encodeForTest + tick
 // duplicated from coherentBarrier.test.ts / sessionLiveness.test.ts because
@@ -146,7 +150,7 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 // Message item builders. Items carry info.time.created so sortMessages orders
 // them deterministically; m2.5's created sits between m2 and m3 (a true MIDDLE
-// message — proving the drop is the wholesale-replace, not tail-windowing).
+// message — so the canary is a true middle resident, not a tail-window artifact).
 // ---------------------------------------------------------------------------
 function msg(id: string, created: number): any {
   return {
@@ -165,8 +169,8 @@ const BASE_ITEMS = [
 // The live middle canary: created between m2 and m3.
 const MIDDLE_INFO = { id: "m2.5", sessionID: "s1", role: "user", time: { created: 2.5 } };
 
-describe("messages.batch wholesale-replace clobbers a live pre-batch message.upsert (C4-exoneration)", () => {
-  it("a live message.upsert for a MIDDLE message landing between snapshot and messages.batch is dropped by the wholesale-replace", async () => {
+describe("messages.batch merge-guard preserves a live pre-batch message.upsert (C4-exoneration + Lane B regression)", () => {
+  it("a live message.upsert for a MIDDLE message landing between snapshot and messages.batch SURVIVES the merge-guard", async () => {
     // Open both streams. Tree ES stays healthy but fires NO tree.snapshot —
     // the C4 barrier is never invoked, which is the strongest exoneration
     // (the bug reproduces purely on the session-stream batch path).
@@ -223,17 +227,19 @@ describe("messages.batch wholesale-replace clobbers a live pre-batch message.ups
     );
 
     // 4. Let the batch decode resolve. The decode continuation runs
-    //    applyMessageEvent("messages.batch", ...) →
-    //    `s.messages["s1"] = buildMessages(items)` — the WHOLESALE-REPLACE.
-    //    items is the 5-message baseline (no m2.5), so m2.5 is CLOBBERED.
-    //    There is NO merge guard here (unlike applySessionSnapshot's
-    //    prependMessagesIfAbsent).
+    //    applyMessageEvent("messages.batch", ...) → prependMessagesIfAbsent
+    //    (the Lane B merge-guard): insert batch items that are ABSENT, never
+    //    touch an existing byId entry. items is the 5-message baseline (no
+    //    m2.5), but m2.5 is ALREADY resident, so it is left untouched. A
+    //    wholesale-replace (`s.messages[sid] = buildMessages(items)`) would
+    //    have clobbered it — this test pins that the merge path is in place.
     await tick(20);
 
-    // 5. THE BUG (RED): the live middle canary m2.5 should survive the batch
-    //    (it was already resident, exactly the live-always-wins invariant the
-    //    snapshot merge path enforces). Current HEAD wholesale-replaces, so
-    //    m2.5 is dropped. Asserting survival → FAILS (RED).
+    // 5. THE INVARIANT (GREEN): the live middle canary m2.5 survives the
+    //    batch — it was already resident, exactly the live-always-wins rule
+    //    the snapshot merge path (applySessionSnapshot) enforces and Lane B
+    //    extended to messages.batch. Reverting to a wholesale-replace drops
+    //    m2.5 here (RED), so this is the Lane B regression guard.
     const order = [...store.state.messages.s1.order];
     expect(order).toContain("m2.5");
     expect(order.length).toBe(6);

@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 // Phase 3 — client initial-window semantics. These tests pin the purely-additive
 // population of `state.messageWindows[id]` (the resident-window state: hasOlder
-// + oldestResidentID) across the three wholesale-replace paths:
+// + oldestResidentID) across the three tail-landing paths:
 //   1. messages.batch case (cold-load SSE)
 //   2. applySessionSnapshot (Stream-2 warm/cold snapshot)
 //   3. (refreshOpenSessions is covered indirectly — it shares the helper + the
@@ -367,7 +367,7 @@ describe("partial → batch → loaded ordering (Phase 3 gate)", () => {
   });
 });
 
-describe("refreshOpenSessions populates messageWindows (third wholesale-replace path)", () => {
+describe("refreshOpenSessions populates messageWindows (third tail-landing path)", () => {
   // Direct wiring test for the third path — clears the convergent advisory
   // (A-F2/B-F1/C-F4/D-F4) that flagged refreshOpenSessions as only indirectly
   // covered. Mocks the /vh/snapshot fetch, drives refreshOpenSessions, and
