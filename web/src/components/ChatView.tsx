@@ -17,7 +17,7 @@ import { loadVersioned, saveVersioned } from "../lib/store";
 import { activeAgent, agentForSession, agents, selectAgentForSession, selectedAgent } from "../agents";
 import { claimQueued, enqueue, fetchQueue, hasQueueState, migrateLegacyQueue, queueFor, queueMode, removeQueued, resolveQueued } from "../queue";
 import { createQueueDrainer } from "../queueDrain";
-import { historyAt, historyLen, pushHistory } from "../history";
+import { pushHistory } from "../history";
 import { harvestPastedFiles } from "../lib/paste";
 import {
   effectiveInline,
@@ -64,6 +64,7 @@ import type { MessageView } from "../types";
 import { agentLabel, costLabel, messageError, modelLabel, roleLabel } from "./chat/messageMeta";
 import { MessageParts, groupParts } from "./chat/MessageParts";
 import { createComposerAutocomplete } from "./chat/createComposerAutocomplete";
+import { createPromptHistory } from "./chat/createPromptHistory";
 
 const draftKey = (sid: string) => "vh.draft." + sid;
 
@@ -1029,18 +1030,21 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // Auto-grow the composer up to a cap, then scroll; keep the highlight mirror
   // scrolled in lockstep.
   let taRef: HTMLTextAreaElement | undefined;
-  // Prompt-history navigation. Two recall scopes share one cursor:
-  //   - histMode "session" = plain Up, reads the per-session store (prompts sent
-  //     in THIS session; a fresh draft recalls the "__new__" store).
-  //   - histMode "global"  = Ctrl/Cmd+Up, reads the global store (any session,
-  //     including legacy pre-split data).
-  //   - "none" = editing the live draft. histIdx -1 = live draft; >=0 = recalled
-  //     entry. histDraft is the live-input snapshot captured on the first step
-  //     of a walk, restored when Down steps past zero. Switching scopes
-  //     (Up↔Ctrl+Up) starts a fresh walk so the two stores never share an index.
-  let histMode: "none" | "session" | "global" = "none";
-  let histIdx = -1;
-  let histDraft = "";
+  // --- prompt-history recall (C5) ------------------------------------------
+  // Extracted to createPromptHistory (a SolidJS `create...` controller factory,
+  // mirroring createComposerAutocomplete / createQueueDrainer). The factory owns
+  // the walk state machine (histMode/histIdx/histDraft), the Up/Ctrl+Up/Down
+  // keyboard handler, and resetHistory — the single reset seam every
+  // invalidation site calls (autocomplete onApplied, onInput, paste, inline
+  // attach, session switch, send). This view keeps ONLY the shared onKeyDown
+  // dispatcher below: ac.onAcKeyDown FIRST → send → hist.onHistoryKey LAST,
+  // preserving the autocomplete → send → history precedence.
+  const hist = createPromptHistory({
+    input,
+    setInput,
+    textarea: () => taRef,
+    sessionId: () => props.sessionId,
+  });
   let mirrorRef: HTMLDivElement | undefined;
   // Command-palette "Focus composer" action.
   const onFocusComposer = () => taRef?.focus();
@@ -1077,12 +1081,13 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // state machine (caret-driven activeToken detection + agent filter + async
   // command/file fetch with a stale-request guard), keyboard navigation, and
   // applyAc. This view keeps only the presentational popover JSX + acStyle()
-  // positioning (reads the composer rect) + the onKeyDown dispatcher that calls
-  // onAcKeyDown FIRST, then falls through to send / prompt-history (C5 will
-  // hook its own handler into that dispatcher later).
+  // positioning (reads the composer rect) + the shared onKeyDown dispatcher
+  // (above): ac.onAcKeyDown FIRST → send → hist.onHistoryKey LAST (C5 hooks the
+  // prompt-history controller into that dispatcher).
   //
-  // onApplied is the C5 seam: prompt-history walk cursors (still inline here)
-  // reset whenever an item is applied, matching the original applyAc behavior.
+  // onApplied is the C5 seam: it calls hist.resetHistory() (the prompt-history
+  // controller's reset) whenever an item is applied, so an in-flight history
+  // walk doesn't leak a recalled value onto a freshly-spliced token.
   const ac = createComposerAutocomplete({
     input,
     setInput,
@@ -1090,10 +1095,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     textarea: () => taRef,
     sessionId: () => props.sessionId,
     draft: () => !!props.draft,
-    onApplied: () => {
-      histMode = "none";
-      histIdx = -1;
-    },
+    onApplied: () => hist.resetHistory(),
   });
 
 
@@ -1128,8 +1130,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       setInput(before + text + cur.slice(end));
       pos = before.length + text.length;
     }
-    histMode = "none";
-    histIdx = -1;
+    hist.resetHistory();
     queueMicrotask(() => {
       if (taRef) {
         taRef.focus();
@@ -1265,8 +1266,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
         // Reset prompt-history walk cursors on session switch so an Up/Ctrl+Up
         // walk started in the previous session doesn't leak its index/mode into
         // the new session's recall.
-        histMode = "none";
-        histIdx = -1;
+        hist.resetHistory();
         setInput(loadVersioned<string>(draftKey(props.sessionId || "__new__"), 1, "", (o) => (typeof o === "string" ? o : "")));
         // Pin to bottom on the next frame — but only if we're still following.
         // This races the chat-scroll session-switch restore (maybeRestore): if the
@@ -1444,8 +1444,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
           ac.syncCaret();
         }
       }
-      histMode = "none";
-      histIdx = -1;
+      hist.resetHistory();
       return;
     }
     if (props.draft) {
@@ -1501,8 +1500,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       // signal so the token is at least present (caret positioning best-effort).
       setInput(input() + ref);
     }
-    histMode = "none";
-    histIdx = -1;
+    hist.resetHistory();
   };
 
   function buildParts(text: string, atts?: Attachment[]): any[] {
@@ -1823,8 +1821,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       return;
     }
     if (text) pushHistory(text, props.sessionId || "__new__"); // plain Up (session) + Ctrl+Up (global)
-    histMode = "none";
-    histIdx = -1;
+    hist.resetHistory();
     // /undo /redo only make sense for an existing session.
     if (!props.draft && text === "/undo") { setInput(""); return void undo(); }
     if (!props.draft && text === "/redo") { setInput(""); return void redo(); }
@@ -2066,64 +2063,21 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     });
   }
 
+  // Shared key dispatcher for the composer: autocomplete FIRST (owns its keys
+  // while the popover is open), then send (Enter), then prompt-history LAST.
+  // ac.onAcKeyDown returns true when it consumed the key; otherwise it falls
+  // through here. hist.onHistoryKey returns true when it recalled/stepped (and
+  // calls preventDefault itself); the return is informational — history is the
+  // LAST entry, so there is nothing further to fall through to. This preserves
+  // the autocomplete → send → history precedence (C3 → C5 shared dispatcher).
   function onKeyDown(e: KeyboardEvent) {
-    const ta = taRef;
-    // Autocomplete owns the keys while its popup is open. onAcKeyDown returns
-    // true when it consumed the key (ArrowUp/Down/Enter/Tab/Escape); otherwise
-    // it falls through here to send / prompt-history. This preserves the
-    // autocomplete-first precedence (C3 → C5 shared handler).
     if (ac.onAcKeyDown(e)) return;
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       void send();
       return;
     }
-    // Shell-style history recall, split by scope:
-    //   - Plain Up with the caret at the very start (so multi-line editing isn't
-    //     hijacked) → walk the PER-SESSION store — only prompts sent in THIS
-    //     session. A fresh draft session (no server id) recalls the shared
-    //     "__new__" store, matching the draft-key convention.
-    //   - Ctrl/Cmd+Up from ANY caret position → walk the GLOBAL store — prompts
-    //     sent in ANY session, including legacy data written before this split.
-    //     The more discoverable global recall skips the caret-start gate.
-    // Down steps back toward the live draft in whichever mode is active. One
-    // index + an active-mode flag: switching scopes (Up↔Ctrl+Up) starts a fresh
-    // walk so the two stores never cross-contaminate by index.
-    const ctrl = e.ctrlKey || e.metaKey;
-    const histSid = props.sessionId || "__new__";
-    if (e.key === "ArrowUp" && ta && (ctrl || (ta.selectionStart === 0 && ta.selectionEnd === 0))) {
-      const mode: "session" | "global" = ctrl ? "global" : "session";
-      const len = mode === "global" ? historyLen() : historyLen(histSid);
-      if (len > 0) {
-        // Capture the live draft exactly once — when starting a walk from the
-        // idle state. Switching scopes mid-walk (Up↔Ctrl+Up) resets the index
-        // but must NOT overwrite the captured draft with a recalled value, or
-        // Down-past-zero would restore the wrong text.
-        const wasIdle = histMode === "none";
-        if (histMode !== mode) {
-          histMode = mode;
-          histIdx = -1;
-        }
-        const next = Math.min(histIdx + 1, len - 1);
-        const v = mode === "global" ? historyAt(next) : historyAt(next, histSid);
-        if (v !== undefined) {
-          e.preventDefault();
-          if (wasIdle && histIdx === -1) histDraft = input();
-          histIdx = next;
-          setInput(v);
-          queueMicrotask(() => ta && (ta.selectionStart = ta.selectionEnd = 0));
-        }
-      }
-    } else if (e.key === "ArrowDown" && histMode !== "none" && histIdx >= 0) {
-      e.preventDefault();
-      histIdx -= 1;
-      if (histIdx < 0) {
-        histMode = "none";
-        setInput(histDraft);
-      } else {
-        setInput(histMode === "global" ? historyAt(histIdx) ?? "" : historyAt(histIdx, histSid) ?? "");
-      }
-    }
+    hist.onHistoryKey(e);
   }
 
   return (
@@ -2625,7 +2579,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
               ref={taRef}
               class="composer-text"
               value={input()}
-              onInput={(e) => (setInput(e.currentTarget.value), ac.syncCaret(), (histMode = "none"), (histIdx = -1))}
+              onInput={(e) => (setInput(e.currentTarget.value), ac.syncCaret(), hist.resetHistory())}
               onClick={ac.syncCaret}
               onKeyUp={ac.syncCaret}
               onBlur={() => setTimeout(() => ac.dismissAc(), 150)}
