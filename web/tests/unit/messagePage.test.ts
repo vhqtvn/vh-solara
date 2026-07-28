@@ -23,12 +23,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { reconcile } from "solid-js/store";
 import {
   MAX_RESIDENT_MESSAGES,
-  closeSessionStream,
   isPageDirtyingKind,
   loadOlder,
   markPageDirty,
   resetPageInFlight,
-} from "../../src/sync/stream";
+} from "../../src/sync/history";
+import { closeSessionStream } from "../../src/sync/session-stream";
 import {
   approxResidentBytes,
   buildMessages,

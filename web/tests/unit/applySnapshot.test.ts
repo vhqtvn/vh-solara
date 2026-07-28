@@ -2,7 +2,9 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { reconcile } from "solid-js/store";
 import { gzipSync } from "node:zlib";
-import { applySnapshot, applySessionEvent, applySessionSnapshot, applyMessageEvent, decodeMessagesBatch } from "../../src/sync/stream";
+import { applySnapshot, applySessionEvent, applyMessageEvent } from "../../src/sync/reducers";
+import { applySessionSnapshot } from "../../src/sync/session-stream";
+import { decodeMessagesBatch } from "../../src/sync/decode";
 import { state, setState, setSelectedIdRaw } from "../../src/sync/store";
 import { sessionLastAgent } from "../../src/sync/selectors";
 import type { Snapshot } from "../../src/types";

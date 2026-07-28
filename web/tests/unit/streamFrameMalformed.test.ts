@@ -19,7 +19,8 @@
 // window.setTimeout.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { reconcile } from "solid-js/store";
-import { applyTreeFrame, applySessionEvent } from "../../src/sync/stream";
+import { applyTreeFrame } from "../../src/sync/tree-transport";
+import { applySessionEvent } from "../../src/sync/reducers";
 import { state, setState } from "../../src/sync/store";
 
 // Reset only the slices these tests touch (sessions + cursor). Solid's setState

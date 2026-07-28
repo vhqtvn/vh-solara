@@ -15,14 +15,11 @@
 // messageWindows).
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { produce, reconcile } from "solid-js/store";
-import {
-  applyMessageEvent,
-  applySessionEvent,
-  applySessionSnapshot,
-  decodeMessagesBatch,
-  deriveMessageWindow,
-  refreshOpenSessions,
-} from "../../src/sync/stream";
+import { applyMessageEvent, applySessionEvent } from "../../src/sync/reducers";
+import { applySessionSnapshot } from "../../src/sync/session-stream";
+import { decodeMessagesBatch } from "../../src/sync/decode";
+import { deriveMessageWindow } from "../../src/sync/history";
+import { refreshOpenSessions } from "../../src/sync/refresh";
 import { state, setState, setSelectedIdRaw } from "../../src/sync/store";
 import type { Snapshot } from "../../src/types";
 

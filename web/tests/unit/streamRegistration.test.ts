@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, expect, it } from "vitest";
-import { TREE_STREAM_KINDS } from "../../src/sync/stream";
+import { TREE_STREAM_KINDS } from "../../src/sync/tree-transport";
 
 // Pins Stream 1's (tree stream) EventSource listener-registration list.
 // applyMessageEvent's handler cases are reachable ONLY for the kinds registered

@@ -24,21 +24,18 @@
 //    counts as diffs-found (an emitter gap was caught).
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { gzipSync } from "node:zlib";
+import { connect, getTreeSnapshotDecode, _markTreeSeenForTest } from "../../src/sync/tree-transport";
+import { closeSessionStream } from "../../src/sync/session-stream";
+import { resyncTree, _resetResyncGateForTest } from "../../src/sync/health";
 import {
-  connect,
-  closeSessionStream,
-  resyncTree,
   startPeriodicResync,
   periodicResyncShouldRun,
-  getTreeSnapshotDecode,
-  _resetResyncGateForTest,
   _resetPeriodicStateForTest,
-  _markTreeSeenForTest,
   _setLastAuthoritativeRecoveryForTest,
   _getPeriodicResyncStatsForTest,
   TREE_RESYNC_PERIODIC_INTERVAL_MS,
-  STALE_MS,
-} from "../../src/sync/stream";
+} from "../../src/sync/periodic-resync";
+import { STALE_MS } from "../../src/sync/stream";
 import { setProjectDirRaw } from "../../src/sync/store";
 import { seedTreeStore, resetTreeStore } from "../../src/sync/treeState";
 import { withGlobalBusy } from "../../src/busy";

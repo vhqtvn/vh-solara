@@ -2,7 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { reconcile } from "solid-js/store";
 import { gzipSync } from "node:zlib";
-import { refreshOpenSessions, runWithConcurrency, REFRESH_CONCURRENCY } from "../../src/sync/stream";
+import { refreshOpenSessions, runWithConcurrency, REFRESH_CONCURRENCY } from "../../src/sync/refresh";
 import { state, setState, setSelectedIdRaw } from "../../src/sync/store";
 
 // Locks in the reconnect-time message refresh being BOUNDED-concurrent: an

@@ -17,7 +17,7 @@
 // server's compress/gzip + encoding/base64 round-trip exactly.
 import { describe, expect, it } from "vitest";
 import { gzipSync } from "node:zlib";
-import { decodeSnapshot } from "../../src/sync/stream";
+import { decodeSnapshot } from "../../src/sync/decode";
 
 // encodeForTest mirrors the server's maybeCompressSnapshot compression:
 // JSON.stringify → gzip → base64. Used to build a realistic fixture.

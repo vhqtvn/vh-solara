@@ -27,7 +27,8 @@ import {
   expandedButUnloadedIds,
   rehydrateExpandedForTest,
 } from "../../src/sync/treeState";
-import { connect, closeSessionStream } from "../../src/sync/stream";
+import { connect } from "../../src/sync/tree-transport";
+import { closeSessionStream } from "../../src/sync/session-stream";
 import { setProjectDirRaw, setSelectedIdRaw } from "../../src/sync/store";
 import { setSelectedId } from "../../src/sync/actions";
 import { saveVersioned } from "../../src/lib/store";

@@ -28,16 +28,10 @@ import {
 } from "./sync/store";
 import { rootOf } from "./sync/selectors";
 import { currentUrlSession, syncUrl, setApplyingUrl } from "./sync/url";
-import {
-  connect,
-  closeSessionStream,
-  openSessionStream,
-  watchdogTick,
-  maybeReconnect,
-  tickHealth,
-  resyncTree,
-  startPeriodicResync,
-} from "./sync/stream";
+import { connect } from "./sync/tree-transport";
+import { closeSessionStream, openSessionStream } from "./sync/session-stream";
+import { watchdogTick, maybeReconnect, tickHealth, resyncTree } from "./sync/health";
+import { startPeriodicResync } from "./sync/periodic-resync";
 import { setSelectedId, switchProject, openSession } from "./sync/actions";
 
 // Inject the session-store accessors alerts needs (instead of alerts importing
@@ -174,16 +168,17 @@ export type { SyncState } from "./sync/store";
 // Feature 1 (stale indicator) + Feature 2 (updating indicator): connection-
 // health selectors + their thresholds, for the sidebar status dot and any
 // diagnostic surface.
-export { isStale, isUpdating } from "./sync/stream";
-export { STALE_MS, UPDATING_DEBOUNCE_MS } from "./sync/stream";
+export { isStale } from "./sync/health";
+export { isUpdating, UPDATING_DEBOUNCE_MS } from "./sync/reducers";
+export { STALE_MS } from "./sync/stream";
 // Phase 4 — historical-page load-older action (called from ChatView's
 // IntersectionObserver top sentinel + "Load older" button).
-export { loadOlder } from "./sync/stream";
+export { loadOlder } from "./sync/history";
 // tree=2 — server-owned tree expand action (called from SessionTree's
 // TreeStateView onToggle). Collapse is client-only (treeState.collapseTreeNode),
 // so no export needed for it here.
-export { expandTreeNode } from "./sync/stream";
+export { expandTreeNode } from "./sync/tree-transport";
 // Issue 5 — eagerly prune an archived session from the client tree even when
 // the server emits no delete event (the session was already absent from the
 // server-side live store). Called from archive.ts after a successful archive.
-export { pruneSessionDeleted } from "./sync/stream";
+export { pruneSessionDeleted } from "./sync/reducers";

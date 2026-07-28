@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { mergeLastAgents, epochChanged } from "../../src/sync/stream";
+import { mergeLastAgents, epochChanged } from "../../src/sync/reducers";
 
 // The agent-label regression fix (Feature 1 / S3). After a server restart the
 // daemon serves HTTP while still aggregating session tails, so a mid-hydrate

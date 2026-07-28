@@ -21,7 +21,9 @@ import {
   LS_PROJECT,
 } from "./store";
 import { syncUrl } from "./url";
-import { closeSessionStream, connect, resetPageInFlight } from "./stream";
+import { connect } from "./tree-transport";
+import { closeSessionStream } from "./session-stream";
+import { resetPageInFlight } from "./history";
 import { resetTreeStore, clearUserToggled, applyTreeOpStore } from "./treeState";
 
 // Selecting any real session leaves draft mode.

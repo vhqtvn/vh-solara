@@ -23,7 +23,7 @@
 // timeout (the 15s fake timer is never advanced in the GREEN path).
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { withGlobalBusy, globalBusy } from "../../src/busy";
-import { closeSessionStream } from "../../src/sync/stream";
+import { closeSessionStream } from "../../src/sync/session-stream";
 import { setSelectedIdRaw, setProjectDirRaw } from "../../src/sync/store";
 
 // --- Mock EventSource (mirrors reconcileBusy.test.ts, +lastEventId support) ---

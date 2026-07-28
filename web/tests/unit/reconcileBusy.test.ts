@@ -14,7 +14,7 @@
 // authoritative snapshots that resolve reconciliation.
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { withGlobalBusy, globalBusy } from "../../src/busy";
-import { openSessionStream, closeSessionStream } from "../../src/sync/stream";
+import { openSessionStream, closeSessionStream } from "../../src/sync/session-stream";
 import { setSelectedIdRaw, setProjectDirRaw } from "../../src/sync/store";
 
 // --- Mock EventSource ---

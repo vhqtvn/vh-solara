@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { beforeEach, describe, expect, it } from "vitest";
 import { reconcile } from "solid-js/store";
-import { pruneSessionDeleted } from "../../src/sync/stream";
+import { pruneSessionDeleted } from "../../src/sync/reducers";
 import { state, setState } from "../../src/sync/store";
 
 // pruneSessionDeleted mirrors the session.delete event handler's pruning: it

@@ -14,7 +14,8 @@
 // drops). The comprehensive 13-case acceptance suite lives in
 // coherentBarrier.test.ts (Case 12 is the decisive fixture).
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
-import { connect, closeSessionStream } from "../../src/sync/stream";
+import { connect } from "../../src/sync/tree-transport";
+import { closeSessionStream } from "../../src/sync/session-stream";
 import { setProjectDirRaw, state } from "../../src/sync/store";
 
 // --- Mock EventSource (mirrors the treeStreamCompression pattern) ---

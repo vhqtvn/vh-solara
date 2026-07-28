@@ -13,13 +13,9 @@
 // cursorless (fresh) EventSource; the throttle window dedups; no-project and
 // closed-stream are no-ops (the watchdog owns recovery of a closed tree).
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
-import {
-  connect,
-  closeSessionStream,
-  resyncTree,
-  _resetResyncGateForTest,
-  TREE_RESYNC_MIN_GAP_MS,
-} from "../../src/sync/stream";
+import { connect } from "../../src/sync/tree-transport";
+import { closeSessionStream } from "../../src/sync/session-stream";
+import { resyncTree, _resetResyncGateForTest, TREE_RESYNC_MIN_GAP_MS } from "../../src/sync/health";
 import { setProjectDirRaw } from "../../src/sync/store";
 import {
   seedTreeStore,
