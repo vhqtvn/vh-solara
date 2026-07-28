@@ -7,6 +7,7 @@
 // loads the browser-bound lib.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, waitFor } from "@solidjs/testing-library";
+import { createSignal } from "solid-js";
 
 // Mock the mermaid renderer (hoisted). Returns a deterministic svg derived from
 // the ORIGINAL src so tests can tell copy-source vs render-output apart.
@@ -237,6 +238,19 @@ describe("MermaidViewer", () => {
     });
     // the single overlay shows the SECOND diagram (the replacer)
     expect(overlayDiagram()).toContain("C to D");
+    // D1: the replacement opener keeps the body scroll-locked. The replaced
+    // viewer's reactive teardown must NOT clear overflow while another overlay
+    // is active (the gate is activeToken() === null AFTER setActiveToken).
+    expect(document.body.style.overflow).toBe("hidden");
+    // Close the remaining (replacer's) overlay and confirm the scroll-lock is
+    // released only once no overlay is active.
+    fireEvent.click(
+      document.body.querySelector<HTMLButtonElement>("button[aria-label='Close']")!,
+    );
+    await waitFor(() =>
+      expect(document.body.querySelector("[data-mermaid='overlay']")).toBeNull(),
+    );
+    expect(document.body.style.overflow).toBe("");
   });
 
   it("open pushes a URL-transparent history entry; host location.search is unchanged", async () => {
@@ -323,9 +337,13 @@ describe("MermaidViewer", () => {
     expect(document.body.querySelector("[data-mermaid='overlay']")).toBeNull();
   });
 
-  it("overlay snapshot is stable: a re-render of the inline svg does not mutate the expanded view", async () => {
-    const { MermaidViewer, renderMermaid } = await fresh();
-    const r = render(() => <MermaidViewer src={SRC} />);
+  it("overlay snapshot is stable: a resource refetch after open does not mutate the expanded view", async () => {
+    const { MermaidViewer } = await fresh();
+    // Reactive src so we can force a GENUINE createResource refetch. The old
+    // test only swapped the renderMermaid mock, which never re-triggered the
+    // resource — so it proved nothing more than "a string didn't change."
+    const [src, setSrc] = createSignal(SRC);
+    const r = render(() => <MermaidViewer src={src()} />);
     await waitFor(() =>
       expect(r.container.querySelector("[data-mermaid-diagram] svg")).toBeTruthy(),
     );
@@ -339,11 +357,11 @@ describe("MermaidViewer", () => {
     );
     const before = overlayDiagram();
     expect(before).toContain("rendered:");
-    // Even if the resource were to resolve again with different output, the
-    // overlay keeps its open-time snapshot.
-    (renderMermaid as unknown as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
-      "<svg data-mock>CHANGED</svg>",
-    );
+    // Force a real refetch: a new src makes createResource re-resolve, so the
+    // INLINE diagram genuinely updates to a different render…
+    setSrc("graph TD\n    X to Y");
+    await waitFor(() => expect(inlineSvg(r.container)).toContain("X to Y"));
+    // …but the OVERLAY keeps its open-time snapshot (unchanged).
     expect(overlayDiagram()).toBe(before);
   });
 });

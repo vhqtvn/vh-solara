@@ -92,7 +92,10 @@ export default function MermaidViewer(props: { src: string }) {
     setActiveToken((t) => (t === wasMine ? null : t));
     window.removeEventListener("popstate", onPopState);
     document.removeEventListener("keydown", onKey);
-    document.body.style.overflow = "";
+    // Only release the scroll lock if no overlay is still active. A replacement
+    // opener (B) already set overflow="hidden" for ITS overlay before our (A's)
+    // teardown fires; clearing unconditionally would unlock the page behind B.
+    if (activeToken() === null) document.body.style.overflow = "";
     if (consumeHistory && historyPushed) {
       historyPushed = false;
       try {
@@ -134,7 +137,7 @@ export default function MermaidViewer(props: { src: string }) {
   };
 
   const copySource = () => {
-    navigator.clipboard.writeText(props.src).then(
+    navigator.clipboard?.writeText(props.src).then(
       () => {
         setCopied(true);
         setTimeout(() => setCopied(false), 1200);
@@ -184,7 +187,12 @@ export default function MermaidViewer(props: { src: string }) {
         >
           <span>download</span>
         </button>
-        <button type="button" onClick={open} title="Expand diagram">
+        <button
+          type="button"
+          onClick={open}
+          title="Expand diagram"
+          disabled={!svg()}
+        >
           <Icon name="maximize" />
           <span>expand</span>
         </button>
