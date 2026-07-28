@@ -84,3 +84,22 @@ test("PWA: the service worker registers and controls the page", async ({ page })
   });
   expect(ready).toBeTruthy();
 });
+
+// Protocol boot flow: a launched `/?proto=` URL is parsed on boot and surfaced
+// to the user-confirmation prompt (ProtocolConfirm) — the confirm-before-act
+// contract protocol.ts guarantees today. Cancel drops the payload without
+// acting. The `?proto=` value is the percent-encoded form Chrome substitutes
+// for `%s` (web+vhsolara:session/abc → web%2Bvhsolara%3Asession%2Fabc).
+test("Protocol: boot URL ?proto= surfaces ProtocolConfirm; Cancel dismisses it", async ({ page }) => {
+  await page.goto(projectUrl("/?proto=web%2Bvhsolara%3Asession%2Fabc"));
+
+  // The confirm dialog renders with the decoded payload verbatim.
+  const payload = page.locator('[data-testid="proto-payload"]');
+  await expect(payload).toBeVisible();
+  await expect(payload).toContainText("web+vhsolara:session/abc");
+  await expect(page.getByText("Incoming link")).toBeVisible();
+
+  // Cancel drops the payload (confirm-before-act: no action taken).
+  await page.getByRole("button", { name: "Cancel" }).click();
+  await expect(payload).toBeHidden();
+});

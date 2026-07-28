@@ -364,4 +364,32 @@ describe("MermaidViewer", () => {
     // …but the OVERLAY keeps its open-time snapshot (unchanged).
     expect(overlayDiagram()).toBe(before);
   });
+
+  it("Tab is trapped inside the overlay (close → copy on Tab; copy → close on Shift+Tab)", async () => {
+    const r = await renderReady();
+    fireEvent.click(
+      Array.from(r.container.querySelectorAll("button")).find((b) =>
+        /expand/i.test(b.textContent || ""),
+      )!,
+    );
+    await waitFor(() =>
+      expect(document.body.querySelector("[data-mermaid='overlay']")).toBeTruthy(),
+    );
+    const overlay = document.body.querySelector<HTMLDivElement>(
+      "[data-mermaid='overlay']",
+    )!;
+    // The overlay's focusable children in DOM order: copy, download, close.
+    const copy = Array.from(overlay.querySelectorAll<HTMLButtonElement>("button")).find(
+      (b) => /copy/i.test(b.textContent || ""),
+    )!;
+    const close = overlay.querySelector<HTMLButtonElement>("button[aria-label='Close']")!;
+    // Focus the LAST focusable (close) and Tab → wraps to the FIRST (copy).
+    close.focus();
+    expect(document.activeElement).toBe(close);
+    fireEvent.keyDown(close, { key: "Tab", shiftKey: false });
+    expect(document.activeElement).toBe(copy);
+    // Shift+Tab from the FIRST (copy) → wraps to the LAST (close).
+    fireEvent.keyDown(copy, { key: "Tab", shiftKey: true });
+    expect(document.activeElement).toBe(close);
+  });
 });

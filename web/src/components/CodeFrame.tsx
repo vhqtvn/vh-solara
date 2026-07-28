@@ -1,6 +1,6 @@
 import { createEffect, createMemo, createSignal, onCleanup, Show } from "solid-js";
 import { projectDir } from "../sync";
-import { bindCodeFrame } from "../code/frame";
+import { bindCodeFrame, resetCodeFrameReady } from "../code/frame";
 import { codeDockOpen, setCodeDockOpen, codeMobileOverlay, setCodeMobileOverlay, setView, view } from "../ui";
 import { isDesktop } from "../layout";
 import { codeDockSide, setCodeDockSide, codeDockWidth, setCodeDockWidth } from "../prefs";
@@ -31,6 +31,17 @@ export default function CodeFrame() {
   });
   let el: HTMLIFrameElement | undefined;
   const src = createMemo(() => `${location.pathname}?standalone=code&dir=${encodeURIComponent(projectDir())}`);
+
+  // A project switch changes src → the iframe reloads. Reset the ready flag
+  // BEFORE the reload so postToCodeFrame queues (rather than sending into a
+  // torn-down child window) until the reloaded child re-posts vh-code:ready.
+  // The effect also fires once on mount (ready is already false then → no-op),
+  // so the Firefox initial-load path (bindCodeFrame deliberately NOT resetting
+  // ready on `load`) is untouched.
+  createEffect(() => {
+    src();
+    resetCodeFrameReady();
+  });
 
   // Close: the dock and the overlay close differently (overlay may also be the
   // full Code tab on mobile, which should return to chat).

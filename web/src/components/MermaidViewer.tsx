@@ -1,6 +1,7 @@
 import { createEffect, createResource, createSignal, onCleanup, Show } from "solid-js";
 import { Portal } from "solid-js/web";
 import { renderMermaid } from "../lib/mermaid";
+import { trapTab } from "../lib/a11y";
 import Icon from "./Icon";
 import styles from "./MermaidViewer.module.css";
 
@@ -207,6 +208,7 @@ export default function MermaidViewer(props: { src: string }) {
             aria-modal="true"
             aria-label="Expanded mermaid diagram"
             tabindex={-1}
+            use:trapTab
             // tap-out is NOT a closer (accidental closure risk during inspection)
           >
             <div class={styles.overlayActions}>

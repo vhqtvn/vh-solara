@@ -240,7 +240,14 @@ export function ToolPart(props: { part: Part; tail?: boolean }) {
   });
   return (
     <div class="tool" classList={{ [status()]: true }}>
-      <button type="button" class="tool-head" classList={{ "no-toggle": !hasDetail() }} onClick={toggle}>
+      <div
+        role="button"
+        tabindex="0"
+        class="tool-head"
+        classList={{ "no-toggle": !hasDetail() }}
+        onClick={toggle}
+        onKeyDown={onActionKey(toggle)}
+      >
         {/* Running tools show the session-list shimmer (smaller); finished/failed
             show a static status dot. */}
         <Show when={status() === "running"} fallback={<span class={styles["tool-status"]} />}>
@@ -308,7 +315,7 @@ export function ToolPart(props: { part: Part; tail?: boolean }) {
             <Icon name="fork" size={13} />
           </span>
         </Show>
-      </button>
+      </div>
       <div class={styles.disclosure} classList={{ open: expanded() }}>
         <div class={styles["disclosure-clip"]}>
           <Show when={revealed()}>

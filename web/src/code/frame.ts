@@ -41,6 +41,16 @@ export function bindCodeFrame(el: HTMLIFrameElement | null) {
   frame = el;
 }
 
+// resetCodeFrameReady clears the ready flag before a known iframe reload (a
+// project switch changes CodeFrame's src, reloading the child). Called BEFORE
+// the reload so postToCodeFrame queues until the child re-posts vh-code:ready,
+// instead of sending directly into a torn-down child window (message loss).
+// This does NOT touch the Firefox initial-load path: bindCodeFrame still does
+// not reset ready on `load` (see its comment).
+export function resetCodeFrameReady() {
+  ready = false;
+}
+
 let installed = false;
 // installCodeFrameHost wires the one window listener for messages FROM the frame
 // (currently just "ready", which flushes anything queued before it loaded).

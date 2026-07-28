@@ -143,6 +143,42 @@ export function modal(el: HTMLElement) {
   onCleanup(attachModal(el));
 }
 
+// Solid directive: <div use:trapTab> traps Tab/Shift+Tab inside an element,
+// cycling focus between its first and last focusable child. Unlike `modal` it
+// does NOT do focus entry, focus restore, or modalCount — use it on an overlay
+// that already manages its own focus lifecycle (e.g. MermaidViewer's token-
+// based entry/restore + one-at-a-time replacement logic, which would conflict
+// with attachModal's unconditional entry/restore). The focusable set is queried
+// at keydown time (not mount) because overlay content may be conditionally
+// rendered; the capture listener catches Tab targeting any descendant.
+export function trapTab(el: HTMLElement) {
+  const FOCUSABLE_IN_OVERLAY =
+    'button:not([disabled]), a[href], input:not([disabled]), [tabindex="0"]';
+  const onKey = (e: KeyboardEvent) => {
+    if (e.key !== "Tab") return;
+    const f = Array.from(el.querySelectorAll<HTMLElement>(FOCUSABLE_IN_OVERLAY));
+    if (!f.length) {
+      e.preventDefault();
+      return;
+    }
+    const first = f[0];
+    const last = f[f.length - 1];
+    const active = document.activeElement as HTMLElement | null;
+    if (!el.contains(active)) {
+      e.preventDefault();
+      first.focus();
+    } else if (e.shiftKey && active === first) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && active === last) {
+      e.preventDefault();
+      first.focus();
+    }
+  };
+  el.addEventListener("keydown", onKey, true);
+  onCleanup(() => el.removeEventListener("keydown", onKey, true));
+}
+
 // Solid directive: <div use:dismiss={() => setOpen(false)}> closes a popover on
 // an outside click or Escape. Armed on the next tick so the click that opened it
 // doesn't immediately dismiss it. Uses composedPath (not el.contains) so a click
@@ -180,6 +216,7 @@ declare module "solid-js" {
   namespace JSX {
     interface Directives {
       modal: true;
+      trapTab: true;
       dismiss: DismissValue;
     }
   }
