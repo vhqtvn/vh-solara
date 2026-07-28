@@ -16,7 +16,8 @@ echo "[bench] building SPA…"
 
 echo "[bench] starting fixture server ($N messages) on $ADDR"
 cd "$repo_root"
-VH_BENCH_MESSAGES="$N" go run ./tools/fixtureserver -addr "$ADDR" >/tmp/vh-bench-srv.log 2>&1 &
+mkdir -p ./tmp
+VH_BENCH_MESSAGES="$N" go run ./tools/fixtureserver -addr "$ADDR" >./tmp/vh-bench-srv.log 2>&1 &
 srv=$!
 trap 'kill $srv 2>/dev/null || true' EXIT
 

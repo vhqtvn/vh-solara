@@ -3,7 +3,7 @@ import { chromium } from "@playwright/test";
 import { mkdirSync } from "node:fs";
 
 const base = process.env.BASE || "http://127.0.0.1:8099";
-const out = process.env.OUT || "/tmp/vhshots";
+const out = process.env.OUT || "./tmp/vhshots";
 mkdirSync(out, { recursive: true });
 const browser = await chromium.launch();
 const wait = (p, ms) => p.waitForTimeout(ms);

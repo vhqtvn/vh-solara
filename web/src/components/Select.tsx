@@ -47,10 +47,14 @@ export default function Select(props: {
 
   // Live, currently-rendered option buttons. The popup mounts via <Portal>
   // when open, so re-query the DOM each time. Disabled options are skipped.
+  // Scoped to this Select's own popup (popEl) so two simultaneously-open
+  // Selects can't cross-navigate each other's option lists. popEl is shared by
+  // the desktop pop and the mobile sheet (mutually exclusive via <Show>), so it
+  // always points to whichever listbox root is currently mounted.
   const listOptions = (): HTMLButtonElement[] =>
-    Array.from(
-      document.querySelectorAll<HTMLButtonElement>("[role='listbox'] .vh-select-opt"),
-    ).filter((b) => !b.disabled);
+    Array.from(popEl?.querySelectorAll<HTMLButtonElement>(".vh-select-opt") ?? []).filter(
+      (b) => !b.disabled,
+    );
 
   const labelOf = (b: HTMLButtonElement): string =>
     (b.querySelector(".vh-select-opt-label") as HTMLElement | null)?.textContent ??
@@ -274,15 +278,15 @@ export default function Select(props: {
             when={isMobile()}
             fallback={
               <>
-                <div class="vh-select-scrim" onClick={() => setOpen(false)} />
+                <div class="vh-select-scrim" onClick={() => { setOpen(false); btn?.focus(); }} />
                 <div ref={popEl} class="vh-select-pop" role="listbox" style={popStyle()}>
                   <Options />
                 </div>
               </>
             }
           >
-            <div class="vh-select-overlay" onClick={() => setOpen(false)}>
-              <div class="vh-select-sheet" role="listbox" onClick={(e) => e.stopPropagation()}>
+            <div class="vh-select-overlay" onClick={() => { setOpen(false); btn?.focus(); }}>
+              <div ref={popEl} class="vh-select-sheet" role="listbox" onClick={(e) => e.stopPropagation()}>
                 <Options />
               </div>
             </div>

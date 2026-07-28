@@ -156,4 +156,62 @@ describe("Select — keyboard navigation (WCAG 2.1.1 / APG Listbox Collapsible)"
     // DOM order: Apple(0), Disabled(1), Banana(2) — disabled is skipped → Banana
     expect(document.activeElement).toBe(optionEls()[2]);
   });
+
+  it("outside-click on the scrim closes the popup and restores focus to the trigger", async () => {
+    // Mirrors the Escape handler's focus-restore contract (WCAG 2.4.3): a mouse
+    // user dismissing the listbox by clicking the scrim should get focus back on
+    // the trigger, just like a keyboard user pressing Escape.
+    const { trigger, isOpen } = setup();
+    trigger().focus();
+    await key("ArrowDown");
+    await waitFor(() => expect(isOpen()).toBe(true));
+
+    const scrim = document.querySelector(".vh-select-scrim") as HTMLElement;
+    expect(scrim).toBeTruthy();
+    fireEvent.click(scrim);
+
+    await waitFor(() => expect(isOpen()).toBe(false));
+    expect(document.activeElement).toBe(trigger());
+  });
+
+  it("navigation stays scoped to this Select's popup when another listbox exists in the document", async () => {
+    // listOptions() must query the component's own popup (popEl), not document
+    // globally, so two concurrently-open Selects can't cross-navigate. We
+    // simulate a second open Select by injecting a foreign [role=listbox] with
+    // its own .vh-select-opt buttons. (Rendering two real open Selects isn't a
+    // clean test here: both attach document keydown listeners and would fight
+    // over focus independently of listOptions() scoping; this injection
+    // isolates the scoping contract.)
+    const { trigger } = setup(); // default opts: Apple, Banana, Cherry, Citrus
+    trigger().focus();
+    await key("ArrowDown");
+    // This Select's own options only (exclude any foreign .vh-select-opt nodes):
+    const ownOpts = () =>
+      Array.from(document.querySelectorAll<HTMLButtonElement>(".vh-select-pop .vh-select-opt"));
+    await waitFor(() => expect(document.activeElement).toBe(ownOpts()[0])); // Apple
+
+    const foreign = document.createElement("div");
+    foreign.setAttribute("role", "listbox");
+    foreign.innerHTML = `
+      <button type="button" class="vh-select-opt">Zebra</button>
+      <button type="button" class="vh-select-opt">Yak</button>`;
+    document.body.appendChild(foreign);
+
+    // Walk to the LAST own option (Citrus): Apple → Banana → Cherry → Citrus.
+    await key("ArrowDown");
+    expect(document.activeElement).toBe(ownOpts()[1]); // Banana
+    await key("ArrowDown");
+    expect(document.activeElement).toBe(ownOpts()[2]); // Cherry
+    await key("ArrowDown");
+    expect(document.activeElement).toBe(ownOpts()[3]); // Citrus
+
+    // CRUX: from the last own option, ArrowDown must WRAP back to Apple (stay in
+    // this popup). With the old document-global query, listOptions() would
+    // instead move forward into the foreign listbox's first option (Zebra).
+    await key("ArrowDown");
+    expect(document.activeElement).toBe(ownOpts()[0]);
+    expect(document.activeElement?.textContent).toContain("Apple");
+
+    foreign.remove();
+  });
 });

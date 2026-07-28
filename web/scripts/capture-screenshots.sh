@@ -24,7 +24,8 @@ export VH_DEMO_DIR="${VH_DEMO_DIR:-$repo_root/tmp/fixture-demo}"
 
 echo "[capture] starting fixture server on $ADDR"
 cd "$repo_root"
-go run ./tools/fixtureserver -addr "$ADDR" >/tmp/vh-capture-srv.log 2>&1 &
+mkdir -p ./tmp
+go run ./tools/fixtureserver -addr "$ADDR" >./tmp/vh-capture-srv.log 2>&1 &
 srv=$!
 trap 'kill $srv 2>/dev/null || true' EXIT
 
