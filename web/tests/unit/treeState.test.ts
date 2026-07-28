@@ -519,6 +519,88 @@ describe("treeState stable activity-edge promotion ordering", () => {
   });
 });
 
+// ---- collapseTreeNode presentation-rank cleanup ------------------------------
+// collapseTreeNode (§8.4) drops the loaded descendants from the map AND must
+// reconcile their shell-owned presentation ranks: the placeholder id and any
+// protected/pinned descendants stay resident (so keep their ranks), every OTHER
+// dropped descendant loses its rank so a later re-introduction is treated as a
+// fresh front insertion (not a stale rank). Mirrors the deletion rank-reconcile
+// contract ("deletion removes rank state; re-introduction is treated as NEW
+// (front)") above, but exercises the COLLAPSE path + the protected/pinned
+// exemption (treeState.ts:697-708).
+describe("treeState collapseTreeNode rank cleanup", () => {
+  beforeEach(() => {
+    resetTreeStore();
+    resetExpandedForTest();
+  });
+
+  it("placeholder + protected descendants KEEP their ranks; a non-protected dropped descendant loses its rank (re-intro is NEW/front)", async () => {
+    // Layout: sibling root S anchors P's own root position; P has three
+    // children — D1 + D3 are PROTECTED/pinned (stay resident through collapse),
+    // D2 is NOT protected (dropped by collapse). D3 (a second protected child)
+    // is needed so a protected descendant's SURVIVING rank is observable: with
+    // only one protected child it renders alone behind any fresh front-inserted
+    // sibling, so its rank value could not be told apart from the -Infinity
+    // fallback. Two protected children let their relative rank order prove the
+    // ranks survived.
+    //
+    // P and D1 are PROMOTED via working edges before collapse so each one's
+    // rank puts it AHEAD of a higher-updatedMs sibling. That rank-vs-recency
+    // mismatch is what makes "rank survives" genuinely observable: if collapse
+    // deleted a surviving rank, the node would fall back to updatedMs and
+    // REORDER.
+    seedTreeStore([
+      node({ id: "S", updatedMs: 1000 }),
+      node({ id: "P", updatedMs: 500, childCount: 3, loaded: true }),
+      node({ id: "D3", parentId: "P", updatedMs: 300 }), // protected
+      node({ id: "D2", parentId: "P", updatedMs: 200 }), // NOT protected (dropped)
+      node({ id: "D1", parentId: "P", updatedMs: 100 }), // protected
+    ]);
+    // Seed recency baselines (updatedMs DESC): roots [S, P]; P's kids [D3, D2, D1].
+    expect(treeRoots().map((n) => n.id)).toEqual(["S", "P"]);
+    expect(treeChildrenOf("P").map((n) => n.id)).toEqual(["D3", "D2", "D1"]);
+
+    // Promote P (root) and D1 (protected child) via working edges -> each jumps
+    // to the FRONT of its group DESPITE a lower updatedMs.
+    applyTreeOpStore({ op: "node.facet", data: { id: "P", activity: "busy" } });
+    applyTreeOpStore({ op: "node.facet", data: { id: "D1", activity: "busy" } });
+    await flush();
+    expect(treeRoots().map((n) => n.id)).toEqual(["P", "S"]); // P over S (rank, not recency)
+    expect(treeChildrenOf("P").map((n) => n.id)).toEqual(["D1", "D3", "D2"]); // D1 over D3/D2
+
+    // Collapse P, protecting D1 + D3 (pinned descendants stay resident). D2 is
+    // dropped from the map; its presentation rank must be cleaned up.
+    collapseTreeNode("P", new Set(["D1", "D3"]));
+
+    // (3) P -- the placeholder -- stays resident AND keeps its (promoted) rank,
+    // so it REMAINS ahead of S despite P.updatedMs(500) < S.updatedMs(1000). If
+    // collapse had deleted P's rank (the `if (rid === id) continue` branch), P
+    // would fall back to updatedMs -> [S, P].
+    expect(treeNode("P")).toBeDefined();
+    expect(treeNode("P")?.loaded).toBe(false);
+    expect(treeRoots().map((n) => n.id)).toEqual(["P", "S"]);
+
+    // (4) D1 + D3 -- protected -- stay resident AND keep their ranks. Their
+    // rank-order ([D1 promoted, D3 seed]) PERSISTS; if collapse had deleted a
+    // protected rank (the `if (protectedIds?.has(rid)) continue` branch), they
+    // would fall back to updatedMs -> [D3(300), D1(100)].
+    expect(treeNode("D1")).toBeDefined();
+    expect(treeNode("D3")).toBeDefined();
+    expect(treeNode("D2")).toBeUndefined(); // dropped (not protected)
+    expect(treeChildrenOf("P").map((n) => n.id)).toEqual(["D1", "D3"]);
+
+    // (5) D2 -- not protected -- was DROPPED and its rank cleaned up, so
+    // re-introducing it via a fresh upsert lands it at the FRONT of P's child
+    // group (a NEW front insertion). D2's pre-collapse rank placed it BEHIND D1
+    // and D3; the fresh front-insertion rank puts it AHEAD of both -> [D2, D1, D3].
+    applyTreeOpStore({
+      op: "node.upsert",
+      data: { node: node({ id: "D2", parentId: "P", updatedMs: 200 }) },
+    });
+    expect(treeChildrenOf("P").map((n) => n.id)).toEqual(["D2", "D1", "D3"]);
+  });
+});
+
 // ---- mode store (proj=1 4-state twisty model) -------------------------------
 // Three PERSISTED modes (collapsed | filtered | expanded) with an implicit
 // "filtered" default for any absent id, plus a transient userToggled overlay

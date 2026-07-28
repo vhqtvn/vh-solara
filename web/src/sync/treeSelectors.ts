@@ -121,10 +121,15 @@ export function selectedPathIds(map: TreeFlatMap, selectedId: string | null): Se
 // SERVER-COMPUTED rollups (flags.subtreeBusy / flags.subtreeNeedsInput) + the
 // node's own activity — NO client-side subtree walk, NO full-map projection. The
 // "balance with server computing" is satisfied by reading these rollups (already
-// on the node) rather than recursing. Used for THREE things in the tree:
+// on the node) rather than recursing. Used for four things in the tree:
 //   1. filtered-mode child inclusion (only working children render),
-//   2. expanded-mode working-first stable ordering,
-//   3. the non-flat ring (.tree-twisty/.tree-node .running).
+//   2. expanded-mode working-first partition (working children before idle),
+//   3. the non-flat ring (.tree-twisty/.tree-node .running),
+//   4. ingestion working() transition detection (seedTreeStore +
+//      applyTreeOpStore): a genuine edge auto-mutates the persisted mode
+//      (collapsed↔filtered); a non-working → working edge also front-promotes
+//      the node's shell presentation rank in treeRoots()/treeChildrenOf()
+//      (the activity-edge promotion).
 // Input-ancestry is represented by the subtreeNeedsInput rollup — error /
 // permission are NOT added independently (Permission:true ⟹ PendingInput today,
 // and the rollup carries input-ancestry for collapsed ancestors).
