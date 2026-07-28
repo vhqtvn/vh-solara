@@ -54,9 +54,15 @@ func (s *Server) handleTreeChildren(w http.ResponseWriter, r *http.Request) {
 	// terminal batch.
 	emitter := state.NewTreeEmitter(agg.Store(), reqDir(r))
 	nodes, hasMore, nextCursor, stale := emitter.ExpandChildren(id, cursor, limit)
+	// L-01 serialization guard: a nil Nodes slice would serialize as JSON
+	// "null", violating the empty-result wire contract ([]). Normalize at this
+	// single response boundary so the wire shape is always an array.
+	if nodes == nil {
+		nodes = []state.Node{}
+	}
 	resp := treeChildrenResponse{
 		ParentID:    id,
-		Nodes:       nodes, // nil slice → JSON "null"; normalize to [] below
+		Nodes:       nodes,
 		HasMore:     hasMore,
 		StaleCursor: stale,
 	}

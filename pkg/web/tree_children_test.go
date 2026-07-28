@@ -146,6 +146,40 @@ func TestTreeChildren_StaleCursor(t *testing.T) {
 	}
 }
 
+// TestTreeChildrenAlwaysArray is the L-01 standing-check: an empty result
+// MUST serialize as "nodes": [] on the wire, never "nodes": null. This inspects
+// the raw JSON body (the violated wire contract), not the unmarshaled Go slice —
+// a JSON null unmarshals to a nil slice with len 0, which would hide the defect.
+// It covers both empty-result cases proven at runtime: a childless parent and a
+// nonexistent id. Red-now against the pre-fix handler (which assigned a nil
+// Nodes slice); green after the single-response-boundary normalization guard.
+func TestTreeChildrenAlwaysArray(t *testing.T) {
+	srv := treeTestServer(t)
+
+	cases := []struct{ name, id string }{
+		{"childless_parent", "C1"}, // C1 is a leaf with no children
+		{"nonexistent_id", "NOPE"}, // never seeded → empty/stale result
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "/vh/tree/children?id="+c.id, nil)
+			w := httptest.NewRecorder()
+			srv.handleTreeChildren(w, req)
+			if w.Code != 200 {
+				t.Fatalf("want 200, got %d: %s", w.Code, w.Body.String())
+			}
+			body := w.Body.String()
+			// Wire contract: must carry an array literal, never a null literal.
+			if strings.Contains(body, `"nodes":null`) {
+				t.Errorf("empty result serialized as \"nodes\": null (wire contract violation):\n%s", body)
+			}
+			if !strings.Contains(body, `"nodes":[]`) {
+				t.Errorf("empty result did not serialize as \"nodes\": []:\n%s", body)
+			}
+		})
+	}
+}
+
 // TestTreeChildren_MissingID asserts 400 when ?id is absent.
 func TestTreeChildren_MissingID(t *testing.T) {
 	srv := treeTestServer(t)
