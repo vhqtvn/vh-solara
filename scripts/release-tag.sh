@@ -11,6 +11,12 @@
 # which builds cross-platform binaries (stamping cmd.Version via ldflags) and
 # creates the GitHub release with auto-generated notes.
 #
+# NOTE: this script deliberately pushes the CURRENT BRANCH FIRST and then the
+# single tag. This is an intentional move away from the prior "tag-only"
+# behavior, where the operator had to `git push` the branch by hand after every
+# release (and a tag could land referencing branch state the remote had never
+# seen). See the invariants below.
+#
 # Usage:
 #   scripts/release-tag.sh vX.Y.Z
 #
@@ -30,7 +36,16 @@
 #   - working tree clean (git status --porcelain empty)
 #   - tag does not already exist
 #   - tags HEAD only (no arbitrary commit arg)
-#   - pushes ONLY the single tag (never --tags / --all / --force)
+#   - current branch resolvable (refuses on detached HEAD)
+#
+# Mutation order (each step stops before the next on failure):
+#   1. push the CURRENT branch first: git push origin refs/heads/<branch>
+#      (never --tags / --all / --force); a rejected push (non-fast-forward /
+#      remote moved ahead) stops here — no local tag is created, so a tag can
+#      never land referencing branch state the remote has never seen.
+#   2. create the annotated tag on HEAD.
+#   3. push ONLY the single tag: git push origin refs/tags/<version>
+#      (never --tags / --all / --force).
 #
 # Output: a single JSON line on stdout:
 #   { "ok": <bool>, "tag": "<vX.Y.Z>", "commit": "<sha>", "pushed": <bool>, "error": <string|null> }
@@ -102,6 +117,35 @@ if git rev-parse --verify --quiet "refs/tags/${VERSION}" >/dev/null 2>&1; then
     refuse "tag ${VERSION} already exists (refs/tags/${VERSION} resolves)"
 fi
 
+# Resolve the current branch. It is pushed before the tag so the remote branch
+# and the tag stay consistent. A detached HEAD cannot be pushed as a branch
+# ref, so refuse up front rather than failing at the push. Never hardcode a
+# branch name (no "main" assumption).
+BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+if [ -z "$BRANCH" ] || [ "$BRANCH" = "HEAD" ]; then
+    refuse "detached HEAD; checkout a branch before releasing (HEAD sha ${HEAD_SHA})"
+fi
+
+# --- push current branch FIRST (before creating the tag) ---------------------
+#
+# Push the current branch before the tag so the remote branch and the tag are
+# consistent: a tag must never land referencing branch state the remote has
+# never seen. A rejected branch push (non-fast-forward / remote moved ahead)
+# stops here — no local tag is created (this push runs before `git tag`). The
+# single explicit ref mirrors the tag push; never --tags / --all / --force.
+
+if git push origin "refs/heads/${BRANCH}" 2>branch-push.err; then
+    rm -f branch-push.err
+else
+    # Branch push rejected. Surface the error and STOP before creating the tag.
+    # No local tag artifact exists (the branch push runs before `git tag`).
+    BRANCH_PUSH_ERR=$(sed -e 's/\\/\\\\/g' -e "s/\"/'/g" branch-push.err 2>/dev/null | tr '\n' ' ' | sed 's/  */ /g')
+    rm -f branch-push.err
+    emit_json 0 "$VERSION" "$HEAD_SHA" 0 \
+        "git push failed for branch ${BRANCH} (stopped before creating tag ${VERSION}): ${BRANCH_PUSH_ERR}"
+    exit 0
+fi
+
 # --- create annotated tag on HEAD --------------------------------------------
 
 MSG_FILE="${RELEASE_TAG_MESSAGE_FILE:-}"
@@ -144,7 +188,7 @@ else
     git tag -a "$VERSION" "$HEAD_SHA" -m "Release ${VERSION}"
 fi
 
-# --- push ONLY the single tag ------------------------------------------------
+# --- push ONLY the single tag (branch already pushed above) ------------------
 
 PUSHED=0
 PUSH_ERR=""
