@@ -62,26 +62,12 @@ import { fmtTurnStats, turnStats } from "../usage";
 import { msgTextOnly, msgTextWithThinking } from "../lib/msgText";
 import { classifyHold, shouldSkipAfterContextmenu } from "../lib/copyHold";
 import type { MessageView } from "../types";
+import { agentLabel, costLabel, messageError, modelLabel, roleLabel } from "./chat/messageMeta";
 
 const draftKey = (sid: string) => "vh.draft." + sid;
 
 // Model/agent/variant a prompt is sent with (captured at queue time too).
 type QueueConfig = { providerID?: string; modelID?: string; variant?: string; agent?: string };
-
-
-function roleLabel(role?: string): string {
-  if (role === "user") return "You";
-  if (role === "assistant") return "Assistant";
-  return role || "";
-}
-
-// The agent/subagent that produced an assistant message (e.g. "build", "plan",
-// or a custom subagent). Empty for user messages or when none was recorded.
-function agentLabel(info: any): string {
-  if (info?.role !== "assistant") return "";
-  const a = info.agent ?? info.mode;
-  return typeof a === "string" ? a.trim() : "";
-}
 
 // The agent label in a message head — plain @name. The COLORED per-agent badge
 // (agentStyles) lives on the session-list rows, not here (deliberately keeping
@@ -93,36 +79,6 @@ function MsgAgent(props: { info: any }) {
       <span class="msg-agent" data-tip={`Agent: ${name()}`}>@{name()}</span>
     </Show>
   );
-}
-
-function messageError(info: any): string | null {
-  const e = info?.error;
-  if (!e) return null;
-  return e.data?.message || e.name || "error";
-}
-
-// The model that produced an assistant message, resolved to its display name
-// (falling back to the raw id). Empty for non-assistant messages or when the
-// message carries no model. message.model uses `modelID`; older/flat envelopes
-// put it directly on the info — accept either.
-function modelLabel(info: any): string {
-  if (info?.role !== "assistant") return "";
-  const providerID = info.providerID ?? info.model?.providerID;
-  const modelID = info.modelID ?? info.model?.modelID;
-  if (!modelID) return "";
-  const name = (providerID ? findModel(providerID, modelID)?.name : undefined) || modelID;
-  const variant = info.variant ?? info.model?.variant;
-  return variant && variant !== "default" ? `${name} · ${variant}` : name;
-}
-
-// Assistant cost/token summary, shown once the turn has completed.
-function costLabel(info: any): string {
-  if (info?.role !== "assistant" || !info?.time?.completed) return "";
-  const parts: string[] = [];
-  if (typeof info.cost === "number" && info.cost > 0) parts.push(`$${info.cost.toFixed(4)}`);
-  const tok = (info.tokens?.input || 0) + (info.tokens?.output || 0);
-  if (tok > 0) parts.push(tok >= 1000 ? `${(tok / 1000).toFixed(1)}k tok` : `${tok} tok`);
-  return parts.join(" · ");
 }
 
 // Group a message's parts for rendering: consecutive tool/reasoning parts fold
