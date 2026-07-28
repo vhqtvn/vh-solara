@@ -18,7 +18,6 @@ import { activeAgent, agentForSession, agents, selectAgentForSession, selectedAg
 import { claimQueued, enqueue, fetchQueue, hasQueueState, migrateLegacyQueue, queueFor, queueMode, removeQueued, resolveQueued } from "../queue";
 import { createQueueDrainer } from "../queueDrain";
 import { historyAt, historyLen, pushHistory } from "../history";
-import { type AcItem, commandSuggestions, fileSuggestions } from "../lib/complete";
 import { harvestPastedFiles } from "../lib/paste";
 import {
   effectiveInline,
@@ -64,6 +63,7 @@ import { classifyHold, shouldSkipAfterContextmenu } from "../lib/copyHold";
 import type { MessageView } from "../types";
 import { agentLabel, costLabel, messageError, modelLabel, roleLabel } from "./chat/messageMeta";
 import { MessageParts, groupParts } from "./chat/MessageParts";
+import { createComposerAutocomplete } from "./chat/createComposerAutocomplete";
 
 const draftKey = (sid: string) => "vh.draft." + sid;
 
@@ -1072,76 +1072,30 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   });
 
   // --- composer autocomplete (@file / @agent / /command) ---------------------
-  const [caret, setCaret] = createSignal(0);
-  const [acItems, setAcItems] = createSignal<AcItem[]>([]);
-  const [acIndex, setAcIndex] = createSignal(0);
-  const acOpen = () => acItems().length > 0;
-  let acReq = 0; // race guard for async (file) fetches
-
-  // The token under the caret that drives suggestions: a leading "/command", or
-  // an "@mention" with no whitespace between the @ and the caret.
-  function activeToken(): { type: "command" | "mention"; query: string; start: number; end: number } | null {
-    const text = input();
-    const c = caret();
-    if (text.startsWith("/")) {
-      const sp = text.indexOf(" ");
-      if (sp === -1 || c <= sp) return { type: "command", query: text.slice(1, c), start: 0, end: c };
-    }
-    const upto = text.slice(0, c);
-    const at = upto.lastIndexOf("@");
-    if (at >= 0 && !/\s/.test(upto.slice(at + 1))) {
-      return { type: "mention", query: upto.slice(at + 1), start: at, end: c };
-    }
-    return null;
-  }
-
-  // Recompute suggestions whenever the input or caret moves.
-  createEffect(() => {
-    input();
-    caret();
-    const tok = activeToken();
-    if (!tok || props.draft && tok.type === "command") {
-      setAcItems([]);
-      return;
-    }
-    const req = ++acReq;
-    setAcIndex(0);
-    if (tok.type === "command") {
-      void commandSuggestions(tok.query).then((items) => req === acReq && setAcItems(items));
-    } else {
-      const q = tok.query.toLowerCase();
-      const agentItems: AcItem[] = agents()
-        .filter((a) => a.name.toLowerCase().includes(q))
-        .slice(0, 5)
-        .map((a) => ({ kind: "agent", label: "@" + a.name, detail: a.description, insert: "@" + a.name + " " }));
-      // Show agents immediately; merge in file matches when they arrive.
-      setAcItems(agentItems);
-      if (tok.query.length >= 1) {
-        void fileSuggestions(tok.query).then((files) => req === acReq && setAcItems([...agentItems, ...files]));
-      }
-    }
+  // Extracted to createComposerAutocomplete (a SolidJS `create...` controller
+  // factory, mirroring createQueueDrainer). The factory owns the suggestion
+  // state machine (caret-driven activeToken detection + agent filter + async
+  // command/file fetch with a stale-request guard), keyboard navigation, and
+  // applyAc. This view keeps only the presentational popover JSX + acStyle()
+  // positioning (reads the composer rect) + the onKeyDown dispatcher that calls
+  // onAcKeyDown FIRST, then falls through to send / prompt-history (C5 will
+  // hook its own handler into that dispatcher later).
+  //
+  // onApplied is the C5 seam: prompt-history walk cursors (still inline here)
+  // reset whenever an item is applied, matching the original applyAc behavior.
+  const ac = createComposerAutocomplete({
+    input,
+    setInput,
+    agents,
+    textarea: () => taRef,
+    sessionId: () => props.sessionId,
+    draft: () => !!props.draft,
+    onApplied: () => {
+      histMode = "none";
+      histIdx = -1;
+    },
   });
 
-  function applyAc(item: AcItem) {
-    const tok = activeToken();
-    if (!tok) return;
-    const text = input();
-    const before = text.slice(0, tok.start);
-    const after = text.slice(tok.end);
-    setInput(before + item.insert + after);
-    const pos = (before + item.insert).length;
-    setAcItems([]);
-    histMode = "none";
-    histIdx = -1;
-    queueMicrotask(() => {
-      if (taRef) {
-        taRef.focus();
-        taRef.selectionStart = taRef.selectionEnd = pos;
-        setCaret(pos);
-      }
-    });
-  }
-  const syncCaret = () => taRef && setCaret(taRef.selectionStart ?? 0);
 
   // Paste clipboard text into the composer. For mobile / no-physical-keyboard
   // where ⌘/Ctrl+V isn't handy; image/file paste still goes through the
@@ -1180,7 +1134,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       if (taRef) {
         taRef.focus();
         taRef.selectionStart = taRef.selectionEnd = pos;
-        setCaret(pos);
+        ac.syncCaret();
       }
     });
   }
@@ -1238,7 +1192,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // change (which happens as you type, when the composer may have grown).
   let composerEl: HTMLDivElement | undefined;
   const acStyle = (): Record<string, string> => {
-    acItems(); // recompute when the list changes
+    ac.acItems(); // recompute when the list changes
     if (!composerEl) return {};
     const r = composerEl.getBoundingClientRect();
     return {
@@ -1487,7 +1441,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
           // advanced persists (no microtask needed, unlike pasteFromClipboard
           // which computes the splice on the signal and must wait for render).
           setInput(ta.value);
-          setCaret(ta.selectionStart ?? 0);
+          ac.syncCaret();
         }
       }
       histMode = "none";
@@ -1541,7 +1495,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       // no-op, so the caret the helper advanced persists — same property the
       // addFiles inline insert path relies on).
       setInput(ta.value);
-      setCaret(ta.selectionStart ?? 0);
+      ac.syncCaret();
     } else {
       // No textarea ref (should not happen in the composer): append to the
       // signal so the token is at least present (caret positioning best-effort).
@@ -2114,13 +2068,11 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
 
   function onKeyDown(e: KeyboardEvent) {
     const ta = taRef;
-    // Autocomplete owns the keys while its popup is open.
-    if (acOpen()) {
-      if (e.key === "ArrowDown") { e.preventDefault(); setAcIndex((i) => Math.min(i + 1, acItems().length - 1)); return; }
-      if (e.key === "ArrowUp") { e.preventDefault(); setAcIndex((i) => Math.max(i - 1, 0)); return; }
-      if (e.key === "Enter" || e.key === "Tab") { e.preventDefault(); applyAc(acItems()[acIndex()]); return; }
-      if (e.key === "Escape") { e.preventDefault(); setAcItems([]); return; }
-    }
+    // Autocomplete owns the keys while its popup is open. onAcKeyDown returns
+    // true when it consumed the key (ArrowUp/Down/Enter/Tab/Escape); otherwise
+    // it falls through here to send / prompt-history. This preserves the
+    // autocomplete-first precedence (C3 → C5 shared handler).
+    if (ac.onAcKeyDown(e)) return;
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       void send();
@@ -2553,17 +2505,17 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
         <div class="composer" classList={{ focus: focusMode() }} ref={composerEl}>
           {/* Autocomplete popup (@file / @agent / /command). Portaled to body so
               chat content can't paint over it; positioned above the composer. */}
-          <Show when={acOpen()}>
+          <Show when={ac.acVisible()}>
             <Portal>
               <div class="ac-pop" style={acStyle()}>
-                <For each={acItems()}>
+                <For each={ac.acItems()}>
                   {(it, i) => (
                     <button
                       type="button"
                       class="ac-item"
-                      classList={{ active: i() === acIndex() }}
-                      onMouseDown={(e) => { e.preventDefault(); applyAc(it); }}
-                      onMouseEnter={() => setAcIndex(i())}
+                      classList={{ active: i() === ac.acIndex() }}
+                      onMouseDown={(e) => { e.preventDefault(); ac.applyAc(it); }}
+                      onMouseEnter={() => ac.setAcIndex(i())}
                     >
                       <span class="ac-kind" classList={{ [it.kind]: true }}>{it.kind === "command" ? "/" : it.kind === "agent" ? "@" : "⎘"}</span>
                       <span class="ac-label">{it.label}</span>
@@ -2673,10 +2625,10 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
               ref={taRef}
               class="composer-text"
               value={input()}
-              onInput={(e) => (setInput(e.currentTarget.value), setCaret(e.currentTarget.selectionStart ?? 0), (histMode = "none"), (histIdx = -1))}
-              onClick={syncCaret}
-              onKeyUp={syncCaret}
-              onBlur={() => setTimeout(() => setAcItems([]), 150)}
+              onInput={(e) => (setInput(e.currentTarget.value), ac.syncCaret(), (histMode = "none"), (histIdx = -1))}
+              onClick={ac.syncCaret}
+              onKeyUp={ac.syncCaret}
+              onBlur={() => setTimeout(() => ac.dismissAc(), 150)}
               onScroll={(e) => mirrorRef && (mirrorRef.scrollTop = e.currentTarget.scrollTop)}
               onKeyDown={onKeyDown}
               onPaste={(e) => {
