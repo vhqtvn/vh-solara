@@ -27,6 +27,7 @@ const mem: Record<string, string> = {};
 // (no module state), so they can be imported statically and exercised directly.
 import {
   bottommostRead,
+  bottommostReadWithFallback,
   classifyScrollDelta,
   orderAhead,
 } from "../../src/lib/scroll";
@@ -167,6 +168,38 @@ describe("bottommostRead (pure geometry helper)", () => {
 
   it("returns undefined for an empty list", () => {
     expect(bottommostRead([])).toBeUndefined();
+  });
+});
+
+describe("bottommostReadWithFallback (pure geometry helper + scroll-origin fallback)", () => {
+  it("returns the bottommost read-through id when some rows scrolled past the top (Case A)", () => {
+    // Same behavior as bottommostRead when there IS a read-through row.
+    expect(
+      bottommostReadWithFallback([
+        { id: "m1", top: -800 },
+        { id: "m2", top: -400 },
+        { id: "m3", top: 0 }, // pinned at viewport top → counts as read
+        { id: "m4", top: 160 }, // below the top → not read yet
+      ]),
+    ).toBe("m3");
+  });
+
+  it("falls back to rows[0]?.id when nothing scrolled past the top (Case B — scroll-origin)", () => {
+    // All rows still below the viewport top (positive deltas). bottommostRead
+    // returns undefined; the fallback returns the topmost row, which IS visibly
+    // in-view and the correct read anchor. This is the load-bearing case: without
+    // the fallback, no anchor would be written and the read position would be
+    // lost on reopen.
+    expect(
+      bottommostReadWithFallback([
+        { id: "m1", top: 16 }, // +16px (chat-scroll padding) — above the <= 0 threshold
+        { id: "m2", top: 200 },
+      ]),
+    ).toBe("m1");
+  });
+
+  it("returns undefined for an empty list (Case C)", () => {
+    expect(bottommostReadWithFallback([])).toBeUndefined();
   });
 });
 

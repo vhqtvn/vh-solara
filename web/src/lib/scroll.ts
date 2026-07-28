@@ -84,6 +84,22 @@ export function bottommostRead(rows: { id: string; top: number }[]): string | un
   return found;
 }
 
+// bottommostReadWithFallback — bottommostRead plus the scroll-origin fallback
+// that lived as a private closure in ChatView (bottommostReadFromDom). When
+// bottommostRead finds nothing scrolled strictly past the container top (the
+// scroll-origin case: the user scrolled all the way UP, e.g. scrollTop=0, so
+// the first row's top is measured at +16px — .chat-scroll has padding:16px —
+// above the `<= 0` threshold), the first row is visibly in-view and IS the
+// topmost read message, so it must be the anchor. Otherwise no anchor is
+// written, flushReadCursor no-ops, and reopening the session falls through to
+// the bottom-pin branch in maybeRestore (losing the read position + clearing the
+// unread dot for an uncaught-up session). rows[0] is the topmost row (rows are
+// document-ordered and the caller stops the sweep at the first row below the
+// top). Pure: no DOM, no signals — extracted so the fallback has a regression pin.
+export function bottommostReadWithFallback(rows: { id: string; top: number }[]): string | undefined {
+  return bottommostRead(rows) ?? rows[0]?.id;
+}
+
 // Is `cand` ahead of (newer than) the stored read anchor in message order? Drives
 // the monotonic read-cursor guard: the stored anchor only ever advances forward,
 // never backward (scrolling up to re-read never lowers it). A missing/stale

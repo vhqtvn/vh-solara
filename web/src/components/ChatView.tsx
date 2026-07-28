@@ -2,7 +2,7 @@ import { createEffect, createMemo, createSignal, For, Match, on, onCleanup, onMo
 import { Portal } from "solid-js/web";
 import { ackSession, createSession, currentVerb, isSending, loadOlder, markSessionIdle, openSession, rootOf, sessionWorking, setSelectedId, setSending, state } from "../sync";
 import {
-  bottommostRead,
+  bottommostReadWithFallback,
   classifyScrollDelta,
   clearReadAnchor,
   getReadAnchor,
@@ -787,21 +787,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       rows.push({ id: m.id, top });
       if (top > 0) break; // first row below the top ends the sweep
     }
-    const found = bottommostRead(rows);
-    if (found) return found;
-    // Nothing scrolled strictly past the container top. This is the scroll-origin
-    // case: the user scrolled all the way UP (e.g. scrollTop=0) to re-read from
-    // the top. .chat-scroll has `padding: 16px` (styles.css), so the first row's
-    // top is measured at +16px — above the `<= 0` threshold — and bottommostRead
-    // returns undefined. But the first row is visibly in-view and IS the topmost
-    // read message, so it must be the anchor; otherwise no anchor is written,
-    // flushReadCursor no-ops, and reopening the session falls through to the
-    // bottom-pin branch in maybeRestore (losing the read position + clearing the
-    // unread dot for an uncaught-up session). rows[0] is the topmost row (rows
-    // are document-ordered and the sweep stops at the first row below the top).
-    // Only reachable when not at the bottom — flushReadCursor's nearBottom guard
-    // returns before calling this once the tail is back in view.
-    return rows[0]?.id;
+    return bottommostReadWithFallback(rows);
   }
   // Is `cand` ahead of (or equal-and-newer than) the stored anchor in message
   // order? Drives the monotonic guard. A missing/stale stored anchor is treated

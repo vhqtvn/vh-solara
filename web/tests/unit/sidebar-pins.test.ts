@@ -723,6 +723,92 @@ describe("Phase 6 — concurrency + DEFER regressions", () => {
   });
 });
 
+// CAS regression coverage for the rollbackOrderIfUnchanged call sites NOT
+// exercised by DEFER1 above. DEFER1 covered only the 409-retry rollback race
+// (performMembershipMutation L460). The initial-PUT rollback (L509, first-
+// attempt non-409/non-400 failure) and the reorder rollback (L582, first-attempt
+// failure) were uncovered. The guard is identical at every call site:
+// serverRevision() !== issueRevision → no-op (fresher frame won); === →
+// applyServerOrder(baseline) (rollback succeeds). These pin both branches for
+// both uncovered paths.
+describe("rollbackOrderIfUnchanged — CAS regression for initial-PUT + reorder paths", () => {
+  it("initial-PUT membership rollback succeeds when revision is unchanged", async () => {
+    // togglePin on a baseline order; the first PUT fails non-409 (network). No
+    // fresher frame landed during the round-trip, so serverRevision() === baseRev
+    // and the optimistic target rolls back to the pre-mutation baseline.
+    applyPinsSnapshot(pinDoc(1, true, ["a", "b"]));
+    vi.stubGlobal("fetch", vi.fn(() => Promise.reject(new Error("net"))));
+
+    await togglePin("c"); // optimistic ["a","b","c"] → rolled back to baseline
+
+    expect(reconciledPinnedOrder()).toEqual(["a", "b"]); // baseline restored
+    expect(pinsRevision()).toBe(1);
+    expect(pinsLastError()).toBe("pin-network");
+  });
+
+  it("initial-PUT membership rollback is a no-op when a fresher frame landed", async () => {
+    // togglePin issues a PUT that stays pending; a pins.updated frame (rev5)
+    // lands DURING the round-trip and is adopted. The PUT then fails non-409.
+    // serverRevision() (5) !== baseRev (1), so the rollback is skipped and the
+    // fresher frame's order is left intact.
+    applyPinsSnapshot(pinDoc(1, true, ["a", "b"]));
+    let rejectPut!: (e: unknown) => void;
+    vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>((_, rej) => (rejectPut = rej))));
+
+    const p = togglePin("c");
+    await flush(); // optimistic ["a","b","c"] applied; PUT pending
+    expect(reconciledPinnedOrder()).toEqual(["a", "b", "c"]);
+
+    applyPinsUpdated(pinDoc(5, true, ["a", "b", "z"])); // fresher frame adopted
+    expect(pinsRevision()).toBe(5);
+    expect(reconciledPinnedOrder()).toEqual(["a", "b", "z"]);
+
+    rejectPut(new Error("net")); // PUT fails non-409
+    await p;
+
+    expect(reconciledPinnedOrder()).toEqual(["a", "b", "z"]); // NOT rolled back
+    expect(pinsRevision()).toBe(5);
+    expect(pinsLastError()).toBe("pin-network");
+  });
+
+  it("reorder rollback succeeds when revision is unchanged", async () => {
+    // movePinnedTo on a baseline order; the first PUT fails non-409 (network).
+    // No fresher frame landed, so the optimistic reorder rolls back to baseline.
+    applyPinsSnapshot(pinDoc(1, true, ["a", "b", "c"]));
+    vi.stubGlobal("fetch", vi.fn(() => Promise.reject(new Error("net"))));
+
+    await movePinnedTo("c", "a", "before"); // optimistic ["c","a","b"] → rolled back
+
+    expect(reconciledPinnedOrder()).toEqual(["a", "b", "c"]); // baseline restored
+    expect(pinsRevision()).toBe(1);
+    expect(pinsLastError()).toBe("pin-network");
+  });
+
+  it("reorder rollback is a no-op when a fresher frame landed", async () => {
+    // movePinnedTo issues a PUT that stays pending; a pins.updated frame (rev5)
+    // lands DURING the round-trip and is adopted. The PUT then fails non-409.
+    // serverRevision() (5) !== baseRev (1), so the rollback is skipped.
+    applyPinsSnapshot(pinDoc(1, true, ["a", "b", "c"]));
+    let rejectPut!: (e: unknown) => void;
+    vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>((_, rej) => (rejectPut = rej))));
+
+    const p = movePinnedTo("c", "a", "before");
+    await flush(); // optimistic ["c","a","b"] applied; PUT pending
+    expect(reconciledPinnedOrder()).toEqual(["c", "a", "b"]);
+
+    applyPinsUpdated(pinDoc(5, true, ["a", "b", "c", "d"])); // fresher frame adopted
+    expect(pinsRevision()).toBe(5);
+    expect(reconciledPinnedOrder()).toEqual(["a", "b", "c", "d"]);
+
+    rejectPut(new Error("net")); // PUT fails non-409
+    await p;
+
+    expect(reconciledPinnedOrder()).toEqual(["a", "b", "c", "d"]); // NOT rolled back
+    expect(pinsRevision()).toBe(5);
+    expect(pinsLastError()).toBe("pin-network");
+  });
+});
+
 // === S3: proactive drop on archive/delete + audits ============================
 // dropPinnedSession is the LOCAL correction called from the session.delete /
 // prune path when a session is archived or deleted, so a stale pinned id is
