@@ -20,6 +20,7 @@ import {
   treeChildrenOf,
   treeNode,
   treeRoots,
+  treeMap,
   modeOf,
   setNodeMode,
   setNodesMode,
@@ -193,14 +194,20 @@ describe("treeState reactivity (Solid tracking)", () => {
   });
 });
 
-// REGRESSION P0-WEB-001: the deleted proj=1 client sorted every group by
-// time.updated DESC in reduce.ts buildChildrenIndex; that sort was deleted with
-// reduce.ts and never re-implemented in the thin client, so tree=2 roots and
-// children rendered in the server's depth/hydration emit order (looked random).
-// treeRoots()/treeChildrenOf() MUST return newest-updatedMs first. updatedMs is
-// on every TreeNode (treeMap.ts:40), so this is a pure client-side sort with no
-// server change. (The pure rootNodes/childrenIndex in treeMap.ts keep their
-// order-preserving contract; the sort lives here in the reactive accessors.)
+// REGRESSION P0-WEB-001 (SEED recency only): the deleted proj=1 client sorted
+// every group by time.updated DESC in reduce.ts buildChildrenIndex; that sort
+// was deleted with reduce.ts and never re-implemented in the thin client, so
+// tree=2 roots and children rendered in the server's depth/hydration emit order
+// (looked random). That recency order is now applied ONLY AT SEED
+// (seedTreeStore rebuilds presentation rank from updatedMs-DESC); the LIVE
+// re-sort on every updatedMs tick was REMOVED so an actively-streaming session
+// no longer jumps position. Live ordering is driven by the stable activity-edge
+// promotion policy (new insertion -> front; non-working->working -> promote
+// once; reparent -> front; updatedMs-only and working->idle settle hold). The
+// exhaustive crux coverage lives in the "stable activity-edge promotion
+// ordering" block below. (The pure rootNodes/childrenIndex in treeMap.ts keep
+// their order-preserving contract; the recency/promotion sort lives here in the
+// reactive accessors.)
 describe("treeState recency ordering (newest updatedMs first) — P0-WEB-001", () => {
   it("treeRoots() returns root nodes newest-updatedMs first", () => {
     // Seed in a DELIBERATELY NON-recency order so the test fails for the right
@@ -240,16 +247,275 @@ describe("treeState recency ordering (newest updatedMs first) — P0-WEB-001", (
     expect(new Set(ids).size).toBe(3);
   });
 
-  it("recency re-orders live after an upsert bumps a node to newest", () => {
-    // The sort must reflect the live map (version-tracked), not a stale
-    // snapshot: upserting an existing root with a newer updatedMs hoists it.
+  it("an updatedMs-only upsert does NOT re-order (stable promotion policy — live recency re-sort removed)", () => {
+    // Formerly this asserted a CONTINUOUS recency re-sort: upserting an existing
+    // root with a newer updatedMs hoisted it to the front. The new stable
+    // activity-edge promotion policy deliberately does NOT re-sort on
+    // updatedMs-only changes for an existing node — only a new insertion / a
+    // working edge / a reparent re-rank. Full crux coverage is in the
+    // "stable activity-edge promotion ordering" block below.
     seedTreeStore([
       node({ id: "a", updatedMs: 100 }),
       node({ id: "b", updatedMs: 200 }),
     ]);
-    expect(treeRoots().map((n) => n.id)).toEqual(["b", "a"]);
+    expect(treeRoots().map((n) => n.id)).toEqual(["b", "a"]); // seed recency
     applyTreeOpStore({ op: "node.upsert", data: { node: node({ id: "a", updatedMs: 300 }) } });
+    expect(treeRoots().map((n) => n.id)).toEqual(["b", "a"]); // a does NOT jump — stable
+  });
+});
+
+// ---- stable activity-edge promotion ordering --------------------------------
+// Replaces the former CONTINUOUS updatedMs-DESC re-sort. An actively-streaming
+// session no longer jumps position on every updatedMs tick: a node is promoted
+// to the front of its sibling group EXACTLY ONCE (on the non-working -> working
+// edge) and then HOLDS through continued streaming and the working -> idle
+// settle. New insertions enter at the front; reparents reconcile to the front of
+// the new group; seed rebuilds from recency (updatedMs DESC) with NO synthetic
+// activity edge. The pure core treeMap.ts is untouched — the shell accessors
+// sort fresh arrays in place and never mutate the map.
+describe("treeState stable activity-edge promotion ordering", () => {
+  beforeEach(() => {
+    resetTreeStore();
+    resetExpandedForTest();
+  });
+
+  // Helper: sibling index of `id` within its group (roots or a parent's children).
+  function siblingIndexRoots(id: string): number {
+    return treeRoots().findIndex((n) => n.id === id);
+  }
+
+  it("new node inserts at the FRONT of its sibling group (roots)", () => {
+    seedTreeStore([node({ id: "old", updatedMs: 200 }), node({ id: "newer", updatedMs: 100 })]);
+    // Seed recency: old(200) before newer(100).
+    expect(treeRoots().map((n) => n.id)).toEqual(["old", "newer"]);
+    // Upsert a BRAND-NEW root -> enters at the front (despite the lowest updatedMs).
+    applyTreeOpStore({ op: "node.upsert", data: { node: node({ id: "fresh", updatedMs: 50 }) } });
+    expect(treeRoots().map((n) => n.id)).toEqual(["fresh", "old", "newer"]);
+  });
+
+  it("new child inserts at the FRONT of its parent's child group", () => {
+    seedTreeStore([
+      node({ id: "p", childCount: 2 }),
+      node({ id: "c1", parentId: "p", updatedMs: 200 }),
+      node({ id: "c2", parentId: "p", updatedMs: 100 }),
+    ]);
+    expect(treeChildrenOf("p").map((n) => n.id)).toEqual(["c1", "c2"]);
+    applyTreeOpStore({
+      op: "node.children",
+      data: {
+        parentId: "p",
+        nodes: [node({ id: "c3", parentId: "p", updatedMs: 5 })],
+        hasMore: false,
+      },
+    });
+    expect(treeChildrenOf("p").map((n) => n.id)).toEqual(["c3", "c1", "c2"]);
+  });
+
+  it("a children batch inserts at the front PRESERVING arrival order", () => {
+    seedTreeStore([
+      node({ id: "p", childCount: 2 }),
+      node({ id: "old", parentId: "p", updatedMs: 200 }),
+    ]);
+    applyTreeOpStore({
+      op: "node.children",
+      data: {
+        parentId: "p",
+        nodes: [
+          node({ id: "a", parentId: "p", updatedMs: 5 }),
+          node({ id: "b", parentId: "p", updatedMs: 5 }),
+        ],
+        hasMore: false,
+      },
+    });
+    // Batch [a, b] enters at the front in arrival order: a most-front.
+    expect(treeChildrenOf("p").map((n) => n.id)).toEqual(["a", "b", "old"]);
+  });
+
+  it("existing node promotes EXACTLY ONCE on non-working -> working", () => {
+    seedTreeStore([node({ id: "a", updatedMs: 100 }), node({ id: "b", updatedMs: 200 })]);
+    expect(treeRoots().map((n) => n.id)).toEqual(["b", "a"]); // recency baseline
+    // a crosses idle -> busy: promoted to the front (despite the lower updatedMs).
+    applyTreeOpStore({ op: "node.facet", data: { id: "a", activity: "busy" } });
     expect(treeRoots().map((n) => n.id)).toEqual(["a", "b"]);
+    expect(siblingIndexRoots("a")).toBe(0);
+  });
+
+  // ── THE CRUX ──────────────────────────────────────────────────────────────
+  // An existing session that became working is promoted once, then REPEATED
+  // updatedMs upserts while it remains working do NOT change its sibling index,
+  // and the working -> idle settle does NOT trigger a delayed jump. This is the
+  // load-bearing path the whole change exists to prove.
+  it("CRUX: repeated updatedMs upserts while working keep sibling index STABLE; settle does NOT jump", async () => {
+    // b has the HIGHER updatedMs so the OLD continuous sort would put b front.
+    seedTreeStore([node({ id: "a", updatedMs: 100 }), node({ id: "b", updatedMs: 200 })]);
+    expect(treeRoots().map((n) => n.id)).toEqual(["b", "a"]);
+    // Promote a -> working (front). Now a is front DESPITE a lower updatedMs.
+    applyTreeOpStore({ op: "node.facet", data: { id: "a", activity: "busy" } });
+    await flush();
+    expect(treeRoots().map((n) => n.id)).toEqual(["a", "b"]);
+    expect(siblingIndexRoots("a")).toBe(0);
+
+    // Repeated updatedMs upserts while a STAYS working. Each value below is under
+    // b's 200, so the OLD continuous sort would flip back to [b, a] every time.
+    // Under the new policy a holds its front position — no jump per updatedMs tick.
+    for (const ms of [120, 150, 180, 199]) {
+      applyTreeOpStore({ op: "node.upsert", data: { node: busyNode({ id: "a", updatedMs: ms }) } });
+      expect(treeRoots().map((n) => n.id)).toEqual(["a", "b"]);
+      expect(siblingIndexRoots("a")).toBe(0);
+    }
+    // Settle: a -> idle. The working -> idle edge does NOT re-rank (position holds
+    // — no completion-time jump). a's updatedMs is STILL LESS than b's: the loop
+    // above capped at 199 < b's 200, so a is OLDER than b at settle. Under the OLD
+    // continuous updatedMs-DESC sort the order would have flipped to [b, a]; under
+    // the new stable policy a holds its front position. This makes the SETTLE half
+    // of the crux independently discriminating against the old sort.
+    applyTreeOpStore({ op: "node.facet", data: { id: "a", activity: "idle" } });
+    await flush();
+    expect(treeRoots().map((n) => n.id)).toEqual(["a", "b"]);
+    expect(siblingIndexRoots("a")).toBe(0);
+  });
+
+  it("working -> idle settle -> NO delayed jump (index stable) — standalone", async () => {
+    seedTreeStore([node({ id: "a", updatedMs: 100 }), node({ id: "b", updatedMs: 200 })]);
+    applyTreeOpStore({ op: "node.facet", data: { id: "a", activity: "busy" } });
+    await flush();
+    expect(treeRoots().map((n) => n.id)).toEqual(["a", "b"]);
+    applyTreeOpStore({ op: "node.facet", data: { id: "a", activity: "idle" } });
+    await flush();
+    // a stays front — no completion-time jump.
+    expect(treeRoots().map((n) => n.id)).toEqual(["a", "b"]);
+    expect(siblingIndexRoots("a")).toBe(0);
+  });
+
+  it("idle metadata-only updatedMs change does NOT restore continuous timestamp sort", () => {
+    // Two idle roots; b is front by recency. a is idle the whole time.
+    seedTreeStore([node({ id: "a", updatedMs: 100 }), node({ id: "b", updatedMs: 200 })]);
+    expect(treeRoots().map((n) => n.id)).toEqual(["b", "a"]);
+    // Upsert a (still idle) with a MUCH newer updatedMs + a title change — under
+    // the OLD continuous sort a would jump to front ([a, b]); under the new policy
+    // an idle updatedMs-only change does NOT reorder.
+    applyTreeOpStore({
+      op: "node.upsert",
+      data: { node: node({ id: "a", updatedMs: 999, title: "renamed" }) },
+    });
+    expect(treeRoots().map((n) => n.id)).toEqual(["b", "a"]);
+    expect(siblingIndexRoots("a")).toBe(1);
+  });
+
+  it("roots and child groups order INDEPENDENTLY", () => {
+    seedTreeStore([
+      node({ id: "r1", updatedMs: 10 }),
+      node({ id: "r2", updatedMs: 20 }),
+      node({ id: "ca", parentId: "r1", updatedMs: 100 }),
+      node({ id: "cb", parentId: "r1", updatedMs: 200 }),
+      node({ id: "cc", parentId: "r2", updatedMs: 300 }),
+    ]);
+    // Baselines: roots [r2(20), r1(10)]; r1 kids [cb(200), ca(100)]; r2 kids [cc].
+    expect(treeRoots().map((n) => n.id)).toEqual(["r2", "r1"]);
+    expect(treeChildrenOf("r1").map((n) => n.id)).toEqual(["cb", "ca"]);
+    expect(treeChildrenOf("r2").map((n) => n.id)).toEqual(["cc"]);
+    // Promote ca (within r1's group). Only r1's child group reorders; roots and
+    // r2's child group are untouched.
+    applyTreeOpStore({ op: "node.facet", data: { id: "ca", activity: "busy" } });
+    expect(treeChildrenOf("r1").map((n) => n.id)).toEqual(["ca", "cb"]);
+    expect(treeRoots().map((n) => n.id)).toEqual(["r2", "r1"]); // unchanged
+    expect(treeChildrenOf("r2").map((n) => n.id)).toEqual(["cc"]); // unchanged
+  });
+
+  it("deletion removes rank state; re-introduction is treated as NEW (front)", () => {
+    seedTreeStore([node({ id: "a", updatedMs: 100 }), node({ id: "b", updatedMs: 200 })]);
+    applyTreeOpStore({ op: "node.facet", data: { id: "a", activity: "busy" } }); // a promoted -> front
+    expect(treeRoots().map((n) => n.id)).toEqual(["a", "b"]);
+    // Remove a (and its rank).
+    removeTreeNode("a");
+    expect(treeRoots().map((n) => n.id)).toEqual(["b"]);
+    // Re-introduce a as a NEW upsert -> front (its stale rank was cleared, so it
+    // is not stuck in an old position).
+    applyTreeOpStore({ op: "node.upsert", data: { node: node({ id: "a", updatedMs: 100 }) } });
+    expect(treeRoots().map((n) => n.id)).toEqual(["a", "b"]);
+  });
+
+  it("reparenting (node.move) reconciles to the front of the new group; unrelated groups intact", () => {
+    seedTreeStore([
+      node({ id: "a", updatedMs: 10 }),
+      node({ id: "b", updatedMs: 20 }),
+      node({ id: "c", parentId: "a", updatedMs: 5 }),
+      node({ id: "d", parentId: "b", updatedMs: 500 }),
+    ]);
+    // Baselines: a's kids [c]; b's kids [d].
+    expect(treeChildrenOf("a").map((n) => n.id)).toEqual(["c"]);
+    expect(treeChildrenOf("b").map((n) => n.id)).toEqual(["d"]);
+    // Move c from a -> b. c reconciles to the FRONT of b's group.
+    applyTreeOpStore({ op: "node.move", data: { id: "c", newParentId: "b" } });
+    expect(treeChildrenOf("a").map((n) => n.id)).toEqual([]);
+    expect(treeChildrenOf("b").map((n) => n.id)).toEqual(["c", "d"]); // c front, d preserved
+    // Unrelated roots intact.
+    expect(treeRoots().map((n) => n.id)).toEqual(["b", "a"]);
+  });
+
+  it("snapshot seed of an already-working node -> seeded from recency (NO manufactured edge)", () => {
+    // a is WORKING at seed but has the LOWER updatedMs. Under the new policy it is
+    // ordered by recency (NOT promoted to front).
+    seedTreeStore([busyNode({ id: "a", updatedMs: 100 }), node({ id: "b", updatedMs: 200 })]);
+    expect(treeRoots().map((n) => n.id)).toEqual(["b", "a"]); // recency, not working-front
+    expect(siblingIndexRoots("a")).toBe(1);
+  });
+
+  it("deterministic tie-breaking: initial-load ties keep emit order", () => {
+    seedTreeStore([
+      node({ id: "a", updatedMs: 500 }),
+      node({ id: "b", updatedMs: 500 }),
+      node({ id: "c", updatedMs: 500 }),
+    ]);
+    expect(treeRoots().map((n) => n.id)).toEqual(["a", "b", "c"]); // emit order, deterministically
+  });
+
+  it("deterministic tie-breaking: sequential promotions form a deterministic stack (last-promoted most-front)", async () => {
+    seedTreeStore([
+      node({ id: "a", updatedMs: 1 }),
+      node({ id: "b", updatedMs: 1 }),
+      node({ id: "c", updatedMs: 1 }),
+    ]);
+    // Baseline (ties): [a, b, c].
+    expect(treeRoots().map((n) => n.id)).toEqual(["a", "b", "c"]);
+    applyTreeOpStore({ op: "node.facet", data: { id: "a", activity: "busy" } });
+    await flush();
+    expect(treeRoots().map((n) => n.id)).toEqual(["a", "b", "c"]); // a promoted -> front (already front)
+    applyTreeOpStore({ op: "node.facet", data: { id: "b", activity: "busy" } });
+    await flush();
+    expect(treeRoots().map((n) => n.id)).toEqual(["b", "a", "c"]); // b promoted -> front, a second
+    applyTreeOpStore({ op: "node.facet", data: { id: "c", activity: "busy" } });
+    await flush();
+    expect(treeRoots().map((n) => n.id)).toEqual(["c", "b", "a"]); // c front, then b, then a
+  });
+
+  it("returned arrays are fresh each call; sorting does NOT mutate the pure map", () => {
+    seedTreeStore([
+      node({ id: "r1", updatedMs: 10 }),
+      node({ id: "r2", updatedMs: 20 }),
+      node({ id: "c1", parentId: "r1", updatedMs: 100 }),
+      node({ id: "c2", parentId: "r1", updatedMs: 200 }),
+    ]);
+    // Fresh arrays: two calls return DIFFERENT array objects.
+    const roots1 = treeRoots();
+    const roots2 = treeRoots();
+    expect(roots1).not.toBe(roots2);
+    expect(roots1.map((n) => n.id)).toEqual(roots2.map((n) => n.id));
+    const kids1 = treeChildrenOf("r1");
+    const kids2 = treeChildrenOf("r1");
+    expect(kids1).not.toBe(kids2);
+
+    // The pure map's insertion order is unchanged by accessor calls. The shell
+    // sorts FRESH arrays; the map itself is never reordered/mutated.
+    const mapInsertionBefore = [...treeMap().values()].map((n) => n.id);
+    void treeRoots();
+    void treeChildrenOf("r1");
+    void treeRoots();
+    const mapInsertionAfter = [...treeMap().values()].map((n) => n.id);
+    expect(mapInsertionAfter).toEqual(mapInsertionBefore);
+    // And the map still resolves each node by id.
+    expect(treeNode("r1")).toBeDefined();
+    expect(treeNode("c2")?.parentId).toBe("r1");
   });
 });
 

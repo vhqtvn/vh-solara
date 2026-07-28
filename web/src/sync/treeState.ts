@@ -21,6 +21,7 @@ import {
   applyOp,
   childrenIndex,
   collapseNode,
+  loadedDescendants,
   rootNodes,
   seedTree,
   type TreeNode,
@@ -361,6 +362,7 @@ export function resetExpandedForTest(): void {
   setTreeModeMap({});
   setUserToggled(new Set<string>());
   invalidateAutoQueue();
+  clearRankState(); // mirror invalidateAutoQueue: drop stale ranks on test reset
 }
 
 // Test helper: re-run the module-init load against the current localStorage.
@@ -368,6 +370,79 @@ export function resetExpandedForTest(): void {
 // reload (the module initializes once per test file).
 export function rehydrateExpandedForTest(): void {
   setTreeModeMap(loadInitialTreeModes());
+}
+
+// ---- presentation rank (stable activity-edge promotion ordering) ------------
+// Shell-owned ordering key that REPLACES the former continuous updatedMs-DESC
+// re-sort in treeRoots()/treeChildrenOf(). Within a sibling group, nodes are
+// ordered by rank DESC (higher rank => closer to the front). Rank changes ONLY
+// on a small set of meaningful edges:
+//   - seed (seedTreeStore): rebuilt from the snapshot's updatedMs-DESC order —
+//     the recency baseline. A node already working at seed is ordered by
+//     updatedMs like every other node; NO synthetic activity edge is
+//     manufactured (a later op-driven false->true edge still promotes it once).
+//   - new insertion (node.upsert / node.children of a not-yet-resident id): the
+//     node enters at the FRONT of its sibling group.
+//   - a non-working -> working edge (applyTreeOpStore): promoted to the front
+//     EXACTLY ONCE (the branch fires only on the edge itself).
+//   - node.move (reparent): (re)placed at the front of its NEW sibling group.
+// updatedMs-only upserts and the working -> idle settle do NOT change rank, so
+// an actively-streaming session no longer jumps position on every updatedMs
+// tick while still keeping "recent on top" for meaningful activity edges.
+//
+// LIFECYCLE: mirrors invalidateAutoQueue() exactly — rebuilt on seed, cleared on
+// reset (project switch) and test reset — so stale ranks never leak across a
+// snapshot replacement. The pure core treeMap.ts is untouched: rootNodes() /
+// childrenIndex() still return fresh, order-preserving arrays; the shell
+// accessors sort those fresh arrays in place and NEVER mutate the map.
+let rankSeq = new Map<string, number>();
+let rankCounter = 0;
+
+function clearRankState(): void {
+  rankSeq = new Map();
+  rankCounter = 0;
+}
+
+// Rebuild ranks for a freshly-seeded map from its current recency (updatedMs
+// DESC) order. Purely timestamp-driven — working() is deliberately NOT
+// consulted, so a node already working at seed is NOT promoted to the front
+// (no synthetic activity edge). Within every sibling group the resulting
+// rank-DESC order equals updatedMs-DESC with stable (emit-order) tie-breaking,
+// i.e. identical to the former continuous sort AT SEED TIME.
+function rebuildRankState(newMap: TreeFlatMap): void {
+  rankSeq = new Map();
+  rankCounter = 0;
+  // Front-first (updatedMs DESC; Array.prototype.sort is stable so ties keep
+  // emit/insertion order). Assign rank back-to-front so the front node receives
+  // the highest rank (rank-DESC => front-first), reproducing the seed recency
+  // order exactly.
+  const frontFirst = [...newMap.values()].sort((a, b) => b.updatedMs - a.updatedMs);
+  for (let i = frontFirst.length - 1; i >= 0; i--) {
+    rankSeq.set(frontFirst[i].id, ++rankCounter);
+  }
+}
+
+// Place one id at the front of its sibling group (highest rank so far).
+function pushFrontRank(id: string): void {
+  rankSeq.set(id, ++rankCounter);
+}
+
+// Place a batch of ids at the front PRESERVING their forward order (the first id
+// ends up most-front). Used by applyTreeOpStore for the set of new / promoted /
+// reparented ids within a single op. Reverse-iterates so forward order maps to
+// rank-DESC front-to-back.
+function pushFrontRankBatch(ids: string[]): void {
+  for (let i = ids.length - 1; i >= 0; i--) pushFrontRank(ids[i]);
+}
+
+// Sort comparator for the shell accessors: rank DESC, then (defensively, for a
+// node that somehow has no rank) updatedMs DESC, then stable. Ranked nodes
+// always sort ahead of unranked ones.
+function rankCompareDesc(a: TreeNode, b: TreeNode): number {
+  const ra = rankSeq.get(a.id) ?? Number.NEGATIVE_INFINITY;
+  const rb = rankSeq.get(b.id) ?? Number.NEGATIVE_INFINITY;
+  if (ra !== rb) return rb - ra;
+  return b.updatedMs - a.updatedMs;
 }
 
 // ---- tracked accessors ------------------------------------------------------
@@ -390,26 +465,29 @@ export function treeNode(id: string): TreeNode | undefined {
 
 export function treeRoots(): TreeNode[] {
   void version();
-  // Newest-first (P0-WEB-001): the deleted proj=1 client sorted every group by
-  // time.updated DESC in reduce.ts buildChildrenIndex; that sort was lost when
-  // reduce.ts was removed. Re-implement it here on the reactive accessor so the
-  // sidebar renders newest-first. The pure `rootNodes`/`childrenIndex` in
-  // treeMap.ts keep their order-preserving (insertion/emit) contract so any
-  // future caller can still get emit order; the recency sort lives here in these
-  // shell accessors only. rootNodes() returns a fresh array each call, so this
-  // sorts in place without mutating the map. updatedMs is on every TreeNode
-  // (treeMap.ts:40). Stable sort: ties keep emit/insertion order.
-  return rootNodes(map).sort((a, b) => b.updatedMs - a.updatedMs);
+  // Stable activity-edge promotion ordering: roots are ordered by shell-owned
+  // presentation rank (rank DESC) instead of a continuous updatedMs-DESC
+  // re-sort. Rank changes only on meaningful edges (new insertion -> front,
+  // non-working->working promote once, reparent -> front) and is rebuilt from
+  // recency on seed — see the "presentation rank" section above. This keeps
+  // "recent on top" for meaningful activity edges while an actively-streaming
+  // session no longer jumps on every updatedMs tick. rootNodes() returns a fresh
+  // array each call, so this in-place sort does NOT mutate the map; the pure
+  // `rootNodes`/`childrenIndex` in treeMap.ts keep their order-preserving
+  // (insertion/emit) contract so any future caller can still get emit order.
+  return rootNodes(map).sort(rankCompareDesc);
 }
 
 // Direct children of `parentId` (grouped by parentId, §7.3 render grouping).
 export function treeChildrenOf(parentId: string): TreeNode[] {
   void version();
-  // Newest-first — see treeRoots() above (P0-WEB-001). childrenIndex() builds a
-  // fresh array per call, so sorting it in place is safe. Pinned children are
-  // filtered out by the caller (SessionTree.tsx) before render, so this does
-  // NOT touch pin order (pins come from selectPinnedNodes, not this accessor).
-  return (childrenIndex(map).get(parentId) ?? []).sort((a, b) => b.updatedMs - a.updatedMs);
+  // Stable activity-edge promotion ordering — see treeRoots() above. Applies
+  // INDEPENDENTLY to each parent's child group. childrenIndex() builds a fresh
+  // array per call, so sorting it in place is safe and does NOT mutate the map.
+  // Pinned children are filtered out by the caller (SessionTree.tsx) before
+  // render, so this does NOT touch pin order (pins come from selectPinnedNodes,
+  // not this accessor).
+  return (childrenIndex(map).get(parentId) ?? []).sort(rankCompareDesc);
 }
 
 // ---- mutators ---------------------------------------------------------------
@@ -476,6 +554,7 @@ export function seedTreeStore(nodes: TreeNode[]): void {
   map = newMap;
   setNodeModes(changes); // no-op (no write, no notify) if changes is empty
   invalidateAutoQueue();
+  rebuildRankState(newMap); // rebuild presentation rank from recency (no synthetic edge)
   bump();
 }
 
@@ -509,8 +588,17 @@ export function applyTreeOpStore(op: TreeOp): void {
   const affectedIds = affectedIdsOfOp(op);
   const before = new Map<string, TreeNode | undefined>();
   for (const id of affectedIds) before.set(id, map.get(id));
+  // Capture the ids a node.remove will drop (the node + its loaded descendants)
+  // BEFORE applyOp so presentation ranks can be cleaned up afterwards (deletion
+  // reconcile). For every other op this is empty.
+  const removeIds: string[] = op.op === "node.remove" ? loadedDescendants(map, op.data.id) : [];
   applyOp(map, op);
   const syncChanges = new Map<string, TreeMode>();
+  // Collect ids that (re)enter at the FRONT of their sibling group this op: new
+  // insertions and non-working->working promotion edges. Reparent (node.move) is
+  // reconciled below. Assigned in one batch after the loop so a multi-id op
+  // (e.g. node.children) preserves arrival order at the front.
+  const frontPromotions: string[] = [];
   for (const id of affectedIds) {
     const after = map.get(id);
     if (!after) continue; // removed by the op (e.g. node.remove) — no transition
@@ -528,7 +616,18 @@ export function applyTreeOpStore(op: TreeOp): void {
         if (target === "filtered") {
           enqueueAutoModeCandidate(id, persisted, curWorking, target);
         }
+        // RANK: a non-working -> working edge promotes the node to the front of
+        // its group EXACTLY ONCE (this branch fires only on the edge itself).
+        // The working -> idle settle deliberately does NOT re-rank here, so the
+        // node's position HOLDS through the settle (no completion-time jump).
+        if (!prevWorking && curWorking) {
+          frontPromotions.push(id);
+        }
       }
+    } else {
+      // RANK: a newly-inserted node (not resident before this op) enters at the
+      // FRONT of its sibling group.
+      frontPromotions.push(id);
     }
     // ABSOLUTE invariant: an idle resident node is NEVER in "filtered".
     // Synchronously collapse before callers observe post-op state. Covers
@@ -540,6 +639,16 @@ export function applyTreeOpStore(op: TreeOp): void {
       syncChanges.set(id, "collapsed");
     }
   }
+  // RANK: reparent (node.move) reconciles by (re)placing the moved node at the
+  // front of its new sibling group. (A node.move does not change the node's own
+  // working(), so it is never caught by the edge branch above.)
+  if (op.op === "node.move" && map.has(op.data.id)) {
+    frontPromotions.push(op.data.id);
+  }
+  if (frontPromotions.length > 0) pushFrontRankBatch(frontPromotions);
+  // RANK: clean up presentation ranks for ids dropped by node.remove (deletion
+  // reconcile) so a later re-introduction is treated as a fresh front insertion.
+  for (const id of removeIds) rankSeq.delete(id);
   if (syncChanges.size > 0) setNodeModes(syncChanges); // ONE signal + ONE LS write
   bump();
 }
@@ -567,7 +676,9 @@ function affectedIdsOfOp(op: TreeOp): string[] {
 // of ghosting for a frame. Same semantics as node.remove (§7.2): drops the node
 // and every loaded descendant rooted at it.
 export function removeTreeNode(id: string): void {
+  const removeIds = loadedDescendants(map, id); // node + loaded descendants
   applyOp(map, { op: "node.remove", data: { id } });
+  for (const rid of removeIds) rankSeq.delete(rid); // deletion rank reconcile
   bump();
 }
 
@@ -584,7 +695,15 @@ export function removeTreeNode(id: string): void {
 // kept resident so the Pinned group keeps rendering them after an ancestor
 // collapse (pin-parity fix). Passed through to the pure collapseNode.
 export function collapseTreeNode(id: string, protectedIds?: ReadonlySet<string>): void {
+  const all = loadedDescendants(map, id); // [id, ...loaded descendants]
   collapseNode(map, id, protectedIds);
+  // Clean up presentation ranks for the dropped descendants (the placeholder id
+  // and protected/pinned descendants stay resident, so keep their ranks).
+  for (const rid of all) {
+    if (rid === id) continue;
+    if (protectedIds?.has(rid)) continue;
+    rankSeq.delete(rid);
+  }
   bump();
 }
 
@@ -618,5 +737,6 @@ export function resetTreeStore(): void {
   saveVersioned(LS_MODE, 1, {});
   setUserToggled(new Set<string>());
   invalidateAutoQueue(); // drop any candidates from the prior project/session-tree
+  clearRankState(); // drop stale ranks from the prior project/session-tree
   bump();
 }

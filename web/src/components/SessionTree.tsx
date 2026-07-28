@@ -62,8 +62,9 @@ function TreeBranch(props: {
   // reveal exactly one path child without a manual expand.
   selectedAncestors: () => Set<string>;
 }) {
-  // Resident direct children (recency-sorted, pinned-dedup'd) — these STAY in
-  // the flat map regardless of display mode (instant re-expand, no round-trip).
+  // Resident direct children (stable activity-edge ordered via treeChildrenOf,
+  // pinned-dedup'd) — these STAY in the flat map regardless of display mode
+  // (instant re-expand, no round-trip).
   const residentChildren = () =>
     treeChildrenOf(props.node.id).filter((c) => !props.pinnedIds().has(c.id));
 
