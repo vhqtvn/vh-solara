@@ -91,6 +91,31 @@
   font-size: 13px;
 }
 
+/* F-SHAPE-B safety net: placeholder shown where a COMPLETED assistant message's
+   parts would render, while zero parts are resident — the residual hydration
+   window (parts not yet served) or a fetch failure. Without it the message head
+   renders over an empty .msg-parts (a silent "completed, 0 parts" message).
+   Pending = muted spinner + label; failed (data-failed="true") = danger-tinted
+   hint so a failed hydration is explicit, never an infinite silent spinner.
+   Deliberately cheap CSS (no backdrop-filter / mask-image / contain — see
+   AGENTS.md "Web frontend performance" for the chat-surface GPU constraints). */
+.msg-partless {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 4px;
+  color: var(--fg-dim);
+  font-size: 13px;
+  line-height: 1.4;
+}
+.msg-partless[data-failed="true"] {
+  color: var(--danger-fg);
+}
+.msg-partless .msg-partless-glyph {
+  font-size: 14px;
+  line-height: 1;
+}
+
 /* In-stream wrapper for the active pending-input surfaces. Renders as the LAST
    item inside .chat-content (the chat-stream content container), not as a fixed
    bottom strip — so there is no `max-height: 40%` clamp and no separate overflow

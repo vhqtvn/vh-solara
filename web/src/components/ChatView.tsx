@@ -160,7 +160,15 @@ function groupParts(m: any): RenderItem[] {
 // Renders one message's parts. Memoizes the render-items and REUSES the wrapper
 // object for an unchanged key, so the row components persist across streaming
 // tokens (no flashing/jumping) and update reactively via the in-place part refs.
-function MessageParts(props: { m: any; isLastMessage: () => boolean; lastActivityKey: () => string | null }) {
+function MessageParts(props: {
+  m: any;
+  isLastMessage: () => boolean;
+  lastActivityKey: () => string | null;
+  // F-SHAPE-B: session-level hydration failed (state.messagesError[sid]). Drives
+  // the failed variant of the partless placeholder so a failed hydration is
+  // EXPLICIT (an error hint) rather than an infinite loading spinner.
+  failed: () => boolean;
+}) {
   let cache = new Map<string, RenderItem>();
   const items = createMemo(() => {
     const fresh = groupParts(props.m);
@@ -176,21 +184,59 @@ function MessageParts(props: { m: any; isLastMessage: () => boolean; lastActivit
   const settled = () => props.m.info.role === "user" || !!props.m.info.time?.completed;
   const tailId = () =>
     !settled() && props.isLastMessage() ? props.m.partOrder[props.m.partOrder.length - 1] : null;
+  // F-SHAPE-B UX safety net for S5: a COMPLETED assistant message with ZERO
+  // resident renderable parts. This is the residual hydration window the S5
+  // primary (daemon-side parts-serving) cannot fully close — the brief fetch
+  // gap before parts arrive, OR a real fetch failure. Without this guard the
+  // message head (role/model/time/cost) renders over an EMPTY .msg-parts: a
+  // silent "completed, 0 parts" message. The predicate is shape-based and
+  // independent of the Go-side mechanism:
+  //   - assistant + time.completed  → the turn finished, so it SHOULD have parts
+  //   - items().length === 0        → none are resident yet (or fetch failed)
+  //   - no per-message model error  → model-level errors are already surfaced
+  //                                  via .msg-error; don't double-indicate.
+  // Excludes user messages (always resident) and in-flight assistant turns
+  // (completed falsy → a live stream shows its own active affordances).
+  const partless = () =>
+    props.m.info.role === "assistant" &&
+    !!props.m.info.time?.completed &&
+    !messageError(props.m.info) &&
+    items().length === 0;
   return (
-    <For each={items()}>
-      {(it) =>
-        it.kind === "activity" ? (
-          <ActivityGroup
-            parts={it.parts}
-            settled={settled()}
-            tailId={tailId()}
-            isLast={it.parts[0]?.id === props.lastActivityKey()}
-          />
-        ) : (
-          <PartView part={it.part} settled={settled()} tail={it.part.id === tailId()} />
-        )
-      }
-    </For>
+    <>
+      <Show when={partless()}>
+        <div
+          class="msg-partless"
+          role="status"
+          aria-live="polite"
+          data-failed={props.failed() ? "true" : "false"}
+        >
+          <Show
+            when={!props.failed()}
+            fallback={<span class="msg-partless-glyph" aria-hidden="true">⚠</span>}
+          >
+            <Spinner size={12} />
+          </Show>
+          <span class="msg-partless-text">
+            {props.failed() ? "Message failed to load" : "Loading message\u2026"}
+          </span>
+        </div>
+      </Show>
+      <For each={items()}>
+        {(it) =>
+          it.kind === "activity" ? (
+            <ActivityGroup
+              parts={it.parts}
+              settled={settled()}
+              tailId={tailId()}
+              isLast={it.parts[0]?.id === props.lastActivityKey()}
+            />
+          ) : (
+            <PartView part={it.part} settled={settled()} tail={it.part.id === tailId()} />
+          )
+        }
+      </For>
+    </>
   );
 }
 
@@ -2485,6 +2531,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
                     m={m}
                     isLastMessage={() => i() === messages().length - 1}
                     lastActivityKey={lastActivityKey}
+                    failed={messageFailed}
                   />
                 </Deferred>
                 <Show when={messageError(m.info)}>
