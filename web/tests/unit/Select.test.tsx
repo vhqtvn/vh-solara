@@ -215,3 +215,53 @@ describe("Select — keyboard navigation (WCAG 2.1.1 / APG Listbox Collapsible)"
     foreign.remove();
   });
 });
+
+// The mobile sheet branch (a centered .vh-select-overlay) is gated behind
+// isMobile(), which reads matchMedia("(max-width: 640px)").matches — undefined in
+// jsdom, so the branch never renders and its onClick handler (which mirrors the
+// desktop scrim's focus-restore: setOpen(false); btn?.focus()) went unexercised.
+// Stub matchMedia to report a mobile viewport to cover the belt-and-suspenders
+// focus-restore contract on the mobile path too.
+describe("Select — mobile sheet (matchMedia reports a mobile viewport)", () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  function stubMobile() {
+    vi.stubGlobal("matchMedia", (query: string) => ({
+      matches: query === "(max-width: 640px)",
+      media: query,
+      onchange: null,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      addListener: () => {},
+      removeListener: () => {},
+      dispatchEvent: () => false,
+    }));
+  }
+
+  it("renders the mobile overlay (not the desktop scrim) on a mobile viewport", async () => {
+    stubMobile();
+    const { trigger, isOpen } = setup();
+    await fireEvent.click(trigger());
+    await waitFor(() => expect(isOpen()).toBe(true));
+    expect(document.querySelector(".vh-select-overlay")).toBeTruthy();
+    expect(document.querySelector(".vh-select-scrim")).toBeNull();
+  });
+
+  it("clicking the mobile overlay closes the sheet and restores focus to the trigger", async () => {
+    stubMobile();
+    const { trigger, isOpen } = setup();
+    trigger().focus();
+    await fireEvent.click(trigger());
+    await waitFor(() => expect(isOpen()).toBe(true));
+
+    const overlay = document.querySelector(".vh-select-overlay") as HTMLElement;
+    expect(overlay).toBeTruthy();
+    fireEvent.click(overlay);
+
+    await waitFor(() => expect(isOpen()).toBe(false));
+    expect(document.activeElement).toBe(trigger());
+  });
+});
