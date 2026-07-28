@@ -11,37 +11,31 @@
 //     (it pairs Stream1's connect(true) with Stream2's openSessionStream on the
 //     outermost busy release).
 //
-// A thin re-export shim (below) remains for TWO reasons, both of which make a
-// symbol load-bearing on this facade:
+// A thin re-export shim (below) remains for ONE reason, which makes each of its
+// symbols load-bearing on this facade:
 //   (a) the namespace-import integration tests that load this module via
 //       `await import("../../src/sync/stream")` and reference symbols as
-//       `stream.<x>` (the C4 / liveness / backoff / periodic-resync suite);
-//   (b) the reverse-dependency edges from the (already-extracted) sibling
-//       modules — health / tree-transport / session-stream still import a few
-//       symbols THROUGH this facade (e.g. health imports connect +
-//       markAuthoritativeRecovery; tree-transport imports applySessionEvent +
-//       refreshOpenSessions). Those edges were NOT re-pointed to the owning
-//       siblings in this slice (the extracted modules are out of scope), so the
-//       facade must keep re-exporting them. Every symbol kept is annotated with
-//       which reason (a)/(b) holds it; removing one requires re-pointing the
-//       named consumer first.
+//       `stream.<x>` (the C4 / liveness / backoff / periodic-resync suite).
+// The reverse-dependency edges that previously held symbols here (health /
+// tree-transport / session-stream importing reducers / refresh /
+// periodic-resync / tree-transport symbols THROUGH this facade) have all been
+// re-pointed to the owning siblings, so every remaining shim symbol is held by
+// (a) only.
 import { setState, selectedId } from "./store";
 import { setReconcileFn } from "../busy";
 
 // === Re-export shim =========================================================
+// Every symbol below is held by reason (a) — the namespace-import integration
+// tests resolve them as `stream.<x>`. The per-group notes name which suite
+// references each.
 // tree-transport (Stream 1 lifecycle + the C4 coherent-capture barrier).
-//   connect / isTreeSnapshotDecoding / getTreeSnapshotDecode / _markTreeSeenForTest
-//   → (a) namespace tests (coherentBarrier / coveredAwait / expandTreeNodeC4 /
-//        stream1Registration / stream1Backoff / treeStreamCompression / etc.)
-//   connect / expandTreeNode → (a) namespace tests (expandTreeNodeC4)
-//   isTreeClosed / getTreeLastSeen / getTreeContentSeen
-//   → (b) ./health imports them from this facade (watchdog transport-stale branch).
+//   connect / expandTreeNode / isTreeSnapshotDecoding / getTreeSnapshotDecode /
+//   _markTreeSeenForTest → (a) namespace tests (coherentBarrier / coveredAwait /
+//     expandTreeNodeC4 / stream1Registration / stream1Backoff /
+//     treeStreamCompression / etc.).
 import {
   connect,
   expandTreeNode,
-  getTreeLastSeen,
-  getTreeContentSeen,
-  isTreeClosed,
   isTreeSnapshotDecoding,
   getTreeSnapshotDecode,
   _markTreeSeenForTest,
@@ -56,38 +50,21 @@ import { openSessionStream, closeSessionStream, getSesGen } from "./session-stre
 //   watchdogTick / maybeReconnect → (a) namespace tests (sessionLiveness /
 //     treeLivenessContentStall / sessionLivenessContentStall).
 import { watchdogTick, maybeReconnect } from "./health";
-// reducers (store reducers).
-//   applySnapshot / applySessionEvent / applyMessageEvent
-//   → (b) ./tree-transport + ./session-stream import them from this facade
-//        (the reverse-dependency edge: the stream listeners apply frames through
-//        these reducers).
-import { applySnapshot, applySessionEvent, applyMessageEvent } from "./reducers";
 // periodic-resync (Q6 conditional drift self-heal).
 //   TREE_RESYNC_PERIODIC_INTERVAL_MS / startPeriodicResync /
 //   _setLastAuthoritativeRecoveryForTest / _getPeriodicResyncStatsForTest
 //   → (a) namespace tests (coherentBarrier reset-after-recovery assertions).
-//   markAuthoritativeRecovery / resolvePeriodicDiff
-//   → (b) ./health + ./tree-transport import them from this facade.
 import {
   TREE_RESYNC_PERIODIC_INTERVAL_MS,
-  markAuthoritativeRecovery,
   startPeriodicResync,
-  resolvePeriodicDiff,
   _setLastAuthoritativeRecoveryForTest,
   _getPeriodicResyncStatsForTest,
 } from "./periodic-resync";
-// refresh (warm-tree-reconnect message refresh).
-//   refreshOpenSessions → (b) ./tree-transport imports it from this facade
-//   (called after a tree reconnect: `void refreshOpenSessions()`).
-import { refreshOpenSessions } from "./refresh";
 
 export {
   // tree-transport
   connect,
   expandTreeNode,
-  getTreeLastSeen,
-  getTreeContentSeen,
-  isTreeClosed,
   isTreeSnapshotDecoding,
   getTreeSnapshotDecode,
   _markTreeSeenForTest,
@@ -98,19 +75,11 @@ export {
   // health
   watchdogTick,
   maybeReconnect,
-  // reducers
-  applySnapshot,
-  applySessionEvent,
-  applyMessageEvent,
   // periodic-resync
   TREE_RESYNC_PERIODIC_INTERVAL_MS,
-  markAuthoritativeRecovery,
   startPeriodicResync,
-  resolvePeriodicDiff,
   _setLastAuthoritativeRecoveryForTest,
   _getPeriodicResyncStatsForTest,
-  // refresh
-  refreshOpenSessions,
 };
 
 // === Shared stale threshold ================================================

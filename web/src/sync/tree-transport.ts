@@ -13,23 +13,23 @@
 // Stream 1 live handlers). These two paths are one indivisible invariant — the
 // single-await ordering proof — and move together.
 //
-// Cross-module seams (deliberate, minimal — typed SYNCHRONOUS callbacks from
-// ./stream, the reducer/refresh facade):
-//   - applySnapshot           — detail projection reducer (snapshot reduction)
-//   - applySessionEvent       — session structural-event reducer (session reduction)
-//   - applyMessageEvent       — message/part/activity/perm/q reducer (message reduction)
-//   - refreshOpenSessions     — warm-tree-reconnect message refresh (refresh coordination)
-//   - recordLatency           — shared tree+session L1 stamp helper
+// Cross-module seams (deliberate, minimal — typed SYNCHRONOUS callbacks):
+//   - applySnapshot           — detail projection reducer (from ./reducers)
+//   - applySessionEvent       — session structural-event reducer (from ./reducers)
+//   - applyMessageEvent       — message/part/activity/perm/q reducer (from ./reducers)
+//   - refreshOpenSessions     — warm-tree-reconnect message refresh (from ./refresh)
+//   - recordLatency           — shared tree+session L1 stamp helper (from ./stream)
 //   - getExpectTreeSnap / setExpectTreeSnap / maybeResolveReconcile
 //                              — the busy-gate "expected tree snapshot" handshake
-//                                (the flag STAYS in ./stream, paired with
-//                                expectSessionSnap by reconcileBusy; this module
-//                                peeks/pokes it through accessors so the
-//                                handshake stays a single-owner mutation surface
-//                                — mirrors the established expectSessionSnap seam)
+//                                (from ./stream; the flag STAYS in ./stream,
+//                                paired with expectSessionSnap by reconcileBusy;
+//                                this module peeks/pokes it through accessors so
+//                                the handshake stays a single-owner mutation
+//                                surface — mirrors the established
+//                                expectSessionSnap seam)
 //   - markAuthoritativeRecovery / resolvePeriodicDiff
-//                              — periodic-resync attribution (periodic machinery
-//                                STAYS in ./stream; this module reports the
+//                              — periodic-resync attribution (from
+//                                ./periodic-resync; this module reports the
 //                                coherent-install + tree-apply boundary)
 //
 // treeGen ownership decision: treeGen MOVES here. It was bumped only by connect()
@@ -49,10 +49,13 @@
 // between the gen recheck and the reducer breaks it.
 //
 // No top-level side effects: only `let` / `const` / function declarations. The
-// stream ↔ tree-transport import cycle (stream imports connect etc.; tree-
-// transport imports applySnapshot etc.) is TDZ-safe — every cross-module read
-// happens inside listener/C4/reducer bodies at runtime, never at module-eval
-// time. The only top-level side effect in ./stream (setReconcileFn(reconcileBusy))
+// stream ↔ tree-transport import cycle (stream imports connect etc. from tree-
+// transport; tree-transport imports recordLatency + the expectTreeSnap
+// accessors from stream) is TDZ-safe — every cross-module read happens inside
+// listener/C4/reducer bodies at runtime, never at module-eval time. (The
+// reducers/refresh/periodic-resync symbols this module also consumes are
+// imported directly from their owning siblings and are not part of that cycle.)
+// The only top-level side effect in ./stream (setReconcileFn(reconcileBusy))
 // passes a hoisted function reference; it does not call connect at eval time.
 import { batch } from "solid-js";
 import type { Snapshot } from "../types";
@@ -73,17 +76,17 @@ import { seedTreeStore, applyTreeOpStore, expandedButUnloadedIds } from "./treeS
 import type { TreeOp, TreeNode } from "./treeMap";
 import { applyPinsSnapshot, applyPinsUpdated } from "../sidebar";
 import { decodeSnapshot } from "./decode";
+import { applySnapshot, applySessionEvent, applyMessageEvent } from "./reducers";
+import { refreshOpenSessions } from "./refresh";
 import {
-  applySnapshot,
-  applySessionEvent,
-  applyMessageEvent,
-  refreshOpenSessions,
+  markAuthoritativeRecovery,
+  resolvePeriodicDiff,
+} from "./periodic-resync";
+import {
   recordLatency,
   getExpectTreeSnap,
   setExpectTreeSnap,
   maybeResolveReconcile,
-  markAuthoritativeRecovery,
-  resolvePeriodicDiff,
 } from "./stream";
 
 let es: EventSource | null = null;

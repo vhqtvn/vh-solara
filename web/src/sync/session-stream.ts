@@ -8,7 +8,7 @@
 // and the open/close lifecycle (openSessionStream / closeSessionStream).
 //
 // Cross-module seams (deliberate, minimal):
-//   - applyMessageEvent (from ./stream): the reducer. Called with
+//   - applyMessageEvent (from ./reducers): the reducer. Called with
 //     trackCursor=false — LOAD-BEARING (Stream 2 must NEVER advance Stream 1's
 //     shared resume cursor; regresses the "busy session shows idle" class if
 //     violated). See invariant audit §3e.
@@ -52,8 +52,8 @@ import {
   markPageDirty,
   isPageDirtyingKind,
 } from "./history";
+import { applyMessageEvent } from "./reducers";
 import {
-  applyMessageEvent,
   recordLatency,
   getExpectSessionSnap,
   setExpectSessionSnap,

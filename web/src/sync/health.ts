@@ -7,14 +7,16 @@
 // (STALE_MS is imported — it is shared with ./stream's periodicResyncShouldRun;
 // CONTENT_STALE_MS / TREE_RESYNC_MIN_GAP_MS live here).
 //
-// connect() STAYS in ./stream — it is the Stream 1 (tree) lifecycle owner and
-// is deeply coupled to the tree EventSource + the C4 coherent barrier. This
-// module only DECIDES when to (re)connect and delegates the actual reconnect to
-// connect() (Stream 1) / openSessionStream() (Stream 2).
+// connect() lives in ./tree-transport — it is the Stream 1 (tree) lifecycle
+// owner and is deeply coupled to the tree EventSource + the C4 coherent barrier.
+// This module only DECIDES when to (re)connect and delegates the actual
+// reconnect to connect() (Stream 1) / openSessionStream() (Stream 2).
 //
 // Cross-module seams (deliberate, minimal — read-only peeks, never mutation):
-//   From ./stream:  connect(fresh?), isTreeClosed(), getTreeLastSeen(),
-//                   getTreeContentSeen(), markAuthoritativeRecovery(), STALE_MS.
+//   From ./tree-transport: connect(fresh?), isTreeClosed(), getTreeLastSeen(),
+//                          getTreeContentSeen().
+//   From ./periodic-resync: markAuthoritativeRecovery().
+//   From ./stream:  STALE_MS.
 //   From ./session-stream: openSessionStream(id, force?), getSesId(),
 //                          isSessionClosed(), getSessionLastSeen(),
 //                          getSessionContentSeen().
@@ -29,14 +31,9 @@
 import { createSignal } from "solid-js";
 import { log } from "../lib/log";
 import { state, setState, projectDir } from "./store";
-import {
-  connect,
-  isTreeClosed,
-  getTreeLastSeen,
-  getTreeContentSeen,
-  markAuthoritativeRecovery,
-  STALE_MS,
-} from "./stream";
+import { connect, isTreeClosed, getTreeLastSeen, getTreeContentSeen } from "./tree-transport";
+import { markAuthoritativeRecovery } from "./periodic-resync";
+import { STALE_MS } from "./stream";
 import {
   openSessionStream,
   getSesId,
