@@ -210,7 +210,26 @@ func (a *Aggregator) EnsureMessages(ctx context.Context, sessionID string) error
 		// and emitting an empty batch to satisfy ordering would reintroduce
 		// state after session.delete (Finding 3). The session is gone; the
 		// client tears it down on session.deleted.
-		if status == state.ColdBatchEmitted || status == state.ColdBatchWarmReconcile {
+		// Emit completion ONLY when a batch was published (cold) or it was a
+		// genuine warm reconcile (no batch required) AND the resident-parts
+		// gate IsMessagesLoaded now holds. The gate (msgLoaded && resident) is
+		// the SAME signal the snapshot's GateFacts.MessagesLoaded exposes, so
+		// the client's messages.loaded (which flips its messagesLoaded=true)
+		// can never disagree with the gate: a fetch that left a completed
+		// assistant with zero resident parts (the S5 envelope-only shape) does
+		// NOT emit loaded — the client stays in the loading state and the next
+		// open re-fetches, instead of being told "delivered" with no parts
+		// (the gate↔emit divergence b-F1). A cold fetch for a session that was
+		// deleted between reconcile and capture, or a packaging failure,
+		// publishes NO batch — emitting loaded here would deliver
+		// messages.loaded with no preceding messages.batch (one-batch-before-
+		// loaded ordering), and emitting an empty batch to satisfy ordering
+		// would reintroduce state after session.delete. When the session is
+		// gone the client tears it down on session.deleted (Finding 3). On a
+		// successful warm reconcile with zero changed deltas the loaded event
+		// is still emitted (resident holds) so the client exits the loading
+		// state.
+		if (status == state.ColdBatchEmitted || status == state.ColdBatchWarmReconcile) && a.store.IsMessagesLoaded(sessionID) {
 			a.store.EmitMessagesLoaded(sessionID, fetchMs, reconcileMs)
 		}
 		return nil
@@ -357,16 +376,21 @@ func (a *Aggregator) EnsureMessagesAsync(ctx context.Context, sessionID string) 
 		status := a.store.SetSessionMessages(sessionID, decodeMessages(items))
 		reconcileMs := time.Since(tR).Milliseconds()
 		// Emit completion ONLY when a batch was published (cold) or it was a
-		// genuine warm reconcile (no batch required). A cold fetch for a session
-		// that was deleted between reconcile and capture, or a packaging
-		// failure, publishes NO batch — emitting loaded here would deliver
-		// messages.loaded with no preceding messages.batch (one-batch-before-
-		// loaded ordering), and emitting an empty batch to satisfy ordering
-		// would reintroduce state after session.delete. When the session is
-		// gone the client tears it down on session.deleted (Finding 3). On a
-		// successful warm reconcile with zero changed deltas the loaded event is
-		// still emitted so the client exits the loading state.
-		if status == state.ColdBatchEmitted || status == state.ColdBatchWarmReconcile {
+		// genuine warm reconcile (no batch required) AND the resident-parts
+		// gate IsMessagesLoaded now holds — the SAME signal the snapshot gate
+		// exposes, so the client's messages.loaded never disagrees with the
+		// gate (b-F1: a fetch that left a completed assistant with zero
+		// resident parts must NOT tell the client "delivered"). A cold fetch
+		// for a session that was deleted between reconcile and capture, or a
+		// packaging failure, publishes NO batch — emitting loaded here would
+		// deliver messages.loaded with no preceding messages.batch
+		// (one-batch-before-loaded ordering), and emitting an empty batch to
+		// satisfy ordering would reintroduce state after session.delete. When
+		// the session is gone the client tears it down on session.deleted
+		// (Finding 3). On a successful warm reconcile with zero changed deltas
+		// the loaded event is still emitted (resident holds) so the client
+		// exits the loading state.
+		if (status == state.ColdBatchEmitted || status == state.ColdBatchWarmReconcile) && a.store.IsMessagesLoaded(sessionID) {
 			a.store.EmitMessagesLoaded(sessionID, fetchMs, reconcileMs)
 		}
 	}()

@@ -240,8 +240,14 @@ type snapSessionCap struct {
 	currentVerbTool   string
 	currentVerbState  json.RawMessage // copy of se.currentVerb.State
 	// Existence facts read from store-level maps.
-	msgLoaded    bool   // s.msgLoaded[sid]
-	hasMessages  bool   // s.messages[sid] != nil
+	msgLoaded   bool // s.msgLoaded[sid]
+	hasMessages bool // s.messages[sid] != nil
+	// msgResident is the source-derived counterpart of msgLoaded: the result of
+	// latestAssistantResidentLocked(sid) (true unless the newest COMPLETED
+	// assistant has zero resident parts). The gate's MessagesLoaded is
+	// msgLoaded && msgResident, so it can never report loaded with zero parts on
+	// a completed message. See IsMessagesLoaded / latestAssistantResidentLocked.
+	msgResident  bool   // s.latestAssistantResidentLocked(sid)
 	hasQuestions bool   // len(s.questions[sid]) > 0
 	hasPerms     bool   // len(s.perms[sid]) > 0
 	permBlocked  bool   // s.permBlocked[sid]
@@ -462,6 +468,7 @@ func (s *Store) captureSnapshotLocked(messagesFor map[string]bool) snapshotCaptu
 			currentVerbTool:   se.currentVerb.Tool,
 			currentVerbState:  append([]byte(nil), se.currentVerb.State...),
 			msgLoaded:         s.msgLoaded[sid],
+			msgResident:       s.latestAssistantResidentLocked(sid),
 			hasMessages:       s.messages[sid] != nil,
 			hasQuestions:      len(s.questions[sid]) > 0,
 			hasPerms:          len(s.perms[sid]) > 0,
@@ -652,11 +659,14 @@ func (s *Store) materializeSnapshot(c snapshotCapture) Snapshot {
 			// session after a restart can't be distinguished from in-flight
 			// without this.
 			Hydrated: sc.msgLoaded || sc.hasMessages,
-			// MessagesLoaded is the STRICT "full history fetched" memo
-			// (msgLoaded), independent of whether live message.* events have
-			// populated a partial messages[sid] entry. See the
-			// GateFacts.MessagesLoaded doc for why it is distinct from Hydrated.
-			MessagesLoaded:         sc.msgLoaded,
+			// MessagesLoaded is the STRICT "full history fetched AND resident"
+			// gate, derived from BOTH the msgLoaded fetch memo AND the actual
+			// resident parts (msgResident). It can NEVER be true when the newest
+			// completed assistant has zero resident parts — that state triggers an
+			// open-path re-fetch instead of lying "loaded". Mirrors the busyCount
+			// retirement (c4c4ef1): derive from source, not the latch alone. See
+			// IsMessagesLoaded / latestAssistantResidentLocked.
+			MessagesLoaded:         sc.msgLoaded && sc.msgResident,
 			LastAssistantCompleted: sc.hasAssistant && sc.lastAsstCompleted,
 			LastAssistantEmpty:     sc.lastAsstEmpty,
 			FinishReason:           sc.lastFinish,
@@ -934,11 +944,47 @@ func (s *Store) Replay(cursor uint64) (events []ClientEvent, head uint64, ok boo
 	return s.ring.since(cursor, s.seq)
 }
 
-// IsMessagesLoaded reports whether a session's history has been fetched.
+// IsMessagesLoaded reports whether a session's history has been fetched AND the
+// resident parts are consistent with a completed assistant turn. It DERIVES from
+// the actual resident parts (latestAssistantResidentLocked), not the msgLoaded
+// latch alone: a completed assistant message with zero resident parts is treated
+// as NOT loaded so the open path re-fetches and the daemon actually serves the
+// parts. This is the S5 contract fix — the latch alone could report loaded with
+// zero parts (the systemic steady state for finished sessions), blocking the
+// re-fetch forever. Mirrors the busyCount retirement (c4c4ef1): derive from
+// source, do not trust a cached flag.
 func (s *Store) IsMessagesLoaded(sid string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.msgLoaded[sid]
+	return s.msgLoaded[sid] && s.latestAssistantResidentLocked(sid)
+}
+
+// latestAssistantResidentLocked is the source-of-truth derivation the gate's
+// MessagesLoaded field and the open-path IsMessagesLoaded read INSTEAD of the
+// msgLoaded latch. It reports whether the session's resident parts are consistent
+// with a completed assistant turn: false when the newest COMPLETED assistant
+// message has zero resident parts. A real completed turn always carries ≥1 part
+// (reasoning / step / text / tool), so zero parts is the signature of unfetched
+// or lost parts — exactly the state the latch papered over. An in-progress
+// assistant (parts still streaming), no assistant message, or no message state at
+// all all return true (vacuously resident — nothing is provably missing). Caller
+// holds s.mu (RLock is sufficient; read-only).
+func (s *Store) latestAssistantResidentLocked(sid string) bool {
+	sm := s.messages[sid]
+	if sm == nil {
+		return true
+	}
+	for i := len(sm.order) - 1; i >= 0; i-- {
+		me := sm.byID[sm.order[i]]
+		if me == nil || me.role != "assistant" {
+			continue
+		}
+		if !me.completed {
+			return true // in-progress: parts still streaming — not provably missing
+		}
+		return len(me.parts) > 0
+	}
+	return true // no assistant message
 }
 
 // SessionIDs returns the ids of the LIVE (active) sessions in this store's

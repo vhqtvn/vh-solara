@@ -1161,8 +1161,14 @@ func TestGateMessagesLoadedVsHydrated(t *testing.T) {
 	if g := s.Snapshot(nil).Gate["a"]; !g.Hydrated || g.MessagesLoaded {
 		t.Fatalf("live-only session: want Hydrated=true MessagesLoaded=false, got %+v", g)
 	}
-	// A history fetch (the lazy hydration path) flips MessagesLoaded.
-	s.SetSessionMessages("a", nil)
+	// A history fetch (the lazy hydration path) flips MessagesLoaded. The fetch
+	// brings the completed assistant's PARTS (a real turn always carries ≥1) —
+	// under the resident-parts contract, loaded requires the parts to be present,
+	// not just the msgLoaded latch.
+	s.SetSessionMessages("a", []MessageWithParts{{
+		Info:  json.RawMessage(`{"id":"m1","sessionID":"a","role":"assistant","time":{"created":1,"completed":2},"finish":"stop"}`),
+		Parts: []json.RawMessage{json.RawMessage(`{"id":"p1","type":"text","text":"hi"}`)},
+	}})
 	if g := s.Snapshot(nil).Gate["a"]; !g.Hydrated || !g.MessagesLoaded {
 		t.Fatalf("after SetSessionMessages: want Hydrated=true MessagesLoaded=true, got %+v", g)
 	}

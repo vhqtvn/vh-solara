@@ -511,7 +511,7 @@ func TestHydrate_MsgRevConsistent(t *testing.T) {
 		map[string][]MessageWithParts{
 			"R": {
 				{Info: json.RawMessage(`{"id":"m1","sessionID":"R","role":"user"}`)},
-				{Info: json.RawMessage(`{"id":"m2","sessionID":"R","role":"assistant","time":{"completed":1700000000}}`)},
+				{Info: json.RawMessage(`{"id":"m2","sessionID":"R","role":"assistant","time":{"completed":1700000000}}`), Parts: []json.RawMessage{json.RawMessage(`{"id":"p2","type":"text","text":"ok"}`)}},
 			},
 		},
 	)
@@ -546,7 +546,7 @@ func TestHydrate_MsgRevConsistent(t *testing.T) {
 		map[string][]MessageWithParts{
 			"R": {
 				{Info: json.RawMessage(`{"id":"m1","sessionID":"R","role":"user"}`)},
-				{Info: json.RawMessage(`{"id":"m2","sessionID":"R","role":"assistant","time":{"completed":1700000000}}`)},
+				{Info: json.RawMessage(`{"id":"m2","sessionID":"R","role":"assistant","time":{"completed":1700000000}}`), Parts: []json.RawMessage{json.RawMessage(`{"id":"p2","type":"text","text":"ok"}`)}},
 				{Info: json.RawMessage(`{"id":"m3","sessionID":"R","role":"user"}`)}, // new message
 			},
 		},

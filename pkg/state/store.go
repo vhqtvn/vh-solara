@@ -197,10 +197,15 @@ type GateFacts struct {
 	// known", NOT "in-flight". A coordinator should force-hydrate (open) the
 	// session, or trust `activity`, before relying on those fields (§1.7).
 	Hydrated bool `json:"hydrated"`
-	// MessagesLoaded reports strictly whether this session's FULL message
-	// history has been fetched (the msgLoaded memo) — NOT "do we have any
-	// message state at all". It is the gate-side counterpart of the lazy-async
-	// hydration completion (the messages.loaded event / EnsureMessagesAsync).
+	// MessagesLoaded reports whether this session's FULL message history has
+	// been fetched AND the resident parts are consistent with a completed
+	// assistant turn (msgLoaded && resident parts) — NOT "do we have any
+	// message state at all". The resident-parts conjunct is the S5 contract
+	// fix: it can NEVER be true when the newest completed assistant has zero
+	// resident parts (the signature of unfetched/lost parts). See
+	// IsMessagesLoaded / latestAssistantResidentLocked. It is the gate-side
+	// counterpart of the lazy-async hydration completion (the messages.loaded
+	// event / EnsureMessagesAsync).
 	//
 	// Distinct from Hydrated (above), which is "we have message state (live
 	// events OR a history hydrate)" and conflates partial-exists with
@@ -215,8 +220,9 @@ type GateFacts struct {
 	// (Record<string,boolean>). They are DIFFERENT facts that happen to share a
 	// name by design (the FE map mirrors this gate field per connected client):
 	//   - server gate GateFacts.MessagesLoaded = "the daemon fetched this
-	//     session's full history" (the msgLoaded memo, set by the aggregator's
-	//     background fetch).
+	//     session's full history AND the resident parts are consistent" (the
+	//     msgLoaded memo AND latestAssistantResidentLocked, so it can never
+	//     report loaded with zero parts on a completed message).
 	//   - FE SyncState.messagesLoaded[id] = "Stream 2 has DELIVERED the real
 	//     message list for this session to THIS client" (set from the snapshot
 	//     gate, when true, OR from a messages.loaded event).
