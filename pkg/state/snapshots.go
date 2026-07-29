@@ -344,7 +344,8 @@ func projectPartCaptured(pc snapPartCap) json.RawMessage {
 //     will read into locals (snapSessionCap / snapPartCap / snapMessageCap plus
 //     the per-session byte-slice maps). All json.RawMessage bytes are COPIED so
 //     the locals never alias store-owned backing arrays. This is the ONLY span
-//     that holds the read lock. computeSubtreeBusyLocked also runs here; its
+//     that holds the read lock. The subtreeBusy projection is built here by
+//     reading the maintained subtreeBusyCount index per node; its
 //     self-contained result map is kept whole.
 //
 //  2. MATERIALIZE after s.mu.RUnlock: build the Snapshot struct purely from the
@@ -444,12 +445,18 @@ func (s *Store) captureSnapshotLocked(messagesFor map[string]bool) snapshotCaptu
 
 	epoch := s.epoch
 	seq := s.seq
-	// subtreeBusy is a self-contained map[string]bool from computeSubtreeBusyLocked
-	// (it allocates its own maps internally and returns a fresh one); safe to keep
-	// whole and read post-RUnlock. The walk is ALWAYS global even when scoped: a
-	// selected session's subtree_busy depends on its descendants, which may be
-	// unselected.
-	subtreeBusy := s.computeSubtreeBusyLocked()
+	// subtreeBusy is the per-node projection of the maintained subtreeBusyCount
+	// index — the SINGLE production source of the subtree-busy fact (L-05
+	// collapse: count > 0 → busy). Built here by reading the index per node
+	// (O(1) lookup each) instead of an independent O(n) tree recompute; the
+	// index already aggregates each node's whole subtree, so a selected
+	// session's subtree_busy correctly reflects its (possibly unselected)
+	// descendants. Safe to keep whole and read post-RUnlock: it is a fresh
+	// map[string]bool of value copies, aliasing nothing in the store.
+	subtreeBusy := make(map[string]bool, len(s.sessions))
+	for id := range s.sessions {
+		subtreeBusy[id] = s.subtreeBusyCount[id] > 0
+	}
 
 	// Per-session scalar facts (Gate / LastAgents / CurrentVerbs / Sessions).
 	sessions := make(map[string]snapSessionCap, len(s.sessions))
@@ -823,6 +830,18 @@ var snapshotMaterializeHook func()
 // subtree (including itself) is busy or retry — the gate's "no busy descendant"
 // fact, so a coordinator needn't walk the tree itself. O(n) via memoized
 // post-order over the parent links. Caller holds s.mu.
+//
+// TEST / REFERENCE ONLY (L-05 collapse). Production no longer calls this: the
+// snapshot/gate projection (captureSnapshotLocked) and SendableNow read the
+// maintained subtreeBusyCount index (count > 0 → busy), the single source of
+// the subtree-busy fact. This recompute survives as the differential reference
+// for the standing/property checks — TestSnapshotGateReadsSubtreeIndex
+// cross-checks the gate value against it. Its {Busy,Retry} classification and
+// s.sessions iteration must stay in lockstep with the index's
+// subtreeBusySelfLocked (both exclude ActivityError — the error-activity
+// carve-out). Do NOT reintroduce a production caller: that would resurrect the
+// redundant-derived dual authority (two sources of one fact, agreeing only by
+// convention) that L-05 collapses.
 func (s *Store) computeSubtreeBusyLocked() map[string]bool {
 	children := map[string][]string{}
 	for id, se := range s.sessions {
@@ -876,7 +895,10 @@ func (s *Store) SendableNow(sid string) (sendable bool, activitySeq uint64, exis
 	if act == "" {
 		act = ActivityIdle
 	}
-	subtreeBusy := s.computeSubtreeBusyLocked()[sid]
+	// subtreeBusy reads the maintained index (single production source of the
+	// subtree-busy fact, L-05 collapse) instead of recomputing the whole tree
+	// to answer one node.
+	subtreeBusy := s.subtreeBusyCount[sid] > 0
 	inflight := se.hasAssistant && !se.lastAsstCompleted
 	sendable = act == ActivityIdle &&
 		!subtreeBusy &&
