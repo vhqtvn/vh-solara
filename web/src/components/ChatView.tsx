@@ -65,6 +65,7 @@ import { MessageParts, groupParts } from "./chat/MessageParts";
 import { createComposerAutocomplete } from "./chat/createComposerAutocomplete";
 import { createPromptHistory } from "./chat/createPromptHistory";
 import { createComposerPaste } from "./chat/createComposerPaste";
+import { createQueueSync } from "./chat/createQueueSync";
 
 const draftKey = (sid: string) => "vh.draft." + sid;
 
@@ -1594,65 +1595,23 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     isSending,
     onResolved: (id) => void fetchQueue(id),
   });
-  // Fires on busy→idle (turn finished) and on opening an idle session that still
-  // has a queue (its turn finished while elsewhere). Reads queue length + working
-  // reactively; the guards above keep it single-flight. pendingCount counts only
-  // items the FE may still dispatch (pending) — dispatching/terminal items stay
-  // visible but don't re-trigger a drain.
-  createEffect(() => {
-    void props.sessionId;
-    const idle = !working();
-    const items = !props.draft ? queueFor(props.sessionId) : [];
-    const pending = items.filter((q) => q.state === "pending").length;
-    if (idle && pending > 0) queueMicrotask(() => void queueDrainer.drain());
-  });
-  // Pull-based sync: refresh the selected session's queue on open, on stream
-  // reconnect (status live-after-reconnecting), on window focus/visibility, and
-  // poll ~5s while the selected session has any queue state. Correctness never
-  // depends on a push channel (/vh/stream is a reconnect trigger only).
-  createEffect(() => {
-    const id = props.sessionId;
-    if (props.draft || !id) return;
-    // Session open: migrate any legacy local queue into the backend, then fetch.
-    void (async () => {
-      await migrateLegacyQueue(id);
-      void fetchQueue(id);
-    })();
-  });
-  createEffect(() => {
-    // Reconnect trigger: when the stream goes live after a reconnect, refresh.
-    const st = state.status;
-    void st; // track status transitions
-    if (st === "live" && !props.draft && props.sessionId) {
-      void fetchQueue(props.sessionId);
-    }
-  });
-  let pollTimer: ReturnType<typeof setInterval> | undefined;
-  createEffect(() => {
-    const id = props.sessionId;
-    const has = !props.draft && id ? hasQueueState(id) : false;
-    // Restart the poll whenever the has-state signal changes.
-    clearInterval(pollTimer);
-    pollTimer = undefined;
-    if (has) {
-      pollTimer = setInterval(() => {
-        if (!props.draft && props.sessionId && document.visibilityState === "visible") {
-          void fetchQueue(props.sessionId);
-        }
-      }, 5000);
-    }
-  });
-  onMount(() => {
-    const onFocus = () => {
-      if (!props.draft && props.sessionId) void fetchQueue(props.sessionId);
-    };
-    window.addEventListener("focus", onFocus);
-    document.addEventListener("visibilitychange", onFocus);
-    onCleanup(() => {
-      window.removeEventListener("focus", onFocus);
-      document.removeEventListener("visibilitychange", onFocus);
-      clearInterval(pollTimer);
-    });
+  // C7: the queue-synchronization effects (drain-trigger on busy→idle + idle-
+  // open-with-queue, session-open migrate+fetch, stream-reconnect refresh, the
+  // ~5s poll while there is queue state, and the focus/visibility refresh +
+  // cleanup) are extracted to ./chat/createQueueSync so they can be exercised
+  // in isolation. Side-effect-only — it returns nothing; the queue-rendering
+  // JSX below reads the cache directly from ../queue. The drainer itself stays
+  // here (above); this factory only arms it via the `drain` dep.
+  createQueueSync({
+    sessionId: () => props.sessionId,
+    draft: () => !!props.draft,
+    working,
+    streamStatus: () => state.status,
+    queueFor,
+    hasQueueState,
+    migrateLegacyQueue,
+    fetchQueue,
+    drain: () => queueDrainer.drain(),
   });
 
   // POST a prompt/shell command and decide success WITHOUT waiting out the whole
