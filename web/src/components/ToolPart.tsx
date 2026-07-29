@@ -114,7 +114,7 @@ export function ToolPart(props: { part: Part; tail?: boolean }) {
   const state = () => (props.part.state || {}) as ToolState;
   const tool = () => (props.part.tool as string | undefined) ?? "";
   const status = () => state().status ?? "";
-  // Live duration timer — mirrors ReasoningPart's elapsed() (see ~line 590):
+  // Live duration timer — mirrors ReasoningPart's elapsed() (see ReasoningPart in Part.tsx):
   // while the tool is running (status "running", a real start, no end yet) the
   // slot ticks once a second; once `end` lands it falls back to durationText()'s
   // sub-second-precise final value. The interval is per-row (cheap at 1fps — the
@@ -199,7 +199,7 @@ export function ToolPart(props: { part: Part; tail?: boolean }) {
   // stays stable across tokens (the row itself already persists in place via
   // upsertPart). Hidden when idle — nothing to flag — mirroring the session
   // tree. (Aliased `state as syncState` because this module's local `state` is
-  // the tool part's own state accessor at line 369.)
+  // the tool part's own state accessor — the local `state` accessor defined above.)
   const childStatus = createMemo<"none" | "error" | "needs-input" | "working" | "idle">(() => {
     const id = subId();
     if (!id) return "none";

@@ -780,7 +780,7 @@ today the hydrate / status-reconcile path stamps `activity=now`, which forces a
 full load after restart and seeds the demotion churn. The new model seeds a
 node's `activity`/`updatedMs` from the session's real last-activity
 (`Session.time.updated` / `subtreeNewestActivity`). The stamping site is now
-verified: `pkg/aggregator/aggregator.go:773`
+verified: `pkg/aggregator/reconciliation.go`
 (`runStatusReconcile` periodic tick → `a.store.SetActivityFromStatuses`) and
 `:848` (the `hydrate` path → `a.store.SetActivityFromStatuses`, inside the
 `run("SessionStatuses", ...)` goroutine at `:843`). That call descends to
@@ -890,8 +890,8 @@ ops are:
   the matching `node.upsert{flags:{archived:true}}`.
 
 **Cadence.** The tick runs on the same kind of periodic-ticker as
-`runStatusReconcile` (`pkg/aggregator/aggregator.go:755`; the existing
-`/session/status` reconcile at `:773`). A conservative default cadence (e.g.
+`runStatusReconcile` (`pkg/aggregator/reconciliation.go`; the existing
+`/session/status` reconcile tick). A conservative default cadence (e.g.
 a few seconds) bounds the worst-case ghost/window visibility; the tick is cheap
 (a flat-list diff against an in-memory map), so it can run frequently. Every
 corrective op carries a `seq` (§4.1/INV-A) and therefore flows through the
@@ -1201,7 +1201,7 @@ per-symbol detail.
 - `pkg/state/store.go` — the resurrect-tombstone guard (`isRecentlyArchivedLocked`
   `:2089`/`upsertSessionLocked` `:1935`/`setActivityLocked` `:1429`) is REUSED by
   the §6.2 reconcile `node.upsert`-refresh branch (do not re-implement).
-- (O1 RESOLVED — was "Open O1") `pkg/aggregator/aggregator.go:773` (status
+- (O1 RESOLVED — was "Open O1") `pkg/aggregator/reconciliation.go` (status
   reconcile tick) and `:848` (hydrate) → `pkg/state/store.go:1703`
   `SetActivityFromStatuses` → `:1421` `setActivityLocked` captures
   `now := time.Now()` (`:1446`) and writes `lastActivityAt[id]=now`
@@ -1350,7 +1350,7 @@ Repo test lanes (AGENTS.md): Go co-located unit in `pkg/`, Go integration in
   orphan check re-checks ONLY the newly-rooted children; sibling orphan status
   is unaffected by a delete, and any drift is caught by the §6.2 reconcile tick.
 - **O1 — RESOLVED & REMOVED (§6 §note A).** The `activity=now` stamp site is
-  verified: `pkg/aggregator/aggregator.go:773` (`runStatusReconcile`) and
+  verified: `pkg/aggregator/reconciliation.go` (`runStatusReconcile`) and
   `:848` (`hydrate`) → `pkg/state/store.go:1703` `SetActivityFromStatuses` →
   `:1421` `setActivityLocked` captures `now := time.Now()` (`:1446`) and writes
   `lastActivityAt[id]=now` via `touchActivityTimeLocked`. Phase 2 replaces the

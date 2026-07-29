@@ -7,13 +7,16 @@
 // analogous Stream1 path (es.onerror → treeGen++ → cancelPendingOwner →
 // setTimeout(connect, backoff) → backoff*=2 cap 15s) had NO dedicated test.
 // This file closes that gap and ALSO pins the C-F2 gen-token-bump invariant:
-// after onerror, every listener registered on the pre-error ES is inert (the
-// entry-guard `if (gen !== treeGen) return;` drops the stale callback BEFORE
-// any state effect — no decode starts, no clock refresh, no store mutation).
+// after onerror, every entry-guarded listener (tree.snapshot + detail-snapshot)
+// registered on the pre-error ES is inert (the entry-guard
+// `if (gen !== treeGen) return;` drops the stale callback BEFORE any state
+// effect — no decode starts, no clock refresh, no store mutation).
 //
-// Stream1 backoff starts at 1000ms (stream.ts:977) — NOT 1500ms like Stream2.
-// onopen resets it to 1000 (stream.ts:2247); onerror reads the current value
-// for the reconnect timer, then doubles it (capped at 15s, stream.ts:2283-4).
+// Stream1 backoff starts at 1000ms (tree-transport.ts, the `backoff`
+// initializer) — NOT 1500ms like Stream2. onopen resets it to 1000
+// (tree-transport.ts, `es.onopen`); onerror reads the current value for the
+// reconnect timer, then doubles it (capped at 15s, tree-transport.ts,
+// `es.onerror`).
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 
 // ---------------------------------------------------------------------------

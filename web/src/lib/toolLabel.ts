@@ -44,7 +44,7 @@ export function toolVerb(tool: string): string {
 }
 
 // The slice of a tool part's `state` we read here. Typed locally so this leaf
-// stays independent of the component-side ToolState definition in Part.tsx.
+// stays independent of the component-side ToolState definition in ToolPart.tsx.
 interface ToolStateLike {
   input?: Record<string, unknown> | null;
   time?: { start?: number; end?: number } | null;

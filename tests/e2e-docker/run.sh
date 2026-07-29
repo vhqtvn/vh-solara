@@ -275,7 +275,7 @@ C_STREAM=$(mktemp)
 # Open a long-lived tree=2 stream: it captures the cold snapshot (victim is now
 # `known` to this connection), then we raw-DELETE the victim row directly in
 # opencode SQLite, bypassing the app so NO session.deleted event fires. The
-# reconcile ticker (TreeReconcileInterval=5s) is the only path that can evict
+# reconcile ticker (tree reconcile ticker, 5s default) is the only path that can evict
 # the resulting ghost -> it emits node.remove for known ids.
 ( curl -fsS -N --max-time 25 "${BASE}/vh/stream?tree=2" > "$C_STREAM" 2>/dev/null & )
 sleep 2  # let the stream subscribe + receive its cold snapshot

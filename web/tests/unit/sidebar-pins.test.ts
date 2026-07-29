@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 //
 // Phase 5: server-backed pin facade. These tests cover the SERVER-mode path of
-// sidebar.ts (the legacy localStorage path is covered by sidebar.test.ts and is
+// pins.ts (the legacy localStorage path is covered by sidebar.test.ts and is
 // unchanged). The server path is activated by the first pins.snapshot frame;
 // pin/unpin/reorder then go through PUT /vh/pins with one bounded 409 retry for
 // membership intents and no auto-replay for reorder.
@@ -848,7 +848,7 @@ describe("dropPinnedSession — proactive local drop on archive/delete", () => {
   });
 });
 
-// Audit: applyPinsUpdated's revision-monotonicity guard (sidebar.ts F1) must
+// Audit: applyPinsUpdated's revision-monotonicity guard (pins.ts F1) must
 // NOT drop a removal-only update at rev+1. The guard only drops STRICTLY-older
 // revisions; equal/never are allowed. A server-side pin removal (archive) fans
 // out as pins.updated at rev+1 with the id absent — the client must adopt it

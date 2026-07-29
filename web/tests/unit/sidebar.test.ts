@@ -9,7 +9,7 @@ import {
   __resetPinnedForTest,
 } from "../../src/pins";
 
-// The pinned order model lives in sidebar.ts alongside the membership set. The
+// The pinned order model lives in pins.ts alongside the membership set. The
 // set is the source of truth for membership; the order array only governs the
 // display order within the pinned group. These tests cover the reconciliation
 // invariant, the pin/unpin append/remove behavior, drag reorder persistence,
