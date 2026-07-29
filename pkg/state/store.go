@@ -225,15 +225,16 @@ type GateFacts struct {
 	// "deliver the transcript / stop showing the loading state" decision on
 	// MessagesLoaded, not Hydrated.
 	//
-	// NAMING: this Go field serializes to JSON `"messagesLoaded"`, the SAME
-	// spelling as the FE's web/src/sync/store.ts SyncState.messagesLoaded map
-	// (Record<string,boolean>). They are DIFFERENT facts that happen to share a
-	// name by design (the FE map mirrors this gate field per connected client):
+	// NAMING: this Go field serializes to JSON `"messagesLoaded"` and is
+	// preserved as-is on the wire. The FE client-side state map that mirrors it
+	// per connected client was renamed to SyncState.messagesDelivered (commit
+	// 87784ab) to distinguish client-DELIVERED state from the wire gate fact.
+	// The two are intentionally DISTINCT names now:
 	//   - server gate GateFacts.MessagesLoaded = "the daemon fetched this
 	//     session's full history AND the resident parts are consistent" (the
 	//     msgLoaded memo AND latestAssistantResidentLocked, so it can never
 	//     report loaded with zero parts on a completed message).
-	//   - FE SyncState.messagesLoaded[id] = "Stream 2 has DELIVERED the real
+	//   - FE SyncState.messagesDelivered[id] = "Stream 2 has DELIVERED the real
 	//     message list for this session to THIS client" (set from the snapshot
 	//     gate, when true, OR from a messages.loaded event).
 	MessagesLoaded         bool   `json:"messagesLoaded"`
@@ -573,9 +574,11 @@ type Store struct {
 	// finished-unread trigger from this index), upsertSessionLocked +
 	// Hydrate's direct assign (create/reparent), deleteSessionLocked (delete) —
 	// so a Snapshot/SendableNow / RunningRoots read is O(1) per node instead of
-	// an O(n) computeSubtreeBusyLocked recompute. ADDITIVE prototype origin: the
-	// snapshot path still calls computeSubtreeBusyLocked unchanged; this index
-	// is proven equivalent by TestSubtreeBusyCountProperty (random-mutation
+	// an O(n) computeSubtreeBusyLocked recompute. This index is the SOLE
+	// production authority for subtree-busy: the snapshot capture, the gate
+	// wire value, and SendableNow all read subtreeBusyCount[id] > 0 (the M1
+	// collapse retired the dual authority). It is proven equivalent to the
+	// former O(n) recompute by TestSubtreeBusyCountProperty (random-mutation
 	// differential vs an independent O(n) recompute), and TestBusyEquivalence_*
 	// pins that RunningRoots (derived from it) agrees with per-session activity
 	// across every terminal transition. Entries exist ONLY for live sessions
@@ -586,10 +589,10 @@ type Store struct {
 	// Phase 1 (Gate C extension): the remaining 7 incremental subtree indexes
 	// the collapsed-frontier projection (O1) reads to build roots + active
 	// closure + frontier stubs in O(|roots|+|closure|×depth+|frontier|) instead
-	// of O(n). ADDITIVE in Phase 1: the snapshot path
-	// (computeSubtreeBusyLocked / Snapshot / SendableNow) is UNCHANGED — these
-	// indexes coexist with the prototype and are proven equivalent to an
-	// independent O(n) recompute by TestSubtreeIndexesProperty.
+	// of O(n). The snapshot path (Snapshot / SendableNow) reads subtreeBusyCount
+	// and these indexes directly — they are the production authority (the M1
+	// collapse retired the dual authority), proven equivalent to an independent
+	// O(n) recompute by TestSubtreeIndexesProperty.
 	// See subtree_indexes.go for the per-index invariants + maintenance sites.
 	//
 	// Topology: children[parentID] = ordered live direct-child ids; children[""]
@@ -923,8 +926,9 @@ func (s *Store) rootOfLocked(id string) string {
 // --- incremental subtreeBusyCount maintenance (Gate C de-risk prototype) ---
 //
 // These helpers maintain s.subtreeBusyCount incrementally. The reference is
-// computeSubtreeBusyLocked (O(n) recompute, UNCHANGED — the snapshot path still
-// calls it). The invariant each helper preserves:
+// computeSubtreeBusyLocked (O(n) recompute, now test/reference-only — the
+// production snapshot capture, gate wire value, and SendableNow read this
+// index directly). The invariant each helper preserves:
 //
 //	subtreeBusyCount[id] == (1 if activity[id] is busy/retry else 0)
 //	                     + Σ subtreeBusyCount[child] for each live child of id

@@ -16,11 +16,12 @@
 //   - subtreeDescendantCount         (sum; stub descendantCount)
 //   - recentBucket                   (bucket; active-closure seed)
 //
-// ADDITIVE in Phase 1: the snapshot path (computeSubtreeBusyLocked / Snapshot /
-// SendableNow) is UNCHANGED. These indexes coexist with the
-// prototype and are proven equivalent to an independent O(n) recompute by
-// TestSubtreeIndexesProperty (random-mutation differential, mirroring
-// subtree_busy_test.go). The projection itself lands in Phase 4.
+// Production authority after the M1 collapse: the snapshot capture, gate wire
+// value, and SendableNow read subtreeBusyCount (and these 7 indexes) directly
+// — computeSubtreeBusyLocked is now test/reference-only. They are proven
+// equivalent to an independent O(n) recompute by TestSubtreeIndexesProperty
+// (random-mutation differential, mirroring subtree_busy_test.go). The
+// projection itself lands in Phase 4.
 //
 // Maintenance sites (grep-verified COMPLETE, mirroring the prototype):
 //   - setActivityLocked  — busy-state chokepoint; also covers message-stream
