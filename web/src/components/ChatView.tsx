@@ -18,7 +18,6 @@ import { activeAgent, agentForSession, agents, selectAgentForSession, selectedAg
 import { claimQueued, enqueue, fetchQueue, hasQueueState, migrateLegacyQueue, queueFor, queueMode, removeQueued, resolveQueued } from "../queue";
 import { createQueueDrainer } from "../queueDrain";
 import { pushHistory } from "../history";
-import { harvestPastedFiles } from "../lib/paste";
 import {
   effectiveInline,
   modelHasVision,
@@ -65,6 +64,7 @@ import { agentLabel, costLabel, messageError, modelLabel, roleLabel } from "./ch
 import { MessageParts, groupParts } from "./chat/MessageParts";
 import { createComposerAutocomplete } from "./chat/createComposerAutocomplete";
 import { createPromptHistory } from "./chat/createPromptHistory";
+import { createComposerPaste } from "./chat/createComposerPaste";
 
 const draftKey = (sid: string) => "vh.draft." + sid;
 
@@ -1097,96 +1097,28 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     draft: () => !!props.draft,
     onApplied: () => hist.resetHistory(),
   });
-
-
-  // Paste clipboard text into the composer. For mobile / no-physical-keyboard
-  // where ⌘/Ctrl+V isn't handy; image/file paste still goes through the
-  // textarea's onPaste. Reads via the async Clipboard API (needs a user gesture
-  // + permission — the tap/hold is the gesture); silently no-ops if
-  // denied/unsupported.
-  //   - "replace": overwrite the whole composer (the plain tap)
-  //   - "insert":  insert at the caret, replacing any selection (long-press)
-  async function pasteFromClipboard(mode: "replace" | "insert") {
-    let text = "";
-    try {
-      text = (await navigator.clipboard?.readText()) ?? "";
-    } catch {
-      taRef?.focus(); // permission denied / unsupported — leave the field focused so ⌘V works
-      return;
-    }
-    if (!text) {
-      taRef?.focus();
-      return;
-    }
-    let pos: number;
-    if (mode === "replace") {
-      setInput(text);
-      pos = text.length;
-    } else {
-      const cur = input();
-      const start = taRef?.selectionStart ?? cur.length;
-      const end = taRef?.selectionEnd ?? cur.length;
-      const before = cur.slice(0, start);
-      setInput(before + text + cur.slice(end));
-      pos = before.length + text.length;
-    }
-    hist.resetHistory();
-    queueMicrotask(() => {
-      if (taRef) {
-        taRef.focus();
-        taRef.selectionStart = taRef.selectionEnd = pos;
-        ac.syncCaret();
-      }
-    });
-  }
-
-  // Tap vs hold on the paste button: a plain tap replaces the whole composer; a
-  // long-press (>=HOLD_THRESHOLD_MS between pointerdown and click) inserts at
-  // the caret. Classification goes through the shared classifyHold helper
-  // (../lib/copyHold, same one the Copy button uses), so the two hold
-  // affordances share one threshold and one load-independent rationale: a
-  // previous timer+flag scheme misclassified as "replace" when main-thread jank
-  // stalled the event loop past the threshold (CI load, throttled devices),
-  // because the timer callback raced the click handler. classifyHold also
-  // returns "tap" for keyboard activation (Enter/Space on the focused button
-  // fires click with no preceding pointerdown → pasteDownAt stays 0 → the
-  // downAt===0 sentinel), giving keyboard users the documented "replaces all"
-  // default instead of the hold branch. The insert runs in the click handler,
-  // which is still inside the transient-activation window opened by pointerdown
-  // (lasts several seconds), so clipboard read works.
+  // --- composer paste/clipboard (C4) ---------------------------------------
+  // Extracted to createComposerPaste (a SolidJS `create...` controller factory,
+  // mirroring createComposerAutocomplete / createPromptHistory). The factory
+  // owns the textarea onPaste (harvest pasted files/images → addFiles), the
+  // paste button's async Clipboard-API read (pasteFromClipboard: insert-at-
+  // caret vs replace-all), and the paste button's tap-vs-hold classification
+  // (classifyHold from lib/copyHold). This view keeps ONLY the addFiles
+  // IMPLEMENTATION (attachment rendering + geometry) + the presentational
+  // button JSX: the factory returns the event handlers wired into that JSX.
   //
-  // SolidJS no-rerender note: SolidJS is NOT React — component bodies and JSX
-  // run once at mount, so this `let pasteDownAt` closure persists for the whole
-  // ChatView instance lifetime (it even survives session switches via the
-  // non-keyed <Show when={selectedId()}> at App.tsx:367). Without an explicit
-  // reset, a single pointer gesture (downAt set to a real timestamp T) would
-  // leave the closure stale, and a LATER keyboard activation of the same
-  // focused button would classify as "hold" (T is old → elapsed >= threshold)
-  // → wrong branch. We close this edge two ways: (1) onBlur resets pasteDownAt
-  // to 0 when focus leaves the button (focus leaving = gesture context ended;
-  // pointer→click→blur ordering means the click already ran with the correct
-  // timestamp, so blur-side reset does not break pointer-hold detection); and
-  // (2) the click handler resets pasteDownAt to 0 AFTER classifyHold consumed
-  // it, closing the narrow residual "pointer-press then immediate Enter on the
-  // same focused button without focus moving away" hole. Both resets return
-  // the closure to the downAt===0 sentinel so the next activation (pointer or
-  // keyboard) starts clean.
-  let pasteDownAt = 0;
-  const onPasteDown = () => {
-    pasteDownAt = Date.now();
-  };
-  const onPasteUp = () => {}; // no-op; elapsed check on click makes hold load-independent
-  const onPasteClick = () => {
-    if (classifyHold(pasteDownAt, Date.now()) === "hold") {
-      pasteDownAt = 0; // reset AFTER classifyHold consumed it — closes the
-                       // "pointer then immediate Enter on the same focused
-                       // button" residual (see comment above).
-      void pasteFromClipboard("insert");
-      return;
-    }
-    pasteDownAt = 0; // same reset on the tap branch.
-    void pasteFromClipboard("replace");
-  };
+  // syncCaret is the C3 seam (caret sync after a clipboard-API text insert so
+  // autocomplete token detection tracks the new caret). onTextInsert is the C5
+  // seam (reset prompt-history walk cursors: the button bypasses the textarea,
+  // so the natural onInput that would reset history never fires).
+  const paste = createComposerPaste({
+    input,
+    setInput,
+    textarea: () => taRef,
+    syncCaret: () => ac.syncCaret(),
+    addFiles: (files) => void addFiles(files),
+    onTextInsert: () => hist.resetHistory(),
+  });
 
   // The popup is portaled to <body> (fixed, above the composer) so chat content
   // can't paint over it. Anchored to the composer's rect; recomputed as items
@@ -2585,22 +2517,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
               onBlur={() => setTimeout(() => ac.dismissAc(), 150)}
               onScroll={(e) => mirrorRef && (mirrorRef.scrollTop = e.currentTarget.scrollTop)}
               onKeyDown={onKeyDown}
-              onPaste={(e) => {
-                // Paste an image/file (e.g. a screenshot) straight into the
-                // composer as an attachment; plain-text paste falls through.
-                // Many browsers expose pasted files ONLY via clipboardData.items
-                // (getAsFile) while .files stays empty, so harvest both and
-                // prefer items (see lib/paste.ts).
-                const cd = e.clipboardData;
-                const harvested = harvestPastedFiles(
-                  cd?.files ? Array.from(cd.files) : null,
-                  cd?.items ? Array.from(cd.items) : null,
-                );
-                if (harvested.length > 0) {
-                  e.preventDefault();
-                  void addFiles(harvested);
-                }
-              }}
+              onPaste={paste.onPaste}
               placeholder={"Message…   (! = shell, /undo /redo)"}
               rows={1}
             />
@@ -2639,20 +2556,12 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
               class="bar-icon"
               aria-label="Paste (hold to insert at cursor)"
               data-tip="Paste — replaces all · hold to insert at cursor"
-              onClick={onPasteClick}
-              onPointerDown={onPasteDown}
-              onPointerUp={onPasteUp}
-              onPointerLeave={onPasteUp}
-              onPointerCancel={onPasteUp}
-              onBlur={() => {
-                // Focus leaving the button = gesture context ended. Return
-                // the closure to the downAt===0 sentinel so the NEXT keyboard
-                // activation (Enter/Space on this focused button) classifies
-                // as "tap" (documented "replaces all" default) instead of
-                // misclassifying from a stale pointer timestamp. See the
-                // SolidJS no-rerender note above the paste classifier.
-                pasteDownAt = 0;
-              }}
+              onClick={paste.onPasteButtonClick}
+              onPointerDown={paste.onPasteButtonDown}
+              onPointerUp={paste.onPasteButtonUp}
+              onPointerLeave={paste.onPasteButtonUp}
+              onPointerCancel={paste.onPasteButtonUp}
+              onBlur={paste.onPasteButtonBlur}
             >
               <Icon name="clipboard" />
             </button>
