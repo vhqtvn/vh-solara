@@ -259,6 +259,28 @@ export function classifyScrollDelta(
     intent = "none";
   }
 
+  // Viewport-resize churn guard (tail + following): a viewport resize — a UI bar
+  // appearing/dismissing, the mobile keyboard, composer autosize — can shift
+  // scrollTop via browser scroll-anchoring, producing a residual OUTSIDE epsilon
+  // that the branches above mis-read as user-scroll-up/down and would DROP
+  // following at the tail. Browser anchor-shift on a viewport resize is bounded
+  // by |viewportDelta|, so when the viewport delta DOMINATES the residual the
+  // scrollTop shift is attributable to the resize (layout churn), NOT user
+  // intent: keep following and let the tail re-glue re-pin to the new bottom.
+  // Genuine user scrolls arrive on frames with viewportDelta≈0 (|0| not > eps),
+  // so they are unaffected and still drop. This locks the load-only flake where a
+  // ~137px viewport shrink while following (busy-bar appear) dropped following and
+  // left the reader stuck on "↓ Latest" with no recovery.
+  if (
+    args.mode === "tail" &&
+    args.following &&
+    (intent === "user-scroll-up" || intent === "user-scroll-down") &&
+    Math.abs(viewportDelta) > eps &&
+    Math.abs(residualUserDelta) <= Math.abs(viewportDelta) + eps
+  ) {
+    intent = "none";
+  }
+
   // TAIL-mode re-glue: while following, any non-user-scroll-up transition is
   // layout churn we must absorb by re-pinning to the bottom. Epsilon-guard the
   // write so a no-op frame doesn't churn RO/onScroll.

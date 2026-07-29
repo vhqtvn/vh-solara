@@ -338,6 +338,25 @@ describe("classifyScrollDelta — tail/following", () => {
     expect(d.newScrollTop).toBe(1500);
   });
 
+  it("viewport shrink while following, browser partially compensated (resid dominated by viewport) → keep following + re-pin to new bottom", () => {
+    // The load-only flake root (ChatView onScrolled dropping following at the
+    // tail): a UI bar appears → clientHeight shrinks 137px; browser
+    // scroll-anchoring nudges scrollTop down 43px. The residual (+43) is outside
+    // epsilon and WOULD classify as user-scroll-down (dropping following), but the
+    // VIEWPORT delta (-137) dominates, so the transition is layout churn: intent
+    // none, and the tail re-glue re-pins to the new bottom (2823) — the reader
+    // stays glued to the tail with no "↓ Latest" recovery needed.
+    const d = tail(
+      { scrollTop: 2686, scrollHeight: 2891, clientHeight: 205 },
+      { scrollTop: 2729, scrollHeight: 2891, clientHeight: 68 },
+    );
+    expect(d.viewportDelta).toBe(-137);
+    expect(d.residualUserDelta).toBe(43);
+    expect(d.intent).toBe("none");
+    expect(d.shouldScroll).toBe(true);
+    expect(d.newScrollTop).toBe(2823);
+  });
+
   it("viewport-only grow (composer shrink, stuck-on-Latest fix) → reached-bottom re-engage signal", () => {
     // Following was false (killed by the deadlock); composer shrinks back so
     // clientHeight grows, browser clamps scrollTop down to the new maxBottom.

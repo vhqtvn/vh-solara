@@ -1252,6 +1252,36 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     requestAnimationFrame(autosize);
   });
 
+  // Focus-mode toggle re-glue (test 110 / focus-toggle flake): toggling focus
+  // resizes the composer dramatically (textarea → height:100%), firing scroll
+  // events whose browser-anchor shift can spuriously drop following at the tail
+  // before autosize's pin runs — leaving the reader "stuck on ↓ Latest" once the
+  // turn finishes, with no recovery (the gap left by the resize exceeds the RO
+  // recovery's nearBottom band). Preserve tail-following across the resize:
+  // capture following() in the SAME reactive tick as the toggle (a signal read,
+  // so NO layout reflow — the value is the PRE-toggle state, before any resize
+  // scroll event has fired), then restore + re-pin after the layout settles
+  // (rAF). Gated on wasFollowing so a reader who scrolled up is NOT yanked
+  // (P1-WEB-042; test 5 toggles focus while scrolled-up and expects the Latest
+  // button to stay suppressed). Complements the classifyScrollDelta viewport-
+  // churn guard in lib/scroll.ts, which handles the common case but cannot cover
+  // every anchor-shift magnitude under a large composer resize.
+  createEffect(
+    on(
+      () => focusMode(),
+      (_v, prev) => {
+        if (prev === undefined || !scrollEl || !ready()) return;
+        const wasFollowing = following();
+        requestAnimationFrame(() => {
+          if (!wasFollowing || !scrollEl || !ready()) return;
+          setFollowing(true);
+          setUserScrolledUp(false);
+          pin();
+        });
+      },
+    ),
+  );
+
   // Reset to bottom + restore this session's saved draft when switching sessions.
   createEffect(
     on(
