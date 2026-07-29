@@ -1043,10 +1043,21 @@ test("composer grow at the idle tail keeps following (bug-2 deadlock guard)", as
   const tall = Array.from({ length: 16 }, (_, i) => `composer growth line ${i + 1}`).join("\n");
   await page.getByPlaceholder("Message…").fill(tall);
 
-  const afterCH = await page.locator(".chat-scroll").evaluate((e: HTMLElement) => e.clientHeight);
-  // Sanity: the composer actually grew (viewport shrank). If this ever flips
-  // false the growth driver is broken and the following assertion is vacuous.
-  expect(afterCH).toBeLessThan(beforeCH);
+  // Sanity: the composer actually grew (viewport shrank). fill() dispatches the
+  // input synchronously, but the textarea autosize + the flex reflow that shrinks
+  // `.chat-scroll` are ASYNC — a bare immediate clientHeight read races the reflow
+  // (afterCH === beforeCH, a false "growth driver broken"). Poll until the viewport
+  // has actually shrunk, using this file's established expect.poll geometry idiom
+  // (e.g. expectFollowingTail). This is the non-vacuous gate the following
+  // assertion below depends on; it does NOT relax that assertion.
+  await expect.poll(
+    () => page.locator(".chat-scroll").evaluate((e: HTMLElement) => e.clientHeight),
+    {
+      timeout: 3000,
+      message:
+        "composer autosize did not shrink the .chat-scroll viewport (growth driver broken — the following assertion would be vacuous)",
+    },
+  ).toBeLessThan(beforeCH);
 
   // Still glued to the tail: geometry at the bottom AND no "↓ Latest" button.
   // Under the pre-reducer deadlock, following flipped false here and button.jump
