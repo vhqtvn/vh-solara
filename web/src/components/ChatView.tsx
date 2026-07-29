@@ -22,14 +22,8 @@ import {
   effectiveInline,
   modelHasVision,
   inlineAttachForced,
-  attachMarkdownRef,
-  insertAtCaret,
-  inlineAttachUrl,
-  INLINE_LOCALID_PREFIX,
   isInlineChipUrl,
   resolveInlineAttachments,
-  scanInlineTokens,
-  inlineLocalIdFromUrl,
   isInlineChipOrphan,
   type ResolvedAttachment,
 } from "../lib/inlineAttach";
@@ -66,6 +60,7 @@ import { createComposerAutocomplete } from "./chat/createComposerAutocomplete";
 import { createPromptHistory } from "./chat/createPromptHistory";
 import { createComposerPaste } from "./chat/createComposerPaste";
 import { createQueueSync } from "./chat/createQueueSync";
+import { createAttachments, type Attachment } from "./chat/createAttachments";
 
 const draftKey = (sid: string) => "vh.draft." + sid;
 
@@ -191,13 +186,10 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   const readyToSend = createMemo(() =>
     agents().length > 0 && (models().length > 0 || !!selectionFor(props.sessionId)),
   );
-  // Pending attachments (file parts) to send with the next message.
-  // `file` is set ONLY for draft-queued attachments (no server session yet):
-  // the raw File is held locally and uploaded at send time, then `file` is
-  // dropped and a real `url` takes its place (see flushPendingAttachments).
-  interface Attachment { url: string; filename: string; mime: string; file?: File; path?: string }
-  const [attachments, setAttachments] = createSignal<Attachment[]>([]);
-  const [uploading, setUploading] = createSignal(false);
+  // The hidden file-picker <input> ref. Bound in JSX below and passed to the
+  // createAttachments factory (C6) as an accessor so addFiles can clear it
+  // after a pick (re-pick of the same file). The attachment signals/state moved
+  // to createAttachments; ChatView keeps this DOM ref because JSX owns it.
   let fileInputRef: HTMLInputElement | undefined;
 
   // Load (or switch to) this session's history (drafts have no server session).
@@ -1098,6 +1090,36 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     draft: () => !!props.draft,
     onApplied: () => hist.resetHistory(),
   });
+  // --- attachments (C6) -----------------------------------------------------
+  // Extracted to createAttachments (a SolidJS `create...` controller factory,
+  // mirroring createComposerAutocomplete / createPromptHistory /
+  // createComposerPaste / createQueueSync). The factory owns the attachment
+  // signals (attachments/uploading), the inline-mode token<->File<->text Map
+  // (inlineFiles), the presentInlineIds orphan-truth memo, and the pipeline
+  // (addFiles/remove/reinsert/flush/upload). This view keeps ONLY the
+  // attachment-chip JSX (<For>, orphan accessor reads via presentInlineIds),
+  // the send() flow's own orchestration (resolveInlineAttachments +
+  // ownership-snapshot clear, which reads attachments()/setAttachments/
+  // inlineFiles RETURNED here), and buildParts.
+  //
+  // syncCaret is the C3 seam (caret sync after an inline markdown-ref insert so
+  // autocomplete token detection tracks the new caret). onInlineInsert is the C5
+  // seam (reset prompt-history walk cursors: the inline insert bypasses the
+  // textarea onInput that would reset history naturally). inlineActive is
+  // precomputed here as effectiveInline(modelHasVision(curModel()),
+  // inlineAttachForced()) so the factory owns NO model/vision/pref concern.
+  const inlineActive = () => effectiveInline(modelHasVision(curModel()), inlineAttachForced());
+  const att = createAttachments({
+    input,
+    setInput,
+    textarea: () => taRef,
+    sessionId: () => props.sessionId,
+    draft: () => !!props.draft,
+    fileInput: () => fileInputRef,
+    inlineActive,
+    syncCaret: () => ac.syncCaret(),
+    onInlineInsert: () => hist.resetHistory(),
+  });
   // --- composer paste/clipboard (C4) ---------------------------------------
   // Extracted to createComposerPaste (a SolidJS `create...` controller factory,
   // mirroring createComposerAutocomplete / createPromptHistory). The factory
@@ -1117,7 +1139,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     setInput,
     textarea: () => taRef,
     syncCaret: () => ac.syncCaret(),
-    addFiles: (files) => void addFiles(files),
+    addFiles: (files) => void att.addFiles(files),
     onTextInsert: () => hist.resetHistory(),
   });
 
@@ -1247,195 +1269,10 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     return props.sessionId;
   }
 
-  // Upload one file into the project's .vh-solara attachments dir; returns the
-  // server-backed Attachment (with a real url) or null on failure.
-  async function uploadFile(file: File, id: string): Promise<Attachment | null> {
-    const fd = new FormData();
-    fd.append("file", file);
-    const res = await fetch(`/vh/attach?session=${encodeURIComponent(id)}`, {
-      method: "POST",
-      body: fd,
-    });
-    if (!res.ok) return null;
-    const part = await res.json();
-    if (!part?.url) return null;
-    // Thread the project-relative attachment path returned by attach.go through
-    // into the FE Attachment (and onward into the queue via QueuedAttachment).
-    // S1 only carries the field; it is not yet used to build the dispatched
-    // part (buildParts). `path` may be absent on older backends → undefined.
-    return { url: part.url, filename: part.filename, mime: part.mime, path: part.path };
-  }
-
-  // Synthetic key for a draft-queued attachment (no server session yet). Real
-  // uploads get a server url; pending ones get this so removeAttachment (which
-  // keys on url) still works on the chip before send.
-  let pendingSeq = 0;
-  const pendingKey = () => `pending:${++pendingSeq}`;
-
-  // --- S3: inline-mode attachment token <-> File <-> text --------------------
-  //
-  // When effectiveInline(...) is ON (non-vision model, OR vision + user-forced
-  // pref), an attached/pasted file is NOT uploaded. Instead we hold the raw
-  // File locally keyed by a stable localId, set a synthetic chip whose url is
-  // vh-attach:<localId>, and insert a markdown reference at the textarea caret.
-  // The markdown ref in the textarea text is the SOURCE OF TRUTH for "this
-  // attachment exists"; the chip is a secondary UI affordance for removal.
-  //
-  // localId shape: INLINE_LOCALID_PREFIX + <N> (e.g. "inl3"), where <N> draws
-  // from the SAME pendingSeq counter above so inline localIds never collide
-  // with pending:N draft keys. The url is built by the pure inlineAttachUrl().
-  //
-  // The held File lives in `inlineFiles` (a Map<localId, File>), NOT on
-  // Attachment.file. flushPendingAttachments (the existing draft-lazy seam
-  // below) filters attachments by `.file` and would double-handle inline chips
-  // if they carried it; inline chips set file: undefined, so that existing path
-  // skips them untouched. `inlineFiles` survives until send (S4 will scan the
-  // textarea text for vh-attach:<localId> tokens and resolve each via this Map).
-  const inlineFiles = new Map<string, File>();
-  const nextInlineLocalId = () => `${INLINE_LOCALID_PREFIX}${++pendingSeq}`;
-
-  // S5: the set of inline localIds whose markdown ref is STILL PRESENT in the
-  // composer text. Reactive over input(): when the user types/deletes, this set
-  // recomputes and each inline chip's orphan flag (its token absent from the
-  // text) updates. This makes the markdown ref the visible source of truth in
-  // the chip strip: a chip whose ref was deleted is shown as an orphan (dimmed,
-  // "won't be sent", with a re-insert control). Non-inline chips are unaffected
-  // (isInlineChipOrphan returns false for non vh-attach: urls).
-  const presentInlineIds = createMemo(() => new Set(scanInlineTokens(input())));
-
-  // Upload any draft-queued (pending) attachments now that a session exists,
-  // replacing their synthetic keys with real server urls. Called right after
-  // createSession() in send(). A no-op for live sessions, whose attachments
-  // upload immediately in addFiles.
-  async function flushPendingAttachments(id: string) {
-    const pending = attachments().filter((a) => a.file);
-    if (pending.length === 0) return;
-    setUploading(true);
-    try {
-      const resolved: Attachment[] = [];
-      for (const a of pending) {
-        const r = await uploadFile(a.file!, id);
-        if (r) resolved.push(r);
-      }
-      // Keep already-uploaded entries; replace pending ones with resolved urls.
-      setAttachments((prev) => [...prev.filter((a) => !a.file), ...resolved]);
-    } finally {
-      setUploading(false);
-    }
-  }
-
-  // Queue a file as an attachment for the next message. For a LIVE session the
-  // upload happens now (chip shows a server-backed url immediately). For a DRAFT
-  // there is no session yet — never create one on paste/pick just to upload:
-  // createSession() navigates away from the draft hero and this component-local
-  // attachment state is lost on the remount. Instead queue the raw File locally
-  // (chip shows from filename) and upload it at send time, once the session
-  // exists (see flushPendingAttachments in send()).
-  async function addFiles(files: FileList | File[] | null) {
-    if (!files || files.length === 0) return;
-    // Snapshot the files BEFORE clearing the input: e.currentTarget.files is a
-    // LIVE FileList tied to the <input>, so setting fileInputRef.value = ""
-    // empties it. Materializing the array first means the upload still sees the
-    // picked files. (The paste path passes standalone File objects not tied to
-    // the input, so it was never affected.)
-    const arr = Array.from(files);
-    if (fileInputRef) fileInputRef.value = "";
-    // S3: inline mode (non-vision model, OR vision model + user-forced pref)
-    // — DO NOT upload. Hold the raw File keyed by localId in `inlineFiles`,
-    // set a synthetic chip whose url is vh-attach:<localId>, and insert a
-    // markdown ref at the textarea caret. The text ref is the SOURCE OF TRUTH
-    // for "this attachment exists"; the chip is a secondary removal affordance.
-    // Applies to BOTH draft and live sessions — inline mode is orthogonal to
-    // session lifecycle (it is about whether we upload at all). The non-inline
-    // path below (draft pending-key / live eager upload) is byte-for-byte
-    // unchanged.
-    if (effectiveInline(modelHasVision(curModel()), inlineAttachForced())) {
-      const ta = taRef;
-      if (ta) ta.focus();
-      for (const file of arr) {
-        const localId = nextInlineLocalId();
-        inlineFiles.set(localId, file);
-        // Chip: url is the synthetic vh-attach:<localId> (so removeAttachment,
-        // which keys on url, still works). file: is deliberately UNSET — see
-        // the inlineFiles comment above (flushPendingAttachments filters by
-        // .file and must skip inline chips).
-        setAttachments((a) => [
-          ...a,
-          { url: inlineAttachUrl(localId), filename: file.name, mime: file.type },
-        ]);
-        if (ta) {
-          insertAtCaret(
-            ta,
-            attachMarkdownRef(file.name, file.type.startsWith("image/"), localId),
-          );
-          // Mirror the helper's DOM mutation into the input() signal so
-          // SolidJS's controlled value={input()} stays in sync. Assigning the
-          // identical string is a DOM no-op, so the caret the helper just
-          // advanced persists (no microtask needed, unlike pasteFromClipboard
-          // which computes the splice on the signal and must wait for render).
-          setInput(ta.value);
-          ac.syncCaret();
-        }
-      }
-      hist.resetHistory();
-      return;
-    }
-    if (props.draft) {
-      for (const file of arr) {
-        setAttachments((a) => [...a, { url: pendingKey(), filename: file.name, mime: file.type, file }]);
-      }
-      return;
-    }
-    const id = props.sessionId;
-    if (!id) return;
-    setUploading(true);
-    try {
-      for (const file of arr) {
-        const uploaded = await uploadFile(file, id);
-        if (uploaded) setAttachments((a) => [...a, uploaded]);
-      }
-    } finally {
-      setUploading(false);
-    }
-  }
-  const removeAttachment = (url: string) => {
-    // S5: deleting an inline chip (vh-attach:<localId>) must ALSO drop its held
-    // File from inlineFiles — otherwise the bytes linger for the ChatView
-    // lifetime even though the chip (and its token) are gone. Non-inline chips
-    // (real file:// uploads) have no inlineFiles entry; inlineLocalIdFromUrl
-    // returns null and the delete is skipped.
-    const localId = inlineLocalIdFromUrl(url);
-    if (localId !== null) inlineFiles.delete(localId);
-    setAttachments((a) => a.filter((x) => x.url !== url));
-  };
-
-  // S5: re-insert an orphaned inline chip's markdown ref back into the composer
-  // at the textarea caret, restoring its token so the chip returns to normal
-  // (no longer orphaned — the lazy upload will pick it up at send). Mirrors the
-  // addFiles inline insert path (insertAtCaret + attachMarkdownRef + mirror into
-  // input()). No-op for a non-inline chip (no localId to re-insert).
-  const reinsertInlineChip = (a: Attachment) => {
-    const localId = inlineLocalIdFromUrl(a.url);
-    if (localId === null) return;
-    const ta = taRef;
-    const ref = attachMarkdownRef(a.filename, a.mime.startsWith("image/"), localId);
-    if (ta) {
-      ta.focus();
-      insertAtCaret(ta, ref);
-      // Mirror the helper's DOM mutation into input() so the controlled
-      // value={input()} stays in sync (assigning the identical string is a DOM
-      // no-op, so the caret the helper advanced persists — same property the
-      // addFiles inline insert path relies on).
-      setInput(ta.value);
-      ac.syncCaret();
-    } else {
-      // No textarea ref (should not happen in the composer): append to the
-      // signal so the token is at least present (caret positioning best-effort).
-      setInput(input() + ref);
-    }
-    hist.resetHistory();
-  };
-
+  // buildParts stays here (send/dispatch concern): it reads the Attachment type
+  // + isInlineChipUrl from the inline-attach lib. The attachment STATE + the
+  // pipeline (addFiles/remove/reinsert/flush/upload) moved to createAttachments
+  // (C6) above; send()/sendText()/JSX read them via the `att` controller.
   function buildParts(text: string, atts?: Attachment[]): any[] {
     // `atts` is optional in practice: the backend serializes QueueItem.Attachments
     // with `omitempty`, so a queued item with no attachments arrives with
@@ -1496,7 +1333,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // chance of silent loss (operator policy); single-flight removes the
   // duplicate without ever risking loss.
   async function sendText(text: string, id: string): Promise<boolean> {
-    const atts = attachments();
+    const atts = att.attachments();
     if ((!text && atts.length === 0) || !id) return false;
     // Always capture a model. OpenCode rejects a prompt with no model. If models
     // haven't loaded, fetch once before enqueue so the persisted queue item
@@ -1690,7 +1527,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
 
   async function send() {
     const text = input().trim();
-    if (!text && attachments().length === 0) return;
+    if (!text && att.attachments().length === 0) return;
     // Gate before any state change: if agents/models aren't loaded yet, a send
     // would route through the leak-prone fallback chain (empty agent list) and
     // likely fail. Surface it and preserve the typed text (do NOT clear input).
@@ -1757,7 +1594,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     migrateModelPick(props.sessionId, id);
     // A draft may have queued attachments locally (no session existed at paste
     // time). Now that we have an id, upload them so buildParts sees real urls.
-    await flushPendingAttachments(id);
+    await att.flushPendingAttachments(id);
     // Shell commands (leading "!") dispatch directly against the live session —
     // they are NOT enqueued (they only make sense against a live shell). Clear
     // the composer text; on failure restore it so a silent noop never loses what
@@ -1825,8 +1662,8 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     if (effectiveInline(modelHasVision(curModel()), inlineAttachForced())) {
       const r = await resolveInlineAttachments(
         text,
-        inlineFiles,
-        (f) => uploadFile(f, id),
+        att.inlineFiles,
+        (f) => att.uploadFile(f, id),
         modelHasVision(curModel()),
       );
       resolvedText = r.resolvedText;
@@ -1836,12 +1673,12 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       // chips already in the list are excluded by buildParts (isInlineChipUrl).
       if (r.imageParts.length > 0) {
         appendedImageParts = r.imageParts;
-        setAttachments((a) => [...a, ...r.imageParts]);
+        att.setAttachments((a) => [...a, ...r.imageParts]);
       }
     }
     await runSendSingleFlight(id, async () => {
       const snapText = input();
-      const snapAtts = attachments();
+      const snapAtts = att.attachments();
       const ok = await sendText(resolvedText, id);
       if (!ok) {
         setInput(text);
@@ -1852,22 +1689,22 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
         // live attachments() list is preserved. Non-inline -> no-op.
         if (appendedImageParts) {
           const ours = appendedImageParts;
-          setAttachments((a) => a.filter((x) => !ours.includes(x)));
+          att.setAttachments((a) => a.filter((x) => !ours.includes(x)));
         }
         return;
       }
       // Durable custody confirmed. Clear the composer ONLY if it still owns the
       // submitted snapshot. If the operator typed a new draft or changed
       // attachments during the enqueue wait, that newer state survives.
-      if (input() === snapText && attachments() === snapAtts) {
+      if (input() === snapText && att.attachments() === snapAtts) {
         setInput("");
-        setAttachments([]);
+        att.setAttachments([]);
         // S5 dF1: a successful inline send consumed every held File (lazy
         // upload resolved all present tokens, and the chips are now cleared).
         // Clear inlineFiles so the raw bytes do not linger for the ChatView
         // lifetime. Inside the snapshot guard so a composer the operator changed
         // during the wait keeps its (new) chips and their held bytes intact.
-        inlineFiles.clear();
+        att.inlineFiles.clear();
       }
       // For a draft, the draft->live transition (ensureSession -> createSession
       // -> setSelectedId) unmounts this ChatView in App.tsx, which disposes the
@@ -2394,9 +2231,9 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
               </For>
             </div>
           </Show>
-          <Show when={attachments().length > 0 || uploading()}>
+          <Show when={att.attachments().length > 0 || att.uploading()}>
             <div class="attach-row">
-              <For each={attachments()}>
+              <For each={att.attachments()}>
                 {(a) => {
                   // S5: an inline chip (vh-attach:<localId>) is an ORPHAN when
                   // its token is absent from the composer text (the user deleted
@@ -2417,7 +2254,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
                   // text, defeating S5. Reading orphan() inside JSX props/class
                   // /Show lets the Solid compiler wrap each read in a reactive
                   // effect so the orphan UI tracks the live present-token set.
-                  const orphan = () => isInlineChipOrphan(a.url, presentInlineIds());
+                  const orphan = () => isInlineChipOrphan(a.url, att.presentInlineIds());
                   return (
                     <span
                       class="attach-chip"
@@ -2437,19 +2274,19 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
                           type="button"
                           aria-label={`Re-insert ${a.filename} into message`}
                           title="Re-insert into message"
-                          onClick={() => reinsertInlineChip(a)}
+                          onClick={() => att.reinsertInlineChip(a)}
                         >
                           <Icon name="retry" size={11} />
                         </button>
                       </Show>
-                      <button type="button" aria-label="Remove attachment" onClick={() => removeAttachment(a.url)}>
+                      <button type="button" aria-label="Remove attachment" onClick={() => att.removeAttachment(a.url)}>
                         <Icon name="x" size={11} />
                       </button>
                     </span>
                   );
                 }}
               </For>
-              <Show when={uploading()}>
+              <Show when={att.uploading()}>
                 <span class="attach-chip uploading">Uploading…</span>
               </Show>
             </div>
@@ -2459,7 +2296,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
             type="file"
             multiple
             style={{ display: "none" }}
-            onChange={(e) => void addFiles(e.currentTarget.files)}
+            onChange={(e) => void att.addFiles(e.currentTarget.files)}
           />
           <div
             class="composer-field"
@@ -2529,7 +2366,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
               class="bar-icon"
               aria-label="Attach file"
               data-tip="Attach file"
-              disabled={uploading()}
+              disabled={att.uploading()}
               onClick={() => fileInputRef?.click()}
             >
               <Icon name="paperclip" />
