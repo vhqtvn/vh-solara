@@ -40,7 +40,7 @@ entrypoints:
     note: "`server` subcommand → pkg/server.NewDaemon (central controller edge + worker registration)."
   - name: worker-daemon-cmd
     path: cmd/client-daemon.go
-    note: "`client-daemon` subcommand → worker daemon; connects to controller via yamux tunnel and serves the local /vh/* web UI. Largest cmd file (~877 LoC)."
+    note: "`client-daemon` subcommand → worker daemon; connects to controller via yamux tunnel and serves the local /vh/* web UI. Largest cmd file (~324 LoC)."
   - name: standalone-local-server-cmd
     path: cmd/local-server.go
     note: "`local-server` subcommand → vh web UI + OpenCode backend on this machine with NO controller/proxy connection."
@@ -70,44 +70,46 @@ entrypoints:
     note: e2e.StartCluster() — real controller daemon + real worker over yamux + fake OpenCode, in-process (no docker/opencode/LLM).
 
 # ─── hotspots — files most likely to need reading for a change ─────────────
-# LoC verified 2026-07-27 via `wc -l`. Listed biggest / most-coupled per tree.
+# LoC verified 2026-07-30 via `wc -l`. Listed biggest / most-coupled per tree.
+# Post-refactor (markdownEnhance + ToolPart extraction; store/aggregator/sync
+# splits) several former giants shrank — notes point at where the logic moved.
 hotspots:
-  - name: state-store
-    path: pkg/state/store.go
-    note: 4698 LoC — materialized session/message/tree state machine + event emission. Largest Go file; the AGG core.
   - name: web-server
     path: pkg/web/server.go
-    note: 2064 LoC — /vh/* HTTP API core + multi-project aggregator routing + embedded SPA serve.
-  - name: queue-lifecycle
-    path: pkg/web/queue.go
-    note: 1117 LoC — on-disk queue state machine (pending/dispatching/sent/failed/unknown). Most-churned file (queue GC-1..5 + STUCK-1 families).
-  - name: aggregator-core
-    path: pkg/aggregator/aggregator.go
-    note: 1067 LoC — OpenCode polling + state hydration + orphan-queue reconciliation hooks.
-  - name: tree-emitter
-    path: pkg/state/tree_emitter.go
-    note: 921 LoC — session-tree event emission / subtree fan-out / interest filtering.
-  - name: fake-opencode
-    path: pkg/fixtures/opencode.go
-    note: 1230 LoC — single-file fake OpenCode backing ALL test lanes (in-process e2e, Playwright via fixtureserver, docker via e2eserver+fakellm). High coupling point.
+    note: 2086 LoC — /vh/* HTTP API core + multi-project aggregator routing + embedded SPA serve. Largest Go file in the repo.
+  - name: chat-view
+    path: web/src/components/ChatView.tsx
+    note: 2487 LoC — chat UI surface (composer, scroll-follow, queue chips, send single-flight). Biggest TSX in the repo.
   - name: web-integration-test
     path: pkg/web/integration_test.go
     note: 1831 LoC — cross-layer /vh/* integration test hotspot; isMessageClassSSE helper mirrors state kinds.
-  - name: sync-stream-reducer
-    path: web/src/sync/stream.ts
-    note: 3407 LoC — SSE event-stream reducer driving the whole SPA's reactive state. BIGGEST TS file in the repo.
-  - name: chat-view
-    path: web/src/components/ChatView.tsx
-    note: 3094 LoC — chat UI surface (composer, scroll-follow, queue chips, send single-flight). Biggest TSX.
+  - name: state-store
+    path: pkg/state/store.go
+    note: 1365 LoC — materialized session/message/tree state machine + event emission. Largest file in pkg/state; the AGG core. pkg/state split across 13 source files (ring, snapshots, hydration, subscriptions, subtree_indexes, tree_emitter, tree_node, tree_reconcile, reducers, message_window, busy_diag, grace + store).
+  - name: fake-opencode
+    path: pkg/fixtures/opencode.go
+    note: 1285 LoC — single-file fake OpenCode backing ALL test lanes (in-process e2e, Playwright via fixtureserver, docker via e2eserver+fakellm). High coupling point.
+  - name: queue-lifecycle
+    path: pkg/web/queue.go
+    note: 1117 LoC — on-disk queue state machine (pending/dispatching/sent/failed/unknown). Most-churned file (queue GC-1..5 + STUCK-1 families).
+  - name: tree-emitter
+    path: pkg/state/tree_emitter.go
+    note: 921 LoC — session-tree event emission / subtree fan-out / interest filtering.
   - name: part-renderer
     path: web/src/components/Part.tsx
-    note: 757 LoC — message-part rendering (text/tool/reasoning) + streaming markdown coalescing (~5fps) + reasoning stick-to-bottom.
+    note: 302 LoC — message-part rendering (text/tool/reasoning) + streaming markdown coalescing (~5fps) + reasoning stick-to-bottom. Trimmed after markdownEnhance + ToolPart extraction.
   - name: scroll-lib
     path: web/src/lib/scroll.ts
-    note: 266 LoC — scroll-follow / bottommostRead / nearBottom. Load-bearing for the Firefox/WebRender heat saga; small but high-coupling.
+    note: 282 LoC — scroll-follow / bottommostRead / nearBottom. Load-bearing for the Firefox/WebRender heat saga; small but high-coupling.
+  - name: aggregator-core
+    path: pkg/aggregator/aggregator.go
+    note: "205 LoC — aggregator entry: polling + tree reconciliation hooks. Bulk logic split across pkg/aggregator/ (lifecycle, hydration, messages, reconciliation, cold-seed — 6 source files)."
+  - name: sync-stream-reducer
+    path: web/src/sync/stream.ts
+    note: 196 LoC — SSE event-stream reducer entry driving the whole SPA's reactive state. Bulk reducer logic split out into web/src/sync/ siblings (store, treeState, actions, reducers, selectors, orchestration, refresh, ...). No longer the biggest TS file (ChatView.tsx is).
   - name: stream-md
     path: web/src/lib/streamMd.ts
-    note: 148 LoC — incremental streaming-markdown appender (text-node append, never rewrites a growing node). Coalesced to ~5fps in Part.tsx.
+    note: 163 LoC — incremental streaming-markdown appender (text-node append, never rewrites a growing node). Coalesced to ~5fps in Part.tsx.
 
 # ─── packages — logical boundaries, keyed by package name ──────────────────
 # Go: 21 packages under pkg/ + the cmd CLI package. TS: logical web/ boundaries.
@@ -121,13 +123,13 @@ packages:
     role: central controller daemon — user edge HTTP, worker registry, cross-worker coord API, proxy, CSRF.
   pkg-web:
     path: pkg/web
-    role: /vh/* + /oc/* HTTP API + embedded SPA; feature-sliced (queue, pins, messages, archive, tree, git, code, terminal, managed, views, notes, theme). 75 files — largest package.
+    role: /vh/* + /oc/* HTTP API + embedded SPA; feature-sliced (queue, pins, messages, archive, tree, git, code, terminal, managed, views, notes, theme). 27 .go source files (+ co-located tests) — largest Go package.
   pkg-aggregator:
     path: pkg/aggregator
-    role: OpenCode polling + state hydration + tree reconciliation + orphan-queue hooks.
+    role: OpenCode polling + state hydration + tree reconciliation + orphan-queue hooks. Split across 6 source files (aggregator, lifecycle, hydration, messages, reconciliation, cold-seed).
   pkg-state:
     path: pkg/state
-    role: materialized session/message/tree state store, ring buffer, event emission, subtree indexes.
+    role: materialized session/message/tree state store, ring buffer, event emission, subtree indexes. Split across 13 source files (store.go 1365 LoC + ring, snapshots, hydration, subscriptions, subtree_indexes, tree_emitter, tree_node, tree_reconcile, reducers, message_window, busy_diag, grace).
   pkg-opencode:
     path: pkg/opencode
     role: OpenCode HTTP client + session DB (sqlite) read-through.
@@ -186,16 +188,16 @@ packages:
     role: SolidJS SPA (Vite + TS), embedded via //go:embed. Build flow — `make web` stages into web/dist-build, then materialize copies into pkg/web/dist.
   web-src-root:
     path: web/src
-    role: flat layer of ~49 root .ts modules (api, sync, queue, busy, sidebar, models, prefs, theme, pwa, git, ...) — not deeply nested.
+    role: flat layer of ~46 root .ts modules (api, sync, queue, busy, sidebar, models, prefs, theme, pwa, git, ...) — not deeply nested.
   web-components:
     path: web/src/components
-    role: UI components (~50 .tsx) with co-located CSS Modules (*.module.css / *.css). ChatView, Part, SessionTree, GitView, CodeView, etc.
+    role: UI components (~66 .tsx) with co-located CSS Modules (*.module.css / *.css). ChatView, Part, SessionTree, GitView, CodeView, etc.
   web-lib:
     path: web/src/lib
     role: pure client helpers — scroll, streamMd, store, reduce, inlineAttach, perfFormat, sendSingleFlight, mermaid, md.
   web-sync:
     path: web/src/sync
-    role: SPA reactive state core — stream.ts (SSE reducer), store.ts, treeState.ts, selectors/treeSelectors, actions, orchestration, url.
+    role: SPA reactive state core — 19 modules. stream.ts (196 LoC SSE reducer entry) + store, treeState, treeSelectors, treeOps, treeMap, actions, reducers, selectors, orchestration, refresh, session-stream, tree-transport, decode, diaglog, health, history, periodic-resync, url.
   web-styles:
     path: web/src/styles
     role: CSS architecture — foundation/ (tokens, z-index, reset, scrollbars, perf-guards) + legacy/ transitional sheets being carved down + main.css entry.
@@ -205,6 +207,7 @@ packages:
 
 # ─── tests — where the suites live + how to run them ───────────────────────
 # Six lanes (AGENTS.md → "Testing rules (this repo)"). go must be on PATH.
+# Typecheck is the web-lane gate (folded into web-unit below), not a 7th lane.
 tests:
   - name: go-unit-colocated
     path: pkg
@@ -224,12 +227,8 @@ tests:
     run: vh-agent-harness exec bash tests/e2e-docker/run.sh
   - name: web-unit
     path: web/tests/unit
-    note: Vitest; ~107 specs. Node env by default, jsdom via // @vitest-environment jsdom docblock per file. Component tests use @solidjs/testing-library.
+    note: Vitest; ~135 specs. Node env by default, jsdom via // @vitest-environment jsdom docblock per file. Component tests use @solidjs/testing-library. Typecheck gate (mirrors CI) — `vh-agent-harness exec npm --prefix web run typecheck`.
     run: vh-agent-harness exec npm --prefix web run test:unit
-  - name: web-typecheck
-    path: web
-    note: tsc --noEmit typecheck gate (mirrors CI).
-    run: vh-agent-harness exec npm --prefix web run typecheck
   - name: web-e2e
     path: web/tests/e2e
     note: Playwright; SERIAL (workers:1, fullyParallel:false) — one shared mutable fixture backend. webServer runs scripts/fixture-web.sh (SPA build + go run ./tools/fixtureserver), so go must be on PATH.
