@@ -9,6 +9,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"strconv"
 	"strings"
 	"sync"
@@ -550,6 +551,15 @@ type Store struct {
 	// Promoted off the package global for the same race reason as
 	// deltaFlushInterval.
 	recentArchiveTTL time.Duration
+	// recentBucketRetentionMinutes is the per-instance bound on the number of
+	// minute-buckets retained in s.recentBucket (memory-bounded; generous vs the
+	// default 10-min projection cutoff in Phase 6). Promoted off the former
+	// package-global var (audit L-15 / remediation M6): the hot-path reader
+	// evictRecentBucketsLocked now reads this instance field under s.mu instead
+	// of an unsynchronized package var, so a -race run cannot observe a global
+	// mutation racing a lingering goroutine — mirroring the GAP-S5 promotion
+	// applied to the other tunables. Set once at construction from Config.
+	recentBucketRetentionMinutes int
 	// subtreeBusyCount is the INCREMENTAL per-node busy aggregate and the SINGLE
 	// SOURCE OF TRUTH for the per-root running count (Store.RunningRoots derives
 	// from it). subtreeBusyCount[id] = the number of busy/retry sessions in id's
@@ -611,9 +621,10 @@ type Store struct {
 	// BUCKET class — recentBucket. A session lives in at most ONE minute bucket
 	// (Unix/60) — the one for its last-activity minute. recentBucketKeys is the
 	// sorted ascending list of bucket minutes, so the projection's cutoff
-	// window walk is O(buckets-in-window). recentBucketRetentionMinutes bounds
-	// the number of buckets retained (memory-bounded; generous vs the default
-	// 10-min projection cutoff in Phase 6).
+	// window walk is O(buckets-in-window). s.recentBucketRetentionMinutes (the
+	// instance field above) bounds the number of buckets retained
+	// (memory-bounded; generous vs the default 10-min projection cutoff in
+	// Phase 6).
 	recentBucket     map[int64][]string // unix-minute → session ids
 	recentBucketKeys []int64            // sorted ascending bucket minutes
 	// msgLoaded marks sessions whose message history has been fetched. Messages
@@ -713,8 +724,110 @@ func newEpoch() string {
 	return "ep-" + hex.EncodeToString(b[:])
 }
 
-// New returns an empty store with an event ring of the given capacity.
-func New(ringCapacity int) *Store {
+// Config is the single validated configuration object governing every Store
+// tunable (audit L-15 / remediation M6). Construction of a Store MUST go
+// through NewWithConfig, which validates the complete configuration before any
+// runtime state is allocated or exposed: non-positive or otherwise invalid
+// values are rejected at construction so a malformed Store can never exist.
+//
+// Every tunable lives here AND as the matching Store instance field — there is
+// no package-global or caller-specific path by which a tunable can avoid
+// validation. Future tunables have one required home (this struct) and one
+// validation boundary (validate / NewWithConfig).
+//
+// DefaultConfig fills the package-default values (the same values New used to
+// inline before M6); production callers that take operator-supplied
+// configuration should build a Config explicitly and handle the error returned
+// by NewWithConfig rather than using the New compatibility wrapper.
+type Config struct {
+	// RingCapacity is the event-ring retention capacity (resume-via-replay
+	// window). Must be positive.
+	RingCapacity int
+	// CompletionGrace is the grace-window duration an assistant turn waits
+	// before authoritatively clearing busy (default defaultCompletionGrace).
+	// Must be positive.
+	CompletionGrace time.Duration
+	// DeltaFlushInterval is the per-instance throttle window for streaming
+	// part-delta flushes (Option C / P1-AGG-004; default deltaFlushInterval).
+	// Must be positive.
+	DeltaFlushInterval time.Duration
+	// PartTextCap bounds the accumulated length of a single part's text field,
+	// in bytes (default partTextCap). Must be positive.
+	PartTextCap int
+	// WindowMaxCount / WindowMaxBytes are the dual bound for the initial
+	// message-window projection (defaults WindowMaxCount / WindowMaxBytes).
+	// Must be positive.
+	WindowMaxCount int
+	WindowMaxBytes int
+	// RecentArchiveTTL is the tombstone TTL for RemoveSessions
+	// (default recentArchiveTTL). Must be positive.
+	RecentArchiveTTL time.Duration
+	// RecentBucketRetentionMinutes bounds the number of minute-buckets retained
+	// in s.recentBucket (default defaultRecentBucketRetentionMinutes). Must be
+	// positive.
+	RecentBucketRetentionMinutes int
+}
+
+// DefaultConfig returns a Config populated with the package-default tunable
+// values for the given ring capacity. This is the configuration the legacy
+// positional New(ringCapacity) constructor produced; New delegates here. A
+// caller that takes operator-supplied configuration should construct a Config
+// explicitly (overriding the fields it exposes) and pass it to NewWithConfig.
+func DefaultConfig(ringCapacity int) Config {
+	return Config{
+		RingCapacity:                 ringCapacity,
+		CompletionGrace:              defaultCompletionGrace,
+		DeltaFlushInterval:           deltaFlushInterval,
+		PartTextCap:                  partTextCap,
+		WindowMaxCount:               WindowMaxCount,
+		WindowMaxBytes:               WindowMaxBytes,
+		RecentArchiveTTL:             recentArchiveTTL,
+		RecentBucketRetentionMinutes: defaultRecentBucketRetentionMinutes,
+	}
+}
+
+// validate returns an error describing the first non-positive or otherwise
+// invalid tunable in cfg, or nil if the whole family is sane. It is the single
+// construction-time guard (M6): NewWithConfig calls it before allocating any
+// runtime state, so a malformed Store can never exist.
+func (cfg Config) validate() error {
+	if cfg.RingCapacity <= 0 {
+		return fmt.Errorf("state.Config: RingCapacity must be positive, got %d", cfg.RingCapacity)
+	}
+	if cfg.CompletionGrace <= 0 {
+		return fmt.Errorf("state.Config: CompletionGrace must be positive, got %v", cfg.CompletionGrace)
+	}
+	if cfg.DeltaFlushInterval <= 0 {
+		return fmt.Errorf("state.Config: DeltaFlushInterval must be positive, got %v", cfg.DeltaFlushInterval)
+	}
+	if cfg.PartTextCap <= 0 {
+		return fmt.Errorf("state.Config: PartTextCap must be positive, got %d", cfg.PartTextCap)
+	}
+	if cfg.WindowMaxCount <= 0 {
+		return fmt.Errorf("state.Config: WindowMaxCount must be positive, got %d", cfg.WindowMaxCount)
+	}
+	if cfg.WindowMaxBytes <= 0 {
+		return fmt.Errorf("state.Config: WindowMaxBytes must be positive, got %d", cfg.WindowMaxBytes)
+	}
+	if cfg.RecentArchiveTTL <= 0 {
+		return fmt.Errorf("state.Config: RecentArchiveTTL must be positive, got %v", cfg.RecentArchiveTTL)
+	}
+	if cfg.RecentBucketRetentionMinutes <= 0 {
+		return fmt.Errorf("state.Config: RecentBucketRetentionMinutes must be positive, got %d", cfg.RecentBucketRetentionMinutes)
+	}
+	return nil
+}
+
+// NewWithConfig is the canonical validated Store constructor (audit L-15 /
+// remediation M6). It validates the complete Config before allocating any
+// runtime state and returns an error (not a panic) on invalid configuration,
+// so production callers that take operator-supplied configuration can handle
+// the failure. Every tunable, including recentBucketRetentionMinutes, becomes
+// a Store instance field sourced from cfg.
+func NewWithConfig(cfg Config) (*Store, error) {
+	if err := cfg.validate(); err != nil {
+		return nil, err
+	}
 	return &Store{
 		epoch:                   newEpoch(),
 		sessions:                map[string]*sessionEntry{},
@@ -730,18 +843,18 @@ func New(ringCapacity int) *Store {
 		graceTimers:             map[string]*time.Timer{},
 		graceGen:                map[string]uint64{},
 		completionAuthoritative: map[string]bool{},
-		completionGrace:         defaultCompletionGrace,
-		// Tunable defaults promoted per-instance (GAP-S5): each is initialized
-		// from its package-level default var so production behavior is
-		// byte-identical, but tests now shrink the instance field (not the
-		// shared global) — killing the latent -race on a global mutated while
-		// a prior test's lingering goroutine still reads it.
-		deltaFlushInterval: deltaFlushInterval,
-		partTextCap:        partTextCap,
-		windowMaxCount:     WindowMaxCount,
-		windowMaxBytes:     WindowMaxBytes,
-		recentArchiveTTL:   recentArchiveTTL,
-		subtreeBusyCount:   map[string]int{},
+		// Every tunable is sourced from the validated Config (M6): the
+		// package-default values arrive via DefaultConfig, but the instance
+		// fields are the only thing the hot paths read — there is no
+		// package-global hot-path read left in the tunable family.
+		completionGrace:              cfg.CompletionGrace,
+		deltaFlushInterval:           cfg.DeltaFlushInterval,
+		partTextCap:                  cfg.PartTextCap,
+		windowMaxCount:               cfg.WindowMaxCount,
+		windowMaxBytes:               cfg.WindowMaxBytes,
+		recentArchiveTTL:             cfg.RecentArchiveTTL,
+		recentBucketRetentionMinutes: cfg.RecentBucketRetentionMinutes,
+		subtreeBusyCount:             map[string]int{},
 		// Phase 1 (Gate C extension): the remaining 7 incremental subtree
 		// indexes. Maps are non-nil; rootIDs / recentBucketKeys start nil and
 		// are grown by rootsAppendLocked / insertRecentBucketKeyLocked.
@@ -758,7 +871,7 @@ func New(ringCapacity int) *Store {
 		coldFetchActive:        map[string]bool{},
 		seeded:                 map[string]bool{},
 		recentlyArchived:       map[string]time.Time{},
-		ring:                   newRingBuffer(ringCapacity),
+		ring:                   newRingBuffer(cfg.RingCapacity),
 		subs:                   map[int]*subscriber{},
 		// Finding 4: SourceOpencodeLive is the iota zero value. Without an
 		// explicit init here, ordinary daemon-originated emissions (messages
@@ -766,7 +879,27 @@ func New(ringCapacity int) *Store {
 		// opencode_live in Probe 2's SourceCount. Daemon-generated is the safe
 		// default for every emit path that does NOT set it explicitly.
 		curEmitSource: diag.SourceDaemonGenerated,
+	}, nil
+}
+
+// New returns an empty store with an event ring of the given capacity. It is a
+// COMPATIBILITY WRAPPER (audit L-15 / remediation M6) retained because the
+// constructor migration is large (~230 call sites): it translates the legacy
+// positional ringCapacity argument into a validated Config via DefaultConfig
+// and delegates to NewWithConfig, so every legacy call site still flows
+// through the single construction-time validation chokepoint.
+//
+// The panic is reachable ONLY for a non-positive ringCapacity, which every
+// production and test caller already avoids (the smallest capacity in the
+// suite is 3). Production code that takes operator-supplied tunables should
+// call NewWithConfig directly and handle the returned error rather than rely
+// on this wrapper's panic-on-invalid behavior.
+func New(ringCapacity int) *Store {
+	s, err := NewWithConfig(DefaultConfig(ringCapacity))
+	if err != nil {
+		panic(fmt.Sprintf("state.New(%d): %v", ringCapacity, err))
 	}
+	return s
 }
 
 func rawObj(kv map[string]interface{}) json.RawMessage {

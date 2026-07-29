@@ -43,11 +43,17 @@ package state
 
 import "time"
 
-// recentBucketRetentionMinutes bounds the number of minute-buckets retained in
-// s.recentBucket, bounding memory. Generous vs the default 10-min projection
-// cutoff (Phase 6) so a cutoff change within the window doesn't lose data.
-// Package var so Phase 6 / tests can tune it.
-var recentBucketRetentionMinutes = 60
+// defaultRecentBucketRetentionMinutes is the DEFAULT per-instance bound on the
+// number of minute-buckets retained in s.recentBucket (memory-bounded; generous
+// vs the default 10-min projection cutoff in Phase 6). It is read ONCE at Store
+// construction (NewWithConfig, via DefaultConfig) into the instance field
+// s.recentBucketRetentionMinutes, which is the field the hot path
+// (evictRecentBucketsLocked) reads under s.mu. A const (not a var) because the
+// former package-global var was read DIRECTLY off the var on the hot path
+// unsynchronized (audit L-15 / M-0285); the instance-field promotion closes
+// that race, and a const default cannot be re-introduced as a mutable global.
+// The per-instance tuning path is Config (passed to NewWithConfig).
+const defaultRecentBucketRetentionMinutes = 60
 
 // ----------------------------------------------------------------------------
 // SUM-class helpers (subtreeRetryCount, subtreePendingInput, subtreeDescendantCount)
@@ -488,7 +494,7 @@ func (s *Store) maintainNewestActivityOnSessionUpsertLocked(id string, prev *ses
 // A session lives in AT MOST ONE bucket — the one for its last-activity minute
 // (Unix/60). Maintenance: touchRecentBucketLocked (called from
 // setActivityLocked on every real transition) moves id to its new bucket,
-// removing it from any prior one. recentBucketRetentionMinutes bounds the
+// removing it from any prior one. s.recentBucketRetentionMinutes bounds the
 // number of buckets retained (memory-bounded). recentBucketKeys is the sorted
 // ascending list of bucket minutes, so the projection's cutoff-window walk is
 // O(buckets-in-window).
@@ -579,7 +585,7 @@ func (s *Store) evictRecentBucketsLocked() {
 		return
 	}
 	newest := s.recentBucketKeys[len(s.recentBucketKeys)-1]
-	cutoff := newest - int64(recentBucketRetentionMinutes)
+	cutoff := newest - int64(s.recentBucketRetentionMinutes)
 	for _, k := range s.recentBucketKeys {
 		if k < cutoff {
 			delete(s.recentBucket, k)
