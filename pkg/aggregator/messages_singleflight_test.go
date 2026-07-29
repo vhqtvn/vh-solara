@@ -106,7 +106,7 @@ func TestEnsureMessagesSyncAsyncSingleFlight(t *testing.T) {
 					close(winnerReturned)
 				}()
 			} else {
-				agg.EnsureMessagesAsync(context.Background(), sid)
+				agg.EnsureMessagesAsync(sid)
 			}
 
 			// Wait until the winner's GET is observably in flight. The slot is
@@ -124,7 +124,7 @@ func TestEnsureMessagesSyncAsyncSingleFlight(t *testing.T) {
 			if tc.winnerIsSync {
 				// winner is sync → second caller is async (dedupes via the shared slot)
 				go func() {
-					agg.EnsureMessagesAsync(context.Background(), sid)
+					agg.EnsureMessagesAsync(sid)
 					close(secondReturned)
 				}()
 			} else {
@@ -343,7 +343,7 @@ func TestEnsureMessagesTOCTOURecheck(t *testing.T) {
 			// both async — so each variant exercises its own re-check site).
 			winnerReturned := make(chan struct{})
 			if tc.async {
-				agg.EnsureMessagesAsync(context.Background(), sid)
+				agg.EnsureMessagesAsync(sid)
 			} else {
 				go func() {
 					_ = agg.EnsureMessages(context.Background(), sid)
@@ -363,7 +363,7 @@ func TestEnsureMessagesTOCTOURecheck(t *testing.T) {
 			lateReturned := make(chan struct{})
 			if tc.async {
 				go func() {
-					agg.EnsureMessagesAsync(context.Background(), sid)
+					agg.EnsureMessagesAsync(sid)
 					close(lateReturned)
 				}()
 			} else {

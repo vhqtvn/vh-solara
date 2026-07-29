@@ -109,7 +109,7 @@ export async function refreshOpenSessions() {
     try {
       const { items, window } = await fetchSessionMessages(id);
       setState("messages", id, buildMessages(items));
-      setState("messagesLoaded", id, true);
+      setState("messagesDelivered", id, true);
       // Phase 3: populate the resident-window state alongside the messages so
       // the Phase-4 "Load older" affordance works after a tree reconnect (not
       // just after the cold-load batch / a Stream-2 snapshot). Mirrors what

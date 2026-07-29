@@ -548,7 +548,7 @@ describe("I — stale async decode", () => {
       // Fresh state landed: m-fresh present, refresh cleared, delivered.
       expect(store.state.messages.s1.order).toEqual(["m-fresh"]);
       expect(store.state.refreshing.s1).toBe(false);
-      expect(store.state.messagesLoaded.s1).toBe(true);
+      expect(store.state.messagesDelivered.s1).toBe(true);
 
       // NOW complete the OLD connection's suspended decode. Before the fix the
       // post-await code only ran the epoch guard (unchanged by a sesGen bump),
@@ -567,7 +567,7 @@ describe("I — stale async decode", () => {
       // Refreshing stays cleared and messagesLoaded stays true (the stale
       // continuation must not touch reveal/refreshing state either).
       expect(store.state.refreshing.s1).toBe(false);
-      expect(store.state.messagesLoaded.s1).toBe(true);
+      expect(store.state.messagesDelivered.s1).toBe(true);
     } finally {
       // Restore the real global so the controlled DS never leaks to other tests.
       g.DecompressionStream = origDS;

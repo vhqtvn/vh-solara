@@ -107,8 +107,8 @@ export interface SyncState {
   // refreshOpenSessions) when a bounded tail lands; pruned on session.delete;
   // reset on switchProject. See MessageWindowState.
   //
-  // DISTINCT from messagesLoaded (the boolean "initial window delivered" gate):
-  // messagesLoaded tells the UI the transcript is ready to REVEAL;
+  // DISTINCT from messagesDelivered (the boolean "initial window delivered" gate):
+  // messagesDelivered tells the UI the transcript is ready to REVEAL;
   // messageWindows[id].hasOlder tells the UI a "Load older" button should SHOW.
   // The split lets the reveal gate and the windowing affordance evolve
   // independently (a warm reopen reveals instantly from cache while the window
@@ -131,22 +131,22 @@ export interface SyncState {
   // "reserved-but-not-delivered" (→ loading) from "delivered-and-empty"
   // (→ genuinely no messages). See ChatView maybeRestore's order-length guard
   // and the transcript empty-state discriminator.
-  messagesLoaded: Record<string, boolean>;
+  messagesDelivered: Record<string, boolean>;
   // Per-session flag: the active-session background hydration FAILED (the daemon
   // emitted messages.error and left the session unloaded). Distinct from
-  // messagesLoaded (which stays false on error): ChatView's visual-reveal gate
+  // messagesDelivered (which stays false on error): ChatView's visual-reveal gate
   // holds the transcript hidden until EITHER delivered OR errored, so a failed
   // hydration reveals whatever partial content we have (instead of wedging on a
   // blank loading state forever — messages.loaded never arrives on failure).
   // Cleared by a later messages.loaded / a successful Stream-2 snapshot, and
-  // pruned on session.delete (mirrors messagesLoaded).
+  // pruned on session.delete (mirrors messagesDelivered).
   messagesError: Record<string, boolean>;
   // Per-session flag: this session's Stream-2 (active-session) connection is
   // OPEN and its first authoritative snapshot has NOT arrived yet this
   // connection — i.e. we are showing cached/stale message state (a warm reopen
   // renders instantly from the in-memory transcript) while the fresh snapshot
   // is still in flight (the ~5s daemon-side serve). Distinct from
-  // messagesLoaded (which flips true IMMEDIATELY on a warm snapshot, so it
+  // messagesDelivered (which flips true IMMEDIATELY on a warm snapshot, so it
   // cannot signal "cached, refresh pending") and from connLatency.session.hydrate
   // (a per-CONNECTION one-shot diagnostic, not a live per-session flag). Set
   // true when openSessionStream (re)opens the stream, cleared when that
@@ -247,7 +247,7 @@ export const [state, setState] = createStore<SyncState>({
   sessions: {}, // §11: tree structure never persisted (tree=2 re-fetches on connect)
   messages: {},
   messageWindows: {},
-  messagesLoaded: {},
+  messagesDelivered: {},
   messagesError: {},
   refreshing: {},
   activity: loadActivity(initialDir),

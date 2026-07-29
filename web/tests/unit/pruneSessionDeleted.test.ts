@@ -6,7 +6,7 @@ import { state, setState } from "../../src/sync/store";
 
 // pruneSessionDeleted mirrors the session.delete event handler's pruning: it
 // removes a session from every client-side store slice (sessions, lastAgents,
-// messageWindows, messagesLoaded, messagesError, refreshing) and resets derived
+// messageWindows, messagesDelivered, messagesError, refreshing) and resets derived
 // caches (pageInFlight, persist).
 // It is called by archiveSession after a successful /vh/archive so that an
 // orphan whose server-side delete event never arrives (the session wasn't in
@@ -17,7 +17,7 @@ beforeEach(() => {
   setState("sessions", reconcile({}));
   setState("lastAgents", reconcile({}));
   setState("messageWindows", reconcile({}));
-  setState("messagesLoaded", reconcile({}));
+  setState("messagesDelivered", reconcile({}));
   setState("messagesError", reconcile({}));
   setState("refreshing", reconcile({}));
   setState("activity", reconcile({}));
@@ -34,13 +34,13 @@ describe("pruneSessionDeleted", () => {
     } as any);
     setState("lastAgents", "ghost", "Claude Sonnet");
     setState("messageWindows", "ghost", { hasMore: false, ids: ["m1"] } as any);
-    setState("messagesLoaded", "ghost", true);
+    setState("messagesDelivered", "ghost", true);
     setState("messagesError", "ghost", "something");
     setState("refreshing", "ghost", true);
 
     expect(state.sessions["ghost"]).toBeDefined();
     expect(state.lastAgents["ghost"]).toBe("Claude Sonnet");
-    expect(state.messagesLoaded["ghost"]).toBe(true);
+    expect(state.messagesDelivered["ghost"]).toBe(true);
 
     pruneSessionDeleted("ghost");
 
@@ -48,7 +48,7 @@ describe("pruneSessionDeleted", () => {
     expect(state.sessions["ghost"]).toBeUndefined();
     expect(state.lastAgents["ghost"]).toBeUndefined();
     expect(state.messageWindows["ghost"]).toBeUndefined();
-    expect(state.messagesLoaded["ghost"]).toBeUndefined();
+    expect(state.messagesDelivered["ghost"]).toBeUndefined();
     expect(state.messagesError["ghost"]).toBeUndefined();
     expect(state.refreshing["ghost"]).toBeUndefined();
   });
@@ -63,15 +63,15 @@ describe("pruneSessionDeleted", () => {
   it("prunes one session without touching a sibling", () => {
     setState("sessions", "sibling", { id: "sibling" } as any);
     setState("sessions", "target", { id: "target" } as any);
-    setState("messagesLoaded", "sibling", true);
-    setState("messagesLoaded", "target", true);
+    setState("messagesDelivered", "sibling", true);
+    setState("messagesDelivered", "target", true);
 
     pruneSessionDeleted("target");
 
     expect(state.sessions["target"]).toBeUndefined();
-    expect(state.messagesLoaded["target"]).toBeUndefined();
+    expect(state.messagesDelivered["target"]).toBeUndefined();
     // Sibling untouched.
     expect(state.sessions["sibling"]).toBeDefined();
-    expect(state.messagesLoaded["sibling"]).toBe(true);
+    expect(state.messagesDelivered["sibling"]).toBe(true);
   });
 });

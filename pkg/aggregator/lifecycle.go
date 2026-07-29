@@ -13,7 +13,7 @@ import (
 // and teardown.
 //
 // These functions own the seedMu-guarded lifecycle group (runCtx, armed,
-// cancel, onHydrate) plus the atomic hydratedOnce flag. seedMu is SHARED
+// cancel, onHydrate) plus the atomic anyHydrateCompleted flag. seedMu is SHARED
 // across lifecycle / hydration / cold-seed (Option 1 of the refactor brief):
 // it stays a single lock declared once on the Aggregator struct in
 // aggregator.go and acquired by code in all three concern files. There is NO
@@ -144,12 +144,12 @@ func (a *Aggregator) SetOnHydrate(fn func()) {
 	a.seedMu.Unlock()
 }
 
-// HydratedOnce reports whether this aggregator has completed at least one
+// AnyHydrateCompleted reports whether this aggregator has completed at least one
 // successful hydrate. Used by the web layer's reconcileQueuesForAgg as the
 // fail-closed gate: if false, the authoritative active-session set is not yet
 // populated and reconciliation MUST delete nothing. Lock-free atomic read —
 // safe to call on the request path (aggFor) without taking seedMu.
-func (a *Aggregator) HydratedOnce() bool { return a.hydratedOnce.Load() }
+func (a *Aggregator) AnyHydrateCompleted() bool { return a.anyHydrateCompleted.Load() }
 
 // Run keeps a live tail on OpenCode's event stream, re-hydrating the full view
 // on every (re)connect because the stream has no replay. It blocks until ctx is

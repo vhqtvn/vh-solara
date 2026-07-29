@@ -363,11 +363,11 @@ func TestEnsureMessagesAsyncSingleFlight(t *testing.T) {
 	// Register + launch the first fetch synchronously so the in-flight slot
 	// exists before we fan out concurrent opens against it (otherwise the test
 	// could read the count before the callers are even scheduled).
-	agg.EnsureMessagesAsync(context.Background(), "demo")
+	agg.EnsureMessagesAsync("demo")
 	// Fan out several MORE concurrent opens; every one must dedupe against the
 	// already-in-flight fetch (not start a second).
 	for i := 0; i < 5; i++ {
-		go agg.EnsureMessagesAsync(context.Background(), "demo")
+		go agg.EnsureMessagesAsync("demo")
 	}
 	agg.waitMessagesAsync("demo")
 
@@ -379,7 +379,7 @@ func TestEnsureMessagesAsyncSingleFlight(t *testing.T) {
 	}
 
 	// A subsequent open is a no-op (already loaded) → no second fetch.
-	agg.EnsureMessagesAsync(context.Background(), "demo")
+	agg.EnsureMessagesAsync("demo")
 	if got := h.countOf("demo"); got != 1 {
 		t.Fatalf("already-loaded session must not trigger a second fetch, got %d", got)
 	}
@@ -416,7 +416,7 @@ func TestEnsureMessagesAsyncSuccessEmitsCompletion(t *testing.T) {
 	ch, unsub := agg.Store().Subscribe(128)
 	defer unsub()
 
-	agg.EnsureMessagesAsync(context.Background(), "empty")
+	agg.EnsureMessagesAsync("empty")
 	agg.waitMessagesAsync("empty")
 
 	if !agg.Store().IsMessagesLoaded("empty") {
@@ -471,7 +471,7 @@ func TestEnsureMessagesAsyncFailureEmitsError(t *testing.T) {
 	ch, unsub := agg.Store().Subscribe(128)
 	defer unsub()
 
-	agg.EnsureMessagesAsync(context.Background(), "broken")
+	agg.EnsureMessagesAsync("broken")
 	agg.waitMessagesAsync("broken")
 
 	if agg.Store().IsMessagesLoaded("broken") {
@@ -509,7 +509,7 @@ func TestEnsureMessagesAsyncFailureEmitsError(t *testing.T) {
 
 	// Retry on reselect: a second trigger issues a fresh fetch (the slot was
 	// cleared and the session is still unloaded).
-	agg.EnsureMessagesAsync(context.Background(), "broken")
+	agg.EnsureMessagesAsync("broken")
 	agg.waitMessagesAsync("broken")
 	// The retry must have issued a SECOND upstream GET — proving the cleared
 	// slot allowed a genuine re-fetch rather than a silent no-op.
@@ -521,33 +521,47 @@ func TestEnsureMessagesAsyncFailureEmitsError(t *testing.T) {
 	}
 }
 
-// TestEnsureMessagesAsyncSurvivesRequestCancel proves the lifetime binding: the
-// background fetch must be bound to the AGGREGATOR's lifetime (a.runCtx, or
-// WithoutCancel(ctx) before Run), NOT to the caller's ctx. handleStream passes
-// r.Context() (well, Background() in the helper, but the contract is the same);
-// canceling a short-lived caller ctx must NOT abort a still-in-flight fetch.
+// TestAggregatorAsyncSurvivalWithoutCallerCtx is the standing check for audit
+// L-12 / remediation M15: EnsureMessagesAsync takes NO caller ctx because the
+// background fetch is bound to the AGGREGATOR's lifetime (a.runCtx, or
+// context.Background() before Run), NOT to the caller's request. handleStream's
+// r.Context() dies the moment the SSE handler returns; the operation must
+// survive that to populate the store for the NEXT client.
+//
+// This is the load-bearing behavioral crux for L-12: the test models the
+// caller's request ending (the request ctx is cancelled) and observes the OUTCOME
+// — the aggregator-owned async operation still completes and marks the session
+// loaded — rather than merely asserting the signature changed. The request ctx
+// is deliberately NOT passed to EnsureMessagesAsync: proving its cancellation
+// cannot reach the fetch is the whole point of removing the parameter. Making a
+// caller ctx authoritative would be a behavioral regression, not a cure.
 // Mirrors TestRehydrateSeedSurvivesRequestCancel.
-func TestEnsureMessagesAsyncSurvivesRequestCancel(t *testing.T) {
+func TestAggregatorAsyncSurvivalWithoutCallerCtx(t *testing.T) {
 	released := make(chan struct{})
 	h := &slowFullMessageHandler{inner: fixtures.New().Handler(), count: map[string]int{}, released: released}
 	oc := httptest.NewServer(h)
 	defer oc.Close()
 
 	agg := New(oc.URL, 100)
-	// A short-lived caller ctx, modeling handleStream's r.Context() dying when
-	// the handler returns.
+	// Model handleStream's r.Context(): a request ctx that dies when the
+	// handler returns. It is intentionally NOT passed to EnsureMessagesAsync —
+	// the parameterless signature is the correction under test.
 	reqCtx, cancel := context.WithCancel(context.Background())
-	agg.EnsureMessagesAsync(reqCtx, "demo")
-	// Wait until the fetch is observably in flight, THEN cancel the caller ctx.
+	_ = reqCtx
+	agg.EnsureMessagesAsync("demo")
+	// Wait until the fetch is observably in flight, THEN end the caller's
+	// request (cancel its ctx). Pre-fix this ctx was cosmetically threaded
+	// into the signature; now it is provably irrelevant to the fetch.
 	h.waitForCount(t, "demo", 1)
 	cancel()
-	// Release the fetch and let it complete. If the goroutine were bound to
-	// reqCtx, this completion would never happen (loaded stays false).
+	// Release the fetch and let it complete. If the operation were bound to
+	// the caller's request, this completion would never happen (loaded stays
+	// false). It completes because it is bound to aggregator lifetime.
 	close(released)
 	agg.waitMessagesAsync("demo")
 
 	if !agg.Store().IsMessagesLoaded("demo") {
-		t.Fatal("the background fetch must survive the caller-ctx cancel and mark loaded")
+		t.Fatal("the parameterless background fetch must complete bound to aggregator lifetime, surviving the caller request's end")
 	}
 }
 
@@ -570,7 +584,7 @@ func TestEnsureMessagesAsyncShutdownCancels(t *testing.T) {
 	agg.runCtx = runCtx
 	agg.seedMu.Unlock()
 
-	agg.EnsureMessagesAsync(context.Background(), "demo")
+	agg.EnsureMessagesAsync("demo")
 	h.waitForCount(t, "demo", 1)
 	// Shut the aggregator down while the fetch is in flight.
 	runCancel()
@@ -1132,10 +1146,10 @@ func TestRunStatusReconcileHealsStaleBusy(t *testing.T) {
 	// Wait for the one-shot hydrate reconcile to run against the empty store so
 	// the later stale-busy seed is not coincidentally cleared by hydrate.
 	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) && !agg.HydratedOnce() {
+	for time.Now().Before(deadline) && !agg.AnyHydrateCompleted() {
 		time.Sleep(2 * time.Millisecond)
 	}
-	if !agg.HydratedOnce() {
+	if !agg.AnyHydrateCompleted() {
 		t.Fatal("aggregator never completed initial hydrate")
 	}
 	agg.waitColdSeed()

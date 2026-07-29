@@ -29,7 +29,7 @@ import type { Snapshot } from "../../src/types";
 beforeEach(() => {
   setState("messages", reconcile({}));
   setState("messageWindows", reconcile({}));
-  setState("messagesLoaded", reconcile({}));
+  setState("messagesDelivered", reconcile({}));
   setState("messagesError", reconcile({}));
   setState("sessions", reconcile({}));
   setState("cursor", 0);
@@ -170,7 +170,7 @@ describe("applySessionSnapshot populates messageWindows[id]", () => {
     applySessionSnapshot("s1", snap);
     expect(state.messageWindows.s1.hasOlder).toBe(true);
     expect(state.messageWindows.s1.oldestResidentID).toBe("m1");
-    expect(state.messagesLoaded.s1).toBe(true);
+    expect(state.messagesDelivered.s1).toBe(true);
   });
 
   it("cold fork (messagesLoaded===false) still populates window from snap.messageWindows", () => {
@@ -178,7 +178,7 @@ describe("applySessionSnapshot populates messageWindows[id]", () => {
     // history yet (messagesLoaded=false), so messagesLoaded stays false — but
     // the window meta for whatever shipped in the partial snapshot still lands.
     setState("messages", "s1", { order: [], byId: {} });
-    setState("messagesLoaded", "s1", false);
+    setState("messagesDelivered", "s1", false);
     const snap: Snapshot = {
       seq: 2,
       sessions: [{ id: "s1" }],
@@ -187,7 +187,7 @@ describe("applySessionSnapshot populates messageWindows[id]", () => {
       messageWindows: { s1: { oldest_loaded_id: "only", has_older: false, message_count: 1 } },
     };
     applySessionSnapshot("s1", snap);
-    expect(state.messagesLoaded.s1).toBe(false);
+    expect(state.messagesDelivered.s1).toBe(false);
     expect(state.messageWindows.s1.hasOlder).toBe(false);
     expect(state.messageWindows.s1.oldestResidentID).toBe("only");
   });
@@ -265,7 +265,7 @@ describe("reset points — B2b parity", () => {
     expect(state.messageWindows.s1.hasOlder).toBe(true);
     expect(state.messageWindows.s1.oldestResidentID).toBe("m1");
     // The gate DID flip.
-    expect(state.messagesLoaded.s1).toBe(true);
+    expect(state.messagesDelivered.s1).toBe(true);
 
     // And a session with NO prior window state stays absent after messages.loaded.
     setState("messages", "s2", { order: [], byId: {} });
@@ -323,7 +323,7 @@ describe("partial → batch → loaded ordering (Phase 3 gate)", () => {
     // window) → messages.batch (the real bounded tail with window meta) →
     // messages.loaded (gate flip, window UNCHANGED).
     setState("messages", "s1", { order: [], byId: {} });
-    setState("messagesLoaded", "s1", false);
+    setState("messagesDelivered", "s1", false);
 
     // 1. Partial snapshot — gate says messagesLoaded=false; empty messages +
     //    an empty window (or none). Window state is {hasOlder:false} (nothing
@@ -335,7 +335,7 @@ describe("partial → batch → loaded ordering (Phase 3 gate)", () => {
       messages: { s1: [] },
       messageWindows: { s1: { has_older: false, message_count: 0 } },
     });
-    expect(state.messagesLoaded.s1).toBe(false);
+    expect(state.messagesDelivered.s1).toBe(false);
     expect(state.messageWindows.s1.hasOlder).toBe(false);
 
     // 2. messages.batch lands the real bounded tail. Window state is replaced.
@@ -353,11 +353,11 @@ describe("partial → batch → loaded ordering (Phase 3 gate)", () => {
     expect(state.messageWindows.s1.hasOlder).toBe(true);
     expect(state.messageWindows.s1.oldestResidentID).toBe("m1");
     // Gate NOT flipped yet (content-only event).
-    expect(state.messagesLoaded.s1).toBe(false);
+    expect(state.messagesDelivered.s1).toBe(false);
 
     // 3. messages.loaded flips the gate. Window state must be UNCHANGED.
     applyMessageEvent("messages.loaded", 41, { sessionID: "s1" }, false);
-    expect(state.messagesLoaded.s1).toBe(true);
+    expect(state.messagesDelivered.s1).toBe(true);
     expect(state.messageWindows.s1.hasOlder).toBe(true);
     expect(state.messageWindows.s1.oldestResidentID).toBe("m1");
     expect(state.messages.s1.order).toEqual(["m1", "m2", "m3"]);
@@ -393,7 +393,7 @@ describe("refreshOpenSessions populates messageWindows (third tail-landing path)
       ),
     );
     await refreshOpenSessions();
-    expect(state.messagesLoaded.s1).toBe(true);
+    expect(state.messagesDelivered.s1).toBe(true);
     expect(state.messageWindows.s1).toBeDefined();
     expect(state.messageWindows.s1.hasOlder).toBe(true);
     expect(state.messageWindows.s1.oldestResidentID).toBe("m1");

@@ -27,7 +27,7 @@ beforeEach(() => {
   // plain setState("x", {}) would leave stale nested keys; reconcile({}) diffs
   // each slice down to empty — selectors.test.ts / applySnapshot.test.ts pattern).
   setState("messages", reconcile({}));
-  setState("messagesLoaded", reconcile({}));
+  setState("messagesDelivered", reconcile({}));
   setSelectedIdRaw(null);
 });
 
@@ -93,7 +93,7 @@ describe("refreshOpenSessions — bounded-concurrent reconnect refresh", () => {
     // refreshes.
     release();
     await done;
-    for (const id of ids) expect(state.messagesLoaded[id]).toBe(true);
+    for (const id of ids) expect(state.messagesDelivered[id]).toBe(true);
   });
 
   it("skips the active session (owned by the live session stream)", async () => {
@@ -113,9 +113,9 @@ describe("refreshOpenSessions — bounded-concurrent reconnect refresh", () => {
 
     await refreshOpenSessions();
     expect(started).toEqual(["keep"]); // active session never round-tripped
-    expect(state.messagesLoaded.keep).toBe(true);
+    expect(state.messagesDelivered.keep).toBe(true);
     // The active session's delivery flag is left untouched by this path.
-    expect(state.messagesLoaded.skip).toBeUndefined();
+    expect(state.messagesDelivered.skip).toBeUndefined();
   });
 
   it("isolates per-session failures (one rejecting fetch does NOT starve the others)", async () => {
@@ -140,9 +140,9 @@ describe("refreshOpenSessions — bounded-concurrent reconnect refresh", () => {
     await expect(refreshOpenSessions()).resolves.toBeUndefined();
     // The two healthy sessions refreshed; the failed one kept stale (still
     // whatever it was before — undefined here — rather than starving ok1/ok2).
-    expect(state.messagesLoaded.ok1).toBe(true);
-    expect(state.messagesLoaded.ok2).toBe(true);
-    expect(state.messagesLoaded.boom).toBeUndefined();
+    expect(state.messagesDelivered.ok1).toBe(true);
+    expect(state.messagesDelivered.ok2).toBe(true);
+    expect(state.messagesDelivered.boom).toBeUndefined();
     expect(state.messages.ok1.order).toContain("m1");
     expect(state.messages.ok2.order).toContain("m1");
   });
@@ -192,7 +192,7 @@ describe("refreshOpenSessions — bounded-concurrent reconnect refresh", () => {
       vi.fn(() => Promise.resolve({ ok: true, json: () => ({ encoding: "gzip64", data }) })),
     );
     await refreshOpenSessions();
-    expect(state.messagesLoaded.gz).toBe(true);
+    expect(state.messagesDelivered.gz).toBe(true);
     expect(state.messages.gz.order).toEqual(["m1", "m2"]);
   });
 });

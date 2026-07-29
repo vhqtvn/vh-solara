@@ -83,14 +83,16 @@ func pinsPublicRespFromDoc(doc PinsDoc) pinsPublicResp {
 // putPinsReq is the PUT /vh/pins request body. BaseRevision is REQUIRED (nil →
 // 400); it is the CAS guard value the client read from its last GET/response.
 // InitializeOnly selects the init-guard form (succeeds only on an
-// uninitialized doc). MigrationID is advisory client idempotency metadata —
-// accepted and ignored in this slice (no idempotency store is built; a future
-// slice may wire it into s.idem if cross-request dedup is needed).
+// uninitialized doc). The decoder is lenient on unknown fields (forward
+// compatibility: a future client sending a new optional field must not get a
+// 400) — see TestPinsPUTAcceptsUnknownAdvisoryField. The obsolete advisory
+// MigrationID member was removed (audit L-11 / remediation M14); genuinely
+// unknown advisory fields remain safely ignorable rather than being retained
+// as named DTO members.
 type putPinsReq struct {
 	BaseRevision      *int64   `json:"baseRevision"`
 	OrderedSessionIDs []string `json:"orderedSessionIds"`
 	InitializeOnly    bool     `json:"initializeOnly,omitempty"`
-	MigrationID       string   `json:"migrationId,omitempty"`
 }
 
 // pinsUnknownSessionResp is the MACHINE-READABLE 400 body emitted when a PUT
@@ -233,14 +235,7 @@ func (s *Server) handlePinsPut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 5. advisory migrationId — accepted, not stored (no idempotency store in
-	//    this slice). Logged at debug so a client can confirm receipt without
-	//    polluting normal logs.
-	if req.MigrationID != "" {
-		vhlog.Debug("pins: migrationId received", "id", req.MigrationID)
-	}
-
-	// 6. Apply via Phase 1's Replace (CAS-guarded, atomically persisted).
+	// 5. Apply via Phase 1's Replace (CAS-guarded, atomically persisted).
 	ok, cur, err := s.pins.Replace(*req.BaseRevision, req.OrderedSessionIDs, activeProjects, req.InitializeOnly)
 	if err != nil {
 		// Persist failure — the store stayed consistent with disk (Phase 1

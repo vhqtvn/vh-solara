@@ -101,16 +101,16 @@ type Aggregator struct {
 	// fresh goroutine.
 	onHydrate func()
 
-	// hydratedOnce is a sticky flag set true at the end of the first successful
+	// anyHydrateCompleted is a sticky flag set true at the end of the first successful
 	// hydrate and never reset (Stop/close do not clear it — it records "this
 	// aggregator has produced at least one authoritative session set"). The web
-	// layer reads it via HydratedOnce() to distinguish "0 active sessions after
+	// layer reads it via AnyHydrateCompleted() to distinguish "0 active sessions after
 	// a successful hydrate" (all on-disk queues are orphans — safe to delete)
 	// from "not yet hydrated at all" (no authoritative set yet — delete NOTHING,
 	// fail-closed). atomic because hydrate writes it (OUTSIDE seedMu — the
-	// callback dispatch must not hold the lock) while HydratedOnce() callers on
+	// callback dispatch must not hold the lock) while AnyHydrateCompleted() callers on
 	// the request path (e.g. aggFor) read it lock-free.
-	hydratedOnce atomic.Bool
+	anyHydrateCompleted atomic.Bool
 
 	// msgMu guards msgInflight. msgInflight[sid] is non-nil (open) while a cold
 	// message-history fetch is in flight for that session — registered by EITHER

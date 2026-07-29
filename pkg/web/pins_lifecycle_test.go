@@ -10,7 +10,7 @@ package web
 //   - L3 post-hydrate backstop: reconcilePinsForProject removes a project's
 //     pins absent from the authoritative active set, scoped strictly by
 //     projectBySessionId (never an unopened project's pins); the driver
-//     reconcilePinsForAgg is fail-closed until HydratedOnce().
+//     reconcilePinsForAgg is fail-closed until AnyHydrateCompleted().
 //
 // Lane: Go co-located unit (pkg/web/). L1 exercises the real HTTP stack via
 // queueLifecycleServer (fakeOC + /vh/archive). L2/L3 use newPinsTestServer
@@ -348,12 +348,12 @@ func TestPinsL2_SubscriberBroadcastsUpdate(t *testing.T) {
 // Layer 3 — post-hydrate backstop (pkg/web/pins_lifecycle.go)
 // ============================================================================
 //
-// The driver reconcilePinsForAgg gates fail-closed on HydratedOnce() and then
+// The driver reconcilePinsForAgg gates fail-closed on AnyHydrateCompleted() and then
 // delegates to reconcilePinsForProject(key, activeSet). Mirroring the GC-3
 // queue reconcile test strategy, the core reconcile logic is tested directly
 // (reconcilePinsForProject with hand-built active sets) and the driver's
-// fail-closed gate is tested separately (HydratedOnce()==false → no-op). The
-// aggregator's hydratedOnce field is not settable from pkg/web without a real
+// fail-closed gate is tested separately (AnyHydrateCompleted()==false → no-op). The
+// aggregator's anyHydrateCompleted field is not settable from pkg/web without a real
 // hydrate, so the driver's success-path delegation is covered compositionally
 // by these two halves — exactly as FIX-QUEUE-GC-3's tests do.
 
@@ -490,7 +490,7 @@ func TestPinsL3_NoRemovalWhenAllPresent(t *testing.T) {
 }
 
 // TestPinsL3_DriverFailClosedWhenNotHydrated: reconcilePinsForAgg must delete
-// NOTHING when the aggregator has not yet completed a hydrate (HydratedOnce()
+// NOTHING when the aggregator has not yet completed a hydrate (AnyHydrateCompleted()
 // is false). This is the fail-closed gate: absence from an
 // unopened/failed/incomplete hydrate is NOT proof of deletion. Mirrors the
 // GC-3 queue reconcile gate test.
@@ -500,14 +500,14 @@ func TestPinsL3_DriverFailClosedWhenNotHydrated(t *testing.T) {
 	_ = defaultKey
 
 	// newPinsTestServer does NOT start the aggregator's Run loop, so
-	// HydratedOnce() is false — exactly the boot race this gate defends.
-	if srv.agg.HydratedOnce() {
+	// AnyHydrateCompleted() is false — exactly the boot race this gate defends.
+	if srv.agg.AnyHydrateCompleted() {
 		t.Fatalf("precondition: aggregator already hydrated; test harness assumption violated")
 	}
 
 	before := pinsGet(t, web.URL)
 	// The production trigger path would call exactly this. With
-	// HydratedOnce()==false it must short-circuit, removing nothing — even
+	// AnyHydrateCompleted()==false it must short-circuit, removing nothing — even
 	// though def-a is "absent" from the store's (empty) session map.
 	srv.reconcilePinsForAgg("", srv.agg)
 	after := pinsGet(t, web.URL)

@@ -21,14 +21,14 @@ import (
 // MUST delete nothing. Distinguishing "0 sessions after a successful hydrate"
 // (test 4a — all on-disk queues are orphans, delete all) from "not yet
 // hydrated" (test 4b — no authoritative set, delete nothing) is the whole
-// reason the aggregator exposes a HydratedOnce signal.
+// reason the aggregator exposes an AnyHydrateCompleted signal.
 //
 // These tests target two surfaces:
 //   - queueRegistry.reconcileOrphanQueues (the filesystem scan + cleanup) —
 //     called directly with a hand-built active map. Covers cases 1, 2, 3, 4a,
 //     5, 6, 7, 8.
 //   - Server.reconcileQueuesForAgg (the fail-closed driver gating on
-//     HydratedOnce + reading store.SessionIDs) — covers case 4b (not-yet-
+//     AnyHydrateCompleted + reading store.SessionIDs) — covers case 4b (not-yet-
 //     hydrated aggregator deletes nothing).
 //
 // Test harness: queueLifecycleServer wires a Server + temp root + chdir and
@@ -150,23 +150,23 @@ func TestQueueReconcile_EmptyNonNilInventoryDeletesAll(t *testing.T) {
 
 // 4b. Not-yet-hydrated aggregator deletes nothing via reconcileQueuesForAgg.
 //
-//	The HydratedOnce gate is the second fail-closed line: even if the registry
+//	The AnyHydrateCompleted gate is the second fail-closed line: even if the registry
 //	scan is reached through the Server driver (the production trigger path),
 //	an aggregator that has never completed a hydrate must short-circuit before
 //	building the active map. queueLifecycleServer does NOT start the Run loop,
-//	so the returned aggregator's HydratedOnce() is false — exactly the boot
+//	so the returned aggregator's AnyHydrateCompleted() is false — exactly the boot
 //	race condition this gate exists to defend.
 func TestQueueReconcile_NotYetHydratedAggregatorDeletesNothing(t *testing.T) {
 	_, agg, srv, root := queueLifecycleServer(t, &fakeOC{})
 	seedQueueFile(t, root, "s1")
 	seedQueueFile(t, root, "s2")
 
-	if agg.HydratedOnce() {
-		t.Fatalf("precondition: aggregator already hydrated (HydratedOnce=true); test harness assumption violated")
+	if agg.AnyHydrateCompleted() {
+		t.Fatalf("precondition: aggregator already hydrated (AnyHydrateCompleted=true); test harness assumption violated")
 	}
 
 	// This is the production trigger path (post-hydrate callback would call
-	// exactly this). With HydratedOnce=false it must return having deleted
+	// exactly this). With AnyHydrateCompleted=false it must return having deleted
 	// nothing, even though orphan queue.json files exist on disk.
 	srv.reconcileQueuesForAgg("", agg)
 

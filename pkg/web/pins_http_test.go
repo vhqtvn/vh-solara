@@ -6,7 +6,8 @@ package web
 // 409 on CAS mismatch (returns full current doc); PUT 400 for
 // malformed/duplicate/oversized/unknown-new-ID/missing-baseRevision; CSRF
 // enforcement; initializeOnly once-then-409; retained pins from an unopened
-// project survive; revision increments; migrationId accepted.
+// project survive; revision increments; unknown advisory fields accepted
+// (lenient decode) while MigrationID is absent from the DTO (L-11/M14).
 //
 // Lane: Go co-located unit (pkg/web/). These exercise the real HTTP stack via
 // httptest.NewServer(srv.Handler()), matching the established pattern in
@@ -20,6 +21,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -668,12 +670,30 @@ func TestPinsHTTPRevisionIncrements(t *testing.T) {
 	}
 }
 
-// --- migrationId accepted ---------------------------------------------------
+// --- DTO surface + lenient decode (L-11 / M14) -----------------------------
 
-// TestPinsHTTPMigrationIdAccepted verifies a request carrying migrationId is
-// accepted (200) — it is advisory idempotency metadata, not stored in this
-// slice. The response is the normal public doc.
-func TestPinsHTTPMigrationIdAccepted(t *testing.T) {
+// TestNoMigrationIDInDTO is the standing check for audit L-11 / remediation
+// M14: the obsolete advisory MigrationID field must NOT be a named operative
+// member of the PUT /vh/pins request DTO. The compiled DTO must not advertise
+// it as operative behavior; forward compatibility is preserved by lenient
+// handling of genuinely unknown advisory fields (the paired
+// TestPinsPUTAcceptsUnknownAdvisoryField), NOT by retaining obsolete named
+// fields. Fails if MigrationID returns to the typed DTO.
+func TestNoMigrationIDInDTO(t *testing.T) {
+	typ := reflect.TypeOf(putPinsReq{})
+	if f, ok := typ.FieldByName("MigrationID"); ok {
+		t.Fatalf("putPinsReq must not declare MigrationID (obsolete advisory field, L-11/M14); found field %q at index %v", f.Name, f.Index)
+	}
+}
+
+// TestPinsPUTAcceptsUnknownAdvisoryField is the paired acceptance side of the
+// L-11 / M14 contract: the PUT /vh/pins decoder is lenient on genuinely
+// UNKNOWN advisory request fields, so a future client sending a new optional
+// field does not get a 400. `migrationId` is now exactly such an unknown field
+// (the obsolete MigrationID DTO member was removed), so this request pins that
+// its presence does not break a well-formed PUT — preserving the desired
+// forward-compatible behavior without retaining the obsolete named field.
+func TestPinsPUTAcceptsUnknownAdvisoryField(t *testing.T) {
 	srv, web := newPinsTestServer(t)
 	seedPinSession(t, srv.agg, "m1")
 
@@ -685,11 +705,11 @@ func TestPinsHTTPMigrationIdAccepted(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
 		b, _ := io.ReadAll(resp.Body)
-		t.Fatalf("PUT with migrationId: status %d, want 200. body: %s", resp.StatusCode, b)
+		t.Fatalf("PUT with unknown advisory field migrationId: status %d, want 200. body: %s", resp.StatusCode, b)
 	}
 	r := decodePinsResp(t, resp.Body)
 	if r.Revision != 1 || len(r.OrderedSessionIDs) != 1 {
-		t.Fatalf("PUT with migrationId: revision=%d order=%v", r.Revision, r.OrderedSessionIDs)
+		t.Fatalf("PUT with unknown advisory field: revision=%d order=%v", r.Revision, r.OrderedSessionIDs)
 	}
 }
 

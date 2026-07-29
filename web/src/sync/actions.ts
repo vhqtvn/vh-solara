@@ -68,11 +68,11 @@ export function switchProject(dir: string, fromUrl = false) {
       s.sessions = {};
       s.messages = {};
       // Phase 3: clear the per-session bounded-window map alongside the other
-      // per-session maps (messagesLoaded/messagesError). A previous project's
+      // per-session maps (messagesDelivered/messagesError). A previous project's
       // window state (hasOlder / oldestResidentID) must not leak across the
       // switch — the new project's snapshot repopulates it from scratch.
       s.messageWindows = {};
-      s.messagesLoaded = {};
+      s.messagesDelivered = {};
       s.messagesError = {};
       s.activity = loadActivity(dir);
       // B2b audit: lastAgents is a per-session facet that must NOT carry over
@@ -118,10 +118,10 @@ export function switchProject(dir: string, fromUrl = false) {
 export async function openSession(id: string) {
   // Mark not-delivered only when actually reserving a fresh slot. A reopening
   // session keeps its cached messages (and its delivered=true) so it renders
-  // instantly instead of flashing a loading state. See SyncState.messagesLoaded.
+  // instantly instead of flashing a loading state. See SyncState.messagesDelivered.
   if (!state.messages[id]) {
     setState("messages", id, { order: [], byId: {} });
-    setState("messagesLoaded", id, false);
+    setState("messagesDelivered", id, false);
   }
 }
 

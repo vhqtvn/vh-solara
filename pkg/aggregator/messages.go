@@ -21,11 +21,11 @@ import (
 // the GAP-1/GAP-2 characterization in messages_singleflight_test.go).
 //
 // Both paths gate on `armed` (read once under seedMu at entry) for the
-// project-isolation backstop, and derive their fetch ctx from the
-// AGGREGATOR's lifetime (a.runCtx, read under seedMu) — NOT the caller's ctx,
-// which dies on handler return. The fetchCtx binding is what lets an async
-// fetch survive handleStream's r.Context() cancellation to populate the store
-// for the NEXT client.
+// project-isolation backstop. The async fetch ctx is the AGGREGATOR's lifetime
+// (a.runCtx, read under seedMu) — NOT a caller request ctx, which dies on
+// handler return; EnsureMessagesAsync therefore takes NO caller ctx (audit
+// L-12 / remediation M15), so a fetch survives handleStream's r.Context()
+// cancellation to populate the store for the NEXT client.
 //
 // Cross-package lock nesting: the only edge is msgMu → s.mu (the Store's
 // RWMutex), created by the under-lock IsMessagesLoaded re-check in BOTH
@@ -214,7 +214,7 @@ func (a *Aggregator) EnsureMessages(ctx context.Context, sessionID string) error
 		// genuine warm reconcile (no batch required) AND the resident-parts
 		// gate IsMessagesLoaded now holds. The gate (msgLoaded && resident) is
 		// the SAME signal the snapshot's GateFacts.MessagesLoaded exposes, so
-		// the client's messages.loaded (which flips its messagesLoaded=true)
+		// the client's messages.loaded (which flips its messagesDelivered=true)
 		// can never disagree with the gate: a fetch that left a completed
 		// assistant with zero resident parts (the S5 envelope-only shape) does
 		// NOT emit loaded — the client stays in the loading state and the next
@@ -249,12 +249,15 @@ func (a *Aggregator) EnsureMessages(ctx context.Context, sessionID string) error
 // ONE upstream fetch (a loser that's already subscribed just receives the
 // eventual completion event). No-op if the session is already loaded.
 //
-// The fetch goroutine is bound to the AGGREGATOR's LIFETIME ctx (a.runCtx), NOT
-// the caller's ctx: handleStream's r.Context() dies the moment the SSE handler
-// returns, but the fetch must survive to populate the store + emit completion
-// for the NEXT client that opens the session. Mirrors startColdSeed's lifetime
-// binding; falls back to a request-detached ctx (context.WithoutCancel) when Run
-// hasn't been called yet (tests calling this directly).
+// The fetch goroutine is bound to the AGGREGATOR's LIFETIME ctx (a.runCtx), not
+// to any caller request ctx (audit L-12 / remediation M15): handleStream's
+// r.Context() dies the moment the SSE handler returns, but the fetch must
+// survive to populate the store + emit completion for the NEXT client that
+// opens the session. The signature therefore takes no caller ctx — accepting
+// one would falsely suggest the caller controls this operation's lifetime.
+// Mirrors startColdSeed's lifetime binding; falls back to a detached
+// context.Background() when Run hasn't been called yet (tests calling this
+// directly).
 //
 // On success: SetSessionMessages (marks loaded, emits message.*/part.* deltas)
 // THEN EmitMessagesLoaded (carrying fetch/reconcile split timing) —
@@ -263,7 +266,7 @@ func (a *Aggregator) EnsureMessages(ctx context.Context, sessionID string) error
 // loading state. On failure (and NOT a shutdown):
 // log + EmitMessagesError, leave the session UNLOADED so a reselect / transport
 // reconnect retries; on shutdown (ctx cancelled) just exit silently.
-func (a *Aggregator) EnsureMessagesAsync(ctx context.Context, sessionID string) {
+func (a *Aggregator) EnsureMessagesAsync(sessionID string) {
 	if sessionID == "" {
 		return
 	}
@@ -314,17 +317,21 @@ func (a *Aggregator) EnsureMessagesAsync(ctx context.Context, sessionID string) 
 	done := make(chan struct{})
 	a.msgInflight[sessionID] = done
 	a.msgMu.Unlock()
-	// Derive the fetch ctx from the AGGREGATOR's lifetime (a.runCtx), NOT the
-	// caller's: handleStream's r.Context() is cancelled when the handler
-	// returns, which would abort a fetch the store needs. Read under seedMu —
-	// a.runCtx is the seedMu-guarded lifetime ctx Run captures (mirrors
-	// startColdSeed). When Run hasn't run yet (a.runCtx == nil, e.g. tests),
-	// detach from the caller so a short-lived ctx can't kill it mid-fetch.
+	// Derive the fetch ctx from the AGGREGATOR's lifetime (a.runCtx). The
+	// caller no longer passes a ctx (audit L-12 / remediation M15): the
+	// operation is bound to aggregator lifetime, NOT to the caller's request,
+	// because handleStream's r.Context() dies the moment the SSE handler
+	// returns, which would abort a fetch the store needs for the NEXT client.
+	// Read under seedMu — a.runCtx is the seedMu-guarded lifetime ctx Run
+	// captures (mirrors startColdSeed). When Run hasn't run yet (a.runCtx ==
+	// nil, e.g. bare tests calling this directly), fall back to a detached
+	// context.Background() so a fetch is never bound to a request that has
+	// already ended.
 	a.seedMu.Lock()
 	fetchCtx := a.runCtx
 	a.seedMu.Unlock()
 	if fetchCtx == nil {
-		fetchCtx = context.WithoutCancel(ctx)
+		fetchCtx = context.Background()
 	}
 
 	go func() {

@@ -30,7 +30,7 @@ package web
 //   - L3 is driven by the aggregator's onHydrate callback — the SAME single
 //     post-hydrate callback field the queue GC-3 reconcile uses (the aggregator
 //     exposes one onHydrate slot; installQueueGCCleanup composes BOTH reconciles
-//     into it). It is gated FAIL-CLOSED by HydratedOnce() and scoped strictly by
+//     into it). It is gated FAIL-CLOSED by AnyHydrateCompleted() and scoped strictly by
 //     projectBySessionId, so it catches sessions deleted WHILE THE WORKER WAS
 //     DOWN (no subscriber saw them) without ever dropping a retained pin whose
 //     owning project is unopened.
@@ -107,7 +107,7 @@ func (s *Server) removePinsAndBroadcast(ids []string) {
 // activeSet MAY be empty (a project that hydrated with zero sessions): every
 // pin scoped to that project is then genuinely absent and is removed. This is
 // the OPPOSITE of the not-yet-hydrated case, which the driver
-// (reconcilePinsForAgg) gates on HydratedOnce BEFORE calling this — so an empty
+// (reconcilePinsForAgg) gates on AnyHydrateCompleted BEFORE calling this — so an empty
 // activeSet reaching here is always "authoritative zero", never "no inventory
 // yet".
 //
@@ -139,17 +139,17 @@ func (s *Server) reconcilePinsForProject(doc PinsDoc, key string, activeSet map[
 // when the default aggregator already hydrated at boot.
 //
 // FAIL-CLOSED gate (the single most important rule, identical to GC-3's): if
-// a.HydratedOnce() is false, the aggregator has not yet produced an
+// a.AnyHydrateCompleted() is false, the aggregator has not yet produced an
 // authoritative active-session set, so this returns WITHOUT removing anything.
 // Absence from an unopened/failed/incomplete hydrate is NOT proof of deletion.
 // The empty active-set case (hydrate succeeded with zero sessions) is the
-// OPPOSITE: HydratedOnce is true and every project-scoped pin is correctly
+// OPPOSITE: AnyHydrateCompleted is true and every project-scoped pin is correctly
 // removed — this is what catches sessions deleted WHILE THE WORKER WAS DOWN.
 //
 // Active-set source: a.Store().SessionIDs() — the SAME authoritative set
 // store.Hydrate just installed (hydrate calls store.Hydrate BEFORE firing
 // onHydrate; SessionIDs reads the map Hydrate writes, under RLock). Calling it
-// AFTER the HydratedOnce gate guarantees we read a set produced by a completed
+// AFTER the AnyHydrateCompleted gate guarantees we read a set produced by a completed
 // hydrate, not a stale/pre-hydrate map.
 //
 // Project identity: projectKey(projectRoot(dir)) — the SAME key the PinStore
@@ -157,7 +157,7 @@ func (s *Server) reconcilePinsForProject(doc PinsDoc, key string, activeSet map[
 // pins" matches the pin doc's own attribution. A root-resolution failure
 // (effectively never — os.Getwd/filepath.Abs) logs and returns without removing.
 func (s *Server) reconcilePinsForAgg(dir string, a *aggregator.Aggregator) {
-	if !a.HydratedOnce() {
+	if !a.AnyHydrateCompleted() {
 		return // FAIL-CLOSED: no authoritative set yet → remove nothing
 	}
 	root, err := projectRoot(dir)

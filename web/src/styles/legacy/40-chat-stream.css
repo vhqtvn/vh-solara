@@ -108,7 +108,7 @@
 .chat-loading-text { font-size: 14px; }
 /* VISUAL REVEAL GATE — `.ready` is added to .chat-content when ChatView's
    `revealed()` memo is true: positioned (ready, for scroll-restore geometry) AND
-   fully delivered (messagesLoaded) OR the background fetch failed. The opacity:0
+   fully delivered (messagesDelivered) OR the background fetch failed. The opacity:0
    window is intentionally wider than `ready()` alone: it covers the WHOLE
    Slice-C async-hydration window (partial snapshot → message/part deltas →
    messages.loaded) so the transcript never visibly populates top-down. opacity:0

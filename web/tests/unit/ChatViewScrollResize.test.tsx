@@ -185,7 +185,7 @@ const seedPartless = (): void => {
       },
     },
   });
-  setState("messagesLoaded", SID, true);
+  setState("messagesDelivered", SID, true);
 };
 
 // Constants modelled on nearBottom()'s < 24px threshold.
@@ -246,7 +246,7 @@ describe("P1-WEB-042 — scrollEl ResizeObserver nearBottom() re-engagement", ()
     roRegistrations.length = 0;
     rafQueue.length = 0;
     setState("messages", SID, undefined as any);
-    setState("messagesLoaded", SID, undefined as any);
+    setState("messagesDelivered", SID, undefined as any);
     clearReadAnchor(SID);
     localStorage.clear();
   });

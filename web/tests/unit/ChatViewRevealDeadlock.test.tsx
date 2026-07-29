@@ -7,7 +7,7 @@
 // to CollapsedBranchStub rows, so opening one is a COLD load. A cold session
 // delivers in TWO SSE frames:
 //   1. messages.batch  — wholesale-sets state.messages[sid] (DOM grows)
-//   2. messages.loaded — sets state.messagesLoaded[sid]=true (NO DOM change)
+//   2. messages.loaded — sets state.messagesDelivered[sid]=true (NO DOM change)
 //
 // ChatView's reveal gate holds `.chat-content` at opacity:0 (CSS class `.ready`
 // absent) until `revealed()` is true. Before the fix `revealed()` was
@@ -147,8 +147,8 @@ describe("ChatView reveal-gate — O1 cold-stub deadlock self-heal", () => {
     clearReadAnchor("s2");
     setState("messages", "s1", undefined as any);
     setState("messages", "s2", undefined as any);
-    setState("messagesLoaded", "s1", undefined as any);
-    setState("messagesLoaded", "s2", undefined as any);
+    setState("messagesDelivered", "s1", undefined as any);
+    setState("messagesDelivered", "s2", undefined as any);
     setState("messagesError", "s1", undefined as any);
     setState("messagesError", "s2", undefined as any);
   });
@@ -177,7 +177,7 @@ describe("ChatView reveal-gate — O1 cold-stub deadlock self-heal", () => {
     // the gate stayed closed forever (the deadlock). The delivered-flip self-heal
     // effect must re-run maybeRestore → with delivered=true the defer condition
     // is false → maybeRestore proceeds → setReady(true) → revealed() → .ready.
-    setState("messagesLoaded", "s1", true);
+    setState("messagesDelivered", "s1", true);
     await waitFor(() => {
       expect(readyClass(container)).toMatch(/\bready\b/);
     });
@@ -203,7 +203,7 @@ describe("ChatView reveal-gate — O1 cold-stub deadlock self-heal", () => {
     expect(state.messages["s1"].order).toEqual([]);
 
     // delivered flips true, but the order is STILL empty.
-    setState("messagesLoaded", "s1", true);
+    setState("messagesDelivered", "s1", true);
     // The gate must open (stale-anchor branch pins to bottom + setReady).
     await waitFor(() => {
       expect(readyClass(container)).toMatch(/\bready\b/);
@@ -253,7 +253,7 @@ describe("ChatView reveal-gate — O1 cold-stub deadlock self-heal", () => {
     const { container } = render(() => <ChatView sessionId="s2" />);
     await waitFor(() => expect(state.messages["s2"]).toBeTruthy());
     setState("messages", "s2", { order: ["m1"], byId: { m1: mkMsg("m1") } });
-    setState("messagesLoaded", "s2", true);
+    setState("messagesDelivered", "s2", true);
     await waitFor(() => {
       expect(readyClass(container)).toMatch(/\bready\b/);
     });
@@ -262,7 +262,7 @@ describe("ChatView reveal-gate — O1 cold-stub deadlock self-heal", () => {
     // messagesLoaded=false on a cold snapshot, so delivered() transiently drops.
     // The base gate would close (ready && delivered → false); the per-session
     // reveal latch must hold the already-shown, populated transcript visible.
-    setState("messagesLoaded", "s2", false);
+    setState("messagesDelivered", "s2", false);
     // Give effects a tick to settle; the .ready class must NOT disappear.
     await new Promise((r) => setTimeout(r, 30));
     expect(readyClass(container)).toMatch(/\bready\b/);

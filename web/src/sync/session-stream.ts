@@ -175,7 +175,7 @@ let sesHydrating = false;
 // application-compressed (gzip+base64) and its decode is ASYNC (native
 // DecompressionStream); EventSource fires the next event (messages.loaded) as
 // soon as the batch listener RETURNS — i.e. before the decode resolves.
-// Without coordination messages.loaded would flip messagesLoaded (the reveal
+// Without coordination messages.loaded would flip messagesDelivered (the reveal
 // gate) before the batch content staged → flash of empty content at reveal.
 // The batch listener stashes its decode promise here; the messages.loaded /
 // messages.error listener awaits any pending entry for the session before
@@ -354,7 +354,7 @@ export function applySessionSnapshot(id: string, snap: Snapshot) {
   // renders "delivered-and-empty" instead of "loading".
   const loaded = snap.gate?.[id]?.messagesLoaded;
   if (loaded === false) {
-    setState("messagesLoaded", id, false);
+    setState("messagesDelivered", id, false);
     // Slice C "hydration attempt started": a partial snapshot (messagesLoaded
     // ===false) is the client-side signal that fires for BOTH openSession-driven
     // hydration AND a Stream-2 reconnect retry (which does NOT call openSession).
@@ -373,7 +373,7 @@ export function applySessionSnapshot(id: string, snap: Snapshot) {
       }),
     );
   } else {
-    setState("messagesLoaded", id, true); // true OR undefined (older daemon) → delivered
+    setState("messagesDelivered", id, true); // true OR undefined (older daemon) → delivered
     // A delivered snapshot supersedes a prior background-hydration failure
     // (e.g. retry after error, or a Stream-2 reconnect): clear the error so the
     // chat's reveal gate stops treating this session as "failed/partial".
@@ -691,7 +691,7 @@ export function openSessionStream(id: string, force = false) {
         // (native DecompressionStream), but EventSource fires the next event
         // (messages.loaded) as soon as this listener RETURNS — i.e. before the
         // decode resolves. Without coordination messages.loaded would flip
-        // messagesLoaded (the reveal gate, P1-WEB-020) before the batch content
+        // messagesDelivered (the reveal gate, P1-WEB-020) before the batch content
         // staged → flash of empty content at reveal. Promise-gate: stash the
         // decode promise keyed by sessionID; the messages.loaded/messages.error
         // path below awaits any pending entry before flipping the gate. The

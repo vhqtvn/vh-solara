@@ -24,7 +24,7 @@ beforeEach(() => {
   setState("sessions", reconcile({}));
   setState("messages", reconcile({}));
   setState("lastAgents", reconcile({}));
-  setState("messagesLoaded", reconcile({}));
+  setState("messagesDelivered", reconcile({}));
   setState("messagesError", reconcile({})); // F5: was leaking across tests
   setState("refreshing", reconcile({}));
   setState("activity", reconcile({}));
@@ -133,7 +133,7 @@ describe("applySessionEvent — B2b session.delete prunes per-session maps", () 
   it("deletes lastAgents/messagesLoaded/messagesError/refreshing alongside the session", () => {
     setState("sessions", "s1", { id: "s1" });
     setState("lastAgents", "s1", "build");
-    setState("messagesLoaded", "s1", true);
+    setState("messagesDelivered", "s1", true);
     setState("messagesError", "s1", true);
     setState("refreshing", "s1", true);
 
@@ -141,7 +141,7 @@ describe("applySessionEvent — B2b session.delete prunes per-session maps", () 
 
     expect(state.sessions.s1).toBeUndefined();
     expect(state.lastAgents.s1).toBeUndefined();
-    expect(state.messagesLoaded.s1).toBeUndefined();
+    expect(state.messagesDelivered.s1).toBeUndefined();
     expect(state.messagesError.s1).toBeUndefined();
     expect(state.refreshing.s1).toBeUndefined();
     expect(state.cursor).toBe(99); // the cursor still advances on a tracked event
@@ -163,7 +163,7 @@ describe("applySessionSnapshot / applyMessageEvent — Slice C async hydration",
   it("a HYDRATING partial snapshot does NOT mark the session delivered", () => {
     // openSession sets messagesLoaded=false on open; the hydrating snapshot must
     // NOT flip it to true (only messages.loaded / a loaded gate does).
-    setState("messagesLoaded", "s1", false);
+    setState("messagesDelivered", "s1", false);
     const snap: Snapshot = {
       seq: 1,
       sessions: [{ id: "s1" }],
@@ -173,7 +173,7 @@ describe("applySessionSnapshot / applyMessageEvent — Slice C async hydration",
     applySessionSnapshot("s1", snap);
     // messages slice is populated (empty order) but the delivery flag stays false
     // so the transcript shows "loading" rather than "delivered-and-empty".
-    expect(state.messagesLoaded.s1).toBe(false);
+    expect(state.messagesDelivered.s1).toBe(false);
     expect(state.messages.s1).toBeDefined();
   });
 
@@ -185,7 +185,7 @@ describe("applySessionSnapshot / applyMessageEvent — Slice C async hydration",
       messages: { s1: [{ info: { id: "m1", sessionID: "s1", role: "user" }, parts: [] }] },
     };
     applySessionSnapshot("s1", snap);
-    expect(state.messagesLoaded.s1).toBe(true);
+    expect(state.messagesDelivered.s1).toBe(true);
     expect(state.messages.s1.order).toEqual(["m1"]);
   });
 
@@ -197,7 +197,7 @@ describe("applySessionSnapshot / applyMessageEvent — Slice C async hydration",
       messages: { s1: [] },
     };
     applySessionSnapshot("s1", snap);
-    expect(state.messagesLoaded.s1).toBe(true);
+    expect(state.messagesDelivered.s1).toBe(true);
   });
 
   it("a hydrating snapshot ACTIVELY clears a stale delivered=true (daemon restart case)", () => {
@@ -206,7 +206,7 @@ describe("applySessionSnapshot / applyMessageEvent — Slice C async hydration",
     // delivered state lingers) must be flipped BACK to loading when a hydrating
     // partial snapshot (gate.messagesLoaded===false) overwrites messages[id].
     // Otherwise the empty-order snapshot renders "delivered-and-empty".
-    setState("messagesLoaded", "s1", true);
+    setState("messagesDelivered", "s1", true);
     const snap: Snapshot = {
       seq: 1,
       sessions: [{ id: "s1" }],
@@ -214,14 +214,14 @@ describe("applySessionSnapshot / applyMessageEvent — Slice C async hydration",
       messages: { s1: [] },
     };
     applySessionSnapshot("s1", snap);
-    expect(state.messagesLoaded.s1).toBe(false);
+    expect(state.messagesDelivered.s1).toBe(false);
     expect(state.messages.s1).toBeDefined();
   });
 
   it("messages.loaded flips the delivery flag (the completion signal)", () => {
-    setState("messagesLoaded", "s1", false); // was hydrating
+    setState("messagesDelivered", "s1", false); // was hydrating
     applyMessageEvent("messages.loaded", 42, { sessionID: "s1" }, false);
-    expect(state.messagesLoaded.s1).toBe(true);
+    expect(state.messagesDelivered.s1).toBe(true);
     // trackCursor:false → Stream 2 must NOT advance the shared resume cursor.
     expect(state.cursor).toBe(0);
   });
@@ -229,13 +229,13 @@ describe("applySessionSnapshot / applyMessageEvent — Slice C async hydration",
   it("messages.loaded fires even when the fetch returned no message.* deltas", () => {
     // Empty/unchanged fetch: no message.upsert would ever land, but the
     // completion event still flips the flag → "delivered-and-empty".
-    setState("messagesLoaded", "s1", false);
+    setState("messagesDelivered", "s1", false);
     applyMessageEvent("messages.loaded", 43, { sessionID: "s1" }, false);
-    expect(state.messagesLoaded.s1).toBe(true);
+    expect(state.messagesDelivered.s1).toBe(true);
   });
 
   it("messages.error sets messagesError + keeps messagesLoaded false", () => {
-    setState("messagesLoaded", "s1", false);
+    setState("messagesDelivered", "s1", false);
     applyMessageEvent("messages.error", 44, { sessionID: "s1", error: "boom" }, false);
     // messages.error is NOT completion, so it must NOT flip the delivery flag
     // (messagesLoaded stays false — a true here would show a misleading empty
@@ -245,17 +245,17 @@ describe("applySessionSnapshot / applyMessageEvent — Slice C async hydration",
     // of wedging on the loading UI forever (messages.loaded never arrives on
     // failure). So the old "keeps loading UI up" claim misdescribes post-4fa8255
     // behavior; only "messagesLoaded stays false" is still accurate.
-    expect(state.messagesLoaded.s1).toBe(false);
+    expect(state.messagesDelivered.s1).toBe(false);
     expect(state.messagesError.s1).toBe(true);
   });
 
   it("messages.loaded clears a prior messagesError (retry success supersedes failure)", () => {
     // A later successful load must clear a past failure flag so the reveal gate
     // stops treating the session as "failed/partial" (stream.ts messages.loaded).
-    setState("messagesLoaded", "s1", false);
+    setState("messagesDelivered", "s1", false);
     setState("messagesError", "s1", true);
     applyMessageEvent("messages.loaded", 50, { sessionID: "s1" }, false);
-    expect(state.messagesLoaded.s1).toBe(true);
+    expect(state.messagesDelivered.s1).toBe(true);
     expect(state.messagesError.s1).toBeUndefined();
   });
 
@@ -271,7 +271,7 @@ describe("applySessionSnapshot / applyMessageEvent — Slice C async hydration",
       messages: { s1: [] },
     };
     applySessionSnapshot("s1", snap);
-    expect(state.messagesLoaded.s1).toBe(true);
+    expect(state.messagesDelivered.s1).toBe(true);
     expect(state.messagesError.s1).toBeUndefined();
   });
 
@@ -292,7 +292,7 @@ describe("applySessionSnapshot / applyMessageEvent — Slice C async hydration",
       messages: { s1: [] },
     };
     applySessionSnapshot("s1", snap);
-    expect(state.messagesLoaded.s1).toBe(false);
+    expect(state.messagesDelivered.s1).toBe(false);
     expect(state.messagesError.s1).toBeUndefined();
   });
 
@@ -334,7 +334,7 @@ describe("applySessionSnapshot / applyMessageEvent — Slice C async hydration",
     // they can land before messages.loaded. They must populate the transcript
     // but not flip the delivery flag (only messages.loaded does). The
     // message.upsert payload is the FLAT MessageInfo ({id,sessionID,role}).
-    setState("messagesLoaded", "s1", false);
+    setState("messagesDelivered", "s1", false);
     setState("messages", "s1", { order: [], byId: {} });
     applyMessageEvent(
       "message.upsert",
@@ -343,7 +343,7 @@ describe("applySessionSnapshot / applyMessageEvent — Slice C async hydration",
       false,
     );
     expect(state.messages.s1.order).toContain("m1");
-    expect(state.messagesLoaded.s1).toBe(false);
+    expect(state.messagesDelivered.s1).toBe(false);
   });
 
   it("messages.batch wholesale-sets the transcript (cold-load structural fix)", () => {
@@ -354,7 +354,7 @@ describe("applySessionSnapshot / applyMessageEvent — Slice C async hydration",
     // reveal gate: content only; messages.loaded (still emitted after the batch)
     // flips messagesLoaded. So a batch landing while messagesLoaded===false
     // stages the content but does NOT claim loaded.
-    setState("messagesLoaded", "s1", false);
+    setState("messagesDelivered", "s1", false);
     setState("messages", "s1", { order: [], byId: {} });
     applyMessageEvent(
       "messages.batch",
@@ -375,13 +375,13 @@ describe("applySessionSnapshot / applyMessageEvent — Slice C async hydration",
     expect(state.messages.s1.byId.m2.parts.p2).toBeDefined();
     // The batch carries CONTENT; it must NOT flip the delivery flag (the gate
     // still waits for messages.loaded — P1-WEB-020 reveal gate is load-bearing).
-    expect(state.messagesLoaded.s1).toBe(false);
+    expect(state.messagesDelivered.s1).toBe(false);
     // trackCursor:false → Stream 2 must NOT advance the shared resume cursor.
     expect(state.cursor).toBe(0);
 
     // messages.loaded AFTER the batch flips the gate open (content was staged).
     applyMessageEvent("messages.loaded", 42, { sessionID: "s1" }, false);
-    expect(state.messagesLoaded.s1).toBe(true);
+    expect(state.messagesDelivered.s1).toBe(true);
     // Content survived — the wholesale set is not clobbered by the gate flip.
     expect(state.messages.s1.order).toEqual(["m1", "m2"]);
   });
@@ -393,7 +393,7 @@ describe("applySessionSnapshot / applyMessageEvent — Slice C async hydration",
     // decoded {sessionID, messages} to applyMessageEvent's "messages.batch"
     // case (unchanged). This pins the decode→apply contract the listener
     // relies on: the case must keep reading payload.sessionID + payload.messages.
-    setState("messagesLoaded", "s7", false);
+    setState("messagesDelivered", "s7", false);
     setState("messages", "s7", { order: [], byId: {} });
     const messages = [
       { info: { id: "m1", sessionID: "s7", role: "user", time: { created: 1 } }, parts: [{ id: "p1", sessionID: "s7", messageID: "m1", type: "text", text: "a" }] },
@@ -407,11 +407,11 @@ describe("applySessionSnapshot / applyMessageEvent — Slice C async hydration",
     expect(state.messages.s7.order).toEqual(["m1", "m2"]);
     expect(state.messages.s7.byId.m1.parts.p1).toBeDefined();
     expect(state.messages.s7.byId.m2.parts.p2).toBeDefined();
-    expect(state.messagesLoaded.s7).toBe(false);
+    expect(state.messagesDelivered.s7).toBe(false);
     expect(state.cursor).toBe(0); // trackCursor:false
     // The subsequent gate flip still works after the compressed ingest.
     applyMessageEvent("messages.loaded", 51, { sessionID: "s7" }, false);
-    expect(state.messagesLoaded.s7).toBe(true);
+    expect(state.messagesDelivered.s7).toBe(true);
     expect(state.messages.s7.order).toEqual(["m1", "m2"]);
   });
 });

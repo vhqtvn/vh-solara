@@ -160,18 +160,18 @@ export function applySessionEvent(kind: string, seq: number, payload: any) {
         delete s.sessions[payload.id];
         // B2b: prune the per-session metadata maps so a deleted session's facts
         // don't leak and can't resurrect on id-reuse. lastAgents is a
-        // snapshot-seeded facet that must not outlive the session; messagesLoaded
+        // snapshot-seeded facet that must not outlive the session; messagesDelivered
         // is the open-session delivery flag, cleared here to stay consistent with
         // the session's removal. (s.messages is owned by the Stream-2 / openSession
         // lifecycle and reconciled separately, so it is NOT pruned here — see
-        // SyncState.messagesLoaded.) Phase 3: messageWindows is pruned for the
+        // SyncState.messagesDelivered.) Phase 3: messageWindows is pruned for the
         // same reason — a stale window state (hasOlder/oldestResidentID) must not
         // resurrect on id-reuse. Phase 4: pageInFlight (the in-flight
         // historical-page request) is also pruned — a deleted session's in-flight
         // page must not land into a resurrected id-reuse.
         delete s.lastAgents[payload.id];
         delete s.messageWindows[payload.id];
-        delete s.messagesLoaded[payload.id];
+        delete s.messagesDelivered[payload.id];
         delete s.messagesError[payload.id];
         delete s.refreshing[payload.id];
         resetPageInFlight(payload.id);
@@ -205,7 +205,7 @@ export function pruneSessionDeleted(id: string) {
       delete s.sessions[id];
       delete s.lastAgents[id];
       delete s.messageWindows[id];
-      delete s.messagesLoaded[id];
+      delete s.messagesDelivered[id];
       delete s.messagesError[id];
       delete s.refreshing[id];
     }),
@@ -265,7 +265,7 @@ export function applyMessageEvent(kind: string, seq: number, payload: any, track
           // Clear any prior messagesError: a later successful load supersedes a
           // past failure (e.g. retry after a transient background-hydration error).
           if (payload.sessionID) {
-            s.messagesLoaded[payload.sessionID] = true;
+            s.messagesDelivered[payload.sessionID] = true;
             delete s.messagesError[payload.sessionID];
           }
           break;
@@ -280,7 +280,7 @@ export function applyMessageEvent(kind: string, seq: number, payload: any, track
           // tunnel each event is a yamux frame + WebSocket message, the root
           // cause of the cold-load stall). DECOUPLED from the reveal gate: this
           // carries content only; messages.loaded (still emitted after the batch)
-          // flips messagesLoaded so the gate opens. The batch MAY arrive before
+          // flips messagesDelivered so the gate opens. The batch MAY arrive before
           // messages.loaded — that is the whole point (content staged, then the
           // gate flips). Live message.upsert/part.upsert are unchanged.
           //

@@ -114,7 +114,7 @@ func TestEnsureMessagesAsyncSuppressesLoadedWithoutParts(t *testing.T) {
 
 	// First async open: schema-drift fetch returns a completed assistant with
 	// NO inline parts.
-	agg.EnsureMessagesAsync(context.Background(), "sub")
+	agg.EnsureMessagesAsync("sub")
 	agg.waitMessagesAsync("sub")
 	if got := h.countOf("sub"); got != 1 {
 		t.Fatalf("expected 1 async fetch, got %d", got)
@@ -141,7 +141,7 @@ func TestEnsureMessagesAsyncSuppressesLoadedWithoutParts(t *testing.T) {
 
 	// Second async open: the DB serves the real parts → the re-fetch populates
 	// them and the loaded event fires (the gate is now true).
-	agg.EnsureMessagesAsync(context.Background(), "sub")
+	agg.EnsureMessagesAsync("sub")
 	agg.waitMessagesAsync("sub")
 	if got := h.countOf("sub"); got != 2 {
 		t.Fatalf("async open path must RE-FETCH when resident parts are missing, got count %d", got)

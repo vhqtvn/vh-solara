@@ -2,7 +2,7 @@ import { expect, test } from "@playwright/test";
 import { projectUrl } from "./util";
 
 // Pins the CURRENT behaviour of the ".dot.hydrating" indicator after its driver
-// switched from the removed `state.hydrated` mirror to `messagesLoaded[id]`.
+// switched from the removed `state.hydrated` mirror to `messagesDelivered[id]`.
 // (Originally written RED-first against the now-fixed permanent-dot driver; see
 // the HISTORICAL NOTE below.)
 //
@@ -11,9 +11,9 @@ import { projectUrl } from "./util";
 //   TRANSIENT indicator shown only while a session's message history is being
 //   fetched (a cold-open). It renders at web/src/components/SessionTree.tsx:326:
 //       <Show when={state.status === "live"
-//                       && state.messagesLoaded[props.session.id] === false
+//                       && state.messagesDelivered[props.session.id] === false
 //                       && !busy()}>
-//   messagesLoaded[id] is `false` ONLY during the cold message-history fetch; it
+//   messagesDelivered[id] is `false` ONLY during the cold message-history fetch; it
 //   is `undefined` for idle never-opened sessions and flips to `true` once
 //   `messages.loaded` resolves. So the dot is ABSENT on idle rows and CLEARS the
 //   moment a selected session's history lands — never a permanent label.
@@ -36,25 +36,25 @@ import { projectUrl } from "./util";
 //
 // WHAT THESE TESTS ENCODE
 //   (1) A never-opened, idle session must NOT display the dot once the page has
-//       settled (messagesLoaded[id]===undefined → no dot).
+//       settled (messagesDelivered[id]===undefined → no dot).
 //   (2) Selecting (clicking) a never-opened session clears the dot — the
-//       cold-open fetch resolves, messagesLoaded flips to true, and the dot
+//       cold-open fetch resolves, messagesDelivered flips to true, and the dot
 //       disappears. (Because the idle row never arms the dot under the current
 //       driver, this is belt-and-suspenders; it also guards against a regression
 //       that re-arms the dot on or after selection.)
-//   Both are GREEN today under the messagesLoaded driver.
+//   Both are GREEN today under the messagesDelivered driver.
 //
 // SHARED-BACKEND STRATEGY (the suite is SERIAL workers:1 over ONE mutable
 // in-memory fixture backend — web/playwright.config.ts; each test reloads the
 // PAGE but the aggregator's msgLoaded/messages state persists for the whole
-// run, so once a session is opened it stays messagesLoaded===true).
+// run, so once a session is opened it stays messagesDelivered===true).
 //   - By the time this spec runs (alphabetically 8th: after agents, chat-
 //     controls-gating, chat-navigator, composer, features, features2, header),
 //     `demo`/`sub`/`other` have already been opened by chat-controls-gating.spec.ts
-//     (it opens all three), so they are messagesLoaded===true, not idle. `slow`
+//     (it opens all three), so they are messagesDelivered===true, not idle. `slow`
 //     is still never-opened here (only reveal-gate.spec.ts opens it, and that
 //     sorts later), but opening `slow` in the click test would pre-load it
-//     (messagesLoaded→true) and break reveal-gate's partial-load window.
+//     (messagesDelivered→true) and break reveal-gate's partial-load window.
 //     /fixture/reset only resets fixture-side messages/busy — NOT aggregator-side
 //     msgLoaded — so it cannot restore an idle row either.
 //   - The robust option: CREATE a brand-new session via a RAW POST /oc/session
@@ -62,12 +62,12 @@ import { projectUrl } from "./util";
 //     guaranteed never-opened (no spec opens it; it is born at test runtime).
 //     Crucially we do NOT route through the SPA's createSession()
 //     (web/src/sync/actions.ts:94), which would setSelectedId + openSession and
-//     flip messagesLoaded to true immediately — we fire the fetch directly so
+//     flip messagesDelivered to true immediately — we fire the fetch directly so
 //     the session lands in the tree (via session.created → session.upsert) but
-//     is never selected, keeping messagesLoaded[id]===undefined.
+//     is never selected, keeping messagesDelivered[id]===undefined.
 //   - We then RELOAD so Stream-1 reconnects and renders the new row from a
-//     fresh snapshot. Under the messagesLoaded driver this does NOT arm the dot
-//     (messagesLoaded[id] stays undefined for an idle never-opened row); the
+//     fresh snapshot. Under the messagesDelivered driver this does NOT arm the dot
+//     (messagesDelivered[id] stays undefined for an idle never-opened row); the
 //     CONFIRM blocks below are therefore silent no-ops today, and the DESIRED
 //     (dot absent) assertions gate the tests.
 
@@ -87,7 +87,7 @@ async function waitForTree(page: Page) {
 }
 
 // Create a brand-new never-opened session via a RAW POST /oc/session (NOT the
-// SPA's createSession, which auto-selects + opens → flips messagesLoaded to true). Run in-page so
+// SPA's createSession, which auto-selects + opens → flips messagesDelivered to true). Run in-page so
 // the request is same-origin; X-VH-CSRF is included for parity with the other
 // state-changing /oc/* probes (unread-dot.spec.ts) even though /vh/* is the
 // guarded prefix. Returns the new session id ("ses_new%d").
@@ -106,10 +106,10 @@ async function createNeverOpenedSession(page: Page): Promise<string> {
 }
 
 // (1) PRIMARY — a never-opened, idle session must NOT display the
-// "loading from server…" dot once the page has settled (messagesLoaded[id]===undefined).
+// "loading from server…" dot once the page has settled (messagesDelivered[id]===undefined).
 //
 // The CONFIRM below (non-gating, short timeout) is a RED-first vestige from the
-// old permanent-dot driver; under the current messagesLoaded driver the dot is
+// old permanent-dot driver; under the current messagesDelivered driver the dot is
 // never armed on an idle row, so the confirm is a silent no-op today. Only the
 // DESIRED (dot absent) assertion gates the test.
 test("never-opened idle session must not show a permanent hydrating dot", async ({ page }) => {
@@ -120,14 +120,14 @@ test("never-opened idle session must not show a permanent hydrating dot", async 
   // Create a guaranteed never-opened session (see strategy above).
   const id = await createNeverOpenedSession(page);
   // Wait for it to appear via session.upsert on the CURRENT Stream-1 — proves
-  // the aggregator has it before we reload. (messagesLoaded[id]===undefined
+  // the aggregator has it before we reload. (messagesDelivered[id]===undefined
   // here, so no dot yet.)
   await expect(page.locator(`.tree-node[data-session-id="${id}"]`)).toBeVisible({
     timeout: 10000,
   });
 
   // Reload so Stream-1 reconnects and renders `id` from a fresh snapshot. Under
-  // the messagesLoaded driver this does NOT arm the dot (messagesLoaded[id]
+  // the messagesDelivered driver this does NOT arm the dot (messagesDelivered[id]
   // stays undefined for an idle never-opened row).
   await page.goto(projectUrl("/?session=demo"));
   await waitForTree(page);
@@ -136,7 +136,7 @@ test("never-opened idle session must not show a permanent hydrating dot", async 
   });
 
   // CONFIRM (non-gating, RED-first vestige): under the old permanent-dot driver
-  // the dot would be armed here; today (messagesLoaded driver) the dot is never
+  // the dot would be armed here; today (messagesDelivered driver) the dot is never
   // armed on an idle row, so this silently no-ops and falls through to the
   // gating assertion below.
   try {
@@ -147,21 +147,21 @@ test("never-opened idle session must not show a permanent hydrating dot", async 
 
   // DESIRED behaviour (gating): once the page has settled, a never-opened idle
   // session must NOT carry a "loading from server…" dot. GREEN today
-  // (messagesLoaded[id]===undefined → no dot); a regression that re-arms the
+  // (messagesDelivered[id]===undefined → no dot); a regression that re-arms the
   // dot on idle rows would turn this RED.
   await expect(hydratingDot(page, id)).toHaveCount(0);
 });
 
 // (2) SELECTING a never-opened session must clear the hydrating dot. Under the
 // current driver the idle row never arms the dot to begin with
-// (messagesLoaded[id]===undefined); selecting it opens Stream-2 which runs the
-// cold message-history fetch → messagesLoaded flips to true → the dot stays
+// (messagesDelivered[id]===undefined); selecting it opens Stream-2 which runs the
+// cold message-history fetch → messagesDelivered flips to true → the dot stays
 // absent. Same confirm-then-desired shape as test (1).
 //
 // NOTE on "wait for messages to load": the brand-new session created above has
 // NO messages (POST /oc/session seeds none), so `.msg` never appears on open.
 // We instead wait for the row to be marked `.selected`, which proves the click
-// registered and openSessionChat ran — the fetch resolves to messagesLoaded===true,
+// registered and openSessionChat ran — the fetch resolves to messagesDelivered===true,
 // so the selection signal is sufficient to know we are observing the post-click
 // state.
 test("selecting a never-opened session must clear its hydrating dot", async ({ page }) => {
@@ -173,8 +173,8 @@ test("selecting a never-opened session must clear its hydrating dot", async ({ p
   await expect(page.locator(`.tree-node[data-session-id="${id}"]`)).toBeVisible({
     timeout: 10000,
   });
-  // Reload → fresh Stream-1 snapshot. Under the messagesLoaded driver `id`
-  // stays idle (messagesLoaded===undefined → no dot).
+  // Reload → fresh Stream-1 snapshot. Under the messagesDelivered driver `id`
+  // stays idle (messagesDelivered===undefined → no dot).
   await page.goto(projectUrl("/?session=demo"));
   await waitForTree(page);
   await expect(page.locator(`.tree-node[data-session-id="${id}"]`)).toBeVisible({
@@ -217,7 +217,7 @@ test("selecting a never-opened session must clear its hydrating dot", async ({ p
 
   // DESIRED behaviour (gating): after selecting the session, the hydrating dot
   // must be gone. GREEN today (the idle row never arms the dot, and selecting it
-  // runs the fetch → messagesLoaded===true); a regression that re-armed the dot
+  // runs the fetch → messagesDelivered===true); a regression that re-armed the dot
   // on or after selection would turn this RED.
   await expect(hydratingDot(page, id)).toHaveCount(0);
 });

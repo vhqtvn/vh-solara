@@ -99,7 +99,7 @@ function seedSession(sm: SessionMessages, oldestID: string, hasOlder = true) {
 beforeEach(() => {
   setState("messages", reconcile({}));
   setState("messageWindows", reconcile({}));
-  setState("messagesLoaded", reconcile({}));
+  setState("messagesDelivered", reconcile({}));
   setState("messagesError", reconcile({}));
   setState("cursor", 0);
   setState("epoch", "e1");

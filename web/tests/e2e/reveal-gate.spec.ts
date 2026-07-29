@@ -22,7 +22,7 @@ import { projectUrl } from "./util";
 // so the partial-hydration window can't be observed there. A dedicated "slow"
 // session holds its full-message GET for a bounded window (~900ms, see
 // handleSession's slow-hydration branch) so the aggregator streams a partial
-// snapshot (messagesLoaded=false → gate closed) and then fills via deltas +
+// snapshot (messagesDelivered=false → gate closed) and then fills via deltas +
 // messages.loaded (gate opens). This spec observes both states.
 
 test("slow session: .chat-content hides at opacity:0 during hydration then reveals at opacity:1", async ({

@@ -224,7 +224,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // can't tell "still loading" from "genuinely empty" — this flag does. Mirrors
   // maybeRestore's order-length guard below (~:591-595) and drives the
   // transcript empty/loading discriminator at the bottom of the render.
-  const delivered = () => !!state.messagesLoaded[props.sessionId];
+  const delivered = () => !!state.messagesDelivered[props.sessionId];
   // messageFailed: the active-session background hydration emitted
   // messages.error and the daemon left the session UNLOADED (it retries on next
   // selection/reconnect). The reveal gate falls back to this so a failed
@@ -233,7 +233,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   const messageFailed = () => !!state.messagesError[props.sessionId];
   // revealed: the VISUAL transcript reveal gate. This is the O2 fix for the
   // "transcript grows top-down" symptom: a large session's Slice-C async
-  // hydration streams a PARTIAL snapshot (messagesLoaded=false) followed by
+  // hydration streams a PARTIAL snapshot (messagesDelivered=false) followed by
   // message.*/part.* deltas and finally messages.loaded. Without this gate the
   // transcript populated progressively while already visible. `revealed` holds
   // the .chat-content opacity:hidden + loading overlay up until the transcript
@@ -250,7 +250,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // That sub-frame empty flash is flagged as a tail "drop" by the
   // session-completion e2e's strict sampler (it polls every mutation). This is
   // the SAME cold-open gap the revealedOnce opacity latch above was built for
-  // (messagesLoaded=false during a cold re-snapshot); the latch only protected
+  // (messagesDelivered=false during a cold re-snapshot); the latch only protected
   // the .ready opacity class, not the rendered rows. This extends the same hold
   // to the <For> list: while the entering session is still cold-opening (not
   // delivered, not failed) and the computed list is empty, KEEP the previous
@@ -267,7 +267,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // LEGITIMATELY revealed (positioned + delivered/failed), keep it revealed
   // while it stays positioned and populated even if delivered() transiently
   // drops — which happens when a resync/reconnect re-snapshots the session
-  // (applySessionSnapshot sets messagesLoaded=false on a cold re-snapshot). The
+  // (applySessionSnapshot sets messagesDelivered=false on a cold re-snapshot). The
   // base gate below is what FIRST reveals; the latch only prevents a transient
   // delivered drop from re-stranding an already-shown transcript behind the
   // opacity:0 overlay. It is per-session (set only when base fires for THIS sid)
@@ -653,12 +653,12 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       // {order:[],byId:{}} the instant a session is selected, so sm() is truthy
       // BEFORE the real snapshot arrives; an empty order means "not delivered yet".
       //
-      // delivered() gate (pre-select-hydration race fix): if messagesLoaded has
+      // delivered() gate (pre-select-hydration race fix): if messagesDelivered has
       // already flipped true while the order is STILL empty, there is nothing
       // left to wait for — either the session is genuinely empty (the stale-
       // anchor branch below pins to bottom + setReady, revealing the empty
       // state), or the batch already staged before the gate flip (pendingBatch
-      // coordination in stream.ts guarantees messagesLoaded flips AFTER the batch
+      // coordination in stream.ts guarantees messagesDelivered flips AFTER the batch
       // resolves). Without this gate the empty-order defer returned false
       // FOREVER for a stored anchor → ready() never set → revealed() false →
       // the pre-selected session stayed blank until a manual switch-away+back.
@@ -2214,7 +2214,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
               is in flight (slot reserved but not yet delivered), an empty hint
               once delivered-and-empty, or a failure hint if the background
               hydration errored. openSession pre-reserves a truthy-but-empty
-              slot, so we key off `delivered` (messagesLoaded) / `messageFailed`,
+              slot, so we key off `delivered` (messagesDelivered) / `messageFailed`,
               NOT sm() truthiness — otherwise "No messages" flashes before the
               snapshot lands. Per-message errors render inline above.
 

@@ -140,7 +140,7 @@ describe("ChatView F-SHAPE-B — partless-completed assistant message safety net
   afterEach(() => {
     cleanup();
     setState("messages", "s1", undefined as any);
-    setState("messagesLoaded", "s1", undefined as any);
+    setState("messagesDelivered", "s1", undefined as any);
     setState("messagesError", "s1", undefined as any);
   });
 
@@ -154,7 +154,7 @@ describe("ChatView F-SHAPE-B — partless-completed assistant message safety net
     // cold empty slot; wait for it before seeding.
     await waitFor(() => expect((container as any).ownerDocument && true).toBe(true));
     seed({ m1: mkPartlessCompleted("m1") });
-    setState("messagesLoaded", "s1", true);
+    setState("messagesDelivered", "s1", true);
 
     // The assistant row must be present (guards against a false red from the
     // message not rendering at all).
@@ -177,7 +177,7 @@ describe("ChatView F-SHAPE-B — partless-completed assistant message safety net
     // fully-hydrated completed message).
     const { container } = render(() => <ChatView sessionId="s1" />);
     seed({ m1: mkCompletedWithText("m1") });
-    setState("messagesLoaded", "s1", true);
+    setState("messagesDelivered", "s1", true);
 
     await waitFor(() =>
       expect(container.querySelector(".msg.assistant")).toBeTruthy(),

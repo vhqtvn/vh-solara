@@ -103,19 +103,19 @@ func (h *gap3GateHandler) waitForFull(want int, timeout time.Duration) bool {
 
 func (h *gap3GateHandler) releaseAll() { close(h.release) }
 
-// waitForHydratedOnce polls HydratedOnce() (lock-free atomic) until it is true
+// waitForAnyHydrateCompleted polls AnyHydrateCompleted() (lock-free atomic) until it is true
 // or the timeout lapses. Used by the GAP-3 test to deterministically observe
 // that Run's first hydrate has completed (and thus startColdSeed has been
 // dispatched) before driving Stop().
-func waitForHydratedOnce(a *Aggregator, timeout time.Duration) bool {
+func waitForAnyHydrateCompleted(a *Aggregator, timeout time.Duration) bool {
 	end := time.Now().Add(timeout)
 	for time.Now().Before(end) {
-		if a.HydratedOnce() {
+		if a.AnyHydrateCompleted() {
 			return true
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	return a.HydratedOnce()
+	return a.AnyHydrateCompleted()
 }
 
 // waitSeedDoneCleared polls a.seedDone (under seedMu) until it is nil (the
@@ -203,8 +203,8 @@ func TestStopDuringInFlightColdSeedAndAsyncFetch(t *testing.T) {
 
 	// Wait for the first hydrate to complete so startColdSeed has dispatched
 	// G4 (which fans out G6 tail-fetch workers). The cold-seed is background,
-	// so HydratedOnce()==true is the earliest reliable signal it was launched.
-	if !waitForHydratedOnce(agg, 5*time.Second) {
+	// so AnyHydrateCompleted()==true is the earliest reliable signal it was launched.
+	if !waitForAnyHydrateCompleted(agg, 5*time.Second) {
 		t.Fatal("aggregator never completed initial hydrate (Run not running?)")
 	}
 
@@ -218,7 +218,7 @@ func TestStopDuringInFlightColdSeedAndAsyncFetch(t *testing.T) {
 	// Trigger an async message fetch (G7) for a cold session. demo is NOT
 	// loaded after a cold hydrate (cold-seed only tails; the full history fetch
 	// happens on first open), so this spawns a fresh G7 full-fetch goroutine.
-	agg.EnsureMessagesAsync(context.Background(), "demo")
+	agg.EnsureMessagesAsync("demo")
 	if !h.waitForFull(1, 5*time.Second) {
 		t.Fatal("async full fetch never entered (G7 not dispatched?)")
 	}
@@ -369,8 +369,8 @@ func TestOnHydrateFiringDiscipline(t *testing.T) {
 		if got := count.Load(); got != 1 {
 			t.Fatalf("onHydrate fires: want exactly 1 on success, got %d", got)
 		}
-		if !agg.HydratedOnce() {
-			t.Fatal("HydratedOnce must be true after a successful hydrate (fail-closed gate for queue-GC)")
+		if !agg.AnyHydrateCompleted() {
+			t.Fatal("AnyHydrateCompleted must be true after a successful hydrate (fail-closed gate for queue-GC)")
 		}
 		// Let the background cold-seed finish so no G4 outlives the test.
 		agg.waitColdSeed()
@@ -380,7 +380,7 @@ func TestOnHydrateFiringDiscipline(t *testing.T) {
 		// /session returns 500 → hydrate fails at ListSessions and returns the
 		// error BEFORE reaching the onHydrate fire-site (which sits after
 		// store.Hydrate + the enrichment fan-out). This is the fail-closed
-		// guarantee: a partial/failed hydrate leaves hydratedOnce=false and
+		// guarantee: a partial/failed hydrate leaves anyHydrateCompleted=false and
 		// fires nothing, so the web-layer queue-GC deletes NOTHING.
 		mux := http.NewServeMux()
 		mux.HandleFunc("/session", func(w http.ResponseWriter, r *http.Request) {
@@ -404,8 +404,8 @@ func TestOnHydrateFiringDiscipline(t *testing.T) {
 		if got := count.Load(); got != 0 {
 			t.Fatalf("onHydrate must NOT fire on failure (fail-closed for queue-GC), got %d", got)
 		}
-		if agg.HydratedOnce() {
-			t.Fatal("HydratedOnce must stay false after a failed hydrate (no authoritative session set)")
+		if agg.AnyHydrateCompleted() {
+			t.Fatal("AnyHydrateCompleted must stay false after a failed hydrate (no authoritative session set)")
 		}
 	})
 }

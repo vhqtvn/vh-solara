@@ -278,8 +278,8 @@
 }
 .tree-title.needs-input { color: var(--warn, #e8a838) !important; font-weight: 600; }
 /* Feature 1 (S4): a TRANSIENT "loading from server…" indicator shown only while
-   a session's message history is being fetched (cold-open, messagesLoaded===false).
-   Absent for idle never-opened rows (messagesLoaded===undefined) and cleared the
+   a session's message history is being fetched (cold-open, messagesDelivered===false).
+   Absent for idle never-opened rows (messagesDelivered===undefined) and cleared the
    moment the fetch resolves — not a permanent label. A faint muted dot so the
    row reads "still loading" — non-urgent, so dim + slow pulse. */
 .dot.hydrating {

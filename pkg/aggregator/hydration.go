@@ -16,7 +16,7 @@ import (
 // messages, reconciles them into the store via id-level diff, kicks off the
 // background cold-seed (cold-seed.go), fans out the three enrichment GETs
 // (statuses / questions / permissions) concurrently under a WaitGroup, then —
-// only on full success — records hydratedOnce and fires the onHydrate callback.
+// only on full success — records anyHydrateCompleted and fires the onHydrate callback.
 //
 // seedMu is SHARED with lifecycle.go / cold-seed.go (Option 1: one lock, no
 // split). The two seedMu acquisitions here are both brief and non-blocking:
@@ -132,7 +132,7 @@ func (a *Aggregator) hydrate(ctx context.Context) error {
 	wg.Wait()
 
 	// Successful hydrate complete: the store now holds the authoritative active-
-	// session set. Record stickiness (HydratedOnce) and fire the onHydrate
+	// session set. Record stickiness (AnyHydrateCompleted) and fire the onHydrate
 	// callback (FIX-QUEUE-GC-3 orphan-queue reconciliation) so the web layer can
 	// delete on-disk queue.json files whose session IDs are NOT in this set.
 	// The callback is read under seedMu and invoked OUTSIDE the lock; production
@@ -140,8 +140,8 @@ func (a *Aggregator) hydrate(ctx context.Context) error {
 	// goroutine or risk a lock-order inversion against store/registry mutexes.
 	// This fire-site is reached ONLY on hydrate success — every error path above
 	// returns early before this point, so a failed/partial hydrate leaves
-	// hydratedOnce=false and fires nothing (fail-closed for reconciliation).
-	a.hydratedOnce.Store(true)
+	// anyHydrateCompleted=false and fires nothing (fail-closed for reconciliation).
+	a.anyHydrateCompleted.Store(true)
 	a.seedMu.Lock()
 	cb := a.onHydrate
 	a.seedMu.Unlock()

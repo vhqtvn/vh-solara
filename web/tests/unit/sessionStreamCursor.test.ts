@@ -21,7 +21,7 @@ import { state, setState } from "../../src/sync/store";
 beforeEach(() => {
   setState("messages", reconcile({}));
   setState("activity", reconcile({}));
-  setState("messagesLoaded", reconcile({}));
+  setState("messagesDelivered", reconcile({}));
   setState("messagesError", reconcile({}));
   setState("cursor", 0);
 });
@@ -109,7 +109,7 @@ describe("applyMessageEvent trackCursor:false — Stream2 replay invariant", () 
     setState("cursor", 200);
 
     applyMessageEvent("messages.loaded", 500, { sessionID: "s1" }, false);
-    expect(state.messagesLoaded.s1).toBe(true);
+    expect(state.messagesDelivered.s1).toBe(true);
     expect(state.cursor).toBe(200);
   });
 

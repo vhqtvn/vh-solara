@@ -164,7 +164,7 @@ describe("pre-selected session hydration on first page load", () => {
     // reveal) on the very first load. The sync layer must deliver this; the
     // VISUAL reveal (.chat-content opacity) is a separate ChatView concern
     // guarded by reveal-gate.spec.ts / ChatViewRevealDeadlock.test.tsx.
-    expect(store.state.messagesLoaded.s1).toBe(true);
+    expect(store.state.messagesDelivered.s1).toBe(true);
     expect(store.selectedId()).toBe("s1");
   });
 

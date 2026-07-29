@@ -31,11 +31,13 @@ export interface GateFacts {
   // upstream fetch, so the snapshot's gate carries messagesLoaded=false until
   // the background load completes; the client keeps its loading UI up until the
   // messages.loaded event (or a gate with messagesLoaded=true) lands.
-  // NAMING NOTE: this server GateFacts field shares its JSON spelling with the
-  // FE SyncState.messagesLoaded map (web/src/sync/store.ts) BY DESIGN — both
-  // answer "is this session's message data complete" — but they are NOT the
-  // same value: the gate field is the daemon-side fetch memo, the SyncState map
-  // is the per-client "Stream 2 has delivered it to me" flag.
+  // NAMING NOTE (audit L-02 / remediation M11): this server GateFacts field is
+  // the daemon-side fetch memo. The FE previously mirrored it under the SAME
+  // spelling (a client SyncState.messagesLoaded map), which collided with this
+  // wire field despite describing a materially different per-client fact; the
+  // client map is now SyncState.messagesDelivered (web/src/sync/store.ts) so the
+  // two no longer imply semantic equivalence. The wire spelling here is
+  // unchanged.
   messagesLoaded?: boolean;
   activity?: string;
   [k: string]: unknown;

@@ -924,7 +924,7 @@ func (qr *queueRegistry) CleanupSession(root, sessionID string) {
 //     and correctly results in every on-disk queue being treated as an orphan.
 //   - The caller (reconcileQueuesForAgg in server.go) is responsible for
 //     producing activeSessions ONLY from a successful post-hydrate
-//     store.SessionIDs() call and for gating on HydratedOnce() before calling.
+//     store.SessionIDs() call and for gating on AnyHydrateCompleted() before calling.
 //     The nil-check here is the second line of defense.
 //
 // Scan discipline:

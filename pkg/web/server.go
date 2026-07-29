@@ -626,14 +626,14 @@ func (s *Server) installQueueGCCleanup(dir string, a *aggregator.Aggregator) {
 	// production installs ONE callback per aggregator, here), so the pins
 	// post-hydrate reconcile piggybacks on it rather than registering a second
 	// callback that would clobber this one. reconcilePinsForAgg is fail-closed
-	// (gated on HydratedOnce, scoped by projectBySessionId) and dispatches to
+	// (gated on AnyHydrateCompleted, scoped by projectBySessionId) and dispatches to
 	// its own goroutine, so it never blocks hydrate or serializes against the
 	// queue reconcile. See pkg/web/pins_lifecycle.go.
 	a.SetOnHydrate(func() {
 		go s.reconcileQueuesForAgg(dir, a)
 		go s.reconcilePinsForAgg(dir, a)
 	})
-	if a.HydratedOnce() {
+	if a.AnyHydrateCompleted() {
 		go s.reconcileQueuesForAgg(dir, a)
 		go s.reconcilePinsForAgg(dir, a)
 	}
@@ -677,21 +677,21 @@ func (s *Server) installQueueGCCleanup(dir string, a *aggregator.Aggregator) {
 
 // reconcileQueuesForAgg is the per-aggregator driver for FIX-QUEUE-GC-3
 // orphan-queue reconciliation. It is the glue between the aggregator's
-// post-hydrate signal (SetOnHydrate / HydratedOnce, installed in
+// post-hydrate signal (SetOnHydrate / AnyHydrateCompleted, installed in
 // installQueueGCCleanup) and the queueRegistry's reconcileOrphanQueues scan.
 //
-// FAIL-CLOSED gate: if a.HydratedOnce() is false, the aggregator has not yet
+// FAIL-CLOSED gate: if a.AnyHydrateCompleted() is false, the aggregator has not yet
 // produced an authoritative active-session set, so this function returns
 // WITHOUT deleting anything. The empty active-set case (hydrate succeeded with
-// zero sessions) is the OPPOSITE: HydratedOnce is true, SessionIDs returns an
+// zero sessions) is the OPPOSITE: AnyHydrateCompleted is true, SessionIDs returns an
 // empty slice, reconcileOrphanQueues receives an empty non-nil map, and every
 // on-disk queue is correctly treated as an orphan. This is the distinction
-// GC-3 exists to enforce — see the field doc on Aggregator.hydratedOnce.
+// GC-3 exists to enforce — see the field doc on Aggregator.anyHydrateCompleted.
 //
 // Active-set source: a.Store().SessionIDs() returns the store's current session
 // IDs under RLock. This is the SAME authoritative set store.Hydrate just
 // installed (hydrate calls store.Hydrate BEFORE firing onHydrate, and
-// SessionIDs reads the map Hydrate writes). Calling it AFTER the HydratedOnce
+// SessionIDs reads the map Hydrate writes). Calling it AFTER the AnyHydrateCompleted
 // gate guarantees we read a set produced by a completed hydrate, not a
 // stale/pre-hydrate map.
 //
@@ -707,7 +707,7 @@ func (s *Server) installQueueGCCleanup(dir string, a *aggregator.Aggregator) {
 // per-session work through queueRegistry.mu, and CleanupSession is idempotent.
 func (s *Server) reconcileQueuesForAgg(dir string, a *aggregator.Aggregator) {
 	// FAIL-CLOSED: no authoritative set yet → delete nothing.
-	if !a.HydratedOnce() {
+	if !a.AnyHydrateCompleted() {
 		return
 	}
 	root, err := projectRoot(dir)
@@ -1361,12 +1361,12 @@ func (s *Server) projectScopedFilter(agg *aggregator.Aggregator, filter map[stri
 func (s *Server) triggerMessageLoad(agg *aggregator.Aggregator, filter map[string]bool) {
 	if filter == nil { // "all" — explicit firehose; async-trigger every unloaded session
 		for _, id := range agg.Store().SessionIDs() {
-			agg.EnsureMessagesAsync(context.Background(), id)
+			agg.EnsureMessagesAsync(id)
 		}
 		return
 	}
 	for id := range filter {
-		agg.EnsureMessagesAsync(context.Background(), id)
+		agg.EnsureMessagesAsync(id)
 	}
 }
 
