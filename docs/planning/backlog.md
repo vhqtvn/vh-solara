@@ -26,6 +26,7 @@ machine-readable completion date (`YYYY-MM-DD`) in `Notes` for `done` /
 | `TUNNEL` | `pkg/tunnel/` | Controller ↔ worker multiplexed WebSocket tunnel (yamux). |
 | `AGG` | `pkg/aggregator/`, `pkg/state/`, `pkg/opencode/` | OpenCode state aggregation + session store. |
 | `AUTH` | `pkg/auth/` | Controller auth / worker enrollment. |
+| `QUOTA` | `pkg/quota/` | Leaf provider-neutral LLM-quota reporting package. |
 | `PWA` | `web/public/`, manifest, service worker | Installable PWA surface. |
 | `REL` | `.github/`, `install.sh`, `Dockerfile*`, `Makefile` | Tag-driven release + packaging. |
 | `CI` | `.github/workflows/` | GitHub Actions CI pipelines (workflow YAML). |
