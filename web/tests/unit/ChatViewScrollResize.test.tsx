@@ -10,24 +10,30 @@
 //   2. scrollEl RO  — re-glues to the bottom on viewport resize. Its body:
 //        if (!scrollEl || !ready()) return;
 //        if (following()) pin();
-//        else if (nearBottom()) {      // <-- P1-WEB-042 branch
-//          setFollowing(true);
-//          setUserScrolledUp(false);
-//          pin();
+//        else {
+//          if (!nearBottom()) return;                 // (1) NOW at bottom (24px)
+//          const prevGap = ...;                        // pre-resize pinnedGeom gap
+//          if (prevGap < RECOVERY_TAIL_GAP) {          // (2) WAS near the tail
+//            setFollowing(true); setUserScrolledUp(false); pin();
+//          }
 //        }
 //      This fires when a pure clientHeight GROW (composer shrink, window resize,
 //      mobile keyboard dismiss) resizes the scroll viewport but NO scroll event
 //      is dispatched — so onScrolled can't recover the "stuck on ↓ Latest" case.
-//      The branch re-engages `following` when the resized viewport lands within
-//      nearBottom() (scrollHeight - scrollTop - clientHeight < 24).
+//      The branch re-engages `following` only when the grow lands the reader at
+//      the bottom (nearBottom()'s 24px) AND they were near the tail pre-resize.
 //
-// FIXED (P1-WEB-042): the branch routes through the dual-axis
-// classifyScrollDelta reducer + a pre-resize baseline (pinnedGeom) gate. It
-// re-engages following ONLY when the reader was ALREADY at/near the bottom in
-// the pre-resize baseline (the genuine "stuck on ↓ Latest" recovery) — NOT
-// when a pure clientHeight GROW merely lands a mid-history reader within
-// nearBottom(). These tests pin the FIXED behavior at the observer seam so a
-// regression (back to bare nearBottom(), or dropping the baseline gate) is
+// FIXED (dual gate — P1-WEB-042 no-yank + bug-2b recovery): two gates, both
+// required. (1) nearBottom()'s 24px "now at the bottom" (the SAME standard
+// onScrolled + the jump pill use — NOT classifyScrollDelta's 1px atBottom, which
+// a composer-shrink recovery lands ~10px outside). (2) the pre-resize baseline
+// (pinnedGeom) gap is within RECOVERY_TAIL_GAP (64px). onScrolled advances
+// pinnedGeom to the settled geometry on every scroll, so a deliberate ~30px
+// one-line scroll-up leaves a ~30px baseline gap; 64px admits that nudge
+// (bug-2b) while rejecting a mid-history ~300px reader (P1-WEB-042 no-yank).
+// The distinguishing signal is the pre-resize gap MAGNITUDE, not the grow size.
+// These tests pin both invariants at the observer seam so a regression (bare
+// nearBottom() yank, OR a too-strict baseline that drops the bug-2b recovery) is
 // caught.
 //
 // Fixture pattern follows ChatViewAutosize.test.tsx (jsdom + controllable
@@ -200,6 +206,14 @@ const UP_TOP = 300; // scrollTop after the scroll-up: gap = SH - UP_TOP - PORT =
 // baseline (scrollTop=SH, max=SH-PORT=600) is 590-600 = -10, outside epsilon,
 // so onScrolled drops following on this scroll-up.
 const NEAR_BOTTOM = 590;
+
+// bug-2b (recovery must fire): a ~30px one-line scroll-up from the tail (gap =
+// 30, JUST past nearBottom's 24px so following drops + ↓Latest appears), then a
+// composer shrink (clientHeight GROWS +20px → PORT→420) landing gap_now = 10
+// (< 24, back at the bottom). 30 < RECOVERY_TAIL_GAP(64) → the RO re-engages.
+// Mirrors the e2e scroll-follow.spec.ts bug-2b case at the observer seam.
+const BUG2B_SCROLL_UP = 570; // gap = SH - 570 - PORT = 30
+const BUG2B_GROWN_PORT = 420; // +20px grow (one autosize row); gap_now = 10
 
 describe("P1-WEB-042 — scrollEl ResizeObserver nearBottom() re-engagement", () => {
   let rafSaved: typeof window.requestAnimationFrame;
@@ -387,5 +401,76 @@ describe("P1-WEB-042 — scrollEl ResizeObserver nearBottom() re-engagement", ()
     expect(container.querySelector(".jump")).toBeNull(); // following re-engaged
     expect(scroll().scrollTop).toBe(SH); // pin aligned to bottom
     expect(scrollCount).toBe(0); // zero scroll events total
+  });
+
+  it("bug-2b recovery: a ~30px scroll-up (one line) + a small composer-shrink grow re-engages following", async () => {
+    // The e2e scroll-follow.spec.ts bug-2b case at the observer seam. A reader
+    // essentially at the tail scrolls UP ~30px (one line — just past nearBottom's
+    // 24px so following drops + ↓Latest appears), then shrinks the composer
+    // (autosize → clientHeight GROWS ~20px), landing back within nearBottom. The
+    // RO MUST re-engage — this is the genuine "stuck on ↓ Latest" recovery. It is
+    // the motivating counter-case to the P1-WEB-042 no-yank test above: there the
+    // reader is ~300px up (mid-history) and a grow must NOT yank; here the reader
+    // is ~30px up (at the tail) and a grow MUST recover. The pinnedGeom baseline
+    // gap is exactly the scroll-up distance (30px) because onScrolled advances
+    // pinnedGeom to the settled geometry on every scroll — so this case fails the
+    // OLD strict <24 baseline gate (30 > 24) and proves the RECOVERY_TAIL_GAP
+    // widening is load-bearing, not decorative.
+    const { container, scroll } = await mountScrolledUp(BUG2B_SCROLL_UP);
+
+    let scrollCount = 0;
+    scroll().addEventListener("scroll", () => {
+      scrollCount++;
+    });
+
+    // Composer-shrink-magnitude grow: clientHeight +20px (one autosize row). New
+    // gap = SH - BUG2B_SCROLL_UP - BUG2B_GROWN_PORT = 10 (< nearBottom 24); no
+    // clamp (570 < newMax = SH - 420 = 580), so scrollTop is unchanged and NO
+    // scroll event is dispatched for the geometry write.
+    setGeom(scroll(), { clientHeight: BUG2B_GROWN_PORT });
+    expect(scroll().scrollTop).toBe(BUG2B_SCROLL_UP); // unchanged by the geometry write
+    expect(scrollCount).toBe(0); // and no scroll event fired for it
+
+    // Trigger ONLY the scrollEl ResizeObserver (contentEl RO stays dormant).
+    ControllableRO.trigger(scroll());
+    await flushMicro();
+
+    // Recovery: following re-engaged (↓Latest gone), pin aligned to the bottom,
+    // and zero scroll events total (the RO branch recovered with no scroll event
+    // — the path onScrolled cannot take).
+    expect(container.querySelector(".jump")).toBeNull(); // following re-engaged
+    expect(scroll().scrollTop).toBe(SH); // pin aligned to bottom
+    expect(scrollCount).toBe(0); // zero scroll events total
+  });
+
+  it("bug-2b guardrail: a mid-history reader (~300px) is NOT yanked even though a large grow overlaps the bottom", async () => {
+    // The P1-WEB-042 no-yank invariant restated as the bug-2b sibling: a reader
+    // scrolled up mid-history (gap = 300, via UP_TOP) whose viewport GROWS enough
+    // to OVERLAP the bottom (clientHeight → 720, gap_now = -20, clamped) must NOT
+    // re-engage following. 300 > RECOVERY_TAIL_GAP(64) → no yank. This is the
+    // case that distinguishes "near-tail recovery" (bug-2b, gap 30) from
+    // "mid-history overlap" (P1-WEB-042, gap 300): same large grow, different
+    // baseline gap — only the gap magnitude separates them.
+    const { container, scroll } = await mountScrolledUp(UP_TOP);
+
+    let scrollCount = 0;
+    scroll().addEventListener("scroll", () => {
+      scrollCount++;
+    });
+
+    // Large clientHeight grow that overlaps the bottom: gap_now = SH - UP_TOP -
+    // 720 = -20 (clamped to 0 → nearBottom true), yet the reader was 300px up.
+    setGeom(scroll(), { clientHeight: 720 });
+    expect(scroll().scrollTop).toBe(UP_TOP); // unchanged by the geometry write
+    expect(scrollCount).toBe(0);
+
+    ControllableRO.trigger(scroll());
+    await flushMicro();
+
+    // No yank: following stays off (↓Latest present), position preserved, no
+    // scroll event.
+    expect(container.querySelector(".jump")).toBeTruthy(); // following stays off
+    expect(scroll().scrollTop).toBe(UP_TOP); // position preserved (no yank)
+    expect(scrollCount).toBe(0); // no scroll event
   });
 });

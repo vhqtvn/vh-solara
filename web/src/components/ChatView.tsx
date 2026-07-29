@@ -37,6 +37,21 @@ import ChatTasksStatus from "./ChatTasksStatus";
 // messages and the live stream land), so scroll-to-bottom and streaming stay
 // correct; older rows mount lazily as they near the viewport (see Deferred).
 const EAGER_TAIL = 30;
+
+// scrollEl ResizeObserver "stuck on ↓ Latest" recovery admission window: the
+// largest PRE-resize (pinnedGeom) gap-from-bottom for which a pure clientHeight
+// GROW (composer shrink / keyboard dismiss) is allowed to re-engage `following`.
+// Distinct from nearBottom()'s 24px (which is the strict am-I-at-bottom line)
+// and from classifyScrollDelta's 1px epsilon (sub-pixel churn absorb): this is a
+// "was the reader still at the tail?" band, deliberately WIDER than nearBottom
+// because onScrolled advances pinnedGeom to the post-scroll geometry, so a
+// deliberate ~30px one-line scroll-up (just past the 24px line — bug-2b) leaves a
+// ~30px baseline gap that 24px would wrongly reject. 64 ≈ a few text lines:
+// comfortably admits bug-2b's deterministic 30px nudge (+ the ~10px isolation
+// case), comfortably rejects a mid-history reader (~300px — P1-WEB-042 no-yank).
+// Absolute (not a viewport fraction): the e2e viewport is intentionally tiny
+// (~70px chat-scroll), so a fraction would collapse below the 30px admission.
+const RECOVERY_TAIL_GAP = 64;
 import QuestionCard from "./QuestionCard";
 import PermissionCard from "./PermissionCard";
 import PendingInput from "./PendingInput";
@@ -943,43 +958,45 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       // on ready() so initial scroll-restore (maybeRestore) owns positioning.
       //
       // When NOT following, re-engage ONLY for the genuine "stuck on ↓ Latest"
-      // recovery: the reader was ALREADY at/near the bottom in the pre-resize
-      // baseline (pinnedGeom) and the resize landed them AT the bottom. This
-      // branch is reached with NO scroll event (a pure clientHeight GROW from a
-      // composer shrink / keyboard dismiss fires the RO but no scroll), so
-      // onScrolled can't recover the stuck state — the RO must.
+      // recovery: a pure clientHeight GROW (composer shrink / keyboard dismiss)
+      // fires this RO but NO scroll event, so onScrolled can't recover it — the
+      // RO must re-engage `following` when the grow lands a near-tail reader back
+      // at the bottom. Two gates, BOTH required:
+      //   (1) NOW at the bottom — nearBottom()'s 24px standard (the SAME
+      //       definition onScrolled's reached-bottom re-glue and the jump pill
+      //       use). NOT classifyScrollDelta's 1px atBottom: a composer-shrink
+      //       recovery lands ~10px from the bottom — "at the bottom" by the
+      //       user-facing 24px line, yet outside the reducer's strict 1px, so the
+      //       reducer classifies it intent="none" and would skip it (bug-2b).
+      //   (2) WAS near the tail pre-resize — the baseline (pinnedGeom) gap is
+      //       within RECOVERY_TAIL_GAP. onScrolled advances pinnedGeom to the
+      //       settled geometry on EVERY scroll, so a deliberate ~30px one-line
+      //       scroll-up that dropped following leaves a ~30px baseline gap; this
+      //       gate must be WIDER than nearBottom's 24px to admit that nudge.
       //
-      // P1-WEB-042: the old `else if (nearBottom())` used a BARE current-only
-      // threshold. A clientHeight grow that merely OVERLAPS the bottom of a
-      // reader scrolled up mid-history (gap was large pre-resize, then the grow
-      // pushes nearBottom() true) re-engaged following and yanked them to the
-      // tail. Route through the dual-axis classifyScrollDelta reducer (the same
-      // reducer onScrolled + the content RO use) for the current-geometry
-      // classification, AND gate on the pre-resize baseline so only a reader
-      // who was already near the bottom re-engages. contentDelta is structurally
-      // ~0 here (the scroll container's own height change moves clientHeight,
-      // not scrollHeight — content changes fire the contentEl RO instead), so
-      // the baseline gate — not a content-change check — is what distinguishes a
-      // genuine stuck-at-tail state from a viewport-overlapping mid-history one.
+      // bug-2b vs P1-WEB-042 tension: bug-2b (scroll up ~30px, then composer
+      // shrink lands at the bottom) MUST recover; P1-WEB-042 (a mid-history
+      // reader ~300px up whose viewport merely GREW to overlap the bottom) must
+      // NOT be yanked. The distinguishing signal is the pre-resize gap MAGNITUDE
+      // (near-tail vs mid-history), NOT the grow size: both can carry a large
+      // clientHeight grow, so a grow-magnitude or grow-explains-gap test cannot
+      // separate them (a 320px grow closes both a 10px and a 300px gap). Only
+      // the absolute baseline gap can — hence gate (2) is a gap threshold. See
+      // RECOVERY_TAIL_GAP for the value rationale. contentDelta is structurally
+      // ~0 here (the container's own height change moves clientHeight, not
+      // scrollHeight — content changes fire the contentEl RO instead).
       if (!scrollEl || !ready()) return;
       if (following()) {
         pin();
       } else {
-        const current = geom(scrollEl);
-        const d = classifyScrollDelta({
-          previous: pinnedGeom,
-          current,
-          mode: "read",
-          following: false,
-        });
-        // Baseline (pre-resize) distance from bottom — was the reader already
-        // near the tail? The {-1,-1,-1} sentinel (pre-first-pin) is rejected by
-        // the scrollHeight >= 0 guard. Threshold matches nearBottom()'s < 24px.
+        if (!nearBottom()) return; // (1) resize left a material gap — nothing to recover
         const prev = pinnedGeom;
-        const prevNearBottom =
-          prev.scrollHeight >= 0 &&
-          prev.scrollHeight - prev.scrollTop - prev.clientHeight < 24;
-        if (prevNearBottom && d.intent === "reached-bottom") {
+        // (2) pre-resize gap; {-1,-1,-1} sentinel (pre-first-pin) → never recover.
+        const prevGap =
+          prev.scrollHeight >= 0
+            ? prev.scrollHeight - prev.scrollTop - prev.clientHeight
+            : Infinity;
+        if (prevGap < RECOVERY_TAIL_GAP) {
           setFollowing(true);
           setUserScrolledUp(false);
           pin();
