@@ -95,3 +95,111 @@ func TestGateDualEmitsPermissionBlocked(t *testing.T) {
 		}
 	}
 }
+
+// TestSnapshotMaterializeDualEmitsGateAliases closes the ASYMMETRIC COVERAGE GAP
+// in the L-03 / L-09 standing-checks above. TestGateDualEmitsHydratedAndHasMessages
+// and TestGateDualEmitsPermissionBlocked hand-build a GateFacts and marshal it —
+// they prove the JSON wire-shape (both names present, same value) but NOT the
+// POPULATION PATH. If someone reverts the materializeSnapshot assignment that
+// populates Hydrated+HasMessages from sc.msgLoaded||sc.hasMessages (L-03), or the
+// assignment that populates PermissionBlocked+PermissionWasBlocked from
+// sc.permBlocked (L-09), the wire-shape tests stay GREEN because they never go
+// through materialization.
+//
+// This test drives the REAL materialization path:
+//
+//	session state (messages + permBlocked) → Store.Snapshot →
+//	captureSnapshotLocked → materializeSnapshot → GateFacts → JSON
+//
+// and asserts BOTH old+new field pairs are present with the materialized value
+// for both a hydrated/blocked session (true) and a bare, untouched session
+// (false). It FAILS if the materializeSnapshot population assignment is reverted
+// — either the new alias stays at its zero value while the old field is still
+// set, or vice versa — and also guards the inverse regression (a population path
+// hard-coding true) via the bare session.
+func TestSnapshotMaterializeDualEmitsGateAliases(t *testing.T) {
+	s := New(100)
+	defer s.Close()
+
+	// "hydrated" session: establish REAL message state (SetSessionMessages
+	// populates s.messages[sid] AND flips s.msgLoaded[sid]=true) and REAL
+	// permission-blocked state (MarkPermissionBlocked sets s.permBlocked[sid]=true
+	// via the public chokepoint, the same path the web layer uses). The
+	// materialized gate's Hydrated/HasMessages must both derive to true and
+	// PermissionBlocked/PermissionWasBlocked must both derive to true.
+	s.Apply(ev("session.created", `{"info":{"id":"hydrated"}}`))
+	s.SetSessionMessages("hydrated", []MessageWithParts{{
+		Info:  json.RawMessage(`{"id":"m1","sessionID":"hydrated","role":"user"}`),
+		Parts: []json.RawMessage{json.RawMessage(`{"id":"p1","type":"text","text":"hi"}`)},
+	}})
+	s.MarkPermissionBlocked("hydrated")
+
+	// "bare" session: created but never touched. No message state
+	// (s.messages[sid]==nil, s.msgLoaded[sid]==false) and no permission block.
+	// The materialized gate's Hydrated/HasMessages must both derive to false and
+	// PermissionBlocked/PermissionWasBlocked must both derive to false. This
+	// guards against a population path that hard-codes true (the inverse revert).
+	s.Apply(ev("session.created", `{"info":{"id":"bare"}}`))
+
+	// The REAL materialization path: Snapshot → captureSnapshotLocked (under
+	// RLock) → materializeSnapshot (lock-free). A hand-built GateFacts would NOT
+	// exercise this — it is exactly the path the wire-shape tests skip.
+	snap := s.Snapshot(nil)
+
+	want := map[string]struct{ msgs, perm bool }{
+		"hydrated": {true, true},
+		"bare":     {false, false},
+	}
+	for sid, w := range want {
+		g, ok := snap.Gate[sid]
+		if !ok {
+			t.Fatalf("materialized gate missing session %q (population path did not emit it)", sid)
+		}
+		raw, err := json.Marshal(g)
+		if err != nil {
+			t.Fatalf("session %q: marshal gate: %v", sid, err)
+		}
+		var m map[string]any
+		if err := json.Unmarshal(raw, &m); err != nil {
+			t.Fatalf("session %q: unmarshal gate: %v", sid, err)
+		}
+
+		// L-03 alias pair: hydrated (retained) + hasMessages (new).
+		hyd, okH := m["hydrated"]
+		has, okM := m["hasMessages"]
+		if !okH {
+			t.Errorf("session %q: materialized gate missing retained `hydrated` field: %v", sid, m)
+		}
+		if !okM {
+			t.Errorf("session %q: materialized gate missing new `hasMessages` field: %v", sid, m)
+		}
+		if okH && hyd != w.msgs {
+			t.Errorf("session %q: materialized gate `hydrated`=%v want %v (materializeSnapshot did not populate from sc.msgLoaded||sc.hasMessages)", sid, hyd, w.msgs)
+		}
+		if okM && has != w.msgs {
+			t.Errorf("session %q: materialized gate `hasMessages`=%v want %v (L-03 population assignment reverted?)", sid, has, w.msgs)
+		}
+		if okH && okM && hyd != has {
+			t.Errorf("session %q: materialized gate hydrated(%v) != hasMessages(%v) — alias fields drifted in materialization", sid, hyd, has)
+		}
+
+		// L-09 alias pair: permission_blocked (retained) + permissionWasBlocked (new).
+		old, okO := m["permission_blocked"]
+		nw, okN := m["permissionWasBlocked"]
+		if !okO {
+			t.Errorf("session %q: materialized gate missing retained `permission_blocked` field: %v", sid, m)
+		}
+		if !okN {
+			t.Errorf("session %q: materialized gate missing new `permissionWasBlocked` field: %v", sid, m)
+		}
+		if okO && old != w.perm {
+			t.Errorf("session %q: materialized gate `permission_blocked`=%v want %v (materializeSnapshot did not populate from sc.permBlocked)", sid, old, w.perm)
+		}
+		if okN && nw != w.perm {
+			t.Errorf("session %q: materialized gate `permissionWasBlocked`=%v want %v (L-09 population assignment reverted?)", sid, nw, w.perm)
+		}
+		if okO && okN && old != nw {
+			t.Errorf("session %q: materialized gate permission_blocked(%v) != permissionWasBlocked(%v) — alias fields drifted in materialization", sid, old, nw)
+		}
+	}
+}
