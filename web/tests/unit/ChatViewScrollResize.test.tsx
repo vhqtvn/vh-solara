@@ -21,12 +21,14 @@
 //      The branch re-engages `following` when the resized viewport lands within
 //      nearBottom() (scrollHeight - scrollTop - clientHeight < 24).
 //
-// REGRESSION under test: the branch consults BARE nearBottom(), bypassing the
-// dual-axis classifyScrollDelta reducer that onScrolled uses. It can therefore
-// yank a reader to the tail on a viewport resize that merely HAPPENS to land
-// near the bottom. This characterization test PINS the current behavior at the
-// observer seam so a future change (routing the branch through the reducer, or
-// removing it) is detected.
+// FIXED (P1-WEB-042): the branch routes through the dual-axis
+// classifyScrollDelta reducer + a pre-resize baseline (pinnedGeom) gate. It
+// re-engages following ONLY when the reader was ALREADY at/near the bottom in
+// the pre-resize baseline (the genuine "stuck on ↓ Latest" recovery) — NOT
+// when a pure clientHeight GROW merely lands a mid-history reader within
+// nearBottom(). These tests pin the FIXED behavior at the observer seam so a
+// regression (back to bare nearBottom(), or dropping the baseline gate) is
+// caught.
 //
 // Fixture pattern follows ChatViewAutosize.test.tsx (jsdom + controllable
 // ResizeObserver / scroll geometry / requestAnimationFrame) and
@@ -192,6 +194,12 @@ const seedPartless = (): void => {
 const SH = 1000; // scrollHeight (tall content)
 const PORT = 400; // clientHeight (modest viewport)
 const UP_TOP = 300; // scrollTop after the scroll-up: gap = SH - UP_TOP - PORT = 300
+// A NEAR-bottom scrollTop: gap = SH - NEAR_BOTTOM - PORT = 10 (< 24, so the
+// reader is "near the bottom" while following()=false — the genuine "stuck on
+// ↓ Latest" recovery case the branch exists for). The residual vs the post-pin
+// baseline (scrollTop=SH, max=SH-PORT=600) is 590-600 = -10, outside epsilon,
+// so onScrolled drops following on this scroll-up.
+const NEAR_BOTTOM = 590;
 
 describe("P1-WEB-042 — scrollEl ResizeObserver nearBottom() re-engagement", () => {
   let rafSaved: typeof window.requestAnimationFrame;
@@ -253,9 +261,11 @@ describe("P1-WEB-042 — scrollEl ResizeObserver nearBottom() re-engagement", ()
 
   // Shared mount: renders ChatView, seeds one partless message, runs the
   // maybeRestore rAF fallback so ready()=true + following()=true + pin()'d at
-  // the bottom, then scrolls the viewport up to establish following()=false
-  // with a material gap from the bottom. Returns handles to the DOM.
-  async function mountScrolledUp() {
+  // the bottom, then scrolls the viewport up to establish following()=false.
+  // `scrollToTop` picks the post-scroll-up position: the default UP_TOP leaves
+  // a 300px material gap (>> nearBottom's 24px threshold); NEAR_BOTTOM leaves a
+  // <24px gap (the "stuck on ↓ Latest" recovery case). Returns handles to DOM.
+  async function mountScrolledUp(scrollToTop: number = UP_TOP) {
     const { container } = render(() => <ChatView sessionId={SID} />);
     seedPartless();
     const scroll = () => container.querySelector(".chat-scroll") as HTMLDivElement;
@@ -281,11 +291,10 @@ describe("P1-WEB-042 — scrollEl ResizeObserver nearBottom() re-engagement", ()
     expect(scroll().scrollTop).toBe(SH);
     expect(container.querySelector(".jump")).toBeNull();
 
-    // Scroll the viewport up to a mid-history position with a material gap
-    // (SH - UP_TOP - PORT = 300px >> nearBottom's 24px threshold). The dual-axis
-    // reducer in onScrolled classifies this as a genuine user-scroll-up ->
-    // following drops, userScrolledUp arms.
-    setGeom(scroll(), { scrollTop: UP_TOP });
+    // Scroll the viewport up to `scrollToTop`. The dual-axis reducer in
+    // onScrolled classifies any residual-outside-epsilon move as a genuine
+    // user-scroll-up -> following drops, userScrolledUp arms.
+    setGeom(scroll(), { scrollTop: scrollToTop });
     scroll().dispatchEvent(new Event("scroll"));
     await flushMicro();
 
@@ -295,7 +304,7 @@ describe("P1-WEB-042 — scrollEl ResizeObserver nearBottom() re-engagement", ()
     return { container, scroll };
   }
 
-  it("positive: a viewport resize that lands within nearBottom() re-engages following and pins to the bottom", async () => {
+  it("positive (P1-WEB-042 fixed): a pure clientHeight GROW mid-transcript does NOT yank a mid-history reader to the tail", async () => {
     const { container, scroll } = await mountScrolledUp();
 
     // Count dispatched scroll events across the remainder of the test.
@@ -304,10 +313,11 @@ describe("P1-WEB-042 — scrollEl ResizeObserver nearBottom() re-engagement", ()
       scrollCount++;
     });
 
-    // Simulate a pure clientHeight GROW (composer shrink / keyboard dismiss):
-    // the viewport now places within nearBottom(). Crucially this is a
+    // Simulate a pure clientHeight GROW (composer shrink / keyboard dismiss)
+    // on a reader scrolled up mid-history: gap = SH - UP_TOP - grownPort =
+    // 1000 - 300 - 720 = -20, which trips bare nearBottom() even though the
+    // reader was 300px from the bottom BEFORE the resize. Crucially this is a
     // programmatic geometry change — NO scroll event is dispatched.
-    // gap = SH - UP_TOP - grownPort = 1000 - 300 - 720 = -20 < 24 -> nearBottom.
     const GROWN_PORT = 720;
     setGeom(scroll(), { clientHeight: GROWN_PORT });
     expect(scroll().scrollTop).toBe(UP_TOP); // unchanged by the geometry write
@@ -317,12 +327,13 @@ describe("P1-WEB-042 — scrollEl ResizeObserver nearBottom() re-engagement", ()
     ControllableRO.trigger(scroll());
     await flushMicro();
 
-    // P1-WEB-042 branch fired: following re-engaged (jump pill gone) and pin()
-    // aligned scrollTop to the bottom (scrollTop = scrollHeight = SH).
-    expect(container.querySelector(".jump")).toBeNull();
-    expect(scroll().scrollTop).toBe(SH);
-    // Isolation: the re-engagement did NOT come from a scroll event.
-    expect(scrollCount).toBe(0);
+    // FIXED (P1-WEB-042): the branch consults the dual-axis baseline
+    // (pinnedGeom: the reader was 300px from the bottom) and so does NOT
+    // re-engage following and does NOT pin. The reader stays put mid-history;
+    // the jump pill remains; zero scroll events.
+    expect(container.querySelector(".jump")).toBeTruthy(); // following stays off
+    expect(scroll().scrollTop).toBe(UP_TOP); // position preserved (no yank)
+    expect(scrollCount).toBe(0); // no scroll event
   });
 
   it("negative: a viewport resize that leaves a material gap from the bottom does NOT force-follow or move the viewport", async () => {
@@ -345,18 +356,24 @@ describe("P1-WEB-042 — scrollEl ResizeObserver nearBottom() re-engagement", ()
     expect(scrollCount).toBe(0);
   });
 
-  it("isolation: the positive re-engagement is caused by the observer callback, not a synthetic scroll event", async () => {
-    const { container, scroll } = await mountScrolledUp();
+  it("isolation: a legit near-bottom re-engagement is caused by the observer callback, not a synthetic scroll event", async () => {
+    // Mount scrolled to a NEAR-bottom stuck position (following()=false but
+    // only ~10px from the bottom — the genuine "stuck on ↓ Latest" recovery
+    // case the branch exists for). A pure clientHeight GROW then lands the
+    // reader AT the bottom; the fixed branch re-engages because the baseline
+    // was near-bottom (contrast the positive case, where a 300px gap means no
+    // re-engagement).
+    const { container, scroll } = await mountScrolledUp(NEAR_BOTTOM);
 
     let scrollCount = 0;
     scroll().addEventListener("scroll", () => {
       scrollCount++;
     });
 
-    // Step 1 — apply the geometry change to a near-bottom viewport, but DO NOT
-    // trigger the observer yet. The geometry change alone must NOT re-engage
-    // following: there is no scroll event for onScrolled to handle, and no
-    // other path flips following on without the RO firing.
+    // Step 1 — apply the geometry change but DO NOT trigger the observer yet.
+    // The geometry change alone must NOT re-engage following: there is no
+    // scroll event for onScrolled to handle, and no other path flips following
+    // on without the RO firing.
     setGeom(scroll(), { clientHeight: 720 });
     await flushMicro();
     expect(scrollCount).toBe(0);

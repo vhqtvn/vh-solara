@@ -942,18 +942,48 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       // DOWN, so without this re-pin we'd sit "Live" but not at the tail. Gated
       // on ready() so initial scroll-restore (maybeRestore) owns positioning.
       //
-      // When NOT following but the resize landed us at the bottom, re-engage:
-      // a pure clientHeight GROW (composer shrinking back) fires NO scroll
-      // event, so onScrolled can't recover — this is the "stuck on ↓ Latest"
-      // path. nearBottom() (not pinnedGeom-dependent) gates it so a reader
-      // scrolled up mid-history is never yanked.
+      // When NOT following, re-engage ONLY for the genuine "stuck on ↓ Latest"
+      // recovery: the reader was ALREADY at/near the bottom in the pre-resize
+      // baseline (pinnedGeom) and the resize landed them AT the bottom. This
+      // branch is reached with NO scroll event (a pure clientHeight GROW from a
+      // composer shrink / keyboard dismiss fires the RO but no scroll), so
+      // onScrolled can't recover the stuck state — the RO must.
+      //
+      // P1-WEB-042: the old `else if (nearBottom())` used a BARE current-only
+      // threshold. A clientHeight grow that merely OVERLAPS the bottom of a
+      // reader scrolled up mid-history (gap was large pre-resize, then the grow
+      // pushes nearBottom() true) re-engaged following and yanked them to the
+      // tail. Route through the dual-axis classifyScrollDelta reducer (the same
+      // reducer onScrolled + the content RO use) for the current-geometry
+      // classification, AND gate on the pre-resize baseline so only a reader
+      // who was already near the bottom re-engages. contentDelta is structurally
+      // ~0 here (the scroll container's own height change moves clientHeight,
+      // not scrollHeight — content changes fire the contentEl RO instead), so
+      // the baseline gate — not a content-change check — is what distinguishes a
+      // genuine stuck-at-tail state from a viewport-overlapping mid-history one.
       if (!scrollEl || !ready()) return;
       if (following()) {
         pin();
-      } else if (nearBottom()) {
-        setFollowing(true);
-        setUserScrolledUp(false);
-        pin();
+      } else {
+        const current = geom(scrollEl);
+        const d = classifyScrollDelta({
+          previous: pinnedGeom,
+          current,
+          mode: "read",
+          following: false,
+        });
+        // Baseline (pre-resize) distance from bottom — was the reader already
+        // near the tail? The {-1,-1,-1} sentinel (pre-first-pin) is rejected by
+        // the scrollHeight >= 0 guard. Threshold matches nearBottom()'s < 24px.
+        const prev = pinnedGeom;
+        const prevNearBottom =
+          prev.scrollHeight >= 0 &&
+          prev.scrollHeight - prev.scrollTop - prev.clientHeight < 24;
+        if (prevNearBottom && d.intent === "reached-bottom") {
+          setFollowing(true);
+          setUserScrolledUp(false);
+          pin();
+        }
       }
     });
     ro.observe(scrollEl);
