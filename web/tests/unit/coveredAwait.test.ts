@@ -94,11 +94,6 @@ const tick = async (n = 1): Promise<void> => {
   for (let i = 0; i < n; i++) await new Promise((r) => setTimeout(r, 0));
 };
 
-// Await the in-flight owner/decode directly via the module accessor.
-const awaitOwner = async (): Promise<void> => {
-  await stream.getTreeSnapshotDecode();
-};
-
 // encodeForTest mirrors the server's maybeCompressSnapshot: JSON → gzip → base64.
 function encodeForTest(value: unknown): string {
   const inner = JSON.stringify(value);
@@ -197,6 +192,7 @@ describe("coveredAwait — mid-wait treeGen bump drops the reducer (§5d#7)", ()
     expect(treeState.treeMap().get("liveNode")).toBeUndefined();
     // 5b. The baseline decode was also invalidated by the gen bump: base absent.
     //    (Corroborates Case 6's decode-drop finding via a different trigger.)
+    // Corroborative only — also passes if gzip64 decode never reaches finishDecode; the primary assertions above (liveNode absence + cursor-unchanged) already pin the invariant.
     expect(treeState.treeMap().get("base")).toBeUndefined();
     // 5c. advanceCursor was NOT called by the dropped handler: cursor unchanged.
     //    The post-await gen check returns BEFORE the `advanceCursor(seq)` at

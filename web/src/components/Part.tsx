@@ -20,7 +20,8 @@ import styles from "./Part.module.css";
 // the row components — local open signals would reset on every new token (a
 // manually-expanded Thinking/tool would snap shut). Keying by id here makes the
 // toggle survive that churn.
-export const [partOpen, setPartOpenStore] = createStore<Record<string, boolean>>({});
+const [partOpen, setPartOpenStore] = createStore<Record<string, boolean>>({});
+export { partOpen };
 export const setPartOpen = (id: string, v: boolean) => setPartOpenStore(id, v);
 
 // One prose segment: daemon-rendered, syntax-highlighted HTML with copy buttons

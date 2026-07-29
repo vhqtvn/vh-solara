@@ -100,6 +100,10 @@ function encodeForTest(value: unknown): string {
   return Buffer.from(gzipSync(Buffer.from(inner))).toString("base64");
 }
 
+// Captured before each override so afterEach can restore the original
+// (prototype-inherited) descriptor — symmetric with the EventSource/fetch cleanup.
+let origVisibilityDesc: PropertyDescriptor | undefined;
+
 beforeEach(async () => {
   instances = [];
   (globalThis as unknown as { EventSource: unknown }).EventSource = MockEventSource;
@@ -108,6 +112,7 @@ beforeEach(async () => {
     vi.fn().mockResolvedValue(new Response("{}", { status: 200 })),
   );
   window.localStorage.clear();
+  origVisibilityDesc = Object.getOwnPropertyDescriptor(document, "visibilityState");
   Object.defineProperty(document, "visibilityState", {
     value: "visible",
     configurable: true,
@@ -119,6 +124,12 @@ afterEach(() => {
   stream?.closeSessionStream();
   vi.unstubAllGlobals();
   delete (globalThis as unknown as { EventSource?: unknown }).EventSource;
+  if (origVisibilityDesc) {
+    Object.defineProperty(document, "visibilityState", origVisibilityDesc);
+  } else {
+    // Originally inherited from Document.prototype (no own prop) — drop the override.
+    delete (document as unknown as Record<string, unknown>).visibilityState;
+  }
 });
 
 // Fixture builders (mirror coherentBarrier.test.ts).
