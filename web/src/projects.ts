@@ -137,7 +137,16 @@ export async function fetchRecentProjects(): Promise<Project[]> {
 export interface ProjectEndpointItem {
   dir: string;
   roots: number;
-  running: number; // running ROOT count (roots whose subtree has ≥1 busy/retry session)
+  // running is the RETAINED wire alias — the daemon still emits it during the
+  // alias-during-transition (audit L-10). The SPA does NOT read it; it reads
+  // `runningRoots` (below) instead. Declared because it remains on the wire for
+  // a stale un-reloaded tab. See docs/ai/wire-field-deprecation.md.
+  running: number;
+  // runningRoots is the exact-name alias of `running` — the count of running
+  // ROOTS specifically (a cardinality + topology correction: `running` alone is
+  // ambiguous with a session/process count). Same value as `running` during the
+  // alias window; this is the field the SPA READS.
+  runningRoots: number;
 }
 
 export interface ActivityMaps {
@@ -156,15 +165,17 @@ export interface ProjectActivityRow {
 }
 
 // Reduce the raw /vh/projects payload into dir->count lookup maps. Only dirs
-// with running > 0 are meaningful for the running badge, but the map keeps every
-// dir's running value verbatim (the server already reports the true count,
-// including 0); callers read it directly. Roots is keyed 1:1 with the payload.
+// with runningRoots > 0 are meaningful for the running badge, but the map keeps
+// every dir's runningRoots value verbatim (the server already reports the true
+// count, including 0); callers read it directly. Roots is keyed 1:1 with the
+// payload. (audit L-10: the SPA reads the `runningRoots` wire field — the exact
+// name; the retained `running` alias stays on the wire for a stale tab.)
 export function buildActivityMaps(projectsEndpoint: ProjectEndpointItem[]): ActivityMaps {
   const roots = new Map<string, number>();
   const running = new Map<string, number>();
   for (const p of Array.isArray(projectsEndpoint) ? projectsEndpoint : []) {
     roots.set(p.dir, p.roots);
-    running.set(p.dir, p.running);
+    running.set(p.dir, p.runningRoots);
   }
   return { roots, running };
 }

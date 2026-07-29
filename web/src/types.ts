@@ -17,20 +17,36 @@ export interface Session {
 // Per-session gate facts the daemon stamps into the snapshot so the client can
 // tell "this session's data is fully aggregated" from "still loading after a
 // restart" WITHOUT opening it. `hydrated` mirrors Go's GateFacts.Hydrated
-// (pkg/state/store.go): true once the session's messages are loaded. The daemon
-// serves HTTP while still aggregating after a restart, so early snapshots have
-// hydrated=false for sessions whose tail hasn't been pulled yet — the client
-// uses that to show a loading hint instead of looking stale/empty.
+// (pkg/state/store.go): true once SOME message state exists for the session (a
+// live tail OR a history hydrate) — NOT necessarily "fully loaded" (that is
+// `messagesLoaded`, a separate stricter field). The daemon serves HTTP while
+// still aggregating after a restart, so early snapshots have hydrated=false for
+// sessions whose tail hasn't been pulled yet — the client uses that to show a
+// loading hint instead of looking stale/empty.
+//
+// WIRE-FIELD ALIAS (audit L-03 / L-09, Posture B): the daemon DUAL-EMITS the
+// exact-name aliases `hasMessages` (of `hydrated`) and `permissionWasBlocked`
+// (of `permission_blocked`) with the SAME values, during a transition window.
+// The SPA reads the NEW `hasMessages` (it does not currently read either
+// permission field — both stay declared for non-SPA consumers / future reads);
+// the old names stay declared here because they remain on the wire for a stale
+// un-reloaded tab. Removal of the old names is gated on an operator-approved
+// cutoff; see docs/ai/wire-field-deprecation.md.
 export interface GateFacts {
   hydrated?: boolean;
+  // hasMessages is the exact-name alias of `hydrated` — "some message state
+  // exists". This is the field the SPA READS (hydrated is retained on the wire
+  // only for a stale tab). Same value as hydrated during the alias window.
+  hasMessages?: boolean;
   // messagesLoaded mirrors Go's GateFacts.MessagesLoaded (pkg/state/store.go):
   // the STRICT "daemon has fetched this session's FULL message history" memo,
-  // distinct from `hydrated` (which is true once ANY message state exists —
-  // including a partial live-event-only entry). On the async-hydration path the
-  // Stream-2 first-open snapshot sends immediately WITHOUT waiting for the
-  // upstream fetch, so the snapshot's gate carries messagesLoaded=false until
-  // the background load completes; the client keeps its loading UI up until the
-  // messages.loaded event (or a gate with messagesLoaded=true) lands.
+  // distinct from `hydrated`/`hasMessages` (which is true once ANY message
+  // state exists — including a partial live-event-only entry). On the
+  // async-hydration path the Stream-2 first-open snapshot sends immediately
+  // WITHOUT waiting for the upstream fetch, so the snapshot's gate carries
+  // messagesLoaded=false until the background load completes; the client keeps
+  // its loading UI up until the messages.loaded event (or a gate with
+  // messagesLoaded=true) lands.
   // NAMING NOTE (audit L-02 / remediation M11): this server GateFacts field is
   // the daemon-side fetch memo. The FE previously mirrored it under the SAME
   // spelling (a client SyncState.messagesLoaded map), which collided with this
@@ -39,6 +55,11 @@ export interface GateFacts {
   // two no longer imply semantic equivalence. The wire spelling here is
   // unchanged.
   messagesLoaded?: boolean;
+  // permissionWasBlocked is the exact-name alias of `permission_blocked` — the
+  // sticky historical "permission blocking occurred" fact. Retained alongside
+  // the old name on the wire during the alias window. (The SPA does not
+  // currently read either name; declared so future reads adopt the exact one.)
+  permissionWasBlocked?: boolean;
   activity?: string;
   [k: string]: unknown;
 }

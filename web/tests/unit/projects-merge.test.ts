@@ -25,8 +25,8 @@ const empty: ActivityMaps = { roots: new Map(), running: new Map() };
 describe("buildActivityMaps", () => {
   it("builds dir->count maps from the /vh/projects payload (roots + running)", () => {
     const maps = buildActivityMaps([
-      { dir: "/a", roots: 2, running: 1 },
-      { dir: "/b", roots: 5, running: 0 },
+      { dir: "/a", roots: 2, running: 1, runningRoots: 1 },
+      { dir: "/b", roots: 5, running: 0, runningRoots: 0 },
     ]);
     expect(maps.roots.get("/a")).toBe(2);
     expect(maps.roots.get("/b")).toBe(5);
@@ -39,9 +39,9 @@ describe("buildActivityMaps", () => {
     // (which omitted idle dirs). Every dir present in the payload lands in the
     // running map with its true count, including 0.
     const maps = buildActivityMaps([
-      { dir: "/x", roots: 1, running: 0 },
-      { dir: "/y", roots: 2, running: 2 },
-      { dir: "/z", roots: 3, running: 3 },
+      { dir: "/x", roots: 1, running: 0, runningRoots: 0 },
+      { dir: "/y", roots: 2, running: 2, runningRoots: 2 },
+      { dir: "/z", roots: 3, running: 3, runningRoots: 3 },
     ]);
     expect(maps.running.get("/x")).toBe(0);
     expect(maps.running.get("/y")).toBe(2);

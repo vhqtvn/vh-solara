@@ -46,7 +46,7 @@ describe("applySnapshot — B2a resync-window lastAgents gating", () => {
       seq: 1,
       epoch: "newEpoch", // epoch transition → resync window
       sessions: [{ id: "s1" }, { id: "s2" }],
-      gate: { s1: { hydrated: true }, s2: { hydrated: true } },
+      gate: { s1: { hydrated: true, hasMessages: true }, s2: { hydrated: true, hasMessages: true } },
       // mid-aggregation: server omits s1's label, but the FE already knows "build"
       lastAgents: { s2: "plan" },
     };
@@ -59,14 +59,17 @@ describe("applySnapshot — B2a resync-window lastAgents gating", () => {
     expect(state.epoch).toBe("newEpoch");
   });
 
-  it("merge-protects a prev label when a session is hydrated===false (no epoch change)", () => {
+  it("merge-protects a prev label when a session is hasMessages===false (no epoch change)", () => {
     setState("epoch", "stable");
     setState("lastAgents", reconcile({ s1: "build", s2: "plan" }));
     const snap: Snapshot = {
       seq: 2,
       epoch: "stable", // NO epoch transition
       sessions: [{ id: "s1" }, { id: "s2" }],
-      gate: { s1: { hydrated: true }, s2: { hydrated: false } }, // s2 mid-aggregation
+      // s2 mid-aggregation (gate fixtures mirror the dual-emit wire shape: the
+      // server emits both `hydrated` and `hasMessages` with the same value; the
+      // SPA reads `hasMessages`). s2 still pulling its tail → resync window.
+      gate: { s1: { hydrated: true, hasMessages: true }, s2: { hydrated: false, hasMessages: false } },
       // server omits s2 (still pulling its tail); s1 updated authoritatively
       lastAgents: { s1: "ship" },
     };
@@ -82,9 +85,9 @@ describe("applySnapshot — B2a resync-window lastAgents gating", () => {
     setState("lastAgents", reconcile({ s1: "build" }));
     const snap: Snapshot = {
       seq: 3,
-      epoch: "stable", // epoch now stable, all hydrated
+      epoch: "stable", // epoch now stable, all hasMessages===true
       sessions: [{ id: "s1" }, { id: "s2" }],
-      gate: { s1: { hydrated: true }, s2: { hydrated: true } },
+      gate: { s1: { hydrated: true, hasMessages: true }, s2: { hydrated: true, hasMessages: true } },
       lastAgents: { s2: "plan" }, // server omits s1
     };
     applySnapshot(snap);
@@ -100,7 +103,7 @@ describe("applySnapshot — B2a resync-window lastAgents gating", () => {
       seq: 4,
       epoch: "stable", // no transition
       sessions: [{ id: "s1" }, { id: "s2" }],
-      gate: { s1: { hydrated: true }, s2: { hydrated: true } }, // all hydrated
+      gate: { s1: { hydrated: true, hasMessages: true }, s2: { hydrated: true, hasMessages: true } }, // all hasMessages===true
       // authoritative: s2 legitimately cleared (its latest assistant no longer
       // has an agent / recomputed messages yield none)
       lastAgents: { s1: "ship" },
@@ -114,7 +117,7 @@ describe("applySnapshot — B2a resync-window lastAgents gating", () => {
     // An older daemon that omits snap.gate entirely must still get wholesale
     // replace when the epoch is stable — otherwise the overcorrection returns
     // for every such daemon (clears never propagate). Only EXPLICIT
-    // hydrated===false counts toward the resync window.
+    // hasMessages===false counts toward the resync window.
     setState("epoch", "stable");
     setState("lastAgents", "s1", "build");
     const snap: Snapshot = {

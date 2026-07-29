@@ -651,6 +651,12 @@ func (s *Store) materializeSnapshot(c snapshotCapture) Snapshot {
 		if act == "" {
 			act = ActivityIdle // a never-touched session renders idle
 		}
+		// hasMsg is the "some message state exists" predicate (live tail OR a
+		// history hydrate). It feeds BOTH wire aliases during the
+		// alias-during-transition (L-03): `hydrated` (retained) and `hasMessages`
+		// (the exact name the SPA migrates to). Computed once and assigned to
+		// both so the two wire fields provably carry the same value.
+		hasMsg := sc.msgLoaded || sc.hasMessages
 		snap.Gate[sid] = GateFacts{
 			Activity: act,
 			// We have message state (live events OR a history hydrate) iff
@@ -658,7 +664,9 @@ func (s *Store) materializeSnapshot(c snapshotCapture) Snapshot {
 			// derived fields below are "not yet known", which a cold/un-opened
 			// session after a restart can't be distinguished from in-flight
 			// without this.
-			Hydrated: sc.msgLoaded || sc.hasMessages,
+			Hydrated: hasMsg,
+			// HasMessages is the alias of Hydrated — same value, exact name.
+			HasMessages: hasMsg,
 			// MessagesLoaded is the STRICT "full history fetched AND resident"
 			// gate, derived from BOTH the msgLoaded fetch memo AND the actual
 			// resident parts (msgResident). It can NEVER be true when the newest
@@ -674,6 +682,9 @@ func (s *Store) materializeSnapshot(c snapshotCapture) Snapshot {
 			PendingQuestion:        sc.hasQuestions,
 			PendingPermission:      sc.hasPerms,
 			PermissionBlocked:      sc.permBlocked,
+			// PermissionWasBlocked is the alias of PermissionBlocked — same value,
+			// exact name (L-09).
+			PermissionWasBlocked: sc.permBlocked,
 			// Tokens is the private byte copy captured above — assigned directly
 			// (no aliasing; see the doc comment's copy invariant).
 			Tokens: sc.lastTokens,

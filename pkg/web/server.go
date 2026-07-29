@@ -1205,6 +1205,14 @@ type projectInfo struct {
 	Seq     uint64 `json:"seq"`     // current head seq for this project's store
 	Roots   int    `json:"roots"`   // live ROOT session count (children/archived excluded)
 	Running int    `json:"running"` // running ROOT count (roots whose subtree has ≥1 busy/retry session)
+	// RunningRoots is the alias of Running (Posture B alias-during-transition).
+	// Same value — the count of running ROOTS specifically (a cardinality +
+	// topology correction: `running` alone is ambiguous with a session/process
+	// count). Dual-emitted alongside running so the SPA migrates to the exact
+	// name while a stale/un-reloaded tab keeps reading the old one. Removal of
+	// `running` is gated on an operator-approved cutoff; see
+	// docs/ai/wire-field-deprecation.md (audit L-10 / remediation M13).
+	RunningRoots int `json:"runningRoots"`
 }
 
 // handleProjects lists the project instances this worker currently bridges — one
@@ -1228,7 +1236,12 @@ func (s *Server) handleProjects(w http.ResponseWriter, r *http.Request) {
 	out := make([]projectInfo, 0, len(live))
 	for _, e := range live {
 		st := e.agg.Store()
-		out = append(out, projectInfo{Dir: e.dir, Epoch: st.Epoch(), Seq: st.Head(), Roots: st.RootCount(), Running: st.RunningRoots()})
+		// runningRootsCount feeds BOTH wire aliases during the
+		// alias-during-transition (L-10): `running` (retained) and
+		// `runningRoots` (the exact name the SPA migrates to). Computed once and
+		// assigned to both so the two wire fields provably carry the same value.
+		runningRootsCount := st.RunningRoots()
+		out = append(out, projectInfo{Dir: e.dir, Epoch: st.Epoch(), Seq: st.Head(), Roots: st.RootCount(), Running: runningRootsCount, RunningRoots: runningRootsCount})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Dir < out[j].Dir })
 	// State-like GET: the response is computed fresh on every call from live

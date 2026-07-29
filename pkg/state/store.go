@@ -197,6 +197,15 @@ type GateFacts struct {
 	// known", NOT "in-flight". A coordinator should force-hydrate (open) the
 	// session, or trust `activity`, before relying on those fields (§1.7).
 	Hydrated bool `json:"hydrated"`
+	// HasMessages is the alias of Hydrated (Posture B alias-during-transition).
+	// It carries the SAME value and is the more honest name for the fact Hydrated
+	// actually reports: "some message state exists" (a live tail OR a history
+	// hydrate) — it does NOT mean "fully loaded" (that is MessagesLoaded, a
+	// separate field that stays unchanged). Dual-emitted alongside hydrated so
+	// the SPA can migrate to the exact name while a stale/un-reloaded tab keeps
+	// reading the old one. Removal of `hydrated` is gated on an operator-approved
+	// cutoff; see docs/ai/wire-field-deprecation.md (audit L-03 / remediation M3).
+	HasMessages bool `json:"hasMessages"`
 	// MessagesLoaded reports whether this session's FULL message history has
 	// been fetched AND the resident parts are consistent with a completed
 	// assistant turn (msgLoaded && resident parts) — NOT "do we have any
@@ -243,8 +252,17 @@ type GateFacts struct {
 	// that triggered the reject lives in the web layer). It is STICKY past the
 	// permission clearing so a caller observes it post-hoc, and clears on session
 	// termination. See store.MarkPermissionBlocked.
-	PermissionBlocked bool            `json:"permission_blocked"`
-	Tokens            json.RawMessage `json:"tokens,omitempty"` // raw token-usage object of the latest assistant turn (meaningful iff hydrated)
+	PermissionBlocked bool `json:"permission_blocked"`
+	// PermissionWasBlocked is the alias of PermissionBlocked (Posture B
+	// alias-during-transition). It carries the SAME value and is the more exact
+	// name for the sticky historical fact ("permission blocking occurred
+	// historically") rather than a bare current auto-reject state. Dual-emitted
+	// alongside permission_blocked so non-SPA consumers (coordapi/MCP/headless)
+	// keep working while new readers adopt the exact name. Removal of
+	// `permission_blocked` is gated on an operator-approved cutoff; see
+	// docs/ai/wire-field-deprecation.md (audit L-09 / remediation M12).
+	PermissionWasBlocked bool            `json:"permissionWasBlocked"`
+	Tokens               json.RawMessage `json:"tokens,omitempty"` // raw token-usage object of the latest assistant turn (meaningful iff hydrated)
 }
 
 // MessageWithParts mirrors OpenCode's GET /session/:id/message item shape.

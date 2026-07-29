@@ -320,6 +320,71 @@ func TestProjectsReportsRunningCount(t *testing.T) {
 	}
 }
 
+// TestProjectsDualEmitsRunningAndRunningRoots is the L-10 standing-check: the
+// /vh/projects response must carry BOTH `running` (retained) and `runningRoots`
+// (the exact name the SPA migrates to), with the SAME value, for the
+// alias-during-transition (Posture B). Seeds a busy root so the count is
+// non-zero, then asserts both wire fields are present and equal. Removal of
+// `running` is a future slice gated on an operator-approved cutoff; during the
+// alias window this test asserts presence of BOTH. See
+// docs/ai/wire-field-deprecation.md.
+func TestProjectsDualEmitsRunningAndRunningRoots(t *testing.T) {
+	f := &fakeOC{}
+	web, agg := newVerbServer(t, f)
+	st := agg.Store()
+
+	// Seed two roots; a child of "a" goes busy → 1 running root (root dedup).
+	st.Apply(ev("session.created", `{"info":{"id":"a"}}`))
+	st.Apply(ev("session.created", `{"info":{"id":"b"}}`))
+	st.Apply(ev("session.created", `{"info":{"id":"c","parentID":"a"}}`))
+	st.Apply(ev("session.status", `{"sessionID":"c","status":{"type":"busy"}}`))
+	want := st.RunningRoots()
+	if want != 1 {
+		t.Fatalf("setup invariant: RunningRoots want 1, got %d", want)
+	}
+
+	resp, err := http.Get(web.URL + "/vh/projects")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var got []map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	var def map[string]any
+	for _, p := range got {
+		if p["dir"] == "" {
+			def = p
+			break
+		}
+	}
+	if def == nil {
+		t.Fatalf("default project not enumerated in /vh/projects: %v", got)
+	}
+	old, okO := def["running"]
+	nw, okN := def["runningRoots"]
+	if !okO {
+		t.Errorf("/vh/projects missing retained `running` field: %v", def)
+	}
+	if !okN {
+		t.Errorf("/vh/projects missing new `runningRoots` field: %v", def)
+	}
+	if okO {
+		if r, _ := old.(float64); int(r) != want {
+			t.Errorf("running = %v, want %d", old, want)
+		}
+	}
+	if okN {
+		if r, _ := nw.(float64); int(r) != want {
+			t.Errorf("runningRoots = %v, want %d", nw, want)
+		}
+	}
+	if okO && okN && old != nw {
+		t.Errorf("running (%v) != runningRoots (%v) — alias fields drifted apart", old, nw)
+	}
+}
+
 // projectsRunning GETs /vh/projects and returns the default project's running
 // count (the single ""-dir entry). Fails the test on any transport/shape error.
 func projectsRunning(t *testing.T, base string) int {

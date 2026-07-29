@@ -91,17 +91,23 @@ export function applySnapshot(snap: Snapshot) {
   //   - the latched epochChanged flag from a recent transition is still set
   //     (the toast hasn't consumed it yet — e.g. back-to-back snapshots in one
   //     reactive tick), OR
-  //   - any session in this snapshot is still hydrated===false (its tail hasn't
-  //     been pulled yet → the lastAgents map is incomplete).
+  //   - any session in this snapshot is still hasMessages===false (its tail
+  //     hasn't been pulled yet → the lastAgents map is incomplete).
   // `state.epochChanged` is read BEFORE the latch is (re)set below, so the first
   // transition snapshot is caught via `changed` and later window snapshots via
-  // the latch / hydration. Only an EXPLICIT hydrated===false counts — an omitted
-  // gate (older daemon) or omitted hydrated must NOT pin resync mode forever
-  // (that would reintroduce the overcorrection and block legitimate clears).
+  // the latch / hydration. Only an EXPLICIT hasMessages===false counts — an
+  // omitted gate (older daemon) or omitted hasMessages must NOT pin resync mode
+  // forever (that would reintroduce the overcorrection and block legitimate
+  // clears).
+  //
+  // WIRE-FIELD ALIAS (audit L-03): the gate field is read as `hasMessages`
+  // (the exact name); the daemon dual-emits the retained `hydrated` alias with
+  // the same value, so a stale un-reloaded tab that still reads `hydrated`
+  // keeps working. See docs/ai/wire-field-deprecation.md.
   const resyncing =
     changed ||
     state.epochChanged ||
-    Object.values(snap.gate || {}).some((g) => !!g && g.hydrated === false);
+    Object.values(snap.gate || {}).some((g) => !!g && g.hasMessages === false);
   setState(
     produce((s) => {
       // Reconcile: replace the session set with the authoritative snapshot.

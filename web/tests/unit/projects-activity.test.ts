@@ -33,7 +33,7 @@ describe("fetchProjectActivity — single-source /vh/projects (P2)", () => {
     // are separate consumers and fetch it themselves).
     const fetchMock = vi.fn((url: string) => {
       if (url.includes("/vh/projects"))
-        return Promise.resolve(jsonResp([{ dir: "/a", roots: 1, running: 0 }]));
+        return Promise.resolve(jsonResp([{ dir: "/a", roots: 1, running: 0, runningRoots: 0 }]));
       return Promise.resolve(jsonResp(null, false, 404));
     });
     vi.stubGlobal("fetch", fetchMock);
@@ -52,7 +52,7 @@ describe("fetchProjectActivity — single-source /vh/projects (P2)", () => {
         // The assertion lives here so a future caller that drops the option is
         // caught at the exact call site.
         expect((init as RequestInit | undefined)?.cache).toBe("no-store");
-        return Promise.resolve(jsonResp([{ dir: "/a", roots: 1, running: 0 }]));
+        return Promise.resolve(jsonResp([{ dir: "/a", roots: 1, running: 0, runningRoots: 0 }]));
       }
       return Promise.resolve(jsonResp(null, false, 404));
     });
@@ -72,8 +72,8 @@ describe("fetchProjectActivity — single-source /vh/projects (P2)", () => {
     const fetchMock = vi.fn(() =>
       Promise.resolve(
         jsonResp([
-          { dir: "/a", roots: 5, running: 2 },
-          { dir: "/b", roots: 3, running: 0 },
+          { dir: "/a", roots: 5, running: 2, runningRoots: 2 },
+          { dir: "/b", roots: 3, running: 0, runningRoots: 0 },
         ]),
       ),
     );
