@@ -1101,7 +1101,22 @@ test("composer shrink at the tail re-engages following (bug-2b recovery)", async
   // a later shrink is possible. Following stays true (reducer + scrollEl RO
   // re-pin — test 15's path); re-glue so the geometry baseline reflects the
   // grown-composer viewport.
+  //
+  // AUTOSIZE RACE GUARD: the textarea autosize runs in requestAnimationFrame
+  // (ChatView.tsx), but expectFollowingTail() resolves the instant the viewport is
+  // already at the bottom (<24px) — which can happen BEFORE the rAF fires, so the
+  // grow never lands and the later shrink becomes a geometry no-op with nothing to
+  // recover (a load-only flake). Capture the 1-line baseline clientHeight and WAIT
+  // for it to shrink by a full autosize row before proceeding, so the precondition
+  // (composer really is 2-line) is deterministic. This makes the grow/shrink REAL;
+  // it does NOT loosen the recovery assertion below.
+  const chatCH = () =>
+    page.locator(".chat-scroll").evaluate((e: HTMLElement) => e.clientHeight);
+  const baseCH = await chatCH();
   await page.getByPlaceholder("Message…").fill("alpha\nbravo");
+  await expect
+    .poll(chatCH, { timeout: 3000 })
+    .toBeLessThan(baseCH - 8); // grow landed: 2-line composer shrank the viewport
   await expectFollowingTail(page);
 
   // Snapshot the bottom geometry right before the deliberate scroll-up; reused
@@ -1109,6 +1124,7 @@ test("composer shrink at the tail re-engages following (bug-2b recovery)", async
   const grownMax = await page.locator(".chat-scroll").evaluate(
     (e: HTMLElement) => e.scrollHeight - e.clientHeight,
   );
+  const grownCH = await chatCH();
 
   // Create the stuck-on-Latest state: scroll UP 30px from the bottom. onScrolled
   // classifies residual -30 (< -1) → user-scroll-up → following=false + latch
@@ -1122,8 +1138,13 @@ test("composer shrink at the tail re-engages following (bug-2b recovery)", async
 
   // Shrink the composer back to one line. autosize shrinks the textarea →
   // `.chat-scroll` clientHeight GROWS → the bottom edge (scrollHeight -
-  // clientHeight) moves UP toward scrollTop.
+  // clientHeight) moves UP toward scrollTop. Same rAF race: wait for the
+  // clientHeight grow to actually land before asserting recovery, else the shrink
+  // could be a no-op within the polled window.
   await page.getByPlaceholder("Message…").fill("alpha");
+  await expect
+    .poll(chatCH, { timeout: 3000 })
+    .toBeGreaterThan(grownCH + 8); // shrink landed: 1-line composer grew the viewport
 
   // Recovery: following re-engaged, "↓ Latest" gone, geometry back at the bottom.
   // (Either the pure RO else-if/nearBottom branch — no scroll event, when the
