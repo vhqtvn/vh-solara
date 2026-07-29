@@ -71,6 +71,7 @@ func (s *Store) graceStateSnapshot(id string) (gen uint64, armed bool, authorita
 // race-closer's observable contract.
 func TestGraceTimer_CancelSupersedesStaleFire(t *testing.T) {
 	s := New(100)
+	defer s.Close()                           // GAP-S1: cancel armed grace so no timer fires into a later test
 	s.completionGrace = 15 * time.Millisecond // small enough for a fast test
 
 	s.Apply(ev("session.created", evSessionCreated("R", "")))
@@ -259,6 +260,7 @@ func TestGraceTimer_ConcurrentArmCancelNoRace(t *testing.T) {
 // the latest decision.
 func TestGraceTimer_MultiStepRearmLatestWins(t *testing.T) {
 	s := New(100)
+	defer s.Close() // GAP-S1: cancel armed grace so no timer fires into a later test
 	s.completionGrace = 15 * time.Millisecond
 
 	s.Apply(ev("session.created", evSessionCreated("R", "")))
@@ -399,6 +401,7 @@ func TestGraceTimer_CloseCancelsArmed(t *testing.T) {
 // split that moves the guard cannot silently regress it.
 func TestGraceTimer_CompletionAuthoritativeReflectsLatestDecision(t *testing.T) {
 	s := New(100)
+	defer s.Close() // GAP-S1: cancel armed grace so no timer fires into a later test
 	s.completionGrace = 15 * time.Millisecond
 
 	s.Apply(ev("session.created", evSessionCreated("R", "")))

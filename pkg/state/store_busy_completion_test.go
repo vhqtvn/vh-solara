@@ -37,6 +37,7 @@ import (
 // exist to close.
 func TestBusyCompletionStrand_NoSessionIdle_StrandsRunningRoots(t *testing.T) {
 	s := New(100)
+	defer s.Close() // GAP-S1: cancel armed grace so no timer fires into a later test
 	// Shrink the completion-grace window so the test can observe the
 	// authoritative clear without waiting the prod default (5s). The grace
 	// window is what lets a completed assistant turn clear a stranded

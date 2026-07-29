@@ -145,6 +145,7 @@ func TestActivityReconcileClearsTerminatedSession(t *testing.T) {
 
 func TestActivityFromMessageStream(t *testing.T) {
 	s := New(100)
+	defer s.Close() // GAP-S1: cancel armed grace so no timer fires into a later test
 	s.Apply(ev("session.created", `{"info":{"id":"a"}}`))
 	// No session.status event at all — busy is derived from the live message
 	// stream (OpenCode's status can lag a streaming turn). An incomplete
@@ -513,6 +514,7 @@ func TestSetActivityFromStatuses(t *testing.T) {
 
 func TestGateFactsFinishAndUsage(t *testing.T) {
 	s := New(100)
+	defer s.Close() // GAP-S1: cancel armed grace so no timer fires into a later test
 	s.Apply(ev("session.created", `{"info":{"id":"a"}}`))
 	// In-flight assistant turn: no finish, not completed → busy, not "completed".
 	s.Apply(ev("message.updated", `{"info":{"id":"m1","sessionID":"a","role":"assistant","time":{"created":1}}}`))
