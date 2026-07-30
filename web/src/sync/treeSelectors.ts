@@ -18,7 +18,7 @@ import type { TreeMode } from "./treeState";
 export type EffectiveTreeMode = TreeMode | "temp";
 
 // The pinned group: iterate the reconciled pinned ORDER (membership + drag
-// order, supplied by sidebar.reconciledPinnedOrder), resolve each id against
+// order, supplied by pins.reconciledPinnedOrder), resolve each id against
 // the flat map, and drop any that are not currently resident. A pinned node
 // that is deep, collapsed (loaded:false), or orphaned still resolves here —
 // that is the whole point: the flat map does not care about depth.

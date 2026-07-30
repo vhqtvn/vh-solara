@@ -1166,7 +1166,7 @@ export function connect(fresh = false) {
   // Both frames are emitted on this Stream-1 (tree) connection. They carry NO
   // SSE `id:` line (both transient — reconnect catches up via pins.snapshot),
   // so there is no cursor to advance and no shared-resume interaction. They are
-  // disjoint from tree/detail state (the sidebar facade owns the pin signals),
+  // disjoint from tree/detail state (the pins facade owns the pin signals),
   // so they are NOT subject to treeSnapshotDecoding serialization or the busy
   // gate: a pins frame during an archive or a tree decode still applies (pins
   // are worker-wide, independent of any one project's archive scope). Only the

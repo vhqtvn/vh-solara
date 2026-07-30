@@ -170,7 +170,7 @@ function TreeBranch(props: {
 function TreeStateView() {
   // PINS — the pinned group. Built from the FLAT map via selectPinnedNodes, so
   // a pinned node hoists here regardless of depth/collapse. `reconciledPinnedOrder`
-  // is the membership+drag-order source (sidebar.ts, persisted vh.pinned.v1 +
+  // is the membership+drag-order source (pins.ts, persisted vh.pinned.v1 +
   // vh.pinned-order.v1). `pinnedIds` is the dedup set threaded through the tree
   // walk so a hoisted node doesn't also render in its natural spot.
   const pinnedOrder = () => reconciledPinnedOrder();
