@@ -33,13 +33,15 @@ type TreeSnapshot struct {
 	Cause string `json:"cause,omitempty"` // "cold" | "reconnect".
 }
 
-// TreeEmitter translates store state + ClientEvents into the tree=2 wire
-// contract for one stream connection. It is NOT safe for concurrent use from
-// multiple goroutines — one per connection, driven by the single stream loop.
-type TreeEmitter struct {
-	store *Store
-	dir   string
-	seq   uint64
+// emitterState is the committed cache state of one TreeEmitter connection: the
+// four fields whose atomicity the L-14/M5 Prepare/Commit delivery protocol
+// protects. It is embedded in TreeEmitter so existing readers/tests access the
+// COMMITTED values via field promotion (e.seq, e.ec, e.parentCache, e.known).
+//
+// Single-owner per connection (one stream-loop goroutine — see the TreeEmitter
+// doc comment), so clone-and-replace during Prepare needs no synchronization.
+type emitterState struct {
+	seq uint64
 
 	// ec is the per-connection loaded-set E_c (§5.4): the set of nodes whose
 	// DIRECT children this connection holds. Seeded from the §5 snapshot's
@@ -59,15 +61,62 @@ type TreeEmitter struct {
 	known map[string]bool
 }
 
+// clone returns a deep copy of st (new maps). Prepare clones the committed
+// state into an isolated working copy; mutations on the clone never reach the
+// committed maps until Commit installs the prepared object, so a failed
+// delivery leaves the committed cache exactly as it was.
+func (st emitterState) clone() emitterState {
+	out := emitterState{
+		seq:         st.seq,
+		ec:          make(map[string]bool, len(st.ec)),
+		parentCache: make(map[string]string, len(st.parentCache)),
+		known:       make(map[string]bool, len(st.known)),
+	}
+	for k, v := range st.ec {
+		out.ec[k] = v
+	}
+	for k, v := range st.parentCache {
+		out.parentCache[k] = v
+	}
+	for k, v := range st.known {
+		out.known[k] = v
+	}
+	return out
+}
+
+// TreeEmitter translates store state + ClientEvents into the tree=2 wire
+// contract for one stream connection. It is NOT safe for concurrent use from
+// multiple goroutines — one per connection, driven by the single stream loop.
+//
+// Delivery protocol (L-14/M5): the committed cache is the embedded
+// emitterState. Translate a store event via Prepare (clones committed, translates
+// against the clone, returns ops + proposed next state WITHOUT mutating
+// committed) then Commit (installs the proposed state) — and only AFTER the ops
+// are accepted by the delivery boundary (pkg/web's checked write). A failed
+// delivery discards the prepared object; committed state is untouched, so the
+// emitter cache always reflects operations the client actually received, not
+// operations merely constructed during translation. Translate remains as a
+// Prepare+Commit convenience for the translation-correctness tests.
+type TreeEmitter struct {
+	store *Store
+	dir   string
+	// emitterState is the COMMITTED cache (promoted: e.seq, e.ec, e.parentCache,
+	// e.known). During Prepare the working clone is swapped in here so the
+	// translation methods operate on the clone, then committed is restored.
+	emitterState
+}
+
 // NewTreeEmitter constructs an emitter bound to store. dir is the project
 // directory scope (mirrors reqDir) stamped onto op envelopes.
 func NewTreeEmitter(store *Store, dir string) *TreeEmitter {
 	return &TreeEmitter{
-		store:       store,
-		dir:         dir,
-		ec:          map[string]bool{},
-		parentCache: map[string]string{},
-		known:       map[string]bool{},
+		store: store,
+		dir:   dir,
+		emitterState: emitterState{
+			ec:          map[string]bool{},
+			parentCache: map[string]string{},
+			known:       map[string]bool{},
+		},
 	}
 }
 
@@ -444,15 +493,17 @@ func sortedByDepthLocked(s *Store, ids map[string]bool) []string {
 // Structural-delta translation (§6)
 // ----------------------------------------------------------------------------
 
-// Translate maps one store ClientEvent into zero or more tree delta ops for
-// THIS connection, applying the §5.4 loaded-set decision (real child op when
-// the parent is in E_c, count-only facet otherwise) and enforcing INV-B
-// (parent-before-child) within the returned slice. Caller must NOT hold s.mu.
-func (e *TreeEmitter) Translate(ev ClientEvent) []TreeOp {
-	s := e.store
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
+// translateLocked maps one store ClientEvent into zero or more tree delta ops
+// for THIS connection, applying the §5.4 loaded-set decision (real child op
+// when the parent is in E_c, count-only facet otherwise) and enforcing INV-B
+// (parent-before-child) within the returned slice.
+//
+// It operates against the CURRENT embedded emitterState — committed when called
+// directly, or the isolated working clone when called from Prepare (which swaps
+// the clone in first). Each op is stamped EXACTLY ONCE by its handler's
+// stamp() call; the former final re-stamp loop is removed so the per-stream seq
+// advances once per op (INV-A) instead of twice. Caller MUST hold s.mu.
+func (e *TreeEmitter) translateLocked(ev ClientEvent) []TreeOp {
 	var ops []TreeOp
 	switch ev.Kind {
 	case KindSessionUpsert:
@@ -474,11 +525,83 @@ func (e *TreeEmitter) Translate(ev ClientEvent) []TreeOp {
 	case KindTreeOrphanCheck:
 		ops = e.onOrphanCheckLocked(ev)
 	}
-	for _, op := range ops {
-		op.assignSeq(e.nextSeq())
-		op.setDir(e.dir)
-	}
 	return ops
+}
+
+// PreparedTranslation is the isolated result of Prepare: the ops to deliver and
+// the proposed next committed state. Committed emitter state is NOT mutated by
+// Prepare; the delivery boundary installs Next via Commit only after the ops
+// are accepted. Commit is idempotent.
+type PreparedTranslation struct {
+	// Ops are the tree delta ops for one store event, each stamped exactly once
+	// (seq/dir/sessionHint). Empty when the event was filtered (e.g. a facet for
+	// a node this connection does not hold).
+	Ops []TreeOp
+	// Next is the proposed committed state after this event's translation. It
+	// equals the committed state when Ops is empty (no handler mutated state).
+	Next emitterState
+	// EventSeq is ev.Seq (the STORE seq), used by the delivery boundary as the
+	// SSE id / Last-Event-ID reconnect cursor. It is NOT op.Seq() (the per-
+	// stream emitter seq). Carried here so the boundary can stamp the wire id
+	// without re-reading the event.
+	EventSeq uint64
+}
+
+// Prepare reads the committed cache state, clones it into an isolated working
+// copy, translates ev entirely against the clone, and returns the ops plus the
+// proposed next state — WITHOUT mutating committed state. The committed cache
+// is restored on return even on panic. Caller must NOT hold s.mu.
+//
+// The delivery boundary (pkg/web) marshals Ops, performs a checked write, and
+// calls Commit only on success; on any failure it discards this object, so a
+// failed delivery leaves the committed cache as if the event never happened.
+// Prepare itself does not fail for well-formed store events today (the store
+// only emits well-formed events; malformed payloads yield zero ops, not an
+// error); the error return exists so the boundary can treat preparation,
+// marshal, and write failures uniformly.
+func (e *TreeEmitter) Prepare(ev ClientEvent) (*PreparedTranslation, error) {
+	s := e.store
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	// Clone-and-replace (single-owner: one stream-loop goroutine per emitter,
+	// so no synchronization is needed). Swap the working clone in as the
+	// embedded state so the translation methods — which read/mutate e.seq,
+	// e.ec, e.parentCache, e.known via field promotion — translate against the
+	// clone. The committed state is captured BEFORE the swap and restored on
+	// return (even on panic), so a Prepare whose delivery later fails leaves
+	// the committed cache untouched.
+	committed := e.emitterState
+	e.emitterState = e.emitterState.clone()
+	defer func() { e.emitterState = committed }()
+
+	ops := e.translateLocked(ev)
+	return &PreparedTranslation{
+		Ops:      ops,
+		Next:     e.emitterState, // the mutated working clone
+		EventSeq: ev.Seq,
+	}, nil
+}
+
+// Commit atomically installs the prepared next state into the committed cache.
+// Idempotent: calling it more than once for the same prepared object is a
+// harmless re-install of equivalent state. nil is a no-op.
+func (e *TreeEmitter) Commit(p *PreparedTranslation) {
+	if p == nil {
+		return
+	}
+	e.emitterState = p.Next
+}
+
+// Translate is a legacy convenience wrapper: Prepare + Commit. It is retained
+// for the translation-correctness tests, which assert on the returned ops and
+// do not exercise the delivery/commit protocol. Production (pkg/web) uses
+// Prepare → checked delivery → Commit so a failed delivery leaves committed
+// state unchanged. Caller must NOT hold s.mu.
+func (e *TreeEmitter) Translate(ev ClientEvent) []TreeOp {
+	p, _ := e.Prepare(ev)
+	e.Commit(p)
+	return p.Ops
 }
 
 // onSessionUpsertLocked handles a session create/update. Emits node.upsert for

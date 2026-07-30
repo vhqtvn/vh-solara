@@ -1523,14 +1523,23 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		for _, ev := range events {
 			if sendable(ev.Kind, ev.Payload) {
 				if treeEmitter != nil {
-					// tree=2 replay: translate each event to tree delta ops.
-					// The SSE id (Last-Event-ID) uses ev.Seq (STORE seq) — NOT
-					// op.Seq() (emitter seq) — so store.Replay(cursor) works in
-					// the same number space on the next reconnect (§5.5).
-					for _, op := range treeEmitter.Translate(ev) {
-						if b, err := json.Marshal(op); err == nil {
-							writeRaw(w, ev.Seq, "tree.op", b)
-						}
+					// tree=2 replay (L-14/M5): Prepare → checked deliver → (on
+					// success) the legacy detail frame. Prepare leaves committed
+					// cache state unchanged; deliverTreeOps commits only after a
+					// full checked write. Any failure aborts the replay response
+					// (the connection terminates) so a dropped/partial frame
+					// cannot poison the emitter's cache. The SSE id
+					// (Last-Event-ID) uses ev.Seq (STORE seq) — NOT op.Seq()
+					// (emitter seq) — so store.Replay(cursor) works in the same
+					// number space on the next reconnect (§5.5).
+					prepared, err := treeEmitter.Prepare(ev)
+					if err != nil {
+						vhlog.Warn("tree=2 replay: prepare failed, aborting stream", "seq", ev.Seq, "err", err)
+						return
+					}
+					if err := deliverTreeOps(w, treeEmitter, prepared); err != nil {
+						vhlog.Warn("tree=2 replay: delivery failed, aborting stream", "seq", ev.Seq, "err", err)
+						return
 					}
 					// Phase 3 Step A.5 (GAP 3): emit the legacy detail frame
 					// alongside tree.op so cross-session detail consumers
@@ -1763,17 +1772,23 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 				continue // background message/part for an unsubscribed session
 			}
 			if treeEmitter != nil {
-				// Phase 2 tree=2: translate the raw store event to tree delta
-				// ops (node.upsert/remove/move/children/facet) and emit each as
-				// a tree.op SSE event. The emitter's per-connection E_c decides
+				// Phase 2 tree=2 live (L-14/M5): Prepare → checked deliver →
+				// (on success) the legacy detail frame + per-event flush. On
+				// any ambiguous failure (marshal/short write/write error) abort
+				// the connection rather than continuing after an advanced
+				// baseline — a dropped/partial frame must not poison the
+				// emitter's cache. The emitter's per-connection E_c decides
 				// whether a child op or only a count facet is shipped (§5.4).
 				// The SSE id (Last-Event-ID) uses ev.Seq (STORE seq) so the
 				// client's cursor matches store.Replay on reconnect (§5.5).
-				ops := treeEmitter.Translate(ev)
-				for _, op := range ops {
-					if b, err := json.Marshal(op); err == nil {
-						writeRaw(w, ev.Seq, "tree.op", b)
-					}
+				prepared, err := treeEmitter.Prepare(ev)
+				if err != nil {
+					vhlog.Warn("tree=2 live: prepare failed, aborting stream", "seq", ev.Seq, "err", err)
+					return
+				}
+				if err := deliverTreeOps(w, treeEmitter, prepared); err != nil {
+					vhlog.Warn("tree=2 live: delivery failed, aborting stream", "seq", ev.Seq, "err", err)
+					return
 				}
 				// Phase 3 Step A.5 (GAP 3): emit the legacy detail frame
 				// alongside tree.op (see replay-loop comment above for full
@@ -1817,6 +1832,48 @@ func writeRaw(w io.Writer, seq uint64, event string, data []byte) {
 // and ignore the absence of an id (existing notice/ping frames already omit it).
 func writeRawNoID(w io.Writer, event string, data []byte) {
 	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, data)
+}
+
+// deliverTreeOps is the L-14/M5 checked delivery boundary for the tree=2
+// TreeEmitter path. It marshals ALL tree.op frames for one prepared store event
+// into a single buffer BEFORE any write (so a marshal failure puts NOTHING on
+// the wire), then performs ONE checked write — err == nil AND n == len(buf) —
+// and calls treeEmitter.Commit ONLY on full acceptance. On any failure (marshal
+// error, write error, short write) it returns a non-nil error and leaves the
+// committed emitter state UNCHANGED; the caller MUST abort the stream rather
+// than continue past an advanced baseline.
+//
+// This replaces the former per-op writeRaw loop, which marshaled+wrote each op
+// in turn and discarded writeRaw's (n, err) — so a dropped or partial frame
+// silently advanced the emitter's committed cache, poisoning later translation
+// (it assumed the client had observed state that was never delivered).
+//
+// Delivery success here is LOCAL write acceptance (the HTTP/OS layer accepted
+// the bytes), NOT proof of browser receipt. There is no rollback: because
+// Prepare never mutated committed state, failure only discards the prepared
+// object.
+func deliverTreeOps(w io.Writer, treeEmitter *state.TreeEmitter, prepared *state.PreparedTranslation) error {
+	if prepared == nil || len(prepared.Ops) == 0 {
+		return nil // nothing to deliver; Next == committed, so no commit needed
+	}
+	var buf bytes.Buffer
+	for _, op := range prepared.Ops {
+		b, err := json.Marshal(op)
+		if err != nil {
+			return fmt.Errorf("tree=2 tree.op marshal (event seq %d): %w", prepared.EventSeq, err)
+		}
+		// Mirror writeRaw's frame shape exactly (id/event/data).
+		fmt.Fprintf(&buf, "id: %d\nevent: tree.op\ndata: %s\n\n", prepared.EventSeq, b)
+	}
+	n, err := w.Write(buf.Bytes())
+	if err != nil {
+		return fmt.Errorf("tree=2 tree.op write (event seq %d): %w", prepared.EventSeq, err)
+	}
+	if n != buf.Len() {
+		return fmt.Errorf("tree=2 tree.op short write (event seq %d): %d/%d bytes", prepared.EventSeq, n, buf.Len())
+	}
+	treeEmitter.Commit(prepared)
+	return nil
 }
 
 // snapshotComplete is the Q5 truthful completion boundary. Emitted on the wire
