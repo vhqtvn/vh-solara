@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -61,6 +62,24 @@ type FakeOpenCode struct {
 	busy            map[string]string             // sessionID -> status type (busy/retry); mirrors /session/status
 	baseline        map[string][]messageWithParts // sessionID -> seeded message list snapshot for /fixture/reset
 	promptAsyncMode PromptAsyncMode               // test-only; default PromptAsyncNormal (see PromptAsyncMode doc)
+
+	// --- test-only exact-GET seam for the reconcile in-flight-guard e2e test ---
+	//
+	// Off by default: reconcileGetBlock == nil means the exact message-GET
+	// (GET /session/:sid/message/:mid) behaves exactly as before. ArmReconcileGetBlock
+	// installs a sentinel channel; while armed, every exact message-GET BLOCKS on
+	// <-reconcileGetBlock until ReleaseReconcileGetBlock closes it — letting a test
+	// hold a reconcile pass's lookup mid-flight so concurrent passes can be shown to
+	// be single-flighted by the Server's queueReconcileInFlight guard. The GET blocks
+	// OUTSIDE reconcileGetHookMu so the fake never deadlocks (Arm/Release only ever
+	// read/swap the channel ref under the lock).
+	//
+	// reconcileGetCount is an always-on atomic counter of exact message-GETs. It is
+	// harmless to existing fixtures/tests (none read it) and gives the in-flight-guard
+	// test a race-free observable for "how many reconcile passes reached the lookup".
+	reconcileGetHookMu sync.Mutex
+	reconcileGetBlock  chan struct{}
+	reconcileGetCount  int64 // atomic; counts every exact message-GET
 }
 
 type messageWithParts struct {
@@ -390,6 +409,44 @@ func (f *FakeOpenCode) PromptAsyncModeNow() PromptAsyncMode {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.promptAsyncMode
+}
+
+// ArmReconcileGetBlock arms the test-only exact-GET blocker: while armed, every
+// GET /session/:sid/message/:mid blocks until ReleaseReconcileGetBlock is called.
+// TEST-ONLY and OFF BY DEFAULT — existing fixtures/tests never arm it, so their
+// behavior is unchanged. Idempotent: arming when already armed is a no-op (the
+// existing sentinel stays). Used by the e2e reconcile in-flight-guard test to
+// hold the first reconcile pass's GET mid-flight so concurrent passes can be
+// shown to be single-flighted by the Server's queueReconcileInFlight guard.
+func (f *FakeOpenCode) ArmReconcileGetBlock() {
+	f.reconcileGetHookMu.Lock()
+	defer f.reconcileGetHookMu.Unlock()
+	if f.reconcileGetBlock == nil {
+		f.reconcileGetBlock = make(chan struct{})
+	}
+}
+
+// ReleaseReconcileGetBlock unblocks every exact-GET held by a prior
+// ArmReconcileGetBlock and disarms the blocker (subsequent GETs do not block
+// until Arm is called again). Idempotent (no-op when not armed). Closing (not
+// nil-then-race) is what unblocks all receivers at once.
+func (f *FakeOpenCode) ReleaseReconcileGetBlock() {
+	f.reconcileGetHookMu.Lock()
+	ch := f.reconcileGetBlock
+	f.reconcileGetBlock = nil
+	f.reconcileGetHookMu.Unlock()
+	if ch != nil {
+		close(ch)
+	}
+}
+
+// ReconcileGetCount returns the number of exact message-GETs
+// (GET /session/:sid/message/:mid) observed since the fake was created.
+// Race-free (atomic). Used by the e2e in-flight-guard test (delta-based, since
+// the shared cluster fake accumulates GETs across the package) to assert exactly
+// one GET occurred under concurrent reconcile passes.
+func (f *FakeOpenCode) ReconcileGetCount() int64 {
+	return atomic.LoadInt64(&f.reconcileGetCount)
 }
 
 // UserMessageCount returns the number of committed user messages for a session.
@@ -850,6 +907,18 @@ func (f *FakeOpenCode) handleSession(w http.ResponseWriter, r *http.Request) {
 		// additionally requires info.role==="user" && info.id===minted, so an
 		// assistant message with a colliding id (never happens — ids are
 		// globally unique) still fails the caller's exact-match check.
+		//
+		// Test-only exact-GET seam (off by default): count every lookup, then —
+		// only when ArmReconcileGetBlock has installed a sentinel — block until
+		// ReleaseReconcileGetBlock closes it. Used by the reconcile in-flight-guard
+		// e2e test (tests/e2e) to hold the first reconcile pass's GET mid-flight.
+		atomic.AddInt64(&f.reconcileGetCount, 1)
+		f.reconcileGetHookMu.Lock()
+		block := f.reconcileGetBlock
+		f.reconcileGetHookMu.Unlock()
+		if block != nil {
+			<-block
+		}
 		mid := parts[3]
 		if !strings.HasPrefix(mid, "msg_") {
 			http.Error(w, "fixture: message id must be msg_-prefixed", http.StatusBadRequest)
