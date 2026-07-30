@@ -322,6 +322,95 @@ rm -f "$D_RECONN"
 [ "$(echo "$D_RES" | sed -n 1p)" = "OK" ] || fail "behavior D (reconnect) failed ($D_RES)"
 echo "    D OK: $(echo "$D_RES" | sed -n 2p)"
 
+# ===========================================================================
+# Flow 6: caller-minted messageID + exact message GET (queue->message-ID
+# reconcile contract) -- docker-gold backstop.
+#
+# The in-process e2e (tests/e2e/) runs against the FAKE opencode, which could
+# model behavior real opencode lacks. This flow proves -- against REAL opencode
+# -- the OpenCode-side contract vh-solara's queue reconciler depends on (source
+# packet: researches/sources/opencode-v1.17.18-messageid-exact-lookup.md). It
+# hits opencode's contract DIRECTLY through the transparent /oc/ passthrough
+# (handlePassthrough forwards bodies+statuses verbatim; NO vh-solara queue is
+# involved -- the queue mints its own id, which would short-circuit the probe):
+#   1. prompt_async {"messageID":"msg_<ascending>", ...} -> 204 (caller-id-wins,
+#      turn accepted + forked; persistence async to the 204).
+#   2. after a bounded wait, GET .../message/<minted> -> 200 with info.id===minted
+#      AND role==="user" (caller-id-wins, NO remint -- exact-match authority).
+#   3. GET <OTHER_SESSION>/message/<minted> -> 404 (composite key id AND
+#      session_id -> session isolation).
+#   4. GET .../message/<non-msg-id> -> 400 (brand rejection -- caller bug).
+# ===========================================================================
+echo "==> [msgid flow] minting a valid ascending msg_ id (replicates pkg/opencode/id.go)"
+MINTED=$(python3 "$repo_root/tests/e2e-docker/mint_msg_id.py") \
+  || fail "could not mint msg_ id"
+echo "    minted id: $MINTED"
+
+echo "==> [msgid flow] creating a second session for the isolation check"
+OTHER_SID=""
+for i in $(seq 1 30); do
+  OTHER_SID=$(curl -fsS -H 'X-VH-CSRF: 1' -X POST "${BASE}/oc/session" \
+        -H 'Content-Type: application/json' -d '{"title":"msgid-iso"}' \
+        | python3 -c 'import sys,json;print(json.load(sys.stdin).get("id",""))' 2>/dev/null || true)
+  [ -n "$OTHER_SID" ] && break
+  sleep 1
+  [ "$i" = 30 ] && fail "could not create a second session for the isolation check"
+done
+echo "    other session id: $OTHER_SID"
+
+# --- 1. prompt_async with caller messageID -> 204 ---------------------------
+echo "==> [msgid flow] 1: POST prompt_async with caller messageID (expect 204)"
+PASYNC_CODE=$(curl -s -o /dev/null -w "%{http_code}" -H 'X-VH-CSRF: 1' \
+  -X POST "${BASE}/oc/session/${SID}/prompt_async" \
+  -H 'Content-Type: application/json' \
+  -d "{\"messageID\":\"${MINTED}\",\"parts\":[{\"type\":\"text\",\"text\":\"msgid contract probe\"}]}" \
+  || true)
+[ "$PASYNC_CODE" = "204" ] \
+  || fail "[msgid flow] prompt_async with messageID did not return 204 (got $PASYNC_CODE)"
+echo "    1 OK: prompt_async -> 204 (turn accepted + forked, persistence async)"
+
+# --- 2. exact GET resolves to the persisted caller-minted user message ------
+# Persistence is ASYNC to the 204 (Effect.forkIn), so a lookup immediately after
+# the 204 may legitimately 404. Poll until 200 + exact match, bounded.
+echo "==> [msgid flow] 2: polling GET .../message/<minted> for the persisted user message"
+MSGID_OK=""
+for i in $(seq 1 60); do
+  G2B=$(mktemp)
+  G2CODE=$(curl -s -o "$G2B" -w "%{http_code}" "${BASE}/oc/session/${SID}/message/${MINTED}" 2>/dev/null || true)
+  if [ "$G2CODE" = "200" ]; then
+    G2RES=$(python3 "$repo_root/tests/e2e-docker/assert_msgid_get.py" "$MINTED" < "$G2B" 2>/dev/null || true)
+    if [ "$(echo "$G2RES" | sed -n 1p)" = "OK" ]; then
+      MSGID_OK=1
+      echo "    2 OK: $(echo "$G2RES" | sed -n 2p)"
+      echo "         $(echo "$G2RES" | sed -n 3p)"
+    fi
+  elif [ "$G2CODE" = "404" ]; then
+    : # not persisted yet -- keep polling (persistence is async to the 204)
+  else
+    rm -f "$G2B"; fail "[msgid flow] unexpected GET status $G2CODE for minted id"
+  fi
+  rm -f "$G2B"
+  [ -n "$MSGID_OK" ] && break
+  sleep 1
+  [ "$i" = 60 ] && fail "[msgid flow] persisted user message not observed via exact GET (last status=$G2CODE)"
+done
+
+# --- 3. session isolation: cross-session GET -> 404 -------------------------
+# Composite key id AND session_id: the minted id lives under SID, so querying a
+# DIFFERENT session must 404 (cannot accidentally resolve cross-session).
+echo "==> [msgid flow] 3: GET <OTHER_SESSION>/message/<minted> (expect 404 isolation)"
+ISO_CODE=$(curl -s -o /dev/null -w "%{http_code}" "${BASE}/oc/session/${OTHER_SID}/message/${MINTED}" 2>/dev/null || true)
+[ "$ISO_CODE" = "404" ] \
+  || fail "[msgid flow] cross-session GET did not return 404 (got $ISO_CODE; isolation broken)"
+echo "    3 OK: GET <other session>/message/<minted> -> 404 (composite-key isolation)"
+
+# --- 4. brand rejection: non-msg id -> 400 ---------------------------------
+echo "==> [msgid flow] 4: GET .../message/<non-msg-id> (expect 400 brand rejection)"
+BAD_CODE=$(curl -s -o /dev/null -w "%{http_code}" "${BASE}/oc/session/${SID}/message/not_a_msg_id" 2>/dev/null || true)
+[ "$BAD_CODE" = "400" ] \
+  || fail "[msgid flow] non-msg id GET did not return 400 (got $BAD_CODE; brand check differs from contract)"
+echo "    4 OK: GET .../message/not_a_msg_id -> 400 (brand rejection)"
+
 echo
 echo "PASS: real opencode driven by the fake LLM exercised the full flow:"
 echo "      - prompt -> streamed assistant reply (snapshot + live stream)"
@@ -330,4 +419,6 @@ echo "      - task tool -> subsession in the tree"
 echo "      - bash tool -> permission asked -> reply -> turn resumes"
 echo "      - tree=2: bounded frontier (A), expand pagination (B),"
 echo "                missed-delete reconcile -> node.remove (C), reconnect no-ship (D)"
+echo "      - msgid: prompt_async caller messageID -> 204, exact GET -> 200 (caller-id-wins),"
+echo "               cross-session 404 (isolation), non-msg 400 (brand reject)"
 exit 0
