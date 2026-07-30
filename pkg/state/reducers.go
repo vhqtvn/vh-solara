@@ -915,7 +915,14 @@ func (s *Store) recomputeLastAssistantLocked(sessionID string) {
 	se.lastTokens = nil
 	se.lastAsstCompleted = false
 	se.lastAsstEmpty = false
-	se.lastAgent = ""
+	// Compute the final lastAgent from the in-memory view WITHOUT writing it
+	// directly. The two historical writers here — a reset to "" before the scan
+	// and a set to the newest assistant's agent inside the scan — are routed
+	// through the universal setLastAgentLocked chokepoint as a SINGLE diff so a
+	// no-net-change recompute (was X, would have reset to "" then back to X)
+	// advances neither the seq nor an event. The helper is a no-op on an
+	// unchanged value (honors the observable-mutation no-op rule).
+	finalAgent := ""
 	for i := len(sm.order) - 1; i >= 0; i-- {
 		me := sm.byID[sm.order[i]]
 		if me == nil || me.role != "assistant" {
@@ -926,9 +933,36 @@ func (s *Store) recomputeLastAssistantLocked(sessionID string) {
 		se.lastTokens = me.tokens
 		se.lastAsstCompleted = me.completed
 		se.lastAsstEmpty = !messageHasContent(me)
-		se.lastAgent = me.agent
-		return
+		finalAgent = me.agent
+		break
 	}
+	s.setLastAgentLocked(sessionID, finalAgent)
+}
+
+// setLastAgentLocked is the UNIVERSAL chokepoint for every observable lastAgent
+// mutation. It enforces the publication-integrity invariant: a real snapshot-
+// visible change produces exactly one KindLastAgentSet event AND one sequence
+// advance, while an unchanged value or an unknown session is a total no-op (no
+// write, no event, no seq bump). The four direct writers route through it:
+// SetLastAgents (cold seed), and recomputeLastAssistantLocked's computed final
+// value (covers the former reset-to-"" and set-from-newest-assistant writers, as
+// well as every indirect recompute callsite). upsertSessionLocked's entry-
+// replace preserve is intentionally NOT routed here — it carries lastAgent over
+// at entry construction (a preserve, not a mutation) and must not emit. Caller
+// MUST hold s.mu.
+func (s *Store) setLastAgentLocked(sid, agent string) {
+	se := s.sessions[sid]
+	if se == nil {
+		return // unknown session: no event, no seq advance
+	}
+	if se.lastAgent == agent {
+		return // unchanged: no event, no seq advance
+	}
+	se.lastAgent = agent
+	s.emit(KindLastAgentSet, rawObj(map[string]interface{}{
+		"sessionID": sid,
+		"agent":     agent,
+	}))
 }
 
 // recomputeCurrentVerbLocked refreshes a session's rich current-activity facet
@@ -1360,14 +1394,24 @@ func (s *Store) deletePartLocked(sessionID, messageID, partID string) {
 // gate as PermissionBlocked) — the policy decision lives in the web layer; the
 // store only records the outcome so callers can observe it post-hoc. The flag
 // is sticky past the permission clearing and is cleared on session termination
-// (deleteSessionLocked). No-op if the session is no longer tracked.
+// (deleteSessionLocked). On the FIRST false→true transition it emits one
+// KindPermissionBlocked event (advancing the seq); repeat calls on an already-
+// blocked session are idempotent (no event, no seq advance). No-op if the
+// session is no longer tracked.
 func (s *Store) MarkPermissionBlocked(sessionID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.sessions[sessionID]; !ok {
 		return
 	}
+	if s.permBlocked[sessionID] {
+		return // idempotent: already blocked — no event, no seq advance
+	}
 	s.permBlocked[sessionID] = true
+	s.emit(KindPermissionBlocked, rawObj(map[string]interface{}{
+		"sessionID":            sessionID,
+		"permissionWasBlocked": true,
+	}))
 }
 
 func removeString(xs []string, x string) []string {

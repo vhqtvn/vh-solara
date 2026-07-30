@@ -95,6 +95,24 @@ const (
 	// message./part. so the web layer's sendable() always-streams it on the
 	// tree-only Stream 1 (mirrors activity.verb / activity / unread.*).
 	KindLastAgentSet = "lastAgent.set"
+	// KindPermissionBlocked records the FIRST observable false→true transition
+	// of a session's automated-spawn permission auto-rejection (MarkPermissionBlocked).
+	// It is a sticky historical fact (NOT the pending-request lifecycle that
+	// KindPermissionSet / KindPermissionClear carry) — it survives a permission
+	// clearing and is cleared only on session termination (deleteSessionLocked →
+	// KindSessionDelete). At most once per session lifetime. Idempotent: an
+	// already-blocked session emits nothing on a repeat MarkPermissionBlocked.
+	// Payload {sessionID, permissionWasBlocked:true}. NOT prefixed message./part.
+	// so the server publishes it as a replayable event on the tree-only Stream 1
+	// and advances the snapshot sequence. CURRENT WEB CLIENTS DO NOT CONSUME IT
+	// INCREMENTALLY: permission.blocked is absent from the web layer's
+	// TREE_STREAM_KINDS and has no reducer case, so an already-connected SPA never
+	// applies the live frame. They converge the permission-blocked state from
+	// snapshot / reconnect data instead — GateFacts.PermissionWasBlocked carries
+	// the flag, so a client that connected before the transition and one that
+	// connected after compose correctly. Wiring the live web consumer is deferred
+	// to the L-08 track.
+	KindPermissionBlocked = "permission.blocked"
 	// KindNotice carries a daemon-detected alert (turn finished, waiting on a
 	// human, stuck/runaway/stalled) for in-app delivery. It is NOT part of the
 	// materialized view — it's a transient fan-out, not stored in any snapshot —

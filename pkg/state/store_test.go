@@ -924,15 +924,25 @@ func TestSetLastAgentsEmitsLiveEvent(t *testing.T) {
 		t.Fatalf("changed-value re-seed: want one a=plan event, got %+v", got)
 	}
 
-	// An empty seed clears the field but must NOT broadcast (nothing to show).
+	// A real change to "" (plan → "") DOES broadcast one agent:"" event under
+	// the universal-chokepoint invariant — clearing a previously-shown chip is
+	// itself an observable mutation and must advance the seq + emit a replayable
+	// event, exactly like setting one.
+	s.SetLastAgents(map[string]string{"a": ""})
+	got = nil
+	drain()
+	if len(got) != 1 || got[0].sid != "a" || got[0].agent != "" {
+		t.Fatalf("empty seed on a non-empty value: want one a=\"\" event, got %+v", got)
+	}
+	if s.Snapshot(nil).LastAgents["a"] != "" {
+		t.Fatal("empty seed must clear the snapshot facet")
+	}
+	// Idempotent: re-seeding "" on an already-"" session must NOT re-emit.
 	s.SetLastAgents(map[string]string{"a": ""})
 	got = nil
 	drain()
 	if len(got) != 0 {
-		t.Fatalf("empty seed must not broadcast, got %+v", got)
-	}
-	if s.Snapshot(nil).LastAgents["a"] != "" {
-		t.Fatal("empty seed must clear the snapshot facet")
+		t.Fatalf("idempotent empty re-seed must not re-emit, got %d events: %+v", len(got), got)
 	}
 }
 

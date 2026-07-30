@@ -375,26 +375,14 @@ func (s *Store) SetLastAgents(agents map[string]string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for sid, agent := range agents {
-		se := s.sessions[sid]
-		if se == nil {
-			continue
-		}
-		if se.lastAgent == agent {
-			continue // idempotent: no change, no fanout
-		}
-		se.lastAgent = agent
-		if agent == "" {
-			continue // never broadcast an empty seed (nothing for the chip to show)
-		}
-		// Push the seeded label to already-connected clients as a live event:
-		// the cold seed runs as a background goroutine that usually finishes
-		// AFTER a client's first snapshot, so Snapshot.LastAgents would otherwise
-		// not carry this label until the next reconnect. Mirrors how
-		// setCurrentVerbLocked fans activity.verb out for a snapshot-only facet.
-		s.emit(KindLastAgentSet, rawObj(map[string]interface{}{
-			"sessionID": sid,
-			"agent":     agent,
-		}))
+		// Route every cold seed through the universal lastAgent chokepoint so a
+		// real change (incl. a seed to "", exercised when a recompute or an
+		// explicit empty seed clears a previously-set chip) advances the seq and
+		// emits a replayable KindLastAgentSet event, while an unchanged or
+		// unknown-session seed is a total no-op. The aggregator only ever feeds
+		// non-empty agents here in production, but the chokepoint keeps the
+		// invariant uniform across all writers.
+		s.setLastAgentLocked(sid, agent)
 	}
 }
 
