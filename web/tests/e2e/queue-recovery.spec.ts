@@ -140,7 +140,7 @@ test("occupied-composer guard refuses to overwrite an in-progress draft", async 
 });
 
 test("mark-sent on an unknown chip resolves it and the chip disappears", async ({ page, request }) => {
-  await setupChip(request, "MARK_SENT_TARGET", "unknown");
+  const { id } = await setupChip(request, "MARK_SENT_TARGET", "unknown");
   await page.goto(projectUrl("/?session=other"));
 
   const chip = page
@@ -154,4 +154,31 @@ test("mark-sent on an unknown chip resolves it and the chip disappears", async (
   await chip.locator(".queue-mark-sent").click();
 
   await expect(chip).toHaveCount(0);
+
+  // Durable daemon-persisted `sent` proof. Chip disappearance alone is
+  // satisfiable by the FE's OPTIMISTIC-LOCAL terminal state: resolveQueued
+  // applies the known outcome to the in-memory cache BEFORE the resolve
+  // POST completes/retries (web/src/queue.ts:329-351). A future reader could
+  // wrongly cite the chip-disappearance assertion above as evidence of durable
+  // persistence / no-redispatch. Close that gap by polling the daemon's own
+  // authoritative store: GET /vh/session/<sid>/queue (the same real queue API
+  // the `request` fixture drives in setup) until the target item's durable
+  // state reflects `sent`.
+  //
+  // The daemon's List() does NOT filter `sent` (that filtering is FE-only) and
+  // a freshly-resolved `sent` item survives compaction (1h TTL / cap 50), so
+  // the item stays present with state "sent". store.Resolve persists the
+  // terminal outcome atomically before returning (pkg/web/queue.go:768), so
+  // once this reads "sent" it is durable daemon state, not an optimistic
+  // projection. The bounded poll avoids a flaky synchronous read right after
+  // the click (the resolve write may still be in flight).
+  await expect.poll(
+    async () => {
+      const res = await request.get(apiUrl());
+      const j = await res.json().catch(() => ({}));
+      const items: Array<{ id: string; state: string }> = Array.isArray(j.items) ? j.items : [];
+      return items.find((it) => it.id === id)?.state;
+    },
+    { timeout: 10_000, message: "daemon queue reflects durable `sent` for the target item" },
+  ).toBe("sent");
 });
