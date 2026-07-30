@@ -1,7 +1,7 @@
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { abortSession, sessionProjectID, sessionWorking, state } from "../sync";
 import { suggestTitle } from "../sessionTitle";
-import { isPinned, togglePin, movePinnedByOffset, reconciledPinnedOrder, pinsPending, pinsLastError, clearPinsError } from "../sidebar";
+import { isPinned, togglePin, movePinnedByOffset, reconciledPinnedOrder, pinsPending, pinsLastError, clearPinsError } from "../pins";
 import { exportSessionMarkdown } from "../export";
 import { pushNotification } from "../notify";
 import { archiveSession, fetchDescendants, ArchiveDriftError, type SessionSummary } from "../archive";

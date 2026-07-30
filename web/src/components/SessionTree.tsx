@@ -20,7 +20,8 @@ import {
   working,
   hasKnownDescendants,
 } from "../sync/treeSelectors";
-import { searchQuery, reconciledPinnedOrder, isPinned } from "../sidebar";
+import { searchQuery } from "../sidebar";
+import { reconciledPinnedOrder, isPinned } from "../pins";
 import { menuTriggers } from "../sessionMenu";
 import TreeRow from "./TreeRow";
 import type { TreeNode } from "../sync/treeMap";

@@ -42,7 +42,7 @@ import { log } from "../lib/log";
 import { state, setState, persist } from "./store";
 import { notifyFromMessage, maybeNotifyRootDone, maybeClearWaiting } from "./orchestration";
 import { patchTreeAgent } from "./treeState";
-import { dropPinnedSession } from "../sidebar";
+import { dropPinnedSession } from "../pins";
 import { deriveMessageWindow, resetPageInFlight } from "./history";
 
 // mergeLastAgents — the agent-label fix (S3). During a server restart the

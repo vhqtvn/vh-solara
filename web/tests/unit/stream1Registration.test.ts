@@ -299,7 +299,7 @@ describe("Stream1 connect() listener manifest", () => {
   // Fast-path listeners — notice / pins.snapshot / pins.updated / ping. These
   // are disjoint from tree/detail coherent state and never await the owner.
   //   notice      → alerts.handleNotice (spied)
-  //   pins.*      → sidebar.applyPins{Snapshot,Updated} (spied)
+  //   pins.*      → pins.applyPins{Snapshot,Updated} (spied)
   //   ping        → markTreeTransportSeen → state.lastSeen mirror (throttled)
   // -------------------------------------------------------------------------
   it("notice + pins.snapshot + pins.updated reach their handlers; ping refreshes the transport clock", async () => {
@@ -314,10 +314,10 @@ describe("Stream1 connect() listener manifest", () => {
     expect(noticeSpy).toHaveBeenCalled();
     noticeSpy.mockRestore();
 
-    // pins.snapshot / pins.updated → sidebar facade (re-exported from ../pins).
-    const sidebar = await import("../../src/sidebar");
-    const pinsSnapSpy = vi.spyOn(sidebar, "applyPinsSnapshot");
-    const pinsUpdSpy = vi.spyOn(sidebar, "applyPinsUpdated");
+    // pins.snapshot / pins.updated → pins.applyPins{Snapshot,Updated} (spied).
+    const pins = await import("../../src/pins");
+    const pinsSnapSpy = vi.spyOn(pins, "applyPinsSnapshot");
+    const pinsUpdSpy = vi.spyOn(pins, "applyPinsUpdated");
     es.fire("pins.snapshot", { initialized: true, revision: 1, orderedSessionIds: [] });
     es.fire("pins.updated", { sessionID: "sP", pinned: true });
     expect(pinsSnapSpy).toHaveBeenCalled();

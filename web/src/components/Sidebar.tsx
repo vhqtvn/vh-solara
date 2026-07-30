@@ -1,6 +1,7 @@
 import { createSignal, createMemo, Show } from "solid-js";
 import { newSession, state, isStale, isUpdating, STALE_MS, projectDir } from "../sync";
-import { searchQuery, setSearchQuery, pinsLastError, clearPinsError } from "../sidebar";
+import { searchQuery, setSearchQuery } from "../sidebar";
+import { pinsLastError, clearPinsError } from "../pins";
 import { setSidebarWidth } from "../layout";
 import SessionTree from "./SessionTree";
 import ArchivedDialog from "./ArchivedDialog";
