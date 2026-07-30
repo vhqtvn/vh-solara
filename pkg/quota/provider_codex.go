@@ -47,17 +47,29 @@ func fetchCodex(ctx context.Context, auth map[string]json.RawMessage) ProviderRe
 		addRL("5h", "primary_window")
 		addRL("weekly", "secondary_window")
 	}
-	if credits := obj(payload, "credits"); credits != nil {
-		label := ""
-		if u, _ := credits["unlimited"].(bool); u {
-			label = "Unlimited"
-		} else if bal, ok := toNumber(credits["balance"]); ok {
-			label = fmt.Sprintf("$%.2f remaining", bal)
-		}
-		if label != "" {
-			res.Windows = append(res.Windows, makeWindow("credits", nil, nil, nil, label))
-		}
+	if w, ok := codexCreditsWindow(payload); ok {
+		res.Windows = append(res.Windows, w)
 	}
 	res.OK = true
 	return res
+}
+
+// codexCreditsWindow turns the optional `credits` object in a Codex usage payload
+// into a single usage window. It returns ok=false when there is no credits
+// object or no label could be derived, so the caller can skip the append.
+func codexCreditsWindow(payload map[string]any) (UsageWindow, bool) {
+	credits := obj(payload, "credits")
+	if credits == nil {
+		return UsageWindow{}, false
+	}
+	label := ""
+	if u, _ := credits["unlimited"].(bool); u {
+		label = "Unlimited"
+	} else if bal, ok := toNumber(credits["balance"]); ok {
+		label = fmt.Sprintf("$%.2f remaining", bal)
+	}
+	if label == "" {
+		return UsageWindow{}, false
+	}
+	return makeWindow("credits", nil, nil, nil, label), true
 }
