@@ -169,7 +169,7 @@ export type { SyncState } from "./sync/store";
 // health selectors + their thresholds, for the sidebar status dot and any
 // diagnostic surface.
 export { isStale } from "./sync/health";
-export { isUpdating, UPDATING_DEBOUNCE_MS } from "./sync/reducers";
+export { isUpdating, UPDATING_DEBOUNCE_MS } from "./sync/reconcile";
 export { STALE_MS } from "./sync/stream";
 // Phase 4 — historical-page load-older action (called from ChatView's
 // IntersectionObserver top sentinel + "Load older" button).
@@ -181,4 +181,4 @@ export { expandTreeNode } from "./sync/tree-transport";
 // Issue 5 — eagerly prune an archived session from the client tree even when
 // the server emits no delete event (the session was already absent from the
 // server-side live store). Called from archive.ts after a successful archive.
-export { pruneSessionDeleted } from "./sync/reducers";
+export { pruneSessionDeleted } from "./sync/reconcile";

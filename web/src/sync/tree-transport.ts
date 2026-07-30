@@ -76,7 +76,7 @@ import { seedTreeStore, applyTreeOpStore, expandedButUnloadedIds } from "./treeS
 import type { TreeOp, TreeNode } from "./treeMap";
 import { applyPinsSnapshot, applyPinsUpdated } from "../pins";
 import { decodeSnapshot } from "./decode";
-import { applySnapshot, applySessionEvent, applyMessageEvent } from "./reducers";
+import { applySnapshot, applySessionEvent, applyMessageEvent } from "./reconcile";
 import { refreshOpenSessions } from "./refresh";
 import {
   markAuthoritativeRecovery,

@@ -15,7 +15,7 @@
 // contract — the events the replay delivers do not corrupt Stream1's cursor.
 import { beforeEach, describe, expect, it } from "vitest";
 import { reconcile } from "solid-js/store";
-import { applyMessageEvent } from "../../src/sync/reducers";
+import { applyMessageEvent } from "../../src/sync/reconcile";
 import { state, setState } from "../../src/sync/store";
 
 beforeEach(() => {

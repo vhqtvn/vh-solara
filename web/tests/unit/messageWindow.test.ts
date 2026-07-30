@@ -15,7 +15,7 @@
 // messageWindows).
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { produce, reconcile } from "solid-js/store";
-import { applyMessageEvent, applySessionEvent } from "../../src/sync/reducers";
+import { applyMessageEvent, applySessionEvent } from "../../src/sync/reconcile";
 import { applySessionSnapshot } from "../../src/sync/session-stream";
 import { decodeMessagesBatch } from "../../src/sync/decode";
 import { deriveMessageWindow } from "../../src/sync/history";

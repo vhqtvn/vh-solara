@@ -52,7 +52,7 @@ import {
   markPageDirty,
   isPageDirtyingKind,
 } from "./history";
-import { applyMessageEvent } from "./reducers";
+import { applyMessageEvent } from "./reconcile";
 import {
   recordLatency,
   getExpectSessionSnap,
