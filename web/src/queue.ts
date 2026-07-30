@@ -203,29 +203,61 @@ export async function enqueue(sessionId: string, input: QueueInput): Promise<Que
   return item;
 }
 
+// Outcome of a remove attempt. A caller that takes a composer-restoring side
+// effect on success (e.g. retract-to-compose) MUST branch on `removed` so a
+// failed/non-removable DELETE never leaves a dangling restored draft alongside
+// a still-present chip. `removed` is true ONLY when the item is confirmed
+// absent from the backend (2xx delete OR 404 already-gone); it is false on a
+// 409 (dispatching — non-removable) and on any other non-2xx / network error.
+export interface RemoveQueuedResult {
+  removed: boolean;
+  // True when the backend explicitly rejected removal because the item is
+  // dispatching (409) — the dispatch may be in flight, so the state machine
+  // must own the transition to terminal first. Distinct from a transient
+  // error: this is a hard "not removable right now".
+  nonRemovable?: boolean;
+  // Diagnostic for a non-success (the HTTP status, "network", etc.).
+  reason?: string;
+}
+
 // removeQueued deletes an item. The backend accepts removal of `pending`
 // (cancel before dispatch) and terminal `sent`/`failed`/`unknown` (explicit
 // dismissal — FIX-QUEUE-GC-4); a `dispatching` item is rejected (409) because
 // the dispatch may be in flight. On 409, refresh the cache so the UI reflects
 // the real (still-dispatching) state.
-export async function removeQueued(sessionId: string, id: string): Promise<void> {
-  const res = await fetch(queueUrl(sessionId, `/${encodeURIComponent(id)}`), {
-    method: "DELETE",
-    headers: { "X-VH-CSRF": "1" },
-  });
+//
+// Returns a confirmed result so the caller knows whether the DELETE actually
+// took. The cache side effects are unchanged: a 2xx deletes from the cache, a
+// 404 reflects nothing (already gone), a 409 refreshes to dispatching truth.
+// A network throw surfaces as a non-removed result (the item's removability is
+// unknown) rather than propagating, so the caller can fail soft.
+export async function removeQueued(sessionId: string, id: string): Promise<RemoveQueuedResult> {
+  let res: Response;
+  try {
+    res = await fetch(queueUrl(sessionId, `/${encodeURIComponent(id)}`), {
+      method: "DELETE",
+      headers: { "X-VH-CSRF": "1" },
+    });
+  } catch (e) {
+    // Network error / interruption — the item's removability is unknown. Do NOT
+    // touch the cache; surface as non-removed so a caller never takes a
+    // success-only side effect (e.g. restoring a draft) on an unconfirmed DELETE.
+    return { removed: false, reason: `network (${String(e)})` };
+  }
   if (res.ok) {
     setQueues(produce((q) => {
       if (q[sessionId]) q[sessionId] = q[sessionId].filter((m) => m.id !== id);
     }));
-    return;
+    return { removed: true };
   }
-  if (res.status === 404) return; // already gone — reflect nothing
+  if (res.status === 404) return { removed: true }; // already gone — confirmed absent
   if (res.status === 409) {
     // Item is dispatching (in flight) — the state machine must own the
     // transition to terminal first. Refresh to show the real state.
     await fetchQueue(sessionId);
-    return;
+    return { removed: false, nonRemovable: true, reason: "409" };
   }
+  return { removed: false, reason: String(res.status) };
 }
 
 // claimQueued atomically claims the oldest pending item (the cross-client

@@ -76,6 +76,7 @@ import { createPromptHistory } from "./chat/createPromptHistory";
 import { createComposerPaste } from "./chat/createComposerPaste";
 import { createQueueSync } from "./chat/createQueueSync";
 import { createAttachments, type Attachment } from "./chat/createAttachments";
+import { createQueueRecovery } from "./chat/createQueueRecovery";
 
 const draftKey = (sid: string) => "vh.draft." + sid;
 
@@ -1190,6 +1191,34 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     onTextInsert: () => hist.resetHistory(),
   });
 
+  // --- queue recovery (retract-to-compose + mark-sent) ---------------------
+  // Extracted to createQueueRecovery (a SolidJS `create...` controller factory,
+  // mirroring createAttachments / createComposerAutocomplete / createPromptHistory
+  // / createComposerPaste) so the recovery state machine (occupied-composer
+  // guard → confirm-delete-first → restore text → filter attachments → reset
+  // transient state → best-effort focus, plus the mark-sent resolve) is unit-
+  // testable in isolation. This view keeps ONLY the wiring: it passes its own
+  // signals/closures + the existing reset seams (ac.dismissAc, hist.resetHistory)
+  // + the observable removeQueued (Slice 1) and the existing resolveQueued. The
+  // recovery actions are exposed to QueueChip at the queue render site below.
+  // INVARIANTS: retract NEVER enqueues/repends (it deletes + restores text; the
+  // subsequent Send enqueues a NEW item). markSent NEVER enqueues/dispatches —
+  // it only resolves an `unknown` item to terminal `sent`. dispatching stays
+  // non-removable (retract confirms the DELETE before touching the composer).
+  const recovery = createQueueRecovery({
+    sessionId: () => props.sessionId,
+    input,
+    setInput,
+    attachments: att.attachments,
+    setAttachments: (next) => att.setAttachments(next),
+    dismissAutocomplete: () => ac.dismissAc(),
+    resetHistory: () => hist.resetHistory(),
+    textarea: () => taRef,
+    removeQueued,
+    resolveQueued,
+    notify: (n) => pushNotification({ ...n, sessionID: props.sessionId }),
+  });
+
   // The popup is portaled to <body> (fixed, above the composer) so chat content
   // can't paint over it. Anchored to the composer's rect; recomputed as items
   // change (which happens as you type, when the composer may have grown).
@@ -2290,9 +2319,10 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
               flight, NOT removable (the state machine owns the transition to
               terminal); terminal `failed`/`unknown` → dismissable
               (FIX-QUEUE-GC-4 flipped DELETE from pending-only to "pending +
-              terminal; not dispatching"). `sent` is filtered from the visible
-              queue upstream (queueFor), so it needs no dismiss surface. See
-              QueueChip.tsx for the per-state dismissal wiring. */}
+              terminal; not dispatching") AND recoverable (retract-to-compose for
+              failed/unknown, mark-sent for unknown — Bug 1 / Bug 2). `sent` is
+              filtered from the visible queue upstream (queueFor), so it needs no
+              surface. See QueueChip.tsx for the per-state action wiring. */}
           <Show when={!props.draft && queueFor(props.sessionId).length > 0}>
             <div class="queue-row">
               <span class="queue-label" data-tip="Sent automatically when the current turn finishes">
@@ -2303,6 +2333,8 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
                   <QueueChip
                     q={q}
                     onRemove={(id) => void removeQueued(props.sessionId, id)}
+                    onRetract={recovery.retract}
+                    onMarkSent={recovery.markSent}
                   />
                 )}
               </For>

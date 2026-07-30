@@ -247,6 +247,15 @@
   background: transparent; color: var(--fg-dim); cursor: pointer;
 }
 .queue-chip button:hover { color: var(--fg); background: var(--bg); }
+/* Recovery affordances (Bug 1 / Bug 2): terminal chips offer distinct actions,
+   each with its own themed tint so they never read as one ambiguous "x". The
+   generic `.queue-chip button` rule above sets size/shape; these only retint
+   color so they adapt to every shipped theme's tokens. */
+.queue-chip button.queue-mark-sent { color: var(--ok); }
+.queue-chip button.queue-mark-sent:hover { color: var(--ok); background: color-mix(in srgb, var(--ok) 18%, var(--bg)); }
+.queue-chip button.queue-retract { color: var(--accent); }
+.queue-chip button.queue-retract:hover { color: var(--accent); background: color-mix(in srgb, var(--accent) 18%, var(--bg)); }
+.queue-chip button.queue-dismiss { color: var(--fg-dim); }
 /* Recovery detail note for recovered `unknown` items (FIX-QUEUE-STUCK-2): a
    backend-set explanation + duplicate-risk warning. Surfaced VISIBLELY (not in
    the data-tip tooltip) so the operator sees it at a glance. Full-width under

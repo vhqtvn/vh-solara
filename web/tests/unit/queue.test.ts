@@ -540,8 +540,8 @@ describe("resolveQueued — resolve-write failure (F1: no misleading dispatching
   });
 });
 
-describe("removeQueued — pending + terminal dismissal (not dispatching)", () => {
-  it("removes the item from the cache on a successful DELETE", async () => {
+describe("removeQueued — pending + terminal dismissal (not dispatching); observable result", () => {
+  it("removes the item from the cache on a successful DELETE and reports removed:true", async () => {
     const sid = "s-rm-1";
     touched.push(sid);
     vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(res(200, { items: [item("a"), item("b")] }))));
@@ -555,11 +555,12 @@ describe("removeQueued — pending + terminal dismissal (not dispatching)", () =
         return Promise.resolve(res(404, {}));
       }),
     );
-    await removeQueued(sid, "a");
+    const result = await removeQueued(sid, "a");
+    expect(result).toEqual({ removed: true });
     expect(queueFor(sid).map((m) => m.id)).toEqual(["b"]);
   });
 
-  it("404 is a no-op (already gone)", async () => {
+  it("404 is a no-op (already gone) but still reports removed:true (confirmed absent)", async () => {
     const sid = "s-rm-2";
     touched.push(sid);
     vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(res(200, { items: [item("a")] }))));
@@ -573,11 +574,12 @@ describe("removeQueued — pending + terminal dismissal (not dispatching)", () =
         return Promise.resolve(res(404, {}));
       }),
     );
-    await removeQueued(sid, "zzz");
+    const result = await removeQueued(sid, "zzz");
+    expect(result).toEqual({ removed: true });
     expect(queueFor(sid).map((m) => m.id)).toEqual(["a"]); // unchanged
   });
 
-  it("409 (dispatching, still in flight) triggers an authoritative refresh", async () => {
+  it("409 (dispatching, still in flight) triggers an authoritative refresh and reports non-removable", async () => {
     const sid = "s-rm-3";
     touched.push(sid);
     // First populate with a pending item.
@@ -598,10 +600,62 @@ describe("removeQueued — pending + terminal dismissal (not dispatching)", () =
         return Promise.resolve(res(404, {}));
       }),
     );
-    await removeQueued(sid, "a");
+    const result = await removeQueued(sid, "a");
     expect(deleteHit).toBe(true);
+    // Non-removable outcome so a retract caller aborts without touching the composer.
+    expect(result).toEqual({ removed: false, nonRemovable: true, reason: "409" });
     // Cache now reflects the backend truth (dispatching), not the stale pending.
     expect(queueFor(sid)[0].state).toBe("dispatching");
+  });
+
+  it("a 500 (transient server error) reports removed:false with the status; cache untouched", async () => {
+    const sid = "s-rm-4";
+    touched.push(sid);
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(res(200, { items: [item("a")] }))));
+    await fetchQueue(sid);
+    let refreshHit = false;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string, init?: any) => {
+        if (url.endsWith(`/vh/session/${sid}/queue/a`) && init?.method === "DELETE") {
+          return Promise.resolve(res(500, { error: "boom" }));
+        }
+        if (url.endsWith(`/vh/session/${sid}/queue`) && !init?.method) {
+          refreshHit = true;
+          return Promise.resolve(res(200, { items: [] }));
+        }
+        return Promise.resolve(res(404, {}));
+      }),
+    );
+    const result = await removeQueued(sid, "a");
+    expect(result.removed).toBe(false);
+    expect(result.nonRemovable).toBeUndefined(); // NOT a 409 → not flagged non-removable
+    expect(result.reason).toBe("500");
+    // A transient 500 does NOT mutate the cache and does NOT refresh.
+    expect(queueFor(sid).map((m) => m.id)).toEqual(["a"]);
+    expect(refreshHit).toBe(false);
+  });
+
+  it("a network throw reports removed:false (reason mentions network); cache untouched, no refresh", async () => {
+    const sid = "s-rm-5";
+    touched.push(sid);
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(res(200, { items: [item("a")] }))));
+    await fetchQueue(sid);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string, init?: any) => {
+        if (url.endsWith(`/vh/session/${sid}/queue/a`) && init?.method === "DELETE") {
+          return Promise.reject(new Error("connection reset"));
+        }
+        return Promise.resolve(res(404, {}));
+      }),
+    );
+    const result = await removeQueued(sid, "a");
+    expect(result.removed).toBe(false);
+    expect(result.nonRemovable).toBeUndefined();
+    expect(String(result.reason)).toContain("network");
+    // Cache untouched: a retract caller must NOT take a restore side effect.
+    expect(queueFor(sid).map((m) => m.id)).toEqual(["a"]);
   });
 });
 

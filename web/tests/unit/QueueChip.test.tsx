@@ -94,16 +94,18 @@ describe("QueueChip — recovered `unknown` detail surfacing", () => {
   });
 });
 
-describe("QueueChip — dismiss button visibility + click handler (FIX-QUEUE-GC-4)", () => {
-  // FIX-QUEUE-GC-4: operators may explicitly dismiss terminal items
-  // (failed/unknown) that would otherwise accumulate forever. The dismiss
-  // (remove x) button shows for `pending` (cancel) and terminal
-  // `failed`/`unknown` (dismiss); it is NEVER shown for `dispatching` (the
-  // dispatch may be in flight — the state machine must own the terminal
-  // transition first). `sent` is filtered from the visible queue upstream
-  // (queueFor), so no dismiss surface is needed for it.
-  it("renders a dismiss (x) button for pending, failed, unknown — NOT for dispatching", () => {
-    // pending: dismissable (cancel before dispatch).
+describe("QueueChip — action visibility per state (dismiss / retract / mark-sent)", () => {
+  // Bug 1 / Bug 2: terminal chips offer distinct recovery actions instead of
+  // only a dismiss "x". Each action has an explicit accessible label so the
+  // operator can RECOVER a misclassified send rather than cancel + re-type.
+  //
+  //   pending     → dismiss only (cancel before dispatch)
+  //   dispatching → NO action (non-removable; the state machine owns the
+  //                 transition to terminal)
+  //   failed      → retract + dismiss (2 actions)
+  //   unknown     → mark-sent + retract + dismiss (3 actions)
+  //   sent        → filtered upstream (queueFor), no chip
+  it("renders ONE action (dismiss) for pending; NONE for dispatching", () => {
     const r1 = render(() => (
       <QueueChip q={item({ state: "pending" })} onRemove={vi.fn()} />
     ));
@@ -111,40 +113,85 @@ describe("QueueChip — dismiss button visibility + click handler (FIX-QUEUE-GC-
     expect(r1.container.querySelector(".queue-chip button")!.getAttribute("aria-label")).toBe("Remove queued message");
     r1.unmount();
 
-    // failed (terminal): dismissable — clears the failed chip from view.
     const r2 = render(() => (
-      <QueueChip q={item({ state: "failed", detail: "500 upstream" })} onRemove={vi.fn()} />
-    ));
-    expect(r2.container.querySelectorAll(".queue-chip button").length).toBe(1);
-    r2.unmount();
-
-    // unknown (terminal): dismissable — clears the recovered chip from view.
-    const r3 = render(() => (
-      <QueueChip q={item({ state: "unknown", detail: RECOVERY_DETAIL })} onRemove={vi.fn()} />
-    ));
-    expect(r3.container.querySelectorAll(".queue-chip button").length).toBe(1);
-    // No "resend"/"retry" affordance anywhere in the rendered output — the
-    // only button is the dismiss (x), never a resend.
-    const txt = r3.container.textContent!.toLowerCase();
-    expect(txt).not.toContain("resend");
-    expect(txt).not.toContain("retry");
-    r3.unmount();
-
-    // dispatching: NOT dismissable — the dispatch may be in flight; the state
-    // machine must own the transition to terminal first.
-    const r4 = render(() => (
       <QueueChip q={item({ state: "dispatching" })} onRemove={vi.fn()} />
     ));
-    expect(r4.container.querySelectorAll(".queue-chip button").length).toBe(0);
-    r4.unmount();
+    expect(r2.container.querySelectorAll(".queue-chip button").length).toBe(0);
+    r2.unmount();
   });
 
+  it("renders retract + dismiss (2 actions) for a `failed` chip", () => {
+    const r = render(() => (
+      <QueueChip
+        q={item({ state: "failed", detail: "500 upstream" })}
+        onRemove={vi.fn()}
+        onRetract={vi.fn()}
+      />
+    ));
+    const btns = r.container.querySelectorAll(".queue-chip button");
+    expect(btns.length).toBe(2);
+    // No mark-sent for failed (mark-sent is unknown-only).
+    expect(r.container.querySelector(".queue-mark-sent")).toBeNull();
+    r.unmount();
+  });
+
+  it("renders mark-sent + retract + dismiss (3 actions) for an `unknown` chip", () => {
+    const r = render(() => (
+      <QueueChip
+        q={item({ state: "unknown", detail: RECOVERY_DETAIL })}
+        onRemove={vi.fn()}
+        onRetract={vi.fn()}
+        onMarkSent={vi.fn()}
+      />
+    ));
+    const btns = r.container.querySelectorAll(".queue-chip button");
+    expect(btns.length).toBe(3);
+    // All three distinct classes present.
+    expect(r.container.querySelector(".queue-mark-sent")).toBeTruthy();
+    expect(r.container.querySelector(".queue-retract")).toBeTruthy();
+    expect(r.container.querySelector(".queue-dismiss")).toBeTruthy();
+    r.unmount();
+  });
+
+  it("retract/mark-sent are NO-OPs (not rendered) when their callbacks are omitted", () => {
+    // Only onRemove supplied → even a terminal chip shows just dismiss. This
+    // keeps the component safe to mount from call sites that haven't wired the
+    // recovery handlers yet (progressive rollout).
+    const r = render(() => (
+      <QueueChip q={item({ state: "unknown", detail: RECOVERY_DETAIL })} onRemove={vi.fn()} />
+    ));
+    expect(r.container.querySelectorAll(".queue-chip button").length).toBe(1);
+    expect(r.container.querySelector(".queue-retract")).toBeNull();
+    expect(r.container.querySelector(".queue-mark-sent")).toBeNull();
+    r.unmount();
+  });
+
+  it("NEVER renders a resend/retry affordance for any state", () => {
+    // Recovery means compose a NEW message (retract) or acknowledge an
+    // already-sent one (mark-sent) — never reviving this item. No button or
+    // label may read "resend"/"retry".
+    const r = render(() => (
+      <QueueChip
+        q={item({ state: "unknown", detail: RECOVERY_DETAIL })}
+        onRemove={vi.fn()}
+        onRetract={vi.fn()}
+        onMarkSent={vi.fn()}
+      />
+    ));
+    const txt = r.container.textContent!.toLowerCase();
+    expect(txt).not.toContain("resend");
+    expect(txt).not.toContain("retry");
+    r.unmount();
+  });
+});
+
+describe("QueueChip — dismiss click handler (FIX-QUEUE-GC-4)", () => {
   it("clicking dismiss on a pending item calls onRemove with the item id", () => {
     const onRemove = vi.fn();
     const { container } = render(() => (
       <QueueChip q={item({ id: "q-42", state: "pending" })} onRemove={onRemove} />
     ));
-    container.querySelector(".queue-chip button")!.click();
+    container.querySelector(".queue-dismiss")!.click();
     expect(onRemove).toHaveBeenCalledTimes(1);
     expect(onRemove).toHaveBeenCalledWith("q-42");
   });
@@ -152,9 +199,13 @@ describe("QueueChip — dismiss button visibility + click handler (FIX-QUEUE-GC-
   it("clicking dismiss on a failed item calls onRemove with the item id (terminal dismissal)", () => {
     const onRemove = vi.fn();
     const { container } = render(() => (
-      <QueueChip q={item({ id: "q-failed-1", state: "failed", detail: "500 upstream" })} onRemove={onRemove} />
+      <QueueChip
+        q={item({ id: "q-failed-1", state: "failed", detail: "500 upstream" })}
+        onRemove={onRemove}
+        onRetract={vi.fn()}
+      />
     ));
-    container.querySelector(".queue-chip button")!.click();
+    container.querySelector(".queue-dismiss")!.click();
     expect(onRemove).toHaveBeenCalledTimes(1);
     expect(onRemove).toHaveBeenCalledWith("q-failed-1");
   });
@@ -162,10 +213,110 @@ describe("QueueChip — dismiss button visibility + click handler (FIX-QUEUE-GC-
   it("clicking dismiss on an unknown item calls onRemove with the item id (recovered-item dismissal)", () => {
     const onRemove = vi.fn();
     const { container } = render(() => (
-      <QueueChip q={item({ id: "q-unknown-1", state: "unknown", detail: RECOVERY_DETAIL })} onRemove={onRemove} />
+      <QueueChip
+        q={item({ id: "q-unknown-1", state: "unknown", detail: RECOVERY_DETAIL })}
+        onRemove={onRemove}
+        onRetract={vi.fn()}
+        onMarkSent={vi.fn()}
+      />
     ));
-    container.querySelector(".queue-chip button")!.click();
+    container.querySelector(".queue-dismiss")!.click();
     expect(onRemove).toHaveBeenCalledTimes(1);
     expect(onRemove).toHaveBeenCalledWith("q-unknown-1");
+  });
+});
+
+describe("QueueChip — retract action (Bug 1: retract-to-compose)", () => {
+  it("renders a retract button for failed AND unknown — NOT for pending/dispatching", () => {
+    const failed = render(() => (
+      <QueueChip q={item({ state: "failed" })} onRemove={vi.fn()} onRetract={vi.fn()} />
+    ));
+    expect(failed.container.querySelector(".queue-retract")).toBeTruthy();
+    failed.unmount();
+
+    const unknown = render(() => (
+      <QueueChip q={item({ state: "unknown" })} onRemove={vi.fn()} onRetract={vi.fn()} />
+    ));
+    expect(unknown.container.querySelector(".queue-retract")).toBeTruthy();
+    unknown.unmount();
+
+    const pending = render(() => (
+      <QueueChip q={item({ state: "pending" })} onRemove={vi.fn()} onRetract={vi.fn()} />
+    ));
+    expect(pending.container.querySelector(".queue-retract")).toBeNull();
+    pending.unmount();
+
+    const dispatching = render(() => (
+      <QueueChip q={item({ state: "dispatching" })} onRemove={vi.fn()} onRetract={vi.fn()} />
+    ));
+    expect(dispatching.container.querySelector(".queue-retract")).toBeNull();
+    dispatching.unmount();
+  });
+
+  it("clicking retract calls onRetract with the WHOLE item (not just the id)", () => {
+    const onRetract = vi.fn();
+    const q = item({ id: "q-ret-1", state: "failed", text: "the message", detail: "500" });
+    const { container } = render(() => (
+      <QueueChip q={q} onRemove={vi.fn()} onRetract={onRetract} />
+    ));
+    container.querySelector(".queue-retract")!.click();
+    expect(onRetract).toHaveBeenCalledTimes(1);
+    expect(onRetract).toHaveBeenCalledWith(q);
+  });
+
+  it("unknown retract carries a DUPLICATE-RISK warning in its label/tip; failed retract does not", () => {
+    // `unknown` may have already landed → re-sending can duplicate. The retract
+    // affordance must surface that risk before the operator re-sends.
+    const unknown = render(() => (
+      <QueueChip q={item({ state: "unknown" })} onRemove={vi.fn()} onRetract={vi.fn()} />
+    ));
+    const unknownTip = unknown.container.querySelector(".queue-retract")!.getAttribute("data-tip")!;
+    expect(unknownTip.toLowerCase()).toContain("duplicate");
+    unknown.unmount();
+
+    const failed = render(() => (
+      <QueueChip q={item({ state: "failed" })} onRemove={vi.fn()} onRetract={vi.fn()} />
+    ));
+    const failedTip = failed.container.querySelector(".queue-retract")!.getAttribute("data-tip")!;
+    expect(failedTip.toLowerCase()).not.toContain("duplicate");
+    failed.unmount();
+  });
+});
+
+describe("QueueChip — mark-sent action (Bug 2: manual mark-sent for unknown)", () => {
+  it("renders a mark-sent button for unknown ONLY", () => {
+    const unknown = render(() => (
+      <QueueChip q={item({ state: "unknown" })} onRemove={vi.fn()} onMarkSent={vi.fn()} />
+    ));
+    expect(unknown.container.querySelector(".queue-mark-sent")).toBeTruthy();
+    unknown.unmount();
+
+    for (const state of ["pending", "dispatching", "failed"] as const) {
+      const r = render(() => (
+        <QueueChip q={item({ state })} onRemove={vi.fn()} onMarkSent={vi.fn()} />
+      ));
+      expect(r.container.querySelector(".queue-mark-sent")).toBeNull();
+      r.unmount();
+    }
+  });
+
+  it("the mark-sent guidance copy tells the operator to only use it when the message is in the transcript", () => {
+    const { container } = render(() => (
+      <QueueChip q={item({ state: "unknown" })} onRemove={vi.fn()} onMarkSent={vi.fn()} />
+    ));
+    const btn = container.querySelector(".queue-mark-sent")!;
+    const tip = (btn.getAttribute("data-tip")! + " " + btn.getAttribute("aria-label")!).toLowerCase();
+    expect(tip).toContain("transcript");
+  });
+
+  it("clicking mark-sent calls onMarkSent with the WHOLE item (not just the id)", () => {
+    const onMarkSent = vi.fn();
+    const q = item({ id: "q-ms-1", state: "unknown", text: "maybe it sent" });
+    const { container } = render(() => (
+      <QueueChip q={q} onRemove={vi.fn()} onMarkSent={onMarkSent} />
+    ));
+    container.querySelector(".queue-mark-sent")!.click();
+    expect(onMarkSent).toHaveBeenCalledTimes(1);
+    expect(onMarkSent).toHaveBeenCalledWith(q);
   });
 });
