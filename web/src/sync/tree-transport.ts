@@ -1163,85 +1163,7 @@ export function connect(fresh = false) {
     // its atomic batch when ALL three participants are staged + validated.
     tryInstall(owner);
   });
-  // Both frames are emitted on this Stream-1 (tree) connection. They carry NO
-  // SSE `id:` line (both transient — reconnect catches up via pins.snapshot),
-  // so there is no cursor to advance and no shared-resume interaction. They are
-  // disjoint from tree/detail state (the pins facade owns the pin signals),
-  // so they are NOT subject to treeSnapshotDecoding serialization or the busy
-  // gate: a pins frame during an archive or a tree decode still applies (pins
-  // are worker-wide, independent of any one project's archive scope). Only the
-  // connection-generation guard (ignore frames from a superseded connection) and
-  // the liveness clock apply — mirroring the discipline of the other listeners.
-  // Validation + the revision-monotonicity guard live inside the facade.
-  es.addEventListener("pins.snapshot", (e) => {
-    if (gen !== treeGen) return;
-    markTreeSeen();
-    let raw: unknown;
-    try {
-      raw = JSON.parse((e as MessageEvent).data);
-    } catch (err) {
-      log.warn("sync", "malformed pins.snapshot frame", { err });
-      return;
-    }
-    applyPinsSnapshot(raw);
-  });
-  es.addEventListener("pins.updated", (e) => {
-    if (gen !== treeGen) return;
-    markTreeSeen();
-    let raw: unknown;
-    try {
-      raw = JSON.parse((e as MessageEvent).data);
-    } catch (err) {
-      log.warn("sync", "malformed pins.updated frame", { err });
-      return;
-    }
-    applyPinsUpdated(raw);
-  });
-  // Transport-only: refresh treeLastSeen (and the debug mirror) but NOT
-  // treeContentSeen, so a ping-only stream (transport alive, zero content) lets
-  // the content clock age out and the watchdog's tree content-stall branch
-  // fires. The Stream1 mirror of Lane C's session ping listener. (No gen guard
-  // here, matching the prior behavior: a ping is a pure transport heartbeat, so
-  // letting a superseded connection's ping refresh the transport clock is
-  // harmless — the replacement seeds a fresh clock at construction, and only
-  // treeContentSeen — refreshed solely by content listeners, which DO gen-guard
-  // — drives the content-stall decision.)
-  es.addEventListener("ping", () => markTreeTransportSeen()); // heartbeat for the watchdog
-  for (const kind of ["session.upsert", "session.delete"]) {
-    es.addEventListener(kind, async (e) => {
-      markTreeSeen();
-      const ev = e as MessageEvent;
-      const seq = Number(ev.lastEventId);
-      if (isGateActive()) {
-        // Deferred — Stream 1 advances the resume cursor but does not mutate.
-        advanceCursor(seq);
-        markBusyDirty();
-        return;
-      }
-      // C4: serialize against a pending coherent owner (capture the EXACT owner
-      // ref via coveredAwait; await it; recheck gen; run reducer + cursor
-      // SYNCHRONOUSLY to completion — no second await). applySnapshot (run
-      // inside the coherent install batch) WHOLESALE-REPLACES state.sessions
-      // and sets cursor=seq; a live session event applied during staging would
-      // be clobbered and the cursor regressed when the baseline installs.
-      // coveredAwait returns null on the fast path (no owner + no decode) so
-      // event floods keep zero microtask latency.
-      const wait = coveredAwait(gen);
-      if (wait) await wait;
-      // Generation re-check: the connection may have been replaced during the
-      // wait. The entry guard ran before the await, so drop the stale
-      // continuation here before any state effect.
-      if (gen !== treeGen) return;
-      // The busy gate may have activated during the wait — defer the same way
-      // the synchronous entry path does (advance cursor, latch dirty).
-      if (isGateActive()) {
-        advanceCursor(seq);
-        markBusyDirty();
-        return;
-      }
-      applyTreeFrame(kind, seq, ev.data, applySessionEvent);
-    });
-  }
+  registerAuxiliaryListeners(es, gen);
   for (const kind of TREE_STREAM_KINDS) {
     es.addEventListener(kind, async (e) => {
       markTreeSeen();
@@ -1321,6 +1243,104 @@ export function connect(fresh = false) {
       backoff = Math.min(backoff * 2, 15_000);
     }
   };
+}
+
+
+// === connect() auxiliary listener registration (decomposition Stage 1) ======
+// Extracted VERBATIM from connect() — the CONTIGUOUS auxiliary cohort: the
+// pins.* fast-path reducers, the watchdog transport heartbeat (ping), and the
+// session.* detail reducers (coveredAwait against a pending C4 owner). Only the
+// addEventListener registrations were relocated; no callback body changed.
+//
+// `notice` was intentionally NOT extracted here: in connect() it is NOT
+// contiguous with this block — it sits AFTER the TREE_STREAM_KINDS registration
+// loop — so per the extraction constraint it stays inline where it is.
+//
+// Synchronous by contract (registration only, no async, no Promise return).
+// `gen` is THIS connection's captured generation token, passed by value; the
+// callbacks read `gen` for the stale-entry / post-await recheck guards and the
+// live module-scope `treeGen` exactly as the inline registrations did. No
+// connect()-local state other than `es`/`gen` is captured, so there is no ctx.
+function registerAuxiliaryListeners(es: EventSource, gen: number): void {
+  // Both frames are emitted on this Stream-1 (tree) connection. They carry NO
+  // SSE `id:` line (both transient — reconnect catches up via pins.snapshot),
+  // so there is no cursor to advance and no shared-resume interaction. They are
+  // disjoint from tree/detail state (the pins facade owns the pin signals),
+  // so they are NOT subject to treeSnapshotDecoding serialization or the busy
+  // gate: a pins frame during an archive or a tree decode still applies (pins
+  // are worker-wide, independent of any one project's archive scope). Only the
+  // connection-generation guard (ignore frames from a superseded connection) and
+  // the liveness clock apply — mirroring the discipline of the other listeners.
+  // Validation + the revision-monotonicity guard live inside the facade.
+  es.addEventListener("pins.snapshot", (e) => {
+    if (gen !== treeGen) return;
+    markTreeSeen();
+    let raw: unknown;
+    try {
+      raw = JSON.parse((e as MessageEvent).data);
+    } catch (err) {
+      log.warn("sync", "malformed pins.snapshot frame", { err });
+      return;
+    }
+    applyPinsSnapshot(raw);
+  });
+  es.addEventListener("pins.updated", (e) => {
+    if (gen !== treeGen) return;
+    markTreeSeen();
+    let raw: unknown;
+    try {
+      raw = JSON.parse((e as MessageEvent).data);
+    } catch (err) {
+      log.warn("sync", "malformed pins.updated frame", { err });
+      return;
+    }
+    applyPinsUpdated(raw);
+  });
+  // Transport-only: refresh treeLastSeen (and the debug mirror) but NOT
+  // treeContentSeen, so a ping-only stream (transport alive, zero content) lets
+  // the content clock age out and the watchdog's tree content-stall branch
+  // fires. The Stream1 mirror of Lane C's session ping listener. (No gen guard
+  // here, matching the prior behavior: a ping is a pure transport heartbeat, so
+  // letting a superseded connection's ping refresh the transport clock is
+  // harmless — the replacement seeds a fresh clock at construction, and only
+  // treeContentSeen — refreshed solely by content listeners, which DO gen-guard
+  // — drives the content-stall decision.)
+  es.addEventListener("ping", () => markTreeTransportSeen()); // heartbeat for the watchdog
+  for (const kind of ["session.upsert", "session.delete"]) {
+    es.addEventListener(kind, async (e) => {
+      markTreeSeen();
+      const ev = e as MessageEvent;
+      const seq = Number(ev.lastEventId);
+      if (isGateActive()) {
+        // Deferred — Stream 1 advances the resume cursor but does not mutate.
+        advanceCursor(seq);
+        markBusyDirty();
+        return;
+      }
+      // C4: serialize against a pending coherent owner (capture the EXACT owner
+      // ref via coveredAwait; await it; recheck gen; run reducer + cursor
+      // SYNCHRONOUSLY to completion — no second await). applySnapshot (run
+      // inside the coherent install batch) WHOLESALE-REPLACES state.sessions
+      // and sets cursor=seq; a live session event applied during staging would
+      // be clobbered and the cursor regressed when the baseline installs.
+      // coveredAwait returns null on the fast path (no owner + no decode) so
+      // event floods keep zero microtask latency.
+      const wait = coveredAwait(gen);
+      if (wait) await wait;
+      // Generation re-check: the connection may have been replaced during the
+      // wait. The entry guard ran before the await, so drop the stale
+      // continuation here before any state effect.
+      if (gen !== treeGen) return;
+      // The busy gate may have activated during the wait — defer the same way
+      // the synchronous entry path does (advance cursor, latch dirty).
+      if (isGateActive()) {
+        advanceCursor(seq);
+        markBusyDirty();
+        return;
+      }
+      applyTreeFrame(kind, seq, ev.data, applySessionEvent);
+    });
+  }
 }
 
 
