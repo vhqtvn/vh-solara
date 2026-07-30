@@ -120,16 +120,36 @@ export function createQueueRecovery(deps: QueueRecoveryDeps): QueueRecovery {
       return;
     }
 
-    // 3. Restore the text. The per-session draft effect in ChatView persists it
+    // 3. TOCTOU re-verify the composer. The occupied guard (step 1) ran BEFORE
+    //    the awaited DELETE above; an operator edit or attachment added during
+    //    that round-trip would be silently overwritten by the restore below. The
+    //    DELETE already succeeded (the old item is confirmed gone), so abort the
+    //    RESTORE — not the delete — and surface a non-blocking notice. The
+    //    operator's current draft is preserved; the deleted chip is already
+    //    removed (they can re-queue via Send). This MUST NOT regress the
+    //    deletion-failure abort paths (409/500/network), which return BEFORE
+    //    reaching here and already leave the composer untouched.
+    if (deps.input().trim() !== "" || deps.attachments().length > 0) {
+      deps.notify({
+        kind: "info",
+        title: "Composer is in use",
+        detail:
+          "The queued message was removed, but the composer changed while retracting — restore skipped to avoid overwriting your current draft.",
+      });
+      return;
+    }
+
+    // 4. Restore the text. The per-session draft effect in ChatView persists it
     //    under this session's draft key — no separate draft write is needed.
     deps.setInput(q.text);
 
-    // 4. Restore reusable (server-backed) attachments ONLY. Inline
+    // 5. Restore reusable (server-backed) attachments ONLY. Inline
     //    vh-attach:<localId> attachments held raw File bytes in memory that are
     //    cleared after enqueue, so they are UNRECOVERABLE — reconstructing them
-    //    would emit broken refs. Drop them with a notice; restore the rest. The
-    //    occupied guard above guarantees the composer's attachment list is empty
-    //    here, so this setAttachments never clears unrelated attachments.
+    //    would emit broken refs. Drop them with a notice; restore the rest. Both
+    //    occupied guards above (preflight + the post-DELETE TOCTOU re-verify)
+    //    guarantee the composer's attachment list is empty here, so this
+    //    setAttachments never clears unrelated attachments.
     const reusable = q.attachments.filter((a) => !isInlineChipUrl(a.url));
     const droppedInline = q.attachments.length - reusable.length;
     if (reusable.length > 0) {
@@ -146,13 +166,13 @@ export function createQueueRecovery(deps: QueueRecoveryDeps): QueueRecovery {
       });
     }
 
-    // 5. Reset transient composer state via the existing controller seams so a
+    // 6. Reset transient composer state via the existing controller seams so a
     //    stale autocomplete popover or prompt-history walk doesn't leak onto the
     //    restored text.
     deps.dismissAutocomplete();
     deps.resetHistory();
 
-    // 6. Focus + select, best-effort. In a microtask AFTER the controlled input
+    // 7. Focus + select, best-effort. In a microtask AFTER the controlled input
     //    updates, focus the textarea and select the restored text so the
     //    operator can immediately edit/replace it. Selection is progressive
     //    enhancement: mobile focus-after-async-delete can be flaky. The

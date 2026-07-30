@@ -52,6 +52,10 @@ interface Harness {
   notify: ReturnType<typeof vi.fn>;
   setText: (v: string) => void;
   setAtts: (a: Attachment[]) => void;
+  // Read accessors over the live composer state (so tests can assert the
+  // TOCTOU draft was preserved, not overwritten).
+  inputText: () => string;
+  inputAtts: () => Attachment[];
   ta: HTMLTextAreaElement;
   taFocus: ReturnType<typeof vi.spyOn>;
   taSelect: ReturnType<typeof vi.spyOn>;
@@ -61,7 +65,7 @@ interface Harness {
 // Build a recovery controller with full control over the composer state and the
 // queue ops. The composer signals are real (so the occupied-guard reads the
 // live value); everything else is a spy.
-function harness(opts: { initialText?: string; initialAtts?: Attachment[]; removeResult?: RemoveQueuedResult } = {}): Harness {
+function harness(opts: { initialText?: string; initialAtts?: Attachment[]; removeResult?: RemoveQueuedResult; removeMutate?: () => void } = {}): Harness {
   const removeResult: RemoveQueuedResult = opts.removeResult ?? { removed: true };
   const state = { text: opts.initialText ?? "", atts: opts.initialAtts ?? [] };
   const setInput = vi.fn((v: string) => {
@@ -72,7 +76,14 @@ function harness(opts: { initialText?: string; initialAtts?: Attachment[]; remov
   });
   const dismissAutocomplete = vi.fn();
   const resetHistory = vi.fn();
-  const removeQueued = vi.fn(async () => removeResult);
+  const removeQueued = vi.fn(async () => {
+    // Optional mid-DELETE mutation hook: simulates the operator editing the
+    // composer (or adding an attachment) DURING the awaited removeQueued
+    // round-trip — the TOCTOU window between the preflight occupied-guard and
+    // the post-DELETE restore.
+    if (opts.removeMutate) opts.removeMutate();
+    return removeResult;
+  });
   const resolveQueued = vi.fn(async () => {});
   const notify = vi.fn();
   const ta = document.createElement("textarea");
@@ -109,6 +120,8 @@ function harness(opts: { initialText?: string; initialAtts?: Attachment[]; remov
     notify,
     setText: (v) => (state.text = v),
     setAtts: (a) => (state.atts = a),
+    inputText: () => state.text,
+    inputAtts: () => state.atts,
     ta,
     taFocus,
     taSelect,
@@ -209,6 +222,63 @@ describe("retract — occupied-composer protection (never silently overwrite)", 
     await flushMicrotasks();
     expect(h.removeQueued).toHaveBeenCalledTimes(1);
     expect(h.setInput).toHaveBeenCalledWith("restored");
+    h.dispose();
+  });
+
+  it("TOCTOU: an operator edit mid-DELETE aborts the restore (no overwrite; item already deleted)", async () => {
+    // The preflight occupied-guard passes (composer empty), the DELETE is
+    // confirmed removed, BUT during the awaited removeQueued round-trip the
+    // operator typed into the composer. The post-DELETE TOCTOU re-verify MUST
+    // catch this and abort the restore rather than clobber the new draft. The
+    // old item is already deleted (removeQueued ran once); only the restore is
+    // skipped. This is the fix for the occupied-composer TOCTOU gap.
+    let mutate: () => void = () => {};
+    const h = harness({
+      removeMutate: () => mutate(), // fires inside the awaited removeQueued
+    });
+    // Wire the mid-DELETE mutation AFTER harness construction (the closure
+    // reads `mutate` at retract time, which is after this assignment).
+    mutate = () => h.setText("operator typed mid-flight");
+    await h.recovery.retract(q({ id: "q-toctou", state: "failed", text: "old queued text" }));
+    await flushMicrotasks();
+
+    // The DELETE happened exactly once (the old item is gone — that is correct;
+    // we do NOT undo a confirmed delete just because the restore was skipped).
+    expect(h.removeQueued).toHaveBeenCalledTimes(1);
+    expect(h.removeQueued).toHaveBeenCalledWith("s-1", "q-toctou");
+    // The restore was ABORTED: no setInput, no setAttachments, no transient
+    // reset, no focus — the operator's mid-flight draft is preserved intact.
+    expect(h.setInput).not.toHaveBeenCalled();
+    expect(h.setAttachments).not.toHaveBeenCalled();
+    expect(h.dismissAutocomplete).not.toHaveBeenCalled();
+    expect(h.resetHistory).not.toHaveBeenCalled();
+    expect(h.taFocus).not.toHaveBeenCalled();
+    // The composer still holds the operator's draft (NOT overwritten with the
+    // old queued text).
+    expect(h.inputText()).toBe("operator typed mid-flight");
+    // A non-blocking notice explains why the restore was skipped.
+    expect(h.notify).toHaveBeenCalledTimes(1);
+    expect(h.notify.mock.calls[0][0].kind).toBe("info");
+    expect(String(h.notify.mock.calls[0][0].detail)).toMatch(/composer changed|overwriting/i);
+    h.dispose();
+  });
+
+  it("TOCTOU: an attachment added mid-DELETE also aborts the restore", async () => {
+    // Symmetric to the text case: an attachment added during the DELETE
+    // round-trip must also abort the restore (setAttachments would otherwise
+    // replace the freshly-added attachment).
+    let mutate: () => void = () => {};
+    const h = harness({ removeMutate: () => mutate() });
+    mutate = () =>
+      h.setAtts([{ url: "file:///p/new.png", filename: "new.png", mime: "image/png" }]);
+    await h.recovery.retract(q({ state: "failed", text: "old", attachments: [
+      { url: "file:///p/queued.png", filename: "queued.png", mime: "image/png" },
+    ] }));
+    await flushMicrotasks();
+    expect(h.removeQueued).toHaveBeenCalledTimes(1);
+    expect(h.setInput).not.toHaveBeenCalled();
+    expect(h.setAttachments).not.toHaveBeenCalled();
+    expect(h.notify).toHaveBeenCalledTimes(1);
     h.dispose();
   });
 });
