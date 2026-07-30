@@ -1380,10 +1380,14 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // pipeline (addFiles/remove/reinsert/flush/upload) moved to createAttachments
   // (C6) above; send()/sendText()/JSX read them via the `att` controller.
   function buildParts(text: string, atts?: Attachment[]): any[] {
-    // `atts` is optional in practice: the backend serializes QueueItem.Attachments
-    // with `omitempty`, so a queued item with no attachments arrives with
-    // attachments === undefined. Iterating undefined throws TypeError, which
-    // rejects the drain's dispatch promise and strands the item at `dispatching`.
+    // The backend ALWAYS serializes QueueItem.Attachments as an array:
+    // pkg/web/queue.go declares the field non-omitempty
+    // (`json:"attachments"`), Enqueue normalizes nil→[] before persist, and
+    // legacy on-disk items with nil/omitted attachments are normalized to [] on
+    // load. So a queued item arrives with attachments as an array (possibly
+    // empty), never `undefined`. The `atts ?? []` below is now defensive only —
+    // kept because the param is optional and the guard costs nothing, not
+    // because the queue contract can deliver undefined.
     const parts: any[] = [];
     if (text) parts.push({ type: "text", text });
     for (const a of atts ?? []) {
@@ -1408,7 +1412,12 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
 
   // Build + POST a prompt with explicit parts and send config (shared by direct
   // sends and queued auto-sends). prompt_async forks the turn and returns 204 at
-  // once, so a send can never hang — the reply/failure arrive via the event feed.
+  // once, so prompt ACCEPTANCE is asynchronous — the caller is never blocked on
+  // a reply. This is NOT a "can never hang" guarantee: on the queued path the
+  // drainer bounds each dispatch with a 12s AbortController
+  // (DEFAULT_DISPATCH_TIMEOUT_MS, web/src/queueDrain.ts); on timeout the claimed
+  // item is classified `unknown` (never auto-retried — the POST may have reached
+  // OpenCode). Outcomes arrive via the event feed, not the POST response.
   // NOTE: normal prompts are now enqueued first (sendText) and dispatched by the
   // drainer via dispatchQueuedItem; only shell still uses dispatchSend directly.
 
