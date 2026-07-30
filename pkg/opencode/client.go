@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -360,6 +361,64 @@ func (c *Client) MessagesTail(ctx context.Context, sessionID string, limit int) 
 		return nil, err
 	}
 	return out, nil
+}
+
+// ErrMessageNotFound is the sentinel returned by Message when OpenCode has no
+// persisted message for the (sessionID, messageID) pair (HTTP 404). It is a
+// distinct, wrapped-able signal — NOT a generic transport or server error — so
+// the queue reconciler can fail-closed on a definitive "not persisted" verdict
+// for that exact id: under caller-id-wins, a 404 after the grace window means
+// the turn's user message never landed under the minted id (it was either
+// never persisted, or the forked fiber died before persisting), so resending
+// would risk duplicate work. The reconciler treats a persistent 404 as
+// TERMINAL for that id and never auto-resends.
+var ErrMessageNotFound = errors.New("opencode: message not found")
+
+// Message fetches a single message by exact id via
+// GET /session/:sessionID/message/:messageID. It is the exact-lookup primitive
+// the queue reconciler uses to decide whether a dispatched queue item became a
+// real persisted user message: vh-solara mints the correlation id at Enqueue
+// (opencode.MintMessageID), threads it into prompt_async's messageID body
+// field, OpenCode persists the user message under that EXACT id
+// (input.messageID ?? MessageID.ascending(), caller-id-wins), and this GET
+// finds it iff the composite (sessionID, messageID) matches. The reconciler
+// matches on info.id === minted AND info.role === "user" (exact-match
+// authority only — never text/time/latest-position).
+//
+// HTTP classes are distinguished so the caller can fail-closed vs retry:
+//   - 200 → (body, nil). The raw {"info":{...},"parts":[...]} body; the caller
+//     inspects info.id + info.role.
+//   - 404 → (nil, ErrMessageNotFound). Definitive "not persisted" for that
+//     exact id; the reconciler fail-closes (records an attempt; a persistent
+//     404 across the bounded budget becomes TERMINAL, never resend).
+//   - 400 → (nil, *Error{Status:400}). Caller bug (malformed/non-msg id); the
+//     reconciler logs and marks TERMINAL immediately (no retry).
+//   - 5xx → (nil, *Error{Status:5xx}). Server/DB defect; the reconciler treats
+//     it as retryable within its bounded budget.
+//   - transport failure → (nil, err). Retryable within the bounded budget.
+func (c *Client) Message(ctx context.Context, sessionID, messageID string) ([]byte, error) {
+	path := "/session/" + sessionID + "/message/" + messageID
+	req, err := c.newRequest(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, ErrMessageNotFound
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return nil, statusErr("GET "+path, resp.StatusCode, b)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, err
+	}
+	return body, nil
 }
 
 // Event is one OpenCode SSE event: { id, type, properties }.

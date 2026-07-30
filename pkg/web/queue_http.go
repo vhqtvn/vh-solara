@@ -75,6 +75,18 @@ func (s *Server) handleQueueList(w http.ResponseWriter, r *http.Request) {
 		writeQueueStoreErr(w, err)
 		return
 	}
+	// Opportunistic message-id reconciliation: if any listed item is a
+	// delivered-but-stuck candidate (unknown + correlation id + not terminal),
+	// kick off ONE async reconcile pass using this dir's opencode client. This
+	// reuses the FE's natural list/sync cadence (no separate poller) and is
+	// bounded by the per-item throttle + terminal markers. The response is
+	// returned immediately; reconciliation (Resolve→sent) is observed by the
+	// FE on its NEXT poll. When nothing is eligible (the common case) there is
+	// no spawn, no aggFor lookup, and no side effect — so existing List
+	// traffic is unaffected.
+	if hasReconcileCandidate(items) {
+		go s.reconcileSessionQueue(reqDir(r), sid, root)
+	}
 	writeJSONResp(w, map[string]any{"items": items})
 }
 

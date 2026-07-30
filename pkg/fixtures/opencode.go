@@ -835,6 +835,44 @@ func (f *FakeOpenCode) handleSession(w http.ResponseWriter, r *http.Request) {
 		// clear its own working state optimistically.
 		writeJSON(w, map[string]any{"ok": true})
 		return
+	case action == "message" && r.Method == http.MethodGet && len(parts) >= 4:
+		// Exact-GET: GET /session/:sid/message/:mid — the authoritative
+		// single-message lookup the queue reconciler (Slice 6) uses to decide
+		// whether a dispatched item became a real persisted user message under
+		// the queue's minted correlation id. Mirrors real OpenCode:
+		//   - non-msg_-prefixed id → 400 (caller bug; same as real server)
+		//   - composite (sid, mid) matches a persisted USER message → 200
+		//     {"info":{...},"parts":[...]}
+		//   - no match (wrong session / wrong id / assistant message) → 404
+		// The composite key is enforced by f.messages being keyed by sessionID
+		// (a mid is unique within its session; a foreign session's store is a
+		// different slice), so session isolation is structural. The reconciler
+		// additionally requires info.role==="user" && info.id===minted, so an
+		// assistant message with a colliding id (never happens — ids are
+		// globally unique) still fails the caller's exact-match check.
+		mid := parts[3]
+		if !strings.HasPrefix(mid, "msg_") {
+			http.Error(w, "fixture: message id must be msg_-prefixed", http.StatusBadRequest)
+			return
+		}
+		f.mu.Lock()
+		var found *messageWithParts
+		for i := range f.messages[id] {
+			m := &f.messages[id][i]
+			if role, _ := m.Info["role"].(string); role == "user" {
+				if mid2, _ := m.Info["id"].(string); mid2 == mid {
+					found = m
+					break
+				}
+			}
+		}
+		f.mu.Unlock()
+		if found == nil {
+			http.Error(w, "fixture: message not found", http.StatusNotFound)
+			return
+		}
+		writeJSON(w, map[string]any{"info": found.Info, "parts": found.Parts})
+		return
 	case action == "message" && r.Method == http.MethodPost:
 		body := map[string]any{}
 		_ = json.NewDecoder(r.Body).Decode(&body)
@@ -960,7 +998,7 @@ func promptText(body map[string]any) string {
 // (prompt_async's optional `messageID` body field) — vh-solara's queue
 // correlation id (Slice 5). Empty when absent (the pre-Slice-5 path; the fake
 // then mints its own u%n). Real OpenCode persists the user message with this
-// EXACT id (caller-id-wins on v1.17.8); the fake honors it identically.
+// EXACT id (caller-id-wins on v1.17.18); the fake honors it identically.
 func promptMessageID(body map[string]any) string {
 	mid, _ := body["messageID"].(string)
 	return mid

@@ -114,6 +114,22 @@ type QueueItem struct {
 	DispatchStartedAt int64             `json:"dispatchStartedAt,omitempty"`
 	ResolvedAt        int64             `json:"resolvedAt,omitempty"`
 	Detail            string            `json:"detail,omitempty"`
+
+	// ReconcileAttempts counts reconciliation passes that FAILED to confirm the
+	// item as sent (404 / 5xx / transport / non-exact 200). Once it reaches
+	// reconcileMaxAttempts the item is marked ReconcileTerminal (fail-closed,
+	// NEVER resend). omitempty keeps on-disk backward compatibility: a legacy
+	// queue.json persisted before reconciliation existed deserializes with
+	// ReconcileAttempts==0, which simply means "freshly eligible".
+	ReconcileAttempts int `json:"reconcileAttempts,omitempty"`
+	// ReconcileTerminal is set once reconciliation has exhausted its bounded
+	// retry budget (or hit a definitive caller-bug 400) for this item's
+	// correlation id. Once true the reconciler skips the item forever — it
+	// stays in its non-sent state (unknown/dispatching) until the operator
+	// dismisses it. This is the fail-closed terminal: a persistent 404 (or
+	// repeated 5xx) past the grace window is treated as TERMINAL for that id,
+	// NEVER an auto-resend trigger. omitempty for backward compatibility.
+	ReconcileTerminal bool `json:"reconcileTerminal,omitempty"`
 }
 
 // queueFile is the on-disk shape. Order is persisted so the monotonic commit
@@ -155,6 +171,17 @@ type sessionQueueStore struct {
 	order    uint64
 	loaded   bool
 	archived bool
+
+	// reconcileLast is an IN-MEMORY (NOT persisted) per-item-id throttle
+	// timestamp for message-id reconciliation: it paces the bounded reconciler
+	// so a single eligible item is looked up at most once per
+	// currentStaleThreshold() window (mirroring stale-dispatch recovery
+	// cadence). It intentionally resets on restart — safe, because a restart
+	// re-runs reconciliation from scratch, still bounded by the PERSISTED
+	// ReconcileAttempts/ReconcileTerminal markers. Lazily initialized in the
+	// reconcile snapshot path (no constructor change). Entries for items that
+	// leave the eligible set (resolved sent / marked terminal) are deleted.
+	reconcileLast map[string]int64
 }
 
 // load reads queue.json once (lazy). A missing file is an empty queue (ok). A

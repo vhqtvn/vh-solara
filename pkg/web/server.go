@@ -161,6 +161,17 @@ type Server struct {
 	queueGCMu sync.Mutex
 	queueGCOn map[string]bool
 
+	// queueReconcileInFlight is a sync.Map keyed by storeKey(root,sid) that
+	// holds a per-session in-flight guard for message-id reconciliation. The
+	// guard is the LoadOrStore(sentinel)+Delete-on-completion idiom (sync.Map
+	// has no compare-and-swap on a missing key): it bounds reconciliation to
+	// ONE concurrent pass per session, so a FE poll storm (or a test poll
+	// loop) cannot fan out overlapping GET /session/:sid/message/:mid passes
+	// for the same session. Purely in-memory; a restart simply loses the guard
+	// (the next poll re-runs reconciliation, still bounded by the persisted
+	// attempt/terminal markers).
+	queueReconcileInFlight sync.Map
+
 	// pinsGCMu + pinsGCOn guard the one-time, per-dir installation of the L2
 	// session.delete subscriber for pinned-session cleanup (Phase 4). It is the
 	// direct structural mirror of queueGCMu/queueGCOn and shares the exact same

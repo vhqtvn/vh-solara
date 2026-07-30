@@ -140,3 +140,91 @@ func TestSubscribeEventsCtxCancel(t *testing.T) {
 		t.Fatalf("SubscribeEvents took too long to honor ctx cancel: %v", elapsed)
 	}
 }
+
+// messageStatusServer is an httptest server for the Message() method: it
+// inspects GET /session/:sid/message/:mid and replies with the caller-supplied
+// status + body, capturing the requested path for assertions.
+func messageStatusServer(t *testing.T, status int, respBody string) (*httptest.Server, *string) {
+	t.Helper()
+	var gotPath string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/session/", func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		if status == http.StatusOK {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(respBody))
+			return
+		}
+		http.Error(w, respBody, status)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv, &gotPath
+}
+
+// TestMessage200 verifies a successful exact-GET returns the raw body.
+func TestMessage200(t *testing.T) {
+	body := `{"info":{"id":"msg_abc","role":"user","sessionID":"s1"},"parts":[]}`
+	srv, gotPath := messageStatusServer(t, http.StatusOK, body)
+	c := New(srv.URL)
+
+	got, err := c.Message(context.Background(), "s1", "msg_abc")
+	if err != nil {
+		t.Fatalf("Message: unexpected error: %v", err)
+	}
+	if string(got) != body {
+		t.Fatalf("Message body mismatch:\n got %q\nwant %q", got, body)
+	}
+	if want := "/session/s1/message/msg_abc"; *gotPath != want {
+		t.Fatalf("request path: got %q want %q", *gotPath, want)
+	}
+}
+
+// TestMessage404 verifies a 404 maps to ErrMessageNotFound (the sentinel the
+// reconciler uses to fail-closed on a definitive "not persisted" verdict).
+func TestMessage404(t *testing.T) {
+	srv, _ := messageStatusServer(t, http.StatusNotFound, "not found")
+	c := New(srv.URL)
+
+	_, err := c.Message(context.Background(), "s1", "msg_missing")
+	if !errors.Is(err, ErrMessageNotFound) {
+		t.Fatalf("want ErrMessageNotFound, got %v", err)
+	}
+}
+
+// TestMessage400 verifies a 400 maps to an *Error{Status:400} (caller bug) the
+// reconciler treats as immediate-terminal.
+func TestMessage400(t *testing.T) {
+	srv, _ := messageStatusServer(t, http.StatusBadRequest, "bad id")
+	c := New(srv.URL)
+
+	_, err := c.Message(context.Background(), "s1", "not-a-msg-id")
+	var opErr *Error
+	if !errors.As(err, &opErr) {
+		t.Fatalf("want *Error, got %T %v", err, err)
+	}
+	if opErr.Status != http.StatusBadRequest {
+		t.Fatalf("status: got %d want 400", opErr.Status)
+	}
+}
+
+// TestMessage5xx verifies a 5xx maps to an *Error carrying the upstream status
+// (the reconciler treats 5xx as retryable within its budget).
+func TestMessage5xx(t *testing.T) {
+	srv, _ := messageStatusServer(t, http.StatusInternalServerError, "boom")
+	c := New(srv.URL)
+
+	_, err := c.Message(context.Background(), "s1", "msg_x")
+	var opErr *Error
+	if !errors.As(err, &opErr) {
+		t.Fatalf("want *Error, got %T %v", err, err)
+	}
+	if opErr.Status != http.StatusInternalServerError {
+		t.Fatalf("status: got %d want 500", opErr.Status)
+	}
+	// A 5xx must NOT be mistaken for a 404.
+	if errors.Is(err, ErrMessageNotFound) {
+		t.Fatalf("5xx must not satisfy ErrMessageNotFound")
+	}
+}
