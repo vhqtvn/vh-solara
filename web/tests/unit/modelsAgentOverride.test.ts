@@ -16,22 +16,9 @@
 // vi.resetModules() + a dynamic import to start from a clean slate.
 
 // jsdom lacks window.matchMedia; importing models/agents pulls in the sync
-// facade whose transitive deps may read it at module load. Install the stub
-// BEFORE any import — vi.hoisted runs before ESM imports.
-vi.hoisted(() => {
-  if (!(window as any).matchMedia) {
-    (window as any).matchMedia = (query: string) => ({
-      matches: false,
-      media: query,
-      onchange: null,
-      addEventListener: () => {},
-      removeEventListener: () => {},
-      addListener: () => {},
-      removeListener: () => {},
-      dispatchEvent: () => false,
-    });
-  }
-});
+// facade whose transitive deps may read it at module load. Import the shared
+// stub BEFORE any import — see _matchMedia.ts.
+import "./_matchMedia";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 

@@ -47,22 +47,9 @@
 // message is seeded.
 
 // jsdom lacks window.matchMedia (read at module-load time by layout.ts via
-// ChatView's transitive deps). Install the stub BEFORE any import that triggers
-// layout.ts — vi.hoisted runs before ESM imports.
-vi.hoisted(() => {
-  if (!(window as any).matchMedia) {
-    (window as any).matchMedia = (query: string) => ({
-      matches: false,
-      media: query,
-      onchange: null,
-      addEventListener: () => {},
-      removeEventListener: () => {},
-      addListener: () => {},
-      removeListener: () => {},
-      dispatchEvent: () => false,
-    });
-  }
-});
+// ChatView's transitive deps). Import the shared stub BEFORE any import that
+// triggers layout.ts — see _matchMedia.ts.
+import "./_matchMedia";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render } from "@solidjs/testing-library";
@@ -225,18 +212,6 @@ describe("P1-WEB-042 — scrollEl ResizeObserver nearBottom() re-engagement", ()
       json: async () => ({}),
       text: async () => "",
     })) as any;
-    if (!(window as any).matchMedia) {
-      (window as any).matchMedia = (query: string) => ({
-        matches: false,
-        media: query,
-        onchange: null,
-        addEventListener: () => {},
-        removeEventListener: () => {},
-        addListener: () => {},
-        removeListener: () => {},
-        dispatchEvent: () => false,
-      });
-    }
     (globalThis as any).IntersectionObserver = class {
       observe() {}
       unobserve() {}

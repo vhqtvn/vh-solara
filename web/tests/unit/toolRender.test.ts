@@ -17,24 +17,10 @@
 //
 // jsdom doesn't implement matchMedia, but importing ToolPart pulls in
 // ./Part → code/frame → layout, which calls window.matchMedia at module load
-// (the same chain PartTool.test.tsx stubs). Install a minimal stub BEFORE the
-// component import is evaluated (vi.hoisted runs ahead of static imports).
-vi.hoisted(() => {
-  const w = globalThis as unknown as { matchMedia?: unknown };
-  if (!w.matchMedia) {
-    w.matchMedia = (query: string) => ({
-      matches: false,
-      media: query,
-      onchange: null,
-      addEventListener: () => {},
-      removeEventListener: () => {},
-      addListener: () => {},
-      removeListener: () => {},
-      dispatchEvent: () => false,
-    });
-  }
-});
-import { describe, expect, it, vi } from "vitest";
+// (the same chain PartTool.test.tsx stubs). Import the shared stub BEFORE the
+// component import is evaluated — see _matchMedia.ts.
+import "./_matchMedia";
+import { describe, expect, it } from "vitest";
 import { jsonPretty, looksXML, toolIconName } from "../../src/components/ToolPart";
 
 // ---- jsonPretty ----------------------------------------------------------

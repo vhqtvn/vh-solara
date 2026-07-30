@@ -9,23 +9,9 @@
 // separately in actionKey.test.ts; this proves the ToolPart wiring end-to-end.
 //
 // jsdom doesn't implement matchMedia, but Part.tsx → code/frame → layout calls
-// window.matchMedia at module load. Install a minimal stub BEFORE the component
-// import is evaluated (vi.hoisted runs ahead of static imports).
-vi.hoisted(() => {
-  const w = globalThis as unknown as { matchMedia?: unknown };
-  if (!w.matchMedia) {
-    w.matchMedia = (query: string) => ({
-      matches: false,
-      media: query,
-      onchange: null,
-      addEventListener: () => {},
-      removeEventListener: () => {},
-      addListener: () => {},
-      removeListener: () => {},
-      dispatchEvent: () => false,
-    });
-  }
-});
+// window.matchMedia at module load. Import the shared stub BEFORE the component
+// import is evaluated — see _matchMedia.ts.
+import "./_matchMedia";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render } from "@solidjs/testing-library";
 import PartView, { partOpen, setPartOpen } from "../../src/components/Part";

@@ -13,25 +13,12 @@
 // These tests pin that contract directly at the new module seam. groupParts
 // itself is pure logic (no SolidJS), but importing it from MessageParts.tsx
 // pulls the module graph through Spinner -> ... -> layout.ts, which reads
-// window.matchMedia at module-load time. jsdom lacks matchMedia, so install the
-// stub BEFORE any import that triggers layout.ts (vi.hoisted runs before ESM
-// imports) — same shape as ChatViewPartlessMessage.test.tsx.
-vi.hoisted(() => {
-  if (!(window as any).matchMedia) {
-    (window as any).matchMedia = (query: string) => ({
-      matches: false,
-      media: query,
-      onchange: null,
-      addEventListener: () => {},
-      removeEventListener: () => {},
-      addListener: () => {},
-      removeListener: () => {},
-      dispatchEvent: () => false,
-    });
-  }
-});
+// window.matchMedia at module-load time. jsdom lacks matchMedia, so import the
+// shared stub FIRST (before any import that triggers layout.ts) — see
+// _matchMedia.ts.
+import "./_matchMedia";
 
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import { groupParts } from "../../src/components/chat/MessageParts";
 
 // Minimal part factory — groupParts only reads .id and .type.

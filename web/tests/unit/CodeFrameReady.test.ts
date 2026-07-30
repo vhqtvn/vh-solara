@@ -9,23 +9,9 @@
 // (it calls resetCodeFrameReady() on a src() change before the iframe reloads).
 //
 // jsdom has no matchMedia, but code/frame → ../layout calls window.matchMedia at
-// module load. Install a minimal stub BEFORE the frame import is evaluated
-// (vi.hoisted runs ahead of static imports).
-vi.hoisted(() => {
-  const w = globalThis as unknown as { matchMedia?: unknown };
-  if (!w.matchMedia) {
-    w.matchMedia = (query: string) => ({
-      matches: false,
-      media: query,
-      onchange: null,
-      addEventListener: () => {},
-      removeEventListener: () => {},
-      addListener: () => {},
-      removeListener: () => {},
-      dispatchEvent: () => false,
-    });
-  }
-});
+// module load. Import the shared stub BEFORE the frame import is evaluated — see
+// _matchMedia.ts.
+import "./_matchMedia";
 import { describe, expect, it, vi } from "vitest";
 import {
   bindCodeFrame,

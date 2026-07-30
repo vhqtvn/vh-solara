@@ -17,22 +17,9 @@
 // parts → no placeholder) and the failed variant (messagesError → failed hint).
 
 // jsdom lacks window.matchMedia (read at module-load time by layout.ts via
-// code/frame.ts via ChatView's transitive deps). Install the stub BEFORE any
-// import that triggers layout.ts — vi.hoisted runs before ESM imports.
-vi.hoisted(() => {
-  if (!(window as any).matchMedia) {
-    (window as any).matchMedia = (query: string) => ({
-      matches: false,
-      media: query,
-      onchange: null,
-      addEventListener: () => {},
-      removeEventListener: () => {},
-      addListener: () => {},
-      removeListener: () => {},
-      dispatchEvent: () => false,
-    });
-  }
-});
+// code/frame.ts via ChatView's transitive deps). Import the shared stub BEFORE
+// any import that triggers layout.ts — see _matchMedia.ts.
+import "./_matchMedia";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, waitFor } from "@solidjs/testing-library";
@@ -67,10 +54,10 @@ vi.mock("../../src/models", () => ({
   loadModels: vi.fn(),
 }));
 
-// jsdom lacks window.matchMedia (module-load read by layout.ts),
-// IntersectionObserver, PointerEvent, and ResizeObserver. Stub fetch too
-// (ChatView onMount may issue unrelated fetches). ResizeObserver is a deliberate
-// no-op so the only drivers of maybeRestore are the rAF fallback + effects.
+// jsdom lacks IntersectionObserver, PointerEvent, and ResizeObserver. Stub
+// fetch too (ChatView onMount may issue unrelated fetches). ResizeObserver is a
+// deliberate no-op so the only drivers of maybeRestore are the rAF fallback +
+// effects.
 beforeEach(() => {
   (globalThis as any).fetch = vi.fn(async () => ({
     ok: true,
@@ -78,18 +65,6 @@ beforeEach(() => {
     json: async () => ({}),
     text: async () => "",
   })) as any;
-  if (!(window as any).matchMedia) {
-    (window as any).matchMedia = (query: string) => ({
-      matches: false,
-      media: query,
-      onchange: null,
-      addEventListener: () => {},
-      removeEventListener: () => {},
-      addListener: () => {},
-      removeListener: () => {},
-      dispatchEvent: () => false,
-    });
-  }
   (globalThis as any).IntersectionObserver = class {
     observe() {}
     unobserve() {}
