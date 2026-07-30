@@ -123,6 +123,15 @@ export function projectSnapshot(s: SyncState, snap: Snapshot, effects: Reconcile
   }
   s.unread = {};
   for (const id of snap.unread || []) s.unread[id] = true;
+  // Per-session gate facts — seed the live mirror authoritatively from the
+  // snapshot so the permission.blocked live patch (projectMessageEvent) composes
+  // coherently: the live false→true flip lands on top of the seeded baseline,
+  // and the next snapshot supersedes it wholesale (mirrors lastAgents). Shallow-
+  // clone each GateFacts so a live mutation never aliases the snapshot object.
+  s.gate = {};
+  for (const [id, g] of Object.entries(snap.gate || {})) {
+    if (g) s.gate[id] = { ...g };
+  }
   // S3 epoch transition: latch so the connection-health toast can surface
   // "Server restarted — re-syncing…". The merge-protect above already shielded
   // the labels from this (potentially mid-aggregation) snapshot.
@@ -153,6 +162,7 @@ export function projectSessionRemoval(s: SyncState, id: string, effects: Reconci
   // id-reuse. resetPageInFlight + dropPinnedSession are orchestration effects.
   delete s.sessions[id];
   delete s.lastAgents[id];
+  delete s.gate[id];
   delete s.messageWindows[id];
   delete s.messagesDelivered[id];
   delete s.messagesError[id];
@@ -356,6 +366,22 @@ export function projectMessageEvent(
           // already have their agent.
           patchTreeAgent(payload.sessionID, payload.agent);
         } else delete s.lastAgents[payload.sessionID];
+      }
+      break;
+    case "permission.blocked":
+      // Live false→true permission-blocking transition (mirrors lastAgent.set's
+      // cold-seed live patch). The server emits this Stream-1 event the moment a
+      // permission blocking occurs (KindPermissionBlocked, M8/L-04) so an
+      // already-connected client flips the sticky gate fact live — without it the
+      // client only converges from the next snapshot/reconnect. Patch BOTH wire
+      // spellings for symmetry (L-09 dual-emit alias window): permissionWasBlocked
+      // (the exact-name alias the SPA migrates toward) and permission_blocked (its
+      // retained peer, set via the GateFacts index signature). Payload shape:
+      // {sessionID, permissionWasBlocked: true}.
+      if (payload.sessionID) {
+        const g = s.gate[payload.sessionID] ?? (s.gate[payload.sessionID] = {});
+        g.permissionWasBlocked = true;
+        g["permission_blocked"] = true;
       }
       break;
     case "status":

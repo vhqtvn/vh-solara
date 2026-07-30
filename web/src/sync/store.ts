@@ -5,7 +5,7 @@
 // without a cycle. State is reconciled by id, never nuked.
 import { createStore } from "solid-js/store";
 import { createSignal } from "solid-js";
-import type { ConnStatus, Permission, ProjectConstants, Question, Session, SessionMessages, VerbFacet } from "../types";
+import type { ConnStatus, GateFacts, Permission, ProjectConstants, Question, Session, SessionMessages, VerbFacet } from "../types";
 import { loadVersioned, saveVersioned } from "../lib/store";
 
 const LS_CURSOR = "vh.cursor.v1";
@@ -168,6 +168,19 @@ export interface SyncState {
   // activity.verb event within seconds — unlike lastAgents/activity, which ARE
   // persisted to render chips/state instantly on a cold reload.
   currentVerbs: Record<string, VerbFacet>;
+  // Per-session gate facts — a live mirror of the server's GateFacts map
+  // (pkg/state/store.go, snap.gate). Seeded authoritatively from the snapshot
+  // in projectSnapshot and live-patched by the permission.blocked event
+  // (projectMessageEvent) so an already-connected client reflects the false→true
+  // permission-blocking transition WITHOUT a snapshot/reconnect — mirroring the
+  // lastAgents snapshot-seed + live-patch pattern. Ephemeral — NOT persisted
+  // (re-derived from the snapshot on every load, like every other gate fact);
+  // pruned on session.delete so a deleted session's facts can't leak or
+  // resurrect on id-reuse. The SPA does not yet RENDER from this field (the
+  // store.go doc on KindPermissionBlocked documented the snapshot-only delivery
+  // gap honestly); wiring it makes the live consumer land so convergence is
+  // immediate and a future render reads the exact gate shape from here.
+  gate: Record<string, GateFacts>;
   permissions: Record<string, Record<string, Permission>>;
   questions: Record<string, Record<string, Question>>;
   // Root sessions that finished and haven't been acknowledged (server-tracked,
@@ -253,6 +266,7 @@ export const [state, setState] = createStore<SyncState>({
   activity: loadActivity(initialDir),
   lastAgents: loadLastAgents(initialDir),
   currentVerbs: {},
+  gate: {},
   permissions: {},
   questions: {},
   unread: {},

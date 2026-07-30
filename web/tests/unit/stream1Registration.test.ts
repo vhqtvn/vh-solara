@@ -145,6 +145,7 @@ const EXPECTED_TREE_LISTENER_KINDS = [
   "activity.verb",
   "lastAgent.set",
   "notice",
+  "permission.blocked",
   "permission.delete",
   "permission.upsert",
   "ping",
@@ -235,7 +236,7 @@ describe("Stream1 connect() listener manifest", () => {
   });
 
   // -------------------------------------------------------------------------
-  // TREE_STREAM_KINDS — the 10 named events routed through applyMessageEvent.
+  // TREE_STREAM_KINDS — the 11 named events routed through applyMessageEvent.
   // Each must reach its handler case with an observable facet mutation. Done in
   // upsert-then-delete order so the delete/clear kinds have prior state.
   // -------------------------------------------------------------------------
@@ -260,6 +261,11 @@ describe("Stream1 connect() listener manifest", () => {
     // lastAgent.set → state.lastAgents[SID] (+ tree-node bridge)
     es.fire("lastAgent.set", { sessionID: SID, agent: "agentK" }, "22");
     expect(store.state.lastAgents[SID]).toBe("agentK");
+
+    // permission.blocked → state.gate[SID] sticky gate fact (both spellings)
+    es.fire("permission.blocked", { sessionID: SID, permissionWasBlocked: true }, "23a");
+    expect(store.state.gate[SID]?.permissionWasBlocked).toBe(true);
+    expect(store.state.gate[SID]?.permission_blocked).toBe(true);
 
     // permission.upsert → state.permissions[SID][id]
     es.fire("permission.upsert", { sessionID: SID, id: "p1", tool: "Bash" }, "23");

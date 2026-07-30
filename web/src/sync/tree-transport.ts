@@ -697,6 +697,7 @@ export const TREE_STREAM_KINDS = [
   "activity",
   "activity.verb",
   "lastAgent.set",
+  "permission.blocked",
   "permission.upsert",
   "permission.delete",
   "question.upsert",
@@ -1047,40 +1048,7 @@ export function connect(fresh = false) {
       finishDecode(raw);
     }
   });
-  es.addEventListener("tree.op", async (e) => {
-    markTreeSeen();
-    const ev = e as MessageEvent;
-    // F4: store seq from the SSE id, not the envelope body seq.
-    const seq = Number(ev.lastEventId);
-    if (isGateActive()) {
-      advanceCursor(seq);
-      markBusyDirty();
-      return;
-    }
-    // C4: serialize against a pending coherent owner (capture the EXACT owner
-    // ref via coveredAwait; await it; recheck gen; run the reducer + cursor
-    // SYNCHRONOUSLY). A delta op applied during staging would be wiped by the
-    // coherent seed (seedTreeStore wholesale-replaces treeMap) inside the
-    // install batch; awaiting the owner guarantees the op applies AFTER the
-    // baseline, as the live tail.
-    const wait = coveredAwait(gen);
-    if (wait) await wait;
-    if (gen !== treeGen) return;
-    if (isGateActive()) {
-      advanceCursor(seq);
-      markBusyDirty();
-      return;
-    }
-    try {
-      const op = decodeTreeOp(JSON.parse(ev.data));
-      if (op) {
-        applyTreeOpStore(op);
-        advanceCursor(seq);
-      }
-    } catch (err) {
-      log.warn("sync", "malformed tree.op frame", { err, seq });
-    }
-  });
+  registerTreeStreamListeners(es, gen);
   // === Q5 C2 — truthful completion boundary ===================================
   // The server (commit C1) emits `snapshot.complete` as a named SSE event AFTER
   // both projections (tree.snapshot + detail snapshot) of the SAME {epoch, seq}
@@ -1164,31 +1132,6 @@ export function connect(fresh = false) {
     tryInstall(owner);
   });
   registerAuxiliaryListeners(es, gen);
-  for (const kind of TREE_STREAM_KINDS) {
-    es.addEventListener(kind, async (e) => {
-      markTreeSeen();
-      const ev = e as MessageEvent;
-      const seq = Number(ev.lastEventId);
-      if (isGateActive()) {
-        // Deferred — Stream 1 advances the resume cursor but does not mutate.
-        advanceCursor(seq);
-        markBusyDirty();
-        return;
-      }
-      // C4: serialize against a pending coherent owner (coveredAwait — same
-      // contract as the session.upsert listener above: capture the exact owner,
-      // await, recheck gen, run reducer + cursor synchronously).
-      const wait = coveredAwait(gen);
-      if (wait) await wait;
-      if (gen !== treeGen) return;
-      if (isGateActive()) {
-        advanceCursor(seq);
-        markBusyDirty();
-        return;
-      }
-      applyTreeFrame(kind, seq, ev.data, applyMessageEvent);
-    });
-  }
   // Daemon-detected alerts (transient; no cursor advance). In-app + OS delivery.
   es.addEventListener("notice", (e) => {
     markTreeSeen();
@@ -1252,9 +1195,12 @@ export function connect(fresh = false) {
 // session.* detail reducers (coveredAwait against a pending C4 owner). Only the
 // addEventListener registrations were relocated; no callback body changed.
 //
-// `notice` was intentionally NOT extracted here: in connect() it is NOT
-// contiguous with this block — it sits AFTER the TREE_STREAM_KINDS registration
-// loop — so per the extraction constraint it stays inline where it is.
+// `notice` is intentionally NOT extracted here: it stays inline in connect().
+// (It was originally left out because it sat AFTER the TREE_STREAM_KINDS
+// registration loop, which was non-contiguous with this block; decomposition
+// Stage 2 — registerTreeStreamListeners — has since extracted that loop, making
+// notice contiguous with this call. Folding notice into a helper remains a
+// separate decision, so it stays inline where it is.)
 //
 // Synchronous by contract (registration only, no async, no Promise return).
 // `gen` is THIS connection's captured generation token, passed by value; the
@@ -1339,6 +1285,91 @@ function registerAuxiliaryListeners(es: EventSource, gen: number): void {
         return;
       }
       applyTreeFrame(kind, seq, ev.data, applySessionEvent);
+    });
+  }
+}
+
+
+// === connect() tree-stream listener registration (decomposition Stage 2) =====
+// Extracted VERBATIM from connect() — the tree-stream event cohort: the
+// standalone tree.op delta listener and the TREE_STREAM_KINDS message-event
+// loop (status / activity.*/ lastAgent.set / permission.*/ question.* /
+// unread.*) forwarded to applyMessageEvent. Only the addEventListener
+// registrations were relocated from their inline positions in connect(); no
+// callback body changed. tree.op was registered before snapshot.complete and
+// the TREE_STREAM_KINDS loop was registered after registerAuxiliaryListeners;
+// both now register together here at tree.op's former source position (the
+// loop was removed from between registerAuxiliaryListeners and notice, leaving
+// notice contiguous with the auxiliary call). Every cohort event name is
+// distinct from all other listeners (the C4 baseline trio snapshot /
+// tree.snapshot / snapshot.complete, the auxiliary cohort, and notice), so
+// consolidating them at one registration site has no dispatch-order effect
+// (EventSource fires per-name listeners in registration order, and each name
+// has exactly one listener); the full set is pinned by stream1Registration.
+//
+// Synchronous by contract (registration only, no async, no Promise return).
+// `gen` is THIS connection's captured generation token, passed by value; the
+// callbacks read `gen` for the stale-entry / post-await recheck guards and the
+// live module-scope `treeGen` exactly as the inline registrations did. No
+// connect()-local state other than `es`/`gen` is captured, so there is no ctx.
+function registerTreeStreamListeners(es: EventSource, gen: number): void {
+  es.addEventListener("tree.op", async (e) => {
+    markTreeSeen();
+    const ev = e as MessageEvent;
+    // F4: store seq from the SSE id, not the envelope body seq.
+    const seq = Number(ev.lastEventId);
+    if (isGateActive()) {
+      advanceCursor(seq);
+      markBusyDirty();
+      return;
+    }
+    // C4: serialize against a pending coherent owner (capture the EXACT owner
+    // ref via coveredAwait; await it; recheck gen; run the reducer + cursor
+    // SYNCHRONOUSLY). A delta op applied during staging would be wiped by the
+    // coherent seed (seedTreeStore wholesale-replaces treeMap) inside the
+    // install batch; awaiting the owner guarantees the op applies AFTER the
+    // baseline, as the live tail.
+    const wait = coveredAwait(gen);
+    if (wait) await wait;
+    if (gen !== treeGen) return;
+    if (isGateActive()) {
+      advanceCursor(seq);
+      markBusyDirty();
+      return;
+    }
+    try {
+      const op = decodeTreeOp(JSON.parse(ev.data));
+      if (op) {
+        applyTreeOpStore(op);
+        advanceCursor(seq);
+      }
+    } catch (err) {
+      log.warn("sync", "malformed tree.op frame", { err, seq });
+    }
+  });
+  for (const kind of TREE_STREAM_KINDS) {
+    es.addEventListener(kind, async (e) => {
+      markTreeSeen();
+      const ev = e as MessageEvent;
+      const seq = Number(ev.lastEventId);
+      if (isGateActive()) {
+        // Deferred — Stream 1 advances the resume cursor but does not mutate.
+        advanceCursor(seq);
+        markBusyDirty();
+        return;
+      }
+      // C4: serialize against a pending coherent owner (coveredAwait — same
+      // contract as the session.upsert listener above: capture the exact owner,
+      // await, recheck gen, run reducer + cursor synchronously).
+      const wait = coveredAwait(gen);
+      if (wait) await wait;
+      if (gen !== treeGen) return;
+      if (isGateActive()) {
+        advanceCursor(seq);
+        markBusyDirty();
+        return;
+      }
+      applyTreeFrame(kind, seq, ev.data, applyMessageEvent);
     });
   }
 }
