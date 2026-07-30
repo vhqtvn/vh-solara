@@ -31,10 +31,17 @@
 //     BEFORE the wasBusy==isBusy early-return in setActivityLocked.
 //   - upsertSessionLocked + Hydrate direct-assign — create / reparent.
 //   - deleteSessionLocked — delete chokepoint (non-cascading: descendants are
-//     orphaned to roots, NOT deleted).
+//     orphaned to roots, NOT deleted). The whole-session delete(s.perms,id) /
+//     delete(s.questions,id) here is the EXEMPTED teardown site (whole-sum
+//     zeroing via maintainIndexesOnDeleteLocked, NOT a per-entry delta).
 //   - permission.asked/replied + question.asked/replied (+ the
 //     SetPendingPermissions / SetPendingQuestions reconcile entrypoints) — the
-//     pending-input chokepoint, funneled through notePendingInputChangeLocked.
+//     pending-input chokepoint. M2/L-06 collapsed this into an EXCLUSIVE-OWNER
+//     helper family (setPermissionLocked / clearPermissionLocked /
+//     setQuestionLocked / clearQuestionLocked) that owns the map write +
+//     wasPending→isPending delta + emit as one unit; no per-session shadow is
+//     kept (the former notePendingInputChangeLocked + pendingInputSelf are
+//     retired).
 //
 // All helpers hold s.mu (same lock as the prototype index). The fresh-create
 // branch's O(n) child-scan is the cold path; reparent / activity / perm /
@@ -42,7 +49,10 @@
 
 package state
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 // defaultRecentBucketRetentionMinutes is the DEFAULT per-instance bound on the
 // number of minute-buckets retained in s.recentBucket (memory-bounded; generous
@@ -175,13 +185,27 @@ func (s *Store) maintainSubtreeRetryOnSessionUpsertLocked(id string, prev *sessi
 // ----------------------------------------------------------------------------
 // subtreePendingInput (sum; self = has any pending permission OR question)
 //
-// pendingInputSelf[id] is the per-session shadow of self (0/1) so a
-// notePendingInputChangeLocked call can resolve the delta without re-deriving
-// the previous self from the (already-mutated) perms/questions maps.
+// EXCLUSIVE-OWNER MODEL (remediation M2 / audit L-06). The four helpers below —
+// setPermissionLocked / clearPermissionLocked / setQuestionLocked /
+// clearQuestionLocked — are the ONLY production writers to s.perms / s.questions
+// affecting pending input. Each owns the full mutation sequence the audit
+// requires: it captures wasPending BEFORE the map mutation, performs the map
+// write, derives isPending AFTER, applies the old→new delta to
+// subtreePendingInput (+ the live ancestor chain), and emits the corresponding
+// wire event. Because the helper captures the before-state itself, no per-
+// session old-self shadow is needed — the retired pendingInputSelf field (which
+// existed only so the prior notePendingInputChangeLocked chokepoint could
+// resolve a delta after a caller-performed mutation) has been removed. The
+// static restriction TestPendingInputMutationExclusiveOwner enforces that no
+// direct production write to s.perms / s.questions exists outside these four
+// helpers (plus the exempted deleteSessionLocked teardown, which uses
+// whole-sum zeroing, not a delta).
 // ----------------------------------------------------------------------------
 
 // pendingInputSelfLocked returns id's OWN pending-input contribution: 1 when
-// it has any pending permission or question, else 0. Caller holds s.mu.
+// it has any pending permission or question, else 0. Reads the maps DIRECTLY
+// (authoritative — no shadow lag), so callers capturing the value before a
+// mutation resolve a correct old→new delta. Caller holds s.mu.
 func (s *Store) pendingInputSelfLocked(id string) int {
 	if len(s.perms[id]) > 0 || len(s.questions[id]) > 0 {
 		return 1
@@ -189,41 +213,104 @@ func (s *Store) pendingInputSelfLocked(id string) int {
 	return 0
 }
 
-// notePendingInputChangeLocked is the SINGLE pending-input chokepoint: called
-// after every mutation to perms[id] or questions[id] (Apply permission.asked /
-// replied, question.asked / replied / rejected, and the SetPendingPermissions
-// / SetPendingQuestions reconcile loops). Recomputes id's own contribution,
-// resolves the delta vs pendingInputSelf[id], and propagates up. Idempotent
-// (a no-op when the contribution is unchanged). Phantom-guarded. Caller holds
-// s.mu.
-func (s *Store) notePendingInputChangeLocked(id string) {
-	se := s.sessions[id]
+// mutatePendingInputLocked is the delta-resolution core shared by the four
+// exclusive-owner helpers. It captures wasPending BEFORE the map mutation, runs
+// mutate (which performs the actual permission/question write), derives
+// isPending AFTER, and applies the old→new delta to subtreePendingInput + the
+// live ancestor chain. Phantom-guarded: when sid is not yet in the live tree
+// (a permission/question event arrived before session.created), the delta is
+// deferred — no index entry is created, and the contribution is seeded on
+// create via maintainSubtreePendingInputOnSessionUpsertLocked. Idempotent when
+// the mutation does not change sid's own pending contribution. The map WRITE
+// (inside mutate) runs unconditionally, even for a phantom; only the index
+// delta is deferred. Caller holds s.mu.
+func (s *Store) mutatePendingInputLocked(sid string, mutate func()) {
+	was := s.pendingInputSelfLocked(sid)
+	mutate()
+	se := s.sessions[sid]
 	if se == nil {
-		return // phantom: perms/questions may arrive before session.created
+		return // phantom: contribution deferred to the upsert seed
 	}
-	want := s.pendingInputSelfLocked(id)
-	prev := s.pendingInputSelf[id]
-	s.pendingInputSelf[id] = want
-	if want == prev {
+	is := s.pendingInputSelfLocked(sid)
+	if is == was {
 		return
 	}
-	delta := want - prev
-	s.subtreePendingInput[id] += delta
+	delta := is - was
+	s.subtreePendingInput[sid] += delta
 	s.adjustAncestorChainSumLocked(se.parentID, delta, s.subtreePendingInput)
 }
 
+// setPermissionLocked is the EXCLUSIVE production owner of a permission set
+// affecting pending input. It captures wasPending, writes s.perms[sid][id],
+// applies the subtreePendingInput delta, and emits KindPermissionSet. Caller
+// holds s.mu. sid and id MUST be non-empty (callers validate).
+func (s *Store) setPermissionLocked(sid, id string, raw json.RawMessage) {
+	s.mutatePendingInputLocked(sid, func() {
+		if s.perms[sid] == nil {
+			s.perms[sid] = map[string]json.RawMessage{}
+		}
+		s.perms[sid][id] = raw
+	})
+	s.emit(KindPermissionSet, raw)
+}
+
+// clearPermissionLocked is the EXCLUSIVE production owner of a permission clear
+// affecting pending input. It captures wasPending, deletes s.perms[sid][id],
+// applies the subtreePendingInput delta, and emits KindPermissionClear. No-op
+// on the map when the submap or entry is absent (the delta is then unchanged
+// and the emit still fires, matching the historical permission.replied path).
+// Caller holds s.mu.
+func (s *Store) clearPermissionLocked(sid, id string) {
+	s.mutatePendingInputLocked(sid, func() {
+		if m := s.perms[sid]; m != nil {
+			delete(m, id)
+		}
+	})
+	s.emit(KindPermissionClear, rawObj(map[string]interface{}{
+		"sessionID": sid, "permissionID": id,
+	}))
+}
+
+// setQuestionLocked is the EXCLUSIVE production owner of a question set
+// affecting pending input. Mirror of setPermissionLocked over s.questions.
+// Emits KindQuestionSet. Caller holds s.mu.
+func (s *Store) setQuestionLocked(sid, id string, raw json.RawMessage) {
+	s.mutatePendingInputLocked(sid, func() {
+		if s.questions[sid] == nil {
+			s.questions[sid] = map[string]json.RawMessage{}
+		}
+		s.questions[sid][id] = raw
+	})
+	s.emit(KindQuestionSet, raw)
+}
+
+// clearQuestionLocked is the EXCLUSIVE production owner of a question clear
+// affecting pending input. Mirror of clearPermissionLocked over s.questions.
+// Emits KindQuestionClear. Caller holds s.mu.
+func (s *Store) clearQuestionLocked(sid, id string) {
+	s.mutatePendingInputLocked(sid, func() {
+		if m := s.questions[sid]; m != nil {
+			delete(m, id)
+		}
+	})
+	s.emit(KindQuestionClear, rawObj(map[string]interface{}{
+		"sessionID": sid, "questionID": id,
+	}))
+}
+
 // maintainSubtreePendingInputOnSessionUpsertLocked maintains subtreePendingInput
-// after a session create / reparent. On fresh-create, ALSO syncs
-// pendingInputSelf[id] so a later notePendingInputChangeLocked call resolves
-// the correct delta (seedSumOnCreateLocked already propagated; this write is
-// bookkeeping only). Caller holds s.mu; s.sessions[id] must already be written.
+// after a session create / reparent. On fresh-create it seeds sid's own +
+// reabsorbed-orphan contribution (the cold-path O(n) child scan in
+// seedSumOnCreateLocked), which is also the deferred-seed path for a phantom
+// permission/question: a perm/event that arrived before session.created left
+// the index untouched, and this seed — reading the CURRENT s.perms/s.questions
+// via pendingInputSelfLocked — records the contribution now that sid is live.
+// No per-session shadow is synced (the helper captures wasPending itself).
+// Caller holds s.mu; s.sessions[id] must already be written.
 func (s *Store) maintainSubtreePendingInputOnSessionUpsertLocked(id string, prev *sessionEntry, newParentID string) {
 	switch {
 	case prev == nil:
 		s.seedSumOnCreateLocked(id, newParentID, s.subtreePendingInput, s.pendingInputSelfLocked)
-		// Sync the per-session self shadow (no further propagation: seedSum
-		// already added self to subtreePendingInput[id] + ancestors).
-		s.pendingInputSelf[id] = s.pendingInputSelfLocked(id)
 	case s.effectiveParentOfLocked(prev.parentID) == s.effectiveParentOfLocked(newParentID):
 		// No effective topology change → no-op.
 	default:

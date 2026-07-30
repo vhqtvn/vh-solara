@@ -451,15 +451,11 @@ func (s *Store) Apply(ev opencode.Event) {
 		// compatibility. Properties are the permission Request ({id, sessionID, …}).
 		var p permissionEnvelope
 		if json.Unmarshal(ev.Properties, &p) == nil && p.SessionID != "" && p.ID != "" {
-			if s.perms[p.SessionID] == nil {
-				s.perms[p.SessionID] = map[string]json.RawMessage{}
-			}
-			s.perms[p.SessionID][p.ID] = ev.Properties
-			// Phase 1 (Gate C extension): pending-input chokepoint. Phantom-
-			// guarded (no-op when SessionID is not yet live; the contribution
-			// is seeded on create via maintainSubtreePendingInputOnSessionUpsertLocked).
-			s.notePendingInputChangeLocked(p.SessionID)
-			s.emit(KindPermissionSet, ev.Properties)
+			// M2/L-06: setPermissionLocked is the EXCLUSIVE owner of this
+			// production write — it captures wasPending, mutates s.perms,
+			// applies the subtreePendingInput delta, and emits
+			// KindPermissionSet. Phantom-guarded inside the helper.
+			s.setPermissionLocked(p.SessionID, p.ID, ev.Properties)
 		}
 	case "permission.replied":
 		// OpenCode sends {sessionID, requestID, reply}; older/fixture payloads use
@@ -475,14 +471,8 @@ func (s *Store) Apply(ev opencode.Event) {
 			if id == "" {
 				id = p.PermissionID
 			}
-			if m := s.perms[p.SessionID]; m != nil {
-				delete(m, id)
-			}
-			// Phase 1 (Gate C extension): pending-input chokepoint.
-			s.notePendingInputChangeLocked(p.SessionID)
-			s.emit(KindPermissionClear, rawObj(map[string]interface{}{
-				"sessionID": p.SessionID, "permissionID": id,
-			}))
+			// M2/L-06: clearPermissionLocked owns the clear + delta + emit.
+			s.clearPermissionLocked(p.SessionID, id)
 		}
 	case "question.asked":
 		var p struct {
@@ -490,13 +480,8 @@ func (s *Store) Apply(ev opencode.Event) {
 			SessionID string `json:"sessionID"`
 		}
 		if json.Unmarshal(ev.Properties, &p) == nil && p.SessionID != "" && p.ID != "" {
-			if s.questions[p.SessionID] == nil {
-				s.questions[p.SessionID] = map[string]json.RawMessage{}
-			}
-			s.questions[p.SessionID][p.ID] = ev.Properties
-			// Phase 1 (Gate C extension): pending-input chokepoint.
-			s.notePendingInputChangeLocked(p.SessionID)
-			s.emit(KindQuestionSet, ev.Properties)
+			// M2/L-06: setQuestionLocked owns the write + delta + emit.
+			s.setQuestionLocked(p.SessionID, p.ID, ev.Properties)
 		}
 	case "question.replied", "question.rejected":
 		var p struct {
@@ -504,14 +489,8 @@ func (s *Store) Apply(ev opencode.Event) {
 			RequestID string `json:"requestID"`
 		}
 		if json.Unmarshal(ev.Properties, &p) == nil && p.SessionID != "" {
-			if m := s.questions[p.SessionID]; m != nil {
-				delete(m, p.RequestID)
-			}
-			// Phase 1 (Gate C extension): pending-input chokepoint.
-			s.notePendingInputChangeLocked(p.SessionID)
-			s.emit(KindQuestionClear, rawObj(map[string]interface{}{
-				"sessionID": p.SessionID, "questionID": p.RequestID,
-			}))
+			// M2/L-06: clearQuestionLocked owns the clear + delta + emit.
+			s.clearQuestionLocked(p.SessionID, p.RequestID)
 		}
 	default:
 		// server.connected / heartbeat / instance.disposed / file.* — ignored for the view.
@@ -669,11 +648,24 @@ func (s *Store) deleteSessionLocked(id string) {
 	delete(s.msgLoaded, id)
 	delete(s.msgRev, id)
 	delete(s.coldFetchActive, id)
+	// Drop the empty-newest confirmation trackers so a recreated id re-confirms
+	// source-emptiness from scratch (a pending sighting must not carry over and
+	// pre-confirm a new session's newest assistant). See the struct comment.
+	delete(s.pendingEmptyNewest, id)
+	delete(s.confirmedEmptyNewest, id)
 	// Drop the cold-seed memo so a session recreated under the same id (live
 	// session.deleted then session.created, an archive/un-archive, or a hydrate
 	// prune-then-reappear) gets its lastAgent re-seeded from a fresh tail fetch.
 	delete(s.seeded, id)
 	delete(s.todos, id)
+	// M2/L-06: deleteSessionLocked is the EXEMPTED teardown site for s.perms /
+	// s.questions (whole-session removal). It is deliberately NOT routed through
+	// the setPermissionLocked / clearPermissionLocked / setQuestionLocked /
+	// clearQuestionLocked exclusive owners: those helpers apply a per-entry
+	// ±delta against a live session, while teardown zeroes the whole subtree
+	// contribution out of every ancestor via maintainIndexesOnDeleteLocked
+	// (whole-sum, not delta) BEFORE these deletes run. TestPendingInputMutation-
+	// ExclusiveOwner names this function in its allowlist for that reason.
 	delete(s.perms, id)
 	delete(s.questions, id)
 	delete(s.statuses, id)
@@ -685,7 +677,6 @@ func (s *Store) deleteSessionLocked(id string) {
 	delete(s.children, id) // direct-child list (already emptied by orphaning)
 	delete(s.subtreeRetryCount, id)
 	delete(s.subtreePendingInput, id)
-	delete(s.pendingInputSelf, id)
 	delete(s.subtreeDescendantCount, id)
 	delete(s.lastActivityAt, id)
 	delete(s.subtreeNewestActivity, id)
@@ -730,21 +721,16 @@ func (s *Store) SetPendingQuestions(requests []json.RawMessage) {
 			continue
 		}
 		seen[e.SessionID+"\x00"+e.ID] = true
-		if s.questions[e.SessionID] == nil {
-			s.questions[e.SessionID] = map[string]json.RawMessage{}
-		}
-		s.questions[e.SessionID][e.ID] = raw
-		// Phase 1 (Gate C extension): pending-input chokepoint (per add).
-		s.notePendingInputChangeLocked(e.SessionID)
-		s.emit(KindQuestionSet, raw)
+		// M2/L-06: setQuestionLocked owns the write + subtreePendingInput delta
+		// + KindQuestionSet emit (per add in the reconcile).
+		s.setQuestionLocked(e.SessionID, e.ID, raw)
 	}
 	for sid, m := range s.questions {
 		for id := range m {
 			if !seen[sid+"\x00"+id] {
-				delete(m, id)
-				// Phase 1 (Gate C extension): pending-input chokepoint (per delete).
-				s.notePendingInputChangeLocked(sid)
-				s.emit(KindQuestionClear, rawObj(map[string]interface{}{"sessionID": sid, "questionID": id}))
+				// M2/L-06: clearQuestionLocked owns the clear + delta +
+				// KindQuestionClear emit (per drop in the reconcile).
+				s.clearQuestionLocked(sid, id)
 			}
 		}
 	}
@@ -763,21 +749,16 @@ func (s *Store) SetPendingPermissions(requests []json.RawMessage) {
 			continue
 		}
 		seen[e.SessionID+"\x00"+e.ID] = true
-		if s.perms[e.SessionID] == nil {
-			s.perms[e.SessionID] = map[string]json.RawMessage{}
-		}
-		s.perms[e.SessionID][e.ID] = raw
-		// Phase 1 (Gate C extension): pending-input chokepoint (per add).
-		s.notePendingInputChangeLocked(e.SessionID)
-		s.emit(KindPermissionSet, raw)
+		// M2/L-06: setPermissionLocked owns the write + subtreePendingInput
+		// delta + KindPermissionSet emit (per add in the reconcile).
+		s.setPermissionLocked(e.SessionID, e.ID, raw)
 	}
 	for sid, m := range s.perms {
 		for id := range m {
 			if !seen[sid+"\x00"+id] {
-				delete(m, id)
-				// Phase 1 (Gate C extension): pending-input chokepoint (per delete).
-				s.notePendingInputChangeLocked(sid)
-				s.emit(KindPermissionClear, rawObj(map[string]interface{}{"sessionID": sid, "permissionID": id}))
+				// M2/L-06: clearPermissionLocked owns the clear + delta +
+				// KindPermissionClear emit (per drop in the reconcile).
+				s.clearPermissionLocked(sid, id)
 			}
 		}
 	}

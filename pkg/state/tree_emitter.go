@@ -215,7 +215,11 @@ func (e *TreeEmitter) buildNodeLocked(id string, loaded bool) (Node, bool) {
 		Loaded:     loaded,
 		UpdatedMs:  updatedMsFromInfo(se.info),
 		Flags: NodeFlags{
-			PendingInput:      s.pendingInputSelf[id] > 0,
+			// M2/L-06: PendingInput is read DIRECTLY from the maps via
+			// pendingInputSelfLocked (authoritative — no shadow lag). The retired
+			// pendingInputSelf shadow is gone; the helper-owned delta keeps
+			// subtreePendingInput (SubtreeNeedsInput, below) correct.
+			PendingInput:      s.pendingInputSelfLocked(id) > 0,
 			SubtreeNeedsInput: s.subtreePendingInput[id] > 0,
 			SubtreeBusy:       s.subtreeBusyCount[id] > 0,
 			Permission:        len(s.perms[id]) > 0,
@@ -264,7 +268,11 @@ func isActiveLocked(s *Store, id string) bool {
 	if a == ActivityBusy || a == ActivityRetry || a == ActivityError {
 		return true
 	}
-	if len(s.perms[id]) > 0 || s.pendingInputSelf[id] > 0 {
+	// M2/L-06: re-derive the pending-input contribution directly from the maps
+	// (pendingInputSelfLocked), replacing the retired pendingInputSelf shadow.
+	// The former `len(s.perms[id])>0 || pendingInputSelf[id]>0` collapses to
+	// pendingInputSelfLocked (which already ORs perms and questions).
+	if s.pendingInputSelfLocked(id) > 0 {
 		return true
 	}
 	return false

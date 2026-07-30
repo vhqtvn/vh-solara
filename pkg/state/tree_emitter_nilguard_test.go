@@ -179,8 +179,8 @@ func TestEmitter_QuestionFacet_HappyPath_AncestorWalk(t *testing.T) {
 	e := NewTreeEmitter(s, "/proj")
 	_ = e.SnapshotFrontier("cold") // e.known[R|A|Q] = true
 
-	// Pending question on Q → notePendingInputChangeLocked flips
-	// subtreePendingInput[A] and subtreePendingInput[R] > 0.
+	// Pending question on Q → setQuestionLocked flips subtreePendingInput[A]
+	// and subtreePendingInput[R] > 0.
 	s.Apply(ev("question.asked", evQuestionAsked("Q", "q1")))
 	qset := lastEventOfKind(t, s, KindQuestionSet)
 

@@ -624,14 +624,15 @@ type Store struct {
 	// id's subtree including id itself (stub wire field "descendantCount").
 	// subtreeRetryCount / subtreePendingInput[id] = the count of retry /
 	// pending-input sessions in id's subtree incl id (sum-class aggregates, same
-	// shape as subtreeBusyCount; pendingInputSelf is the per-session 0/1 shadow
-	// so notePendingInputChangeLocked can resolve a delta without re-deriving
-	// the prior self from the already-mutated perms/questions maps).
+	// shape as subtreeBusyCount). subtreePendingInput is maintained by the
+	// EXCLUSIVE-OWNER helper family in subtree_indexes.go (setPermissionLocked
+	// / clearPermissionLocked / setQuestionLocked / clearQuestionLocked) which
+	// captures wasPending itself, so no per-session old-self shadow is kept
+	// (remediation M2 / audit L-06 retired the former pendingInputSelf field).
 	children               map[string][]string // parentID→ordered child ids; ""=roots (in sync with rootIDs)
 	rootIDs                []string            // ordered live roots (orphans included)
 	subtreeRetryCount      map[string]int
 	subtreePendingInput    map[string]int
-	pendingInputSelf       map[string]int // per-session own (0/1); delta-resolution shadow for subtreePendingInput
 	subtreeDescendantCount map[string]int // live nodes in subtree incl self
 	// MAX class — subtreeNewestActivity. lastActivityAt[id] = id's own last
 	// real activity time (zero = never; bumped ONLY in setActivityLocked on a
@@ -702,6 +703,39 @@ type Store struct {
 	// persists for the session lifetime (marks "history was loaded"),
 	// coldFetchActive is a transient in-flight window.
 	coldFetchActive map[string]bool
+	// pendingEmptyNewest / confirmedEmptyNewest distinguish a newest COMPLETED
+	// assistant message with zero resident parts that is SOURCE TRUTH (the
+	// server genuinely has no parts for that turn — e.g. a finished turn whose
+	// only output was consumed/dropped upstream) from a TRANSIENT GAP (a
+	// schema-drift cold load that returned an envelope-only message while the
+	// opencode DB actually has its parts, or a live race where a newer
+	// assistant turn completed via message.upsert after the fetch but its
+	// parts — which arrive via separate part.append events — have not streamed
+	// yet). The resident-parts gate added in 3b3860e forces a re-fetch for ANY
+	// zero-parts newest completed assistant to recover the schema-drift parts,
+	// but a single fetch returning zero parts is AMBIGUOUS: it cannot tell a
+	// lying cold load from a faithful one. Only a SECOND authoritative
+	// reconcile observing the SAME empty newest id confirms source truth — the
+	// schema-drift shape instead resolves via the len(parts)>0 branch once the
+	// re-fetch serves the real parts. Tracking is therefore two-stage:
+	//   - pendingEmptyNewest[sid]   = newest-completed-assistant id seen empty
+	//                                 in the MOST RECENT reconcile (awaiting
+	//                                 confirmation); and
+	//   - confirmedEmptyNewest[sid] = that same id once a SECOND reconcile
+	//                                 observed it empty again (source truth).
+	// Both are set inside reconcileMessagesLocked (under s.mu — no new lock)
+	// and read by latestAssistantResidentLocked, which admits a zero-parts
+	// newest only when its id equals confirmedEmptyNewest[sid]. The aggregator
+	// (EnsureMessages / EnsureMessagesAsync) performs ONE bounded
+	// disambiguating re-fetch when a fetch leaves the session not-loaded
+	// specifically because of an unconfirmed empty newest, so the
+	// schema-drift↔source-truth distinction resolves within a single open
+	// (neither loops forever on a genuinely-empty turn nor silently serves a
+	// lying cold load). Cleared on session delete so a recreated id re-confirms.
+	// Mirrors the 3b3860e derivation (itself in the spirit of the busyCount
+	// retirement c4c4ef1: derive from source, not a cached flag).
+	pendingEmptyNewest   map[string]string // sid → empty newest-completed-assistant id seen in the most recent reconcile (awaiting confirmation)
+	confirmedEmptyNewest map[string]string // sid → empty newest-completed-assistant id confirmed by ≥2 reconciles (source truth)
 	// seeded marks sessions whose lastAgent has already been cold-seeded by the
 	// aggregator (via a lightweight message-tail fetch during hydrate). It makes
 	// the cold-seed fire-once-per-session for the aggregator's lifetime instead
@@ -885,7 +919,6 @@ func NewWithConfig(cfg Config) (*Store, error) {
 		children:               map[string][]string{},
 		subtreeRetryCount:      map[string]int{},
 		subtreePendingInput:    map[string]int{},
-		pendingInputSelf:       map[string]int{},
 		subtreeDescendantCount: map[string]int{},
 		lastActivityAt:         map[string]time.Time{},
 		subtreeNewestActivity:  map[string]time.Time{},
@@ -893,6 +926,8 @@ func NewWithConfig(cfg Config) (*Store, error) {
 		msgLoaded:              map[string]bool{},
 		msgRev:                 map[string]uint64{},
 		coldFetchActive:        map[string]bool{},
+		pendingEmptyNewest:     map[string]string{},
+		confirmedEmptyNewest:   map[string]string{},
 		seeded:                 map[string]bool{},
 		recentlyArchived:       map[string]time.Time{},
 		ring:                   newRingBuffer(cfg.RingCapacity),
