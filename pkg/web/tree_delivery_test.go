@@ -10,12 +10,15 @@ package web
 //     reached (committed cache unchanged);
 //   - empty ops: no Write, no error.
 //
-// The marshal-failure branch is exercised at the op level in
-// pkg/state/tree_emitter_prepare_test.go (TestPrepare_MarshalFailureIsRejectable):
-// an unexported-method interface (state.TreeOp) cannot be satisfied by a type in
-// package web, so the faulty op must live in package state. The branch shares
-// deliverTreeOps's "return err before any Commit" guard, which the write/short
-// tests below prove.
+// The marshal-failure branch is exercised BOTH at the op level (pkg/state/
+// tree_emitter_prepare_test.go: TestPrepare_MarshalFailureIsRejectable, which
+// pins the precondition that a TreeOp CAN fail to marshal) AND at the
+// deliverTreeOps boundary below (TestDeliver_MarshalFailure_NoWriteNoCommit).
+// A new faulty op type cannot be defined in package web — TreeOp's unexported
+// methods (assignSeq/setDir/setSessionHint) forbid it — but the EXPORTED op
+// types are real TreeOps (via embedded baseOp), and NodeUpsert's Node.Verb.State
+// (json.RawMessage) is the one field that fails to marshal when fed invalid
+// bytes. That reaches the boundary branch from outside package state.
 //
 // The committed-cache invariant is proven BEHAVIORALLY here (no new test
 // accessors): a subsequent delete produces node.remove for C IFF C was
@@ -117,6 +120,30 @@ func hasRemoveOp(ops []state.TreeOp) bool {
 		}
 	}
 	return false
+}
+
+// marshalFailTreeOp constructs an EXPORTED TreeOp whose MarshalJSON fails. It is
+// the only way to reach deliverTreeOps's marshal-failure branch from package
+// web: TreeOp's unexported methods (assignSeq/setDir/setSessionHint) forbid
+// defining a new faulty op type here, but the exported NodeUpsert is a real
+// TreeOp (via its embedded baseOp). Its Node.Verb.State is a json.RawMessage,
+// the one field that fails to marshal when fed invalid bytes — json.Marshal
+// rejects the raw message at the compact step. (Verified: the op both satisfies
+// state.TreeOp at compile time and returns a marshal error at run time.)
+func marshalFailTreeOp(t *testing.T) state.TreeOp {
+	t.Helper()
+	op := state.NodeUpsertOp(state.Node{
+		ID:   "marshal-fail",
+		Verb: &state.VerbFacet{State: json.RawMessage("<<not-valid-json>>")},
+	})
+	// Compile-time: exported op satisfies TreeOp despite the unexported methods.
+	var _ state.TreeOp = op
+	// Runtime guard: the fixture must actually fail to marshal, or this test
+	// silently stops covering the marshal branch.
+	if _, err := json.Marshal(op); err == nil {
+		t.Fatalf("marshalFailTreeOp: op must fail to marshal (marshal branch is dead otherwise)")
+	}
+	return op
 }
 
 // ---------------------------------------------------------------------------
@@ -240,6 +267,61 @@ func TestDeliver_ShortWrite_LeavesUncommitted(t *testing.T) {
 	delPrepared, _ := e.Prepare(delEv)
 	if hasRemoveOp(delPrepared.Ops) {
 		t.Errorf("short-write delivery must NOT commit: delete of C unexpectedly emitted node.remove; got %v", opKindsWeb(delPrepared.Ops))
+	}
+}
+
+// TestDeliver_MarshalFailure_NoWriteNoCommit asserts the marshal-failure branch
+// of deliverTreeOps: a prepared op that fails to json.Marshal must
+//   - return a non-nil error (the documented "caller MUST abort the stream" signal);
+//   - write ZERO bytes to the wire — ALL frames are marshaled into one buffer
+//     BEFORE any write, so a marshal failure puts nothing on the wire even when
+//     earlier ops in the same event marshaled fine;
+//   - leave the committed emitter cache unchanged (Commit is never reached): a
+//     later delete of C emits no node.remove (C never became committed-known).
+//
+// This complements the write-error / short-write tests: those fail at the Write
+// step; this fails one step earlier (marshal), proving the all-or-nothing
+// buffering holds when SOME ops marshal fine before a later one fails. The
+// op-level precondition (a TreeOp can fail to marshal) is pinned in
+// pkg/state/tree_emitter_prepare_test.go (TestPrepare_MarshalFailureIsRejectable).
+func TestDeliver_MarshalFailure_NoWriteNoCommit(t *testing.T) {
+	e, store := mkDeliveryEmitter(t)
+	applyCreate(store, "C", "R")
+	createEv := lastStoreEvent(t, store, state.KindSessionUpsert)
+	prepared, err := e.Prepare(createEv)
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	if len(prepared.Ops) == 0 {
+		t.Fatalf("fixture: expected ops for child create under loaded R")
+	}
+	// Append a marshal-failing op AFTER the real ops so the buffer is partially
+	// built before the failure — proving the partial buffer is discarded and
+	// nothing reaches the wire.
+	prepared.Ops = append(prepared.Ops, marshalFailTreeOp(t))
+
+	var cw countingWriter
+	err = deliverTreeOps(&cw, e, prepared)
+	if err == nil {
+		t.Fatalf("marshal-failure delivery: want non-nil error, got nil")
+	}
+	if !strings.Contains(err.Error(), "marshal") {
+		t.Errorf("error should mention marshal, got %q", err.Error())
+	}
+	// Wire untouched: zero Write calls AND zero bytes (the single checked Write
+	// is gated behind the full marshal loop, so a marshal failure never writes).
+	if cw.writes != 0 {
+		t.Errorf("marshal failure: want 0 Write calls, got %d", cw.writes)
+	}
+	if cw.buf.Len() != 0 {
+		t.Errorf("marshal failure: want 0 bytes on wire, got %d", cw.buf.Len())
+	}
+	// Commit NOT reached: deleting C emits no node.remove (C is not committed-known).
+	applyDelete(store, "C")
+	delEv := lastStoreEvent(t, store, state.KindSessionDelete)
+	delPrepared, _ := e.Prepare(delEv)
+	if hasRemoveOp(delPrepared.Ops) {
+		t.Errorf("marshal failure must NOT commit: delete of C unexpectedly emitted node.remove; got %v", opKindsWeb(delPrepared.Ops))
 	}
 }
 
