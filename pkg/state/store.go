@@ -512,15 +512,18 @@ type Store struct {
 	// Finished-unread tracking. The per-root busy aggregate is derived from the
 	// incremental subtreeBusyCount index (single source of truth — see
 	// RunningRoots); when a root's subtree goes fully idle the root is marked
-	// unread (a finished task awaiting acknowledgement). suppressUnread guards
-	// the hydrate reconcile. The mark/clear is driven from setActivityAtLocked
-	// (the busy↔non-busy chokepoint), reading subtreeBusyCount[root] before/after
-	// the delta. (The legacy root-keyed busyCount was RETIRED: it had asymmetric
-	// maintenance — a reparent gap and a phantom-status gap — that let
-	// RunningRoots diverge from per-session activity and report a phantom
-	// running root. subtreeBusyCount has neither gap.)
-	unread         map[string]bool
-	suppressUnread bool
+	// unread (a finished task awaiting acknowledgement). The finished mark is
+	// governed by an EXPLICIT per-transition markOnIdle policy threaded into
+	// setActivityAtLocked (M9/L-16): ordinary completions mark, status-reconcile
+	// does not — replacing the retired ambient Store.suppressUnread flag. The
+	// mark/clear is driven from setActivityAtLocked (the busy↔non-busy
+	// chokepoint), reading subtreeBusyCount[root] before/after the delta, and
+	// targets `root` (root-scoped reach is by design — audit L-13). (The legacy
+	// root-keyed busyCount was RETIRED: it had asymmetric maintenance — a
+	// reparent gap and a phantom-status gap — that let RunningRoots diverge from
+	// per-session activity and report a phantom running root. subtreeBusyCount
+	// has neither gap.)
+	unread map[string]bool
 	// Completion-grace window + completion-authority guard (Lane A fix for the
 	// stale "1 running" strand). When an assistant turn COMPLETES without a
 	// timely session.idle, the root's busy aggregate (subtreeBusyCount[root])

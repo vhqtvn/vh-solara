@@ -71,9 +71,12 @@ func normalizeActivity(statusType string) string {
 // when it changes. Caller must hold s.mu.
 // setActivityLocked records an activity transition using the REAL wall-clock
 // now (the live Apply path). It is the original entry point; the at-parameterized
-// variant below is the O1 fix path used by status-reconcile/hydrate.
+// variant below is the O1 fix path used by status-reconcile/hydrate. It carries
+// markOnIdle=true: every ordinary completion path (MarkIdle/abort, Apply
+// idle|error|status, message & part-delta escalation, graceFire) is a real
+// finish and may mark the root finished-unread.
 func (s *Store) setActivityLocked(sessionID, st string) {
-	s.setActivityAtLocked(sessionID, st, time.Now())
+	s.setActivityAtLocked(sessionID, st, time.Now(), true)
 }
 
 // setActivityAtLocked is setActivityLocked with an explicit activity timestamp
@@ -88,7 +91,23 @@ func (s *Store) setActivityLocked(sessionID, st string) {
 // stampTime is `at` when it carries upstream recency (non-zero), else real now
 // (original behavior for the live Apply path, which passes time.Now(), and for
 // sessions whose info lacks time.updated).
-func (s *Store) setActivityAtLocked(sessionID, st string, at time.Time) {
+//
+// markOnIdle is the EXPLICIT per-transition unread policy (M9/L-16). It carries,
+// per transition, the decision the retired ambient Store.suppressUnread flag
+// used to encode Store-wide: whether a busy→idle flip that fully idles a root's
+// subtree may mark that root finished-unread. The ordinary completion paths
+// (MarkIdle/abort, Apply idle|error|status, message & part-delta escalation,
+// graceFire) pass true (a real turn finished → mark the root for ack). The
+// status-reconcile path (SetActivityFromStatuses — the /session/status snapshot
+// reconcile on (re)hydrate) passes false: clearing busy from a reconstructed
+// snapshot is NOT a real completion and must not flag every idle root unread.
+//
+// Root-scoped reach is BY DESIGN (audit L-13, closed as such): the unread mark
+// targets `root` (rootOfLocked), not `sessionID` — a finished subagent's whole
+// root subtree is what the operator acknowledges. Count maintenance
+// (subtreeBusyCount deltas, the running-again clearUnreadLocked) is UNCONDITIONAL
+// and runs regardless of markOnIdle; only the finished mark is policy-gated.
+func (s *Store) setActivityAtLocked(sessionID, st string, at time.Time, markOnIdle bool) {
 	// Archive tombstone (Issue 4 B-i): a busy status for a recently-archived
 	// id (the subagent is still running) must NOT record activity or emit for
 	// it — otherwise the periodic status reconcile re-marks it busy →
@@ -186,7 +205,13 @@ func (s *Store) setActivityAtLocked(sessionID, st string, at time.Time) {
 				s.clearUnreadLocked(root) // running again — no longer a stale "finished"
 			}
 		} else {
-			if s.subtreeBusyCount[root] == 0 && !s.suppressUnread {
+			// Finished-unread mark is gated by the explicit per-transition
+			// markOnIdle policy (M9/L-16): an ordinary completion marks the
+			// root; a status-reconcile (markOnIdle=false) does not. The mark
+			// targets `root` (rootOfLocked), not sessionID — root-scoped reach
+			// is by design (audit L-13, closed as by-design: a finished
+			// subagent's whole root subtree is what the operator acknowledges).
+			if s.subtreeBusyCount[root] == 0 && markOnIdle {
 				s.markUnreadLocked(root) // a finished task awaiting acknowledgement
 			}
 		}
@@ -210,7 +235,10 @@ func (s *Store) clearUnreadLocked(id string) {
 }
 
 // AckUnread clears a root's finished-unread flag (the client scrolled it to the
-// bottom). The id may be any session in the subtree; its root is acked.
+// bottom). The id may be any session in the subtree; its ROOT is acked —
+// finished-unread reach is root-scoped BY DESIGN (audit L-13, closed as such):
+// a finished subagent's whole root subtree is what the operator acknowledges,
+// and the matching finished mark (setActivityAtLocked) targets the same root.
 func (s *Store) AckUnread(sessionID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -241,9 +269,10 @@ func (s *Store) SetActivityFromStatuses(statuses map[string]json.RawMessage) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	// Reconciling activity on (re)hydrate must not spuriously flag sessions as
-	// finished-unread (subtreeBusyCount still tracks correctly, just don't mark).
-	s.suppressUnread = true
-	defer func() { s.suppressUnread = false }()
+	// finished-unread: the busy/clear transitions below call setActivityAtLocked
+	// with markOnIdle=false (M9/L-16), the explicit per-transition policy that
+	// replaced the retired ambient Store.suppressUnread flag. subtreeBusyCount
+	// still tracks correctly; only the finished-unread mark is suppressed.
 	busy := map[string]bool{}
 	for sid, raw := range statuses {
 		var st struct {
@@ -268,7 +297,9 @@ func (s *Store) SetActivityFromStatuses(statuses map[string]json.RawMessage) {
 		// promoted into the recent-activity window. Falls back to now when the
 		// session or its time.updated is absent/zero.
 		at := activityTimeFromSessionLocked(s, sid)
-		s.setActivityAtLocked(sid, a, at)
+		// markOnIdle=false: a status-snapshot reconcile is NOT a real
+		// completion, so it must not flag the root finished-unread (M9/L-16).
+		s.setActivityAtLocked(sid, a, at, false)
 		if a != ActivityIdle {
 			busy[sid] = true
 		}
@@ -280,7 +311,9 @@ func (s *Store) SetActivityFromStatuses(statuses map[string]json.RawMessage) {
 	// shadowing the Go 1.21+ builtin clear (this repo is Go 1.25).
 	clearActivity := func(sid string) {
 		if !busy[sid] {
-			s.setActivityAtLocked(sid, ActivityIdle, activityTimeFromSessionLocked(s, sid))
+			// markOnIdle=false: clearing busy from a reconstructed status
+			// snapshot is not a real completion (M9/L-16).
+			s.setActivityAtLocked(sid, ActivityIdle, activityTimeFromSessionLocked(s, sid), false)
 		}
 	}
 	for sid := range s.sessions {
