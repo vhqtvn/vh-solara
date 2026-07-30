@@ -1168,6 +1168,67 @@ function main() {
             );
         }
 
+        // Listing resilience regression (debate #10): a single malformed card
+        // must NOT abort enumeration. Write an intentionally-invalid ready
+        // card directly to disk (bypassing saveCoordinationTask's validation)
+        // — non-draft status with success_criteria omitted — then assert the
+        // listing surfaces it in skipped_cards instead of throwing, while
+        // valid sibling cards remain listable.
+        const invalidTaskID = `${prefix}-invalid-ready-card`;
+        const invalidPayload = {
+            task_id: invalidTaskID,
+            title: "Intentionally invalid ready card (missing success_criteria)",
+            task_type: "study",
+            coordination_mode: "short",
+            primary_lane: "queueing",
+            status: "ready",
+            session_aliases: [],
+            active_session_alias: null,
+            claimed_at: null,
+            report_paths: [],
+            review_paths: [],
+            history: [],
+            created_at: "2026-07-30T00:00:00Z",
+            updated_at: "2026-07-30T00:00:00Z",
+            files_in_scope: ["tests/fixtures/example-pkg/"],
+            validation_plan: [
+                "Never runs — fixture for listing-resilience regression.",
+            ],
+        };
+        fs.writeFileSync(
+            taskCardPath(invalidTaskID),
+            JSON.stringify(invalidPayload, null, 2),
+        );
+        createdTaskIDs.push(invalidTaskID);
+
+        const resilientList = listCoordinationTasks(coordinatorSessionID, {
+            cwd: "/verification",
+            statuses: ["ready"],
+        });
+        const skippedInvalid = resilientList.skipped_cards.find(
+            (entry) => entry.task_id === invalidTaskID,
+        );
+        if (!skippedInvalid) {
+            throw new StateError(
+                "Expected the intentionally-invalid card to be reported in skipped_cards instead of aborting the listing.",
+            );
+        }
+        if (!String(skippedInvalid.error || "").includes("success_criteria")) {
+            throw new StateError(
+                `Expected skipped_cards error to name the missing success_criteria field, got "${skippedInvalid.error}".`,
+            );
+        }
+        if (resilientList.tasks.some((task) => task.task_id === invalidTaskID)) {
+            throw new StateError(
+                "Expected the invalid card to be skipped, not listed.",
+            );
+        }
+        if (!resilientList.tasks.length) {
+            throw new StateError(
+                "Expected valid ready tasks to remain listable alongside the invalid card.",
+            );
+        }
+
         console.log("verification: ok");
         console.log(`primary_task_id: ${primary.task.task_id}`);
         console.log(`overlap_task_id: ${overlap.task.task_id}`);

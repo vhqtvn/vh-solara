@@ -3498,22 +3498,39 @@ function loadCoordinationTask(taskIDRaw, options = {}) {
     };
 }
 
-function listCoordinationTaskCards() {
+function listCoordinationTaskCards(options = {}) {
     ensureLocalCoordinatorNamespace();
     const files = fs.existsSync(localCoordinatorTasksRoot())
         ? fs.readdirSync(localCoordinatorTasksRoot())
         : [];
-    return files
-        .filter((name) => name.endsWith(".json"))
-        .map((name) => {
-            const taskID = name.replace(/\.json$/, "");
-            return loadCoordinationTask(taskID).payload;
-        })
-        .sort((left, right) => {
-            const leftUpdated = String(left.updated_at || left.created_at || "");
-            const rightUpdated = String(right.updated_at || right.created_at || "");
-            return rightUpdated.localeCompare(leftUpdated);
-        });
+    // enumerate-the-good, report-the-bad: a single malformed legacy card must
+    // NOT abort the whole listing. Single-card reads (loadCoordinationTask,
+    // used by read/resume/activate) still throw so an explicit open surfaces
+    // the error; only enumeration is tolerant. Pass { collectSkipped: [] } to
+    // receive a per-card report of what was skipped and why.
+    const collectSkipped = Array.isArray(options.collectSkipped)
+        ? options.collectSkipped
+        : null;
+    const cards = [];
+    for (const name of files.filter((entry) => entry.endsWith(".json"))) {
+        const taskID = name.replace(/\.json$/, "");
+        try {
+            cards.push(loadCoordinationTask(taskID).payload);
+        } catch (error) {
+            if (collectSkipped) {
+                collectSkipped.push({
+                    task_id: taskID,
+                    path: coordinationTaskPath(taskID),
+                    error: error instanceof Error ? error.message : String(error),
+                });
+            }
+        }
+    }
+    return cards.sort((left, right) => {
+        const leftUpdated = String(left.updated_at || left.created_at || "");
+        const rightUpdated = String(right.updated_at || right.created_at || "");
+        return rightUpdated.localeCompare(leftUpdated);
+    });
 }
 
 function updateCoordinationTask(taskIDRaw, updateFn) {
@@ -4038,7 +4055,10 @@ function listCoordinationTasks(sessionID, options = {}) {
             "task_statuses",
         ),
     );
-    const tasks = listCoordinationTaskCards().filter((task) =>
+    const skipped_cards = [];
+    const tasks = listCoordinationTaskCards({
+        collectSkipped: skipped_cards,
+    }).filter((task) =>
         statuses.length ? statuses.includes(task.status) : true,
     );
     const counts = {};
@@ -4049,6 +4069,7 @@ function listCoordinationTasks(sessionID, options = {}) {
         ...actor,
         total: tasks.length,
         status_counts: counts,
+        skipped_cards,
         tasks: tasks.map((task) => ({
             ...summarizeCoordinationTask(task),
             ...recommendedCoordinationTaskFields(
