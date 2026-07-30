@@ -33,6 +33,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/vhqtvn/vh-solara/pkg/opencode"
 	"github.com/vhqtvn/vh-solara/pkg/projectcfg"
 	"github.com/vhqtvn/vh-solara/pkg/vhlog"
 )
@@ -80,6 +81,17 @@ type QueueSendConfig struct {
 // monotonic FIFO commit sequence. OriginClientID is diagnostics-only and MUST
 // NOT affect ordering, visibility, or dispatch eligibility.
 //
+// OpencodeMsgID is the authoritative correlation ID minted once at Enqueue (via
+// opencode.MintMessageID, replicating sst/opencode's Identifier.ascending
+// "message" format). It is threaded into prompt_async's `messageID` body field
+// so OpenCode persists the dispatched user message with this EXACT id, and
+// later looked up via GET /session/:sid/message/:mid to reconcile
+// delivered-but-stuck items (dispatching/unknown → sent). omitempty for on-disk
+// backward compatibility: a queue.json persisted before this field existed
+// deserializes with OpencodeMsgID=="" and the reconciler simply skips it (no
+// correlation id → no exact-match lookup → fail-closed, never resend). NEVER
+// reused across enqueues; never derived from text; never regenerated.
+//
 // DispatchStartedAt records when Claim() transitioned the item to `dispatching`.
 // It is the timestamp stale-dispatch recovery (recoverStaleDispatchingLocked)
 // uses to detect abandoned dispatches after a network failure, browser crash,
@@ -97,6 +109,7 @@ type QueueItem struct {
 	Attachments       []QueueAttachment `json:"attachments"`
 	SendConfig        QueueSendConfig   `json:"sendConfig,omitempty"`
 	OriginClientID    string            `json:"originClientId,omitempty"`
+	OpencodeMsgID     string            `json:"opencodeMsgID,omitempty"`
 	CreatedAt         int64             `json:"createdAt"`
 	DispatchStartedAt int64             `json:"dispatchStartedAt,omitempty"`
 	ResolvedAt        int64             `json:"resolvedAt,omitempty"`
@@ -618,7 +631,14 @@ func (s *sessionQueueStore) Enqueue(text string, attachments []QueueAttachment, 
 		Attachments:    attachments,
 		SendConfig:     cfg,
 		OriginClientID: originClientID,
-		CreatedAt:      time.Now().UnixMilli(),
+		// Mint the OpenCode correlation ID ONCE here (backend-authoritative):
+		// it survives reload and session-switch, which is why the backend owns
+		// it rather than a FE-only listener. Fresh per enqueue (never reused),
+		// never derived from text, never regenerated after a timeout. Threaded
+		// into prompt_async's `messageID` body field at dispatch; looked up via
+		// GET /session/:sid/message/:mid to reconcile delivered-but-stuck items.
+		OpencodeMsgID: opencode.MintMessageID(),
+		CreatedAt:     time.Now().UnixMilli(),
 	}
 	s.items = append(s.items, item)
 	if err := s.save(); err != nil {

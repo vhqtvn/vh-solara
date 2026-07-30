@@ -417,13 +417,23 @@ func (f *FakeOpenCode) UserMessageCount(sessionID string) int {
 // response. Single lock acquisition makes the commit atomic with the counter
 // allocation. Does NOT emit events or start an assistant turn — the dispatch is
 // considered lost, so no assistant reply streams.
-func (f *FakeOpenCode) commitUserMessage(sessionID, text string) int {
+//
+// messageID mirrors real OpenCode's caller-id-wins prompt_async contract
+// (input.messageID ?? MessageID.ascending()): when the caller supplies a
+// non-empty, msg_-prefixed id (vh-solara's queue correlation id, Slice 5), the
+// user message is persisted with that EXACT id so a later
+// GET /session/:sid/message/:mid finds it. Empty → the fake mints its own u%n
+// (the pre-Slice-5 path).
+func (f *FakeOpenCode) commitUserMessage(sessionID, text, messageID string) int {
 	now := float64(time.Now().UnixMilli())
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.counter++
 	n := f.counter
-	userID := fmt.Sprintf("u%d", n)
+	userID := messageID
+	if userID == "" {
+		userID = fmt.Sprintf("u%d", n)
+	}
 	upID := fmt.Sprintf("up%d", n)
 	userInfo := map[string]any{"id": userID, "sessionID": sessionID, "role": "user",
 		"time": map[string]any{"created": now, "completed": now}}
@@ -828,7 +838,7 @@ func (f *FakeOpenCode) handleSession(w http.ResponseWriter, r *http.Request) {
 	case action == "message" && r.Method == http.MethodPost:
 		body := map[string]any{}
 		_ = json.NewDecoder(r.Body).Decode(&body)
-		go f.simulatePrompt(id, promptText(body))
+		go f.simulatePrompt(id, promptText(body), promptMessageID(body))
 		writeJSON(w, map[string]any{"ok": true})
 		return
 	case action == "prompt_async" && r.Method == http.MethodPost:
@@ -840,6 +850,11 @@ func (f *FakeOpenCode) handleSession(w http.ResponseWriter, r *http.Request) {
 		body := map[string]any{}
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		text := promptText(body)
+		// messageID is vh-solara's queue correlation id (Slice 5), threaded in
+		// by the dispatch path. Real OpenCode persists the user message with
+		// this EXACT id (caller-id-wins); the fake honors it identically so a
+		// later GET /session/:sid/message/:mid can reconcile the item.
+		messageID := promptMessageID(body)
 		f.mu.Lock()
 		mode := f.promptAsyncMode
 		f.mu.Unlock()
@@ -850,7 +865,7 @@ func (f *FakeOpenCode) handleSession(w http.ResponseWriter, r *http.Request) {
 			// in `dispatching`: OpenCode recorded the turn but the caller never
 			// got the 204, so it can never resolve to sent/failed. No assistant
 			// turn is started — the dispatch is considered lost.
-			f.commitUserMessage(id, text)
+			f.commitUserMessage(id, text, messageID)
 			f.dropResponse(w)
 			return
 		case PromptAsyncRejectBeforeCommit:
@@ -860,7 +875,7 @@ func (f *FakeOpenCode) handleSession(w http.ResponseWriter, r *http.Request) {
 			return
 		default:
 			// PromptAsyncNormal: the faithful path.
-			go f.simulatePrompt(id, text)
+			go f.simulatePrompt(id, text, messageID)
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
@@ -939,6 +954,16 @@ func promptText(body map[string]any) string {
 		}
 	}
 	return "(empty prompt)"
+}
+
+// promptMessageID extracts the caller-supplied OpenCode message id
+// (prompt_async's optional `messageID` body field) — vh-solara's queue
+// correlation id (Slice 5). Empty when absent (the pre-Slice-5 path; the fake
+// then mints its own u%n). Real OpenCode persists the user message with this
+// EXACT id (caller-id-wins on v1.17.8); the fake honors it identically.
+func promptMessageID(body map[string]any) string {
+	mid, _ := body["messageID"].(string)
+	return mid
 }
 
 // --- event stream + streaming simulation ---
@@ -1043,14 +1068,22 @@ func (f *FakeOpenCode) emit(eventType string, props any) {
 // simulatePrompt mimics a live turn: append the user message, then stream an
 // assistant text part in chunks, then mark it complete. Also persists to the
 // message store so a reload reflects the turn.
-func (f *FakeOpenCode) simulatePrompt(sessionID, text string) {
+//
+// messageID mirrors real OpenCode's caller-id-wins prompt_async contract: when
+// non-empty, the user message is persisted with that EXACT id (vh-solara's
+// queue correlation id, Slice 5) so a later GET /session/:sid/message/:mid
+// finds it. Empty → the fake mints its own u%n.
+func (f *FakeOpenCode) simulatePrompt(sessionID, text, messageID string) {
 	now := func() float64 { return float64(time.Now().UnixMilli()) }
 	f.mu.Lock()
 	f.counter++
 	n := f.counter
 	f.mu.Unlock()
 
-	userID := fmt.Sprintf("u%d", n)
+	userID := messageID
+	if userID == "" {
+		userID = fmt.Sprintf("u%d", n)
+	}
 	asstID := fmt.Sprintf("a%d", n)
 	upID := fmt.Sprintf("up%d", n)
 	apID := fmt.Sprintf("ap%d", n)

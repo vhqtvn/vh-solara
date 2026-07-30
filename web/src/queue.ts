@@ -45,6 +45,13 @@ export interface QueuedMessage {
   // change a queued message.
   sendConfig?: { providerID?: string; modelID?: string; variant?: string; agent?: string };
   originClientId?: string;
+  // Backend-minted OpenCode message-ID correlation key (the exact id OpenCode
+  // will persist the dispatched user message under, via prompt_async's
+  // `messageID` body field — caller-id-wins on v1.17.18). Optional for backward
+  // compat with in-flight items persisted before this field shipped. The drainer
+  // threads it into the dispatch POST so a later exact GET
+  // /session/:sid/message/:mid can reconcile delivered-but-stuck items.
+  opencodeMsgID?: string;
   createdAt: number;
   resolvedAt?: number;
   // Failure / ambiguous detail for failed | unknown (diagnostics).

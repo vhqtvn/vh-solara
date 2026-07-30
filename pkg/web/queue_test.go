@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -65,6 +66,75 @@ func TestQueueEnqueuePersistsAndReloads(t *testing.T) {
 	}
 	if len(got2) != 2 || got2[0].ID != got[0].ID || got2[1].ID != got[1].ID {
 		t.Fatalf("reload lost items or order: %+v", got2)
+	}
+}
+
+// TestQueueEnqueueMintsOpencodeMsgID pins Slice 5's correlation-id contract:
+// Enqueue mints a fresh OpenCode message ID (opencode.MintMessageID format)
+// once per item, it is unique across enqueues, and it SURVIVES reload/re-list
+// (the property that makes backend-authoritative minting survive a reload or
+// session switch — the reason the backend owns the id rather than a FE listener).
+// Legacy on-disk items persisted WITHOUT the field deserialize to "" and the
+// reconciler skips them (backward compat).
+func TestQueueEnqueueMintsOpencodeMsgID(t *testing.T) {
+	s, root := newTestStore(t, "s1")
+	a := mustEnqueue(t, s, "first")
+	b := mustEnqueue(t, s, "second")
+
+	// Each item gets a non-empty, msg_-prefixed correlation id.
+	for _, it := range []QueueItem{a, b} {
+		if it.OpencodeMsgID == "" {
+			t.Fatalf("item %s: OpencodeMsgID empty (must be minted at Enqueue)", it.ID)
+		}
+		if !strings.HasPrefix(it.OpencodeMsgID, "msg_") {
+			t.Fatalf("item %s: OpencodeMsgID %q is not msg_-prefixed", it.ID, it.OpencodeMsgID)
+		}
+		if len(it.OpencodeMsgID) != 30 {
+			t.Fatalf("item %s: OpencodeMsgID %q len=%d, want 30", it.ID, it.OpencodeMsgID, len(it.OpencodeMsgID))
+		}
+	}
+	// Fresh per enqueue — never reused.
+	if a.OpencodeMsgID == b.OpencodeMsgID {
+		t.Fatalf("two enqueues minted the SAME OpencodeMsgID %q (must be fresh per enqueue)", a.OpencodeMsgID)
+	}
+
+	// Re-list through the SAME store keeps the id (in-memory cache).
+	got, err := s.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[0].OpencodeMsgID != a.OpencodeMsgID || got[1].OpencodeMsgID != b.OpencodeMsgID {
+		t.Fatalf("List lost OpencodeMsgID: got %+v", got)
+	}
+
+	// Reload from disk (fresh store): the id is durable on disk.
+	s2 := &sessionQueueStore{path: queuePath(root, "s1")}
+	got2, err := s2.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got2[0].OpencodeMsgID != a.OpencodeMsgID || got2[1].OpencodeMsgID != b.OpencodeMsgID {
+		t.Fatalf("reload lost OpencodeMsgID: got %+v (the id must survive reload)", got2)
+	}
+
+	// Backward compat: a legacy on-disk item written WITHOUT the opencodeMsgID
+	// key deserializes to "" and the reconciler must skip it (not crash, not
+	// synthesize one). Seed such a file directly.
+	legacy := queuePath(root, "legacy")
+	if err := os.MkdirAll(filepath.Dir(legacy), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	legacyBody := `{"order":1,"items":[{"id":"q-old","order":1,"state":"unknown","text":"pre-field","attachments":[],"createdAt":1,"resolvedAt":9999999999999}]}`
+	if err := os.WriteFile(legacy, []byte(legacyBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sLeg := &sessionQueueStore{path: legacy}
+	leg, err := sLeg.List()
+	if err != nil {
+		t.Fatalf("legacy item List: %v", err)
+	}
+	if len(leg) != 1 || leg[0].OpencodeMsgID != "" {
+		t.Fatalf("legacy item should load with empty OpencodeMsgID (reconciler skips): %+v", leg)
 	}
 }
 

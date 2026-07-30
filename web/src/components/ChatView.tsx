@@ -1481,6 +1481,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     attachments: { url: string; filename: string; mime: string }[],
     config: QueueConfig,
     itemId: string,
+    opencodeMsgID: string,
     signal: AbortSignal,
   ): Promise<{ state: "sent" | "failed" | "unknown"; detail: string }> {
     const body: any = { parts: buildParts(text, attachments) };
@@ -1489,6 +1490,14 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       body.model = { providerID: config.providerID, modelID: config.modelID };
       if (config.variant) body.variant = config.variant;
     }
+    // Thread the backend-minted OpenCode correlation id (Slice 5) into the
+    // prompt_async body as `messageID`. On v1.17.18 this is caller-id-wins
+    // (input.messageID ?? MessageID.ascending()): OpenCode persists the
+    // dispatched user message with this EXACT id, so a later exact
+    // GET /session/:sid/message/:mid can reconcile delivered-but-stuck items.
+    // Including it is safe (optional field); only set when present so legacy
+    // in-flight items without it dispatch unchanged.
+    if (opencodeMsgID) body.messageID = opencodeMsgID;
     if (!userScrolledUp()) jumpToLatest();
     try {
       const res = await fetch(`/oc/session/${encodeURIComponent(id)}/prompt_async`, {
@@ -1531,7 +1540,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       const config = claimed.sendConfig?.providerID && claimed.sendConfig?.modelID
         ? (claimed.sendConfig as QueueConfig)
         : captureConfig(id);
-      return dispatchQueuedItem(id, claimed.text, claimed.attachments, config, claimed.id, signal);
+      return dispatchQueuedItem(id, claimed.text, claimed.attachments, config, claimed.id, claimed.opencodeMsgID ?? "", signal);
     },
     resolve: resolveQueued,
     setSending,
