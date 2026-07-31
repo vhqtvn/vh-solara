@@ -314,8 +314,18 @@ func (s *Store) reconcileMessagesLocked(sid string, list []MessageWithParts) (co
 		}
 		if isTerminalError(termErr) {
 			delete(s.pendingEmptyNewest, sid)
-			delete(s.confirmedEmptyNewest, sid)
-			log.Printf("[state] messages loaded: session=%s newest assistant=%s admitted (aborted: %s)", sid, newestID, termErr)
+			// Guard: only on transition (mirrors the O5 branch below). SET instead
+			// of delete — records the terminal admit in confirmedEmptyNewest so a
+			// reconnect Hydrate re-reconcile does NOT re-fire the log (the O5
+			// branch is symmetric). This does NOT change IsMessagesLoaded: the gate
+			// (latestAssistantResidentLocked) admits an aborted newest via its
+			// isTerminalError(me.terminalError) fast-path, which is checked BEFORE
+			// the confirmedEmptyNewest[sid]==me.id O5 backstop — so the fast path
+			// already returns true here regardless of the recorded value.
+			if s.confirmedEmptyNewest[sid] != newestID {
+				s.confirmedEmptyNewest[sid] = newestID
+				log.Printf("[state] messages loaded: session=%s newest assistant=%s admitted (aborted: %s)", sid, newestID, termErr)
+			}
 			break
 		}
 		if s.pendingEmptyNewest[sid] == newestID {

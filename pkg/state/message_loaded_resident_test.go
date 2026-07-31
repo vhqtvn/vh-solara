@@ -312,11 +312,78 @@ func TestMessagesLoadedAbortedNewestAdmittedOnFirstReconcile(t *testing.T) {
 	}
 }
 
+// TestMessagesLoadedAbortedNewestRecordsTransitionInConfirmedEmpty pins F4b: the
+// abort branch of reconcileMessagesLocked now RECORDS the terminal admit in
+// confirmedEmptyNewest (SET instead of delete, guarded so it only fires on the
+// transition) — mirroring the O5 branch's transition guard. The behavioral proof
+// is the recorded state (what the guard keys on): after one reconcile of a
+// newest completed assistant that is an aborted turn,
+// confirmedEmptyNewest[sid] == newestID holds. This is the new state-recording
+// effect; the gate itself is unchanged (the fast-path in
+// latestAssistantResidentLocked already admitted the aborted newest BEFORE this
+// recorded value existed, and still does — the fast-path is checked before the
+// confirmedEmptyNewest[sid]==me.id O5 backstop).
+//
+// Asserting the recorded state (not the log line) is deliberate: the log is the
+// observable side the guard suppresses on re-reconcile, but log output is
+// awkward to test directly — the recorded map entry is what the guard keys on.
+// A second reconcile of the SAME aborted newest must NOT re-transition (the
+// guard confirmedEmptyNewest[sid] != newestID is false), so the log is guarded
+// from re-firing — proven here by the recorded value staying equal.
+func TestMessagesLoadedAbortedNewestRecordsTransitionInConfirmedEmpty(t *testing.T) {
+	s := New(100)
+	defer s.Close()
+	const sid = "sess"
+	s.Apply(ev("session.created", `{"info":{"id":"sess"}}`))
+
+	// ONE authoritative reconcile of the aborted newest (verbatim live shape).
+	const abortedNewestID = "m_fb30"
+	res := s.SetSessionMessages(sid, []MessageWithParts{{
+		Info: json.RawMessage(abortedAssistantInfo),
+		// no Parts — the turn is aborted and produced no output
+	}})
+
+	// CRUX (F4b): the abort branch RECORDED the terminal admit —
+	// confirmedEmptyNewest[sid] == the aborted newest's id (SET, not delete).
+	if got := s.confirmedEmptyNewest[sid]; got != abortedNewestID {
+		t.Fatalf("confirmedEmptyNewest[sid] must equal the aborted newest id %q after one reconcile (got %q) — F4b records the terminal admit", abortedNewestID, got)
+	}
+	// pendingEmptyNewest is still cleared (the abort branch deletes it).
+	if _, ok := s.pendingEmptyNewest[sid]; ok {
+		t.Fatalf("pendingEmptyNewest[sid] must be cleared on the abort branch")
+	}
+	// The gate is unchanged by this recording: loaded is TRUE (the fast-path
+	// admitted the aborted newest BEFORE the O5 backstop, and the recorded value
+	// does not alter that ordering).
+	if !s.IsMessagesLoaded(sid) {
+		t.Fatalf("IsMessagesLoaded must be TRUE on the FIRST reconcile for an aborted newest (terminal-error fast-path)")
+	}
+	if g := s.Snapshot(nil).Gate[sid]; !g.MessagesLoaded {
+		t.Fatalf("gate.messagesLoaded must be TRUE on the first reconcile for an aborted newest")
+	}
+	if res.BlockedByUnconfirmedEmptyNewest {
+		t.Fatalf("BlockedByUnconfirmedEmptyNewest must be FALSE for an aborted newest — the aggregator must not re-fetch a positively-terminal turn")
+	}
+
+	// A SECOND reconcile of the SAME aborted newest must NOT re-transition
+	// (the guard confirmedEmptyNewest[sid] != newestID is false) — the recorded
+	// value stays equal to newestID, and the guarded log does not re-fire.
+	s.SetSessionMessages(sid, []MessageWithParts{{
+		Info: json.RawMessage(abortedAssistantInfo),
+	}})
+	if got := s.confirmedEmptyNewest[sid]; got != abortedNewestID {
+		t.Fatalf("confirmedEmptyNewest[sid] must still equal the aborted newest id %q after the second reconcile (got %q) — the guard must not re-transition", abortedNewestID, got)
+	}
+	if !s.IsMessagesLoaded(sid) {
+		t.Fatalf("IsMessagesLoaded must remain TRUE on the second reconcile of the same aborted newest")
+	}
+}
+
 // TestMessagesLoadedNonTerminalErrorFallsBackToO5Confirmation is TDD case #2:
 // a newest COMPLETED assistant with zero parts whose error name is NOT a
 // recognized terminal classification must still require the O5 two-empty
 // confirmation (the backstop is preserved for unrecognized errors). The gate
-// treats only the documented terminalErrorNames set as positive; an unknown
+// treats only the cases isTerminalError recognizes as positive; an unknown
 // error name is not trusted to mean "outputless".
 func TestMessagesLoadedNonTerminalErrorFallsBackToO5Confirmation(t *testing.T) {
 	s := New(100)

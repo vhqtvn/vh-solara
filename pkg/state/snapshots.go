@@ -997,31 +997,30 @@ func (s *Store) IsMessagesLoaded(sid string) bool {
 	return s.msgLoaded[sid] && s.latestAssistantResidentLocked(sid)
 }
 
-// terminalErrorNames is the set of opencode `info.error.name` values the
-// messages-loaded gate treats as a POSITIVE terminal classification: a
-// completed assistant turn carrying one of these produced no output, so zero
-// resident parts is source truth and the turn is admitted as loaded on the
-// FIRST reconcile (no two-empty confirmation re-fetch). The aborted signal is
-// strictly stronger evidence than the O5 "same empty across two reconciles"
-// heuristic — opencode itself marked the turn terminal.
+// isTerminalError reports whether an opencode info.error.name marks a turn as
+// terminal/outputless. A terminal error positively classifies the newest
+// completed assistant as having produced no output, so it is admitted as
+// messages-loaded on the first reconcile (no disambiguating re-fetch). The
+// aborted signal is strictly stronger evidence than the O5 "same empty across
+// two reconciles" heuristic — opencode itself marked the turn terminal.
 //
-// Membership is an intentionally small, documented, extensible set. Add a name
-// here only when opencode positively marks a turn as terminal-and-outputless.
+// Membership is an intentionally small, documented, extensible set: add a case
+// only when opencode positively marks a turn as terminal-and-outputless.
 //
 //   - "MessageAbortedError" — the confirmed trigger (ses_05ff9273dffe7N4dh1HliZhIXq):
 //     an aborted turn. The live opencode payload (pid 1923) carried
 //     info.error.name="MessageAbortedError", tokens all zero, parts:[], no
 //     finish. This set may grow as further terminal shapes are confirmed.
-var terminalErrorNames = map[string]bool{
-	"MessageAbortedError": true, // confirmed: aborted turn (operator/limit abort)
-}
-
-// isTerminalError reports whether the given opencode error name is a recognized
-// terminal classification for the messages-loaded gate. Empty (no error) and
-// unrecognized names return false — those turns fall through to the O5
-// two-empty confirmation backstop for non-aborted zero-parts cases.
+//
+// Empty (no error) and unrecognized names return false — those turns fall
+// through to the O5 two-empty confirmation backstop for non-aborted zero-parts
+// cases.
 func isTerminalError(name string) bool {
-	return terminalErrorNames[name]
+	switch name {
+	case "MessageAbortedError": // confirmed: aborted turn (operator/limit abort)
+		return true
+	}
+	return false
 }
 
 // latestAssistantResidentLocked is the source-of-truth derivation the gate's
