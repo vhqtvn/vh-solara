@@ -223,12 +223,43 @@ function ReasoningPart(props: { part: Part; settled: boolean; tail?: boolean }) 
   );
 }
 
+// Minimal muted marker for structural/metadata part kinds (step-start,
+// step-finish, patch, agent, compaction, and any unknown/future kind). These
+// parts carry machine bookkeeping — not prose — so they render as a collapsed,
+// non-interactive chip instead of verbose content. This is the INV-7 render
+// contract: every opencode part kind must render SOMETHING non-empty; none is
+// ever silently dropped. A labeled chip is cheap inline DOM (no GPU-hot scroll
+// cost — no mask-image/backdrop-filter/contain per AGENTS.md GPU-perf bans).
+function PartMarker(props: { kind: string; icon: string; label: string }) {
+  return (
+    <div class={styles["part-marker"]} data-kind={props.kind} title={props.label}>
+      <span class={styles["part-marker-ico"]}><Icon name={props.icon} size={11} /></span>
+      <span class={styles["part-marker-label"]}>{props.label}</span>
+    </div>
+  );
+}
+
 export default function PartView(props: { part: Part; settled?: boolean; tail?: boolean }) {
   const p = () => props.part;
   // A part is settled (worth the full markdown render) when the part itself has
   // ended, or when the owning message is settled — user messages never stream,
   // and a completed assistant turn settles all its parts at once.
   const settled = () => props.settled || !!p().time?.end;
+  // step-finish carries a tokens map {input,output,reasoning,cache_*}; sum it so
+  // the step marker shows real cost instead of a bare "Step" label.
+  const stepFinishLabel = () => {
+    const t = p().tokens as Record<string, number> | undefined;
+    if (!t) return "Step";
+    let total = 0;
+    for (const v of Object.values(t)) total += Number(v) || 0;
+    return total > 0 ? `Step \u00b7 ${total.toLocaleString()} tok` : "Step";
+  };
+  // patch carries a `files` array; surface the count so the marker is informative.
+  const patchLabel = () => {
+    const files = p().files as unknown[] | undefined;
+    const n = Array.isArray(files) ? files.length : 0;
+    return n > 0 ? `Patch \u00b7 ${n} file${n === 1 ? "" : "s"}` : "Patch";
+  };
   return (
     <Switch>
       <Match when={p().type === "text"}>
@@ -243,7 +274,34 @@ export default function PartView(props: { part: Part; settled?: boolean; tail?: 
       <Match when={p().type === "file"}>
         <div class={styles["file-chip"]}>📎 {(p().filename as string) || (p().mime as string)}</div>
       </Match>
-      {/* step-start/finish, snapshot, patch, agent, retry, compaction: omitted in v1 */}
+      {/* INV-7 render contract: every remaining part kind renders a defined,
+          non-empty marker — none is silently dropped. step-start/step-finish
+          bracket the reasoning/text content already shown above; they render as
+          compact structural chips (step-finish surfaces token cost). patch/
+          agent/compaction surface a one-line summary. `snapshot` is a KEY inside
+          step-start/step-finish (not its own type) and `retry` was not observed
+          in the live DB — if either ever appears as a type, the catch-all below
+          renders it as a labeled marker rather than vanishing. */}
+      <Match when={p().type === "step-start"}>
+        <PartMarker kind="step-start" icon="layers" label="Step" />
+      </Match>
+      <Match when={p().type === "step-finish"}>
+        <PartMarker kind="step-finish" icon="check" label={stepFinishLabel()} />
+      </Match>
+      <Match when={p().type === "patch"}>
+        <PartMarker kind="patch" icon="code" label={patchLabel()} />
+      </Match>
+      <Match when={p().type === "agent"}>
+        <PartMarker kind="agent" icon="fork" label={`Agent: ${(p().name as string) || ""}`} />
+      </Match>
+      <Match when={p().type === "compaction"}>
+        <PartMarker kind="compaction" icon="layers" label="Compaction" />
+      </Match>
+      {/* Catch-all: any other/unknown/future kind renders a generic marker so the
+          part is visible (not dropped) even if its type is unrecognized. */}
+      <Match when={true}>
+        <PartMarker kind={String(p().type ?? "unknown")} icon="info" label={String(p().type ?? "unknown")} />
+      </Match>
     </Switch>
   );
 }

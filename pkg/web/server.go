@@ -885,6 +885,13 @@ func (s *Server) Handler() http.Handler {
 	// /vh/diag/latency). Dumps per-workspace RunningRoots + subtreeBusy +
 	// per-session activity so a phantom running count is one-query-diagnosable.
 	mux.HandleFunc("/vh/diag/busy", s.handleDiagBusy)
+	// Standing-proof invariant diagnostic (GET-only → no CSRF). Diffs the
+	// daemon's resident message/parts vs a fresh OpenCode fetch per session and
+	// reports per-invariant pass/fail/deferred with evidence for the daemon-side
+	// subset (INV-1/2/3 live; INV-4/8 structural → deferred to Go property
+	// tests). Side-effect-free: uses aggForExisting (never opens a project). See
+	// pkg/web/diag_invariants.go.
+	mux.HandleFunc("/vh/diag/invariants", s.handleDiagInvariants)
 	mux.HandleFunc("/vh/skill/emit", s.handleSkillEmit)
 	mux.HandleFunc("/vh/version", func(w http.ResponseWriter, r *http.Request) {
 		writeJSONResp(w, map[string]string{"version": s.version()})

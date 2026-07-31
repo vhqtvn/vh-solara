@@ -258,3 +258,28 @@
   padding: 2px 8px;
   margin: 4px 0;
 }
+
+/* Minimal muted marker for structural/metadata part kinds (step-start,
+   step-finish, patch, agent, compaction, unknown/fallback) — INV-7 render
+   contract. Same cheap visual recipe as .file-chip: an inline-flex chip with a
+   small icon + label. No mask-image/backdrop-filter/contain (this sits in the
+   GPU-hot chat-scroll surface; see AGENTS.md GPU-perf bans). data-kind carries
+   the original type so tests/inspection can assert each kind rendered. */
+.part-marker {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--fg-dim);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 2px 8px;
+  margin: 4px 0;
+}
+.part-marker-ico { display: inline-flex; align-items: center; color: var(--fg-dim); flex: 0 0 auto; }
+.part-marker-label {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 40ch;
+}
