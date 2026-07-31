@@ -676,10 +676,13 @@ func (s *Store) materializeSnapshot(c snapshotCapture) Snapshot {
 			HasMessages: hasMsg,
 			// MessagesLoaded is the STRICT "full history fetched AND resident"
 			// gate, derived from BOTH the msgLoaded fetch memo AND the actual
-			// resident parts (msgResident). It can NEVER be true when the newest
-			// completed assistant has zero resident parts — that state triggers an
-			// open-path re-fetch instead of lying "loaded". Mirrors the busyCount
-			// retirement (c4c4ef1): derive from source, not the latch alone. See
+			// resident parts (msgResident). It is false when the newest
+			// completed assistant has zero resident parts — UNLESS that exact
+			// empty newest was confirmed as source-truth by a second reconcile
+			// (confirmedEmptyNewest), in which case it is admitted. An
+			// unconfirmed zero-parts newest triggers an open-path re-fetch
+			// instead of lying "loaded". Mirrors the busyCount retirement
+			// (c4c4ef1): derive from source, not the latch alone. See
 			// IsMessagesLoaded / latestAssistantResidentLocked.
 			MessagesLoaded:         sc.msgLoaded && sc.msgResident,
 			LastAssistantCompleted: sc.hasAssistant && sc.lastAsstCompleted,
@@ -982,26 +985,62 @@ func (s *Store) Replay(cursor uint64) (events []ClientEvent, head uint64, ok boo
 // the actual resident parts (latestAssistantResidentLocked), not the msgLoaded
 // latch alone: a completed assistant message with zero resident parts is treated
 // as NOT loaded so the open path re-fetches and the daemon actually serves the
-// parts. This is the S5 contract fix — the latch alone could report loaded with
-// zero parts (the systemic steady state for finished sessions), blocking the
-// re-fetch forever. Mirrors the busyCount retirement (c4c4ef1): derive from
-// source, do not trust a cached flag.
+// parts — UNLESS that exact empty newest was confirmed as source-truth by a
+// second reconcile (confirmedEmptyNewest), in which case it is admitted (the
+// server genuinely has no parts for that turn). This is the S5 contract fix —
+// the latch alone could report loaded with zero parts (the systemic steady state
+// for finished sessions), blocking the re-fetch forever. Mirrors the busyCount
+// retirement (c4c4ef1): derive from source, do not trust a cached flag.
 func (s *Store) IsMessagesLoaded(sid string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.msgLoaded[sid] && s.latestAssistantResidentLocked(sid)
 }
 
+// terminalErrorNames is the set of opencode `info.error.name` values the
+// messages-loaded gate treats as a POSITIVE terminal classification: a
+// completed assistant turn carrying one of these produced no output, so zero
+// resident parts is source truth and the turn is admitted as loaded on the
+// FIRST reconcile (no two-empty confirmation re-fetch). The aborted signal is
+// strictly stronger evidence than the O5 "same empty across two reconciles"
+// heuristic — opencode itself marked the turn terminal.
+//
+// Membership is an intentionally small, documented, extensible set. Add a name
+// here only when opencode positively marks a turn as terminal-and-outputless.
+//
+//   - "MessageAbortedError" — the confirmed trigger (ses_05ff9273dffe7N4dh1HliZhIXq):
+//     an aborted turn. The live opencode payload (pid 1923) carried
+//     info.error.name="MessageAbortedError", tokens all zero, parts:[], no
+//     finish. This set may grow as further terminal shapes are confirmed.
+var terminalErrorNames = map[string]bool{
+	"MessageAbortedError": true, // confirmed: aborted turn (operator/limit abort)
+}
+
+// isTerminalError reports whether the given opencode error name is a recognized
+// terminal classification for the messages-loaded gate. Empty (no error) and
+// unrecognized names return false — those turns fall through to the O5
+// two-empty confirmation backstop for non-aborted zero-parts cases.
+func isTerminalError(name string) bool {
+	return terminalErrorNames[name]
+}
+
 // latestAssistantResidentLocked is the source-of-truth derivation the gate's
 // MessagesLoaded field and the open-path IsMessagesLoaded read INSTEAD of the
 // msgLoaded latch. It reports whether the session's resident parts are consistent
 // with a completed assistant turn: false when the newest COMPLETED assistant
-// message has zero resident parts. A real completed turn always carries ≥1 part
-// (reasoning / step / text / tool), so zero parts is the signature of unfetched
-// or lost parts — exactly the state the latch papered over. An in-progress
-// assistant (parts still streaming), no assistant message, or no message state at
-// all all return true (vacuously resident — nothing is provably missing). Caller
-// holds s.mu (RLock is sufficient; read-only).
+// message has zero resident parts — UNLESS that exact empty newest was confirmed
+// as source-truth by a second authoritative reconcile (confirmedEmptyNewest), in
+// which case it is admitted (the server genuinely has no parts for that turn). A
+// real completed turn normally carries ≥1 part (reasoning / step / text / tool),
+// so zero parts is the signature of unfetched/lost parts — exactly the state the
+// latch papered over, and the schema-drift cold-load shape (3b3860e) the re-fetch
+// guard exists to recover. But a single fetch returning zero parts cannot tell a
+// lying cold load from a faithful one: only a SECOND reconcile observing the SAME
+// empty newest confirms source-truth (the schema-drift shape instead resolves
+// via the len(parts)>0 branch once the re-fetch serves the real parts). An
+// in-progress assistant (parts still streaming), no assistant message, or no
+// message state at all return true (vacuously resident — nothing is provably
+// missing). Caller holds s.mu (RLock is sufficient; read-only).
 func (s *Store) latestAssistantResidentLocked(sid string) bool {
 	sm := s.messages[sid]
 	if sm == nil {
@@ -1015,7 +1054,39 @@ func (s *Store) latestAssistantResidentLocked(sid string) bool {
 		if !me.completed {
 			return true // in-progress: parts still streaming — not provably missing
 		}
-		return len(me.parts) > 0
+		if len(me.parts) > 0 {
+			return true
+		}
+		// Aborted/terminal-error fast-path (ses_05ff9273dffe7N4dh1HliZhIXq):
+		// opencode positively classified this turn as terminal
+		// (info.error.name is a recognized terminal error — confirmed shape:
+		// MessageAbortedError). Such a turn produced NO output, so zero parts
+		// is source truth — admit on the FIRST reconcile, BEFORE the O5
+		// two-empty confirmation. This is strictly stronger evidence than the
+		// O5 heuristic: opencode itself marked the turn terminal. The
+		// schema-drift case (a NON-aborted turn whose parts were omitted by
+		// the fetch) carries NO terminal error → it does NOT hit this branch →
+		// it falls through to the O5 confirmation below, preserving the
+		// 3b3860e re-fetch guard. reconcileMessagesLocked mirrors this admit
+		// on the write side (keeps BlockedByUnconfirmedEmptyNewest false so the
+		// aggregator does exactly ONE fetch) and emits the confirm-log.
+		if isTerminalError(me.terminalError) {
+			return true
+		}
+		// Newest COMPLETED assistant has zero resident parts. This is either
+		// source truth (the server genuinely has no parts for this turn) or a
+		// transient gap (a schema-drift cold load that returned envelope-only,
+		// or a live race where a newer assistant turn completed via message.
+		// upsert but its parts have not streamed yet). Admit ONLY when this
+		// exact empty newest was confirmed by a second authoritative reconcile
+		// (confirmedEmptyNewest[sid] == me.id): two reconciles returning the
+		// same empty newest is the signature of source truth, while the
+		// schema-drift shape resolves via the len(parts)>0 branch above once
+		// the re-fetch serves the real parts. Anything else — including a
+		// brand-new live-completed assistant newer than the last reconcile, or
+		// a newest seen empty only once — returns false and forces the
+		// re-fetch, preserving the S5 guard (3b3860e).
+		return s.confirmedEmptyNewest[sid] == me.id
 	}
 	return true // no assistant message
 }

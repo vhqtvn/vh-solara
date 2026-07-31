@@ -394,6 +394,20 @@ type messageEntry struct {
 	// agent is the opencode `info.agent` string cached from info, used to populate
 	// lastAgent on the session entry when this is the latest assistant message.
 	agent string
+	// terminalError caches the opencode `info.error.name` for a COMPLETED
+	// assistant turn that ended terminally (e.g. an abort — the confirmed shape
+	// "MessageAbortedError"). The messages-loaded gate uses it as a POSITIVE
+	// terminal classification: a zero-parts completed assistant carrying a
+	// recognized terminal error produced no output, so zero resident parts is
+	// source truth and the turn is admitted as loaded on the FIRST reconcile —
+	// WITHOUT the two-empty confirmation re-fetch the non-aborted zero-parts
+	// case needs (see isTerminalError / latestAssistantResidentLocked /
+	// reconcileMessagesLocked). Empty for normal turns. Set from
+	// messageInfoEnvelope.errorName() in BOTH reconcileMessagesLocked (history
+	// fetch) and upsertMessageLocked (live message.updated), alongside
+	// finish/tokens/agent; cleared implicitly when the entry is dropped
+	// (message/part removal or session delete drop the whole messageEntry).
+	terminalError string
 	// deltaBuf is the native streaming-text accumulator (Option C / P1-AGG-004):
 	// per (partID, field) it holds the authoritative accumulated field text in a
 	// strings.Builder so a token-delta flood appends at amortized O(len(delta))
@@ -472,6 +486,36 @@ type messageInfoEnvelope struct {
 	// message). Cached here so the denormalized lastAgent on the session entry can
 	// be set without re-parsing info.
 	Agent string `json:"agent"`
+	// Error is opencode's `info.error`, present iff the turn ended terminally
+	// (e.g. an abort). Carries the structured error opencode attached —
+	// notably `name` (e.g. "MessageAbortedError"). Cached so the messages-
+	// loaded gate can classify a zero-parts COMPLETED assistant as a
+	// positively-terminal turn (it produced no output) and admit it on the
+	// FIRST reconcile without a re-fetch. Absent (nil) on older or non-error
+	// responses — backward-compatible, since older structs simply omit the
+	// field. Data is kept raw (vh-solara reports, never interprets).
+	Error *messageErrorEnvelope `json:"error,omitempty"`
+}
+
+// messageErrorEnvelope mirrors opencode's `info.error` shape: a named error
+// (e.g. "MessageAbortedError") with an opaque data payload. Only Name is
+// interpreted by the gate (terminal-error classification); Data is preserved
+// raw for reporting.
+type messageErrorEnvelope struct {
+	Name string          `json:"name"`
+	Data json.RawMessage `json:"data"`
+}
+
+// errorName returns the opencode `info.error.name` for this envelope, or "" when
+// the turn carries no terminal error (env.Error == nil). Used to populate
+// messageEntry.terminalError from BOTH the history-fetch reconcile
+// (reconcileMessagesLocked) and the live message.updated path
+// (upsertMessageLocked), alongside finish/tokens/agent.
+func (e *messageInfoEnvelope) errorName() string {
+	if e.Error != nil {
+		return e.Error.Name
+	}
+	return ""
 }
 
 type partEnvelope struct {

@@ -25,8 +25,8 @@ func ev(t, props string) opencode.Event {
 // failing the test on validation error. It is the validated-construction path
 // for tests that need a non-default tunable: every test-side override flows
 // through a Config (withFlushInterval / withPartTextCap / withRecentArchiveTTL
-// / withWindowBounds — each returns a modified Config) and then through
-// mustNew, so NO Store instance field is mutated after construction. This is
+// / withWindowBounds / withCompletionGrace — each returns a modified Config)
+// and then through mustNew, so NO Store instance field is mutated after construction. This is
 // the test-side completion of the GAP-S5 promotion: Config.validate() can
 // never be bypassed, even from tests.
 func mustNew(tb testing.TB, cfg Config) *Store {
@@ -1935,10 +1935,10 @@ func TestSetSessionMessagesReturnsSessionGoneWhenDeletedDuringCapture(t *testing
 			Parts: []json.RawMessage{json.RawMessage(`{"id":"p1","sessionID":"gone","messageID":"m1","type":"text","text":"OLD"}`)}},
 	}
 
-	var status ColdBatchStatus
+	var result SessionMessagesResult
 	done := make(chan struct{})
 	go func() {
-		status = s.SetSessionMessages("gone", oldList)
+		result = s.SetSessionMessages("gone", oldList)
 		close(done)
 	}()
 	<-capturedCh
@@ -1946,13 +1946,13 @@ func TestSetSessionMessagesReturnsSessionGoneWhenDeletedDuringCapture(t *testing
 	<-done
 
 	// The status MUST be SessionGone (capture returned nil on the retry).
-	if status != ColdBatchSessionGone {
-		t.Fatalf("SetSessionMessages status: want ColdBatchSessionGone, got %v", status)
+	if result.Status != ColdBatchSessionGone {
+		t.Fatalf("SetSessionMessages status: want ColdBatchSessionGone, got %v", result.Status)
 	}
 
 	// Mirror the aggregator's Finding-3 gating: loaded is emitted ONLY for
 	// Emitted|WarmReconcile. For SessionGone it MUST NOT be emitted.
-	if status == ColdBatchEmitted || status == ColdBatchWarmReconcile {
+	if result.Status == ColdBatchEmitted || result.Status == ColdBatchWarmReconcile {
 		s.EmitMessagesLoaded("gone", 1, 1)
 	}
 

@@ -34,6 +34,7 @@ package state
 import (
 	"bytes"
 	"encoding/json"
+	"log"
 	"time"
 
 	diag "github.com/vhqtvn/vh-solara/pkg/diagnostics"
@@ -127,7 +128,8 @@ func (s *Store) Hydrate(sessions []json.RawMessage, messages map[string][]Messag
 	// lock — it blocks all Apply ingestion during compression). ---
 	var coldBatched []string
 	for sid, list := range messages {
-		if s.reconcileMessagesLocked(sid, list) {
+		cold, _ := s.reconcileMessagesLocked(sid, list)
+		if cold {
 			coldBatched = append(coldBatched, sid)
 		}
 	}
@@ -168,7 +170,7 @@ func (s *Store) Hydrate(sessions []json.RawMessage, messages map[string][]Messag
 // ingests in one mutation. The warm/incremental path (msgLoaded already true — a
 // daemon OpenCode-stream reconnect for an already-loaded session) keeps emitting
 // individual upserts so a connected client reconciles only the diffs.
-func (s *Store) reconcileMessagesLocked(sid string, list []MessageWithParts) (coldLoad bool) {
+func (s *Store) reconcileMessagesLocked(sid string, list []MessageWithParts) (coldLoad bool, blockedByUnconfirmedEmpty bool) {
 	coldLoad = !s.msgLoaded[sid] // detect BEFORE setting it true (msgLoaded lifecycle is unchanged)
 	s.msgLoaded[sid] = true
 	// The authoritative history reconcile rewrites this session's message/part
@@ -220,6 +222,7 @@ func (s *Store) reconcileMessagesLocked(sid string, list []MessageWithParts) (co
 			me.finish = env.Finish
 			me.tokens = env.Tokens
 			me.agent = env.Agent
+			me.terminalError = env.errorName()
 		}
 		// A history fetch is authoritative for this message's parts: discard
 		// streaming accumulators (they were building on stale/live bases) —
@@ -278,6 +281,73 @@ func (s *Store) reconcileMessagesLocked(sid string, list []MessageWithParts) (co
 	// deletion.
 	s.recomputeLastAssistantLocked(sid)
 
+	// Empty-newest confirmation tracking. A history reconcile is authoritative
+	// for the resident parts, so it is the seam that decides whether a
+	// zero-parts newest COMPLETED assistant is SOURCE TRUTH (the server
+	// genuinely has no parts) versus a TRANSIENT GAP (schema-drift cold load,
+	// or a live race). A single fetch returning zero parts is ambiguous; only a
+	// SECOND reconcile observing the SAME empty newest confirms source truth
+	// (the schema-drift shape instead resolves via newestCompletedAssistantEmpty
+	// going false once the re-fetch serves the real parts). See
+	// latestAssistantResidentLocked and the pendingEmptyNewest /
+	// confirmedEmptyNewest struct comment.
+	newestID, newestEmpty := s.newestCompletedAssistantEmptyLocked(sid)
+	switch {
+	case newestID != "" && newestEmpty:
+		// Aborted/terminal-error fast-path (ses_05ff9273dffe7N4dh1HliZhIXq):
+		// opencode positively classified this completed assistant turn as
+		// terminal (info.error.name is a recognized terminal error — the
+		// confirmed live shape: MessageAbortedError, tokens all zero,
+		// parts:[], no finish). Such a turn produced NO output, so zero
+		// resident parts is SOURCE TRUTH — not a schema-drift gap. Admit it
+		// directly on the FIRST reconcile: skip the O5 two-empty confirmation,
+		// drop any stale pending/confirmed trackers, and keep
+		// blockedByUnconfirmedEmpty false so the aggregator does NOT re-fetch
+		// (one fetch is enough — the error is positive evidence). The
+		// schema-drift case (a NON-aborted turn whose parts were omitted by
+		// the fetch) carries NO terminal error → it does NOT hit this branch →
+		// it still falls through to the O5 confirmation + re-fetch below,
+		// which recovers the parts (commit 3b3860e guard preserved).
+		var termErr string
+		if me := sm.byID[newestID]; me != nil {
+			termErr = me.terminalError
+		}
+		if isTerminalError(termErr) {
+			delete(s.pendingEmptyNewest, sid)
+			delete(s.confirmedEmptyNewest, sid)
+			log.Printf("[state] messages loaded: session=%s newest assistant=%s admitted (aborted: %s)", sid, newestID, termErr)
+			break
+		}
+		if s.pendingEmptyNewest[sid] == newestID {
+			// Second consecutive sighting of the same empty newest → confirm
+			// source-truth. This is the gate's admit-source-empty transition:
+			// the same completed assistant with zero parts, seen across two
+			// authoritative reconciles, is genuinely empty (a schema-drift
+			// cold load would have served its parts on the re-fetch and taken
+			// the newestEmpty==false branch instead).
+			if s.confirmedEmptyNewest[sid] != newestID {
+				s.confirmedEmptyNewest[sid] = newestID
+				log.Printf("[state] messages loaded: session=%s newest assistant=%s confirmed empty by fetch (0 source parts)", sid, newestID)
+			}
+		} else {
+			// First sighting of THIS empty newest (or the newest changed since
+			// the last reconcile): drop any stale confirmation so a different
+			// empty newest must re-confirm from scratch.
+			delete(s.confirmedEmptyNewest, sid)
+		}
+		s.pendingEmptyNewest[sid] = newestID
+		// Blocked (disambiguation needed) iff not yet confirmed: this is the
+		// signal the aggregator reads to perform ONE bounded re-fetch.
+		blockedByUnconfirmedEmpty = s.confirmedEmptyNewest[sid] != newestID
+	default:
+		// The newest completed assistant has parts, the newest assistant is
+		// still in progress, or there is no assistant — the empty-newest
+		// tracking no longer applies. Reset both so a future empty newest must
+		// re-confirm (a parts-bearing turn is resident and loaded directly).
+		delete(s.pendingEmptyNewest, sid)
+		delete(s.confirmedEmptyNewest, sid)
+	}
+
 	if coldLoad {
 		// Clear the live-touch markers (C-F2): they are scoped to the cold-fetch
 		// window and have served their purpose. Cold load happens once per
@@ -295,7 +365,33 @@ func (s *Store) reconcileMessagesLocked(sid string, list []MessageWithParts) (co
 		// caller re-validates the per-session message revision before emitting
 		// so a stale prepared batch can never overwrite newer live deltas.
 	}
-	return coldLoad
+	return coldLoad, blockedByUnconfirmedEmpty
+}
+
+// newestCompletedAssistantEmptyLocked reports the id of the session's NEWEST
+// COMPLETED assistant message and whether it has zero resident parts. It mirrors
+// the newest→oldest sm.order walk used by latestAssistantResidentLocked and
+// recomputeLastAssistantLocked so all three agree on which message is "the
+// newest assistant". Returns ("", false) when there is no completed assistant
+// to evaluate — i.e. no assistant message at all, or the newest assistant is
+// still in progress (parts streaming) — because neither is an empty-completed
+// case (an in-progress assistant is vacuously resident). Caller holds s.mu.
+func (s *Store) newestCompletedAssistantEmptyLocked(sid string) (id string, empty bool) {
+	sm := s.messages[sid]
+	if sm == nil {
+		return "", false
+	}
+	for i := len(sm.order) - 1; i >= 0; i-- {
+		me := sm.byID[sm.order[i]]
+		if me == nil || me.role != "assistant" {
+			continue
+		}
+		if !me.completed {
+			return "", false // newest assistant is still generating — not an empty-completed case
+		}
+		return me.id, len(me.parts) == 0
+	}
+	return "", false // no assistant message
 }
 
 // MarkColdFetchStart records that a full-history GET is in flight for the given
@@ -334,31 +430,38 @@ func (s *Store) ClearColdFetchActive(sessionID string) {
 // (session not previously loaded) it does NOT return until a revision-valid
 // cold batch has been published.
 //
-// Returns a ColdBatchStatus the aggregator uses to gate EmitMessagesLoaded
-// (Finding 3): Emitted means a valid messages.batch was published (caller SHOULD
-// emit loaded); WarmReconcile means the session was already loaded and the
-// incremental upsert/delete events were emitted inside reconcile (caller SHOULD
-// emit loaded — the client needs the completion signal); SessionGone /
-// PackagingFailed mean NO batch was published and the caller MUST NOT emit
+// Returns a SessionMessagesResult the aggregator uses to gate EmitMessagesLoaded
+// (Finding 3): Status.Emitted means a valid messages.batch was published (caller
+// SHOULD emit loaded); Status.WarmReconcile means the session was already loaded
+// and the incremental upsert/delete events were emitted inside reconcile (caller
+// SHOULD emit loaded — the client needs the completion signal); Status.SessionGone
+// / PackagingFailed mean NO batch was published and the caller MUST NOT emit
 // loaded (the session is gone or the batch failed — emitting loaded without a
 // preceding batch would break the one-batch-before-loaded ordering, and
 // emitting an empty batch to satisfy ordering would reintroduce state after
-// session.delete).
-func (s *Store) SetSessionMessages(sid string, list []MessageWithParts) ColdBatchStatus {
+// session.delete). BlockedByUnconfirmedEmptyNewest signals that this reconcile
+// left the session not-loaded because the newest COMPLETED assistant has zero
+// resident parts not yet confirmed as source-truth — the aggregator performs
+// ONE bounded re-fetch in that case to disambiguate schema-drift from a
+// genuinely-empty turn (see reconcileMessagesLocked / latestAssistantResidentLocked).
+func (s *Store) SetSessionMessages(sid string, list []MessageWithParts) SessionMessagesResult {
 	s.mu.Lock()
-	cold := s.reconcileMessagesLocked(sid, list)
+	cold, blocked := s.reconcileMessagesLocked(sid, list)
 	s.mu.Unlock()
+	var status ColdBatchStatus
 	if cold {
 		// marshal+gzip+base64 happens OUTSIDE s.mu; the per-session revision is
 		// re-validated before emit so a stale batch is discarded + retried.
-		return s.publishColdBatch(sid)
+		status = s.publishColdBatch(sid)
+	} else {
+		// Warm path: reconcileMessagesLocked already emitted the incremental
+		// upsert/delete deltas under the lock. No wholesale batch is needed; the
+		// caller should still emit messages.loaded (the client exits the loading
+		// state on the loaded event, not on a batch — a warm reconnect may emit
+		// zero deltas if nothing changed).
+		status = ColdBatchWarmReconcile
 	}
-	// Warm path: reconcileMessagesLocked already emitted the incremental
-	// upsert/delete deltas under the lock. No wholesale batch is needed; the
-	// caller should still emit messages.loaded (the client exits the loading
-	// state on the loaded event, not on a batch — a warm reconnect may emit
-	// zero deltas if nothing changed).
-	return ColdBatchWarmReconcile
+	return SessionMessagesResult{Status: status, BlockedByUnconfirmedEmptyNewest: blocked}
 }
 
 // SetLastAgents cold-seeds the agent name of each session's most recent

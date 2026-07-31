@@ -599,6 +599,27 @@ const (
 	ColdBatchPackagingFailed
 )
 
+// SessionMessagesResult is the outcome of SetSessionMessages. It carries the
+// cold-batch Status (unchanged contract) plus the empty-newest disambiguation
+// signal the aggregator uses to decide whether to perform ONE bounded
+// re-fetch: BlockedByUnconfirmedEmptyNewest is true when this reconcile ended
+// with the newest COMPLETED assistant message having zero resident parts that
+// are NOT yet confirmed as source-truth (pendingEmptyNewest set,
+// confirmedEmptyNewest not yet matching). In that state a single fetch is
+// ambiguous (schema-drift cold load vs genuinely-empty turn), so the aggregator
+// re-fetches once to let the server serve the real parts or confirm the
+// emptiness. The facts are captured atomically inside reconcileMessagesLocked
+// under s.mu (the same lock that wrote the parts), so they describe THIS
+// reconcile rather than a possibly-intervening live update. See
+// latestAssistantResidentLocked / pendingEmptyNewest / confirmedEmptyNewest.
+type SessionMessagesResult struct {
+	Status ColdBatchStatus
+	// BlockedByUnconfirmedEmptyNewest is true iff the reconcile left a newest
+	// COMPLETED assistant with zero resident parts that is pending (seen once,
+	// not yet confirmed). The aggregator re-fetches once in this case.
+	BlockedByUnconfirmedEmptyNewest bool
+}
+
 // publishColdBatch packages and emits a session's cold-load KindMessagesBatch
 // with the marshal+gzip+base64 pipeline performed OUTSIDE s.mu, while
 // GUARANTEEING a stale prepared batch can never overwrite newer live deltas.

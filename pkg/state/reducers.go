@@ -789,6 +789,7 @@ func (s *Store) upsertMessageLocked(info json.RawMessage) {
 		me.finish = env.Finish
 		me.tokens = env.Tokens
 		me.agent = env.Agent
+		me.terminalError = env.errorName()
 		// Mark live-touched so a concurrent cold-load reconcile (background
 		// full-history GET in flight) does NOT clobber this newer live body
 		// with the stale fetched one (C-F2). Only tagged while a cold GET is
@@ -803,6 +804,7 @@ func (s *Store) upsertMessageLocked(info json.RawMessage) {
 			id: env.ID, info: info, parts: map[string]json.RawMessage{},
 			role: env.Role, completed: env.Time.Completed != nil,
 			finish: env.Finish, tokens: env.Tokens, agent: env.Agent,
+			terminalError: env.errorName(),
 		}
 		sm.order = append(sm.order, env.ID)
 		// A live-created message is also live-touched (its body is at least as

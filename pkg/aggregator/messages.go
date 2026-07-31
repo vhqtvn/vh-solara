@@ -188,51 +188,64 @@ func (a *Aggregator) EnsureMessages(ctx context.Context, sessionID string) error
 			a.store.ClearColdFetchActive(sessionID)
 			close(done)
 		}()
-		t0 := time.Now()
-		items, err := a.client.Messages(ctx, sessionID)
-		if err != nil {
-			// Signal failure to any async caller that deduped against this sync
-			// winner (shared-slot completion contract). The session stays
-			// unloaded; the defer above cleared the slot so a reselect retries.
-			a.store.EmitMessagesError(sessionID, err.Error())
-			return err
+		// BOUNDED DISAMBIGUATION LOOP. A fetch that leaves the session
+		// not-loaded because the newest COMPLETED assistant has zero resident
+		// parts is AMBIGUOUS: it may be a schema-drift cold load (the opencode
+		// DB has parts the fetch did not inline — a re-fetch serves them) or
+		// source truth (the DB genuinely has no parts — a re-fetch confirms
+		// emptiness). The web client does not auto-retry a stuck-loaded
+		// session, so without an in-open re-fetch a genuinely-empty turn
+		// (ses_05ff9273dffe7N4dh1HliZhIXq) would loop "not loaded → re-fetch"
+		// forever across operator restarts. When BlockedByUnconfirmedEmptyNewest
+		// is set, perform exactly ONE more GET on the SAME single-flight slot
+		// (the winner already holds it; the defer reclaims it on return) so the
+		// server can serve the real parts (schema-drift → resident → loaded) or
+		// confirm the emptiness (second reconcile observing the same empty
+		// newest → confirmed → loaded). Never a third GET. The final
+		// IsMessagesLoaded gate remains authoritative, so a redundant re-fetch
+		// (e.g. a live update changed the newest between the two reconciles)
+		// can never publish an incorrect messages.loaded.
+		for attempt := 0; ; attempt++ {
+			t0 := time.Now()
+			items, err := a.client.Messages(ctx, sessionID)
+			if err != nil {
+				// Signal failure to any async caller that deduped against this
+				// sync winner (shared-slot completion contract). The session
+				// stays unloaded; the defer above cleared the slot so a
+				// reselect retries.
+				a.store.EmitMessagesError(sessionID, err.Error())
+				return err
+			}
+			fetchMs := time.Since(t0).Milliseconds()
+			tR := time.Now()
+			res := a.store.SetSessionMessages(sessionID, decodeMessages(items))
+			reconcileMs := time.Since(tR).Milliseconds()
+			// Emit completion ONLY when a batch was published (cold) or it was
+			// a genuine warm reconcile (no batch required) AND the resident-
+			// parts gate IsMessagesLoaded now holds — the SAME signal the
+			// snapshot's GateFacts.MessagesLoaded exposes, so the client's
+			// messages.loaded (which flips its messagesDelivered=true) can
+			// never disagree with the gate (b-F1). A cold fetch for a session
+			// deleted between reconcile and capture, or a packaging failure,
+			// publishes NO batch (SessionGone / PackagingFailed) — emitting
+			// loaded then would deliver messages.loaded with no preceding
+			// messages.batch (one-batch-before-loaded ordering), and emitting
+			// an empty batch to satisfy ordering would reintroduce state after
+			// session.delete (Finding 3).
+			if (res.Status == state.ColdBatchEmitted || res.Status == state.ColdBatchWarmReconcile) && a.store.IsMessagesLoaded(sessionID) {
+				a.store.EmitMessagesLoaded(sessionID, fetchMs, reconcileMs)
+				return nil
+			}
+			// One disambiguating re-fetch when the block is specifically an
+			// unconfirmed empty newest (not a gone session or a packaging
+			// failure, both of which must neither retry nor emit loaded).
+			if attempt == 0 &&
+				(res.Status == state.ColdBatchEmitted || res.Status == state.ColdBatchWarmReconcile) &&
+				res.BlockedByUnconfirmedEmptyNewest {
+				continue
+			}
+			return nil
 		}
-		fetchMs := time.Since(t0).Milliseconds()
-		tR := time.Now()
-		status := a.store.SetSessionMessages(sessionID, decodeMessages(items))
-		reconcileMs := time.Since(tR).Milliseconds()
-		// Emit completion ONLY when a batch was published (cold) or it was a
-		// genuine warm reconcile (no batch required). When the session
-		// disappeared (deleted between reconcile and capture) or packaging
-		// failed, SetSessionMessages published NO batch — emitting loaded here
-		// would deliver messages.loaded with no preceding messages.batch,
-		// breaking the one-batch-before-loaded ordering the client relies on,
-		// and emitting an empty batch to satisfy ordering would reintroduce
-		// state after session.delete (Finding 3). The session is gone; the
-		// client tears it down on session.deleted.
-		// Emit completion ONLY when a batch was published (cold) or it was a
-		// genuine warm reconcile (no batch required) AND the resident-parts
-		// gate IsMessagesLoaded now holds. The gate (msgLoaded && resident) is
-		// the SAME signal the snapshot's GateFacts.MessagesLoaded exposes, so
-		// the client's messages.loaded (which flips its messagesDelivered=true)
-		// can never disagree with the gate: a fetch that left a completed
-		// assistant with zero resident parts (the S5 envelope-only shape) does
-		// NOT emit loaded — the client stays in the loading state and the next
-		// open re-fetches, instead of being told "delivered" with no parts
-		// (the gate↔emit divergence b-F1). A cold fetch for a session that was
-		// deleted between reconcile and capture, or a packaging failure,
-		// publishes NO batch — emitting loaded here would deliver
-		// messages.loaded with no preceding messages.batch (one-batch-before-
-		// loaded ordering), and emitting an empty batch to satisfy ordering
-		// would reintroduce state after session.delete. When the session is
-		// gone the client tears it down on session.deleted (Finding 3). On a
-		// successful warm reconcile with zero changed deltas the loaded event
-		// is still emitted (resident holds) so the client exits the loading
-		// state.
-		if (status == state.ColdBatchEmitted || status == state.ColdBatchWarmReconcile) && a.store.IsMessagesLoaded(sessionID) {
-			a.store.EmitMessagesLoaded(sessionID, fetchMs, reconcileMs)
-		}
-		return nil
 	}
 }
 
@@ -362,43 +375,57 @@ func (a *Aggregator) EnsureMessagesAsync(sessionID string) {
 		// the newer live body instead of clobbering it with the stale fetched
 		// one (C-F2). Cleared by reconcileMessagesLocked after the merge.
 		a.store.MarkColdFetchStart(sessionID)
-		t0 := time.Now()
-		items, err := a.client.Messages(fetchCtx, sessionID)
-		if err != nil {
-			if fetchCtx.Err() != nil {
-				// Aggregator shutting down (or caller ctx cancelled in a direct
-				// test path): don't spam a completion event into a torn-down
-				// store, and don't log a spurious failure. The session stays
-				// unloaded; a later selection on a fresh aggregator retries.
+		// BOUNDED DISAMBIGUATION LOOP — see EnsureMessages for the full
+		// rationale. When a fetch leaves the session not-loaded because the
+		// newest COMPLETED assistant has zero resident parts
+		// (BlockedByUnconfirmedEmptyNewest), perform exactly ONE more GET on
+		// the same single-flight slot so the server can serve the real parts
+		// (schema-drift) or confirm the emptiness (source truth). Never a third
+		// GET; the final IsMessagesLoaded gate stays authoritative.
+		for attempt := 0; ; attempt++ {
+			t0 := time.Now()
+			items, err := a.client.Messages(fetchCtx, sessionID)
+			if err != nil {
+				if fetchCtx.Err() != nil {
+					// Aggregator shutting down (or caller ctx cancelled in a
+					// direct test path): don't spam a completion event into a
+					// torn-down store, and don't log a spurious failure. The
+					// session stays unloaded; a later selection on a fresh
+					// aggregator retries.
+					return
+				}
+				// Include fetchMs in the log: a background fetch the operator
+				// isn't watching still took wall-clock time before failing.
+				log.Printf("[aggregator] EnsureMessagesAsync failed for %s (fetch=%dms): %v", sessionID, time.Since(t0).Milliseconds(), err)
+				a.store.EmitMessagesError(sessionID, err.Error())
 				return
 			}
-			// Include fetchMs in the log: a background fetch the operator isn't
-			// watching still took wall-clock time before failing, useful signal.
-			log.Printf("[aggregator] EnsureMessagesAsync failed for %s (fetch=%dms): %v", sessionID, time.Since(t0).Milliseconds(), err)
-			a.store.EmitMessagesError(sessionID, err.Error())
+			fetchMs := time.Since(t0).Milliseconds()
+			tR := time.Now()
+			res := a.store.SetSessionMessages(sessionID, decodeMessages(items))
+			reconcileMs := time.Since(tR).Milliseconds()
+			// Emit completion ONLY when a batch was published (cold) or it was
+			// a genuine warm reconcile (no batch required) AND the resident-
+			// parts gate IsMessagesLoaded now holds — the SAME signal the
+			// snapshot gate exposes, so the client's messages.loaded never
+			// disagrees with the gate (b-F1: a fetch that left a completed
+			// assistant with zero resident parts must NOT tell the client
+			// "delivered"). SessionGone / PackagingFailed publish NO batch —
+			// emitting loaded then would break the one-batch-before-loaded
+			// ordering and reintroduce state after session.delete (Finding 3).
+			if (res.Status == state.ColdBatchEmitted || res.Status == state.ColdBatchWarmReconcile) && a.store.IsMessagesLoaded(sessionID) {
+				a.store.EmitMessagesLoaded(sessionID, fetchMs, reconcileMs)
+				return
+			}
+			// One disambiguating re-fetch when the block is specifically an
+			// unconfirmed empty newest (not a gone session or a packaging
+			// failure, both of which must neither retry nor emit loaded).
+			if attempt == 0 &&
+				(res.Status == state.ColdBatchEmitted || res.Status == state.ColdBatchWarmReconcile) &&
+				res.BlockedByUnconfirmedEmptyNewest {
+				continue
+			}
 			return
-		}
-		fetchMs := time.Since(t0).Milliseconds()
-		tR := time.Now()
-		status := a.store.SetSessionMessages(sessionID, decodeMessages(items))
-		reconcileMs := time.Since(tR).Milliseconds()
-		// Emit completion ONLY when a batch was published (cold) or it was a
-		// genuine warm reconcile (no batch required) AND the resident-parts
-		// gate IsMessagesLoaded now holds — the SAME signal the snapshot gate
-		// exposes, so the client's messages.loaded never disagrees with the
-		// gate (b-F1: a fetch that left a completed assistant with zero
-		// resident parts must NOT tell the client "delivered"). A cold fetch
-		// for a session that was deleted between reconcile and capture, or a
-		// packaging failure, publishes NO batch — emitting loaded here would
-		// deliver messages.loaded with no preceding messages.batch
-		// (one-batch-before-loaded ordering), and emitting an empty batch to
-		// satisfy ordering would reintroduce state after session.delete. When
-		// the session is gone the client tears it down on session.deleted
-		// (Finding 3). On a successful warm reconcile with zero changed deltas
-		// the loaded event is still emitted (resident holds) so the client
-		// exits the loading state.
-		if (status == state.ColdBatchEmitted || status == state.ColdBatchWarmReconcile) && a.store.IsMessagesLoaded(sessionID) {
-			a.store.EmitMessagesLoaded(sessionID, fetchMs, reconcileMs)
 		}
 	}()
 }

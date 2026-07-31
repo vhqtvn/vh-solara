@@ -93,3 +93,304 @@ func TestMessagesLoadedResidentGenuineEmpty(t *testing.T) {
 		t.Fatalf("gate.last_assistant_empty must be true for a reasoning-only turn (no text/tool content), got false")
 	}
 }
+
+// TestMessagesLoadedConfirmsSameEmptyNewestOnSecondReconcile is the CRUX fix for
+// ses_05ff9273dffe7N4dh1HliZhIXq: a session whose newest COMPLETED assistant
+// GENUINELY has zero source parts (confirmed in opencode's own DB) must report
+// IsMessagesLoaded=true after the emptiness is confirmed by a SECOND
+// authoritative reconcile — instead of looping "not loaded → re-fetch" forever.
+//
+// The distinguishing signal: a single fetch returning zero parts is ambiguous
+// (schema-drift cold load OR source-truth empty); only a SECOND reconcile
+// observing the SAME empty newest confirms source-truth. The schema-drift shape
+// (TestMessagesLoadedDerivedFromResidentParts) instead resolves via the
+// len(parts)>0 branch once the re-fetch serves the real parts.
+//
+// Maps to TDD cases 2 (confirmed → TRUE) and 3 (one reconcile → FALSE).
+func TestMessagesLoadedConfirmsSameEmptyNewestOnSecondReconcile(t *testing.T) {
+	s := New(100)
+	defer s.Close()
+	const sid = "sess"
+	s.Apply(ev("session.created", `{"info":{"id":"sess"}}`))
+
+	empty := func() []MessageWithParts {
+		return []MessageWithParts{{
+			Info: json.RawMessage(`{"id":"m_fb30","sessionID":"sess","role":"assistant","time":{"created":1,"completed":2},"finish":"stop"}`),
+			// no Parts — the genuine source-truth shape (opencode DB has 0 parts)
+		}}
+	}
+
+	// FIRST authoritative reconcile of the empty newest: pending only, NOT
+	// confirmed → IsMessagesLoaded must stay FALSE (the re-fetch guard — this
+	// is indistinguishable from a schema-drift cold load on a single fetch).
+	s.SetSessionMessages(sid, empty())
+	if s.IsMessagesLoaded(sid) {
+		t.Fatalf("IsMessagesLoaded must be FALSE after the FIRST empty reconcile (pending, not confirmed) — a single 0-parts fetch is ambiguous and must re-fetch")
+	}
+	if g := s.Snapshot(nil).Gate[sid]; g.MessagesLoaded {
+		t.Fatalf("gate.messagesLoaded must be FALSE after the first empty reconcile")
+	}
+
+	// SECOND authoritative reconcile returns the SAME empty newest: source truth
+	// confirmed → IsMessagesLoaded must become TRUE (the fix). This is the exact
+	// ses_05ff path: the aggregator re-fetches once, the server still has 0
+	// parts, and the turn is admitted as genuinely empty.
+	s.SetSessionMessages(sid, empty())
+	if !s.IsMessagesLoaded(sid) {
+		t.Fatalf("IsMessagesLoaded must be TRUE once the same empty newest is confirmed by a second reconcile (source truth)")
+	}
+	if g := s.Snapshot(nil).Gate[sid]; !g.MessagesLoaded {
+		t.Fatalf("gate.messagesLoaded must be TRUE after the second confirming reconcile")
+	}
+
+	// A third reconcile (e.g. a later re-open) stays confirmed → still loaded.
+	s.SetSessionMessages(sid, empty())
+	if !s.IsMessagesLoaded(sid) {
+		t.Fatalf("IsMessagesLoaded must remain TRUE on a third reconcile of the same confirmed-empty newest")
+	}
+}
+
+// TestMessagesLoadedEmptyConfirmationResetsWhenNewestChanges pins that the
+// confirmation is keyed on the EXACT newest-completed-assistant id: when the
+// newest changes (a newer completed turn appears), the confirmation resets and
+// the NEW empty newest must re-confirm from scratch. This is what keeps a
+// schema-drift or live-race gap on a NEWER turn from being pre-admitted by an
+// older turn's confirmation.
+func TestMessagesLoadedEmptyConfirmationResetsWhenNewestChanges(t *testing.T) {
+	s := New(100)
+	defer s.Close()
+	const sid = "sess"
+	s.Apply(ev("session.created", `{"info":{"id":"sess"}}`))
+
+	mk := func(id string) []MessageWithParts {
+		return []MessageWithParts{{
+			Info: json.RawMessage(`{"id":"` + id + `","sessionID":"sess","role":"assistant","time":{"created":1,"completed":2},"finish":"stop"}`),
+		}}
+	}
+
+	// Confirm the first empty newest "A" across two reconciles.
+	s.SetSessionMessages(sid, mk("A"))
+	s.SetSessionMessages(sid, mk("A"))
+	if !s.IsMessagesLoaded(sid) {
+		t.Fatalf("A must be confirmed empty (loaded) after two reconciles")
+	}
+
+	// A newer completed assistant "B" with 0 parts appears in the fetched set.
+	// "B" is NOT the confirmed id → must re-fetch (pending only, not loaded),
+	// even though "A" was previously confirmed empty.
+	s.SetSessionMessages(sid, mk("B"))
+	if s.IsMessagesLoaded(sid) {
+		t.Fatalf("IsMessagesLoaded must be FALSE for a NEWER empty newest 'B' (confirmed id is still 'A') — it must re-confirm")
+	}
+
+	// A second reconcile of "B" confirms it → loaded again.
+	s.SetSessionMessages(sid, mk("B"))
+	if !s.IsMessagesLoaded(sid) {
+		t.Fatalf("IsMessagesLoaded must be TRUE once the newer empty newest 'B' is confirmed by a second reconcile")
+	}
+}
+
+// TestMessagesLoadedLiveNewerEmptyAssistantRemainsBlocked is the S5 live-race
+// preservation guard (TDD case 4). A live message.upsert that completes a NEWER
+// assistant turn AFTER the cold fetch — with parts not yet streamed (zero
+// resident parts) — must force a re-fetch: the live turn was never processed by
+// an authoritative reconcile, so its emptiness is NOT confirmed, and admitting
+// it would hide a transient gap. The fix must not regress this.
+func TestMessagesLoadedLiveNewerEmptyAssistantRemainsBlocked(t *testing.T) {
+	s := New(100)
+	defer s.Close()
+	const sid = "sess"
+	s.Apply(ev("session.created", `{"info":{"id":"sess"}}`))
+
+	// Cold fetch returns a completed assistant "m1" WITH parts → loaded
+	// (resident; the empty-newest trackers are cleared since m1 has parts).
+	s.SetSessionMessages(sid, []MessageWithParts{{
+		Info:  json.RawMessage(`{"id":"m1","sessionID":"sess","role":"assistant","time":{"created":1,"completed":2},"finish":"stop"}`),
+		Parts: []json.RawMessage{json.RawMessage(`{"id":"p1","type":"text","text":"answer"}`)},
+	}})
+	if !s.IsMessagesLoaded(sid) {
+		t.Fatalf("baseline: a completed assistant with parts must be loaded")
+	}
+
+	// A LIVE message.upsert completes a NEWER assistant "m2" with zero parts
+	// (its parts arrive later via separate part.append events — the live race).
+	s.Apply(ev("message.updated", `{"info":{"id":"m2","sessionID":"sess","role":"assistant","time":{"created":3,"completed":4},"finish":"stop"}}`))
+
+	// m2 is now the newest COMPLETED assistant with 0 parts, but it was never
+	// processed by a reconcile → confirmedEmptyNewest[sid] ("" or "m1") != "m2"
+	// → NOT loaded → forces a re-fetch. This is the S5 guard preserved.
+	if s.IsMessagesLoaded(sid) {
+		t.Fatalf("IsMessagesLoaded must be FALSE when a LIVE newer completed assistant has 0 unconfirmed parts (live-race re-fetch guard)")
+	}
+	if g := s.Snapshot(nil).Gate[sid]; g.MessagesLoaded {
+		t.Fatalf("gate.messagesLoaded must be FALSE for the live newer 0-parts assistant")
+	}
+}
+
+// TestEmptyNewestConfirmationClearedOnSessionDelete ensures a recreated session
+// id re-confirms source-emptiness from scratch: the pending/confirmed trackers
+// are dropped on session delete, so a new session under the same id cannot be
+// pre-admitted by the prior lifetime's confirmation.
+func TestEmptyNewestConfirmationClearedOnSessionDelete(t *testing.T) {
+	s := New(100)
+	defer s.Close()
+	const sid = "sess"
+	s.Apply(ev("session.created", `{"info":{"id":"sess"}}`))
+
+	empty := []MessageWithParts{{
+		Info: json.RawMessage(`{"id":"m1","sessionID":"sess","role":"assistant","time":{"created":1,"completed":2},"finish":"stop"}`),
+	}}
+
+	// Confirm emptiness in the first lifetime.
+	s.SetSessionMessages(sid, empty)
+	s.SetSessionMessages(sid, empty)
+	if !s.IsMessagesLoaded(sid) {
+		t.Fatalf("expected loaded after confirming emptiness")
+	}
+
+	// Delete + recreate under the same id.
+	s.Apply(ev("session.deleted", `{"info":{"id":"sess"}}`))
+	s.Apply(ev("session.created", `{"info":{"id":"sess"}}`))
+
+	// First empty reconcile in the NEW lifetime must be pending (not confirmed)
+	// → NOT loaded. The prior confirmation must not carry over.
+	s.SetSessionMessages(sid, empty)
+	if s.IsMessagesLoaded(sid) {
+		t.Fatalf("IsMessagesLoaded must be FALSE on the first empty reconcile of a recreated session (confirmation was cleared on delete)")
+	}
+	// Second reconcile re-confirms → loaded.
+	s.SetSessionMessages(sid, empty)
+	if !s.IsMessagesLoaded(sid) {
+		t.Fatalf("IsMessagesLoaded must be TRUE after re-confirming emptiness in the new session lifetime")
+	}
+}
+
+// abortedAssistantInfo is the live opencode payload for the offending newest
+// completed assistant msg_fb30d2644001rKpffGJmphivax in ses_05ff9273dffe7N4dh1HliZhIXq
+// (fetched from opencode pid 1923 @ http://127.0.0.1:43889). It is an ABORTED
+// turn: info.error.name == "MessageAbortedError", tokens all zero, parts:[],
+// no finish. Verbatim so the terminal-error parsing is exercised against the
+// exact wire shape the daemon sees in production.
+const abortedAssistantInfo = `{"id":"m_fb30","sessionID":"sess","role":"assistant","time":{"created":1785415411268,"completed":1785415414277},"error":{"name":"MessageAbortedError","data":{"message":"Aborted"}},"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"variant":"default"}`
+
+// TestMessagesLoadedAbortedNewestAdmittedOnFirstReconcile is the CRUX of the
+// terminal-error fast-path (TDD case #1): a newest COMPLETED assistant carrying
+// a recognized terminal error (MessageAbortedError) with zero parts is admitted
+// as loaded on the FIRST reconcile — WITHOUT the second confirming reconcile the
+// O5 backstop requires. The aborted signal is a POSITIVE terminal
+// classification: opencode itself marked the turn as having produced no output
+// (the live payload: error.name=MessageAbortedError, tokens all zero, parts:[],
+// no finish), so zero resident parts is source truth, not a schema-drift gap.
+//
+// This is strictly better than O5 for aborted turns: ses_05ff now loads after a
+// SINGLE fetch instead of two. The store-level proof that the aggregator will
+// NOT re-fetch is BlockedByUnconfirmedEmptyNewest == false after this reconcile.
+func TestMessagesLoadedAbortedNewestAdmittedOnFirstReconcile(t *testing.T) {
+	s := New(100)
+	defer s.Close()
+	const sid = "sess"
+	s.Apply(ev("session.created", `{"info":{"id":"sess"}}`))
+
+	// ONE authoritative reconcile of the aborted newest (verbatim live shape).
+	res := s.SetSessionMessages(sid, []MessageWithParts{{
+		Info: json.RawMessage(abortedAssistantInfo),
+		// no Parts — the turn is aborted and produced no output
+	}})
+
+	// CRUX: loaded is TRUE after the SINGLE first reconcile (no re-fetch).
+	if !s.IsMessagesLoaded(sid) {
+		t.Fatalf("IsMessagesLoaded must be TRUE on the FIRST reconcile for an aborted newest (terminal-error fast-path) — a single 0-parts fetch with a terminal error is positive source truth, not ambiguous")
+	}
+	if g := s.Snapshot(nil).Gate[sid]; !g.MessagesLoaded {
+		t.Fatalf("gate.messagesLoaded must be TRUE on the first reconcile for an aborted newest")
+	}
+	// The aggregator reads this to decide whether to re-fetch: an aborted turn
+	// is positively classified, so it must NOT signal a re-fetch (one fetch
+	// suffices). This is the store-level "no re-fetch" proof.
+	if res.BlockedByUnconfirmedEmptyNewest {
+		t.Fatalf("BlockedByUnconfirmedEmptyNewest must be FALSE for an aborted newest — the aggregator must not re-fetch a positively-terminal turn")
+	}
+}
+
+// TestMessagesLoadedNonTerminalErrorFallsBackToO5Confirmation is TDD case #2:
+// a newest COMPLETED assistant with zero parts whose error name is NOT a
+// recognized terminal classification must still require the O5 two-empty
+// confirmation (the backstop is preserved for unrecognized errors). The gate
+// treats only the documented terminalErrorNames set as positive; an unknown
+// error name is not trusted to mean "outputless".
+func TestMessagesLoadedNonTerminalErrorFallsBackToO5Confirmation(t *testing.T) {
+	s := New(100)
+	defer s.Close()
+	const sid = "sess"
+	s.Apply(ev("session.created", `{"info":{"id":"sess"}}`))
+
+	// A completed assistant with zero parts and an UNRECOGNIZED error name.
+	nonTerminal := []MessageWithParts{{
+		Info: json.RawMessage(`{"id":"m1","sessionID":"sess","role":"assistant","time":{"created":1,"completed":2},"error":{"name":"SomeUnrecognizedError","data":{}}}`),
+	}}
+
+	// FIRST reconcile: not confirmed → must stay FALSE (O5 backstop preserved).
+	res := s.SetSessionMessages(sid, nonTerminal)
+	if s.IsMessagesLoaded(sid) {
+		t.Fatalf("IsMessagesLoaded must be FALSE after the first reconcile of a NON-terminal error newest — the O5 backstop must still require confirmation")
+	}
+	if !res.BlockedByUnconfirmedEmptyNewest {
+		t.Fatalf("BlockedByUnconfirmedEmptyNewest must be TRUE for a non-terminal error newest — the aggregator must re-fetch to disambiguate")
+	}
+
+	// SECOND reconcile of the same empty newest → O5 confirms source truth → TRUE.
+	s.SetSessionMessages(sid, nonTerminal)
+	if !s.IsMessagesLoaded(sid) {
+		t.Fatalf("IsMessagesLoaded must be TRUE once the same non-terminal-error empty newest is confirmed by a second reconcile (O5 backstop intact)")
+	}
+}
+
+// TestMessagesLoadedAbortedFastPathDoesNotBreakO5Confirmation is TDD case #3
+// (regression guard): the O5 two-empty confirmation path for a zero-parts
+// newest with NO error at all must remain unchanged after the aborted fast-path
+// is layered on top — a single empty reconcile stays FALSE, a second confirms
+// TRUE. (Also covered by TestMessagesLoadedConfirmsSameEmptyNewestOnSecondReconcile;
+// this is the focused assertion that the new branch did not regress the no-error
+// shape.)
+func TestMessagesLoadedAbortedFastPathDoesNotBreakO5Confirmation(t *testing.T) {
+	s := New(100)
+	defer s.Close()
+	const sid = "sess"
+	s.Apply(ev("session.created", `{"info":{"id":"sess"}}`))
+
+	empty := []MessageWithParts{{
+		Info: json.RawMessage(`{"id":"m1","sessionID":"sess","role":"assistant","time":{"created":1,"completed":2},"finish":"stop"}`),
+	}}
+
+	// FIRST reconcile (no error): pending → FALSE.
+	s.SetSessionMessages(sid, empty)
+	if s.IsMessagesLoaded(sid) {
+		t.Fatalf("IsMessagesLoaded must be FALSE after the first no-error empty reconcile — O5 path unchanged")
+	}
+	// SECOND reconcile (no error): confirmed → TRUE.
+	s.SetSessionMessages(sid, empty)
+	if !s.IsMessagesLoaded(sid) {
+		t.Fatalf("IsMessagesLoaded must be TRUE after the second no-error empty reconcile — O5 path unchanged")
+	}
+}
+
+// TestMessagesLoadedAbortedNewestWithPartsLoadsNormally is TDD case #4
+// (baseline): an aborted newest that DID carry resident parts loads via the
+// normal len(parts)>0 branch — the terminal-error fast-path is only the
+// zero-parts admit; a parts-bearing turn is resident regardless of error.
+func TestMessagesLoadedAbortedNewestWithPartsLoadsNormally(t *testing.T) {
+	s := New(100)
+	defer s.Close()
+	const sid = "sess"
+	s.Apply(ev("session.created", `{"info":{"id":"sess"}}`))
+
+	// An aborted turn that nonetheless has a resident part (e.g. partial output
+	// streamed before the abort). The len(parts)>0 branch admits it directly.
+	s.SetSessionMessages(sid, []MessageWithParts{{
+		Info:  json.RawMessage(abortedAssistantInfo),
+		Parts: []json.RawMessage{json.RawMessage(`{"id":"p1","type":"text","text":"partial before abort"}`)},
+	}})
+	if !s.IsMessagesLoaded(sid) {
+		t.Fatalf("IsMessagesLoaded must be TRUE for an aborted newest that carries resident parts (normal len(parts)>0 branch)")
+	}
+}
