@@ -1266,6 +1266,60 @@ function main() {
             );
         }
 
+        // Overlap-detection skipped-cards surfacing — SAVE path
+        // (defer-overlap-detector-save-path-skipped-cards): saveCoordinationTask
+        // must surface the same collectSkipped signal as the read path. Commit
+        // b3080ed threaded collectSkipped into detectCoordinationTaskOverlaps;
+        // both save AND read allocate a collector and return skipped_cards, but
+        // the prior regression only asserted the READ path. Save a VALID task
+        // with non-empty files_in_scope overlapping the malformed card and assert
+        // its returned skipped_cards carries invalidTaskID with the
+        // success_criteria error — mirroring the read-path assertion above.
+        const saveSurfaced = saveCoordinationTask(
+            coordinatorSessionID,
+            {
+                title: "Save-path overlap skipped-cards probe",
+                task_type: "study",
+                coordination_mode: "short",
+                primary_lane: "queueing",
+                files_in_scope: ["tests/fixtures/example-pkg/"],
+                constraints: [
+                    "This task exists only to verify the save-path skipped_cards signal.",
+                ],
+                non_goals: ["No implementation work."],
+                success_criteria: [
+                    "Save path surfaces the malformed sibling card in skipped_cards.",
+                ],
+                validation_plan: [
+                    "Assert saveCoordinationTask's skipped_cards carries the invalid card.",
+                ],
+            },
+            { cwd: "/verification" },
+        );
+        createdTaskIDs.push(saveSurfaced.task.task_id);
+        const saveSkippedInvalid = (saveSurfaced.skipped_cards || []).find(
+            (entry) => entry.task_id === invalidTaskID,
+        );
+        if (!saveSkippedInvalid) {
+            throw new StateError(
+                "Expected saveCoordinationTask to surface the malformed card in skipped_cards via overlap detection's collectSkipped collector.",
+            );
+        }
+        if (!String(saveSkippedInvalid.error || "").includes("success_criteria")) {
+            throw new StateError(
+                `Expected save-path skipped_cards error to name the missing success_criteria field, got "${saveSkippedInvalid.error}".`,
+            );
+        }
+        if (
+            saveSurfaced.overlaps.some(
+                (entry) => entry.task_id === invalidTaskID,
+            )
+        ) {
+            throw new StateError(
+                "Expected the invalid card to be skipped (surfaced in skipped_cards on save), not reported as an overlap.",
+            );
+        }
+
         console.log("verification: ok");
         console.log(`primary_task_id: ${primary.task.task_id}`);
         console.log(`overlap_task_id: ${overlap.task.task_id}`);
