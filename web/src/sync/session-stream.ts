@@ -574,13 +574,7 @@ export function openSessionStream(id: string, force = false) {
         if (wasExpected) maybeResolveReconcile();
       }
     });
-    ses.addEventListener("ping", () => {
-      if (gen !== sesGen) return;
-      // Transport-only: refresh sessionLastSeen but NOT sessionContentSeen, so
-      // a ping-only stream (transport alive, zero content) lets the content
-      // clock age out and the watchdog's content-stall branch fires.
-      markSessionTransportSeen();
-    });
+    registerSessionPingListener(ses, gen);
     // L1 t1: socket established → pure connection-latency delta. Stream 2 had
     // no explicit onopen before; added for the latency diagnostic (and parity
     // with Stream 1's connect/backoff semantics).
@@ -591,184 +585,7 @@ export function openSessionStream(id: string, force = false) {
       if (sesT0) recordLatency("session", "open", sesT1 - sesT0);
       sesBackoff = 1500; // Phase 3-F: healthy open resets the CLOSED-reopen backoff
     };
-    for (const kind of ["message.upsert", "message.delete", "part.upsert", "part.delete", "messages.loaded", "messages.error", "messages.batch"]) {
-      ses!.addEventListener(kind, async (e) => {
-        // Gen guard: ignore frames from a superseded connection BEFORE touching
-        // the clock or the store.
-        if (gen !== sesGen) return;
-        markSessionSeen();
-        // Track Stream2's local cursor from the SSE id field (mirrors the
-        // snapshot listener). Done BEFORE the gate check so even a deferred
-        // (busy-gated) frame advances sesCursor — the event WAS received, so a
-        // retry after the gate releases must not replay it.
-        {
-          const seq = Number((e as MessageEvent).lastEventId);
-          if (seq > sesCursor) sesCursor = seq;
-        }
-        if (isGateActive()) {
-          // Deferred Stream-2 frame — neither mutate the store nor advance the
-          // shared cursor. Latch dirty so the coalesced refresh catches up.
-          markBusyDirty();
-          return;
-        }
-        const ev = e as MessageEvent;
-        // Parse the payload once (was inline at applyMessageEvent); reused for
-        // the split-timing read below. trackCursor:false — Stream 2 must not
-        // advance Stream 1's resume cursor.
-        let data: any;
-        try {
-          data = JSON.parse(ev.data);
-        } catch (err) {
-          // Stream-2 never advances the shared cursor; a malformed message/part
-          // frame is a clean log + drop. No pendingBatch entry was registered
-          // for this frame (it's set up downstream, only for messages.batch
-          // AFTER a successful parse), so a later messages.loaded for this
-          // session finds no pending decode and opens the reveal gate without
-          // wedging.
-          log.warn("sync", "malformed session frame", { kind, err });
-          return;
-        }
-        const sid: string | undefined = data?.sessionID;
-        // Capture the gate epoch at entry so post-await application points can
-        // detect that the gate activated during an await (snapshot decode or
-        // batch decode) and refuse to mutate the store.
-        const ep = currentGateEpoch();
-
-        // Serialize against an in-flight gzip64 snapshot decode for this
-        // connection. applySessionSnapshot MERGES message bodies via
-        // prependMessagesIfAbsent (a mid-decode live event is NOT clobbered in
-        // body), but wholesale-sets messageWindows[id] + the delivered flag and
-        // lazily inits messages[id] — those side-effects must serialize behind
-        // the decode. Wait ONLY
-        // when a decode is actually in flight — the boolean check is a no-op on
-        // the fast path so message.upsert/part.upsert floods keep zero microtask
-        // latency. Connect-time only (a snapshot decode is ms-scale).
-        if (sesSnapshotDecoding) await sesSnapshotDecode;
-        // Generation re-check (finding #3): we just awaited the in-flight
-        // snapshot decode — the connection may have been replaced (sesGen
-        // bumped) during that wait. The entry guard ran before the await, so
-        // drop the stale continuation here before any state effect. Supplements
-        // the epoch guard below (which handles a busy-gate activation, not a
-        // connection replacement — a sesGen bump does not change the epoch).
-        if (gen !== sesGen) return;
-        // Epoch guard: the gate may have activated during the snapshot-decode wait.
-        if (ep !== currentGateEpoch()) {
-          if (isGateActive()) markBusyDirty();
-          return;
-        }
-
-        // Phase 4 — historical-page dirty-mirror hook. Mark the in-flight
-        // historical page dirty ONLY for resurrection-class mutations
-        // (message.delete / part.delete / messages.batch — see
-        // isPageDirtyingKind) so the response gate (runPageFetchLoop) discards
-        // + retries. This is the client mirror of the server's
-        // me.liveTouchedBody/me.liveTouchedParts (pkg/state/store.go) — live
-        // state always wins, so a page snapshot that raced a resurrection-class
-        // mutation is stale.
-        //
-        // NARROW FILTER: the filter deliberately EXCLUDES message.upsert and
-        // part.upsert. The merge is insert-if-not-present (live always wins),
-        // so a live upsert CANNOT make a stale page resurrect anything:
-        //   - upsert for a NEW tail message: newer than the `before` cursor →
-        //     NOT in the page range.
-        //   - upsert for an EXISTING message / part: prependMessagesIfAbsent
-        //     and upsertPart both leave the live entry untouched.
-        // Excluding upserts is what keeps Load-older usable on actively-
-        // streaming sessions (a part.upsert flood per streamed token would
-        // otherwise exhaust MAX_PAGE_RETRIES and abandon with no merge).
-        // messages.loaded/messages.error are also excluded (reveal-gate flips,
-        // not content mutations).
-        //
-        // Placed AFTER the gen+epoch re-checks so a superseded connection or a
-        // gate activation during the snapshot-decode await does NOT mark a page
-        // dirty for a connection/gate the page no longer belongs to.
-        if (sid && isPageDirtyingKind(kind)) {
-          markPageDirty(sid);
-        }
-
-        // messages.batch is application-compressed (gzip+base64) to cut cold-
-        // load hydrate latency over the controller tunnel. The decode is ASYNC
-        // (native DecompressionStream), but EventSource fires the next event
-        // (messages.loaded) as soon as this listener RETURNS — i.e. before the
-        // decode resolves. Without coordination messages.loaded would flip
-        // messagesDelivered (the reveal gate, P1-WEB-020) before the batch content
-        // staged → flash of empty content at reveal. Promise-gate: stash the
-        // decode promise keyed by sessionID; the messages.loaded/messages.error
-        // path below awaits any pending entry before flipping the gate. The
-        // batch case of applyMessageEvent is UNCHANGED — it receives an
-        // already-decoded {sessionID, messages} (same shape as before
-        // compression). NOTE: an async listener with NO await on the warm path
-        // runs synchronously to completion (async functions only suspend at an
-        // awaited expression), so message.upsert/part.upsert floods pay zero
-        // microtask latency — only batch (decode) and loaded/error (gate wait)
-        // ever await.
-        if (kind === "messages.batch") {
-          const p = (async () => {
-            const decoded = await decodeMessagesBatch(data);
-            // Generation re-check (finding #3): the batch decode AWAITED — the
-            // connection may have been replaced (sesGen bumped) while decoding.
-            // The entry guard ran before the await. A superseded decode must not
-            // stage its batch into the store; supplements the epoch guard below.
-            if (gen !== sesGen) return;
-            // Epoch guard: the gate may have activated during the batch decode.
-            if (ep === currentGateEpoch()) {
-              applyMessageEvent("messages.batch", Number(ev.lastEventId), decoded, false);
-            } else if (isGateActive()) {
-              markBusyDirty();
-            }
-          })();
-          if (sid) pendingBatch.set(sid, p);
-          try {
-            await p;
-          } finally {
-            if (sid) pendingBatch.delete(sid);
-          }
-          return;
-        }
-
-        // messages.loaded / messages.error: await any in-flight batch decode
-        // for this session so the gate opens AFTER content is staged. (Also
-        // makes the L1 hydrate timing stamp below include the decode cost —
-        // more correct.) If no batch is pending this is a no-op.
-        if (sid && pendingBatch.has(sid)) {
-          await pendingBatch.get(sid);
-        }
-        // Generation re-check (finding #3): we just awaited a pending batch
-        // decode — the connection may have been replaced (sesGen bumped) during
-        // that wait. The entry guard ran before the await. Drop the stale
-        // continuation before the latency/reveal stamps and the messages.loaded
-        // application below; supplements the epoch guard.
-        if (gen !== sesGen) return;
-        // Epoch guard: the gate may have activated during the batch-decode wait.
-        if (ep !== currentGateEpoch()) {
-          if (isGateActive()) markBusyDirty();
-          return;
-        }
-
-        // L1 hydrate: messages.loaded arrival closes the cold-session
-        // upstream-fetch window that `snap` misses. Recorded once per
-        // connection — sesHydrating flips off so a duplicate messages.loaded
-        // (or one arriving after a warm snapshot, which never set the flag)
-        // does not overwrite the stamp. Belongs to THIS connection: the flag
-        // and sesFirstSnap are reset in open() and only this connection's
-        // (still-open) EventSource fires its listeners, so a torn-down prior
-        // connection cannot stamp a stale delta here.
-        if (kind === "messages.loaded" && sesHydrating && sesFirstSnap) {
-          sesHydrating = false;
-          recordSessionHydrate(performance.now() - sesFirstSnap);
-          // Split-timing: the daemon reports how much of `hydrate` was the
-          // upstream fetch vs the daemon-side reconcile. Read defensively — an
-          // older daemon omits fetchMs/reconcileMs (render "—"). Parsed on the
-          // same cold-session path as the hydrate stamp (a warm session never
-          // reaches here).
-          recordSessionFetchSplit(
-            typeof data.fetchMs === "number" ? data.fetchMs : undefined,
-            typeof data.reconcileMs === "number" ? data.reconcileMs : undefined,
-          );
-        }
-        applyMessageEvent(kind, Number(ev.lastEventId), data, false);
-      });
-    }
+    registerSessionMessageListeners(ses, gen);
     ses.onerror = () => {
       // Gen guard: a superseded connection's error must not arm a retry on
       // behalf of the new (current) connection — the current connection owns
@@ -787,4 +604,230 @@ export function openSessionStream(id: string, force = false) {
     };
   };
   open();
+}
+
+
+// === open() session ping listener registration (decomposition Stage 1) ======
+// Extracted VERBATIM from the nested open() in openSessionStream() — the
+// transport-only Stream2 heartbeat listener. Only the addEventListener
+// registration was relocated from its inline position in open(); no callback
+// body changed. Registration order is preserved: ping is registered after the
+// inline snapshot listener and before the inline onopen, exactly as before.
+//
+// Synchronous by contract (registration only, no async, no Promise return).
+// `gen` is THIS connection's captured generation token, passed by value; the
+// callback reads `gen` for the stale-entry guard and the live module-scope
+// `sesGen` exactly as the inline registration did. No open()-local state other
+// than `es`/`gen` is captured, so there is no ctx.
+function registerSessionPingListener(es: EventSource, gen: number): void {
+  es.addEventListener("ping", () => {
+    if (gen !== sesGen) return;
+    // Transport-only: refresh sessionLastSeen but NOT sessionContentSeen, so
+    // a ping-only stream (transport alive, zero content) lets the content
+    // clock age out and the watchdog's content-stall branch fires.
+    markSessionTransportSeen();
+  });
+}
+
+// === open() session message-listener registration (decomposition Stage 2) ====
+// Extracted VERBATIM from the nested open() in openSessionStream() — the
+// CONTIGUOUS message/part cohort: the 7-kind loop (message.upsert /
+// message.delete / part.upsert / part.delete / messages.loaded / messages.error
+// / messages.batch) routed through applyMessageEvent with trackCursor=false —
+// the LOAD-BEARING Stream2 invariant (Stream 2 must NEVER advance Stream 1's
+// shared resume cursor; see invariant audit §3e). Only the addEventListener
+// registration (the for-loop) was relocated from its inline position in open();
+// no callback body changed (the only mechanical edit: `ses!.addEventListener`
+// became `es.addEventListener` because the parameter is already non-nullable).
+// Registration order is preserved: the 7 kinds are registered after the inline
+// onopen and before the inline onerror, exactly as before. Every cohort event
+// name is distinct from the inline snapshot / ping listeners, so consolidating
+// them at this registration site has no dispatch-order effect (EventSource
+// fires per-name listeners in registration order, and each name has exactly one
+// listener); the full set is pinned by stream2Registration.test.ts.
+//
+// Synchronous by contract (registration only, no async, no Promise return).
+// `gen` is THIS connection's captured generation token, passed by value; the
+// callback reads `gen` for the stale-entry / post-await recheck guards and the
+// live module-scope `sesGen` exactly as the inline registration did. No
+// open()-local state other than `es`/`gen` is captured, so there is no ctx.
+function registerSessionMessageListeners(es: EventSource, gen: number): void {
+  for (const kind of ["message.upsert", "message.delete", "part.upsert", "part.delete", "messages.loaded", "messages.error", "messages.batch"]) {
+    es.addEventListener(kind, async (e) => {
+      // Gen guard: ignore frames from a superseded connection BEFORE touching
+      // the clock or the store.
+      if (gen !== sesGen) return;
+      markSessionSeen();
+      // Track Stream2's local cursor from the SSE id field (mirrors the
+      // snapshot listener). Done BEFORE the gate check so even a deferred
+      // (busy-gated) frame advances sesCursor — the event WAS received, so a
+      // retry after the gate releases must not replay it.
+      {
+        const seq = Number((e as MessageEvent).lastEventId);
+        if (seq > sesCursor) sesCursor = seq;
+      }
+      if (isGateActive()) {
+        // Deferred Stream-2 frame — neither mutate the store nor advance the
+        // shared cursor. Latch dirty so the coalesced refresh catches up.
+        markBusyDirty();
+        return;
+      }
+      const ev = e as MessageEvent;
+      // Parse the payload once (was inline at applyMessageEvent); reused for
+      // the split-timing read below. trackCursor:false — Stream 2 must not
+      // advance Stream 1's resume cursor.
+      let data: any;
+      try {
+        data = JSON.parse(ev.data);
+      } catch (err) {
+        // Stream-2 never advances the shared cursor; a malformed message/part
+        // frame is a clean log + drop. No pendingBatch entry was registered
+        // for this frame (it's set up downstream, only for messages.batch
+        // AFTER a successful parse), so a later messages.loaded for this
+        // session finds no pending decode and opens the reveal gate without
+        // wedging.
+        log.warn("sync", "malformed session frame", { kind, err });
+        return;
+      }
+      const sid: string | undefined = data?.sessionID;
+      // Capture the gate epoch at entry so post-await application points can
+      // detect that the gate activated during an await (snapshot decode or
+      // batch decode) and refuse to mutate the store.
+      const ep = currentGateEpoch();
+
+      // Serialize against an in-flight gzip64 snapshot decode for this
+      // connection. applySessionSnapshot MERGES message bodies via
+      // prependMessagesIfAbsent (a mid-decode live event is NOT clobbered in
+      // body), but wholesale-sets messageWindows[id] + the delivered flag and
+      // lazily inits messages[id] — those side-effects must serialize behind
+      // the decode. Wait ONLY
+      // when a decode is actually in flight — the boolean check is a no-op on
+      // the fast path so message.upsert/part.upsert floods keep zero microtask
+      // latency. Connect-time only (a snapshot decode is ms-scale).
+      if (sesSnapshotDecoding) await sesSnapshotDecode;
+      // Generation re-check (finding #3): we just awaited the in-flight
+      // snapshot decode — the connection may have been replaced (sesGen
+      // bumped) during that wait. The entry guard ran before the await, so
+      // drop the stale continuation here before any state effect. Supplements
+      // the epoch guard below (which handles a busy-gate activation, not a
+      // connection replacement — a sesGen bump does not change the epoch).
+      if (gen !== sesGen) return;
+      // Epoch guard: the gate may have activated during the snapshot-decode wait.
+      if (ep !== currentGateEpoch()) {
+        if (isGateActive()) markBusyDirty();
+        return;
+      }
+
+      // Phase 4 — historical-page dirty-mirror hook. Mark the in-flight
+      // historical page dirty ONLY for resurrection-class mutations
+      // (message.delete / part.delete / messages.batch — see
+      // isPageDirtyingKind) so the response gate (runPageFetchLoop) discards
+      // + retries. This is the client mirror of the server's
+      // me.liveTouchedBody/me.liveTouchedParts (pkg/state/store.go) — live
+      // state always wins, so a page snapshot that raced a resurrection-class
+      // mutation is stale.
+      //
+      // NARROW FILTER: the filter deliberately EXCLUDES message.upsert and
+      // part.upsert. The merge is insert-if-not-present (live always wins),
+      // so a live upsert CANNOT make a stale page resurrect anything:
+      //   - upsert for a NEW tail message: newer than the `before` cursor →
+      //     NOT in the page range.
+      //   - upsert for an EXISTING message / part: prependMessagesIfAbsent
+      //     and upsertPart both leave the live entry untouched.
+      // Excluding upserts is what keeps Load-older usable on actively-
+      // streaming sessions (a part.upsert flood per streamed token would
+      // otherwise exhaust MAX_PAGE_RETRIES and abandon with no merge).
+      // messages.loaded/messages.error are also excluded (reveal-gate flips,
+      // not content mutations).
+      //
+      // Placed AFTER the gen+epoch re-checks so a superseded connection or a
+      // gate activation during the snapshot-decode await does NOT mark a page
+      // dirty for a connection/gate the page no longer belongs to.
+      if (sid && isPageDirtyingKind(kind)) {
+        markPageDirty(sid);
+      }
+
+      // messages.batch is application-compressed (gzip+base64) to cut cold-
+      // load hydrate latency over the controller tunnel. The decode is ASYNC
+      // (native DecompressionStream), but EventSource fires the next event
+      // (messages.loaded) as soon as this listener RETURNS — i.e. before the
+      // decode resolves. Without coordination messages.loaded would flip
+      // messagesDelivered (the reveal gate, P1-WEB-020) before the batch content
+      // staged → flash of empty content at reveal. Promise-gate: stash the
+      // decode promise keyed by sessionID; the messages.loaded/messages.error
+      // path below awaits any pending entry before flipping the gate. The
+      // batch case of applyMessageEvent is UNCHANGED — it receives an
+      // already-decoded {sessionID, messages} (same shape as before
+      // compression). NOTE: an async listener with NO await on the warm path
+      // runs synchronously to completion (async functions only suspend at an
+      // awaited expression), so message.upsert/part.upsert floods pay zero
+      // microtask latency — only batch (decode) and loaded/error (gate wait)
+      // ever await.
+      if (kind === "messages.batch") {
+        const p = (async () => {
+          const decoded = await decodeMessagesBatch(data);
+          // Generation re-check (finding #3): the batch decode AWAITED — the
+          // connection may have been replaced (sesGen bumped) while decoding.
+          // The entry guard ran before the await. A superseded decode must not
+          // stage its batch into the store; supplements the epoch guard below.
+          if (gen !== sesGen) return;
+          // Epoch guard: the gate may have activated during the batch decode.
+          if (ep === currentGateEpoch()) {
+            applyMessageEvent("messages.batch", Number(ev.lastEventId), decoded, false);
+          } else if (isGateActive()) {
+            markBusyDirty();
+          }
+        })();
+        if (sid) pendingBatch.set(sid, p);
+        try {
+          await p;
+        } finally {
+          if (sid) pendingBatch.delete(sid);
+        }
+        return;
+      }
+
+      // messages.loaded / messages.error: await any in-flight batch decode
+      // for this session so the gate opens AFTER content is staged. (Also
+      // makes the L1 hydrate timing stamp below include the decode cost —
+      // more correct.) If no batch is pending this is a no-op.
+      if (sid && pendingBatch.has(sid)) {
+        await pendingBatch.get(sid);
+      }
+      // Generation re-check (finding #3): we just awaited a pending batch
+      // decode — the connection may have been replaced (sesGen bumped) during
+      // that wait. The entry guard ran before the await. Drop the stale
+      // continuation before the latency/reveal stamps and the messages.loaded
+      // application below; supplements the epoch guard.
+      if (gen !== sesGen) return;
+      // Epoch guard: the gate may have activated during the batch-decode wait.
+      if (ep !== currentGateEpoch()) {
+        if (isGateActive()) markBusyDirty();
+        return;
+      }
+
+      // L1 hydrate: messages.loaded arrival closes the cold-session
+      // upstream-fetch window that `snap` misses. Recorded once per
+      // connection — sesHydrating flips off so a duplicate messages.loaded
+      // (or one arriving after a warm snapshot, which never set the flag)
+      // does not overwrite the stamp. Belongs to THIS connection: the flag
+      // and sesFirstSnap are reset in open() and only this connection's
+      // (still-open) EventSource fires its listeners, so a torn-down prior
+      // connection cannot stamp a stale delta here.
+      if (kind === "messages.loaded" && sesHydrating && sesFirstSnap) {
+        sesHydrating = false;
+        recordSessionHydrate(performance.now() - sesFirstSnap);
+        // Split-timing: the daemon reports how much of `hydrate` was the
+        // upstream fetch vs the daemon-side reconcile. Read defensively — an
+        // older daemon omits fetchMs/reconcileMs (render "—"). Parsed on the
+        // same cold-session path as the hydrate stamp (a warm session never
+        // reaches here).
+        recordSessionFetchSplit(
+          typeof data.fetchMs === "number" ? data.fetchMs : undefined,
+          typeof data.reconcileMs === "number" ? data.reconcileMs : undefined,
+        );
+      }
+      applyMessageEvent(kind, Number(ev.lastEventId), data, false);
+    });
+  }
 }
