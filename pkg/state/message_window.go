@@ -44,7 +44,7 @@ import (
 //     s.windowMaxCount / s.windowMaxBytes, which are the fields actually read
 //     by the store's projection paths (captureMessagesBatchLocked,
 //     materializeSnapshot, SnapshotMessagesPage). Tests shrink the INSTANCE
-//     field (via withWindowBounds(t, s, ...)), not this global, so a -race run
+//     field (via withWindowBounds(cfg, ...) + mustNew), not this global, so a -race run
 //     cannot observe a global mutation racing a lingering goroutine.
 //
 //  2. The cross-package clamp ceiling: pkg/web/messages_http.go reads these

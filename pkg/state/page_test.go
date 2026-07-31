@@ -395,8 +395,7 @@ func TestSnapshotMessagesPage_MissingSession(t *testing.T) {
 // `before`. Shrinks the defaults so the fallback is observable without seeding
 // 100+ messages.
 func TestSnapshotMessagesPage_DefaultsWhenBoundsZero(t *testing.T) {
-	s := New(100)
-	withWindowBounds(t, s, 2, 1<<20)
+	s := mustNew(t, withWindowBounds(DefaultConfig(100), 2, 1<<20))
 	seedFourMessages(t, s, "df") // m1..m4
 	// limit=0 → defaults to WindowMaxCount=2; page = [m2,m3] (overlap m3 + 1 older)
 	res := s.SnapshotMessagesPage("df", "m3", 0, 0)

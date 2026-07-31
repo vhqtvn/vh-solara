@@ -139,17 +139,14 @@ func TestArchiveTombstone_LiveStatusEventBlocked(t *testing.T) {
 	}
 }
 
-// TestArchiveTombstone_ExpiresAndAllowsReinsertion verifies the tombstone has a
-// bounded TTL: after it expires, a session.updated with archived=null is
-// withRecentArchiveTTL temporarily overrides the per-instance s.recentArchiveTTL
-// (promoted off the package global in GAP-S5 so tests can shrink it without a
-// global-mutation race under -race) and restores it on cleanup. The Store must
-// already be constructed (call after New). Mirrors withFlushInterval.
-func withRecentArchiveTTL(t *testing.T, s *Store, d time.Duration) {
-	t.Helper()
-	prev := s.recentArchiveTTL
-	s.recentArchiveTTL = d
-	t.Cleanup(func() { s.recentArchiveTTL = prev })
+// withRecentArchiveTTL sets the per-instance archive tombstone TTL on a Config
+// (the GAP-S5-promoted tunable), returning the modified Config for chaining.
+// Pair with mustNew so the value flows through Config.validate() at
+// construction — no Store instance field is mutated post-construction.
+// Mirrors withFlushInterval.
+func withRecentArchiveTTL(cfg Config, d time.Duration) Config {
+	cfg.RecentArchiveTTL = d
+	return cfg
 }
 
 // TestArchiveTombstone_ExpiresAndAllowsReinsertion is the TTL-expiry case: a
@@ -158,9 +155,8 @@ func withRecentArchiveTTL(t *testing.T, s *Store, d time.Duration) {
 // passed) is processed normally (so a genuine re-creation or a long-delayed
 // event isn't suppressed forever).
 func TestArchiveTombstone_ExpiresAndAllowsReinsertion(t *testing.T) {
-	// Use a short TTL for the test (on the instance, GAP-S5).
-	s := New(100)
-	withRecentArchiveTTL(t, s, 5*time.Millisecond)
+	// Use a short TTL for the test (validated via Config, GAP-S5).
+	s := mustNew(t, withRecentArchiveTTL(DefaultConfig(100), 5*time.Millisecond))
 
 	s.Apply(ev("session.created", `{"info":{"id":"s1","title":"root"}}`))
 	s.RemoveSessions([]string{"s1"})
@@ -191,8 +187,7 @@ func TestArchiveTombstone_ExpiresAndAllowsReinsertion(t *testing.T) {
 // and leave it unguarded so the next busy status re-promotes it. The tombstone
 // is cleared ONLY by the explicit unarchive flow (ClearArchiveTombstones).
 func TestArchiveTombstone_HydrateDoesNotClearTombstone(t *testing.T) {
-	s := New(100)
-	withRecentArchiveTTL(t, s, 5*time.Minute) // long enough to not expire during the test
+	s := mustNew(t, withRecentArchiveTTL(DefaultConfig(100), 5*time.Minute)) // long enough to not expire during the test
 
 	s.Apply(ev("session.created", `{"info":{"id":"s1","title":"root"}}`))
 	s.RemoveSessions([]string{"s1"})

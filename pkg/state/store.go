@@ -1214,7 +1214,7 @@ func (s *Store) PendingPermissions() map[string][]json.RawMessage {
 // budget (the FE coalesces streaming markdown to ~5fps in components/Part.tsx
 // / lib/streamMd.ts), while cutting the per-char marshal+emit+ring-push cost
 // to ~1× per window.
-var deltaFlushInterval = 30 * time.Millisecond
+const deltaFlushInterval = 30 * time.Millisecond
 
 // recentArchiveTTL is the DEFAULT per-instance tombstone TTL: how long
 // RemoveSessions' tombstone suppresses resurrection of an archived session by
@@ -1228,7 +1228,7 @@ var deltaFlushInterval = 30 * time.Millisecond
 // unarchive flow (ClearArchiveTombstones); Hydrate does NOT clear it, because
 // a hydrate can't tell a genuine unarchive from a stale clobber (both carry
 // archived=null).
-var recentArchiveTTL = 30 * time.Second
+const recentArchiveTTL = 30 * time.Second
 
 // defaultCompletionGrace is how long the store waits after an assistant turn
 // completes (with no in-flight assistant message remaining) before
@@ -1240,7 +1240,7 @@ var recentArchiveTTL = 30 * time.Second
 // into s.completionGrace; tests shrink the instance field, not this global —
 // the same per-instance promotion pattern GAP-S5 extends to the other
 // tunables above.
-var defaultCompletionGrace = 5 * time.Second
+const defaultCompletionGrace = 5 * time.Second
 
 // partTextCap bounds the accumulated length of a single part's text field, in
 // bytes. External latency analysis (17.8k sessions / 13 GB) found one bash
@@ -1257,7 +1257,7 @@ var defaultCompletionGrace = 5 * time.Second
 // shrink the instance field to a few bytes for deterministic truncation
 // assertions. The cap is a STOPGAP guardrail; a larger transcript-windowing
 // fix will follow separately and is intentionally out of scope here.
-var partTextCap = 1 << 20 // 1 MiB
+const partTextCap = 1 << 20 // 1 MiB
 
 // truncatedMarker returns the visible cap-reached marker that gets appended to
 // a sealed part field. omitted is the number of original output bytes that were
