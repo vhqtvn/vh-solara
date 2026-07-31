@@ -192,6 +192,18 @@ type Server struct {
 	pinsGCMu sync.Mutex
 	pinsGCOn map[string]bool
 
+	// labelsGCMu + labelsGCOn guard the one-time, per-dir installation of the L2
+	// session.delete subscriber for label lifecycle cleanup (Slice 3). It is the
+	// direct structural mirror of pinsGCMu/pinsGCOn (and queueGCMu/queueGCOn) and
+	// shares the exact same lifecycle: installed from aggFor for the default +
+	// every per-dir aggregator, run exactly once per (dir, aggregator) pair, the
+	// goroutine exits when the store closes its subscriber channels, and
+	// handleReloadProject/stopServerOwnedAggregators resets labelsGCOn[dir] when
+	// it tears down a per-dir aggregator so the fresh aggFor(dir) rebuild gets a
+	// fresh subscriber. See installLabelsLifecycle for the full rationale.
+	labelsGCMu sync.Mutex
+	labelsGCOn map[string]bool
+
 	// features are the capability modules mounted at startup (B). The
 	// coordination verbs are the first one (dogfood).
 	features []Feature
@@ -413,6 +425,7 @@ func NewServer(agg *aggregator.Aggregator, opencodeURL string, ringCapacity int)
 		watcherCancel: map[string]context.CancelFunc{},
 		queueGCOn:     map[string]bool{},
 		pinsGCOn:      map[string]bool{},
+		labelsGCOn:    map[string]bool{},
 		bgCtx:         bgCtx,
 		bgCancel:      bgCancel,
 		reassertDelay: defaultReassertDelay,
@@ -544,6 +557,9 @@ func (s *Server) stopServerOwnedAggregators() {
 		s.pinsGCMu.Lock()
 		delete(s.pinsGCOn, dir)
 		s.pinsGCMu.Unlock()
+		s.labelsGCMu.Lock()
+		delete(s.labelsGCOn, dir)
+		s.labelsGCMu.Unlock()
 	}
 	s.aggMu.Unlock()
 }
@@ -565,6 +581,7 @@ func (s *Server) aggFor(dir string) *aggregator.Aggregator {
 		s.ensurePermissionWatcher("", s.agg)
 		s.installQueueGCCleanup("", s.agg)
 		s.installPinsLifecycle("", s.agg)
+		s.installLabelsLifecycle("", s.agg)
 		return s.agg
 	}
 	s.aggMu.Lock()
@@ -596,6 +613,7 @@ func (s *Server) aggFor(dir string) *aggregator.Aggregator {
 	s.ensurePermissionWatcher(dir, a)
 	s.installQueueGCCleanup(dir, a)
 	s.installPinsLifecycle(dir, a)
+	s.installLabelsLifecycle(dir, a)
 	// Run under the Server's background-task lifetime (bgCtx) so Shutdown cancels
 	// this per-directory aggregator's RunManaged child. RunManaged derives a
 	// cancellable CHILD of bgCtx and arms a.cancel internally, so cancelling that
@@ -790,10 +808,12 @@ func (s *Server) installQueueGCCleanup(dir string, a *aggregator.Aggregator) {
 	a.SetOnHydrate(func() {
 		go s.reconcileQueuesForAgg(dir, a)
 		go s.reconcilePinsForAgg(dir, a)
+		go s.reconcileLabelsForAgg(dir, a)
 	})
 	if a.AnyHydrateCompleted() {
 		go s.reconcileQueuesForAgg(dir, a)
 		go s.reconcilePinsForAgg(dir, a)
+		go s.reconcileLabelsForAgg(dir, a)
 	}
 
 	root, err := projectRoot(dir)
@@ -903,6 +923,213 @@ func (s *Server) reconcileQueuesForAgg(dir string, a *aggregator.Aggregator) {
 	}); err != nil {
 		vhlog.Error("queue reconcile failed", "dir", dir, "root", root, "err", err)
 	}
+}
+
+// --- labels lifecycle cleanup (Slice 3) ---------------------------------------
+//
+// The direct structural mirror of the pins lifecycle helpers
+// (pkg/web/pins_lifecycle.go). All helpers live here in server.go rather than a
+// dedicated labels_lifecycle.go because this slice's production-code scope is
+// bounded to server.go + labels_http.go. The ONE labels-specific difference
+// from pins is documented per-helper: labels are ROOT-ONLY (the active set is
+// RootInventory() filtered to IsRoot, not SessionIDs()), and the private
+// projectByRootSessionId sidecar is accessed via labelsReconcileSnapshot
+// (defined here, same package) rather than through the public Snapshot (which
+// deliberately hides it).
+
+// labelsGCSubscribeBuffer is the channel buffer for the L2 session.delete
+// subscriber, mirroring pinsGCSubscribeBuffer. Sized to absorb a burst of
+// deletes; label cleanup via this path is best-effort — a full buffer closes
+// the channel (ending the goroutine), and a dropped event is caught by L1
+// (archive.go's RemoveSessions → KindSessionDelete is also emitted there) and
+// L3 (the authoritative post-hydrate backstop below).
+const labelsGCSubscribeBuffer = 128
+
+// labelsReconcileSnapshot atomically snapshots the public LabelsDoc AND the
+// private projectByRootSessionId sidecar under a single mutex acquisition. This
+// is the labels analogue of PinStore.Snapshot() returning a PinsDoc that already
+// includes ProjectBySessionID: because LabelStore.Snapshot() deliberately hides
+// the sidecar (it is cleanup metadata, never on the wire), the reconcile path
+// needs a combined accessor that exposes both projections atomically. Defined
+// here in server.go (same package web) so it can read the private labelsFile
+// fields without editing labels.go (out of scope this slice). Both the returned
+// LabelsDoc and the projects map are deep copies the caller may mutate freely.
+func (s *LabelStore) labelsReconcileSnapshot() (LabelsDoc, map[string]string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	doc := s.snapshotPublicLocked()
+	projects := make(map[string]string, len(s.doc.ProjectByRootSessionID))
+	for k, v := range s.doc.ProjectByRootSessionID {
+		projects[k] = v
+	}
+	return doc, projects
+}
+
+// FanOutLabelsUpdate pushes a transient labels.updated full-state frame carrying
+// the committed labels doc to the LIVE subscribers of EVERY active project store
+// (s.aggs). The direct mirror of FanOutPinsUpdate. Labels are worker-wide (one
+// labels.json), but /vh/stream is backed by per-project state.Store instances,
+// so the fan-out iterates every aggregator's store — a label mutation that
+// happened while the operator was viewing project A must reach a subscriber on
+// project B's stream. The payload is marshaled ONCE (LabelsDoc IS the wire
+// shape — no private projection needed) and reused for every store. EmitTransient
+// is transient (not recorded to the replay ring, no seq advance), so a
+// reconnecting client never replays it — labels.snapshot on connect is the catch-up.
+func (s *Server) FanOutLabelsUpdate(doc LabelsDoc) {
+	raw, err := json.Marshal(doc)
+	if err != nil {
+		vhlog.Warn("labels.updated fan-out: marshal failed, skipping broadcast", "err", err)
+		return
+	}
+	s.aggMu.Lock()
+	live := make([]*state.Store, 0, len(s.aggs))
+	for _, a := range s.aggs {
+		live = append(live, a.Store())
+	}
+	s.aggMu.Unlock()
+	for _, st := range live {
+		st.EmitTransient(kindLabelsUpdated, raw)
+	}
+}
+
+// removeLabelsAndBroadcast is the shared cleanup→broadcast primitive for the
+// label lifecycle layers, mirroring removePinsAndBroadcast: RemoveRootIDs; if
+// changed, fan out the post-removal snapshot via FanOutLabelsUpdate; if not, do
+// nothing. RemoveRootIDs strips root references from group OrderedRootSessionIDs
+// and TagIDsByRootSessionID (and the sidecar) but KEEPS group/tag definitions —
+// so cleanup removes the ROOT REFERENCES only, preserving the definitions the
+// operator authored. Idempotent (RemoveRootIDs is a no-op when none are
+// present), so the L2 subscriber path and the L3 backstop compose harmlessly.
+func (s *Server) removeLabelsAndBroadcast(ids []string) {
+	changed, current, err := s.labels.RemoveRootIDs(ids)
+	if err != nil {
+		vhlog.Error("labels: lifecycle cleanup RemoveRootIDs failed", "ids", ids, "err", err)
+		return
+	}
+	if !changed {
+		return
+	}
+	s.FanOutLabelsUpdate(current)
+}
+
+// reconcileLabelsForProject is the project-scoped core of Layer 3, mirroring
+// reconcilePinsForProject. Given a labels-doc snapshot + its
+// projectByRootSessionId sidecar (the caller MUST snapshot BOTH atomically before
+// deriving the active set — see reconcileLabelsForAgg for the F1 ordering
+// invariant), a project's stable key, and that project's authoritative
+// active-ROOT set, it selects referenced roots whose sidecar attribution == key
+// AND that are absent from the active-root set, and removes them via the
+// cleanup→broadcast rule (a single RemoveRootIDs call, so at most one revision
+// bump + one broadcast per pass).
+//
+// SCOPE FENCE: ONLY roots whose owning project is `key` are candidates. A root
+// whose sidecar attribution is a DIFFERENT (unopened) project is NEVER touched
+// — absence from THIS project's active-root set is not proof of deletion for a
+// root owned by another project. "Never drop retained roots whose owning
+// project is unopened" is enforced structurally by the projects[id]==key filter.
+//
+// ROOT-ONLY difference from pins: the active set is ROOT ids (IsRoot==true from
+// RootInventory), not all session ids. A root removed here is stripped from
+// group orders + tag assignments, but the group/tag definitions survive
+// (RemoveRootIDs keeps them).
+func (s *Server) reconcileLabelsForProject(doc LabelsDoc, projects map[string]string, key string, activeRoots map[string]bool) {
+	referenced := referencedRootsInLabelsDoc(doc)
+	var remove []string
+	for rid := range referenced {
+		if projects[rid] != key {
+			continue // not this project's root — never drop an unopened project's root
+		}
+		if activeRoots[rid] {
+			continue // still active in its project
+		}
+		remove = append(remove, rid)
+	}
+	if len(remove) == 0 {
+		return
+	}
+	s.removeLabelsAndBroadcast(remove)
+}
+
+// reconcileLabelsForAgg is the per-aggregator Layer 3 driver — the direct
+// analogue of reconcilePinsForAgg. It is dispatched to a fresh goroutine from
+// the aggregator's onHydrate callback (composed into installQueueGCCleanup's
+// single onHydrate slot alongside the queue + pins reconciles) and from the
+// immediate-run branch when the default aggregator already hydrated at boot.
+//
+// FAIL-CLOSED gate: if a.AnyHydrateCompleted() is false, remove nothing.
+// Active-root source: a.Store().RootInventory() filtered to IsRoot — the STRICT
+// root definition labels require (NOT SessionIDs(), because a label target must
+// be a true root). ORDERING INVARIANT (F1 fix): the doc+sidecar snapshot is
+// taken BEFORE the active-root set, so a root added AFTER the snapshot is not a
+// removal candidate — the same TOCTOU guard pins use.
+func (s *Server) reconcileLabelsForAgg(dir string, a *aggregator.Aggregator) {
+	if !a.AnyHydrateCompleted() {
+		return // FAIL-CLOSED: no authoritative set yet → remove nothing
+	}
+	root, err := projectRoot(dir)
+	if err != nil {
+		vhlog.Error("labels reconcile: projectRoot failed", "dir", dir, "err", err)
+		return
+	}
+	key := projectKey(root)
+	// ORDERING INVARIANT (F1 fix): snapshot the doc + sidecar BEFORE reading the
+	// authoritative active-root set. A root added AFTER this snapshot is not in
+	// `doc`/`referenced` and therefore cannot be a removal candidate this pass.
+	doc, projects := s.labels.labelsReconcileSnapshot()
+	inventory := a.Store().RootInventory()
+	activeRoots := make(map[string]bool, len(inventory))
+	for _, inv := range inventory {
+		if inv.IsRoot {
+			activeRoots[inv.SessionID] = true
+		}
+	}
+	s.reconcileLabelsForProject(doc, projects, key, activeRoots)
+}
+
+// installLabelsLifecycle arms the L2 session.delete subscriber on a's store, the
+// direct mirror of installPinsLifecycle. Called from aggFor for the default AND
+// every lazily-created per-dir aggregator. On KindSessionDelete it calls
+// removeLabelsAndBroadcast([id]). Idempotent (guarded by labelsGCOn); the
+// goroutine exits when the store closes its subscriber channels. A separate
+// channel from the pins/queue GC subscribers keeps the three cleanup paths
+// independent (one dropping never silences the others). handleReloadProject /
+// stopServerOwnedAggregators resets labelsGCOn[dir] so a fresh aggFor(dir) gets
+// a fresh subscriber.
+func (s *Server) installLabelsLifecycle(dir string, a *aggregator.Aggregator) {
+	s.labelsGCMu.Lock()
+	if s.labelsGCOn[dir] {
+		s.labelsGCMu.Unlock()
+		return
+	}
+	s.labelsGCOn[dir] = true
+	s.labelsGCMu.Unlock()
+
+	store := a.Store()
+	// Drop ALL message-class events at fanout — we only care about the structural
+	// session.delete event. Identical to installPinsLifecycle's filter.
+	ch, _ := store.SubscribeWith(labelsGCSubscribeBuffer, state.Interest{MessageSessions: map[string]bool{}})
+	// Track on lifecycleWG for NON-DEFAULT dirs only (mirrors
+	// installPinsLifecycle): the default dir's subscriber is daemon-owned.
+	if dir != "" {
+		s.lifecycleWG.Add(1)
+	}
+	go func() {
+		if dir != "" {
+			defer s.lifecycleWG.Done()
+		}
+		for ev := range ch {
+			if ev.Kind != state.KindSessionDelete {
+				continue
+			}
+			var p struct {
+				ID string `json:"id"`
+			}
+			if json.Unmarshal(ev.Payload, &p) != nil || p.ID == "" {
+				continue
+			}
+			s.removeLabelsAndBroadcast([]string{p.ID})
+		}
+	}()
 }
 
 // permReconcileInterval is the period of the per-directory fail-closed
@@ -1941,6 +2168,24 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	} else {
 		vhlog.Warn("pins.snapshot bootstrap: marshal failed, skipping pins frame", "err", err)
 	}
+	// Slice 3: bootstrap the worker-wide labels view (groups + tags +
+	// tagIdsByRootSessionId) on EVERY fresh /vh/stream connect, the direct
+	// analogue of the pins.snapshot block above. Labels are a SEPARATE store
+	// from this connection's state.Store (one labels.json under stateBaseDir,
+	// worker-wide, not per-project), NOT carried in the replay ring, so a
+	// reconnecting client catches up on labels via THIS snapshot frame (live
+	// label mutations arrive later as transient labels.updated frames, also not
+	// replayed). Emitted with NO id line AFTER the state bootstrap block and the
+	// pins snapshot, BEFORE the live-tail loop drains the subscribe channel
+	// (SubscribeWith already created `ch`, so subscribe-before-snapshot ordering
+	// holds — identical guarantee to pins). LabelsDoc IS the wire shape (no
+	// private projection needed), and projectByRootSessionId is private to
+	// labelsFile and never crosses the wire.
+	if lb, err := json.Marshal(s.labels.Snapshot()); err == nil {
+		writeRawNoID(w, "labels.snapshot", lb)
+	} else {
+		vhlog.Warn("labels.snapshot bootstrap: marshal failed, skipping labels frame", "err", err)
+	}
 	flusher.Flush()
 
 	// 15s keepalive ping ticker. A NAMED ping event (not an SSE `:` comment) so
@@ -1956,16 +2201,18 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 				discReason = diag.DiscSubscriberChannelClosed // PROBE 3
 				return                                        // dropped as a slow consumer; client will reconnect + resume
 			}
-			if ev.Kind == state.KindNotice || ev.Kind == kindPinsUpdated {
-				// Transient fan-out (state.KindNotice or the Phase 3
-				// pins.updated full-state frame): not part of the replayable
+			if ev.Kind == state.KindNotice || ev.Kind == kindPinsUpdated || ev.Kind == kindLabelsUpdated {
+				// Transient fan-out (state.KindNotice, the Phase 3
+				// pins.updated full-state frame, or the Slice 3
+				// labels.updated full-state frame): not part of the replayable
 				// view and it reuses the current head seq, so forward it
 				// WITHOUT the seq-baseline guard and WITHOUT an id line (don't
 				// move the resume cursor). A resuming client never replays it —
-				// pins catch up via the pins.snapshot bootstrap frame emitted
+				// pins/labels catch up via the snapshot bootstrap frames emitted
 				// above on connect. The SSE event name is ev.Kind itself, so a
-				// notice stays "notice" and a pins.updated becomes
-				// "pins.updated" — Phase 5's stream.ts dispatches on the name.
+				// notice stays "notice", a pins.updated becomes "pins.updated",
+				// and a labels.updated becomes "labels.updated" — the client
+				// dispatches on the name.
 				writeRawNoID(w, ev.Kind, ev.Payload)
 				flusher.Flush()
 				continue

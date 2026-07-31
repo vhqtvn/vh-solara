@@ -775,3 +775,51 @@ func TestLabelsHTTPRetainedRootSurvivesUnopenedProject(t *testing.T) {
 		t.Fatalf("ghost-add PUT: status %d, want 400 (anti-resurrection)", resp3.StatusCode)
 	}
 }
+
+// --- F3 deferred: validate-before-CAS ordering over the HTTP stack ----------
+
+// TestLabelsHTTPPutStaleAndInvalidYields400Not409 proves the validate-before-CAS
+// ordering end-to-end over the HTTP stack: a PUT carrying BOTH a stale
+// baseRevision AND a structurally-invalid candidate (empty group id) returns 400
+// (validation rejection), NOT 409 (CAS mismatch). The store validates the
+// candidate BEFORE the CAS check (slice-1 design), so a malformed doc always
+// yields a clear *LabelRejection regardless of any revision race. This is
+// currently proven only at the store seam (TestLabelStoreReplaceStaleAndInvalid);
+// this test pins it through the full HTTP handler.
+func TestLabelsHTTPPutStaleAndInvalidYields400Not409(t *testing.T) {
+	srv, web := newLabelsTestServer(t)
+	seedLabelSession(t, srv.agg, "a", "")
+
+	// Establish authority at rev 1.
+	resp := labelsPut(t, web.URL+"/vh/labels", map[string]any{
+		"baseRevision": 0,
+		"groups": []map[string]any{
+			{"id": "g1", "name": "G", "color": "blue", "orderedRootSessionIds": []string{"a"}},
+		},
+		"tags":                  []any{},
+		"tagIdsByRootSessionId": map[string][]string{},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("setup PUT: status %d, want 200", resp.StatusCode)
+	}
+
+	// PUT with a STALE baseRevision (0, but server is at 1) AND an INVALID
+	// candidate (empty group id). Validation must win: 400 empty_group_id, not 409.
+	staleInvalid := labelsPut(t, web.URL+"/vh/labels", map[string]any{
+		"baseRevision": 0, // stale — server is at 1
+		"groups": []map[string]any{
+			{"id": "", "name": "Bad", "color": "blue", "orderedRootSessionIds": []string{"a"}},
+		},
+		"tags":                  []any{},
+		"tagIdsByRootSessionId": map[string][]string{},
+	})
+	defer staleInvalid.Body.Close()
+	if staleInvalid.StatusCode != http.StatusBadRequest {
+		t.Fatalf("stale+invalid PUT: status = %d, want 400 (validation must precede CAS)", staleInvalid.StatusCode)
+	}
+	e := decodeLabelsRejection(t, staleInvalid.Body)
+	if e.Error != string(LabelRejectionEmptyGroupID) {
+		t.Fatalf("error = %q, want %s (empty_group_id)", e.Error, LabelRejectionEmptyGroupID)
+	}
+}

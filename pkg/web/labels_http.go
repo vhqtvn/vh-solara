@@ -43,6 +43,14 @@ import (
 	"github.com/vhqtvn/vh-solara/pkg/vhlog"
 )
 
+// kindLabelsUpdated is the SSE event name for the transient labels fan-out frame
+// (Slice 3), emitted after a committed PUT 200 and after lifecycle cleanup that
+// changed the doc. The direct analogue of kindPinsUpdated (pkg/web/pins_http.go):
+// it carries no `id:` line (writeRawNoID) so it never becomes a resume cursor —
+// it is orthogonal to the state store's seq space, and a reconnecting client
+// catches up via the labels.snapshot bootstrap frame emitted on connect.
+const kindLabelsUpdated = "labels.updated"
+
 // putLabelsReq is the PUT /vh/labels request body. BaseRevision is REQUIRED
 // (nil → 400); it is the CAS guard the client read from its last GET/response.
 // Revision is SERVER-OWNED and intentionally absent from the request — the
@@ -188,8 +196,14 @@ func (s *Server) handleLabelsPut(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(cur)
 		return
 	}
-	// Success — committed authority (same shape as GET). No SSE fan-out in this
-	// slice (slice 3 adds labels.snapshot/labels.updated).
+	// Success — committed authority (same shape as GET). Fan the new doc out to
+	// EVERY active project event store's live subscribers BEFORE writing the HTTP
+	// response, so a concurrent SSE listener observes the update no later than
+	// the PUT caller receives its 200 (mirrors pins' handlePinsPut ordering).
+	// cur is the post-write snapshot returned by Replace, so this emits committed
+	// state without an extra Snapshot() read. Transient (not replayed); reconnect
+	// catches up via the labels.snapshot bootstrap frame.
+	s.FanOutLabelsUpdate(cur)
 	writeJSONResp(w, cur)
 }
 

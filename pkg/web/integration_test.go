@@ -302,6 +302,12 @@ func TestEndToEndAggregateAndServe(t *testing.T) {
 		t.Fatalf("expected pins.snapshot bootstrap after state snapshot, got %q", ev)
 	}
 
+	// Slice 3: a labels.snapshot bootstrap frame is emitted after pins.snapshot.
+	// Consume it so the next read is the live event, not the labels frame.
+	if ev := readSSEEvent(t, reader); ev != "labels.snapshot" {
+		t.Fatalf("expected labels.snapshot bootstrap after pins.snapshot, got %q", ev)
+	}
+
 	// Push a live session.created via the fake event stream.
 	fake.events <- `{"type":"session.created","properties":{"info":{"id":"root2","title":"Second root"}}}`
 	gotLive := readSSEEvent(t, reader)

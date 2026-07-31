@@ -498,6 +498,13 @@ func (s *Server) handleReloadProject(w http.ResponseWriter, r *http.Request) {
 			s.pinsGCMu.Lock()
 			delete(s.pinsGCOn, dir)
 			s.pinsGCMu.Unlock()
+			// Reset labelsGCOn for the same reason: the next aggFor(dir) builds a
+			// FRESH aggregator (new store, new subs map), and the labels L2
+			// subscriber must be rebuilt on it. Mirrors the pinsGCOn reset above;
+			// labelsGCMu nested inside aggMu (same lock order).
+			s.labelsGCMu.Lock()
+			delete(s.labelsGCOn, dir)
+			s.labelsGCMu.Unlock()
 		}
 		s.aggMu.Unlock()
 	}
