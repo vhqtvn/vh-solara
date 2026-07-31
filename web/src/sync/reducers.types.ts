@@ -37,6 +37,15 @@ export type ReconcileEffect =
   // cascade: resetPageInFlight + dropPinnedSession. Emitted by session.delete
   // and the eager archive prune (both route through projectSessionRemoval).
   | { kind: "session-removed"; sessionID: string }
+  // A cold-seed lastAgent.set event filled an agent label for an un-opened
+  // session. The tree node must be patched so the chip renders on collapsed
+  // nodes without an expand round-trip — a cross-store (tree) mutation that is
+  // NO LONGER allowed inline in the projection. Orchestration calls
+  // patchTreeAgent here; interpreted synchronously within the same
+  // reconciliation cycle as the producing event (ordering-equivalent to the
+  // former inline call, which ran inside the produce() batch). Emitted by the
+  // lastAgent.set projection.
+  | { kind: "reconcile-tree-agent"; sessionID: string; agent: string }
   // The projected mutation dirtied the persisted slices (cursor/activity/
   // lastAgents). Interpreted LAST (after the cursor advance) so persistence
   // captures the final cursor value. Orchestration calls the debounced persist.

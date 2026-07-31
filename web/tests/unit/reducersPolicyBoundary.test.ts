@@ -1,16 +1,12 @@
 // L-08/M4 standing check — TestApplyReconcileHasNoInlinePolicy.
 //
-// The projection module (reducers.ts) must NOT invoke policy APIs inline.
-// Reducers project server facts into SyncState and RETURN typed effects; the
-// orchestration boundary (reconcile.ts) interprets those effects and owns every
-// side-effect policy (notify / persist / pin / page-flight / cursor / timers).
-// This keeps projection and policy independently checkable.
-//
-// A NAMED temporary exception is allowed during the phased tree-boundary
-// migration: patchTreeAgent (the tree-agent patch) stays inline in the
-// projection because its final ownership is a must-wait tree-boundary item
-// (applyTreeOpStore / tree ranking / tree-agent patch final ownership). Every
-// other policy API must be absent from the projection module.
+// The projection module (reducers.ts) must NOT invoke policy APIs inline, NOR
+// perform any direct cross-store mutation. Reducers project server facts into
+// SyncState and RETURN typed effects; the orchestration boundary (reconcile.ts)
+// interprets those effects and owns every side-effect policy (notify / persist
+// / pin / page-flight / cursor / timers) AND every cross-store mutation
+// (patchTreeAgent — the tree-agent patch — recorded as a reconcile-tree-agent
+// effect). This keeps projection and policy independently checkable.
 //
 // Modeled on wire-field-aliases.test.ts (readFileSync source scan).
 import { describe, it, expect } from "vitest";
@@ -69,13 +65,16 @@ describe("TestApplyReconcileHasNoInlinePolicy (L-08/M4)", () => {
     ).toEqual([]);
   });
 
-  it("the only direct cross-store mutation is the named patchTreeAgent exception", () => {
-    // During the phased tree-boundary migration (L-08/M4 safe-now slice), the
-    // tree-agent patch stays inline because its final ownership is a must-wait
-    // item (applyTreeOpStore / tree ranking / tree-agent patch final ownership).
-    // This assertion documents that the exception is real and intentional; the
-    // slice that extracts it will update this check.
-    expect(code).toContain("patchTreeAgent");
+  it("the projection performs no direct cross-store tree mutation (no patchTreeAgent)", () => {
+    // The tree-agent patch was formerly a named inline exception in the
+    // projection. It is now recorded as a reconcile-tree-agent effect and
+    // interpreted by orchestration (reconcile.ts), so the projection must NOT
+    // import or invoke patchTreeAgent at all. This assertion pins that the
+    // reducer boundary stays pure projection.
+    expect(
+      code,
+      "reducers.ts references patchTreeAgent — it must record a reconcile-tree-agent effect instead",
+    ).not.toContain("patchTreeAgent");
   });
 
   it("projection module does not import the orchestration/policy modules", () => {

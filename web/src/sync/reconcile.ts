@@ -26,6 +26,7 @@ import {
 import { pushNotification } from "../notify";
 import { dropPinnedSession } from "../pins";
 import { resetPageInFlight } from "./history";
+import { patchTreeAgent } from "./treeState";
 import { maybeNotifyRootDone, maybeClearWaiting } from "./orchestration";
 
 // interpretEffects — map factual effects to side-effect policy. sync-state-dirty
@@ -50,6 +51,13 @@ function interpretEffects(effects: ReconcileEffect[]): void {
         // backstop for the pin.
         resetPageInFlight(e.sessionID);
         dropPinnedSession(e.sessionID);
+        break;
+      case "reconcile-tree-agent":
+        // Cold-seed gap fill: patch the tree node so the chip renders on
+        // collapsed nodes without an expand round-trip. Synchronously within
+        // the same reconciliation cycle as the producing lastAgent.set event
+        // (ordering-equivalent to the former inline call inside produce()).
+        patchTreeAgent(e.sessionID, e.agent);
         break;
     }
   }

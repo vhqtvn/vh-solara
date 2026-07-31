@@ -9,13 +9,9 @@
 //
 // The standing check TestApplyReconcileHasNoInlinePolicy (web/tests/unit/
 // reducersPolicyBoundary.test.ts) pins that this file invokes none of those
-// policy APIs directly.
-//
-// ONE NAMED TEMPORARY EXCEPTION during the phased tree-boundary migration:
-// patchTreeAgent (the tree-agent patch) stays inline here because its final
-// ownership is a must-wait tree-boundary item (applyTreeOpStore / tree ranking
-// / tree-agent patch final ownership). It is the ONLY direct cross-store tree
-// mutation allowed in this slice; a later slice extracts it behind an effect.
+// policy APIs directly — and no cross-store tree mutation (patchTreeAgent)
+// either; the tree-agent patch is recorded as a reconcile-tree-agent effect
+// and interpreted by orchestration.
 //
 // SEAM — synchronous, draft-mutating, pure of store-coupling. Each project*
 // function takes the produce() draft `s` (so it reads current pre-mutation
@@ -35,7 +31,6 @@ import {
   prependMessagesIfAbsent,
 } from "../lib/reduce";
 import { deriveMessageWindow } from "./history";
-import { patchTreeAgent } from "./treeState"; // NAMED tree-boundary exception (see header)
 import { log } from "../lib/log";
 
 // mergeLastAgents — the agent-label fix (S3). During a server restart the
@@ -359,12 +354,16 @@ export function projectMessageEvent(
       if (payload.sessionID) {
         if (payload.agent) {
           s.lastAgents[payload.sessionID] = payload.agent;
-          // NAMED TREE-BOUNDARY EXCEPTION (L-08/M4): tree-agent patch final
-          // ownership is a must-wait item, so patchTreeAgent stays inline here.
           // tree=2 gap fill: also patch the tree node so the chip renders on
-          // collapsed nodes without an expand round-trip. No-op for nodes that
-          // already have their agent.
-          patchTreeAgent(payload.sessionID, payload.agent);
+          // collapsed nodes without an expand round-trip. Recorded as an effect
+          // (no inline cross-store mutation): orchestration calls patchTreeAgent
+          // synchronously within the same reconciliation cycle. No-op for nodes
+          // that already have their agent (patchTreeAgent guards on empty).
+          effects.push({
+            kind: "reconcile-tree-agent",
+            sessionID: payload.sessionID,
+            agent: payload.agent,
+          });
         } else delete s.lastAgents[payload.sessionID];
       }
       break;

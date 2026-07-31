@@ -7,6 +7,8 @@ import { applySessionSnapshot } from "../../src/sync/session-stream";
 import { decodeMessagesBatch } from "../../src/sync/decode";
 import { state, setState, setSelectedIdRaw } from "../../src/sync/store";
 import { sessionLastAgent } from "../../src/sync/selectors";
+import { seedTreeStore, resetTreeStore, treeMap } from "../../src/sync/treeState";
+import type { TreeNode } from "../../src/sync/treeMap";
 import type { Snapshot } from "../../src/types";
 
 // B2a (resync-window gating of lastAgents) + B2b (session.delete prunes the
@@ -458,5 +460,63 @@ describe("applyMessageEvent — lastAgent.set cold-seed live patch (tree chip)",
     // the live assistant turn's agent, NOT the stale/seeded value.
     expect(state.lastAgents.live).toBe("seeded");
     expect(sessionLastAgent("live")).toBe("real");
+  });
+});
+
+// ===========================================================================
+// L-08 reducer-boundary purity: patchTreeAgent was extracted from the inline
+// call in projectMessageEvent behind a reconcile-tree-agent effect. This block
+// proves the tree-node patch still occurs correctly THROUGH the effect path —
+// i.e. ordering-equivalent to the former inline call (which ran inside the
+// produce() batch). reconcileEvent is fully synchronous, so the patch lands in
+// the SAME reconciliation cycle, synchronously, before applyMessageEvent returns.
+// ===========================================================================
+describe("applyMessageEvent — lastAgent.set tree-node bridge via reconcile-tree-agent effect", () => {
+  const node = (id: string): TreeNode => ({
+    id,
+    parentId: null,
+    title: id,
+    activity: "idle",
+    childCount: 0,
+    loaded: true,
+    flags: {},
+    updatedMs: 0,
+  });
+
+  beforeEach(() => {
+    resetTreeStore();
+  });
+
+  it("patches the tree node synchronously within the same reconciliation cycle (ordering equivalence)", () => {
+    // Cold-seed state: a tree node exists for the session but carries NO agent.
+    seedTreeStore([node("bridge")]);
+    expect(treeMap().get("bridge")?.agent).toBeUndefined();
+
+    // The event projects lastAgents (produce draft) AND records a
+    // reconcile-tree-agent effect; orchestration interprets it synchronously
+    // before applyMessageEvent returns. No await — proving the effect path is
+    // not deferred to a microtask.
+    applyMessageEvent("lastAgent.set", 1, { sessionID: "bridge", agent: "orch" });
+
+    // SyncState projection still ran.
+    expect(state.lastAgents.bridge).toBe("orch");
+    // Tree-node bridge: patchTreeAgent ran through the effect path.
+    expect(treeMap().get("bridge")?.agent).toBe("orch");
+  });
+
+  it("preserves patchTreeAgent's no-overwrite guard through the effect path", () => {
+    // An authoritative agent set by a tree op must NOT be clobbered by the
+    // cold-seed effect (patchTreeAgent guards on empty).
+    seedTreeStore([{ ...node("auth"), agent: "authoritative" }]);
+    applyMessageEvent("lastAgent.set", 1, { sessionID: "auth", agent: "seeded" });
+    expect(treeMap().get("auth")?.agent).toBe("authoritative");
+  });
+
+  it("is a no-op when no tree node exists for the session", () => {
+    // Unknown session: patchTreeAgent is a no-op (guard on missing node).
+    applyMessageEvent("lastAgent.set", 1, { sessionID: "ghost", agent: "x" });
+    expect(treeMap().get("ghost")?.agent).toBeUndefined();
+    // SyncState projection still ran regardless.
+    expect(state.lastAgents.ghost).toBe("x");
   });
 });
