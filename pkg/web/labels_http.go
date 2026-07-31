@@ -1,0 +1,245 @@
+package web
+
+// Server-managed root-session labels (groups + tags) — Slice 2: the HTTP API.
+//
+// This slice exposes the Slice-1 LabelStore (pkg/web/labels.go, commit 24ecf6b)
+// over HTTP with the exact contract the PinStore already has
+// (pkg/web/pins_http.go):
+//   - GET /vh/labels returns the public LabelsDoc.
+//   - PUT /vh/labels (CSRF-guarded, baseRevision CAS) validates + normalizes +
+//     atomically persists and returns the committed authority.
+//   - Stale revision → 409 + authority body.
+//   - Validation rejection (*LabelRejection) → 400 + structured body carrying
+//     the rejection reason/ids AND the self-healed authority doc.
+//
+// No SSE fan-out in this slice (that is slice 3). handleLabels persists and
+// returns authority only.
+//
+// LABELS CLONE THE PIN HTTP CONTRACT with ONE deliberate addition. Pins map a
+// validation failure to a plain 400: the pin store normalizes silently and the
+// HTTP layer does only light structural checks (empty/dupe/oversized ids), so
+// pins emit a machine-readable 400 ONLY for the anti-resurrection case and
+// return the authority body ONLY on the 409 path. Labels move ALL invariant
+// validation into the store (slice 1), so EVERY store *LabelRejection is mapped
+// to a machine-readable 400 that ALSO carries the authoritative current doc —
+// the client adopts it (self-heal) in one round-trip on BOTH the 400 and 409
+// paths. This is the documented "400 self-heal" addition vs pins.
+//
+// PUBLIC PROJECTION (honest deviation from pins): pins need a dedicated
+// pinsPublicResp because PinsDoc carries the private projectBySessionId. Labels
+// have NO private field in their public type — Snapshot() already returns
+// LabelsDoc (revision, groups, tags, tagIdsByRootSessionId), which IS exactly
+// the wire shape. So GET / PUT-200 / 409 marshal LabelsDoc directly, and the 400
+// body embeds it. schemaVersion and projectByRootSessionId live only in the
+// private labelsFile and never cross the wire (proven by the GET-shape test's
+// byte-contains checks, mirroring the pins projectBySessionId-leak guard).
+
+import (
+	"encoding/json"
+	"errors"
+	"net/http"
+
+	"github.com/vhqtvn/vh-solara/pkg/aggregator"
+	"github.com/vhqtvn/vh-solara/pkg/vhlog"
+)
+
+// putLabelsReq is the PUT /vh/labels request body. BaseRevision is REQUIRED
+// (nil → 400); it is the CAS guard the client read from its last GET/response.
+// Revision is SERVER-OWNED and intentionally absent from the request — the
+// server assigns it (base+1) on a successful Replace. The decoder is lenient on
+// unknown fields (forward compatibility: a future client sending a new optional
+// field must not get a 400), mirroring putPinsReq.
+type putLabelsReq struct {
+	BaseRevision          *int64              `json:"baseRevision"`
+	Groups                []LabelGroup        `json:"groups"`
+	Tags                  []LabelTag          `json:"tags"`
+	TagIDsByRootSessionID map[string][]string `json:"tagIdsByRootSessionId"`
+}
+
+// labelsRejectionResp is the machine-readable 400 body emitted when PUT /vh/labels
+// fails store validation (*LabelRejection). It carries the rejection metadata
+// (error/message/ids) AND the self-healed authoritative current doc (embedded
+// LabelsDoc) so the client adopts server state in one round-trip — the labels
+// analogue of pins' 409-authority-body, extended to the 400 path because the
+// label store is the single validation chokepoint.
+//
+// Contract (LOCKED):
+//
+//	{ "error": "<LabelRejectionReason>",
+//	  "message": "<human-readable detail>",
+//	  "ids": ["<offending ids>"],          // omitted when empty
+//	  "revision": <int>,                    // promoted from embedded LabelsDoc
+//	  "groups": [...],
+//	  "tags": [...],
+//	  "tagIdsByRootSessionId": {...} }
+//
+// Clients MUST adopt the promoted revision/groups/tags/tagIdsByRootSessionId as
+// the new authority (self-heal); error/message/ids are for logging/display and
+// optional bounded-retry logic (slice 4 facade).
+type labelsRejectionResp struct {
+	Error     string   `json:"error"`
+	Message   string   `json:"message"`
+	IDs       []string `json:"ids,omitempty"`
+	LabelsDoc          // embedded → promotes revision/groups/tags/tagIdsByRootSessionId
+}
+
+// labelsRejectionRespFrom builds the structured 400 body from a store
+// *LabelRejection and the authoritative current snapshot the failed Replace
+// returned (cur is the current doc — nothing was persisted on rejection, so cur
+// IS the self-healed authority the client should adopt).
+func labelsRejectionRespFrom(rej *LabelRejection, cur LabelsDoc) labelsRejectionResp {
+	return labelsRejectionResp{
+		Error:     string(rej.Reason),
+		Message:   rej.Detail,
+		IDs:       rej.IDs,
+		LabelsDoc: cur,
+	}
+}
+
+// handleLabels serves GET (read) and PUT (compare-and-swap replace) for the
+// worker-wide labels doc. Registered as a single path with a method switch
+// (same convention as /vh/pins and /vh/notes). PUT is state-changing and is
+// guarded by csrfGuard — the outer middleware wrapping every /vh/* route — so
+// no per-handler CSRF check is needed (but the test suite verifies a headerless
+// PUT is rejected, mirroring the pins CSRF test).
+func (s *Server) handleLabels(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSONResp(w, s.labels.Snapshot())
+	case http.MethodPut:
+		s.handleLabelsPut(w, r)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// handleLabelsPut validates and applies a compare-and-swap replacement of the
+// whole labels doc.
+//
+// Validation precedence (mirrors pins): the structural 400 checks (malformed
+// JSON, missing baseRevision) run BEFORE the store call. The store then
+// validates the candidate BEFORE the CAS check (slice-1 design: a malformed doc
+// is always a clear *LabelRejection regardless of any revision race), so a
+// structurally-invalid-but-stale-revision request yields a 400 (not a silent
+// 409) — this ordering is pinned by TestLabelStoreReplaceStaleAndInvalid.
+//
+// On success → 200 + committed authority. On CAS mismatch → 409 + authority.
+// On store validation rejection → 400 + structured body (rejection + authority).
+// On persist failure → 500 (store stayed consistent with disk; the candidate was
+// built separately and only assigned after a successful save).
+func (s *Server) handleLabelsPut(w http.ResponseWriter, r *http.Request) {
+	// 1. Parse body. Lenient on unknown fields (forward-compat); strict on
+	//    malformed JSON. 1 MiB matches pins and dwarfs any realistic doc (50
+	//    groups + 100 tags + UUID-keyed assignments).
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	var req putLabelsReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// 2. baseRevision is required (must be explicitly present, even for the
+	//    initial empty doc). A *int64 distinguishes absent from explicit-0 (the
+	//    legitimate initial CAS value).
+	if req.BaseRevision == nil {
+		http.Error(w, "baseRevision required", http.StatusBadRequest)
+		return
+	}
+
+	// 3. Build the candidate. Revision is server-owned; the store ignores any
+	//    candidate Revision and assigns base+1 on success. Nil slices/maps are
+	//    normalized by the store's validateLabelsDoc, so a client omitting them
+	//    is equivalent to sending empty collections.
+	candidate := LabelsDoc{
+		Groups:                req.Groups,
+		Tags:                  req.Tags,
+		TagIDsByRootSessionID: req.TagIDsByRootSessionID,
+	}
+
+	// 4. Build the authoritative active-ROOT inventory (root id → project key)
+	//    from s.aggs + RootInventory() filtered to IsRoot, then Replace
+	//    (validate → normalize → CAS → atomic persist). Replace returns the
+	//    current snapshot on every non-success path (rejection, CAS mismatch),
+	//    which is the self-healed authority the client adopts.
+	activeRootProjects := s.activeRootProjects()
+	ok, cur, err := s.labels.Replace(*req.BaseRevision, candidate, activeRootProjects)
+	if err != nil {
+		var rej *LabelRejection
+		if errors.As(err, &rej) {
+			// Store validation rejection → 400 with structured body + authority.
+			// The client adopts the embedded doc (self-heal) and may use
+			// error/ids for a bounded retry or display.
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(labelsRejectionRespFrom(rej, cur))
+			return
+		}
+		// Persist failure — surface as 500; the client may retry with the same
+		// baseRevision (the doc did not advance).
+		vhlog.Error("labels: persist failed", "err", err)
+		http.Error(w, "labels persist failed", http.StatusInternalServerError)
+		return
+	}
+	if !ok {
+		// CAS mismatch — return the full current public doc so the client can
+		// adopt server state and retry. Do NOT partially apply. (Mirrors pins.)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(cur)
+		return
+	}
+	// Success — committed authority (same shape as GET). No SSE fan-out in this
+	// slice (slice 3 adds labels.snapshot/labels.updated).
+	writeJSONResp(w, cur)
+}
+
+// activeRootProjects builds the activeRootProjects map argument for
+// LabelStore.Replace from the current authoritative session state across ALL of
+// the worker's project aggregators (s.aggs). Each active ROOT session id (one
+// whose parentID == "", per Store.RootInventory().IsRoot — the STRICT root
+// definition labels require, NOT the orphan-inclusive RootCount) is mapped to
+// its stable project key (projectKey(projectRoot(dir)) — the SAME
+// sha1-of-abs-cwd key pkg/web/notes.go and pins.go use, so the cleanup sidecar
+// and projectByRootSessionId agree on project identity).
+//
+// This is the labels analogue of activeSessionProjects (pkg/web/pins_http.go);
+// the ONLY difference is the root filter. Pins consume SessionIDs() (every live
+// session, because a pin can target a subsession); labels consume
+// RootInventory() filtered to IsRoot (because a label target must be a true
+// root). pkg/state is per-project and has no project concept, so project
+// ownership is composed here in pkg/web — exactly as pins do.
+//
+// Concurrency mirrors activeSessionProjects: s.aggMu is held only to snapshot
+// the dir→aggregator entries; each aggregator's Store is then read under its
+// own RLock via RootInventory(). A dir whose projectRoot fails to resolve is
+// skipped with a log (fail-closed: roots from an unresolvable project are
+// absent from the map, so newly-referenced roots from that project fail the
+// store's unknown_root check — the safe behavior).
+func (s *Server) activeRootProjects() map[string]string {
+	type entry struct {
+		dir string
+		agg *aggregator.Aggregator
+	}
+	s.aggMu.Lock()
+	live := make([]entry, 0, len(s.aggs))
+	for dir, a := range s.aggs {
+		live = append(live, entry{dir, a})
+	}
+	s.aggMu.Unlock()
+
+	out := map[string]string{}
+	for _, e := range live {
+		root, err := projectRoot(e.dir)
+		if err != nil {
+			vhlog.Warn("labels: skipping project in active-root map (projectRoot failed)", "dir", e.dir, "err", err)
+			continue
+		}
+		key := projectKey(root)
+		for _, inv := range e.agg.Store().RootInventory() {
+			if inv.IsRoot {
+				out[inv.SessionID] = key
+			}
+		}
+	}
+	return out
+}

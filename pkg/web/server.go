@@ -117,6 +117,13 @@ type Server struct {
 	// pins_http.go (Phase 2 HTTP layer).
 	pins *PinStore
 
+	// labels is the worker-wide root-session labels store (groups + tags),
+	// Slice 2 of server-managed labels, building on the Slice-1 LabelStore
+	// (commit 24ecf6b). Constructed once at NewServer from
+	// filepath.Join(stateBaseDir(), "labels.json"); serves GET/PUT /vh/labels.
+	// See labels.go (Slice 1 store) and labels_http.go (Slice 2 HTTP layer).
+	labels *LabelStore
+
 	// failFast is the set of sessionIDs whose spawn requested the fail-closed
 	// permission policy (unattended/automated spawning): when such a session
 	// raises a permission prompt, the permission watcher auto-rejects it (never
@@ -373,6 +380,19 @@ func NewServer(agg *aggregator.Aggregator, opencodeURL string, ringCapacity int)
 		bgCancel()
 		return nil, fmt.Errorf("pins: init store: %w", err)
 	}
+	// Worker-wide root-session labels store (Slice 2). Constructed ONCE at
+	// server startup — never per-request — grounded at
+	// stateBaseDir()/"labels.json" (same worker-wide flat dir pins.go/notes.go
+	// use; no worker-id subpath). A construction failure (permission, etc.) is
+	// propagated to the caller, matching how NewPinStore failure is handled
+	// above. A missing file or a corrupt/schema-mismatched file is NOT an error
+	// (NewLabelStore returns a zero doc — see labels.go).
+	labelsPath := filepath.Join(stateBaseDir(), "labels.json")
+	labelStore, err := NewLabelStore(labelsPath)
+	if err != nil {
+		bgCancel()
+		return nil, fmt.Errorf("labels: init store: %w", err)
+	}
 	srv := &Server{
 		agg:           agg,
 		proxy:         rp,
@@ -387,6 +407,7 @@ func NewServer(agg *aggregator.Aggregator, opencodeURL string, ringCapacity int)
 		views:         newViewRegistry(),
 		queues:        newQueueRegistry(),
 		pins:          pinStore,
+		labels:        labelStore,
 		failFast:      map[string]struct{}{},
 		watcherOn:     map[string]bool{},
 		watcherCancel: map[string]context.CancelFunc{},
@@ -1079,6 +1100,12 @@ func (s *Server) Handler() http.Handler {
 	// guarded by the csrfGuard middleware wrapping every /vh/* route (no
 	// per-handler CSRF check needed). See pkg/web/pins_http.go.
 	mux.HandleFunc("/vh/pins", s.handlePins)
+	// Server-managed root-session labels (Slice 2): GET reads the worker-wide
+	// labels doc (groups + tags + per-root tag assignments), PUT applies a
+	// CAS-guarded replace. PUT is state-changing and is guarded by the
+	// csrfGuard middleware wrapping every /vh/* route (no per-handler CSRF
+	// check needed). See pkg/web/labels_http.go.
+	mux.HandleFunc("/vh/labels", s.handleLabels)
 	mux.HandleFunc("/vh/attach", s.handleAttach)
 	mux.HandleFunc("/vh/quota", s.handleQuota)
 	mux.HandleFunc("/vh/archive", s.handleArchive)

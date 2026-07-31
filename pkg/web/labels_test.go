@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -837,5 +838,123 @@ func TestLabelStoreReplaceDeepCopiesInputDoc(t *testing.T) {
 	}
 	if !bytes.Equal(diskBefore, diskAfter) {
 		t.Fatalf("input mutation rewrote disk:\nbefore: %s\nafter:  %s", diskBefore, diskAfter)
+	}
+}
+
+// --- D1/D2 backfill: negative validation codes deferred from the slice-1 review.
+//
+// The slice-1 review (commit 24ecf6b) shipped the full positive contract but
+// DEFERRED the per-reason negative coverage for the structural-id and
+// name-length rejection codes, plus the validate-before-CAS ordering proof.
+// These are absorbed here so the full validation matrix is test-proven before
+// the HTTP layer (slice 2) starts mapping these codes to 400s. They use the
+// existing expectRejection helper (which fatals if the call succeeds, returns a
+// CAS-mismatch false, or a non-rejection error).
+
+// 24. Empty group id → rejected.
+func TestLabelStoreRejectsEmptyGroupID(t *testing.T) {
+	st, _ := newLabelTestStore(t)
+	activeRoots := map[string]string{}
+	doc := LabelsDoc{
+		Groups:                []LabelGroup{{ID: "", Name: "NoID", Color: "blue"}},
+		Tags:                  []LabelTag{},
+		TagIDsByRootSessionID: map[string][]string{},
+	}
+	expectRejection(t, st, 0, doc, activeRoots, LabelRejectionEmptyGroupID)
+}
+
+// 25. Duplicate group id → rejected.
+func TestLabelStoreRejectsDuplicateGroupID(t *testing.T) {
+	st, _ := newLabelTestStore(t)
+	activeRoots := map[string]string{}
+	doc := LabelsDoc{
+		Groups: []LabelGroup{
+			{ID: "dup", Name: "A", Color: "blue"},
+			{ID: "dup", Name: "B", Color: "green"},
+		},
+		Tags:                  []LabelTag{},
+		TagIDsByRootSessionID: map[string][]string{},
+	}
+	expectRejection(t, st, 0, doc, activeRoots, LabelRejectionDuplicateGroupID)
+}
+
+// 26. Empty tag id → rejected.
+func TestLabelStoreRejectsEmptyTagID(t *testing.T) {
+	st, _ := newLabelTestStore(t)
+	activeRoots := map[string]string{}
+	doc := LabelsDoc{
+		Groups:                []LabelGroup{},
+		Tags:                  []LabelTag{{ID: "", Name: "NoID", Color: "red"}},
+		TagIDsByRootSessionID: map[string][]string{},
+	}
+	expectRejection(t, st, 0, doc, activeRoots, LabelRejectionEmptyTagID)
+}
+
+// 27. Duplicate tag id → rejected.
+func TestLabelStoreRejectsDuplicateTagID(t *testing.T) {
+	st, _ := newLabelTestStore(t)
+	activeRoots := map[string]string{}
+	doc := LabelsDoc{
+		Groups: []LabelGroup{},
+		Tags: []LabelTag{
+			{ID: "dup", Name: "A", Color: "red"},
+			{ID: "dup", Name: "B", Color: "orange"},
+		},
+		TagIDsByRootSessionID: map[string][]string{},
+	}
+	expectRejection(t, st, 0, doc, activeRoots, LabelRejectionDuplicateTagID)
+}
+
+// 28. Group name too long (>maxGroupNameLen after trim) → rejected.
+func TestLabelStoreRejectsGroupNameTooLong(t *testing.T) {
+	st, _ := newLabelTestStore(t)
+	activeRoots := map[string]string{}
+	doc := LabelsDoc{
+		Groups:                []LabelGroup{{ID: "g1", Name: strings.Repeat("x", maxGroupNameLen+1), Color: "blue"}},
+		Tags:                  []LabelTag{},
+		TagIDsByRootSessionID: map[string][]string{},
+	}
+	expectRejection(t, st, 0, doc, activeRoots, LabelRejectionGroupNameTooLong)
+}
+
+// 29. Tag name too long (>maxTagNameLen after trim) → rejected.
+func TestLabelStoreRejectsTagNameTooLong(t *testing.T) {
+	st, _ := newLabelTestStore(t)
+	activeRoots := map[string]string{}
+	doc := LabelsDoc{
+		Groups:                []LabelGroup{},
+		Tags:                  []LabelTag{{ID: "t1", Name: strings.Repeat("x", maxTagNameLen+1), Color: "red"}},
+		TagIDsByRootSessionID: map[string][]string{},
+	}
+	expectRejection(t, st, 0, doc, activeRoots, LabelRejectionTagNameTooLong)
+}
+
+// 30. Validate-before-CAS ordering proof. A request that is BOTH stale (wrong
+// baseRevision) AND structurally invalid (empty group id) MUST yield a clear
+// *LabelRejection, NOT a silent CAS-mismatch false (ok=false, err=nil). This
+// directly pins the slice-1 design documented on Replace: validation runs BEFORE
+// the CAS guard (labels.go step 1 before step 2), so a malformed doc is never
+// hidden behind a 409. The HTTP layer (slice 2) relies on this to map a
+// malformed+stale request to a 400 (not a 409). expectRejection fatals on a CAS
+// false, so this test fails loudly if the ordering ever flips.
+func TestLabelStoreReplaceStaleAndInvalidYieldsRejectionNotCASFalse(t *testing.T) {
+	st, _ := newLabelTestStore(t)
+	activeRoots := map[string]string{"r1": "projA"}
+	// Establish the doc at revision 1.
+	mustReplaceLabels(t, st, 0, minimalValidDoc([]string{"r1"}, nil), activeRoots)
+
+	// Submit a candidate that is BOTH stale (base=0, but current=1) AND
+	// invalid (empty group id). The store must reject with *LabelRejection,
+	// NOT return a CAS-mismatch false.
+	invalid := LabelsDoc{
+		Groups:                []LabelGroup{{ID: "", Name: "Bad", Color: "blue"}},
+		Tags:                  []LabelTag{},
+		TagIDsByRootSessionID: map[string][]string{},
+	}
+	expectRejection(t, st, 0, invalid, activeRoots, LabelRejectionEmptyGroupID)
+
+	// And the doc must NOT have mutated (still rev 1, the prior committed doc).
+	if snap := st.Snapshot(); snap.Revision != 1 {
+		t.Fatalf("stale+invalid Replace mutated doc: revision=%d, want 1", snap.Revision)
 	}
 }
