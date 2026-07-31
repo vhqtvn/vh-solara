@@ -1,5 +1,5 @@
 import { createEffect, createMemo, createSignal, For, Match, on, onCleanup, onMount, Show, Switch, untrack } from "solid-js";
-import { ackSession, createSession, currentVerb, isSending, loadOlder, openSession, rootOf, sessionWorking, setSelectedId, setSending, state } from "../sync";
+import { ackSession, createSession, currentVerb, isSending, openSession, rootOf, sessionWorking, setSelectedId, setSending, state } from "../sync";
 import {
   bottommostReadWithFallback,
   classifyScrollDelta,
@@ -57,6 +57,7 @@ import { createQueueRecovery } from "./chat/createQueueRecovery";
 import { createSend } from "./chat/createSend";
 import { createMessageActions, type MessageActions } from "./chat/createMessageActions";
 import { createNavigator } from "./chat/createNavigator";
+import { createLoadOlder } from "./chat/createLoadOlder";
 import { ChatNavigator } from "./chat/ChatNavigator";
 import { Composer } from "./chat/Composer";
 
@@ -451,14 +452,12 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // capturing `restoredAnchorId`/`restoredAnchorOffset` BEFORE the fetch so the
   // existing read-mode ResizeObserver branch (line ~940) corrects scrollTop
   // mechanically via `anchorDelta` — NO new scroll code here.
-  const win = () => state.messageWindows[props.sessionId];
-  const hasOlder = () => !!win()?.hasOlder;
-  const loadingOlder = () => !!win()?.loadingOlder;
-  // Capture the visible logical anchor before a prepend. If we're following
-  // (tail mode), there is no anchor to preserve — the prepend lands above the
-  // viewport and the user stays at the tail. If we're reading up, capture the
-  // current top-visible message (or the first resident as a fallback) so the
-  // RO's anchorDelta branch keeps it in view through the prepend.
+  //
+  // `win`/`hasOlder`/`loadingOlder` + `onLoadOlder` are extracted to
+  // ./chat/createLoadOlder. The anchor capture below STAYS here — it is
+  // scroll-surface-coupled (writes restoredAnchor{Id,Offset} shared with the
+  // contentEl RO branch) — and is injected into the controller as `captureAnchor`.
+  // The sentinel IO (rooted at scrollEl) + the load-more JSX stay here too.
   function captureAnchorBeforeLoadOlder() {
     if (!scrollEl) return;
     if (following()) return; // tail mode: nothing to preserve
@@ -469,11 +468,10 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     restoredAnchorId = cand;
     restoredAnchorOffset = anchorContentOffset(el);
   }
-  async function onLoadOlder() {
-    if (loadingOlder()) return; // single-flight guard (mirrors pageInFlight)
-    captureAnchorBeforeLoadOlder();
-    await loadOlder(props.sessionId);
-  }
+  const { hasOlder, loadingOlder, onLoadOlder } = createLoadOlder({
+    sessionId: () => props.sessionId,
+    captureAnchor: captureAnchorBeforeLoadOlder,
+  });
 
   // Scroll restore: reopening a session returns to its read-up-to anchor (the
   // last message scrolled past), else the bottom. `restoredFor` tracks which
