@@ -52,6 +52,19 @@ func (s *Store) graceStateSnapshot(id string) (gen uint64, armed bool, authorita
 	return
 }
 
+// withCompletionGrace sets the per-instance completion-grace window on a Config
+// (the GAP-S5-promoted tunable), returning the modified Config for chaining.
+// Pair with mustNew so the value flows through Config.validate() at
+// construction — no Store instance field is mutated post-construction. Mirrors
+// withFlushInterval / withPartTextCap / withRecentArchiveTTL / withWindowBounds.
+// Config.validate() rejects CompletionGrace <= 0, so a test that needs the
+// tightest legal window uses time.Nanosecond (the validated equivalent of the
+// former direct s.completionGrace = 0 mutation).
+func withCompletionGrace(cfg Config, d time.Duration) Config {
+	cfg.CompletionGrace = d
+	return cfg
+}
+
 // TestGraceTimer_CancelSupersedesStaleFire is GAP-S1 case 1 (fire-vs-cancel):
 // arm a grace timer, cancel it via a new inflight assistant message (the
 // production cancel path), and assert the stale fire is a no-op.
@@ -70,9 +83,8 @@ func (s *Store) graceStateSnapshot(id string) (gen uint64, armed bool, authorita
 // Either way busy stays 1 and authority stays clear — that is the
 // race-closer's observable contract.
 func TestGraceTimer_CancelSupersedesStaleFire(t *testing.T) {
-	s := New(100)
-	defer s.Close()                           // GAP-S1: cancel armed grace so no timer fires into a later test
-	s.completionGrace = 15 * time.Millisecond // small enough for a fast test
+	s := mustNew(t, withCompletionGrace(DefaultConfig(100), 15*time.Millisecond)) // small enough for a fast test
+	defer s.Close()                                                               // GAP-S1: cancel armed grace so no timer fires into a later test
 
 	s.Apply(ev("session.created", evSessionCreated("R", "")))
 	s.Apply(ev("message.updated", evAssistantInflight("R", "m1")))
@@ -155,8 +167,7 @@ func TestGraceTimer_CancelSupersedesStaleFire(t *testing.T) {
 // the verifier — a regression that introduces an unsynchronized read/write
 // in the arm/cancel/fire path will fail this test under -race.
 func TestGraceTimer_ConcurrentArmCancelNoRace(t *testing.T) {
-	s := New(2000)
-	s.completionGrace = time.Millisecond // tiny so timers fire frequently during the test
+	s := mustNew(t, withCompletionGrace(DefaultConfig(2000), time.Millisecond)) // tiny so timers fire frequently during the test
 
 	// Seed N root sessions so writers spread across ids.
 	const N = 40
@@ -259,9 +270,8 @@ func TestGraceTimer_ConcurrentArmCancelNoRace(t *testing.T) {
 // strictly monotonic across the lifecycle and the final fire reflects only
 // the latest decision.
 func TestGraceTimer_MultiStepRearmLatestWins(t *testing.T) {
-	s := New(100)
+	s := mustNew(t, withCompletionGrace(DefaultConfig(100), 15*time.Millisecond))
 	defer s.Close() // GAP-S1: cancel armed grace so no timer fires into a later test
-	s.completionGrace = 15 * time.Millisecond
 
 	s.Apply(ev("session.created", evSessionCreated("R", "")))
 
@@ -334,8 +344,7 @@ func TestGraceTimer_MultiStepRearmLatestWins(t *testing.T) {
 // post-Close diagnostic read and risking a nil-map panic if a future
 // refactor nils maps on Close.
 func TestGraceTimer_CloseCancelsArmed(t *testing.T) {
-	s := New(100)
-	s.completionGrace = 15 * time.Millisecond
+	s := mustNew(t, withCompletionGrace(DefaultConfig(100), 15*time.Millisecond))
 
 	s.Apply(ev("session.created", evSessionCreated("R", "")))
 	s.Apply(ev("message.updated", evAssistantInflight("R", "m1")))
@@ -400,9 +409,8 @@ func TestGraceTimer_CloseCancelsArmed(t *testing.T) {
 // set/clear lifecycle directly (not just the observable RunningRoots) so a
 // split that moves the guard cannot silently regress it.
 func TestGraceTimer_CompletionAuthoritativeReflectsLatestDecision(t *testing.T) {
-	s := New(100)
+	s := mustNew(t, withCompletionGrace(DefaultConfig(100), 15*time.Millisecond))
 	defer s.Close() // GAP-S1: cancel armed grace so no timer fires into a later test
-	s.completionGrace = 15 * time.Millisecond
 
 	s.Apply(ev("session.created", evSessionCreated("R", "")))
 	s.Apply(ev("message.updated", evAssistantInflight("R", "m1")))

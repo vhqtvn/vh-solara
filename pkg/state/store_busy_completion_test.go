@@ -36,14 +36,13 @@ import (
 // never emits session.idle — exactly the gap the grace window + authority guard
 // exist to close.
 func TestBusyCompletionStrand_NoSessionIdle_StrandsRunningRoots(t *testing.T) {
-	s := New(100)
-	defer s.Close() // GAP-S1: cancel armed grace so no timer fires into a later test
 	// Shrink the completion-grace window so the test can observe the
 	// authoritative clear without waiting the prod default (5s). The grace
 	// window is what lets a completed assistant turn clear a stranded
 	// busyCount WITHOUT synchronously idling (which would dip the spinner mid
 	// multi-step turn).
-	s.completionGrace = 2 * time.Millisecond
+	s := mustNew(t, withCompletionGrace(DefaultConfig(100), 2*time.Millisecond))
+	defer s.Close() // GAP-S1: cancel armed grace so no timer fires into a later test
 
 	// Root session "R".
 	s.Apply(ev("session.created", evSessionCreated("R", "")))

@@ -309,9 +309,8 @@ func TestHydrate_IndexesConsistent(t *testing.T) {
 // clearOnCompletionLocked → busyCount→0 + authority armed. The test then
 // fails on busyAfter != 1 / authAfter != false.
 func TestHydrate_DoesNotLeakGraceTimers(t *testing.T) {
-	s := New(100)
-	defer s.Close()                           // GAP-S1: cancel armed grace so no timer fires into a later test
-	s.completionGrace = 15 * time.Millisecond // small enough for a fast test
+	s := mustNew(t, withCompletionGrace(DefaultConfig(100), 15*time.Millisecond)) // small enough for a fast test
+	defer s.Close()                                                               // GAP-S1: cancel armed grace so no timer fires into a later test
 
 	// Arm grace the production way: a completed assistant turn on root R.
 	s.Apply(ev("session.created", evSessionCreated("R", "")))

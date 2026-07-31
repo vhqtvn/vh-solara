@@ -152,9 +152,8 @@ func eventKinds(events []ClientEvent) []string {
 // stale fire re-creates phantom activity/authority (st2.activity!="" or
 // st2.authoritative==true).
 func TestDeleteSession_CancelsArmedGrace(t *testing.T) {
-	s := New(100)
-	s.completionGrace = 15 * time.Millisecond // small enough for a fast test
-	defer s.Close()                           // reap any straggler timer
+	s := mustNew(t, withCompletionGrace(DefaultConfig(100), 15*time.Millisecond)) // small enough for a fast test
+	defer s.Close()                                                               // reap any straggler timer
 
 	s.Apply(ev("session.created", evSessionCreated("R", "")))
 	// Inflight → busy armed (busyCount["R"]=1).
@@ -540,8 +539,7 @@ func TestDeleteSession_EmitOrderActivityBeforeDeleteBeforeOrphanCheck(t *testing
 // -race. Mirrors TestGraceTimer_ConcurrentArmCancelNoRace (grace_timer_test.go)
 // but adds the DELETE path as the canceling agent.
 func TestDeleteSession_ConcurrentWithGraceFire(t *testing.T) {
-	s := New(2000)
-	s.completionGrace = time.Millisecond // tiny so timers fire frequently during the test
+	s := mustNew(t, withCompletionGrace(DefaultConfig(2000), time.Millisecond)) // tiny so timers fire frequently during the test
 	defer s.Close()
 
 	const N = 60
