@@ -33,6 +33,10 @@ export interface Selection {
 const LS_DEFAULT = "vh.model.default.v1";
 const LS_RECENT = "vh.model.recent.v1";
 const LS_HIDE_BUILTIN = "vh.model.hideBuiltin.v1";
+// The draft composer's explicit pre-first-send model pick (sessionID === "").
+// Exported so tests can assert against the exact key (the sibling LS_* consts
+// are module-local; this one is test-coupled by design).
+export const LS_DRAFT = "vh.model.draft.v1";
 const RECENT_MAX = 6;
 
 // When enabled, OpenCode's builtin (source "api") models are hidden from the
@@ -59,20 +63,70 @@ function loadJSON<T>(key: string, fallback: T): T {
 }
 
 const [models, setModels] = createSignal<ModelRef[]>([]);
+
+// Draft composer model pick (sessionID === "") persistence: the ONE session
+// entry that survives reload. An explicit pre-first-send composer pick must
+// survive a page/app reload so the first send dispatches the operator's chosen
+// model instead of the selected agent's declared model overwriting it on reload
+// (when the in-memory explicit marker is gone). The record carries the complete
+// draft Selection AND its explicit-pick provenance TOGETHER: the record's
+// presence IS the explicit marker (there is no separate lone marker — a stale
+// lone marker could suppress the agent default while pointing at a global
+// default that no longer represents the draft). Real sessions are NEVER
+// persisted here — OpenCode is their source of truth (session.model + per-
+// message stamps) — so only the draft "" Selection is stored. (Previously a
+// localStorage map vh.model.sessions.v1 duplicated real-session server state;
+// that is NOT recreated — only the draft "" entry persists.)
+const draftPick = loadVersioned<Selection | null>(LS_DRAFT, 1, null, (old) => {
+  // Shape-validate + reconstruct a clean Selection so a foreign/corrupt payload
+  // (or a stray session-id field) falls back to null rather than hydrating junk.
+  if (!old || typeof old !== "object") return null;
+  const o = old as Record<string, unknown>;
+  if (typeof o.providerID !== "string" || typeof o.modelID !== "string") return null;
+  return { providerID: o.providerID, modelID: o.modelID, variant: typeof o.variant === "string" ? o.variant : undefined };
+});
 const [defaultSel, setDefaultSig] = createSignal<Selection | null>(loadJSON<Selection | null>(LS_DEFAULT, null));
-// In-memory only (NOT persisted): an explicit dropdown pick for a session before
-// a message is sent with it. OpenCode is the source of truth for a session's
-// model — it persists session.model and stamps each message — so this just
-// bridges the moment between picking and sending; on reload selectionFor falls
-// back to the server-persisted model. (Previously this was a localStorage map,
-// vh.model.sessions.v1, which duplicated server state; opencode web/openchamber
-// don't keep one either.)
-const [sessionSel, setSessionSel] = createStore<Record<string, Selection>>({});
+
+// Per-session in-memory selection overrides. A REAL session's entry is in-memory
+// only (NOT persisted): on reload selectionFor falls back to the server-persisted
+// model. The DRAFT "" entry is the one exception — hydrated from LS_DRAFT above
+// so an explicit pre-first-send pick survives reload (see saveDraft/clearDraft).
+const [sessionSel, setSessionSel] = createStore<Record<string, Selection>>(
+  draftPick ? { "": draftPick } : {},
+);
+
 // Tracks sessions ("" = draft) for which the user has made an explicit composer
 // model/variant pick. An agent's declared model is a DEFAULT — it must never
-// override such an explicit pick. In-memory only (NOT persisted): provenance
-// does not survive reload; on reload the server-persisted session model wins.
+// override such an explicit pick. In-memory for real sessions (provenance does
+// not survive reload; on reload the server-persisted session model wins); the
+// DRAFT "" membership IS restored from LS_DRAFT on load — the draft record
+// carries the Selection + its explicit provenance together — and this hydration
+// runs at module load, BEFORE any agent-model application (the draft init effect
+// in ChatView runs selectAgentForSession("", agent) → applyAgentModel("", …)
+// only after mount), so applyAgentModel's explicit guard keeps the restored pick.
 const explicitModelPicks = new Set<string>();
+if (draftPick) explicitModelPicks.add("");
+
+// Persist the draft pick (Selection + explicit provenance, atomically — one
+// write). Called only for sessionId === "" (an explicit composer gesture on the
+// draft), never for a real session, so a real session id is never stored here.
+function saveDraft(sel: Selection): void {
+  saveVersioned(LS_DRAFT, 1, sel);
+}
+
+// Clear the draft pick. The record's lifetime ends when the draft is consumed by
+// a first send (migrateModelPick("", liveID)), which transfers the pick to the
+// live session — a consumed draft must not carry over into the next draft. There
+// is no other explicit draft-reset UI in this codebase; migrate-on-first-send is
+// the draft's lifecycle end. (Not cleared on incidental composer/keystroke
+// changes — an unsent pick deliberately survives reload; that IS the feature.)
+function clearDraft(): void {
+  try {
+    localStorage.removeItem(LS_DRAFT);
+  } catch {
+    /* private mode / quota — ignore */
+  }
+}
 const [recentKeys, setRecentKeys] = createSignal<string[]>(loadJSON<string[]>(LS_RECENT, []));
 
 const keyOf = (providerID: string, modelID: string) => providerID + "/" + modelID;
@@ -144,6 +198,7 @@ export function chooseModel(sessionId: string, providerID: string, modelID: stri
   // USER gesture: this session now has an explicit model pick that an
   // agent-select must not override.
   explicitModelPicks.add(sessionId);
+  if (sessionId === "") saveDraft(sel);
 }
 
 export function chooseVariant(sessionId: string, variant: string | undefined) {
@@ -154,6 +209,7 @@ export function chooseVariant(sessionId: string, variant: string | undefined) {
   setDefault(sel);
   // USER gesture: mark the session explicit (same as chooseModel).
   explicitModelPicks.add(sessionId);
+  if (sessionId === "") saveDraft(sel);
 }
 
 // Apply a model + variant to a session, or — when there's no session yet (a
@@ -265,6 +321,11 @@ export function migrateModelPick(fromID: string, toID: string) {
     explicitModelPicks.add(toID);
     explicitModelPicks.delete(fromID);
   }
+  // A draft materializing into a real session consumes the draft record: the
+  // pick (and its explicit provenance) transfer to the live id, so the draft
+  // storage must not survive and carry over into the next draft. Only the draft
+  // ("") source is persisted, so this clear only fires for a draft→live migrate.
+  if (fromID === "") clearDraft();
 }
 
 export async function loadModels() {
