@@ -3630,12 +3630,24 @@ function assertSaveCoordinationTaskStatusTransition(
     );
 }
 
-function detectCoordinationTaskOverlaps(taskID, filesInScope) {
+function detectCoordinationTaskOverlaps(taskID, filesInScope, options = {}) {
     if (!filesInScope.length) {
         return [];
     }
     const currentFiles = normalizeFileScope(filesInScope);
-    return listCoordinationTaskCards()
+    // Mirror listCoordinationTasks' hardened enumeration (see the sibling call
+    // below at the collectSkipped: skipped_cards site): thread a {collectSkipped}
+    // collector so a malformed open card is surfaced in the caller's
+    // skipped_cards instead of being silently excluded from overlap detection.
+    // Without this, a card skipped during enumeration is invisible to overlap
+    // detection (and thus to the operator reviewing overlaps on save/read),
+    // defeating the hardened loader's enumerate-the-good/report-the-bad contract.
+    const collectSkipped = Array.isArray(options.collectSkipped)
+        ? options.collectSkipped
+        : null;
+    return listCoordinationTaskCards(
+        collectSkipped ? { collectSkipped } : {},
+    )
         .filter((task) => task.task_id !== taskID)
         .filter((task) => OPEN_COORDINATION_TASK_STATUSES.has(task.status))
         .map((task) => {
@@ -3998,9 +4010,11 @@ function saveCoordinationTask(sessionID, taskPayload, options = {}) {
         throwCollectedErrors(errors);
         return next;
     });
+    const overlapSkippedCards = [];
     const overlaps = detectCoordinationTaskOverlaps(
         saved.task_id,
         saved.files_in_scope,
+        { collectSkipped: overlapSkippedCards },
     );
     return {
         ...actor,
@@ -4009,6 +4023,7 @@ function saveCoordinationTask(sessionID, taskPayload, options = {}) {
         task: saved,
         summary: summarizeCoordinationTask(saved),
         overlaps,
+        skipped_cards: overlapSkippedCards,
         ...recommendedCoordinationTaskFields(saved, actor.session_name || null),
     };
 }
@@ -4028,6 +4043,7 @@ function readCoordinationTask(sessionID, taskIDRaw, options = {}) {
               includeBody: Boolean(options.includeBody),
           })
         : null;
+    const overlapSkippedCards = [];
     return {
         ...actor,
         path: relativeToRepo(loaded.path),
@@ -4038,7 +4054,9 @@ function readCoordinationTask(sessionID, taskIDRaw, options = {}) {
         overlaps: detectCoordinationTaskOverlaps(
             loaded.payload.task_id,
             loaded.payload.files_in_scope,
+            { collectSkipped: overlapSkippedCards },
         ),
+        skipped_cards: overlapSkippedCards,
         ...recommendedCoordinationTaskFields(
             loaded.payload,
             actor.session_name || null,

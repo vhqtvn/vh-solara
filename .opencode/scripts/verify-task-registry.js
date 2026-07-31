@@ -1229,6 +1229,43 @@ function main() {
             );
         }
 
+        // Overlap-detection skipped-cards surfacing
+        // (defer-2026-07-31-overlap-detector-skips-malformed): detectCoordinationTaskOverlaps
+        // must thread the hardened enumerator's collectSkipped collector (mirroring
+        // listCoordinationTasks) so a malformed open card is surfaced via the
+        // caller's skipped_cards instead of leaving overlap detection blind to it.
+        // Re-read a task with non-empty files_in_scope (primary) and assert the
+        // intentionally-invalid card appears in skipped_cards. It must NOT appear
+        // in overlaps — it was skipped during enumeration, never reached the
+        // overlap filter, so surfacing it via skipped_cards is the only signal.
+        const overlapSurfaced = readCoordinationTask(
+            coordinatorSessionID,
+            primary.task.task_id,
+            { cwd: "/verification" },
+        );
+        const overlapSkippedInvalid = (overlapSurfaced.skipped_cards || []).find(
+            (entry) => entry.task_id === invalidTaskID,
+        );
+        if (!overlapSkippedInvalid) {
+            throw new StateError(
+                "Expected readCoordinationTask to surface the malformed card in skipped_cards via overlap detection's collectSkipped collector.",
+            );
+        }
+        if (!String(overlapSkippedInvalid.error || "").includes("success_criteria")) {
+            throw new StateError(
+                `Expected overlap skipped_cards error to name the missing success_criteria field, got "${overlapSkippedInvalid.error}".`,
+            );
+        }
+        if (
+            overlapSurfaced.overlaps.some(
+                (entry) => entry.task_id === invalidTaskID,
+            )
+        ) {
+            throw new StateError(
+                "Expected the invalid card to be skipped (surfaced in skipped_cards), not reported as an overlap.",
+            );
+        }
+
         console.log("verification: ok");
         console.log(`primary_task_id: ${primary.task.task_id}`);
         console.log(`overlap_task_id: ${overlap.task.task_id}`);
