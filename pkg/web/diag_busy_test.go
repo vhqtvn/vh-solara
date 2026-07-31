@@ -22,7 +22,9 @@ import (
 //   - an unsafe POST WITHOUT X-VH-CSRF is stopped by csrfGuard (403);
 //   - an unsafe POST WITH X-VH-CSRF still reaches handleDiagBusy's own method
 //     guard and is rejected with 405 — the route is read-only at the handler
-//     level too (defense in depth);
+//     level too (defense in depth) — and the 405 advertises Allow: GET, HEAD
+//     (RFC 7231);
+//   - an AUTHENTICATED HEAD returns 200 (the handler allows GET+HEAD);
 //   - /vh/healthz remains the ONLY auth exemption on the edge.
 //
 // This test FAILS if /vh/diag/busy is accidentally mounted outside auth or
@@ -115,8 +117,23 @@ func TestDiagBusyRouteAuthChainWorker(t *testing.T) {
 	req4.Header.Set(csrfHeader, "1")
 	h.ServeHTTP(rec4, req4)
 	if rec4.Code != http.StatusMethodNotAllowed {
-		t.Fatalf("authenticated POST /vh/diag/busy with %s: want 405 (handler-level GET-only), got %d (body=%q)",
+		t.Fatalf("authenticated POST /vh/diag/busy with %s: want 405 (handler-level GET/HEAD-only), got %d (body=%q)",
 			csrfHeader, rec4.Code, rec4.Body.String())
+	}
+	// 3c. The 405 from the handler-level method guard must advertise the
+	// allowed methods (RFC 7231 Allow: GET, HEAD) so well-behaved clients can
+	// adapt and so a future tightening/drop is caught here.
+	if allow := rec4.Result().Header.Get("Allow"); allow != "GET, HEAD" {
+		t.Fatalf("405 POST /vh/diag/busy: Allow header want %q, got %q", "GET, HEAD", allow)
+	}
+	// 3d. Authenticated HEAD /vh/diag/busy → 200. The handler allows GET+HEAD;
+	// pin HEAD so a future accidental narrowing to GET-only is caught.
+	recHead := httptest.NewRecorder()
+	reqHead := httptest.NewRequest(http.MethodHead, "/vh/diag/busy", nil)
+	reqHead.AddCookie(session)
+	h.ServeHTTP(recHead, reqHead)
+	if recHead.Code != http.StatusOK {
+		t.Fatalf("authenticated HEAD /vh/diag/busy: want 200, got %d (body=%q)", recHead.Code, recHead.Body.String())
 	}
 
 	// 4. /vh/healthz remains the ONLY auth exemption: a credential-less GET
