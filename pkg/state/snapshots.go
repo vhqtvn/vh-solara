@@ -1131,3 +1131,54 @@ func (s *Store) LoadedSessions() []string {
 	}
 	return out
 }
+
+// RootInventoryEntry is one row of the authoritative live-session inventory
+// (Store.RootInventory). It carries the session id and its parentage so a
+// worker-wide store (labels) can validate that a target is a root WITHOUT
+// trusting the client.
+//
+// pkg/state is per-project: a single Store holds the sessions of ONE project
+// and has no notion of project identity. Project ownership (which project a
+// root belongs to) is therefore NOT carried here — it is composed by the web
+// layer, which iterates s.aggs (dir → aggregator → this Store) and maps each
+// root id to its project key. This mirrors exactly how the pin system's
+// activeSessionProjects composes project keys in pkg/web rather than pkg/state.
+type RootInventoryEntry struct {
+	SessionID string // live (non-archived) session id
+	ParentID  string // "" = a true root (parentID == "")
+	IsRoot    bool   // true iff ParentID == "" (the strict labels root definition)
+}
+
+// RootInventory returns the authoritative live-session inventory WITH PARENTAGE.
+// Every live (non-archived) session is one entry; IsRoot is true iff the
+// session's parentID == "". This is the parentage-carrying counterpart of
+// SessionIDs: the pin system consumes SessionIDs (which lacks parentage); the
+// labels system consumes this, derives the authoritative active-ROOT set by
+// filtering IsRoot, and validates that every label target is a known root.
+//
+// ROOT DEFINITION (deliberately STRICT, distinct from RootCount/RunningRoots):
+// labels target true roots only — parentID == "" — so an ORPHANED child (one
+// whose parent was archived, leaving parentID != "" pointing at a now-absent
+// session) is NOT a root here and is NOT a valid label target. RootCount and
+// RunningRoots use the orphan-INCLUSIVE definition (parentID == "" OR parent
+// absent) because they count population for badges; labels use the STRICT
+// definition because they target the browser-tab-group unit, which is the true
+// root session. See tree_node.go (ParentID == "" = root) and the labels design
+// plan (invariant #1: a root is a session whose parentID is empty).
+//
+// Pure read projection under s.mu.RLock; iteration order is nondeterministic
+// (set-equality parity, exactly like SessionIDs). The returned slice is a fresh
+// copy; callers may mutate it freely.
+func (s *Store) RootInventory() []RootInventoryEntry {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]RootInventoryEntry, 0, len(s.sessions))
+	for id, se := range s.sessions {
+		out = append(out, RootInventoryEntry{
+			SessionID: id,
+			ParentID:  se.parentID,
+			IsRoot:    se.parentID == "",
+		})
+	}
+	return out
+}
