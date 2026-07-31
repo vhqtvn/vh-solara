@@ -222,7 +222,16 @@ func NodeChildrenOp(parentID string, nodes []Node, hasMore bool, cursor string) 
 
 func (o *NodeChildren) Op() string { return "node.children" }
 func (o *NodeChildren) MarshalJSON() ([]byte, error) {
-	d := nodeChildrenData{ParentID: o.ParentID, Nodes: o.Nodes, HasMore: o.HasMore, Cursor: o.Cursor}
+	// Normalize nil Nodes → [] so the wire shape is always a JSON array, never
+	// "nodes":null. A null array breaks clients that iterate data.nodes
+	// unconditionally (.map / for…of). Mirrors the sibling HTTP-path fix in
+	// pkg/web/tree_children.go (L-01); this is the op-side guard so every
+	// emitter (not just the HTTP handler) is covered.
+	nodes := o.Nodes
+	if nodes == nil {
+		nodes = []Node{}
+	}
+	d := nodeChildrenData{ParentID: o.ParentID, Nodes: nodes, HasMore: o.HasMore, Cursor: o.Cursor}
 	return json.Marshal(o.envelope("node.children", d))
 }
 

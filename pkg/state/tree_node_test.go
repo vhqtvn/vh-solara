@@ -184,6 +184,30 @@ func TestTreeOp_JSON_Shapes(t *testing.T) {
 	}
 }
 
+// TestNodeChildren_NilNodesIsEmptyArray pins the wire invariant for
+// node.children: a nil Nodes slice MUST marshal to "nodes":[] (a JSON array),
+// never "nodes":null. A null array breaks clients that iterate data.nodes
+// unconditionally (.map / for…of). Mirrors the sibling HTTP-path normalization
+// in pkg/web/tree_children.go (L-01); regression guard for the nil→[] guard in
+// NodeChildren.MarshalJSON.
+func TestNodeChildren_NilNodesIsEmptyArray(t *testing.T) {
+	op := NodeChildrenOp("S_parent", nil, false, "")
+	raw, err := json.Marshal(op)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(raw), `"nodes":null`) {
+		t.Fatalf("nil Nodes must NOT marshal to null: %s", raw)
+	}
+	if !strings.Contains(string(raw), `"nodes":[]`) {
+		t.Fatalf("nil Nodes must marshal to an empty array \"nodes\":[], got: %s", raw)
+	}
+	// Sanity: the rest of the envelope shape is intact.
+	if !strings.Contains(string(raw), `"op":"node.children"`) || !strings.Contains(string(raw), `"parentId":"S_parent"`) {
+		t.Fatalf("envelope shape lost: %s", raw)
+	}
+}
+
 // TestTreeOp_Sequence verifies the envelope carries a monotonic seq (INV-A).
 func TestTreeOp_Sequence(t *testing.T) {
 	if NodeUpsertOp(Node{ID: "x"}).Op() != "node.upsert" {
