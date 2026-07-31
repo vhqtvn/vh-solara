@@ -393,6 +393,40 @@ func textPart(msgID, sessionID, partID, text string, t float64) map[string]any {
 	}
 }
 
+// SeedFlatSessions is a MEASUREMENT-ONLY helper (used by tests/e2e tunnel-gate
+// probe) that appends n flat root sessions under demoDir so the daemon's cold
+// detail snapshot scales with session count — reproducing the large-dir payload
+// shape (N session rows + N computed gate entries, 0 messages) without a real
+// opencode DB. Each row carries the fields a real session row serializes
+// (id/projectID/title/directory/model/time) so the per-row byte cost is
+// realistic. It does NOT seed messages (the detail snapshot bottleneck is the
+// session+gate volume, not message parts — see tmp/agent-runs/delivery-proof/
+// subtree-open-hang.md). New sessions are picked up by the aggregator's
+// tree-reconcile poll and/or the live /event session.created fan-out below.
+func (f *FakeOpenCode) SeedFlatSessions(n int) {
+	if n <= 0 {
+		return
+	}
+	f.mu.Lock()
+	now := float64(time.Now().UnixMilli())
+	for i := 0; i < n; i++ {
+		f.counter++
+		s := map[string]any{
+			"id": fmt.Sprintf("ses_scale_%d", f.counter), "projectID": "proj",
+			"title": "Scale session " + fmt.Sprintf("%d", f.counter),
+			"directory": demoDir,
+			"model":     map[string]any{"providerID": "fake", "id": "dummy", "variant": "default"},
+			"time":      map[string]any{"created": now - float64(f.counter), "updated": now},
+		}
+		f.sessions = append(f.sessions, s)
+	}
+	f.mu.Unlock()
+	// No live emit: the per-dir aggregator hydrates from GET /session at creation,
+	// which returns f.sessions authoritatively. Bulk emits would overflow the
+	// default aggregator's buffered /event subscriber channel (close-on-full) and
+	// are unnecessary for the measurement shape (sessions + computed gate).
+}
+
 // SetPromptAsyncMode overrides the prompt_async response mode. TEST-ONLY: the
 // shared fixture defaults to PromptAsyncNormal (the faithful path). The e2e
 // queue-recovery test (tests/e2e) switches to CommitThenDropResponse to model
