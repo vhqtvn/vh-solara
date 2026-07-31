@@ -314,6 +314,44 @@ func TestEnsureMessagesAbortedNewestLoadsInOneFetch(t *testing.T) {
 	}
 }
 
+// TestEnsureMessagesAsyncAbortedNewestLoadsInOneFetch is the async (Stream-2)
+// counterpart of the terminal-error fast-path: a session whose newest COMPLETED
+// assistant is an ABORTED turn must load within ONE open via EXACTLY ONE
+// upstream fetch on the async path too. The aborted signal positively
+// classifies the turn as terminal/outputless, so it admits on the FIRST
+// reconcile (no O5 disambiguating re-fetch, contrast
+// TestEnsureMessagesAsyncConfirmsSourceEmptyWithinSingleOpen which needs two
+// fetches for a non-aborted genuinely-empty newest) and messages.loaded is
+// emitted. Mirrors the async wait/assert idiom of
+// TestEnsureMessagesAsyncConfirmsSourceEmptyWithinSingleOpen.
+func TestEnsureMessagesAsyncAbortedNewestLoadsInOneFetch(t *testing.T) {
+	h := &abortedHandler{inner: fixtures.New().Handler(), count: map[string]int{}}
+	oc := httptest.NewServer(h)
+	defer oc.Close()
+
+	agg := New(oc.URL, 100)
+	if err := agg.Rehydrate(context.Background()); err != nil {
+		t.Fatalf("rehydrate: %v", err)
+	}
+	agg.waitColdSeed()
+
+	ch, unsub := agg.Store().Subscribe(256)
+	defer unsub()
+
+	// ONE async open. The aborted newest admits on the FIRST fetch — NO re-fetch.
+	agg.EnsureMessagesAsync("sub")
+	agg.waitMessagesAsync("sub")
+	if got, want := h.countOf("sub"), 1; got != want {
+		t.Fatalf("an aborted newest must load via exactly ONE fetch on the async path (terminal-error fast-path, no disambiguating re-fetch): full-fetch count=%d want %d", got, want)
+	}
+	if !agg.Store().IsMessagesLoaded("sub") {
+		t.Fatalf("IsMessagesLoaded must be TRUE for an aborted newest after a single fetch on the async path")
+	}
+	if !drainForLoaded(t, ch, time.Second) {
+		t.Fatalf("messages.loaded must be emitted for an aborted newest after a single fetch on the async path")
+	}
+}
+
 // abortedHandler wraps the fixture backend and answers EVERY full fetch
 // (GET /session/:id/message with NO limit) as an ABORTED completed-assistant
 // turn with zero parts — the confirmed ses_05ff shape: info.error.name ==
