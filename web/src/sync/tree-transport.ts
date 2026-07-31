@@ -1132,15 +1132,6 @@ export function connect(fresh = false) {
     tryInstall(owner);
   });
   registerAuxiliaryListeners(es, gen);
-  // Daemon-detected alerts (transient; no cursor advance). In-app + OS delivery.
-  es.addEventListener("notice", (e) => {
-    markTreeSeen();
-    try {
-      handleNotice(JSON.parse((e as MessageEvent).data));
-    } catch {
-      /* ignore malformed notice */
-    }
-  });
   es.onopen = () => {
     markTreeSeen();
     // L1 t1: socket established → pure connection-latency delta.
@@ -1191,16 +1182,11 @@ export function connect(fresh = false) {
 
 // === connect() auxiliary listener registration (decomposition Stage 1) ======
 // Extracted VERBATIM from connect() — the CONTIGUOUS auxiliary cohort: the
-// pins.* fast-path reducers, the watchdog transport heartbeat (ping), and the
-// session.* detail reducers (coveredAwait against a pending C4 owner). Only the
-// addEventListener registrations were relocated; no callback body changed.
-//
-// `notice` is intentionally NOT extracted here: it stays inline in connect().
-// (It was originally left out because it sat AFTER the TREE_STREAM_KINDS
-// registration loop, which was non-contiguous with this block; decomposition
-// Stage 2 — registerTreeStreamListeners — has since extracted that loop, making
-// notice contiguous with this call. Folding notice into a helper remains a
-// separate decision, so it stays inline where it is.)
+// pins.* fast-path reducers, the watchdog transport heartbeat (ping), the
+// session.* detail reducers (coveredAwait against a pending C4 owner), and the
+// daemon-detected notice alerts (transient; no cursor advance, in-app + OS
+// delivery). Only the addEventListener registrations were relocated; no
+// callback body changed.
 //
 // Synchronous by contract (registration only, no async, no Promise return).
 // `gen` is THIS connection's captured generation token, passed by value; the
@@ -1287,6 +1273,15 @@ function registerAuxiliaryListeners(es: EventSource, gen: number): void {
       applyTreeFrame(kind, seq, ev.data, applySessionEvent);
     });
   }
+  // Daemon-detected alerts (transient; no cursor advance). In-app + OS delivery.
+  es.addEventListener("notice", (e) => {
+    markTreeSeen();
+    try {
+      handleNotice(JSON.parse((e as MessageEvent).data));
+    } catch {
+      /* ignore malformed notice */
+    }
+  });
 }
 
 
