@@ -44,7 +44,6 @@ import PermissionCard from "./PermissionCard";
 import PendingInput from "./PendingInput";
 import Icon from "./Icon";
 import Spinner from "./Spinner";
-import { isDesktop } from "../layout";
 import BrandMark from "./BrandMark";
 import { pushNotification } from "../notify";
 import { groupParts } from "./chat/MessageParts";
@@ -57,6 +56,8 @@ import { createAttachments } from "./chat/createAttachments";
 import { createQueueRecovery } from "./chat/createQueueRecovery";
 import { createSend } from "./chat/createSend";
 import { createMessageActions, type MessageActions } from "./chat/createMessageActions";
+import { createNavigator } from "./chat/createNavigator";
+import { ChatNavigator } from "./chat/ChatNavigator";
 import { Composer } from "./chat/Composer";
 
 const draftKey = (sid: string) => "vh.draft." + sid;
@@ -237,60 +238,13 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   );
   // Chat navigator: a faint strip of markers (one per user turn) on the right
   // edge — click to jump. Cheap: just markers + a tooltip, no rendered minimap.
-  // (Defined after `messages` — createMemo runs eagerly, so it must not read it
-  // before init.)
-  const userTurns = createMemo(() => messages().filter((m: any) => m.info?.role === "user"));
-  const turnText = (m: any) => {
-    const pid = (m.partOrder || []).find((id: string) => m.parts[id]?.type === "text");
-    const t = (pid && m.parts[pid]?.text) || "";
-    return t.replace(/\s+/g, " ").trim().slice(0, 140) || "(message)";
-  };
+  // Logic lives in ./chat/createNavigator and is rendered by <ChatNavigator>;
+  // the controller exposes scheduleActiveTurn / measureNavCap, which this view
+  // calls from its scroll / content-RO / scrollEl-RO callbacks below. cssEsc is
+  // shared with this view's own [data-mid] scroll/anchor logic, so it stays here
+  // and is injected into the controller (single source of truth).
   const cssEsc = (id: string) => (typeof CSS !== "undefined" && CSS.escape ? CSS.escape(id) : id);
-  const jumpToMsg = (id: string) => {
-    scrollEl?.querySelector(`[data-mid="${cssEsc(id)}"]`)?.scrollIntoView({ behavior: "smooth", block: "start" });
-  };
-  // Navigator highlight: the user turn currently at the top of the viewport, plus
-  // a hover-preview bubble. Recomputed on scroll (rAF-throttled) — desktop only.
-  const [activeTurn, setActiveTurn] = createSignal<string>("");
-  const [navPreview, setNavPreview] = createSignal<{ text: string; y: number } | null>(null);
-  let navRaf = 0;
-  function updateActiveTurn() {
-    navRaf = 0;
-    if (!scrollEl) return;
-    const turns = userTurns();
-    if (!turns.length) return;
-    const cTop = scrollEl.getBoundingClientRect().top;
-    let active = turns[0].id;
-    for (const m of turns) {
-      const el = scrollEl.querySelector(`[data-mid="${cssEsc(m.id)}"]`) as HTMLElement | null;
-      if (!el) continue;
-      if (el.getBoundingClientRect().top - cTop <= 8) active = m.id;
-      else break; // turns are in order; first one below the fold ends the scan
-    }
-    setActiveTurn(active);
-  }
-  function scheduleActiveTurn() {
-    if (!navRaf) navRaf = requestAnimationFrame(updateActiveTurn);
-  }
-  // How many ticks fit at the fixed spacing (4px dot + 5px gap), leaving room for
-  // the two indicators. Recomputed on resize.
-  const [navCap, setNavCap] = createSignal(15);
-  function measureNavCap() {
-    if (!scrollEl) return;
-    const usable = scrollEl.clientHeight - 20 /*insets*/ - 28 /*indicators*/;
-    setNavCap(Math.max(5, Math.floor(usable / 9)));
-  }
-  // The visible window of ticks, centred on the active turn. When the whole set
-  // fits (N <= cap) this is just all of them (identical to the old minimap).
-  const navWindow = createMemo(() => {
-    const turns = userTurns();
-    const N = turns.length;
-    const cap = Math.max(3, Math.min(navCap(), N));
-    const ai = Math.max(0, turns.findIndex((t: any) => t.id === activeTurn()));
-    let start = Math.max(0, Math.min(ai - Math.floor(cap / 2), N - cap));
-    const end = Math.min(N, start + cap);
-    return { items: turns.slice(start, end), start, end, total: N };
-  });
+  const navigator = createNavigator({ messages, scrollEl: () => scrollEl, cssEsc });
 
   const pendingPermissions = createMemo(() => Object.values(state.permissions[props.sessionId] || {}));
   const pendingQuestions = createMemo(() => Object.values(state.questions[props.sessionId] || {}));
@@ -877,7 +831,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       // browser clamp) so the next RO computes an incremental delta.
       pinnedGeom = geom(scrollEl);
       clearTimeout(navDebounce);
-      navDebounce = window.setTimeout(scheduleActiveTurn, 150);
+      navDebounce = window.setTimeout(navigator.scheduleActiveTurn, 150);
     });
     ro.observe(contentEl);
     onCleanup(() => {
@@ -893,10 +847,10 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
 
   // Track the scroll-area height to size the navigator window (how many ticks fit).
   onMount(() => {
-    measureNavCap();
+    navigator.measureNavCap();
     if (!scrollEl) return;
     const ro = new ResizeObserver(() => {
-      measureNavCap();
+      navigator.measureNavCap();
       // Viewport resized (window resize, mobile keyboard toggle, composer
       // grow/shrink, layout shift). When following, re-glue to the bottom: a
       // viewport SHRINK leaves scrollTop ~unchanged while the bottom edge moves
@@ -1008,7 +962,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     // Advance the baseline to the settled geometry (after any write) so the
     // next scroll/RO event computes an incremental delta.
     pinnedGeom = geom(scrollEl);
-    scheduleActiveTurn();
+    navigator.scheduleActiveTurn();
   }
 
   const [focusMode, setFocusMode] = createSignal(false);
@@ -1534,51 +1488,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
             <span class="chat-loading-text">Loading…</span>
           </div>
         </Show>
-        <Show when={isDesktop() && userTurns().length > 1}>
-          <div class="chat-nav" aria-label="Jump to a turn">
-            <Show when={navWindow().start > 0}>
-              <button
-                type="button"
-                class="chat-nav-more up"
-                title={`${navWindow().start} earlier turn${navWindow().start > 1 ? "s" : ""}`}
-                aria-label={`${navWindow().start} earlier turns`}
-                onClick={() => jumpToMsg(userTurns()[Math.max(0, navWindow().start - 1)].id)}
-              >
-                <Icon name="chevronDown" size={11} />
-              </button>
-            </Show>
-            <For each={navWindow().items}>
-              {(m) => (
-                <button
-                  type="button"
-                  class="chat-nav-dot"
-                  classList={{ active: activeTurn() === m.id }}
-                  aria-label={turnText(m)}
-                  aria-current={activeTurn() === m.id ? "true" : undefined}
-                  onClick={() => jumpToMsg(m.id)}
-                  onMouseEnter={(e) => setNavPreview({ text: turnText(m), y: e.currentTarget.offsetTop + e.currentTarget.offsetHeight / 2 })}
-                  onMouseLeave={() => setNavPreview(null)}
-                  onFocus={(e) => setNavPreview({ text: turnText(m), y: e.currentTarget.offsetTop + e.currentTarget.offsetHeight / 2 })}
-                  onBlur={() => setNavPreview(null)}
-                />
-              )}
-            </For>
-            <Show when={navWindow().end < navWindow().total}>
-              <button
-                type="button"
-                class="chat-nav-more"
-                title={`${navWindow().total - navWindow().end} more turn${navWindow().total - navWindow().end > 1 ? "s" : ""}`}
-                aria-label={`${navWindow().total - navWindow().end} more turns`}
-                onClick={() => jumpToMsg(userTurns()[Math.min(navWindow().total - 1, navWindow().end)].id)}
-              >
-                <Icon name="chevronDown" size={11} />
-              </button>
-            </Show>
-            <Show when={navPreview()}>
-              {(pv) => <div class="chat-nav-bubble" style={{ top: `${pv().y}px` }}>{pv().text}</div>}
-            </Show>
-          </div>
-        </Show>
+        <ChatNavigator navigator={navigator} />
         {/*
           Local "following latest" cue (slice b). The only tail-anchored signal
           used to be the ABSENCE of the "↓ Latest" button. This adds a subtle
