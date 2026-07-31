@@ -96,6 +96,13 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: playwright-e2e
+          # Coupled to web/playwright.config.ts `artifactRoot` (default
+          # tmp/agent-runs/playwright, overridable via PLAYWRIGHT_ARTIFACTS_DIR).
+          # If that root changes or PLAYWRIGHT_ARTIFACTS_DIR is set in CI, update
+          # this path to match or the upload will miss the artifacts.
           path: tmp/agent-runs/playwright
           retention-days: 14
-          if-no-files-found: ignore
+          # warn (not ignore) so a missing artifact root surfaces instead of
+          # silently passing — an empty upload usually means the e2e step never
+          # produced output or the artifactRoot above has drifted.
+          if-no-files-found: warn
