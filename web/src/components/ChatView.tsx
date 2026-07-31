@@ -1,6 +1,5 @@
 import { createEffect, createMemo, createSignal, For, Match, on, onCleanup, onMount, Show, Switch, untrack } from "solid-js";
-import { Portal } from "solid-js/web";
-import { ackSession, createSession, currentVerb, isSending, loadOlder, markSessionIdle, openSession, rootOf, sessionWorking, setSelectedId, setSending, state } from "../sync";
+import { ackSession, createSession, currentVerb, isSending, loadOlder, openSession, rootOf, sessionWorking, setSelectedId, setSending, state } from "../sync";
 import {
   bottommostReadWithFallback,
   classifyScrollDelta,
@@ -11,10 +10,9 @@ import {
 } from "../lib/scroll";
 import type { ScrollGeometry } from "../lib/scroll";
 import { createReadCursorStash } from "../lib/readCursorStash";
-import { highlightInput } from "../lib/composerHighlight";
-import { chooseVariant, findModel, loadModels, migrateModelPick, models, selectionFor } from "../models";
+import { findModel, loadModels, migrateModelPick, models, selectionFor } from "../models";
 import { loadVersioned, saveVersioned } from "../lib/store";
-import { activeAgent, agentForSession, agents, selectAgentForSession, selectedAgent } from "../agents";
+import { activeAgent, agents, selectAgentForSession, selectedAgent } from "../agents";
 import { claimQueued, enqueue, fetchQueue, hasQueueState, migrateLegacyQueue, queueFor, queueMode, removeQueued, resolveQueued } from "../queue";
 import { createQueueDrainer } from "../queueDrain";
 import { pushHistory } from "../history";
@@ -22,10 +20,8 @@ import {
   effectiveInline,
   modelHasVision,
   inlineAttachForced,
-  isInlineChipOrphan,
 } from "../lib/inlineAttach";
 import { isSendInFlight } from "../lib/sendSingleFlight";
-import ModelDialog from "./ModelDialog";
 import PartView, { ActivityGroup } from "./Part";
 import ChatTasksStatus from "./ChatTasksStatus";
 
@@ -46,15 +42,11 @@ const RECOVERY_TAIL_GAP = 64;
 import QuestionCard from "./QuestionCard";
 import PermissionCard from "./PermissionCard";
 import PendingInput from "./PendingInput";
-import { QueueChip } from "./QueueChip";
 import Icon from "./Icon";
 import Spinner from "./Spinner";
 import { isDesktop } from "../layout";
 import BrandMark from "./BrandMark";
 import { pushNotification } from "../notify";
-import Select from "./Select";
-import { agentDisplay } from "../projectSettings";
-import { msgTextOnly, msgTextWithThinking } from "../lib/msgText";
 import { groupParts } from "./chat/MessageParts";
 import { MessageRow } from "./chat/MessageRow";
 import { createComposerAutocomplete } from "./chat/createComposerAutocomplete";
@@ -64,6 +56,8 @@ import { createQueueSync } from "./chat/createQueueSync";
 import { createAttachments } from "./chat/createAttachments";
 import { createQueueRecovery } from "./chat/createQueueRecovery";
 import { createSend } from "./chat/createSend";
+import { createMessageActions, type MessageActions } from "./chat/createMessageActions";
+import { Composer } from "./chat/Composer";
 
 const draftKey = (sid: string) => "vh.draft." + sid;
 
@@ -1028,9 +1022,10 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // the walk state machine (histMode/histIdx/histDraft), the Up/Ctrl+Up/Down
   // keyboard handler, and resetHistory — the single reset seam every
   // invalidation site calls (autocomplete onApplied, onInput, paste, inline
-  // attach, session switch, send). This view keeps ONLY the shared onKeyDown
-  // dispatcher below: ac.onAcKeyDown FIRST → send → hist.onHistoryKey LAST,
-  // preserving the autocomplete → send → history precedence.
+  // attach, session switch, send). The shared onKeyDown dispatcher (ac.onAcKeyDown
+  // FIRST → send → hist.onHistoryKey LAST, preserving the autocomplete → send →
+  // history precedence) moved to the Composer component (./chat/Composer.tsx)
+  // with the rest of the composer JSX.
   const hist = createPromptHistory({
     input,
     setInput,
@@ -1072,10 +1067,11 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // factory, mirroring createQueueDrainer). The factory owns the suggestion
   // state machine (caret-driven activeToken detection + agent filter + async
   // command/file fetch with a stale-request guard), keyboard navigation, and
-  // applyAc. This view keeps only the presentational popover JSX + acStyle()
-  // positioning (reads the composer rect) + the shared onKeyDown dispatcher
-  // (above): ac.onAcKeyDown FIRST → send → hist.onHistoryKey LAST (C5 hooks the
-  // prompt-history controller into that dispatcher).
+  // applyAc. The presentational popover JSX + acStyle() positioning (reads the
+  // composer rect) + the shared onKeyDown dispatcher moved to the Composer
+  // component (./chat/Composer.tsx): ac.onAcKeyDown FIRST → send →
+  // hist.onHistoryKey LAST (C5 hooks the prompt-history controller into that
+  // dispatcher).
   //
   // onApplied is the C5 seam: it calls hist.resetHistory() (the prompt-history
   // controller's reset) whenever an item is applied, so an in-flight history
@@ -1170,21 +1166,6 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     notify: (n) => pushNotification({ ...n, sessionID: props.sessionId }),
   });
 
-  // The popup is portaled to <body> (fixed, above the composer) so chat content
-  // can't paint over it. Anchored to the composer's rect; recomputed as items
-  // change (which happens as you type, when the composer may have grown).
-  let composerEl: HTMLDivElement | undefined;
-  const acStyle = (): Record<string, string> => {
-    ac.acItems(); // recompute when the list changes
-    if (!composerEl) return {};
-    const r = composerEl.getBoundingClientRect();
-    return {
-      position: "fixed",
-      left: `${Math.round(r.left)}px`,
-      width: `${Math.round(r.width)}px`,
-      bottom: `${Math.round(window.innerHeight - r.top + 6)}px`,
-    };
-  };
   const MAX_COMPOSER_PX = 200;
   function autosize() {
     const ta = taRef;
@@ -1330,10 +1311,15 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // dispatchQueuedItem, dispatchSend, runShell, send) is extracted to
   // ./chat/createSend so it can be exercised in isolation. The factory owns NO
   // session/composer/queue/transport state — it is all injected as deps here.
-  // retry() below calls resendText; the drainer below forwards to
-  // dispatchQueuedItem (config capture moved inside that method, matching
-  // queueDrain.ts's `dispatch` signature). undo/redo (hoisted function
-  // declarations below) are injected by reference.
+  // retry() (in createMessageActions below) calls resendText; the drainer below
+  // forwards to dispatchQueuedItem (config capture moved inside that method,
+  // matching queueDrain.ts's `dispatch` signature). undo/redo are injected as
+  // lazy closures: createSend needs them, but they live in createMessageActions
+  // which needs resendText FROM createSend — a cycle. Both deps are consumed
+  // lazily (undo/redo at send-time for "/undo" "/redo"; resendText at retry-
+  // click-time), so a forward declaration bridges it. msgActions is assigned
+  // synchronously right after createSend returns, before any user interaction.
+  let msgActions: MessageActions;
   const { send, resendText, dispatchQueuedItem } = createSend({
     sessionId: () => props.sessionId,
     draft: () => !!props.draft,
@@ -1363,14 +1349,18 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     pushHistory,
     resetHistory: () => hist.resetHistory(),
     pushNotification,
-    undo,
-    redo,
+    undo: () => msgActions.undo(),
+    redo: () => msgActions.redo(),
     attachments: att.attachments,
     setAttachments: att.setAttachments,
     flushPendingAttachments: att.flushPendingAttachments,
     inlineFiles: att.inlineFiles,
     uploadFile: att.uploadFile,
     draftKey,
+  });
+  msgActions = createMessageActions({
+    sessionId: () => props.sessionId,
+    resendText,
   });
 
   // Wire the extracted drain state machine to ChatView's closures. The drainer
@@ -1406,95 +1396,6 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     fetchQueue,
     drain: () => queueDrainer.drain(),
   });
-
-  // Copy / Retry text extraction lives in ../lib/msgText (pure, unit-tested).
-  // Retry uses msgTextOnly (thinking is never valid to re-send as a user
-  // prompt). Copy has THREE coexisting paths: a tap (elapsed < HOLD_THRESHOLD_MS)
-  // copies text-only (msgTextOnly); a long-press (elapsed >= HOLD_THRESHOLD_MS)
-  // and a right-click both copy msgTextWithThinking (wraps each contiguous
-  // reasoning run in <think>…</think>). The tap-vs-hold classifier is in
-  // ../lib/copyHold (classifyHold, pure, unit-tested) — the single threshold
-  // source of truth shared with the paste button.
-  const copyMessage = (m: any) => void navigator.clipboard?.writeText(msgTextOnly(m));
-  const copyMessageWithThinking = (m: any) =>
-    void navigator.clipboard?.writeText(msgTextWithThinking(m));
-  const retry = (m: any) => void resendText(msgTextOnly(m), props.sessionId);
-
-  // Inspect: tokens / cost / raw message JSON.
-  const [inspectId, setInspectId] = createSignal<string | null>(null);
-  const toggleInspect = (id: string) => setInspectId(inspectId() === id ? null : id);
-  function inspectText(m: any): string {
-    const i = m.info || {};
-    const summary: any = {
-      role: i.role,
-      model: i.model ?? (i.providerID ? { providerID: i.providerID, modelID: i.modelID } : undefined),
-      agent: i.agent,
-      cost: i.cost,
-      tokens: i.tokens,
-      time: i.time,
-    };
-    return JSON.stringify({ summary, parts: m.partOrder.map((pid: string) => m.parts[pid]) }, null, 2);
-  }
-
-  // One-click fork from a turn.
-  async function fork(messageID: string) {
-    const res = await fetch(`/oc/session/${encodeURIComponent(props.sessionId)}/fork`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ messageID }),
-    });
-    const s = await res.json().catch(() => null);
-    if (s?.id) {
-      setSelectedId(s.id);
-      void openSession(s.id);
-    }
-  }
-
-  // /undo and /redo map to revert / unrevert of the latest turn.
-  async function undo() {
-    const sm = state.messages[props.sessionId];
-    const lastId = sm?.order[sm.order.length - 1];
-    if (!lastId) return;
-    await fetch(`/oc/session/${encodeURIComponent(props.sessionId)}/revert`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ messageID: lastId }),
-    });
-  }
-  async function redo() {
-    await fetch(`/oc/session/${encodeURIComponent(props.sessionId)}/unrevert`, { method: "POST" });
-  }
-
-  async function abort() {
-    // Clear the working indicator immediately — OpenCode doesn't reliably emit
-    // an idle event on abort, so without this the spinner/shimmer would linger.
-    markSessionIdle(props.sessionId);
-    // /vh/abort (not the /oc passthrough) also marks the session idle
-    // authoritatively server-side, so a stream-reconnect snapshot can't re-arm
-    // the working indicator on this stopped turn.
-    await fetch("/vh/abort", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ sessionID: props.sessionId }),
-    });
-  }
-
-  // Shared key dispatcher for the composer: autocomplete FIRST (owns its keys
-  // while the popover is open), then send (Enter), then prompt-history LAST.
-  // ac.onAcKeyDown returns true when it consumed the key; otherwise it falls
-  // through here. hist.onHistoryKey returns true when it recalled/stepped (and
-  // calls preventDefault itself); the return is informational — history is the
-  // LAST entry, so there is nothing further to fall through to. This preserves
-  // the autocomplete → send → history precedence (C3 → C5 shared dispatcher).
-  function onKeyDown(e: KeyboardEvent) {
-    if (ac.onAcKeyDown(e)) return;
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      void send();
-      return;
-    }
-    hist.onHistoryKey(e);
-  }
 
   return (
     <div class="chat" classList={{ draft: props.draft }}>
@@ -1551,13 +1452,13 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
                 scrollRoot={() => scrollEl}
                 lastActivityKey={lastActivityKey}
                 messageFailed={messageFailed}
-                inspected={() => inspectId() === m.id}
-                onToggleInspect={() => toggleInspect(m.id)}
-                onCopyText={() => copyMessage(m)}
-                onCopyWithThinking={() => copyMessageWithThinking(m)}
-                onFork={() => fork(m.id)}
-                onRetry={() => retry(m)}
-                inspectText={() => inspectText(m)}
+                inspected={() => msgActions.inspectId() === m.id}
+                onToggleInspect={() => msgActions.toggleInspect(m.id)}
+                onCopyText={() => msgActions.copyMessage(m)}
+                onCopyWithThinking={() => msgActions.copyMessageWithThinking(m)}
+                onFork={() => msgActions.fork(m.id)}
+                onRetry={() => msgActions.retry(m)}
+                inspectText={() => msgActions.inspectText(m)}
               />
             )}
           </For>
@@ -1719,266 +1620,36 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
         workingAriaLabel={workingAriaLabel}
       />
 
-      <div class="composer-wrap">
-        <Show
-          when={!isChild()}
-          fallback={
-            <div class="composer-child-note">
-              <span>Prompting is disabled for subagent sessions.</span>
-              <Show when={parentId()}>
-                <button type="button" class="composer-child-back" onClick={openParent}>
-                  Back to parent session →
-                </button>
-              </Show>
-              {/* A stuck subagent can still be stopped from here. */}
-              <Show when={working()}>
-                <button type="button" class="composer-child-stop" onClick={abort}>
-                  <Icon name="stop" size={13} /> Stop
-                </button>
-              </Show>
-            </div>
-          }
-        >
-        <div class="composer" classList={{ focus: focusMode() }} ref={composerEl}>
-          {/* Autocomplete popup (@file / @agent / /command). Portaled to body so
-              chat content can't paint over it; positioned above the composer. */}
-          <Show when={ac.acVisible()}>
-            <Portal>
-              <div class="ac-pop" style={acStyle()}>
-                <For each={ac.acItems()}>
-                  {(it, i) => (
-                    <button
-                      type="button"
-                      class="ac-item"
-                      classList={{ active: i() === ac.acIndex() }}
-                      onMouseDown={(e) => { e.preventDefault(); ac.applyAc(it); }}
-                      onMouseEnter={() => ac.setAcIndex(i())}
-                    >
-                      <span class="ac-kind" classList={{ [it.kind]: true }}>{it.kind === "command" ? "/" : it.kind === "agent" ? "@" : "⎘"}</span>
-                      <span class="ac-label">{it.label}</span>
-                      <Show when={it.detail}><span class="ac-detail">{it.detail}</span></Show>
-                    </button>
-                  )}
-                </For>
-              </div>
-            </Portal>
-          </Show>
-          {/* Queue chips reflect the backend-authoritative per-session queue.
-              pending → removable (cancel before dispatch); dispatching → in
-              flight, NOT removable (the state machine owns the transition to
-              terminal); terminal `failed`/`unknown` → dismissable
-              (FIX-QUEUE-GC-4 flipped DELETE from pending-only to "pending +
-              terminal; not dispatching") AND recoverable (retract-to-compose for
-              failed/unknown, mark-sent for unknown — Bug 1 / Bug 2). `sent` is
-              filtered from the visible queue upstream (queueFor), so it needs no
-              surface. See QueueChip.tsx for the per-state action wiring. */}
-          <Show when={!props.draft && queueFor(props.sessionId).length > 0}>
-            <div class="queue-row">
-              <span class="queue-label" data-tip="Sent automatically when the current turn finishes">
-                Queued
-              </span>
-              <For each={queueFor(props.sessionId)}>
-                {(q) => (
-                  <QueueChip
-                    q={q}
-                    onRemove={(id) => void removeQueued(props.sessionId, id)}
-                    onRetract={recovery.retract}
-                    onMarkSent={recovery.markSent}
-                  />
-                )}
-              </For>
-            </div>
-          </Show>
-          <Show when={att.attachments().length > 0 || att.uploading()}>
-            <div class="attach-row">
-              <For each={att.attachments()}>
-                {(a) => {
-                  // S5: an inline chip (vh-attach:<localId>) is an ORPHAN when
-                  // its token is absent from the composer text (the user deleted
-                  // the markdown ref). Its held File will NOT be uploaded at
-                  // send (lazy upload skips absent tokens); show it dimmed with
-                  // a "won't be sent" badge + a re-insert control that splices
-                  // the ref back at the caret. Non-inline chips (real file://
-                  // uploads) are never orphans. presentInlineIds is a memo over
-                  // scanInlineTokens(input()) so this re-evaluates on every
-                  // keystroke.
-                  //
-                  // a-F1: orphan is a DERIVED ACCESSOR, not a captured boolean.
-                  // SolidJS <For> callbacks run ONCE per item in a NON-tracking
-                  // scope, so a captured `const orphan = isInlineChipOrphan(...)`
-                  // would freeze at item-creation and never react to
-                  // presentInlineIds() changes — the dim/badge/re-insert button
-                  // would NOT appear/disappear as the user edits the composer
-                  // text, defeating S5. Reading orphan() inside JSX props/class
-                  // /Show lets the Solid compiler wrap each read in a reactive
-                  // effect so the orphan UI tracks the live present-token set.
-                  const orphan = () => isInlineChipOrphan(a.url, att.presentInlineIds());
-                  return (
-                    <span
-                      class="attach-chip"
-                      classList={{ orphan: orphan() }}
-                      data-tip={orphan() ? `${a.filename} (ref removed — won't be sent)` : a.filename}
-                    >
-                      <Icon name="paperclip" size={12} />
-                      <span class="attach-name">{a.filename}</span>
-                      <Show when={orphan()}>
-                        <span
-                          class="attach-orphan-badge"
-                          title="Reference removed from message — won't be uploaded or sent. Re-insert to restore."
-                        >
-                          ref removed
-                        </span>
-                        <button
-                          type="button"
-                          aria-label={`Re-insert ${a.filename} into message`}
-                          title="Re-insert into message"
-                          onClick={() => att.reinsertInlineChip(a)}
-                        >
-                          <Icon name="retry" size={11} />
-                        </button>
-                      </Show>
-                      <button type="button" aria-label="Remove attachment" onClick={() => att.removeAttachment(a.url)}>
-                        <Icon name="x" size={11} />
-                      </button>
-                    </span>
-                  );
-                }}
-              </For>
-              <Show when={att.uploading()}>
-                <span class="attach-chip uploading">Uploading…</span>
-              </Show>
-            </div>
-          </Show>
-          <input
-            ref={fileInputRef}
-            type="file"
-            multiple
-            style={{ display: "none" }}
-            onChange={(e) => void att.addFiles(e.currentTarget.files)}
-          />
-          <div
-            class="composer-field"
-            classList={{ shell: input().startsWith("!"), command: input().startsWith("/") }}
-          >
-            <div ref={mirrorRef} class="composer-mirror" aria-hidden="true" innerHTML={highlightInput(input())} />
-            <textarea
-              ref={taRef}
-              class="composer-text"
-              value={input()}
-              onInput={(e) => (setInput(e.currentTarget.value), ac.syncCaret(), hist.resetHistory())}
-              onClick={ac.syncCaret}
-              onKeyUp={ac.syncCaret}
-              onBlur={() => setTimeout(() => ac.dismissAc(), 150)}
-              onScroll={(e) => mirrorRef && (mirrorRef.scrollTop = e.currentTarget.scrollTop)}
-              onKeyDown={onKeyDown}
-              onPaste={paste.onPaste}
-              placeholder={"Message…   (! = shell, /undo /redo)"}
-              rows={1}
-            />
-          </div>
-          <div class="composer-bar">
-            <Show when={agents().length > 0} fallback={<span class="bar-loading">Loading agents…</span>}>
-              <Select
-                class="bar-select agent-select"
-                ariaLabel="Agent"
-                value={agentForSession(props.sessionId)}
-                options={agents().map((a) => ({ value: a.name, label: `@${a.name}`, swatch: agentDisplay(a.name)?.color, sub: a.description }))}
-                onChange={(v) => selectAgentForSession(props.sessionId, v)}
-              />
-            </Show>
-            <Show when={models().length > 0}>
-              <button type="button" class="bar-btn model-btn" aria-label="Model" onClick={() => setModelDialog(true)}>
-                <span class="model-btn-name">{curModel()?.name || "Select model"}</span>
-                <span class="model-btn-caret"><Icon name="chevronDown" size={14} /></span>
-              </button>
-              <Show when={(curModel()?.variants?.length ?? 0) > 0}>
-                <Select
-                  class="bar-select variant-select"
-                  ariaLabel="Variant"
-                  value={curVariant()}
-                  options={[
-                    { value: "", label: "default" },
-                    ...curModel()!.variants.map((v) => ({ value: v, label: v })),
-                  ]}
-                  onChange={(v) => chooseVariant(props.sessionId, v || undefined)}
-                />
-              </Show>
-            </Show>
-            <span class="bar-spacer" />
-            <button
-              type="button"
-              class="bar-icon"
-              aria-label="Paste (hold to insert at cursor)"
-              data-tip="Paste — replaces all · hold to insert at cursor"
-              onClick={paste.onPasteButtonClick}
-              onPointerDown={paste.onPasteButtonDown}
-              onPointerUp={paste.onPasteButtonUp}
-              onPointerLeave={paste.onPasteButtonUp}
-              onPointerCancel={paste.onPasteButtonUp}
-              onBlur={paste.onPasteButtonBlur}
-            >
-              <Icon name="clipboard" />
-            </button>
-            <button
-              type="button"
-              class="bar-icon"
-              aria-label="Attach file"
-              data-tip="Attach file"
-              disabled={att.uploading()}
-              onClick={() => fileInputRef?.click()}
-            >
-              <Icon name="paperclip" />
-            </button>
-            <button
-              type="button"
-              class="bar-icon"
-              aria-label="Focus mode"
-              data-tip="Expand / focus"
-              onClick={() => setFocusMode((v) => !v)}
-            >
-              <Icon name="maximize" />
-            </button>
-            <Show
-              when={working()}
-              fallback={
-                <button
-                  type="button"
-                  class="send-btn"
-                  classList={{ sending: sendInFlight() }}
-                  aria-label={sendInFlight() ? "Sending…" : "Send"}
-                  onClick={send}
-                  disabled={sending() || sendInFlight() || !readyToSend()}
-                >
-                  <Icon name="send" />
-                </button>
-              }
-            >
-              {/* Busy: Stop aborts the running turn; a Queue button appears once
-                  you've typed something (Enter queues too). */}
-              <Show when={queueMode() && input().trim().length > 0}>
-                <button
-                  type="button"
-                  class="send-btn queue"
-                  classList={{ sending: sendInFlight() }}
-                  aria-label={sendInFlight() ? "Queueing…" : "Queue"}
-                  data-tip="Queue — sends when the current turn finishes"
-                  disabled={sendInFlight() || !readyToSend()}
-                  onClick={send}
-                >
-                  <Icon name="plus" />
-                </button>
-              </Show>
-              <button type="button" class="send-btn stop" aria-label="Stop" onClick={abort}>
-                <Icon name="stop" />
-              </button>
-            </Show>
-          </div>
-          <Show when={modelDialog()}>
-            <ModelDialog sessionId={props.sessionId} onClose={() => setModelDialog(false)} />
-          </Show>
-        </div>
-        </Show>
-      </div>
+      <Composer
+        draft={() => !!props.draft}
+        sessionId={() => props.sessionId}
+        isChild={isChild}
+        parentId={parentId}
+        onOpenParent={openParent}
+        input={input}
+        setInput={setInput}
+        focusMode={focusMode}
+        setFocusMode={setFocusMode}
+        working={working}
+        sending={sending}
+        sendInFlight={sendInFlight}
+        readyToSend={readyToSend}
+        curModel={curModel}
+        curVariant={curVariant}
+        modelDialog={modelDialog}
+        setModelDialog={setModelDialog}
+        ac={ac}
+        att={att}
+        paste={paste}
+        hist={hist}
+        recovery={recovery}
+        send={send}
+        abort={msgActions.abort}
+        refTa={(el) => (taRef = el)}
+        refMirror={(el) => (mirrorRef = el)}
+        refFileInput={(el) => (fileInputRef = el)}
+        onPickFile={() => fileInputRef?.click()}
+      />
     </div>
   );
 }
