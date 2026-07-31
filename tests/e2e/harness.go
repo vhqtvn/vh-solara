@@ -38,6 +38,7 @@ type Cluster struct {
 
 	fakeSrv   *httptest.Server
 	workerSrv *httptest.Server
+	webSrv    *web.Server
 	cancel    context.CancelFunc
 }
 
@@ -62,6 +63,7 @@ func StartCluster() (*Cluster, error) {
 	if err != nil {
 		return nil, err
 	}
+	c.webSrv = wsrv
 	c.workerSrv = httptest.NewServer(wsrv.Handler())
 	c.WorkerVHURL = c.workerSrv.URL
 	webPort, err := portOf(c.workerSrv.URL)
@@ -105,6 +107,21 @@ func StartCluster() (*Cluster, error) {
 func (c *Cluster) Close() {
 	if c.cancel != nil {
 		c.cancel()
+	}
+	// Shut down the worker web Server's background lifetime so its
+	// per-directory aggregators — each holding an always-on /event SSE
+	// subscription to fakeSrv — cancel and release those connections. Without
+	// this, a test that opened a non-default project leaves a fakeSrv /event
+	// handler blocked on r.Context().Done(), and fakeSrv.Close() below then
+	// hangs in httptest's per-connection wg.Wait() awaiting that handler. The
+	// default aggregator is stopped by c.cancel() above (it runs under the
+	// harness ctx); the per-directory ones run under the web Server's bgCtx, so
+	// Shutdown is what reaches them. Bounded so a wedged teardown surfaces
+	// instead of hanging the whole `go test` run.
+	if c.webSrv != nil {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = c.webSrv.Shutdown(shutdownCtx)
+		shutdownCancel()
 	}
 	if c.workerSrv != nil {
 		c.workerSrv.Close()

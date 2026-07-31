@@ -466,11 +466,19 @@ func (s *Server) aggFor(dir string) *aggregator.Aggregator {
 	s.ensurePermissionWatcher(dir, a)
 	s.installQueueGCCleanup(dir, a)
 	s.installPinsLifecycle(dir, a)
-	// Run under a context the aggregator itself can cancel via Stop(), so
-	// handleReloadProject can drop ONE project (a.Stop()) without disturbing the
-	// default or any other project. RunManaged derives the cancellable child and
-	// arms a.cancel internally.
-	go a.RunManaged(context.Background())
+	// Run under the Server's background-task lifetime (bgCtx) so Shutdown cancels
+	// this per-directory aggregator's RunManaged child. RunManaged derives a
+	// cancellable CHILD of bgCtx and arms a.cancel internally, so cancelling that
+	// child closes the aggregator's always-on /event SSE subscription — the
+	// connection a backing httptest/fake server's /event handler waits on, so the
+	// server can Close() without hanging. Per-project drop isolation is preserved:
+	// handleReloadProject can still drop ONE project via a.Stop() (cancels only
+	// that child) without disturbing the default or any other project. Scope note:
+	// this binds only the aggregator's Run goroutine to bgCtx; other per-dir
+	// lifecycle goroutines (permission watcher, store-channel subscribers) still
+	// outlive Shutdown as before — they hold no /event connection, so they do not
+	// block teardown, but are not yet retired on Shutdown (tracked separately).
+	go a.RunManaged(s.bgCtx)
 	return a
 }
 
