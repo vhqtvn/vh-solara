@@ -1161,11 +1161,12 @@ func TestQueueArchivedStoreConcurrentNoResurrection(t *testing.T) {
 // (attach.go: `[^A-Za-z0-9_.-]` → ""), which strips '/' among others, at every
 // entry point (queue_http.go:28, archive.go:94). The cases below cover the full
 // safeID-allowed character set; multi-segment slash-bearing IDs are intentionally
-// NOT tested here because they cannot reach queuePath in production. (Caveat:
-// vhSolaraDir's three-nested-filepath.Dir derivation is therefore correct by
-// construction ONLY because of that sanitization — if a future caller bypasses
-// safeID, the invariant would break for slash-bearing IDs. That is a latent
-// fragility worth a follow-up, not in scope for this hardening slice.)
+// NOT tested here because they cannot reach queuePath in production. (Historically
+// a latent fragility — vhSolaraDir's three-nested-filepath.Dir derivation is
+// correct by construction ONLY because of that sanitization. queuePath is now
+// self-defending against slash-bearing/.. IDs regardless of caller; the
+// adversarial coverage for that lives in TestQueuePath_MaliciousIDsNeutralized
+// below.)
 func TestQueuePath_vhSolaraDirInvariant(t *testing.T) {
 	root := t.TempDir()
 	// Representative IDs spanning the safeID-allowed character set
@@ -1183,6 +1184,56 @@ func TestQueuePath_vhSolaraDirInvariant(t *testing.T) {
 		want := filepath.Join(root, ".vh-solara")
 		if got != want {
 			t.Fatalf("vhSolaraDir(queuePath(%q,%q)) = %q, want %q", root, sid, got, want)
+		}
+	}
+}
+
+// TestQueuePath_MaliciousIDsNeutralized covers the defensive sanitization added
+// to queuePath: a slash-bearing or ".." sessionID must NOT escape the intended
+// sessions/ directory and must NOT break vhSolaraDir's 3x filepath.Dir
+// invariant. This closes the "latent fragility worth a follow-up" noted in
+// TestQueuePath_vhSolaraDirInvariant's doc comment above. The cases below
+// include shapes that cannot reach queuePath in production (HTTP entry points
+// pre-sanitize with safeID) but that a future caller bypassing safeID could
+// pass directly; queuePath is now self-defending against all of them.
+func TestQueuePath_MaliciousIDsNeutralized(t *testing.T) {
+	root := t.TempDir()
+	sessionsDir := filepath.Join(root, ".vh-solara", "sessions")
+	wantVhSolara := filepath.Join(root, ".vh-solara")
+	for _, sid := range []string{
+		"a/b",         // interior slash (would create a subdirectory)
+		"..",          // exact parent (survives safeID, which keeps dots)
+		"../..",       // multi-level escape attempt
+		"/etc/passwd", // absolute path injection
+		"/leading",    // leading slash (absolute-looking segment)
+		".",           // exact current dir (survives safeID, which keeps dots)
+		"",            // empty (filepath.Join would collapse the segment)
+		"///",         // sanitizes to empty
+		"@@@",         // sanitizes to empty (all-disallowed chars)
+	} {
+		got := queuePath(root, sid)
+		// (1) The resolved path must stay within the sessions directory: the
+		// queue.json's parent is the <sid> directory, whose own parent must be
+		// <root>/.vh-solara/sessions — i.e. the sid is a single direct child of
+		// sessions and no malicious segment escaped as an extra path level.
+		sidDir := filepath.Dir(got)
+		if gp := filepath.Dir(sidDir); gp != sessionsDir {
+			t.Fatalf("queuePath(%q): grandparent = %q, want sessions dir %q", sid, gp, sessionsDir)
+		}
+		// (2) The 3x filepath.Dir invariant (vhSolaraDir) must still resolve to
+		// <root>/.vh-solara — an escape would break save()'s gitignore
+		// targeting (EnsureRuntimeGitignore) if the invariant were lost.
+		if got2 := vhSolaraDir(got); got2 != wantVhSolara {
+			t.Fatalf("queuePath(%q): vhSolaraDir = %q, want %q", sid, got2, wantVhSolara)
+		}
+	}
+
+	// Valid IDs (the safeID-allowed set, minus exact "."/"..") must remain
+	// byte-unchanged: queuePath must not munge legitimate session IDs.
+	for _, sid := range []string{"s1", "with.dot", "with-dash", "MIXED_Case-1.2"} {
+		want := filepath.Join(root, ".vh-solara", "sessions", sid, "queue.json")
+		if got := queuePath(root, sid); got != want {
+			t.Fatalf("valid sid %q: queuePath = %q, want %q (byte-unchanged)", sid, got, want)
 		}
 	}
 }

@@ -821,8 +821,24 @@ func newQueueRegistry() *queueRegistry {
 
 // queuePath returns the on-disk path for a session's queue under the project's
 // .vh-solara runtime dir (peer to attachments/).
+//
+// The sessionID is sanitized defensively so a slash-bearing or ".." value
+// cannot escape the intended sessions/ directory and break vhSolaraDir's
+// 3x filepath.Dir arithmetic (queue.json→<sid>→sessions→.vh-solara). This
+// mirrors production safeID sanitization (attach.go), which is applied at the
+// HTTP entry points, but queuePath is also called from filesystem scans
+// (reconcileOrphanQueues) on directory names read off disk; making it
+// self-defending closes the latent fragility where any future caller bypassing
+// safeID would escape sessions/. Exact "." and ".." (the only traversal shapes
+// that survive safeID, since it keeps dots) and "" (any input that sanitizes
+// to empty, e.g. all-"/" or all-disallowed chars) collapse to "_" so the
+// segment remains a single, safe directory entry in every case.
 func queuePath(root, sessionID string) string {
-	return filepath.Join(root, ".vh-solara", "sessions", sessionID, "queue.json")
+	sid := safeID.ReplaceAllString(sessionID, "")
+	if sid == "" || sid == "." || sid == ".." {
+		sid = "_"
+	}
+	return filepath.Join(root, ".vh-solara", "sessions", sid, "queue.json")
 }
 
 // vhSolaraDir returns the .vh-solara directory that owns a queue path
@@ -1097,6 +1113,7 @@ func (qr *queueRegistry) reconcileOrphanQueues(root string, activeSessions map[s
 			// the race window from T1→T2 to T2.recheck→T2.delete, which is
 			// the GC-2 pattern (a different, accepted hazard — see the
 			// "GC-2 hazard — OPEN" block in the doc comment above).
+			vhlog.Debug("queue reconcile: skipped deletion, session active at T2 recheck (GC-3)", "sid", sid)
 			continue
 		}
 		qr.CleanupSession(root, sid)
