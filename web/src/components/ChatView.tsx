@@ -27,13 +27,7 @@ import {
 import { isSendInFlight } from "../lib/sendSingleFlight";
 import ModelDialog from "./ModelDialog";
 import PartView, { ActivityGroup } from "./Part";
-import { Deferred } from "./Deferred";
 import ChatTasksStatus from "./ChatTasksStatus";
-
-// Eager-mount the last N message rows (the tail you see on open + where new
-// messages and the live stream land), so scroll-to-bottom and streaming stay
-// correct; older rows mount lazily as they near the viewport (see Deferred).
-const EAGER_TAIL = 30;
 
 // scrollEl ResizeObserver "stuck on ↓ Latest" recovery admission window: the
 // largest PRE-resize (pinnedGeom) gap-from-bottom for which a pure clientHeight
@@ -58,15 +52,11 @@ import Spinner from "./Spinner";
 import { isDesktop } from "../layout";
 import BrandMark from "./BrandMark";
 import { pushNotification } from "../notify";
-import RelTime from "./RelTime";
 import Select from "./Select";
 import { agentDisplay } from "../projectSettings";
-import { fmtTurnStats, turnStats } from "../usage";
 import { msgTextOnly, msgTextWithThinking } from "../lib/msgText";
-import { classifyHold, shouldSkipAfterContextmenu } from "../lib/copyHold";
-import type { MessageView } from "../types";
-import { agentLabel, costLabel, messageError, modelLabel, roleLabel } from "./chat/messageMeta";
-import { MessageParts, groupParts } from "./chat/MessageParts";
+import { groupParts } from "./chat/MessageParts";
+import { MessageRow } from "./chat/MessageRow";
 import { createComposerAutocomplete } from "./chat/createComposerAutocomplete";
 import { createPromptHistory } from "./chat/createPromptHistory";
 import { createComposerPaste } from "./chat/createComposerPaste";
@@ -76,39 +66,6 @@ import { createQueueRecovery } from "./chat/createQueueRecovery";
 import { createSend } from "./chat/createSend";
 
 const draftKey = (sid: string) => "vh.draft." + sid;
-
-// The agent label in a message head — plain @name. The COLORED per-agent badge
-// (agentStyles) lives on the session-list rows, not here (deliberately keeping
-// the transcript quiet).
-function MsgAgent(props: { info: any }) {
-  const name = () => agentLabel(props.info);
-  return (
-    <Show when={name()}>
-      <span class="msg-agent" data-tip={`Agent: ${name()}`}>@{name()}</span>
-    </Show>
-  );
-}
-
-// Per-turn performance (tok/s · TTFT) for a SETTLED assistant turn, behind a
-// hover ⓘ icon so the footer stays clean. Memoized — turnStats only walks parts
-// for a completed assistant message (gated at the call site on role+completed),
-// so it never runs for in-flight turns and never touches the streaming hot loop.
-// The hover surface is a plain delegated `data-tip` tooltip (static text), so it
-// is cheap to render and free of the GPU-punishing patterns (no backdrop-filter,
-// mask-image, or contain) called out for the chat surface.
-function MsgPerf(props: { m: MessageView }) {
-  const tip = createMemo(() => {
-    const s = turnStats(props.m);
-    return s ? fmtTurnStats(s) : "";
-  });
-  return (
-    <Show when={tip()}>
-      <span class="msg-perf" data-tip={tip()} tabindex="0" aria-label="Turn performance">
-        <Icon name="info" size={12} />
-      </span>
-    </Show>
-  );
-}
 
 export default function ChatView(props: { sessionId: string; draft?: boolean }) {
   let scrollEl: HTMLDivElement | undefined;
@@ -1586,156 +1543,23 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
             </div>
           </Show>
           <For each={messages()}>
-            {(m, i) => {
-              // Per-message hold state for the Copy button: a long-press
-              // (>=HOLD_THRESHOLD_MS) copies thinking, a tap copies text-only,
-              // right-click copies thinking. State is per-row (captured in this
-              // For closure) so two messages' gestures can't race a shared
-              // timestamp; only one button is pressed at a time anyway.
-              // thinkingJustCopied dedupes the Android-Chrome touch
-              // double-fire (contextmenu then a synthesized click) — see
-              // shouldSkipAfterContextmenu in ../lib/copyHold.
-              //
-              // SolidJS no-rerender note (same as the paste button): SolidJS
-              // is NOT React — the <For> row callback runs ONCE per row at
-              // mount, so these `let`s persist for the whole ChatView lifetime
-              // (closure even survives session switches via the non-keyed
-              // <Show when={selectedId()}> at App.tsx:367). Without an explicit
-              // reset, a single pointer gesture (copyDownAt set to a real
-              // timestamp T) would leave the closure stale, and a LATER
-              // keyboard activation of the same focused Copy button would
-              // classify as "hold" → wrong branch (thinking-or-skip instead of
-              // text-only). We close this edge two ways: (1) onBlur resets
-              // copyDownAt (and thinkingJustCopied, defensively) to their
-              // initial values when focus leaves the button (focus leaving =
-              // gesture context ended; pointer→click→blur ordering means the
-              // click already ran with the correct timestamp, so blur-side
-              // reset does not break pointer-hold detection); and (2) the
-              // click handler resets copyDownAt to 0 AFTER classifyHold
-              // consumed it, closing the narrow residual "pointer-press then
-              // immediate Enter on the same focused button without focus
-              // moving away" hole. Note: when copyDownAt===0, classifyHold
-              // returns "tap", and shouldSkipAfterContextmenu is short-circuited
-              // because it requires cls==="hold" — so a lingering stale
-              // thinkingJustCopied=true cannot suppress a keyboard tap;
-              // resetting it anyway is harmless and keeps state clean.
-              let copyDownAt = 0;
-              let thinkingJustCopied = false;
-              return (
-              <div class="msg" data-mid={m.id} classList={{ user: m.info.role === "user", assistant: m.info.role === "assistant" }}>
-                <div class="msg-head">
-                  <span class="msg-role">{roleLabel(m.info.role)}</span>
-                  <MsgAgent info={m.info} />
-                  <Show when={modelLabel(m.info)}>
-                    <span class="msg-model" data-tip={modelLabel(m.info)}>{modelLabel(m.info)}</span>
-                  </Show>
-                  <RelTime class="msg-time" mode="ago" ms={m.info.time?.created} />
-                  <Show when={costLabel(m.info)}>
-                    <span class="msg-cost">{costLabel(m.info)}</span>
-                  </Show>
-                  <Show when={m.info.role === "assistant" && m.info.time?.completed}>
-                    <MsgPerf m={m} />
-                  </Show>
-                  <div class="msg-actions">
-                    <button
-                      type="button"
-                      class="msg-copy"
-                      data-tip="Copy · hold or right-click for thinking"
-                      aria-label="Copy message text; hold or right-click to include reasoning"
-                      onPointerDown={() => {
-                        // Fresh gesture: record the press time (mouse-hold and
-                        // touch-hold unified via Pointer Events, same reasoning
-                        // as the paste button) and clear the contextmenu-dedupe
-                        // flag for a new cycle.
-                        copyDownAt = Date.now();
-                        thinkingJustCopied = false;
-                      }}
-                      onClick={() => {
-                        const cls = classifyHold(copyDownAt, Date.now());
-                        // Reset AFTER classifyHold consumed the value — closes
-                        // the narrow residual "pointer-press then immediate
-                        // Enter on the same focused button without focus
-                        // moving away" hole (see the SolidJS no-rerender note
-                        // above). Safe because classifyHold already read the
-                        // value; the next pointerdown of a fresh gesture will
-                        // set it again.
-                        copyDownAt = 0;
-                        if (cls === "hold") {
-                          // Android-Chrome touch long-press synthesizes a click
-                          // AFTER the contextmenu that already copied thinking;
-                          // skip the duplicate. Mouse-hold and iOS (no touch
-                          // contextmenu) copy thinking here.
-                          if (shouldSkipAfterContextmenu(thinkingJustCopied, cls)) {
-                            thinkingJustCopied = false;
-                            return;
-                          }
-                          copyMessageWithThinking(m);
-                        } else {
-                          copyMessage(m);
-                        }
-                      }}
-                      onContextMenu={(e) => {
-                        e.preventDefault();
-                        // Flag that thinking was already copied so the
-                        // synthesized click in the same touch long-press
-                        // gesture is deduped (deterministic: contextmenu is
-                        // guaranteed to precede the click).
-                        thinkingJustCopied = true;
-                        copyMessageWithThinking(m);
-                      }}
-                      onBlur={() => {
-                        // Focus leaving the button = gesture context ended.
-                        // Return the per-row closure to its initial state so
-                        // the NEXT keyboard activation (Enter/Space on this
-                        // focused Copy button) classifies as "tap" (text-only)
-                        // instead of misclassifying from a stale pointer
-                        // timestamp. See the SolidJS no-rerender note above
-                        // the per-row classifier. Resetting copyDownAt alone
-                        // is sufficient for keyboard parity (a downAt===0
-                        // classifyHold result is "tap", which bypasses
-                        // shouldSkipAfterContextmenu entirely); we reset
-                        // thinkingJustCopied too for cleanliness/symmetry.
-                        copyDownAt = 0;
-                        thinkingJustCopied = false;
-                      }}
-                    >
-                      <Icon name="copy" size={14} />
-                    </button>
-                    <button type="button" data-tip="Inspect" aria-label="Inspect" onClick={() => toggleInspect(m.id)}>
-                      <Icon name="info" size={14} />
-                    </button>
-                    <button type="button" data-tip="Fork from here" aria-label="Fork" onClick={() => fork(m.id)}>
-                      <Icon name="fork" size={14} />
-                    </button>
-                    <Show when={m.info.role === "user"}>
-                      <button type="button" data-tip="Retry" aria-label="Retry" onClick={() => retry(m)}>
-                        <Icon name="retry" size={14} />
-                      </button>
-                    </Show>
-                  </div>
-                </div>
-                <Deferred
-                  class="msg-parts"
-                  eager={i() >= messages().length - EAGER_TAIL}
-                  root={() => scrollEl}
-                  minHeight={48}
-                >
-                  <MessageParts
-                    m={m}
-                    isLastMessage={() => i() === messages().length - 1}
-                    lastActivityKey={lastActivityKey}
-                    failed={messageFailed}
-                  />
-                </Deferred>
-                <Show when={messageError(m.info)}>
-                  <div class="msg-error">⚠ {messageError(m.info)}</div>
-                </Show>
-                <Show when={inspectId() === m.id}>
-                  <pre class="msg-inspect">{inspectText(m)}</pre>
-                </Show>
-              </div>
-              );
-            }}
+            {(m, i) => (
+              <MessageRow
+                message={m}
+                index={i}
+                messageCount={() => messages().length}
+                scrollRoot={() => scrollEl}
+                lastActivityKey={lastActivityKey}
+                messageFailed={messageFailed}
+                inspected={() => inspectId() === m.id}
+                onToggleInspect={() => toggleInspect(m.id)}
+                onCopyText={() => copyMessage(m)}
+                onCopyWithThinking={() => copyMessageWithThinking(m)}
+                onFork={() => fork(m.id)}
+                onRetry={() => retry(m)}
+                inspectText={() => inspectText(m)}
+              />
+            )}
           </For>
           {/* Transcript-level states: a loading hint while the first snapshot
               is in flight (slot reserved but not yet delivered), an empty hint
