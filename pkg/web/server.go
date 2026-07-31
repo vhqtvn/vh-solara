@@ -140,8 +140,9 @@ type Server struct {
 	// watcherCancel holds the per-dir cancel func for the sweep goroutine, so a
 	// non-default dir's sweep can be stopped cleanly when Reload drops its
 	// aggregator (stopPermissionWatcher). The default dir's sweep ("") has no
-	// stopper: it is process-lifetime and is never reloaded. Both maps are
-	// guarded by watcherMu.
+	// Reload stopper, but Shutdown's stopAllPermissionWatchers cancels EVERY
+	// watcher — including the default dir's — and awaits all of them on
+	// lifecycleWG. Both maps are guarded by watcherMu.
 	watcherMu     sync.Mutex
 	watcherOn     map[string]bool
 	watcherCancel map[string]context.CancelFunc
@@ -228,6 +229,30 @@ type Server struct {
 	// one-shot close of reassertReadyCh.
 	reassertReadyCh chan struct{}
 	reassertBlockCh chan struct{}
+
+	// lifecycleWG tracks the Server-owned per-directory lifecycle goroutines so
+	// Shutdown can AWAIT (not merely cancel) them: every permission watcher (all
+	// dirs, incl. the default — the Server arms them) and every NON-DEFAULT
+	// queue/pin store subscriber. The default dir's subscribers are daemon-owned
+	// (process-lifetime: the default aggregator is started with plain Run(vhCtx),
+	// not RunManaged, and is NOT stopped by Shutdown), so they are deliberately
+	// NOT tracked here — awaiting them would hang until process exit. Shutdown
+	// cancels all watchers (stopAllPermissionWatchers) and stops every non-default
+	// aggregator (stopServerOwnedAggregators, whose Aggregator.Stop() closes the
+	// store → closes every subscriber channel, retiring the subscriber loops),
+	// then waits on bgWG followed by lifecycleWG. Add(1) happens BEFORE goroutine
+	// launch at each install site; Done() is deferred inside the goroutine.
+	lifecycleWG sync.WaitGroup
+
+	// Test-only seams for the per-dir watcher Shutdown-ownership test (nil in
+	// production). reconcileReadyCh, if set, is signalled (non-blocking) once
+	// runPermissionReconcile completes its immediate sweep and reaches its block
+	// point. reconcileBlockCh, if set, makes the reconcile goroutine block on a
+	// pure (ctx-independent) receive from it — so a test can hold the watcher in
+	// a spot watcher cancellation CANNOT reach, proving the only way Shutdown
+	// returns is by awaiting lifecycleWG.
+	reconcileReadyCh chan struct{}
+	reconcileBlockCh chan struct{}
 }
 
 // RegisterFeature adds a capability module to be mounted by Handler(). Call
@@ -400,22 +425,106 @@ func (s *Server) SetReassertDelay(d time.Duration) {
 	s.bgMu.Unlock()
 }
 
-// Shutdown cancels the Server's background-task lifetime (bgCtx) and awaits
-// outstanding background work (bgWG), bounded by ctx. It is idempotent: bgCancel
-// is safe to call repeatedly. The daemon's restart and KillFunc paths call this
-// so a re-assert goroutine in flight is cancelled (its ListSessions ctx is a
-// child of bgCtx) and awaited before the process exits — no detached goroutine
-// outlives the Server. Returns ctx.Err() if the await is bounded by ctx.
+// Shutdown retires the Server's owned lifetimes and awaits them, bounded by ctx.
+// It is idempotent and safe to call repeatedly (every cancellation it issues is
+// idempotent; the WaitGroups are only ever waited, never re-Add'd after exit).
+// It establishes an EXPLICIT per-directory ownership boundary — not a blanket
+// context swap — by issuing each retirement signal AND awaiting the goroutines:
+//
+//  1. bgCancel() — cancels the background-task ctx (the post-archive re-assert
+//     goroutine, and every non-default aggregator's RunManaged Run loop).
+//  2. stopAllPermissionWatchers() — cancels + clears EVERY per-dir permission
+//     watcher, including the default dir's. Watchers root their own ctx in
+//     context.Background() (NOT bgCtx), so bgCancel alone cannot retire them;
+//     cancelling the watcher ctx also aborts an in-flight auto-reject RPC (that
+//     RPC's timeout is now derived from the watcher ctx — see reconcileFailFastPerms).
+//  3. stopServerOwnedAggregators() — stops every NON-DEFAULT aggregator the
+//     Server created lazily via aggFor. Aggregator.Stop() closes its store,
+//     which closes every subscriber channel, retiring the queue/pin subscriber
+//     range loops those aggregators own. The DEFAULT aggregator is daemon-owned
+//     (started with plain Run(vhCtx), process-lifetime) and is deliberately NOT
+//     stopped here — closing its store would sever daemon-owned SSE streams and
+//     break callers that keep using the default aggregator across a Shutdown.
+//
+// After all retirement signals are issued, Shutdown awaits bgWG then lifecycleWG
+// (the watchers + non-default subscribers), returning nil once both drain or
+// ctx.Err() if the await is bounded by ctx. This proves server-owned per-dir
+// watchers and subscriber-backed workers cannot remain live after Shutdown.
+//
+// Terminal-Shutdown contract: this is a terminal, single-caller teardown. In
+// production both callers (cmd/client-daemon-vh, cmd/local-server) drain the HTTP
+// server (vhHTTP.Shutdown) BEFORE srv.Shutdown, so no concurrent aggFor can
+// install fresh lifecycle work during teardown; tests call Shutdown in cleanup.
+// There is intentionally no admission barrier: the default aggFor path is
+// lock-free for per-request performance, and the only race that could install
+// post-signal work cannot occur at the actual call sites.
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.bgCancel() // idempotent; never reassigned after NewServer
+	s.stopAllPermissionWatchers()
+	s.stopServerOwnedAggregators()
 	waitDone := make(chan struct{})
-	go func() { s.bgWG.Wait(); close(waitDone) }()
+	go func() {
+		s.bgWG.Wait()
+		s.lifecycleWG.Wait()
+		close(waitDone)
+	}()
 	select {
 	case <-waitDone:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// stopAllPermissionWatchers cancels and clears every per-dir permission
+// reconcile watcher the Server armed (including the default dir's). Idempotent:
+// a second call is a no-op over already-cleared entries. watcherMu is taken
+// standalone (NOT nested under aggMu here) — Shutdown issues it as a separate
+// phase before stopServerOwnedAggregators and never holds both at once, so it
+// does not invert the established aggMu-outer nesting order. Cancelling the
+// watcher ctx propagates to the in-flight auto-reject RPC inside
+// reconcileFailFastPerms (its timeout derives from this ctx), letting a watcher
+// blocked on a slow reject exit promptly instead of waiting out permRejectTimeout.
+func (s *Server) stopAllPermissionWatchers() {
+	s.watcherMu.Lock()
+	for dir, cancel := range s.watcherCancel {
+		cancel()
+		delete(s.watcherCancel, dir)
+		delete(s.watcherOn, dir)
+	}
+	s.watcherMu.Unlock()
+}
+
+// stopServerOwnedAggregators stops every NON-DEFAULT aggregator the Server
+// created lazily via aggFor, mirroring handleReloadProject's per-dir teardown
+// (stop + delete + reset queueGCOn/pinsGCOn) applied to all server-owned
+// non-default dirs at once. The read+stop+delete for each entry happens inside
+// ONE aggMu critical section — no pre-snapshot — so it stays safe against a
+// concurrent handleReloadProject identity recheck (shutdown-first → reload's
+// cur==a recheck sees the entry gone and skips; reload-first → shutdown stops
+// the replacement). Aggregator.Stop() closes the store (idempotent), closing
+// every subscriber channel and retiring the queue/pin subscriber loops. The
+// DEFAULT dir ("") is skipped: that aggregator is daemon-owned and
+// process-lifetime (its Run loop is owned by vhCancel, not RunManaged), so
+// stopping/closing it here would invalidate a resource owned by another
+// lifecycle boundary. Nested lock order matches reload: aggMu outer,
+// queueGCMu/pinsGCMu inner.
+func (s *Server) stopServerOwnedAggregators() {
+	s.aggMu.Lock()
+	for dir, a := range s.aggs {
+		if dir == "" {
+			continue
+		}
+		a.Stop()
+		delete(s.aggs, dir)
+		s.queueGCMu.Lock()
+		delete(s.queueGCOn, dir)
+		s.queueGCMu.Unlock()
+		s.pinsGCMu.Lock()
+		delete(s.pinsGCOn, dir)
+		s.pinsGCMu.Unlock()
+	}
+	s.aggMu.Unlock()
 }
 
 // aggFor returns the aggregator for a project directory, creating and starting
@@ -474,10 +583,11 @@ func (s *Server) aggFor(dir string) *aggregator.Aggregator {
 	// server can Close() without hanging. Per-project drop isolation is preserved:
 	// handleReloadProject can still drop ONE project via a.Stop() (cancels only
 	// that child) without disturbing the default or any other project. Scope note:
-	// this binds only the aggregator's Run goroutine to bgCtx; other per-dir
-	// lifecycle goroutines (permission watcher, store-channel subscribers) still
-	// outlive Shutdown as before — they hold no /event connection, so they do not
-	// block teardown, but are not yet retired on Shutdown (tracked separately).
+	// Shutdown now retires these per-dir lifetimes EXPLICITLY — it cancels every
+	// permission watcher (stopAllPermissionWatchers) and stops this non-default
+	// aggregator (stopServerOwnedAggregators → a.Stop() → store.Close(), retiring
+	// the queue/pin subscriber range loops) and awaits all of them via lifecycleWG.
+	// The default aggregator ("") is daemon-owned and is NOT stopped by Shutdown.
 	go a.RunManaged(s.bgCtx)
 	return a
 }
@@ -560,7 +670,15 @@ func (s *Server) ensurePermissionWatcher(dir string, a *aggregator.Aggregator) {
 	s.watcherCancel[dir] = cancel
 	s.watcherMu.Unlock()
 
-	go s.runPermissionReconcile(ctx, a)
+	// Track on lifecycleWG so Shutdown can AWAIT (not just signal) the watcher.
+	// Add BEFORE launch; Done is deferred inside. ALL watchers are tracked,
+	// including the default dir's — Shutdown cancels every watcher, so every
+	// armed watcher must contribute to the await.
+	s.lifecycleWG.Add(1)
+	go func() {
+		defer s.lifecycleWG.Done()
+		s.runPermissionReconcile(ctx, a)
+	}()
 }
 
 // queueGCSubscribeBuffer is the per-subscriber channel buffer for the queue-GC
@@ -672,7 +790,19 @@ func (s *Server) installQueueGCCleanup(dir string, a *aggregator.Aggregator) {
 	// means "deliver message-class events only for sessions in the set", and an
 	// empty set drops them all (see state.Interest.wants).
 	ch, _ := store.SubscribeWith(queueGCSubscribeBuffer, state.Interest{MessageSessions: map[string]bool{}})
+	// Track on lifecycleWG for NON-DEFAULT dirs only: the default dir's
+	// subscriber is daemon-owned (process-lifetime — the default aggregator is
+	// NOT stopped by Shutdown), so awaiting it would hang until process exit.
+	// Non-default subscribers exit when Shutdown stops their aggregator
+	// (Aggregator.Stop() → store.Close() closes this channel), so Shutdown can
+	// await them. Add BEFORE launch; Done is deferred inside the goroutine.
+	if dir != "" {
+		s.lifecycleWG.Add(1)
+	}
 	go func() {
+		if dir != "" {
+			defer s.lifecycleWG.Done()
+		}
 		for ev := range ch {
 			if ev.Kind != state.KindSessionDelete {
 				continue
@@ -792,13 +922,29 @@ func (s *Server) runPermissionReconcile(ctx context.Context, a *aggregator.Aggre
 	client := a.Client()
 	// One sweep immediately on arming, so a permission already pending at
 	// registration is rejected with ~0 latency instead of waiting a full tick.
-	s.reconcileFailFastPerms(store, client)
+	// ctx is threaded into reconcileFailFastPerms so a watcher cancellation
+	// (Shutdown / Reload) aborts an in-flight auto-reject RPC instead of waiting
+	// out permRejectTimeout.
+	s.reconcileFailFastPerms(ctx, store, client)
+	// Test seam (nil in production): signal that the watcher reached its
+	// post-sweep point, then optionally hold on a pure (ctx-independent)
+	// receive — the ONE spot watcher cancellation cannot reach — so a test can
+	// prove the only way Shutdown returns is by awaiting lifecycleWG.
+	if s.reconcileReadyCh != nil {
+		select {
+		case s.reconcileReadyCh <- struct{}{}:
+		default:
+		}
+	}
+	if s.reconcileBlockCh != nil {
+		<-s.reconcileBlockCh
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			s.reconcileFailFastPerms(store, client)
+			s.reconcileFailFastPerms(ctx, store, client)
 		}
 	}
 }
@@ -836,7 +982,13 @@ func (s *Server) stopPermissionWatcher(dir string) {
 // before the next read, so a cleared perm is not re-rejected beyond the one
 // in-flight race window). The client is the per-dir aggregator's Client() (same
 // dir→client resolution the aggregator uses for every other write verb).
-func (s *Server) reconcileFailFastPerms(store *state.Store, client *opencode.Client) {
+//
+// ctx threads the watcher's lifetime into the per-RPC timeout: the reject RPC
+// uses context.WithTimeout(ctx, permRejectTimeout) so a watcher cancellation
+// (Shutdown via stopAllPermissionWatchers, or Reload via stopPermissionWatcher)
+// aborts an in-flight reject instead of running out the full permRejectTimeout.
+// Callers that are not bound to a watcher lifetime pass context.Background().
+func (s *Server) reconcileFailFastPerms(ctx context.Context, store *state.Store, client *opencode.Client) {
 	perms := store.PendingPermissions()
 	for sessionID, plist := range perms {
 		if !s.isFailFast(sessionID) {
@@ -848,9 +1000,10 @@ func (s *Server) reconcileFailFastPerms(store *state.Store, client *opencode.Cli
 				continue
 			}
 			// NEVER "always": no persistent grant, so a prompt can't widen what
-			// the unattended worker is allowed to do.
-			ctx, cancel := context.WithTimeout(context.Background(), permRejectTimeout)
-			err := client.ReplyPermission(ctx, env.ID, sessionID, "reject")
+			// the unattended worker is allowed to do. rpcCtx derives from the
+			// watcher ctx so cancellation aborts the RPC promptly.
+			rpcCtx, cancel := context.WithTimeout(ctx, permRejectTimeout)
+			err := client.ReplyPermission(rpcCtx, env.ID, sessionID, "reject")
 			cancel()
 			if err != nil {
 				// Swallow: a stale/already-cleared permission errors here, the

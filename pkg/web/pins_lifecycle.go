@@ -236,7 +236,17 @@ func (s *Server) installPinsLifecycle(dir string, a *aggregator.Aggregator) {
 	// them all (see state.Interest.wants). Identical to installQueueGCCleanup's
 	// filter.
 	ch, _ := store.SubscribeWith(pinsGCSubscribeBuffer, state.Interest{MessageSessions: map[string]bool{}})
+	// Track on lifecycleWG for NON-DEFAULT dirs only (mirrors
+	// installQueueGCCleanup): the default dir's subscriber is daemon-owned
+	// (process-lifetime), so awaiting it would hang; non-default subscribers
+	// exit when Shutdown stops their aggregator. Add BEFORE launch.
+	if dir != "" {
+		s.lifecycleWG.Add(1)
+	}
 	go func() {
+		if dir != "" {
+			defer s.lifecycleWG.Done()
+		}
 		for ev := range ch {
 			if ev.Kind != state.KindSessionDelete {
 				continue

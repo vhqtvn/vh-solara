@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"net/http"
 	"strings"
 	"testing"
@@ -283,7 +284,7 @@ func TestSweepRejectsFailFastAfterOverflow(t *testing.T) {
 	// The live-tail path is now dead (channel closed). The reconcile backstop
 	// must STILL reject the pending permission — it reads the Snapshot, not the
 	// channel, so event-tail loss cannot defeat it.
-	srv.reconcileFailFastPerms(store, client)
+	srv.reconcileFailFastPerms(context.Background(), store, client)
 
 	replies := f.permReplies()
 	sawReject := false
@@ -325,7 +326,7 @@ func TestSweepRejectsMultipleFailFastSessions(t *testing.T) {
 	}
 
 	// A single reconcile sweep must reject all three pending permissions.
-	srv.reconcileFailFastPerms(store, client)
+	srv.reconcileFailFastPerms(context.Background(), store, client)
 
 	replies := f.permReplies()
 	// Each pending permission yields exactly one reject reply (distinct ids, one
@@ -365,7 +366,7 @@ func TestReconcileIsIdempotentOnClearedPermission(t *testing.T) {
 	store.Apply(ev("permission.asked", `{"id":"p1","sessionID":"new_sess","permission":"bash"}`))
 
 	// First sweep: rejects cleanly, records the fact.
-	srv.reconcileFailFastPerms(store, client)
+	srv.reconcileFailFastPerms(context.Background(), store, client)
 	if !store.Snapshot(nil).Gate["new_sess"].PermissionBlocked {
 		t.Fatal("permission_blocked must be set after the first reconcile")
 	}
@@ -378,7 +379,7 @@ func TestReconcileIsIdempotentOnClearedPermission(t *testing.T) {
 	// RPC, no panic, permission_blocked stays sticky. The fact that this returns
 	// without aborting is the idempotency assertion.
 	before := len(f.permReplies())
-	srv.reconcileFailFastPerms(store, client)
+	srv.reconcileFailFastPerms(context.Background(), store, client)
 	if got := len(f.permReplies()); got != before {
 		t.Fatalf("second reconcile after clear must issue no new reject RPC, want %d got %d", before, got)
 	}
