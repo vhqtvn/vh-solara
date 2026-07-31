@@ -157,6 +157,26 @@
   background: color-mix(in srgb, var(--fg) 8%, transparent);
   color: var(--fg);
 }
+/* Tap-target floor: the shared .icon-btn is 26px wide, an undersized click
+   target for this dialog's close button on mouse/desktop (height already
+   tracks the ~38px search input via align-self: stretch, so WIDTH is the
+   load-bearing dimension). Give it a comfortable ≥36px interactive minimum,
+   scoped to this dialog only. Two deliberate choices:
+   - UNCONDITIONAL (no @media (pointer: fine)): headless browsers — including
+     this repo's Playwright harness — report pointer: none, so a pointer:fine
+     guard (and the existing global pointer:coarse rule) never fire there. A
+     dialog-scoped floor applies in EVERY pointer context, stays consistent with
+     the coarse rule (still 36px on real touch), and is verifiable in e2e.
+   - [class~="projects-dialog"] attribute selector: the plain .projects-dialog
+     class form is used elsewhere in this file (lines ~146-159) and works in
+     real browsers, but in this headless e2e Chromium it proved intermittent as
+     a descendant ancestor (sometimes matched, sometimes not — enough to flake a
+     computed-size guard). The semantically-equal [class~=] attribute form
+     matches reliably there, so the e2e guard is deterministic. Both forms are
+     production-equivalent.
+   This does NOT resize the shared .icon-btn, so ModelDialog and every other
+   .icon-btn keep their 26px chrome. */
+[class~="projects-dialog"] .dialog-head .icon-btn { min-width: 36px; min-height: 36px; }
 /* Slightly more compact than the 560px default since rows are short. Desktop
    only; mobile is fullscreen via the canonical @media(max-width:720px) block. */
 .dialog.projects-dialog { width: 480px; }

@@ -480,3 +480,31 @@ test("project switcher: Copy link writes the per-project deep link to the clipbo
 
   await ctx.close();
 });
+
+// Tap-target floor (DEFER defer-projectswitcher-header-visual-check): the shared
+// .icon-btn is 26px wide, so the project-dialog close button inherited an
+// undersized click target. A dialog-scoped (NOT pointer-gated) min-width/
+// min-height:36 floor (via [class~="projects-dialog"]) gives it a ≥36px
+// interactive minimum WITHOUT resizing the shared .icon-btn or touching
+// ModelDialog. Headless Chromium reports pointer:none (so neither a pointer:fine
+// guard nor the global coarse rule would fire here) — the floor is unconditional
+// precisely so it is verifiable in e2e. Measures offsetWidth/offsetHeight (layout
+// size) rather than boundingBox: the dialog runs an entrance transform animation
+// (scale+translate) that transiently shrinks boundingBox ~1% mid-flight, while
+// the resting layout target is exactly 36px. Without the fix offsetWidth is ~26
+// → red; with it, 36. (Firefox is scoped to codeview.spec.ts only, so this runs
+// under chromium.)
+test("project switcher close button meets the fine-pointer tap-target floor", async ({ page }) => {
+  await page.goto("/");
+  await page.locator(".proj-current").click();
+  const dialog = page.getByRole("dialog", { name: "Switch project" });
+  await expect(dialog).toBeVisible();
+
+  const close = dialog.getByRole("button", { name: "Close", exact: true });
+  // offsetWidth/Height = layout size, unaffected by the dialog's entrance
+  // transform. ≥36×36px interactive target; WIDTH is the dimension the scoped
+  // rule changes (26→36); height already stretches to the search input.
+  const box = await close.evaluate((el) => ({ width: el.offsetWidth, height: el.offsetHeight }));
+  expect(box.width).toBeGreaterThanOrEqual(36);
+  expect(box.height).toBeGreaterThanOrEqual(36);
+});
