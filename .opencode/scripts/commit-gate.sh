@@ -1070,6 +1070,28 @@ cmd_commit() {
         return 1
       fi
 
+      # S2: approved-tree integrity under concurrency. The CAS 3-way merge
+      # produced a tree that DIFFERS from the reviewed tree the committer
+      # asked to land. Committing it would substitute a tree the reviewer
+      # never saw (the concurrent winner's content fused into the approved
+      # scope by the merge). Fail closed: REFUSE the commit, record it
+      # durably as a terminal sibling of could_not_land, and require
+      # re-acquire + re-review. The deferred RE-VIEW/auto-retry path will
+      # key off these rebased_refused closeouts. post_commit_head is
+      # current_head (the branch did not move on this session's behalf —
+      # no commit landed).
+      if [[ "$new_tree" != "$original_tree" ]]; then
+        _closeout_append "$lock_uuid" \
+          "$(_field_str "$lock_content" "acquired_at")" \
+          "$(_field_str "$lock_content" "head_at_acquire")" \
+          "$current_head" "rebased_refused" "$branch"
+        json_out "{\"status\":\"rebased_refused\",\"reason\":\"reviewed_tree_diverged\",\"reviewed_tree\":\"${original_tree}\",\"merged_tree\":\"${new_tree}\",\"original_head\":\"${head_at_acquire}\",\"current_head\":\"${current_head}\"}"
+        return 1
+      fi
+
+      # The merge reproduced the reviewed tree exactly (new_tree ==
+      # original_tree): safe to land. Take the reconciled tree and advance
+      # the anchor so commit-tree parents onto current_head.
       tree_hash="$new_tree"
       head_at_acquire="$current_head"
     fi
@@ -1116,11 +1138,12 @@ cmd_commit() {
         _gate_gc_sweep || true
         # Resync shared index to new HEAD
         git read-tree HEAD 2>/dev/null || true
-        local rebased_flag=""
-        if [[ "$tree_hash" != "$original_tree" ]]; then
-          rebased_flag=",\"rebased\":true,\"original_tree\":\"${original_tree}\""
-        fi
-        json_out "{\"status\":\"${closeout_status}\",\"commit_hash\":\"${commit_hash}\",\"tree_hash\":\"${tree_hash}\",\"branch\":\"${branch}\",\"cas_attempts\":${cas_attempt}${rebased_flag}}"
+        # S2: under refuse-on-rebase the only success paths reproduce the
+        # reviewed tree exactly (tree_hash == original_tree) — either no HEAD
+        # movement (current_head == expected_head) or a CAS merge that
+        # reproduced the reviewed tree. Any divergence was refused above, so
+        # no rebased flag is emitted on success.
+        json_out "{\"status\":\"${closeout_status}\",\"commit_hash\":\"${commit_hash}\",\"tree_hash\":\"${tree_hash}\",\"branch\":\"${branch}\",\"cas_attempts\":${cas_attempt}}"
         return 0
       else
         # CAS failed — HEAD moved under us

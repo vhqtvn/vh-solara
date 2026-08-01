@@ -1,7 +1,7 @@
 // check-defer-triggers.js — predicate evaluator for DEFER / p2 / follow-up
 // candidates held in .local/coordinator/tasks/.
 //
-// TWO MODES, ONE EVALUATOR. The predicate primitives (repoRoot, resolveSince,
+// THREE MODES, ONE EVALUATOR. The predicate primitives (repoRoot, resolveSince,
 // changedPathsSince, isSafeRef, tagExists, parsePredicate, evaluatePredicate,
 // extractTriggers) are shared. Mode selects the surface contract:
 //
@@ -54,6 +54,21 @@
 //           record disposition is override_required and the operator supplies
 //           --override-release-version + --override-manifest-sha to the
 //           wrapper, which forwards --override-confirmed-version here).
+//
+//   RELEASE-PREP MODE (--mode=release-prep)
+//     - The F4-C release-diff-recurrence MECHANICAL ENUMERATOR for release
+//       preparation (Scope B). Phase-0 established the manifest is hand-
+//       populated (no mechanical writer), so the releaser needs a tool that
+//       discovers which OPEN defer cards whose path_touched target re-fires in
+//       the release arc lack a disposition and emits draft stub manifest records
+//       to convert. This is that tool.
+//     - DISTINCT from --mode=release: release-prep READS
+//       .local/coordinator/tasks/ (silencer-immune — ALL files, no prefix or
+//       extension filter) to discover what still needs disposing. It NEVER
+//       writes the manifest (federated authority: the releaser authors M); it
+//       emits draft stub records as stdout JSON.
+//     - Exit codes: 0 = prep clean (no missing dispositions); 1 = missing
+//       dispositions found (must dispose before release); 2 = evaluator error.
 //
 // This is a deliberately tiny predicate engine, not a full rules system:
 //   path_touched(<path>)   true if <path> appears in `git diff --name-only`
@@ -174,7 +189,7 @@ function parseArgs(argv) {
             if (v !== null) options.overrideConfirmedVersion = v;
         } else if (a === "--help" || a === "-h") {
             process.stdout.write(
-                "usage: check-defer-triggers.js [--mode promoter|release] [--since <ref>] [--tasks <dir>]\n" +
+                "usage: check-defer-triggers.js [--mode promoter|release|release-prep] [--since <ref>] [--tasks <dir>]\n" +
                 "                                  [--release-version <vX.Y.Z>]\n" +
                 "                                  [--override-confirmed-version <vX.Y.Z>]\n" +
                 "  Predicate evaluator for DEFER/p2/follow-up candidates.\n" +
@@ -186,6 +201,11 @@ function parseArgs(argv) {
                 "    --override-confirmed-version is the operator-side wrapper confirmation\n" +
                 "    signal: an override_required record is honored only when\n" +
                 "    override.release_version == --release-version == --override-confirmed-version.\n" +
+                "  --mode=release-prep: F4-C mechanical enumerator. Reads\n" +
+                "    .local/coordinator/tasks/ (silencer-immune) to find OPEN defer cards\n" +
+                "    whose path_touched target re-fires in the release diff without a\n" +
+                "    disposition; emits draft stub manifest records. Exit 1 = missing\n" +
+                "    dispositions; exit 2 = evaluator error.\n" +
                 "  Two failure classes: missing/malformed/stale manifest → evaluator-error\n" +
                 "    (repair the committed manifest; override cannot cure it);\n" +
                 "    release-relevant finding requires disposition → blocker (resolve OR\n" +
@@ -265,23 +285,63 @@ function tagExists(tag) {
 }
 
 // Parse a single predicate string into {kind, arg}. Returns null for
-// unrecognized shapes (caller reports unknown-predicate). PROMOTER-mode
-// parser: lenient greedy match so `path_touched(a)||path_touched(b)` reports
-// unknown-predicate rather than throwing. Release mode no longer parses
-// task-card trigger grammar — it reads committed manifest dispositions only.
-// The promoter remains on this lenient parser.
+// unrecognized shapes (caller reports unknown-predicate). Returns
+// {kind:"malformed"} for a shape that LOOKS like a known predicate but whose
+// greedy-captured arg still carries predicate-structural characters — a
+// literal `||` (a malformed OR attempt; the real OR grammar is `any(...)` via
+// extractTriggers) or an unbalanced `(`/`)` (a path/ref operand never contains
+// parens) — so the caller surfaces it as malformed-predicate, NOT a clean
+// not-touched. Without this guard the greedy `(.+)` in the regex would swallow
+// `a)||path_touched(b` for `path_touched(a)||path_touched(b)`, classify it as a
+// valid path_touched with a garbage arg, and the card would silently park as
+// "valid-not-met" (note: not-touched-since-ref) — indistinguishable from a
+// genuine future-watch. The card is malformed and can never fire, so it must be
+// visibly flagged, not parked. PROMOTER-mode parser only; release mode reads
+// committed manifest dispositions and never parses task-card trigger grammar.
 function parsePredicate(trigger) {
     const t = (trigger || "").trim();
     let m = t.match(/^path_touched\((.+)\)$/);
-    if (m) return { kind: "path_touched", arg: m[1].trim() };
+    if (m) {
+        const arg = m[1].trim();
+        if (isMalformedArg(arg)) return { kind: "malformed" };
+        return { kind: "path_touched", arg };
+    }
     m = t.match(/^after_tag\((.+)\)$/);
-    if (m) return { kind: "after_tag", arg: m[1].trim() };
+    if (m) {
+        const arg = m[1].trim();
+        if (isMalformedArg(arg)) return { kind: "malformed" };
+        return { kind: "after_tag", arg };
+    }
     return null;
 }
 
+// True if a greedy-captured predicate arg still carries predicate-structural
+// characters, i.e. it is not a clean operand: a literal `||` (malformed OR
+// join — the real OR is `any(...)`), or an unbalanced `(`/`)` (a path/ref/tag
+// operand never contains parens). Legitimate operands never contain `|`, `(`,
+// or `)`, so this never rejects a well-formed trigger.
+function isMalformedArg(arg) {
+    if (arg.includes("||")) return true;
+    let depth = 0;
+    for (const ch of arg) {
+        if (ch === "(") depth++;
+        else if (ch === ")") {
+            depth--;
+            if (depth < 0) return true;
+        }
+    }
+    return depth !== 0;
+}
+
 // Evaluate one parsed predicate against the current repo state. Returns
-// { met: bool, note: string }. Generic predicate evaluator; currently called only by the promoter path (via evaluateCandidate).
+// { met: bool, note: string }. Generic predicate evaluator; currently called
+// only by the promoter path (via evaluateCandidate). A {kind:"malformed"}
+// predicate (from parsePredicate) reports malformed-predicate so the card is
+// visibly not a clean not-touched, never silently parked as valid-not-met.
 function evaluatePredicate(pred, changedPaths) {
+    if (pred.kind === "malformed") {
+        return { met: false, note: "malformed-predicate" };
+    }
     if (pred.kind === "path_touched") {
         if (!changedPaths) {
             return { met: false, note: "no-git-diff-data" };
@@ -647,6 +707,39 @@ function validateReleaseManifest(obj) {
         if (r.override !== null && r.override !== undefined) {
             const ov = validateOverrideObject(r.override, i);
             if (!ov.ok) return ov;
+        }
+        // Slice 5 recurrence ack-pair forward-compat. The manifest gains
+        // OPTIONAL recurrence acknowledgement fields (recurrence_count +
+        // last_acknowledged_count) on a record. The pair is a CONTRACT: when
+        // EITHER field is present, BOTH must be present, both must be
+        // non-negative integers, and recurrence_count >= last_acknowledged_count
+        // (you cannot have acknowledged more observations than exist). A record
+        // WITHOUT either field is a v1 entry and passes UNCHANGED (backward-
+        // compat — no existing release breaks). This validates the manifest's
+        // INTERNAL consistency only; the release-time count-vs-ack comparison
+        // against live card state is the release gate's job (Go checkDeferLiveness).
+        //
+        // Presence is detected by KEY EXISTENCE (hasOwnProperty), NOT by value
+        // truthiness: an explicit `{"recurrence_count": null}` carries the key
+        // and so enters the pair-contract block, where the typeof check below
+        // rejects null (typeof null === "object", not "number"). Detecting
+        // presence by `!== null` would treat a null half-pair as absent and let
+        // it pass as a v1 record — a fail-open on a malformed manifest.
+        const hasRecCount = Object.prototype.hasOwnProperty.call(r, "recurrence_count");
+        const hasAckCount = Object.prototype.hasOwnProperty.call(r, "last_acknowledged_count");
+        if (hasRecCount || hasAckCount) {
+            if (!hasRecCount || !hasAckCount) {
+                return { ok: false, error: `${where}.acknowledgement pair incomplete: recurrence_count and last_acknowledged_count are both required when either is present` };
+            }
+            if (typeof r.recurrence_count !== "number" || !Number.isInteger(r.recurrence_count) || r.recurrence_count < 0) {
+                return { ok: false, error: `${where}.recurrence_count must be a non-negative integer; got ${JSON.stringify(r.recurrence_count)}` };
+            }
+            if (typeof r.last_acknowledged_count !== "number" || !Number.isInteger(r.last_acknowledged_count) || r.last_acknowledged_count < 0) {
+                return { ok: false, error: `${where}.last_acknowledged_count must be a non-negative integer; got ${JSON.stringify(r.last_acknowledged_count)}` };
+            }
+            if (r.recurrence_count < r.last_acknowledged_count) {
+                return { ok: false, error: `${where}.recurrence_count (${r.recurrence_count}) < last_acknowledged_count (${r.last_acknowledged_count}): ack-pair invariant violated` };
+            }
         }
     }
     // Sort check: records must already be in lexical order by defer_id. This
@@ -1038,6 +1131,172 @@ function mainPromoter(options) {
     process.exit(0);
 }
 
+// ---- Release-prep mode (mechanical enumerator, Scope B) -------------------
+//
+// RELEASE-PREP MODE (--mode=release-prep) is the F4-C release-diff-recurrence
+// enumerator for release preparation. Phase-0 established the manifest is HAND-
+// populated (no mechanical writer mutates records[]), so the releaser needs a
+// tool that discovers which OPEN defer cards whose path_touched target re-fires
+// in the release arc lack a disposition, and emits draft stub manifest records
+// to convert. This is that tool.
+//
+// It READS .local/coordinator/tasks/ (silencer-immune — ALL files, no prefix or
+// extension filter, mirroring the Go claims.loadLivenessCards) and the committed
+// manifest's defer_id set. It NEVER WRITES the manifest (federated authority:
+// the releaser authors M). It emits a JSON envelope on stdout:
+//   { mode, classification, diff_since, missing_disposition: [...],
+//     draft_stub_records: [...], advisory: { fired_total, fog_cards, cold_cards } }
+//
+// Exit codes: 0 = prep clean; 1 = missing dispositions (blocker); 2 = evaluator
+// error (git unusable). Fog/cold cards are advisory (never block), matching the
+// Go predicate.
+
+const PREP_CLOSED_STATUSES = new Set(["completed", "cancelled", "staged"]);
+
+// isNonGrammarTargetJS mirrors the Go isNonGrammarTarget: a path_touched operand
+// ending in '/' (directory) or containing glob metacharacters (* ? [ {) is
+// non-grammar for v1 exact-match → COLD (advisory, never block).
+function isNonGrammarTargetJS(t) {
+    if (t.endsWith("/")) return true;
+    return /[*?[{]/.test(t);
+}
+
+// extractPathTouchedJS mirrors the Go claims.extractPathTouchedTargets: scan the
+// WHOLE raw file body for path_touched(<arg>) (de-duped, first-seen order). A
+// target in owner_notes, rough_scope, free text in a .md card — all are caught.
+function extractPathTouchedJS(body) {
+    const re = /path_touched\(([^)]+)\)/g;
+    const seen = new Set();
+    const out = [];
+    let m;
+    while ((m = re.exec(body || "")) !== null) {
+        const arg = m[1].trim();
+        if (arg && !seen.has(arg)) {
+            seen.add(arg);
+            out.push(arg);
+        }
+    }
+    return out;
+}
+
+// committedManifestDeferIds mirrors the Go manifestEntryIDs: read the committed
+// manifest and return the set of defer_id values with a disposition. No handshake
+// validation (that is release-mode's job). A missing/unparseable manifest yields
+// an empty set (fail-safe: the closed-status check still carries the burden).
+function committedManifestDeferIds() {
+    try {
+        const raw = fs.readFileSync(releaseManifestAbsPath(), "utf8");
+        const obj = JSON.parse(raw);
+        const ids = new Set();
+        if (Array.isArray(obj.records)) {
+            for (const r of obj.records) {
+                if (r && typeof r.defer_id === "string" && r.defer_id) {
+                    ids.add(r.defer_id);
+                }
+            }
+        }
+        return ids;
+    } catch (_) {
+        return new Set();
+    }
+}
+
+function mainReleasePrep(options) {
+    const tasksDir = options.tasksDir ? path.resolve(options.tasksDir) : defaultTasksDir();
+    const since = resolveSince(options);
+
+    let files = [];
+    try {
+        files = fs
+            .readdirSync(tasksDir)
+            .filter((f) => !fs.statSync(path.join(tasksDir, f)).isDirectory())
+            .map((f) => path.join(tasksDir, f));
+    } catch (_) {
+        // No tasks dir → nothing to enumerate; prep is clean.
+        emitReleasePrepResult(since, [], [], { firedCount: 0, fog: [], cold: [] });
+        return;
+    }
+
+    const changedPaths = changedPathsSince(since);
+    if (!changedPaths) {
+        process.stderr.write(
+            `check-defer-triggers: release-prep could not compute diff since ${since} (git unavailable).\n`,
+        );
+        process.exit(2);
+    }
+    const manifestIds = committedManifestDeferIds();
+
+    const missing = [];
+    const fog = [];
+    const cold = [];
+    let firedTotal = 0;
+
+    for (const f of files) {
+        let raw;
+        try {
+            raw = fs.readFileSync(f, "utf8");
+        } catch (_) {
+            continue; // unreadable file: skip (no targets → cannot fire)
+        }
+        let body = null;
+        try { body = JSON.parse(raw); } catch (_) { body = null; }
+
+        const id = (body && typeof body.task_id === "string" && body.task_id)
+            || path.basename(f).replace(/\.(json|md|txt)$/, "");
+        const status = (body && typeof body.status === "string") ? body.status : "";
+        const targets = extractPathTouchedJS(raw);
+
+        // disposition_satisfied: closed status OR manifest entry.
+        if (PREP_CLOSED_STATUSES.has(status.trim().toLowerCase())) continue;
+        if (manifestIds.has(id)) continue;
+
+        if (targets.length === 0) { fog.push(id); continue; }
+        const exact = targets.filter((t) => !isNonGrammarTargetJS(t));
+        const nonGrammar = targets.filter((t) => isNonGrammarTargetJS(t));
+        const firedTargets = exact.filter((t) => changedPaths.has(t));
+        if (firedTargets.length > 0) {
+            firedTotal++;
+            missing.push({
+                defer_id: id,
+                file: path.basename(f),
+                status: status || "(implicit open, non-JSON)",
+                fired_targets: firedTargets,
+            });
+        } else if (exact.length === 0 && nonGrammar.length > 0) {
+            cold.push(id);
+        }
+    }
+
+    // Draft stub records: one per missing disposition, for the releaser to
+    // convert into a real disposition before committing the manifest.
+    const draftStubRecords = missing.map((m) => ({
+        defer_id: m.defer_id,
+        relevance: "unknown",
+        disposition: "override_required",
+        _note: "AUTO-GENERATED STUB by --mode=release-prep; the releaser must set relevance + disposition + rationale before committing.",
+    }));
+
+    emitReleasePrepResult(since, missing, draftStubRecords, { firedCount: firedTotal, fog, cold });
+}
+
+function emitReleasePrepResult(since, missing, draftStubRecords, extra) {
+    const classification = missing.length > 0 ? "blocker" : "clear";
+    const payload = {
+        mode: "release-prep",
+        classification,
+        diff_since: since,
+        missing_disposition: missing,
+        draft_stub_records: draftStubRecords,
+        advisory: {
+            fired_total: extra.firedCount,
+            fog_cards: extra.fog,
+            cold_cards: extra.cold,
+        },
+    };
+    process.stdout.write(JSON.stringify(payload, null, 2) + "\n");
+    process.exit(classification === "blocker" ? 1 : 0);
+}
+
 // Dispatcher: --mode=release routes to the strict JSON evaluator; anything
 // else (null, "promoter", or a typo) routes to the lenient human-readable
 // promoter mode. An unknown --mode value is treated as promoter with a stderr
@@ -1046,6 +1305,10 @@ function main() {
     const options = parseArgs(process.argv);
     if (options.mode === "release") {
         mainRelease(options);
+        return;
+    }
+    if (options.mode === "release-prep") {
+        mainReleasePrep(options);
         return;
     }
     if (options.mode !== null && options.mode !== "promoter") {

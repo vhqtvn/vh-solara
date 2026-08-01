@@ -84,6 +84,8 @@ Use the report for lane selection, blocker framing, and handoff shaping.
 Do not treat partial or `uncertain` results as settled evidence.
 
 
+
+
 Default output:
 - goal framing
 - task mode

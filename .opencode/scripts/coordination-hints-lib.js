@@ -1,5 +1,10 @@
 import fs from "fs";
 import path from "path";
+import {
+    countLines as complexityCountLines,
+    loadPolicy as loadComplexityPolicy,
+    eligible as complexityEligible,
+} from "./complexity-signal-lib.js";
 
 const LARGE_FILE_LINE_THRESHOLD = 350;
 const LARGE_FILE_EXTENSIONS = new Set([
@@ -89,10 +94,10 @@ function countLines(directory, relativePath) {
     try {
         const absolute = path.join(directory, relativePath);
         const text = fs.readFileSync(absolute, "utf8");
-        if (!text.length) {
-            return 0;
-        }
-        return text.split(/\r?\n/).length;
+        // Delegate to the shared complexity line-counter, which implements the
+        // canonical semantics: empty=0, terminal newline does not create a
+        // phantom line, CRLF==LF.
+        return complexityCountLines(text);
     } catch {
         return 0;
     }
@@ -116,9 +121,9 @@ function previewList(paths, maxItems = 3) {
 
 function largeFileMessage(largeFiles) {
     const items = largeFiles.map((entry) =>
-        `${entry.relative_path} (${entry.line_count} lines)`
+        `${entry.relative_path} (${entry.line_count} lines, threshold ${entry.threshold})`
     );
-    return `${previewList(items)} exceeded the ${LARGE_FILE_LINE_THRESHOLD}-line hint threshold after this edit. Consider extracting helpers or splitting the boundary before it grows further.`;
+    return `${previewList(items)} ${largeFiles.length === 1 ? "is" : "are"} above the complexity threshold after this edit. Consider extracting helpers or reviewing the boundary's cohesion; record a disposition (accept-as-cohesive or split-defer) if it is intentionally cohesive.`;
 }
 
 function buildCoordinationHintMessages(input) {
@@ -181,13 +186,29 @@ function buildCoordinationHintMessages(input) {
         });
     }
 
-    const largeFiles = normalized
-        .filter((entry) => entry.additions > 0 && supportsLargeFileHint(entry.relative_path))
-        .map((entry) => ({
-            ...entry,
-            line_count: countLines(directory, entry.relative_path),
-        }))
-        .filter((entry) => entry.line_count > lineThreshold);
+    // Large-file hint: load the complexity policy so the threshold and
+    // supported extensions come from .vh-agent-harness/complexity-policy.yml
+    // (adds .go, respects per-language overrides and event exclusions) rather
+    // than the fixed constants. Falls back to the constants when the policy is
+    // absent (pre-install / greenfield). When enabled:false, the complexity
+    // hint is disabled entirely (matches the Go doctor tierSkip).
+    const rawPolicy = loadComplexityPolicy(directory);
+    const complexityExplicitlyDisabled = rawPolicy !== null && rawPolicy.enabled === false;
+    const complexityPolicy = rawPolicy && rawPolicy.enabled !== false ? rawPolicy : null;
+    const largeFiles = complexityExplicitlyDisabled ? [] : normalized
+        .filter((entry) => entry.additions > 0)
+        .filter((entry) => {
+            if (complexityPolicy) {
+                return complexityEligible(complexityPolicy, entry.relative_path, "post_edit");
+            }
+            return supportsLargeFileHint(entry.relative_path);
+        })
+        .map((entry) => {
+            const lineCount = countLines(directory, entry.relative_path);
+            const threshold = resolveEventThreshold(complexityPolicy, entry.relative_path, lineThreshold);
+            return { ...entry, line_count: lineCount, threshold };
+        })
+        .filter((entry) => entry.line_count > entry.threshold);
 
     if (largeFiles.length) {
         hints.push({
@@ -199,6 +220,25 @@ function buildCoordinationHintMessages(input) {
     }
 
     return hints;
+}
+
+// resolveEventThreshold returns the event-time threshold for a file: the policy's
+// per-language override (or default event_file_lines) when available, else the
+// caller-supplied fallback (input.lineThreshold or the LARGE_FILE_LINE_THRESHOLD
+// constant).
+function resolveEventThreshold(policy, relativePath, fallback) {
+    if (!policy) {
+        return Number(fallback) || LARGE_FILE_LINE_THRESHOLD;
+    }
+    const ext = path.extname(relativePath);
+    const ov = policy.perLanguage && policy.perLanguage[ext];
+    if (ov && ov.eventFileLines != null) {
+        return ov.eventFileLines;
+    }
+    if (policy.defaults && policy.defaults.eventFileLines) {
+        return policy.defaults.eventFileLines;
+    }
+    return Number(fallback) || LARGE_FILE_LINE_THRESHOLD;
 }
 
 // --- Command-repetition hints (signal-triggered, not path-triggered) ---------

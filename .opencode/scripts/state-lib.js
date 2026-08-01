@@ -1,5 +1,6 @@
 import fs from "fs";
 import path from "path";
+import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "url";
 import {
     validateF3DesignReadiness,
@@ -106,6 +107,8 @@ const COORDINATION_TASK_TYPES = Object.freeze([
     "implementation",
     "study",
     "research",
+    "docs",
+    "verification",
 ]);
 const RESEARCH_SOURCE_POLICIES = Object.freeze([
     "repo_only",
@@ -214,9 +217,17 @@ const TASK_CONTRACT_SECTION_ORDER = Object.freeze([
 ]);
 
 export class StateError extends Error {
-    constructor(message) {
+    constructor(message, cause) {
         super(message);
         this.name = "StateError";
+        // Optional causal chain. Attaching the original error preserves the
+        // distinction a caller needs to classify a failure (e.g. a JSON.parse
+        // SyntaxError vs a genuine filesystem error that surfaced inside the
+        // same try block). Existing callers construct StateError with a single
+        // message argument, so an absent cause changes nothing.
+        if (cause !== undefined && cause !== null) {
+            this.cause = cause;
+        }
     }
 }
 
@@ -413,7 +424,13 @@ function readJson(targetPath, defaultValue) {
     try {
         return JSON.parse(fs.readFileSync(targetPath, "utf8"));
     } catch (error) {
-        throw new StateError(`Malformed JSON state file: ${targetPath}`);
+        // Preserve the original error as `.cause` so a caller can classify the
+        // failure: a JSON.parse SyntaxError (corrupt JSON) vs a genuine
+        // filesystem error (permission denied / IO) that surfaced inside this
+        // try block. The thrown type (StateError) and message are unchanged, so
+        // every existing caller behaves exactly as before; only callers that
+        // opt into inspecting `.cause` see the new field.
+        throw new StateError(`Malformed JSON state file: ${targetPath}`, error);
     }
 }
 
@@ -1397,7 +1414,11 @@ function ensureLocalCoordinatorNamespace() {
     ensureDir(localCoordinatorScratchRoot());
 }
 
-function normalizeStoredCoordinationReview(sourceLastReview, reviewPaths) {
+function normalizeStoredCoordinationReview(
+    sourceLastReview,
+    reviewPaths,
+    accumulators = {},
+) {
     const raw =
         sourceLastReview && typeof sourceLastReview === "object"
             ? sourceLastReview
@@ -1428,13 +1449,23 @@ function normalizeStoredCoordinationReview(sourceLastReview, reviewPaths) {
             : parsed?.frontmatter?.session_name
               ? String(parsed.frontmatter.session_name).trim()
               : null;
+    // Read-path enum normalization must be fault-tolerant: a bad stored
+    // last_review.status coerces to "" (then null) instead of throwing, so a
+    // single degraded review block cannot brick listCoordinationTasks() or
+    // any load-based op. Collected messages flow into the caller-provided
+    // accumulators when present (so the read-path scan can surface them as
+    // quarantine diagnostics); the save path remains the strict authority
+    // for INPUT and never passes accumulators here.
+    const reviewEnumErrors = accumulators.enumErrors || [];
+    const reviewEnumInvalidFields =
+        accumulators.enumInvalidFields || new Set();
     const normalized = {
         path: storedPath,
         reviewed_at: (raw && raw.reviewed_at) || parsed?.reviewed_at || null,
         session_name: sessionName || null,
         title: String((raw && raw.title) || parsed?.title || "").trim(),
         status:
-            normalizeCoordinationEnum(
+            normalizeCoordinationEnumCollected(
                 (raw && raw.status) || parsed?.status,
                 [
                     "ready",
@@ -1445,6 +1476,8 @@ function normalizeStoredCoordinationReview(sourceLastReview, reviewPaths) {
                     "cancelled",
                 ],
                 "last_review.status",
+                reviewEnumErrors,
+                reviewEnumInvalidFields,
             ) || null,
         summary: String((raw && raw.summary) || parsed?.summary || "").trim(),
         next_action: String(
@@ -1472,16 +1505,33 @@ function normalizeStoredCoordinationReview(sourceLastReview, reviewPaths) {
     return normalized;
 }
 
-function normalizeCoordinationTaskRecord(payload, taskID = "") {
+function normalizeCoordinationTaskRecord(payload, taskID = "", accumulators = {}) {
     const source = payload && typeof payload === "object" ? payload : {};
     const normalizedTaskID = normalizeCoordinationTaskId(
         source.task_id || taskID || "",
     );
+    // Read/normalize path must be fault-tolerant where the save path is
+    // strict: route every enum field through the collected (non-throwing)
+    // validator so a single card with a bad stored enum value cannot brick
+    // listCoordinationTasks() and every load-based op that depends on it
+    // (read, activate, ready, update, repair, review, saveCloseout). A bad
+    // value coerces to "" and the per-field default applies. Collected
+    // messages and offending-field names flow into the caller-provided
+    // accumulators when present (so the read-path scan can surface them as
+    // quarantine diagnostics without re-reading the raw stored bytes); when
+    // absent (every write-path caller) they are local throwaways and the
+    // save path remains the authority that rejects bad INPUT — the read
+    // path only tolerates what is on disk.
+    const readEnumErrors = accumulators.enumErrors || [];
+    const enumInvalidFields =
+        accumulators.enumInvalidFields || new Set();
     let normalizedStatus =
-        normalizeCoordinationEnum(
+        normalizeCoordinationEnumCollected(
             source.status,
             COORDINATION_TASK_STATUSES,
             "status",
+            readEnumErrors,
+            enumInvalidFields,
         ) || "draft";
     const sessionAliases = uniqueStrings(
         normalizeStringList(source.session_aliases).map((value) =>
@@ -1505,42 +1555,52 @@ function normalizeCoordinationTaskRecord(payload, taskID = "") {
             claimedAt = null;
         }
     }
-    const coordinationMode = normalizeCoordinationEnum(
+    const coordinationMode = normalizeCoordinationEnumCollected(
         source.coordination_mode,
         COORDINATION_MODES,
         "coordination_mode",
+        readEnumErrors,
+        enumInvalidFields,
     );
     const reportEnvelope =
-        normalizeCoordinationEnum(
+        normalizeCoordinationEnumCollected(
             source.report_envelope,
             COORDINATION_REPORT_ENVELOPES,
             "report_envelope",
+            readEnumErrors,
+            enumInvalidFields,
         ) || defaultReportEnvelopeForMode(coordinationMode);
     return {
         ...defaultCoordinationTaskPayload(normalizedTaskID),
         ...source,
         task_id: normalizedTaskID,
         title: String(source.title || "").trim(),
-        task_type: normalizeCoordinationEnum(
+        task_type: normalizeCoordinationEnumCollected(
             source.task_type,
             COORDINATION_TASK_TYPES,
             "task_type",
+            readEnumErrors,
+            enumInvalidFields,
         ),
         coordination_mode: coordinationMode,
         primary_lane: String(source.primary_lane || "").trim(),
         research_question: String(source.research_question || "").trim(),
         source_policy:
-            normalizeCoordinationEnum(
+            normalizeCoordinationEnumCollected(
                 source.source_policy,
                 RESEARCH_SOURCE_POLICIES,
                 "source_policy",
+                readEnumErrors,
+                enumInvalidFields,
             ) || null,
         source_allowlist: normalizeStringList(source.source_allowlist),
         desired_artifact_type:
-            normalizeCoordinationEnum(
+            normalizeCoordinationEnumCollected(
                 source.desired_artifact_type,
                 RESEARCH_ARTIFACT_TYPES,
                 "desired_artifact_type",
+                readEnumErrors,
+                enumInvalidFields,
             ) || null,
         target_artifact_path: normalizeOptionalText(source.target_artifact_path),
         rough_scope: normalizeStringList(source.rough_scope),
@@ -1580,16 +1640,20 @@ function normalizeCoordinationTaskRecord(payload, taskID = "") {
                           : "",
                       title: String(source.latest_report.title || "").trim(),
                       status:
-                          normalizeCoordinationEnum(
+                          normalizeCoordinationEnumCollected(
                               source.latest_report.status,
                               [...COORDINATION_CLOSEOUT_STATUSES],
                               "latest_report.status",
+                              readEnumErrors,
+                              enumInvalidFields,
                           ) || null,
                       report_envelope:
-                          normalizeCoordinationEnum(
+                          normalizeCoordinationEnumCollected(
                               source.latest_report.report_envelope,
                               COORDINATION_REPORT_ENVELOPES,
                               "latest_report.report_envelope",
+                              readEnumErrors,
+                              enumInvalidFields,
                           ) || null,
                       created_at: source.latest_report.created_at || null,
                       summary: String(source.latest_report.summary || "").trim(),
@@ -1616,6 +1680,10 @@ function normalizeCoordinationTaskRecord(payload, taskID = "") {
                     storePathForRepo(normalizeRepoPath(value)),
                 ),
             ),
+            {
+                enumErrors: readEnumErrors,
+                enumInvalidFields,
+            },
         ),
         history: Array.isArray(source.history)
             ? source.history
@@ -1641,36 +1709,60 @@ function normalizeCoordinationTaskRecord(payload, taskID = "") {
  * error (the raw enum message) while multi-error aggregation still fires for
  * genuinely independent problems.
  *
+ * `options.offendingFields`, when provided, is populated (mutated in place)
+ * with the field names implicated by every problem collected here — both
+ * missing-required fields and compound-condition fields. The read-path scan
+ * uses this to build the quarantine entry's `offending_fields` list without
+ * re-parsing the message strings. The save path never passes it.
+ *
  * @param {object} task
  * @param {object} [options]
  * @param {boolean} [options.allowLegacyIncompleteResearch]
  * @param {Set<string>} [options.enumInvalidFields]
+ * @param {Set<string>} [options.offendingFields]
  * @returns {string[]} collected error messages (empty when valid)
  */
 function collectCoordinationTaskCoreFieldErrors(task, options = {}) {
     const errors = [];
     const enumInvalid = options.enumInvalidFields || new Set();
+    const offendingFields = options.offendingFields || null;
+    const markOffending = (...fieldNames) => {
+        if (!offendingFields) {
+            return;
+        }
+        for (const fieldName of fieldNames) {
+            if (fieldName && typeof offendingFields.add === "function") {
+                offendingFields.add(fieldName);
+            }
+        }
+    };
     // True when the field has NO already-collected enum error of its own, i.e.
     // a missing/blank value here is a genuine missing-value problem rather
     // than a side effect of a failed enum normalization upstream.
     const isGenuinelyMissing = (field) => !enumInvalid.has(field);
     if (!task.title && isGenuinelyMissing("title")) {
         errors.push("Task title is required.");
+        markOffending("title");
     }
     if (!task.task_type && isGenuinelyMissing("task_type")) {
         errors.push("task_type is required.");
+        markOffending("task_type");
     }
     if (!task.coordination_mode && isGenuinelyMissing("coordination_mode")) {
         errors.push("coordination_mode is required.");
+        markOffending("coordination_mode");
     }
     if (!task.primary_lane && isGenuinelyMissing("primary_lane")) {
         errors.push("primary_lane is required.");
+        markOffending("primary_lane");
     }
     if (!task.status && isGenuinelyMissing("status")) {
         errors.push("status is required.");
+        markOffending("status");
     }
     if (!task.report_envelope && isGenuinelyMissing("report_envelope")) {
         errors.push("report_envelope is required.");
+        markOffending("report_envelope");
     }
     if (task.task_type === "research") {
         const missingResearchFields = missingResearchContractFields(task);
@@ -1683,6 +1775,7 @@ function collectCoordinationTaskCoreFieldErrors(task, options = {}) {
             isGenuinelyMissing("research_question")
         ) {
             errors.push("Research tasks must define research_question.");
+            markOffending("research_question");
         }
         if (
             !tolerateLegacyResearchGap &&
@@ -1690,6 +1783,7 @@ function collectCoordinationTaskCoreFieldErrors(task, options = {}) {
             isGenuinelyMissing("source_policy")
         ) {
             errors.push("Research tasks must define source_policy.");
+            markOffending("source_policy");
         }
         if (
             !tolerateLegacyResearchGap &&
@@ -1697,6 +1791,7 @@ function collectCoordinationTaskCoreFieldErrors(task, options = {}) {
             isGenuinelyMissing("desired_artifact_type")
         ) {
             errors.push("Research tasks must define desired_artifact_type.");
+            markOffending("desired_artifact_type");
         }
         if (
             !tolerateLegacyResearchGap &&
@@ -1704,6 +1799,7 @@ function collectCoordinationTaskCoreFieldErrors(task, options = {}) {
             isGenuinelyMissing("target_artifact_path")
         ) {
             errors.push("Research tasks must define target_artifact_path.");
+            markOffending("target_artifact_path");
         }
     }
     if (task.status === "draft") {
@@ -1715,6 +1811,7 @@ function collectCoordinationTaskCoreFieldErrors(task, options = {}) {
             errors.push(
                 "Draft tasks must capture rough_scope, open_questions, or ready_criteria before they can be saved.",
             );
+            markOffending("rough_scope", "open_questions", "ready_criteria");
         }
         return errors;
     }
@@ -1723,20 +1820,24 @@ function collectCoordinationTaskCoreFieldErrors(task, options = {}) {
             errors.push(
                 "Working tasks must record active_session_alias and claimed_at.",
             );
+            markOffending("active_session_alias", "claimed_at");
         }
     }
     if (!(task.files_in_scope || []).length) {
         errors.push("files_in_scope must contain at least one path.");
+        markOffending("files_in_scope");
     }
     if (!(task.success_criteria || []).length) {
         errors.push(
             "success_criteria must contain at least one requirement.",
         );
+        markOffending("success_criteria");
     }
     if (!(task.validation_plan || []).length) {
         errors.push(
             "validation_plan must contain at least one verification step.",
         );
+        markOffending("validation_plan");
     }
     if (task.latest_report) {
         if (
@@ -1747,6 +1848,7 @@ function collectCoordinationTaskCoreFieldErrors(task, options = {}) {
             errors.push(
                 "latest_report is missing required path/status/report_envelope fields.",
             );
+            markOffending("latest_report");
         }
     }
     if (task.last_review) {
@@ -1759,6 +1861,7 @@ function collectCoordinationTaskCoreFieldErrors(task, options = {}) {
             errors.push(
                 "last_review is missing required path/reviewed_at/title/status fields.",
             );
+            markOffending("last_review");
         }
     }
     return errors;
@@ -1766,6 +1869,109 @@ function collectCoordinationTaskCoreFieldErrors(task, options = {}) {
 
 function ensureCoordinationTaskCoreFields(task, options = {}) {
     throwCollectedErrors(collectCoordinationTaskCoreFieldErrors(task, options));
+}
+
+// Canonical field-name ordering for quarantine diagnostics. Keeps the
+// offending_fields list deterministic regardless of insertion order from
+// the enum + core-field collectors, so two scans of the same degraded card
+// produce byte-identical quarantine entries.
+const COORDINATION_QUARANTINE_FIELD_ORDER = [
+    "title",
+    "task_type",
+    "coordination_mode",
+    "primary_lane",
+    "status",
+    "report_envelope",
+    "research_question",
+    "source_policy",
+    "desired_artifact_type",
+    "target_artifact_path",
+    "source_allowlist",
+    "rough_scope",
+    "open_questions",
+    "ready_criteria",
+    "files_in_scope",
+    "success_criteria",
+    "validation_plan",
+    "active_session_alias",
+    "claimed_at",
+    "latest_report",
+    "latest_report.status",
+    "latest_report.report_envelope",
+    "last_review",
+    "last_review.status",
+];
+
+function stableSortQuarantineFields(fieldNames) {
+    const seen = new Set();
+    const unique = [];
+    for (const fieldName of fieldNames) {
+        const value = String(fieldName || "");
+        if (!value || seen.has(value)) {
+            continue;
+        }
+        seen.add(value);
+        unique.push(value);
+    }
+    return unique.sort((left, right) => {
+        const leftRank = COORDINATION_QUARANTINE_FIELD_ORDER.indexOf(left);
+        const rightRank = COORDINATION_QUARANTINE_FIELD_ORDER.indexOf(right);
+        const leftIndex = leftRank === -1 ? COORDINATION_QUARANTINE_FIELD_ORDER.length : leftRank;
+        const rightIndex = rightRank === -1 ? COORDINATION_QUARANTINE_FIELD_ORDER.length : rightRank;
+        if (leftIndex !== rightIndex) {
+            return leftIndex - rightIndex;
+        }
+        return left.localeCompare(right);
+    });
+}
+
+/**
+ * Normalize a coordination-task record AND preserve the validation findings
+ * the read path used to discard. Returns a discriminated result alongside the
+ * normalized record so callers (the scan boundary, the action boundary) can
+ * surface degradation without mutating the persistent task DTO.
+ *
+ * `problems` is the deterministic union of enum-coercion messages and
+ * core-field messages (enum first, in declaration order, then core-field in
+ * validator order). `offendingFields` is the deduped, stably-sorted field-name
+ * list a quarantine entry publishes. `degraded` is true iff `problems` is
+ * non-empty.
+ *
+ * The fallback/coercion behavior of `normalizeCoordinationTaskRecord` is
+ * UNCHANGED — a bad stored enum still coerces to "" (and the per-field default
+ * applies) so read resilience is identical to before. This helper only stops
+ * throwing away the evidence of the coercion.
+ *
+ * @param {object} payload - raw stored record (already JSON-parsed)
+ * @param {string} [taskID]
+ * @returns {{task: object, diagnostics: {problems: string[], offendingFields: string[], degraded: boolean}}}
+ */
+function normalizeCoordinationTaskRecordWithDiagnostics(payload, taskID = "") {
+    const enumErrors = [];
+    const enumInvalidFields = new Set();
+    const task = normalizeCoordinationTaskRecord(payload, taskID, {
+        enumErrors,
+        enumInvalidFields,
+    });
+    const coreOffendingFields = new Set();
+    const coreErrors = collectCoordinationTaskCoreFieldErrors(task, {
+        allowLegacyIncompleteResearch: true,
+        enumInvalidFields,
+        offendingFields: coreOffendingFields,
+    });
+    const problems = [...enumErrors, ...coreErrors];
+    const offendingFields = stableSortQuarantineFields([
+        ...enumInvalidFields,
+        ...coreOffendingFields,
+    ]);
+    return {
+        task,
+        diagnostics: {
+            problems,
+            offendingFields,
+            degraded: problems.length > 0,
+        },
+    };
 }
 
 function coordinationActorContext(sessionID, options = {}) {
@@ -1840,6 +2046,26 @@ const RESEARCH_REPAIRABLE_FIELD_NAMES = [
     "source_allowlist",
     "desired_artifact_type",
     "target_artifact_path",
+];
+
+// Core identity/enum fields a DEGRADED card may need restored through
+// /task-repair. This is the restorable identity/enum offender subset — the
+// fields whose corruption degrades a card that the repair branch can fix in
+// one request. The ordinary update allowlist
+// (TASK_METADATA_UPDATE_*_FIELD_NAMES) deliberately never exposes
+// task_type/status, so healthy-card task_type/status immutability is enforced
+// elsewhere (by that allowlist). The repair carve-out is gated strictly on
+// diagnostics.degraded === true AND restricted to fields that are CURRENTLY
+// offending (restore-only — see repairDegradedCoordinationTaskCoreFields), so
+// it cannot be used to move a healthy field (e.g. a non-offending status) and
+// thereby bypass the lifecycle transition guard.
+const DEGRADED_CORE_REPAIRABLE_FIELD_NAMES = [
+    "task_type",
+    "status",
+    "coordination_mode",
+    "report_envelope",
+    "title",
+    "primary_lane",
 ];
 
 const TASK_METADATA_UPDATE_PRE_EXECUTION_FIELD_NAMES = [
@@ -1962,7 +2188,25 @@ function defaultCoordinationTaskNextAction(taskIDRaw, status) {
     }
 }
 
-function coordinationTaskRecommendation(task, actorSessionName = null) {
+function coordinationTaskRecommendation(
+    task,
+    actorSessionName = null,
+    options = {},
+) {
+    // Degraded cards are quarantined: they are surfaced in listCoordinationTasks
+    // with a diagnostics block and refused at the action boundary
+    // (readyCoordinationTask). Recommend inspection/repair instead of any
+    // lifecycle transition, so a degraded card (e.g. a bad stored status that
+    // coerced to "draft") cannot be routed toward /task-ready through guidance.
+    // The action-boundary refusal in readyCoordinationTask is the hard gate;
+    // this is the soft (guidance) layer that keeps the coordinator from ever
+    // proposing the transition in the first place.
+    if (options.degraded) {
+        return {
+            command: `/task-open ${task.task_id}`,
+            note: "This coordination-task card is degraded (a stored field failed validation). Inspect or repair it before any lifecycle transition — see the quarantine entry.",
+        };
+    }
     const missingResearchFields = missingResearchContractFields(task);
     if (missingResearchFields.length) {
         return {
@@ -2011,8 +2255,16 @@ function coordinationTaskRecommendation(task, actorSessionName = null) {
     }
 }
 
-function recommendedCoordinationTaskFields(task, actorSessionName = null) {
-    const recommendation = coordinationTaskRecommendation(task, actorSessionName);
+function recommendedCoordinationTaskFields(
+    task,
+    actorSessionName = null,
+    options = {},
+) {
+    const recommendation = coordinationTaskRecommendation(
+        task,
+        actorSessionName,
+        options,
+    );
     return {
         next_recommended_command: recommendation.command,
         next_recommended_note: recommendation.note,
@@ -3477,60 +3729,176 @@ function loadCoordinationTask(taskIDRaw, options = {}) {
                 path: targetPath,
                 payload: defaultCoordinationTaskPayload(taskID),
                 exists: false,
+                diagnostics: {
+                    problems: [],
+                    offendingFields: [],
+                    degraded: false,
+                },
             };
         }
         throw new StateError(
             `Coordination task does not exist: ${relativeToRepo(targetPath)}`,
         );
     }
-    const payload = normalizeCoordinationTaskRecord(
-        readJson(targetPath, defaultCoordinationTaskPayload(taskID)),
-        taskID,
-    );
-    ensureCoordinationTaskCoreFields(payload, {
-        allowLegacyIncompleteResearch: true,
-    });
+    // Read-path fault tolerance: COLLECT (do not throw) every validation
+    // problem so a degraded card — a bad stored enum coerced to "" upstream,
+    // or a legacy-incomplete record — does not brick listCoordinationTasks()
+    // and every load-based op. The collected problems are now SURFACED as
+    // `diagnostics` (previously discarded) so the scan boundary can route
+    // degraded cards into `quarantine[]` and the action boundary
+    // (readyCoordinationTask) can refuse them. The save path
+    // (updateCoordinationTask and friends) keeps the strict throwing
+    // ensureCoordinationTaskCoreFields call, so only the read path tolerates
+    // already-stored data. This closes the read/write asymmetry: writes
+    // reject bad INPUT, reads tolerate bad STORED data — and now REPORT it.
+    const { task: payload, diagnostics } =
+        normalizeCoordinationTaskRecordWithDiagnostics(
+            readJson(targetPath, defaultCoordinationTaskPayload(taskID)),
+            taskID,
+        );
     return {
         task_id: taskID,
         path: targetPath,
         payload,
         exists: true,
+        diagnostics,
     };
 }
 
-function listCoordinationTaskCards(options = {}) {
+// Internal scan boundary: read every card in the registry and preserve the
+// per-card diagnostics (degradation evidence) alongside the normalized task.
+// This is the single read-path point that knows a card is degraded; the
+// public listCoordinationTasks() publishes it as `quarantine[]` and the
+// action boundary (readyCoordinationTask) refuses degraded cards. Each entry
+// carries the repo-relative path so a quarantine row is safe to display
+// without leaking absolute operator-local paths.
+//
+// Syntax-invalid quarantine: a SINGLE corrupt `.json` file used to brick the
+// whole scan, because readJson() throws on a JSON.parse failure and
+// loadCoordinationTask() propagated that throw. Different scanner contract
+// from the semantic-degradation quarantine (which has a normalized task object
+// to report offending_fields against): a syntax-corrupt file cannot be parsed
+// at all, so there is no task_id and no offending_fields to report — only the
+// filename is recoverable. Here we catch the JSON.parse failure PER CARD,
+// emit a filename-level quarantine entry, and CONTINUE scanning the rest.
+// Genuine filesystem errors (permission denied, missing directory, IO) are
+// RETHROWN so they surface loudly instead of being silently swallowed as a
+// "quarantined card" — only JSON parse failures are reported-and-continue.
+// This mirrors the normalizeCoordinationEnum -> normalizeCoordinationEnumCollected
+// split: the throw lives at readJson (every direct caller), the fault tolerance
+// lives at this scan boundary (the only place that scans a whole directory and
+// must not let one bad file poison the rest).
+function scanCoordinationTaskCards() {
     ensureLocalCoordinatorNamespace();
     const files = fs.existsSync(localCoordinatorTasksRoot())
         ? fs.readdirSync(localCoordinatorTasksRoot())
         : [];
-    // enumerate-the-good, report-the-bad: a single malformed legacy card must
-    // NOT abort the whole listing. Single-card reads (loadCoordinationTask,
-    // used by read/resume/activate) still throw so an explicit open surfaces
-    // the error; only enumeration is tolerant. Pass { collectSkipped: [] } to
-    // receive a per-card report of what was skipped and why.
-    const collectSkipped = Array.isArray(options.collectSkipped)
-        ? options.collectSkipped
-        : null;
-    const cards = [];
-    for (const name of files.filter((entry) => entry.endsWith(".json"))) {
-        const taskID = name.replace(/\.json$/, "");
-        try {
-            cards.push(loadCoordinationTask(taskID).payload);
-        } catch (error) {
-            if (collectSkipped) {
-                collectSkipped.push({
-                    task_id: taskID,
-                    path: coordinationTaskPath(taskID),
-                    error: error instanceof Error ? error.message : String(error),
-                });
+    const scanned = files
+        .filter((name) => name.endsWith(".json"))
+        .map((name) => {
+            const taskID = name.replace(/\.json$/, "");
+            const targetPath = coordinationTaskPath(taskID);
+            try {
+                const loaded = loadCoordinationTask(taskID);
+                return {
+                    taskID,
+                    path: relativeToRepo(loaded.path),
+                    task: loaded.payload,
+                    diagnostics: loaded.diagnostics,
+                    degraded: Boolean(loaded.diagnostics && loaded.diagnostics.degraded),
+                };
+            } catch (error) {
+                // Catch JSON.parse failures ONLY. readJson attaches the
+                // original error as `.cause`, so a genuine SyntaxError
+                // (corrupt JSON) is distinguishable from a filesystem error
+                // (permission denied / missing / IO) that surfaced inside
+                // readJson's try block. Genuine fs errors are rethrown.
+                if (!isCoordinationCardSyntaxError(error)) {
+                    throw error;
+                }
+                return {
+                    taskID,
+                    path: relativeToRepo(targetPath),
+                    // No task object is recoverable from an unparseable file;
+                    // null keeps the array consumers (listCoordinationTaskCards,
+                    // resolveRecurrenceDedup, listCoordinationTasks) honest —
+                    // they must treat a syntax entry as "not a card" and route
+                    // it into quarantine[] only.
+                    task: null,
+                    diagnostics: null,
+                    degraded: true,
+                    syntaxError: true,
+                    problems: [coordinationCardSyntaxMessage(error)],
+                };
             }
-        }
-    }
-    return cards.sort((left, right) => {
-        const leftUpdated = String(left.updated_at || left.created_at || "");
-        const rightUpdated = String(right.updated_at || right.created_at || "");
+        });
+    return scanned.sort((left, right) => {
+        const leftTask = left && left.task ? left.task : null;
+        const rightTask = right && right.task ? right.task : null;
+        const leftUpdated = String(
+            (leftTask && (leftTask.updated_at || leftTask.created_at)) || "",
+        );
+        const rightUpdated = String(
+            (rightTask && (rightTask.updated_at || rightTask.created_at)) || "",
+        );
         return rightUpdated.localeCompare(leftUpdated);
     });
+}
+
+/**
+ * Classify an error thrown while scanning a single coordination-task card as a
+ * JSON.parse (syntax) failure. Returns true ONLY when the error is the
+ * StateError readJson emits for malformed JSON AND its `.cause` is a genuine
+ * SyntaxError — the signature of JSON.parse rejecting corrupt input. Any other
+ * error (a filesystem SystemError with `.code`, a missing-file StateError from
+ * a TOCTOU race, anything without a SyntaxError cause) returns false so the
+ * scan boundary rethrows it instead of swallowing a real failure as a
+ * "quarantined card".
+ *
+ * @param {*} error
+ * @returns {boolean}
+ */
+function isCoordinationCardSyntaxError(error) {
+    if (!(error instanceof StateError)) {
+        return false;
+    }
+    const message = String(error.message || "");
+    if (!message.startsWith("Malformed JSON state file:")) {
+        return false;
+    }
+    return error.cause instanceof SyntaxError;
+}
+
+/**
+ * Extract a stable, human-readable message from a JSON.parse failure caught at
+ * the scan boundary. Prefers the original SyntaxError's message (the parser's
+ * own positioning text) so a quarantine row points the operator at the defect;
+ * falls back to a generic label if the cause is unexpectedly absent.
+ *
+ * @param {*} error
+ * @returns {string}
+ */
+function coordinationCardSyntaxMessage(error) {
+    const cause = error && error.cause;
+    const text =
+        cause && typeof cause.message === "string" && cause.message.trim()
+            ? cause.message.trim()
+            : "Invalid JSON (parse failure).";
+    return text;
+}
+
+// Trusted projection: every NON-degraded card's normalized task. Degraded
+// cards are excluded so a defaulted/empty status or core field cannot
+// produce false overlap findings or otherwise contaminate a consumer that
+// trusts the listed cards as healthy. The two pre-slice consumers were
+// detectCoordinationTaskOverlaps (wants healthy only) and listCoordinationTasks
+// (now uses scanCoordinationTaskCards directly so it can keep degraded cards
+// in tasks[] for compat while still excluding them from healthy_* counts).
+// Callers that need degraded cards MUST use scanCoordinationTaskCards.
+function listCoordinationTaskCards() {
+    return scanCoordinationTaskCards()
+        .filter((entry) => !entry.degraded)
+        .map((entry) => entry.task);
 }
 
 function updateCoordinationTask(taskIDRaw, updateFn) {
@@ -3630,24 +3998,12 @@ function assertSaveCoordinationTaskStatusTransition(
     );
 }
 
-function detectCoordinationTaskOverlaps(taskID, filesInScope, options = {}) {
+function detectCoordinationTaskOverlaps(taskID, filesInScope) {
     if (!filesInScope.length) {
         return [];
     }
     const currentFiles = normalizeFileScope(filesInScope);
-    // Mirror listCoordinationTasks' hardened enumeration (see the sibling call
-    // below at the collectSkipped: skipped_cards site): thread a {collectSkipped}
-    // collector so a malformed open card is surfaced in the caller's
-    // skipped_cards instead of being silently excluded from overlap detection.
-    // Without this, a card skipped during enumeration is invisible to overlap
-    // detection (and thus to the operator reviewing overlaps on save/read),
-    // defeating the hardened loader's enumerate-the-good/report-the-bad contract.
-    const collectSkipped = Array.isArray(options.collectSkipped)
-        ? options.collectSkipped
-        : null;
-    return listCoordinationTaskCards(
-        collectSkipped ? { collectSkipped } : {},
-    )
+    return listCoordinationTaskCards()
         .filter((task) => task.task_id !== taskID)
         .filter((task) => OPEN_COORDINATION_TASK_STATUSES.has(task.status))
         .map((task) => {
@@ -3808,6 +4164,336 @@ function parseCoordinationReview(reviewPath, options = {}) {
     return result;
 }
 
+
+// resolveHarnessBinary picks the vh-agent-harness binary to invoke for the
+// recurrence dedup bridge. Resolution order:
+//   1. env VH_AGENT_HARNESS_BIN (explicit override; tests use this)
+//   2. repo-relative bin/vh-agent-harness (dev/dogfood: freshly built)
+//   3. "vh-agent-harness" on PATH (consumer install)
+// Returns null only if no explicit override and no repo bin exists and the
+// bare name is not on PATH (checked lazily by execFileSync later).
+function resolveHarnessBinary() {
+    const envBin = (process.env.VH_AGENT_HARNESS_BIN || "").trim();
+    if (envBin) return envBin;
+    const repoBin = path.join(repoRoot(), "bin", "vh-agent-harness");
+    if (fs.existsSync(repoBin)) return repoBin;
+    return "vh-agent-harness"; // PATH fallback; execFileSync searches PATH
+}
+
+// resolveRecurrenceDedup consults the Go derivation via `vh-agent-harness
+// recurrence dedup` to decide whether an incoming recurrence-bearing card is a
+// REPEAT of a known canonical (merge → the producer updates the canonical
+// instead of spawning) or a new defect (new_card → write fresh).
+//
+// FAIL-CLOSED: if the binary is unavailable, the scan errors, or the response
+// is malformed, this THROWS rather than returning a new_card decision. A
+// fail-open to new_card would silently spawn a SECOND card for one
+// effective_recurrence_id, violating the slice's defining N→1 invariant.
+// Fail-closed forces the caller to see the error and retry; the release gate
+// (Slice 5) provides additional fail-closed enforcement on unadjudicated
+// recurrences.
+//
+// @param {{task_id: string, recurrence: object}} incomingCard
+// @returns {{action: string, effective_id: string, canonical_task_id: string, merged: ?object}}
+// @throws {Error} if the bridge scan, binary execution, or response parsing fails
+function resolveRecurrenceDedup(incomingCard) {
+    // Scan existing recurrence-bearing cards (exclude the incoming card itself
+    // so an update to an existing card does not "merge" it with itself).
+    let existingCards;
+    try {
+        const scanned = scanCoordinationTaskCards();
+        existingCards = scanned
+            .filter(
+                (entry) =>
+                    !entry.degraded &&
+                    entry.task &&
+                    entry.task.recurrence &&
+                    entry.taskID !== incomingCard.task_id,
+            )
+            .map((entry) => ({
+                task_id: entry.taskID,
+                recurrence: entry.task.recurrence,
+            }));
+    } catch (e) {
+        throw new Error(
+            `recurrence dedup scan failed (cannot determine merge target; fail-closed): ${e && e.message ? e.message : e}`,
+        );
+    }
+
+    const bin = resolveHarnessBinary();
+    let raw;
+    try {
+        raw = execFileSync(
+            bin,
+            ["recurrence", "dedup"],
+            {
+                input: JSON.stringify({
+                    incoming: {
+                        task_id: incomingCard.task_id,
+                        recurrence: incomingCard.recurrence,
+                    },
+                    existing: existingCards,
+                }),
+                encoding: "utf8",
+                timeout: 10000,
+                stdio: ["pipe", "pipe", "ignore"],
+            },
+        );
+    } catch (e) {
+        throw new Error(
+            `recurrence dedup bridge failed — binary unavailable or timed out (cannot determine merge target; fail-closed): ${e && e.message ? e.message : e}`,
+        );
+    }
+
+    let decision;
+    try {
+        decision = JSON.parse(raw);
+    } catch (e) {
+        throw new Error(
+            `recurrence dedup bridge returned malformed JSON (fail-closed): ${e && e.message ? e.message : e}`,
+        );
+    }
+
+    if (decision && decision.action === "new_card") {
+        return decision; // valid: bridge ran successfully, no match
+    }
+    if (
+        decision &&
+        decision.action === "merge" &&
+        decision.merged &&
+        typeof decision.merged === "object" &&
+        decision.canonical_task_id
+    ) {
+        return decision; // valid: bridge ran successfully, match found
+    }
+    // Unknown action or structurally incomplete merge decision.
+    throw new Error(
+        `recurrence dedup bridge returned unexpected response (fail-closed): ${raw.slice(0, 200)}`,
+    );
+}
+
+// normalizeRecurrenceBlockForWrite validates an incoming recurrence block
+// against the task-card schema contract (task-card.schema.json:304-395)
+// BEFORE it reaches the persisted record. The schema requires:
+//   - string recurrence_id (minLength 1) — NO type coercion
+//   - string symptom_class_id (^recurrence.v1/.+$)
+//   - integer recurrence_count >= 0, last_acknowledged_count >= 0
+//   - ack-pair invariant recurrence_count >= last_acknowledged_count
+//   - additionalProperties:false at block, evidence[], and aliases[] levels
+//
+// This is WRITE-BOUNDARY validation (producer convenience), NOT gate-wired
+// schema enforcement (defer-018, Slice 5). It prevents a caller from
+// persisting a malformed recurrence block that would violate the schema.
+// On success, returns a FRESHLY-CONSTRUCTED conforming object (only known
+// properties, so no unexpected keys leak to disk). On failure, throws an
+// Error listing every validation problem.
+//
+// @param {object} recurrence
+// @returns {object} a schema-conforming recurrence block
+// @throws {Error} if the block violates the schema contract
+function normalizeRecurrenceBlockForWrite(recurrence) {
+    if (
+        typeof recurrence !== "object" ||
+        recurrence === null ||
+        Array.isArray(recurrence)
+    ) {
+        throw new Error("recurrence must be an object");
+    }
+    const problems = [];
+
+    // --- Top-level type checks (strict — no String() coercion) ---
+    if (
+        typeof recurrence.recurrence_id !== "string" ||
+        recurrence.recurrence_id.trim() === ""
+    ) {
+        problems.push(
+            "recurrence_id must be a non-empty string.",
+        );
+    }
+    if (
+        typeof recurrence.symptom_class_id !== "string" ||
+        !/^recurrence\.v1\/.+$/.test(recurrence.symptom_class_id)
+    ) {
+        problems.push(
+            "symptom_class_id must be a string matching ^recurrence.v1/<class>.",
+        );
+    }
+    if (
+        !Number.isInteger(recurrence.recurrence_count) ||
+        recurrence.recurrence_count < 0
+    ) {
+        problems.push("recurrence_count must be a non-negative integer.");
+    }
+    if (
+        !Number.isInteger(recurrence.last_acknowledged_count) ||
+        recurrence.last_acknowledged_count < 0
+    ) {
+        problems.push(
+            "last_acknowledged_count must be a non-negative integer.",
+        );
+    }
+    if (
+        Number.isInteger(recurrence.recurrence_count) &&
+        Number.isInteger(recurrence.last_acknowledged_count) &&
+        recurrence.recurrence_count < recurrence.last_acknowledged_count
+    ) {
+        problems.push(
+            "ack-pair invariant violated: recurrence_count < last_acknowledged_count.",
+        );
+    }
+
+    // --- Top-level additionalProperties: false ---
+    const BLOCK_ALLOWED = new Set([
+        "recurrence_id",
+        "symptom_class_id",
+        "recurrence_count",
+        "last_acknowledged_count",
+        "evidence",
+        "aliases",
+    ]);
+    for (const key of Object.keys(recurrence)) {
+        if (!BLOCK_ALLOWED.has(key))
+            problems.push(
+                `unknown property "${key}" (additionalProperties: false).`,
+            );
+    }
+
+    // --- evidence[] items (additionalProperties: false on each item) ---
+    const EVIDENCE_ALLOWED = new Set([
+        "kind",
+        "ref",
+        "note",
+        "capability",
+        "outcome",
+        "commit_subject",
+        "commit_range",
+    ]);
+    if (recurrence.evidence !== undefined) {
+        if (!Array.isArray(recurrence.evidence)) {
+            problems.push("evidence must be an array.");
+        } else {
+            recurrence.evidence.forEach((e, i) => {
+                if (
+                    typeof e !== "object" ||
+                    e === null ||
+                    Array.isArray(e)
+                ) {
+                    problems.push(`evidence[${i}] must be an object.`);
+                    return;
+                }
+                if (typeof e.kind !== "string" || e.kind.trim() === "")
+                    problems.push(
+                        `evidence[${i}].kind must be a non-empty string.`,
+                    );
+                if (typeof e.ref !== "string" || e.ref.trim() === "")
+                    problems.push(
+                        `evidence[${i}].ref must be a non-empty string.`,
+                    );
+                for (const opt of [
+                    "note",
+                    "capability",
+                    "outcome",
+                    "commit_subject",
+                    "commit_range",
+                ]) {
+                    if (e[opt] !== undefined && typeof e[opt] !== "string")
+                        problems.push(
+                            `evidence[${i}].${opt} must be a string if present.`,
+                        );
+                }
+                for (const key of Object.keys(e)) {
+                    if (!EVIDENCE_ALLOWED.has(key))
+                        problems.push(
+                            `evidence[${i}] unknown property "${key}" (additionalProperties: false).`,
+                        );
+                }
+            });
+        }
+    }
+
+    // --- aliases[] items (additionalProperties: false on each item) ---
+    const ALIAS_ALLOWED = new Set(["recurrence_id", "superseded", "note"]);
+    if (recurrence.aliases !== undefined) {
+        if (!Array.isArray(recurrence.aliases)) {
+            problems.push("aliases must be an array.");
+        } else {
+            recurrence.aliases.forEach((a, i) => {
+                if (
+                    typeof a !== "object" ||
+                    a === null ||
+                    Array.isArray(a)
+                ) {
+                    problems.push(`aliases[${i}] must be an object.`);
+                    return;
+                }
+                if (
+                    typeof a.recurrence_id !== "string" ||
+                    a.recurrence_id.trim() === ""
+                )
+                    problems.push(
+                        `aliases[${i}].recurrence_id must be a non-empty string.`,
+                    );
+                if (
+                    a.superseded !== undefined &&
+                    typeof a.superseded !== "boolean"
+                )
+                    problems.push(
+                        `aliases[${i}].superseded must be a boolean if present.`,
+                    );
+                if (a.note !== undefined && typeof a.note !== "string")
+                    problems.push(
+                        `aliases[${i}].note must be a string if present.`,
+                    );
+                for (const key of Object.keys(a)) {
+                    if (!ALIAS_ALLOWED.has(key))
+                        problems.push(
+                            `aliases[${i}] unknown property "${key}" (additionalProperties: false).`,
+                        );
+                }
+            });
+        }
+    }
+
+    if (problems.length) {
+        throw new Error(
+            `recurrence validation failed: ${problems.length} problem(s):\n${problems.map((p, i) => `${i + 1}. ${p}`).join("\n")}`,
+        );
+    }
+
+    // Return a FRESHLY-CONSTRUCTED conforming object so no unexpected
+    // properties from the input leak to the persisted record.
+    const out = {
+        recurrence_id: recurrence.recurrence_id,
+        symptom_class_id: recurrence.symptom_class_id,
+        recurrence_count: recurrence.recurrence_count,
+        last_acknowledged_count: recurrence.last_acknowledged_count,
+    };
+    if (recurrence.evidence !== undefined) {
+        out.evidence = recurrence.evidence.map((e) => {
+            const eo = { kind: e.kind, ref: e.ref };
+            for (const opt of [
+                "note",
+                "capability",
+                "outcome",
+                "commit_subject",
+                "commit_range",
+            ]) {
+                if (e[opt] !== undefined) eo[opt] = e[opt];
+            }
+            return eo;
+        });
+    }
+    if (recurrence.aliases !== undefined) {
+        out.aliases = recurrence.aliases.map((a) => {
+            const ao = { recurrence_id: a.recurrence_id };
+            if (a.superseded !== undefined) ao.superseded = a.superseded;
+            if (a.note !== undefined) ao.note = a.note;
+            return ao;
+        });
+    }
+    return out;
+}
+
 function saveCoordinationTask(sessionID, taskPayload, options = {}) {
     const actor = coordinationActorContext(sessionID, options);
     const input = taskPayload && typeof taskPayload === "object" ? taskPayload : {};
@@ -3816,11 +4502,177 @@ function saveCoordinationTask(sessionID, taskPayload, options = {}) {
             ? String(input.next_action || "").trim()
             : null;
     const explicitTaskID = String(input.task_id || "").trim();
-    const taskID = explicitTaskID
+    const requestedTaskID = explicitTaskID
         ? normalizeCoordinationTaskId(explicitTaskID)
         : generateCoordinationTaskId(input.title || "task");
+
+    // --- Write-boundary recurrence validation ---
+    // Validate the recurrence block BEFORE any dedup processing so no durable
+    // card carries an invalid acknowledgement pair (schema contract:
+    // task-card.schema.json:304-395). This is producer convenience, NOT
+    // gate-wired schema enforcement (defer-018, Slice 5). A recurrence block
+    // that is undefined or null passes through unchanged (legacy / remove).
+    let validatedRecurrence = input.recurrence;
+    if (input.recurrence !== undefined && input.recurrence !== null) {
+        validatedRecurrence = normalizeRecurrenceBlockForWrite(input.recurrence);
+    }
+
+    // --- Recurrence dedup (P1-MEMORY-001 Slice 3, WRITE-LAYER crux) ---
+    // If the incoming card carries a recurrence block, consult the Go
+    // derivation to decide whether it is a repeat of a known canonical (merge
+    // → update the canonical instead of spawning) or a new defect (new_card →
+    // write fresh). On merge, the write is redirected to the canonical task_id
+    // so NO new card is spawned; the canonical's recurrence block is updated
+    // with the merged block (count bumped, observation appended, ack held →
+    // unacknowledged). The producer APPLIES this convenience; the release gate
+    // (Slice 5) is the transition authority.
+    let dedup = null;
+    let taskID = requestedTaskID;
+    if (
+        validatedRecurrence &&
+        typeof validatedRecurrence === "object" &&
+        String(validatedRecurrence.recurrence_id || "").trim()
+    ) {
+        dedup = resolveRecurrenceDedup({
+            task_id: requestedTaskID,
+            recurrence: validatedRecurrence,
+        });
+        if (dedup.action === "merge" && dedup.canonical_task_id) {
+            taskID = dedup.canonical_task_id; // redirect to canonical
+        }
+    }
+    const isMerge = Boolean(dedup && dedup.action === "merge" && dedup.canonical_task_id);
+
     const existing = loadCoordinationTask(taskID, { required: false });
     const created = !existing.exists;
+
+    // MERGE PATH (recurrence repeat): update the canonical's recurrence block
+    // + append a recurrence_merged history event. The canonical's
+    // non-recurrence fields (title, status, scope, …) are AUTHORITY — the
+    // repeat's identity folds in ONLY via the merged recurrence block
+    // (count bumped, observation appended, ack held → unacknowledged). No
+    // new card is spawned; the incoming requestedTaskID is intentionally
+    // NOT persisted as a separate card.
+    //
+    // TOCTOU guard: the dedup decision (which canonical) is stable, but the
+    // merged block's recurrence_count was computed from a scan OUTSIDE the
+    // per-card lock. If a concurrent save bumped the canonical's count between
+    // the scan and lock acquisition, re-resolve from the lock-time state
+    // inside the callback. This narrows (does not eliminate) the race window;
+    // full concurrency integrity is the Slice 5 release-gate authority (the
+    // producer is convenience, not authority — see DEFER card
+    // defer-recurrence-toctou-race).
+    if (isMerge) {
+        // --- TEST-ONLY pre-lock interleaving seam (TOCTOU guard exercise) ---
+        // The dedup decision (which canonical) and the merged block were
+        // computed from a scan OUTSIDE the per-card lock acquired inside
+        // updateCoordinationTask below — the TOCTOU window this producer's
+        // lock-time re-resolve guard narrows. This optional, per-call,
+        // synchronous callback fires exactly once at the after-decision /
+        // before-lock boundary so a verifier can mutate the canonical via
+        // the real producer (saveCoordinationTask) and exercise the
+        // lock-time re-resolve → throw wiring deterministically.
+        //
+        // Containment contract (enforced by construction):
+        //  - per-call: passed via the options arg only; NOT an env var.
+        //  - inert by default: every production + existing-test caller omits it.
+        //  - synchronous, invoked at most once (single merge path, single call).
+        //  - NOT propagated: the merge path calls updateCoordinationTask
+        //    (lock+persist), never saveCoordinationTask; the only nested
+        //    saveCoordinationTask is one the callback itself issues, and the
+        //    caller controls whether to pass this option there.
+        //  - CANNOT override the dedup result, suppress locking, authorize
+        //    persistence, or override a thrown guard: the callback only
+        //    provides the interleaving opportunity; the re-resolve guard
+        //    below remains the sole authority and may still throw.
+        if (typeof options._testPreLockInterleave === "function") {
+            options._testPreLockInterleave({
+                canonical_task_id: dedup.canonical_task_id,
+                requested_task_id: requestedTaskID,
+            });
+        }
+        const mergedSaved = updateCoordinationTask(taskID, (current) => {
+            let mergedBlock = dedup.merged;
+            const currentBlock = current.recurrence;
+            if (
+                currentBlock &&
+                mergedBlock &&
+                currentBlock.recurrence_count !==
+                    mergedBlock.recurrence_count - 1
+            ) {
+                // Stale scan: a concurrent save bumped the canonical's count
+                // OR changed which card is canonical. Re-resolve from the
+                // lock-time state so the count and observations reflect all
+                // prior merges. The re-resolve must confirm BOTH a merge AND
+                // the same canonical we hold the lock on — if a concurrent
+                // writer established a different card as the new canonical,
+                // adopting its merged block here would persist a foreign
+                // identity into the locked card (identity/history corruption).
+                const reDecision = resolveRecurrenceDedup({
+                    task_id: requestedTaskID,
+                    recurrence: validatedRecurrence,
+                });
+                if (
+                    reDecision.action === "merge" &&
+                    reDecision.merged &&
+                    reDecision.canonical_task_id === taskID
+                ) {
+                    mergedBlock = reDecision.merged;
+                } else {
+                    // Re-resolution did not confirm a merge for THIS canonical.
+                    // This can happen when the bridge fails-open (action=
+                    // new_card on binary timeout/error), when a genuine state
+                    // change means the incoming is no longer a repeat, or when
+                    // a concurrent writer established a DIFFERENT card as the
+                    // new canonical. ABORT the write instead of persisting the
+                    // stale pre-lock mergedBlock, which could overwrite a
+                    // concurrent merge and silently lose an observation or
+                    // corrupt recurrence identity. atomicWriteJson is never
+                    // reached because the callback throws before returning.
+                    // The caller can retry the operation.
+                    throw new Error(
+                        "recurrence merge aborted: lock-time re-resolution could not confirm merge " +
+                        "for the locked canonical (possible concurrent write, canonical-identity change, " +
+                        "or bridge failure); retry the operation.",
+                    );
+                }
+            }
+            return {
+                ...current,
+                recurrence: mergedBlock,
+                history: [
+                    ...(current.history || []),
+                    {
+                        at: isoZ(),
+                        event: "recurrence_merged",
+                        session_name: actor.session_name,
+                        status: current.status,
+                        note:
+                            `Recurrence repeat merged into canonical from incoming ${requestedTaskID} ` +
+                            `(count ${mergedBlock.recurrence_count}, disposition now unacknowledged: count > ack).`,
+                    },
+                ],
+            };
+        });
+        const mergedOverlaps = detectCoordinationTaskOverlaps(
+            mergedSaved.task_id,
+            mergedSaved.files_in_scope,
+        );
+        return {
+            ...actor,
+            created: false,
+            merged_into: dedup.canonical_task_id,
+            path: relativeToRepo(coordinationTaskPath(mergedSaved.task_id)),
+            task: mergedSaved,
+            summary: summarizeCoordinationTask(mergedSaved),
+            overlaps: mergedOverlaps,
+            ...recommendedCoordinationTaskFields(
+                mergedSaved,
+                actor.session_name || null,
+            ),
+        };
+    }
+
     const saved = updateCoordinationTask(taskID, (current) => {
         // Collect every validation problem in this callback before throwing.
         // We never want to partially mutate `next` and then throw, so we
@@ -3966,6 +4818,10 @@ function saveCoordinationTask(sessionID, taskPayload, options = {}) {
                 input.owner_notes !== undefined
                     ? normalizeStringList(input.owner_notes)
                     : current.owner_notes,
+            recurrence:
+                validatedRecurrence !== undefined
+                    ? validatedRecurrence
+                    : current.recurrence,
             status: nextStatus,
             next_action:
                 explicitNextAction !== null
@@ -4008,13 +4864,18 @@ function saveCoordinationTask(sessionID, taskPayload, options = {}) {
             }),
         );
         throwCollectedErrors(errors);
+        // null recurrence = explicit removal: delete the property entirely
+        // so the persisted card does not carry a schema-invalid
+        // `recurrence: null` (the schema requires type:object; nullable
+        // fields elsewhere use [type,null] — recurrence does not).
+        if (validatedRecurrence === null) {
+            delete next.recurrence;
+        }
         return next;
     });
-    const overlapSkippedCards = [];
     const overlaps = detectCoordinationTaskOverlaps(
         saved.task_id,
         saved.files_in_scope,
-        { collectSkipped: overlapSkippedCards },
     );
     return {
         ...actor,
@@ -4023,7 +4884,6 @@ function saveCoordinationTask(sessionID, taskPayload, options = {}) {
         task: saved,
         summary: summarizeCoordinationTask(saved),
         overlaps,
-        skipped_cards: overlapSkippedCards,
         ...recommendedCoordinationTaskFields(saved, actor.session_name || null),
     };
 }
@@ -4043,23 +4903,38 @@ function readCoordinationTask(sessionID, taskIDRaw, options = {}) {
               includeBody: Boolean(options.includeBody),
           })
         : null;
-    const overlapSkippedCards = [];
+    const degraded = Boolean(loaded.diagnostics && loaded.diagnostics.degraded);
+    // Map internal diagnostics to public-facing field names so the
+    // single-card read is consistent with the quarantine entries in
+    // listCoordinationTasks (offending_fields, problems — snake_case).
+    const diagnostics = loaded.diagnostics
+        ? {
+              degraded: loaded.diagnostics.degraded,
+              offending_fields: [...loaded.diagnostics.offendingFields],
+              problems: [...loaded.diagnostics.problems],
+          }
+        : {
+              degraded: false,
+              offending_fields: [],
+              problems: [],
+          };
     return {
         ...actor,
         path: relativeToRepo(loaded.path),
         task: loaded.payload,
         summary: summarizeCoordinationTask(loaded.payload),
+        degraded,
+        diagnostics,
         latest_report: latestReport,
         last_review: lastReview,
         overlaps: detectCoordinationTaskOverlaps(
             loaded.payload.task_id,
             loaded.payload.files_in_scope,
-            { collectSkipped: overlapSkippedCards },
         ),
-        skipped_cards: overlapSkippedCards,
         ...recommendedCoordinationTaskFields(
             loaded.payload,
             actor.session_name || null,
+            { degraded },
         ),
     };
 }
@@ -4073,28 +4948,95 @@ function listCoordinationTasks(sessionID, options = {}) {
             "task_statuses",
         ),
     );
-    const skipped_cards = [];
-    const tasks = listCoordinationTaskCards({
-        collectSkipped: skipped_cards,
-    }).filter((task) =>
-        statuses.length ? statuses.includes(task.status) : true,
-    );
+    // Scan preserves per-card degradation diagnostics. The public response
+    // keeps degraded cards in `tasks` (compat — no data disappears) while
+    // also surfacing them in `quarantine` and excluding them from the
+    // `healthy_*` counts. The status filter applies to the NORMALIZED status
+    // (a degraded status coerces to "draft"), matching the pre-slice filter
+    // semantics; the safeguard against acting on a degraded card is the
+    // action-boundary refusal in readyCoordinationTask plus the degraded flag
+    // on the task representation, not omission from the list.
+    //
+    // Syntax-invalid (unparseable) files carry no task object — they are
+    // excluded from the status filter (there is no status to match), from
+    // `tasks`, and from every count, but they ARE surfaced in `quarantine[]`
+    // with error_type:"syntax" so a single corrupt `.json` no longer bricks
+    // the scan AND is still reported. The status filter intentionally does
+    // NOT gate syntax entries: a corrupt file is a problem regardless of any
+    // requested status subset.
+    const scanned = scanCoordinationTaskCards();
+    const syntaxEntries = scanned.filter((entry) => entry.syntaxError);
+    const filteredScanned = scanned.filter((entry) => {
+        if (!entry.task) {
+            return false;
+        }
+        return statuses.length ? statuses.includes(entry.task.status) : true;
+    });
+    const tasks = filteredScanned.map((entry) => entry.task);
     const counts = {};
     for (const task of tasks) {
         counts[task.status] = (counts[task.status] || 0) + 1;
     }
+    // Healthy (non-degraded) projection for the additive counts. Degraded
+    // cards are excluded so a dashboard reading healthy_status_counts cannot
+    // mistake a coerced-to-draft degraded card for a genuine draft.
+    const healthyTasks = filteredScanned
+        .filter((entry) => !entry.degraded)
+        .map((entry) => entry.task);
+    const healthyCounts = {};
+    for (const task of healthyTasks) {
+        healthyCounts[task.status] = (healthyCounts[task.status] || 0) + 1;
+    }
+    // Semantic quarantine: degraded-but-parseable cards (bad stored enum or
+    // missing core field). Unchanged from the report-and-continue contract —
+    // each carries offending_fields from the normalized task's diagnostics.
+    const semanticQuarantine = filteredScanned
+        .filter((entry) => entry.degraded)
+        .map((entry) => ({
+            // card_id comes from the parsed card when the task_id is
+            // trustworthy (it always is here — the id is derived from the
+            // filename, not from the possibly-corrupt card body); fall back
+            // to the filename stem otherwise. Both equal entry.taskID today.
+            card_id: entry.task.task_id || entry.taskID,
+            path: entry.path,
+            error_type: "semantic",
+            offending_fields: [...entry.diagnostics.offendingFields],
+            problems: [...entry.diagnostics.problems],
+        }));
+    // Syntax quarantine: unparseable files. No normalized task exists, so
+    // there is no card_id recoverable from the body and no offending_fields
+    // to report — the filename stem is the only stable key and the parse
+    // error message is the only diagnostic. error_type:"syntax" lets a
+    // consumer render these differently from semantic-degraded cards.
+    const syntaxQuarantine = syntaxEntries.map((entry) => ({
+        card_id: entry.taskID,
+        path: entry.path,
+        error_type: "syntax",
+        offending_fields: [],
+        problems: [...entry.problems],
+    }));
+    const quarantine = [...semanticQuarantine, ...syntaxQuarantine];
     return {
         ...actor,
+        // Existing counts are UNCHANGED (compat): they cover every card that
+        // passed the status filter, degraded or not.
         total: tasks.length,
         status_counts: counts,
-        skipped_cards,
-        tasks: tasks.map((task) => ({
-            ...summarizeCoordinationTask(task),
-            ...recommendedCoordinationTaskFields(
-                task,
-                actor.session_name || null,
-            ),
+        tasks: filteredScanned.map((entry) => ({
+            ...summarizeCoordinationTask(entry.task),
+            degraded: entry.degraded,
+            ...recommendedCoordinationTaskFields(entry.task, actor.session_name || null, {
+                degraded: entry.degraded,
+            }),
         })),
+        // Additive quarantine fields (new). Consumers that never read them
+        // behave exactly as before; consumers that want a trusted projection
+        // read healthy_total / healthy_status_counts instead of total /
+        // status_counts.
+        quarantine,
+        degraded_count: quarantine.length,
+        healthy_total: healthyTasks.length,
+        healthy_status_counts: healthyCounts,
     };
 }
 
@@ -4272,6 +5214,30 @@ function computeTaskDesignDigest(currentPayload, incomingChanges) {
 function readyCoordinationTask(sessionID, taskIDRaw, input = {}, options = {}) {
     const actor = coordinationActorContext(sessionID, options);
     const loaded = loadCoordinationTask(taskIDRaw);
+    // ACTION BOUNDARY (load-bearing). A degraded card has at least one stored
+    // field that failed read-path validation — most dangerously a stored
+    // status that normalized to "draft" only because the original value was
+    // invalid and coerced. Letting such a card through to the status guard
+    // below would let it pass (coerced status === "draft") and promote a
+    // malformed card to "ready", reproducing the exact hazard this slice
+    // exists to close. Refuse BEFORE the status guard, regardless of the
+    // coerced status, so direct-API promotion is blocked even if a caller
+    // never reads listCoordinationTasks() guidance. The soft guidance layer
+    // (coordinationTaskRecommendation with {degraded}) keeps the coordinator
+    // from proposing the transition; this hard gate keeps every other caller
+    // honest.
+    if (loaded.diagnostics && loaded.diagnostics.degraded) {
+        const fields = loaded.diagnostics.offendingFields.length
+            ? loaded.diagnostics.offendingFields.join(", ")
+            : "(unspecified)";
+        throw new StateError(
+            `Task ${loaded.payload.task_id} is degraded ` +
+                `(offending fields: ${fields}) and cannot be prepared for ` +
+                `execution. Inspect or repair the stored card first; a ` +
+                `degraded card is refused at the action boundary regardless ` +
+                `of its normalized status.`,
+        );
+    }
     if (!["draft", "ready"].includes(loaded.payload.status)) {
         throw new StateError(
             `Task ${loaded.payload.task_id} is ${loaded.payload.status} and cannot be prepared for execution.`,
@@ -4690,16 +5656,185 @@ function updateCoordinationTaskMetadata(
     };
 }
 
+// Degraded-core repair branch of repairCoordinationTask. Restores the CURRENT
+// core-offender subset (offendingFields ∩ DEGRADED_CORE_REPAIRABLE_FIELD_NAMES)
+// on a degraded card in one atomic request — restore-only, never an edit of
+// non-offending fields. Dispatched STRICTLY on diagnostics.degraded === true
+// (a healthy card never reaches here), so the task_type/status carve-out does
+// not weaken healthy-card immutability — which the ordinary update allowlist
+// (TASK_METADATA_UPDATE_*_FIELD_NAMES, never including task_type/status)
+// enforces elsewhere. Repair routes through updateCoordinationTask (the
+// canonical writer), which re-runs collectCoordinationTaskCoreFieldErrors +
+// throws BEFORE atomicWriteJson, so a partial/invalid repair never lands.
+function repairDegradedCoordinationTaskCoreFields(actor, loaded, payload) {
+    const offendingFields = loaded.diagnostics
+        ? [...loaded.diagnostics.offendingFields]
+        : [];
+    const errors = [];
+    const enumInvalidFields = new Set();
+    // RESTORE-ONLY: a degraded-card repair may touch ONLY fields that are
+    // currently offending. The allowed payload set is the intersection of the
+    // core-offender field set and THIS card's offendingFields — NOT the full
+    // repairable set. This closes a transition-guard bypass: if status were
+    // accepted on a card degraded by a NON-status corruption (e.g. title), the
+    // repair could move a healthy status to a terminal value (completed) via
+    // updateCoordinationTask, which re-runs only enum-validity
+    // (collectCoordinationTaskCoreFieldErrors), never the lifecycle transition
+    // legality guard (coordinationTaskStatusTransitionErrors, enforced only on
+    // the save path). Restricting to offenders keeps the carve-out a pure
+    // "restore corrupted fields" exit; legitimate status recovery (where status
+    // itself is the corrupted offender) remains allowed.
+    const repairableOffenders = offendingFields.filter((field) =>
+        DEGRADED_CORE_REPAIRABLE_FIELD_NAMES.includes(field),
+    );
+    errors.push(
+        ...unexpectedCoordinationTaskPayloadFieldsErrors(
+            payload,
+            repairableOffenders,
+            "degraded task repair",
+        ),
+    );
+    const providedRepairFields = Object.keys(payload).filter((key) =>
+        repairableOffenders.includes(key),
+    );
+    // Residual risk #1: the repair must cover EVERY offending field this
+    // branch can repair (the core enum/identity offenders). Status-conditional
+    // offenders (rough_scope/open_questions/ready_criteria when status coerces
+    // to "draft"; active_session_alias/claimed_at for "working") VANISH once
+    // status is corrected; list-field offenders (files_in_scope etc.) are
+    // outside this branch (caught by the canonical save-path throw as
+    // backstop). So the partial-repair check considers only repairable
+    // offenders uncovered by the payload — keeping the save-path throw a
+    // backstop, not the primary diagnostic.
+    const uncoveredFields = repairableOffenders.filter(
+        (field) => !providedRepairFields.includes(field),
+    );
+    if (uncoveredFields.length) {
+        errors.push(
+            `Task ${loaded.payload.task_id} is degraded (repairable offending fields: ${repairableOffenders.join(", ")}). Provide a repair value for every repairable offending field; still missing: ${uncoveredFields.join(", ")}.`,
+        );
+    }
+    // Pre-normalize provided enum values so a bogus replacement yields a
+    // precise error BEFORE the canonical writer takes the lock.
+    const repairedTaskType =
+        payload.task_type !== undefined
+            ? normalizeCoordinationEnumCollected(
+                  payload.task_type,
+                  COORDINATION_TASK_TYPES,
+                  "task_type",
+                  errors,
+                  enumInvalidFields,
+              )
+            : null;
+    const repairedStatus =
+        payload.status !== undefined
+            ? normalizeCoordinationEnumCollected(
+                  payload.status,
+                  COORDINATION_TASK_STATUSES,
+                  "status",
+                  errors,
+                  enumInvalidFields,
+              )
+            : null;
+    const repairedCoordinationMode =
+        payload.coordination_mode !== undefined
+            ? normalizeCoordinationEnumCollected(
+                  payload.coordination_mode,
+                  COORDINATION_MODES,
+                  "coordination_mode",
+                  errors,
+                  enumInvalidFields,
+              )
+            : null;
+    const repairedReportEnvelope =
+        payload.report_envelope !== undefined
+            ? normalizeCoordinationEnumCollected(
+                  payload.report_envelope,
+                  COORDINATION_REPORT_ENVELOPES,
+                  "report_envelope",
+                  errors,
+                  enumInvalidFields,
+              )
+            : null;
+    const repairedTitle =
+        payload.title !== undefined
+            ? String(payload.title || "").trim()
+            : null;
+    const repairedPrimaryLane =
+        payload.primary_lane !== undefined
+            ? String(payload.primary_lane || "").trim()
+            : null;
+    throwCollectedErrors(errors);
+
+    // Fields actually written by this repair. With restore-only,
+    // providedRepairFields == repairableOffenders (the partial-repair check
+    // above guarantees every repairable offender is covered, and the
+    // unexpected-field check forbids any non-offender). Scope the history note
+    // and return value to these, not the full offending set (which may also
+    // carry status-conditional / list-field offenders this branch never wrote).
+    const repairedFields = uniqueStrings(providedRepairFields);
+    const saved = updateCoordinationTask(loaded.payload.task_id, (current) => ({
+        ...current,
+        task_type:
+            repairedTaskType !== null ? repairedTaskType : current.task_type,
+        status: repairedStatus !== null ? repairedStatus : current.status,
+        coordination_mode:
+            repairedCoordinationMode !== null
+                ? repairedCoordinationMode
+                : current.coordination_mode,
+        report_envelope:
+            repairedReportEnvelope !== null
+                ? repairedReportEnvelope
+                : current.report_envelope,
+        title: repairedTitle !== null ? repairedTitle : current.title,
+        primary_lane:
+            repairedPrimaryLane !== null
+                ? repairedPrimaryLane
+                : current.primary_lane,
+        history: [
+            ...(current.history || []),
+            {
+                at: isoZ(),
+                event: "task_repaired",
+                session_name: actor.session_name,
+                status: current.status,
+                note: `Repaired degraded core fields (${repairedFields.join(", ")}).`,
+            },
+        ],
+    }));
+    return {
+        ...actor,
+        path: relativeToRepo(coordinationTaskPath(saved.task_id)),
+        task: saved,
+        summary: summarizeCoordinationTask(saved),
+        repaired_fields: repairedFields,
+        ...recommendedCoordinationTaskFields(saved, actor.session_name || null),
+    };
+}
+
 function repairCoordinationTask(sessionID, taskIDRaw, input = {}, options = {}) {
     const actor = coordinationActorContext(sessionID, options);
     const loaded = loadCoordinationTask(taskIDRaw);
+    const payload = input && typeof input === "object" ? input : {};
+
+    // DISPATCH: a DEGRADED card (diagnostics.degraded === true — authoritative,
+    // recorded pre-coercion by normalizeCoordinationTaskRecordWithDiagnostics)
+    // takes the degraded-core repair branch, which can restore the core
+    // enum/identity fields that the ordinary update allowlist never exposes. A
+    // HEALTHY research card whose contract is missing-but-tolerated
+    // (allowLegacyIncompleteResearch) is NOT degraded and falls through to the
+    // preserved research-contract repair branch below.
+    if (loaded.diagnostics && loaded.diagnostics.degraded === true) {
+        return repairDegradedCoordinationTaskCoreFields(actor, loaded, payload);
+    }
+
+    // Research-contract repair branch (preserved).
     const errors = [];
     if (loaded.payload.task_type !== "research") {
         errors.push(
             `Task ${loaded.payload.task_id} is ${loaded.payload.task_type} and does not use the research repair flow.`,
         );
     }
-    const payload = input && typeof input === "object" ? input : {};
     const missingResearchFields = missingResearchContractFields(loaded.payload);
     if (loaded.payload.task_type === "research") {
         if (!missingResearchFields.length) {

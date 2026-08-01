@@ -140,6 +140,8 @@ The canonical field names + closed vocabularies are exported from
   INFORM the design context F3 consumes; they cannot satisfy or override the F3
   gate. Do not offer an F1/F2 artifact as a substitute for the F3 envelope.
 
+
+
 ## Default output
 
 When closing a slice, return:

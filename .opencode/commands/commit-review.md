@@ -66,7 +66,7 @@ Inspect:
 !`git diff --cached --stat`
 !`git diff --cached -- . ':(exclude)package-lock.json'`
 
-Note: The diff expansion above is for the orchestrator's own reference to understand the change scope. The orchestrator must NOT inline the expanded diff into leaf task parameters — pass the tree_hash instead so leaves can read the diff via `git diff HEAD <tree_hash>`.
+Note: The diff expansion above is for the orchestrator's own reference to understand the change scope. The orchestrator must NOT inline the expanded diff into leaf task parameters — pass the tree_hash AND the `head_at_acquire` anchor (forwarded from the commit-gate acquire output) so leaves can read the diff via `git diff <head_at_acquire> <tree_hash>`, anchored on the acquire-time HEAD (NOT bare `HEAD` — review is lock-free and bare `HEAD` can move under a concurrent committer).
 
 ## Review rules (forwarded to leaves)
 

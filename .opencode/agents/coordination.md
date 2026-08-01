@@ -82,6 +82,8 @@ Remain read-only. At most ONE leaf delegation for routing or handoff shaping.
 Do not broaden into implementation or accumulate perception detail.
 
 
+
+
 ## Command hygiene to avoid permission prompts
 
 > **RESTART-GATED:** This subsection takes effect on the next OpenCode restart. Apply the rules consciously even if your loaded copy predates it.

@@ -79,7 +79,6 @@ add-an-agent / add-command / add-skill recipe and the overlay anatomy.
 - `vh-agent-harness docs opencode-memory-model` when shaping or changing agent-memory conventions, workstream memory, or local/private OpenCode state
 - `docs/coordination/README.md` when shaping cross-boundary ownership, handoffs, blocker rules, or prompt/closeout coordination
 - `docs/coordination/TASK_MODES.md` and `docs/coordination/RUNTIME_MODEL.md` when a task may span multiple sessions, several subagent reports, or a local coordination runtime
-- `researches/AGENTS.md` when creating or updating durable comparative research material, source packets, or option memos
 - the relevant `researches/decisions/` memo when rethinking the coordinator-session workflow, local task registry, or future external coordinator/runtime options
 - the relevant `researches/decisions/` memo when designing or implementing `/write-task`, `/task-ready`, `/task-update`, `/task-repair`, `/task-list`, `/task-open`, `/resume-task`, `/task-closeout`, or `/task-review`
 - the relevant `researches/decisions/` memo when designing or changing the repo's durable research workflow, source-packet conventions, long-running research setup, or `/research` entrypoint
@@ -347,12 +346,20 @@ candidates** (transport, not truth) and reach `backlog.md` only after a
 trigger fires AND the promoter applies the promotion Definition of Ready:
 
 - **Capture** a DEFER/follow-up via `/write-task` into
-  `.local/coordinator/tasks/` with Notes-prefix provenance:
+  `.local/coordinator/tasks/` **as `status: draft`** — do NOT let an
+  advisory candidate inherit the `ready` default. `draft` is a first-class create
+  status (`/write-task` accepts `status: draft|ready`) and is correct for
+  candidates whose trigger has not fired and that therefore lack the file scope +
+  validation plan `ready` requires; carry the Notes-prefix provenance:
   `source:review-defer` (or `source:p2-followup`), `trigger:path_touched(<path>)`
   (or another approved predicate), `studied:YYYY-MM-DD`.
 - **Holding area is transport, not truth.** Unpromoted candidates may be lost —
   this is intentionally fine, because they are not trusted work yet. Do not
-  create a parallel committed ledger for them.
+  create a parallel committed ledger for them. **Retiring a transport card is
+  `rm` of the gitignored file** (`.local/coordinator/tasks/<card>.json`):
+  this is the SANCTIONED retire path, not a workaround — there is no cancel/drop
+  command for these cards, and the file is gitignored transport (not committed
+  truth), so deleting it loses nothing durable.
 - **Fog vs ticket (triage test).** A finding is **ticket-ready** when you can
   state the question precisely now — even if blocked. A finding is **fog** when
   you cannot yet phrase it that sharply: in-scope, but not yet specifiable. Fog

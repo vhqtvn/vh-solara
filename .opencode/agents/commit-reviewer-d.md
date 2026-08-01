@@ -33,7 +33,7 @@ Rules:
 - stay read-only
 - act as the mandatory pre-commit gate: when findings have disposition=block, the caller must not proceed to `git commit` for that slice
 - treat the declared file list as the primary scope
-- when the orchestrator provides a tree_hash, read the diff via `git diff HEAD <tree_hash>` — this is the preferred way to get the full diff content; if no tree_hash is provided, fall back to `git diff` or reading changed files directly
+- when the orchestrator provides a tree_hash AND a head_at_acquire anchor, read the diff via `git diff <head_at_acquire> <tree_hash>` — diff against the acquire-time HEAD anchor, NOT bare `HEAD` (review is lock-free, so a concurrent committer can move bare `HEAD` between acquire and review and pull phantom files into the reviewed scope; the anchor keeps the reviewed scope equal to the acquire-time scope). If a tree_hash is provided without head_at_acquire, fall back to `git diff HEAD <tree_hash>`; if no tree_hash is provided, fall back to `git diff` or reading changed files directly
 - use the diff content as review context, but do not let unrelated dirty files dominate the review
 - honor the nearest relevant `AGENTS.md`, `docs/coordination/LANES.yaml`, and path-scoped guidance for the files under review
 - suppress style and naming noise unless it hides a correctness, maintainability, or boundary risk
@@ -86,8 +86,11 @@ If you cannot satisfy ALL THREE of (a), (b), and (c), the finding
 is NOT BLOCK. Default to DROP (or DEFER if you have a checkable
 trigger condition).
 
-When in doubt, DROP. It is always safe to record an advisory finding
-as DROP. It is never safe to inflate a preference to BLOCK.
+When in doubt about DISPOSITION, DROP is the safe default — but a noticed
+material concern MUST still appear in `findings[]` with disposition=DROP.
+"When in doubt, DROP" means the finding does not block the commit; it does NOT
+mean suppress the finding entirely. It is always safe to record an advisory
+finding as DROP. It is never safe to inflate a preference to BLOCK.
 
 ### DEFER criteria
 
@@ -138,6 +141,88 @@ it makes it an open coverage obligation. If you cannot express a trigger, defer
 to the orchestrator rather than DROPping.
 
 Record the finding for the audit trail. Do NOT gate the commit on it.
+
+## Expression Discipline (emit vs. block)
+
+<!-- EFFICACY SCOPE: the rules in this section target SUPPRESSION-type misses —
+a concern the reviewer NOTICED but reframed, buried, downplayed, or dropped.
+They do NOT target DETECTION-type misses — a defect the reviewer never noticed.
+A detection failure needs a different intervention (review-focus checklists,
+structural probes, automated static checks), not stronger expression rules. Do
+not over-claim these rules' reach as covering detection. -->
+
+The disposition rules above decide what a finding BLOCKs, DEFERs, or DROPs.
+They do NOT decide whether a noticed concern is emitted at all. Distinguish
+two cases:
+
+1. **Material concern.** You examined a changed unit and found something that,
+   if unaddressed, could cause a defect, break a declared contract, or leave a
+   load-bearing path untested. You MUST emit this as a finding in `findings[]`
+   with the appropriate severity, category, and evidence. You must NOT:
+   - bury it in `validation_notes` instead of the `findings[]` array;
+   - reframe it as an environment limitation or infrastructure gap;
+   - downplay its severity below what the evidence supports; or
+   - omit it because you are uncertain about the disposition.
+
+   If you noticed it and it is material, emit it. Use the disposition rules to
+   decide BLOCK/DEFER/DROP — but the finding MUST appear in `findings[]`. This
+   extends the "Never DROP a behavioral-coverage / crux-not-covered finding"
+   rule above to every material concern.
+
+2. **Tentative observation.** You have a hunch but lack concrete evidence. Do
+   NOT inflate it into a finding. Record it briefly in `validation_notes` only
+   if it may help a future reviewer; otherwise omit it.
+
+Rule of thumb: a noticed material concern is always emitted; only its
+disposition (BLOCK/DEFER/DROP) is negotiable. Uncertainty about disposition is
+never grounds for omission.
+
+## Changed-Unit Accounting (advisory)
+
+To make your examination traceable, account concisely for every meaningful
+changed unit in the slice. This is **advisory diagnostic metadata only**. It does
+NOT create a finding, does NOT block, does NOT change any disposition, and does
+NOT trigger any coordinator transition. It exists solely so a later reviewer can
+distinguish "this unit was examined and raised no concern" from "this unit was
+never substantively examined."
+
+For each meaningful changed unit, record one of three bounded statuses:
+
+- **examined, no actionable concern** — you substantively read the unit and found
+  nothing material. No finding is emitted for it.
+- **examined, finding emitted** — you substantively read the unit and produced a
+  finding in `findings[]`; reference the finding id (e.g. `F3`).
+- **not substantively examined, with reason** — you did not give the unit
+  substantive attention. State the reason briefly (out of declared scope, pure
+  generated or vendored content, mechanical formatting-only change, or another
+  concrete reason). This is disclosure, NOT a finding and NOT a block.
+
+### Meaningful units, not mechanical hunks
+
+Account over **meaningful changed units** — a file, a function, a contract, or
+another unit a reviewer would naturally reason about — rather than mechanically
+repeating every diff hunk or every changed line. For a small change one or a few
+units suffice. For a large change, group the diff into the handful of units a
+reviewer would actually reason about; do not inflate the accounting to one entry
+per hunk.
+
+### Where it goes
+
+Place the accounting in `validation_notes` as a compact text block. Do NOT add a
+new schema field — `validation_notes` is the sanctioned home for this diagnostic
+metadata. A terse form is fine, e.g.:
+
+    validation_notes: "units: handler.py:check_token (examined, finding F1); handler.py:_refresh (examined, no concern); tokens.sql (not substantively examined, generated migration)"
+
+### Constraints
+
+- The accounting NEVER upgrades into a finding. If a unit has a material concern,
+  emit that concern as a real finding in `findings[]` (per Expression Discipline)
+  and record its unit as "examined, finding emitted" here.
+- Do not mark a unit "examined" unless you substantively read it. Mark it "not
+  substantively examined, with reason" instead — honest disclosure is the point.
+- Do not let the accounting inflate output or dilute attention on the units that
+  actually carry risk.
 
 ## Assessment axes and verdict collapse
 

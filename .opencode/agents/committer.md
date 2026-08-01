@@ -102,14 +102,45 @@ It is the only agent that stages, commits, and manages session lifecycle on beha
      - Exact file list (from acquire output)
      - Primary lane (if known)
      - Staged tree hash
+     - The `head_at_acquire` anchor from the acquire output (forwarded VERBATIM).
+       This is the acquire-time HEAD the gate recorded and emitted in the acquire
+       JSON (`"head_at_acquire"`). The reviewer needs BOTH the tree_hash AND this
+       anchor so each leaf reads the reviewed diff via
+       `git diff <head_at_acquire> <tree_hash>` (anchored on the acquire-time
+       HEAD, NOT bare `HEAD`). Review is lock-free (the gate releases the lock
+       before Phase 2), so a concurrent committer can move bare `HEAD` between
+       acquire and review; diffing against bare `HEAD` would pull the concurrent
+       commit's files into the reviewed scope as phantom reverse-changes.
+       Anchoring on `head_at_acquire` keeps the reviewed scope equal to the
+       acquire-time scope (S1: approved-tree integrity under concurrency).
    - Wait for review result
 
 4. Decision: commit or release
 
    IF commit-reviewer returns APPROVED:
       → .opencode/scripts/commit-gate.sh commit --uuid "<UUID>" --tree-hash "<HASH>" --message-file tmp/commit-gate-message/msg-${UUID}
-     - On success: report commit hash to A
-     - On error: release lock, report error
+      - On success (status `committed`/`no_head_progress`): report the commit hash to A.
+      - On `rebased_refused` or `could_not_land`: the commit did NOT land. Do
+        NOT report success. The gate has already recorded the outcome to the
+        durable closeout ledger and the lock was released at acquire end
+        (review is lock-free), so there is nothing for the agent to release.
+        On these terminal-refusal paths the gate does NOT inline-reclaim the
+        per-session private index / `meta-${UUID}` / message scratch the way
+        the success path does — those orphans are reclaimed by aged-GC /
+        next-acquire stale-meta cleanup, exactly like `could_not_land`. Report
+        to A that a re-acquire + re-review is required (the branch advanced
+        under this session):
+          * `rebased_refused` (reason `reviewed_tree_diverged`): a concurrent
+            committer landed between acquire and commit, and the CAS 3-way
+            merge would have substituted a merged tree ≠ the reviewed tree.
+            The gate REFUSED (fail-closed) rather than commit a tree the
+            reviewer never saw (S2: approved-tree integrity under concurrency).
+          * `could_not_land` (reason `merge_failed`/`write_tree_failed`): the
+            same-file content tangle the CAS merge cannot reconcile.
+        In both cases the branch did not move on this session's behalf. A must
+        re-acquire against the new HEAD and re-review before retrying. Do not
+        retry from the stale acquire (its tree_hash is no longer landable).
+      - On other error: release lock, report error.
 
    IF commit-reviewer returns BLOCKED or SPLIT:
        → .opencode/scripts/commit-gate.sh release --uuid "<UUID>" --message-file tmp/commit-gate-message/msg-${UUID}

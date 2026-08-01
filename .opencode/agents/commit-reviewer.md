@@ -38,8 +38,12 @@ Follow this state machine exactly. Do NOT deviate or exercise independent judgme
           if not). The lightweight path is a leaf invocation, NOT a
           contract-free shortcut — it MUST use the same bound-session/null
           logic as normal tier leaves.
+        - Obtain and forward the selected leaf's `seat_routing` metadata per
+          the "Seat routing metadata (Lever E)" section below (or
+          `seat_routing: null` if the panel section is absent). The lightweight
+          path uses the SAME per-seat metadata logic as normal tier leaves.
         - Invoke ONLY that single leaf with the full review context (including
-          the task contract).
+          the task contract and seat routing metadata).
         - Return that leaf's verdict directly as the cascade result.
         - Skip the entire tier cascade (Steps 1-8 below).
      d. If ANY file does NOT match, proceed with the normal tier cascade (Steps 1-8).
@@ -117,9 +121,10 @@ Forward the following context to every leaf:
 - All user-provided context: feature summary, exact file list, primary lane, repo rules/docs references, file-cap override, review mode, non-goals, validation already run
 - The review rules and review-for checklist from the command
 - Any lane defaults or assumptions the command has already stated
-- If a tree_hash is available from the commit-gate acquire step: pass the tree_hash value to each leaf so it can read the diff via `git diff HEAD <tree_hash>`
+- If a tree_hash is available from the commit-gate acquire step: pass BOTH the tree_hash AND the `head_at_acquire` anchor (the acquire-time HEAD the gate records, emitted in the acquire output) to each leaf. Each leaf reads the diff via `git diff <head_at_acquire> <tree_hash>` — diffing against the acquire anchor, NOT bare `HEAD`. Review is lock-free (the gate releases the lock before Phase 2), so a concurrent committer can move bare `HEAD` between acquire and review; diffing against bare `HEAD` would pull the concurrent commit's files into the reviewed scope as phantom reverse-changes. Anchoring on `head_at_acquire` keeps the reviewed scope equal to the acquire-time scope (S1: approved-tree integrity under concurrency).
 - The changed-file list (for lightweight_review matching and scope reference)
 - The active task-contract body (the Spec-axis input), obtained per "Task-contract injection" below; forward `task_contract: null` when no session is bound
+- The leaf's `seat_routing` metadata (per-seat focus steering for stakes-based allocation), obtained per "Seat routing metadata (Lever E)" below; forward `seat_routing: null` when the panel section is absent or the leaf has no role entry
 
 ### Task-contract injection (Spec axis input)
 
@@ -144,11 +149,56 @@ Ad-hoc commits without a bound session are legitimate; the Spec axis is simply
 not evaluated with explicit disclosure. Do not synthesize a contract from the
 feature summary or the diff.
 
+### Seat routing metadata (Lever E — stakes-based allocation)
+
+Before ANY leaf invocation — the lightweight Step 0 path OR any tier leaf —
+also obtain the leaf's seat routing metadata from the `panel` section of
+`.opencode/config/review-tiers.json`. This is the per-seat focus steering that
+implements stakes-based seat allocation. It is **attention steering ONLY** and
+changes NO disposition, evidence, aggregation, or quorum rule.
+
+For each leaf you are about to invoke:
+
+1. Read `panel.leaf_roles[<leaf>]` to get that leaf's `role` and `lens`.
+2. Read `panel.lenses[<lens>].finding_classes` for that lens's focus classes.
+3. Read the role description from `panel.roles[<role>].description`.
+
+Forward a compact `seat_routing` block to that leaf. It MUST be DOMAIN-FREE —
+generic role/lens IDs and generic review terms only; never model names, never
+project/adopter literals.
+
+- For a **specialist** leaf (role != `r1_redundant`): state the seat's role and
+  lens, name its focus finding classes, and instruct it to **prioritize** the
+  capability-bound review concerns in generic terms — declared-contract
+  consistency, state-transition correctness, data invariants, and subtle
+  concurrency correctness — while still reviewing every class across the diff
+  and emitting findings under the UNCHANGED disposition/evidence rules. A
+  specialist focus is an emphasis, NOT a narrowing of scope: the seat still
+  covers all finding classes; it is simply the designated owner for the
+  high-stakes, capability-bound ones.
+- For a **generalist** leaf (role == `r1_redundant`): state that this is an
+  independently-attributable redundant generalist covering all finding classes,
+  with no special emphasis.
+
+Rules:
+- The `seat_routing` block is additive per-invocation metadata, NOT leaf prompt
+  expansion. The leaf's own prompt body (disposition rules, evidence
+  requirements, output schema) is unchanged and authoritative.
+- `panel.class_ownership` and `panel.quorum` are ownership/ROUTING documentation
+  here; they do NOT change cross-leaf disagreement resolution or aggregation,
+  which remain exactly as specified below (BLOCK-only gating,
+  evidence-verifiability, strict-consensus tier verdict). Because three leaves
+  hold `r1_redundant`, routing a class to a specialist owner does NOT narrow the
+  set of seats that can uphold a BLOCK — independent corroboration is preserved.
+- If a leaf has no `panel.leaf_roles` entry, or the panel section is absent,
+  forward `seat_routing: null` (the leaf behaves as a generalist). This graceful
+  fallback is identical to the pre-E behavior.
+
 ### HARD RULE: Never inline diff content in task parameters
 
-The command's inspection scaffold may include `!`git diff --cached` expansions. Do NOT paste the expanded diff output into any leaf's task parameter. The diff can be very large and will overflow the task JSON. Instead, provide only the tree_hash and file list so each leaf can read the diff from the repo using `git diff HEAD <tree_hash>`.
+The command's inspection scaffold may include `!`git diff --cached` expansions. Do NOT paste the expanded diff output into any leaf's task parameter. The diff can be very large and will overflow the task JSON. Instead, provide the `head_at_acquire` anchor, the tree_hash, and the file list so each leaf can read the diff from the repo using `git diff <head_at_acquire> <tree_hash>` (NOT bare `HEAD` — see the acquire-anchor rule in the Invocation section above).
 
-Forward user-provided context verbatim (feature summary, file list, lane, etc.), but replace the diff expansion with a reference (tree_hash + file list).
+Forward user-provided context verbatim (feature summary, file list, lane, etc.), but replace the diff expansion with a reference (head_at_acquire + tree_hash + file list).
 
 **`review_mode` forwarding:** If the caller provides a `review_mode`, forward it verbatim to all leaves. If the caller-provided value is not in the declared enum (`merge-ready`, `security-focused`, `docs-only`, `coordination-synthesis`, `runtime-policy`, `eval-promotion`, `frontend-ui`, `degraded-single-review`), default to `merge-ready` and forward a note to all leaves mentioning the unrecognized value. In the aggregated output, set `review_mode` to the value all leaves agree on. If leaf `review_mode` values disagree, treat as malformed and set overall verdict to `blocked` with a blocking issue noting the mismatch.
 

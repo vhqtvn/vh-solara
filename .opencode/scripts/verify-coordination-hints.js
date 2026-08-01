@@ -7,6 +7,13 @@ import {
     normalizeCommandIdentity,
 } from "./coordination-hints-lib.js";
 import { server } from "../plugins/coordination-hints.js";
+import {
+    countLines as complexityCountLines,
+    computeSignal,
+    eligible as complexityEligible,
+    parsePolicy,
+    sortSignals,
+} from "./complexity-signal-lib.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -197,7 +204,234 @@ async function verifyAsyncReentrancy() {
     console.log("async re-entrancy verification: ok");
 }
 
+// Complexity parity verification: runs the shared signal vectors
+// (internal/complexity/testdata/complexity-vectors.json) through the Node
+// adapter and asserts the SAME results the Go adapter produces. This is the
+// cross-language parity contract for the shared signal computation. Skipped
+// gracefully when the fixture is absent (consumer projects do not carry it).
+function verifyComplexityParity() {
+    // The fixture lives at internal/complexity/testdata/ in the dogfood repo.
+    // When run from the rendered .opencode/scripts/, REPO_ROOT is the repo
+    // root; when run from the corpus tree (templates/core/.opencode/scripts/),
+    // REPO_ROOT resolves to templates/core/ and we must walk further up to find
+    // go.mod. Consumer projects do not carry this fixture (skipped gracefully).
+    let fixturePath = null;
+    let searchRoot = REPO_ROOT;
+    for (let i = 0; i < 5; i += 1) {
+        const candidate = path.join(
+            searchRoot,
+            "internal",
+            "complexity",
+            "testdata",
+            "complexity-vectors.json",
+        );
+        if (fs.existsSync(candidate)) {
+            fixturePath = candidate;
+            break;
+        }
+        const parent = path.resolve(searchRoot, "..");
+        if (parent === searchRoot) break;
+        searchRoot = parent;
+    }
+    if (!fixturePath) {
+        console.log("complexity parity: skipped (fixture absent)");
+        return;
+    }
+    const doc = JSON.parse(fs.readFileSync(fixturePath, "utf8"));
+    const defaultPolicy = parsePolicy(
+        yamlStringify(doc.default_policy),
+    );
+
+    for (const vec of doc.vectors) {
+        const policy = vec.policy ? mergePolicy(doc.default_policy, vec.policy) : defaultPolicy;
+        verifyVector(vec, policy);
+        if (vec.post_edit_override) {
+            verifyVector(
+                { ...vec.post_edit_override, files: vec.files },
+                policy,
+            );
+        }
+    }
+    console.log(`complexity parity: ok (${doc.vectors.length} vectors)`);
+}
+
+// yamlStringify produces a minimal YAML string from a JSON-parsed object so
+// parsePolicy can read it. This is NOT a general serializer — it covers the
+// complexity-policy shape only.
+function yamlStringify(obj, indent = "") {
+    if (obj === null || obj === undefined) return "";
+    if (typeof obj !== "object") return String(obj);
+    if (Array.isArray(obj)) {
+        return obj.map((v) => `${indent}- ${typeof v === "object" ? yamlStringify(v, indent + "  ") : v}`).join("\n");
+    }
+    const lines = [];
+    for (const [k, v] of Object.entries(obj)) {
+        if (v !== null && typeof v === "object" && !Array.isArray(v) && Object.keys(v).length > 0) {
+            lines.push(`${indent}${k}:`);
+            lines.push(yamlStringify(v, indent + "  "));
+        } else if (Array.isArray(v) && v.length > 0) {
+            lines.push(`${indent}${k}:`);
+            for (const item of v) {
+                lines.push(`${indent}  - ${typeof item === "string" ? `"${item}"` : item}`);
+            }
+        } else if (Array.isArray(v)) {
+            lines.push(`${indent}${k}: []`);
+        } else if (v !== null && typeof v === "object") {
+            lines.push(`${indent}${k}: {}`);
+        } else {
+            lines.push(`${indent}${k}: ${v}`);
+        }
+    }
+    return lines.join("\n");
+}
+
+// mergePolicy deep-merges an overlay over a base at the object level.
+function mergePolicy(base, overlay) {
+    const merged = parsePolicy(yamlStringify(base));
+    if (overlay.defaults) {
+        if (overlay.defaults.event_file_lines != null)
+            merged.defaults.eventFileLines = overlay.defaults.event_file_lines;
+        if (overlay.defaults.snapshot_file_lines != null)
+            merged.defaults.snapshotFileLines = overlay.defaults.snapshot_file_lines;
+    }
+    if (overlay.per_language) {
+        for (const [ext, ov] of Object.entries(overlay.per_language)) {
+            if (!merged.perLanguage[ext]) merged.perLanguage[ext] = {};
+            if (ov.event_file_lines != null) merged.perLanguage[ext].eventFileLines = ov.event_file_lines;
+            if (ov.snapshot_file_lines != null) merged.perLanguage[ext].snapshotFileLines = ov.snapshot_file_lines;
+        }
+    }
+    if (overlay.exclude) {
+        if (overlay.exclude.event_paths) merged.exclude.eventPaths = overlay.exclude.event_paths;
+        if (overlay.exclude.snapshot_paths) merged.exclude.snapshotPaths = overlay.exclude.snapshot_paths;
+        if (overlay.exclude.snapshot_suffixes) merged.exclude.snapshotSuffixes = overlay.exclude.snapshot_suffixes;
+    }
+    if (overlay.doctor && overlay.doctor.max_candidates != null) {
+        merged.doctor.maxCandidates = overlay.doctor.max_candidates;
+    }
+    return merged;
+}
+
+function materializeContent(fileEntry) {
+    if (fileEntry.content_lines && fileEntry.content_lines > 0) {
+        const lines = [];
+        for (let i = 0; i < fileEntry.content_lines; i += 1) lines.push("line");
+        return lines.join("\n") + "\n";
+    }
+    return fileEntry.content || "";
+}
+
+function verifyVector(vec, policy) {
+    const proj = vec.projection;
+
+    // Line-count assertions.
+    if (vec.line_counts) {
+        for (const lc of vec.line_counts) {
+            const file = vec.files.find((f) => f.path === lc.path);
+            const content = file ? materializeContent(file) : "";
+            const got = complexityCountLines(content);
+            assert(got === lc.expected, `[${vec.id}] line count ${lc.path}: got ${got} want ${lc.expected}`);
+        }
+    }
+
+    // Eligibility + signals.
+    const eligibleSignals = [];
+    const excluded = new Set();
+    for (const f of vec.files) {
+        const content = materializeContent(f);
+        if (!complexityEligible(policy, f.path, proj)) {
+            excluded.add(f.path);
+            continue;
+        }
+        eligibleSignals.push(computeSignal(f.path, content, policy, proj));
+    }
+
+    // Expected excluded.
+    if (vec.expected_excluded) {
+        for (const p of vec.expected_excluded) {
+            assert(excluded.has(p), `[${vec.id}] expected ${p} to be excluded`);
+        }
+    }
+
+    // Expected signals.
+    if (vec.expected_signals) {
+        const sigByPath = new Map(eligibleSignals.map((s) => [s.path, s]));
+        for (const es of vec.expected_signals) {
+            const s = sigByPath.get(es.path);
+            assert(s, `[${vec.id}] expected signal for ${es.path}`);
+            assert(s.language === es.language, `[${vec.id}] ${es.path} language: got ${s.language} want ${es.language}`);
+            assert(s.metric.observed === es.observed, `[${vec.id}] ${es.path} observed: got ${s.metric.observed} want ${es.observed}`);
+            assert(s.metric.threshold === es.threshold, `[${vec.id}] ${es.path} threshold: got ${s.metric.threshold} want ${es.threshold}`);
+            assert(s.metric.nominated === es.nominated, `[${vec.id}] ${es.path} nominated: got ${s.metric.nominated} want ${es.nominated}`);
+        }
+    }
+
+    // Ordering.
+    if (vec.expected_ordered_paths) {
+        const sorted = sortSignals(eligibleSignals);
+        const got = sorted.map((s) => s.path);
+        assert(
+            JSON.stringify(got) === JSON.stringify(vec.expected_ordered_paths),
+            `[${vec.id}] ordering: got ${JSON.stringify(got)} want ${JSON.stringify(vec.expected_ordered_paths)}`,
+        );
+    }
+
+    // Presentation truncation.
+    if (vec.expected_total || vec.expected_shown_count) {
+        const sorted = sortSignals(eligibleSignals);
+        const max = vec.max_candidates || 0;
+        const shown = max > 0 ? sorted.slice(0, max) : sorted;
+        assert(sorted.length === vec.expected_total, `[${vec.id}] total: got ${sorted.length} want ${vec.expected_total}`);
+        assert(shown.length === vec.expected_shown_count, `[${vec.id}] shown: got ${shown.length} want ${vec.expected_shown_count}`);
+    }
+}
+
+// verifyComplexityDisabled asserts that when complexity-policy.yml carries
+// enabled: false, the Node event-time projection suppresses the large-file hint
+// entirely (matching the Go doctor tierSkip on the same configuration).
+function verifyComplexityDisabled() {
+    const sandbox = fs.mkdtempSync(
+        path.join(TMP_ROOT, "verify-complexity-disabled-"),
+    );
+    try {
+        ensureDir(path.join(sandbox, ".vh-agent-harness"));
+        ensureDir(path.join(sandbox, "apps", "api", "src"));
+
+        // Policy with enabled: false — the hint must NOT fire.
+        fs.writeFileSync(
+            path.join(sandbox, ".vh-agent-harness", "complexity-policy.yml"),
+            "version: 1\nenabled: false\ndefaults:\n  event_file_lines: 350\n  snapshot_file_lines: 500\n",
+            "utf8",
+        );
+
+        // A 400-line .go file that WOULD trigger the hint if enabled were true.
+        writeLines(path.join(sandbox, "apps", "api", "src", "big.go"), 400);
+
+        const hints = buildCoordinationHintMessages({
+            directory: sandbox,
+            diffFiles: [
+                {
+                    file: "apps/api/src/big.go",
+                    additions: 400,
+                    deletions: 0,
+                },
+            ],
+        });
+
+        assert(
+            !hints.some((hint) => hint.key.startsWith("large-file-warning:")),
+            "enabled:false must suppress the large-file hint (parity with Go doctor tierSkip).",
+        );
+
+        console.log("complexity disabled: ok (enabled:false suppresses hint)");
+    } finally {
+        fs.rmSync(sandbox, { recursive: true, force: true });
+    }
+}
+
 async function main() {
+    verifyComplexityParity();
+    verifyComplexityDisabled();
     verifyRepetitionHints();
     await verifyAsyncReentrancy();
     ensureDir(TMP_ROOT);

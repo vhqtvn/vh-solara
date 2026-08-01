@@ -5,17 +5,19 @@
 // Asserts the operator-interaction contract landed in the rendered release-flow
 // agent prompts and that the superseded "human explicitly approves" /
 // approval-round phrasing is gone. This is the contract encoded by releaser
-// Invariant 8 (the two-list: core rule = operator initiation IS the
+// Invariant 8 (the three-class contract: core rule = operator initiation IS the
 // authorization, green gate = proceed; STOP-AND-ASK only on the six named
-// conditions; NEVER-ASK for the standard ceremony) plus the handoff-field
-// binding any readiness reporter must satisfy (authorized_by:"operator-
-// initiation", no separate confirmation round).
+// conditions; NEVER-ASK for the standard ceremony; AUTO-RECOVER for a red gate
+// whose recovery is mechanical, known-safe, and named in the closed recipe
+// list) plus the handoff-field binding any readiness reporter must satisfy
+// (authorized_by:"operator-initiation", no separate confirmation round).
 //
 // HONEST FRAMING — READ BEFORE TRUSTING A PASS:
 //   This is a STRUCTURAL contract-content regression guard. It proves:
-//     (a) the contract text (the two-list, operator-initiation authorization,
-//         do-not-run-confirmation-rounds) is PRESENT in the rendered releaser
-//         prompt; AND
+//     (a) the contract text (the three-class contract — STOP-AND-ASK,
+//         NEVER-ASK, AUTO-RECOVER — plus operator-initiation authorization and
+//         the do-not-run-confirmation-rounds rule) is PRESENT in the rendered
+//         releaser prompt; AND
 //     (b) any rendered agent that populates a release handoff field binds it to
 //         authorized_by:"operator-initiation" and names the confirmation-round
 //         anti-pattern; AND
@@ -97,8 +99,11 @@ const releaser = releaserExists ? read(releaserPath) : "";
 // =============================================================================
 //
 // Robust anchors chosen to survive minor rewording while genuinely proving the
-// two-list landed: the STOP-AND-ASK heading, the NEVER-ASK heading, the
-// confirmation-round anti-pattern name, and the operator-initiation core rule.
+// three-class contract landed: the STOP-AND-ASK heading, the NEVER-ASK heading,
+// the confirmation-round anti-pattern name, the operator-initiation core rule,
+// and the AUTO-RECOVER class (its heading, the closed recipe-list marker, and
+// the seeded make-build recipe #1). The AUTO-RECOVER anchors guard the class
+// added to all three contract surfaces against silent removal.
 
 if (releaserExists) {
   const releaserName = "releaser.md";
@@ -121,6 +126,21 @@ if (releaserExists) {
   expect(
     /operator initiation/i.test(releaser),
     `${releaserName} must state the operator-initiation authorization core rule`,
+  );
+  // The AUTO-RECOVER class (the third interaction class, complement to
+  // STOP-AND-ASK #1): a self-recoverable red gate. Guarded so the class cannot
+  // be silently removed from the rendered contract.
+  expect(
+    /AUTO-RECOVER/i.test(releaser),
+    `${releaserName} must carry the AUTO-RECOVER class heading (Invariant 8)`,
+  );
+  expect(
+    /closed recipe list/i.test(releaser),
+    `${releaserName} must mark the closed recipe list (AUTO-RECOVER is whitelist-only)`,
+  );
+  expect(
+    /make build/i.test(releaser),
+    `${releaserName} must name recipe #1 (make build) for the seeded AUTO-RECOVER recovery`,
   );
 }
 

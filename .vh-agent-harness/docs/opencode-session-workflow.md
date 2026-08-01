@@ -259,3 +259,21 @@ summary.
 This applies at every handoff/dispatch/resume boundary: encode load-bearing
 premises as the 4-tuple when you send them (see `/handoff-save`), and re-derive
 the cheap ones when you receive them (see `/resume-task`).
+
+### Authority on refuted premises
+
+The protocol above says *when* a load-bearing premise is stale; this note fixes
+what an executor *may* do once re-derivation has refuted one. The authority
+splits along the kind of conflict, not its size:
+
+> An executor may REFUSE work built on a refuted premise (immediate safety authority) but must ESCALATE the disposition of an explicit operator-directive conflict to coordinator/operator — it may not unilaterally park it as a DEFER/canon edit.
+
+Refusing work that rests on a refuted premise is a stop action the executor
+owns. Re-disposing an explicit operator directive is not — that path runs back
+to the coordinator/operator, never to a silent DEFER or an autonomous canon
+edit. This keeps a refuted premise from being laundered into either silent
+compliance or a self-issued re-scoping. (The rule is general; it was
+illustrated by a refuted guard-extension premise whose correct generalization
+proved to be a path-existence check rather than a prefix check — the executor
+recorded the refutation and escalated rather than self-issuing the re-scoping
+as canon.)

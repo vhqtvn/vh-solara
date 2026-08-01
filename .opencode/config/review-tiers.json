@@ -1,6 +1,7 @@
 {
     "_comment": "Leaf model files live in .local/config/agent-model/ (gitignored, operator-managed). Each leaf listed here must have a corresponding model file and opencode.jsonc agent entry. Disabled tiers (premium) are listed here for future activation — their leaf agents are NOT registered in opencode.jsonc until the tier is enabled. Temperature is NOT set here — it is pinned per-agent in opencode.jsonc.",
-    "schema_version": 1,
+    "_comment_schema_v2": "schema_version 2 adds panel structural capacity (the optional `panel` section: roles, lenses, class ownership, per-class quorum, escalation). It is ADDITIVE and BACKWARD-COMPATIBLE: a config WITHOUT a `panel` section parses and behaves identically to schema_version 1. The shipped config (this file) ACTIVATES Lever E (stakes-based seat allocation): one leaf is specialized as the contract/data-integrity seat while the others remain independently-attributable redundant generalists, at a FIXED 4-leaf count. The schema_version is the CONFIG schema version (distinct from the commit-review-result.v2 OUTPUT schema emitted by leaves).",
+    "schema_version": 2,
     "tiers": [
         {
             "name": "free",
@@ -24,6 +25,63 @@
     "fail_fast": true,
     "escalation_policy": "all_approve",
     "findings_combination": "merge_across_tiers",
+    "panel": {
+        "_comment": "schema_version 2 panel capacity. DOMAIN-FREE: core ships GENERIC role/lens IDs only — no model names, no project specifics. MODEL IDENTITY stays in .local/config/agent-model/<leaf> (gitignored, per-repo). CLASS-OWNERSHIP MAPS, ROLE/LENS ASSIGNMENTS, and QUORUM/ESCALATION POLICY are per-repo config. A leaf assumes a specialized role ONLY when its leaf_roles entry is changed from r1_redundant. A role's ranked primary/fallback MODEL CHAIN is expressed by assigning MULTIPLE leaves to the same role and relying on tier/leaf ordering; each leaf resolves its own model via .local/config/agent-model/<leaf>. This keeps model identity in one place and the fallback chain as leaf ordering, not a parallel model-id list. LEVER E (stakes-based seat allocation) is ACTIVATED below: commit-reviewer-a owns the capability-bound, loss-weakest classes (contract_drift, data_integrity) and the operator designates the strongest measured model at its agent-model file; b/c/d remain redundant generalists so at least one independently attributable seat covers every class. The orchestrator forwards each leaf's role/lens as per-seat routing metadata (attention steering ONLY — no disposition/aggregation change). To revert to the pre-E uniform panel, set every leaf back to {role: r1_redundant, lens: block_finder}.",
+        "roles": {
+            "r1_redundant": {
+                "description": "Redundant generalist block-finder. The default role for every leaf. Reviews all finding classes; authoritative as a redundant raiser for per-class quorum.",
+                "model_chain": "expressed via leaf ordering (multiple leaves with this role); each leaf model from .local/config/agent-model/<leaf>"
+            },
+            "r1_backup_secondary": {
+                "description": "Secondary backup block-finder (redundant slot, model-agnostic). Same charter as r1_redundant; exists to preserve block-finding when a primary leaf is unavailable. The dependency is the fallback chain, not any pinned model.",
+                "model_chain": "expressed via leaf ordering; each leaf model from .local/config/agent-model/<leaf>"
+            },
+            "r2_contract_data": {
+                "description": "Contract/data-integrity specialist lens. Authoritative owner for contract_drift and data_integrity finding classes (the loss-weakest class — where primary model coverage is most fragile). Intended to backstop those classes WITHOUT depending on any specific model.",
+                "model_chain": "expressed via leaf ordering; each leaf model from .local/config/agent-model/<leaf>"
+            },
+            "r3_security": {
+                "description": "Security specialist lens. Authoritative owner for the security finding class.",
+                "model_chain": "expressed via leaf ordering; each leaf model from .local/config/agent-model/<leaf>"
+            },
+            "r4_blind_spot": {
+                "description": "Blind-spot / spec-conformance lens. RESERVED — NOT active by default. The 5-leaf reshape is not approved; this entry exists for structural completeness only and has no leaf assigned in the default leaf_roles.",
+                "model_chain": "expressed via leaf ordering; each leaf model from .local/config/agent-model/<leaf>"
+            }
+        },
+        "lenses": {
+            "block_finder": { "description": "Generalist lens covering all finding classes.", "finding_classes": ["*"] },
+            "contract_data": { "description": "Contract/data-integrity lens.", "finding_classes": ["contract_drift", "data_integrity"] },
+            "security": { "description": "Security lens.", "finding_classes": ["security"] },
+            "blind_spot": { "description": "Blind-spot / spec-conformance lens. RESERVED (not active by default).", "finding_classes": ["spec_alignment"] }
+        },
+        "leaf_roles": {
+            "_comment": "leaf name -> {role, lens}. Lever E (stakes-based seat allocation) ACTIVATED: commit-reviewer-a is the contract/data-integrity specialist seat (the empirically loss-weakest, capability-bound classes per the recall study), while b/c/d remain independently-attributable redundant generalists. Fixed 4-leaf count is preserved; at least one generalist seat still covers EVERY class. To revert to the pre-E uniform panel, set every leaf back to {role: r1_redundant, lens: block_finder}. MODEL COMPLETION: core is model-agnostic; the operator designates the strongest measured model at .local/config/agent-model/commit-reviewer-a so the specialist seat carries the strongest capability for the high-stakes classes it owns.",
+            "commit-reviewer-a": { "role": "r2_contract_data", "lens": "contract_data" },
+            "commit-reviewer-b": { "role": "r1_redundant", "lens": "block_finder" },
+            "commit-reviewer-c": { "role": "r1_redundant", "lens": "block_finder" },
+            "commit-reviewer-d": { "role": "r1_redundant", "lens": "block_finder" }
+        },
+        "class_ownership": {
+            "_comment": "finding class -> owning role. Lever E: the capability-bound, high-stakes classes (contract_drift, data_integrity) are owned by the specialist seat r2_contract_data (= commit-reviewer-a); security, correctness, and the '*' fallback remain with the redundant generalists. quorum is owner_or_redundant, so a generalist leaf raising the same class WITH evidence still upholds it — independent attribution is preserved and the disposition outcome is unchanged from the uniform panel. class_ownership is ROUTING METADATA here (the orchestrator forwards it as per-seat focus); it does NOT alter disposition extraction or aggregation.",
+            "security": "r1_redundant",
+            "data_integrity": "r2_contract_data",
+            "contract_drift": "r2_contract_data",
+            "correctness": "r1_redundant",
+            "*": "r1_redundant"
+        },
+        "quorum": {
+            "_comment": "Per-class quorum. REFINES (does not replace) cross-leaf disagreement resolution. A class-C BLOCK finding is UPHELD if (a) at least one owner-role lens for class C raises it, OR (b) at least one r1_redundant leaf raises it. A non-owner, non-redundant lens CANNOT outvote the owner on the owner's class (no cross-lens outvote). The existing evidence-verifiability rule still applies — a BLOCK without diff-verifiable evidence is still downgraded. Under Lever E this still reduces to current behavior: because three leaves (b/c/d) hold r1_redundant, a class-C BLOCK is upheld if ANY of the four leaves raises it with evidence — routing a class to a specialist owner does NOT narrow the set of seats that can uphold it.",
+            "rule": "owner_or_redundant",
+            "owner_predicate": "panel.class_ownership[<class>]",
+            "redundant_role": "r1_redundant"
+        },
+        "escalation": {
+            "_comment": "Cross-lens conflict disposition. When owner-lenses DISAGREE across classes on the same finding (a genuine cross-lens conflict, not a simple within-class disagreement), record an escalation_disclosures entry. DISCLOSURE ONLY (like axis_conflict): surfaces the conflict verbatim and NEVER changes the collapsed verdict (still blocked > split > approve). The authority line is unchanged — lenses propose, the coordinator + commit-gate dispose.",
+            "disposition": "disclose_only",
+            "field": "escalation_disclosures"
+        }
+    },
     "lightweight_review": {
         "doc_globs": ["researches/**/*.md", "docs/**/*.md", "docs/*.md", "researches/*.md"],
         "mode": "single_leaf",
