@@ -43,6 +43,18 @@ type fakeOC struct {
 	// to fake OpenCode reporting an affected id with archived=null (didn't
 	// stick because a busy subagent clobbered it).
 	listSessionsReply []byte
+
+	// permHold, when non-nil, blocks POST /permission/:id/reply (the watcher's
+	// auto-reject RPC) until the channel is closed — letting a test hold the RPC
+	// genuinely in-flight so Server.Shutdown's watcher-ctx cancellation can be
+	// proven to abort it short of permRejectTimeout. nil (default) = no hold
+	// (the handler records + returns 200 as before, so existing tests are
+	// unaffected). permEntered/permDone are the rendezvous signals: permEntered
+	// fires on handler entry (RPC is in-flight), permDone fires on return (clean
+	// unwind after release). Both nil (default) = not tracked.
+	permHold    chan struct{}
+	permEntered chan struct{}
+	permDone    chan struct{}
 }
 
 func (f *fakeOC) handler() http.Handler {
@@ -127,6 +139,31 @@ func (f *fakeOC) handler() http.Handler {
 		w.WriteHeader(http.StatusOK)
 	})
 	mux.HandleFunc("/permission/", func(w http.ResponseWriter, r *http.Request) {
+		// Test-only rendezvous (permHold is nil for every production-shaped
+		// test, so existing behavior is unchanged): hold the auto-reject RPC
+		// genuinely in-flight so a test can prove Server.Shutdown aborts it via
+		// watcher-ctx cancellation. Engaged BEFORE readAll/f.mu so the block
+		// does not serialize against the fake's other handlers, and the request
+		// body stays buffered for recording once released. permDone (deferred)
+		// fires when the handler actually returns, so a test can confirm the
+		// server-side goroutine unwinds cleanly after permHold is released.
+		if f.permDone != nil {
+			defer func() {
+				select {
+				case f.permDone <- struct{}{}:
+				default:
+				}
+			}()
+		}
+		if f.permHold != nil {
+			if f.permEntered != nil {
+				select {
+				case f.permEntered <- struct{}{}:
+				default:
+				}
+			}
+			<-f.permHold
+		}
 		b, _ := readAll(r)
 		f.mu.Lock()
 		defer f.mu.Unlock()

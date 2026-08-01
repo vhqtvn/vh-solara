@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -122,5 +123,135 @@ func TestShutdownRetiresServerOwnedPerDirLifetimes(t *testing.T) {
 	if stillOpen {
 		t.Fatal("non default aggregator still present in s.aggs after Shutdown " +
 			"(must be retired + removed, not reusable)")
+	}
+}
+
+// TestShutdownAbortsInFlightRejectRPC is the liveness sibling of
+// TestShutdownRetiresServerOwnedPerDirLifetimes. That test holds the watcher at
+// the PRE-RPC pure-channel block (reconcileBlockCh) which watcher-ctx
+// cancellation cannot reach, proving Shutdown AWaits lifecycleWG. It does NOT
+// exercise the in-flight RPC-abort path. THIS test does: a fail_fast session's
+// auto-reject RPC is held GENUINELY in-flight inside reconcileFailFastPerms
+// (blocked on the upstream), and Server.Shutdown's watcher-ctx cancellation
+// must propagate into the RPC's derived timeout ctx
+// (context.WithTimeout(ctx, permRejectTimeout) at server.go reconcileFailFastPerms)
+// and ABORT the stalled RPC, so Shutdown returns WELL BEFORE the 10s
+// permRejectTimeout — instead of blocking the full 10s on a stallable upstream.
+//
+// The watcher ctx is the PARENT of the reject RPC's rpcCtx; without the
+// threading, cancelling the watcher would leave the in-flight ReplyPermission
+// to run out its full 10s WithTimeout, and Shutdown (which awaits lifecycleWG,
+// which the watcher is tracked on) would stall for that whole window.
+//
+// Harness: newVerbServerSrv (fakeOC) + ensurePermissionWatcher("", agg). The
+// watcher is armed exactly as production arms it (aggFor →
+// ensurePermissionWatcher), but the aggregator's Run/hydrate loop is NOT
+// started — so the seeded pending permission is stable (a running hydrate would
+// SetPendingPermissions from the empty fake and clobber the seed). The reject
+// RPC fires from the WATCHER goroutine (whose ctx is the one Shutdown will
+// cancel), not from a direct reconcileFailFastPerms call with
+// context.Background(), which would not be connected to any watcher ctx and
+// could not be aborted by Shutdown. That distinction is the whole point.
+//
+// The proof is OUTCOME-level: it asserts the elapsed wall time of Shutdown is
+// unambiguously under permRejectTimeout, not merely that a context was plumbed.
+func TestShutdownAbortsInFlightRejectRPC(t *testing.T) {
+	f := &fakeOC{}
+	_, agg, srv := newVerbServerSrv(t, f)
+
+	// Hold the auto-reject RPC genuinely in-flight via the fake's /permission/
+	// handler rendezvous: permEntered signals the handler was entered (RPC is
+	// in-flight), permHold blocks it until released, permDone signals return so
+	// the test can confirm a clean unwind (no leaked server-side goroutine).
+	permHold := make(chan struct{})
+	permEntered := make(chan struct{}, 1)
+	permDone := make(chan struct{}, 1)
+	f.permHold = permHold
+	f.permEntered = permEntered
+	f.permDone = permDone
+	// Guarantee the server-side handler goroutine is never leaked past the test,
+	// even on a failure path (t.Fatalf) that aborts before the explicit release
+	// below. sync.Once makes a mid-test release + the cleanup both safe.
+	var releaseOnce sync.Once
+	releasePerm := func() {
+		releaseOnce.Do(func() { close(permHold) })
+	}
+	t.Cleanup(releasePerm)
+
+	// Seed FIRST, then arm: the watcher's immediate sweep (fired on arming) must
+	// find the pending permission already in the store, so the reject RPC is
+	// deterministic instead of waiting up to permReconcileInterval for the first
+	// ticker tick. Register the fail_fast binding + seed the session + its
+	// pending permission on the default store.
+	store := agg.Store()
+	srv.registerFailFast("ff_sess")
+	store.Apply(ev("session.updated", `{"info":{"id":"ff_sess","title":"t"}}`))
+	store.Apply(ev("permission.asked", `{"id":"p1","sessionID":"ff_sess","permission":"bash"}`))
+
+	// Arm the DEFAULT dir's permission watcher (tracked on lifecycleWG) — the
+	// same arming aggFor("") does in production. Its immediate sweep rejects the
+	// seeded fail_fast permission, firing the in-flight reject RPC. The watcher
+	// then ticks every permReconcileInterval.
+	srv.ensurePermissionWatcher("", agg)
+
+	// Rendezvous: wait until the auto-reject RPC is genuinely in-flight — the
+	// fake's /permission/ handler was entered and is now blocked on permHold.
+	// This proves the RPC is in-flight BEFORE Shutdown is called (the sweep may
+	// be the immediate one or the next ticker tick, hence the generous bound).
+	select {
+	case <-permEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("auto-reject RPC never entered the fake's /permission/ handler " +
+			"(watcher sweep did not fire / did not find the pending fail_fast perm)")
+	}
+
+	// Shutdown issues stopAllPermissionWatchers, cancelling every watcher ctx.
+	// The watcher ctx is the PARENT of the RPC's rpcCtx
+	// (WithTimeout(ctx, permRejectTimeout)), so cancelling it must abort the
+	// in-flight ReplyPermission short of the 10s permRejectTimeout. Assert the
+	// OUTCOME: Shutdown returns nil and its elapsed wall time is well under
+	// permRejectTimeout. The Shutdown ctx itself (5s) is just a safety bound so
+	// a regression (RPC not aborted → lifecycleWG never drains) fails fast
+	// instead of hanging the suite.
+	const abortBudget = 4 * time.Second // unambiguously < permRejectTimeout (10s)
+	start := time.Now()
+	shutdownDone := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		shutdownDone <- srv.Shutdown(ctx)
+	}()
+	select {
+	case err := <-shutdownDone:
+		if err != nil {
+			t.Fatalf("Shutdown returned %v — the in-flight reject RPC was NOT aborted "+
+				"by watcher-ctx cancellation (lifecycleWG did not drain within the ctx, "+
+				"i.e. the watcher stayed blocked on the stallable upstream for the full "+
+				"permRejectTimeout window)", err)
+		}
+		elapsed := time.Since(start)
+		// CRUX (outcome): Shutdown returned WELL BEFORE the 10s permRejectTimeout.
+		if elapsed >= abortBudget {
+			t.Fatalf("Shutdown took %s (>= %s budget); the in-flight reject RPC was "+
+				"not aborted promptly by watcher-ctx cancellation (would have stalled "+
+				"toward the %s permRejectTimeout)", elapsed, abortBudget, permRejectTimeout)
+		}
+		t.Logf("Shutdown returned in %s with an in-flight reject RPC (well under "+
+			"%s permRejectTimeout) — watcher-ctx cancellation aborted the RPC", elapsed, permRejectTimeout)
+	case <-time.After(permRejectTimeout):
+		t.Fatalf("Shutdown did not return within %s (permRejectTimeout) — the in-flight "+
+			"reject RPC was not aborted by watcher-ctx cancellation", permRejectTimeout)
+	}
+
+	// Release the fake's block: the server-side /permission/ handler goroutine
+	// (still blocked after the client aborted the round-trip) unblocks, writes
+	// to the now-broken connection, and exits. Confirm it actually returns so no
+	// goroutine leaks past the test.
+	releasePerm()
+	select {
+	case <-permDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the fake's /permission/ handler never returned after permHold was " +
+			"released (server-side goroutine leak)")
 	}
 }
