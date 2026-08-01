@@ -133,6 +133,31 @@ export interface Snapshot {
   // non-hoisted snapshots (old clients, legacy Snapshot path). See
   // ProjectConstants.
   projectConstants?: ProjectConstants;
+  // Slice-A (D4): when present, this is a FRONTIER-SCOPED partial detail frame
+  // (tree-Stream-1 cold/reconnect only), NOT a full snapshot. The scoped
+  // installer (tree-transport.ts) reads `partial` to apply each map by its
+  // authority tag instead of the full wholesale-replace path (applySnapshot →
+  // projectSnapshot). Absent on every full snapshot (/vh/snapshot, firehose,
+  // session-selected, coordapi, MCP) — absence ⇒ full = wholesale-replace.
+  partial?: PartialMeta;
+}
+
+// Slice-A: per-map authority for a frontier-scoped partial detail frame. The
+// tree-Stream-1 detail frame carries FRONTIER-scoped
+// sessions/activity/gate/lastAgents/currentVerbs (merge — preserve buried
+// detail outside `scope`) and GLOBAL questions/permissions/unread
+// (authoritative-replace — Q/P/unread are always frontier subsets in practice
+// since pending-input sessions are promoted to the active frontier, but the
+// global tag makes the clear-replied-questions semantics explicit).
+// todos/statuses/messages are OMITTED. The scoped installer keys off each tag:
+// "global" = authoritative-replace, "frontier" = merge (scope ids only),
+// "omitted" = ignore.
+export type PartialMapAuthority = "global" | "frontier" | "omitted";
+export interface PartialMeta {
+  mode: string; // "tree-stream-1-frontier"
+  scope: string[]; // exact frontier session IDs (the merge set)
+  authority: Record<string, PartialMapAuthority>; // map-name → authority
+  ringGap?: boolean; // true ONLY on a same-epoch ring-gap reconnect → invalidate buried not-in-scope (D1)
 }
 
 // Tier-A "current verb" facet: the RAW tool part primitive the daemon emits so

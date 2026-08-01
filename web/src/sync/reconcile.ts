@@ -16,12 +16,13 @@ import { produce } from "solid-js/store";
 import { createSignal } from "solid-js";
 import type { Snapshot } from "../types";
 import type { ReconcileContext, ReconcileEffect, ReconcileEvent } from "./reducers.types";
-import { setState, persist } from "./store";
+import { setState, persist, type SyncState } from "./store";
 import {
   projectSnapshot,
   projectSessionEvent,
   projectMessageEvent,
   projectSessionRemoval,
+  epochChanged,
 } from "./reducers";
 import { pushNotification } from "../notify";
 import { dropPinnedSession } from "../pins";
@@ -106,13 +107,132 @@ export function applyMessageEvent(kind: string, seq: number, payload: any, track
 
 // applySnapshot — wholesale snapshot reducer. Cursor is set unconditionally to
 // snap.seq (the snapshot is authoritative regardless of stream). Signature
-// preserved for tree-transport.ts.
+// preserved for tree-transport.ts + session-stream.ts.
 export function applySnapshot(snap: Snapshot): void {
   bumpUpdating();
   const effects: ReconcileEffect[] = [];
   setState(produce((s) => projectSnapshot(s, snap, effects)));
   interpretEffects(effects);
   setState("cursor", snap.seq); // snapshot cursor is unconditional
+  if (effects.some((e) => e.kind === "sync-state-dirty")) persist();
+}
+
+// projectScopedPartial — Slice-A (D3/D4): the FRONTIER-SCOPED partial detail
+// installer, the structural twin of projectSnapshot for the tree-Stream-1
+// cold/reconnect detail frame (snap.partial present). Applies each map by its
+// `partial.authority` tag instead of wholesale-replacing every map:
+//   - "frontier" (sessions/activity/gate/lastAgents/currentVerbs): MERGE —
+//     upsert ONLY ids in `partial.scope`, PRESERVE buried detail outside scope.
+//     No deletion from omission; deletions arrive as continuous-replay
+//     session.delete (transition 7).
+//   - "global" (questions/permissions/unread): AUTHORITATIVE-REPLACE (same
+//     array→keyed translation as projectSnapshot). Q/P/unread are always
+//     frontier subsets in practice — a session with pending input is promoted
+//     to the active frontier (isActiveLocked) — so global-replace never drops a
+//     buried pending input; the tag makes the clear-replied-questions semantics
+//     explicit.
+//   - "omitted" (todos/statuses/messages): IGNORE (the frame carries none).
+// On an epoch-change (server restart) prior-epoch frontier-mergeable detail is
+// STALE → clear it before merging the fresh frontier (transition 9). Q/P/unread
+// are wholesale-replaced regardless of epoch. cursor advance + persistence are
+// orchestration policy (handled by applyScopedSnapshot, mirroring applySnapshot).
+export function projectScopedPartial(s: SyncState, snap: Snapshot, effects: ReconcileEffect[]): void {
+  const p = snap.partial;
+  if (!p) return; // defensive: caller gates on snap.partial
+  const incomingEpoch = snap.epoch || "";
+  const changed = epochChanged(s.epoch, incomingEpoch);
+  const scopeSet = new Set(p.scope || []);
+  const auth = p.authority || {};
+  // Epoch-change: clear prior-epoch frontier-mergeable detail (stale from the
+  // restarted server). The global maps are wholesale-replaced below regardless.
+  if (changed) {
+    s.sessions = {};
+    s.gate = {};
+    s.activity = {};
+    s.lastAgents = {};
+    s.currentVerbs = {};
+  }
+  // D1 ring-gap invalidate-affected: when the cursor was evicted (ring-gap, same
+  // epoch), the deltas that would have updated buried detail were lost. The
+  // fresh partial re-seeds the frontier (scope below), but retained detail for
+  // ids NOT in scope MAY be stale. MECHANICALLY invalidate: delete frontier-
+  // mergeable detail for ids outside scope — the set is "everything retained
+  // minus what this frame covers", NOT inferred from omission (too-narrow =
+  // stale detail persists; the broad clear is the safe choice because the ring
+  // consumed the per-id change evidence). Epoch-change already cleared all
+  // above, so this runs only on a same-epoch ring-gap.
+  if (p.ringGap && !changed) {
+    for (const id of Object.keys(s.sessions)) if (!scopeSet.has(id)) delete s.sessions[id];
+    for (const id of Object.keys(s.gate)) if (!scopeSet.has(id)) delete s.gate[id];
+    for (const id of Object.keys(s.activity)) if (!scopeSet.has(id)) delete s.activity[id];
+    for (const id of Object.keys(s.lastAgents)) if (!scopeSet.has(id)) delete s.lastAgents[id];
+    for (const id of Object.keys(s.currentVerbs)) if (!scopeSet.has(id)) delete s.currentVerbs[id];
+  }
+  // FRONTIER-scoped MERGE (upsert scope ids only; preserve buried).
+  if (auth.sessions !== "omitted") {
+    for (const sess of snap.sessions || []) {
+      if (scopeSet.has(sess.id)) s.sessions[sess.id] = sess;
+    }
+  }
+  if (auth.activity !== "omitted") {
+    for (const [sid, val] of Object.entries(snap.activity || {})) {
+      if (scopeSet.has(sid)) s.activity[sid] = val;
+    }
+  }
+  if (auth.gate !== "omitted") {
+    for (const [id, g] of Object.entries(snap.gate || {})) {
+      if (g && scopeSet.has(id)) s.gate[id] = { ...g }; // shallow-clone (mirrors projectSnapshot)
+    }
+  }
+  if (auth.lastAgents !== "omitted") {
+    for (const [id, val] of Object.entries(snap.lastAgents || {})) {
+      if (scopeSet.has(id)) s.lastAgents[id] = val;
+    }
+  }
+  if (auth.currentVerbs !== "omitted") {
+    for (const [id, val] of Object.entries(snap.currentVerbs || {})) {
+      if (scopeSet.has(id)) s.currentVerbs[id] = val;
+    }
+  }
+  // GLOBAL AUTHORITATIVE-REPLACE (wholesale; same array→keyed translation).
+  if (auth.questions !== "omitted") {
+    s.questions = {};
+    for (const [sid, qs] of Object.entries(snap.questions || {})) {
+      s.questions[sid] = {};
+      for (const q of qs) s.questions[sid][q.id] = q;
+    }
+  }
+  if (auth.permissions !== "omitted") {
+    s.permissions = {};
+    for (const [sid, perms] of Object.entries(snap.permissions || {})) {
+      s.permissions[sid] = {};
+      for (const perm of perms) s.permissions[sid][perm.id] = perm;
+    }
+  }
+  if (auth.unread !== "omitted") {
+    s.unread = {};
+    for (const id of snap.unread || []) s.unread[id] = true;
+  }
+  // todos/statuses/messages: OMITTED — never touched.
+  if (changed) s.epochChanged = true;
+  if (incomingEpoch) s.epoch = incomingEpoch;
+  effects.push({ kind: "sync-state-dirty" });
+}
+
+// applyScopedSnapshot — Slice-A (D3): the transport-selected scoped installer
+// for frontier-scoped partial detail frames (snap.partial present). Mirrors
+// applySnapshot (wholesale) but projects via projectScopedPartial (scoped
+// merge/replace). Selected in BOTH tree-transport install paths
+// (applyDetailIndependent + tryInstall) so an independent OR a staged partial
+// never falls through to wholesale replacement. Cursor set unconditionally to
+// snap.seq (mirrors applySnapshot; the coherent-install path also calls
+// advanceCursor(id.seq) with the same shared value — idempotent).
+export function applyScopedSnapshot(snap: Snapshot): void {
+  bumpUpdating();
+  const effects: ReconcileEffect[] = [];
+  setState(produce((s) => projectScopedPartial(s, snap, effects)));
+  interpretEffects(effects);
+  setState("cursor", snap.seq);
   if (effects.some((e) => e.kind === "sync-state-dirty")) persist();
 }
 

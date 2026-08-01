@@ -2018,7 +2018,18 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			// writer (the false-confidence failure that blocked a truthworthy
 			// completion signal). baseline is the captured seq (tree.Seq ==
 			// detail.Seq), dropping the third store.Head() lock.
-			detailSnap, treeSnap := store.SnapshotWithTree(treeEmitter, filter, "reconnect")
+			// Slice-A D7: tree-only reconnect (sessions absent → filter={}) ships a
+			// FRONTIER-SCOPED partial detail (global Q/P/unread + frontier
+			// sessions/gate/activity/lastAgents/currentVerbs; messages omitted).
+			// Session-selected/firehose reconnect keeps the full capture. Both
+			// paths share ONE RLock + {epoch,seq} with the tree projection.
+			var detailSnap state.Snapshot
+			var treeSnap *state.TreeSnapshot
+			if filter != nil && len(filter) == 0 {
+				detailSnap, treeSnap = store.SnapshotWithTreePartial(treeEmitter, "reconnect")
+			} else {
+				detailSnap, treeSnap = store.SnapshotWithTree(treeEmitter, filter, "reconnect")
+			}
 			treeOK := false
 			if rb, err := json.Marshal(treeSnap); err == nil {
 				wire := maybeCompressSnapshot(rb, wantsCompress(r))
@@ -2080,7 +2091,23 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			// hard prerequisite for the truthworthy completion signal. baseline
 			// is the captured seq (tree.Seq == detail.Seq), dropping the third
 			// store.Head() lock.
-			detailSnap, treeSnap := store.SnapshotWithTree(treeEmitter, filter, cause)
+			// Slice-A D7: tree-only cold/ring-gap (sessions absent → filter={})
+			// ships the frontier-scoped partial detail (see reconnect-site comment
+			// above). Session-selected/firehose keeps the full capture.
+			var detailSnap state.Snapshot
+			var treeSnap *state.TreeSnapshot
+			if filter != nil && len(filter) == 0 {
+				detailSnap, treeSnap = store.SnapshotWithTreePartial(treeEmitter, cause)
+				// D1: stamp the ring-gap signal ONLY when the cursor existed but the
+				// shared ring evicted it (hasCursor && !replayOK) — the missed deltas
+				// were lost, so the client mechanically invalidates buried detail not
+				// in scope. A fresh (no-cursor) connect leaves it false.
+				if detailSnap.Partial != nil && hasCursor && !replayOK {
+					detailSnap.Partial.RingGap = true
+				}
+			} else {
+				detailSnap, treeSnap = store.SnapshotWithTree(treeEmitter, filter, cause)
+			}
 			treeOK := false
 			if rb, err := json.Marshal(treeSnap); err == nil {
 				wire := maybeCompressSnapshot(rb, wantsCompress(r))

@@ -198,6 +198,52 @@ type Snapshot struct {
 	// been acknowledged yet — surfaced as an "unread/finished" indicator. Cleared
 	// via Ack (the client scrolling that session to the bottom).
 	Unread []string `json:"unread,omitempty"`
+	// Partial, when non-nil, marks this snapshot as a PARTIAL tree-Stream-1
+	// detail frame: only the session IDs in Partial.Scope carry
+	// sessions/activity/gate/lastAgents/currentVerbs (frontier-scoped → the
+	// client MERGES these and must NOT delete buried detail absent from scope);
+	// the global maps (questions/permissions/unread) are authoritative-complete
+	// (the client REPLACES them); todos/statuses are omitted. Every other caller
+	// (the full Snapshot(), /vh/snapshot, coordapi, MCP) leaves Partial nil so the
+	// legacy wholesale-replace apply path runs unchanged. See PartialMeta.
+	Partial *PartialMeta `json:"partial,omitempty"`
+}
+
+// PartialMeta is the wire metadata a tree-Stream-1 partial detail frame carries
+// so the client picks the scoped installer (D3) instead of the wholesale
+// projectSnapshot path. Partiality is tree-Stream-1-only (D7): the handleStream
+// tree=2 cold/reconnect/ring-gap paths set it; every non-SPA consumer stays full.
+type PartialMeta struct {
+	// Mode is the partial-frame discriminator. Today only "tree-stream-1-frontier".
+	// A client that does not recognize the mode MUST fall back to wholesale apply
+	// (defensive: an unknown partial mode is treated as a full snapshot).
+	Mode string `json:"mode"`
+	// Scope is the EXACT set of session IDs whose per-session detail
+	// (sessions/activity/gate/lastAgents/currentVerbs) is included. A client
+	// merges these by id and preserves detail for ids NOT in scope (buried
+	// frontier detail is never deleted by a partial frame).
+	Scope []string `json:"scope"`
+	// Authority tags each carried map with one of:
+	//   "global"  — authoritative-complete; the client REPLACES its whole map
+	//                (questions, permissions, unread).
+	//   "frontier"— scoped to Scope; the client MERGES (only Scope ids), never
+	//                deleting ids outside Scope (sessions, activity, gate,
+	//                lastAgents, currentVerbs).
+	//   "omitted" — not carried in this frame; the client MUST NOT touch its
+	//                existing map (todos, statuses).
+	// A map absent from Authority is treated as "omitted".
+	Authority map[string]string `json:"authority"`
+	// RingGap is set ONLY on a same-epoch reconnect whose cursor the shared replay
+	// ring evicted (hasCursor && !replayOK). The missed deltas that would have
+	// updated buried detail were lost, so the client must MECHANICALLY invalidate
+	// retained frontier-mergeable detail (sessions/gate/activity/lastAgents/
+	// currentVerbs) for ids NOT in Scope — the set is "everything retained minus
+	// what this frame covers", NOT inferred from omission (too-narrow = stale
+	// detail persists; the broad clear is the safe mechanical choice because the
+	// ring consumed the per-id change evidence). Global Q/P/unread are
+	// authoritative-replaced regardless. A replay-OK reconnect (deltas applied)
+	// and a fresh (no-cursor) connect leave this false — no invalidation.
+	RingGap bool `json:"ringGap,omitempty"`
 }
 
 // GateFacts is the denormalized "is this session safe to act on" summary for one

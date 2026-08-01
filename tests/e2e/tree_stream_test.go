@@ -5,11 +5,12 @@ package e2e
 // aggregator + store + tree emitter + web stream handler driven by the REAL
 // fake OpenCode fixture, on the worker-local /vh/stream?tree=2 path.
 //
-// WHY THE WORKER-LOCAL STREAM (not the coordination tunnel): the coordination
-// API's /vh/stream proxy rebuilds the upstream query via dirQuery, which
-// carries ONLY dir+sessions+cursor — tree=2 is STRIPPED through the tunnel
-// (same constraint as projection_demotion_test.go's proj=1). The
-// worker-local path runs the identical tree=2 code.
+// WHY THE WORKER-LOCAL STREAM (primary): these tests exercise the worker-local
+// /vh/stream?tree=2 path directly (the path the live diagnosis captured + the
+// SPA worker-local Stream-1 open). The coordination tunnel NOW forwards tree=2
+// too (RESIDUAL-1 closed, slice A: coordapi.coordEvents forwards the `tree`
+// query); the through-tunnel partial engagement is proven separately in
+// tunnel_gate_test.go TestStream1PartialFrameTunnel.
 //
 // Behaviors verified:
 //   (a) Cold load ships ONLY the lazy frontier — grandchildren are collapsed.

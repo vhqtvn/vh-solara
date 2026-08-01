@@ -100,11 +100,20 @@ func TestTreeResume_ReconnectBootstrapsDetail(t *testing.T) {
 	if !hasEvent(resumed, "snapshot") {
 		t.Errorf("tree=2 resume: MISSING legacy snapshot (detail bootstrap); events=%v", eventNames(resumed))
 	}
-	// The legacy detail snapshot must carry the session detail (incl. C2).
-	if data, ok := eventDataFor(resumed, "snapshot", "C2"); !ok {
-		t.Errorf("tree=2 resume: legacy snapshot should contain C2 detail; events=%v", eventNames(resumed))
-	} else if !strings.Contains(data, "R") {
-		t.Errorf("tree=2 resume: legacy snapshot should also contain R; data=%.200s", data)
+	// Slice-A partial contract: the tree=2 resume now emits a FRONTIER-SCOPED
+	// detail snapshot (mode "tree-stream-1-frontier"), not the legacy full
+	// detail. With no session loaded, the frontier = roots only (R); buried
+	// children (C1, C2) are intentionally omitted and arrive via the expand
+	// bundle (/vh/tree/children detail, slice-A D2) when the node is opened.
+	// Assert: snapshot is partial, R (root/frontier) present, C2 (buried) absent.
+	data, hasR := eventDataFor(resumed, "snapshot", "R")
+	if !hasR {
+		t.Errorf("tree=2 resume: partial snapshot should contain frontier root R; events=%v", eventNames(resumed))
+	} else if !strings.Contains(data, "tree-stream-1-frontier") {
+		t.Errorf("tree=2 resume: snapshot should be partial (mode tree-stream-1-frontier); data=%.200s", data)
+	}
+	if _, hasC2 := eventDataFor(resumed, "snapshot", "C2"); hasC2 {
+		t.Errorf("tree=2 resume: partial snapshot must OMIT buried C2 (arrives via expand); events=%v", eventNames(resumed))
 	}
 }
 

@@ -245,6 +245,13 @@ func (d *Daemon) coordEvents(w http.ResponseWriter, r *http.Request) {
 	if v := r.URL.Query().Get("cursor"); v != "" {
 		extra.Set("cursor", v)
 	}
+	// R-1 (completion): forward the opt-in tree= mode through the tunnel so the
+	// worker takes the frontier-scoped partial branch. Absent/other values are
+	// not forwarded → worker keeps the legacy full-snapshot branch (compat-safe;
+	// pinned by tree_children_test.go). Only literal tree=2 engages partial.
+	if v := r.URL.Query().Get("tree"); v != "" {
+		extra.Set("tree", v)
+	}
 	d.proxyToVH(w, r, worker, http.MethodGet, "/vh/stream", dirQuery(r, extra), nil)
 }
 

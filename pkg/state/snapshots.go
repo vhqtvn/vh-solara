@@ -820,7 +820,155 @@ func (s *Store) SnapshotWithTree(e *TreeEmitter, messagesFor map[string]bool, ca
 	return detail, treeSnap
 }
 
-// snapshotMaterializeHook is a test seam fired after Snapshot releases s.mu and
+// capturePartialDetailLocked is the D4 two-scope tree-Stream-1-only capture.
+// Caller MUST hold s.mu (at least RLock). It is the partial counterpart of
+// captureSnapshotLocked: instead of applying ONE inScope predicate to every
+// map, it splits the authority:
+//   - GLOBAL (authoritative-complete): questions, permissions, unread. A client
+//     REPLACES its whole map for these (NotificationCenter iterates ALL
+//     permissions/questions; tree rows show unread for all sessions).
+//   - FRONTIER-scoped (merge): sessions, activity (and the gate/lastAgents/
+//     currentVerbs derived from the per-session capture). Only the frontier IDs
+//     the tree projection shipped are included; a client MERGES and must NOT
+//     delete buried detail for ids outside the frontier.
+//   - OMITTED: todos, statuses, messages (no tree-Stream-1 SPA consumer reads
+//     todos/statuses from the snapshot — verified: only the notes-doc feature
+//     references todos; statuses has no SPA consumer). A client MUST NOT touch
+//     its existing map for these.
+// subtreeBusy is captured for ALL sessions (it is a fresh map[string]bool of
+// value copies aliasing nothing, and the gate's SubtreeBusy for a frontier
+// session must reflect its full possibly-buried subtree). This keeps the
+// no-aliasing invariant identical to captureSnapshotLocked.
+func (s *Store) capturePartialDetailLocked(frontier map[string]bool) snapshotCapture {
+	epoch := s.epoch
+	seq := s.seq
+
+	// subtreeBusy: ALL sessions (full subtree aggregation for frontier gates).
+	subtreeBusy := make(map[string]bool, len(s.sessions))
+	for id := range s.sessions {
+		subtreeBusy[id] = s.subtreeBusyCount[id] > 0
+	}
+
+	// Per-session scalar facts — FRONTIER-scoped only.
+	sessions := make(map[string]snapSessionCap, len(frontier))
+	for sid := range frontier {
+		se := s.sessions[sid]
+		if se == nil {
+			continue
+		}
+		sessions[sid] = snapSessionCap{
+			info:              append([]byte(nil), se.info...),
+			hasAssistant:      se.hasAssistant,
+			lastAsstCompleted: se.lastAsstCompleted,
+			lastAsstEmpty:     se.lastAsstEmpty,
+			lastFinish:        se.lastFinish,
+			lastTokens:        append([]byte(nil), se.lastTokens...),
+			lastAgent:         se.lastAgent,
+			currentVerbTool:   se.currentVerb.Tool,
+			currentVerbState:  append([]byte(nil), se.currentVerb.State...),
+			msgLoaded:         s.msgLoaded[sid],
+			msgResident:       s.latestAssistantResidentLocked(sid),
+			hasMessages:       s.messages[sid] != nil,
+			hasQuestions:      len(s.questions[sid]) > 0,
+			hasPerms:          len(s.perms[sid]) > 0,
+			permBlocked:       s.permBlocked[sid],
+			activity:          s.activity[sid],
+		}
+	}
+
+	// Questions: GLOBAL (authoritative-complete).
+	questions := map[string][][]byte{}
+	for sid, m := range s.questions {
+		var qs [][]byte
+		for _, q := range m {
+			qs = append(qs, append([]byte(nil), q...))
+		}
+		questions[sid] = qs
+	}
+	// Activity: FRONTIER-scoped (merge).
+	activity := map[string]string{}
+	for sid := range frontier {
+		if st, ok := s.activity[sid]; ok {
+			activity[sid] = st
+		}
+	}
+	// Unread: GLOBAL (authoritative-complete).
+	unread := make([]string, 0, len(s.unread))
+	for id := range s.unread {
+		unread = append(unread, id)
+	}
+	// Permissions: GLOBAL (authoritative-complete).
+	perms := map[string][][]byte{}
+	for sid, m := range s.perms {
+		var ps [][]byte
+		for _, perm := range m {
+			ps = append(ps, append([]byte(nil), perm...))
+		}
+		perms[sid] = ps
+	}
+	// Todos, statuses, messages: OMITTED (nil) — a client must not touch its
+	// existing maps for these. materializeSnapshot leaves them as empty maps on
+	// the wire (omitempty drops them), which the partial installer treats as
+	// "omitted", not "authoritative-empty".
+	return snapshotCapture{
+		epoch:       epoch,
+		seq:         seq,
+		subtreeBusy: subtreeBusy,
+		sessions:    sessions,
+		questions:   questions,
+		activity:    activity,
+		unread:      unread,
+		perms:       perms,
+		// todos, statuses, messages intentionally nil (omitted).
+	}
+}
+
+// SnapshotWithTreePartial is the D4 tree-Stream-1-only partial capture. It
+// derives BOTH the tree frontier AND a PARTIAL detail snapshot under a SINGLE
+// s.mu.RLock, stamping both with the SAME {epoch, seq} (Q5 capture
+// consolidation — identical rationale to SnapshotWithTree: a writer on the
+// Apply path cannot interleave and bump s.seq between the two captures). The
+// detail snapshot carries frontier-scoped sessions/activity/gate/lastAgents/
+// currentVerbs + GLOBAL questions/permissions/unread, with Snapshot.Partial set
+// so the client picks the scoped installer (D3) instead of wholesale apply.
+//
+// The frontier scope is treeSnap.FrontierIDs — the EXACT emitted-node set
+// computed once inside snapshotFrontierLocked, reused here without recompute.
+// Non-tree callers MUST use SnapshotWithTree (full) or Snapshot (full): this
+// method is reached only from handleStream's tree=2 cold/reconnect/ring-gap
+// paths when no active session is selected (D7).
+func (s *Store) SnapshotWithTreePartial(e *TreeEmitter, cause string) (Snapshot, *TreeSnapshot) {
+	s.mu.RLock()
+	treeSnap := e.snapshotFrontierLocked(cause)
+	frontier := make(map[string]bool, len(treeSnap.FrontierIDs))
+	for _, id := range treeSnap.FrontierIDs {
+		frontier[id] = true
+	}
+	c := s.capturePartialDetailLocked(frontier)
+	s.mu.RUnlock()
+	if snapshotMaterializeHook != nil {
+		snapshotMaterializeHook()
+	}
+	detail := s.materializeSnapshot(c)
+	detail.Partial = &PartialMeta{
+		Mode:  "tree-stream-1-frontier",
+		Scope: treeSnap.FrontierIDs,
+		Authority: map[string]string{
+			"sessions":     "frontier",
+			"activity":     "frontier",
+			"gate":         "frontier",
+			"lastAgents":   "frontier",
+			"currentVerbs": "frontier",
+			"questions":    "global",
+			"permissions":  "global",
+			"unread":       "global",
+			"todos":        "omitted",
+			"statuses":     "omitted",
+			"messages":     "omitted",
+		},
+	}
+	return detail, treeSnap
+}
 // before it materializes the result from captured locals. A test sets it to
 // block (e.g. on a channel) so it can drive a concurrent Apply (which needs the
 // write lock) to completion while a Snapshot is parked in its lock-free

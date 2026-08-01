@@ -145,11 +145,19 @@ func TestTreeDetail_FreshConnectEmitsBothSnapshots(t *testing.T) {
 	if !hasEvent(initial, "snapshot") {
 		t.Fatalf("fresh tree=2 connect: missing legacy snapshot (detail bootstrap, GAP 3); events=%v", eventNames(initial))
 	}
-	// The legacy detail snapshot must carry session detail (the sessions array).
-	if data, ok := eventDataFor(initial, "snapshot", "R"); !ok {
-		t.Errorf("legacy detail snapshot should contain session R; got events=%v", eventNames(initial))
-	} else if !strings.Contains(data, "C1") {
-		t.Errorf("legacy detail snapshot should contain child session C1; data=%.200s", data)
+	// Slice-A partial contract: the fresh tree=2 detail snapshot is now
+	// FRONTIER-SCOPED (mode "tree-stream-1-frontier"). R (root) is frontier →
+	// present; C1 (child of a non-loaded root) is buried → omitted (arrives via
+	// the /vh/tree/children expand bundle when the node is opened). Assert:
+	// partial mode set, R present, C1 absent.
+	data, hasR := eventDataFor(initial, "snapshot", "R")
+	if !hasR {
+		t.Errorf("fresh tree=2 partial snapshot should contain frontier root R; events=%v", eventNames(initial))
+	} else if !strings.Contains(data, "tree-stream-1-frontier") {
+		t.Errorf("fresh tree=2 snapshot should be partial (mode tree-stream-1-frontier); data=%.200s", data)
+	}
+	if _, hasC1 := eventDataFor(initial, "snapshot", "C1"); hasC1 {
+		t.Errorf("fresh tree=2 partial snapshot must OMIT buried C1 (arrives via expand); events=%v", eventNames(initial))
 	}
 }
 

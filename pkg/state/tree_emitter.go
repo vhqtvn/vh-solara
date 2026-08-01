@@ -2,6 +2,7 @@ package state
 
 import (
 	"encoding/json"
+	"sort"
 )
 
 // tree_emitter.go is the server-owned tree emitter (Phase 2a) — the frontier
@@ -31,6 +32,13 @@ type TreeSnapshot struct {
 	Seq   uint64 `json:"seq"` // head op seq (resume cursor, INV-A).
 	Nodes []Node `json:"nodes"`
 	Cause string `json:"cause,omitempty"` // "cold" | "reconnect".
+	// FrontierIDs is the EXACT set of session ids emitted as nodes in this
+	// snapshot (roots ∪ active-path ∪ direct-children-of-loaded). It is
+	// server-internal (json:"-") — NOT serialized on the wire — and exists so
+	// SnapshotWithTreePartial can scope the partial detail capture to exactly
+	// the frontier the tree projection shipped, under the SAME RLock, without
+	// recomputing the set (avoiding double-capture / double side-effects).
+	FrontierIDs []string `json:"-"`
 }
 
 // emitterState is the committed cache state of one TreeEmitter connection: the
@@ -428,6 +436,19 @@ func (e *TreeEmitter) snapshotFrontierLocked(cause string) *TreeSnapshot {
 	for _, id := range sortedByDepthLocked(s, directChildren) {
 		e.emitSnapshotNode(out, id, false)
 	}
+
+	// FrontierIDs: the exact emitted-node set (parents ∪ direct-children). Built
+	// here so SnapshotWithTreePartial can scope the partial detail capture to
+	// exactly what the tree shipped — same set, same lock, no recompute. Sorted
+	// for deterministic parity assertions.
+	out.FrontierIDs = make([]string, 0, len(parentSet)+len(directChildren))
+	for id := range parentSet {
+		out.FrontierIDs = append(out.FrontierIDs, id)
+	}
+	for id := range directChildren {
+		out.FrontierIDs = append(out.FrontierIDs, id)
+	}
+	sort.Strings(out.FrontierIDs)
 
 	// out.Seq is the resume cursor the client sends back as Last-Event-ID on
 	// reconnect. It MUST be the STORE head seq (s.seq), NOT the emitter's
@@ -1008,7 +1029,17 @@ func (e *TreeEmitter) ExpandChildren(parentID, cursor string, limit int) (nodes 
 	}
 	s := e.store
 	s.mu.RLock()
-	defer s.mu.RUnlock()
+	nodes, hasMore, nextCursor, stale = e.expandChildrenLocked(parentID, cursor, limit)
+	s.mu.RUnlock()
+	return nodes, hasMore, nextCursor, stale
+}
+
+// expandChildrenLocked is the page-computation core shared by ExpandChildren and
+// ExpandChildrenWithDetail. Caller MUST hold s.mu (at least RLock). Extracted
+// verbatim from the former ExpandChildren body so the public ExpandChildren
+// behavior is byte-identical.
+func (e *TreeEmitter) expandChildrenLocked(parentID, cursor string, limit int) (nodes []Node, hasMore bool, nextCursor string, stale bool) {
+	s := e.store
 	kids := s.children[parentID]
 	start := 0
 	if cursor != "" {
@@ -1049,4 +1080,53 @@ func (e *TreeEmitter) ExpandChildren(parentID, cursor string, limit int) (nodes 
 		e.MarkLoaded(parentID)
 	}
 	return nodes, hasMore, nextCursor, false
+}
+
+// ExpandChildrenWithDetail (Direction-3 stage-1 slice A, decision D2) captures
+// the structural page AND the bounded detail bundle for the page's node IDs
+// under a SINGLE s.mu.RLock, so the page and its detail facets cannot diverge
+// across an interleaving writer (the split-capture hazard the SnapshotWithTree
+// rationale closes — split capture is unsafe). The bundle per returned ID =
+// session + GateFacts + activity + lastAgents + currentVerbs (D5),
+// PAGE-BOUNDED: only this page's direct children are captured — it never
+// detail-hydrates all descendants or turns a 50-node page into an unbounded
+// response. Questions/permissions/unread are carried authoritative-global (a
+// frontier-subset by the active-promotion invariant; authoritative-replace
+// keeps the client's notification center in sync on expand); todos/statuses/
+// messages omitted. Reuses capturePartialDetailLocked (page-ID set as the
+// "frontier") + materializeSnapshot (lock-free materialization), then stamps a
+// PartialMeta so the client's scoped installer (applyScopedSnapshot, D3) applies
+// it via merge-frontier / replace-global / ignore-omitted rather than wholesale.
+func (e *TreeEmitter) ExpandChildrenWithDetail(parentID, cursor string, limit int) (nodes []Node, hasMore bool, nextCursor string, stale bool, detail Snapshot) {
+	if limit <= 0 {
+		limit = defaultTreeExpandLimit
+	}
+	s := e.store
+	s.mu.RLock()
+	nodes, hasMore, nextCursor, stale = e.expandChildrenLocked(parentID, cursor, limit)
+	// Capture the detail bundle for EXACTLY this page's IDs under the SAME RLock.
+	// A stale-cursor empty page → empty pageIDs → empty per-ID facets (the global
+	// Q/P/unread are still captured, which is correct: a stale expand still
+	// refreshes the authoritative notification sets).
+	pageIDs := make(map[string]bool, len(nodes))
+	scope := make([]string, 0, len(nodes))
+	for _, n := range nodes {
+		pageIDs[n.ID] = true
+		scope = append(scope, n.ID)
+	}
+	cap := s.capturePartialDetailLocked(pageIDs)
+	s.mu.RUnlock()
+	detail = s.materializeSnapshot(cap)
+	sort.Strings(scope)
+	detail.Partial = &PartialMeta{
+		Mode:  "expand-page",
+		Scope: scope,
+		Authority: map[string]string{
+			"sessions": "frontier", "gate": "frontier", "activity": "frontier",
+			"lastAgents": "frontier", "currentVerbs": "frontier",
+			"questions": "global", "permissions": "global", "unread": "global",
+			"todos": "omitted", "statuses": "omitted", "messages": "omitted",
+		},
+	}
+	return nodes, hasMore, nextCursor, stale, detail
 }

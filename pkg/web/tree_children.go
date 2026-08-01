@@ -12,11 +12,19 @@ import (
 // endpoint (§8). Mirrors the node.children delta-op data shape (§4) but as a
 // standalone HTTP JSON response, NOT an SSE event.
 type treeChildrenResponse struct {
-	ParentID    string       `json:"parentId"`
-	Nodes       []state.Node `json:"nodes"`
-	HasMore     bool         `json:"hasMore"`
-	Cursor      string       `json:"cursor,omitempty"`
-	StaleCursor bool         `json:"staleCursor,omitempty"`
+	ParentID    string          `json:"parentId"`
+	Nodes       []state.Node    `json:"nodes"`
+	HasMore     bool            `json:"hasMore"`
+	Cursor      string          `json:"cursor,omitempty"`
+	StaleCursor bool            `json:"staleCursor,omitempty"`
+	// Detail (Direction-3 stage-1 slice A, D2) is the page-bounded detail bundle
+	// for the returned Nodes: per-ID session + GateFacts + activity + lastAgents +
+	// currentVerbs (D5), captured under the SAME single RLock as the structural
+	// page (split capture is unsafe per the SnapshotWithTree rationale). nil for
+	// a stale-cursor empty page. The client's scoped installer (applyScopedSnapshot)
+	// applies it via merge-frontier / replace-global / ignore-omitted using the
+	// embedded PartialMeta. Carried ONLY on the tree=2 expand path.
+	Detail *state.Snapshot `json:"detail,omitempty"`
 }
 
 // handleTreeChildren implements GET /vh/tree/children (§8 expand protocol).
@@ -53,7 +61,11 @@ func (s *Server) handleTreeChildren(w http.ResponseWriter, r *http.Request) {
 	// transient emitter still computes the correct page and MarkLoads on the
 	// terminal batch.
 	emitter := state.NewTreeEmitter(agg.Store(), reqDir(r))
-	nodes, hasMore, nextCursor, stale := emitter.ExpandChildren(id, cursor, limit)
+	// D2: capture the structural page AND its page-bounded detail bundle under
+	// one RLock (ExpandChildrenWithDetail) so an expand supplies the per-ID
+	// detail facets coherently with the page — closing G1 (expand is a detail
+	// supplier) without a separate round-trip or split-capture hazard.
+	nodes, hasMore, nextCursor, stale, detail := emitter.ExpandChildrenWithDetail(id, cursor, limit)
 	// L-01 serialization guard: a nil Nodes slice would serialize as JSON
 	// "null", violating the empty-result wire contract ([]). Normalize at this
 	// single response boundary so the wire shape is always an array.
@@ -65,6 +77,7 @@ func (s *Server) handleTreeChildren(w http.ResponseWriter, r *http.Request) {
 		Nodes:       nodes,
 		HasMore:     hasMore,
 		StaleCursor: stale,
+		Detail:      &detail,
 	}
 	if nextCursor != "" {
 		resp.Cursor = nextCursor

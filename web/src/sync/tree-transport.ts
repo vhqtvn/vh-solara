@@ -77,7 +77,7 @@ import type { TreeOp, TreeNode } from "./treeMap";
 import { applyPinsSnapshot, applyPinsUpdated } from "../pins";
 import { applyLabelsSnapshot, applyLabelsUpdated } from "../labels";
 import { decodeSnapshot } from "./decode";
-import { applySnapshot, applySessionEvent, applyMessageEvent } from "./reconcile";
+import { applySnapshot, applyScopedSnapshot, applySessionEvent, applyMessageEvent } from "./reconcile";
 import { refreshOpenSessions } from "./refresh";
 import {
   markAuthoritativeRecovery,
@@ -573,7 +573,12 @@ function applyDetailIndependent(snap: Snapshot): void {
     setExpectTreeSnap(false);
     maybeResolveReconcile();
   }
-  applySnapshot(snap);
+  // D3: a frontier-scoped partial detail frame (snap.partial present) installs
+  // via the scoped merge/replace path, NOT wholesale projectSnapshot — so buried
+  // detail outside the frontier scope is preserved. Both install paths branch
+  // identically (this independent path + the coherent tryInstall path).
+  if (snap.partial) applyScopedSnapshot(snap);
+  else applySnapshot(snap);
   if (!treeSnapDone) {
     treeSnapDone = true;
     if (treeT1) recordLatency("tree", "snap", performance.now() - treeT1);
@@ -637,10 +642,14 @@ function tryInstall(owner: PendingCaptureOwner): void {
   owner.installed = true;
   let backfillIds: string[] = [];
   batch(() => {
-    // Detail projection (existing applySnapshot path). applySnapshot
-    // wholesale-replaces state.sessions and sets state.cursor = snap.seq; inside
-    // the batch this and the tree seed are ONE reactive flush.
-    applySnapshot(detail.snap);
+    // Detail projection. A frontier-scoped partial (snap.partial present)
+    // installs via the scoped merge/replace path (D3) — same branch as the
+    // independent applyDetailIndependent path — so a staged partial can never
+    // fall through to wholesale replacement. applySnapshot/applyScopedSnapshot
+    // wholesale-replaces (or scoped-merges) state.sessions and sets state.cursor
+    // = snap.seq; inside the batch this and the tree seed are ONE reactive flush.
+    if (detail.snap.partial) applyScopedSnapshot(detail.snap);
+    else applySnapshot(detail.snap);
     // Tree projection (existing seedTreeStore path). Replaces treeMap in one
     // signal update; userExpanded preserved.
     seedTreeStore(tree.nodes);
@@ -1448,7 +1457,14 @@ export async function expandTreeNode(id: string): Promise<void> {
         hasMore?: boolean;
         cursor?: string | null;
         staleCursor?: boolean;
+        detail?: Snapshot;
       }>(raw);
+      // B (completion): the server ships a page-scoped detail bundle
+      // (ExpandChildrenWithDetail) alongside the structural page. Install it via
+      // the scoped installer so the expanded children get session/GateFacts/
+      // activity/lastAgents/currentVerbs + global Q/P/unread. MERGE (page IDs as
+      // frontier scope) — preserves buried detail; no deletion from omission.
+      if (decoded.detail) applyScopedSnapshot(decoded.detail);
       return {
         parentId: decoded.parentId ?? nodeId,
         nodes: (decoded.nodes ?? []) as any[],
