@@ -34,6 +34,14 @@ test("switching sessions re-targets the message stream", async ({ page }) => {
   await expect(page.locator(".msg").first()).toBeVisible({ timeout: 8000 });
   const demoMsgs = await page.locator(".msg").count();
   expect(demoMsgs).toBeGreaterThan(0);
+  // Confirm demo's seeded first-turn content (m1) is ACTUALLY rendered before
+  // switching — otherwise the post-switch absence check below could pass
+  // vacuously (e.g. if the m1 seed text drifted, the fixture didn't load, or a
+  // prior spec left demo in an unexpected state). Bounded so a genuinely-broken
+  // demo surface fails loudly here rather than as a false-green absence later.
+  await expect(page.getByText("Refactor the parser and explain the change.")).toBeVisible({
+    timeout: 8000,
+  });
 
   // Switch to a different root — the transcript must re-target to that session
   // (not keep showing demo's messages).
@@ -48,7 +56,7 @@ test("switching sessions re-targets the message stream", async ({ page }) => {
   // `toHaveCount(0)` breaks when `other` itself is polluted (it legitimately
   // retains its own turns). But demo's static seed text (m1) can never appear
   // in `other`'s transcript, so its absence proves the stream re-targeted.
-  // Marker literal mirrors pkg/fixtures/opencode.go:73 (demo m1 static seed) —
+  // Marker literal mirrors pkg/fixtures/opencode.go:150 (demo m1 static seed) —
   // keep in sync if that seed text ever changes.
   await expect(page.getByText("Refactor the parser and explain the change.")).toHaveCount(0);
 });
