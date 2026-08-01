@@ -23,6 +23,18 @@ import (
 	"time"
 )
 
+// Cross-file mirror — KEEP IN SYNC:
+// tests/e2e-docker/mint_msg_id.py replicates MintMessageID's byte layout in
+// Python for the docker-gold e2e harness (it mints pre-known IDs the assert
+// helpers match on). It is NOT exercised by Go tests. If you change ANY part
+// of the layout — the "msg_" prefix, the 6-byte/12-hex time prefix, the
+// 14-char base62 suffix, opencodeIDAlphabet, opencodeIDSuffixLen, or the
+// now = unixMilli*0x1000 + counter encoding — you MUST co-update
+// tests/e2e-docker/mint_msg_id.py or the docker-gold e2e assertions will
+// silently drift. (mint_msg_id.py:4-8 already points back here.) The Go
+// format-invariant test TestMintMessageID_Format (id_test.go) covers the Go
+// side; it is NOT duplicated for Python.
+
 // opencodeIDAlphabet mirrors sst/opencode's base62 alphabet (id.ts randomBase62):
 // digits, then UPPER-case, then lower-case. The ordering within the alphabet does
 // not affect sort order (ordering is carried by the time-ordered hex prefix); only
