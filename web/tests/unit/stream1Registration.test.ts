@@ -143,6 +143,8 @@ function node(id: string, parentId: string | null = null): any {
 const EXPECTED_TREE_LISTENER_KINDS = [
   "activity",
   "activity.verb",
+  "labels.snapshot",
+  "labels.updated",
   "lastAgent.set",
   "notice",
   "permission.blocked",
@@ -302,13 +304,15 @@ describe("Stream1 connect() listener manifest", () => {
   });
 
   // -------------------------------------------------------------------------
-  // Fast-path listeners — notice / pins.snapshot / pins.updated / ping. These
-  // are disjoint from tree/detail coherent state and never await the owner.
+  // Fast-path listeners — notice / pins.snapshot / pins.updated / labels.* /
+  // ping. These are disjoint from tree/detail coherent state and never await
+  // the owner.
   //   notice      → alerts.handleNotice (spied)
   //   pins.*      → pins.applyPins{Snapshot,Updated} (spied)
+  //   labels.*    → labels.applyLabels{Snapshot,Updated} (spied)
   //   ping        → markTreeTransportSeen → state.lastSeen mirror (throttled)
   // -------------------------------------------------------------------------
-  it("notice + pins.snapshot + pins.updated reach their handlers; ping refreshes the transport clock", async () => {
+  it("notice + pins.snapshot + pins.updated + labels.snapshot + labels.updated reach their handlers; ping refreshes the transport clock", async () => {
     stream.connect();
     const es = treeESes()[0];
     es.simulateOpen();
@@ -330,6 +334,17 @@ describe("Stream1 connect() listener manifest", () => {
     expect(pinsUpdSpy).toHaveBeenCalled();
     pinsSnapSpy.mockRestore();
     pinsUpdSpy.mockRestore();
+
+    // labels.snapshot / labels.updated → labels.applyLabels{Snapshot,Updated}.
+    const labels = await import("../../src/labels");
+    const labelsSnapSpy = vi.spyOn(labels, "applyLabelsSnapshot");
+    const labelsUpdSpy = vi.spyOn(labels, "applyLabelsUpdated");
+    es.fire("labels.snapshot", { revision: 1, groups: [], tags: [], tagIdsByRootSessionId: {} });
+    es.fire("labels.updated", { revision: 2, groups: [], tags: [], tagIdsByRootSessionId: {} });
+    expect(labelsSnapSpy).toHaveBeenCalled();
+    expect(labelsUpdSpy).toHaveBeenCalled();
+    labelsSnapSpy.mockRestore();
+    labelsUpdSpy.mockRestore();
 
     // ping → markTreeTransportSeen refreshes treeLastSeen, mirrored (throttled
     // to ~1/sec) into state.lastSeen. Bypass the throttle: connect()'s

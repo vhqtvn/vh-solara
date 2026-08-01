@@ -75,6 +75,7 @@ import {
 import { seedTreeStore, applyTreeOpStore, expandedButUnloadedIds } from "./treeState";
 import type { TreeOp, TreeNode } from "./treeMap";
 import { applyPinsSnapshot, applyPinsUpdated } from "../pins";
+import { applyLabelsSnapshot, applyLabelsUpdated } from "../labels";
 import { decodeSnapshot } from "./decode";
 import { applySnapshot, applySessionEvent, applyMessageEvent } from "./reconcile";
 import { refreshOpenSessions } from "./refresh";
@@ -1227,6 +1228,37 @@ function registerAuxiliaryListeners(es: EventSource, gen: number): void {
       return;
     }
     applyPinsUpdated(raw);
+  });
+  // labels.* — the worker-wide grouping+tagging authority. Same transient
+  // contract as pins.* (no `id:` line, not in the replay ring; reconnect catches
+  // up via labels.snapshot). Disjoint from tree/detail state (the labels facade
+  // owns its signals), so they are NOT subject to treeSnapshotDecoding
+  // serialization or the busy gate — only the connection-generation guard and
+  // the liveness clock apply, mirroring the pins.* listeners above. Validation +
+  // the revision-monotonicity guard live inside the facade.
+  es.addEventListener("labels.snapshot", (e) => {
+    if (gen !== treeGen) return;
+    markTreeSeen();
+    let raw: unknown;
+    try {
+      raw = JSON.parse((e as MessageEvent).data);
+    } catch (err) {
+      log.warn("sync", "malformed labels.snapshot frame", { err });
+      return;
+    }
+    applyLabelsSnapshot(raw);
+  });
+  es.addEventListener("labels.updated", (e) => {
+    if (gen !== treeGen) return;
+    markTreeSeen();
+    let raw: unknown;
+    try {
+      raw = JSON.parse((e as MessageEvent).data);
+    } catch (err) {
+      log.warn("sync", "malformed labels.updated frame", { err });
+      return;
+    }
+    applyLabelsUpdated(raw);
   });
   // Transport-only: refresh treeLastSeen (and the debug mirror) but NOT
   // treeContentSeen, so a ping-only stream (transport alive, zero content) lets
