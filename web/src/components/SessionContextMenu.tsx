@@ -2,6 +2,17 @@ import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show }
 import { abortSession, sessionProjectID, sessionWorking, state } from "../sync";
 import { suggestTitle } from "../sessionTitle";
 import { isPinned, togglePin, movePinnedByOffset, reconciledPinnedOrder, pinsPending, pinsLastError, clearPinsError } from "../pins";
+import {
+  createGroup,
+  moveRootToGroup,
+  labelsGroups,
+  labelsPending as labelsPendingFacade,
+  createTag,
+  addRootTag,
+  removeRootTag,
+  labelsTags,
+} from "../labels";
+import { groupOf, tagsOf } from "../sync/treeSelectors";
 import { exportSessionMarkdown } from "../export";
 import { pushNotification } from "../notify";
 import { archiveSession, fetchDescendants, ArchiveDriftError, type SessionSummary } from "../archive";
@@ -16,6 +27,8 @@ import {
 import { displayName } from "../projectSettings";
 import Icon from "./Icon";
 import TextPromptDialog from "./TextPromptDialog";
+import { defaultColorForIndex, labelColorVar } from "./labelPalette";
+import ctxmStyles from "./SessionContextMenu.module.css";
 
 const copy = (text: string) => void navigator.clipboard?.writeText(text);
 
@@ -169,6 +182,13 @@ export default function SessionContextMenu() {
     confirm: string;
   } | null>(null);
 
+  // New-group dialog (slice 6 labels). The ONLY entry point to group creation is
+  // a root's context menu → "Group" ▸ "New group…", so we capture that root id
+  // here; the dialog's onConfirm creates the group AND moves the root into it
+  // (the operator's evident intent — an empty group is not a useful outcome from
+  // this surface). null when no new-group dialog is open.
+  const [newGroupFor, setNewGroupFor] = createSignal<{ rootId: string } | null>(null);
+
   function rename(id: string, current: string) {
     closeSessionMenu();
     setPrompt({ id, title: "Rename session", initial: current, confirm: "Rename" });
@@ -282,6 +302,134 @@ export default function SessionContextMenu() {
         >
           <Icon name="stop" size={14} /> Stop{sessionWorking(props.id) ? "" : " (force)"}
         </button>
+        {/* ── Labels (slice 6) — ROOT sessions only. A root is a node with no
+            parent (mirrors the pin Move up/down gate above). Group assigns a
+            root to at most one colored group (exclusive membership);
+            "New group…" creates a group AND moves this root into it; an
+            existing-group choice shows a ✓ on the current group and is an
+            idempotent no-op when re-clicked; "Remove from group" ungroups.
+            Tags is an inline editor that STAYS OPEN while toggling so the
+            operator can set several tags at once (no closeSessionMenu on
+            toggle); the input creates a new tag definition on Enter (create-
+            if-absent by case-insensitive name) and assigns it in one flow. ── */}
+        <Show when={!state.sessions[props.id]?.parentID}>
+          <div class="ctxm-sep" />
+          <div class="ctxm-grouplabel">Group</div>
+          {/* Single-column (not the 2-col Copy grid): group names vary in
+              length and each row carries a color dot + optional ✓, so full-
+              width tap targets read better on mobile. Mirrors the ctxm-item
+              rhythm otherwise. */}
+          <div class={ctxmStyles.groupList}>
+            <button
+              type="button"
+              class="ctxm-item"
+              disabled={labelsPendingFacade()}
+              onClick={() => {
+                setNewGroupFor({ rootId: props.id });
+                closeSessionMenu();
+              }}
+            >
+              <Icon name="plus" size={14} /> New group…
+            </button>
+            <For each={labelsGroups()}>
+              {(g) => {
+                const isCurrent = () => groupOf(props.id)?.id === g.id;
+                return (
+                  <button
+                    type="button"
+                    class="ctxm-item"
+                    classList={{ [ctxmStyles.groupChoiceOn]: isCurrent() }}
+                    aria-pressed={isCurrent()}
+                    disabled={labelsPendingFacade()}
+                    onClick={() => {
+                      void moveRootToGroup(props.id, g.id);
+                      closeSessionMenu();
+                    }}
+                  >
+                    <span
+                      class={ctxmStyles.groupDot}
+                      style={{ "--label-color": labelColorVar(g.color) }}
+                      aria-hidden="true"
+                    />
+                    <span class={ctxmStyles.groupChoiceName}>{g.name}</span>
+                    <Show when={isCurrent()}>
+                      <Icon name="check" size={13} />
+                    </Show>
+                  </button>
+                );
+              }}
+            </For>
+            <Show when={groupOf(props.id)}>
+              <button
+                type="button"
+                class="ctxm-item"
+                disabled={labelsPendingFacade()}
+                onClick={() => {
+                  void moveRootToGroup(props.id, null);
+                  closeSessionMenu();
+                }}
+              >
+                <Icon name="x" size={14} /> Remove from group
+              </button>
+            </Show>
+            <Show when={labelsGroups().length === 0}>
+              <div class={ctxmStyles.hint}>No groups yet — create one.</div>
+            </Show>
+          </div>
+          <div class="ctxm-grouplabel">Tags</div>
+          <div class={ctxmStyles.tagsEditor}>
+            <For each={labelsTags()}>
+              {(t) => {
+                const on = () => tagsOf(props.id).includes(t.id);
+                return (
+                  <button
+                    type="button"
+                    class={ctxmStyles.tagToggleChip}
+                    classList={{ [ctxmStyles.tagToggleOn]: on() }}
+                    aria-pressed={on()}
+                    style={{ "--label-color": labelColorVar(t.color) }}
+                    disabled={labelsPendingFacade()}
+                    onClick={() => void (on() ? removeRootTag(props.id, t.id) : addRootTag(props.id, t.id))}
+                  >
+                    <span class={ctxmStyles.tagDot} aria-hidden="true" />
+                    {t.name}
+                  </button>
+                );
+              }}
+            </For>
+            <input
+              class={ctxmStyles.tagInput}
+              type="text"
+              placeholder="Add tag…"
+              aria-label="Create and add a new tag"
+              disabled={labelsPendingFacade()}
+              onKeyDown={(e) => {
+                if (e.key !== "Enter") return;
+                const v = e.currentTarget.value.trim();
+                if (!v) return;
+                e.currentTarget.value = "";
+                // Create-if-absent (case-insensitive name match against the
+                // worker-wide registry) then assign to this root. createTag
+                // mints its own id and returns void, so the new tag is located
+                // by name post-create — the documented assign-after-create path.
+                void (async () => {
+                  const existing = labelsTags().find(
+                    (t) => t.name.toLowerCase() === v.toLowerCase(),
+                  );
+                  if (existing) {
+                    await addRootTag(props.id, existing.id);
+                    return;
+                  }
+                  await createTag(v, defaultColorForIndex(labelsTags().length));
+                  const created = labelsTags().find(
+                    (t) => t.name.toLowerCase() === v.toLowerCase(),
+                  );
+                  if (created) await addRootTag(props.id, created.id);
+                })();
+              }}
+            />
+          </div>
+        </Show>
         <div class="ctxm-sep" />
         {/* Copy/export: a 2-column grid so the menu stays short on small screens
             (the whole menu also scrolls as a safety net — see styles.css). */}
@@ -430,6 +578,30 @@ export default function SessionContextMenu() {
           const p = prompt();
           if (p) void setSessionTitle(p.id, v);
           setPrompt(null);
+        }}
+      />
+
+      {/* New-group dialog (slice 6 labels). Creates the group (default palette
+          color cycling by current group count) and moves the originating root
+          into it. Empty name cancels (TextPromptDialog submit gates on trim). */}
+      <TextPromptDialog
+        open={!!newGroupFor()}
+        title="New group"
+        label="Group name:"
+        placeholder="e.g. Backend"
+        confirmText="Create"
+        onCancel={() => setNewGroupFor(null)}
+        onConfirm={(v) => {
+          const f = newGroupFor();
+          setNewGroupFor(null);
+          if (!f) return;
+          void (async () => {
+            await createGroup(v, defaultColorForIndex(labelsGroups().length));
+            // createGroup mints its own id and returns void; locate the new
+            // group by name to move the root into it.
+            const created = labelsGroups().find((g) => g.name === v);
+            if (created) await moveRootToGroup(f.rootId, created.id);
+          })();
         }}
       />
     </>

@@ -14,3 +14,74 @@
   cursor: default;
   user-select: none;
 }
+
+/* ── Labels (slice 6) ──────────────────────────────────────────────────────
+   GPU-cheap by construction: solid colors + color-mix tints only. NO mask,
+   NO backdrop-filter, NO contain/content-visibility (the tree is a large
+   always-present surface; per AGENTS.md Firefox/WebRender guardrails those
+   patterns pin the GPU). */
+
+/* Pinned-group hint dot — a small solid dot beside a pinned root's title. The
+   --label-color is set inline by TreeRow from labelColorVar(); falls back to
+   --label-gray. Inherits .dot sizing from the global tree styles. */
+.groupHintDot {
+  --label-color: var(--label-gray);
+  background: var(--label-color);
+  /* Slightly smaller than the status dots — it's a quiet hint, not an alert. */
+  width: 7px;
+  height: 7px;
+  flex: none;
+  margin-left: -2px;
+  margin-right: 4px;
+}
+
+/* Root tag chips — a non-wrapping inline cluster at the end of tree-meta. Max
+   2 chips + an overflow "+N" are rendered by the caller; this just lays them
+   out. nowrap + overflow-hidden keeps a long name from forcing a 2nd line
+   (mobile density rule from the plan's UX layer). */
+.rowTags {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  margin-left: 4px;
+}
+
+/* A single chip: a colored dot + a 1–2 char abbreviation. Tinted background
+   derived from the same --label-color so the chip reads as "belonging to" its
+   tag at a glance, with the dot as the strong color anchor. */
+.tagChip {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 1px 5px 1px 4px;
+  border-radius: 9px;
+  font-size: 10px;
+  line-height: 14px;
+  letter-spacing: 0.02em;
+  color: var(--fg-dim);
+  background: color-mix(in srgb, var(--label-color, var(--label-gray)) 16%, transparent);
+  border: 1px solid color-mix(in srgb, var(--label-color, var(--label-gray)) 30%, transparent);
+}
+
+/* The solid color dot inside a chip — the saturated anchor (the bg is a tint). */
+.tagDot {
+  width: 6px;
+  height: 6px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--label-color, var(--label-gray));
+}
+
+/* The "+N" overflow chip — a quiet count, not a tag. No dot, neutral tint, so
+   it reads as "N more" rather than a real tag of color gray. */
+.tagOverflow {
+  color: var(--fg-dim);
+  background: transparent;
+  border-color: transparent;
+  padding-left: 5px;
+  padding-right: 5px;
+}

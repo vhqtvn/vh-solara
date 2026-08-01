@@ -94,3 +94,95 @@
   font: inherit;
 }
 .pinErrBtn:hover { background: color-mix(in srgb, var(--fg) 10%, transparent); }
+
+/* ── Tag-filter chip rail (slice 6 labels) ──────────────────────────────────
+   A horizontal-scrolling rail of tag chips above the tree, revealed by the
+   header tag-icon (mirrors the search toggle). Mobile density: the rail
+   scrolls horizontally with a HIDDEN scrollbar (scrollbar-width:none + the
+   ::-webkit-scrollbar twin) so a long registry doesn't wrap and eat vertical
+   space; on desktop the chips wrap naturally (flex-wrap). Each chip is
+   aria-pressed and carries the tag's color dot. Solid colors + color-mix
+   only — GPU-cheap (no mask/backdrop/contain on this rail; it is short and
+   transient, never a hot scroll surface). */
+.filterRail {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 6px;
+  margin: 4px 8px;
+  padding: 2px 0;
+  overflow-x: auto;
+  scrollbar-width: none; /* Firefox: hide scrollbar */
+}
+.filterRail::-webkit-scrollbar {
+  display: none; /* Chromium/Safari: hide scrollbar */
+}
+/* On finer pointers / wider screens, wrap instead of scroll so the whole
+   registry is visible at once. (pointer:coarse keeps the scroll behavior on
+   touch, where vertical space is precious.) */
+@media (pointer: fine) {
+  .filterRail {
+    flex-wrap: wrap;
+    overflow-x: visible;
+  }
+}
+
+.filterChip {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--fg);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.filterChip:hover {
+  background: color-mix(in srgb, var(--fg) 7%, transparent);
+}
+
+.filterDot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--label-color, var(--label-gray));
+}
+
+/* Pressed (active filter) chip: tinted with the tag color so the active
+   selection reads at a glance. */
+.filterChipOn {
+  border-color: color-mix(in srgb, var(--label-color, var(--label-gray)) 55%, var(--border));
+  background: color-mix(in srgb, var(--label-color, var(--label-gray)) 18%, transparent);
+}
+
+.filterClear {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 4px 8px;
+  border: 0;
+  background: transparent;
+  color: var(--fg-dim);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.filterClear:hover {
+  color: var(--fg);
+}
+
+.filterEmpty {
+  flex: none;
+  font-size: 12px;
+  color: var(--fg-dim);
+  white-space: nowrap;
+}

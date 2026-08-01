@@ -20,6 +20,7 @@ import RelTime from "./RelTime";
 import { agentDisplay, displayName } from "../projectSettings";
 import { working, type EffectiveTreeMode } from "../sync/treeSelectors";
 import type { TreeNode } from "../sync/treeMap";
+import { abbreviate, labelColorVar } from "./labelPalette";
 import styles from "./TreeRow.module.css";
 
 // The context-menu trigger handlers (right-click desktop / long-press touch),
@@ -66,6 +67,19 @@ export interface TreeRowProps {
   // populated under tree=2 (unread.set/unread.clear events + snapshot unread
   // list). Passed in (not read from the store) so TreeRow stays presentational.
   unread?: boolean;
+  // ── Labels (slice 6) — both OPTIONAL + presentational, so callers that omit
+  //    them (existing unit tests, flat search rows) render unchanged. ──
+  // tags: the ROOT's tag chips to render in the meta line (dot + abbreviation,
+  // max 2 + "+N" overflow). Caller computes the visible set via visibleTagChips
+  // (labelPalette) from tagsOf(node.id) + the tag registry; this row just paints
+  // them, including a possible synthetic "+N" overflow chip (no dot).
+  // A getter (not a plain array) so a labels-signal change re-runs the chip
+  // render without re-keying the whole row.
+  tags?: () => { id: string; name: string; color: string; overflow?: boolean }[];
+  // groupHint: when this row is PINNED but belongs to a group, a small color
+  // dot is rendered beside the title so the operator sees where it returns on
+  // unpin. null/undefined → no hint. Getter for the same reactivity reason.
+  groupHint?: () => { color: string; name: string } | null;
 }
 
 export function TreeRow(props: TreeRowProps) {
@@ -220,6 +234,20 @@ export function TreeRow(props: TreeRowProps) {
             </span>
           </Show>
           <span class="tree-title">{displayName(node().title || node().id)}</span>
+          {/* Pinned-group hint (slice 6): a pinned root that belongs to a group
+              shows a small color dot beside its title so the operator sees where
+              it returns on unpin. Rendered only when the caller passes a hint
+              (pinned section). Pure presentation of the passed color/name. */}
+          <Show when={props.groupHint?.()}>
+            {(hint) => (
+              <span
+                class={`dot ${styles.groupHintDot}`}
+                style={{ "--label-color": labelColorVar(hint().color) }}
+                data-tip={`Pinned · returns to group “${hint().name}” on unpin`}
+                aria-label={`Pinned, in group ${hint().name}`}
+              />
+            )}
+          </Show>
           <span class="tree-meta">
             {/* The "▸ N" badge appears ONLY on a non-flat, non-leaf node in a
                 collapsed/filtered display state (§3: descendantCount drives the
@@ -233,6 +261,31 @@ export function TreeRow(props: TreeRowProps) {
               </span>
             </Show>
             <RelTime class="tree-time" ms={node().updatedMs} />
+            {/* Root tag chips (slice 6): dot + abbreviation, rendered ONLY when
+                the caller passes a non-empty tags() (root rows in the labeled
+                sections). The caller pre-computes the visible set (max 2 + an
+                overflow "+N" chip) so this stays presentational. Never wraps to
+                a 2nd line (mobile density) — .rowTags is flex-nowrap, ellipsized. */}
+            <Show when={props.tags?.()}>
+              {(tags) => (
+                <span class={styles.rowTags} aria-label={`${tags().length} tag${tags().length === 1 ? "" : "s"}`}>
+                  <For each={tags()}>
+                    {(t) => (
+                      <span
+                        class={styles.tagChip}
+                        classList={{ [styles.tagOverflow]: !!t.overflow }}
+                        style={{ "--label-color": labelColorVar(t.color) }}
+                      >
+                        <Show when={!t.overflow}>
+                          <span class={styles.tagDot} aria-hidden="true" />
+                        </Show>
+                        {t.overflow ? t.name : abbreviate(t.name)}
+                      </span>
+                    )}
+                  </For>
+                </span>
+              )}
+            </Show>
           </span>
         </span>
       </button>

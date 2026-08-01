@@ -283,6 +283,39 @@ describe("selectLabeledSections — pin / group exactly-once + d_F1 preserved", 
     expect(out.pinned.map((p) => p.node.id)).toEqual(["C"]);
     expect(out.pinned[0].group).toBeNull(); // C is not a root → no group
   });
+
+  // F1 (filter×pin matrix): a pinned NON-root (deep pin) is DROPPED from the
+  // pinned section under an active tag filter. Labels are root-only, so a deep
+  // pin can never carry a tag assignment and cannot match a non-empty filter —
+  // selectLabeledSections skips it (parentId !== null → continue). With NO
+  // filter it still surfaces (the case above); the drop is filter-gated. This
+  // is the deterministic proof of the contract the slice-6 e2e also exercises
+  // (the e2e is brittle to set up because a non-root must be expanded into the
+  // tree map first; the selector logic is fully covered here).
+  it("F1: a deep (non-root) pin is dropped from the pinned section under an active filter", () => {
+    const map = sampleMap(); // chain R → A → B → C
+    const tags = [{ id: "t1", name: "T1", color: "#" }];
+    // R (a root) carries t1 so the filter has a matching root; C is the deep pin.
+    const d = doc([], { R: ["t1"] }, tags);
+    // No filter: C surfaces in pinned.
+    const noFilter = selectLabeledSections({
+      map,
+      rankedRoots: rankedRoots(map, ["R1", "R"]),
+      pinnedOrder: ["C"],
+      doc: d,
+      selectedTagIds: [],
+    });
+    expect(noFilter.pinned.map((p) => p.node.id)).toEqual(["C"]);
+    // Under filter: C (parentId !== null) is dropped from pinned.
+    const filtered = selectLabeledSections({
+      map,
+      rankedRoots: rankedRoots(map, ["R1", "R"]),
+      pinnedOrder: ["C"],
+      doc: d,
+      selectedTagIds: ["t1"],
+    });
+    expect(filtered.pinned).toEqual([]);
+  });
 });
 
 describe("selectLabeledSections — AND tag filtering", () => {

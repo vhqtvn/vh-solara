@@ -1,0 +1,239 @@
+/* SessionTree — labeled-group rendering (slice 6).
+   The tree reuses the legacy GLOBAL `tree-*` classes (legacy.css) for the rows
+   themselves; this co-located module holds ONLY the new labeled-group chrome:
+   the collapsible group header (color dot + name + count + caret) and its
+   inline manage popover (rename / move / recolor / delete). See
+   docs/ai/web-css-architecture.md for the module-vs-global convention.
+   GPU-cheap: solid colors + color-mix tints only. NO mask, NO backdrop-filter,
+   NO contain/content-visibility (the tree is a large always-present surface). */
+
+/* A whole group section: header + body. */
+.group {
+  display: flex;
+  flex-direction: column;
+}
+
+/* The header row: a full-width toggle button (caret+dot+name+count) on the left
+   + a small manage-popover trigger on the right. Sticky-free (the tree scrolls
+   as one). Aligns with .tree-row height visually but is its own row kind. */
+.groupHeaderRow {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 0 2px;
+  margin-top: 4px;
+}
+
+/* The collapse toggle — a button so it's keyboard-focusable + aria-expanded. */
+.groupToggle {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  background: transparent;
+  border: 0;
+  color: var(--fg-dim);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 4px 6px;
+  border-radius: 6px;
+  cursor: pointer;
+  text-align: left;
+}
+.groupToggle:hover {
+  background: color-mix(in srgb, var(--fg) 6%, transparent);
+  color: var(--fg);
+}
+.groupToggle:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
+.groupToggle:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* The collapse caret — rotates to point right when collapsed (closed). Open
+   state (expanded) points down via the .groupCaretOpen modifier. */
+.groupCaret {
+  display: inline-flex;
+  flex: none;
+  transition: transform 0.12s ease;
+  transform: rotate(-90deg);
+}
+.groupCaretOpen {
+  transform: rotate(0deg);
+}
+
+/* The color dot — the saturated anchor for the group. Inline --label-color set
+   by labelColorVar(); falls back to gray. */
+.groupDot {
+  --label-color: var(--label-gray);
+  width: 9px;
+  height: 9px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--label-color);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--label-color) 28%, transparent);
+}
+
+.groupName {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The member count — a quiet pill reflecting the VISIBLE (filter-applied)
+   roots in this group. */
+.groupCount {
+  flex: none;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--fg-dim);
+  background: color-mix(in srgb, var(--fg) 8%, transparent);
+  border-radius: 8px;
+  padding: 0 6px;
+  line-height: 16px;
+}
+
+/* The manage-popover trigger + its anchoring wrapper. */
+.groupManageWrap {
+  position: relative;
+  flex: none;
+}
+.groupManageBtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  background: transparent;
+  border: 0;
+  color: var(--fg-dim);
+  border-radius: 5px;
+  cursor: pointer;
+}
+.groupManageBtn:hover {
+  background: color-mix(in srgb, var(--fg) 8%, transparent);
+  color: var(--fg);
+}
+.groupManageBtn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* The popover menu — anchored to the trigger's bottom-right. */
+.groupMenu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: var(--z-popover);
+  min-width: 180px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 4px;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 12px 40px #0009;
+}
+.groupMenuItem {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  text-align: left;
+  width: 100%;
+  background: transparent;
+  border: 0;
+  color: var(--fg);
+  cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+  padding: 6px 8px;
+  border-radius: 6px;
+}
+.groupMenuItem:hover {
+  background: var(--bg);
+}
+.groupMenuItem:disabled {
+  color: var(--fg-dim);
+  cursor: default;
+  opacity: 0.6;
+}
+.groupMenuItem:disabled:hover {
+  background: transparent;
+}
+.groupMenuDanger {
+  color: var(--danger-fg);
+}
+.groupMenuDanger:hover {
+  background: color-mix(in srgb, var(--danger) 14%, transparent);
+}
+.groupMenuSep {
+  height: 1px;
+  margin: 3px 0;
+  background: var(--border);
+}
+
+/* The color-swatch row — the server-validated palette. Each swatch is a button
+   (aria-pressed = current); the active one gets a ring. */
+.groupSwatches {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 4px 8px;
+}
+.groupSwatch {
+  width: 18px;
+  height: 18px;
+  flex: none;
+  border-radius: 50%;
+  border: 2px solid transparent;
+  background: var(--label-color, var(--label-gray));
+  cursor: pointer;
+  padding: 0;
+}
+.groupSwatch:hover {
+  transform: scale(1.12);
+}
+.groupSwatch:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.groupSwatch:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+.groupSwatchOn {
+  border-color: var(--fg);
+  box-shadow: 0 0 0 2px var(--bg-2);
+}
+
+/* The group body — its root rows. A subtle left tint bar ties the rows to the
+   group's color so a collapsed-then-expanded group reads as one cluster. */
+.groupBody {
+  position: relative;
+  padding-left: 6px;
+}
+.groupBody::before {
+  content: "";
+  position: absolute;
+  left: 7px;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: color-mix(in srgb, var(--label-color, var(--label-gray)) 0%, transparent);
+  /* The rail is intentionally near-invisible by default (color comes from the
+     header dot); kept as a structural hook. Avoids per-element color plumbing
+     that would re-rasterize on every labels mutation. */
+  opacity: 0;
+}

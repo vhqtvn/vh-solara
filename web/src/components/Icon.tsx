@@ -158,6 +158,17 @@ const PATHS: Record<string, () => JSX.Element> = {
       <circle cx="15" cy="18" r="1.4" fill="currentColor" stroke="none" />
     </>
   ),
+  // Price tag — the labels feature (root-session tags + the tag-filter toggle).
+  // A simple tag outline with a hole; the filter chip rail toggles via this.
+  tag: () => (
+    <>
+      <path d="M20.59 13.41 11 3.82A2 2 0 0 0 9.59 3H4a1 1 0 0 0-1 1v5.59A2 2 0 0 0 3.59 11l9.59 9.59a2 2 0 0 0 2.83 0l4.59-4.59a2 2 0 0 0 0-2.83z" />
+      <circle cx="7.5" cy="7.5" r="1.2" fill="currentColor" stroke="none" />
+    </>
+  ),
+  // Folder — the labels group (browser-tab-group style). Used in the context
+  // menu's Group submenu affordance + the inline group header on hover.
+  folder: () => <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />,
 };
 
 export default function Icon(props: { name: keyof typeof PATHS | string; size?: number }) {

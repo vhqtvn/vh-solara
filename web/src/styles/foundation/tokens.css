@@ -56,6 +56,22 @@
   --ok: #3fb950;
   --sel: #1f6feb; /* selection / "current" highlight base */
 
+  /* Root-session label palette (groups + tags). A FIXED saturated mid-tone set
+     the server validates against (pkg/web labels.go: red orange amber green teal
+     blue purple gray) — the UI MUST only offer these. Mid-tones read on both
+     light and dark chrome (same posture as --danger/--warn/--ok); tint/translucent
+     chip backgrounds are derived via color-mix at the use site. Defining them
+     here (not in a component module) keeps them as app-wide semantic tokens per
+     the CSS architecture: modules CONSUME var(--label-<color>), never redefine. */
+  --label-red: #f85149;
+  --label-orange: #db6d28;
+  --label-amber: #d29922;
+  --label-green: #3fb950;
+  --label-teal: #2dd4bf;
+  --label-blue: #58a6ff;
+  --label-purple: #bc8cff;
+  --label-gray: #8b949e;
+
   /* Markdown + chat coloring tokens (openchamber's theme model, ported). Most
      derive from the base palette via color-mix so every theme stays coherent;
      only --accent-2 is set per theme. Override any token in a theme block to

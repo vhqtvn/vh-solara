@@ -26,6 +26,7 @@ import {
 } from "./reducers";
 import { pushNotification } from "../notify";
 import { dropPinnedSession } from "../pins";
+import { dropLabelRoot } from "../labels";
 import { resetPageInFlight } from "./history";
 import { patchTreeAgent } from "./treeState";
 import { maybeNotifyRootDone, maybeClearWaiting } from "./orchestration";
@@ -48,10 +49,13 @@ function interpretEffects(effects: ReconcileEffect[]): void {
         break;
       case "session-removed":
         // Deletion cascade: reset the in-flight page request + drop the stale
-        // pinned id. Both are idempotent; the S2 400 self-heal is the durable
-        // backstop for the pin.
+        // pinned id + drop the stale label root. All three are idempotent local
+        // corrections (no PUT) so the stale id does not linger until the server's
+        // own lifecycle broadcast (pins.updated / labels.updated) lands; the S2
+        // 400 self-heal remains the durable backstop for both pin and label docs.
         resetPageInFlight(e.sessionID);
         dropPinnedSession(e.sessionID);
+        dropLabelRoot(e.sessionID);
         break;
       case "reconcile-tree-agent":
         // Cold-seed gap fill: patch the tree node so the chip renders on

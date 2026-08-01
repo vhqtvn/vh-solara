@@ -79,3 +79,44 @@ export async function resetPins(request: APIRequestContext): Promise<void> {
   }
   throw new Error("resetPins: exhausted retries on repeated 409 (revision kept advancing)");
 }
+
+// resetLabels clears the worker-wide labels doc to empty via the real
+// /vh/labels CAS API (GET to read the current revision, then a CSRF-bearing PUT
+// with empty groups/tags/tagIdsByRootSessionId). Mirrors resetPins exactly: the
+// serial Playwright suite shares ONE fixtureserver process, so server-side
+// label state persists across specs within a suite run — any spec that creates
+// a group/tag/assignment MUST bracket itself with beforeEach/afterEach
+// resetLabels, otherwise it leaks state into sibling specs (a grouped root
+// renders under a GroupHeader and OUT of the ungrouped list, silently breaking
+// tree-body / section assertions elsewhere — the same cross-spec failure mode
+// resetPins exists for).
+//
+// Uses the bare `request` fixture (NOT page.request): in beforeEach the page has
+// not navigated yet. The fixture server enforces no auth; only the CSRF guard
+// applies (GET exempt, PUT satisfied via X-VH-CSRF). Retries on 409: a concurrent
+// revision advance is unlikely in the serial suite, but a just-closed browser's
+// in-flight mutation could race a fast reset — re-read and retry rather than fail
+// setup.
+export async function resetLabels(request: APIRequestContext): Promise<void> {
+  const csrf = { "X-VH-CSRF": "1" };
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const cur = await request.get("/vh/labels");
+    if (!cur.ok()) {
+      throw new Error(`resetLabels: GET /vh/labels -> ${cur.status()} ${cur.statusText()}`);
+    }
+    const baseRevision = (await cur.json()).revision as number;
+    const put = await request.put("/vh/labels", {
+      headers: csrf,
+      data: {
+        baseRevision,
+        groups: [],
+        tags: [],
+        tagIdsByRootSessionId: {},
+      },
+    });
+    if (put.ok()) return;
+    if (put.status() === 409) continue; // revision advanced under us; re-read + retry
+    throw new Error(`resetLabels: PUT /vh/labels -> ${put.status()} ${put.statusText()}`);
+  }
+  throw new Error("resetLabels: exhausted retries on repeated 409 (revision kept advancing)");
+}

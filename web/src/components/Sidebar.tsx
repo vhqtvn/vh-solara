@@ -1,7 +1,8 @@
-import { createSignal, createMemo, Show } from "solid-js";
+import { createSignal, createMemo, Show, For } from "solid-js";
 import { newSession, state, isStale, isUpdating, STALE_MS, projectDir } from "../sync";
-import { searchQuery, setSearchQuery } from "../sidebar";
+import { searchQuery, setSearchQuery, selectedTagIds, filterOpen, setFilterOpen, toggleTagFilter, clearTagFilter } from "../sidebar";
 import { pinsLastError, clearPinsError } from "../pins";
+import { labelsTags } from "../labels";
 import { setSidebarWidth } from "../layout";
 import SessionTree from "./SessionTree";
 import ArchivedDialog from "./ArchivedDialog";
@@ -12,6 +13,7 @@ import StatusMark from "./StatusMark";
 import Icon from "./Icon";
 import { setView } from "../ui";
 import { dismiss } from "../lib/a11y";
+import { labelColorVar } from "./labelPalette";
 import styles from "./Sidebar.module.css";
 
 // Pin sync error → human label for the sidebar's dismissible banner. Slightly
@@ -73,6 +75,27 @@ export default function Sidebar(props: { open: boolean; onClose: () => void }) {
     } else {
       setSearchQuery("");
       setSearchOpen(false);
+    }
+  };
+
+  // Tag-filter rail (slice 6 labels): mirrors the search toggle — a header
+  // icon reveals a horizontal chip rail above the tree; an active selection
+  // keeps it shown so the active filter is never silently hidden. Toggling
+  // off with an active filter CLEARS the selection (the operator's evident
+  // intent — the icon is the "done filtering" exit). Hidden entirely when no
+  // tags exist in the registry AND none are selected (nothing to show). The
+  // rail filters ALL three tree sections (pinned/groups/ungrouped) via AND;
+  // OrphanBanner + Archived nav stay OUTSIDE filtering by construction (they
+  // render above/below this Show block). selectedTagIds/filterOpen are pure
+  // local UI state (sidebar.ts), not persisted and not PUT — the labels doc
+  // is the only server-side labels authority.
+  const toggleFilter = () => {
+    const next = !(filterOpen() || selectedTagIds().length > 0);
+    if (next) {
+      setFilterOpen(true);
+    } else {
+      clearTagFilter();
+      setFilterOpen(false);
     }
   };
 
@@ -141,6 +164,17 @@ export default function Sidebar(props: { open: boolean; onClose: () => void }) {
           aria-pressed={searchOpen() || !!searchQuery()}
         >
           <Icon name="search" />
+        </button>
+        <button
+          type="button"
+          class="icon-btn"
+          classList={{ on: filterOpen() || selectedTagIds().length > 0 }}
+          onClick={toggleFilter}
+          data-tip="Filter by tags"
+          aria-label="Filter sessions by tags"
+          aria-pressed={filterOpen() || selectedTagIds().length > 0}
+        >
+          <Icon name="tag" />
         </button>
         <button type="button" class="icon-btn" onClick={() => void newSession()} data-tip="New session" aria-label="Create session">
           <Icon name="plus" />
@@ -215,6 +249,41 @@ export default function Sidebar(props: { open: boolean; onClose: () => void }) {
           <button type="button" class="session-search-clear" aria-label="Clear search" onClick={() => { setSearchQuery(""); searchInput?.focus(); }}>
             <Icon name="x" size={12} />
           </button>
+        </div>
+      </Show>
+      {/* Tag-filter chip rail (slice 6 labels). Horizontal-scroll with a hidden
+          scrollbar on mobile (scrollbar-width:none) per the plan's mobile
+          density rules; wraps on desktop. Each chip is aria-pressed; the dot
+          uses the tag's own color. "Clear" resets the whole AND selection.
+          Hidden when no tags exist and none are selected (nothing to filter). */}
+      <Show when={filterOpen() || selectedTagIds().length > 0}>
+        <div class={styles.filterRail} role="group" aria-label="Filter sessions by tag">
+          <For each={labelsTags()}>
+            {(t) => {
+              const on = () => selectedTagIds().includes(t.id);
+              return (
+                <button
+                  type="button"
+                  class={styles.filterChip}
+                  classList={{ [styles.filterChipOn]: on() }}
+                  aria-pressed={on()}
+                  style={{ "--label-color": labelColorVar(t.color) }}
+                  onClick={() => toggleTagFilter(t.id)}
+                >
+                  <span class={styles.filterDot} aria-hidden="true" />
+                  {t.name}
+                </button>
+              );
+            }}
+          </For>
+          <Show when={selectedTagIds().length > 0}>
+            <button type="button" class={styles.filterClear} onClick={() => clearTagFilter()}>
+              <Icon name="x" size={12} /> Clear
+            </button>
+          </Show>
+          <Show when={labelsTags().length === 0}>
+            <span class={styles.filterEmpty}>No tags yet — tag a root session to filter.</span>
+          </Show>
         </div>
       </Show>
       <OrphanBanner />

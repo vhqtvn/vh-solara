@@ -1,0 +1,126 @@
+/* SessionContextMenu — slice-6 labels additions (group choices + tags editor).
+   Co-located module per docs/ai/web-css-architecture.md. The menu's structural
+   classes (.ctxm-menu/.ctxm-item/.ctxm-grouplabel/.ctxm-grid/.ctxm-sep) stay in
+   styles/legacy/ as the shared global menu chrome; this module scopes ONLY the
+   new label-specific surfaces so they don't bleed into the archive/confirm
+   dialogs that reuse the same global classes.
+   GPU posture: solid colors + color-mix tints only — no mask-image, no
+   backdrop-filter, no per-element contain/content-visibility (AGENTS.md
+   "Firefox/WebRender gotchas"). The menu is a transient popover, not a hot
+   scroll surface, so this is doubly safe. */
+
+/* Group choices: a single-column stack of full-width ctxm-item buttons (the
+   names vary in length and each carries a dot + optional ✓, so a 2-col grid
+   would clip on mobile). The list itself imposes no background/border — the
+   surrounding .ctxm-menu provides the chrome. */
+.groupList {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+/* The color dot leading a group-choice row. Solid-filled (cheap); reads as a
+   9px disc. Inherits --label-color from the row's style binding. */
+.groupDot {
+  flex: none;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--label-color, var(--label-gray));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--label-color, var(--label-gray)) 35%, transparent);
+}
+
+/* The currently-assigned group: a subtle pressed tint + the ✓ glyph (rendered
+   by the Icon child). aria-pressed mirrors the visual for screen readers. */
+.groupChoiceOn {
+  background: color-mix(in srgb, var(--label-color, var(--label-gray)) 14%, transparent);
+}
+.groupChoiceName {
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Empty-state hint line ("No groups yet — create one."). Muted, non-interactive. */
+.hint {
+  padding: 6px 10px 4px;
+  font-size: 12px;
+  color: var(--fg-dim);
+}
+
+/* Tags inline editor: chips wrap (flex-wrap) so a long registry still fits on
+   mobile; the create-input takes the remaining width on its own line via
+   flex-basis:100%. Stays open while toggling (no menu close on chip click). */
+.tagsEditor {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  padding: 4px 8px 6px;
+}
+
+/* A toggleable tag chip: dot + name, aria-pressed. Tinted by the tag's own
+   color when on; neutral outline when off. Tap target ≥ 28px tall on mobile. */
+.tagToggleChip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 100%;
+  padding: 4px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--fg);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.tagToggleChip:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--fg) 7%, transparent);
+}
+.tagToggleChip:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+/* The leading color dot on a tag chip. Inherits --label-color from the chip. */
+.tagDot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--label-color, var(--label-gray));
+}
+
+/* Pressed (assigned) state: tint the whole chip with the tag color so the
+   on/off distinction is obvious without relying on the tiny dot alone. */
+.tagToggleOn {
+  border-color: color-mix(in srgb, var(--label-color, var(--label-gray)) 55%, var(--border));
+  background: color-mix(in srgb, var(--label-color, var(--label-gray)) 16%, transparent);
+}
+
+/* Create-new-tag input: fills the remaining row (flex-basis:100% forces a wrap
+   after the chips) so Enter-to-create has a comfortable tap area. Mirrors the
+   session-search input's quiet border style. */
+.tagInput {
+  flex: 1 1 100%;
+  min-width: 0;
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--fg);
+  font: inherit;
+  font-size: 12px;
+}
+.tagInput:focus {
+  outline: none;
+  border-color: color-mix(in srgb, var(--fg) 40%, var(--border));
+}
+.tagInput::placeholder {
+  color: var(--fg-dim);
+}

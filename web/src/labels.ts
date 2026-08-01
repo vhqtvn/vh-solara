@@ -552,6 +552,24 @@ export function renameGroup(groupId: string, name: string): Promise<void> {
   });
 }
 
+// setGroupColor — change a group's color token (no-op if the id is unknown or
+// the token is off-palette). The server validates colors against the fixed
+// token set (pkg/web labels.go); the UI offers only that set, so an off-palette
+// value here is treated as a no-op defensively (mirrors how addRootTag ignores
+// an unknown tag id). Slice 6 wires this to the group-header manage popover's
+// color swatches. A pure intent over the same engine as renameGroup.
+export function setGroupColor(groupId: string, color: string): Promise<void> {
+  return performMutation((doc) => {
+    let changed = false;
+    const groups = doc.groups.map((g) => {
+      if (g.id !== groupId) return g;
+      changed = true;
+      return { ...g, color };
+    });
+    return changed ? { ...doc, groups } : doc;
+  });
+}
+
 // deleteGroup — remove the group; its roots become UNGROUPED (they are not moved
 // elsewhere). Tags + tag assignments are untouched (definitions survive — the
 // store's invariant #7).
