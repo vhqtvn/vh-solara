@@ -501,6 +501,20 @@ func (f *FakeOpenCode) UserMessageCount(sessionID string) int {
 	return n
 }
 
+// ActiveEventSubs returns the number of currently-active /event SSE subscribers
+// (one per aggregator that has opened its always-on event tail to this fake).
+// It is a read-only test-only observability seam: f.subs is managed solely by
+// handleEvent's subscribe/unsub, so this reads existing state with NO behavior
+// change — it lets a regression test deterministically confirm a per-directory
+// aggregator's /event connection was accepted by the fake (the exact antecedent
+// for the teardown-SSE-hang bound, pkg/web/server.go aggFor→RunManaged). Mirrors
+// the f.mu-guarded read pattern of UserMessageCount above.
+func (f *FakeOpenCode) ActiveEventSubs() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.subs)
+}
+
 // commitUserMessage persists a single user message for a session and returns
 // the allocated counter. It is the "commit" half of the
 // CommitThenDropResponse mode: the user turn is durably recorded (exactly what
