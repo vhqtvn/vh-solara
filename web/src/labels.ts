@@ -537,13 +537,23 @@ async function performMutation(intent: LabelsIntent): Promise<void> {
   const scopeGen = labelsScopeGen;
   const baseDoc = currentServerDoc();
   const baseRev = serverRevision(); // rollback guard baseline for the first attempt
+  // F1-web: a gen-guard drop is a CORRECT discard of an orphaned PUT result (the
+  // project switched under it). It must NOT call decPending — resetLabelsScope
+  // already zeroed pendingCount, so decrementing on a dropped result would steal
+  // a decrement from the new project's in-flight mutation and clear its
+  // labelsPending latch early. `dropped` gates the finally (declared outside the
+  // try so the finally can read it).
+  let dropped = false;
   try {
     const target = intent(baseDoc);
     if (contentEqual(target, baseDoc)) return; // no-op
     clearLabelsErrorSig();
     applyDoc(target); // optimistic
     let res = await putLabels(baseRev, target);
-    if (scopeGen !== labelsScopeGen) return; // project switched — drop late result
+    if (scopeGen !== labelsScopeGen) {
+      dropped = true; // project switched — drop late result (skip decPending)
+      return;
+    }
     if (res.status === 200 && res.doc) {
       adoptPutResponse(res.doc);
       return;
@@ -558,7 +568,10 @@ async function performMutation(intent: LabelsIntent): Promise<void> {
       const retryRev = serverRevision(); // rollback guard baseline for the retry
       applyDoc(retryTarget); // optimistic retry
       res = await putLabels(retryRev, retryTarget);
-      if (scopeGen !== labelsScopeGen) return; // project switched — drop late retry
+      if (scopeGen !== labelsScopeGen) {
+        dropped = true; // project switched — drop late retry (skip decPending)
+        return;
+      }
       if (res.status === 200 && res.doc) {
         adoptPutResponse(res.doc);
         return;
@@ -580,7 +593,11 @@ async function performMutation(intent: LabelsIntent): Promise<void> {
     rollbackDocIfUnchanged(baseDoc, baseRev);
     setLabelsErrorSig(res.status === 0 ? "labels-network" : "labels-error");
   } finally {
-    decPending();
+    // F1-web: skip the decrement on a gen-guard drop so an orphaned-A PUT that
+    // resetLabelsScope already accounted for cannot steal a decrement from B's
+    // in-flight mutation. The normal adoption / rebase / retry / rollback paths
+    // all set incPending on entry and legitimately own their decPending here.
+    if (!dropped) decPending();
   }
 }
 

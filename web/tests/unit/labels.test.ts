@@ -835,6 +835,72 @@ describe("per-project scope — resetLabelsScope + scope-gen guard", () => {
     expect(labelsLastError()).toBeNull(); // A's failure does NOT surface on B
   });
 
+  it("F1-web: a dropped A PUT does not steal the decrement from B's in-flight mutation", async () => {
+    // The overlap case the gen-guard fixes: while project A has a PUT in flight,
+    // switch to B (resetLabelsScope zeroes pending) and start a mutation on B
+    // (pending latched true again for B). Now settle A's orphaned PUT. The
+    // scope-gen guard correctly DROPS A's result, but BEFORE F1-web the shared
+    // finally still ran decPending() — and since resetLabelsScope zeroed
+    // pendingCount, that decrement stole B's lone pending slot and cleared B's
+    // labelsPending latch early (B's PUT was still in flight). After F1-web the
+    // dropped path skips decPending, so B's labelsPending stays true until B's
+    // own PUT settles. (Labels DATA is correct either way — the dropped A PUT
+    // never adopts — only the advisory pending latch was briefly wrong.)
+    applyLabelsSnapshot(doc(1, [grp("gA", { name: "A" })]));
+
+    // Two independent PUTs in flight; capture each resolver separately. The
+    // first fetch() is A's PUT, the second is B's PUT.
+    let resolveA!: (v: Response) => void;
+    let resolveB!: (v: Response) => void;
+    let aCall = true;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => {
+        if (aCall) {
+          aCall = false;
+          return new Promise<Response>((r) => (resolveA = r));
+        }
+        return new Promise<Response>((r) => (resolveB = r));
+      }),
+    );
+
+    // 1. Start project-A mutation (PUT in flight, labelsPending true).
+    const pA = renameGroup("gA", "renamed-A");
+    await flush(); // optimistic applied; A's PUT issued + pending
+    expect(labelsPending()).toBe(true);
+
+    // 2. resetLabelsScope (A → B) — zeroes pending + bumps labelsScopeGen.
+    resetLabelsScope();
+    expect(labelsPending()).toBe(false); // B starts clean
+
+    // Establish B's doc (B's snapshot, delivered on B's stream).
+    applyLabelsSnapshot(doc(1, [grp("gB", { name: "B" })]));
+
+    // 3. Start project-B mutation (pending true again).
+    const pB = renameGroup("gB", "renamed-B");
+    await flush(); // B's optimistic applied; B's PUT issued + pending
+    expect(labelsPending()).toBe(true);
+
+    // 4. Settle the orphaned project-A PUT (the gen-guard dropped path).
+    resolveA(jsonRes(doc(2, [grp("gA", { name: "renamed-A" })])));
+    await pA; // A's gen-guard return fires; F1-web finally skips decPending.
+
+    // 5a. B's labelsPending stays TRUE until B's own PUT settles.
+    //    (Before F1-web, A's finally decPending() had cleared it here.)
+    expect(labelsPending()).toBe(true);
+    // B's doc must NOT be clobbered by A's dropped response.
+    expect(labelsGroups()).toEqual([grp("gB", { name: "renamed-B" })]); // B's optimistic
+    expect(labelsLastError()).toBeNull();
+
+    // 5b. Settle B's own PUT — now labelsPending clears.
+    resolveB(jsonRes(doc(2, [grp("gB", { name: "renamed-B" })])));
+    await pB;
+    expect(labelsPending()).toBe(false);
+    expect(labelsGroups()).toEqual([grp("gB", { name: "renamed-B" })]);
+    expect(labelsRevision()).toBe(2);
+    expect(labelsLastError()).toBeNull();
+  });
+
   it("after reset, B's labels.snapshot establishes B's state", () => {
     applyLabelsSnapshot(doc(7, [grp("from-A", { roots: ["ra"] })]));
     resetLabelsScope();
