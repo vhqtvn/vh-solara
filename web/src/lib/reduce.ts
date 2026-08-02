@@ -78,20 +78,64 @@ export function buildMessages(items: any[]): SessionMessages {
   return sm;
 }
 
-// Phase 4 — historical-page merge primitive. Merges a page of older messages
-// into a resident SessionMessages by INSERT-IF-NOT-PRESENT only. NEVER touches
-// an existing byId entry — live always wins (a page snapshot is a stale
-// point-in-time read; a live delta that landed during the page flight must not
-// be overwritten by the stale snapshot copy). Returns the count of messages
-// actually inserted (callers use this to decide whether to update oldestResident
-// and whether to update the hasOlder signal). The final sortMessages handles
-// prepend ordering naturally — the new ids slot into their creation-time
+// Phase 4 — historical-page merge primitive. Merges a page/snapshot/batch of
+// messages into a resident SessionMessages by INSERT-IF-NOT-PRESENT, with ONE
+// safe upgrade exception for an already-resident id (see below). The default is
+// still "never clobber a resident entry — live always wins": a page/reconnect
+// snapshot is a stale point-in-time read; a live delta (a mid-stream tail
+// message) that landed during the flight must not be overwritten by the stale
+// snapshot copy.
+//
+// UPGRADE-ON-COMPLETED exception: an OpenCode message is TERMINAL and immutable
+// once info.time.completed is set — a completed copy is the authoritative final
+// form and can never lose a race against live data. So for an id that is ALREADY
+// resident, if the INCOMING message is completed we UPGRADE the resident entry:
+// replace its info and merge the incoming parts (add missing parts; for parts
+// already present, Object.assign IN PLACE so the stored part KEEPS ITS
+// REFERENCE — replacing the object recreates the chat row and flashes/loses
+// scroll; same rationale as upsertPart). This repairs the "just-finished session
+// re-activated shows a STALE PARTIAL message" bug: a warm Stream-2 snapshot (or
+// cold batch) inlines the now-completed message, but the old insert-if-absent
+// skipped it because its id was already resident (the partial cached while
+// streaming), so the stale partial stayed on screen until a full reload. It also
+// fills a resident message that the activity-idle path stamped time.completed on
+// but that is MISSING parts. A NON-completed incoming copy still takes the
+// insert-if-absent path (this is the live-streaming tail the guard protects) —
+// so the fix does NOT reopen "a stale snapshot clobbers a live mid-stream
+// message."
+//
+// Returns the count of messages actually INSERTED (an in-place upgrade is NOT
+// counted — callers rely on the return meaning "newly inserted older messages"
+// for oldestResident/hasOlder bookkeeping in history.ts). The final sortMessages
+// handles prepend ordering naturally — new ids slot into their creation-time
 // position relative to the existing tail.
 export function prependMessagesIfAbsent(sm: SessionMessages, items: any[]): number {
   let added = 0;
+  let upgraded = false;
   for (const it of items) {
     const info = it.info as MessageInfo;
-    if (!info || sm.byId[info.id]) continue; // live always wins — NEVER touch existing
+    if (!info) continue;
+    const resident = sm.byId[info.id];
+    if (resident) {
+      // Already resident. Upgrade ONLY if the incoming copy is completed
+      // (terminal/immutable — safe against live); otherwise live always wins and
+      // we NEVER touch the existing entry.
+      if (info.time?.completed) {
+        resident.info = info;
+        for (const p of it.parts || []) {
+          if (!resident.parts[p.id]) {
+            resident.partOrder.push(p.id);
+            resident.parts[p.id] = p;
+          } else {
+            // Merge in place — keep the part's object reference (chat row
+            // identity + scroll), same as upsertPart.
+            Object.assign(resident.parts[p.id], p);
+          }
+        }
+        upgraded = true;
+      }
+      continue;
+    }
     const parts: Record<string, Part> = {};
     const partOrder: string[] = [];
     for (const p of it.parts || []) {
@@ -102,7 +146,10 @@ export function prependMessagesIfAbsent(sm: SessionMessages, items: any[]): numb
     sm.order.push(info.id);
     added++;
   }
-  if (added) sortMessages(sm);
+  // Re-sort on an insert (prepend ordering) OR an upgrade (a completed copy may
+  // carry a time.created the resident placeholder lacked, changing its slot). A
+  // sort that yields the identical order is a no-op for reactivity.
+  if (added || upgraded) sortMessages(sm);
   return added;
 }
 

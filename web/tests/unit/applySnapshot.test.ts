@@ -334,6 +334,91 @@ describe("applySessionSnapshot / applyMessageEvent — Slice C async hydration",
     expect(state.messages.s1.order).toEqual(["snap-only", "live"]);
   });
 
+  it("re-activating a JUST-FINISHED session UPGRADES the stale partial from the warm snapshot", () => {
+    // Regression (shipped 2-3 times): while streaming, a PARTIAL assistant M is
+    // cached in state.messages (info WITHOUT time.completed, only the streamed
+    // parts). The operator switches away (closeSessionStream keeps the cache),
+    // the turn completes upstream, and a non-force reopen fetches a warm snapshot
+    // that inlines the now-COMPLETED M. The old insert-if-absent SKIPPED M (id
+    // already resident) so the stale partial stayed until a full reload. The
+    // upgrade-on-completed path must now replace the resident with the completed
+    // copy + fill its parts.
+    setState("messages", "s1", {
+      order: ["m1"],
+      byId: {
+        m1: {
+          id: "m1",
+          info: { id: "m1", sessionID: "s1", role: "assistant", time: { created: 10 } }, // PARTIAL — no completed
+          partOrder: ["p1"],
+          parts: {
+            p1: { id: "p1", sessionID: "s1", messageID: "m1", type: "text", text: "half" },
+          },
+        },
+      },
+    });
+    const p1Ref = state.messages.s1.byId["m1"].parts["p1"];
+    const snap: Snapshot = {
+      seq: 1,
+      sessions: [{ id: "s1" }],
+      gate: { s1: { messagesLoaded: true } },
+      messages: {
+        s1: [
+          {
+            info: { id: "m1", sessionID: "s1", role: "assistant", time: { created: 10, completed: 20 } },
+            parts: [
+              { id: "p1", sessionID: "s1", messageID: "m1", type: "text", text: "half then whole" },
+              { id: "p2", sessionID: "s1", messageID: "m1", type: "text", text: "tail" },
+            ],
+          },
+        ],
+      },
+    };
+    applySessionSnapshot("s1", snap);
+    // M upgraded to completed, parts merged (p1 updated in place, p2 filled).
+    expect(state.messages.s1.byId["m1"].info.time?.completed).toBe(20);
+    expect(state.messages.s1.byId["m1"].partOrder).toEqual(["p1", "p2"]);
+    expect(state.messages.s1.byId["m1"].parts["p1"].text).toBe("half then whole");
+    expect(state.messages.s1.byId["m1"].parts["p2"].text).toBe("tail");
+    // p1 kept its reference through the in-place merge (chat-row identity/scroll).
+    expect(state.messages.s1.byId["m1"].parts["p1"]).toBe(p1Ref);
+    expect(state.messages.s1.order).toEqual(["m1"]);
+  });
+
+  it("a mid-stream (NOT completed) snapshot copy does NOT clobber the resident partial", () => {
+    // The clobber-guard the upgrade must NOT reopen: a stale snapshot whose copy
+    // of the live tail is itself still partial (no time.completed) must leave the
+    // resident streaming message untouched.
+    setState("messages", "s1", {
+      order: ["m1"],
+      byId: {
+        m1: {
+          id: "m1",
+          info: { id: "m1", sessionID: "s1", role: "assistant", time: { created: 10 } },
+          partOrder: ["p1"],
+          parts: {
+            p1: { id: "p1", sessionID: "s1", messageID: "m1", type: "text", text: "live-latest" },
+          },
+        },
+      },
+    });
+    const snap: Snapshot = {
+      seq: 1,
+      sessions: [{ id: "s1" }],
+      gate: { s1: { messagesLoaded: true } },
+      messages: {
+        s1: [
+          {
+            info: { id: "m1", sessionID: "s1", role: "assistant", time: { created: 10 } }, // still partial
+            parts: [{ id: "p1", sessionID: "s1", messageID: "m1", type: "text", text: "STALE" }],
+          },
+        ],
+      },
+    };
+    applySessionSnapshot("s1", snap);
+    expect(state.messages.s1.byId["m1"].parts["p1"].text).toBe("live-latest"); // untouched
+    expect(state.messages.s1.byId["m1"].info.time?.completed).toBeUndefined();
+  });
+
   it("message.upsert arriving BEFORE completion is applied without claiming loaded", () => {
     // Stream 2 forwards reconciled deltas on the same connection as the fetch;
     // they can land before messages.loaded. They must populate the transcript
