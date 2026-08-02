@@ -1,5 +1,5 @@
 version: 1
-enabled: false
+enabled: true
 
 defaults:
   event_file_lines: 350
@@ -20,10 +20,20 @@ per_language:
 exclude:
   event_paths:
     - ".git/**"
-    - ".opencode/state/**"
+    # Align with snapshot_paths: the entire .opencode/** tree is harness-managed
+    # (platform_managed, overwritten by `vh-agent-harness update`); none of it is
+    # a project refactor target. `.opencode/state/**` (session memory) is
+    # subsumed.
+    - ".opencode/**"
     - "**/__pycache__/**"
     - "**/node_modules/**"
     - "tmp/**"
+    # Vendored read-only reference snapshots of OTHER projects (refs/opencode,
+    # refs/paseo). Gitignored, zero tracked files, never refactor targets.
+    - "refs/**"
+    # Generated SPA embed (gitignored; materialized from web/dist-build/ at
+    # build time). Minified, not project source.
+    - "pkg/web/dist/**"
 
   snapshot_paths:
     - ".git/**"
@@ -36,6 +46,10 @@ exclude:
     - "**/__pycache__/**"
     - "**/node_modules/**"
     - "tmp/**"
+    # See event_paths: vendored reference snapshots of other projects.
+    - "refs/**"
+    # See event_paths: generated SPA embed.
+    - "pkg/web/dist/**"
 
   snapshot_suffixes:
     - "_test.go"
