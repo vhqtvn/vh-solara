@@ -23,7 +23,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -44,8 +43,8 @@ import (
 type gap3GateHandler struct {
 	inner     http.Handler
 	mu        sync.Mutex
-	tailCount int // cold-seed ?limit=<coldTailLimit> fetches gated
-	fullCount int // async cold-load ?limit=<WindowMaxCount> fetches gated
+	tailCount int // cold-seed ?limit= fetches gated
+	fullCount int // async no-?limit= fetches gated
 	release   chan struct{}
 }
 
@@ -56,10 +55,7 @@ func newGap3GateHandler(inner http.Handler) *gap3GateHandler {
 func (h *gap3GateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/session/") &&
 		strings.HasSuffix(r.URL.Path, "/message") {
-		// Part-A modernization: cold-load is now MessagesTail(WindowMaxCount)
-		// (?limit=<WindowMaxCount>), NOT no-?limit. Classify by limit value:
-		// cold-seed uses coldTailLimit; cold-load uses WindowMaxCount.
-		isTail := r.URL.Query().Get("limit") == strconv.Itoa(coldTailLimit)
+		isTail := r.URL.Query().Get("limit") != ""
 		h.mu.Lock()
 		if isTail {
 			h.tailCount++

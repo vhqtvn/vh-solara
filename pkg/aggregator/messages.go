@@ -207,14 +207,7 @@ func (a *Aggregator) EnsureMessages(ctx context.Context, sessionID string) error
 		// can never publish an incorrect messages.loaded.
 		for attempt := 0; ; attempt++ {
 			t0 := time.Now()
-			// Part A (cold-load bounded fetch): fetch only the render-window tail
-			// (state.WindowMaxCount newest) instead of the WHOLE transcript. The
-			// gate (IsMessagesLoaded) keys on the newest COMPLETED assistant,
-			// which is normally within this tail; latestAssistantResidentLocked
-			// returns true vacuously when no assistant is resident, so the gate
-			// flips on window-complete (not transcript-complete) — correct for the
-			// render window. Older-than-resident pages are Part B (out of scope).
-			items, err := a.client.MessagesTail(ctx, sessionID, state.WindowMaxCount)
+			items, err := a.client.Messages(ctx, sessionID)
 			if err != nil {
 				// Signal failure to any async caller that deduped against this
 				// sync winner (shared-slot completion contract). The session
@@ -391,10 +384,7 @@ func (a *Aggregator) EnsureMessagesAsync(sessionID string) {
 		// GET; the final IsMessagesLoaded gate stays authoritative.
 		for attempt := 0; ; attempt++ {
 			t0 := time.Now()
-			// Part A (cold-load bounded fetch): fetch only the render-window tail
-			// (state.WindowMaxCount newest), not the whole transcript. See
-			// EnsureMessages for the full rationale + gate-correctness note.
-			items, err := a.client.MessagesTail(fetchCtx, sessionID, state.WindowMaxCount)
+			items, err := a.client.Messages(fetchCtx, sessionID)
 			if err != nil {
 				if fetchCtx.Err() != nil {
 					// Aggregator shutting down (or caller ctx cancelled in a

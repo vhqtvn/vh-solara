@@ -16,6 +16,7 @@ package state
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -436,5 +437,56 @@ func TestSnapshotMessagesPage_DefensiveCopy(t *testing.T) {
 		if got := messageIDFromInfo(r2.Items[i].Info); got != want {
 			t.Fatalf("defensive copy leak: item[%d] id want %q, got %q", i, want, got)
 		}
+	}
+}
+
+// TestSnapshotMessagesPage_FullResidentSupportsOlderHistory is the Part-A revert
+// regression guard. After a FULL cold-load (the pre-Part-A / reverted behavior —
+// EnsureMessages calls client.Messages, not MessagesTail), the resident store
+// holds the WHOLE transcript, so paging older-than-the-newest-window
+// (before = oldest id of the newest WindowMaxCount) returns a REAL older page
+// reaching back to the transcript start — WITHOUT a reconnect/reload.
+//
+// This guards against re-introducing the MessagesTail(WindowMaxCount) bound (the
+// reverted Part A) without a compatible Part-B history-recovery mechanism: under
+// that bound the resident store would hold only the newest WindowMaxCount, so
+// paging before their oldest would return just the overlap item (len(Items)==1,
+// OldestID == the boundary) — silently losing older-history access until a
+// reconnect. Here the full-resident path pages back to m1.
+func TestSnapshotMessagesPage_FullResidentSupportsOlderHistory(t *testing.T) {
+	total := WindowMaxCount + 50 // > WindowMaxCount (100) → newest window is a strict subset
+	st := New(1024)
+	st.Apply(ev("session.created", `{"info":{"id":"s","title":"S"}}`))
+	// Seed a FULL transcript (oldest-first), exactly as a cold-load
+	// client.Messages() reconcile populates resident post-revert.
+	list := make([]MessageWithParts, total)
+	for i := 0; i < total; i++ {
+		list[i] = pageMsg(fmt.Sprintf("m%d", i+1), 10) // m1..m{total}
+	}
+	st.SetSessionMessages("s", list)
+
+	// The newest WindowMaxCount window is m{total-WindowMaxCount+1}..m{total}
+	// (m51..m100 for total=150). Its OLDEST id is the page-0 boundary the client
+	// would page backward from.
+	oldestOfNewestWindow := fmt.Sprintf("m%d", total-WindowMaxCount+1)
+	page := st.SnapshotMessagesPage("s", oldestOfNewestWindow, WindowMaxCount, 1<<20)
+
+	// The boundary IS resident (full cold-load), so paging finds it.
+	if !page.BoundaryFound {
+		t.Fatalf("boundary_found: want true (full transcript resident post-revert), got false — resident was bounded (Part A re-introduced without Part B?)")
+	}
+	// CRUX — real older history: the page returns the boundary + strictly-older
+	// messages, paging all the way back to m1. Under the reverted-bound hazard
+	// (resident = newest 100 only), this page would be just [m51] (len==1,
+	// OldestID=m51) — older history silently lost.
+	if len(page.Items) <= 1 {
+		t.Fatalf("older page must return the boundary + strictly-older messages (full-resident paging); got %d items — older history not reachable without reconnect (Part A re-introduced?)", len(page.Items))
+	}
+	if page.OldestID != "m1" {
+		t.Fatalf("oldest_id: want m1 (paged back to the transcript start — full resident), got %q — older history truncated (Part A re-introduced?)", page.OldestID)
+	}
+	// Paged back to m1 (the start) → nothing older remains.
+	if page.HasOlder {
+		t.Fatalf("has_older: want false (paged to m1, the transcript start), got true")
 	}
 }
