@@ -372,7 +372,13 @@ func (s *Server) checkSessionInvariants(sid string, snap state.Snapshot, st *sta
 		MessagesLoaded:          gate.MessagesLoaded,
 		NewestAssistantResident: newestResident,
 	}
-	gateSummary.Consistent = (msgLoaded == gate.MessagesLoaded) && (gate.MessagesLoaded == newestResident)
+	// U1: when there is no completed assistant turn (newestAssistant == nil), the
+	// resident-parts leg is N/A — the gate's latestAssistantResidentLocked returns
+	// true vacuously ("no assistant → true"), so a loaded session with no
+	// assistant turn is consistent, not a disagreement. Apply the resident-parts
+	// leg only when an assistant turn exists to check.
+	newestLegOK := newestAssistant == nil || gate.MessagesLoaded == newestResident
+	gateSummary.Consistent = (msgLoaded == gate.MessagesLoaded) && newestLegOK
 
 	// --- per-invariant verdicts ---
 	inv := make([]invariantResult, 0, 5)

@@ -156,6 +156,31 @@ function childrenBody(parentId: string, childIds: string[]): unknown {
   };
 }
 
+// A page-scoped detail bundle (the ExpandChildrenWithDetail payload) — a partial
+// Snapshot with mode "expand-page", scope = page ids, and the full authority map.
+function expandDetailBundle(seq: number, scope: string[], sessions: { id: string; title: string }[]): unknown {
+  return {
+    seq,
+    epoch: "e1",
+    sessions,
+    partial: {
+      mode: "expand-page",
+      scope,
+      authority: {
+        sessions: "frontier", activity: "frontier", gate: "frontier",
+        lastAgents: "frontier", currentVerbs: "frontier",
+        questions: "global", permissions: "global", unread: "global",
+        todos: "omitted", statuses: "omitted", messages: "omitted",
+      },
+    },
+  };
+}
+
+// childrenBody + a detail bundle (the server ships both under one response).
+function childrenBodyWithDetail(parentId: string, childIds: string[], detail: unknown): unknown {
+  return { ...(childrenBody(parentId, childIds) as object), detail };
+}
+
 beforeEach(async () => {
   instances = [];
   (globalThis as unknown as { EventSource: unknown }).EventSource = MockEventSource;
@@ -316,5 +341,135 @@ describe("expandTreeNode C4 deferral — Case B: drop after generation bump", ()
     // The prior owner was canceled (not left wedged); no decode/owner pending
     // for the fresh generation.
     expect(stream.isTreeSnapshotDecoding()).toBe(false);
+  });
+});
+
+// ===========================================================================
+// Case C (F4) — the expand-page DETAIL install (applyScopedSnapshot) must honor
+// the SAME C4 deferral as ownerAwareApply (Cases A/B cover the tree-OP apply).
+// Without the guard (tree-transport.ts:1467 pre-fix), an expand HTTP resolving
+// while a coherent capture is pending runs applyScopedSnapshot UNGUARDED: its
+// UNCONDITIONAL cursor set (reconcile.ts:239) lands BEFORE tryInstall's
+// advanceCursor (:677, non-ratcheting) → cursor REGRESSES (expand N+5 → coherent
+// N); and on scope overlap the older coherent data clobbers the newer expand
+// data. The fix mirrors ownerAwareApply: defer the detail apply onto
+// ownerNow.promise (+ gen recheck) so the coherent install lands FIRST and the
+// deferred expand applies LAST (newer wins, cursor advances forward — no
+// regression, no clobber).
+// ===========================================================================
+describe("expandTreeNode C4 deferral — Case C (F4): defer the expand-page DETAIL install", () => {
+  it("defers applyScopedSnapshot behind the pending owner → no cursor regression; newer expand data wins on overlap", async () => {
+    stream.connect();
+    const treeES = treeESes()[0];
+    treeES.simulateOpen();
+
+    // 1. Open a coherent capture (tree.snapshot seq=100, frontier {base, c1}).
+    //    c1 is in the coherent frontier AND will be in the expand page → overlap.
+    treeES.fire("tree.snapshot", treeSnapBody(100, "e1", ["base", "c1"]), "100");
+    expect(stream.isTreeSnapshotDecoding()).toBe(true);
+
+    // 2. Re-stub fetch so the expand returns a page-scoped DETAIL bundle at a
+    //    NEWER seq (105) carrying NEWER data for the overlapping id c1.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) => {
+        if (typeof url === "string" && url.startsWith("/vh/tree/children")) {
+          return new Response(
+            JSON.stringify(
+              childrenBodyWithDetail(
+                "base",
+                ["c1"],
+                expandDetailBundle(105, ["c1"], [{ id: "c1", title: "expand-c1-new" }]),
+              ),
+            ),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+        }
+        return new Response("{}", { status: 200 });
+      }),
+    );
+
+    const beforeCursor = store.state.cursor;
+    // 3. Fire expandTreeNode during the pending window → fetcher resolves →
+    //    the F4 guard defers applyScopedSnapshot onto ownerNow.promise.
+    const expandP = stream.expandTreeNode("base");
+    await tick(5);
+
+    // 4. CRUX — DEFERRED: the expand detail is NOT yet installed (c1 absent from
+    //    state.sessions) and the cursor did NOT jump to 105. Without the guard,
+    //    applyScopedSnapshot would have run synchronously (c1 present, cursor 105)
+    //    and the later coherent install would then regress the cursor + clobber.
+    expect(store.state.sessions.c1).toBeUndefined();
+    expect(store.state.cursor).toBe(beforeCursor);
+
+    // 5. Complete the coherent capture at the OLDER seq 100. tryInstall runs
+    //    (coherent detail c1="d-c1" + advanceCursor(100)), settles the owner →
+    //    the deferred expand apply fires (registered before the release) →
+    //    c1="expand-c1-new" (newer wins) + cursor advances to 105.
+    treeES.fire("snapshot", detailSnap(100, "e1", ["base", "c1"]), "100");
+    treeES.fire(
+      "snapshot.complete",
+      { epoch: "e1", revision: 100, projections: ["tree", "detail"] },
+      "100",
+    );
+    await awaitOwner();
+    await expandP;
+    await tick(2);
+
+    // 6. CRUX — no regression + newer wins: cursor = 105 (forward, NOT regressed
+    //    to 100); c1 carries the NEWER expand data (older coherent "d-c1" did NOT
+    //    clobber it). base (coherent-only) also landed.
+    expect(store.state.cursor).toBe(105);
+    expect(store.state.sessions.c1?.title).toBe("expand-c1-new");
+    expect(store.state.sessions.base?.title).toBe("d-base");
+    expect(stream.isTreeSnapshotDecoding()).toBe(false);
+  });
+
+  it("reverse ordering (coherent capture settles BEFORE the expand fetch resolves) stays benign", async () => {
+    stream.connect();
+    const treeES = treeESes()[0];
+    treeES.simulateOpen();
+
+    // 1. Open + COMPLETE the coherent capture FIRST (seq 100). No pending owner
+    //    when the expand fires → the F4 guard takes the fast path (apply sync).
+    treeES.fire("tree.snapshot", treeSnapBody(100, "e1", ["base", "c1"]), "100");
+    treeES.fire("snapshot", detailSnap(100, "e1", ["base", "c1"]), "100");
+    treeES.fire(
+      "snapshot.complete",
+      { epoch: "e1", revision: 100, projections: ["tree", "detail"] },
+      "100",
+    );
+    await awaitOwner();
+    await tick(2);
+    expect(stream.isTreeSnapshotDecoding()).toBe(false);
+
+    // 2. Re-stub fetch: expand detail at newer seq 105.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) => {
+        if (typeof url === "string" && url.startsWith("/vh/tree/children")) {
+          return new Response(
+            JSON.stringify(
+              childrenBodyWithDetail(
+                "base",
+                ["c1"],
+                expandDetailBundle(105, ["c1"], [{ id: "c1", title: "expand-c1-new" }]),
+              ),
+            ),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+        }
+        return new Response("{}", { status: 200 });
+      }),
+    );
+
+    // 3. Fire expandTreeNode — no pending owner → apply runs synchronously.
+    await stream.expandTreeNode("base");
+    await tick(2);
+
+    // 4. Benign: cursor advanced forward to 105; newer expand data won. No
+    //    regression, no clobber (the coherent was already settled).
+    expect(store.state.cursor).toBe(105);
+    expect(store.state.sessions.c1?.title).toBe("expand-c1-new");
   });
 });

@@ -414,6 +414,64 @@ func TestDiagInvariants_PartialHydrate(t *testing.T) {
 	}
 }
 
+// TestDiagInvariants_LoadedNoAssistantTurn pins U1: a LOADED session with NO
+// completed assistant turn must report INV-3 Consistent=true, not the false-
+// negative the pre-fix code produced (newestAssistant==nil → newestResident=
+// false → spurious Consistent=false). The gate's latestAssistantResidentLocked
+// returns true vacuously for "no assistant", so the resident-parts leg is N/A;
+// Consistent hinges on msgLoaded==messagesLoaded only. The NewestAssistantResident
+// FIELD stays false (factually: no resident assistant turn exists) — the fix is
+// in the Consistent computation, not the field.
+func TestDiagInvariants_LoadedNoAssistantTurn(t *testing.T) {
+	fake := newFake()
+	fake.sessions = []string{`{"id":"s","title":"S"}`}
+	// USER-only message list: no assistant turn → the diag handler's
+	// newestAssistant is nil (no completed role:"assistant" message).
+	fake.messages["s"] = `[{"info":{"id":"u1","sessionID":"s","role":"user"},"parts":[{"id":"p1","sessionID":"s","messageID":"u1","type":"text","text":"hi"}]}]`
+	ocSrv := httptest.NewServer(fake.handler())
+	t.Cleanup(ocSrv.Close)
+	agg := aggregator.New(ocSrv.URL, 1000)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go agg.Run(ctx)
+	srv, err := NewServer(agg, ocSrv.URL, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	web := httptest.NewServer(srv.Handler())
+	t.Cleanup(web.Close)
+	waitFor(t, func() bool { return len(agg.Store().SessionIDs()) >= 1 }, "session hydrated into tree")
+	if err := agg.EnsureMessages(ctx, "s"); err != nil {
+		t.Fatalf("EnsureMessages: %v", err)
+	}
+	waitFor(t, func() bool {
+		for _, x := range agg.Store().LoadedSessions() {
+			if x == "s" {
+				return true
+			}
+		}
+		return false
+	}, "session reported loaded")
+
+	env := getDiag(t, web.URL, "sessions=s", 200)
+	if len(env.Sessions) != 1 {
+		t.Fatalf("sessions: want 1, got %d", len(env.Sessions))
+	}
+	s := env.Sessions[0]
+	// U1 crux: Consistent=true despite no assistant turn. The resident-parts
+	// leg is N/A; only msgLoaded==messagesLoaded must agree (both true here).
+	if !s.Gate.Consistent {
+		t.Fatalf("U1: loaded session with no assistant turn should be Consistent=true (resident-parts leg N/A); got false; gate=%+v", s.Gate)
+	}
+	if got := invStatus(s, "INV3_gate_loaded_iff_resident"); got != "pass" {
+		t.Fatalf("U1: INV-3 want pass (no-assistant turn is vacuously consistent), got %q; gate=%+v", got, s.Gate)
+	}
+	// The field stays false (factually accurate: no resident assistant turn).
+	if s.Gate.NewestAssistantResident {
+		t.Fatalf("U1: NewestAssistantResident field should be false (no assistant turn exists); got true")
+	}
+}
+
 // TestDiagInvariants_MethodNotAllowed pins the GET-only contract: a POST is
 // rejected. A POST without the X-VH-CSRF header is rejected 403 by the CSRF
 // middleware BEFORE reaching this handler; to pin the handler's OWN method

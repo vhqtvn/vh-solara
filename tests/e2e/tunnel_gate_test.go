@@ -394,6 +394,69 @@ func TestStream1PartialFrameTunnel(t *testing.T) {
 	t.Logf("RESIDUAL-2: e2e loopback UNDER-REPRESENTS production-network throughput (see tunnel-gate.md); fast-on-loopback isolates compute/serialization/mux only.")
 }
 
+// TestStream1DeepTreePartialTunnel (F1) closes the deep-tree-through-tunnel
+// coverage gap. SeedFlatSessions makes every session a root, so the frontier ==
+// the full dir and TestStream1PartialFrameTunnel cannot show the frontier
+// reduction engaging through the tunnel. SeedDeepTreeSessions builds 1 root +
+// N direct-children + M buried-grandchildren, so with no session loaded the
+// frontier = roots only — a STRICT subset of the dir. Through the real
+// controller→yamux→worker tunnel (R-1 forwards tree=2), the partial detail frame
+// must engage with scope_len << full-dir AND be ≤300 KB, demonstrating the
+// frontier reduction end-to-end through the tunnel (the combined proof the flat
+// fixture cannot provide; the ≤300 KB bound is otherwise pinned at the pkg/state
+// deep-tree unit).
+//
+// Skipped unless VH_TUNNEL_GATE=1. LOOPBACK CAVEAT applies (see file doc).
+func TestStream1DeepTreePartialTunnel(t *testing.T) {
+	if os.Getenv("VH_TUNNEL_GATE") == "" {
+		t.Skip("set VH_TUNNEL_GATE=1 to run the deep-tree partial-frame tunnel test")
+	}
+	const dir = "/work/demo" // fixtures.DemoDir() default
+	const byteBudget = 300 * 1024 // DoD §1: ≤300 KB raw
+
+	c, err := StartCluster()
+	if err != nil {
+		t.Fatalf("StartCluster: %v", err)
+	}
+	defer c.Close()
+	// Deep tree: 1 root + 195 direct-children + 785 buried grandchildren.
+	c.Fake.SeedDeepTreeSessions(195, 785)
+	waitForSessions(t, c, dir, 1)
+	fullDir := countSessions(t, c, dir)
+	t.Logf("deep-tree dir=%s full-dir=%d (seeded 1 root + 195 children + 785 grandchildren)", dir, fullDir)
+
+	// Through-tunnel WITH tree=2 (R-1 forwarding). With no session loaded the
+	// frontier = roots only → a strict subset of the dir.
+	tBytes, tMs, tSnap, tOK := readDecodeDetailSnapshot(t,
+		c.ControllerURL+"/api/workers/"+c.WorkerID+"/events?dir="+dir+"&tree=2",
+		map[string]string{"Authorization": "Bearer " + c.APIToken})
+
+	t.Logf("=== DEEP-TREE PARTIAL FRAME THROUGH TUNNEL (F1) ===")
+	t.Logf("full-dir=%d  byte-budget=%d bytes", fullDir, byteBudget)
+	t.Logf("through-tunnel (tree=2): ok=%v bytes=%d (%.1f KB) ms=%.2f", tOK, tBytes, kb(tBytes), tMs)
+
+	if !tOK {
+		t.Fatalf("through-tunnel tree=2: detail snapshot frame not observed")
+	}
+	mode, scopeLen := partialFrameShape(tSnap)
+	t.Logf("through-tunnel partial: mode=%q scope_len=%d (full-dir=%d)", mode, scopeLen, fullDir)
+	if mode == "" {
+		t.Fatalf("through-tunnel tree=2: partial NOT engaged (R-1 forwarding or SnapshotWithTreePartial wiring failed)")
+	}
+	// F1 crux: the frontier is a STRICT subset of the dir (scope_len << full-dir).
+	// With no session loaded, the frontier = roots only → scope_len should be a
+	// handful (the dir's roots), far below the full ~981-session dir.
+	if scopeLen >= fullDir {
+		t.Fatalf("F1: frontier NOT reduced through tunnel — scope_len=%d >= full-dir=%d (SeedDeepTreeSessions must make the frontier a strict subset: roots only)", scopeLen, fullDir)
+	}
+	t.Logf("F1 PASS: frontier reduced through tunnel — scope_len=%d << full-dir=%d (%.1fx reduction)", scopeLen, fullDir, float64(fullDir)/float64(scopeLen))
+	if tBytes > byteBudget {
+		t.Fatalf("F1: deep-tree partial frame %.1f KB > %d KB budget", kb(tBytes), byteBudget/1024)
+	}
+	t.Logf("F1 SIZE PASS: %.1f KB ≤ %d KB", kb(tBytes), byteBudget/1024)
+	t.Logf("RESIDUAL-2: e2e loopback UNDER-REPRESENTS production-network throughput (see tunnel-gate.md).")
+}
+
 // readDecodeDetailSnapshot opens the SSE stream, stops at the end of the first
 // `event: snapshot` frame, and JSON-decodes its accumulated `data:` payload.
 // Returns bytes read, wall-clock ms, the decoded snapshot (nil if undecodable),

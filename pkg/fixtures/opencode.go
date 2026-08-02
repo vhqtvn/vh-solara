@@ -427,6 +427,51 @@ func (f *FakeOpenCode) SeedFlatSessions(n int) {
 	// are unnecessary for the measurement shape (sessions + computed gate).
 }
 
+// SeedDeepTreeSessions appends a DEEP session tree (1 root + nChildren direct
+// children + nGrandchildren buried under the first child) under demoDir. Unlike
+// SeedFlatSessions (all roots → frontier == full dir), a deep tree has a STRICT
+// frontier subset: with no session loaded, the frontier = roots = {root} only;
+// the direct children and grandchildren are buried (collapsed) and omitted from
+// the partial detail frame. This lets the through-tunnel partial-frame test
+// demonstrate the frontier reduction engaging end-to-end (scope_len << full-dir,
+// frame ≤300 KB), which the flat all-roots fixture cannot. Measurement helper
+// only: append, no live emit (same close-on-full rationale as SeedFlatSessions).
+func (f *FakeOpenCode) SeedDeepTreeSessions(nChildren, nGrandchildren int) {
+	if nChildren <= 0 {
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	now := float64(time.Now().UnixMilli())
+	mk := func(parent, title string) map[string]any {
+		f.counter++
+		s := map[string]any{
+			"id": fmt.Sprintf("ses_deep_%d", f.counter), "projectID": "proj",
+			"title": title, "directory": demoDir,
+			"model": map[string]any{"providerID": "fake", "id": "dummy", "variant": "default"},
+			"time":  map[string]any{"created": now - float64(f.counter), "updated": now},
+		}
+		if parent != "" {
+			s["parentID"] = parent
+		}
+		return s
+	}
+	root := mk("", "Deep root")
+	f.sessions = append(f.sessions, root)
+	rootID := root["id"].(string)
+	var firstChildID string
+	for i := 0; i < nChildren; i++ {
+		c := mk(rootID, "Deep child "+fmt.Sprintf("%d", i))
+		f.sessions = append(f.sessions, c)
+		if i == 0 {
+			firstChildID = c["id"].(string)
+		}
+	}
+	for i := 0; i < nGrandchildren; i++ {
+		f.sessions = append(f.sessions, mk(firstChildID, "Deep grandchild "+fmt.Sprintf("%d", i)))
+	}
+}
+
 // SetPromptAsyncMode overrides the prompt_async response mode. TEST-ONLY: the
 // shared fixture defaults to PromptAsyncNormal (the faithful path). The e2e
 // queue-recovery test (tests/e2e) switches to CommitThenDropResponse to model
