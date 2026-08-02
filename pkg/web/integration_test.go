@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/vhqtvn/vh-solara/pkg/aggregator"
 	"github.com/vhqtvn/vh-solara/pkg/opencode"
+	"github.com/vhqtvn/vh-solara/pkg/state"
 )
 
 // fakeOpenCode is a minimal stand-in for `opencode serve`: a session list, a
@@ -27,26 +29,28 @@ type fakeOpenCode struct {
 	events   chan string    // raw JSON event payloads ({id,type,properties})
 	prompts  []string       // bodies POSTed to /session/:id/message (prompt passthrough)
 	msgGets  map[string]int // GET /session/:id/message hit counts (lazy-hydration test)
-	// msgFullGets counts ONLY full-history GETs (no ?limit= query) — the
-	// single-flight invariant. Cold-seed tail fetches (?limit=) and other
-	// partial GETs are excluded so a test can assert "exactly ONE full fetch
-	// served all concurrent callers" robustly, independent of background
-	// cold-seed tail noise. Mirrors the msgFullGetReady signal's full-vs-tail
-	// discrimination.
+	// msgFullGets counts ONLY cold-load GETs (?limit=<state.WindowMaxCount>) —
+	// the single-flight invariant. Cold-seed tail fetches (?limit=<coldTailLimit>)
+	// and other partial GETs are excluded so a test can assert "exactly ONE
+	// cold-load fetch served all concurrent callers" robustly, independent of
+	// background cold-seed tail noise. Mirrors the msgFullGetReady signal's
+	// cold-load-vs-cold-seed discrimination. (Part-A modernization: cold-load is
+	// now MessagesTail(WindowMaxCount), previously the no-?limit Messages().)
 	msgFullGets map[string]int
 	holdMu      sync.Mutex
-	// msgHold lets a test BLOCK the full-message GET for a session until the
-	// chan is closed — used by the async-hydration test to assert the snapshot
-	// lands BEFORE the upstream fetch completes. nil (default) = no hold.
+	// msgHold lets a test BLOCK the cold-load message GET for a session until
+	// the chan is closed — used by the async-hydration test to assert the
+	// snapshot lands BEFORE the upstream fetch completes. nil (default) = no
+	// hold.
 	msgHold map[string]chan struct{}
 	// msgFullGetReady, if non-nil, is signalled (non-blocking) once per
-	// FULL-history message GET — a request with no ?limit= query — right
-	// BEFORE it blocks on msgHold[id]. A sync-path test (the /vh/snapshot
+	// cold-load message GET — a request with ?limit=<state.WindowMaxCount> —
+	// right BEFORE it blocks on msgHold[id]. A sync-path test (the /vh/snapshot
 	// EnsureMessages path) uses it to deterministically wait for the GET to be
-	// in flight: by the time the fake receives that request, EnsureMessages
-	// has ALREADY called MarkColdFetchStart, so the test can safely inject
-	// live events that must tag their entries. nil (default) = no signal, so
-	// existing tests are unaffected. Cold-seed tail GETs carry ?limit= and are
+	// in flight: by the time the fake receives that request, EnsureMessages has
+	// ALREADY called MarkColdFetchStart, so the test can safely inject live
+	// events that must tag their entries. nil (default) = no signal, so existing
+	// tests are unaffected. Cold-seed tail GETs (?limit=<coldTailLimit>) are
 	// never signalled here.
 	msgFullGetReady chan struct{}
 
@@ -92,12 +96,14 @@ func (f *fakeOpenCode) handler() http.Handler {
 		f.holdMu.Lock()
 		hold := f.msgHold[id]
 		f.holdMu.Unlock()
-		// Optional rendezvous for sync-path tests: signal that a FULL-history
-		// GET (no ?limit=) has arrived and is about to block on the hold — at
-		// which point EnsureMessages has already set coldFetchActive. Tail
-		// GETs (?limit=) are not signalled. Non-blocking; default-dropped if
-		// the test isn't reading, so it can never wedge the handler.
-		if hold != nil && r.URL.Query().Get("limit") == "" && f.msgFullGetReady != nil {
+		// Optional rendezvous for sync-path tests: signal that a cold-load
+		// GET (?limit=<WindowMaxCount>) has arrived and is about to block on the
+		// hold — at which point EnsureMessages has already set coldFetchActive.
+		// Cold-seed tail GETs (?limit=<coldTailLimit>) are not signalled.
+		// Non-blocking; default-dropped if the test isn't reading, so it can
+		// never wedge the handler. (Part-A modernization: cold-load is now
+		// MessagesTail(WindowMaxCount), not no-?limit Messages().)
+		if hold != nil && r.URL.Query().Get("limit") == strconv.Itoa(state.WindowMaxCount) && f.msgFullGetReady != nil {
 			select {
 			case f.msgFullGetReady <- struct{}{}:
 			default:
@@ -115,9 +121,10 @@ func (f *fakeOpenCode) handler() http.Handler {
 			return
 		}
 		f.msgGets[id]++
-		// Full-history GET only (no ?limit=) — the single-flight invariant
-		// counter. Tail GETs (?limit=) are excluded.
-		if r.URL.Query().Get("limit") == "" {
+		// Cold-load GET only (?limit=<WindowMaxCount>) — the single-flight
+		// invariant counter. Cold-seed tail GETs (?limit=<coldTailLimit>) are
+		// excluded. (Part-A modernization: cold-load is now MessagesTail.)
+		if r.URL.Query().Get("limit") == strconv.Itoa(state.WindowMaxCount) {
 			f.msgFullGets[id]++
 		}
 		if m, ok := f.messages[id]; ok {
