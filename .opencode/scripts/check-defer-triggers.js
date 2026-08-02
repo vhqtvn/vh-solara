@@ -384,12 +384,42 @@ function extractTriggers(body) {
     return { mode: "all", items: triggers };
 }
 
+// PROMOTER-mode terminal/discharge statuses. A candidate whose trigger
+// predicates are met but whose `status` is one of these has already been
+// discharged (the work was completed or cancelled) and must NOT resurface as
+// READY-for-DoR — the false-READY root cause this filter fixes: a
+// completed/cancelled card whose trigger file was later re-touched by
+// unrelated churn re-appeared as `[READY] ready-for-dor`. Deliberately
+// DISTINCT from PREP_CLOSED_STATUSES (release-prep additionally treats
+// "staged" as closed): the two modes carry different semantics, so only the
+// status-READING (readCardStatus) is shared, not the discharge SETS.
+const PROMOTER_DISCHARGE_STATUSES = new Set(["completed", "cancelled"]);
+
+// Read a card's `status` field defensively. Returns "" for missing/null/non-
+// string (which the caller treats as active / implicit-open). NEVER throws.
+// Shared single source of truth for "what is this card's status string?" so
+// the promoter DoR-readiness filter (evaluateCandidate) and release-prep's
+// closed-status skip read status IDENTICALLY — centralizing the read the
+// checker already had inline in mainReleasePrep.
+function readCardStatus(body) {
+    return (body && typeof body.status === "string") ? body.status : "";
+}
+
 // Evaluate one candidate (PROMOTER mode). Returns a report object. `body` is
 // the PARSED JSON task-card object (not the raw file text): task_id and
 // owner_notes are read natively so DEFER/p2-followup cards (.json produced
 // by /write-task) are honored. The Notes-prefix trigger grammar is fed
 // UNMODIFIED to extractTriggers as the owner_notes[] text joined by newlines
 // — the existing `^trigger:` regex + predicate parser are unchanged.
+//
+// Status filter (PROMOTER-mode DoR-readiness): the `met` field stays the RAW
+// trigger-evaluation truth (so the report can distinguish "triggers met" from
+// "READY-for-DoR"); `discharged` carries the status-filter verdict. A
+// trigger-met candidate whose `status` is a terminal value (completed/
+// cancelled) is discharged (NOT READY) regardless of trigger state. LENIENT:
+// an unknown status (not completed/cancelled) is treated as active — never
+// discharged; a missing/non-string status behaves exactly as before (READY
+// when triggers met). Never throws on status.
 function evaluateCandidate(file, body, since, changedPaths) {
     const id = (body && typeof body.task_id === "string" && body.task_id)
         || path.basename(file, ".json");
@@ -397,8 +427,16 @@ function evaluateCandidate(file, body, since, changedPaths) {
         ? body.owner_notes.join("\n")
         : "";
     const trig = extractTriggers(notesText);
+    const status = readCardStatus(body);
     if (!trig.items || trig.items.length === 0) {
-        return { id, file, met: false, mode: "none", note: "no-trigger-line", details: [] };
+        // No-trigger-line path: output unchanged ([hold] ... no-trigger-line).
+        // status/discharged are surfaced for object-shape consistency only; a
+        // no-trigger card is never READY and never discharged.
+        return {
+            id, file, met: false, mode: "none",
+            status, discharged: false,
+            note: "no-trigger-line", details: [],
+        };
     }
     const details = trig.items.map((t) => {
         const pred = parsePredicate(t);
@@ -408,7 +446,24 @@ function evaluateCandidate(file, body, since, changedPaths) {
     const met = trig.mode === "any"
         ? details.some((d) => d.met)
         : details.every((d) => d.met);
-    return { id, file, met, mode: trig.mode, note: met ? "ready-for-dor" : "trigger-not-met", details };
+    // Status filter: a trigger-met card with a terminal status is discharged,
+    // not READY. PROMOTER_DISCHARGE_STATUSES.has on the lowercased value gives
+    // case-insensitive matching; "" (missing status) and any unrecognized
+    // value are absent from the set → not discharged (lenient/active).
+    const statusLower = status.trim().toLowerCase();
+    const discharged = met && PROMOTER_DISCHARGE_STATUSES.has(statusLower);
+    return {
+        id,
+        file,
+        met,
+        mode: trig.mode,
+        status,
+        discharged,
+        note: discharged
+            ? `discharged: status:${statusLower} (trigger met but card not active)`
+            : (met ? "ready-for-dor" : "trigger-not-met"),
+        details,
+    };
 }
 
 // ---- Release-mode primitives (strict) -------------------------------------
@@ -1114,7 +1169,11 @@ function mainPromoter(options) {
     }
 
     for (const r of reports) {
-        const flag = r.met ? "READY" : "hold";
+        // Discharged cards (trigger met but terminal status) get a distinct
+        // [discharged] flag; they are NOT READY and do NOT count toward the
+        // READY total. trigger-not-met and no-trigger-line cards stay [hold]
+        // (unchanged).
+        const flag = r.discharged ? "discharged" : (r.met ? "READY" : "hold");
         process.stdout.write(`[${flag}] ${r.id} (${path.basename(r.file)}) — ${r.note}\n`);
         for (const d of r.details) {
             const mark = d.met ? "met" : "not-met";
@@ -1122,9 +1181,12 @@ function mainPromoter(options) {
         }
     }
 
-    const ready = reports.filter((r) => r.met).length;
+    const triggersMet = reports.filter((r) => r.met).length;
+    const ready = reports.filter((r) => r.met && !r.discharged).length;
+    const metButDischarged = reports.filter((r) => r.discharged).length;
     process.stdout.write(
-        `\n${ready}/${reports.length} candidate(s) have triggers met. ` +
+        `\n${ready} ready-for-dor / ${metButDischarged} discharged (trigger-met but status completed/cancelled) / ${reports.length} total. ` +
+        `${triggersMet}/${reports.length} candidate(s) have triggers met. ` +
         `Promoter: apply the Definition of Ready (area + file scope + validation ` +
         `plan + clear slice + provenance) before promoting any READY candidate.\n`,
     );
@@ -1243,7 +1305,7 @@ function mainReleasePrep(options) {
 
         const id = (body && typeof body.task_id === "string" && body.task_id)
             || path.basename(f).replace(/\.(json|md|txt)$/, "");
-        const status = (body && typeof body.status === "string") ? body.status : "";
+        const status = readCardStatus(body);
         const targets = extractPathTouchedJS(raw);
 
         // disposition_satisfied: closed status OR manifest entry.
@@ -1319,4 +1381,14 @@ function main() {
     mainPromoter(options);
 }
 
-main();
+// Dual-purpose module: runnable as a CLI (`node check-defer-triggers.js`) OR
+// importable by the verify-* self-test harness (which unit-tests
+// evaluateCandidate against synthetic fixtures WITHOUT invoking git). The
+// main-guard ensures importing the module never executes main() (which would
+// read .local/ and exit). process.argv[1] is the script path node was given;
+// resolving it handles both absolute and repo-relative invocations.
+export { evaluateCandidate, readCardStatus, PROMOTER_DISCHARGE_STATUSES };
+
+if (path.resolve(process.argv[1] || "") === __filename) {
+    main();
+}
