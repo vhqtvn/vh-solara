@@ -122,17 +122,21 @@ export async function fetchRecentProjects(): Promise<Project[]> {
 // --- Project activity (cross-workspace root/running counts) ---
 //
 // The switcher dialog annotates each project row with how many LIVE roots a
-// workspace has and how many are currently running. BOTH counts are
-// server-authoritative, sourced from a SINGLE endpoint:
-//   GET /vh/projects -> [{dir, epoch, seq, roots, running}]  (live ROOT count +
-//                       running ROOT count per bridged dir)
+// workspace has, how many are currently running, and how many are finished-
+// unread (the "unread idle" subset). ALL three counts are server-authoritative,
+// sourced from a SINGLE endpoint:
+//   GET /vh/projects -> [{dir, epoch, seq, roots, running, unreadRoots}]  (live
+//                       ROOT count + running ROOT count + unread ROOT count per
+//                       bridged dir)
 // The active project reads its counts from the SAME endpoint as every other
 // project — there is no client-side re-derivation (P2 collapsed the split-brain
 // where the active project previously walked state.sessions). Both key by the
 // exact project directory, so they merge into the pinned list by `dir`. Root
 // counts are ROOT-ONLY (children/archived excluded) on both sides, so
-// idle = roots − running is meaningful. The merge + sort below is a PURE
-// function (no DOM, no fetch) so it can be unit-tested directly.
+// idle = roots − running is meaningful, and unreadRoots ⊆ idle by invariant
+// (a root is marked finished-unread on ordinary busy→idle, cleared on idle→busy
+// or ack), so the switcher renders "N idle (M unread)". The merge + sort below
+// is a PURE function (no DOM, no fetch) so it can be unit-tested directly.
 
 export interface ProjectEndpointItem {
   dir: string;
@@ -147,11 +151,19 @@ export interface ProjectEndpointItem {
   // ambiguous with a session/process count). Same value as `running` during the
   // alias window; this is the field the SPA READS.
   runningRoots: number;
+  // unreadRoots is the count of live ROOTS currently finished-unread (an
+  // operator hasn't acknowledged them yet). unread ⊆ idle by invariant, so
+  // this is a SUBSET of (roots − running). Server-authoritative (the unread
+  // state is already synced via unread.set/unread.clear events + the snapshot's
+  // GLOBAL Unread field); the endpoint merely surfaces the per-project
+  // cardinality so the switcher can render "N idle (M unread)".
+  unreadRoots: number;
 }
 
 export interface ActivityMaps {
   roots: Map<string, number>; // dir -> LIVE root count (/vh/projects)
   running: Map<string, number>; // dir -> running root count (/vh/projects)
+  unread: Map<string, number>; // dir -> finished-unread LIVE root count (/vh/projects); subset of (roots − running)
 }
 
 // A row the switcher renders: a project enriched with activity + the active
@@ -161,6 +173,7 @@ export interface ProjectActivityRow {
   name: string;
   running: number; // 0 when not running / unknown
   idle: number; // max(0, roots − running); 0 when roots unknown
+  unreadIdle: number; // finished-unread live roots; a SUBSET of `idle`; 0 when unknown
   active: boolean; // true for projectDir()
 }
 
@@ -173,11 +186,13 @@ export interface ProjectActivityRow {
 export function buildActivityMaps(projectsEndpoint: ProjectEndpointItem[]): ActivityMaps {
   const roots = new Map<string, number>();
   const running = new Map<string, number>();
+  const unread = new Map<string, number>();
   for (const p of Array.isArray(projectsEndpoint) ? projectsEndpoint : []) {
     roots.set(p.dir, p.roots);
     running.set(p.dir, p.runningRoots);
+    unread.set(p.dir, p.unreadRoots);
   }
-  return { roots, running };
+  return { roots, running, unread };
 }
 
 // Enrich + sort the pinned project list. Sort order: running projects first,
@@ -186,13 +201,16 @@ export function buildActivityMaps(projectsEndpoint: ProjectEndpointItem[]): Acti
 // server-authoritative `maps` populated from /vh/projects — there is no live-
 // store special-case for the active project (P2). `idle` is derived defensively
 // as max(0, roots − running) so a transient roots < running (an endpoint race
-// between successive GETs) can never render a negative idle count.
+// between successive GETs) can never render a negative idle count. `unreadIdle`
+// is the finished-unread subset of `idle` (read verbatim from the endpoint's
+// per-dir unreadRoots; 0 when the dir has no endpoint entry); unreadRoots ⊆ idle
+// holds server-side by invariant, so unreadIdle <= idle always holds here too.
 export function mergeProjectActivity(
   pinned: Project[],
   maps: ActivityMaps,
   activeDir: string,
 ): ProjectActivityRow[] {
-  const { roots, running } = maps;
+  const { roots, running, unread } = maps;
   const rows: ProjectActivityRow[] = pinned.map((p) => {
     const isActive = p.directory === activeDir;
     const run = running.get(p.directory) || 0;
@@ -203,6 +221,7 @@ export function mergeProjectActivity(
       active: isActive,
       running: run,
       idle: Math.max(0, tot - run),
+      unreadIdle: unread.get(p.directory) || 0, // subset of idle; 0 when this dir has no endpoint entry
     };
   });
   rows.sort((a, b) => {
@@ -269,7 +288,7 @@ export async function fetchProjectActivity(): Promise<ActivityMaps> {
     return buildActivityMaps(Array.isArray(projects) ? (projects as ProjectEndpointItem[]) : []);
   } catch (e) {
     log.warn("projects", "activity fetch failed", e);
-    return { roots: new Map(), running: new Map() };
+    return { roots: new Map(), running: new Map(), unread: new Map() };
   }
 }
 

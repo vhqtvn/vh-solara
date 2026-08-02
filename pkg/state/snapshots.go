@@ -1120,6 +1120,69 @@ func (s *Store) RootCount() int {
 	return n
 }
 
+// UnreadRoots returns the number of LIVE ROOT sessions currently marked
+// finished-unread. Unread is root-scoped (keyed by rootOf) and unread ⊆ idle is
+// an enforced invariant (set on ordinary busy→idle via markUnreadLocked, cleared
+// unconditionally on idle→busy via clearUnreadLocked — see
+// unread_transition_test.go), so this is the per-project "unread idle" count.
+// Defensively intersected with the SAME live-root population RootCount uses
+// (parentID=="" || sessions[parentID]==nil) so an entry stranded in s.unread
+// after an archive/delete path can never inflate the count. deleteSessionLocked
+// already does delete(s.unread, id), so the intersection is harmless redundancy
+// (a belt-and-suspenders guard), not a correctness crutch.
+func (s *Store) UnreadRoots() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	n := 0
+	for id := range s.unread {
+		e, ok := s.sessions[id]
+		if !ok {
+			continue
+		}
+		if e.parentID == "" || s.sessions[e.parentID] == nil {
+			n++
+		}
+	}
+	return n
+}
+
+// ProjectCounts returns (roots, running, unread) under a SINGLE RLock so the
+// triple is a coherent snapshot — a busy↔idle writer cannot interleave
+// between the reads and produce a response where unread > (roots − running)
+// (which would violate the unread ⊆ idle wire invariant surfaced on
+// /vh/projects). Equivalent to calling RootCount()/RunningRoots()/UnreadRoots()
+// separately on a quiescent store, but atomic with respect to writers.
+// handleProjects MUST use this instead of the three individual accessors so
+// the per-project badge never renders "(N unread)" with N > idle.
+//
+// Atomicity is STRUCTURAL (the single RLock makes the triple coherent); the
+// value-equivalence with the individual accessors is pinned by
+// TestProjectCountsEquivalentToIndividualAccessors, and the read path is
+// verified under concurrency by `go test -race` on that seed + the
+// TestProjectCountsConcurrentInvariant hammer.
+func (s *Store) ProjectCounts() (roots, running, unread int) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for id, e := range s.sessions {
+		if e.parentID == "" || s.sessions[e.parentID] == nil {
+			roots++
+			if s.subtreeBusyCount[id] > 0 {
+				running++
+			}
+		}
+	}
+	for id := range s.unread {
+		e, ok := s.sessions[id]
+		if !ok {
+			continue
+		}
+		if e.parentID == "" || s.sessions[e.parentID] == nil {
+			unread++
+		}
+	}
+	return roots, running, unread
+}
+
 // Replay returns buffered events with seq > cursor. ok is false when the cursor
 // is older than the buffer's oldest retained event (caller must send a snapshot).
 func (s *Store) Replay(cursor uint64) (events []ClientEvent, head uint64, ok bool) {

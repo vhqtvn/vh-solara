@@ -102,7 +102,7 @@ describe("withActiveProject", () => {
     // mark the synthesized row active: the active dir is present in the output,
     // then the merge marks it active.
     const shaped = withActiveProject([], "/home/you/solara");
-    const empty: ActivityMaps = { roots: new Map(), running: new Map() };
+    const empty: ActivityMaps = { roots: new Map(), running: new Map(), unread: new Map() };
     const rows = mergeProjectActivity(shaped, empty, "/home/you/solara");
     expect(rows).toHaveLength(1);
     expect(rows[0].directory).toBe("/home/you/solara");

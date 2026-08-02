@@ -317,6 +317,13 @@ func TestProjectsEnumeratesInstances(t *testing.T) {
 	if r, _ := got[0]["running"].(float64); int(r) != agg.Store().RunningRoots() {
 		t.Fatalf("project running must match store RunningRoots, got %v want %d", got[0]["running"], agg.Store().RunningRoots())
 	}
+	// unreadRoots (NEW): per-project "unread idle" count (subset of roots −
+	// running). Server-authoritative, present and 0 on an empty store.
+	if r, ok := got[0]["unreadRoots"].(float64); !ok {
+		t.Fatalf("project unreadRoots must be present, got %v", got[0])
+	} else if int(r) != agg.Store().UnreadRoots() {
+		t.Fatalf("project unreadRoots must match store UnreadRoots, got %v want %d", got[0]["unreadRoots"], agg.Store().UnreadRoots())
+	}
 }
 
 // TestProjectsReportsRunningCount exercises the per-project Running badge source
@@ -354,6 +361,126 @@ func TestProjectsReportsRunningCount(t *testing.T) {
 	st.Apply(ev("session.idle", `{"sessionID":"c"}`))
 	if got := projectsRunning(t, web.URL); got != 0 {
 		t.Fatalf("after child idles: want running 0, got %d", got)
+	}
+}
+
+// TestProjectsReportsUnreadCount mirrors TestProjectsReportsRunningCount for the
+// per-project "unread idle" count (a SUBSET of roots − running). /vh/projects
+// must report UnreadRoots(), the count of live roots marked finished-unread.
+// Seeds two roots, drives one through an ordinary busy→idle completion (which
+// marks its root unread via markUnreadLocked — the unread ⊆ idle invariant), so
+// unreadRoots flips to 1; acking that root clears it back to 0. Also asserts the
+// invariant unreadRoots <= roots − running holds in BOTH states.
+func TestProjectsReportsUnreadCount(t *testing.T) {
+	f := &fakeOC{}
+	web, agg := newVerbServer(t, f)
+	st := agg.Store()
+
+	// Empty store → roots 0, running 0, unread 0.
+	if got := projectsUnread(t, web.URL); got != 0 {
+		t.Fatalf("empty store: want unread 0, got %d", got)
+	}
+
+	// Two roots; a child of root "a" goes busy → 1 running root. unread still 0
+	// (a busy subtree is not finished-unread).
+	st.Apply(ev("session.created", `{"info":{"id":"a"}}`))
+	st.Apply(ev("session.created", `{"info":{"id":"b"}}`))
+	st.Apply(ev("session.created", `{"info":{"id":"c","parentID":"a"}}`))
+	st.Apply(ev("session.status", `{"sessionID":"c","status":{"type":"busy"}}`))
+	if got := projectsUnread(t, web.URL); got != 0 {
+		t.Fatalf("busy subtree: want unread 0, got %d", got)
+	}
+	// Invariant: unread ⊆ idle (idle = roots − running = 2 − 1 = 1).
+	if u, idle := st.UnreadRoots(), st.RootCount()-st.RunningRoots(); u > idle {
+		t.Fatalf("invariant violated (busy state): unread %d > idle %d", u, idle)
+	}
+
+	// Child idles via the ORDINARY completion path (session.idle, markOnIdle=true)
+	// → root "a" marked finished-unread → unreadRoots 1.
+	st.Apply(ev("session.idle", `{"sessionID":"c"}`))
+	if want := st.UnreadRoots(); want != 1 {
+		t.Fatalf("setup invariant: UnreadRoots want 1, got %d", want)
+	}
+	if got := projectsUnread(t, web.URL); got != 1 {
+		t.Fatalf("after ordinary busy→idle: want unread 1, got %d", got)
+	}
+	// Invariant: unread ⊆ idle (idle = roots − running = 2 − 0 = 2; unread 1).
+	if u, idle := st.UnreadRoots(), st.RootCount()-st.RunningRoots(); u > idle {
+		t.Fatalf("invariant violated (idle state): unread %d > idle %d", u, idle)
+	}
+
+	// Ack the root → finished-unread cleared → unreadRoots 0.
+	st.AckUnread("a")
+	if want := st.UnreadRoots(); want != 0 {
+		t.Fatalf("setup invariant: UnreadRoots want 0 after ack, got %d", want)
+	}
+	if got := projectsUnread(t, web.URL); got != 0 {
+		t.Fatalf("after ack: want unread 0, got %d", got)
+	}
+}
+
+// TestProjectsReportsCoherentCounts is the B-F1 standing-check for the
+// /vh/projects coherence fix. After handleProjects switched from THREE separate
+// locked accessors (RootCount/RunningRoots/UnreadRoots, each its own RLock) to
+// the single-locked Store.ProjectCounts() accessor, the response's
+// roots/running/unreadRoots must (a) match the store's authoritative
+// ProjectCounts() triple, and (b) satisfy the wire invariant
+// unreadRoots <= roots − running, on a MIXED population (a running root AND an
+// unread root coexisting) — exactly the state where the earlier three-read race
+// could let a busy→idle writer interleave and surface unread > idle. The race is
+// now structurally impossible: the three counts come from one RLocked read.
+func TestProjectsReportsCoherentCounts(t *testing.T) {
+	f := &fakeOC{}
+	web, agg := newVerbServer(t, f)
+	st := agg.Store()
+
+	// R1 — root, busy via child C1 (subtreeBusyCount[R1] = 1).
+	// R2 — root, idle (driven to finished-unread below).
+	// R3 — root, idle, not unread.
+	// Children never count toward roots/running/unread.
+	st.Apply(ev("session.created", `{"info":{"id":"R1"}}`))
+	st.Apply(ev("session.created", `{"info":{"id":"C1","parentID":"R1"}}`))
+	st.Apply(ev("session.status", `{"sessionID":"C1","status":{"type":"busy"}}`))
+	st.Apply(ev("session.created", `{"info":{"id":"R2"}}`))
+	st.Apply(ev("session.created", `{"info":{"id":"R3"}}`))
+
+	// State 1 — busy: roots 3, running 1 (R1), unread 0; idle = 2 ⊇ unread 0.
+	wantRoots, wantRunning, wantUnread := st.ProjectCounts()
+	if wantRoots != 3 || wantRunning != 1 || wantUnread != 0 {
+		t.Fatalf("setup invariant (busy): want ProjectCounts (3,1,0), got (%d,%d,%d)",
+			wantRoots, wantRunning, wantUnread)
+	}
+	gotRoots, gotRunning, gotUnread := projectsCounts(t, web.URL)
+	if gotRoots != wantRoots || gotRunning != wantRunning || gotUnread != wantUnread {
+		t.Fatalf("busy state: endpoint (roots,running,unread)=(%d,%d,%d), want ProjectCounts (%d,%d,%d)",
+			gotRoots, gotRunning, gotUnread, wantRoots, wantRunning, wantUnread)
+	}
+	if gotUnread > gotRoots-gotRunning {
+		t.Fatalf("wire invariant violated (busy): unread %d > idle %d", gotUnread, gotRoots-gotRunning)
+	}
+
+	// Drive R2 through an ordinary busy→idle completion (session.status busy →
+	// idle, markOnIdle=true) so it flips finished-unread WITHOUT disturbing R1's
+	// busy subtree. Result: one running root AND one unread root coexist.
+	st.Apply(ev("session.created", `{"info":{"id":"C2","parentID":"R2"}}`))
+	st.Apply(ev("session.status", `{"sessionID":"C2","status":{"type":"busy"}}`))
+	st.Apply(ev("session.status", `{"sessionID":"C2","status":{"type":"idle"}}`))
+
+	// State 2 — mixed: roots 3, running 1 (R1), unread 1 (R2); idle = 2 ⊇ unread 1.
+	// This is the coherence-critical state: running and unread are both nonzero,
+	// so a read-interleaving race here would surface unread > idle on the wire.
+	wantRoots, wantRunning, wantUnread = st.ProjectCounts()
+	if wantRoots != 3 || wantRunning != 1 || wantUnread != 1 {
+		t.Fatalf("setup invariant (mixed): want ProjectCounts (3,1,1), got (%d,%d,%d)",
+			wantRoots, wantRunning, wantUnread)
+	}
+	gotRoots, gotRunning, gotUnread = projectsCounts(t, web.URL)
+	if gotRoots != wantRoots || gotRunning != wantRunning || gotUnread != wantUnread {
+		t.Fatalf("mixed state: endpoint (roots,running,unread)=(%d,%d,%d), want ProjectCounts (%d,%d,%d)",
+			gotRoots, gotRunning, gotUnread, wantRoots, wantRunning, wantUnread)
+	}
+	if gotUnread > gotRoots-gotRunning {
+		t.Fatalf("wire invariant violated (mixed): unread %d > idle %d", gotUnread, gotRoots-gotRunning)
 	}
 }
 
@@ -443,6 +570,58 @@ func projectsRunning(t *testing.T, base string) int {
 	}
 	t.Fatalf("default project not enumerated in /vh/projects: %v", got)
 	return 0
+}
+
+// projectsUnread GETs /vh/projects and returns the default project's unreadRoots
+// count (the single ""-dir entry). Fails the test on any transport/shape error.
+func projectsUnread(t *testing.T, base string) int {
+	t.Helper()
+	resp, err := http.Get(base + "/vh/projects")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var got []map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range got {
+		if p["dir"] == "" {
+			r, _ := p["unreadRoots"].(float64)
+			return int(r)
+		}
+	}
+	t.Fatalf("default project not enumerated in /vh/projects: %v", got)
+	return 0
+}
+
+// projectsCounts GETs /vh/projects and returns the default project's
+// (roots, running, unreadRoots) — the THREE contract-coupled counts behind the
+// unread ⊆ idle wire invariant (idle = roots − running must bound unreadRoots).
+// Fails the test on any transport/shape error. Mirrors projectsRunning/
+// projectsUnread but reads all three fields in one decode so a caller can assert
+// the coherent triple handleProjects now emits via Store.ProjectCounts().
+func projectsCounts(t *testing.T, base string) (roots, running, unread int) {
+	t.Helper()
+	resp, err := http.Get(base + "/vh/projects")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var got []map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range got {
+		if p["dir"] == "" {
+			r, _ := p["roots"].(float64)
+			ru, _ := p["running"].(float64)
+			u, _ := p["unreadRoots"].(float64)
+			return int(r), int(ru), int(u)
+		}
+	}
+	t.Fatalf("default project not enumerated in /vh/projects: %v", got)
+	return 0, 0, 0
 }
 
 func TestSendForwardsPrompt(t *testing.T) {

@@ -204,6 +204,11 @@
   background: var(--accent);
   border-radius: 50%;
 }
+/* Unread-idle subset: "(N unread)" inside the idle badge. Finished-but-not-yet-
+   acknowledged roots are a "needs your attention" signal, so they reuse the
+   existing --warn token (no new color literal). Plain inline span — no mask-
+   image/backdrop-filter/animation (WebRender heat rules). */
+.proj-unread-count { color: var(--warn); }
 /* Empty / no-results: a single muted, centered line. */
 .proj-empty {
   margin: 0;

@@ -20,18 +20,20 @@ const P = (directory: string, name?: string): Project => ({
   name: name ?? directory,
 });
 
-const empty: ActivityMaps = { roots: new Map(), running: new Map() };
+const empty: ActivityMaps = { roots: new Map(), running: new Map(), unread: new Map() };
 
 describe("buildActivityMaps", () => {
   it("builds dir->count maps from the /vh/projects payload (roots + running)", () => {
     const maps = buildActivityMaps([
-      { dir: "/a", roots: 2, running: 1, runningRoots: 1 },
-      { dir: "/b", roots: 5, running: 0, runningRoots: 0 },
+      { dir: "/a", roots: 2, running: 1, runningRoots: 1, unreadRoots: 0 },
+      { dir: "/b", roots: 5, running: 0, runningRoots: 0, unreadRoots: 2 },
     ]);
     expect(maps.roots.get("/a")).toBe(2);
     expect(maps.roots.get("/b")).toBe(5);
     expect(maps.running.get("/a")).toBe(1);
     expect(maps.running.get("/b")).toBe(0); // kept verbatim, including 0
+    expect(maps.unread.get("/a")).toBe(0);
+    expect(maps.unread.get("/b")).toBe(2);
   });
 
   it("keeps every dir's running value verbatim (including 0, no omission)", () => {
@@ -39,9 +41,9 @@ describe("buildActivityMaps", () => {
     // (which omitted idle dirs). Every dir present in the payload lands in the
     // running map with its true count, including 0.
     const maps = buildActivityMaps([
-      { dir: "/x", roots: 1, running: 0, runningRoots: 0 },
-      { dir: "/y", roots: 2, running: 2, runningRoots: 2 },
-      { dir: "/z", roots: 3, running: 3, runningRoots: 3 },
+      { dir: "/x", roots: 1, running: 0, runningRoots: 0, unreadRoots: 0 },
+      { dir: "/y", roots: 2, running: 2, runningRoots: 2, unreadRoots: 0 },
+      { dir: "/z", roots: 3, running: 3, runningRoots: 3, unreadRoots: 0 },
     ]);
     expect(maps.running.get("/x")).toBe(0);
     expect(maps.running.get("/y")).toBe(2);
@@ -68,6 +70,7 @@ describe("mergeProjectActivity", () => {
     const maps: ActivityMaps = {
       roots: new Map([["/a", 5], ["/b", 1]]),
       running: new Map([["/a", 2], ["/b", 0]]),
+      unread: new Map(),
     };
     const rows = mergeProjectActivity([P("/a"), P("/b")], maps, "/not-active");
     const byDir = Object.fromEntries(rows.map((r) => [r.directory, r]));
@@ -77,12 +80,40 @@ describe("mergeProjectActivity", () => {
     expect(byDir["/b"].idle).toBe(1);
   });
 
+  it("derives unreadIdle as a subset of idle (finished-unread live roots)", () => {
+    // /a: 3 roots, 1 running → idle 2; 1 of those idle roots is finished-unread
+    // → unreadIdle 1 (a SUBSET of idle). /b: 2 roots, 0 running → idle 2, but 0
+    // unread → unreadIdle 0. unreadIdle <= idle must hold in both.
+    const maps: ActivityMaps = {
+      roots: new Map([["/a", 3], ["/b", 2]]),
+      running: new Map([["/a", 1], ["/b", 0]]),
+      unread: new Map([["/a", 1], ["/b", 0]]),
+    };
+    const rows = mergeProjectActivity([P("/a"), P("/b")], maps, "/not-active");
+    const byDir = Object.fromEntries(rows.map((r) => [r.directory, r]));
+    expect(byDir["/a"].idle).toBe(2);
+    expect(byDir["/a"].unreadIdle).toBe(1);
+    expect(byDir["/a"].unreadIdle).toBeLessThanOrEqual(byDir["/a"].idle);
+    expect(byDir["/b"].idle).toBe(2);
+    expect(byDir["/b"].unreadIdle).toBe(0);
+    expect(byDir["/b"].unreadIdle).toBeLessThanOrEqual(byDir["/b"].idle);
+  });
+
+  it("falls back to unreadIdle 0 when a dir has no endpoint entry (unknown)", () => {
+    // A dir with no /vh/projects entry has no unread count either — unreadIdle
+    // is 0 (not undefined), mirroring the idle/running 0-fallback.
+    const rows = mergeProjectActivity([P("/unknown")], empty, "");
+    expect(rows[0].unreadIdle).toBe(0);
+    expect(rows[0].idle).toBe(0);
+  });
+
   it("never reports a negative idle when running > roots (transient endpoint race)", () => {
     // /a claims 1 root but 3 running (a race between successive /vh/projects
     // GETs, or a count that briefly inverts). idle must clamp to 0, never -2.
     const maps: ActivityMaps = {
       roots: new Map([["/a", 1]]),
       running: new Map([["/a", 3]]),
+      unread: new Map(),
     };
     const rows = mergeProjectActivity([P("/a")], maps, "/x");
     expect(rows[0].running).toBe(3);
@@ -97,6 +128,7 @@ describe("mergeProjectActivity", () => {
     const maps: ActivityMaps = {
       roots: new Map([["/a", 9], ["/b", 4]]),
       running: new Map([["/a", 7], ["/b", 0]]),
+      unread: new Map(),
     };
     const rows = mergeProjectActivity([P("/a"), P("/b")], maps, "/b");
     const byDir = Object.fromEntries(rows.map((r) => [r.directory, r]));
@@ -120,6 +152,7 @@ describe("mergeProjectActivity", () => {
         ["/apple", 1],
         ["/zebra", 1],
       ]),
+      unread: new Map(),
     };
     const rows = mergeProjectActivity(
       [
@@ -143,6 +176,7 @@ describe("mergeProjectActivity", () => {
     const maps: ActivityMaps = {
       roots: new Map(),
       running: new Map([["/busy", 1]]),
+      unread: new Map(),
     };
     const rows = mergeProjectActivity([P("/active", "active"), P("/busy", "busy")], maps, "/active");
     expect(rows[0].name).toBe("busy");
@@ -154,7 +188,7 @@ describe("mergeProjectActivity", () => {
   it("default project (empty dir) participates like any other row", () => {
     // P2: the active default reads its counts from the endpoint like every
     // other row (3 roots, 0 running → idle 3), NOT a live-store 0/0 override.
-    const maps: ActivityMaps = { roots: new Map([["", 3]]), running: new Map([["", 0]]) };
+    const maps: ActivityMaps = { roots: new Map([["", 3]]), running: new Map([["", 0]]), unread: new Map() };
     const rows = mergeProjectActivity([P("", "Default project"), P("/x", "x")], maps, "");
     const def = rows.find((r) => r.directory === "")!;
     expect(def.active).toBe(true);

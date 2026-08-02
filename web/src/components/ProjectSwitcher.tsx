@@ -201,7 +201,7 @@ export default function ProjectSwitcher() {
   const rows = createMemo(() =>
     mergeProjectActivity(
       pinnedWithActive(),
-      activity() ?? { roots: new Map(), running: new Map() },
+      activity() ?? { roots: new Map(), running: new Map(), unread: new Map() },
       projectDir(),
     ),
   );
@@ -292,7 +292,13 @@ export default function ProjectSwitcher() {
                               {p.running} running
                             </Show>
                             <Show when={p.running > 0 && p.idle > 0}>{", "}</Show>
-                            <Show when={p.idle > 0}>{p.idle} idle</Show>
+                            <Show when={p.idle > 0}>
+                              {p.idle} idle
+                              <Show when={p.unreadIdle > 0}>
+                                {" "}
+                                <span class="proj-unread-count">({p.unreadIdle} unread)</span>
+                              </Show>
+                            </Show>
                           </span>
                         </Show>
                       </span>
@@ -355,10 +361,15 @@ export default function ProjectSwitcher() {
                     // is NOT guaranteed. When one IS present for this dir, show
                     // idle too (consistency with pinned rows); otherwise fall back
                     // to running-only. idle is defensive: max(0, roots − running).
+                    // unreadIdle mirrors the same rootsKnown() guard: the unread
+                    // count is read only when the dir's roots are known (the
+                    // endpoint reports both or neither for a dir), so a recent
+                    // that isn't bridged never shows a stale "(N unread)".
                     const act = () => activity();
                     const rootsKnown = () => act()?.roots.has(r.directory) ?? false;
                     const run = () => act()?.running.get(r.directory) ?? 0;
                     const idle = () => (rootsKnown() ? Math.max(0, (act()!.roots.get(r.directory) ?? 0) - run()) : 0);
+                    const unreadIdle = () => (rootsKnown() ? act()!.unread.get(r.directory) ?? 0 : 0);
                     return (
                       <div class="proj-item">
                         <button type="button" class="proj-pick" onClick={() => (addProject(r.directory), setOpen(false))}>
@@ -373,7 +384,13 @@ export default function ProjectSwitcher() {
                                   {run()} running
                                 </Show>
                                 <Show when={run() > 0 && idle() > 0}>{", "}</Show>
-                                <Show when={idle() > 0}>{idle()} idle</Show>
+                                <Show when={idle() > 0}>
+                                  {idle()} idle
+                                  <Show when={unreadIdle() > 0}>
+                                    {" "}
+                                    <span class="proj-unread-count">({unreadIdle()} unread)</span>
+                                  </Show>
+                                </Show>
                               </span>
                             </Show>
                           </span>

@@ -1665,6 +1665,13 @@ type projectInfo struct {
 	// `running` is gated on an operator-approved cutoff; see
 	// docs/ai/wire-field-deprecation.md (audit L-10 / remediation M13).
 	RunningRoots int `json:"runningRoots"`
+	// UnreadRoots is the count of live ROOTS currently finished-unread (an
+	// operator hasn't acknowledged them yet). unread ⊆ idle by invariant, so
+	// this is a subset of (roots − running) — the switcher renders it as
+	// "N idle (M unread)". Server-authoritative and already synced between
+	// clients via unread.set/unread.clear events + the snapshot's GLOBAL Unread
+	// field; this endpoint merely surfaces the per-project cardinality.
+	UnreadRoots int `json:"unreadRoots"`
 }
 
 // handleProjects lists the project instances this worker currently bridges — one
@@ -1688,12 +1695,25 @@ func (s *Server) handleProjects(w http.ResponseWriter, r *http.Request) {
 	out := make([]projectInfo, 0, len(live))
 	for _, e := range live {
 		st := e.agg.Store()
-		// runningRootsCount feeds BOTH wire aliases during the
-		// alias-during-transition (L-10): `running` (retained) and
-		// `runningRoots` (the exact name the SPA migrates to). Computed once and
-		// assigned to both so the two wire fields provably carry the same value.
-		runningRootsCount := st.RunningRoots()
-		out = append(out, projectInfo{Dir: e.dir, Epoch: st.Epoch(), Seq: st.Head(), Roots: st.RootCount(), Running: runningRootsCount, RunningRoots: runningRootsCount})
+		// roots/running/unread are the THREE contract-coupled counts behind the
+		// unread ⊆ idle wire invariant (idle = roots − running must bound
+		// unreadRoots on every response). They MUST come from a SINGLE locked
+		// accessor (Store.ProjectCounts) so a busy↔idle writer cannot interleave
+		// between the reads and surface unread > (roots − running). The two wire
+		// aliases `running`/`runningRoots` (alias-during-transition, L-10) carry
+		// the same value because both are assigned from this one triple.
+		// Epoch()/Head() are metadata that do NOT participate in the invariant,
+		// so they stay as separate reads — the lock is not broadened for them.
+		roots, running, unread := st.ProjectCounts()
+		out = append(out, projectInfo{
+			Dir:          e.dir,
+			Epoch:        st.Epoch(),
+			Seq:          st.Head(),
+			Roots:        roots,
+			Running:      running,
+			RunningRoots: running,
+			UnreadRoots:  unread,
+		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Dir < out[j].Dir })
 	// State-like GET: the response is computed fresh on every call from live
