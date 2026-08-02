@@ -1,5 +1,5 @@
 import { expect, test, type APIRequestContext, type Browser, type Locator, type Page } from "@playwright/test";
-import { projectUrl, resetLabels, resetPins } from "./util";
+import { demoDir, projectUrl, resetLabels, resetPins } from "./util";
 
 // Slice 6 — server-managed root-session labels (groups + tags): multi-client
 // convergence + the filter×pin render matrix.
@@ -94,9 +94,12 @@ async function withLabels(
   request: APIRequestContext,
   fn: (doc: LabelDocApi) => LabelDocApi,
 ): Promise<void> {
-  const csrf = { "X-VH-CSRF": "1" };
+  // Mirror the SPA: stamp x-opencode-directory so reqDir resolves to the demo
+  // project key (the same key the SPA loads via ?dir=). See resetLabels in
+  // util.ts for the full rationale.
+  const csrf = { "X-VH-CSRF": "1", "x-opencode-directory": demoDir };
   for (let attempt = 0; attempt < 3; attempt++) {
-    const cur = await request.get("/vh/labels");
+    const cur = await request.get("/vh/labels", { headers: csrf });
     if (!cur.ok()) throw new Error(`withLabels: GET -> ${cur.status()}`);
     const base = (await cur.json()) as LabelDocApi;
     const next = fn(JSON.parse(JSON.stringify(base)));
@@ -615,7 +618,26 @@ test("(g) GroupHeader manage popover: rename, recolor, reorder, delete converge 
       // --label-color CSS var (the optimistic apply flips both before the PUT).
       await expect(menu.locator('button[aria-label="Color red"]')).toHaveAttribute("aria-pressed", "true", { timeout: 8000 });
       await expect(menu.locator('button[aria-label="Color blue"]')).toHaveAttribute("aria-pressed", "false");
-      await expect(groupToggle(a.page, "AlphaRenamed").locator('span[style*="--label-red"]')).toBeVisible({ timeout: 8000 });
+      // d63c757 hoisted the inline --label-color binding OFF the .groupDot span
+      // and onto the .group container div (rail/tint/dot share one source), so
+      // the dot no longer carries style*="--label-red" — its [data-group-id]
+      // ancestor does. Assert the recolor bound red by comparing the container's
+      // resolved --label-color to :root's --label-red value: chromium resolves
+      // the var() substitution for a custom property (so --label-color comes
+      // back as the hex, e.g. #f85149), and --label-red on :root resolves the
+      // same way — so the two are string-equal iff the recolor took effect,
+      // without hardcoding the palette hex here. closest("[data-group-id]")
+      // climbs from the AlphaRenamed toggle to the group container holding the
+      // binding. (Custom-property resolution is chromium-only here; this e2e
+      // runs the single chromium project, so the comparison is stable.)
+      await expect.poll(
+        () => groupToggle(a.page, "AlphaRenamed").evaluate((btn) => {
+          const root = btn.ownerDocument.documentElement;
+          const bound = getComputedStyle(btn.closest("[data-group-id]")!).getPropertyValue("--label-color").trim();
+          return bound === getComputedStyle(root).getPropertyValue("--label-red").trim();
+        }),
+        { timeout: 8000 },
+      ).toBe(true);
       // AlphaRenamed is FIRST → Move-up disabled (onFirst). Assert Move-down
       // ENABLED first so the disabled below is due to onFirst, not a stray
       // labelsPending left over from the recolor PUT (toBeEnabled auto-retries
@@ -655,5 +677,74 @@ test("(g) GroupHeader manage popover: rename, recolor, reorder, delete converge 
   } finally {
     await a.close();
     await b.close();
+  }
+});
+
+// ─── (h) group-card chrome renders (d63c757) ─────────────────────────────────
+// Commit d63c757 made each labeled group a visually distinct card: the .group
+// container carries a faint --label-color background tint, a 2px --label-color
+// left accent rail, rounded corners, and 4px separation. --label-color is set
+// INLINE on the .group element (labelColorVar) and cascades to the rail/tint.
+// This spec seeds a red group via the labels API (NOT the fixture) and asserts
+// the chrome actually resolves in the browser. The .group class is hashed (CSS
+// Modules), so select via the stable [data-group-id] hook (precedent: (a)–(g))
+// and read getComputedStyle on it. Single client — the chrome is a client-local
+// render, no multi-client convergence to prove here.
+//
+// What the assertions distinguish from the pre-d63c757 state:
+//   - --label-color: the .group module default is var(--label-gray); the inline
+//     var(--label-red) override must beat it. Custom properties are not var()-
+//     resolved by getComputedStyle, so the literal reference is what comes back.
+//   - borderLeftWidth "2px" + a resolved rgba() borderLeftColor (color-mix at
+//     45%): before the commit the container had no border (0px / transparent).
+//   - a resolved rgba() backgroundColor (color-mix at 6%): before the commit
+//     the surface was the unset rgba(0,0,0,0).
+test("(h) a labeled group renders the d63c757 card chrome (tint + accent rail)", async ({ request, browser }) => {
+  await withLabels(request, (doc) => ({
+    ...doc,
+    groups: [
+      ...doc.groups,
+      {
+        id: "lg-e2e-chrome",
+        name: "Chrome",
+        color: "red",
+        collapsed: false,
+        orderedRootSessionIds: ["demo"],
+      },
+    ],
+  }));
+
+  const a = await openClient(browser);
+  try {
+    const group = a.page.locator("[data-group-id]").first();
+    await expect(group).toBeVisible({ timeout: 10000 });
+
+    // --label-color is set inline to var(--label-red) by labelColorVar and must
+    // beat the module's var(--label-gray) default. Custom props are not var()-
+    // resolved by getComputedStyle, so the literal reference is returned (for
+    // "red" this reads "var(--label-red)"); asserting non-empty proves the inline
+    // override applied, format-stable across browsers.
+    await expect.poll(
+      () => group.evaluate((el) => getComputedStyle(el).getPropertyValue("--label-color").trim()),
+      { timeout: 5000 },
+    ).not.toBe("");
+
+    // The 2px left accent rail: width + a resolved (non-transparent) color.
+    await expect.poll(
+      () => group.evaluate((el) => getComputedStyle(el).borderLeftWidth),
+      { timeout: 5000 },
+    ).toBe("2px");
+    await expect.poll(
+      () => group.evaluate((el) => getComputedStyle(el).borderLeftColor),
+      { timeout: 5000 },
+    ).not.toBe("rgba(0, 0, 0, 0)");
+
+    // The faint surface tint: a resolved (non-transparent) rgba().
+    await expect.poll(
+      () => group.evaluate((el) => getComputedStyle(el).backgroundColor),
+      { timeout: 5000 },
+    ).not.toBe("rgba(0, 0, 0, 0)");
+  } finally {
+    await a.close();
   }
 });

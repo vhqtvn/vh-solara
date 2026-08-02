@@ -98,9 +98,15 @@ export async function resetPins(request: APIRequestContext): Promise<void> {
 // in-flight mutation could race a fast reset — re-read and retry rather than fail
 // setup.
 export async function resetLabels(request: APIRequestContext): Promise<void> {
-  const csrf = { "X-VH-CSRF": "1" };
+  // Mirror the SPA: stamp x-opencode-directory so reqDir resolves to the demo
+  // project key (the same one the SPA's installCsrf stamps on every request).
+  // Without this the raw `request` GET/PUT resolves to the daemon cwd project
+  // (the fixtureserver's managed-project cwd, distinct from VH_DEMO_DIR), so
+  // PUT writes one store while the bootstrap snapshot reads another (empty) →
+  // [data-group-id] never renders.
+  const csrf = { "X-VH-CSRF": "1", "x-opencode-directory": demoDir };
   for (let attempt = 0; attempt < 3; attempt++) {
-    const cur = await request.get("/vh/labels");
+    const cur = await request.get("/vh/labels", { headers: csrf });
     if (!cur.ok()) {
       throw new Error(`resetLabels: GET /vh/labels -> ${cur.status()} ${cur.statusText()}`);
     }
