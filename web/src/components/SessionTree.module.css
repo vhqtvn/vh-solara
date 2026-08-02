@@ -7,10 +7,25 @@
    GPU-cheap: solid colors + color-mix tints only. NO mask, NO backdrop-filter,
    NO contain/content-visibility (the tree is a large always-present surface). */
 
-/* A whole group section: header + body. */
+/* A whole group section: header + body, rendered as a visually contained
+   block. --label-color is set INLINE (labelColorVar) on this element and
+   cascades to the dot, the left rail, and the tinted surface, so the whole
+   group reads as one color-coherent cluster clearly bounded from the
+   ungrouped rows that follow. Defaults to gray when the inline var is absent.
+   GPU-cheap: solid color-mix tints only (no blur/mask/contain/
+   content-visibility — the tree is a large always-present surface). */
 .group {
+  --label-color: var(--label-gray);
   display: flex;
   flex-direction: column;
+  position: relative;
+  background: color-mix(in srgb, var(--label-color) 6%, transparent);
+  border-left: 2px solid color-mix(in srgb, var(--label-color) 45%, transparent);
+  border-radius: 8px;
+  padding: 3px 4px 4px;
+  /* Separates a group from its neighbors and from the ungrouped rows that
+     follow, so the boundary is obvious even at a glance. */
+  margin: 4px 0;
 }
 
 /* The header row: a full-width toggle button (caret+dot+name+count) on the left
@@ -21,7 +36,6 @@
   align-items: center;
   gap: 2px;
   padding: 0 2px;
-  margin-top: 4px;
 }
 
 /* The collapse toggle — a button so it's keyboard-focusable + aria-expanded. */
@@ -69,10 +83,10 @@
   transform: rotate(0deg);
 }
 
-/* The color dot — the saturated anchor for the group. Inline --label-color set
-   by labelColorVar(); falls back to gray. */
+/* The color dot — the saturated anchor for the group. Inherits --label-color
+   from the .group container (set inline by labelColorVar); falls back to gray
+   via the container's own default. */
 .groupDot {
-  --label-color: var(--label-gray);
   width: 9px;
   height: 9px;
   flex: none;
@@ -218,22 +232,10 @@
   box-shadow: 0 0 0 2px var(--bg-2);
 }
 
-/* The group body — its root rows. A subtle left tint bar ties the rows to the
-   group's color so a collapsed-then-expanded group reads as one cluster. */
+/* The group body — its root rows. The container (.group) already provides the
+   tinted surface, the left accent rail, and the rounding; the body only insets
+   the rows so they read as contained under the header. */
 .groupBody {
   position: relative;
-  padding-left: 6px;
-}
-.groupBody::before {
-  content: "";
-  position: absolute;
-  left: 7px;
-  top: 0;
-  bottom: 0;
-  width: 2px;
-  background: color-mix(in srgb, var(--label-color, var(--label-gray)) 0%, transparent);
-  /* The rail is intentionally near-invisible by default (color comes from the
-     header dot); kept as a structural hook. Avoids per-element color plumbing
-     that would re-rasterize on every labels mutation. */
-  opacity: 0;
+  padding: 2px 0 2px 6px;
 }

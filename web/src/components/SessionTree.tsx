@@ -246,11 +246,7 @@ function GroupHeader(props: {
         >
           <Icon name="chevronDown" size={12} />
         </span>
-        <span
-          class={styles.groupDot}
-          style={{ "--label-color": labelColorVar(props.group.color) }}
-          aria-hidden="true"
-        />
+        <span class={styles.groupDot} aria-hidden="true" />
         <span class={styles.groupName}>{props.group.name}</span>
         <span class={styles.groupCount}>{props.count}</span>
       </button>
@@ -499,7 +495,11 @@ function TreeStateView() {
               (effectiveExpanded masks stored `collapsed` without overwriting). */}
           <For each={sections().groups}>
             {(sec) => (
-              <div class={styles.group} data-group-id={sec.group.id}>
+              <div
+                class={styles.group}
+                data-group-id={sec.group.id}
+                style={{ "--label-color": labelColorVar(sec.group.color) }}
+              >
                 <GroupHeader
                   group={sec.group}
                   count={sec.roots.length}
