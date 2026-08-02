@@ -503,6 +503,14 @@ type messageEntry struct {
 type sessionMessages struct {
 	order []string // message ids in creation order
 	byID  map[string]*messageEntry
+	// historyExhausted is true once a backward older-page fetch (Part B
+	// EnsureOlderMessages) reached the session's oldest message
+	// (X-Next-Cursor == ""). Until then false → projectMessagePage's HasOlder
+	// stays truthful even when the resident walk hits the resident floor (older
+	// history may exist in opencode beyond the bounded cold-load tail).
+	// Reset to false implicitly when a fresh sessionMessages is created (cold
+	// load / reconnect) — the bounded tail never proves exhaustion.
+	historyExhausted bool
 }
 
 // --- envelope parse helpers ---
@@ -523,6 +531,7 @@ type messageInfoEnvelope struct {
 	Role      string `json:"role"`
 	Time      struct {
 		Completed *float64 `json:"completed"`
+		Created   *float64 `json:"created"`
 	} `json:"time"`
 	// Assistant-turn facts surfaced for the gate (A2). `finish` is opencode's
 	// raw completion reason; `tokens` the raw usage object.

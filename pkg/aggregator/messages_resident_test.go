@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -208,7 +209,7 @@ type schemaDriftHandler struct {
 }
 
 func (h *schemaDriftHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.Method == http.MethodGet && r.URL.Query().Get("limit") == "" &&
+	if r.Method == http.MethodGet && r.URL.Query().Get("limit") == strconv.Itoa(state.WindowMaxCount) &&
 		strings.HasPrefix(r.URL.Path, "/session/") && strings.HasSuffix(r.URL.Path, "/message") {
 		sid := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/session/"), "/message")
 		h.mu.Lock()
@@ -250,7 +251,7 @@ type sourceEmptyHandler struct {
 }
 
 func (h *sourceEmptyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.Method == http.MethodGet && r.URL.Query().Get("limit") == "" &&
+	if r.Method == http.MethodGet && r.URL.Query().Get("limit") == strconv.Itoa(state.WindowMaxCount) &&
 		strings.HasPrefix(r.URL.Path, "/session/") && strings.HasSuffix(r.URL.Path, "/message") {
 		sid := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/session/"), "/message")
 		h.mu.Lock()
@@ -364,7 +365,7 @@ type abortedHandler struct {
 }
 
 func (h *abortedHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.Method == http.MethodGet && r.URL.Query().Get("limit") == "" &&
+	if r.Method == http.MethodGet && r.URL.Query().Get("limit") == strconv.Itoa(state.WindowMaxCount) &&
 		strings.HasPrefix(r.URL.Path, "/session/") && strings.HasSuffix(r.URL.Path, "/message") {
 		sid := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/session/"), "/message")
 		h.mu.Lock()

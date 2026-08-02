@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/vhqtvn/vh-solara/pkg/aggregator"
 	"github.com/vhqtvn/vh-solara/pkg/opencode"
+	"github.com/vhqtvn/vh-solara/pkg/state"
 )
 
 // fakeOpenCode is a minimal stand-in for `opencode serve`: a session list, a
@@ -92,12 +94,14 @@ func (f *fakeOpenCode) handler() http.Handler {
 		f.holdMu.Lock()
 		hold := f.msgHold[id]
 		f.holdMu.Unlock()
-		// Optional rendezvous for sync-path tests: signal that a FULL-history
-		// GET (no ?limit=) has arrived and is about to block on the hold — at
-		// which point EnsureMessages has already set coldFetchActive. Tail
-		// GETs (?limit=) are not signalled. Non-blocking; default-dropped if
-		// the test isn't reading, so it can never wedge the handler.
-		if hold != nil && r.URL.Query().Get("limit") == "" && f.msgFullGetReady != nil {
+		// Optional rendezvous for sync-path tests: signal that a cold-load
+		// GET (?limit=<WindowMaxCount>) has arrived and is about to block on the
+		// hold — at which point EnsureMessages has already set coldFetchActive.
+		// Cold-seed tail GETs (?limit=<coldTailLimit>) are not signalled.
+		// Non-blocking; default-dropped if the test isn't reading, so it can
+		// never wedge the handler. (Part-B modernization: cold-load is now
+		// MessagesTail(WindowMaxCount), not no-?limit Messages().)
+		if hold != nil && r.URL.Query().Get("limit") == strconv.Itoa(state.WindowMaxCount) && f.msgFullGetReady != nil {
 			select {
 			case f.msgFullGetReady <- struct{}{}:
 			default:
@@ -115,9 +119,10 @@ func (f *fakeOpenCode) handler() http.Handler {
 			return
 		}
 		f.msgGets[id]++
-		// Full-history GET only (no ?limit=) — the single-flight invariant
-		// counter. Tail GETs (?limit=) are excluded.
-		if r.URL.Query().Get("limit") == "" {
+		// Cold-load GET only (?limit=<WindowMaxCount>) — the single-flight
+		// invariant counter. Cold-seed tail GETs (?limit=<coldTailLimit>) are
+		// excluded. (Part-B modernization: cold-load is now MessagesTail.)
+		if r.URL.Query().Get("limit") == strconv.Itoa(state.WindowMaxCount) {
 			f.msgFullGets[id]++
 		}
 		if m, ok := f.messages[id]; ok {

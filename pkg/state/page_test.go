@@ -455,38 +455,112 @@ func TestSnapshotMessagesPage_DefensiveCopy(t *testing.T) {
 // reconnect. Here the full-resident path pages back to m1.
 func TestSnapshotMessagesPage_FullResidentSupportsOlderHistory(t *testing.T) {
 	total := WindowMaxCount + 50 // > WindowMaxCount (100) → newest window is a strict subset
-	st := New(1024)
-	st.Apply(ev("session.created", `{"info":{"id":"s","title":"S"}}`))
-	// Seed a FULL transcript (oldest-first), exactly as a cold-load
-	// client.Messages() reconcile populates resident post-revert.
-	list := make([]MessageWithParts, total)
-	for i := 0; i < total; i++ {
-		list[i] = pageMsg(fmt.Sprintf("m%d", i+1), 10) // m1..m{total}
-	}
-	st.SetSessionMessages("s", list)
 
-	// The newest WindowMaxCount window is m{total-WindowMaxCount+1}..m{total}
-	// (m51..m100 for total=150). Its OLDEST id is the page-0 boundary the client
-	// would page backward from.
-	oldestOfNewestWindow := fmt.Sprintf("m%d", total-WindowMaxCount+1)
-	page := st.SnapshotMessagesPage("s", oldestOfNewestWindow, WindowMaxCount, 1<<20)
+	t.Run("full-resident-exhausted-pages-to-start-HasOlder-false", func(t *testing.T) {
+		st := New(1024)
+		st.Apply(ev("session.created", `{"info":{"id":"s","title":"S"}}`))
+		// Seed a FULL transcript (oldest-first), the post-boundary-demand shape
+		// (cold-load bounded to WindowMaxCount, then older history merged in via
+		// the cursor; historyExhausted=true marks "we have the session's oldest").
+		list := make([]MessageWithParts, total)
+		for i := 0; i < total; i++ {
+			list[i] = pageMsg(fmt.Sprintf("m%d", i+1), 10) // m1..m{total}
+		}
+		st.SetSessionMessages("s", list)
+		st.MergeOlderMessages("s", nil, true) // mark historyExhausted=true (full transcript resident)
 
-	// The boundary IS resident (full cold-load), so paging finds it.
-	if !page.BoundaryFound {
-		t.Fatalf("boundary_found: want true (full transcript resident post-revert), got false — resident was bounded (Part A re-introduced without Part B?)")
-	}
-	// CRUX — real older history: the page returns the boundary + strictly-older
-	// messages, paging all the way back to m1. Under the reverted-bound hazard
-	// (resident = newest 100 only), this page would be just [m51] (len==1,
-	// OldestID=m51) — older history silently lost.
-	if len(page.Items) <= 1 {
-		t.Fatalf("older page must return the boundary + strictly-older messages (full-resident paging); got %d items — older history not reachable without reconnect (Part A re-introduced?)", len(page.Items))
-	}
-	if page.OldestID != "m1" {
-		t.Fatalf("oldest_id: want m1 (paged back to the transcript start — full resident), got %q — older history truncated (Part A re-introduced?)", page.OldestID)
-	}
-	// Paged back to m1 (the start) → nothing older remains.
-	if page.HasOlder {
-		t.Fatalf("has_older: want false (paged to m1, the transcript start), got true")
-	}
+		oldestOfNewestWindow := fmt.Sprintf("m%d", total-WindowMaxCount+1) // m51
+		page := st.SnapshotMessagesPage("s", oldestOfNewestWindow, WindowMaxCount, 1<<20)
+
+		if !page.BoundaryFound {
+			t.Fatalf("boundary_found: want true (full transcript resident), got false")
+		}
+		if len(page.Items) <= 1 {
+			t.Fatalf("older page must return the boundary + strictly-older messages; got %d items", len(page.Items))
+		}
+		if page.OldestID != "m1" {
+			t.Fatalf("oldest_id: want m1 (paged to transcript start), got %q", page.OldestID)
+		}
+		// historyExhausted=true (full transcript) → no older remains.
+		if page.HasOlder {
+			t.Fatalf("has_older: want false (historyExhausted=true, paged to m1 the start), got true")
+		}
+		if !page.HistoryExhausted {
+			t.Fatalf("history_exhausted: want true (full transcript resident), got false")
+		}
+	})
+
+	t.Run("bounded-resident-not-exhausted-HasOlder-true", func(t *testing.T) {
+		// The Part-B cold-load shape: resident = newest WindowMaxCount only
+		// (m51..m150), historyExhausted=false (older history exists but is not
+		// yet resident — the boundary-demand path will fetch it).
+		st := New(1024)
+		st.Apply(ev("session.created", `{"info":{"id":"s","title":"S"}}`))
+		bounded := make([]MessageWithParts, WindowMaxCount)
+		for i := 0; i < WindowMaxCount; i++ {
+			bounded[i] = pageMsg(fmt.Sprintf("m%d", total-WindowMaxCount+1+i), 10) // m51..m150
+		}
+		st.SetSessionMessages("s", bounded) // historyExhausted=false (default)
+
+		page := st.SnapshotMessagesPage("s", "m51", WindowMaxCount, 1<<20)
+		if !page.BoundaryFound {
+			t.Fatalf("boundary_found: want true (m51 resident), got false")
+		}
+		// CRUX (d): HasOlder hinges on !historyExhausted when not count/byte
+		// limited. The bounded resident has NOT exhausted history → HasOlder=true
+		// (older history natively accessible via the boundary-demand path).
+		if !page.HasOlder {
+			t.Fatalf("has_older: want true (bounded resident, historyExhausted=false → older exists), got false")
+		}
+		if page.HistoryExhausted {
+			t.Fatalf("history_exhausted: want false (bounded resident), got true")
+		}
+	})
+
+	t.Run("boundary-demand-ID-prepend-merges-older-then-exhausts", func(t *testing.T) {
+		// Start bounded (m51..m150, historyExhausted=false). Simulate the
+		// boundary-demand: MergeOlderMessages prepends the strictly-older page
+		// (m1..m50) by ID, then a final merge marks historyExhausted=true.
+		st := New(1024)
+		st.Apply(ev("session.created", `{"info":{"id":"s","title":"S"}}`))
+		bounded := make([]MessageWithParts, WindowMaxCount)
+		for i := 0; i < WindowMaxCount; i++ {
+			bounded[i] = pageMsg(fmt.Sprintf("m%d", total-WindowMaxCount+1+i), 10)
+		}
+		st.SetSessionMessages("s", bounded)
+
+		// Older page m1..m50 (oldest-first, as the cursor returns), not exhausted.
+		older := make([]MessageWithParts, total-WindowMaxCount)
+		for i := 0; i < total-WindowMaxCount; i++ {
+			older[i] = pageMsg(fmt.Sprintf("m%d", i+1), 10) // m1..m50
+		}
+		st.MergeOlderMessages("s", older, false) // ID-prepend; historyExhausted still false
+
+		// After the prepend, paging from m51 reaches m1 (the merged older page).
+		page := st.SnapshotMessagesPage("s", "m51", WindowMaxCount, 1<<20)
+		if page.OldestID != "m1" {
+			t.Fatalf("after ID-prepend merge: oldest_id want m1, got %q (prepend did not merge the older page)", page.OldestID)
+		}
+		if len(page.Items) <= 1 {
+			t.Fatalf("after ID-prepend merge: page must include older items, got %d", len(page.Items))
+		}
+		// Still not exhausted → HasOlder=true (the cursor's X-Next-Cursor was set).
+		if !page.HasOlder {
+			t.Fatalf("after merge (historyExhausted=false): has_older want true, got false")
+		}
+
+		// Final merge: the cursor's X-Next-Cursor is now empty → historyExhausted=true.
+		st.MergeOlderMessages("s", nil, true)
+		page2 := st.SnapshotMessagesPage("s", "m51", WindowMaxCount, 1<<20)
+		if page2.OldestID != "m1" {
+			t.Fatalf("after exhaust: oldest_id want m1, got %q", page2.OldestID)
+		}
+		// historyExhausted=true → HasOlder=false (truthful end-of-history).
+		if page2.HasOlder {
+			t.Fatalf("after historyExhausted=true: has_older want false (end-of-history), got true")
+		}
+		if !page2.HistoryExhausted {
+			t.Fatalf("history_exhausted: want true after the empty-X-Next-Cursor merge, got false")
+		}
+	})
 }

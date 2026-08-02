@@ -185,7 +185,17 @@ func (s *Store) reconcileMessagesLocked(sid string, list []MessageWithParts) (co
 	s.bumpMsgRev(sid)
 	sm := s.messages[sid]
 	if sm == nil {
-		sm = &sessionMessages{byID: map[string]*messageEntry{}}
+		// Part B: historyExhausted records whether the resident holds the
+		// session's oldest message. The cold-load fetches MessagesTail(windowMaxCount),
+		// so a PARTIAL window (len < windowMaxCount) means the session had fewer
+		// than windowMaxCount messages → all fetched → exhausted; a FULL window
+		// (len == windowMaxCount) means older history likely exists → NOT exhausted
+		// (the boundary-demand path will fetch + merge it, then MergeOlderMessages
+		// sets exhausted=true when the cursor's X-Next-Cursor is empty). Set only
+		// on FRESH creation; warm reconciles preserve the existing flag so a
+		// boundary-demand's exhaustion survives a reconnect re-fetch.
+		exhausted := len(list) < s.windowMaxCount
+		sm = &sessionMessages{byID: map[string]*messageEntry{}, historyExhausted: exhausted}
 		s.messages[sid] = sm
 	}
 	for _, mwp := range list {

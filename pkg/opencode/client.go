@@ -8,6 +8,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -351,6 +352,13 @@ func (c *Client) Messages(ctx context.Context, sessionID string) ([]json.RawMess
 // Used by the aggregator during cold hydrate to seed the tree's per-agent chips
 // (the agent lives on assistant messages as info.agent) without fetching every
 // session's full history.
+//
+// For OLDER pages (strictly-older-than-a-cursor), use MessagesBefore — opencode
+// supports backward paging via `?before=<cursor-token>&limit=N` + the
+// `X-Next-Cursor` response header (see researches/sources/opencode-latest-
+// message-backward-cursor.md). The earlier "no backward pagination" inference
+// was wrong for latest; it was a raw-id-probe artifact (a raw msg_ id is not a
+// valid cursor token → 400).
 func (c *Client) MessagesTail(ctx context.Context, sessionID string, limit int) ([]json.RawMessage, error) {
 	path := "/session/" + sessionID + "/message"
 	if limit > 0 {
@@ -361,6 +369,57 @@ func (c *Client) MessagesTail(ctx context.Context, sessionID string, limit int) 
 		return nil, err
 	}
 	return out, nil
+}
+
+// EncodeMessageCursor builds an opencode backward-paging cursor token for the
+// (id, time_created) tuple: base64url(JSON({"id":id,"time":timeMs})), keys id
+// then time, UNPADDED. This is the ?before=<token> value the
+// GET /session/:id/message route decodes (cursor.decode) to page strictly-older
+// messages (sst/opencode MessageV2.page: older(cursor) = lt(time_created,
+// cursor.time) OR (eq AND lt(id))). timeMs is the message's time_created as
+// unix-ms (the unit the `message` table stores). The token is base64url
+// (charset [A-Za-z0-9-_], no padding) → URL-query-safe, no escaping needed.
+// See researches/sources/opencode-latest-message-backward-cursor.md.
+func EncodeMessageCursor(id string, timeMs float64) string {
+	b, _ := json.Marshal(struct {
+		ID   string  `json:"id"`
+		Time float64 `json:"time"`
+	}{id, timeMs})
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+// MessagesBefore fetches one strictly-older message page via opencode's backward
+// cursor: GET /session/:id/message?before=<cursor>&limit=N. Returns the page
+// (chronological, oldest-first) plus the parsed X-Next-Cursor response header —
+// the cursor for the NEXT older page, EMPTY when the session's oldest message
+// has been reached (history exhausted). limit <= 0 falls back to a default page
+// size (state.WindowMaxCount at the call site). The cursor MUST be a token from
+// EncodeMessageCursor (or an X-Next-Cursor value), NEVER a raw msg_ id (the
+// route runs cursor.decode on `before`; a raw id 400s). Unlike getJSON, this
+// variant does NOT discard response headers (X-Next-Cursor is load-bearing).
+func (c *Client) MessagesBefore(ctx context.Context, sessionID, cursor string, limit int) ([]json.RawMessage, string, error) {
+	path := "/session/" + sessionID + "/message?before=" + cursor
+	if limit > 0 {
+		path += "&limit=" + fmt.Sprintf("%d", limit)
+	}
+	req, err := c.newRequest(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, "", err
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return nil, "", fmt.Errorf("GET %s: status %d: %s", path, resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	var out []json.RawMessage
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, "", err
+	}
+	return out, resp.Header.Get("X-Next-Cursor"), nil
 }
 
 // ErrMessageNotFound is the sentinel returned by Message when OpenCode has no

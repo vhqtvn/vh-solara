@@ -129,6 +129,17 @@ type Aggregator struct {
 	msgMu       sync.Mutex
 	msgInflight map[string]chan struct{}
 
+	// pageMu guards pageInflight. pageInflight[sid] is non-nil (open) while a
+	// Part B "past-resident older-page" fetch (EnsureOlderMessages, triggered by
+	// the boundary-demand handler) is in flight for that session. INDEPENDENT of
+	// msgInflight (the cold-load slot): an older-page fetch does NOT block or
+	// dedupe against a live cold-load, and vice versa. Collapses concurrent
+	// same-session "Load older" demands to ONE upstream
+	// GET /session/:id/message?before=<cursor> — concurrent callers wait for the
+	// winner's merge and return nil. Cleared on completion (success OR failure).
+	pageMu       sync.Mutex
+	pageInflight map[string]chan struct{}
+
 	// msgGateHook (test-only, nil in production) is invoked once per
 	// EnsureMessages / EnsureMessagesAsync call immediately AFTER the unlocked
 	// IsMessagesLoaded fast-path gate returns false — i.e. at the START of the
@@ -169,12 +180,19 @@ type Aggregator struct {
 	treeReconcileInterval time.Duration
 }
 
+// DESIGN NOTE: state.New panic-translates the unreachable validate() error because
+// all production callers supply vhEventRingCapacity (4096). If aggregator construction
+// ever accepts a non-constant state.Config or operator-controlled ring capacity,
+// re-evaluate error-returning construction (NewWithConfig returns (*Store, error))
+// rather than relying on the panic-translating wrapper.
+//
 // New builds an aggregator targeting an opencode server base URL.
 func New(baseURL string, ringCapacity int) *Aggregator {
 	return &Aggregator{
 		client:                  opencode.New(baseURL),
 		store:                   state.New(ringCapacity),
 		msgInflight:             map[string]chan struct{}{},
+		pageInflight:            map[string]chan struct{}{},
 		statusReconcileInterval: 60 * time.Second,
 		treeReconcileInterval:   5 * time.Second,
 	}
@@ -189,6 +207,7 @@ func NewForDirectory(baseURL, directory string, ringCapacity int) *Aggregator {
 		client:                  c,
 		store:                   state.New(ringCapacity),
 		msgInflight:             map[string]chan struct{}{},
+		pageInflight:            map[string]chan struct{}{},
 		statusReconcileInterval: 60 * time.Second,
 		treeReconcileInterval:   5 * time.Second,
 	}

@@ -6,6 +6,7 @@
 package fixtures
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -1110,14 +1111,127 @@ func (f *FakeOpenCode) handleSession(w http.ResponseWriter, r *http.Request) {
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	// Honor ?limit=N like real OpenCode (sst/opencode MessageV2.page: newest N
-	// messages, in chronological order within the window). The fixture stores
-	// messages in chronological order, so the newest window is the tail slice.
+	// Honor the backward cursor API (sst/opencode MessageV2.page) like real
+	// OpenCode: ?before=<cursor-token>&limit=N returns the N strictly-older
+	// messages (chronological), with X-Next-Cursor set to the oldest of the slice
+	// when more older history remains. Cursor token = base64url(JSON{id,time})
+	// (matches pkg/opencode EncodeMessageCursor). ?limit=N alone = newest-N tail.
 	msgs := f.messages[id]
-	if l, _ := strconv.Atoi(r.URL.Query().Get("limit")); l > 0 && l < len(msgs) {
-		msgs = msgs[len(msgs)-l:]
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	if before := r.URL.Query().Get("before"); before != "" {
+		cid, ctime, ok := decodeMessageCursor(before)
+		if !ok {
+			http.Error(w, "invalid before cursor", http.StatusBadRequest)
+			return
+		}
+		// Strictly-older by (time_created, id) — chronological order preserved.
+		var older []messageWithParts
+		for _, m := range msgs {
+			mt, _ := messageCreatedTime(m)
+			mid, _ := m.Info["id"].(string)
+			if mt < ctime || (mt == ctime && mid < cid) {
+				older = append(older, m)
+			}
+		}
+		if limit <= 0 {
+			limit = len(older)
+		}
+		if len(older) > limit {
+			// Newest `limit` of the strictly-older set; X-Next-Cursor = its oldest.
+			older = older[len(older)-limit:]
+			oldest := older[0]
+			oid, _ := oldest.Info["id"].(string)
+			otime, _ := messageCreatedTime(oldest)
+			w.Header().Set("X-Next-Cursor", encodeMessageCursor(oid, otime))
+		}
+		writeJSON(w, older)
+		return
+	}
+	// Tail (no cursor): newest N messages, chronological within the window.
+	if limit > 0 && limit < len(msgs) {
+		msgs = msgs[len(msgs)-limit:]
 	}
 	writeJSON(w, msgs)
+}
+
+// encodeMessageCursor builds the ?before=<token> value: base64url(JSON{id,time})
+// (unpadded; keys id then time). Mirrors pkg/opencode.EncodeMessageCursor.
+func encodeMessageCursor(id string, timeMs float64) string {
+	b, _ := json.Marshal(struct {
+		ID   string  `json:"id"`
+		Time float64 `json:"time"`
+	}{id, timeMs})
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+// decodeMessageCursor parses a ?before token. Returns ok=false on malformed.
+func decodeMessageCursor(token string) (id string, timeMs float64, ok bool) {
+	b, err := base64.RawURLEncoding.DecodeString(token)
+	if err != nil {
+		return "", 0, false
+	}
+	var c struct {
+		ID   string  `json:"id"`
+		Time float64 `json:"time"`
+	}
+	if json.Unmarshal(b, &c) != nil || c.ID == "" {
+		return "", 0, false
+	}
+	return c.ID, c.Time, true
+}
+
+// messageCreatedTime extracts info.time.created (unix-ms) from a fixture message.
+func messageCreatedTime(m messageWithParts) (float64, bool) {
+	t, _ := m.Info["time"].(map[string]any)
+	if t == nil {
+		return 0, false
+	}
+	c, _ := t["created"].(float64)
+	return c, c != 0
+}
+
+// SeedChronologicalMessages seeds <sid> with n COMPLETED assistant turns in
+// chronological order (oldest-first), each with info.time.created set (ascending
+// unix-ms) so the backward-cursor paging is exercisable. Measurement/test
+// helper only: appends to f.messages; no live emit. Used by the Part-B
+// boundary-demand e2e.
+func (f *FakeOpenCode) SeedChronologicalMessages(sid string, n int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	base := float64(time.Now().UnixMilli())
+	out := make([]messageWithParts, 0, n)
+	for i := 0; i < n; i++ {
+		t := base - float64(n-i)*1000 // ascending: m1 oldest
+		id := fmt.Sprintf("cm%d", i+1)
+		out = append(out, messageWithParts{
+			Info: map[string]any{
+				"id": id, "sessionID": sid, "role": "assistant", "agent": "build",
+				"time": map[string]any{"created": t, "completed": t + 500},
+			},
+			Parts: []map[string]any{
+				{"id": "cp" + strconv.Itoa(i+1), "sessionID": sid, "messageID": id, "type": "text", "text": "older turn " + strconv.Itoa(i+1)},
+			},
+		})
+	}
+	f.messages[sid] = out
+	// Register the session in the session list so the aggregator's hydrate
+	// (GET /session) admits it into the project store. Without this the
+	// project-isolation guard (pkg/web projectScopedFilter: HasSession) drops it
+	// and EnsureMessages never runs, so the cold-load never populates resident.
+	already := false
+	for _, s := range f.sessions {
+		if id, _ := s["id"].(string); id == sid {
+			already = true
+			break
+		}
+	}
+	if !already {
+		f.sessions = append(f.sessions, map[string]any{
+			"id": sid, "title": "Chronological " + strconv.Itoa(n),
+			"directory": demoDir,
+			"time":      map[string]any{"created": base - float64(n)*1000, "updated": base},
+		})
+	}
 }
 
 // simulateShell emits a user message containing the command and an assistant

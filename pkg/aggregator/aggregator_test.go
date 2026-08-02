@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/vhqtvn/vh-solara/pkg/fixtures"
 	"github.com/vhqtvn/vh-solara/pkg/opencode"
+	"github.com/vhqtvn/vh-solara/pkg/state"
 )
 
 // A daemon restart rebuilds the store from a fresh hydrate. Pending questions
@@ -283,12 +285,13 @@ func TestRehydrateSeedSurvivesRequestCancel(t *testing.T) {
 	}
 }
 
-// slowFullMessageHandler wraps an OpenCode handler and delays the FULL message
-// fetch (GET /session/:id/message with NO ?limit=) — exactly the request
-// client.Messages issues (the lazy-hydration path) — while leaving every other
-// request (incl. the cold-seed's ?limit= tail) fast. This is the async-msg
-// analog of slowTailHandler. The !limit distinction is what separates the
-// lazy full-fetch from the cold-seed tail-fetch.
+// slowFullMessageHandler wraps an OpenCode handler and delays the lazy-hydration
+// cold-load fetch — post Part-B, that is client.MessagesTail(sid,
+// state.WindowMaxCount) (GET /session/:id/message?limit=<WindowMaxCount>), i.e.
+// the ?limit=<WindowMaxCount> tail — while leaving every other request (incl.
+// the cold-seed ?limit=<coldTailLimit> tail) fast. This is the async-msg analog
+// of slowTailHandler. The WindowMaxCount limit value is what separates the
+// cold-load tail from the cold-seed tail (coldTailLimit).
 type slowFullMessageHandler struct {
 	inner    http.Handler
 	delay    time.Duration
@@ -298,8 +301,12 @@ type slowFullMessageHandler struct {
 }
 
 func (h *slowFullMessageHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Post Part-B the lazy-hydration fetch is MessagesTail(WindowMaxCount) — a
+	// ?limit=<WindowMaxCount> tail — NOT the no-limit Messages() fetch. Match
+	// that exact limit value so the handler delays/counts the cold-load fetch
+	// and leaves the cold-seed ?limit=<coldTailLimit> tail untouched.
 	if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/session/") &&
-		strings.HasSuffix(r.URL.Path, "/message") && r.URL.Query().Get("limit") == "" {
+		strings.HasSuffix(r.URL.Path, "/message") && r.URL.Query().Get("limit") == strconv.Itoa(state.WindowMaxCount) {
 		sid := strings.TrimPrefix(r.URL.Path, "/session/")
 		sid = strings.TrimSuffix(sid, "/message")
 		h.mu.Lock()
@@ -397,12 +404,11 @@ func TestEnsureMessagesAsyncSuccessEmitsCompletion(t *testing.T) {
 	// answers GET /session/empty/message with [].
 	mux := http.NewServeMux()
 	mux.HandleFunc("/session/empty/message", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Get("limit") == "" {
-			w.Header().Set("Content-Type", "application/json")
-			w.Write([]byte("[]"))
-			return
-		}
-		http.Error(w, "no tail", http.StatusNotFound)
+		// Contract-agnostic (Part-B modernization): cold-load now sends ?limit
+		// (MessagesTail). The empty session's tail is [] regardless of N, so serve
+		// [] unconditionally (the no-tail discrimination is obsolete).
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte("[]"))
 	})
 	// Delegate everything else to the standard fixture so the aggregator's
 	// hydrate (sessions list, cold-seed tails) still works.
@@ -454,14 +460,13 @@ func TestEnsureMessagesAsyncFailureEmitsError(t *testing.T) {
 	)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/session/broken/message", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Get("limit") == "" {
-			mu.Lock()
-			fullCount++
-			mu.Unlock()
-			http.Error(w, "upstream down", http.StatusInternalServerError)
-			return
-		}
-		http.Error(w, "no tail", http.StatusNotFound)
+		// Contract-agnostic (Part-B modernization): cold-load now sends ?limit
+		// (MessagesTail), so count + 500 the fetch regardless of ?limit. The retry
+		// assertion (N calls → N fetches) still holds.
+		mu.Lock()
+		fullCount++
+		mu.Unlock()
+		http.Error(w, "upstream down", http.StatusInternalServerError)
 	})
 	mux.Handle("/", fixtures.New().Handler())
 	oc := httptest.NewServer(mux)
@@ -761,14 +766,13 @@ func TestEnsureMessagesSyncFailureEmitsErrorAndRetries(t *testing.T) {
 	)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/session/broken/message", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Get("limit") == "" {
-			mu.Lock()
-			fullCount++
-			mu.Unlock()
-			http.Error(w, "upstream down", http.StatusInternalServerError)
-			return
-		}
-		http.Error(w, "no tail", http.StatusNotFound)
+		// Contract-agnostic (Part-B modernization): cold-load now sends ?limit
+		// (MessagesTail), so count + 500 the fetch regardless of ?limit. The retry
+		// assertion (N calls → N fetches) still holds.
+		mu.Lock()
+		fullCount++
+		mu.Unlock()
+		http.Error(w, "upstream down", http.StatusInternalServerError)
 	})
 	mux.Handle("/", fixtures.New().Handler())
 	oc := httptest.NewServer(mux)
@@ -877,25 +881,23 @@ func TestEnsureMessagesSyncSingleFlightWaiter(t *testing.T) {
 
 			mux := http.NewServeMux()
 			mux.HandleFunc("/session/"+sid+"/message", func(w http.ResponseWriter, r *http.Request) {
-				if r.URL.Query().Get("limit") == "" {
-					mu.Lock()
-					fullCount++
-					n := fullCount
-					mu.Unlock()
-					select {
-					case notify <- struct{}{}:
-					default:
-					}
-					<-hold // deterministic in-flight: block until released
-					if tc.failFirst && n == 1 {
-						http.Error(w, "upstream down", http.StatusInternalServerError)
-						return
-					}
-					w.Header().Set("Content-Type", "application/json")
-					w.Write([]byte(successBody))
+				// Contract-agnostic (Part-B modernization): cold-load now sends
+				// ?limit (MessagesTail), so count + signal + serve unconditionally.
+				mu.Lock()
+				fullCount++
+				n := fullCount
+				mu.Unlock()
+				select {
+				case notify <- struct{}{}:
+				default:
+				}
+				<-hold // deterministic in-flight: block until released
+				if tc.failFirst && n == 1 {
+					http.Error(w, "upstream down", http.StatusInternalServerError)
 					return
 				}
-				http.Error(w, "no tail", http.StatusNotFound)
+				w.Header().Set("Content-Type", "application/json")
+				w.Write([]byte(successBody))
 			})
 			mux.Handle("/", fixtures.New().Handler())
 			oc := httptest.NewServer(mux)

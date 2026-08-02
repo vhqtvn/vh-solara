@@ -1,21 +1,23 @@
 package aggregator
 
-// coldload_full_guard_test.go — 7648673-F1 guard: the cold-load fetch must be
-// the FULL transcript (client.Messages, NO ?limit=), NOT MessagesTail(N). This
-// is the aggregator-level complement to pkg/state's
-// TestSnapshotMessagesPage_FullResidentSupportsOlderHistory (which pins the
-// state-store paging path but bypasses the fetch). If a future change swaps
-// EnsureMessages/EnsureMessagesAsync back to MessagesTail(WindowMaxCount), the
-// fetch would carry ?limit=<WindowMaxCount> and THIS test fails (sawLimit != "").
+// coldload_bounded_guard_test.go — Part-B guard: the cold-load fetch is BOUNDED
+// to the render window (client.MessagesTail(sid, state.WindowMaxCount), i.e.
+// GET /session/:id/message?limit=<WindowMaxCount>), NOT the full transcript.
+// Part B recovers older history via the boundary-demand path (EnsureOlderMessages
+// → MessagesBefore cursor paging), so the bound is correct AND older history stays
+// accessible.
 //
-// Inverse of the removed bounded_coldload_test.go (which asserted ?limit=100 WAS
-// sent under the reverted Part-A bound).
+// If a future change reverts to client.Messages (no ?limit), sawLimit becomes ""
+// and THIS test fails. Complement to pkg/state's
+// TestSnapshotMessagesPage_FullResidentSupportsOlderHistory (which pins the
+// state-store paging path directly).
 
 import (
 	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -24,16 +26,16 @@ import (
 	"github.com/vhqtvn/vh-solara/pkg/state"
 )
 
-// TestEnsureMessagesColdLoadFetchesFullTranscript proves the post-revert
-// contract: EnsureMessages issues a no-?limit full-transcript fetch. A session
-// with total=state.WindowMaxCount+50 messages cold-loads via a GET whose ?limit
-// query is ABSENT. If MessagesTail(WindowMaxCount) is re-introduced, sawLimit
-// becomes "<WindowMaxCount>" and this fails.
-func TestEnsureMessagesColdLoadFetchesFullTranscript(t *testing.T) {
+// TestEnsureMessagesColdLoadFetchesBoundedTail proves the Part-B contract:
+// EnsureMessages issues a ?limit=<WindowMaxCount> tail fetch (MessagesTail), not
+// a full no-?limit fetch. A session with total=state.WindowMaxCount+50 messages
+// cold-loads via a GET whose ?limit == state.WindowMaxCount. If the bound is
+// removed (revert to client.Messages), sawLimit becomes "" → fail.
+func TestEnsureMessagesColdLoadFetchesBoundedTail(t *testing.T) {
 	total := state.WindowMaxCount + 50 // 150 > WindowMaxCount (100)
 	// Newest-last page (opencode chronological order); each a COMPLETED assistant
 	// turn with one text part so the gate's latestAssistantResident finds a
-	// parts-bearing newest assistant and IsMessagesLoaded flips.
+	// parts-bearing newest assistant (within the tail) and IsMessagesLoaded flips.
 	msgs := make([]string, total)
 	for i := 0; i < total; i++ {
 		msgs[i] = fmt.Sprintf(
@@ -67,26 +69,27 @@ func TestEnsureMessagesColdLoadFetchesFullTranscript(t *testing.T) {
 		t.Fatalf("EnsureMessages: %v", err)
 	}
 
-	// CRUX (7648673-F1): the cold-load fetch carried NO ?limit — i.e. it was
-	// client.Messages (full transcript), NOT MessagesTail(N). If a future change
-	// re-introduces MessagesTail(WindowMaxCount), sawLimit becomes "100" → fail.
+	// CRUX (Part B): the cold-load fetch carried ?limit=<WindowMaxCount> — i.e.
+	// client.MessagesTail (bounded tail), NOT client.Messages (full). If a future
+	// change reverts to the full fetch, sawLimit becomes "" → fail.
 	mu.Lock()
 	gotLimit := sawLimit
 	mu.Unlock()
-	if gotLimit != "" {
-		t.Fatalf("cold-load fetch must be full (no ?limit=, client.Messages); got ?limit=%q — MessagesTail re-introduced at messages.go?", gotLimit)
+	if gotLimit != strconv.Itoa(state.WindowMaxCount) {
+		t.Fatalf("cold-load fetch must be bounded (?limit=%d, MessagesTail); got ?limit=%q — bound removed (client.Messages)?", state.WindowMaxCount, gotLimit)
 	}
-	// The gate still flips (the full fetch populates the resident store; the
-	// newest assistant m149 is present with parts).
+	// The gate still flips: the newest assistant (m149) is within the bounded
+	// tail, so latestAssistantResident holds and IsMessagesLoaded is true
+	// (window-complete, not transcript-complete — the spec intent).
 	if !agg.Store().IsMessagesLoaded("big") {
-		t.Fatal("full cold-load fetch must mark the session loaded")
+		t.Fatal("bounded cold-load fetch must mark the session loaded (newest assistant within the tail)")
 	}
 }
 
-// TestEnsureMessagesAsyncColdLoadFetchesFullTranscript is the async-path twin:
-// EnsureMessagesAsync must likewise issue a no-?limit full fetch. Guards the
-// second cold-load call site (messages.go EnsureMessagesAsync).
-func TestEnsureMessagesAsyncColdLoadFetchesFullTranscript(t *testing.T) {
+// TestEnsureMessagesAsyncColdLoadFetchesBoundedTail is the async-path twin:
+// EnsureMessagesAsync must likewise issue a ?limit=<WindowMaxCount> tail fetch.
+// Guards the second cold-load call site (messages.go EnsureMessagesAsync).
+func TestEnsureMessagesAsyncColdLoadFetchesBoundedTail(t *testing.T) {
 	total := state.WindowMaxCount + 50
 	msgs := make([]string, total)
 	for i := 0; i < total; i++ {
@@ -118,10 +121,10 @@ func TestEnsureMessagesAsyncColdLoadFetchesFullTranscript(t *testing.T) {
 	mu.Lock()
 	gotLimit := sawLimit
 	mu.Unlock()
-	if gotLimit != "" {
-		t.Fatalf("async cold-load fetch must be full (no ?limit=); got ?limit=%q — MessagesTail re-introduced?", gotLimit)
+	if gotLimit != strconv.Itoa(state.WindowMaxCount) {
+		t.Fatalf("async cold-load fetch must be bounded (?limit=%d); got ?limit=%q — bound removed?", state.WindowMaxCount, gotLimit)
 	}
 	if !agg.Store().IsMessagesLoaded("big2") {
-		t.Fatal("async full cold-load fetch must mark the session loaded")
+		t.Fatal("async bounded cold-load fetch must mark the session loaded")
 	}
 }

@@ -106,6 +106,28 @@ func (s *Server) handleSessionMessages(w http.ResponseWriter, r *http.Request) {
 	res := agg.Store().SnapshotMessagesPage(sid, before, limit, maxBytes)
 	res.ProjectID = dir
 
+	// Part B boundary-demand (D trigger): the resident strictly-older walk hit the
+	// resident floor WITHOUT a count/byte limit (and not the oversized-anchor
+	// case), AND history is not known exhausted → older messages may exist in
+	// opencode beyond the bounded cold-load tail. Fetch ONE older page (lock-free,
+	// bound to aggregator lifetime via EnsureOlderMessages) + merge into resident
+	// state, then RE-PROJECT so this response carries the older page (Contract C:
+	// post-merge point-in-time view; BaselineSeq captures any live tail updates
+	// that landed during the fetch). This is a SILENT mutation (no SSE emit, no
+	// s.seq bump — distinct from EnsureMessages's cold-load batch): the no-SSE-
+	// side-effect contract is preserved; only the "no new server state" half is
+	// relaxed, intentionally, for the older-page merge. A raw-id anchor that is
+	// NOT resident (BoundaryFound=false) is NOT boundary-fetched (the cursor
+	// cannot be reconstructed from a raw id) — the client retries via freshness.
+	if res.BoundaryFound && !res.CountLimited && !res.BytesLimited && !res.OversizedItem && !res.HistoryExhausted {
+		if oid, oms, ok := agg.Store().OldestResidentCursorTuple(sid); ok {
+			if err := agg.EnsureOlderMessages(sid, oid, oms); err == nil {
+				res = agg.Store().SnapshotMessagesPage(sid, before, limit, maxBytes)
+				res.ProjectID = dir
+			}
+		}
+	}
+
 	b, err := json.Marshal(res)
 	if err != nil {
 		// MessagePageResult is a well-typed struct, so this cannot fail today;

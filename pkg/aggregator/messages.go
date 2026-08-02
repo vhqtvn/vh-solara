@@ -6,6 +6,7 @@ import (
 	"log"
 	"time"
 
+	"github.com/vhqtvn/vh-solara/pkg/opencode"
 	"github.com/vhqtvn/vh-solara/pkg/state"
 )
 
@@ -207,7 +208,16 @@ func (a *Aggregator) EnsureMessages(ctx context.Context, sessionID string) error
 		// can never publish an incorrect messages.loaded.
 		for attempt := 0; ; attempt++ {
 			t0 := time.Now()
-			items, err := a.client.Messages(ctx, sessionID)
+			// Part A/B: bound the initial cold-load to the render window
+			// (state.WindowMaxCount newest). The gate (IsMessagesLoaded) keys on
+			// the newest assistant (always within the tail). Older-than-resident
+			// history is NOT lost: Part B's boundary-demand handler
+			// (messages_http.go D trigger) pages it on demand via the backward
+			// cursor + MergeOlderMessages, so the regression that sank the bare
+			// bound (7648673) is recovered. The prior revert's regression guard
+			// (TestSnapshotMessagesPage_FullResidentSupportsOlderHistory, now
+			// extended for the boundary-demand path) stays green.
+			items, err := a.client.MessagesTail(ctx, sessionID, state.WindowMaxCount)
 			if err != nil {
 				// Signal failure to any async caller that deduped against this
 				// sync winner (shared-slot completion contract). The session
@@ -384,7 +394,10 @@ func (a *Aggregator) EnsureMessagesAsync(sessionID string) {
 		// GET; the final IsMessagesLoaded gate stays authoritative.
 		for attempt := 0; ; attempt++ {
 			t0 := time.Now()
-			items, err := a.client.Messages(fetchCtx, sessionID)
+			// Part A/B: bound the initial cold-load to the render window
+			// (state.WindowMaxCount newest). See EnsureMessages for the full
+			// rationale + Part B recovery.
+			items, err := a.client.MessagesTail(fetchCtx, sessionID, state.WindowMaxCount)
 			if err != nil {
 				if fetchCtx.Err() != nil {
 					// Aggregator shutting down (or caller ctx cancelled in a
@@ -442,4 +455,62 @@ func (a *Aggregator) waitMessagesAsync(sessionID string) {
 	if done != nil {
 		<-done
 	}
+}
+
+// EnsureOlderMessages fetches ONE strictly-older message page from opencode (via
+// the backward cursor) and merges it into the resident store. It is the Part B
+// "past-resident older-page" path, triggered by the boundary-demand handler
+// (pkg/web/messages_http.go D trigger) when a resident strictly-older walk
+// exhausts at the resident floor without a count/byte limit (older history may
+// exist in opencode beyond the bounded cold-load tail).
+//
+// Contract:
+//   - (a) Single-flight: a DEDICATED pageInflight[sessionID] slot (INDEPENDENT of
+//     the cold-load msgInflight) collapses concurrent same-session "Load older"
+//     demands — concurrent callers wait for the winner's merge and return nil.
+//     It does NOT block or dedupe against a live cold-load.
+//   - (b) Locking: the fetch is lock-free; Store.MergeOlderMessages takes s.mu
+//     internally. No network I/O under any store lock.
+//   - The fetch ctx is bound to the AGGREGATOR's lifetime (a.runCtx), NOT the
+//     caller's request — so the merge lands for the NEXT client even if the
+//     triggering HTTP request disconnects (mirrors EnsureMessagesAsync's L-12
+//     rationale). On a nil runCtx (bare tests) it falls back to Background.
+//
+// anchorID/anchorTimeMs identify the OLDEST resident message (the cursor anchor);
+// the cursor token is built via opencode.EncodeMessageCursor (the full (id,
+// time_created) tuple; a raw id alone 400s). Returns nil on success OR when
+// collapsed onto an in-flight demand; a non-nil error only on fetch failure.
+func (a *Aggregator) EnsureOlderMessages(sessionID, anchorID string, anchorTimeMs float64) error {
+	a.pageMu.Lock()
+	if done, ok := a.pageInflight[sessionID]; ok {
+		a.pageMu.Unlock()
+		<-done // collapse: a concurrent older-page fetch is in flight; its merge suffices
+		return nil
+	}
+	done := make(chan struct{})
+	a.pageInflight[sessionID] = done
+	a.pageMu.Unlock()
+	defer func() {
+		a.pageMu.Lock()
+		if a.pageInflight[sessionID] == done {
+			delete(a.pageInflight, sessionID)
+		}
+		a.pageMu.Unlock()
+		close(done)
+	}()
+
+	// Bound the page to the cold-load window size (one older page == one tail).
+	a.seedMu.Lock()
+	fetchCtx := a.runCtx
+	a.seedMu.Unlock()
+	if fetchCtx == nil {
+		fetchCtx = context.Background()
+	}
+	cursor := opencode.EncodeMessageCursor(anchorID, anchorTimeMs)
+	items, nextCursor, err := a.client.MessagesBefore(fetchCtx, sessionID, cursor, state.WindowMaxCount)
+	if err != nil {
+		return err
+	}
+	a.store.MergeOlderMessages(sessionID, decodeMessages(items), nextCursor == "")
+	return nil
 }

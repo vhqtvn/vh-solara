@@ -94,6 +94,18 @@ func messageIDFromInfo(info json.RawMessage) string {
 	return ""
 }
 
+// messageCreatedFromInfo extracts info.time.created (unix-ms) from a message
+// info JSON blob. Used to build the backward-paging cursor token — the full
+// (id, time_created) tuple opencode's cursor.decode expects (a raw id alone
+// 400s). Returns (0, false) on parse failure / absent field.
+func messageCreatedFromInfo(info json.RawMessage) (float64, bool) {
+	var env messageInfoEnvelope
+	if json.Unmarshal(info, &env) == nil && env.Time.Created != nil {
+		return *env.Time.Created, true
+	}
+	return 0, false
+}
+
 // projectMessageWindow bounds a session's message list (creation-ordered, oldest
 // first) to a recent tail of at most maxCount messages whose aggregate
 // serialized size does not exceed maxBytes. Messages stay atomic: a message is
@@ -260,6 +272,12 @@ type MessagePageResult struct {
 	// is set when either limit fires AND older messages exist).
 	CountLimited bool `json:"count_limited"`
 	BytesLimited bool `json:"bytes_limited"`
+	// HistoryExhausted is true once a backward older-page fetch reached the
+	// session's oldest message (X-Next-Cursor == ""). The boundary-demand
+	// handler (Part B D trigger) reads this to decide whether to fetch an older
+	// page from opencode when the resident walk hits the resident floor without a
+	// count/byte limit. HasOlder = countLimited || bytesLimited || !HistoryExhausted.
+	HistoryExhausted bool `json:"history_exhausted"`
 	// OversizedItem / ActualBytes / BudgetBytes mirror WindowMeta: set ONLY in
 	// the oversized-anchor case (the ?before= message alone exceeds the byte
 	// budget). The page returns the anchor alone so the client never sees a
@@ -404,6 +422,7 @@ func (s *Store) SnapshotMessagesPage(sid, before string, limit, maxBytes int) Me
 	sm := s.messages[sid]
 	epoch := s.epoch
 	seq := s.seq
+	historyExhausted := sm != nil && sm.historyExhausted
 	var full []MessageWithParts
 	if sm != nil {
 		// Defensive copy of info + each part, exactly as captureMessagesBatchLocked
@@ -430,7 +449,111 @@ func (s *Store) SnapshotMessagesPage(sid, before string, limit, maxBytes int) Me
 	res.SessionID = sid
 	res.DaemonEpoch = epoch
 	res.BaselineSeq = seq
+	res.HistoryExhausted = historyExhausted
+	// Part B (truthful HasOlder): when the resident strictly-older walk hit the
+	// resident floor WITHOUT a count/byte limit (and not the oversized-anchor
+	// case), older history may still exist in opencode beyond the bounded
+	// cold-load tail — HasOlder hinges on !historyExhausted. (countLimited/
+	// bytesLimited already set HasOlder=true via projectMessagePage.)
+	if !res.CountLimited && !res.BytesLimited && !res.OversizedItem {
+		res.HasOlder = !historyExhausted
+	}
 	return res
+}
+
+// MergeOlderMessages merges a strictly-older fetched page (from opencode's
+// backward cursor, Client.MessagesBefore) into the session's resident message
+// list. ID-based: items whose id is already resident are skipped (the overlap
+// anchor + any concurrently-arrived live ids); genuinely-new (older) ids are
+// PREPENDED at the start of sm.order in creation order (fetched items are older
+// than the resident oldest, and the fetched page is chronological oldest-first,
+// so concatenating fetched + resident preserves oldest-first order).
+// historyExhausted records whether the fetch reached the session's oldest
+// message (X-Next-Cursor == ""); once true it stays true (truthful HasOlder).
+//
+// No SSE emit, no s.seq bump (silent merge: the HTTP page response carries the
+// merged view; the X-VH-Seq header stamped at request entry stays comparable to
+// BaselineSeq — only a LIVE event during the fetch bumps s.seq, which the client
+// dirty-flag discards correctly). Bumps msgRev[sid] so a concurrent cold-batch
+// projection stays consistent. Caller: aggregator EnsureOlderMessages
+// (lock-free fetch → this merge under s.mu.Lock). Contract (b) + (e).
+func (s *Store) MergeOlderMessages(sid string, items []MessageWithParts, historyExhausted bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sm := s.messages[sid]
+	if sm == nil {
+		return // session gone between fetch and merge
+	}
+	if historyExhausted {
+		sm.historyExhausted = true
+	}
+	if len(items) == 0 {
+		return
+	}
+	prepend := make([]string, 0, len(items))
+	for _, mw := range items {
+		id := messageIDFromInfo(mw.Info)
+		if id == "" || sm.byID[id] != nil {
+			continue // missing id, or already resident (overlap anchor / live)
+		}
+		me := &messageEntry{
+			id:    id,
+			info:  append([]byte(nil), mw.Info...),
+			parts: map[string]json.RawMessage{},
+		}
+		for _, p := range mw.Parts {
+			var pe partEnvelope
+			if json.Unmarshal(p, &pe) != nil || pe.ID == "" {
+				continue
+			}
+			me.partOrder = append(me.partOrder, pe.ID)
+			me.parts[pe.ID] = append([]byte(nil), p...)
+		}
+		// Cache role/completed (cheap; the gate reads only the newest assistant,
+		// which lives in the tail, so older-page entries don't drive it — but
+		// snapshot/gate walks must still classify their role correctly).
+		var env messageInfoEnvelope
+		if json.Unmarshal(me.info, &env) == nil {
+			me.role = env.Role
+			me.completed = env.Time.Completed != nil
+		}
+		sm.byID[id] = me
+		prepend = append(prepend, id)
+	}
+	if len(prepend) > 0 {
+		newOrder := make([]string, 0, len(prepend)+len(sm.order))
+		newOrder = append(newOrder, prepend...) // fetched oldest-first
+		newOrder = append(newOrder, sm.order...) // resident oldest-first
+		sm.order = newOrder
+		s.bumpMsgRev(sid)
+	}
+}
+
+// OldestResidentCursorTuple returns the (id, time_created-unix-ms) of the OLDEST
+// resident message, for building a backward-paging cursor token. The boundary-
+// demand handler (Part B D trigger) constructs the cursor here to fetch the
+// older page from opencode. ok=false if the session has no resident messages or
+// the oldest lacks a parseable (id, time.created) tuple.
+func (s *Store) OldestResidentCursorTuple(sid string) (id string, timeMs float64, ok bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	sm := s.messages[sid]
+	if sm == nil || len(sm.order) == 0 {
+		return "", 0, false
+	}
+	me := sm.byID[sm.order[0]]
+	if me == nil {
+		return "", 0, false
+	}
+	id = messageIDFromInfo(me.info)
+	if id == "" {
+		return "", 0, false
+	}
+	t, alright := messageCreatedFromInfo(me.info)
+	if !alright {
+		return "", 0, false
+	}
+	return id, t, true
 }
 
 // bumpMsgRev advances the Store-wide monotonic token and assigns it to the

@@ -59,20 +59,18 @@ func TestEnsureMessagesSyncAsyncSingleFlight(t *testing.T) {
 
 			mux := http.NewServeMux()
 			mux.HandleFunc("/session/"+sid+"/message", func(w http.ResponseWriter, r *http.Request) {
-				if r.URL.Query().Get("limit") == "" {
-					mu.Lock()
-					fullCount++
-					mu.Unlock()
-					select {
-					case gotGET <- struct{}{}:
-					default:
-					}
-					<-hold
-					w.Header().Set("Content-Type", "application/json")
-					w.Write([]byte(successBody))
-					return
+				// Contract-agnostic (Part-B modernization): cold-load now sends
+				// ?limit (MessagesTail), so count + signal + serve unconditionally.
+				mu.Lock()
+				fullCount++
+				mu.Unlock()
+				select {
+				case gotGET <- struct{}{}:
+				default:
 				}
-				http.Error(w, "no tail", http.StatusNotFound)
+				<-hold
+				w.Header().Set("Content-Type", "application/json")
+				w.Write([]byte(successBody))
 			})
 			mux.Handle("/", fixtures.New().Handler())
 			oc := httptest.NewServer(mux)
@@ -308,20 +306,18 @@ func TestEnsureMessagesTOCTOURecheck(t *testing.T) {
 
 			mux := http.NewServeMux()
 			mux.HandleFunc("/session/"+sid+"/message", func(w http.ResponseWriter, r *http.Request) {
-				if r.URL.Query().Get("limit") == "" {
-					mu.Lock()
-					fullCount++
-					mu.Unlock()
-					select {
-					case gotGET <- struct{}{}:
-					default:
-					}
-					<-hold
-					w.Header().Set("Content-Type", "application/json")
-					w.Write([]byte(successBody))
-					return
+				// Contract-agnostic (Part-B modernization): cold-load now sends
+				// ?limit (MessagesTail), so count + signal + serve unconditionally.
+				mu.Lock()
+				fullCount++
+				mu.Unlock()
+				select {
+				case gotGET <- struct{}{}:
+				default:
 				}
-				http.Error(w, "no tail", http.StatusNotFound)
+				<-hold
+				w.Header().Set("Content-Type", "application/json")
+				w.Write([]byte(successBody))
 			})
 			mux.Handle("/", fixtures.New().Handler())
 			oc := httptest.NewServer(mux)
