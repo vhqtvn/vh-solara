@@ -30,6 +30,7 @@ import {
   removeRootTag,
   renameGroup,
   reorderGroup,
+  resetLabelsScope,
   setGroupColor,
   toggleGroupCollapse,
   type LabelGroup,
@@ -788,5 +789,161 @@ describe("concurrency — fresher frame during PUT is not clobbered", () => {
     expect(labelsGroups()[0].name).toBe("fresher"); // NOT regressed
     expect(labelsRevision()).toBe(5);
     expect(labelsLastError()).toBeNull();
+  });
+});
+
+// === Per-project scope (commit 23efd32 cutover) =============================
+// Labels are now per-project server-side: each project has its own revision/CAS
+// domain, its own labels.snapshot bootstrap, and its own labels.updated fanout.
+// The facade mirrors this with resetLabelsScope() (called from switchProject on
+// every project switch + the no-project teardown) and a scope-generation guard
+// inside performMutation that drops any late PUT result from a switched-AWAY
+// project. These tests pin the lifecycle directly against the facade: the
+// full switchProject→connect wiring is covered separately in
+// labelsProjectScope.test.ts (jsdom + MockEventSource).
+describe("per-project scope — resetLabelsScope + scope-gen guard", () => {
+  it("resetLabelsScope clears ALL signals (A's labels gone immediately)", () => {
+    applyLabelsSnapshot(doc(7, [grp("gA", { roots: ["r1"] })], [tag("t1")], { r1: ["t1"] }));
+    expect(labelsConnected()).toBe(true);
+    expect(labelsGroups()).toHaveLength(1);
+
+    resetLabelsScope(); // project switch A → B
+
+    expect(labelsConnected()).toBe(false);
+    expect(labelsGroups()).toEqual([]);
+    expect(labelsTags()).toEqual([]);
+    expect(labelTagIdsByRootSessionId()).toEqual({});
+    expect(labelsRevision()).toBe(0);
+  });
+
+  it("resetLabelsScope clears labelsPending + labelsLastError (no latch onto B)", async () => {
+    applyLabelsSnapshot(doc(1, [grp("gA")]));
+    let resolveFetch!: (v: Response) => void;
+    vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>((r) => (resolveFetch = r))));
+
+    const p = renameGroup("gA", "x");
+    expect(labelsPending()).toBe(true); // PUT in flight on project A
+
+    resetLabelsScope(); // switch away mid-PUT
+    expect(labelsPending()).toBe(false); // pending latched OFF — B starts clean
+    expect(labelsLastError()).toBeNull();
+
+    // The orphaned PUT resolves; the gen guard drops it (no adoption, no error).
+    resolveFetch(jsonRes(doc(2, [grp("gA", { name: "x" })])));
+    await p;
+    expect(labelsPending()).toBe(false);
+    expect(labelsLastError()).toBeNull(); // A's failure does NOT surface on B
+  });
+
+  it("after reset, B's labels.snapshot establishes B's state", () => {
+    applyLabelsSnapshot(doc(7, [grp("from-A", { roots: ["ra"] })]));
+    resetLabelsScope();
+    // B's snapshot arrives on B's stream (transport treeGen-guarantees it is B's,
+    // not a stale A frame) and is adopted unconditionally as the bootstrap.
+    applyLabelsSnapshot(doc(3, [grp("from-B", { roots: ["rb"] })], [tag("tb")], { rb: ["tb"] }));
+    expect(labelsConnected()).toBe(true);
+    expect(labelsRevision()).toBe(3); // B's own revision domain (3 < A's 7 is fine)
+    expect(labelsGroups()).toEqual([grp("from-B", { roots: ["rb" ]})]);
+    expect(labelTagIdsByRootSessionId()).toEqual({ rb: ["tb"] });
+  });
+
+  it("a late 200 PUT response from A cannot overwrite B (scope-gen guard)", async () => {
+    // Project A loaded. User starts a rename; the PUT stays pending. The user
+    // switches to B (resetLabelsScope) and B's snapshot establishes B. A's PUT
+    // response then resolves — WITHOUT the guard, adoptPutResponse would write
+    // A's doc into B's signals. The scope-gen check drops it.
+    applyLabelsSnapshot(doc(1, [grp("gA", { name: "A" })]));
+    let resolvePut!: (v: Response) => void;
+    vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>((r) => (resolvePut = r))));
+
+    const p = renameGroup("gA", "renamed-A");
+    await flush(); // optimistic applied on A; PUT pending
+    expect(labelsGroups()[0].name).toBe("renamed-A");
+
+    resetLabelsScope(); // A → B
+    applyLabelsSnapshot(doc(4, [grp("gB", { name: "B" })])); // B's snapshot
+    expect(labelsGroups()).toEqual([grp("gB", { name: "B" })]);
+    expect(labelsRevision()).toBe(4);
+
+    resolvePut(jsonRes(doc(2, [grp("gA", { name: "renamed-A" })]))); // A's late 200
+    await p;
+
+    // B intact — A's response was dropped by the scope-gen guard.
+    expect(labelsGroups()).toEqual([grp("gB", { name: "B" })]);
+    expect(labelsRevision()).toBe(4);
+    expect(labelsLastError()).toBeNull();
+  });
+
+  it("a late FAILED PUT from A cannot roll back B (scope-gen guard on rollback)", async () => {
+    // Same shape, but A's PUT fails (network). Without the guard,
+    // rollbackDocIfUnchanged would write A's baseline doc into B's signals.
+    applyLabelsSnapshot(doc(1, [grp("gA", { name: "A" })]));
+    let rejectPut!: (e: unknown) => void;
+    vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>((_, rej) => (rejectPut = rej))));
+
+    const p = renameGroup("gA", "renamed-A");
+    await flush();
+
+    resetLabelsScope(); // A → B
+    applyLabelsSnapshot(doc(4, [grp("gB", { name: "B" })]));
+    expect(labelsGroups()).toEqual([grp("gB", { name: "B" })]);
+
+    rejectPut(new Error("net")); // A's PUT fails after the switch
+    await p;
+
+    // B intact — A's rollback was dropped. (No error surfaced either: the late
+    // failure belongs to A, not B.)
+    expect(labelsGroups()).toEqual([grp("gB", { name: "B" })]);
+    expect(labelsRevision()).toBe(4);
+    expect(labelsLastError()).toBeNull();
+  });
+
+  it("a late 409→retry sequence from A cannot overwrite B (scope-gen guard on retry)", async () => {
+    // Project A: a mutation 409s, the facade adopts the 409 authority and issues
+    // a retry. The retry stays pending across a switch to B. Both the first-PUT
+    // adoption and the retry must be dropped once the scope advanced.
+    applyLabelsSnapshot(doc(1, [grp("gA")]));
+    let resolveRetry!: (v: Response) => void;
+    let firstCall = true;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => {
+        if (firstCall) {
+          firstCall = false;
+          return Promise.resolve(jsonRes(doc(1, [grp("gA"), grp("gConcurrent")]), 409));
+        }
+        return new Promise<Response>((r) => (resolveRetry = r));
+      }),
+    );
+
+    const p = createGroup("Mine", "red"); // 409 → adopt → retry pending
+    await flush(); // first PUT resolved (409 adopted), retry issued + pending
+
+    resetLabelsScope(); // A → B (retry still pending)
+    applyLabelsSnapshot(doc(4, [grp("gB", { name: "B" })]));
+    expect(labelsGroups()).toEqual([grp("gB", { name: "B" })]);
+
+    resolveRetry(jsonRes(doc(2, [grp("gA"), grp("gConcurrent"), grp("lg-x", { name: "Mine" })]))); // A's late retry 200
+    await p;
+
+    // B intact — A's retry adoption was dropped by the scope-gen guard.
+    expect(labelsGroups()).toEqual([grp("gB", { name: "B" })]);
+    expect(labelsRevision()).toBe(4);
+    expect(labelsLastError()).toBeNull();
+  });
+
+  it("a mutation started AFTER the reset adopts onto the new project's scope", async () => {
+    // Sanity: the guard drops only results whose captured gen is STALE. A
+    // mutation started on B (after the reset) captures the NEW gen and adopts
+    // normally — the guard must not over-fire and block legitimate B mutations.
+    applyLabelsSnapshot(doc(1, [grp("gA")]));
+    resetLabelsScope(); // A → B
+    applyLabelsSnapshot(doc(1, [grp("gB", { name: "B" })]));
+
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(jsonRes(doc(2, [grp("gB", { name: "B2" })])))));
+    await renameGroup("gB", "B2");
+
+    expect(labelsGroups()).toEqual([grp("gB", { name: "B2" })]);
+    expect(labelsRevision()).toBe(2);
   });
 });

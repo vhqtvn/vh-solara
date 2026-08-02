@@ -205,6 +205,55 @@ function clearLabelsErrorSig(): void {
   if (labelsErrorSig() !== null) setLabelsErrorSig(null);
 }
 
+// === Project scope (per-project labels) =====================================
+// Labels are scoped per-project server-side (commit 23efd32): each project has
+// its own revision/CAS domain, its own labels.snapshot bootstrap, and its own
+// labels.updated fanout. The facade mirrors this: the signals above hold ONLY
+// the active project's labels. resetLabelsScope() clears them on every project
+// switch (called from sync/actions.ts switchProject, right after resetTreeStore)
+// so the outgoing project's labels vanish IMMEDIATELY, before the incoming
+// project's stream connects — matching how switchProject already tears down the
+// session map, tree store, and per-project facets.
+//
+// labelsScopeGen is a monotonic token bumped on every reset. The PUT mutation
+// path (performMutation) captures it at issue time and re-checks after each
+// await: a late PUT response / retry / rollback arriving from a switched-AWAY
+// project is DROPPED rather than adopted into the new project's signals. This
+// is the load-bearing guard for the labels-owned async path (the PUT is a
+// standalone fetch not covered by the stream's connection-generation guard).
+//
+// The SSE snapshot/updated frames are guarded SEPARATELY by the transport's
+// connection-generation check (treeGen in sync/tree-transport.ts): a frame from
+// project A's closed stream is dropped at the listener (`if (gen !== treeGen)
+// return;`) before it ever reaches applyLabelsSnapshot/applyLabelsUpdated. A
+// snapshot therefore always adopts unconditionally — it IS the new project's
+// bootstrap, and the transport guarantees it came from the live connection. A
+// labels frame carries no directory field, so the facade cannot distinguish
+// projects by content; the connection identity IS the project identity.
+let labelsScopeGen = 0;
+
+// resetLabelsScope — clear ALL label signals and advance the scope generation.
+// Called on every project switch (and on the no-project teardown) so the
+// outgoing project's labels are gone before the incoming project connects, and
+// so any in-flight PUT from the outgoing project is invalidated (its captured
+// scope gen no longer matches → performMutation drops the late result). Mirrors
+// the per-project resets switchProject already performs for sessions/tree.
+// Pending is reset too: an in-flight PUT is now an orphan the gen guard will
+// drop, so it must not keep labelsPending latched on the new project.
+export function resetLabelsScope(): void {
+  batch(() => {
+    setServerGroups([]);
+    setServerTags([]);
+    setServerTagAssign({});
+    setServerRevision(0);
+    setConnectedSig(false);
+    setLabelsPendingSig(false);
+    setLabelsErrorSig(null);
+  });
+  pendingCount = 0;
+  labelsScopeGen++;
+}
+
 // === Read accessors (for slice-5 selectors + slice-6 UI) =====================
 // Each returns the signal's current reference. Selectors/UI MUST treat these as
 // read-only (never mutate in place): every internal write installs a NEW array
@@ -475,6 +524,17 @@ function contentEqual(a: LabelsDoc, b: LabelsDoc): boolean {
 // re-apply cleanly against a concurrently-changed doc.
 async function performMutation(intent: LabelsIntent): Promise<void> {
   incPending();
+  // Capture the project scope at issue time. The PUT is a standalone fetch
+  // (dir-scoped via the x-opencode-directory header installCsrf adds from
+  // projectDir()), so its REQUEST is always for the project that was active
+  // when the mutation started. Its RESPONSE, however, can land after a project
+  // switch — and without this guard a late 200/409/400 adoption or a rollback
+  // from project A would overwrite project B's signals. Every await below is
+  // followed by a scope-gen recheck that drops the result if the scope advanced
+  // (resetLabelsScope bumped labelsScopeGen on the switch). The adoption +
+  // rollback calls are all SYNCHRONOUS between the awaits, so a switch cannot
+  // interleave there — only the two await points are race windows.
+  const scopeGen = labelsScopeGen;
   const baseDoc = currentServerDoc();
   const baseRev = serverRevision(); // rollback guard baseline for the first attempt
   try {
@@ -483,6 +543,7 @@ async function performMutation(intent: LabelsIntent): Promise<void> {
     clearLabelsErrorSig();
     applyDoc(target); // optimistic
     let res = await putLabels(baseRev, target);
+    if (scopeGen !== labelsScopeGen) return; // project switched — drop late result
     if (res.status === 200 && res.doc) {
       adoptPutResponse(res.doc);
       return;
@@ -497,6 +558,7 @@ async function performMutation(intent: LabelsIntent): Promise<void> {
       const retryRev = serverRevision(); // rollback guard baseline for the retry
       applyDoc(retryTarget); // optimistic retry
       res = await putLabels(retryRev, retryTarget);
+      if (scopeGen !== labelsScopeGen) return; // project switched — drop late retry
       if (res.status === 200 && res.doc) {
         adoptPutResponse(res.doc);
         return;
@@ -718,7 +780,9 @@ export function dropLabelRoot(id: string): void {
 }
 
 // Test-only: reset ALL label signals so cases don't leak state across each
-// other. Mirrors __resetPinnedForTest.
+// other. Mirrors __resetPinnedForTest. Also zeroes labelsScopeGen so each test
+// starts from a deterministic scope (resetLabelsScope, which tests call to
+// simulate a project switch, then bumps it monotonically from 0).
 export function __resetLabelsForTest(): void {
   batch(() => {
     setServerGroups([]);
@@ -730,4 +794,5 @@ export function __resetLabelsForTest(): void {
     setLabelsErrorSig(null);
   });
   pendingCount = 0;
+  labelsScopeGen = 0;
 }

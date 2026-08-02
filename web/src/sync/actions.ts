@@ -25,6 +25,7 @@ import { connect } from "./tree-transport";
 import { closeSessionStream } from "./session-stream";
 import { resetPageInFlight } from "./history";
 import { resetTreeStore, clearUserToggled, applyTreeOpStore } from "./treeState";
+import { resetLabelsScope } from "../labels";
 
 // Selecting any real session leaves draft mode.
 //
@@ -98,6 +99,14 @@ export function switchProject(dir: string, fromUrl = false) {
   // switch discards the outgoing project's tree. This sits BEFORE the if(!dir)
   // split so BOTH the no-dir teardown and the project-switch reconnect clear.
   resetTreeStore();
+  // Per-project labels (commit 23efd32): each project has its own labels
+  // revision/CAS domain + its own labels.snapshot bootstrap. Clear the outgoing
+  // project's labels IMMEDIATELY — before connect() opens the incoming project's
+  // stream — so A's labels are gone before B connects, and so any in-flight PUT
+  // from A is invalidated (resetLabelsScope bumps labelsScopeGen; performMutation
+  // drops the late response). Sits alongside resetTreeStore so both the no-dir
+  // teardown and the switch reconnect clear, mirroring the session/tree resets.
+  resetLabelsScope();
   if (!dir) {
     // No-project state: tear down both streams so nothing keeps bridging the old
     // project (or cwd). connect() would no-op too, but closing the session
