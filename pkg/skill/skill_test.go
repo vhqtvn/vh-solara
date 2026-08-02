@@ -79,12 +79,20 @@ func TestGenerateIsVersionStampedAndFromLiveSurface(t *testing.T) {
 // two halves. (1) A sentinel self-check runs UNCONDITIONALLY — it injects a
 // known sentinel into a copy of the output and verifies the scanner catches it,
 // so the scanner logic itself is machine-enforced on every run (never vacuous).
-// (2) The real customer-token deny-list is env-sourced via
-// VH_SKILL_BANNED_TOKENS (comma-separated; set locally or in CI) so that no
-// real customer token is ever committed as a test fixture; it runs ONLY when
-// that env var is set and t.Skip's otherwise. Net: the scanner is
-// machine-enforced by default; the actual customer-token deny-list is
-// operator/CI-enforced (not default-CI-enforced).
+// (2) The real customer-token deny-list is env/secret-sourced via
+// VH_SKILL_BANNED_TOKENS (comma-separated) so that no real customer token is
+// ever committed as a test fixture. LOCALLY the deny-list is skipped when that
+// var is unset (local-dev convenience). In CI (GitHub Actions) it FAILS LOUD
+// via t.Fatal ONLY in trusted contexts (push events / same-repo PRs, signalled
+// by VH_CI_TRUSTED=true) — fork PRs skip, because GitHub intentionally
+// withholds repository secrets from pull_request events originating from
+// forks, and failing there would make every external fork PR permanently red
+// regardless of secret creation. CI enforcement of the deny-list begins once
+// the operator creates the VH_SKILL_BANNED_TOKENS repo secret (the secret VALUE
+// is out-of-band, never committed); until then CI is red on trusted events,
+// which is the intended forcing function, not a bug. Net: the scanner is
+// machine-enforced by default; the customer-token deny-list is
+// operator/CI-enforced once the secret exists (trusted CI contexts only).
 func TestGenerateHasNoBannedTokens(t *testing.T) {
 	out := Generate("v-test")
 
@@ -134,7 +142,18 @@ func TestGenerateHasNoBannedTokens(t *testing.T) {
 	// carries no customer token; the VALUES are never committed in source.
 	banned := os.Getenv("VH_SKILL_BANNED_TOKENS")
 	if banned == "" {
-		t.Skip("VH_SKILL_BANNED_TOKENS unset — operators set it locally / in CI to enforce the customer-token deny-list (no token is committed in source)")
+		// In a trusted CI context (GitHub Actions on a push or same-repo PR,
+		// signalled by VH_CI_TRUSTED=="true") an unset deny-list FAILS LOUD so
+		// an unconfigured CI cannot pass as if it had scanned. Locally we
+		// preserve the convenience skip. Fork PRs (VH_CI_TRUSTED unset/false)
+		// also skip: GitHub intentionally withholds the repo secret there, so
+		// failing would make every external fork PR permanently red. CI
+		// enforcement of the deny-list begins once the operator creates the
+		// secret; the test then has the trust signal AND the secret together.
+		if os.Getenv("GITHUB_ACTIONS") == "true" && os.Getenv("VH_CI_TRUSTED") == "true" {
+			t.Fatal("VH_SKILL_BANNED_TOKENS unset in a trusted CI context (push / same-repo PR) — create the repo secret so the customer-token deny-list runs on every build; no token is committed in source")
+		}
+		t.Skip("VH_SKILL_BANNED_TOKENS unset — set it locally to enforce the customer-token deny-list, or this is an untrusted/fork CI context where the secret is intentionally withheld (no token is committed in source)")
 	}
 	if hit, found := scanBanned(out, strings.Split(banned, ",")); found {
 		t.Fatalf("generated skill contains banned token %q — the doc must stay customer-agnostic", hit)

@@ -32,6 +32,24 @@ jobs:
       - name: go vet
         run: go vet ./...
       - name: go test
+        env:
+          # Customer-token deny-list for TestGenerateHasNoBannedTokens. The
+          # secret VALUE is out-of-band (never committed in source); the env-var
+          # NAME carries no customer token. The deny-list FAILS LOUD only in
+          # trusted CI contexts (push / same-repo PR) where the secret is
+          # available. Fork PRs are exempt because GitHub intentionally
+          # withholds repository secrets from pull_request events that
+          # originate from forks — without the trust gate, every external fork
+          # PR would be permanently red (the secret resolves to empty and the
+          # fail-loud branch fires). CI enforcement of the deny-list begins
+          # once the operator creates the VH_SKILL_BANNED_TOKENS repo secret.
+          VH_SKILL_BANNED_TOKENS: ${{ secrets.VH_SKILL_BANNED_TOKENS }}
+          # Trust signal for the deny-list test: true on push events and
+          # same-repo PRs (secret available), false on fork PRs (secret
+          # withheld). The || short-circuits so github.event.pull_request is
+          # never dereferenced on non-PR events. GitHub Actions coerces the
+          # boolean expression result to the string "true"/"false".
+          VH_CI_TRUSTED: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
         run: go test ./...
 
   web:
