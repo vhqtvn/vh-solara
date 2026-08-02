@@ -117,12 +117,17 @@ type Server struct {
 	// pins_http.go (Phase 2 HTTP layer).
 	pins *PinStore
 
-	// labels is the worker-wide root-session labels store (groups + tags),
-	// Slice 2 of server-managed labels, building on the Slice-1 LabelStore
-	// (commit 24ecf6b). Constructed once at NewServer from
-	// filepath.Join(stateBaseDir(), "labels.json"); serves GET/PUT /vh/labels.
-	// See labels.go (Slice 1 store) and labels_http.go (Slice 2 HTTP layer).
-	labels *LabelStore
+	// labelsReg is the per-project root-session labels registry (groups +
+	// tags). Each project owns an independent LabelStore at
+	// <stateBaseDir>/projects/<projectKey>/labels.json with its own
+	// revision/CAS domain, resolved lazily via labelsForDir from reqDir(r)
+	// (HTTP/stream) or the aggregator's dir (lifecycle/reconcile). The store
+	// API (labels.go) is unchanged from the Slice-1 design; only its scope
+	// moved from worker-wide to per-project. NewServer runs the one-time
+	// worker-wide → per-project migration (migrateLabelsToPerProject) before
+	// any store can be opened. See labels_registry.go, labels.go (store), and
+	// labels_http.go (HTTP layer).
+	labelsReg *labelRegistry
 
 	// failFast is the set of sessionIDs whose spawn requested the fail-closed
 	// permission policy (unattended/automated spawning): when such a session
@@ -392,18 +397,18 @@ func NewServer(agg *aggregator.Aggregator, opencodeURL string, ringCapacity int)
 		bgCancel()
 		return nil, fmt.Errorf("pins: init store: %w", err)
 	}
-	// Worker-wide root-session labels store (Slice 2). Constructed ONCE at
-	// server startup — never per-request — grounded at
-	// stateBaseDir()/"labels.json" (same worker-wide flat dir pins.go/notes.go
-	// use; no worker-id subpath). A construction failure (permission, etc.) is
-	// propagated to the caller, matching how NewPinStore failure is handled
-	// above. A missing file or a corrupt/schema-mismatched file is NOT an error
-	// (NewLabelStore returns a zero doc — see labels.go).
-	labelsPath := filepath.Join(stateBaseDir(), "labels.json")
-	labelStore, err := NewLabelStore(labelsPath)
-	if err != nil {
+	// Per-project root-session labels: run the one-time worker-wide →
+	// per-project migration (idempotent, synchronous) BEFORE any store can be
+	// opened by labelsForDir. Migration reads the legacy
+	// stateBaseDir()/"labels.json" (if present), partitions it into
+	// <stateBaseDir>/projects/<key>/labels.json files using the existing
+	// projectByRootSessionId sidecar, routes ambiguous material to
+	// labels-legacy-unassigned.json, and removes the legacy file (single
+	// cutover, no dual-writer). A missing legacy file is a no-op (writes the
+	// completion marker and returns). See labels_registry.go.
+	if err := migrateLabelsToPerProject(); err != nil {
 		bgCancel()
-		return nil, fmt.Errorf("labels: init store: %w", err)
+		return nil, fmt.Errorf("labels: per-project migration: %w", err)
 	}
 	srv := &Server{
 		agg:           agg,
@@ -419,7 +424,7 @@ func NewServer(agg *aggregator.Aggregator, opencodeURL string, ringCapacity int)
 		views:         newViewRegistry(),
 		queues:        newQueueRegistry(),
 		pins:          pinStore,
-		labels:        labelStore,
+		labelsReg:     newLabelRegistry(),
 		failFast:      map[string]struct{}{},
 		watcherOn:     map[string]bool{},
 		watcherCancel: map[string]context.CancelFunc{},
@@ -965,51 +970,56 @@ func (s *LabelStore) labelsReconcileSnapshot() (LabelsDoc, map[string]string) {
 	return doc, projects
 }
 
-// FanOutLabelsUpdate pushes a transient labels.updated full-state frame carrying
-// the committed labels doc to the LIVE subscribers of EVERY active project store
-// (s.aggs). The direct mirror of FanOutPinsUpdate. Labels are worker-wide (one
-// labels.json), but /vh/stream is backed by per-project state.Store instances,
-// so the fan-out iterates every aggregator's store — a label mutation that
-// happened while the operator was viewing project A must reach a subscriber on
-// project B's stream. The payload is marshaled ONCE (LabelsDoc IS the wire
-// shape — no private projection needed) and reused for every store. EmitTransient
-// is transient (not recorded to the replay ring, no seq advance), so a
-// reconnecting client never replays it — labels.snapshot on connect is the catch-up.
-func (s *Server) FanOutLabelsUpdate(doc LabelsDoc) {
-	raw, err := json.Marshal(doc)
-	if err != nil {
-		vhlog.Warn("labels.updated fan-out: marshal failed, skipping broadcast", "err", err)
+// fanOutLabelsUpdate publishes a transient labels.updated full-state frame
+// carrying the committed labels doc to the LIVE subscribers of the SINGLE
+// project whose directory is dir ONLY. This replaces the former worker-wide
+// FanOutLabelsUpdate: labels are now per-project (one store per project under
+// <stateBaseDir>/projects/<key>/), so a mutation in project A must NOT reach
+// project B's stream.
+//
+// Uses aggForExisting(dir) — it never opens a project. A mutation for a project
+// that has no open aggregator has no live subscribers to reach, so it is
+// silently dropped (the snapshot-on-reconnect bootstrap is the catch-up).
+// EmitTransient is transient (not recorded to the replay ring, no seq advance),
+// so a reconnecting client never replays it — labels.snapshot on connect is the
+// catch-up.
+func (s *Server) fanOutLabelsUpdate(dir string, doc LabelsDoc) {
+	a := s.aggForExisting(dir)
+	if a == nil {
 		return
 	}
-	s.aggMu.Lock()
-	live := make([]*state.Store, 0, len(s.aggs))
-	for _, a := range s.aggs {
-		live = append(live, a.Store())
+	raw, err := json.Marshal(doc)
+	if err != nil {
+		vhlog.Warn("labels.updated fan-out: marshal failed, skipping", "err", err)
+		return
 	}
-	s.aggMu.Unlock()
-	for _, st := range live {
-		st.EmitTransient(kindLabelsUpdated, raw)
-	}
+	a.Store().EmitTransient(kindLabelsUpdated, raw)
 }
 
 // removeLabelsAndBroadcast is the shared cleanup→broadcast primitive for the
-// label lifecycle layers, mirroring removePinsAndBroadcast: RemoveRootIDs; if
-// changed, fan out the post-removal snapshot via FanOutLabelsUpdate; if not, do
-// nothing. RemoveRootIDs strips root references from group OrderedRootSessionIDs
-// and TagIDsByRootSessionID (and the sidecar) but KEEPS group/tag definitions —
+// label lifecycle layers, mirroring removePinsAndBroadcast: resolve the project
+// store via labelsForDir(dir); RemoveRootIDs; if changed, fan out the
+// post-removal snapshot via fanOutLabelsUpdate(dir, …); if not, do nothing.
+// RemoveRootIDs strips root references from group OrderedRootSessionIDs and
+// TagIDsByRootSessionID (and the sidecar) but KEEPS group/tag definitions —
 // so cleanup removes the ROOT REFERENCES only, preserving the definitions the
 // operator authored. Idempotent (RemoveRootIDs is a no-op when none are
 // present), so the L2 subscriber path and the L3 backstop compose harmlessly.
-func (s *Server) removeLabelsAndBroadcast(ids []string) {
-	changed, current, err := s.labels.RemoveRootIDs(ids)
+// A nil store (unresolvable dir) is a silent no-op — there is nothing to clean.
+func (s *Server) removeLabelsAndBroadcast(dir string, ids []string) {
+	st := s.labelsForDir(dir)
+	if st == nil {
+		return
+	}
+	changed, current, err := st.RemoveRootIDs(ids)
 	if err != nil {
-		vhlog.Error("labels: lifecycle cleanup RemoveRootIDs failed", "ids", ids, "err", err)
+		vhlog.Error("labels: lifecycle cleanup RemoveRootIDs failed", "dir", dir, "ids", ids, "err", err)
 		return
 	}
 	if !changed {
 		return
 	}
-	s.FanOutLabelsUpdate(current)
+	s.fanOutLabelsUpdate(dir, current)
 }
 
 // reconcileLabelsForProject is the project-scoped core of Layer 3, mirroring
@@ -1032,7 +1042,10 @@ func (s *Server) removeLabelsAndBroadcast(ids []string) {
 // RootInventory), not all session ids. A root removed here is stripped from
 // group orders + tag assignments, but the group/tag definitions survive
 // (RemoveRootIDs keeps them).
-func (s *Server) reconcileLabelsForProject(doc LabelsDoc, projects map[string]string, key string, activeRoots map[string]bool) {
+//
+// dir threads the project identity to removeLabelsAndBroadcast so cleanup +
+// fan-out land on THIS project's store and stream only.
+func (s *Server) reconcileLabelsForProject(dir string, doc LabelsDoc, projects map[string]string, key string, activeRoots map[string]bool) {
 	referenced := referencedRootsInLabelsDoc(doc)
 	var remove []string
 	for rid := range referenced {
@@ -1047,7 +1060,7 @@ func (s *Server) reconcileLabelsForProject(doc LabelsDoc, projects map[string]st
 	if len(remove) == 0 {
 		return
 	}
-	s.removeLabelsAndBroadcast(remove)
+	s.removeLabelsAndBroadcast(dir, remove)
 }
 
 // reconcileLabelsForAgg is the per-aggregator Layer 3 driver — the direct
@@ -1072,10 +1085,16 @@ func (s *Server) reconcileLabelsForAgg(dir string, a *aggregator.Aggregator) {
 		return
 	}
 	key := projectKey(root)
+	// Resolve THIS project's store. A nil store (unresolvable / not yet
+	// materialized) means there is nothing to reconcile — return.
+	st := s.labelsForDir(dir)
+	if st == nil {
+		return
+	}
 	// ORDERING INVARIANT (F1 fix): snapshot the doc + sidecar BEFORE reading the
 	// authoritative active-root set. A root added AFTER this snapshot is not in
 	// `doc`/`referenced` and therefore cannot be a removal candidate this pass.
-	doc, projects := s.labels.labelsReconcileSnapshot()
+	doc, projects := st.labelsReconcileSnapshot()
 	inventory := a.Store().RootInventory()
 	activeRoots := make(map[string]bool, len(inventory))
 	for _, inv := range inventory {
@@ -1083,7 +1102,7 @@ func (s *Server) reconcileLabelsForAgg(dir string, a *aggregator.Aggregator) {
 			activeRoots[inv.SessionID] = true
 		}
 	}
-	s.reconcileLabelsForProject(doc, projects, key, activeRoots)
+	s.reconcileLabelsForProject(dir, doc, projects, key, activeRoots)
 }
 
 // installLabelsLifecycle arms the L2 session.delete subscriber on a's store, the
@@ -1127,7 +1146,7 @@ func (s *Server) installLabelsLifecycle(dir string, a *aggregator.Aggregator) {
 			if json.Unmarshal(ev.Payload, &p) != nil || p.ID == "" {
 				continue
 			}
-			s.removeLabelsAndBroadcast([]string{p.ID})
+			s.removeLabelsAndBroadcast(dir, []string{p.ID})
 		}
 	}()
 }
@@ -2195,20 +2214,27 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	} else {
 		vhlog.Warn("pins.snapshot bootstrap: marshal failed, skipping pins frame", "err", err)
 	}
-	// Slice 3: bootstrap the worker-wide labels view (groups + tags +
-	// tagIdsByRootSessionId) on EVERY fresh /vh/stream connect, the direct
-	// analogue of the pins.snapshot block above. Labels are a SEPARATE store
-	// from this connection's state.Store (one labels.json under stateBaseDir,
-	// worker-wide, not per-project), NOT carried in the replay ring, so a
-	// reconnecting client catches up on labels via THIS snapshot frame (live
-	// label mutations arrive later as transient labels.updated frames, also not
-	// replayed). Emitted with NO id line AFTER the state bootstrap block and the
-	// pins snapshot, BEFORE the live-tail loop drains the subscribe channel
-	// (SubscribeWith already created `ch`, so subscribe-before-snapshot ordering
-	// holds — identical guarantee to pins). LabelsDoc IS the wire shape (no
-	// private projection needed), and projectByRootSessionId is private to
-	// labelsFile and never crosses the wire.
-	if lb, err := json.Marshal(s.labels.Snapshot()); err == nil {
+	// Slice 3: bootstrap the per-project labels view (groups + tags +
+	// tagIdsByRootSessionId) for THIS stream's project on EVERY fresh /vh/stream
+	// connect, the direct analogue of the pins.snapshot block above (but
+	// per-project: pins are worker-wide, labels are NOT). Labels are a SEPARATE
+	// store from this connection's state.Store (<stateBaseDir>/projects/<key>/
+	// labels.json, resolved from reqDir(r)) and NOT carried in the replay ring,
+	// so a reconnecting client catches up on labels via THIS snapshot frame
+	// (live label mutations arrive later as transient labels.updated frames,
+	// also not replayed). Emitted with NO id line AFTER the state bootstrap
+	// block and the pins snapshot, BEFORE the live-tail loop drains the
+	// subscribe channel (SubscribeWith already created `ch`, so
+	// subscribe-before-snapshot ordering holds — identical guarantee to pins).
+	// LabelsDoc IS the wire shape (no private projection needed), and
+	// projectByRootSessionId is private to labelsFile and never crosses the wire.
+	// A nil store (unresolvable project) emits an empty-doc snapshot so the
+	// client always receives the frame and stays in sync.
+	streamLabelsDoc := emptyLabelsDoc()
+	if st := s.labelsForDir(reqDir(r)); st != nil {
+		streamLabelsDoc = st.Snapshot()
+	}
+	if lb, err := json.Marshal(streamLabelsDoc); err == nil {
 		writeRawNoID(w, "labels.snapshot", lb)
 	} else {
 		vhlog.Warn("labels.snapshot bootstrap: marshal failed, skipping labels frame", "err", err)

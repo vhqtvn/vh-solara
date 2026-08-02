@@ -48,6 +48,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -65,6 +66,22 @@ func labelsGet(t *testing.T, url string) LabelsDoc {
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
 		t.Fatalf("GET /vh/labels: status %d, want 200", resp.StatusCode)
+	}
+	return decodeLabelsResp(t, resp.Body)
+}
+
+// labelsGetDir fetches the public labels doc for a SPECIFIC project dir (per-
+// project cutover). dir is passed via ?dir= so the server resolves the project's
+// own store.
+func labelsGetDir(t *testing.T, webURL, dir string) LabelsDoc {
+	t.Helper()
+	resp, err := http.Get(webURL + "/vh/labels?dir=" + url.QueryEscape(dir))
+	if err != nil {
+		t.Fatalf("GET /vh/labels?dir=%s: %v", dir, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("GET /vh/labels?dir=%s: status %d, want 200", dir, resp.StatusCode)
 	}
 	return decodeLabelsResp(t, resp.Body)
 }
@@ -112,6 +129,20 @@ func waitForLabelRootGone(t *testing.T, web *httptest.Server, id, msg string) {
 	t.Fatalf("%s: root %q still referenced after 2s", msg, id)
 }
 
+// waitForLabelRootGoneDir is the per-project variant: polls GET /vh/labels?dir=
+// for a specific project's store until id is absent from its doc.
+func waitForLabelRootGoneDir(t *testing.T, web *httptest.Server, dir, id, msg string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if !labelsHasRootRef(labelsGetDir(t, web.URL, dir), id) {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("%s: root %q still referenced after 2s", msg, id)
+}
+
 // assertLabelsRevision asserts the current labels doc revision. Mirrors
 // assertPinsRevision.
 func assertLabelsRevision(t *testing.T, web *httptest.Server, want int64, msg string) {
@@ -121,27 +152,36 @@ func assertLabelsRevision(t *testing.T, web *httptest.Server, want int64, msg st
 	}
 }
 
-// labelTwoProjects seeds a default-project root and a /proj2 root, labels both
-// in a single group, and returns the two project keys + establishes the doc at
-// rev 1. Mirrors pinTwoProjects. Used by the L3 scope-fence tests.
-func labelTwoProjects(t *testing.T, srv *Server, web *httptest.Server, defID, proj2ID string) (defaultKey, proj2Key string) {
+// labelDefaultRoots seeds the given root ids in the DEFAULT project's aggregator
+// and labels them (in one group) in the default project's labels doc, leaving it
+// at rev 1. Returns the default project's stable key. Used by the L3 reconcile
+// tests, which now operate per-project (the cutover moved each project onto its
+// own store, so a single doc can no longer hold two projects' roots).
+func labelDefaultRoots(t *testing.T, srv *Server, web *httptest.Server, ids ...string) (defaultKey string) {
 	t.Helper()
-	seedLabelSession(t, srv.agg, defID, "")
-	const deadURL = "http://127.0.0.1:1"
-	proj2 := aggregator.New(deadURL, 100)
-	srv.aggs["/proj2"] = proj2
-	seedLabelSession(t, proj2, proj2ID, "")
-
-	r := labelsPut(t, web.URL+"/vh/labels", map[string]any{
+	if len(ids) == 0 {
+		t.Fatal("labelDefaultRoots: need at least one root id")
+	}
+	for _, id := range ids {
+		seedLabelSession(t, srv.agg, id, "")
+	}
+	ordered := make([]string, 0, len(ids))
+	ordered = append(ordered, ids...)
+	resp := labelsPut(t, web.URL+"/vh/labels", map[string]any{
 		"baseRevision": 0,
 		"groups": []map[string]any{
-			{"id": "g1", "name": "G", "color": "blue", "orderedRootSessionIds": []string{defID, proj2ID}},
+			{"id": "g1", "name": "G", "color": "blue", "orderedRootSessionIds": ordered},
 		},
 		"tags":                  []any{},
 		"tagIdsByRootSessionId": map[string][]string{},
 	})
-	r.Body.Close()
-	return projectKey(mustProjectRoot(t, "")), projectKey(mustProjectRoot(t, "/proj2"))
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		t.Fatalf("labelDefaultRoots PUT: status %d, want 200. body: %s", resp.StatusCode, b)
+	}
+	resp.Body.Close()
+	return projectKey(mustProjectRoot(t, ""))
 }
 
 // ============================================================================
@@ -296,19 +336,21 @@ func TestLabelsL2_SubscriberBroadcastsUpdate(t *testing.T) {
 
 // TestLabelsL3_RemovesAbsentProjectRootScoped: reconcileLabelsForProject removes
 // a project's root reference absent from the authoritative active set, while
-// preserving (a) a same-project root that IS active, and (b) a DIFFERENT
-// project's root (the scope fence — an unopened/other project's root is never
-// dropped). Labels-specific: group/tag definitions survive the removal.
+// preserving a same-project root that IS active. (Per-project cutover: each
+// project owns its own doc, so "another project's root" can no longer co-exist
+// in this doc — the cross-project isolation is covered by
+// TestLabelsL3_ReconcileOneProjectLeavesOtherUntouched instead.) Labels-specific:
+// group/tag definitions survive the removal.
 func TestLabelsL3_RemovesAbsentProjectRootScoped(t *testing.T) {
 	srv, web := newLabelsTestServer(t)
-	defaultKey, proj2Key := labelTwoProjects(t, srv, web, "def-keep", "proj2-sess")
+	defaultKey := labelDefaultRoots(t, srv, web, "def-keep")
 	// Also label a second default-project root that will be "deleted" (absent
-	// from the authoritative active set).
+	// from the authoritative active set), plus a tag assignment on it.
 	seedLabelSession(t, srv.agg, "def-gone", "")
 	r := labelsPut(t, web.URL+"/vh/labels", map[string]any{
-		"baseRevision": 1, // labelTwoProjects left it at 1
+		"baseRevision": 1, // labelDefaultRoots left it at 1
 		"groups": []map[string]any{
-			{"id": "g1", "name": "G", "color": "blue", "orderedRootSessionIds": []string{"def-keep", "def-gone", "proj2-sess"}},
+			{"id": "g1", "name": "G", "color": "blue", "orderedRootSessionIds": []string{"def-keep", "def-gone"}},
 		},
 		"tags":                  []map[string]any{{"id": "t1", "name": "urgent", "color": "red"}},
 		"tagIdsByRootSessionId": map[string][]string{"def-gone": {"t1"}},
@@ -316,10 +358,9 @@ func TestLabelsL3_RemovesAbsentProjectRootScoped(t *testing.T) {
 	r.Body.Close()
 
 	// Authoritative active set for the DEFAULT project: def-keep present,
-	// def-gone ABSENT (deleted while worker was down). proj2-sess belongs to a
-	// different project and must be ignored entirely.
-	doc, projects := srv.labels.labelsReconcileSnapshot()
-	srv.reconcileLabelsForProject(doc, projects, defaultKey, map[string]bool{"def-keep": true})
+	// def-gone ABSENT (deleted while worker was down).
+	doc, projects := srv.labelsForDir("").labelsReconcileSnapshot()
+	srv.reconcileLabelsForProject("", doc, projects, defaultKey, map[string]bool{"def-keep": true})
 
 	g := labelsGet(t, web.URL)
 	if labelsHasRootRef(g, "def-gone") {
@@ -328,10 +369,7 @@ func TestLabelsL3_RemovesAbsentProjectRootScoped(t *testing.T) {
 	if !labelsHasRootRef(g, "def-keep") {
 		t.Fatalf("L3: active default-project root def-keep was wrongly removed")
 	}
-	if !labelsHasRootRef(g, "proj2-sess") {
-		t.Fatalf("L3: other-project root proj2-sess was removed — scope fence violation")
-	}
-	// labelTwoProjects left the doc at rev 1; the second PUT bumped it to 2;
+	// labelDefaultRoots left the doc at rev 1; the second PUT bumped it to 2;
 	// this reconcile removes def-gone → rev 3.
 	assertLabelsRevision(t, web, 3, "L3 scoped remove should bump revision once")
 
@@ -345,14 +383,9 @@ func TestLabelsL3_RemovesAbsentProjectRootScoped(t *testing.T) {
 
 	// Reconcile must be idempotent: a second pass with the same set removes
 	// nothing (def-gone already gone) and does not bump the revision.
-	doc2, projects2 := srv.labels.labelsReconcileSnapshot()
-	srv.reconcileLabelsForProject(doc2, projects2, defaultKey, map[string]bool{"def-keep": true})
+	doc2, projects2 := srv.labelsForDir("").labelsReconcileSnapshot()
+	srv.reconcileLabelsForProject("", doc2, projects2, defaultKey, map[string]bool{"def-keep": true})
 	assertLabelsRevision(t, web, 3, "L3 idempotent re-reconcile must not bump revision")
-
-	// Sanity: the proj2 key is distinct from the default key (test isolation).
-	if defaultKey == proj2Key {
-		t.Fatalf("default and /proj2 project keys collided — test isolation broken")
-	}
 }
 
 // TestLabelsL3_EmptyActiveSetRemovesAllProjectRoots: a project that hydrated with
@@ -361,52 +394,67 @@ func TestLabelsL3_RemovesAbsentProjectRootScoped(t *testing.T) {
 // down.
 func TestLabelsL3_EmptyActiveSetRemovesAllProjectRoots(t *testing.T) {
 	srv, web := newLabelsTestServer(t)
-	defaultKey, _ := labelTwoProjects(t, srv, web, "def-a", "proj2-sess")
-	seedLabelSession(t, srv.agg, "def-b", "")
-	r := labelsPut(t, web.URL+"/vh/labels", map[string]any{
-		"baseRevision": 1,
-		"groups": []map[string]any{
-			{"id": "g1", "name": "G", "color": "blue", "orderedRootSessionIds": []string{"def-a", "def-b", "proj2-sess"}},
-		},
-		"tags":                  []any{},
-		"tagIdsByRootSessionId": map[string][]string{},
-	})
-	r.Body.Close()
+	defaultKey := labelDefaultRoots(t, srv, web, "def-a", "def-b")
+	// doc at rev 1 with [def-a, def-b].
 
 	// Empty NON-nil active set = "hydrate succeeded with zero roots." Both
-	// default-project roots are genuinely absent → removed. proj2-sess survives.
-	doc, projects := srv.labels.labelsReconcileSnapshot()
-	srv.reconcileLabelsForProject(doc, projects, defaultKey, map[string]bool{})
+	// default-project roots are genuinely absent → removed.
+	doc, projects := srv.labelsForDir("").labelsReconcileSnapshot()
+	srv.reconcileLabelsForProject("", doc, projects, defaultKey, map[string]bool{})
 
 	g := labelsGet(t, web.URL)
 	if labelsHasRootRef(g, "def-a") || labelsHasRootRef(g, "def-b") {
 		t.Fatalf("L3 empty-set: default-project roots survived")
 	}
-	if !labelsHasRootRef(g, "proj2-sess") {
-		t.Fatalf("L3 empty-set: proj2-sess removed — scope fence violation")
-	}
 }
 
-// TestLabelsL3_PreservesUnopenedProjectRoots: reconciling the DEFAULT project with
-// an empty active set must NOT touch roots whose projectByRootSessionId is a
-// different (unopened) project. This is the core scope-fence guarantee:
-// absence from THIS project's active set is not proof of deletion for a root
-// owned by another project.
-func TestLabelsL3_PreservesUnopenedProjectRoots(t *testing.T) {
+// TestLabelsL3_ReconcileOneProjectLeavesOtherUntouched is the per-project scope
+// fence (replaces the former cross-project-roots-in-one-doc test): reconciling
+// project A's store with an empty active set removes A's own roots AND leaves
+// project B's store ENTIRELY untouched. After the cutover the two projects live
+// in independent stores, so a reconcile for A can never reach into B's doc — the
+// strongest form of the "never drop another project's roots" guarantee.
+func TestLabelsL3_ReconcileOneProjectLeavesOtherUntouched(t *testing.T) {
 	srv, web := newLabelsTestServer(t)
-	defaultKey, _ := labelTwoProjects(t, srv, web, "def-a", "proj2-sess")
+	// Default project: label def-a (rev 1).
+	defaultKey := labelDefaultRoots(t, srv, web, "def-a")
+	// Second project /proj2: open its aggregator, seed a root, label it via the
+	// per-project (?dir=) endpoint so it lands in proj2's OWN store.
+	const deadURL = "http://127.0.0.1:1"
+	proj2 := aggregator.New(deadURL, 100)
+	srv.aggs["/proj2"] = proj2
+	seedLabelSession(t, proj2, "proj2-sess", "")
+	resp := labelsPut(t, web.URL+"/vh/labels?dir="+url.QueryEscape("/proj2"), map[string]any{
+		"baseRevision": 0,
+		"groups": []map[string]any{
+			{"id": "g1", "name": "G", "color": "blue", "orderedRootSessionIds": []string{"proj2-sess"}},
+		},
+		"tags":                  []any{},
+		"tagIdsByRootSessionId": map[string][]string{},
+	})
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		t.Fatalf("proj2 label PUT: status %d, want 200. body: %s", resp.StatusCode, b)
+	}
+	resp.Body.Close()
 
-	// Reconcile the default project with an EMPTY active set. The proj2 root
-	// must survive — it does not belong to the default project.
-	doc, projects := srv.labels.labelsReconcileSnapshot()
-	srv.reconcileLabelsForProject(doc, projects, defaultKey, map[string]bool{})
+	// Reconcile the DEFAULT project with an EMPTY active set → removes def-a.
+	doc, projects := srv.labelsForDir("").labelsReconcileSnapshot()
+	srv.reconcileLabelsForProject("", doc, projects, defaultKey, map[string]bool{})
 
-	g := labelsGet(t, web.URL)
-	if labelsHasRootRef(g, "def-a") {
+	// Default doc: def-a gone.
+	if labelsHasRootRef(labelsGet(t, web.URL), "def-a") {
 		t.Fatalf("L3: default root def-a survived empty-set reconcile (should be removed)")
 	}
-	if !labelsHasRootRef(g, "proj2-sess") {
-		t.Fatalf("L3: unopened-project root proj2-sess was removed by a different project's reconcile")
+	// proj2 doc: proj2-sess MUST survive and its revision MUST be untouched —
+	// reconciling the default project cannot reach a different project's store.
+	proj2Doc := labelsGetDir(t, web.URL, "/proj2")
+	if !labelsHasRootRef(proj2Doc, "proj2-sess") {
+		t.Fatalf("L3: proj2 root proj2-sess was removed by the default project's reconcile — per-project isolation violation")
+	}
+	if proj2Doc.Revision != 1 {
+		t.Fatalf("L3: proj2 doc revision = %d, want 1 (untouched by default's reconcile)", proj2Doc.Revision)
 	}
 }
 
@@ -415,11 +463,11 @@ func TestLabelsL3_PreservesUnopenedProjectRoots(t *testing.T) {
 // the revision (no spurious broadcast).
 func TestLabelsL3_NoRemovalWhenAllPresent(t *testing.T) {
 	srv, web := newLabelsTestServer(t)
-	defaultKey, _ := labelTwoProjects(t, srv, web, "def-a", "proj2-sess")
+	defaultKey := labelDefaultRoots(t, srv, web, "def-a")
 
 	before := labelsGet(t, web.URL)
-	doc, projects := srv.labels.labelsReconcileSnapshot()
-	srv.reconcileLabelsForProject(doc, projects, defaultKey, map[string]bool{"def-a": true})
+	doc, projects := srv.labelsForDir("").labelsReconcileSnapshot()
+	srv.reconcileLabelsForProject("", doc, projects, defaultKey, map[string]bool{"def-a": true})
 	after := labelsGet(t, web.URL)
 
 	if after.Revision != before.Revision {
@@ -434,8 +482,7 @@ func TestLabelsL3_NoRemovalWhenAllPresent(t *testing.T) {
 // GC-3 queue reconcile gate test.
 func TestLabelsL3_DriverFailClosedWhenNotHydrated(t *testing.T) {
 	srv, web := newLabelsTestServer(t)
-	defaultKey, _ := labelTwoProjects(t, srv, web, "def-a", "proj2-sess")
-	_ = defaultKey
+	labelDefaultRoots(t, srv, web, "def-a")
 
 	// newLabelsTestServer does NOT start the aggregator's Run loop, so
 	// AnyHydrateCompleted() is false — exactly the boot race this gate defends.
@@ -472,11 +519,11 @@ func TestLabelsL3_DriverFailClosedWhenNotHydrated(t *testing.T) {
 // reconcile iterates.
 func TestLabelsL3_RootAddedAfterSnapshotSurvives(t *testing.T) {
 	srv, web := newLabelsTestServer(t)
-	defaultKey, _ := labelTwoProjects(t, srv, web, "preexisting", "proj2-sess")
+	defaultKey := labelDefaultRoots(t, srv, web, "preexisting")
 
 	// T0: snapshot the labels doc + sidecar BEFORE the "new" root exists. This
 	// is the snapshot the driver would pass under the F1-fixed ordering.
-	docAtT0, projectsAtT0 := srv.labels.labelsReconcileSnapshot()
+	docAtT0, projectsAtT0 := srv.labelsForDir("").labelsReconcileSnapshot()
 	if !labelsHasRootRef(docAtT0, "preexisting") {
 		t.Fatalf("precondition: preexisting root missing from T0 snapshot")
 	}
@@ -487,7 +534,7 @@ func TestLabelsL3_RootAddedAfterSnapshotSurvives(t *testing.T) {
 	r := labelsPut(t, web.URL+"/vh/labels", map[string]any{
 		"baseRevision": docAtT0.Revision, // current rev at the time of the PUT
 		"groups": []map[string]any{
-			{"id": "g1", "name": "G", "color": "blue", "orderedRootSessionIds": []string{"preexisting", "fresh", "proj2-sess"}},
+			{"id": "g1", "name": "G", "color": "blue", "orderedRootSessionIds": []string{"preexisting", "fresh"}},
 		},
 		"tags":                  []any{},
 		"tagIdsByRootSessionId": map[string][]string{},
@@ -498,7 +545,7 @@ func TestLabelsL3_RootAddedAfterSnapshotSurvives(t *testing.T) {
 		t.Fatalf("concurrent PUT adding fresh root: status %d, want 200. body: %s", r.StatusCode, b)
 	}
 	r.Body.Close()
-	// "fresh" is now a valid labeled root in the live LabelStore.
+	// "fresh" is now a valid labeled root in the live default-project store.
 
 	// T1: the active set derived by the driver AFTER T0. Simulate the worst
 	// case for the race — "fresh" is ABSENT from this set (its session was
@@ -509,7 +556,7 @@ func TestLabelsL3_RootAddedAfterSnapshotSurvives(t *testing.T) {
 	// reconcile iterates only docAtT0's referenced roots (no "fresh"), so "fresh"
 	// is not a removal candidate and survives even though it is absent from the
 	// active set.
-	srv.reconcileLabelsForProject(docAtT0, projectsAtT0, defaultKey, activeSetMissingFresh)
+	srv.reconcileLabelsForProject("", docAtT0, projectsAtT0, defaultKey, activeSetMissingFresh)
 
 	g := labelsGet(t, web.URL)
 	if !labelsHasRootRef(g, "fresh") {
@@ -517,9 +564,6 @@ func TestLabelsL3_RootAddedAfterSnapshotSurvives(t *testing.T) {
 	}
 	if !labelsHasRootRef(g, "preexisting") {
 		t.Fatalf("F1 regression: preexisting active root was wrongly removed")
-	}
-	if !labelsHasRootRef(g, "proj2-sess") {
-		t.Fatalf("F1 regression: other-project root was removed — scope fence violation")
 	}
 	// No root in the T0 snapshot was absent from the active set, so no removal
 	// happened and the revision must not have advanced beyond the PUT.
@@ -531,7 +575,7 @@ func TestLabelsL3_RootAddedAfterSnapshotSurvives(t *testing.T) {
 // labels.updated.
 func TestLabelsL3_ReconcileBroadcastsUpdate(t *testing.T) {
 	srv, web := newLabelsTestServer(t)
-	defaultKey, _ := labelTwoProjects(t, srv, web, "def-gone", "proj2-sess")
+	defaultKey := labelDefaultRoots(t, srv, web, "def-gone")
 
 	sresp, err := http.Get(web.URL + "/vh/stream")
 	if err != nil {
@@ -542,8 +586,8 @@ func TestLabelsL3_ReconcileBroadcastsUpdate(t *testing.T) {
 	drainIdle(ch, 500*time.Millisecond)
 
 	// Reconcile removes def-gone (absent from the active set).
-	doc, projects := srv.labels.labelsReconcileSnapshot()
-	srv.reconcileLabelsForProject(doc, projects, defaultKey, map[string]bool{})
+	doc, projects := srv.labelsForDir("").labelsReconcileSnapshot()
+	srv.reconcileLabelsForProject("", doc, projects, defaultKey, map[string]bool{})
 
 	events := drainIdle(ch, 1*time.Second)
 	data, ok := eventDataFor(events, "labels.updated", "revision")
@@ -579,26 +623,32 @@ func TestLabelsL3_ReconcileBroadcastsUpdate(t *testing.T) {
 // Seeding deviation from the queue test (necessitated by labels): the queue
 // reload test seeds cleanup targets as on-disk queue.json files (no store
 // validation). Labels PUT /vh/labels validates every referenced root against
-// activeRootProjects(), which derives from each aggregator's Store.RootInventory()
-// — and a RUNNING aggregator (newReloadServer starts RunManaged) ghost-reconciles
-// its store against the fake OpenCode's authoritative /session list, evicting a
-// root applied via Apply that the backend never sourced. So the roots are seeded
-// authoritatively via fake.sessions (the same pattern the integration tests use)
-// and the hydrate is awaited before the labels PUT.
+// activeRootProjectsForDir(dir) — the per-dir active-root inventory derived from
+// THAT aggregator's Store.RootInventory() — and a RUNNING aggregator
+// (newReloadServer starts RunManaged) ghost-reconciles its store against the fake
+// OpenCode's authoritative /session list, evicting a root applied via Apply that
+// the backend never sourced. So the roots are seeded authoritatively via
+// fake.sessions (the same pattern the integration tests use) and the hydrate is
+// awaited before the labels PUT.
+//
+// Per-project cutover: all labels PUT/GET target dirB (?dir=) so they resolve
+// dirB's OWN project store — the default-project endpoint would reject dirB's
+// roots as unknown_root.
 //
 // Harness: newReloadServer (needs fakeOpenCode's /instance/dispose handler).
 // dirB is t.TempDir() so projectRoot(dirB) resolves cleanly and auto-cleans.
 func TestLabelsL2_ReloadProjectReinstallsSubscriber(t *testing.T) {
-	// Isolate the worker-wide labels.json (stateBaseDir()/VH_STATE_DIR). The
+	// Isolate the per-project labels state (stateBaseDir()/VH_STATE_DIR). The
 	// other reload tests can share state because they never touch the labels
-	// store; this one does, and a non-isolated dir would persist a stale
-	// labels doc across runs and collide with the optimistic-CAS PUTs below.
+	// store; this one does, and a non-isolated dir would persist a stale labels
+	// doc across runs and collide with the optimistic-CAS PUTs below.
 	// Mirrors newLabelsTestServer's isolation.
 	t.Setenv("VH_STATE_DIR", t.TempDir())
 
 	srv, fake, _, web := newReloadServer(t)
 
 	dirB := t.TempDir() // absolute; projectRoot(dirB) == dirB
+	dirBQuery := web.URL + "/vh/labels?dir=" + url.QueryEscape(dirB)
 
 	// Seed BOTH roots authoritatively in the fake backend so any aggregator
 	// that hydrates dirB sees them as live roots (surviving ghost-reconcile).
@@ -621,7 +671,7 @@ func TestLabelsL2_ReloadProjectReinstallsSubscriber(t *testing.T) {
 	// (2) Sanity: the L2 subscriber is live on aB1. Label root "s1" in a group,
 	//     fire session.deleted via the normalized delete chokepoint, confirm
 	//     the root reference is stripped (L2 cleanup works pre-reload).
-	resp := labelsPut(t, web.URL+"/vh/labels", map[string]any{
+	resp := labelsPut(t, dirBQuery, map[string]any{
 		"baseRevision": 0,
 		"groups": []map[string]any{
 			{"id": "g1", "name": "G", "color": "blue", "orderedRootSessionIds": []string{"s1"}},
@@ -636,7 +686,7 @@ func TestLabelsL2_ReloadProjectReinstallsSubscriber(t *testing.T) {
 	}
 	resp.Body.Close()
 	aB1.Store().RemoveSessions([]string{"s1"})
-	waitForLabelRootGone(t, web, "s1", "pre-reload L2 subscriber cleanup")
+	waitForLabelRootGoneDir(t, web, dirB, "s1", "pre-reload L2 subscriber cleanup")
 
 	// (3) Reload dirB: disposes the OpenCode instance, Stops aB1, drops it
 	//     from s.aggs, and (the F1 fix) resets labelsGCOn[dirB] so the next
@@ -667,9 +717,9 @@ func TestLabelsL2_ReloadProjectReinstallsSubscriber(t *testing.T) {
 	//     is stripped. baseRevision tracks the live doc (rev advanced to 2 when
 	//     the L2 subscriber stripped "s1"). If the subscriber had NOT been
 	//     re-installed (the Slice 3 F1 bug — stale labelsGCOn[dirB]==true),
-	//     "s2" would persist and waitForLabelRootGone would fatal.
-	baseRev := labelsGet(t, web.URL).Revision
-	resp2 := labelsPut(t, web.URL+"/vh/labels", map[string]any{
+	//     "s2" would persist and waitForLabelRootGoneDir would fatal.
+	baseRev := labelsGetDir(t, web.URL, dirB).Revision
+	resp2 := labelsPut(t, dirBQuery, map[string]any{
 		"baseRevision": baseRev,
 		"groups": []map[string]any{
 			{"id": "g1", "name": "G", "color": "blue", "orderedRootSessionIds": []string{"s2"}},
@@ -684,5 +734,5 @@ func TestLabelsL2_ReloadProjectReinstallsSubscriber(t *testing.T) {
 	}
 	resp2.Body.Close()
 	aB2.Store().RemoveSessions([]string{"s2"})
-	waitForLabelRootGone(t, web, "s2", "post-reload L2 subscriber cleanup on fresh aggregator")
+	waitForLabelRootGoneDir(t, web, dirB, "s2", "post-reload L2 subscriber cleanup on fresh aggregator")
 }

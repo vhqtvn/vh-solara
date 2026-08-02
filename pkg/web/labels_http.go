@@ -39,7 +39,6 @@ import (
 	"errors"
 	"net/http"
 
-	"github.com/vhqtvn/vh-solara/pkg/aggregator"
 	"github.com/vhqtvn/vh-solara/pkg/vhlog"
 )
 
@@ -113,7 +112,14 @@ func labelsRejectionRespFrom(rej *LabelRejection, cur LabelsDoc) labelsRejection
 func (s *Server) handleLabels(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		writeJSONResp(w, s.labels.Snapshot())
+		// Per-project: resolve the store from reqDir(r). A nil store (unresolvable
+		// project) yields an empty wire-shaped doc — the caller learns there are no
+		// labels for this project rather than 500-ing.
+		if st := s.labelsForDir(reqDir(r)); st != nil {
+			writeJSONResp(w, st.Snapshot())
+		} else {
+			writeJSONResp(w, emptyLabelsDoc())
+		}
 	case http.MethodPut:
 		s.handleLabelsPut(w, r)
 	default:
@@ -164,13 +170,24 @@ func (s *Server) handleLabelsPut(w http.ResponseWriter, r *http.Request) {
 		TagIDsByRootSessionID: req.TagIDsByRootSessionID,
 	}
 
+	dir := reqDir(r)
 	// 4. Build the authoritative active-ROOT inventory (root id → project key)
-	//    from s.aggs + RootInventory() filtered to IsRoot, then Replace
+	//    for THIS project only, then resolve the per-project store, Replace
 	//    (validate → normalize → CAS → atomic persist). Replace returns the
 	//    current snapshot on every non-success path (rejection, CAS mismatch),
 	//    which is the self-healed authority the client adopts.
-	activeRootProjects := s.activeRootProjects()
-	ok, cur, err := s.labels.Replace(*req.BaseRevision, candidate, activeRootProjects)
+	//
+	//    Per-project isolation: a PUT for project A validates against A's active
+	//    roots only and writes A's store only. The store is resolved via
+	//    labelsForDir(dir); a nil store (unresolvable project) maps to 500 — a
+	//    mutation cannot land for a project we cannot identify.
+	activeRootProjects := s.activeRootProjectsForDir(dir)
+	st := s.labelsForDir(dir)
+	if st == nil {
+		http.Error(w, "labels: project directory not resolvable", http.StatusBadRequest)
+		return
+	}
+	ok, cur, err := st.Replace(*req.BaseRevision, candidate, activeRootProjects)
 	if err != nil {
 		var rej *LabelRejection
 		if errors.As(err, &rej) {
@@ -197,62 +214,53 @@ func (s *Server) handleLabelsPut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Success — committed authority (same shape as GET). Fan the new doc out to
-	// EVERY active project event store's live subscribers BEFORE writing the HTTP
+	// THIS project's live subscribers ONLY (per-project: a label mutation in
+	// project A must not reach project B's stream) BEFORE writing the HTTP
 	// response, so a concurrent SSE listener observes the update no later than
 	// the PUT caller receives its 200 (mirrors pins' handlePinsPut ordering).
-	// cur is the post-write snapshot returned by Replace, so this emits committed
-	// state without an extra Snapshot() read. Transient (not replayed); reconnect
-	// catches up via the labels.snapshot bootstrap frame.
-	s.FanOutLabelsUpdate(cur)
+	// cur is the post-write snapshot returned by Replace, so this emits
+	// committed state without an extra Snapshot() read. Transient (not
+	// replayed); reconnect catches up via the labels.snapshot bootstrap frame.
+	s.fanOutLabelsUpdate(dir, cur)
 	writeJSONResp(w, cur)
 }
 
-// activeRootProjects builds the activeRootProjects map argument for
-// LabelStore.Replace from the current authoritative session state across ALL of
-// the worker's project aggregators (s.aggs). Each active ROOT session id (one
-// whose parentID == "", per Store.RootInventory().IsRoot — the STRICT root
+// activeRootProjectsForDir builds the activeRootProjects map argument for
+// LabelStore.Replace for a SINGLE project (dir). Each active ROOT session id
+// (one whose parentID == "", per Store.RootInventory().IsRoot — the STRICT root
 // definition labels require, NOT the orphan-inclusive RootCount) is mapped to
-// its stable project key (projectKey(projectRoot(dir)) — the SAME
+// this project's stable key (projectKey(projectRoot(dir)) — the SAME
 // sha1-of-abs-cwd key pkg/web/notes.go and pins.go use, so the cleanup sidecar
 // and projectByRootSessionId agree on project identity).
 //
-// This is the labels analogue of activeSessionProjects (pkg/web/pins_http.go);
-// the ONLY difference is the root filter. Pins consume SessionIDs() (every live
-// session, because a pin can target a subsession); labels consume
-// RootInventory() filtered to IsRoot (because a label target must be a true
-// root). pkg/state is per-project and has no project concept, so project
-// ownership is composed here in pkg/web — exactly as pins do.
+// Per-project isolation: this replaces the former worker-wide activeRootProjects
+// (which aggregated roots across ALL of s.aggs). A PUT for project A now
+// validates only against A's live roots, so a root reference from another
+// project cannot leak into A's doc, and a stale cross-project ref cannot
+// survive. This is the labels analogue of the per-dir narrowing the per-project
+// cutover requires; the ONLY difference from the former global builder is the
+// single-project scope.
 //
-// Concurrency mirrors activeSessionProjects: s.aggMu is held only to snapshot
-// the dir→aggregator entries; each aggregator's Store is then read under its
-// own RLock via RootInventory(). A dir whose projectRoot fails to resolve is
-// skipped with a log (fail-closed: roots from an unresolvable project are
-// absent from the map, so newly-referenced roots from that project fail the
-// store's unknown_root check — the safe behavior).
-func (s *Server) activeRootProjects() map[string]string {
-	type entry struct {
-		dir string
-		agg *aggregator.Aggregator
+// Uses aggForExisting(dir) — it does NOT open a project. A PUT for an unopened
+// project yields an empty inventory, so every newly-referenced root fails the
+// store's unknown_root check (fail-closed): labels cannot reference roots the
+// server is not tracking for that project. A dir whose projectRoot fails to
+// resolve returns nil (same fail-closed behavior).
+func (s *Server) activeRootProjectsForDir(dir string) map[string]string {
+	root, err := projectRoot(dir)
+	if err != nil {
+		vhlog.Warn("labels: skipping project in active-root map (projectRoot failed)", "dir", dir, "err", err)
+		return nil
 	}
-	s.aggMu.Lock()
-	live := make([]entry, 0, len(s.aggs))
-	for dir, a := range s.aggs {
-		live = append(live, entry{dir, a})
+	key := projectKey(root)
+	a := s.aggForExisting(dir)
+	if a == nil {
+		return nil
 	}
-	s.aggMu.Unlock()
-
 	out := map[string]string{}
-	for _, e := range live {
-		root, err := projectRoot(e.dir)
-		if err != nil {
-			vhlog.Warn("labels: skipping project in active-root map (projectRoot failed)", "dir", e.dir, "err", err)
-			continue
-		}
-		key := projectKey(root)
-		for _, inv := range e.agg.Store().RootInventory() {
-			if inv.IsRoot {
-				out[inv.SessionID] = key
-			}
+	for _, inv := range a.Store().RootInventory() {
+		if inv.IsRoot {
+			out[inv.SessionID] = key
 		}
 	}
 	return out

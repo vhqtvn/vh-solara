@@ -652,13 +652,14 @@ func TestLabelsHTTPGetReflectsPut(t *testing.T) {
 	}
 }
 
-// --- multi-project activeRootProjects builder -------------------------------
+// --- per-dir activeRootProjectsForDir builder --------------------------------
 
-// TestLabelsActiveRootProjectsMultiProject verifies the builder aggregates ROOT
-// session ids across ALL of s.aggs (default + extra projects), maps each to its
-// project's stable key, and EXCLUDES non-root (child) sessions — proving the
-// IsRoot filter is the strict parentID=="" definition.
-func TestLabelsActiveRootProjectsMultiProject(t *testing.T) {
+// TestLabelsActiveRootProjectsForDir verifies the per-project builder returns
+// ONLY the requested project's ROOT session ids (mapped to that project's stable
+// key) and EXCLUDES non-root (child) sessions as well as OTHER projects' roots.
+// This is the per-project narrowing that replaced the former worker-wide
+// activeRootProjects: a PUT for project A validates only against A's live roots.
+func TestLabelsActiveRootProjectsForDir(t *testing.T) {
 	srv, _ := newLabelsTestServer(t)
 	seedLabelSession(t, srv.agg, "default-root", "")
 	seedLabelSession(t, srv.agg, "default-child", "default-root") // child, must be excluded
@@ -670,24 +671,31 @@ func TestLabelsActiveRootProjectsMultiProject(t *testing.T) {
 	seedLabelSession(t, proj2, "proj2-root", "")
 	seedLabelSession(t, proj2, "proj2-child", "proj2-root")
 
-	got := srv.activeRootProjects()
-	// Exactly the two roots; the two children are excluded.
-	if len(got) != 2 {
-		t.Fatalf("activeRootProjects len = %d, want 2 (roots only, children excluded): %v", len(got), got)
+	// Per-project: ask for /proj2's active roots ONLY.
+	got := srv.activeRootProjectsForDir("/proj2")
+	// Exactly proj2-root; default-root (other project) + both children excluded.
+	if len(got) != 1 {
+		t.Fatalf("activeRootProjectsForDir(/proj2) len = %d, want 1 (proj2 root only): %v", len(got), got)
 	}
-	defaultKey := projectKey(mustProjectRoot(t, ""))
 	proj2Key := projectKey(mustProjectRoot(t, "/proj2"))
-	if got["default-root"] != defaultKey {
-		t.Fatalf("default-root key = %q, want %q", got["default-root"], defaultKey)
-	}
 	if got["proj2-root"] != proj2Key {
 		t.Fatalf("proj2-root key = %q, want %q", got["proj2-root"], proj2Key)
 	}
-	if _, ok := got["default-child"]; ok {
-		t.Fatalf("default-child must NOT be in activeRootProjects (not a root): %v", got)
+	if _, ok := got["default-root"]; ok {
+		t.Fatalf("default-root (other project) MUST NOT be in /proj2's active-root map: %v", got)
 	}
 	if _, ok := got["proj2-child"]; ok {
-		t.Fatalf("proj2-child must NOT be in activeRootProjects (not a root): %v", got)
+		t.Fatalf("proj2-child must NOT be in activeRootProjectsForDir (not a root): %v", got)
+	}
+	if _, ok := got["default-child"]; ok {
+		t.Fatalf("default-child must NOT be in activeRootProjectsForDir (not a root): %v", got)
+	}
+
+	// Default project's map is independent and carries its OWN root only.
+	gotDefault := srv.activeRootProjectsForDir("")
+	defaultKey := projectKey(mustProjectRoot(t, ""))
+	if len(gotDefault) != 1 || gotDefault["default-root"] != defaultKey {
+		t.Fatalf("activeRootProjectsForDir(\"\") = %v, want {default-root: %s}", gotDefault, defaultKey)
 	}
 	if defaultKey == proj2Key {
 		t.Fatalf("default and /proj2 resolved to the same project key — test isolation broken")
@@ -696,27 +704,27 @@ func TestLabelsActiveRootProjectsMultiProject(t *testing.T) {
 
 // --- retained root survives (anti-resurrection does not re-validate) --------
 
-// TestLabelsHTTPRetainedRootSurvivesUnopenedProject is the key anti-resurrection
-// guarantee, mirrored from TestPinsHTTPRetainedPinSurvivesUnopenedProject: a
-// retained root whose owning project is NO LONGER OPEN (absent from s.aggs and
-// thus from the active-root set) MUST survive a PUT that keeps it in a group.
-// Only NEWLY-REFERENCED roots are validated against activeRootProjects; retained
-// roots skip re-validation (the slice-1 store's anti-resurrection mirror), so an
-// archival race never makes a valid Replace spuriously fail.
-func TestLabelsHTTPRetainedRootSurvivesUnopenedProject(t *testing.T) {
+// TestLabelsHTTPRetainedRootSurvivesArchive is the per-project anti-resurrection
+// guarantee: a root that is RETAINED in this project's labels doc (already
+// present) but no longer in the project's active-root inventory (archived while
+// the doc was not being reconciled) MUST survive a PUT that keeps it in a group.
+// Only NEWLY-REFERENCED roots are validated against activeRootProjectsForDir;
+// retained roots skip re-validation (the slice-1 store's anti-resurrection
+// mirror), so an archival race never makes a valid Replace spuriously fail.
+//
+// (Per-project cutover: this replaces the former cross-project "unopened
+// project" angle — a root can only be retained within its OWN project's doc now.
+// The L2 cleanup subscriber is intentionally NOT installed here so the archived
+// root lingers in the doc, exercising the anti-resurrection path directly.)
+func TestLabelsHTTPRetainedRootSurvivesArchive(t *testing.T) {
 	srv, web := newLabelsTestServer(t)
+	seedLabelSession(t, srv.agg, "r1", "")
 
-	// Open a second project and seed a root under it.
-	const deadURL = "http://127.0.0.1:1"
-	proj2 := aggregator.New(deadURL, 100)
-	srv.aggs["/proj2"] = proj2
-	seedLabelSession(t, proj2, "proj2-root", "")
-
-	// Initialize the labels doc with the /proj2 root in a group.
+	// Initialize the labels doc with r1 in a group.
 	resp := labelsPut(t, web.URL+"/vh/labels", map[string]any{
 		"baseRevision": 0,
 		"groups": []map[string]any{
-			{"id": "g1", "name": "G", "color": "blue", "orderedRootSessionIds": []string{"proj2-root"}},
+			{"id": "g1", "name": "G", "color": "blue", "orderedRootSessionIds": []string{"r1"}},
 		},
 		"tags":                  []any{},
 		"tagIdsByRootSessionId": map[string][]string{},
@@ -731,19 +739,18 @@ func TestLabelsHTTPRetainedRootSurvivesUnopenedProject(t *testing.T) {
 		t.Fatalf("init PUT: revision %d, want 1", r.Revision)
 	}
 
-	// Drop /proj2 from s.aggs — its root is now absent from every active set.
-	delete(srv.aggs, "/proj2")
+	// r1 is now RETAINED in the doc. Archive it from the active-root inventory
+	// WITHOUT installing the L2 subscriber (no aggFor("")), so no cleanup runs.
+	// Then seed a new active root r2 for the newly-referenced id.
+	srv.agg.Store().RemoveSessions([]string{"r1"})
+	seedLabelSession(t, srv.agg, "r2", "")
 
-	// Seed a root under the default project for the newly-referenced id.
-	seedLabelSession(t, srv.agg, "default-root", "")
-
-	// PUT that RETAINS "proj2-root" (not re-validated despite its project being
-	// gone) AND ADDS "default-root" (validated — it IS an active root). Must
-	// succeed: 200.
+	// PUT that RETAINS "r1" (not re-validated despite being archived) AND ADDS
+	// "r2" (validated — it IS an active root). Must succeed: 200.
 	resp2 := labelsPut(t, web.URL+"/vh/labels", map[string]any{
 		"baseRevision": 1,
 		"groups": []map[string]any{
-			{"id": "g1", "name": "G", "color": "blue", "orderedRootSessionIds": []string{"proj2-root", "default-root"}},
+			{"id": "g1", "name": "G", "color": "blue", "orderedRootSessionIds": []string{"r1", "r2"}},
 		},
 		"tags":                  []any{},
 		"tagIdsByRootSessionId": map[string][]string{},
@@ -757,22 +764,22 @@ func TestLabelsHTTPRetainedRootSurvivesUnopenedProject(t *testing.T) {
 	if r2.Revision != 2 {
 		t.Fatalf("retained-root PUT: revision %d, want 2", r2.Revision)
 	}
-	if len(r2.Groups[0].OrderedRootSessionIDs) != 2 || r2.Groups[0].OrderedRootSessionIDs[0] != "proj2-root" || r2.Groups[0].OrderedRootSessionIDs[1] != "default-root" {
-		t.Fatalf("retained-root PUT: group roots = %v, want [proj2-root default-root]", r2.Groups[0].OrderedRootSessionIDs)
+	if len(r2.Groups[0].OrderedRootSessionIDs) != 2 || r2.Groups[0].OrderedRootSessionIDs[0] != "r1" || r2.Groups[0].OrderedRootSessionIDs[1] != "r2" {
+		t.Fatalf("retained-root PUT: group roots = %v, want [r1 r2]", r2.Groups[0].OrderedRootSessionIDs)
 	}
 
 	// Contrast: a PUT that adds a genuinely-unknown root ("ghost") still gets 400.
 	resp3 := labelsPut(t, web.URL+"/vh/labels", map[string]any{
 		"baseRevision": 2,
 		"groups": []map[string]any{
-			{"id": "g1", "name": "G", "color": "blue", "orderedRootSessionIds": []string{"proj2-root", "default-root", "ghost"}},
+			{"id": "g1", "name": "G", "color": "blue", "orderedRootSessionIds": []string{"r1", "r2", "ghost"}},
 		},
 		"tags":                  []any{},
 		"tagIdsByRootSessionId": map[string][]string{},
 	})
 	defer resp3.Body.Close()
 	if resp3.StatusCode != http.StatusBadRequest {
-		t.Fatalf("ghost-add PUT: status %d, want 400 (anti-resurrection)", resp3.StatusCode)
+		t.Fatalf("ghost-add PUT: status %d, want 400 (anti-resurrection only retains, never admits unknowns)", resp3.StatusCode)
 	}
 }
 

@@ -2,26 +2,29 @@ package web
 
 // SSE stream tests for Slice 3 of server-managed root-session labels.
 //
-// Slice 3 wires the LabelStore into the /vh/stream SSE channel:
+// Slice 3 wires the per-project LabelStore into the /vh/stream SSE channel:
 //   - labels.snapshot: a bootstrap frame emitted on EVERY fresh /vh/stream
-//     connect, sourced from s.labels.Snapshot(). It is the catch-up mechanism
-//     for a reconnecting client (transient labels.updated events are NOT
-//     replayed from the ring — see pkg/state/emit_transient).
+//     connect, sourced from THIS stream's project store (labelsForDir(reqDir(r))
+//     → Snapshot()). It is the catch-up mechanism for a reconnecting client
+//     (transient labels.updated events are NOT replayed from the ring — see
+//     pkg/state/emit_transient). The snapshot carries ONLY the stream's own
+//     project document.
 //   - labels.updated: a transient fan-out emitted after a committed PUT 200,
-//     reaching ALL active project stores' live subscribers (worker-wide — a
-//     mutation on project A reaches a subscriber viewing project B).
+//     reaching the MUTATING project's live subscribers ONLY (per-project — a
+//     mutation on project A does NOT reach a subscriber viewing project B).
 //
 // Both frames carry the public LabelsDoc payload {revision, groups, tags,
 // tagIdsByRootSessionId} and are written with NO `id:` line (writeRawNoID) so
 // they never become a resume cursor — they are orthogonal to the state store's
 // seq space.
 //
-// This file mirrors pkg/web/pins_stream_test.go test-for-test (snapshot-on-
-// connect, update fan-out to multiple project streams, reconnect restoration,
-// subscribe-before-snapshot bootstrap race protection, worker-wide fan-out, and
-// no broadcast from rejected writes). The SSE reader helpers (startSSEReader,
-// drainIdle, hasEvent, eventDataFor, eventNames) and lastCursor are shared from
-// tree_detail_test.go / pins_stream_test.go.
+// This file mirrors pkg/web/pins_stream_test.go (snapshot-on-connect, update
+// fan-out to multiple project streams, reconnect restoration, subscribe-before-
+// snapshot bootstrap race protection, no broadcast from rejected writes) and
+// INVERTS the former worker-wide fan-out test into a per-project isolation test.
+// The SSE reader helpers (startSSEReader, drainIdle, hasEvent, eventDataFor,
+// eventNames) and lastCursor are shared from tree_detail_test.go /
+// pins_stream_test.go.
 //
 // Lane: Go co-located unit (pkg/web/). Exercises the real HTTP stack via
 // httptest.NewServer(srv.Handler()) and the shared SSE reader helpers.
@@ -360,13 +363,15 @@ func TestLabelsStreamMutationDuringBootstrapNotLost(t *testing.T) {
 	}
 }
 
-// --- 5. Worker-wide fan-out: other-project subscriber gets the update -----
+// --- 5. Per-project isolation: other-project subscriber does NOT get the update
 
-// TestLabelsStreamOtherProjectFanOut asserts the worker-wide broadcast: a PUT
-// on the DEFAULT project reaches a subscriber viewing a DIFFERENT project
-// (/proj2). FanOutLabelsUpdate iterates ALL s.aggs stores under aggMu and emits
-// to each, so the cross-project delivery is guaranteed.
-func TestLabelsStreamOtherProjectFanOut(t *testing.T) {
+// TestLabelsStreamOtherProjectIsolation asserts the per-project fan-out contract
+// (replaces the former worker-wide fan-out test): a PUT on the DEFAULT project
+// reaches ONLY the default-project subscriber. The /proj2 subscriber — backed by
+// a separate store — must NOT receive the default project's labels.updated. This
+// is the cutover's core isolation guarantee: fanOutLabelsUpdate(dir, …) emits to
+// the matching project's aggregator only, never to every aggregator.
+func TestLabelsStreamOtherProjectIsolation(t *testing.T) {
 	srv, web := newLabelsTestServer(t)
 	seedLabelSession(t, srv.agg, "root-a", "")
 
@@ -384,7 +389,7 @@ func TestLabelsStreamOtherProjectFanOut(t *testing.T) {
 	ch2 := startSSEReader(t, s2.Body)
 	drainIdle(ch2, 500*time.Millisecond) // clear proj2 bootstrap
 
-	// Also open a default-project subscriber to confirm BOTH receive it.
+	// Also open a default-project subscriber to confirm it DOES receive it.
 	s1, err := http.Get(web.URL + "/vh/stream")
 	if err != nil {
 		t.Fatalf("GET /vh/stream default: %v", err)
@@ -417,20 +422,12 @@ func TestLabelsStreamOtherProjectFanOut(t *testing.T) {
 		t.Fatalf("default-project subscriber did not receive labels.updated; events: %v", eventNames(ev1))
 	}
 
-	// The OTHER-project subscriber MUST also get it — this is the worker-wide
-	// fan-out contract. If only the default store were notified, this fails.
-	if !hasEvent(ev2, "labels.updated") {
-		t.Fatalf("/proj2 subscriber did NOT receive labels.updated — fan-out did not reach the other project; events: %v", eventNames(ev2))
-	}
-	r2 := decodeLabelsSSEData(t, func() string {
-		d, ok := eventDataFor(ev2, "labels.updated", "")
-		if !ok {
-			t.Fatalf("/proj2 subscriber labels.updated data missing (should be unreachable — hasEvent passed)")
-		}
-		return d
-	}())
-	if r2.Revision != 1 {
-		t.Fatalf("/proj2 subscriber labels.updated revision = %d, want 1", r2.Revision)
+	// The OTHER-project subscriber MUST NOT get it — this is the per-project
+	// isolation contract. Under the old worker-wide fan-out this would have
+	// failed (proj2 would have received it); the cutover makes the fan-out
+	// project-scoped.
+	if hasEvent(ev2, "labels.updated") {
+		t.Fatalf("/proj2 subscriber received the DEFAULT project's labels.updated — per-project isolation broken; events: %v", eventNames(ev2))
 	}
 }
 
