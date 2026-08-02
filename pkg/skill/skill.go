@@ -199,8 +199,10 @@ func Generate(version string) string {
 	p("session transcript. All are HTTP-only (deliberately NOT MCP tools). State-changing calls require\n")
 	p("`X-VH-CSRF: 1` (the outer middleware on every /vh/* route). NONE has a cross-machine mirror on\n")
 	p("the controller today — they are worker-local; reach them on the worker's own /vh/* edge (or its\n")
-	p("UDS). The controller's `/api/workers/{id}/*` mirrors the verbs/projects/views/sessions/events\n")
-	p("surface, not these docs.\n\n")
+	p("UDS). The controller's `/api/workers/{id}/*` mirrors the skill/projects/views/sessions/events\n")
+	p("surface — `skill/emit`, `projects`, `views`, the `sessions` reads + act-verbs\n")
+	p("(send/spawn/abort/archive/answer-question/reply-permission under `/sessions/*`), and the `events` SSE\n")
+	p("stream — not these docs.\n\n")
 
 	p("### Labels (root-session groups + tags) — per-project\n\n")
 	p("Browser-tab-group-style grouping of ROOT sessions, scoped to ONE project (`?dir=<dir>` or\n")
@@ -232,7 +234,7 @@ func Generate(version string) string {
 	p("  DEFINITIONS survive cleanup even when their assignments are gone (a future restore is\n")
 	p("  possible).\n\n")
 
-	p("### Pins (pinned root-session order) — worker-wide\n\n")
+	p("### Pins (pinned session order) — worker-wide\n\n")
 	p("A flat, ordered list of pinned session ids, WORKER-WIDE (one pins.json; NO `?dir=` — a pin\n")
 	p("mutation fans out to EVERY project's stream, unlike per-project labels). The public shape\n")
 	p("OMITS the internal project-by-session map.\n\n")

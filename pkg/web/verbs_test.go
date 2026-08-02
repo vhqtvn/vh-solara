@@ -290,9 +290,21 @@ func TestSkillEmitEndpoint(t *testing.T) {
 	}
 	// The server-managed state docs section (labels/pins/queue) is generated into
 	// the live bytes served by this endpoint — proves /vh/skill/emit carries the
-	// new content, not just that skill.Generate() produces it.
-	if !strings.Contains(s, "## Server-managed state docs") || !strings.Contains(s, "### Labels (root-session groups + tags)") {
-		t.Fatalf("emitted skill missing the server-managed state docs section")
+	// new content, not just that skill.Generate() produces it. Assert ALL THREE
+	// subsection headers + their route anchors so an endpoint regression cannot
+	// strip the pins/queue subsections while leaving the Labels header green.
+	for _, must := range []string{
+		"## Server-managed state docs",
+		"### Labels (root-session groups + tags)",
+		"### Pins (pinned session order)",
+		"### Queue (per-session work distribution)",
+		"/vh/labels",
+		"/vh/pins",
+		"/vh/session/{sessionId}/queue",
+	} {
+		if !strings.Contains(s, must) {
+			t.Fatalf("emitted skill missing server-managed-state anchor %q", must)
+		}
 	}
 }
 
