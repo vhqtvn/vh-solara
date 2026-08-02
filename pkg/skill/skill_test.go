@@ -43,4 +43,33 @@ func TestGenerateIsVersionStampedAndFromLiveSurface(t *testing.T) {
 			t.Fatalf("generated skill missing contract point %q", must)
 		}
 	}
+
+	// Server-managed state docs section (labels/pins/queue): the three subsection
+	// headers + key per-surface contract anchors must all render. Mirrors the
+	// existing drift-proof style — a dropped p() line fails loudly.
+	for _, must := range []string{
+		"## Server-managed state docs",
+		"### Labels (root-session groups + tags)",
+		"### Pins (pinned root-session order)",
+		"### Queue (per-session work distribution)",
+		"/vh/labels",
+		"/vh/pins",
+		"/vh/session/{sessionId}/queue",
+		"labels.snapshot",
+		"labels.updated",
+		"pins.snapshot",
+		"pins.updated",
+		"baseRevision",
+		"tagIdsByRootSessionId",
+		"orderedSessionIds",
+		"unknown_session",
+		"unknownIds",
+		"unknown_root",
+		"initializeOnly",
+		// Anonymization guard: the state-docs prose must stay customer-agnostic.
+	} {
+		if !strings.Contains(out, must) {
+			t.Fatalf("generated skill missing server-managed-state anchor %q", must)
+		}
+	}
 }

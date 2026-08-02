@@ -288,6 +288,12 @@ func TestSkillEmitEndpoint(t *testing.T) {
 	if strings.HasPrefix(strings.TrimSpace(s), "<") || !strings.Contains(s, "### `send_message`") || !strings.Contains(s, "gate{}") {
 		t.Fatalf("body is not the generated skill: %.80s", s)
 	}
+	// The server-managed state docs section (labels/pins/queue) is generated into
+	// the live bytes served by this endpoint — proves /vh/skill/emit carries the
+	// new content, not just that skill.Generate() produces it.
+	if !strings.Contains(s, "## Server-managed state docs") || !strings.Contains(s, "### Labels (root-session groups + tags)") {
+		t.Fatalf("emitted skill missing the server-managed state docs section")
+	}
 }
 
 func TestProjectsEnumeratesInstances(t *testing.T) {
