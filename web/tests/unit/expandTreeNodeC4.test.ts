@@ -473,3 +473,73 @@ describe("expandTreeNode C4 deferral — Case C (F4): defer the expand-page DETA
     expect(store.state.sessions.c1?.title).toBe("expand-c1-new");
   });
 });
+
+// ===========================================================================
+// Case D (F4 gen-recheck) — the F4 guard's gen-recheck DROP branch. While a
+// coherent capture is pending and the expand detail's applyScopedSnapshot is
+// deferred onto ownerNow.promise, a treeGen bump (reconnect/resync via
+// connect(true)) must DROP the deferred apply entirely — the gen recheck
+// (`ownerNow.generation !== treeGen`) fails, so applyScopedSnapshot NEVER runs:
+// NO state mutation. This is the detail-install analog of Case B's tree-OP
+// gen-recheck drop, exercising the F4 guard's drop branch directly (previously
+// only mechanism-asserted by analogy to ownerAwareApply). Closes defer-f4-
+// genrecheck.
+// ===========================================================================
+describe("expandTreeNode C4 deferral — Case D (F4 gen-recheck): drop the deferred detail apply on treeGen bump", () => {
+  it("DROPS the deferred applyScopedSnapshot when treeGen bumps mid-deferral (no state mutation)", async () => {
+    stream.connect();
+    const treeES = treeESes()[0];
+    treeES.simulateOpen();
+
+    // 1. Open a coherent capture → owner pending.
+    treeES.fire("tree.snapshot", treeSnapBody(100, "e1", ["base", "c1"]), "100");
+    expect(stream.isTreeSnapshotDecoding()).toBe(true);
+
+    // 2. Re-stub fetch: expand returns a page-scoped DETAIL bundle (newer seq 105).
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) => {
+        if (typeof url === "string" && url.startsWith("/vh/tree/children")) {
+          return new Response(
+            JSON.stringify(
+              childrenBodyWithDetail(
+                "base",
+                ["c1"],
+                expandDetailBundle(105, ["c1"], [{ id: "c1", title: "expand-c1-new" }]),
+              ),
+            ),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+        }
+        return new Response("{}", { status: 200 });
+      }),
+    );
+
+    const beforeCursor = store.state.cursor;
+    // 3. Fire expandTreeNode → F4 guard defers applyScopedSnapshot onto ownerNow.promise.
+    const expandP = stream.expandTreeNode("base");
+    await tick(5);
+
+    // 4. Deferred: c1 NOT yet applied; cursor unchanged.
+    expect(store.state.sessions.c1).toBeUndefined();
+    expect(store.state.cursor).toBe(beforeCursor);
+
+    // 5. Bump treeGen via connect(true). connect() does treeGen++ BEFORE
+    //    cancelPendingOwner, so the deferred apply's gen recheck FAILS → drop.
+    stream.connect(true);
+    const freshES = treeESes()[treeESes().length - 1];
+    freshES.simulateOpen();
+
+    // 6. Await the cancel-settle + the chained callback + trailing microtasks.
+    await awaitOwner();
+    await expandP;
+    await tick(2);
+
+    // 7. CRUX — DROPPED: the deferred expand detail apply NEVER ran. c1 stays
+    //    absent; the cursor never advanced to 105. The gen-recheck drop branch
+    //    fired (ownerNow.generation !== treeGen → return without applying).
+    expect(store.state.sessions.c1).toBeUndefined();
+    expect(store.state.cursor).toBe(beforeCursor);
+    expect(stream.isTreeSnapshotDecoding()).toBe(false);
+  });
+});

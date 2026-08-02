@@ -1470,7 +1470,7 @@ export async function expandTreeNode(id: string): Promise<void> {
       // resolving while a coherent capture is pending runs applyScopedSnapshot
       // unguarded, regressing the cursor (applyScopedSnapshot's unconditional
       // cursor set at reconcile.ts:239 vs tryInstall's non-ratcheting
-      // advanceCursor at :677) and clobbering scope-overlap ids with older
+      // advanceCursor at tree-transport.ts:211) and clobbering scope-overlap ids with older
       // coherent data. Defer the apply onto the pending owner's promise and
       // recheck treeGen (drop if superseded by a reconnect). Mirrors :1489.
       const detail = decoded.detail;
