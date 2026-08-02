@@ -30,6 +30,7 @@ import {
   removeRootTag,
   renameGroup,
   reorderGroup,
+  setGroupColor,
   toggleGroupCollapse,
   type LabelGroup,
   type LabelTag,
@@ -544,6 +545,149 @@ describe("intent semantics — full-doc transforms", () => {
 
     const body = JSON.parse((vi.mocked(fetch).mock.calls[0][1] as RequestInit).body as string);
     expect(body.tagIdsByRootSessionId).toEqual({});
+  });
+});
+
+// === setGroupColor — color-swatch handler (parity with renameGroup) ==========
+// setGroupColor is a pure intent over the SAME engine as renameGroup
+// (performMutation): optimistic apply, one bounded 409/400 retry, network
+// rollback, and the stale-frame guards. These mirror the renameGroup cases that
+// already pin that engine — closing the slice-6 review DEFER that flagged the
+// TS-only color-swatch handler as untested.
+describe("setGroupColor — change a group's color token", () => {
+  it("changes the color optimistically, PUTs the full doc with the new color, bumps revision on 200", async () => {
+    applyLabelsSnapshot(doc(1, [grp("g1", { name: "G1", color: "blue" })]));
+    const fetchMock = vi.fn(() =>
+      Promise.resolve(jsonRes(doc(2, [grp("g1", { name: "G1", color: "red" })]))),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const p = setGroupColor("g1", "red");
+    // Optimistic: color flips to red BEFORE the PUT resolves (no rev bump yet).
+    expect(labelsGroups()[0].color).toBe("red");
+    expect(labelsRevision()).toBe(1); // optimistic apply does not bump revision
+
+    await p;
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect(body.baseRevision).toBe(1);
+    expect(body.groups[0]).toMatchObject({ id: "g1", name: "G1", color: "red" });
+    expect(labelsGroups()[0].color).toBe("red");
+    expect(labelsRevision()).toBe(2);
+    expect(labelsLastError()).toBeNull();
+  });
+
+  it("is a no-op (no PUT) when the color is unchanged (contentEqual)", async () => {
+    applyLabelsSnapshot(doc(1, [grp("g1", { color: "blue" })]));
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    await setGroupColor("g1", "blue"); // same color → doc identical → no PUT
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(labelsLastError()).toBeNull();
+    expect(labelsRevision()).toBe(1);
+  });
+
+  it("is a no-op (no PUT) when the group id is unknown", async () => {
+    // Mirrors setGroupColor's documented "no-op if the id is unknown" clause: the
+    // intent returns the doc unchanged → contentEqual → no PUT.
+    applyLabelsSnapshot(doc(1, [grp("g1", { color: "blue" })]));
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    await setGroupColor("ghost", "red");
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(labelsLastError()).toBeNull();
+    expect(labelsGroups()[0].color).toBe("blue");
+  });
+
+  it("on 409 adopts authority, rebases the SAME recolor intent, retries once (200)", async () => {
+    // Client holds g1 (blue) @ rev1. A concurrent winner renamed g1 to "Renamed"
+    // @ rev2. setGroupColor(g1, red) is stale → 409; the facade adopts the
+    // authority [g1 "Renamed" blue] @ rev2, rebases the recolor onto it
+    // ([g1 "Renamed" red]), and the single retry wins @ rev3. This proves the
+    // recolor rebases like renameGroup (find-by-id re-applies cleanly), NOT a
+    // blind replay that would clobber the concurrent rename.
+    applyLabelsSnapshot(doc(1, [grp("g1", { name: "G1", color: "blue" })]));
+    const seq = [
+      jsonRes(doc(2, [grp("g1", { name: "Renamed", color: "blue" })]), 409),
+      jsonRes(doc(3, [grp("g1", { name: "Renamed", color: "red" })])),
+    ];
+    let i = 0;
+    const fetchMock = vi.fn(() => Promise.resolve(seq[i++]));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await setGroupColor("g1", "red");
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    // Retry body derived from the ADOPTED authority: recolor applied on top of
+    // the concurrent rename (name preserved, color flipped), baseRevision bumped.
+    const retryBody = JSON.parse((fetchMock.mock.calls[1][1] as RequestInit).body as string);
+    expect(retryBody).toMatchObject({ baseRevision: 2 });
+    expect(retryBody.groups[0]).toMatchObject({ id: "g1", name: "Renamed", color: "red" });
+    expect(labelsGroups()[0]).toMatchObject({ name: "Renamed", color: "red" });
+    expect(labelsRevision()).toBe(3);
+    expect(labelsLastError()).toBeNull();
+  });
+
+  it("rolls back the optimistic recolor on network failure", async () => {
+    applyLabelsSnapshot(doc(1, [grp("g1", { color: "blue" })]));
+    vi.stubGlobal("fetch", vi.fn(() => Promise.reject(new Error("net"))));
+
+    await setGroupColor("g1", "red"); // optimistic recolor → rolled back
+
+    expect(labelsGroups()[0].color).toBe("blue"); // original restored
+    expect(labelsRevision()).toBe(1);
+    expect(labelsLastError()).toBe("labels-network");
+  });
+
+  it("a labels.updated landing during a failed recolor PUT is left intact (rollback guard)", async () => {
+    // setGroupColor issues a PUT that stays pending; a labels.updated frame (rev5)
+    // lands DURING the round-trip and is adopted. The PUT then fails non-409.
+    // serverRevision() (5) !== baseRev (1), so the rollback is skipped and the
+    // fresher frame's doc is left intact (mirrors the renameGroup F1 case).
+    applyLabelsSnapshot(doc(1, [grp("g1", { name: "G1", color: "blue" })]));
+    let rejectPut!: (e: unknown) => void;
+    vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>((_, rej) => (rejectPut = rej))));
+
+    const p = setGroupColor("g1", "red");
+    await flush(); // optimistic applied; PUT pending
+    expect(labelsGroups()[0].color).toBe("red");
+
+    applyLabelsUpdated(doc(5, [grp("g1", { name: "G1", color: "purple" })])); // fresher frame
+    expect(labelsRevision()).toBe(5);
+    expect(labelsGroups()[0].color).toBe("purple");
+
+    rejectPut(new Error("net")); // PUT fails non-409
+    await p;
+
+    expect(labelsGroups()[0].color).toBe("purple"); // NOT rolled back to blue/red
+    expect(labelsRevision()).toBe(5);
+    expect(labelsLastError()).toBe("labels-network");
+  });
+
+  it("a 200 recolor response older than the held revision is dropped (F1 on the success path)", async () => {
+    // setGroupColor issues a PUT (baseRev1). DURING the round-trip a labels.updated
+    // (rev5) lands and is adopted. The PUT's 200 returns an OLDER revision (rev2).
+    // adoptPutResponse drops it (2 < 5), leaving the fresher doc intact.
+    applyLabelsSnapshot(doc(1, [grp("g1", { name: "G1", color: "blue" })]));
+    let resolvePut!: (v: Response) => void;
+    vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>((r) => (resolvePut = r))));
+
+    const p = setGroupColor("g1", "red");
+    await flush(); // PUT issued, pending
+
+    applyLabelsUpdated(doc(5, [grp("g1", { name: "G1", color: "green" })]));
+    expect(labelsGroups()[0].color).toBe("green");
+
+    resolvePut(jsonRes(doc(2, [grp("g1", { name: "G1", color: "red" })]))); // stale 200
+    await p;
+
+    expect(labelsGroups()[0].color).toBe("green"); // NOT regressed to red
+    expect(labelsRevision()).toBe(5);
+    expect(labelsLastError()).toBeNull();
   });
 });
 

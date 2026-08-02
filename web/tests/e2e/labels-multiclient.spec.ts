@@ -1,4 +1,4 @@
-import { expect, test, type APIRequestContext, type Browser, type Page } from "@playwright/test";
+import { expect, test, type APIRequestContext, type Browser, type Locator, type Page } from "@playwright/test";
 import { projectUrl, resetLabels, resetPins } from "./util";
 
 // Slice 6 — server-managed root-session labels (groups + tags): multi-client
@@ -459,5 +459,201 @@ test("(f) tag filter AND narrows the visible roots", async ({ request, browser }
     await expect(rail.locator("button[aria-pressed='true']")).toHaveCount(2);
   } finally {
     await a.close();
+  }
+});
+
+// ─── (g) GroupHeader manage popover: rename / recolor / reorder / delete ──────
+// Drives the group header "⋯" manage popover end-to-end through a real browser.
+// The popover actions are NOT exercised by any other e2e — the facade intents
+// are unit-covered (labels.test.ts), and multi-client convergence is e2e-proven
+// by (a)–(f), but the popover-driven paths were a slice-6 review DEFER. One
+// walkthrough test exercises every popover action on two groups created via the
+// context menu (reusing (a)'s create flow):
+//   - rename via the popover input (closes the popover, opens TextPromptDialog)
+//   - recolor via a swatch (aria-pressed flips + the header dot's --label-color)
+//   - reorder (move up) + the move buttons disable at the ends
+//   - delete (group gone, its root returns to ungrouped)
+// Two-tab convergence is asserted for the rename and the delete (a second tab
+// sees the same change via labels.updated).
+//
+// SELECTOR STRATEGY (stable hooks only — slice-6 CSS is hashed CSS Modules):
+//   - open popover : button[aria-label="Manage group <name>"]
+//   - popover menu : [role="menu"][aria-label="Manage group <name>"]  (the shared
+//                    module-scope manageOpenId keeps one popover open at a time,
+//                    so the per-group menu aria-label disambiguates)
+//   - menu items   : menu.getByRole("menuitem", { name: "..." })
+//   - swatches     : [role="group"][aria-label="Group color"] button[aria-label="Color <c>"]
+//                    with aria-pressed reflecting the current color
+//   - header name  : groupToggle(page, name) matches the Expand/Collapse toggle
+//                    by an ANCHORED regex so "Alpha" never matches "AlphaRenamed"
+//                    (a plain prefix/suffix matcher would hit either the substring
+//                    trap or the "Manage group <name>" button)
+//   - popover open : openManagePopover(name) clicks the manage button; the menu
+//                    is an overlapping high-z-index dropdown, so before touching
+//                    anything below the open menu the caller MUST first call
+//                    closeManagePopover (toggles its own trigger closed — the
+//                    trigger sits above its dropdown so it is never covered).
+//                    Never reopen the group whose popover is currently open
+//                    (that click toggles it closed); Escape proved an unreliable
+//                    closer in e2e.
+
+function escapeForRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// groupToggle — the GroupHeader collapse/expand toggle button for the group
+// named `name`. Matches the toggle aria-label ("Expand group <name>" or
+// "Collapse group <name>") by an ANCHORED regex so that "Alpha" does NOT match
+// "AlphaRenamed" and the "Manage group <name>" button is excluded.
+function groupToggle(page: Page, name: string): Locator {
+  const re = new RegExp(`^(Expand|Collapse) group ${escapeForRegex(name)}$`);
+  return page.getByRole("button", { name: re });
+}
+
+// groupOrder — the ordered list of group header names as rendered (the groups[]
+// array order). Reads the Expand/Collapse toggle buttons in DOM order and strips
+// the prefix. Used to assert reorder actually permutes the rendered headers.
+async function groupOrder(page: Page): Promise<string[]> {
+  const toggles = page.locator('button[aria-label^="Expand group"], button[aria-label^="Collapse group"]');
+  const count = await toggles.count();
+  const names: string[] = [];
+  for (let i = 0; i < count; i++) {
+    const label = (await toggles.nth(i).getAttribute("aria-label")) ?? "";
+    names.push(label.replace(/^(Expand|Collapse) group /, ""));
+  }
+  return names;
+}
+
+// openManagePopover — opens the GroupHeader "⋯" manage popover for `name` and
+// returns its menu locator.
+//
+// OVERLAP HAZARD: the menu is an absolutely-positioned, high-z-index dropdown
+// anchored to the trigger's bottom-right (.groupMenu { position: absolute; top:
+// calc(100% + 4px); right: 0; z-index: var(--z-popover) }), so while it is open
+// it OVERLAPS the group header(s) below it. Therefore, before interacting with
+// anything beneath the open menu (e.g. another group's header / manage button),
+// the caller MUST first close it via closeManagePopover — otherwise the click
+// lands on the overlapping menu (e.g. its "Delete group" item), not the target.
+//
+// SAME-GROUP-REOPEN HAZARD: clicking a group's own manage button while its
+// popover is already open TOGGLES it closed (open() is true). And keyboard
+// Escape proved an unreliable closer in e2e (a same-group Escape-then-click
+// ended up toggling closed). So: never reopen the group whose popover is
+// currently open; close it explicitly first.
+async function openManagePopover(page: Page, name: string): Promise<Locator> {
+  await page.locator(`button[aria-label="Manage group ${name}"]`).click();
+  const menu = page.locator(`[role="menu"][aria-label="Manage group ${name}"]`);
+  await expect(menu).toBeVisible();
+  return menu;
+}
+
+// closeManagePopover — toggles the open popover for `name` CLOSED by clicking
+// its own manage button again (open() is true → setManageOpenId(null)). The
+// trigger sits ABOVE its own dropdown menu (.groupMenu top: calc(100% + 4px)),
+// so it is never covered by the menu and the click always lands on the trigger.
+// Verified-closed (menu count 0) before returning. Precondition: the popover is
+// open (otherwise the click would OPEN it and the verify fails fast).
+async function closeManagePopover(page: Page, name: string): Promise<void> {
+  await page.locator(`button[aria-label="Manage group ${name}"]`).click();
+  await expect(page.locator(`[role="menu"][aria-label="Manage group ${name}"]`)).toHaveCount(0);
+}
+
+test("(g) GroupHeader manage popover: rename, recolor, reorder, delete converge across tabs", async ({ browser }) => {
+  const a = await openClient(browser);
+  const b = await openClient(browser);
+  try {
+    // ── Setup: create two groups via the context menu (proven in (a)), each with
+    //    a root in it. Order is [Alpha, Beta] (createGroup appends). Alpha (first)
+    //    takes the palette-cycle default color "blue"; Beta (second) "green".
+    await a.page.locator(`.tree-node[data-session-id="other"]`).first().click({ button: "right" });
+    await expect(a.page.locator(".ctxm-menu")).toBeVisible();
+    await a.page.locator(".ctxm-item", { hasText: "New group…" }).click();
+    await expect(a.page.locator(".vh-prompt")).toBeVisible();
+    await a.page.locator(".vh-prompt-input").fill("Alpha");
+    await a.page.locator(".vh-prompt .confirm-go").click();
+    await expect(inGroup(a.page, "other")).toBeVisible({ timeout: 8000 });
+
+    await a.page.locator(`.tree-node[data-session-id="slow"]`).first().click({ button: "right" });
+    await expect(a.page.locator(".ctxm-menu")).toBeVisible();
+    await a.page.locator(".ctxm-item", { hasText: "New group…" }).click();
+    await expect(a.page.locator(".vh-prompt")).toBeVisible();
+    await a.page.locator(".vh-prompt-input").fill("Beta");
+    await a.page.locator(".vh-prompt .confirm-go").click();
+    await expect(inGroup(a.page, "slow")).toBeVisible({ timeout: 8000 });
+
+    // Both groups converge in B; order is [Alpha, Beta].
+    await expect(groupToggle(b.page, "Alpha")).toBeVisible({ timeout: 8000 });
+    await expect(groupToggle(b.page, "Beta")).toBeVisible({ timeout: 8000 });
+    expect(await groupOrder(a.page)).toEqual(["Alpha", "Beta"]);
+
+    // ── Rename Alpha → AlphaRenamed via the popover input.
+    {
+      const menu = await openManagePopover(a.page, "Alpha");
+      await menu.getByRole("menuitem", { name: "Rename group" }).click();
+      // Popover closes (setManageOpenId(null)); the rename TextPromptDialog opens.
+      await expect(a.page.locator(".vh-prompt")).toBeVisible();
+      await a.page.locator(".vh-prompt-input").fill("AlphaRenamed");
+      await a.page.locator(".vh-prompt .confirm-go").click();
+    }
+    // A: old toggle gone, new toggle renders.
+    await expect(groupToggle(a.page, "Alpha")).toHaveCount(0, { timeout: 8000 });
+    await expect(groupToggle(a.page, "AlphaRenamed")).toBeVisible({ timeout: 8000 });
+    // B converges via labels.updated: same rename.
+    await expect(groupToggle(b.page, "Alpha")).toHaveCount(0, { timeout: 8000 });
+    await expect(groupToggle(b.page, "AlphaRenamed")).toBeVisible({ timeout: 8000 });
+
+    // ── Session 1 — AlphaRenamed's popover (opened once; nothing was open after
+    //    the rename menuitem closed Alpha's). Recolor blue→red AND assert the
+    //    move-up button disables at the FIRST end, in the same popover session.
+    {
+      const menu = await openManagePopover(a.page, "AlphaRenamed");
+      // Recolor via the red swatch.
+      const swatches = menu.locator('[role="group"][aria-label="Group color"]');
+      await expect(swatches.locator('button[aria-label="Color blue"]')).toHaveAttribute("aria-pressed", "true");
+      await swatches.locator('button[aria-label="Color red"]').click();
+      // Red swatch now pressed, blue no longer; header dot adopts red via the
+      // --label-color CSS var (the optimistic apply flips both before the PUT).
+      await expect(menu.locator('button[aria-label="Color red"]')).toHaveAttribute("aria-pressed", "true", { timeout: 8000 });
+      await expect(menu.locator('button[aria-label="Color blue"]')).toHaveAttribute("aria-pressed", "false");
+      await expect(groupToggle(a.page, "AlphaRenamed").locator('span[style*="--label-red"]')).toBeVisible({ timeout: 8000 });
+      // AlphaRenamed is FIRST → Move-up disabled (onFirst). Assert Move-down
+      // ENABLED first so the disabled below is due to onFirst, not a stray
+      // labelsPending left over from the recolor PUT (toBeEnabled auto-retries
+      // until the PUT settles).
+      await expect(menu.getByRole("menuitem", { name: "Move group down" })).toBeEnabled();
+      await expect(menu.getByRole("menuitem", { name: "Move group up" })).toBeDisabled();
+    }
+    // Close AlphaRenamed's popover before touching Beta: the open dropdown
+    // overlaps Beta's header below it (see openManagePopover OVERLAP HAZARD).
+    await closeManagePopover(a.page, "AlphaRenamed");
+
+    // ── Session 2 — Beta's popover. Assert the move-down button disables at the
+    //    LAST end, move Beta up, then delete Beta — all in the same popover
+    //    session (the move and delete clicks do not close it; delete closes it).
+    {
+      const menu = await openManagePopover(a.page, "Beta");
+      // Beta is LAST → Move-down disabled (onLast), Move-up enabled.
+      await expect(menu.getByRole("menuitem", { name: "Move group up" })).toBeEnabled();
+      await expect(menu.getByRole("menuitem", { name: "Move group down" })).toBeDisabled();
+      // Move Beta up → order becomes [Beta, AlphaRenamed].
+      await menu.getByRole("menuitem", { name: "Move group up" }).click();
+      await expect.poll(() => groupOrder(a.page), { timeout: 8000, message: "group order to become [Beta, AlphaRenamed]" }).toEqual(["Beta", "AlphaRenamed"]);
+      // Delete Beta from the SAME open popover. Wait for the move PUT to settle
+      // (Delete is disabled while labelsPending), then click.
+      const deleteBtn = menu.getByRole("menuitem", { name: "Delete group" });
+      await expect(deleteBtn).toBeEnabled();
+      await deleteBtn.click();
+    }
+    // Beta gone; its root (slow) returns to ungrouped; AlphaRenamed survives.
+    await expect(groupToggle(a.page, "Beta")).toHaveCount(0, { timeout: 8000 });
+    await expectUngrouped(a.page, "slow");
+    await expect(groupToggle(a.page, "AlphaRenamed")).toBeVisible();
+    await expect(inGroup(a.page, "other")).toBeVisible();
+    // B converges via labels.updated: Beta gone, slow ungrouped.
+    await expect(groupToggle(b.page, "Beta")).toHaveCount(0, { timeout: 8000 });
+    await expectUngrouped(b.page, "slow");
+  } finally {
+    await a.close();
+    await b.close();
   }
 });
