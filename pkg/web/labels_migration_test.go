@@ -21,6 +21,7 @@ package web
 // on-disk outputs.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -349,4 +350,196 @@ func labelGroupDefExists(lf labelsFile, id string) bool {
 		}
 	}
 	return false
+}
+
+// --- corrupt / unparseable source recovery (DEFER F5-Go) ---------------------
+//
+// migrateLabelsToPerProject's recovery branch fires when the legacy source is
+// UNPARSEABLE (json.Unmarshal fails) or SCHEMA-MISMATCHED (SchemaVersion !=
+// labelsSchemaVersion). It cannot partition such input safely, so its contract
+// is: preserve the raw bytes verbatim in BOTH the backup and the unassigned
+// sink, remove the legacy file, write the completion marker, return nil, and
+// write NO per-project store. These tests pin that contract (items 1-6).
+
+// seedLegacyLabelsRaw writes raw bytes verbatim as the legacy worker-wide
+// labels.json under the current stateBaseDir(). Used to stage an unparseable /
+// schema-mismatched legacy file the migration must recover from.
+func seedLegacyLabelsRaw(t *testing.T, raw []byte) {
+	t.Helper()
+	path := filepath.Join(stateBaseDir(), labelsLegacyFile)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("mkdir legacy dir: %v", err)
+	}
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
+		t.Fatalf("write legacy %s: %v", path, err)
+	}
+}
+
+// assertCorruptRecoveryContract asserts the documented recovery behavior when
+// migrateLabelsToPerProject encounters an unparseable / schema-mismatched legacy
+// source (labels_registry.go recovery branch). Covers DEFER F5-Go items 1-5:
+//  1. raw bytes preserved verbatim in BOTH the backup and the unassigned sink,
+//  2. the legacy labels.json is removed,
+//  3. the completion marker is present,
+//  4. no error is returned (the recovery branch returns writeMigrationMarker,
+//     which is nil on success),
+//  5. NO per-project store is materialized from unparseable input.
+func assertCorruptRecoveryContract(t *testing.T, raw []byte) {
+	t.Helper()
+	// 4. No panic / no error: the recovery branch returns writeMigrationMarker,
+	//    which is nil on success.
+	if err := migrateLabelsToPerProject(); err != nil {
+		t.Fatalf("migrateLabelsToPerProject on corrupt source returned error: %v (contract: nil on recovery)", err)
+	}
+	base := stateBaseDir()
+	// 1. Raw bytes preserved verbatim in BOTH the backup and the unassigned sink.
+	backup, err := os.ReadFile(filepath.Join(base, labelsBackupFile))
+	if err != nil {
+		t.Fatalf("backup missing after corrupt-source recovery: %v", err)
+	}
+	if !bytes.Equal(backup, raw) {
+		t.Fatalf("backup bytes diverged from source raw: got %q want %q", backup, raw)
+	}
+	unassigned, err := os.ReadFile(filepath.Join(base, labelsUnassignedFile))
+	if err != nil {
+		t.Fatalf("unassigned sink missing after corrupt-source recovery: %v", err)
+	}
+	if !bytes.Equal(unassigned, raw) {
+		t.Fatalf("unassigned sink bytes diverged from source raw: got %q want %q", unassigned, raw)
+	}
+	// 2. Legacy file removed (single cutover).
+	if _, err := os.Stat(filepath.Join(base, labelsLegacyFile)); err == nil {
+		t.Fatalf("legacy labels.json still present after corrupt-source recovery")
+	}
+	// 3. Completion marker present.
+	if _, err := os.Stat(migrationMarkerPath()); err != nil {
+		t.Fatalf("completion marker missing after corrupt-source recovery: %v", err)
+	}
+	// 5. NO per-project store materialized from unparseable input. projects/ is
+	//    absent unless the partition loop (never reached on this branch) wrote
+	//    one; a missing dir reads as zero entries.
+	if entries, _ := os.ReadDir(filepath.Join(base, "projects")); len(entries) != 0 {
+		t.Fatalf("corrupt-source recovery wrote per-project stores from unparseable input: %v", entries)
+	}
+}
+
+// TestLabelsMigration_UnparseableJSONSourcePreserved (DEFER F5-Go): a legacy
+// labels.json whose bytes are not valid JSON cannot be partitioned safely. The
+// recovery branch must preserve the raw bytes verbatim in BOTH the backup and
+// the unassigned sink, remove the legacy file, write the marker, return nil,
+// and write NO per-project store.
+func TestLabelsMigration_UnparseableJSONSourcePreserved(t *testing.T) {
+	t.Setenv("VH_STATE_DIR", t.TempDir())
+	// Bytes that fail json.Unmarshal outright (recovery branch via err != nil).
+	raw := []byte("{totally not valid json at all")
+	seedLegacyLabelsRaw(t, raw)
+	assertCorruptRecoveryContract(t, raw)
+}
+
+// TestLabelsMigration_SchemaMismatchedSourcePreserved (DEFER F5-Go): a legacy
+// labels.json that PARSES as JSON but carries a foreign/unknown schemaVersion is
+// treated identically to an unparseable one — the recovery branch keys on
+// SchemaVersion != labelsSchemaVersion and preserves the raw bytes. This guards
+// the second half of the branch predicate (which a pure garbage-JSON seed would
+// not exercise).
+func TestLabelsMigration_SchemaMismatchedSourcePreserved(t *testing.T) {
+	t.Setenv("VH_STATE_DIR", t.TempDir())
+	// Valid JSON object, but a schemaVersion this binary will never write.
+	raw := []byte(`{"schemaVersion":999,"revision":3,"groups":[{"id":"g","name":"G","color":"blue","orderedRootSessionIds":["r1"]}],"tags":[],"tagIdsByRootSessionId":{}}`)
+	// Sanity: the seed MUST parse as JSON (otherwise this collapses into the
+	// unparseable case and stops exercising the schema-version predicate).
+	var lf labelsFile
+	if err := json.Unmarshal(raw, &lf); err != nil {
+		t.Fatalf("schema-mismatch seed must be valid JSON: %v", err)
+	}
+	if lf.SchemaVersion == labelsSchemaVersion {
+		t.Fatalf("schema-mismatch seed accidentally matches labelsSchemaVersion=%d", labelsSchemaVersion)
+	}
+	seedLegacyLabelsRaw(t, raw)
+	assertCorruptRecoveryContract(t, raw)
+}
+
+// TestLabelsMigration_CorruptSourceIdempotent (DEFER F5-Go, item 6): re-running
+// migration after a corrupt-source recovery is a no-op. The completion marker
+// short-circuits the second run (step a), so the backup, the unassigned sink,
+// and the marker are byte-stable and no per-project store materializes.
+//
+// It also simulates an interruption (removing the marker after recovery, with
+// the legacy file already gone): the retry re-runs the recovery branch against
+// the backup as the durable source and MUST leave the raw bytes preserved and
+// still write no per-project store.
+func TestLabelsMigration_CorruptSourceIdempotent(t *testing.T) {
+	t.Setenv("VH_STATE_DIR", t.TempDir())
+	raw := []byte("{totally not valid json at all")
+	seedLegacyLabelsRaw(t, raw)
+
+	// First run: recovery branch lands the backup + unassigned sink + marker.
+	if err := migrateLabelsToPerProject(); err != nil {
+		t.Fatalf("migrate #1: %v", err)
+	}
+	base := stateBaseDir()
+	backupBefore, err := os.ReadFile(filepath.Join(base, labelsBackupFile))
+	if err != nil {
+		t.Fatalf("read backup after run #1: %v", err)
+	}
+	unassignedBefore, err := os.ReadFile(filepath.Join(base, labelsUnassignedFile))
+	if err != nil {
+		t.Fatalf("read unassigned after run #1: %v", err)
+	}
+
+	// Second run: marker present → must short-circuit (no re-do of any work).
+	if err := migrateLabelsToPerProject(); err != nil {
+		t.Fatalf("migrate #2 (marker present) returned error: %v (contract: nil)", err)
+	}
+	backupAfter, err := os.ReadFile(filepath.Join(base, labelsBackupFile))
+	if err != nil {
+		t.Fatalf("read backup after run #2: %v", err)
+	}
+	unassignedAfter, err := os.ReadFile(filepath.Join(base, labelsUnassignedFile))
+	if err != nil {
+		t.Fatalf("read unassigned after run #2: %v", err)
+	}
+	if !bytes.Equal(backupAfter, backupBefore) {
+		t.Fatalf("marker-gated re-run rewrote backup: got %q want %q", backupAfter, backupBefore)
+	}
+	if !bytes.Equal(unassignedAfter, unassignedBefore) {
+		t.Fatalf("marker-gated re-run rewrote unassigned sink: got %q want %q", unassignedAfter, unassignedBefore)
+	}
+	// Legacy still gone; no per-project store materialized.
+	if _, err := os.Stat(filepath.Join(base, labelsLegacyFile)); err == nil {
+		t.Fatalf("legacy labels.json re-appeared after marker-gated re-run")
+	}
+	if entries, _ := os.ReadDir(filepath.Join(base, "projects")); len(entries) != 0 {
+		t.Fatalf("marker-gated re-run materialized per-project stores: %v", entries)
+	}
+
+	// Interruption simulation: drop the marker (legacy already gone; the backup
+	// is the durable source). The retry re-runs the recovery branch against the
+	// backup and MUST leave the raw bytes preserved + no per-project store.
+	if err := os.Remove(migrationMarkerPath()); err != nil {
+		t.Fatalf("remove marker (simulate interruption): %v", err)
+	}
+	if err := migrateLabelsToPerProject(); err != nil {
+		t.Fatalf("migrate #3 (post-interruption): %v", err)
+	}
+	backupRetry, err := os.ReadFile(filepath.Join(base, labelsBackupFile))
+	if err != nil {
+		t.Fatalf("read backup after interruption retry: %v", err)
+	}
+	unassignedRetry, err := os.ReadFile(filepath.Join(base, labelsUnassignedFile))
+	if err != nil {
+		t.Fatalf("read unassigned after interruption retry: %v", err)
+	}
+	if !bytes.Equal(backupRetry, raw) {
+		t.Fatalf("post-interruption retry altered backup: got %q want %q", backupRetry, raw)
+	}
+	if !bytes.Equal(unassignedRetry, raw) {
+		t.Fatalf("post-interruption retry altered unassigned sink: got %q want %q", unassignedRetry, raw)
+	}
+	if _, err := os.Stat(migrationMarkerPath()); err != nil {
+		t.Fatalf("marker not re-written after interruption recovery: %v", err)
+	}
+	if entries, _ := os.ReadDir(filepath.Join(base, "projects")); len(entries) != 0 {
+		t.Fatalf("post-interruption retry materialized per-project stores: %v", entries)
+	}
 }
