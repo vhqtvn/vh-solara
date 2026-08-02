@@ -901,6 +901,81 @@ describe("per-project scope — resetLabelsScope + scope-gen guard", () => {
     expect(labelsLastError()).toBeNull();
   });
 
+  it("F2-web: a dropped A RETRY-PUT does not steal the decrement from B's in-flight mutation", async () => {
+    // Companion to the F1-web case above, exercising gen-guard SITE #2 (the
+    // retry-PUT drop). A's first PUT 409s → performMutation adopts the server
+    // authority, rebases the intent, and issues the retry PUT. That retry stays
+    // pending across a switch to B. While B has its OWN mutation in flight, A's
+    // retry PUT resolves 200. The SECOND scope-gen early-return (after the retry
+    // await) must set dropped=true so the shared finally skips decPending —
+    // resetLabelsScope already zeroed pendingCount, so an unguarded decrement
+    // would steal B's lone pending slot and clear B's labelsPending latch early
+    // (B's PUT still in flight). Site #1 (first-PUT drop) is covered above; this
+    // pins the retry-PUT drop served by the SAME finally.
+    applyLabelsSnapshot(doc(1, [grp("gA", { name: "A" })]));
+
+    // Three fetch calls in order: A's first PUT (409, immediate), A's retry PUT
+    // (pending → resolveARetry), B's PUT (pending → resolveB).
+    let resolveARetry!: (v: Response) => void;
+    let resolveB!: (v: Response) => void;
+    let call = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => {
+        call++;
+        if (call === 1) {
+          // A's first PUT → 409: a concurrent winner added gConcurrent to A's doc.
+          return Promise.resolve(jsonRes(doc(1, [grp("gA", { name: "A" }), grp("gConcurrent")]), 409));
+        }
+        if (call === 2) {
+          // A's retry PUT → stays pending across the switch to B.
+          return new Promise<Response>((r) => (resolveARetry = r));
+        }
+        // call === 3: B's PUT → pending.
+        return new Promise<Response>((r) => (resolveB = r));
+      }),
+    );
+
+    // 1. Start project-A mutation: first PUT 409s → adopt authority → rebase →
+    //    retry PUT issued + pending.
+    const pA = renameGroup("gA", "renamed-A");
+    await flush(); // A's first PUT resolved (409 adopted + rebased), retry issued
+    expect(labelsPending()).toBe(true); // A's retry in flight
+
+    // 2. resetLabelsScope (A → B) — zeroes pendingCount, bumps labelsScopeGen.
+    resetLabelsScope();
+    expect(labelsPending()).toBe(false); // B starts clean
+
+    // 3. B's snapshot establishes B's state.
+    applyLabelsSnapshot(doc(1, [grp("gB", { name: "B" })]));
+
+    // 4. Start project-B mutation (pending latched true again for B).
+    const pB = renameGroup("gB", "renamed-B");
+    await flush(); // B's optimistic applied; B's PUT issued + pending
+    expect(labelsPending()).toBe(true);
+
+    // 5. Settle A's orphaned RETRY PUT (gen-guard site #2 dropped path).
+    resolveARetry(jsonRes(doc(2, [grp("gA", { name: "renamed-A" }), grp("gConcurrent")])));
+    await pA; // A's retry gen-guard return fires; F2-web finally skips decPending.
+
+    // 6a. B's labelsPending stays TRUE — the dropped A retry did NOT steal the
+    //     decrement. (Without dropped=true at site #2, A's finally decPending()
+    //     would have zeroed pendingCount and cleared B's latch while B's PUT was
+    //     still in flight — this is the assertion that catches the regression.)
+    expect(labelsPending()).toBe(true);
+    // B's doc must NOT be clobbered by A's dropped retry response.
+    expect(labelsGroups()).toEqual([grp("gB", { name: "renamed-B" })]); // B's optimistic
+    expect(labelsLastError()).toBeNull();
+
+    // 6b. Settle B's own PUT — now labelsPending clears.
+    resolveB(jsonRes(doc(2, [grp("gB", { name: "renamed-B" })])));
+    await pB;
+    expect(labelsPending()).toBe(false);
+    expect(labelsGroups()).toEqual([grp("gB", { name: "renamed-B" })]);
+    expect(labelsRevision()).toBe(2);
+    expect(labelsLastError()).toBeNull();
+  });
+
   it("after reset, B's labels.snapshot establishes B's state", () => {
     applyLabelsSnapshot(doc(7, [grp("from-A", { roots: ["ra"] })]));
     resetLabelsScope();
