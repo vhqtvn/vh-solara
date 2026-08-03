@@ -15,6 +15,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/vhqtvn/vh-solara/pkg/aggregator"
+	"github.com/vhqtvn/vh-solara/pkg/oclife"
 	"github.com/vhqtvn/vh-solara/pkg/web"
 )
 
@@ -57,50 +58,101 @@ with --opencode-url, or spawn a survivable detached instance with
 		external := localOpenCodeURL != ""
 		var opencodeURL string
 		opencodePort := 0
+
+		// DECOUPLING (p2-api-004 / oc-003): a fatal OpenCode spawn/listen
+		// failure is recorded in ocLife as a failed state and local-server
+		// keeps serving — a dead OpenCode must NOT take the reporting
+		// process with it. Mirrors client-daemon's setupVHMode. The topology
+		// is fixed BEFORE any spawn so a fatal spawn/listen failure can be
+		// recorded in the lifecycle instead of killing the process: the
+		// whole point of this slice is that a dead OpenCode must NOT take
+		// the local-server process with it.
+		var topo oclife.Topology
+		switch {
+		case external:
+			topo = oclife.TopologyExternal
+		case localOpenCodeDetached:
+			topo = oclife.TopologyDetached
+		default:
+			topo = oclife.TopologyOwned
+		}
+		ocLife := oclife.New(topo)
+
 		switch {
 		case external:
 			opencodeURL = strings.TrimRight(localOpenCodeURL, "/")
 			log.Printf("local-server: attaching to external OpenCode at %s", opencodeURL)
 			if err := waitForURL(opencodeURL+"/session", 30*time.Second); err != nil {
-				log.Fatalf("external OpenCode not reachable at %s: %v", opencodeURL, err)
+				// DECOUPLED: do NOT kill the process. Record the failure and
+				// keep serving so the operator can diagnose + restart OpenCode
+				// locally. opencodeURL stays set (the aggregator's lazy proxy
+				// dials it per-request and surfaces 502).
+				log.Printf("external OpenCode not reachable at %s: %v (local-server stays up; opencode status=failed)", opencodeURL, err)
+				ocLife.SetFailed(fmt.Sprintf("external OpenCode not reachable at %s: %v", opencodeURL, err), nil)
+			} else {
+				ocLife.SetReady()
 			}
 
 		case localOpenCodeDetached:
 			if st, ok := readOCState(); ok && ocInstanceOurs(st) {
 				opencodePort = st.Port
 				opencodeURL = fmt.Sprintf("http://127.0.0.1:%d", st.Port)
+				ocLife.SetReady() // reconnected to a known-live instance
 				log.Printf("local-server: reconnected to our detached OpenCode pid=%d port=%d", st.PID, st.Port)
 			} else {
 				opencodePort = freePort()
 				if st, ok := readOCState(); ok && portFree(st.Port) {
 					opencodePort = st.Port
 				}
+				// Pre-set opencodeURL so a failure below still leaves a
+				// parseable (dead) loopback target for the aggregator's
+				// lazy proxy.
+				opencodeURL = fmt.Sprintf("http://127.0.0.1:%d", opencodePort)
 				c, err := startOpenCodeServeDetached(localOpenCodeBin, opencodePort, cwd)
 				if err != nil {
-					log.Fatalf("Failed to start detached opencode serve: %v", err)
+					log.Printf("Failed to start detached opencode serve: %v (local-server stays up; opencode status=failed)", err)
+					ocLife.SetFailed(fmt.Sprintf("failed to start detached opencode serve: %v", err), nil)
+				} else {
+					opencodeServeCmd = c
+					if err := waitForPort(opencodePort, 30*time.Second); err != nil {
+						log.Printf("opencode serve failed to listen on port %d: %v (local-server stays up; opencode status=failed)", opencodePort, err)
+						ocLife.SetFailed(fmt.Sprintf("opencode serve failed to listen on port %d: %v", opencodePort, err), nil)
+					} else {
+						writeOCState(ocState{PID: c.Process.Pid, Port: opencodePort})
+						ocLife.SetReady()
+						log.Printf("local-server: spawned detached OpenCode pid=%d port=%d", c.Process.Pid, opencodePort)
+					}
 				}
-				opencodeServeCmd = c
-				if err := waitForPort(opencodePort, 30*time.Second); err != nil {
-					log.Fatalf("opencode serve failed to listen on port %d: %v", opencodePort, err)
-				}
-				writeOCState(ocState{PID: c.Process.Pid, Port: opencodePort})
-				opencodeURL = fmt.Sprintf("http://127.0.0.1:%d", opencodePort)
-				log.Printf("local-server: spawned detached OpenCode pid=%d port=%d", c.Process.Pid, opencodePort)
 			}
 
 		default:
 			opencodePort = freePort()
+			// Pre-set opencodeURL so a failure below still leaves a parseable
+			// (dead) loopback target for the aggregator's lazy proxy.
+			opencodeURL = fmt.Sprintf("http://127.0.0.1:%d", opencodePort)
 			c, err := startOpenCodeServe(localOpenCodeBin, opencodePort, cwd)
 			if err != nil {
-				log.Fatalf("Failed to start opencode serve: %v", err)
+				log.Printf("Failed to start opencode serve: %v (local-server stays up; opencode status=failed)", err)
+				ocLife.SetFailed(fmt.Sprintf("failed to start opencode serve: %v", err), nil)
+			} else {
+				opencodeServeCmd = c
+				if err := waitForPort(opencodePort, 30*time.Second); err != nil {
+					log.Printf("opencode serve failed to listen on port %d: %v (local-server stays up; opencode status=failed)", opencodePort, err)
+					ocLife.SetFailed(fmt.Sprintf("opencode serve failed to listen on port %d: %v", opencodePort, err), nil)
+				} else {
+					ocLife.SetReady()
+					log.Printf("local-server: spawned OpenCode pid=%d port=%d", c.Process.Pid, opencodePort)
+				}
 			}
-			opencodeServeCmd = c
-			if err := waitForPort(opencodePort, 30*time.Second); err != nil {
-				log.Fatalf("opencode serve failed to listen on port %d: %v", opencodePort, err)
-			}
-			opencodeURL = fmt.Sprintf("http://127.0.0.1:%d", opencodePort)
-			log.Printf("local-server: spawned OpenCode pid=%d port=%d", c.Process.Pid, opencodePort)
 		}
+		if opencodeURL == "" {
+			// Defensive: every arm above sets a parseable URL (a dead
+			// loopback on failure). If a future arm forgets, fall back
+			// rather than kill the process — the whole point of this slice.
+			opencodeURL = "http://127.0.0.1:0"
+			log.Printf("internal warning: opencodeURL not set by topology arm; using dead loopback %s", opencodeURL)
+		}
+		ocLife.SetOpenCodeURL(opencodeURL)
 
 		// Register this daemon so `vh-solara kill` can find it.
 		writeDaemonState()
@@ -119,20 +171,36 @@ with --opencode-url, or spawn a survivable detached instance with
 		// direct-DB unarchive guard can refuse fast in that topology (the local DB
 		// may not be the remote instance's). See pkg/opencode/db.go.
 		srv.SetExternalOpenCode(external)
+		// Expose the local OpenCode lifecycle at /vh/opencode/status so the
+		// operator can observe a failed OpenCode without local-server having
+		// died with it. Mirrors client-daemon's setupVHMode wiring.
+		srv.SetOpenCodeLifecycle(ocLife)
 
 		// Restart the owned OpenCode in place; the aggregator re-hydrates. Caller
-		// holds opencodeMu.
+		// holds opencodeMu. Drives ocLife through starting → ready|failed so
+		// /vh/opencode/status reflects the restart outcome (mirrors
+		// client-daemon's restartOpencode). A restart is a readiness event:
+		// the restarted process becomes ready or fails, so the lifecycle must
+		// transition with it or the status endpoint would lie.
 		restartOpencodeLocked := func() error {
 			if external {
 				if localOpenCodeRestart == "" {
 					return fmt.Errorf("OpenCode is externally managed; set --opencode-restart-cmd to enable restart from the UI")
 				}
+				ocLife.SetStarting()
 				if err := runShellCmd(context.Background(), localOpenCodeRestart, cwd, nil); err != nil {
+					ocLife.SetFailed(fmt.Sprintf("external restart command failed: %v", err), nil)
 					return err
 				}
-				return waitForURL(opencodeURL+"/session", 30*time.Second)
+				if err := waitForURL(opencodeURL+"/session", 30*time.Second); err != nil {
+					ocLife.SetFailed(fmt.Sprintf("external OpenCode not reachable after restart: %v", err), nil)
+					return err
+				}
+				ocLife.SetReady()
+				return nil
 			}
 			if localOpenCodeDetached {
+				ocLife.SetStarting()
 				if st, ok := readOCState(); ok {
 					killPID(st.PID)
 				}
@@ -142,25 +210,35 @@ with --opencode-url, or spawn a survivable detached instance with
 				time.Sleep(300 * time.Millisecond)
 				c, err := startOpenCodeServeDetached(localOpenCodeBin, opencodePort, cwd)
 				if err != nil {
+					ocLife.SetFailed(fmt.Sprintf("failed to start detached opencode serve: %v", err), nil)
 					return err
 				}
 				opencodeServeCmd = c
 				if err := waitForPort(opencodePort, 30*time.Second); err != nil {
+					ocLife.SetFailed(fmt.Sprintf("opencode serve failed to listen on port %d: %v", opencodePort, err), nil)
 					return err
 				}
 				writeOCState(ocState{PID: c.Process.Pid, Port: opencodePort})
+				ocLife.SetReady()
 				return nil
 			}
+			ocLife.SetStarting()
 			if opencodeServeCmd != nil && opencodeServeCmd.Process != nil {
 				_ = opencodeServeCmd.Process.Signal(syscall.SIGTERM)
 				_ = opencodeServeCmd.Wait()
 			}
 			c, err := startOpenCodeServe(localOpenCodeBin, opencodePort, cwd)
 			if err != nil {
+				ocLife.SetFailed(fmt.Sprintf("failed to start opencode serve: %v", err), nil)
 				return err
 			}
 			opencodeServeCmd = c
-			return waitForPort(opencodePort, 30*time.Second)
+			if err := waitForPort(opencodePort, 30*time.Second); err != nil {
+				ocLife.SetFailed(fmt.Sprintf("opencode serve failed to listen on port %d: %v", opencodePort, err), nil)
+				return err
+			}
+			ocLife.SetReady()
+			return nil
 		}
 
 		if len(localCORSOrigins) > 0 {
