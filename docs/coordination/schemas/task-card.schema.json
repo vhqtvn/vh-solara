@@ -34,7 +34,7 @@
     },
     "task_type": {
       "type": "string",
-      "enum": ["implementation", "study", "research"]
+      "enum": ["implementation", "study", "research", "docs", "verification"]
     },
     "coordination_mode": {
       "type": "string",
@@ -300,6 +300,93 @@
     "updated_at": {
       "type": "string",
       "format": "date-time"
+    },
+    "recurrence": {
+      "type": "object",
+      "description": "Optional recurrence-signature block. OPTIONAL on every card: legacy cards carry no block (backward-compat). When present, REQUIRES the two-level identity (recurrence_id = exact-defect collapse key; symptom_class_id = immutable/versioned taxonomy id) AND the acknowledgement pair (recurrence_count / last_acknowledged_count), and carries non-identity evidence[] plus an aliases[]/supersession list of structurally bounded items (item-shape bounding via additionalProperties:false, not a cardinality cap). The cross-field invariant recurrence_count >= last_acknowledged_count is enforced by the validator script (draft-07 cannot express it).",
+      "required": ["recurrence_id", "symptom_class_id", "recurrence_count", "last_acknowledged_count"],
+      "properties": {
+        "recurrence_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Stable, explicit identity of ONE underlying defect. The actual collapse key. Authored when a defect is first recognized as recurring."
+        },
+        "symptom_class_id": {
+          "type": "string",
+          "pattern": "^recurrence\\.v1/.+$",
+          "description": "Immutable, versioned taxonomy identifier aggregating the CLASS of symptom (e.g. recurrence.v1/<class>)."
+        },
+        "recurrence_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Total observations of this recurrence_id. The ack-pair invariant (recurrence_count >= last_acknowledged_count) is enforced by the validator script."
+        },
+        "last_acknowledged_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "recurrence_count at last disposition adjudication. A recurrence_count above this marks the entry unadjudicated (release-enforcement semantics, a later slice)."
+        },
+        "evidence": {
+          "type": "array",
+          "description": "Non-identity observations attached to the entry: paths, claim_ids, affected capabilities, outcomes, commit subjects/ranges, later root-cause findings.",
+          "items": {
+            "type": "object",
+            "required": ["kind", "ref"],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Discriminator for the evidence entry (e.g. path, claim_id, capability, outcome, commit_subject, commit_range)."
+              },
+              "ref": {
+                "type": "string",
+                "minLength": 1,
+                "description": "The evidence locator/value (a path, a claim id, a capability name, a commit subject/range, etc.)."
+              },
+              "note": {
+                "type": "string"
+              },
+              "capability": {
+                "type": "string"
+              },
+              "outcome": {
+                "type": "string"
+              },
+              "commit_subject": {
+                "type": "string"
+              },
+              "commit_range": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "aliases": {
+          "type": "array",
+          "description": "Alias/supersession reconciliation with structurally bounded items (item-shape, not cardinality) for an identity that must be re-pointed after later evidence.",
+          "items": {
+            "type": "object",
+            "required": ["recurrence_id"],
+            "properties": {
+              "recurrence_id": {
+                "type": "string",
+                "minLength": 1,
+                "description": "An alternate or superseded recurrence_id reconciled into this canonical entry."
+              },
+              "superseded": {
+                "type": "boolean",
+                "description": "True when this alias has been superseded by the canonical recurrence_id."
+              },
+              "note": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
     }
   },
   "allOf": [
