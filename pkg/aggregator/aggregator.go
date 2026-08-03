@@ -129,16 +129,21 @@ type Aggregator struct {
 	msgMu       sync.Mutex
 	msgInflight map[string]chan struct{}
 
-	// pageMu guards pageInflight. pageInflight[sid] is non-nil (open) while a
-	// Part B "past-resident older-page" fetch (EnsureOlderMessages, triggered by
-	// the boundary-demand handler) is in flight for that session. INDEPENDENT of
+	// pageMu guards pageInflight. pageInflight[sid] is non-nil while a Part B
+	// "past-resident older-page" fetch (EnsureOlderMessages, triggered by the
+	// boundary-demand handler) is in flight for that session. INDEPENDENT of
 	// msgInflight (the cold-load slot): an older-page fetch does NOT block or
 	// dedupe against a live cold-load, and vice versa. Collapses concurrent
 	// same-session "Load older" demands to ONE upstream
-	// GET /session/:id/message?before=<cursor> — concurrent callers wait for the
-	// winner's merge and return nil. Cleared on completion (success OR failure).
+	// GET /session/:id/message?before=<cursor>. A collapsed waiter blocks on the
+	// slot's done chan (broadcast-wake on winner completion) and PROPAGATES the
+	// winner's result error — nil on success, the MessagesBefore failure on
+	// failure — instead of unconditionally nil (P2-AGG-004: a collapsed waiter
+	// must learn of winner failure so the boundary-demand caller does not treat
+	// a failed older-page fetch as success). Cleared on completion (success OR
+	// failure).
 	pageMu       sync.Mutex
-	pageInflight map[string]chan struct{}
+	pageInflight map[string]*olderPageInflight
 
 	// msgGateHook (test-only, nil in production) is invoked once per
 	// EnsureMessages / EnsureMessagesAsync call immediately AFTER the unlocked
@@ -150,6 +155,18 @@ type Aggregator struct {
 	// the exact schedule the under-lock IsMessagesLoaded re-check must close.
 	// NOT guarded by a lock — install it once before any concurrent call.
 	msgGateHook func(sessionID string)
+
+	// pageGateHook (test-only, nil in production) is invoked once per
+	// EnsureOlderMessages call immediately AFTER a collapsed waiter finds a
+	// registered pageInflight slot and releases pageMu — i.e. at the instant it
+	// has committed to the collapse and is about to park on <-slot.done. A test
+	// blocks here to deterministically confirm the collapse (the waiter found
+	// the winner's slot) before releasing the winner, eliminating the scheduling
+	// race where the waiter might otherwise run its slot lookup only AFTER the
+	// winner's defer reclaimed the slot (turning a collapse into a fresh-winner
+	// re-fetch). Mirrors msgGateHook. NOT lock-guarded — install once before any
+	// concurrent call.
+	pageGateHook func(sessionID string)
 
 	// statusReconcileInterval is how often runStatusReconcile polls OpenCode's
 	// /session/status to self-heal a stale "busy" flag (see the doc block on
@@ -180,6 +197,24 @@ type Aggregator struct {
 	treeReconcileInterval time.Duration
 }
 
+// olderPageInflight is the single-flight slot for a Part-B older-page fetch
+// (EnsureOlderMessages). It carries BOTH the completion signal (done, closed by
+// the winner to broadcast-wake ALL collapsed waiters) AND the winner's
+// MessagesBefore result error (err, read by a woken waiter after <-done). The
+// err is published by the winner BEFORE close(done), so the happens-before edge
+// from the close to a waiter's <-done return guarantees the waiter observes it.
+//
+// A bare chan error CANNOT broadcast a non-nil error to N collapsed waiters — a
+// send delivers to exactly one receiver, and close yields the zero value (a nil
+// error) — so a pure chan error would either deadlock the 2nd+ waiter
+// (unbuffered send, no close) or hand it nil on winner-failure (buffered +
+// close). The slot struct is the idiomatic "broadcast a value" carrier
+// (P2-AGG-004).
+type olderPageInflight struct {
+	err  error
+	done chan struct{}
+}
+
 // DESIGN NOTE: state.New panic-translates the unreachable validate() error because
 // all production callers supply vhEventRingCapacity (4096). If aggregator construction
 // ever accepts a non-constant state.Config or operator-controlled ring capacity,
@@ -192,7 +227,7 @@ func New(baseURL string, ringCapacity int) *Aggregator {
 		client:                  opencode.New(baseURL),
 		store:                   state.New(ringCapacity),
 		msgInflight:             map[string]chan struct{}{},
-		pageInflight:            map[string]chan struct{}{},
+		pageInflight:            map[string]*olderPageInflight{},
 		statusReconcileInterval: 60 * time.Second,
 		treeReconcileInterval:   5 * time.Second,
 	}
@@ -207,7 +242,7 @@ func NewForDirectory(baseURL, directory string, ringCapacity int) *Aggregator {
 		client:                  c,
 		store:                   state.New(ringCapacity),
 		msgInflight:             map[string]chan struct{}{},
-		pageInflight:            map[string]chan struct{}{},
+		pageInflight:            map[string]*olderPageInflight{},
 		statusReconcileInterval: 60 * time.Second,
 		treeReconcileInterval:   5 * time.Second,
 	}

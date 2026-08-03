@@ -45,6 +45,16 @@ import (
 // lock-guarded — install once before any concurrent call.
 func (a *Aggregator) SetMsgGateHook(fn func(sessionID string)) { a.msgGateHook = fn }
 
+// SetPageGateHook installs a TEST-ONLY rendezvous callback fired once per
+// EnsureOlderMessages call immediately after a collapsed waiter finds a
+// registered pageInflight slot and releases pageMu — i.e. at the instant it has
+// committed to the collapse and is about to park on <-slot.done. A test blocks
+// in the callback to deterministically confirm the collapse before releasing
+// the winner (mirrors SetMsgGateHook). Nil (the default) is a no-op; production
+// code never sets it. Not lock-guarded — install once before any concurrent
+// call.
+func (a *Aggregator) SetPageGateHook(fn func(sessionID string)) { a.pageGateHook = fn }
+
 func decodeMessages(items []json.RawMessage) []state.MessageWithParts {
 	mwp := make([]state.MessageWithParts, 0, len(items))
 	for _, it := range items {
@@ -467,8 +477,10 @@ func (a *Aggregator) waitMessagesAsync(sessionID string) {
 // Contract:
 //   - (a) Single-flight: a DEDICATED pageInflight[sessionID] slot (INDEPENDENT of
 //     the cold-load msgInflight) collapses concurrent same-session "Load older"
-//     demands — concurrent callers wait for the winner's merge and return nil.
-//     It does NOT block or dedupe against a live cold-load.
+//     demands — concurrent callers wait for the winner's merge and PROPAGATE the
+//     winner's result error (nil on winner success, the winner's fetch failure
+//     on winner failure — P2-AGG-004). It does NOT block or dedupe against a
+//     live cold-load.
 //   - (b) Locking: the fetch is lock-free; Store.MergeOlderMessages takes s.mu
 //     internally. No network I/O under any store lock.
 //   - The fetch ctx is bound to the AGGREGATOR's lifetime (a.runCtx), NOT the
@@ -478,25 +490,45 @@ func (a *Aggregator) waitMessagesAsync(sessionID string) {
 //
 // anchorID/anchorTimeMs identify the OLDEST resident message (the cursor anchor);
 // the cursor token is built via opencode.EncodeMessageCursor (the full (id,
-// time_created) tuple; a raw id alone 400s). Returns nil on success OR when
-// collapsed onto an in-flight demand; a non-nil error only on fetch failure.
+// time_created) tuple; a raw id alone 400s). Returns nil on success. A collapsed
+// waiter (a concurrent caller that found an in-flight demand) PROPAGATES the
+// winner's result error instead of returning nil unconditionally (P2-AGG-004),
+// so the boundary-demand caller (pkg/web/messages_http.go) does not treat a
+// failed older-page fetch as success.
 func (a *Aggregator) EnsureOlderMessages(sessionID, anchorID string, anchorTimeMs float64) error {
 	a.pageMu.Lock()
-	if done, ok := a.pageInflight[sessionID]; ok {
+	if slot, ok := a.pageInflight[sessionID]; ok {
+		// Collapse: a concurrent older-page fetch is in flight. Wait for it to
+		// complete (broadcast-wake via close(slot.done)), then PROPAGATE its
+		// result error — nil on winner success, the winner's MessagesBefore
+		// failure on winner failure — instead of returning nil unconditionally.
+		// Before P2-AGG-004 this branch did `<-done; return nil`, so a winner
+		// whose upstream GET ?before=<cursor> failed still woke its collapsed
+		// waiter to a success-shaped nil; the HTTP boundary-demand handler
+		// (pkg/web/messages_http.go) then re-projected as if the older page had
+		// merged. slot.err is published by the winner BEFORE close(slot.done),
+		// so reading it after <-slot.done is happens-before-correct.
 		a.pageMu.Unlock()
-		<-done // collapse: a concurrent older-page fetch is in flight; its merge suffices
-		return nil
+		// pageGateHook (test-only, nil in production): rendezvous right after the
+		// waiter committed to the collapse (released pageMu, about to park on
+		// <-slot.done) so a test can deterministically confirm the collapse
+		// before releasing the winner. Mirrors SetMsgGateHook.
+		if a.pageGateHook != nil {
+			a.pageGateHook(sessionID)
+		}
+		<-slot.done
+		return slot.err
 	}
-	done := make(chan struct{})
-	a.pageInflight[sessionID] = done
+	slot := &olderPageInflight{done: make(chan struct{})}
+	a.pageInflight[sessionID] = slot
 	a.pageMu.Unlock()
 	defer func() {
 		a.pageMu.Lock()
-		if a.pageInflight[sessionID] == done {
+		if a.pageInflight[sessionID] == slot {
 			delete(a.pageInflight, sessionID)
 		}
 		a.pageMu.Unlock()
-		close(done)
+		close(slot.done)
 	}()
 
 	// Bound the page to the cold-load window size (one older page == one tail).
@@ -509,6 +541,11 @@ func (a *Aggregator) EnsureOlderMessages(sessionID, anchorID string, anchorTimeM
 	cursor := opencode.EncodeMessageCursor(anchorID, anchorTimeMs)
 	items, nextCursor, err := a.client.MessagesBefore(fetchCtx, sessionID, cursor, state.WindowMaxCount)
 	if err != nil {
+		// Publish the failure to any collapsed waiter BEFORE the defer closes
+		// slot.done (the defer runs on this return). The close wakes the waiter;
+		// it reads slot.err and propagates the SAME failure instead of nil
+		// (P2-AGG-004).
+		slot.err = err
 		return err
 	}
 	a.store.MergeOlderMessages(sessionID, decodeMessages(items), nextCursor == "")
