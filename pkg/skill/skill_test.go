@@ -1,10 +1,14 @@
 package skill
 
 import (
+	"bytes"
+	"context"
 	"os"
+	"os/exec"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/vhqtvn/vh-solara/pkg/mcp"
 	"github.com/vhqtvn/vh-solara/pkg/state"
@@ -74,6 +78,45 @@ func TestGenerateIsVersionStampedAndFromLiveSurface(t *testing.T) {
 	}
 }
 
+// gateAction is the decision the env-driven deny-list gate makes after reading
+// GITHUB_ACTIONS, VH_CI_TRUSTED, and VH_SKILL_BANNED_TOKENS. It is extracted as a
+// PURE function so the decision table (TestDecideGateAction) can prove every
+// branch — including gateFatal, whose env combo (GITHUB_ACTIONS=true +
+// VH_CI_TRUSTED=true) never exists in a local `go test` and is therefore
+// otherwise unreachable in-process. TestGenerateHasNoBannedTokens routes its
+// skip/fatal/scan switching through this helper, so the table test and the
+// subprocess reentry tests exercise the identical branching (one source of
+// truth). Routing through it is behavior-preserving vs the prior inline
+// if/skip/fatal.
+type gateAction int
+
+const (
+	// gateSkip: deny-list unset AND not a trusted-CI context → preserve the
+	// local/fork-PR convenience skip.
+	gateSkip gateAction = iota
+	// gateFatal: deny-list unset AND trusted-CI → fail loud so an unconfigured CI
+	// cannot pass as if it had scanned (forces the operator to wire the
+	// VH_SKILL_BANNED_TOKENS repo secret).
+	gateFatal
+	// gateScan: deny-list SET → always scan the generated doc for every listed
+	// token, regardless of CI flags.
+	gateScan
+)
+
+// decideGateAction is the pure, env-free form of the deny-list gate predicate.
+// denyListSet means VH_SKILL_BANNED_TOKENS is non-empty. githubActions and
+// vhCITrusted mirror os.Getenv(...)=="true" for the two CI-trust signals.
+func decideGateAction(githubActions, vhCITrusted, denyListSet bool) gateAction {
+	switch {
+	case denyListSet:
+		return gateScan
+	case githubActions && vhCITrusted:
+		return gateFatal
+	default:
+		return gateSkip
+	}
+}
+
 // TestGenerateHasNoBannedTokens guards the anonymization invariant: the
 // generated skill doc must never reference any adopter/customer. The guard has
 // two halves. (1) A sentinel self-check runs UNCONDITIONALLY — it injects a
@@ -93,6 +136,15 @@ func TestGenerateIsVersionStampedAndFromLiveSurface(t *testing.T) {
 // which is the intended forcing function, not a bug. Net: the scanner is
 // machine-enforced by default; the customer-token deny-list is
 // operator/CI-enforced once the secret exists (trusted CI contexts only).
+//
+// Coverage of the env-predicate branches: the decision logic is proved for all
+// four branches by TestDecideGateAction (in-process table over every input
+// combo, including the trusted-Fatal branch that is unreachable in a local
+// run). The trusted-Fatal t.Fatal and the deny-list-hit t.Fatalf are then
+// exercised END-TO-END (non-zero exit + expected message) by the
+// TestGenerateHasNoBannedTokensTrustedCIFatal and
+// TestGenerateHasNoBannedTokensDenyListHit subprocess reentry tests, since
+// their env combos never exist under a plain `go test`.
 func TestGenerateHasNoBannedTokens(t *testing.T) {
 	out := Generate("v-test")
 
@@ -140,22 +192,162 @@ func TestGenerateHasNoBannedTokens(t *testing.T) {
 	// Env-driven deny-list. Operators set VH_SKILL_BANNED_TOKENS (comma-separated)
 	// locally / in CI to enforce the customer-token deny-list. The env-var NAME
 	// carries no customer token; the VALUES are never committed in source.
+	//
+	// The skip/fatal/scan decision is routed through the pure decideGateAction so
+	// TestDecideGateAction and the subprocess reentry tests exercise the same
+	// logic — including the trusted-Fatal branch that is unreachable in a local
+	// run (its GITHUB_ACTIONS=true + VH_CI_TRUSTED=true combo never exists here).
 	banned := os.Getenv("VH_SKILL_BANNED_TOKENS")
-	if banned == "" {
-		// In a trusted CI context (GitHub Actions on a push or same-repo PR,
-		// signalled by VH_CI_TRUSTED=="true") an unset deny-list FAILS LOUD so
-		// an unconfigured CI cannot pass as if it had scanned. Locally we
-		// preserve the convenience skip. Fork PRs (VH_CI_TRUSTED unset/false)
-		// also skip: GitHub intentionally withholds the repo secret there, so
-		// failing would make every external fork PR permanently red. CI
-		// enforcement of the deny-list begins once the operator creates the
-		// secret; the test then has the trust signal AND the secret together.
-		if os.Getenv("GITHUB_ACTIONS") == "true" && os.Getenv("VH_CI_TRUSTED") == "true" {
-			t.Fatal("VH_SKILL_BANNED_TOKENS unset in a trusted CI context (push / same-repo PR) — create the repo secret so the customer-token deny-list runs on every build; no token is committed in source")
-		}
+	switch decideGateAction(
+		os.Getenv("GITHUB_ACTIONS") == "true",
+		os.Getenv("VH_CI_TRUSTED") == "true",
+		banned != "",
+	) {
+	case gateFatal:
+		t.Fatal("VH_SKILL_BANNED_TOKENS unset in a trusted CI context (push / same-repo PR) — create the repo secret so the customer-token deny-list runs on every build; no token is committed in source")
+	case gateSkip:
 		t.Skip("VH_SKILL_BANNED_TOKENS unset — set it locally to enforce the customer-token deny-list, or this is an untrusted/fork CI context where the secret is intentionally withheld (no token is committed in source)")
+	case gateScan:
+		if hit, found := scanBanned(out, strings.Split(banned, ",")); found {
+			t.Fatalf("generated skill contains banned token %q — the doc must stay customer-agnostic", hit)
+		}
+	default:
+		// Defensive: decideGateAction is exhaustive over the gateAction enum today,
+		// but a future constant added without updating this switch would otherwise
+		// silently fall through. Fail loud so the switch stays in sync with the enum.
+		t.Fatalf("unexpected gateAction %d from decideGateAction (switch out of sync with gateAction enum)", decideGateAction(
+			os.Getenv("GITHUB_ACTIONS") == "true",
+			os.Getenv("VH_CI_TRUSTED") == "true",
+			banned != "",
+		))
 	}
-	if hit, found := scanBanned(out, strings.Split(banned, ",")); found {
-		t.Fatalf("generated skill contains banned token %q — the doc must stay customer-agnostic", hit)
+}
+
+// TestDecideGateAction is the in-process, exhaustive decision-table proof
+// (option a) for the deny-list gate predicate. It covers all 8 input
+// combinations, including gateFatal (trusted-CI + unset deny-list) whose env
+// combo never exists in a local `go test` — so without this table the fatal
+// branch is only reachable via the subprocess reentry below. Catches
+// regressions like fatal-on-fork-PR or skip-on-trusted-CI.
+func TestDecideGateAction(t *testing.T) {
+	tests := []struct {
+		name          string
+		githubActions bool
+		vhCITrusted   bool
+		denyListSet   bool
+		want          gateAction
+	}{
+		{name: "local-skip", githubActions: false, vhCITrusted: false, denyListSet: false, want: gateSkip},
+		{name: "fork-PR-skip", githubActions: true, vhCITrusted: false, denyListSet: false, want: gateSkip},
+		{name: "trusted-only-skip", githubActions: false, vhCITrusted: true, denyListSet: false, want: gateSkip},
+		{name: "trusted-CI-fatal", githubActions: true, vhCITrusted: true, denyListSet: false, want: gateFatal},
+		{name: "deny-set-local", githubActions: false, vhCITrusted: false, denyListSet: true, want: gateScan},
+		{name: "deny-set-fork-PR", githubActions: true, vhCITrusted: false, denyListSet: true, want: gateScan},
+		{name: "deny-set-trusted-only", githubActions: false, vhCITrusted: true, denyListSet: true, want: gateScan},
+		{name: "deny-set-trusted-CI", githubActions: true, vhCITrusted: true, denyListSet: true, want: gateScan},
 	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := decideGateAction(tt.githubActions, tt.vhCITrusted, tt.denyListSet); got != tt.want {
+				t.Fatalf("decideGateAction(githubActions=%v, vhCITrusted=%v, denyListSet=%v) = %v; want %v",
+					tt.githubActions, tt.vhCITrusted, tt.denyListSet, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestGenerateHasNoBannedTokensTrustedCIFatal is the end-to-end subprocess proof
+// (option b, the crux) that the trusted-CI t.Fatal branch of
+// TestGenerateHasNoBannedTokens actually fires: non-zero exit + the expected
+// message. It re-runs the test binary as a subprocess under the
+// GITHUB_ACTIONS=true + VH_CI_TRUSTED=true combo with an UNSET deny-list — an
+// env combo that never exists in a local `go test`, so without this reentry the
+// Fatal branch is only "covered" by a real trusted-CI run going red. This is
+// the test that satisfies the card's ready_criteria[3] (fatal path exercised
+// end-to-end, not just manually).
+func TestGenerateHasNoBannedTokensTrustedCIFatal(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0],
+		"-test.run=^TestGenerateHasNoBannedTokens$", "-test.v")
+	// Controlled env: trusted-CI combo + deny-list UNSET. Inherit a clean
+	// baseline (PATH/HOME/etc.) with the three gate-relevant vars stripped so the
+	// parent's environment can never leak in (e.g. if run inside a real CI).
+	cmd.Env = append(envWithout("VH_SKILL_BANNED_TOKENS", "GITHUB_ACTIONS", "VH_CI_TRUSTED"),
+		"GITHUB_ACTIONS=true",
+		"VH_CI_TRUSTED=true",
+	)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("trusted-CI subprocess exited zero; want non-zero (the t.Fatal branch should have fired)\ncombined output:\n%s", out)
+	}
+	const wantMsg = "VH_SKILL_BANNED_TOKENS unset in a trusted CI context"
+	if !bytes.Contains(out, []byte(wantMsg)) {
+		t.Fatalf("trusted-CI subprocess output missing expected fatal message %q\ncombined output:\n%s", wantMsg, out)
+	}
+	// Guard against a regression where the branch accidentally skips instead of
+	// fatals: a skip is exit-zero with a PASS banner for the matched test.
+	if bytes.Contains(out, []byte("--- PASS: TestGenerateHasNoBannedTokens")) {
+		t.Fatalf("trusted-CI subprocess PASSED the gate test; want FAIL (fatal)\ncombined output:\n%s", out)
+	}
+}
+
+// TestGenerateHasNoBannedTokensDenyListHit is the end-to-end subprocess proof of
+// the sad-path: when the deny-list is SET and a banned token is present in the
+// generated skill, the t.Fatalf scan-hit branch fires (non-zero exit + expected
+// message). It re-runs the test binary with VH_SKILL_BANNED_TOKENS set to a
+// SYNTHETIC token that is verifiably present in Generate's output — honoring the
+// anonymization constraint (never a real customer token). CI-trust flags are
+// left unset so the gate routes to the scan branch purely via the deny-list.
+func TestGenerateHasNoBannedTokensDenyListHit(t *testing.T) {
+	// Synthetic stand-in for a real customer token. "vh-solara" is (a) obviously
+	// not a real secret and (b) guaranteed present in Generate's output (the
+	// product name is stamped throughout), so the scanner reliably catches it.
+	// Verify presence up front so a future Generate change fails THIS test
+	// clearly instead of the subprocess exiting zero silently.
+	const syntheticBanned = "vh-solara"
+	if !strings.Contains(strings.ToLower(Generate("v-test")), syntheticBanned) {
+		t.Fatalf("synthetic stand-in token %q is no longer present in Generate output; pick another stable substring", syntheticBanned)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0],
+		"-test.run=^TestGenerateHasNoBannedTokens$", "-test.v")
+	cmd.Env = append(envWithout("VH_SKILL_BANNED_TOKENS", "GITHUB_ACTIONS", "VH_CI_TRUSTED"),
+		"VH_SKILL_BANNED_TOKENS="+syntheticBanned,
+	)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("deny-list sad-path subprocess exited zero; want non-zero (the scan-hit t.Fatalf should have fired)\ncombined output:\n%s", out)
+	}
+	const wantSub = "generated skill contains banned token"
+	if !bytes.Contains(out, []byte(wantSub)) {
+		t.Fatalf("deny-list sad-path subprocess output missing expected fatalf message %q\ncombined output:\n%s", wantSub, out)
+	}
+	if !bytes.Contains(out, []byte(syntheticBanned)) {
+		t.Fatalf("deny-list sad-path subprocess output missing the matched token %q in the failure message\ncombined output:\n%s", syntheticBanned, out)
+	}
+}
+
+// envWithout returns os.Environ() filtered to remove the named keys, so a
+// subprocess reentry starts from a clean baseline for the gate-relevant env
+// vars (no leakage of the parent's VH_SKILL_BANNED_TOKENS / CI-trust flags into
+// the child). The child still inherits PATH/HOME/etc. needed to run.
+func envWithout(names ...string) []string {
+	drop := make(map[string]struct{}, len(names))
+	for _, n := range names {
+		drop[n] = struct{}{}
+	}
+	cleaned := make([]string, 0, len(os.Environ()))
+	for _, kv := range os.Environ() {
+		key := kv
+		if i := strings.IndexByte(kv, '='); i >= 0 {
+			key = kv[:i]
+		}
+		if _, ok := drop[key]; ok {
+			continue
+		}
+		cleaned = append(cleaned, kv)
+	}
+	return cleaned
 }
