@@ -320,8 +320,11 @@ export function applySessionSnapshot(id: string, snap: Snapshot) {
   // (sesSnapshotDecoding, stream.ts:~2186) protects live events landing DURING
   // the gzip64 decode; THIS guard closes the residual gap — live data ALREADY in
   // the store when a stale snapshot lands. Reuses prependMessagesIfAbsent (the
-  // Phase-4 historical-page idiom): insert snapshot items that are ABSENT, NEVER
-  // touch an existing byId entry. Cold/warm first hydrate is unaffected —
+  // Phase-4 historical-page idiom): insert snapshot items that are ABSENT; an
+  // existing byId entry is left untouched (live always wins) EXCEPT the
+  // upgrade-on-completed path (reduce.ts:123-136), which replaces the resident
+  // info when the incoming copy is completed (terminal/immutable — safe against
+  // live). Cold/warm first hydrate is unaffected —
   // messages[id] is empty so every item is absent (equivalent to the old
   // buildMessages wholesale-replace). A seq/revision guard was considered but
   // rejected: the store tracks no per-session last-applied seq (only the shared

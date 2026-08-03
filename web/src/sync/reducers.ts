@@ -254,8 +254,11 @@ export function projectMessageEvent(
         const items = payload.messages || [];
         // MERGE, not wholesale-replace. A live message.upsert/part.upsert for
         // this session can land on Stream-2 BEFORE the batch's gzip64 decode
-        // resolves. prependMessagesIfAbsent inserts batch items that are ABSENT
-        // and NEVER touches an existing byId entry, so live always wins.
+        // resolves. prependMessagesIfAbsent inserts batch items that are ABSENT;
+        // it leaves existing byId entries untouched (live always wins) EXCEPT
+        // the upgrade-on-completed path (reduce.ts:123-136), which replaces a
+        // resident entry's info when the incoming copy is completed (terminal/
+        // immutable — safe against live). A non-completed copy never wins.
         if (!s.messages[payload.sessionID]) {
           s.messages[payload.sessionID] = { order: [], byId: {} };
         }

@@ -139,6 +139,66 @@ describe("prependMessagesIfAbsent — upgrade-on-completed", () => {
     expect(sm.byId["m1"].info.time?.completed).toBeUndefined();
   });
 
+  it("re-slots a resident PLACEHOLDER lacking time.created to its correct position on upgrade", () => {
+    // A resident placeholder created by upsertPart (a part arrived before
+    // message.updated) has NO time.created — it sorts as 0 (front of order).
+    // An incoming COMPLETED copy carrying time.created must trigger the upgrade
+    // path (reduce.ts:123-136) AND the post-upgrade sortMessages (reduce.ts:152)
+    // must re-slot the resident to its real creation-time position. This is the
+    // sort-reorder case the created:10-only resident above does NOT exercise.
+    const p2Ref = { id: "p2", sessionID: "s", messageID: "m2", type: "text", text: "placeholder" };
+    const sm: SessionMessages = {
+      // m2 placeholder lacks time.created → sorts as 0 → front (WRONG slot).
+      order: ["m2", "m1", "m3"],
+      byId: {
+        m2: {
+          id: "m2",
+          // NO time field — a placeholder created by upsertPart (reduce.ts:33-42).
+          info: { id: "m2", sessionID: "s", role: "assistant" },
+          partOrder: ["p2"],
+          parts: { p2: p2Ref },
+        },
+        m1: {
+          id: "m1",
+          info: { id: "m1", sessionID: "s", role: "user", time: { created: 10 } },
+          partOrder: [],
+          parts: {},
+        },
+        m3: {
+          id: "m3",
+          info: { id: "m3", sessionID: "s", role: "assistant", time: { created: 20 } },
+          partOrder: [],
+          parts: {},
+        },
+      },
+    };
+    // Sanity: the placeholder currently sits at the FRONT (wrong slot) because
+    // its missing time.created sorts as 0.
+    expect(sm.order[0]).toBe("m2");
+
+    // Incoming completed copy for the placeholder carries time.created=15 →
+    // after upgrade it belongs BETWEEN m1(10) and m3(20).
+    const added = prependMessagesIfAbsent(sm, [
+      {
+        info: { id: "m2", sessionID: "s", role: "assistant", time: { created: 15, completed: 16 } },
+        parts: [{ id: "p2", sessionID: "s", messageID: "m2", type: "text", text: "completed" }],
+      },
+    ]);
+
+    // Upgrade is NOT an insert → return count stays 0 (oldestResident/hasOlder
+    // bookkeeping in history.ts must not see an upgrade as an insert).
+    expect(added).toBe(0);
+    // info upgraded to the completed copy (now carries time.created=15).
+    expect(sm.byId["m2"].info.time?.created).toBe(15);
+    expect(sm.byId["m2"].info.time?.completed).toBe(16);
+    // existing part updated IN PLACE (same object reference kept).
+    expect(sm.byId["m2"].parts["p2"]).toBe(p2Ref);
+    expect(sm.byId["m2"].parts["p2"].text).toBe("completed");
+    // CRUX: post-upgrade sortMessages (reduce.ts:152) re-slotted m2 from the
+    // front (created=0 fallback) to its real creation-time slot between m1 and m3.
+    expect(sm.order).toEqual(["m1", "m2", "m3"]);
+  });
+
   it("still inserts ABSENT messages and returns the insert count (base behavior intact)", () => {
     const sm = partialResident();
     const added = prependMessagesIfAbsent(sm, [

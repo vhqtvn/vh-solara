@@ -46,7 +46,9 @@
 //     keeps the live tail); the sticky evictedHistory flag ORs into hasOlder so the
 //     Load-older button re-appears for evicted messages.
 //   - §5d#2 (live always wins): applyPageMerge uses prependMessagesIfAbsent
-//     (insert-if-not-present, NEVER touch an existing byId entry).
+//     (insert-if-not-present; an existing byId entry is left untouched EXCEPT
+//     the upgrade-on-completed path, reduce.ts:123-136, which replaces a
+//     resident entry's info when the incoming copy is completed).
 //
 // Callers (preserved by stream.ts re-exports — see the import/re-export block there):
 //   - ChatView: loadOlder(sid) on the IntersectionObserver sentinel + "Load older" button.
@@ -394,7 +396,9 @@ export function isPageDirtyingKind(kind: string): boolean {
 }
 
 // applyPageMerge — the clean-response merge. Inserts page messages that are NOT
-// already resident (live always wins — NEVER touch existing byId entries),
+// already resident (live always wins — existing byId entries are left untouched
+// EXCEPT the upgrade-on-completed path, reduce.ts:123-136, which replaces a
+// resident entry's info when the incoming copy is completed),
 // updates oldestResidentID + hasOlder from the server's page meta, and evicts
 // from the oldest end if resident caps are exceeded. Mutates the store via
 // produce() so Solid's reactivity propagates the prepend + the window-state
