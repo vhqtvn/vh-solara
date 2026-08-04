@@ -679,8 +679,8 @@ type Store struct {
 	// observed-vs-inferred line that runs through every correctness lesson in
 	// this repo.
 	//
-	// Mechanically: set ONLY by a live session.idle event (the AUTHORITATIVE
-	// terminal), NOT by graceFire (an INFERENCE of completion); distinct from
+	// Mechanically: set by a live session.idle OR session.error event (both
+	// OBSERVED terminals), NOT by graceFire (an INFERENCE of completion); distinct from
 	// completionAuthoritative (set by BOTH session.idle and graceFire, used for
 	// the stale-busy guard). Cleared by an authoritative new turn
 	// (markTurnRunningLocked). See upsertMessageLocked.

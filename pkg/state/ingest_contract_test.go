@@ -25,25 +25,25 @@ import "testing"
 // into slice #3.
 //
 // session.error is a turn TERMINAL — it routes to settleTerminalLocked exactly
-// like session.idle (reducers.go:432-436). But the #2696 guard in
-// upsertMessageLocked (reducers.go:927) keys on liveIdleObserved, which
-// session.idle arms (reducers.go:426) and session.error does NOT. So the guard
-// covers ONE of TWO OBSERVED terminals today: a post-session.error MUTABLE
-// assistant message re-opens the turn (re-escalates activity to busy) — the
+// like session.idle. Pre-F4, the #2696 guard in upsertMessageLocked keyed on
+// liveIdleObserved, which session.idle armed but session.error did NOT, so the
+// guard covered ONE of TWO OBSERVED terminals: a post-session.error MUTABLE
+// assistant message re-opened the turn (re-escalated activity to busy) — the
 // exact #2696 trap (OpenCode stamps its fs-snapshot diff onto a message AFTER
 // the turn ended).
 //
-// This test is RED TODAY because the guard is absent on the session.error path:
-// the late inflight after session.error re-escalates to ActivityBusy. Phase 2
-// (the rewire + F4 fold) arms liveIdleObserved on session.error too — extending
-// OBSERVED-terminal coverage from {session.idle} to {session.idle,
-// session.error} — and turns this green. (graceFire stays OUT of the guard by
-// design: it is an INFERRED terminal, and the principle is "never BLOCK a turn
-// on an inference." F4 extends OBSERVED coverage only.)
+// This test was RED pre-fold (the guard was absent on the session.error path:
+// the late inflight after session.error re-escalated to ActivityBusy). The F4
+// fold arms liveIdleObserved on session.error too — extending OBSERVED-terminal
+// coverage from {session.idle} to {session.idle, session.error} — and turned
+// this GREEN. (graceFire stays OUT of the guard by design: it is an INFERRED
+// terminal, and the principle is "never BLOCK a turn on an inference." F4
+// extends OBSERVED coverage only.)
 //
 // Sibling: TestP7_PostIdleMutableMessageDoesNotReopenTurn (turn_state_test.go)
-// is the session.idle analog — GREEN today (the guard exists there). This test
-// is its session.error twin, RED today (the gap).
+// is the session.idle analog (the guard already existed there). This test is
+// its session.error twin — GREEN now that the fold arms both OBSERVED
+// terminals.
 func TestP7Fold_PostErrorMutableMessageDoesNotReopenTurn(t *testing.T) {
 	s := New(100)
 	defer s.Close()
@@ -55,21 +55,22 @@ func TestP7Fold_PostErrorMutableMessageDoesNotReopenTurn(t *testing.T) {
 	assertTurn(t, s, "R", TurnRunning, "turn running (authoritative busy)")
 
 	// The turn ends in ERROR. session.error is a TERMINAL (settleTerminalLocked),
-	// so TurnRunning → TurnIdle. But — the gap — it does NOT arm liveIdleObserved
-	// (only session.idle does today).
+	// so TurnRunning → TurnIdle. Post-fold it ALSO arms liveIdleObserved (both
+	// OBSERVED terminals — session.idle AND session.error — arm it now).
 	s.Apply(ev("session.error", `{"sessionID":"R","status":{"type":"error"}}`))
 	assertTurn(t, s, "R", TurnIdle, "session.error is a terminal → TurnIdle")
 
 	// A MUTABLE assistant message arrives AFTER the terminal — the #2696 trap.
 	// The guard MUST refuse to re-open the turn, exactly as it does after
-	// session.idle. Today it does NOT (liveIdleObserved is false after
-	// session.error), so the late inflight re-escalates to ActivityBusy.
+	// session.idle: session.error arms liveIdleObserved too (post-fold), so the
+	// late inflight must NOT re-escalate to ActivityBusy.
 	s.Apply(ev("message.updated", evAssistantInflight("R", "m_late")))
 
 	if got := s.Snapshot(nil).Activity["R"]; got == ActivityBusy {
-		t.Errorf("F4 gap: late inflight after session.error re-escalated activity to %q — "+
-			"the #2696 guard must cover session.error terminals too (it covers "+
-			"session.idle today via liveIdleObserved, but NOT session.error)", got)
+		t.Errorf("F4 regression: late inflight after session.error re-escalated activity to %q — "+
+			"the #2696 guard covers BOTH OBSERVED terminals (session.idle AND "+
+			"session.error) via liveIdleObserved, so a post-session.error "+
+			"mutable message must NOT re-open the turn", got)
 	}
 	assertTurn(t, s, "R", TurnIdle,
 		"F4 gap: late inflight after session.error must not re-open the turn")

@@ -1,9 +1,10 @@
 // Package state: the reducers concern — the WRITE path of the store,
 // mechanically extracted from store.go (reference model: snapshots.go,
 // subscriptions.go, message_window.go, subtree_indexes.go). This file owns:
-//   - Apply, the single ingress for live OpenCode SSE events, which switches on
-//     ev.Type and routes to the *Locked mutators below (all under the held write
-//     lock);
+//   - Apply, the single ingress for live OpenCode SSE events, which routes raw
+//     events through the versioned Translator (translate.go) and switches on
+//     NormalizedEvent.Kind, routing to the *Locked mutators below (all under
+//     the held write lock);
 //   - the session/message/part *Locked mutators Apply routes to
 //     (upsertSessionLocked / deleteSessionLocked / upsertMessageLocked /
 //     deleteMessageLocked / upsertPartLocked / deletePartLocked /
@@ -893,10 +894,11 @@ func (s *Store) upsertMessageLocked(info json.RawMessage) {
 				// recorded above (upsertMessageLocked); only the activity
 				// escalation is refused.
 				//
-				// liveIdleObserved is session.idle-ONLY (NOT set by graceFire): a
-				// grace-fired completion is an INFERENCE, where a subsequent
-				// inflight is a genuine new turn (the multi-turn grace cycle), not
-				// the trap. This keeps the completion-grace strand fix (grace→idle
+				// liveIdleObserved is set by OBSERVED terminals only (session.idle
+				// AND session.error — NOT set by graceFire): a grace-fired
+				// completion is an INFERENCE, where a subsequent inflight is a
+				// genuine new turn (the multi-turn grace cycle), not the trap.
+				// This keeps the completion-grace strand fix (grace→idle
 				// →new-inflight re-arms busy) intact while closing the #2696 hole.
 			} else {
 				// An in-flight assistant message is generating right now: assert
