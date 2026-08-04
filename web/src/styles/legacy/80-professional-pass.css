@@ -312,6 +312,15 @@ div.katex-math { display: block; overflow-x: auto; margin: 0.7em 0; text-align: 
   white-space: pre-wrap;
   word-break: break-word;
   overflow-wrap: anywhere;
+  /* Reserve the scrollbar gutter on BOTH layers so the transparent textarea
+     and the highlight mirror always share an identical content width. Without
+     this, once the prompt overflows max-height the textarea's space-taking
+     scrollbar steals width that the overflow:hidden mirror never loses, so the
+     two wrap at different columns and the caret drifts off the highlighted
+     glyph (up to ~450px horiz / ~42px vert). Cost: ~7-10px of text width and a
+     narrow empty strip on the right when text is short — the intended trade for
+     keeping a scroll indicator in a 200px box. No GPU hazard (plain layout). */
+  scrollbar-gutter: stable;
 }
 .composer-mirror {
   position: absolute;
