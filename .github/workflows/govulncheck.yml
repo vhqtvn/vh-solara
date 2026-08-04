@@ -1,0 +1,50 @@
+# Scheduled, non-blocking govulncheck scan.
+#
+# Triggered ONLY by a weekly cron + manual `workflow_dispatch` — it NEVER runs
+# on push/PR, so it never gates a change. Govulncheck findings are dependency /
+# stdlib-level (the tool scans the module graph), virtually never caused by the
+# diff of the PR under test; gating PRs on it would couple unrelated failures
+# to whatever change happened to land the day a CVE was filed. A weekly cadence
+# converts what used to be a quarterly-manual, one-dependency-at-a-time check
+# into a mechanical every-dependency check. A scheduled red is visible but inert
+# against any individual change. Use the manual `workflow_dispatch` trigger to
+# observe a run on demand after a `go get -u` or a public CVE advisory.
+#
+# govulncheck itself is pinned to a reviewed version (not `@latest`) for
+# supply-chain hygiene and run-to-run reproducibility — every other execution
+# dependency in this workflow is SHA-pinned too. Bump the pin deliberately when
+# advancing the scanner; the vuln DATABASE it reads still updates continuously
+# (default Go vuln DB at vuln.go.dev), so a pinned binary still scans against
+# the freshest advisories.
+name: govulncheck
+
+on:
+  schedule:
+    # Every Monday 06:00 UTC.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+      - name: install govulncheck
+        run: |
+          # Pinned (see header). Bump deliberately when advancing the scanner;
+          # the vuln DB it scans against still updates continuously.
+          go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: govulncheck ./...
+        # Exits non-zero if vulnerabilities are found. On the scheduled run that
+        # red is intentional and visible — it surfaces the finding without ever
+        # gating a PR (this workflow has no push/PR trigger).
+        run: govulncheck ./...

@@ -1,0 +1,68 @@
+# Scheduled, non-blocking e2e flake characterization.
+#
+# Triggered ONLY by a weekly cron + manual `workflow_dispatch` — it NEVER runs
+# on push/PR, so it never gates a change. The point is to GENERATE pass/fail
+# ratio data for the known CI-only flake-prone specs (the terminal PTY-
+# contamination flake and the scroll-follow flake). Both reproduce only under
+# CI's heavy/serial load, not in a clean dev run, so a deadlocked DEFER card
+# had no way to gather the ratio from local attempts. Running `--repeat-each=10`
+# weekly against exactly those two specs produces the convergence data that the
+# merged `e2e-demo-flakiness` DEFER card tracks: close that card after N
+# consecutive clean weekly runs. A non-zero exit (flake surfaces) fails the
+# scheduled run loudly so the flake stays observable — do NOT add
+# `continue-on-error`; the failures ARE the signal. Staggered ~1h after the
+# govulncheck cron so the two weekly scans don't contend for runners.
+name: e2e-flake-watch
+
+on:
+  schedule:
+    # Every Monday 07:00 UTC (1h after govulncheck at 06:00 UTC).
+    - cron: "0 7 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  flake-probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: install deps
+        working-directory: web
+        run: npm ci
+      - name: install Playwright browser
+        working-directory: web
+        run: npx playwright install --with-deps chromium firefox
+      - name: flake-probe (terminal + scroll-follow, repeat-each=10, no retries)
+        working-directory: web
+        env:
+          # Override playwright.config.ts `retries: process.env.CI ? 2 : 0`:
+          # flakes must surface, not be masked by CI retries.
+          CI: "1"
+        # webServer in playwright.config.ts auto-starts scripts/fixture-web.sh,
+        # which builds the SPA and runs ./tools/fixtureserver (real aggregator +
+        # fake OpenCode) — so Go must be on PATH (provided by setup-go above).
+        # No `continue-on-error`: a flake surfacing is the signal this job
+        # exists to produce, never a PR gate (no push/PR trigger).
+        run: npx playwright test terminal.spec.ts scroll-follow.spec.ts --repeat-each=10 --retries=0
+      - name: upload Playwright artifacts
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: playwright-flake-probe
+          # Mirrors the CI e2e job's artifact root (see web/playwright.config.ts
+          # `artifactRoot`, overridable via PLAYWRIGHT_ARTIFACTS_DIR).
+          path: tmp/agent-runs/playwright
+          retention-days: 14
+          if-no-files-found: warn
