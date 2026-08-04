@@ -7,3 +7,5 @@ runtime:
 # lifecycle: {}     # hooks are scripts/ pointers; absent = no-op
 # runners: {}
 # verbs: {}
+exec_sandbox:
+  min_mode: strict
