@@ -73,5 +73,5 @@ func TestP7Fold_PostErrorMutableMessageDoesNotReopenTurn(t *testing.T) {
 			"mutable message must NOT re-open the turn", got)
 	}
 	assertTurn(t, s, "R", TurnIdle,
-		"F4 gap: late inflight after session.error must not re-open the turn")
+		"F4 regression: late inflight after session.error must not re-open the turn")
 }

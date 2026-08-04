@@ -424,7 +424,7 @@ func (s *Store) Apply(ev opencode.Event) {
 			// the trap (OpenCode stamps its fs-snapshot diff AFTER idle), so
 			// upsertMessageLocked's #2696 guard refuses to re-open the turn
 			// while this is set. Distinct from completionAuthoritative (which
-			// graceFire also sets); this is session.idle-only.
+			// graceFire also sets): liveIdleObserved is set by OBSERVED terminals only (session.idle AND session.error), NOT by graceFire.
 			s.liveIdleObserved[ne.SessionID] = true
 			// P7 turn-state: session.idle is a turn TERMINAL. If the turn was
 			// Stopping, this is the canceled run's terminal — settle the abort
@@ -871,9 +871,9 @@ func (s *Store) upsertMessageLocked(info json.RawMessage) {
 			if s.liveIdleObserved[env.SessionID] {
 				// #2696 guard (PRIMARY CRUX of the P7 slice).
 				//
-				// Principle (Deviation 1): liveIdleObserved distinguishes an
-				// OBSERVED terminal (session.idle) from an INFERRED one (graceFire);
-				// the guard blocks on observed terminals only. Never BLOCK a turn
+				// Principle (Deviation 1): liveIdleObserved distinguishes OBSERVED
+				// terminals (session.idle, session.error) from an INFERRED one
+				// (graceFire); the guard blocks on observed terminals only. Never BLOCK a turn
 				// on an inference — an inferred terminal that is wrong suppresses
 				// real work. graceFire is an inference; a subsequent inflight after
 				// graceFire is a genuine new turn, not the #2696 trap (OpenCode

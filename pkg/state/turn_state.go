@@ -44,8 +44,9 @@
 //	CONSUMPTION STATUS (honest — do NOT read this as "the abort race is closed").
 //	  Three separate properties; each can pass/fail independently (see the
 //	  behavioral-closure token for the F-slice):
-//	  (a) #2696 guard — LIVE, scoped to session.idle terminals ONLY (session.error
-//	      path is the F4 deferred question).
+//	  (a) #2696 guard — LIVE, scoped to OBSERVED turn terminals (session.idle
+//	      AND session.error); graceFire stays OUT (INFERRED terminal — never
+//	      BLOCK on an inference). F4 folded session.error in.
 //	  (b) SendableNow CAS rejection — LIVE: turnState != TurnStopping in
 //	      SendableNow (snapshots.go) is consumed by the production CAS send path
 //	      (pkg/web/verbs.go:113-121), so post-abort sends return 409 Conflict

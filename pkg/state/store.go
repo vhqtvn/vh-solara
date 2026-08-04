@@ -667,9 +667,9 @@ type Store struct {
 	stopTurnID    map[string]string
 	stopTimers    map[string]*time.Timer
 	stopGen       map[string]uint64
-	// liveIdleObserved distinguishes an OBSERVED terminal (session.idle) from an
-	// INFERRED one (graceFire). The #2696 guard (upsertMessageLocked) blocks on
-	// observed terminals only.
+	// liveIdleObserved distinguishes OBSERVED terminals (session.idle,
+	// session.error) from an INFERRED one (graceFire). The #2696 guard
+	// (upsertMessageLocked) blocks on observed terminals only.
 	//
 	// Principle (Deviation 1 of the P7 slice): never BLOCK a turn on an
 	// inference — an inferred terminal that is wrong suppresses real work.
