@@ -238,7 +238,11 @@ func fetchOpencodeChangelogRaw(ctx context.Context) ([]rawChangelogRelease, erro
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("changelog: HTTP %d", resp.StatusCode)
 	}
-	body, err := io.ReadAll(resp.Body)
+	// Cap the body at 8 MiB: changelog.json is a structured array of releases,
+	// well under a MiB today — 8 MiB is generous headroom while bounding a
+	// hostile/oversized response (cheap insurance alongside the 3-min cache).
+	const maxChangelogBytes = 8 << 20 // 8 MiB
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxChangelogBytes))
 	if err != nil {
 		return nil, err
 	}
