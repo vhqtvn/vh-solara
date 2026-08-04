@@ -335,6 +335,8 @@ func (s *Store) Close() {
 	// Stop every pending completion-grace timer so no callback fires after
 	// teardown against a torn-down store.
 	s.cancelAllGraceLocked()
+	// P7: stop every pending stop-settle timer for the same reason.
+	s.cancelAllStopTimersLocked()
 	for id, sub := range s.subs {
 		close(sub.ch)
 		delete(s.subs, id)

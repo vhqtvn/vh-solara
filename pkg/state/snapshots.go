@@ -1053,7 +1053,16 @@ func (s *Store) SendableNow(sid string) (sendable bool, activitySeq uint64, exis
 	// to answer one node.
 	subtreeBusy := s.subtreeBusyCount[sid] > 0
 	inflight := se.hasAssistant && !se.lastAsstCompleted
+	// P7 turn-boundary: a session mid-stop (TurnStopping) is not sendable even
+	// if its activity has not yet cleared — the canceled run is still in flight
+	// until its terminal. (The fail-closed abort gate AbortSettling is
+	// invariant with TurnStopping — Stop sets both, settle clears both — so
+	// checking TurnStopping here is sufficient; the gate itself is reported
+	// separately for the caller-driven awaitRunnerQuiescence the dispatch path
+	// will consume in a future slice.)
+	stopping := s.turnState[sid] == TurnStopping
 	sendable = act == ActivityIdle &&
+		!stopping &&
 		!subtreeBusy &&
 		!inflight &&
 		len(s.questions[sid]) == 0 &&

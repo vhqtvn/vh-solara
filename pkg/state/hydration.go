@@ -69,6 +69,15 @@ func (s *Store) Hydrate(sessions []json.RawMessage, messages map[string][]Messag
 	// armed against the pre-reconnect live message stream is stale.
 	s.cancelAllGraceLocked()
 
+	// P7: cancel any pending stop-settle timers for the same reason — a
+	// reconnect/rehydrate rebuilds turn-state from the snapshot, so a settle
+	// timer armed against the pre-reconnect live stop is stale (its captured
+	// stopGen will not match the post-hydrate state). This binds the
+	// cancelAllStopTimersLocked "used on hydrate / shutdown" doc claim in
+	// turn_state.go (the call was previously missing — only Close had it — so
+	// the doc was an unbound assertion; see the doc/call-binding scan note).
+	s.cancelAllStopTimersLocked()
+
 	// --- sessions ---
 	seen := make(map[string]bool, len(sessions))
 	for _, info := range sessions {

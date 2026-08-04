@@ -246,11 +246,19 @@ func (s *Store) AckUnread(sessionID string) {
 }
 
 // MarkIdle authoritatively marks a session idle and emits the activity event.
-// Used by the abort verb: OpenCode does not emit session.idle on abort, so
-// without this the authoritative activity stays "busy" until a stale event (or
-// a stream reconnect's snapshot) re-applies it and re-arms the working
-// indicator on a turn the user already stopped. setActivityLocked is a no-op
-// when already idle, so a later real session.idle reconciles harmlessly.
+//
+// RETIRED from the abort path (P7 slice): the abort verb (pkg/web/verbs.go)
+// now calls Store.Stop (enter TurnStopping + close the fail-closed gate) instead
+// of this synchronous force-idle. The synchronous force-idle was the
+// abort-mid-flight bug — it idled a session while the runner was still aborting.
+// Stop keeps the session running-class until its terminal (or the stopFire
+// settle-timer fallback / the periodic reconcile) idles it, which is the honest
+// reflection of an abort still draining server-side.
+//
+// MarkIdle is RETAINED for tests and internal callers that genuinely want a
+// synchronous authoritative idle clear independent of the turn-boundary state
+// machine. setActivityLocked is a no-op when already idle, so a later real
+// session.idle reconciles harmlessly.
 func (s *Store) MarkIdle(sessionID string) {
 	s.mu.Lock()
 	s.setActivityLocked(sessionID, ActivityIdle)
@@ -288,7 +296,8 @@ func (s *Store) SetActivityFromStatuses(statuses map[string]json.RawMessage) {
 		// signal; a stale status snapshot must not override it. Cleared when a
 		// NEW assistant message goes inflight (a new turn started), so a
 		// legitimate future busy is respected.
-		if a != ActivityIdle && s.completionAuthoritative[sid] {
+		blockedByAuthority := a != ActivityIdle && s.completionAuthoritative[sid]
+		if blockedByAuthority {
 			a = ActivityIdle
 		}
 		// O1 fix: seed the activity timestamp from the session's OWN time.updated
@@ -302,6 +311,15 @@ func (s *Store) SetActivityFromStatuses(statuses map[string]json.RawMessage) {
 		s.setActivityAtLocked(sid, a, at, false)
 		if a != ActivityIdle {
 			busy[sid] = true
+			// P7 on-subscribe adoption (reconcileExternalRunnerStatus): a
+			// provider-reported already-busy session is adopted as TurnRunning.
+			// The race guard is completionAuthoritative (blockedByAuthority): a
+			// live session.idle observed since the last turn supersedes the
+			// (async, possibly stale) busy snapshot, so a stale busy is not
+			// re-adopted as running. markTurnRunningLocked also opens the abort
+			// gate if a stop was in flight (the server reporting busy ⇒ the
+			// prior abort settled).
+			s.markTurnRunningLocked(sid)
 		}
 	}
 	// Clear everything else. Known sessions and loaded sessions are set idle;
@@ -314,6 +332,18 @@ func (s *Store) SetActivityFromStatuses(statuses map[string]json.RawMessage) {
 			// markOnIdle=false: clearing busy from a reconstructed status
 			// snapshot is not a real completion (M9/L-16).
 			s.setActivityAtLocked(sid, ActivityIdle, activityTimeFromSessionLocked(s, sid), false)
+			// P7 fallback: a session no longer reported busy by the authoritative
+			// /session/status snapshot is not running — if a stop was in flight
+			// (TurnStopping) this is the settle signal the periodic reconcile
+			// supplies when OpenCode did not emit session.idle on abort. Settle
+			// the abort (open the gate) and drop to TurnIdle. (The terminal path
+			// in Apply settles faster; this is the bounded-latency backstop.)
+			if s.turnState[sid] == TurnStopping {
+				s.cancelStopTimerLocked(sid)
+				s.abortSettling[sid] = false
+				delete(s.stopTurnID, sid)
+				s.turnState[sid] = TurnIdle
+			}
 		}
 	}
 	for sid := range s.sessions {
@@ -387,10 +417,35 @@ func (s *Store) Apply(ev opencode.Event) {
 				s.cancelGraceLocked(p.SessionID)
 				s.setActivityLocked(p.SessionID, ActivityIdle)
 				s.completionAuthoritative[p.SessionID] = true
+				// #2696 discriminator: a LIVE session.idle was observed (the
+				// authoritative terminal). A subsequent mutable message.updated is
+				// the trap (OpenCode stamps its fs-snapshot diff AFTER idle), so
+				// upsertMessageLocked's #2696 guard refuses to re-open the turn
+				// while this is set. Distinct from completionAuthoritative (which
+				// graceFire also sets); this is session.idle-only.
+				s.liveIdleObserved[p.SessionID] = true
+				// P7 turn-state: session.idle is a turn TERMINAL. If the turn was
+				// Stopping, this is the canceled run's terminal — settle the abort
+				// (OPEN the fail-closed gate) and go TurnIdle. If Running, the turn
+				// ended normally → TurnIdle. NO auto-promotion (caller-driven).
+				s.settleTerminalLocked(p.SessionID)
 			case "session.error":
 				s.setActivityLocked(p.SessionID, ActivityError)
+				// P7 turn-state: session.error is also a turn TERMINAL (a failed
+				// turn ends the turn). Settle the same way session.idle does.
+				s.settleTerminalLocked(p.SessionID)
 			case "session.status":
-				s.setActivityLocked(p.SessionID, normalizeActivity(p.Status.Type))
+				normalized := normalizeActivity(p.Status.Type)
+				s.setActivityLocked(p.SessionID, normalized)
+				// P7 turn-state / #2696 boundary: AUTHORITATIVE runner status
+				// (busy|retry) is the ONLY signal that may (re)start a turn
+				// (paseo shouldStartAutonomousTurn). A mutable message.updated is
+				// NOT (see the #2696 guard in upsertMessageLocked). markTurnRunningLocked
+				// also opens the abort gate if a stop was in flight (the server
+				// accepting a new turn ⇒ the prior abort settled).
+				if normalized == ActivityBusy || normalized == ActivityRetry {
+					s.markTurnRunningLocked(p.SessionID)
+				}
 			}
 		}
 	case "message.updated":
@@ -685,6 +740,14 @@ func (s *Store) deleteSessionLocked(id string) {
 	// busy guard applies to this id (and a recreated id starts fresh).
 	s.cancelGraceLocked(id)
 	delete(s.completionAuthoritative, id)
+	// P7 turn-state teardown: cancel the settle timer (no callback fires into a
+	// torn-down entry) and drop the turn-state / abort-gate / pending-turn-id
+	// records. A recreated id starts fresh (TurnIdle, gate open).
+	s.cancelStopTimerLocked(id)
+	delete(s.turnState, id)
+	delete(s.abortSettling, id)
+	delete(s.stopTurnID, id)
+	delete(s.liveIdleObserved, id)
 	// Clear the automated-spawn permission-blocked fact on termination. This is
 	// the single session-removal chokepoint (live session.deleted, archive via
 	// time.archived, and hydrate prune all funnel here), so one delete covers
@@ -861,14 +924,48 @@ func (s *Store) upsertMessageLocked(info json.RawMessage) {
 	if env.Role == "assistant" {
 		switch {
 		case s.assistantInflightLocked(env.SessionID):
-			// An in-flight assistant message is generating right now: assert
-			// busy (cheap no-op once set). A NEW inflight also cancels any
-			// pending completion-grace (the turn is continuing, not ending) and
-			// clears the completion-authority guard (a new turn started, so a
-			// prior turn's authority no longer applies).
-			s.cancelGraceLocked(env.SessionID)
-			delete(s.completionAuthoritative, env.SessionID)
-			s.setActivityLocked(env.SessionID, ActivityBusy)
+			if s.liveIdleObserved[env.SessionID] {
+				// #2696 guard (PRIMARY CRUX of the P7 slice).
+				//
+				// Principle (Deviation 1): liveIdleObserved distinguishes an
+				// OBSERVED terminal (session.idle) from an INFERRED one (graceFire);
+				// the guard blocks on observed terminals only. Never BLOCK a turn
+				// on an inference — an inferred terminal that is wrong suppresses
+				// real work. graceFire is an inference; a subsequent inflight after
+				// graceFire is a genuine new turn, not the #2696 trap (OpenCode
+				// stamping its fs-snapshot diff onto the user message AFTER the turn
+				// went idle). This is the same observed-vs-inferred line that runs
+				// through every correctness lesson in this repo.
+				//
+				// Concrete: a mutable assistant message arriving AFTER the runner
+				// AUTHORITATIVELY went idle (a live session.idle observed —
+				// liveIdleObserved) must NOT re-open the turn. Message records are
+				// mutable — OpenCode stamps its fs-snapshot diff onto them AFTER
+				// idle (#2696) — so an inflight assistant record appearing
+				// post-idle is not evidence a turn is running. Only AUTHORITATIVE
+				// runner status (session.status busy|retry, routed through
+				// markTurnRunningLocked, which clears liveIdleObserved) may
+				// (re)start a turn. Skip escalation ENTIRELY: do not set busy, do
+				// not clear authority, do not cancel grace. The message is still
+				// recorded above (upsertMessageLocked); only the activity
+				// escalation is refused.
+				//
+				// liveIdleObserved is session.idle-ONLY (NOT set by graceFire): a
+				// grace-fired completion is an INFERENCE, where a subsequent
+				// inflight is a genuine new turn (the multi-turn grace cycle), not
+				// the trap. This keeps the completion-grace strand fix (grace→idle
+				// →new-inflight re-arms busy) intact while closing the #2696 hole.
+			} else {
+				// An in-flight assistant message is generating right now: assert
+				// busy (cheap no-op once set). A NEW inflight also cancels any
+				// pending completion-grace (the turn is continuing, not ending)
+				// and clears the completion-authority guard (a new turn started,
+				// so a prior turn's authority no longer applies) — the genuine
+				// new-turn path (NOT post-idle, so NOT the #2696 trap).
+				s.cancelGraceLocked(env.SessionID)
+				delete(s.completionAuthoritative, env.SessionID)
+				s.setActivityLocked(env.SessionID, ActivityBusy)
+			}
 		case !wasCompleted && env.Time.Completed != nil:
 			// This assistant message just transitioned to completed AND no
 			// assistant message is in-flight: the turn MAY have ended. We

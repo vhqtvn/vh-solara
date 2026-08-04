@@ -332,7 +332,10 @@ func TestSubtreeBusyCount_TargetedScenarios(t *testing.T) {
 	})
 
 	t.Run("mark_idle_entrypoint", func(t *testing.T) {
-		// MarkIdle is the abort path; it calls setActivityLocked directly.
+		// MarkIdle is the synchronous authoritative-idle entrypoint (RETIRED from
+		// the abort path as of the P7 slice — the abort verb now calls Stop; this
+		// tests the retained setActivityLocked-direct path used by tests/internal
+		// callers). It calls setActivityLocked directly.
 		s := New(100)
 		s.Apply(ev("session.created", evSessionCreated("x", "")))
 		s.Apply(ev("session.status", evStatus("x", "busy")))

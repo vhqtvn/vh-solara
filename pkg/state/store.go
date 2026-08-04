@@ -650,7 +650,41 @@ type Store struct {
 	// completionGrace is the grace-window duration (default 5s via
 	// defaultCompletionGrace; shrunk in tests). Set on the Store instance in New
 	// so a test can shrink s.completionGrace without a global-mutation race.
+	// It is ALSO the settle-window for the P7 stop-settle timer (turn_state.go):
+	// the same "missed session.idle" fallback, reused for the abort case.
 	completionGrace time.Duration
+	// P7 turn-boundary state machine (turn_state.go). turnState[sid] is the
+	// authoritative turn-boundary state (idle|running|stopping), distinct from
+	// the activity map (the UI spinner indicator). abortSettling[sid] is the
+	// fail-closed gate (a session-scoped abort is settling — a new turn's caller
+	// must await it). stopTurnID[sid] is the stopping payload's
+	// pendingCancellationTurnID. stopTimers[sid] / stopGen[sid] are the settle
+	// timer + its supersede counter (mirroring graceTimers / graceGen) — OpenCode
+	// does not emit session.idle on abort, so the terminal that opens the gate
+	// may never arrive; the timer force-opens it after completionGrace.
+	turnState     map[string]TurnState
+	abortSettling map[string]bool
+	stopTurnID    map[string]string
+	stopTimers    map[string]*time.Timer
+	stopGen       map[string]uint64
+	// liveIdleObserved distinguishes an OBSERVED terminal (session.idle) from an
+	// INFERRED one (graceFire). The #2696 guard (upsertMessageLocked) blocks on
+	// observed terminals only.
+	//
+	// Principle (Deviation 1 of the P7 slice): never BLOCK a turn on an
+	// inference — an inferred terminal that is wrong suppresses real work.
+	// graceFire is an inference; a subsequent inflight after graceFire is a
+	// genuine new turn, not the #2696 trap (OpenCode stamping its fs-snapshot
+	// diff onto the user message AFTER the turn went idle). This is the same
+	// observed-vs-inferred line that runs through every correctness lesson in
+	// this repo.
+	//
+	// Mechanically: set ONLY by a live session.idle event (the AUTHORITATIVE
+	// terminal), NOT by graceFire (an INFERENCE of completion); distinct from
+	// completionAuthoritative (set by BOTH session.idle and graceFire, used for
+	// the stale-busy guard). Cleared by an authoritative new turn
+	// (markTurnRunningLocked). See upsertMessageLocked.
+	liveIdleObserved map[string]bool
 	// deltaFlushInterval is the per-instance throttle window for streaming
 	// part-delta flushes (Option C / P1-AGG-004). Promoted off the package
 	// global so tests shrink the instance under test rather than the shared
@@ -1000,6 +1034,15 @@ func NewWithConfig(cfg Config) (*Store, error) {
 		graceTimers:             map[string]*time.Timer{},
 		graceGen:                map[string]uint64{},
 		completionAuthoritative: map[string]bool{},
+		// P7 turn-boundary state machine (turn_state.go): the per-session
+		// idle|running|stopping layer + the fail-closed abort gate + the settle
+		// timer / supersede counter.
+		turnState:        map[string]TurnState{},
+		abortSettling:    map[string]bool{},
+		stopTurnID:       map[string]string{},
+		stopTimers:       map[string]*time.Timer{},
+		stopGen:          map[string]uint64{},
+		liveIdleObserved: map[string]bool{},
 		// Every tunable is sourced from the validated Config (M6): the
 		// package-default values arrive via DefaultConfig, but the instance
 		// fields are the only thing the hot paths read — there is no

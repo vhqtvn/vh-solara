@@ -381,6 +381,81 @@ func TestHydrate_DoesNotLeakGraceTimers(t *testing.T) {
 	}
 }
 
+// TestHydrate_DoesNotLeakStopTimers is the P7 stop-settle-timer twin of
+// TestHydrate_DoesNotLeakGraceTimers. Hydrate must cancel every pending
+// stop-settle timer (cancelAllStopTimersLocked) on reconnect, exactly as it
+// cancels grace timers: a reconnect/rehydrate rebuilds turn-state from the
+// snapshot, so a settle timer armed against the pre-reconnect live stop is
+// stale — its captured stopGen will not match the post-hydrate state, and a
+// fire that is NOT cancelled (or not guarded) would settle the gate against a
+// torn-down/rebuilt entry. The cancel's stopGen bump is what makes any in-flight
+// armGen-captured callback a benign no-op (same race-close as graceGen).
+//
+// This test exists because the cancelAllStopTimersLocked "used on hydrate /
+// shutdown" doc claim (turn_state.go) was an UNBOUND assertion until this call
+// site landed: only Close had the call. The doc/call binding is the principle
+// (the same stale-doc/unbound-claim class that recently caused an external false
+// claim about the harness's permission gate).
+func TestHydrate_DoesNotLeakStopTimers(t *testing.T) {
+	s := mustNew(t, withCompletionGrace(DefaultConfig(100), 15*time.Millisecond)) // small enough for a fast test
+	defer s.Close()
+
+	// Arm a stop-settle timer the production way: a running turn, then Stop.
+	s.Apply(ev("session.created", evSessionCreated("R", "")))
+	s.Apply(ev("session.status", evStatus("R", "busy")))
+	s.Stop("R", "turn1")
+
+	// Pre-hydrate: stopping, gate CLOSED, settle timer armed.
+	assertTurn(t, s, "R", TurnStopping, "pre-hydrate")
+	if !s.AbortSettling("R") {
+		t.Fatalf("pre-hydrate: AbortSettling=false, want true (gate CLOSED)")
+	}
+	armGen, armed, _, _ := s.stopStateSnapshot("R")
+	if !armed {
+		t.Fatalf("pre-hydrate: settle timer should be armed, got disarmed")
+	}
+
+	// Hydrate keeping R alive, with CHANGED info so the direct-assign branch
+	// fires (proving the full Hydrate ran, not just the cancel). The cancel
+	// happens BEFORE the session loop, so it fires whether or not R is
+	// re-assigned — but the changed info makes the test robust to the
+	// diff-guard's byte-comparison.
+	s.Hydrate(
+		[]json.RawMessage{
+			json.RawMessage(`{"id":"R","title":"post-reconnect"}`),
+		},
+		map[string][]MessageWithParts{},
+	)
+
+	// Immediately post-hydrate: cancelAllStopTimersLocked ran. stopTimers[R] is
+	// deleted, stopGen[R] bumped PAST armGen (an in-flight armGen-captured
+	// callback will see the mismatch and abort). turnState is UNCHANGED
+	// (Stopping) and abortSettling is UNCHANGED (true) — cancel is NOT a settle,
+	// exactly mirroring how cancelAllGraceLocked leaves busy/authority alone.
+	postGen, postArmed, _, _ := s.stopStateSnapshot("R")
+	if postArmed {
+		t.Fatalf("post-hydrate: stopTimers[R] should be deleted by cancelAllStopTimersLocked, still armed")
+	}
+	if postGen <= armGen {
+		t.Fatalf("post-hydrate: stopGen=%d, want > %d (cancelAllStopTimersLocked must bump past the armed gen so an in-flight callback aborts)", postGen, armGen)
+	}
+	assertTurn(t, s, "R", TurnStopping, "post-hydrate (cancel is not a settle)")
+	if !s.AbortSettling("R") {
+		t.Fatalf("post-hydrate: AbortSettling should still be true (cancelAllStopTimersLocked must NOT settle the gate), got false")
+	}
+
+	// Wait WELL past the original settle window. The armGen-captured callback
+	// (if it runs at all — Stop may have won) takes s.mu, sees stopGen[R] !=
+	// armGen, and returns a benign no-op. State must be UNCHANGED: no stale fire
+	// settled the gate post-hydrate (the cancel held). stopGen must not move
+	// further (the stale fire no-op'd without bumping).
+	time.Sleep(80 * time.Millisecond)
+	if !s.AbortSettling("R") {
+		t.Errorf("post-hydrate+wait: AbortSettling=false, want true (cancel held; no stale fire should have settled the gate)")
+	}
+	assertTurn(t, s, "R", TurnStopping, "post-hydrate+wait (cancel held; no stale fire settled)")
+}
+
 // TestHydrate_IdempotentOnIdenticalInfo_ReplaceOnChangedInfo is GAP-S3 case 4.
 // Hydrate's direct-assign is guarded by `old == nil || !bytes.Equal(old.info,
 // info)` (store.go:2632). Two contracts flow from that guard:

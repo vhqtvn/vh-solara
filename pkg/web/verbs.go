@@ -258,11 +258,15 @@ func (h coordHandlers) spawn(w http.ResponseWriter, r *http.Request) {
 }
 
 // abort cancels a session's in-flight turn. Body: {sessionID, idempotency_key?}.
-// OpenCode does not emit session.idle on abort, so after the upstream abort
-// succeeds we mark the session idle authoritatively (Store.MarkIdle) — otherwise
-// the activity stays "busy" and a later stream-reconnect snapshot re-applies it,
-// re-arming the working indicator on a turn the user already stopped. Callers
-// may send again immediately (no need to wait for a session.idle transition).
+// The turn-boundary state machine (pkg/state/turn_state.go) enters TurnStopping
+// and closes the session-scoped abort gate (Store.AbortSettling). OpenCode does
+// NOT emit session.idle on abort (reducers.go:249), so the gate's settle relies
+// on the state layer's settle-timer fallback (Store.Stop arms it) plus the
+// periodic /session/status reconcile — NOT on a synchronous force-idle. The
+// canceled run's pendingCancellationTurnID is the inflight assistant message id
+// at stop time (informational; OpenCode's abort is session-scoped, so terminal
+// matching is session-scoped too). A new turn's caller must await the gate
+// (Store.AbortSettling) before starting — caller-driven, never state-initiated.
 func (h coordHandlers) abort(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -284,9 +288,14 @@ func (h coordHandlers) abort(w http.ResponseWriter, r *http.Request) {
 		if err := agg.Client().Abort(r.Context(), body.SessionID); err != nil {
 			return upstreamStatus(err, false), errResp(err.Error()), ""
 		}
-		// The turn was stopped: clear the authoritative activity so reconnects
-		// and second tabs see idle, matching the client's optimistic clear.
-		agg.Store().MarkIdle(body.SessionID)
+		// The turn was stopped: enter TurnStopping + close the fail-closed abort
+		// gate. We no longer synchronously force idle (the retired Store.MarkIdle
+		// path): a stopping session is still running-class until its terminal
+		// (or the settle-timer fallback) idles it, which is the honest reflection
+		// of an abort still draining server-side. canceledTurnID is the inflight
+		// assistant message id ("" if none).
+		canceledTurnID := agg.Store().InflightAssistantID(body.SessionID)
+		agg.Store().Stop(body.SessionID, canceledTurnID)
 		return http.StatusOK, jsonBytes(map[string]any{"ok": true}), ""
 	})
 }
