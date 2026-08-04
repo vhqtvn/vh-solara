@@ -335,6 +335,19 @@ export function applySessionSnapshot(id: string, snap: Snapshot) {
     produce((s) => {
       if (!s.messages[id]) s.messages[id] = { order: [], byId: {} };
       prependMessagesIfAbsent(s.messages[id], items);
+      // Hydrate the opened session's STRUCTURAL detail (parentID/title/...) from
+      // the Stream-2 snapshot. Stream-2 is scope-selected to exactly this session
+      // (pkg/state/snapshots.go captureSnapshotLocked: inScope(sid)=messagesFor),
+      // so snap.sessions carries this session's authoritative structural row. This
+      // is the hydration path for a deep-linked NON-frontier (child) session: the
+      // frontier-scoped Stream-1 partial (SnapshotWithTreePartial) ships only
+      // frontier detail on cold/reconnect, so a child session's parentID — which
+      // isChild() reads via state.sessions[id].parentID — arrives via Stream-2.
+      // Without this the composer child-note never renders on a deep link to a
+      // subagent session (chat-controls-gating e2e). Find-by-id is the scope-leak
+      // guard: only the opened session is ever touched.
+      const sessInfo = snap.sessions?.find((x) => x?.id === id);
+      if (sessInfo) s.sessions[id] = sessInfo;
     }),
   );
   // Phase 3 (transcript windowing): populate the resident-window state from the

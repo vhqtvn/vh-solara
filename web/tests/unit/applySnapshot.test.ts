@@ -160,6 +160,59 @@ describe("applySessionEvent — B2b session.delete prunes per-session maps", () 
   });
 });
 
+// Stream-2 hydrates the opened session's STRUCTURAL detail (parentID etc.).
+// Regression guard for the deep-linked child-session hydration gap: the
+// frontier-scoped Stream-1 partial (SnapshotWithTreePartial) ships only
+// frontier sessions' detail on cold/reconnect, so a NON-frontier (child)
+// session's parentID — which isChild() reads via state.sessions[id].parentID —
+// must arrive via Stream-2 (scope-selected to the opened session). Without this
+// the composer child-note never renders on a deep link to a subagent session.
+describe("applySessionSnapshot — hydrates the opened session's structural detail", () => {
+  it("upserts the opened session's row (incl. parentID) from snap.sessions", () => {
+    const snap: Snapshot = {
+      seq: 1,
+      sessions: [{ id: "sub", parentID: "demo", title: "Subagent: search" }],
+      gate: { sub: { messagesLoaded: true } },
+      messages: { sub: [] },
+    };
+    applySessionSnapshot("sub", snap);
+    // Structural detail hydrated from the Stream-2 (scope-selected) snapshot.
+    expect(state.sessions.sub).toBeDefined();
+    expect(state.sessions.sub?.parentID).toBe("demo");
+    expect(state.sessions.sub?.title).toBe("Subagent: search");
+  });
+
+  it("does not leak a DIFFERENT session's row (scope-leak guard)", () => {
+    // Even if a (malformed/future) snapshot carried another session's row, only
+    // the opened session is hydrated — find-by-id is the guard.
+    const snap: Snapshot = {
+      seq: 1,
+      sessions: [
+        { id: "other", parentID: "x" },
+        { id: "sub", parentID: "demo" },
+      ],
+      gate: { sub: { messagesLoaded: true } },
+      messages: { sub: [] },
+    };
+    applySessionSnapshot("sub", snap);
+    expect(state.sessions.sub?.parentID).toBe("demo");
+    expect(state.sessions.other).toBeUndefined();
+  });
+
+  it("no-op when the snapshot carries no session row (back-compat)", () => {
+    setState("sessions", "sub", { id: "sub", title: "pre-existing" });
+    const snap: Snapshot = {
+      seq: 1,
+      sessions: [], // empty: no row for `sub` → no structural upsert
+      gate: { sub: { messagesLoaded: true } },
+      messages: { sub: [] },
+    };
+    applySessionSnapshot("sub", snap);
+    // Pre-existing structural detail is left untouched (no overwrite).
+    expect(state.sessions.sub?.title).toBe("pre-existing");
+  });
+});
+
 // Slice C — async selected-session hydration. The Stream-2 first-open snapshot
 // no longer waits for the upstream full-message fetch: a hydrating snapshot
 // (gate.messagesLoaded===false) must keep the loading UI up until the explicit
