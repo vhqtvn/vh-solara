@@ -221,6 +221,41 @@ describe("ChatView reveal-gate — O1 cold-stub deadlock self-heal", () => {
     });
   });
 
+  it("reveals when hydration errors (messagesError=true) while the order is STILL empty (empty-order ∩ messageFailed intersection)", async () => {
+    // Advisory intersection case (b×c): the two terminal strands are pinned
+    // individually above — the "loaded but order empty" test covers empty-order
+    // + delivered (strand B on the empty-order axis), and the "errors while
+    // anchor absent" test covers partial-batch + messageFailed (strand C on the
+    // anchor-absent axis). This pins the INTERSECTION: a cold session whose
+    // very first hydration errors BEFORE staging any partial batch → order=[]
+    // + messagesError=true. maybeRestore()'s empty-order defer (~:571) returns
+    // false only when `!order.length && !delivered && !messageFailed`; the
+    // !messageFailed() clause (added by 4c5ca82) MUST bypass the defer on the
+    // error terminal exactly as !delivered() bypasses it on the loaded
+    // terminal, or the gate wedges on blank forever for a failed cold load
+    // with a stored anchor.
+    setReadAnchor("s1", "m4");
+    const { container } = render(() => <ChatView sessionId="s1" />);
+    // openSession reserves a cold empty slot {order:[],byId:{}}.
+    await waitFor(() => expect(state.messages["s1"]).toBeTruthy());
+    expect(state.messages["s1"].order).toEqual([]);
+
+    // Drain microtask + rAF so the switch-effect rAF fallback fires and defers
+    // (order empty + delivered=false + messageFailed=false). Gate stays closed.
+    await new Promise((r) => setTimeout(r, 30));
+    expect(readyClass(container)).not.toMatch(/\bready\b/);
+
+    // Hydration ERRORS with NO partial batch staged: order is STILL empty,
+    // messageFailed flips true, delivered stays false. The
+    // delivered||messageFailed self-heal effect re-runs maybeRestore; with the
+    // !messageFailed() guard the empty-order defer is bypassed → stale-anchor
+    // pin (anchor m4 absent from empty order) → setReady(true) → revealed().
+    setState("messagesError", "s1", true);
+    await waitFor(() => {
+      expect(readyClass(container)).toMatch(/\bready\b/);
+    });
+  });
+
   it("latch keeps a revealed transcript shown across a transient delivered() drop (resync re-snapshot)", async () => {
     // Anchor IS present in the batch — first reveal takes the normal path.
     setReadAnchor("s2", "m1");
