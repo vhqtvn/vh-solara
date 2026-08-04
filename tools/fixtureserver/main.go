@@ -103,6 +103,22 @@ func main() {
 	if err != nil {
 		log.Fatalf("build web server: %v", err)
 	}
+	// The fixture's OpenCode is an EXTERNAL HTTP loopback server (ln above), not
+	// a spawned/co-located process whose env is inherited. Declare that topology
+	// honestly so the unarchive guard (pkg/web/archive.go handleArchive →
+	// opencode.UnarchiveGuard, pkg/web/archive.go:64) REFUSES the direct-DB
+	// unarchive path instead of silently allowing it: with the default
+	// externalOC=false the guard's co-located branch returns nil, which would let
+	// /vh/unarchive proceed to opencode.UnarchiveSessions and open a LOCAL SQLite
+	// file that does not correspond to the fake opencode (it has no real DB). The
+	// fake opencode is HTTP-attached, so external=true is the truthful setting
+	// and makes the guard refuse fast unless VH_OPENCODE_DB_PATH is explicitly
+	// bound — the same contract the real external-topology daemon enforces.
+	// externalOC is single-purpose (consumed only by UnarchiveGuard), so this
+	// carries no other behavioral change. No e2e spec exercises unarchive (the
+	// fixture has no SQLite backing — see web/tests/e2e/interactive.spec.ts); the
+	// archive path uses the HTTP PATCH branch and is unaffected.
+	srv.SetExternalOpenCode(true)
 	// Fake OpenCode lifecycle hooks so the UI's version/update/restart controls
 	// are demoable and testable without a real OpenCode process.
 	srv.SetOpenCodeVersion(func(context.Context) (string, string, string, error) { return "0.1.0", "0.1.0", "0.2.0", nil })
