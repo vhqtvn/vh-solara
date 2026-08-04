@@ -14,24 +14,33 @@
 // switches on NormalizedEvent.Kind and consumes typed routing fields; it never
 // re-parses wire JSON for routing.
 //
-// BEHAVIOR-PRESERVING (the F4 fold is the ONE intentional change). TranslatorV1
-// replicates EXACTLY the per-arm parsing + validity guards that used to live
-// inline in Apply, so the rewire is a pure refactor modulo F4 (session.error
-// arms liveIdleObserved — see Apply's NormSessionTerminalError arm). Parse
-// failure / failed guard → NormIgnored (Apply no-ops), matching the prior
-// `if json.Unmarshal(...) == nil && <guard>` skip semantics. The opaque Raw
-// payload is stored/emitted byte-identically by the handlers (no re-serialization
-// → no behavior change); the translator EXTRACTS it but does NOT interpret it.
-// The deep parse inside a handler (e.g. upsertMessageLocked parsing info into
-// messageInfoEnvelope) is handler DOMAIN logic on an already-extracted blob, not
-// Apply-level routing — it stays put.
+// BEHAVIOR-PRESERVING modulo TWO intentional changes (F4 + the callId
+// defensive-parsing invariant). TranslatorV1 replicates EXACTLY the per-arm
+// parsing + validity guards that used to live inline in Apply, so the rewire
+// (slice #3) was a pure refactor modulo F4 (session.error arms
+// liveIdleObserved — see Apply's NormSessionTerminalError arm). The opaque Raw
+// payload is stored/emitted byte-identically by the handlers (no
+// re-serialization → no behavior change on the stored blob); the translator
+// EXTRACTS it and, for the ONE part kind it now interprets (tool-call parts),
+// resolves identity. Parse failure / failed guard → NormIgnored (Apply
+// no-ops), matching the prior `if json.Unmarshal(...) == nil && <guard>` skip
+// semantics. The deep parse inside a handler (e.g. upsertMessageLocked
+// parsing info into messageInfoEnvelope) is handler DOMAIN logic on an
+// already-extracted blob, not Apply-level routing — it stays put.
 //
-// WHAT THIS SLICE DOES NOT DO (deferred). The tool-call callId defensive-parsing
-// invariant (paseo ToolCallDetail: a part with no callId is DROPPED, never
-// synthesized) is NOT enforced here — current pass-through store-all-parts
-// behavior is preserved. Enforcing it is its own slice with its own RED test
-// (attribution: a behavioral change in the same commit that restructures the
-// code the net-tests guard would re-baseline those tests). See the F4 follow-up.
+// THE callId INVARIANT (intentional behavior change — this slice). A tool-call
+// part's identity resolves by precedence **callID > id > drop**: prefer the
+// tool-call correlation id (callID); if absent fall back to the part id; if
+// NEITHER is present the part is DROPPED at the translation boundary
+// (NormIgnored), never passed through. A callId is NEVER synthesized or
+// fabricated — only wire-carried fields are used, and the part blob passes
+// through byte-identical. The resolved identity is surfaced in PartID for the
+// routing layer (the NormPartUpsert handler still keys by the embedded id
+// inside Raw; consuming the resolved identity there is the separate
+// full-typing slice). Rule is tool-call-specific (type:"tool"); non-tool
+// parts are untouched. Adapted from paseo ToolCallDetail defensive parsing
+// (AGPL: design only, never copied source). The rule and its RED test land in
+// the SAME slice (the first behavior wholly inside the translator).
 package state
 
 import (
@@ -117,7 +126,9 @@ type Translator interface {
 
 // TranslatorV1 is the current opencode event-shape ("v1") Translator. Translate
 // replicates EXACTLY the per-arm parsing + validity guards that used to live
-// inline in Apply, so the rewire is behavior-preserving modulo the F4 fold.
+// inline in Apply, so the rewire (slice #3) was behavior-preserving modulo the
+// F4 fold; this slice adds the second intentional change, the tool-call callId
+// defensive-parsing invariant (see the file-level BEHAVIOR-PRESERVING block).
 type TranslatorV1 struct{}
 
 // Version is the opencode event-shape version this translator maps.
@@ -187,6 +198,29 @@ func (TranslatorV1) Translate(raw opencode.Event) (NormalizedEvent, error) {
 		}
 		if json.Unmarshal(raw.Properties, &p) != nil || len(p.Part) == 0 {
 			return NormalizedEvent{Kind: NormIgnored}, nil
+		}
+		// Tool-call callId defensive-parsing invariant (paseo ToolCallDetail,
+		// adapted to Go — DESIGN ONLY, never copied; paseo is AGPL). A
+		// tool-call part's identity resolves by precedence **callID > id >
+		// drop**: prefer the tool-call correlation id (callID); if absent fall
+		// back to the part id; if NEITHER is present the part is
+		// uncorrelatable and is DROPPED at the translation boundary
+		// (NormIgnored) — never passed through. A callId is NEVER synthesized
+		// or fabricated: only fields the wire payload actually carries are
+		// used, and the opaque part blob is passed through byte-identical (Raw
+		// == the input part sub-blob; no re-serialization). The rule is
+		// TOOL-CALL-specific (type:"tool"); non-tool parts pass through
+		// unchanged (no identity resolution, no callId-driven drop here).
+		//
+		// The resolved identity is surfaced in PartID for the routing layer.
+		// (The NormPartUpsert handler currently keys by the part's embedded id
+		// inside Raw — consuming this resolved identity at the handler is the
+		// separate full-typing slice. This slice owns the resolution + drop.)
+		if partTool, resolved, ok := resolveToolCallIdentity(p.Part); partTool {
+			if !ok {
+				return NormalizedEvent{Kind: NormIgnored}, nil
+			}
+			return NormalizedEvent{Kind: NormPartUpsert, PartID: resolved, Raw: p.Part}, nil
 		}
 		return NormalizedEvent{Kind: NormPartUpsert, Raw: p.Part}, nil
 	case "message.part.delta":
@@ -266,4 +300,46 @@ func (TranslatorV1) Translate(raw opencode.Event) (NormalizedEvent, error) {
 		// server.connected / heartbeat / instance.disposed / file.* — ignored for the view.
 		return NormalizedEvent{Kind: NormIgnored}, nil
 	}
+}
+
+// resolveToolCallIdentity applies the tool-call callId defensive-parsing
+// invariant to a message.part.updated part sub-blob. It reports whether the
+// part is a tool-call part (type:"tool"), and for a tool-call part returns the
+// resolved identity and whether the part survives.
+//
+// Precedence is **callID > id > drop**: the resolved identity is the tool-call
+// correlation id (callID) when present, else the part id (id) when present.
+// When NEITHER is present the part is uncorrelatable: ok is false (the caller
+// drops it → NormIgnored). A callId is NEVER synthesized or fabricated — only
+// fields the wire payload actually carries are used. The opaque part blob is
+// not mutated by this helper; the caller passes it through byte-identical.
+//
+// For a non-tool part, partTool is false and the caller leaves the part alone
+// (the rule is tool-call-specific). Adapted from paseo's ToolCallDetail
+// defensive-parsing DESIGN (AGPL: design only, never copied source).
+func resolveToolCallIdentity(part json.RawMessage) (partTool bool, resolved string, ok bool) {
+	var meta struct {
+		Type   string `json:"type"`
+		ID     string `json:"id"`
+		CallID string `json:"callID"`
+	}
+	// A part that fails to parse here is left to the existing validity guard
+	// path (the handler drops it on its own envelope check) — do not conflate a
+	// parse error with the callId-driven drop. Only interpret a parseable part
+	// whose type is exactly "tool".
+	if json.Unmarshal(part, &meta) != nil {
+		return false, "", false
+	}
+	if meta.Type != "tool" {
+		return false, "", false
+	}
+	// callID > id > drop. Never synthesize.
+	resolved = meta.CallID
+	if resolved == "" {
+		resolved = meta.ID
+	}
+	if resolved == "" {
+		return true, "", false // tool part, uncorrelatable → drop
+	}
+	return true, resolved, true
 }
