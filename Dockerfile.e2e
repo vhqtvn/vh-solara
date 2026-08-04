@@ -17,6 +17,14 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 COPY --from=webbuild /app/web/dist-build ./pkg/web/dist
+# GOTOOLCHAIN=local is deliberate (hermetic, reproducible builds) and means there is
+# NO auto-download fallback inside this image. Invariant: the base image's Go (FROM
+# golang:1.25-alpine above) MUST be >= the `go` directive in go.mod, or this stage
+# hard-fails. Local dev and CI stay green via GOTOOLCHAIN=auto / go-version-file, so a
+# go.mod directive bump that outruns the Docker official image is a SILENT TRAP here.
+# Before bumping go.mod's `go` line, confirm the tag already carries that patch:
+#   docker run --rm golang:1.25-alpine go version
+# (As of go.mod 1.25.12 the margin is zero: the image supplies exactly go1.25.12.)
 ENV CGO_ENABLED=0 GOTOOLCHAIN=local
 RUN go build -trimpath -o /out/e2eserver ./tools/e2eserver \
  && go build -trimpath -o /out/fakellm ./tools/fakellm
