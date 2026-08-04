@@ -63,19 +63,22 @@ func TestMintMessageID_Unique(t *testing.T) {
 // across successive mints, so string-sort matches chronological order (the
 // property OpenCode's latest()/pagination rely on). Within a single millisecond
 // the prefix strictly increases (counter adds to the low bits); across
-// milliseconds it is non-decreasing while counter < 0x1000.
+// milliseconds it is non-decreasing — the counter saturates at 0xFFF (see
+// MintMessageID in id.go), so it never carries into the ms bits.
 //
-// NOTE on the counter-bleed edge: id.ts's formula is `now = ms*0x1000 + counter`
-// with NO cap on counter, so minting MORE than 0x1000 (4096) IDs in one ms lets
-// counter overflow into the timestamp bits and can break cross-ms monotonicity
-// — that is opencode's own behavior and MintMessageID replicates it exactly for
-// format fidelity. It is UNREACHABLE in production: the queue mints one ID per
-// Enqueue, and Enqueue is gated by an atomic temp-write + fsync + rename (a few
-// ms each), so >4096 enqueues in a single millisecond cannot occur. This test
-// therefore caps the run well below the bleed threshold (≤3000 mints) so it
-// exercises realistic rates and both the within-ms and cross-ms transitions.
+// NOTE on the >4095/ms edge: id.ts's `counter++` is unbounded and WOULD bleed
+// past 0x1000 (carrying into the ms bits and breaking cross-ms monotonicity) if
+// >4095 IDs were minted in one ms. MintMessageID DIVERGES from id.ts here: it
+// saturates the counter at 0xFFF (id.go), honoring id.ts's ascending INTENT
+// (monotonic sort) over replicating its latent bleed. The byte layout and the
+// now = ms*0x1000 + counter encoding are unchanged; divergence occurs only in
+// the >4095/ms regime, unreachable in production (the queue mints one ID per
+// Enqueue, gated by fsync). This test caps the run at n=3000 not to avoid a
+// bleed (one cannot occur post-saturation) but to exercise realistic rates
+// including the within-ms and cross-ms transitions; the saturation branch
+// itself is exercised under dense minting by a dedicated test below.
 func TestMintMessageID_TimePrefixMonotonic(t *testing.T) {
-	const n = 3000 // < 0x1000: stays below the counter-bleed threshold
+	const n = 3000 // realistic rate; bleed is impossible post-saturation
 	prevPrefix := ""
 	prevMs := time.Now().UnixMilli()
 	sawAdvance := false
