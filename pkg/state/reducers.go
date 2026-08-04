@@ -389,166 +389,109 @@ func (s *Store) Apply(ev opencode.Event) {
 	s.curEmitSource = diag.SourceOpencodeLive
 	defer func() { s.curEmitIngest = 0; s.curEmitSource = diag.SourceDaemonGenerated }()
 
-	switch ev.Type {
-	case "session.created", "session.updated", "session.compacted":
-		s.upsertSessionLocked(ev.Properties) // properties.info is the Session
-	case "session.deleted":
-		var p struct {
-			Info sessionEnvelope `json:"info"`
-		}
-		if json.Unmarshal(ev.Properties, &p) == nil && p.Info.ID != "" {
-			s.deleteSessionLocked(p.Info.ID)
-		}
-	case "session.status", "session.idle", "session.error", "session.diff":
-		var p struct {
-			SessionID string `json:"sessionID"`
-			Status    struct {
-				Type string `json:"type"`
-			} `json:"status"`
-		}
-		if json.Unmarshal(ev.Properties, &p) == nil && p.SessionID != "" {
-			s.statuses[p.SessionID] = ev.Properties
-			s.emit(KindStatus, ev.Properties)
-			switch ev.Type {
-			case "session.idle":
-				// Authoritative turn-end: cancel any pending completion-grace
-				// (redundant now) and arm the completion-authority guard so a
-				// stale busy from /session/status does not re-strand.
-				s.cancelGraceLocked(p.SessionID)
-				s.setActivityLocked(p.SessionID, ActivityIdle)
-				s.completionAuthoritative[p.SessionID] = true
-				// #2696 discriminator: a LIVE session.idle was observed (the
-				// authoritative terminal). A subsequent mutable message.updated is
-				// the trap (OpenCode stamps its fs-snapshot diff AFTER idle), so
-				// upsertMessageLocked's #2696 guard refuses to re-open the turn
-				// while this is set. Distinct from completionAuthoritative (which
-				// graceFire also sets); this is session.idle-only.
-				s.liveIdleObserved[p.SessionID] = true
-				// P7 turn-state: session.idle is a turn TERMINAL. If the turn was
-				// Stopping, this is the canceled run's terminal — settle the abort
-				// (OPEN the fail-closed gate) and go TurnIdle. If Running, the turn
-				// ended normally → TurnIdle. NO auto-promotion (caller-driven).
-				s.settleTerminalLocked(p.SessionID)
-			case "session.error":
-				s.setActivityLocked(p.SessionID, ActivityError)
-				// P7 turn-state: session.error is also a turn TERMINAL (a failed
-				// turn ends the turn). Settle the same way session.idle does.
-				s.settleTerminalLocked(p.SessionID)
-			case "session.status":
-				normalized := normalizeActivity(p.Status.Type)
-				s.setActivityLocked(p.SessionID, normalized)
-				// P7 turn-state / #2696 boundary: AUTHORITATIVE runner status
-				// (busy|retry) is the ONLY signal that may (re)start a turn
-				// (paseo shouldStartAutonomousTurn). A mutable message.updated is
-				// NOT (see the #2696 guard in upsertMessageLocked). markTurnRunningLocked
-				// also opens the abort gate if a stop was in flight (the server
-				// accepting a new turn ⇒ the prior abort settled).
-				if normalized == ActivityBusy || normalized == ActivityRetry {
-					s.markTurnRunningLocked(p.SessionID)
-				}
+	// Slice #3 (contract/translator rewire): the raw opencode.Event is parsed to
+	// a NormalizedEvent by the single versioned Translator (translate.go). Apply
+	// switches on NormalizedEvent.Kind and consumes typed routing fields — it no
+	// longer parses wire JSON for routing (the ~15 inline json.Unmarshal arms
+	// collapsed into the translator). Opaque payloads handlers store/emit
+	// byte-identically pass through as ne.Raw. This dispatch is a behavior
+	// PRESERVING refactor modulo F4 (the session.error liveIdleObserved arm).
+	ne, err := s.translator.Translate(ev)
+	if err != nil || ne.Kind == NormIgnored {
+		return
+	}
+	switch ne.Kind {
+	case NormSessionUpsert:
+		s.upsertSessionLocked(ne.Raw) // ne.Raw is properties; upsertSessionLocked parses {info}
+	case NormSessionDelete:
+		s.deleteSessionLocked(ne.SessionID)
+	case NormSessionStatus, NormSessionTerminalIdle, NormSessionTerminalError, NormSessionDiff:
+		// Shared prefix (all four wire types store the authoritative status
+		// snapshot + emit KindStatus), then the kind-specific activity/turn-state.
+		s.statuses[ne.SessionID] = ne.Raw
+		s.emit(KindStatus, ne.Raw)
+		switch ne.Kind {
+		case NormSessionTerminalIdle:
+			// Authoritative turn-end: cancel any pending completion-grace
+			// (redundant now) and arm the completion-authority guard so a
+			// stale busy from /session/status does not re-strand.
+			s.cancelGraceLocked(ne.SessionID)
+			s.setActivityLocked(ne.SessionID, ActivityIdle)
+			s.completionAuthoritative[ne.SessionID] = true
+			// #2696 discriminator: a LIVE session.idle was observed (the
+			// authoritative terminal). A subsequent mutable message.updated is
+			// the trap (OpenCode stamps its fs-snapshot diff AFTER idle), so
+			// upsertMessageLocked's #2696 guard refuses to re-open the turn
+			// while this is set. Distinct from completionAuthoritative (which
+			// graceFire also sets); this is session.idle-only.
+			s.liveIdleObserved[ne.SessionID] = true
+			// P7 turn-state: session.idle is a turn TERMINAL. If the turn was
+			// Stopping, this is the canceled run's terminal — settle the abort
+			// (OPEN the fail-closed gate) and go TurnIdle. If Running, the turn
+			// ended normally → TurnIdle. NO auto-promotion (caller-driven).
+			s.settleTerminalLocked(ne.SessionID)
+		case NormSessionTerminalError:
+			s.setActivityLocked(ne.SessionID, ActivityError)
+			// F4 (folded into slice #3): session.error is an OBSERVED turn
+			// terminal — the SAME class as session.idle — so it arms
+			// liveIdleObserved too. This widens the #2696 guard's coverage from
+			// {session.idle} to {session.idle, session.error}: a mutable
+			// message.updated arriving AFTER either observed terminal must NOT
+			// re-open the turn (the #2696 trap). Before this arm, a post-error
+			// mutable message re-escalated to busy (the F4 RED test,
+			// TestP7Fold_PostErrorMutableMessageDoesNotReopenTurn). graceFire
+			// stays OUT of the guard by design — it is an INFERRED terminal, and
+			// the principle is "never BLOCK a turn on an inference." This is the
+			// P7 observed-vs-inferred line applied structurally (two OBSERVED
+			// terminal kinds) rather than by convention.
+			s.liveIdleObserved[ne.SessionID] = true
+			// P7 turn-state: session.error is a turn TERMINAL. Settle the same
+			// way session.idle does.
+			s.settleTerminalLocked(ne.SessionID)
+		case NormSessionStatus:
+			normalized := normalizeActivity(ne.StatusType)
+			s.setActivityLocked(ne.SessionID, normalized)
+			// P7 turn-state / #2696 boundary: AUTHORITATIVE runner status
+			// (busy|retry) is the ONLY signal that may (re)start a turn
+			// (paseo shouldStartAutonomousTurn). A mutable message.updated is
+			// NOT (see the #2696 guard in upsertMessageLocked). markTurnRunningLocked
+			// also opens the abort gate if a stop was in flight (the server
+			// accepting a new turn ⇒ the prior abort settled).
+			if normalized == ActivityBusy || normalized == ActivityRetry {
+				s.markTurnRunningLocked(ne.SessionID)
 			}
 		}
-	case "message.updated":
-		var p struct {
-			Info json.RawMessage `json:"info"`
-		}
-		if json.Unmarshal(ev.Properties, &p) == nil && len(p.Info) > 0 {
-			s.upsertMessageLocked(p.Info)
-		}
-	case "message.removed":
-		var p struct {
-			SessionID string `json:"sessionID"`
-			MessageID string `json:"messageID"`
-		}
-		if json.Unmarshal(ev.Properties, &p) == nil {
-			s.deleteMessageLocked(p.SessionID, p.MessageID)
-		}
-	case "message.part.updated":
-		var p struct {
-			Part json.RawMessage `json:"part"`
-		}
-		if json.Unmarshal(ev.Properties, &p) == nil && len(p.Part) > 0 {
-			s.upsertPartLocked(p.Part)
-		}
-	case "message.part.delta":
+	case NormMessageUpsert:
+		s.upsertMessageLocked(ne.Raw) // ne.Raw is the message info sub-blob
+	case NormMessageRemove:
+		s.deleteMessageLocked(ne.SessionID, ne.MessageID)
+	case NormPartUpsert:
+		s.upsertPartLocked(ne.Raw) // ne.Raw is the part sub-blob
+	case NormPartDelta:
 		// Token-level streaming: OpenCode publishes deltas ({field,delta})
 		// separately from the full message.part.updated snapshot. Accumulate them
 		// so streaming text appears live instead of only at the next snapshot.
-		var p struct {
-			SessionID string `json:"sessionID"`
-			MessageID string `json:"messageID"`
-			PartID    string `json:"partID"`
-			Field     string `json:"field"`
-			Delta     string `json:"delta"`
-		}
-		if json.Unmarshal(ev.Properties, &p) == nil && p.SessionID != "" && p.PartID != "" && p.Delta != "" {
-			s.appendPartDeltaLocked(p.SessionID, p.MessageID, p.PartID, p.Field, p.Delta)
-		}
-	case "message.part.removed":
-		var p struct {
-			SessionID string `json:"sessionID"`
-			MessageID string `json:"messageID"`
-			PartID    string `json:"partID"`
-		}
-		if json.Unmarshal(ev.Properties, &p) == nil {
-			s.deletePartLocked(p.SessionID, p.MessageID, p.PartID)
-		}
-	case "todo.updated":
-		var p struct {
-			SessionID string `json:"sessionID"`
-		}
-		if json.Unmarshal(ev.Properties, &p) == nil && p.SessionID != "" {
-			s.todos[p.SessionID] = ev.Properties
-			s.emit(KindTodo, ev.Properties)
-		}
-	case "permission.asked", "permission.updated":
-		// OpenCode emits "permission.asked"; "permission.updated" is kept for
-		// compatibility. Properties are the permission Request ({id, sessionID, …}).
-		var p permissionEnvelope
-		if json.Unmarshal(ev.Properties, &p) == nil && p.SessionID != "" && p.ID != "" {
-			// M2/L-06: setPermissionLocked is the EXCLUSIVE owner of this
-			// production write — it captures wasPending, mutates s.perms,
-			// applies the subtreePendingInput delta, and emits
-			// KindPermissionSet. Phantom-guarded inside the helper.
-			s.setPermissionLocked(p.SessionID, p.ID, ev.Properties)
-		}
-	case "permission.replied":
-		// OpenCode sends {sessionID, requestID, reply}; older/fixture payloads use
-		// permissionID. Normalize so the client's delete (keyed by permissionID)
-		// always clears the card.
-		var p struct {
-			SessionID    string `json:"sessionID"`
-			RequestID    string `json:"requestID"`
-			PermissionID string `json:"permissionID"`
-		}
-		if json.Unmarshal(ev.Properties, &p) == nil && p.SessionID != "" {
-			id := p.RequestID
-			if id == "" {
-				id = p.PermissionID
-			}
-			// M2/L-06: clearPermissionLocked owns the clear + delta + emit.
-			s.clearPermissionLocked(p.SessionID, id)
-		}
-	case "question.asked":
-		var p struct {
-			ID        string `json:"id"`
-			SessionID string `json:"sessionID"`
-		}
-		if json.Unmarshal(ev.Properties, &p) == nil && p.SessionID != "" && p.ID != "" {
-			// M2/L-06: setQuestionLocked owns the write + delta + emit.
-			s.setQuestionLocked(p.SessionID, p.ID, ev.Properties)
-		}
-	case "question.replied", "question.rejected":
-		var p struct {
-			SessionID string `json:"sessionID"`
-			RequestID string `json:"requestID"`
-		}
-		if json.Unmarshal(ev.Properties, &p) == nil && p.SessionID != "" {
-			// M2/L-06: clearQuestionLocked owns the clear + delta + emit.
-			s.clearQuestionLocked(p.SessionID, p.RequestID)
-		}
-	default:
-		// server.connected / heartbeat / instance.disposed / file.* — ignored for the view.
+		s.appendPartDeltaLocked(ne.SessionID, ne.MessageID, ne.PartID, ne.Field, ne.Delta)
+	case NormPartRemove:
+		s.deletePartLocked(ne.SessionID, ne.MessageID, ne.PartID)
+	case NormTodoUpsert:
+		s.todos[ne.SessionID] = ne.Raw
+		s.emit(KindTodo, ne.Raw)
+	case NormPermissionSet:
+		// M2/L-06: setPermissionLocked is the EXCLUSIVE owner of this
+		// production write — it captures wasPending, mutates s.perms,
+		// applies the subtreePendingInput delta, and emits
+		// KindPermissionSet. Phantom-guarded inside the helper.
+		s.setPermissionLocked(ne.SessionID, ne.ID, ne.Raw)
+	case NormPermissionClear:
+		// M2/L-06: clearPermissionLocked owns the clear + delta + emit.
+		s.clearPermissionLocked(ne.SessionID, ne.ID)
+	case NormQuestionSet:
+		// M2/L-06: setQuestionLocked owns the write + delta + emit.
+		s.setQuestionLocked(ne.SessionID, ne.ID, ne.Raw)
+	case NormQuestionClear:
+		// M2/L-06: clearQuestionLocked owns the clear + delta + emit.
+		s.clearQuestionLocked(ne.SessionID, ne.ID)
 	}
 }
 

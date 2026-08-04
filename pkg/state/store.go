@@ -685,6 +685,12 @@ type Store struct {
 	// the stale-busy guard). Cleared by an authoritative new turn
 	// (markTurnRunningLocked). See upsertMessageLocked.
 	liveIdleObserved map[string]bool
+	// translator is the SINGLE VERSIONED boundary at which raw opencode.Event
+	// wire-JSON is parsed into a NormalizedEvent for Apply (slice #3 — the
+	// contract/translator rewire). Defaults to TranslatorV1 (the current
+	// opencode event shape); a future shape is a translator swap, not a 16th
+	// Apply switch arm. See translate.go.
+	translator Translator
 	// deltaFlushInterval is the per-instance throttle window for streaming
 	// part-delta flushes (Option C / P1-AGG-004). Promoted off the package
 	// global so tests shrink the instance under test rather than the shared
@@ -1043,6 +1049,9 @@ func NewWithConfig(cfg Config) (*Store, error) {
 		stopTimers:       map[string]*time.Timer{},
 		stopGen:          map[string]uint64{},
 		liveIdleObserved: map[string]bool{},
+		// P7 slice #3: the versioned opencode→NormalizedEvent translator. Default
+		// to the current event shape (v1); Apply routes through Translate.
+		translator: TranslatorV1{},
 		// Every tunable is sourced from the validated Config (M6): the
 		// package-default values arrive via DefaultConfig, but the instance
 		// fields are the only thing the hot paths read — there is no
