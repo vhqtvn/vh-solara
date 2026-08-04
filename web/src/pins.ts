@@ -656,20 +656,8 @@ export async function togglePin(id: string): Promise<void> {
   legacyTogglePin(id);
 }
 
-export async function movePinnedTo(
-  draggedId: string,
-  targetId: string,
-  pos: "before" | "after",
-): Promise<void> {
-  if (pinsMode() === "server") {
-    await performReorder(draggedId, targetId, pos);
-    return;
-  }
-  legacyMovePinnedTo(draggedId, targetId, pos);
-}
-
-// Keyboard-accessible reorder for pinned ROOT sessions — the a11y fallback for
-// the pointer-only drag handle. Move `id` one slot toward a neighbor. Inert at
+// Keyboard-accessible reorder for pinned ROOT sessions — the context-menu
+// "Move up / Move down" items. Move `id` one slot toward a neighbor. Inert at
 // the boundary being pushed past and when id is absent from the order.
 export async function movePinnedByOffset(id: string, delta: -1 | 1): Promise<void> {
   if (pinsMode() === "server") {

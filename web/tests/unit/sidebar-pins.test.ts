@@ -13,7 +13,6 @@ import {
   coercePinDoc,
   dropPinnedSession,
   isPinned,
-  movePinnedTo,
   movePinnedByOffset,
   pinsInitialized,
   pinsLastError,
@@ -315,33 +314,7 @@ describe("togglePin (server mode) — PUT + bounded 409 retry", () => {
   });
 });
 
-describe("movePinnedTo / movePinnedByOffset (server mode) — reorder, no replay", () => {
-  it("reorders via PUT 200 and adopts", async () => {
-    applyPinsSnapshot(pinDoc(1, true, ["a", "b", "c"]));
-    const fetchMock = vi.fn(() => Promise.resolve(jsonRes(pinDoc(2, true, ["c", "a", "b"]))));
-    vi.stubGlobal("fetch", fetchMock);
-
-    await movePinnedTo("c", "a", "before");
-
-    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
-    expect(body.orderedSessionIds).toEqual(["c", "a", "b"]);
-    expect(reconciledPinnedOrder()).toEqual(["c", "a", "b"]);
-  });
-
-  it("on 409 discards the optimistic ordering and does NOT auto-replay", async () => {
-    applyPinsSnapshot(pinDoc(1, true, ["a", "b", "c"]));
-    const fetchMock = vi.fn(() =>
-      Promise.resolve(jsonRes(pinDoc(1, true, ["a", "b", "c", "d"]), 409)),
-    );
-    vi.stubGlobal("fetch", fetchMock);
-
-    await movePinnedTo("c", "a", "before");
-
-    expect(fetchMock).toHaveBeenCalledTimes(1); // NO retry for reorder
-    expect(reconciledPinnedOrder()).toEqual(["a", "b", "c", "d"]); // authoritative
-    expect(pinsLastError()).toBe("pin-conflict");
-  });
-
+describe("movePinnedByOffset (server mode) — reorder", () => {
   it("movePinnedByOffset translates to a reorder PUT", async () => {
     applyPinsSnapshot(pinDoc(1, true, ["a", "b", "c"]));
     const fetchMock = vi.fn(() => Promise.resolve(jsonRes(pinDoc(2, true, ["b", "a", "c"]))));
@@ -440,7 +413,7 @@ describe("400 self-heal — stale pinned id dropped + one bounded retry", () => 
     const fetchMock = vi.fn(() => Promise.resolve(seq[i++]));
     vi.stubGlobal("fetch", fetchMock);
 
-    await movePinnedTo("b", "a", "before"); // move b before a
+    await movePinnedByOffset("b", -1); // move b up one slot (before a)
 
     // First PUT: reorder ["stale","a","b"] → ["stale","b","a"] → 400 unknownIds=["stale"].
     // cleanedBase = ["a","b"]; retryTarget = reorder ["a","b"] b-before-a → ["b","a"].
@@ -589,19 +562,19 @@ describe("Phase 6 — concurrency + DEFER regressions", () => {
 
   it("stale reorder is NOT silently replayed — on 409 adopts the server doc verbatim", async () => {
     applyPinsSnapshot(pinDoc(1, true, ["a", "b", "c"]));
-    // User reorders c→before a (optimistic [c,a,b]); server 409s with a doc whose
+    // User moves c up one slot (optimistic [a,c,b]); server 409s with a doc whose
     // order DIFFERS (a concurrent change appended "d", rev2). The new
     // adoptPutResponse guard adopts it (2 >= 1) and the client must NOT re-apply
-    // the stale [c,a,b] permutation. Reorder never retries.
+    // the stale [a,c,b] permutation. Reorder never retries.
     const fetchMock = vi.fn(() =>
       Promise.resolve(jsonRes(pinDoc(2, true, ["a", "b", "c", "d"]), 409)),
     );
     vi.stubGlobal("fetch", fetchMock);
 
-    await movePinnedTo("c", "a", "before");
+    await movePinnedByOffset("c", -1);
 
     expect(fetchMock).toHaveBeenCalledTimes(1); // NO retry for reorder
-    expect(reconciledPinnedOrder()).toEqual(["a", "b", "c", "d"]); // server doc, NOT [c,a,b]
+    expect(reconciledPinnedOrder()).toEqual(["a", "b", "c", "d"]); // server doc, NOT [a,c,b]
     expect(pinsLastError()).toBe("pin-conflict");
   });
 
@@ -772,12 +745,12 @@ describe("rollbackOrderIfUnchanged — CAS regression for initial-PUT + reorder 
   });
 
   it("reorder rollback succeeds when revision is unchanged", async () => {
-    // movePinnedTo on a baseline order; the first PUT fails non-409 (network).
-    // No fresher frame landed, so the optimistic reorder rolls back to baseline.
+    // movePinnedByOffset on a baseline order; the first PUT fails non-409 (network).
+    // No fresher frame landed during the round-trip, so the optimistic reorder rolls back to baseline.
     applyPinsSnapshot(pinDoc(1, true, ["a", "b", "c"]));
     vi.stubGlobal("fetch", vi.fn(() => Promise.reject(new Error("net"))));
 
-    await movePinnedTo("c", "a", "before"); // optimistic ["c","a","b"] → rolled back
+    await movePinnedByOffset("c", -1); // optimistic ["a","c","b"] → rolled back
 
     expect(reconciledPinnedOrder()).toEqual(["a", "b", "c"]); // baseline restored
     expect(pinsRevision()).toBe(1);
@@ -785,16 +758,16 @@ describe("rollbackOrderIfUnchanged — CAS regression for initial-PUT + reorder 
   });
 
   it("reorder rollback is a no-op when a fresher frame landed", async () => {
-    // movePinnedTo issues a PUT that stays pending; a pins.updated frame (rev5)
+    // movePinnedByOffset issues a PUT that stays pending; a pins.updated frame (rev5)
     // lands DURING the round-trip and is adopted. The PUT then fails non-409.
     // serverRevision() (5) !== baseRev (1), so the rollback is skipped.
     applyPinsSnapshot(pinDoc(1, true, ["a", "b", "c"]));
     let rejectPut!: (e: unknown) => void;
     vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>((_, rej) => (rejectPut = rej))));
 
-    const p = movePinnedTo("c", "a", "before");
-    await flush(); // optimistic ["c","a","b"] applied; PUT pending
-    expect(reconciledPinnedOrder()).toEqual(["c", "a", "b"]);
+    const p = movePinnedByOffset("c", -1);
+    await flush(); // optimistic ["a","c","b"] applied; PUT pending
+    expect(reconciledPinnedOrder()).toEqual(["a", "c", "b"]);
 
     applyPinsUpdated(pinDoc(5, true, ["a", "b", "c", "d"])); // fresher frame adopted
     expect(pinsRevision()).toBe(5);

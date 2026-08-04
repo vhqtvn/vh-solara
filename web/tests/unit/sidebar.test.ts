@@ -4,7 +4,6 @@ import {
   isPinned,
   togglePin,
   reconciledPinnedOrder,
-  movePinnedTo,
   movePinnedByOffset,
   __resetPinnedForTest,
 } from "../../src/pins";
@@ -12,8 +11,8 @@ import {
 // The pinned order model lives in pins.ts alongside the membership set. The
 // set is the source of truth for membership; the order array only governs the
 // display order within the pinned group. These tests cover the reconciliation
-// invariant, the pin/unpin append/remove behavior, drag reorder persistence,
-// and the lazy migration from a v1-only (no order array) store.
+// invariant, the pin/unpin append/remove behavior, keyboard reorder
+// persistence, and the lazy migration from a v1-only (no order array) store.
 
 beforeEach(() => {
   localStorage.clear();
@@ -34,8 +33,8 @@ describe("reconciledPinnedOrder", () => {
 
   it("preserves a persisted order for current members", () => {
     ["a", "b", "c"].forEach(togglePin);
-    movePinnedTo("c", "a", "before"); // → [c, a, b]
-    expect(reconciledPinnedOrder()).toEqual(["c", "a", "b"]);
+    movePinnedByOffset("c", -1); // [a, c, b]
+    expect(reconciledPinnedOrder()).toEqual(["a", "c", "b"]);
   });
 
   it("drops stale ids (unpinned since last save)", () => {
@@ -106,36 +105,6 @@ describe("togglePin order behavior", () => {
     expect(reconciledPinnedOrder()).toEqual([]);
     expect(isPinned("a")).toBe(false);
     expect(readOrderStore()).toEqual([]);
-  });
-});
-
-describe("movePinnedTo (drag reorder)", () => {
-  it("moves before a target and persists to the order store", () => {
-    ["a", "b", "c"].forEach(togglePin); // [a, b, c]
-    movePinnedTo("c", "a", "before"); // [c, a, b]
-    expect(reconciledPinnedOrder()).toEqual(["c", "a", "b"]);
-    expect(readOrderStore()).toEqual(["c", "a", "b"]);
-  });
-
-  it("moves after a target", () => {
-    ["a", "b", "c"].forEach(togglePin);
-    movePinnedTo("a", "c", "after"); // [b, c, a]
-    expect(reconciledPinnedOrder()).toEqual(["b", "c", "a"]);
-  });
-
-  it("is a no-op when dragged === target (no pointless write)", () => {
-    ["a", "b", "c"].forEach(togglePin);
-    movePinnedTo("b", "b", "before");
-    expect(reconciledPinnedOrder()).toEqual(["a", "b", "c"]);
-  });
-
-  it("survives a reload (order rehydrates from the store)", () => {
-    ["a", "b", "c"].forEach(togglePin);
-    movePinnedTo("c", "a", "before"); // [c, a, b]
-    // Simulate a fresh page load: re-import-time hydration is modeled by
-    // __resetPinnedForTest re-reading the (still-populated) store.
-    __resetPinnedForTest();
-    expect(reconciledPinnedOrder()).toEqual(["c", "a", "b"]);
   });
 });
 

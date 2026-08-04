@@ -248,13 +248,12 @@ export default function SessionContextMenu() {
         >
           <Icon name="layers" size={14} /> {isPinned(props.id) ? "Unpin" : "Pin to top"}
         </button>
-        {/* Keyboard reorder for pinned ROOT sessions only (the pointer drag
-            handle has no keyboard affordance). The scope fence matches the
-            drag feature: subsessions and unpinned rows never show these.
-            Disabled at the ends so the first item's "Move up" and last item's
-            "Move down" read as inert rather than firing a no-op. Also disabled
-            while a pin mutation is in flight (pinsPending) so a conflicting
-            reorder cannot stack on an unresolved PUT. */}
+        {/* Keyboard reorder for pinned ROOT sessions only. Subsessions and
+            unpinned rows never show these. Disabled at the ends so the first
+            item's "Move up" and last item's "Move down" read as inert rather
+            than firing a no-op. Also disabled while a pin mutation is in flight
+            (pinsPending) so a conflicting reorder cannot stack on an
+            unresolved PUT. */}
         <Show when={isPinned(props.id) && !state.sessions[props.id]?.parentID}>
           {(() => {
             const order = reconciledPinnedOrder();
