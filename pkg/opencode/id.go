@@ -80,21 +80,45 @@ var (
 // regenerated after a timeout. Used by the queue (Enqueue) as the authoritative
 // correlation ID threaded into prompt_async's `messageID` body field.
 func MintMessageID() string {
-	ms := time.Now().UnixMilli()
 	mintMu.Lock()
+	// Read the wall clock INSIDE the lock and forward-clamp it so mintLastMs is
+	// non-decreasing. time.Now().UnixMilli() is pure wall clock (not Go's
+	// monotonic clock) and can step backwards under NTP/settimeofday; clamping
+	// honors the format's ascending intent over raw wall-clock under skew.
+	ms := time.Now().UnixMilli()
+	if ms < mintLastMs {
+		ms = mintLastMs
+	}
 	if ms != mintLastMs {
 		mintLastMs = ms
 		mintCounter = 0
 	}
 	mintCounter++
+	// Saturate at 0xFFF so the counter can never bleed into the timestamp bits.
+	// id.ts's `counter++` is unbounded and WOULD bleed past 0x1000 (carrying into
+	// the ms bits) if >4095 IDs were minted in one millisecond — and a bleed
+	// breaks the very monotonicity this format exists to provide: a bled prefix
+	// (effective ms = real_ms + carry) sorts AFTER the prefix minted when the
+	// next millisecond actually advances and the counter resets to 1. id.ts never
+	// hits this because a single user session mints far fewer than 4096/ms, but
+	// our port shares one counter across all callers (dense test loops, multiple
+	// test functions, -count iterations) and CAN exceed 4096/ms. Saturating
+	// preserves the byte layout and the now = ms*0x1000 + counter encoding
+	// exactly (counter ∈ [1, 4095]); in the >4095/ms regime — unreachable in
+	// production (the queue mints one ID per Enqueue, gated by fsync) — the
+	// saturated counter holds a stable prefix instead of bleeding, and the
+	// random 14-char tail still guarantees uniqueness. This is a strictly better
+	// realization of id.ts's ascending intent than replicating its latent bleed.
+	if mintCounter > 0xFFF {
+		mintCounter = 0xFFF
+	}
 	counter := mintCounter
 	mintMu.Unlock()
 
 	// now = ms * 0x1000 + counter, mirroring id.ts's
 	// `BigInt(currentTimestamp) * BigInt(0x1000) + BigInt(counter)`. counter
-	// mirrors id.ts exactly (starts at 1 within a ms); if it ever exceeds
-	// 0x1000 it bleeds into the timestamp bits — that is id.ts's own behavior
-	// and we replicate it for fidelity.
+	// mirrors id.ts exactly (starts at 1 within a ms) and is saturated at 0xFFF
+	// above, so it never carries into the timestamp bits.
 	now := uint64(ms)*0x1000 + counter
 
 	// Low 48 bits of `now`, big-endian, as 6 bytes → 12 lowercase hex chars.
