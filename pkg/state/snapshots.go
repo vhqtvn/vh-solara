@@ -1250,8 +1250,13 @@ func isTerminalError(name string) bool {
 // lying cold load from a faithful one: only a SECOND reconcile observing the SAME
 // empty newest confirms source-truth (the schema-drift shape instead resolves
 // via the len(parts)>0 branch once the re-fetch serves the real parts). An
-// in-progress assistant (parts still streaming), no assistant message, or no
-// message state at all return true (vacuously resident — nothing is provably
+// in-progress newest assistant does not by itself decide residency: the walk
+// continues PAST it to the newest COMPLETED assistant, because "completed" does
+// not imply "has all parts" (the activity-idle path can stamp time.completed
+// WITHOUT adding parts), so a newer in-progress turn must not mask an OLDER
+// completed assistant's zero-parts gap. If there is no completed assistant at
+// all — no assistant message, every assistant in-progress, or no message state
+// — the walk returns true (vacuously resident: nothing completed is provably
 // missing). Caller holds s.mu (RLock is sufficient; read-only).
 func (s *Store) latestAssistantResidentLocked(sid string) bool {
 	sm := s.messages[sid]
@@ -1264,7 +1269,16 @@ func (s *Store) latestAssistantResidentLocked(sid string) bool {
 			continue
 		}
 		if !me.completed {
-			return true // in-progress: parts still streaming — not provably missing
+			// In-progress turn: its parts are still streaming, so it cannot
+			// itself be a completed-0-parts gap. But it must NOT mask an OLDER
+			// completed assistant's missing parts — "completed" does not imply
+			// "has all parts" (the activity-idle path can stamp time.completed
+			// without adding parts). Continue the newest->oldest walk to the
+			// newest COMPLETED assistant, whose residency the contract keys on.
+			// If every assistant is in-progress (no completed turn at all), the
+			// walk falls through to the trailing `return true` (vacuously
+			// resident — nothing completed is provably missing).
+			continue
 		}
 		if len(me.parts) > 0 {
 			return true
@@ -1300,7 +1314,7 @@ func (s *Store) latestAssistantResidentLocked(sid string) bool {
 		// re-fetch, preserving the S5 guard (3b3860e).
 		return s.confirmedEmptyNewest[sid] == me.id
 	}
-	return true // no assistant message
+	return true // no COMPLETED assistant message (none at all, or every assistant in-progress)
 }
 
 // SessionIDs returns the ids of the LIVE (active) sessions in this store's
