@@ -1510,6 +1510,33 @@ func (f *FakeOpenCode) handleFixtureReset(w http.ResponseWriter, r *http.Request
 		return
 	}
 	f.mu.Lock()
+	// Collect accumulated message IDs (present in the current transcript but
+	// NOT in the seeded baseline) BEFORE the restore below overwrites
+	// f.messages. These are messages prior tests appended via simulatePrompt
+	// (user turns + streamed assistant replies from the prompt-sending tests)
+	// that the fixture-side restore clears from f.messages but the AGGREGATOR
+	// store (pkg/state — the SPA's snapshot source) still holds. The store's
+	// reconcile is upsert-only ("absence never deletes", reconcileMessagesLocked
+	// Option A) and EnsureMessages short-circuits on IsMessagesLoaded=true, so a
+	// page.goto never re-fetches and the accumulated transcript persists across
+	// serial --repeat-each iterations. Emitting message.removed for each (after
+	// the unlock, below) is what clears the aggregator store — same
+	// aggregator-store-clear rationale as the clearedQ/clearedP emits further
+	// down for leaked blocker state.
+	baseIDs := map[string]bool{}
+	if base, ok := f.baseline[session]; ok {
+		for _, m := range base {
+			if id, _ := m.Info["id"].(string); id != "" {
+				baseIDs[id] = true
+			}
+		}
+	}
+	var removedMsgs []string
+	for _, m := range f.messages[session] {
+		if id, _ := m.Info["id"].(string); id != "" && !baseIDs[id] {
+			removedMsgs = append(removedMsgs, id)
+		}
+	}
 	if base, ok := f.baseline[session]; ok {
 		f.messages[session] = append([]messageWithParts(nil), base...)
 	} else {
@@ -1558,6 +1585,25 @@ func (f *FakeOpenCode) handleFixtureReset(w http.ResponseWriter, r *http.Request
 	}
 	for _, pid := range clearedP {
 		f.emit("permission.replied", map[string]any{"sessionID": session, "requestID": pid})
+	}
+	// Emit message.removed for each accumulated message so the aggregator store
+	// (pkg/state) drops it too — same aggregator-store-clear rationale as the
+	// question.replied/permission.replied emits above. Clearing only f.messages
+	// is NOT sufficient: the aggregator holds the accumulated transcript in its
+	// store (EnsureMessages short-circuits on IsMessagesLoaded=true so page.goto
+	// never re-fetches, and the store's reconcile is upsert-only so a re-hydrate
+	// via POST /vh/reload won't remove them either — "absence never deletes").
+	// message.removed maps to KindMessageDelete in the store (translate.go →
+	// deleteMessageLocked), which removes the message + its parts and forwards a
+	// message.delete to any connected SPA. Without these emits, prompt-sending
+	// tests (scroll-follow 4/9/10b/11/12) accumulate user+assistant turns across
+	// serial --repeat-each iterations, growing scrollHeight so the
+	// scroll-follow geometry (captured bottomClamp) drifts stale by repeat 4+.
+	// (Cross-repeat transcript-accumulation flake — sibling of the terminal PTY
+	// contamination fix 54703e61; both are serial-suite shared-backend state that
+	// the per-test fixture reset must explicitly clear from the aggregator.)
+	for _, mid := range removedMsgs {
+		f.emit("message.removed", map[string]any{"sessionID": session, "messageID": mid})
 	}
 	// Notify any connected client the session is idle; a fresh page.goto re-reads
 	// the cleared status regardless, so this is belt-and-suspenders.
