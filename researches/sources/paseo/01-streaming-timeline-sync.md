@@ -1,5 +1,5 @@
 # Paseo — streaming & timeline-sync
-Pin: 9e5accee (base, verified). Cross-checked against HEAD 5d15e40 (see README open contradiction).
+Pin: 9e5accee (base, verified). Cross-checked against HEAD 5d15e40 (backpressure threshold resolved at both pins — see README § "Backpressure threshold — RESOLVED").
 Source access: local clone refs/paseo @ 9e5accee.
 
 ## Model
@@ -13,8 +13,8 @@ Source access: local clone refs/paseo @ 9e5accee.
 
 ## Backpressure — DEFINITIVE (at 9e5accee)
 - The agent-manager fan-out is an **unbounded synchronous loop** (no per-subscriber buffer/queue).
-- BUT the WS send layer enforces a hard high-water → **terminate socket**: `packages/server/src/server/websocket/physical-socket.ts:MAX_PHYSICAL_SOCKET_BUFFERED_BYTES`. `sendBoundedPhysicalFrame` checks `bufferedAmount + frameBytes <= cap`; over → `closeAtOutboundHighWater` → `ws.terminate()`. `sendMessageToSockets` pre-filters sockets by capacity and **silently drops** when none writable.
-- **⚠️ CONTRADICTION (see README):** the cap value cited at 9e5accee was **64 MiB**. HEAD `docs/architecture.md` (5d15e40) says **8 MiB hard + 4 MiB terminal-soft**. **Re-derive from code before relying on either number.** Mechanism (terminate-not-throttle, no producer feedback) is confirmed; the threshold is not.
+- BUT the WS send layer enforces a hard high-water → **terminate socket**: `packages/server/src/server/websocket/physical-socket.ts:MAX_PHYSICAL_SOCKET_BUFFERED_BYTES`. `sendBoundedPhysicalFrame` checks `bufferedAmount + frameBytes <= cap`; over → invokes a **caller-supplied `onHighWater: () => void` callback** (the `ws.terminate()` action lives in the caller, not a named export in `physical-socket.ts`). `sendMessageToSockets` pre-filters sockets by capacity and **silently drops** when none writable.
+- **RESOLVED (read at `9e5accee` + `5d15e40`):** the cap is **64 MiB** at BOTH commits, byte-identical (`MAX_PHYSICAL_SOCKET_BUFFERED_BYTES = 64*1024*1024`). Paseo's `docs/architecture.md` "8 MiB hard" is a **paseo doc-error** (same layer, wrong number). The **4 MiB terminal-soft** is also confirmed in code (`terminal-restore.ts:MAX_CLIENT_BUFFERED_BYTES = 4*1024*1024`). The relay-adapter queue the doc folds into "8 MiB" is a different queue and scoped out (vh-solara doesn't use paseo's relay topology). Mechanism (terminate-not-throttle, no producer feedback) confirmed; threshold = 64 MiB hard + 4 MiB soft.
 
 ## Durable / retention — DEFINITIVE
 - **OSS daemon wires NO durable timeline store** (`bootstrap.ts:new AgentManager` omits `durableTimelineStore`; repo has zero concrete `AgentTimelineStore` impls — only the interface + injection point). Timeline rows live ONLY in process memory → **all lost on crash**.
