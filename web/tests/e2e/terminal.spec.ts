@@ -1,6 +1,6 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { expect, test } from "@playwright/test";
+import { expect, test, type APIRequestContext } from "@playwright/test";
 import { projectUrl } from "./util";
 
 // Repo root — a real directory, so the PTY can actually spawn a shell. (The
@@ -28,6 +28,41 @@ async function termKill(page: import("@playwright/test").Page, dir: string, id: 
     { d: dir, i: id },
   );
 }
+
+async function resetAllTerminals(request: APIRequestContext): Promise<void> {
+  // GET /vh/term/list with NO ?dir= returns EVERY live terminal across all
+  // project dirs (handleTermList -> listTermSessions("")); each TermInfo carries
+  // its own `dir`, which POST /vh/term/kill requires. Killing all of them makes
+  // every test (and every --repeat-each iteration) start from clean PTY state.
+  //
+  // Why this matters: termReg is a package-global map that persists across the
+  // WHOLE fixtureserver process (workers:1, fullyParallel:false -> one shared
+  // server). The "terminal tabs" test spawns a "shared" PTY and never kills it,
+  // and the vim test leaves "shared" alive with accumulated scrollback/tildes
+  // after :q. On the next repeat the SPA reattaches that stale PTY and replays
+  // its buffer, so a fresh test pollutes its polls with leftover output. Killing
+  // all terminals up front means the first Terminal click spawns a FRESH shell
+  // with empty scrollback every time.
+  //
+  // Uses the bare `request` fixture (NOT page.request): in beforeEach the page
+  // has not navigated yet, so page.request would resolve the relative URL
+  // against about:blank and silently no-op (same rationale as resetPins in
+  // util.ts). GET is CSRF-exempt; POST carries X-VH-CSRF.
+  const res = await request.get("/vh/term/list");
+  const terms = res.ok() ? ((await res.json()) as Array<{ dir: string; id: string }>) : [];
+  await Promise.all(
+    terms.map((t) =>
+      request.post("/vh/term/kill", {
+        headers: { "X-VH-CSRF": "1" },
+        data: { dir: t.dir, id: t.id },
+      }),
+    ),
+  );
+}
+
+test.beforeEach(async ({ request }) => {
+  await resetAllTerminals(request);
+});
 
 test("terminal tabs: separate shells, add, switch, and per-tab kill", async ({ page }) => {
   await page.goto(`/?dir=${encodeURIComponent(repoRoot)}`);
