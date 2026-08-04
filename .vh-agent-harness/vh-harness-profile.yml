@@ -1,6 +1,9 @@
 profile: supervised
 features:
     backlog: false
+    contract-invariant-audit-pilot: true
+    formal-verification-pilot: true
+    resolve-first-pilot: true
 overlays:
     - auto-classifier-pilot
     - release

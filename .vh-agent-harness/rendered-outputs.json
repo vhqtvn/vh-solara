@@ -1,5 +1,55 @@
 {
   "manifest_version": "1",
-  "successful_render_id": "1005023f7a38a1b6",
-  "entries": []
+  "successful_render_id": "1268e9491ea1aae8",
+  "entries": [
+    {
+      "destination_path": ".opencode/skills/contract-invariant-audit/SKILL.md",
+      "producer_kind": "overlay_skill",
+      "overlay_pack": "contract-invariant-audit-pilot",
+      "source_relative_path": "skills/contract-invariant-audit/SKILL.md",
+      "rendered_digest": "sha256:f721a42c88cf114d8d72ae56740c3371b803cebc2ddc680ef902d60dea0d1f89"
+    },
+    {
+      "destination_path": ".opencode/skills/contract-invariant-audit/references/pilot-runbook.md",
+      "producer_kind": "overlay_skill",
+      "overlay_pack": "contract-invariant-audit-pilot",
+      "source_relative_path": "skills/contract-invariant-audit/references/pilot-runbook.md",
+      "rendered_digest": "sha256:f7df10194fd7856513b7637a1972646e1a8551888ca36b75749d58b4c167ad98"
+    },
+    {
+      "destination_path": ".opencode/skills/contract-invariant-audit/scripts/manifest-helper.js",
+      "producer_kind": "overlay_skill",
+      "overlay_pack": "contract-invariant-audit-pilot",
+      "source_relative_path": "skills/contract-invariant-audit/scripts/manifest-helper.js",
+      "rendered_digest": "sha256:47d6f5d61a212d2627c39647457a0092c0c4ca0de30b975a01913923f7b860b9"
+    },
+    {
+      "destination_path": ".opencode/skills/formal-verification/SKILL.md",
+      "producer_kind": "overlay_skill",
+      "overlay_pack": "formal-verification-pilot",
+      "source_relative_path": "skills/formal-verification/SKILL.md",
+      "rendered_digest": "sha256:1df3c76e054925c0758541358bb0050389c34bb13fbe59746d4e97df64b273ef"
+    },
+    {
+      "destination_path": ".opencode/skills/formal-verification/references/pilot-runbook.md",
+      "producer_kind": "overlay_skill",
+      "overlay_pack": "formal-verification-pilot",
+      "source_relative_path": "skills/formal-verification/references/pilot-runbook.md",
+      "rendered_digest": "sha256:f901c1e62a6c8942cb9f5d8e674ee18920ca96b06cb340f7954e0d322b42a539"
+    },
+    {
+      "destination_path": ".opencode/skills/resolve-first/SKILL.md",
+      "producer_kind": "overlay_skill",
+      "overlay_pack": "resolve-first-pilot",
+      "source_relative_path": "skills/resolve-first/SKILL.md",
+      "rendered_digest": "sha256:d75a1f6df7f93fd5abb6c1663f081576f80e3bada90542b102b18e7e9e9bcaaf"
+    },
+    {
+      "destination_path": ".opencode/skills/resolve-first/references/runbook.md",
+      "producer_kind": "overlay_skill",
+      "overlay_pack": "resolve-first-pilot",
+      "source_relative_path": "skills/resolve-first/references/runbook.md",
+      "rendered_digest": "sha256:7eb5b91026d4e3d48846324d46f209144b3b91b510b30dfd6305bd66a36370fe"
+    }
+  ]
 }

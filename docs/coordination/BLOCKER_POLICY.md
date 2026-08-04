@@ -6,6 +6,12 @@
 - `p1`: Work can continue in a narrower lane, but the main objective is blocked.
 - `p2`: Follow-up or cleanup blocker that does not stop the current slice.
 
+> **Before declaring `p0`:** run the **Pre-Operator-Ask Routing Canon** (see
+> *OpenCode Session Workflow* → "Pre-Operator-Ask Routing Canon") as prerequisite
+> triage — self-resolve avoidable asks (re-derive, investigate, act-if-reversible)
+> first; a `p0` is a protected decision that survives that triage, not a fatigue
+> leak.
+
 ## Recording Rules
 
 Use the existing state owners:

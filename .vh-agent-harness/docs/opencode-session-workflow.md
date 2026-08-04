@@ -277,3 +277,27 @@ illustrated by a refuted guard-extension premise whose correct generalization
 proved to be a path-existence check rather than a prefix check — the executor
 recorded the refutation and escalated rather than self-issuing the re-scoping
 as canon.)
+
+## Pre-Operator-Ask Routing Canon
+
+Before asking an operator for a decision or unblock, agents and coordinators
+MUST self-resolve avoidable asks using this routing sequence:
+
+1. **Re-derive the premise:** Re-derive the premise from current repo state
+   (see *Premise-recheck protocol* above).
+2. **Investigate if observable:** If the missing fact is agent-investigable,
+   route to `researcher`, `debate`, or `planner` — don't ask.
+3. **Act if reversible and authorized:** If an authorized, reversible action
+   resolves it, proceed through the normal gate.
+4. **Ask only for protected decisions:** Ask the operator *only* when a named
+   protected decision remains and safe/truthful continuation requires operator
+   disposition — state the exact blocker, options, recommendation, and
+   irreversible consequence.
+5. **INFORMS-only boundary:** Never use this to bypass `p0`, ownership,
+   permission, review, or transition gates.
+
+This canon **INFORMS** self-resolution; it never grants transition authority.
+Steps 4 and 5 are load-bearing: a `p0` that survives this triage is a legitimate
+escalation, not a fatigue leak, and an operator-directive conflict (see
+*Authority on refuted premises* above) is never reclassified as a "reversible
+action" under step 3.
