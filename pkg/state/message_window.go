@@ -522,7 +522,7 @@ func (s *Store) MergeOlderMessages(sid string, items []MessageWithParts, history
 	}
 	if len(prepend) > 0 {
 		newOrder := make([]string, 0, len(prepend)+len(sm.order))
-		newOrder = append(newOrder, prepend...) // fetched oldest-first
+		newOrder = append(newOrder, prepend...)  // fetched oldest-first
 		newOrder = append(newOrder, sm.order...) // resident oldest-first
 		sm.order = newOrder
 		s.bumpMsgRev(sid)

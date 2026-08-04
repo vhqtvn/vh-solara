@@ -317,8 +317,8 @@ func stringSliceToSet(xs []string) map[string]bool {
 // ==========================================================================
 func TestSnapshotWithTreePartial_FrameSizeScaling(t *testing.T) {
 	cases := []struct{ frontier, buried int }{
-		{50, 50},    // ~100 total, frontier ~51
-		{195, 785},  // ~980 total, frontier ~196 (matches the live ses_05ff9273 shape)
+		{50, 50},   // ~100 total, frontier ~51
+		{195, 785}, // ~980 total, frontier ~196 (matches the live ses_05ff9273 shape)
 	}
 	for _, c := range cases {
 		s := New(64)

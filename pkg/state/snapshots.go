@@ -835,6 +835,7 @@ func (s *Store) SnapshotWithTree(e *TreeEmitter, messagesFor map[string]bool, ca
 //     todos/statuses from the snapshot — verified: only the notes-doc feature
 //     references todos; statuses has no SPA consumer). A client MUST NOT touch
 //     its existing map for these.
+//
 // subtreeBusy is captured for ALL sessions (it is a fresh map[string]bool of
 // value copies aliasing nothing, and the gate's SubtreeBusy for a frontier
 // session must reflect its full possibly-buried subtree). This keeps the
@@ -969,6 +970,7 @@ func (s *Store) SnapshotWithTreePartial(e *TreeEmitter, cause string) (Snapshot,
 	}
 	return detail, treeSnap
 }
+
 // before it materializes the result from captured locals. A test sets it to
 // block (e.g. on a channel) so it can drive a concurrent Apply (which needs the
 // write lock) to completion while a Snapshot is parked in its lock-free

@@ -12,11 +12,11 @@ import (
 // endpoint (§8). Mirrors the node.children delta-op data shape (§4) but as a
 // standalone HTTP JSON response, NOT an SSE event.
 type treeChildrenResponse struct {
-	ParentID    string          `json:"parentId"`
-	Nodes       []state.Node    `json:"nodes"`
-	HasMore     bool            `json:"hasMore"`
-	Cursor      string          `json:"cursor,omitempty"`
-	StaleCursor bool            `json:"staleCursor,omitempty"`
+	ParentID    string       `json:"parentId"`
+	Nodes       []state.Node `json:"nodes"`
+	HasMore     bool         `json:"hasMore"`
+	Cursor      string       `json:"cursor,omitempty"`
+	StaleCursor bool         `json:"staleCursor,omitempty"`
 	// Detail (Direction-3 stage-1 slice A, D2) is the page-bounded detail bundle
 	// for the returned Nodes: per-ID session + GateFacts + activity + lastAgents +
 	// currentVerbs (D5), captured under the SAME single RLock as the structural

@@ -414,7 +414,7 @@ func (f *FakeOpenCode) SeedFlatSessions(n int) {
 		f.counter++
 		s := map[string]any{
 			"id": fmt.Sprintf("ses_scale_%d", f.counter), "projectID": "proj",
-			"title": "Scale session " + fmt.Sprintf("%d", f.counter),
+			"title":     "Scale session " + fmt.Sprintf("%d", f.counter),
 			"directory": demoDir,
 			"model":     map[string]any{"providerID": "fake", "id": "dummy", "variant": "default"},
 			"time":      map[string]any{"created": now - float64(f.counter), "updated": now},
