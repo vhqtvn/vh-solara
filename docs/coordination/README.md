@@ -38,25 +38,32 @@ converge on correctness without blocking edits:
 1. **Hybrid split-commit conflict discipline (gate-enforced).** The commit-gate
    O1 preflight refuses an `acquire` whose `--paths` mixes
    `docs/planning/backlog.md` with any other path — so a backlog change can
-   never `cas_conflict` a code commit. The rejection message is the teaching:
-   agents learn split-commit at the commit boundary. On `cas_conflict` for a
-   backlog-only commit, re-read from the new HEAD, re-apply only your rows, and
-   retry. Dirty backlog edits are **preserved before any restore** — never
-   blind-revert `backlog.md`. See [PROMOTER_RUNBOOK.md](PROMOTER_RUNBOOK.md).
+   never content-tangle (land as `could_not_land`) a code commit. The rejection
+   message is the teaching: agents learn split-commit at the commit boundary.
+   On `could_not_land` for a backlog-only commit (the backlog content-tangle —
+   another session's backlog edit landed first), re-read from the new HEAD,
+   re-apply only your rows, and retry. Dirty backlog edits are **preserved
+   before any restore** — never blind-revert `backlog.md`. See
+   [PROMOTER_RUNBOOK.md](PROMOTER_RUNBOOK.md).
 2. **Intake curation.** DEFER findings and p2 follow-ups NEVER become backlog
    rows directly. They land in `.local/coordinator/tasks/` as
    conditional candidates and reach the backlog only after a trigger fires AND
    the promotion Definition of Ready is met (concrete area + file scope +
    validation plan + clear slice + provenance). The promoter runs the
-   `check-defer-triggers.js` predicate checker as a review aid (promoter-use-
+   `check-defer-triggers.mjs` predicate checker as a review aid (promoter-use-
    only; never a commit hook; never blocking).
 
 The **promoter** curates candidates, batch-promotes a cycle's consolidated
-status transitions (normalize + archive + one backlog commit), and runs the
-narrow eventual-consistency pass (normalize `--check`, holding-area ↔ backlog
+status transitions (normalize + archive), and runs the narrow
+eventual-consistency pass (normalize `--check`, holding-area ↔ backlog
 reconciliation, blind-revert-symptom detection) that repairs residual drift.
 It is a curator and cycle-consolidator, not the sole writer — agents write
-their own rows.
+their own rows. A normalizer quarter-boundary sweep that spans `backlog.md`
+**and** `docs/planning/archive/**` lands as **two reviewed commits back to
+back** — `backlog.md` alone first, then the `archive/**` companions — because
+the same O1 preflight above refuses any acquire mixing the ledger with another
+path (no archive-companion carveout). See the `backlog` skill ("Two-commit
+normalizer protocol") and the committer runbook for the full procedure.
 
 See [PROMOTER_RUNBOOK.md](PROMOTER_RUNBOOK.md) for the promoter procedure,
 the eventual-consistency pass, conflict resolution, and the Definition of
@@ -74,7 +81,7 @@ promotion engine.
 | `docs/planning/backlog.md` | Canonical task-status ledger | Committed source of truth (eventually-consistent; hybrid split-commit keeps a backlog edit from blocking a code commit) | Agents edit freely; one backlog commit per cycle; DEFER / p2 candidates promote in only after trigger + Definition of Ready | `done` / `cancelled` rows move to `docs/planning/archive/` via `/backlog-cleanup` |
 | `docs/checkpoints/` | Durable decisions, blockers, closeouts | Committed truth — reopen later | Commit only snapshots worth reopening; nothing auto-promotes out | None — durable by design; older checkpoints are retained for retrieval |
 | `.opencode/state/sessions/`, `.opencode/state/workstreams/` | Resumable working state (task contracts, checkpoints, workstream briefs) | Local, gitignored — resumable across compaction but **not** truth | Keep small durable state here; bulky outputs go to `tmp/` | Compaction prunes; `/workstream-clear` stops carrying a theme; `/job-cleanup` clears run-scoped artifacts |
-| `.local/coordinator/tasks/` | Conditional candidate holding area | Gitignored **transport, not truth** — unpromoted candidates may be lost (intentionally) | Curated into `backlog.md` by the promoter only after trigger + Definition of Ready | `rm` the file — sanctioned retire path (no cancel/drop command; gitignored, so lossy by design) |
+| `.local/coordinator/tasks/` | Conditional candidate holding area | Gitignored **transport, not truth** — unpromoted candidates may be lost (intentionally) | Curated into `backlog.md` by the promoter only after trigger + Definition of Ready | `/task-delete <id>` (validated single-card wrapper) or direct `rm` — sanctioned retire path; destructive hard removal, not a lifecycle status; gitignored, so lossy by design |
 | `tmp/` (run-scoped scratch, `tmp/agent-runs/<alias>/`) | Disposable run artifacts | Gitignored — never truth, never committed | Keep transient outputs here, never under `docs/` | `/job-cleanup` when the task completes |
 | `docs/planning/archive/` | Retrieval-only history of moved-out rows | Committed (archived) | Populated by the normalizer on completion / cancellation | Terminal tier |
 
@@ -128,7 +135,7 @@ Use:
 - [schemas/task-card.schema.json](schemas/task-card.schema.json) for the local
   task-card contract used by `/write-task`, `/research`, `/task-ready`,
   `/task-update`, `/task-repair`, `/task-list`, `/resume-task`,
-  `/task-closeout`, and `/task-review`
+  `/task-closeout`, `/task-delete`, and `/task-review`
 
 ## Coordination Rules
 
@@ -168,7 +175,7 @@ invoke it:
 
 | Surface | Location | Purpose |
 | --- | --- | --- |
-| OpenCode commands | `.opencode/commands/` | Native repo workflows such as `/coordination`, `/write-task`, `/research`, `/solution-brief`, `/task-ready`, `/task-update`, `/task-repair`, `/task-list`, `/resume-task`, and `/commit-review`. |
+| OpenCode commands | `.opencode/commands/` | Native repo workflows such as `/coordination`, `/write-task`, `/research`, `/solution-brief`, `/task-ready`, `/task-update`, `/task-repair`, `/task-list`, `/resume-task`, `/task-delete`, and `/commit-review`. |
 | OpenCode primary agents | `opencode.jsonc`, `.opencode/agents/` | Direct chat modes such as `build`, `plan`, and the read-only `coordination` entrypoint. |
 | OpenCode subagents | `.opencode/agents/` | Delegated specialists such as `project-coordinator`, `researcher`, `debate`, `commit-message`, `commit-reviewer`, and `ship-review`. |
 | Copilot path instructions | `.github/instructions/` | File-scoped GitHub/Copilot guidance that mirrors boundary-specific review rules. |
@@ -235,6 +242,18 @@ execution notes in the coordinator context.
 Do not keep extending the coordinator thread after step 8 unless the user
 explicitly wants a subagent prompt or a synthesis pass. The task card plus
 `/resume-task` is the handoff boundary.
+
+Retiring an unpromoted transport card (one that should never reach execution)
+uses `/task-delete <id>` — a validated single-card destructive wrapper over the
+sanctioned hard-removal mechanic. It removes the gitignored card and its local
+report directory. It is NOT a lifecycle status (no cancel/drop transition, no
+tombstone, no archive), it does NOT edit `backlog.md`, and it must NOT be used
+to bypass `/task-review` or `/task-closeout`. A card in `draft`, `ready`, or
+`cancelled` state is freely disposable; a card in `working`, `reported`,
+`blocked`, or `completed` state is refused without an explicit `force` because
+its report directory may carry evidence a coordinator gate still needs. Direct
+`rm` of the gitignored file remains an equivalent operator path; the wrapper
+exists to make single-card removal safe, validated, and observable.
 
 For research-heavy work:
 

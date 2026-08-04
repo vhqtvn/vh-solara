@@ -59,13 +59,18 @@ other edit decision stays denied (findLast — last match wins).
     "jq *": "allow",
     "git status *": "allow",
     "git diff *": "allow",
-    "vh-agent-harness exec pytest tests/unit/*": "ask",
-    "vh-agent-harness exec node .opencode/scripts/normalize-backlog.js": "ask"
+    "vh-agent-harness exec-sandbox *": "allow",
+    "vh-agent-harness exec pytest tests/unit/*": "ask"
   }
 }
 ```
 
-Adjust the `vh-agent-harness exec ...` allowlist to exact repo-safe commands only.
+For Level-B read-only roles, `vh-agent-harness exec-sandbox *` is the canonical
+host-local read-code grant, but ONLY where the applicable `exec_sandbox.min_mode`
+supplies the required kernel containment — keep unrestricted
+`vh-agent-harness exec` denied. Exact pinned `vh-agent-harness exec …` entries
+remain appropriate for explicitly allowed deterministic runtime/container checks;
+keep those entries narrow and repo-safe.
 
 ## 3a) Read-only harness specialist template
 

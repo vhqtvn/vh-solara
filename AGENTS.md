@@ -124,8 +124,8 @@ applied, not as an authority that acts on its own.
 
 - Run project commands through `harness`. Do not rely on host-level `python`, `pytest`, `npm`, `pnpm`, `yarn`, or `docker compose`.
 - The `shell-guard` plugin refuses a list of high-risk patterns (Docker socket access, ad-hoc apt installs, host-key bypass, scp deploys, cloud-provider lifecycle on Terraform-managed resources, raw database writes against protected identity/auth tables, project JWT secrets on the command line). See `docs/ai/shell-execution.md` → "Forbidden patterns". If a deny fires, do not paraphrase the command to evade it — read the rule's `why` and pick the canonical alternative, or surface the situation to the operator.
-- For agent-driven shell work, prefer `vh-agent-harness exec <cmd>` and avoid interactive `vh-agent-harness shell` unless a human explicitly asks for it.
-- The execution verbs are an intentionally distinct **exec family** — `exec` (run inside the project runtime), `exec-ro` (read-only, prompt-free), `exec-sandbox` (host-local; kernel-enforced only when its sandbox is active — `--sandbox=off|best-effort|strict`, default best-effort), and `shell` (interactive). Do NOT unify or alias these: opencode permission matching is verb-based, so collapsing them would break `exec-ro`'s prompt-free guarantee and `exec-sandbox`'s host-local guarantee. Pick the narrowest verb that fits the work. See `README.agent.md` → exec-family for the full per-verb contract.
+- For agent-driven shell work, use a `vh-agent-harness` **exec-family** verb rather than invoking project tools directly on the bare host (no host-level `python`, `pytest`, `npm`, `pnpm`, `yarn`, or `docker compose`). Pick the narrowest verb that fits the work: `exec-ro` for classifier-proven, prompt-free read-only inspection; `exec-sandbox` for explicitly granted host-local read-code when the applicable mode-floor supplies the required containment (host-local only — it does NOT follow a command into `proxy`/`docker_compose` backends); `exec` for genuine mutation or runtime/backend execution. Avoid interactive `vh-agent-harness shell` unless a human explicitly asks for it.
+- The execution verbs are an intentionally distinct **exec family** — `exec` (run inside the project runtime), `exec-ro` (read-only, prompt-free), `exec-sandbox` (host-local; kernel-enforced only when its sandbox is active — `--sandbox=off|best-effort|strict`, default best-effort), and `shell` (interactive). Do NOT unify or alias these: opencode permission matching is verb-based, so collapsing them would break `exec-ro`'s prompt-free guarantee and `exec-sandbox`'s host-local guarantee. See `README.agent.md` → exec-family for the full per-verb contract.
 - For long-running detached work that may outlive one shell call/session, name the relevant skill explicitly: `bgshell-job` for non-GPU shell jobs (see `vh-agent-harness docs opencode-skills`).
 - **Skill visibility & restart caveat:** `vh-agent-harness skill list` and `vh-agent-harness skill validate [dir]` inspect installed OpenCode skills (core, overlay-pack, and rendered) and validate their SKILL.md frontmatter without python. These reads are always fresh — they walk the embed/rendered trees directly. However, opencode caches the discovered skill list per-process (a module-closure map cleared only on process death), so a **running** opencode session will NOT see skills that `vh-agent-harness update` just added or changed under `.opencode/skills/` until the session is restarted. `update` prints a one-line restart hint whenever it writes skill files. `doctor`'s `skills` check lints every rendered skill's frontmatter as part of health.
 - **Glossary — "seam":** in this harness, a *seam* is an internal render/apply pipeline stage (the classify → plan → per-class apply → lineage flow that turns templates into rendered files) — it is **not** a command you run. This is distinct from the "repository testing seam" mentioned in the Testing section below, which refers to where a test attaches to a code boundary.
@@ -226,6 +226,46 @@ outcome).
   a code path ran). Asserting the mechanism without observing the outcome is
   `result: skipped`, not `proven`.
 
+- **Provable-invariant crux:** when the crux is a provable concurrency or
+  state-machine invariant, the `formal-verification` skill authors an
+  engine-checked proof whose result feeds this crux model.
+
+### Verification claims: full, targeted, and transition-clean
+
+"Green" is ambiguous. When a success report or closeout claims verification,
+distinguish three SEPARATE senses and never let one stand in for another. These
+are the F4 assurance/integrity-stewardship properties (A, B1, B2); each can
+pass or fail independently.
+
+- **B1 — full verification:** the canonical full command set actually ran
+  successfully AND the result is bound to the assessed revision/tree. A
+  targeted or smoke run (a single `-run` filter, one package, a smoke probe)
+  MUST be labeled targeted or smoke and NEVER summarized as full green. If full
+  execution cannot be observed or bound to the assessed state, the result is
+  `inconclusive` or `not-demonstrable`, not green. A missing or unverifiable
+  receipt never fabricates a pass.
+- **B2 — clean transition state:** the working-tree / transition state matches
+  what was reviewed. **Cleanliness is transition-relative.** Release / tag
+  transitions require global cleanliness — the tagged commit must be exactly
+  what was verified (release G0b refuses a dirty worktree). Ordinary
+  commit-gate integrity is **exact-slice based** and MUST tolerate unrelated
+  concurrent dirt: the committed tree for the authorized slice equals the
+  reviewed/approved tree for that slice, and unrelated concurrent working-tree
+  changes are normal. Do NOT require a global clean tree at the commit
+  boundary, and never erase or revert unrelated concurrent work for a
+  cosmetically clean status.
+- **A — declared-scope coverage (structural only):** every item in the
+  declared scope should receive a terminal disposition (examined or excluded by
+  contract) before any aggregate "reviewed" or "complete" claim. Structural
+  coverage proves only that each declared item was accounted for — never that
+  it was meaningfully examined. The `behavioral-closure` token is a declaration
+  of crux consistency, not proof the cited path executed; it is distinct from
+  B1.
+
+B1 and B2 are separate controls: all canonical commands passing (B1) does not
+imply a clean tree (B2), and a clean tree (B2) does not imply the build passed
+(B1). State both independently. See `docs/coordination/CLOSEOUT_TEMPLATE.md` →
+"Success-report integrity" for the closeout-facing form.
 
 ## Output expectations for agents
 
@@ -278,7 +318,7 @@ When making changes:
 - For multi-session coordination work, classify the task as `short`, `medium`, or `long` before fanning out. Use `docs/coordination/TASK_MODES.md` and `docs/coordination/RUNTIME_MODEL.md` to decide whether `.opencode/state/` is enough or whether a local runtime layer under `.local/coordinator/` is justified.
 - Use `repo-explorer` as a path finder and call-graph tracer first. Ask for exact full file bodies only through an explicit read command when needed.
 - For read-only shell inspection, prefer narrow commands such as `ls`, `find`, `grep`, `sed -n`, `head`, `tail`, `jq`, and `git grep`. Avoid `cat` dumps for exploration.
-- Prefer the standard command templates under `.opencode/commands/` when they fit the task: `coordination`, `harness`, `write-task`, `research`, `solution-brief`, `task-ready`, `task-update`, `task-repair`, `task-list`, `task-open`, `resume-task`, `task-closeout`, `task-review`, `repo-map`, `read-files`, `draft-plan`, `approve-plan`, `plan-save`, `plans`, `adopt-plan`, `implement`, `implement-goal`, `workstream-start`, `workstream-open`, `workstream-update`, `workstream-clear`, `backlog-cleanup`, `docs-sync`, `ship-review`, and `commit-review`.
+- Prefer the standard command templates under `.opencode/commands/` when they fit the task: `coordination`, `harness`, `write-task`, `research`, `solution-brief`, `task-ready`, `task-update`, `task-repair`, `task-list`, `task-open`, `resume-task`, `task-closeout`, `task-delete`, `task-review`, `repo-map`, `read-files`, `draft-plan`, `approve-plan`, `plan-save`, `plans`, `adopt-plan`, `implement`, `implement-goal`, `workstream-start`, `workstream-open`, `workstream-update`, `workstream-clear`, `backlog-cleanup`, `docs-sync`, `ship-review`, and `commit-review`.
 - Commit gate rule for every agent/session: before any `git commit` attempt, run `commit-reviewer` (typically via `/commit-review`) on the exact slice, read the reviewer response, and stop when it returns blocked/split guidance.
 - **Escape hatch:** If the gated-commit mechanism locks up, the operator can bypass it: `rm -rf .git/commit-gate.lock/ && git reset --mixed` clears the lock and index, then `SKIP_COMMIT_GATE=1 git commit ...` commits directly. This is operator-only — agents must never use this path.
 - When using `/commit-review`, always provide a `Feature summary` and `Exact file list`. Prefer naming the `Primary lane` and any relevant repo rules/docs up front. If the review intentionally spans more than 8 files, include `File-cap override` with a short reason. Use `docs/coordination/PROMPT_TEMPLATE.md` or `.github/prompts/commit-review.prompt.md` for the repo-standard request shape.
@@ -294,6 +334,7 @@ When making changes:
   - `/resume-task <id>` to bootstrap an execution session from that card
   - `/task-closeout <id>` to persist a local closeout report
   - `/task-review <id>` to record the coordinator-side decision after reviewing the result
+  - `/task-delete <id>` to destroy one unpromoted transport card and its report directory (irreversible hard-rm, NOT a lifecycle status or gate bypass)
 - Prefer repo-local OpenCode skills under `.opencode/skills/` for reusable workflows that should be discoverable through the native `skill` tool, but do not assume automatic selection; name the skill explicitly when it matters to correctness, cost, or operational safety.
 - Do not mix runtime routing, semantics, and promotion claims into one undisciplined change. Hand off between specialists when crossing boundaries.
 - Any component or configuration promotion, rollback, or profile change must name the affected manifests or profiles and the exact evidence that justifies it.
@@ -355,11 +396,18 @@ trigger fires AND the promoter applies the promotion Definition of Ready:
   (or another approved predicate), `studied:YYYY-MM-DD`.
 - **Holding area is transport, not truth.** Unpromoted candidates may be lost —
   this is intentionally fine, because they are not trusted work yet. Do not
-  create a parallel committed ledger for them. **Retiring a transport card is
-  `rm` of the gitignored file** (`.local/coordinator/tasks/<card>.json`):
-  this is the SANCTIONED retire path, not a workaround — there is no cancel/drop
-  command for these cards, and the file is gitignored transport (not committed
-  truth), so deleting it loses nothing durable.
+  create a parallel committed ledger for them. **Retiring an unpromoted
+  transport card is destructive hard removal, not a lifecycle status, tombstone,
+  archive, or durable record.** `/task-delete <task_id>` is the sanctioned
+  validated single-card wrapper over that removal mechanic: it removes the
+  gitignored card and its local report directory. It does NOT mark the task
+  cancelled and must NOT be used to bypass a promotion, review, or closeout
+  gate. Direct `rm` of the gitignored file
+  (`.local/coordinator/tasks/<card>.json`) remains a sanctioned retire
+  path equivalent to the wrapper for operators who know exactly what they are
+  doing; the wrapper exists to make the single-card removal safe, validated, and
+  observable. The file is gitignored transport (not committed truth), so
+  deleting it loses nothing durable.
 - **Fog vs ticket (triage test).** A finding is **ticket-ready** when you can
   state the question precisely now — even if blocked. A finding is **fog** when
   you cannot yet phrase it that sharply: in-scope, but not yet specifiable. Fog
@@ -369,12 +417,15 @@ trigger fires AND the promoter applies the promotion Definition of Ready:
 - **Promotion Definition of Ready (DoR):** a candidate reaches `backlog.md`
   only if ALL of: trigger has fired (or operator override) + concrete area +
   file scope + validation plan + clear slice + provenance Notes. Run the
-  predicate checker (`node .opencode/scripts/check-defer-triggers.js`) as a
+  predicate checker (`node .opencode/scripts/check-defer-triggers.mjs`) as a
   promotion-review aid — it is **promoter-use-only**, never wired into a commit
   hook, never blocking.
 - **Reviewer DEFER never becomes a direct backlog row.** A `/commit-review`
   DEFER finding is captured to `.local/` and curated later; it is not
   transcribed into `backlog.md` in the same slice.
+- **DEFER/follow-up triage:** when deciding a candidate's disposition at
+  card-creation (resolve-now vs. drive-to-verdict vs. defer-with-trigger), the
+  `resolve-first` skill is the front-gate classifier for that triage.
 
 ### Picking contract (R1)
 

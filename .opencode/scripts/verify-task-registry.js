@@ -5,6 +5,7 @@ import {
     activateCoordinationTask,
     bindSessionName,
     computeTaskDesignDigest,
+    deleteCoordinationTask,
     listCoordinationTasks,
     repairCoordinationTask,
     readyCoordinationTask,
@@ -58,6 +59,16 @@ function taskCardPath(taskID) {
     );
 }
 
+function taskReportDir(taskID) {
+    return path.join(
+        repoRoot(),
+        ".local",
+        "coordinator",
+        "reports",
+        taskID,
+    );
+}
+
 function expectStateError(fn, expectedFragment) {
     let thrown = null;
     try {
@@ -105,6 +116,33 @@ function main() {
         bindSessionName(secondSubagentSessionID, `${prefix}-subagent-2`, {
             cwd: "/verification",
         });
+
+        // ------------------------------------------------------------------
+        // Baseline: an empty / all-healthy registry reports NO quarantine and
+        // ZERO degraded cards. The live coordinator registry starts in this
+        // state (defer + transport cards only, none degraded); the assertion
+        // guards against a regression where a healthy registry is misreported
+        // as degraded, and anchors the degraded_count===quarantine.length
+        // invariant at the empty-quarantine boundary.
+        // ------------------------------------------------------------------
+        const baselineList = listCoordinationTasks(coordinatorSessionID, {
+            cwd: "/verification",
+        });
+        if (baselineList.quarantine.length !== 0) {
+            throw new StateError(
+                `Baseline: expected empty quarantine on an all-healthy registry, got ${baselineList.quarantine.length} entries: ${baselineList.quarantine.map((entry) => entry.card_id).join(", ")}.`,
+            );
+        }
+        if (baselineList.degraded_count !== 0) {
+            throw new StateError(
+                `Baseline: expected degraded_count 0 on an all-healthy registry, got ${baselineList.degraded_count}.`,
+            );
+        }
+        if (baselineList.degraded_count !== baselineList.quarantine.length) {
+            throw new StateError(
+                "Baseline: degraded_count must equal quarantine.length (both 0 here).",
+            );
+        }
 
         const primary = saveCoordinationTask(
             coordinatorSessionID,
@@ -1821,6 +1859,146 @@ function main() {
             );
         }
 
+        // ------------------------------------------------------------------
+        // D1. readCoordinationTask(<corrupt id>) must propagate the
+        // SyntaxError-wrapped StateError. A corrupt-id read is NOT a bulk
+        // scan, so it has no quarantine safety net — it must surface the
+        // underlying parse failure so a caller can distinguish a missing card
+        // from a corrupt one. The error is a StateError whose message is
+        // prefixed "Malformed JSON state file:" and whose cause is the
+        // original SyntaxError.
+        // ------------------------------------------------------------------
+        let d1Threw = false;
+        let d1Error = null;
+        try {
+            readCoordinationTask(
+                coordinatorSessionID,
+                syntaxCorruptID,
+                { cwd: "/verification" },
+            );
+        } catch (error) {
+            d1Threw = true;
+            d1Error = error;
+        }
+        if (!d1Threw) {
+            throw new StateError(
+                "Case D1: expected readCoordinationTask to throw on a corrupt card id.",
+            );
+        }
+        if (!(d1Error instanceof StateError)) {
+            throw new StateError(
+                `Case D1: expected StateError, got ${d1Error && d1Error.constructor ? d1Error.constructor.name : d1Error}.`,
+            );
+        }
+        if (!String(d1Error.message || "").startsWith("Malformed JSON state file:")) {
+            throw new StateError(
+                `Case D1: expected message to start with "Malformed JSON state file:", got "${d1Error.message}".`,
+            );
+        }
+        if (!(d1Error.cause instanceof SyntaxError)) {
+            throw new StateError(
+                "Case D1: expected StateError.cause to be a SyntaxError (the wrapped parse failure).",
+            );
+        }
+
+        // ------------------------------------------------------------------
+        // D2. A NON-SyntaxError filesystem error must THROW, not quarantine
+        // (rethrow guarantee). isCoordinationCardSyntaxError returns false
+        // when the cause is not a SyntaxError, so the scan rethrows instead
+        // of emitting a quarantine entry. We trigger a real fs error by
+        // creating a DIRECTORY at a `<id>.json` card path: readFileSync then
+        // throws EISDIR (POSIX; root-proof — unlike EACCES, root cannot bypass
+        // EISDIR). EACCES/ENOENT/TOCTOU follow the identical non-SyntaxError
+        // path. Cleanup is inline (try/finally) so a failing assertion cannot
+        // poison the rest of the suite, and the id is tracked in
+        // createdTaskIDs as belt-and-suspenders.
+        // ------------------------------------------------------------------
+        const d2DirID = "verification-d2-fs-error-fixture-card";
+        const d2DirPath = taskCardPath(d2DirID);
+        createdTaskIDs.push(d2DirID);
+        fs.mkdirSync(d2DirPath, { recursive: true });
+        let d2Threw = false;
+        let d2Error = null;
+        try {
+            try {
+                listCoordinationTasks(coordinatorSessionID, {
+                    cwd: "/verification",
+                });
+            } catch (error) {
+                d2Threw = true;
+                d2Error = error;
+            }
+            if (!d2Threw) {
+                throw new StateError(
+                    "Case D2: expected listCoordinationTasks to THROW on a non-SyntaxError fs error (directory-as-card), but it did not throw.",
+                );
+            }
+            if (!(d2Error instanceof StateError)) {
+                throw new StateError(
+                    `Case D2: expected StateError (rethrow guarantee), got ${d2Error && d2Error.constructor ? d2Error.constructor.name : d2Error}.`,
+                );
+            }
+            // The discriminator: the cause must NOT be a SyntaxError. This is
+            // exactly what keeps the error out of quarantine and forces the
+            // rethrow.
+            if (d2Error.cause instanceof SyntaxError) {
+                throw new StateError(
+                    "Case D2: cause must NOT be a SyntaxError (fs errors must rethrow, not quarantine).",
+                );
+            }
+            // Confirm it is a genuine fs error: EISDIR is the POSIX code for
+            // "directory where a file was expected" (portable across the dev
+            // environment; this is what the directory-as-card fixture raises).
+            if (!d2Error.cause || d2Error.cause.code !== "EISDIR") {
+                throw new StateError(
+                    `Case D2: expected cause.code "EISDIR" (directory-as-card fs error), got ${d2Error.cause && d2Error.cause.code}.`,
+                );
+            }
+        } finally {
+            removeIfExists(d2DirPath);
+        }
+
+        // Recovery: after removing the directory, the scan works again and
+        // the fixture does not linger in quarantine (it never produced a
+        // quarantine entry — it threw).
+        const d2Recovery = listCoordinationTasks(coordinatorSessionID, {
+            cwd: "/verification",
+        });
+        const d2Lingering = d2Recovery.quarantine.find(
+            (entry) => entry.card_id === d2DirID,
+        );
+        if (d2Lingering) {
+            throw new StateError(
+                "Case D2: directory fixture must NOT linger in quarantine after cleanup.",
+            );
+        }
+
+        // ------------------------------------------------------------------
+        // F1. Null-safety of listCoordinationTaskCards /
+        // resolveRecurrenceDedup against task:null syntax entries. Both
+        // helpers share the same `!entry.degraded && entry.task` short-circuit
+        // filter (a syntax entry is degraded:true / task:null and is excluded
+        // before any .map(e => e.task) projection). They are not exported, so
+        // null-safety is asserted indirectly through listCoordinationTasks:
+        // with the corrupt sibling on disk, tasks[] must contain ZERO
+        // null/undefined slots and every returned task must carry a
+        // non-empty string task_id. (resolveRecurrenceDedup's identical
+        // short-circuit is covered structurally — a binary-dependent live
+        // recurrence test would be fragile.)
+        // ------------------------------------------------------------------
+        for (const task of syntaxList.tasks) {
+            if (task === null || task === undefined) {
+                throw new StateError(
+                    "Case F1: tasks[] must contain no null/undefined slots (syntax entry projected out).",
+                );
+            }
+            if (typeof task.task_id !== "string" || !task.task_id.length) {
+                throw new StateError(
+                    "Case F1: every task in tasks[] must carry a non-empty string task_id.",
+                );
+            }
+        }
+
         // Case 10: degraded-core repair branch (lifecycle-exit recovery).
         // A degraded non-research card can be repaired in place via repair; a
         // healthy card's task_type/status stay immutable; the research-repair
@@ -2280,6 +2458,857 @@ function main() {
         }
         if (titleRestoredRead.task.title !== "Restored title") {
             throw new StateError("Case 10i: title must be restored.");
+        }
+
+        // ------------------------------------------------------------------
+        // Case 10 (recovery re-scan): a degraded card repaired in place must
+        // LEAVE quarantine[] on the next listCoordinationTasks scan, and
+        // degraded_count must drop by exactly one. Case 10a proved repair
+        // restores the single-card read; this proves the quarantine ledger
+        // tracks the recovery on re-enumeration (the closed loop:
+        // quarantine -> repairCoordinationTask -> re-scan).
+        // ------------------------------------------------------------------
+        const recoveryCard = saveCoordinationTask(
+            coordinatorSessionID,
+            {
+                title: "Quarantine recovery re-scan card",
+                task_type: "implementation",
+                coordination_mode: "short",
+                primary_lane: "build",
+                files_in_scope: ["tests/fixtures/example-pkg/"],
+                success_criteria: ["Card leaves quarantine after repair."],
+                validation_plan: ["List before and after repair."],
+            },
+            { cwd: "/verification" },
+        );
+        createdTaskIDs.push(recoveryCard.task.task_id);
+
+        // Snapshot the quarantine baseline for this case BEFORE degrading.
+        const recoveryBeforeDegrade = listCoordinationTasks(coordinatorSessionID, {
+            cwd: "/verification",
+        });
+        const recoveryBaselineDegraded = recoveryBeforeDegrade.degraded_count;
+
+        // Degrade -> the card must appear in quarantine[] on re-scan and
+        // degraded_count must rise by exactly one.
+        degradeCard(recoveryCard.task.task_id, (data) => {
+            data.task_type = "";
+        });
+        const recoveryAfterDegrade = listCoordinationTasks(coordinatorSessionID, {
+            cwd: "/verification",
+        });
+        const recoveryEntryBefore = recoveryAfterDegrade.quarantine.find(
+            (entry) => entry.card_id === recoveryCard.task.task_id,
+        );
+        if (!recoveryEntryBefore) {
+            throw new StateError(
+                "Case 10 (recovery): expected degraded card to appear in quarantine[] before repair.",
+            );
+        }
+        if (recoveryAfterDegrade.degraded_count !== recoveryBaselineDegraded + 1) {
+            throw new StateError(
+                `Case 10 (recovery): expected degraded_count to rise by one after degrade (${recoveryBaselineDegraded} -> ${recoveryBaselineDegraded + 1}), got ${recoveryAfterDegrade.degraded_count}.`,
+            );
+        }
+
+        // Repair -> the card must LEAVE quarantine[] on re-scan and
+        // degraded_count must drop back to the baseline.
+        repairCoordinationTask(
+            coordinatorSessionID,
+            recoveryCard.task.task_id,
+            { task_type: "implementation" },
+            { cwd: "/verification" },
+        );
+        const recoveryAfterRepair = listCoordinationTasks(coordinatorSessionID, {
+            cwd: "/verification",
+        });
+        const recoveryEntryAfter = recoveryAfterRepair.quarantine.find(
+            (entry) => entry.card_id === recoveryCard.task.task_id,
+        );
+        if (recoveryEntryAfter) {
+            throw new StateError(
+                "Case 10 (recovery): expected repaired card to LEAVE quarantine[] after re-scan.",
+            );
+        }
+        if (recoveryAfterRepair.degraded_count !== recoveryBaselineDegraded) {
+            throw new StateError(
+                `Case 10 (recovery): expected degraded_count to drop back to baseline (${recoveryBaselineDegraded}) after repair, got ${recoveryAfterRepair.degraded_count}.`,
+            );
+        }
+
+        // Case 11: deleteCoordinationTask — destructive single-card removal.
+        // Exercises (11a) ordinary draft, (11b) cancelled (terminal, gate-
+        // passed), (11c) degraded valid-JSON, (11d) malformed, (11e) active-
+        // working refusal without force, (11f) forced active-working deletion,
+        // (11g) enumeration health, (11h) single-ID safety, (11i) transport-
+        // root confinement, (11j) cleanup compatibility, (11k) symlink-escape
+        // refusal (physical confinement — a symlinked report target is refused
+        // and the external sentinel survives), (11l) reported lifecycle-guard
+        // refusal + forced override, and (11m/11n/11o) blocked, completed, and
+        // stale-working lifecycle-guard refusals proving card + report evidence
+        // survive intact when a pending coordinator gate owns the card.
+        //
+        // Every fixture id is pushed to createdTaskIDs so the finally-block
+        // cleanupArtifacts runs over ids whose card + report dir were already
+        // removed by deleteCoordinationTask — that is the (11j) compatibility
+        // assertion (removeIfExists must be idempotent and must not affect
+        // surviving siblings).
+        const assertAbsent = (taskID, label) => {
+            // 11g (woven through every successful deletion class): enumeration
+            // must not crash, the deleted id must be absent from both tasks[]
+            // and quarantine[], and the primary sibling must remain present.
+            const snap = listCoordinationTasks(coordinatorSessionID, {
+                cwd: "/verification",
+            });
+            if (snap.tasks.some((task) => task.task_id === taskID)) {
+                throw new StateError(
+                    `${label}: deleted id "${taskID}" must not appear in tasks[].`,
+                );
+            }
+            if (snap.quarantine.some((entry) => entry.card_id === taskID)) {
+                throw new StateError(
+                    `${label}: deleted id "${taskID}" must not linger in quarantine[].`,
+                );
+            }
+            if (!snap.tasks.some((task) => task.task_id === primary.task.task_id)) {
+                throw new StateError(
+                    `${label}: the unrelated primary sibling must remain present.`,
+                );
+            }
+        };
+
+        // 11a. Ordinary draft card + report dir + sentinel: removed cleanly,
+        //      summary carries the original id/title/status.
+        const deleteDraft = saveCoordinationTask(
+            coordinatorSessionID,
+            {
+                title: "Delete test draft card",
+                task_type: "implementation",
+                coordination_mode: "short",
+                primary_lane: "build",
+                files_in_scope: ["tests/fixtures/example-pkg/"],
+                success_criteria: ["Card is removable."],
+                validation_plan: ["Read back gone."],
+            },
+            { cwd: "/verification" },
+        );
+        const deleteDraftID = deleteDraft.task.task_id;
+        createdTaskIDs.push(deleteDraftID);
+        fs.mkdirSync(taskReportDir(deleteDraftID), { recursive: true });
+        fs.writeFileSync(
+            path.join(taskReportDir(deleteDraftID), "sentinel.md"),
+            "# draft report sentinel\n",
+        );
+        const deleteDraftResult = deleteCoordinationTask(
+            coordinatorSessionID,
+            deleteDraftID,
+            { cwd: "/verification" },
+        );
+        if (!deleteDraftResult.ok || deleteDraftResult.operation !== "delete_coordination_task") {
+            throw new StateError("Case 11a: expected ok delete_coordination_task result.");
+        }
+        if (deleteDraftResult.removed.task_id !== deleteDraftID) {
+            throw new StateError("Case 11a: removed.task_id must match the fixture id.");
+        }
+        if (deleteDraftResult.removed.title !== "Delete test draft card") {
+            throw new StateError("Case 11a: removed.title must carry the original title.");
+        }
+        if (deleteDraftResult.removed.status !== deleteDraft.task.status) {
+            throw new StateError(
+                `Case 11a: removed.status must carry the fixture's original status (got "${deleteDraftResult.removed.status}", expected "${deleteDraft.task.status}").`,
+            );
+        }
+        if (deleteDraftResult.removed.malformed) {
+            throw new StateError("Case 11a: a valid card must not be reported malformed.");
+        }
+        if (deleteDraftResult.removed.forced) {
+            throw new StateError("Case 11a: forced must be false without the force option.");
+        }
+        if (!deleteDraftResult.removed.card_removed || !deleteDraftResult.removed.report_dir_removed) {
+            throw new StateError("Case 11a: card and report dir must both be removed.");
+        }
+        if (fs.existsSync(taskCardPath(deleteDraftID))) {
+            throw new StateError("Case 11a: card JSON must be gone after deletion.");
+        }
+        if (fs.existsSync(taskReportDir(deleteDraftID))) {
+            throw new StateError("Case 11a: report dir must be gone after deletion.");
+        }
+        assertAbsent(deleteDraftID, "Case 11a");
+
+        // 11b. Cancelled (terminal, gate-already-passed) card: removed without
+        //      force. 'cancelled' is terminal — /task-review already ran and
+        //      decided — so it is freely disposable transport cleanup, not a
+        //      gate bypass.
+        const deleteCancelled = saveCoordinationTask(
+            coordinatorSessionID,
+            {
+                title: "Delete test cancelled card",
+                task_type: "implementation",
+                coordination_mode: "short",
+                primary_lane: "build",
+                files_in_scope: ["tests/fixtures/example-pkg/"],
+                success_criteria: ["Card is removable."],
+                validation_plan: ["Read back gone."],
+            },
+            { cwd: "/verification" },
+        );
+        const deleteCancelledID = deleteCancelled.task.task_id;
+        createdTaskIDs.push(deleteCancelledID);
+        degradeCard(deleteCancelledID, (data) => {
+            data.status = "cancelled";
+        });
+        fs.mkdirSync(taskReportDir(deleteCancelledID), { recursive: true });
+        const deleteCancelledResult = deleteCoordinationTask(
+            coordinatorSessionID,
+            deleteCancelledID,
+            { cwd: "/verification" },
+        );
+        if (!deleteCancelledResult.ok) {
+            throw new StateError("Case 11b: cancelled card must be removable without force.");
+        }
+        if (deleteCancelledResult.removed.status !== "cancelled") {
+            throw new StateError("Case 11b: removed.status must carry 'cancelled'.");
+        }
+        if (!deleteCancelledResult.removed.card_removed || !deleteCancelledResult.removed.report_dir_removed) {
+            throw new StateError("Case 11b: card and report dir must both be removed.");
+        }
+        if (fs.existsSync(taskCardPath(deleteCancelledID)) || fs.existsSync(taskReportDir(deleteCancelledID))) {
+            throw new StateError("Case 11b: card and report dir must be gone.");
+        }
+        assertAbsent(deleteCancelledID, "Case 11b");
+
+        // 11c. Degraded valid-JSON card (missing core fields): no strict
+        //      validation blocks the retire; summary uses honest fallback
+        //      values (null title, "degraded" status, not malformed).
+        const degradedID = "delete-test-degraded-card";
+        const degradedCardFile = taskCardPath(degradedID);
+        createdTaskIDs.push(degradedID);
+        fs.mkdirSync(path.dirname(degradedCardFile), { recursive: true });
+        fs.writeFileSync(
+            degradedCardFile,
+            JSON.stringify({ note: "no core fields here" }, null, 2),
+        );
+        fs.mkdirSync(taskReportDir(degradedID), { recursive: true });
+        const degradedResult = deleteCoordinationTask(
+            coordinatorSessionID,
+            degradedID,
+            { cwd: "/verification" },
+        );
+        if (!degradedResult.ok) {
+            throw new StateError(
+                "Case 11c: degraded card must be removable without strict validation blocking.",
+            );
+        }
+        if (degradedResult.removed.malformed) {
+            throw new StateError("Case 11c: valid-JSON card must not be reported malformed.");
+        }
+        if (degradedResult.removed.title !== null) {
+            throw new StateError("Case 11c: missing title must surface as null, not fabricated.");
+        }
+        if (degradedResult.removed.status !== "degraded") {
+            throw new StateError("Case 11c: missing status must surface as 'degraded'.");
+        }
+        if (!degradedResult.removed.card_removed || !degradedResult.removed.report_dir_removed) {
+            throw new StateError("Case 11c: card and report dir must both be removed.");
+        }
+        if (fs.existsSync(degradedCardFile) || fs.existsSync(taskReportDir(degradedID))) {
+            throw new StateError("Case 11c: card and report dir must be gone.");
+        }
+        assertAbsent(degradedID, "Case 11c");
+
+        // 11d. Malformed (syntactically invalid JSON) card: both card + report
+        //      dir removed; result reports malformed: true; title null;
+        //      status "degraded".
+        const malformedID = "delete-test-malformed-card";
+        const malformedCardFile = taskCardPath(malformedID);
+        createdTaskIDs.push(malformedID);
+        fs.mkdirSync(path.dirname(malformedCardFile), { recursive: true });
+        fs.writeFileSync(malformedCardFile, "{ not valid json ,,, ");
+        fs.mkdirSync(taskReportDir(malformedID), { recursive: true });
+        const malformedResult = deleteCoordinationTask(
+            coordinatorSessionID,
+            malformedID,
+            { cwd: "/verification" },
+        );
+        if (!malformedResult.ok) {
+            throw new StateError("Case 11d: malformed card must be removable.");
+        }
+        if (!malformedResult.removed.malformed) {
+            throw new StateError("Case 11d: unparseable card must be reported malformed.");
+        }
+        if (malformedResult.removed.title !== null) {
+            throw new StateError("Case 11d: malformed card title must surface as null.");
+        }
+        if (malformedResult.removed.status !== "degraded") {
+            throw new StateError("Case 11d: malformed card status must surface as 'degraded'.");
+        }
+        if (!malformedResult.removed.card_removed || !malformedResult.removed.report_dir_removed) {
+            throw new StateError("Case 11d: card and report dir must both be removed.");
+        }
+        if (fs.existsSync(malformedCardFile) || fs.existsSync(taskReportDir(malformedID))) {
+            throw new StateError("Case 11d: card and report dir must be gone.");
+        }
+        assertAbsent(malformedID, "Case 11d");
+
+        // 11e. Active working refusal: status:working + non-empty
+        //      active_session_alias, called WITHOUT force → structured
+        //      active_working_task refusal; card + report dir unchanged.
+        const deleteWorking = saveCoordinationTask(
+            coordinatorSessionID,
+            {
+                title: "Delete test working card",
+                task_type: "implementation",
+                coordination_mode: "short",
+                primary_lane: "build",
+                files_in_scope: ["tests/fixtures/example-pkg/"],
+                success_criteria: ["Card is guarded."],
+                validation_plan: ["Read back unchanged on refusal."],
+            },
+            { cwd: "/verification" },
+        );
+        const workingID = deleteWorking.task.task_id;
+        createdTaskIDs.push(workingID);
+        degradeCard(workingID, (data) => {
+            data.status = "working";
+            data.active_session_alias = `${prefix}-subagent`;
+        });
+        fs.mkdirSync(taskReportDir(workingID), { recursive: true });
+        const workingRefusal = deleteCoordinationTask(
+            coordinatorSessionID,
+            workingID,
+            { cwd: "/verification" },
+        );
+        if (workingRefusal.ok) {
+            throw new StateError(
+                "Case 11e: actively-owned working card must be refused without force.",
+            );
+        }
+        if (workingRefusal.operation !== "delete_coordination_task") {
+            throw new StateError("Case 11e: refusal must carry the operation name.");
+        }
+        if (!workingRefusal.refusal || workingRefusal.refusal.code !== "active_working_task") {
+            throw new StateError("Case 11e: refusal must carry code active_working_task.");
+        }
+        if (workingRefusal.refusal.task_id !== workingID) {
+            throw new StateError("Case 11e: refusal must carry the task id.");
+        }
+        if (workingRefusal.refusal.status !== "working") {
+            throw new StateError("Case 11e: refusal must report status 'working'.");
+        }
+        if (workingRefusal.refusal.active_session_alias !== `${prefix}-subagent`) {
+            throw new StateError("Case 11e: refusal must report the active owner alias.");
+        }
+        if (!workingRefusal.refusal.force_required) {
+            throw new StateError("Case 11e: refusal must indicate force is required.");
+        }
+        if (!fs.existsSync(taskCardPath(workingID))) {
+            throw new StateError("Case 11e: card must NOT be removed on refusal.");
+        }
+        if (!fs.existsSync(taskReportDir(workingID))) {
+            throw new StateError("Case 11e: report dir must NOT be removed on refusal.");
+        }
+
+        // 11f. Forced active working deletion: same fixture with {force:true}
+        //      → card + report dir removed; forced:true; original status
+        //      "working" carried in the summary.
+        const workingForcedResult = deleteCoordinationTask(
+            coordinatorSessionID,
+            workingID,
+            { cwd: "/verification", force: true },
+        );
+        if (!workingForcedResult.ok) {
+            throw new StateError(
+                "Case 11f: forced deletion of an active working card must succeed.",
+            );
+        }
+        if (!workingForcedResult.removed.forced) {
+            throw new StateError("Case 11f: removed.forced must be true when force was supplied.");
+        }
+        if (workingForcedResult.removed.status !== "working") {
+            throw new StateError("Case 11f: removed.status must carry the original 'working'.");
+        }
+        if (!workingForcedResult.removed.card_removed || !workingForcedResult.removed.report_dir_removed) {
+            throw new StateError("Case 11f: card and report dir must both be removed.");
+        }
+        if (fs.existsSync(taskCardPath(workingID)) || fs.existsSync(taskReportDir(workingID))) {
+            throw new StateError("Case 11f: card and report dir must be gone after forced deletion.");
+        }
+        assertAbsent(workingID, "Case 11f");
+
+        // 11g consolidated re-check: every deleted id absent, primary present.
+        const consolidated = listCoordinationTasks(coordinatorSessionID, {
+            cwd: "/verification",
+        });
+        const consolidatedIDs = consolidated.tasks.map((task) => task.task_id);
+        for (const goneID of [deleteDraftID, deleteCancelledID, degradedID, malformedID, workingID]) {
+            if (consolidatedIDs.includes(goneID)) {
+                throw new StateError(
+                    `Case 11g: deleted id "${goneID}" must not appear in the consolidated list.`,
+                );
+            }
+        }
+        if (!consolidatedIDs.includes(primary.task.task_id)) {
+            throw new StateError("Case 11g: the primary sibling must remain present.");
+        }
+
+        // 11h. Single-ID safety: wildcards, path-like input, comma-lists,
+        //      whitespace-separated tokens, and multiple-id (array / empty)
+        //      input are refused BEFORE any filesystem mutation. A real fixture
+        //      card is created first so we can prove it survives every invalid
+        //      attempt unchanged.
+        const safetyFixture = saveCoordinationTask(
+            coordinatorSessionID,
+            {
+                title: "Delete test safety card",
+                task_type: "implementation",
+                coordination_mode: "short",
+                primary_lane: "build",
+                files_in_scope: ["tests/fixtures/example-pkg/"],
+                success_criteria: ["Card survives invalid attempts."],
+                validation_plan: ["Read back present."],
+            },
+            { cwd: "/verification" },
+        );
+        const safetyID = safetyFixture.task.task_id;
+        createdTaskIDs.push(safetyID);
+        const safetyCardBefore = fs.readFileSync(taskCardPath(safetyID), "utf8");
+        const invalidInputs = [
+            "*",
+            "?",
+            "*.json",
+            "[a-z]",
+            "a,b",
+            "../escape",
+            "foo/bar",
+            "foo\\bar",
+            "..",
+            "alpha beta",
+            "a\tb",
+        ];
+        for (const invalid of invalidInputs) {
+            expectStateError(
+                () => deleteCoordinationTask(coordinatorSessionID, invalid, { cwd: "/verification" }),
+                "delete_coordination_task",
+            );
+        }
+        expectStateError(
+            () => deleteCoordinationTask(coordinatorSessionID, ["array"], { cwd: "/verification" }),
+            "delete_coordination_task",
+        );
+        expectStateError(
+            () => deleteCoordinationTask(coordinatorSessionID, "   ", { cwd: "/verification" }),
+            "delete_coordination_task",
+        );
+        const safetyCardAfter = fs.readFileSync(taskCardPath(safetyID), "utf8");
+        if (safetyCardAfter !== safetyCardBefore) {
+            throw new StateError(
+                "Case 11h: fixture card must be unchanged after invalid-input refusals.",
+            );
+        }
+
+        // 11h (cont). Whitespace-collision survival: the exact scenario the
+        //      whitespace guard exists to prevent. slugify collapses
+        //      "alpha beta" -> "alpha-beta", so WITHOUT the guard the input
+        //      "alpha beta" would be silently normalized to "alpha-beta" and,
+        //      if such a card existed, deleted. Plant a real draft card at the
+        //      collision id, then prove the whitespace input is REJECTED and
+        //      the collision card survives byte-identical.
+        const collisionID = "alpha-beta";
+        const collisionCard = {
+            id: collisionID,
+            title: "whitespace collision sibling",
+            task_type: "implementation",
+            coordination_mode: "short",
+            status: "draft",
+        };
+        fs.writeFileSync(
+            taskCardPath(collisionID),
+            JSON.stringify(collisionCard, null, 2),
+        );
+        createdTaskIDs.push(collisionID);
+        const collisionBefore = fs.readFileSync(taskCardPath(collisionID), "utf8");
+        expectStateError(
+            () => deleteCoordinationTask(coordinatorSessionID, "alpha beta", { cwd: "/verification" }),
+            "delete_coordination_task",
+        );
+        expectStateError(
+            () => deleteCoordinationTask(coordinatorSessionID, "alpha\tbeta", { cwd: "/verification" }),
+            "delete_coordination_task",
+        );
+        if (!fs.existsSync(taskCardPath(collisionID))) {
+            throw new StateError(
+                "Case 11h: whitespace input 'alpha beta' silently normalized to 'alpha-beta' and deleted the collision card.",
+            );
+        }
+        const collisionAfter = fs.readFileSync(taskCardPath(collisionID), "utf8");
+        if (collisionAfter !== collisionBefore) {
+            throw new StateError(
+                "Case 11h: collision card must be byte-identical after whitespace-input refusals.",
+            );
+        }
+
+        // 11i. Transport-root confinement: sentinels in an unrelated local
+        //      sibling dir and a committed tracked file are recorded before
+        //      deletion and must be unchanged after; only the exact card +
+        //      report targets move.
+        const confinementFixture = saveCoordinationTask(
+            coordinatorSessionID,
+            {
+                title: "Delete test confinement card",
+                task_type: "implementation",
+                coordination_mode: "short",
+                primary_lane: "build",
+                files_in_scope: ["tests/fixtures/example-pkg/"],
+                success_criteria: ["Confinement holds."],
+                validation_plan: ["Read back unchanged siblings."],
+            },
+            { cwd: "/verification" },
+        );
+        const confinementID = confinementFixture.task.task_id;
+        createdTaskIDs.push(confinementID);
+        const siblingDir = path.join(
+            repoRoot(),
+            ".local",
+            "coordinator",
+            "dashboards",
+        );
+        fs.mkdirSync(siblingDir, { recursive: true });
+        const siblingSentinel = path.join(siblingDir, "delete-test-sentinel.md");
+        fs.writeFileSync(siblingSentinel, "# sibling sentinel — must survive\n");
+        const siblingBefore = fs.readFileSync(siblingSentinel, "utf8");
+        const committedFile = path.join(repoRoot(), "Makefile");
+        const committedBefore = fs.readFileSync(committedFile, "utf8");
+        fs.mkdirSync(taskReportDir(confinementID), { recursive: true });
+        const confinementResult = deleteCoordinationTask(
+            coordinatorSessionID,
+            confinementID,
+            { cwd: "/verification" },
+        );
+        if (!confinementResult.ok) {
+            throw new StateError("Case 11i: confinement fixture must be removable.");
+        }
+        if (fs.existsSync(taskCardPath(confinementID)) || fs.existsSync(taskReportDir(confinementID))) {
+            throw new StateError("Case 11i: exact card + report targets must be gone.");
+        }
+        if (fs.readFileSync(siblingSentinel, "utf8") !== siblingBefore) {
+            throw new StateError(
+                "Case 11i: unrelated local sibling sentinel must be unchanged.",
+            );
+        }
+        if (fs.readFileSync(committedFile, "utf8") !== committedBefore) {
+            throw new StateError("Case 11i: committed tracked file must be unchanged.");
+        }
+        // Clean up the sibling sentinel we created (it is not a task card).
+        removeIfExists(siblingSentinel);
+
+        // 11j. Cleanup compatibility: the finally-block cleanupArtifacts runs
+        //      over createdTaskIDs and must be safe (idempotent) for ids
+        //      whose card + report dir were already removed earlier in this
+        //      run. Calling it here explicitly over the already-removed ids
+        //      must not throw and must not disturb surviving tasks.
+        const survivingBefore = listCoordinationTasks(coordinatorSessionID, {
+            cwd: "/verification",
+        }).tasks.length;
+        cleanupArtifacts([
+            deleteDraftID,
+            deleteCancelledID,
+            degradedID,
+            malformedID,
+            workingID,
+            confinementID,
+        ]);
+        const survivingAfter = listCoordinationTasks(coordinatorSessionID, {
+            cwd: "/verification",
+        }).tasks.length;
+        if (survivingAfter !== survivingBefore) {
+            throw new StateError(
+                "Case 11j: cleanup over already-removed ids must not affect surviving tasks.",
+            );
+        }
+
+        // 11k. Symlink-escape refusal (physical confinement): a symlinked
+        //      DELETION TARGET (this card's report dir repointed at an
+        //      external sentinel) MUST be refused before any filesystem
+        //      mutation. This is the boundary a purely lexical path.resolve +
+        //      startsWith check would miss — rmSync would follow the symlink
+        //      and delete the sentinel subtree. Prove the op refuses, the card
+        //      survives byte-identical, and the sentinel + its marker are
+        //      untouched.
+        const symlinkFixture = saveCoordinationTask(
+            coordinatorSessionID,
+            {
+                title: "Delete test symlink-escape card",
+                task_type: "implementation",
+                coordination_mode: "short",
+                primary_lane: "build",
+                files_in_scope: ["tests/fixtures/example-pkg/"],
+                success_criteria: ["Symlink escape refused."],
+                validation_plan: ["Sentinel untouched."],
+            },
+            { cwd: "/verification" },
+        );
+        const symlinkID = symlinkFixture.task.task_id;
+        createdTaskIDs.push(symlinkID);
+        // External sentinel OUTSIDE the reports root but inside the
+        // gitignored transport tree (under dashboards/), with a marker file
+        // whose contents we will prove survive.
+        const escapeSentinelDir = path.join(
+            repoRoot(),
+            ".local",
+            "coordinator",
+            "dashboards",
+            "delete-symlink-sentinel",
+        );
+        removeIfExists(escapeSentinelDir);
+        fs.mkdirSync(escapeSentinelDir, { recursive: true });
+        const escapeMarker = path.join(escapeSentinelDir, "marker.txt");
+        const escapeMarkerContent =
+            "# escape sentinel — MUST survive a delete op\n";
+        fs.writeFileSync(escapeMarker, escapeMarkerContent);
+        // Replace THIS card's own report dir with a symlink at the sentinel.
+        // (We touch only this fixture's report dir, never the shared reports
+        // root, so other fixtures stay intact.)
+        const symlinkReportDir = taskReportDir(symlinkID);
+        removeIfExists(symlinkReportDir);
+        fs.symlinkSync(escapeSentinelDir, symlinkReportDir);
+        const cardByteBefore = fs.readFileSync(
+            taskCardPath(symlinkID),
+            "utf8",
+        );
+        // The op must refuse because the report candidate is now a symlink
+        // (realpath differs from its lexical path).
+        expectStateError(
+            () =>
+                deleteCoordinationTask(coordinatorSessionID, symlinkID, {
+                    cwd: "/verification",
+                }),
+            "delete_coordination_task",
+        );
+        if (!fs.existsSync(taskCardPath(symlinkID))) {
+            throw new StateError(
+                "Case 11k: card must survive a symlink-escape refusal.",
+            );
+        }
+        if (
+            fs.readFileSync(taskCardPath(symlinkID), "utf8") !== cardByteBefore
+        ) {
+            throw new StateError(
+                "Case 11k: card must be byte-identical after a symlink-escape refusal.",
+            );
+        }
+        if (
+            !fs.existsSync(escapeSentinelDir) ||
+            !fs.existsSync(escapeMarker)
+        ) {
+            throw new StateError(
+                "Case 11k: external sentinel must survive a symlink-escape refusal.",
+            );
+        }
+        if (fs.readFileSync(escapeMarker, "utf8") !== escapeMarkerContent) {
+            throw new StateError(
+                "Case 11k: external sentinel contents must be unchanged.",
+            );
+        }
+        // Cleanup the symlink we planted and the sentinel so neither leaks.
+        removeIfExists(symlinkReportDir);
+        removeIfExists(escapeSentinelDir);
+
+        // 11l. Reported card (pending /task-review): lifecycle_state_protected
+        //      refusal without force — the report dir carries the closeout
+        //      evidence a coordinator review needs; destroying it would bypass
+        //      the review gate. Card + report dir + sentinel must survive
+        //      intact. An explicit force then removes both.
+        const reportedFixture = saveCoordinationTask(
+            coordinatorSessionID,
+            {
+                title: "Delete test reported card",
+                task_type: "implementation",
+                coordination_mode: "short",
+                primary_lane: "build",
+                files_in_scope: ["tests/fixtures/example-pkg/"],
+                success_criteria: ["Reported card is guarded."],
+                validation_plan: ["Read back intact on refusal."],
+            },
+            { cwd: "/verification" },
+        );
+        const reportedID = reportedFixture.task.task_id;
+        createdTaskIDs.push(reportedID);
+        degradeCard(reportedID, (data) => {
+            data.status = "reported";
+            data.active_session_alias = null;
+        });
+        const reportedReportDir = taskReportDir(reportedID);
+        fs.mkdirSync(reportedReportDir, { recursive: true });
+        const reportedMarker = path.join(reportedReportDir, "closeout.md");
+        const reportedMarkerContent = "# reported closeout — review evidence\n";
+        fs.writeFileSync(reportedMarker, reportedMarkerContent);
+        const reportedCardBefore = fs.readFileSync(
+            taskCardPath(reportedID),
+            "utf8",
+        );
+        const reportedRefusal = deleteCoordinationTask(
+            coordinatorSessionID,
+            reportedID,
+            { cwd: "/verification" },
+        );
+        if (reportedRefusal.ok) {
+            throw new StateError(
+                "Case 11l: reported card must be refused without force.",
+            );
+        }
+        if (
+            !reportedRefusal.refusal ||
+            reportedRefusal.refusal.code !== "lifecycle_state_protected"
+        ) {
+            throw new StateError(
+                "Case 11l: refusal must carry code lifecycle_state_protected.",
+            );
+        }
+        if (reportedRefusal.refusal.status !== "reported") {
+            throw new StateError(
+                "Case 11l: refusal must report status 'reported'.",
+            );
+        }
+        if (!reportedRefusal.refusal.force_required) {
+            throw new StateError(
+                "Case 11l: refusal must indicate force is required.",
+            );
+        }
+        if (!fs.existsSync(taskCardPath(reportedID))) {
+            throw new StateError(
+                "Case 11l: card must survive a lifecycle refusal.",
+            );
+        }
+        if (
+            fs.readFileSync(taskCardPath(reportedID), "utf8") !==
+            reportedCardBefore
+        ) {
+            throw new StateError(
+                "Case 11l: card must be byte-identical after a lifecycle refusal.",
+            );
+        }
+        if (
+            !fs.existsSync(reportedMarker) ||
+            fs.readFileSync(reportedMarker, "utf8") !== reportedMarkerContent
+        ) {
+            throw new StateError(
+                "Case 11l: report evidence must survive a lifecycle refusal.",
+            );
+        }
+        // Explicit force overrides the pending-gate guard and removes both.
+        const reportedForced = deleteCoordinationTask(
+            coordinatorSessionID,
+            reportedID,
+            { cwd: "/verification", force: true },
+        );
+        if (!reportedForced.ok || !reportedForced.removed.forced) {
+            throw new StateError(
+                "Case 11l: forced deletion of a reported card must succeed with forced:true.",
+            );
+        }
+        if (
+            fs.existsSync(taskCardPath(reportedID)) ||
+            fs.existsSync(reportedReportDir)
+        ) {
+            throw new StateError(
+                "Case 11l: card + report dir must be gone after forced deletion.",
+            );
+        }
+        assertAbsent(reportedID, "Case 11l");
+
+        // 11m/11n/11o. Blocked, completed, and stale-working (no active owner)
+        //      cards: each is protected by the lifecycle guard. A blocked card
+        //      awaits a coordinator decision; a completed card has a closeout
+        //      report awaiting review; a stale working card (no active owner)
+        //      may carry in-progress artifacts. Each refusal must leave the
+        //      card + report dir + sentinel byte-identical and intact.
+        const lifecycleStatusFixtures = [
+            { label: "11m", status: "blocked", title: "Delete test blocked card" },
+            { label: "11n", status: "completed", title: "Delete test completed card" },
+            { label: "11o", status: "working", title: "Delete test stale-working card" },
+        ];
+        for (const spec of lifecycleStatusFixtures) {
+            const fixture = saveCoordinationTask(
+                coordinatorSessionID,
+                {
+                    title: spec.title,
+                    task_type: "implementation",
+                    coordination_mode: "short",
+                    primary_lane: "build",
+                    files_in_scope: ["tests/fixtures/example-pkg/"],
+                    success_criteria: ["Lifecycle guard holds."],
+                    validation_plan: ["Read back intact on refusal."],
+                },
+                { cwd: "/verification" },
+            );
+            const lifecycleID = fixture.task.task_id;
+            createdTaskIDs.push(lifecycleID);
+            degradeCard(lifecycleID, (data) => {
+                data.status = spec.status;
+                data.active_session_alias = null;
+            });
+            const lifecycleReportDir = taskReportDir(lifecycleID);
+            fs.mkdirSync(lifecycleReportDir, { recursive: true });
+            const lifecycleMarker = path.join(
+                lifecycleReportDir,
+                "closeout.md",
+            );
+            const lifecycleMarkerContent = `# ${spec.status} evidence — must survive\n`;
+            fs.writeFileSync(lifecycleMarker, lifecycleMarkerContent);
+            const lifecycleCardBefore = fs.readFileSync(
+                taskCardPath(lifecycleID),
+                "utf8",
+            );
+            const lifecycleRefusal = deleteCoordinationTask(
+                coordinatorSessionID,
+                lifecycleID,
+                { cwd: "/verification" },
+            );
+            if (lifecycleRefusal.ok) {
+                throw new StateError(
+                    `Case ${spec.label}: ${spec.status} card must be refused without force.`,
+                );
+            }
+            if (
+                !lifecycleRefusal.refusal ||
+                lifecycleRefusal.refusal.code !== "lifecycle_state_protected"
+            ) {
+                throw new StateError(
+                    `Case ${spec.label}: refusal must carry code lifecycle_state_protected.`,
+                );
+            }
+            if (lifecycleRefusal.refusal.status !== spec.status) {
+                throw new StateError(
+                    `Case ${spec.label}: refusal must report status '${spec.status}'.`,
+                );
+            }
+            if (!lifecycleRefusal.refusal.force_required) {
+                throw new StateError(
+                    `Case ${spec.label}: refusal must indicate force is required.`,
+                );
+            }
+            if (!fs.existsSync(taskCardPath(lifecycleID))) {
+                throw new StateError(
+                    `Case ${spec.label}: card must survive a lifecycle refusal.`,
+                );
+            }
+            if (
+                fs.readFileSync(taskCardPath(lifecycleID), "utf8") !==
+                lifecycleCardBefore
+            ) {
+                throw new StateError(
+                    `Case ${spec.label}: card must be byte-identical after a lifecycle refusal.`,
+                );
+            }
+            if (
+                !fs.existsSync(lifecycleMarker) ||
+                fs.readFileSync(lifecycleMarker, "utf8") !==
+                    lifecycleMarkerContent
+            ) {
+                throw new StateError(
+                    `Case ${spec.label}: report evidence must survive a lifecycle refusal.`,
+                );
+            }
         }
 
         console.log("verification: ok");

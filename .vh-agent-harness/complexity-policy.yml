@@ -1,61 +1,41 @@
 version: 1
 enabled: true
-
 defaults:
-  event_file_lines: 350
-  snapshot_file_lines: 500
-
+    event_file_lines: 350
+    snapshot_file_lines: 500
 per_language:
-  ".go": {}
-  ".cjs": {}
-  ".cts": {}
-  ".js": {}
-  ".jsx": {}
-  ".mjs": {}
-  ".mts": {}
-  ".py": {}
-  ".ts": {}
-  ".tsx": {}
-
+    .cjs: {}
+    .cts: {}
+    .go: {}
+    .js: {}
+    .jsx: {}
+    .mjs: {}
+    .mts: {}
+    .py: {}
+    .ts: {}
+    .tsx: {}
 exclude:
-  event_paths:
-    - ".git/**"
-    # Align with snapshot_paths: the entire .opencode/** tree is harness-managed
-    # (platform_managed, overwritten by `vh-agent-harness update`); none of it is
-    # a project refactor target. `.opencode/state/**` (session memory) is
-    # subsumed.
-    - ".opencode/**"
-    - "**/__pycache__/**"
-    - "**/node_modules/**"
-    - "tmp/**"
-    # Vendored read-only reference snapshots of OTHER projects (refs/opencode,
-    # refs/paseo). Gitignored, zero tracked files, never refactor targets.
-    - "refs/**"
-    # Generated SPA embed (gitignored; materialized from web/dist-build/ at
-    # build time). Minified, not project source.
-    - "pkg/web/dist/**"
-
-  snapshot_paths:
-    - ".git/**"
-    - ".opencode/**"
-    # templates/core/.opencode/** is the go:embed embedded-source mirror of the
-    # rendered .opencode/** tree (byte-identical; diff exit=0). Both are
-    # harness-release-managed artifacts, not project refactor targets, so both
-    # are excluded for consistency. No-op for consumers (no templates/core/).
-    - "templates/core/.opencode/**"
-    - "**/__pycache__/**"
-    - "**/node_modules/**"
-    - "tmp/**"
-    # See event_paths: vendored reference snapshots of other projects.
-    - "refs/**"
-    # See event_paths: generated SPA embed.
-    - "pkg/web/dist/**"
-
-  snapshot_suffixes:
-    - "_test.go"
-
+    event_paths:
+        - '**/__pycache__/**'
+        - '**/node_modules/**'
+        - .git/**
+        - .opencode/**
+        - .opencode/state/**
+        - pkg/web/dist/**
+        - refs/**
+        - tmp/**
+    snapshot_paths:
+        - '**/__pycache__/**'
+        - '**/node_modules/**'
+        - .git/**
+        - .opencode/**
+        - pkg/web/dist/**
+        - refs/**
+        - templates/core/.opencode/**
+        - tmp/**
+    snapshot_suffixes:
+        - _test.go
 doctor:
-  max_candidates: 10
-
+    max_candidates: 10
 recurrence:
-  enabled: false
+    enabled: false

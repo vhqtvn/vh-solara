@@ -1,6 +1,6 @@
 ---
 name: backlog
-description: "Backlog ledger discipline for vh-solara — conflict-safe edits to docs/planning/backlog.md (hybrid split-commit) plus DEFER/follow-up curation routing. Load this skill before editing the backlog, when handling a cas_conflict on the backlog, or when deciding where a DEFER/p2 finding should land."
+description: "Backlog ledger discipline for vh-solara — conflict-safe edits to docs/planning/backlog.md (hybrid split-commit) plus DEFER/follow-up curation routing. Load this skill before editing the backlog, when handling a could_not_land (content-tangle) on the backlog, or when deciding where a DEFER/p2 finding should land."
 compatibility: opencode
 ---
 
@@ -18,7 +18,8 @@ This skill owns two disciplines that share one file (`docs/planning/backlog.md`)
 
 1. **Conflict discipline (hybrid split-commit).** How to edit the ledger without
    a concurrent edit blocking your code commit, and how to recover from a
-   `cas_conflict` without losing a collaborator's status update.
+   `could_not_land` (the backlog content-tangle) without losing a
+   collaborator's status update.
 2. **Curation routing (composition O1).** Where DEFER / p2 / follow-up findings
    land (the holding area), and the Definition of Ready a candidate must meet
    before it is promoted into a backlog row.
@@ -32,7 +33,7 @@ at.
 - **Editing the ledger:** re-read from disk immediately before your edit; edit
   only your own task rows (match the stable ID); keep one backlog commit per
   cycle, separate from any code commit.
-- **On `cas_conflict`:** re-read from the new HEAD, re-apply your row change,
+- **On `could_not_land`:** re-read from the new HEAD, re-apply your row change,
   retry. **Do NOT revert `backlog.md` to unblock** — that discards a
   collaborator's update. Do NOT use `commit-gate.sh revert` on the backlog
   (that path restores working-tree files to HEAD; on the ledger it is the
@@ -55,8 +56,9 @@ at.
 
 `backlog.md` is edited by every active session; a code commit is owned by one
 session. If a code commit bundles an incidental backlog edit, a concurrent
-session's later backlog edit can `cas_conflict` the whole code commit and block
-it. The fix is at the **commit layer**: keep backlog edits out of code commits.
+session's later backlog edit can content-tangle the whole code commit (it
+lands as `could_not_land`) and block it. The fix is at the **commit layer**:
+keep backlog edits out of code commits.
 
 ### Edit contract
 
@@ -74,11 +76,13 @@ it. The fix is at the **commit layer**: keep backlog edits out of code commits.
    transitions, then commit them together. This minimizes concurrent-edit
    surface and matches the promoter's batch-promote cadence.
 
-### On `cas_conflict` (the anti-pattern and the fix)
+### On `could_not_land` (the anti-pattern and the fix)
 
-When `commit-gate.sh commit` reports a `cas_conflict` on `backlog.md`, it means
-another session committed a backlog edit after your `acquire` snapshot. The
-gate will have preserved your intended changes; the recovery is:
+When `commit-gate.sh commit` reports a `could_not_land` on `backlog.md` (reason
+`merge_failed`/`write_tree_failed`), it means another session committed a
+backlog edit after your `acquire` snapshot and the blob-level CAS merge could
+not reconcile the two same-file edits. The gate will have preserved your
+intended changes; the recovery is:
 
 1. **Re-read `backlog.md` from the new HEAD** (the post-conflict state, which
    now includes the other session's row update).
@@ -118,6 +122,18 @@ with another path (status `path_error` / `backlog_must_commit_separately`),
 there is no archive-companion carveout, and the normalizer's archive companions
 are NOT ordinary "code/docs" changes that could ride alongside unrelated work.
 
+**Build/host prestep — who runs the normalizer.** The committer agent's
+permission profile denies both `vh-agent-harness *` and bare `node`, so the
+committer **cannot run `normalize-backlog.js` itself** — neither the write pass
+nor the `--check` pass. The normalizer must be run by **build**
+(`vh-agent-harness exec node .opencode/scripts/normalize-backlog.js`) or by the
+**operator host-side** BEFORE the closeout is handed to the committer. The
+committer then lands the already-normalized two-commit transaction (backlog-only
+commit + archive-companion commit) against the working tree build/host prepared.
+This documents the current permission split — it is NOT a carve-out: do not
+relax the committer profile from a doc edit (that is a separate coordinator
+decision).
+
 Treat the normalizer output as **one work-cycle transaction** landed through
 **two reviewed commits, back to back**:
 
@@ -141,8 +157,8 @@ node .opencode/scripts/normalize-backlog.js --check
 If the check fails on either pass, rerun the normalizer (without `--check`)
 and recompute both exact path sets before committing.
 
-If the ledger changes concurrently or a `cas_conflict` occurs on the
-backlog-only commit, apply the normal `cas_conflict` recovery (re-read from
+If the ledger changes concurrently or a `could_not_land` occurs on the
+backlog-only commit, apply the normal `could_not_land` recovery (re-read from
 the new HEAD, re-apply, retry) — but because the normalizer is deterministic
 over the ledger + archives, the safer path is to re-read the ledger, rerun
 the normalizer over the complete working tree, and recompute both exact path
@@ -177,7 +193,7 @@ is the date the finding was produced, for staleness awareness.
 A candidate reaches `backlog.md` only when **all** of the following hold:
 
 1. **Trigger fired OR operator override.** The predicate checker
-   (`.opencode/scripts/check-defer-triggers.js`) confirms the `trigger:` line
+   (`.opencode/scripts/check-defer-triggers.mjs`) confirms the `trigger:` line
    is currently met, OR the operator explicitly marks
    `override:operator` in Notes.
 2. **Concrete area.** The candidate names the repo boundary it belongs to
@@ -195,7 +211,7 @@ records what is missing on the task card.
 
 ### Predicate checker (promoter-use-only)
 
-`.opencode/scripts/check-defer-triggers.js` reads the task cards, regexes for
+`.opencode/scripts/check-defer-triggers.mjs` reads the task cards, regexes for
 `trigger:` lines in Notes, and reports which candidates' conditions are
 currently met. It supports a small predicate vocabulary (`path_touched(<path>)`,
 `after_tag(<tag>)`). It is:
@@ -228,7 +244,7 @@ executing a stale plan.
 
 - `docs/planning/backlog.md` — the ledger itself
 - `.opencode/scripts/normalize-backlog.js` — executable format spec (sections, statuses, columns, dup-ID rejection)
-- `.opencode/scripts/check-defer-triggers.js` — promotion predicate checker (promoter-use-only)
+- `.opencode/scripts/check-defer-triggers.mjs` — promotion predicate checker (promoter-use-only)
 - `docs/coordination/PROMOTER_RUNBOOK.md` — promoter procedure: curation, batch-promote, hybrid CAS preservation
 - `docs/coordination/BLOCKER_POLICY.md` — p2 follow-ups route to the holding area
 - `.opencode/skills/gated-commit/SKILL.md` — the commit layer this discipline depends on (commit backlog separately from code; `commit-gate.sh revert` is the anti-pattern on `backlog.md`)

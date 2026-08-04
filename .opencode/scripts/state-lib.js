@@ -5040,6 +5040,310 @@ function listCoordinationTasks(sessionID, options = {}) {
     };
 }
 
+function deleteCoordinationTask(sessionID, taskIDRaw, options = {}) {
+    const actor = coordinationActorContext(sessionID, options);
+    const forced = options.force === true;
+
+    // 1. Exact single-ID normalization. Batch is OUT of scope — this is a
+    //    single-card destructive op. Reject any selector/wildcard/path-like
+    //    hint BEFORE filesystem mutation so the refusal is honest about
+    //    intent (the normalized slug form would silently rewrite "*foo" into
+    //    "foo", hiding a probable batch attempt). Arrays / non-strings are
+    //    rejected as missing input.
+    if (typeof taskIDRaw !== "string" || taskIDRaw.trim() === "") {
+        throw new StateError(
+            "delete_coordination_task requires a non-empty task_id.",
+        );
+    }
+    const rawTrimmed = taskIDRaw.trim();
+    // Whitespace inside a trimmed task id is a strong multiple-token / paste
+    // signal: slugify collapses runs of [^a-z0-9._-] (incl. spaces) to "-", so
+    // "alpha beta" would silently become "alpha-beta" — a DIFFERENT single id
+    // than either token the operator typed. Reject it before normalization so
+    // the refusal is honest, the same way "*" is rejected above.
+    if (/\s/.test(rawTrimmed)) {
+        throw new StateError(
+            `delete_coordination_task requires an exact single task_id; whitespace-separated input is not accepted ("${rawTrimmed}").`,
+        );
+    }
+    if (
+        rawTrimmed.includes("*") ||
+        rawTrimmed.includes("?") ||
+        rawTrimmed.includes(",") ||
+        rawTrimmed.includes("[") ||
+        rawTrimmed.includes("]") ||
+        rawTrimmed.includes("/") ||
+        rawTrimmed.includes("\\") ||
+        rawTrimmed.includes("..")
+    ) {
+        throw new StateError(
+            `delete_coordination_task requires an exact single task_id; wildcards, selectors, comma-lists, and path-like input are not accepted ("${rawTrimmed}").`,
+        );
+    }
+    // Normalize through the existing ID seam, but surface any refusal with a
+    //    stable delete-prefixed message: slugify throws an UN-prefixed error
+    //    for inputs that reduce to an empty slug (e.g. a lone "."), so wrap it
+    //    so every refusal from this op carries the tag.
+    let taskID;
+    try {
+        taskID = normalizeCoordinationTaskId(rawTrimmed);
+    } catch (error) {
+        throw new StateError(
+            `delete_coordination_task requires an exact single task_id; "${rawTrimmed}" is not acceptable (${error instanceof StateError ? error.message : "normalization failed"}).`,
+        );
+    }
+    if (!taskID || taskID.trim() === "") {
+        throw new StateError(
+            `delete_coordination_task requires an exact single task_id; "${rawTrimmed}" normalizes to an empty slug.`,
+        );
+    }
+
+    // 2. Transport-only path construction + PHYSICAL containment. Derive the
+    //    targets ONLY from the normalized id through the existing helpers,
+    //    then assert each target is physically contained inside its transport
+    //    root. Containment is PHYSICAL, not lexical: we resolve the transport
+    //    ancestor, the roots, and any present candidate via fs.realpathSync
+    //    and REFUSE any symlink that would redirect a recursive rmSync out of
+    //    transport (e.g. a reports root or report dir symlinked at docs/). A
+    //    purely lexical path.resolve + startsWith check would pass a symlinked
+    //    root and let rmSync delete through it into a committed location.
+    //    Never accept arbitrary paths; never address docs/,
+    //    docs/planning/backlog.md, or any committed location.
+    const isStrictlyInside = (candidate, root) =>
+        candidate !== root && candidate.startsWith(`${root}${path.sep}`);
+
+    // Resolve a path to its real (symlink-dereferenced) location, REFUSING if
+    //    the path is a symlink (realpath differs from the lexical path).
+    //    Returns null when the path does not exist (the caller falls back to a
+    //    lexical check against an already-real root — there is no symlink to
+    //    follow on a non-existent leaf).
+    const resolveRealRefusingSymlink = (lexical) => {
+        if (!fs.existsSync(lexical)) {
+            return null;
+        }
+        let resolved;
+        try {
+            resolved = fs.realpathSync(lexical);
+        } catch (_error) {
+            throw new StateError(
+                `delete_coordination_task: failed to resolve the real path of "${relativeToRepo(lexical)}"; refusing to delete.`,
+            );
+        }
+        if (resolved !== lexical) {
+            throw new StateError(
+                `delete_coordination_task: path "${relativeToRepo(lexical)}" resolves to a different physical location (symlink detected at "${resolved}"); refusing to delete.`,
+            );
+        }
+        return resolved;
+    };
+
+    // Canonical transport ancestor (.local/<coord>/). Refuse if it is itself a
+    //    symlink or absent — a missing transport means nothing was ever
+    //    created there, so there is nothing to delete.
+    const transportLexical = path.resolve(localCoordinatorRoot());
+    const transportReal = resolveRealRefusingSymlink(transportLexical);
+    if (transportReal === null) {
+        throw new StateError(
+            `delete_coordination_task: coordinator transport root is not present; nothing to delete.`,
+        );
+    }
+
+    // Each transport root must not be a symlink and must sit strictly inside
+    //    the (real) transport ancestor. A missing root returns null and is
+    //    checked lexically against the real transport ancestor (no candidate
+    //    can exist under a missing root, but we still fence the lexical path).
+    const fenceRoot = (rootLexical, label) => {
+        const rootReal = resolveRealRefusingSymlink(rootLexical);
+        const effective = rootReal !== null ? rootReal : rootLexical;
+        if (!isStrictlyInside(effective, transportReal)) {
+            throw new StateError(
+                `delete_coordination_task: ${label} transport root resolves outside the coordinator transport area ("${effective}"); refusing to delete.`,
+            );
+        }
+        return effective;
+    };
+    const tasksRootReal = fenceRoot(
+        path.resolve(localCoordinatorTasksRoot()),
+        "tasks",
+    );
+    const reportsRootReal = fenceRoot(
+        path.resolve(localCoordinatorReportsRoot()),
+        "reports",
+    );
+
+    // Each candidate must be physically contained inside its (real) root. A
+    //    candidate that exists is realpath-resolved and refused if it is a
+    //    symlink or escapes the root; a missing leaf is checked lexically
+    //    against the real root (no symlink to follow on a non-existent path).
+    const fenceCandidate = (candidateAny, rootReal, label) => {
+        const candidateLexical = path.resolve(candidateAny);
+        const candidateReal = resolveRealRefusingSymlink(candidateLexical);
+        const effective =
+            candidateReal !== null ? candidateReal : candidateLexical;
+        if (!isStrictlyInside(effective, rootReal)) {
+            throw new StateError(
+                `delete_coordination_task: resolved ${label} is not strictly inside the ${label} transport root; refusing to delete "${effective}".`,
+            );
+        }
+    };
+    const cardPath = coordinationTaskPath(taskID);
+    const reportDir = coordinationTaskReportDir(taskID);
+    fenceCandidate(cardPath, tasksRootReal, "card");
+    fenceCandidate(reportDir, reportsRootReal, "report directory");
+
+    // 3. Lenient-load. Read the exact card path directly; if it parses,
+    //    extract best-effort summary fields. Do NOT require core-field
+    //    validation — degraded and malformed cards are precisely the cards an
+    //    operator may need to retire, so strict validation here would brick
+    //    the retire path. A missing file is a not-found refusal; a parse
+    //    failure is classified as malformed and removal proceeds.
+    if (!fs.existsSync(cardPath)) {
+        throw new StateError(
+            `delete_coordination_task: card not found for task_id "${taskID}" (expected at ${relativeToRepo(cardPath)}).`,
+        );
+    }
+    let parsedCard = null;
+    let malformed = false;
+    try {
+        const readBack = JSON.parse(fs.readFileSync(cardPath, "utf8"));
+        if (!readBack || typeof readBack !== "object" || Array.isArray(readBack)) {
+            malformed = true;
+            parsedCard = null;
+        } else {
+            parsedCard = readBack;
+        }
+    } catch (_error) {
+        malformed = true;
+        parsedCard = null;
+    }
+
+    // Honest best-effort summary. No validation, no refusal on a missing
+    // field — the summary's job is to report what was there. A non-object or
+    // unparseable card surfaces null title + "degraded" status + null owner.
+    const summaryTitle =
+        parsedCard &&
+        typeof parsedCard.title === "string" &&
+        parsedCard.title.trim()
+            ? parsedCard.title
+            : null;
+    const summaryStatus =
+        parsedCard &&
+        typeof parsedCard.status === "string" &&
+        parsedCard.status.trim()
+            ? parsedCard.status
+            : "degraded";
+    const summaryOwner =
+        parsedCard &&
+        typeof parsedCard.active_session_alias === "string" &&
+        parsedCard.active_session_alias.trim()
+            ? parsedCard.active_session_alias
+            : null;
+
+    // 4. Active-owner guard. Refuse an actively-owned working card unless the
+    //    caller passed force. This MUST run before any fs mutation. Degraded
+    //    tolerance is preserved: a malformed card (parsedCard === null) gets
+    //    status "degraded" + null owner, so it does not trip this guard — only
+    //    a genuinely working + actively-owned card is protected.
+    const isActiveWorking = summaryStatus === "working" && Boolean(summaryOwner);
+    if (isActiveWorking && !forced) {
+        return {
+            ...actor,
+            ok: false,
+            operation: "delete_coordination_task",
+            refusal: {
+                code: "active_working_task",
+                task_id: taskID,
+                status: "working",
+                active_session_alias: summaryOwner,
+                force_required: true,
+                message: `Task ${taskID} is currently active in session ${summaryOwner}. Re-run with an explicit force only if you intend to destroy an in-flight task's local card and report directory. This does not mark the task cancelled and does not bypass review or closeout.`,
+            },
+        };
+    }
+
+    // 4b. Pending-gate lifecycle guard. A card that has entered the active
+    //     lifecycle — working without an active owner (stale/abandoned),
+    //     reported, blocked, or completed — carries a closeout report or
+    //     work evidence that a coordinator gate (/task-review,
+    //     /task-closeout) may still need to consume. Refuse deletion without
+    //     an explicit force so this retire wrapper cannot bypass a pending
+    //     review or closeout gate by destroying the evidence first. Only
+    //     pre-work / terminal-gate-passed statuses (draft, ready, cancelled)
+    //     are freely disposable. Degraded tolerance is preserved: a malformed
+    //     card (parsedCard === null) gets status "degraded", which is not in
+    //     the protected set.
+    const PROTECTED_LIFECYCLE_STATUSES = new Set([
+        "working",
+        "reported",
+        "blocked",
+        "completed",
+    ]);
+    if (PROTECTED_LIFECYCLE_STATUSES.has(summaryStatus) && !forced) {
+        const lifecycleMessage =
+            summaryStatus === "working"
+                ? `Task ${taskID} is 'working' (no active owner; possibly stale) and may carry in-progress work artifacts in its report directory. Refusing deletion without explicit force.`
+                : `Task ${taskID} is '${summaryStatus}' and has entered the review/closeout pipeline; its report directory carries evidence /task-review or /task-closeout may still need to consume. Refusing deletion without explicit force so the retire wrapper cannot bypass a pending coordinator gate. This does not mark the task cancelled.`;
+        return {
+            ...actor,
+            ok: false,
+            operation: "delete_coordination_task",
+            refusal: {
+                code: "lifecycle_state_protected",
+                task_id: taskID,
+                status: summaryStatus,
+                force_required: true,
+                message: lifecycleMessage,
+            },
+        };
+    }
+
+    // 5. Pre-removal summary. Built BEFORE any fs mutation; emitted to the
+    //    beforeRemove hook so a caller can log or audit. The same summary
+    //    (plus removal results) is returned post-removal.
+    const summary = {
+        task_id: taskID,
+        title: summaryTitle,
+        status: summaryStatus,
+        active_session_alias: summaryOwner,
+        malformed,
+        card_path: relativeToRepo(cardPath),
+        report_dir: relativeToRepo(reportDir),
+        forced,
+    };
+    if (typeof options.beforeRemove === "function") {
+        options.beforeRemove(summary);
+    }
+
+    // 6. Removal sequence (removeIfExists idiom). Exact card JSON first, then
+    //    the exact report dir recursively. Verify each is gone. Do NOT read
+    //    fields again after deletion.
+    let cardRemoved = false;
+    if (fs.existsSync(cardPath)) {
+        fs.rmSync(cardPath, { recursive: true, force: true });
+        cardRemoved = !fs.existsSync(cardPath);
+    }
+    let reportDirRemoved = false;
+    if (fs.existsSync(reportDir)) {
+        fs.rmSync(reportDir, { recursive: true, force: true });
+        reportDirRemoved = !fs.existsSync(reportDir);
+    }
+
+    return {
+        ...actor,
+        ok: true,
+        operation: "delete_coordination_task",
+        removed: {
+            task_id: taskID,
+            title: summaryTitle,
+            status: summaryStatus,
+            malformed,
+            forced,
+            card_removed: cardRemoved,
+            report_dir_removed: reportDirRemoved,
+        },
+    };
+}
+
 function activateCoordinationTask(sessionID, taskIDRaw, options = {}) {
     const actor = coordinationActorContext(sessionID, options);
     const loaded = loadCoordinationTask(taskIDRaw);
@@ -6889,6 +7193,7 @@ export {
     repairCoordinationTask,
     saveCoordinationTaskCloseout,
     reviewCoordinationTask,
+    deleteCoordinationTask,
     recordArtifact,
     recordArtifacts,
     resolvePaths,
@@ -6954,6 +7259,7 @@ export default {
     repairCoordinationTask,
     saveCoordinationTaskCloseout,
     reviewCoordinationTask,
+    deleteCoordinationTask,
     recordArtifact,
     recordArtifacts,
     resolvePaths,

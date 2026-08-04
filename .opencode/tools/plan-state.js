@@ -35,6 +35,7 @@ import {
     savePlan,
     saveTaskContract,
     activateCoordinationTask,
+    deleteCoordinationTask,
     adoptPlan,
     writeSessionMemoryFile,
     writeWorkstreamFile,
@@ -119,6 +120,7 @@ export const planStateTool = tool({
                 "repair_coordination_task",
                 "save_coordination_task_closeout",
                 "review_coordination_task",
+                "delete_coordination_task",
                 "record_artifact",
                 "record_artifacts",
                 "resolve_paths",
@@ -310,6 +312,12 @@ export const planStateTool = tool({
             .optional()
             .describe(
                 "Allow activate_coordination_task to take over a working task owned by another session alias.",
+            ),
+        force: tool.schema
+            .boolean()
+            .optional()
+            .describe(
+                "Allow delete_coordination_task to remove a protected card despite its guard. Overrides BOTH the active-owner guard (an actively-owned working card, refusal code active_working_task) AND the pending-gate lifecycle guard (a card in working/reported/blocked/completed state, refusal code lifecycle_state_protected). This is a destructive override — the task card and its local report directory are destroyed, not transitioned. Use deliberately.",
             ),
     },
     async execute(args, context) {
@@ -607,6 +615,17 @@ export const planStateTool = tool({
                                 .map((value) => value.trim())
                                 .filter(Boolean),
                         }),
+                    );
+                case "delete_coordination_task":
+                    return render(
+                        deleteCoordinationTask(
+                            context.sessionID,
+                            args.task_id || "",
+                            {
+                                cwd: context.directory,
+                                force: Boolean(args.force),
+                            },
+                        ),
                     );
                 case "activate_coordination_task":
                     return render(

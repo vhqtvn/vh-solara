@@ -92,10 +92,33 @@ export const INSPECTOR_EXISTENCE = "test|\\[|ls|stat|echo|printf";
 //   read          — read a line from stdin INTO a named variable
 //   ls            — list directory entries
 //   man           — display a manual page
-// None can execute an arbitrary argument. The shared INSPECTOR_FULL keeps
-// `command` for the OTHER rules (apt/usermod/ssh/scp); its `command` gap there
-// is a SEPARATE follow-up, out of this slice.
+// None can execute an arbitrary argument. The shared INSPECTOR_FULL still
+// EXPORTS `command` (it is public API for project overlays that may legitimately
+// carve out `command -v foo` lookups for non-executor triggers), but every
+// EXECUTOR-class core rule uses a `command`-EXCLUDING set so `command <verb>`
+// cannot carve the rule out: git-mutation uses GIT_MUTATION_INSPECTORS (here),
+// and the infra-lifecycle rules apt/usermod/ssh/scp use
+// INFRA_LIFECYCLE_INSPECTORS (below). An agent that wants the lookup form
+// (`command -v usermod`) must use `which`/`type` (still in both sets).
 export const GIT_MUTATION_INSPECTORS =
+    "grep|rg|cat|head|tail|less|more|echo|printf|which|type|file|stat|test|\\[|read|ls|man";
+
+// infra-lifecycle inspector set: INSPECTOR_FULL with the `command` verb
+// REMOVED, for the SAME reason GIT_MUTATION_INSPECTORS excludes it — `command`
+// is a bash builtin that EXECUTES its argument (`command apt-get install x`
+// runs `apt-get install`, `command usermod -aG ...` runs `usermod`, `command
+// ssh -o ...` runs `ssh`, `command scp ...` runs `scp`), so it must NOT be
+// treated as a safe inspector in these carve-outs. Used by the apt-install-
+// ad-hoc / user-group-mutation / ssh-host-key-bypass / scp-upload rules.
+// Mirrors the landed git-lane fix (P1-PERM-001, f88d29f): a dedicated
+// `command`-excluding constant per executor-class rule, leaving the shared
+// INSPECTOR_FULL untouched (it stays the public-API default for non-executor
+// rules). Validated real FP: user-group-mutation previously false-positive'd
+// on the literal `usermod` token in commit-message prose, so the echo/grep/
+// printf carve-out (via this set + the upgraded chain-guard above) is
+// load-bearing for the FP fix while `command` exclusion closes the executor
+// carve-out.
+export const INFRA_LIFECYCLE_INSPECTORS =
     "grep|rg|cat|head|tail|less|more|echo|printf|which|type|file|stat|test|\\[|read|ls|man";
 
 export function inspectorAllowIf(inspectorGroup) {
@@ -111,8 +134,18 @@ export function inspectorAllowIf(inspectorGroup) {
     // second command leg could carry the dangerous invocation behind a harmless
     // leading inspector. Narrow FP cost: piped inspectors like `grep foo | head`
     // are no longer exempt (use `rg` or unpiped `grep`).
+    //
+    // The operator set is the FULL 11-op chain-guard (matches
+    // `gitMutationInspectorAllowIf` below): &&, ||, ;, newline, CR, &, |,
+    // backtick, $(, and process-substitution <( / >(. Bash treats a literal
+    // newline/CR as a statement separator (equivalent to `;`), and process
+    // substitution `<(...)`/`>(` runs the inner command with NO list separator,
+    // so a smuggled second leg after any of these must NOT escape the guard
+    // (e.g. `echo step1\nusermod ...`, `echo x <(apt-get install ...)`).
+    // Upgrading this set only ever turns carve-outs INTO denials (more
+    // conservative); it can never open a new bypass.
     return new RegExp(
-        "(?![\\s\\S]*(?:&&|\\|\\||[;&|`]|\\$\\())" +
+        "(?![\\s\\S]*(?:&&|\\|\\||[;\n\r&|`]|\\$\\(|<\\(|>\\())" +
         "(?:^\\s*" +
             "(?:[A-Z_][A-Z0-9_]*=\\S*\\s+)*" + // leading env-var assignments
             "(?:vh-agent-harness\\s+(?:[A-Za-z]+\\s+)*exec\\s+(?:--\\s+)?)?" + // vh-agent-harness [subcmd] exec [--]
@@ -127,6 +160,11 @@ export function inspectorAllowIf(inspectorGroup) {
 // Pre-built allowIf objects (reused across rules).
 export const ALLOW_IF_INSPECTOR_FULL = inspectorAllowIf(INSPECTOR_FULL);
 export const ALLOW_IF_INSPECTOR_EXISTENCE = inspectorAllowIf(INSPECTOR_EXISTENCE);
+// infra-lifecycle carve-out: INSPECTOR_FULL minus the `command` executor verb,
+// built with the SAME `inspectorAllowIf` (now carrying the full-11-op
+// chain-guard). Used by apt-install-ad-hoc / user-group-mutation /
+// ssh-host-key-bypass / scp-upload so `command <verb>` cannot carve them out.
+export const ALLOW_IF_INFRA_LIFECYCLE = inspectorAllowIf(INFRA_LIFECYCLE_INSPECTORS);
 
 // git-mutation-bypass carve-out union:
 //   (A) the committer agent's commit-gate wrapper invocation (or the dead-but-
@@ -196,10 +234,13 @@ export const ALLOW_IF_INSPECTOR_EXISTENCE = inspectorAllowIf(INSPECTOR_EXISTENCE
 //     so the 2-char sequences must be in the alternation (they cannot live in
 //     the char class, which is single-char) — otherwise `echo x <(git commit
 //     ...)` smuggles the mutation behind a leading echo.
-// NOTE: the generic ALLOW_IF_INSPECTOR_FULL is intentionally left untouched
-// (other rules — apt/usermod/ssh/scp — depend on it); only the git carve-out
-// is re-anchored here, because the `git <verb> -m "<inspector prose>"` shape is
-// the genuinely exploitable surface.
+// NOTE: the generic ALLOW_IF_INSPECTOR_FULL remains public API for non-executor
+// project-overlay rules, and its shared `inspectorAllowIf` chain-guard is now
+// the SAME full 11-op guard used here. The 4 infra-lifecycle rules
+// (apt/usermod/ssh/scp) no longer depend on it — they use the parallel
+// ALLOW_IF_INFRA_LIFECYCLE (also `command`-excluding). Only the git carve-out
+// is RE-ANCHORED here (vs the unanchored generic builder), because the
+// `git <verb> -m "<inspector prose>"` shape is the genuinely exploitable surface.
 export function gitMutationInspectorAllowIf(inspectorGroup) {
     // COMMAND-POSITION-ANCHORED inspector carve-out. The shared leading
     // `^\s*` + env-vars + optional `vh-agent-harness exec ` wrapper anchors
@@ -259,7 +300,7 @@ export const FORBIDDEN_PATTERNS = [
     {
         id: "apt-install-ad-hoc",
         re: /\bapt(-get)?\s+install\b/,
-        allowIf: ALLOW_IF_INSPECTOR_FULL,
+        allowIf: ALLOW_IF_INFRA_LIFECYCLE,
         why:
             "Do not run apt-get install at runtime. Container packages belong in" +
             " the Dockerfile. Add the dep and rebuild the image; runtime installs" +
@@ -268,11 +309,13 @@ export const FORBIDDEN_PATTERNS = [
     {
         id: "user-group-mutation",
         // Broad trigger: the bare tool name anywhere. The allowIf below carves
-        // out benign INSPECTION forms (`grep usermod README`, `command -v
-        // useradd`, `which usermod`, `ls /usr/sbin/useradd`, `echo "...useradd..."`)
-        // so only real INVOCATIONS (`sudo useradd x`, `usermod -aG ...`) fire.
+        // out benign INSPECTION forms (`grep usermod README`, `which useradd`,
+        // `type usermod`, `ls /usr/sbin/useradd`, `echo "...useradd..."`) so
+        // only real INVOCATIONS (`sudo useradd x`, `usermod -aG ...`) fire.
+        // NOTE: `command -v/-V <tool>` is NOT carved out — `command` is excluded
+        // from INFRA_LIFECYCLE_INSPECTORS (it executes its arg); use which/type.
         re: /\b(usermod|groupmod|groupadd|useradd|gpasswd|chpasswd)\b/,
-        allowIf: ALLOW_IF_INSPECTOR_FULL,
+        allowIf: ALLOW_IF_INFRA_LIFECYCLE,
         why:
             "Do not mutate users or groups inside the dev container. Fix the" +
             " image / compose file, not the running container.",
@@ -283,7 +326,7 @@ export const FORBIDDEN_PATTERNS = [
         // StrictHostKeyChecking=no file` (grep's `-o` flag, not ssh's). The
         // allowIf exempts grep/echo/which/etc. in command position.
         re: /-o\s+(StrictHostKeyChecking=no|UserKnownHostsFile=\/dev\/null)\b/,
-        allowIf: ALLOW_IF_INSPECTOR_FULL,
+        allowIf: ALLOW_IF_INFRA_LIFECYCLE,
         why:
             "Do not disable SSH host-key verification. The dev container has" +
             " .local/ssh/ bind-mounted RO, so you cannot append to known_hosts" +
@@ -296,7 +339,7 @@ export const FORBIDDEN_PATTERNS = [
         // Anchored to `scp ... user@host:` (upload shape). allowIf exempts
         // echo/grep/doc references that contain the literal pattern.
         re: /\bscp\b[^|;&\n]+@[^\s:]+:/,
-        allowIf: ALLOW_IF_INSPECTOR_FULL,
+        allowIf: ALLOW_IF_INFRA_LIFECYCLE,
         why:
             "Do not upload source via scp. scp uploads leave a remote host out of" +
             " sync with git and bypass managed releases. Land changes via the" +

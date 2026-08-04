@@ -90,11 +90,11 @@ It is the only agent that stages, commits, and manages session lifecycle on beha
    trip the matcher. See `.opencode/skills/gated-commit/SKILL.md` for the full
    canonical example.
 
-2.5. Refresh heartbeat during long operations (required for reviews exceeding TTL)
+2.5. Refresh heartbeat during long operations (required for reviews exceeding the retention window)
      → .opencode/scripts/commit-gate.sh heartbeat --uuid "<UUID>"
      - Heartbeat refreshes both lock metadata (if a lock dir exists) and per-session metadata (`meta-${UUID}`).
-     - In lock-free mode, TTL-based stale cleanup uses the per-session metadata file's mtime. If a review may take longer than the TTL window (default 10 minutes), heartbeat MUST be called periodically to prevent the session metadata from being deleted by a later acquire.
-     - **Required** for any review that may exceed the TTL. Call at least once every TTL / 2 interval during long-running reviews.
+     - In lock-free mode, scratch retention uses the per-session metadata file's mtime. Scratch (meta-/index-) is only reaped once it is BOTH older than the retention window (`COMMIT_GATE_GC_MAX_AGE`, default 3600s / 1 hour) AND not in the protected-UUID set (active lock UUID, `_current_uuid`, or any UUID whose `meta-*` is still fresh). This is the SAME contract `_gate_gc_sweep` uses — the acquire-time cleanup does NOT carry a separate shorter 600s lock-TTL contract. Heartbeat keeps a session inside the fresh-meta protection (it refreshes `meta-${UUID}` mtime and rewrites `_current_uuid`), so heartbeat MUST be called periodically for any review that may run longer than the 1-hour retention window. Do NOT conflate the lock TTL (`COMMIT_GATE_TTL_SECONDS`, 600s — "is a held lock dead?") with the scratch retention window (`COMMIT_GATE_GC_MAX_AGE`, 3600s — "may aged scratch be reaped?").
+     - **Required** for any review that may exceed the 1-hour retention window (`COMMIT_GATE_GC_MAX_AGE`). Call at least once every `GC_MAX_AGE / 2` interval during long-running reviews.
 
 3. Delegate to commit-reviewer
    → Invoke commit-reviewer subagent with:
@@ -125,9 +125,11 @@ It is the only agent that stages, commits, and manages session lifecycle on beha
         durable closeout ledger and the lock was released at acquire end
         (review is lock-free), so there is nothing for the agent to release.
         On these terminal-refusal paths the gate does NOT inline-reclaim the
-        per-session private index / `meta-${UUID}` / message scratch the way
-        the success path does — those orphans are reclaimed by aged-GC /
-        next-acquire stale-meta cleanup, exactly like `could_not_land`. Report
+         per-session private index / `meta-${UUID}` / message scratch the way
+         the success path does — those orphans are reclaimed by aged-GC /
+         next-acquire scratch cleanup (both use the same GC contract:
+         `COMMIT_GATE_GC_MAX_AGE`, default 3600s, with protected-UUID skip),
+         exactly like `could_not_land`. Report
         to A that a re-acquire + re-review is required (the branch advanced
         under this session):
           * `rebased_refused` (reason `reviewed_tree_diverged`): a concurrent
@@ -163,7 +165,7 @@ It is the only agent that stages, commits, and manages session lifecycle on beha
 
 - **Consecutive failures**: If 3 consecutive commit-reviewer rejections occur for the same change scope, escalate to the operator. Do not retry indefinitely.
 - **Lock contention**: If acquire fails twice in a row due to lock contention, report to A with the holder info from status output.
-- **Crash recovery**: If C crashes or loses context, the lock TTL (10 minutes) ensures automatic cleanup. Lock-free sessions also have TTL-based stale cleanup via `.git/commit-gate/meta-*` files. On restart, check `.opencode/scripts/commit-gate.sh status` before acquiring.
+- **Crash recovery**: If C crashes or loses context, the lock TTL (`COMMIT_GATE_TTL_SECONDS`, default 600s) ensures a dead held lock is reaped automatically. Lock-free sessions' scratch (`meta-${UUID}` / `index-${UUID}` under `.git/commit-gate/`) is retained under the SAME GC contract as the rest of the gate: it is only reaped once older than the retention window (`COMMIT_GATE_GC_MAX_AGE`, default 3600s / 1 hour) AND not in the protected-UUID set (active lock UUID, `_current_uuid`, or any UUID whose `meta-*` is fresh) — so a live concurrent session is never reaped by another session's acquire. On restart, check `.opencode/scripts/commit-gate.sh status` before acquiring.
 
 ## Escape hatch
 
@@ -218,14 +220,23 @@ The review MUST be treated as BLOCKED (release lock, report failure to A) if ANY
 6. **No task delegation except commit-reviewer.** May only invoke `commit-reviewer` for review. All other work stays within the protocol.
 7. **Preserve the commit message.** Use the message provided by A. Do not rewrite it.
 8. **Report machine-parseable results.** All outputs from the wrapper are JSON. Parse and relay the relevant fields to A.
-9. **Commit `docs/planning/backlog.md` ALONE.** The shared task-status ledger must NEVER travel in the same commit as code/docs changes — the commit-gate O1 preflight refuses an `acquire` whose `--paths` mixes `docs/planning/backlog.md` with any other path (status `path_error` / `backlog_must_commit_separately`). If a worker hands you a mixed path set, do NOT attempt to stage it: tell the worker to load the `backlog` skill and split — commit code first (without the ledger), then re-read `docs/planning/backlog.md` from disk and commit the backlog alone (backlog-only acquire). This is the W2/split-commit enforcement that keeps a concurrent backlog edit from `cas_conflict`-ing a clean code commit.
+9. **Commit `docs/planning/backlog.md` ALONE.** The shared task-status ledger must NEVER travel in the same commit as code/docs changes — the commit-gate O1 preflight refuses an `acquire` whose `--paths` mixes `docs/planning/backlog.md` with any other path (status `path_error` / `backlog_must_commit_separately`). If a worker hands you a mixed path set, do NOT attempt to stage it: tell the worker to load the `backlog` skill and split — commit code first (without the ledger), then re-read `docs/planning/backlog.md` from disk and commit the backlog alone (backlog-only acquire). This is the W2/split-commit enforcement that keeps a concurrent backlog edit from content-tangling a clean code commit — without it, a code commit bundling an incidental backlog edit would land as `could_not_land` the moment a concurrent backlog edit landed first.
    - **The backlog normalizer is the one case where `backlog.md` and a set of companion paths change together as one transaction.** A normalizer run (`vh-agent-harness exec node .opencode/scripts/normalize-backlog.js`, or `/backlog-cleanup`) writes `docs/planning/backlog.md` together with companion paths under `docs/planning/archive/` (managed archive files like `backlog-archive-<period>.md` and `archive/index.md`, including creates / removes). **This is NOT an exception to the rule above — there is no carveout in `commit-gate.sh`, no privileged archive path class, and the normalizer-managed archive companions are NOT ordinary "code/docs" changes.** The generic "commit code first" instruction above applies to a code + backlog mix handed to you by a worker; for a backlog + archive mix from a normalizer run, follow the two-commit protocol below instead. See the `backlog` skill for the full version.
    - **Two-commit normalizer protocol (treat the output as one transaction):**
+     - **You (the committer) cannot run `normalize-backlog.js`** — your profile
+       denies `vh-agent-harness *` and bare `node` is not in your allowlist. The
+       normalized working tree (`backlog.md` rewrite + archive companions, plus
+       the `--check` validation) must be prepared by **build**
+       (`vh-agent-harness exec node .opencode/scripts/normalize-backlog.js`) or
+       the **operator host-side** BEFORE the closeout is handed to you. The
+       "run the normalizer" / "rerun the normalizer" steps below are executed by
+       build/host, not by you — you only land the already-prepared two-commit
+       transaction. This documents the current permission split (no carve-out).
      1. Commit `docs/planning/backlog.md` alone (backlog-only acquire).
      2. Immediately commit only the changed, created, or removed `docs/planning/archive/**` companions as one archive-companion commit.
-     - Run `node .opencode/scripts/normalize-backlog.js --check` over the complete working tree **before the first commit and again after the second**.
+     - Build/host runs `node .opencode/scripts/normalize-backlog.js --check` over the complete working tree **before the first commit and again after the second** — request the run from build/host (or have the worker include both passes in the handoff).
      - **Do not stop, hand off, close out, or report the normalization complete between the two commits** — they are one logical transaction.
-     - If a `cas_conflict` occurs, re-read the ledger, rerun the normalizer over the complete working tree, and recompute both exact path sets before retrying. Do NOT revert the archive companions to unblock.
+     - If a `could_not_land` occurs (the backlog content-tangle — another session's backlog edit landed first), re-read the ledger, have build/host rerun the normalizer over the complete working tree, and recompute both exact path sets before retrying. Do NOT revert the archive companions to unblock.
 
 ## Input from A
 

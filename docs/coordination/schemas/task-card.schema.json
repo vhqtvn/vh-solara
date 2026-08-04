@@ -303,7 +303,7 @@
     },
     "recurrence": {
       "type": "object",
-      "description": "Optional recurrence-signature block. OPTIONAL on every card: legacy cards carry no block (backward-compat). When present, REQUIRES the two-level identity (recurrence_id = exact-defect collapse key; symptom_class_id = immutable/versioned taxonomy id) AND the acknowledgement pair (recurrence_count / last_acknowledged_count), and carries non-identity evidence[] plus an aliases[]/supersession list of structurally bounded items (item-shape bounding via additionalProperties:false, not a cardinality cap). The cross-field invariant recurrence_count >= last_acknowledged_count is enforced by the validator script (draft-07 cannot express it).",
+      "description": "Optional recurrence-signature block. OPTIONAL on every card: legacy cards carry no block (backward-compat). When present, REQUIRES the two-level identity (recurrence_id = exact-defect collapse key; symptom_class_id = immutable/versioned taxonomy id) AND the acknowledgement pair (recurrence_count / last_acknowledged_count), and carries non-identity evidence[] plus a bounded aliases[]/supersession list. The cross-field invariant recurrence_count >= last_acknowledged_count is enforced by the validator script (draft-07 cannot express it).",
       "required": ["recurrence_id", "symptom_class_id", "recurrence_count", "last_acknowledged_count"],
       "properties": {
         "recurrence_id": {
@@ -364,7 +364,7 @@
         },
         "aliases": {
           "type": "array",
-          "description": "Alias/supersession reconciliation with structurally bounded items (item-shape, not cardinality) for an identity that must be re-pointed after later evidence.",
+          "description": "Bounded alias/supersession reconciliation for an identity that must be re-pointed after later evidence.",
           "items": {
             "type": "object",
             "required": ["recurrence_id"],

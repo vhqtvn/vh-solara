@@ -216,8 +216,12 @@ These verbs are always allowed and pass through shell-guard:
 
 Heartbeat refreshes both lock metadata (if a lock dir exists) and per-session metadata
 (`meta-${UUID}` in `.git/commit-gate/`). In lock-free mode, the per-session metadata file's mtime
-is what TTL-based stale cleanup checks — so **heartbeat is required** for any review that may
-exceed the TTL window (default 10 minutes).
+is what the scratch-retention cleanups (the acquire-time cleanup AND `_gate_gc_sweep`) consult — both
+use the SAME contract (`COMMIT_GATE_GC_MAX_AGE`, default 3600s / 1 hour) with a protected-UUID skip
+(active lock UUID, `_current_uuid`, any UUID whose `meta-*` is still fresh). A live concurrent session
+is never reaped by another session's acquire, so **heartbeat is required** for any review that may
+exceed the 1-hour retention window (heartbeat refreshes the `meta-${UUID}` mtime and rewrites
+`_current_uuid`, keeping the session inside the fresh-meta protection).
 
 ```bash
 .opencode/scripts/commit-gate.sh heartbeat --uuid "<UUID>"
@@ -227,6 +231,29 @@ This updates the `heartbeat_at` timestamp in the session metadata without changi
 If the lock dir exists, it also refreshes lock metadata atomically. If no lock dir exists
 (lock-free mode), it refreshes the per-session `meta-${UUID}` file, keeping the session alive
 during long reviews.
+
+## Working-tree cleanliness (transition-relative)
+
+Working-tree cleanliness is **transition-relative** — it is NOT a single
+universal requirement. The commit gate preserves a NARROWER, harder invariant
+than "globally clean tree":
+
+> the committed tree for the authorized slice equals the reviewed/approved tree
+> for that slice (exact-slice / approved-tree identity).
+
+This intentionally **tolerates unrelated concurrent dirt**. A concurrently-dirty
+working tree is normal during concurrent sessions; unrelated files are
+mechanically excluded by the gate's private-index staging. The gate MUST NOT:
+
+- require a globally clean tree to commit (that would break the exact-slice +
+  concurrent-dirt-tolerance model);
+- erase, revert, or discard unrelated concurrent changes to obtain a
+  cosmetically clean `git status`.
+
+**Global cleanliness is a release-only invariant** (release/tag transitions,
+where the tagged commit must be exactly what was verified — release G0b). It is
+a SEPARATE control (F4-B2) from exact-slice commit integrity and from canonical
+full verification (F4-B1). Do not conflate them at the commit boundary.
 
 ## Cross-references
 

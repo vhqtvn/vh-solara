@@ -832,6 +832,7 @@
                     "commit-reviewer": "allow",
                     "ship-review": "allow",
                     "committer": "allow",
+                    "docs-steward": "allow",
                     "debate": "allow",
                     "solution-brief": "allow",
                     "media-perception": "allow",
@@ -1435,7 +1436,8 @@
                     "vh-agent-harness help *": "allow",
                     "vh-agent-harness skill list": "allow",
                     "vh-agent-harness skill list *": "allow",
-                    "vh-agent-harness overlay docs *": "allow"
+                    "vh-agent-harness overlay docs *": "allow",
+                    "vh-agent-harness exec-sandbox *": "allow"
                 },
                 "edit": {
                     "*": "deny",
@@ -1723,6 +1725,7 @@
                     "commit-reviewer": "allow",
                     "ship-review": "allow",
                     "committer": "allow",
+                    "docs-steward": "allow",
                     "debate": "allow",
                     "solution-brief": "allow",
                     "media-perception": "allow",
@@ -1889,7 +1892,8 @@
                     "vh-agent-harness help *": "allow",
                     "vh-agent-harness skill list": "allow",
                     "vh-agent-harness skill list *": "allow",
-                    "vh-agent-harness overlay docs *": "allow"
+                    "vh-agent-harness overlay docs *": "allow",
+                    "vh-agent-harness exec-sandbox *": "allow"
                 },
                 "edit": {
                     "*": "deny",
@@ -1990,7 +1994,8 @@
                     "vh-agent-harness help *": "allow",
                     "vh-agent-harness skill list": "allow",
                     "vh-agent-harness skill list *": "allow",
-                    "vh-agent-harness overlay docs *": "allow"
+                    "vh-agent-harness overlay docs *": "allow",
+                    "vh-agent-harness exec-sandbox *": "allow"
                 },
                 "edit": {
                     "*": "deny",

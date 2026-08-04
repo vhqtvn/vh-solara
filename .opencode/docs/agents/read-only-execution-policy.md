@@ -124,9 +124,36 @@ read-only exec-sandbox grant.
 
 ## Failure behavior rule
 
-If permission blocks a needed command:
+Routing and reporting are separate. Choose the correct route before invoking a
+command; do not treat this decision tree as a fallback sequence (an `exec-ro`
+DENY is final — never rewrite or rerun the denied command through another verb).
 
-1. report exact blocked command
-2. report why it is needed
-3. request handoff to `build` or an editable specialist
-4. do not attempt workaround commands
+### Routing decision tree
+
+1. **`exec-ro` classifier DENY:** the command was not proven read-only and was
+   not executed. DENY is final: do not rewrite or rerun the command through
+   another verb. The deny notice names the active mode-floor and routes you.
+2. **Real permission denial:** if opencode or shell-guard blocks a command that
+   is otherwise appropriate, follow the reporting protocol below and request
+   handoff. Do not attempt workaround commands.
+3. **Explicitly granted host-local read-code:** use
+   `vh-agent-harness exec-sandbox` only when the calling role has that grant AND
+   the applicable `exec_sandbox.min_mode` supplies the required containment.
+   `exec-sandbox` is host-local only — it does NOT follow a command into `proxy`
+   or `docker_compose` backends; preserved/upgrade run-shapes may lack the floor
+   entirely, in which case this rung is unavailable.
+4. **`proxy`/`docker_compose` backend work:** do not use `exec-sandbox`; it is
+   host-local only. Use backend-native containment or the authorized runtime
+   path, or request handoff.
+5. **Genuine mutation:** use an authorized editable role and the appropriate
+   execution path. Do not disguise mutation as read-only work.
+
+### Reporting protocol
+
+When a command is denied or permission-blocked:
+
+1. report the exact blocked command;
+2. report why it is needed;
+3. identify the applicable routing case above;
+4. request handoff to `build` or another authorized specialist when required;
+5. do not attempt workaround commands.

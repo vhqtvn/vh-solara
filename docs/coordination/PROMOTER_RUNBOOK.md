@@ -52,7 +52,7 @@ Promote on any of these triggers:
    for candidate cards carrying Notes-prefix provenance (`source:review-defer`,
    `source:p2-followup`, `trigger:...`, `studied:YYYY-MM-DD`).
 2. **Run the predicate checker.** Execute
-   `node .opencode/scripts/check-defer-triggers.js` to see which candidates'
+   `node .opencode/scripts/check-defer-triggers.mjs` to see which candidates'
    `trigger:` conditions are currently met (`path_touched(<path>)` via
    `git diff --name-only`, `after_tag(<tag>)` via `git describe`). The checker
    is a **promotion-review aid only** — it never runs in a commit hook, never

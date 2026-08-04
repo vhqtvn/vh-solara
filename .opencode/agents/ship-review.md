@@ -16,6 +16,10 @@ is a final read-only pass that surfaces issues a slice-scoped review may have
 missed. Never emit a verdict shaped like the commit-reviewer's; never block a
 commit.
 
+For latent contract or invariant defects in code NOT touched by this change —
+the per-change blind spot — the distinct `contract-invariant-audit` skill
+audits declared existing surfaces across repository history.
+
 ## Assessment axes (dual-axis, whole-change scope)
 
 Review along TWO evidence axes, both reported in the same conclusion:

@@ -45,6 +45,49 @@ result: proven               # proven | skipped | not-demonstrable (the crux out
   flag is set, a record exists, a code path ran). Mechanism-without-outcome is
   `result: skipped`, not `proven`.
 
+## Success-report integrity (verification claims)
+
+"Green" is ambiguous. When a closeout claims verification, distinguish three
+SEPARATE senses and never let one stand in for another. These are the F4
+assurance/integrity-stewardship properties (A, B1, B2); each can pass or fail
+independently.
+
+| Sense | Means | Fails when |
+|-------|-------|------------|
+| **B1 — full verification** | the canonical full command set actually ran successfully AND the result is bound to the assessed revision/tree | a command was skipped, failed, or cannot be bound to the assessed state; a targeted/smoke run is summarized as full |
+| **targeted / smoke** | only a subset ran (e.g. a single `-run` filter, one package, a smoke probe) | (not a failure by itself — it is a failure only if labeled or implied to be full) |
+| **B2 — clean transition state** | the working-tree / transition state matches what was reviewed | uncommitted or untracked bytes make the verified state differ from the state being released |
+
+Rules:
+
+- **Targeted or smoke commands must be labeled targeted or smoke.** They must
+  never be summarized as full green. If full execution cannot be observed or
+  bound to the assessed state, the result is `inconclusive` or
+  `not-demonstrable`, not green.
+- **B1 and B2 are separate controls.** All canonical commands passing (B1) does
+  not imply a clean tree (B2), and a clean tree (B2) does not imply the build
+  passed (B1). State both independently.
+- **Cleanliness is transition-relative.**
+  - **Release / tag transitions require global cleanliness** — the tagged
+    commit must be exactly what was verified (release G0b refuses a dirty
+    worktree).
+  - **Ordinary commit-gate integrity is exact-slice based** and MUST tolerate
+    unrelated concurrent dirt. The committed tree for the authorized slice
+    equals the reviewed/approved tree for that slice; unrelated concurrent
+    working-tree changes are normal and must NOT be erased, reverted, or
+    blocked to obtain a cosmetically clean status. Do not require a global
+    clean tree at the commit boundary.
+- **Declared-scope coverage (F4-A) is structural.** Every item in the declared
+  scope should receive a terminal disposition (examined or excluded by
+  contract). "Reviewed" or "complete" must not be claimed when a declared item
+  lacks a disposition. Structural coverage proves only that each declared item
+  was accounted for — never that it was meaningfully examined.
+
+The `behavioral-closure` token (above) is a declaration of crux consistency,
+not proof that the cited path executed. It is distinct from B1: a consistent
+token does not prove the canonical command ran, and a full-green run does not
+prove the load-bearing crux path was the one exercised.
+
 ## Motivation check (advisory, distinct property)
 
 When the task was driven by a stated motivation, record whether that motivation

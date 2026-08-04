@@ -202,6 +202,32 @@ Forward user-provided context verbatim (feature summary, file list, lane, etc.),
 
 **`review_mode` forwarding:** If the caller provides a `review_mode`, forward it verbatim to all leaves. If the caller-provided value is not in the declared enum (`merge-ready`, `security-focused`, `docs-only`, `coordination-synthesis`, `runtime-policy`, `eval-promotion`, `frontend-ui`, `degraded-single-review`), default to `merge-ready` and forward a note to all leaves mentioning the unrecognized value. In the aggregated output, set `review_mode` to the value all leaves agree on. If leaf `review_mode` values disagree, treat as malformed and set overall verdict to `blocked` with a blocking issue noting the mismatch.
 
+## Declared-scope coverage (structural substrate, non-blocking)
+
+The orchestrator aggregates leaf `reviewed_files` into a single union
+(`reviewed_files` in the output schema, Step 4h/within-tier aggregation #4).
+This union is a **structural substrate** for declared-scope coverage (the F4-A
+assurance property): it is the raw material a future coverage validator could
+compare against an explicit declared scope.
+
+Two honesty constraints apply wherever `reviewed_files` is consumed:
+
+- **Structural coverage is not semantic examination.** A file appearing in the
+  union proves only that a leaf claimed to review it — never that it was
+  meaningfully examined. Do not let a "reviewed" or "complete" claim rest on
+  union presence alone.
+- **Non-blocking.** Comparing the union against a declared scope is INFORM
+  only. A deterministic declared-scope equality check may become a hard gate
+  only after canonical declared-scope and coverage-disposition representations
+  exist, item identity and exclusion semantics are deterministic, the check is
+  attached to the actual approval transition, and fixtures prove partial or
+  truncated coverage refuses approval. Until then, coverage gaps are advisory.
+
+The `fail_fast` flag (configurable, default true) is directly relevant: when a
+cascade stops at the first block/split, later tiers never run, so later-declared
+items may receive no disposition at all. A fail-fast-terminated review cannot
+claim complete coverage while any declared item lacks a terminal disposition.
+
 ## Disposition extraction
 
 Each leaf returns a v2 schema with a `findings[]` array. Each finding has a `disposition` field. Extract dispositions mechanically:
@@ -437,7 +463,7 @@ This orchestrator implements Phase 1 of the Commit-Gate Disposition (CGD) system
 - **BLOCK-only gating:** DEFER and DROP never block a commit, regardless of severity.
 - **Evidence-grounded disagreement:** Cross-leaf BLOCK disagreements are resolved by checking evidence verifiability, not by voting.
 - **Resolved-categories:** Prevents re-block-after-approve within a session.
-- **DEFER routes to the holding area:** DEFER findings are non-blocking. They are NOT transcribed into `docs/planning/backlog.md` directly. The DEFER grammar (trigger.predicate + trigger.params) IS the intake predicate: a DEFER finding is captured into `.local/coordinator/tasks/` (via `/write-task`) as a conditional candidate with Notes provenance (`source:review-defer`, the trigger expression, `studied:YYYY-MM-DD`), and reaches the backlog only after the trigger fires + the promoter applies the Definition of Ready. The promoter runs `check-defer-triggers.js` as a review aid. See the `backlog` skill.
+- **DEFER routes to the holding area:** DEFER findings are non-blocking. They are NOT transcribed into `docs/planning/backlog.md` directly. The DEFER grammar (trigger.predicate + trigger.params) IS the intake predicate: a DEFER finding is captured into `.local/coordinator/tasks/` (via `/write-task`) as a conditional candidate with Notes provenance (`source:review-defer`, the trigger expression, `studied:YYYY-MM-DD`), and reaches the backlog only after the trigger fires + the promoter applies the Definition of Ready. The promoter runs `check-defer-triggers.mjs` as a review aid. See the `backlog` skill.
 - **Success criteria:** <3 review rounds average, <15% block rate. If >80% of reviews are blocked, disposition calibration is too strict.
 - **Restart-gated:** These changes take effect only after opencode restart.
 

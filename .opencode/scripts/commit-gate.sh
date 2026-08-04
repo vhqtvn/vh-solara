@@ -753,18 +753,75 @@ EOF
     fi
   fi
 
-  # Clean up stale session metadata (older than TTL)
+  # -------------------------------------------------------------------
+  # Acquire-time scratch cleanup. This MUST mirror _gate_gc_sweep's
+  # contract (the canonical GC at no_changes/commit/release), NOT carry a
+  # divergent one. Historically this block used the LOCK-TTL age
+  # (COMMIT_GATE_TTL_SECONDS, 600s) with NO protected-UUID set, which
+  # `rm`'d LIVE concurrent sessions' meta-*/index-* scratch (a session in
+  # its lock-free review phase whose heartbeat had lapsed > 600s) and
+  # caused spurious uuid_mismatch / private_index-gone failures on commit.
+  #
+  # Two DISTINCT age concepts travel through this gate — do NOT re-conflate:
+  #   - COMMIT_GATE_TTL_SECONDS (600s)  = LOCK staleness (is a held lock dead?).
+  #   - COMMIT_GATE_GC_MAX_AGE (3600s)  = SCRATCH retention (may aged scratch
+  #     be reaped?). Acquire-time meta cleanup is a SCRATCH-retention concern,
+  #     so it uses the GC-max-age concept (3600s), NOT the lock-TTL (600s).
+  #
+  # The protected-UUID set (active lock UUID + _current_uuid + any UUID whose
+  # meta-* is fresh) is consulted so a live concurrent session is never reaped.
+  # Mirrors _gate_gc_sweep's construction (~376-400); scoped here to meta-/
+  # index- only (this is the pre-lock sweep; the full-prefix sweep still runs
+  # on no_changes/commit/release via _gate_gc_sweep).
+  # -------------------------------------------------------------------
   if [[ -d "$GATE_INDEX_DIR" ]]; then
-    local ttl="${COMMIT_GATE_TTL_SECONDS:-$DEFAULT_TTL}"
+    local gc_max_age="${COMMIT_GATE_GC_MAX_AGE:-$DEFAULT_GC_MAX_AGE}"
+    # Build the protected-UUID set (mirrors _gate_gc_sweep).
+    local protected_uuids=()
+    if [[ -d "$LOCK_DIR" ]]; then
+      local gc_lock_content gc_lock_uuid
+      gc_lock_content=$(cat "$LOCK_META" 2>/dev/null || echo "{}")
+      gc_lock_uuid=$(_field_str "$gc_lock_content" "uuid")
+      [[ -n "$gc_lock_uuid" ]] && protected_uuids+=("$gc_lock_uuid")
+    fi
+    local gc_cu_file="${GATE_INDEX_DIR}/_current_uuid"
+    if [[ -f "$gc_cu_file" ]]; then
+      local gc_cu_val
+      gc_cu_val=$(tr -d '[:space:]' < "$gc_cu_file" 2>/dev/null || true)
+      [[ -n "$gc_cu_val" ]] && protected_uuids+=("$gc_cu_val")
+    fi
+    local gc_m
+    while IFS= read -r gc_m; do
+      [[ -z "$gc_m" ]] && continue
+      local gc_m_age gc_m_uuid
+      gc_m_age=$(_file_age_seconds "$gc_m" 2>/dev/null || echo "0")
+      if [[ $gc_m_age -le $gc_max_age ]]; then
+        gc_m_uuid="${gc_m#${GATE_INDEX_DIR}/meta-}"
+        protected_uuids+=("$gc_m_uuid")
+      fi
+    done < <(ls -1 "${GATE_INDEX_DIR}"/meta-* 2>/dev/null)
+
     local meta_file
     while IFS= read -r meta_file; do
       [[ -z "$meta_file" ]] && continue
       local meta_age
       meta_age=$(_file_age_seconds "$meta_file" 2>/dev/null || echo "0")
-      if [[ $meta_age -gt $ttl ]]; then
-        # Extract UUID from filename (meta-${UUID})
+      if [[ $meta_age -gt $gc_max_age ]]; then
+        # Extract UUID from filename (meta-${UUID}).
         local stale_uuid
-        stale_uuid=$(basename "$meta_file" | sed 's/^meta-//')
+        stale_uuid="${meta_file#${GATE_INDEX_DIR}/meta-}"
+        # Skip protected UUIDs (exact string match on the UUID portion).
+        local is_protected=false
+        if [[ ${#protected_uuids[@]} -gt 0 ]]; then
+          local prot
+          for prot in "${protected_uuids[@]}"; do
+            if [[ "$stale_uuid" == "$prot" ]]; then
+              is_protected=true
+              break
+            fi
+          done
+        fi
+        [[ "$is_protected" == "true" ]] && continue
         rm -f "$meta_file" 2>/dev/null || true
         rm -f "${GATE_INDEX_DIR}/index-${stale_uuid}" 2>/dev/null || true
       fi
@@ -1446,8 +1503,12 @@ print(json.dumps({'status': 'heartbeat_refreshed', 'uuid': data['uuid'], 'heartb
   fi
 
   # --- Per-session metadata heartbeat (lock-free sessions) ---
-  # Refreshes mtime on the per-session meta file so TTL-based stale cleanup
-  # in cmd_acquire does not delete metadata for an active review.
+  # Refreshes mtime on the per-session meta file so the acquire-time and
+  # _gate_gc_sweep scratch cleanups (both use COMMIT_GATE_GC_MAX_AGE, default
+  # 3600s, with a protected-UUID skip — see cmd_acquire ~756 and _gate_gc_sweep
+  # ~368) treat this meta as fresh and never reap it during an active review.
+  # Do NOT confuse the scratch retention window (GC_MAX_AGE, 1h) with the lock
+  # TTL (COMMIT_GATE_TTL_SECONDS, 600s) — they are distinct concepts.
   local session_meta
   session_meta="$(_session_meta_path "$uuid")"
   if [[ -f "$session_meta" ]]; then

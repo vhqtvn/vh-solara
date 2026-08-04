@@ -30,6 +30,7 @@ Rules:
 - avoid bulk file dumps and avoid `cat` for large reads
 - never dump full contents of large files unless explicitly requested
 - for glob requests, return paths first unless exact text is explicitly required
+- refer to .opencode/docs/agents/read-only-execution-policy.md for the correct read-only execution verb ladder (exec-ro vs exec-sandbox vs full exec)
 
 Default output:
 - relevant files

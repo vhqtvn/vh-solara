@@ -2,9 +2,11 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import {
+    DEFAULT_PRODUCT_PREFIXES,
     buildCoordinationHintMessages,
     buildRepetitionHint,
     normalizeCommandIdentity,
+    parseProductPrefixes,
 } from "./coordination-hints-lib.js";
 import { server } from "../plugins/coordination-hints.js";
 import {
@@ -429,9 +431,134 @@ function verifyComplexityDisabled() {
     }
 }
 
+// verifyProductPrefixes covers the config-driven product-prefix path that
+// replaced the phase-later TODO. It exercises the pure parser
+// (parseProductPrefixes) directly, then the integration path through
+// buildCoordinationHintMessages: a valid override makes custom prefixes the
+// product surface (and the monorepo defaults no longer match), while a malformed
+// file falls back safely to the default. The "absent file -> monorepo default"
+// path is already proven by the main() sandbox below (no product-prefixes.json,
+// apps/ recognised as product, cross-boundary warning fires).
+function verifyProductPrefixes() {
+    ensureDir(TMP_ROOT);
+
+    // (a) pure parser: a valid array normalizes + de-duplicates. Pin the default
+    // constant too so a change to the fallback is a deliberate decision.
+    assert(
+        JSON.stringify(DEFAULT_PRODUCT_PREFIXES) === JSON.stringify(["apps/", "packages/"]),
+        "The monorepo default must stay apps/ + packages/ (the override path's fallback).",
+    );
+    const parsed = parseProductPrefixes('{"product_prefixes":["src/","services/","src/"]}');
+    assert(
+        parsed !== null && JSON.stringify(parsed) === JSON.stringify(["src/", "services/"]),
+        `parseProductPrefixes should normalize + de-duplicate a valid array, got: ${JSON.stringify(parsed)}`,
+    );
+
+    // (b) pure parser: invalid shapes return null (caller falls back to default).
+    const nullCases = [
+        ["empty string", ""],
+        ["not json", "{not json"],
+        ["missing field", "{}"],
+        ["wrong field name", '{"product_prefix":["src/"]}'],
+        ["non-array", '{"product_prefixes":"src/"}'],
+        ["empty array", '{"product_prefixes":[]}'],
+        ["non-string member", '{"product_prefixes":["src/",5]}'],
+        ["empty-string member", '{"product_prefixes":["src",""]}'],
+    ];
+    for (const [label, text] of nullCases) {
+        const got = parseProductPrefixes(text);
+        assert(
+            got === null,
+            `parseProductPrefixes should return null for ${label}, got: ${JSON.stringify(got)}`,
+        );
+    }
+
+    // (c) integration: a valid override makes src/ a product surface and stops
+    // apps/ from matching. coordination+src fires the cross-boundary warning;
+    // coordination+apps does NOT.
+    {
+        const sandbox = fs.mkdtempSync(path.join(TMP_ROOT, "verify-product-prefixes-override-"));
+        try {
+            ensureDir(path.join(sandbox, ".vh-agent-harness"));
+            ensureDir(path.join(sandbox, "docs", "coordination"));
+            ensureDir(path.join(sandbox, "src"));
+            ensureDir(path.join(sandbox, "apps", "api"));
+            fs.writeFileSync(
+                path.join(sandbox, ".vh-agent-harness", "product-prefixes.json"),
+                '{"product_prefixes":["src/","services/"]}',
+                "utf8",
+            );
+            fs.writeFileSync(path.join(sandbox, "docs", "coordination", "README.md"), "# c\n", "utf8");
+            fs.writeFileSync(path.join(sandbox, "src", "mod.py"), "print('hi')\n", "utf8");
+            fs.writeFileSync(path.join(sandbox, "apps", "api", "main.py"), "print('hi')\n", "utf8");
+
+            const hintsCustomProduct = buildCoordinationHintMessages({
+                directory: sandbox,
+                diffFiles: [
+                    { file: "docs/coordination/README.md", additions: 2 },
+                    { file: "src/mod.py", additions: 2 },
+                ],
+            });
+            assert(
+                hintsCustomProduct.some((h) => h.key === "cross-boundary-slice-warning"),
+                "Valid product-prefixes.json override: src/ is now a product surface, so coordination+src must fire the cross-boundary warning.",
+            );
+
+            const hintsAppsNoLongerProduct = buildCoordinationHintMessages({
+                directory: sandbox,
+                diffFiles: [
+                    { file: "docs/coordination/README.md", additions: 2 },
+                    { file: "apps/api/main.py", additions: 2 },
+                ],
+            });
+            assert(
+                !hintsAppsNoLongerProduct.some((h) => h.key === "cross-boundary-slice-warning"),
+                "Valid override: apps/ is no longer a product surface, so coordination+apps must NOT fire the cross-boundary warning.",
+            );
+        } finally {
+            fs.rmSync(sandbox, { recursive: true, force: true });
+        }
+    }
+
+    // (d) integration: a malformed file falls back to the monorepo default, so
+    // apps/ is still a product surface and a coordination+apps slice warns.
+    {
+        const sandbox = fs.mkdtempSync(path.join(TMP_ROOT, "verify-product-prefixes-malformed-"));
+        try {
+            ensureDir(path.join(sandbox, ".vh-agent-harness"));
+            ensureDir(path.join(sandbox, "docs", "coordination"));
+            ensureDir(path.join(sandbox, "apps", "api"));
+            fs.writeFileSync(
+                path.join(sandbox, ".vh-agent-harness", "product-prefixes.json"),
+                "{not json",
+                "utf8",
+            );
+            fs.writeFileSync(path.join(sandbox, "docs", "coordination", "README.md"), "# c\n", "utf8");
+            fs.writeFileSync(path.join(sandbox, "apps", "api", "main.py"), "print('hi')\n", "utf8");
+
+            const hints = buildCoordinationHintMessages({
+                directory: sandbox,
+                diffFiles: [
+                    { file: "docs/coordination/README.md", additions: 2 },
+                    { file: "apps/api/main.py", additions: 2 },
+                ],
+            });
+            assert(
+                hints.some((h) => h.key === "cross-boundary-slice-warning"),
+                "Malformed product-prefixes.json: must fall back to the monorepo default so apps/ is still a product surface.",
+            );
+        } finally {
+            fs.rmSync(sandbox, { recursive: true, force: true });
+        }
+    }
+
+    console.log("product-prefixes verification: ok");
+}
+
 async function main() {
     verifyComplexityParity();
     verifyComplexityDisabled();
+    verifyProductPrefixes();
     verifyRepetitionHints();
     await verifyAsyncReentrancy();
     ensureDir(TMP_ROOT);

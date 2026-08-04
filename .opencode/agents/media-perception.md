@@ -191,3 +191,4 @@ immediately with an honest report.
 - classify failures into the structured classes above; never retry
   unboundedly — at most one explicit retry for `timeout` or
   `transient_transport`
+- refer to .opencode/docs/agents/read-only-execution-policy.md for the correct read-only execution verb ladder (exec-ro vs exec-sandbox vs full exec)

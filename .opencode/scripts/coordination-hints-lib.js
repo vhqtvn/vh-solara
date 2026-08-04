@@ -44,13 +44,72 @@ const COORDINATION_EXACT_PATHS = new Set([
     "opencode.jsonc",
 ]);
 
-// TODO(phase-later): read product prefixes from .vh-agent-harness/project.config.json
-// (project.product_prefixes) at runtime so non-monorepo projects can override.
-// Default kept as ["apps/", "packages/"] for monorepo compatibility.
-const PRODUCT_PREFIXES = [
+// Product-prefix source: coordination-hints resolves the product-code surface
+// from .vh-agent-harness/product-prefixes.json (a project-owned, committed
+// override) so non-monorepo projects can declare their own layout. The file is
+// absent on most projects (the monorepo default below applies); loadProductPrefixes
+// returns null when absent or malformed, and callers fall back to the default.
+// Dedicated file rather than project.config.json: that file has a contract-closed
+// 4-field set consumed only by the Go render seam (see its //_fields comment),
+// and vh-harness-profile.yml rejects unknown top-level keys — neither is an
+// extensible host for this runtime-consumed field.
+const DEFAULT_PRODUCT_PREFIXES = [
     "apps/",
     "packages/",
 ];
+
+// parseProductPrefixes is the pure parser/normalizer for the product-prefixes
+// config. Accepts the raw file text, returns a de-duplicated array of normalized
+// (forward-slash) string prefixes, or null when the content is missing, not
+// valid JSON, lacks a non-empty product_prefixes array, or any member is not a
+// non-empty string. Mirrors the loadComplexityPolicy parse/load split so parsing
+// stays directly unit-testable; a null return means "use the monorepo default".
+function parseProductPrefixes(text) {
+    if (!text) {
+        return null;
+    }
+    let doc;
+    try {
+        doc = JSON.parse(text);
+    } catch {
+        return null;
+    }
+    const raw = doc && Array.isArray(doc.product_prefixes) ? doc.product_prefixes : null;
+    if (!raw || !raw.length) {
+        return null;
+    }
+    const normalized = [];
+    const seen = new Set();
+    for (const entry of raw) {
+        if (typeof entry !== "string") {
+            return null;
+        }
+        const norm = entry.replaceAll("\\", "/").trim();
+        if (!norm) {
+            return null;
+        }
+        if (!seen.has(norm)) {
+            seen.add(norm);
+            normalized.push(norm);
+        }
+    }
+    return normalized;
+}
+
+// loadProductPrefixes reads .vh-agent-harness/product-prefixes.json under
+// directory and returns the parsed/normalized prefix list, or null when the file
+// is absent/malformed/invalid (callers fall back to DEFAULT_PRODUCT_PREFIXES).
+// Mirrors complexity-signal-lib.js :: loadPolicy (read + parse, null on absent).
+function loadProductPrefixes(directory) {
+    const filePath = path.join(directory, ".vh-agent-harness", "product-prefixes.json");
+    let text;
+    try {
+        text = fs.readFileSync(filePath, "utf8");
+    } catch {
+        return null;
+    }
+    return parseProductPrefixes(text);
+}
 
 function normalizePath(value) {
     return String(value || "").replaceAll("\\", "/");
@@ -82,8 +141,8 @@ function isCoordinationSurface(relativePath) {
     return COORDINATION_PREFIXES.some((prefix) => relativePath.startsWith(prefix));
 }
 
-function isProductSurface(relativePath) {
-    return PRODUCT_PREFIXES.some((prefix) => relativePath.startsWith(prefix));
+function isProductSurface(relativePath, productPrefixes = DEFAULT_PRODUCT_PREFIXES) {
+    return productPrefixes.some((prefix) => relativePath.startsWith(prefix));
 }
 
 function supportsLargeFileHint(relativePath) {
@@ -151,10 +210,12 @@ function buildCoordinationHintMessages(input) {
         return [];
     }
 
+    const productPrefixes = loadProductPrefixes(directory) ?? DEFAULT_PRODUCT_PREFIXES;
+
     const hints = [];
     const touchedPaths = normalized.map((entry) => entry.relative_path);
     const coordinationTouched = touchedPaths.filter(isCoordinationSurface);
-    const productTouched = touchedPaths.filter(isProductSurface);
+    const productTouched = touchedPaths.filter((p) => isProductSurface(p, productPrefixes));
 
     if (touchedPaths.includes("docs/planning/backlog.md")) {
         hints.push({
@@ -344,6 +405,7 @@ function buildRepetitionHint(commandIdentity, count) {
 
 export {
     COMMAND_REPETITION_THRESHOLD,
+    DEFAULT_PRODUCT_PREFIXES,
     LARGE_FILE_LINE_THRESHOLD,
     buildCoordinationHintMessages,
     buildRepetitionHint,
@@ -352,10 +414,12 @@ export {
     isProductSurface,
     normalizeCommandIdentity,
     normalizeRepoRelativePath,
+    parseProductPrefixes,
 };
 
 export default {
     COMMAND_REPETITION_THRESHOLD,
+    DEFAULT_PRODUCT_PREFIXES,
     LARGE_FILE_LINE_THRESHOLD,
     buildCoordinationHintMessages,
     buildRepetitionHint,
@@ -364,4 +428,5 @@ export default {
     isProductSurface,
     normalizeCommandIdentity,
     normalizeRepoRelativePath,
+    parseProductPrefixes,
 };

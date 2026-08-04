@@ -61,6 +61,7 @@ Rules:
   home-dir usernames (e.g. `/home/<operator-typo>`, `/home/<operator-typo>`) are the recurring
   cause of `external_directory` prompts (see AGENTS.md → "Command hygiene to
   avoid permission prompts")
+- refer to .opencode/docs/agents/read-only-execution-policy.md for the correct read-only execution verb ladder (exec-ro vs exec-sandbox vs full exec)
 
 
 ## Media perception (capability available)
