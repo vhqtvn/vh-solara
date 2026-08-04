@@ -50,19 +50,32 @@ func DemoDir() string {
 
 // FakeOpenCode implements the subset of OpenCode's HTTP API the daemon uses.
 type FakeOpenCode struct {
-	mu              sync.Mutex
-	sessions        []map[string]any
-	messages        map[string][]messageWithParts // sessionID -> ordered messages
-	subs            map[int]chan string
-	nextSub         int
-	counter         int
-	pendingQ        map[string]string             // questionID -> sessionID
-	pendingQReq     map[string]map[string]any     // questionID -> full question request
-	pendingP        map[string]map[string]any     // permissionID -> full permission request
-	archived        map[string]bool               // sessionID -> archived (native time.archived)
-	busy            map[string]string             // sessionID -> status type (busy/retry); mirrors /session/status
-	baseline        map[string][]messageWithParts // sessionID -> seeded message list snapshot for /fixture/reset
-	promptAsyncMode PromptAsyncMode               // test-only; default PromptAsyncNormal (see PromptAsyncMode doc)
+	mu          sync.Mutex
+	sessions    []map[string]any
+	messages    map[string][]messageWithParts // sessionID -> ordered messages
+	subs        map[int]chan string
+	nextSub     int
+	counter     int
+	pendingQ    map[string]string             // questionID -> sessionID
+	pendingQReq map[string]map[string]any     // questionID -> full question request
+	pendingP    map[string]map[string]any     // permissionID -> full permission request
+	archived    map[string]bool               // sessionID -> archived (native time.archived)
+	busy        map[string]string             // sessionID -> status type (busy/retry); mirrors /session/status
+	baseline    map[string][]messageWithParts // sessionID -> seeded message list snapshot for /fixture/reset
+	// resetGen is a per-session generation counter bumped by handleFixtureReset.
+	// simulatePrompt captures the generation active at turn-start and gates its
+	// DEFERRED session.idle emit on it being unchanged. A [[stall]] goroutine
+	// leaked across serial e2e tests (tests 4/9 sleep 5s server-side and do not
+	// wait) would otherwise emit a stale session.idle AFTER a later test's
+	// beforeEach reset + that test's own send — racing the new turn's
+	// session.status busy and clearing working() mid-turn (the :693 flake:
+	// .working-text never appears because the leaked idle cancels the busy).
+	// Bumping the generation on reset makes the leaked defer a no-op; the reset
+	// emits its own session.idle, so no event is lost. Sibling of the 2f6e697
+	// message-accumulation fix — same "aggregator-store-clear must reach the
+	// event feed" rationale, on the busy/idle axis instead of the message axis.
+	resetGen        map[string]uint64 // sessionID -> generation, bumped on /fixture/reset
+	promptAsyncMode PromptAsyncMode   // test-only; default PromptAsyncNormal (see PromptAsyncMode doc)
 
 	// --- test-only exact-GET seam for the reconcile in-flight-guard e2e test ---
 	//
@@ -127,6 +140,7 @@ func New() *FakeOpenCode {
 		pendingP:    map[string]map[string]any{},
 		archived:    map[string]bool{},
 		busy:        map[string]string{},
+		resetGen:    map[string]uint64{},
 	}
 	now := float64(time.Now().UnixMilli())
 	f.sessions = []map[string]any{
@@ -1392,6 +1406,11 @@ func (f *FakeOpenCode) simulatePrompt(sessionID, text, messageID string) {
 	f.mu.Lock()
 	f.counter++
 	n := f.counter
+	// Capture the turn-start reset generation. The deferred session.idle below
+	// is gated on this so a [[stall]] goroutine leaked past a /fixture/reset
+	// cannot emit a stale idle that cancels a later test's busy turn (the :693
+	// flake). See resetGen doc.
+	gen := f.resetGen[sessionID]
 	f.mu.Unlock()
 
 	userID := messageID
@@ -1404,7 +1423,21 @@ func (f *FakeOpenCode) simulatePrompt(sessionID, text, messageID string) {
 
 	// Mark the session busy for the duration of the turn (drives the sidebar dot).
 	f.emit("session.status", map[string]any{"sessionID": sessionID, "status": map[string]any{"type": "busy"}})
-	defer f.emit("session.idle", map[string]any{"sessionID": sessionID})
+	// The trailing session.idle is gated on the turn-start reset generation. A
+	// /fixture/reset between this busy emit and the defer bumps resetGen, which
+	// suppresses this idle — the reset emits its own idle, and (critically) the
+	// stale idle cannot land on a LATER turn's busy window and cancel it. Only
+	// the deferred idle is gated; streamAssistant's own trailing idle (normal
+	// ~720ms completion, never leaks across tests) is unaffected.
+	defer func() {
+		f.mu.Lock()
+		cur := f.resetGen[sessionID]
+		f.mu.Unlock()
+		if cur != gen {
+			return
+		}
+		f.emit("session.idle", map[string]any{"sessionID": sessionID})
+	}()
 
 	userInfo := map[string]any{"id": userID, "sessionID": sessionID, "role": "user", "time": map[string]any{"created": now(), "completed": now()}}
 	userPart := textPart(userID, sessionID, upID, text, now())
@@ -1543,6 +1576,15 @@ func (f *FakeOpenCode) handleFixtureReset(w http.ResponseWriter, r *http.Request
 		delete(f.messages, session)
 	}
 	delete(f.busy, session)
+	// Invalidate any in-flight [[stall]] turn's deferred session.idle. A leaked
+	// stall goroutine (tests 4/9 sleep 5s and do not wait) would otherwise emit
+	// a stale idle AFTER this reset — racing a later test's session.status busy
+	// and clearing working() mid-turn (the :693 flake: .working-text never
+	// appears). The bump makes the stall's defer a no-op; this reset emits its
+	// own session.idle below, so no event is lost. (Sibling of the message-
+	// accumulation emit above — same aggregator-store-clear rationale, busy
+	// axis. resetGen doc in the struct.)
+	f.resetGen[session]++
 	// Also clear any leaked pending question/permission blocker state for this
 	// session. A prior test may have armed an unanswered [[ask]]/[[perm]] that
 	// would otherwise mount a PendingInput/permission pill on the next open,

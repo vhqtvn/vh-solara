@@ -21,6 +21,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // startFixtureHTTP stands up the fake on an httptest server. Returns the server
@@ -189,4 +190,93 @@ func TestExactGET_400ForNonMsgPrefix(t *testing.T) {
 func jsonQuote(s string) string {
 	b, _ := json.Marshal(s)
 	return string(b)
+}
+
+// countEvents reads the subscriber channel until deadline, returning the count
+// of events whose payload contains all of the given substrings (AND). Used by
+// the stall-leak regression test to count session.idle emits for a session.
+func countEvents(t *testing.T, ch <-chan string, deadline time.Time, contains ...string) int {
+	t.Helper()
+	n := 0
+	for time.Now().Before(deadline) {
+		select {
+		case raw := <-ch:
+			ok := true
+			for _, s := range contains {
+				if !strings.Contains(raw, s) {
+					ok = false
+					break
+				}
+			}
+			if ok {
+				n++
+			}
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+	return n
+}
+
+// TestFixtureReset_SuppressesLeakedStallIdle is the regression guard for the
+// scroll-follow.spec.ts :693 flake. A [[stall]] goroutine leaked past a
+// /fixture/reset (tests 4/9 sleep ~5s server-side and do not wait for idle)
+// used to emit a deferred session.idle AFTER the reset — racing a later test's
+// session.status busy and clearing working() mid-turn, so .working-text never
+// appeared. The fix bumps a per-session resetGen on reset; simulatePrompt's
+// deferred idle is gated on the turn-start generation and is suppressed when a
+// reset has invalidated it.
+//
+// This test drives a stall, resets mid-stall, and asserts that ONLY the reset's
+// session.idle is observed — the stall's deferred idle is suppressed. Without
+// the gate the stall's defer would emit a second session.idle ~5s after the
+// prompt_async, and this test would see 2.
+//
+// Runs ~6s (the stall sleeps 5s); t.Parallel keeps it off the critical path.
+func TestFixtureReset_SuppressesLeakedStallIdle(t *testing.T) {
+	t.Parallel()
+	f := New()
+	srv := startFixtureHTTP(t, f)
+	ch, unsub := f.subscribe()
+	defer unsub()
+
+	// 1. Start a [[stall]] turn — spawns a goroutine that sleeps ~5s then
+	//    (without the gate) emits a deferred session.idle.
+	postJSON(t, srv, "/session/demo/prompt_async",
+		`{"parts":[{"type":"text","text":"[[stall]] leak probe"}]}`)
+	// 2. Let the stall goroutine capture its generation + emit busy BEFORE the
+	//    reset, so this models the LEAK scenario (prior test's stall, current
+	//    test's beforeEach reset). 100ms is ample for the goroutine to start.
+	time.Sleep(100 * time.Millisecond)
+	// 3. Reset mid-stall: bumps resetGen and emits the reset's own session.idle.
+	postJSON(t, srv, "/fixture/reset?session=demo", "")
+
+	// 4. Collect until well past the stall's 5s sleep. With the gate, only the
+	//    reset's idle is seen (1). Without the gate, the stall's deferred idle
+	//    fires ~5s after the prompt_async (2).
+	idles := countEvents(t, ch, time.Now().Add(6500*time.Millisecond),
+		`"session.idle"`, `"demo"`)
+	if idles != 1 {
+		t.Fatalf("expected exactly 1 session.idle (reset only; leaked stall defer must be suppressed), got %d", idles)
+	}
+}
+
+// TestFixtureReset_PreservesUnresetStallIdle locks in the gate does NOT
+// over-suppress: when NO reset invalidates the turn, the deferred session.idle
+// fires normally (every stall-based e2e test depends on this). Companion to
+// TestFixtureReset_SuppressesLeakedStallIdle. Runs ~6s; t.Parallel.
+func TestFixtureReset_PreservesUnresetStallIdle(t *testing.T) {
+	t.Parallel()
+	f := New()
+	srv := startFixtureHTTP(t, f)
+	ch, unsub := f.subscribe()
+	defer unsub()
+
+	postJSON(t, srv, "/session/demo/prompt_async",
+		`{"parts":[{"type":"text","text":"[[stall]] baseline probe"}]}`)
+	// NO reset — the stall's deferred idle must fire normally ~5s later.
+	idles := countEvents(t, ch, time.Now().Add(6500*time.Millisecond),
+		`"session.idle"`, `"demo"`)
+	if idles < 1 {
+		t.Fatalf("expected the stall's deferred session.idle to fire when no reset occurred, got %d", idles)
+	}
 }
