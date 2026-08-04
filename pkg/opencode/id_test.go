@@ -118,6 +118,64 @@ func TestMintMessageID_CrossMillisecondStrictOrder(t *testing.T) {
 	}
 }
 
+// Saturation branch: under dense minting (>4095 IDs in one wall-ms) the counter
+// saturates at 0xFFF (id.go) and monotonicity must hold THROUGH the saturation.
+// TestMintMessageID_TimePrefixMonotonic caps at n=3000 so the cap never fires
+// there; this test mints a large N to drive density and guard the saturated path
+// directly.
+//
+// PROBABILISTIC on coverage, not on correctness. The non-decreasing-prefix
+// assertion holds post-fix regardless of density (it is the property the
+// saturation exists to preserve), so the test passes when the fix is present and
+// FAILS if someone removes the saturation: without the cap, a bled prefix
+// (effective ms = real_ms + carry) would sort AFTER the next ms's first
+// counter=1 prefix. Whether the saturation branch (mintCounter > 0xFFF) actually
+// executes depends on minting >4095 IDs within a single wall-ms, achievable on
+// fast machines (each mint does a crypto/rand.Read of 14 bytes; prior
+// instrumentation observed ~5762/ms) but not guaranteed on slow CI runners.
+//   - assert every prefix is non-decreasing (the load-bearing regression guard);
+//   - group prefixes by their ms portion and report the densest ms: counter
+//     takes only 4095 distinct values per ms (1..0xFFF, since MintMessageID does
+//     counter++ before use so 0 is never emitted), so a ms-group larger than
+//     4095 proves the saturation branch fired this run.
+//
+// Coverage is logged honestly and never failed on (that would be flaky); under
+// -count the branch is exercised on any run fast enough to cross 4096/ms.
+func TestMintMessageID_SaturationMonotonic(t *testing.T) {
+	const n = 20000
+	prefixes := make([]string, n)
+	for i := 0; i < n; i++ {
+		prefixes[i] = MintMessageID()[4 : 4+12]
+	}
+	// Regression guard: prefixes must be non-decreasing.
+	for i := 1; i < n; i++ {
+		if prefixes[i] < prefixes[i-1] {
+			t.Fatalf("time prefix DECREASED at i=%d: prev=%q cur=%q (monotonicity broken through saturation)", i-1, prefixes[i-1], prefixes[i])
+		}
+	}
+	// Coverage probe: group by the ms portion of the prefix. The 12-hex prefix
+	// is the low 48 bits of now = ms*0x1000 + counter; multiplying by 0x1000
+	// shifts ms up by 3 hex digits, so prefix[0:9] is ms (mod 2^36) and
+	// prefix[9:12] is the counter. counter emits only 4095 distinct values per
+	// ms (1..0xFFF), so a group larger than 4095 means more mints hit that ms
+	// than there are counter values — the saturation branch must have fired.
+	const distinctCounterValues = 4095
+	densest := 0
+	msCounts := make(map[string]int)
+	for _, p := range prefixes {
+		k := p[:9]
+		msCounts[k]++
+		if msCounts[k] > densest {
+			densest = msCounts[k]
+		}
+	}
+	if densest > distinctCounterValues {
+		t.Logf("densest-ms count = %d (> %d): saturation branch (mintCounter > 0xFFF -> 0xFFF) WAS exercised this run; monotonicity held through it", densest, distinctCounterValues)
+	} else {
+		t.Logf("densest-ms count = %d (<= %d): saturation branch NOT exercised this run (mint density too low for this machine); monotonicity still holds and is asserted above", densest, distinctCounterValues)
+	}
+}
+
 // 5. ParseMessageIDTime round-trips the time prefix (mirrors id.ts's
 // timestamp()). NOTE: the 48-bit encoding keeps the low 48 bits of
 // `now = ms*0x1000 + counter`, so the decoded value is `ms mod 2^36`. Over the
