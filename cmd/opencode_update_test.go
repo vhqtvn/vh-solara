@@ -305,6 +305,50 @@ func TestFetchOpencodeChangelogRawRefetchesAfterTTL(t *testing.T) {
 	}
 }
 
+// TestFetchOpencodeChangelogRawBoundsBody proves the io.LimitReader cap at
+// maxChangelogBytes (cmd/opencode_update.go) actually bounds the body read. It
+// serves a response whose first maxChangelogBytes form a valid JSON array
+// (padded with trailing whitespace, which decodeChangelog's TrimSpace strips)
+// and whose very next byte is non-whitespace. With the cap in place the reader
+// stops at exactly maxChangelogBytes, the trailing byte is never read, and the
+// trimmed body decodes to one release. If a future refactor drops the
+// LimitReader, that trailing byte surfaces as a JSON trailing-data error and
+// this test fails — a non-tautological regression guard on the cap path added
+// in commit 11c76cf.
+func TestFetchOpencodeChangelogRawBoundsBody(t *testing.T) {
+	resetChangelogCache()
+	t.Cleanup(resetChangelogCache)
+	origURL := ocChangelogURL
+	t.Cleanup(func() { ocChangelogURL = origURL })
+
+	// Mirror of the function-local const maxChangelogBytes in
+	// cmd/opencode_update.go (8 MiB). Kept here as a test-only mirror to avoid a
+	// production change; if the cap moves, update both sites in lockstep.
+	const maxChangelogBytes = 8 << 20
+
+	// Body layout: [<valid array>]<spaces filling the cap><one non-ws byte>.
+	// Total length = maxChangelogBytes + 1, strictly exceeding the cap.
+	release := []byte(`[{"tag":"vCAPPED"}]`)
+	body := make([]byte, maxChangelogBytes+1)
+	copy(body, release)
+	for i := len(release); i < maxChangelogBytes; i++ {
+		body[i] = ' '
+	}
+	body[maxChangelogBytes] = 'X' // non-whitespace: trailing-data error if ever read
+
+	srv, _ := newChangelogServer(t, http.StatusOK, body)
+	ocChangelogURL = srv.URL
+
+	got, err := fetchOpencodeChangelogRaw(context.Background())
+	if err != nil {
+		t.Fatalf("fetchOpencodeChangelogRaw on oversized-but-valid-at-cap body failed; "+
+			"the LimitReader cap is not bounding the read as expected: %v", err)
+	}
+	if len(got) != 1 || got[0].Tag != "vCAPPED" {
+		t.Fatalf("expected exactly 1 release tagged vCAPPED (read bounded at cap), got %+v", got)
+	}
+}
+
 // TestOpencodeChangelogHeuristicGating verifies the orchestrator gates the
 // "may affect you" flag to Core/SDK/Extensions sections (a Desktop item that
 // matches a migration token must NOT be flagged). It avoids the network by
