@@ -227,6 +227,18 @@ func (c *Client) CreateSession(ctx context.Context, body json.RawMessage) (json.
 // Prompt sends a message to a session via POST /session/:id/prompt_async, which
 // forks the turn and returns at once (204) — so a coordinator's send never blocks
 // on the turn. The body is forwarded raw ({parts, agent?, model?, variant?}).
+//
+// Bug-class #1925 (clean-room from the paseo study, AGPL — implemented from the
+// bug understanding, not the source): the body is forwarded BYTE-FOR-BYTE via
+// postRaw. Prompt deliberately never parses, splits, or re-resolves the model
+// field, and never synthesizes a providerID. A client that force-resolves a
+// prefix-less model id against a hardcoded providerID default (e.g. providerID
+// "opencode") breaks models owned by another provider and surfaces as a
+// server-side "Model not found". vh-solara avoids the whole class by proxying
+// the caller's model verbatim; the opencode server is the single authority for
+// provider/model resolution. Do NOT add providerID synthesis, "provider/"
+// splitting, or any model defaulting here — TestPromptForwardsModelVerbatim is
+// the regression guard.
 func (c *Client) Prompt(ctx context.Context, sessionID string, body json.RawMessage) (json.RawMessage, error) {
 	st, b, err := c.postRaw(ctx, "/session/"+sessionID+"/prompt_async", body)
 	if err != nil {
