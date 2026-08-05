@@ -422,11 +422,18 @@ function lexCompare(a, b) {
 
 // Emit the release-mode JSON envelope and exit with the classification's
 // canonical exit code: clear/advisory → 0; blocker → 1; evaluator-error → 2.
-function emitReleaseResult(payload) {
-    process.stdout.write(JSON.stringify(payload, null, 2) + "\n");
+export function emitReleaseResult(payload) {
     const code = payload.classification === "blocker" ? 1
         : payload.classification === "evaluator-error" ? 2 : 0;
-    process.exit(code);
+    // Flush the FULL payload before exiting. A bare process.stdout.write() of a
+    // large string returns false once it crosses the ~64KiB kernel pipe buffer,
+    // and a following process.exit() fires before the remainder drains — so the
+    // captured output is truncated at exactly 65536 bytes whenever stdout is a
+    // pipe (e.g. the release CI step `node ... | tee tmp/release-defer-evaluator.json`
+    // then JSON.parse on the file). The write() callback fires only after the
+    // entire chunk is flushed to the OS, so exiting inside it is safe for pipes,
+    // files, and TTYs alike. Regression: release CI red v0.22.0.
+    process.stdout.write(JSON.stringify(payload, null, 2) + "\n", () => process.exit(code));
 }
 
 // ---- Release-mode manifest-authority primitives ----------------------------
@@ -1279,7 +1286,7 @@ function mainReleasePrep(options) {
     emitReleasePrepResult(since, missing, draftStubRecords, { firedCount: firedTotal, fog, cold });
 }
 
-function emitReleasePrepResult(since, missing, draftStubRecords, extra) {
+export function emitReleasePrepResult(since, missing, draftStubRecords, extra) {
     const classification = missing.length > 0 ? "blocker" : "clear";
     const payload = {
         mode: "release-prep",
@@ -1293,8 +1300,11 @@ function emitReleasePrepResult(since, missing, draftStubRecords, extra) {
             cold_cards: extra.cold,
         },
     };
-    process.stdout.write(JSON.stringify(payload, null, 2) + "\n");
-    process.exit(classification === "blocker" ? 1 : 0);
+    const exitCode = classification === "blocker" ? 1 : 0;
+    // Flush the full payload before exiting — see emitReleaseResult for the
+    // pipe-truncation defect this guards (write()+process.exit() loses bytes
+    // past the ~64KiB pipe buffer when stdout is piped).
+    process.stdout.write(JSON.stringify(payload, null, 2) + "\n", () => process.exit(exitCode));
 }
 
 // Dispatcher: --mode=release routes to the strict JSON evaluator; anything
@@ -1319,4 +1329,9 @@ function main() {
     mainPromoter(options);
 }
 
-main();
+// Run as a CLI only when invoked directly (not when imported by tests). The
+// guard lets tests import emitReleaseResult/emitReleasePrepResult and exercise
+// the piped-stdout path without triggering the manifest/git CLI flow.
+if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
+    main();
+}

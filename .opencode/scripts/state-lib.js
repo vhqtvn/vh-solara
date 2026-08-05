@@ -1412,6 +1412,7 @@ function ensureLocalCoordinatorNamespace() {
     ensureDir(localCoordinatorReportsRoot());
     ensureDir(localCoordinatorDashboardsRoot());
     ensureDir(localCoordinatorScratchRoot());
+    ensureDir(localCoordinatorSkillProposalsRoot());
 }
 
 function normalizeStoredCoordinationReview(
@@ -5344,6 +5345,610 @@ function deleteCoordinationTask(sessionID, taskIDRaw, options = {}) {
     };
 }
 
+// =============================================================================
+// Skill-authoring proposal transport (CC borrowable #4, N11+R4)
+// =============================================================================
+// A dedicated, LIGHTER-WEIGHT sibling of the coordination-task registry. Like
+// task cards, proposals are gitignored LOCAL CANDIDATE TRANSPORT under
+// .local/coordinator/skill-proposals/ — transport, not truth. Unlike
+// task cards, a proposal has no lifecycle state machine beyond
+// draft → accepted | rejected, no closeout, no review cascade, no recurrence
+// dedup, and no report envelope: it is pure intake. The value is a structured
+// card that survives compaction so a model-discovered reusable workflow can be
+// captured for human review instead of lost in chat.
+//
+// Candidate-vs-authority boundary (non-negotiable): a proposal is NEVER
+// authority. It cannot install a skill, write a canonical SKILL.md, alter a
+// promotion state, or bypass the S2 overlay-pilot-then-promote gate.
+// Acceptance (`status: accepted`) ONLY marks a proposal human-approved for
+// SEPARATELY AUTHORIZED overlay authoring under
+// .vh-agent-harness/overlays/<pack>/skills/; it creates nothing. The /init
+// direct-write path (a model writing SKILL.md directly into .opencode/skills/)
+// is REJECTED by design — this transport is the sanctioned intake surface
+// instead. Provenance is enforced at the write layer: nested
+// metadata.proposal-origin MUST equal "model-session", and a top-level
+// created_by field is REFUSED (the intake debate explicitly rejected the
+// top-level authority-adjacent tag). See AGENTS.core.md → "Skill-authoring
+// proposal intake".
+
+const SKILL_PROPOSAL_STATUSES = ["draft", "accepted", "rejected"];
+const SKILL_PROPOSAL_ORIGIN = "model-session";
+const SKILL_PROPOSAL_SCHEMA_VERSION = 1;
+
+function localCoordinatorSkillProposalsRoot() {
+    return path.join(localCoordinatorRoot(), "skill-proposals");
+}
+
+function skillProposalPath(proposalID) {
+    return path.join(
+        localCoordinatorSkillProposalsRoot(),
+        `${normalizeSkillProposalId(proposalID)}.json`,
+    );
+}
+
+function skillProposalLockPath(proposalID) {
+    return path.join(
+        localCoordinatorSkillProposalsRoot(),
+        `.${normalizeSkillProposalId(proposalID)}.lock`,
+    );
+}
+
+function normalizeSkillProposalId(value) {
+    const normalized = slugify(value);
+    return normalized.startsWith("skill-propose-")
+        ? normalized
+        : `skill-propose-${normalized}`;
+}
+
+function generateSkillProposalId(skillSlug) {
+    // Pre-normalize so the returned proposal_id matches the on-disk filename
+    // stem (skillProposalPath also normalizes via slugify, which lowercases
+    // planTimestamp()'s capital "T"). Without this, a fresh create's returned
+    // proposal_id diverged in case from the filename until a re-normalizing
+    // update converged them. D2 fix.
+    return normalizeSkillProposalId(
+        `skill-propose-${planTimestamp()}-${slugify(skillSlug || "skill")}`,
+    );
+}
+
+function defaultSkillProposalMetadata() {
+    return {
+        "proposal-origin": SKILL_PROPOSAL_ORIGIN,
+        proposing_session_id: null,
+        proposing_session_name: null,
+    };
+}
+
+function defaultSkillProposalPayload(proposalID) {
+    return {
+        schema_version: SKILL_PROPOSAL_SCHEMA_VERSION,
+        proposal_id: proposalID,
+        skill_slug: "",
+        skill_name: "",
+        description: "",
+        trigger: "",
+        proposed_pack: null,
+        rationale: "",
+        evidence_refs: [],
+        proposed_skill_content: "",
+        metadata: defaultSkillProposalMetadata(),
+        status: "draft",
+        accepted_at: null,
+        rejected_at: null,
+        rejection_reason: "",
+        created_at: null,
+        updated_at: null,
+        history: [],
+    };
+}
+
+// Enforce the candidate-vs-authority provenance contract at the write layer.
+// Collects every problem and throws one aggregated StateError (same collect-all
+// contract as ensureCoordinationTaskCoreFields). A proposal MUST carry nested
+// metadata.proposal-origin === "model-session" (the only admitted origin), and
+// MUST NOT carry a top-level created_by field — the intake debate explicitly
+// rejected the top-level tag because it reads as authority.
+function ensureSkillProposalCoreFields(payload) {
+    const problems = [];
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+        throw new StateError("Skill proposal payload must be a JSON object.");
+    }
+    if (
+        Object.prototype.hasOwnProperty.call(payload, "created_by") &&
+        payload.created_by !== undefined &&
+        payload.created_by !== null &&
+        payload.created_by !== ""
+    ) {
+        problems.push(
+            'Skill proposal must NOT carry a top-level "created_by" field; provenance is nested under metadata.proposal-origin (the top-level tag was explicitly rejected as authority-adjacent).',
+        );
+    }
+    const requiredStrings = {
+        skill_slug: "skill slug",
+        skill_name: "skill name",
+        description: "description",
+        trigger: "trigger (when to use the skill)",
+    };
+    for (const [field, label] of Object.entries(requiredStrings)) {
+        if (!String(payload[field] || "").trim()) {
+            problems.push(`Skill proposal missing required field: ${label}.`);
+        }
+    }
+    const metadata =
+        payload.metadata &&
+        typeof payload.metadata === "object" &&
+        !Array.isArray(payload.metadata)
+            ? payload.metadata
+            : null;
+    if (!metadata) {
+        problems.push(
+            'Skill proposal missing required nested "metadata" object (provenance lives under metadata.proposal-origin, never top-level).',
+        );
+    } else {
+        const origin = String(metadata["proposal-origin"] || "").trim();
+        if (origin !== SKILL_PROPOSAL_ORIGIN) {
+            problems.push(
+                `Skill proposal metadata.proposal-origin must be exactly "${SKILL_PROPOSAL_ORIGIN}" (got "${origin || "<empty>"}"). Only model-session proposals are admitted by the intake.`,
+            );
+        }
+    }
+    throwCollectedErrors(problems);
+}
+
+// The human gate. draft → accepted | rejected only; terminal states
+// (accepted, rejected) are closed and cannot reopen or re-transition. This is
+// the candidate-vs-authority control: once a human has decided, a model cannot
+// resurrect or relabel the proposal. save_skill_proposal never moves status.
+function skillProposalStatusTransitionErrors(
+    currentStatus,
+    nextStatus,
+    options = {},
+) {
+    const current = String(currentStatus || "").trim() || "draft";
+    const next = String(nextStatus || "").trim().toLowerCase();
+    if (options.created) {
+        if (next !== "draft") {
+            return ["New skill proposals must start in status draft."];
+        }
+        return [];
+    }
+    if (!next) {
+        return ["set_skill_proposal_status requires a target status."];
+    }
+    if (!SKILL_PROPOSAL_STATUSES.includes(next)) {
+        return [
+            `Skill proposal status must be one of ${SKILL_PROPOSAL_STATUSES.join(", ")} (got "${next}").`,
+        ];
+    }
+    if (current === next) {
+        return [
+            `Skill proposal is already in status ${current}; set_skill_proposal_status requires a transition.`,
+        ];
+    }
+    const permitted = { draft: ["accepted", "rejected"] }[current];
+    if (!permitted || !permitted.includes(next)) {
+        return [
+            `Skill proposal status ${current} cannot transition to ${next}. Only draft → accepted | rejected is allowed; accepted and rejected are terminal.`,
+        ];
+    }
+    return [];
+}
+
+function loadSkillProposal(proposalIDRaw, options = {}) {
+    ensureLocalCoordinatorNamespace();
+    const proposalID = normalizeSkillProposalId(proposalIDRaw);
+    const targetPath = skillProposalPath(proposalID);
+    if (!fs.existsSync(targetPath)) {
+        if (options.required === false) {
+            return {
+                proposal_id: proposalID,
+                path: targetPath,
+                payload: defaultSkillProposalPayload(proposalID),
+                exists: false,
+            };
+        }
+        throw new StateError(
+            `Skill proposal does not exist: ${relativeToRepo(targetPath)}`,
+        );
+    }
+    const raw = readJson(targetPath, defaultSkillProposalPayload(proposalID));
+    const payload = {
+        ...defaultSkillProposalPayload(proposalID),
+        ...raw,
+        metadata: {
+            ...defaultSkillProposalMetadata(),
+            ...((raw && raw.metadata) || {}),
+        },
+        proposal_id:
+            raw && raw.proposal_id ? raw.proposal_id : proposalID,
+        evidence_refs: Array.isArray(raw && raw.evidence_refs)
+            ? raw.evidence_refs
+            : [],
+        history: Array.isArray(raw && raw.history) ? raw.history : [],
+    };
+    return { proposal_id: proposalID, path: targetPath, payload, exists: true };
+}
+
+// Internal scan boundary: read every card in the registry. Report-and-continue
+// on a per-card parse failure (mirrors scanCoordinationTaskCards' syntax
+// quarantine) so one corrupt .json does not brick the whole scan.
+function scanSkillProposalCards() {
+    ensureLocalCoordinatorNamespace();
+    const root = localCoordinatorSkillProposalsRoot();
+    const files = fs.existsSync(root) ? fs.readdirSync(root) : [];
+    return files
+        .filter((name) => name.endsWith(".json"))
+        .map((name) => {
+            const proposalID = name.replace(/\.json$/, "");
+            try {
+                const loaded = loadSkillProposal(proposalID);
+                return {
+                    proposalID,
+                    path: relativeToRepo(loaded.path),
+                    proposal: loaded.payload,
+                    parseError: null,
+                };
+            } catch (error) {
+                return {
+                    proposalID,
+                    path: relativeToRepo(skillProposalPath(proposalID)),
+                    proposal: null,
+                    parseError:
+                        error instanceof StateError
+                            ? error.message
+                            : String(error),
+                };
+            }
+        });
+}
+
+function summarizeSkillProposal(proposal) {
+    return {
+        proposal_id: proposal.proposal_id,
+        skill_slug: proposal.skill_slug,
+        skill_name: proposal.skill_name,
+        description: proposal.description,
+        trigger: proposal.trigger,
+        proposed_pack: proposal.proposed_pack || null,
+        status: proposal.status,
+        "proposal-origin":
+            proposal.metadata && proposal.metadata["proposal-origin"]
+                ? proposal.metadata["proposal-origin"]
+                : null,
+        created_at: proposal.created_at || null,
+        updated_at: proposal.updated_at || null,
+        accepted_at: proposal.accepted_at || null,
+        rejected_at: proposal.rejected_at || null,
+    };
+}
+
+function saveSkillProposal(sessionID, proposalPayload, options = {}) {
+    const actor = coordinationActorContext(sessionID, options);
+    const input =
+        proposalPayload && typeof proposalPayload === "object"
+            ? proposalPayload
+            : {};
+    // REFUSE a top-level authority-adjacent tag before any other work. The
+    // intake debate explicitly rejected created_by; enforcing it at the write
+    // layer makes the convention impossible to forget rather than a convention.
+    if (
+        input.created_by !== undefined &&
+        input.created_by !== null &&
+        input.created_by !== ""
+    ) {
+        throw new StateError(
+            'Skill proposals must NOT carry a top-level "created_by" field; provenance is nested under metadata.proposal-origin.',
+        );
+    }
+    const explicitID = String(input.proposal_id || "").trim();
+    const skillSlug = String(
+        input.skill_slug || input.skill_name || "skill",
+    ).trim();
+    const proposalID = explicitID
+        ? normalizeSkillProposalId(explicitID)
+        : generateSkillProposalId(skillSlug);
+    // Enforced provenance: nested metadata stamped from the REAL session
+    // context. A caller cannot forge a different origin; the transport owns
+    // this field. proposing_session_* record who proposed, not authority.
+    const metadata = {
+        "proposal-origin": SKILL_PROPOSAL_ORIGIN,
+        proposing_session_id: actor.session_id || null,
+        proposing_session_name: actor.session_name || null,
+    };
+    const candidateFields = {
+        skill_slug: String(input.skill_slug || "").trim(),
+        skill_name: String(input.skill_name || "").trim(),
+        description: String(input.description || "").trim(),
+        trigger: String(input.trigger || "").trim(),
+        proposed_pack: input.proposed_pack
+            ? String(input.proposed_pack).trim() || null
+            : null,
+        rationale: String(input.rationale || "").trim(),
+        evidence_refs: normalizeStringList(input.evidence_refs),
+        proposed_skill_content: String(input.proposed_skill_content || ""),
+    };
+    const lockPath = skillProposalLockPath(proposalID);
+    const result = withLock(lockPath, () => {
+        const existing = loadSkillProposal(proposalID, { required: false });
+        const created = !existing.exists;
+        // save NEVER moves status. Create is draft-only; updates preserve the
+        // existing status. A terminal-state proposal (accepted/rejected) is
+        // frozen — re-editing would bypass the human gate's finality. The
+        // operator who changed their mind opens a NEW proposal.
+        const currentStatus = existing.exists ? existing.payload.status : null;
+        if (existing.exists && currentStatus !== "draft") {
+            throw new StateError(
+                `Skill proposal ${proposalID} is in terminal status ${currentStatus}; open a new proposal instead of editing a decided one.`,
+            );
+        }
+        // save NEVER moves status. Route ONLY the create case through the
+        // transition validator (draft-only-create: a brand-new proposal must
+        // start in draft). Do NOT route a status-preserving UPDATE of an
+        // existing draft through it: the validator's current===next branch
+        // treats draft->draft as a non-transition and throws, even though
+        // preserving draft is exactly the intended behavior on an update.
+        // The preceding currentStatus !== "draft" guard already freezes
+        // terminal cards (accepted/rejected), and the merged.status:"draft"
+        // assignment below hardcodes draft for every save — together they
+        // enforce the candidate-vs-authority invariant without mis-routing a
+        // preservation save through a transition validator.
+        // (B1 regression: before this was scoped to creates, every
+        // existing-draft update deterministically threw, breaking /skill-propose
+        // create on an existing proposal_id entirely.)
+        if (created) {
+            throwCollectedErrors(
+                skillProposalStatusTransitionErrors(null, "draft", {
+                    created: true,
+                }),
+            );
+        }
+        const base = existing.exists
+            ? existing.payload
+            : defaultSkillProposalPayload(proposalID);
+        const merged = {
+            ...base,
+            ...candidateFields,
+            schema_version: SKILL_PROPOSAL_SCHEMA_VERSION,
+            proposal_id: proposalID,
+            metadata,
+            status: "draft",
+            created_at: base.created_at || isoZ(),
+            updated_at: isoZ(),
+            accepted_at: base.accepted_at || null,
+            rejected_at: base.rejected_at || null,
+            rejection_reason: base.rejection_reason || "",
+            history: Array.isArray(base.history)
+                ? base.history.map((entry) => ({ ...entry }))
+                : [],
+        };
+        merged.history.push({
+            at: isoZ(),
+            event: created ? "proposal_created" : "proposal_updated",
+            session_name: actor.session_name || null,
+            status: "draft",
+            note: created
+                ? "Model-originated skill proposal captured as a draft candidate."
+                : "Draft proposal content updated.",
+        });
+        ensureSkillProposalCoreFields(merged);
+        atomicWriteJson(skillProposalPath(proposalID), merged);
+        return { proposal: merged, created };
+    });
+    return {
+        ...actor,
+        path: relativeToRepo(skillProposalPath(proposalID)),
+        proposal: result.proposal,
+        summary: summarizeSkillProposal(result.proposal),
+        created: result.created,
+    };
+}
+
+function readSkillProposal(sessionID, proposalIDRaw, options = {}) {
+    const actor = coordinationActorContext(sessionID, options);
+    const loaded = loadSkillProposal(proposalIDRaw);
+    return {
+        ...actor,
+        path: relativeToRepo(loaded.path),
+        proposal: loaded.payload,
+        summary: summarizeSkillProposal(loaded.payload),
+    };
+}
+
+function listSkillProposals(sessionID, options = {}) {
+    const actor = coordinationActorContext(sessionID, options);
+    const statuses = normalizeStringList(options.statuses).map((value) =>
+        String(value || "").trim().toLowerCase(),
+    );
+    const scanned = scanSkillProposalCards();
+    const quarantine = scanned
+        .filter((entry) => entry.parseError)
+        .map((entry) => ({
+            proposal_id: entry.proposalID,
+            path: entry.path,
+            problems: [entry.parseError],
+        }));
+    const matching = scanned
+        .filter((entry) => entry.proposal)
+        .filter((entry) =>
+            statuses.length
+                ? statuses.includes(entry.proposal.status)
+                : true,
+        );
+    const counts = {};
+    for (const entry of matching) {
+        counts[entry.proposal.status] =
+            (counts[entry.proposal.status] || 0) + 1;
+    }
+    return {
+        ...actor,
+        total: matching.length,
+        status_counts: counts,
+        proposals: matching.map((entry) => ({
+            ...summarizeSkillProposal(entry.proposal),
+            path: entry.path,
+        })),
+        quarantine,
+    };
+}
+
+// The human accept/reject gate. This is the load-bearing transition that makes
+// the intake safe: a model proposal advances ONLY when a human (driving a build
+// session) moves it from draft to accepted or rejected. Acceptance does NOT
+// create a skill — it only marks the proposal human-approved for SEPARATELY
+// AUTHORIZED overlay authoring. Rejection is terminal and may carry a reason.
+//
+// ENFORCEMENT MODEL (B2): the human gate is DOCUMENTATION-ENFORCED, not
+// code-enforced — identical to the task-card promotion pattern
+// (saveCoordinationTask likewise accepts a model-supplied status:"ready"; the
+// rule forbidding a model from promoting its own task out of draft lives in
+// AGENTS.core.md, not in code). opencode's plan-state tool surface is ONE tool
+// with an operation enum and cannot distinguish human-initiated from
+// model-initiated calls, so set_skill_proposal_status cannot be scoped out of
+// agent-reachable plan-state. The model-facing prohibition ("a model must not
+// accept/reject its own proposal") lives in AGENTS.core.md. The mechanical
+// gates that hold REGARDLESS of who calls this are DOWNSTREAM:
+//   (1) overlay authoring requires human file writes under
+//       .vh-agent-harness/overlays/<pack>/skills/<name>/SKILL.md;
+//   (2) the S2 hold gates overlay->core promotion on real-repo pilot evidence;
+//   (3) core promotion requires human approval.
+// A model that self-accepts still cannot self-author an overlay, self-promote
+// through S2, or self-promote to core. Acceptance is "human-approved to START
+// overlay authoring", not promotion. Do not claim this gate is code-enforced.
+function setSkillProposalStatus(
+    sessionID,
+    proposalIDRaw,
+    nextStatus,
+    options = {},
+) {
+    const actor = coordinationActorContext(sessionID, options);
+    const proposalID = normalizeSkillProposalId(proposalIDRaw);
+    const target = String(nextStatus || "").trim().toLowerCase();
+    const rejectionReason = String(options.rejectionReason || "").trim();
+    const lockPath = skillProposalLockPath(proposalID);
+    const result = withLock(lockPath, () => {
+        const loaded = loadSkillProposal(proposalID, { required: false });
+        if (!loaded.exists) {
+            throw new StateError(
+                `Skill proposal does not exist: ${relativeToRepo(loaded.path)}`,
+            );
+        }
+        const current = loaded.payload;
+        throwCollectedErrors(
+            skillProposalStatusTransitionErrors(current.status, target),
+        );
+        const now = isoZ();
+        const updated = {
+            ...current,
+            status: target,
+            updated_at: now,
+            accepted_at:
+                target === "accepted"
+                    ? now
+                    : current.accepted_at || null,
+            rejected_at:
+                target === "rejected"
+                    ? now
+                    : current.rejected_at || null,
+            rejection_reason:
+                target === "rejected"
+                    ? rejectionReason || current.rejection_reason || ""
+                    : current.rejection_reason || "",
+            history: (
+                Array.isArray(current.history) ? current.history : []
+            ).map((entry) => ({ ...entry })),
+        };
+        updated.history.push({
+            at: now,
+            event: `proposal_${target}`,
+            session_name: actor.session_name || null,
+            status: target,
+            note:
+                target === "accepted"
+                    ? "Human accepted the proposal for separately authorized overlay authoring (no skill is created by acceptance)."
+                    : `Human rejected the proposal${rejectionReason ? `: ${rejectionReason}` : "."}`,
+        });
+        ensureSkillProposalCoreFields(updated);
+        atomicWriteJson(loaded.path, updated);
+        return updated;
+    });
+    return {
+        ...actor,
+        path: relativeToRepo(skillProposalPath(proposalID)),
+        proposal: result,
+        summary: summarizeSkillProposal(result),
+    };
+}
+
+// Sanctioned single-card retire path. Mirrors deleteCoordinationTask's
+// single-ID + physical-containment discipline but lighter (no report dir, no
+// lifecycle gate): a skill proposal is gitignored disposable transport, so
+// removing an unpromoted card loses nothing durable. This is NOT a lifecycle
+// status and must NOT be used to bypass the accept/reject gate — it retires
+// transport, it does not decide the proposal.
+function deleteSkillProposal(sessionID, proposalIDRaw, options = {}) {
+    const actor = coordinationActorContext(sessionID, options);
+    if (typeof proposalIDRaw !== "string" || proposalIDRaw.trim() === "") {
+        throw new StateError(
+            "delete_skill_proposal requires a non-empty proposal_id.",
+        );
+    }
+    const rawTrimmed = proposalIDRaw.trim();
+    if (
+        /\s/.test(rawTrimmed) ||
+        rawTrimmed.includes("*") ||
+        rawTrimmed.includes("?") ||
+        rawTrimmed.includes(",") ||
+        rawTrimmed.includes("[") ||
+        rawTrimmed.includes("]") ||
+        rawTrimmed.includes("/") ||
+        rawTrimmed.includes("\\") ||
+        rawTrimmed.includes("..")
+    ) {
+        throw new StateError(
+            `delete_skill_proposal requires an exact single proposal_id; wildcards, selectors, comma-lists, and path-like input are not accepted ("${rawTrimmed}").`,
+        );
+    }
+    let proposalID;
+    try {
+        proposalID = normalizeSkillProposalId(rawTrimmed);
+    } catch (error) {
+        throw new StateError(
+            `delete_skill_proposal requires an exact single proposal_id; "${rawTrimmed}" is not acceptable (${error instanceof StateError ? error.message : "normalization failed"}).`,
+        );
+    }
+    const targetPath = skillProposalPath(proposalID);
+    const root = path.resolve(localCoordinatorSkillProposalsRoot());
+    const resolved = fs.existsSync(targetPath)
+        ? path.resolve(fs.realpathSync(targetPath))
+        : path.resolve(targetPath);
+    if (resolved !== root && !resolved.startsWith(`${root}${path.sep}`)) {
+        throw new StateError(
+            "delete_skill_proposal target escapes the transport root; refusing.",
+        );
+    }
+    const existed = fs.existsSync(targetPath);
+    if (existed) {
+        fs.rmSync(targetPath, { force: true });
+    }
+    const lockPath = skillProposalLockPath(proposalID);
+    if (fs.existsSync(lockPath)) {
+        try {
+            fs.rmSync(lockPath, { force: true });
+        } catch (_lockErr) {
+            // Non-fatal: a stale lock for a deleted card is harmless.
+        }
+    }
+    return {
+        ...actor,
+        ok: true,
+        operation: "delete_skill_proposal",
+        removed: {
+            proposal_id: proposalID,
+            card_removed: existed && !fs.existsSync(targetPath),
+        },
+    };
+}
+
 function activateCoordinationTask(sessionID, taskIDRaw, options = {}) {
     const actor = coordinationActorContext(sessionID, options);
     const loaded = loadCoordinationTask(taskIDRaw);
@@ -7194,6 +7799,11 @@ export {
     saveCoordinationTaskCloseout,
     reviewCoordinationTask,
     deleteCoordinationTask,
+    saveSkillProposal,
+    readSkillProposal,
+    listSkillProposals,
+    setSkillProposalStatus,
+    deleteSkillProposal,
     recordArtifact,
     recordArtifacts,
     resolvePaths,
@@ -7260,6 +7870,11 @@ export default {
     saveCoordinationTaskCloseout,
     reviewCoordinationTask,
     deleteCoordinationTask,
+    saveSkillProposal,
+    readSkillProposal,
+    listSkillProposals,
+    setSkillProposalStatus,
+    deleteSkillProposal,
     recordArtifact,
     recordArtifacts,
     resolvePaths,

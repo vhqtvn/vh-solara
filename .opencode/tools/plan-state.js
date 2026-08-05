@@ -34,6 +34,11 @@ import {
     saveCheckpoint,
     savePlan,
     saveTaskContract,
+    saveSkillProposal,
+    readSkillProposal,
+    listSkillProposals,
+    setSkillProposalStatus,
+    deleteSkillProposal,
     activateCoordinationTask,
     deleteCoordinationTask,
     adoptPlan,
@@ -121,6 +126,11 @@ export const planStateTool = tool({
                 "save_coordination_task_closeout",
                 "review_coordination_task",
                 "delete_coordination_task",
+                "save_skill_proposal",
+                "read_skill_proposal",
+                "list_skill_proposals",
+                "set_skill_proposal_status",
+                "delete_skill_proposal",
                 "record_artifact",
                 "record_artifacts",
                 "resolve_paths",
@@ -282,6 +292,36 @@ export const planStateTool = tool({
             .optional()
             .describe(
                 "Comma-separated coordination-task statuses to filter list_coordination_tasks.",
+            ),
+        proposal_id: tool.schema
+            .string()
+            .optional()
+            .describe(
+                "Skill-proposal id for read/set_status/delete skill-proposal operations.",
+            ),
+        proposal_payload: tool.schema
+            .string()
+            .optional()
+            .describe(
+                "JSON object payload for save_skill_proposal (skill_slug, skill_name, description, trigger, optional proposed_pack/rationale/evidence_refs/proposed_skill_content). Provenance is enforced at the write layer; do NOT set created_by or metadata.proposal-origin.",
+            ),
+        proposal_statuses_csv: tool.schema
+            .string()
+            .optional()
+            .describe(
+                "Comma-separated skill-proposal statuses to filter list_skill_proposals.",
+            ),
+        next_status: tool.schema
+            .string()
+            .optional()
+            .describe(
+                "Target status (accepted | rejected) for set_skill_proposal_status — the human accept/reject gate.",
+            ),
+        rejection_reason: tool.schema
+            .string()
+            .optional()
+            .describe(
+                "Optional reason recorded when set_skill_proposal_status rejects a proposal.",
             ),
         report_envelope: tool.schema
             .string()
@@ -624,6 +664,66 @@ export const planStateTool = tool({
                             {
                                 cwd: context.directory,
                                 force: Boolean(args.force),
+                            },
+                        ),
+                    );
+                case "save_skill_proposal": {
+                    const proposalPayload = parseJsonObject(
+                        args.proposal_payload,
+                        "proposal_payload",
+                    );
+                    if (args.proposal_id && !proposalPayload.proposal_id) {
+                        proposalPayload.proposal_id = args.proposal_id;
+                    }
+                    return render(
+                        saveSkillProposal(
+                            context.sessionID,
+                            proposalPayload,
+                            {
+                                cwd: context.directory,
+                            },
+                        ),
+                    );
+                }
+                case "read_skill_proposal":
+                    return render(
+                        readSkillProposal(
+                            context.sessionID,
+                            args.proposal_id || "",
+                            {
+                                cwd: context.directory,
+                            },
+                        ),
+                    );
+                case "list_skill_proposals":
+                    return render(
+                        listSkillProposals(context.sessionID, {
+                            cwd: context.directory,
+                            statuses: String(args.proposal_statuses_csv || "")
+                                .split(",")
+                                .map((value) => value.trim())
+                                .filter(Boolean),
+                        }),
+                    );
+                case "set_skill_proposal_status":
+                    return render(
+                        setSkillProposalStatus(
+                            context.sessionID,
+                            args.proposal_id || "",
+                            args.next_status || "",
+                            {
+                                cwd: context.directory,
+                                rejectionReason: args.rejection_reason || "",
+                            },
+                        ),
+                    );
+                case "delete_skill_proposal":
+                    return render(
+                        deleteSkillProposal(
+                            context.sessionID,
+                            args.proposal_id || "",
+                            {
+                                cwd: context.directory,
                             },
                         ),
                     );

@@ -150,19 +150,20 @@ function parseTaskRow(line, originLabel, index) {
     const rawCells = splitMarkdownRow(trimmed.slice(1, -1)).map((cell) =>
         unescapeTableCell(cell),
     );
-    const cells =
-        rawCells.length <= 7
-            ? [...rawCells, ...Array(Math.max(0, 7 - rawCells.length)).fill("")]
-            : [
-                  rawCells[0],
-                  rawCells[1],
-                  rawCells[2],
-                  rawCells[3],
-                  rawCells[4],
-                  rawCells.slice(5, -1).join(" | "),
-                  rawCells.at(-1),
-              ];
-    const [id, status, area, task, owner, notes, links] = cells;
+    if (rawCells.length !== 7) {
+        // Branch the remedy on direction. More than seven cells means a stray
+        // unescaped pipe split a cell (escape it). Fewer than seven means a
+        // column is missing (supply it). A single hardcoded pipe-escape remedy
+        // misdirects the operator toward pipes when the row is actually short.
+        const remedy =
+            rawCells.length > 7
+                ? "escape stray pipes as \\|"
+                : "supply the missing column(s)";
+        throw new BacklogError(
+            `Expected 7 cells but found ${rawCells.length} for ${rawCells[0] || "(no ID)"} in ${originLabel}: ${remedy}`,
+        );
+    }
+    const [id, status, area, task, owner, notes, links] = rawCells;
     if (!id) {
         throw new BacklogError(`Missing task ID in ${originLabel}`);
     }
@@ -594,7 +595,7 @@ function renderArchiveIndexFile(archiveSummary) {
         "",
         "## Retrieval",
         "",
-        '- Search by task ID: `rg "P0-DOCS-006" docs/planning/archive docs/checkpoints`',
+        '- Search by a task ID from the ID column: `rg "<TASK_ID>" docs/planning/archive docs/checkpoints`',
         '- Search by theme or component/profile names the same way when a checkpoint path alone is not enough.',
     );
     return `${lines.join("\n").trimEnd()}\n`;

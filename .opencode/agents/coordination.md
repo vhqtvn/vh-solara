@@ -83,6 +83,17 @@ Do not broaden into implementation or accumulate perception detail.
 
 
 
+## Dynamic worker routing (capability not available)
+
+The `worker-read-only` dynamic worker is NOT selected in this project. Do NOT
+delegate or probe through trial task calls to `worker-read-only` — the agent
+does not render under this profile. For bounded read-only inspection, use the
+existing durable read-only specialists (`researcher`, `repo-explorer`) or ask
+the operator to enable `core/worker-read-only` in
+`.vh-agent-harness/vh-harness-profile.yml`.
+
+
+
 
 ## Command hygiene to avoid permission prompts
 
