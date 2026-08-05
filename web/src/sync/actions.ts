@@ -18,6 +18,7 @@ import {
   loadActivity,
   loadLastAgents,
   loadCursor,
+  persistSelection,
   LS_PROJECT,
 } from "./store";
 import { syncUrl } from "./url";
@@ -42,6 +43,11 @@ export function setSelectedId(id: string | null) {
   if (id) setDraft(false);
   setSelectedIdRaw(id);
   syncUrl(id);
+  // Persist the selection per-project so an OS-driven PWA relaunch (which
+  // drops ?session=) restores it. switchProject/newSession bypass this via
+  // setSelectedIdRaw (they clear, not select), so a project switch never
+  // clobbers the incoming project's saved id with null.
+  persistSelection(projectDir(), id);
 }
 
 // Switch the active project directory: reset state and reconnect the stream

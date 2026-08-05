@@ -11,6 +11,10 @@ import { loadVersioned, saveVersioned } from "../lib/store";
 const LS_CURSOR = "vh.cursor.v1";
 const LS_ACTIVITY = "vh.activity.v1";
 const LS_LASTAGENTS = "vh.lastagents.v1";
+// Last-selected session id, persisted per project so the installed PWA reopens
+// the same session after an OS-driven relaunch (which drops ?session=). NOT part
+// of the debounced persist() batch — see persistSelection() for why.
+const LS_SELECTED = "vh.selected.v1";
 export const LS_PROJECT = "vh.project.dir";
 
 // Persistence is keyed per project directory so each project hydrates its own
@@ -18,10 +22,11 @@ export const LS_PROJECT = "vh.project.dir";
 // §11 (docs/design/server-owned-tree.md): the session TREE STRUCTURE is NEVER
 // persisted to localStorage — that caused flatten-on-load (tree=2 re-fetches
 // the frontier via tree.snapshot on connect). Only chat fast-path data
-// (cursor/activity/lastAgents) and UI state (LS_PROJECT) are persisted.
+// (cursor/activity/lastAgents) and UI state (LS_PROJECT + LS_SELECTED) are persisted.
 export const lsCursor = (dir: string) => `${LS_CURSOR}:${dir}`;
 export const lsActivity = (dir: string) => `${LS_ACTIVITY}:${dir}`;
 export const lsLastAgents = (dir: string) => `${LS_LASTAGENTS}:${dir}`;
+export const lsSelected = (dir: string) => `${LS_SELECTED}:${dir}`;
 
 export const loadCursor = (dir: string) =>
   loadVersioned<number>(lsCursor(dir), 1, 0, (o) => Number(o) || 0);
@@ -43,6 +48,35 @@ export function loadLastAgents(dir: string): Record<string, string> {
   return loadVersioned<Record<string, string>>(lsLastAgents(dir), 1, {}, (o) =>
     o && typeof o === "object" ? (o as Record<string, string>) : {},
   );
+}
+
+// Last-selected session id for this project — the localStorage counterpart to
+// the URL's ?session= deep-link. On an OS-driven relaunch the installed PWA
+// reopens start_url=/ (dropping ?session=), so without this fallback the
+// selection was lost on every resume. The URL still WINS when ?session= is
+// present (mirrors urlDir() — shareability + per-tab state preserved); this is
+// the fallback ONLY when the URL omits it. Restore is OPTIMISTIC and mirrors
+// the existing ?session= path (no existence check): a stale id (session
+// deleted server-side, or belongs to a different project) leaves a ghost
+// selection exactly as the URL path already does today — see closeout.
+export function loadSelected(dir: string): string | null {
+  // No migrate fn: this key has no legacy format to preserve, so a version
+  // mismatch / corrupt-JSON / legacy-unversioned value all fall back to null.
+  // loadVersioned returns env.data AS-IS when the envelope version matches
+  // (no type validation), so re-check the type here to defend against a
+  // foreign/corrupt {v:1,data:<non-string>} payload.
+  const v = loadVersioned<unknown>(lsSelected(dir), 1, null);
+  return typeof v === "string" && v ? v : null;
+}
+
+// Persist the current selection explicitly. Deliberately OUTSIDE the debounced
+// persist(): switchProject calls setSelectedIdRaw(null) under the NEW
+// projectDir, and a reactive debounced write would clobber the new project's
+// saved id with null. Writing here only on actual selection (setSelectedId /
+// startSync restore / popstate) — never on the switchProject/newSession nulls
+// (those bypass setSelectedId via setSelectedIdRaw, correctly).
+export function persistSelection(dir: string, id: string | null): void {
+  saveVersioned(lsSelected(dir), 1, id);
 }
 
 // The workspace is the URL's source of truth (so each tab keeps its own across

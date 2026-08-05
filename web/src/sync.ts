@@ -25,6 +25,8 @@ import {
   isSending,
   setSending,
   urlDir,
+  loadSelected,
+  persistSelection,
 } from "./sync/store";
 import { rootOf } from "./sync/selectors";
 import { currentUrlSession, syncUrl, setApplyingUrl } from "./sync/url";
@@ -101,12 +103,20 @@ export function startSync() {
   // even if it loaded from the localStorage fallback) — replace, don't push.
   syncUrl(currentUrlSession(), true);
 
-  // Open the session named in the URL on load (deep link / refresh).
-  const initial = currentUrlSession();
+  // Open the session named in the URL on load (deep link / refresh). When the
+  // URL lacks ?session= (an OS-driven relaunch of the installed PWA drops it —
+  // start_url is /), fall back to the last-selected session persisted for this
+  // project, mirroring the urlDir() ?? LS_PROJECT pattern. The URL still WINS
+  // when present (shareability + per-tab state); localStorage is the fallback
+  // ONLY when the URL omits it. Restore is optimistic (no existence check),
+  // identical to the ?session= path. Persisting `initial` here seeds LS from a
+  // URL deep-link so a later OS-relaunch (which drops ?session=) restores it.
+  const initial = currentUrlSession() ?? loadSelected(projectDir());
   if (initial) {
     setSelectedIdRaw(initial);
     openSessionStream(initial);
     void openSession(initial);
+    persistSelection(projectDir(), initial);
   }
   // Back/forward navigates between previously-selected sessions AND projects.
   window.addEventListener("popstate", () => {
@@ -120,6 +130,9 @@ export function startSync() {
       if (id) {
         setDraft(false);
         void openSession(id);
+        // Keep LS in sync with a back/forward selection (id is the URL's source
+        // of truth here; mirror it into the per-project fallback).
+        persistSelection(projectDir(), id);
       }
     } finally {
       setApplyingUrl(false);

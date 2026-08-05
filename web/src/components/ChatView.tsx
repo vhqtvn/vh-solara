@@ -522,6 +522,31 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     if (!cand) return;
     if (orderAhead(cand, getReadAnchor(sid), sm()?.order ?? [])) setReadAnchor(sid, cand);
   }
+  // Page-lifecycle flush: the debounced scheduleReadCursor (400ms) can be
+  // pending when the OS suspends the page (mobile PWA backgrounded → evicted).
+  // pagehide/freeze are the last reliable pre-suspend signals; visibilitychange
+  // →hidden is the iOS Safari backstop (iOS does not fire freeze). Cancel the
+  // pending debounce and flush SYNCHRONOUSLY + IMMEDIATELY (no new timer) so the
+  // last scroll position lands in localStorage before JS is evicted/frozen.
+  // Without this, the last scroll within 400ms of suspension was never persisted
+  // → reopen returned to a stale anchor. props.sessionId is reactive, so reading
+  // it in the handler yields the CURRENT session (ChatView is reused across
+  // sessions; the effect at the session-switch re-points props.sessionId).
+  const flushReadCursorOnSuspend = () => {
+    clearTimeout(readCursorTimer);
+    flushReadCursor(props.sessionId);
+  };
+  const onVisHideFlush = () => {
+    if (document.visibilityState === "hidden") flushReadCursorOnSuspend();
+  };
+  window.addEventListener("pagehide", flushReadCursorOnSuspend);
+  document.addEventListener("freeze", flushReadCursorOnSuspend);
+  document.addEventListener("visibilitychange", onVisHideFlush);
+  onCleanup(() => {
+    window.removeEventListener("pagehide", flushReadCursorOnSuspend);
+    document.removeEventListener("freeze", flushReadCursorOnSuspend);
+    document.removeEventListener("visibilitychange", onVisHideFlush);
+  });
   // Read-through cursor from live geometry: the bottommost message whose top has
   // scrolled to/past the container top. Stops measuring at the first row below
   // the top (rows are in order), so it's ~O(rows above the fold) per sweep.
