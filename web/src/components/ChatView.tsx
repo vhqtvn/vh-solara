@@ -39,6 +39,27 @@ import ChatTasksStatus from "./ChatTasksStatus";
 // Absolute (not a viewport fraction): the e2e viewport is intentionally tiny
 // (~70px chat-scroll), so a fraction would collapse below the 30px admission.
 const RECOVERY_TAIL_GAP = 64;
+// busy→idle (turn-finish) recovery admission window: the largest CURRENT gap-
+// from-bottom for which a turn finishing is allowed to re-engage `following`.
+// Distinct from RECOVERY_TAIL_GAP (which gates RO-based recovery on the PRE-
+// resize gap): this gates the busy→idle effect on the CURRENT gap at the moment
+// the stream finishes. Under the :1178 race (concurrent composer-grow + content-
+// grow spuriously arms the latch), once the stream finishes geometry FREEZES —
+// no RO fires to run the RO recovery branches. The busy→idle edge is the last
+// reactive event. The gap at that moment is the post-drop drift (content that
+// streamed + viewport that shrank after the spurious arm froze scrollTop),
+// observed ~96px in the failure trace — comfortably under 200. A mid-history
+// reader (~300px, P1-WEB-042) is rejected. Absolute (not a viewport fraction)
+// for the same reason as RECOVERY_TAIL_GAP.
+const TURN_FINISH_RECOVERY_GAP = 200;
+// Max age (ms) of a wheel/touch input for it to back a scroll-away as genuine
+// reader intent (the Approach A input-backed veto — see the busy→idle effect).
+// A real wheel produces its scroll event within a frame (~16ms); 300ms
+// comfortably admits it while expiring a stale marker before a later, unrelated
+// (:1178-style) geometry misclassification can misuse it as fake input
+// provenance. No timer is needed — onScrolled reads the timestamp and the
+// staleness check naturally rejects an old one.
+const INPUT_FRESHNESS_MS = 300;
 import QuestionCard from "./QuestionCard";
 import PermissionCard from "./PermissionCard";
 import PendingInput from "./PendingInput";
@@ -410,6 +431,82 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   // the textarea → viewport shrinks in the same frame content grows). Sentinel
   // {-1,-1,-1} means "no valid snapshot yet".
   let pinnedGeom: ScrollGeometry = { scrollTop: -1, scrollHeight: -1, clientHeight: -1 };
+  // (b) non-recovery fix: was the intent latch last armed by the contentEl RO's
+  // own classification (system-driven, eligible for the recovery branch below)
+  // vs a genuine user scroll (onScrolled, never yanked)? Set true at the
+  // contentEl RO arm site, false at the onScrolled arm site. Stale-true across a
+  // session switch was a yank hazard (the scrollEl RO recovery branch fires on
+  // !following() and has no restoredAnchorId guard), so BOTH latch fields are
+  // reset in the session-switch effect below; intra-session, a following()
+  // frame takes the tail branch so the recovery branch never runs, and the flag
+  // is re-written fresh at every arm.
+  let contentROArmedLatch = false;
+  // (b) non-recovery fix: the PRE-arm viewport gap, captured at the system-driven
+  // arm site (contentEl RO) BEFORE the common tail advances pinnedGeom to the
+  // (now large) post-arm geometry. The recovery gates below check preArmGap, not
+  // the post-arm pinnedGeom gap, because the spurious arm fires INSIDE a frame
+  // whose geometry already changed (content grew + composer grew) — by the next
+  // frame pinnedGeom holds that large gap and would wrongly reject recovery.
+  // Reset to Infinity at the genuine-user-scroll arm and after each recovery.
+  let preArmGap = Infinity;
+  // busy→idle recovery for a system-driven arm. The RO recovery branches below
+  // (contentEl RO + scrollEl RO) only fire on geometry CHANGES. But under the
+  // :1178 race (concurrent composer-grow + content-grow spuriously arms the
+  // latch), the stream can FINISH almost immediately after the arm — geometry
+  // then FREEZES (gap stays off-tail) and no RO callback fires to run the
+  // recovery. The busy→idle edge (working() true→false) is the last reliable
+  // reactive event. The gate is geometric (gap < TURN_FINISH_RECOVERY_GAP) so it
+  // cannot be defeated by the :1178 misclassification (an earlier flag-based
+  // attempt gave 5/40 — the misclassification set that flag too). The geometric
+  // gate alone yanked ANY <200px reader including a deliberate one, so Approach A
+  // adds the input-backed veto (inputBackedAway, declared just below) to skip the
+  // yank when the off-tail position was caused by genuine wheel/pointer input —
+  // which the :1178 race (geometry-only) cannot fabricate. See the veto decl +
+  // the onMount input listeners for the full mechanism.
+  let prevWorkingEnd = false;
+  // Approach A — input-backed veto for the busy→idle recovery below. The
+  // geometric TURN_FINISH_RECOVERY_GAP gate alone cannot tell a system-driven
+  // ~96px drift (the :1178 race — recover) from a genuine ~96px scroll-up (a
+  // deliberate reader — must NOT yank). The discriminator is PHYSICAL INPUT
+  // provenance: the :1178 race is geometry-only (composer autosize + a streamed
+  // chunk fire NO wheel/pointer over the viewport), while a deliberate scroll-up
+  // has real input. `pendingInputAt` is stamped by wheel/pointerdown listeners on
+  // the scroll viewport (onMount below) and consumed by onScrolled's user-scroll-
+  // away branch to arm `inputBackedAway`. The geometry classifier cannot
+  // fabricate input provenance, so the :1178 misclassification — which reaches
+  // onScrolled as a bogus user-scroll-up — does NOT arm the veto (pendingInputAt
+  // is stale/0), leaving the geometric recovery intact. `inputBackedAway` mirrors
+  // userScrolledUp's lifecycle: armed on a genuine scroll-away, cleared at every
+  // re-engage (reached-bottom, jumpToLatest, the RO-recovery branches, session
+  // switch). DELIBERATELY NOT cleared at busy→idle: it persists so a reader who
+  // stays off-tail across several turns is never yanked by a later turn's finish.
+  // (An earlier flag-based attempt gated on onScrolled's own classification and
+  // gave 5/40 — the :1178 misclassification set that flag too; sourcing the
+  // signal from real input events OUTSIDE onScrolled is what defeats it.)
+  let pendingInputAt = 0; // ms timestamp of the last wheel/pointerdown over the viewport; 0 = none
+  let inputBackedAway = false; // durable: the current off-tail episode is input-backed
+  createEffect(() => {
+    const w = working();
+    if (!ready()) return;
+    const endEdge = prevWorkingEnd && !w;
+    prevWorkingEnd = w;
+    if (endEdge && scrollEl) {
+      const gap = scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight;
+      // Recover a system-driven drift (the :1178 race). The input-backed veto
+      // (Approach A) prevents yanking a deliberate reader: inputBackedAway is
+      // armed only when fresh wheel/pointer input correlates with the scroll-away,
+      // which the :1178 geometry misclassification cannot produce. When the veto
+      // is set we leave following=false and the reader in place (NOT cleared here
+      // — see the decl above).
+      if (gap < TURN_FINISH_RECOVERY_GAP && !inputBackedAway) {
+        setFollowing(true);
+        setUserScrolledUp(false);
+        contentROArmedLatch = false;
+        preArmGap = Infinity;
+        pin();
+      }
+    }
+  });
   // Read-mode logical anchor tracking: the data-mid id we restored to and its
   // content-coordinate offset at restore/pin time, so a grow/shrink ABOVE the
   // viewport that overflow-anchor:auto failed to track can be corrected
@@ -435,6 +532,8 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   function jumpToLatest() {
     setFollowing(true);
     setUserScrolledUp(false); // user explicitly chose to follow again
+    inputBackedAway = false; // Approach A: explicit re-engage clears the veto
+    pendingInputAt = 0;
     pin();
   }
 
@@ -716,6 +815,20 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
         restoredAnchorId = undefined;
         restoredAnchorOffset = -1;
         restoredFor = "";
+        // Reset the recovery/latch state too: a spurious arm in the LEAVING
+        // session (contentROArmedLatch/preArmGap) must not carry into the
+        // entering session's scrollEl RO recovery branch (which has no
+        // restoredAnchorId guard and would yank a mid-history reader).
+        // prevWorkingEnd is reset so a busy→idle edge crossing sessions (busy A
+        // → idle B) does not fire the busy→idle recovery on B's ready() flip.
+        contentROArmedLatch = false;
+        preArmGap = Infinity;
+        prevWorkingEnd = false;
+        // Approach A: the leaving session's input-backed veto must not carry
+        // into the entering session (would wrongly suppress a legitimate
+        // recovery, or yank if polarity were ever inverted).
+        pendingInputAt = 0;
+        inputBackedAway = false;
         setReady(false);
         // Fallback reveal: if no content change fires the ResizeObserver (so
         // maybeRestore never runs), position + reveal on the next frame anyway.
@@ -821,6 +934,13 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
           // after content+viewport+clamp accounted). Let it win; do NOT pin.
           setFollowing(false);
           setUserScrolledUp(true);
+          contentROArmedLatch = true; // system-driven arm → eligible for the recovery branch below
+          // Capture the PRE-arm gap (pinnedGeom still holds the previous frame's
+          // geometry here — the common tail advances it only after this branch).
+          preArmGap =
+            pinnedGeom.scrollHeight >= 0
+              ? pinnedGeom.scrollHeight - pinnedGeom.scrollTop - pinnedGeom.clientHeight
+              : Infinity;
         } else if (d.shouldScroll && d.newScrollTop !== undefined && !holdActive()) {
           // Layout churn (grow/shrink/viewport resize) while still following:
           // re-glue to the bottom. Epsilon-guarded inside the reducer against
@@ -848,6 +968,31 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
             scrollEl.scrollTop = d.newScrollTop;
           }
           restoredAnchorOffset = off; // advance measured baseline
+        }
+      } else if (contentROArmedLatch) {
+        // (b) non-recovery fix: a concurrent content-grow + viewport-shrink frame
+        // can spuriously arm the intent latch above (the dual-axis reducer's
+        // viewport-churn guard admits most concurrent frames, but a frame where
+        // content-delta dominates the residual slips through as user-scroll-up).
+        // Once armed, the following() branch above stops re-pinning, so the next
+        // streamed chunk grows scrollHeight while scrollTop stays frozen → the
+        // viewport drifts off the tail and nothing recovers: the scrollEl RO
+        // only observes clientHeight changes; onScrolled only scroll events;
+        // the self-heal/visibility effects are gated on !userScrolledUp(). This
+        // branch recovers a SYSTEM-driven arm on the next content grow when the
+        // reader was still at the tail — mirrors the scrollEl RO recovery below
+        // but for the content-grow axis. The gap gate uses preArmGap (captured at
+        // the arm site, BEFORE the common tail advanced pinnedGeom to this frame's
+        // large post-arm gap) to reject a mid-history reader; contentROArmedLatch
+        // rejects a genuine user-scroll arm (cleared at onScrolled).
+        if (preArmGap < RECOVERY_TAIL_GAP) {
+          setFollowing(true);
+          setUserScrolledUp(false);
+          contentROArmedLatch = false;
+          preArmGap = Infinity;
+          inputBackedAway = false; // Approach A: re-engage clears the veto
+          pendingInputAt = 0;
+          pin();
         }
       }
       // Advance the geometry baseline to the settled state (after any write +
@@ -912,22 +1057,97 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       if (following()) {
         pin();
       } else {
-        if (!nearBottom()) return; // (1) resize left a material gap — nothing to recover
+        // (b) non-recovery fix: a spurious arm (the contentEl RO's concurrent
+        // content-grow + composer-grow race) can leave the reader near the tail
+        // but with a viewport-explained gap. If content then STOPS streaming (the :1178 case — the stream finishes mid-race), the contentEl
+        // RO never fires another frame to run its recovery branch above; only this
+        // scrollEl RO observes the ongoing composer-grow. Recover here when the
+        // PRE-arm gap was at the tail (preArmGap, captured before the common tail
+        // advanced pinnedGeom). contentROArmedLatch is cleared by a genuine user
+        // scroll, so this never yanks a real reader.
+        if (contentROArmedLatch && preArmGap < RECOVERY_TAIL_GAP) {
+          setFollowing(true);
+          setUserScrolledUp(false);
+          contentROArmedLatch = false;
+          preArmGap = Infinity;
+          inputBackedAway = false; // Approach A: re-engage clears the veto
+          pendingInputAt = 0;
+          pin();
+          return;
+        }
+        // bug-2b recovery: a composer SHRINK (clientHeight grow) lands a near-tail
+        // reader back at the bottom with no scroll event. Two gates, BOTH required:
+        //   (2) WAS near the tail pre-resize — the baseline (pinnedGeom) gap is
+        //       within RECOVERY_TAIL_GAP. onScrolled advances pinnedGeom on EVERY
+        //       scroll, so a deliberate ~30px scroll-up leaves a ~30px baseline
+        //       gap (admitted); a mid-history ~300px reader is rejected. See
+        //       RECOVERY_TAIL_GAP for the value rationale.
+        //   (1) NOW at the bottom — nearBottom()'s 24px standard (NOT the reducer's
+        //       strict 1px atBottom: a composer-shrink recovery lands ~10px from
+        //       the bottom — outside the reducer's 1px, so it would skip (bug-2b)).
         const prev = pinnedGeom;
-        // (2) pre-resize gap; {-1,-1,-1} sentinel (pre-first-pin) → never recover.
+        // {-1,-1,-1} sentinel (pre-first-pin) → never recover.
         const prevGap =
           prev.scrollHeight >= 0
             ? prev.scrollHeight - prev.scrollTop - prev.clientHeight
             : Infinity;
-        if (prevGap < RECOVERY_TAIL_GAP) {
-          setFollowing(true);
-          setUserScrolledUp(false);
-          pin();
-        }
+        if (prevGap >= RECOVERY_TAIL_GAP) return; // (2) mid-history reader — never yank
+        if (!nearBottom()) return; // (1)
+        setFollowing(true);
+        setUserScrolledUp(false);
+        contentROArmedLatch = false;
+        preArmGap = Infinity;
+        inputBackedAway = false; // Approach A: re-engage clears the veto
+        pendingInputAt = 0;
+        pin();
       }
     });
     ro.observe(scrollEl);
     onCleanup(() => ro.disconnect());
+  });
+
+  // Approach A — physical-input provenance listeners for the busy→idle veto.
+  // Stamp `pendingInputAt` on a real input over the chat viewport so onScrolled's
+  // user-scroll-away branch can arm `inputBackedAway`. These are OUTSIDE the
+  // geometry classifier, so the :1178 race (which fires NO real input — it is
+  // composer autosize + a streamed chunk) cannot fake provenance. Two surfaces
+  // cover every deliberate-reader modality except keyboard (the chat viewport is
+  // not focusable, so keyboard scroll-nav is moot):
+  //   • wheel       — wheel/trackpad (the deterministic e2e path).
+  //   • pointerdown — mouse/touch/pen AND scrollbar-thumb drag: a pointer press
+  //     over the scroll container (including its scrollbar lane) precedes every
+  //     pointer-driven scroll-away. Direction is resolved by onScrolled's
+  //     classification, so a press that does not scroll away simply never arms
+  //     the veto. passive where it matters: observation only — never
+  //     preventDefault — and a passive wheel listener avoids WebRender scroll-
+  //     jank on the always-present scroll surface (AGENTS.md "Web frontend
+  //     performance"). pointerdown has no default scroll action to block.
+  // ChatView is reused across sessions and scrollEl is stable across the reuse,
+  // so a single onMount mount/unmount pair covers the component's lifetime.
+  onMount(() => {
+    if (!scrollEl) return;
+    // Wheel: only an UPWARD wheel (deltaY < 0) can precede a scroll-away-to-
+    // read-history; arming on down would let a coincident :1178 up-
+    // misclassification falsely arm the veto.
+    const onWheel = (e: WheelEvent) => {
+      if (e.deltaY < 0) pendingInputAt = Date.now();
+    };
+    // pointerdown covers mouse, touch, pen, AND scrollbar-thumb drag (a press on
+    // the scrollbar lane targets the scroll container). It fires at the START of
+    // the gesture; onScrolled's fresh-input correlation (within INPUT_FRESHNESS_MS)
+    // arms the veto on the resulting scroll-away. Shares the exact onScrolled
+    // correlation path proven by the wheel-based busy→idle no-yank test; the
+    // pointer (scrollbar-drag) path is proven by the pointer-drag no-yank test.
+    const onPointerDown = () => {
+      pendingInputAt = Date.now();
+    };
+    const node = scrollEl;
+    node.addEventListener("wheel", onWheel, { passive: true });
+    node.addEventListener("pointerdown", onPointerDown);
+    onCleanup(() => {
+      node.removeEventListener("wheel", onWheel);
+      node.removeEventListener("pointerdown", onPointerDown);
+    });
   });
 
   // Scroll handling: track follow state, advance the read cursor (debounced),
@@ -958,6 +1178,7 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       // at the bottom). Clear the intent latch + ack unread.
       setFollowing(true);
       setUserScrolledUp(false);
+      inputBackedAway = false; // Approach A: re-engage clears the input veto
       if (!props.draft) {
         clearReadAnchor(props.sessionId);
         readStash.invalidateIfSession(props.sessionId);
@@ -969,6 +1190,17 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
       // reader. Schedule a debounced read-cursor write.
       setFollowing(false);
       setUserScrolledUp(true);
+      contentROArmedLatch = false; // genuine user scroll → NOT eligible for contentEl RO recovery
+      preArmGap = Infinity;
+      // Approach A: if this scroll-away was backed by fresh physical input (a
+      // real wheel/pointer within INPUT_FRESHNESS_MS), arm the durable veto so the
+      // busy→idle turn-finish recovery does NOT yank a deliberate reader. The
+      // :1178 race has no physical input → pendingInputAt is stale/0 → the veto
+      // stays unset → geometric recovery remains intact. (Read BEFORE the
+      // consume-clear at the end of onScrolled.)
+      if (pendingInputAt && Date.now() - pendingInputAt < INPUT_FRESHNESS_MS) {
+        inputBackedAway = true;
+      }
       if (!props.draft) scheduleReadCursor();
     } else {
       // intent === "none": layout churn (content/viewport resize fully
@@ -985,6 +1217,14 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
     // Advance the baseline to the settled geometry (after any write) so the
     // next scroll/RO event computes an incremental delta.
     pinnedGeom = geom(scrollEl);
+    // Approach A: onScrolled is the correlation point for pendingInputAt — once
+    // it has run, the input's effect is classified (armed the veto above or
+    // not), so consume the marker. This keeps the veto's input provenance tight:
+    // a real wheel re-stamps it on the next gesture, while a stray marker cannot
+    // linger into a later (:1178-style) misclassification. (The staleness check
+    // in the arm branch is the secondary safety net for a wheel that fires NO
+    // scroll event.)
+    pendingInputAt = 0;
     navigator.scheduleActiveTurn();
   }
 

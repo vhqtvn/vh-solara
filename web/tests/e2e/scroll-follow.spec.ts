@@ -1211,6 +1211,192 @@ test("concurrent composer grow + streamed content grow keeps following at the ta
   await expectFollowingTail(page);
 });
 
+// (17b) A deliberate sub-200px scroll-up immediately before turn finish is NOT
+//       yanked (the busy→idle input-backed veto — Approach A).
+//
+// Sibling of (10b) and (14). (10b) pins the intent-latch on the BUSY edge (turn
+// start); (14) pins it on tab resume. This pins the THIRD edge the no-yank
+// contract must hold: the busy→IDLE edge (turn finish). The geometric
+// TURN_FINISH_RECOVERY_GAP gate alone recovers ANY off-tail reader within 200px
+// — including a deliberate one — so without the input-backed veto a genuine
+// reader who scrolled up <200px just before the turn ends is yanked to the tail.
+// Approach A: the busy→idle recovery skips the yank when the off-tail position
+// was caused by genuine physical input (a real wheel here), which the :1178
+// geometry misclassification cannot fabricate (it fires no wheel/touch).
+//
+// Proven with a REAL Playwright wheel action — NOT the direct scrollTop helper
+// (setScrollTop), which is programmatic and carries no input provenance: it
+// would not arm the veto, so it would assert nothing about the input-gate. This
+// is the one test in the suite that drives real input over the viewport.
+//
+// Why [[stall]] (not a real prompt): a real prompt STREAMS content (contentEl RO
+// grow), shifting the gap during the busy window and risking it exceeding 200px
+// (→ geometric reject → a vacuous pass). [[stall]] sleeps ~5s busy with NO
+// content stream, so the post-wheel gap is stable through turn finish.
+test("a deliberate sub-200px scroll-up immediately before turn finish is not yanked", async ({ page }) => {
+  // beforeEach loaded demo (VP + reset + idle). Glue to the tail.
+  await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
+    el.scrollTop = el.scrollHeight;
+  });
+  await expectFollowingTail(page);
+
+  // Drive a busy turn ([[stall]] sleeps ~5s server-side before idle) so the
+  // busy→idle edge fires AFTER our deliberate scroll-up. working-text visible
+  // proves we are inside the busy window (the self-heal busy edge already fired;
+  // no further busy edge will re-pin before idle).
+  const beforeCount = await page.locator(".msg").count();
+  await page.getByPlaceholder("Message…").fill("[[stall]] finish while reading");
+  await page.keyboard.press("Enter");
+  await expect(page.locator(".working-text")).toBeVisible({ timeout: 5000 });
+
+  // CRITICAL ordering: wait for the stall turn's user message to append (count
+  // +1), then re-glue to the tail and let the append's contentEl RO deliver +
+  // settle BEFORE wheeling. [[stall]] streams NOTHING after the user message, so
+  // once settled there is no concurrent content-grow to race the wheel: the
+  // wheel's scroll-away is then classified ONLY by onScrolled (the scroll event),
+  // which is the arm site of the input-backed veto. (Wheeling DURING active
+  // content streaming is a separate, harder sub-case where the contentEl RO may
+  // classify first — out of scope for this slice and no worse than the prior
+  // always-yank behavior.)
+  await expect
+    .poll(() => page.locator(".msg").count(), { timeout: 5000 })
+    .toBeGreaterThan(beforeCount);
+  await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
+    el.scrollTop = el.scrollHeight;
+  });
+  await expectFollowingTail(page);
+  await page.waitForTimeout(250); // absorb any in-flight RO callback from the append
+  await expectFollowingTail(page);
+
+  // Position the pointer over the chat scroll viewport, then a REAL upward wheel.
+  // Negative deltaY = scroll up. ~100px lands the gap comfortably under
+  // TURN_FINISH_RECOVERY_GAP (200) and above nearBottom (24) — the band where the
+  // geometric gate alone WOULD yank (the regression this test pins).
+  const center = await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
+    const r = el.getBoundingClientRect();
+    return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+  });
+  await page.mouse.move(center.x, center.y);
+  await page.mouse.wheel(0, -100);
+
+  // Non-vacuity gate 1: the wheel actually moved us off-tail (> nearBottom's
+  // 24px). Polling >24 (not <200) is what makes this non-vacuous — a wheel that
+  // was absorbed/raced-to-zero would leave gap ~0 and fail here, not pass
+  // silently. (The scroll event + Solid update are async-but-fast.)
+  await expect.poll(
+    () =>
+      page.locator(".chat-scroll").evaluate((e: HTMLElement) =>
+        e.scrollHeight - e.scrollTop - e.clientHeight,
+      ),
+    { timeout: 3000, message: "wheel-up did not move the viewport off-tail (>24px)" },
+  ).toBeGreaterThan(24);
+  // Non-vacuity gate 2: still inside the geometric yank band (< 200). If the
+  // wheel overshot past 200 the busy→idle gate would reject on geometry alone →
+  // a vacuous pass; assert we are in the band the bug yanks.
+  const preGap = await page.locator(".chat-scroll").evaluate(
+    (e: HTMLElement) => e.scrollHeight - e.scrollTop - e.clientHeight,
+  );
+  expect(preGap).toBeLessThan(200);
+  // following dropped (the wheel armed userScrolledUp at onScrolled) → "↓ Latest".
+  await expect(page.locator("button.jump")).toBeVisible({ timeout: 3000 });
+
+  // Let the stall turn finish → busy→idle edge fires. Under the BUG (geometric
+  // gate only) this yanks: gap ~100 < 200 → setFollowing(true)+pin → at tail. Under
+  // the FIX the input-backed veto (armed by the real wheel above) skips the yank
+  // and the deliberate reader stays in place.
+  await expect(page.locator(".working-text")).toHaveCount(0, { timeout: 12000 });
+
+  // NOT yanked: still off-tail (> nearBottom) and the "↓ Latest" button remains
+  // available so the reader can jump back when ready. Under the bug postGap
+  // polls to <24 (yanked to tail) and this fails.
+  await expect(page.locator("button.jump")).toBeVisible({ timeout: 3000 });
+  const postGap = await page.locator(".chat-scroll").evaluate(
+    (e: HTMLElement) => e.scrollHeight - e.scrollTop - e.clientHeight,
+  );
+  expect(postGap).toBeGreaterThan(24);
+});
+
+// (17c) A pointer-initiated scroll-up (scrollbar-drag / touch class) immediately
+//       before turn finish is NOT yanked (the busy→idle pointerdown veto path).
+//
+// Sibling of (17b). (17b) proves the WHEEL input path arms the veto; this proves
+// the POINTERDOWN path — which covers mouse, touch, pen, AND scrollbar-thumb
+// drag (a pointer press over the scroll container or its scrollbar lane). A real
+// native scrollbar-thumb drag is non-deterministic in headless chromium (the
+// thumb target is only a few px at this fixture's tiny viewport), so this drives
+// the pointerdown → scroll correlation directly: a real pointer press (mouse.down
+// → pointerdown) stamps pendingInputAt, then a scroll-up (here programmatic,
+// standing in for the drag's native scroll event — onScrolled's veto logic is
+// identical either way) arms the veto. Under the bug (no pointerdown listener)
+// the pointer press carries no provenance, the veto never arms, and busy→idle
+// yanks; under the fix the pointerdown stamps pendingInputAt and the reader
+// stays put.
+test("a pointer-initiated scroll-up immediately before turn finish is not yanked", async ({ page }) => {
+  // beforeEach loaded demo (VP + reset + idle). Glue to the tail.
+  await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
+    el.scrollTop = el.scrollHeight;
+  });
+  await expectFollowingTail(page);
+
+  const beforeCount = await page.locator(".msg").count();
+  await page.getByPlaceholder("Message…").fill("[[stall]] finish while reading (pointer)");
+  await page.keyboard.press("Enter");
+  await expect(page.locator(".working-text")).toBeVisible({ timeout: 5000 });
+  // Same settle as (17b): wait for the user message, re-glue, let the append's
+  // contentEl RO deliver, so the scroll-away below is classified only by onScrolled.
+  await expect
+    .poll(() => page.locator(".msg").count(), { timeout: 5000 })
+    .toBeGreaterThan(beforeCount);
+  await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
+    el.scrollTop = el.scrollHeight;
+  });
+  await expectFollowingTail(page);
+  await page.waitForTimeout(250);
+  await expectFollowingTail(page);
+
+  // Real pointer press over the viewport (mouse.down fires pointerdown on the
+  // scroll container → pendingInputAt). A content press is a faithful stand-in
+  // for a scrollbar-lane press: both target the scroll container, both fire
+  // pointerdown, and direction is resolved by onScrolled's classification below.
+  const center = await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
+    const r = el.getBoundingClientRect();
+    return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+  });
+  await page.mouse.move(center.x, center.y);
+  await page.mouse.down();
+  // Scroll up ~100px into the (24, 200) no-yank band. Programmatic here stands in
+  // for the drag's native scroll event; onScrolled classifies the residual and
+  // arms the veto on the fresh pointerdown provenance.
+  await page.locator(".chat-scroll").evaluate((el: HTMLElement) => {
+    el.scrollTop = Math.max(0, el.scrollTop - 100);
+  });
+  await page.mouse.up();
+
+  // Non-vacuity: the scroll moved us off-tail into the band.
+  await expect.poll(
+    () =>
+      page.locator(".chat-scroll").evaluate((e: HTMLElement) =>
+        e.scrollHeight - e.scrollTop - e.clientHeight,
+      ),
+    { timeout: 3000, message: "pointer scroll-up did not move off-tail (>24px)" },
+  ).toBeGreaterThan(24);
+  const preGap = await page.locator(".chat-scroll").evaluate(
+    (e: HTMLElement) => e.scrollHeight - e.scrollTop - e.clientHeight,
+  );
+  expect(preGap).toBeLessThan(200);
+  await expect(page.locator("button.jump")).toBeVisible({ timeout: 3000 });
+
+  // Turn finishes → busy→idle. Under the bug the reader is yanked to the tail;
+  // under the fix the pointerdown-backed veto skips the yank.
+  await expect(page.locator(".working-text")).toHaveCount(0, { timeout: 12000 });
+
+  await expect(page.locator("button.jump")).toBeVisible({ timeout: 3000 });
+  const postGap = await page.locator(".chat-scroll").evaluate(
+    (e: HTMLElement) => e.scrollHeight - e.scrollTop - e.clientHeight,
+  );
+  expect(postGap).toBeGreaterThan(24);
+});
+
 // (18) Epsilon DATA test: how many px of scroll-up does it take to drop
 //      `following`? Pins the REAL user-scroll-up drop boundary with measured
 //      data so the epsilon DEFER card
