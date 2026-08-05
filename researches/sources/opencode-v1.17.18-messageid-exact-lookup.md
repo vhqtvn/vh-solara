@@ -64,7 +64,7 @@ correctness: a caller-minted ID interleaves with real OpenCode IDs under
 OpenCode's string-based ordering, so it sorts as if OpenCode minted it. vh-solara
 replicates it in `pkg/opencode/id.go` (`MintMessageID`, with a per-process
 monotonic counter mirroring id.ts's module-level lastTimestamp/counter, guarded
-by `mintMu`). **Fresh per enqueue, never reused, never derived from text, never
+by `mintMu`). **Fresh per claim, never reused, never derived from text, never
 regenerated after a timeout.**
 
 ### 1b. No collision with other identifier spaces
