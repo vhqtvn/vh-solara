@@ -95,8 +95,11 @@ https://github.com/sst/opencode/blob/v1.17.18/packages/opencode/src/session/prom
 - A caller that supplies a correctly-formatted `msg_…` ID gets that **EXACT** ID
   back on the persisted user message — OpenCode does **not** remint. This is the
   foundation of vh-solara's correlation: the queue mints `OpencodeMsgID` at
-  Enqueue (`pkg/web/queue.go` `Enqueue`), threads it into `prompt_async`'s
-  `messageID` field at dispatch, and later looks it up by exact ID.
+  Claim (`pkg/web/queue.go` `Claim`), threads it into `prompt_async`'s
+  `messageID` field at dispatch, and later looks it up by exact ID. (The mint
+  moved from Enqueue to Claim in commit 3f696865 to fix a silent-loss defect
+  where an enqueue-time id could sort before intervening messages under
+  OpenCode's string ordering; see `pkg/web/queue.go` `Claim`'s doc comment.)
 - Omitting the field is safe (OpenCode mints one), but supplying it is what
   enables exact-match reconciliation. The field is **optional** — its presence
   never causes a request to be rejected on format grounds as long as the value is

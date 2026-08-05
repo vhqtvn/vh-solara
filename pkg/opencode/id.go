@@ -77,7 +77,7 @@ var (
 // information.
 //
 // Fresh per call; NEVER reused; never derived from message text; never
-// regenerated after a timeout. Used by the queue (Enqueue) as the authoritative
+// regenerated after a timeout. Used by the queue (Claim) as the authoritative
 // correlation ID threaded into prompt_async's `messageID` body field.
 func MintMessageID() string {
 	mintMu.Lock()
