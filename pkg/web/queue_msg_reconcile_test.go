@@ -88,18 +88,23 @@ func (f *fakeResolver) count() int {
 
 // newStuckUnknownStore enqueues, claims, and recovers one item to terminal
 // `unknown` (the delivered-but-stuck state reconciliation targets), returning
-// the store + the stuck item (carrying its minted OpencodeMsgID).
+// the store + the stuck item (carrying its minted OpencodeMsgID). The returned
+// item is the CLAIMED one, because the OpencodeMsgID is minted at Claim (not
+// Enqueue); callers look the id up in the resolver, so they need the claimed
+// copy, not the pending enqueue result (whose OpencodeMsgID is intentionally
+// empty).
 func newStuckUnknownStore(t *testing.T, sid, text string) (*sessionQueueStore, QueueItem) {
 	t.Helper()
 	s, _ := newTestStore(t, sid)
-	it := mustEnqueue(t, s, text)
-	if _, _, err := s.Claim(); err != nil {
+	mustEnqueue(t, s, text)
+	claimed, _, err := s.Claim()
+	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
-	if _, err := s.Resolve(it.ID, QueueUnknown, "stuck"); err != nil {
+	if _, err := s.Resolve(claimed.ID, QueueUnknown, "stuck"); err != nil {
 		t.Fatalf("Resolve(unknown): %v", err)
 	}
-	return s, it
+	return s, claimed
 }
 
 func mustListItem(t *testing.T, s *sessionQueueStore, id string) QueueItem {

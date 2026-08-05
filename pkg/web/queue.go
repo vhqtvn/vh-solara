@@ -81,16 +81,44 @@ type QueueSendConfig struct {
 // monotonic FIFO commit sequence. OriginClientID is diagnostics-only and MUST
 // NOT affect ordering, visibility, or dispatch eligibility.
 //
-// OpencodeMsgID is the authoritative correlation ID minted once at Enqueue (via
-// opencode.MintMessageID, replicating sst/opencode's Identifier.ascending
-// "message" format). It is threaded into prompt_async's `messageID` body field
-// so OpenCode persists the dispatched user message with this EXACT id, and
-// later looked up via GET /session/:sid/message/:mid to reconcile
-// delivered-but-stuck items (dispatching/unknown → sent). omitempty for on-disk
-// backward compatibility: a queue.json persisted before this field existed
-// deserializes with OpencodeMsgID=="" and the reconciler simply skips it (no
-// correlation id → no exact-match lookup → fail-closed, never resend). NEVER
-// reused across enqueues; never derived from text; never regenerated.
+// OpencodeMsgID is the authoritative correlation ID minted at Claim/dispatch
+// time (via opencode.MintMessageID, replicating sst/opencode's
+// Identifier.ascending "message" format). It is threaded into prompt_async's
+// `messageID` body field so OpenCode persists the dispatched user message with
+// this EXACT id, and later looked up via GET /session/:sid/message/:mid to
+// reconcile delivered-but-stuck items (dispatching/unknown → sent). omitempty
+// for on-disk backward compatibility: a queue.json persisted before this field
+// existed deserializes with OpencodeMsgID=="" and the reconciler simply skips
+// it (no correlation id → no exact-match lookup → fail-closed, never resend).
+//
+// WHY MINT AT CLAIM, NOT ENQUEUE. OpenCode orders messages by STRING id
+// (MessageV2.latest re-derives the newest message per role by string `>`
+// regardless of SQL time_created ordering), and sst/opencode's ascending
+// "message" id encodes a wall-clock timestamp. An id minted at Enqueue and then
+// left pending can encode a wall-clock EARLIER than messages that land while the
+// item sits in the queue; under OpenCode's string ordering the dispatched user
+// message then sorts INTO THE PAST of the transcript, is not the newest user
+// message, and the assistant-turn trigger never fires (loop break on
+// lastUser.id < lastAssistant.id). Minting at Claim — as late as possible,
+// immediately before the dispatch POST — shrinks that divergence window from
+// UNBOUNDED (arbitrary queue-pending latency) to the dispatch round-trip. This
+// is an HONEST BOUND, not an absolute guarantee: only OpenCode minting the id at
+// persist time would make the invariant absolute; the residual round-trip window
+// is documented here rather than claimed eliminated.
+//
+// PROPERTIES PRESERVED. Backend-owned (not a FE listener): the backend mints,
+// so the id survives reload and session-switch (persisted at Claim in the SAME
+// atomic save as the pending→dispatching transition, BEFORE the dispatch POST).
+// Fresh per dispatch attempt (never reused across dispatches, never derived from
+// text). The reconciler still has a correlation id for everything actually
+// dispatched: Claim persists OpencodeMsgID before the dispatch reaches the
+// network, so even a dispatch response lost on the wire leaves the id on disk
+// for reconciliation. NEVER regenerated after a dispatch has been attempted:
+// the only path that can re-mint is the Claim save-failure rollback, which
+// clears OpencodeMsgID="" and fires STRICTLY BEFORE Claim returns (hence before
+// any dispatch POST); lifecycle forbids a dispatching item from returning to
+// pending, so no later claim can re-mint over an id OpenCode may already have
+// persisted under.
 //
 // DispatchStartedAt records when Claim() transitioned the item to `dispatching`.
 // It is the timestamp stale-dispatch recovery (recoverStaleDispatchingLocked)
@@ -658,14 +686,14 @@ func (s *sessionQueueStore) Enqueue(text string, attachments []QueueAttachment, 
 		Attachments:    attachments,
 		SendConfig:     cfg,
 		OriginClientID: originClientID,
-		// Mint the OpenCode correlation ID ONCE here (backend-authoritative):
-		// it survives reload and session-switch, which is why the backend owns
-		// it rather than a FE-only listener. Fresh per enqueue (never reused),
-		// never derived from text, never regenerated after a timeout. Threaded
-		// into prompt_async's `messageID` body field at dispatch; looked up via
-		// GET /session/:sid/message/:mid to reconcile delivered-but-stuck items.
-		OpencodeMsgID: opencode.MintMessageID(),
-		CreatedAt:     time.Now().UnixMilli(),
+		// OpencodeMsgID is intentionally NOT minted here: a `pending` item is
+		// not yet dispatched, and minting the OpenCode correlation id at enqueue
+		// time would let it encode a wall-clock earlier than messages that land
+		// while this item waits. Minting happens in Claim() (dispatch time) so
+		// the id tracks the actual dispatch wall-clock as closely as possible.
+		// Nothing reads OpencodeMsgID while the item is pending (the reconciler
+		// skips empty ids; the FE reads it off the claimed item).
+		CreatedAt: time.Now().UnixMilli(),
 	}
 	s.items = append(s.items, item)
 	if err := s.save(); err != nil {
@@ -737,18 +765,30 @@ func (s *sessionQueueStore) Claim() (QueueItem, bool, error) {
 	}
 	for i := range s.items {
 		if s.items[i].State == QueuePending {
-			// Record the dispatch-start timestamp in the SAME in-memory
-			// mutation + atomic save as the pending→dispatching transition, so
-			// a crash after Claim returns but before dispatch leaves a
-			// recoverable timestamp on disk (recoverStaleDispatchingLocked
-			// uses it to detect abandoned dispatches).
+			// Record the dispatch-start timestamp AND mint the OpenCode
+			// correlation id in the SAME in-memory mutation + atomic save as
+			// the pending→dispatching transition. Minting here (not at Enqueue)
+			// makes the ascending id track the actual dispatch wall-clock as
+			// closely as possible, so it does not sort into the transcript's
+			// past when OpenCode orders messages by string id. A crash after
+			// Claim returns but before dispatch leaves BOTH a recoverable
+			// timestamp and a reconciler correlation id on disk
+			// (recoverStaleDispatchingLocked uses the timestamp;
+			// queue_msg_reconcile.go uses the id).
 			s.items[i].State = QueueDispatching
 			s.items[i].DispatchStartedAt = time.Now().UnixMilli()
+			s.items[i].OpencodeMsgID = opencode.MintMessageID()
 			if err := s.save(); err != nil {
-				// Roll back BOTH the state and the timestamp so the store
-				// stays consistent with disk (neither was durably committed).
+				// Roll back the state, timestamp, AND correlation id so the
+				// store stays consistent with disk (none were durably
+				// committed). This rollback fires STRICTLY BEFORE Claim returns,
+				// hence strictly before any dispatch POST reaches the network,
+				// so re-minting on a later Claim is safe (no duplicate-message
+				// hazard: OpenCode never persisted anything under the cleared
+				// id). Clearing — not freezing — is correct here.
 				s.items[i].State = QueuePending
 				s.items[i].DispatchStartedAt = 0
+				s.items[i].OpencodeMsgID = ""
 				return QueueItem{}, false, err
 			}
 			item := s.items[i]

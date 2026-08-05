@@ -69,22 +69,54 @@ func TestQueueEnqueuePersistsAndReloads(t *testing.T) {
 	}
 }
 
-// TestQueueEnqueueMintsOpencodeMsgID pins Slice 5's correlation-id contract:
-// Enqueue mints a fresh OpenCode message ID (opencode.MintMessageID format)
-// once per item, it is unique across enqueues, and it SURVIVES reload/re-list
-// (the property that makes backend-authoritative minting survive a reload or
-// session switch — the reason the backend owns the id rather than a FE listener).
-// Legacy on-disk items persisted WITHOUT the field deserialize to "" and the
-// reconciler skips them (backward compat).
-func TestQueueEnqueueMintsOpencodeMsgID(t *testing.T) {
+// TestQueueClaimMintsOpencodeMsgID pins the correlation-id contract after the
+// mint moved from Enqueue to Claim: a PENDING item has NO OpencodeMsgID (it is
+// not dispatched yet, and nothing reads it while pending), and Claim mints a
+// fresh OpenCode message id (opencode.MintMessageID format) once per dispatched
+// item. The id is unique across dispatches and SURVIVES reload/re-list (the
+// property that makes backend-authoritative minting survive a reload or session
+// switch — the reason the backend owns the id rather than a FE listener). Legacy
+// on-disk items persisted WITHOUT the field deserialize to "" and the reconciler
+// skips them (backward compat).
+func TestQueueClaimMintsOpencodeMsgID(t *testing.T) {
 	s, root := newTestStore(t, "s1")
 	a := mustEnqueue(t, s, "first")
 	b := mustEnqueue(t, s, "second")
 
-	// Each item gets a non-empty, msg_-prefixed correlation id.
+	// Pending items have NO correlation id: the id encodes a wall-clock and is
+	// only meaningful once the item is actually being dispatched. Minting it
+	// earlier would let it sort into the transcript's past under OpenCode's
+	// string-id ordering.
 	for _, it := range []QueueItem{a, b} {
+		if it.OpencodeMsgID != "" {
+			t.Fatalf("pending item %s: OpencodeMsgID %q must be empty until Claim", it.ID, it.OpencodeMsgID)
+		}
+	}
+	// And List() agrees (no in-memory-only mint hiding somewhere).
+	got, err := s.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, it := range got {
+		if it.OpencodeMsgID != "" {
+			t.Fatalf("List: pending item %s has non-empty OpencodeMsgID %q", it.ID, it.OpencodeMsgID)
+		}
+	}
+
+	// Claim mints the id at dispatch time. Claim oldest first (a, then b).
+	a2, won, err := s.Claim()
+	if err != nil || !won {
+		t.Fatalf("Claim a: won=%v err=%v", won, err)
+	}
+	b2, won, err := s.Claim()
+	if err != nil || !won {
+		t.Fatalf("Claim b: won=%v err=%v", won, err)
+	}
+
+	// Each claimed item gets a non-empty, msg_-prefixed, 30-char correlation id.
+	for _, it := range []QueueItem{a2, b2} {
 		if it.OpencodeMsgID == "" {
-			t.Fatalf("item %s: OpencodeMsgID empty (must be minted at Enqueue)", it.ID)
+			t.Fatalf("claimed item %s: OpencodeMsgID empty (must be minted at Claim)", it.ID)
 		}
 		if !strings.HasPrefix(it.OpencodeMsgID, "msg_") {
 			t.Fatalf("item %s: OpencodeMsgID %q is not msg_-prefixed", it.ID, it.OpencodeMsgID)
@@ -93,27 +125,28 @@ func TestQueueEnqueueMintsOpencodeMsgID(t *testing.T) {
 			t.Fatalf("item %s: OpencodeMsgID %q len=%d, want 30", it.ID, it.OpencodeMsgID, len(it.OpencodeMsgID))
 		}
 	}
-	// Fresh per enqueue — never reused.
-	if a.OpencodeMsgID == b.OpencodeMsgID {
-		t.Fatalf("two enqueues minted the SAME OpencodeMsgID %q (must be fresh per enqueue)", a.OpencodeMsgID)
+	// Fresh per claim — never reused.
+	if a2.OpencodeMsgID == b2.OpencodeMsgID {
+		t.Fatalf("two claims minted the SAME OpencodeMsgID %q (must be fresh per dispatch)", a2.OpencodeMsgID)
 	}
 
 	// Re-list through the SAME store keeps the id (in-memory cache).
-	got, err := s.List()
+	got, err = s.List()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got[0].OpencodeMsgID != a.OpencodeMsgID || got[1].OpencodeMsgID != b.OpencodeMsgID {
+	if got[0].OpencodeMsgID != a2.OpencodeMsgID || got[1].OpencodeMsgID != b2.OpencodeMsgID {
 		t.Fatalf("List lost OpencodeMsgID: got %+v", got)
 	}
 
-	// Reload from disk (fresh store): the id is durable on disk.
+	// Reload from disk (fresh store): the id is durable on disk — the backend
+	// mint survives a reload / session switch.
 	s2 := &sessionQueueStore{path: queuePath(root, "s1")}
 	got2, err := s2.List()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got2[0].OpencodeMsgID != a.OpencodeMsgID || got2[1].OpencodeMsgID != b.OpencodeMsgID {
+	if got2[0].OpencodeMsgID != a2.OpencodeMsgID || got2[1].OpencodeMsgID != b2.OpencodeMsgID {
 		t.Fatalf("reload lost OpencodeMsgID: got %+v (the id must survive reload)", got2)
 	}
 

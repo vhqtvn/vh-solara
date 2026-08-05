@@ -430,9 +430,10 @@ func listQueue(t *testing.T, sid, dir string) []queueItemView {
 }
 
 // enqueueAndClaim is the common setup: enqueue + claim, returning the minted
-// item id and OpenCode correlation id. The dispatch body's messageID is the FE
-// threading of the correlation id (closes the Slice-5 DEFER F1 coverage gap
-// end-to-end).
+// item id and OpenCode correlation id. The correlation id is minted at CLAIM
+// (dispatch time), not enqueue — a pending item carries an empty opencodeMsgID
+// — so the id threaded into the dispatch body's messageID comes from the CLAIM
+// response (closes the Slice-5 DEFER F1 coverage gap end-to-end).
 func enqueueAndClaim(t *testing.T, sid, dir, text string) (itemID, opencodeMsgID string) {
 	t.Helper()
 	resp, body := postJSON(t, queuePath(sid, "", dir), map[string]any{"text": text})
@@ -445,8 +446,15 @@ func enqueueAndClaim(t *testing.T, sid, dir, text string) (itemID, opencodeMsgID
 	if err := json.Unmarshal(body, &enq); err != nil {
 		t.Fatalf("enqueue decode: %v (body=%s)", err, body)
 	}
-	if enq.Item.ID == "" || enq.Item.OpencodeMsgID == "" {
-		t.Fatalf("enqueue: missing id/opencodeMsgID: %+v (body=%s)", enq.Item, body)
+	// The pending item has an id but NO opencodeMsgID yet: the correlation id
+	// is minted at claim/dispatch time so it tracks the actual dispatch
+	// wall-clock (an enqueue-time mint would let it sort into the transcript's
+	// past under OpenCode's string-id ordering).
+	if enq.Item.ID == "" {
+		t.Fatalf("enqueue: missing id: %+v (body=%s)", enq.Item, body)
+	}
+	if enq.Item.OpencodeMsgID != "" {
+		t.Fatalf("enqueue: pending item must have empty opencodeMsgID until claim; got %+v (body=%s)", enq.Item, body)
 	}
 	resp, body = postJSON(t, queuePath(sid, "/claim", dir), nil)
 	if resp == nil || resp.StatusCode != http.StatusOK {
@@ -461,7 +469,11 @@ func enqueueAndClaim(t *testing.T, sid, dir, text string) (itemID, opencodeMsgID
 	if claim.Item.ID != enq.Item.ID || claim.Item.State != "dispatching" {
 		t.Fatalf("claim: want same id+dispatching, got %+v", claim.Item)
 	}
-	return enq.Item.ID, enq.Item.OpencodeMsgID
+	// Claim mints the correlation id at dispatch time; the claim response carries it.
+	if claim.Item.OpencodeMsgID == "" {
+		t.Fatalf("claim: missing opencodeMsgID (must be minted at claim): %+v (body=%s)", claim.Item, body)
+	}
+	return claim.Item.ID, claim.Item.OpencodeMsgID
 }
 
 // dispatchWithMessageID dispatches the claimed item via the FE dispatch path,
