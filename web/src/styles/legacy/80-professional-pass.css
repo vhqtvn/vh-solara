@@ -111,6 +111,11 @@ div.katex-math { display: block; overflow-x: auto; margin: 0.7em 0; text-align: 
 .md table { border-collapse: collapse; font-size: 0.94em; margin: 0.6em 0; display: block; overflow-x: auto; }
 .md th, .md td { border: 1px solid var(--border); padding: 4px 9px; text-align: left; }
 .md th { background: var(--code-bg); font-weight: 600; }
+/* Size-bound rendered-markdown images so they never overflow the .md container
+   (mirrors the .code-image img house pattern). height:auto preserves aspect
+   ratio under both maxes; no GPU-perf-banned properties (no mask/backdrop/
+   contain/content-visibility). */
+.md img { max-width: 100%; max-height: 70vh; height: auto; border-radius: 6px; vertical-align: middle; }
 
 /* ============================================================================
    (b) Chat reading surface: calmer role labels, your turns in a quiet card,

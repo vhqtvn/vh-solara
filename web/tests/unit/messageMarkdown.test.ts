@@ -208,10 +208,38 @@ describe("classifyImageSrc", () => {
     expect(classifyImageSrc("/assets/x.png", self).kind).toBe("keep");
   });
 
-  it("relative path → keep", () => {
-    expect(classifyImageSrc("assets/x.png", self).kind).toBe("keep");
-    expect(classifyImageSrc("./x.png", self).kind).toBe("keep");
-    expect(classifyImageSrc("../x.png", self).kind).toBe("keep");
+  it("relative path → projectFile (routed to /vh/code/raw)", () => {
+    // A relative path is a project-file reference (the SPA serves only
+    // root-absolute assets, so a relative URL would 404 against the document
+    // origin). The classifier returns the raw path; the render site resolves it.
+    const generic = classifyImageSrc("assets/x.png", self);
+    expect(generic.kind).toBe("projectFile");
+    if (generic.kind === "projectFile") expect(generic.path).toBe("assets/x.png");
+
+    const dotSlash = classifyImageSrc("./x.png", self);
+    expect(dotSlash.kind).toBe("projectFile");
+    if (dotSlash.kind === "projectFile") expect(dotSlash.path).toBe("./x.png");
+
+    const dotDotSlash = classifyImageSrc("../x.png", self);
+    expect(dotDotSlash.kind).toBe("projectFile");
+    if (dotDotSlash.kind === "projectFile") expect(dotDotSlash.path).toBe("../x.png");
+  });
+
+  it("inline attachment relative path → projectFile", () => {
+    // The exact shape produced by lib/inlineAttach.ts substituteInlineTokens at
+    // send time (vh-attach:<localId> → .vh-solara/sessions/<sid>/attachments/...).
+    const attach = ".vh-solara/sessions/ses_abc/attachments/1700000000000_shot.png";
+    const r = classifyImageSrc(attach, self);
+    expect(r.kind).toBe("projectFile");
+    if (r.kind === "projectFile") expect(r.path).toBe(attach);
+  });
+
+  it("model-emitted repo-relative path → projectFile", () => {
+    // Model output referencing a repo file relatively (e.g. ![d](docs/arch.png))
+    // is the same class of relative URL and routes the same way.
+    const r = classifyImageSrc("docs/diagram.png", self);
+    expect(r.kind).toBe("projectFile");
+    if (r.kind === "projectFile") expect(r.path).toBe("docs/diagram.png");
   });
 
   it("vh-attach: → keep", () => {
@@ -282,10 +310,37 @@ describe("renderer.image — classifier applied in render output", () => {
     expect(out).not.toContain("/vh/img");
   });
 
-  it("relative image src kept unchanged", () => {
+  it("root-relative (/) image src kept unchanged (SPA asset)", () => {
     const out = messageMarked.parse("![alt](/assets/x.png)", { async: false }) as string;
     expect(out).toContain('src="/assets/x.png"');
     expect(out).not.toContain("/vh/img");
+    expect(out).not.toContain("/vh/code/raw");
+  });
+
+  it("relative image src rewritten to /vh/code/raw (project file)", () => {
+    // In the jsdom test env projectDir() is "" (no project selected), so the
+    // daemon URL is /vh/code/raw?dir=&path=<enc>. Assert the endpoint + encoded
+    // path; do NOT hard-assert the dir= value (that is the sync store's concern,
+    // tested via the live app, not here).
+    const md = "![alt](docs/diagram.png)";
+    const out = messageMarked.parse(md, { async: false }) as string;
+    expect(out).toContain("/vh/code/raw?");
+    expect(out).toContain("path=" + encodeURIComponent("docs/diagram.png"));
+    // The raw relative src must NOT survive to the DOM (it would 404).
+    expect(out).not.toContain('src="docs/diagram.png"');
+    expect(out).not.toContain("/vh/img");
+  });
+
+  it("inline attachment relative src rewritten to /vh/code/raw", () => {
+    // The exact substituted form a RENDERED message carries after send:
+    // .vh-solara/sessions/<sid>/attachments/<ts>_<name>.png (never vh-attach:).
+    const attach = ".vh-solara/sessions/ses_abc/attachments/1700000000000_shot.png";
+    const out = messageMarked.parse(`![shot.png](${attach})`, { async: false }) as string;
+    expect(out).toContain("/vh/code/raw?");
+    expect(out).toContain("path=" + encodeURIComponent(attach));
+    expect(out).not.toContain('src=".vh-solara/');
+    // alt text (the filename) is preserved.
+    expect(out).toContain('alt="shot.png"');
   });
 
   it("javascript: image src neutralized (no src attribute)", () => {

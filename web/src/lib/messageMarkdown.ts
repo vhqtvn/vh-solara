@@ -29,8 +29,9 @@
 //   third party (a privacy/tracking hazard), and would allow a malicious
 //   message to probe the operator's internal network (SSRF via the browser).
 //   `classifyImageSrc` routes cross-origin http(s) images through the
-//   daemon-side `/vh/img` proxy (which applies its own SSRF gate), leaves
-//   same-origin/relative/attachment/raster-data URLs untouched, and
+//   daemon-side `/vh/img` proxy (which applies its own SSRF gate), routes
+//   project-relative paths through `/vh/code/raw`, leaves
+//   same-origin/root-relative/attachment/raster-data URLs untouched, and
 //   neutralizes dangerous or ambiguous sources (javascript:, file:, SVG data
 //   URLs, protocol-relative). The custom `renderer.image` applies the
 //   classifier so both the one-shot and streaming paths rewrite hrefs BEFORE
@@ -40,6 +41,7 @@
 //   settled HTML is cached or inserted into the DOM).
 
 import { Marked, type Tokens } from "marked";
+import { codeRawUrl } from "../code/api";
 
 // escapeHtml escapes the five XML-mandated characters. Used for raw HTML
 // tokens so their original source renders as visible literal text, and for
@@ -56,10 +58,15 @@ export function escapeHtml(s: string): string {
 // ---------------------------------------------------------------------------
 // Image-source classifier (pure — no DOM dependency).
 //
-// Returns one of three actions:
-//   keep      — leave the src unchanged (safe to fetch directly).
-//   proxy     — rewrite to the daemon-side /vh/img proxy (cross-origin http(s)).
-//   neutralize— drop the src (dangerous/ambiguous source; no fetch at all).
+// Returns one of four actions:
+//   keep        — leave the src unchanged (safe to fetch directly).
+//   proxy       — rewrite to the daemon-side /vh/img proxy (cross-origin http(s)).
+//   projectFile — rewrite to the daemon's /vh/code/raw endpoint (a project file
+//                 referenced by a relative path, e.g. an attachment
+//                 .vh-solara/sessions/<sid>/attachments/x.png or a model-emitted
+//                 docs/diagram.png). Resolution to the URL happens at the RENDER
+//                 SITE so this classifier stays free of any sync/window dep.
+//   neutralize  — drop the src (dangerous/ambiguous source; no fetch at all).
 //
 // `selfOrigin` is injectable for unit tests; production reads window.location.
 // ---------------------------------------------------------------------------
@@ -67,6 +74,7 @@ export function escapeHtml(s: string): string {
 export type ImageSrcAction =
   | { kind: "keep" }
   | { kind: "proxy"; url: string }
+  | { kind: "projectFile"; path: string }
   | { kind: "neutralize" };
 
 // Raster image MIME types permitted in data: URLs. SVG is deliberately absent
@@ -115,10 +123,32 @@ export function classifyImageSrc(
     return { kind: "proxy", url: "/vh/img?url=" + encodeURIComponent(s) };
   }
 
-  // Root-relative (/path) or relative (path, ./, ../) — same-origin by
-  // definition. Also any token that does not look like a scheme:absolute URL.
-  if (s.startsWith("/") || !/^[a-z][a-z0-9+.-]*:/i.test(s)) {
+  // Root-relative (/path) — a same-origin SPA asset (e.g. /assets/...). The SPA
+  // serves these directly, so keep unchanged. (Distinct from a RELATIVE path,
+  // which the SPA does NOT serve and which is resolved to /vh/code/raw below.)
+  if (s.startsWith("/")) {
     return { kind: "keep" };
+  }
+
+  // Relative path (no leading /, does not look like a scheme:absolute URL) — a
+  // PROJECT FILE reference. Two producers feed this branch:
+  //   - inline attachments, substituted at send time from synthetic vh-attach:
+  //     tokens to the real project-relative path (see lib/inlineAttach.ts), so a
+  //     RENDERED message carries e.g.
+  //     .vh-solara/sessions/<sid>/attachments/<ts>_<name>.png; and
+  //   - model output that references a repo file relatively, e.g.
+  //     ![diagram](docs/arch.png).
+  // The SPA only serves root-absolute assets, so a relative URL would resolve
+  // against the document origin and 404 (broken image). Route it through the
+  // daemon's GET /vh/code/raw endpoint, which serves project file bytes.
+  // /vh/code/raw is same-origin, requires an open project, and safeJoin contains
+  // the path under the project root — a relative path cannot escape the project
+  // root, so this introduces NO new SSRF and NO new cross-origin exposure. It
+  // only rewrites srcs that currently 404. The classifier returns the raw path;
+  // the RENDER SITE (browser) resolves it to the daemon URL via codeRawUrl so
+  // this function stays pure and unit-testable with no sync dependency.
+  if (!/^[a-z][a-z0-9+.-]*:/i.test(s)) {
+    return { kind: "projectFile", path: s };
   }
 
   // Any other absolute scheme (mailto:, tel:, unknown:) — neutralize for img.
@@ -142,9 +172,10 @@ export const messageMarked = new Marked({
     },
     // IMAGE renderer: apply the source classifier BEFORE the HTML string is
     // built so the browser never fetches a dangerous/cross-origin URL
-    // directly. Cross-origin http(s) → daemon proxy; same-origin/relative/
-    // attachment/raster-data → unchanged; everything else → neutralized
-    // (img emitted without src so no fetch fires).
+    // directly. Four-way split: keep (same-origin/root-relative/attachment/
+    // raster-data) → unchanged; proxy (cross-origin http(s)) → daemon proxy;
+    // projectFile (relative path) → /vh/code/raw; everything else →
+    // neutralized (img emitted without src so no fetch fires).
     image(token: Tokens.Image): string {
       const action = classifyImageSrc(token.href);
       const alt = escapeHtml(token.text ?? "");
@@ -154,6 +185,11 @@ export const messageMarked = new Marked({
           return `<img src="${escapeHtml(token.href)}" alt="${alt}"${title}>`;
         case "proxy":
           return `<img src="${escapeHtml(action.url)}" alt="${alt}"${title}>`;
+        case "projectFile":
+          // Resolve the project-relative path to the daemon's /vh/code/raw URL
+          // (same-origin, path-contained, requires an open project). escapeHtml
+          // on the resolved URL preserves the existing attribute-escape policy.
+          return `<img src="${escapeHtml(codeRawUrl(action.path))}" alt="${alt}"${title}>`;
         case "neutralize":
           return `<img alt="${alt}"${title}>`;
       }

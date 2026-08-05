@@ -38,10 +38,31 @@ describe("rewriteImageSrcs", () => {
     expect(out).toContain('src="/assets/a.png"');
   });
 
-  it("keeps relative img src unchanged", () => {
+  it("rewrites relative img src to /vh/code/raw (project file)", () => {
+    // A relative src is a project-file reference the SPA does NOT serve; it
+    // would 404 against the document origin. rewriteImageSrcs routes it through
+    // the daemon's /vh/code/raw endpoint (same-origin, contained, open-project-
+    // gated). projectDir() is "" in the test env, so assert endpoint + encoded
+    // path, not the dir= value.
     const html = '<img src="assets/a.png" alt="a">';
     const out = rewriteImageSrcs(html);
-    expect(out).toContain('src="assets/a.png"');
+    expect(out).toContain("/vh/code/raw?");
+    expect(out).toContain("path=" + encodeURIComponent("assets/a.png"));
+    // The raw relative src must NOT survive.
+    expect(out).not.toContain('src="assets/a.png"');
+  });
+
+  it("rewrites inline attachment relative src to /vh/code/raw", () => {
+    // The substituted form a RENDERED message carries (never vh-attach:): a
+    // project-relative path under .vh-solara/sessions/<sid>/attachments/.
+    const attach = ".vh-solara/sessions/ses_abc/attachments/1700000000000_shot.png";
+    const html = `<img src="${attach}" alt="shot.png">`;
+    const out = rewriteImageSrcs(html);
+    expect(out).toContain("/vh/code/raw?");
+    expect(out).toContain("path=" + encodeURIComponent(attach));
+    expect(out).not.toContain(`src="${attach}"`);
+    // alt is preserved for accessibility.
+    expect(out).toContain('alt="shot.png"');
   });
 
   it("keeps vh-attach: img src unchanged", () => {

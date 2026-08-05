@@ -13,6 +13,7 @@
 
 import { looksLikePath } from "./pathlike";
 import { classifyImageSrc } from "./messageMarkdown";
+import { codeRawUrl } from "../code/api";
 
 // Linkify file paths (containing "/" + an extension, optional :line) in
 // rendered prose so they jump to the file. Skips code/links.
@@ -160,6 +161,12 @@ export function rewriteImageSrcs(html: string): string {
     if (action.kind === "keep") return;
     if (action.kind === "proxy") {
       img.setAttribute("src", action.url);
+    } else if (action.kind === "projectFile") {
+      // Project-relative path (e.g. .vh-solara/.../attachments/x.png) → daemon
+      // /vh/code/raw URL. The daemon serves the bytes (same-origin, contained,
+      // requires an open project); the raw src would otherwise 404 against the
+      // SPA document origin.
+      img.setAttribute("src", codeRawUrl(action.path));
     } else {
       // neutralize: remove src so no fetch fires. Keep alt for accessibility.
       img.removeAttribute("src");
