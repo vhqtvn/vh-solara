@@ -132,10 +132,11 @@ function TreeBranch(props: {
   //               each group; sibling order preserved).
   //
   // Memoized so childrenForState(displayState()…) is computed ONCE per node per
-  // update. It previously ran twice — `visibleKids` and `kidsNow` were the
-  // identical call — so this removes the double/triple compute and makes the
-  // shared reactive dependencies explicit. `visibleKids` aliases the memo (a
-  // memo is callable), so existing call sites `visibleKids()` and
+  // reactive update. Previously `visibleKids` was an unmemoized function
+  // recomputed at each call site; the eye derivation added a second identical
+  // computation (`kidsNow`). Both are now a single `createMemo` (`kidsNowM`)
+  // computed once per node per reactive update, aliased by `visibleKids` (a memo
+  // is callable), so existing call sites `visibleKids()` and
   // `<For each={visibleKids()}>` are unchanged in behavior.
   const kidsNowM = createMemo(() =>
     childrenForState(displayState(), residentChildren(), working, props.selectedPath()),

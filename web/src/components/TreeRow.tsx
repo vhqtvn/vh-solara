@@ -174,16 +174,19 @@ export function TreeRow(props: TreeRowProps) {
           <span class="twisty-temp"><Icon name="eye" size={11} /></span>
         ) : isFiltered() || isTemp() ? (
           // "filtered" glyph (the rail-and-bars; same glyph as flat mode — both
-          // mean "a filtered view"). Covers TWO cases that render exactly their
-          // filtered baseline:
+          // mean "a filtered view"). Covers TWO cases whose rendered children
+          // equal the baseline (so no eye, caught by the branch above):
           //   - a plain filtered node (displayState==="filtered"), and
           //   - a temp node that does NOT show the eye (displayState==="temp"
-          //     but its children-list is unchanged by selection). Such a node
-          //     always has persistedMode==="filtered" (a collapsed-persisted
-          //     temp node would have an empty baseline and thus WOULD show the
-          //     eye, caught by the branch above), so the filtered glyph is its
-          //     correct non-eye rendering. Rendered BARE (no span) so the
-          //     chevron's `.tree-twisty span:not(.open)` rotate cannot catch it.
+          //     but its children-list is unchanged by selection). This is
+          //     *usually* a filtered-persisted ancestor whose only working child
+          //     is the path child — BUT it can also be a temp node whose path
+          //     child was deduped out of residentChildren by pinnedIds, leaving
+          //     an empty reveal equal to an empty baseline (e.g.
+          //     persistedMode==="collapsed"); in that case the eye rule is still
+          //     honored (empty === empty → no eye) and we fall through here to a
+          //     non-blank glyph. Rendered BARE (no span) so the chevron's
+          //     `.tree-twisty span:not(.open)` rotate cannot catch it.
           <Icon name="filtered" size={13} />
         ) : (
           // Expandable tree node (collapsed/expanded): the chevron, wrapped in
