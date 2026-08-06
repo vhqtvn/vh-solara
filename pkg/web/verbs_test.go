@@ -693,6 +693,290 @@ func TestSendCASAcceptsIdleAndRejectsStaleSeq(t *testing.T) {
 	}
 }
 
+// promptCount is the race-safe reader for fakeOC.prompts (the handler appends
+// under f.mu; the test asserts concurrently in the P7 consumer suite).
+func (f *fakeOC) promptCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.prompts)
+}
+
+// TestP7_SendCASAwaitAbortSettling is the consumer RED suite: the FIRST
+// production caller of Store.AbortSettling. A CAS-bearing /vh/send (If-Idle-Seq
+// present) rejected SOLELY by an active abort settlement (the session is
+// TurnStopping / AbortSettling==true) AWAITS the gate, then reruns the FULL
+// SendableNow + seq CAS; it forwards exactly ONE prompt iff the fresh CAS
+// passes, else 409. All other 409 conditions stay immediate: ordinary non-abort
+// busy, stale If-Idle-Seq, sequence drift during the wait, continued
+// non-sendability after release (e.g. a session.error release leaves activity in
+// the error state).
+//
+// Determinism: the abort is settled by directly applying state transitions
+// (session.idle / session.error), NEVER by waiting on the real 5s settle timer.
+// The only real-time waits here are bounded goroutine-rendezvous windows
+// (assertSendBlockedShortly / waitFor), not correctness proofs.
+func TestP7_SendCASAwaitAbortSettling(t *testing.T) {
+	// assertSendBlockedShortly confirms the async send is genuinely blocked in
+	// the AbortSettling await: it returns BEFORE release ⇒ the consumer is
+	// missing/broken (the send 409'd immediately instead of awaiting). This is
+	// the RED signal for the consumer itself.
+	assertSendBlockedShortly := func(t *testing.T, done <-chan struct{}) {
+		t.Helper()
+		select {
+		case <-done:
+			t.Fatal("send returned before release — it did NOT await AbortSettling (consumer missing/broken)")
+		case <-time.After(100 * time.Millisecond):
+			// good: still blocked after a generous in-process window → it is awaiting.
+		}
+	}
+
+	// seedAbortSettling puts session "a" into the abort-settling window: a turn
+	// was running (authoritative busy), then Stop was issued. Returns the
+	// activitySeq captured at this point (for the drift sub-test's providedSeq).
+	seedAbortSettling := func(t *testing.T, agg *aggregator.Aggregator) uint64 {
+		t.Helper()
+		s := agg.Store()
+		s.Apply(ev("session.created", `{"info":{"id":"a"}}`))
+		s.Apply(ev("session.status", `{"sessionID":"a","status":{"type":"busy"}}`))
+		s.Stop("a", "turn1")
+		if !s.AbortSettling("a") {
+			t.Fatal("seed: AbortSettling should be true after Stop")
+		}
+		_, seq, exists := s.SendableNow("a")
+		if !exists {
+			t.Fatal("seed: session a should exist")
+		}
+		return seq
+	}
+
+	// asyncSend launches a /vh/send in a goroutine and signals done on return.
+	// Returns the done channel and a pointer-to-result the goroutine writes.
+	asyncSend := func(url, body string, hdr map[string]string) (<-chan struct{}, *sendResult) {
+		res := &sendResult{}
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			st, out, _ := post(t, url, body, hdr)
+			res.st, res.body = st, out
+		}()
+		return done, res
+	}
+
+	t.Run("idle_release_forwards_exactly_one_prompt", func(t *testing.T) {
+		f := &fakeOC{}
+		web, agg := newVerbServer(t, f)
+		seedAbortSettling(t, agg)
+
+		// providedSeq huge ⇒ the seq CAS passes after release; only the abort
+		// window blocks the initial send.
+		done, _ := asyncSend(web.URL+"/vh/send", `{"sessionID":"a","text":"follow"}`,
+			map[string]string{ifIdleSeqHeader: "999999"})
+
+		assertSendBlockedShortly(t, done)
+		if n := f.promptCount(); n != 0 {
+			t.Fatalf("before release: promptCount=%d, want 0 (await must not forward)", n)
+		}
+
+		// Deterministic release: a LIVE session.idle settles the abort (activity
+		// busy→idle, gate opens). The waiter wakes, the fresh CAS passes, and the
+		// send forwards exactly ONE prompt.
+		agg.Store().Apply(ev("session.idle", `{"sessionID":"a"}`))
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Fatal("after idle release: send did not return (await did not unblock)")
+		}
+		if n := f.promptCount(); n != 1 {
+			t.Fatalf("after idle release: promptCount=%d, want EXACTLY 1 (fresh CAS passed → forward one prompt)", n)
+		}
+	})
+
+	t.Run("error_release_unblocks_but_non_sendable_409", func(t *testing.T) {
+		// Deviation from the card's literal "idle/error → 1 prompt": session.error
+		// settles the abort gate (the await unblocks) BUT leaves activity in the
+		// ERROR state, so the fresh SendableNow CAS fails (act != idle). Per the
+		// design's "forward iff the fresh CAS passes, else 409", an error release
+		// therefore 409s. This subtest proves the await unblocks on the error
+		// terminal AND that "continued non-sendability after release" stays 409.
+		f := &fakeOC{}
+		web, agg := newVerbServer(t, f)
+		seedAbortSettling(t, agg)
+
+		done, res := asyncSend(web.URL+"/vh/send", `{"sessionID":"a","text":"follow"}`,
+			map[string]string{ifIdleSeqHeader: "999999"})
+
+		assertSendBlockedShortly(t, done)
+		if n := f.promptCount(); n != 0 {
+			t.Fatalf("before release: promptCount=%d, want 0", n)
+		}
+
+		agg.Store().Apply(ev("session.error", `{"sessionID":"a"}`))
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Fatal("after error release: send did not return (await did not unblock on the error terminal)")
+		}
+		if res.st != http.StatusConflict {
+			t.Fatalf("after error release: status=%d, want 409 (activity=error → fresh CAS fails)", res.st)
+		}
+		if n := f.promptCount(); n != 0 {
+			t.Fatalf("after error release: promptCount=%d, want 0 (non-sendable → no forward)", n)
+		}
+	})
+
+	t.Run("activity_seq_drift_before_release_409", func(t *testing.T) {
+		// providedSeq captured at seed (the abort window's activity seq). An
+		// activity transition during the wait (here: session.status idle, which
+		// bumps activitySeq WITHOUT releasing the gate — NormSessionStatus idle
+		// does not settle the abort) makes the post-release seq CAS stale → 409.
+		f := &fakeOC{}
+		web, agg := newVerbServer(t, f)
+		providedSeq := seedAbortSettling(t, agg)
+
+		done, res := asyncSend(web.URL+"/vh/send", `{"sessionID":"a","text":"follow"}`,
+			map[string]string{ifIdleSeqHeader: strconv.FormatUint(providedSeq, 10)})
+
+		assertSendBlockedShortly(t, done)
+		if n := f.promptCount(); n != 0 {
+			t.Fatalf("before drift: promptCount=%d, want 0", n)
+		}
+
+		// Advance activity-seq WITHOUT releasing the gate.
+		agg.Store().Apply(ev("session.status", `{"sessionID":"a","status":{"type":"idle"}}`))
+		// Then release via the live idle terminal.
+		agg.Store().Apply(ev("session.idle", `{"sessionID":"a"}`))
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Fatal("after release: send did not return")
+		}
+		if res.st != http.StatusConflict {
+			t.Fatalf("after seq drift + release: status=%d, want 409 (activitySeq drifted past If-Idle-Seq)", res.st)
+		}
+		if n := f.promptCount(); n != 0 {
+			t.Fatalf("after seq drift + release: promptCount=%d, want 0 (stale CAS → no forward)", n)
+		}
+	})
+
+	t.Run("request_context_cancelled_returns_no_prompt", func(t *testing.T) {
+		// The await is request-context-cancellable: cancelling the request during
+		// the wait unblocks it with zero prompts forwarded. The done channel is
+		// closed on return so assertSendBlockedShortly proves the send was
+		// genuinely awaiting before the cancel (a pre-consumer immediate 409
+		// would fire done and fail the block assertion).
+		f := &fakeOC{}
+		web, agg := newVerbServer(t, f)
+		seedAbortSettling(t, agg)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			req, _ := http.NewRequestWithContext(ctx, http.MethodPost, web.URL+"/vh/send",
+				bytes.NewBufferString(`{"sessionID":"a","text":"follow"}`))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set(csrfHeader, "1")
+			req.Header.Set(ifIdleSeqHeader, "999999")
+			resp, _ := http.DefaultClient.Do(req)
+			if resp != nil {
+				resp.Body.Close()
+			}
+		}()
+
+		assertSendBlockedShortly(t, done)
+		if n := f.promptCount(); n != 0 {
+			t.Fatalf("before cancel: promptCount=%d, want 0", n)
+		}
+
+		cancel()
+		select {
+		case <-done:
+			// good: the cancelled request returned.
+		case <-time.After(3 * time.Second):
+			t.Fatal("after request cancel: send did not return (await ignored context cancellation)")
+		}
+		if n := f.promptCount(); n != 0 {
+			t.Fatalf("after cancel: promptCount=%d, want 0 (cancellation must not forward)", n)
+		}
+	})
+
+	t.Run("ordinary_non_abort_busy_immediate_409", func(t *testing.T) {
+		// A busy session that is NOT mid-abort (TurnRunning, AbortSettling==false)
+		// must 409 IMMEDIATELY — the await is only for the abort-settlement window.
+		f := &fakeOC{}
+		web, agg := newVerbServer(t, f)
+		s := agg.Store()
+		s.Apply(ev("session.created", `{"info":{"id":"a"}}`))
+		s.Apply(ev("session.status", `{"sessionID":"a","status":{"type":"busy"}}`))
+		if s.AbortSettling("a") {
+			t.Fatal("ordinary running session must have AbortSettling==false")
+		}
+
+		st, _, _ := post(t, web.URL+"/vh/send", `{"sessionID":"a","text":"x"}`,
+			map[string]string{ifIdleSeqHeader: "999999"})
+		if st != http.StatusConflict {
+			t.Fatalf("ordinary non-abort busy must 409 IMMEDIATELY, got %d", st)
+		}
+		if n := f.promptCount(); n != 0 {
+			t.Fatalf("ordinary busy: promptCount=%d, want 0", n)
+		}
+	})
+
+	t.Run("settle_in_snapshot_to_await_window_no_stale_409", func(t *testing.T) {
+		// B1 regression pin (tier1_b from commit-review). The /vh/send CAS path
+		// MUST observe sendability + activitySeq + the abort gate as a SINGLE
+		// atomic snapshot. Under the two-read form, an abort settling in the gap
+		// between the SendableNow read (sendable=false, STALE — the session is
+		// now idle post-settle) and the AbortSettling read (gate=open, FRESH)
+		// left the handler holding a stale sendable=false alongside a fresh
+		// gate-open. The await guard (!sendable && seqCAS && AbortSettling) was
+		// then false, so the handler skipped BOTH WaitAbortSettling AND the
+		// mandatory fresh SendableNow+seq CAS rerun, falling through to
+		// `if !sendable` (stale true) → 409. With a large If-Idle-Seq the fresh
+		// CAS WOULD pass and a prompt SHOULD forward; instead it stale-409'd — a
+		// residual instance of the exact race this slice exists to close.
+		//
+		// This subtest injects the settle DETERMINISTICALLY in the
+		// snapshot→await window via the sendCASPostSnapshotHook (nil in prod) and
+		// asserts the contract holds: no stale 409 — the handler forwards
+		// EXACTLY ONE prompt when the fresh CAS passes. (RED on the two-read
+		// form, where the hook sits between the two reads; GREEN on the single
+		// atomic SendCASState snapshot, where the hook sits after it and the
+		// await re-snapshots authoritatively.)
+		f := &fakeOC{}
+		web, agg := newVerbServer(t, f)
+		seedAbortSettling(t, agg)
+
+		// Hook: settle the abort (live idle → gate opens, activity busy→idle,
+		// activitySeq bumps S→S+1) immediately after the handler's atomic
+		// snapshot, before the await decision. This is the precise settle that
+		// used to land in the read1→read2 gap.
+		sendCASPostSnapshotHook = func(sid string) {
+			if sid == "a" {
+				agg.Store().Apply(ev("session.idle", `{"sessionID":"a"}`))
+			}
+		}
+		t.Cleanup(func() { sendCASPostSnapshotHook = nil })
+
+		// Large If-Idle-Seq (>= the post-settle activitySeq) → the fresh CAS
+		// passes. The handler must forward, not stale-409.
+		st, out, _ := post(t, web.URL+"/vh/send", `{"sessionID":"a","text":"follow"}`,
+			map[string]string{ifIdleSeqHeader: "999999"})
+		if st != 200 || out["ok"] != true {
+			t.Fatalf("B1: settle in snapshot→await window must NOT stale-409; got status=%d body=%v (want 200 ok — fresh CAS passes)", st, out)
+		}
+		if n := f.promptCount(); n != 1 {
+			t.Fatalf("B1: promptCount=%d, want EXACTLY 1 (the fresh CAS forwarded, not a stale 409)", n)
+		}
+	})
+}
+
+// sendResult captures an async /vh/send response for the P7 consumer suite.
+type sendResult struct {
+	st   int
+	body map[string]any
+}
+
 func TestIdempotentSendReplays(t *testing.T) {
 	f := &fakeOC{}
 	web, _ := newVerbServer(t, f)

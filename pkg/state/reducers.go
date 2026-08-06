@@ -320,7 +320,13 @@ func (s *Store) SetActivityFromStatuses(statuses map[string]json.RawMessage) {
 			// re-adopted as running. markTurnRunningLocked also opens the abort
 			// gate if a stop was in flight (the server reporting busy ⇒ the
 			// prior abort settled).
-			s.markTurnRunningLocked(sid)
+			//
+			// D4: this is a RECONCILE-SNAPSHOT busy (turnStartReconcileSnapshot).
+			// markTurnRunningLocked refuses the adoption if the session is
+			// TurnStopping (a draining abort), preserving the gate + settle
+			// timer. A direct LIVE session.status busy (Apply's NormSessionStatus
+			// arm) passes turnStartLive and still adopts unconditionally.
+			s.markTurnRunningLocked(sid, turnStartReconcileSnapshot)
 		}
 	}
 	// Clear everything else. Known sessions and loaded sessions are set idle;
@@ -337,11 +343,12 @@ func (s *Store) SetActivityFromStatuses(statuses map[string]json.RawMessage) {
 			// /session/status snapshot is not running — if a stop was in flight
 			// (TurnStopping) this is the settle signal the periodic reconcile
 			// supplies when OpenCode did not emit session.idle on abort. Settle
-			// the abort (open the gate) and drop to TurnIdle. (The terminal path
-			// in Apply settles faster; this is the bounded-latency backstop.)
+			// the abort (open the gate + wake any /vh/send consumer awaiting it)
+			// and drop to TurnIdle. (The terminal path in Apply settles faster;
+			// this is the bounded-latency backstop.)
 			if s.turnState[sid] == TurnStopping {
 				s.cancelStopTimerLocked(sid)
-				s.abortSettling[sid] = false
+				s.setAbortSettlingLocked(sid, false)
 				delete(s.stopTurnID, sid)
 				s.turnState[sid] = TurnIdle
 			}
@@ -446,6 +453,15 @@ func (s *Store) Apply(ev opencode.Event) {
 			// P7 observed-vs-inferred line applied structurally (two OBSERVED
 			// terminal kinds) rather than by convention.
 			s.liveIdleObserved[ne.SessionID] = true
+			// session.error companion (mirrors session.idle's
+			// completionAuthoritative at :421): an OBSERVED error terminal is
+			// AUTHORITATIVELY over, so a stale reconcile busy from /session/status
+			// must NOT re-adopt the just-error-settled session as TurnRunning.
+			// Without this, the D4 TurnStopping check does not catch the re-adoption
+			// (turnState is already TurnIdle after the error settle), so
+			// completionAuthoritative is the load-bearing guard here — exactly as
+			// it is for session.idle.
+			s.completionAuthoritative[ne.SessionID] = true
 			// P7 turn-state: session.error is a turn TERMINAL. Settle the same
 			// way session.idle does.
 			s.settleTerminalLocked(ne.SessionID)
@@ -458,8 +474,15 @@ func (s *Store) Apply(ev opencode.Event) {
 			// NOT (see the #2696 guard in upsertMessageLocked). markTurnRunningLocked
 			// also opens the abort gate if a stop was in flight (the server
 			// accepting a new turn ⇒ the prior abort settled).
+			//
+			// D4: this is a DIRECT LIVE event (turnStartLive), so it adopts
+			// unconditionally — including during TurnStopping (the server
+			// accepting a new turn ⇒ the prior abort settled ⇒ open the gate).
+			// This is the authoritative counterpart to the reconcile-snapshot
+			// adoption (SetActivityFromStatuses → turnStartReconcileSnapshot),
+			// which D4 refuses during a drain.
 			if normalized == ActivityBusy || normalized == ActivityRetry {
-				s.markTurnRunningLocked(ne.SessionID)
+				s.markTurnRunningLocked(ne.SessionID, turnStartLive)
 			}
 		}
 	case NormMessageUpsert:
@@ -688,6 +711,10 @@ func (s *Store) deleteSessionLocked(id string) {
 	// torn-down entry) and drop the turn-state / abort-gate / pending-turn-id
 	// records. A recreated id starts fresh (TurnIdle, gate open).
 	s.cancelStopTimerLocked(id)
+	// Wake any /vh/send consumer blocked in WaitAbortSettling on this session
+	// before the records go away — its recheck will then report the session gone
+	// (SendableNow exists=false), yielding a clean 404 rather than a wedge.
+	s.signalAbortWaitersLocked(id)
 	delete(s.turnState, id)
 	delete(s.abortSettling, id)
 	delete(s.stopTurnID, id)

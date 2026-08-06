@@ -310,3 +310,136 @@ func TestP7_StopFireSettlesGateWhenNoTerminalArrives(t *testing.T) {
 		t.Errorf("after settle-timer fired: activity=%q, want %q (stopFire idled activity)", got, ActivityIdle)
 	}
 }
+
+// TestP7_D4_ReconcileSnapshotBusyPreservesStopping_LiveBusyAdopts pins the D4
+// fix (the mandatory companion to the /vh/send AbortSettling consumer). A
+// reconcile-SNAPSHOT busy/retry arriving while a session is TurnStopping (a
+// draining abort) is the canceled run's own still-busy status reflected back by
+// /session/status — NOT evidence a new turn started. Without D4,
+// SetActivityFromStatuses re-adopts it as TurnRunning via
+// markTurnRunningLocked, which cancels the settle timer and OPENS the abort
+// gate mid-drain — exactly the race window the consumer exists to close. D4
+// threads a provenance flag (reconcile-snapshot vs live-event) into the busy-
+// adoption path so a reconcile-snapshot busy preserves TurnStopping; a direct
+// LIVE session.status busy stays authoritative new-turn evidence and still
+// transitions to TurnRunning + opens the gate (the server accepting a new turn
+// ⇒ the prior abort settled).
+//
+// Determinism: no real settle timer is relied on for the correctness proof
+// here — state transitions are injected directly (Stop, SetActivityFromStatuses,
+// live session.status). stopStateSnapshot reads the raw timer/gen/gate fields so
+// the assertion can see "timer still armed" without waiting for it.
+func TestP7_D4_ReconcileSnapshotBusyPreservesStopping_LiveBusyAdopts(t *testing.T) {
+	s := New(100)
+	defer s.Close()
+	s.Apply(ev("session.created", evSessionCreated("R", "")))
+	s.Apply(ev("session.status", evStatus("R", "busy"))) // authoritative new turn
+	assertTurn(t, s, "R", TurnRunning, "turn running (authoritative busy)")
+
+	// Stop issued on the in-flight turn: running → stopping, gate CLOSED, settle
+	// timer ARMED.
+	s.Stop("R", "turn1")
+	assertTurn(t, s, "R", TurnStopping, "after Stop")
+	if !s.AbortSettling("R") {
+		t.Fatalf("after Stop: AbortSettling=false, want true (gate CLOSED)")
+	}
+	_, armed, settling, _ := s.stopStateSnapshot("R")
+	if !armed {
+		t.Fatalf("after Stop: settle timer should be ARMED")
+	}
+	if !settling {
+		t.Fatalf("after Stop: abortSettling should be true")
+	}
+
+	// D4 crux #1: a reconcile-SNAPSHOT busy (the periodic /session/status poll
+	// reflecting the still-draining abort) must NOT re-adopt as TurnRunning. It
+	// must preserve TurnStopping (gate closed, settle timer still armed).
+	s.SetActivityFromStatuses(map[string]json.RawMessage{
+		"R": json.RawMessage(`{"type":"busy"}`),
+	})
+	assertTurn(t, s, "R", TurnStopping, "D4: reconcile-snapshot busy during drain must preserve TurnStopping (not re-adopt as Running)")
+	if !s.AbortSettling("R") {
+		t.Errorf("D4: reconcile-snapshot busy must keep the gate CLOSED (drain still in progress)")
+	}
+	_, armedAfterBusy, settlingAfterBusy, _ := s.stopStateSnapshot("R")
+	if !armedAfterBusy {
+		t.Errorf("D4: reconcile-snapshot busy must NOT cancel the settle timer (still armed)")
+	}
+	if !settlingAfterBusy {
+		t.Errorf("D4: reconcile-snapshot busy must NOT clear abortSettling")
+	}
+
+	// D4 crux #2: repeat with retry — same provenance, same preservation.
+	s.SetActivityFromStatuses(map[string]json.RawMessage{
+		"R": json.RawMessage(`{"type":"retry"}`),
+	})
+	assertTurn(t, s, "R", TurnStopping, "D4: reconcile-snapshot retry during drain still preserves TurnStopping")
+	if !s.AbortSettling("R") {
+		t.Errorf("D4: reconcile-snapshot retry must keep the gate CLOSED")
+	}
+	_, armedAfterRetry, _, _ := s.stopStateSnapshot("R")
+	if !armedAfterRetry {
+		t.Errorf("D4: reconcile-snapshot retry must NOT cancel the settle timer")
+	}
+
+	// D4 crux #3: a DIRECT LIVE session.status busy IS authoritative new-turn
+	// evidence — it transitions to TurnRunning and OPENS the gate (the server
+	// accepting a new turn ⇒ the prior abort settled). D4 must not over-block
+	// the legitimate path.
+	s.Apply(ev("session.status", evStatus("R", "busy")))
+	assertTurn(t, s, "R", TurnRunning, "D4: live session.status busy IS authoritative new turn (must adopt)")
+	if s.AbortSettling("R") {
+		t.Errorf("D4: live busy must OPEN the gate (prior abort settled)")
+	}
+	_, armedAfterLive, _, _ := s.stopStateSnapshot("R")
+	if armedAfterLive {
+		t.Errorf("D4: live busy must cancel the settle timer (new turn adopted)")
+	}
+}
+
+// TestP7_SessionErrorCompanion_CompletionAuthoritativeBlocksStaleReconcile pins
+// the session.error companion to the #2696 fold: session.idle arms
+// completionAuthoritative (reducers.go:421) so a stale reconcile busy cannot
+// re-adopt the just-completed turn; session.error must do the SAME (mirror), or
+// a stale reconcile busy arriving after an error terminal re-adopts the
+// error-settled session as TurnRunning (completionAuthoritative is the only
+// guard, since turnState is already TurnIdle after the error settle, so the D4
+// TurnStopping check does not catch it).
+func TestP7_SessionErrorCompanion_CompletionAuthoritativeBlocksStaleReconcile(t *testing.T) {
+	s := New(100)
+	defer s.Close()
+	s.Apply(ev("session.created", evSessionCreated("R", "")))
+	s.Apply(ev("session.status", evStatus("R", "busy")))
+	assertTurn(t, s, "R", TurnRunning, "turn running")
+	s.Stop("R", "turn1")
+	assertTurn(t, s, "R", TurnStopping, "after Stop")
+	if !s.AbortSettling("R") {
+		t.Fatalf("after Stop: gate should be CLOSED")
+	}
+
+	// The canceled run's terminal arrives as a LIVE session.error → the gate
+	// RELEASES and the session settles to TurnIdle. The companion arms
+	// completionAuthoritative so a subsequent stale reconcile busy cannot
+	// re-adopt.
+	s.Apply(ev("session.error", evError("R")))
+	assertTurn(t, s, "R", TurnIdle, "session.error terminal settles to TurnIdle")
+	if s.AbortSettling("R") {
+		t.Errorf("after session.error: gate should be OPEN (terminal settled the abort)")
+	}
+	s.mu.RLock()
+	auth := s.completionAuthoritative["R"]
+	s.mu.RUnlock()
+	if !auth {
+		t.Fatalf("session.error must arm completionAuthoritative (the companion mirror of session.idle) — without it a stale reconcile busy re-adopts")
+	}
+
+	// Stale reconcile busy arrives (the /session/status snapshot predates the
+	// error). It must NOT re-adopt the error-settled session as TurnRunning.
+	s.SetActivityFromStatuses(map[string]json.RawMessage{
+		"R": json.RawMessage(`{"type":"busy"}`),
+	})
+	assertTurn(t, s, "R", TurnIdle, "companion: stale reconcile busy after error must NOT re-adopt (completionAuthoritative holds)")
+	if got := s.Snapshot(nil).Activity["R"]; got == ActivityBusy {
+		t.Errorf("companion: stale reconcile busy after error re-escalated activity to %q — completionAuthoritative must force it to idle", got)
+	}
+}

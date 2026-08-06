@@ -49,14 +49,19 @@
 //	      BLOCK on an inference). F4 folded session.error in.
 //	  (b) SendableNow CAS rejection — LIVE: turnState != TurnStopping in
 //	      SendableNow (snapshots.go) is consumed by the production CAS send path
-//	      (pkg/web/verbs.go:113-121), so post-abort sends return 409 Conflict
+//	      (pkg/web/verbs.go), so post-abort sends return 409 Conflict
 //	      during the ~completionGrace Stopping window (intended fail-closed shift).
-//	  (c) AbortSettling await — the INTENDED caller contract for a FOLLOW-UP
-//	      dispatch slice (the awaitRunnerQuiescence analog: a new turn's caller
-//	      would await AbortSettling at the top of its start path). NO production
-//	      caller consumes AbortSettling today — only tests + this doc reference
-//	      it. The current live production behavior is the SendableNow 409 window
-//	      (b), NOT an AbortSettling await.
+//	  (c) AbortSettling await — LIVE (P7 Slice 1): the /vh/send CAS path
+//	      (pkg/web/verbs.go) is the FIRST production caller. A CAS-bearing send
+//	      rejected solely by an active abort settlement (not sendable, fresh seq,
+//	      AbortSettling==true) awaits WaitAbortSettling, then reruns the full
+//	      SendableNow + seq CAS; it forwards exactly one prompt iff the fresh
+//	      CAS passes, else 409. Gate release is NOT send authority. The D4
+//	      reconcile-snapshot provenance fix (markTurnRunningLocked) ships in
+//	      lockstep so a stale /session/status busy cannot re-open the gate
+//	      mid-drain and defeat the wait. Scope (Option C): /vh/send ONLY — the
+//	      SPA /oc/* path is structurally protected by the activity↔gate atomic
+//	      invariant (a reopener card tracks gating it too).
 //
 //	settle-timer fallback (stopFire): OpenCode does NOT emit session.idle on
 //	  abort (reducers.go:249 / verbs.go:261), so the terminal that opens the
@@ -82,7 +87,10 @@
 //	  idle supersedes a stale busy snapshot, so the snapshot is not re-adopted.
 package state
 
-import "time"
+import (
+	"context"
+	"time"
+)
 
 // TurnState is the per-session turn-boundary state (the P7 state machine). It is
 // distinct from the activity map's idle|busy|retry|error UI indicator: a session
@@ -128,7 +136,7 @@ func (s *Store) stopLocked(sessionID, canceledTurnID string) {
 		return
 	}
 	s.turnState[sessionID] = TurnStopping
-	s.abortSettling[sessionID] = true
+	s.setAbortSettlingLocked(sessionID, true) // arms the gate + the wait channel
 	s.stopTurnID[sessionID] = canceledTurnID
 	s.armStopTimerLocked(sessionID)
 }
@@ -151,15 +159,46 @@ func (s *Store) TurnState(sessionID string) TurnState {
 // abort is session-scoped and outlives the stop that issued it, so a new turn
 // that races the settling abort would double-drive the runner. This is a pure
 // GATE: the state layer reports open/closed; the new turn's CALLER polls/awaits
-// it and starts the turn itself (caller-driven — the state layer never
-// auto-starts a pending turn). Closed by Stop; opened by the canceled run's
-// terminal (session.idle|error), an authoritative new turn start, or the settle
-// timer.
+// it (WaitAbortSettling) and starts the turn itself (caller-driven — the state
+// layer never auto-starts a pending turn). Closed by Stop; opened by the
+// canceled run's terminal (session.idle|error), an authoritative new turn
+// start, the periodic reconcile clear, or the settle timer.
+//
+// PRODUCTION CONSUMER (P7 Slice 1): the /vh/send CAS path (pkg/web/verbs.go)
+// awaits this gate via WaitAbortSettling for a CAS-bearing send rejected solely
+// by an active abort settlement. The D4 reconcile-snapshot provenance fix
+// (markTurnRunningLocked) keeps a stale /session/status busy from re-opening the
+// gate mid-drain.
 func (s *Store) AbortSettling(sessionID string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.abortSettling[sessionID]
 }
+
+// turnStartSource is the provenance flag threaded into the busy-adoption path
+// (markTurnRunningLocked). It distinguishes AUTHORITATIVE new-turn evidence (a
+// direct LIVE session.status busy|retry event) from a RECONCILE-SNAPSHOT busy
+// (the periodic /session/status poll). The D4 fix keys on it: a reconcile-
+// snapshot busy arriving while a session is TurnStopping (a draining abort) is
+// the canceled run's own still-busy status reflected back — NOT a new turn — so
+// it must preserve TurnStopping; a live busy is authoritative new-turn evidence
+// and may still transition to TurnRunning + open the gate.
+type turnStartSource int
+
+const (
+	// turnStartLive: a direct LIVE session.status busy|retry event (Apply →
+	// NormSessionStatus arm). Authoritative new-turn evidence — proceeds
+	// unconditionally, including during TurnStopping (the server accepting a new
+	// turn ⇒ the prior abort settled ⇒ open the gate).
+	turnStartLive turnStartSource = iota
+	// turnStartReconcileSnapshot: a /session/status snapshot busy/retry
+	// (SetActivityFromStatuses). NOT authoritative new-turn evidence — the
+	// snapshot is async and may reflect a still-draining abort. D4: if the
+	// session is TurnStopping, preserve it (do NOT call
+	// markTurnRunningLocked's transition body, do NOT clear abortSettling, do
+	// NOT cancel the settle timer).
+	turnStartReconcileSnapshot
+)
 
 // markTurnRunningLocked transitions a session to TurnRunning on AUTHORITATIVE
 // runner status (session.status busy|retry, or on-subscribe reconcile adoption).
@@ -168,12 +207,30 @@ func (s *Store) AbortSettling(sessionID string) bool {
 // enforced in upsertMessageLocked). A genuine new turn clears the prior turn's
 // authority (completionAuthoritative) and, if a stop was in flight, opens the
 // abort gate (the server accepting a new turn ⇒ the prior abort settled ⇒ the
-// caller-driven awaitRunnerQuiescence succeeds). Caller holds s.mu.
-func (s *Store) markTurnRunningLocked(sessionID string) {
+// caller-driven awaitRunnerQuiescence succeeds).
+//
+// D4 (source discriminator): a RECONCILE-SNAPSHOT busy (source ==
+// turnStartReconcileSnapshot) arriving while the session is TurnStopping is the
+// canceled run's own still-busy status reflected back by /session/status — NOT a
+// new turn. It must NOT re-adopt as TurnRunning (which would clear
+// abortSettling, cancel the settle timer, and open the gate mid-drain — exactly
+// the race window the /vh/send AbortSettling consumer exists to close). It
+// returns early, preserving TurnStopping. A LIVE session.status busy
+// (turnStartLive) stays authoritative new-turn evidence and proceeds
+// unconditionally. Caller holds s.mu.
+func (s *Store) markTurnRunningLocked(sessionID string, source turnStartSource) {
+	if source == turnStartReconcileSnapshot && s.turnState[sessionID] == TurnStopping {
+		// D4: the reconcile snapshot is reflecting the still-draining abort, not a
+		// new turn. Preserve TurnStopping (gate closed, settle timer armed). The
+		// activity-side busy/retry is still recorded by setActivityAtLocked (the
+		// spinner stays on — the run is still draining), which is correct; only
+		// the turn-boundary adoption is refused.
+		return
+	}
 	delete(s.completionAuthoritative, sessionID)
 	delete(s.liveIdleObserved, sessionID)
 	s.cancelStopTimerLocked(sessionID)
-	s.abortSettling[sessionID] = false
+	s.setAbortSettlingLocked(sessionID, false) // opens the gate + wakes waiters
 	delete(s.stopTurnID, sessionID)
 	s.turnState[sessionID] = TurnRunning
 }
@@ -193,7 +250,7 @@ func (s *Store) settleTerminalLocked(sessionID string) {
 	switch s.turnState[sessionID] {
 	case TurnStopping:
 		s.cancelStopTimerLocked(sessionID)
-		s.abortSettling[sessionID] = false
+		s.setAbortSettlingLocked(sessionID, false) // opens the gate + wakes waiters
 		delete(s.stopTurnID, sessionID)
 		s.turnState[sessionID] = TurnIdle
 	case TurnRunning:
@@ -261,6 +318,84 @@ func (s *Store) cancelAllStopTimersLocked() {
 	}
 }
 
+// setAbortSettlingLocked is the single mutator for the abort gate + its wait
+// channel. setting=true arms the gate (Stop closing it) and creates the
+// one-shot wait channel if absent; setting=false opens the gate (terminal /
+// settle timer / authoritative new turn / reconcile clear) and closes the wait
+// channel, waking any /vh/send consumer blocked in WaitAbortSettling.
+// Centralizing the mutation here guarantees no gate-opening site misses a
+// wake-up. Caller holds s.mu.
+func (s *Store) setAbortSettlingLocked(sessionID string, setting bool) {
+	if setting {
+		s.abortSettling[sessionID] = true
+		if _, ok := s.abortWaitCh[sessionID]; !ok {
+			s.abortWaitCh[sessionID] = make(chan struct{})
+		}
+		return
+	}
+	s.abortSettling[sessionID] = false
+	if ch, ok := s.abortWaitCh[sessionID]; ok {
+		close(ch)
+		delete(s.abortWaitCh, sessionID)
+	}
+}
+
+// signalAbortWaitersLocked closes the wait channel for sessionID if one exists,
+// waking any blocked WaitAbortSettling caller without touching abortSettling
+// itself. Used at session-teardown (deleteSessionLocked) to wake any blocked
+// WaitAbortSettling caller before the session records are deleted, yielding a
+// clean 404 on the caller's recheck (the gate-open sites that clear
+// abortSettling route through setAbortSettlingLocked, which closes the channel
+// inline; teardown deletes the map entry outright, so it signals separately).
+// Caller holds s.mu.
+func (s *Store) signalAbortWaitersLocked(sessionID string) {
+	if ch, ok := s.abortWaitCh[sessionID]; ok {
+		close(ch)
+		delete(s.abortWaitCh, sessionID)
+	}
+}
+
+// WaitAbortSettling blocks until sessionID's abort gate opens
+// (AbortSettling==false) or ctx is cancelled. Returns true if the gate opened
+// (or was already open), false on ctx cancellation.
+//
+// This is the caller-driven awaitRunnerQuiescence analog CONSUMED by the
+// /vh/send CAS path: a CAS-bearing send rejected solely by an active abort
+// settlement awaits the gate before rerunning the full SendableNow + seq CAS.
+// Gate release is NOT send authority — the caller MUST re-check sendability +
+// seq CAS after this returns (the session may have settled to idle, errored, or
+// a new turn may have started). Does not change AbortSettling's signature or
+// semantics; it is a new consumer of the existing gate.
+//
+// The wake is event-driven (a per-session channel closed at every gate-opening
+// site via setAbortSettlingLocked / signalAbortWaitersLocked), so the happy-path
+// latency is the gate-open event itself, not a poll interval. A spurious true
+// return (e.g. the channel was closed for a prior settle and a new Stop re-armed
+// the gate before the caller re-checked) is safe because the caller's recheck is
+// authoritative.
+func (s *Store) WaitAbortSettling(ctx context.Context, sessionID string) bool {
+	s.mu.RLock()
+	if !s.abortSettling[sessionID] {
+		s.mu.RUnlock()
+		return true
+	}
+	ch := s.abortWaitCh[sessionID]
+	s.mu.RUnlock()
+	if ch == nil {
+		// abortSettling is true but no wait channel — unreachable if stopLocked
+		// created both (the invariant setAbortSettlingLocked maintains), but
+		// fail OPEN: treat as settled so the caller's recheck decides
+		// authoritatively rather than wedging.
+		return true
+	}
+	select {
+	case <-ch:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
 // stopFire is the settle-timer callback. It runs on a time.AfterFunc goroutine.
 // Under s.mu it re-checks stopGen (abort if superseded by a terminal / new turn
 // / cancel / hydrate), then force-settles: opens the gate, drops the
@@ -274,13 +409,14 @@ func (s *Store) cancelAllStopTimersLocked() {
 // it infers a NORMAL turn-end (a stale /session/status must not re-strand the
 // completed turn); stopFire infers an ABORTED turn-end, and aborts do not emit
 // session.idle, so there is no live-idle observation to pin the guard on here.
-// Whether stopFire (and the session.error terminal path) SHOULD set
-// completionAuthoritative to block a stale busy from re-escalating an
-// abort/error-settled session is the F4 deferred question (open). Today neither
-// path arms the guard — a stale busy snapshot post-settle is handled by the
-// SetActivityFromStatuses completionAuthoritative guard only when session.idle
-// or graceFire set it earlier, NOT by this path. See upsertMessageLocked's
-// liveIdleObserved discriminator for the #2696 line.
+// The session.error terminal path — the other OBSERVED-terminal half of the F4
+// question — DOES arm completionAuthoritative now (the session.error companion
+// in reducers.go mirrors session.idle's :421 arm, so a stale reconcile busy
+// cannot re-adopt an error-settled session). stopFire alone stays un-armed by
+// this F5 omission; a stale busy snapshot after a stopFire settle is handled by
+// the SetActivityFromStatuses completionAuthoritative guard only when
+// session.idle, session.error, or graceFire set it earlier, NOT by this path.
+// See upsertMessageLocked's liveIdleObserved discriminator for the #2696 line.
 func (s *Store) stopFire(sessionID string, gen uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -289,7 +425,7 @@ func (s *Store) stopFire(sessionID string, gen uint64) {
 		// hydrate bumped stopGen after this timer captured it.
 	}
 	delete(s.stopTimers, sessionID)
-	s.abortSettling[sessionID] = false
+	s.setAbortSettlingLocked(sessionID, false) // opens the gate + wakes waiters
 	delete(s.stopTurnID, sessionID)
 	s.turnState[sessionID] = TurnIdle
 	// Authoritative idle clear (the deferred MarkIdle). setActivityLocked is a

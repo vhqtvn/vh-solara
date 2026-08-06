@@ -53,6 +53,14 @@ func (coordinationFeature) Routes(svc Services) map[string]http.HandlerFunc {
 // idempotency key travels in the request body, not a header.
 const ifIdleSeqHeader = "If-Idle-Seq"
 
+// sendCASPostSnapshotHook is a test-only instrumentation hook for the B1
+// regression test. It is invoked immediately after the /vh/send CAS path reads
+// its sendability snapshot, before the await decision — letting the test
+// deterministically inject an abort settle in the snapshot→await window (the
+// TOCTOU the two-read form suffered). nil in production (zero overhead: the
+// handler nil-checks before calling). The hook MUST NOT block.
+var sendCASPostSnapshotHook func(sessionID string)
+
 // outcome values classify a verb result so a caller parsing the JSON body (not
 // headers) can classify it for its accounting. ONLY "created" means a new session
 // was minted (counting); all others are non-counting.
@@ -110,17 +118,61 @@ func (h coordHandlers) send(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "invalid "+ifIdleSeqHeader+" header", http.StatusBadRequest)
 			return
 		}
-		sendable, activitySeq, exists := agg.Store().SendableNow(body.SessionID)
+		// P7 AbortSettling consumer (F6): sendability + activitySeq + the abort
+		// gate are observed as ONE atomic snapshot (SendCASState, single RLock)
+		// so an abort settling in the gap between a sendability read and a gate
+		// read cannot leave the handler with a stale sendable + a fresh
+		// gate-open — the B1 TOCTOU that stale-409'd a send whose fresh CAS
+		// would have forwarded. A CAS-bearing send rejected with a FRESH seq
+		// while an abort is actively settling (the snapshot's abortSettling==true)
+		// AWAITS the gate, then reruns the FULL snapshot + seq CAS. Gate release
+		// is NOT send authority — it permits a fresh CAS, nothing more. This is
+		// the FIRST production caller of AbortSettling; it closes the race where
+		// a /vh/send would 409 through a draining abort and force the caller to
+		// retry. The await is request-context-cancellable.
+		//
+		// Scope (Option C): /vh/send ONLY. All other 409 conditions stay
+		// immediate — a stale If-Idle-Seq (seqCAS==false) never awaits; an
+		// ordinary non-abort busy (abortSettling==false) never awaits; and any
+		// continued non-sendability after release (the settle left activity in
+		// error, a new turn started, a question/permission is pending, ...) is
+		// caught by the post-await full CAS recheck and 409s. The D4 fix
+		// (markTurnRunningLocked reconcile-snapshot provenance) ships in
+		// lockstep so a stale /session/status busy cannot re-open the gate
+		// mid-drain and defeat this wait.
+		sendable, activitySeq, exists, abortSettling := agg.Store().SendCASState(body.SessionID)
 		if !exists {
 			http.Error(w, "unknown session", http.StatusNotFound)
 			return
 		}
-		if !sendable {
-			http.Error(w, "session not sendable (busy/blocked) — CAS precondition failed", http.StatusConflict)
+		// seqCAS holds iff the session's activity has not changed since the
+		// caller's snapshot — the compare half of the compare-and-swap.
+		seqCAS := activitySeq <= providedSeq
+
+		// Test-only hook (B1 regression): inject a settle in the snapshot→await
+		// window. nil in production.
+		if sendCASPostSnapshotHook != nil {
+			sendCASPostSnapshotHook(body.SessionID)
+		}
+
+		if !sendable && seqCAS && abortSettling {
+			agg.Store().WaitAbortSettling(r.Context(), body.SessionID)
+			// Rerun the FULL atomic snapshot + seq CAS after release. Gate
+			// release is NOT send authority — this re-snapshot decides.
+			sendable, activitySeq, exists, abortSettling = agg.Store().SendCASState(body.SessionID)
+			if !exists {
+				http.Error(w, "unknown session", http.StatusNotFound)
+				return
+			}
+			seqCAS = activitySeq <= providedSeq
+		}
+
+		if !seqCAS {
+			http.Error(w, "session changed since If-Idle-Seq — CAS precondition failed", http.StatusConflict)
 			return
 		}
-		if activitySeq > providedSeq {
-			http.Error(w, "session changed since If-Idle-Seq — CAS precondition failed", http.StatusConflict)
+		if !sendable {
+			http.Error(w, "session not sendable (busy/blocked) — CAS precondition failed", http.StatusConflict)
 			return
 		}
 	}

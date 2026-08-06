@@ -1037,12 +1037,34 @@ func (s *Store) computeSubtreeBusyLocked() map[string]bool {
 // pending question or permission (those need a typed reply, not a message).
 // exists is false for an unknown session. This is a raw mechanism check; the
 // decision to *use* it (i.e. whether to gate a send) belongs to the caller.
+//
+// It delegates to SendCASState (the atomic single-observation form) and drops
+// the abort-gate leg — callers that need sendability AND the gate together (the
+// /vh/send CAS consumer) MUST call SendCASState directly so an abort settling in
+// the gap between a sendability read and a gate read cannot leave them with a
+// stale sendable + a fresh gate-open (the B1 TOCTOU).
 func (s *Store) SendableNow(sid string) (sendable bool, activitySeq uint64, exists bool) {
+	sendable, activitySeq, exists, _ = s.SendCASState(sid)
+	return sendable, activitySeq, exists
+}
+
+// SendCASState is the atomic single-observation form of the /vh/send CAS gate:
+// it returns sendability, the activity seq (for If-Idle-Seq CAS), session
+// existence, AND the abort-settlement gate (AbortSettling) under ONE RLock. The
+// /vh/send consumer MUST observe all four together: under the two-read form, an
+// abort settling between a SendableNow read (sendable=false, stale) and an
+// AbortSettling read (gate=open, fresh) left the handler skipping BOTH the await
+// and the mandatory fresh CAS rerun, stale-409ing a send whose fresh CAS would
+// have forwarded — a residual instance of the exact race this slice closes (B1).
+// Observing under a single lock makes the snapshot consistent: the settle is
+// either fully before (sendable reflects the idle post-settle) or fully after
+// (gate still closed), never the inconsistent split. SendableNow delegates here.
+func (s *Store) SendCASState(sid string) (sendable bool, activitySeq uint64, exists bool, abortSettling bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	se := s.sessions[sid]
 	if se == nil {
-		return false, 0, false
+		return false, 0, false, false
 	}
 	act := s.activity[sid]
 	if act == "" {
@@ -1058,8 +1080,9 @@ func (s *Store) SendableNow(sid string) (sendable bool, activitySeq uint64, exis
 	// until its terminal. (The fail-closed abort gate AbortSettling is
 	// invariant with TurnStopping — Stop sets both, settle clears both — so
 	// checking TurnStopping here is sufficient; the gate itself is reported
-	// separately for the caller-driven awaitRunnerQuiescence the dispatch path
-	// will consume in a future slice.)
+	// separately and consumed by the /vh/send CAS path via WaitAbortSettling,
+	// which awaits it for a CAS-bearing send rejected solely by an active abort
+	// settlement before rerunning this full SendableNow + seq CAS.)
 	stopping := s.turnState[sid] == TurnStopping
 	sendable = act == ActivityIdle &&
 		!stopping &&
@@ -1067,7 +1090,7 @@ func (s *Store) SendableNow(sid string) (sendable bool, activitySeq uint64, exis
 		!inflight &&
 		len(s.questions[sid]) == 0 &&
 		len(s.perms[sid]) == 0
-	return sendable, s.activitySeq[sid], true
+	return sendable, s.activitySeq[sid], true, s.abortSettling[sid]
 }
 
 // Head returns the current head seq without building a full snapshot — for

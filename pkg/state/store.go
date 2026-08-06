@@ -667,6 +667,13 @@ type Store struct {
 	stopTurnID    map[string]string
 	stopTimers    map[string]*time.Timer
 	stopGen       map[string]uint64
+	// abortWaitCh carries a per-session one-shot notification channel closed when
+	// the abort gate opens (abortSettling → false), waking any /vh/send
+	// consumer blocked in WaitAbortSettling. Created when Stop closes the gate;
+	// closed+deleted at every gate-opening site (terminal, settle timer,
+	// authoritative new turn, reconcile clear, session delete). Managed via
+	// setAbortSettlingLocked so no open-site misses a wake-up.
+	abortWaitCh map[string]chan struct{}
 	// liveIdleObserved distinguishes OBSERVED terminals (session.idle,
 	// session.error) from an INFERRED one (graceFire). The #2696 guard
 	// (upsertMessageLocked) blocks on observed terminals only.
@@ -1048,6 +1055,7 @@ func NewWithConfig(cfg Config) (*Store, error) {
 		stopTurnID:       map[string]string{},
 		stopTimers:       map[string]*time.Timer{},
 		stopGen:          map[string]uint64{},
+		abortWaitCh:      map[string]chan struct{}{},
 		liveIdleObserved: map[string]bool{},
 		// P7 slice #3: the versioned opencode→NormalizedEvent translator. Default
 		// to the current event shape (v1); Apply routes through Translate.
