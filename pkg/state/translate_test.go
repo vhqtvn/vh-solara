@@ -139,3 +139,101 @@ func TestTranslatorV1_ToolCallPartCallIDPrecedence(t *testing.T) {
 		}
 	})
 }
+
+// TestResolveToolCallIdentity_FallThrough pins the two NON-happy fall-through
+// contracts of resolveToolCallIdentity that were previously unpinned by an
+// executable assertion (a prior review DEFER flagged the gap). Both fall-throughs
+// return the zero tuple (partTool=false, resolved="", ok=false), which tells the
+// translator to LEAVE THE PART ALONE — no identity resolution and no callId-driven
+// drop; the part is then subject to the handler's own validity guard.
+//
+// This is a CHARACTERIZATION test (it pins current behavior), NOT TDD-red: it is
+// expected to pass against the current implementation and FAIL if a later change
+// violates the documented fall-through contract:
+//
+//   - parse-fail must NOT panic, must NOT be conflated with a tool part
+//     (partTool stays false), and must NOT fabricate an identity (resolved
+//     stays ""). A panic surfaces as a normal test failure, so simply running
+//     the function under each malformed input pins the no-panic guarantee.
+//   - a non-tool part must NOT be misclassified as a tool call (partTool stays
+//     false) and must NOT synthesize an identity (resolved stays "").
+//
+// resolveToolCallIdentity is package-private, so this test lives in package
+// state and calls it directly — exercising the EXACT fall-through code paths in
+// translate.go (the two `return false, "", false` statements) rather than only
+// their downstream Translate-level effect.
+func TestResolveToolCallIdentity_FallThrough(t *testing.T) {
+	// --- (a) parse-FAIL: malformed / unparseable part sub-blobs. ---
+	// Every input below makes json.Unmarshal(part, &meta) return a non-nil
+	// error (syntax error OR a type mismatch — array/string/number into a
+	// struct). The contract is a graceful fall-through to the zero tuple.
+	t.Run("parse_fail_no_panic_no_fabricated_identity", func(t *testing.T) {
+		cases := []struct {
+			name  string
+			input string
+		}{
+			{"truncated_garbage", `{bad json`},
+			{"truncated_object_mid_field", `{"type":"tool",`},
+			{"json_array_into_struct", `[1,2,3]`},
+			{"json_string_into_struct", `"a string"`},
+			{"json_number_into_struct", `42`},
+		}
+		for _, c := range cases {
+			t.Run(c.name, func(t *testing.T) {
+				// A panic here (e.g. if a future change panics on parse error)
+				// fails the test outright — pinning the no-panic guarantee.
+				partTool, resolved, ok := resolveToolCallIdentity(json.RawMessage(c.input))
+				if partTool {
+					t.Errorf("parse-fail input %q: partTool=true, want false "+
+						"(a parse error must NOT be conflated with a tool part; "+
+						"the part is left to the handler's own validity guard, "+
+						"not the callId-driven drop)", c.input)
+				}
+				if resolved != "" {
+					t.Errorf("parse-fail input %q: resolved=%q, want empty "+
+						"(a parse error must NOT fabricate/synthesize an identity; "+
+						"only wire-carried fields are used, never synthesized)", c.input, resolved)
+				}
+				if ok {
+					t.Errorf("parse-fail input %q: ok=true, want false "+
+						"(an unparseable part does not survive identity resolution)", c.input)
+				}
+			})
+		}
+	})
+
+	// --- (b) NON-TOOL: a parseable part that is genuinely not a tool call. ---
+	// These all parse cleanly but meta.Type != "tool", so the rule (which is
+	// tool-call-specific) does not apply and no identity is produced.
+	t.Run("non_tool_no_identity_synthesized", func(t *testing.T) {
+		cases := []struct {
+			name  string
+			input string
+		}{
+			{"type_text", `{"id":"t1","type":"text","text":"hi"}`},
+			{"type_reasoning", `{"id":"r1","type":"reasoning"}`},
+			{"type_file", `{"id":"f1","type":"file"}`},
+			{"type_absent", `{"id":"p1"}`},
+			{"type_empty_string", `{"id":"p2","type":""}`},
+		}
+		for _, c := range cases {
+			t.Run(c.name, func(t *testing.T) {
+				partTool, resolved, ok := resolveToolCallIdentity(json.RawMessage(c.input))
+				if partTool {
+					t.Errorf("non-tool input %q: partTool=true, want false "+
+						"(the rule is tool-call-specific (type:\"tool\"); a non-tool "+
+						"part must NOT be misclassified as a tool call)", c.input)
+				}
+				if resolved != "" {
+					t.Errorf("non-tool input %q: resolved=%q, want empty "+
+						"(a non-tool part must NOT synthesize a tool-call identity; "+
+						"identity resolution applies only to type:\"tool\")", c.input, resolved)
+				}
+				if ok {
+					t.Errorf("non-tool input %q: ok=true, want false "+
+						"(a non-tool part is not a tool-call survival/drop decision)", c.input)
+				}
+			})
+		}
+	})
+}
