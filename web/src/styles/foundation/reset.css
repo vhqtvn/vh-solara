@@ -8,4 +8,16 @@ html, body, #root {
      their own scrolling and only stop the chain via overscroll-behavior. */
   overscroll-behavior: none;
   overflow: hidden;
+  /* Block browser pinch-zoom at the CSS level. `pan-x pan-y` keeps horizontal +
+     vertical scrolling/panning but disables pinch/rotation. Do NOT use
+     `manipulation` here — per spec that value still ALLOWS pinch-zoom. This is
+     the PRIMARY pinch-block for Android Edge (and iOS Safari), which IGNORE
+     user-scalable=no in the viewport meta (see web/index.html and
+     prefs.ts setViewportScale) — Android Chrome honors that meta, Edge/iOS do
+     not (their own zoom policy overrides it), so this meta-independent layer is
+     required. Belt-and-suspenders: a 2+-finger touchmove preventDefault in
+     viewport.ts covers browsers where touch-action alone is insufficient. The
+     per-component touch-action declarations below (manipulation on buttons, none
+     on drag handles) intentionally override this for those elements. */
+  touch-action: pan-x pan-y;
 }

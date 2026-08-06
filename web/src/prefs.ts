@@ -50,6 +50,11 @@ function setViewportScale(scale: number) {
   // slider (Settings) remains the single, deliberate zoom control, so WCAG 1.4.4
   // (resize text/zoom) is still satisfied — just not via a gesture that breaks the
   // layout model.
+  // NOTE: this meta is honored by Android Chrome but IGNORED by Android Edge and
+  // iOS Safari (their zoom policy overrides user-scalable=no), so two more
+  // meta-independent layers enforce the same pinch block: CSS `touch-action:
+  // pan-x pan-y` on the document root (foundation/reset.css) and a 2+-finger
+  // touchmove preventDefault (viewport.ts).
   const s = scale.toFixed(2);
   meta?.setAttribute(
     "content",
