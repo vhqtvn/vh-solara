@@ -28,6 +28,7 @@ package state
 //      with a race guard so a live idle supersedes a stale busy snapshot.
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
 	"time"
@@ -442,4 +443,203 @@ func TestP7_SessionErrorCompanion_CompletionAuthoritativeBlocksStaleReconcile(t 
 	if got := s.Snapshot(nil).Activity["R"]; got == ActivityBusy {
 		t.Errorf("companion: stale reconcile busy after error re-escalated activity to %q — completionAuthoritative must force it to idle", got)
 	}
+}
+
+// TestP7_WaitAbortSettling_SpuriousWakeAfterRearm_RecheckAuthoritative pins DEFER
+// finding p7-d1: the "spurious true return is safe" doc claim at
+// turn_state.go:370-375. The interleaving the claim rests on:
+//  1. Stop#1 → TurnStopping, gate closed (channel A armed).
+//  2. A CAS-bearing /vh/send awaits in WaitAbortSettling (parked on channel A).
+//  3. Release#1 (live idle/error or reconcile-clear) opens the gate — channel A
+//     is closed+deleted under s.mu via setAbortSettlingLocked.
+//  4. Stop#2 is issued on the now-TurnIdle session → re-arms a FRESH channel B
+//     (gate closed again), TurnStopping.
+//  5. The stale waiter (parked on channel A from step 2) wakes — channel A was
+//     closed by release#1.
+//  6. The post-await FULL SendCASState+seq CAS recheck (the exact call the
+//     /vh/send handler makes at verbs.go:162) sees the NEW TurnStopping →
+//     sendable=false, abortSettling=true → the handler 409s with ZERO prompts
+//     forwarded.
+//
+// WHY THE STATE LAYER (not the verbs layer): pinning this EXACT interleaving at
+// the verbs layer requires Stop#2's re-arm to land in the race window between
+// channel-A-close (release#1) and the handler's recheck — a window inside
+// production code (verbs.go:159-162) with no test hook, and non-deterministic
+// under -race (the waiter goroutine's SendCASState RLock can win against Stop#2's
+// Lock, observing TurnIdle and forwarding instead of 409). The state layer runs
+// the WHOLE interleaving sequentially on one goroutine (the channel close +
+// re-arm are synchronous under s.mu), so the recheck deterministically observes
+// Stop#2's TurnStopping. The recheck here is the SAME SendCASState call the
+// verbs handler uses (snapshots.go:1062), so a sendable=false result is EXACTLY
+// what produces 409 + zero prompts at the verbs layer (verbs.go:174-177). No
+// production code is modified.
+func TestP7_WaitAbortSettling_SpuriousWakeAfterRearm_RecheckAuthoritative(t *testing.T) {
+	s := New(100)
+	defer s.Close()
+	s.Apply(ev("session.created", evSessionCreated("R", "")))
+	s.Apply(ev("session.status", evStatus("R", "busy"))) // authoritative new turn
+
+	// Stop#1: TurnStopping, gate closed, channel A armed.
+	s.Stop("R", "turn1")
+	if !s.AbortSettling("R") {
+		t.Fatalf("Stop#1: AbortSettling should be true (gate closed)")
+	}
+
+	// Capture channel A — exactly what WaitAbortSettling does internally
+	// (turn_state.go:382: ch := s.abortWaitCh[sessionID] under RLock, then parks
+	// on <-ch). The stale waiter holds this reference for the whole wait.
+	s.mu.RLock()
+	chA := s.abortWaitCh["R"]
+	s.mu.RUnlock()
+	if chA == nil {
+		t.Fatalf("Stop#1: abort wait channel A should be armed")
+	}
+
+	// Release#1: a LIVE session.idle settles the abort — setAbortSettlingLocked(false)
+	// (turn_state.go:336-340) closes channel A and deletes it from the map; the
+	// session goes TurnIdle.
+	s.Apply(ev("session.idle", evIdle("R")))
+	if s.AbortSettling("R") {
+		t.Fatalf("Release#1: AbortSettling should be false (gate opened, channel A closed)")
+	}
+	// The map entry is gone (closed+deleted), but chA is still a valid reference
+	// to the now-closed channel — the stale waiter holds exactly this reference.
+	s.mu.RLock()
+	_, stillMapped := s.abortWaitCh["R"]
+	s.mu.RUnlock()
+	if stillMapped {
+		t.Fatalf("Release#1: abortWaitCh[R] should be deleted (channel closed+removed)")
+	}
+
+	// Stop#2: the session is TurnIdle (NOT TurnStopping), so stopLocked runs the
+	// FULL body (turn_state.go:138-141) — re-arms a FRESH channel B,
+	// abortSettling=true, TurnStopping.
+	s.Stop("R", "turn2")
+	if !s.AbortSettling("R") {
+		t.Fatalf("Stop#2: AbortSettling should be true again (gate re-armed)")
+	}
+	s.mu.RLock()
+	chB := s.abortWaitCh["R"]
+	s.mu.RUnlock()
+	if chB == nil {
+		t.Fatalf("Stop#2: a FRESH abort wait channel B should be armed")
+	}
+	if chB == chA {
+		t.Fatalf("Stop#2: channel B must be a FRESH channel, not the reused channel A")
+	}
+
+	// Step 5 — the stale waiter (holding the chA reference from step 2) wakes.
+	// channel A was closed by release#1, so this receive returns immediately —
+	// the "spurious true return" the doc claim names. Non-blocking by construction.
+	select {
+	case <-chA:
+		// good: the stale waiter woke (channel A was closed by release#1).
+	default:
+		t.Fatalf("stale waiter: channel A should be closed (spurious wake), but receive blocked")
+	}
+
+	// Step 6 — the caller's AUTHORITATIVE recheck. This is the exact SendCASState
+	// call the /vh/send handler makes after WaitAbortSettling returns
+	// (verbs.go:162). It must see Stop#2's NEW TurnStopping → sendable=false.
+	// That sendable=false is what yields 409 + ZERO prompts at the verbs layer
+	// (verbs.go:174-177); the spurious wake does NOT become send authority.
+	sendable, _, exists, abortSettling := s.SendCASState("R")
+	if !exists {
+		t.Fatalf("recheck: session should still exist (Stop#2 did not delete it)")
+	}
+	if sendable {
+		t.Errorf("recheck: SendableNow=true, want false (Stop#2 re-armed TurnStopping — the fresh recheck catches the new stop; the spurious wake must NOT become send authority)")
+	}
+	if !abortSettling {
+		t.Errorf("recheck: AbortSettling=false, want true (Stop#2 re-armed the gate)")
+	}
+
+	// The FRESH channel B is still armed (open) — a FUTURE waiter would block on
+	// it, confirming Stop#2 genuinely re-armed a new gate (not a no-op idempotent
+	// return that left channel A's closed state in place).
+	select {
+	case <-chB:
+		t.Errorf("channel B: should still be OPEN (a fresh waiter would block on it), but it was already closed")
+	default:
+		// good: channel B is open (armed) — the new gate is genuinely closed.
+	}
+}
+
+// TestP7_StopFireReleasesWaiter pins DEFER finding p7-d2 (settle-timer release
+// path): stopFire (the settle-timer callback, turn_state.go:420-435) opens the
+// abort gate + idles activity under s.mu, which must wake a blocked
+// WaitAbortSettling caller so its post-await SendCASState recheck runs and
+// observes the now-idle, sendable session. This is the NORMAL production
+// gate-open path because OpenCode does NOT emit session.idle on abort
+// (reducers.go:249 / verbs.go:261), so the terminal that opens the gate may
+// never arrive — stopFire is the bounded-latency backstop.
+//
+// Bounded liveness check (per the task's determinism discipline): uses a
+// shortened completionGrace so the test does NOT rely on the real 5s settle
+// timer for its correctness proof — only for the bounded "the timer does fire
+// and release the waiter" liveness observation, matching
+// TestP7_StopFireSettlesGateWhenNoTerminalArrives. The OUTCOME is deterministic
+// regardless of host scheduling: after stopFire the session is stably
+// TurnIdle+ActivityIdle, so the waiter's recheck always observes sendable=true.
+func TestP7_StopFireReleasesWaiter(t *testing.T) {
+	s := mustNew(t, withCompletionGrace(DefaultConfig(100), 25*time.Millisecond))
+	defer s.Close()
+
+	s.Apply(ev("session.created", evSessionCreated("R", "")))
+	s.Apply(ev("session.status", evStatus("R", "busy"))) // authoritative new turn
+	s.Stop("R", "turn1")                                 // TurnStopping, gate closed, settle timer armed
+	if !s.AbortSettling("R") {
+		t.Fatalf("after Stop: AbortSettling should be true (gate closed)")
+	}
+
+	// Launch the waiter: WaitAbortSettling + the post-await SendCASState recheck
+	// (the exact pair the /vh/send handler runs at verbs.go:159-162). It parks on
+	// the abort wait channel until stopFire closes it. A bounded ctx guards
+	// against a wedge leaking the goroutine if the test fails mid-flight.
+	type recheck struct {
+		opened   bool
+		sendable bool
+		exists   bool
+	}
+	done := make(chan recheck, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		opened := s.WaitAbortSettling(ctx, "R")
+		sendable, _, exists, _ := s.SendCASState("R")
+		done <- recheck{opened, sendable, exists}
+	}()
+
+	// The waiter must be genuinely blocked BEFORE the settle timer fires (RED
+	// signal: a broken gate would not park the waiter at all). 10ms < 25ms timer,
+	// and plenty for goroutine startup + the RLock/park.
+	select {
+	case <-done:
+		t.Fatal("waiter returned before stopFire fired — it did NOT await (gate was not closed / consumer missing)")
+	case <-time.After(10 * time.Millisecond):
+		// good: still parked before the 25ms settle window expires.
+	}
+
+	// stopFire force-opened the gate + idled activity. Wait for the waiter to
+	// unblock and run its recheck.
+	select {
+	case got := <-done:
+		if !got.opened {
+			t.Errorf("WaitAbortSettling returned opened=false, want true (stopFire opened the gate)")
+		}
+		if !got.exists {
+			t.Fatalf("recheck: session should still exist after stopFire")
+		}
+		if !got.sendable {
+			t.Errorf("recheck: SendableNow=false, want true (stopFire idled activity + went TurnIdle → sendable)")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("waiter did not unblock after the settle window — stopFire did not release it")
+	}
+
+	// Confirm stopFire settled the session (the authoritative ground truth).
+	if s.AbortSettling("R") {
+		t.Errorf("after stopFire: AbortSettling=true, want false (gate opened)")
+	}
+	assertTurn(t, s, "R", TurnIdle, "after stopFire (settle timer idled the session)")
 }

@@ -1239,3 +1239,140 @@ func TestReplyPermissionAlreadyClearedMapsTo410(t *testing.T) {
 		t.Fatalf("reply to a cleared permission should map 404→410, got %d", st)
 	}
 }
+
+// TestP7_SendCASAwaitAbortSettling_ReconcileClearRelease pins DEFER finding
+// p7-d2 (reconcile-clear release path). The existing consumer suite
+// (TestP7_SendCASAwaitAbortSettling) only exercises the LIVE idle and LIVE error
+// release paths; this adds the RECONCILE-CLEAR release: SetActivityFromStatuses
+// idling a TurnStopping session opens the gate via the clearActivity closure
+// (reducers.go:337-356 → setAbortSettlingLocked(false) under s.mu). The waiter
+// must unblock, the post-await FULL SendCASState+seq CAS recheck must run, and
+// the documented outcome holds: a fresh CAS (large If-Idle-Seq) forwards EXACTLY
+// ONE prompt (TurnIdle + activity idle → sendable).
+//
+// Determinism: the OUTCOME is deterministic regardless of host scheduling. After
+// the reconcile-clear release the session is stably TurnIdle+ActivityIdle (no
+// concurrent mutation), so the waiter's recheck always observes sendable=true —
+// the only timing-dependent part is goroutine scheduling, never the result.
+func TestP7_SendCASAwaitAbortSettling_ReconcileClearRelease(t *testing.T) {
+	f := &fakeOC{}
+	web, agg := newVerbServer(t, f)
+	s := agg.Store()
+	s.Apply(ev("session.created", `{"info":{"id":"a"}}`))
+	s.Apply(ev("session.status", `{"sessionID":"a","status":{"type":"busy"}}`))
+	s.Stop("a", "turn1") // TurnStopping, gate closed, settle timer armed
+	if !s.AbortSettling("a") {
+		t.Fatal("seed: AbortSettling should be true after Stop")
+	}
+
+	// providedSeq huge ⇒ the seq CAS passes after release; only the abort window
+	// blocks the initial send.
+	res := &sendResult{}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		st, out, _ := post(t, web.URL+"/vh/send", `{"sessionID":"a","text":"follow"}`,
+			map[string]string{ifIdleSeqHeader: "999999"})
+		res.st, res.body = st, out
+	}()
+
+	// RED signal: the send must be genuinely blocked in WaitAbortSettling before
+	// release (a missing/broken consumer would 409 immediately).
+	select {
+	case <-done:
+		t.Fatal("send returned before reconcile-clear release — it did NOT await AbortSettling (consumer missing/broken)")
+	case <-time.After(100 * time.Millisecond):
+		// good: still blocked → it is awaiting.
+	}
+	if n := f.promptCount(); n != 0 {
+		t.Fatalf("before release: promptCount=%d, want 0 (await must not forward)", n)
+	}
+
+	// Release via reconcile-clear: the periodic /session/status snapshot reports
+	// "a" as idle. SetActivityFromStatuses's clearActivity closure
+	// (reducers.go:337-356) sees !busy["a"], idles activity, and — because the
+	// session is TurnStopping — settles the abort: cancelStopTimerLocked +
+	// setAbortSettlingLocked(false) (opens the gate + wakes the waiter) +
+	// TurnIdle. This is the bounded-latency backstop for the case OpenCode did
+	// not emit session.idle on abort.
+	s.SetActivityFromStatuses(map[string]json.RawMessage{
+		"a": json.RawMessage(`{"type":"idle"}`),
+	})
+
+	select {
+	case <-done:
+		// good: the waiter unblocked.
+	case <-time.After(3 * time.Second):
+		t.Fatal("after reconcile-clear release: send did not return (waiter did not unblock — clearActivity did not open the gate)")
+	}
+	if res.st != 200 || res.body["ok"] != true {
+		t.Fatalf("reconcile-clear release: status=%d body=%v, want 200 ok (fresh CAS passed → forward one prompt)", res.st, res.body)
+	}
+	if n := f.promptCount(); n != 1 {
+		t.Fatalf("reconcile-clear release: promptCount=%d, want EXACTLY 1 (fresh CAS passed → forward one prompt, not a stale 409)", n)
+	}
+}
+
+// TestP7_SendCASAwaitAbortSettling_SessionDeleteYields404 pins DEFER finding
+// p7-d2 (session-delete release path). At session teardown,
+// deleteSessionLocked (reducers.go:592) deletes s.sessions[id] and THEN calls
+// signalAbortWaitersLocked (reducers.go:717), which closes the wait channel —
+// waking any blocked WaitAbortSettling caller — before the turn-state records
+// are deleted. The woken caller's post-await SendCASState recheck then sees
+// exists=false (the session is gone) and the handler returns a clean 404, NOT a
+// stale forward or a wedge (the caller parked on a channel whose map entry was
+// deleted outright, so it would never unblock without this explicit signal).
+//
+// Determinism: the OUTCOME is deterministic regardless of host scheduling. After
+// session.deleted the session is stably gone (no concurrent mutation), so the
+// waiter's recheck always observes exists=false → 404.
+func TestP7_SendCASAwaitAbortSettling_SessionDeleteYields404(t *testing.T) {
+	f := &fakeOC{}
+	web, agg := newVerbServer(t, f)
+	s := agg.Store()
+	s.Apply(ev("session.created", `{"info":{"id":"a"}}`))
+	s.Apply(ev("session.status", `{"sessionID":"a","status":{"type":"busy"}}`))
+	s.Stop("a", "turn1") // TurnStopping, gate closed
+	if !s.AbortSettling("a") {
+		t.Fatal("seed: AbortSettling should be true after Stop")
+	}
+
+	res := &sendResult{}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		st, out, _ := post(t, web.URL+"/vh/send", `{"sessionID":"a","text":"follow"}`,
+			map[string]string{ifIdleSeqHeader: "999999"})
+		res.st, res.body = st, out
+	}()
+
+	// RED signal: the send must be genuinely blocked before teardown.
+	select {
+	case <-done:
+		t.Fatal("send returned before session-delete — it did NOT await AbortSettling (consumer missing/broken)")
+	case <-time.After(100 * time.Millisecond):
+		// good: still blocked → it is awaiting.
+	}
+	if n := f.promptCount(); n != 0 {
+		t.Fatalf("before delete: promptCount=%d, want 0", n)
+	}
+
+	// Release via session teardown: session.deleted → deleteSessionLocked. It
+	// deletes s.sessions["a"] (line 668) and then calls signalAbortWaitersLocked
+	// (line 717), closing the wait channel the waiter is parked on. The waiter's
+	// recheck SendCASState → se == nil → exists=false → 404.
+	s.Apply(ev("session.deleted", `{"info":{"id":"a"}}`))
+
+	select {
+	case <-done:
+		// good: the waiter unblocked.
+	case <-time.After(3 * time.Second):
+		t.Fatal("after session-delete: send did not return (waiter did not unblock — signalAbortWaitersLocked did not wake it)")
+	}
+	if res.st != http.StatusNotFound {
+		t.Fatalf("session-delete release: status=%d, want 404 (session gone — the recheck sees exists=false, not a stale forward or hang)", res.st)
+	}
+	if n := f.promptCount(); n != 0 {
+		t.Fatalf("session-delete release: promptCount=%d, want 0 (session gone → no forward)", n)
+	}
+}
