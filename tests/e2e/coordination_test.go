@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/vhqtvn/vh-solara/pkg/mcp"
+	"github.com/vhqtvn/vh-solara/pkg/state"
 )
 
 // cluster is shared across the package: one real controller + tunneled worker +
@@ -122,6 +123,13 @@ func TestE2E_SpawnSendAbortOverTunnel(t *testing.T) {
 // The settle window is armed by a stable busy (Fake.EmitSessionBusy — no
 // [[stall]] 5s sleep, no [[perm]]/[[ask]] pending blocker), so nothing competes
 // with the deterministic seam release.
+//
+// Parking determinism (p7-d4): the CAS send's PARKING in the await is proven
+// via the waitAbortSettlingParkHook (fired at the commit-to-park point inside
+// the worker's WaitAbortSettling), NOT by an elapsed-time sleep — so a release
+// landing before the goroutine parked cannot pass the test vacuously. The hook
+// is reachable because the harness is in-process: the worker's pkg/state
+// package var IS the test's package var (same process, same binary).
 func TestE2E_AbortSettleSendOverTunnel(t *testing.T) {
 	// spawnAbortSettle brings a FRESH spawned session into the abort-settle
 	// window: a real spawn over the tunnel, a deterministic busy via the fixture
@@ -188,19 +196,51 @@ func TestE2E_AbortSettleSendOverTunnel(t *testing.T) {
 		return done, res
 	}
 
-	// assertAwaiting proves the CAS send is genuinely blocked in the
-	// AbortSettling await: it has NOT returned within a generous in-process
-	// window AND the fake OpenCode has received ZERO prompts for it (the
-	// consumer forwards only AFTER the gate opens). A pre-consumer immediate
-	// 409/200 would close done and fail this assertion — the RED signal for a
-	// missing/broken consumer or a gate that was not actually closed.
-	assertAwaiting := func(t *testing.T, done <-chan struct{}, sid string) {
+	// armParkHook installs the deterministic parked-observable for the P7
+	// await-path. The e2e harness is fully in-process (StartCluster runs the
+	// controller daemon + worker agent + worker web server in one process), so
+	// the worker's pkg/state package-level waitAbortSettlingParkHook var is the
+	// SAME instance the test reaches via state.SetWaitAbortSettlingParkHookForTest.
+	// The hook fires at the COMMIT-TO-PARK point inside the worker's
+	// WaitAbortSettling (gate confirmed closed under RLock, wait channel in hand,
+	// blocking select is the very next statement), so receiving the signal
+	// deterministically proves the CAS send goroutine parked on the abort gate
+	// BEFORE the terminal release is injected. This replaces the prior 150ms
+	// elapsed-time barrier as the sole parking proof, which could pass vacuously
+	// under scheduler delay (the release landing before the goroutine parked →
+	// fast-path return → the test passes without exercising the await-unblock
+	// path). A broken/missing consumer that immediate-409s would never reach
+	// the park point → the bounded-liveness timeout fails the test. The hook is
+	// reset in t.Cleanup so each sub-test owns it cleanly.
+	armParkHook := func(t *testing.T, sid string) <-chan struct{} {
+		t.Helper()
+		parked := make(chan struct{}, 1)
+		state.SetWaitAbortSettlingParkHookForTest(func(s string) {
+			if s == sid {
+				select {
+				case parked <- struct{}{}:
+				default:
+				}
+			}
+		})
+		t.Cleanup(func() { state.SetWaitAbortSettlingParkHookForTest(nil) })
+		return parked
+	}
+
+	// assertAwaiting proves the CAS send is genuinely parked in the worker's
+	// AbortSettling await: the park hook fired at the commit-to-park point (the
+	// send goroutine is blocked on the abort gate channel) AND the fake OpenCode
+	// has received ZERO prompts for it (the consumer forwards only AFTER the
+	// gate opens). A pre-consumer immediate 409/200 would never fire the park
+	// hook → the bounded-liveness timeout fails this assertion — the RED signal
+	// for a missing/broken consumer or a gate that was not actually closed.
+	assertAwaiting := func(t *testing.T, parked <-chan struct{}, sid string) {
 		t.Helper()
 		select {
-		case <-done:
-			t.Fatal("CAS send returned before release — it did NOT await AbortSettling (consumer missing/broken, or gate was not closed)")
-		case <-time.After(150 * time.Millisecond):
-			// good: still blocked after a generous in-process window → it is awaiting.
+		case <-parked:
+			// good: the CAS send goroutine parked in the worker's WaitAbortSettling.
+		case <-time.After(5 * time.Second):
+			t.Fatal("CAS send did not park in WaitAbortSettling — consumer missing/broken, or park hook did not fire over the tunnel")
 		}
 		if n := cluster.Fake.PromptArrivals(sid); n != 0 {
 			t.Fatalf("during await: PromptArrivals=%d, want 0 (await must not forward to OpenCode)", n)
@@ -214,8 +254,9 @@ func TestE2E_AbortSettleSendOverTunnel(t *testing.T) {
 
 	t.Run("idle_release_forwards_exactly_one_prompt", func(t *testing.T) {
 		sid := spawnAbortSettle(t)
+		parked := armParkHook(t, sid)
 		done, res := asyncCASSend(sid, freshCAS)
-		assertAwaiting(t, done, sid)
+		assertAwaiting(t, parked, sid)
 
 		// Deterministic release: a LIVE session.idle through the real /event
 		// stream settles the abort (busy→idle, gate opens, TurnIdle). The waiter
@@ -242,8 +283,9 @@ func TestE2E_AbortSettleSendOverTunnel(t *testing.T) {
 		// forwarded there is no subsequent busy churn, so the snapshot's gate
 		// activity settles to "error" and stays there.
 		sid := spawnAbortSettle(t)
+		parked := armParkHook(t, sid)
 		done, res := asyncCASSend(sid, freshCAS)
-		assertAwaiting(t, done, sid)
+		assertAwaiting(t, parked, sid)
 
 		cluster.Fake.EmitSessionTerminal(sid, "session.error")
 		select {
