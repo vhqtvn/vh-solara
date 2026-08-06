@@ -99,6 +99,67 @@ export async function archiveSession(
   return affected;
 }
 
+// DeleteDriftError is thrown by deleteSession on a 409 (descendants_changed):
+// the affected session set's MEMBERSHIP changed between preview and commit. Same
+// shape + contract as ArchiveDriftError (the caller re-fetches descendants and
+// re-shows the confirmation dialog WITHOUT auto-retrying — the operator must
+// re-consent, which is doubly important for a destructive, irreversible op).
+// Kept as a distinct type so a dialog can branch on delete-vs-archive semantics.
+export class DeleteDriftError extends Error {
+  readonly currentAffected: string[];
+  readonly currentFingerprint: string;
+  constructor(currentAffected: string[], currentFingerprint: string) {
+    super("delete drifted: the affected session set changed between preview and commit");
+    this.name = "DeleteDriftError";
+    this.currentAffected = currentAffected;
+    this.currentFingerprint = currentFingerprint;
+  }
+}
+
+// Delete a session and all its subsessions. DESTRUCTIVE and IRREVERSIBLE — there
+// is no undelete. Returns the affected ids. Mirrors archiveSession (same C5
+// drift fence via expectedFingerprint, same prune tail). If the currently-
+// selected session was deleted, the selection is cleared.
+export async function deleteSession(
+  id: string,
+  expectedFingerprint?: string,
+): Promise<string[]> {
+  const res = await fetch("/vh/delete", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sessionID: id, expectedFingerprint }),
+  });
+  // C5: 409 is the drift signal — throw a typed error so the caller can
+  // distinguish "the set changed, re-preview" from a transport/server failure.
+  if (res.status === 409) {
+    const j = await res.json().catch(() => ({}));
+    const cur = ((j && j.current) || {}) as {
+      fingerprint?: string;
+      affected?: string[];
+    };
+    throw new DeleteDriftError(cur.affected ?? [], cur.fingerprint ?? "");
+  }
+  // Surface failures instead of mapping any error to `affected: []`.
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`delete failed (${res.status}): ${body || res.statusText}`);
+  }
+  const j = await res.json().catch(() => ({}));
+  const affected: string[] = j.affected || [];
+  // Deleted sessions are permanently gone — the backend deletes their queue
+  // state server-side (handleDelete clears .vh-solara/sessions/<id>/queue.json
+  // for each affected session). Prune the local cache so the UI drops them
+  // immediately (same tail as archiveSession).
+  if (affected.length) {
+    clearReadAnchors(affected);
+    clearQueueCache(affected);
+    markRead((n) => affected.includes(n.sessionID || ""));
+    for (const id of affected) pruneSessionDeleted(id);
+  }
+  if (selectedId() && affected.includes(selectedId()!)) setSelectedId(null);
+  return affected;
+}
+
 export async function unarchiveSession(id: string): Promise<string[]> {
   const res = await fetch("/vh/unarchive", {
     method: "POST",

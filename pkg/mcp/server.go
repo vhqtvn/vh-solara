@@ -226,6 +226,8 @@ func toolDefs() []map[string]any {
 			}, "session_id", "permission_id", "reply")},
 		{"name": "archive_session", "description": "Archive a session (and its subtree). Archive only a confirmed-done session — it leaves the live view.",
 			"inputSchema": objSchema(map[string]any{"worker": worker, "session_id": strProp("session id"), "dir": dir}, "session_id")},
+		{"name": "delete_session", "description": "Delete a session and its whole subtree. DESTRUCTIVE and IRREVERSIBLE — there is no undelete. The session (and every subsession) is permanently removed from OpenCode.",
+			"inputSchema": objSchema(map[string]any{"worker": worker, "session_id": strProp("session id"), "dir": dir}, "session_id")},
 	}
 }
 
@@ -302,6 +304,8 @@ func (s *Server) buildCall(name, worker, dir string, args map[string]any) (metho
 			return http.MethodPost, "/vh/reply-permission", dirVals(dir, nil), b, csrf, nil
 		case "archive_session":
 			return http.MethodPost, "/vh/archive", dirVals(dir, nil), map[string]any{"sessionID": sid}, csrf, nil
+		case "delete_session":
+			return http.MethodPost, "/vh/delete", dirVals(dir, nil), map[string]any{"sessionID": sid}, csrf, nil
 		}
 		return "", "", nil, nil, nil, fmt.Errorf("unknown tool: %s", name)
 	}
@@ -341,6 +345,8 @@ func (s *Server) buildCall(name, worker, dir string, args map[string]any) (metho
 		return http.MethodPost, workerPath(worker, "/sessions/"+url.PathEscape(sid)+"/permissions/"+url.PathEscape(str(args, "permission_id"))), dirVals(dir, nil), b, nil, nil
 	case "archive_session":
 		return http.MethodPost, workerPath(worker, "/sessions/"+url.PathEscape(sid)+"/archive"), dirVals(dir, nil), nil, nil, nil
+	case "delete_session":
+		return http.MethodPost, workerPath(worker, "/sessions/"+url.PathEscape(sid)+"/delete"), dirVals(dir, nil), nil, nil, nil
 	}
 	return "", "", nil, nil, nil, fmt.Errorf("unknown tool: %s", name)
 }

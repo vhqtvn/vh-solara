@@ -13,6 +13,11 @@ export interface MenuTarget {
 
 const [menuTarget, setMenuTarget] = createSignal<MenuTarget | null>(null);
 const [archiveTarget, setArchiveTarget] = createSignal<{ id: string; title: string } | null>(null);
+// deleteTarget is the destructive-delete confirmation target. Parallel to
+// archiveTarget (delete is irreversible, so it gets its own confirm dialog with
+// explicit irreversibility copy). Only one of {archiveTarget, deleteTarget} is
+// ever set at a time (both close the menu before opening their confirm).
+const [deleteTarget, setDeleteTarget] = createSignal<{ id: string; title: string } | null>(null);
 
 export function openSessionMenu(id: string, title: string, x: number | null, y: number | null) {
   setMenuTarget({ id, title, x, y });
@@ -26,6 +31,13 @@ export function openArchiveConfirm(id: string, title: string) {
 }
 export function closeArchiveConfirm() {
   setArchiveTarget(null);
+}
+export function openDeleteConfirm(id: string, title: string) {
+  setMenuTarget(null);
+  setDeleteTarget({ id, title });
+}
+export function closeDeleteConfirm() {
+  setDeleteTarget(null);
 }
 
 // Reusable trigger handlers for an element representing a session title.
@@ -57,4 +69,4 @@ export function menuTriggers(id: () => string, title: () => string) {
   };
 }
 
-export { menuTarget, archiveTarget };
+export { menuTarget, archiveTarget, deleteTarget };

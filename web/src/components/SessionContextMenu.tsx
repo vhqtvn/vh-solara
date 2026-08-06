@@ -15,14 +15,17 @@ import {
 import { groupOf, tagsOf } from "../sync/treeSelectors";
 import { exportSessionMarkdown } from "../export";
 import { pushNotification } from "../notify";
-import { archiveSession, fetchDescendants, ArchiveDriftError, type SessionSummary } from "../archive";
+import { archiveSession, deleteSession, fetchDescendants, ArchiveDriftError, DeleteDriftError, type SessionSummary } from "../archive";
 import { withGlobalBusy } from "../busy";
 import {
   archiveTarget,
   closeArchiveConfirm,
+  closeDeleteConfirm,
   closeSessionMenu,
+  deleteTarget,
   menuTarget,
   openArchiveConfirm,
+  openDeleteConfirm,
 } from "../sessionMenu";
 import { displayName } from "../projectSettings";
 import Icon from "./Icon";
@@ -65,6 +68,7 @@ export default function SessionContextMenu() {
     if (e.key === "Escape") {
       closeSessionMenu();
       closeArchiveConfirm();
+      closeDeleteConfirm();
     }
   };
   onMount(() => document.addEventListener("keydown", onKey));
@@ -455,6 +459,15 @@ export default function SessionContextMenu() {
         >
           <Icon name="layers" size={14} /> Archive…
         </button>
+        {/* Delete is DESTRUCTIVE and IRREVERSIBLE (no undelete). Placed below
+            Archive and marked danger; the confirm dialog spells out permanence. */}
+        <button
+          type="button"
+          class="ctxm-item danger"
+          onClick={() => openDeleteConfirm(props.id, props.title)}
+        >
+          <Icon name="trash" size={14} /> Delete…
+        </button>
       </>
     );
   }
@@ -496,6 +509,72 @@ export default function SessionContextMenu() {
           return; // do NOT closeArchiveConfirm — re-show for re-consent
         }
         throw e; // non-drift errors propagate to withGlobalBusy's caller
+      }
+    });
+  }
+
+  // Delete confirmation descendant preview — parallel to the archive effect
+  // above. Same optimistic seed + stale-response suppression (a monotonic
+  // deleteReqId discards a prior in-flight response if the target changed).
+  // Kept as SEPARATE state so the archive and delete dialogs never cross-talk
+  // (only one is open at a time, but independent state is the safer mirror).
+  const [deleteRelatedItems, setDeleteRelatedItems] = createSignal<SessionSummary[]>([]);
+  const [deleteRelatedFingerprint, setDeleteRelatedFingerprint] = createSignal<string>("");
+  let deleteReqId = 0;
+  createEffect(() => {
+    const t = deleteTarget();
+    if (!t) {
+      setDeleteRelatedItems([]);
+      setDeleteRelatedFingerprint("");
+      return;
+    }
+    setDeleteRelatedItems([{ id: t.id, title: t.title }]);
+    setDeleteRelatedFingerprint("");
+    const myReq = ++deleteReqId;
+    void (async () => {
+      try {
+        const resp = await fetchDescendants(t.id);
+        if (myReq !== deleteReqId) return; // superseded by a later open
+        const list = resp.data?.descendants || [];
+        if (list.length) setDeleteRelatedItems(list);
+        setDeleteRelatedFingerprint(resp.data?.fingerprint ?? "");
+      } catch {
+        // Keep the optimistic single-item list on failure (fail-open, no fence).
+      }
+    })();
+  });
+
+  async function doDelete() {
+    const t = deleteTarget();
+    if (!t) return;
+    await withGlobalBusy(async () => {
+      try {
+        await deleteSession(t.id, deleteRelatedFingerprint());
+        closeDeleteConfirm();
+      } catch (e) {
+        if (e instanceof DeleteDriftError) {
+          // C5 drift (mirrors doArchive): the affected set changed between
+          // preview and commit, the server deleted NOTHING (409). Re-fetch +
+          // re-show against the CURRENT set. NO auto-retry — for a destructive,
+          // irreversible op the operator MUST re-consent to the new set.
+          const myReq = ++deleteReqId;
+          try {
+            const resp = await fetchDescendants(t.id);
+            if (myReq !== deleteReqId) return; // superseded by a reopen
+            const list = resp.data?.descendants || [];
+            if (list.length) setDeleteRelatedItems(list);
+            setDeleteRelatedFingerprint(resp.data?.fingerprint ?? "");
+            pushNotification({
+              kind: "info",
+              sessionID: t.id,
+              title: "Affected sessions changed — review and confirm again",
+            });
+          } catch {
+            // Re-fetch failed: leave the dialog on the (now-stale) list.
+          }
+          return; // do NOT closeDeleteConfirm — re-show for re-consent
+        }
+        throw e;
       }
     });
   }
@@ -559,6 +638,48 @@ export default function SessionContextMenu() {
               </button>
               <button type="button" class="confirm-go" onClick={doArchive}>
                 Archive {relatedItems().length > 1 ? `${relatedItems().length} sessions` : "session"}
+              </button>
+            </div>
+          </div>
+        </div>
+      </Show>
+
+      {/* Delete confirmation — DESTRUCTIVE and IRREVERSIBLE. Lists all related
+          sessions (same descendant preview as archive) and makes permanence
+          explicit in the lead copy. */}
+      <Show when={deleteTarget()}>
+        <div class="dialog-overlay" onClick={closeDeleteConfirm}>
+          <div class="dialog confirm" role="dialog" aria-label="Confirm delete" onClick={(e) => e.stopPropagation()}>
+            <div class="dialog-head">
+              <span class="dialog-title">Delete session</span>
+              <button type="button" class="icon-btn" aria-label="Close" onClick={closeDeleteConfirm}>
+                <Icon name="x" />
+              </button>
+            </div>
+            <div class="dialog-body">
+              <p class="confirm-lead">
+                This will <strong>permanently delete</strong>{" "}
+                <strong>{deleteRelatedItems().length}</strong>{" "}
+                {deleteRelatedItems().length === 1 ? "session" : "sessions"} (the session and all its
+                subsessions). <strong>This cannot be undone.</strong>
+              </p>
+              <ul class="confirm-list">
+                <For each={deleteRelatedItems()}>
+                  {(s, i) => (
+                    <li classList={{ root: i() === 0 }}>
+                      <span class="confirm-title">{displayName(s.title || s.id)}</span>
+                      <span class="confirm-id">{s.id}</span>
+                    </li>
+                  )}
+                </For>
+              </ul>
+            </div>
+            <div class="confirm-actions">
+              <button type="button" class="confirm-cancel" onClick={closeDeleteConfirm}>
+                Cancel
+              </button>
+              <button type="button" class="confirm-go" onClick={doDelete}>
+                Delete {deleteRelatedItems().length > 1 ? `${deleteRelatedItems().length} sessions` : "session"}
               </button>
             </div>
           </div>

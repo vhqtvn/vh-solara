@@ -162,7 +162,7 @@ func Generate(version string) string {
 	p("## Multi-project (one worker, many project dirs)\n\n")
 	p("- A worker multiplexes one instance per project DIR (own store/epoch/seq). A session is\n")
 	p("  owned by the dir it was created under. Pass the SAME `?dir=<dir>` (or `x-opencode-directory`\n")
-	p("  header) on EVERY verb (snapshot/stream/send/spawn/abort/answer/reply/archive); omitting it\n")
+	p("  header) on EVERY verb (snapshot/stream/send/spawn/abort/answer/reply/archive/delete); omitting it\n")
 	p("  targets the default project — mismatched dir silently hits the wrong (often empty) instance.\n")
 	p("- `GET /vh/projects` → `[{dir, epoch, seq, roots, running}]` lists the bridged instances; pin your\n")
 	p("  watch cursor to one project's (epoch, seq). Cross-machine: `/api/workers/{id}/projects`.\n\n")
@@ -201,7 +201,7 @@ func Generate(version string) string {
 	p("the controller today — they are worker-local; reach them on the worker's own /vh/* edge (or its\n")
 	p("UDS). The controller's `/api/workers/{id}/*` mirrors the skill/projects/views/sessions/events\n")
 	p("surface — `skill/emit`, `projects`, `views`, the `sessions` reads + act-verbs\n")
-	p("(send/spawn/abort/archive/answer-question/reply-permission under `/sessions/*`), and the `events` SSE\n")
+	p("(send/spawn/abort/archive/delete/answer-question/reply-permission under `/sessions/*`), and the `events` SSE\n")
 	p("stream — not these docs.\n\n")
 
 	p("### Labels (root-session groups + tags) — per-project\n\n")

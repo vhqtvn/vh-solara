@@ -1356,6 +1356,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/vh/quota", s.handleQuota)
 	mux.HandleFunc("/vh/archive", s.handleArchive)
 	mux.HandleFunc("/vh/unarchive", s.handleArchive)
+	// POST /vh/delete {sessionID, expectedFingerprint?} — delete a session and
+	// its subtree (DESTRUCTIVE, irreversible; OpenCode auto-cascades). Mirrors
+	// /vh/archive's cascade + C5 drift fence + RemoveSessions/queue/pins tail,
+	// minus the archive re-assert goroutine. See pkg/web/delete.go.
+	mux.HandleFunc("/vh/delete", s.handleDelete)
 	// Backend-authoritative per-session message queue (GET/POST list+enqueue,
 	// claim, resolve, delete). Under /vh/* (beside the other write verbs), NOT
 	// under /oc/* which stays a transparent proxy. Method-routed via Go 1.22

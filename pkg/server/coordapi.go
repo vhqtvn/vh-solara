@@ -22,6 +22,7 @@ import (
 //	POST   /api/workers/{id}/sessions/{sid}/message            → /vh/send
 //	DELETE /api/workers/{id}/sessions/{sid}                    → /vh/abort
 //	POST   /api/workers/{id}/sessions/{sid}/archive            → /vh/archive
+//	POST   /api/workers/{id}/sessions/{sid}/delete             → /vh/delete
 //	POST   /api/workers/{id}/sessions/{sid}/questions/{qid}    → /vh/answer-question
 //	POST   /api/workers/{id}/sessions/{sid}/permissions/{pid}  → /vh/reply-permission
 //	GET    /api/workers/{id}/events                            → /vh/stream  (SSE)
@@ -48,6 +49,7 @@ func (d *Daemon) registerCoordRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /api/workers/{id}/sessions/{sid}", d.coordAbort)
 	mux.HandleFunc("POST /api/workers/{id}/sessions/{sid}/message", d.coordMessage)
 	mux.HandleFunc("POST /api/workers/{id}/sessions/{sid}/archive", d.coordArchive)
+	mux.HandleFunc("POST /api/workers/{id}/sessions/{sid}/delete", d.coordDelete)
 	mux.HandleFunc("POST /api/workers/{id}/sessions/{sid}/questions/{qid}", d.coordAnswerQuestion)
 	mux.HandleFunc("POST /api/workers/{id}/sessions/{sid}/permissions/{pid}", d.coordReplyPermission)
 	mux.HandleFunc("GET /api/workers/{id}/events", d.coordEvents)
@@ -296,6 +298,17 @@ func (d *Daemon) coordArchive(w http.ResponseWriter, r *http.Request) {
 	}
 	body := map[string]any{"sessionID": r.PathValue("sid")}
 	d.proxyToVH(w, r, worker, http.MethodPost, "/vh/archive", dirQuery(r, nil), body)
+}
+
+// coordDelete proxies a destructive subtree delete through to the worker's
+// /vh/delete. Mirrors coordArchive (POST + sessionID path-param injection).
+func (d *Daemon) coordDelete(w http.ResponseWriter, r *http.Request) {
+	worker, ok := d.coordWorker(w, r)
+	if !ok {
+		return
+	}
+	body := map[string]any{"sessionID": r.PathValue("sid")}
+	d.proxyToVH(w, r, worker, http.MethodPost, "/vh/delete", dirQuery(r, nil), body)
 }
 
 func (d *Daemon) coordAnswerQuestion(w http.ResponseWriter, r *http.Request) {

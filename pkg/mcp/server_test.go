@@ -142,7 +142,7 @@ func TestToolsListHasVerbs(t *testing.T) {
 	for _, tl := range tools {
 		names[tl["name"].(string)] = true
 	}
-	for _, want := range []string{"list_workers", "list_sessions", "send_message", "spawn_session", "abort_session", "answer_question", "reply_permission", "archive_session"} {
+	for _, want := range []string{"list_workers", "list_sessions", "send_message", "spawn_session", "abort_session", "answer_question", "reply_permission", "archive_session", "delete_session"} {
 		if !names[want] {
 			t.Fatalf("tools/list missing %q (got %v)", want, names)
 		}

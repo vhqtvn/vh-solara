@@ -167,6 +167,30 @@ func (c *Client) SetArchived(ctx context.Context, id string, ts int64) error {
 	return nil
 }
 
+// DeleteSession deletes a session via OpenCode's native delete
+// (DELETE /session/:id). OpenCode auto-cascades to the session's whole subtree
+// (deleting the root removes every descendant too). Delete is DESTRUCTIVE and
+// IRREVERSIBLE — there is no undelete. A non-2xx is returned as *Error (carrying
+// the upstream status) so a handler can distinguish "session already gone"
+// (404/410 — the delete intent is satisfied) from a real failure, mirroring the
+// SetArchived error shape above.
+func (c *Client) DeleteSession(ctx context.Context, id string) error {
+	req, err := c.newRequest(ctx, http.MethodDelete, "/session/"+id, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return statusErr("DELETE /session/"+id, resp.StatusCode, b)
+	}
+	return nil
+}
+
 // Error is a non-2xx response from a write verb. It carries the upstream status
 // so a handler can propagate a meaningful client error (e.g. a stale request-id)
 // instead of masking everything as a 502.

@@ -95,6 +95,9 @@ const PATHS: Record<string, () => JSX.Element> = {
     </>
   ),
   layers: () => <path d="M12 2 2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5" />,
+  trash: () => (
+    <path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M10 11v6M14 11v6" />
+  ),
   // Angle brackets + slash — the code viewer.
   code: () => <path d="m8 16-4-4 4-4M16 8l4 4-4 4M14 4l-4 16" />,
   // Magnifier — code search.

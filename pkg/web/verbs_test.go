@@ -39,6 +39,13 @@ type fakeOC struct {
 	// call, in order — used by the archive re-assert test to assert a re-PATCH.
 	archivedPATCHes []string
 
+	// deleteStatus: if non-zero, DELETE /session/:id (DeleteSession) returns
+	// this status (delete failure simulation). deleteIDs records the ids of
+	// every DELETE call, in order — used by the delete tests to assert the
+	// per-id loop fired (and to distinguish gone-tolerance from a real failure).
+	deleteStatus int
+	deleteIDs    []string
+
 	// listSessionsReply is the body returned by GET /session (ListSessions).
 	// Defaults to nil → "[]" (no sessions). Used by the archive re-assert test
 	// to fake OpenCode reporting an affected id with archived=null (didn't
@@ -105,6 +112,23 @@ func (f *fakeOC) handler() http.Handler {
 		case contains(p, "/permissions/"):
 			b, _ := readAll(r)
 			f.permissions = append(f.permissions, "legacy:"+b)
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodDelete:
+			// DeleteSession (DELETE /session/:id). Record the id (strip the
+			// "/session/" prefix; ignore any sub-resource suffix). The handler's
+			// outer f.mu.Lock()/defer Unlock() (above) already serializes this
+			// append against the deletedIDs read helper, so no inner lock.
+			id := strings.TrimPrefix(p, "/session/")
+			if i := strings.IndexByte(id, '/'); i >= 0 {
+				id = id[:i]
+			}
+			if id != "" {
+				f.deleteIDs = append(f.deleteIDs, id)
+			}
+			if f.deleteStatus != 0 {
+				w.WriteHeader(f.deleteStatus)
+				return
+			}
 			w.WriteHeader(http.StatusOK)
 		case r.Method == http.MethodPatch:
 			// SetArchived (PATCH /session/:id time.archived). Used by /vh/archive
