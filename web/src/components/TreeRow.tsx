@@ -54,6 +54,15 @@ export interface TreeRowProps {
   // Distinct from `node.loaded` (are the children RESIDENT in the flat map): a
   // node can be loaded:true but display-collapsed, or mid-fetch.
   displayState?: EffectiveTreeMode;
+  // Eye marker: TRUE iff the current selection ALTERS this node's displayed
+  // children-list vs its no-selection baseline (a collapsed/filtered ancestor
+  // whose rendered children differ when a descendant is selected). Derived by
+  // the caller (TreeBranch) by diffing childrenForState(displayState) against
+  // childrenForState(persistedMode); passed down so this row stays presentational.
+  // With NO session selected this is always false (nothing differs from the
+  // no-selection baseline). When true the eye glyph renders (reusing
+  // .twisty-temp CSS); when false the node falls through to its mode glyph.
+  showEye?: boolean;
   onSelect: (id: string) => void;
   onToggle: (id: string) => void;
   // Flat (filtered search-results) mode: every row shows the uniform `filtered`
@@ -152,21 +161,29 @@ export function TreeRow(props: TreeRowProps) {
           // it toggles the `running` class on this button (above), so a working
           // leaf gains a pulsing accent ring around its terminal marker.
           <Icon name="noChild" size={13} />
-        ) : isTemp() ? (
-          // "temp" display state (auto-revealed ancestor of the selected
-          // session): the dimmed `eye` glyph (.twisty-temp). A node open ONLY
-          // because the selected session lives inside it (the user did NOT
-          // click it into this state). .twisty-temp CSS dims it (var(--fg-dim))
-          // and keeps it upright (transform:none), overriding the chevron's
-          // span:not(.open) rotate. onClick is UNCHANGED: a temp node is still
-          // expandable, so the guard above still fires onToggle — clicking the
-          // eye promotes it to "filtered" + cascades (proj=1 temp→filtered).
+        ) : props.showEye ? (
+          // Eye marker: the current selection ALTERS this node's displayed
+          // children-list vs its no-selection baseline. This is the activation
+          // effect on a collapsed/filtered ancestor whose rendered children
+          // differ when a descendant is selected — a node open ONLY because the
+          // selected session lives inside it (the user did NOT click it into
+          // this state). Reuses .twisty-temp CSS (var(--fg-dim) + transform:none,
+          // overriding the chevron's span:not(.open) rotate). onClick is
+          // UNCHANGED: an eye node is still expandable, so the guard above still
+          // fires onToggle — clicking promotes it to its persisted/expanded mode.
           <span class="twisty-temp"><Icon name="eye" size={11} /></span>
-        ) : isFiltered() ? (
-          // "filtered" display state: the rail-and-bars `filtered` glyph (same
-          // glyph as flat mode — both mean "a filtered view"). Rendered BARE
-          // (no span) so the chevron's `.tree-twisty span:not(.open)` rotate
-          // rule cannot catch it.
+        ) : isFiltered() || isTemp() ? (
+          // "filtered" glyph (the rail-and-bars; same glyph as flat mode — both
+          // mean "a filtered view"). Covers TWO cases that render exactly their
+          // filtered baseline:
+          //   - a plain filtered node (displayState==="filtered"), and
+          //   - a temp node that does NOT show the eye (displayState==="temp"
+          //     but its children-list is unchanged by selection). Such a node
+          //     always has persistedMode==="filtered" (a collapsed-persisted
+          //     temp node would have an empty baseline and thus WOULD show the
+          //     eye, caught by the branch above), so the filtered glyph is its
+          //     correct non-eye rendering. Rendered BARE (no span) so the
+          //     chevron's `.tree-twisty span:not(.open)` rotate cannot catch it.
           <Icon name="filtered" size={13} />
         ) : (
           // Expandable tree node (collapsed/expanded): the chevron, wrapped in

@@ -428,3 +428,275 @@ describe("auto-mutation — temp/userToggled independence", () => {
     expect(twistyFor(container as unknown as HTMLElement, "A").querySelector("span.twisty-temp")).toBeNull();
   });
 });
+
+// ── eye derivation — children-diff semantics (the fix) ─────────────────────────
+// The eye shows on a node iff the current selection ALTERS its displayed
+// children-list vs its no-selection baseline (childrenForState(displayState) ≠
+// childrenForState(persistedMode) by id-set). This REPLACES the old pure-ancestry
+// rule (eye ⟺ strict ancestor), which wrongly showed the eye on a filtered
+// ancestor whose only working child was the path child (its children-list was
+// UNCHANGED by selection). These mount the REAL <SessionTree/> and assert the
+// eye on the integrated SessionTree → TreeBranch → showEye → TreeRow path.
+//
+// Glyph paths (from Icon.tsx) for asserting the rendered glyph, not just "eye
+// absent":
+//   eye     → M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z   (inside .twisty-temp)
+//   filtered → M6 5v14M6 8h11M6 12h5M6 16h11                       (rail-and-bars, bare)
+const EYE_PATH = "M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z";
+const FILTERED_PATH = "M6 5v14M6 8h11M6 12h5M6 16h11";
+
+function glyphPath(twisty: HTMLElement): string | null {
+  return twisty.querySelector("svg.icon path")?.getAttribute("d") ?? null;
+}
+
+describe("eye derivation — children-diff (not pure ancestry)", () => {
+  // CRITERION 1 (the bug case): a filtered ancestor whose ONLY working child is
+  // the selected path child → NO eye. Its temp reveal [pathChild] equals its
+  // filtered baseline [pathChild]; the selection changed nothing about what it
+  // displays. Under the OLD pure-ancestry rule this wrongly showed the eye.
+  it("filtered ancestor whose only working child is the path child → NO eye (the fix)", () => {
+    seedTreeStore([
+      node({ id: "PARENT", title: "parent", childCount: 2, descendantCount: 2, loaded: true, activity: "busy" }),
+      node({ id: "PATHCHILD", parentId: "PARENT", title: "path", activity: "busy", updatedMs: 50 }),
+      node({ id: "IDLE1", parentId: "PARENT", title: "idle", updatedMs: 10 }),
+    ]);
+    setSelectedIdRaw("PATHCHILD");
+    const { container } = render(() => <SessionTree />);
+    // PARENT is a strict ancestor of PATHCHILD, persisted filtered (implicit,
+    // working), not toggled → displayState "temp". Its temp reveal is exactly
+    // [PATHCHILD], which equals its filtered baseline (PATHCHILD is the only
+    // working child) → the selection did NOT alter its children-list → no eye.
+    const tw = twistyFor(container as unknown as HTMLElement, "PARENT");
+    expect(tw.querySelector("span.twisty-temp")).toBeNull();
+    // CRITERION 7: the temp-without-eye node renders the filtered glyph (its
+    // persisted-mode glyph), NOT a blank twisty.
+    expect(glyphPath(tw)).toBe(FILTERED_PATH);
+    // The path child still renders under temp (visibleKids unchanged); the idle
+    // sibling does not.
+    const ids = renderedIds(container as unknown as HTMLElement);
+    expect(ids).toContain("PATHCHILD");
+    expect(ids).not.toContain("IDLE1");
+  });
+
+  // CRITERION 3: a filtered ancestor with SEVERAL working children, one on the
+  // path → eye. Its temp reveal [pathChild] is a strict subset of its filtered
+  // baseline [pathChild, otherWorking] → the selection HID a working child.
+  it("filtered ancestor with several working children (one on path) → eye", () => {
+    seedTreeStore([
+      node({ id: "PARENT", title: "parent", childCount: 3, descendantCount: 3, loaded: true, activity: "busy" }),
+      node({ id: "WORK_A", parentId: "PARENT", title: "a", activity: "busy", updatedMs: 50 }),
+      node({ id: "WORK_B", parentId: "PARENT", title: "b", activity: "busy", updatedMs: 40 }),
+      node({ id: "IDLE1", parentId: "PARENT", title: "idle", updatedMs: 10 }),
+    ]);
+    setSelectedIdRaw("WORK_A");
+    const { container } = render(() => <SessionTree />);
+    const tw = twistyFor(container as unknown as HTMLElement, "PARENT");
+    expect(tw.querySelector("span.twisty-temp")).not.toBeNull();
+    expect(glyphPath(tw)).toBe(EYE_PATH);
+  });
+
+  // CRITERION 2: a collapsed ancestor on the active path → eye. Its temp reveal
+  // [pathChild] differs from its collapsed baseline [] (children went hidden →
+  // revealed).
+  it("collapsed ancestor on the active path → eye", () => {
+    seedTreeStore([
+      node({ id: "PARENT", title: "parent", childCount: 1, descendantCount: 1, loaded: true }),
+      node({ id: "CHILD", parentId: "PARENT", title: "child", updatedMs: 10 }),
+    ]);
+    // PARENT is idle; cold-norm materializes it collapsed. Make it explicit so
+    // the persisted mode is unambiguous.
+    setNodeMode("PARENT", "collapsed");
+    setSelectedIdRaw("CHILD");
+    const { container } = render(() => <SessionTree />);
+    const tw = twistyFor(container as unknown as HTMLElement, "PARENT");
+    expect(tw.querySelector("span.twisty-temp")).not.toBeNull();
+    expect(glyphPath(tw)).toBe(EYE_PATH);
+  });
+
+  // CRITERION 4: an expanded ancestor → never temp, children unchanged → no eye.
+  it("expanded ancestor → NO eye (expanded is never overridden to temp)", () => {
+    seedTreeStore([
+      node({ id: "PARENT", title: "parent", childCount: 2, descendantCount: 2, loaded: true }),
+      node({ id: "CHILD", parentId: "PARENT", title: "child", updatedMs: 50 }),
+      node({ id: "SIB", parentId: "PARENT", title: "sib", updatedMs: 10 }),
+    ]);
+    setNodeMode("PARENT", "expanded");
+    setSelectedIdRaw("CHILD");
+    const { container } = render(() => <SessionTree />);
+    const tw = twistyFor(container as unknown as HTMLElement, "PARENT");
+    expect(tw.querySelector("span.twisty-temp")).toBeNull();
+  });
+
+  // CRITERION 5: with NO session selected there are zero eye icons anywhere
+  // (even on collapsed nodes) — nothing differs from the no-selection baseline.
+  it("no session selected → NO eye anywhere (including collapsed nodes)", () => {
+    seedTreeStore([
+      node({ id: "PARENT", title: "parent", childCount: 1, descendantCount: 1, loaded: true }),
+      node({ id: "CHILD", parentId: "PARENT", title: "child", activity: "busy", updatedMs: 10 }),
+    ]);
+    setNodeMode("PARENT", "collapsed"); // a collapsed node with a resident child
+    setSelectedIdRaw(null);
+    const { container } = render(() => <SessionTree />);
+    expect(
+      (container as unknown as HTMLElement).querySelectorAll("span.twisty-temp").length,
+    ).toBe(0);
+  });
+
+  // CRITERION 6 (guard): visibleKids output is identical to before for all four
+  // states — the refactor to childrenForState changed nothing about WHAT renders.
+  // (The per-state visibility matrix above already pins this; here we re-state
+  // the temp single-path-child reveal under the new helper for completeness.)
+  it("temp still reveals exactly the one path child (visibleKids parity)", () => {
+    seedTreeStore([
+      node({ id: "PARENT", title: "parent", childCount: 3, descendantCount: 3, loaded: true, activity: "busy" }),
+      node({ id: "WORK_A", parentId: "PARENT", title: "a", activity: "busy", updatedMs: 50 }),
+      node({ id: "WORK_B", parentId: "PARENT", title: "b", activity: "busy", updatedMs: 40 }),
+      node({ id: "IDLE1", parentId: "PARENT", title: "idle", updatedMs: 10 }),
+    ]);
+    setSelectedIdRaw("WORK_B");
+    const { container } = render(() => <SessionTree />);
+    const ids = renderedIds(container as unknown as HTMLElement);
+    // PARENT (temp) reveals exactly WORK_B — not WORK_A, not IDLE1.
+    expect(ids).toContain("WORK_B");
+    expect(ids).not.toContain("WORK_A");
+    expect(ids).not.toContain("IDLE1");
+  });
+});
+
+// ── eye derivation — dynamic reactivity ─────────────────────────────────────
+// The static tests above prove the eye at INITIAL MOUNT only. These three prove
+// it STAYS correct under live mutation, observing the real DOM after each
+// mutation (not a selector call): the reactive propagation
+// SessionTree → TreeBranch → showEye getter → TreeRow JSX must re-evaluate when
+// (a) the activation changes, (b) a session's running/idle state flips, and
+// (c) an ancestor's persisted mode is toggled. Each mounts FIRST, mutates AFTER,
+// then asserts the DOM eye state per the rule.
+describe("eye derivation — dynamic reactivity", () => {
+  // (a) ACTIVATION CHANGE — selectedId flips. The eye follows the selection: it
+  // lights on the new selection's ancestors (where temp alters the children-
+  // list) and clears on the old branch's ancestors (no longer ancestors).
+  //
+  //   ROOT (idle root, EXPLICIT expanded so A/B rows stay observable across
+  //   │     selection changes — expanded is never temp, never collapses)
+  //   ├─ A (idle, cold-norm collapsed) — parent of LEAF_A
+  //   │   └─ LEAF_A (idle)
+  //   └─ B (idle, cold-norm collapsed) — parent of LEAF_B
+  //       └─ LEAF_B (idle)
+  it("activation change — selecting a nested session shows the eye on its collapsed ancestors; switching branches moves the eye", () => {
+    seedTreeStore([
+      node({ id: "ROOT", title: "root", childCount: 2, descendantCount: 4, loaded: true }),
+      node({ id: "A", parentId: "ROOT", title: "a", childCount: 1, descendantCount: 1 }),
+      node({ id: "LEAF_A", parentId: "A", title: "leafA" }),
+      node({ id: "B", parentId: "ROOT", title: "b", childCount: 1, descendantCount: 1 }),
+      node({ id: "LEAF_B", parentId: "B", title: "leafB" }),
+    ]);
+    // ROOT expanded so A/B rows always render (their twisties stay observable).
+    setNodeMode("ROOT", "expanded");
+    setSelectedIdRaw(null);
+    const { container } = render(() => <SessionTree />);
+    const c = container as unknown as HTMLElement;
+
+    // No selection → no temp anywhere → no eyes.
+    expect(c.querySelectorAll("span.twisty-temp").length).toBe(0);
+    expect(renderedIds(c)).toContain("A");
+    expect(renderedIds(c)).toContain("B");
+
+    // Select LEAF_A via the CANONICAL setter (clears userToggled synchronously).
+    // BEFORE: A persisted collapsed → kidsBaseline = []. Selection makes A a
+    // strict ancestor → temp → kidsNow = [LEAF_A]. [] ≠ [LEAF_A] → eye ON.
+    // B is not an ancestor of LEAF_A → stays collapsed → no eye. ROOT is
+    // expanded → never temp → no eye.
+    setSelectedId("LEAF_A");
+    expect(twistyFor(c, "A").querySelector("span.twisty-temp")).not.toBeNull();
+    expect(twistyFor(c, "B").querySelector("span.twisty-temp")).toBeNull();
+    expect(twistyFor(c, "ROOT").querySelector("span.twisty-temp")).toBeNull();
+
+    // Switch selection to the other branch. A is no longer an ancestor → not
+    // temp → kidsNow = kidsBaseline = [] → eye CLEARS. B becomes a strict
+    // ancestor → temp → kidsNow = [LEAF_B] ≠ [] → eye LIGHTS. The eye MOVED.
+    setSelectedId("LEAF_B");
+    expect(twistyFor(c, "A").querySelector("span.twisty-temp")).toBeNull();
+    expect(twistyFor(c, "B").querySelector("span.twisty-temp")).not.toBeNull();
+  });
+
+  // (b) RUNNING/IDLE FLIP — a session's activity transitions busy↔idle, so the
+  // working() predicate output changes for a resident child, which alters a
+  // filtered ancestor's baseline children-list. The eye toggles live.
+  //
+  //   PARENT (working=busy, implicit filtered) — strict ancestor of PATHCHILD
+  //   ├─ PATHCHILD (working=busy) ← selected (the temp path child)
+  //   └─ OTHER (working=busy)
+  //   BEFORE (OTHER busy): temp reveal [PATHCHILD] ≠ filtered baseline
+  //     [PATHCHILD, OTHER] → eye ON.
+  //   AFTER  (OTHER idle): temp reveal [PATHCHILD] = filtered baseline
+  //     [PATHCHILD] (OTHER dropped from the working set) → eye OFF.
+  it("running/idle flip — a child's busy→idle edge toggles the eye on its filtered ancestor", async () => {
+    seedTreeStore([
+      node({ id: "PARENT", title: "parent", childCount: 2, descendantCount: 2, loaded: true, activity: "busy" }),
+      node({ id: "PATHCHILD", parentId: "PARENT", title: "path", activity: "busy", updatedMs: 50 }),
+      node({ id: "OTHER", parentId: "PARENT", title: "other", activity: "busy", updatedMs: 40 }),
+    ]);
+    setSelectedIdRaw("PATHCHILD");
+    const { container } = render(() => <SessionTree />);
+    const c = container as unknown as HTMLElement;
+
+    // BEFORE: eye ON. PARENT temp reveal = [PATHCHILD]; filtered baseline =
+    // [PATHCHILD, OTHER] (both working). Lists differ → eye.
+    const tw = twistyFor(c, "PARENT");
+    expect(tw.querySelector("span.twisty-temp")).not.toBeNull();
+    expect(glyphPath(tw)).toBe(EYE_PATH);
+
+    // Flip OTHER busy→idle through the real store op path. PARENT's filtered
+    // baseline loses OTHER (no longer working) → [PATHCHILD] == temp reveal →
+    // eye OFF. (PARENT itself stays working+filtered: its own activity=busy is
+    // untouched by a facet op on a child. The version bump propagates through
+    // treeMap → residentChildren → showEye reactively.)
+    applyTreeOpStore({ op: "node.facet", data: { id: "OTHER", activity: "idle" } });
+    await new Promise((r) => setTimeout(r, 0)); // flush any auto-mutation microtask
+
+    const tw2 = twistyFor(c, "PARENT");
+    expect(tw2.querySelector("span.twisty-temp")).toBeNull();
+  });
+
+  // (c) ANCESTOR MODE TOGGLE — setNodeMode on an ancestor changes its
+  // persistedMode/displayState, which re-derives the eye. Round-tripped both
+  // directions to prove the eye re-evaluates on EACH persisted-mode change.
+  //
+  //   PARENT (working=busy, implicit filtered) — strict ancestor of PATHCHILD
+  //   ├─ PATHCHILD (working=busy) ← selected
+  //   └─ OTHERWORK (working=busy)
+  //   filtered (temp):  reveal [PATHCHILD] ≠ baseline [PATHCHILD, OTHERWORK] → eye ON.
+  //   expanded:         reveal [PATHCHILD, OTHERWORK] = baseline [PATHCHILD, OTHERWORK] → eye OFF.
+  //   filtered again:   eye returns (temp again — setNodeMode does NOT mark userToggled).
+  it("ancestor mode toggle — setNodeMode(filtered→expanded) clears the eye, and toggling back restores it", () => {
+    seedTreeStore([
+      node({ id: "PARENT", title: "parent", childCount: 2, descendantCount: 2, loaded: true, activity: "busy" }),
+      node({ id: "PATHCHILD", parentId: "PARENT", title: "path", activity: "busy", updatedMs: 50 }),
+      node({ id: "OTHERWORK", parentId: "PARENT", title: "otherwork", activity: "busy", updatedMs: 40 }),
+    ]);
+    setSelectedIdRaw("PATHCHILD");
+    const { container } = render(() => <SessionTree />);
+    const c = container as unknown as HTMLElement;
+
+    // BEFORE: PARENT implicit filtered → temp (strict ancestor, not toggled).
+    // reveal [PATHCHILD] ≠ baseline [PATHCHILD, OTHERWORK] → eye ON.
+    let tw = twistyFor(c, "PARENT");
+    expect(tw.querySelector("span.twisty-temp")).not.toBeNull();
+    expect(glyphPath(tw)).toBe(EYE_PATH);
+
+    // Toggle PARENT filtered→expanded via the real setNodeMode path.
+    // effectiveTreeMode now returns expanded (expanded is NEVER temp), so
+    // kidsNow = kidsBaseline = [PATHCHILD, OTHERWORK] → eye OFF.
+    setNodeMode("PARENT", "expanded");
+    tw = twistyFor(c, "PARENT");
+    expect(tw.querySelector("span.twisty-temp")).toBeNull();
+
+    // Toggle back to filtered. setNodeMode does NOT mark userToggled, so PARENT
+    // is again a non-expanded strict ancestor → temp → eye returns. Proves the
+    // eye re-evaluates on each persisted-mode change, in both directions.
+    setNodeMode("PARENT", "filtered");
+    tw = twistyFor(c, "PARENT");
+    expect(tw.querySelector("span.twisty-temp")).not.toBeNull();
+    expect(glyphPath(tw)).toBe(EYE_PATH);
+  });
+});

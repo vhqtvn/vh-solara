@@ -587,22 +587,21 @@ describe("TreeRow twisty running ring (P1)", () => {
   });
 });
 
-// ── tree=2 UI parity: twisty "temp" eye (P1, port from proj=1) ────────────────
-// The old proj=1 client showed a dimmed `eye` glyph (.twisty-temp) on an AUTO-
-// REVEALED ancestor's twisty — a node open ONLY because the selected session
-// lives inside it (the user did NOT manually expand it). It was dropped in the
-// tree=2 rewrite even though its CSS rule (legacy/20-session-tree.css) survived
-// unused. These pin the eye variant directly via the `revealed` prop: TreeRow
-// takes `revealed` as a plain boolean (SessionTree computes it from the STRICT
-// selectedPathIds set ∩ !isUserExpanded ∩ id !== selectedId), so the eye is
-// testable without SessionTree plumbing. The glyph precedence is flat > leaf >
-// revealed(eye) > chevron — busy no longer picks the glyph (it toggles the
-// `running` ring on the button instead) — so these also guard that the eye
-// does NOT clobber the leaf terminal marker.
-describe("TreeRow twisty temp eye (P1, port from proj=1)", () => {
-  it("renders the eye glyph (.twisty-temp) for a revealed (temp) node", () => {
+// ── tree=2 UI parity: twisty eye glyph (children-diff activation marker) ──────
+// The eye marks a node whose displayed children-list the current selection
+// ALTERED vs its no-selection baseline (a collapsed/filtered ancestor whose
+// rendered children differ when a descendant is selected). TreeRow takes `showEye`
+// as a plain boolean (SessionTree derives it by diffing childrenForState(displayState)
+// against childrenForState(persistedMode)); the eye is testable without that
+// plumbing. The glyph precedence is flat > leaf > showEye(eye) >
+// filtered|temp-without-eye(rail-and-bars) > chevron. Note a temp node that does
+// NOT show the eye always has persistedMode==="filtered" (a collapsed-persisted
+// temp node has an empty baseline and thus WOULD show the eye), so its fallback
+// glyph is the filtered rail-and-bars — never blank.
+describe("TreeRow twisty eye glyph (children-diff activation marker)", () => {
+  it("renders the eye glyph (.twisty-temp) when showEye is true", () => {
     const { container } = render(() => (
-      <TreeRow node={baseNode({ activity: "idle", childCount: 2 })} depth={0} selected={false} displayState="temp" onSelect={() => {}} onToggle={() => {}} />
+      <TreeRow node={baseNode({ activity: "idle", childCount: 2 })} depth={0} selected={false} displayState="temp" showEye={true} onSelect={() => {}} onToggle={() => {}} />
     ));
     const t = twisty(container as unknown as HTMLElement);
     const temp = t.querySelector("span.twisty-temp");
@@ -616,10 +615,25 @@ describe("TreeRow twisty temp eye (P1, port from proj=1)", () => {
     expect(t.classList.contains("leaf")).toBe(false);
   });
 
-  it("still fires onToggle when a revealed node's twisty is clicked (revealed stays expandable)", () => {
+  // Success criterion 7: a temp node whose children-list is UNCHANGED by the
+  // selection (showEye false) must render a sensible non-eye glyph — the
+  // filtered rail-and-bars (its persisted-mode glyph), NOT a blank twisty.
+  it("renders the FILTERED glyph (not eye, not blank) for a temp node with showEye=false", () => {
+    const { container } = render(() => (
+      <TreeRow node={baseNode({ activity: "idle", childCount: 2 })} depth={0} selected={false} displayState="temp" showEye={false} onSelect={() => {}} onToggle={() => {}} />
+    ));
+    const t = twisty(container as unknown as HTMLElement);
+    // No eye.
+    expect(t.querySelector("span.twisty-temp")).toBeNull();
+    // The filtered rail-and-bars glyph (rendered bare, no span) — pin its path.
+    const path = t.querySelector("svg.icon path");
+    expect(path?.getAttribute("d")).toBe("M6 5v14M6 8h11M6 12h5M6 16h11");
+  });
+
+  it("still fires onToggle when an eye node's twisty is clicked (stays expandable)", () => {
     const onToggle = vi.fn();
     const { container } = render(() => (
-      <TreeRow node={baseNode({ id: "temp-tog", activity: "idle", childCount: 2 })} depth={0} selected={false} displayState="temp" onSelect={() => {}} onToggle={onToggle} />
+      <TreeRow node={baseNode({ id: "temp-tog", activity: "idle", childCount: 2 })} depth={0} selected={false} displayState="temp" showEye={true} onSelect={() => {}} onToggle={onToggle} />
     ));
     twisty(container as unknown as HTMLElement).dispatchEvent(
       new MouseEvent("click", { bubbles: true }),

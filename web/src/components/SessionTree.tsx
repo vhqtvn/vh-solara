@@ -17,6 +17,8 @@ import {
   selectedPathIds,
   strictAncestors,
   effectiveTreeMode,
+  childrenForState,
+  sameChildIds,
   effectiveExpanded,
   working,
   hasKnownDescendants,
@@ -119,32 +121,41 @@ function TreeBranch(props: {
       userToggledSignal(),
     );
 
-  // visibleKids — EXACTLY four branches (proj=1 model). Children STAY resident
-  // in the flat map; this only gates RENDER:
+  // visibleKids — EXACTLY four branches (proj=1 model), delegated to the pure
+  // childrenForState helper so the eye-derivation below can compute the
+  // no-selection baseline with the SAME semantic. Children STAY resident in the
+  // flat map; this only gates RENDER:
   //   collapsed — renders nothing (even working children).
   //   filtered  — renders only working children (the default).
   //   temp      — renders exactly ONE child: the next step toward the selection.
   //   expanded  — renders ALL children, working-first (stable partition within
   //               each group; sibling order preserved).
-  const visibleKids = (): TreeNode[] => {
-    switch (displayState()) {
-      case "collapsed":
-        return [];
-      case "filtered":
-        return residentChildren().filter(working);
-      case "temp": {
-        const p = props.selectedPath();
-        const c = residentChildren().find((k) => p.has(k.id));
-        return c ? [c] : [];
-      }
-      case "expanded": {
-        const active: TreeNode[] = [];
-        const idle: TreeNode[] = [];
-        for (const c of residentChildren()) (working(c) ? active : idle).push(c);
-        return [...active, ...idle];
-      }
-    }
-  };
+  //
+  // Memoized so childrenForState(displayState()…) is computed ONCE per node per
+  // update. It previously ran twice — `visibleKids` and `kidsNow` were the
+  // identical call — so this removes the double/triple compute and makes the
+  // shared reactive dependencies explicit. `visibleKids` aliases the memo (a
+  // memo is callable), so existing call sites `visibleKids()` and
+  // `<For each={visibleKids()}>` are unchanged in behavior.
+  const kidsNowM = createMemo(() =>
+    childrenForState(displayState(), residentChildren(), working, props.selectedPath()),
+  );
+  const visibleKids = kidsNowM;
+
+  // Eye derivation — the eye shows on this node iff the current selection
+  // ALTERS its displayed children-list vs what it would show with NO session
+  // selected. kidsNow = children under the EFFECTIVE display state (may be
+  // "temp"); kidsBaseline = children under the node's PERSISTED mode alone.
+  // Because persistedMode is a TreeMode (never "temp"), childrenForState never
+  // hits the temp branch for the baseline — and with selectedId === null there
+  // are no selectedAncestors, so effectiveTreeMode === persistedMode, making
+  // this exactly the no-selection baseline. (Reusing the live selectedPath is
+  // safe: it is only read inside the temp branch, which the baseline never
+  // takes.) Memoized for the same reason as kidsNowM.
+  const kidsBaselineM = createMemo(() =>
+    childrenForState(persistedMode(), residentChildren(), working, props.selectedPath()),
+  );
+  const showEye = (): boolean => !sameChildIds(kidsNowM(), kidsBaselineM());
 
   // Lazy frontier: when this branch is mounted in a REVEALING mode (filtered /
   // expanded / temp) AND the node is unloaded AND it has known descendants,
@@ -171,6 +182,7 @@ function TreeBranch(props: {
         isLast={props.isLast}
         selected={selectedId() === props.node.id}
         displayState={displayState()}
+        showEye={showEye()}
         unread={!!state.unread[props.node.id]}
         onSelect={() => openSessionChat(props.node.id)}
         onToggle={() => props.onToggle(props.node)}

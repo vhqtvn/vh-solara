@@ -205,6 +205,64 @@ export function effectiveTreeMode(
   return persistedMode;
 }
 
+// childrenForState — the PURE rendering of a node's children for a given
+// display state, factored out of SessionTree.visibleKids so the eye-derivation
+// can compare "current children" against "no-selection baseline children" using
+// ONE shared semantic. Reproduces the four visibleKids branches verbatim:
+//   collapsed → []
+//   filtered  → residentChildren filtered to the working ones
+//   temp      → exactly the ONE resident child on the selected path (or [])
+//   expanded  → ALL children, working-first (stable partition within each group;
+//               sibling arrival order preserved)
+// PURE: takes the state + the resident children + a working predicate + the
+// selected-path set as data; never reads signals/store. The temp branch is the
+// ONLY one that consults `selectedPath` — so passing a TreeMode (never "temp")
+// as `state` (the no-selection baseline path) makes `selectedPath` irrelevant,
+// which is exactly the property the eye-derivation relies on.
+export function childrenForState(
+  state: EffectiveTreeMode,
+  residentChildren: readonly TreeNode[],
+  workingFn: (n: TreeNode) => boolean,
+  selectedPath: ReadonlySet<string>,
+): TreeNode[] {
+  switch (state) {
+    case "collapsed":
+      return [];
+    case "filtered":
+      return residentChildren.filter(workingFn);
+    case "temp": {
+      const c = residentChildren.find((k) => selectedPath.has(k.id));
+      return c ? [c] : [];
+    }
+    case "expanded": {
+      const active: TreeNode[] = [];
+      const idle: TreeNode[] = [];
+      for (const c of residentChildren) (workingFn(c) ? active : idle).push(c);
+      return [...active, ...idle];
+    }
+  }
+}
+
+// sameChildIds — set-equality by id of two child lists. Selection only ever
+// HIDES or REVEALS children (it never reorders WITHIN a single altered case),
+// so set-equality by id is the correct semantic for "did the displayed
+// children-list change under selection". Order is intentionally ignored (a
+// temp node's single path-child vs an expanded node's working-first list would
+// order differently but contain the same ids only when nothing was hidden).
+export function sameChildIds(
+  a: readonly TreeNode[],
+  b: readonly TreeNode[],
+): boolean {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  const seen = new Set<string>();
+  for (const n of a) seen.add(n.id);
+  for (const n of b) {
+    if (!seen.has(n.id)) return false;
+  }
+  return true;
+}
+
 // hasKnownDescendants — does this node have ANY known descendants (structural OR
 // resident)? A structural leaf (childCount 0 + no descendantCount) never has
 // children to fetch, so the lazy frontier never fires for it.

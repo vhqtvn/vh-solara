@@ -17,6 +17,8 @@ import {
   strictAncestors,
   working,
   effectiveTreeMode,
+  childrenForState,
+  sameChildIds,
   hasKnownDescendants,
   autoTreeModeForWorkingTransition,
 } from "../../src/sync/treeSelectors";
@@ -377,3 +379,120 @@ describe("autoTreeModeForWorkingTransition — qualified transition table", () =
     expect(autoTreeModeForWorkingTransition(true, true, "expanded")).toBeUndefined();
   });
 });
+
+// childrenForState — the PURE rendering of a node's children for a given display
+// state, factored out of SessionTree.visibleKids. Reproduces the four branches
+// verbatim; the eye-derivation composes it twice (displayState vs persistedMode)
+// to decide whether the selection altered the children-list.
+describe("childrenForState — pure per-state children rendering (visibleKids factored)", () => {
+  // Children: one working (busy), one idle. selectedPath marks CHILD (the path
+  // child) so the temp branch is observable.
+  const CHILD = node({ id: "CHILD", activity: "busy" });
+  const IDLE = node({ id: "IDLE", activity: "idle" });
+  const resident = [CHILD, IDLE];
+  const path = new Set(["CHILD", "PARENT"]);
+
+  it("collapsed → [] (renders nothing, even working children)", () => {
+    expect(childrenForState("collapsed", resident, working, path)).toEqual([]);
+  });
+
+  it("filtered → only working children", () => {
+    expect(childrenForState("filtered", resident, working, path).map((n) => n.id)).toEqual(["CHILD"]);
+  });
+
+  it("temp → exactly the one resident path child (or [] if none on path)", () => {
+    expect(childrenForState("temp", resident, working, path).map((n) => n.id)).toEqual(["CHILD"]);
+    // No resident child on the path → [].
+    const offPath = node({ id: "OFFPATH", activity: "idle" });
+    expect(childrenForState("temp", [offPath], working, path)).toEqual([]);
+  });
+
+  it("expanded → ALL children, working-first (idle after working)", () => {
+    expect(childrenForState("expanded", resident, working, path).map((n) => n.id)).toEqual([
+      "CHILD",
+      "IDLE",
+    ]);
+  });
+
+  it("matches the old inline visibleKids switch exactly (four branches)", () => {
+    // Re-derives the OLD inline logic alongside the helper to lock parity.
+    const oldVisibleKids = (
+      state: "collapsed" | "filtered" | "temp" | "expanded",
+    ): TreeNode[] => {
+      switch (state) {
+        case "collapsed":
+          return [];
+        case "filtered":
+          return resident.filter(working);
+        case "temp": {
+          const c = resident.find((k) => path.has(k.id));
+          return c ? [c] : [];
+        }
+        case "expanded": {
+          const active: TreeNode[] = [];
+          const idle: TreeNode[] = [];
+          for (const c of resident) (working(c) ? active : idle).push(c);
+          return [...active, ...idle];
+        }
+      }
+    };
+    const states = ["collapsed", "filtered", "temp", "expanded"] as const;
+    for (const s of states) {
+      expect(childrenForState(s, resident, working, path).map((n) => n.id)).toEqual(
+        oldVisibleKids(s).map((n) => n.id),
+      );
+    }
+  });
+});
+
+// sameChildIds — set-equality by id (the "did the displayed children-list
+// change under selection" predicate that drives the eye). Order is intentionally
+// ignored: selection only hides/reveals children, never reorders within a case.
+describe("sameChildIds — set-equality by id (eye change predicate)", () => {
+  it("true for identical lists", () => {
+    expect(sameChildIds([CHILD("a")], [CHILD("a")])).toBe(true);
+  });
+
+  it("true for the same ids in a DIFFERENT order (set-equality, not sequence)", () => {
+    expect(
+      sameChildIds(
+        [CHILD("a"), CHILD("b"), CHILD("c")],
+        [CHILD("c"), CHILD("a"), CHILD("b")],
+      ),
+    ).toBe(true);
+  });
+
+  it("false when the id sets differ (a child hidden/revealed)", () => {
+    expect(sameChildIds([CHILD("a"), CHILD("b")], [CHILD("a")])).toBe(false);
+    expect(sameChildIds([CHILD("a")], [CHILD("a"), CHILD("b")])).toBe(false);
+  });
+
+  it("false for completely disjoint id sets", () => {
+    expect(sameChildIds([CHILD("a")], [CHILD("b")])).toBe(false);
+  });
+
+  it("true for two empty lists (nothing vs nothing)", () => {
+    expect(sameChildIds([], [])).toBe(true);
+  });
+
+  it("false for empty vs non-empty (the collapsed-temp eye case)", () => {
+    // collapsed baseline [] vs temp reveal [pathChild] → differ → eye.
+    expect(sameChildIds([], [CHILD("pathChild")])).toBe(false);
+    expect(sameChildIds([CHILD("pathChild")], [])).toBe(false);
+  });
+
+  it("true for the same reference (short-circuit)", () => {
+    const arr = [CHILD("a")];
+    expect(sameChildIds(arr, arr)).toBe(true);
+  });
+
+  // Duplicate ids never occur in practice (the flat map keys by unique id, and
+  // treeChildrenOf returns distinct nodes), so the length-check fast path is
+  // valid for every real input. No duplicate-id assertion is needed: the
+  // predicate's contract is set-equality over the UNIQUE-id child lists the
+  // tree actually produces.
+});
+
+function CHILD(id: string): TreeNode {
+  return node({ id });
+}
