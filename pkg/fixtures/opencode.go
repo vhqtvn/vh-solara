@@ -94,6 +94,17 @@ type FakeOpenCode struct {
 	reconcileGetHookMu sync.Mutex
 	reconcileGetBlock  chan struct{}
 	reconcileGetCount  int64 // atomic; counts every exact message-GET
+
+	// promptArrivals counts POST /session/:id/prompt_async arrivals — the route
+	// /vh/send forwards through agg.Client().Prompt (pkg/opencode/client.go).
+	// TEST-ONLY observability for the P7 Slice 3 e2e (tests/e2e): a CAS-bearing
+	// /vh/send that is AWAITING the abort-settle gate has NOT yet reached
+	// prompt_async (it is blocked in Store.WaitAbortSettling before calling
+	// Prompt), so its arrival stays uncounted until the gate opens and the fresh
+	// CAS forwards — giving the test a race-free "zero prompts during the await,
+	// exactly one on release" observable. Guarded by f.mu; never read by the
+	// shipped binary or by existing fixtures/tests.
+	promptArrivals map[string]int
 }
 
 type messageWithParts struct {
@@ -133,14 +144,15 @@ const (
 // part plus a completed tool part.
 func New() *FakeOpenCode {
 	f := &FakeOpenCode{
-		messages:    map[string][]messageWithParts{},
-		subs:        map[int]chan string{},
-		pendingQ:    map[string]string{},
-		pendingQReq: map[string]map[string]any{},
-		pendingP:    map[string]map[string]any{},
-		archived:    map[string]bool{},
-		busy:        map[string]string{},
-		resetGen:    map[string]uint64{},
+		messages:       map[string][]messageWithParts{},
+		subs:           map[int]chan string{},
+		pendingQ:       map[string]string{},
+		pendingQReq:    map[string]map[string]any{},
+		pendingP:       map[string]map[string]any{},
+		archived:       map[string]bool{},
+		busy:           map[string]string{},
+		resetGen:       map[string]uint64{},
+		promptArrivals: map[string]int{},
 	}
 	now := float64(time.Now().UnixMilli())
 	f.sessions = []map[string]any{
@@ -573,6 +585,53 @@ func (f *FakeOpenCode) ActiveEventSubs() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.subs)
+}
+
+// PromptArrivals returns the number of POST /session/:id/prompt_async calls
+// observed for sessionID (the route /vh/send forwards through
+// agg.Client().Prompt). TEST-ONLY observability for the P7 Slice 3 e2e: a
+// CAS-bearing /vh/send blocked in Store.WaitAbortSettling has not reached
+// prompt_async, so this stays at its pre-await value until the gate opens and
+// the fresh CAS forwards — the race-free "zero during the await, exactly one on
+// release" signal. Reads existing state under f.mu; no behavior change. Mirrors
+// the UserMessageCount read pattern.
+func (f *FakeOpenCode) PromptArrivals(sessionID string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.promptArrivals[sessionID]
+}
+
+// EmitSessionBusy emits a LIVE session.status busy for sessionID through the
+// fake's real /event stream (the authoritative new-turn path the reducer's
+// NormSessionStatus arm consumes → markTurnRunningLocked → TurnRunning).
+// TEST-ONLY deterministic control seam for the P7 Slice 3 e2e: unlike [[stall]]
+// (which sleeps 5s then auto-idles via the deferred session.idle) or
+// [[perm]]/[[ask]] (which arm a pending question/permission blocker that
+// independently makes the session non-sendable), this produces a STABLE busy
+// window with no competing terminal and no side effects — so the abort-settle
+// gate stays closed until EmitSessionTerminal releases it, with no race against
+// a 5s stall timer or a pending-blocker CAS failure. It is test-infra only: it
+// calls the existing unexported emit (no change to emit itself) and is never
+// reached by the shipped binary.
+func (f *FakeOpenCode) EmitSessionBusy(sessionID string) {
+	f.emit("session.status", map[string]any{
+		"sessionID": sessionID, "status": map[string]any{"type": "busy"},
+	})
+}
+
+// EmitSessionTerminal emits a turn-TERMINAL event (session.idle or
+// session.error) for sessionID through the fake's real /event stream. It is the
+// deterministic P7 Slice 3 release seam: the event propagates fixture /event →
+// worker aggregator → Store.Apply, where session.idle / session.error route to
+// settleTerminalLocked (open the fail-closed abort gate + wake any /vh/send
+// consumer awaiting it). session.idle also clears activity to idle (the fresh
+// CAS passes → forward); session.error clears activity to error (the fresh CAS
+// fails → 409). Using this instead of sleeping for the ~5s settle timer keeps
+// the e2e deterministic and the consumer's event-driven WaitAbortSettling the
+// proof. eventName MUST be "session.idle" or "session.error". TEST-ONLY: calls
+// the existing unexported emit; no behavior change; never reached by the binary.
+func (f *FakeOpenCode) EmitSessionTerminal(sessionID, eventName string) {
+	f.emit(eventName, map[string]any{"sessionID": sessionID})
 }
 
 // commitUserMessage persists a single user message for a session and returns
@@ -1071,6 +1130,7 @@ func (f *FakeOpenCode) handleSession(w http.ResponseWriter, r *http.Request) {
 		// later GET /session/:sid/message/:mid can reconcile the item.
 		messageID := promptMessageID(body)
 		f.mu.Lock()
+		f.promptArrivals[id]++ // test-only observability (see promptArrivals doc)
 		mode := f.promptAsyncMode
 		f.mu.Unlock()
 		switch mode {
