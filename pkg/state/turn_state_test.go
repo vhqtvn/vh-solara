@@ -663,3 +663,115 @@ func TestP7_StopFireReleasesWaiter(t *testing.T) {
 	}
 	assertTurn(t, s, "R", TurnIdle, "after stopFire (settle timer idled the session)")
 }
+
+// TestP7_ReconcileBusyReAdoptsAfterStopFire characterizes the F5 design decision
+// (solution-brief ses_027ab1d09 → Position B): stopFire MUST stay LIVENESS-ONLY.
+// It force-opens the abort gate, goes TurnIdle, and idles activity, but it MUST
+// NOT arm completionAuthoritative. Position A (arm it) was rejected because the
+// authority has no epoch/expiry and would persistently suppress genuine
+// reconcile-only new turns during event-stream gaps (reconcile cannot clear it).
+// This test locks that decision as an EXECUTABLE INVARIANT: it passes against
+// the current B behavior and FAILS if a future change arms
+// completionAuthoritative in stopFire (i.e. implements rejected option A).
+//
+// The interleaving (the post-stopFire path this locks):
+//  1. A turn is running (authoritative session.status busy).
+//  2. Stop → TurnStopping, gate closed.
+//  3. stopFire fires (no terminal — the production abort case, since OpenCode
+//     emits no session.idle on abort): gate opens, TurnIdle, activity idle, and
+//     completionAuthoritative is NOT armed (THE load-bearing F5-B assertion).
+//  4. A subsequent reconcile-snapshot busy (the periodic /session/status poll)
+//     re-adopts the session as TurnRunning via markTurnRunningLocked: D4 no
+//     longer applies (the session is TurnIdle, not TurnStopping), so the full
+//     adoption body runs, and SendCASState reports sendable=false.
+//
+// This is a CHARACTERIZATION / REGRESSION LOCK, not a new-behavior proof. It
+// does NOT claim to prove duplicate-prompt prevention (that is the /vh/send
+// consumer's CAS boundary, covered elsewhere in the P7 suite). It locks exactly
+// one invariant: stopFire must not arm completionAuthoritative, so a busy
+// snapshot after an abort-settle re-adopts rather than being silently suppressed.
+//
+// Determinism: stopFire is driven by a shortened completionGrace (15ms) + a
+// bounded sleep (80ms) — the SAME established pattern as
+// TestP7_StopFireSettlesGateWhenNoTerminalArrives. No real 5s timer is relied
+// on. The sleep is a bounded-liveness release wait (the post-fire state is
+// stably TurnIdle+ActivityIdle regardless), not a correctness proof.
+func TestP7_ReconcileBusyReAdoptsAfterStopFire(t *testing.T) {
+	s := mustNew(t, withCompletionGrace(DefaultConfig(100), 15*time.Millisecond))
+	defer s.Close() // cancel any armed timer so no callback fires into a later test
+
+	s.Apply(ev("session.created", evSessionCreated("R", "")))
+	s.Apply(ev("session.status", evStatus("R", "busy"))) // authoritative new turn
+	assertTurn(t, s, "R", TurnRunning, "turn running (authoritative busy)")
+
+	// Stop issued: running → stopping, gate CLOSED, settle timer ARMED.
+	s.Stop("R", "turn1")
+	assertTurn(t, s, "R", TurnStopping, "after Stop")
+	if !s.AbortSettling("R") {
+		t.Fatalf("after Stop: AbortSettling=false, want true (gate CLOSED)")
+	}
+
+	// No terminal arrives (the production abort case — OpenCode emits no
+	// session.idle on abort). Let the shortened completionGrace settle window
+	// expire so stopFire runs. Bounded liveness: the post-fire state is stable.
+	time.Sleep(80 * time.Millisecond)
+
+	// Post-fire state (F5-B characterization): gate opened, TurnIdle, activity
+	// idle — the standard stopFire settle.
+	if s.AbortSettling("R") {
+		t.Errorf("after stopFire: AbortSettling=true, want false (gate opened)")
+	}
+	assertTurn(t, s, "R", TurnIdle, "after stopFire (settle timer idled the session)")
+	if got := s.Snapshot(nil).Activity["R"]; got != ActivityIdle {
+		t.Fatalf("after stopFire: activity=%q, want %q (stopFire idled activity)", got, ActivityIdle)
+	}
+
+	// THE LOAD-BEARING F5-B ASSERTION: completionAuthoritative is NOT armed.
+	// stopFire stayed liveness-only (Position B). This is the single line that
+	// turns the F5 decision into an executable invariant: it FAILS if a future
+	// change arms completionAuthoritative in stopFire (option A). Read directly
+	// under the lock (same pattern as TestP7_SessionErrorCompanion_...).
+	s.mu.RLock()
+	auth := s.completionAuthoritative["R"]
+	s.mu.RUnlock()
+	if auth {
+		t.Fatalf("F5-B INVARIANT VIOLATED: stopFire armed completionAuthoritative — " +
+			"it must stay LIVENESS-ONLY (Position B, solution-brief ses_027ab1d09). " +
+			"Arming the authority here (option A) would persistently suppress genuine " +
+			"reconcile-only new turns during event-stream gaps (the authority has no " +
+			"epoch/expiry and reconcile cannot clear it).")
+	}
+
+	// F5-B CONSEQUENCE: a subsequent reconcile-snapshot busy (the periodic
+	// /session/status poll) RE-ADOPTS the session as TurnRunning. Because
+	// completionAuthoritative is NOT armed, the SetActivityFromStatuses guard
+	// (blockedByAuthority, reducers.go:300) does not force the busy to idle;
+	// because the session is TurnIdle (not TurnStopping), the D4 early-return in
+	// markTurnRunningLocked (turn_state.go:222) does not fire either. The full
+	// adoption body runs: clears the (already-clear) gate, cancels the
+	// (already-fired) stop timer, and sets TurnRunning.
+	s.SetActivityFromStatuses(map[string]json.RawMessage{
+		"R": json.RawMessage(`{"type":"busy"}`),
+	})
+	assertTurn(t, s, "R", TurnRunning, "F5-B: reconcile-snapshot busy after stopFire re-adopts as TurnRunning "+
+		"(completionAuthoritative not armed → guard does not fire; TurnIdle not TurnStopping → D4 does not apply)")
+	if got := s.Snapshot(nil).Activity["R"]; got != ActivityBusy {
+		t.Errorf("F5-B: reconcile-snapshot busy after stopFire should set activity busy, got %q", got)
+	}
+
+	// The /vh/send consumer's CAS gate (SendCASState, snapshots.go:1062): after
+	// the busy re-adoption the session is NOT sendable (a turn is in flight).
+	// This is the same single-atomic snapshot the /vh/send handler reads; a busy
+	// re-adoption yields sendable=false. The abort gate is open (a TurnRunning
+	// session has no settling abort) — characterizing current behavior.
+	sendable, _, exists, abortSettling := s.SendCASState("R")
+	if !exists {
+		t.Fatalf("SendCASState: session should still exist after re-adoption")
+	}
+	if sendable {
+		t.Errorf("SendCASState: sendable=true, want false (busy re-adoption → a turn is in flight)")
+	}
+	if abortSettling {
+		t.Errorf("SendCASState: abortSettling=true, want false (re-adoption left the gate open — no settling abort)")
+	}
+}

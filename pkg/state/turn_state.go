@@ -437,10 +437,11 @@ func SetWaitAbortSettlingParkHookForTest(fn func(string)) {
 // stopFire is the settle-timer callback. It runs on a time.AfterFunc goroutine.
 // Under s.mu it re-checks stopGen (abort if superseded by a terminal / new turn
 // / cancel / hydrate), then force-settles: opens the gate, drops the
-// pendingCancellationTurnID, goes TurnIdle, and authoritatively idles activity
-// (the canceled run is assumed settled — OpenCode did not emit session.idle).
-// Routed through setActivityLocked so busyCount / subtreeBusyCount / the
-// KindActivity emit all stay consistent.
+// pendingCancellationTurnID, goes TurnIdle, and idles activity via
+// setActivityLocked (ActivityIdle ONLY — NOT clearOnCompletionLocked, so it does
+// NOT arm completionAuthoritative; see the F5 note below). The canceled run is
+// assumed settled — OpenCode did not emit session.idle. setActivityLocked keeps
+// busyCount / subtreeBusyCount / the KindActivity emit consistent.
 //
 // INTENTIONAL OMISSION (F5): unlike graceFire (grace.go → clearOnCompletionLocked),
 // stopFire does NOT set completionAuthoritative. graceFire arms the guard because
