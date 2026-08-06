@@ -388,12 +388,50 @@ func (s *Store) WaitAbortSettling(ctx context.Context, sessionID string) bool {
 		// authoritatively rather than wedging.
 		return true
 	}
+	// Test-only park signal (p7-d2): fires at the commit-to-park point — the
+	// caller read abortSettling==true under RLock and holds the wait channel,
+	// so the very next statement is the blocking select. A test receives this
+	// to deterministically prove the awaiter parked BEFORE injecting a gate
+	// release (reconcile-clear / stopFire / session-delete), replacing the
+	// timing-based elapsed-time-sleep parking proof that could pass vacuously
+	// under scheduler delay. nil in production; cross-package wiring via
+	// SetWaitAbortSettlingParkHookForTest. The hook MUST NOT block (it fires
+	// holding no lock).
+	if waitAbortSettlingParkHook != nil {
+		waitAbortSettlingParkHook(sessionID)
+	}
 	select {
 	case <-ch:
 		return true
 	case <-ctx.Done():
 		return false
 	}
+}
+
+// waitAbortSettlingParkHook is a test-only instrumentation hook for the P7
+// await-path. It fires at the COMMIT-TO-PARK point inside WaitAbortSettling:
+// the caller has confirmed abortSettling==true under RLock and holds a non-nil
+// wait channel, so the blocking select is the very next statement. A test
+// receives this signal to deterministically prove the /vh/send consumer (or any
+// awaiter) parked in the await BEFORE injecting a gate release — replacing the
+// timing-based elapsed-time-sleep parking proof that could pass vacuously under
+// scheduler delay (the release landing before the awaiter reached the park →
+// fast-path return → the test passes without exercising the await-unblock path).
+//
+// nil in production (zero overhead: WaitAbortSettling nil-checks before
+// calling). Test-assigned and t.Cleanup-reset. Cross-package wiring (the
+// pkg/web verbs-layer tests) goes through SetWaitAbortSettlingParkHookForTest;
+// same-package tests may assign the var directly. The web test suite is fully
+// serial (workers:1), so a non-atomic package var is safe.
+var waitAbortSettlingParkHook func(sessionID string)
+
+// SetWaitAbortSettlingParkHookForTest installs the test-only
+// waitAbortSettlingParkHook. Intended exclusively for cross-package test
+// instrumentation (the pkg/web P7 verbs-layer tests set it to observe a
+// /vh/send consumer parking before injecting a release). Production code MUST
+// NOT call it. Passing nil clears the hook (the t.Cleanup reset idiom).
+func SetWaitAbortSettlingParkHookForTest(fn func(string)) {
+	waitAbortSettlingParkHook = fn
 }
 
 // stopFire is the settle-timer callback. It runs on a time.AfterFunc goroutine.

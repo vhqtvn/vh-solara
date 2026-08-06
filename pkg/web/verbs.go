@@ -61,6 +61,18 @@ const ifIdleSeqHeader = "If-Idle-Seq"
 // handler nil-checks before calling). The hook MUST NOT block.
 var sendCASPostSnapshotHook func(sessionID string)
 
+// sendCASPostAwaitHook is the test-only sibling of sendCASPostSnapshotHook for
+// the await→recheck window. It is invoked immediately after WaitAbortSettling
+// returns, before the fresh SendCASState+seq CAS recheck — letting a test
+// deterministically sequence a Stop#2 re-arm (the spurious-wake-after-rearm
+// interleaving) into the gap between the gate release (channel close) and the
+// handler's authoritative recheck. Without it, reproducing that interleaving at
+// the verbs layer is non-deterministic under -race (the re-arm's Lock races the
+// recheck's RLock). nil in production (zero overhead: the handler nil-checks
+// before calling). The hook MUST NOT block. Same pattern as
+// sendCASPostSnapshotHook.
+var sendCASPostAwaitHook func(sessionID string)
+
 // outcome values classify a verb result so a caller parsing the JSON body (not
 // headers) can classify it for its accounting. ONLY "created" means a new session
 // was minted (counting); all others are non-counting.
@@ -157,6 +169,13 @@ func (h coordHandlers) send(w http.ResponseWriter, r *http.Request) {
 
 		if !sendable && seqCAS && abortSettling {
 			agg.Store().WaitAbortSettling(r.Context(), body.SessionID)
+			// Test-only hook (p7-d1 spurious-wake-after-rearm): sequence a
+			// Stop#2 re-arm into the await→recheck window so a test can
+			// deterministically observe the stale wake yield 409 + zero prompts.
+			// nil in production.
+			if sendCASPostAwaitHook != nil {
+				sendCASPostAwaitHook(body.SessionID)
+			}
 			// Rerun the FULL atomic snapshot + seq CAS after release. Gate
 			// release is NOT send authority — this re-snapshot decides.
 			sendable, activitySeq, exists, abortSettling = agg.Store().SendCASState(body.SessionID)

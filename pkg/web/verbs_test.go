@@ -15,6 +15,7 @@ import (
 
 	"github.com/vhqtvn/vh-solara/pkg/aggregator"
 	"github.com/vhqtvn/vh-solara/pkg/opencode"
+	"github.com/vhqtvn/vh-solara/pkg/state"
 )
 
 // fakeOC is a minimal opencode stand-in for the write verbs: it records the
@@ -1250,10 +1251,16 @@ func TestReplyPermissionAlreadyClearedMapsTo410(t *testing.T) {
 // the documented outcome holds: a fresh CAS (large If-Idle-Seq) forwards EXACTLY
 // ONE prompt (TurnIdle + activity idle → sendable).
 //
-// Determinism: the OUTCOME is deterministic regardless of host scheduling. After
-// the reconcile-clear release the session is stably TurnIdle+ActivityIdle (no
-// concurrent mutation), so the waiter's recheck always observes sendable=true —
-// the only timing-dependent part is goroutine scheduling, never the result.
+// Determinism (p7-d2 hardened): the waitAbortSettlingParkHook fires at the
+// commit-to-park point inside WaitAbortSettling, deterministically proving the
+// /vh/send consumer's request goroutine parked on the abort gate channel BEFORE
+// the reconcile-clear release is injected — replacing the prior elapsed-time
+// sleep (100ms) as the SOLE parking proof, which could pass vacuously under
+// scheduler delay (the release landing before the goroutine parked → fast-path
+// return → the test passes without exercising the await-unblock path). The
+// OUTCOME is deterministic regardless: after the reconcile-clear release the
+// session is stably TurnIdle+ActivityIdle, so the recheck always observes
+// sendable=true.
 func TestP7_SendCASAwaitAbortSettling_ReconcileClearRelease(t *testing.T) {
 	f := &fakeOC{}
 	web, agg := newVerbServer(t, f)
@@ -1264,6 +1271,21 @@ func TestP7_SendCASAwaitAbortSettling_ReconcileClearRelease(t *testing.T) {
 	if !s.AbortSettling("a") {
 		t.Fatal("seed: AbortSettling should be true after Stop")
 	}
+
+	// Deterministic parked-observable (p7-d2): the park hook fires at the
+	// commit-to-park point inside WaitAbortSettling (gate confirmed closed under
+	// RLock, channel in hand), proving the send goroutine genuinely parked BEFORE
+	// the release is injected. This replaces the prior 100ms elapsed-time sleep.
+	parked := make(chan struct{}, 1)
+	state.SetWaitAbortSettlingParkHookForTest(func(sid string) {
+		if sid == "a" {
+			select {
+			case parked <- struct{}{}:
+			default:
+			}
+		}
+	})
+	t.Cleanup(func() { state.SetWaitAbortSettlingParkHookForTest(nil) })
 
 	// providedSeq huge ⇒ the seq CAS passes after release; only the abort window
 	// blocks the initial send.
@@ -1276,13 +1298,16 @@ func TestP7_SendCASAwaitAbortSettling_ReconcileClearRelease(t *testing.T) {
 		res.st, res.body = st, out
 	}()
 
-	// RED signal: the send must be genuinely blocked in WaitAbortSettling before
-	// release (a missing/broken consumer would 409 immediately).
+	// Deterministic parking proof: wait for the park signal. The send goroutine
+	// is now parked in WaitAbortSettling on the abort gate channel. A missing /
+	// broken consumer (immediate 409) would never park → bounded-liveness
+	// timeout. The prior elapsed-time sleep could NOT distinguish "parked" from
+	// "not yet scheduled to park."
 	select {
-	case <-done:
-		t.Fatal("send returned before reconcile-clear release — it did NOT await AbortSettling (consumer missing/broken)")
-	case <-time.After(100 * time.Millisecond):
-		// good: still blocked → it is awaiting.
+	case <-parked:
+		// good: the send goroutine parked in the await.
+	case <-time.After(3 * time.Second):
+		t.Fatal("send goroutine did not park in WaitAbortSettling — consumer missing/broken or park hook did not fire")
 	}
 	if n := f.promptCount(); n != 0 {
 		t.Fatalf("before release: promptCount=%d, want 0 (await must not forward)", n)
@@ -1323,9 +1348,12 @@ func TestP7_SendCASAwaitAbortSettling_ReconcileClearRelease(t *testing.T) {
 // stale forward or a wedge (the caller parked on a channel whose map entry was
 // deleted outright, so it would never unblock without this explicit signal).
 //
-// Determinism: the OUTCOME is deterministic regardless of host scheduling. After
-// session.deleted the session is stably gone (no concurrent mutation), so the
-// waiter's recheck always observes exists=false → 404.
+// Determinism (p7-d2 hardened): the waitAbortSettlingParkHook fires at the
+// commit-to-park point inside WaitAbortSettling, deterministically proving the
+// send goroutine parked on the abort gate channel BEFORE the session-delete is
+// injected — replacing the prior elapsed-time sleep (100ms) as the SOLE parking
+// proof. The OUTCOME is deterministic regardless: after session.deleted the
+// session is stably gone, so the recheck always observes exists=false → 404.
 func TestP7_SendCASAwaitAbortSettling_SessionDeleteYields404(t *testing.T) {
 	f := &fakeOC{}
 	web, agg := newVerbServer(t, f)
@@ -1337,6 +1365,21 @@ func TestP7_SendCASAwaitAbortSettling_SessionDeleteYields404(t *testing.T) {
 		t.Fatal("seed: AbortSettling should be true after Stop")
 	}
 
+	// Deterministic parked-observable (p7-d2): the park hook fires at the
+	// commit-to-park point inside WaitAbortSettling, proving the send goroutine
+	// genuinely parked BEFORE the session-delete is injected. Replaces the prior
+	// 100ms elapsed-time sleep.
+	parked := make(chan struct{}, 1)
+	state.SetWaitAbortSettlingParkHookForTest(func(sid string) {
+		if sid == "a" {
+			select {
+			case parked <- struct{}{}:
+			default:
+			}
+		}
+	})
+	t.Cleanup(func() { state.SetWaitAbortSettlingParkHookForTest(nil) })
+
 	res := &sendResult{}
 	done := make(chan struct{})
 	go func() {
@@ -1346,12 +1389,12 @@ func TestP7_SendCASAwaitAbortSettling_SessionDeleteYields404(t *testing.T) {
 		res.st, res.body = st, out
 	}()
 
-	// RED signal: the send must be genuinely blocked before teardown.
+	// Deterministic parking proof: wait for the park signal before teardown.
 	select {
-	case <-done:
-		t.Fatal("send returned before session-delete — it did NOT await AbortSettling (consumer missing/broken)")
-	case <-time.After(100 * time.Millisecond):
-		// good: still blocked → it is awaiting.
+	case <-parked:
+		// good: the send goroutine parked in the await.
+	case <-time.After(3 * time.Second):
+		t.Fatal("send goroutine did not park in WaitAbortSettling — consumer missing/broken or park hook did not fire")
 	}
 	if n := f.promptCount(); n != 0 {
 		t.Fatalf("before delete: promptCount=%d, want 0", n)
@@ -1374,5 +1417,127 @@ func TestP7_SendCASAwaitAbortSettling_SessionDeleteYields404(t *testing.T) {
 	}
 	if n := f.promptCount(); n != 0 {
 		t.Fatalf("session-delete release: promptCount=%d, want 0 (session gone → no forward)", n)
+	}
+}
+
+// TestP7_SendCAS_SpuriousWakeAfterRearm_Yields409 closes DEFER finding p7-d1 at
+// the VERBS layer. The state-layer companion
+// (TestP7_WaitAbortSettling_SpuriousWakeAfterRearm_RecheckAuthoritative) proves
+// only the STATE mechanism (SendCASState sees sendable=false after a Stop#2
+// re-arm). This test observes the user-visible VERBS-layer OUTCOME — the actual
+// HTTP 409 + zero forwarded prompts — for the EXACT interleaving the
+// "spurious true return is safe" doc claim (turn_state.go:370-375) rests on:
+//
+//  1. Stop#1 → TurnStopping, gate closed (channel A armed).
+//  2. A CAS-bearing /vh/send awaits in WaitAbortSettling (parked on channel A).
+//  3. Release#1 (live session.idle) opens the gate — channel A closed.
+//  4. Stop#2 re-arms a FRESH channel B (gate closed again), TurnStopping.
+//  5. The stale waiter wakes (channel A was closed by release#1) — spurious wake.
+//  6. The post-await fresh SendCASState+seq CAS recheck sees the NEW TurnStopping
+//     → sendable=false → the handler 409s with ZERO prompts forwarded.
+//
+// Determinism: both hooks sequence the interleaving deterministically —
+// waitAbortSettlingParkHook (fired at the commit-to-park point) rendezvous-
+// confirms the send goroutine parked on channel A BEFORE release#1, and
+// sendCASPostAwaitHook (fired between WaitAbortSettling's return and the fresh
+// recheck, ON the send goroutine) sequences Stop#2 into the await→recheck gap.
+// The recheck then deterministically observes Stop#2's TurnStopping — no
+// scheduler race between the re-arm's Lock and the recheck's RLock (which made
+// this interleaving non-deterministic at the verbs layer without the hook).
+func TestP7_SendCAS_SpuriousWakeAfterRearm_Yields409(t *testing.T) {
+	f := &fakeOC{}
+	web, agg := newVerbServer(t, f)
+	s := agg.Store()
+	s.Apply(ev("session.created", `{"info":{"id":"a"}}`))
+	s.Apply(ev("session.status", `{"sessionID":"a","status":{"type":"busy"}}`))
+	s.Stop("a", "turn1") // Stop#1: TurnStopping, gate closed, channel A armed
+	if !s.AbortSettling("a") {
+		t.Fatal("Stop#1: AbortSettling should be true (gate closed)")
+	}
+
+	// Hook B (park rendezvous): signals when the send goroutine commits to park
+	// inside WaitAbortSettling (on channel A). nil in production.
+	parked := make(chan struct{}, 1)
+	state.SetWaitAbortSettlingParkHookForTest(func(sid string) {
+		if sid == "a" {
+			select {
+			case parked <- struct{}{}:
+			default:
+			}
+		}
+	})
+	t.Cleanup(func() { state.SetWaitAbortSettlingParkHookForTest(nil) })
+
+	// Hook A (post-await re-arm): sequences Stop#2 into the await→recheck gap,
+	// ON the send goroutine (the hook fires inline in the handler, between
+	// WaitAbortSettling's return and the fresh SendCASState recheck). This is
+	// the spurious-wake re-arm — a fresh gate close before the recheck. nil in
+	// production.
+	sendCASPostAwaitHook = func(sid string) {
+		if sid == "a" {
+			s.Stop("a", "turn2") // Stop#2: re-arm channel B, TurnStopping, gate closed
+		}
+	}
+	t.Cleanup(func() { sendCASPostAwaitHook = nil })
+
+	// Launch the async CAS send. providedSeq huge ⇒ the seq CAS passes; only the
+	// abort window (Stop#1's gate) blocks the initial send.
+	res := &sendResult{}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		st, out, _ := post(t, web.URL+"/vh/send", `{"sessionID":"a","text":"follow"}`,
+			map[string]string{ifIdleSeqHeader: "999999"})
+		res.st, res.body = st, out
+	}()
+
+	// Rendezvous: wait for the send goroutine to park in WaitAbortSettling on
+	// channel A (deterministic — the park hook fires at the commit-to-park
+	// point). This confirms step 2 before we inject release#1.
+	select {
+	case <-parked:
+		// good: parked on channel A.
+	case <-time.After(3 * time.Second):
+		t.Fatal("send goroutine did not park in WaitAbortSettling — consumer missing/broken or park hook did not fire")
+	}
+	if n := f.promptCount(); n != 0 {
+		t.Fatalf("before release#1: promptCount=%d, want 0 (await must not forward)", n)
+	}
+
+	// Release#1: a LIVE session.idle settles the abort (activity busy→idle,
+	// gate opens, channel A closed). The parked send goroutine wakes — the
+	// spurious-wake (step 5): channel A was closed by release#1, so the stale
+	// waiter's <-ch returns immediately. It then hits the post-await hook,
+	// which issues Stop#2 (step 4, sequenced into the await→recheck gap).
+	s.Apply(ev("session.idle", `{"sessionID":"a"}`))
+
+	// The send goroutine: wakes → post-await hook (Stop#2 re-arm) → fresh
+	// SendCASState+seq CAS recheck sees Stop#2's TurnStopping → sendable=false →
+	// 409. Bounded liveness guard (the outcome is deterministic — Stop#2 ran on
+	// the send goroutine before the recheck, so the recheck always sees it).
+	select {
+	case <-done:
+		// good: the send returned.
+	case <-time.After(3 * time.Second):
+		t.Fatal("send did not return after spurious-wake + Stop#2 re-arm")
+	}
+
+	// OUTCOME observed (not mechanism-asserted): HTTP 409 + zero prompts. The
+	// spurious wake did NOT become send authority — the fresh recheck caught
+	// Stop#2's re-arm and refused the send.
+	if res.st != http.StatusConflict {
+		t.Fatalf("spurious-wake-after-rearm: status=%d, want %d (fresh recheck saw Stop#2's TurnStopping → sendable=false → 409)", res.st, http.StatusConflict)
+	}
+	if n := f.promptCount(); n != 0 {
+		t.Fatalf("spurious-wake-after-rearm: promptCount=%d, want 0 (the spurious wake must NOT become send authority — no prompt forwarded)", n)
+	}
+
+	// Ground truth: Stop#2 genuinely re-armed the gate (channel B armed, gate
+	// closed, TurnStopping) — confirming the rearm the recheck observed was real.
+	if !s.AbortSettling("a") {
+		t.Errorf("after Stop#2: AbortSettling=false, want true (gate re-armed by the post-await hook's Stop#2)")
+	}
+	if ts := s.TurnState("a"); ts != state.TurnStopping {
+		t.Errorf("after Stop#2: TurnState=%q, want %q (re-armed by the post-await hook)", ts, state.TurnStopping)
 	}
 }
