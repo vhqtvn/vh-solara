@@ -280,3 +280,142 @@ func TestFixtureReset_PreservesUnresetStallIdle(t *testing.T) {
 		t.Fatalf("expected the stall's deferred session.idle to fire when no reset occurred, got %d", idles)
 	}
 }
+
+// TestFixtureReset_EmitsMessageRemovedForAccumulated pins the
+// handleFixtureReset → emit("message.removed") crux at opencode.go:1707-1709.
+//
+// WHY THIS TEST EXISTS. pkg/state reconcileMessagesLocked is upsert-only
+// ("absence never deletes", hydration.go), so once the aggregator store has
+// absorbed a message the only way a /fixture/reset can make the store DROP it
+// is by emitting message.removed (translate.go → deleteMessageLocked). Prompt-
+// sending e2e tests (scroll-follow 4/9/10b/11/12) leave user+assistant turns in
+// the fixture; without the emit block those turns accumulate across serial
+// Playwright --repeat-each iterations, growing scrollHeight until the
+// scroll-follow geometry drifts stale and the cross-repeat follow-to-tail flake
+// (fixed in 2f6e697) resurfaces. Because the committed e2e runs repeat-each=1,
+// a silent revert of the emit block passes CI and only reappears as an
+// intermittent flake — this test makes that revert deterministic and CI-fast.
+//
+// THE CRUX. The fixture-side f.messages restore (opencode.go:1633-1637) clears
+// the fixture's OWN transcript regardless; that is NOT what this test pins. This
+// test pins the AGGREGATOR-store-clear emit: that message.removed is emitted for
+// EACH accumulated (non-baseline) message ID and NOT for any baseline ID. Remove
+// the emit block (1707-1709) and removedFor is empty → this test fails, even
+// though f.messages is still restored to baseline (the belt, asserted last,
+// deliberately passes either way so it cannot mask the emit crux).
+//
+// Sibling to TestFixtureReset_SuppressesLeakedStallIdle (which pins the
+// resetGen/busy axis); this pins the message-removal axis of the same reset.
+func TestFixtureReset_EmitsMessageRemovedForAccumulated(t *testing.T) {
+	t.Parallel()
+	f := New()
+	srv := startFixtureHTTP(t, f)
+	ch, unsub := f.subscribe()
+	defer unsub()
+
+	// 1. Record the seeded baseline IDs for "demo" (m1..m6) so we can assert
+	//    reset never emits message.removed for a baseline message.
+	f.mu.Lock()
+	baselineIDs := map[string]bool{}
+	for _, m := range f.baseline["demo"] {
+		if id, _ := m.Info["id"].(string); id != "" {
+			baselineIDs[id] = true
+		}
+	}
+	f.mu.Unlock()
+	if len(baselineIDs) == 0 {
+		t.Fatalf("setup: expected a non-empty seeded baseline for \"demo\"")
+	}
+
+	// 2. Append non-baseline messages modeling the accumulation vector: a user
+	//    turn + an assistant reply (the exact shape simulatePrompt appends — a
+	//    u%n user id and an a%n assistant id). Direct mutation is the
+	//    deterministic seam: handleFixtureReset reasons over f.messages, not
+	//    over how the messages got there, and direct mutation avoids
+	//    simulatePrompt's ~720ms streaming race. No f.emit here — the channel
+	//    receives only the reset's emits below.
+	const accUser = "u7"
+	const accAsst = "a7"
+	f.mu.Lock()
+	f.messages["demo"] = append(f.messages["demo"],
+		messageWithParts{Info: map[string]any{"id": accUser, "sessionID": "demo", "role": "user"}},
+		messageWithParts{Info: map[string]any{"id": accAsst, "sessionID": "demo", "role": "assistant"}},
+	)
+	f.mu.Unlock()
+
+	// 3. POST /fixture/reset?session=demo — the reset endpoint the sibling
+	//    TestFixtureReset_* tests use.
+	postJSON(t, srv, "/fixture/reset?session=demo", "")
+
+	// 4. Drain emitted events. The reset handler emits synchronously (every
+	//    f.emit runs before writeJSON returns), so by the time postJSON returns
+	//    every payload is already in the subscriber channel. session.idle is the
+	//    handler's FINAL emit — seeing it proves the drain captured a complete
+	//    emit sequence (no early cut). Early-exit on it; the 1s deadline is belt.
+	removedFor := map[string]bool{}
+	sawIdle := false
+	deadline := time.Now().Add(time.Second)
+	for !sawIdle && time.Now().Before(deadline) {
+		select {
+		case raw := <-ch:
+			var ev struct {
+				Type       string `json:"type"`
+				Properties struct {
+					SessionID string `json:"sessionID"`
+					MessageID string `json:"messageID"`
+				} `json:"properties"`
+			}
+			if json.Unmarshal([]byte(raw), &ev) != nil {
+				continue
+			}
+			if ev.Properties.SessionID != "demo" {
+				continue
+			}
+			switch ev.Type {
+			case "message.removed":
+				removedFor[ev.Properties.MessageID] = true
+			case "session.idle":
+				sawIdle = true
+			}
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	if !sawIdle {
+		t.Fatalf("never observed session.idle sentinel — reset handler did not complete its emit block")
+	}
+
+	// 5. CRUX: message.removed emitted for EACH accumulated (non-baseline) id.
+	for _, id := range []string{accUser, accAsst} {
+		if !removedFor[id] {
+			t.Errorf("expected message.removed for accumulated message %q, not emitted (removedFor=%v)", id, removedFor)
+		}
+	}
+	// 6. CRUX: message.removed NOT emitted for any baseline id (reset clears
+	//    accumulated msgs only; the baseline transcript is preserved).
+	for id := range removedFor {
+		if baselineIDs[id] {
+			t.Errorf("baseline message %q must NOT be removed (reset clears accumulated msgs only), but got message.removed", id)
+		}
+	}
+
+	// BELT: f.messages restored to baseline. This deliberately passes even if
+	// the emit block (1707-1709) is reverted — the restore at 1633-1637 is
+	// independent of the emit — so it cannot mask the emit crux above; it only
+	// confirms the fixture-side transcript is also clean.
+	f.mu.Lock()
+	gotIDs := map[string]bool{}
+	for _, m := range f.messages["demo"] {
+		if id, _ := m.Info["id"].(string); id != "" {
+			gotIDs[id] = true
+		}
+	}
+	f.mu.Unlock()
+	for id := range baselineIDs {
+		if !gotIDs[id] {
+			t.Errorf("belt: baseline message %q missing from f.messages after reset", id)
+		}
+	}
+	if gotIDs[accUser] || gotIDs[accAsst] {
+		t.Errorf("belt: accumulated messages still present in f.messages after reset (gotIDs=%v)", gotIDs)
+	}
+}
