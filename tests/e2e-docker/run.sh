@@ -411,6 +411,137 @@ BAD_CODE=$(curl -s -o /dev/null -w "%{http_code}" "${BASE}/oc/session/${SID}/mes
   || fail "[msgid flow] non-msg id GET did not return 400 (got $BAD_CODE; brand check differs from contract)"
 echo "    4 OK: GET .../message/not_a_msg_id -> 400 (brand rejection)"
 
+# ===========================================================================
+# Flow 7: queue Claim -> dispatch -> real-opencode persist -> turn-start
+# ordering (queue-claim-ordering contract) -- docker-gold backstop.
+#
+# The in-process e2e (tests/e2e/) runs against the FAKE opencode, which could
+# model behavior real opencode lacks. This flow proves -- against REAL opencode
+# -- the ordering crux the vh-solara queue reconciler depends on:
+#   * Claim (pkg/web/queue.go Claim) is mutex-serialized + atomic: it persists
+#     opencodeMsgID (via opencode.MintMessageID, a valid msg_ ascending id) AND
+#     transitions the item pending->dispatching in the SAME atomic save, BEFORE
+#     any dispatch POST hits the network. So the persisted id is observable via
+#     the list endpoint BEFORE the dispatch is issued (THE CRUX).
+# The flow uses the REAL vh-solara queue endpoints (enqueue + claim + list) to
+# obtain the Claim-minted id, then dispatches through opencode's transparent
+# /oc/ passthrough (prompt_async) threading that id as messageID -- mirroring
+# how the browser dispatch path consumes a claimed item. It then asserts:
+#   1. enqueue -> item id.
+#   2. claim -> {opencodeMsgID, state=="dispatching"}.
+#   3. (CRUX, before dispatch) list -> the claimed item shows
+#      state=="dispatching" AND opencodeMsgID == $MINTED (Claim persisted the
+#      id before any dispatch POST reached the network).
+#   4. dispatch: prompt_async {"messageID":"$MINTED", ...} -> 204.
+#   5. real opencode persisted the user message under $MINTED (assert_msgid_get).
+#   6. the turn started (assert_turn_started: gate[sid].activity == "busy").
+# A FRESH session is used so the idle->busy transition unambiguously attributes
+# to THIS dispatch: the shared $SID carries several prior turns whose residual
+# busy/idle state could mask whether Flow 7's dispatch drove the transition.
+# ===========================================================================
+echo "==> [queue-claim flow] creating a fresh session for a clean turn-start"
+QSID=""
+for i in $(seq 1 30); do
+  QSID=$(curl -fsS -H 'X-VH-CSRF: 1' -X POST "${BASE}/oc/session" \
+        -H 'Content-Type: application/json' -d '{"title":"queue-claim-ordering"}' \
+        | python3 -c 'import sys,json;print(json.load(sys.stdin).get("id",""))' 2>/dev/null || true)
+  [ -n "$QSID" ] && break
+  sleep 1
+  [ "$i" = 30 ] && fail "could not create a fresh session for the queue-claim flow"
+done
+echo "    queue-claim session id: $QSID"
+
+# --- 1. enqueue a queue item ------------------------------------------------
+echo "==> [queue-claim flow] 1: POST /vh/session/$QSID/queue (enqueue)"
+QENQ=$(mktemp)
+curl -fsS -H 'X-VH-CSRF: 1' -X POST "${BASE}/vh/session/${QSID}/queue" \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"queue-ordering probe Q7"}' > "$QENQ" \
+  || { rm -f "$QENQ"; fail "[queue-claim flow] enqueue POST failed"; }
+QITEM=$(python3 -c 'import sys,json;print(json.load(sys.stdin).get("item",{}).get("id",""))' < "$QENQ" 2>/dev/null || true)
+rm -f "$QENQ"
+[ -n "$QITEM" ] || fail "[queue-claim flow] enqueue response carried no item id"
+echo "    1 OK: enqueued item id: $QITEM"
+
+# --- 2. claim -> capture opencodeMsgID, assert state==dispatching -----------
+echo "==> [queue-claim flow] 2: POST /vh/session/$QSID/queue/claim (expect dispatching + opencodeMsgID)"
+QCLAIM=$(mktemp)
+curl -fsS -H 'X-VH-CSRF: 1' -X POST "${BASE}/vh/session/${QSID}/queue/claim" > "$QCLAIM" 2>/dev/null \
+  || { rm -f "$QCLAIM"; fail "[queue-claim flow] claim POST failed"; }
+MINTED=$(python3 -c 'import sys,json;it=json.load(sys.stdin).get("item") or {};print(it.get("opencodeMsgID",""))' < "$QCLAIM" 2>/dev/null || true)
+QSTATE=$(python3 -c 'import sys,json;it=json.load(sys.stdin).get("item") or {};print(it.get("state",""))' < "$QCLAIM" 2>/dev/null || true)
+rm -f "$QCLAIM"
+[ -n "$MINTED" ] || fail "[queue-claim flow] claim returned no opencodeMsgID (Claim did not mint)"
+[ "$QSTATE" = "dispatching" ] \
+  || fail "[queue-claim flow] claimed item state=$QSTATE (want dispatching; Claim did not transition)"
+echo "    2 OK: claim -> state=$QSTATE, opencodeMsgID=$MINTED"
+
+# --- 3. (CRUX, BEFORE dispatch) list shows the id persisted pre-dispatch -----
+# Load-bearing ordering assertion: Claim persisted opencodeMsgID in the SAME
+# atomic save as pending->dispatching, BEFORE any dispatch POST. The list
+# endpoint reads the persisted queue.json, so it MUST surface the id NOW --
+# before a single dispatch byte has hit the network.
+echo "==> [queue-claim flow] 3 (CRUX): GET /vh/session/$QSID/queue BEFORE dispatch (expect id persisted pre-dispatch)"
+QLIST=$(mktemp)
+curl -fsS "${BASE}/vh/session/${QSID}/queue" > "$QLIST" 2>/dev/null \
+  || { rm -f "$QLIST"; fail "[queue-claim flow] list GET failed"; }
+LIST_ID=$(QITEM="$QITEM" python3 -c 'import sys,json,os;q=os.environ["QITEM"];d=json.load(sys.stdin);print(next((it.get("opencodeMsgID","") for it in d.get("items",[]) if it.get("id")==q),""))' < "$QLIST" 2>/dev/null || true)
+LIST_STATE=$(QITEM="$QITEM" python3 -c 'import sys,json,os;q=os.environ["QITEM"];d=json.load(sys.stdin);print(next((it.get("state","") for it in d.get("items",[]) if it.get("id")==q),""))' < "$QLIST" 2>/dev/null || true)
+rm -f "$QLIST"
+[ "$LIST_ID" = "$MINTED" ] \
+  || fail "[queue-claim flow] pre-dispatch list opencodeMsgID=$LIST_ID (want $MINTED; Claim did NOT persist the id before dispatch -- ORDERING BROKEN)"
+[ "$LIST_STATE" = "dispatching" ] \
+  || fail "[queue-claim flow] pre-dispatch list state=$LIST_STATE (want dispatching)"
+echo "    3 OK: list (pre-dispatch) shows opencodeMsgID=$LIST_ID, state=$LIST_STATE -- Claim persisted the id BEFORE any dispatch POST"
+
+# --- 4. dispatch: prompt_async with the Claim-minted messageID -> 204 -------
+echo "==> [queue-claim flow] 4: POST prompt_async with Claim-minted messageID (expect 204)"
+QPASYNC_CODE=$(curl -s -o /dev/null -w "%{http_code}" -H 'X-VH-CSRF: 1' \
+  -X POST "${BASE}/oc/session/${QSID}/prompt_async" \
+  -H 'Content-Type: application/json' \
+  -d "{\"messageID\":\"${MINTED}\",\"parts\":[{\"type\":\"text\",\"text\":\"queue-ordering probe Q7\"}]}" \
+  || true)
+[ "$QPASYNC_CODE" = "204" ] \
+  || fail "[queue-claim flow] prompt_async with Claim-minted messageID did not return 204 (got $QPASYNC_CODE)"
+echo "    4 OK: prompt_async -> 204 (turn accepted + forked under the Claim-minted id)"
+
+# --- 5. real opencode persisted the user message under the Claim id ---------
+# Mirrors Flow 6 step 2: persistence is ASYNC to the 204 (Effect.forkIn), so a
+# lookup immediately after the 204 may legitimately 404. Poll until 200 + exact
+# match (info.id==MINTED && info.role=="user") via the existing assert helper.
+echo "==> [queue-claim flow] 5: polling GET .../message/<claim-minted> for the persisted user message"
+QMSG_OK=""
+for i in $(seq 1 60); do
+  QGB=$(mktemp)
+  QGCODE=$(curl -s -o "$QGB" -w "%{http_code}" "${BASE}/oc/session/${QSID}/message/${MINTED}" 2>/dev/null || true)
+  if [ "$QGCODE" = "200" ]; then
+    QGRES=$(python3 "$repo_root/tests/e2e-docker/assert_msgid_get.py" "$MINTED" < "$QGB" 2>/dev/null || true)
+    if [ "$(echo "$QGRES" | sed -n 1p)" = "OK" ]; then
+      QMSG_OK=1
+      echo "    5 OK: $(echo "$QGRES" | sed -n 2p)"
+      echo "         $(echo "$QGRES" | sed -n 3p)"
+    fi
+  elif [ "$QGCODE" = "404" ]; then
+    : # not persisted yet -- keep polling (persistence is async to the 204)
+  else
+    rm -f "$QGB"; fail "[queue-claim flow] unexpected GET status $QGCODE for claim-minted id"
+  fi
+  rm -f "$QGB"
+  [ -n "$QMSG_OK" ] && break
+  sleep 1
+  [ "$i" = 60 ] && fail "[queue-claim flow] persisted user message not observed under the claim-minted id (last status=$QGCODE)"
+done
+
+# --- 6. the turn started (gate activity -> busy) ----------------------------
+echo "==> [queue-claim flow] 6: polling /vh/snapshot for gate.activity==busy (turn started)"
+for i in $(seq 1 60); do
+  SNAP=$(curl -fsS "${BASE}/vh/snapshot?sessions=${QSID}" 2>/dev/null || true)
+  RESULT=$(printf '%s' "$SNAP" | python3 "$repo_root/tests/e2e-docker/assert_turn_started.py" "$QSID" 2>/dev/null || true)
+  [ "$(echo "$RESULT" | sed -n 1p)" = "OK" ] && { echo "    6 OK: $(echo "$RESULT" | sed -n 2p)"; break; }
+  sleep 1
+  [ "$i" = 60 ] && fail "[queue-claim flow] turn did not start after dispatch ($RESULT)"
+done
+
 echo
 echo "PASS: real opencode driven by the fake LLM exercised the full flow:"
 echo "      - prompt -> streamed assistant reply (snapshot + live stream)"
@@ -421,4 +552,7 @@ echo "      - tree=2: bounded frontier (A), expand pagination (B),"
 echo "                missed-delete reconcile -> node.remove (C), reconnect no-ship (D)"
 echo "      - msgid: prompt_async caller messageID -> 204, exact GET -> 200 (caller-id-wins),"
 echo "               cross-session 404 (isolation), non-msg 400 (brand reject)"
+echo "      - queue-claim: Claim persisted opencodeMsgID BEFORE dispatch (list),"
+echo "                     prompt_async -> 204, exact GET -> persisted user msg,"
+echo "                     gate.activity -> busy (turn started)"
 exit 0
