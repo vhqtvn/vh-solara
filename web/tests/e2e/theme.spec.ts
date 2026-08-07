@@ -93,7 +93,7 @@ test("light theme: accent-filled controls (send button, active tab) use white te
   expect(channelSum(await send.evaluate((el) => getComputedStyle(el).color))).toBeGreaterThan(600);
 });
 
-test("light theme: a destructive menu item uses a readable red, not faint pink", async ({ page }) => {
+test("light theme: every destructive menu item uses a readable red, not faint pink", async ({ page }) => {
   await page.goto(projectUrl("/"));
   await useLightTheme(page);
   await page.getByRole("button", { name: /Demo session/ }).click();
@@ -101,18 +101,25 @@ test("light theme: a destructive menu item uses a readable red, not faint pink",
   // Right-click the chat header title → the session context menu, which has TWO
   // destructive items sharing the .ctxm-item.danger class: Archive… and Delete…
   // (both intentional — Delete is the irreversible one, placed below Archive).
-  // The red-channel assertions hold for either, so disambiguate with .first().
   await page.locator(".main-title.has-menu").click({ button: "right" });
-  const danger = page.locator(".ctxm-item.danger").first();
-  await expect(danger).toBeVisible();
-
-  const color = await danger.evaluate((el) => getComputedStyle(el).color);
-  const [r, g, b] = color.match(/\d+(\.\d+)?/g)!.map(Number);
-  // A saturated dark red reads on white; the old light pink (#ffb4ba ≈ 255,180,186)
-  // would fail the green/blue ceilings.
-  expect(r).toBeGreaterThan(150);
-  expect(g).toBeLessThan(120);
-  expect(b).toBeLessThan(120);
+  const dangers = page.locator(".ctxm-item.danger");
+  // The menu renders two destructive items (Archive…, Delete…); assert readable
+  // red on EACH so an accidental de-styling of either (esp. Delete, the
+  // irreversible action) is caught.
+  // Auto-retrying wait (replaces the old expect(danger).toBeVisible()): settle
+  // the menu's danger items before snapshotting count() / reading colors, so an
+  // async mount can't transiently read 0/1 and trip the floor guard.
+  await expect(dangers).toHaveCount(2);
+  const count = await dangers.count();
+  for (let i = 0; i < count; i++) {
+    const color = await dangers.nth(i).evaluate((el) => getComputedStyle(el).color);
+    const [r, g, b] = color.match(/\d+(\.\d+)?/g)!.map(Number);
+    // A saturated dark red reads on white; the old light pink (#ffb4ba ≈
+    // 255,180,186) would fail the green/blue ceilings.
+    expect(r).toBeGreaterThan(150);
+    expect(g).toBeLessThan(120);
+    expect(b).toBeLessThan(120);
+  }
 });
 
 test("markdown code blocks use the light syntax sheet on every light theme (not just `light`)", async ({ page }) => {
