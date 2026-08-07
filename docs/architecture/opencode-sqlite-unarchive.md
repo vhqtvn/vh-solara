@@ -1,6 +1,6 @@
 # OpenCode direct-SQLite unarchive — coupling contract
 
-> **validatedAgainst:** `opencode v1.18.14` (sst/opencode tag v1.18.14, Jul 6 2026)
+> **validatedAgainst:** `opencode v1.18.14` (sst/opencode tag v1.18.14, Aug 5 2026)
 >
 > Evidence base: [`researches/sources/opencode-unarchive-patch-audit.md`](../../researches/sources/opencode-unarchive-patch-audit.md) (why HTTP unarchive is impossible) and [`researches/sources/opencode-sqlite-unarchive-spec.md`](../../researches/sources/opencode-sqlite-unarchive-spec.md) (the full DB-path/driver/SQL/concurrency/drift spec this code implements). Every path/schema/pragma claim below is cited to those packets.
 
