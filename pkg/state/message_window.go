@@ -319,9 +319,12 @@ type MessagePageResult struct {
 	//     whether even-older messages exist beyond it.
 	// In all three cases ActualBytes is the OVERSIZED ITEM's byte size (NOT
 	// the page total) and BudgetBytes is the maxBytes bound. OversizedItem is
-	// kept true in cases 2 and 3 so the Part-B boundary-demand D-triggers
-	// (messages_http.go:122 + SnapshotMessagesPage) gate their opencode older-
-	// page fetch on !OversizedItem and do NOT misfire.
+	// kept true in ALL THREE cases (1, 2, and 3); the Part-B boundary-demand
+	// D-triggers (messages_http.go:122 + SnapshotMessagesPage) gate their
+	// opencode older-page fetch on !OversizedItem. That gating rationale is
+	// load-bearing only in cases 2 and 3 (where HasOlder may be true): case 1
+	// returns with HasOlder=false, so there is no "Load older" affordance to
+	// misfire on even though OversizedItem is still stamped.
 	OversizedItem bool `json:"oversized_item,omitempty"`
 	ActualBytes   int  `json:"actual_bytes,omitempty"`
 	BudgetBytes   int  `json:"budget_bytes,omitempty"`
@@ -375,7 +378,12 @@ type MessagePageResult struct {
 // includes in b/c), the page may return 2 items even when the caller passed
 // limit=1, because the overlap anchor + one strictly-older progress item are
 // both part of the minimum required atomic set. This is documented behavior,
-// not a limit violation.
+// not a limit violation. The ORDINARY case also returns 2 items under
+// maxCount=1: a NON-oversized anchor with older history (anchorIdx>0)
+// force-includes the first strictly-older regardless of the count bound, and
+// then the count bound stops the next-older (CountLimited=true) — or, when the
+// first-older IS the session's oldest, the loop exits at the floor with no
+// limit flag. See TestPage_ForwardProgress_MaxCount1_NormalAnchor.
 //
 // In every overshoot sub-case where further older messages remain, at least
 // one of bytes_limited/oversized_item is true, so the Part-B boundary-demand
@@ -491,9 +499,10 @@ func projectMessagePage(list []MessageWithParts, before string, maxCount, maxByt
 		// iff anchorIdx > 1.)
 		res.HasOlder = anchorIdx > 1
 		// OversizedItem stays true so BOTH Part-B boundary-demand D-trigger
-		// readers (messages_http.go:122 and SnapshotMessagesPage below, line
-		// ~556) — which gate the opencode older-page fetch on !OversizedItem
-		// — do NOT misfire. SerializedBytes carries the truthful page total
+		// readers (messages_http.go:122 and SnapshotMessagesPage's
+		// !CountLimited && !BytesLimited && !OversizedItem gate below) — which
+		// gate the opencode older-page fetch on !OversizedItem — do NOT
+		// misfire. SerializedBytes carries the truthful page total
 		// for the returned pair; ActualBytes follows the struct contract
 		// (the OVERSIZED ITEM's bytes — the anchor here, matching the
 		// projectMessageWindow oversized-newest precedent).

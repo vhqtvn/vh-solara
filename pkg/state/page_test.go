@@ -11,7 +11,11 @@ package state
 //     strictly-older messages, creation-ordered (oldest first) so the client
 //     prepends verbatim.
 //   - `before` not found / empty → empty page, boundary_found=false.
-//   - Oversized anchor (before alone > maxBytes) → [anchor] alone + diagnostics.
+//   - Oversized anchor (before alone > maxBytes): anchorIdx==0 (anchor IS the
+//     session's oldest) → [anchor] alone + diagnostics; anchorIdx>0 (anchor
+//     HAS older history) → the required atomic pair [neighbor, anchor] so
+//     OldestID advances past the cursor (NEVER [anchor] alone with HasOlder=
+//     true, which was the zero-progress stall).
 //   - Pure + deterministic (same input → same page + same metadata).
 
 import (
@@ -374,8 +378,12 @@ func TestPage_ItemsAlwaysNonNil(t *testing.T) {
 // b): anchor + first-strictly-older > maxBytes, but the first-older alone fits.
 // Before the fix the page returned [anchor] alone with OldestID == before and
 // bytes_limited == true → infinite refetch loop. After the fix the first-older
-// is force-included; OldestID advances; bytes_limited fires on the NEXT older
-// message (m0) as the "overshot budget by one atomic item" signal.
+// is force-included; OldestID advances. bytes_limited is the "overshot budget
+// by one atomic item" signal — it fires on the NEXT older message IF one
+// remains. Here m0 IS the session's oldest (list [m0, m1(anchor), m2]), so the
+// loop exits naturally at the floor and bytes_limited stays FALSE (truthful
+// end-of-history). The companion test WithMoreOlder covers the variant where a
+// further older message does remain and bytes_limited fires.
 func TestPage_ForwardProgress_ByteOvershoot(t *testing.T) {
 	// [m0, m1(anchor), m2]: m0 and m1 are each ~89B; anchor m1 alone fits the
 	// budget, but anchor + m0 (178B) exceeds it. m0 alone (89B) fits.
@@ -398,15 +406,11 @@ func TestPage_ForwardProgress_ByteOvershoot(t *testing.T) {
 	if res.OldestID != "m0" {
 		t.Fatalf("oldest_id: want m0 (advanced past cursor m1), got %q (STALL: cursor never advanced)", res.OldestID)
 	}
-	// bytes_limited is the "overshot budget by one atomic item" signal — the
-	// byte bound fired when trying to walk further (there is no further older
-	// here, so actually bytes_limited is FALSE: m0 IS the oldest in the list,
-	// the loop exited naturally). has_older reflects truthfully: false.
-	//
-	// Wait — m0 IS the oldest here (index 0, no further older). So the loop
-	// exits with NO limit flag, and has_older is false. This is the truthful
-	// end-of-history signal (constraint #2): the force-included first-older IS
-	// the session's oldest.
+	// bytes_limited is the "overshot budget by one atomic item" signal: it
+	// fires when the byte bound rejects the NEXT older message after the
+	// force-included first-older. Here m0 IS the session's oldest (index 0, no
+	// further older), so the loop exits naturally with no limit flag →
+	// bytes_limited false, has_older false (truthful end-of-history).
 	if res.HasOlder {
 		t.Fatalf("has_older: want false (m0 is the session's oldest; truthful end-of-history), got true")
 	}
@@ -726,6 +730,90 @@ func TestPage_ForwardProgress_OversizedAnchor_MaxCount1(t *testing.T) {
 	if res.HasOlder {
 		t.Fatalf("has_older: want false (m1 is the session's oldest), got true")
 	}
+}
+
+// TestPage_ForwardProgress_MaxCount1_NormalAnchor pins the ORDINARY maxCount=1
+// two-item outcome (complement to TestPage_ForwardProgress_OversizedAnchor_
+// MaxCount1): even with a NON-oversized anchor, maxCount=1 still returns 2 items
+// because the first strictly-older message is always force-included (the
+// forward-progress guarantee), and then the count bound stops the next-older.
+//
+// Sub-case A (anchorIdx>1): the count bound fires on the next-older →
+// CountLimited=true, HasOlder=true, OldestID advances to the first-older.
+// Sub-case B (anchorIdx==1): the first-older IS the session's oldest → the loop
+// exits at the floor with no limit flag → CountLimited=false, HasOlder=false
+// (truthful end-of-history).
+func TestPage_ForwardProgress_MaxCount1_NormalAnchor(t *testing.T) {
+	t.Run("anchorIdx_gt1_count_bound_fires", func(t *testing.T) {
+		// [m0, m1, m2(anchor), m3]: anchor m2 fits; first-older m1 is force-
+		// included; the count bound stops m0. Page = [m1, m2] (2 items).
+		list := []MessageWithParts{
+			pageMsg("m0", 10),
+			pageMsg("m1", 10), // first strictly-older (force-included)
+			pageMsg("m2", 10), // anchor
+			pageMsg("m3", 10),
+		}
+		res := projectMessagePage(list, "m2", 1, 1<<20)
+		if !res.BoundaryFound {
+			t.Fatalf("boundary_found: want true, got false")
+		}
+		if got := msgIDs(res.Items); !equalStrings(got, []string{"m1", "m2"}) {
+			t.Fatalf("items: want [m1 m2] (force-included first-older + anchor), got %v", got)
+		}
+		if res.MessageCount != 2 {
+			t.Fatalf("message_count: want 2 (force-included first-older + anchor despite limit=1), got %d", res.MessageCount)
+		}
+		if res.OldestID != "m1" {
+			t.Fatalf("oldest_id: want m1 (advanced past cursor m2), got %q", res.OldestID)
+		}
+		if !res.CountLimited {
+			t.Fatalf("count_limited: want true (count bound fired on the next-older m0), got false")
+		}
+		if res.BytesLimited {
+			t.Fatalf("bytes_limited: want false (generous budget), got true")
+		}
+		if res.OversizedItem {
+			t.Fatalf("oversized_item: want false (non-oversized anchor), got true")
+		}
+		if !res.HasOlder {
+			t.Fatalf("has_older: want true (m0 exists beyond the page), got false")
+		}
+	})
+
+	t.Run("anchorIdx_eq1_loop_exits_at_floor", func(t *testing.T) {
+		// [m0, m1(anchor)]: the first-older m0 IS the session's oldest. It is
+		// force-included; the loop has nothing further to walk → exits at the
+		// floor with no limit flag. Page = [m0, m1] (2 items).
+		list := []MessageWithParts{
+			pageMsg("m0", 10), // the ONLY strictly-older; force-included
+			pageMsg("m1", 10), // anchor
+		}
+		res := projectMessagePage(list, "m1", 1, 1<<20)
+		if !res.BoundaryFound {
+			t.Fatalf("boundary_found: want true, got false")
+		}
+		if got := msgIDs(res.Items); !equalStrings(got, []string{"m0", "m1"}) {
+			t.Fatalf("items: want [m0 m1] (force-included first-older + anchor), got %v", got)
+		}
+		if res.MessageCount != 2 {
+			t.Fatalf("message_count: want 2 (force-included first-older + anchor), got %d", res.MessageCount)
+		}
+		if res.OldestID != "m0" {
+			t.Fatalf("oldest_id: want m0 (advanced past cursor m1), got %q", res.OldestID)
+		}
+		if res.CountLimited {
+			t.Fatalf("count_limited: want false (loop exited at the floor, no next-older to bound), got true")
+		}
+		if res.BytesLimited {
+			t.Fatalf("bytes_limited: want false (generous budget), got true")
+		}
+		if res.OversizedItem {
+			t.Fatalf("oversized_item: want false (non-oversized anchor), got true")
+		}
+		if res.HasOlder {
+			t.Fatalf("has_older: want false (m0 is the session's oldest; truthful end-of-history), got true")
+		}
+	})
 }
 
 // TestPage_ForwardProgress_ChainedWalk_OversizedCursor proves repeated paging
