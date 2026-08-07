@@ -576,13 +576,14 @@ func TestP7_WaitAbortSettling_SpuriousWakeAfterRearm_RecheckAuthoritative(t *tes
 //
 // Determinism (p7-d2 hardened): the waitAbortSettlingParkHook fires at the
 // commit-to-park point inside WaitAbortSettling, deterministically proving the
-// waiter parked on the abort gate channel BEFORE the settle timer fires —
-// replacing the prior elapsed-time sleep (10ms < 25ms timer) as the SOLE
-// parking proof, which could pass vacuously under scheduler delay (the timer
-// firing before the waiter parked → the test passes without the await being
-// exercised). The settle timer itself stays a bounded-liveness release
-// authority (the OUTCOME is deterministic regardless: after stopFire the session
-// is stably TurnIdle+ActivityIdle, so the recheck always observes sendable=true).
+// waiter reached the commit-to-park boundary (abort gate channel in hand) BEFORE
+// the settle timer fires — replacing the prior elapsed-time sleep (10ms < 25ms
+// timer) as the SOLE parking proof, which could pass vacuously under scheduler
+// delay (the timer firing before the waiter reached the park point → the test
+// passes without the await being exercised). The settle timer itself stays a
+// bounded-liveness release authority (the OUTCOME is deterministic regardless:
+// after stopFire the session is stably TurnIdle+ActivityIdle, so the recheck
+// always observes sendable=true).
 func TestP7_StopFireReleasesWaiter(t *testing.T) {
 	s := mustNew(t, withCompletionGrace(DefaultConfig(100), 25*time.Millisecond))
 	defer s.Close()
@@ -596,8 +597,9 @@ func TestP7_StopFireReleasesWaiter(t *testing.T) {
 
 	// Deterministic parked-observable (p7-d2): the park hook fires at the
 	// commit-to-park point inside WaitAbortSettling (gate confirmed closed under
-	// RLock, channel in hand), proving the waiter genuinely parked BEFORE the
-	// settle timer fires. This replaces the prior 10ms elapsed-time sleep.
+	// RLock, channel in hand), proving the waiter reached the commit-to-park
+	// boundary BEFORE the settle timer fires. This replaces the prior 10ms
+	// elapsed-time sleep.
 	parked := make(chan struct{}, 1)
 	waitAbortSettlingParkHook = func(sid string) {
 		if sid == "R" {
@@ -630,10 +632,10 @@ func TestP7_StopFireReleasesWaiter(t *testing.T) {
 	// Deterministic parking proof: wait for the park signal (the waiter reached
 	// the commit-to-park point). A broken gate (no park) would block here and
 	// hit the bounded liveness timeout — the prior elapsed-time sleep could NOT
-	// distinguish "parked" from "not yet scheduled to park."
+	// distinguish "reached the park point" from "not yet scheduled to reach it."
 	select {
 	case <-parked:
-		// good: the waiter is parked on the abort gate channel.
+		// good: the waiter reached the commit-to-park boundary.
 	case <-time.After(3 * time.Second):
 		t.Fatal("waiter did not park in WaitAbortSettling — the park hook never fired (gate broken / consumer missing)")
 	}

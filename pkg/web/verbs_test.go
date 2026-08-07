@@ -1277,11 +1277,12 @@ func TestReplyPermissionAlreadyClearedMapsTo410(t *testing.T) {
 //
 // Determinism (p7-d2 hardened): the waitAbortSettlingParkHook fires at the
 // commit-to-park point inside WaitAbortSettling, deterministically proving the
-// /vh/send consumer's request goroutine parked on the abort gate channel BEFORE
-// the reconcile-clear release is injected — replacing the prior elapsed-time
-// sleep (100ms) as the SOLE parking proof, which could pass vacuously under
-// scheduler delay (the release landing before the goroutine parked → fast-path
-// return → the test passes without exercising the await-unblock path). The
+// /vh/send consumer's request goroutine reached the commit-to-park boundary
+// (abort gate channel in hand) BEFORE the reconcile-clear release is injected —
+// replacing the prior elapsed-time sleep (100ms) as the SOLE parking proof,
+// which could pass vacuously under scheduler delay (the release landing before
+// the goroutine reached the park point → fast-path return → the test passes
+// without exercising the await-unblock path). The
 // OUTCOME is deterministic regardless: after the reconcile-clear release the
 // session is stably TurnIdle+ActivityIdle, so the recheck always observes
 // sendable=true.
@@ -1298,8 +1299,9 @@ func TestP7_SendCASAwaitAbortSettling_ReconcileClearRelease(t *testing.T) {
 
 	// Deterministic parked-observable (p7-d2): the park hook fires at the
 	// commit-to-park point inside WaitAbortSettling (gate confirmed closed under
-	// RLock, channel in hand), proving the send goroutine genuinely parked BEFORE
-	// the release is injected. This replaces the prior 100ms elapsed-time sleep.
+	// RLock, channel in hand), proving the send goroutine reached the
+	// commit-to-park boundary BEFORE the release is injected. This replaces the
+	// prior 100ms elapsed-time sleep.
 	parked := make(chan struct{}, 1)
 	state.SetWaitAbortSettlingParkHookForTest(func(sid string) {
 		if sid == "a" {
@@ -1323,13 +1325,14 @@ func TestP7_SendCASAwaitAbortSettling_ReconcileClearRelease(t *testing.T) {
 	}()
 
 	// Deterministic parking proof: wait for the park signal. The send goroutine
-	// is now parked in WaitAbortSettling on the abort gate channel. A missing /
-	// broken consumer (immediate 409) would never park → bounded-liveness
-	// timeout. The prior elapsed-time sleep could NOT distinguish "parked" from
-	// "not yet scheduled to park."
+	// has now reached the commit-to-park boundary in WaitAbortSettling (abort
+	// gate channel in hand). A missing / broken consumer (immediate 409) would
+	// never reach the park point → bounded-liveness timeout. The prior
+	// elapsed-time sleep could NOT distinguish "reached the park point" from
+	// "not yet scheduled to reach it."
 	select {
 	case <-parked:
-		// good: the send goroutine parked in the await.
+		// good: the send goroutine reached the commit-to-park boundary.
 	case <-time.After(3 * time.Second):
 		t.Fatal("send goroutine did not park in WaitAbortSettling — consumer missing/broken or park hook did not fire")
 	}
@@ -1374,10 +1377,11 @@ func TestP7_SendCASAwaitAbortSettling_ReconcileClearRelease(t *testing.T) {
 //
 // Determinism (p7-d2 hardened): the waitAbortSettlingParkHook fires at the
 // commit-to-park point inside WaitAbortSettling, deterministically proving the
-// send goroutine parked on the abort gate channel BEFORE the session-delete is
-// injected — replacing the prior elapsed-time sleep (100ms) as the SOLE parking
-// proof. The OUTCOME is deterministic regardless: after session.deleted the
-// session is stably gone, so the recheck always observes exists=false → 404.
+// send goroutine reached the commit-to-park boundary (abort gate channel in
+// hand) BEFORE the session-delete is injected — replacing the prior elapsed-time
+// sleep (100ms) as the SOLE parking proof. The OUTCOME is deterministic
+// regardless: after session.deleted the session is stably gone, so the recheck
+// always observes exists=false → 404.
 func TestP7_SendCASAwaitAbortSettling_SessionDeleteYields404(t *testing.T) {
 	f := &fakeOC{}
 	web, agg := newVerbServer(t, f)
@@ -1391,8 +1395,8 @@ func TestP7_SendCASAwaitAbortSettling_SessionDeleteYields404(t *testing.T) {
 
 	// Deterministic parked-observable (p7-d2): the park hook fires at the
 	// commit-to-park point inside WaitAbortSettling, proving the send goroutine
-	// genuinely parked BEFORE the session-delete is injected. Replaces the prior
-	// 100ms elapsed-time sleep.
+	// reached the commit-to-park boundary BEFORE the session-delete is injected.
+	// Replaces the prior 100ms elapsed-time sleep.
 	parked := make(chan struct{}, 1)
 	state.SetWaitAbortSettlingParkHookForTest(func(sid string) {
 		if sid == "a" {
@@ -1416,7 +1420,7 @@ func TestP7_SendCASAwaitAbortSettling_SessionDeleteYields404(t *testing.T) {
 	// Deterministic parking proof: wait for the park signal before teardown.
 	select {
 	case <-parked:
-		// good: the send goroutine parked in the await.
+		// good: the send goroutine reached the commit-to-park boundary.
 	case <-time.After(3 * time.Second):
 		t.Fatal("send goroutine did not park in WaitAbortSettling — consumer missing/broken or park hook did not fire")
 	}
@@ -1462,12 +1466,13 @@ func TestP7_SendCASAwaitAbortSettling_SessionDeleteYields404(t *testing.T) {
 //
 // Determinism: both hooks sequence the interleaving deterministically —
 // waitAbortSettlingParkHook (fired at the commit-to-park point) rendezvous-
-// confirms the send goroutine parked on channel A BEFORE release#1, and
-// sendCASPostAwaitHook (fired between WaitAbortSettling's return and the fresh
-// recheck, ON the send goroutine) sequences Stop#2 into the await→recheck gap.
-// The recheck then deterministically observes Stop#2's TurnStopping — no
-// scheduler race between the re-arm's Lock and the recheck's RLock (which made
-// this interleaving non-deterministic at the verbs layer without the hook).
+// confirms the send goroutine reached the commit-to-park boundary on channel A
+// BEFORE release#1, and sendCASPostAwaitHook (fired between WaitAbortSettling's
+// return and the fresh recheck, ON the send goroutine) sequences Stop#2 into
+// the await→recheck gap. The recheck then deterministically observes Stop#2's
+// TurnStopping — no scheduler race between the re-arm's Lock and the recheck's
+// RLock (which made this interleaving non-deterministic at the verbs layer
+// without the hook).
 func TestP7_SendCAS_SpuriousWakeAfterRearm_Yields409(t *testing.T) {
 	f := &fakeOC{}
 	web, agg := newVerbServer(t, f)
@@ -1515,12 +1520,13 @@ func TestP7_SendCAS_SpuriousWakeAfterRearm_Yields409(t *testing.T) {
 		res.st, res.body = st, out
 	}()
 
-	// Rendezvous: wait for the send goroutine to park in WaitAbortSettling on
-	// channel A (deterministic — the park hook fires at the commit-to-park
-	// point). This confirms step 2 before we inject release#1.
+	// Rendezvous: wait for the send goroutine to reach the commit-to-park
+	// boundary in WaitAbortSettling on channel A (deterministic — the park hook
+	// fires at the commit-to-park point). This confirms step 2 before we inject
+	// release#1.
 	select {
 	case <-parked:
-		// good: parked on channel A.
+		// good: reached commit-to-park on channel A.
 	case <-time.After(3 * time.Second):
 		t.Fatal("send goroutine did not park in WaitAbortSettling — consumer missing/broken or park hook did not fire")
 	}
