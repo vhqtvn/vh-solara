@@ -96,43 +96,53 @@ func TestPage_CountBound(t *testing.T) {
 
 // TestPage_ByteBound pins the dual bound's byte axis: when adding the next older
 // message would exceed maxBytes, the page stops and signals bytes_limited +
-// has_older.
+// has_older. After the forward-progress fix, the FIRST strictly-older message is
+// always force-included (atomic), so the byte bound stops the page at
+// [first-older, anchor] — NOT [anchor] alone — and bytes_limited fires on the
+// NEXT older message (the one that would cross the budget).
 func TestPage_ByteBound(t *testing.T) {
-	// Each message ~ info(~40B) + part(~30B + 50 'x') ≈ 120B raw. Anchor m3
-	// alone fits; adding m2 would cross ~240B. Set maxBytes=200 so the byte
-	// bound fires after the anchor.
+	// Each message ~ info(~40B) + part(~49B) ≈ 89B raw. Anchor m3 alone fits;
+	// the first strictly-older m2 is force-included (anchor+m2 ≈ 178B); adding
+	// m1 would cross further. Set maxBytes = anchorSize+50 so the byte bound
+	// fires on m1 (the message AFTER the force-included first-older).
 	list := fiveMessageList()
 	anchorSize := messageSerializedBytes(list[2])
-	maxBytes := anchorSize + 50 // room for the anchor only, not anchor+m2
+	maxBytes := anchorSize + 50 // room for anchor + force-included m2, not +m1
 	res := projectMessagePage(list, "m3", 5, maxBytes)
 	if !res.BoundaryFound {
 		t.Fatalf("boundary_found: want true, got false")
 	}
-	if got := msgIDs(res.Items); !equalStrings(got, []string{"m3"}) {
-		t.Fatalf("items: want [m3] (byte bound stops before m2), got %v", got)
+	if got := msgIDs(res.Items); !equalStrings(got, []string{"m2", "m3"}) {
+		t.Fatalf("items: want [m2 m3] (force-included first-older + anchor), got %v", got)
 	}
 	if !res.BytesLimited {
-		t.Fatalf("bytes_limited: want true, got false")
+		t.Fatalf("bytes_limited: want true (m1 would cross budget), got false")
 	}
 	if res.CountLimited {
 		t.Fatalf("count_limited: want false, got true")
 	}
 	if !res.HasOlder {
-		t.Fatalf("has_older: want true (m1,m2 exist beyond the page), got false")
+		t.Fatalf("has_older: want true (m1 exists beyond the page), got false")
 	}
-	if res.SerializedBytes != anchorSize {
-		t.Fatalf("serialized_bytes: want %d (anchor only), got %d", anchorSize, res.SerializedBytes)
+	if res.OldestID != "m2" {
+		t.Fatalf("oldest_id: want m2 (advanced past cursor m3), got %q", res.OldestID)
+	}
+	wantBytes := anchorSize + messageSerializedBytes(list[1])
+	if res.SerializedBytes != wantBytes {
+		t.Fatalf("serialized_bytes: want %d (anchor + force-included m2), got %d", wantBytes, res.SerializedBytes)
 	}
 }
 
 // TestPage_OversizedAnchor pins the atomic-message guarantee on the page path:
-// when the anchor (before) ALONE exceeds maxBytes, the page returns it alone +
-// oversized_item / actual_bytes / budget_bytes so the client renders the item
-// without a silent gap. has_older reflects whether older messages exist beyond
-// the anchor.
+// when the anchor (before) ALONE exceeds maxBytes AND the anchor HAS older
+// history (anchorIdx > 0, sub-case d), the page returns the REQUIRED ATOMIC
+// PAIR [neighbor, anchor] so OldestID ADVANCES past the cursor — NEVER [anchor]
+// alone with HasOlder=true (that was the zero-progress stall). has_older
+// reflects whether messages exist beyond the neighbor; oversized_item stays
+// true so the D-triggers do not misfire.
 func TestPage_OversizedAnchor(t *testing.T) {
 	list := []MessageWithParts{
-		pageMsg("m1", 10),
+		pageMsg("m1", 10),  // strictly older than the anchor
 		pageMsg("m2", 500), // anchor, oversized
 		pageMsg("m3", 10),
 	}
@@ -142,24 +152,36 @@ func TestPage_OversizedAnchor(t *testing.T) {
 	if !res.BoundaryFound {
 		t.Fatalf("boundary_found: want true, got false")
 	}
-	if got := msgIDs(res.Items); !equalStrings(got, []string{"m2"}) {
-		t.Fatalf("items: want [m2] (oversized anchor alone), got %v", got)
+	// CRUX: the page MUST return the pair [m1, m2], not [m2] alone. Without
+	// this, OldestID stays at the cursor m2 and HasOlder=true → infinite stall.
+	if got := msgIDs(res.Items); !equalStrings(got, []string{"m1", "m2"}) {
+		t.Fatalf("items: want [m1 m2] (required atomic pair: neighbor + oversized anchor), got %v", got)
+	}
+	if res.OldestID != "m1" {
+		t.Fatalf("oldest_id: want m1 (advanced past cursor m2), got %q (STALL: cursor never advanced)", res.OldestID)
+	}
+	if res.NewestID != "m2" {
+		t.Fatalf("newest_id: want m2 (overlap == RequestBefore), got %q", res.NewestID)
+	}
+	// m1 IS the session's oldest (index 0, no further older) → has_older false
+	// (truthful end-of-history beyond the pair).
+	if res.HasOlder {
+		t.Fatalf("has_older: want false (m1 is the session's oldest; truthful end-of-history), got true")
 	}
 	if !res.OversizedItem {
-		t.Fatalf("oversized_item: want true, got false")
+		t.Fatalf("oversized_item: want true (anchor alone > maxBytes), got false")
 	}
 	if res.ActualBytes != anchorSize {
-		t.Fatalf("actual_bytes: want %d, got %d", anchorSize, res.ActualBytes)
+		t.Fatalf("actual_bytes: want %d (the oversized anchor's size), got %d", anchorSize, res.ActualBytes)
 	}
 	if res.BudgetBytes != maxBytes {
 		t.Fatalf("budget_bytes: want %d, got %d", maxBytes, res.BudgetBytes)
 	}
-	// m1 exists beyond the anchor → has_older true.
-	if !res.HasOlder {
-		t.Fatalf("has_older: want true (m1 exists beyond oversized anchor), got false")
+	if res.MessageCount != 2 {
+		t.Fatalf("message_count: want 2 (the required pair), got %d", res.MessageCount)
 	}
-	if res.MessageCount != 1 {
-		t.Fatalf("message_count: want 1, got %d", res.MessageCount)
+	if res.SerializedBytes != anchorSize+messageSerializedBytes(list[0]) {
+		t.Fatalf("serialized_bytes: want %d (truthful pair total: anchor + m1), got %d", anchorSize+messageSerializedBytes(list[0]), res.SerializedBytes)
 	}
 }
 
@@ -336,6 +358,467 @@ func TestPage_ItemsAlwaysNonNil(t *testing.T) {
 			}
 		})
 	}
+}
+
+// --- Forward-progress guarantee tests (regression: zero-progress stall) ---
+//
+// projectMessagePage guarantees that for EVERY page where BoundaryFound==true &&
+// HasOlder==true, OldestID advances to at least one STRICTLY-OLDER message. The
+// first strictly-older is ALWAYS included (atomic), mirroring projectMessageWindow's
+// "newest always included even if oversized" rule. Without this, anchor +
+// first-older > maxBytes would leave the page at [anchor] with OldestID == before
+// (never advanced) → the client merges 0 new messages and refetches the identical
+// zero-progress page forever.
+
+// TestPage_ForwardProgress_ByteOvershoot is the CORE stall regression (sub-case
+// b): anchor + first-strictly-older > maxBytes, but the first-older alone fits.
+// Before the fix the page returned [anchor] alone with OldestID == before and
+// bytes_limited == true → infinite refetch loop. After the fix the first-older
+// is force-included; OldestID advances; bytes_limited fires on the NEXT older
+// message (m0) as the "overshot budget by one atomic item" signal.
+func TestPage_ForwardProgress_ByteOvershoot(t *testing.T) {
+	// [m0, m1(anchor), m2]: m0 and m1 are each ~89B; anchor m1 alone fits the
+	// budget, but anchor + m0 (178B) exceeds it. m0 alone (89B) fits.
+	list := []MessageWithParts{
+		pageMsg("m0", 10),
+		pageMsg("m1", 10), // anchor
+		pageMsg("m2", 10),
+	}
+	anchorSize := messageSerializedBytes(list[1])
+	maxBytes := anchorSize + 50 // fits anchor alone and m0 alone, but NOT anchor+m0
+	res := projectMessagePage(list, "m1", 5, maxBytes)
+	if !res.BoundaryFound {
+		t.Fatalf("boundary_found: want true, got false")
+	}
+	// CRUX: the page MUST include the first strictly-older (m0), not just the
+	// anchor. Without this, OldestID stays at the cursor → infinite stall.
+	if got := msgIDs(res.Items); !equalStrings(got, []string{"m0", "m1"}) {
+		t.Fatalf("items: want [m0 m1] (force-included first-older + anchor), got %v", got)
+	}
+	if res.OldestID != "m0" {
+		t.Fatalf("oldest_id: want m0 (advanced past cursor m1), got %q (STALL: cursor never advanced)", res.OldestID)
+	}
+	// bytes_limited is the "overshot budget by one atomic item" signal — the
+	// byte bound fired when trying to walk further (there is no further older
+	// here, so actually bytes_limited is FALSE: m0 IS the oldest in the list,
+	// the loop exited naturally). has_older reflects truthfully: false.
+	//
+	// Wait — m0 IS the oldest here (index 0, no further older). So the loop
+	// exits with NO limit flag, and has_older is false. This is the truthful
+	// end-of-history signal (constraint #2): the force-included first-older IS
+	// the session's oldest.
+	if res.HasOlder {
+		t.Fatalf("has_older: want false (m0 is the session's oldest; truthful end-of-history), got true")
+	}
+	if res.BytesLimited {
+		t.Fatalf("bytes_limited: want false (loop exited naturally at the oldest), got true")
+	}
+	if res.CountLimited {
+		t.Fatalf("count_limited: want false, got true")
+	}
+	if res.OversizedItem {
+		t.Fatalf("oversized_item: want false (sub-case b, not c), got true")
+	}
+}
+
+// TestPage_ForwardProgress_ByteOvershoot_WithMoreOlder is sub-case (b) where
+// further older messages DO remain beyond the force-included first-older. Here
+// bytes_limited fires on the next older message as the overshoot signal, and
+// has_older is true (correctly).
+func TestPage_ForwardProgress_ByteOvershoot_WithMoreOlder(t *testing.T) {
+	// [m0, m1, m2(anchor), m3]: anchor m2 + first-older m1 > maxBytes, but m1
+	// alone fits. m0 exists beyond m1 → has_older should be true.
+	list := []MessageWithParts{
+		pageMsg("m0", 10),
+		pageMsg("m1", 10), // first strictly-older (force-included)
+		pageMsg("m2", 10), // anchor
+		pageMsg("m3", 10),
+	}
+	anchorSize := messageSerializedBytes(list[2])
+	maxBytes := anchorSize + 50 // fits anchor alone and m1 alone, but NOT anchor+m1
+	res := projectMessagePage(list, "m2", 5, maxBytes)
+	if !res.BoundaryFound {
+		t.Fatalf("boundary_found: want true, got false")
+	}
+	if got := msgIDs(res.Items); !equalStrings(got, []string{"m1", "m2"}) {
+		t.Fatalf("items: want [m1 m2] (force-included first-older + anchor), got %v", got)
+	}
+	if res.OldestID != "m1" {
+		t.Fatalf("oldest_id: want m1 (advanced past cursor m2), got %q", res.OldestID)
+	}
+	// m0 exists beyond the force-included m1 → bytes_limited fires on the m0
+	// check (res.SerializedBytes already overshot, so m0 definitely overflows),
+	// and has_older is true.
+	if !res.BytesLimited {
+		t.Fatalf("bytes_limited: want true (m0 would cross the overshot budget), got false")
+	}
+	if !res.HasOlder {
+		t.Fatalf("has_older: want true (m0 exists beyond the page), got false")
+	}
+	if res.CountLimited {
+		t.Fatalf("count_limited: want false, got true")
+	}
+}
+
+// TestPage_ForwardProgress_OversizedNeighbor is sub-case (c): the first
+// strictly-older alone exceeds maxBytes. The page MUST still include it (atomic
+// forward progress); OldestID advances; oversized_item/actual_bytes/budget_bytes
+// are stamped. bytes_limited/count_limited stay false (matching
+// projectMessageWindow's oversized-newest precedent at window_test.go:164-165).
+func TestPage_ForwardProgress_OversizedNeighbor(t *testing.T) {
+	// [m0(big), m1(anchor), m2]: m0 alone (5000B) exceeds the budget (1000B).
+	// m1 fits. The page force-includes m0 anyway for forward progress.
+	list := []MessageWithParts{
+		pageMsg("m0", 5000), // first strictly-older, oversized
+		pageMsg("m1", 10),   // anchor
+		pageMsg("m2", 10),
+	}
+	maxBytes := 1000
+	neighborSize := messageSerializedBytes(list[0])
+	res := projectMessagePage(list, "m1", 5, maxBytes)
+	if !res.BoundaryFound {
+		t.Fatalf("boundary_found: want true, got false")
+	}
+	if got := msgIDs(res.Items); !equalStrings(got, []string{"m0", "m1"}) {
+		t.Fatalf("items: want [m0 m1] (force-included oversized neighbor + anchor), got %v", got)
+	}
+	if res.OldestID != "m0" {
+		t.Fatalf("oldest_id: want m0 (advanced past cursor m1), got %q", res.OldestID)
+	}
+	if !res.OversizedItem {
+		t.Fatalf("oversized_item: want true (neighbor alone > maxBytes), got false")
+	}
+	if res.ActualBytes != neighborSize {
+		t.Fatalf("actual_bytes: want %d (the oversized neighbor's size), got %d", neighborSize, res.ActualBytes)
+	}
+	if res.BudgetBytes != maxBytes {
+		t.Fatalf("budget_bytes: want %d, got %d", maxBytes, res.BudgetBytes)
+	}
+	// Matching projectMessageWindow's oversized precedent: bytes_limited and
+	// count_limited are NOT set (the oversized short-circuit fires before either
+	// bound is evaluated).
+	if res.BytesLimited || res.CountLimited {
+		t.Fatalf("bytes_limited/count_limited: want both false (oversized precedent), got bytes=%v count=%v", res.BytesLimited, res.CountLimited)
+	}
+	// m0 IS the session's oldest (index 0) → has_older false (truthful).
+	if res.HasOlder {
+		t.Fatalf("has_older: want false (m0 is the session's oldest), got true")
+	}
+}
+
+// TestPage_ForwardProgress_OversizedNeighbor_WithMoreOlder: sub-case (c) where
+// further older messages exist beyond the oversized neighbor. has_older is true;
+// oversized_item still stamps the diagnostics.
+func TestPage_ForwardProgress_OversizedNeighbor_WithMoreOlder(t *testing.T) {
+	// [m0, m1(big), m2(anchor), m3]: m1 alone exceeds the budget. m0 exists
+	// beyond m1 → has_older should be true.
+	list := []MessageWithParts{
+		pageMsg("m0", 10),
+		pageMsg("m1", 5000), // first strictly-older, oversized
+		pageMsg("m2", 10),   // anchor
+		pageMsg("m3", 10),
+	}
+	maxBytes := 1000
+	res := projectMessagePage(list, "m2", 5, maxBytes)
+	if !res.BoundaryFound {
+		t.Fatalf("boundary_found: want true, got false")
+	}
+	if got := msgIDs(res.Items); !equalStrings(got, []string{"m1", "m2"}) {
+		t.Fatalf("items: want [m1 m2] (oversized neighbor + anchor), got %v", got)
+	}
+	if res.OldestID != "m1" {
+		t.Fatalf("oldest_id: want m1 (advanced), got %q", res.OldestID)
+	}
+	if !res.OversizedItem {
+		t.Fatalf("oversized_item: want true, got false")
+	}
+	// m0 exists beyond the oversized m1 → has_older true.
+	if !res.HasOlder {
+		t.Fatalf("has_older: want true (m0 exists beyond the oversized neighbor), got false")
+	}
+	if res.BytesLimited || res.CountLimited {
+		t.Fatalf("bytes/count limited: want false (oversized precedent), got bytes=%v count=%v", res.BytesLimited, res.CountLimited)
+	}
+}
+
+// TestPage_ForwardProgress_ForceIncludedIsOldest guards constraint #2: when the
+// force-included first-older IS the session's oldest message (no further older
+// exists), has_older MUST be false — do NOT leave a stale bytes_limited=true
+// implying more exist. This is the truthful end-of-history signal.
+func TestPage_ForwardProgress_ForceIncludedIsOldest(t *testing.T) {
+	// [m0(big-ish), m1(anchor)]: m0 is the ONLY strictly-older. anchor + m0 >
+	// maxBytes (sub-case b), but m0 alone fits. After force-including m0, the
+	// loop exits (no further older) → bytes_limited stays false, has_older
+	// stays false.
+	list := []MessageWithParts{
+		pageMsg("m0", 10), // the ONLY strictly-older; force-included
+		pageMsg("m1", 10), // anchor
+		pageMsg("m2", 10),
+	}
+	anchorSize := messageSerializedBytes(list[1])
+	maxBytes := anchorSize + 50 // anchor + m0 > maxBytes, but m0 alone fits
+	res := projectMessagePage(list, "m1", 5, maxBytes)
+	if !res.BoundaryFound {
+		t.Fatalf("boundary_found: want true, got false")
+	}
+	if got := msgIDs(res.Items); !equalStrings(got, []string{"m0", "m1"}) {
+		t.Fatalf("items: want [m0 m1], got %v", got)
+	}
+	if res.OldestID != "m0" {
+		t.Fatalf("oldest_id: want m0 (advanced), got %q", res.OldestID)
+	}
+	// CRUX (constraint #2): has_older MUST be false. m0 is the session's oldest;
+	// a stale bytes_limited=true would imply more older exist (wrong).
+	if res.HasOlder {
+		t.Fatalf("has_older: want false (force-included m0 IS the session's oldest; constraint #2), got true")
+	}
+	if res.BytesLimited {
+		t.Fatalf("bytes_limited: want false (loop exited at the oldest, no stale flag), got true")
+	}
+	if res.CountLimited {
+		t.Fatalf("count_limited: want false, got true")
+	}
+}
+
+// TestPage_ForwardProgress_ChainedWalk verifies that two successive "Load older"
+// calls from above a big message each advance oldest_id STRICTLY — the client
+// can walk backward through history without stalling. This is the end-to-end
+// forward-progress guarantee: the fix at one page boundary does not create a
+// stall at the next.
+//
+// This walk APPROACHES the big message from above (the realistic "Load older"
+// direction): neither cursor IS the oversized message. The sibling
+// TestPage_ForwardProgress_ChainedWalk_OversizedCursor covers the case where
+// the cursor itself IS the oversized message (sub-case d: the required pair).
+func TestPage_ForwardProgress_ChainedWalk(t *testing.T) {
+	// [m0, m1(big), m2, m3, m4]: m1 is oversized (alone > budget). Walking
+	// backward from m4: call 1 byte-bounds at m2 (m1 too big to add after
+	// m2+m3); call 2 force-includes the oversized m1 as its first-strictly-older.
+	list := []MessageWithParts{
+		pageMsg("m0", 10),
+		pageMsg("m1", 5000), // oversized message in the middle
+		pageMsg("m2", 10),
+		pageMsg("m3", 10),
+		pageMsg("m4", 10),
+	}
+	maxBytes := 1000
+
+	// Call 1: before=m4. First strictly-older m3 force-included; m2 included;
+	// m1 too big (bytes_limited). oldest_id advances to m2.
+	res1 := projectMessagePage(list, "m4", 5, maxBytes)
+	if res1.OldestID != "m2" {
+		t.Fatalf("call 1 (before=m4): oldest_id want m2, got %q", res1.OldestID)
+	}
+	if !res1.HasOlder {
+		t.Fatalf("call 1: has_older want true (m0,m1 exist), got false")
+	}
+	if !isStrictlyOlder(list, "m2", "m4") {
+		t.Fatalf("call 1: oldest_id m2 must be strictly older than cursor m4")
+	}
+
+	// Call 2: before=m2 (the new cursor from call 1). First strictly-older is
+	// m1 (oversized, alone > budget). Force-included (sub-case c). oldest_id
+	// advances to m1 — STRICTLY older than m2.
+	res2 := projectMessagePage(list, "m2", 5, maxBytes)
+	if res2.OldestID != "m1" {
+		t.Fatalf("call 2 (before=m2): oldest_id want m1, got %q", res2.OldestID)
+	}
+	if !res2.OversizedItem {
+		t.Fatalf("call 2: oversized_item want true (m1 alone > budget), got false")
+	}
+	if !res2.HasOlder {
+		t.Fatalf("call 2: has_older want true (m0 exists beyond m1), got false")
+	}
+	if !isStrictlyOlder(list, "m1", "m2") {
+		t.Fatalf("call 2: oldest_id m1 must be strictly older than cursor m2")
+	}
+}
+
+// TestPage_ForwardProgress_OversizedAnchor_WithNeighbors is the DIRECT infinite-
+// refetch regression (sub-case d, multiple older neighbors). When the oversized
+// anchor has more than one older neighbor, the page MUST return the required
+// pair [first-neighbor, anchor], OldestID MUST advance to the first neighbor
+// (NOT stay at the cursor), AND OldestID MUST differ from before. Before the
+// O1 fix this returned [anchor] alone with OldestID==before && HasOlder=true →
+// zero progress → infinite refetch.
+func TestPage_ForwardProgress_OversizedAnchor_WithNeighbors(t *testing.T) {
+	// [m0, m1, oversized-anchor]: the anchor alone exceeds the budget; m0 and
+	// m1 are both strictly older. The pair is [m1, anchor]; m0 exists beyond.
+	list := []MessageWithParts{
+		pageMsg("m0", 10),
+		pageMsg("m1", 10),
+		pageMsg("big", 5000), // oversized anchor
+	}
+	anchorSize := messageSerializedBytes(list[2])
+	maxBytes := anchorSize - 1 // anchor alone exceeds budget
+	res := projectMessagePage(list, "big", 5, maxBytes)
+	if !res.BoundaryFound {
+		t.Fatalf("boundary_found: want true, got false")
+	}
+	// CRUX: the pair, not [anchor] alone.
+	if got := msgIDs(res.Items); !equalStrings(got, []string{"m1", "big"}) {
+		t.Fatalf("items: want [m1 big] (required pair: first-neighbor + oversized anchor), got %v", got)
+	}
+	// CRUX: OldestID MUST be strictly older than the cursor (the direct
+	// infinite-refetch assertion).
+	if res.OldestID == res.RequestBefore {
+		t.Fatalf("oldest_id == before (%q): STALL — cursor never advanced (infinite refetch)", res.OldestID)
+	}
+	if res.OldestID != "m1" {
+		t.Fatalf("oldest_id: want m1 (advanced past cursor 'big'), got %q", res.OldestID)
+	}
+	if res.NewestID != "big" {
+		t.Fatalf("newest_id: want big (overlap == RequestBefore), got %q", res.NewestID)
+	}
+	// m0 exists beyond the neighbor m1 → has_older true.
+	if !res.HasOlder {
+		t.Fatalf("has_older: want true (m0 exists beyond the neighbor m1), got false")
+	}
+	if !res.OversizedItem {
+		t.Fatalf("oversized_item: want true (anchor alone > maxBytes), got false")
+	}
+	// The D-trigger gating flags: OversizedItem=true suppresses the boundary-
+	// demand fetch; bytes_limited/count_limited stay false (no ordinary
+	// accumulation ran for this branch).
+	if res.BytesLimited || res.CountLimited {
+		t.Fatalf("bytes/count limited: want both false (oversized-anchor pair branch), got bytes=%v count=%v", res.BytesLimited, res.CountLimited)
+	}
+	if res.ActualBytes != anchorSize {
+		t.Fatalf("actual_bytes: want %d (the oversized anchor's size), got %d", anchorSize, res.ActualBytes)
+	}
+	if res.MessageCount != 2 {
+		t.Fatalf("message_count: want 2 (the required pair), got %d", res.MessageCount)
+	}
+}
+
+// TestPage_ForwardProgress_OversizedAnchor_MaxCount1 pins the maxCount=1 TWO-
+// ITEM EXCEPTION: when the anchor is oversized with an older neighbor, the page
+// returns 2 items (the required pair) even though the caller passed limit=1,
+// because the overlap anchor + one strictly-older progress item are both part
+// of the minimum required atomic set. This mirrors projectMessageWindow force-
+// including its oversized newest regardless of maxCount.
+func TestPage_ForwardProgress_OversizedAnchor_MaxCount1(t *testing.T) {
+	list := []MessageWithParts{
+		pageMsg("m1", 10),
+		pageMsg("big", 5000), // oversized anchor
+	}
+	anchorSize := messageSerializedBytes(list[1])
+	maxBytes := anchorSize - 1 // anchor alone exceeds budget
+	// maxCount=1: the caller asked for at most 1 item, but the minimum
+	// required atomic set is the pair [neighbor, anchor] (2 items).
+	res := projectMessagePage(list, "big", 1, maxBytes)
+	if !res.BoundaryFound {
+		t.Fatalf("boundary_found: want true, got false")
+	}
+	if got := msgIDs(res.Items); !equalStrings(got, []string{"m1", "big"}) {
+		t.Fatalf("items: want [m1 big] (maxCount=1 two-item exception), got %v", got)
+	}
+	if res.MessageCount != 2 {
+		t.Fatalf("message_count: want 2 (the exception returns the required pair despite limit=1), got %d", res.MessageCount)
+	}
+	if res.OldestID != "m1" {
+		t.Fatalf("oldest_id: want m1 (advanced past cursor 'big'), got %q", res.OldestID)
+	}
+	if !res.OversizedItem {
+		t.Fatalf("oversized_item: want true, got false")
+	}
+	// m1 IS the oldest → has_older false.
+	if res.HasOlder {
+		t.Fatalf("has_older: want false (m1 is the session's oldest), got true")
+	}
+}
+
+// TestPage_ForwardProgress_ChainedWalk_OversizedCursor proves repeated paging
+// from a cursor AT an oversized message produces ≥1 newly-older message whenever
+// has_older=true, advances the cursor each step, does NOT loop on the oversized
+// anchor, and terminates with has_older=false. This is the end-to-end
+// forward-progress guarantee for the residual stall class (sub-case d): before
+// the O1 fix, a page whose `before` cursor was the oversized message returned
+// [anchor] alone with OldestID==before && HasOlder=true → the walk could never
+// advance past the oversized anchor.
+func TestPage_ForwardProgress_ChainedWalk_OversizedCursor(t *testing.T) {
+	// [m0, m1, m2, big-oversized-anchor, m4]: the oversized message is the
+	// page cursor for call 1. The walk must step through the oversized anchor
+	// (pair), then through the normal older neighbors, terminating at m0.
+	list := []MessageWithParts{
+		pageMsg("m0", 10),
+		pageMsg("m1", 10),
+		pageMsg("m2", 10),
+		pageMsg("big", 5000), // oversized; IS the call-1 cursor
+		pageMsg("m4", 10),
+	}
+	anchorSize := messageSerializedBytes(list[3])
+	maxBytes := anchorSize - 1 // 'big' alone exceeds budget
+
+	// Call 1: before=big (the oversized cursor). Sub-case d: required pair
+	// [m2, big]; OldestID advances to m2; has_older=true (m0,m1 beyond).
+	res1 := projectMessagePage(list, "big", 5, maxBytes)
+	if res1.OldestID == res1.RequestBefore {
+		t.Fatalf("call 1: oldest_id == before (%q): STALL (the oversized cursor never advanced)", res1.OldestID)
+	}
+	if res1.OldestID != "m2" {
+		t.Fatalf("call 1 (before=big): oldest_id want m2, got %q", res1.OldestID)
+	}
+	if got := msgIDs(res1.Items); !equalStrings(got, []string{"m2", "big"}) {
+		t.Fatalf("call 1: items want [m2 big] (required pair), got %v", got)
+	}
+	if !res1.HasOlder {
+		t.Fatalf("call 1: has_older want true (m0,m1 exist beyond m2), got false")
+	}
+	if !res1.OversizedItem {
+		t.Fatalf("call 1: oversized_item want true, got false")
+	}
+	if !isStrictlyOlder(list, "m2", "big") {
+		t.Fatalf("call 1: oldest_id m2 must be strictly older than cursor big")
+	}
+
+	// Call 2: before=m2 (the new cursor). 'big' is no longer involved; the
+	// walk continues through the normal older neighbors. maxBytes is now
+	// generous relative to the small messages, so the page reaches m1 (and
+	// possibly m0). OldestID advances strictly past m2.
+	res2 := projectMessagePage(list, "m2", 5, maxBytes)
+	if res2.OldestID == res2.RequestBefore {
+		t.Fatalf("call 2: oldest_id == before (%q): STALL", res2.OldestID)
+	}
+	if !isStrictlyOlder(list, res2.OldestID, "m2") {
+		t.Fatalf("call 2: oldest_id %q must be strictly older than cursor m2", res2.OldestID)
+	}
+	// With the generous budget relative to small messages, call 2 reaches the
+	// oldest message m0 → has_older=false (truthful end-of-history).
+	if res2.OldestID != "m0" {
+		t.Fatalf("call 2 (before=m2): oldest_id want m0 (reached start), got %q", res2.OldestID)
+	}
+	if res2.HasOlder {
+		t.Fatalf("call 2: has_older want false (reached m0, the session's oldest), got true")
+	}
+
+	// Termination invariant: the walk MUST have terminated with has_older=false
+	// (call 2), proving it does NOT loop forever on the oversized anchor.
+	if res1.HasOlder && !res2.HasOlder {
+		// expected: call 1 had more history, call 2 exhausted it.
+	} else {
+		t.Fatalf("chained walk did not terminate: call1.has_older=%v call2.has_older=%v", res1.HasOlder, res2.HasOlder)
+	}
+}
+
+// isStrictlyOlder returns true if `older` appears before `newer` in the
+// creation-ordered list (oldest first). Used by the chained-walk test to verify
+// strict oldest_id advancement.
+func isStrictlyOlder(list []MessageWithParts, older, newer string) bool {
+	olderIdx, newerIdx := -1, -1
+	for i := range list {
+		id := messageIDFromInfo(list[i].Info)
+		if id == older {
+			olderIdx = i
+		}
+		if id == newer {
+			newerIdx = i
+		}
+	}
+	if olderIdx < 0 || newerIdx < 0 {
+		return false
+	}
+	return olderIdx < newerIdx
 }
 
 // --- Store accessor tests ---

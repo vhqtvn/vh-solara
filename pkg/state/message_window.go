@@ -258,6 +258,14 @@ type MessagePageResult struct {
 	// HasOlder is true when older messages exist beyond this page. The client
 	// uses this (NOT boundary_found) to decide whether to render a "Load older"
 	// affordance below the prepended page.
+	//
+	// Forward-progress guarantee (UNIVERSAL): when BoundaryFound==true &&
+	// HasOlder==true, Items contains at least one message strictly older than
+	// RequestBefore, and OldestID identifies that message or an even older
+	// returned message. This holds for EVERY overshoot sub-case including an
+	// oversized anchor with older history (sub-case d: the required pair
+	// [neighbor, anchor] advances OldestID to the neighbor), so a "Load older"
+	// walk never stalls on a zero-progress page.
 	HasOlder bool `json:"has_older"`
 	// MessageCount is len(Items); carried explicitly so a client reads it
 	// without decoding the items array.
@@ -270,6 +278,14 @@ type MessagePageResult struct {
 	// CountLimited / BytesLimited signal WHY the page stopped, mirroring
 	// WindowMeta. A "Load older" affordance is meaningful iff HasOlder (which
 	// is set when either limit fires AND older messages exist).
+	//
+	// bytes_limited is the natural signal for the byte-budget overshoot case
+	// (sub-case b): when the first strictly-older message is force-included
+	// past the byte budget (anchor + first-older > maxBytes, but neither alone
+	// oversized), bytes_limited fires on the NEXT older message (if one
+	// remains) as the "overshot budget by one atomic item" signal. When the
+	// force-included first-older IS the session's oldest (no further older
+	// remains), bytes_limited stays false so HasOlder is truthful (false).
 	CountLimited bool `json:"count_limited"`
 	BytesLimited bool `json:"bytes_limited"`
 	// HistoryExhausted is true once a backward older-page fetch reached the
@@ -278,11 +294,34 @@ type MessagePageResult struct {
 	// page from opencode when the resident walk hits the resident floor without a
 	// count/byte limit. HasOlder = countLimited || bytesLimited || !HistoryExhausted.
 	HistoryExhausted bool `json:"history_exhausted"`
-	// OversizedItem / ActualBytes / BudgetBytes mirror WindowMeta: set ONLY in
-	// the oversized-anchor case (the ?before= message alone exceeds the byte
-	// budget). The page returns the anchor alone so the client never sees a
-	// silent gap, and signals the overflow so it can explain the single-item
-	// page.
+	// OversizedItem / ActualBytes / BudgetBytes mirror WindowMeta. They are
+	// set in three cases (all keep messages atomic — a message is NEVER split
+	// or truncated):
+	//  1. Oversized anchor WITH NO older history (anchorIdx==0): the ?before=
+	//     message alone exceeds the byte budget AND is the session's oldest →
+	//     the page returns [anchor] ALONE (truthful end-of-history; HasOlder=
+	//     false). ActualBytes is the anchor's byte size.
+	//  2. Oversized anchor WITH older history (anchorIdx>0, sub-case d): the
+	//     anchor alone exceeds the byte budget but older messages exist → the
+	//     page returns the REQUIRED ATOMIC PAIR [neighbor, anchor] (neighbor
+	//     = list[anchorIdx-1]) so OldestID ADVANCES past the cursor. ActualBytes
+	//     is the OVERSIZED ANCHOR's byte size (NOT the page total —
+	//     SerializedBytes carries the truthful pair total). HasOlder reflects
+	//     whether messages exist beyond the neighbor (anchorIdx > 1).
+	//  3. Oversized first-strictly-older (sub-case c): the first strictly-
+	//     older message alone exceeds the byte budget → the page force-
+	//     includes it anyway (atomic forward progress; OldestID advances
+	//     past the cursor) and stamps the diagnostics so a client can explain
+	//     the single-older-item overshoot. bytes_limited/count_limited stay
+	//     false (matching projectMessageWindow's oversized-newest precedent:
+	//     the oversized short-circuit fires before either bound is evaluated).
+	//     ActualBytes is the oversized neighbor's byte size. HasOlder reflects
+	//     whether even-older messages exist beyond it.
+	// In all three cases ActualBytes is the OVERSIZED ITEM's byte size (NOT
+	// the page total) and BudgetBytes is the maxBytes bound. OversizedItem is
+	// kept true in cases 2 and 3 so the Part-B boundary-demand D-triggers
+	// (messages_http.go:122 + SnapshotMessagesPage) gate their opencode older-
+	// page fetch on !OversizedItem and do NOT misfire.
 	OversizedItem bool `json:"oversized_item,omitempty"`
 	ActualBytes   int  `json:"actual_bytes,omitempty"`
 	BudgetBytes   int  `json:"budget_bytes,omitempty"`
@@ -297,6 +336,53 @@ type MessagePageResult struct {
 // NOT already present), so continuity is preserved even if the resident cache
 // evicted the boundary message.
 //
+// UNIVERSAL FORWARD-PROGRESS GUARANTEE: when BoundaryFound==true &&
+// HasOlder==true, Items contains at least one message strictly older than
+// RequestBefore, and OldestID identifies that message (or an even older
+// returned message) — so a "Load older" walk NEVER stalls on a zero-progress
+// page. This is enforced by the minimum-required-atomic-set policy below.
+//
+// MINIMUM-REQUIRED-ATOMIC-SET POLICY: byte/count caps govern ORDINARY
+// accumulation; a projector may exceed them ONLY for its minimum required
+// atomic set (messages are NEVER split or truncated):
+//   - projectMessageWindow requires its newest (force-included even when
+//     oversized, regardless of maxCount).
+//   - projectMessagePage, when BoundaryFound && older history exists, requires
+//     its overlap anchor + the first strictly-older message (the neighbor at
+//     anchorIdx-1). This holds for EVERY overshoot sub-case:
+//     (b) neighbor-alone <= maxBytes but anchor + neighbor > maxBytes: the
+//     neighbor is included; bytes_limited fires on the next older message
+//     (if one remains) as the "overshot budget by one atomic item" signal.
+//     When the neighbor IS the session's oldest (no further older),
+//     bytes_limited stays false so HasOlder is truthful (false).
+//     (c) neighbor-alone > maxBytes: the neighbor is included anyway (atomic
+//     forward progress); oversized_item + actual_bytes/budget_bytes are
+//     stamped (bytes_limited/count_limited stay false, matching
+//     projectMessageWindow's oversized-newest precedent).
+//     (d) ANCHOR-alone > maxBytes AND anchorIdx > 0 (oversized anchor WITH
+//     older history): the required atomic pair [neighbor, anchor] is
+//     returned — the neighbor (list[anchorIdx-1]) is force-included so
+//     OldestID ADVANCES past the cursor. OversizedItem stays true so the
+//     D-triggers below do not misfire; HasOlder reflects whether messages
+//     beyond the neighbor exist (anchorIdx > 1). This mirrors
+//     projectMessageWindow force-including its oversized newest regardless
+//     of maxCount. (When anchorIdx == 0 — the oversized anchor IS the
+//     session's oldest — no older history exists, so no progress is needed
+//     and the page returns [anchor] alone with HasOlder=false, truthful
+//     end-of-history.)
+//
+// The maxCount=1 TWO-ITEM EXCEPTION: in sub-case (d) (and the atomic force-
+// includes in b/c), the page may return 2 items even when the caller passed
+// limit=1, because the overlap anchor + one strictly-older progress item are
+// both part of the minimum required atomic set. This is documented behavior,
+// not a limit violation.
+//
+// In every overshoot sub-case where further older messages remain, at least
+// one of bytes_limited/oversized_item is true, so the Part-B boundary-demand
+// triggers at messages_http.go:122 and message_window.go (SnapshotMessagesPage
+// — see the !CountLimited && !BytesLimited && !OversizedItem gate) — do NOT
+// misfire and re-fetch from opencode for a pure byte-budget overshoot.
+//
 // Contract:
 //   - `before` is REQUIRED. An empty cursor returns an empty page with
 //     boundary_found=false (the initial window is the documented source of the
@@ -305,11 +391,19 @@ type MessagePageResult struct {
 //     boundary_found=false (the client refetches from a known-good cursor;
 //     Contract-B's dirty-flag is the primary guard against resurrecting a
 //     deleted-then-recreated message).
-//   - If the anchor (`before`) alone exceeds maxBytes, the page returns it
-//     ALONE with oversized_item + actual_bytes/budget_bytes (the same
-//     atomic-message guarantee as projectMessageWindow).
+//   - If the anchor (`before`) alone exceeds maxBytes, two sub-cases:
+//     (A) the anchor is the session's OLDEST message (anchorIdx==0, no older
+//     history) → the page returns [anchor] alone with oversized_item +
+//     actual_bytes/budget_bytes and HasOlder=false (truthful end-of-
+//     history); (B) the anchor HAS older history (anchorIdx>0) → the page
+//     returns the required atomic pair [neighbor, anchor] (sub-case d
+//     above) so OldestID ADVANCES past the cursor. In both, oversized_item
+//     is stamped and messages stay atomic (NEVER split or truncated).
 //   - `limit` bounds TOTAL page size (overlap + older), matching
-//     projectMessageWindow's maxCount semantics.
+//     projectMessageWindow's maxCount semantics. The count bound governs
+//     messages AFTER the force-included first strictly-older. The maxCount=1
+//     two-item exception (above) may return 2 items when the minimum required
+//     atomic set demands it.
 //
 // PURE and DETERMINISTIC: same input list + cursor → same page + same metadata.
 // This is what makes the page a point-in-time Contract-B snapshot the client can
@@ -354,35 +448,134 @@ func projectMessagePage(list []MessageWithParts, before string, maxCount, maxByt
 	res.SerializedBytes = anchorSize
 
 	if anchorSize > maxBytes {
-		// Oversized anchor: return it ALONE. has_older reflects whether older
-		// messages exist beyond the anchor (i.e. anchorIdx > 0).
-		res.Items = page
-		res.HasOlder = anchorIdx > 0
+		// Oversized anchor: the ?before= message alone exceeds the byte
+		// budget. Two sub-cases, decided by whether the anchor HAS older
+		// history (the UNIVERSAL FORWARD-PROGRESS GUARANTEE below applies):
+		//
+		//  A. anchorIdx == 0 (the anchor IS the session's oldest message):
+		//     return it ALONE. HasOlder=false — truthful end-of-history (no
+		//     older message exists, so no forward progress is needed). This
+		//     is the ONLY case where Items=[anchor] alone with
+		//     OversizedItem=true is the final page.
+		//
+		//  B. anchorIdx > 0 (the oversized anchor HAS older history): return
+		//     the REQUIRED ATOMIC PAIR [neighbor, anchor] where neighbor is
+		//     list[anchorIdx-1] (creation order: neighbor is strictly older).
+		//     Stopping at [anchor] alone here would set OldestID==before and
+		//     HasOlder=true → zero progress → infinite refetch loop. The pair
+		//     exceeds BOTH the byte bound (anchor alone already does) AND the
+		//     count bound (the maxCount=1 two-item exception — see the
+		//     guarantee below), matching projectMessageWindow force-including
+		//     its oversized newest regardless of maxCount. STOP after the
+		//     pair: do NOT continue the normal accumulation loop for further
+		//     older messages in this branch.
+		if anchorIdx == 0 {
+			// Sub-case A: oversized anchor IS the session's oldest.
+			// Truthful end-of-history.
+			res.Items = page
+			res.HasOlder = false
+			res.OversizedItem = true
+			res.ActualBytes = anchorSize
+			res.BudgetBytes = maxBytes
+			res.MessageCount = 1
+			return res
+		}
+		// Sub-case B: oversized anchor with older history → required pair.
+		neighbor := list[anchorIdx-1]
+		neighborSize := messageSerializedBytes(neighbor)
+		page = append(page, neighbor)
+		res.SerializedBytes += neighborSize
+		res.OldestID = messageIDFromInfo(neighbor.Info) // ADVANCED past cursor
+		// HasOlder is truthful: are there messages beyond the neighbor?
+		// (neighbor is list[anchorIdx-1]; list[anchorIdx-2] and below remain
+		// iff anchorIdx > 1.)
+		res.HasOlder = anchorIdx > 1
+		// OversizedItem stays true so BOTH Part-B boundary-demand D-trigger
+		// readers (messages_http.go:122 and SnapshotMessagesPage below, line
+		// ~556) — which gate the opencode older-page fetch on !OversizedItem
+		// — do NOT misfire. SerializedBytes carries the truthful page total
+		// for the returned pair; ActualBytes follows the struct contract
+		// (the OVERSIZED ITEM's bytes — the anchor here, matching the
+		// projectMessageWindow oversized-newest precedent).
 		res.OversizedItem = true
 		res.ActualBytes = anchorSize
 		res.BudgetBytes = maxBytes
-		res.MessageCount = 1
+		// page was built newest-first (anchor, neighbor); reverse to
+		// creation order (neighbor, anchor) for the client's verbatim prepend.
+		for i, j := 0, len(page)-1; i < j; i, j = i+1, j-1 {
+			page[i], page[j] = page[j], page[i]
+		}
+		res.Items = page
+		res.MessageCount = len(page)
 		return res
 	}
 
 	countLimited := false
 	bytesLimited := false
-	for i := anchorIdx - 1; i >= 0; i-- {
-		m := list[i]
-		size := messageSerializedBytes(m)
-		if len(page)+1 > maxCount {
-			countLimited = true
-			break
+	oversizedFirstOlder := false
+	// FORWARD-PROGRESS GUARANTEE: the first strictly-older message (index
+	// anchorIdx-1) is ALWAYS included (atomic), mirroring projectMessageWindow's
+	// "newest always included even if oversized" rule. Without this, anchor +
+	// first-older > maxBytes would leave the page at [anchor] with OldestID ==
+	// before (never advanced) and HasOlder == true → the client merges 0 new
+	// messages and refetches the identical zero-progress page forever.
+	if anchorIdx > 0 {
+		firstOlder := list[anchorIdx-1]
+		firstOlderSize := messageSerializedBytes(firstOlder)
+		if firstOlderSize > maxBytes {
+			// Sub-case (c): the first strictly-older alone exceeds the byte
+			// budget. Include it anyway (atomic forward progress), stamp
+			// oversized_item + actual_bytes/budget_bytes (matching
+			// projectMessageWindow's oversized-newest precedent: bytes_limited/
+			// count_limited stay false), and stop — the budget is blown by a
+			// single atomic item so no further older message can fit.
+			page = append(page, firstOlder)
+			res.SerializedBytes += firstOlderSize
+			res.OldestID = messageIDFromInfo(firstOlder.Info)
+			oversizedFirstOlder = true
+			res.ActualBytes = firstOlderSize
+			res.BudgetBytes = maxBytes
+		} else {
+			// Sub-case (b) or normal: include even when anchor + first-older >
+			// maxBytes. The byte loop below sets bytes_limited on the NEXT
+			// older message (if one remains) as the "overshot budget by one
+			// atomic item" signal. When the first-older IS the session's
+			// oldest (no further older), the loop exits with no limit flag so
+			// HasOlder stays false (truthful end-of-history).
+			page = append(page, firstOlder)
+			res.SerializedBytes += firstOlderSize
+			res.OldestID = messageIDFromInfo(firstOlder.Info)
 		}
-		if res.SerializedBytes+size > maxBytes {
-			bytesLimited = true
-			break
-		}
-		page = append(page, m)
-		res.SerializedBytes += size
-		res.OldestID = messageIDFromInfo(m.Info)
 	}
-	res.HasOlder = countLimited || bytesLimited
+	// Normal dual-bound loop for SUBSEQUENT older messages (anchorIdx-2 and
+	// below). Skipped entirely when the first strictly-older was oversized
+	// (sub-case c: the budget is already blown by one atomic item).
+	if !oversizedFirstOlder {
+		for i := anchorIdx - 2; i >= 0; i-- {
+			m := list[i]
+			size := messageSerializedBytes(m)
+			if len(page)+1 > maxCount {
+				countLimited = true
+				break
+			}
+			if res.SerializedBytes+size > maxBytes {
+				bytesLimited = true
+				break
+			}
+			page = append(page, m)
+			res.SerializedBytes += size
+			res.OldestID = messageIDFromInfo(m.Info)
+		}
+	}
+	if oversizedFirstOlder {
+		res.OversizedItem = true
+		// has_older reflects whether even-older messages exist beyond the
+		// oversized first-older (anchorIdx-2 >= 0, i.e. anchorIdx > 1).
+		// bytes_limited/count_limited stay false (window_test.go precedent).
+		res.HasOlder = anchorIdx > 1
+	} else {
+		res.HasOlder = countLimited || bytesLimited
+	}
 	res.CountLimited = countLimited
 	res.BytesLimited = bytesLimited
 	// page was built newest-first (anchor, older, older...); reverse to
