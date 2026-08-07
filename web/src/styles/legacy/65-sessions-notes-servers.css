@@ -156,4 +156,23 @@
 }
 .confirm-go:hover { background: color-mix(in srgb, var(--warn) 28%, var(--bg)); }
 
+/* Delete confirm — destructive variant. The Archive confirm's confirm-go uses
+   --warn (amber); the Delete confirm is IRREVERSIBLE, so the .danger modifier
+   on .dialog.confirm gives it a red/danger border + accent (title) + a SOLID-
+   danger confirm-go button, distinct at a glance from the amber Archive confirm
+   (recoverable caution). Scoped to .dialog.confirm.danger so the Archive confirm
+   (.dialog.confirm WITHOUT .danger) is untouched. Solid colors + color-mix tints
+   only — GPU-cheap on this transient dialog: no mask-image, no backdrop-filter,
+   no per-element contain/content-visibility (AGENTS.md "Firefox/WebRender
+   gotchas"). The solid confirm-go mirrors the existing .send-btn.stop danger
+   button (background: var(--danger); color: var(--danger-fg)). */
+.dialog.confirm.danger { border-color: color-mix(in srgb, var(--danger) 55%, var(--border)); }
+.dialog.confirm.danger .dialog-title { color: var(--danger-fg); }
+.dialog.confirm.danger .confirm-go {
+  background: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 70%, var(--border));
+  color: var(--danger-fg);
+}
+.dialog.confirm.danger .confirm-go:hover { background: color-mix(in srgb, var(--danger) 85%, var(--bg)); }
+
 

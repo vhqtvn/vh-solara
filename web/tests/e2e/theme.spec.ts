@@ -98,18 +98,18 @@ test("light theme: every destructive menu item uses a readable red, not faint pi
   await useLightTheme(page);
   await page.getByRole("button", { name: /Demo session/ }).click();
 
-  // Right-click the chat header title → the session context menu, which has TWO
-  // destructive items sharing the .ctxm-item.danger class: Archive… and Delete…
-  // (both intentional — Delete is the irreversible one, placed below Archive).
+  // Right-click the chat header title → the session context menu. Delete is no
+  // longer a visible menu item (it moved behind a long-press on the Archive
+  // button → the irreversible Delete confirm); only Archive… remains as a
+  // destructive menu item sharing the .ctxm-item.danger class. Assert readable
+  // red on it so an accidental de-styling of the destructive entry is caught.
   await page.locator(".main-title.has-menu").click({ button: "right" });
   const dangers = page.locator(".ctxm-item.danger");
-  // The menu renders two destructive items (Archive…, Delete…); assert readable
-  // red on EACH so an accidental de-styling of either (esp. Delete, the
-  // irreversible action) is caught.
+  // The menu renders ONE destructive item (Archive…); assert readable red on it.
   // Auto-retrying wait (replaces the old expect(danger).toBeVisible()): settle
   // the menu's danger items before snapshotting count() / reading colors, so an
   // async mount can't transiently read 0/1 and trip the floor guard.
-  await expect(dangers).toHaveCount(2);
+  await expect(dangers).toHaveCount(1);
   const count = await dangers.count();
   for (let i = 0; i < count; i++) {
     const color = await dangers.nth(i).evaluate((el) => getComputedStyle(el).color);

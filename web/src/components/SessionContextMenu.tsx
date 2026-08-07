@@ -28,6 +28,7 @@ import {
   openDeleteConfirm,
 } from "../sessionMenu";
 import { displayName } from "../projectSettings";
+import { classifyHold } from "../lib/copyHold";
 import Icon from "./Icon";
 import TextPromptDialog from "./TextPromptDialog";
 import { defaultColorForIndex, labelColorVar } from "./labelPalette";
@@ -223,6 +224,12 @@ export default function SessionContextMenu() {
 
   function Items(props: { id: string; title: string }) {
     const line = () => `${props.title} (${props.id})`;
+    // Archive button hold state: a long-press (>= HOLD_THRESHOLD_MS) opens the
+    // irreversible Delete confirm; a tap opens the recoverable Archive confirm.
+    // The Delete menu item was removed, so the long-press is the only delete
+    // entry. Fresh per menu-open: <Items> mounts inside <Show>, so each open
+    // re-initializes this to 0 (no stale state across opens). See the button.
+    let archiveDownAt = 0;
     return (
       <>
         {/* Pin sync error hint (dismissible). The mutation resolves AFTER the
@@ -452,21 +459,43 @@ export default function SessionContextMenu() {
           </button>
         </div>
         <div class="ctxm-sep" />
+        {/* Archive: a TAP opens the (recoverable) Archive confirm; a LONG-PRESS
+            (hold) opens the IRREVERSIBLE Delete confirm — the standalone Delete
+            menu item was removed, so the long-press is the only delete entry.
+            The hold wiring mirrors the Copy button (MessageRow.tsx): pointerdown
+            records the press time, click classifies via classifyHold. The
+            downAt===0 sentinel means a keyboard activation (Enter/Space) or
+            programmatic .click() classifies as "tap" → Archive (the safe
+            default). onContextMenu only preventDefaults (suppresses the native
+            menu on Android touch long-press); it performs NO action, so unlike
+            the Copy button there is no contextmenu/click double-fire to dedupe
+            (shouldSkipAfterContextmenu's precondition — a prior contextmenu
+            action — never holds), and the synthesized hold-click opens Delete
+            exactly once. */}
         <button
           type="button"
           class="ctxm-item danger"
-          onClick={() => openArchiveConfirm(props.id, props.title)}
+          onPointerDown={() => {
+            archiveDownAt = Date.now();
+          }}
+          onClick={() => {
+            const cls = classifyHold(archiveDownAt, Date.now());
+            // Reset AFTER classifyHold consumed the value (mirrors MessageRow):
+            // the next gesture's pointerdown sets it again, and the downAt===0
+            // sentinel keeps a keyboard activation safe.
+            archiveDownAt = 0;
+            if (cls === "hold") {
+              openDeleteConfirm(props.id, props.title);
+            } else {
+              openArchiveConfirm(props.id, props.title);
+            }
+          }}
+          onContextMenu={(e) => e.preventDefault()}
+          onBlur={() => {
+            archiveDownAt = 0;
+          }}
         >
           <Icon name="layers" size={14} /> Archive…
-        </button>
-        {/* Delete is DESTRUCTIVE and IRREVERSIBLE (no undelete). Placed below
-            Archive and marked danger; the confirm dialog spells out permanence. */}
-        <button
-          type="button"
-          class="ctxm-item danger"
-          onClick={() => openDeleteConfirm(props.id, props.title)}
-        >
-          <Icon name="trash" size={14} /> Delete…
         </button>
       </>
     );
@@ -646,10 +675,13 @@ export default function SessionContextMenu() {
 
       {/* Delete confirmation — DESTRUCTIVE and IRREVERSIBLE. Lists all related
           sessions (same descendant preview as archive) and makes permanence
-          explicit in the lead copy. */}
+          explicit in the lead copy. The extra `danger` class gives it a visually
+          distinct red/destructive treatment (border + accent + solid confirm
+          button) so it reads as unrecoverable at a glance, clearly different
+          from the amber Archive confirm. */}
       <Show when={deleteTarget()}>
         <div class="dialog-overlay" onClick={closeDeleteConfirm}>
-          <div class="dialog confirm" role="dialog" aria-label="Confirm delete" onClick={(e) => e.stopPropagation()}>
+          <div class="dialog confirm danger" role="dialog" aria-label="Confirm delete" onClick={(e) => e.stopPropagation()}>
             <div class="dialog-head">
               <span class="dialog-title">Delete session</span>
               <button type="button" class="icon-btn" aria-label="Close" onClick={closeDeleteConfirm}>
