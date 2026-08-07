@@ -2,15 +2,8 @@ import { For, Show } from "solid-js";
 import { DockviewHost } from "./dockview/DockviewHost";
 import { Tabstrip } from "./shell/Tabstrip";
 import { Statusbar } from "./shell/Statusbar";
-import { panes, trayIds } from "./dockview/store";
+import { hostOps, panes, trayIds } from "./dockview/store";
 import s from "./App.module.css";
-
-interface HostBridgeLike {
-  restore?: (id: string) => void;
-}
-function bridge(): HostBridgeLike | undefined {
-  return (window as unknown as { __host?: HostBridgeLike }).__host;
-}
 
 /**
  * Host shell: top workspace tabstrip, main Dockview layout-view, optional
@@ -18,7 +11,9 @@ function bridge(): HostBridgeLike | undefined {
  *
  * The tray rail is host chrome AROUND a keep-mounted floating group: collapse
  * parks a pane (addFloatingGroup, never removePanel — rule #1) and the chip
- * restores it (moveTo back into the grid). The iframe survives both.
+ * restores it (moveTo back into the grid). The iframe survives both. Layout ops
+ * are called through the typed HostOps controller surface (store.hostOps), not
+ * the DEV-only window.__host test bridge — so this shell works in production.
  */
 export function App() {
   const trayPanes = () => {
@@ -43,7 +38,7 @@ export function App() {
                 title={`Restore ${p.title}`}
                 data-testid="tray-chip"
                 data-pane={p.id}
-                onClick={() => bridge()?.restore?.(p.id)}
+                onClick={() => hostOps()?.restore?.(p.id)}
               >
                 <span class={s.trayChipServer}>{p.server}</span>
                 <span class={s.trayChipView}>{p.view}</span>

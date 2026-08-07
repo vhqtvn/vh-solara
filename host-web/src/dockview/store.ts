@@ -1,5 +1,5 @@
 import { createSignal } from "solid-js";
-import type { PaneVm, PaneToHost, Survival, SurvivalBaseline } from "./types";
+import type { HostOps, PaneVm, PaneToHost, Survival, SurvivalBaseline } from "./types";
 
 // Module-level singleton store. Signals created at module scope are fine in
 // SolidJS: components that read them inside a tracking scope re-render on
@@ -12,6 +12,22 @@ const [isMaximized, setIsMaximized] = createSignal<boolean>(false);
 const [connected, setConnected] = createSignal<boolean>(false);
 
 export { panes, focusedId, trayIds, isMaximized, connected };
+
+// ---- host imperative ops registry (set by DockviewHost, read by the shell) ----
+// The shell (App, Tabstrip) calls layout ops through this typed HostOps surface
+// instead of window.__host, so the shell never depends on the DEV-only test
+// bridge. DockviewHost registers the same mutable `ops` object the
+// HostController fills (installOps, onMount); the shell reads it with optional
+// chaining — user clicks always land post-mount, so the methods are populated by
+// then. This is the established shell⇄dockview sharing pattern (it mirrors the
+// state mutators below): it is NOT DEV-gated and it is NOT the test bridge.
+let hostOpsRef: HostOps | null = null;
+export function setHostOps(ops: HostOps): void {
+  hostOpsRef = ops;
+}
+export function hostOps(): HostOps | null {
+  return hostOpsRef;
+}
 
 // ---- per-pane survival tracking (polled by the gate, not reactive) --------
 

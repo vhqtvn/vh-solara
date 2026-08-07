@@ -1,19 +1,13 @@
 import { For, Show } from "solid-js";
-import { focusedId, panes, trayIds } from "../dockview/store";
+import { focusedId, hostOps, panes, trayIds } from "../dockview/store";
 import s from "./Tabstrip.module.css";
-
-interface HostBridgeLike {
-  split?: (id: string, dir: "right" | "down") => string | null;
-  focus?: (id: string) => void;
-}
-function bridge(): HostBridgeLike | undefined {
-  return (window as unknown as { __host?: HostBridgeLike }).__host;
-}
 
 /**
  * Top workspace tabstrip: brand + one tab per open pane + "+". Clicking a tab
  * focuses that pane — a survival-safe "switch tab" (just setActive, no layout
- * disposal). The "+" splits a new mock pane off the focused pane.
+ * disposal). The "+" splits a new mock pane off the focused pane. Layout ops go
+ * through the typed HostOps controller surface (store.hostOps), not the DEV-only
+ * window.__host test bridge, so this shell works in production builds.
  */
 export function Tabstrip() {
   return (
@@ -32,7 +26,7 @@ export function Tabstrip() {
               title={p.title}
               data-testid="ws-tab"
               data-pane={p.id}
-              onClick={() => bridge()?.focus?.(p.id)}
+              onClick={() => hostOps()?.focusPane?.(p.id)}
             >
               <span class={s.tabServer}>{p.server}</span>
               <span class={s.tabView}>{p.view}</span>
@@ -47,7 +41,7 @@ export function Tabstrip() {
         data-testid="ws-add"
         onClick={() => {
           const id = focusedId();
-          if (id) bridge()?.split?.(id, "right");
+          if (id) hostOps()?.split?.(id, "right");
         }}
       >
         +

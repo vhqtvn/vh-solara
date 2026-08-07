@@ -3,6 +3,7 @@ import { createDockview, type DockviewApi } from "dockview-core";
 import { IframeRenderer } from "./iframeRenderer";
 import { HostController } from "./hostController";
 import type { HostOps } from "./types";
+import { setHostOps } from "./store";
 import { INITIAL_PANES, nextPaneId } from "../state/mockData";
 
 /**
@@ -25,6 +26,9 @@ export function DockviewHost() {
   // Mutable ops object breaks the dockview↔controller creation cycle: the
   // factory captures it; the controller fills it after the api exists.
   const ops: HostOps = {};
+  // Register the ops object so the shell (App, Tabstrip) can call layout ops
+  // through the typed HostOps surface — NOT through the DEV-only test bridge.
+  setHostOps(ops);
   const renderers = new Map<string, IframeRenderer>();
 
   onMount(() => {
@@ -40,7 +44,8 @@ export function DockviewHost() {
       disableDnd: false,
     });
 
-    // Controller wires events, installs HostOps, and exposes window.__host.
+    // Controller wires events, installs HostOps (shell reads via store.hostOps),
+    // and exposes window.__host as a DEV-only test bridge.
     new HostController(api, renderers, ops);
 
     seedInitialPanes(api);

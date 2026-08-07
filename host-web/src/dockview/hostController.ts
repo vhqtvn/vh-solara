@@ -252,8 +252,24 @@ export class HostController implements HostOps {
   // Drives ops programmatically (deterministic survival assertions) and exposes
   // the two NEGATIVE-CONTROL hooks that deliberately do the reload-causing
   // wrong thing, so the gate can prove it detects them.
+  //
+  // DEV-ONLY. The ENTIRE bridge — including the two INTENTIONAL destructive
+  // negative-control hooks `naiveReload` and `jsonReswap` — is gated behind
+  // `import.meta.env.DEV` so production builds never expose the test surface or
+  // the destructive reload hooks. Vite statically replaces `import.meta.env.DEV`
+  // with `false` in prod builds, making this whole body unreachable, so the
+  // bridge object and both hook closures are dead-code-eliminated from the
+  // bundle (verified: grep dist/ for __host / naiveReload / jsonReswap → 0).
+  //
+  // DO NOT "helpfully" delete or expose `naiveReload` / `jsonReswap` in prod:
+  // they are INTENTIONAL negative controls. The survival regression test
+  // (tests/e2e/survival.spec.ts) drives each one and asserts it reloads the
+  // iframe, which proves the survival gate is non-vacuous (it actually detects a
+  // reload). They run only under the Vite dev server (the e2e webServer uses
+  // `npm run dev:host`), where DEV is true.
 
   private installTestBridge(): void {
+    if (!import.meta.env.DEV) return;
     const bridge = {
       panes: (): string[] => this.api.panels.map((p) => p.id),
       focused: (): string | null => focusedId(),
