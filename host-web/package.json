@@ -1,0 +1,33 @@
+{
+  "name": "vh-solara-host-web",
+  "private": true,
+  "type": "module",
+  "description": "vh-solara multi-server host SPA: SolidJS/Dockview shell embedding one cross-origin iframe per vh-solara server.",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "dev": "vite",
+    "dev:host": "vite --port 5173 --strictPort",
+    "dev:iframe": "vite --config vite.iframe.config.ts --port 5174 --strictPort",
+    "dev:ws": "node tools/ws-echo.mjs",
+    "build": "vite build",
+    "typecheck": "tsc --noEmit",
+    "preview": "vite preview",
+    "test:e2e": "playwright test",
+    "test:e2e:headed": "playwright test --headed"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.60.0",
+    "@types/node": "^24",
+    "@types/ws": "^8.5.13",
+    "solid-js": "^1.8.22",
+    "typescript": "^5.4.5",
+    "vite": "^5.4.10",
+    "vite-plugin-solid": "^2.10.2",
+    "ws": "^8.18.0"
+  },
+  "dependencies": {
+    "dockview-core": "^7.0.4"
+  }
+}

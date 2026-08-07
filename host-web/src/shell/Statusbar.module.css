@@ -1,0 +1,36 @@
+.statusbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 26px;
+  padding: 0 10px;
+  background: var(--bg-soft);
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+  color: var(--fg-dim);
+  flex: 0 0 auto;
+  overflow: hidden;
+}
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--warn);
+  flex: 0 0 auto;
+}
+.dot[data-on="1"] {
+  background: var(--good);
+}
+.item {
+  white-space: nowrap;
+}
+.sep {
+  color: var(--border);
+}
+.spacer {
+  flex: 1 1 auto;
+}
+.badge {
+  white-space: nowrap;
+  color: var(--fg-dim);
+}

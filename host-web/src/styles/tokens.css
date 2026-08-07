@@ -1,0 +1,40 @@
+:root {
+  --bg: #0d1117;
+  --bg-soft: #161b22;
+  --bg-elev: #1c2330;
+  --border: #30363d;
+  --fg: #e6edf3;
+  --fg-dim: #8b949e;
+  --accent: #58a6ff;
+  --accent-soft: rgba(88, 166, 255, 0.15);
+  --good: #3fb950;
+  --warn: #d29922;
+  --sash: #30363d;
+  color-scheme: dark;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-size: 13px;
+}
+
+* {
+  box-sizing: border-box;
+}
+html,
+body,
+#root {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  width: 100%;
+}
+body {
+  background: var(--bg);
+  color: var(--fg);
+  overflow: hidden;
+}
+
+/* Dockview root fills its container */
+.dockview-root {
+  width: 100%;
+  height: 100%;
+  background: var(--bg);
+}

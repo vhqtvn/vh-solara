@@ -1,0 +1,111 @@
+:root {
+  --bg: #0d1117;
+  --bg-soft: #161b22;
+  --fg: #c9d1d9;
+  --fg-dim: #8b949e;
+  --accent: #58a6ff;
+  --add: #3fb950;
+  --del: #f85149;
+  --focus-ring: #58a6ff;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--fg);
+}
+#app {
+  height: 100vh;
+  width: 100vw;
+  overflow: auto;
+  padding: 8px 10px;
+  border: 2px solid transparent;
+}
+#app.is-focused {
+  border-color: var(--focus-ring);
+}
+
+.view-label {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--fg-dim);
+  margin: 2px 0 8px;
+}
+
+/* chat */
+.chat-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.chat-msg {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  font-size: 13px;
+}
+.chat-role {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  color: var(--accent);
+  min-width: 52px;
+}
+.chat-assistant .chat-role {
+  color: var(--add);
+}
+.chat-text {
+  flex: 1;
+}
+
+/* terminal */
+.term-body {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  font-size: 12px;
+  white-space: pre;
+  color: var(--fg);
+}
+.term-line {
+  line-height: 1.5;
+}
+
+/* diff */
+.diff-body {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  font-size: 12px;
+}
+.diff-line {
+  white-space: pre;
+  line-height: 1.5;
+}
+.diff-hunk {
+  color: var(--accent);
+}
+.diff-add {
+  color: var(--add);
+  background: rgba(63, 185, 80, 0.08);
+}
+.diff-del {
+  color: var(--del);
+  background: rgba(248, 81, 73, 0.08);
+}
+
+/* sessions tree */
+.tree-body {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  font-size: 12px;
+}
+.tree-node {
+  padding-left: calc(var(--depth, 0) * 16px + 2px);
+  line-height: 1.8;
+  white-space: pre;
+}

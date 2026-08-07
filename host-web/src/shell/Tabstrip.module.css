@@ -1,0 +1,97 @@
+.tabstrip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 36px;
+  padding: 0 8px;
+  background: var(--bg-soft);
+  border-bottom: 1px solid var(--border);
+  flex: 0 0 auto;
+  overflow: hidden;
+}
+.brand {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding-right: 8px;
+  border-right: 1px solid var(--border);
+  margin-right: 4px;
+  flex: 0 0 auto;
+}
+.brandMark {
+  color: var(--accent);
+  font-size: 14px;
+}
+.brandText {
+  font-weight: 700;
+  font-size: 13px;
+}
+.brandSub {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--fg-dim);
+}
+.tabs {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: 1 1 auto;
+  overflow-x: auto;
+  overflow-y: hidden;
+  height: 100%;
+}
+.tab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 26px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--fg-dim);
+  cursor: pointer;
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+.tab:hover {
+  border-color: var(--accent);
+  color: var(--fg);
+}
+.tabServer {
+  font-size: 12px;
+  font-weight: 600;
+}
+.tabView {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--fg-dim);
+}
+.tabActive {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--fg);
+}
+.plus {
+  width: 26px;
+  height: 26px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--fg-dim);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+.plus:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.trayBadge {
+  font-size: 11px;
+  color: var(--warn);
+  flex: 0 0 auto;
+}

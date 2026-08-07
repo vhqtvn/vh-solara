@@ -1,0 +1,102 @@
+/* Pane chrome emitted by the vanilla IframeRenderer (not a CSS module, since
+ * the renderer builds DOM imperatively outside SolidJS tracking). */
+
+.pane {
+  background: var(--bg);
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+}
+.pane.is-active > .pane-header {
+  background: var(--bg-elev);
+  border-bottom-color: var(--accent);
+}
+.pane.is-tray > .pane-header {
+  background: var(--bg-soft);
+}
+.pane.is-maximized > .pane-header {
+  border-bottom-color: var(--good);
+}
+
+.pane-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 8px;
+  height: 30px;
+  flex: 0 0 auto;
+  background: var(--bg-soft);
+  border-bottom: 1px solid var(--border);
+  color: var(--fg);
+  user-select: none;
+}
+.pane-brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+.pane-server {
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 220px;
+}
+.pane-view {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--fg-dim);
+  background: var(--bg);
+  padding: 1px 6px;
+  border-radius: 8px;
+  white-space: nowrap;
+}
+.pane-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
+}
+.pane-btn {
+  appearance: none;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--fg-dim);
+  font-size: 11px;
+  line-height: 1;
+  padding: 3px 6px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.pane-btn:hover:not(:disabled) {
+  color: var(--fg);
+  border-color: var(--accent);
+}
+.pane-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.pane-btn--close {
+  color: var(--warn);
+}
+
+.pane-body {
+  flex: 1 1 auto;
+  position: relative;
+  min-height: 0;
+  background: var(--bg);
+}
+.pane-iframe {
+  width: 100%;
+  height: 100%;
+  border: 0;
+  display: block;
+  background: var(--bg);
+}

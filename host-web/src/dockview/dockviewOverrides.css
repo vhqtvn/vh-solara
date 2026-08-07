@@ -1,0 +1,74 @@
+/*
+ * Dockview overrides for the vh-solara host shell.
+ *
+ * RULE #3 (load-bearing): Dockview's default per-group tab strip is redundant
+ * for single-server-view panes — we render a CUSTOM per-pane header inside the
+ * content renderer instead (see iframeRenderer.ts). Hide the group's own
+ * header (tabs + void + actions) via CSS so only our header shows.
+ *
+ * renderer:'always' places each panel's element in a shared
+ * .dv-overlay-render-container, with one .dv-render-overlay per panel
+ * absolutely positioned to match the panel's live geometry. That is the
+ * mechanism that keeps each <iframe> permanently mounted (only geometry
+ * changes) — so the overlay + its children MUST fill the content area.
+ */
+
+/* hide the default group header (tabs + void + actions) */
+.dv-groupview > .dv-tabs-and-actions-container {
+  display: none !important;
+}
+
+/* content area fills the group */
+.dv-groupview > .dv-content-container {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  padding: 0;
+}
+
+/* always-render overlay fills the content area */
+.dv-overlay-render-container,
+.dv-render-overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+/* our pane root fills its overlay slot */
+.dv-render-overlay > .pane {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* native sashes (drag-rearrange = resize). Make them visible + grabbable. */
+.dv-sash.dv-horizontal {
+  cursor: col-resize;
+}
+.dv-sash.dv-vertical {
+  cursor: row-resize;
+}
+.dv-sash.dv-enabled::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: var(--sash, #30363d);
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+.dv-sash.dv-enabled:hover::after {
+  opacity: 1;
+}
+
+/* floating group (collapse-to-tray) chrome: slim, keep-mounted, restorable */
+.dv-resize-container {
+  border: 1px solid #30363d;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+}
+.dv-floating-titlebar {
+  background: #161b22;
+  color: #c9d1d9;
+}

@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <!--
+    Cross-origin mock "vh-solara server" content (dev origin :5174, host SPA on
+    :5173 — distinct origins by port, so this is genuinely cross-origin to the
+    embedding host). The host SPA embeds this page in one <iframe> per server
+    view (?server=&view=). This page:
+
+      - captures survival identity ONCE per document load (mountTs + nonce);
+      - opens a WebSocket to the echo server (:5175), whose connection id
+        changes iff this iframe reloaded (a reconnect == a reload);
+      - heartbeats to its parent window (~4 Hz) carrying mountTs/nonce/uptime/
+        connId so the host (and the Playwright gate) can prove the iframe
+        element was NOT destroyed/reparented by a layout op.
+
+    Real vh-solara SPA embedding replaces this page later; the survival
+    contract this page demonstrates is the load-bearing guarantee for the whole
+    multi-server architecture.
+  -->
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.00" />
+    <title>vh-solara mock server</title>
+    <link rel="stylesheet" href="./content.css" />
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="./content.ts"></script>
+  </body>
+</html>

@@ -1,0 +1,9 @@
+node_modules/
+*.log
+test-results/
+playwright-report/
+.playwright/
+dist/
+dist-iframe/
+# Vite optimizeDeps cache
+.vite/
