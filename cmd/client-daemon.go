@@ -47,6 +47,7 @@ var (
 	daemonOpenCodeDetached bool
 	daemonExternalManaged  bool
 	daemonCORSOrigins      []string
+	daemonFrameAncestors   []string
 	daemonProjectConfig    string // --project-config override path for managed projects
 	daemonTrustOnOpen      bool   // headless: auto-approve repo-declared configs
 )
@@ -311,6 +312,7 @@ func init() {
 	clientDaemonCmd.Flags().StringVar(&daemonOpenCodePasswd, "opencode-password", "", "(opencode only) Sets OPENCODE_SERVER_PASSWORD for the web UI")
 	clientDaemonCmd.Flags().StringVar(&daemonOpenCodeUpdate, "opencode-update-cmd", "", "(vh only) Command to update OpenCode (default: `<opencode-bin> upgrade`); runs in OpenCode's environment")
 	clientDaemonCmd.Flags().StringArrayVar(&daemonCORSOrigins, "cors-origin", nil, "(vh only) Allowed cross-origin caller (repeatable; e.g. https://app.example.com, or * to allow any)")
+	clientDaemonCmd.Flags().StringArrayVar(&daemonFrameAncestors, "frame-ancestors", nil, "(vh only) Allowed CSP frame-ancestors for cross-origin <iframe> embedding (repeatable; e.g. 'self' https://app.my-root-domain). Default 'self'; the list REPLACES the default, so include 'self' if the app's own iframes (e.g. the code viewer) must still work")
 	clientDaemonCmd.Flags().StringVar(&daemonOpenCodeURL, "opencode-url", "", "(vh only) Attach to an externally-managed OpenCode at this URL instead of spawning one (e.g. http://127.0.0.1:4096)")
 	clientDaemonCmd.Flags().BoolVar(&daemonExternalManaged, "external-managed", false, "(vh only) The vh daemon is run under a supervisor (e.g. systemd, Restart=always); on a 'restart server' request it exits cleanly and lets the supervisor relaunch it, instead of re-exec'ing itself")
 	clientDaemonCmd.Flags().StringVar(&daemonOpenCodeRestart, "opencode-restart-cmd", "", "(vh only, external) Command to restart externally-managed OpenCode, e.g. 'systemctl --user restart opencode'")

@@ -98,6 +98,14 @@ type Server struct {
 	// cross-origin half of the CSRF protection — only set it if you mean it).
 	corsOrigins []string
 
+	// frameAncestors is the CSP frame-ancestors source-list allowlist for who
+	// may embed the web UI in an <iframe>. Empty (default) = 'self' only
+	// (same-origin, the historic secure default — blocks cross-origin
+	// clickjacking). Set by the daemon from --frame-ancestors to permit a
+	// trusted host (e.g. https://app.my-root-domain) to embed the UI
+	// cross-origin. The list REPLACES 'self' (see frameAncestorsDirective).
+	frameAncestors []string
+
 	// auth, when set, gates the whole server (login + session). nil = no auth
 	// (only safe on a loopback bind; see auth.CheckBindSafety).
 	auth *auth.Authenticator
@@ -293,6 +301,13 @@ func (s *Server) SetAuth(a *auth.Authenticator) { s.auth = a }
 // SetCORSOrigins sets the allowed cross-origin callers (e.g. a separate app or
 // dev frontend). Optional; default is strict same-origin.
 func (s *Server) SetCORSOrigins(origins []string) { s.corsOrigins = origins }
+
+// SetFrameAncestors sets the CSP frame-ancestors allowlist (who may embed the
+// web UI in an <iframe>). Optional; default is 'self' (same-origin only). Each
+// entry is a CSP source expression (e.g. https://app.my-root-domain, or 'self');
+// the list REPLACES the default — include 'self' explicitly if the app's own
+// same-origin iframes (e.g. the code viewer) must keep working.
+func (s *Server) SetFrameAncestors(origins []string) { s.frameAncestors = origins }
 
 // SetAppVersion records this vh-solara build's version for GET /vh/version.
 func (s *Server) SetAppVersion(v string) { s.appVersion = v }
@@ -1448,7 +1463,7 @@ func (s *Server) Handler() http.Handler {
 	// Auth gates everything (login page + session); it sits inside securityHeaders
 	// so the login page still gets CSP, and outside cors/csrf so an unauthenticated
 	// request is challenged before reaching application logic. nil/ModeNone = no-op.
-	return securityHeaders(s.auth.Middleware(s.cors(csrfGuard(logRequests(s.stampMeta(s.dispatchView(mux)))))))
+	return s.securityHeaders(s.auth.Middleware(s.cors(csrfGuard(logRequests(s.stampMeta(s.dispatchView(mux)))))))
 }
 
 // stampMeta sets X-VH-Epoch and X-VH-Seq on /vh/* responses so a cross-worker
@@ -1545,13 +1560,18 @@ func (s *statusWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	return nil, nil, http.ErrNotSupported
 }
 
-// contentSecurityPolicy: dev-friendly but still blocks a key XSS goal —
-// EXTERNAL resource loading/exfiltration. script-src allows 'unsafe-inline'/
-// 'unsafe-eval' (relaxed while developing), but lists no external origins, so an
-// injected script can't pull in external scripts; connect-src/img-src/default-src
-// stay 'self', so it can't fetch or beacon out to other origins either.
+// cspDirectives are the static CSP directives. dev-friendly but still blocks a
+// key XSS goal — EXTERNAL resource loading/exfiltration. script-src allows
+// 'unsafe-inline'/'unsafe-eval' (relaxed while developing), but lists no
+// external origins, so an injected script can't pull in external scripts;
+// connect-src/img-src/default-src stay 'self', so it can't fetch or beacon out
+// to other origins either.
 // TODO: tighten script-src to 'self' (drop unsafe-inline/eval) once stable.
-var contentSecurityPolicy = strings.Join([]string{
+//
+// frame-ancestors is NOT in this list: it is per-server (see
+// Server.frameAncestorsDirective) so an operator can widen framing for a trusted
+// host embed via --frame-ancestors, while the default stays 'self'.
+var cspDirectives = []string{
 	"default-src 'self'",
 	"script-src 'self' 'unsafe-inline' 'unsafe-eval'",
 	"style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
@@ -1562,18 +1582,58 @@ var contentSecurityPolicy = strings.Join([]string{
 	"manifest-src 'self'",
 	"object-src 'none'",
 	"base-uri 'self'",
-	// 'self' (not 'none') so the app can frame its OWN pages — the code viewer
-	// runs in a same-origin iframe to keep its heavy DOM out of the main
-	// document. Cross-origin framing (clickjacking) is still blocked.
-	"frame-ancestors 'self'",
-}, "; ")
+}
 
-func securityHeaders(next http.Handler) http.Handler {
+// frameAncestorsDirective returns the CSP frame-ancestors directive for this
+// server.
+//
+// Default (no --frame-ancestors): 'self'. This lets the app frame its OWN pages
+// (the code viewer runs in a same-origin iframe to keep its heavy DOM out of the
+// main document) while still blocking cross-origin framing / clickjacking.
+//
+// Explicit allowlist (--frame-ancestors set): the operator's source list verbatim
+// (space-separated, the CSP-correct separator for a source-expression list). This
+// REPLACES 'self' — an operator who still needs the app's own same-origin
+// iframes (e.g. the code viewer) must include 'self' in the list, e.g.
+// `--frame-ancestors 'self' --frame-ancestors https://app.my-root-domain`. This
+// mirrors how --cors-origin works (full replacement, operator controls the list)
+// and avoids implicit broadening: only an operator who sets the flag widens
+// framing permission.
+func (s *Server) frameAncestorsDirective() string {
+	if len(s.frameAncestors) == 0 {
+		return "frame-ancestors 'self'"
+	}
+	return "frame-ancestors " + strings.Join(s.frameAncestors, " ")
+}
+
+// contentSecurityPolicy returns the full CSP for this server (the static
+// directives plus the per-server frame-ancestors directive).
+func (s *Server) contentSecurityPolicy() string {
+	dirs := make([]string, 0, len(cspDirectives)+1)
+	dirs = append(dirs, cspDirectives...)
+	dirs = append(dirs, s.frameAncestorsDirective())
+	return strings.Join(dirs, "; ")
+}
+
+// securityHeaders sets the document security headers. It is a method on *Server
+// so the CSP (frame-ancestors) and X-Frame-Options can reflect the per-server
+// --frame-ancestors allowlist.
+//
+// X-Frame-Options decision: when frame-ancestors is at its default ('self') we
+// send X-Frame-Options: SAMEORIGIN for defense-in-depth (legacy browsers that
+// don't understand CSP frame-ancestors). When an operator sets an explicit
+// allowlist we OMIT X-Frame-Options: it is legacy/superseded by CSP
+// frame-ancestors, modern browsers ignore it when frame-ancestors is present,
+// and keeping SAMEORIGIN would actually BLOCK the intended cross-origin embed on
+// browsers that DO honor X-Frame-Options — defeating the flag.
+func (s *Server) securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()
-		h.Set("Content-Security-Policy", contentSecurityPolicy)
+		h.Set("Content-Security-Policy", s.contentSecurityPolicy())
 		h.Set("X-Content-Type-Options", "nosniff")
-		h.Set("X-Frame-Options", "SAMEORIGIN")
+		if len(s.frameAncestors) == 0 {
+			h.Set("X-Frame-Options", "SAMEORIGIN")
+		}
 		h.Set("Referrer-Policy", "no-referrer")
 		next.ServeHTTP(w, r)
 	})

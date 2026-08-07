@@ -31,6 +31,7 @@ var (
 	localOpenCodeUpdate   string
 	localOpenCodeRestart  string
 	localCORSOrigins      []string
+	localFrameAncestors   []string
 	localExternalManaged  bool
 	localAuth             authFlags
 )
@@ -244,6 +245,9 @@ with --opencode-url, or spawn a survivable detached instance with
 		if len(localCORSOrigins) > 0 {
 			srv.SetCORSOrigins(localCORSOrigins)
 		}
+		if len(localFrameAncestors) > 0 {
+			srv.SetFrameAncestors(localFrameAncestors)
+		}
 		authn, err := buildAuth(localAddr, &localAuth)
 		if err != nil {
 			log.Fatalf("Auth setup failed: %v", err)
@@ -345,6 +349,7 @@ func init() {
 	localServerCmd.Flags().StringVar(&localOpenCodeUpdate, "opencode-update-cmd", "", "Command to update OpenCode (default: `<opencode-bin> upgrade`)")
 	localServerCmd.Flags().StringVar(&localOpenCodeRestart, "opencode-restart-cmd", "", "(external) Command to restart externally-managed OpenCode")
 	localServerCmd.Flags().StringArrayVar(&localCORSOrigins, "cors-origin", nil, "Allowed cross-origin caller (repeatable; or * to allow any)")
+	localServerCmd.Flags().StringArrayVar(&localFrameAncestors, "frame-ancestors", nil, "Allowed CSP frame-ancestors for cross-origin <iframe> embedding (repeatable; e.g. 'self' https://app.my-root-domain). Default 'self'; the list REPLACES the default, so include 'self' if the app's own iframes (e.g. the code viewer) must still work")
 	localServerCmd.Flags().BoolVar(&localExternalManaged, "external-managed", false, "Run under a supervisor; on a 'restart server' request exit cleanly instead of re-exec'ing")
 	registerAuthFlags(localServerCmd, &localAuth)
 	rootCmd.AddCommand(localServerCmd)

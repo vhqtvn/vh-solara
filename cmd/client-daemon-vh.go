@@ -209,6 +209,9 @@ func (rt *clientDaemonRuntime) setupVHMode() {
 	if len(daemonCORSOrigins) > 0 {
 		srv.SetCORSOrigins(daemonCORSOrigins)
 	}
+	if len(daemonFrameAncestors) > 0 {
+		srv.SetFrameAncestors(daemonFrameAncestors)
+	}
 
 	srv.SetRestartOpenCode(func(ctx context.Context) error {
 		rt.opencodeMu.Lock()
