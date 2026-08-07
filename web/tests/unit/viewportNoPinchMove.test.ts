@@ -23,7 +23,16 @@
 // TouchEvent constructor, so the event is built as a plain cancelable Event and
 // given a `touches` array via defineProperty (the guard only reads
 // `.touches.length` and calls `.preventDefault()`).
-import { describe, it, expect, beforeAll } from "vitest";
+//
+// jsdom ALSO does not enforce passive-listener semantics: it cannot tell a
+// registration of { passive: false } apart from the default (passive), so the
+// behavioral tests below (defaultPrevented) CANNOT detect a regression that
+// silently drops { passive: false } — in jsdom preventDefault still "works"
+// either way, while a real browser would ignore it on a passive listener and
+// the pinch gesture would re-enable. A separate registration-contract test
+// ("registers touchmove with { passive: false }") closes that gap by spying on
+// document.addEventListener and pinning the options shape directly.
+import { describe, it, expect, beforeAll, vi } from "vitest";
 import { installViewport } from "../../src/viewport";
 
 // Dispatch a cancelable `touchmove` on document with `touchCount` touches and
@@ -68,5 +77,38 @@ describe("installViewport — noPinchMove guard", () => {
   it("does NOT cancel a 0-touch touchmove", () => {
     // Edge case at the low boundary: touches.length === 0 must pass through.
     expect(dispatchTouchmove(0)).toBe(false);
+  });
+
+  it("registers touchmove with { passive: false } so preventDefault takes effect", () => {
+    // REGISTRATION-CONTRACT coverage (not behavioral). jsdom ignores the
+    // passive flag entirely, so the defaultPrevented-based tests above cannot
+    // observe a regression that drops { passive: false } — yet in a real
+    // browser that flag is exactly what lets noPinchMove's preventDefault()
+    // cancel the pinch gesture (a passive listener's preventDefault is a
+    // no-op there). Pin the registration shape directly: spy on
+    // document.addEventListener around a fresh installViewport() call and
+    // assert the touchmove registration carries passive === false. Asserting
+    // only that field (via objectContaining) avoids brittle exact-object
+    // equality if unrelated listener options are added later.
+    //
+    // The spy calls through to the real addEventListener (vi.spyOn default),
+    // so installViewport()'s other wiring still attaches normally; we only
+    // need the recorded calls. try/finally guarantees mockRestore even if an
+    // assertion throws, so the spy never leaks into sibling tests.
+    const spy = vi.spyOn(document, "addEventListener");
+    try {
+      installViewport();
+      const touchmoveCall = spy.mock.calls.find(
+        ([type]) => type === "touchmove",
+      );
+      expect(
+        touchmoveCall,
+        "installViewport must register a touchmove listener on document",
+      ).toBeDefined();
+      const options = touchmoveCall![2];
+      expect(options).toEqual(expect.objectContaining({ passive: false }));
+    } finally {
+      spy.mockRestore();
+    }
   });
 });
