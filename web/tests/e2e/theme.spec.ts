@@ -98,10 +98,12 @@ test("light theme: a destructive menu item uses a readable red, not faint pink",
   await useLightTheme(page);
   await page.getByRole("button", { name: /Demo session/ }).click();
 
-  // Right-click the chat header title → the context menu with the "Archive…"
-  // destructive item.
+  // Right-click the chat header title → the session context menu, which has TWO
+  // destructive items sharing the .ctxm-item.danger class: Archive… and Delete…
+  // (both intentional — Delete is the irreversible one, placed below Archive).
+  // The red-channel assertions hold for either, so disambiguate with .first().
   await page.locator(".main-title.has-menu").click({ button: "right" });
-  const danger = page.locator(".ctxm-item.danger");
+  const danger = page.locator(".ctxm-item.danger").first();
   await expect(danger).toBeVisible();
 
   const color = await danger.evaluate((el) => getComputedStyle(el).color);
