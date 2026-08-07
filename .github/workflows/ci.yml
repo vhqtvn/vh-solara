@@ -116,3 +116,46 @@ jobs:
           # silently passing — an empty upload usually means the e2e step never
           # produced output or the artifactRoot above has drifted.
           if-no-files-found: warn
+
+  # host-web Playwright e2e — the multi-server host SPA (SolidJS/Dockview shell
+  # embedding cross-origin iframes). Runs two disjoint suites that self-bootstrap
+  # their own servers via the Playwright webServer config:
+  #   1. tests/e2e        — iframe survival + shell ops against vite DEV servers
+  #                         (:5173 host, :5174 iframe, :5175 ws-echo).
+  #   2. tests/preview-e2e — production-build shell proof against `vite preview`
+  #                         (asserts window.__host is absent in a real bundle).
+  # No Go, no fixtureserver — disjoint from the Go/web jobs above.
+  host-web-e2e:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: host-web
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: host-web/package-lock.json
+      - run: npm ci
+      - name: install Playwright browsers
+        run: npx playwright install --with-deps chromium firefox
+      - name: host-web e2e (iframe survival + shell, DEV servers)
+        run: npm run test:e2e
+      - name: host-web e2e (production-build shell proof, vite preview)
+        run: npm run test:e2e:preview
+      - name: upload Playwright artifacts
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: playwright-host-web-e2e
+          # Covers both artifact roots, set in host-web/playwright.config.ts
+          # (tmp/agent-runs/host-web-playwright) and playwright.preview.config.ts
+          # (tmp/agent-runs/host-web-playwright-preview); overridable via
+          # PLAYWRIGHT_ARTIFACTS_DIR. upload-artifact is a `uses:` step, so
+          # defaults.run.working-directory does NOT apply — paths are repo-root-relative.
+          path: |
+            tmp/agent-runs/host-web-playwright
+            tmp/agent-runs/host-web-playwright-preview
+          retention-days: 14
+          if-no-files-found: warn

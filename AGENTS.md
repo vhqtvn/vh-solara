@@ -699,18 +699,18 @@ reasoning body):
 > placement, runners, and seam choices from the repository's own verified testing
 > seam localization rather than generic harness defaults — but is deliberately
 > generic about what that localization IS. This section is this repo's actual
-> localization: the six lanes, their runners, commands, and acceptance signals.
+> localization: the seven lanes, their runners, commands, and acceptance signals.
 
-Every meaningful change should add or update tests. This repo has two test
-trees (Go and web) and four runner families across six lanes. There is **no
-`tests/unit/` directory** — Go unit tests are co-located in `pkg/`. There is
-**no pytest** anywhere in this repo.
+Every meaningful change should add or update tests. This repo has three test
+trees (Go, web, and host-web) and four runner families across seven lanes. There
+is **no `tests/unit/` directory** — Go unit tests are co-located in `pkg/`. There
+is **no pytest** anywhere in this repo.
 
 > **Go PATH note:** `go` may not be on `PATH`. Prefix Go commands with
 > `export PATH=$PATH:/usr/local/go/bin` (or use the harness equivalent:
 > `vh-agent-harness exec bash -c 'export PATH=$PATH:/usr/local/go/bin && go ...'`).
 
-### The six lanes
+### The seven lanes
 
 1. **Go co-located unit** — `pkg/*/*_test.go` beside the source under test.
    Runner: `go test ./pkg/<pkg>/` (whole tree: `go test ./pkg/...`).
@@ -749,6 +749,16 @@ trees (Go and web) and four runner families across six lanes. There is **no
    `go run ./tools/fixtureserver`, so go must be on PATH.
    Runner: `npm --prefix web run test:e2e`.
 
+7. **host-web e2e** — `host-web/tests/e2e/*.spec.ts` (Playwright: iframe survival
+   + shell ops) and `host-web/tests/preview-e2e/*.spec.ts` (production-build shell
+   proof against `vite preview`). Both run **serially** (`fullyParallel: false`,
+   `workers: 1`) and self-bootstrap their servers via the Playwright `webServer`
+   config (vite DEV host :5173, cross-origin iframe :5174, ws-echo :5175); the
+   preview suite swaps the host dev server for `vite build && vite preview` to
+   prove the shell works when `window.__host` is absent. No Go, no fixtureserver.
+   Runner (survival + shell): `npm --prefix host-web run test:e2e`.
+   Runner (production-build proof): `npm --prefix host-web run test:e2e:preview`.
+
 Execution examples:
 
 ```bash
@@ -765,6 +775,10 @@ vh-agent-harness exec npm --prefix web run test:unit
 vh-agent-harness exec npm --prefix web run typecheck
 # Web e2e (serial; go must be on PATH for the fixtureserver):
 vh-agent-harness exec bash -c 'export PATH=$PATH:/usr/local/go/bin && npm --prefix web run test:e2e'
+# host-web e2e (iframe survival + shell; self-bootstrapped vite dev servers):
+vh-agent-harness exec npm --prefix host-web run test:e2e
+# host-web production-build shell proof (vite preview):
+vh-agent-harness exec npm --prefix host-web run test:e2e:preview
 ```
 
 For any substantial boundary change, also update the relevant docs.

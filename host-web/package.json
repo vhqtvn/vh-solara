@@ -15,7 +15,8 @@
     "typecheck": "tsc --noEmit",
     "preview": "vite preview",
     "test:e2e": "playwright test",
-    "test:e2e:headed": "playwright test --headed"
+    "test:e2e:headed": "playwright test --headed",
+    "test:e2e:preview": "playwright test --config=playwright.preview.config.ts"
   },
   "devDependencies": {
     "@playwright/test": "1.60.0",

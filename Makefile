@@ -3,7 +3,7 @@
 # gitignored staging dir (web/dist-build); embed-producing targets materialize
 # (copy) the staged bundle into pkg/web/dist right before `go build`.
 
-.PHONY: web web-materialize build build-debug install install-local test test-unit test-web verify fmt fmt-check vet typecheck e2e e2e-keep docker fixtures bench clean-web-embed
+.PHONY: web web-materialize build build-debug install install-local test test-unit test-web test-host-web test-host-web-preview verify fmt fmt-check vet typecheck e2e e2e-keep docker fixtures bench clean-web-embed
 
 web: ## Build the SolidJS UI into the staging dir web/dist-build (gitignored, NOT pkg/web/dist)
 	cd web && npm ci && npm run build
@@ -55,6 +55,12 @@ test-unit: ## Run Go co-located unit tests (fast lane: ./pkg/...)
 
 test-web: ## Run web unit tests + fixture-backed Playwright e2e (needs Node >= 24)
 	cd web && npm run test:unit && npm run test:e2e
+
+test-host-web: ## Run host-web Playwright e2e (iframe survival + shell, self-bootstrapped vite DEV servers; needs Node >= 24)
+	cd host-web && npm run test:e2e
+
+test-host-web-preview: ## Run host-web production-build shell proof (vite preview; needs Node >= 24)
+	cd host-web && npm run test:e2e:preview
 
 fmt: ## Format all Go source (mirrors CI's gofmt scope)
 	gofmt -w pkg cmd main.go
