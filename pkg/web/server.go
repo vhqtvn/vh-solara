@@ -1634,7 +1634,17 @@ func (s *Server) securityHeaders(next http.Handler) http.Handler {
 		if len(s.frameAncestors) == 0 {
 			h.Set("X-Frame-Options", "SAMEORIGIN")
 		}
-		h.Set("Referrer-Policy", "no-referrer")
+		// same-origin (not no-referrer): cross-origin requests still get NO
+		// referrer (the third-party-leak protection no-referrer provided is
+		// preserved), but same-origin requests carry a referrer to our own
+		// server (which already knows its own URLs — no leak). This matters for
+		// the native passphrase login <form>: under no-referrer, Chromium AND
+		// Firefox serialize Origin as "null" on a form-POST navigation, and
+		// submitPassphrase's same-origin guard then rejects it (403) — breaking
+		// the rendered login form in a real browser. same-origin lets the
+		// browser send a genuine same-origin Origin, which that guard
+		// legitimately accepts. CSRF defense stays in the guard, unchanged.
+		h.Set("Referrer-Policy", "same-origin")
 		next.ServeHTTP(w, r)
 	})
 }

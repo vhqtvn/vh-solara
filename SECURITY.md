@@ -86,7 +86,13 @@ same-origin only (it can't carry the CSRF header).
 
 **CSP + headers.** Every response carries a `Content-Security-Policy` plus
 `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and
-`Referrer-Policy: no-referrer`. The CSP lists **no external origins** in
+`Referrer-Policy: same-origin`. (Earlier this was `no-referrer`; it was relaxed
+to `same-origin` because `no-referrer` made Chromium and Firefox serialize
+`Origin: null` on the native passphrase login `<form>` POST, which the
+`submitPassphrase` same-origin guard then rejected with 403 — breaking the
+rendered login form in a real browser. `same-origin` preserves the
+third-party-leak protection — cross-origin requests get no referrer — while
+letting a genuine same-origin form POST carry a real `Origin`.) The CSP lists **no external origins** in
 `script-src` / `connect-src` / `img-src` / `default-src`, so an injected script
 can't load external resources or exfiltrate to other origins. (`script-src` still
 allows inline/eval; tightening it to `'self'` is a follow-up.)

@@ -221,6 +221,15 @@ func TestSameOrigin(t *testing.T) {
 	if sameOrigin("https://evil.com", "app.example.com") {
 		t.Error("different host must not be same-origin")
 	}
+	// Regression sentinel: the literal Origin "null" (what Chromium AND Firefox
+	// serialize for a native form-POST navigation under
+	// Referrer-Policy: no-referrer) must NOT be treated as same-origin — this
+	// is exactly the value submitPassphrase's guard must reject to avoid a
+	// login-CSRF hole, and is what broke the rendered login form before the
+	// Referrer-Policy was relaxed to same-origin.
+	if sameOrigin("null", "app.example.com") {
+		t.Error(`Origin "null" must not be treated as same-origin (login-CSRF guard)`)
+	}
 }
 
 func TestAbsURLForwardedProto(t *testing.T) {

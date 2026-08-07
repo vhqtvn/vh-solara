@@ -1712,6 +1712,13 @@ func TestSecurityHeaders(t *testing.T) {
 	if !strings.Contains(csp, "frame-ancestors 'self'") {
 		t.Fatalf("CSP frame-ancestors should be 'self': %q", csp)
 	}
+	// same-origin (not no-referrer): cross-origin requests still get no
+	// referrer (leak protection preserved), but a native form POST may carry a
+	// real same-origin Origin so the passphrase login <form> works in a real
+	// browser. See TestLoginFormPostAcceptsSameOriginOrigin for the crux.
+	if got := resp.Header.Get("Referrer-Policy"); got != "same-origin" {
+		t.Fatalf("Referrer-Policy: want same-origin, got %q", got)
+	}
 }
 
 // TestStreamTreeOnlySurvivesTokenFlood is the end-to-end wiring proof for the
