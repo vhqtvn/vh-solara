@@ -2,6 +2,7 @@ import { onCleanup, onMount } from "solid-js";
 import { createDockview, type DockviewApi } from "dockview-core";
 import { IframeRenderer } from "./iframeRenderer";
 import { HostController } from "./hostController";
+import { applyColdRestore, installLayoutSaver } from "./layoutPersistence";
 import type { HostOps } from "./types";
 import { setHostOps } from "./store";
 import { nextPaneId, resolveFleet } from "../state/mockData";
@@ -48,7 +49,22 @@ export function DockviewHost() {
     // and exposes window.__host as a DEV-only test bridge.
     new HostController(api, renderers, ops);
 
-    seedInitialPanes(api);
+    // ---- COLD INIT: restore the saved layout exactly once, else seed. --------
+    // HARD RULE: api.fromJSON() is COLD-RESTORE ONLY — it disposes + recreates
+    // every panel, RELOADING every iframe (proven by the jsonReswap negative
+    // control). It runs EXACTLY ONCE here, before any iframe has a live
+    // identity. Runtime ops never call fromJSON; they mutate the live tree.
+    // applyColdRestore is structurally one-shot (a second call is a cached
+    // no-op), so no code path can drive a second restore.
+    //
+    // PRECEDENCE (defensible default, NOT canon): saved-layout-wins-with-
+    // validation; fleet/mock seed is the fallback when no valid layout exists.
+    const restored = applyColdRestore(api);
+    if (!restored) seedInitialPanes(api);
+
+    // Hook the debounced save AFTER cold init so the initial seed/restore does
+    // not itself trigger a save — only subsequent user mutations persist.
+    installLayoutSaver(api);
   });
 
   onCleanup(() => {

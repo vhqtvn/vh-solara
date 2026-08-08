@@ -63,6 +63,19 @@ export function nextPaneId(): string {
   return `pane-${paneSeq}`;
 }
 
+/**
+ * Advance the pane-id counter past `n` so the next nextPaneId() never collides
+ * with ids restored from a saved layout. fromJSON recreates panels with their
+ * SAVED ids verbatim (dockview's deserializer uses panelData.id), while the
+ * module counter resets to 0 on a cold page load — so without this seeding a
+ * post-reload "+" / split would regenerate `pane-1` and collide with a restored
+ * `pane-1`. The cold-restore path seeds this with the max restored numeric
+ * suffix; new splits then continue past the restored range.
+ */
+export function seedPaneSeq(n: number): void {
+  if (Number.isFinite(n) && n > paneSeq) paneSeq = n;
+}
+
 // The next mock (server, view) to add when the user hits "+" in MOCK mode. Cycles
 // views so repeated "+" spreads across views. (In real-fleet mode the "+"/split
 // path clones the focused pane instead — see hostController.newPaneParams.)
@@ -103,7 +116,13 @@ export function mockFleet(): FleetEntry[] {
   }));
 }
 
-function isFleetEntry(v: unknown): v is FleetEntry {
+// Exported (not just used internally by resolveFleet) because the layout-
+// persistence cold-restore path REUSES this exact guard to validate pane urls
+// read back from localStorage — restored urls go to an UNSANDBOXED iframe.src,
+// so the same http/https protocol requirement + reject-on-malformed stance
+// applies. Never weaken this; both surfaces (fleet config + saved layout) must
+// agree on what a trustworthy {url,label} is.
+export function isFleetEntry(v: unknown): v is FleetEntry {
   if (
     typeof v !== "object" ||
     v === null ||

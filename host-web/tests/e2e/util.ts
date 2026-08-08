@@ -25,6 +25,29 @@ export async function panes(page: Page): Promise<string[]> {
     return h ? h.panes() : [];
   });
 }
+
+// Read-only {url,label} snapshot per panel — used by the layout-persistence e2e
+// to assert a restored layout round-trips with the correct urls/labels.
+export interface PaneParam {
+  id: string;
+  url: string;
+  label: string;
+}
+export async function paneParams(page: Page): Promise<PaneParam[]> {
+  return page.evaluate(() => {
+    const h = (window as unknown as { __host?: { paneParams(): PaneParam[] } }).__host;
+    return h ? h.paneParams() : [];
+  });
+}
+
+// Read-only full-layout serialization (api.toJSON). The persistence negative
+// control captures a real layout via this, poisons one url, and writes it back.
+export async function serialize(page: Page): Promise<Record<string, unknown>> {
+  return page.evaluate(() => {
+    const h = (window as unknown as { __host?: { serialize(): unknown } }).__host;
+    return (h ? h.serialize() : {}) as Record<string, unknown>;
+  });
+}
 export async function focused(page: Page): Promise<string | null> {
   const r = await page.evaluate(() => {
     const h = (window as unknown as { __host?: { focused(): string | null } }).__host;
@@ -221,4 +244,47 @@ export async function loadHost(page: Page): Promise<string[]> {
   expect(ids.length, "seeded panes present").toBeGreaterThanOrEqual(2);
   for (const id of ids) await waitForReady(page, id);
   return ids;
+}
+
+// ---- layout-persistence helpers -------------------------------------------
+
+/** Storage key persistence writes (must match src/dockview/layoutPersistence.ts). */
+export const LAYOUT_STORAGE_KEY = "vh-host:layout:v1";
+
+/** Wait until localStorage holds a saved layout with the expected panel count.
+ *  The save is debounced (~450ms); this polls the raw blob so a test can flush it
+ *  before reloading. Returns the parsed panels map (id → params). */
+export async function waitForSavedLayout(
+  page: Page,
+  expectedPanelCount: number,
+  timeoutMs = 8000,
+): Promise<Record<string, { params?: { url?: string; label?: string } }>> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const panels = await page.evaluate((key) => {
+      const raw = localStorage.getItem(key);
+      if (!raw) return null;
+      try {
+        const parsed = JSON.parse(raw) as { panels?: Record<string, unknown> };
+        return (parsed.panels ?? null) as Record<string, unknown> | null;
+      } catch {
+        return null;
+      }
+    }, LAYOUT_STORAGE_KEY);
+    if (panels && Object.keys(panels).length === expectedPanelCount) {
+      return panels as Record<string, { params?: { url?: string; label?: string } }>;
+    }
+    await page.waitForTimeout(80);
+  }
+  throw new Error(
+    `saved layout with ${expectedPanelCount} panels never appeared in localStorage within ${timeoutMs}ms`,
+  );
+}
+
+/** The `.src` of every pane iframe, in DOM order (defense-in-depth check: a
+ *  poisoned `javascript:` url must never reach an unsandboxed iframe.src). */
+export async function iframeSrcs(page: Page): Promise<string[]> {
+  return page.locator("iframe.pane-iframe").evaluateAll((els) =>
+    (els as HTMLIFrameElement[]).map((e) => e.src),
+  );
 }

@@ -313,6 +313,24 @@ export class HostController implements HostOps {
     if (!import.meta.env.DEV) return;
     const bridge = {
       panes: (): string[] => this.api.panels.map((p) => p.id),
+      // Read-only snapshot of every panel's {url,label} params — used by the
+      // layout-persistence e2e to assert a restored layout round-trips with the
+      // correct urls/labels (ids are opaque; params are the trusted content).
+      paneParams: (): Array<{ id: string; url: string; label: string }> =>
+        this.api.panels.map((p) => {
+          const params = (p.params ?? {}) as { url?: string; label?: string };
+          return {
+            id: p.id,
+            url: params.url ?? "",
+            label: params.label ?? "",
+          };
+        }),
+      // Read-only: serialize the whole layout (api.toJSON). The persistence e2e
+      // captures a real, well-formed layout via this, poisons one url, writes it
+      // back to localStorage, and asserts the cold restore rejects the poison.
+      // (Distinct from the destructive jsonReswap negative control below, which
+      // round-trips toJSON→fromJSON to PROVE such a reswap reloads iframes.)
+      serialize: (): unknown => this.api.toJSON(),
       focused: (): string | null => focusedId(),
       trayIds: (): string[] => this.api.groups
         .filter((g) => g.api.location.type === "floating")
