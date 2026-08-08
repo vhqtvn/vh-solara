@@ -85,17 +85,36 @@ and the side-effect-free `/vh/render` are exempt. The terminal WebSocket upgrade
 same-origin only (it can't carry the CSRF header).
 
 **CSP + headers.** Every response carries a `Content-Security-Policy` plus
-`X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and
-`Referrer-Policy: same-origin`. (Earlier this was `no-referrer`; it was relaxed
-to `same-origin` because `no-referrer` made Chromium and Firefox serialize
-`Origin: null` on the native passphrase login `<form>` POST, which the
-`submitPassphrase` same-origin guard then rejected with 403 — breaking the
-rendered login form in a real browser. `same-origin` preserves the
+`X-Content-Type-Options: nosniff`, `X-Frame-Options: SAMEORIGIN` (by default; see
+`--frame-ancestors` below), and `Referrer-Policy: same-origin`. (Earlier this was
+`no-referrer`; it was relaxed to `same-origin` because `no-referrer` made Chromium
+and Firefox serialize `Origin: null` on the native passphrase login `<form>` POST,
+which the `submitPassphrase` same-origin guard then rejected with 403 — breaking
+the rendered login form in a real browser. `same-origin` preserves the
 third-party-leak protection — cross-origin requests get no referrer — while
 letting a genuine same-origin form POST carry a real `Origin`.) The CSP lists **no external origins** in
 `script-src` / `connect-src` / `img-src` / `default-src`, so an injected script
 can't load external resources or exfiltrate to other origins. (`script-src` still
 allows inline/eval; tightening it to `'self'` is a follow-up.)
+
+**Framing (`--frame-ancestors`).** By default the UI may only be framed
+same-origin: the CSP carries `frame-ancestors 'self'` and `X-Frame-Options:
+SAMEORIGIN` is sent as defense-in-depth for legacy browsers. To allow a trusted
+host app to embed the **whole** UI cross-origin, pass `--frame-ancestors`
+(repeatable, on `client-daemon` and `local-server`):
+
+```bash
+vh-solara client-daemon --frame-ancestors 'self' --frame-ancestors https://app.my-root-domain
+```
+
+The list **replaces** `'self'` (include `'self'` explicitly to keep the app's own
+same-origin iframes working), and `X-Frame-Options` is **omitted** when the flag
+is set — it is legacy and superseded by CSP `frame-ancestors`, and keeping
+`SAMEORIGIN` would block the intended cross-origin embed on browsers that honor
+`X-Frame-Options`. Managed custom-view proxy responses keep their own fixed
+`frame-ancestors 'self'` regardless of the flag (the allowlist governs the
+top-level app document only); see
+[docs/guides/custom-views.md](docs/guides/custom-views.md).
 
 **CORS.** Cross-origin access is off by default (strict same-origin). To allow a
 separate app/frontend, pass `--cors-origin https://app.example.com` (repeatable;

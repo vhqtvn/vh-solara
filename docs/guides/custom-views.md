@@ -127,11 +127,52 @@ allow-scripts  allow-same-origin  allow-forms  allow-popups  allow-modals  allow
 ```
 
 Anything else (notably `allow-top-navigation`) is stripped. The view is framed
-only by vh-solara (`frame-ancestors 'self'` + `X-Frame-Options: SAMEORIGIN`).
+only by vh-solara (`frame-ancestors 'self'` + `X-Frame-Options: SAMEORIGIN`) —
+this is **fixed** on view proxy responses regardless of the `--frame-ancestors`
+flag (see below).
 
 > This sandbox is defense-in-depth for an **operator-registered** upstream you
 > control — it is not a hostile-content boundary. Don't embed untrusted code as a
 > view.
+
+### Framing the whole UI vs. framing a view (`--frame-ancestors`)
+
+The CSP block above governs the **view itself** (what an embedded view app may
+load, and who may frame the view). Separately, vh-solara's **top-level app
+document** — the shell hosting chat, the code viewer, and these view iframes — has
+its own framing policy, set by the `--frame-ancestors` flag. The two are distinct:
+
+- **Top-level document** (`--frame-ancestors`): who may embed the **whole**
+  vh-solara UI in an `<iframe>`.
+- **View proxy responses** (the `viewCSP` above): always `frame-ancestors 'self'`,
+  **fixed** — managed custom-view iframes stay same-origin regardless of
+  `--frame-ancestors`. By design the flag widens who can embed the whole UI; the
+  inner view iframes are always framed by vh-solara itself.
+
+`--frame-ancestors` is a repeatable CSP source-expression list (mirrors
+`--cors-origin`), set on both `client-daemon` and `local-server`:
+
+- **Default (flag absent):** `frame-ancestors 'self'` + `X-Frame-Options:
+  SAMEORIGIN` — same-origin only, the historic secure default. The app's own
+  same-origin iframes (e.g. the code viewer) work; cross-origin framing is
+  blocked.
+- **Explicit allowlist (flag set):** the list **replaces** `'self'` — there is no
+  implicit broadening, so include `'self'` explicitly if the app's own iframes
+  must keep working. `X-Frame-Options` is **omitted** when the flag is set (it is
+  legacy and superseded by CSP `frame-ancestors`; keeping `SAMEORIGIN` would block
+  the intended cross-origin embed on browsers that honor `X-Frame-Options`).
+
+```bash
+# Allow a host app to embed the whole UI, and keep same-origin iframes working:
+vh-solara client-daemon --frame-ancestors 'self' --frame-ancestors https://app.my-root-domain
+vh-solara local-server   --frame-ancestors 'self' --frame-ancestors https://app.my-root-domain
+```
+
+In a controller + multiple-worker deployment, set the same allowlist on **each
+worker daemon** (and the controller-facing surface) so every proxied worker
+permits embedding from the host app origin. See
+[SECURITY.md](../../SECURITY.md) → "Browser-facing hardening" for the full header
+set.
 
 ---
 
