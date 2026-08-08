@@ -169,8 +169,9 @@ vh-solara local-server   --frame-ancestors 'self' --frame-ancestors https://app.
 ```
 
 In a controller + multiple-worker deployment, set the same allowlist on **each
-worker daemon** (and the controller-facing surface) so every proxied worker
-permits embedding from the host app origin. See
+worker daemon** — the controller reverse-proxies browser traffic to workers, so
+each worker's own CSP governs framing for its proxied UI (the controller `server`
+command has no `--frame-ancestors` flag; it is worker-scoped). See
 [SECURITY.md](../../SECURITY.md) → "Browser-facing hardening" for the full header
 set.
 
