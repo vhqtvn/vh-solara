@@ -148,8 +148,8 @@ is **no pytest** anywhere in this repo.
    config (vite DEV host :5173, cross-origin iframe :5174, ws-echo :5175); the
    preview suite swaps the host dev server for `vite build && vite preview` to
    prove the shell works when `window.__host` is absent. No Go, no fixtureserver.
-   Runner (survival + shell): `npm --prefix host-web run test:e2e`.
-   Runner (production-build proof): `npm --prefix host-web run test:e2e:preview`.
+   Runner (survival + shell; Chromium + Firefox + WebKit): `npm --prefix host-web run test:e2e`.
+   Runner (production-build proof; Chromium + Firefox): `npm --prefix host-web run test:e2e:preview`.
 
 Execution examples:
 

@@ -139,7 +139,7 @@ jobs:
           cache-dependency-path: host-web/package-lock.json
       - run: npm ci
       - name: install Playwright browsers
-        run: npx playwright install --with-deps chromium firefox
+        run: npx playwright install --with-deps chromium firefox webkit
       - name: host-web e2e (iframe survival + shell, DEV servers)
         run: npm run test:e2e
       - name: host-web e2e (production-build shell proof, vite preview)
