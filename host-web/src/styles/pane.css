@@ -39,6 +39,46 @@
   min-width: 0;
   flex: 1 1 auto;
 }
+/* Per-pane document-liveness indicator (Q1-C). dot color + label reflect
+ * livenessFor(paneId) — document/SPA liveness only, NEVER realtime/SSE health.
+ * See docs/heartbeat-protocol.md §6. */
+.pane-liveness {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
+}
+.pane-liveness-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--fg-dim);
+  flex: 0 0 auto;
+}
+.pane-liveness-dot[data-state="alive"] {
+  background: var(--good);
+}
+.pane-liveness-dot[data-state="reloaded"] {
+  background: var(--warn);
+}
+.pane-liveness-dot[data-state="no-signal"] {
+  background: var(--fg-dim);
+}
+.pane-liveness-label {
+  font-size: 10px;
+  color: var(--fg-dim);
+  white-space: nowrap;
+}
+.pane-liveness-label[data-state="alive"] {
+  color: var(--fg-dim);
+}
+.pane-liveness-label[data-state="reloaded"] {
+  color: var(--warn);
+}
+.pane-liveness-label[data-state="no-signal"] {
+  color: var(--fg-dim);
+  font-style: italic;
+}
 .pane-label {
   font-size: 12px;
   font-weight: 600;

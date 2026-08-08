@@ -16,6 +16,7 @@ import { installCsrf } from "./csrf";
 import { installViewport } from "./viewport";
 import { installScrollEdges } from "./lib/scrollEdges";
 import { startPresence } from "./alerts";
+import { startHeartbeat } from "./heartbeat";
 import { refreshProjectSettings } from "./projectSettings";
 import "./styles/main.css";
 
@@ -75,6 +76,12 @@ if (standalone === "code") {
   render(() => <StandaloneCode />, root);
   installScrollEdges();
 } else {
+  // Embed-gated document-liveness heartbeat (no-op when standalone). When this
+  // SPA is embedded by the vh-solara host shell, it heartbeats so the host can
+  // drive a per-pane "document alive / reloaded / no recent signal" indicator.
+  // Installed early so the handshake listener is registered before the host's
+  // iframe load event delivers it. See host-web/docs/heartbeat-protocol.md.
+  startHeartbeat();
   startSync();
   // OpenCode lifecycle health polling (independent of the worker SSE stream):
   // the worker being reachable (state.status "live") only means the vh-solara

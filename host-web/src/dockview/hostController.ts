@@ -15,10 +15,18 @@ import {
 import {
   baselineFor,
   bindContentWindow,
+  bindScratchSource,
   connected,
+  expectedNonceFor,
   focusedId,
+  livenessFor,
+  lookupContentWindow,
+  noteIframeLoad,
   panes,
   resetBaseline,
+  routeMessage,
+  scratchSource,
+  sendHandshake,
   setFocused,
   setMaximized,
   setTray,
@@ -417,8 +425,59 @@ export class HostController implements HostOps {
       groupBox: (id: string) => this.api.getPanel(id)?.group.api.boundingBox ?? null,
       survival: (id: string) => survivalFor(id) ?? null,
       baseline: (id: string) => baselineFor(id) ?? null,
+      expectedNonce: (id: string) => expectedNonceFor(id) ?? null,
       resetBaseline: (id: string) => resetBaseline(id),
       connected: () => connected(),
+
+      // ---- document-liveness protocol probes (heartbeat-protocol e2e) ------
+      // livenessFor() drives the per-pane Q1-C indicator. probeHeartbeat()
+      // routes a SYNTHETIC message through the REAL router (routeMessage) so the
+      // protocol e2e can deterministically assert origin/window/nonce rejection
+      // without a second real cross-origin iframe. `sourcePaneId` resolves to
+      // that pane's bound contentWindow as the MessageEvent source; pass null to
+      // simulate an unknown source window (wrong-window rejection).
+      //
+      // The scratch-pane surface (protocolScratch/Probe/Liveness/NoteLoad/Dispose)
+      // is a self-contained mini-pane with NO real heartbeat stream, used for the
+      // pure protocol-logic tests (valid acceptance, stale-nonce, reload) where a
+      // real mock iframe would interleave.
+      liveness: (id: string) => livenessFor(id),
+      probeHeartbeat: (
+        args: {
+          sourcePaneId: string | null;
+          origin: string;
+          payload: unknown;
+        },
+      ) => {
+        const cw = args.sourcePaneId
+          ? (lookupContentWindow(args.sourcePaneId) ?? null)
+          : null;
+        // When sourcePaneId is given but unbound, fall back to the host window
+        // so the source is genuinely "unknown" to sourceMap (wrong-window path).
+        const src: Window | null = cw ?? (args.sourcePaneId === null ? window : null);
+        return routeMessage(src, args.origin, args.payload);
+      },
+      noteIframeLoad: (id: string) => noteIframeLoad(id),
+      sendHandshake: (id: string) => sendHandshake(id),
+      // scratch-pane protocol surface: the sentinel source lives in-page and is
+      // addressed by an opaque scratchId string (it cannot round-trip through
+      // Playwright's serialization). probeHeartbeat/Probe route a synthetic
+      // message through the REAL router; scratchId=null simulates an unknown
+      // source (wrong-window rejection).
+      protocolScratch: (id: string, origin: string) => {
+        bindScratchSource(id, origin);
+      },
+      protocolProbe: (args: {
+        scratchId: string | null;
+        origin: string;
+        payload: unknown;
+      }) => {
+        const src = args.scratchId ? (scratchSource(args.scratchId) ?? null) : null;
+        return routeMessage(src as Window | null, args.origin, args.payload);
+      },
+      protocolLiveness: (id: string) => livenessFor(id),
+      protocolNoteLoad: (id: string) => noteIframeLoad(id),
+      protocolDispose: (id: string) => unregisterPane(id),
 
       split: (id: string, dir: SplitDir) => this.split(id, dir),
       swap: (a: string, b: string) => this.swap(a, b),
@@ -465,6 +524,15 @@ export class HostController implements HostOps {
       // The fresh contentWindow is bound so the gate can observe the reload
       // signal via the new heartbeat (the whole point is to PROVE the gate
       // detects this mistake).
+      //
+      // Document-liveness protocol reconcile: the fresh iframe is created here
+      // (NOT by the renderer), so it has none of the renderer's wiring. We
+      // re-bind the contentWindow, and on the fresh iframe's `load` event we
+      // mark the pending load + re-issue the handshake — exactly what the
+      // renderer does for the panels it owns. Without this, the new document's
+      // heartbeats would carry a new identity but no pending-load flag, so the
+      // router would reject them as stale (and the gate would never observe the
+      // reload). See docs/heartbeat-protocol.md §4.
       naiveReload: (id: string): void => {
         const r = this.renderers.get(id);
         if (!r) return;
@@ -476,6 +544,11 @@ export class HostController implements HostOps {
         fresh.src = old.src;
         body.appendChild(fresh);
         if (fresh.contentWindow) bindContentWindow(id, fresh.contentWindow);
+        fresh.addEventListener("load", () => {
+          if (fresh.contentWindow) bindContentWindow(id, fresh.contentWindow);
+          noteIframeLoad(id);
+          sendHandshake(id);
+        });
       },
 
       // NEGATIVE CONTROL (b): wholesale toJSON → fromJSON re-swap. This

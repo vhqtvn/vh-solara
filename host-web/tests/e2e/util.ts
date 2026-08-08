@@ -48,6 +48,107 @@ export async function serialize(page: Page): Promise<Record<string, unknown>> {
     return (h ? h.serialize() : {}) as Record<string, unknown>;
   });
 }
+
+// ---- document-liveness protocol probes (heartbeat-protocol e2e) ------------
+// These drive the DEV-only window.__host bridge (absent in prod builds). The
+// scratch-pane surface is a self-contained mini-pane with NO real heartbeat
+// stream, so protocol-logic assertions are deterministic (no interleaving).
+
+export type LivenessState = "alive" | "reloaded" | "no-signal";
+
+export type RouteReason =
+  | "ignored-non-pane-to-host"
+  | "rejected:unknown-source"
+  | "rejected:origin-mismatch"
+  | "rejected:stale-nonce"
+  | "accepted:first-after-load"
+  | "accepted:reload"
+  | "accepted:stable"
+  | "accepted:non-heartbeat";
+
+export interface RouteResult {
+  routed: boolean;
+  paneId: string | null;
+  accepted: boolean;
+  reason: RouteReason;
+}
+
+/** Liveness state of a real pane (drives the Q1-C indicator). */
+export async function liveness(page: Page, id: string): Promise<LivenessState> {
+  return page.evaluate((id) => {
+    const h = (window as unknown as { __host?: { liveness(i: string): LivenessState } }).__host;
+    return h ? h.liveness(id) : "no-signal";
+  }, id);
+}
+
+/** Create a scratch protocol pane (sentinel source + origin + pending load).
+ *  The sentinel lives in-page; address it via the scratchId in protocolProbe. */
+export async function protocolScratch(
+  page: Page,
+  id: string,
+  origin: string,
+): Promise<void> {
+  await page.evaluate(({ id, origin }) => {
+    const h = (window as unknown as { __host?: { protocolScratch(i: string, o: string): void } }).__host;
+    h?.protocolScratch(id, origin);
+  }, { id, origin });
+}
+
+/** Route a synthetic message through the REAL router. `scratchId` resolves to
+ *  the scratch pane's in-page sentinel source; pass null for an unknown source
+ *  (wrong-window rejection). Returns the verdict. */
+export async function protocolProbe(
+  page: Page,
+  args: { scratchId: string | null; origin: string; payload: unknown },
+): Promise<RouteResult> {
+  return page.evaluate(({ scratchId, origin, payload }) => {
+    const h = (window as unknown as { __host?: { protocolProbe(a: { scratchId: string | null; origin: string; payload: unknown }): RouteResult } }).__host;
+    return h
+      ? h.protocolProbe({ scratchId, origin, payload })
+      : { routed: false, paneId: null, accepted: false, reason: "ignored-non-pane-to-host" as RouteReason };
+  }, args);
+}
+
+/** Liveness state of a scratch protocol pane. */
+export async function protocolLiveness(page: Page, id: string): Promise<LivenessState> {
+  return page.evaluate((id) => {
+    const h = (window as unknown as { __host?: { protocolLiveness(i: string): LivenessState } }).__host;
+    return h ? h.protocolLiveness(id) : "no-signal";
+  }, id);
+}
+
+/** Mark a pending load on a scratch/real pane (forces re-establish identity). */
+export async function protocolNoteLoad(page: Page, id: string): Promise<void> {
+  await page.evaluate((id) => {
+    const h = (window as unknown as { __host?: { protocolNoteLoad(i: string): void } }).__host;
+    h?.protocolNoteLoad(id);
+  }, id);
+}
+
+/** Issue a handshake for a scratch/real pane (stores the issued challenge nonce
+ *  the host will verify the first post-load heartbeat against). */
+export async function protocolHandshake(page: Page, id: string): Promise<void> {
+  await page.evaluate((id) => {
+    const h = (window as unknown as { __host?: { sendHandshake(i: string): void } }).__host;
+    h?.sendHandshake(id);
+  }, id);
+}
+
+/** Read the challenge nonce the host issued for a pane's current pending load. */
+export async function expectedNonce(page: Page, id: string): Promise<string | null> {
+  return page.evaluate((id) => {
+    const h = (window as unknown as { __host?: { expectedNonce(i: string): string | null } }).__host;
+    return h ? h.expectedNonce(id) : null;
+  }, id);
+}
+
+/** Dispose a scratch protocol pane (clears its protocol state). */
+export async function protocolDispose(page: Page, id: string): Promise<void> {
+  await page.evaluate((id) => {
+    const h = (window as unknown as { __host?: { protocolDispose(i: string): void } }).__host;
+    h?.protocolDispose(id);
+  }, id);
+}
 export async function focused(page: Page): Promise<string | null> {
   const r = await page.evaluate(() => {
     const h = (window as unknown as { __host?: { focused(): string | null } }).__host;

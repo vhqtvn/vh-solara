@@ -2,10 +2,14 @@ import type {
   GroupPanelPartInitParameters,
   IContentRenderer,
 } from "dockview-core";
-import type { HostOps, PaneHeaderState, PaneParams } from "./types";
+import type { HostOps, LivenessState, PaneHeaderState, PaneParams } from "./types";
 import {
   bindContentWindow,
+  bindPaneOrigin,
+  livenessFor,
   lookupContentWindow,
+  noteIframeLoad,
+  sendHandshake,
   unbindContentWindow,
 } from "./store";
 
@@ -34,6 +38,12 @@ export class IframeRenderer implements IContentRenderer {
   private headerLabel!: HTMLElement;
   private btnCollapse!: HTMLButtonElement;
   private btnZoom!: HTMLButtonElement;
+  // Per-pane document-liveness indicator (Q1-C). Updated on a ~2 Hz timer that
+  // reads livenessFor(paneId) so staleness + the reloaded window expire without
+  // another heartbeat arriving.
+  private livenessDot!: HTMLElement;
+  private livenessLabel!: HTMLElement;
+  private livenessTimer: number | undefined;
   private headerState: PaneHeaderState = {
     inTray: false,
     maximized: false,
@@ -52,8 +62,18 @@ export class IframeRenderer implements IContentRenderer {
     this.paneId = params.api.id;
     this.params = (params.params as PaneParams) ?? this.params;
     this.element.dataset.paneId = this.paneId;
+    // Bind the configured server origin for the constraint-#3 origin check.
+    // Derived from params.url (mock :5174 or a real server origin).
+    try {
+      bindPaneOrigin(this.paneId, new URL(this.params!.url).origin);
+    } catch {
+      // malformed url: leave origin unbound → routeMessage treats a missing
+      // expected origin as "do not origin-reject" (defensive; seed urls are
+      // validated http/https so this is unreachable in practice).
+    }
     this.buildDom();
     this.buildIframe();
+    this.startLivenessIndicator();
   }
 
   private buildDom(): void {
@@ -65,6 +85,19 @@ export class IframeRenderer implements IContentRenderer {
 
     const brand = document.createElement("div");
     brand.className = "pane-brand";
+    // Per-pane document-liveness indicator (Q1-C). dot color + label reflect
+    // livenessFor(paneId). NEVER realtime/SSE wording — see
+    // docs/heartbeat-protocol.md §6.
+    const live = document.createElement("div");
+    live.className = "pane-liveness";
+    live.setAttribute("data-testid", "pane-liveness");
+    this.livenessDot = document.createElement("span");
+    this.livenessDot.className = "pane-liveness-dot";
+    this.livenessLabel = document.createElement("span");
+    this.livenessLabel.className = "pane-liveness-label";
+    live.appendChild(this.livenessDot);
+    live.appendChild(this.livenessLabel);
+    brand.appendChild(live);
     this.headerLabel = document.createElement("span");
     this.headerLabel.className = "pane-label";
     this.headerLabel.textContent = p.label;
@@ -138,6 +171,13 @@ export class IframeRenderer implements IContentRenderer {
     // ~250ms heartbeat).
     iframe.addEventListener("load", () => {
       if (iframe.contentWindow) bindContentWindow(this.paneId, iframe.contentWindow);
+      // Document-liveness protocol (docs/heartbeat-protocol.md §3.1 + §4): on
+      // every load (initial + reload), mark a pending load so the next
+      // heartbeat establishes a fresh identity, then issue a fresh challenge
+      // nonce. Both the real SPA and the mock stand-in echo this nonce; the
+      // host verifies the first post-load heartbeat carries it (constraint #4).
+      noteIframeLoad(this.paneId);
+      sendHandshake(this.paneId);
     });
     if (iframe.contentWindow) bindContentWindow(this.paneId, iframe.contentWindow);
   }
@@ -177,6 +217,22 @@ export class IframeRenderer implements IContentRenderer {
     this.postToPane({ type: "blur" });
   }
 
+  /** Start the ~2 Hz per-pane liveness indicator refresh. */
+  private startLivenessIndicator(): void {
+    this.updateLiveness();
+    if (typeof window !== "undefined") {
+      this.livenessTimer = window.setInterval(() => this.updateLiveness(), 500);
+    }
+  }
+
+  /** Reflect livenessFor(paneId) into the dot + label (Q1-C states). */
+  private updateLiveness(): void {
+    const state: LivenessState = livenessFor(this.paneId);
+    this.livenessDot.setAttribute("data-state", state);
+    this.livenessLabel.textContent = liveLabel(state);
+    this.livenessLabel.setAttribute("data-state", state);
+  }
+
   private postToPane(msg: unknown): void {
     const cw = lookupContentWindow(this.paneId) ?? this.iframe?.contentWindow;
     if (!cw || !this.params) return;
@@ -195,6 +251,22 @@ export class IframeRenderer implements IContentRenderer {
   }
 
   dispose(): void {
+    if (this.livenessTimer !== undefined && typeof window !== "undefined") {
+      window.clearInterval(this.livenessTimer);
+      this.livenessTimer = undefined;
+    }
     unbindContentWindow(this.paneId);
+  }
+}
+
+/** Q1-C visible label for a per-pane liveness state. */
+function liveLabel(s: LivenessState): string {
+  switch (s) {
+    case "alive":
+      return "document alive";
+    case "reloaded":
+      return "reloaded";
+    case "no-signal":
+      return "no recent signal";
   }
 }

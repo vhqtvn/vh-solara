@@ -65,13 +65,42 @@ export type PaneToHost =
       mountTs: number;
       nonce: string;
       uptime: number;
-      connId: number | null;
-      src: string;
+      // connId + src are OPTIONAL: kept only for the mock content page stand-in
+      // (the survival gate's WS negative control asserts on connId). The real
+      // SPA omits both; the document-liveness indicator keys on mountTs + nonce
+      // + uptime, never on connId. See docs/heartbeat-protocol.md §7.
+      connId?: number | null;
+      src?: string;
     }
   | { type: "title"; title: string }
   | { type: "route" };
 
-export type HostToPane = { type: "focus" } | { type: "blur" };
+// Host → pane. `focus`/`blur` are the pre-existing host-focus routing. The
+// `vh-host-handshake` is the document-liveness challenge (see
+// docs/heartbeat-protocol.md §3.1): issued once per iframe load, carries a fresh
+// nonce the SPA echoes back in its heartbeats.
+export type HostToPane =
+  | { type: "focus" }
+  | { type: "blur" }
+  | { type: "vh-host-handshake"; nonce: string };
+
+// ---- document-liveness indicator (Q1-C) ------------------------------------
+// The on-screen per-pane indicator state derived from heartbeats. This is
+// document/SPA liveness ONLY — never realtime/SSE health. See
+// docs/heartbeat-protocol.md §1 + §6.
+export type LivenessState = "alive" | "reloaded" | "no-signal";
+
+/** Human-visible label for a liveness state (Q1-C exact strings). */
+export function livenessLabel(s: LivenessState): string {
+  switch (s) {
+    case "alive":
+      return "document alive";
+    case "reloaded":
+      return "reloaded";
+    case "no-signal":
+      return "no recent signal";
+  }
+}
 
 export const VIEW_KINDS: ViewKind[] = ["chat", "terminal", "diff", "sessions"];
 

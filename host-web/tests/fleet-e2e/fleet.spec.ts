@@ -23,11 +23,12 @@ import { FLEET_POISONED, FLEET_SERVERS } from "./fleet-data";
 test.describe("config-driven fleet seeding (VITE_SERVERS)", () => {
   test("seeds panes from VITE_SERVERS, not the mock fleet", async ({ page }) => {
     await page.goto("/");
-    // Heartbeats flowing through the store router → "connected" proves the
-    // configured urls (which point at the mock content page) actually loaded and
-    // heartbeated, i.e. the url wiring is real, not just a label.
+    // Heartbeats flowing through the store router → focused-pane liveness
+    // "document alive" (Q1-C) proves the configured urls (which point at the
+    // mock content page) actually loaded and heartbeated, i.e. the url wiring is
+    // real, not just a label.
     await expect(page.locator('[data-testid="statusbar"]')).toContainText(
-      "connected",
+      "document alive",
       { timeout: 30_000 },
     );
 
@@ -80,7 +81,7 @@ test.describe("config-driven fleet seeding (VITE_SERVERS)", () => {
     // iframe.src (which would execute same-origin against the host shell).
     await page.goto("/");
     await expect(page.locator('[data-testid="statusbar"]')).toContainText(
-      "connected",
+      "document alive",
       { timeout: 30_000 },
     );
 

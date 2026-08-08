@@ -15,11 +15,17 @@
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: var(--warn);
+  background: var(--fg-dim);
   flex: 0 0 auto;
 }
-.dot[data-on="1"] {
+.dot[data-state="alive"] {
   background: var(--good);
+}
+.dot[data-state="reloaded"] {
+  background: var(--warn);
+}
+.dot[data-state="no-signal"] {
+  background: var(--fg-dim);
 }
 .item {
   white-space: nowrap;

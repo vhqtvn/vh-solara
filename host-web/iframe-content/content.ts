@@ -20,12 +20,16 @@
 const PARENT_ORIGIN =
   new URLSearchParams(location.search).get("parent") ?? "*";
 
-// Captured exactly once, at script-run (== document load). NEVER reassigned.
+// mountTs captured exactly once, at script-run (== document load). NEVER
+// reassigned. Changes iff the iframe document was destroyed and recreated.
 const MOUNT_TS = Date.now();
-const NONCE =
-  typeof crypto !== "undefined" && "randomUUID" in crypto
-    ? crypto.randomUUID()
-    : Math.random().toString(36).slice(2) + Date.now().toString(36);
+// nonce is the host's handshake CHALLENGE echoed back (constraint #4: the host
+// knows the expected value before accepting a heartbeat). Captured from the
+// inbound handshake exactly once per load (the host issues one handshake per
+// load); null until the handshake arrives, so heartbeats hold off until then
+// (mirrors the real SPA in web/src/heartbeat.ts). Changes on reload because a
+// reload is a new document that receives a fresh handshake with a fresh nonce.
+let nonce: string | null = null;
 
 const params = new URLSearchParams(location.search);
 const SERVER = params.get("server") ?? "unknown";
@@ -144,11 +148,20 @@ renderView();
 
 // ---- pane → host: title + route (minimal postMessage contract) -----------
 
+// Q2-A: the host origin is captured from the inbound handshake's
+// MessageEvent.origin (browser-validated). Until the handshake arrives, fall
+// back to the ?parent= query param / '*' (non-secret mock payload). This mirrors
+// what the real SPA does (web/src/heartbeat.ts) — the mock is the faithful
+// embedded-SPA stand-in. The mock echoes the host's handshake challenge nonce
+// (constraint #4) and heartbeats once the nonce is captured; connId (WS negative
+// control) is optional. See docs/heartbeat-protocol.md §7.
+let hostOrigin: string | null = null;
+
 function postToParent(msg: unknown): void {
-  // Mock content; messages carry no secrets, so '*' target is acceptable for
-  // Phase 1. The host→iframe direction is targeted precisely (host knows the
-  // :5174 origin).
-  parent.postMessage(msg, PARENT_ORIGIN);
+  // Mock content; messages carry no secrets. Reply to the captured host origin
+  // when known (Q2-A); otherwise the ?parent= param or '*' fallback. The host→
+  // iframe direction is targeted precisely (host knows the :5174 origin).
+  parent.postMessage(msg, hostOrigin ?? PARENT_ORIGIN);
 }
 
 postToParent({ type: "title", title: `${SERVER} · ${VIEW}` });
@@ -189,10 +202,15 @@ connectWs();
 
 const HEARTBEAT_MS = 250;
 window.setInterval(() => {
+  // Hold off until the host has handshaked (challenge nonce captured). Mirrors
+  // the real SPA (web/src/heartbeat.ts): the host is waiting for the issued
+  // challenge on the first post-load heartbeat, so a heartbeat before the
+  // handshake would carry no echoable nonce.
+  if (nonce === null) return;
   postToParent({
     type: "heartbeat",
     mountTs: MOUNT_TS,
-    nonce: NONCE,
+    nonce,
     uptime: Date.now() - MOUNT_TS,
     connId,
     src: location.href,
@@ -202,8 +220,26 @@ window.setInterval(() => {
 // ---- host → pane: focus / blur (visual ack of the contract) ---------------
 
 window.addEventListener("message", (ev) => {
-  const data = ev.data as { type?: string };
-  if (data && data.type === "focus") {
+  const data = ev.data as { type?: string; nonce?: string };
+  if (data && data.type === "vh-host-handshake") {
+    // F1 (inbound source-guard): mirror the real SPA (web/src/heartbeat.ts)
+    // EXACTLY — only the actual parent window may establish the heartbeat
+    // target. A handshake from any other source (e.g. an untrusted sibling
+    // frame that grabbed this window via window.parent.frames[index]) is
+    // ignored, so it cannot capture this document's origin/nonce or redirect
+    // its heartbeats. The mock MUST stay faithful to the production emitter:
+    // the survival + heartbeat gates depend on identical behavior here.
+    // event.source for the real host handshake is window.parent (the host calls
+    // this contentWindow's postMessage directly in sendHandshake/postToPane).
+    if (ev.source !== window.parent) return;
+    // Q2-A: capture the browser-validated host origin for targeted replies.
+    // Constraint #4: capture the host's challenge nonce and echo it in every
+    // heartbeat (the host verifies the first post-load heartbeat carries this
+    // value). One handshake per load ⇒ nonce is stable for the document's life
+    // and changes on reload (new document ⇒ new handshake ⇒ new nonce).
+    hostOrigin = ev.origin;
+    if (typeof data.nonce === "string") nonce = data.nonce;
+  } else if (data && data.type === "focus") {
     app.classList.add("is-focused");
   } else if (data && data.type === "blur") {
     app.classList.remove("is-focused");

@@ -14,10 +14,11 @@ import { test, expect } from "@playwright/test";
 
 async function waitForHostReady(page: import("@playwright/test").Page): Promise<void> {
   await page.goto("/");
-  // "connected" in the statusbar proves heartbeats are flowing through the
-  // store's message router (not DEV-gated) — independent of window.__host.
+  // "document alive" in the statusbar (Q1-C focused-pane liveness) proves
+  // heartbeats are flowing through the store's message router (not DEV-gated) —
+  // independent of window.__host. Never realtime/SSE wording.
   await expect(page.locator('[data-testid="statusbar"]'))
-    .toContainText("connected", { timeout: 30_000 });
+    .toContainText("document alive", { timeout: 30_000 });
   // Seed panes rendered as workspace tabs (DOM-only readiness).
   await expect
     .poll(async () => page.locator('[data-testid="ws-tab"]').count(), { timeout: 30_000 })

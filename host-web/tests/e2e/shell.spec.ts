@@ -11,9 +11,11 @@ test.describe("host shell UI wiring", () => {
     await H.loadHost(page);
   });
 
-  test("statusbar reports connection + servers + renderer", async ({ page }) => {
+  test("statusbar reports liveness + servers + renderer", async ({ page }) => {
     const bar = page.locator('[data-testid="statusbar"]');
-    await expect(bar).toContainText("connected");
+    // Q1-C: the statusbar shows the focused pane's DOCUMENT liveness ("document
+    // alive" when heartbeats are flowing), never realtime/SSE wording.
+    await expect(bar).toContainText("document alive");
     await expect(bar).toContainText("servers");
     await expect(bar).toContainText("dockview · renderer:always");
   });
