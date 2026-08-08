@@ -1,4 +1,5 @@
 import type { ViewKind } from "../dockview/types";
+import { runtimeServers } from "./serverList";
 
 // The host's pane model is decoupled from any concrete content page: each pane
 // is just a `{ url, label }` (see dockview/types.ts PaneParams). This module is
@@ -158,14 +159,19 @@ export function hasRealFleetEnv(): boolean {
 }
 
 /**
- * Resolve the startup fleet. REAL servers from VITE_SERVERS when valid+non-empty;
- * else the mock fleet (DEFAULT). Pure + side-effect-free; reads the (static,
- * build-time-baked) VITE_SERVERS env. Memoized so the mode is decided once and
- * stays stable for the session.
+ * Resolve the BASE fleet: REAL servers from VITE_SERVERS when valid+non-empty;
+ * else the mock fleet (DEFAULT). This is the build-time-baked, session-stable
+ * tier — it does NOT consult the runtime catalog (that tier lives in
+ * resolveFleet() below). Memoized (cached) so the VITE_SERVERS parse runs once.
+ *
+ * Exported because layout persistence's restore-validation uses it to build the
+ * origin allowlist INDEPENDENTLY of the runtime catalog: layout restore must
+ * stay anchored to the build-time VITE_SERVERS config (the runtime server list
+ * is ORTHOGONAL to layout restore — it must not gate which panes restore).
  */
-let fleetCache: FleetEntry[] | null = null;
-export function resolveFleet(): FleetEntry[] {
-  if (fleetCache) return fleetCache;
+let baseFleetCache: FleetEntry[] | null = null;
+export function resolveBaseFleet(): FleetEntry[] {
+  if (baseFleetCache) return baseFleetCache;
   let fleet: FleetEntry[] = [];
   if (hasRealFleetEnv()) {
     try {
@@ -176,15 +182,43 @@ export function resolveFleet(): FleetEntry[] {
     }
   }
   if (fleet.length === 0) fleet = mockFleet();
-  fleetCache = fleet;
+  baseFleetCache = fleet;
   return fleet;
 }
 
 /**
- * Whether the session is in real-fleet mode. Decided from the same env as
- * resolveFleet() (stable for the build/session). Used by the "+"/split path to
- * decide whether to clone a focused pane (real) or cycle a mock pane (mock).
+ * Resolve the EFFECTIVE fleet used for seeding NEW panes + the add-server
+ * universe. Precedence (highest wins):
+ *   1. RUNTIME catalog (operator-added servers, persisted in localStorage) —
+ *      when non-empty, it shadows the build-time tiers entirely.
+ *   2. VITE_SERVERS (build-time config) — when valid + non-empty.
+ *   3. mock fleet (DEFAULT — keeps the survival gate green on a fresh context).
+ *
+ * Reactive: reads the runtimeServers() SolidJS signal, so a call inside a
+ * tracking scope (e.g. the Statusbar) re-resolves when the catalog changes. The
+ * base tier (VITE_SERVERS → mock) stays memoized via resolveBaseFleet().
+ *
+ * Survival-gate safety: a fresh Playwright context has empty localStorage →
+ * runtime catalog is empty → resolveFleet() falls through to the mock fleet, so
+ * the survival/shell gates are unaffected (verified separately). The fleet-e2e
+ * lane likewise starts on a fresh context → VITE_SERVERS still wins there.
+ */
+export function resolveFleet(): FleetEntry[] {
+  const runtime = runtimeServers();
+  if (runtime.length > 0) return runtime; // runtime catalog wins
+  return resolveBaseFleet();
+}
+
+/**
+ * Whether the session is in real (non-mock) fleet mode: TRUE when the operator
+ * has added runtime servers OR VITE_SERVERS is configured. Used by the "+"/split
+ * path to decide whether to clone a focused pane (real) or cycle a mock pane.
+ *
+ * NOTE: layout persistence deliberately uses hasRealFleetEnv() (build-time only)
+ * for its restore-validation gate, NOT isRealFleet(), so the runtime catalog
+ * cannot gate which panes restore. Keep that asymmetry — the two concerns
+ * (catalog vs. layout) are intentionally independent.
  */
 export function isRealFleet(): boolean {
-  return hasRealFleetEnv();
+  return hasRealFleetEnv() || runtimeServers().length > 0;
 }

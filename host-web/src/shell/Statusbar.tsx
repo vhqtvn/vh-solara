@@ -13,10 +13,11 @@ export function Statusbar() {
     return panes().find((p) => p.id === id);
   });
 
-  // resolveFleet() is memoized (decided once at seed time), so the count reflects
-  // the REAL fleet size when VITE_SERVERS is set (1- or 3-server deployment)
-  // rather than the hardcoded mock SERVERS.length.
-  const fleet = resolveFleet();
+  // resolveFleet() reads the runtimeServers() signal, so wrapping it in a memo
+  // makes the count reactive: it updates when the operator adds/removes a server.
+  // On a fresh mock context the catalog is empty → resolveFleet() returns the
+  // mock fleet (4), matching the prior behavior.
+  const fleet = createMemo(() => resolveFleet());
 
   return (
     <div class={s.statusbar} data-testid="statusbar">
@@ -25,7 +26,7 @@ export function Statusbar() {
         {connected() ? "connected" : "connecting"}
       </span>
       <span class={s.sep}>·</span>
-      <span class={s.item}>{fleet.length} servers</span>
+      <span class={s.item}>{fleet().length} servers</span>
       <span class={s.sep}>·</span>
       <span class={s.item}>
         focus:{" "}

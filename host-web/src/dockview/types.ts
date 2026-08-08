@@ -92,6 +92,17 @@ export interface HostOps {
   toggleZoom?(paneId: string): void;
   collapse?(paneId: string): void;
   restore?(paneId: string): void;
+  /** Add a server to the runtime catalog + open a pane for it. The url is
+   *  validated through isFleetEntry (http/https) — a javascript:/data:/opaque
+   *  value is REJECTED (returns null, no pane, no catalog change) because it
+   *  would execute same-origin against the host shell via the unsandboxed
+   *  iframe.src. Returns the new pane id, or null on rejection. */
+  addServer?(url: string, label: string): string | null;
+  /** Remove a server (by url) from the runtime catalog + close its open panes.
+   *  Returns true when applied; false when refused — specifically when closing
+   *  that server's grid panes would empty the visible grid (refused so the grid
+   *  never goes blank; survival-safe: no layout mutation when refused). */
+  removeServer?(url: string): boolean;
 }
 
 /** State pushed to a pane's header so it can reflect tray/zoom affordances. */

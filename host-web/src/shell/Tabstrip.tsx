@@ -1,5 +1,6 @@
 import { For, Show } from "solid-js";
 import { focusedId, hostOps, panes, trayIds } from "../dockview/store";
+import { AddServer } from "./AddServer";
 import s from "./Tabstrip.module.css";
 
 /**
@@ -48,6 +49,7 @@ export function Tabstrip() {
       >
         +
       </button>
+      <AddServer />
       <Show when={trayIds().length > 0}>
         <span class={s.trayBadge} title="Collapsed panes">
           tray: {trayIds().length}

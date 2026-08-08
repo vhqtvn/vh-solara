@@ -1,7 +1,17 @@
 import type { DockviewApi, IDockviewPanel } from "dockview-core";
 import type { IframeRenderer } from "./iframeRenderer";
 import type { HostOps, SplitDir } from "./types";
-import { isRealFleet, mockUrl, nextMockPane, nextPaneId } from "../state/mockData";
+import {
+  isFleetEntry,
+  isRealFleet,
+  mockUrl,
+  nextMockPane,
+  nextPaneId,
+} from "../state/mockData";
+import {
+  addRuntimeServer,
+  removeRuntimeServer,
+} from "../state/serverList";
 import {
   baselineFor,
   bindContentWindow,
@@ -153,6 +163,69 @@ export class HostController implements HostOps {
     this.afterMutation();
   }
 
+  // ---- runtime server management (catalog add/remove) ---------------------
+
+  /**
+   * Add a server to the runtime catalog AND open a new pane for it.
+   *
+   * SECURITY: the url is validated through isFleetEntry (http/https). A
+   * javascript:/data:/opaque/parse-failure value is REJECTED — returns null,
+   * no pane opens, no catalog change — because the url lands on an UNSANDBOXED
+   * iframe.src and a non-http(s) value would execute same-origin against the
+   * host shell. This mirrors the F1 fleet-rejection guard.
+   *
+   * On a valid url: append {url,label} to the catalog (idempotent on url) and
+   * addPanel a new pane with that {url,label} (split-right off the focused pane
+   * when one exists, else absolute). The new pane's iframe src is set ONCE here
+   * and never mutated (renderer:'always' keeps it mounted).
+   */
+  addServer(url: string, label: string): string | null {
+    // Trim + derive a label from the url host when none supplied (UX nicety; the
+    // isFleetEntry check below still owns the security boundary).
+    const u = url.trim();
+    const l = label.trim() || safeHost(u);
+    if (!isFleetEntry({ url: u, label: l })) return null; // reject: not http/https
+    addRuntimeServer(u, l); // idempotent on url (catalog side)
+    const ref = this.api.activePanel ?? undefined;
+    const created = this.api.addPanel({
+      id: nextPaneId(),
+      component: "iframe",
+      renderer: "always",
+      params: { url: u, label: l },
+      position: ref ? { referencePanel: ref, direction: "right" } : undefined,
+    });
+    created.api.setActive();
+    this.afterMutation();
+    return created.id;
+  }
+
+  /**
+   * Remove a server (by url) from the runtime catalog + close its open panes.
+   * Returns true when applied; false when refused (closing this server's grid
+   * panes would empty the visible grid — refused so the grid never goes blank).
+   * Refusal is survival-safe: NO layout mutation happens when refused.
+   */
+  removeServer(url: string): boolean {
+    const u = url.trim();
+    // Collect every panel whose pane url matches this server.
+    const matching: IDockviewPanel[] = [];
+    for (const p of this.api.panels) {
+      const pu = (p.params as { url?: string } | undefined)?.url;
+      if (pu === u) matching.push(p);
+    }
+    // Guard: would closing the matching GRID panes empty the visible grid?
+    const matchingGrid = matching.filter(
+      (p) => p.group.api.location.type === "grid",
+    );
+    if (matchingGrid.length > 0 && this.gridPaneCount() - matchingGrid.length <= 0) {
+      return false; // refuse — never leave a blank grid
+    }
+    removeRuntimeServer(u); // catalog side (no-op if url not in catalog)
+    for (const p of matching) this.api.removePanel(p);
+    this.afterMutation();
+    return true;
+  }
+
   // ---- event wiring → store ------------------------------------------------
 
   private wireEvents(): void {
@@ -244,14 +317,15 @@ export class HostController implements HostOps {
   /**
    * Build params for a NEW pane created by "+" / split.
    *
-   * - REAL-fleet mode (VITE_SERVERS): clone the SOURCE/focused pane's
-   *   {url,label} — splitting opens another view of the same server, not a new
-   *   mock. The url is reused verbatim (a server view, not a different server).
+   * - REAL-fleet mode (runtime catalog OR VITE_SERVERS): clone the SOURCE/focused
+   *   pane's {url,label} — splitting opens another view of the same server, not a
+   *   new mock. The url is reused verbatim (a server view, not a different server).
    * - MOCK mode (default): cycle the next mock (server, view) and build its
    *   {url,label} (url → mock content page; label "srv-A · chat"-style).
    *
-   * Mode is decided once from the (static) VITE_SERVERS env via isRealFleet(),
-   * so it stays stable for the whole session.
+   * Mode is decided per-call via isRealFleet() (runtime-aware: true when the
+   * operator has added servers OR VITE_SERVERS is set), so "+" clones in any
+   * real-server session and cycles mock only on a fresh mock context.
    */
   private newPaneParams(source?: IDockviewPanel): {
     id: string;
@@ -287,6 +361,8 @@ export class HostController implements HostOps {
     this.ops.toggleZoom = (id) => this.toggleZoom(id);
     this.ops.collapse = (id) => this.collapse(id);
     this.ops.restore = (id) => this.restore(id);
+    this.ops.addServer = (url, label) => this.addServer(url, label);
+    this.ops.removeServer = (url) => this.removeServer(url);
   }
 
   // ---- test bridge (window.__host) ----------------------------------------
@@ -412,5 +488,16 @@ export class HostController implements HostOps {
       },
     };
     (window as unknown as { __host?: typeof bridge }).__host = bridge;
+  }
+}
+
+/** Best-effort host:port extraction for a fallback label. Returns "" on a
+ *  malformed url (the caller's isFleetEntry check rejects those anyway). */
+function safeHost(url: string): string {
+  try {
+    const h = new URL(url).host;
+    return h || url;
+  } catch {
+    return url;
   }
 }

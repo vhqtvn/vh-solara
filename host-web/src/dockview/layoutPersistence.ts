@@ -1,8 +1,8 @@
 import type { DockviewApi, SerializedDockview } from "dockview-core";
 import {
+  hasRealFleetEnv,
   isFleetEntry,
-  isRealFleet,
-  resolveFleet,
+  resolveBaseFleet,
   seedPaneSeq,
   type FleetEntry,
 } from "../state/mockData";
@@ -204,9 +204,16 @@ export function loadRepairedLayout(): SerializedDockview | null {
 // script the host); and mock mode is a dev/test posture, not a production fleet.
 // Real-fleet mode tightens this with the origin-membership allowlist above.
 function validRestoreIds(panels: SavedLayout["panels"]): Set<string> {
-  const fleetOrigins = isRealFleet()
+  // The origin allowlist is anchored to the BUILD-TIME VITE_SERVERS config
+  // (hasRealFleetEnv + resolveBaseFleet), NOT the runtime catalog. This keeps
+  // layout restore ORTHOGONAL to the runtime server list: adding/removing a
+  // runtime server never gates which panes restore. (Using isRealFleet()/
+  // resolveFleet() here would let the runtime catalog reshape the allowlist and
+  // drop restored panes that point at build-time-only servers — a behavior
+  // change this slice must NOT introduce.)
+  const fleetOrigins = hasRealFleetEnv()
     ? new Set(
-        resolveFleet()
+        resolveBaseFleet()
           .map((e) => safeOrigin(e.url))
           .filter((o): o is string => o !== null),
       )
