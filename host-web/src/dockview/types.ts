@@ -53,6 +53,12 @@ export interface SurvivalBaseline {
 // Independent panes: no deep cross-tile DOM integration. Pane labels its own
 // tab/header (title/route); host tells a pane when it gains/loses focus.
 
+// Inbound pane→host message contract. The host router (`store.ts`) keys only on
+// `type` + the per-variant payload it actually consumes (survival identity for
+// heartbeat, title text for title, nothing for route). The Phase-1′a pane-model
+// refactor retired the old `server`/`view` pair from this surface — a pane is
+// now addressed by its `url`+`label` (PaneParams) and the host never routes
+// inbound messages by server/view, so those fields were documented-but-dead.
 export type PaneToHost =
   | {
       type: "heartbeat";
@@ -60,12 +66,10 @@ export type PaneToHost =
       nonce: string;
       uptime: number;
       connId: number | null;
-      server: string;
-      view: ViewKind;
       src: string;
     }
-  | { type: "title"; server: string; view: ViewKind; title: string }
-  | { type: "route"; server: string; view: ViewKind };
+  | { type: "title"; title: string }
+  | { type: "route" };
 
 export type HostToPane = { type: "focus" } | { type: "blur" };
 

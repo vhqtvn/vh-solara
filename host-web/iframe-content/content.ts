@@ -151,8 +151,8 @@ function postToParent(msg: unknown): void {
   parent.postMessage(msg, PARENT_ORIGIN);
 }
 
-postToParent({ type: "title", server: SERVER, view: VIEW, title: `${SERVER} · ${VIEW}` });
-postToParent({ type: "route", server: SERVER, view: VIEW });
+postToParent({ type: "title", title: `${SERVER} · ${VIEW}` });
+postToParent({ type: "route" });
 
 // ---- WebSocket echo (connId = reload signal) ------------------------------
 
@@ -195,8 +195,6 @@ window.setInterval(() => {
     nonce: NONCE,
     uptime: Date.now() - MOUNT_TS,
     connId,
-    server: SERVER,
-    view: VIEW,
     src: location.href,
   });
 }, HEARTBEAT_MS);
