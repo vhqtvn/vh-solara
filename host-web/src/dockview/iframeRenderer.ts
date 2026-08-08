@@ -3,18 +3,17 @@ import type {
   IContentRenderer,
 } from "dockview-core";
 import type { HostOps, PaneHeaderState, PaneParams } from "./types";
-import { iframeUrl } from "../state/mockData";
 import {
   bindContentWindow,
   lookupContentWindow,
   unbindContentWindow,
 } from "./store";
-import { IFRAME_ORIGIN } from "../state/mockData";
 
 /**
- * Per-pane content renderer. Builds a CUSTOM header (server label + view +
+ * Per-pane content renderer. Builds a CUSTOM header (a single `.pane-label` +
  * split/collapse/zoom/close affordances) over a single cross-origin <iframe>
- * that points at the (mock) vh-solara server page.
+ * whose src is the pane's {url,label} — in MOCK mode the mock content page
+ * url; in REAL-fleet mode (VITE_SERVERS) a real server origin.
  *
  * LOAD-BEARING RULE (the whole architecture's guarantee): create exactly ONE
  * <iframe> element and NEVER reparent, replace, or remove+re-add it. Dockview's
@@ -32,8 +31,7 @@ export class IframeRenderer implements IContentRenderer {
   private paneId = "";
   private params: PaneParams | undefined;
   private iframe!: HTMLIFrameElement;
-  private headerServer!: HTMLElement;
-  private headerView!: HTMLElement;
+  private headerLabel!: HTMLElement;
   private btnCollapse!: HTMLButtonElement;
   private btnZoom!: HTMLButtonElement;
   private headerState: PaneHeaderState = {
@@ -67,15 +65,11 @@ export class IframeRenderer implements IContentRenderer {
 
     const brand = document.createElement("div");
     brand.className = "pane-brand";
-    this.headerServer = document.createElement("span");
-    this.headerServer.className = "pane-server";
-    this.headerServer.textContent = p.server;
-    this.headerServer.title = p.server;
-    this.headerView = document.createElement("span");
-    this.headerView.className = "pane-view";
-    this.headerView.textContent = p.view;
-    brand.appendChild(this.headerServer);
-    brand.appendChild(this.headerView);
+    this.headerLabel = document.createElement("span");
+    this.headerLabel.className = "pane-label";
+    this.headerLabel.textContent = p.label;
+    this.headerLabel.title = p.label;
+    brand.appendChild(this.headerLabel);
     header.appendChild(brand);
 
     const actions = document.createElement("div");
@@ -116,16 +110,19 @@ export class IframeRenderer implements IContentRenderer {
 
   private buildIframe(): void {
     const p = this.params!;
-    // EXACTLY ONE iframe, created once. Its src is set at creation and never
-    // changed (changing src reloads). Geometry/visibility is owned by Dockview.
+    // EXACTLY ONE iframe, created once. Its src is set at creation (from
+    // params.url) and never changed (changing src reloads). Geometry/visibility
+    // is owned by Dockview. params.url is the FULL iframe src — mock content page
+    // url in mock mode, a real server origin in real-fleet mode (VITE_SERVERS).
     const iframe = document.createElement("iframe");
     iframe.className = "pane-iframe";
-    iframe.src = iframeUrl(p.server, p.view);
-    iframe.title = `${p.server} · ${p.view}`;
-    // No sandbox: the child keeps its real cross-origin (here :5174 vs the host
-    // :5173 by port) so it can run its SPA + same-origin-to-itself WebSocket
-    // unimpeded, exactly as a real embedded vh-solara server would. The real
-    // embedding is gated server-side by the (deferred) --frame-ancestors CSP.
+    iframe.src = p.url;
+    iframe.title = p.label;
+    // No sandbox: the child keeps its real cross-origin (mock :5174 vs host
+    // :5173 by port; real servers are cross-origin by domain) so it can run its
+    // SPA + same-origin-to-itself connections unimpeded, exactly as a real
+    // embedded vh-solara server would. Real embedding is gated server-side by
+    // the --frame-ancestors CSP.
     iframe.setAttribute("loading", "eager");
     this.iframe = iframe;
 
@@ -182,10 +179,19 @@ export class IframeRenderer implements IContentRenderer {
 
   private postToPane(msg: unknown): void {
     const cw = lookupContentWindow(this.paneId) ?? this.iframe?.contentWindow;
-    if (cw) {
-      // Targeted to the known child origin (host knows :5174); never '*'.
-      cw.postMessage(msg, IFRAME_ORIGIN);
+    if (!cw || !this.params) return;
+    // Target the child's own origin, derived from the pane url (mock :5174 or a
+    // real server origin). Never '*' — a targeted origin is both safer and lets
+    // the message actually deliver to a listening child (the mock content page).
+    // A real SPA does not listen, so a targeted-but-ignored message is a harmless
+    // no-op (the host must not crash when a pane sends no heartbeat).
+    let origin: string;
+    try {
+      origin = new URL(this.params.url).origin;
+    } catch {
+      return; // malformed url: drop the message rather than broadcast to '*'
     }
+    cw.postMessage(msg, origin);
   }
 
   dispose(): void {

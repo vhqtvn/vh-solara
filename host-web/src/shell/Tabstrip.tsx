@@ -5,9 +5,12 @@ import s from "./Tabstrip.module.css";
 /**
  * Top workspace tabstrip: brand + one tab per open pane + "+". Clicking a tab
  * focuses that pane — a survival-safe "switch tab" (just setActive, no layout
- * disposal). The "+" splits a new mock pane off the focused pane. Layout ops go
- * through the typed HostOps controller surface (store.hostOps), not the DEV-only
- * window.__host test bridge, so this shell works in production builds.
+ * disposal). The "+" splits a new pane off the focused one: in MOCK mode it
+ * cycles the next mock (server, view); in REAL-fleet mode (VITE_SERVERS) it
+ * clones the focused pane's {url,label} (another view of the same server).
+ * Layout ops go through the typed HostOps controller surface (store.hostOps),
+ * not the DEV-only window.__host test bridge, so this shell works in production
+ * builds.
  */
 export function Tabstrip() {
   return (
@@ -28,8 +31,7 @@ export function Tabstrip() {
               data-pane={p.id}
               onClick={() => hostOps()?.focusPane?.(p.id)}
             >
-              <span class={s.tabServer}>{p.server}</span>
-              <span class={s.tabView}>{p.view}</span>
+              <span class={s.tabLabel}>{p.label}</span>
             </button>
           )}
         </For>

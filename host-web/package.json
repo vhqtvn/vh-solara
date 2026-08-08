@@ -9,6 +9,7 @@
   "scripts": {
     "dev": "vite",
     "dev:host": "vite --port 5173 --strictPort",
+    "dev:host:fleet": "vite --port 5177 --strictPort",
     "dev:iframe": "vite --config vite.iframe.config.ts --port 5174 --strictPort",
     "dev:ws": "node tools/ws-echo.mjs",
     "build": "vite build",
@@ -16,7 +17,8 @@
     "preview": "vite preview",
     "test:e2e": "playwright test",
     "test:e2e:headed": "playwright test --headed",
-    "test:e2e:preview": "playwright test --config=playwright.preview.config.ts"
+    "test:e2e:preview": "playwright test --config=playwright.preview.config.ts",
+    "test:e2e:fleet": "playwright test --config=playwright.fleet.config.ts"
   },
   "devDependencies": {
     "@playwright/test": "1.60.0",

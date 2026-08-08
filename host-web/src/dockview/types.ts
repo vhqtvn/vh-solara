@@ -7,17 +7,27 @@
 
 export type ViewKind = "chat" | "terminal" | "diff" | "sessions";
 
-/** Params carried by each Dockview panel; determine the iframe target + header. */
+/**
+ * Params carried by each Dockview panel; determine the iframe target + header.
+ *
+ * `url` is the FULL iframe src, set ONCE at pane creation and NEVER mutated
+ * afterward — changing `src` reloads the iframe and breaks the survival
+ * guarantee. In mock mode it points at the mock content page; in real-fleet
+ * mode (VITE_SERVERS) it points at a real vh-solara server.
+ *
+ * `label` is the single display string for the pane header / tab / tray chip.
+ * It folds the old `server` + `view` pair (mock label: "srv-A · chat") so the
+ * shell view-model stays decoupled from how a pane target is described.
+ */
 export interface PaneParams {
-  server: string; // full server label, e.g. "srv-A.my-root-domain"
-  view: ViewKind;
+  url: string;
+  label: string;
 }
 
 /** Shell view-model for a pane (mirrors the live Dockview panel). */
 export interface PaneVm {
   id: string;
-  server: string;
-  view: ViewKind;
+  label: string;
   title: string;
 }
 

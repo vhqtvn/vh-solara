@@ -39,24 +39,13 @@
   min-width: 0;
   flex: 1 1 auto;
 }
-.pane-server {
+.pane-label {
   font-size: 12px;
   font-weight: 600;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  max-width: 220px;
-}
-.pane-view {
-  font-size: 10px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-  color: var(--fg-dim);
-  background: var(--bg);
-  padding: 1px 6px;
-  border-radius: 8px;
-  white-space: nowrap;
+  max-width: 240px;
 }
 .pane-actions {
   display: flex;

@@ -59,15 +59,13 @@
   border-color: var(--accent);
   color: var(--fg);
 }
-.tabServer {
+.tabLabel {
   font-size: 12px;
   font-weight: 600;
-}
-.tabView {
-  font-size: 10px;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  color: var(--fg-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 200px;
 }
 .tabActive {
   background: var(--accent-soft);

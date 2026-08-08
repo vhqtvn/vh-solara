@@ -40,8 +40,7 @@ export function App() {
                 data-pane={p.id}
                 onClick={() => hostOps()?.restore?.(p.id)}
               >
-                <span class={s.trayChipServer}>{p.server}</span>
-                <span class={s.trayChipView}>{p.view}</span>
+                <span class={s.trayChipLabel}>{p.label}</span>
                 <span class={s.trayChipRestore}>↩</span>
               </button>
             )}

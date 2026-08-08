@@ -4,7 +4,7 @@ import { IframeRenderer } from "./iframeRenderer";
 import { HostController } from "./hostController";
 import type { HostOps } from "./types";
 import { setHostOps } from "./store";
-import { INITIAL_PANES, nextPaneId } from "../state/mockData";
+import { nextPaneId, resolveFleet } from "../state/mockData";
 
 /**
  * SolidJS adapter around the imperative Dockview widget.
@@ -63,27 +63,35 @@ export function DockviewHost() {
   );
 }
 
-/** Seed the initial multi-server, multi-view tiled layout. */
+/**
+ * Seed the initial tiled layout from the resolved fleet. resolveFleet() returns
+ * REAL servers (VITE_SERVERS) when configured, else the mock fleet (DEFAULT).
+ * Each entry becomes one pane carrying its full {url,label}; the url is the
+ * iframe src (set once, never mutated) and the label is the single display
+ * string. Behavior in mock mode is identical to the prior hardcoded seed (same
+ * urls → mock content page → same heartbeats → survival gate stays green).
+ */
 function seedInitialPanes(api: DockviewApi): void {
-  if (INITIAL_PANES.length === 0) return;
+  const fleet = resolveFleet();
+  if (fleet.length === 0) return;
   // First pane is absolute; the rest split relative to it into a 2x2-ish grid.
-  const first = INITIAL_PANES[0];
+  const first = fleet[0];
   api.addPanel({
     id: nextPaneId(),
     component: "iframe",
     renderer: "always",
-    params: { server: first.server, view: first.view },
+    params: { url: first.url, label: first.label },
   });
 
-  for (let i = 1; i < INITIAL_PANES.length; i++) {
-    const p = INITIAL_PANES[i];
+  for (let i = 1; i < fleet.length; i++) {
+    const p = fleet[i];
     const dir = i % 2 === 1 ? "right" : "below";
     const ref = api.panels[0];
     api.addPanel({
       id: nextPaneId(),
       component: "iframe",
       renderer: "always",
-      params: { server: p.server, view: p.view },
+      params: { url: p.url, label: p.label },
       position: { referencePanel: ref, direction: dir },
     });
   }

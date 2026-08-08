@@ -1,7 +1,7 @@
 import type { DockviewApi, IDockviewPanel } from "dockview-core";
 import type { IframeRenderer } from "./iframeRenderer";
-import type { HostOps, PaneVm, SplitDir } from "./types";
-import { nextMockPane, nextPaneId } from "../state/mockData";
+import type { HostOps, SplitDir } from "./types";
+import { isRealFleet, mockUrl, nextMockPane, nextPaneId } from "../state/mockData";
 import {
   baselineFor,
   bindContentWindow,
@@ -47,12 +47,13 @@ export class HostController implements HostOps {
     // NEW group (never 'within' — we want a tiled split, not a tab). This does
     // NOT touch the existing iframe; addPanel only creates the new pane.
     const dir: Direction = direction === "right" ? "right" : "below";
-    const params = this.newPaneParams();
+    const params = this.newPaneParams(panel);
+    if (!params) return null;
     const created = this.api.addPanel({
       id: params.id,
       component: "iframe",
       renderer: "always",
-      params: { server: params.server, view: params.view },
+      params: { url: params.url, label: params.label },
       position: { referencePanel: panel, direction: dir },
     });
     created.api.setActive();
@@ -183,13 +184,12 @@ export class HostController implements HostOps {
   /** Reconcile the shell view-model with the live Dockview panels. */
   private syncPanes(): void {
     for (const panel of this.api.panels) {
-      const params = (panel.params ?? {}) as { server?: string; view?: string };
+      const params = (panel.params ?? {}) as { url?: string; label?: string };
       const existing = panes().find((p) => p.id === panel.id);
       upsertPaneVm({
         id: panel.id,
-        server: params.server ?? existing?.server ?? "server",
-        view: (params.view ?? existing?.view ?? "chat") as PaneVm["view"],
-        title: existing?.title ?? `${params.server ?? ""} · ${params.view ?? ""}`.trim(),
+        label: params.label ?? existing?.label ?? "server",
+        title: existing?.title ?? params.label ?? "",
       });
     }
     this.afterMutation();
@@ -233,9 +233,42 @@ export class HostController implements HostOps {
     return n;
   }
 
-  private newPaneParams(): { id: string; server: string; view: PaneVm["view"] } {
+  /**
+   * Build params for a NEW pane created by "+" / split.
+   *
+   * - REAL-fleet mode (VITE_SERVERS): clone the SOURCE/focused pane's
+   *   {url,label} — splitting opens another view of the same server, not a new
+   *   mock. The url is reused verbatim (a server view, not a different server).
+   * - MOCK mode (default): cycle the next mock (server, view) and build its
+   *   {url,label} (url → mock content page; label "srv-A · chat"-style).
+   *
+   * Mode is decided once from the (static) VITE_SERVERS env via isRealFleet(),
+   * so it stays stable for the whole session.
+   */
+  private newPaneParams(source?: IDockviewPanel): {
+    id: string;
+    url: string;
+    label: string;
+  } | null {
+    if (isRealFleet()) {
+      const sp = (source?.params ?? {}) as { url?: string; label?: string };
+      // GUARD (defensive): if the source pane has no usable url, refuse the
+      // split rather than seed an empty iframe.src — an empty src self-embeds
+      // the host. Statically unreachable today (seeded panes always carry a
+      // url), but keeps the split safe under any future code path.
+      if (!sp.url) return null;
+      return {
+        id: nextPaneId(),
+        url: sp.url,
+        label: sp.label ?? "server",
+      };
+    }
     const m = nextMockPane();
-    return { id: nextPaneId(), server: m.server, view: m.view };
+    return {
+      id: nextPaneId(),
+      url: mockUrl(m.server, m.view),
+      label: `${m.server} · ${m.view}`,
+    };
   }
 
   private installOps(): void {

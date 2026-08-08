@@ -14,6 +14,9 @@ const baseURL = process.env.PLAYWRIGHT_BASE_URL ?? "http://127.0.0.1:5173";
 
 export default defineConfig({
   testDir: path.join(hostRoot, "tests/e2e"),
+  // Spike specs are opt-in — run only via their own playwright.spike.config.ts
+  // (they need an externally-started real server). Keep them out of the default lane.
+  testIgnore: ["**/spike-*.spec.ts"],
   // Serial: the host SPA holds shared live Dockview state; run one engine at a
   // time to keep assertions deterministic.
   fullyParallel: false,
