@@ -10,6 +10,7 @@
     "dev": "vite",
     "dev:host": "vite --port 5173 --strictPort",
     "dev:host:fleet": "vite --port 5177 --strictPort",
+    "dev:host:real-embed": "vite --port 5183 --strictPort",
     "dev:iframe": "vite --config vite.iframe.config.ts --port 5174 --strictPort",
     "dev:ws": "node tools/ws-echo.mjs",
     "build": "vite build",

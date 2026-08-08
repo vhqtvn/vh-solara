@@ -4,6 +4,10 @@ on:
   push:
     branches: ["**"]
   pull_request:
+  schedule:
+    # Nightly at 04:17 UTC (off-peak; non-round-number to spread GitHub Actions load).
+    - cron: "17 4 * * *"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -157,5 +161,71 @@ jobs:
           path: |
             tmp/agent-runs/host-web-playwright
             tmp/agent-runs/host-web-playwright-preview
+          retention-days: 14
+          if-no-files-found: warn
+
+  # host-web REAL-EMBEDDING e2e — LANE 8. The FIRST host-web lane to embed the
+  # REAL production web/ SPA (built + materialized into pkg/web/dist/, served by
+  # a real local-server binary) instead of the mock content page. Boots a real Go
+  # server (:8765, --auth-mode none loopback default, --frame-ancestors) + the
+  # host dev server (:5183, VITE_IFRAME_ORIGIN=:8765) cross-origin. Asserts: the
+  # live production heartbeat emitter (web/src/heartbeat.ts) drives the host's
+  # Q1-C "document alive" indicator, real SPA render, real SSE connect, and
+  # iframe survival across a Dockview split. Heavier than the mock survival gate.
+  #
+  # SCHEDULED/DISPATCHABLE ONLY — NOT in the push/PR matrix. The `if:` guard
+  # restricts this job to schedule/workflow_dispatch; it is additive to the
+  # PR-blocking mock survival gate (host-web-e2e above), which stays untouched.
+  # Adding schedule/workflow_dispatch to the workflow `on:` also gives the
+  # existing jobs a nightly run (additive — their push/PR behavior is unchanged).
+  host-web-real-embed:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            web/package-lock.json
+            host-web/package-lock.json
+      - name: build web/ SPA (into gitignored web/dist-build/)
+        working-directory: web
+        run: npm ci && npm run build
+      - name: materialize SPA into pkg/web/dist (the //go:embed path)
+        run: bash web/scripts/materialize.sh
+      - name: build vh-solara binary (embeds the real SPA)
+        # setup-go puts go on PATH; the export is belt-and-suspenders (matches
+        # the AGENTS convention for local runs where go may not be on PATH).
+        run: |
+          export PATH="$PATH:/usr/local/go/bin"
+          go build -o vh-solara .
+      - name: install host-web deps
+        working-directory: host-web
+        run: npm ci
+      - name: install Playwright browsers
+        working-directory: host-web
+        run: npx playwright install --with-deps chromium firefox
+      - name: real-embed e2e (real SPA embedded cross-origin; no-auth local-server)
+        # The webServer config boots the real :8765 server + host :5183 dev
+        # server and tears them down on exit. CI=true (set by GitHub Actions)
+        # makes Playwright boot fresh servers (reuseExistingServer: false).
+        working-directory: host-web
+        run: npx playwright test --config=playwright.real-embed.config.ts
+      - name: upload Playwright artifacts
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: playwright-host-web-real-embed
+          # Covers the artifact root set in host-web/playwright.real-embed.config.ts
+          # (tmp/agent-runs/host-web-real-embed); overridable via PLAYWRIGHT_ARTIFACTS_DIR.
+          # upload-artifact is a `uses:` step, so paths are repo-root-relative.
+          path: tmp/agent-runs/host-web-real-embed
           retention-days: 14
           if-no-files-found: warn

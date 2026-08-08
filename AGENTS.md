@@ -699,10 +699,10 @@ reasoning body):
 > placement, runners, and seam choices from the repository's own verified testing
 > seam localization rather than generic harness defaults — but is deliberately
 > generic about what that localization IS. This section is this repo's actual
-> localization: the seven lanes, their runners, commands, and acceptance signals.
+> localization: the eight lanes, their runners, commands, and acceptance signals.
 
 Every meaningful change should add or update tests. This repo has three test
-trees (Go, web, and host-web) and four runner families across seven lanes. There
+trees (Go, web, and host-web) and four runner families across eight lanes. There
 is **no `tests/unit/` directory** — Go unit tests are co-located in `pkg/`. There
 is **no pytest** anywhere in this repo.
 
@@ -710,7 +710,7 @@ is **no pytest** anywhere in this repo.
 > `export PATH=$PATH:/usr/local/go/bin` (or use the harness equivalent:
 > `vh-agent-harness exec bash -c 'export PATH=$PATH:/usr/local/go/bin && go ...'`).
 
-### The seven lanes
+### The eight lanes
 
 1. **Go co-located unit** — `pkg/*/*_test.go` beside the source under test.
    Runner: `go test ./pkg/<pkg>/` (whole tree: `go test ./pkg/...`).
@@ -759,6 +759,28 @@ is **no pytest** anywhere in this repo.
    Runner (survival + shell; Chromium + Firefox + WebKit): `npm --prefix host-web run test:e2e`.
    Runner (production-build proof; Chromium + Firefox): `npm --prefix host-web run test:e2e:preview`.
 
+8. **host-web real-embedding e2e** — `host-web/tests/real-embed-e2e/real-embed.spec.ts`
+   (Playwright). The FIRST host-web lane to embed the REAL production `web/` SPA
+   (built + materialized into `pkg/web/dist/`, served by a real `local-server`
+   binary via `//go:embed`) instead of the mock content page
+   (`host-web/iframe-content/content.ts`). Boots a real Go server (`:8765`,
+   `--auth-mode none` loopback default, `--frame-ancestors`) + the host dev server
+   (`:5183`, `VITE_IFRAME_ORIGIN=:8765`) cross-origin, then asserts: gate
+   continuity (iframe loads the SPA, not `/auth/login`), real SPA render, real SSE
+   connect, the **live production heartbeat emitter** (`web/src/heartbeat.ts`)
+   drives the host's Q1-C "document alive" indicator (the crux), and the real-SPA
+   iframe survives a Dockview split (`renderer:'always'`). The auth posture is
+   `--auth-mode none` (cheapest: zero auth code, no session cookie) — the two
+   cruxes this lane closes (heartbeat + survival) are cookie-INDEPENDENT; the
+   SameSite=Lax cookie crux was proven by the Phase-0′ spike in passphrase mode
+   and is not re-exercised here. Runs **serially** (`workers: 1`). Chromium +
+   Firefox (WebKit opt-in). **Scheduled/dispatchable ONLY** (nightly cron +
+   `workflow_dispatch`); NOT in the push/PR matrix — additive to the PR-blocking
+   mock survival gate, not PR-blocking until measured stable.
+   Runner: `make test-host-web-real-embed` (full pipeline), or
+   `cd host-web && npx playwright test --config=playwright.real-embed.config.ts`
+   (after the binary is built; or `bash host-web/scripts/real-embed-run.sh`).
+
 Execution examples:
 
 ```bash
@@ -779,6 +801,8 @@ vh-agent-harness exec bash -c 'export PATH=$PATH:/usr/local/go/bin && npm --pref
 vh-agent-harness exec npm --prefix host-web run test:e2e
 # host-web production-build shell proof (vite preview):
 vh-agent-harness exec npm --prefix host-web run test:e2e:preview
+# host-web real-embedding e2e (LANE 8: real web/ SPA + real local-server; NOT PR-blocking; full pipeline builds web→materializes→builds go→runs Playwright):
+vh-agent-harness exec bash host-web/scripts/real-embed-run.sh
 ```
 
 For any substantial boundary change, also update the relevant docs.

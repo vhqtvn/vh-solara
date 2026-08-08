@@ -3,7 +3,7 @@
 # gitignored staging dir (web/dist-build); embed-producing targets materialize
 # (copy) the staged bundle into pkg/web/dist right before `go build`.
 
-.PHONY: web web-materialize build build-debug install install-local test test-unit test-web test-host-web test-host-web-preview verify fmt fmt-check vet typecheck e2e e2e-keep docker fixtures bench clean-web-embed
+.PHONY: web web-materialize build build-debug install install-local test test-unit test-web test-host-web test-host-web-preview test-host-web-real-embed verify fmt fmt-check vet typecheck e2e e2e-keep docker fixtures bench clean-web-embed
 
 web: ## Build the SolidJS UI into the staging dir web/dist-build (gitignored, NOT pkg/web/dist)
 	cd web && npm ci && npm run build
@@ -61,6 +61,9 @@ test-host-web: ## Run host-web Playwright e2e (iframe survival + shell, self-boo
 
 test-host-web-preview: ## Run host-web production-build shell proof (vite preview; needs Node >= 24)
 	cd host-web && npm run test:e2e:preview
+
+test-host-web-real-embed: ## Run host-web real-embedding e2e (real web/ SPA + real local-server, cross-origin host embed; LANE 8, nightly-grade, NOT PR-blocking). Full pipeline: builds web SPA, materializes into pkg/web/dist, builds the Go binary, runs Playwright. Needs go + Node >= 24 + Playwright browsers.
+	bash host-web/scripts/real-embed-run.sh
 
 fmt: ## Format all Go source (mirrors CI's gofmt scope)
 	gofmt -w pkg cmd main.go
