@@ -137,9 +137,17 @@ export class HostController implements HostOps {
     if (ref) {
       panel.api.moveTo({ group: ref, position: "right" });
     } else {
-      // No grid reference (shouldn't happen given the collapse guard): dock
-      // to center as a fallback.
-      panel.api.moveTo({ group: ref as never, position: "center" });
+      // No grid group to anchor against. Reachable: closePane (unlike collapse)
+      // has no count guard, so closing every grid pane while one is parked in
+      // the tray leaves a floating pane with an empty grid. Create a fresh grid
+      // group and dock the panel into it. Survival-safe: moveTo repositions the
+      // always-mounted renderer; the now-empty floating group is auto-removed.
+      // NOTE: the prior `moveTo({ group: undefined })` silently no-opped —
+      // panel.api.moveTo resolves a missing group to the panel's OWN (floating)
+      // group, so the pane never left the tray (proven: a restore-into-empty-grid
+      // e2e saw gridPaneCount stuck at 0 against the old code; green with this).
+      const fresh = this.api.addGroup();
+      panel.api.moveTo({ group: fresh, position: "center" });
     }
     panel.api.setActive();
     this.afterMutation();
@@ -333,6 +341,26 @@ export class HostController implements HostOps {
       },
       collapse: (id: string) => this.collapse(id),
       restore: (id: string) => this.restore(id),
+
+      // Test ARRANGEMENT (not a shell op): dock panel `a` into panel `b`'s
+      // group as a tab (position:'center'). No real shell op creates a tabbed
+      // group — split() always opens a new group — so the same-group branch of
+      // swap() is otherwise unreachable deterministically (only native tab DnD
+      // gets there). Uses the SAME survival-safe primitive (panel.api.moveTo)
+      // the real swap()'s first step uses, so it never disposes a renderer.
+      dockAsTab: (a: string, b: string): void => {
+        const pa = this.api.getPanel(a);
+        const pb = this.api.getPanel(b);
+        if (!pa || !pb || a === b) return;
+        pa.api.moveTo({ group: pb.group, position: "center" });
+        this.afterMutation();
+      },
+      // Read-only: are two panels currently in the SAME Dockview group?
+      sameGroup: (a: string, b: string): boolean => {
+        const pa = this.api.getPanel(a);
+        const pb = this.api.getPanel(b);
+        return !!pa && !!pb && pa.group === pb.group;
+      },
 
       getIframe: (id: string): HTMLIFrameElement | null =>
         this.renderers.get(id)?.getIframe() ?? null,

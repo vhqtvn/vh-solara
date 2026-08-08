@@ -134,6 +134,22 @@ export async function restore(page: Page, id: string): Promise<void> {
     h?.restore(id);
   }, id);
 }
+// DEV-only test arrangement: dock `a` into `b`'s group as a tab. No shell op
+// creates a tabbed group, so this is the only deterministic way to reach
+// swap()'s same-group branch in e2e. Uses the survival-safe moveTo primitive.
+export async function dockAsTab(page: Page, a: string, b: string): Promise<void> {
+  await page.evaluate(({ a, b }) => {
+    const h = (window as unknown as { __host?: { dockAsTab(x: string, y: string): void } }).__host;
+    h?.dockAsTab(a, b);
+  }, { a, b });
+}
+// Read-only: are `a` and `b` currently in the same Dockview group?
+export async function sameGroup(page: Page, a: string, b: string): Promise<boolean> {
+  return page.evaluate(({ a, b }) => {
+    const h = (window as unknown as { __host?: { sameGroup(x: string, y: string): boolean } }).__host;
+    return h ? h.sameGroup(a, b) : false;
+  }, { a, b });
+}
 export async function naiveReload(page: Page, id: string): Promise<void> {
   await page.evaluate((id) => {
     const h = (window as unknown as { __host?: { naiveReload(i: string): void } }).__host;
