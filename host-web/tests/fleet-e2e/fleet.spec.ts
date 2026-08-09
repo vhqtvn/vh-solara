@@ -1,4 +1,5 @@
 import { test, expect } from "@playwright/test";
+import { paneParams } from "../e2e/util";
 import { FLEET_POISONED, FLEET_SERVERS } from "./fleet-data";
 
 // =============================================================================
@@ -10,8 +11,19 @@ import { FLEET_POISONED, FLEET_SERVERS } from "./fleet-data";
 // proves resolveFleet() seeds the CONFIGURED {url,label} pairs — NOT the mock
 // fleet — WITHOUT needing a live real vh-solara server.
 //
+// WORKSPACE MODEL (post workspace-tabs refactor, commit 41a28fa): the host
+// shell's top Tabstrip carries ONE TAB PER WORKSPACE, not one tab per server
+// pane. A configured fleet seeds into the SINGLE default workspace
+// (initWorkspaces() → "Workspace 1"), so a fleet of N servers shows as ONE
+// workspace tab + N panes (Dockview panels whose iframes live in the always-
+// rendered overlay). Per-pane identity lives in those panes — verified here via
+// the DEV-only window.__host bridge (paneParams → {id,url,label}) and the pane
+// iframes (.pane-iframe srcs), NOT via the top Tabstrip. The fleet dev server
+// runs the Vite dev build, so window.__host is present.
+//
 // What this gate proves (the slice's crux):
-//   - panes are seeded from VITE_SERVERS (count + labels match the config),
+//   - the top Tabstrip shows the WORKSPACE tab(s), not per-server tabs,
+//   - panes are seeded from VITE_SERVERS (count + url + label match the config),
 //   - each pane's iframe src is the configured url (not the mock fleet's),
 //   - no mock-fleet label ("srv-A · …") leaks into a real-fleet session,
 //   - a `javascript:` (non-http/https) VITE_SERVERS entry is REJECTED and never
@@ -21,7 +33,7 @@ import { FLEET_POISONED, FLEET_SERVERS } from "./fleet-data";
 // =============================================================================
 
 test.describe("config-driven fleet seeding (VITE_SERVERS)", () => {
-  test("seeds panes from VITE_SERVERS, not the mock fleet", async ({ page }) => {
+  test("seeds panes from VITE_SERVERS into the workspace, not the mock fleet", async ({ page }) => {
     await page.goto("/");
     // Heartbeats flowing through the store router → focused-pane liveness
     // "document alive" (Q1-C) proves the configured urls (which point at the
@@ -32,22 +44,42 @@ test.describe("config-driven fleet seeding (VITE_SERVERS)", () => {
       { timeout: 30_000 },
     );
 
-    // Exactly the configured number of panes, not the mock fleet's 4.
-    const tabs = page.locator('[data-testid="ws-tab"]');
+    // ---- TOP TABSTRIP: one workspace tab, NOT per-server tabs. ----
+    // The fleet seeds into the SINGLE default workspace; the top strip carries
+    // workspace names, so a fleet of N servers still shows ONE workspace tab.
+    const wsTabs = page.locator('[data-testid="ws-tab"]');
     await expect
-      .poll(async () => await tabs.count(), { timeout: 20_000 })
-      .toBe(FLEET_SERVERS.length);
-
-    // Labels are the configured ones, NOT the mock "srv-A · …" labels.
-    const texts = await tabs.allInnerTexts();
+      .poll(async () => await wsTabs.count(), { timeout: 20_000 })
+      .toBe(1);
+    // No workspace tab carries a per-server label (the strip is workspace-
+    // scoped, not pane-scoped).
+    const wsTexts = await wsTabs.allInnerTexts();
     for (const f of FLEET_SERVERS) {
       expect(
-        texts.some((t) => t.includes(f.label)),
-        `tab label includes configured "${f.label}"`,
+        wsTexts.join("\n"),
+        `no workspace tab carries the per-server label "${f.label}"`,
+      ).not.toContain(f.label);
+    }
+
+    // ---- PANES: seeded from VITE_SERVERS, count + url + label config-driven. ----
+    // Per-pane identity lives in Dockview's panes (verified via the DEV bridge),
+    // not the top Tabstrip. Exactly the configured number of panes, not the mock
+    // fleet's 4.
+    await expect
+      .poll(async () => (await paneParams(page)).length, { timeout: 20_000 })
+      .toBe(FLEET_SERVERS.length);
+
+    // Each configured {url,label} is carried by exactly one seeded pane.
+    const params = await paneParams(page);
+    for (const f of FLEET_SERVERS) {
+      expect(
+        params.some((p) => p.url === f.url && p.label === f.label),
+        `a seeded pane carries configured {url,label} for "${f.label}"`,
       ).toBe(true);
     }
+    // No mock-fleet label leaks into a real-fleet session.
     expect(
-      texts.join("\n"),
+      params.map((p) => p.label).join("\n"),
       "no mock-fleet label leaked into a real-fleet session",
     ).not.toContain("srv-A");
 
@@ -66,7 +98,7 @@ test.describe("config-driven fleet seeding (VITE_SERVERS)", () => {
       ).toContain(f.url);
     }
 
-    // Statusbar focus reflects the first configured label (tab0 is focused).
+    // Statusbar focus reflects the first configured label (pane0 is focused).
     await expect(page.locator('[data-testid="statusbar"]')).toContainText(
       FLEET_SERVERS[0].label,
     );
@@ -85,18 +117,18 @@ test.describe("config-driven fleet seeding (VITE_SERVERS)", () => {
       { timeout: 30_000 },
     );
 
-    // The poisoned entry must NOT seed a pane: the count is the VALID entries
-    // only (isFleetEntry filtered out the javascript: value at seed time).
-    const tabs = page.locator('[data-testid="ws-tab"]');
+    // The poisoned entry must NOT seed a pane: the pane count is the VALID
+    // entries only (isFleetEntry filtered out the javascript: value at seed
+    // time). Verified via the DEV bridge (paneParams) and the iframe DOM.
     await expect
-      .poll(async () => await tabs.count(), { timeout: 20_000 })
+      .poll(async () => (await paneParams(page)).length, { timeout: 20_000 })
       .toBe(FLEET_SERVERS.length);
 
-    // The poisoned label never appears in any tab.
-    const texts = await tabs.allInnerTexts();
+    const params = await paneParams(page);
+    // The poisoned label never appears in any pane.
     expect(
-      texts.join("\n"),
-      "the poisoned label never appears in any tab",
+      params.map((p) => p.label).join("\n"),
+      "the poisoned label never appears in any pane",
     ).not.toContain(FLEET_POISONED.label);
 
     // No pane iframe src is a javascript: value, and the poisoned url never
