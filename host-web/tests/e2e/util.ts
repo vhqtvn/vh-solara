@@ -68,12 +68,14 @@ export async function closeWorkspace(page: Page, id: string): Promise<boolean> {
   }, id);
 }
 
-// Read-only {url,label} snapshot per panel — used by the layout-persistence e2e
-// to assert a restored layout round-trips with the correct urls/labels.
+// Read-only {url,label,route} snapshot per panel — used by the layout-persistence
+// e2e to assert a restored layout round-trips with the correct urls/labels, and
+// by the route-survival e2e to assert a captured route persists across reload.
 export interface PaneParam {
   id: string;
   url: string;
   label: string;
+  route?: string;
 }
 export async function paneParams(page: Page): Promise<PaneParam[]> {
   return page.evaluate(() => {
@@ -191,6 +193,73 @@ export async function protocolDispose(page: Page, id: string): Promise<void> {
     h?.protocolDispose(id);
   }, id);
 }
+
+// ---- route-emission probe (route-message capture) --------------------------
+// Synthesize a pane→host message through the REAL routeMessage router with a
+// real pane's contentWindow as source. Used to drive a route change into a pane
+// exactly as the real SPA's heartbeat-loop emission would (the route variant
+// {type:"route",route} is source-bound like title, so any origin passes).
+
+/** Route a synthetic message through the real router using a real pane's
+ *  contentWindow as the source. Returns the router verdict. */
+export async function probePaneMessage(
+  page: Page,
+  args: { sourcePaneId: string; origin: string; payload: unknown },
+): Promise<RouteResult> {
+  return page.evaluate(({ sourcePaneId, origin, payload }) => {
+    const h = (window as unknown as { __host?: { probeHeartbeat(a: { sourcePaneId: string | null; origin: string; payload: unknown }): RouteResult } }).__host;
+    return h
+      ? h.probeHeartbeat({ sourcePaneId, origin, payload })
+      : { routed: false, paneId: null, accepted: false, reason: "ignored-non-pane-to-host" as RouteReason };
+  }, args);
+}
+
+// ---- URL hash state (per-tab URL source-of-truth) --------------------------
+
+/** The raw location.hash string ("" when none). */
+export async function rawHash(page: Page): Promise<string> {
+  return page.evaluate(() => window.location.hash);
+}
+
+/** Decode the `#state=<encoded>` URL hash into the PersistedState JSON object,
+ *  or null when there is no hash / it is malformed. */
+export async function readHashState(page: Page): Promise<unknown> {
+  return page.evaluate(() => {
+    const hash = window.location.hash;
+    if (!hash || !hash.startsWith("#state=")) return null;
+    try {
+      return JSON.parse(decodeURIComponent(hash.slice("#state=".length)));
+    } catch {
+      return null;
+    }
+  });
+}
+
+/** Wait until location.hash starts with `#state=` (the debounced save has
+ *  written it). Throws after timeoutMs. */
+export async function waitForHashState(page: Page, timeoutMs = 8000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const has = await page.evaluate(() => window.location.hash.startsWith("#state="));
+    if (has) return;
+    await page.waitForTimeout(80);
+  }
+  throw new Error(`location.hash never acquired a #state= within ${timeoutMs}ms`);
+}
+
+/** Wait until the decoded #state= hash contains `substring` (the debounced save
+ *  has flushed the NEW content). Use this (not waitForHashState) when the hash
+ *  already exists from a prior save and you need to wait for an UPDATE. */
+export async function waitForHashContent(page: Page, substring: string, timeoutMs = 8000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const json = await readHashState(page);
+    if (json !== null && JSON.stringify(json).includes(substring)) return;
+    await page.waitForTimeout(80);
+  }
+  throw new Error(`location.hash never contained "${substring}" within ${timeoutMs}ms`);
+}
+
 export async function focused(page: Page): Promise<string | null> {
   const r = await page.evaluate(() => {
     const h = (window as unknown as { __host?: { focused(): string | null } }).__host;

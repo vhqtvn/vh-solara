@@ -144,12 +144,29 @@ export class IframeRenderer implements IContentRenderer {
   private buildIframe(): void {
     const p = this.params!;
     // EXACTLY ONE iframe, created once. Its src is set at creation (from
-    // params.url) and never changed (changing src reloads). Geometry/visibility
-    // is owned by Dockview. params.url is the FULL iframe src — mock content page
-    // url in mock mode, a real server origin in real-fleet mode (VITE_SERVERS).
+    // params.url, with any stored route query appended) and never changed
+    // (changing src reloads). Geometry/visibility is owned by Dockview.
+    // params.url is the FULL iframe src — mock content page url in mock mode,
+    // a real server origin in real-fleet mode (VITE_SERVERS). A stored route
+    // (a ?dir=...&session=... query captured from the SPA's route emission) is
+    // appended so the SPA deep-links itself on cold restore (reload). src is
+    // set ONCE here; runtime route changes update params WITHOUT touching src.
     const iframe = document.createElement("iframe");
     iframe.className = "pane-iframe";
-    iframe.src = p.url;
+    let src = p.url;
+    if (p.route) {
+      try {
+        const u = new URL(p.url);
+        // p.route is a query string (e.g. "?dir=/x&session=1" or "dir=/x").
+        // Setting .search replaces any existing query; leading '?' is optional.
+        u.search = p.route.startsWith("?") ? p.route.slice(1) : p.route;
+        src = u.href;
+      } catch {
+        // Malformed url/route — fall back to the bare params.url (survival-safe).
+        src = p.url;
+      }
+    }
+    iframe.src = src;
     iframe.title = p.label;
     // No sandbox: the child keeps its real cross-origin (mock :5174 vs host
     // :5173 by port; real servers are cross-origin by domain) so it can run its

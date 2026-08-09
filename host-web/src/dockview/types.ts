@@ -22,6 +22,14 @@ export type ViewKind = "chat" | "terminal" | "diff" | "sessions";
 export interface PaneParams {
   url: string;
   label: string;
+  /**
+   * The SPA route (a `?dir=...&session=...` query string) captured from the
+   * embedded SPA's route emission, restored into the iframe src at CREATION
+   * only so the SPA deep-links itself on reload. Non-authoritative: src is set
+   * once from `url` (+ appended route) and never mutated afterward; runtime
+   * route changes update this param via updateParameters WITHOUT touching src.
+   */
+  route?: string;
 }
 
 /** Shell view-model for a pane (mirrors the live Dockview panel). */
@@ -73,7 +81,7 @@ export type PaneToHost =
       src?: string;
     }
   | { type: "title"; title: string }
-  | { type: "route" };
+  | { type: "route"; route?: string };
 
 // Host → pane. `focus`/`blur` are the pre-existing host-focus routing. The
 // `vh-host-handshake` is the document-liveness challenge (see
@@ -132,6 +140,15 @@ export interface HostOps {
    *  that server's grid panes would empty the visible grid (refused so the grid
    *  never goes blank; survival-safe: no layout mutation when refused). */
   removeServer?(url: string): boolean;
+  /**
+   * Capture a route change reported by an embedded pane's SPA so it persists
+   * across reload. Updates the panel params via `api.updateParameters` WITHOUT
+   * reloading the iframe (the iframeRenderer has no `update()` → survival-safe),
+   * then schedules a debounced save of the full state. The route is restored
+   * into the iframe src at the NEXT cold creation (reload) so the SPA deep-links
+   * itself; runtime route changes never touch src.
+   */
+  updateRoute?(paneId: string, route: string): void;
 }
 
 /** State pushed to a pane's header so it can reflect tray/zoom affordances. */

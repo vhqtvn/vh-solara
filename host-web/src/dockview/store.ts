@@ -608,7 +608,16 @@ export function routeMessage(
       return { routed: true, paneId, accepted: true, reason: "accepted:non-heartbeat" };
     }
     case "route": {
-      // route changes are accepted but not surfaced beyond the title for Phase 1
+      // Capture the SPA's route change so it persists per-pane and restores on
+      // reload. Source-bound (like title — display-only, no liveness semantics).
+      // updateRoute updates panel params WITHOUT reloading the iframe (the
+      // renderer has no update() → survival-safe); scheduleSave writes the URL
+      // hash + localStorage mirror. The route is restored into the iframe src
+      // at the NEXT cold creation (reload) so the SPA deep-links itself.
+      if (typeof d.route === "string") {
+        hostOps()?.updateRoute?.(paneId, d.route);
+        scheduleSave();
+      }
       return { routed: true, paneId, accepted: true, reason: "accepted:non-heartbeat" };
     }
     default:

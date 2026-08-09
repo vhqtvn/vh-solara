@@ -131,21 +131,49 @@ function flushSave(): void {
   } catch {
     return; // serialize failure — never throw
   }
-  if (!state || state.workspaces.length === 0) {
-    // No workspaces (should not happen — there is always ≥1). Clear so a reload
-    // re-seeds rather than restoring a degenerate empty blob.
-    try {
-      localStorage.removeItem(LAYOUT_STORAGE_KEY);
-    } catch {
-      // localStorage unavailable — nothing to clear.
-    }
-    return;
-  }
+  // Fork 1: a single JSON string feeds BOTH mirrors (URL hash + localStorage)
+  // so they can never drift. An empty/absent state clears both.
+  const json =
+    state && state.workspaces.length > 0 ? JSON.stringify(state) : null;
+
+  // localStorage mirror — keeps the bare-`/` reopen working (inherits last
+  // state when there is no hash).
   try {
-    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(state));
+    if (json === null) {
+      localStorage.removeItem(LAYOUT_STORAGE_KEY);
+    } else {
+      localStorage.setItem(LAYOUT_STORAGE_KEY, json);
+    }
   } catch {
-    // localStorage unavailable / quota exceeded / private mode, OR a JSON
-    // serialize failure (a non-cloneable value inside api.toJSON) — swallow.
+    // localStorage unavailable / quota exceeded / private mode — swallow.
+  }
+
+  // URL hash mirror — the per-tab source of truth. history.replaceState does
+  // NOT fire hashchange → no re-render / fromJSON (survival-safe: the only
+  // fromJSON is the cold restore on page load, which reads the hash via
+  // readBlob at module init, never on a runtime save).
+  writeHashState(json);
+}
+
+/**
+ * Write the full PersistedState JSON into the URL hash as `#state=<encoded>`,
+ * or clear the hash when there is no state. Uses history.replaceState so NO
+ * hashchange event fires — this is the survival guarantee: a runtime save
+ * updates the URL + localStorage mirror without re-reading the state or
+ * touching any iframe. Never throws.
+ */
+function writeHashState(json: string | null): void {
+  if (typeof window === "undefined" || typeof window.history === "undefined") return;
+  try {
+    const path = window.location.pathname + window.location.search;
+    const hash = json === null ? "" : `#state=${encodeURIComponent(json)}`;
+    // replaceState with the SAME path + the new/cleared hash. No hashchange
+    // fires → no fromJSON → survival-safe.
+    window.history.replaceState(null, "", path + hash);
+  } catch {
+    // replaceState can throw on cross-origin or extremely long URLs — swallow
+    // (the localStorage mirror is the fallback). Note: if URL-length becomes a
+    // real problem for realistic layouts, report it (STOP condition (c)).
   }
 }
 
@@ -329,10 +357,44 @@ function maxPaneSeqSuffix(ids: Iterable<string>): number {
 // BLOB READ + structural validation of the v2 envelope.
 // =============================================================================
 
-/** Read + parse + structurally validate the v2 blob. Returns null when absent /
- *  corrupt JSON / wrong envelope shape. Never throws. Called ONCE at module
- *  init. */
+/** Read + parse + structurally validate the persisted state. Called ONCE at
+ *  module init. Never throws.
+ *
+ *  Fork 1 — HYBRID URL state: the URL hash is the source of truth for PER-TAB
+ *  state (two same-origin tabs stay independent — each carries its own
+ *  `#state=` hash). localStorage is the write-through mirror so a bare `/`
+ *  reopen inherits the last-saved state. Read the hash FIRST; if absent or
+ *  invalid, fall back to localStorage. This per-tab independence is the whole
+ *  point of the hash: localStorage is shared across tabs, so two tabs at `/`
+ *  would otherwise clobber each other. */
 function readBlob(): PersistedState | null {
+  const fromHash = readHashState();
+  if (fromHash !== null) return fromHash;
+  return readLocalStorageState();
+}
+
+/**
+ * Read + decode + validate the `#state=<encoded>` URL hash. Returns null when
+ * there is no hash, the hash is malformed, or the decoded JSON is structurally
+ * invalid. Never throws — a corrupt hash falls through to the localStorage
+ * fallback (the caller) rather than poisoning the restore.
+ */
+function readHashState(): PersistedState | null {
+  if (typeof window === "undefined" || typeof window.location === "undefined") return null;
+  const hash = window.location.hash;
+  if (!hash || !hash.startsWith("#state=")) return null;
+  const encoded = hash.slice("#state=".length);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(decodeURIComponent(encoded));
+  } catch {
+    return null; // corrupt hash → fall back to localStorage
+  }
+  return validatePersistedState(parsed);
+}
+
+/** The pre-Fork-1 localStorage-only read path. Kept as the hash-miss fallback. */
+function readLocalStorageState(): PersistedState | null {
   let raw: string | null;
   try {
     raw = localStorage.getItem(LAYOUT_STORAGE_KEY);

@@ -15,6 +15,27 @@
 const HEARTBEAT_MS = 250; // ≈4 Hz, matching the mock stand-in (docs §6).
 
 /**
+ * Reconstruct the SPA's route query carrying ONLY the known deep-link params
+ * (dir, session). Every other query param in window.location.search is dropped
+ * so the cross-origin route payload stays within the declared non-sensitive
+ * boundary — the SPA's routing vocabulary is exactly {dir, session}
+ * (sync/url.ts writes nothing else). Returns a canonical
+ * "?dir=...&session=..." (only params actually present, in dir-then-session
+ * order), or "" when the SPA has no deep-link to forward. If the SPA's routing
+ * vocabulary grows, extend this allowlist.
+ */
+function allowlistRoute(): string {
+  const incoming = new URLSearchParams(window.location.search);
+  const out = new URLSearchParams();
+  const dir = incoming.get("dir");
+  if (dir !== null) out.set("dir", dir);
+  const session = incoming.get("session");
+  if (session !== null) out.set("session", session);
+  const qs = out.toString();
+  return qs === "" ? "" : `?${qs}`;
+}
+
+/**
  * Install the embed-gated heartbeat emitter. Captures identity ONCE per document
  * load (mountTs + nonce) and posts periodic heartbeats to the captured host
  * origin. Returns the interval id (the emitter lives for the document lifetime;
@@ -44,6 +65,13 @@ export function startHeartbeat(): number | undefined {
   let nonce: string | null = null;
   // Q2-A: host origin captured from the inbound handshake MessageEvent.origin.
   let hostOrigin: string | null = null;
+
+  // Route emission: track the SPA's current URL query (a non-sensitive
+  // ?dir=...&session=... deep-link) and post it to the host on change so the
+  // host can persist it per-pane and restore it on reload. Mirrors the
+  // heartbeat exactly: embed-gated, captured origin, never '*'. The route is
+  // the same threat class as mountTs/nonce (non-sensitive display state).
+  let lastRoute: string | null = null;
 
   const onMessage = (ev: MessageEvent): void => {
     const data = ev.data as { type?: string; nonce?: string } | null;
@@ -83,6 +111,25 @@ export function startHeartbeat(): number | undefined {
       window.parent.postMessage(msg, hostOrigin);
     } catch {
       /* parent window gone — ignore */
+    }
+
+    // Route emission: post a route message when the SPA's URL query changes.
+    // Same origin target + embed gate + source-guard as the heartbeat above.
+    // ALLOWLIST (CF1): only the SPA's known deep-link params (dir, session) are
+    // forwarded; all other query params are dropped to keep the cross-origin
+    // payload within the declared non-sensitive boundary. The SPA's routing
+    // vocabulary is exactly {dir, session} (sync/url.ts); if it grows, extend
+    // allowlistRoute(). The reconstructed query is a canonical
+    // "?dir=...&session=..." (only params actually present) — "" when the SPA
+    // has no deep-link to forward.
+    const route = allowlistRoute();
+    if (route !== lastRoute) {
+      lastRoute = route;
+      try {
+        window.parent.postMessage({ type: "route", route }, hostOrigin);
+      } catch {
+        /* parent window gone — ignore */
+      }
     }
   }, HEARTBEAT_MS);
 }

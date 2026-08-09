@@ -282,6 +282,19 @@ export class HostController implements HostOps {
     return true;
   }
 
+  /**
+   * Capture a route change reported by an embedded pane's SPA. Updates the
+   * panel params via `api.updateParameters` WITHOUT reloading the iframe (the
+   * renderer has no `update()` → survival-safe). The route is restored into
+   * the iframe src at the NEXT cold creation (reload) so the SPA deep-links
+   * itself; runtime route changes never touch src.
+   */
+  updateRoute(paneId: string, route: string): void {
+    const panel = this.api.getPanel(paneId);
+    if (!panel) return;
+    panel.api.updateParameters({ ...(panel.params ?? {}), route });
+  }
+
   // ---- event wiring → store (display projection of THIS workspace) ---------
 
   private wireEvents(): void {
@@ -426,6 +439,7 @@ export class HostController implements HostOps {
     this.ops.restore = (id) => this.restore(id);
     this.ops.addServer = (url, label) => this.addServer(url, label);
     this.ops.removeServer = (url) => this.removeServer(url);
+    this.ops.updateRoute = (paneId, route) => this.updateRoute(paneId, route);
   }
 
   /** Dispose this controller: unregister from the store + the controller map so
@@ -482,13 +496,14 @@ export class HostController implements HostOps {
 
       // ---- active-workspace-scoped reads/ops ----
       panes: (): string[] => activeController()?.api.panels.map((p) => p.id) ?? [],
-      paneParams: (): Array<{ id: string; url: string; label: string }> =>
+      paneParams: (): Array<{ id: string; url: string; label: string; route?: string }> =>
         activeController()?.api.panels.map((p) => {
-          const params = (p.params ?? {}) as { url?: string; label?: string };
+          const params = (p.params ?? {}) as { url?: string; label?: string; route?: string };
           return {
             id: p.id,
             url: params.url ?? "",
             label: params.label ?? "",
+            route: params.route,
           };
         }) ?? [],
       // Read-only full-layout serialization of the ACTIVE workspace's api.
