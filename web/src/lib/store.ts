@@ -54,6 +54,19 @@ export function saveVersioned<T>(key: string, version: number, data: T): void {
 // that was hand-written for every preference. The setter takes a value (prefs
 // don't use the updater form). Wrap it when a setter also has a side effect
 // (e.g. apply the value to the DOM).
+//
+// Cross-document sync: when more than one document on this origin holds the same
+// pref (each host pane is a separate iframe document; each browser tab is a
+// separate document), the writer's saveVersioned persists to the shared
+// localStorage, and the browser fires a `storage` event in the OTHER documents
+// (never in the writer). Without re-reading on that event, each document's
+// in-memory signal diverges until a reload — the host-shell "settings in a
+// window wont be sent to others, need to reload page" bug. The listener below
+// re-runs the same loadVersioned parse path (so migration + fallback semantics
+// are identical) and updates the signal via the RAW setter (NOT setSaved), so
+// reacting to a write never echoes a second write (the storage event doesn't
+// fire in the writer anyway, but using the raw setter keeps the stored bytes
+// exactly what the other document wrote and avoids redundant work).
 export function persistedSignal<T>(
   key: string,
   version: number,
@@ -65,6 +78,15 @@ export function persistedSignal<T>(
     set(() => value);
     saveVersioned(key, version, value);
   };
+  if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
+    window.addEventListener("storage", (e: StorageEvent) => {
+      if (e.key !== key) return;
+      // Re-read through the shared parse/migrate path. localStorage is shared
+      // same-origin, so by the time the event fires here our storage already
+      // reflects the other document's write; loadVersioned reads it back out.
+      set(() => loadVersioned(key, version, fallback, migrate));
+    });
+  }
   return [get, setSaved];
 }
 
