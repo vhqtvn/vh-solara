@@ -41,6 +41,7 @@ import {
   getSessionLastSeen,
   getSessionContentSeen,
 } from "./session-stream";
+import { captureDiagEntry } from "./diaglog";
 
 // Content-stall threshold (product policy). Transport staleness (STALE_MS)
 // catches a stream whose pings STOP. CONTENT_STALE_MS catches a stream whose
@@ -135,6 +136,17 @@ export function watchdogTick() {
         contentSilentMs: getTreeContentSeen() ? Date.now() - getTreeContentSeen() : 0,
         reason: contentStale && !transportStale ? "content-stall" : "transport-stall",
       });
+      // StallEntry: capture the watchdog's pre-recovery state. Today this path
+      // had NO diag — the operator could only observe the symptom (stuck
+      // running node) with no record of the watchdog firing.
+      captureDiagEntry({
+        kind: "stall",
+        ts: Date.now(),
+        trigger: "content-stale-watchdog",
+        stream: "tree",
+        treeLastSeenAge: getTreeLastSeen() ? Date.now() - getTreeLastSeen() : undefined,
+        treeContentSeenAge: getTreeContentSeen() ? Date.now() - getTreeContentSeen() : undefined,
+      });
       setState("status", "reconnecting");
       connect();
     }
@@ -180,6 +192,16 @@ export function watchdogTick() {
           silentMs: getSessionLastSeen() ? Date.now() - getSessionLastSeen() : 0,
           contentSilentMs: getSessionContentSeen() ? Date.now() - getSessionContentSeen() : 0,
           reason: contentStale && !transportStale ? "content-stall" : "transport-stall",
+        });
+        // StallEntry: capture the watchdog's pre-recovery state.
+        captureDiagEntry({
+          kind: "stall",
+          ts: Date.now(),
+          trigger: "content-stale-watchdog",
+          stream: "session",
+          sessionId: sesId,
+          sessionLastSeenAge: getSessionLastSeen() ? Date.now() - getSessionLastSeen() : undefined,
+          sessionContentSeenAge: getSessionContentSeen() ? Date.now() - getSessionContentSeen() : undefined,
         });
         openSessionStream(sesId, true);
       }

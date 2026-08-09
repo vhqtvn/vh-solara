@@ -259,33 +259,34 @@ describe("Stream2 openSessionStream() listener manifest", () => {
     es.fire("snapshot", rawSessionSnap(1, SID, "m1"), "1");
 
     // message.upsert — a NEW assistant message m2 lands in the store.
-    es.fire("message.upsert", { id: "m2", sessionID: SID, role: "assistant", time: { created: 2 } }, "10");
+    // (seqs are contiguous to avoid triggering the seq-gap forced resync.)
+    es.fire("message.upsert", { id: "m2", sessionID: SID, role: "assistant", time: { created: 2 } }, "2");
     expect(store.state.messages[SID]?.byId?.m2).toBeDefined();
     expect(store.state.messages[SID]?.order).toEqual(expect.arrayContaining(["m1", "m2"]));
     // trackCursor=false: the shared cursor is NOT advanced by Stream2 frames.
     expect(store.state.cursor).toBe(0);
 
     // part.upsert — part p1 attaches to m2.
-    es.fire("part.upsert", { id: "p1", sessionID: SID, messageID: "m2", type: "text", text: "hi" }, "11");
+    es.fire("part.upsert", { id: "p1", sessionID: SID, messageID: "m2", type: "text", text: "hi" }, "3");
     expect(store.state.messages[SID]?.byId?.m2?.parts?.p1).toBeDefined();
 
     // part.delete — p1 removed.
-    es.fire("part.delete", { sessionID: SID, messageID: "m2", partID: "p1" }, "12");
+    es.fire("part.delete", { sessionID: SID, messageID: "m2", partID: "p1" }, "4");
     expect(store.state.messages[SID]?.byId?.m2?.parts?.p1).toBeUndefined();
 
     // message.delete — m2 removed.
-    es.fire("message.delete", { sessionID: SID, messageID: "m2" }, "13");
+    es.fire("message.delete", { sessionID: SID, messageID: "m2" }, "5");
     expect(store.state.messages[SID]?.byId?.m2).toBeUndefined();
     expect(store.state.messages[SID]?.order).not.toContain("m2");
 
     // messages.error — background-hydration failure records the per-session error.
-    es.fire("messages.error", { sessionID: SID, error: { message: "boom" } }, "14");
+    es.fire("messages.error", { sessionID: SID, error: { message: "boom" } }, "6");
     expect(store.state.messagesError[SID]).toBe(true);
 
     // messages.loaded — a later successful load supersedes the failure: clears
     // messagesError and re-asserts delivered. Proves the kind is wired via its
     // DISTINCT observable (clearing what messages.error just set).
-    es.fire("messages.loaded", { sessionID: SID }, "15");
+    es.fire("messages.loaded", { sessionID: SID }, "7");
     expect(store.state.messagesError[SID]).toBeUndefined();
     expect(store.state.messagesDelivered[SID]).toBe(true);
 
@@ -296,7 +297,7 @@ describe("Stream2 openSessionStream() listener manifest", () => {
     es.fire("messages.batch", {
       sessionID: SID,
       messages: [{ info: { id: "mB", sessionID: SID, role: "user", time: { created: 0 } }, parts: [] }],
-    }, "16");
+    }, "8");
     expect(store.state.messages[SID]?.byId?.mB).toBeUndefined(); // not yet (decode awaits)
     await flushMicro();
     expect(store.state.messages[SID]?.byId?.mB).toBeDefined();

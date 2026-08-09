@@ -89,6 +89,8 @@ import {
   setExpectTreeSnap,
   maybeResolveReconcile,
 } from "./stream";
+import { captureDiagEntry } from "./diaglog";
+import { getSesCursor } from "./session-stream";
 
 let es: EventSource | null = null;
 // Two INDEPENDENT liveness clocks — the dead-but-OPEN Stream2 bug (a frozen
@@ -314,6 +316,21 @@ let treeSnapDone = false;
 // and again after the await. Without this, a stale decode from a superseded
 // connection would clobber the replacement's fresh state with a stale snapshot.
 let treeGen = 0;
+// treeLastSeq — the last store-seq processed by ANY Stream1 listener (snapshot,
+// tree.snapshot, tree.op, session.*, TREE_STREAM_KINDS). Used by the per-stream
+// seq-gap detection (Invariant 1, Stream1 side): when a new event's seq exceeds
+// treeLastSeq + 1 AND the gap is NOT covered by Stream2's cursor (sesCursor <
+// seq - 1), a silent event loss likely occurred → force a fresh-snapshot
+// reconnect via connect(true). The covering check suppresses benign gaps caused
+// by message events for the selected session (which Stream1's interest filter
+// excludes). Reset in connect() so a fresh connection starts with no gap
+// baseline.
+let treeLastSeq = 0;
+// treeDropNextN — test-only hook. When > 0, the next N events on the
+// TREE_STREAM_KINDS listener loop are silently dropped BEFORE markTreeSeen/
+// reconcile, simulating "events lost below SSE but the connection stays OPEN."
+// Only armed by _setTreeDropNextNForTest from vitest.
+let treeDropNextN = 0;
 // In-flight gzip64 snapshot decode for the CURRENT tree connection. A warm
 // tree snapshot ships compressed (server maybeCompressSnapshot when z=1); the
 // decode is ASYNC (native DecompressionStream). applySnapshot
@@ -735,6 +752,59 @@ export function getTreeSnapshotDecode(): Promise<void> {
   return treeSnapshotDecode;
 }
 
+// --- Invariant 1 (Stream1 side): per-stream seq-gap detection → forced resync --
+//
+// checkTreeSeqGap — called on EVERY seq'd Stream1 event. If the incoming seq
+// exceeds treeLastSeq + 1, a gap of events occurred. The gap is BENIGN if
+// Stream2's cursor (sesCursor) has already reached seq - 1 — that means the gap
+// events were message events for the selected session that Stream1's interest
+// filter excluded (Stream2 received them). If sesCursor < seq - 1, the gap
+// includes events NEITHER stream's FE processed (other-session messages are
+// filtered out of both streams) → likely loss on Stream1 → force a
+// fresh-snapshot reconnect via connect(true).
+//
+// LIMITATION: a MIXED gap (selected-session messages + lost structural events)
+// where sesCursor happens to reach seq - 1 will be classified as benign (false
+// negative). The Stream2-side gap check + Invariant 2 (tail-integrity) catch
+// the complementary cases. The recovery (connect(true) → fresh tree snapshot →
+// C4 reconcile) is always safe.
+//
+// The diag entry is written BEFORE the resync so pre-recovery state is recorded.
+function checkTreeSeqGap(seq: number, kind: string): void {
+  // Guard: seq must be a positive finite integer. Events without an SSE id
+  // line produce NaN — skip them (not in the store-seq space).
+  if (!Number.isFinite(seq) || seq <= 0 || treeLastSeq <= 0) return;
+  const expected = treeLastSeq + 1;
+  if (seq <= expected) return; // contiguous or out-of-order
+  const gap = seq - expected;
+  // Covering check: if Stream2's cursor reached seq - 1, the gap events were
+  // message events for the selected session (Stream1's filter excludes them).
+  // Benign — skip.
+  if (getSesCursor() >= seq - 1) return;
+  // Uncovered gap — events neither stream's FE processed. Force reconnect.
+  captureDiagEntry({
+    kind: "stall",
+    ts: Date.now(),
+    trigger: "seq-gap",
+    stream: "tree",
+    seqGap: { stream: "tree", expected, got: seq, missed: gap },
+    eventSourceState: {
+      tree: es?.readyState ?? -1,
+      session: 0, // not tracked here; session-stream fills its own entries
+    },
+  });
+  log.warn("sync", "tree seq-gap → forcing fresh-snapshot reconnect", {
+    kind,
+    expected,
+    got: seq,
+    missed: gap,
+    sesCursor: getSesCursor(),
+  });
+  // Force a cursorless fresh-snapshot reconnect. connect(true) bumps treeGen,
+  // closes the old EventSource, and opens a fresh one with an authoritative
+  // full snapshot (C4 coherent barrier reconciles).
+  connect(true);
+}
 
 export function connect(fresh = false) {
   clearTimeout(reconnectTimer);
@@ -754,6 +824,9 @@ export function connect(fresh = false) {
   // connection doesn't await a stale decode from the prior connection.
   treeSnapshotDecode = Promise.resolve();
   treeSnapshotDecoding = false;
+  // Reset the seq-gap baseline so the first event on the new connection doesn't
+  // trigger a false gap (there's no prior baseline to compare against).
+  treeLastSeq = 0;
   es?.close();
   // No project selected (daemon cwd is not a meaningful project): do NOT open
   // a tree stream. The watchdog/maybeReconnect also no-op while projectDir is
@@ -1281,9 +1354,20 @@ function registerAuxiliaryListeners(es: EventSource, gen: number): void {
   es.addEventListener("ping", () => markTreeTransportSeen()); // heartbeat for the watchdog
   for (const kind of ["session.upsert", "session.delete"]) {
     es.addEventListener(kind, async (e) => {
+      // Gen guard at entry (mirrors the TREE_STREAM_KINDS listener) — a stale
+      // frame must not trigger markTreeSeen or checkTreeSeqGap before any
+      // downstream gen re-check.
+      if (gen !== treeGen) return;
       markTreeSeen();
       const ev = e as MessageEvent;
       const seq = Number(ev.lastEventId);
+      // Invariant 1 (Stream1): seq-gap detection. Checked BEFORE advancing
+      // treeLastSeq so the gap is measured from the prior baseline.
+      checkTreeSeqGap(seq, kind);
+      // checkTreeSeqGap MAY have triggered connect(true) → treeGen++ → this
+      // connection is superseded. Drop cleanly.
+      if (gen !== treeGen) return;
+      if (seq > treeLastSeq) treeLastSeq = seq;
       if (isGateActive()) {
         // Deferred — Stream 1 advances the resume cursor but does not mutate.
         advanceCursor(seq);
@@ -1354,6 +1438,10 @@ function registerTreeStreamListeners(es: EventSource, gen: number): void {
     const ev = e as MessageEvent;
     // F4: store seq from the SSE id, not the envelope body seq.
     const seq = Number(ev.lastEventId);
+    // Invariant 1 (Stream1): seq-gap detection.
+    checkTreeSeqGap(seq, "tree.op");
+    if (gen !== treeGen) return; // gap-check resync superseded this connection
+    if (seq > treeLastSeq) treeLastSeq = seq;
     if (isGateActive()) {
       advanceCursor(seq);
       markBusyDirty();
@@ -1385,9 +1473,22 @@ function registerTreeStreamListeners(es: EventSource, gen: number): void {
   });
   for (const kind of TREE_STREAM_KINDS) {
     es.addEventListener(kind, async (e) => {
+      // Test-only drop hook: silently ignore the next N events BEFORE
+      // markTreeSeen/reconcile, simulating "events lost below SSE but the
+      // connection stays OPEN" — the exact silent-loss class. Decremented
+      // BEFORE any state effect so a dropped event leaves NO trace.
+      if (treeDropNextN > 0) {
+        treeDropNextN--;
+        return;
+      }
       markTreeSeen();
       const ev = e as MessageEvent;
       const seq = Number(ev.lastEventId);
+      // Invariant 1 (Stream1): seq-gap detection. Checked BEFORE advancing
+      // treeLastSeq so the gap is measured from the prior baseline.
+      checkTreeSeqGap(seq, kind);
+      if (gen !== treeGen) return; // gap-check resync superseded this connection
+      if (seq > treeLastSeq) treeLastSeq = seq;
       if (isGateActive()) {
         // Deferred — Stream 1 advances the resume cursor but does not mutate.
         advanceCursor(seq);
@@ -1556,4 +1657,18 @@ export function _markTreeSeenForTest(ms?: number): void {
 // through this accessor.
 export function getTreeGen(): number {
   return treeGen;
+}
+
+// --- Test-only accessors for the seq-gap drop-N regression test -------------
+// NOT wired into any production path. Used by vitest to arm the __dropNextN
+// hook and reset the gap baseline between tests.
+export function _setTreeDropNextNForTest(n: number): void {
+  treeDropNextN = n;
+}
+export function _getTreeLastSeqForTest(): number {
+  return treeLastSeq;
+}
+export function _resetTreeGapStateForTest(): void {
+  treeLastSeq = 0;
+  treeDropNextN = 0;
 }

@@ -50,6 +50,12 @@ export const TREE_RESYNC_PERIODIC_JITTER_MS = 2 * 60 * 1000; // ±2 min
 // low frequency, gated so it ONLY runs when it is safe and likely to be the
 // highest-value action available.
 //
+// NOTE: this periodic tick is now a BACKSTOP. The primary fast-loss detection
+// is the per-stream seq-gap check (Invariant 1, tree-transport.ts +
+// session-stream.ts) which self-heals in seconds on the next surviving event.
+// This 10-min tick catches the residual class (drift with NO surviving event to
+// expose the gap, or gaps masked by the covering check in multi-session mode).
+//
 // Preconditions (ALL must hold — see periodicResyncShouldRun):
 //   - document visible             (only a foregrounded tab accumulates this)
 //   - navigator.onLine             (don't resync over a dead network)

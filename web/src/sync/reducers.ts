@@ -306,6 +306,26 @@ export function projectMessageEvent(
                 time: { ...(last.info.time || {}), completed: Date.now() },
               };
             }
+            // Invariant 2: tail-integrity check. If after the bridge stamp the
+            // last message is STILL not a completed assistant message, the
+            // terminal message.upsert that creates/ completes the assistant
+            // turn was lost in transit. Emit an effect so orchestration
+            // force-fetches a fresh snapshot to recover the true tail. The
+            // bridge above handles the common case (assistant message exists,
+            // just missing time.completed); this catches the case where the
+            // message itself was lost (tail ends with a user/partial message).
+            const afterStamp = sm.byId[sm.order[sm.order.length - 1]];
+            if (
+              !afterStamp ||
+              afterStamp.info.role !== "assistant" ||
+              !afterStamp.info.time?.completed
+            ) {
+              effects.push({ kind: "tail-incomplete-on-idle", sessionID: payload.sessionID });
+            }
+          } else {
+            // No messages resident for this session at all — the entire
+            // message stream for this turn was lost. Force-fetch.
+            effects.push({ kind: "tail-incomplete-on-idle", sessionID: payload.sessionID });
           }
         }
       }

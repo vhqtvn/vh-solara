@@ -53,7 +53,68 @@ export interface ColdOpenEntry {
   /** Daemon-side SetSessionMessages portion of hydrate (ms). */
   reconcileMs?: number;
 }
-export type DiagEntry = ColdOpenEntry;
+/**
+ * StallEntry — a diagnostic record captured when the FE detects a silent event
+ * loss (or suspected loss) and forces a self-heal resync. Written BEFORE the
+ * resync fires so the pre-recovery state is preserved in the ring.
+ *
+ * The triggers:
+ *  - `seq-gap`              — a per-stream seq gap not covered by the other
+ *                             stream's cursor (Invariant 1).
+ *  - `tail-incomplete-on-idle` — activity=idle arrived but the resident tail's
+ *                             last assistant message lacks time.completed
+ *                             (Invariant 2).
+ *  - `content-stale-watchdog` — the dual-clock watchdog forced a reconnect
+ *                             (health.ts transport/content stall paths).
+ *  - `reconnect`            — any other forced reconnect (visibility/online).
+ */
+export interface StallEntry {
+  kind: "stall";
+  /** Wall-clock capture time (ms epoch). */
+  ts: number;
+  /** What triggered the stall detection + self-heal. */
+  trigger: "seq-gap" | "tail-incomplete-on-idle" | "content-stale-watchdog" | "reconnect";
+  /** Which stream(s) the detection + recovery targets. */
+  stream: "tree" | "session" | "both";
+  /** The session the stall concerns (for session-scoped triggers). */
+  sessionId?: string;
+  /** Age of Stream1's transport clock at capture (ms). */
+  treeLastSeenAge?: number;
+  /** Age of Stream1's content-only clock at capture (ms). */
+  treeContentSeenAge?: number;
+  /** Age of Stream2's transport clock at capture (ms). */
+  sessionLastSeenAge?: number;
+  /** Age of Stream2's content-only clock at capture (ms). */
+  sessionContentSeenAge?: number;
+  /** Gate snapshot at capture — what in-flight barriers existed. */
+  gate?: {
+    busyActive: boolean;
+    expectSessionSnap: boolean;
+    expectTreeSnap: boolean;
+    sesSnapshotDecoding: boolean;
+    treeSnapshotDecoding: boolean;
+  };
+  /** Resident tail summary at capture (for tail-incomplete triggers). */
+  residentTail?: {
+    sessionId: string;
+    lastMsgRole?: string;
+    lastMsgCompleted?: boolean;
+    msgCount: number;
+  } | null;
+  /** Seq gap details (for seq-gap triggers). */
+  seqGap?: {
+    stream: "tree" | "session";
+    expected: number;
+    got: number;
+    missed: number;
+  };
+  /** EventSource readyState snapshot at capture (0=CONNECTING,1=OPEN,2=CLOSED). */
+  eventSourceState?: {
+    tree: number;
+    session: number;
+  };
+}
+export type DiagEntry = ColdOpenEntry | StallEntry;
 
 // --- entryLine rendering ----------------------------------------------------
 // One entry -> a single copy-friendly line. The label `conn` (not the persisted
@@ -97,6 +158,39 @@ export function entryLine(e: DiagEntry): string {
   switch (e.kind) {
     case "cold-open":
       return `${iso(e.ts)} cold-open sess=${e.sessionId} total=${fmtMs(coldOpenTotal(e))} conn=${fmtMs(e.open)} snap=${fmtMs(e.snap)} hydrate=${fmtMs(e.hydrate)} fetch=${fmtMs(e.fetchMs)} recon=${fmtMs(e.reconcileMs)}`;
+    case "stall": {
+      const parts: string[] = [
+        iso(e.ts),
+        "stall",
+        `trigger=${e.trigger}`,
+        `stream=${e.stream}`,
+      ];
+      if (e.sessionId) parts.push(`sess=${e.sessionId}`);
+      if (e.seqGap) parts.push(`gap[${e.seqGap.stream}]=${e.seqGap.expected}→${e.seqGap.got}(-${e.seqGap.missed})`);
+      if (typeof e.treeLastSeenAge === "number") parts.push(`treeAge=${fmtMs(e.treeLastSeenAge)}`);
+      if (typeof e.treeContentSeenAge === "number") parts.push(`treeContentAge=${fmtMs(e.treeContentSeenAge)}`);
+      if (typeof e.sessionLastSeenAge === "number") parts.push(`sesAge=${fmtMs(e.sessionLastSeenAge)}`);
+      if (typeof e.sessionContentSeenAge === "number") parts.push(`sesContentAge=${fmtMs(e.sessionContentSeenAge)}`);
+      if (e.residentTail) {
+        parts.push(
+          `tail[${e.residentTail.sessionId}]:${e.residentTail.msgCount}msgs last=${e.residentTail.lastMsgRole ?? "?"}` +
+            (e.residentTail.lastMsgCompleted ? "(done)" : "(no-done)"),
+        );
+      }
+      if (e.gate) {
+        const g: string[] = [];
+        if (e.gate.busyActive) g.push("busy");
+        if (e.gate.expectSessionSnap) g.push("expSes");
+        if (e.gate.expectTreeSnap) g.push("expTree");
+        if (e.gate.sesSnapshotDecoding) g.push("sesDec");
+        if (e.gate.treeSnapshotDecoding) g.push("treeDec");
+        if (g.length) parts.push(`gate=${g.join(",")}`);
+      }
+      if (e.eventSourceState) {
+        parts.push(`es[t=${e.eventSourceState.tree},s=${e.eventSourceState.session}]`);
+      }
+      return parts.join(" ");
+    }
   }
 }
 
@@ -136,15 +230,16 @@ function loadDiagEntries(dir: string): DiagEntry[] {
     return (old as unknown[]).filter(isDiagEntry) as DiagEntry[];
   });
 }
-// Runtime validator for migrated / foreign persisted payloads.
+// Runtime validator for migrated / foreign persisted payloads. StallEntry's
+// sessionId is OPTIONAL, so a valid entry must have (ts:number + kind:string)
+// and EITHER a string sessionId (cold-open) OR kind==="stall".
 function isDiagEntry(o: unknown): o is DiagEntry {
-  return (
-    !!o &&
-    typeof o === "object" &&
-    typeof (o as { ts?: unknown }).ts === "number" &&
-    typeof (o as { sessionId?: unknown }).sessionId === "string" &&
-    typeof (o as { kind?: unknown }).kind === "string"
-  );
+  if (!o || typeof o !== "object") return false;
+  const obj = o as { ts?: unknown; kind?: unknown; sessionId?: unknown };
+  if (typeof obj.ts !== "number") return false;
+  if (typeof obj.kind !== "string") return false;
+  if (obj.kind === "stall") return true; // sessionId optional on stall entries
+  return typeof obj.sessionId === "string"; // cold-open requires it
 }
 
 // Debounced persistence of the current project's buffer (mirrors store.persist).

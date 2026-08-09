@@ -43,7 +43,7 @@ import { produce } from "solid-js/store";
 import type { Snapshot } from "../types";
 import { prependMessagesIfAbsent } from "../lib/reduce";
 import { log } from "../lib/log";
-import { setState, projectDir } from "./store";
+import { setState, projectDir, state } from "./store";
 import { isGateActive, currentGateEpoch, markBusyDirty } from "../busy";
 import { decodeSnapshot, decodeMessagesBatch } from "./decode";
 import {
@@ -59,6 +59,7 @@ import {
   setExpectSessionSnap,
   maybeResolveReconcile,
 } from "./stream";
+import { captureDiagEntry } from "./diaglog";
 
 // Two INDEPENDENT liveness clocks — the dead-but-OPEN Stream2 bug (a frozen
 // transcript with the `updating` pulse lit and no reconnect) came from a single
@@ -225,6 +226,22 @@ let sesBackoff = 1500;
 // state.cursor. Reset to 0 in closeSessionStream (session switch / close) so a
 // new session always starts fresh; preserved across retries (same session).
 let sesCursor = 0;
+// sesLastSeq — the last store-seq processed by ANY Stream2 listener (snapshot or
+// message event). Used by the per-stream seq-gap detection (Invariant 1): when a
+// new event's seq exceeds sesLastSeq + 1 AND the gap is NOT covered by Stream1's
+// structural cursor (state.cursor < seq - 1), a silent event loss likely
+// occurred → force a fresh-snapshot resync. The covering check suppresses benign
+// gaps caused by structural events (which Stream2 receives on the wire but has
+// no FE listener for — sesLastSeq doesn't advance for them). See
+// checkSesSeqGap for the full rationale. Reset in closeSessionStream (like
+// sesCursor) so a fresh connection starts with no gap baseline.
+let sesLastSeq = 0;
+// sesDropNextN — test-only hook. When > 0, the next N events on the session
+// message listener are silently dropped BEFORE markSessionSeen/reconcile,
+// simulating "events lost below SSE but the connection stays OPEN." This is
+// the deterministic red signal for the drop-N regression test. NEVER set in
+// production code — only by _setSesDropNextNForTest from vitest.
+let sesDropNextN = 0;
 // sesGen: Stream2 connection-generation token. Incremented on EVERY open /
 // reopen / close / selection-switch. Captured in every Stream2 listener so a
 // callback from a SUPERSEDED connection (closed, replaced, switched-away — or a
@@ -248,6 +265,69 @@ export function getSesGen(): number {
   return sesGen;
 }
 
+// --- Invariant 1: per-stream seq-gap detection → forced resync ---------------
+//
+// checkSesSeqGap — called on EVERY seq'd Stream2 event (snapshot + message.*).
+// If the incoming seq exceeds sesLastSeq + 1, a gap of `gap` events occurred.
+// The gap is BENIGN if Stream1's structural cursor (state.cursor) has already
+// reached seq - 1 — that means the gap events were structural events that
+// Stream2 received on the wire but has no FE listener for (sesLastSeq doesn't
+// advance for structural events). If state.cursor < seq - 1, the gap includes
+// events NEITHER stream's FE processed (other-session messages are filtered out
+// of both streams) → likely loss on Stream2 → force a fresh-snapshot resync
+// via openSessionStream(id, true).
+//
+// LIMITATION: a MIXED gap (structural + lost message events) where state.cursor
+// happens to reach seq - 1 via the structural events will be classified as
+// benign (false negative). Invariant 2 (tail-integrity on idle) catches the
+// terminal case of this class. See the task analysis for the full rationale.
+//
+// The diag entry is written BEFORE the resync so pre-recovery state is recorded.
+// The resync (openSessionStream(id, true)) bumps sesGen and creates a fresh
+// EventSource; the current event continues to process on the old gen (it's a
+// surviving event whose application is correct — the fresh snapshot MERGEs
+// via prependMessagesIfAbsent, live always wins).
+function checkSesSeqGap(seq: number, kind: string): void {
+  // Guard: seq must be a positive finite integer. Events without an SSE id
+  // line (no lastEventId) produce NaN — those are transient/non-replayable
+  // frames that don't participate in the store-seq space; skip them.
+  if (!Number.isFinite(seq) || seq <= 0 || sesLastSeq <= 0) return;
+  const expected = sesLastSeq + 1;
+  if (seq <= expected) return; // contiguous or out-of-order (existing dedup handles)
+  const gap = seq - expected;
+  // Covering check: if Stream1's structural cursor reached seq - 1, the gap
+  // events were structural (Stream2 received on wire, no FE listener →
+  // sesLastSeq didn't advance). Benign — skip.
+  if (state.cursor >= seq - 1) return;
+  // Uncovered gap — events neither stream's FE processed. Force resync.
+  const sid = sesId;
+  captureDiagEntry({
+    kind: "stall",
+    ts: Date.now(),
+    trigger: "seq-gap",
+    stream: "session",
+    sessionId: sid || undefined,
+    seqGap: { stream: "session", expected, got: seq, missed: gap },
+    eventSourceState: {
+      tree: 0, // not tracked here; health.ts fills tree state in its own entries
+      session: ses?.readyState ?? -1,
+    },
+  });
+  log.warn("sync", "session seq-gap → forcing fresh-snapshot resync", {
+    id: sid,
+    kind,
+    expected,
+    got: seq,
+    missed: gap,
+    treeCursor: state.cursor,
+  });
+  // Force a cursorless fresh-snapshot reconnect. openSessionStream(id, true)
+  // bypasses the "already open" guard, closes the old EventSource (sesGen++),
+  // and opens a fresh one starting with an authoritative snapshot (MERGE via
+  // prependMessagesIfAbsent — live always wins).
+  if (sid) openSessionStream(sid, true);
+}
+
 // Health accessors for ./health's watchdogTick — that module evaluates each
 // stream's liveness independently and must peek Stream2's transport + clock
 // state without owning it. Kept narrow (read-only) so health can never mutate
@@ -263,6 +343,14 @@ export function getSessionLastSeen(): number {
 }
 export function getSessionContentSeen(): number {
   return sessionContentSeen;
+}
+// getSesCursor — read-only peek at Stream2's local resume cursor (the last
+// store-seq Stream2 processed: snapshot + message events). Consumed by
+// tree-transport's Stream1 seq-gap covering check: if a gap on Stream1 is
+// covered by sesCursor, the gap events were message events for the selected
+// session that Stream2 received → benign for Stream1.
+export function getSesCursor(): number {
+  return sesCursor;
 }
 
 export function closeSessionStream() {
@@ -300,6 +388,9 @@ export function closeSessionStream() {
   // deadline is seeded fresh by open().
   sessionLastSeen = 0;
   sessionContentSeen = 0;
+  // Reset the seq-gap baseline so the first event on the new connection doesn't
+  // trigger a false gap (there's no prior baseline to compare against).
+  sesLastSeq = 0;
   // Phase 3-F: a session switch starts the next session's CLOSED-reopen backoff
   // fresh (per-session backoff does not carry across session switches).
   sesBackoff = 1500;
@@ -468,7 +559,16 @@ export function openSessionStream(id: string, force = false) {
       // by writeRaw as the SSE id. Using max guards against any out-of-order
       // delivery (shouldn't happen, but defensive).
       const seq = Number((e as MessageEvent).lastEventId);
+      // Invariant 1: per-stream seq-gap detection. Checked BEFORE advancing
+      // sesCursor/sesLastSeq so the gap is measured from the prior baseline.
+      checkSesSeqGap(seq, "snapshot");
+      // checkSesSeqGap MAY have triggered openSessionStream(id, true) → sesGen++
+      // → this connection is superseded. The fresh snapshot from the new
+      // connection is authoritative (MERGE via prependMessagesIfAbsent), so
+      // drop this frame cleanly.
+      if (gen !== sesGen) return;
       if (seq > sesCursor) sesCursor = seq;
+      if (seq > sesLastSeq) sesLastSeq = seq;
       let raw: any;
       try {
         raw = JSON.parse((e as MessageEvent).data);
@@ -673,6 +773,15 @@ function registerSessionMessageListeners(es: EventSource, gen: number): void {
       // Gen guard: ignore frames from a superseded connection BEFORE touching
       // the clock or the store.
       if (gen !== sesGen) return;
+      // Test-only drop hook: silently ignore the next N events BEFORE
+      // markSessionSeen/reconcile, simulating "events lost below SSE but the
+      // connection stays OPEN" — the exact silent-loss class. Decremented
+      // BEFORE any state effect so a dropped event leaves NO trace (no clock
+      // refresh, no cursor advance, no seq baseline update).
+      if (sesDropNextN > 0) {
+        sesDropNextN--;
+        return;
+      }
       markSessionSeen();
       // Track Stream2's local cursor from the SSE id field (mirrors the
       // snapshot listener). Done BEFORE the gate check so even a deferred
@@ -680,7 +789,14 @@ function registerSessionMessageListeners(es: EventSource, gen: number): void {
       // retry after the gate releases must not replay it.
       {
         const seq = Number((e as MessageEvent).lastEventId);
+        // Invariant 1: per-stream seq-gap detection. Checked BEFORE advancing
+        // sesCursor/sesLastSeq so the gap is measured from the prior baseline.
+        checkSesSeqGap(seq, kind);
+        // checkSesSeqGap MAY have triggered openSessionStream(id, true) →
+        // sesGen++ → this connection is superseded. Drop cleanly.
+        if (gen !== sesGen) return;
         if (seq > sesCursor) sesCursor = seq;
+        if (seq > sesLastSeq) sesLastSeq = seq;
       }
       if (isGateActive()) {
         // Deferred Stream-2 frame — neither mutate the store nor advance the
@@ -846,4 +962,18 @@ function registerSessionMessageListeners(es: EventSource, gen: number): void {
       applyMessageEvent(kind, Number(ev.lastEventId), data, false);
     });
   }
+}
+
+// --- Test-only accessors for the seq-gap drop-N regression test -------------
+// These are NOT wired into any production path. They exist so vitest can arm
+// the __dropNextN hook and reset the gap baseline between tests.
+export function _setSesDropNextNForTest(n: number): void {
+  sesDropNextN = n;
+}
+export function _getSesLastSeqForTest(): number {
+  return sesLastSeq;
+}
+export function _resetSesGapStateForTest(): void {
+  sesLastSeq = 0;
+  sesDropNextN = 0;
 }

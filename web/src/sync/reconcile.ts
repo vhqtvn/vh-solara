@@ -16,7 +16,7 @@ import { produce } from "solid-js/store";
 import { createSignal } from "solid-js";
 import type { Snapshot } from "../types";
 import type { ReconcileContext, ReconcileEffect, ReconcileEvent } from "./reducers.types";
-import { setState, persist, type SyncState } from "./store";
+import { setState, persist, type SyncState, selectedId, state } from "./store";
 import {
   projectSnapshot,
   projectSessionEvent,
@@ -30,6 +30,8 @@ import { dropLabelRoot } from "../labels";
 import { resetPageInFlight } from "./history";
 import { patchTreeAgent } from "./treeState";
 import { maybeNotifyRootDone, maybeClearWaiting } from "./orchestration";
+import { openSessionStream } from "./session-stream";
+import { captureDiagEntry } from "./diaglog";
 
 // interpretEffects — map factual effects to side-effect policy. sync-state-dirty
 // is intentionally NOT handled here: the entrypoint persists it LAST (after the
@@ -63,6 +65,32 @@ function interpretEffects(effects: ReconcileEffect[]): void {
         // the same reconciliation cycle as the producing lastAgent.set event
         // (ordering-equivalent to the former inline call inside produce()).
         patchTreeAgent(e.sessionID, e.agent);
+        break;
+      case "tail-incomplete-on-idle":
+        // Invariant 2: activity=idle arrived but the resident tail's last
+        // message is not a completed assistant message → the terminal
+        // message.upsert was lost. Force-fetch a fresh snapshot to recover
+        // the true tail. Only actionable for the SELECTED session
+        // (openSessionStream opens a Stream2 EventSource for it); for other
+        // sessions the tail isn't display-critical until selected.
+        if (e.sessionID === selectedId()) {
+          const sm = state.messages[e.sessionID];
+          const lastMsg = sm && sm.order.length ? sm.byId[sm.order[sm.order.length - 1]] : null;
+          captureDiagEntry({
+            kind: "stall",
+            ts: Date.now(),
+            trigger: "tail-incomplete-on-idle",
+            stream: "session",
+            sessionId: e.sessionID,
+            residentTail: {
+              sessionId: e.sessionID,
+              lastMsgRole: lastMsg?.info.role,
+              lastMsgCompleted: !!lastMsg?.info.time?.completed,
+              msgCount: sm?.order.length ?? 0,
+            },
+          });
+          openSessionStream(e.sessionID, true);
+        }
         break;
     }
   }

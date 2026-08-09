@@ -46,6 +46,12 @@ export type ReconcileEffect =
   // former inline call, which ran inside the produce() batch). Emitted by the
   // lastAgent.set projection.
   | { kind: "reconcile-tree-agent"; sessionID: string; agent: string }
+  // activity=idle arrived for a session whose resident tail's last message is
+  // NOT a completed assistant message — the terminal message.upsert
+  // (time.completed) was lost in transit. Orchestration force-fetches a fresh
+  // snapshot via openSessionStream(id, true) to recover the true tail.
+  // Emitted by the activity projection (Invariant 2).
+  | { kind: "tail-incomplete-on-idle"; sessionID: string }
   // The projected mutation dirtied the persisted slices (cursor/activity/
   // lastAgents). Interpreted LAST (after the cursor advance) so persistence
   // captures the final cursor value. Orchestration calls the debounced persist.
