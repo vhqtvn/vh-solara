@@ -634,13 +634,18 @@ It lets an operator:
   release workflow, which stamps `cmd.Version` via ldflags. There is no in-repo
   version constant — "bump version" = create and push the next `vX.Y.Z` tag.
 
-## Web frontend (`web/`)
+## Web frontend (`web/`) and host shell (`host-web/`)
 
-- SolidJS SPA built with Vite; TypeScript. `make web` builds the SPA into a
-  **gitignored staging dir** (`web/dist-build/`), NOT into `pkg/web/dist/`. A
-  self-contained fallback `pkg/web/dist/placeholder.html` is tracked so
-  `//go:embed dist` compiles and a cold `go build`/`go test` works with **no
-  frontend build** (it renders a "web UI was not built" banner — fully
+The binary embeds TWO SPAs (the fold): the **single-server SPA** (`web/`, served
+at `/app`) and the **multi-server host shell** (`host-web/`, served at `/` — the
+default view, which self-seeds the local server at same-origin `/app`). One
+binary, one origin, both SPAs.
+
+- SolidJS SPA built with Vite; TypeScript. `make web` builds the single-server
+  SPA into a **gitignored staging dir** (`web/dist-build/`), NOT into
+  `pkg/web/dist/`. A self-contained fallback `pkg/web/dist/placeholder.html` is
+  tracked so `//go:embed dist` compiles and a cold `go build`/`go test` works
+  with **no frontend build** (it renders a "web UI was not built" banner — fully
   self-contained, with no `/assets` or `/sw.js` references). Generated
   `pkg/web/dist/index.html` (the real SPA shell) and its assets are gitignored.
   Embed-producing targets (`make build`/`install`/`fixtures`, the release
@@ -652,7 +657,24 @@ It lets an operator:
   since those are gitignored, `git status` stays clean; `make clean-web-embed`
   removes the generated artifacts and returns to the true cold-fallback embed
   state (placeholder.html only).
-- Full build (Node ≥ 24): `make build` (or `make web` for the SPA only).
+- The host shell (`host-web/`) mirrors this: `make host-web` builds it into
+  `host-web/dist/` with `VITE_HOST_FOLDED=1`, which namespaces its assets under
+  `/host/` (base `/host/`) so they do NOT collide with the single-server SPA's
+  root-level `/assets/`. `make host-web-materialize` copies the staged build into
+  `pkg/web/host-dist/` (mirror of the dist pipeline; tracked
+  `pkg/web/host-dist/placeholder.html` keeps a cold `go build`/`go test` working;
+  `make clean-host-web-embed` returns it to placeholder-only). Embed-producing
+  targets materialize BOTH bundles (`embed-materialize` alias) before `go build`.
+- Routing (`pkg/web/server.go` `handleStatic`): `/` → host shell; `/app` →
+  single-server SPA; `/host/*` → host assets; single-server static files
+  (`/assets/`, `/sw.js`, `/manifest.webmanifest`, icons) → dist FS. The host
+  shell's routes (`/`, `/host/*`) get a CSP with `frame-src http: https:` so the
+  host can embed operator-chosen servers cross-origin; `frame-ancestors` stays
+  `'self'` (unchanged). The fixture server opts out of the fold
+  (`SetHostShellAtRoot(false)`) so the web e2e lane keeps testing the
+  single-server SPA at `/`.
+- Full build (Node ≥ 24): `make build` (or `make web` for the single-server SPA
+  only, `make host-web` for the host shell only).
 - SPA unit tests: `cd web && npm run test:unit` (preferred over bare `npx vitest run`, which from the repo root can resolve to a cached vitest that lacks the project jsdom config). Typecheck: `npm run typecheck`.
 - Playwright e2e: `cd web && export PATH=$PATH:/usr/local/go/bin && npx playwright
   test` (the `webServer` runs `scripts/fixture-web.sh`, which builds the SPA and

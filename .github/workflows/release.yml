@@ -27,9 +27,11 @@ jobs:
         with:
           node-version: 24
           cache: npm
-          cache-dependency-path: web/package-lock.json
+          cache-dependency-path: |
+            web/package-lock.json
+            host-web/package-lock.json
 
-      - name: Build web UI (embedded into the binary)
+      - name: Build single-server web UI (embedded into the binary)
         # `npm run build` stages the SPA into the gitignored web/dist-build/
         # (NOT pkg/web/dist, which holds the tracked fallback placeholder). The
         # materialize step then copies the staged bundle into pkg/web/dist/ so
@@ -39,8 +41,22 @@ jobs:
           cd web
           npm ci
           npm run build
-      - name: Materialize staged SPA into pkg/web/dist
+      - name: Materialize single-server SPA into pkg/web/dist
         run: bash web/scripts/materialize.sh
+
+      - name: Build host shell (embedded into the binary)
+        # VITE_HOST_FOLDED=1 namespaces the host shell's assets under /host/ so
+        # they do not collide with the single-server SPA's root-level /assets/.
+        # The materialize step copies the staged host bundle into pkg/web/host-dist
+        # so `go build` embeds the real host shell via //go:embed host-dist. The
+        # binary then serves the host at `/` (default view) and the single-server
+        # SPA at `/app`.
+        run: |
+          cd host-web
+          npm ci
+          VITE_HOST_FOLDED=1 npm run build
+      - name: Materialize host shell into pkg/web/host-dist
+        run: bash host-web/scripts/materialize.sh
 
       - name: Download dependencies
         run: go mod download

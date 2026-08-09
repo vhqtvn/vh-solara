@@ -103,6 +103,13 @@ func main() {
 	if err != nil {
 		log.Fatalf("build web server: %v", err)
 	}
+	// The fixture server backs the WEB e2e lane (web/tests/e2e), which targets
+	// the SINGLE-SERVER SPA at `/`. The production fold mounts the host shell at
+	// `/` (and the single-server at `/app`); opt OUT of the fold here so the web
+	// e2e's `/` continues to serve the single-server SPA unchanged. The host-web
+	// real-embed e2e (LANE 8) uses the REAL binary, so it always runs with the
+	// host at `/` (production posture) — this opt-out affects ONLY this fixture.
+	srv.SetHostShellAtRoot(false)
 	// The fixture's OpenCode is an EXTERNAL HTTP loopback server (ln above), not
 	// a spawned/co-located process whose env is inherited. Declare that topology
 	// honestly so the unarchive guard (pkg/web/archive.go handleArchive →

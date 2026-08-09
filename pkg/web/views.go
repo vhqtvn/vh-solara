@@ -249,7 +249,10 @@ func (vr *viewRegistry) del(id string) bool {
 }
 
 // reservedPrefixes are vh-solara's own roots; a view can't shadow them.
-var reservedPrefixes = []string{"/vh", "/oc", "/auth", "/assets"}
+// `/app` (single-server SPA entry) and `/host` (host shell's namespaced assets)
+// are reserved so a managed/operator view can never shadow the two embedded SPAs
+// served by handleStatic.
+var reservedPrefixes = []string{"/vh", "/oc", "/auth", "/assets", "/app", "/host"}
 
 // normalizeViewPrefix validates + canonicalizes a path_prefix (leading slash, no
 // trailing slash, not "/", not a reserved root).

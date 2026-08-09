@@ -1,23 +1,33 @@
 # vh-solara developer tasks.
-# The web UI is embedded into the Go binary. `make web` builds the SPA into a
-# gitignored staging dir (web/dist-build); embed-producing targets materialize
-# (copy) the staged bundle into pkg/web/dist right before `go build`.
+# The web UI is embedded into the Go binary. `make web` builds the single-server
+# SPA into a gitignored staging dir (web/dist-build); `make host-web` builds the
+# multi-server host shell into host-web/dist. Embed-producing targets materialize
+# (copy) BOTH staged bundles into pkg/web/dist + pkg/web/host-dist right before
+# `go build`, so one binary carries both SPAs (`/` → host, `/app` → single-server).
 
-.PHONY: web web-materialize build build-debug install install-local test test-unit test-web test-host-web test-host-web-preview test-host-web-real-embed verify fmt fmt-check vet typecheck e2e e2e-keep docker fixtures bench clean-web-embed
+.PHONY: web web-materialize host-web host-web-materialize embed-materialize build build-debug install install-local test test-unit test-web test-host-web test-host-web-preview test-host-web-real-embed verify fmt fmt-check vet typecheck e2e e2e-keep docker fixtures bench clean-web-embed clean-host-web-embed
 
-web: ## Build the SolidJS UI into the staging dir web/dist-build (gitignored, NOT pkg/web/dist)
+web: ## Build the SolidJS single-server SPA into web/dist-build (gitignored, NOT pkg/web/dist)
 	cd web && npm ci && npm run build
 
-web-materialize: web ## Copy staged SPA (web/dist-build) into the Go embed dir pkg/web/dist
+web-materialize: web ## Copy staged single-server SPA (web/dist-build) into pkg/web/dist
 	bash web/scripts/materialize.sh
 
-build: web-materialize ## Build the vh-solara binary (single file, UI embedded via go:embed)
+host-web: ## Build the host shell SPA into host-web/dist (gitignored, NOT pkg/web/host-dist). VITE_HOST_FOLDED=1 namespaces assets under /host/ so they do not collide with the single-server /assets/.
+	cd host-web && npm ci && VITE_HOST_FOLDED=1 npm run build
+
+host-web-materialize: host-web ## Copy staged host shell (host-web/dist) into pkg/web/host-dist
+	bash host-web/scripts/materialize.sh
+
+embed-materialize: web-materialize host-web-materialize ## Materialize BOTH SPA bundles (single-server + host) into their Go embed dirs
+
+build: embed-materialize ## Build the vh-solara binary (single file, BOTH SPAs embedded via go:embed)
 	go build -o vh-solara .
 
-build-debug: web-materialize ## Build a local debug binary: debug logging forced on (no VH_DEBUG=1 needed); mirrors the cmd.Version ldflags pattern
+build-debug: embed-materialize ## Build a local debug binary: debug logging forced on (no VH_DEBUG=1 needed); mirrors the cmd.Version ldflags pattern
 	go build -ldflags "-X github.com/vhqtvn/vh-solara/pkg/vhlog.debugForced=1" -o vh-solara .
 
-install: web-materialize ## Build the UI then `go install` the single embedded binary into GOBIN
+install: embed-materialize ## Build BOTH UIs then `go install` the single embedded binary into GOBIN
 	go install .
 
 install-local: build ## Build vh-solara and atomically install it over the existing binary on PATH (sudo/chown adapts to destination owner)
@@ -79,7 +89,7 @@ typecheck: ## Typecheck the web SPA (mirrors CI's `npm run typecheck`)
 
 verify: fmt-check vet test typecheck ## Local end-of-impl/release verification gate (mirrors CI: gofmt -> vet -> test -> typecheck). Run before any release or declaring implementation done.
 
-fixtures: web-materialize ## Run the fixture-backed web stack locally on :8099 (no opencode needed)
+fixtures: embed-materialize ## Run the fixture-backed web stack locally on :8099 (no opencode needed)
 	go run ./tools/fixtureserver -addr 127.0.0.1:8099
 
 bench: ## Benchmark the chat view (VH_BENCH_MESSAGES=N complex messages, default 300)
@@ -94,5 +104,8 @@ e2e-keep: ## Same as e2e but leave the container running for inspection
 docker: ## Build the production image
 	docker build -t vh-solara .
 
-clean-web-embed: ## Remove generated SPA artifacts from pkg/web/dist (preserve tracked placeholder.html → cold-fallback embed)
+clean-web-embed: ## Remove generated single-server SPA artifacts from pkg/web/dist (preserve tracked placeholder.html → cold-fallback embed)
 	rm -rf pkg/web/dist/assets pkg/web/dist/index.html pkg/web/dist/*.js pkg/web/dist/*.map pkg/web/dist/*.webmanifest pkg/web/dist/*.svg pkg/web/dist/*.png 2>/dev/null || true
+
+clean-host-web-embed: ## Remove generated host shell artifacts from pkg/web/host-dist (preserve tracked placeholder.html → cold-fallback embed)
+	rm -rf pkg/web/host-dist/assets pkg/web/host-dist/index.html pkg/web/host-dist/*.js pkg/web/host-dist/*.map 2>/dev/null || true

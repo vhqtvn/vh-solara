@@ -43,6 +43,15 @@ import (
 //go:embed dist
 var distFS embed.FS
 
+// hostDistFS embeds the multi-server HOST shell (host-web/ SPA), materialized
+// into pkg/web/host-dist/ by embed-producing targets (mirror of distFS for the
+// single-server SPA). The tracked pkg/web/host-dist/placeholder.html keeps a
+// cold `go build`/`go test` compiling and serving a real page with no host-web
+// build. Served at `/` (the default view) and `/host/*` (its namespaced assets).
+//
+//go:embed host-dist
+var hostDistFS embed.FS
+
 // Server wires the aggregator's view to HTTP: /vh/* protocol endpoints, /oc/*
 // OpenCode passthrough, and the embedded SPA at /.
 type Server struct {
@@ -50,7 +59,22 @@ type Server struct {
 	proxy    *httputil.ReverseProxy
 	staticFS fs.FS
 	static   http.Handler
-	renderer *render.Renderer
+	// hostFS is the embedded multi-server HOST shell (host-dist), served at `/`
+	// (the default view) with its assets under `/host/*`. nil-equivalent never:
+	// NewServer always materializes it from hostDistFS. The single-server SPA
+	// (staticFS) is served at `/app`.
+	hostFS     fs.FS
+	hostStatic http.Handler
+	// hostShellAtRoot is the fold switch: true (production default) → the host
+	// shell is served at `/` (the default view) and the single-server SPA at
+	// `/app`; false (test-only, set by the fixture server) → the single-server
+	// SPA owns `/` (legacy pre-fold behavior) so the web e2e lane, which targets
+	// the single-server SPA at `/`, is unchanged by the fold. This is a TEST
+	// SEAM, not an operator flag: production (local-server / client-daemon) never
+	// toggles it. The host-web real-embed e2e uses the real binary, so it always
+	// runs with the host at `/` (production posture).
+	hostShellAtRoot bool
+	renderer        *render.Renderer
 
 	// Multi-project: one aggregator per directory, created lazily. "" → agg.
 	opencodeURL string
@@ -67,6 +91,12 @@ type Server struct {
 	// repeats on the same path.
 	staticPathsOnce sync.Once
 	staticPaths     map[string]bool
+
+	// hostStaticPaths is the analogue of staticPaths for the HOST shell embed
+	// (hostFS). Used by the `/host/*` asset probe so a host-asset request is a
+	// cheap map lookup. Built lazily on first knownHostStatic call.
+	hostStaticPathsOnce sync.Once
+	hostStaticPaths     map[string]bool
 
 	quotaMu    sync.Mutex
 	quotaCache *quota.Report
@@ -309,6 +339,15 @@ func (s *Server) SetCORSOrigins(origins []string) { s.corsOrigins = origins }
 // same-origin iframes (e.g. the code viewer) must keep working.
 func (s *Server) SetFrameAncestors(origins []string) { s.frameAncestors = origins }
 
+// SetHostShellAtRoot controls whether the multi-server HOST shell is served at
+// `/` (true, the production default) or whether the single-server SPA owns `/`
+// (false, legacy pre-fold behavior). TEST SEAM for the fixture server: the web
+// e2e lane targets the single-server SPA at `/`, so the fixture server sets this
+// false to stay unchanged by the fold. Production never toggles it. When false,
+// `/app` still serves the single-server SPA (direct access) and `/host/*` falls
+// through to the single-server (the host shell is effectively unmounted).
+func (s *Server) SetHostShellAtRoot(enabled bool) { s.hostShellAtRoot = enabled }
+
 // SetAppVersion records this vh-solara build's version for GET /vh/version.
 func (s *Server) SetAppVersion(v string) { s.appVersion = v }
 
@@ -399,6 +438,14 @@ func NewServer(agg *aggregator.Aggregator, opencodeURL string, ringCapacity int)
 		bgCancel()
 		return nil, err
 	}
+	// Materialize the HOST shell embed (host-dist) the same way as the
+	// single-server SPA (dist). The tracked placeholder.html keeps a cold
+	// build serving a real page. Served at `/` (default view) + `/host/*`.
+	hostSub, err := fs.Sub(hostDistFS, "host-dist")
+	if err != nil {
+		bgCancel()
+		return nil, err
+	}
 	// Worker-wide pinned-sessions store (Phase 2). Constructed ONCE at server
 	// startup — never per-request — grounded at stateBaseDir()/"pins.json"
 	// (same worker-wide flat dir notes.go uses; no worker-id subpath). A
@@ -426,29 +473,35 @@ func NewServer(agg *aggregator.Aggregator, opencodeURL string, ringCapacity int)
 		return nil, fmt.Errorf("labels: per-project migration: %w", err)
 	}
 	srv := &Server{
-		agg:           agg,
-		proxy:         rp,
-		staticFS:      sub,
-		renderer:      render.New(),
-		static:        http.FileServer(http.FS(sub)),
-		opencodeURL:   opencodeURL,
-		ringCap:       ringCapacity,
-		aggs:          map[string]*aggregator.Aggregator{"": agg},
-		idem:          newIdemCache(10 * time.Minute),
-		features:      defaultFeatures(),
-		views:         newViewRegistry(),
-		queues:        newQueueRegistry(),
-		pins:          pinStore,
-		labelsReg:     newLabelRegistry(),
-		failFast:      map[string]struct{}{},
-		watcherOn:     map[string]bool{},
-		watcherCancel: map[string]context.CancelFunc{},
-		queueGCOn:     map[string]bool{},
-		pinsGCOn:      map[string]bool{},
-		labelsGCOn:    map[string]bool{},
-		bgCtx:         bgCtx,
-		bgCancel:      bgCancel,
-		reassertDelay: defaultReassertDelay,
+		agg:        agg,
+		proxy:      rp,
+		staticFS:   sub,
+		renderer:   render.New(),
+		static:     http.FileServer(http.FS(sub)),
+		hostFS:     hostSub,
+		hostStatic: http.FileServer(http.FS(hostSub)),
+		// Production default: the host shell is the default view at `/`. The
+		// fixture server (web e2e lane) calls SetHostShellAtRoot(false) to keep
+		// the single-server SPA at `/` (legacy, so the web e2e is unchanged).
+		hostShellAtRoot: true,
+		opencodeURL:     opencodeURL,
+		ringCap:         ringCapacity,
+		aggs:            map[string]*aggregator.Aggregator{"": agg},
+		idem:            newIdemCache(10 * time.Minute),
+		features:        defaultFeatures(),
+		views:           newViewRegistry(),
+		queues:          newQueueRegistry(),
+		pins:            pinStore,
+		labelsReg:       newLabelRegistry(),
+		failFast:        map[string]struct{}{},
+		watcherOn:       map[string]bool{},
+		watcherCancel:   map[string]context.CancelFunc{},
+		queueGCOn:       map[string]bool{},
+		pinsGCOn:        map[string]bool{},
+		labelsGCOn:      map[string]bool{},
+		bgCtx:           bgCtx,
+		bgCancel:        bgCancel,
+		reassertDelay:   defaultReassertDelay,
 	}
 	// Arm the DEFAULT aggregator synchronously, BEFORE the server can serve
 	// any HTTP request. The default aggregator is created in the daemon
@@ -1584,6 +1637,43 @@ var cspDirectives = []string{
 	"base-uri 'self'",
 }
 
+// hostCSPDirectives are the CSP directives for the HOST shell routes (`/` and
+// `/host/*`). They are cspDirectives PLUS `frame-src http: https:`, which the
+// host needs because its whole purpose is to embed operator-chosen servers as
+// (possibly cross-origin) <iframe>s. Without an explicit frame-src the
+// single-server SPA's default-src 'self' applies (frame-src falls back to it),
+// which would BLOCK cross-origin remote-server embeds — defeating the host's
+// multi-server role. The added frame-src is the ONLY difference from
+// cspDirectives; every other directive is identical so the host inherits the
+// same exfiltration/XSS posture (no external connect/img/script origins).
+//
+// This is frame-SRC (what WE frame), NOT frame-ANCESTORS (who frames us). The
+// frame-ancestors default ('self') is UNCHANGED and is appended per-server below
+// for BOTH policies — so the host page at `/` is still NOT embeddable
+// cross-origin unless an operator passes --frame-ancestors (unchanged behavior).
+var hostCSPDirectives = []string{
+	"default-src 'self'",
+	"script-src 'self' 'unsafe-inline' 'unsafe-eval'",
+	"style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+	"font-src 'self' https://fonts.gstatic.com data:",
+	"img-src 'self' data: blob:",
+	"connect-src 'self'",
+	"worker-src 'self'",
+	"manifest-src 'self'",
+	"object-src 'none'",
+	"base-uri 'self'",
+	"frame-src http: https:",
+}
+
+// isHostRoute reports whether path is served by the HOST shell (`/` and the
+// host's namespaced `/host/*` assets). Used to select the host CSP (which adds
+// frame-src so the host can embed operator-chosen servers). Every other path —
+// the single-server SPA at `/app`, its root-level assets, and the daemon routes
+// `/vh/*`, `/oc/*` — keeps the strict single-server CSP (cspDirectives).
+func isHostRoute(path string) bool {
+	return path == "/" || strings.HasPrefix(path, "/host/")
+}
+
 // frameAncestorsDirective returns the CSP frame-ancestors directive for this
 // server.
 //
@@ -1606,11 +1696,19 @@ func (s *Server) frameAncestorsDirective() string {
 	return "frame-ancestors " + strings.Join(s.frameAncestors, " ")
 }
 
-// contentSecurityPolicy returns the full CSP for this server (the static
-// directives plus the per-server frame-ancestors directive).
-func (s *Server) contentSecurityPolicy() string {
-	dirs := make([]string, 0, len(cspDirectives)+1)
-	dirs = append(dirs, cspDirectives...)
+// contentSecurityPolicyForPath returns the full CSP for this server on the given
+// path: the HOST directives (with frame-src) for host routes, the single-server
+// directives otherwise; both plus the per-server frame-ancestors directive.
+// Host-route selection is gated on hostShellAtRoot: in legacy/test mode (fixture
+// server, hostShellAtRoot=false) `/` is the single-server SPA, so it gets the
+// single-server CSP (no frame-src).
+func (s *Server) contentSecurityPolicyForPath(path string) string {
+	dirs := make([]string, 0, len(cspDirectives)+2)
+	if s.hostShellAtRoot && isHostRoute(path) {
+		dirs = append(dirs, hostCSPDirectives...)
+	} else {
+		dirs = append(dirs, cspDirectives...)
+	}
 	dirs = append(dirs, s.frameAncestorsDirective())
 	return strings.Join(dirs, "; ")
 }
@@ -1629,7 +1727,11 @@ func (s *Server) contentSecurityPolicy() string {
 func (s *Server) securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()
-		h.Set("Content-Security-Policy", s.contentSecurityPolicy())
+		// Path-aware CSP: host shell routes (`/`, `/host/*`) get the host policy
+		// (adds frame-src so the host can embed operator-chosen servers); every
+		// other path keeps the strict single-server policy. frame-ancestors is
+		// appended identically for both (unchanged default 'self').
+		h.Set("Content-Security-Policy", s.contentSecurityPolicyForPath(r.URL.Path))
 		h.Set("X-Content-Type-Options", "nosniff")
 		if len(s.frameAncestors) == 0 {
 			h.Set("X-Frame-Options", "SAMEORIGIN")
@@ -2689,10 +2791,11 @@ func (s *Server) handlePassthrough(w http.ResponseWriter, r *http.Request) {
 	s.proxy.ServeHTTP(w, r)
 }
 
-// knownStatic reports whether p is a real embedded static file path. It builds
-// the path set lazily on first use (walking the immutable embed FS once) so
-// handleStatic's real-asset-vs-SPA-route decision is a map lookup rather than an
-// Open+Close that http.FileServer then repeats on the same path.
+// knownStatic reports whether p is a real embedded static file path in the
+// SINGLE-SERVER SPA embed (dist). It builds the path set lazily on first use
+// (walking the immutable embed FS once) so handleStatic's real-asset-vs-route
+// decision is a map lookup rather than an Open+Close that http.FileServer then
+// repeats on the same path.
 func (s *Server) knownStatic(p string) bool {
 	s.staticPathsOnce.Do(func() {
 		s.staticPaths = map[string]bool{}
@@ -2707,29 +2810,123 @@ func (s *Server) knownStatic(p string) bool {
 	return s.staticPaths[p]
 }
 
-// handleStatic serves embedded static files. Real assets (hashed bundles,
-// sw.js, manifest, icons) are served by http.FileServer. For the root path and
-// unknown client routes (SPA history fallback) it serves embedded index.html
-// when a real SPA build is materialized, otherwise the self-contained
-// placeholder.html—​the only tracked file under dist/—​so a cold
-// `go build`/`go test` with no frontend build serves a banner page instead of a
-// directory listing. This explicitly does NOT rely on http.FileServer's
-// directory-index/listing semantics, which would list the directory when
-// index.html is absent.
+// knownHostStatic is the analogue of knownStatic for the HOST shell embed
+// (host-dist). p is a host-internal path (NO leading slash, relative to the
+// host FS root). Built lazily on first use.
+func (s *Server) knownHostStatic(p string) bool {
+	s.hostStaticPathsOnce.Do(func() {
+		s.hostStaticPaths = map[string]bool{}
+		_ = fs.WalkDir(s.hostFS, ".", func(path string, d fs.DirEntry, err error) error {
+			if err != nil || d.IsDir() {
+				return nil
+			}
+			s.hostStaticPaths[path] = true
+			return nil
+		})
+	})
+	return s.hostStaticPaths[p]
+}
+
+// handleStatic serves the TWO embedded SPAs plus their static files:
+//
+//   - `/` and any unknown root path → the HOST shell (the default view). The host
+//     is served at `/` so a solo operator who opens the binary immediately sees
+//     the multi-server shell (which self-seeds the local server at `/app`).
+//   - `/app` and `/app/*` → the SINGLE-SERVER SPA. Kept for direct access AND so
+//     the host can embed the local server same-origin (the local self-seed points
+//     its iframes at `/app`). The single-server SPA's own assets are root-level
+//     (`/assets/`, `/sw.js`, `/manifest.webmanifest`, icons) — served below.
+//   - `/host/*` → the host shell's namespaced assets (the folded host-web build
+//     uses base `/host/` so its assets never collide with the single-server's
+//     root-level `/assets/`).
+//   - any other path that is a real single-server static file (`/assets/...`,
+//     `/sw.js`, `/manifest.webmanifest`, `/icon.svg`, ...) → served from the
+//     single-server dist FS.
+//
+// Both index pages prefer a real SPA shell (index.html, present only after an
+// embed-producing target materialized a build) and fall back to the tracked
+// placeholder.html so a cold `go build`/`go test` with NO frontend build serves a
+// banner page instead of a directory listing. This does NOT rely on
+// http.FileServer's directory-index/listing semantics (which would list the
+// directory when index.html is absent).
+//
+// PWA/identity note: `/` is now the HOST (its title is "VHSolara · Host"); the
+// single-server PWA identity moves to `/app`. The single-server service worker
+// (`/sw.js`, scope `/`) is unchanged — see pkg/web/server.go CSP notes for the
+// offline cache-pollution caveat documented in the fold closeout.
 func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
-	p := strings.TrimPrefix(r.URL.Path, "/")
-	// Serve an existing embedded static file directly (real assets, sw.js,
-	// manifest, icons, etc.). knownStatic is a lazy map lookup over the embed
-	// FS so this does not Open+Close a file that http.FileServer re-opens below.
-	if p != "" && s.knownStatic(p) {
+	path := r.URL.Path
+
+	// Host shell's namespaced assets: `/host/<sub>` → host FS at <sub>. Only
+	// mounted when the host shell is at root (production); in legacy/test mode
+	// (hostShellAtRoot=false) `/host/*` falls through to the single-server.
+	if s.hostShellAtRoot && strings.HasPrefix(path, "/host/") {
+		sub := strings.TrimPrefix(path, "/host/")
+		// `/host/` (the directory root) → host index; a known host asset →
+		// served by the host FileServer; an unknown `/host/<x>` → host index
+		// (SPA-history fallback; the host has no client router today, this is
+		// defensive for any future host-side route).
+		if sub == "" || sub == "index.html" {
+			s.serveHostIndex(w, r)
+			return
+		}
+		if s.knownHostStatic(sub) {
+			// Serve from the host FS at the stripped path. The host FileServer
+			// was built over hostFS (rooted at "."), so rewrite r.URL.Path to
+			// the stripped sub-path before delegating.
+			r2 := newHTTPRequestPath(r, "/"+sub)
+			s.hostStatic.ServeHTTP(w, r2)
+			return
+		}
+		s.serveHostIndex(w, r)
+		return
+	}
+
+	// Single-server SPA entry: `/app` and any `/app/*` client route.
+	if path == "/app" || strings.HasPrefix(path, "/app/") {
+		s.serveAppIndex(w, r)
+		return
+	}
+
+	// A real single-server static file at the root (`/assets/...`, `/sw.js`,
+	// `/manifest.webmanifest`, `/icon.svg`, ...): serve it from the dist FS.
+	if p := strings.TrimPrefix(path, "/"); p != "" && s.knownStatic(p) {
 		s.static.ServeHTTP(w, r)
 		return
 	}
-	// Root or SPA-history fallback: prefer index.html (the real SPA shell,
-	// present only after an embed-producing target materialized a build); fall
-	// back to placeholder.html (the always-tracked cold-build banner). Both are
-	// served as text/html directly from the embed FS so the fallback does not
-	// depend on FileServer resolving a directory index.
+
+	// `/` and any other unknown path:
+	//   - production (hostShellAtRoot=true) → the HOST shell (the default view);
+	//   - legacy/test (hostShellAtRoot=false) → the SINGLE-SERVER SPA (pre-fold).
+	if s.hostShellAtRoot {
+		s.serveHostIndex(w, r)
+		return
+	}
+	s.serveAppIndex(w, r)
+}
+
+// serveHostIndex serves the HOST shell's index page: prefer a real host build
+// (index.html, present after an embed-producing target materialized the host-web
+// build), else the tracked placeholder.html cold-build banner. Both are served
+// as text/html directly from the host embed FS.
+func (s *Server) serveHostIndex(w http.ResponseWriter, r *http.Request) {
+	if data, err := fs.ReadFile(s.hostFS, "index.html"); err == nil {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write(data)
+		return
+	}
+	if data, err := fs.ReadFile(s.hostFS, "placeholder.html"); err == nil {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write(data)
+		return
+	}
+	http.NotFound(w, r)
+}
+
+// serveAppIndex serves the SINGLE-SERVER SPA's index page: prefer a real SPA
+// build (index.html), else the tracked placeholder.html cold-build banner. Both
+// are served as text/html directly from the single-server embed FS.
+func (s *Server) serveAppIndex(w http.ResponseWriter, r *http.Request) {
 	if data, err := fs.ReadFile(s.staticFS, "index.html"); err == nil {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = w.Write(data)
@@ -2741,4 +2938,15 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.NotFound(w, r)
+}
+
+// newHTTPRequestPath clones r with the URL path rewritten to p (preserving
+// RawQuery and the rest). Used so a delegated http.FileServer sees the
+// prefix-stripped path it expects without mutating the caller's *http.Request.
+func newHTTPRequestPath(r *http.Request, p string) *http.Request {
+	r2 := r.Clone(r.Context())
+	r2.URL = new(url.URL)
+	*r2.URL = *r.URL
+	r2.URL.Path = p
+	return r2
 }

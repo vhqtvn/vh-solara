@@ -58,6 +58,11 @@ web/playwright-report/
 web/dist-build/
 pkg/web/dist/*
 !pkg/web/dist/placeholder.html
+# Host shell embed (mirror of pkg/web/dist): generated index.html + assets are
+# gitignored; only the tracked placeholder.html (cold-build fallback) is kept.
+host-web/dist/
+pkg/web/host-dist/*
+!pkg/web/host-dist/placeholder.html
 
 # Agent-local tooling / config.
 .claude/

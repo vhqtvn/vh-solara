@@ -160,14 +160,21 @@ export function hasRealFleetEnv(): boolean {
 
 /**
  * Resolve the BASE fleet: REAL servers from VITE_SERVERS when valid+non-empty;
- * else the mock fleet (DEFAULT). This is the build-time-baked, session-stable
- * tier — it does NOT consult the runtime catalog (that tier lives in
- * resolveFleet() below). Memoized (cached) so the VITE_SERVERS parse runs once.
+ * else the folded-or-mock default (DEFAULT). This is the build-time-baked,
+ * session-stable tier — it does NOT consult the runtime catalog (that tier lives
+ * in resolveFleet() below). Memoized (cached) so the VITE_SERVERS parse runs once.
  *
  * Exported because layout persistence's restore-validation uses it to build the
  * origin allowlist INDEPENDENTLY of the runtime catalog: layout restore must
  * stay anchored to the build-time VITE_SERVERS config (the runtime server list
  * is ORTHOGONAL to layout restore — it must not gate which panes restore).
+ *
+ * FOLDED default: in the PRODUCTION folded build (host shell embedded in the
+ * vh-solara binary, gated by the VITE_HOST_FOLDED build-time flag), the fallback
+ * is ONE pane pointing at the local server's same-origin /app — so a solo
+ * operator running one binary immediately sees their local server. In every
+ * other build (dev, preview, the e2e lanes) the flag is unset and the fallback
+ * is the MOCK fleet, preserving the survival/heartbeat/fleet gates unchanged.
  */
 let baseFleetCache: FleetEntry[] | null = null;
 export function resolveBaseFleet(): FleetEntry[] {
@@ -181,9 +188,50 @@ export function resolveBaseFleet(): FleetEntry[] {
       fleet = []; // fall back to mock
     }
   }
-  if (fleet.length === 0) fleet = mockFleet();
+  if (fleet.length === 0) fleet = foldedOrDefaultFleet();
   baseFleetCache = fleet;
   return fleet;
+}
+
+/**
+ * The default fleet when no real fleet is configured (no VITE_SERVERS, no runtime
+ * catalog at the resolveBaseFleet tier). In the PRODUCTION folded build this self-
+ * seeds the local server; otherwise it returns the mock fleet. Never throws.
+ */
+function foldedOrDefaultFleet(): FleetEntry[] {
+  if (isFoldedApp()) return [localAppEntry()];
+  return mockFleet();
+}
+
+/**
+ * True ONLY for the PRODUCTION folded host-web build (VITE_HOST_FOLDED=1 at build
+ * time). Vite statically replaces `import.meta.env.VITE_HOST_FOLDED` with the
+ * literal "1" in the folded build and with undefined in every other build (dev,
+ * preview, the e2e lanes), so this is a build-time constant. The folded build is
+ * the one materialized into pkg/web/host-dist and embedded in the Go binary.
+ */
+function isFoldedApp(): boolean {
+  return import.meta.env.VITE_HOST_FOLDED === "1";
+}
+
+/**
+ * The local-server self-seed entry for the folded default. The url is the
+ * same-origin `/app` (absolute, built at runtime from window.location.origin so
+ * it is correct regardless of how the binary is exposed — localhost, a domain,
+ * behind a proxy). Same-origin `/app` carries the host-scoped SameSite=Lax cookie
+ * for free and is always allowed by the default frame-ancestors 'self' (no CSP
+ * frame-ancestors change needed for the same-origin embed). The label uses the
+ * server hostname when available, else "this server".
+ */
+function localAppEntry(): FleetEntry {
+  const origin =
+    typeof window !== "undefined" && window.location ? window.location.origin : "";
+  const host =
+    typeof window !== "undefined" && window.location ? window.location.hostname : "";
+  return {
+    url: origin + "/app",
+    label: host || "this server",
+  };
 }
 
 /**
@@ -192,27 +240,46 @@ export function resolveBaseFleet(): FleetEntry[] {
  *   1. RUNTIME catalog (operator-added servers, persisted in localStorage) —
  *      when non-empty, it shadows the build-time tiers entirely.
  *   2. VITE_SERVERS (build-time config) — when valid + non-empty.
- *   3. mock fleet (DEFAULT — keeps the survival gate green on a fresh context).
+ *   3. folded-or-mock default (DEFAULT — folded: local server at /app; else the
+ *      mock fleet that keeps the survival gate green on a fresh context).
  *
  * Reactive: reads the runtimeServers() SolidJS signal, so a call inside a
  * tracking scope (e.g. the Statusbar) re-resolves when the catalog changes. The
- * base tier (VITE_SERVERS → mock) stays memoized via resolveBaseFleet().
+ * base tier (VITE_SERVERS → folded/mock) stays memoized via resolveBaseFleet().
+ *
+ * FOLDED local-always: in the PRODUCTION folded build the local server (the
+ * binary itself) is ALWAYS present alongside any operator-added remote servers —
+ * it is prepended to the runtime catalog unless the operator already added it
+ * (deduped by url). This realizes the mission intent: a solo operator sees their
+ * local server in a pane AND can add more servers at runtime without the local
+ * one disappearing. In every other build isFoldedApp() is false → no prepend →
+ * the runtime catalog is returned verbatim (unchanged behavior).
  *
  * Survival-gate safety: a fresh Playwright context has empty localStorage →
- * runtime catalog is empty → resolveFleet() falls through to the mock fleet, so
+ * runtime catalog is empty → resolveFleet() falls through to the base tier, so
  * the survival/shell gates are unaffected (verified separately). The fleet-e2e
  * lane likewise starts on a fresh context → VITE_SERVERS still wins there.
  */
 export function resolveFleet(): FleetEntry[] {
   const runtime = runtimeServers();
-  if (runtime.length > 0) return runtime; // runtime catalog wins
+  if (runtime.length > 0) {
+    if (isFoldedApp()) {
+      const local = localAppEntry();
+      if (!runtime.some((e) => e.url === local.url)) {
+        return [local, ...runtime];
+      }
+    }
+    return runtime; // runtime catalog wins
+  }
   return resolveBaseFleet();
 }
 
 /**
  * Whether the session is in real (non-mock) fleet mode: TRUE when the operator
- * has added runtime servers OR VITE_SERVERS is configured. Used by the "+"/split
- * path to decide whether to clone a focused pane (real) or cycle a mock pane.
+ * has added runtime servers OR VITE_SERVERS is configured OR this is the folded
+ * production build (whose default seed is the real local server, not a mock).
+ * Used by the "+"/split path to decide whether to clone a focused pane (real) or
+ * cycle a mock pane.
  *
  * NOTE: layout persistence deliberately uses hasRealFleetEnv() (build-time only)
  * for its restore-validation gate, NOT isRealFleet(), so the runtime catalog
@@ -220,5 +287,5 @@ export function resolveFleet(): FleetEntry[] {
  * (catalog vs. layout) are intentionally independent.
  */
 export function isRealFleet(): boolean {
-  return hasRealFleetEnv() || runtimeServers().length > 0;
+  return hasRealFleetEnv() || runtimeServers().length > 0 || isFoldedApp();
 }
