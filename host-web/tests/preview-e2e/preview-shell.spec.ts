@@ -32,15 +32,19 @@ test.describe("host shell — production build (vite preview)", () => {
     await waitForHostReady(page);
   });
 
-  test("production build has NO window.__host", async ({ page }) => {
+  test("production build has NO window.__host (and no keyboard-focus DEV bridge)", async ({ page }) => {
     // The DEV-only test bridge (and its destructive hooks) must be entirely
     // absent from the running production app. This is the runtime twin of the
     // dist/ grep proof.
     const hasBridge = await page.evaluate(() => {
-      const w = window as unknown as { __host?: unknown };
-      return typeof w.__host !== "undefined";
+      const w = window as unknown as { __host?: unknown; __hostKbdFocus?: unknown };
+      return {
+        host: typeof w.__host !== "undefined",
+        kbdFocus: typeof w.__hostKbdFocus !== "undefined",
+      };
     });
-    expect(hasBridge, "window.__host must be absent in production").toBe(false);
+    expect(hasBridge.host, "window.__host must be absent in production").toBe(false);
+    expect(hasBridge.kbdFocus, "window.__hostKbdFocus must be absent in production").toBe(false);
   });
 
   test("'+' adds a workspace — shell addWorkspace via HostOps (not the bridge)", async ({ page }) => {

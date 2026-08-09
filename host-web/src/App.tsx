@@ -1,4 +1,4 @@
-import { For, Show } from "solid-js";
+import { For, Show, createEffect, onCleanup, onMount } from "solid-js";
 import { DockviewHost } from "./dockview/DockviewHost";
 import { Tabstrip } from "./shell/Tabstrip";
 import { Statusbar } from "./shell/Statusbar";
@@ -10,6 +10,11 @@ import {
   workspaces,
 } from "./dockview/store";
 import { AddServer } from "./shell/AddServer";
+import {
+  installKeyboardFocus,
+  onWorkspaceActivated,
+  uninstallKeyboardFocus,
+} from "./keyboardFocus";
 import s from "./App.module.css";
 
 /**
@@ -35,6 +40,10 @@ import s from "./App.module.css";
  * the DEV-only window.__host test bridge — so this shell works in production.
  */
 export function App() {
+  // Ref to the host root (`.app`). Keyboard focus-mode overrides its inline
+  // height on keyboard-open so the focused pane's iframe element shrinks to the
+  // visible area (the host owns keyboard behavior — see keyboardFocus.ts).
+  let appRoot!: HTMLDivElement;
   const trayPanes = () => {
     const ids = trayIds();
     return panes().filter((p) => ids.includes(p.id));
@@ -43,8 +52,28 @@ export function App() {
   // show a centered Add-Server affordance instead of a blank grid.
   const activeEmpty = () => panes().length === 0;
 
+  // Install keyboard focus-mode once the root element exists. The module
+  // self-gates on touch-capability (no-op on desktop) and on a browser
+  // visualViewport. onMount runs after the root div is mounted, so appRoot is
+  // bound by the time the accessor fires.
+  onMount(() => {
+    installKeyboardFocus(() => appRoot);
+  });
+  onCleanup(() => {
+    uninstallKeyboardFocus();
+  });
+
+  // While the keyboard is open and the operator switches workspace, re-point
+  // focus-mode at the newly-active workspace's focused pane (exit the old
+  // owned maximize, maximize the new one). No-op when the keyboard is closed.
+  createEffect(() => {
+    // track the active workspace signal so this fires on a switch.
+    void activeWorkspaceId();
+    onWorkspaceActivated();
+  });
+
   return (
-    <div class={s.app}>
+    <div class={s.app} ref={appRoot} data-testid="host-app-root">
       <Tabstrip />
       <main class={s.main}>
         {/* The overlay stack: one permanently-mounted host per workspace.

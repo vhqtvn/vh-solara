@@ -415,6 +415,79 @@ export async function jsonReswap(page: Page): Promise<void> {
   });
 }
 
+// ---- keyboard focus-mode bridge (window.__hostKbdFocus, DEV-only) ----------
+// Drives the host-owned keyboard focus-mode (host-web/src/keyboardFocus.ts)
+// programmatically for deterministic headless e2e. The real soft-keyboard
+// OUTCOME is not-demonstrable headlessly; these hooks prove the MECHANISM.
+
+export interface KbdFocusState {
+  open: boolean;
+  ownedWs: string | null;
+}
+
+/** Read the focus-mode state (open + owned workspace). */
+export async function kbdFocusState(page: Page): Promise<KbdFocusState> {
+  return page.evaluate(() => {
+    const b = (window as unknown as { __hostKbdFocus?: { isOpen(): boolean; ownedWs(): string | null } }).__hostKbdFocus;
+    return {
+      open: b ? b.isOpen() : false,
+      ownedWs: b ? b.ownedWs() : null,
+    };
+  });
+}
+
+/** Simulate keyboard-open at a given visible height (px). Bypasses the gate +
+ *  heuristic so the mechanism is provable headlessly. Idempotent. */
+export async function kbdFocusOpen(page: Page, visibleHeight: number): Promise<void> {
+  await page.evaluate((h) => {
+    const b = (window as unknown as { __hostKbdFocus?: { open(h: number): void } }).__hostKbdFocus;
+    b?.open(h);
+  }, visibleHeight);
+}
+
+/** Simulate keyboard-close. Restores the root + exits the owned maximize. */
+export async function kbdFocusClose(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    const b = (window as unknown as { __hostKbdFocus?: { close(): void } }).__hostKbdFocus;
+    b?.close();
+  });
+}
+
+/** Force the REAL detection path (heuristic + debounce) to run now. Used by the
+ *  e2e to prove the listener fires open/close after a visualViewport change. */
+export async function kbdFocusFlushDetection(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    const b = (window as unknown as { __hostKbdFocus?: { flushDetection(): void } }).__hostKbdFocus;
+    b?.flushDetection();
+  });
+}
+
+/** The focused pane's iframe element bounding box (null when none). */
+export async function focusedIframeBox(
+  page: Page,
+): Promise<{ x: number; y: number; width: number; height: number } | null> {
+  return page.evaluate(async () => {
+    const h = (window as unknown as {
+      __host?: { focused(): string | null; getIframe(i: string): HTMLIFrameElement | null };
+    }).__host;
+    if (!h) return null;
+    const id = h.focused();
+    if (!id) return null;
+    const f = h.getIframe(id);
+    if (!f) return null;
+    const r = f.getBoundingClientRect();
+    return { x: r.x, y: r.y, width: r.width, height: r.height };
+  });
+}
+
+/** The host root (`.app`) client height — what keyboard focus-mode overrides. */
+export async function appRootHeight(page: Page): Promise<number> {
+  return page.evaluate(() => {
+    const el = document.querySelector('[data-testid="host-app-root"]') as HTMLElement | null;
+    return el ? el.clientHeight : 0;
+  });
+}
+
 // ---- waiting helpers -------------------------------------------------------
 
 /** Wait until the pane has heartbeated AND its WS echo connection is up. */
