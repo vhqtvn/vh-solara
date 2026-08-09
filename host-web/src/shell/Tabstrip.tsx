@@ -1,17 +1,24 @@
 import { For, Show } from "solid-js";
-import { focusedId, hostOps, panes, trayIds } from "../dockview/store";
+import {
+  activeWorkspaceId,
+  addWorkspace,
+  setActiveWorkspace,
+  trayIds,
+  workspaces,
+} from "../dockview/store";
 import { AddServer } from "./AddServer";
 import s from "./Tabstrip.module.css";
 
 /**
- * Top workspace tabstrip: brand + one tab per open pane + "+". Clicking a tab
- * focuses that pane — a survival-safe "switch tab" (just setActive, no layout
- * disposal). The "+" splits a new pane off the focused one: in MOCK mode it
- * cycles the next mock (server, view); in REAL-fleet mode (VITE_SERVERS) it
- * clones the focused pane's {url,label} (another view of the same server).
- * Layout ops go through the typed HostOps controller surface (store.hostOps),
- * not the DEV-only window.__host test bridge, so this shell works in production
- * builds.
+ * Top WORKSPACE tabstrip: brand + one tab per workspace + "+". Clicking a tab
+ * switches the active workspace — a SURVIVAL-SAFE CSS-visibility-only switch
+ * (App.tsx's overlay stack; no host is disposed, no iframe reloads). The "+"
+ * creates a new empty workspace. Within the active workspace, panes are
+ * represented by their own custom headers (iframeRenderer's per-pane header
+ * with split/collapse/zoom/close), so the top bar no longer carries a per-pane
+ * strip. Layout ops go through the typed HostOps controller surface
+ * (store.hostOps), not the DEV-only window.__host test bridge, so this shell
+ * works in production builds.
  */
 export function Tabstrip() {
   return (
@@ -22,17 +29,17 @@ export function Tabstrip() {
         <span class={s.brandSub}>host</span>
       </div>
       <div class={s.tabs}>
-        <For each={panes()}>
-          {(p) => (
+        <For each={workspaces()}>
+          {(ws) => (
             <button
               type="button"
-              class={`${s.tab} ${focusedId() === p.id ? s.tabActive : ""}`}
-              title={p.title}
+              class={`${s.tab} ${activeWorkspaceId() === ws.id ? s.tabActive : ""}`}
+              title={ws.name}
               data-testid="ws-tab"
-              data-pane={p.id}
-              onClick={() => hostOps()?.focusPane?.(p.id)}
+              data-workspace={ws.id}
+              onClick={() => setActiveWorkspace(ws.id)}
             >
-              <span class={s.tabLabel}>{p.label}</span>
+              <span class={s.tabLabel}>{ws.name}</span>
             </button>
           )}
         </For>
@@ -40,18 +47,15 @@ export function Tabstrip() {
       <button
         type="button"
         class={s.plus}
-        title="Add pane (split focused)"
+        title="Add workspace"
         data-testid="ws-add"
-        onClick={() => {
-          const id = focusedId();
-          if (id) hostOps()?.split?.(id, "right");
-        }}
+        onClick={() => addWorkspace()}
       >
         +
       </button>
       <AddServer />
       <Show when={trayIds().length > 0}>
-        <span class={s.trayBadge} title="Collapsed panes">
+        <span class={s.trayBadge} title="Collapsed panes (active workspace)">
           tray: {trayIds().length}
         </span>
       </Show>

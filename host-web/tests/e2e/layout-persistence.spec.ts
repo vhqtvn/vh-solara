@@ -2,29 +2,47 @@ import { test, expect } from "@playwright/test";
 import * as H from "./util";
 
 // =============================================================================
-// Layout-persistence regression gate — proves the Dockview tiling round-trips
-// through a page reload AND that a poisoned saved layout is rejected.
+// Layout-persistence regression gate (multi-workspace v2 schema) — proves the
+// Dockview tiling round-trips through a page reload AND that a poisoned saved
+// layout is rejected.
 //
 // Mechanism under test (src/dockview/layoutPersistence.ts):
-//   SAVE   — debounced api.toJSON() → localStorage["vh-host:layout:v1"], hooked
-//            on Dockview's onDidLayoutChange (runtime ops mutate the live tree;
-//            the save only serializes the result).
-//   RESTORE — cold init reads localStorage, VALIDATES every pane url through the
-//            SAME isFleetEntry http/https guard the fleet resolver uses, REPAIRS
-//            (drops invalid panes from the tree), and calls api.fromJSON() exactly
-//            ONCE (COLD ONLY — it reloads every iframe; runtime never calls it).
+//   SAVE   — debounced, serializes EVERY workspace's api.toJSON() into the v2
+//            blob localStorage["vh-host:layout:v2"] =
+//              { activeWorkspaceId, workspaces: [{id, name, layout}] }, hooked
+//            on any workspace's onDidLayoutChange + workspace add/close/switch.
+//   RESTORE — cold init reads the v2 blob, validates every workspace's every
+//            pane url through the SAME isFleetEntry http/https guard the fleet
+//            resolver uses, REPAIRS (drops invalid panes per workspace), and
+//            calls api.fromJSON() exactly ONCE PER WORKSPACE (COLD ONLY — it
+//            reloads every iframe in that workspace; runtime never calls it).
 //
 // PRECEDENCE under test: saved-layout-wins-with-validation; fleet/mock seed is
-// the fallback when no valid saved layout exists.
+// the fallback for the default workspace when no valid blob exists.
 //
 // Playwright gives each test() a fresh browser context, so localStorage is EMPTY
-// at the start of every test unless a test explicitly pre-seeds it (via
-// addInitScript). The survival/shell gates therefore see no saved layout and cold
-// restore falls back to seed — they are unaffected (verified separately).
+// at the start of every test unless a test explicitly pre-seeds it. The
+// survival/shell gates therefore see no blob and cold restore falls back to
+// seed — they are unaffected (verified separately).
 //
 // Runs on Chromium AND Firefox (webkit is launch-blocked locally; see the default
 // lane's project set).
 // =============================================================================
+
+/** Wrap a serialized Dockview layout in the v2 envelope as the default
+ *  workspace (ws-1), so a pre-seeded blob matches what the app cold-restores.
+ *  The default workspace id on a fresh context is "ws-1" (nextWsId starts at 1).
+ *  This keeps the poison test's blob otherwise structurally valid so the restore
+ *  rejects it for the POISON, not a shape defect. */
+function wrapV2(layout: Record<string, unknown>): {
+  activeWorkspaceId: string;
+  workspaces: Array<{ id: string; name: string; layout: Record<string, unknown> }>;
+} {
+  return {
+    activeWorkspaceId: "ws-1",
+    workspaces: [{ id: "ws-1", name: "Workspace 1", layout }],
+  };
+}
 
 test.describe("layout persistence", () => {
   test("saved layout round-trips through reload (panes restored with same urls/labels)", async ({
@@ -48,9 +66,9 @@ test.describe("layout persistence", () => {
     // Flush the debounced save to localStorage before reloading.
     await H.waitForSavedLayout(page, expected.length);
 
-    // Reload → cold restore reads localStorage (fromJSON, exactly once). The
-    // restored iframes are FRESH (fromJSON recreates them) — that is allowed here
-    // because this is cold init, before any iframe had a live identity.
+    // Reload → cold restore reads localStorage (fromJSON, exactly once per ws).
+    // The restored iframes are FRESH (fromJSON recreates them) — that is allowed
+    // here because this is cold init, before any iframe had a live identity.
     await page.reload();
     await expect.poll(async () => H.connected(page), { timeout: 20000 }).toBe(true);
     await expect
@@ -94,17 +112,18 @@ test.describe("layout persistence", () => {
     const victim = ids[ids.length - 1];
     panels[victim].params = { url: "javascript:alert(document.domain)", label: "evil" };
 
-    // Pre-seed the poisoned layout into the host origin's localStorage (the page
-    // is currently at :5173 from loadHost), then reload so the app's cold
-    // restore reads the poisoned blob. (addInitScript is avoided because it also
-    // runs in every child iframe — the cross-origin mock panes on :5174 — which
-    // is the wrong origin; writing on the live :5173 page then reloading is
-    // unambiguous and scopes to the host origin only.)
+    // Wrap in the v2 envelope (default workspace ws-1) so the app cold-restores
+    // this workspace, then pre-seed it into the host origin's localStorage.
+    // (addInitScript is avoided because it also runs in every child iframe — the
+    // cross-origin mock panes on :5174 — which is the wrong origin; writing on
+    // the live :5173 page then reloading is unambiguous and scopes to the host
+    // origin only.)
+    const payload = wrapV2(state);
     await page.evaluate(
       ({ payload, key }) => {
         localStorage.setItem(key, JSON.stringify(payload));
       },
-      { payload: state, key: H.LAYOUT_STORAGE_KEY },
+      { payload, key: H.LAYOUT_STORAGE_KEY },
     );
 
     // Cold load: the poisoned panel is DROPPED by restore validation; the
@@ -136,4 +155,70 @@ test.describe("layout persistence", () => {
       "restored urls are all http/https",
     ).toBe(true);
   });
+
+  test("the WORKSPACE SET round-trips through reload (all workspaces + layouts + active restored)", async ({
+    page,
+  }) => {
+    // Fresh context → one default workspace (ws-1) seeded with the mock fleet.
+    await H.loadHost(page);
+    const ws1 = await H.activeWorkspace(page);
+    expect(ws1, "default workspace active").toBeTruthy();
+    const ws1PanesBefore = await H.panes(page);
+    expect(ws1PanesBefore.length, "ws1 has seeded panes").toBeGreaterThanOrEqual(2);
+    // Capture ws1's urls BEFORE the reload (ws1 is active here).
+    const ws1ParamsBefore = await H.paneParams(page);
+    const ws1UrlsBefore = new Set(ws1ParamsBefore.map((p) => p.url));
+
+    // Create a second workspace + add a server pane to it.
+    const ws2 = await H.addWorkspace(page);
+    expect(ws2, "ws2 created").toBeTruthy();
+    await expect.poll(async () => H.activeWorkspace(page)).toBe(ws2);
+    const ws2Url = serverUrl("ws-persist");
+    const ws2Pane = await H.addServer(page, ws2Url, "ws-persist");
+    expect(ws2Pane, "server pane opened in ws2").toBeTruthy();
+    const ws2PanesBefore = await H.panes(page);
+    expect(ws2PanesBefore, "ws2 has the added pane").toContain(ws2Pane);
+
+    // Flush the debounced save (both workspaces' layouts + the workspace set).
+    await H.waitForSavedLayout(page, ws1PanesBefore.length + ws2PanesBefore.length);
+
+    // Reload → cold restore reads the v2 blob: BOTH workspaces + their layouts +
+    // the active workspace are restored.
+    await page.reload();
+    await expect.poll(async () => H.connected(page), { timeout: 20000 }).toBe(true);
+
+    // The workspace SET round-tripped: both workspace ids survive.
+    await expect.poll(async () => (await H.workspaces(page)).sort()).toEqual([ws1, ws2].sort());
+    // The active workspace is restored (ws2 was active when we reloaded).
+    await expect.poll(async () => H.activeWorkspace(page)).toBe(ws2);
+    // ws2's pane restored + live.
+    await expect.poll(async () => H.panes(page)).toContain(ws2Pane);
+    for (const id of await H.panes(page)) await H.waitForReady(page, id);
+
+    // Switch to ws1 → its seeded panes restored too (the layout, not the seed,
+    // was persisted — fromJSON recreated them with the same urls/labels).
+    await H.setActiveWorkspace(page, ws1!);
+    await expect.poll(async () => H.activeWorkspace(page)).toBe(ws1);
+    await expect
+      .poll(async () => (await H.panes(page)).length, { timeout: 20000 })
+      .toBe(ws1PanesBefore.length);
+    for (const id of await H.panes(page)) await H.waitForReady(page, id);
+    const ws1Restored = await H.paneParams(page);
+    expect(
+      ws1Restored.length,
+      "ws1 panes restored with the same count",
+    ).toBe(ws1PanesBefore.length);
+    // Every ws1 url survived the round-trip (fromJSON preserves params).
+    for (const r of ws1Restored) {
+      expect(ws1UrlsBefore.has(r.url), `ws1 restored url ${r.url} was seeded before`).toBe(true);
+    }
+  });
 });
+
+/** Build a mock-content server url (matches server-mgmt's helper). */
+function serverUrl(server: string): string {
+  const MOCK_ORIGIN = "http://127.0.0.1:5174";
+  const q = new URLSearchParams({ server, view: "chat" });
+  return `${MOCK_ORIGIN}/?${q.toString()}`;
+}
+

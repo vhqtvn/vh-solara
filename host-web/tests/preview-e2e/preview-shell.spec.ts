@@ -4,13 +4,14 @@ import { test, expect } from "@playwright/test";
 // bundle) via playwright.preview.config.ts. Every assertion here is PURELY DOM
 // — it NEVER touches window.__host (which is correctly absent in a production
 // build). This is what the DEV-only tests/e2e suite CANNOT prove: that the host
-// shell's three layout ops (split / focusPane / restore) still work when the
-// DEV test bridge is eliminated. The pane-header ops already went through the
-// HostOps controller surface; this proves the SHELL ops do too.
+// shell's layout ops still work when the DEV test bridge is eliminated. The
+// pane-header ops already went through the HostOps controller surface; this
+// proves the SHELL ops do too.
 //
-// Seed layout (state/mockData.ts): 4 panes —
-//   tab0 = srv-A · chat (initially focused), tab1 = srv-A · terminal,
-//   tab2 = srv-B · diff, tab3 = srv-B · sessions.
+// MULTI-WORKSPACE: the top tabstrip is workspace-scoped. The "+" adds a
+// WORKSPACE (not a pane); clicking a workspace tab switches (CSS-visibility-
+// only — survival-safe, no iframe reload, proven separately in tests/e2e).
+// Panes within the active workspace are represented by their own custom headers.
 
 async function waitForHostReady(page: import("@playwright/test").Page): Promise<void> {
   await page.goto("/");
@@ -19,10 +20,11 @@ async function waitForHostReady(page: import("@playwright/test").Page): Promise<
   // independent of window.__host. Never realtime/SSE wording.
   await expect(page.locator('[data-testid="statusbar"]'))
     .toContainText("document alive", { timeout: 30_000 });
-  // Seed panes rendered as workspace tabs (DOM-only readiness).
+  // Seed panes rendered (DOM-only readiness): the active workspace has panes
+  // with custom headers carrying the Split affordance.
   await expect
-    .poll(async () => page.locator('[data-testid="ws-tab"]').count(), { timeout: 30_000 })
-    .toBeGreaterThanOrEqual(2);
+    .poll(async () => page.locator('[data-testid="pane-split-right"]').count(), { timeout: 30_000 })
+    .toBeGreaterThanOrEqual(1);
 }
 
 test.describe("host shell — production build (vite preview)", () => {
@@ -41,24 +43,34 @@ test.describe("host shell — production build (vite preview)", () => {
     expect(hasBridge, "window.__host must be absent in production").toBe(false);
   });
 
-  test("'+' adds a pane — shell split via HostOps (not the bridge)", async ({ page }) => {
-    // The "+" button calls hostOps().split(focused, "right") in the production
-    // bundle. A new tab must appear.
+  test("'+' adds a workspace — shell addWorkspace via HostOps (not the bridge)", async ({ page }) => {
+    // The "+" button calls addWorkspace() in the production bundle. A new
+    // workspace tab must appear and the empty-workspace affordance must show
+    // (a freshly-created workspace has 0 panels).
     const before = await page.locator('[data-testid="ws-tab"]').count();
     await page.locator('[data-testid="ws-add"]').click();
     await expect
       .poll(async () => page.locator('[data-testid="ws-tab"]').count())
       .toBe(before + 1);
+    await expect(page.locator('[data-testid="empty-workspace"]')).toBeVisible();
   });
 
-  test("clicking a tab focuses it — shell focusPane via HostOps", async ({ page }) => {
-    // Focus routing: ws-tab click → hostOps().focusPane(id) → setActive → the
-    // statusbar's "focus: …" text updates from the store's focusedId() signal.
-    // tab0 is initially focused (srv-A · chat); tab1 is srv-A · terminal.
-    const status = page.locator('[data-testid="statusbar"]');
-    await expect(status).toContainText("chat");
-    await page.locator('[data-testid="ws-tab"]').nth(1).click();
-    await expect(status).toContainText("terminal");
+  test("clicking a workspace tab switches active workspace (survival-safe)", async ({ page }) => {
+    // There is initially one workspace tab. Add a second one and switch between
+    // them by clicking tabs — this exercises the CSS-visibility-only overlay
+    // stack path in production (no bridge).
+    await page.locator('[data-testid="ws-add"]').click();
+    await expect
+      .poll(async () => page.locator('[data-testid="ws-tab"]').count())
+      .toBe(2);
+    const tabs = page.locator('[data-testid="ws-tab"]');
+    // The second tab is active (addWorkspace activates the new workspace).
+    await expect(tabs.nth(1)).toHaveClass(/tabActive/);
+    // Click the first tab → it becomes active (switch back).
+    await tabs.nth(0).click();
+    await expect(tabs.nth(0)).toHaveClass(/tabActive/);
+    // The empty-workspace affordance disappears (ws1 has seeded panes).
+    await expect(page.locator('[data-testid="empty-workspace"]')).toHaveCount(0);
   });
 
   test("collapse + tray-chip restore — shell restore via HostOps", async ({ page }) => {

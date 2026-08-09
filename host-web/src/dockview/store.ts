@@ -1,4 +1,5 @@
 import { createSignal } from "solid-js";
+import type { DockviewApi } from "dockview-core";
 import type {
   HostOps,
   LivenessState,
@@ -7,10 +8,260 @@ import type {
   Survival,
   SurvivalBaseline,
 } from "./types";
+import {
+  hadSavedStateAtInit,
+  loadWorkspaceSet,
+  scheduleSave,
+  setSerializeAllFn,
+} from "./layoutPersistence";
 
 // Module-level singleton store. Signals created at module scope are fine in
 // SolidJS: components that read them inside a tracking scope re-render on
 // change. (Effects need a root — those live in the adapter component.)
+
+// ============================================================================
+// MULTI-WORKSPACE MODEL
+//
+// The host shell models N workspaces, each its own isolated Dockview layout
+// tree of server panes. Switching workspaces is CSS-visibility-only (see
+// App.tsx's overlay stack) — every iframe stays permanently mounted in its own
+// host, so a switch NEVER reloads any iframe (the load-bearing survival
+// guarantee; proven by the workspace-switch survival gate).
+//
+// Per-workspace DockviewApis are registered here as each host mounts. The
+// per-workspace HostOps facet is registered too, and hostOps() resolves the
+// ACTIVE workspace's facet at call time so shell ops route to the active
+// workspace's live tree.
+//
+// DISPLAY PROJECTION: the panes/focusedId/trayIds/isMaximized signals reflect
+// ONLY the active workspace (the shell renders the active workspace's chrome).
+// Background-workspace writes are guarded out at the mutator level; on a
+// workspace switch the newly-active host re-syncs these signals from its api.
+// Survival/liveness state (survivalMap etc.) is GLOBAL, keyed by paneId (pane
+// ids are unique across the whole app), so it is NOT workspace-scoped — a
+// background workspace's panes keep heartbeating and their identity survives.
+// ============================================================================
+
+export interface Workspace {
+  id: string;
+  name: string;
+}
+
+let wsSeq = 0;
+/** Stable workspace id generator (unique within a session + across reloads when
+ *  combined with the persisted set). */
+function nextWsId(): string {
+  wsSeq += 1;
+  return `ws-${wsSeq}`;
+}
+
+/** Build the initial workspace set. When a valid v2 blob exists, restore the
+ *  persisted set (+ active id); otherwise create a single default workspace
+ *  whose id is the seed target for fleet/mock panes. */
+function initWorkspaces(): {
+  list: Workspace[];
+  activeId: string;
+  seedId: string | null;
+} {
+  const saved = loadWorkspaceSet();
+  if (saved) {
+    // Restore: workspace ids/names from the blob; advance the counter past any
+    // numeric suffix so a runtime addWorkspace does not collide.
+    for (const w of saved.workspaces) {
+      const m = /^ws-(\d+)$/.exec(w.id);
+      if (m) {
+        const n = parseInt(m[1], 10);
+        if (Number.isFinite(n) && n > wsSeq) wsSeq = n;
+      }
+    }
+    return {
+      list: saved.workspaces.map((w) => ({ id: w.id, name: w.name })),
+      activeId: saved.activeWorkspaceId,
+      seedId: null, // blob present → each workspace cold-restores its own layout
+    };
+  }
+  // No blob (first load): one default workspace; it seeds the fleet/mock fleet.
+  const id = nextWsId();
+  return { list: [{ id, name: "Workspace 1" }], activeId: id, seedId: id };
+}
+
+const initial = initWorkspaces();
+const [workspaces, setWorkspaces] = createSignal<Workspace[]>(initial.list);
+const [activeWorkspaceId, setActiveWorkspaceIdSignal] = createSignal<string>(
+  initial.activeId,
+);
+/** The workspace that should seed the fleet/mock fleet on cold init (the default
+ *  workspace when there was no blob; null otherwise). Runtime-added workspaces
+ *  are never seed targets — they start empty (the empty-workspace affordance). */
+const seedWorkspaceId: string | null = hadSavedStateAtInit() ? null : initial.seedId;
+
+export { workspaces, activeWorkspaceId };
+
+/** True iff this workspace should seed the fleet/mock fleet at cold init. Only
+ *  the default workspace when there was no saved blob; false for every other
+ *  workspace (restored-from-blob or runtime-added). */
+export function shouldSeedWorkspace(wsId: string): boolean {
+  return seedWorkspaceId !== null && wsId === seedWorkspaceId;
+}
+
+/** Register the serializer the debounced persistence writer calls, sourced from
+ *  the live workspace list + the per-workspace DockviewApi registry. Registered
+ *  once at module load so scheduleSave() always has a current snapshot. */
+setSerializeAllFn(() => {
+  const list = workspaces();
+  return {
+    activeWorkspaceId: activeWorkspaceId(),
+    workspaces: list.map((ws) => ({
+      id: ws.id,
+      name: ws.name,
+      layout: workspaceApis.get(ws.id)?.toJSON() ?? null,
+    })),
+  };
+});
+
+// ---- workspace add / close / activate --------------------------------------
+
+/** Per-workspace "became active" re-sync callback (registered by each host's
+ *  controller so the display signals re-project from the now-active api on a
+ *  switch). Keyed by workspace id. */
+const workspaceSyncCbs = new Map<string, () => void>();
+export function registerWorkspaceSync(wsId: string, cb: () => void): void {
+  workspaceSyncCbs.set(wsId, cb);
+}
+export function unregisterWorkspaceSync(wsId: string): void {
+  workspaceSyncCbs.delete(wsId);
+}
+
+/**
+ * Switch the active workspace. CSS-visibility-only (App.tsx's overlay stack
+ * toggles classes); this does NOT touch any DockviewApi, dispose any host, or
+ * reload any iframe. After setting the signal, the newly-active workspace's
+ * sync callback re-projects the display signals (panes/focus/tray/maximize)
+ * from its api. If that host has not mounted yet (a freshly-created workspace),
+ * its onMount will sync itself when it becomes active.
+ */
+export function setActiveWorkspace(id: string): void {
+  if (id === activeWorkspaceId()) return;
+  if (!workspaces().some((w) => w.id === id)) return; // unknown ws — no-op
+  setActiveWorkspaceIdSignal(id);
+  scheduleSave(); // remember the active workspace for the next reload
+  workspaceSyncCbs.get(id)?.();
+}
+
+/**
+ * Create + activate a new (empty) workspace. The new host mounts empty — no seed
+ * (only the default workspace on a first-ever load seeds the fleet). Returns the
+ * new workspace id. Triggers a debounced save so the workspace set persists.
+ */
+export function addWorkspace(name?: string): string {
+  const id = nextWsId();
+  const ws: Workspace = {
+    id,
+    name: name?.trim() || `Workspace ${workspaces().length + 1}`,
+  };
+  setWorkspaces((list) => [...list, ws]);
+  setActiveWorkspaceIdSignal(id);
+  scheduleSave();
+  return id;
+}
+
+/**
+ * Close (destroy) a workspace. Removing it from the workspaces signal makes
+ * SolidJS <For> unmount that workspace's DockviewHost, whose onCleanup calls
+ * api.dispose() (the SINGLE dispose — do NOT dispose here too, or Dockview
+ * double-disposes). Disposing DOES reload that workspace's iframes — acceptable
+ * because the workspace is being DESTROYED, not switched (switching is CSS-only
+ * and never reloads). Refuses to close the last remaining workspace so the shell
+ * never has zero. Returns true when closed.
+ */
+export function closeWorkspace(id: string): boolean {
+  const list = workspaces();
+  if (list.length <= 1) return false; // never zero workspaces
+  if (!list.some((w) => w.id === id)) return false;
+  setWorkspaces((l) => l.filter((w) => w.id !== id));
+  // If we closed the active workspace, activate a remaining one (its host's
+  // onCleanup + the active-switch sync handle display teardown). The destroyed
+  // workspace's host unmounts via the <For> signal change → onCleanup disposes.
+  if (activeWorkspaceId() === id) {
+    const remaining = workspaces();
+    if (remaining.length > 0) {
+      setActiveWorkspaceIdSignal(remaining[0].id);
+      workspaceSyncCbs.get(remaining[0].id)?.();
+    }
+  }
+  scheduleSave();
+  return true;
+}
+
+/** Rename a workspace (idempotent no-op when the name is unchanged).
+ *
+ *  NOTE: not currently wired to any UI/bridge caller. If/when wired, it MUST
+ *  preserve the Workspace object's referential identity (App.tsx's <For> overlay
+ *  stack keys hosts by reference — a spread-new-object rename would unmount +
+ *  remount that workspace's host → cold fromJSON → EVERY iframe in it reloads,
+ *  regressing the load-bearing survival guarantee). Use a Solid store/produce or
+ *  a separate reactive name signal keyed by id, NOT a spread. */
+export function renameWorkspace(id: string, name: string): void {
+  const trimmed = name.trim();
+  if (!trimmed) return;
+  setWorkspaces((list) =>
+    list.map((w) => (w.id === id ? { ...w, name: trimmed } : w)),
+  );
+  scheduleSave();
+}
+
+// ============================================================================
+// PER-WORKSPACE DOCKVIEW API + OPS REGISTRY
+// ============================================================================
+
+const workspaceApis = new Map<string, DockviewApi>();
+export function registerWorkspaceApi(wsId: string, api: DockviewApi): void {
+  workspaceApis.set(wsId, api);
+}
+export function unregisterWorkspaceApi(wsId: string): void {
+  workspaceApis.delete(wsId);
+}
+export function workspaceApiFor(wsId: string): DockviewApi | undefined {
+  return workspaceApis.get(wsId);
+}
+
+/** The per-workspace HostOps facet, registered by each controller. hostOps()
+ *  resolves the ACTIVE workspace's facet so shell ops route to the active tree. */
+const workspaceOpsByWs = new Map<string, HostOps>();
+export function registerWorkspaceOps(wsId: string, ops: HostOps): void {
+  workspaceOpsByWs.set(wsId, ops);
+}
+export function unregisterWorkspaceOps(wsId: string): void {
+  workspaceOpsByWs.delete(wsId);
+}
+
+// ---- legacy single-facet accessor (kept for the shell's hostOps() reads) ----
+// The shell (App, Tabstrip, AddServer) calls hostOps() and optional-chains the
+// method it needs. With multi-workspace, hostOps() resolves the ACTIVE
+// workspace's facet at call time, so a click always lands in the active tree.
+let hostOpsRef: HostOps | null = null;
+export function setHostOps(ops: HostOps): void {
+  hostOpsRef = ops;
+}
+export function hostOps(): HostOps | null {
+  const ws = activeWorkspaceId();
+  if (ws) {
+    const ops = workspaceOpsByWs.get(ws);
+    if (ops) return ops;
+  }
+  // Fall back to the legacy single facet (the first host to mount registers it
+  // before the workspace map is populated) so nothing breaks during the brief
+  // cold-init window. User clicks always land post-mount.
+  return hostOpsRef;
+}
+
+// ============================================================================
+// DISPLAY PROJECTION (active workspace only)
+//
+// panes / focusedId / trayIds / isMaximized reflect the ACTIVE workspace. Writes
+// are guarded by the writer's workspace id (background writes are dropped); the
+// active host's sync callback re-derives them from its api on a switch.
+// ============================================================================
 
 const [panes, setPanes] = createSignal<PaneVm[]>([]);
 const [focusedId, setFocusedId] = createSignal<string | null>(null);
@@ -20,24 +271,21 @@ const [connected, setConnected] = createSignal<boolean>(false);
 
 export { panes, focusedId, trayIds, isMaximized, connected };
 
-// ---- host imperative ops registry (set by DockviewHost, read by the shell) ----
-// The shell (App, Tabstrip) calls layout ops through this typed HostOps surface
-// instead of window.__host, so the shell never depends on the DEV-only test
-// bridge. DockviewHost registers the same mutable `ops` object the
-// HostController fills (installOps, onMount); the shell reads it with optional
-// chaining — user clicks always land post-mount, so the methods are populated by
-// then. This is the established shell⇄dockview sharing pattern (it mirrors the
-// state mutators below): it is NOT DEV-gated and it is NOT the test bridge.
-let hostOpsRef: HostOps | null = null;
-export function setHostOps(ops: HostOps): void {
-  hostOpsRef = ops;
-}
-export function hostOps(): HostOps | null {
-  return hostOpsRef;
+/** Clear the display projection (used by a host on unmount / dispose so a
+ *  destroyed workspace's panes do not linger in the active view). */
+export function clearDisplayFor(wsId: string): void {
+  if (wsId !== activeWorkspaceId()) return;
+  setPanes([]);
+  setFocusedId(null);
+  setTrayIds([]);
+  setIsMaximized(false);
 }
 
 // ---- per-pane survival + document-liveness tracking -----------------------
-// See docs/heartbeat-protocol.md for the full contract. In brief:
+// See docs/heartbeat-protocol.md for the full contract. This state is GLOBAL
+// (keyed by paneId; pane ids are unique across the whole app), NOT workspace-
+// scoped, so a background workspace's panes keep heartbeating and their identity
+// survives a workspace switch unchanged. In brief:
 //   - survivalMap[paneId]   = last ACCEPTED heartbeat's Survival identity
 //   - baselineMap[paneId]   = first-observed identity (survival-gate reference)
 //   - configuredOrigin[id]  = the pane's server origin (from params.url); the
@@ -47,13 +295,13 @@ export function hostOps(): HostOps | null {
 //                             is accepted as the new identity (constraint #4),
 //                             and must echo the issued challenge nonce
 //                             (expectedNonce[id]) when one is outstanding
-//   - expectedNonce[id]     = the challenge nonce issued by sendHandshake for
-//                             the current pending load; verified on the first
-//                             post-load heartbeat (constraint #4 — the host
-//                             knows the expected value before accepting it)
 //   - reloadDetectedAt[id]  = when a reload (identity change) was last observed;
 //                             the "reloaded" indicator state shows for a window
 //                             after this, then reverts to "document alive"
+//   - titleFor(paneId)      = last reported pane title (survives a workspace
+//                             switch because it is NOT active-workspace-scoped;
+//                             syncPanes reads from it so a background pane's
+//                             title update is not lost on the next switch)
 //
 // The `connected` signal above is a GLOBAL "any heartbeat ever accepted" flag —
 // it is INTERNAL (the DEV test bridge + a few specs wait on it for readiness).
@@ -69,6 +317,7 @@ const baselineMap = new Map<string, SurvivalBaseline>();
 const configuredOrigin = new Map<string, string>();
 const pendingLoad = new Map<string, boolean>();
 const reloadDetectedAt = new Map<string, number>();
+const titleByPane = new Map<string, string>();
 // expectedNonce[id] = the challenge nonce the host issued for the pane's current
 // pending load (constraint #4). Set in sendHandshake; verified in routeMessage:
 // while pendingLoad is true, the first post-load heartbeat MUST echo this value
@@ -109,9 +358,17 @@ export function configuredOriginFor(id: string): string | undefined {
   return configuredOrigin.get(id);
 }
 
-/** The challenge nonce the host issued for the pane's current pending load. */
+/** The challenge nonce the host issued for a pane's current pending load. */
 export function expectedNonceFor(id: string): string | undefined {
   return expectedNonce.get(id);
+}
+
+/** Last reported title for a pane (GLOBAL — survives workspace switches). */
+export function titleFor(id: string): string | undefined {
+  return titleByPane.get(id);
+}
+export function setTitleFor(id: string, title: string): void {
+  titleByPane.set(id, title);
 }
 
 // ---- [DEV/TEST] scratch protocol pane --------------------------------------
@@ -196,42 +453,42 @@ export function unregisterPane(id: string): void {
   pendingLoad.delete(id);
   reloadDetectedAt.delete(id);
   expectedNonce.delete(id);
+  titleByPane.delete(id);
   setPanes((list) => list.filter((p) => p.id !== id));
   setTrayIds((list) => list.filter((t) => t !== id));
   setFocusedId((cur) => (cur === id ? null : cur));
 }
 
 // ---- shell view-model mutators (called by the controller from dockview) ----
+// Each takes the writer's workspace id and is a no-op when that workspace is
+// not active (the active host re-derives these from its api on a switch). This
+// keeps the display projection purely active-workspace-scoped.
 
-export function upsertPaneVm(vm: PaneVm): void {
-  setPanes((list) => {
-    const i = list.findIndex((p) => p.id === vm.id);
-    if (i === -1) return [...list, vm];
-    const copy = list.slice();
-    copy[i] = vm;
-    return copy;
-  });
+/** Replace the active-workspace pane projection with a full rebuild (used by
+ *  a controller's syncPanes/syncAll so the display mirrors the active api exactly,
+ *  including on a workspace switch). No-op when wsId is not active. */
+export function setPanesVm(wsId: string, vms: PaneVm[]): void {
+  if (wsId !== activeWorkspaceId()) return;
+  setPanes(vms);
 }
 
-export function setFocused(id: string | null): void {
+export function setFocused(wsId: string, id: string | null): void {
+  if (wsId !== activeWorkspaceId()) return;
   setFocusedId(id);
 }
 
-export function setTray(ids: string[]): void {
+export function setTray(wsId: string, ids: string[]): void {
+  if (wsId !== activeWorkspaceId()) return;
   setTrayIds(ids);
 }
 
-export function addTray(id: string): void {
-  setTrayIds((list) => (list.includes(id) ? list : [...list, id]));
-}
-
-export function removeTray(id: string): void {
-  setTrayIds((list) => list.filter((t) => t !== id));
-}
-
-export function setMaximized(v: boolean): void {
+export function setMaximized(wsId: string, v: boolean): void {
+  if (wsId !== activeWorkspaceId()) return;
   setIsMaximized(v);
 }
+
+// `connected` is set internally by routeMessage (any heartbeat ever accepted).
+// It is INTERNAL — exported for read, never set from outside the store.
 
 // ---- central message router (ONE listener for all panes) ------------------
 
@@ -261,7 +518,10 @@ export interface RouteResult {
  * Heartbeats are accepted only when source+origin bind to a pane (constraint
  * #3) AND the nonce is fresh per the load lifecycle (constraint #4). title/
  * route messages are accepted on source-binding alone (display-only, no
- * liveness semantics — see docs/heartbeat-protocol.md §5).
+ * liveness semantics — see docs/heartbeat-protocol.md §5). Titles are stored
+ * GLOBALLY (titleByPane) so they survive a workspace switch; the active-
+ * workspace projection's setPanes is only touched when the pane belongs to the
+ * active workspace.
  */
 export function routeMessage(
   src: Window | null,
@@ -339,6 +599,9 @@ export function routeMessage(
       return { routed: true, paneId, accepted: false, reason: "rejected:stale-nonce" };
     }
     case "title": {
+      // Store the title GLOBALLY so it survives a workspace switch; then update
+      // the active projection only if this pane is currently displayed.
+      setTitleFor(paneId, d.title!);
       setPanes((list) =>
         list.map((p) => (p.id === paneId ? { ...p, title: d.title! } : p)),
       );

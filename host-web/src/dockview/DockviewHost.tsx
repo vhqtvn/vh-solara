@@ -1,14 +1,26 @@
-import { onCleanup, onMount } from "solid-js";
+import { createEffect, onCleanup, onMount } from "solid-js";
 import { createDockview, type DockviewApi } from "dockview-core";
 import { IframeRenderer } from "./iframeRenderer";
 import { HostController } from "./hostController";
-import { applyColdRestore, installLayoutSaver } from "./layoutPersistence";
+import {
+  applyColdRestoreForWorkspace,
+  installLayoutSaver,
+} from "./layoutPersistence";
 import type { HostOps } from "./types";
-import { setHostOps } from "./store";
+import {
+  activeWorkspaceId,
+  clearDisplayFor,
+  registerWorkspaceApi,
+  registerWorkspaceOps,
+  registerWorkspaceSync,
+  setHostOps,
+  shouldSeedWorkspace,
+} from "./store";
 import { nextPaneId, resolveFleet } from "../state/mockData";
 
 /**
- * SolidJS adapter around the imperative Dockview widget.
+ * SolidJS adapter around the imperative Dockview widget — ONE INSTANCE PER
+ * WORKSPACE.
  *
  * PATTERN (proven by the Phase-0 spike): onMount → createDockview with an
  * imperative widget model + a component factory + `defaultRenderer: 'always'`.
@@ -19,17 +31,24 @@ import { nextPaneId, resolveFleet } from "../state/mockData";
  * `renderer: 'always'` (set both as the default AND per-panel) is the mechanism
  * that keeps each cross-origin <iframe> permanently mounted — only its
  * geometry/visibility changes. Removing it reloads iframes.
+ *
+ * MULTI-WORKSPACE (survival-safe overlay stack): App.tsx renders a `<For>` of
+ * these hosts, one per workspace, stacked via CSS visibility (see App.module
+ * .hostLayer). Every host stays permanently mounted; switching workspaces is
+ * CSS-visibility-only and never touches any api/fromJSON, so no iframe ever
+ * reloads on a switch. On becoming active, the host calls api.layout() so a
+ * previously-hidden host recomputes its dimensions after becoming visible
+ * (belt-and-suspenders: visibility:hidden keeps the layout box, so Dockview's
+ * ResizeObserver already has the right size, but this forces a recompute).
  */
-export function DockviewHost() {
+export function DockviewHost(props: { workspaceId: string }) {
   let container!: HTMLDivElement;
   let api: DockviewApi | undefined;
+  let controller: HostController | undefined;
 
   // Mutable ops object breaks the dockview↔controller creation cycle: the
   // factory captures it; the controller fills it after the api exists.
   const ops: HostOps = {};
-  // Register the ops object so the shell (App, Tabstrip) can call layout ops
-  // through the typed HostOps surface — NOT through the DEV-only test bridge.
-  setHostOps(ops);
   const renderers = new Map<string, IframeRenderer>();
 
   onMount(() => {
@@ -45,29 +64,71 @@ export function DockviewHost() {
       disableDnd: false,
     });
 
-    // Controller wires events, installs HostOps (shell reads via store.hostOps),
-    // and exposes window.__host as a DEV-only test bridge.
-    new HostController(api, renderers, ops);
+    // Register the api + ops + sync callback with the store BEFORE the
+    // controller runs (the bridge + hostOps() resolve through these).
+    registerWorkspaceApi(props.workspaceId, api);
+    registerWorkspaceOps(props.workspaceId, ops);
+    // Legacy single-facet fallback: the first host to mount registers its ops
+    // so hostOps() works during the brief cold-init window before every
+    // workspace has registered. The active-workspace facet takes precedence.
+    registerLegacyHostOps(ops);
 
-    // ---- COLD INIT: restore the saved layout exactly once, else seed. --------
+    // Controller wires events, installs HostOps (shell reads via store.hostOps),
+    // and exposes window.__host as a DEV-only test bridge (singleton).
+    controller = new HostController(props.workspaceId, api, renderers, ops);
+    // Register the become-active re-sync so switching to this workspace re-
+    // projects the display signals from this api.
+    registerWorkspaceSync(props.workspaceId, () => controller?.syncAll());
+
+    // ---- COLD INIT: restore the saved layout exactly once for THIS workspace,
+    //      else seed (default ws only), else empty. ---------------------------
     // HARD RULE: api.fromJSON() is COLD-RESTORE ONLY — it disposes + recreates
-    // every panel, RELOADING every iframe (proven by the jsonReswap negative
-    // control). It runs EXACTLY ONCE here, before any iframe has a live
-    // identity. Runtime ops never call fromJSON; they mutate the live tree.
-    // applyColdRestore is structurally one-shot (a second call is a cached
-    // no-op), so no code path can drive a second restore.
-    //
-    // PRECEDENCE (defensible default, NOT canon): saved-layout-wins-with-
-    // validation; fleet/mock seed is the fallback when no valid layout exists.
-    const restored = applyColdRestore(api);
-    if (!restored) seedInitialPanes(api);
+    // every panel IN THIS WORKSPACE, RELOADING every iframe in it (proven by
+    // the jsonReswap negative control). It runs EXACTLY ONCE here per workspace,
+    // before any iframe has a live identity. Runtime ops never call fromJSON;
+    // they mutate the live tree. applyColdRestoreForWorkspace is structurally
+    // one-shot per workspace id (a second call is a cached no-op), so no code
+    // path can drive a second restore.
+    const restored = applyColdRestoreForWorkspace(api, props.workspaceId);
+    if (!restored) {
+      if (shouldSeedWorkspace(props.workspaceId)) {
+        seedInitialPanes(api);
+      }
+      // else: empty workspace (e.g. a runtime-added workspace) — the
+      // empty-workspace affordance prompts Add Server.
+    }
 
     // Hook the debounced save AFTER cold init so the initial seed/restore does
     // not itself trigger a save — only subsequent user mutations persist.
     installLayoutSaver(api);
+
+    // If this host is already active at mount (the default workspace on a cold
+    // load, or a freshly-added workspace), project its display signals now.
+    if (activeWorkspaceId() === props.workspaceId) {
+      controller.syncAll();
+    }
+  });
+
+  // On becoming active, recompute dimensions (a previously-hidden host may need
+  // a layout() nudge) + re-project the display signals. createEffect tracks
+  // activeWorkspaceId(); it fires whenever the active workspace changes.
+  createEffect(() => {
+    const isActive = activeWorkspaceId() === props.workspaceId;
+    if (!api) return;
+    if (isActive) {
+      // Force Dockview to re-read its container size after becoming visible.
+      // visibility:hidden keeps the box, so this is belt-and-suspenders, but it
+      // guarantees correct geometry after a switch in every browser.
+      const w = container.clientWidth;
+      const h = container.clientHeight;
+      if (w > 0 && h > 0) api.layout(w, h);
+      controller?.syncAll();
+    }
   });
 
   onCleanup(() => {
+    controller?.dispose();
+    clearDisplayFor(props.workspaceId);
     api?.dispose();
   });
 
@@ -77,6 +138,17 @@ export function DockviewHost() {
           rendered by IframeRenderer inside the always-render overlay. */}
     </div>
   );
+}
+
+/** Legacy single-facet registration: the first host to mount wins. Kept so
+ *  hostOps() works during the cold-init window before every workspace has
+ *  registered its facet. The active-workspace facet (workspaceOpsByWs) takes
+ *  precedence in store.hostOps(). */
+let legacyOpsRegistered = false;
+function registerLegacyHostOps(ops: HostOps): void {
+  if (legacyOpsRegistered) return;
+  legacyOpsRegistered = true;
+  setHostOps(ops);
 }
 
 /**

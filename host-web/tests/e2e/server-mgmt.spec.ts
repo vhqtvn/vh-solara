@@ -68,10 +68,16 @@ test.describe("runtime server management", () => {
     expect(added, "added pane carries the configured url").toBeDefined();
     expect(added!.label, "added pane carries the configured label").toBe(label);
 
-    // A workspace tab shows the configured label.
+    // The new pane's header shows the configured label (the top tabstrip is
+    // workspace-scoped now; a pane is represented by its own custom header).
+    // Use toContainText on the scoped pane (NOT toBeVisible on .pane-label): in
+    // a narrow 5-pane column the label's flex-shrunk brand clips to a zero
+    // bounding box, which Playwright reports as "hidden" even though the text is
+    // rendered. The Split-button visibility above already proves the header is
+    // shown; this proves the label text is wired through.
     await expect(
-      page.locator('[data-testid="ws-tab"]', { hasText: label }),
-    ).toBeVisible();
+      page.locator(`[data-pane-id="${added!.id}"]`),
+    ).toContainText(label);
 
     // The catalog lists the newly-added server (a remove affordance keyed by url).
     await expect(
@@ -139,15 +145,15 @@ test.describe("runtime server management", () => {
       .toBe(withAdded);
     for (const id of await H.panes(page)) await H.waitForReady(page, id);
 
-    // The added server's pane restored (tab + pane url survive the reload).
+    // The added server's pane restored (pane header + pane url survive reload).
+    const restoredParams = await H.paneParams(page);
+    const restored = restoredParams.find((p) => p.url === url);
+    expect(restored, "persisted server's pane restored after reload").toBeDefined();
+    // toContainText on the scoped pane (not .pane-label toBeVisible — the label
+    // is geometry-fragile in a narrow column; see the add-server test above).
     await expect(
-      page.locator('[data-testid="ws-tab"]', { hasText: label }),
-    ).toBeVisible();
-    const restored = await H.paneParams(page);
-    expect(
-      restored.find((p) => p.url === url),
-      "persisted server's pane restored after reload",
-    ).toBeDefined();
+      page.locator(`[data-pane-id="${restored!.id}"]`),
+    ).toContainText(label);
 
     // The runtime catalog also restored (the remove affordance keyed by url is
     // present without re-adding the server).

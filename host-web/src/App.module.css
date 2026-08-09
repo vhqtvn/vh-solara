@@ -11,6 +11,67 @@
   position: relative;
   overflow: hidden;
 }
+
+/* ---- multi-workspace overlay stack (load-bearing survival mechanism) -------
+ * Every workspace host is permanently mounted and stacked absolutely. Inactive
+ * hosts are visibility:hidden + pointer-events:none + opacity:0; the active
+ * host is visibility:visible + pointer-events:auto + opacity:1.
+ *
+ * NOT display:none (Dockview's ResizeObserver skips offsetParent===null, which
+ * display:none causes) and NOT <Show>/conditional unmount (would destroy the
+ * host + reload every iframe in it). visibility:hidden keeps the layout box,
+ * so Dockview sizes every host correctly even while hidden → iframes survive
+ * every workspace switch. See App.tsx + docs. */
+.hostLayer {
+  position: absolute;
+  inset: 0;
+  visibility: hidden;
+  pointer-events: none;
+  opacity: 0;
+  z-index: 0;
+  transition: opacity 0.12s ease;
+}
+.hostLayerActive {
+  visibility: visible;
+  pointer-events: auto;
+  opacity: 1;
+  z-index: 1;
+}
+
+/* ---- empty-workspace affordance (a freshly-created workspace has 0 panels) -- */
+.emptyOverlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+  z-index: 2;
+}
+.emptyCard {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 28px 36px;
+  border: 1px dashed var(--border);
+  border-radius: 10px;
+  background: var(--bg-soft);
+  color: var(--fg-dim);
+  pointer-events: auto;
+}
+.emptyTitle {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--fg);
+}
+.emptyHint {
+  font-size: 12px;
+}
+.emptyAction {
+  margin-top: 8px;
+}
+
 .trayRail {
   display: flex;
   align-items: center;

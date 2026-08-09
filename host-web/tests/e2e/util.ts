@@ -26,6 +26,48 @@ export async function panes(page: Page): Promise<string[]> {
   });
 }
 
+// ---- multi-workspace bridge helpers (window.__host, DEV-only) --------------
+// The workspace model: N workspaces, each its own Dockview tree. Switching is
+// CSS-visibility-only (survival-safe — no iframe reloads). These drive the
+// model programmatically for the workspace-switch survival gate + shell tests.
+
+export async function workspaces(page: Page): Promise<string[]> {
+  return page.evaluate(() => {
+    const h = (window as unknown as { __host?: { workspaces(): string[] } }).__host;
+    return h ? h.workspaces() : [];
+  });
+}
+
+export async function activeWorkspace(page: Page): Promise<string | null> {
+  const r = await page.evaluate(() => {
+    const h = (window as unknown as { __host?: { activeWorkspace(): string | null } }).__host;
+    return h ? h.activeWorkspace() : null;
+  });
+  return r ?? null;
+}
+
+export async function setActiveWorkspace(page: Page, id: string): Promise<void> {
+  await page.evaluate((id) => {
+    const h = (window as unknown as { __host?: { setActiveWorkspace(i: string): void } }).__host;
+    h?.setActiveWorkspace(id);
+  }, id);
+}
+
+export async function addWorkspace(page: Page, name?: string): Promise<string | null> {
+  const r = await page.evaluate((name) => {
+    const h = (window as unknown as { __host?: { addWorkspace(n?: string): string } }).__host;
+    return h ? h.addWorkspace(name) : null;
+  }, name);
+  return r ?? null;
+}
+
+export async function closeWorkspace(page: Page, id: string): Promise<boolean> {
+  return page.evaluate((id) => {
+    const h = (window as unknown as { __host?: { closeWorkspace(i: string): boolean } }).__host;
+    return h ? h.closeWorkspace(id) : false;
+  }, id);
+}
+
 // Read-only {url,label} snapshot per panel — used by the layout-persistence e2e
 // to assert a restored layout round-trips with the correct urls/labels.
 export interface PaneParam {
@@ -258,6 +300,23 @@ export async function restore(page: Page, id: string): Promise<void> {
     h?.restore(id);
   }, id);
 }
+// Add a server to the runtime catalog + open a pane for it in the ACTIVE
+// workspace (returns the new pane id, or null when isFleetEntry rejects).
+export async function addServer(page: Page, url: string, label: string): Promise<string | null> {
+  const r = await page.evaluate(({ url, label }) => {
+    const h = (window as unknown as { __host?: { addServer(u: string, l: string): string | null } }).__host;
+    return h ? h.addServer(url, label) : null;
+  }, { url, label });
+  return r ?? null;
+}
+// Remove a server (by url) from the runtime catalog + close its panes in the
+// ACTIVE workspace. Returns true when applied; false when refused.
+export async function removeServer(page: Page, url: string): Promise<boolean> {
+  return page.evaluate((url) => {
+    const h = (window as unknown as { __host?: { removeServer(u: string): boolean } }).__host;
+    return h ? h.removeServer(url) : false;
+  }, url);
+}
 // DEV-only test arrangement: dock `a` into `b`'s group as a tab. No shell op
 // creates a tabbed group, so this is the only deterministic way to reach
 // swap()'s same-group branch in e2e. Uses the survival-safe moveTo primitive.
@@ -350,35 +409,48 @@ export async function loadHost(page: Page): Promise<string[]> {
 // ---- layout-persistence helpers -------------------------------------------
 
 /** Storage key persistence writes (must match src/dockview/layoutPersistence.ts). */
-export const LAYOUT_STORAGE_KEY = "vh-host:layout:v1";
+export const LAYOUT_STORAGE_KEY = "vh-host:layout:v2";
 
-/** Wait until localStorage holds a saved layout with the expected panel count.
- *  The save is debounced (~450ms); this polls the raw blob so a test can flush it
- *  before reloading. Returns the parsed panels map (id → params). */
+/** Wait until localStorage holds a saved layout with the expected TOTAL panel
+ *  count across all workspaces. The v2 schema wraps each workspace's serialized
+ *  layout under `workspaces[*].layout`; this sums panels across every workspace
+ *  so a multi-workspace save is validated. The save is debounced (~450ms); this
+ *  polls the raw blob so a test can flush it before reloading. Returns a map of
+ *  paneId → params aggregated across all workspaces. */
 export async function waitForSavedLayout(
   page: Page,
-  expectedPanelCount: number,
+  expectedTotalPanelCount: number,
   timeoutMs = 8000,
 ): Promise<Record<string, { params?: { url?: string; label?: string } }>> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const panels = await page.evaluate((key) => {
+    const aggregated = await page.evaluate((key) => {
       const raw = localStorage.getItem(key);
       if (!raw) return null;
       try {
-        const parsed = JSON.parse(raw) as { panels?: Record<string, unknown> };
-        return (parsed.panels ?? null) as Record<string, unknown> | null;
+        const parsed = JSON.parse(raw) as {
+          workspaces?: Array<{ layout?: { panels?: Record<string, unknown> } }>;
+        };
+        const wsList = parsed.workspaces ?? [];
+        const panels: Record<string, unknown> = {};
+        for (const ws of wsList) {
+          const lp = ws.layout?.panels;
+          if (lp && typeof lp === "object") {
+            for (const [id, v] of Object.entries(lp)) panels[id] = v;
+          }
+        }
+        return panels;
       } catch {
         return null;
       }
     }, LAYOUT_STORAGE_KEY);
-    if (panels && Object.keys(panels).length === expectedPanelCount) {
-      return panels as Record<string, { params?: { url?: string; label?: string } }>;
+    if (aggregated && Object.keys(aggregated).length === expectedTotalPanelCount) {
+      return aggregated as Record<string, { params?: { url?: string; label?: string } }>;
     }
     await page.waitForTimeout(80);
   }
   throw new Error(
-    `saved layout with ${expectedPanelCount} panels never appeared in localStorage within ${timeoutMs}ms`,
+    `saved layout with ${expectedTotalPanelCount} total panels never appeared in localStorage within ${timeoutMs}ms`,
   );
 }
 

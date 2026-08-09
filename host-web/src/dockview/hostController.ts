@@ -13,50 +13,101 @@ import {
   removeRuntimeServer,
 } from "../state/serverList";
 import {
+  activeWorkspaceId,
+  addWorkspace as storeAddWorkspace,
   baselineFor,
   bindContentWindow,
   bindScratchSource,
+  closeWorkspace as storeCloseWorkspace,
   connected,
   expectedNonceFor,
   focusedId,
   livenessFor,
   lookupContentWindow,
   noteIframeLoad,
-  panes,
   resetBaseline,
   routeMessage,
   scratchSource,
   sendHandshake,
+  setActiveWorkspace as storeSetActiveWorkspace,
   setFocused,
   setMaximized,
+  setPanesVm,
   setTray,
   survivalFor,
+  titleFor,
   unregisterPane,
-  upsertPaneVm,
+  unregisterWorkspaceApi,
+  unregisterWorkspaceOps,
+  unregisterWorkspaceSync,
 } from "./store";
 
 type Direction = "left" | "right" | "above" | "below";
 
-/**
- * Imperative host controller. Owns the DockviewApi and implements every layout
- * op as a MUTATION OF THE LIVE TREE (rule #2): runtime actions never round-trip
- * through toJSON/fromJSON — that disposes + recreates panels and reloads the
- * cross-origin iframes. toJSON/fromJSON are reserved for cold persistence
- * (deferred) and for the negative-control test hook that PROVES such a reswap
- * reloads.
- */
+// ============================================================================
+// MULTI-WORKSPACE HOST CONTROLLER
+//
+// One HostController per workspace, owning that workspace's isolated DockviewApi.
+// Each controller registers itself in the module-level `controllers` map; the
+// DEV-only test bridge (a singleton installed once) resolves the ACTIVE
+// workspace's controller at call time so bridge ops route to the active tree.
+//
+// Shell ops route through store.hostOps(), which returns the active workspace's
+// HostOps facet — so a click always lands in the active workspace's live tree.
+// Each controller's `this.api` is its OWN workspace's api, so when the active
+// facet is invoked the op mutates the correct (active) tree. Switching
+// workspaces is CSS-only (App.tsx) and never touches any api.
+// ============================================================================
+
+/** Module-level controller registry: workspaceId → controller. The DEV test
+ *  bridge resolves the active controller through this map. */
+const controllers = new Map<string, HostController>();
+
+function activeController(): HostController | null {
+  const ws = activeWorkspaceId();
+  return ws ? (controllers.get(ws) ?? null) : null;
+}
+
+/** Find the controller that owns a given pane (by renderer), across ALL
+ *  workspaces. Used by bridge methods that address a pane directly (getIframe,
+ *  naiveReload) — the pane may live in any workspace, not just the active one. */
+function controllerForPane(paneId: string): HostController | null {
+  for (const c of controllers.values()) {
+    if (c.renderers.has(paneId)) return c;
+  }
+  return null;
+}
+
 export class HostController implements HostOps {
+  // `api` and `renderers` are read by the module-level bridge helpers
+  // (activeController / controllerForPane) which resolve the active or owning
+  // controller for a bridge call. They are NOT part of the public HostOps
+  // surface; the shell uses hostOps() (the typed facet), never these fields.
   constructor(
-    private readonly api: DockviewApi,
-    private readonly renderers: Map<string, IframeRenderer>,
+    private readonly workspaceId: string,
+    readonly api: DockviewApi,
+    readonly renderers: Map<string, IframeRenderer>,
     private readonly ops: HostOps,
   ) {
+    controllers.set(workspaceId, this);
     this.installOps();
     this.wireEvents();
     this.installTestBridge();
   }
 
-  // ---- HostOps implementation (mutates the live tree) ---------------------
+  /** Re-project the display signals from this workspace's api. Called when this
+   *  workspace becomes active (so panes/focus/tray/maximize reflect the now-
+   *  visible tree) and on this host's cold mount when it is already active. */
+  syncAll(): void {
+    this.syncPanes();
+    this.syncTray();
+    const active = this.api.activePanel?.id ?? null;
+    setFocused(this.workspaceId, active);
+    setMaximized(this.workspaceId, this.api.hasMaximizedGroup());
+    this.pushHeaderStates();
+  }
+
+  // ---- HostOps implementation (mutates the live tree of THIS workspace) ----
 
   split(paneId: string, direction: SplitDir): string | null {
     const panel = this.api.getPanel(paneId);
@@ -160,10 +211,6 @@ export class HostController implements HostOps {
       // the tray leaves a floating pane with an empty grid. Create a fresh grid
       // group and dock the panel into it. Survival-safe: moveTo repositions the
       // always-mounted renderer; the now-empty floating group is auto-removed.
-      // NOTE: the prior `moveTo({ group: undefined })` silently no-opped —
-      // panel.api.moveTo resolves a missing group to the panel's OWN (floating)
-      // group, so the pane never left the tray (proven: a restore-into-empty-grid
-      // e2e saw gridPaneCount stuck at 0 against the old code; green with this).
       const fresh = this.api.addGroup();
       panel.api.moveTo({ group: fresh, position: "center" });
     }
@@ -174,7 +221,8 @@ export class HostController implements HostOps {
   // ---- runtime server management (catalog add/remove) ---------------------
 
   /**
-   * Add a server to the runtime catalog AND open a new pane for it.
+   * Add a server to the runtime catalog AND open a new pane for it (in THIS
+   * workspace).
    *
    * SECURITY: the url is validated through isFleetEntry (http/https). A
    * javascript:/data:/opaque/parse-failure value is REJECTED — returns null,
@@ -208,10 +256,10 @@ export class HostController implements HostOps {
   }
 
   /**
-   * Remove a server (by url) from the runtime catalog + close its open panes.
-   * Returns true when applied; false when refused (closing this server's grid
-   * panes would empty the visible grid — refused so the grid never goes blank).
-   * Refusal is survival-safe: NO layout mutation happens when refused.
+   * Remove a server (by url) from the runtime catalog + close its open panes
+   * (in THIS workspace). Returns true when applied; false when refused (closing
+   * this server's grid panes would empty the visible grid — refused so the grid
+   * never goes blank). Refusal is survival-safe: NO layout mutation happens.
    */
   removeServer(url: string): boolean {
     const u = url.trim();
@@ -234,7 +282,7 @@ export class HostController implements HostOps {
     return true;
   }
 
-  // ---- event wiring → store ------------------------------------------------
+  // ---- event wiring → store (display projection of THIS workspace) ---------
 
   private wireEvents(): void {
     this.api.onDidActivePanelChange((ev) => {
@@ -250,15 +298,16 @@ export class HostController implements HostOps {
         r?.setActive(true);
         r?.sendFocus();
       }
-      setFocused(next);
+      setFocused(this.workspaceId, next);
     });
     this.api.onDidMaximizedGroupChange(() => {
-      setMaximized(this.api.hasMaximizedGroup());
+      setMaximized(this.workspaceId, this.api.hasMaximizedGroup());
       this.pushHeaderStates();
     });
     this.api.onDidAddPanel(() => this.syncPanes());
     this.api.onDidRemovePanel((p) => {
       unregisterPane(p.id);
+      this.syncPanes();
     });
     this.api.onDidMovePanel(() => {
       this.syncPanes();
@@ -270,18 +319,22 @@ export class HostController implements HostOps {
     });
   }
 
-  /** Reconcile the shell view-model with the live Dockview panels. */
+  /** Reconcile the shell view-model with the live Dockview panels of THIS
+   *  workspace (full rebuild; titles read from the global titleFor map so they
+   *  survive a workspace switch). No-op for the display signal when this
+   *  workspace is not active (the store mutator guards on active). */
   private syncPanes(): void {
+    const vms: { id: string; label: string; title: string }[] = [];
     for (const panel of this.api.panels) {
       const params = (panel.params ?? {}) as { url?: string; label?: string };
-      const existing = panes().find((p) => p.id === panel.id);
-      upsertPaneVm({
+      const title = titleFor(panel.id) ?? params.label ?? "";
+      vms.push({
         id: panel.id,
-        label: params.label ?? existing?.label ?? "server",
-        title: existing?.title ?? params.label ?? "",
+        label: params.label ?? "server",
+        title,
       });
     }
-    this.afterMutation();
+    setPanesVm(this.workspaceId, vms);
   }
 
   private syncTray(): void {
@@ -291,7 +344,7 @@ export class HostController implements HostOps {
         tray.push(g.activePanel.id);
       }
     }
-    setTray(tray);
+    setTray(this.workspaceId, tray);
   }
 
   private afterMutation(): void {
@@ -314,7 +367,9 @@ export class HostController implements HostOps {
     }
   }
 
-  private gridPaneCount(): number {
+  /** Number of panes currently on the grid (not in the tray). Public so the
+   *  DEV bridge can read it via the active controller. */
+  gridPaneCount(): number {
     let n = 0;
     for (const g of this.api.groups) {
       if (g.api.location.type === "grid") n += g.activePanel ? 1 : g.panels.length;
@@ -323,7 +378,7 @@ export class HostController implements HostOps {
   }
 
   /**
-   * Build params for a NEW pane created by "+" / split.
+   * Build params for a NEW pane created by "+" / split (in THIS workspace).
    *
    * - REAL-fleet mode (runtime catalog OR VITE_SERVERS): clone the SOURCE/focused
    *   pane's {url,label} — splitting opens another view of the same server, not a
@@ -373,6 +428,17 @@ export class HostController implements HostOps {
     this.ops.removeServer = (url) => this.removeServer(url);
   }
 
+  /** Dispose this controller: unregister from the store + the controller map so
+   *  a closed workspace's host fully tears down. Called by DockviewHost
+   *  onCleanup (closing a workspace disposes its host — that DOES reload its
+   *  iframes, which is acceptable since the workspace is being destroyed). */
+  dispose(): void {
+    controllers.delete(this.workspaceId);
+    unregisterWorkspaceApi(this.workspaceId);
+    unregisterWorkspaceOps(this.workspaceId);
+    unregisterWorkspaceSync(this.workspaceId);
+  }
+
   // ---- test bridge (window.__host) ----------------------------------------
   // Drives ops programmatically (deterministic survival assertions) and exposes
   // the two NEGATIVE-CONTROL hooks that deliberately do the reload-causing
@@ -386,43 +452,60 @@ export class HostController implements HostOps {
   // bridge object and both hook closures are dead-code-eliminated from the
   // bundle (verified: grep dist/ for __host / naiveReload / jsonReswap → 0).
   //
+  // SINGLETON: with multiple workspaces there are multiple controllers, but the
+  // bridge is installed ONCE (bridgeInstalled guard). Every method resolves the
+  // ACTIVE workspace's controller at call time (so bridge ops route to the
+  // active tree), except renderer-lookup methods (getIframe, naiveReload) which
+  // search ALL controllers since the addressed pane may live in any workspace.
+  //
   // DO NOT "helpfully" delete or expose `naiveReload` / `jsonReswap` in prod:
   // they are INTENTIONAL negative controls. The survival regression test
   // (tests/e2e/survival.spec.ts) drives each one and asserts it reloads the
-  // iframe, which proves the survival gate is non-vacuous (it actually detects a
-  // reload). They run only under the Vite dev server (the e2e webServer uses
-  // `npm run dev:host`), where DEV is true.
+  // iframe, which proves the survival gate is non-vacuous. They run only under
+  // the Vite dev server (the e2e webServer uses `npm run dev:host`), where DEV
+  // is true.
 
   private installTestBridge(): void {
     if (!import.meta.env.DEV) return;
+    if (bridgeInstalled) return;
+    bridgeInstalled = true;
     const bridge = {
-      panes: (): string[] => this.api.panels.map((p) => p.id),
-      // Read-only snapshot of every panel's {url,label} params — used by the
-      // layout-persistence e2e to assert a restored layout round-trips with the
-      // correct urls/labels (ids are opaque; params are the trusted content).
+      // ---- multi-workspace model (workspace switch/add/close) ----
+      workspaces: (): string[] =>
+        Array.from(controllers.keys()),
+      activeWorkspace: (): string | null => activeWorkspaceId(),
+      setActiveWorkspace: (id: string): void => {
+        storeSetActiveWorkspace(id);
+      },
+      addWorkspace: (name?: string): string => storeAddWorkspace(name),
+      closeWorkspace: (id: string): boolean => storeCloseWorkspace(id),
+
+      // ---- active-workspace-scoped reads/ops ----
+      panes: (): string[] => activeController()?.api.panels.map((p) => p.id) ?? [],
       paneParams: (): Array<{ id: string; url: string; label: string }> =>
-        this.api.panels.map((p) => {
+        activeController()?.api.panels.map((p) => {
           const params = (p.params ?? {}) as { url?: string; label?: string };
           return {
             id: p.id,
             url: params.url ?? "",
             label: params.label ?? "",
           };
-        }),
-      // Read-only: serialize the whole layout (api.toJSON). The persistence e2e
-      // captures a real, well-formed layout via this, poisons one url, writes it
-      // back to localStorage, and asserts the cold restore rejects the poison.
-      // (Distinct from the destructive jsonReswap negative control below, which
-      // round-trips toJSON→fromJSON to PROVE such a reswap reloads iframes.)
-      serialize: (): unknown => this.api.toJSON(),
+        }) ?? [],
+      // Read-only full-layout serialization of the ACTIVE workspace's api.
+      serialize: (): unknown => activeController()?.api.toJSON() ?? {},
       focused: (): string | null => focusedId(),
-      trayIds: (): string[] => this.api.groups
-        .filter((g) => g.api.location.type === "floating")
-        .map((g) => g.activePanel?.id ?? "")
-        .filter(Boolean),
-      gridPaneCount: (): number => this.gridPaneCount(),
-      isMaximized: (): boolean => this.api.hasMaximizedGroup(),
-      groupBox: (id: string) => this.api.getPanel(id)?.group.api.boundingBox ?? null,
+      trayIds: (): string[] => {
+        const c = activeController();
+        if (!c) return [];
+        return c.api.groups
+          .filter((g) => g.api.location.type === "floating")
+          .map((g) => g.activePanel?.id ?? "")
+          .filter(Boolean);
+      },
+      gridPaneCount: (): number => activeController()?.gridPaneCount() ?? 0,
+      isMaximized: (): boolean => activeController()?.api.hasMaximizedGroup() ?? false,
+      groupBox: (id: string) =>
+        activeController()?.api.getPanel(id)?.group.api.boundingBox ?? null,
       survival: (id: string) => survivalFor(id) ?? null,
       baseline: (id: string) => baselineFor(id) ?? null,
       expectedNonce: (id: string) => expectedNonceFor(id) ?? null,
@@ -430,17 +513,6 @@ export class HostController implements HostOps {
       connected: () => connected(),
 
       // ---- document-liveness protocol probes (heartbeat-protocol e2e) ------
-      // livenessFor() drives the per-pane Q1-C indicator. probeHeartbeat()
-      // routes a SYNTHETIC message through the REAL router (routeMessage) so the
-      // protocol e2e can deterministically assert origin/window/nonce rejection
-      // without a second real cross-origin iframe. `sourcePaneId` resolves to
-      // that pane's bound contentWindow as the MessageEvent source; pass null to
-      // simulate an unknown source window (wrong-window rejection).
-      //
-      // The scratch-pane surface (protocolScratch/Probe/Liveness/NoteLoad/Dispose)
-      // is a self-contained mini-pane with NO real heartbeat stream, used for the
-      // pure protocol-logic tests (valid acceptance, stale-nonce, reload) where a
-      // real mock iframe would interleave.
       liveness: (id: string) => livenessFor(id),
       probeHeartbeat: (
         args: {
@@ -452,18 +524,11 @@ export class HostController implements HostOps {
         const cw = args.sourcePaneId
           ? (lookupContentWindow(args.sourcePaneId) ?? null)
           : null;
-        // When sourcePaneId is given but unbound, fall back to the host window
-        // so the source is genuinely "unknown" to sourceMap (wrong-window path).
         const src: Window | null = cw ?? (args.sourcePaneId === null ? window : null);
         return routeMessage(src, args.origin, args.payload);
       },
       noteIframeLoad: (id: string) => noteIframeLoad(id),
       sendHandshake: (id: string) => sendHandshake(id),
-      // scratch-pane protocol surface: the sentinel source lives in-page and is
-      // addressed by an opaque scratchId string (it cannot round-trip through
-      // Playwright's serialization). probeHeartbeat/Probe route a synthetic
-      // message through the REAL router; scratchId=null simulates an unknown
-      // source (wrong-window rejection).
       protocolScratch: (id: string, origin: string) => {
         bindScratchSource(id, origin);
       },
@@ -479,63 +544,55 @@ export class HostController implements HostOps {
       protocolNoteLoad: (id: string) => noteIframeLoad(id),
       protocolDispose: (id: string) => unregisterPane(id),
 
-      split: (id: string, dir: SplitDir) => this.split(id, dir),
-      swap: (a: string, b: string) => this.swap(a, b),
-      closePane: (id: string) => this.closePane(id),
-      focus: (id: string) => this.focusPane(id),
+      split: (id: string, dir: SplitDir) => activeController()?.split(id, dir) ?? null,
+      swap: (a: string, b: string) => activeController()?.swap(a, b),
+      closePane: (id: string) => activeController()?.closePane(id),
+      focus: (id: string) => activeController()?.focusPane(id),
       maximize: (id: string) => {
-        const p = this.api.getPanel(id);
-        if (p && !this.api.hasMaximizedGroup()) this.api.maximizeGroup(p);
-        this.afterMutation();
+        const c = activeController();
+        if (!c) return;
+        const p = c.api.getPanel(id);
+        if (p && !c.api.hasMaximizedGroup()) c.api.maximizeGroup(p);
       },
       exitMaximized: () => {
-        this.api.exitMaximizedGroup();
-        this.afterMutation();
+        activeController()?.api.exitMaximizedGroup();
       },
-      collapse: (id: string) => this.collapse(id),
-      restore: (id: string) => this.restore(id),
+      collapse: (id: string) => activeController()?.collapse(id),
+      restore: (id: string) => activeController()?.restore(id),
 
-      // Test ARRANGEMENT (not a shell op): dock panel `a` into panel `b`'s
-      // group as a tab (position:'center'). No real shell op creates a tabbed
-      // group — split() always opens a new group — so the same-group branch of
-      // swap() is otherwise unreachable deterministically (only native tab DnD
-      // gets there). Uses the SAME survival-safe primitive (panel.api.moveTo)
-      // the real swap()'s first step uses, so it never disposes a renderer.
+      addServer: (url: string, label: string): string | null =>
+        activeController()?.addServer(url, label) ?? null,
+      removeServer: (url: string): boolean =>
+        activeController()?.removeServer(url) ?? false,
+
       dockAsTab: (a: string, b: string): void => {
-        const pa = this.api.getPanel(a);
-        const pb = this.api.getPanel(b);
+        const c = activeController();
+        if (!c) return;
+        const pa = c.api.getPanel(a);
+        const pb = c.api.getPanel(b);
         if (!pa || !pb || a === b) return;
         pa.api.moveTo({ group: pb.group, position: "center" });
-        this.afterMutation();
       },
-      // Read-only: are two panels currently in the SAME Dockview group?
       sameGroup: (a: string, b: string): boolean => {
-        const pa = this.api.getPanel(a);
-        const pb = this.api.getPanel(b);
+        const c = activeController();
+        if (!c) return false;
+        const pa = c.api.getPanel(a);
+        const pb = c.api.getPanel(b);
         return !!pa && !!pb && pa.group === pb.group;
       },
 
+      // Renderer-lookup methods search ALL controllers (the addressed pane may
+      // live in any workspace, not just the active one).
       getIframe: (id: string): HTMLIFrameElement | null =>
-        this.renderers.get(id)?.getIframe() ?? null,
+        controllerForPane(id)?.renderers.get(id)?.getIframe() ?? null,
 
       // NEGATIVE CONTROL (a): naive remove + re-add. This is the exact mistake
       // renderer:'always' exists to prevent. It RELOADS the iframe (new
       // element) → mountTs/nonce/connId all change. The gate asserts that.
-      // The fresh contentWindow is bound so the gate can observe the reload
-      // signal via the new heartbeat (the whole point is to PROVE the gate
-      // detects this mistake).
-      //
-      // Document-liveness protocol reconcile: the fresh iframe is created here
-      // (NOT by the renderer), so it has none of the renderer's wiring. We
-      // re-bind the contentWindow, and on the fresh iframe's `load` event we
-      // mark the pending load + re-issue the handshake — exactly what the
-      // renderer does for the panels it owns. Without this, the new document's
-      // heartbeats would carry a new identity but no pending-load flag, so the
-      // router would reject them as stale (and the gate would never observe the
-      // reload). See docs/heartbeat-protocol.md §4.
       naiveReload: (id: string): void => {
-        const r = this.renderers.get(id);
-        if (!r) return;
+        const c = controllerForPane(id);
+        const r = c?.renderers.get(id);
+        if (!c || !r) return;
         const old = r.getIframe();
         const body = r.getBody();
         old.remove();
@@ -551,18 +608,23 @@ export class HostController implements HostOps {
         });
       },
 
-      // NEGATIVE CONTROL (b): wholesale toJSON → fromJSON re-swap. This
-      // disposes + recreates EVERY panel (rule #2 violation when used as a
-      // re-render step) → all iframes reload. The gate asserts a reload.
+      // NEGATIVE CONTROL (b): wholesale toJSON → fromJSON re-swap on the ACTIVE
+      // workspace. This disposes + recreates EVERY panel in that workspace →
+      // all its iframes reload. The gate asserts a reload.
       jsonReswap: (): void => {
-        const state = this.api.toJSON();
+        const c = activeController();
+        if (!c) return;
+        const state = c.api.toJSON();
         // default reuseExistingPanels=false → full dispose + recreate.
-        this.api.fromJSON(state as never);
+        c.api.fromJSON(state as never);
       },
     };
     (window as unknown as { __host?: typeof bridge }).__host = bridge;
   }
 }
+
+/** Singleton guard: the bridge installs exactly once across all controllers. */
+let bridgeInstalled = false;
 
 /** Best-effort host:port extraction for a fallback label. Returns "" on a
  *  malformed url (the caller's isFleetEntry check rejects those anyway). */
