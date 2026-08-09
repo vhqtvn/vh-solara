@@ -255,6 +255,44 @@ export async function needsYou(page: Page): Promise<number> {
   });
 }
 
+// ---- P3 NEXT hero button probes --------------------------------------------
+// Inspect the ranking without acting (nextTarget), trigger the action (next),
+// and read the host-latched firstNeedsYouAt tiebreak. next/nextTarget route
+// through attentionNext.ts (the SAME production path the statusbar button uses).
+
+export interface NeedyCandidate {
+  paneId: string;
+  wsId: string;
+  attention: string;
+  firstNeedsYouAt: number;
+}
+
+/** The highest-priority needy pane system-wide (null when none). Read-only. */
+export async function nextTarget(page: Page): Promise<NeedyCandidate | null> {
+  return page.evaluate(() => {
+    const h = (window as unknown as { __host?: { nextTarget(): NeedyCandidate | null } }).__host;
+    return h ? h.nextTarget() : null;
+  });
+}
+
+/** Trigger the NEXT hero button action (rank → cross-ws → restore-from-tray →
+ *  keyboard-rule → focus) through the production attentionNext path. */
+export async function next(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    const h = (window as unknown as { __host?: { next(): void } }).__host;
+    h?.next();
+  });
+}
+
+/** The host-latched timestamp when the pane transitioned into its current
+ *  needs-you state (null when not currently needs-you / never latched). */
+export async function firstNeedsYouAt(page: Page, id: string): Promise<number | null> {
+  return page.evaluate((id) => {
+    const h = (window as unknown as { __host?: { firstNeedsYouAt(i: string): number | null } }).__host;
+    return h ? h.firstNeedsYouAt(id) : null;
+  }, id);
+}
+
 // ---- URL hash state (per-tab URL source-of-truth) --------------------------
 
 /** The raw location.hash string ("" when none). */

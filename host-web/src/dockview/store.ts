@@ -278,19 +278,27 @@ const [connected, setConnected] = createSignal<boolean>(false);
 // workspaces' panes are not in the display projection); the per-pane header
 // indicator carries the load-bearing signal regardless of workspace.
 const [needsYouCount, setNeedsYouCount] = createSignal<number>(0);
+// P3: count of ACTIVE-workspace panes whose activity is "running". Drives the
+// statusbar attention-hub "M running" text (paired with needsYouCount). Same
+// recompute trigger + scope as needsYouCount.
+const [runningCount, setRunningCount] = createSignal<number>(0);
 
-export { panes, focusedId, trayIds, isMaximized, connected, needsYouCount };
+export { panes, focusedId, trayIds, isMaximized, connected, needsYouCount, runningCount };
 
-/** Recompute the active-workspace needs-you aggregate from the current pane
- *  view-model. Called after a status store and after setPanesVm. Cheap: a small
- *  linear scan over the active panes. */
-function recomputeNeedsYou(): void {
-  let n = 0;
+/** Recompute the active-workspace attention aggregates (needs-you + running)
+ *  from the current pane view-model. Called after a status store and after
+ *  setPanesVm. Cheap: a small linear scan over the active panes. */
+function recomputeAggregates(): void {
+  let need = 0;
+  let run = 0;
   for (const p of panes()) {
     const st = statusByPane.get(p.id);
-    if (st && (st.attention === "needs_permission" || st.attention === "needs_reply")) n++;
+    if (!st) continue;
+    if (st.attention === "needs_permission" || st.attention === "needs_reply") need++;
+    if (st.activity === "running") run++;
   }
-  setNeedsYouCount(n);
+  setNeedsYouCount(need);
+  setRunningCount(run);
 }
 
 /** Clear the display projection (used by a host on unmount / dispose so a
@@ -345,6 +353,13 @@ const titleByPane = new Map<string, string>();
 // a sender-claimed server id (the pane is identified by its bound
 // contentWindow, exactly like heartbeats/routes). See web/src/statusEmitter.ts.
 const statusByPane = new Map<string, PaneStatus>();
+// P3 NEXT tiebreak: host-latched timestamp recording when each pane transitioned
+// into its current needs-you state (attention none → non-none). GLOBAL (keyed by
+// paneId). Honestly host-side — "when the host learned of the need", NOT when
+// the SPA-side attention changed (there is no SPA-side changedAt source; P1
+// omitted it). Exists solely to make the NEXT hero button deterministic +
+// oldest-first. Cleared on transition back to attention "none" or on unregister.
+const firstNeedsYouAt = new Map<string, number>();
 // expectedNonce[id] = the challenge nonce the host issued for the pane's current
 // pending load (constraint #4). Set in sendHandshake; verified in routeMessage:
 // while pendingLoad is true, the first post-load heartbeat MUST echo this value
@@ -413,10 +428,30 @@ export function setTitleFor(id: string, title: string): void {
 export function statusFor(id: string): PaneStatus | undefined {
   return statusByPane.get(id);
 }
+/** P3 NEXT tiebreak: host-latched timestamp of when this pane transitioned into
+ *  its current needs-you state (undefined/0 when not currently needs-you). The
+ *  latch is updated in setStatusFor on the none→non-none transition. */
+export function firstNeedsYouAtFor(id: string): number | undefined {
+  return firstNeedsYouAt.get(id);
+}
 /** Test/INTERNAL setter for a pane's status (capped title + stored globally).
  *  Recomputes the active-workspace needs-you aggregate and mirrors the status
  *  into the active projection's PaneVm so SolidJS shell components react. */
 function setStatusFor(paneId: string, status: PaneStatus): void {
+  // P3 firstNeedsYouAt latch: record when the HOST learned a pane transitioned
+  // into a needs-you state (attention none → non-none). This is honestly
+  // host-side ("when the host first saw the need via a status message"), NOT a
+  // claim about when the SPA-side attention changed (P1 omitted a changedAt
+  // source). It exists solely to make the NEXT hero button's tiebreak
+  // deterministic + oldest-first. Cleared when the pane returns to attention
+  // "none" or unregisters. Captured BEFORE the overwrite so the transition is
+  // detectable.
+  const prevAttention = statusByPane.get(paneId)?.attention ?? "none";
+  if (prevAttention === "none" && status.attention !== "none") {
+    firstNeedsYouAt.set(paneId, Date.now());
+  } else if (status.attention === "none") {
+    firstNeedsYouAt.delete(paneId);
+  }
   // Cap the title ONCE at ingress (defense-in-depth) so both the status store
   // and the title store carry the capped value consistently.
   const capped: PaneStatus = { ...status, title: capTitle(status.title) };
@@ -425,7 +460,7 @@ function setStatusFor(paneId: string, status: PaneStatus): void {
   setPanes((list) =>
     list.map((p) => (p.id === paneId ? { ...p, status: capped, title: capped.title || p.title } : p)),
   );
-  recomputeNeedsYou();
+  recomputeAggregates();
 }
 
 // ---- [DEV/TEST] scratch protocol pane --------------------------------------
@@ -512,10 +547,11 @@ export function unregisterPane(id: string): void {
   expectedNonce.delete(id);
   titleByPane.delete(id);
   statusByPane.delete(id);
+  firstNeedsYouAt.delete(id);
   setPanes((list) => list.filter((p) => p.id !== id));
   setTrayIds((list) => list.filter((t) => t !== id));
   setFocusedId((cur) => (cur === id ? null : cur));
-  recomputeNeedsYou();
+  recomputeAggregates();
 }
 
 // ---- shell view-model mutators (called by the controller from dockview) ----
@@ -529,9 +565,9 @@ export function unregisterPane(id: string): void {
 export function setPanesVm(wsId: string, vms: PaneVm[]): void {
   if (wsId !== activeWorkspaceId()) return;
   setPanes(vms);
-  // Re-derive the needs-you aggregate for the now-active pane set (status is
+  // Re-derive the attention aggregates for the now-active pane set (status is
   // GLOBAL; a workspace switch must re-tally the visible panes' attention).
-  recomputeNeedsYou();
+  recomputeAggregates();
 }
 
 export function setFocused(wsId: string, id: string | null): void {

@@ -101,6 +101,24 @@ function applyClose(): void {
   exitOwned();
 }
 
+/** P3: read whether keyboard focus-mode is currently open. Used by the NEXT
+ *  hero button's keyboard-composition rule (keep mode for a same-pane target;
+ *  exit it for a cross-pane target). Mirrors the DEV bridge's isOpen(). */
+export function isKeyboardOpen(): boolean {
+  return keyboardOpen;
+}
+
+/** P3: programmatically exit keyboard focus-mode (restore the host root + exit
+ *  the maximize focus-mode owns). Used by the NEXT hero button when crossing to
+ *  a different pane so the previously-focused pane's keyboard-maximize does not
+ *  pin the layout. PRESERVES a user's manual maximize — exitOwned() only exits
+ *  what focus-mode entered (ownedWs !== null); a user-owned maximize is never
+ *  touched. No-op (and cheap) when the keyboard is already closed. */
+export function exitKeyboardFocus(): void {
+  if (!keyboardOpen) return;
+  applyClose();
+}
+
 function setRootHeight(h: number): void {
   const el = getAppEl?.();
   if (!el) return;

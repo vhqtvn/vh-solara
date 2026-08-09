@@ -40,3 +40,63 @@
   white-space: nowrap;
   color: var(--fg-dim);
 }
+
+/* ---- P3 attention hub (statusbar-level; distinct from Q1-C dot + P1 badge) -- */
+.hub {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+/* "N need you" is emphasized when there is a need (carries the action signal);
+   dimmed otherwise so a calm statusbar stays calm. */
+.hubNeed {
+  color: var(--fg-dim);
+}
+.hubNeed[data-need="1"] {
+  color: var(--warn);
+  font-weight: 600;
+}
+.hubRun {
+  color: var(--fg-dim);
+}
+
+/* NEXT hero button: a prominent statusbar action that appears only when the
+   active workspace has a needs-you pane. The slow opacity pulse is the ONLY
+   animation (no mask-image / backdrop-filter — AGENTS.md Firefox/WebRender GPU
+   rules; the same pulse recipe the P1 per-pane badge uses). */
+.nextBtn {
+  appearance: none;
+  border: 1px solid var(--warn);
+  background: var(--warn);
+  color: var(--bg);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  padding: 4px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  letter-spacing: 0.04em;
+  flex: 0 0 auto;
+}
+.nextBtn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.nextBtn.is-pulsing {
+  animation: statusbar-next-pulse 2s ease-in-out infinite;
+}
+@keyframes statusbar-next-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .nextBtn.is-pulsing {
+    animation: none;
+  }
+}

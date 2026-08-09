@@ -87,4 +87,15 @@ test.describe("host shell — production build (vite preview)", () => {
     await chip.click();
     await expect(page.locator('[data-testid="tray-chip"]')).toHaveCount(0);
   });
+
+  test("P3 attention hub renders in production; NEXT button absent when no needs-you", async ({ page }) => {
+    // The statusbar attention-hub text ("N need you · M running") is part of the
+    // production shell (NOT DEV-gated) and must render in a production build.
+    // With no DEV bridge to inject a {type:"status"} message, every pane stays
+    // attention="none" → N=0 → the NEXT hero button must be ABSENT.
+    await expect(page.locator('[data-testid="attention-hub"]')).toContainText("need you");
+    await expect(page.locator('[data-testid="attention-hub"]')).toContainText("running");
+    await expect(page.locator('[data-testid="attention-hub"]')).toContainText("0 need you");
+    await expect(page.locator('[data-testid="attention-next"]')).toHaveCount(0);
+  });
 });

@@ -12,6 +12,8 @@ import {
   addRuntimeServer,
   removeRuntimeServer,
 } from "../state/serverList";
+import { firstNeedsYouAtFor } from "./store";
+import { next as attentionNext, nextTarget as attentionNextTarget } from "../attentionNext";
 import {
   activeWorkspaceId,
   addWorkspace as storeAddWorkspace,
@@ -530,6 +532,19 @@ export class HostController implements HostOps {
       connected: () => connected(),
       // P1: active-workspace needs-you aggregate (drives the workspace badge).
       needsYou: () => needsYouCount(),
+      // P3 NEXT hero button: inspect the ranking without acting + trigger the
+      // action + read the host-latched firstNeedsYouAt tiebreak. These route
+      // through attentionNext.ts (production logic) so the e2e drives the SAME
+      // path the statusbar's NEXT button uses.
+      nextTarget: (): { paneId: string; wsId: string; attention: string; firstNeedsYouAt: number } | null =>
+        attentionNextTarget(),
+      next: (): void => {
+        attentionNext();
+      },
+      firstNeedsYouAt: (id: string): number | null => {
+        const v = firstNeedsYouAtFor(id);
+        return v === undefined ? null : v;
+      },
 
       // ---- document-liveness protocol probes (heartbeat-protocol e2e) ------
       liveness: (id: string) => livenessFor(id),
