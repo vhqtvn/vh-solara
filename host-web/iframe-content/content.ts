@@ -167,6 +167,18 @@ function postToParent(msg: unknown): void {
 postToParent({ type: "title", title: `${SERVER} · ${VIEW}` });
 postToParent({ type: "route" });
 
+// P4 reverse-nav (mock stand-in for the real SPA's selectListener): the host
+// posts {type:'vh-host-select',dir,session} to direct this mock pane to a
+// specific {dir, session} WITHOUT reloading (a survival-safe SPA-internal route
+// change). The mock stand-in cannot run setSelectedId/switchProject (it is not
+// the real SPA), so it models the round-trip the real SPA's heartbeat loop
+// produces: capture the target as the mock's current route + re-emit
+// {type:'route',route} so the host's route-capture (updateRoute) observes the
+// round-trip. Source-guards + payload-allowlist mirror the real SPA's
+// selectListener EXACTLY so this stays a faithful stand-in (the survival +
+// reverse-nav gates depend on identical behavior here).
+let currentRoute = "";
+
 // ---- WebSocket echo (connId = reload signal) ------------------------------
 
 let connId: number | null = null;
@@ -243,5 +255,28 @@ window.addEventListener("message", (ev) => {
     app.classList.add("is-focused");
   } else if (data && data.type === "blur") {
     app.classList.remove("is-focused");
+  } else if (data && data.type === "vh-host-select") {
+    // F1 (inbound source-guard): mirror the real SPA's selectListener
+    // (web/src/selectListener.ts) EXACTLY — only the actual parent window may
+    // drive a select. An untrusted sibling pane that grabbed this window's
+    // WindowProxy must not hijack the mock's route (which would spoof the
+    // round-trip the survival/reverse-nav gates assert on). event.source for
+    // the real host select is window.parent.
+    if (ev.source !== window.parent) return;
+    // CF1 payload allowlist: dir + session MUST be strings (drop everything
+    // else — a poison field never reaches the route). Mirrors the real SPA.
+    const sel = data as { dir?: unknown; session?: unknown };
+    if (typeof sel.dir !== "string" || typeof sel.session !== "string") return;
+    // Model the round-trip: capture the target as the mock's current route +
+    // re-emit {type:'route',route} exactly as the real SPA's heartbeat-loop
+    // emission would after an SPA-internal setSelectedId/switchProject. The
+    // host's routeMessage captures it via updateRoute (survival-safe — params
+    // only, no src change). Surface in the DOM so a gate can assert the select
+    // was received (deterministic, not network-bound).
+    currentRoute = `?dir=${encodeURIComponent(sel.dir)}&session=${encodeURIComponent(sel.session)}`;
+    app.dataset.route = currentRoute;
+    app.dataset.selectDir = sel.dir;
+    app.dataset.selectSession = sel.session;
+    postToParent({ type: "route", route: currentRoute });
   }
 });

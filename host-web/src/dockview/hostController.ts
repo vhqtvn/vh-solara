@@ -21,6 +21,7 @@ import {
   bindContentWindow,
   bindScratchSource,
   closeWorkspace as storeCloseWorkspace,
+  configuredOriginFor,
   connected,
   expectedNonceFor,
   focusedId,
@@ -299,6 +300,31 @@ export class HostController implements HostOps {
     panel.api.updateParameters({ ...(panel.params ?? {}), route });
   }
 
+  /**
+   * Direct a pane's embedded SPA to switch to a specific {dir, session} via a
+   * survival-safe postMessage (P4 reverse-nav enabler). The iframe src +
+   * element are NEVER touched — this posts {type:'vh-host-select',dir,session}
+   * to the pane's bound contentWindow targeted at its configured origin
+   * (never '*'). The SPA performs an INTERNAL route change
+   * (setSelectedId/switchProject); its existing route emission fires
+   * {type:'route'} back, which updateRoute captures — the round-trip success
+   * signal. No-op when the pane is not found or its origin is unbound.
+   *
+   * SURVIVAL-INVARIANT (load-bearing): unlike a route CAPTURE (updateRoute,
+   * which only mutates params), a select DRIVES the SPA. But it does so purely
+   * via postMessage — the iframe element, its src, and `renderer:'always'` are
+   * untouched. Survival is unchanged (the SPA document is never reloaded).
+   */
+  selectTarget(paneId: string, dir: string, session: string): void {
+    const cw = lookupContentWindow(paneId);
+    const origin = configuredOriginFor(paneId);
+    // No-op if the pane is not found (no bound contentWindow) or its origin is
+    // unbound (never fall back to '*' — a broadcast select is both unsafe and
+    // pointless, since the listening child would reject an untargeted post).
+    if (!cw || !origin) return;
+    cw.postMessage({ type: "vh-host-select", dir, session }, origin);
+  }
+
   // ---- event wiring → store (display projection of THIS workspace) ---------
 
   private wireEvents(): void {
@@ -444,6 +470,7 @@ export class HostController implements HostOps {
     this.ops.addServer = (url, label) => this.addServer(url, label);
     this.ops.removeServer = (url) => this.removeServer(url);
     this.ops.updateRoute = (paneId, route) => this.updateRoute(paneId, route);
+    this.ops.selectTarget = (paneId, dir, session) => this.selectTarget(paneId, dir, session);
   }
 
   /** Dispose this controller: unregister from the store + the controller map so
@@ -600,6 +627,15 @@ export class HostController implements HostOps {
         activeController()?.addServer(url, label) ?? null,
       removeServer: (url: string): boolean =>
         activeController()?.removeServer(url) ?? false,
+
+      // P4 reverse-nav: drive a select through the SAME production HostOps path
+      // the shell's NEXT/jump-to-session UI will use (hostOps().selectTarget).
+      // Routes through the active controller's facet; the method itself does a
+      // global store lookup (lookupContentWindow/configuredOriginFor), so the
+      // round-trip lands in the pane regardless of its workspace.
+      selectTarget: (paneId: string, dir: string, session: string): void => {
+        activeController()?.selectTarget(paneId, dir, session);
+      },
 
       dockAsTab: (a: string, b: string): void => {
         const c = activeController();

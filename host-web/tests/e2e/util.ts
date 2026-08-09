@@ -465,6 +465,22 @@ export async function removeServer(page: Page, url: string): Promise<boolean> {
     return h ? h.removeServer(url) : false;
   }, url);
 }
+// P4 reverse-nav: drive a select through the production HostOps path
+// (hostOps().selectTarget). Posts {type:'vh-host-select',dir,session} to the
+// pane's contentWindow; the mock stand-in re-emits {type:'route',route} as the
+// round-trip signal (the real SPA's heartbeat loop does the same after its
+// SPA-internal setSelectedId/switchProject).
+export async function selectTarget(
+  page: Page,
+  paneId: string,
+  dir: string,
+  session: string,
+): Promise<void> {
+  await page.evaluate(({ paneId, dir, session }) => {
+    const h = (window as unknown as { __host?: { selectTarget(p: string, d: string, s: string): void } }).__host;
+    h?.selectTarget(paneId, dir, session);
+  }, { paneId, dir, session });
+}
 // DEV-only test arrangement: dock `a` into `b`'s group as a tab. No shell op
 // creates a tabbed group, so this is the only deterministic way to reach
 // swap()'s same-group branch in e2e. Uses the survival-safe moveTo primitive.

@@ -99,7 +99,7 @@ export function Statusbar() {
       <Show when={showNext()}>
         <button
           type="button"
-          class={`${s.nextBtn} is-pulsing`}
+          class={`${s.nextBtn} ${s["is-pulsing"]}`}
           data-testid="attention-next"
           title="Focus the highest-priority session that needs you"
           onClick={() => next()}

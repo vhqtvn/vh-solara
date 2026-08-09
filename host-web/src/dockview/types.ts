@@ -130,11 +130,16 @@ export type PaneToHost =
 // Host → pane. `focus`/`blur` are the pre-existing host-focus routing. The
 // `vh-host-handshake` is the document-liveness challenge (see
 // docs/heartbeat-protocol.md §3.1): issued once per iframe load, carries a fresh
-// nonce the SPA echoes back in its heartbeats.
+// nonce the SPA echoes back in its heartbeats. The `vh-host-select` is the P4
+// reverse-nav command (see web/src/selectListener.ts): directs the embedded SPA
+// to switch to a specific {dir, session} via a survival-safe SPA-INTERNAL route
+// change (setSelectedId/switchProject) — the iframe src + element are NEVER
+// touched. Origin-scoped to the pane's configured origin (never '*').
 export type HostToPane =
   | { type: "focus" }
   | { type: "blur" }
-  | { type: "vh-host-handshake"; nonce: string };
+  | { type: "vh-host-handshake"; nonce: string }
+  | { type: "vh-host-select"; dir: string; session: string };
 
 // ---- document-liveness indicator (Q1-C) ------------------------------------
 // The on-screen per-pane indicator state derived from heartbeats. This is
@@ -193,6 +198,17 @@ export interface HostOps {
    * itself; runtime route changes never touch src.
    */
   updateRoute?(paneId: string, route: string): void;
+  /**
+   * Direct a pane's embedded SPA to switch to a specific {dir, session} via a
+   * survival-safe postMessage (SPA-INTERNAL route change; the iframe src +
+   * element are NEVER touched — contrast with updateRoute which captures the
+   * SPA's OUTBOUND route into params; select is the INBOUND reverse). Posts
+   * {type:'vh-host-select',dir,session} to the pane's bound contentWindow
+   * targeted at its configured origin (never '*'). No-op when the pane is not
+   * found or its origin is unbound. The SPA echoes the route change back via
+   * its existing {type:'route'} emission — that round-trip is the success
+   * signal (no new reply message). See web/src/selectListener.ts. */
+  selectTarget?(paneId: string, dir: string, session: string): void;
 }
 
 /** State pushed to a pane's header so it can reflect tray/zoom affordances. */

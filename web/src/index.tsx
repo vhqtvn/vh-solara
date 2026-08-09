@@ -18,6 +18,7 @@ import { installScrollEdges } from "./lib/scrollEdges";
 import { startPresence } from "./alerts";
 import { startHeartbeat } from "./heartbeat";
 import { startStatusEmitter } from "./statusEmitter";
+import { startSelectListener } from "./selectListener";
 import { refreshProjectSettings } from "./projectSettings";
 import "./styles/main.css";
 
@@ -89,6 +90,13 @@ if (standalone === "code") {
   // current (dir,session)'s attention/activity (distinct from Q1-C liveness).
   // See web/src/statusEmitter.ts.
   startStatusEmitter();
+  // P4 enabler: host→pane reverse-nav select listener (no-op when standalone).
+  // Same embed gate + inbound source-guard + payload-allowlist security pattern
+  // as the heartbeat/status bridges. When the host posts a
+  // {type:'vh-host-select',dir,session}, the SPA performs a survival-safe
+  // SPA-INTERNAL route change (setSelectedId/switchProject) — the iframe element
+  // + src are NEVER touched. See web/src/selectListener.ts.
+  startSelectListener();
   startSync();
   // OpenCode lifecycle health polling (independent of the worker SSE stream):
   // the worker being reachable (state.status "live") only means the vh-solara
