@@ -66,19 +66,31 @@ export function applyScale() {
   const scale = uiScale();
   const root = document.documentElement;
   const coarse = typeof matchMedia !== "undefined" && matchMedia("(pointer: coarse)").matches;
+  // When this SPA is embedded in the host shell's iframe (window.parent !==
+  // window — the post-fold default: the SPA at /app is embedded same-origin by
+  // the host shell at /), the iframe's own viewport meta is IGNORED by browsers
+  // (the top-level document's meta governs layout/zoom), so setViewportScale's
+  // meta-scale is a visual no-op there. CSS zoom, by contrast, scales the
+  // iframe's own documentElement and DOES take effect inside an iframe — so when
+  // embedded we use the zoom path on every device. Standalone mobile keeps the
+  // meta path (the real virtual-viewport zoom); standalone desktop already uses
+  // zoom. Without this, ui-scale was a no-op for mobile-embedded users (the
+  // "ui scaling no longer works" report once the host shell became default).
+  const embedded = typeof window !== "undefined" && window.parent !== window;
   // ui-zoom always drives the viewport meta's initial/min/max-scale — the
   // mechanism that actually scales on mobile (and webviews that honor it).
   setViewportScale(scale);
-  if (coarse) {
-    // Mobile: the meta scale above does the work; CSS zoom reset so they don't
-    // compound, and --ui-zoom stays 1 (no app-height compensation needed).
+  if (coarse && !embedded) {
+    // Mobile standalone: the meta scale above does the work; CSS zoom reset so
+    // they don't compound, and --ui-zoom stays 1 (no app-height compensation
+    // needed).
     (root.style as any).zoom = "";
     root.style.setProperty("--ui-zoom", "1");
   } else {
-    // Desktop: the viewport meta is ignored, so CSS `zoom` does the visible
-    // scaling. --ui-zoom lets the app height (a fixed px from the visual
-    // viewport, which zoom would otherwise render at <100%, leaving dead space)
-    // divide it back so it still fills the screen.
+    // Desktop (any context) OR embedded mobile (meta ignored → zoom does the
+    // visible scaling). --ui-zoom lets the app height (a fixed px from the
+    // visual viewport, which zoom would otherwise render at <100%, leaving dead
+    // space) divide it back so it still fills the screen.
     (root.style as any).zoom = String(scale);
     root.style.setProperty("--ui-zoom", String(scale));
   }
