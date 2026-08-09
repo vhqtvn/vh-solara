@@ -3,11 +3,30 @@
 // panning a too-tall page. dvh/interactive-widget alone are unreliable on mobile
 // (esp. iOS Safari); visualViewport.height is the value that actually shrinks
 // when the keyboard opens. Sets --app-h, which .app consumes.
+//
+// EMBEDDED (host-shell iframe, the post-fold default at /): the iframe's OWN
+// visualViewport/innerHeight do NOT change on keyboard, because the iframe
+// element is sized by the host's LAYOUT viewport (Dockview geometry) and the
+// host meta (host-web/index.html) lacks `interactive-widget=resizes-content`, so
+// the browser default `resizes-visual` shrinks ONLY the host's VISUAL viewport —
+// not its layout viewport, hence not the iframe element. To still resize for the
+// keyboard when embedded, we ALSO track the PARENT's visualViewport (which DOES
+// shrink on keyboard — the same signal the standalone path relies on) and cap
+// --app-h at min(own box height, parent visible height). Same-origin only; a
+// cross-origin parent's visualViewport access throws and readParentViewport()
+// returns null there (graceful degradation to own-height-only). No host
+// cooperation / postMessage is required for this.
 export function installViewport() {
   const root = document.documentElement;
+  const parentVV = readParentViewport();
   const apply = () => {
     const vv = window.visualViewport;
-    const h = vv ? vv.height : window.innerHeight;
+    let h = vv ? vv.height : window.innerHeight;
+    // Embedded keyboard: cap at the parent's visible height so .app shrinks
+    // above the keyboard (parent.vv shrinks below the iframe box). When the
+    // parent is taller than the iframe (no keyboard, or a docked/split pane),
+    // this is a no-op and --app-h keeps the iframe's own box height.
+    if (parentVV && parentVV.height < h) h = parentVV.height;
     root.style.setProperty("--app-h", `${Math.round(h)}px`);
   };
   apply();
@@ -15,6 +34,10 @@ export function installViewport() {
   if (vv) {
     vv.addEventListener("resize", apply);
     vv.addEventListener("scroll", apply);
+  }
+  if (parentVV) {
+    parentVV.addEventListener("resize", apply);
+    parentVV.addEventListener("scroll", apply);
   }
   window.addEventListener("resize", apply);
   window.addEventListener("orientationchange", apply);
@@ -45,4 +68,19 @@ export function installViewport() {
     if (e.touches.length >= 2) e.preventDefault();
   };
   document.addEventListener("touchmove", noPinchMove, { passive: false });
+}
+
+// Read the parent window's VisualViewport when this document is embedded
+// same-origin in the host-shell iframe (window.parent !== window). Returns null
+// when standalone, when the parent is cross-origin (visualViewport access throws
+// on the cross-origin WindowProxy), or where the parent exposes no
+// visualViewport (older browsers) — in all those cases installViewport degrades
+// to own-height-only tracking (the original standalone behavior).
+function readParentViewport(): VisualViewport | null {
+  try {
+    if (typeof window === "undefined" || window.parent === window) return null;
+    return window.parent.visualViewport ?? null;
+  } catch {
+    return null;
+  }
 }
