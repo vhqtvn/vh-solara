@@ -1,8 +1,11 @@
 import { createSignal } from "solid-js";
 import type { DockviewApi } from "dockview-core";
 import type {
+  Attention,
+  Activity,
   HostOps,
   LivenessState,
+  PaneStatus,
   PaneVm,
   PaneToHost,
   Survival,
@@ -268,8 +271,27 @@ const [focusedId, setFocusedId] = createSignal<string | null>(null);
 const [trayIds, setTrayIds] = createSignal<string[]>([]);
 const [isMaximized, setIsMaximized] = createSignal<boolean>(false);
 const [connected, setConnected] = createSignal<boolean>(false);
+// P1: count of ACTIVE-workspace panes whose session needs operator input
+// (needs_permission or needs_reply). Drives the workspace-aggregate badge.
+// Recomputed on every status store and on every active-workspace pane-list
+// change (setPanesVm). P1 scope: active-workspace aggregate only (background
+// workspaces' panes are not in the display projection); the per-pane header
+// indicator carries the load-bearing signal regardless of workspace.
+const [needsYouCount, setNeedsYouCount] = createSignal<number>(0);
 
-export { panes, focusedId, trayIds, isMaximized, connected };
+export { panes, focusedId, trayIds, isMaximized, connected, needsYouCount };
+
+/** Recompute the active-workspace needs-you aggregate from the current pane
+ *  view-model. Called after a status store and after setPanesVm. Cheap: a small
+ *  linear scan over the active panes. */
+function recomputeNeedsYou(): void {
+  let n = 0;
+  for (const p of panes()) {
+    const st = statusByPane.get(p.id);
+    if (st && (st.attention === "needs_permission" || st.attention === "needs_reply")) n++;
+  }
+  setNeedsYouCount(n);
+}
 
 /** Clear the display projection (used by a host on unmount / dispose so a
  *  destroyed workspace's panes do not linger in the active view). */
@@ -318,6 +340,11 @@ const configuredOrigin = new Map<string, string>();
 const pendingLoad = new Map<string, boolean>();
 const reloadDetectedAt = new Map<string, number>();
 const titleByPane = new Map<string, string>();
+// P1 session-attention: last-reported status per pane (GLOBAL — survives
+// workspace switches, like titleByPane). Keyed by paneId; the host NEVER trusts
+// a sender-claimed server id (the pane is identified by its bound
+// contentWindow, exactly like heartbeats/routes). See web/src/statusEmitter.ts.
+const statusByPane = new Map<string, PaneStatus>();
 // expectedNonce[id] = the challenge nonce the host issued for the pane's current
 // pending load (constraint #4). Set in sendHandshake; verified in routeMessage:
 // while pendingLoad is true, the first post-load heartbeat MUST echo this value
@@ -367,8 +394,38 @@ export function expectedNonceFor(id: string): string | undefined {
 export function titleFor(id: string): string | undefined {
   return titleByPane.get(id);
 }
+// P1: host-side length cap on ingested titles (defense-in-depth). Titles are
+// OpenCode-authored plain session/project text (safe), but a cross-origin
+// payload is capped at ingress so a pathological/malicious value can never
+// blow up the header DOM or the persisted layout. ~120 chars matches typical
+// session-title lengths with wide headroom.
+const TITLE_CAP = 120;
+function capTitle(t: string): string {
+  return t.length > TITLE_CAP ? t.slice(0, TITLE_CAP) : t;
+}
 export function setTitleFor(id: string, title: string): void {
-  titleByPane.set(id, title);
+  titleByPane.set(id, capTitle(title));
+}
+
+/** Last reported session-attention status for a pane (GLOBAL — survives
+ *  workspace switches). Source-bound to the pane's contentWindow; the host
+ *  never trusts a sender-claimed id. */
+export function statusFor(id: string): PaneStatus | undefined {
+  return statusByPane.get(id);
+}
+/** Test/INTERNAL setter for a pane's status (capped title + stored globally).
+ *  Recomputes the active-workspace needs-you aggregate and mirrors the status
+ *  into the active projection's PaneVm so SolidJS shell components react. */
+function setStatusFor(paneId: string, status: PaneStatus): void {
+  // Cap the title ONCE at ingress (defense-in-depth) so both the status store
+  // and the title store carry the capped value consistently.
+  const capped: PaneStatus = { ...status, title: capTitle(status.title) };
+  statusByPane.set(paneId, capped);
+  if (capped.title) titleByPane.set(paneId, capped.title);
+  setPanes((list) =>
+    list.map((p) => (p.id === paneId ? { ...p, status: capped, title: capped.title || p.title } : p)),
+  );
+  recomputeNeedsYou();
 }
 
 // ---- [DEV/TEST] scratch protocol pane --------------------------------------
@@ -454,9 +511,11 @@ export function unregisterPane(id: string): void {
   reloadDetectedAt.delete(id);
   expectedNonce.delete(id);
   titleByPane.delete(id);
+  statusByPane.delete(id);
   setPanes((list) => list.filter((p) => p.id !== id));
   setTrayIds((list) => list.filter((t) => t !== id));
   setFocusedId((cur) => (cur === id ? null : cur));
+  recomputeNeedsYou();
 }
 
 // ---- shell view-model mutators (called by the controller from dockview) ----
@@ -470,6 +529,9 @@ export function unregisterPane(id: string): void {
 export function setPanesVm(wsId: string, vms: PaneVm[]): void {
   if (wsId !== activeWorkspaceId()) return;
   setPanes(vms);
+  // Re-derive the needs-you aggregate for the now-active pane set (status is
+  // GLOBAL; a workspace switch must re-tally the visible panes' attention).
+  recomputeNeedsYou();
 }
 
 export function setFocused(wsId: string, id: string | null): void {
@@ -618,6 +680,70 @@ export function routeMessage(
         hostOps()?.updateRoute?.(paneId, d.route);
         scheduleSave();
       }
+      return { routed: true, paneId, accepted: true, reason: "accepted:non-heartbeat" };
+    }
+    case "status": {
+      // P1 session-attention. Source-bound (keyed by the pane's bound
+      // contentWindow, NEVER a sender-claimed id). Validate the minimal payload
+      // shape; a malformed/spoofed status is ignored entirely. The host NEVER
+      // trusts a sender-claimed serverId: `dir`+`session` are the SPA's routing
+      // vocabulary, and the SERVER is implied by the pane the message came from.
+      //
+      // TRUST TIER (stricter than title/route): status carries
+      // `attention: needs_reply|needs_permission`, which drives operator
+      // NEXT/attention routing — a forged needs-you is trust-destroying. So
+      // status follows the HEARTBEAT trust tier (origin-checked), NOT the
+      // title/route tier (source-binding-only, which is display-only with no
+      // liveness/attention semantics). A bound WindowProxy survives a
+      // cross-origin navigation, so a hijacked/navigated iframe could otherwise
+      // inject a forged needs_permission/needs_reply; the origin check below
+      // prevents that. Q1-C document-liveness stays driven by heartbeats only;
+      // status is display/attention only.
+      if (
+        typeof d.dir !== "string" ||
+        typeof d.session !== "string" ||
+        typeof d.title !== "string" ||
+        typeof d.attention !== "string" ||
+        typeof d.activity !== "string"
+      ) {
+        return { routed: false, paneId: null, accepted: false, reason: "ignored-non-pane-to-host" };
+      }
+      // Constraint #3 (heartbeat trust tier): origin must match the pane's
+      // configured server origin. Mirrors the heartbeat branch's check exactly.
+      // A bound WindowProxy survives a cross-origin navigation; source-binding
+      // alone is NOT sufficient for an attention-driving message. Rejected here
+      // → status/title/needsYou are NOT mutated.
+      const expected = configuredOrigin.get(paneId);
+      if (expected !== undefined && origin !== expected) {
+        return { routed: true, paneId, accepted: false, reason: "rejected:origin-mismatch" };
+      }
+      const attention = d.attention as Attention;
+      const activity = d.activity as Activity;
+      // Closed-set check: reject out-of-vocabulary values rather than storing
+      // an arbitrary string (defense-in-depth against a spoofed/malformed post).
+      if (
+        attention !== "none" &&
+        attention !== "needs_reply" &&
+        attention !== "needs_permission"
+      ) {
+        return { routed: false, paneId: null, accepted: false, reason: "ignored-non-pane-to-host" };
+      }
+      if (
+        activity !== "running" &&
+        activity !== "idle" &&
+        activity !== "done_unread" &&
+        activity !== "error" &&
+        activity !== "unknown"
+      ) {
+        return { routed: false, paneId: null, accepted: false, reason: "ignored-non-pane-to-host" };
+      }
+      setStatusFor(paneId, {
+        dir: d.dir,
+        session: d.session,
+        title: d.title,
+        attention,
+        activity,
+      });
       return { routed: true, paneId, accepted: true, reason: "accepted:non-heartbeat" };
     }
     default:

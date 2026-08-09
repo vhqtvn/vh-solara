@@ -2,7 +2,7 @@ import type {
   GroupPanelPartInitParameters,
   IContentRenderer,
 } from "dockview-core";
-import type { HostOps, LivenessState, PaneHeaderState, PaneParams } from "./types";
+import type { Attention, Activity, HostOps, LivenessState, PaneHeaderState, PaneParams } from "./types";
 import {
   bindContentWindow,
   bindPaneOrigin,
@@ -10,6 +10,8 @@ import {
   lookupContentWindow,
   noteIframeLoad,
   sendHandshake,
+  statusFor,
+  titleFor,
   unbindContentWindow,
 } from "./store";
 
@@ -44,6 +46,12 @@ export class IframeRenderer implements IContentRenderer {
   private livenessDot!: HTMLElement;
   private livenessLabel!: HTMLElement;
   private livenessTimer: number | undefined;
+  // P1 session-attention badge (DISTINCT from Q1-C liveness: a rounded-rect
+  // badge with a glyph, not a circle dot). Shown only when the pane's current
+  // (dir,session) needs operator input (needs_permission / needs_reply). The
+  // same periodic refresh reflects the real session title (via the status
+  // message's title field, stored in titleByPane) over the raw server label.
+  private statusBadge!: HTMLElement;
   private headerState: PaneHeaderState = {
     inTray: false,
     maximized: false,
@@ -103,6 +111,16 @@ export class IframeRenderer implements IContentRenderer {
     this.headerLabel.textContent = p.label;
     this.headerLabel.title = p.label;
     brand.appendChild(this.headerLabel);
+    // P1 session-attention badge. A rounded-rect badge with a glyph (NOT a
+    // circle dot — visually + semantically distinct from the Q1-C liveness
+    // indicator). Hidden until a status lands; updated by updateStatus() on the
+    // periodic refresh. The slow opacity pulse is the ONLY animation (no
+    // mask-image / backdrop-filter — AGENTS.md Firefox/WebRender GPU rules).
+    this.statusBadge = document.createElement("span");
+    this.statusBadge.className = "pane-status-badge";
+    this.statusBadge.setAttribute("data-testid", "pane-status-badge");
+    this.statusBadge.hidden = true;
+    brand.appendChild(this.statusBadge);
     header.appendChild(brand);
 
     const actions = document.createElement("div");
@@ -234,11 +252,18 @@ export class IframeRenderer implements IContentRenderer {
     this.postToPane({ type: "blur" });
   }
 
-  /** Start the ~2 Hz per-pane liveness indicator refresh. */
+  /** Start the ~2 Hz per-pane header refresh: Q1-C liveness (dot + label) AND
+   *  P1 session-attention (title over server label + attention badge). Both are
+   *  read from the store on the same timer; neither touches the iframe element
+   *  (survival-unchanged). */
   private startLivenessIndicator(): void {
     this.updateLiveness();
+    this.updateStatus();
     if (typeof window !== "undefined") {
-      this.livenessTimer = window.setInterval(() => this.updateLiveness(), 500);
+      this.livenessTimer = window.setInterval(() => {
+        this.updateLiveness();
+        this.updateStatus();
+      }, 500);
     }
   }
 
@@ -248,6 +273,42 @@ export class IframeRenderer implements IContentRenderer {
     this.livenessDot.setAttribute("data-state", state);
     this.livenessLabel.textContent = liveLabel(state);
     this.livenessLabel.setAttribute("data-state", state);
+  }
+
+  /** Reflect P1 session-attention into the header: the real session title (via
+   *  the status message's title field, falling back to the server label) drives
+   *  `.pane-label`, and a distinct attention badge shows when the pane's current
+   *  (dir,session) needs operator input. Activity tints the label so a glance
+   *  distinguishes running / done / error / idle. */
+  private updateStatus(): void {
+    const st = statusFor(this.paneId);
+    const title = titleFor(this.paneId);
+    // Title over server label (augments, never suppresses the Q1-C indicator).
+    const label = title || this.params?.label || "";
+    this.headerLabel.textContent = label;
+    this.headerLabel.title = label;
+    const activity: Activity | "none" = st?.activity ?? "none";
+    if (activity === "none") {
+      this.headerLabel.removeAttribute("data-activity");
+    } else {
+      this.headerLabel.setAttribute("data-activity", activity);
+    }
+    const attention: Attention = st?.attention ?? "none";
+    if (attention === "none") {
+      this.statusBadge.hidden = true;
+      this.statusBadge.classList.remove("is-pulsing");
+      this.statusBadge.removeAttribute("data-attention");
+      this.statusBadge.textContent = "";
+    } else {
+      this.statusBadge.hidden = false;
+      this.statusBadge.setAttribute("data-attention", attention);
+      // Glyph distinguishes the two attention kinds (capability grant vs
+      // clarifying question); the rounded-rect shape + color distinguish P1
+      // attention from the Q1-C circle dot. Wording never overlaps Q1-C.
+      this.statusBadge.textContent = attention === "needs_permission" ? "!" : "?";
+      // Slow opacity pulse (the only animation) draws the eye to needs-input.
+      this.statusBadge.classList.add("is-pulsing");
+    }
   }
 
   private postToPane(msg: unknown): void {

@@ -87,6 +87,72 @@
   text-overflow: ellipsis;
   max-width: 240px;
 }
+/* P1 session-attention: activity tints the title so a glance distinguishes the
+ * pane's lifecycle state. This is the PRIMARY pane-level signal's activity
+ * channel; the attention badge below is the needs-input channel. Both are
+ * DISTINCT from the Q1-C liveness dot/label (different shape, color, wording). */
+.pane-label[data-activity="running"] {
+  color: var(--accent);
+}
+.pane-label[data-activity="done_unread"] {
+  color: var(--accent);
+  font-weight: 700;
+}
+.pane-label[data-activity="error"] {
+  color: var(--warn);
+}
+.pane-label[data-activity="unknown"] {
+  color: var(--fg-dim);
+  font-style: italic;
+}
+/* P1 attention badge: a rounded-rect (NOT a circle dot) with a glyph. Shown
+ * only when the pane's current (dir,session) needs operator input. The slow
+ * opacity pulse is the ONLY animation (no mask-image / backdrop-filter —
+ * AGENTS.md Firefox/WebRender GPU rules; a tiny header element is safe). */
+.pane-status-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 15px;
+  height: 15px;
+  padding: 0 4px;
+  border-radius: 4px; /* rounded rect, NOT 50% — distinct from the Q1-C dot */
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+  flex: 0 0 auto;
+  color: var(--bg);
+}
+/* The HTML hidden attribute's default display:none comes from the UA stylesheet,
+ * which this rule's `display:inline-flex` would otherwise defeat. Reinforce it
+ * so toggling `el.hidden` actually hides the badge (attribute selector wins on
+ * specificity). */
+.pane-status-badge[hidden] {
+  display: none;
+}
+.pane-status-badge[data-attention="needs_permission"] {
+  background: var(--warn);
+}
+.pane-status-badge[data-attention="needs_reply"] {
+  background: var(--accent);
+}
+.pane-status-badge.is-pulsing {
+  animation: pane-status-pulse 2s ease-in-out infinite;
+}
+@keyframes pane-status-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .pane-status-badge.is-pulsing {
+    animation: none;
+  }
+}
 .pane-actions {
   display: flex;
   align-items: center;

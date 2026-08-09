@@ -2,6 +2,7 @@ import { For, Show } from "solid-js";
 import {
   activeWorkspaceId,
   addWorkspace,
+  needsYouCount,
   setActiveWorkspace,
   trayIds,
   workspaces,
@@ -40,6 +41,19 @@ export function Tabstrip() {
               onClick={() => setActiveWorkspace(ws.id)}
             >
               <span class={s.tabLabel}>{ws.name}</span>
+              {/* P1: workspace-aggregate needs-you count (SECONDARY indicator).
+                Shown only on the ACTIVE workspace tab — the aggregate is
+                derived from the active-workspace pane projection (P1 scope).
+                The per-pane header badge carries the load-bearing signal. */}
+              <Show when={activeWorkspaceId() === ws.id && needsYouCount() > 0}>
+                <span
+                  class={s.needBadge}
+                  data-testid="ws-needs-you"
+                  title={`${needsYouCount()} session${needsYouCount() === 1 ? "" : "s"} need you`}
+                >
+                  {needsYouCount()}
+                </span>
+              </Show>
             </button>
           )}
         </For>

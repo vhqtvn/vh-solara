@@ -214,6 +214,47 @@ export async function probePaneMessage(
   }, args);
 }
 
+// ---- P1 session-attention probes -------------------------------------------
+// Drive a {type:"status"} message through the REAL routeMessage router (source-
+// bound to a real pane's contentWindow — same path the SPA's statusEmitter
+// uses) and read back the per-pane status + the active-workspace needs-you
+// aggregate. The bridge is DEV-only; these run under the dev:host webServer.
+
+export interface PaneStatus {
+  dir: string;
+  session: string;
+  title: string;
+  attention: "none" | "needs_reply" | "needs_permission";
+  activity: "running" | "idle" | "done_unread" | "error" | "unknown";
+}
+
+/** Post a {type:"status"} message from a pane (source-bound) through the real
+ *  router, exactly as the SPA's statusEmitter would. Returns the verdict. */
+export async function probeStatus(
+  page: Page,
+  args: { sourcePaneId: string; origin: string; payload: unknown },
+): Promise<RouteResult> {
+  return probePaneMessage(page, args);
+}
+
+/** Last-reported P1 status for a pane (source-bound; null until the first
+ *  status lands). */
+export async function status(page: Page, id: string): Promise<PaneStatus | null> {
+  return page.evaluate((id) => {
+    const h = (window as unknown as { __host?: { status(i: string): PaneStatus | null } }).__host;
+    return h ? h.status(id) : null;
+  }, id);
+}
+
+/** Active-workspace needs-you aggregate (panes whose attention is
+ *  needs_permission or needs_reply). Drives the workspace badge. */
+export async function needsYou(page: Page): Promise<number> {
+  return page.evaluate(() => {
+    const h = (window as unknown as { __host?: { needsYou(): number } }).__host;
+    return h ? h.needsYou() : 0;
+  });
+}
+
 // ---- URL hash state (per-tab URL source-of-truth) --------------------------
 
 /** The raw location.hash string ("" when none). */

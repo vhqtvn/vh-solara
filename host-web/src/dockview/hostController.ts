@@ -24,6 +24,7 @@ import {
   focusedId,
   livenessFor,
   lookupContentWindow,
+  needsYouCount,
   noteIframeLoad,
   resetBaseline,
   routeMessage,
@@ -34,6 +35,7 @@ import {
   setMaximized,
   setPanesVm,
   setTray,
+  statusFor,
   survivalFor,
   titleFor,
   unregisterPane,
@@ -526,9 +528,13 @@ export class HostController implements HostOps {
       expectedNonce: (id: string) => expectedNonceFor(id) ?? null,
       resetBaseline: (id: string) => resetBaseline(id),
       connected: () => connected(),
+      // P1: active-workspace needs-you aggregate (drives the workspace badge).
+      needsYou: () => needsYouCount(),
 
       // ---- document-liveness protocol probes (heartbeat-protocol e2e) ------
       liveness: (id: string) => livenessFor(id),
+      // P1 session-attention: last-reported status for a pane (source-bound).
+      status: (id: string) => statusFor(id) ?? null,
       probeHeartbeat: (
         args: {
           sourcePaneId: string | null;

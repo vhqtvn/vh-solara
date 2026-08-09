@@ -17,6 +17,7 @@ import { installViewport } from "./viewport";
 import { installScrollEdges } from "./lib/scrollEdges";
 import { startPresence } from "./alerts";
 import { startHeartbeat } from "./heartbeat";
+import { startStatusEmitter } from "./statusEmitter";
 import { refreshProjectSettings } from "./projectSettings";
 import "./styles/main.css";
 
@@ -82,6 +83,12 @@ if (standalone === "code") {
   // Installed early so the handshake listener is registered before the host's
   // iframe load event delivers it. See host-web/docs/heartbeat-protocol.md.
   startHeartbeat();
+  // P1 session-attention emitter (no-op when standalone). Same embed gate +
+  // captured-origin security pattern as the heartbeat; posts a {type:"status"}
+  // message idempotent-on-change so the host can decorate each pane with the
+  // current (dir,session)'s attention/activity (distinct from Q1-C liveness).
+  // See web/src/statusEmitter.ts.
+  startStatusEmitter();
   startSync();
   // OpenCode lifecycle health polling (independent of the worker SSE stream):
   // the worker being reachable (state.status "live") only means the vh-solara

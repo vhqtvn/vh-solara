@@ -72,6 +72,24 @@
   border-color: var(--accent);
   color: var(--fg);
 }
+/* P1 workspace-aggregate needs-you count badge (SECONDARY). Distinct shape from
+ * the per-pane attention badge (pill here vs rounded-rect there) and from the
+ * Q1-C liveness dot. Amber = "operator action needed". */
+.needBadge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 8px;
+  background: var(--warn);
+  color: var(--bg);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+  flex: 0 0 auto;
+}
 .plus {
   width: 26px;
   height: 26px;

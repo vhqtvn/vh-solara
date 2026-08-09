@@ -37,6 +37,36 @@ export interface PaneVm {
   id: string;
   label: string;
   title: string;
+  /**
+   * P1 session-attention status for the pane's current `(dir, session)`, when
+   * the embedded SPA has reported one via a `{type:"status"}` message. Absent
+   * until the first status lands (the host renders no attention indicator and
+   * treats activity as "unknown"). Carried in the view-model so SolidJS shell
+   * components (the workspace needs-you badge) react to status changes; the
+   * imperative pane renderer reads the source-of-truth `statusFor(paneId)`.
+   */
+  status?: PaneStatus;
+}
+
+// ---- P1 session-attention (pane ⇄ host) ------------------------------------
+// The embedded SPA derives its current `(dir, session)`'s attention/activity
+// from its sync store and reports it via a `{type:"status"}` message that
+// reuses the heartbeat/route security pattern (embed gate, inbound source-
+// guard, captured-origin targeting). The host keys it by the pane's bound
+// contentWindow (NEVER a sender-claimed id) and decorates the pane header +
+// a workspace-aggregate badge. This is DISTINCT from Q1-C document-liveness
+// (the heartbeat dot/label): attention is an operator-action signal, not a
+// document-health signal. See web/src/statusEmitter.ts for the SPA side.
+
+export type Attention = "none" | "needs_reply" | "needs_permission";
+export type Activity = "running" | "idle" | "done_unread" | "error" | "unknown";
+
+export interface PaneStatus {
+  dir: string;
+  session: string;
+  title: string;
+  attention: Attention;
+  activity: Activity;
 }
 
 /** Survival identity/signal reported by each iframe's heartbeat. */
@@ -81,7 +111,21 @@ export type PaneToHost =
       src?: string;
     }
   | { type: "title"; title: string }
-  | { type: "route"; route?: string };
+  | { type: "route"; route?: string }
+  // P1 session-attention. dir + session are the SPA's declared non-sensitive
+  // routing vocabulary (identical to the route message); title is OpenCode-
+  // authored plain session/project text (no transcript/URL/content); attention
+  // + activity are derived values. The host keys by the pane's bound
+  // contentWindow and IGNORES any sender-claimed server id — same threat model
+  // as route. See web/src/statusEmitter.ts.
+  | {
+      type: "status";
+      dir: string;
+      session: string;
+      title: string;
+      attention: Attention;
+      activity: Activity;
+    };
 
 // Host → pane. `focus`/`blur` are the pre-existing host-focus routing. The
 // `vh-host-handshake` is the document-liveness challenge (see
