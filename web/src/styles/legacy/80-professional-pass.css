@@ -311,7 +311,13 @@ div.katex-math { display: block; overflow-x: auto; margin: 0.7em 0; text-align: 
   margin: 0;
   padding: 11px 12px;
   font-family: var(--font-ui);
-  font-size: var(--text-base);
+  /* ONE source of truth for the composer font-size, consumed by BOTH layers so
+     they can never diverge (a divergence drifts the transparent textarea's caret
+     off the highlighted glyph in the mirror). Defaults to the app base size; the
+     mobile media query overrides the variable to the iOS-safe 16px on .composer
+     (see 70-composer-diff-git.css) so BOTH layers bump together without a
+     per-element rule desyncing them. */
+  font-size: var(--composer-fs, var(--text-base));
   line-height: 1.5;
   letter-spacing: inherit;
   white-space: pre-wrap;

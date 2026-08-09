@@ -574,7 +574,16 @@
   /* One row on mobile too: the tab bar collapses surplus views into its ⋯ menu
      and the title truncates, so nothing wraps to a second row. */
   .main-head { flex-wrap: nowrap; gap: 6px; }
-  .composer textarea { font-size: 16px; } /* prevents iOS/zoom on focus */
+  /* Mobile: bump BOTH composer layers (transparent textarea + highlight mirror)
+     to the iOS-safe 16px so focusing the textarea doesn't trigger auto-zoom on
+     iOS Safari (<16px inputs zoom on focus). Set via a custom property on
+     .composer so the SHARED .composer-mirror/.composer-text rule (which consumes
+     --composer-fs, see 80-professional-pass.css) resolves BOTH layers to the same
+     size. A per-element `font-size` override on only the textarea (the prior
+     `.composer textarea { font-size: 16px }` rule) desynced its glyph advance +
+     line-box from the 14px mirror, drifting the caret off the highlighted glyph
+     on both axes — visible from the empty state. */
+  .composer { --composer-fs: 16px; }
   .tree-node { min-height: 38px; }
   /* Stack the model name over its badges so neither is squeezed on narrow
      (Galaxy Fold folded) screens; keep the selected check in the corner. */
