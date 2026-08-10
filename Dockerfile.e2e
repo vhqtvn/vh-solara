@@ -2,7 +2,7 @@
 # End-to-end image: real `opencode` driven by a fake LLM, behind the real
 # vh-solara aggregator + web server. Used by tests/e2e-docker/run.sh.
 
-# 1) Build the SPA (embedded into the Go e2e server).
+# 1) Build the SolidJS single-server SPA (embedded into the Go e2e server).
 FROM node:24-alpine AS webbuild
 WORKDIR /app
 COPY web/package.json web/package-lock.json ./web/
@@ -10,13 +10,41 @@ RUN cd web && npm ci
 COPY web ./web
 RUN cd web && npm run build
 
-# 2) Build the Go binaries (e2e server + fake LLM).
+# 2) Build the SolidJS host shell (the multi-server SPA served at `/`). The
+#    e2e server (tools/e2eserver) calls web.NewServer with the production
+#    default hostShellAtRoot=true, so it serves the host shell at `/` exactly
+#    like the production binary. The e2e-docker lane (tests/e2e-docker/run.sh)
+#    currently exercises ONLY the /vh/* and /oc/* API flows -- no assertion hits
+#    `/`, `/app`, or `/host/*` -- so the host shell is never asserted TODAY; we
+#    still build + embed it for parity with the production Dockerfile so the e2e
+#    image mirrors the real vh-solara stack (and any future `/` or `/app`
+#    assertion gets the real SPA, not the cold-fallback placeholder banner).
+#    Mirrors the Makefile `host-web` target: VITE_HOST_FOLDED=1 namespaces
+#    assets under /host/ so they don't collide with single-server /assets/.
+FROM node:24-alpine AS hostbuild
+WORKDIR /app
+COPY host-web/package.json host-web/package-lock.json ./host-web/
+RUN cd host-web && npm ci
+COPY host-web ./host-web
+RUN cd host-web && VITE_HOST_FOLDED=1 npm run build
+
+# 3) Build the Go binaries (e2e server + fake LLM).
 FROM golang:1.25-alpine AS gobuild
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 COPY --from=webbuild /app/web/dist-build ./pkg/web/dist
+# Materialize the host shell, mirroring host-web/scripts/materialize.sh: clean
+# stale generated host artifacts FIRST (a local `make docker` build context can
+# carry gitignored host assets from a prior `make build`, since
+# pkg/web/host-dist is NOT in .dockerignore -- unlike pkg/web/dist), preserving
+# the tracked placeholder.html, then copy the fresh build. serveHostIndex prefers
+# index.html, so the placeholder is inert when a real build is present. See the
+# production Dockerfile stage 3 for the full rationale.
+RUN rm -rf ./pkg/web/host-dist/assets ./pkg/web/host-dist/index.html \
+    ./pkg/web/host-dist/*.js ./pkg/web/host-dist/*.map 2>/dev/null || true
+COPY --from=hostbuild /app/host-web/dist ./pkg/web/host-dist
 # GOTOOLCHAIN=local is deliberate (hermetic, reproducible builds) and means there is
 # NO auto-download fallback inside this image. Invariant: the base image's Go (FROM
 # golang:1.25-alpine above) MUST be >= the `go` directive in go.mod, or this stage
@@ -29,7 +57,7 @@ ENV CGO_ENABLED=0 GOTOOLCHAIN=local
 RUN go build -trimpath -o /out/e2eserver ./tools/e2eserver \
  && go build -trimpath -o /out/fakellm ./tools/fakellm
 
-# 3) Runtime with the real opencode binary (glibc/bun).
+# 4) Runtime with the real opencode binary (glibc/bun).
 FROM debian:bookworm-slim
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl git tar sqlite3 \
