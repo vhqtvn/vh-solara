@@ -3,15 +3,29 @@
   flex: 0 0 auto;
 }
 .trigger {
-  width: 26px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   height: 26px;
+  padding: 0 8px;
   border: 1px solid var(--border);
   border-radius: 6px;
   background: var(--bg);
   color: var(--fg-dim);
-  font-size: 14px;
+  font-size: 12px;
+  font-weight: 600;
   line-height: 1;
   cursor: pointer;
+  white-space: nowrap;
+  -webkit-user-select: none;
+  user-select: none;
+}
+.triggerIcon {
+  font-size: 14px;
+  line-height: 1;
+}
+.triggerText {
+  font-size: 12px;
 }
 .trigger:hover {
   border-color: var(--accent);
@@ -26,16 +40,33 @@
   background: var(--bg-elev);
   border: 1px solid var(--border);
   border-radius: 8px;
-  padding: 10px;
+  padding: 12px;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 10px;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+}
+.heading {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--fg);
 }
 .form {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 8px;
+}
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.fieldLabel {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--fg-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
 }
 .input {
   width: 100%;
@@ -51,8 +82,13 @@
   outline: none;
   border-color: var(--accent);
 }
+.helper {
+  font-size: 10px;
+  color: var(--fg-dim);
+  line-height: 1.35;
+}
 .addBtn {
-  height: 26px;
+  height: 28px;
   border: 1px solid var(--accent);
   border-radius: 5px;
   background: var(--accent-soft);
@@ -68,6 +104,16 @@
 .error {
   font-size: 11px;
   color: var(--warn);
+}
+/* Outcome line (decision #3): stays visible after submit so the operator can
+ * tell what the + did. data-kind carries already-open|opened|added for e2e. */
+.outcome {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--accent);
+  padding: 4px 6px;
+  background: var(--accent-soft);
+  border-radius: 4px;
 }
 .catalog {
   display: flex;
@@ -115,4 +161,18 @@
 }
 .removeBtn:hover {
   border-color: var(--warn);
+}
+
+/* Narrow strips (phone width): hide the "Add server" text, keep the + icon +
+ * the aria-label. The trigger collapses to an icon button so it never crowds
+ * the tab row on a small viewport. */
+@media (max-width: 480px) {
+  .triggerText {
+    display: none;
+  }
+  .trigger {
+    padding: 0;
+    width: 26px;
+    justify-content: center;
+  }
 }

@@ -411,6 +411,12 @@ const CLOCK_TICK_MS = 500; // ≈2 Hz re-evaluation
 const survivalMap = new Map<string, Survival>();
 const baselineMap = new Map<string, SurvivalBaseline>();
 const configuredOrigin = new Map<string, string>();
+// P4 decision #7 (unavailable-server state): a revision signal bumped on every
+// bindPaneOrigin / unregisterPane so the Tabstrip can reactively re-evaluate
+// whether each tab's server still has a bound pane. The Set of origins is
+// derived from configuredOrigin on read; this signal is what makes that read
+// reactive (configuredOrigin itself is a plain Map, not a signal).
+const [originRevision, setOriginRevision] = createSignal(0);
 const pendingLoad = new Map<string, boolean>();
 const reloadDetectedAt = new Map<string, number>();
 const titleByPane = new Map<string, string>();
@@ -461,9 +467,23 @@ export function resetBaseline(id: string): void {
 /** Bind a pane's configured server origin (constraint #3 origin check). */
 export function bindPaneOrigin(id: string, origin: string): void {
   configuredOrigin.set(id, origin);
+  setOriginRevision((n) => n + 1); // P4 #7: Tabstrip unavailable-state reactivity
 }
 export function configuredOriginFor(id: string): string | undefined {
   return configuredOrigin.get(id);
+}
+
+/**
+ * The set of currently-bound server origins across ALL panes (P4 decision #7).
+ * REACTIVE: depends on originRevision (bumped on bind/unbind), so a Tabstrip
+ * consumer re-evaluates when a pane opens/closes — this is what lets a tab go
+ * aria-disabled the moment its server's last pane closes. Returns a fresh Set
+ * each call (cheap: small N). */
+export function boundOrigins(): Set<string> {
+  void originRevision(); // track
+  const s = new Set<string>();
+  for (const o of configuredOrigin.values()) s.add(o);
+  return s;
 }
 
 /** The challenge nonce the host issued for a pane's current pending load. */
@@ -620,6 +640,7 @@ export function unregisterPane(id: string): void {
   survivalMap.delete(id);
   baselineMap.delete(id);
   configuredOrigin.delete(id);
+  setOriginRevision((n) => n + 1); // P4 #7: Tabstrip unavailable-state reactivity
   pendingLoad.delete(id);
   reloadDetectedAt.delete(id);
   expectedNonce.delete(id);

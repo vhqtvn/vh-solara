@@ -1,6 +1,6 @@
 import type { DockviewApi, IDockviewPanel } from "dockview-core";
 import type { IframeRenderer } from "./iframeRenderer";
-import type { HostOps, SplitDir } from "./types";
+import type { AddServerOutcome, HostOps, SplitDir } from "./types";
 import {
   isFleetEntry,
   isRealFleet,
@@ -11,6 +11,7 @@ import {
 import {
   addRuntimeServer,
   removeRuntimeServer,
+  runtimeServers,
 } from "../state/serverList";
 import { firstNeedsYouAtFor } from "./store";
 import {
@@ -277,6 +278,61 @@ export class HostController implements HostOps {
   }
 
   /**
+   * Deterministic add-server with an OUTCOME the operator can see (decision
+   * #3). This is the path the AddServer popover uses; it differs from the
+   * legacy addServer (always add+open) by handling the three cases the operator
+   * could not previously distinguish:
+   *
+   *  - matching pane ALREADY OPEN in the active workspace → focus it, NO new
+   *    pane, NO catalog change → {kind:"already-open"}. (This is the fix for
+   *    the "+ does nothing / opens a duplicate" confusion: a re-add of an
+   *    already-open server now focuses the existing pane instead of silently
+   *    stacking a duplicate.)
+   *  - catalog-known (runtimeServers has the url) but no open pane → open one,
+   *    NO catalog change → {kind:"opened"}.
+   *  - new url → addRuntimeServer + open → {kind:"added"}.
+   *
+   * SECURITY: same isFleetEntry guard as addServer — a non-http(s) value is
+   * rejected (null return, no pane, no catalog change). The url lands on an
+   * unsandboxed iframe.src.
+   *
+   * NOTE: the already-open check is scoped to THIS workspace (the active one),
+   * matching the popover's "Add a server" intent (the operator is looking at
+   * the active workspace). A url open in a NON-active workspace is treated as
+   * "opened" here (a new pane opens in the active workspace) — cross-workspace
+   * focus is the tab-click path's job (selectTab), not the add-server path's.
+   */
+  addServerWithOutcome(url: string, label: string): AddServerOutcome | null {
+    const u = url.trim();
+    const l = label.trim() || safeHost(u);
+    if (!isFleetEntry({ url: u, label: l })) return null; // reject: not http/https
+    // (1) matching pane ALREADY OPEN in the active workspace → focus it.
+    for (const panel of this.api.panels) {
+      const pu = (panel.params as { url?: string } | undefined)?.url;
+      if (pu === u) {
+        panel.api.setActive();
+        this.afterMutation();
+        return { kind: "already-open", paneId: panel.id, label: l };
+      }
+    }
+    // (2) catalog-known but no open pane → open one (no catalog change).
+    // (3) new url → addRuntimeServer + open.
+    const known = runtimeServers().some((e) => e.url === u);
+    if (!known) addRuntimeServer(u, l);
+    const ref = this.api.activePanel ?? undefined;
+    const created = this.api.addPanel({
+      id: nextPaneId(),
+      component: "iframe",
+      renderer: "always",
+      params: { url: u, label: l },
+      position: ref ? { referencePanel: ref, direction: "right" } : undefined,
+    });
+    created.api.setActive();
+    this.afterMutation();
+    return { kind: known ? "opened" : "added", paneId: created.id, label: l };
+  }
+
+  /**
    * Remove a server (by url) from the runtime catalog + close its open panes
    * (in THIS workspace). Returns true when applied; false when refused (closing
    * this server's grid panes would empty the visible grid — refused so the grid
@@ -507,6 +563,7 @@ export class HostController implements HostOps {
     this.ops.collapse = (id) => this.collapse(id);
     this.ops.restore = (id) => this.restore(id);
     this.ops.addServer = (url, label) => this.addServer(url, label);
+    this.ops.addServerWithOutcome = (url, label) => this.addServerWithOutcome(url, label);
     this.ops.removeServer = (url) => this.removeServer(url);
     this.ops.updateRoute = (paneId, route) => this.updateRoute(paneId, route);
     this.ops.selectTarget = (paneId, dir, session) => this.selectTarget(paneId, dir, session);
@@ -688,6 +745,15 @@ export class HostController implements HostOps {
         activeController()?.addServer(url, label) ?? null,
       removeServer: (url: string): boolean =>
         activeController()?.removeServer(url) ?? false,
+      // P4 decision #3: deterministic add-server with an OUTCOME. Drives the
+      // SAME production HostOps path the AddServer popover uses
+      // (hostOps().addServerWithOutcome). Returns {kind,paneId,label} or null
+      // on isFleetEntry rejection.
+      addServerWithOutcome: (
+        url: string,
+        label: string,
+      ): AddServerOutcome | null =>
+        activeController()?.addServerWithOutcome(url, label) ?? null,
 
       // P4 reverse-nav: drive a select through the SAME production HostOps path
       // the shell's NEXT/jump-to-session UI will use (hostOps().selectTarget).
@@ -725,7 +791,8 @@ export class HostController implements HostOps {
       // targetRegistry module the Tabstrip + selectTarget/updateRoute use.
       targets: (): Array<{
         serverId: string; dir: string; session: string;
-        title: string; lastVisitedAt: number; pinned: boolean;
+        title: string; titleSource: "fallback" | "session";
+        lastVisitedAt: number; pinned: boolean;
         live: boolean;
         liveStatus: { attention: string; activity: string; title: string } | null;
       }> => {
@@ -737,6 +804,7 @@ export class HostController implements HostOps {
             dir: r.target.dir,
             session: r.target.session,
             title: r.title,
+            titleSource: r.titleSource ?? "fallback",
             lastVisitedAt: r.lastVisitedAt,
             pinned: r.pinned,
             live: live.has(k),
@@ -773,6 +841,13 @@ export class HostController implements HostOps {
       // Resolve the pane bound to a serverId (the Tabstrip's tab-click resolver).
       findPaneForServer: (serverId: string): string | null =>
         findPaneForServer(serverId),
+      // P4 decision #7: resolve BOTH the pane AND its owning workspace for a
+      // serverId (cross-workspace selection). Returns {workspaceId,paneId}|null.
+      resolveTabTarget: (serverId: string): { workspaceId: string; paneId: string } | null =>
+        findPaneAndWorkspaceForServer(serverId),
+      // P4 decision #7: read the workspace id that owns a given pane (cross-ws e2e).
+      workspaceOfPane: (paneId: string): string | null =>
+        workspaceOfPane(paneId),
       // Drive a tab select through the SAME production path the Tabstrip uses
       // (findPaneForServer → hostOps().selectTarget → visit).
       selectTab: (serverId: string, dir: string, session: string): boolean =>
@@ -861,34 +936,92 @@ function safeHost(url: string): string {
  * default — the brief's ambiguity. A future per-DIR iframe pool (DELETED from
  * P4 scope) would change this resolution.
  */
+/**
+ * Find the pane id bound to a given serverId (origin), across ALL workspaces.
+ * Prefers the currently-focused pane when its origin matches (so a tab click
+ * for the focused server reuses it); otherwise returns the first matching pane
+ * found by scanning each workspace's live api.panels. Returns null when no pane
+ * is bound to that server (the tab cannot be selected — the Tabstrip renders it
+ * aria-disabled + explanatory).
+ *
+ * AMBIGUITY NOTE (flagged reversible default): if MULTIPLE panes are bound to
+ * the same server origin, this picks the focused one (when it matches) else the
+ * first in workspace-then-panel iteration order. That is a deliberate reversible
+ * default — the brief's ambiguity. A future per-DIR iframe pool (DELETED from
+ * P4 scope) would change this resolution.
+ *
+ * Cross-workspace-aware callers should prefer findPaneAndWorkspaceForServer
+ * (which also returns the owning workspace id so selectTab can activate it).
+ */
 export function findPaneForServer(serverId: string): string | null {
+  return findPaneAndWorkspaceForServer(serverId)?.paneId ?? null;
+}
+
+/**
+ * Resolve BOTH the pane and its owning workspace for a serverId (decision #7).
+ * Used by selectTab to activate the owning workspace FIRST (CSS-only visibility,
+ * survival-safe) before issuing selectTarget — this fixes the "click did
+ * nothing" path when the matching pane is in a hidden (non-active) workspace:
+ * previously selectTarget posted to the pane's contentWindow (which worked) but
+ * the operator saw nothing change because the workspace stayed hidden. Now the
+ * owning workspace is surfaced first so the operator sees the result.
+ *
+ * Returns null when no pane is bound to the server (unavailable-server state).
+ */
+export function findPaneAndWorkspaceForServer(
+  serverId: string,
+): { workspaceId: string; paneId: string } | null {
+  // Prefer the focused pane when its origin matches (it lives in the active
+  // workspace, so its owning workspace is activeWorkspaceId()).
   const focused = focusedId();
   if (focused && configuredOriginFor(focused) === serverId) {
-    return focused;
+    const ws = activeWorkspaceId();
+    if (ws) return { workspaceId: ws, paneId: focused };
   }
   for (const ws of storeWorkspaces()) {
     const api = workspaceApiFor(ws.id);
     if (!api) continue;
     for (const panel of api.panels) {
       if (configuredOriginFor(panel.id) === serverId) {
-        return panel.id;
+        return { workspaceId: ws.id, paneId: panel.id };
       }
     }
   }
   return null;
 }
 
+/** Read the workspace id that owns a given pane (across all workspaces), or
+ *  null when no live api has the pane. Used by the DEV bridge for the cross-
+ *  workspace e2e. */
+export function workspaceOfPane(paneId: string): string | null {
+  for (const ws of storeWorkspaces()) {
+    const api = workspaceApiFor(ws.id);
+    if (!api) continue;
+    if (api.panels.some((p) => p.id === paneId)) return ws.id;
+  }
+  return null;
+}
+
 /**
- * Select a target's tab: resolve the pane bound to the target's server and
- * issue a survival-safe selectTarget (SPA-internal route change; the iframe src
- * + element are NEVER touched — proven mechanism). No-op (returns false) when
- * no pane is bound to that server. On success, visit() (called inside
- * selectTarget) sets the target active. Returns true when a select was issued.
+ * Select a target's tab (decision #7 cross-workspace path). Resolves the pane
+ * bound to the target's server AND its owning workspace; if the owning workspace
+ * is not active, activates it FIRST (CSS-only visibility switch — survival-safe,
+ * no iframe reload), then issues the survival-safe selectTarget (SPA-internal
+ * route change; the iframe src + element are NEVER touched). No-op (returns
+ * false) when no pane is bound to that server (the Tabstrip renders the tab
+ * aria-disabled + explanatory — unavailable-server state). On success, visit()
+ * (called inside selectTarget) sets the target active.
  */
 export function selectTab(target: AttentionTargetLike): boolean {
-  const paneId = findPaneForServer(target.serverId);
-  if (!paneId) return false;
-  hostOps()?.selectTarget?.(paneId, target.dir, target.session);
+  const resolved = findPaneAndWorkspaceForServer(target.serverId);
+  if (!resolved) return false; // unavailable-server: no pane bound → no-op
+  // Cross-workspace: surface the owning workspace FIRST so the operator sees
+  // the result (CSS-only visibility — survival-safe). No-op when already active.
+  const active = activeWorkspaceId();
+  if (active !== resolved.workspaceId) {
+    storeSetActiveWorkspace(resolved.workspaceId);
+  }
+  hostOps()?.selectTarget?.(resolved.paneId, target.dir, target.session);
   return true;
 }
 
@@ -902,6 +1035,8 @@ interface AttentionTargetLike {
 
 // Re-export the registry accessors the Tabstrip + bridge consume, so the shell
 // imports everything tab-related from hostController (one import surface).
+// (findPaneAndWorkspaceForServer + workspaceOfPane are already `export
+// function` above, so they are NOT re-listed here.)
 export {
   visitTarget,
   dismissTarget,

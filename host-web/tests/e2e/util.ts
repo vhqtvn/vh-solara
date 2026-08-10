@@ -488,6 +488,48 @@ export async function addServer(page: Page, url: string, label: string): Promise
   }, { url, label });
   return r ?? null;
 }
+
+// P4 decision #3: deterministic add-server with an OUTCOME. Returns the outcome
+// {kind: "already-open"|"opened"|"added", paneId, label} or null on rejection.
+// Drives the SAME production path the AddServer popover uses.
+export interface AddServerOutcomeVm {
+  kind: "already-open" | "opened" | "added";
+  paneId: string;
+  label: string;
+}
+export async function addServerWithOutcome(
+  page: Page,
+  url: string,
+  label: string,
+): Promise<AddServerOutcomeVm | null> {
+  const r = await page.evaluate(({ url, label }) => {
+    const h = (window as unknown as { __host?: { addServerWithOutcome(u: string, l: string): AddServerOutcomeVm | null } }).__host;
+    return h ? h.addServerWithOutcome(url, label) : null;
+  }, { url, label });
+  return r ?? null;
+}
+
+// P4 decision #7: resolve BOTH the pane AND its owning workspace for a serverId
+// (cross-workspace selection). Returns {workspaceId, paneId} or null.
+export async function resolveTabTarget(
+  page: Page,
+  serverId: string,
+): Promise<{ workspaceId: string; paneId: string } | null> {
+  const r = await page.evaluate((serverId) => {
+    const h = (window as unknown as { __host?: { resolveTabTarget(s: string): { workspaceId: string; paneId: string } | null } }).__host;
+    return h ? h.resolveTabTarget(serverId) : null;
+  }, serverId);
+  return r ?? null;
+}
+
+// P4 decision #7: read the workspace id that owns a given pane (cross-ws e2e).
+export async function workspaceOfPane(page: Page, paneId: string): Promise<string | null> {
+  const r = await page.evaluate((paneId) => {
+    const h = (window as unknown as { __host?: { workspaceOfPane(p: string): string | null } }).__host;
+    return h ? h.workspaceOfPane(paneId) : null;
+  }, paneId);
+  return r ?? null;
+}
 // Remove a server (by url) from the runtime catalog + close its panes in the
 // ACTIVE workspace. Returns true when applied; false when refused.
 export async function removeServer(page: Page, url: string): Promise<boolean> {
@@ -524,6 +566,7 @@ export interface TargetVm {
   dir: string;
   session: string;
   title: string;
+  titleSource: "fallback" | "session";
   lastVisitedAt: number;
   pinned: boolean;
   live: boolean;

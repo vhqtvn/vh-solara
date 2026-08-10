@@ -70,11 +70,16 @@ function keyOf(serverId: string, dir: string, session: string): string {
 // ---- reactive state ---------------------------------------------------------
 
 /**
- * The registry: a list of TabRecords (deduped by targetKey). Ordered
- * most-recently-visited first (inserts + revisits move to front), with pinned
- * records kept ahead of unpinned within the same recency bucket is NOT done —
- * the order is pure LRU (lastVisitedAt desc). The Tabstrip renders this list
- * as-is; stable order = no tab shuffle on a status-only update.
+ * The registry: a list of TabRecords (deduped by targetKey) in STABLE
+ * INSERTION ORDER (decision #1). New tabs APPEND to the end; a re-visit
+ * updates `lastVisitedAt` + the active target but does NOT move the record.
+ * This is what stops the "tabs jump positions on re-visit" defect the
+ * operator reported: the visible order never changes from a status-only or
+ * re-select update.
+ *
+ * `lastVisitedAt` is retained ONLY for cap-eviction (LRU at the 20-unpinned
+ * cap) and age retirement (7-day) — NOT for visible reorder. The Tabstrip
+ * renders this list as-is.
  */
 const [records, setRecords] = createSignal<TabRecord[]>([]);
 export { records };
@@ -133,7 +138,10 @@ const TARGET_SAVE_DEBOUNCE_MS = 450;
 
 /** Durable persisted shape. `liveStatus` is deliberately absent (runtime-only).
  *  The envelope carries a `v` tag so a future schema bump can fall back cleanly
- *  (a stale/malformed blob is rejected wholesale → empty registry). */
+ *  (a stale/malformed blob is rejected wholesale → empty registry).
+ *
+ *  `titleSource` is OPTIONAL (backward-compat with v1 blobs written before the
+ *  source-precedence fix): an absent field is loaded as `"fallback"`. */
 interface PersistedTargets {
   v: 1;
   records: Array<{
@@ -141,6 +149,7 @@ interface PersistedTargets {
     title: string;
     lastVisitedAt: number;
     pinned: boolean;
+    titleSource?: "fallback" | "session";
   }>;
 }
 
@@ -189,6 +198,11 @@ function validatePersistedTargets(v: unknown): TabRecord[] {
     ) {
       return [];
     }
+    // titleSource is optional + bounded; absent/malformed → "fallback".
+    let titleSource: "fallback" | "session" = "fallback";
+    if (e.titleSource === "fallback" || e.titleSource === "session") {
+      titleSource = e.titleSource;
+    }
     const target: AttentionTarget = {
       serverId: t.serverId,
       dir: t.dir,
@@ -202,6 +216,7 @@ function validatePersistedTargets(v: unknown): TabRecord[] {
       title: e.title,
       lastVisitedAt: e.lastVisitedAt,
       pinned: e.pinned,
+      titleSource,
       // liveStatus is deliberately NOT loaded (runtime-only).
     });
   }
@@ -245,6 +260,7 @@ function flushTargetSave(): void {
       title: r.title,
       lastVisitedAt: r.lastVisitedAt,
       pinned: r.pinned,
+      titleSource: r.titleSource ?? "fallback",
     })),
   };
   try {
@@ -279,18 +295,30 @@ function retireAged(list: TabRecord[], now: number): TabRecord[] {
 
 /** Enforce the unpinned cap (LRU-evict the least-recently-visited unpinned).
  *  Mutates the array in place (the caller has just built a fresh list). Pinned
- *  records are exempt. The just-inserted/revisited record is most-recent so it
- *  is never the LRU victim. */
+ *  records are exempt. The just-inserted/revisited record is never the LRU
+ *  victim (its lastVisitedAt is `now`). NOTE: this evicts BY lastVisitedAt, NOT
+ *  by array position — the visible order is STABLE insertion order (decision
+ *  #1), so LRU here means "drop the unpinned record with the smallest
+ *  lastVisitedAt", wherever it sits in the list. */
 function enforceUnpinnedCap(list: TabRecord[]): void {
-  // list is ordered most-recent-first. Walk from the END (least-recent) and
-  // drop unpinned records until the unpinned count is within cap.
   let unpinned = list.reduce((n, r) => (r.pinned ? n : n + 1), 0);
   if (unpinned <= UNPINNED_CAP) return;
-  for (let i = list.length - 1; i >= 0 && unpinned > UNPINNED_CAP; i--) {
-    if (!list[i].pinned) {
-      list.splice(i, 1);
-      unpinned--;
+  // Evict the unpinned record(s) with the smallest lastVisitedAt until the
+  // unpinned count is within cap. Splice by index (highest first so earlier
+  // indices stay valid), choosing the current min each iteration.
+  while (unpinned > UNPINNED_CAP) {
+    let victimIdx = -1;
+    let victimTs = Number.POSITIVE_INFINITY;
+    for (let i = 0; i < list.length; i++) {
+      if (list[i].pinned) continue;
+      if (list[i].lastVisitedAt < victimTs) {
+        victimTs = list[i].lastVisitedAt;
+        victimIdx = i;
+      }
     }
+    if (victimIdx < 0) break; // no unpinned left (shouldn't happen)
+    list.splice(victimIdx, 1);
+    unpinned--;
   }
 }
 
@@ -325,11 +353,24 @@ function recomputeLiveKeys(): void {
 // ---- registry operations ----------------------------------------------------
 
 /**
- * Upsert a target as a visited tab. Dedupes by exact (serverId,dir,session):
- * on re-visit, updates lastVisitedAt + title and moves the record to
- * most-recent (front). On first visit, creates the record at the front. Sets
- * the record as the active target. Enforces age retirement + the unpinned cap
- * (LRU-evict) on every call. Persists via a debounced save.
+ * Upsert a target as a visited tab. Dedupes by exact (serverId,dir,session).
+ * STABLE INSERTION ORDER (decision #1): on first visit, the record APPENDS to
+ * the end of the list; on re-visit, `lastVisitedAt` is updated + the record is
+ * set as the active target, but the record is NOT moved (its position is
+ * preserved — no tab jumps). Enforces age retirement + the unpinned cap
+ * (LRU-evict by lastVisitedAt) on every call. Persists via a debounced save.
+ *
+ * TITLE SOURCE-PRECEDENCE (decision #2): the `title` arg here is the PANE
+ * title (titleFor(paneId)) — a document/page label, NOT a session status title.
+ * It is FALLBACK-TIER only: a fresh record starts titleSource="fallback"
+ * (title = the pane title if supplied, else the server host). A re-visit may
+ * refresh the fallback label value (the pane title may have improved) while
+ * still "fallback". The ONLY promotion to "session" (pinned) happens in
+ * applyLiveStatus, when the first non-empty SESSION STATUS title arrives.
+ * Once "session", the title is never touched here. This is the fix for the
+ * "server label does nothing" defect: the server/pane label is the fallback
+ * shown until a real session title arrives, then the session title wins
+ * permanently (no flicker, no re-clobber by later status ticks).
  *
  * Fork B: this is the ONLY way a never-visited session enters the registry
  * (host-driven selectTarget or an accepted SPA route). No background creation
@@ -344,24 +385,36 @@ export function visit(target: AttentionTarget, title?: string): void {
   let updated: TabRecord[];
   if (existingIdx >= 0) {
     const existing = list[existingIdx];
+    // TITLE PRECEDENCE: a re-visit's `title` (pane title) refreshes the FALLBACK
+    // label value ONLY while titleSource is still "fallback". Once "session"
+    // (pinned by applyLiveStatus), the visit title is IGNORED — a pinned session
+    // title is never clobbered by a pane/server label.
+    const isFallback = (existing.titleSource ?? "fallback") === "fallback";
+    const refreshFallback = isFallback && !!title && title.length > 0;
     const refreshed: TabRecord = {
       target: existing.target, // keep referential target identity
-      title: title && title.length > 0 ? title : existing.title,
-      lastVisitedAt: now,
+      title: refreshFallback ? title! : existing.title,
+      titleSource: existing.titleSource ?? "fallback",
+      lastVisitedAt: now, // LRU for cap-eviction + age retirement (NOT for reorder)
       pinned: existing.pinned,
       liveStatus: existing.liveStatus, // preserve last-known live status
     };
-    // Move to front (most-recent).
-    updated = [refreshed, ...list.filter((_, i) => i !== existingIdx)];
+    // STABLE ORDER: update IN PLACE — do NOT move the record. This is the fix
+    // for the "tabs jump positions on re-visit" defect.
+    updated = list.slice();
+    updated[existingIdx] = refreshed;
   } else {
-    // First visit: new record at front, unpinned.
+    // First visit: new record APPENDED at the end, unpinned. titleSource is
+    // ALWAYS "fallback" here (the pane/server label is fallback-tier; only a
+    // session status title — applyLiveStatus — promotes to "session").
     const rec: TabRecord = {
       target,
       title: title && title.length > 0 ? title : fallbackTitle(target),
+      titleSource: "fallback",
       lastVisitedAt: now,
       pinned: false,
     };
-    updated = [rec, ...list];
+    updated = [...list, rec];
     enforceUnpinnedCap(updated);
   }
   setRecords(updated);
@@ -481,14 +534,33 @@ export function applyLiveStatus(
     return;
   }
   const next = list.slice();
+  // TITLE SOURCE-PRECEDENCE (decision #2): adopt the session title from a
+  // status tick ONLY while the source is still "fallback" AND the tick carries
+  // a non-empty title — then PIN it ("session"). Once "session", the title is
+  // NEVER replaced by a status tick (this is the fix for the "server label
+  // does nothing" defect: previously EVERY non-empty status.title overwrote
+  // the tab title, so a session title clobbered the server label and then got
+  // re-clobbered by each later tick — flicker). An empty status title cannot
+  // clear a pinned title. The server label (catalog/pane context) is the
+  // fallback only until a real session title arrives; after that the session
+  // title wins permanently.
+  const wasFallback = (prev.titleSource ?? "fallback") === "fallback";
+  const adoptTitle = wasFallback && !!status.title && status.title.length > 0;
   next[idx] = {
     ...prev,
     liveStatus: status,
-    title: status.title && status.title.length > 0 ? status.title : prev.title,
+    title: adoptTitle ? status.title : prev.title,
+    titleSource: adoptTitle ? "session" : (prev.titleSource ?? "fallback"),
   };
   setRecords(next);
-  // liveStatus is runtime-only — no scheduleTargetSave() (it's stripped on save
-  // anyway, so persisting now would be a wasted write).
+  // PERSISTENCE: liveStatus itself is runtime-only (stripped on save), so a
+  // status-only tick needs no save. BUT when this tick PROMOTED the title
+  // source (fallback → session pin), the durable `title` + `titleSource`
+  // fields changed — persist so a reload before the next registry mutation
+  // does NOT revert the pinned session title to the fallback server label.
+  // (Decision #2 completeness: "Never replace a session title with fallback"
+  // must hold across a cold reload, not only across later mutations.)
+  if (adoptTitle) scheduleTargetSave();
 }
 
 // ---- helpers ----------------------------------------------------------------

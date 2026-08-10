@@ -135,3 +135,83 @@
   color: var(--warn);
   flex: 0 0 auto;
 }
+
+/* ---- P4 decisions #4 + #7 (dismiss, unavailable, empty-state) ---- */
+
+/* Empty-state hint (decision #7 holistic): muted inline text when the registry
+ * is empty, telling the operator how a tab appears (Fork B). GPU-cheap: plain
+ * text, no effects. */
+.emptyHint {
+  font-size: 11px;
+  color: var(--fg-dim);
+  font-style: italic;
+  white-space: nowrap;
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Dismiss (×) button (decision #4). On FINE pointers it is revealed on
+ * hover/focus of the enclosing tab (so the resting strip is uncluttered); on
+ * COARSE pointers (touch) it is ALWAYS visible (a touch target must be
+ * discoverable). Touch-safe hit area (32×32) under pointer:coarse. GPU-cheap:
+ * static. */
+.dismissBtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  margin-left: 2px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--fg-dim);
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+  flex: 0 0 auto;
+  padding: 0;
+  /* Fine-pointer default: hidden until hover/focus of the tab (see .tab:hover
+   * + .tab:focus-within below). Coarse pointers override to always-visible. */
+  opacity: 0;
+  transition: opacity 0.1s linear;
+}
+.tab:hover .dismissBtn,
+.tab:focus-within .dismissBtn {
+  opacity: 1;
+}
+.dismissBtn:hover {
+  background: var(--warn);
+  color: var(--bg);
+}
+
+/* Unavailable-server (decision #7): the tab's server has no bound pane. Distinct
+ * from stale (a live-status concept): unavailable is a STRUCTURAL "no pane"
+ * state. GPU-cheap: dashed border + reduced opacity (no animation). */
+.tabUnavailable {
+  opacity: 0.45;
+  border-style: dashed;
+  cursor: not-allowed;
+}
+.tabUnavailable:hover {
+  border-color: var(--border);
+  color: var(--fg-dim);
+}
+
+/* COARSE POINTER (touch): the dismiss × is ALWAYS visible + a touch-safe target
+ * (32×32 hit area). Tabs are the primary nav on a phone; hiding the dismiss
+ * affordance behind hover would make it undiscoverable. */
+@media (pointer: coarse) {
+  .dismissBtn {
+    opacity: 1;
+    width: 32px;
+    height: 32px;
+    margin-left: 4px;
+  }
+  .tab {
+    /* Slightly taller touch target on phone-width strips. */
+    height: 30px;
+  }
+}

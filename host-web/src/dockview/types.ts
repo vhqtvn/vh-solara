@@ -170,6 +170,18 @@ export const VIEW_KINDS: ViewKind[] = ["chat", "terminal", "diff", "sessions"];
 
 export type SplitDir = "right" | "down";
 
+/**
+ * Outcome of a deterministic add-server action (decision #3). The kind tells
+ * the UI which outcome line to show; `paneId` is the pane that ended up
+ * focused/opened (existing for "already-open", newly created otherwise);
+ * `label` is the resolved display label (supplied or derived from the url
+ * host). See HostOps.addServerWithOutcome. */
+export interface AddServerOutcome {
+  kind: "already-open" | "opened" | "added";
+  paneId: string;
+  label: string;
+}
+
 export interface HostOps {
   split?(paneId: string, direction: SplitDir): string | null;
   swap?(a: string, b: string): void;
@@ -182,8 +194,29 @@ export interface HostOps {
    *  validated through isFleetEntry (http/https) — a javascript:/data:/opaque
    *  value is REJECTED (returns null, no pane, no catalog change) because it
    *  would execute same-origin against the host shell via the unsandboxed
-   *  iframe.src. Returns the new pane id, or null on rejection. */
+   *  iframe.src. Returns the new pane id, or null on rejection.
+   *
+   *  NOTE: this is the LEGACY always-add-and-open path retained for the test
+   *  bridge (existing survival/layout/attention e2e call it for deterministic
+   *  pane creation). The UI's AddServer popover uses addServerWithOutcome
+   *  (deterministic-duplicate handling + an outcome the operator can see). */
   addServer?(url: string, label: string): string | null;
+  /**
+   * Deterministic add-server with an OUTCOME the operator can see (decision
+   * #3). Three outcomes, all returning the resolved label + the pane id that
+   * ended up focused/opened:
+   *  - `"already-open"`: the active workspace already has a pane bound to this
+   *    url → focus it (NO new pane, NO catalog change).
+   *  - `"opened"`: the url is catalog-known but no pane is open for it → open
+   *    one (NO catalog change).
+   *  - `"added"`: the url is new → addRuntimeServer + open a pane.
+   * Returns null on isFleetEntry rejection (no pane, no catalog change). The
+   * popover stays open + shows the outcome line so the operator can tell what
+   * happened (the core legibility fix). */
+  addServerWithOutcome?(
+    url: string,
+    label: string,
+  ): AddServerOutcome | null;
   /** Remove a server (by url) from the runtime catalog + close its open panes.
    *  Returns true when applied; false when refused — specifically when closing
    *  that server's grid panes would empty the visible grid (refused so the grid
@@ -262,4 +295,15 @@ export interface TabRecord {
   pinned: boolean;
   /** LAST-KNOWN status (runtime-only; not persisted). Honest only while live. */
   liveStatus?: PaneStatus;
+  /**
+   * TITLE SOURCE-PRECEDENCE (decision #2). A tab starts as `"fallback"` (its
+   * title is the server host, derived from the bound origin). The FIRST
+   * non-empty session status title that arrives flips this to `"session"`
+   * (PINNED) — once pinned, the title is NEVER replaced by a fallback or a
+   * later status tick. This is what stops the "server label does nothing"
+   * flicker the operator reported: the title was being overwritten on every
+   * non-empty status tick. Persistence is optional + backward-compat (an
+   * absent field on a cold-loaded v1 blob defaults to `"fallback"`).
+   */
+  titleSource?: "fallback" | "session";
 }
