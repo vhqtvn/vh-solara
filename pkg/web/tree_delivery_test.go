@@ -169,21 +169,21 @@ func TestDeliver_Success_BuffersAndCommits(t *testing.T) {
 	}
 
 	var cw countingWriter
-	if err := deliverTreeOps(&cw, e, prepared); err != nil {
+	if err := deliverTreeOps(&cw, e, prepared, compoundSSEID(prepared.EventSeq, 1)); err != nil {
 		t.Fatalf("deliverTreeOps success: %v", err)
 	}
 	// Buffering: exactly one Write for the whole event.
 	if cw.writes != 1 {
 		t.Errorf("want exactly 1 Write (buffered), got %d", cw.writes)
 	}
-	// Wire shape: each op is a tree.op frame carrying the store seq as the id.
+	// Wire shape: each op is a tree.op frame carrying the compound SSE id.
 	out := cw.buf.String()
 	if got := strings.Count(out, "event: tree.op"); got != len(prepared.Ops) {
 		t.Errorf("want %d tree.op frames on the wire, got %d", len(prepared.Ops), got)
 	}
-	wantID := strings.TrimSpace(ulongToStr(prepared.EventSeq))
+	wantID := compoundSSEID(prepared.EventSeq, 1)
 	if !strings.Contains(out, "id: "+wantID+"\n") {
-		t.Errorf("wire missing id line for store seq %s; frame head=%.80s", wantID, out)
+		t.Errorf("wire missing id line for compound id %s; frame head=%.80s", wantID, out)
 	}
 	// Commit reached: deleting C now emits node.remove (C is committed-known).
 	applyDelete(store, "C")
@@ -200,7 +200,7 @@ func TestDeliver_EmptyOps_NoWriteNoError(t *testing.T) {
 	e, _ := mkDeliveryEmitter(t)
 	prepared := &state.PreparedTranslation{Ops: nil, EventSeq: 7}
 	var cw countingWriter
-	if err := deliverTreeOps(&cw, e, prepared); err != nil {
+	if err := deliverTreeOps(&cw, e, prepared, compoundSSEID(prepared.EventSeq, 1)); err != nil {
 		t.Errorf("empty ops: want nil error, got %v", err)
 	}
 	if cw.writes != 0 {
@@ -212,7 +212,7 @@ func TestDeliver_EmptyOps_NoWriteNoError(t *testing.T) {
 func TestDeliver_NilPrepared_NoError(t *testing.T) {
 	e, _ := mkDeliveryEmitter(t)
 	var cw countingWriter
-	if err := deliverTreeOps(&cw, e, nil); err != nil {
+	if err := deliverTreeOps(&cw, e, nil, "0.0"); err != nil {
 		t.Errorf("nil prepared: want nil error, got %v", err)
 	}
 	if cw.writes != 0 {
@@ -234,7 +234,7 @@ func TestDeliver_WriteError_LeavesUncommitted(t *testing.T) {
 	createEv := lastStoreEvent(t, store, state.KindSessionUpsert)
 	prepared, _ := e.Prepare(createEv)
 
-	if err := deliverTreeOps(errWriter{}, e, prepared); err == nil {
+	if err := deliverTreeOps(errWriter{}, e, prepared, compoundSSEID(prepared.EventSeq, 1)); err == nil {
 		t.Fatalf("write-error delivery: want non-nil error, got nil")
 	}
 	// Commit NOT reached: deleting C emits no node.remove (C is not known).
@@ -254,7 +254,7 @@ func TestDeliver_ShortWrite_LeavesUncommitted(t *testing.T) {
 	createEv := lastStoreEvent(t, store, state.KindSessionUpsert)
 	prepared, _ := e.Prepare(createEv)
 
-	err := deliverTreeOps(shortWriter{}, e, prepared)
+	err := deliverTreeOps(shortWriter{}, e, prepared, compoundSSEID(prepared.EventSeq, 1))
 	if err == nil {
 		t.Fatalf("short-write delivery: want non-nil error, got nil")
 	}
@@ -301,7 +301,7 @@ func TestDeliver_MarshalFailure_NoWriteNoCommit(t *testing.T) {
 	prepared.Ops = append(prepared.Ops, marshalFailTreeOp(t))
 
 	var cw countingWriter
-	err = deliverTreeOps(&cw, e, prepared)
+	err = deliverTreeOps(&cw, e, prepared, compoundSSEID(prepared.EventSeq, 1))
 	if err == nil {
 		t.Fatalf("marshal-failure delivery: want non-nil error, got nil")
 	}
@@ -336,12 +336,12 @@ func TestDeliver_FailureIsRetriable(t *testing.T) {
 	prepared, _ := e.Prepare(createEv)
 
 	// First attempt fails.
-	if err := deliverTreeOps(errWriter{}, e, prepared); err == nil {
+	if err := deliverTreeOps(errWriter{}, e, prepared, compoundSSEID(prepared.EventSeq, 1)); err == nil {
 		t.Fatalf("first delivery: want error, got nil")
 	}
 	// Retry the SAME prepared object on a good writer → succeeds and commits.
 	var cw countingWriter
-	if err := deliverTreeOps(&cw, e, prepared); err != nil {
+	if err := deliverTreeOps(&cw, e, prepared, compoundSSEID(prepared.EventSeq, 1)); err != nil {
 		t.Fatalf("retry delivery: want nil error, got %v", err)
 	}
 	if cw.writes != 1 {

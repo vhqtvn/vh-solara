@@ -66,7 +66,7 @@ func TestSubscribeWithStructuralInterestFiltersTokenFlood(t *testing.T) {
 		t.Fatal("expected at least the structural activity event from the flood's first delta; got empty channel")
 	}
 	for _, e := range got {
-		if isMessageClassKind(e.Kind) {
+		if IsMessageClassKind(e.Kind) {
 			t.Fatalf("structural-only subscriber received message-class event %s — upstream filter failed", e.Kind)
 		}
 	}
@@ -178,7 +178,7 @@ func TestSubscribeWithFirehoseInterestDeliversEverything(t *testing.T) {
 	countMsgClass := func(evs []ClientEvent) int {
 		var n int
 		for _, e := range evs {
-			if isMessageClassKind(e.Kind) {
+			if IsMessageClassKind(e.Kind) {
 				n++
 			}
 		}
@@ -273,7 +273,7 @@ func TestSubscribeWithStructuralInterestConcurrentFloodNoRace(t *testing.T) {
 	// promptly readable. No message-class event may have leaked through.
 	var sawLate bool
 	for _, e := range drainAll(ch) {
-		if isMessageClassKind(e.Kind) {
+		if IsMessageClassKind(e.Kind) {
 			t.Fatalf("structural-only subscriber received message-class event under concurrent flood: %s", e.Kind)
 		}
 		if e.Kind == KindSessionUpsert {

@@ -1795,7 +1795,7 @@ func TestStreamTreeOnlySurvivesTokenFlood(t *testing.T) {
 	t.Fatal("timed out waiting for the trailing session.upsert on the tree-only stream")
 }
 
-// isMessageClassSSE mirrors state.isMessageClassKind over the SSE event names
+// isMessageClassSSE mirrors state.IsMessageClassKind over the SSE event names
 // the server emits (see server.go sendable()). Kept local to avoid a web→state
 // kind-name dependency in test code.
 func isMessageClassSSE(event string) bool {

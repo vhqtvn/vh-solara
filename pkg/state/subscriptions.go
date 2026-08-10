@@ -60,7 +60,7 @@ type Interest struct {
 // kind to a delivery class, so the kind→class rule is not duplicated across the
 // codebase (the web layer's sendable() stays only as a defensive double-check).
 func (i Interest) wants(kind, sid string) bool {
-	if !isMessageClassKind(kind) {
+	if !IsMessageClassKind(kind) {
 		return true // structural/notification/control: always delivered
 	}
 	if i.MessageSessions == nil {
@@ -69,18 +69,64 @@ func (i Interest) wants(kind, sid string) bool {
 	return sid != "" && i.MessageSessions[sid]
 }
 
-// isMessageClassKind reports whether kind is a message/part/messages event —
+// IsMessageClassKind reports whether kind is a message/part/messages event —
 // the ONLY kinds subject to per-session interest filtering. Every other kind
 // (session.*, activity, status, todo, unread.*, activity.verb, permission.*,
 // question.*, notice) is delivered to every subscriber unconditionally. Listed
 // by exact Kind constant (not string-prefix matching) so the set is explicit,
 // typed, and greppable.
-func isMessageClassKind(kind string) bool {
+//
+// O3 SINGLE SOURCE OF TRUTH: this is the canonical ordinal-counted kind set
+// shared between the store's Interest filter (wants, below) and the web
+// layer's per-connection delivery ordinal (pkg/web/server.go Stream-2
+// stamping). The FE session-stream listener (web/src/sync/session-stream.ts
+// registerSessionMessageListeners) registers exactly these kinds; a future
+// change to one side MUST update the other.
+func IsMessageClassKind(kind string) bool {
 	switch kind {
 	case KindMessageUpsert, KindMessageDelete,
 		KindPartUpsert, KindPartDelete,
 		KindMessagesLoaded, KindMessagesError,
 		KindMessagesBatch:
+		return true
+	}
+	return false
+}
+
+// IsTreeCountedKind reports whether kind is a tree-stream ordinal-counted DETAIL
+// kind — the kinds the FE tree-stream listener observes AND uses to advance
+// treeLastDeliveryOrdinal. It is the Stream-1 mirror of IsMessageClassKind
+// (Stream 2): the canonical per-stream classifier the web layer's per-connection
+// delivery ordinal gates on.
+//
+// The set is EXACTLY: web/src/sync/tree-transport.ts TREE_STREAM_KINDS (11 kinds:
+// status, activity, activity.verb, lastAgent.set, permission.blocked,
+// permission.upsert, permission.delete, question.upsert, question.delete,
+// unread.set, unread.clear) PLUS session.upsert / session.delete (2 kinds —
+// registered in the separate registerAuxiliaryListeners loop). 13 kinds total.
+//
+// Kinds NOT listed here reach the tree branch but must NOT advance the ordinal:
+//   - KindTodo: consumed by the FE via snapshot + 5s poll (NO live listener —
+//     the residual the O3 tree-branch gate closes; an invisible ordinal bump
+//     here forced a spurious connect(true) on the next tree event).
+//   - KindTreeOrphanCheck: server-internal; its detail frame is suppressed. It
+//     MAY still produce tree.op ops (node.facet) — the delivery boundary's
+//     hasOps term (not this classifier) advances the ordinal for those.
+//
+// O3 SINGLE SOURCE OF TRUTH: shared between the store (this classifier) and the
+// web layer's per-connection tree delivery ordinal (pkg/web/server.go Stream-1
+// stamping, treeEmitter != nil replay + live-tail branches). The FE tree-stream
+// listeners (registerTreeStreamListeners TREE_STREAM_KINDS loop +
+// registerAuxiliaryListeners session.upsert/delete loop) register exactly these
+// kinds AND advance treeLastDeliveryOrdinal for them; a future change to one
+// side MUST update the other.
+func IsTreeCountedKind(kind string) bool {
+	switch kind {
+	case KindStatus, KindActivity, KindActivityVerb, KindLastAgentSet,
+		KindPermissionBlocked, KindPermissionSet, KindPermissionClear,
+		KindQuestionSet, KindQuestionClear,
+		KindUnreadSet, KindUnreadClear,
+		KindSessionUpsert, KindSessionDelete:
 		return true
 	}
 	return false
@@ -114,7 +160,7 @@ func (s *Store) emit(kind string, payload json.RawMessage) {
 	ev := ClientEvent{Seq: s.seq, Kind: kind, Payload: payload, ingestNano: s.curEmitIngest}
 	s.ring.push(ev)
 	sid := ""
-	if isMessageClassKind(kind) {
+	if IsMessageClassKind(kind) {
 		sid = payloadSessionID(payload)
 	}
 	// PROBE 2 (latency diagnostics): emit-boundary aggregates. PURE ATOMICS

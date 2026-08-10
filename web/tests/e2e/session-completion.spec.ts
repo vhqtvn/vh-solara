@@ -438,10 +438,14 @@ async function installCaptureWithStreamRace(page: Page, session: string) {
 // idle. Inv2 (tail-incomplete-on-idle) is untouched (discrete-path-only; its
 // unit tests in seqGapRecovery.test.ts use applyMessageEvent, unaffected).
 //
-// STILL PENDING: Inv1-A — the covering-check root fix (checkTreeSeqGap /
-// getSesCursor robustness to Stream-2 lag). B closes the completion-correctness
-// gap + this test, but the spurious-tree-reconnect thrash risk (the false-
-// positive Inv1 gap that bumps treeGen in the race) remains until A lands.
+// LANDED: Inv1-A (O3) — the covering-check root fix. The cross-stream covering
+// check (getSesCursor >= seq-1) was REMOVED and replaced with a per-connection
+// delivery ordinal (compound SSE id "globalSeq.ordinal") that counts ONLY
+// Inv1-relevant logical source events. A gap in the ordinal is DIRECTLY
+// actionable as real loss — no timing heuristic, no false-positive thrash.
+// B closes the completion-correctness gap + this test; A removes the spurious-
+// tree-reconnect thrash risk (the false-positive Inv1 gap that bumped treeGen
+// in the race). Both A + B together close the race cleanly.
 // ============================================================================
 // Deterministic regression guard for the cross-stream completion race. With the
 // session stream deliberately lagging the tree stream, the streaming view MUST

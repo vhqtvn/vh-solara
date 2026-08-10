@@ -13,7 +13,7 @@ package state
 //   - no new goroutine (lazy time check on the Apply path under s.mu).
 //
 // It also folds in P1-AGG-005: a drift test pinning store's exact-constant
-// message-class classification (isMessageClassKind) against web sendable()'s
+// message-class classification (IsMessageClassKind) against web sendable()'s
 // string-prefix equivalent, so the two filter layers cannot silently diverge.
 
 import (
@@ -329,7 +329,7 @@ func TestDeltaCoalesce_ColdLoadPreservesUnflushedDeltaBuf(t *testing.T) {
 // --- P1-AGG-005: classification-drift test ---
 //
 // store classifies message-class events by exact Kind constant
-// (isMessageClassKind); the web layer's sendable() classifies by string prefix
+// (IsMessageClassKind); the web layer's sendable() classifies by string prefix
 // (HasPrefix "message." / "part." / "messages."). The two MUST agree for every
 // Kind constant, or an event could be filtered upstream but always-streamed
 // downstream (or vice versa). This test pins them together so adding a new
@@ -379,11 +379,11 @@ func TestMessageClassKind_NoDriftFromWebPrefix(t *testing.T) {
 		}
 		seen[k] = true
 
-		storeSays := isMessageClassKind(k)
+		storeSays := IsMessageClassKind(k)
 		webSays := hasMessageClassPrefix(k)
 		if storeSays != webSays {
-			t.Errorf("classification drift for Kind %q: store isMessageClassKind=%v but web sendable() prefix=%v — "+
-				"update isMessageClassKind and/or the constant's prefix so both layers agree", k, storeSays, webSays)
+			t.Errorf("classification drift for Kind %q: store IsMessageClassKind=%v but web sendable() prefix=%v — "+
+				"update IsMessageClassKind and/or the constant's prefix so both layers agree", k, storeSays, webSays)
 		}
 	}
 }

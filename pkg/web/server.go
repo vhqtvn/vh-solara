@@ -2106,13 +2106,14 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	flusher.Flush()
 
 	// Prefer the Last-Event-ID header (sent automatically by EventSource on
-	// reconnect) over the cursor query param.
+	// reconnect) over the cursor query param. Both may be compound
+	// ("globalSeq.ordinal") or legacy numeric — parseResumeCursor extracts the
+	// global seq for store.Replay, discarding the connection-local ordinal.
 	cursorStr := r.Header.Get("Last-Event-ID")
 	if cursorStr == "" {
 		cursorStr = r.URL.Query().Get("cursor")
 	}
-	hasCursor := cursorStr != ""
-	cursor, _ := strconv.ParseUint(cursorStr, 10, 64)
+	cursor, hasCursor := parseResumeCursor(cursorStr)
 
 	agg := s.aggFor(reqDir(r))
 	store := agg.Store()
@@ -2167,6 +2168,26 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		treeEmitter = state.NewTreeEmitter(store, reqDir(r))
 	}
 
+	// O3: per-connection delivery ordinal for Inv1 gap detection. Incremented
+	// ONLY for Inv1-relevant logical source events that the FE observes on the
+	// given stream:
+	//   - tree stream (treeEmitter != nil): tree.op ops (hasOps) OR tree-counted
+	//     detail kinds (state.IsTreeCountedKind — TREE_STREAM_KINDS +
+	//     session.upsert/delete). Non-counted detail kinds (todo) emit via
+	//     writeRawNoID — they do NOT advance the ordinal because the FE has NO
+	//     live listener for them (todo is consumed via snapshot + 5s poll).
+	//     Snapshots (tree.snapshot/snapshot.complete) carry ordinal 0 and are
+	//     NOT gap-checked.
+	//   - session/firehose stream (treeEmitter == nil): message-class events
+	//     (state.IsMessageClassKind) + the initial snapshot. Structural frames
+	//     (status/activity/...) are emitted via writeRawNoID — they do NOT
+	//     advance the ordinal because the FE session-stream listener registers
+	//     NO structural listener (it consumes structural via the tree stream).
+	// A gap in this ordinal is DIRECTLY actionable as real loss. The ordinal
+	// resets on every fresh connection (it is NOT part of the resume cursor);
+	// global resume still replays from the global seq component.
+	var ordinal uint64
+
 	events, head, replayOK := store.Replay(cursor)
 	if hasCursor && replayOK {
 		for _, ev := range events {
@@ -2181,28 +2202,84 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 					// (Last-Event-ID) uses ev.Seq (STORE seq) — NOT op.Seq()
 					// (emitter seq) — so store.Replay(cursor) works in the same
 					// number space on the next reconnect (§5.5).
+					//
+					// O3 (T1C-F1, Stream-1 gate): the ordinal advances ONLY when
+					// the FE observes at least one frame for this event — i.e.
+					//   counted = hasOps (FE tree.op listener) OR
+					//             state.IsTreeCountedKind(ev.Kind) (FE detail
+					//             listener: TREE_STREAM_KINDS + session.upsert/
+					//             delete).
+					// tree.orphan's detail frame is always suppressed, but its
+					// tree.op ops (when produced) are observed → counted via
+					// hasOps. Non-counted kinds with no ops (todo — consumed by
+					// the FE via snapshot+poll, NO live listener) are STILL
+					// EMITTED but via writeRawNoID: no ordinal advance, no id
+					// line, so they don't create an invisible ordinal gap that
+					// spurious-reconnects the FE (checkTreeOrdinalGap). This is
+					// the Stream-1 mirror of the Stream-2 IsMessageClassKind
+					// gate below; IsTreeCountedKind is the single source of
+					// truth (see its doc comment + the FE TREE_STREAM_KINDS const).
 					prepared, err := treeEmitter.Prepare(ev)
 					if err != nil {
 						vhlog.Warn("tree=2 replay: prepare failed, aborting stream", "seq", ev.Seq, "err", err)
 						return
 					}
-					if err := deliverTreeOps(w, treeEmitter, prepared); err != nil {
-						vhlog.Warn("tree=2 replay: delivery failed, aborting stream", "seq", ev.Seq, "err", err)
-						return
-					}
-					// Phase 3 Step A.5 (GAP 3): emit the legacy detail frame
-					// alongside tree.op so cross-session detail consumers
-					// (NotificationCenter, selectors) stay populated. tree=2
-					// replaces only the STRUCTURE projection (snapshot);
-					// session-detail (permissions/questions/todos/session
-					// metadata/activity/lastAgent/unread) is orthogonal (§10).
-					// tree.orphan is server-internal (translated to node.facet
-					// above; no client listener) — skip it.
-					if ev.Kind != state.KindTreeOrphanCheck {
-						writeEvent(w, ev.Seq, ev.Kind, ev.Payload)
+					hasOps := prepared != nil && len(prepared.Ops) > 0
+					if hasOps || state.IsTreeCountedKind(ev.Kind) {
+						ordinal++
+						id := compoundSSEID(ev.Seq, ordinal)
+						if hasOps {
+							if err := deliverTreeOps(w, treeEmitter, prepared, id); err != nil {
+								vhlog.Warn("tree=2 replay: delivery failed, aborting stream", "seq", ev.Seq, "err", err)
+								return
+							}
+						}
+						// Phase 3 Step A.5 (GAP 3): emit the legacy detail frame
+						// alongside tree.op so cross-session detail consumers stay
+						// populated. tree.orphan is server-internal (translated to
+						// node.facet above; no client detail listener) — skip it.
+						if ev.Kind != state.KindTreeOrphanCheck {
+							writeEvent(w, id, ev.Kind, ev.Payload)
+						}
+					} else {
+						// Non-counted detail frame (todo): still deliver to the
+						// client but WITHOUT advancing the ordinal / stamping an
+						// id (the FE has no live listener that advances
+						// treeLastDeliveryOrdinal for it). tree.orphan with no ops
+						// falls here too and is skipped (no detail frame).
+						if ev.Kind != state.KindTreeOrphanCheck {
+							writeRawNoID(w, ev.Kind, ev.Payload)
+						}
 					}
 				} else {
-					writeEvent(w, ev.Seq, ev.Kind, ev.Payload)
+					// O3 Finding 1: Stream-2 (session/firehose, treeEmitter==nil)
+					// ordinal alignment. The ordinal advances ONLY for message-
+					// class events — the kinds the FE session-stream listener
+					// registers for (snapshot + the 7 message/part/messages
+					// kinds). Structural frames (status/activity/unread/
+					// permission/question/session.upsert) are still EMITTED but
+					// WITHOUT advancing the ordinal: the FE has NO listener for
+					// them on Stream 2 (it consumes structural via the tree
+					// stream), so an ordinal bump here would be invisible and
+					// force a spurious resync on the next message event
+					// (checkSesOrdinalGap sees ordinal > expected).
+					//
+					// SINGLE SOURCE OF TRUTH: state.IsMessageClassKind is the
+					// canonical classifier, shared with the store's Interest
+					// filter. web/src/sync/session-stream.ts
+					// registerSessionMessageListeners registers exactly these
+					// kinds; keep both sides in sync.
+					//
+					// writeRawNoID emits the structural frame with NO id line
+					// so it neither advances the ordinal nor moves the client's
+					// Last-Event-ID resume cursor (structural events on Stream 2
+					// are not tracked by sesCursor — the FE ignores them).
+					if state.IsMessageClassKind(ev.Kind) {
+						ordinal++
+						writeEvent(w, compoundSSEID(ev.Seq, ordinal), ev.Kind, ev.Payload)
+					} else {
+						writeRawNoID(w, ev.Kind, ev.Payload)
+					}
 				}
 			}
 		}
@@ -2249,7 +2326,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			treeOK := false
 			if rb, err := json.Marshal(treeSnap); err == nil {
 				wire := maybeCompressSnapshot(rb, wantsCompress(r))
-				writeRaw(w, treeSnap.Seq, "tree.snapshot", wire)
+				writeRaw(w, compoundSSEID(treeSnap.Seq, 0), "tree.snapshot", wire)
 				sw.RecordSnapshotPath(len(wire))
 				treeOK = true
 			} else {
@@ -2260,7 +2337,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			// treeSnapshotDecoding flag (same rationale as fresh-connect).
 			detailOK := false
 			if db, err := json.Marshal(detailSnap); err == nil {
-				writeRaw(w, detailSnap.Seq, "snapshot", db)
+				writeRaw(w, compoundSSEID(detailSnap.Seq, 0), "snapshot", db)
 				detailOK = true
 			} else {
 				vhlog.Warn("tree=2 resume detail snapshot: marshal failed", "err", err)
@@ -2270,7 +2347,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			// on the wire." A marshal failure skips a projection, so the
 			// boundary must NOT fire (no false atomicity claim).
 			if treeOK && detailOK {
-				writeSnapshotComplete(w, treeSnap.Epoch, treeSnap.Seq)
+				writeSnapshotComplete(w, treeSnap.Epoch, treeSnap.Seq, compoundSSEID(treeSnap.Seq, 0))
 			}
 			baseline = treeSnap.Seq
 		}
@@ -2327,7 +2404,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			treeOK := false
 			if rb, err := json.Marshal(treeSnap); err == nil {
 				wire := maybeCompressSnapshot(rb, wantsCompress(r))
-				writeRaw(w, treeSnap.Seq, "tree.snapshot", wire)
+				writeRaw(w, compoundSSEID(treeSnap.Seq, 0), "tree.snapshot", wire)
 				sw.RecordSnapshotPath(len(wire))
 				treeOK = true
 			} else {
@@ -2347,7 +2424,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			// (state.sessions vs treeMap) so there is no clobber.
 			detailOK := false
 			if db, err := json.Marshal(detailSnap); err == nil {
-				writeRaw(w, detailSnap.Seq, "snapshot", db)
+				writeRaw(w, compoundSSEID(detailSnap.Seq, 0), "snapshot", db)
 				detailOK = true
 			} else {
 				vhlog.Warn("tree=2 detail snapshot: marshal failed", "err", err)
@@ -2357,7 +2434,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			// on the wire." A marshal failure skips a projection, so the
 			// boundary must NOT fire (no false atomicity claim).
 			if treeOK && detailOK {
-				writeSnapshotComplete(w, treeSnap.Epoch, treeSnap.Seq)
+				writeSnapshotComplete(w, treeSnap.Epoch, treeSnap.Seq, compoundSSEID(treeSnap.Seq, 0))
 			}
 			baseline = treeSnap.Seq
 		} else {
@@ -2382,8 +2459,11 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 				// marshaled length — overstated ~3x). snapshot_bytes now reflects the
 				// actual bytes written, keeping the diag self-consistent with Phase-1
 				// per-path wire counters.
+				// O3: the snapshot IS Inv1-relevant for the session stream (the FE's
+				// sesLastDeliveryOrdinal advances for it), so increment the ordinal.
+				ordinal++
 				wire := maybeCompressSnapshot(b, wantsCompress(r))
-				writeRaw(w, snap.Seq, "snapshot", wire)
+				writeRaw(w, compoundSSEID(snap.Seq, ordinal), "snapshot", wire)
 				sw.RecordSnapshotPath(len(wire)) // PROBE 3: initial snapshot branch + wire bytes
 			}
 			baseline = snap.Seq
@@ -2484,26 +2564,48 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 				// whether a child op or only a count facet is shipped (§5.4).
 				// The SSE id (Last-Event-ID) uses ev.Seq (STORE seq) so the
 				// client's cursor matches store.Replay on reconnect (§5.5).
+				//
+				// O3 (T1C-F1, Stream-1 gate): identical to the replay-loop tree
+				// branch above — counted = hasOps || IsTreeCountedKind. Non-
+				// counted detail kinds (todo) emit via writeRawNoID so they don't
+				// create an invisible ordinal gap. See the replay-loop comment
+				// for the full single-source-of-truth rationale.
 				prepared, err := treeEmitter.Prepare(ev)
 				if err != nil {
 					vhlog.Warn("tree=2 live: prepare failed, aborting stream", "seq", ev.Seq, "err", err)
 					return
 				}
-				if err := deliverTreeOps(w, treeEmitter, prepared); err != nil {
-					vhlog.Warn("tree=2 live: delivery failed, aborting stream", "seq", ev.Seq, "err", err)
-					return
-				}
-				// Phase 3 Step A.5 (GAP 3): emit the legacy detail frame
-				// alongside tree.op (see replay-loop comment above for full
-				// rationale). tree.orphan is server-internal (no client
-				// listener) — skip.
-				if ev.Kind != state.KindTreeOrphanCheck {
-					writeEvent(w, ev.Seq, ev.Kind, ev.Payload)
+				hasOps := prepared != nil && len(prepared.Ops) > 0
+				if hasOps || state.IsTreeCountedKind(ev.Kind) {
+					ordinal++
+					id := compoundSSEID(ev.Seq, ordinal)
+					if hasOps {
+						if err := deliverTreeOps(w, treeEmitter, prepared, id); err != nil {
+							vhlog.Warn("tree=2 live: delivery failed, aborting stream", "seq", ev.Seq, "err", err)
+							return
+						}
+					}
+					if ev.Kind != state.KindTreeOrphanCheck {
+						writeEvent(w, id, ev.Kind, ev.Payload)
+					}
+				} else {
+					if ev.Kind != state.KindTreeOrphanCheck {
+						writeRawNoID(w, ev.Kind, ev.Payload)
+					}
 				}
 				flusher.Flush()
 				continue
 			}
-			writeEvent(w, ev.Seq, ev.Kind, ev.Payload)
+			// O3 Finding 1: Stream-2 (session/firehose, treeEmitter==nil) ordinal
+			// alignment — see the identical branch in the replay loop above for the
+			// full rationale. Message-class events advance the ordinal; structural
+			// frames are emitted via writeRawNoID (no ordinal advance, no id line).
+			if state.IsMessageClassKind(ev.Kind) {
+				ordinal++
+				writeEvent(w, compoundSSEID(ev.Seq, ordinal), ev.Kind, ev.Payload)
+			} else {
+				writeRawNoID(w, ev.Kind, ev.Payload)
+			}
 			flusher.Flush()
 		case <-ticker.C:
 			// A NAMED ping event (not an SSE ` : comment`) so the client can observe
@@ -2518,12 +2620,42 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func writeEvent(w io.Writer, seq uint64, kind string, payload []byte) {
-	writeRaw(w, seq, kind, payload)
+// compoundSSEID encodes a compound SSE id in the form "globalSeq.ordinal".
+// The globalSeq is the STORE seq (used for resume/replay via store.Replay);
+// the ordinal is a per-connection, stream-role-specific delivery counter that
+// counts ONLY Inv1-relevant logical source events (O3). The FE parses both
+// parts: globalSeq → cursor/resume bookkeeping; ordinal → per-stream gap
+// detection (a gap in the ordinal is DIRECTLY actionable as real loss).
+func compoundSSEID(seq, ordinal uint64) string {
+	return strconv.FormatUint(seq, 10) + "." + strconv.FormatUint(ordinal, 10)
 }
 
-func writeRaw(w io.Writer, seq uint64, event string, data []byte) {
-	fmt.Fprintf(w, "id: %d\nevent: %s\ndata: %s\n\n", seq, event, data)
+// parseResumeCursor extracts the global store seq from a Last-Event-ID value
+// that may be either the new compound form ("globalSeq.ordinal") or a legacy
+// plain numeric string. The ordinal component is connection-local and is
+// discarded here — only the global seq feeds store.Replay(). Returns the parsed
+// seq and true if the value was non-empty and numeric; (0, false) otherwise.
+func parseResumeCursor(cursorStr string) (uint64, bool) {
+	if cursorStr == "" {
+		return 0, false
+	}
+	// Compound form: take everything before the first dot.
+	if i := strings.IndexByte(cursorStr, '.'); i >= 0 {
+		cursorStr = cursorStr[:i]
+	}
+	seq, err := strconv.ParseUint(cursorStr, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return seq, true
+}
+
+func writeEvent(w io.Writer, id string, kind string, payload []byte) {
+	writeRaw(w, id, kind, payload)
+}
+
+func writeRaw(w io.Writer, id string, event string, data []byte) {
+	fmt.Fprintf(w, "id: %s\nevent: %s\ndata: %s\n\n", id, event, data)
 }
 
 // writeRawNoID writes an SSE frame WITHOUT an `id:` line, so the event does not
@@ -2555,7 +2687,11 @@ func writeRawNoID(w io.Writer, event string, data []byte) {
 // the bytes), NOT proof of browser receipt. There is no rollback: because
 // Prepare never mutated committed state, failure only discards the prepared
 // object.
-func deliverTreeOps(w io.Writer, treeEmitter *state.TreeEmitter, prepared *state.PreparedTranslation) error {
+// deliverTreeOps marshals ALL tree.op frames for one prepared store event into
+// a single buffer BEFORE any write, then performs ONE checked write, and calls
+// treeEmitter.Commit ONLY on full acceptance. The `id` parameter is the compound
+// SSE id stamped on each tree.op frame (globalSeq.ordinal) — see compoundSSEID.
+func deliverTreeOps(w io.Writer, treeEmitter *state.TreeEmitter, prepared *state.PreparedTranslation, id string) error {
 	if prepared == nil || len(prepared.Ops) == 0 {
 		return nil // nothing to deliver; Next == committed, so no commit needed
 	}
@@ -2566,7 +2702,7 @@ func deliverTreeOps(w io.Writer, treeEmitter *state.TreeEmitter, prepared *state
 			return fmt.Errorf("tree=2 tree.op marshal (event seq %d): %w", prepared.EventSeq, err)
 		}
 		// Mirror writeRaw's frame shape exactly (id/event/data).
-		fmt.Fprintf(&buf, "id: %d\nevent: tree.op\ndata: %s\n\n", prepared.EventSeq, b)
+		fmt.Fprintf(&buf, "id: %s\nevent: tree.op\ndata: %s\n\n", id, b)
 	}
 	n, err := w.Write(buf.Bytes())
 	if err != nil {
@@ -2597,10 +2733,9 @@ type snapshotComplete struct {
 
 // writeSnapshotComplete marshals + writes the snapshot.complete SSE frame,
 // stamped with the capture's {epoch, seq} (revision == seq). The SSE id is the
-// capture seq (same as both projections' ids) so Last-Event-ID stays in the
-// store-seq space. Called once per SnapshotWithTree capture site, AFTER both
-// projection writeRaw calls.
-func writeSnapshotComplete(w io.Writer, epoch string, seq uint64) {
+// compound id passed by the caller (same globalSeq as both projections; ordinal
+// is 0 for tree-stream snapshots since the FE does not gap-check snapshots).
+func writeSnapshotComplete(w io.Writer, epoch string, seq uint64, id string) {
 	cb, err := json.Marshal(snapshotComplete{
 		Epoch:       epoch,
 		Revision:    seq,
@@ -2610,7 +2745,7 @@ func writeSnapshotComplete(w io.Writer, epoch string, seq uint64) {
 		vhlog.Warn("snapshot.complete: marshal failed", "err", err)
 		return
 	}
-	writeRaw(w, seq, "snapshot.complete", cb)
+	writeRaw(w, id, "snapshot.complete", cb)
 }
 
 // snapshotCompressThreshold is the minimum marshaled-snapshot size above which

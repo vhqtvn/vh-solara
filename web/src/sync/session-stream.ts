@@ -43,7 +43,7 @@ import { produce } from "solid-js/store";
 import type { Snapshot } from "../types";
 import { prependMessagesIfAbsent } from "../lib/reduce";
 import { log } from "../lib/log";
-import { setState, projectDir, state } from "./store";
+import { setState, projectDir } from "./store";
 import { isGateActive, currentGateEpoch, markBusyDirty } from "../busy";
 import { decodeSnapshot, decodeMessagesBatch } from "./decode";
 import {
@@ -60,6 +60,18 @@ import {
   maybeResolveReconcile,
 } from "./stream";
 import { captureDiagEntry } from "./diaglog";
+
+// Parse a compound SSE id ("globalSeq.ordinal") or legacy numeric id.
+// O3: the ordinal is a per-connection delivery counter for Inv1 gap detection;
+// the global seq is for sesCursor/resume bookkeeping. Legacy (no dot) → ordinal 0.
+function parseSSEID(id: string): { globalSeq: number; ordinal: number } {
+  const dot = id.indexOf(".");
+  if (dot < 0) return { globalSeq: Number(id), ordinal: 0 };
+  return {
+    globalSeq: Number(id.slice(0, dot)),
+    ordinal: Number(id.slice(dot + 1)),
+  };
+}
 
 // Two INDEPENDENT liveness clocks — the dead-but-OPEN Stream2 bug (a frozen
 // transcript with the `updating` pulse lit and no reconnect) came from a single
@@ -226,16 +238,16 @@ let sesBackoff = 1500;
 // state.cursor. Reset to 0 in closeSessionStream (session switch / close) so a
 // new session always starts fresh; preserved across retries (same session).
 let sesCursor = 0;
-// sesLastSeq — the last store-seq processed by ANY Stream2 listener (snapshot or
-// message event). Used by the per-stream seq-gap detection (Invariant 1): when a
-// new event's seq exceeds sesLastSeq + 1 AND the gap is NOT covered by Stream1's
-// structural cursor (state.cursor < seq - 1), a silent event loss likely
-// occurred → force a fresh-snapshot resync. The covering check suppresses benign
-// gaps caused by structural events (which Stream2 receives on the wire but has
-// no FE listener for — sesLastSeq doesn't advance for them). See
-// checkSesSeqGap for the full rationale. Reset in closeSessionStream (like
-// sesCursor) so a fresh connection starts with no gap baseline.
-let sesLastSeq = 0;
+// sesLastDeliveryOrdinal — O3: per-stream DELIVERY ORDINAL for Inv1 gap
+// detection. The server stamps each Stream2-relevant wire event (snapshot +
+// message events) with a compound SSE id ("globalSeq.ordinal"); the ordinal is
+// a per-connection counter. A gap in this ordinal is DIRECTLY actionable as real
+// loss → openSessionStream(id, true). This REMOVES the cross-stream covering
+// check (the false-positive source when Stream1's structural events created a
+// phantom gap). Reset in closeSessionStream (like sesCursor) so a fresh
+// connection starts with no gap baseline. Initialized to -1 so the first event
+// (ordinal 0) doesn't trigger a false gap.
+let sesLastDeliveryOrdinal = -1;
 // sesDropNextN — test-only hook. When > 0, the next N events on the session
 // message listener are silently dropped BEFORE markSessionSeen/reconcile,
 // simulating "events lost below SSE but the connection stays OPEN." This is
@@ -265,41 +277,29 @@ export function getSesGen(): number {
   return sesGen;
 }
 
-// --- Invariant 1: per-stream seq-gap detection → forced resync ---------------
+// --- Invariant 1: delivery-ordinal gap detection → forced resync ---------------
 //
-// checkSesSeqGap — called on EVERY seq'd Stream2 event (snapshot + message.*).
-// If the incoming seq exceeds sesLastSeq + 1, a gap of `gap` events occurred.
-// The gap is BENIGN if Stream1's structural cursor (state.cursor) has already
-// reached seq - 1 — that means the gap events were structural events that
-// Stream2 received on the wire but has no FE listener for (sesLastSeq doesn't
-// advance for structural events). If state.cursor < seq - 1, the gap includes
-// events NEITHER stream's FE processed (other-session messages are filtered out
-// of both streams) → likely loss on Stream2 → force a fresh-snapshot resync
-// via openSessionStream(id, true).
-//
-// LIMITATION: a MIXED gap (structural + lost message events) where state.cursor
-// happens to reach seq - 1 via the structural events will be classified as
-// benign (false negative). Invariant 2 (tail-integrity on idle) catches the
-// terminal case of this class. See the task analysis for the full rationale.
+// checkSesOrdinalGap — O3: called on EVERY seq'd Stream2 event (snapshot +
+// message.*) with the DELIVERY ORDINAL extracted from the compound SSE id. If
+// the ordinal exceeds sesLastDeliveryOrdinal + 1, a real loss occurred (the
+// ordinal counts ONLY Stream2-relevant logical source events, so a gap means
+// selected-session message events were silently lost below SSE). This REMOVES
+// the cross-stream covering check that false-positived when Stream1's structural
+// events created a phantom gap. A gap directly → openSessionStream(id, true).
 //
 // The diag entry is written BEFORE the resync so pre-recovery state is recorded.
 // The resync (openSessionStream(id, true)) bumps sesGen and creates a fresh
 // EventSource; the current event continues to process on the old gen (it's a
 // surviving event whose application is correct — the fresh snapshot MERGEs
 // via prependMessagesIfAbsent, live always wins).
-function checkSesSeqGap(seq: number, kind: string): void {
-  // Guard: seq must be a positive finite integer. Events without an SSE id
-  // line (no lastEventId) produce NaN — those are transient/non-replayable
-  // frames that don't participate in the store-seq space; skip them.
-  if (!Number.isFinite(seq) || seq <= 0 || sesLastSeq <= 0) return;
-  const expected = sesLastSeq + 1;
-  if (seq <= expected) return; // contiguous or out-of-order (existing dedup handles)
-  const gap = seq - expected;
-  // Covering check: if Stream1's structural cursor reached seq - 1, the gap
-  // events were structural (Stream2 received on wire, no FE listener →
-  // sesLastSeq didn't advance). Benign — skip.
-  if (state.cursor >= seq - 1) return;
-  // Uncovered gap — events neither stream's FE processed. Force resync.
+function checkSesOrdinalGap(ordinal: number, kind: string): void {
+  // Guard: ordinal must be a non-negative finite integer and we must have a
+  // prior baseline (sesLastDeliveryOrdinal >= 0 means at least one prior event).
+  if (!Number.isFinite(ordinal) || ordinal < 0 || sesLastDeliveryOrdinal < 0) return;
+  const expected = sesLastDeliveryOrdinal + 1;
+  if (ordinal <= expected) return; // contiguous or out-of-order (existing dedup handles)
+  const gap = ordinal - expected;
+  // Ordinal gap = DIRECTLY actionable real loss. No covering check.
   const sid = sesId;
   captureDiagEntry({
     kind: "stall",
@@ -307,19 +307,18 @@ function checkSesSeqGap(seq: number, kind: string): void {
     trigger: "seq-gap",
     stream: "session",
     sessionId: sid || undefined,
-    seqGap: { stream: "session", expected, got: seq, missed: gap },
+    seqGap: { stream: "session", expected, got: ordinal, missed: gap },
     eventSourceState: {
       tree: 0, // not tracked here; health.ts fills tree state in its own entries
       session: ses?.readyState ?? -1,
     },
   });
-  log.warn("sync", "session seq-gap → forcing fresh-snapshot resync", {
+  log.warn("sync", "session delivery-ordinal gap → forcing fresh-snapshot resync", {
     id: sid,
     kind,
     expected,
-    got: seq,
+    got: ordinal,
     missed: gap,
-    treeCursor: state.cursor,
   });
   // Force a cursorless fresh-snapshot reconnect. openSessionStream(id, true)
   // bypasses the "already open" guard, closes the old EventSource (sesGen++),
@@ -390,7 +389,7 @@ export function closeSessionStream() {
   sessionContentSeen = 0;
   // Reset the seq-gap baseline so the first event on the new connection doesn't
   // trigger a false gap (there's no prior baseline to compare against).
-  sesLastSeq = 0;
+  sesLastDeliveryOrdinal = -1;
   // Phase 3-F: a session switch starts the next session's CLOSED-reopen backoff
   // fresh (per-session backoff does not carry across session switches).
   sesBackoff = 1500;
@@ -519,6 +518,18 @@ export function openSessionStream(id: string, force = false) {
     // open() runs directly from the sesRetry timer, not via openSessionStream).
     const gen = ++sesGen;
     ses?.close();
+    // O3 Finding 2: re-baseline the delivery ordinal whenever open() constructs
+    // a replacement EventSource. The server restarts its per-connection ordinal
+    // on each new HTTP connection (server.go: `var ordinal uint64` is handler-
+    // local), so after a CLOSED-retry (this open() running directly from the
+    // sesRetry timer, NOT via closeSessionStream) the client would hold a stale
+    // HIGH baseline while the server restarts LOW → checkSesOrdinalGap would
+    // classify early replacement events as ordinal <= expected → IGNORE real
+    // losses among the replay-relevant early events. closeSessionStream already
+    // resets this for the switch/force path; THIS reset covers the retry path.
+    // ses.onopen below ALSO resets it to cover native EventSource auto-reconnect
+    // (which does not call open() at all).
+    sesLastDeliveryOrdinal = -1;
     sesT0 = performance.now(); // L1 t0: session-stream connection attempt
     sesT1 = 0;
     sesSnapDone = false;
@@ -554,21 +565,19 @@ export function openSessionStream(id: string, force = false) {
       // the clock or the store.
       if (gen !== sesGen) return;
       markSessionSeen();
-      // Track Stream2's local cursor from the SSE id field so the next retry
-      // can pass cursor= for replay-based resume. The snapshot's seq is stamped
-      // by writeRaw as the SSE id. Using max guards against any out-of-order
-      // delivery (shouldn't happen, but defensive).
-      const seq = Number((e as MessageEvent).lastEventId);
-      // Invariant 1: per-stream seq-gap detection. Checked BEFORE advancing
-      // sesCursor/sesLastSeq so the gap is measured from the prior baseline.
-      checkSesSeqGap(seq, "snapshot");
-      // checkSesSeqGap MAY have triggered openSessionStream(id, true) → sesGen++
+      // O3: parse compound SSE id — globalSeq for sesCursor resume, ordinal for
+      // gap detection. Using max guards against any out-of-order delivery.
+      const { globalSeq: seq, ordinal } = parseSSEID((e as MessageEvent).lastEventId);
+      // Invariant 1: delivery-ordinal gap detection. Checked BEFORE advancing
+      // sesCursor/sesLastDeliveryOrdinal so the gap is measured from the prior baseline.
+      checkSesOrdinalGap(ordinal, "snapshot");
+      // checkSesOrdinalGap MAY have triggered openSessionStream(id, true) → sesGen++
       // → this connection is superseded. The fresh snapshot from the new
       // connection is authoritative (MERGE via prependMessagesIfAbsent), so
       // drop this frame cleanly.
       if (gen !== sesGen) return;
       if (seq > sesCursor) sesCursor = seq;
-      if (seq > sesLastSeq) sesLastSeq = seq;
+      if (ordinal > sesLastDeliveryOrdinal) sesLastDeliveryOrdinal = ordinal;
       let raw: any;
       try {
         raw = JSON.parse((e as MessageEvent).data);
@@ -696,6 +705,15 @@ export function openSessionStream(id: string, force = false) {
     // with Stream 1's connect/backoff semantics).
     ses.onopen = () => {
       if (gen !== sesGen) return;
+      // O3 Finding 2: re-baseline the delivery ordinal on every successful
+      // (re)open. This covers NATIVE EventSource auto-reconnect: the browser
+      // reuses this EventSource object but opens a NEW HTTP connection, so the
+      // server restarts its ordinal while the client's baseline was stale (high).
+      // open() above already reset it for the manual-retry path; this covers
+      // the native path (which does NOT call open()). The first event after
+      // this re-seeds the baseline (checkSesOrdinalGap returns early when
+      // sesLastDeliveryOrdinal < 0, then the listener sets it).
+      sesLastDeliveryOrdinal = -1;
       markSessionSeen();
       sesT1 = performance.now();
       if (sesT0) recordLatency("session", "open", sesT1 - sesT0);
@@ -745,16 +763,33 @@ function registerSessionPingListener(es: EventSource, gen: number): void {
   });
 }
 
+// SESSION_MESSAGE_KINDS — the 7 message/part/messages SSE event kinds the
+// Stream-2 (active-session) listener registers for. O3 SINGLE SOURCE OF TRUTH
+// (FE half): this set MUST match the server's ordinal-counted kind set for
+// Stream 2 — i.e. pkg/state.IsMessageClassKind (the Go-side classifier used in
+// server.go's treeEmitter==nil replay + live-tail branches). The server
+// advances the per-connection delivery ordinal ONLY for these kinds + the
+// initial snapshot; structural frames are emitted via writeRawNoID (no ordinal
+// advance). If you add/remove a kind here, update IsMessageClassKind too.
+export const SESSION_MESSAGE_KINDS = [
+  "message.upsert",
+  "message.delete",
+  "part.upsert",
+  "part.delete",
+  "messages.loaded",
+  "messages.error",
+  "messages.batch",
+] as const;
+
 // === open() session message-listener registration (decomposition Stage 2) ====
 // Extracted VERBATIM from the nested open() in openSessionStream() — the
-// CONTIGUOUS message/part cohort: the 7-kind loop (message.upsert /
-// message.delete / part.upsert / part.delete / messages.loaded / messages.error
-// / messages.batch) routed through applyMessageEvent with trackCursor=false —
-// the LOAD-BEARING Stream2 invariant (Stream 2 must NEVER advance Stream 1's
-// shared resume cursor; see invariant audit §3e). Only the addEventListener
-// registration (the for-loop) was relocated from its inline position in open();
-// no callback body changed (the only mechanical edit: `ses!.addEventListener`
-// became `es.addEventListener` because the parameter is already non-nullable).
+// CONTIGUOUS message/part cohort: the 7-kind loop (SESSION_MESSAGE_KINDS above)
+// routed through applyMessageEvent with trackCursor=false — the LOAD-BEARING
+// Stream2 invariant (Stream 2 must NEVER advance Stream 1's shared resume
+// cursor; see invariant audit §3e). Only the addEventListener registration (the
+// for-loop) was relocated from its inline position in open(); no callback body
+// changed (the only mechanical edit: `ses!.addEventListener` became
+// `es.addEventListener` because the parameter is already non-nullable).
 // Registration order is preserved: the 7 kinds are registered after the inline
 // onopen and before the inline onerror, exactly as before. Every cohort event
 // name is distinct from the inline snapshot / ping listeners, so consolidating
@@ -768,7 +803,7 @@ function registerSessionPingListener(es: EventSource, gen: number): void {
 // live module-scope `sesGen` exactly as the inline registration did. No
 // open()-local state other than `es`/`gen` is captured, so there is no ctx.
 function registerSessionMessageListeners(es: EventSource, gen: number): void {
-  for (const kind of ["message.upsert", "message.delete", "part.upsert", "part.delete", "messages.loaded", "messages.error", "messages.batch"]) {
+  for (const kind of SESSION_MESSAGE_KINDS) {
     es.addEventListener(kind, async (e) => {
       // Gen guard: ignore frames from a superseded connection BEFORE touching
       // the clock or the store.
@@ -788,15 +823,16 @@ function registerSessionMessageListeners(es: EventSource, gen: number): void {
       // (busy-gated) frame advances sesCursor — the event WAS received, so a
       // retry after the gate releases must not replay it.
       {
-        const seq = Number((e as MessageEvent).lastEventId);
-        // Invariant 1: per-stream seq-gap detection. Checked BEFORE advancing
-        // sesCursor/sesLastSeq so the gap is measured from the prior baseline.
-        checkSesSeqGap(seq, kind);
-        // checkSesSeqGap MAY have triggered openSessionStream(id, true) →
+        // O3: parse compound SSE id — globalSeq for sesCursor, ordinal for gap.
+        const { globalSeq: seq, ordinal } = parseSSEID((e as MessageEvent).lastEventId);
+        // Invariant 1: delivery-ordinal gap detection. Checked BEFORE advancing
+        // sesCursor/sesLastDeliveryOrdinal so the gap is measured from the prior baseline.
+        checkSesOrdinalGap(ordinal, kind);
+        // checkSesOrdinalGap MAY have triggered openSessionStream(id, true) →
         // sesGen++ → this connection is superseded. Drop cleanly.
         if (gen !== sesGen) return;
         if (seq > sesCursor) sesCursor = seq;
-        if (seq > sesLastSeq) sesLastSeq = seq;
+        if (ordinal > sesLastDeliveryOrdinal) sesLastDeliveryOrdinal = ordinal;
       }
       if (isGateActive()) {
         // Deferred Stream-2 frame — neither mutate the store nor advance the
@@ -905,7 +941,7 @@ function registerSessionMessageListeners(es: EventSource, gen: number): void {
           if (gen !== sesGen) return;
           // Epoch guard: the gate may have activated during the batch decode.
           if (ep === currentGateEpoch()) {
-            applyMessageEvent("messages.batch", Number(ev.lastEventId), decoded, false);
+            applyMessageEvent("messages.batch", parseSSEID(ev.lastEventId).globalSeq, decoded, false);
           } else if (isGateActive()) {
             markBusyDirty();
           }
@@ -959,7 +995,7 @@ function registerSessionMessageListeners(es: EventSource, gen: number): void {
           typeof data.reconcileMs === "number" ? data.reconcileMs : undefined,
         );
       }
-      applyMessageEvent(kind, Number(ev.lastEventId), data, false);
+      applyMessageEvent(kind, parseSSEID(ev.lastEventId).globalSeq, data, false);
     });
   }
 }
@@ -971,9 +1007,9 @@ export function _setSesDropNextNForTest(n: number): void {
   sesDropNextN = n;
 }
 export function _getSesLastSeqForTest(): number {
-  return sesLastSeq;
+  return sesLastDeliveryOrdinal;
 }
 export function _resetSesGapStateForTest(): void {
-  sesLastSeq = 0;
+  sesLastDeliveryOrdinal = -1;
   sesDropNextN = 0;
 }

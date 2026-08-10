@@ -5,7 +5,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -141,9 +140,9 @@ func TestTreeReplay_SnapshotIdIsStoreHead(t *testing.T) {
 		t.Fatalf("initial event: got %q, want tree.snapshot", ev.event)
 	}
 	head := store.Head()
-	wantID := strconv.FormatUint(head, 10)
+	wantID := compoundSSEID(head, 0)
 	if ev.id != wantID {
-		t.Errorf("snapshot SSE id: got %q, want %q (store head seq)", ev.id, wantID)
+		t.Errorf("snapshot SSE id: got %q, want %q (compound: globalSeq=head, ordinal=0 for snapshot)", ev.id, wantID)
 	}
 }
 
