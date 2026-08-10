@@ -192,37 +192,9 @@ test.describe("P1 session-attention", () => {
     await expect.poll(async () => badge.isHidden(), { timeout: 5000 }).toBe(true);
   });
 
-  // ---- workspace-aggregate badge (SECONDARY) -------------------------------
-
-  test("workspace needs-you badge counts needs-attention panes", async ({ page }) => {
-    const ids = await H.panes(page);
-    // No needs-you panes → no badge, count 0.
-    expect(await H.needsYou(page), "no needs-you before any status").toBe(0);
-    await expect(page.locator('[data-testid="ws-needs-you"]')).toHaveCount(0);
-
-    // Two panes need you.
-    await H.probeStatus(page, {
-      sourcePaneId: ids[0],
-      origin: MOCK_ORIGIN,
-      payload: { type: "status", dir: "", session: "a", title: "", attention: "needs_permission", activity: "idle" },
-    });
-    await H.probeStatus(page, {
-      sourcePaneId: ids[1],
-      origin: MOCK_ORIGIN,
-      payload: { type: "status", dir: "", session: "b", title: "", attention: "needs_reply", activity: "idle" },
-    });
-    await expect.poll(async () => H.needsYou(page), { timeout: 5000 }).toBe(2);
-    await expect(page.locator('[data-testid="ws-needs-you"]')).toHaveText("2");
-
-    // One resolves → count drops to 1.
-    await H.probeStatus(page, {
-      sourcePaneId: ids[0],
-      origin: MOCK_ORIGIN,
-      payload: { type: "status", dir: "", session: "a", title: "", attention: "none", activity: "idle" },
-    });
-    await expect.poll(async () => H.needsYou(page), { timeout: 5000 }).toBe(1);
-    await expect(page.locator('[data-testid="ws-needs-you"]')).toHaveText("1");
-  });
+  // P4: the per-workspace needs-you badge was REPLACED by per-target indicators
+  // on the flat tabstrip. The per-pane header badge (tested above) is unchanged.
+  // The flat-tab honest-status behavior is covered by target-tabs.spec.ts.
 
   // ---- distinctness from Q1-C document-liveness ----------------------------
 

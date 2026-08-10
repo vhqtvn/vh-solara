@@ -21,39 +21,18 @@ test.describe("host shell UI wiring", () => {
     await expect(bar).toContainText("dockview · renderer:always");
   });
 
-  test("workspace tabstrip shows one tab per workspace and '+' adds a workspace", async ({ page }) => {
-    // The default context has exactly one workspace (Workspace 1).
-    const before = (await H.workspaces(page)).length;
-    await expect(page.locator('[data-testid="ws-tab"]')).toHaveCount(before);
-    await page.locator('[data-testid="ws-add"]').click();
-    await expect.poll(async () => (await H.workspaces(page)).length).toBe(before + 1);
-    // The newly-added workspace is empty → the empty-workspace affordance shows.
-    await expect(page.locator('[data-testid="empty-workspace"]')).toBeVisible();
-  });
+  // P4: the workspace tabstrip was REPLACED by the flat target tabstrip. The
+  // ws-tab/ws-add/delete/rename affordances are GONE from the primary nav
+  // (workspaces stay internal — the overlay stack is untouched). The flat-tab
+  // visit/select/survival behavior is covered by target-tabs.spec.ts; this
+  // suite keeps covering the pane-level shell chrome (split/close/tray/zoom/
+  // focus/statusbar) which is unchanged.
 
-  test("switching workspace tabs is survival-safe (UI click path)", async ({ page }) => {
-    // The default workspace is active. Create a second one (via the UI +) and
-    // switch between them by clicking tabs; this is CSS-visibility-only and
-    // must keep every iframe alive.
-    const [ws1] = await H.workspaces(page);
-    const aIds = await H.panes(page);
-    const a = aIds[0];
-    const beforeA = (await H.survival(page, a))!;
-
-    await page.locator('[data-testid="ws-add"]').click();
-    await expect.poll(async () => (await H.workspaces(page)).length).toBe(2);
-    const ws2 = (await H.workspaces(page))[1];
-
-    // Click the ws2 tab → it becomes active (UI click path).
-    await page.locator('[data-testid="ws-tab"][data-workspace="' + ws2 + '"]').click();
-    await expect.poll(async () => H.activeWorkspace(page)).toBe(ws2);
-
-    // Click back to ws1.
-    await page.locator('[data-testid="ws-tab"][data-workspace="' + ws1 + '"]').click();
-    await expect.poll(async () => H.activeWorkspace(page)).toBe(ws1);
-
-    // The ws1 pane survived the UI round-trip.
-    await H.assertSurvived(page, a, beforeA, "ws tab click round-trip");
+  test("flat tabstrip has no workspace chrome (ws-tab/ws-add absent)", async ({ page }) => {
+    // The workspace tabs + the add-workspace "+" were removed from the primary
+    // tabstrip (P4). The brand + AddServer remain.
+    await expect(page.locator('[data-testid="ws-tab"]')).toHaveCount(0);
+    await expect(page.locator('[data-testid="ws-add"]')).toHaveCount(0);
   });
 
   test("pane header 'Split →' adds a pane to the active workspace", async ({ page }) => {

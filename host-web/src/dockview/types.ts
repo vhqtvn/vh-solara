@@ -217,3 +217,49 @@ export interface PaneHeaderState {
   maximized: boolean;
   canCollapse: boolean;
 }
+
+// ---- P4 attention-target registry (host state) -----------------------------
+// The operator's unit of attention is a SESSION, not a workspace. The host
+// keeps a registry of intentionally-visited AttentionTarget records and renders
+// them as a flat tabstrip (replacing the workspace tabstrip). A target becomes
+// a tab ONLY when the operator opens/selects it (Fork B — explicit-watch; no
+// auto-enumeration of server sessions). See targetRegistry.ts.
+
+/**
+ * A single session the operator has intentionally visited. `serverId` is the
+ * pane's bound server origin (configuredOriginFor), DERIVED from the pane/server
+ * binding — NEVER sender-claimed (a status/route message carries dir+session but
+ * no trustworthy server id; the server is implied by the pane the message came
+ * from, exactly like the P1 status bridge). `dir`+`session` are the SPA's
+ * declared non-sensitive routing vocabulary (same as PaneStatus).
+ */
+export interface AttentionTarget {
+  serverId: string;
+  dir: string;
+  session: string;
+}
+
+/**
+ * One row in the flat tabstrip. Deduped by exact (serverId,dir,session).
+ *
+ * `liveStatus` is the LAST-KNOWN PaneStatus for this target (metadata). It is
+ * valid as CURRENT attention ONLY while a live pane is reporting this exact
+ * target (targetRegistry.isLive(target)); once the pane navigates away the
+ * record is no longer "live" and the tab MUST NOT claim current attention (no
+ * needs-you badge) — it shows the last-known status dimmed/stale instead. This
+ * is the honest-status invariant: never carry needs_reply/needs_permission to a
+ * target no pane is currently reporting.
+ *
+ * PERSISTENCE: only {target, title, lastVisitedAt, pinned} are durable.
+ * `liveStatus` is RUNTIME-ONLY (transient; stripped on save) — on a cold reload
+ * no record is live until status messages re-arrive, so no stale needs-you can
+ * survive a reload.
+ */
+export interface TabRecord {
+  target: AttentionTarget;
+  title: string;
+  lastVisitedAt: number;
+  pinned: boolean;
+  /** LAST-KNOWN status (runtime-only; not persisted). Honest only while live. */
+  liveStatus?: PaneStatus;
+}

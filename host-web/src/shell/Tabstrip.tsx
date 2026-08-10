@@ -1,46 +1,40 @@
-import { For, Show, createSignal, onCleanup } from "solid-js";
+import { For, Show } from "solid-js";
+import { trayIds } from "../dockview/store";
 import {
-  activeWorkspaceId,
-  addWorkspace,
-  closeWorkspace,
-  needsYouCountFor,
-  renameWorkspace,
-  setActiveWorkspace,
-  trayIds,
-  workspaces,
-  type Workspace,
-} from "../dockview/store";
+  targetRecords,
+  activeRegistryTarget,
+  liveKeysSet,
+  selectTab,
+} from "../dockview/hostController";
+import type { TabRecord } from "../dockview/types";
 import { AddServer } from "./AddServer";
 import s from "./Tabstrip.module.css";
 
 /**
- * Top WORKSPACE tabstrip: brand + one tab per workspace + "+". Clicking a tab
- * switches the active workspace — a SURVIVAL-SAFE CSS-visibility-only switch
- * (App.tsx's overlay stack; no host is disposed, no iframe reloads). The "+"
- * creates a new empty workspace.
+ * Top FLAT tabstrip: brand + one tab per AttentionTarget record + AddServer +
+ * tray badge. This REPLACES the workspace tabstrip (P4 Phase 2). The operator's
+ * unit of attention is a SESSION, not a workspace — the strip shows the sessions
+ * the operator has intentionally visited (Fork B: explicit-watch), most-recent
+ * first.
  *
- * PER-TAB AFFORDANCES (ship together):
- *  - DELETE: a × on each tab. Fat-finger-safe two-step inline confirm (first tap
- *    enters a "delete?" state with ✓/✗; second tap confirms; auto-revert after a
- *    short timeout). The last remaining workspace is guarded (× disabled).
- *    Deleting a workspace DESTROYS its panes (intentional; not a survival op).
- *  - RENAME: long-press the label → inline edit. Commit on blur/Enter; cancel on
- *    Esc. Long-press over double-tap (double-tap conflicts with mobile zoom).
- *  - PER-TAB BADGE: needs-you count on EVERY tab (background ws's needy sessions
- *    are the ones the operator can't see). Same visual language as the prior
- *    active-ws badge (rounded-rect number, GPU-cheap, distinct from Q1-C
- *    liveness).
+ * SURVIVAL: clicking a tab calls selectTab → findPaneForServer →
+ * hostOps().selectTarget → an SPA-INTERNAL route change (postMessage). The
+ * iframe src + element are NEVER touched (proven mechanism; the e2e asserts
+ * iframe identity survives a tab switch). Workspaces stay INTERNAL (the overlay
+ * stack of DockviewHost-per-workspace is the rendering layer; it is NOT removed
+ * — only the primary nav chrome changed).
  *
- * Layout ops within the active workspace go through the typed HostOps controller
- * surface (store.hostOps), not the DEV-only window.__host test bridge.
+ * HONEST STATUS (load-bearing): a needs-you badge shows ONLY when a live pane
+ * is currently reporting that exact target (liveKeys) AND its last-known
+ * attention is needs_reply/needs_permission. A tab whose pane navigated away is
+ * NOT live → no badge, dimmed/stale styling — it never claims current attention
+ * it cannot honestly back. The Q1-C document-liveness dot (per-pane header) is
+ * a separate signal and is not shown here.
+ *
+ * What was REMOVED vs the workspace tabstrip (kept internal, not destroyed):
+ * the add-workspace "+", the workspace delete/rename, the per-workspace
+ * needs-you aggregate badge. The per-target indicators here REPLACE that badge.
  */
-
-/** Long-press threshold (ms) to enter rename mode. Long enough that a tap never
- *  triggers it; short enough to feel responsive on touch. */
-const RENAME_PRESS_MS = 500;
-/** Auto-revert window for the delete two-step confirm (ms). If the operator
- *  doesn't confirm within this window, the tab exits the confirming state. */
-const DELETE_CONFIRM_MS = 3500;
 
 export function Tabstrip() {
   return (
@@ -51,19 +45,10 @@ export function Tabstrip() {
         <span class={s.brandSub}>host</span>
       </div>
       <div class={s.tabs}>
-        <For each={workspaces()}>
-          {(ws) => <WorkspaceTab ws={ws} />}
+        <For each={targetRecords()}>
+          {(rec) => <TargetTab rec={rec} />}
         </For>
       </div>
-      <button
-        type="button"
-        class={s.plus}
-        title="Add workspace"
-        data-testid="ws-add"
-        onClick={() => addWorkspace()}
-      >
-        +
-      </button>
       <AddServer />
       <Show when={trayIds().length > 0}>
         <span class={s.trayBadge} title="Collapsed panes (active workspace)">
@@ -74,247 +59,133 @@ export function Tabstrip() {
   );
 }
 
-/** One workspace tab. Owns its local interaction state: a two-step delete
- *  confirm + a long-press rename edit. Only ONE of confirming/editing is active
- *  at a time (rename cancels confirm and vice versa). */
-function WorkspaceTab(props: { ws: Workspace }) {
-  const active = () => activeWorkspaceId() === props.ws.id;
-  const need = () => needsYouCountFor(props.ws.id);
-  // The × is disabled when this is the last remaining workspace (never zero).
-  const isLast = () => workspaces().length <= 1;
+/** Stable key for a record (matches the registry's targetKey encoding). */
+function recKey(rec: TabRecord): string {
+  return `${rec.target.serverId}\u0000${rec.target.dir}\u0000${rec.target.session}`;
+}
 
-  // ---- delete two-step confirm ---------------------------------------------
-  const [confirming, setConfirming] = createSignal(false);
-  let confirmTimer: ReturnType<typeof setTimeout> | undefined;
-  const armConfirmTimer = () => {
-    if (confirmTimer) clearTimeout(confirmTimer);
-    confirmTimer = setTimeout(() => setConfirming(false), DELETE_CONFIRM_MS);
+/** One target tab. Honest status: live badge only when a live pane currently
+ *  reports this exact target AND its attention is needs_*. Stale (non-live)
+ *  tabs show dimmed styling and NO badge. Clicking selects via the survival-safe
+ *  SPA-internal route change. */
+function TargetTab(props: { rec: TabRecord }) {
+  const active = () => {
+    const at = activeRegistryTarget();
+    return !!at && recKey(props.rec) === recKeyOf(at);
   };
-  const clearConfirmTimer = () => {
-    if (confirmTimer) {
-      clearTimeout(confirmTimer);
-      confirmTimer = undefined;
+  const live = () => liveKeysSet().has(recKey(props.rec));
+  // The needs-you badge shows ONLY when live AND the last-known attention is
+  // needs_reply/needs_permission. A stale record never shows a badge (it must
+  // not claim current attention it cannot honestly back).
+  const need = () =>
+    live() &&
+    !!props.rec.liveStatus &&
+    (props.rec.liveStatus.attention === "needs_reply" ||
+      props.rec.liveStatus.attention === "needs_permission");
+  // Activity indicator dot for live tabs only (cheap, GPU-safe). Shows the
+  // current activity for a live target; nothing for a stale one.
+  const activityClass = () => {
+    if (!live() || !props.rec.liveStatus) return "";
+    switch (props.rec.liveStatus.activity) {
+      case "running":
+        return s.actRunning;
+      case "error":
+        return s.actError;
+      case "done_unread":
+        return s.actUnread;
+      default:
+        return "";
     }
   };
-  const startConfirm = () => {
-    if (isLast()) return; // guarded — can't delete the last workspace
-    setEditing(false);
-    clearPressTimer();
-    setConfirming(true);
-    armConfirmTimer();
-  };
-  const cancelConfirm = () => {
-    setConfirming(false);
-    clearConfirmTimer();
-  };
-  const confirmDelete = () => {
-    clearConfirmTimer();
-    setConfirming(false);
-    closeWorkspace(props.ws.id);
-  };
 
-  // ---- rename via long-press → inline edit ---------------------------------
-  const [editing, setEditing] = createSignal(false);
-  const [draft, setDraft] = createSignal("");
-  let inputEl: HTMLInputElement | undefined;
-  let pressTimer: ReturnType<typeof setTimeout> | undefined;
-
-  const beginEdit = () => {
-    clearPressTimer();
-    setConfirming(false);
-    clearConfirmTimer();
-    setDraft(props.ws.name);
-    setEditing(true);
-    // Focus after the input mounts. queueMicrotask runs after SolidJS renders
-    // the <Show> branch. select() highlights the current name so a replacement
-    // is one keystroke (touch-friendly).
-    queueMicrotask(() => {
-      inputEl?.focus();
-      inputEl?.select();
+  const onSelect = () => {
+    // selectTab resolves the pane bound to this target's server and issues a
+    // survival-safe selectTarget (SPA-internal route; no iframe.src change).
+    // No-op when no pane is bound (the tab is effectively unselectable — the
+    // server's pane was closed). Phase 3 may add a disabled visual.
+    selectTab({
+      serverId: props.rec.target.serverId,
+      dir: props.rec.target.dir,
+      session: props.rec.target.session,
     });
   };
-  const commitEdit = () => {
-    if (!editing()) return;
-    const name = draft().trim();
-    setEditing(false);
-    if (name && name !== props.ws.name) renameWorkspace(props.ws.id, name);
-  };
-  const cancelEdit = () => {
-    setEditing(false);
-  };
-
-  // Long-press detection: pointerdown arms a timer; if it elapses while still
-  // pressed, enter rename. pointerup/leave/cancel clears an unfired timer so a
-  // quick tap never triggers rename.
-  const onLabelPointerDown = () => {
-    if (editing() || confirming()) return;
-    clearPressTimer();
-    pressTimer = setTimeout(() => {
-      pressTimer = undefined;
-      beginEdit();
-    }, RENAME_PRESS_MS);
-  };
-  const clearPressTimer = () => {
-    if (pressTimer) {
-      clearTimeout(pressTimer);
-      pressTimer = undefined;
-    }
-  };
-
-  onCleanup(() => {
-    clearConfirmTimer();
-    clearPressTimer();
-  });
 
   return (
     <div
-      class={`${s.tab} ${active() ? s.tabActive : ""} ${confirming() ? s.tabConfirming : ""}`}
-      data-testid="ws-tab"
-      data-workspace={props.ws.id}
-      data-active={active() ? "1" : "0"}
-      data-confirming={confirming() ? "1" : "0"}
-      data-editing={editing() ? "1" : "0"}
-      // a11y: the tab was a <button> (focusable, Enter/Space to activate). It is
-      // now a <div> because nested interactive buttons (×/✓/✗) cannot live
-      // inside a <button>. Restore the keyboard + AT semantics explicitly so
-      // workspace-switch + rename remain reachable without a pointer.
-      role="tab"
-      tabindex={editing() ? -1 : 0}
-      aria-selected={active() ? "true" : "false"}
-      aria-label={props.ws.name}
-      // Clicking anywhere on the tab (that isn't a nested button or an active
-      // edit/confirm state) switches the workspace. Nested × / ✓ / ✗ buttons
-      // stopPropagation so they never trigger a switch. After a long-press
-      // enters edit mode, editing() is true and the click is suppressed.
-      onClick={() => {
-        if (editing() || confirming()) return;
-        setActiveWorkspace(props.ws.id);
+      classList={{
+        [s.tab]: true,
+        [s.tabActive]: active(),
+        [s.tabStale]: !live(),
       }}
+      data-testid="target-tab"
+      data-server={props.rec.target.serverId}
+      data-dir={props.rec.target.dir}
+      data-session={props.rec.target.session}
+      data-active={active() ? "1" : "0"}
+      data-live={live() ? "1" : "0"}
+      data-pinned={props.rec.pinned ? "1" : "0"}
+      role="tab"
+      tabindex={0}
+      aria-selected={active() ? "true" : "false"}
+      aria-label={tabLabel(props.rec, live())}
+      title={tabTitle(props.rec, live())}
+      onClick={onSelect}
       onKeyDown={(e) => {
-        if (editing() || confirming()) return;
         if (e.key === "Enter" || e.key === " ") {
           e.preventDefault();
-          setActiveWorkspace(props.ws.id);
+          onSelect();
         }
       }}
     >
-      <Show
-        when={editing()}
-        fallback={
-          <Show
-            when={confirming()}
-            fallback={
-              <span
-                class={s.tabLabel}
-                title={props.ws.name}
-                onPointerDown={onLabelPointerDown}
-                onPointerUp={clearPressTimer}
-                onPointerLeave={clearPressTimer}
-                onPointerCancel={clearPressTimer}
-              >
-                {props.ws.name}
-              </span>
-            }
-          >
-            <span class={s.tabConfirmLabel} title="Confirm delete?">
-              Delete?
-            </span>
-          </Show>
-        }
-      >
-        <input
-          ref={inputEl}
-          class={s.tabInput}
-          data-testid="ws-rename-input"
-          value={draft()}
-          // Stop pointer events from re-entering the long-press arm while typing.
-          onPointerDown={(e) => e.stopPropagation()}
-          onInput={(e) => setDraft(e.currentTarget.value)}
-          onBlur={commitEdit}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") {
-              e.preventDefault();
-              commitEdit();
-            } else if (e.key === "Escape") {
-              e.preventDefault();
-              cancelEdit();
-            }
-          }}
-          maxlength={80}
-        />
-      </Show>
-
-      {/* PER-TAB needs-you badge (EVERY workspace, not just active). A
-          background ws's needy sessions are the ones the operator can't see on
-          the active grid — surfacing them here is the whole point. Hidden when
-          the count is 0. Same rounded-rect number + amber as the prior badge;
-          distinct from Q1-C liveness (dot) and the per-pane attention badge. */}
-      <Show when={need() > 0}>
+      <span
+        class={`${s.actDot} ${activityClass()}`}
+        data-testid="target-activity"
+      />
+      <span class={s.tabLabel} title={props.rec.title || props.rec.target.serverId}>
+        {props.rec.title || fallbackHost(props.rec.target.serverId)}
+      </span>
+      <Show when={need()}>
         <span
           class={s.needBadge}
-          data-testid="ws-needs-you"
-          data-workspace={props.ws.id}
-          title={`${need()} session${need() === 1 ? "" : "s"} need you`}
+          data-testid="target-needs-you"
+          title={
+            props.rec.liveStatus?.attention === "needs_permission"
+              ? "Permission requested"
+              : "Reply needed"
+          }
         >
-          {need()}
+          {props.rec.liveStatus?.attention === "needs_permission" ? "！" : "?"}
         </span>
-      </Show>
-
-      {/* Delete affordance. When NOT confirming: a single × (disabled on the
-          last ws). When confirming: a ✓ confirm + a ✗ cancel, replacing the ×. */}
-      <Show
-        when={confirming()}
-        fallback={
-          <Show when={!editing()}>
-            <button
-              type="button"
-              class={s.tabDel}
-              data-testid="ws-delete"
-              data-workspace={props.ws.id}
-              disabled={isLast()}
-              title={
-                isLast()
-                  ? "Can't delete the last workspace"
-                  : `Delete "${props.ws.name}"`
-              }
-              // stopPropagation so the tap never also switches the workspace.
-              onClick={(e) => {
-                e.stopPropagation();
-                startConfirm();
-              }}
-            >
-              ×
-            </button>
-          </Show>
-        }
-      >
-        <button
-          type="button"
-          class={s.tabDelConfirm}
-          data-testid="ws-delete-confirm"
-          data-workspace={props.ws.id}
-          title="Confirm delete"
-          onClick={(e) => {
-            e.stopPropagation();
-            confirmDelete();
-          }}
-        >
-          ✓
-        </button>
-        <button
-          type="button"
-          class={s.tabDelCancel}
-          data-testid="ws-delete-cancel"
-          data-workspace={props.ws.id}
-          title="Cancel"
-          onClick={(e) => {
-            e.stopPropagation();
-            cancelConfirm();
-          }}
-        >
-          ✕
-        </button>
       </Show>
     </div>
   );
+}
+
+/** Key-from-a-target helper (avoids importing targetKey for the active match). */
+function recKeyOf(t: { serverId: string; dir: string; session: string }): string {
+  return `${t.serverId}\u0000${t.dir}\u0000${t.session}`;
+}
+
+function tabLabel(rec: TabRecord, live: boolean): string {
+  const host = fallbackHost(rec.target.serverId);
+  const title = rec.title || host;
+  return live ? title : `${title} (stale)`;
+}
+
+function tabTitle(rec: TabRecord, live: boolean): string {
+  const host = fallbackHost(rec.target.serverId);
+  const title = rec.title || host;
+  const status = rec.liveStatus
+    ? ` · ${rec.liveStatus.attention}/${rec.liveStatus.activity}`
+    : "";
+  return live ? `${title}${status}` : `${title} (stale — not currently displayed)`;
+}
+
+function fallbackHost(serverId: string): string {
+  try {
+    const h = new URL(serverId).host;
+    return h || serverId;
+  } catch {
+    return serverId;
+  }
 }

@@ -8,10 +8,12 @@ import { test, expect } from "@playwright/test";
 // pane-header ops already went through the HostOps controller surface; this
 // proves the SHELL ops do too.
 //
-// MULTI-WORKSPACE: the top tabstrip is workspace-scoped. The "+" adds a
-// WORKSPACE (not a pane); clicking a workspace tab switches (CSS-visibility-
-// only — survival-safe, no iframe reload, proven separately in tests/e2e).
-// Panes within the active workspace are represented by their own custom headers.
+// P4: the top tabstrip is the FLAT target tabstrip (workspace tabs were removed
+// from primary nav — workspaces stay internal as the rendering layer). The
+// flat-tab visit/select/survival behavior is covered by the DEV e2e
+// (target-tabs.spec.ts, which has the bridge to drive visits). Here we only
+// prove the production build renders the new tabstrip without workspace chrome
+// and without crashing.
 
 async function waitForHostReady(page: import("@playwright/test").Page): Promise<void> {
   await page.goto("/");
@@ -47,34 +49,14 @@ test.describe("host shell — production build (vite preview)", () => {
     expect(hasBridge.kbdFocus, "window.__hostKbdFocus must be absent in production").toBe(false);
   });
 
-  test("'+' adds a workspace — shell addWorkspace via HostOps (not the bridge)", async ({ page }) => {
-    // The "+" button calls addWorkspace() in the production bundle. A new
-    // workspace tab must appear and the empty-workspace affordance must show
-    // (a freshly-created workspace has 0 panels).
-    const before = await page.locator('[data-testid="ws-tab"]').count();
-    await page.locator('[data-testid="ws-add"]').click();
-    await expect
-      .poll(async () => page.locator('[data-testid="ws-tab"]').count())
-      .toBe(before + 1);
-    await expect(page.locator('[data-testid="empty-workspace"]')).toBeVisible();
-  });
-
-  test("clicking a workspace tab switches active workspace (survival-safe)", async ({ page }) => {
-    // There is initially one workspace tab. Add a second one and switch between
-    // them by clicking tabs — this exercises the CSS-visibility-only overlay
-    // stack path in production (no bridge).
-    await page.locator('[data-testid="ws-add"]').click();
-    await expect
-      .poll(async () => page.locator('[data-testid="ws-tab"]').count())
-      .toBe(2);
-    const tabs = page.locator('[data-testid="ws-tab"]');
-    // The second tab is active (addWorkspace activates the new workspace).
-    await expect(tabs.nth(1)).toHaveClass(/tabActive/);
-    // Click the first tab → it becomes active (switch back).
-    await tabs.nth(0).click();
-    await expect(tabs.nth(0)).toHaveClass(/tabActive/);
-    // The empty-workspace affordance disappears (ws1 has seeded panes).
-    await expect(page.locator('[data-testid="empty-workspace"]')).toHaveCount(0);
+  test("production tabstrip has NO workspace chrome (flat target strip)", async ({ page }) => {
+    // P4: the workspace tabs + add-workspace "+" were removed from the primary
+    // tabstrip. The brand remains. This proves the production bundle reflects
+    // the flat-tabstrip change (no ws-tab / ws-add elements in the DOM).
+    await expect(page.locator('[data-testid="ws-tab"]')).toHaveCount(0);
+    await expect(page.locator('[data-testid="ws-add"]')).toHaveCount(0);
+    // The brand mark is still present (the tabstrip container rendered).
+    await expect(page.locator('[data-testid="statusbar"]')).toContainText("document alive");
   });
 
   test("collapse + tray-chip restore — shell restore via HostOps", async ({ page }) => {

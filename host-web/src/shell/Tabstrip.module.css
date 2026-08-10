@@ -54,10 +54,7 @@
   cursor: pointer;
   white-space: nowrap;
   flex: 0 0 auto;
-  /* Prevent text selection / long-press context menu during the rename
-   * long-press, and double-tap-to-zoom on rapid tab taps (touch-friendly). The
-   * -webkit-touch-callout suppression specifically stops iOS Safari's native
-   * callout from racing the ~500ms RENAME_PRESS_MS threshold. */
+  /* Prevent text selection + double-tap-to-zoom on rapid tab taps (touch). */
   user-select: none;
   -webkit-user-select: none;
   -webkit-touch-callout: none;
@@ -80,98 +77,44 @@
   border-color: var(--accent);
   color: var(--fg);
 }
-/* Two-step delete confirm state. GPU-cheap: a slow opacity pulse ONLY (no
- * mask-image / backdrop-filter — AGENTS.md Firefox/WebRender rules). Honored
- * under prefers-reduced-motion. The destructive tint uses --warn (amber, the
- * established "operator action needed" color) so it reads as cautionary. */
-.tabConfirming {
-  background: rgba(210, 153, 34, 0.18);
-  border-color: var(--warn);
-  color: var(--fg);
-  animation: ws-confirm-pulse 1.4s ease-in-out infinite;
+/* HONEST STATUS (load-bearing): a tab whose target no live pane is currently
+ * reporting. Dimmed — it shows last-known title/metadata but MUST NOT claim
+ * current attention (no needs-you badge). GPU-cheap: opacity only (no
+ * mask-image / backdrop-filter — AGENTS.md Firefox/WebRender rules). */
+.tabStale {
+  opacity: 0.55;
 }
-@keyframes ws-confirm-pulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.6; }
-}
-@media (prefers-reduced-motion: reduce) {
-  .tabConfirming { animation: none; }
-}
-.tabConfirmLabel {
-  font-size: 12px;
-  font-weight: 700;
-  color: var(--warn);
-  white-space: nowrap;
-  flex: 0 1 auto;
-}
-/* Inline rename input — replaces the label while editing. Sized to fit the tab
- * height; inherits the tab's color so it reads as in-place editing. */
-.tabInput {
-  appearance: none;
-  background: var(--bg);
-  color: var(--fg);
-  border: 1px solid var(--accent);
-  border-radius: 4px;
-  font-size: 12px;
-  font-weight: 600;
-  height: 20px;
-  padding: 0 4px;
-  width: 110px;
-  max-width: 40vw;
-  outline: none;
+/* Activity dot for LIVE tabs (cheap, GPU-safe — a static colored circle, no
+ * animation). Communicates the target's current activity (running/error/unread).
+ * Only shown for live tabs; a stale tab shows an empty dot. Distinct from the
+ * Q1-C document-liveness indicator (per-pane header) and from the needs-you
+ * badge. */
+.actDot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--fg-dim);
+  opacity: 0.4;
   flex: 0 0 auto;
 }
-/* Per-tab delete/confirm affordances. The × is always rendered (touch has no
- * hover); it's subtle by default and brightens on hover of the tab. */
-.tabDel,
-.tabDelConfirm,
-.tabDelCancel {
-  appearance: none;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 16px;
-  height: 16px;
-  padding: 0;
-  border: 0;
-  border-radius: 4px;
-  background: transparent;
-  color: var(--fg-dim);
-  font-size: 13px;
-  line-height: 1;
-  cursor: pointer;
-  flex: 0 0 auto;
+.actRunning {
+  background: var(--accent);
+  opacity: 1;
 }
-.tab.tab:hover .tabDel {
-  color: var(--warn);
-}
-.tabDel:hover:not(:disabled) {
-  color: var(--warn);
-  background: rgba(210, 153, 34, 0.2);
-}
-.tabDel:disabled {
-  opacity: 0.3;
-  cursor: not-allowed;
-}
-.tabDelConfirm {
-  color: var(--warn);
-  font-size: 12px;
-}
-.tabDelConfirm:hover {
+.actError {
   background: var(--warn);
-  color: var(--bg);
+  opacity: 1;
 }
-.tabDelCancel {
-  color: var(--fg-dim);
-  font-size: 11px;
+.actUnread {
+  background: var(--accent);
+  opacity: 0.7;
 }
-.tabDelCancel:hover {
-  color: var(--fg);
-  background: var(--bg-elev);
-}
-/* P1 workspace-aggregate needs-you count badge (SECONDARY). Distinct shape from
- * the per-pane attention badge (pill here vs rounded-rect there) and from the
- * Q1-C liveness dot. Amber = "operator action needed". */
+/* Per-target needs-you badge (migrated from the per-workspace badge). Same
+ * rounded-rect number + amber as the prior badge (GPU-cheap). Shows ONLY when a
+ * live pane currently reports this target AND its last-known attention is
+ * needs_reply/needs_permission. Distinct shape from the per-pane attention
+ * badge (pill here vs rounded-rect there) and from the Q1-C liveness dot. */
 .needBadge {
   display: inline-flex;
   align-items: center;
@@ -186,22 +129,6 @@
   font-weight: 700;
   line-height: 1;
   flex: 0 0 auto;
-}
-.plus {
-  width: 26px;
-  height: 26px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background: var(--bg);
-  color: var(--fg-dim);
-  font-size: 16px;
-  line-height: 1;
-  cursor: pointer;
-  flex: 0 0 auto;
-}
-.plus:hover {
-  border-color: var(--accent);
-  color: var(--accent);
 }
 .trayBadge {
   font-size: 11px;

@@ -512,6 +512,153 @@ export async function selectTarget(
     h?.selectTarget(paneId, dir, session);
   }, { paneId, dir, session });
 }
+
+// ---- P4 attention-target registry (flat tabstrip) --------------------------
+// Drive the registry programmatically for the flat-tabstrip e2e (caps/age/visit/
+// dedup/honest-status assertions). These route through the SAME production
+// targetRegistry module the Tabstrip + selectTarget/updateRoute use. The bridge
+// is DEV-only (absent in prod — the preview-e2e asserts __host=0).
+
+export interface TargetVm {
+  serverId: string;
+  dir: string;
+  session: string;
+  title: string;
+  lastVisitedAt: number;
+  pinned: boolean;
+  live: boolean;
+  liveStatus: { attention: string; activity: string; title: string } | null;
+}
+
+/** Read-only snapshot of the registry records (most-recent-first). */
+export async function targets(page: Page): Promise<TargetVm[]> {
+  return page.evaluate(() => {
+    const h = (window as unknown as { __host?: { targets(): TargetVm[] } }).__host;
+    return h ? h.targets() : [];
+  });
+}
+
+/** Count of registry records (convenience for cap assertions). */
+export async function targetCount(page: Page): Promise<number> {
+  const list = await targets(page);
+  return list.length;
+}
+
+/** Upsert a target as a visited tab (production visit() path). */
+export async function visitTarget(
+  page: Page,
+  serverId: string,
+  dir: string,
+  session: string,
+  title?: string,
+): Promise<void> {
+  await page.evaluate(({ serverId, dir, session, title }) => {
+    const h = (window as unknown as { __host?: { visitTarget(s: string, d: string, t: string, n?: string): void } }).__host;
+    h?.visitTarget(serverId, dir, session, title);
+  }, { serverId, dir, session, title });
+}
+
+/** Remove a record (dismiss). Idempotent. */
+export async function dismissTarget(
+  page: Page,
+  serverId: string,
+  dir: string,
+  session: string,
+): Promise<void> {
+  await page.evaluate(({ serverId, dir, session }) => {
+    const h = (window as unknown as { __host?: { dismissTarget(s: string, d: string, t: string): void } }).__host;
+    h?.dismissTarget(serverId, dir, session);
+  }, { serverId, dir, session });
+}
+
+/** Pin a record. Returns true on success, false on cap-refusal. */
+export async function pinTarget(
+  page: Page,
+  serverId: string,
+  dir: string,
+  session: string,
+): Promise<boolean> {
+  return page.evaluate(({ serverId, dir, session }) => {
+    const h = (window as unknown as { __host?: { pinTarget(s: string, d: string, t: string): boolean } }).__host;
+    return h ? h.pinTarget(serverId, dir, session) : false;
+  }, { serverId, dir, session });
+}
+
+/** Unpin a record. */
+export async function unpinTarget(
+  page: Page,
+  serverId: string,
+  dir: string,
+  session: string,
+): Promise<void> {
+  await page.evaluate(({ serverId, dir, session }) => {
+    const h = (window as unknown as { __host?: { unpinTarget(s: string, d: string, t: string): void } }).__host;
+    h?.unpinTarget(serverId, dir, session);
+  }, { serverId, dir, session });
+}
+
+/** The currently-active target (the highlighted tab), or null. */
+export async function activeTarget(
+  page: Page,
+): Promise<{ serverId: string; dir: string; session: string } | null> {
+  return page.evaluate(() => {
+    const h = (window as unknown as { __host?: { activeTarget(): { serverId: string; dir: string; session: string } | null } }).__host;
+    return h ? h.activeTarget() : null;
+  });
+}
+
+/** Resolve the pane bound to a serverId (the Tabstrip's tab-click resolver). */
+export async function findPaneForServer(page: Page, serverId: string): Promise<string | null> {
+  const r = await page.evaluate((serverId) => {
+    const h = (window as unknown as { __host?: { findPaneForServer(s: string): string | null } }).__host;
+    return h ? h.findPaneForServer(serverId) : null;
+  }, serverId);
+  return r ?? null;
+}
+
+/** Drive a tab select through the production path (findPaneForServer →
+ *  hostOps().selectTarget). Returns true when a select was issued. */
+export async function selectTab(
+  page: Page,
+  serverId: string,
+  dir: string,
+  session: string,
+): Promise<boolean> {
+  return page.evaluate(({ serverId, dir, session }) => {
+    const h = (window as unknown as { __host?: { selectTab(s: string, d: string, t: string): boolean } }).__host;
+    return h ? h.selectTab(serverId, dir, session) : false;
+  }, { serverId, dir, session });
+}
+
+/** TEST-ONLY: backdate a record's lastVisitedAt by `daysAgo` days so age-
+ *  retirement (7-day eviction of unpinned records) is exercisable in a fast
+ *  e2e. Persists (cold-load retirement test reads it on reload). DEV-only. */
+export async function backdateTarget(
+  page: Page,
+  serverId: string,
+  dir: string,
+  session: string,
+  daysAgo: number,
+): Promise<void> {
+  await page.evaluate(({ serverId, dir, session, daysAgo }) => {
+    const h = (window as unknown as { __host?: { _backdateTarget(s: string, d: string, t: string, n: number): void } }).__host;
+    h?._backdateTarget(serverId, dir, session, daysAgo);
+  }, { serverId, dir, session, daysAgo });
+}
+
+/** Storage key target-registry persistence writes (must match
+ *  src/dockview/targetRegistry.ts). */
+export const TARGETS_STORAGE_KEY = "vh-host:targets:v1";
+
+/** Wait until the registry holds exactly `count` records (polls the bridge).
+ *  Useful after a mutation that triggers a debounced save + cap enforcement. */
+export async function waitForTargetCount(
+  page: Page,
+  count: number,
+  timeoutMs = 4000,
+): Promise<void> {
+  await expect.poll(async () => targetCount(page), { timeout: timeoutMs }).toBe(count);
+}
 // DEV-only test arrangement: dock `a` into `b`'s group as a tab. No shell op
 // creates a tabbed group, so this is the only deterministic way to reach
 // swap()'s same-group branch in e2e. Uses the survival-safe moveTo primitive.
