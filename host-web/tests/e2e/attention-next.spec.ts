@@ -359,4 +359,193 @@ test.describe("P3 attention hub + NEXT hero button", () => {
     await H.kbdFocusClose(page);
     await expect.poll(async () => (await H.kbdFocusState(page)).open).toBe(false);
   });
+
+  // ---- cross-workspace COMPOSITION (reviewer a-F1) --------------------------
+  // The cross-ws primitive and the tray-restore primitive are individually
+  // proven above; this exercises their COMPOSITION — a needy pane that is BOTH
+  // in a background workspace AND collapsed to the tray. next() must
+  // setActiveWorkspace(target.ws) FIRST (the sync re-projects hostOps() to the
+  // target ws) THEN hostOps().restore() on the now-active ws, survival-safely
+  // (moveTo/addGroup, NEVER removePanel). Pin behaviorally that hostOps()
+  // resolves the target ws after the switch + that the iframe identity survives
+  // the cross-ws switch AND the tray restore together.
+
+  test("cross-ws + tray-restore composition: NEXT switches ws AND restores the trayed needy pane; iframe survives", async ({ page }) => {
+    const wsIds = await H.workspaces(page);
+    const ws1 = wsIds[0]; // active, seeded panes
+
+    // Create ws2 (becomes active). Add TWO panes so a collapse is allowed — the
+    // collapse guard refuses when gridPaneCount would drop to 0.
+    const ws2 = await H.addWorkspace(page, "WS2");
+    expect(ws2, "second workspace created").not.toBeNull();
+    const ws2Needy = await H.addServer(page, "http://127.0.0.1:5174/w2n", "ws2-needy");
+    const ws2Grid = await H.addServer(page, "http://127.0.0.1:5174/w2g", "ws2-grid");
+    expect(ws2Needy, "ws2 needy pane created").not.toBeNull();
+    expect(ws2Grid, "ws2 grid pane created").not.toBeNull();
+    await H.waitForReady(page, ws2Needy!);
+    await H.waitForReady(page, ws2Grid!);
+
+    // Collapse ws2Needy to the tray (ws2 is active; ws2Grid stays on the grid).
+    // addFloatingGroup is survival-safe — the iframe stays mounted, only its
+    // Dockview location moves to a floating group (renderer:'always').
+    await H.focusPane(page, ws2Grid!);
+    await H.collapse(page, ws2Needy!);
+    await expect.poll(async () => H.trayIds(page)).toContain(ws2Needy);
+
+    // Make the TRAYED ws2 pane HIGH-priority needy (needs_permission). Status is
+    // GLOBAL (source-bound), so it lands regardless of the active workspace.
+    await H.probeStatus(page, {
+      sourcePaneId: ws2Needy!,
+      origin: MOCK_ORIGIN,
+      payload: { type: "status", dir: "", session: "w2", title: "W2", attention: "needs_permission", activity: "idle" },
+    });
+
+    // Capture survival baseline for the trayed pane BEFORE the cross-ws+restore.
+    const before = (await H.survival(page, ws2Needy!))!;
+    expect(before.connId, "trayed pane is heartbeating").not.toBeNull();
+
+    // Switch to ws1 + make a ws1 pane LOW-priority needy (needs_reply) so the
+    // button shows (active-ws N>0) but the GLOBAL rank picks ws2's trayed pane.
+    await H.setActiveWorkspace(page, ws1);
+    await expect.poll(async () => H.activeWorkspace(page)).toBe(ws1);
+    const ws1Panes = await H.panes(page);
+    const ws1Pane = ws1Panes[0];
+    await H.probeStatus(page, {
+      sourcePaneId: ws1Pane,
+      origin: MOCK_ORIGIN,
+      payload: { type: "status", dir: "", session: "w1", title: "W1", attention: "needs_reply", activity: "idle" },
+    });
+    await expect.poll(async () => H.needsYou(page)).toBe(1);
+    await expect(page.locator('[data-testid="attention-next"]')).toBeVisible();
+
+    // The global ranking crosses ws AND skips the tray to pick ws2's permission pane.
+    const t = await H.nextTarget(page);
+    expect(t!.paneId, "ranking crosses ws to the trayed permission pane").toBe(ws2Needy);
+    expect(t!.wsId, "target workspace is ws2").toBe(ws2);
+
+    // CRUX — click NEXT: the composition is setActiveWorkspace(ws2) THEN
+    // hostOps().restore(ws2Needy) on the now-active ws2. ws2 must be active AND
+    // the pane restored from tray AND iframe identity unchanged.
+    await page.locator('[data-testid="attention-next"]').click();
+
+    await expect.poll(async () => H.activeWorkspace(page), { timeout: 5000 }).toBe(ws2);
+    await expect.poll(async () => H.focused(page), { timeout: 5000 }).toBe(ws2Needy);
+    await expect.poll(async () => H.trayIds(page), { timeout: 5000 }).not.toContain(ws2Needy);
+
+    // CRUX — iframe SURVIVED the cross-ws switch + tray restore (no reload).
+    await H.assertSurvived(page, ws2Needy!, before, "cross-ws + tray restore");
+  });
+
+  // ---- cross-workspace COMPOSITION (reviewer d-F1) --------------------------
+  // The cross-ws primitive and the keyboard-exit primitive are individually
+  // proven above; this exercises their COMPOSITION — keyboard focus-mode owned
+  // in ws1 while a needy pane lives in ws2. next() must exitKeyboardFocus()
+  // (cross-pane rule) so the keyboard closes and ws1's owned maximize is exited
+  // (not re-pinned by onWorkspaceActivated, which is a no-op once
+  // keyboardOpen=false). Pin behaviorally that no stale maximize is left on ws1
+  // and that the iframe identity survives the cross-ws switch + keyboard exit.
+
+  // KNOWN-BROKEN — production composition bug in attentionNext.ts, NOT a test
+  // defect. This test asserts the d-F1 contract (a cross-ws NEXT must EXIT
+  // keyboard focus-mode) and is RED against the current implementation. Marked
+  // .fixme so the suite stays green; remove .fixme once the production fix
+  // lands — the body below is the correct contract and should then pass
+  // unchanged.
+  //
+  // ROOT CAUSE: in attentionNext.ts next(), the ws switch runs BEFORE the
+  // keyboard rule. setActiveWorkspace(target.wsId) SYNCHRONOUSLY re-projects
+  // focusedId() to the target (store.ts setActiveWorkspace → the sync callback
+  // hostController.syncAll → setFocused). So by the time the keyboard rule
+  // evaluates
+  //     if (isKeyboardOpen() && target.paneId !== focusedId())
+  // focusedId() ALREADY equals target.paneId (the re-projected ws-switch
+  // target) → the cross-pane condition is false → exitKeyboardFocus() NEVER
+  // fires. onWorkspaceActivated (App.tsx createEffect on activeWorkspaceId)
+  // then flushes with keyboardOpen still true and re-points the maximize to
+  // ws2 (exitOwned(ws1) + maximizeActive(ws2)); switching back re-maximizes ws1.
+  // Observed (chromium probe): open=true ownedWs=ws-2 ws2Maximized=true
+  // ws1Maximized=true.
+  //
+  // MINIMAL FIX (separate production slice — out of scope here): capture the
+  // PRE-switch focused pane at the top of next() and evaluate the keyboard rule
+  // against it; OR treat target.wsId !== activeWorkspaceId() as an additional
+  // cross-pane trigger forcing exitKeyboardFocus; OR move the keyboard rule
+  // before the ws switch.
+  test.fixme("cross-ws + keyboard-open composition: NEXT switches ws, exits keyboard focus-mode, leaves no stale ws1 maximize; iframe survives", async ({ page }) => {
+    const wsIds = await H.workspaces(page);
+    const ws1 = wsIds[0]; // active, seeded panes
+
+    // Create ws2 (becomes active) + a pane; wait for it to heartbeat so it can be
+    // the needy target and so its survival is observable.
+    const ws2 = await H.addWorkspace(page, "WS2");
+    expect(ws2).not.toBeNull();
+    const ws2Pane = await H.addServer(page, "http://127.0.0.1:5174/w2", "ws2-srv");
+    expect(ws2Pane).not.toBeNull();
+    await H.waitForReady(page, ws2Pane!);
+
+    // Make the ws2 pane HIGH-priority needy (needs_permission). Status is GLOBAL.
+    await H.probeStatus(page, {
+      sourcePaneId: ws2Pane!,
+      origin: MOCK_ORIGIN,
+      payload: { type: "status", dir: "", session: "w2", title: "W2", attention: "needs_permission", activity: "idle" },
+    });
+
+    // Switch back to ws1 + make a ws1 pane LOW-priority needy (needs_reply) so
+    // the button shows (active-ws N>0) but the GLOBAL rank picks ws2's pane.
+    await H.setActiveWorkspace(page, ws1);
+    await expect.poll(async () => H.activeWorkspace(page)).toBe(ws1);
+    const ws1Panes = await H.panes(page);
+    const ws1Focused = ws1Panes[0];
+    await H.focusPane(page, ws1Focused);
+    await expect.poll(async () => H.focused(page)).toBe(ws1Focused);
+    await H.probeStatus(page, {
+      sourcePaneId: ws1Focused,
+      origin: MOCK_ORIGIN,
+      payload: { type: "status", dir: "", session: "w1", title: "W1", attention: "needs_reply", activity: "idle" },
+    });
+    await expect.poll(async () => H.needsYou(page)).toBe(1);
+    await expect(page.locator('[data-testid="attention-next"]')).toBeVisible();
+
+    // Capture ws2 pane survival BEFORE the cross-ws switch (survival is GLOBAL).
+    const before = (await H.survival(page, ws2Pane!))!;
+    expect(before.connId, "ws2 pane is heartbeating").not.toBeNull();
+
+    // Open keyboard focus-mode in ws1 (owns ws1's maximize on the focused group).
+    // This is the "keyboard focus-mode owned in ws1" setup.
+    await H.kbdFocusOpen(page, 360);
+    await expect.poll(async () => (await H.kbdFocusState(page)).open).toBe(true);
+    await expect.poll(async () => (await H.kbdFocusState(page)).ownedWs).toBe(ws1);
+    await expect.poll(async () => H.isMaximized(page)).toBe(true);
+
+    // The global ranking picks ws2's permission pane over ws1's reply pane.
+    const t = await H.nextTarget(page);
+    expect(t!.paneId, "ranking crosses ws to ws2's permission pane").toBe(ws2Pane);
+    expect(t!.wsId, "target workspace is ws2").toBe(ws2);
+
+    // CRUX — click NEXT: composition is the cross-pane keyboard rule
+    // (exitKeyboardFocus) + the ws switch. exitKeyboardFocus must fire so the
+    // keyboard closes and ws1's owned maximize is exited (not re-pinned by
+    // onWorkspaceActivated, which is a no-op once keyboardOpen=false).
+    await page.locator('[data-testid="attention-next"]').click();
+
+    // ws2 activated + ws2 pane focused.
+    await expect.poll(async () => H.activeWorkspace(page), { timeout: 5000 }).toBe(ws2);
+    await expect.poll(async () => H.focused(page), { timeout: 5000 }).toBe(ws2Pane);
+
+    // Keyboard focus-mode EXITED (the cross-pane rule).
+    await expect.poll(async () => (await H.kbdFocusState(page)).open, { timeout: 5000 }).toBe(false);
+    await expect.poll(async () => (await H.kbdFocusState(page)).ownedWs).toBeNull();
+    // ws2 (now active) is not left maximized.
+    await expect.poll(async () => H.isMaximized(page), { timeout: 5000 }).toBe(false);
+
+    // CRUX — no stale maximize pinned on ws1 after onWorkspaceActivated flushes.
+    // Switch back to ws1 (survival-safe CSS-visibility switch) and confirm ws1's
+    // group is no longer maximized.
+    await H.setActiveWorkspace(page, ws1);
+    await expect.poll(async () => H.activeWorkspace(page)).toBe(ws1);
+    await expect.poll(async () => H.isMaximized(page), { timeout: 5000 }).toBe(false);
+
+    // CRUX — iframe SURVIVED the cross-ws switch + keyboard exit (no reload).
+    await H.assertSurvived(page, ws2Pane!, before, "cross-ws + keyboard exit");
+  });
 });
