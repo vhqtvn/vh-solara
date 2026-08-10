@@ -76,6 +76,16 @@ type fakeOC struct {
 	// stick because a busy subagent clobbered it).
 	listSessionsReply []byte
 
+	// listArchivedReply is the body returned by GET /session?archived=true
+	// (ListArchivedSessions). Defaults to nil → falls back to listSessionsReply
+	// (backward-compat: tests written before the /session vs ?archived=true split
+	// continue to work). The RT4 partial-resume test (Slice 4) sets this to the
+	// archived-session list (with time.archived set) so resumeArchiveAffected can
+	// confirm the root is archived and derive live stragglers. Mirrors the real
+	// fixture's behavior (pkg/fixtures/opencode.go:929-937) which distinguishes
+	// the two endpoints server-side.
+	listArchivedReply []byte
+
 	// permHold, when non-nil, blocks POST /permission/:id/reply (the watcher's
 	// auto-reject RPC) until the channel is closed — letting a test hold the RPC
 	// genuinely in-flight so Server.Shutdown's watcher-ctx cancellation can be
@@ -104,12 +114,24 @@ func (f *fakeOC) handler() http.Handler {
 			w.Write([]byte(`{"id":"new_sess","title":"t"}`))
 			return
 		}
-		// GET /session (ListSessions / ListArchivedSessions — both hit this
-		// path; the archived=true query param is ignored by the handler, the
-		// caller filters server-side). Return the configured reply, defaulting
-		// to an empty list.
+		// GET /session (ListSessions) and GET /session?archived=true
+		// (ListArchivedSessions) both hit this handler. The real OpenCode
+		// fixture (pkg/fixtures/opencode.go:929-937) DISTINGUISHES them:
+		// /session returns live-only, ?archived=true returns archived-only.
+		// Mirror that split here: return listArchivedReply for the archived
+		// endpoint when set, falling back to listSessionsReply for backward-
+		// compat (tests written before the split expected the same reply for
+		// both). Default to "[]" when neither is set.
 		f.mu.Lock()
-		reply := f.listSessionsReply
+		var reply []byte
+		if r.URL.Query().Get("archived") == "true" {
+			reply = f.listArchivedReply
+			if reply == nil {
+				reply = f.listSessionsReply // backward-compat
+			}
+		} else {
+			reply = f.listSessionsReply
+		}
 		f.mu.Unlock()
 		if reply == nil {
 			reply = []byte("[]")

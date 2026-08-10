@@ -153,10 +153,15 @@ func (s *Server) handleArchive(w http.ResponseWriter, r *http.Request) {
 		// orphan whose parent was archived server-side — the orphan banner
 		// surfaces such sessions from the CLIENT store, but vh-solara's store
 		// may have already pruned it via a prior archive cascade or a demotion
-		// sweep), archive at least the requested id directly so OpenCode marks
-		// it archived and the client receives it in the affected list to prune.
+		// sweep), the live-store walk returns nothing. The RT4 resume path
+		// (resumeArchiveAffected) checks whether the root is confirmed archived
+		// in OpenCode and, if so, derives the remaining LIVE stragglers from
+		// OpenCode's authoritative session lists — so reissuing archive on a
+		// partially-archived root completes the remainder. Falls back to
+		// [body.SessionID] for the ghost / never-existed / fully-archived-no-
+		// stragglers cases (re-PATCH / 404-tolerate the root alone).
 		if len(affected) == 0 {
-			affected = []string{body.SessionID}
+			affected = s.resumeArchiveAffected(r.Context(), agg, body.SessionID)
 		}
 		// C5 — archive-preview drift fence. If the caller carried a preview
 		// fingerprint (the FE's SessionContextMenu threads the one returned by
@@ -619,6 +624,153 @@ func (s *Server) reassertArchiveWork(bgCtx context.Context, delay time.Duration,
 			log.Printf("[archive] re-assert SetArchived(%s): %v", id, err)
 		}
 	}
+}
+
+// resumeArchiveAffected derives the affected set for the RT4 resume path: when
+// handleArchive is invoked for a root that is ABSENT from the live store
+// (Store.Descendants returned nil — the root was archived by a prior cascade and
+// RemoveSessionIfPresent removed it, or it was pruned by hydrate/demotion), the
+// live-store subtree walk can't see its remaining descendants. This method
+// fetches OpenCode's authoritative session lists and, if the root is confirmed
+// archived, derives the set of LIVE (non-archived) sessions still in its subtree
+// — the stragglers a reissue must complete (the contract RT4: "re-issuing
+// archive on a partially-archived root completes the remainder").
+//
+// Returns [rootID] (the prior ghost-tolerant fallback) when:
+//   - either fetch fails (never inflate a partial view into a wrong affected
+//     set — the root alone is re-PATCH'd / 404-tolerated),
+//   - the root is NOT confirmed archived in OpenCode (genuinely absent / ghost /
+//     never-existed — the prior fallback), or
+//   - the root IS archived but has NO live stragglers (fully-archived idempotent
+//     no-op — re-PATCH the root, same as the prior fallback; the existing
+//     TestQueueGC_ReissueArchiveIsIdempotent covers this path).
+//
+// Fetch authority (build-validate 1): BOTH lists are required. The VERIFIED
+// OpenCode behavior (pkg/fixtures/opencode.go:929-937, confirmed by Slice 1's
+// hydration.go:132-135 comment "The /session list excludes archived entries") is
+// that /session returns LIVE-only and /session?archived=true returns ARCHIVED-
+// only. A live straggler's parent chain may pass through ARCHIVED intermediates
+// (a partial cascade that aborted at a deep child); the live list alone lacks
+// those intermediates' parentIDs to link the straggler to the root. The archived
+// list supplies the intermediate parentID links so the DFS reaches the live
+// leaves through any depth of archived ancestors.
+//
+// Lock discipline (build-validate 2): the OpenCode fetches happen OUTSIDE the
+// store lock (the aggregator Client is HTTP). The only store access in
+// handleArchive (Descendants) already completed under a brief RLock before this
+// is called; no store lock is held across the fetch. This is NOT the hot path —
+// normal archive uses the live-store Descendants walk; this fires only on the
+// reissue/ghost edge case (root absent from the live store).
+func (s *Server) resumeArchiveAffected(ctx context.Context, agg *aggregator.Aggregator, rootID string) []string {
+	live, errLive := agg.Client().ListSessions(ctx)
+	archived, errArch := agg.Client().ListArchivedSessions(ctx)
+	if errLive != nil || errArch != nil {
+		// Fetch failed — can't safely derive. Fall back to the prior ghost-
+		// tolerant behavior (re-PATCH / 404-tolerate the root alone).
+		return []string{rootID}
+	}
+	if !idHasArchivedTime(archived, rootID) {
+		// Root is not confirmed archived in OpenCode (ghost / never-existed / or
+		// live-but-absent-from-our-store). Fall back to [rootID]: the job will
+		// PATCH it (archives if genuinely live) or 404/410-tolerate (ghost).
+		return []string{rootID}
+	}
+	stragglers := liveDescendantsOfArchivedRoot(live, archived, rootID)
+	if len(stragglers) == 0 {
+		// Root is archived but no live stragglers remain — fully-archived no-op.
+		// Re-PATCH the root idempotently (same as the prior fallback).
+		return []string{rootID}
+	}
+	return stragglers
+}
+
+// idHasArchivedTime reports whether id is present in sessions with a non-zero
+// time.archived (genuinely archived). Mirrors sessionEnvelope.archivedAt() in
+// pkg/state/store.go. Used by resumeArchiveAffected to confirm a root is
+// archived in OpenCode's authoritative list before deriving live stragglers.
+func idHasArchivedTime(sessions []json.RawMessage, id string) bool {
+	for _, raw := range sessions {
+		var env struct {
+			ID   string `json:"id"`
+			Time struct {
+				Archived *float64 `json:"archived"`
+			} `json:"time"`
+		}
+		if json.Unmarshal(raw, &env) != nil || env.ID != id {
+			continue
+		}
+		return env.Time.Archived != nil && *env.Time.Archived != 0
+	}
+	return false
+}
+
+// liveDescendantsOfArchivedRoot returns the set of currently-LIVE (non-archived)
+// sessions in rootID's subtree, derived from OpenCode's authoritative session
+// lists. It is the RT4 resume derivation: when a root is already archived
+// (absent from the live store), this reconstructs its subtree from OpenCode and
+// collects the live stragglers a reissue must complete.
+//
+// BOTH the live and archived lists are required (see resumeArchiveAffected's
+// "Fetch authority" note): the live list holds the stragglers but lacks the
+// parentID links of archived intermediates; the archived list supplies those
+// links so the DFS reaches live leaves through any depth of archived ancestors.
+//
+// Only ids with time.archived == 0 (genuinely live) are collected — rootID
+// itself (archived) and any archived intermediates are TRAVERSED (so a deeper
+// live member stays reachable) but never collected. This preserves the e88f19e
+// false-positive gate: only confirmed-subtree LIVE descendants are returned,
+// never an unrelated live session. The DFS starts at rootID and follows
+// parent→child edges through the unified children map, so an unrelated root's
+// subtree is structurally unreachable (exact-parent confirmation).
+func liveDescendantsOfArchivedRoot(live, archived []json.RawMessage, rootID string) []string {
+	// Build a unified parent→children map and a live-id set from BOTH lists.
+	// Iterating both lets the DFS traverse archived intermediates (which appear
+	// only in `archived`) to reach live stragglers (which appear only in `live`).
+	children := map[string][]string{}
+	isLive := map[string]bool{}
+	for _, sessions := range [][]json.RawMessage{live, archived} {
+		for _, raw := range sessions {
+			var env struct {
+				ID       string `json:"id"`
+				ParentID string `json:"parentID"`
+				Time     struct {
+					Archived *float64 `json:"archived"`
+				} `json:"time"`
+			}
+			if json.Unmarshal(raw, &env) != nil || env.ID == "" {
+				continue
+			}
+			if env.ParentID != "" {
+				children[env.ParentID] = append(children[env.ParentID], env.ID)
+			}
+			// A genuinely live session (time.archived absent or zero). Track it
+			// so the walk collects it; archived members are traversed (linked)
+			// but skipped at collection. Mirrors sessionEnvelope.archivedAt().
+			if env.Time.Archived == nil || *env.Time.Archived == 0 {
+				isLive[env.ID] = true
+			}
+		}
+	}
+	// DFS from rootID through the unified children map. Collect only LIVE ids
+	// (the stragglers to archive). rootID itself is archived → never collected
+	// (the cur != rootID gate). seen guards against a revisit loop on malformed
+	// parent links (defensive; session trees are acyclic but never trust data).
+	out := []string{}
+	seen := map[string]bool{}
+	stack := []string{rootID}
+	for len(stack) > 0 {
+		cur := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if seen[cur] {
+			continue
+		}
+		seen[cur] = true
+		if cur != rootID && isLive[cur] {
+			out = append(out, cur)
+		}
+		stack = append(stack, children[cur]...)
+	}
+	return out
 }
 
 // archivedDescendants returns id plus every genuinely archived session

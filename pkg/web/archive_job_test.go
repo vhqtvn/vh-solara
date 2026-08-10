@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"sort"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -413,5 +414,222 @@ func TestArchiveJob_ConcurrentReissueNoDoubleCleanup(t *testing.T) {
 	}
 	if got := srv.queues.CleanupCallCount(); got > 2 {
 		t.Errorf("CleanupSession called %d times for r, want <= 2 (CAS should prevent double job-direct cleanup; without CAS would be >= 3)", got)
+	}
+}
+
+// RT4-partial-resume — THE CRUX of this slice (Slice 4): re-issuing /vh/archive
+// on a PARTIALLY-archived root (root itself already archived + absent from the
+// live store, but with remaining LIVE descendants) completes the remainder.
+// Before this slice, Descendants(root) returned nil (root pruned from live store)
+// → the fallback made affected=[root] → the job re-PATCHed the already-archived
+// root (a no-op) and the live stragglers were left behind (caught only by the
+// orphan banner from Slices 1/2, not by the operator's named recovery path).
+//
+// The fix (resumeArchiveAffected): when Descendants(root) is nil, fetch
+// OpenCode's authoritative lists, confirm the root is archived, derive the LIVE
+// subtree, and make those stragglers the job's affected set.
+//
+// Seed: root r archived in OpenCode AND removed from the live store (simulating
+// a prior partial cascade). Live child c (parentID=r) + live grandchild g
+// (parentID=c, proves depth through a live intermediate). Unrelated live root
+// "other" + its live child "otherC" (exact-subtree proof — the e88f19e spirit:
+// never touch an unrelated live session).
+func TestArchiveJob_ReissueOnPartiallyArchivedRootCompletesRemainder(t *testing.T) {
+	f := &fakeOC{}
+	web, agg, srv, root := queueLifecycleServer(t, f)
+	srv.SetReassertDelay(5 * time.Millisecond)
+
+	// Seed the live store: r (root), c (child of r), g (grandchild of r via c),
+	// and the unrelated other (root) + otherC (child of other).
+	agg.Store().Apply(ev("session.created", `{"info":{"id":"r"}}`))
+	agg.Store().Apply(ev("session.created", `{"info":{"id":"c","parentID":"r"}}`))
+	agg.Store().Apply(ev("session.created", `{"info":{"id":"g","parentID":"c"}}`))
+	agg.Store().Apply(ev("session.created", `{"info":{"id":"other"}}`))
+	agg.Store().Apply(ev("session.created", `{"info":{"id":"otherC","parentID":"other"}}`))
+
+	// Seed queues for the stragglers + the unrelated pair (NOT for r — its queue
+	// was cleaned by the prior archive that removed it).
+	seedQueueFile(t, root, "c")
+	seedQueueFile(t, root, "g")
+	seedQueueFile(t, root, "other")
+	seedQueueFile(t, root, "otherC")
+
+	// Simulate the prior partial cascade: r was archived (PATCHed in OpenCode)
+	// and removed from the live store (RemoveSessionIfPresent), but c and g were
+	// left LIVE (the cascade aborted before reaching them — the defect). This is
+	// the EXACT state the orphan banner from Slices 1/2 surfaces; this test
+	// proves the operator's named recovery path (re-issue /vh/archive {r}) now
+	// completes them instead of just re-PATCHing the already-archived root.
+	agg.Store().RemoveSessionIfPresent("r")
+
+	// Configure the fakeOC's authoritative lists to mirror the real OpenCode
+	// split (pkg/fixtures/opencode.go:929-937): /session returns LIVE-only,
+	// /session?archived=true returns ARCHIVED-only.
+	//
+	// LIVE list: c, g, other, otherC (all time.archived absent → live). r is NOT
+	// here (it's archived). The resume helper fetches this to find the stragglers.
+	f.listSessionsReply = []byte(`[
+		{"id":"c","parentID":"r"},
+		{"id":"g","parentID":"c"},
+		{"id":"other"},
+		{"id":"otherC","parentID":"other"}
+	]`)
+	// ARCHIVED list: r (time.archived set). The resume helper fetches this to
+	// confirm the root is archived AND to link archived intermediates (none here,
+	// but the helper traverses them if present — proven by g reaching through c).
+	f.listArchivedReply = []byte(`[{"id":"r","time":{"archived":1}}]`)
+
+	// THE ACTION: re-issue /vh/archive {r} on the partially-archived root.
+	resp, affected := postArchive(t, web.URL, "r")
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("/vh/archive reissue on partially-archived root: got %d, want 200", resp.StatusCode)
+	}
+
+	// The response's affected must be exactly {c, g} — the derived LIVE
+	// stragglers. NOT r (already archived, excluded from the live set). NOT
+	// other/otherC (unrelated subtree — the e88f19e exact-subtree gate).
+	sort.Strings(affected)
+	want := []string{"c", "g"}
+	sort.Strings(want)
+	if len(affected) != len(want) || affected[0] != want[0] || affected[len(affected)-1] != want[len(want)-1] {
+		t.Fatalf("reissue affected: got %v, want %v (live stragglers of archived r only)", affected, want)
+	}
+
+	srv.awaitArchiveJobs(t, 5*time.Second)
+
+	// CRUX — the stragglers were completed: PATCHed SetArchived in OpenCode,
+	// removed from the live store, queue-cleaned.
+	patches := archivedPATCHes(f)
+	for _, id := range []string{"c", "g"} {
+		if countID(patches, id) < 1 {
+			t.Errorf("straggler %s never PATCHed (resume did not complete it): patches=%v", id, patches)
+		}
+		if agg.Store().Descendants(id) != nil {
+			t.Errorf("straggler %s still in live store (not RemoveSessionIfPresent'd)", id)
+		}
+		if queueFileExists(root, id) {
+			t.Errorf("straggler %s queue.json still present (not cleaned)", id)
+		}
+	}
+
+	// EXACT-SUBTREE GATE (e88f19e spirit) — the unrelated live root + its child
+	// were NOT touched: never PATCHed, still in the live store, queues survive.
+	for _, id := range []string{"other", "otherC"} {
+		if countID(patches, id) != 0 {
+			t.Errorf("unrelated %s PATCHed (exact-subtree gate violated): patches=%v", id, patches)
+		}
+		if agg.Store().Descendants(id) == nil {
+			t.Errorf("unrelated %s removed from live store (must not be touched)", id)
+		}
+		if !queueFileExists(root, id) {
+			t.Errorf("unrelated %s queue.json removed (must survive — not in affected)", id)
+		}
+	}
+
+	// r (the already-archived root) was NOT re-PATCHed by the resume path — it
+	// is excluded from the derived live set (cur != rootID gate). The prior
+	// fallback would have re-PATCHed it; the resume path correctly skips it.
+	if countID(patches, "r") != 0 {
+		t.Errorf("already-archived root r re-PATCHed by resume path (should be excluded from live set): patches=%v", patches)
+	}
+}
+
+// RT4-archived-intermediate — closes the "both lists required" coverage gap
+// (commit-review F1, raised by 3 of 4 leaves): the load-bearing reason the
+// resume helper fetches BOTH ListSessions (live) AND ListArchivedSessions
+// (archived) is that a live straggler's parent chain may pass through an
+// ARCHIVED intermediate — and the live list alone lacks that intermediate's
+// parentID to link the straggler to the root. The prior test
+// (TestArchiveJob_ReissueOnPartiallyArchivedRootCompletesRemainder) reaches
+// grandchild g through a LIVE intermediate c; the live list alone suffices
+// there, so the archived-list-as-intermediate-linker mechanism is dormant.
+//
+// This test exercises the dormant path: root r (archived) → intermediate m
+// (ARCHIVED, parentID=r) → grandchild g (LIVE, parentID=m). g is reachable from
+// r ONLY because the archived list supplies the r→m edge and the live list
+// supplies the m→g edge. If the helper dropped the archived param, g would be
+// unreachable (m is absent from the live list → g looks like an unrelated root
+// in the live-only map) and the test would fail.
+func TestArchiveJob_ReissueReachesStragglerThroughArchivedIntermediate(t *testing.T) {
+	f := &fakeOC{}
+	web, agg, srv, root := queueLifecycleServer(t, f)
+	srv.SetReassertDelay(5 * time.Millisecond)
+
+	// Seed: r (root), m (intermediate child of r), g (grandchild of r via m),
+	// and an unrelated live root other (exact-subtree gate).
+	agg.Store().Apply(ev("session.created", `{"info":{"id":"r"}}`))
+	agg.Store().Apply(ev("session.created", `{"info":{"id":"m","parentID":"r"}}`))
+	agg.Store().Apply(ev("session.created", `{"info":{"id":"g","parentID":"m"}}`))
+	agg.Store().Apply(ev("session.created", `{"info":{"id":"other"}}`))
+
+	seedQueueFile(t, root, "g")
+	seedQueueFile(t, root, "other")
+
+	// Prior partial cascade: r AND m were archived + removed from the live
+	// store, but g (a grandchild) was left LIVE. m is an ARCHIVED intermediate.
+	agg.Store().RemoveSessionIfPresent("r")
+	agg.Store().RemoveSessionIfPresent("m")
+
+	// LIVE list: g (parentID=m) + other. r and m are NOT here (both archived).
+	// g's parentID points at m, which is NOT in the live list — so a live-only
+	// walk from r reaches nothing. The archived list below is what links r→m→g.
+	f.listSessionsReply = []byte(`[
+		{"id":"g","parentID":"m"},
+		{"id":"other"}
+	]`)
+	// ARCHIVED list: r (root, archived) + m (intermediate, archived, parentID=r).
+	// The m→r edge here is what lets the DFS walk r→m, and the m entry (via its
+	// presence in the unified map) is what links to g (from the live list). BOTH
+	// fetches are load-bearing: drop either and g becomes unreachable from r.
+	f.listArchivedReply = []byte(`[
+		{"id":"r","time":{"archived":1}},
+		{"id":"m","parentID":"r","time":{"archived":1}}
+	]`)
+
+	// Re-issue /vh/archive {r}.
+	resp, affected := postArchive(t, web.URL, "r")
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("/vh/archive reissue through archived intermediate: got %d, want 200", resp.StatusCode)
+	}
+
+	// affected must be exactly [g] — the live grandchild behind an archived
+	// intermediate. NOT r/m (already archived). NOT other (unrelated subtree).
+	sort.Strings(affected)
+	if len(affected) != 1 || affected[0] != "g" {
+		t.Fatalf("reissue affected through archived intermediate: got %v, want [g] (the live straggler reachable only via archived intermediate m)", affected)
+	}
+
+	srv.awaitArchiveJobs(t, 5*time.Second)
+
+	// CRUX — g was completed: PATCHed, removed from store, queue cleaned.
+	patches := archivedPATCHes(f)
+	if countID(patches, "g") < 1 {
+		t.Errorf("straggler g (behind archived intermediate m) never PATCHed: patches=%v", patches)
+	}
+	if agg.Store().Descendants("g") != nil {
+		t.Errorf("straggler g still in live store (not RemoveSessionIfPresent'd)")
+	}
+	if queueFileExists(root, "g") {
+		t.Errorf("straggler g queue.json still present (not cleaned)")
+	}
+
+	// EXACT-SUBTREE GATE — the unrelated live root was NOT touched.
+	if countID(patches, "other") != 0 {
+		t.Errorf("unrelated other PATCHed (exact-subtree gate violated): patches=%v", patches)
+	}
+	if agg.Store().Descendants("other") == nil {
+		t.Errorf("unrelated other removed from live store (must not be touched)")
+	}
+	if !queueFileExists(root, "other") {
+		t.Errorf("unrelated other queue.json removed (must survive)")
+	}
+
+	// r and m (already archived) were NOT re-PATCHed by the resume path.
+	for _, id := range []string{"r", "m"} {
+		if countID(patches, id) != 0 {
+			t.Errorf("already-archived %s re-PATCHed by resume path (should be excluded from live set): patches=%v", id, patches)
+		}
 	}
 }
