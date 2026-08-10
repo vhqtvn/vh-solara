@@ -64,6 +64,33 @@ export function epochChanged(prevEpoch: string, incomingEpoch: string): boolean 
   return !!prevEpoch && !!incomingEpoch && prevEpoch !== incomingEpoch;
 }
 
+// stampCompletionIfIdle — the cross-stream completion bridge's stamp-if-missing
+// core, DELIVERY-PATH-INDEPENDENT (fix B for the cross-stream completion race).
+// Stamps `time.completed` on `sessionID`'s last assistant message when that
+// session's activity is idle, so `settled` flips in the SAME reactive flush that
+// unmounts .working-text — regardless of whether the idle arrived as a discrete
+// `activity{state:idle}` event (Stream 1) or via a snapshot path (projectSnapshot
+// / projectScopedPartial). See the activity case comment for the cross-stream
+// race rationale. IDEMPOTENT: a no-op once any path has stamped `completed` (the
+// `!completed` guard), so discrete + snapshot paths never double-stamp or race.
+// Mirrors the original discrete bridge's "last assistant message, if missing
+// completed" semantics exactly. NOTE: this is the STAMP only — the Inv2
+// tail-incomplete-on-idle effect stays discrete-path-only (a snapshot is not a
+// loss signal). Exported so the scoped partial installer (reconcile.ts) can call
+// it from the snapshot-application path.
+export function stampCompletionIfIdle(s: SyncState, sessionID: string): void {
+  if (s.activity[sessionID] !== "idle") return;
+  const sm = s.messages[sessionID];
+  if (!sm || !sm.order.length) return;
+  const last = sm.byId[sm.order[sm.order.length - 1]];
+  if (last && last.info.role === "assistant" && !last.info.time?.completed) {
+    last.info = {
+      ...last.info,
+      time: { ...(last.info.time || {}), completed: Date.now() },
+    };
+  }
+}
+
 // projectSnapshot — project a wholesale snapshot into the draft. Reads the
 // resync-window signals from the draft (s.epoch / s.epochChanged — the
 // pre-mutation values) and rebuilds the authoritative slices. Records
@@ -95,6 +122,11 @@ export function projectSnapshot(s: SyncState, snap: Snapshot, effects: Reconcile
   s.sessions = {};
   for (const sess of snap.sessions || []) s.sessions[sess.id] = sess;
   s.activity = { ...(snap.activity || {}) };
+  // Cross-stream completion bridge (fix B, delivery-path-independent): stamp
+  // time.completed for any session now idle via this wholesale snapshot path,
+  // so `settled` flips regardless of whether the idle arrived discretely or via
+  // this snapshot. Idempotent (helper no-ops non-idle / already-stamped).
+  for (const sid of Object.keys(s.activity)) stampCompletionIfIdle(s, sid);
   // B2a: merge-protect labels only INSIDE the resync window (above) so a
   // mid-aggregation snapshot can ADD/UPDATE but never wipe. Outside the
   // window the server map is authoritative. mergeLastAgents semantics are
@@ -296,16 +328,12 @@ export function projectMessageEvent(
         // SAME produce() draft that clears activity, makes `settled` flip in the
         // SAME reactive flush that unmounts .working-text. Scoped to idle:
         // busy/retry are mid-turn (the last assistant is genuinely in-flight).
+        // The stamp core is shared (delivery-path-independent) with the snapshot
+        // paths via stampCompletionIfIdle — see its comment.
         if (payload.state === "idle") {
+          stampCompletionIfIdle(s, payload.sessionID);
           const sm = s.messages[payload.sessionID];
           if (sm && sm.order.length) {
-            const last = sm.byId[sm.order[sm.order.length - 1]];
-            if (last && last.info.role === "assistant" && !last.info.time?.completed) {
-              last.info = {
-                ...last.info,
-                time: { ...(last.info.time || {}), completed: Date.now() },
-              };
-            }
             // Invariant 2: tail-integrity check. If after the bridge stamp the
             // last message is STILL not a completed assistant message, the
             // terminal message.upsert that creates/ completes the assistant

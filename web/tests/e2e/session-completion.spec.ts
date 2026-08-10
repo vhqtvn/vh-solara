@@ -427,49 +427,27 @@ async function installCaptureWithStreamRace(page: Page, session: string) {
 }
 
 // ============================================================================
-// QUARANTINED (test.fixme) — REGRESSION from commit 4de7655 (#1 live-stall,
-// Invariant 1 tree-seq-gap detection). Failed twice (full run + isolated rerun
-// — NOT flaky). Asserts streamViewsMounted === 0 at the completion instant;
-// gets 1 (an assistant .md-stream view still mounted). Tracked in follow-up task
-// defer-inv1-treeseqgap-completion433-regression (deliberately tracked, NOT
-// silently red). Un-fixme when the fix lands.
+// UN-FIXME'd — fix B landed (delivery-path-independent completion bridge).
+// The bridge in web/src/sync/reducers.ts (stampCompletionIfIdle) now stamps
+// time.completed when activity transitions to idle via a SNAPSHOT path
+// (projectScopedPartial / projectSnapshot), not only via the discrete
+// activity{state:idle} event. In this cross-stream race the discrete idle was
+// dropped by the Inv1 tree-gap-reconnect gen guard (tree-transport.ts:1490), so
+// the idle landed via the seq-scoped partial snapshot — which previously had NO
+// bridge. Now it does, so `settled` flips regardless of which path delivered the
+// idle. Inv2 (tail-incomplete-on-idle) is untouched (discrete-path-only; its
+// unit tests in seqGapRecovery.test.ts use applyMessageEvent, unaffected).
 //
-// ROOT CAUSE (worktree bisect: 4de7655~1 = 693dfd7 PASSES → HEAD FAILS, on
-// chromium; confirmed via instrumented investigation):
-//  - Culprit is Invariant 1's TREE-SIDE seq-gap detection
-//    (web/src/sync/tree-transport.ts checkTreeSeqGap), NOT Invariant 2. In this
-//    cross-stream race a `status` event on Stream 1 has a global seq that jumped
-//    over the selected session's in-flight `message.*` events (Stream-2-only,
-//    deliberately lagged ~150ms via CROSS_STREAM_RACE_DELAY_MS).
-//  - The covering check `getSesCursor() >= seq - 1` FAILS (Stream 2 hasn't
-//    reconciled those messages yet) → false-positive "uncovered gap".
-//  - That triggers connect(true), which bumps treeGen.
-//  - The gen guard at tree-transport.ts:1490 (`if (gen !== treeGen) return`)
-//    then DROPS the discrete `activity{idle}` event.
-//  - The cross-stream completion bridge (web/src/sync/reducers.ts:299-308,
-//    stamps time.completed on the last assistant msg) NEVER runs → the
-//    session's completion is never stamped → the .md-stream view stays mounted
-//    at the completion instant.
-//  - This is exactly the "known false-positive / thrash class in multi-session"
-//    flagged in #1's autonomous decision. Inv2 (tail-incomplete-on-idle) NEVER
-//    fires (forceInv2:0) because the discrete idle is dropped before the reducer
-//    sees it — so a guard on Inv2 is the WRONG target.
-//
-// CANDIDATE FIXES (for the morning review; this quarantine is fully reversible):
-//  (A) Make checkTreeSeqGap's covering check robust to Stream-2 lag (hardest;
-//      must NOT weaken real-loss detection).
-//  (B) Generalize the completion bridge (reducers.ts:299-308) to also stamp
-//      time.completed when activity transitions to idle via a SNAPSHOT path
-//      (projectScopedPartial / projectSnapshot), not only via the discrete event
-//      (~10 lines; preserves Inv2).
-//  (C) Suppress the gen-guard drop so a gap-reconnect doesn't discard an
-//      in-flight `activity{idle}` (risk: changes gap-recovery ordering semantics).
+// STILL PENDING: Inv1-A — the covering-check root fix (checkTreeSeqGap /
+// getSesCursor robustness to Stream-2 lag). B closes the completion-correctness
+// gap + this test, but the spurious-tree-reconnect thrash risk (the false-
+// positive Inv1 gap that bumps treeGen in the race) remains until A lands.
 // ============================================================================
 // Deterministic regression guard for the cross-stream completion race. With the
 // session stream deliberately lagging the tree stream, the streaming view MUST
 // still have unmounted at the completion instant — the idle transition settles
 // the last assistant message regardless of which stream wins.
-test.fixme("CROSS-STREAM RACE: session stream lags tree stream (activity=idle) — settled still flips at completion instant", async ({ page }) => {
+test("CROSS-STREAM RACE: session stream lags tree stream (activity=idle) — settled still flips at completion instant", async ({ page }) => {
   await page.setViewportSize(VP);
   await installCaptureWithStreamRace(page, "other");
   await page.goto(projectUrl("/?session=other"));

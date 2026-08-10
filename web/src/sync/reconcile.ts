@@ -23,6 +23,7 @@ import {
   projectMessageEvent,
   projectSessionRemoval,
   epochChanged,
+  stampCompletionIfIdle,
 } from "./reducers";
 import { pushNotification } from "../notify";
 import { dropPinnedSession } from "../pins";
@@ -209,6 +210,17 @@ export function projectScopedPartial(s: SyncState, snap: Snapshot, effects: Reco
   if (auth.activity !== "omitted") {
     for (const [sid, val] of Object.entries(snap.activity || {})) {
       if (scopeSet.has(sid)) s.activity[sid] = val;
+    }
+    // Cross-stream completion bridge (fix B, delivery-path-independent): stamp
+    // time.completed for any in-scope session now idle via this scoped partial
+    // snapshot path, so `settled` flips regardless of which stream/path
+    // delivered the idle. This is the regression-site for the cross-stream
+    // completion race (a false-positive Inv1 tree-gap reconnect bumps treeGen,
+    // the gen guard drops the discrete activity{idle}, and the idle lands HERE
+    // via the seq-scoped partial instead). Idempotent (helper no-ops non-idle /
+    // already-stamped). Inv2 tail-incomplete-on-idle stays discrete-path-only.
+    for (const sid of Object.keys(snap.activity || {})) {
+      if (scopeSet.has(sid)) stampCompletionIfIdle(s, sid);
     }
   }
   if (auth.gate !== "omitted") {
