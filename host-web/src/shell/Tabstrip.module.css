@@ -54,6 +54,14 @@
   cursor: pointer;
   white-space: nowrap;
   flex: 0 0 auto;
+  /* Prevent text selection / long-press context menu during the rename
+   * long-press, and double-tap-to-zoom on rapid tab taps (touch-friendly). The
+   * -webkit-touch-callout suppression specifically stops iOS Safari's native
+   * callout from racing the ~500ms RENAME_PRESS_MS threshold. */
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+  touch-action: manipulation;
 }
 .tab:hover {
   border-color: var(--accent);
@@ -71,6 +79,95 @@
   background: var(--accent-soft);
   border-color: var(--accent);
   color: var(--fg);
+}
+/* Two-step delete confirm state. GPU-cheap: a slow opacity pulse ONLY (no
+ * mask-image / backdrop-filter — AGENTS.md Firefox/WebRender rules). Honored
+ * under prefers-reduced-motion. The destructive tint uses --warn (amber, the
+ * established "operator action needed" color) so it reads as cautionary. */
+.tabConfirming {
+  background: rgba(210, 153, 34, 0.18);
+  border-color: var(--warn);
+  color: var(--fg);
+  animation: ws-confirm-pulse 1.4s ease-in-out infinite;
+}
+@keyframes ws-confirm-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .tabConfirming { animation: none; }
+}
+.tabConfirmLabel {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--warn);
+  white-space: nowrap;
+  flex: 0 1 auto;
+}
+/* Inline rename input — replaces the label while editing. Sized to fit the tab
+ * height; inherits the tab's color so it reads as in-place editing. */
+.tabInput {
+  appearance: none;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  height: 20px;
+  padding: 0 4px;
+  width: 110px;
+  max-width: 40vw;
+  outline: none;
+  flex: 0 0 auto;
+}
+/* Per-tab delete/confirm affordances. The × is always rendered (touch has no
+ * hover); it's subtle by default and brightens on hover of the tab. */
+.tabDel,
+.tabDelConfirm,
+.tabDelCancel {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--fg-dim);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+.tab.tab:hover .tabDel {
+  color: var(--warn);
+}
+.tabDel:hover:not(:disabled) {
+  color: var(--warn);
+  background: rgba(210, 153, 34, 0.2);
+}
+.tabDel:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+}
+.tabDelConfirm {
+  color: var(--warn);
+  font-size: 12px;
+}
+.tabDelConfirm:hover {
+  background: var(--warn);
+  color: var(--bg);
+}
+.tabDelCancel {
+  color: var(--fg-dim);
+  font-size: 11px;
+}
+.tabDelCancel:hover {
+  color: var(--fg);
+  background: var(--bg-elev);
 }
 /* P1 workspace-aggregate needs-you count badge (SECONDARY). Distinct shape from
  * the per-pane attention badge (pill here vs rounded-rect there) and from the

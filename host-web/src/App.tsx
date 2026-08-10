@@ -78,9 +78,13 @@ export function App() {
       <main class={s.main}>
         {/* The overlay stack: one permanently-mounted host per workspace.
             SolidJS <For> preserves each host by referential identity of the
-            workspace object (the store never recreates workspace objects — it
-            only appends on addWorkspace and filters on closeWorkspace), so a
-            tab reorder or add/remove never recreates an existing host. */}
+            workspace object. The store (a SolidJS store array, not a plain
+            signal) NEVER recreates a Workspace object: addWorkspace appends,
+            closeWorkspace splices, and renameWorkspace mutates ONLY the name
+            field (setStore path-setter) — so a tab reorder, add, remove, or
+            rename never recreates an existing host. A rename that spread a new
+            object would remount the host → cold fromJSON → every iframe
+            reloads; the field-only mutation is what keeps rename survival-safe. */}
         <For each={workspaces()}>
           {(ws) => (
             <div

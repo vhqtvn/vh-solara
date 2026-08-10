@@ -68,6 +68,26 @@ export async function closeWorkspace(page: Page, id: string): Promise<boolean> {
   }, id);
 }
 
+// Rename a workspace (idempotent no-op on empty name). Survival-safe: the store
+// mutates only the name field, preserving the Workspace object's referential
+// identity (no iframe reload). Mirrors the production path the UI's inline edit
+// uses, so a round-trip test drives the exact rename code.
+export async function renameWorkspace(page: Page, id: string, name: string): Promise<void> {
+  await page.evaluate(({ id, name }) => {
+    const h = (window as unknown as { __host?: { renameWorkspace(i: string, n: string): void } }).__host;
+    h?.renameWorkspace(id, name);
+  }, { id, name });
+}
+
+// Read the live workspace name (for asserting a rename landed / round-tripped).
+export async function workspaceName(page: Page, id: string): Promise<string | null> {
+  const r = await page.evaluate((id) => {
+    const h = (window as unknown as { __host?: { workspaceName(i: string): string } }).__host;
+    return h ? h.workspaceName(id) : null;
+  }, id);
+  return r ?? null;
+}
+
 // Read-only {url,label,route} snapshot per panel — used by the layout-persistence
 // e2e to assert a restored layout round-trips with the correct urls/labels, and
 // by the route-survival e2e to assert a captured route persists across reload.
@@ -253,6 +273,17 @@ export async function needsYou(page: Page): Promise<number> {
     const h = (window as unknown as { __host?: { needsYou(): number } }).__host;
     return h ? h.needsYou() : 0;
   });
+}
+
+/** PER-WORKSPACE needs-you count (ALL workspaces, not just active). Drives the
+ *  per-tab badge. Counts a workspace's panes whose attention is needs_permission
+ *  or needs_reply. 0 for an unknown/empty workspace. */
+export async function needsYouFor(page: Page, wsId: string): Promise<number> {
+  const r = await page.evaluate((wsId) => {
+    const h = (window as unknown as { __host?: { needsYouFor(w: string): number } }).__host;
+    return h ? h.needsYouFor(wsId) : 0;
+  }, wsId);
+  return r ?? 0;
 }
 
 // ---- P3 NEXT hero button probes --------------------------------------------
@@ -710,6 +741,37 @@ export async function waitForSavedLayout(
   }
   throw new Error(
     `saved layout with ${expectedTotalPanelCount} total panels never appeared in localStorage within ${timeoutMs}ms`,
+  );
+}
+
+/** Wait until the v2 layout blob in localStorage carries `name` for workspace
+ *  `wsId`. The save is debounced; this polls the raw blob so a rename-round-trip
+ *  test can flush the NEW name before reloading (waitForSavedLayout keys on
+ *  panel COUNT, which a rename does not change, so it cannot detect a rename). */
+export async function waitForPersistedWorkspaceName(
+  page: Page,
+  wsId: string,
+  name: string,
+  timeoutMs = 8000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const match = await page.evaluate(({ key, wsId, name }) => {
+      const raw = localStorage.getItem(key);
+      if (!raw) return false;
+      try {
+        const parsed = JSON.parse(raw) as { workspaces?: Array<{ id: string; name: string }> };
+        const ws = parsed.workspaces?.find((w) => w.id === wsId);
+        return ws?.name === name;
+      } catch {
+        return false;
+      }
+    }, { key: LAYOUT_STORAGE_KEY, wsId, name });
+    if (match) return;
+    await page.waitForTimeout(80);
+  }
+  throw new Error(
+    `workspace ${wsId} name "${name}" never appeared in localStorage within ${timeoutMs}ms`,
   );
 }
 

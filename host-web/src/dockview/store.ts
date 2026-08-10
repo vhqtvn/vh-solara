@@ -1,4 +1,5 @@
 import { createSignal } from "solid-js";
+import { createStore, produce } from "solid-js/store";
 import type { DockviewApi } from "dockview-core";
 import type {
   Attention,
@@ -89,12 +90,29 @@ function initWorkspaces(): {
 }
 
 const initial = initWorkspaces();
-const [workspaces, setWorkspaces] = createSignal<Workspace[]>(initial.list);
+// WORKSPACE STORE (fine-grained): a SolidJS store array, NOT a plain signal.
+// This is load-bearing for renameWorkspace: the App.tsx overlay stack keys each
+// DockviewHost by the Workspace object's REFERENTIAL IDENTITY. A signal-based
+// rename that spreads a new object ({...w, name}) would change that identity →
+// <For> unmounts + remounts that host → cold fromJSON → EVERY iframe in that
+// workspace reloads (regresses the survival guarantee). The store lets rename
+// mutate ONLY the `name` field (setStore(path, "name", x)) while the Workspace
+// object reference is preserved → <For> keeps the row mounted → no reload.
+// addWorkspace/closeWorkspace mutate the array; surviving items keep identity.
+//
+// EXPOSURE: callers throughout the shell use signal-style accessors
+// (workspaces()). The store proxy is itself reactive, so wrapping it in a
+// thin accessor preserves every existing call site AND keeps fine-grained
+// field tracking (reading ws.name inside JSX tracks just that field).
+const [workspacesStore, setWorkspacesStore] = createStore<Workspace[]>(initial.list);
+function workspaces(): Workspace[] {
+  return workspacesStore;
+}
 const [activeWorkspaceId, setActiveWorkspaceIdSignal] = createSignal<string>(
   initial.activeId,
 );
 /** The workspace that should seed the fleet/mock fleet on cold init (the default
- *  workspace when there was no blob; null otherwise). Runtime-added workspaces
+ *  workspace when there was no saved blob; null otherwise). Runtime-added workspaces
  *  are never seed targets — they start empty (the empty-workspace affordance). */
 const seedWorkspaceId: string | null = hadSavedStateAtInit() ? null : initial.seedId;
 
@@ -162,7 +180,7 @@ export function addWorkspace(name?: string): string {
     id,
     name: name?.trim() || `Workspace ${workspaces().length + 1}`,
   };
-  setWorkspaces((list) => [...list, ws]);
+  setWorkspacesStore(produce((list) => { list.push(ws); }));
   setActiveWorkspaceIdSignal(id);
   scheduleSave();
   return id;
@@ -181,10 +199,15 @@ export function closeWorkspace(id: string): boolean {
   const list = workspaces();
   if (list.length <= 1) return false; // never zero workspaces
   if (!list.some((w) => w.id === id)) return false;
-  setWorkspaces((l) => l.filter((w) => w.id !== id));
+  setWorkspacesStore(
+    produce((arr) => {
+      const i = arr.findIndex((w) => w.id === id);
+      if (i >= 0) arr.splice(i, 1);
+    }),
+  );
   // If we closed the active workspace, activate a remaining one (its host's
   // onCleanup + the active-switch sync handle display teardown). The destroyed
-  // workspace's host unmounts via the <For> signal change → onCleanup disposes.
+  // workspace's host unmounts via the <For> store change → onCleanup disposes.
   if (activeWorkspaceId() === id) {
     const remaining = workspaces();
     if (remaining.length > 0) {
@@ -192,23 +215,30 @@ export function closeWorkspace(id: string): boolean {
       workspaceSyncCbs.get(remaining[0].id)?.();
     }
   }
+  // Recompute per-ws aggregates so a deleted ws's needs-you count drops
+  // immediately (its panes' status entries are cleared via onDidRemovePanel →
+  // unregisterPane → recomputeAggregates, but this covers the count-for-the-
+  // deleted-ws-id itself going absent from the byWs map).
+  recomputeAggregates();
   scheduleSave();
   return true;
 }
 
-/** Rename a workspace (idempotent no-op when the name is unchanged).
- *
- *  NOTE: not currently wired to any UI/bridge caller. If/when wired, it MUST
- *  preserve the Workspace object's referential identity (App.tsx's <For> overlay
- *  stack keys hosts by reference — a spread-new-object rename would unmount +
- *  remount that workspace's host → cold fromJSON → EVERY iframe in it reloads,
- *  regressing the load-bearing survival guarantee). Use a Solid store/produce or
- *  a separate reactive name signal keyed by id, NOT a spread. */
+/** Rename a workspace. SURVIVAL-SAFE: mutates ONLY the `name` field of the
+ *  existing Workspace object via the SolidJS store (setStore(path, "name", x)),
+ *  preserving the object's referential identity. This is load-bearing: App.tsx's
+ *  overlay stack keys each DockviewHost by reference, so a spread-new-object
+ *  rename would unmount + remount that host → cold fromJSON → EVERY iframe in it
+ *  reloads (regresses the survival guarantee). The store mutation keeps <For>
+ *  from re-mounting the row while still reactively updating the label text.
+ *  Idempotent no-op when the name is empty after trim. Persists via scheduleSave. */
 export function renameWorkspace(id: string, name: string): void {
   const trimmed = name.trim();
   if (!trimmed) return;
-  setWorkspaces((list) =>
-    list.map((w) => (w.id === id ? { ...w, name: trimmed } : w)),
+  setWorkspacesStore(
+    (w) => w.id === id,
+    "name",
+    trimmed,
   );
   scheduleSave();
 }
@@ -282,12 +312,30 @@ const [needsYouCount, setNeedsYouCount] = createSignal<number>(0);
 // statusbar attention-hub "M running" text (paired with needsYouCount). Same
 // recompute trigger + scope as needsYouCount.
 const [runningCount, setRunningCount] = createSignal<number>(0);
+// PER-WORKSPACE needs-you counts (ALL workspaces, not just active). A signal
+// holding a Record<wsId, count>; recomputed in recomputeAggregates on every
+// status store + active-ws pane-list change. Each workspace tab reads its own
+// count via needsYouCountFor(wsId); the count is only stored when > 0 (absent
+// ⇒ 0). Background-workspace needy sessions are the ones the operator can't
+// see on the active grid — surfacing them on EVERY tab is the whole point.
+// Mirrors rankNeedy()'s pane→ws mapping (workspaceApiFor(wsId).panels).
+const [needsYouByWs, setNeedsYouByWs] = createSignal<Record<string, number>>({});
 
 export { panes, focusedId, trayIds, isMaximized, connected, needsYouCount, runningCount };
 
+/** Needs-you count for a SPECIFIC workspace (its panes whose attention is
+ *  needs_permission or needs_reply). Reactive: tracks needsYouByWs(). Returns 0
+ *  for an unknown/empty workspace. Used by the per-tab badge so a background
+ *  workspace's needy sessions are visible on its tab. */
+export function needsYouCountFor(wsId: string): number {
+  return needsYouByWs()[wsId] ?? 0;
+}
+
 /** Recompute the active-workspace attention aggregates (needs-you + running)
- *  from the current pane view-model. Called after a status store and after
- *  setPanesVm. Cheap: a small linear scan over the active panes. */
+ *  AND the per-workspace needs-you counts (ALL workspaces) from the current
+ *  pane view-model + global status store. Called after a status store, after
+ *  setPanesVm, on unregisterPane, and on closeWorkspace. Cheap: a small linear
+ *  scan over the active panes + one pass over each workspace's live panels. */
 function recomputeAggregates(): void {
   let need = 0;
   let run = 0;
@@ -299,6 +347,23 @@ function recomputeAggregates(): void {
   }
   setNeedsYouCount(need);
   setRunningCount(run);
+  // Per-workspace needs-you counts (ALL workspaces, not just active). Maps each
+  // pane to its owning workspace via the live Dockview apis (same pattern as
+  // rankNeedy). Only stores entries for workspaces with count > 0; absent ⇒ 0.
+  const byWs: Record<string, number> = {};
+  for (const ws of workspaces()) {
+    const api = workspaceApis.get(ws.id);
+    if (!api) continue;
+    let wn = 0;
+    for (const panel of api.panels) {
+      const st = statusByPane.get(panel.id);
+      if (st && (st.attention === "needs_permission" || st.attention === "needs_reply")) {
+        wn++;
+      }
+    }
+    if (wn > 0) byWs[ws.id] = wn;
+  }
+  setNeedsYouByWs(byWs);
 }
 
 /** Clear the display projection (used by a host on unmount / dispose so a

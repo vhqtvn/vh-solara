@@ -28,7 +28,9 @@ import {
   livenessFor,
   lookupContentWindow,
   needsYouCount,
+  needsYouCountFor,
   noteIframeLoad,
+  renameWorkspace as storeRenameWorkspace,
   resetBaseline,
   routeMessage,
   scratchSource,
@@ -45,6 +47,7 @@ import {
   unregisterWorkspaceApi,
   unregisterWorkspaceOps,
   unregisterWorkspaceSync,
+  workspaces as storeWorkspaces,
 } from "./store";
 
 type Direction = "left" | "right" | "above" | "below";
@@ -476,9 +479,23 @@ export class HostController implements HostOps {
   /** Dispose this controller: unregister from the store + the controller map so
    *  a closed workspace's host fully tears down. Called by DockviewHost
    *  onCleanup (closing a workspace disposes its host — that DOES reload its
-   *  iframes, which is acceptable since the workspace is being destroyed). */
+   *  iframes, which is acceptable since the workspace is being destroyed).
+   *
+   *  PANE CLEANUP: explicitly unregister every pane this controller owns BEFORE
+   *  the api disposes. Dockview's api.dispose() does not reliably fire
+   *  onDidRemovePanel for each panel, so without this the destroyed workspace's
+   *  panes would leak in the GLOBAL maps (survivalMap, statusByPane,
+   *  titleByPane, firstNeedsYouAt, etc.) as orphaned entries. (They cannot
+   *  inflate a LIVE workspace's needs-you count — recomputeAggregates scopes its
+   *  scan by workspaceApis, and the destroyed ws is already gone from there —
+   *  but the stale global entries would linger and the survival store would
+   *  report identities for panes that no longer exist.) unregisterPane is
+   *  idempotent (safe for panes a prior removePanel already cleared). */
   dispose(): void {
     controllers.delete(this.workspaceId);
+    for (const id of this.renderers.keys()) {
+      unregisterPane(id);
+    }
     unregisterWorkspaceApi(this.workspaceId);
     unregisterWorkspaceOps(this.workspaceId);
     unregisterWorkspaceSync(this.workspaceId);
@@ -515,7 +532,7 @@ export class HostController implements HostOps {
     if (bridgeInstalled) return;
     bridgeInstalled = true;
     const bridge = {
-      // ---- multi-workspace model (workspace switch/add/close) ----
+      // ---- multi-workspace model (workspace switch/add/close/rename) ----
       workspaces: (): string[] =>
         Array.from(controllers.keys()),
       activeWorkspace: (): string | null => activeWorkspaceId(),
@@ -524,6 +541,11 @@ export class HostController implements HostOps {
       },
       addWorkspace: (name?: string): string => storeAddWorkspace(name),
       closeWorkspace: (id: string): boolean => storeCloseWorkspace(id),
+      renameWorkspace: (id: string, name: string): void => storeRenameWorkspace(id, name),
+      // The workspace name as currently stored (for asserting a rename landed +
+      // round-tripped through persistence). Reads the live store.
+      workspaceName: (id: string): string =>
+        storeWorkspaces().find((w) => w.id === id)?.name ?? "",
 
       // ---- active-workspace-scoped reads/ops ----
       panes: (): string[] => activeController()?.api.panels.map((p) => p.id) ?? [],
@@ -559,6 +581,9 @@ export class HostController implements HostOps {
       connected: () => connected(),
       // P1: active-workspace needs-you aggregate (drives the workspace badge).
       needsYou: () => needsYouCount(),
+      // PER-WORKSPACE needs-you count (ALL workspaces, not just active). Drives
+      // the per-tab badge so a background ws's needy sessions are surfaced.
+      needsYouFor: (wsId: string): number => needsYouCountFor(wsId),
       // P3 NEXT hero button: inspect the ranking without acting + trigger the
       // action + read the host-latched firstNeedsYouAt tiebreak. These route
       // through attentionNext.ts (production logic) so the e2e drives the SAME
