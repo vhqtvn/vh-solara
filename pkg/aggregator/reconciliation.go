@@ -133,5 +133,21 @@ func (a *Aggregator) runTreeReconcile(ctx context.Context) {
 				log.Printf("[aggregator] re-assert archive failed for %s: %v", id, err)
 			}
 		}
+		// Refresh the authoritative archived-ID snapshot + run the Defect-3
+		// orphan backstop sweep. The /session list fetched above (sessions)
+		// excludes archived entries, so the snapshot is derived from the
+		// archived-session fetch (ListArchivedSessions / /session?archived=true).
+		// Best-effort: a fetch error leaves the snapshot stale until the next
+		// tick. Fetch is outside the store lock; RefreshArchivedSnapshot takes
+		// the lock only for the in-memory rebuild + sweep.
+		archived, err := a.client.ListArchivedSessions(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			log.Printf("[aggregator] archived snapshot fetch failed at reconcile: %v", err)
+		} else {
+			a.store.RefreshArchivedSnapshot(archived)
+		}
 	}
 }

@@ -129,6 +129,23 @@ func (a *Aggregator) hydrate(ctx context.Context) error {
 		a.store.SetPendingPermissions(ps)
 		return nil
 	})
+	// Refresh the authoritative archived-ID snapshot + run the Defect-3 orphan
+	// backstop sweep. The /session list fetched above (sessions) excludes
+	// archived entries, so the snapshot must be derived from the
+	// archived-session fetch (ListArchivedSessions / /session?archived=true).
+	// Runs AFTER a.store.Hydrate (which reconciled the live tree above) so the
+	// sweep walks the post-hydrate session set. Concurrent with the three
+	// enrichment GETs above (each takes s.mu independently); a failure leaves
+	// the snapshot stale until the next 5s tree-reconcile tick
+	// (runTreeReconcile refreshes it). Fetch is outside the store lock.
+	run("ArchivedSnapshot", func() error {
+		archived, err := a.client.ListArchivedSessions(ctx)
+		if err != nil {
+			return err
+		}
+		a.store.RefreshArchivedSnapshot(archived)
+		return nil
+	})
 	wg.Wait()
 
 	// Successful hydrate complete: the store now holds the authoritative active-

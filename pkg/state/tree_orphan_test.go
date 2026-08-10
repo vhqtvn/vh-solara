@@ -287,3 +287,181 @@ func TestOrphan_UnknownNodeSkipped(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Archive-defect-chain Slice 1 — authoritative archived-ID snapshot + Defect-3
+// backstop sweep (RT2 Go portion: flag survives rehydrate + daemon restart;
+// RT3 Go portion: live/unresolvable chain root never flagged).
+//
+// The live store cannot be the orphan authority: RemoveSessions drops the
+// archived parent, so a straggler child's parentID points at a session absent
+// from the live store. The tombstone (recentlyArchived) is in-memory, 30s TTL,
+// and lost on restart — so the ONLY cross-restart authority is OpenCode's
+// archived-session list, captured in Store.archivedSnapshot and rebuilt by
+// RefreshArchivedSnapshot (hydrate + each 5s reconcile). These tests pin that
+// the snapshot-backed sweep flags stragglers across rehydrate AND a fresh-store
+// restart (RT2 crux), and never flags a live/unresolvable root (RT3, the e88f19e
+// false-positive gate).
+// ---------------------------------------------------------------------------
+
+// archivedSessionInfo builds a session JSON carrying time.archived (the shape
+// ListArchivedSessions returns), so a test can feed RefreshArchivedSnapshot the
+// authoritative archived-set payload without a real HTTP fetch.
+func archivedSessionInfo(id string) json.RawMessage {
+	return sessInfo(id, "", 1700000000)
+}
+
+// TestTreeOrphan_RT2_RehydrateKeepsFlag pins RT2(a): after a parent is archived
+// (leaves the live store + arms the tombstone) and the store is rehydrated, the
+// live child still carries flags.orphan because the snapshot — rebuilt from
+// OpenCode's archived list — is the authority, not the in-memory tombstone.
+func TestTreeOrphan_RT2_RehydrateKeepsFlag(t *testing.T) {
+	s := New(64)
+	applySeq(t, s,
+		[2]string{"session.created", evSessionCreated("P", "")},
+		[2]string{"session.created", evSessionCreated("C", "P")},
+	)
+	// Archive P: RemoveSessions drops P from the live store + arms the tombstone.
+	s.RemoveSessions([]string{"P"})
+
+	// Simulate rehydrate: OpenCode's /session lists C (live) but NOT P (archived
+	// — it is excluded from the default list). Hydrate reconciles: C re-inserted
+	// (parentID still P), P absent (already deleted by RemoveSessions).
+	s.Hydrate([]json.RawMessage{sessInfo("C", "P", 0)}, nil)
+
+	// Build the authoritative archived snapshot from OpenCode's archived list,
+	// then sweep. P is archived → snapshot{P:true} → C flagged.
+	s.RefreshArchivedSnapshot([]json.RawMessage{archivedSessionInfo("P")})
+
+	if !s.IsOrphanFlagged("C") {
+		t.Errorf("RT2(a): C should carry flags.orphan after rehydrate (snapshot authority)")
+	}
+}
+
+// TestTreeOrphan_RT2_RestartKeepsFlag is the CRUX of RT2(b): a FRESH store
+// (tombstones empty — simulating a daemon restart) hydrates from OpenCode and
+// the child STILL carries flags.orphan, because the authoritative snapshot — not
+// the lost tombstone — is the authority. Without the snapshot this case fails:
+// the fresh store has no way to know P was archived, so C would classify as a
+// plain root and never be flagged (the Defect-2 false-negative).
+func TestTreeOrphan_RT2_RestartKeepsFlag(t *testing.T) {
+	// Fresh store: tombstones empty (daemon restart simulation).
+	s := New(64)
+
+	// Hydrate from OpenCode: /session lists C (live); P is archived and thus
+	// excluded from the default list. C's parentID points at the absent P.
+	s.Hydrate([]json.RawMessage{sessInfo("C", "P", 0)}, nil)
+
+	// Confirm the tombstone is empty (restart precondition): without the
+	// snapshot, nothing here knows P was archived.
+	if s.IsRecentlyArchived("P") {
+		t.Fatalf("precondition: fresh store must have empty tombstone for P")
+	}
+
+	// Build the snapshot from the archived list (the cross-restart authority).
+	s.RefreshArchivedSnapshot([]json.RawMessage{archivedSessionInfo("P")})
+
+	// CRUX: tombstones empty, but the snapshot is authoritative → C flagged.
+	if !s.IsOrphanFlagged("C") {
+		t.Errorf("RT2(b) crux: C should carry flags.orphan after daemon restart (snapshot, not tombstone, is authority)")
+	}
+}
+
+// TestTreeOrphan_RT2_DeepChain walks a multi-hop chain: grandchild G → child C →
+// archived parent P. The sweep must walk through the LIVE intermediate (C) and
+// flag G because the chain terminates at the archived P.
+func TestTreeOrphan_RT2_DeepChain(t *testing.T) {
+	s := New(64)
+	// P archived (absent from /session); C and G are live, C's parent is P,
+	// G's parent is C. Only C and G appear in /session.
+	s.Hydrate([]json.RawMessage{
+		sessInfo("C", "P", 0),
+		sessInfo("G", "C", 0),
+	}, nil)
+	s.RefreshArchivedSnapshot([]json.RawMessage{archivedSessionInfo("P")})
+
+	if !s.IsOrphanFlagged("C") {
+		t.Errorf("deep chain: C (direct child of archived P) should be flagged")
+	}
+	if !s.IsOrphanFlagged("G") {
+		t.Errorf("deep chain: G (grandchild via live C) should be flagged — chain terminates at archived P")
+	}
+}
+
+// TestTreeOrphan_RT3_LiveRootNeverFlagged pins RT3: a live session whose
+// parent-chain root is LIVE (in the store, not archived) is NEVER flagged orphan,
+// even when the archived snapshot contains unrelated ids. This is the e88f19e
+// false-positive gate, preserved.
+func TestTreeOrphan_RT3_LiveRootNeverFlagged(t *testing.T) {
+	s := New(64)
+	// R (live root) → C (live child). Snapshot contains an unrelated archived X.
+	s.Hydrate([]json.RawMessage{
+		sessInfo("R", "", 0),
+		sessInfo("C", "R", 0),
+	}, nil)
+	s.RefreshArchivedSnapshot([]json.RawMessage{archivedSessionInfo("X")})
+
+	if s.IsOrphanFlagged("R") {
+		t.Errorf("RT3: live root R should NOT be flagged orphan")
+	}
+	if s.IsOrphanFlagged("C") {
+		t.Errorf("RT3: child C of live root R should NOT be flagged orphan")
+	}
+}
+
+// TestTreeOrphan_RT3_UnresolvableParentNeverFlagged pins RT3: a live session
+// whose parent NEVER existed (absent from the live store AND absent from the
+// archived snapshot) is NEVER flagged orphan. The snapshot is the discriminator:
+// without a confirmed-archived parent, the chain is "unresolvable", not orphan.
+func TestTreeOrphan_RT3_UnresolvableParentNeverFlagged(t *testing.T) {
+	s := New(64)
+	// C's parent P never existed. Snapshot contains an unrelated archived X
+	// (proving the gate keys on the ACTUAL terminating parent, not any archived id).
+	s.Hydrate([]json.RawMessage{sessInfo("C", "P", 0)}, nil)
+	s.RefreshArchivedSnapshot([]json.RawMessage{archivedSessionInfo("X")})
+
+	if s.IsOrphanFlagged("C") {
+		t.Errorf("RT3: child C whose parent P is unresolvable (not in snapshot) should NOT be flagged orphan")
+	}
+}
+
+// TestTreeOrphan_SweepClearsStaleFlag pins the idempotent re-evaluation: after a
+// parent leaves the archived snapshot (a legitimate un-archive), the child's
+// stale orphan flag must be cleared by the next sweep.
+func TestTreeOrphan_SweepClearsStaleFlag(t *testing.T) {
+	s := New(64)
+	s.Hydrate([]json.RawMessage{sessInfo("C", "P", 0)}, nil)
+	// P archived → C flagged.
+	s.RefreshArchivedSnapshot([]json.RawMessage{archivedSessionInfo("P")})
+	if !s.IsOrphanFlagged("C") {
+		t.Fatalf("setup: C should be flagged after P archived")
+	}
+	// P un-archived (legit unarchive) → leaves the snapshot. Empty archived set.
+	s.RefreshArchivedSnapshot(nil)
+	if s.IsOrphanFlagged("C") {
+		t.Errorf("sweep: C flag should clear after parent leaves the snapshot (unarchive)")
+	}
+}
+
+// TestTreeOrphan_IsArchivedAuthoritativeAccessor pins the read accessor Slice 2
+// consumes: it reports snapshot membership under the store lock, distinct from
+// the in-memory tombstone.
+func TestTreeOrphan_IsArchivedAuthoritativeAccessor(t *testing.T) {
+	s := New(64)
+	s.Hydrate(nil, nil)
+	// Empty snapshot before any refresh.
+	s.mu.RLock()
+	if s.isArchivedAuthoritativeLocked("P") {
+		t.Errorf("accessor: empty snapshot should report P not archived")
+	}
+	s.mu.RUnlock()
+	s.RefreshArchivedSnapshot([]json.RawMessage{archivedSessionInfo("P")})
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if !s.isArchivedAuthoritativeLocked("P") {
+		t.Errorf("accessor: snapshot should report P archived after refresh")
+	}
+	if s.isArchivedAuthoritativeLocked("Q") {
+		t.Errorf("accessor: snapshot should report Q not archived")
+	}
+}

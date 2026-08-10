@@ -421,6 +421,19 @@ type sessionEntry struct {
 	// replaces the entry (mirrors lastAgent) so a metadata refresh can't wipe a
 	// live-set verb.
 	currentVerb VerbFacet
+	// orphan is the Defect-3 backstop flag, set by sweepOrphansLocked when the
+	// session's parentID chain terminates at a parent that is ABSENT from the
+	// live store but PRESENT in the authoritative archived snapshot
+	// (Store.archivedSnapshot). It is the durable, cross-restart signal that a
+	// straggler's ancestor was archived — distinct from isOrphanLocked (the
+	// emit-time computation in tree_emitter.go, which Slice 2 widens to consult
+	// the same snapshot). A chain that terminates at a LIVE root or an
+	// UNRESOLVABLE parent is NEVER flagged (e88f19e false-positive gate). The
+	// sweep is idempotent and re-evaluates every live session each run, so a
+	// parent that un-archives (leaves the snapshot) clears the child's flag on
+	// the next sweep. Defaults to false (zero value) on entry creation; the
+	// sweep is the sole writer.
+	orphan bool
 }
 
 type messageEntry struct {
@@ -900,6 +913,19 @@ type Store struct {
 	// genuinely active session (the authoritative reconcile — e.g. unarchive).
 	// See recentArchiveTTL.
 	recentlyArchived map[string]time.Time
+	// archivedSnapshot is the AUTHORITATIVE cross-restart set of session IDs
+	// whose time.archived != 0 — rebuilt by RefreshArchivedSnapshot from
+	// OpenCode's archived-session list (e.g. ListArchivedSessions /
+	// /session?archived=true) on every hydrate + 5s reconcile, then consumed by
+	// sweepOrphansLocked (the Defect-3 backstop) and — via
+	// isArchivedAuthoritativeLocked — by Slice 2's isOrphanLocked at emit time.
+	// It is the ONLY authority that survives a daemon restart: the tombstones
+	// (recentlyArchived, above) are in-memory, 30s TTL, and lost on restart, so
+	// without this snapshot a fresh store cannot tell an archived parent from an
+	// unresolvable one and would classify the straggler as a plain root (the
+	// Defect-2 false-negative). Guarded by s.mu; read-only under the lock by the
+	// sweep + the emit-time accessor (no concurrent writers).
+	archivedSnapshot map[string]bool
 
 	ring *ringBuffer
 	subs map[int]*subscriber
@@ -1089,6 +1115,7 @@ func NewWithConfig(cfg Config) (*Store, error) {
 		confirmedEmptyNewest:   map[string]string{},
 		seeded:                 map[string]bool{},
 		recentlyArchived:       map[string]time.Time{},
+		archivedSnapshot:       map[string]bool{},
 		ring:                   newRingBuffer(cfg.RingCapacity),
 		subs:                   map[int]*subscriber{},
 		// Finding 4: SourceOpencodeLive is the iota zero value. Without an
@@ -1321,6 +1348,146 @@ func (s *Store) IsRecentlyArchived(id string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.isRecentlyArchivedLocked(id)
+}
+
+// --- authoritative archived-ID snapshot + Defect-3 backstop sweep ---
+//
+// The live store CANNOT be the orphan authority: RemoveSessions drops an
+// archived parent from s.sessions, so a child whose parentID points at it
+// classifies as a plain root (effectiveParentOfLocked returns "" for an absent
+// parent) — the Defect-2 false-negative. The tombstone (recentlyArchived,
+// 30s TTL) is a resurrection-guard, not an orphan authority: it is in-memory
+// and lost on daemon restart, so a fresh store cannot reconstruct it. The ONLY
+// cross-restart authority is OpenCode's archived-session list, captured here as
+// archivedSnapshot and rebuilt on every hydrate + 5s reconcile by
+// RefreshArchivedSnapshot. sweepOrphansLocked then flags live sessions whose
+// parentID chain terminates at a confirmed-archived parent — the Defect-3
+// backstop that makes the recurrence (a straggler left behind after a partial
+// archive cascade) detectable and, once Slice 2 widens isOrphanLocked,
+// visible to the operator.
+
+// RefreshArchivedSnapshot rebuilds the authoritative archived-ID snapshot from
+// rawArchived (the result of OpenCode's archived-session fetch, e.g.
+// ListArchivedSessions / /session?archived=true) and then runs the orphan
+// backstop sweep, flagging live sessions whose parentID chain terminates at a
+// confirmed-archived parent.
+//
+// The HTTP fetch MUST happen OUTSIDE the store lock (the aggregator owns it);
+// this method takes s.mu only for the in-memory snapshot rebuild + sweep, so no
+// store lock is ever held across network I/O. Invoked by the aggregator at
+// hydrate (after Hydrate reconciles the live tree) and on each 5s tree-reconcile
+// tick (after ReconcileSessions). Idempotent: rebuilding the snapshot from the
+// same input yields the same set, and the sweep re-evaluates every live session
+// each run (clearing stale flags when a parent leaves the snapshot, e.g. after a
+// legitimate un-archive).
+func (s *Store) RefreshArchivedSnapshot(rawArchived []json.RawMessage) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rebuildArchivedSnapshotLocked(rawArchived)
+	s.sweepOrphansLocked()
+}
+
+// rebuildArchivedSnapshotLocked rebuilds s.archivedSnapshot from rawArchived. An
+// id is archived iff its session info carries time.archived != 0 — the SAME
+// filter archivedDescendants (pkg/web/archive.go:356-408) applies, reused here so
+// the snapshot and the unarchive walk agree on what "archived" means. The map is
+// rebuilt wholesale (not merged) so ids that left the archived set (a legitimate
+// un-archive) are dropped on the next refresh. Caller holds s.mu.
+func (s *Store) rebuildArchivedSnapshotLocked(rawArchived []json.RawMessage) {
+	next := make(map[string]bool, len(rawArchived))
+	for _, raw := range rawArchived {
+		var env sessionEnvelope
+		if json.Unmarshal(raw, &env) != nil || env.ID == "" {
+			continue
+		}
+		// Defensive filter: archivedDescendants keeps only genuinely archived
+		// members (time.archived set to a non-zero value) so non-archived
+		// entries that leak into the list (OpenCode 1.17.x ?archived=true is
+		// documented as ignored by some versions) are never admitted.
+		if env.archivedAt() {
+			next[env.ID] = true
+		}
+	}
+	s.archivedSnapshot = next
+}
+
+// sweepOrphansLocked is the Defect-3 backstop: it flags every live session whose
+// parentID chain terminates at a parent that is ABSENT from the live store but
+// PRESENT in the authoritative archived snapshot. A chain that terminates at a
+// LIVE root (parentID == "") or an UNRESOLVABLE parent (absent from both the
+// live store and the archived snapshot) is NEVER flagged — the e88f19e
+// false-positive gate, non-negotiable. Idempotent: re-evaluates every live
+// session each run, setting OR clearing sessionEntry.orphan so the flag tracks
+// the current snapshot. Caller holds s.mu.
+func (s *Store) sweepOrphansLocked() {
+	for id, se := range s.sessions {
+		se.orphan = s.chainTerminatesAtArchivedLocked(id)
+	}
+}
+
+// chainTerminatesAtArchivedLocked reports whether id's parentID chain, walked up
+// through live ancestors, terminates at a parent that is absent from the live
+// store AND present in the authoritative archived snapshot. Returns false for a
+// live root (parentID == "") and for a chain ending at an unresolvable parent
+// (absent from both) — the e88f19e false-positive gate. Bounded against cyclic
+// parent links (defensive; malformed data). Caller holds s.mu.
+func (s *Store) chainTerminatesAtArchivedLocked(id string) bool {
+	cur := id
+	seen := map[string]bool{id: true}
+	for i := 0; i < 100000; i++ {
+		se := s.sessions[cur]
+		if se == nil {
+			// Defensive: iterating live sessions, cur should always exist. A
+			// concurrent mutation is impossible (caller holds s.mu).
+			return false
+		}
+		pid := se.parentID
+		if pid == "" {
+			// cur is a live root; the chain terminates at a live node.
+			return false
+		}
+		if s.sessions[pid] == nil {
+			// Parent absent from the live store → the chain TERMINATES at pid.
+			// Flag iff pid is confirmed-archived (in the snapshot). An
+			// unresolvable pid (never existed, not in snapshot) is NOT flagged.
+			return s.archivedSnapshot[pid]
+		}
+		// Parent is live → walk up. Cycle guard against malformed parent links.
+		if seen[pid] {
+			return false
+		}
+		seen[pid] = true
+		cur = pid
+	}
+	return false
+}
+
+// isArchivedAuthoritativeLocked reports whether id is in the authoritative
+// archived-ID snapshot (archivedSnapshot) — the cross-restart authority for
+// "this session was archived". Distinct from the in-memory tombstone
+// (isRecentlyArchivedLocked): the tombstone is a 30s resurrection-guard lost on
+// daemon restart, whereas the snapshot is rebuilt from OpenCode's
+// archived-session list on every hydrate + 5s reconcile and so survives restart.
+// Slice 2's isOrphanLocked consults this to classify a straggler whose archived
+// parent is gone from the live store, without duplicating the fetch. Caller
+// holds s.mu.
+func (s *Store) isArchivedAuthoritativeLocked(id string) bool {
+	return s.archivedSnapshot[id]
+}
+
+// IsOrphanFlagged reports whether the Defect-3 backstop sweep has flagged id as
+// an orphan (its parentID chain terminates at a confirmed-archived parent). It
+// is the public, lock-acquiring read used by tests and diagnostics; the emitted
+// node flag is derived separately by isOrphanLocked at emit time (Slice 2 widens
+// that computation to consult the same snapshot, at which point the swept flag
+// and the emitted flag converge). Returns false for an unknown id.
+func (s *Store) IsOrphanFlagged(id string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if se := s.sessions[id]; se != nil {
+		return se.orphan
+	}
+	return false
 }
 
 // PendingPermissions returns a copy of the pending-permission set under a READ
