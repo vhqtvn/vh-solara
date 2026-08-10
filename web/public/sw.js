@@ -9,12 +9,25 @@
 // latest shell (and thus the latest hashed assets), falling back to cache only
 // when offline. Hashed assets are immutable → cache-first. The live API
 // (/vh/, /oc/) is never intercepted.
+//
+// Host-route exclusion (post-fold): `/` is the multi-server HOST shell (online-
+// only — it embeds live cross-origin servers in iframes) and `/host/*` are its
+// assets. This SW caches only the SINGLE-SERVER shell (at /app + /index.html),
+// so it must NEVER intercept `/` or `/host/*` — doing so would cache the host
+// shell under the shared /index.html key and pollute the single-server offline
+// fallback with the wrong app. Host routes pass straight to the network. This
+// mirrors Go's isHostRoute (pkg/web/server.go). BUILD_ID is unique per build, so
+// shipping this reaps every prior cache (incl. any stale `/` from a pre-fold
+// install) on activate.
 
 const BUILD_ID = "__BUILD_ID__";
 const CACHE = "vh-" + BUILD_ID;
 
 self.addEventListener("install", (e) => {
-  e.waitUntil(caches.open(CACHE).then((c) => c.addAll(["/", "/index.html"]).catch(() => {})));
+  // Precache only the SINGLE-SERVER shell. `/` is the host shell post-fold
+  // (online-only) and must not be precached; /index.html resolves to the
+  // single-server SPA index (a root-level static file). See the header note.
+  e.waitUntil(caches.open(CACHE).then((c) => c.addAll(["/index.html"]).catch(() => {})));
   self.skipWaiting(); // activate the new version right away
 });
 
@@ -75,8 +88,13 @@ self.addEventListener("fetch", (e) => {
   const url = new URL(req.url);
   if (url.origin !== location.origin) return;
   if (url.pathname.startsWith("/vh/") || url.pathname.startsWith("/oc/")) return;
+  // Host shell (`/`) + its assets (`/host/*`) are online-only and excluded
+  // from caching — see the header note. Never intercept, never cache.
+  if (url.pathname === "/" || url.pathname.startsWith("/host/")) return;
 
-  const isNav = req.mode === "navigate" || url.pathname === "/" || url.pathname.endsWith(".html");
+  // `/` is excluded above (host route), so nav detection is the SPA navigation
+  // mode or an explicit .html file — never the bare host root.
+  const isNav = req.mode === "navigate" || url.pathname.endsWith(".html");
 
   e.respondWith(
     (async () => {

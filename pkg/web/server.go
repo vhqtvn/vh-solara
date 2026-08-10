@@ -2852,8 +2852,11 @@ func (s *Server) knownHostStatic(p string) bool {
 //
 // PWA/identity note: `/` is now the HOST (its title is "VHSolara · Host"); the
 // single-server PWA identity moves to `/app`. The single-server service worker
-// (`/sw.js`, scope `/`) is unchanged — see pkg/web/server.go CSP notes for the
-// offline cache-pollution caveat documented in the fold closeout.
+// (`/sw.js`, scope `/`) is registered only by the single-server SPA but its
+// scope covers the whole origin, so it EXCLUDES host routes (`/`, `/host/*`)
+// from its fetch handler and precache — it caches only the single-server shell
+// (at /app + /index.html) and never the online-only host shell. See
+// web/public/sw.js (host-route exclusion) — the predicate mirrors isHostRoute.
 func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 
