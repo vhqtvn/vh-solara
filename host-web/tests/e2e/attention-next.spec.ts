@@ -445,33 +445,31 @@ test.describe("P3 attention hub + NEXT hero button", () => {
   // keyboardOpen=false). Pin behaviorally that no stale maximize is left on ws1
   // and that the iframe identity survives the cross-ws switch + keyboard exit.
 
-  // KNOWN-BROKEN — production composition bug in attentionNext.ts, NOT a test
-  // defect. This test asserts the d-F1 contract (a cross-ws NEXT must EXIT
-  // keyboard focus-mode) and is RED against the current implementation. Marked
-  // .fixme so the suite stays green; remove .fixme once the production fix
-  // lands — the body below is the correct contract and should then pass
-  // unchanged.
+  // d-F1 composition contract (now passing). This test asserts the d-F1
+  // contract: a cross-ws NEXT while keyboard focus-mode is owned in ws1 must
+  // EXIT keyboard focus-mode (cross-pane rule) so the keyboard closes, ws1's
+  // owned maximize is exited (not re-pinned by onWorkspaceActivated), and the
+  // ws2 iframe identity survives the cross-ws switch.
   //
-  // ROOT CAUSE: in attentionNext.ts next(), the ws switch runs BEFORE the
-  // keyboard rule. setActiveWorkspace(target.wsId) SYNCHRONOUSLY re-projects
-  // focusedId() to the target (store.ts setActiveWorkspace → the sync callback
-  // hostController.syncAll → setFocused). So by the time the keyboard rule
-  // evaluates
+  // HISTORY: this composition was previously broken in attentionNext.ts next().
+  // The ws switch ran BEFORE the keyboard rule; setActiveWorkspace(target.wsId)
+  // SYNCHRONOUSLY re-projected focusedId() to the target (store.ts
+  // setActiveWorkspace → hostController.syncAll → setFocused), so by the time
+  // the keyboard rule evaluated
   //     if (isKeyboardOpen() && target.paneId !== focusedId())
-  // focusedId() ALREADY equals target.paneId (the re-projected ws-switch
-  // target) → the cross-pane condition is false → exitKeyboardFocus() NEVER
-  // fires. onWorkspaceActivated (App.tsx createEffect on activeWorkspaceId)
-  // then flushes with keyboardOpen still true and re-points the maximize to
-  // ws2 (exitOwned(ws1) + maximizeActive(ws2)); switching back re-maximizes ws1.
+  // focusedId() ALREADY equaled target.paneId (the re-projected ws-switch
+  // target) → the cross-pane condition was false → exitKeyboardFocus() NEVER
+  // fired. onWorkspaceActivated (keyboardFocus.ts) then flushed with
+  // keyboardOpen still true and re-pointed the maximize to ws2
+  // (exitOwned(ws1) + maximizeActive(ws2)); switching back re-maximized ws1.
   // Observed (chromium probe): open=true ownedWs=ws-2 ws2Maximized=true
   // ws1Maximized=true.
   //
-  // MINIMAL FIX (separate production slice — out of scope here): capture the
-  // PRE-switch focused pane at the top of next() and evaluate the keyboard rule
-  // against it; OR treat target.wsId !== activeWorkspaceId() as an additional
-  // cross-pane trigger forcing exitKeyboardFocus; OR move the keyboard rule
-  // before the ws switch.
-  test.fixme("cross-ws + keyboard-open composition: NEXT switches ws, exits keyboard focus-mode, leaves no stale ws1 maximize; iframe survives", async ({ page }) => {
+  // FIX: attentionNext.ts next() now captures the PRE-switch focusedId at the
+  // top (before setActiveWorkspace) and evaluates the keyboard rule against it,
+  // so the cross-pane case is correctly detected and exitKeyboardFocus() fires
+  // before onWorkspaceActivated re-points the owned maximize.
+  test("cross-ws + keyboard-open composition: NEXT switches ws, exits keyboard focus-mode, leaves no stale ws1 maximize; iframe survives", async ({ page }) => {
     const wsIds = await H.workspaces(page);
     const ws1 = wsIds[0]; // active, seeded panes
 

@@ -124,6 +124,17 @@ export function next(): void {
   const target = nextTarget();
   if (!target) return;
 
+  // Capture the PRE-switch focusedId BEFORE any state mutation. On a cross-ws
+  // NEXT, setActiveWorkspace(target.wsId) SYNCHRONOUSLY re-projects focusedId()
+  // to the target (store.ts setActiveWorkspace → hostController.syncAll →
+  // setFocused on workspace activation), so by the time the keyboard cross-pane
+  // rule below runs the live focusedId() has already flipped to target.paneId
+  // and the rule would wrongly conclude "same pane" (never firing
+  // exitKeyboardFocus). Reading the captured pre-switch id makes the rule see
+  // the genuine cross-pane case → exitKeyboardFocus() fires before
+  // onWorkspaceActivated (keyboardFocus.ts) re-points the owned maximize.
+  const preFocusedId = focusedId();
+
   // 1. Cross-workspace: activate the target's workspace first (survival-safe).
   if (target.wsId !== activeWorkspaceId()) {
     setActiveWorkspace(target.wsId);
@@ -143,7 +154,10 @@ export function next(): void {
   // 3. Keyboard focus-mode composition (debate ownership rule, operator-
   //    confirmed). A target switch mid-keyboard keeps keyboard mode ONLY if the
   //    new target is the SAME active pane; otherwise dismiss the keyboard first.
-  if (isKeyboardOpen() && target.paneId !== focusedId()) {
+  //    Evaluate against the PRE-switch focusedId (captured at the top): the live
+  //    focusedId() has already been re-projected to target.paneId by a cross-ws
+  //    switch in step 1, which would mask the cross-pane case.
+  if (isKeyboardOpen() && target.paneId !== preFocusedId) {
     // Cross-pane target: exit keyboard focus-mode. exitKeyboardFocus() restores
     // the host root height + exits ONLY the maximize focus-mode owns — a user's
     // manual maximize is never clobbered.
