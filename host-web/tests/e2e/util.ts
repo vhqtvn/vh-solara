@@ -557,6 +557,18 @@ export async function kbdFocusFlushDetection(page: Page): Promise<void> {
   });
 }
 
+/** Force the continuous re-apply path to run now (re-pin the root to the current
+ *  visualViewport height + offsetTop). Proves the offset-compensation MATH on
+ *  engines whose synthetic visualViewport event dispatch does not reach the
+ *  addEventListener listener (firefox); the production event wiring is proven
+ *  on chromium. No-op when the keyboard is closed. */
+export async function kbdFocusReapplyGeometry(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    const b = (window as unknown as { __hostKbdFocus?: { reapplyGeometry(): void } }).__hostKbdFocus;
+    b?.reapplyGeometry();
+  });
+}
+
 /** The focused pane's iframe element bounding box (null when none). */
 export async function focusedIframeBox(
   page: Page,
@@ -580,6 +592,16 @@ export async function appRootHeight(page: Page): Promise<number> {
   return page.evaluate(() => {
     const el = document.querySelector('[data-testid="host-app-root"]') as HTMLElement | null;
     return el ? el.clientHeight : 0;
+  });
+}
+
+/** The host root (`.app`) inline transform — the offset-compensation value
+ *  keyboard focus-mode pins to visualViewport.offsetTop while the keyboard is
+ *  open ("" when no inline transform is set). */
+export async function appRootTransform(page: Page): Promise<string> {
+  return page.evaluate(() => {
+    const el = document.querySelector('[data-testid="host-app-root"]') as HTMLElement | null;
+    return el ? el.style.transform : "";
   });
 }
 

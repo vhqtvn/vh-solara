@@ -240,4 +240,195 @@ test.describe("host keyboard focus-mode", () => {
     await expect.poll(async () => (await H.kbdFocusState(page)).open).toBe(false);
     await H.assertSurvived(page, target, before, "real-path detected open→close");
   });
+
+  // ---- 4. OFFSET COMPENSATION (root pinned to visible rect, continuous) ------
+  //
+  // The bug (operator on-device, Fold + soft keyboard): the host root had the
+  // right SIZE (height = visible area) but the wrong POSITION — focusing an
+  // editable in the cross-origin iframe makes the browser scroll the layout
+  // viewport to reveal the caret, so visualViewport.offsetTop becomes nonzero
+  // and the root (still at layout-y 0) scrolled off the top with a black body
+  // band below it. The fix pins the root's top to offsetTop continuously. This
+  // proves the MATH headlessly: the root's inline transform tracks offsetTop on
+  // open, on a mid-typing scroll, and on a SECOND scroll (continuous re-apply,
+  // not one-shot), then clears on close. The real soft-keyboard OUTCOME (no
+  // scroll-up on a real Fold) is the operator's on-device retest gate — not
+  // demonstrable headlessly (no engine opens a keyboard or scrolls a layout
+  // viewport to reveal a cross-origin caret).
+
+  test("keyboard-open pins the host root to the visible rect and re-pins on every scroll (offset compensation)", async ({ page }) => {
+    const ids = await H.panes(page);
+    const focused = await H.focused(page);
+    const target = focused ?? ids[0];
+    if (focused !== target) await H.focusPane(page, target);
+    await page.waitForTimeout(200);
+    const before = (await H.survival(page, target))!;
+
+    // Sanity: no inline transform before the keyboard.
+    expect(await H.appRootTransform(page), "no inline transform before keyboard").toBe("");
+
+    // Install a controllable visualViewport mock: height + offsetTop getters
+    // and a helper that sets both and OPTIONALLY dispatches resize/scroll on the
+    // REAL visualViewport. The offset-compensation MATH is proven via the mock-
+    // bridge (set values + bridge.reapplyGeometry) so it does NOT depend on
+    // synthetic event delivery (firefox does not deliver synthetic visualViewport
+    // events to addEventListener listeners); the event WIRING is proven in the
+    // chromium-only test below.
+    await page.evaluate(() => {
+      const real = window.visualViewport!;
+      let mockH = real.height;
+      let mockOffset = 0;
+      Object.defineProperty(real, "height", { configurable: true, get: () => mockH });
+      Object.defineProperty(real, "offsetTop", { configurable: true, get: () => mockOffset });
+      (window as unknown as {
+        __setMockVv?: (h: number, offset: number, ev?: "resize" | "scroll") => void;
+      }).__setMockVv = (h, offset, ev) => {
+        mockH = h;
+        mockOffset = offset;
+        if (ev) real.dispatchEvent(new Event(ev));
+      };
+    });
+
+    // --- OPEN with a caret-reveal offset already present (offsetTop = 80). ---
+    // The real detection path reads BOTH height and offsetTop; the root must be
+    // pinned to [80, 80+360], i.e. transform.top = 80, height = 360.
+    await page.evaluate(
+      ({ h, offset }) => {
+        (window as unknown as { __setMockVv: (h: number, o: number) => void }).__setMockVv(h, offset);
+      },
+      { h: KEYBOARD_VISIBLE_H, offset: 80 },
+    );
+    await H.kbdFocusFlushDetection(page); // bypass debounce → applyOpen reads vv
+    await expect.poll(async () => (await H.kbdFocusState(page)).open).toBe(true);
+    // CRUX #1: the root's top is pinned to offsetTop (the visible-rect top),
+    // not left at 0. Before the fix this was "" (no compensation) → the app
+    // scrolled off the top with a black band below.
+    await expect
+      .poll(async () => H.appRootTransform(page), { timeout: 8000 })
+      .toBe("translateY(80px)");
+    await expect.poll(async () => H.appRootHeight(page), { timeout: 8000 }).toBe(KEYBOARD_VISIBLE_H);
+
+    // --- CONTINUOUS re-apply: a mid-keyboard offset change re-pins the root. ---
+    // The browser re-scrolls on caret moves mid-typing (offsetTop 80 → 150); the
+    // root must re-pin to the NEW visible rect immediately — a single pin at
+    // open is NOT enough (the contract). Driven through the bridge re-apply
+    // (the exact function onVvEvent calls on every event) so the math is
+    // engine-independent; the event-wiring is proven separately on chromium.
+    await page.evaluate(
+      ({ h, offset }) => {
+        (window as unknown as { __setMockVv: (h: number, o: number) => void }).__setMockVv(h, offset);
+      },
+      { h: KEYBOARD_VISIBLE_H, offset: 150 },
+    );
+    await H.kbdFocusReapplyGeometry(page);
+    await expect
+      .poll(async () => H.appRootTransform(page), { timeout: 8000 })
+      .toBe("translateY(150px)");
+    await expect.poll(async () => H.appRootHeight(page), { timeout: 8000 }).toBe(KEYBOARD_VISIBLE_H);
+
+    // --- A SECOND offset change (proves continuous re-apply, not one-shot). ---
+    await page.evaluate(
+      ({ h, offset }) => {
+        (window as unknown as { __setMockVv: (h: number, o: number) => void }).__setMockVv(h, offset);
+      },
+      { h: KEYBOARD_VISIBLE_H, offset: 220 },
+    );
+    await H.kbdFocusReapplyGeometry(page);
+    await expect
+      .poll(async () => H.appRootTransform(page), { timeout: 8000 })
+      .toBe("translateY(220px)");
+    await expect.poll(async () => H.appRootHeight(page), { timeout: 8000 }).toBe(KEYBOARD_VISIBLE_H);
+
+    // --- CLEAN RESTORE on close: offset compensation removed, original
+    //     positioning restored exactly (transform cleared, height → CSS 100vh).
+    await page.evaluate(
+      ({ h, offset }) => {
+        (window as unknown as { __setMockVv: (h: number, o: number) => void }).__setMockVv(h, offset);
+      },
+      { h: VIEWPORT.height, offset: 0 },
+    );
+    await H.kbdFocusFlushDetection(page);
+    await expect.poll(async () => (await H.kbdFocusState(page)).open).toBe(false);
+    await expect.poll(async () => H.appRootTransform(page), { timeout: 8000 }).toBe("");
+    await expect
+      .poll(async () => H.appRootHeight(page), { timeout: 8000 })
+      .toBeGreaterThanOrEqual(VIEWPORT.height - 5);
+
+    // Identity survived the whole pin → re-pin → re-pin → restore cycle.
+    await H.assertSurvived(page, target, before, "offset-compensation pin→re-pin→restore");
+  });
+
+  // ---- 5. SCROLL-EVENT WIRING (scroll fires continuous re-apply) -------------
+  //
+  // Companion to the offset-compensation math test above: proves a real
+  // visualViewport SCROLL event routes through onVvEvent → reapplyGeometryIfOpen
+  // and re-pins the root mid-keyboard, WITHOUT a resize or a detection flush.
+  // Chromium-only: firefox does not deliver synthetic visualViewport scroll
+  // events via dispatchEvent (a headless-test limitation; the production
+  // addEventListener("scroll", onVvEvent) wiring is engine-agnostic and the
+  // shared re-apply MATH is proven cross-engine in the test above). WebKit is
+  // skipped file-wide.
+
+  test("a visualViewport scroll event re-pins the host root mid-keyboard (scroll-event wiring)", async ({ page, browserName }) => {
+    test.skip(browserName !== "chromium", "synthetic visualViewport scroll dispatch is chromium-only");
+    const ids = await H.panes(page);
+    const focused = await H.focused(page);
+    const target = focused ?? ids[0];
+    if (focused !== target) await H.focusPane(page, target);
+    await page.waitForTimeout(200);
+
+    // Same controllable-vv mock as the offset math test.
+    await page.evaluate(() => {
+      const real = window.visualViewport!;
+      let mockH = real.height;
+      let mockOffset = 0;
+      Object.defineProperty(real, "height", { configurable: true, get: () => mockH });
+      Object.defineProperty(real, "offsetTop", { configurable: true, get: () => mockOffset });
+      (window as unknown as {
+        __setMockVv?: (h: number, offset: number, ev?: "resize" | "scroll") => void;
+      }).__setMockVv = (h, offset, ev) => {
+        mockH = h;
+        mockOffset = offset;
+        if (ev) real.dispatchEvent(new Event(ev));
+      };
+    });
+
+    // Open with offset 0.
+    await page.evaluate(
+      ({ h, offset }) => {
+        (window as unknown as { __setMockVv: (h: number, o: number) => void }).__setMockVv(h, offset);
+      },
+      { h: KEYBOARD_VISIBLE_H, offset: 0 },
+    );
+    await H.kbdFocusFlushDetection(page);
+    await expect.poll(async () => (await H.kbdFocusState(page)).open).toBe(true);
+    await expect.poll(async () => H.appRootTransform(page), { timeout: 8000 }).toBe("translateY(0px)");
+
+    // A SCROLL event (offset change, NO resize, NO detection flush, NO bridge
+    // call) must fire onVvEvent → reapplyGeometryIfOpen and re-pin the root to
+    // the new offset. This is the continuous-re-apply contract: the browser
+    // re-scrolls on caret moves mid-typing and the root follows every event,
+    // not just keyboard-open.
+    await page.evaluate(
+      ({ h, offset, ev }) => {
+        (window as unknown as { __setMockVv: (h: number, o: number, e: "resize" | "scroll") => void }).__setMockVv(h, offset, ev);
+      },
+      { h: KEYBOARD_VISIBLE_H, offset: 180, ev: "scroll" as const },
+    );
+    await expect
+      .poll(async () => H.appRootTransform(page), { timeout: 8000 })
+      .toBe("translateY(180px)");
+    await expect.poll(async () => H.appRootHeight(page), { timeout: 8000 }).toBe(KEYBOARD_VISIBLE_H);
+
+    // A second scroll (continuous, not one-shot).
+    await page.evaluate(
+      ({ h, offset, ev }) => {
+        (window as unknown as { __setMockVv: (h: number, o: number, e: "resize" | "scroll") => void }).__setMockVv(h, offset, ev);
+      },
+      { h: KEYBOARD_VISIBLE_H, offset: 240, ev: "scroll" as const },
+    );
+    await expect
+      .poll(async () => H.appRootTransform(page), { timeout: 8000 })
+      .toBe("translateY(240px)");
+  });
 });

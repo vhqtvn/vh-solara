@@ -63,6 +63,18 @@ let ownedWs: string | null = null;
 /** Captured inline height string to restore on close ("" = no prior inline
  *  override; restore to CSS default by clearing the inline style). */
 let savedHeight = "";
+/** Captured inline transform to restore on close ("" = no prior inline
+ *  override). The transform pins the root's TOP to visualViewport.offsetTop
+ *  during keyboard-open (see applyGeometry) so the root occupies the visible
+ *  band, not just the right height at the wrong position; this restores the
+ *  pre-open transform exactly on close. */
+let savedTransform = "";
+/** Whether savedHeight/savedTransform have been captured this open cycle. MUST
+ *  be a distinct flag (not ""-as-sentinel): the pre-open inline height/transform
+ *  are genuinely "" (the CSS defaults), so a `=== ""` guard would re-capture the
+ *  OVERRIDDEN values on the continuous re-apply calls and restore would write
+ *  them back instead of clearing. */
+let geometryCaptured = false;
 
 function activeApi(): DockviewApi | undefined {
   return workspaceApiFor(activeWorkspaceId());
@@ -84,20 +96,20 @@ function keyboardDetected(): boolean {
   return vv.height < KEYBOARD_THRESHOLD * window.innerHeight;
 }
 
-/** Apply the keyboard-open state: shrink the host root to the visible area and
- *  maximize the active pane's group (if we don't already own / the user hasn't
- *  manually maximized). */
-function applyOpen(visibleHeight: number): void {
+/** Apply the keyboard-open state: pin the host root to the visible rect (height
+ *  + top-offset) and maximize the active pane's group (if we don't already own
+ *  / the user hasn't manually maximized). */
+function applyOpen(height: number, offsetTop: number): void {
   keyboardOpen = true;
-  setRootHeight(visibleHeight);
+  applyGeometry(height, offsetTop);
   maximizeActive();
 }
 
-/** Apply the keyboard-close state: restore the host root and exit the maximize
- *  we own (never the one the user manually entered). */
+/** Apply the keyboard-close state: restore the host root (height + transform)
+ *  and exit the maximize we own (never the one the user manually entered). */
 function applyClose(): void {
   keyboardOpen = false;
-  restoreRootHeight();
+  restoreGeometry();
   exitOwned();
 }
 
@@ -119,22 +131,87 @@ export function exitKeyboardFocus(): void {
   applyClose();
 }
 
-function setRootHeight(h: number): void {
+/** Pin the host root to the visible rect: height = visible height, top glued to
+ *  visualViewport.offsetTop.
+ *
+ *  WHY (the bug this fixes). When the soft keyboard opens and the browser
+ *  scrolls the layout viewport to reveal the caret in the cross-origin iframe,
+ *  visualViewport.offsetTop becomes nonzero — the visible band, in the root's
+ *  (layout-viewport) coordinate space, shifts from [0,H] to [offsetTop,
+ *  offsetTop+H]. The host root had the right SIZE (height=H) but the wrong
+ *  POSITION (still at layout-y 0), so its top scrolled off-screen above the
+ *  visual viewport and a body-background band opened below it (operator report:
+ *  "app shifts above the viewport, statusbar floats mid-screen, black band
+ *  below"). Pinning the root's top to offsetTop makes it occupy exactly the
+ *  visible band.
+ *
+ *  MECHANISM CHOICE (transform, not position/top/fixed). transform: translateY
+ *  is GPU-cheap (composite-only, no layout, no repaint) and shifts the WHOLE
+ *  app — including Dockview's maximize overlay and any fixed/absolute
+ *  descendants — uniformly to the visible rect, so nothing is left behind at
+ *  layout-y 0. A transform on `.app` does become the containing block for fixed
+ *  descendants, but `.app` is itself the visible-rect-sized band, so an
+ *  inset:0 fixed child still fills it equivalently. position:fixed/top:offsetTop
+ *  was rejected: mobile fixed positioning is relative to the layout viewport
+ *  with engine-specific caret-scroll interaction, less predictable than an
+ *  explicit document-space translate. The host root has overflow:hidden +
+ *  height:100vh, so window.scrollY stays 0 and offsetTop IS the full
+ *  visible-rect offset; pageTop (the scrollY-robust generalization) is
+ *  equivalent here — switch to pageTop if a future host layout ever allows
+ *  document scroll. Horizontal offset (offsetLeft) and pinch-scale are
+ *  non-issues for this app (portrait, no user-zoom) and intentionally ignored. */
+function applyGeometry(height: number, offsetTop: number): void {
   const el = getAppEl?.();
   if (!el) return;
-  // Capture the current inline height once (so close restores exactly), then
-  // override to the visible height. The root's CSS is height:100vh; an inline
-  // pixel height wins and propagates via the flex column to the Dockview
+  // Capture the current inline height + transform ONCE per open cycle (the flag
+  // is distinct from the captured values, which are genuinely "" pre-open), then
+  // pin to the visible rect. The root's CSS is height:100vh + transform:none;
+  // inline pixel values win and propagate via the flex column to the Dockview
   // container, whose ResizeObserver recomputes the maximized overlay's geometry.
-  if (savedHeight === "") savedHeight = el.style.height;
-  el.style.height = `${Math.round(h)}px`;
+  if (!geometryCaptured) {
+    savedHeight = el.style.height;
+    savedTransform = el.style.transform;
+    geometryCaptured = true;
+  }
+  el.style.height = `${Math.round(height)}px`;
+  el.style.transform = `translateY(${Math.round(offsetTop)}px)`;
 }
 
-function restoreRootHeight(): void {
+/** Restore the pre-open inline height + transform exactly ("" clears the inline
+ *  override → CSS defaults win: height:100vh, transform:none). */
+function restoreGeometry(): void {
   const el = getAppEl?.();
   if (!el) return;
-  el.style.height = savedHeight; // "" → clears inline override → CSS 100vh wins
+  el.style.height = savedHeight;
+  el.style.transform = savedTransform;
   savedHeight = "";
+  savedTransform = "";
+  geometryCaptured = false;
+}
+
+/** Continuous re-apply: re-pin the root to the CURRENT visible rect on every
+ *  resize AND scroll while the keyboard is open. The browser can re-scroll on
+ *  caret moves mid-typing (offsetTop changes); a single application at
+ *  keyboard-open is NOT enough. Immediate (no debounce) so the root tracks the
+ *  visible rect every event; the debounced detection gates only the open↔close
+ *  TRANSITION, not the geometry. */
+function reapplyGeometryIfOpen(): void {
+  if (!keyboardOpen) return;
+  const vv = window.visualViewport;
+  if (!vv) return;
+  applyGeometry(vv.height, vv.offsetTop);
+}
+
+/** visualViewport event entry (fires on resize OR scroll): (1) immediately
+ *  re-pin the root to the current visible rect while the keyboard is open
+ *  (continuous offset compensation — the browser can re-scroll on caret moves
+ *  mid-typing), then (2) schedule the debounced open↔close detection. Both
+ *  resize and scroll route here: resize = visible HEIGHT changed (keyboard
+ *  open/close animation); scroll = visible OFFSET changed (caret-reveal
+ *  re-scroll mid-typing). */
+function onVvEvent(): void {
+  reapplyGeometryIfOpen();
+  scheduleDetection();
 }
 
 /** Maximize the active workspace's focused pane group, recording ownership only
@@ -185,7 +262,7 @@ function scheduleDetection(): void {
     const now = keyboardDetected();
     if (now && !keyboardOpen) {
       const vv = window.visualViewport;
-      applyOpen(vv ? vv.height : window.innerHeight);
+      applyOpen(vv ? vv.height : window.innerHeight, vv ? vv.offsetTop : 0);
     } else if (!now && keyboardOpen) {
       applyClose();
     }
@@ -215,7 +292,10 @@ export function installKeyboardFocus(appEl: () => HTMLElement | null): void {
   // listener — the production detection path.
   installDevBridge();
   if (!isTouchCapable()) return; // desktop: no soft keyboard → no real listener
-  vvListener = scheduleDetection;
+  // resize AND scroll both route through onVvEvent (see its doc): resize covers
+  // the keyboard open/close HEIGHT animation; scroll covers the caret-reveal
+  // OFFSET re-scroll mid-typing. Both re-pin the root continuously while open.
+  vvListener = onVvEvent;
   window.visualViewport.addEventListener("resize", vvListener);
   window.visualViewport.addEventListener("scroll", vvListener);
 }
@@ -269,13 +349,24 @@ interface KbdFocusDevBridge {
   /** Workspace id whose maximize focus-mode owns (null = user-owned / none). */
   ownedWs(): string | null;
   /** Simulate keyboard-open at a given visible height (px). Bypasses the gate
-   *  + heuristic so the mechanism is provable headlessly. Idempotent. */
+   *  + heuristic so the mechanism is provable headlessly. The host root is
+   *  pinned to the visible rect: height = visibleHeight, transform.top =
+   *  visualViewport.offsetTop (0 unless a test mocks vv.offsetTop, so the
+   *  offset-compensation path is exercisable headlessly). Idempotent. */
   open(visibleHeight: number): void;
   /** Simulate keyboard-close. Restores the root + exits the owned maximize. */
   close(): void;
   /** Force the REAL detection path to run now (used by the e2e to prove the
    *  heuristic + debounce fire after a visualViewport height change). */
   flushDetection(): void;
+  /** Force the continuous re-apply path to run now (re-pin the root to the
+   *  current visualViewport height + offsetTop). Used by the e2e to prove the
+   *  offset-compensation MATH headlessly on engines whose synthetic
+   *  visualViewport event dispatch does not reach addEventListener listeners
+   *  (firefox): the production onVvEvent wiring is proven separately on
+   *  chromium, where synthetic events DO fire the listeners. No-op when the
+   *  keyboard is closed. */
+  reapplyGeometry(): void;
 }
 
 const DEV_BRIDGE_KEY = "__hostKbdFocus";
@@ -287,7 +378,11 @@ function installDevBridge(): void {
     ownedWs: () => ownedWs,
     open: (visibleHeight: number) => {
       if (keyboardOpen) return;
-      applyOpen(visibleHeight);
+      const vv = window.visualViewport;
+      // Height from the arg (so a test pins the visible height without mocking
+      // vv.height); offsetTop from the live vv (0 unless the test mocks it, so
+      // the offset-compensation path is exercisable headlessly).
+      applyOpen(visibleHeight, vv ? vv.offsetTop : 0);
     },
     close: () => {
       if (!keyboardOpen) return;
@@ -301,10 +396,13 @@ function installDevBridge(): void {
       const now = keyboardDetected();
       if (now && !keyboardOpen) {
         const vv = window.visualViewport;
-        applyOpen(vv ? vv.height : window.innerHeight);
+        applyOpen(vv ? vv.height : window.innerHeight, vv ? vv.offsetTop : 0);
       } else if (!now && keyboardOpen) {
         applyClose();
       }
+    },
+    reapplyGeometry: () => {
+      reapplyGeometryIfOpen();
     },
   };
   (window as unknown as Record<string, unknown>)[DEV_BRIDGE_KEY] = bridge;
