@@ -1412,25 +1412,52 @@ func (s *Store) rebuildArchivedSnapshotLocked(rawArchived []json.RawMessage) {
 }
 
 // sweepOrphansLocked is the Defect-3 backstop: it flags every live session whose
-// parentID chain terminates at a parent that is ABSENT from the live store but
-// PRESENT in the authoritative archived snapshot. A chain that terminates at a
-// LIVE root (parentID == "") or an UNRESOLVABLE parent (absent from both the
-// live store and the archived snapshot) is NEVER flagged — the e88f19e
-// false-positive gate, non-negotiable. Idempotent: re-evaluates every live
-// session each run, setting OR clearing sessionEntry.orphan so the flag tracks
-// the current snapshot. Caller holds s.mu.
+// parentID chain terminates at an archived parent (see
+// chainTerminatesAtArchivedLocked for both termination conditions). A chain that
+// terminates at a LIVE root (parentID == "") or an UNRESOLVABLE parent (absent
+// from both the live store and the archived snapshot) is NEVER flagged — the
+// e88f19e false-positive gate, non-negotiable. Idempotent: re-evaluates every
+// live session each run, setting OR clearing sessionEntry.orphan so the flag
+// tracks the current snapshot.
+//
+// PROPAGATION (archive-defect-chain Slice 2): when a session's flag CHANGES, the
+// sweep emits a KindTreeOrphanCheck for it, prompting the tree emitter to
+// recompute the orphan facet and emit node.facet{flags:{orphan}} to each
+// connection that knows the node — so an ALREADY-CONNECTED client sees the flag
+// flip without waiting for an unrelated session event on the straggler or a
+// full reconnect. Without this, RefreshArchivedSnapshot would update the stored
+// se.orphan but never re-emit, leaving connected clients on the stale pre-flip
+// flag until the next reconnect (the restart case works because reconnect forces
+// a fresh SnapshotFrontier; the live rehydrate case did not). The emission is
+// change-gated: steady-state sweeps (no flag flips) emit nothing. Caller holds
+// s.mu.
 func (s *Store) sweepOrphansLocked() {
 	for id, se := range s.sessions {
-		se.orphan = s.chainTerminatesAtArchivedLocked(id)
+		now := s.chainTerminatesAtArchivedLocked(id)
+		if now != se.orphan {
+			se.orphan = now
+			// Propagate the flip to connected clients (see PROPAGATION above).
+			s.emitOrphanCheckLocked([]string{id})
+		}
 	}
 }
 
 // chainTerminatesAtArchivedLocked reports whether id's parentID chain, walked up
-// through live ancestors, terminates at a parent that is absent from the live
-// store AND present in the authoritative archived snapshot. Returns false for a
-// live root (parentID == "") and for a chain ending at an unresolvable parent
-// (absent from both) — the e88f19e false-positive gate. Bounded against cyclic
-// parent links (defensive; malformed data). Caller holds s.mu.
+// through live ancestors, terminates at an ARCHIVED parent. Two termination
+// conditions, both resolving to "archived":
+//   - the parent is ABSENT from the live store AND present in the authoritative
+//     archived snapshot (the production path: RemoveSessions dropped an archived
+//     parent, so the straggler's parentID points at a session no longer resident);
+//   - the parent is STILL resident but carries time.archived (§9.1 archive-keep
+//     defense / direct state inspection). In production archive REMOVES the
+//     session, so this branch is only reached for the archive-keep hypothetical —
+//     but resolving it here keeps emit (isOrphanLocked) and the sweep
+//     (sweepOrphansLocked), which both call this function, in lockstep.
+//
+// Returns false for a live root (parentID == "") and for a chain ending at an
+// unresolvable parent (absent from both the live store and the snapshot) — the
+// e88f19e false-positive gate. Bounded against cyclic parent links (defensive;
+// malformed data). Caller holds s.mu.
 func (s *Store) chainTerminatesAtArchivedLocked(id string) bool {
 	cur := id
 	seen := map[string]bool{id: true}
@@ -1451,6 +1478,13 @@ func (s *Store) chainTerminatesAtArchivedLocked(id string) bool {
 			// Flag iff pid is confirmed-archived (in the snapshot). An
 			// unresolvable pid (never existed, not in snapshot) is NOT flagged.
 			return s.archivedSnapshot[pid]
+		}
+		// Parent is still resident. §9.1 archive-keep defense: an archived
+		// ancestor that is STILL present orphans its descendants. (In production
+		// archive removes the session, so this is only reached for the
+		// archive-keep hypothetical / direct inspection.)
+		if isArchivedLocked(s, pid) {
+			return true
 		}
 		// Parent is live → walk up. Cycle guard against malformed parent links.
 		if seen[pid] {

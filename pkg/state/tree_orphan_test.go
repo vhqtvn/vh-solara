@@ -465,3 +465,229 @@ func TestTreeOrphan_IsArchivedAuthoritativeAccessor(t *testing.T) {
 		t.Errorf("accessor: snapshot should report Q not archived")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Archive-defect-chain Slice 2 — EMIT path: isOrphanLocked + buildNodeLocked
+// carry flags.orphan end-to-end (RT2 Go emit portion + RT3 Go emit portion).
+//
+// Slice 1 pinned the SWEEP (sweepOrphansLocked → sessionEntry.orphan, read via
+// IsOrphanFlagged). These tests pin the EMIT path: isOrphanLocked — which
+// buildNodeLocked reads to set Node.flags.orphan on every emitted node — must
+// agree with the sweep (both call chainTerminatesAtArchivedLocked) so the
+// operator-facing OrphanBanner sees the flag the moment a straggler's archived
+// parent leaves the live store.
+//
+// Design note (coherence): the snapshot (archivedSnapshot) is the SOLE orphan
+// authority. There is NO tombstone fast-path: the tombstone (recentlyArchived)
+// is set by RemoveSessions for BOTH archive and delete, is in-memory, and is
+// lost on restart — so it is neither cross-restart nor a reliable "archived"
+// signal. The snapshot refreshes every hydrate + 5s reconcile, so the banner
+// appears within one tick. Both cases below prove the snapshot authority: (a)
+// tombstone-armed (RemoveSessions path) and (b) fresh-store restart (tombstone
+// empty) — emit reads the snapshot, not the tombstone.
+// ---------------------------------------------------------------------------
+
+// TestTreeOrphan_RT2_EmitFlagAfterArchive pins RT2 emit (tombstone-armed case):
+// after P is archived (RemoveSessions drops it from the live store + arms the
+// tombstone) and the snapshot is refreshed, isOrphanLocked(C) returns true AND
+// buildNodeLocked(C) carries Flags.Orphan=true — so the emitted node surfaces
+// the flag the operator-facing OrphanBanner reads.
+func TestTreeOrphan_RT2_EmitFlagAfterArchive(t *testing.T) {
+	s := New(64)
+	applySeq(t, s,
+		[2]string{"session.created", evSessionCreated("P", "")},
+		[2]string{"session.created", evSessionCreated("C", "P")},
+	)
+	// Archive P: drops P from the live store + arms the tombstone.
+	s.RemoveSessions([]string{"P"})
+	// Refresh the snapshot from OpenCode's archived list (P archived).
+	s.RefreshArchivedSnapshot([]json.RawMessage{archivedSessionInfo("P")})
+
+	e := NewTreeEmitter(s, "/proj")
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if !isOrphanLocked(s, "C") {
+		t.Errorf("RT2 emit: isOrphanLocked(C) should be true (parent P archived+removed, in snapshot)")
+	}
+	node, ok := e.buildNodeLocked("C", true)
+	if !ok {
+		t.Fatalf("RT2 emit: buildNodeLocked(C) should succeed")
+	}
+	if !node.Flags.Orphan {
+		t.Errorf("RT2 emit: emitted node C should carry Flags.Orphan=true")
+	}
+}
+
+// TestTreeOrphan_RT2_EmitFlagAfterRestart pins RT2 emit CRUX (post-restart): a
+// FRESH store (tombstones empty — daemon restart) hydrates C only (P is archived
+// and thus excluded from /session) and refreshes the snapshot. isOrphanLocked(C)
+// returns true AND the emitted node carries the flag — proving the snapshot, not
+// the lost tombstone, is the emit-time authority.
+func TestTreeOrphan_RT2_EmitFlagAfterRestart(t *testing.T) {
+	// Fresh store: tombstones empty (daemon restart simulation).
+	s := New(64)
+	// Hydrate from OpenCode: /session lists C (live); P archived (excluded).
+	s.Hydrate([]json.RawMessage{sessInfo("C", "P", 0)}, nil)
+	if s.IsRecentlyArchived("P") {
+		t.Fatalf("precondition: fresh store must have empty tombstone for P")
+	}
+	// Snapshot from OpenCode's archived list (the cross-restart authority).
+	s.RefreshArchivedSnapshot([]json.RawMessage{archivedSessionInfo("P")})
+
+	e := NewTreeEmitter(s, "/proj")
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if !isOrphanLocked(s, "C") {
+		t.Errorf("RT2 emit crux: isOrphanLocked(C) should be true after restart (snapshot authority)")
+	}
+	node, ok := e.buildNodeLocked("C", true)
+	if !ok {
+		t.Fatalf("RT2 emit crux: buildNodeLocked(C) should succeed")
+	}
+	if !node.Flags.Orphan {
+		t.Errorf("RT2 emit crux: emitted node C should carry Flags.Orphan=true after restart")
+	}
+}
+
+// TestTreeOrphan_RT3_EmitLiveRootNotFlagged pins RT3 emit: a live session whose
+// parent-chain root is LIVE (present, not archived) is NEVER flagged orphan via
+// the emit path, even when the snapshot contains unrelated archived ids. This is
+// the e88f19e false-positive gate, preserved on the emit path.
+func TestTreeOrphan_RT3_EmitLiveRootNotFlagged(t *testing.T) {
+	s := New(64)
+	// R (live root) → C (live child). Snapshot contains an unrelated archived X.
+	s.Hydrate([]json.RawMessage{
+		sessInfo("R", "", 0),
+		sessInfo("C", "R", 0),
+	}, nil)
+	s.RefreshArchivedSnapshot([]json.RawMessage{archivedSessionInfo("X")})
+
+	e := NewTreeEmitter(s, "/proj")
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, id := range []string{"R", "C"} {
+		if isOrphanLocked(s, id) {
+			t.Errorf("RT3 emit: %s under live root R should NOT be flagged orphan", id)
+		}
+		node, ok := e.buildNodeLocked(id, true)
+		if !ok {
+			t.Fatalf("RT3 emit: buildNodeLocked(%s) should succeed", id)
+		}
+		if node.Flags.Orphan {
+			t.Errorf("RT3 emit: emitted node %s should carry Flags.Orphan=false", id)
+		}
+	}
+}
+
+// TestTreeOrphan_RT3_EmitUnresolvableNotFlagged pins RT3 emit: a live session
+// whose parent NEVER existed (absent from the live store AND absent from the
+// snapshot) is NEVER flagged orphan via the emit path. The snapshot is the
+// discriminator: without a confirmed-archived parent, the chain is
+// "unresolvable", not orphan.
+func TestTreeOrphan_RT3_EmitUnresolvableNotFlagged(t *testing.T) {
+	s := New(64)
+	// C's parent P never existed. Snapshot contains an unrelated archived X.
+	s.Hydrate([]json.RawMessage{sessInfo("C", "P", 0)}, nil)
+	s.RefreshArchivedSnapshot([]json.RawMessage{archivedSessionInfo("X")})
+
+	e := NewTreeEmitter(s, "/proj")
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if isOrphanLocked(s, "C") {
+		t.Errorf("RT3 emit: C whose parent P is unresolvable should NOT be flagged orphan")
+	}
+	node, ok := e.buildNodeLocked("C", true)
+	if !ok {
+		t.Fatalf("RT3 emit: buildNodeLocked(C) should succeed")
+	}
+	if node.Flags.Orphan {
+		t.Errorf("RT3 emit: emitted node C (unresolvable parent) should carry Flags.Orphan=false")
+	}
+}
+
+// TestTreeOrphan_RT3_CycleGuardNotFlagged pins that a cyclic parent link
+// (malformed data: A's parent is B, B's parent is A) is NEVER flagged orphan and
+// does NOT hang the emit path — the cycle guard in chainTerminatesAtArchivedLocked
+// bounds the walk.
+func TestTreeOrphan_RT3_CycleGuardNotFlagged(t *testing.T) {
+	s := New(64)
+	// A↔B 2-cycle (neither archived, neither absent).
+	s.Hydrate([]json.RawMessage{
+		sessInfo("A", "B", 0),
+		sessInfo("B", "A", 0),
+	}, nil)
+	s.RefreshArchivedSnapshot(nil)
+
+	e := NewTreeEmitter(s, "/proj")
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, id := range []string{"A", "B"} {
+		if isOrphanLocked(s, id) {
+			t.Errorf("RT3 cycle: %s in a parent-cycle should NOT be flagged orphan", id)
+		}
+		node, ok := e.buildNodeLocked(id, true)
+		if !ok {
+			t.Fatalf("RT3 cycle: buildNodeLocked(%s) should succeed", id)
+		}
+		if node.Flags.Orphan {
+			t.Errorf("RT3 cycle: emitted node %s should carry Flags.Orphan=false", id)
+		}
+	}
+}
+
+// TestTreeOrphan_SweepPropagatesFlagFlip pins the PROPAGATION contract (closes
+// review finding F1b): when the sweep FLIPS a session's orphan flag, it emits a
+// KindTreeOrphanCheck so the tree emitter re-emits node.facet{flags:{orphan}} to
+// connected clients. Without this, RefreshArchivedSnapshot would update the
+// stored se.orphan but never re-emit, leaving an already-connected client on the
+// stale pre-flip flag until a full reconnect (the restart case works because
+// reconnect forces a fresh SnapshotFrontier; the live rehydrate case did not).
+// The emission is change-gated: steady-state re-sweeps emit nothing.
+func TestTreeOrphan_SweepPropagatesFlagFlip(t *testing.T) {
+	s := New(64)
+	s.Hydrate([]json.RawMessage{sessInfo("C", "P", 0)}, nil)
+
+	// First refresh: P enters the snapshot → C flips false→true → emit orphan-check.
+	s.RefreshArchivedSnapshot([]json.RawMessage{archivedSessionInfo("P")})
+	if !s.IsOrphanFlagged("C") {
+		t.Fatalf("setup: C should be flagged after P enters snapshot")
+	}
+	if got := orphanChecksFor(s, "C"); got != 1 {
+		t.Errorf("first sweep: expected 1 orphan-check emitted for C, got %d", got)
+	}
+
+	// Steady-state re-sweep (same snapshot): no flag flip → no new orphan-check.
+	s.RefreshArchivedSnapshot([]json.RawMessage{archivedSessionInfo("P")})
+	if got := orphanChecksFor(s, "C"); got != 1 {
+		t.Errorf("steady-state re-sweep: expected no new orphan-check for C (still 1 total), got %d", got)
+	}
+
+	// P leaves the snapshot (legitimate un-archive) → C flips true→false → emit.
+	s.RefreshArchivedSnapshot(nil)
+	if s.IsOrphanFlagged("C") {
+		t.Errorf("un-archive: C flag should clear after P leaves snapshot")
+	}
+	if got := orphanChecksFor(s, "C"); got != 2 {
+		t.Errorf("un-archive sweep: expected a 2nd orphan-check for C (the clear), got %d", got)
+	}
+}
+
+// orphanChecksFor counts KindTreeOrphanCheck events for id in the full replay
+// (since seq 0). Each flag flip emits exactly one.
+func orphanChecksFor(s *Store, id string) int {
+	evs, _, _ := s.Replay(0)
+	n := 0
+	for _, ev := range evs {
+		if ev.Kind != KindTreeOrphanCheck {
+			continue
+		}
+		var p struct {
+			ID string `json:"id"`
+		}
+		_ = json.Unmarshal(ev.Payload, &p)
+		if p.ID == id {
+			n++
+		}
+	}
+	return n
+}

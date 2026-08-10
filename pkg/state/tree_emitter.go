@@ -241,24 +241,44 @@ func (e *TreeEmitter) buildNodeLocked(id string, loaded bool) (Node, bool) {
 	return n, true
 }
 
-// isOrphanLocked implements the §9.1 orphan rule: N is a genuine orphan iff its
-// effective parent is non-empty AND the root of its chain is archived AND N is
-// still resident. A live-rooted session is NEVER an orphan.
+// isOrphanLocked implements the §9.1 orphan rule, widened for the archive-defect
+// chain: N is a genuine orphan iff its parentID chain — walked up through live
+// ancestors — terminates at a parent that is ABSENT from the live store AND
+// confirmed-archived in the authoritative snapshot (Store.archivedSnapshot). A
+// live-rooted session is NEVER an orphan.
+//
+// WHY this no longer routes through effectiveParentOfLocked: the live store
+// CANNOT be the orphan authority. RemoveSessions drops an archived parent from
+// s.sessions, so a straggler child's parentID points at a session absent from the
+// live tree. The pre-widening rule ran that parentID through
+// effectiveParentOfLocked, which collapses an absent parent to "" → "N is itself
+// a root → not orphan" — the Defect-2 false-negative on exactly the straggler
+// the operator needs surfaced. The absent-parent case is now resolved by the
+// authoritative snapshot instead of by the live-store root collapse.
+//
+// SINGLE SOURCE OF TRUTH: the computation delegates to chainTerminatesAtArchived
+// Locked — the SAME function sweepOrphansLocked (the Defect-3 backstop) uses to
+// set the stored sessionEntry.orphan flag — so emit-time and sweep-time ALWAYS
+// agree. The emitted Node.flags.orphan is computed here from the snapshot at
+// emit time (always fresh); the swept sessionEntry.orphan is a diagnostic cache
+// of the same function (read by IsOrphanFlagged for tests/diagnostics).
+//
+// The snapshot is the SOLE authority. It is rebuilt from OpenCode's
+// archived-session list on every hydrate + 5s reconcile (RefreshArchivedSnapshot)
+// and survives a daemon restart. The in-memory tombstone (recentlyArchived) is
+// deliberately NOT consulted here: it is lost on restart AND RemoveSessions arms
+// it for BOTH the archive and the delete paths (delete.go cascades the whole
+// subtree so no child is left behind, but the tombstone is still not a
+// cross-restart "archived" signal) — so the tombstone is a resurrection-guard,
+// not an orphan authority. A chain that terminates at a LIVE root (parentID ==
+// "") or an UNRESOLVABLE parent (absent from both the live store and the
+// snapshot) is NEVER flagged — the e88f19e false-positive gate, non-negotiable.
+// Caller holds s.mu.
 func isOrphanLocked(s *Store, id string) bool {
-	pid := s.effectiveParentOfLocked(s.sessions[id].parentID)
-	if pid == "" {
-		return false // N is itself a root → not an orphan.
+	if s.sessions[id] == nil {
+		return false
 	}
-	// Walk to the chain root.
-	cur := id
-	for i := 0; i < 10000; i++ { // bound against cycles (defensive)
-		p := s.effectiveParentOfLocked(s.sessions[cur].parentID)
-		if p == "" {
-			break
-		}
-		cur = p
-	}
-	return isArchivedLocked(s, cur)
+	return s.chainTerminatesAtArchivedLocked(id)
 }
 
 // ----------------------------------------------------------------------------

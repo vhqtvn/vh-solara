@@ -348,6 +348,14 @@ func (s *Store) maintainSubtreeDescendantOnSessionUpsertLocked(id string, prev *
 // effectiveParentOfLocked returns p when p is a live session, else "". This is
 // the orphan-inclusive normalization: a child whose parentID points at a
 // deleted id is effectively a root. Caller holds s.mu.
+//
+// NOTE: the orphan computation (isOrphanLocked) deliberately does NOT route
+// through here — collapsing an archived-but-removed parent to "" caused the
+// Defect-2 false-negative ("N is itself a root → not orphan"). isOrphanLocked
+// walks raw parentID via chainTerminatesAtArchivedLocked and resolves the
+// absent parent against the authoritative archived snapshot instead. This helper
+// keeps its current root-collapse semantics for its other callers (rootOfLocked,
+// subtree-busy, children index, reparenting).
 func (s *Store) effectiveParentOfLocked(p string) string {
 	if p == "" || s.sessions[p] == nil {
 		return ""
