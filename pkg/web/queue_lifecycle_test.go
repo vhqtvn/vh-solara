@@ -130,13 +130,16 @@ func TestQueueGC_RemoveSessionsRemovesQueue(t *testing.T) {
 
 // 3. Direct local archive invokes cleanup even without the subscriber.
 //
-//	/vh/archive calls CleanupSession DIRECTLY inside the handler (the archive
-//	branch's loop). The queue.json must be gone by the time the POST returns —
-//	archive correctness must NOT depend on best-effort subscriber delivery
-//	(events can be dropped, delayed, or fired before subscription).
+//	/vh/archive accepts the job (200) and the background cascade calls
+//	CleanupSession DIRECTLY per successful id. The queue.json must be gone once
+//	the bg job finishes — archive correctness must NOT depend on best-effort
+//	subscriber delivery (events can be dropped, delayed, or fired before
+//	subscription). (Pre-Defect-1 this was synchronous; the cascade is now async
+//	under bgCtx so the cleanup lands shortly after the POST returns.)
 func TestQueueGC_DirectArchiveRemovesQueue(t *testing.T) {
 	f := &fakeOC{}
-	web, agg, _, root := queueLifecycleServer(t, f)
+	web, agg, srv, root := queueLifecycleServer(t, f)
+	srv.SetReassertDelay(5 * time.Millisecond)
 	seedQueueFile(t, root, "s1")
 	agg.Store().Apply(ev("session.created", `{"info":{"id":"s1"}}`))
 	resp := csrfPost(t, web.URL+"/vh/archive", map[string]any{"sessionID": "s1"})
@@ -144,10 +147,13 @@ func TestQueueGC_DirectArchiveRemovesQueue(t *testing.T) {
 	if resp.StatusCode != 200 {
 		t.Fatalf("/vh/archive: got %d, want 200", resp.StatusCode)
 	}
-	// The direct CleanupSession call ran synchronously inside the handler —
-	// no wait needed. This is the deterministic-backstop guarantee.
+	// The cascade is async — wait for the bg job's direct CleanupSession to land
+	// (it runs per successful id, after SetArchived returns 200). This is the
+	// deterministic-backstop guarantee: cleanup does not depend on the
+	// best-effort subscriber.
+	srv.awaitArchiveJobs(t, 5*time.Second)
 	if queueFileExists(root, "s1") {
-		t.Fatalf("direct archive: queue.json must be gone by the time the POST returns")
+		t.Fatalf("direct archive: queue.json must be gone once the cascade job finishes")
 	}
 }
 
@@ -187,31 +193,100 @@ func TestQueueGC_DirectAndEventCleanupIsIdempotent(t *testing.T) {
 
 // 5. Failed OpenCode archive does NOT prematurely delete the queue.
 //
-//	fakeOC.archiveStatus makes PATCH /session/:id return 5xx, so
-//	agg.Client().SetArchived fails and the archive handler returns 502 BEFORE
-//	reaching the CleanupSession loop. The queue.json must persist — a failed
-//	archive must never lose queued messages.
+//	fakeOC.archiveStatus makes PATCH /session/:id return 5xx, so the cascade
+//	job's SetArchived fails. Under the Defect 1 fix the handler ACCEPTS the job
+//	(200, not the prior 502) and the background cascade retries the transient
+//	5xx under budget; on exhaustion the id is retained (retain-on-failure). The
+//	queue.json must persist — a failed archive must never lose queued messages.
 func TestQueueGC_FailedArchivePreservesQueue(t *testing.T) {
 	f := &fakeOC{archiveStatus: http.StatusInternalServerError}
-	web, agg, _, root := queueLifecycleServer(t, f)
+	web, agg, srv, root := queueLifecycleServer(t, f)
+	// Shrink the retry budget + backoff so the job reaches terminal failure in
+	// milliseconds (production defaults span ~15s).
+	srv.SetArchiveRetryConfig(3, 1*time.Millisecond, 2*time.Millisecond)
+	srv.SetReassertDelay(5 * time.Millisecond)
 	seedQueueFile(t, root, "s1")
 	agg.Store().Apply(ev("session.created", `{"info":{"id":"s1"}}`))
 	resp := csrfPost(t, web.URL+"/vh/archive", map[string]any{"sessionID": "s1"})
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusBadGateway {
-		t.Fatalf("/vh/archive with failing SetArchived: got %d, want 502", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("/vh/archive with failing SetArchived: got %d, want 200 (job accepted; failure handled async)", resp.StatusCode)
 	}
-	// Queue must still be present — the handler returned early before the
-	// direct CleanupSession call. Poll the negative condition across a short
-	// window (rather than a single sleep) so a delayed stray event surfaces as
-	// a test failure instead of being masked by timing. No event should fire
-	// here: RemoveSessions is only reached on archive success.
-	deadline := time.Now().Add(200 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		if !queueFileExists(root, "s1") {
-			t.Fatalf("failed archive must NOT prematurely delete queue.json (stray event fired)")
+	// Wait for the bg job to exhaust its retries and reach terminal failure.
+	srv.awaitArchiveJobs(t, 5*time.Second)
+	// RETAIN-ON-FAILURE: the queue must survive (CleanupSession never ran for
+	// the failed id), and the session must stay in the live store
+	// (RemoveSessions never ran).
+	if !queueFileExists(root, "s1") {
+		t.Fatalf("failed archive must NOT delete queue.json (retain-on-failure violated)")
+	}
+	if agg.Store().Descendants("s1") == nil {
+		t.Fatal("failed archive must NOT remove the session from the live store (retain-on-failure)")
+	}
+}
+
+// 9. RT4 — re-issuing /vh/archive on a (now fully-)archived root is idempotent:
+// no 502/error on the already-archived ids, CleanupSession fires exactly once
+// per id from the job (the counting registry proves no double-cleanup), and the
+// already-cleaned queues stay gone (no re-creation). This is the resume
+// contract (decision B): re-issuing handleArchive completes the remainder
+// idempotently — SetArchived re-writes 200 on already-archived, RemoveSessions
+// skips-if-absent (so no session.delete event → no subscriber double-cleanup),
+// and CleanupSession is a no-op on an already-removed queue.
+func TestQueueGC_ReissueArchiveIsIdempotent(t *testing.T) {
+	f := &fakeOC{}
+	web, agg, srv, root := queueLifecycleServer(t, f)
+	srv.SetReassertDelay(5 * time.Millisecond)
+	agg.Store().Apply(ev("session.created", `{"info":{"id":"r"}}`))
+	agg.Store().Apply(ev("session.created", `{"info":{"id":"c1","parentID":"r"}}`))
+	agg.Store().Apply(ev("session.created", `{"info":{"id":"c2","parentID":"r"}}`))
+	seedQueueFile(t, root, "r")
+	seedQueueFile(t, root, "c1")
+	seedQueueFile(t, root, "c2")
+
+	// First archive: all three. Count the CleanupSession calls (job direct +
+	// subscriber for each — the idempotent composition already pinned by
+	// TestQueueGC_DirectAndEventCleanupIsIdempotent).
+	resp := csrfPost(t, web.URL+"/vh/archive", map[string]any{"sessionID": "r"})
+	if sc := resp.StatusCode; sc != 200 {
+		t.Fatalf("first /vh/archive: got %d, want 200", sc)
+	}
+	resp.Body.Close()
+	srv.awaitArchiveJobs(t, 5*time.Second)
+	for _, id := range []string{"r", "c1", "c2"} {
+		if agg.Store().Descendants(id) != nil {
+			t.Fatalf("[first archive] id %s not removed from store", id)
 		}
-		time.Sleep(10 * time.Millisecond)
+		if queueFileExists(root, id) {
+			t.Fatalf("[first archive] queue.json for %s not removed", id)
+		}
+	}
+	countAfterFirst := srv.queues.CleanupCallCount()
+
+	// RE-ISSUE /vh/archive on the same (now-archived) root. Descendants(r) is
+	// nil (r removed) → the fallback makes affected=[r]. The job re-PATCHes r
+	// (SetArchived idempotently re-writes 200 — NO error on already-archived),
+	// RemoveSessionIfPresent(r) returns false (r already gone → THIS job did
+	// NOT transition it → skip CleanupSession), and the tombstone is refreshed.
+	// The CAS gate (F2 fix) is what prevents double-queue-cleanup under
+	// concurrent re-issue: no CleanupSession fires for an already-removed id.
+	resp2 := csrfPost(t, web.URL+"/vh/archive", map[string]any{"sessionID": "r"})
+	if sc := resp2.StatusCode; sc != 200 {
+		t.Fatalf("re-issue /vh/archive: got %d, want 200 (no error on already-archived)", sc)
+	}
+	resp2.Body.Close()
+	srv.awaitArchiveJobs(t, 5*time.Second)
+	// ZERO additional CleanupSession calls: RemoveSessionIfPresent(r) returned
+	// false (r absent) → the CAS gate skipped CleanupSession entirely. This is
+	// the no-double-cleanup guarantee the F2 fix provides.
+	if got := srv.queues.CleanupCallCount() - countAfterFirst; got != 0 {
+		t.Errorf("re-issue CleanupSession delta: got %d, want 0 (CAS skips cleanup for already-removed id)", got)
+	}
+	// All queues stay gone (no re-creation; idempotent).
+	for _, id := range []string{"r", "c1", "c2"} {
+		if queueFileExists(root, id) {
+			t.Errorf("re-issue re-created queue.json for %s (must stay gone)", id)
+		}
 	}
 }
 

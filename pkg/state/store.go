@@ -1524,6 +1524,62 @@ func (s *Store) IsOrphanFlagged(id string) bool {
 	return false
 }
 
+// ChainTerminatesAtArchived is the public, lock-acquiring form of
+// chainTerminatesAtArchivedLocked. It reports whether id's parentID chain,
+// walked up through live ancestors, terminates at an ARCHIVED parent (the same
+// authority Slices 1/2 use for the orphan classification). The archive cascade
+// job (pkg/web/archive.go runArchiveCascade) consults it to classify a
+// permanently-stuck id: true → descendant of an archived root → leave live so
+// the orphan sweep flags it (OrphanBanner surfaces it); false → root or
+// unresolvable chain → surface as an explicit job failure and NEVER orphan-flag
+// (the e88f19e false-positive gate). Returns false for an unknown id.
+func (s *Store) ChainTerminatesAtArchived(id string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.sessions[id] == nil {
+		return false
+	}
+	return s.chainTerminatesAtArchivedLocked(id)
+}
+
+// ParentOf returns the raw parentID of id from the live store ("" for a root or
+// an unknown id). The archive cascade job captures a snapshot of the parent
+// chain for every id in the frozen affected scope BEFORE any RemoveSessions
+// mutates the tree, so classifyArchiveFailure can recognize a failed descendant
+// of a root archived by the SAME job (the authoritative archivedSnapshot is not
+// refreshed mid-job, and RemoveSessions re-roots children — both would otherwise
+// make ChainTerminatesAtArchived return false for a just-orphaned child).
+func (s *Store) ParentOf(id string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if se := s.sessions[id]; se != nil {
+		return se.parentID
+	}
+	return ""
+}
+
+// RemoveSessionIfPresent is the compare-and-swap archive removal: it always
+// arms the archive-resurrection tombstone (the resurrection guard is needed
+// after any successful SetArchived, even for an id not currently in the live
+// store — it blocks a stale session.updated from resurrecting it), but it
+// deletes id from the live store + returns whether it ACTUALLY performed the
+// deletion. The archive cascade job uses the return value to decide whether
+// THIS job owns the queue/pin cleanup for the id — a concurrent re-issue whose
+// job already RemoveSessions'd the id returns false, so CleanupSession is NOT
+// double-called (the RT4 no-double-queue-cleanup contract under concurrent
+// detached jobs). This preserves the old RemoveSessions tombstone-always
+// semantics while adding the CAS gate the F2 fix requires.
+func (s *Store) RemoveSessionIfPresent(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, present := s.sessions[id]
+	if present {
+		s.deleteSessionLocked(id)
+	}
+	s.recentlyArchived[id] = time.Now().Add(s.recentArchiveTTL)
+	return present
+}
+
 // PendingPermissions returns a copy of the pending-permission set under a READ
 // lock. It exists so callers that only need permissions (e.g. the 2s reconcile
 // backstop) do not pay for a full Snapshot: Snapshot materializes every

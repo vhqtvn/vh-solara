@@ -120,7 +120,7 @@ func TestArchiveReassert_SkipsRepatchAfterTombstoneCleared(t *testing.T) {
 	list := []byte(`[{"id":"s1","parentID":"","time":{"archived":null}}]`)
 	f := &fakeOC{listSessionsReply: list}
 	web, agg, srv, _ := queueLifecycleServer(t, f)
-	srv.SetReassertDelay(30 * time.Millisecond) // window to clear the tombstone first
+	srv.SetReassertDelay(30 * time.Millisecond) // window to clear the tombstone inside
 	agg.Store().Apply(ev("session.created", `{"info":{"id":"s1"}}`))
 
 	resp := csrfPost(t, web.URL+"/vh/archive", map[string]any{"sessionID": "s1"})
@@ -128,9 +128,23 @@ func TestArchiveReassert_SkipsRepatchAfterTombstoneCleared(t *testing.T) {
 	if resp.StatusCode != 200 {
 		t.Fatalf("/vh/archive: got %d, want 200", resp.StatusCode)
 	}
-	// Simulate the unarchive flow clearing the tombstone BEFORE the 30ms
-	// re-assert fires (the POST returned immediately; this runs microseconds
-	// later, well inside the window).
+	// The cascade is async: wait for its RemoveSessions to SET the tombstone
+	// BEFORE clearing it (clearing at POST-time would race the cascade's
+	// RemoveSessions, which re-sets it). Once set, the reassert is in its 30ms
+	// delay window — clearing now lands inside it.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if agg.Store().IsRecentlyArchived("s1") {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if !agg.Store().IsRecentlyArchived("s1") {
+		t.Fatal("cascade never set the tombstone (RemoveSessions did not run)")
+	}
+	// Simulate the unarchive flow clearing the tombstone INSIDE the re-assert
+	// window (the POST returned immediately; the 30ms reassert delay is now
+	// counting down).
 	agg.Store().ClearArchiveTombstones([]string{"s1"})
 
 	// Wait well past the re-assert window so a stray re-PATCH would land.

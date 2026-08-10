@@ -853,6 +853,14 @@ func (s *sessionQueueStore) Resolve(id string, target QueueItemState, detail str
 type queueRegistry struct {
 	mu     sync.Mutex
 	stores map[string]*sessionQueueStore
+	// cleanupCalls counts CleanupSession invocations (atomic). Test
+	// observability for the archive idempotency contract (RT4): re-issuing
+	// /vh/archive on a partially-archived root must not double-clean an
+	// already-archived id's queue. deleteStore is idempotent (missing file is a
+	// no-op), so correctness does not depend on the count — but the count makes
+	// the "exactly once per id" guarantee crisp and regression-visible. Not read
+	// by production code paths.
+	cleanupCalls int64
 }
 
 func newQueueRegistry() *queueRegistry {
@@ -1005,7 +1013,14 @@ func (qr *queueRegistry) deleteStore(root, sessionID string) {
 //     GC slices (orphan reconciliation, terminal-item dismissal, compaction)
 //     have one obvious hook.
 func (qr *queueRegistry) CleanupSession(root, sessionID string) {
+	atomic.AddInt64(&qr.cleanupCalls, 1)
 	qr.deleteStore(root, sessionID)
+}
+
+// CleanupCallCount returns the total number of CleanupSession invocations since
+// the registry was created (test observability — see the cleanupCalls field doc).
+func (qr *queueRegistry) CleanupCallCount() int64 {
+	return atomic.LoadInt64(&qr.cleanupCalls)
 }
 
 // reconcileOrphanQueues is the durable backstop (FIX-QUEUE-GC-3) for GC-2's

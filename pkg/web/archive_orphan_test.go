@@ -44,7 +44,8 @@ func postArchive(t *testing.T, url, id string) (*http.Response, []string) {
 // the store, and set the tombstone.
 func TestArchiveOrphan_InStoreSucceeds(t *testing.T) {
 	f := &fakeOC{}
-	web, agg, _, _ := queueLifecycleServer(t, f)
+	web, agg, srv, _ := queueLifecycleServer(t, f)
+	srv.SetReassertDelay(5 * time.Millisecond)
 	// Seed an orphan: parent "root" is never inserted, so "orphan" is
 	// genuinely parentless in the store.
 	agg.Store().Apply(ev("session.created", `{"info":{"id":"orphan","parentID":"root"}}`))
@@ -53,12 +54,16 @@ func TestArchiveOrphan_InStoreSucceeds(t *testing.T) {
 	}
 
 	resp, affected := postArchive(t, web.URL, "orphan")
+	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
 		t.Fatalf("/vh/archive orphan: got %d, want 200", resp.StatusCode)
 	}
 	if len(affected) != 1 || affected[0] != "orphan" {
 		t.Fatalf("affected: got %v, want [orphan]", affected)
 	}
+	// The cascade is async — wait for the bg job to finish before asserting
+	// store side-effects (POST returns 200 immediately on job acceptance).
+	srv.awaitArchiveJobs(t, 5*time.Second)
 	// Must be removed from the live store.
 	if agg.Store().Descendants("orphan") != nil {
 		t.Error("orphan still in store after archive; RemoveSessions should have pruned it")
@@ -80,16 +85,19 @@ func TestArchiveOrphan_InStoreSucceeds(t *testing.T) {
 // so the client can prune.
 func TestArchiveOrphan_NotInStoreFallback(t *testing.T) {
 	f := &fakeOC{}
-	web, agg, _, _ := queueLifecycleServer(t, f)
+	web, agg, srv, _ := queueLifecycleServer(t, f)
+	srv.SetReassertDelay(5 * time.Millisecond)
 	// "ghost" is never seeded → Descendants returns nil.
 
 	resp, affected := postArchive(t, web.URL, "ghost")
+	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
 		t.Fatalf("/vh/archive ghost: got %d, want 200", resp.StatusCode)
 	}
 	if len(affected) != 1 || affected[0] != "ghost" {
 		t.Fatalf("affected: got %v, want [ghost] (fallback to body.SessionID)", affected)
 	}
+	srv.awaitArchiveJobs(t, 5*time.Second)
 	// SetArchived must have been attempted for "ghost" even though it's not in
 	// the store — the fallback populates affected=[ghost] and the loop runs.
 	patches := archivedPATCHes(f)
@@ -116,6 +124,7 @@ func TestArchiveOrphan_ToleratesGoneStatus(t *testing.T) {
 	}
 
 	resp, affected := postArchive(t, web.URL, "orphan")
+	defer resp.Body.Close()
 	// MUST be 200, NOT 502 — the 404 means the session is verifiably gone, so
 	// the loop continues past the failed SetArchived.
 	if resp.StatusCode != 200 {
@@ -124,6 +133,7 @@ func TestArchiveOrphan_ToleratesGoneStatus(t *testing.T) {
 	if len(affected) != 1 || affected[0] != "orphan" {
 		t.Fatalf("affected: got %v, want [orphan]", affected)
 	}
+	srv.awaitArchiveJobs(t, 5*time.Second)
 	// Must STILL be removed from the store despite the SetArchived failure.
 	if agg.Store().Descendants("orphan") != nil {
 		t.Error("orphan still in store after archive; RemoveSessions should fire for gone status")
@@ -139,37 +149,61 @@ func TestArchiveOrphan_ToleratesGoneStatus(t *testing.T) {
 	}
 }
 
-// TestArchiveOrphan_NonGoneStatusAborts: SetArchived returns 409 (Conflict) —
-// the session IS still live in OpenCode. The archive MUST abort with 502 so
-// RemoveSessions and CleanupSession (queue deletion) do NOT fire. This locks
-// the boundary: only 404/410 are tolerated; everything else preserves the
-// queue state. Same expectation for 400/401/403/429/5xx/network.
-func TestArchiveOrphan_NonGoneStatusAborts(t *testing.T) {
-	f := &fakeOC{archiveStatus: http.StatusConflict} // 409
+// TestArchiveOrphan_NonGoneStatusRetainsQueueAndSession: SetArchived returns 409
+// (Conflict) — the session IS still live in OpenCode. Under the Defect 1 fix the
+// handler no longer aborts synchronously (502); it ACCEPTS the job (200) and the
+// background cascade handles the failure. A 409 is re-derived: the authoritative
+// list does not report the id archived (fakeOC serves "[]"), so it retries under
+// budget; on exhaustion the id is classified (its parent "root" is absent from
+// both the live store and the snapshot → root/unresolvable → explicit failure,
+// NOT orphan-flagged). The core invariant is unchanged from the prior 502 test:
+// RemoveSessions and CleanupSession (queue deletion) do NOT fire for a failed
+// id — the queue and the live session are retained. (409 here is representative
+// of the whole non-gone class: 400/403 terminal, 429/5xx/network transient —
+// all retain-on-failure; the classification per status lives in archiveOneID.)
+func TestArchiveOrphan_NonGoneStatusRetainsQueueAndSession(t *testing.T) {
+	f := &fakeOC{archiveStatus: http.StatusConflict} // 409 on every PATCH
 	web, agg, srv, root := queueLifecycleServer(t, f)
+	// Shrink the retry budget + backoff so the job reaches terminal failure in
+	// milliseconds (production defaults span ~15s — fine for the field, too
+	// slow for a unit test).
+	srv.SetArchiveRetryConfig(3, 1*time.Millisecond, 2*time.Millisecond)
 	srv.SetReassertDelay(5 * time.Millisecond)
 	seedQueueFile(t, root, "orphan")
 	agg.Store().Apply(ev("session.created", `{"info":{"id":"orphan","parentID":"root"}}`))
 
 	resp, _ := postArchive(t, web.URL, "orphan")
-	// MUST be 502 — the session is still live (409 conflict), so the archive
-	// aborts to preserve the queue.
-	if resp.StatusCode != http.StatusBadGateway {
-		t.Fatalf("/vh/archive with 409 SetArchived: got %d, want 502 (abort)", resp.StatusCode)
+	defer resp.Body.Close()
+	// 200 — the job is accepted; the 409 failure is handled in the background.
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("/vh/archive with 409 SetArchived: got %d, want 200 (job accepted; failure handled async)", resp.StatusCode)
 	}
-	// Must STILL be in the store — RemoveSessions must NOT have fired.
+	srv.awaitArchiveJobs(t, 5*time.Second)
+	// RETAIN-ON-FAILURE (the non-negotiable invariant): the failed id stays in
+	// the live store and its queue survives — RemoveSessions/CleanupSession did
+	// NOT fire for it.
 	if agg.Store().Descendants("orphan") == nil {
-		t.Error("orphan removed from store after aborted archive; RemoveSessions should NOT fire")
+		t.Error("orphan removed from store after failed archive; RemoveSessions must NOT fire on failure")
 	}
-	// Queue state must survive — CleanupSession must NOT have fired. Poll the
-	// negative condition across a short window (mirrors the existing
-	// TestQueueGC_FailedArchivePreservesQueue pattern) so a delayed stray
-	// cleanup surfaces as a failure.
-	deadline := time.Now().Add(200 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		if !queueFileExists(root, "orphan") {
-			t.Fatalf("409 archive must NOT delete queue.json (CleanupSession fired)")
+	if !queueFileExists(root, "orphan") {
+		t.Error("orphan queue.json deleted after failed archive; CleanupSession must NOT fire on failure (retain-on-failure)")
+	}
+	// SetArchived was attempted (3 retries under the shrunk budget).
+	if n := countID(archivedPATCHes(f), "orphan"); n != 3 {
+		t.Errorf("orphan PATCH count: got %d, want 3 (budget exhausted on 409)", n)
+	}
+	// "orphan" is root/unresolvable (parent "root" absent everywhere) → recorded
+	// as an EXPLICIT job failure, NOT orphan-flagged (e88f19e gate).
+	if agg.Store().IsOrphanFlagged("orphan") {
+		t.Error("orphan flagged (a root/unresolvable id must NEVER be orphan-flagged)")
+	}
+	found := false
+	for _, fl := range srv.ArchiveFailures() {
+		if fl.ID == "orphan" {
+			found = true
 		}
-		time.Sleep(10 * time.Millisecond)
+	}
+	if !found {
+		t.Errorf("orphan not recorded in ArchiveFailures (stuck root must surface): %+v", srv.ArchiveFailures())
 	}
 }

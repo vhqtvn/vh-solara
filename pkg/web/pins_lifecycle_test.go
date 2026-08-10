@@ -92,7 +92,8 @@ func assertPinsRevision(t *testing.T, web *httptest.Server, want int64, msg stri
 func TestPinsL1_ArchiveRemovesPin(t *testing.T) {
 	t.Setenv("VH_STATE_DIR", t.TempDir()) // isolate the PinStore
 	f := &fakeOC{}
-	web, agg, _, _ := queueLifecycleServer(t, f)
+	web, agg, srv, _ := queueLifecycleServer(t, f)
+	srv.SetReassertDelay(5 * time.Millisecond)
 
 	seedPinSession(t, agg, "sess-a")
 	// Establish the pin doc at revision 1 [sess-a].
@@ -104,12 +105,16 @@ func TestPinsL1_ArchiveRemovesPin(t *testing.T) {
 
 	// Archive sess-a via the real handler. fakeOC accepts the PATCH (200).
 	resp, affected := postArchive(t, web.URL, "sess-a")
+	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
 		t.Fatalf("/vh/archive: status %d, want 200", resp.StatusCode)
 	}
 	if len(affected) != 1 || affected[0] != "sess-a" {
 		t.Fatalf("affected = %v, want [sess-a]", affected)
 	}
+	// The L1 unpin runs in the async cascade job (removePinsAndBroadcast for the
+	// succeeded set) — wait for the bg job before asserting the pin is gone.
+	srv.awaitArchiveJobs(t, 5*time.Second)
 
 	// The pin must be gone and the revision must have bumped (cleanup ran).
 	if pinsHasID(pinsGet(t, web.URL), "sess-a") {
@@ -123,7 +128,8 @@ func TestPinsL1_ArchiveRemovesPin(t *testing.T) {
 func TestPinsL1_ArchiveCascadesSubtree(t *testing.T) {
 	t.Setenv("VH_STATE_DIR", t.TempDir())
 	f := &fakeOC{}
-	web, agg, _, _ := queueLifecycleServer(t, f)
+	web, agg, srv, _ := queueLifecycleServer(t, f)
+	srv.SetReassertDelay(5 * time.Millisecond)
 
 	// Seed a parent + child in the live store so Descendants cascades.
 	agg.Store().Apply(ev("session.created", `{"info":{"id":"parent"}}`))
@@ -137,12 +143,15 @@ func TestPinsL1_ArchiveCascadesSubtree(t *testing.T) {
 	r.Body.Close()
 
 	resp, affected := postArchive(t, web.URL, "parent")
+	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
 		t.Fatalf("/vh/archive: status %d, want 200", resp.StatusCode)
 	}
 	if len(affected) != 2 {
 		t.Fatalf("affected = %v, want [parent child]", affected)
 	}
+	// The L1 cascade unpin runs in the async bg job — wait for it.
+	srv.awaitArchiveJobs(t, 5*time.Second)
 
 	g := pinsGet(t, web.URL)
 	if pinsHasID(g, "parent") || pinsHasID(g, "child") {
@@ -161,12 +170,19 @@ func TestPinsL1_ArchiveCascadesSubtree(t *testing.T) {
 }
 
 // TestPinsL1_FailedArchivePreservesPin: a non-404/410 SetArchived failure makes
-// /vh/archive return 502 BEFORE the L1 hook runs, so a still-active session's
-// pin MUST survive. This is the "failed archive must not unpin" contract.
+// the async cascade job RETAIN the id (retain-on-failure — never RemoveSessions
+// or unpin a failed id), so a still-active session's pin MUST survive. Under the
+// Defect 1 fix the handler no longer returns 502 synchronously; it accepts the
+// job (200) and the background cascade retries the 409 under budget then retains
+// the id on exhaustion. The "failed archive must not unpin" contract is
+// unchanged — only its observation moved from the response status to the bg
+// job's retain guarantee.
 func TestPinsL1_FailedArchivePreservesPin(t *testing.T) {
 	t.Setenv("VH_STATE_DIR", t.TempDir())
 	f := &fakeOC{archiveStatus: http.StatusConflict} // 409 → session still live
 	web, agg, srv, _ := queueLifecycleServer(t, f)
+	// Shrink the retry budget + backoff so the job reaches terminal failure fast.
+	srv.SetArchiveRetryConfig(3, 1*time.Millisecond, 2*time.Millisecond)
 	srv.SetReassertDelay(5 * time.Millisecond)
 
 	seedPinSession(t, agg, "sess-a")
@@ -177,19 +193,17 @@ func TestPinsL1_FailedArchivePreservesPin(t *testing.T) {
 	r.Body.Close()
 
 	resp, _ := postArchive(t, web.URL, "sess-a")
-	if resp.StatusCode != http.StatusBadGateway {
-		t.Fatalf("/vh/archive with 409: status %d, want 502 (abort)", resp.StatusCode)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("/vh/archive with 409: status %d, want 200 (job accepted; failure handled async)", resp.StatusCode)
 	}
+	// Wait for the bg job to exhaust retries and reach terminal failure.
+	srv.awaitArchiveJobs(t, 5*time.Second)
 
-	// Pin must survive — the handler returned 502 before the L1 hook.
-	// Poll the negative condition across a short window (mirrors the queue
-	// failed-archive test) so a delayed stray cleanup surfaces as a failure.
-	deadline := time.Now().Add(200 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		if !pinsHasID(pinsGet(t, web.URL), "sess-a") {
-			t.Fatalf("L1 failed-archive: pin sess-a was removed by a failed archive")
-		}
-		time.Sleep(10 * time.Millisecond)
+	// RETAIN-ON-FAILURE: the pin must survive (removePinsAndBroadcast never ran
+	// for the failed id), and the revision must NOT have bumped.
+	if pinsHasID(pinsGet(t, web.URL), "sess-a") == false {
+		t.Fatalf("L1 failed-archive: pin sess-a was removed by a failed archive (retain-on-failure violated)")
 	}
 	assertPinsRevision(t, web, 1, "L1 failed-archive must not bump revision")
 }

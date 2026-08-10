@@ -292,6 +292,35 @@ type Server struct {
 	reassertReadyCh chan struct{}
 	reassertBlockCh chan struct{}
 
+	// Archive cascade job (Defect 1 fix) state. The job is dispatched by
+	// handleArchive under bgCtx/bgWG (same lifecycle as reassert); these fields
+	// configure its retry policy and record operator-visible failures.
+	//
+	// archiveRetryBudget/Base/Max are captured under bgMu at job launch (same
+	// seam pattern as reassertDelay): the job receives a frozen
+	// archiveRetryConfig and never reads shared mutable state after dispatch.
+	// Defaults from defaultArchiveRetry* (archive.go); test override via
+	// SetArchiveRetryConfig.
+	archiveRetryBudget int
+	archiveRetryBase   time.Duration
+	archiveRetryMax    time.Duration
+	// archiveJobsActive counts in-flight cascade jobs (atomic). Test seam:
+	// awaitArchiveJobs (archive_job_test.go) polls it to deterministically wait
+	// for the bg job to reach terminal state before asserting side-effects (the
+	// cascade is async — POST returns before RemoveSessions/Cleanup run). Not
+	// read by production code.
+	archiveJobsActive int64
+	// archiveFailures records ids that reached terminal failure in a cascade
+	// job (permanent error, budget exhaustion on a root/unresolvable chain, or
+	// shutdown cancellation). A descendant-of-archived exhausted id is NOT
+	// recorded here — the orphan banner (Slices 1/2) surfaces it, and recording
+	// it as a failure would double-count the recovery affordance. This is the
+	// build-validate-4 operator-visibility surface: a structured log fires per
+	// failure, and this registry is the seed a future job-status endpoint could
+	// expose. Guarded by archiveFailuresMu.
+	archiveFailuresMu sync.Mutex
+	archiveFailures   []archiveJobFailure
+
 	// lifecycleWG tracks the Server-owned per-directory lifecycle goroutines so
 	// Shutdown can AWAIT (not merely cancel) them: every permission watcher (all
 	// dirs, incl. the default — the Server arms them) and every NON-DEFAULT
@@ -483,25 +512,28 @@ func NewServer(agg *aggregator.Aggregator, opencodeURL string, ringCapacity int)
 		// Production default: the host shell is the default view at `/`. The
 		// fixture server (web e2e lane) calls SetHostShellAtRoot(false) to keep
 		// the single-server SPA at `/` (legacy, so the web e2e is unchanged).
-		hostShellAtRoot: true,
-		opencodeURL:     opencodeURL,
-		ringCap:         ringCapacity,
-		aggs:            map[string]*aggregator.Aggregator{"": agg},
-		idem:            newIdemCache(10 * time.Minute),
-		features:        defaultFeatures(),
-		views:           newViewRegistry(),
-		queues:          newQueueRegistry(),
-		pins:            pinStore,
-		labelsReg:       newLabelRegistry(),
-		failFast:        map[string]struct{}{},
-		watcherOn:       map[string]bool{},
-		watcherCancel:   map[string]context.CancelFunc{},
-		queueGCOn:       map[string]bool{},
-		pinsGCOn:        map[string]bool{},
-		labelsGCOn:      map[string]bool{},
-		bgCtx:           bgCtx,
-		bgCancel:        bgCancel,
-		reassertDelay:   defaultReassertDelay,
+		hostShellAtRoot:    true,
+		opencodeURL:        opencodeURL,
+		ringCap:            ringCapacity,
+		aggs:               map[string]*aggregator.Aggregator{"": agg},
+		idem:               newIdemCache(10 * time.Minute),
+		features:           defaultFeatures(),
+		views:              newViewRegistry(),
+		queues:             newQueueRegistry(),
+		pins:               pinStore,
+		labelsReg:          newLabelRegistry(),
+		failFast:           map[string]struct{}{},
+		watcherOn:          map[string]bool{},
+		watcherCancel:      map[string]context.CancelFunc{},
+		queueGCOn:          map[string]bool{},
+		pinsGCOn:           map[string]bool{},
+		labelsGCOn:         map[string]bool{},
+		bgCtx:              bgCtx,
+		bgCancel:           bgCancel,
+		reassertDelay:      defaultReassertDelay,
+		archiveRetryBudget: defaultArchiveRetryBudget,
+		archiveRetryBase:   defaultArchiveRetryBase,
+		archiveRetryMax:    defaultArchiveRetryMax,
 	}
 	// Arm the DEFAULT aggregator synchronously, BEFORE the server can serve
 	// any HTTP request. The default aggregator is created in the daemon
@@ -529,6 +561,20 @@ func NewServer(agg *aggregator.Aggregator, opencodeURL string, ringCapacity int)
 func (s *Server) SetReassertDelay(d time.Duration) {
 	s.bgMu.Lock()
 	s.reassertDelay = d
+	s.bgMu.Unlock()
+}
+
+// SetArchiveRetryConfig overrides the archive cascade job's retry policy (a test
+// seam mirroring SetReassertDelay). budget is the max SetArchived attempts per
+// id; base is the initial exponential backoff; max is its ceiling. Captured
+// under bgMu at job launch so the running job never reads shared mutable state.
+// Tests shrink budget/base/max to keep failure-path assertions deterministic
+// (production defaults are calibrated in archive.go — see defaultArchiveRetry*).
+func (s *Server) SetArchiveRetryConfig(budget int, base, max time.Duration) {
+	s.bgMu.Lock()
+	s.archiveRetryBudget = budget
+	s.archiveRetryBase = base
+	s.archiveRetryMax = max
 	s.bgMu.Unlock()
 }
 

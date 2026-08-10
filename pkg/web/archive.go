@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
+	"math/rand/v2"
 	"net/http"
 	"sort"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/vhqtvn/vh-solara/pkg/aggregator"
@@ -26,6 +29,51 @@ import (
 // own state. The per-Server delay (Server.reassertDelay) defaults to this;
 // tests override it via SetReassertDelay.
 const defaultReassertDelay = 1 * time.Second
+
+// Archive cascade job retry policy (Defect 1 fix — server-owned background job).
+//
+// budget is the maximum SetArchived attempts per id. base is the initial
+// exponential backoff; max is its ceiling. Total worst-case backoff for ONE id
+// ≈ base + 2·base + 4·base + … capped at max, summed over budget attempts.
+//
+// Calibration (build-validate 5): budget=5, base=500ms, max=8s → ≈15.5s of
+// backoff span per failing id. That comfortably covers an OpenCode/LLM
+// rate-limit window (seconds) and a transient 5xx blip, without indefinitely
+// blocking a genuinely-stuck id: after ~15s it hands off to the stuck
+// classification (descendant → orphan banner via Slices 1/2; root → explicit
+// job failure). The cascade is SERIAL (one SetArchived at a time), matching the
+// prior loop and avoiding burst rate-limiting (429) against OpenCode — so a
+// 1000-descendant cascade where a few ids fail pays the backoff only on the
+// failing ids, not the whole batch.
+const (
+	defaultArchiveRetryBudget = 5
+	defaultArchiveRetryBase   = 500 * time.Millisecond
+	defaultArchiveRetryMax    = 8 * time.Second
+)
+
+// archiveRetryConfig is the captured-at-launch retry policy for one cascade
+// job. Frozen from the Server's per-instance config under bgMu so the job never
+// reads shared mutable state after dispatch (same pattern as reassertDelay).
+type archiveRetryConfig struct {
+	budget int
+	base   time.Duration
+	max    time.Duration
+}
+
+// archiveJobFailure records an id that reached terminal failure in a cascade
+// job. This is the operator-visibility surface for stuck ROOTS (build-validate
+// 4): a structured log fires per failure, and this registry is the seed a
+// future job-status endpoint could expose. A DESCENDANT-of-archived id that
+// exhausted its budget is NOT recorded here — the orphan banner (Slices 1/2)
+// surfaces it instead, and recording it as a "failure" would double-count the
+// recovery affordance. ArchiveFailures returns a snapshot copy for tests /
+// diagnostics.
+type archiveJobFailure struct {
+	ID      string
+	Reason  string // "permanent:403", "exhausted:5", "cancelled:shutdown"
+	RootSrc string // the originating POST /vh/archive sessionID
+	At      time.Time
+}
 
 // Archiving uses OpenCode's NATIVE archive (PATCH /session/:id time.archived):
 // it persists in OpenCode and is visible to every client. Archiving cascades to
@@ -165,107 +213,342 @@ func (s *Server) handleArchive(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		ts := time.Now().UnixMilli()
-		for _, id := range affected {
-			if err := agg.Client().SetArchived(r.Context(), id, ts); err != nil {
-				// Distinguish "session is gone" (404/410) from everything else.
-				//
-				// 404/410 — the session doesn't exist in OpenCode (a ghost: the
-				// orphan banner surfaces sessions from the CLIENT store, but
-				// vh-solara's server store may have already pruned it, and
-				// OpenCode may have already cascade-deleted it when its ancestor
-				// was archived). The archive intent is satisfied — the session is
-				// verifiably gone — so tolerate: log, continue, and let
-				// RemoveSessions prune the tree below.
-				//
-				// All other statuses (400 schema rejection, 401/403 auth, 409
-				// conflict, 429 rate-limited, 5xx, network) mean the session IS
-				// still live in OpenCode or the server is broken. Abort so the
-				// archive does NOT reach RemoveSessions (which would fire
-				// KindSessionDelete → CleanupSession and delete the session's
-				// queue state). A failed archive must preserve the queue — the
-				// session may still be active. Return 502.
-				var ocErr *opencode.Error
-				if errors.As(err, &ocErr) && (ocErr.Status == http.StatusNotFound || ocErr.Status == http.StatusGone) {
-					log.Printf("[archive] SetArchived(%s): %v (session gone)", id, err)
-					continue
-				}
-				http.Error(w, err.Error(), http.StatusBadGateway)
-				return
-			}
-		}
-		// Drop them from the live view immediately (clients prune via delete).
-		agg.Store().RemoveSessions(affected)
-		// Archive clears the queue: a successful archive deletes that session's
-		// queue state (matches the prior FE-only behavior and the operator's
-		// confirmed policy). Done AFTER the archive commits so a failed archive
-		// never loses queued messages. Routed through the same CleanupSession
-		// wrapper the session.delete subscriber uses (FIX-QUEUE-GC-2): archive
-		// correctness must NOT depend on best-effort subscriber delivery, so the
-		// direct call is retained here even though RemoveSessions above also
-		// fires KindSessionDelete → subscriber → CleanupSession. The two calls
-		// compose idempotently (the second is a no-op).
-		root, err := projectRoot(dir)
-		if err == nil {
-			for _, id := range affected {
-				s.queues.CleanupSession(root, safeID.ReplaceAllString(id, ""))
-			}
-		}
-		// (A) Re-assert against OpenCode clobber. A busy/compacting subagent
-		// still running when we PATCHed can cause OpenCode to rewrite the full
-		// session record from a pre-PATCH snapshot, reverting time.archived to
-		// null. The PATCH itself returned 200 — no error visible here — but the
-		// persisted value didn't stick for that descendant. The store-side
-		// tombstone (set by RemoveSessions above) holds the live tree during
-		// the window; this goroutine closes the gap in OpenCode itself by
-		// re-reading the authoritative list after the busy write settles and
-		// re-PATCHing any affected id where archived didn't stick. Best-effort
-		// (logs on error); the tombstone is the hard guarantee.
+		// Defect 1 fix: the cascade is a SERVER-OWNED background job, not a
+		// request-bound synchronous loop. The handler responds 200 + the frozen
+		// affected set IMMEDIATELY (job accepted); the job runs under bgCtx (so a
+		// cancelled/disconnected request — a mobile screen-off — does NOT cancel
+		// the cascade), retries transient per-id SetArchived failures under a
+		// bounded budget, is idempotent on re-issue for already-archived ids
+		// (SetArchived re-writes 200; RemoveSessionIfPresent/Cleanup are no-ops
+		// on absent ids), retains failed ids per-id (never RemoveSessions/Cleanup
+		// on failure), and hands permanently-stuck descendants to the orphan
+		// banner (Slices 1/2) while surfacing stuck roots as explicit failures.
+		// See runArchiveCascade for the full contract.
 		//
-		// LIFECYCLE (Issue A): this goroutine is OWNED by the Server, not the
-		// request. It captures its delay + bgCtx under bgMu BEFORE launch (so
-		// it never reads shared mutable state after dispatch — the prior read of
-		// a package global was a -race data race across tests), registers with
-		// bgWG so Server.Shutdown can await it, derives its RPC context from
-		// bgCtx (so Shutdown cancels it), and waits via a cancellable
-		// select on bgCtx.Done() instead of a bare time.Sleep. Dispatched
-		// async so it never delays the archive response.
+		// The C5 fence above ran synchronously and validated `affected` — that is
+		// the FROZEN job scope. The async job MUST NOT expand it: a post-acceptance
+		// spawn/reparent child is absent from this snapshot and is caught by the
+		// Slice 1/2 backstop sweep, never silently included here (no internal
+		// re-Descendants).
 		s.bgMu.Lock()
-		delay := s.reassertDelay
 		bgCtx := s.bgCtx
+		delay := s.reassertDelay
+		cfg := archiveRetryConfig{
+			budget: s.archiveRetryBudget,
+			base:   s.archiveRetryBase,
+			max:    s.archiveRetryMax,
+		}
 		s.bgWG.Add(1)
+		atomic.AddInt64(&s.archiveJobsActive, 1) // hoisted before launch: awaitArchiveJobs must see >=1
 		s.bgMu.Unlock()
-		go s.reassertArchive(bgCtx, delay, agg, affected, body.SessionID)
-		// Phase 4 Layer 1 — direct archive hook: a successfully-archived session
-		// (and its cascaded subtree in `affected`) is no longer active, so unpin
-		// it from the worker-wide PinStore and broadcast. This runs ONLY on the
-		// archive success path (SetArchived returned 200, or 404/410 for a
-		// session verifiably gone from OpenCode) — a failed archive returned 502
-		// above, before reaching here, so a still-active session is never
-		// unpinned by a failed archive. removePinsAndBroadcast is idempotent
-		// (RemoveIDs is a no-op when none of the ids are present, so IDs already
-		// absent from the live store — or already cleaned by the L2 subscriber
-		// that RemoveSessions' KindSessionDelete fires just above — cost nothing)
-		// and follows the uniform cleanup→broadcast rule. The unarchive branch
-		// above intentionally does NOT unpin: unarchive RESTORES a session.
-		s.removePinsAndBroadcast(affected)
+		go s.runArchiveCascade(bgCtx, agg, affected, body.SessionID, dir, delay, cfg)
 	}
 	writeJSONResp(w, map[string]any{"ok": true, "affected": affected})
 }
 
-// reassertArchive is the Server-owned post-archive re-assert (Issue A). It is
-// dispatched as a tracked goroutine (bgWG) by handleArchive; bgCtx is the
-// Server's background lifetime so Shutdown cancels and awaits it. delay is the
-// captured per-Server re-assert wait (read under bgMu at launch). srcID is the
-// originating session id, used only for logging.
+// runArchiveCascade is the Server-owned archive cascade job (Defect 1 fix). It
+// replaces the prior request-bound, abort-on-first-error synchronous loop with
+// a background goroutine that:
+//  1. survives mobile disconnect (runs under bgCtx, NOT the request context),
+//  2. retries transient per-id SetArchived failures (bounded budget + backoff),
+//  3. is idempotent on re-issue (SetArchived re-writes 200 on already-archived;
+//     RemoveSessionIfPresent/Cleanup are no-ops on absent ids — re-issuing a
+//     fully-archived root does no work and no duplicate cleanup; re-issuing a
+//     root that is STILL LIVE completes its remaining live descendants),
+//  4. retains failed ids (NEVER RemoveSessions/Cleanup on failure — per id),
+//  5. hands permanently-stuck DESCENDANTS to the orphan banner (Slices 1/2),
+//     and surfaces stuck ROOTS as explicit job failures (never fake orphans —
+//     the e88f19e false-positive gate).
+//
+// It also SUBSUMES the post-archive re-assert (Issue A): after the cascade loop,
+// it runs reassertArchiveWork for the successfully-archived ids (re-PATCHes any
+// id a busy/compacting subagent clobbered — SetArchived returned 200 but didn't
+// persist). The prior standalone reassertArchive dispatcher is retired: one
+// goroutine owns the whole archive lifecycle for this request, so there is no
+// double-archive and no second bgWG-tracked goroutine to coordinate.
+//
+// `affected` is the FROZEN job scope (captured at acceptance, after the C5
+// fence). The job MUST NOT expand it: post-acceptance spawn/reparent children
+// are absent from this snapshot and are caught by the Slice 1/2 backstop sweep,
+// not silently included here (no internal re-Descendants).
+//
+// Lifecycle: bgWG.Add(1) + archiveJobsActive increment happen in handleArchive
+// BEFORE launch; defer bgWG.Done() here, defer archiveJobsActive decrement here.
+// bgCtx is the Server's background lifetime so Shutdown cancels (via bgCancel)
+// AND awaits (via bgWG.Wait) the job. archiveJobsActive is a test seam
+// (awaitArchiveJobs polls it); production never reads it.
+func (s *Server) runArchiveCascade(bgCtx context.Context, agg *aggregator.Aggregator, affected []string, srcID, dir string, delay time.Duration, cfg archiveRetryConfig) {
+	defer s.bgWG.Done()
+	defer atomic.AddInt64(&s.archiveJobsActive, -1)
+
+	ts := time.Now().UnixMilli()
+	root, rootErr := projectRoot(dir)
+	succeeded := make([]string, 0, len(affected))
+	// F1 fix: capture the ORIGINAL parent chain for every id in the frozen scope
+	// BEFORE any RemoveSessions mutates the tree. classifyArchiveFailure uses
+	// this (plus the succeeded set) to recognize a failed descendant of a root
+	// archived by THIS job — the authoritative archivedSnapshot is not refreshed
+	// mid-job, and RemoveSessionIfPresent re-roots children, so
+	// ChainTerminatesAtArchived alone would misclassify a just-orphaned child as
+	// a root/unresolvable failure.
+	parentOf := make(map[string]string, len(affected))
+	for _, id := range affected {
+		if p := agg.Store().ParentOf(id); p != "" {
+			parentOf[id] = p
+		}
+	}
+	// succeededSet mirrors `succeeded` as a lookup for classifyArchiveFailure.
+	succeededSet := make(map[string]bool, len(affected))
+
+	for _, id := range affected {
+		if s.archiveOneID(bgCtx, agg, id, ts, srcID, cfg, succeededSet, parentOf) {
+			// Per-id retain-on-failure (non-negotiable): cleanup runs ONLY for
+			// this successful id. A failed id is never RemoveSessions'd — its
+			// queue state survives so a still-active session isn't muted. This
+			// mirrors the prior all-or-nothing retain-on-failure but applied
+			// per-id, so a partial cascade cleans up exactly what succeeded.
+			//
+			// F2 fix (concurrent-reissue CAS): RemoveSessionIfPresent returns
+			// true ONLY if THIS job actually deleted the id. A concurrent re-
+			// issue whose job already removed it returns false → skip
+			// CleanupSession (no double queue-cleanup — the RT4 contract).
+			if agg.Store().RemoveSessionIfPresent(id) {
+				if rootErr == nil {
+					s.queues.CleanupSession(root, safeID.ReplaceAllString(id, ""))
+				}
+			}
+			succeededSet[id] = true
+			succeeded = append(succeeded, id)
+		}
+		// archiveOneID already classified + recorded a terminal failure. The
+		// failed id stays live (retained) — the orphan sweep flags it if it is
+		// a descendant of an archived root; otherwise it remains a normal
+		// session with an explicit job-failure record.
+	}
+
+	if len(succeeded) > 0 {
+		// Phase 4 Layer 1 — unpin succeeded ids (idempotent; no-op if absent).
+		s.removePinsAndBroadcast(succeeded)
+		// Subsumed re-assert (Issue A): re-PATCH any succeeded id a busy
+		// subagent clobbered (200 returned but archived reverted to null).
+		s.reassertArchiveWork(bgCtx, delay, agg, succeeded, srcID)
+	}
+}
+
+// archiveOneID performs the bounded-retry SetArchived for a single id and
+// returns true on success, false on terminal failure. It NEVER RemoveSessions
+// or CleanupSession — the caller does that only on success (retain-on-failure).
+//
+// Success cases: SetArchived 200; 404/410 (ghost — verifiably gone); 409 where
+// a re-derive from OpenCode's authoritative list confirms the id is already
+// archived (a concurrent archive won).
+//
+// Terminal-failure handling: on a PERMANENT error (400/403) or budget
+// exhaustion, the id is classified. A DESCENDANT of an archived root — either
+// per the authoritative archivedSnapshot (Store.ChainTerminatesAtArchived, the
+// SAME authority Slices 1/2 use) OR per THIS job's succeeded set via the
+// captured parent chain (a root archived moments ago that is not yet in the
+// snapshot) — is LEFT live so the orphan sweep flags it (OrphanBanner surfaces
+// it). A ROOT or unresolvable chain is recorded as an explicit job failure
+// (recordArchiveFailure + structured log) and is NEVER orphan-flagged (e88f19e).
+//
+// Error classification (build-validate 5/6):
+//   - 404/410: ghost → success (no retry).
+//   - 409: re-derive; already-archived → success; else transient retry.
+//   - 400/403: permanent → terminal failure (no retry).
+//   - 401/429/5xx/network/unknown: transient → retry under budget.
+//
+// 409 assumption (build-validate 6): the fakeOC does not model a SetArchived
+// 409 with distinct semantics, so the re-derive rests on the assumption that a
+// 409 means a concurrent modification and that the authoritative
+// ListArchivedSessions distinguishes already-complete (id archived → count done)
+// from genuine retryable concurrency (id not archived → retry under budget).
+//
+// succeededSet + parentOf are the F1 fix: they let classifyArchiveFailure
+// recognize a descendant of a root archived by THIS job (see classifyArchiveFailure).
+func (s *Server) archiveOneID(bgCtx context.Context, agg *aggregator.Aggregator, id string, ts int64, srcID string, cfg archiveRetryConfig, succeededSet map[string]bool, parentOf map[string]string) bool {
+	for attempt := 1; attempt <= cfg.budget; attempt++ {
+		err := agg.Client().SetArchived(bgCtx, id, ts)
+		if err == nil {
+			return true // archived
+		}
+		var ocErr *opencode.Error
+		isOCErr := errors.As(err, &ocErr)
+		switch {
+		case isOCErr && (ocErr.Status == http.StatusNotFound || ocErr.Status == http.StatusGone):
+			// Ghost: verifiably gone → archive intent satisfied.
+			log.Printf("[archive] SetArchived(%s): %v (session gone — counted complete)", id, err)
+			return true
+		case isOCErr && ocErr.Status == http.StatusConflict:
+			// 409: re-derive from OpenCode's authoritative list. If the id is
+			// already archived there, the conflict is benign (concurrent archive
+			// won) → count complete. Otherwise fall through to transient retry.
+			if idArchivedInOpenCode(bgCtx, agg, id) {
+				log.Printf("[archive] SetArchived(%s): 409 but already archived in OpenCode (counted complete)", id)
+				return true
+			}
+			// Not yet archived → transient, retry under budget.
+		case isOCErr && (ocErr.Status == http.StatusBadRequest || ocErr.Status == http.StatusForbidden):
+			// Permanent client error → no retry will help. Record + classify.
+			s.classifyArchiveFailure(agg, id, srcID, fmt.Sprintf("permanent:%d", ocErr.Status), succeededSet, parentOf)
+			return false
+		default:
+			// 401/429/5xx/network/unknown → transient, retry under budget.
+		}
+		if attempt >= cfg.budget {
+			break // exhausted — classify below
+		}
+		// Transient: exponential backoff + jitter (cancellable via bgCtx).
+		select {
+		case <-time.After(archiveBackoff(cfg.base, cfg.max, attempt)):
+		case <-bgCtx.Done():
+			// Shutdown mid-retry: record + return. The id stays live (retained).
+			s.classifyArchiveFailure(agg, id, srcID, "cancelled:shutdown", succeededSet, parentOf)
+			return false
+		}
+	}
+	// Budget exhausted on a transient error. Classify the stuck id:
+	s.classifyArchiveFailure(agg, id, srcID, fmt.Sprintf("exhausted:%d", cfg.budget), succeededSet, parentOf)
+	return false
+}
+
+// classifyArchiveFailure records a terminal archive failure for id. A DESCENDANT
+// of an archived root is the recoverable case: it is left live so the Slice 1/2
+// orphan sweep flags it (OrphanBanner surfaces it) — it is NOT recorded as a job
+// failure (that would double-count the recovery affordance the banner already
+// provides). A ROOT or unresolvable chain is recorded (recordArchiveFailure) so
+// the operator has an explicit visibility surface (build-validate 4) and is NEVER
+// orphan-flagged (e88f19e gate).
+//
+// Descendant-of-archived is determined by TWO authorities (F1 fix):
+//  1. The authoritative archivedSnapshot (Store.ChainTerminatesAtArchived) — the
+//     cross-restart authority Slices 1/2 use. This catches a straggler whose
+//     parent was archived by a PRIOR job (or a prior run) and has since entered
+//     the snapshot via the periodic reconcile.
+//  2. THIS job's succeeded set, walked via the captured parentOf chain. A root
+//     archived moments ago by this job is NOT yet in the snapshot, and
+//     RemoveSessionIfPresent has already re-rooted the child — so authority 1
+//     alone returns false. The succeeded-set walk recognizes the just-orphaned
+//     child using the ORIGINAL parent chain captured before any mutation.
+func (s *Server) classifyArchiveFailure(agg *aggregator.Aggregator, id, srcID, reason string, succeededSet map[string]bool, parentOf map[string]string) {
+	// Authority 1: the authoritative archived snapshot (Slices 1/2).
+	if agg.Store().ChainTerminatesAtArchived(id) {
+		log.Printf("[archive] SetArchived(%s): %s; descendant of archived root (snapshot) — left live for orphan sweep (Slices 1/2)", id, reason)
+		return // the orphan banner surfaces this — do not double-record
+	}
+	// Authority 2: THIS job's succeeded set via the captured parent chain.
+	if descendantOfSucceeded(id, succeededSet, parentOf) {
+		log.Printf("[archive] SetArchived(%s): %s; descendant of archived root (this job) — left live for orphan sweep (Slices 1/2)", id, reason)
+		return // the orphan banner will surface this once the snapshot reconciles
+	}
+	s.recordArchiveFailure(id, srcID, reason)
+	log.Printf("[archive] SetArchived(%s): %s; root/unresolvable — explicit job failure (not orphan-flagged)", id, reason)
+}
+
+// descendantOfSucceeded walks the captured parentOf chain from id upward; if any
+// ancestor is in succeededSet, id is a descendant of a root archived by THIS job.
+// parentOf was captured at job start (before any RemoveSessionIfPresent mutated
+// the tree), so it still links a re-rooted child to its just-archived parent.
+// Bounded against cyclic parent links (defensive; malformed data).
+func descendantOfSucceeded(id string, succeeded map[string]bool, parentOf map[string]string) bool {
+	cur := id
+	for i := 0; i < 100; i++ {
+		p, ok := parentOf[cur]
+		if !ok || p == "" {
+			return false // cur is a root in the captured chain
+		}
+		if succeeded[p] {
+			return true
+		}
+		cur = p
+	}
+	return false // cycle guard
+}
+
+// recordArchiveFailure appends a stuck-root/unresolvable failure to the
+// registry (the build-validate-4 operator-visibility surface) and is the single
+// append site. Guarded by archiveFailuresMu.
+func (s *Server) recordArchiveFailure(id, srcID, reason string) {
+	s.archiveFailuresMu.Lock()
+	s.archiveFailures = append(s.archiveFailures, archiveJobFailure{
+		ID: id, Reason: reason, RootSrc: srcID, At: time.Now(),
+	})
+	s.archiveFailuresMu.Unlock()
+}
+
+// ArchiveFailures returns a snapshot copy of the recorded archive job failures
+// (stuck roots / unresolvable chains). Descendant-of-archived exhausted ids are
+// NOT here — the orphan banner surfaces them. Test + diagnostic surface; a
+// future job-status endpoint could expose this to the SPA.
+func (s *Server) ArchiveFailures() []archiveJobFailure {
+	s.archiveFailuresMu.Lock()
+	out := make([]archiveJobFailure, len(s.archiveFailures))
+	copy(out, s.archiveFailures)
+	s.archiveFailuresMu.Unlock()
+	return out
+}
+
+// idArchivedInOpenCode re-derives whether id is genuinely archived in OpenCode
+// by walking the authoritative archived-session list (the same list
+// archivedDescendants consumes). Used by the 409 re-derive path to distinguish
+// already-complete (count done) from genuine retryable concurrency. Returns
+// false on fetch error (→ retry under budget, never falsely counts complete).
+func idArchivedInOpenCode(ctx context.Context, agg *aggregator.Aggregator, id string) bool {
+	sessions, err := agg.Client().ListArchivedSessions(ctx)
+	if err != nil {
+		return false
+	}
+	for _, raw := range sessions {
+		var env struct {
+			ID   string `json:"id"`
+			Time struct {
+				Archived *float64 `json:"archived"`
+			} `json:"time"`
+		}
+		if json.Unmarshal(raw, &env) != nil || env.ID == "" {
+			continue
+		}
+		if env.ID == id && env.Time.Archived != nil && *env.Time.Archived != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// archiveBackoff returns the exponential backoff for a transient retry: base *
+// 2^(attempt-1), capped at max, with ±20% jitter. attempt is 1-indexed (the
+// FIRST retry follows attempt 1's backoff). math/rand/v2 is auto-seeded (Go
+// 1.22+), so this is nondeterministic by design — tests shrink base/max so the
+// jitter is immaterial to timing assertions.
+func archiveBackoff(base, max time.Duration, attempt int) time.Duration {
+	d := base
+	for i := 1; i < attempt && d < max; i++ {
+		d *= 2
+	}
+	if d > max {
+		d = max
+	}
+	// Jitter ±20% of d: offset ∈ [-d/5, +d/5].
+	halfRange := int64(d) / 5
+	if halfRange > 0 {
+		offset := rand.Int64N(halfRange*2+1) - halfRange
+		d += time.Duration(offset)
+	}
+	return d
+}
+
+// reassertArchiveWork is the post-archive re-assert body (Issue A), refactored
+// out of the prior standalone reassertArchive so the cascade job (which owns the
+// single bgWG Done) can call it inline after archiving the succeeded set. The
+// prior dispatcher is retired (runArchiveCascade subsumes it); this body retains
+// its delay wait, test seams (reassertReadyCh/reassertBlockCh), and the
+// re-list + re-PATCH loop unchanged.
 //
 // The delay wait is a cancellable select on bgCtx.Done() (not a bare
 // time.Sleep): if Shutdown runs during the delay window, the goroutine exits
-// promptly instead of running a full delay against a server that is already
-// shutting down. The RPC context is a timeout child of bgCtx, so the same
-// Shutdown cancellation propagates to an in-flight ListSessions/SetArchived.
-func (s *Server) reassertArchive(bgCtx context.Context, delay time.Duration, agg *aggregator.Aggregator, affected []string, srcID string) {
-	defer s.bgWG.Done()
+// promptly. The RPC context is a timeout child of bgCtx, so the same Shutdown
+// cancellation propagates to an in-flight ListSessions/SetArchived.
+func (s *Server) reassertArchiveWork(bgCtx context.Context, delay time.Duration, agg *aggregator.Aggregator, affected []string, srcID string) {
 	select {
 	case <-time.After(delay):
 	case <-bgCtx.Done():
@@ -276,7 +559,7 @@ func (s *Server) reassertArchive(bgCtx context.Context, delay time.Duration, agg
 	// receive. Everything else this goroutine does is ctx-bound, so bgCancel
 	// frees it immediately — which makes Shutdown's bgWG.Wait unobservable via
 	// timing. The pure block here is the one spot bgCancel CANNOT reach, so a
-	// test can hold the goroutine and prove the ONLY way Shutdown returns is by
+	// test can hold the job and prove the ONLY way Shutdown returns is by
 	// awaiting bgWG (cancel alone leaves it blocked here). Guarded by bgMu for
 	// the one-shot close of reassertReadyCh.
 	s.bgMu.Lock()

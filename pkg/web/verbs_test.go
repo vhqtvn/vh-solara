@@ -39,6 +39,30 @@ type fakeOC struct {
 	// call, in order — used by the archive re-assert test to assert a re-PATCH.
 	archivedPATCHes []string
 
+	// archiveFailNext (per-id transient-failure injection, RT1a): maps a session
+	// id to the number of transient (500) SetArchived failures to inject before
+	// succeeding. Each PATCH for that id with a remaining count >0 returns 500
+	// and decrements; once 0 the PATCH succeeds. nil/absent = no injection
+	// (existing behavior). Used by the archive cascade job retry test.
+	archiveFailNext map[string]int
+	// archiveStatusByID (per-id permanent status override, RT1c/RT1d): if an id
+	// is present, EVERY PATCH for it returns that status (e.g. 403 to model a
+	// permanent client error the job must NOT retry). Takes precedence over
+	// archiveFailNext and the global archiveStatus. nil/absent = no override.
+	archiveStatusByID map[string]int
+	// archiveBlockCh (F2 concurrent-reissue + RT1b request-cancellation test
+	// seam): when non-nil, a PATCH /session/:id blocks on <-ch BEFORE responding,
+	// OUTSIDE f.mu so concurrent jobs' SetArchived calls overlap or so a test can
+	// pin the bg job in-flight. The test closes the channel to release. nil = no
+	// block.
+	archiveBlockCh chan struct{}
+	// archiveReachedCh (RT1b crux seam): when non-nil, the PATCH handler does a
+	// non-blocking send BEFORE blocking on archiveBlockCh, so a test can observe
+	// that the bg job has reached (and is now blocked inside) SetArchived — the
+	// exact point at which to cancel the REQUEST context to prove the job
+	// survives disconnect. nil = no signal.
+	archiveReachedCh chan struct{}
+
 	// deleteStatus: if non-zero, DELETE /session/:id (DeleteSession) returns
 	// this status (delete failure simulation). deleteIDs records the ids of
 	// every DELETE call, in order — used by the delete tests to assert the
@@ -95,6 +119,25 @@ func (f *fakeOC) handler() http.Handler {
 	})
 	mux.HandleFunc("/session/", func(w http.ResponseWriter, r *http.Request) {
 		p := r.URL.Path
+		// F2 concurrent-reissue test seam: block PATCH OUTSIDE f.mu so two
+		// concurrent jobs' SetArchived calls overlap (the CAS race window).
+		if r.Method == http.MethodPatch {
+			f.mu.Lock()
+			ch := f.archiveBlockCh
+			reached := f.archiveReachedCh
+			f.mu.Unlock()
+			if ch != nil {
+				// RT1b crux seam: signal that the bg job has reached a blocked
+				// SetArchived (non-blocking — only the first receiver observes it).
+				if reached != nil {
+					select {
+					case reached <- struct{}{}:
+					default:
+					}
+				}
+				<-ch
+			}
+		}
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		switch {
@@ -142,6 +185,19 @@ func (f *fakeOC) handler() http.Handler {
 			}
 			if id != "" {
 				f.archivedPATCHes = append(f.archivedPATCHes, id)
+			}
+			// Per-id permanent override (RT1c/RT1d): always return this status.
+			if f.archiveStatusByID != nil {
+				if st, ok := f.archiveStatusByID[id]; ok && st != 0 {
+					w.WriteHeader(st)
+					return
+				}
+			}
+			// Per-id transient injection (RT1a): count down failures → 500.
+			if f.archiveFailNext != nil && f.archiveFailNext[id] > 0 {
+				f.archiveFailNext[id]--
+				w.WriteHeader(http.StatusInternalServerError)
+				return
 			}
 			if f.archiveStatus != 0 {
 				w.WriteHeader(f.archiveStatus)

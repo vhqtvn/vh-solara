@@ -118,6 +118,10 @@ func TestArchiveDrift_SpawnBetweenPreviewAndCommit(t *testing.T) {
 // proceeds normally (the fence is transparent when nothing changed).
 func TestArchiveDrift_MatchingFingerprint_Archives(t *testing.T) {
 	f := &fakeOC{}
+	// Report the affected ids as archived in OpenCode so the (now-async)
+	// reassert phase is a no-op — keeps the PATCH-count assertion crisp at
+	// exactly the 2 cascade PATCHes.
+	f.listSessionsReply = []byte(`[{"id":"s1","time":{"archived":1}},{"id":"c1","time":{"archived":1}}]`)
 	web, agg, srv, _ := queueLifecycleServer(t, f)
 	srv.SetReassertDelay(5 * time.Millisecond)
 	agg.Store().Apply(ev("session.created", `{"info":{"id":"s1","title":"root"}}`))
@@ -134,6 +138,9 @@ func TestArchiveDrift_MatchingFingerprint_Archives(t *testing.T) {
 	if len(affected) != 2 || !containsAny(affected, "s1") || !containsAny(affected, "c1") {
 		t.Fatalf("matching-fingerprint affected: want [s1 c1], got %v", affected)
 	}
+	// The cascade is async — wait for the bg job before asserting PATCHes +
+	// store removal (POST returns 200 immediately on job acceptance).
+	srv.awaitArchiveJobs(t, 5*time.Second)
 	// Archive really happened.
 	if patches := archivedPATCHes(f); len(patches) != 2 {
 		t.Fatalf("matching fingerprint: want 2 SetArchived PATCHes [s1 c1], got %v", patches)
@@ -149,6 +156,9 @@ func TestArchiveDrift_MatchingFingerprint_Archives(t *testing.T) {
 // archive proceeds. This matches the If-Idle-Seq opt-in precedent (verbs.go).
 func TestArchiveDrift_AbsentFingerprint_BackwardCompat(t *testing.T) {
 	f := &fakeOC{}
+	// Report the affected ids as archived so the async reassert is a no-op
+	// (crisp PATCH-count assertion at exactly the 3 cascade PATCHes).
+	f.listSessionsReply = []byte(`[{"id":"s1","time":{"archived":1}},{"id":"c1","time":{"archived":1}},{"id":"c2","time":{"archived":1}}]`)
 	web, agg, srv, _ := queueLifecycleServer(t, f)
 	srv.SetReassertDelay(5 * time.Millisecond)
 	agg.Store().Apply(ev("session.created", `{"info":{"id":"s1"}}`))
@@ -165,6 +175,8 @@ func TestArchiveDrift_AbsentFingerprint_BackwardCompat(t *testing.T) {
 	if len(affected) != 3 {
 		t.Fatalf("absent fingerprint: want 3 affected (current behavior, all live), got %v", affected)
 	}
+	// Async cascade — wait for the bg job before counting PATCHes.
+	srv.awaitArchiveJobs(t, 5*time.Second)
 	if len(archivedPATCHes(f)) != 3 {
 		t.Fatalf("absent fingerprint: want 3 SetArchived PATCHes, got %v", archivedPATCHes(f))
 	}
