@@ -27,6 +27,7 @@ import { closeSessionStream } from "./session-stream";
 import { resetPageInFlight } from "./history";
 import { resetTreeStore, clearUserToggled, applyTreeOpStore } from "./treeState";
 import { resetLabelsScope } from "../labels";
+import { resetArchiveFailuresScope } from "../archiveFailures";
 
 // Selecting any real session leaves draft mode.
 //
@@ -113,6 +114,17 @@ export function switchProject(dir: string, fromUrl = false) {
   // drops the late response). Sits alongside resetTreeStore so both the no-dir
   // teardown and the switch reconnect clear, mirroring the session/tree resets.
   resetLabelsScope();
+  // Per-project archive-failures (archive-failure-visibility feature): each
+  // project has its own stuck-root registry + its own archive-failures.snapshot
+  // bootstrap. Clear the outgoing project's failures IMMEDIATELY — before
+  // connect() opens the incoming project's stream — so A's stuck-root banner is
+  // gone before B connects. Without this, a no-project switch ('') renders A's
+  // banner INDEFINITELY (connect early-returns on empty dir → no snapshot), and
+  // an A→B switch leaks A's failures into B's banner until B's snapshot lands.
+  // resetArchiveFailuresScope also bumps archiveFailuresScopeGen so any in-flight
+  // frame from A is dropped on arrival (defense-in-depth; the primary guard is
+  // treeGen at the transport listener). Mirrors resetLabelsScope precisely.
+  resetArchiveFailuresScope();
   if (!dir) {
     // No-project state: tear down both streams so nothing keeps bridging the old
     // project (or cwd). connect() would no-op too, but closing the session

@@ -62,17 +62,35 @@ type archiveRetryConfig struct {
 
 // archiveJobFailure records an id that reached terminal failure in a cascade
 // job. This is the operator-visibility surface for stuck ROOTS (build-validate
-// 4): a structured log fires per failure, and this registry is the seed a
-// future job-status endpoint could expose. A DESCENDANT-of-archived id that
-// exhausted its budget is NOT recorded here — the orphan banner (Slices 1/2)
-// surfaces it instead, and recording it as a "failure" would double-count the
-// recovery affordance. ArchiveFailures returns a snapshot copy for tests /
-// diagnostics.
+// 4): a structured log fires per failure, and this registry is the seed the
+// archive-failures SSE snapshot/updated frames (Slice 1) expose to the mobile
+// SPA. A DESCENDANT-of-archived id that exhausted its budget is NOT recorded
+// here — the orphan banner (Slices 1/2) surfaces it instead, and recording it
+// as a "failure" would double-count the recovery affordance.
+//
+// The registry is a per-project (Dir, ID) composite-keyed UPSERT map (Slice 1
+// reshape): a repeat permanent failure for the same (Dir,ID) refreshes one
+// coherent record (Reason/At), NOT a duplicate append. Dir is the reqDir value
+// captured at handleArchive (the originating POST's project); "" is the default
+// project. Tenant isolation: the SSE snapshot + updated frames are filtered to
+// one project's Dir — a failure in project A never reaches project B's stream.
+// ArchiveFailures returns a snapshot copy (all projects, sorted) for tests /
+// diagnostics; ArchiveFailuresForDir is the per-project wire-DTO builder.
 type archiveJobFailure struct {
+	Dir     string // the project dir (reqDir at record time); "" is the default project
 	ID      string
-	Reason  string // "permanent:403", "exhausted:5", "cancelled:shutdown"
+	Reason  string // "permanent:403", "exhausted:5", "cancelled:shutdown" — classified token only
 	RootSrc string // the originating POST /vh/archive sessionID
 	At      time.Time
+}
+
+// archiveFailureKey is the composite upsert key for the archiveFailures map: one
+// coherent record per (project, stuck-root). A repeat permanent failure for the
+// same key UPSERTS (refreshes Reason/At), so the operator sees one banner, not
+// an append-log of duplicates.
+type archiveFailureKey struct {
+	Dir string
+	ID  string
 }
 
 // Archiving uses OpenCode's NATIVE archive (PATCH /session/:id time.archived):
@@ -306,7 +324,7 @@ func (s *Server) runArchiveCascade(bgCtx context.Context, agg *aggregator.Aggreg
 	succeededSet := make(map[string]bool, len(affected))
 
 	for _, id := range affected {
-		if s.archiveOneID(bgCtx, agg, id, ts, srcID, cfg, succeededSet, parentOf) {
+		if s.archiveOneID(bgCtx, agg, id, ts, srcID, dir, cfg, succeededSet, parentOf) {
 			// Per-id retain-on-failure (non-negotiable): cleanup runs ONLY for
 			// this successful id. A failed id is never RemoveSessions'd — its
 			// queue state survives so a still-active session isn't muted. This
@@ -317,6 +335,19 @@ func (s *Server) runArchiveCascade(bgCtx context.Context, agg *aggregator.Aggreg
 			// true ONLY if THIS job actually deleted the id. A concurrent re-
 			// issue whose job already removed it returns false → skip
 			// CleanupSession (no double queue-cleanup — the RT4 contract).
+			//
+			// Slice 1 clear-on-success (LOAD-BEARING): this `if true` block is
+			// the success funnel ALL three success branches (200-ok, 404/410-
+			// ghost, 409-already-archived) fall through to — archiveOneID
+			// returns true only on genuine archive completion. A stuck-root
+			// record for (dir,id) recorded by a PRIOR failed attempt is
+			// resolved HERE, so the mobile banner clears the moment a retry
+			// actually succeeds. NEVER clear at the 200-accepted handler
+			// response (archive.go handleArchive) — acceptance ≠ success (the
+			// cascade runs async under bgCtx; the handler returns before any
+			// SetArchived). clearArchiveFailure is a no-op when no record
+			// exists (the happy path), so this is cheap on first-success.
+			s.clearArchiveFailure(dir, id)
 			if agg.Store().RemoveSessionIfPresent(id) {
 				if rootErr == nil {
 					s.queues.CleanupSession(root, safeID.ReplaceAllString(id, ""))
@@ -371,7 +402,11 @@ func (s *Server) runArchiveCascade(bgCtx context.Context, agg *aggregator.Aggreg
 //
 // succeededSet + parentOf are the F1 fix: they let classifyArchiveFailure
 // recognize a descendant of a root archived by THIS job (see classifyArchiveFailure).
-func (s *Server) archiveOneID(bgCtx context.Context, agg *aggregator.Aggregator, id string, ts int64, srcID string, cfg archiveRetryConfig, succeededSet map[string]bool, parentOf map[string]string) bool {
+//
+// dir is the project dir (reqDir at handleArchive), threaded through to
+// classifyArchiveFailure → recordArchiveFailure so the stuck-root record lands
+// under the correct (dir,id) composite key (tenant isolation).
+func (s *Server) archiveOneID(bgCtx context.Context, agg *aggregator.Aggregator, id string, ts int64, srcID, dir string, cfg archiveRetryConfig, succeededSet map[string]bool, parentOf map[string]string) bool {
 	for attempt := 1; attempt <= cfg.budget; attempt++ {
 		err := agg.Client().SetArchived(bgCtx, id, ts)
 		if err == nil {
@@ -395,7 +430,7 @@ func (s *Server) archiveOneID(bgCtx context.Context, agg *aggregator.Aggregator,
 			// Not yet archived → transient, retry under budget.
 		case isOCErr && (ocErr.Status == http.StatusBadRequest || ocErr.Status == http.StatusForbidden):
 			// Permanent client error → no retry will help. Record + classify.
-			s.classifyArchiveFailure(agg, id, srcID, fmt.Sprintf("permanent:%d", ocErr.Status), succeededSet, parentOf)
+			s.classifyArchiveFailure(agg, dir, id, srcID, fmt.Sprintf("permanent:%d", ocErr.Status), succeededSet, parentOf)
 			return false
 		default:
 			// 401/429/5xx/network/unknown → transient, retry under budget.
@@ -408,12 +443,12 @@ func (s *Server) archiveOneID(bgCtx context.Context, agg *aggregator.Aggregator,
 		case <-time.After(archiveBackoff(cfg.base, cfg.max, attempt)):
 		case <-bgCtx.Done():
 			// Shutdown mid-retry: record + return. The id stays live (retained).
-			s.classifyArchiveFailure(agg, id, srcID, "cancelled:shutdown", succeededSet, parentOf)
+			s.classifyArchiveFailure(agg, dir, id, srcID, "cancelled:shutdown", succeededSet, parentOf)
 			return false
 		}
 	}
 	// Budget exhausted on a transient error. Classify the stuck id:
-	s.classifyArchiveFailure(agg, id, srcID, fmt.Sprintf("exhausted:%d", cfg.budget), succeededSet, parentOf)
+	s.classifyArchiveFailure(agg, dir, id, srcID, fmt.Sprintf("exhausted:%d", cfg.budget), succeededSet, parentOf)
 	return false
 }
 
@@ -435,7 +470,7 @@ func (s *Server) archiveOneID(bgCtx context.Context, agg *aggregator.Aggregator,
 //     RemoveSessionIfPresent has already re-rooted the child — so authority 1
 //     alone returns false. The succeeded-set walk recognizes the just-orphaned
 //     child using the ORIGINAL parent chain captured before any mutation.
-func (s *Server) classifyArchiveFailure(agg *aggregator.Aggregator, id, srcID, reason string, succeededSet map[string]bool, parentOf map[string]string) {
+func (s *Server) classifyArchiveFailure(agg *aggregator.Aggregator, dir, id, srcID, reason string, succeededSet map[string]bool, parentOf map[string]string) {
 	// Authority 1: the authoritative archived snapshot (Slices 1/2).
 	if agg.Store().ChainTerminatesAtArchived(id) {
 		log.Printf("[archive] SetArchived(%s): %s; descendant of archived root (snapshot) — left live for orphan sweep (Slices 1/2)", id, reason)
@@ -446,7 +481,7 @@ func (s *Server) classifyArchiveFailure(agg *aggregator.Aggregator, id, srcID, r
 		log.Printf("[archive] SetArchived(%s): %s; descendant of archived root (this job) — left live for orphan sweep (Slices 1/2)", id, reason)
 		return // the orphan banner will surface this once the snapshot reconciles
 	}
-	s.recordArchiveFailure(id, srcID, reason)
+	s.recordArchiveFailure(dir, id, srcID, reason)
 	log.Printf("[archive] SetArchived(%s): %s; root/unresolvable — explicit job failure (not orphan-flagged)", id, reason)
 }
 
@@ -470,25 +505,72 @@ func descendantOfSucceeded(id string, succeeded map[string]bool, parentOf map[st
 	return false // cycle guard
 }
 
-// recordArchiveFailure appends a stuck-root/unresolvable failure to the
-// registry (the build-validate-4 operator-visibility surface) and is the single
-// append site. Guarded by archiveFailuresMu.
-func (s *Server) recordArchiveFailure(id, srcID, reason string) {
+// recordArchiveFailure UPSERTS a stuck-root/unresolvable failure into the
+// per-project (dir,id) registry (Slice 1 reshape). A repeat permanent failure
+// for the same (dir,id) refreshes Reason/At/RootSrc on ONE coherent record —
+// not a duplicate append — so the mobile banner shows one entry per stuck
+// root, not a log of every retry. Guards the registry under archiveFailuresMu,
+// then fans the updated per-project doc out to live subscribers AFTER releasing
+// the lock (no lock held across the emit; the fan-out is in-process, no
+// OpenCode HTTP I/O — mirrors sweepOrphansLocked fetch-outside-lock discipline).
+func (s *Server) recordArchiveFailure(dir, id, srcID, reason string) {
 	s.archiveFailuresMu.Lock()
-	s.archiveFailures = append(s.archiveFailures, archiveJobFailure{
-		ID: id, Reason: reason, RootSrc: srcID, At: time.Now(),
-	})
+	s.archiveFailures[archiveFailureKey{Dir: dir, ID: id}] = archiveJobFailure{
+		Dir: dir, ID: id, Reason: reason, RootSrc: srcID, At: time.Now(),
+	}
+	doc := s.archiveFailuresDocForDirLocked(dir)
 	s.archiveFailuresMu.Unlock()
+	s.fanOutArchiveFailuresUpdate(dir, doc)
 }
 
-// ArchiveFailures returns a snapshot copy of the recorded archive job failures
-// (stuck roots / unresolvable chains). Descendant-of-archived exhausted ids are
-// NOT here — the orphan banner surfaces them. Test + diagnostic surface; a
-// future job-status endpoint could expose this to the SPA.
+// clearArchiveFailure removes a resolved failure for (dir,id) — the success-
+// funnel counterpart of recordArchiveFailure. Called ONLY at the success
+// funnel (runArchiveCascade's `if archiveOneID(...)` block — the chokepoint all
+// three success branches fall through), NEVER at the 200-accepted handler
+// response (acceptance ≠ success). No-op when no record exists (the happy
+// path — first-success on a never-stuck id); the fan-out is GATED on an actual
+// deletion so a cascade over N never-stuck ids emits ZERO needless empty-set
+// SSE frames (only a lock+lookup+unlock per id). Fans the cleared doc out to
+// live subscribers after releasing the lock so every connected client removes
+// the warning. The narrow "exhausted + later OOB-delete/archive" ghost-failure
+// window (record exists, root later archived outside this daemon) is the
+// Slice-2 backstop's job — Slice 1 has no backstop, so a stale warning may
+// persist there until daemon restart (bounded + self-healing).
+func (s *Server) clearArchiveFailure(dir, id string) {
+	s.archiveFailuresMu.Lock()
+	key := archiveFailureKey{Dir: dir, ID: id}
+	if _, ok := s.archiveFailures[key]; !ok {
+		s.archiveFailuresMu.Unlock()
+		return // no record → no broadcast (happy path: never-stuck id succeeds)
+	}
+	delete(s.archiveFailures, key)
+	doc := s.archiveFailuresDocForDirLocked(dir)
+	s.archiveFailuresMu.Unlock()
+	s.fanOutArchiveFailuresUpdate(dir, doc)
+}
+
+// ArchiveFailures returns a snapshot copy of ALL recorded archive job failures
+// (all projects, sorted by Dir then At then ID for deterministic test output).
+// Diagnostic + test surface; the SSE wire path uses archiveFailuresDocForDir
+// (per-project, the DTO shape). Existing tests assert only `fl.ID == "x"` and
+// are Dir-agnostic, so this keeps working after the registry → map reshape.
+// Descendant-of-archived exhausted ids are NOT here — the orphan banner
+// surfaces them.
 func (s *Server) ArchiveFailures() []archiveJobFailure {
 	s.archiveFailuresMu.Lock()
-	out := make([]archiveJobFailure, len(s.archiveFailures))
-	copy(out, s.archiveFailures)
+	out := make([]archiveJobFailure, 0, len(s.archiveFailures))
+	for _, fl := range s.archiveFailures {
+		out = append(out, fl)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Dir != out[j].Dir {
+			return out[i].Dir < out[j].Dir
+		}
+		if !out[i].At.Equal(out[j].At) {
+			return out[i].At.Before(out[j].At)
+		}
+		return out[i].ID < out[j].ID
+	})
 	s.archiveFailuresMu.Unlock()
 	return out
 }

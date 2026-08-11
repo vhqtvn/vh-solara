@@ -8,6 +8,7 @@ import SessionTree from "./SessionTree";
 import ArchivedDialog from "./ArchivedDialog";
 import ProjectSwitcher from "./ProjectSwitcher";
 import OrphanBanner from "./OrphanBanner";
+import ArchiveFailureBanner from "./ArchiveFailureBanner";
 import HelpInspector from "./HelpInspector";
 import StatusMark from "./StatusMark";
 import Icon from "./Icon";
@@ -287,6 +288,13 @@ export default function Sidebar(props: { open: boolean; onClose: () => void }) {
         </div>
       </Show>
       <OrphanBanner />
+      {/* Archive-failure banner (Slice 1): surfaces PERMANENTLY-STUCK archive
+          ROOTS (retry-exhausted / OpenCode 400-403) — distinct from OrphanBanner
+          (which surfaces descendants of a successfully-archived root). Renders
+          from the archiveFailures() SSE signal, NOT the client tree (the tree
+          eager-prunes accepted ids — Q5). Mounted right after OrphanBanner so
+          both warning surfaces stack together above the session tree. */}
+      <ArchiveFailureBanner />
       {/* Pin sync error (dismissible). Surfaces pinsLastError() from the
           server-backed pin facade: a 409 the retry could not resolve, or a
           network/other PUT failure. Self-clears on the next successful mutation

@@ -315,11 +315,14 @@ type Server struct {
 	// shutdown cancellation). A descendant-of-archived exhausted id is NOT
 	// recorded here — the orphan banner (Slices 1/2) surfaces it, and recording
 	// it as a failure would double-count the recovery affordance. This is the
-	// build-validate-4 operator-visibility surface: a structured log fires per
-	// failure, and this registry is the seed a future job-status endpoint could
-	// expose. Guarded by archiveFailuresMu.
+	// Slice-1 operator-visibility surface: the archive-failures.snapshot (SSE
+	// bootstrap) + archive-failures.updated (record/clear fan-out) frames drive
+	// the mobile ArchiveFailureBanner. The registry is a per-project (dir,id)
+	// composite-keyed UPSERT map (one coherent record per stuck root, refreshed
+	// on repeat permanent failure — not an append-log). In-memory + current-
+	// daemon-only (no persistence). Guarded by archiveFailuresMu.
 	archiveFailuresMu sync.Mutex
-	archiveFailures   []archiveJobFailure
+	archiveFailures   map[archiveFailureKey]archiveJobFailure
 
 	// lifecycleWG tracks the Server-owned per-directory lifecycle goroutines so
 	// Shutdown can AWAIT (not merely cancel) them: every permission watcher (all
@@ -534,6 +537,7 @@ func NewServer(agg *aggregator.Aggregator, opencodeURL string, ringCapacity int)
 		archiveRetryBudget: defaultArchiveRetryBudget,
 		archiveRetryBase:   defaultArchiveRetryBase,
 		archiveRetryMax:    defaultArchiveRetryMax,
+		archiveFailures:    map[archiveFailureKey]archiveJobFailure{},
 	}
 	// Arm the DEFAULT aggregator synchronously, BEFORE the server can serve
 	// any HTTP request. The default aggregator is created in the daemon
@@ -2562,6 +2566,27 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	} else {
 		vhlog.Warn("labels.snapshot bootstrap: marshal failed, skipping labels frame", "err", err)
 	}
+	// Slice 1 (archive-failure visibility): bootstrap the per-project archive-
+	// failures view for THIS stream's project on EVERY fresh /vh/stream connect,
+	// the direct analogue of the labels.snapshot block above (and per-project
+	// like labels, NOT worker-wide like pins). The registry is in-memory +
+	// current-daemon-only (no persistence, no replay ring), so a reconnecting
+	// client catches up on stuck archive roots via THIS snapshot frame (live
+	// record/clear arrive later as transient archive-failures.updated frames,
+	// also not replayed). Emitted with NO id line AFTER the labels snapshot,
+	// BEFORE the live-tail loop drains the subscribe channel (same ordering
+	// guarantee as pins/labels: SubscribeWith already created `ch`, so a
+	// mutation landing between this snapshot read and the live-tail drain is
+	// covered EITHER by this snapshot OR by the queued live updated frame).
+	// Filtered to reqDir(r) — only this project's failures cross the wire
+	// (tenant isolation). The DTO carries classified reason tokens only (never
+	// raw opencode.Error.Body).
+	streamArchiveFailuresDoc := s.archiveFailuresDocForDir(reqDir(r))
+	if afb, err := json.Marshal(streamArchiveFailuresDoc); err == nil {
+		writeRawNoID(w, "archive-failures.snapshot", afb)
+	} else {
+		vhlog.Warn("archive-failures.snapshot bootstrap: marshal failed, skipping frame", "err", err)
+	}
 	flusher.Flush()
 
 	// 15s keepalive ping ticker. A NAMED ping event (not an SSE `:` comment) so
@@ -2577,18 +2602,20 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 				discReason = diag.DiscSubscriberChannelClosed // PROBE 3
 				return                                        // dropped as a slow consumer; client will reconnect + resume
 			}
-			if ev.Kind == state.KindNotice || ev.Kind == kindPinsUpdated || ev.Kind == kindLabelsUpdated {
+			if ev.Kind == state.KindNotice || ev.Kind == kindPinsUpdated || ev.Kind == kindLabelsUpdated || ev.Kind == kindArchiveFailuresUpdated {
 				// Transient fan-out (state.KindNotice, the Phase 3
-				// pins.updated full-state frame, or the Slice 3
-				// labels.updated full-state frame): not part of the replayable
-				// view and it reuses the current head seq, so forward it
-				// WITHOUT the seq-baseline guard and WITHOUT an id line (don't
-				// move the resume cursor). A resuming client never replays it —
-				// pins/labels catch up via the snapshot bootstrap frames emitted
-				// above on connect. The SSE event name is ev.Kind itself, so a
-				// notice stays "notice", a pins.updated becomes "pins.updated",
-				// and a labels.updated becomes "labels.updated" — the client
-				// dispatches on the name.
+				// pins.updated full-state frame, the Slice 3 labels.updated
+				// full-state frame, or the Slice 1 archive-failures.updated
+				// full-state frame): not part of the replayable view and it
+				// reuses the current head seq, so forward it WITHOUT the
+				// seq-baseline guard and WITHOUT an id line (don't move the
+				// resume cursor). A resuming client never replays it —
+				// pins/labels/archive-failures catch up via the snapshot
+				// bootstrap frames emitted above on connect. The SSE event name
+				// is ev.Kind itself, so a notice stays "notice", a pins.updated
+				// becomes "pins.updated", a labels.updated becomes
+				// "labels.updated", and an archive-failures.updated becomes
+				// "archive-failures.updated" — the client dispatches on the name.
 				writeRawNoID(w, ev.Kind, ev.Payload)
 				flusher.Flush()
 				continue

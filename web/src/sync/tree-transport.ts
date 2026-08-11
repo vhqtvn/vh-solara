@@ -76,6 +76,7 @@ import { seedTreeStore, applyTreeOpStore, expandedButUnloadedIds } from "./treeS
 import type { TreeOp, TreeNode } from "./treeMap";
 import { applyPinsSnapshot, applyPinsUpdated } from "../pins";
 import { applyLabelsSnapshot, applyLabelsUpdated } from "../labels";
+import { applyArchiveFailuresSnapshot, applyArchiveFailuresUpdated } from "../archiveFailures";
 import { decodeSnapshot } from "./decode";
 import { applySnapshot, applyScopedSnapshot, applySessionEvent, applyMessageEvent } from "./reconcile";
 import { refreshOpenSessions } from "./refresh";
@@ -1349,6 +1350,40 @@ function registerAuxiliaryListeners(es: EventSource, gen: number): void {
       return;
     }
     applyLabelsUpdated(raw);
+  });
+  // archive-failures.* — the per-project stuck-archive-ROOT registry (Slice 1).
+  // Same transient contract as labels.* (no `id:` line, not in the replay ring;
+  // reconnect catches up via archive-failures.snapshot). Disjoint from tree/
+  // detail/pins/labels state (the archiveFailures facade owns its signal), so
+  // these are NOT subject to treeSnapshotDecoding serialization or the busy
+  // gate — only the connection-generation guard and the liveness clock apply,
+  // mirroring the labels.* listeners above. The frames are ALREADY filtered
+  // server-side to reqDir (tenant isolation), so no client-side dir filtering.
+  // No revision guard (the registry has no revision — each frame is the full
+  // per-project set applied by replacement).
+  es.addEventListener("archive-failures.snapshot", (e) => {
+    if (gen !== treeGen) return;
+    markTreeSeen();
+    let raw: unknown;
+    try {
+      raw = JSON.parse((e as MessageEvent).data);
+    } catch (err) {
+      log.warn("sync", "malformed archive-failures.snapshot frame", { err });
+      return;
+    }
+    applyArchiveFailuresSnapshot(raw);
+  });
+  es.addEventListener("archive-failures.updated", (e) => {
+    if (gen !== treeGen) return;
+    markTreeSeen();
+    let raw: unknown;
+    try {
+      raw = JSON.parse((e as MessageEvent).data);
+    } catch (err) {
+      log.warn("sync", "malformed archive-failures.updated frame", { err });
+      return;
+    }
+    applyArchiveFailuresUpdated(raw);
   });
   // Transport-only: refresh treeLastSeen (and the debug mirror) but NOT
   // treeContentSeen, so a ping-only stream (transport alive, zero content) lets

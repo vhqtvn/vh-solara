@@ -313,6 +313,14 @@ func TestEndToEndAggregateAndServe(t *testing.T) {
 		t.Fatalf("expected labels.snapshot bootstrap after pins.snapshot, got %q", ev)
 	}
 
+	// Slice 1 (archive-failure visibility): an archive-failures.snapshot bootstrap
+	// frame is emitted after labels.snapshot. Consume it so the next read is the
+	// live event, not the archive-failures frame. (Third snapshot domain added
+	// to the cold-reconnect bootstrap — see build-validate item 1.)
+	if ev := readSSEEvent(t, reader); ev != "archive-failures.snapshot" {
+		t.Fatalf("expected archive-failures.snapshot bootstrap after labels.snapshot, got %q", ev)
+	}
+
 	// Push a live session.created via the fake event stream.
 	fake.events <- `{"type":"session.created","properties":{"info":{"id":"root2","title":"Second root"}}}`
 	gotLive := readSSEEvent(t, reader)

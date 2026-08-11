@@ -1,0 +1,100 @@
+/* Archive-failure banner (permanently-stuck archive ROOTS — distinct from the
+   orphan banner, which surfaces descendants whose root archived successfully).
+   Mobile-first: the expanded list is capped + scrollable so multiple failures
+   (+ a potential orphan banner) never saturate a small viewport. */
+.af-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 4px 8px;
+  padding: 6px 10px;
+  border: 1px solid color-mix(in srgb, var(--error, var(--warn)) 45%, var(--border));
+  background: color-mix(in srgb, var(--error, var(--warn)) 12%, transparent);
+  border-radius: 8px;
+  font-size: var(--text-sm);
+}
+.af-banner-text { display: inline-flex; align-items: center; gap: 6px; color: var(--fg); flex: 1; }
+.af-banner-btn {
+  flex: none;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--fg);
+  border-radius: 6px;
+  padding: 3px 10px;
+  cursor: pointer;
+}
+.af-banner-btn:hover { background: color-mix(in srgb, var(--fg) 10%, transparent); }
+
+/* Expanded detail list — capped height + scroll so N failures don't overflow a
+   phone screen alongside the orphan banner + sidebar chrome. */
+.af-list {
+  margin: 0 8px 4px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-top: none;
+  border-radius: 0 0 8px 8px;
+  background: var(--bg);
+  max-height: 240px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.af-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
+}
+.af-row:last-of-type { border-bottom: none; }
+.af-row-main { flex: 1; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.af-row-id {
+  font-size: var(--text-sm);
+  color: var(--fg);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.af-row-reason {
+  /* The classified reason token renders verbatim (a diagnostic, not prose).
+     NEVER raw opencode.Error.Body — the client never receives it. */
+  font-size: 11px;
+  color: var(--fg-dim);
+  font-family: var(--font-mono, monospace);
+}
+.af-row-actions { display: flex; align-items: center; gap: 4px; flex: none; }
+.af-row-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--fg);
+  border-radius: 6px;
+  padding: 3px 10px;
+  cursor: pointer;
+  font-size: var(--text-sm);
+}
+.af-row-btn:hover:not(:disabled) { background: color-mix(in srgb, var(--fg) 10%, transparent); }
+.af-row-btn:disabled { opacity: 0.5; cursor: default; }
+.af-row-dismiss {
+  background: transparent;
+  border: none;
+  color: var(--fg-dim);
+  cursor: pointer;
+  padding: 2px;
+  display: inline-flex;
+  align-items: center;
+}
+.af-row-dismiss:hover { color: var(--fg); }
+.af-retry-all {
+  align-self: flex-end;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--fg);
+  border-radius: 6px;
+  padding: 4px 12px;
+  cursor: pointer;
+  font-size: var(--text-sm);
+  margin-top: 2px;
+}
+.af-retry-all:hover:not(:disabled) { background: color-mix(in srgb, var(--fg) 10%, transparent); }
+.af-retry-all:disabled { opacity: 0.5; cursor: default; }

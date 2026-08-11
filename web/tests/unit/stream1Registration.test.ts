@@ -143,6 +143,8 @@ function node(id: string, parentId: string | null = null): any {
 const EXPECTED_TREE_LISTENER_KINDS = [
   "activity",
   "activity.verb",
+  "archive-failures.snapshot",
+  "archive-failures.updated",
   "labels.snapshot",
   "labels.updated",
   "lastAgent.set",
