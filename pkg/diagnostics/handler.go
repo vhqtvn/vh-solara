@@ -28,6 +28,12 @@ type snapshotJSON struct {
 		// a fresh snapshot (ring evicted the cursor). Non-zero under multi-
 		// session load flags the deferred per-session-ring finding.
 		Stream2ReplayFallback uint64 `json:"stream2_replay_fallback"`
+		// PartDeltaFields: bounded distinct-(partType,field) probe for the
+		// part-delta flush path. Resolves the part-append-streaming redesign's
+		// open-question #1 and gives slice 4 a per-field byte baseline. See
+		// part_delta_fields.go and docs/ai/wire-protocols/part-append-streaming.md §6.
+		PartDeltaFields        []partDeltaFieldObsJSON `json:"part_delta_fields"`
+		PartDeltaFieldOverflow uint64                  `json:"part_delta_field_overflow"`
 	} `json:"probes"`
 }
 
@@ -113,6 +119,17 @@ type handlerBytesJSON struct {
 	Class  string `json:"class"`
 	Bytes  uint64 `json:"bytes"`
 	Writes uint64 `json:"writes"`
+}
+
+// partDeltaFieldObsJSON is the wire shape of one slot in the bounded
+// distinct-(partType,field) probe for the part-delta flush path. See
+// part_delta_fields.go (PartDeltaFieldStats) and
+// docs/ai/wire-protocols/part-append-streaming.md §6.
+type partDeltaFieldObsJSON struct {
+	PartType string `json:"part_type"`
+	Field    string `json:"field"`
+	Count    uint64 `json:"count"`
+	Bytes    uint64 `json:"bytes"`
 }
 
 // tunnelJSON is the worker-side tunnel-lifecycle probe's wire shape. On the
@@ -276,6 +293,25 @@ func Snapshot() snapshotJSON {
 		})
 	}
 	out.Probes.Stream2ReplayFallback = r.Stream2ReplayFallback.Load()
+
+	// PartDeltaFields: bounded distinct-(partType,field) probe. Only claimed
+	// slots appear; the slot order is stable (array index), so repeat snapshots
+	// diff cleanly. Lock-free reads against the flush-path writer (which is
+	// serialized under the store's s.mu but publishes via atomics).
+	out.Probes.PartDeltaFields = make([]partDeltaFieldObsJSON, 0, MaxPartDeltaFieldSlots)
+	for i := range r.PartDeltaFields.slots {
+		pair := r.PartDeltaFields.slots[i].pair.Load()
+		if pair == nil {
+			continue // unclaimed slot: omit (keeps the JSON shape dense)
+		}
+		out.Probes.PartDeltaFields = append(out.Probes.PartDeltaFields, partDeltaFieldObsJSON{
+			PartType: pair.partType,
+			Field:    pair.field,
+			Count:    r.PartDeltaFields.slots[i].count.Load(),
+			Bytes:    r.PartDeltaFields.slots[i].bytes.Load(),
+		})
+	}
+	out.Probes.PartDeltaFieldOverflow = r.PartDeltaFields.overflow.Load()
 
 	return out
 }

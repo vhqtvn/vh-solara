@@ -458,6 +458,14 @@ type Registry struct {
 	// to a fresh snapshot because the shared replay ring evicted the cursor
 	// (Replay ok=false with hasCursor). See handler_bytes.go.
 	Stream2ReplayFallback Counter
+	// PartDeltaFields is the bounded distinct-(partType,field) probe for the
+	// part-delta flush path (flushPartDeltasLocked in pkg/state/reducers.go).
+	// Counter / atomic.Pointer only — no Histogram, so no initSentinels entry
+	// is needed. Resolves the part-append-streaming redesign's open-question #1
+	// ("does nested tool output flow through the append-delta path today?")
+	// empirically via /vh/diag/latency. See part_delta_fields.go and
+	// docs/ai/wire-protocols/part-append-streaming.md §6.
+	PartDeltaFields PartDeltaFieldStats
 
 	// startedAt is the process/registry creation time, reported in the snapshot
 	// so a consumer can compute rates per second since start.
@@ -495,6 +503,7 @@ func ResetForTest() {
 		r.HandlerBytes[i] = HandlerBytesStats{}
 	}
 	r.Stream2ReplayFallback = Counter{}
+	r.PartDeltaFields = PartDeltaFieldStats{}
 	r.startedAt = nowNano()
 	r.initSentinels()
 }

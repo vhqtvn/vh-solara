@@ -1407,6 +1407,23 @@ func (me *messageEntry) flushPartDeltasLocked(s *Store, emit bool) {
 			part = map[string]any{"id": partID, "type": "text"}
 		}
 		part[field] = buf.String()
+		// Slice-1 telemetry (part-append-streaming spec, see
+		// docs/ai/wire-protocols/part-append-streaming.md §5.1 / §6): record
+		// the (partType, field) pair this flush is materializing, so the open
+		// question "which fields flow through the append-delta path, especially
+		// nested tool output" is empirically confirmable via /vh/diag/latency.
+		// part["type"] is read from the ALREADY-unmarshaled map above (no new
+		// parse); the diag probe is pure atomics with no per-flush allocation.
+		// This observes the FLAT TOP-LEVEL field the accumulator just SET — it
+		// cannot represent nested paths (state.output etc. ride the wholesale
+		// part.upsert path, not this one). buf.Len() is the accumulated
+		// field-text length being flushed (the O(L)-per-flush quantity that
+		// sums to O(L²) across a part's lifetime).
+		pt, _ := part["type"].(string)
+		if pt == "" {
+			pt = "text"
+		}
+		diag.Default.PartDeltaFields.Observe(pt, field, buf.Len())
 		if updated, err := json.Marshal(part); err == nil {
 			me.parts[partID] = updated
 			if emit {
