@@ -38,11 +38,18 @@ export interface PaneVm {
   label: string;
   title: string;
   /**
+   * The pane's server URL (the iframe src). Carried in the view-model so the
+   * shell can prefill the AddServer form with the currently-active pane's URL
+   * (tabs=panes model, operator point #4). Read-only view-model copy; the
+   * authoritative value lives in the panel params (never mutated after creation).
+   */
+  url: string;
+  /**
    * P1 session-attention status for the pane's current `(dir, session)`, when
    * the embedded SPA has reported one via a `{type:"status"}` message. Absent
    * until the first status lands (the host renders no attention indicator and
    * treats activity as "unknown"). Carried in the view-model so SolidJS shell
-   * components (the workspace needs-you badge) react to status changes; the
+   * components (the per-pane needs-you badge) react to status changes; the
    * imperative pane renderer reads the source-of-truth `statusFor(paneId)`.
    */
   status?: PaneStatus;
@@ -242,6 +249,17 @@ export interface HostOps {
    * its existing {type:'route'} emission — that round-trip is the success
    * signal (no new reply message). See web/src/selectListener.ts. */
   selectTarget?(paneId: string, dir: string, session: string): void;
+  /**
+   * Rename a pane's LABEL inline (tabs=panes model). Updates the panel params
+   * via `api.updateParameters({label})` WITHOUT reloading the iframe (same
+   * survival-safe mechanism as updateRoute — the renderer has no update()).
+   * Persists via scheduleSave (updateParameters does NOT fire onDidLayoutChange,
+   * so the rename must explicitly schedule a debounced save). The iframe element
+   * + src + renderer:'always' mount are ALL untouched. Mirrors the
+   * renameWorkspace referential-identity-preserving pattern (mutate the label
+   * field, don't spread-recreate the panel). Refuses an empty/whitespace label
+   * (keeps the current label). */
+  renamePane?(paneId: string, label: string): void;
 }
 
 /** State pushed to a pane's header so it can reflect tray/zoom affordances. */

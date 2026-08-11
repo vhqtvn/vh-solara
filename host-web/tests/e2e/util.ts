@@ -455,6 +455,15 @@ export async function focusPane(page: Page, id: string): Promise<void> {
     h?.focus(id);
   }, id);
 }
+// tabs=panes model: rename a pane's label inline (survival-safe: updateParameters,
+// no iframe reload). Drives the SAME production HostOps path the Tabstrip's inline
+// edit uses (hostOps().renamePane). Returns nothing; assert via paneParams().
+export async function renamePane(page: Page, paneId: string, label: string): Promise<void> {
+  await page.evaluate(({ paneId, label }) => {
+    const h = (window as unknown as { __host?: { renamePane(p: string, l: string): void } }).__host;
+    h?.renamePane(paneId, label);
+  }, { paneId, label });
+}
 export async function maximize(page: Page, id: string): Promise<void> {
   await page.evaluate((id) => {
     const h = (window as unknown as { __host?: { maximize(i: string): void } }).__host;

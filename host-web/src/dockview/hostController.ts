@@ -1,6 +1,6 @@
 import type { DockviewApi, IDockviewPanel } from "dockview-core";
 import type { IframeRenderer } from "./iframeRenderer";
-import type { AddServerOutcome, HostOps, SplitDir } from "./types";
+import type { AddServerOutcome, HostOps, PaneVm, SplitDir } from "./types";
 import {
   isFleetEntry,
   isRealFleet,
@@ -14,17 +14,7 @@ import {
   runtimeServers,
 } from "../state/serverList";
 import { firstNeedsYouAtFor } from "./store";
-import {
-  visit as visitTarget,
-  parseRouteTarget,
-  activeTarget as activeRegistryTarget,
-  records as targetRecords,
-  liveKeys as liveKeysSet,
-  dismiss as dismissTarget,
-  pin as pinTarget,
-  unpin as unpinTarget,
-  _setRecordVisitedAtForTest,
-} from "./targetRegistry";
+import { scheduleSave } from "./layoutPersistence";
 import { next as attentionNext, nextTarget as attentionNextTarget } from "../attentionNext";
 import {
   activeWorkspaceId,
@@ -42,7 +32,6 @@ import {
   needsYouCount,
   needsYouCountFor,
   noteIframeLoad,
-  hostOps,
   renameWorkspace as storeRenameWorkspace,
   resetBaseline,
   routeMessage,
@@ -61,7 +50,6 @@ import {
   unregisterWorkspaceOps,
   unregisterWorkspaceSync,
   workspaces as storeWorkspaces,
-  workspaceApiFor,
 } from "./store";
 
 type Direction = "left" | "right" | "above" | "below";
@@ -366,39 +354,28 @@ export class HostController implements HostOps {
    * the iframe src at the NEXT cold creation (reload) so the SPA deep-links
    * itself; runtime route changes never touch src.
    *
-   * P4: when the route carries a {dir,session} (the SPA's routing vocabulary),
-   * upsert it as a visited AttentionTarget — Fork B's SPA-internal visit path.
-   * The serverId is the pane's bound origin (NEVER sender-claimed). Dedupes
-   * with the host-driven visit in selectTarget (a select round-trip lands here
-   * too when the SPA echoes its new route). A route without dir+session (a
-   * non-session view) does not mint a tab.
+   * (tabs=panes model: routes are NO LONGER minted as session tabs. The
+   * tabstrip shows panes directly. Route capture is purely for cold-restore
+   * persistence — the SPA re-deep-links itself on reload.)
    */
   updateRoute(paneId: string, route: string): void {
     const panel = this.api.getPanel(paneId);
     if (!panel) return;
     panel.api.updateParameters({ ...(panel.params ?? {}), route });
-    // P4 SPA-internal visit: parse the route for a session target.
-    const parsed = parseRouteTarget(route);
-    if (parsed) {
-      const serverId = configuredOriginFor(paneId);
-      if (serverId) {
-        visitTarget(
-          { serverId, dir: parsed.dir, session: parsed.session },
-          titleFor(paneId),
-        );
-      }
-    }
   }
 
   /**
    * Direct a pane's embedded SPA to switch to a specific {dir, session} via a
-   * survival-safe postMessage (P4 reverse-nav enabler). The iframe src +
-   * element are NEVER touched — this posts {type:'vh-host-select',dir,session}
-   * to the pane's bound contentWindow targeted at its configured origin
-   * (never '*'). The SPA performs an INTERNAL route change
-   * (setSelectedId/switchProject); its existing route emission fires
-   * {type:'route'} back, which updateRoute captures — the round-trip success
-   * signal. No-op when the pane is not found or its origin is unbound.
+   * survival-safe postMessage (reverse-nav). The iframe src + element are NEVER
+   * touched — this posts {type:'vh-host-select',dir,session} to the pane's bound
+   * contentWindow targeted at its configured origin (never '*'). The SPA
+   * performs an INTERNAL route change (setSelectedId/switchProject); its
+   * existing route emission fires {type:'route'} back, which updateRoute
+   * captures — the round-trip success signal. No-op when the pane is not found
+   * or its origin is unbound.
+   *
+   * (tabs=panes model: selectTarget is for navigating sessions WITHIN a window
+   * via the SPA tree; it is NOT the tab identity anymore. Tabs ARE panes.)
    *
    * SURVIVAL-INVARIANT (load-bearing): unlike a route CAPTURE (updateRoute,
    * which only mutates params), a select DRIVES the SPA. But it does so purely
@@ -413,11 +390,28 @@ export class HostController implements HostOps {
     // pointless, since the listening child would reject an untargeted post).
     if (!cw || !origin) return;
     cw.postMessage({ type: "vh-host-select", dir, session }, origin);
-    // P4 host-driven visit (Fork B): the operator explicitly selected this
-    // session → it becomes a tab. serverId is the pane's bound origin (NEVER
-    // sender-claimed). Dedupes with the SPA-internal visit in updateRoute (the
-    // SPA echoes its new route back, which lands there). Sets it as active.
-    visitTarget({ serverId: origin, dir, session }, titleFor(paneId));
+  }
+
+  /**
+   * Rename a pane's LABEL inline (tabs=panes model, operator point #2: "rename
+   * mean rename the prefix"). Updates the panel params via
+   * `api.updateParameters({label})` WITHOUT reloading the iframe (same
+   * survival-safe mechanism as updateRoute — IframeRenderer has no update()
+   * method → no-op on the component → iframe element + src + renderer:'always'
+   * mount are ALL untouched). Persists via scheduleSave (updateParameters does
+   * NOT fire onDidLayoutChange, so the rename must explicitly schedule a
+   * debounced save). Mirrors the renameWorkspace referential-identity-preserving
+   * pattern (mutate the label field, don't spread-recreate the panel). Refuses
+   * an empty/whitespace label (keeps the current label).
+   */
+  renamePane(paneId: string, label: string): void {
+    const panel = this.api.getPanel(paneId);
+    if (!panel) return;
+    const trimmed = label.trim();
+    if (!trimmed) return; // refuse empty rename (keep current label)
+    panel.api.updateParameters({ ...(panel.params ?? {}), label: trimmed });
+    this.syncPanes(); // rebuild PaneVm with the new label
+    scheduleSave(); // persist (updateParameters does NOT fire onDidLayoutChange)
   }
 
   // ---- event wiring → store (display projection of THIS workspace) ---------
@@ -459,10 +453,12 @@ export class HostController implements HostOps {
 
   /** Reconcile the shell view-model with the live Dockview panels of THIS
    *  workspace (full rebuild; titles read from the global titleFor map so they
-   *  survive a workspace switch). No-op for the display signal when this
-   *  workspace is not active (the store mutator guards on active). */
+   *  survive a workspace switch; status read from the global statusFor map so
+   *  the per-pane needs-you badge survives a syncPanes rebuild). No-op for the
+   *  display signal when this workspace is not active (the store mutator guards
+   *  on active). */
   private syncPanes(): void {
-    const vms: { id: string; label: string; title: string }[] = [];
+    const vms: PaneVm[] = [];
     for (const panel of this.api.panels) {
       const params = (panel.params ?? {}) as { url?: string; label?: string };
       const title = titleFor(panel.id) ?? params.label ?? "";
@@ -470,6 +466,8 @@ export class HostController implements HostOps {
         id: panel.id,
         label: params.label ?? "server",
         title,
+        url: params.url ?? "",
+        status: statusFor(panel.id) ?? undefined,
       });
     }
     setPanesVm(this.workspaceId, vms);
@@ -567,6 +565,7 @@ export class HostController implements HostOps {
     this.ops.removeServer = (url) => this.removeServer(url);
     this.ops.updateRoute = (paneId, route) => this.updateRoute(paneId, route);
     this.ops.selectTarget = (paneId, dir, session) => this.selectTarget(paneId, dir, session);
+    this.ops.renamePane = (paneId, label) => this.renamePane(paneId, label);
   }
 
   /** Dispose this controller: unregister from the store + the controller map so
@@ -785,82 +784,12 @@ export class HostController implements HostOps {
       getIframe: (id: string): HTMLIFrameElement | null =>
         controllerForPane(id)?.renderers.get(id)?.getIframe() ?? null,
 
-      // ---- P4 attention-target registry (flat tabstrip) -------------------
-      // Drives the registry programmatically for e2e (caps/age/visit/dedup/
-      // honest-status assertions). These route through the SAME production
-      // targetRegistry module the Tabstrip + selectTarget/updateRoute use.
-      targets: (): Array<{
-        serverId: string; dir: string; session: string;
-        title: string; titleSource: "fallback" | "session";
-        lastVisitedAt: number; pinned: boolean;
-        live: boolean;
-        liveStatus: { attention: string; activity: string; title: string } | null;
-      }> => {
-        const live = liveKeysSet();
-        return targetRecords().map((r) => {
-          const k = `${r.target.serverId}\u0000${r.target.dir}\u0000${r.target.session}`;
-          return {
-            serverId: r.target.serverId,
-            dir: r.target.dir,
-            session: r.target.session,
-            title: r.title,
-            titleSource: r.titleSource ?? "fallback",
-            lastVisitedAt: r.lastVisitedAt,
-            pinned: r.pinned,
-            live: live.has(k),
-            liveStatus: r.liveStatus
-              ? {
-                  attention: r.liveStatus.attention,
-                  activity: r.liveStatus.activity,
-                  title: r.liveStatus.title,
-                }
-              : null,
-          };
-        });
-      },
-      visitTarget: (
-        serverId: string,
-        dir: string,
-        session: string,
-        title?: string,
-      ): void => {
-        visitTarget({ serverId, dir, session }, title);
-      },
-      dismissTarget: (serverId: string, dir: string, session: string): void => {
-        dismissTarget({ serverId, dir, session });
-      },
-      pinTarget: (serverId: string, dir: string, session: string): boolean =>
-        pinTarget({ serverId, dir, session }),
-      unpinTarget: (serverId: string, dir: string, session: string): void => {
-        unpinTarget({ serverId, dir, session });
-      },
-      activeTarget: (): { serverId: string; dir: string; session: string } | null => {
-        const at = activeRegistryTarget();
-        return at ? { serverId: at.serverId, dir: at.dir, session: at.session } : null;
-      },
-      // Resolve the pane bound to a serverId (the Tabstrip's tab-click resolver).
-      findPaneForServer: (serverId: string): string | null =>
-        findPaneForServer(serverId),
-      // P4 decision #7: resolve BOTH the pane AND its owning workspace for a
-      // serverId (cross-workspace selection). Returns {workspaceId,paneId}|null.
-      resolveTabTarget: (serverId: string): { workspaceId: string; paneId: string } | null =>
-        findPaneAndWorkspaceForServer(serverId),
-      // P4 decision #7: read the workspace id that owns a given pane (cross-ws e2e).
-      workspaceOfPane: (paneId: string): string | null =>
-        workspaceOfPane(paneId),
-      // Drive a tab select through the SAME production path the Tabstrip uses
-      // (findPaneForServer → hostOps().selectTarget → visit).
-      selectTab: (serverId: string, dir: string, session: string): boolean =>
-        selectTab({ serverId, dir, session }),
-      // TEST-ONLY: backdate a record's lastVisitedAt so age-retirement (7-day
-      // eviction) is exercisable in a fast e2e. Persists (cold-load retirement
-      // test). DEV-only; absent in prod builds.
-      _backdateTarget: (serverId: string, dir: string, session: string, daysAgo: number): void => {
-        const DAY = 24 * 60 * 60 * 1000;
-        _setRecordVisitedAtForTest(
-          { serverId, dir, session },
-          Date.now() - daysAgo * DAY,
-        );
+      // ---- tabs=panes model: rename + select (replaces P4 target bridge) ----
+      // Rename a pane's label inline (survival-safe: updateParameters, no
+      // iframe reload). Drives the SAME production HostOps path the Tabstrip's
+      // inline edit uses (hostOps().renamePane).
+      renamePane: (paneId: string, label: string): void => {
+        activeController()?.renamePane(paneId, label);
       },
 
       // NEGATIVE CONTROL (a): naive remove + re-add. This is the exact mistake
@@ -913,136 +842,3 @@ function safeHost(url: string): string {
     return url;
   }
 }
-
-// ---- P4 target → pane resolution + tab-select (flat tabstrip) --------------
-// The flat tabstrip renders AttentionTarget records; clicking a tab must drive
-// a survival-safe selectTarget on the pane bound to that target's server. These
-// helpers resolve a target's server pane + issue the select. They live here
-// (not in targetRegistry.ts) because pane resolution needs the live Dockview
-// apis + configuredOrigin map (store accessors), and the registry is kept pure
-// (types-only import) to avoid an import cycle with store.ts.
-
-/**
- * Find the pane id bound to a given serverId (origin), across ALL workspaces.
- * Prefers the currently-focused pane when its origin matches (so a tab click
- * for the focused server reuses it); otherwise returns the first matching pane
- * found by scanning each workspace's live api.panels. Returns null when no pane
- * is bound to that server (the tab cannot be selected — the Tabstrip renders it
- * disabled).
- *
- * AMBIGUITY NOTE (flagged reversible default): if MULTIPLE panes are bound to
- * the same server origin, this picks the focused one (when it matches) else the
- * first in workspace-then-panel iteration order. That is a deliberate reversible
- * default — the brief's ambiguity. A future per-DIR iframe pool (DELETED from
- * P4 scope) would change this resolution.
- */
-/**
- * Find the pane id bound to a given serverId (origin), across ALL workspaces.
- * Prefers the currently-focused pane when its origin matches (so a tab click
- * for the focused server reuses it); otherwise returns the first matching pane
- * found by scanning each workspace's live api.panels. Returns null when no pane
- * is bound to that server (the tab cannot be selected — the Tabstrip renders it
- * aria-disabled + explanatory).
- *
- * AMBIGUITY NOTE (flagged reversible default): if MULTIPLE panes are bound to
- * the same server origin, this picks the focused one (when it matches) else the
- * first in workspace-then-panel iteration order. That is a deliberate reversible
- * default — the brief's ambiguity. A future per-DIR iframe pool (DELETED from
- * P4 scope) would change this resolution.
- *
- * Cross-workspace-aware callers should prefer findPaneAndWorkspaceForServer
- * (which also returns the owning workspace id so selectTab can activate it).
- */
-export function findPaneForServer(serverId: string): string | null {
-  return findPaneAndWorkspaceForServer(serverId)?.paneId ?? null;
-}
-
-/**
- * Resolve BOTH the pane and its owning workspace for a serverId (decision #7).
- * Used by selectTab to activate the owning workspace FIRST (CSS-only visibility,
- * survival-safe) before issuing selectTarget — this fixes the "click did
- * nothing" path when the matching pane is in a hidden (non-active) workspace:
- * previously selectTarget posted to the pane's contentWindow (which worked) but
- * the operator saw nothing change because the workspace stayed hidden. Now the
- * owning workspace is surfaced first so the operator sees the result.
- *
- * Returns null when no pane is bound to the server (unavailable-server state).
- */
-export function findPaneAndWorkspaceForServer(
-  serverId: string,
-): { workspaceId: string; paneId: string } | null {
-  // Prefer the focused pane when its origin matches (it lives in the active
-  // workspace, so its owning workspace is activeWorkspaceId()).
-  const focused = focusedId();
-  if (focused && configuredOriginFor(focused) === serverId) {
-    const ws = activeWorkspaceId();
-    if (ws) return { workspaceId: ws, paneId: focused };
-  }
-  for (const ws of storeWorkspaces()) {
-    const api = workspaceApiFor(ws.id);
-    if (!api) continue;
-    for (const panel of api.panels) {
-      if (configuredOriginFor(panel.id) === serverId) {
-        return { workspaceId: ws.id, paneId: panel.id };
-      }
-    }
-  }
-  return null;
-}
-
-/** Read the workspace id that owns a given pane (across all workspaces), or
- *  null when no live api has the pane. Used by the DEV bridge for the cross-
- *  workspace e2e. */
-export function workspaceOfPane(paneId: string): string | null {
-  for (const ws of storeWorkspaces()) {
-    const api = workspaceApiFor(ws.id);
-    if (!api) continue;
-    if (api.panels.some((p) => p.id === paneId)) return ws.id;
-  }
-  return null;
-}
-
-/**
- * Select a target's tab (decision #7 cross-workspace path). Resolves the pane
- * bound to the target's server AND its owning workspace; if the owning workspace
- * is not active, activates it FIRST (CSS-only visibility switch — survival-safe,
- * no iframe reload), then issues the survival-safe selectTarget (SPA-internal
- * route change; the iframe src + element are NEVER touched). No-op (returns
- * false) when no pane is bound to that server (the Tabstrip renders the tab
- * aria-disabled + explanatory — unavailable-server state). On success, visit()
- * (called inside selectTarget) sets the target active.
- */
-export function selectTab(target: AttentionTargetLike): boolean {
-  const resolved = findPaneAndWorkspaceForServer(target.serverId);
-  if (!resolved) return false; // unavailable-server: no pane bound → no-op
-  // Cross-workspace: surface the owning workspace FIRST so the operator sees
-  // the result (CSS-only visibility — survival-safe). No-op when already active.
-  const active = activeWorkspaceId();
-  if (active !== resolved.workspaceId) {
-    storeSetActiveWorkspace(resolved.workspaceId);
-  }
-  hostOps()?.selectTarget?.(resolved.paneId, target.dir, target.session);
-  return true;
-}
-
-/** Minimal structural shape selectTab accepts (avoids importing the type into
- *  this call site's consumers that already hold a {serverId,dir,session}). */
-interface AttentionTargetLike {
-  serverId: string;
-  dir: string;
-  session: string;
-}
-
-// Re-export the registry accessors the Tabstrip + bridge consume, so the shell
-// imports everything tab-related from hostController (one import surface).
-// (findPaneAndWorkspaceForServer + workspaceOfPane are already `export
-// function` above, so they are NOT re-listed here.)
-export {
-  visitTarget,
-  dismissTarget,
-  pinTarget,
-  unpinTarget,
-  activeRegistryTarget,
-  targetRecords,
-  liveKeysSet,
-};

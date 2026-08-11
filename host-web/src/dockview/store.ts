@@ -18,7 +18,6 @@ import {
   scheduleSave,
   setSerializeAllFn,
 } from "./layoutPersistence";
-import { applyLiveStatus } from "./targetRegistry";
 
 // Module-level singleton store. Signals created at module scope are fine in
 // SolidJS: components that read them inside a tracking scope re-render on
@@ -543,13 +542,6 @@ function setStatusFor(paneId: string, status: PaneStatus): void {
   const capped: PaneStatus = { ...status, title: capTitle(status.title) };
   statusByPane.set(paneId, capped);
   if (capped.title) titleByPane.set(paneId, capped.title);
-  // P4: mirror the pane's current status into the attention-target registry so
-  // the flat tabstrip shows honest live status. serverId is the pane's bound
-  // origin (NEVER sender-claimed); applyLiveStatus derives the target from
-  // {serverId, dir, session} and maintains the live/stale distinction. Only
-  // affects records that exist (Fork B: a status for a never-visited target
-  // does NOT mint a tab).
-  applyLiveStatus(paneId, configuredOrigin.get(paneId), capped);
   setPanes((list) =>
     list.map((p) => (p.id === paneId ? { ...p, status: capped, title: capped.title || p.title } : p)),
   );
@@ -632,11 +624,6 @@ export function livenessFor(id: string): LivenessState {
 }
 
 export function unregisterPane(id: string): void {
-  // P4: withdraw this pane's live-status contribution BEFORE clearing its
-  // origin (applyLiveStatus reads the origin to know which target is going
-  // non-live). The registry keeps the target's last-known liveStatus for
-  // dimmed/stale display but stops considering it live.
-  applyLiveStatus(id, configuredOrigin.get(id), null);
   survivalMap.delete(id);
   baselineMap.delete(id);
   configuredOrigin.delete(id);

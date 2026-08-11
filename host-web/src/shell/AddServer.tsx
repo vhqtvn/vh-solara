@@ -1,5 +1,5 @@
 import { For, Show, createSignal } from "solid-js";
-import { hostOps } from "../dockview/store";
+import { hostOps, panes, focusedId } from "../dockview/store";
 import { runtimeServers } from "../state/serverList";
 import type { AddServerOutcome } from "../dockview/types";
 import s from "./AddServer.module.css";
@@ -34,6 +34,31 @@ export function AddServer() {
   const [error, setError] = createSignal("");
   const [outcome, setOutcome] = createSignal<AddServerOutcome | null>(null);
 
+  const openPopover = () => {
+    // OPERATOR POINT #4: "default to prefill current server." Prefill the URL
+    // field with the currently-active pane's server URL so the operator can
+    // quickly open another window into the same box, or edit for a different
+    // server. Label is left empty (the operator names the new window).
+    const activePane = panes().find((p) => p.id === focusedId());
+    setUrl(activePane?.url ?? "");
+    setLabel("");
+    setError("");
+    setOutcome(null);
+    setOpen(true);
+  };
+
+  const closePopover = () => {
+    setOpen(false);
+  };
+
+  const togglePopover = () => {
+    if (open()) {
+      closePopover();
+    } else {
+      openPopover();
+    }
+  };
+
   const submit = (e: Event) => {
     e.preventDefault();
     const u = url().trim();
@@ -41,8 +66,10 @@ export function AddServer() {
     const res = hostOps()?.addServerWithOutcome?.(u, l) ?? null;
     if (res) {
       // Success (one of the three deterministic outcomes): clear the form +
-      // error; keep the outcome line + popover visible for more adds.
-      setUrl("");
+      // error; keep the outcome line + popover visible for more adds. Re-prefill
+      // the URL from the now-active pane (the new pane became active on add).
+      const activePane = panes().find((p) => p.id === focusedId());
+      setUrl(activePane?.url ?? "");
       setLabel("");
       setError("");
       setOutcome(res);
@@ -70,7 +97,7 @@ export function AddServer() {
         title="Add server"
         aria-label="Add server"
         data-testid="add-server-btn"
-        onClick={() => setOpen((v) => !v)}
+        onClick={() => togglePopover()}
       >
         <span class={s.triggerIcon} aria-hidden="true">+</span>
         <span class={s.triggerText}>Add server</span>

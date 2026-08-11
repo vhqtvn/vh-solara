@@ -72,6 +72,24 @@
   text-overflow: ellipsis;
   max-width: 200px;
 }
+/* Inline rename input (operator point #2: rename = edit the label). Shown when
+ * the operator double-clicks a tab label. Sized to match the tab label so the
+ * tab does not shift geometry on edit. GPU-cheap: plain input, no effects. */
+.renameInput {
+  font-size: 12px;
+  font-weight: 600;
+  font-family: inherit;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--accent);
+  border-radius: 3px;
+  outline: none;
+  padding: 0 4px;
+  height: 18px;
+  max-width: 200px;
+  min-width: 80px;
+  flex: 0 1 auto;
+}
 .tabActive {
   background: var(--accent-soft);
   border-color: var(--accent);
