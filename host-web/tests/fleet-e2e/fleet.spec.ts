@@ -44,14 +44,14 @@ test.describe("config-driven fleet seeding (VITE_SERVERS)", () => {
       { timeout: 30_000 },
     );
 
-    // ---- TOP TABSTRIP: flat target strip, NO workspace tabs. ----
-    // P4: the workspace tabstrip was replaced by the flat target tabstrip. The
-    // fleet seeds into the SINGLE default workspace; with no ws tabs in the
-    // primary strip, there are ZERO ws-tab elements regardless of fleet size.
-    // (Fleet seeding is proven below via panes + iframe srcs, which are
-    // unchanged.) No per-server labels leak into the strip either.
+    // ---- TOP TABSTRIP: workspace tabstrip (i3 host-shell, Phase 1). ----
+    // The fleet seeds into the SINGLE default workspace, so there is exactly
+    // ONE workspace tab (the default "Workspace 1"). A ws tab carries the
+    // WORKSPACE name, never a per-server label — the per-server identity lives
+    // in the panes (proven below), not the strip. (Fleet seeding is proven via
+    // panes + iframe srcs, which are unchanged by the tabstrip model.)
     const wsTabs = page.locator('[data-testid="ws-tab"]');
-    await expect(wsTabs).toHaveCount(0);
+    await expect(wsTabs).toHaveCount(1);
     const wsTexts = await wsTabs.allInnerTexts();
     for (const f of FLEET_SERVERS) {
       expect(

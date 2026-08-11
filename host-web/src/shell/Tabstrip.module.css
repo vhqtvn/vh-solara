@@ -7,7 +7,14 @@
   background: var(--bg-soft);
   border-bottom: 1px solid var(--border);
   flex: 0 0 auto;
-  overflow: hidden;
+  /* overflow: VISIBLE (not hidden) so the AddServer popover (position:absolute,
+   * a child of .wrap here) can drop down over the workspace area below without
+   * being clipped. The .tabs scroller has its own overflow-x:auto, so the tab
+   * row still scrolls independently. This was the "+ does nothing with tabs"
+   * bug: with tabs present the operator uses the tabstrip's AddServer (clipped
+   * by overflow:hidden); with no tabs they used the empty-overlay AddServer
+   * (no clip) so it seemed to work only when empty. */
+  overflow: visible;
 }
 .brand {
   display: flex;
@@ -54,7 +61,10 @@
   cursor: pointer;
   white-space: nowrap;
   flex: 0 0 auto;
-  /* Prevent text selection + double-tap-to-zoom on rapid tab taps (touch). */
+  /* Prevent text selection / long-press context menu during the rename
+   * long-press, and double-tap-to-zoom on rapid tab taps (touch-friendly). The
+   * -webkit-touch-callout suppression specifically stops iOS Safari's native
+   * callout from racing the ~500ms RENAME_PRESS_MS threshold. */
   user-select: none;
   -webkit-user-select: none;
   -webkit-touch-callout: none;
@@ -72,67 +82,103 @@
   text-overflow: ellipsis;
   max-width: 200px;
 }
-/* Inline rename input (operator point #2: rename = edit the label). Shown when
- * the operator double-clicks a tab label. Sized to match the tab label so the
- * tab does not shift geometry on edit. GPU-cheap: plain input, no effects. */
-.renameInput {
-  font-size: 12px;
-  font-weight: 600;
-  font-family: inherit;
-  color: var(--fg);
-  background: var(--bg);
-  border: 1px solid var(--accent);
-  border-radius: 3px;
-  outline: none;
-  padding: 0 4px;
-  height: 18px;
-  max-width: 200px;
-  min-width: 80px;
-  flex: 0 1 auto;
-}
 .tabActive {
   background: var(--accent-soft);
   border-color: var(--accent);
   color: var(--fg);
 }
-/* HONEST STATUS (load-bearing): a tab whose target no live pane is currently
- * reporting. Dimmed — it shows last-known title/metadata but MUST NOT claim
- * current attention (no needs-you badge). GPU-cheap: opacity only (no
- * mask-image / backdrop-filter — AGENTS.md Firefox/WebRender rules). */
-.tabStale {
-  opacity: 0.55;
+/* Two-step delete confirm state. GPU-cheap: a slow opacity pulse ONLY (no
+ * mask-image / backdrop-filter — AGENTS.md Firefox/WebRender rules). Honored
+ * under prefers-reduced-motion. The destructive tint uses --warn (amber, the
+ * established "operator action needed" color) so it reads as cautionary. */
+.tabConfirming {
+  background: rgba(210, 153, 34, 0.18);
+  border-color: var(--warn);
+  color: var(--fg);
+  animation: ws-confirm-pulse 1.4s ease-in-out infinite;
 }
-/* Activity dot for LIVE tabs (cheap, GPU-safe — a static colored circle, no
- * animation). Communicates the target's current activity (running/error/unread).
- * Only shown for live tabs; a stale tab shows an empty dot. Distinct from the
- * Q1-C document-liveness indicator (per-pane header) and from the needs-you
- * badge. */
-.actDot {
-  display: inline-block;
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: var(--fg-dim);
-  opacity: 0.4;
+@keyframes ws-confirm-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .tabConfirming { animation: none; }
+}
+.tabConfirmLabel {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--warn);
+  white-space: nowrap;
+  flex: 0 1 auto;
+}
+/* Inline rename input — replaces the label while editing. Sized to fit the tab
+ * height; inherits the tab's color so it reads as in-place editing. */
+.tabInput {
+  appearance: none;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  height: 20px;
+  padding: 0 4px;
+  width: 110px;
+  max-width: 40vw;
+  outline: none;
   flex: 0 0 auto;
 }
-.actRunning {
-  background: var(--accent);
-  opacity: 1;
+/* Per-tab delete/confirm affordances. The × is always rendered (touch has no
+ * hover); it's subtle by default and brightens on hover of the tab. */
+.tabDel,
+.tabDelConfirm,
+.tabDelCancel {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--fg-dim);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  flex: 0 0 auto;
 }
-.actError {
+.tab.tab:hover .tabDel {
+  color: var(--warn);
+}
+.tabDel:hover:not(:disabled) {
+  color: var(--warn);
+  background: rgba(210, 153, 34, 0.2);
+}
+.tabDel:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+}
+.tabDelConfirm {
+  color: var(--warn);
+  font-size: 12px;
+}
+.tabDelConfirm:hover {
   background: var(--warn);
-  opacity: 1;
+  color: var(--bg);
 }
-.actUnread {
-  background: var(--accent);
-  opacity: 0.7;
+.tabDelCancel {
+  color: var(--fg-dim);
+  font-size: 11px;
 }
-/* Per-target needs-you badge (migrated from the per-workspace badge). Same
- * rounded-rect number + amber as the prior badge (GPU-cheap). Shows ONLY when a
- * live pane currently reports this target AND its last-known attention is
- * needs_reply/needs_permission. Distinct shape from the per-pane attention
- * badge (pill here vs rounded-rect there) and from the Q1-C liveness dot. */
+.tabDelCancel:hover {
+  color: var(--fg);
+  background: var(--bg-elev);
+}
+/* P1 workspace-aggregate needs-you count badge. Distinct shape from the
+ * per-pane attention badge (pill here) and from the Q1-C liveness dot.
+ * Amber = "operator action needed". */
 .needBadge {
   display: inline-flex;
   align-items: center;
@@ -148,88 +194,24 @@
   line-height: 1;
   flex: 0 0 auto;
 }
+.plus {
+  width: 26px;
+  height: 26px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--fg-dim);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+.plus:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
 .trayBadge {
   font-size: 11px;
   color: var(--warn);
   flex: 0 0 auto;
-}
-
-/* ---- P4 decisions #4 + #7 (dismiss, unavailable, empty-state) ---- */
-
-/* Empty-state hint (decision #7 holistic): muted inline text when the registry
- * is empty, telling the operator how a tab appears (Fork B). GPU-cheap: plain
- * text, no effects. */
-.emptyHint {
-  font-size: 11px;
-  color: var(--fg-dim);
-  font-style: italic;
-  white-space: nowrap;
-  flex: 1 1 auto;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-/* Dismiss (×) button (decision #4). On FINE pointers it is revealed on
- * hover/focus of the enclosing tab (so the resting strip is uncluttered); on
- * COARSE pointers (touch) it is ALWAYS visible (a touch target must be
- * discoverable). Touch-safe hit area (32×32) under pointer:coarse. GPU-cheap:
- * static. */
-.dismissBtn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 18px;
-  height: 18px;
-  margin-left: 2px;
-  border: none;
-  border-radius: 4px;
-  background: transparent;
-  color: var(--fg-dim);
-  font-size: 15px;
-  line-height: 1;
-  cursor: pointer;
-  flex: 0 0 auto;
-  padding: 0;
-  /* Fine-pointer default: hidden until hover/focus of the tab (see .tab:hover
-   * + .tab:focus-within below). Coarse pointers override to always-visible. */
-  opacity: 0;
-  transition: opacity 0.1s linear;
-}
-.tab:hover .dismissBtn,
-.tab:focus-within .dismissBtn {
-  opacity: 1;
-}
-.dismissBtn:hover {
-  background: var(--warn);
-  color: var(--bg);
-}
-
-/* Unavailable-server (decision #7): the tab's server has no bound pane. Distinct
- * from stale (a live-status concept): unavailable is a STRUCTURAL "no pane"
- * state. GPU-cheap: dashed border + reduced opacity (no animation). */
-.tabUnavailable {
-  opacity: 0.45;
-  border-style: dashed;
-  cursor: not-allowed;
-}
-.tabUnavailable:hover {
-  border-color: var(--border);
-  color: var(--fg-dim);
-}
-
-/* COARSE POINTER (touch): the dismiss × is ALWAYS visible + a touch-safe target
- * (32×32 hit area). Tabs are the primary nav on a phone; hiding the dismiss
- * affordance behind hover would make it undiscoverable. */
-@media (pointer: coarse) {
-  .dismissBtn {
-    opacity: 1;
-    width: 32px;
-    height: 32px;
-    margin-left: 4px;
-  }
-  .tab {
-    /* Slightly taller touch target on phone-width strips. */
-    height: 30px;
-  }
 }

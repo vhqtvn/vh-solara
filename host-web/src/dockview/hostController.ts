@@ -1,6 +1,6 @@
 import type { DockviewApi, IDockviewPanel } from "dockview-core";
 import type { IframeRenderer } from "./iframeRenderer";
-import type { AddServerOutcome, HostOps, PaneVm, SplitDir } from "./types";
+import type { AddServerOutcome, FocusDir, HostOps, LayoutMode, PaneVm, SplitDir } from "./types";
 import {
   isFleetEntry,
   isRealFleet,
@@ -414,6 +414,117 @@ export class HostController implements HostOps {
     scheduleSave(); // persist (updateParameters does NOT fire onDidLayoutChange)
   }
 
+  /**
+   * Switch the focused pane's group into one of the four i3 container layout
+   *  modes (Phase 1). LIVE-TREE (Gate 1 passed: orientation flip + header
+   *  position flip both survival-safe — iframe identity unchanged).
+   *
+   *  - tabbed: group.api.setHeaderPosition('top') — native tab strip across the
+   *    top (un-hidden by dockviewOverrides.css for ≥2 panels).
+   *  - stacked: group.api.setHeaderPosition('left') — tab strip down the side.
+   *  - split-h: break each panel (after the first) out of the group into its own
+   *    group to the RIGHT (moveTo repositions the keep-mounted renderer).
+   *  - split-v: break each panel out BELOW.
+   *
+   *  SURVIVAL: both setHeaderPosition and moveTo are proven survival-safe by the
+   *  gate probe (identity unchanged). No cold reload. Single-panel groups are a
+   *  no-op for split-h/split-v (nothing to break out) and set the header
+   *  position for tabbed/stacked (visually inert until a second panel arrives).
+   */
+  setLayoutMode(paneId: string, mode: LayoutMode): void {
+    const panel = this.api.getPanel(paneId);
+    if (!panel) return;
+    const group = panel.group;
+    if (mode === "tabbed" || mode === "stacked") {
+      const pos = mode === "tabbed" ? "top" : "left";
+      try {
+        group.api.setHeaderPosition(pos);
+      } catch {
+        // setHeaderPosition can throw on certain group states — swallow.
+      }
+      this.afterMutation();
+      return;
+    }
+    // split-h / split-v: break a multi-panel group's panels out into separate
+    // tiled groups. moveTo(position) relative to the first panel's group.
+    // Position vocabulary is dockview's 'left'|'right'|'top'|'bottom' (NOT the
+    // addPanel 'direction' vocabulary 'right'|'below').
+    const pos = mode === "split-h" ? "right" : "bottom";
+    const panels = [...group.panels];
+    if (panels.length > 1) {
+      const anchor = panels[0];
+      for (let i = 1; i < panels.length; i++) {
+        panels[i].api.moveTo({ group: anchor.group, position: pos });
+      }
+      anchor.api.setActive();
+    }
+    this.afterMutation();
+  }
+
+  /**
+   * Focus the spatially-nearest grid pane in the given cardinal direction
+   *  (i3 Alt+Arrow). Bounding-box geometry: among all GRID panes whose center
+   *  lies in the requested half-plane (and whose primary-axis offset dominates
+   *  the cross-axis), pick the smallest primary-axis distance. Survival-safe
+   *  (focusPane only — setActive; no iframe touched). No-op when no neighbor.
+   */
+  focusDirection(paneId: string, dir: FocusDir): void {
+    const id = this.nearestPaneInDir(paneId, dir);
+    if (id) this.focusPane(id);
+  }
+
+  /**
+   * Swap the focused pane with the spatially-nearest grid pane in the given
+   *  cardinal direction (i3 Alt+Shift+Arrow move). Survival-safe (swap uses
+   *  moveTo, which repositions the keep-mounted renderers). No-op when no
+   *  neighbor. */
+  moveDirection(paneId: string, dir: FocusDir): void {
+    const id = this.nearestPaneInDir(paneId, dir);
+    if (id && id !== paneId) this.swap(paneId, id);
+  }
+
+  /** Spatial nearest-neighbor in a cardinal direction, by group bounding-box
+   *  centers. Returns null when no grid pane lies in that direction. */
+  private nearestPaneInDir(paneId: string, dir: FocusDir): string | null {
+    const panel = this.api.getPanel(paneId);
+    if (!panel) return null;
+    const myBox = panel.group.api.boundingBox;
+    if (!myBox) return null;
+    const myCx = myBox.left + myBox.width / 2;
+    const myCy = myBox.top + myBox.height / 2;
+    let best: { id: string; dist: number } | null = null;
+    for (const p of this.api.panels) {
+      if (p.id === paneId) continue;
+      if (p.group.api.location.type !== "grid") continue;
+      const box = p.group.api.boundingBox;
+      if (!box) continue;
+      const cx = box.left + box.width / 2;
+      const cy = box.top + box.height / 2;
+      const dx = cx - myCx;
+      const dy = cy - myCy;
+      // Require the primary-axis offset to dominate the cross-axis (a pane
+      // roughly in the requested half-plane, not diagonally off).
+      let inDir = false;
+      let primary = 0;
+      if (dir === "left") {
+        inDir = dx < 0 && Math.abs(dx) >= Math.abs(dy) * 0.5;
+        primary = -dx;
+      } else if (dir === "right") {
+        inDir = dx > 0 && dx >= Math.abs(dy) * 0.5;
+        primary = dx;
+      } else if (dir === "up") {
+        inDir = dy < 0 && Math.abs(dy) >= Math.abs(dx) * 0.5;
+        primary = -dy;
+      } else {
+        inDir = dy > 0 && dy >= Math.abs(dx) * 0.5;
+        primary = dy;
+      }
+      if (!inDir || primary <= 0) continue;
+      if (!best || primary < best.dist) best = { id: p.id, dist: primary };
+    }
+    return best?.id ?? null;
+  }
+
   // ---- event wiring → store (display projection of THIS workspace) ---------
 
   private wireEvents(): void {
@@ -566,6 +677,9 @@ export class HostController implements HostOps {
     this.ops.updateRoute = (paneId, route) => this.updateRoute(paneId, route);
     this.ops.selectTarget = (paneId, dir, session) => this.selectTarget(paneId, dir, session);
     this.ops.renamePane = (paneId, label) => this.renamePane(paneId, label);
+    this.ops.setLayoutMode = (paneId, mode) => this.setLayoutMode(paneId, mode);
+    this.ops.focusDirection = (paneId, dir) => this.focusDirection(paneId, dir);
+    this.ops.moveDirection = (paneId, dir) => this.moveDirection(paneId, dir);
   }
 
   /** Dispose this controller: unregister from the store + the controller map so
@@ -779,6 +893,82 @@ export class HostController implements HostOps {
         return !!pa && !!pb && pa.group === pb.group;
       },
 
+      // ---- i3 layout-mode probes (orientation + header position) ------------
+      // Read the gridview root orientation ("HORIZONTAL" | "VERTICAL"). The root
+      // orientation + tree depth jointly derive every branch's orientation
+      // (dockview-core serializeBranchNode alternates orthogonal by depth). Used
+      // by the gate probe + the persistence round-trip e2e. The DockviewApi TS
+      // type doesn't expose `orientation` (it's on the gridview base), but it
+      // exists at runtime — cast through unknown to read/write it.
+      rootOrientation: (): "HORIZONTAL" | "VERTICAL" => {
+        const c = activeController();
+        if (!c) return "HORIZONTAL";
+        const ori = (c.api as unknown as { orientation?: string }).orientation;
+        return (ori ?? "HORIZONTAL") as "HORIZONTAL" | "VERTICAL";
+      },
+      // Flip the gridview root orientation at runtime. gridview.set orientation
+      // calls flipNode(root) which rebuilds the splitview tree. Whether that
+      // reloads iframes is THE Gate 1 question (probed, not assumed).
+      setRootOrientation: (o: "HORIZONTAL" | "VERTICAL"): boolean => {
+        const c = activeController();
+        if (!c) return false;
+        try {
+          (c.api as unknown as { orientation: string }).orientation = o;
+          return true;
+        } catch {
+          return false;
+        }
+      },
+      // Read the focused pane's group identity + panel count + header position.
+      // headerPosition drives the native tab strip placement ('top' = tabbed,
+      // 'left'/'right' = stacked). Used by the mode-switch e2e.
+      groupOf: (
+        paneId: string,
+      ): { groupId: string; panelCount: number; headerPosition: string } | null => {
+        const c = activeController();
+        if (!c) return null;
+        const p = c.api.getPanel(paneId);
+        if (!p) return null;
+        const g = p.group;
+        return {
+          groupId: g.id,
+          panelCount: g.panels.length,
+          headerPosition: g.api.getHeaderPosition(),
+        };
+      },
+      // Set the focused pane's group header position (tabbed/stacked mode-switch).
+      setGroupHeaderPosition: (
+        paneId: string,
+        pos: "top" | "bottom" | "left" | "right",
+      ): boolean => {
+        const c = activeController();
+        if (!c) return false;
+        const p = c.api.getPanel(paneId);
+        if (!p) return false;
+        try {
+          p.group.api.setHeaderPosition(pos);
+          return true;
+        } catch {
+          return false;
+        }
+      },
+      // Move a pane OUT of its group into a fresh group at the given direction
+      // (split a tabbed group back into tiled panes). Survival-safe: moveTo
+      // repositions the keep-mounted renderer. Position vocabulary is dockview's
+      // 'left'|'right'|'top'|'bottom' (NOT addPanel's 'direction' vocab).
+      breakOutGroup: (paneId: string, dir: "right" | "left" | "top" | "bottom"): boolean => {
+        const c = activeController();
+        if (!c) return false;
+        const p = c.api.getPanel(paneId);
+        if (!p) return false;
+        try {
+          p.api.moveTo({ group: p.group, position: dir });
+          return true;
+        } catch {
+          return false;
+        }
+      },
+
       // Renderer-lookup methods search ALL controllers (the addressed pane may
       // live in any workspace, not just the active one).
       getIframe: (id: string): HTMLIFrameElement | null =>
@@ -790,6 +980,21 @@ export class HostController implements HostOps {
       // inline edit uses (hostOps().renamePane).
       renamePane: (paneId: string, label: string): void => {
         activeController()?.renamePane(paneId, label);
+      },
+
+      // i3 layout-mode switch (Phase 1). Drives the SAME production HostOps path
+      // the statusbar cluster + keyboard shortcuts use (hostOps().setLayoutMode).
+      setLayoutMode: (paneId: string, mode: LayoutMode): void => {
+        activeController()?.setLayoutMode(paneId, mode);
+      },
+
+      // i3 directional focus/move (Alt+Arrow / Alt+Shift+Arrow). Drives the SAME
+      // production HostOps path the keyboard shortcuts use.
+      focusDirection: (paneId: string, dir: FocusDir): void => {
+        activeController()?.focusDirection(paneId, dir);
+      },
+      moveDirection: (paneId: string, dir: FocusDir): void => {
+        activeController()?.moveDirection(paneId, dir);
       },
 
       // NEGATIVE CONTROL (a): naive remove + re-add. This is the exact mistake

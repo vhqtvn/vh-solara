@@ -177,6 +177,29 @@ export const VIEW_KINDS: ViewKind[] = ["chat", "terminal", "diff", "sessions"];
 
 export type SplitDir = "right" | "down";
 
+/** Cardinal direction for i3 focus/move shortcuts (Item 4). Maps to the
+ *  spatial nearest-neighbor lookup in hostController.focusDirection /
+ *  moveDirection (bounding-box geometry, not Dockview's tree location). */
+export type FocusDir = "left" | "right" | "up" | "down";
+
+/**
+ * i3 container layout modes (Phase 1). The four i3 modes, mapped to Dockview:
+ *  - `"split-h"`: panes side-by-side (N groups in a horizontal row). Reached by
+ *    breaking a multi-panel group's panels out to the right.
+ *  - `"split-v"`: panes stacked vertically (N groups in a vertical stack).
+ *    Reached by breaking out below.
+ *  - `"tabbed"`: one pane visible at a time, tabs across the top. A multi-panel
+ *    Dockview group with `headerPosition:'top'` (the native tab strip, un-hidden
+ *    by dockviewOverrides.css for ≥2 tabs).
+ *  - `"stacked"`: one pane visible, tabs down the side. A multi-panel group with
+ *    `headerPosition:'left'`.
+ *
+ * LIVE-TREE (Gate 1 passed): setHeaderPosition + moveTo are both survival-safe
+ * (proven by the gate probe — iframe identity unchanged across the switch). No
+ * cold reload needed. The mode-switch operates on the FOCUSED pane's group.
+ */
+export type LayoutMode = "split-h" | "split-v" | "tabbed" | "stacked";
+
 /**
  * Outcome of a deterministic add-server action (decision #3). The kind tells
  * the UI which outcome line to show; `paneId` is the pane that ended up
@@ -260,6 +283,23 @@ export interface HostOps {
    * field, don't spread-recreate the panel). Refuses an empty/whitespace label
    * (keeps the current label). */
   renamePane?(paneId: string, label: string): void;
+  /**
+   * Switch the focused pane's group into one of the four i3 container layout
+   *  modes (Phase 1). LIVE-TREE (Gate 1 passed): survival-safe — no iframe
+   *  reloads. tabbed/stacked set the group's native tab-strip position; split-h/
+   *  split-v break a multi-panel group's panels out into separate tiled groups.
+   *  See {@link LayoutMode}. */
+  setLayoutMode?(paneId: string, mode: LayoutMode): void;
+  /**
+   * Focus the spatially-nearest pane in the given cardinal direction (i3
+   *  Alt+Arrow focus). Bounding-box geometry lookup; survival-safe (focusPane
+   *  only). No-op when no pane lies in that direction. */
+  focusDirection?(paneId: string, dir: FocusDir): void;
+  /**
+   * Swap the focused pane with the spatially-nearest pane in the given cardinal
+   *  direction (i3 Alt+Shift+Arrow move). Survival-safe (moveTo repositions the
+   *  keep-mounted renderers). No-op when no neighbor lies in that direction. */
+  moveDirection?(paneId: string, dir: FocusDir): void;
 }
 
 /** State pushed to a pane's header so it can reflect tray/zoom affordances. */

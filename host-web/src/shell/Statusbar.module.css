@@ -100,3 +100,46 @@
     animation: none;
   }
 }
+
+/* ---- i3 control cluster (Phase 1 touch fallback for the keyboard shortcuts) -- */
+.cluster {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  flex: 0 0 auto;
+}
+.cbtn {
+  appearance: none;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--fg-dim);
+  font-size: 13px;
+  line-height: 1;
+  padding: 3px 5px;
+  border-radius: 3px;
+  cursor: pointer;
+  min-width: 22px;
+}
+.cbtn:hover:not(:disabled) {
+  color: var(--fg);
+  border-color: var(--border);
+  background: var(--bg-elev);
+}
+.cbtn:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+}
+.cbtnWarn {
+  color: var(--warn);
+}
+.cbtnWarn:hover:not(:disabled) {
+  color: var(--warn);
+  border-color: var(--warn);
+}
+.csep {
+  width: 1px;
+  height: 14px;
+  background: var(--border);
+  margin: 0 2px;
+  flex: 0 0 auto;
+}

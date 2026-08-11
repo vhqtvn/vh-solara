@@ -204,15 +204,19 @@ test.describe("document-liveness heartbeat protocol", () => {
     const a = ids[0];
     // The mock stand-in heartbeats unconditionally → Q1-C state "alive".
     await expect.poll(async () => H.liveness(page, a), { timeout: 10_000 }).toBe("alive");
-    // The per-pane header indicator (Q1-C label) reflects it.
-    const ind = page.locator(`[data-pane-id="${a}"] [data-testid="pane-liveness"]`);
-    await expect(ind).toContainText("document alive");
+    // Phase 1 (item 2): the per-pane liveness indicator was removed; the Q1-C
+    // label now lives in the STATUSBAR for the focused pane. Focus a + assert the
+    // statusbar reflects its "document alive" liveness.
+    await H.focusPane(page, a);
+    await expect(page.locator('[data-testid="statusbar"]')).toContainText("document alive");
   });
 
   test("a real iframe reload (naiveReload) flips the indicator to reloaded", async ({ page }) => {
     const ids = await H.panes(page);
     const a = ids[0];
     await expect.poll(async () => H.liveness(page, a), { timeout: 10_000 }).toBe("alive");
+    // Focus a so the statusbar reflects its liveness through the reload window.
+    await H.focusPane(page, a);
 
     await H.naiveReload(page, a);
     // naiveReload creates a fresh iframe + (reconciled) re-binds + marks a
@@ -220,9 +224,11 @@ test.describe("document-liveness heartbeat protocol", () => {
     // establishes a new identity → reload detected → "reloaded" for the display
     // window. See docs/heartbeat-protocol.md §4.
     await expect.poll(async () => H.liveness(page, a), { timeout: 10_000 }).toBe("reloaded");
-    // The per-pane indicator reflects the reload too.
-    const ind = page.locator(`[data-pane-id="${a}"] [data-testid="pane-liveness"]`);
-    await expect(ind).toContainText("reloaded");
+    // The statusbar (focused-pane Q1-C surface) reflects the reload too.
+    await expect.poll(
+      async () => page.locator('[data-testid="statusbar"]').textContent(),
+      { timeout: 10_000 },
+    ).toContain("reloaded");
   });
 
   test("rejects a vh-host-handshake from a non-parent (sibling) source — heartbeats keep the legit identity (F1 source-guard)", async ({ page }) => {

@@ -2,24 +2,26 @@ import type {
   GroupPanelPartInitParameters,
   IContentRenderer,
 } from "dockview-core";
-import type { Attention, Activity, HostOps, LivenessState, PaneHeaderState, PaneParams } from "./types";
+import type { HostOps, PaneParams, PaneHeaderState } from "./types";
 import {
   bindContentWindow,
   bindPaneOrigin,
-  livenessFor,
   lookupContentWindow,
   noteIframeLoad,
   sendHandshake,
-  statusFor,
-  titleFor,
   unbindContentWindow,
 } from "./store";
 
 /**
- * Per-pane content renderer. Builds a CUSTOM header (a single `.pane-label` +
- * split/collapse/zoom/close affordances) over a single cross-origin <iframe>
- * whose src is the pane's {url,label} — in MOCK mode the mock content page
- * url; in REAL-fleet mode (VITE_SERVERS) a real server origin.
+ * Per-pane content renderer. Builds a CHROMELESS pane: a single cross-origin
+ * <iframe> filling the slot + a thin focus border when active. NO title text,
+ * NO per-pane buttons (the operator: "every pixel matters; title takes space
+ * without benefit"). Layout ops (split/mode/zoom/close) live in the statusbar
+ * control cluster + the i3 keyboard shortcuts, not on the pane itself.
+ *
+ * A Dockview group with multiple panels keeps its NATIVE tab strip (the tabbed/
+ * stacked affordance — see dockviewOverrides.css which un-hides it for multi-
+ * panel groups). The per-pane header this renderer used to draw is GONE.
  *
  * LOAD-BEARING RULE (the whole architecture's guarantee): create exactly ONE
  * <iframe> element and NEVER reparent, replace, or remove+re-add it. Dockview's
@@ -37,31 +39,15 @@ export class IframeRenderer implements IContentRenderer {
   private paneId = "";
   private params: PaneParams | undefined;
   private iframe!: HTMLIFrameElement;
-  private headerLabel!: HTMLElement;
-  private btnCollapse!: HTMLButtonElement;
-  private btnZoom!: HTMLButtonElement;
-  // Per-pane document-liveness indicator (Q1-C). Updated on a ~2 Hz timer that
-  // reads livenessFor(paneId) so staleness + the reloaded window expire without
-  // another heartbeat arriving.
-  private livenessDot!: HTMLElement;
-  private livenessLabel!: HTMLElement;
-  private livenessTimer: number | undefined;
-  // P1 session-attention badge (DISTINCT from Q1-C liveness: a rounded-rect
-  // badge with a glyph, not a circle dot). Shown only when the pane's current
-  // (dir,session) needs operator input (needs_permission / needs_reply). The
-  // same periodic refresh reflects the real session title (via the status
-  // message's title field, stored in titleByPane) over the raw server label.
-  private statusBadge!: HTMLElement;
-  private headerState: PaneHeaderState = {
-    inTray: false,
-    maximized: false,
-    canCollapse: true,
-  };
+  // Body wrapper that holds the iframe. Kept so naiveReload (the NEGATIVE
+  // control) can re-add a fresh iframe to PROVE a reload — never used by any
+  // production path.
+  private body!: HTMLElement;
 
   constructor(private readonly ops: HostOps) {
-    // Root container: header + body. This `.pane` element is what Dockview's
-    // OverlayRenderContainer keeps mounted; the iframe lives inside it for the
-    // panel's entire lifetime.
+    // Root container: body only (header removed — chromeless panes). This
+    // `.pane` element is what Dockview's OverlayRenderContainer keeps mounted;
+    // the iframe lives inside it for the panel's entire lifetime.
     this.element = document.createElement("div");
     this.element.className = "pane";
   }
@@ -81,82 +67,16 @@ export class IframeRenderer implements IContentRenderer {
     }
     this.buildDom();
     this.buildIframe();
-    this.startLivenessIndicator();
   }
 
   private buildDom(): void {
-    const p = this.params!;
     this.element.innerHTML = "";
-
-    const header = document.createElement("div");
-    header.className = "pane-header";
-
-    const brand = document.createElement("div");
-    brand.className = "pane-brand";
-    // Per-pane document-liveness indicator (Q1-C). dot color + label reflect
-    // livenessFor(paneId). NEVER realtime/SSE wording — see
-    // docs/heartbeat-protocol.md §6.
-    const live = document.createElement("div");
-    live.className = "pane-liveness";
-    live.setAttribute("data-testid", "pane-liveness");
-    this.livenessDot = document.createElement("span");
-    this.livenessDot.className = "pane-liveness-dot";
-    this.livenessLabel = document.createElement("span");
-    this.livenessLabel.className = "pane-liveness-label";
-    live.appendChild(this.livenessDot);
-    live.appendChild(this.livenessLabel);
-    brand.appendChild(live);
-    this.headerLabel = document.createElement("span");
-    this.headerLabel.className = "pane-label";
-    this.headerLabel.textContent = p.label;
-    this.headerLabel.title = p.label;
-    brand.appendChild(this.headerLabel);
-    // P1 session-attention badge. A rounded-rect badge with a glyph (NOT a
-    // circle dot — visually + semantically distinct from the Q1-C liveness
-    // indicator). Hidden until a status lands; updated by updateStatus() on the
-    // periodic refresh. The slow opacity pulse is the ONLY animation (no
-    // mask-image / backdrop-filter — AGENTS.md Firefox/WebRender GPU rules).
-    this.statusBadge = document.createElement("span");
-    this.statusBadge.className = "pane-status-badge";
-    this.statusBadge.setAttribute("data-testid", "pane-status-badge");
-    this.statusBadge.hidden = true;
-    brand.appendChild(this.statusBadge);
-    header.appendChild(brand);
-
-    const actions = document.createElement("div");
-    actions.className = "pane-actions";
-
-    const mk = (label: string, act: string, fn: () => void): HTMLButtonElement => {
-      const b = document.createElement("button");
-      b.type = "button";
-      b.className = `pane-btn pane-btn--${act}`;
-      b.dataset.testid = `pane-${act}`;
-      b.textContent = label;
-      b.title = label;
-      b.addEventListener("click", () => fn());
-      actions.appendChild(b);
-      return b;
-    };
-
-    mk("Split →", "split-right", () => this.ops.split?.(this.paneId, "right"));
-    mk("Split ↓", "split-down", () => this.ops.split?.(this.paneId, "down"));
-    this.btnCollapse = mk("Collapse", "collapse", () =>
-      this.headerState.inTray
-        ? this.ops.restore?.(this.paneId)
-        : this.ops.collapse?.(this.paneId),
-    );
-    this.btnZoom = mk("Zoom", "zoom", () => this.ops.toggleZoom?.(this.paneId));
-    mk("✕", "close", () => this.ops.closePane?.(this.paneId));
-
-    header.appendChild(actions);
-    this.element.appendChild(header);
-
+    // Chromeless: body only. The focus border is drawn by the `.is-active`
+    // class on `.pane` (see pane.css) — a 2px accent outline, no title/buttons.
     const body = document.createElement("div");
     body.className = "pane-body";
     this.element.appendChild(body);
-
-    // Stash body for the iframe (added in buildIframe).
-    body.setAttribute("data-body", "");
+    this.body = body;
   }
 
   private buildIframe(): void {
@@ -193,9 +113,7 @@ export class IframeRenderer implements IContentRenderer {
     // the --frame-ancestors CSP.
     iframe.setAttribute("loading", "eager");
     this.iframe = iframe;
-
-    const body = this.element.querySelector<HTMLElement>('[data-body=""]')!;
-    body.appendChild(iframe);
+    this.body.appendChild(iframe);
 
     // contentWindow is null until the element is connected to the document.
     // At init() time this element may still be detached (Dockview attaches it
@@ -226,20 +144,18 @@ export class IframeRenderer implements IContentRenderer {
 
   /** Body element (naiveReload re-adds a fresh iframe here to PROVE a reload). */
   getBody(): HTMLElement {
-    return this.element.querySelector<HTMLElement>('[data-body=""]')!;
+    return this.body;
   }
 
-  /** Push tray/zoom affordance state so header buttons reflect it. */
+  /** Push tray/zoom affordance state. With no header buttons, this only toggles
+   *  the `.is-tray` / `.is-maximized` classes on the pane root (kept so the
+   *  focus border can tint a trayed/maximized pane if desired). */
   setHeaderState(s: PaneHeaderState): void {
-    this.headerState = s;
-    this.btnZoom.textContent = s.maximized ? "Restore" : "Zoom";
-    this.btnCollapse.textContent = s.inTray ? "Restore" : "Collapse";
-    this.btnCollapse.disabled = !s.inTray && !s.canCollapse;
     this.element.classList.toggle("is-tray", s.inTray);
     this.element.classList.toggle("is-maximized", s.maximized);
   }
 
-  /** Visual active focus on the header (host focus routing). */
+  /** Visual active focus border (host focus routing). */
   setActive(active: boolean): void {
     this.element.classList.toggle("is-active", active);
   }
@@ -250,65 +166,6 @@ export class IframeRenderer implements IContentRenderer {
   }
   sendBlur(): void {
     this.postToPane({ type: "blur" });
-  }
-
-  /** Start the ~2 Hz per-pane header refresh: Q1-C liveness (dot + label) AND
-   *  P1 session-attention (title over server label + attention badge). Both are
-   *  read from the store on the same timer; neither touches the iframe element
-   *  (survival-unchanged). */
-  private startLivenessIndicator(): void {
-    this.updateLiveness();
-    this.updateStatus();
-    if (typeof window !== "undefined") {
-      this.livenessTimer = window.setInterval(() => {
-        this.updateLiveness();
-        this.updateStatus();
-      }, 500);
-    }
-  }
-
-  /** Reflect livenessFor(paneId) into the dot + label (Q1-C states). */
-  private updateLiveness(): void {
-    const state: LivenessState = livenessFor(this.paneId);
-    this.livenessDot.setAttribute("data-state", state);
-    this.livenessLabel.textContent = liveLabel(state);
-    this.livenessLabel.setAttribute("data-state", state);
-  }
-
-  /** Reflect P1 session-attention into the header: the real session title (via
-   *  the status message's title field, falling back to the server label) drives
-   *  `.pane-label`, and a distinct attention badge shows when the pane's current
-   *  (dir,session) needs operator input. Activity tints the label so a glance
-   *  distinguishes running / done / error / idle. */
-  private updateStatus(): void {
-    const st = statusFor(this.paneId);
-    const title = titleFor(this.paneId);
-    // Title over server label (augments, never suppresses the Q1-C indicator).
-    const label = title || this.params?.label || "";
-    this.headerLabel.textContent = label;
-    this.headerLabel.title = label;
-    const activity: Activity | "none" = st?.activity ?? "none";
-    if (activity === "none") {
-      this.headerLabel.removeAttribute("data-activity");
-    } else {
-      this.headerLabel.setAttribute("data-activity", activity);
-    }
-    const attention: Attention = st?.attention ?? "none";
-    if (attention === "none") {
-      this.statusBadge.hidden = true;
-      this.statusBadge.classList.remove("is-pulsing");
-      this.statusBadge.removeAttribute("data-attention");
-      this.statusBadge.textContent = "";
-    } else {
-      this.statusBadge.hidden = false;
-      this.statusBadge.setAttribute("data-attention", attention);
-      // Glyph distinguishes the two attention kinds (capability grant vs
-      // clarifying question); the rounded-rect shape + color distinguish P1
-      // attention from the Q1-C circle dot. Wording never overlaps Q1-C.
-      this.statusBadge.textContent = attention === "needs_permission" ? "!" : "?";
-      // Slow opacity pulse (the only animation) draws the eye to needs-input.
-      this.statusBadge.classList.add("is-pulsing");
-    }
   }
 
   private postToPane(msg: unknown): void {
@@ -329,22 +186,6 @@ export class IframeRenderer implements IContentRenderer {
   }
 
   dispose(): void {
-    if (this.livenessTimer !== undefined && typeof window !== "undefined") {
-      window.clearInterval(this.livenessTimer);
-      this.livenessTimer = undefined;
-    }
     unbindContentWindow(this.paneId);
-  }
-}
-
-/** Q1-C visible label for a per-pane liveness state. */
-function liveLabel(s: LivenessState): string {
-  switch (s) {
-    case "alive":
-      return "document alive";
-    case "reloaded":
-      return "reloaded";
-    case "no-signal":
-      return "no recent signal";
   }
 }

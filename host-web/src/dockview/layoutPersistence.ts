@@ -515,7 +515,18 @@ function repairLayout(
 
 /** Prune one grid node: filter a leaf's views to valid ids (drop the leaf when
  *  empty); recurse a branch and collapse it when it loses children. Returns the
- *  pruned node, or null when the node has no valid pane left. */
+ *  pruned node, or null when the node has no valid pane left.
+ *
+ *  ORIENTATION-PRESERVING (load-bearing, Item 6 fix): dockview-core derives
+ *  each branch's orientation from its TREE DEPTH (root.orientation alternates
+ *  orthogonal per level — see gridview.js serializeBranchNode). A single-child
+ *  branch is therefore NOT degenerate — it carries a depth level that encodes
+ *  orientation. The prior `if (children.length === 1) return children[0]`
+ *  collapse flattened the tree by one level, flipping the derived orientation
+ *  of every descendant (the "vertical split → horizontal on reload" bug). The
+ *  collapse is removed: a branch with one surviving child is kept as-is so the
+ *  depth-derived orientation round-trips. dockview fromJSON accepts a branch
+ *  with one child (a split with one survivor). */
 function pruneGridNode(
   node: GridNode,
   validIds: Set<string>,
@@ -538,7 +549,10 @@ function pruneGridNode(
     .map((c) => pruneGridNode(c, validIds, survivingGroups))
     .filter((c): c is GridNode => c !== null);
   if (children.length === 0) return null;
-  if (children.length === 1) return children[0]; // collapse single-child branch
+  // DO NOT collapse a single-child branch — it carries a depth level that
+  // encodes orientation (dockview derives orientation by depth). Collapsing
+  // flips the derived orientation of the subtree (the Item-6 bug). Keep the
+  // branch with its surviving children so the structure round-trips.
   return { ...node, data: children };
 }
 

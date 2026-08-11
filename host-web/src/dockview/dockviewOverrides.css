@@ -1,10 +1,11 @@
 /*
  * Dockview overrides for the vh-solara host shell.
  *
- * RULE #3 (load-bearing): Dockview's default per-group tab strip is redundant
- * for single-server-view panes — we render a CUSTOM per-pane header inside the
- * content renderer instead (see iframeRenderer.ts). Hide the group's own
- * header (tabs + void + actions) via CSS so only our header shows.
+ * i3 Phase 1 (chromeless panes): the per-pane CUSTOM header is GONE. A
+ * single-panel group (the default tiled split) hides Dockview's native tab
+ * strip too (one tab = no point). A MULTI-panel group (i3 tabbed/stacked mode)
+ * SHOWS the native strip — that is the tabbed/stacked affordance, switched via
+ * group.api.setHeaderPosition('top' = tabbed, 'left' = stacked).
  *
  * renderer:'always' places each panel's element in a shared
  * .dv-overlay-render-container, with one .dv-render-overlay per panel
@@ -13,9 +14,16 @@
  * changes) — so the overlay + its children MUST fill the content area.
  */
 
-/* hide the default group header (tabs + void + actions) */
+/* Single-panel group (default): hide the native tab strip (one tab = no point).
+ * Multi-panel group (tabbed/stacked): show it. :has() with nth-of-type(2) is
+ * cheap on this small subtree and NOT a scroll container (so the Firefox/
+ * WebRender GPU rules do not apply). Supported in Chromium 105+ + Firefox 121+
+ * (both in our test matrix). */
 .dv-groupview > .dv-tabs-and-actions-container {
   display: none !important;
+}
+.dv-groupview:has(.dv-tabs-container .dv-tab:nth-of-type(2)) > .dv-tabs-and-actions-container {
+  display: flex !important;
 }
 
 /* content area fills the group */

@@ -4,16 +4,11 @@ import { test, expect } from "@playwright/test";
 // bundle) via playwright.preview.config.ts. Every assertion here is PURELY DOM
 // — it NEVER touches window.__host (which is correctly absent in a production
 // build). This is what the DEV-only tests/e2e suite CANNOT prove: that the host
-// shell's layout ops still work when the DEV test bridge is eliminated. The
-// pane-header ops already went through the HostOps controller surface; this
-// proves the SHELL ops do too.
+// shell's layout ops still work when the DEV test bridge is eliminated.
 //
-// P4: the top tabstrip is the FLAT target tabstrip (workspace tabs were removed
-// from primary nav — workspaces stay internal as the rendering layer). The
-// flat-tab visit/select/survival behavior is covered by the DEV e2e
-// (target-tabs.spec.ts, which has the bridge to drive visits). Here we only
-// prove the production build renders the new tabstrip without workspace chrome
-// and without crashing.
+// Phase 1 (i3 host-shell): the top tabstrip is the WORKSPACE tabstrip again
+// (ws-tab/ws-add present), and split/close/zoom/mode-switch live in the statusbar
+// control cluster (the touch fallback). Per-pane headers are gone.
 
 async function waitForHostReady(page: import("@playwright/test").Page): Promise<void> {
   await page.goto("/");
@@ -22,10 +17,10 @@ async function waitForHostReady(page: import("@playwright/test").Page): Promise<
   // independent of window.__host. Never realtime/SSE wording.
   await expect(page.locator('[data-testid="statusbar"]'))
     .toContainText("document alive", { timeout: 30_000 });
-  // Seed panes rendered (DOM-only readiness): the active workspace has panes
-  // with custom headers carrying the Split affordance.
+  // Seed panes rendered (DOM-only readiness): the workspace tabstrip is present
+  // (Phase 1 restored it) with the default workspace tab.
   await expect
-    .poll(async () => page.locator('[data-testid="pane-split-right"]').count(), { timeout: 30_000 })
+    .poll(async () => page.locator('[data-testid="ws-tab"]').count(), { timeout: 30_000 })
     .toBeGreaterThanOrEqual(1);
 }
 
@@ -34,40 +29,69 @@ test.describe("host shell — production build (vite preview)", () => {
     await waitForHostReady(page);
   });
 
-  test("production build has NO window.__host (and no keyboard-focus DEV bridge)", async ({ page }) => {
-    // The DEV-only test bridge (and its destructive hooks) must be entirely
-    // absent from the running production app. This is the runtime twin of the
-    // dist/ grep proof.
+  test("production build has NO window.__host (and no DEV bridges)", async ({ page }) => {
+    // The DEV-only test bridges (host + keyboard-focus + i3-keys) and their
+    // destructive hooks must be entirely absent from the running production app.
     const hasBridge = await page.evaluate(() => {
-      const w = window as unknown as { __host?: unknown; __hostKbdFocus?: unknown };
+      const w = window as unknown as {
+        __host?: unknown;
+        __hostKbdFocus?: unknown;
+        __hostI3Keys?: unknown;
+      };
       return {
         host: typeof w.__host !== "undefined",
         kbdFocus: typeof w.__hostKbdFocus !== "undefined",
+        i3Keys: typeof w.__hostI3Keys !== "undefined",
       };
     });
     expect(hasBridge.host, "window.__host must be absent in production").toBe(false);
     expect(hasBridge.kbdFocus, "window.__hostKbdFocus must be absent in production").toBe(false);
+    expect(hasBridge.i3Keys, "window.__hostI3Keys must be absent in production").toBe(false);
   });
 
-  test("production tabstrip has NO workspace chrome (flat target strip)", async ({ page }) => {
-    // P4: the workspace tabs + add-workspace "+" were removed from the primary
-    // tabstrip. The brand remains. This proves the production bundle reflects
-    // the flat-tabstrip change (no ws-tab / ws-add elements in the DOM).
-    await expect(page.locator('[data-testid="ws-tab"]')).toHaveCount(0);
-    await expect(page.locator('[data-testid="ws-add"]')).toHaveCount(0);
-    // The brand mark is still present (the tabstrip container rendered).
+  test("production tabstrip HAS workspace chrome (ws-tab/ws-add present)", async ({ page }) => {
+    // Phase 1: the workspace tabs + add-workspace "+" are RESTORED to the
+    // primary tabstrip (P4 pane-tabs reverted). This proves the production
+    // bundle reflects the workspace-tabstrip change.
+    await expect(page.locator('[data-testid="ws-tab"]')).toHaveCount(1);
+    await expect(page.locator('[data-testid="ws-add"]')).toHaveCount(1);
     await expect(page.locator('[data-testid="statusbar"]')).toContainText("document alive");
   });
 
-  test("collapse + tray-chip restore — shell restore via HostOps", async ({ page }) => {
-    // Collapse a pane via its header button (controller collapse → floating
-    // group), which makes App.tsx render a tray-chip. Clicking the SHELL tray-
-    // chip calls hostOps().restore(id) → grid. The chip must disappear.
-    await page.locator('[data-testid="pane-collapse"]').first().click();
-    const chip = page.locator('[data-testid="tray-chip"]');
-    await expect(chip).toHaveCount(1);
-    await chip.click();
-    await expect(page.locator('[data-testid="tray-chip"]')).toHaveCount(0);
+  test("production statusbar control cluster is present (touch fallback)", async ({ page }) => {
+    // The i3 control cluster (split-h/v, mode, zoom, close) is part of the
+    // production shell (NOT DEV-gated) and must render in a production build.
+    // With a focused pane, none of these are disabled.
+    await expect(page.locator('[data-testid="i3-controls"]')).toBeVisible();
+    for (const tid of [
+      "i3-split-h",
+      "i3-split-v",
+      "i3-tabbed",
+      "i3-stacked",
+      "i3-zoom",
+      "i3-close",
+    ]) {
+      await expect(page.locator(`[data-testid="${tid}"]`)).toBeVisible();
+    }
+  });
+
+  test("zoom (statusbar cluster) maximizes + restores in production", async ({ page }) => {
+    // Zoom is reachable in production via the statusbar cluster (no DEV bridge).
+    // The statusbar "maximized" badge reflects the state.
+    await page.locator('[data-testid="i3-zoom"]').click();
+    await expect(page.locator('[data-testid="statusbar"]')).toContainText("maximized");
+    await page.locator('[data-testid="i3-zoom"]').click();
+    await expect(page.locator('[data-testid="statusbar"]')).not.toContainText("maximized");
+  });
+
+  test("split (statusbar cluster) adds a pane in production", async ({ page }) => {
+    // Split is reachable in production via the statusbar cluster (no DEV bridge).
+    // Count the iframes before/after (DOM-only — no bridge needed).
+    const before = await page.locator("iframe.pane-iframe").count();
+    await page.locator('[data-testid="i3-split-h"]').click();
+    await expect
+      .poll(async () => page.locator("iframe.pane-iframe").count())
+      .toBe(before + 1);
   });
 
   test("P3 attention hub renders in production; NEXT button absent when no needs-you", async ({ page }) => {

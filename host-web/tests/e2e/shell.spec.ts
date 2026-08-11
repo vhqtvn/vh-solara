@@ -1,11 +1,16 @@
 import { test, expect } from "@playwright/test";
 import * as H from "./util";
 
-// Shell wiring: drives the REAL UI (buttons, workspace tabs, tray chip,
-// statusbar) — not the bridge — to prove the host chrome is wired end-to-end.
+// Shell wiring: drives the REAL UI (workspace tabs, statusbar control cluster,
+// tray chip) — not the bridge — to prove the host chrome is wired end-to-end.
 // Survival is covered by survival.spec.ts; this covers the affordances a human
 // would use. Chromium only (Firefox runs survival.spec.ts; this is chrome-only
 // UI smoke).
+//
+// Phase 1 (i3 host-shell): the per-pane header was REMOVED (panes are content +
+// focus-border only). Split/close/zoom/mode-switch are driven from the statusbar
+// control cluster (the touch fallback) or the keyboard (i3Keyboard.ts). The top
+// tabstrip is the WORKSPACE tabstrip again (ws-tab/ws-add present).
 
 test.describe("host shell UI wiring", () => {
   test.beforeEach(async ({ page }) => {
@@ -21,36 +26,36 @@ test.describe("host shell UI wiring", () => {
     await expect(bar).toContainText("dockview · renderer:always");
   });
 
-  // P4: the workspace tabstrip was REPLACED by the flat target tabstrip. The
-  // ws-tab/ws-add/delete/rename affordances are GONE from the primary nav
-  // (workspaces stay internal — the overlay stack is untouched). The flat-tab
-  // visit/select/survival behavior is covered by target-tabs.spec.ts; this
-  // suite keeps covering the pane-level shell chrome (split/close/tray/zoom/
-  // focus/statusbar) which is unchanged.
-
-  test("flat tabstrip has no workspace chrome (ws-tab/ws-add absent)", async ({ page }) => {
-    // The workspace tabs + the add-workspace "+" were removed from the primary
-    // tabstrip (P4). The brand + AddServer remain.
-    await expect(page.locator('[data-testid="ws-tab"]')).toHaveCount(0);
-    await expect(page.locator('[data-testid="ws-add"]')).toHaveCount(0);
+  // Phase 1: the workspace tabstrip is RESTORED (P4 pane-tabs reverted). The
+  // brand + one ws-tab per workspace + the add-workspace "+" are present in the
+  // primary nav. Workspace switching + add/delete/rename/needs-you are covered
+  // by workspace-tabs.spec.ts; here we only assert the chrome is present.
+  test("workspace tabstrip is present (ws-tab/ws-add visible)", async ({ page }) => {
+    const wsTabs = page.locator('[data-testid="ws-tab"]');
+    await expect(wsTabs).toHaveCount(1); // the seeded default workspace
+    await expect(page.locator('[data-testid="ws-add"]')).toHaveCount(1);
   });
 
-  test("pane header 'Split →' adds a pane to the active workspace", async ({ page }) => {
+  test("statusbar control cluster split adds a pane to the active workspace", async ({ page }) => {
     const before = (await H.panes(page)).length;
-    await page.locator('[data-testid="pane-split-right"]').first().click();
+    await page.locator('[data-testid="i3-split-h"]').click();
     await expect.poll(async () => (await H.panes(page)).length).toBe(before + 1);
   });
 
-  test("pane header close removes a pane", async ({ page }) => {
+  test("statusbar control cluster close removes the focused pane", async ({ page }) => {
     const before = (await H.panes(page)).length;
-    await page.locator('[data-testid="pane-close"]').first().click();
+    await page.locator('[data-testid="i3-close"]').click();
     await expect.poll(async () => (await H.panes(page)).length).toBe(before - 1);
   });
 
-  test("collapse parks a pane in the tray chip rail; chip restores it", async ({ page }) => {
+  test("collapse (bridge) parks a pane in the tray chip rail; chip restores it", async ({ page }) => {
+    // Phase 1 does not surface collapse-to-tray in the chrome (no per-pane
+    // header, no statusbar collapse button). The tray rail + restore chip still
+    // exist for a cold-restored tray; drive collapse via the DEV bridge to prove
+    // the tray-chip restore wiring still works.
     const ids = await H.panes(page);
     const first = ids[0];
-    await page.locator(`[data-pane-id="${first}"] [data-testid="pane-collapse"]`).click();
+    await H.collapse(page, first);
     // a tray chip appears
     const chip = page.locator('[data-testid="tray-chip"]');
     await expect(chip).toHaveCount(1);
@@ -61,32 +66,21 @@ test.describe("host shell UI wiring", () => {
     await expect(page.locator('[data-testid="tray-chip"]')).toHaveCount(0);
   });
 
-  test("zoom toggles the maximized badge in the statusbar", async ({ page }) => {
-    await page.locator('[data-testid="pane-zoom"]').first().click();
+  test("zoom (statusbar cluster) toggles the maximized badge", async ({ page }) => {
+    await page.locator('[data-testid="i3-zoom"]').click();
     await expect.poll(async () => H.isMaximized(page)).toBe(true);
     await expect(page.locator('[data-testid="statusbar"]')).toContainText("maximized");
-    await page.locator('[data-testid="pane-zoom"]').first().click();
+    await page.locator('[data-testid="i3-zoom"]').click();
     await expect.poll(async () => H.isMaximized(page)).toBe(false);
   });
 
-  test("focusing a pane via its header updates the statusbar focus line", async ({ page }) => {
+  test("focusing a pane updates the statusbar focus line", async ({ page }) => {
     const ids = await H.panes(page);
-    // Focus pane b via the bridge (the top tabstrip is workspace-scoped now;
-    // within-workspace focus is exercised by clicking a pane's header area).
+    // Focus pane 1 via the bridge; the statusbar "focus: <label>" line updates.
+    const params = await H.paneParams(page);
+    const label1 = params.find((p) => p.id === ids[1])?.label ?? "";
     await H.focusPane(page, ids[1]);
     await expect.poll(async () => H.focused(page)).toBe(ids[1]);
-  });
-
-  test("can't collapse the last remaining pane via the UI", async ({ page }) => {
-    const ids = await H.panes(page);
-    for (let i = 1; i < ids.length; i++) {
-      await page.locator('[data-testid="pane-close"]').first().click();
-    }
-    await expect.poll(async () => H.gridPaneCount(page)).toBe(1);
-    // The Collapse affordance is DISABLED (the guard): Playwright refuses to
-    // click a disabled button, so we assert the disabled state directly.
-    const collapseBtn = page.locator('[data-testid="pane-collapse"]').first();
-    await expect(collapseBtn).toBeDisabled();
-    await expect(page.locator('[data-testid="tray-chip"]')).toHaveCount(0);
+    await expect(page.locator('[data-testid="statusbar"]')).toContainText(`focus: ${label1}`);
   });
 });

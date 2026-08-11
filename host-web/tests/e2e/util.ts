@@ -727,6 +727,62 @@ export async function sameGroup(page: Page, a: string, b: string): Promise<boole
     return h ? h.sameGroup(a, b) : false;
   }, { a, b });
 }
+// ---- i3 layout-mode + directional ops (window.__host, DEV-only) ------------
+// Phase 1 i3 host-shell: drive the layout-mode switch + directional focus/move
+// through the SAME production HostOps path the statusbar cluster + i3Keyboard
+// use (hostOps().setLayoutMode / focusDirection / moveDirection). Also expose
+// the group/orientation inspection hooks the modes e2e asserts on.
+
+export type LayoutMode = "split-h" | "split-v" | "tabbed" | "stacked";
+export type FocusDir = "left" | "right" | "up" | "down";
+
+/** Set the i3 layout mode for the focused pane's group (tabbed/stacked flip
+ *  header position; split-h/split-v break a multi-panel group out). Bridges
+ *  hostOps().setLayoutMode — the SAME path the statusbar cluster uses. */
+export async function setLayoutModeBridge(page: Page, paneId: string, mode: LayoutMode): Promise<void> {
+  await page.evaluate(({ paneId, mode }) => {
+    const h = (window as unknown as { __host?: { setLayoutMode(p: string, m: LayoutMode): void } }).__host;
+    h?.setLayoutMode(paneId, mode);
+  }, { paneId, mode });
+}
+
+/** Focus the nearest pane in a cardinal direction (Alt+Arrow path). */
+export async function focusDirection(page: Page, paneId: string, dir: FocusDir): Promise<void> {
+  await page.evaluate(({ paneId, dir }) => {
+    const h = (window as unknown as { __host?: { focusDirection(p: string, d: FocusDir): void } }).__host;
+    h?.focusDirection(paneId, dir);
+  }, { paneId, dir });
+}
+
+/** Swap the focused pane with the nearest pane in a cardinal direction (Alt+Shift+Arrow). */
+export async function moveDirection(page: Page, paneId: string, dir: FocusDir): Promise<void> {
+  await page.evaluate(({ paneId, dir }) => {
+    const h = (window as unknown as { __host?: { moveDirection(p: string, d: FocusDir): void } }).__host;
+    h?.moveDirection(paneId, dir);
+  }, { paneId, dir });
+}
+
+/** The focused pane's group info: {groupId, panelCount, headerPosition}. */
+export async function groupOf(
+  page: Page,
+  paneId: string,
+): Promise<{ groupId: string; panelCount: number; headerPosition: string } | null> {
+  const r = await page.evaluate((paneId) => {
+    const h = (window as unknown as { __host?: { groupOf(p: string): { groupId: string; panelCount: number; headerPosition: string } | null } }).__host;
+    return h ? h.groupOf(paneId) : null;
+  }, paneId);
+  return r ?? null;
+}
+
+/** The grid root orientation ("HORIZONTAL" | "VERTICAL"). */
+export async function rootOrientation(page: Page): Promise<string | null> {
+  const r = await page.evaluate(() => {
+    const h = (window as unknown as { __host?: { rootOrientation(): string } }).__host;
+    return h ? h.rootOrientation() : null;
+  });
+  return r ?? null;
+}
+
 export async function naiveReload(page: Page, id: string): Promise<void> {
   await page.evaluate((id) => {
     const h = (window as unknown as { __host?: { naiveReload(i: string): void } }).__host;

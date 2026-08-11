@@ -2,12 +2,14 @@ import { createMemo, Show } from "solid-js";
 import {
   connected,
   focusedId,
+  hostOps,
   isMaximized,
   livenessFor,
   needsYouCount,
   panes,
   runningCount,
 } from "../dockview/store";
+import type { LayoutMode } from "../dockview/types";
 import { livenessLabel } from "../dockview/types";
 import { resolveFleet } from "../state/mockData";
 import { next } from "../attentionNext";
@@ -108,9 +110,110 @@ export function Statusbar() {
         </button>
       </Show>
       <span class={s.spacer} />
+      {/* i3 control cluster (Phase 1): the touch fallback for when there's no
+          keyboard (the i3 shortcuts of Item 4 mirror these). Compact — this is
+          the power-user/touch surface, not the primary chrome. Each button acts
+          on the FOCUSED pane's group via the typed HostOps surface. Disabled
+          when no pane is focused. */}
+      <ControlCluster />
       <span class={s.badge} title="layout engine / render mode">
         dockview · renderer:always{isMaximized() ? " · maximized" : ""}
       </span>
     </div>
+  );
+}
+
+/**
+ * Compact i3 control cluster: split-h/split-v, mode (tabbed/stacked), zoom,
+ * close. The touch fallback for the i3 keyboard shortcuts (Item 4). Operates on
+ * the focused pane's group via hostOps(). GPU-cheap: plain buttons, no effects.
+ */
+function ControlCluster() {
+  const hasFocus = createMemo(() => !!focusedId());
+  const splitH = () => {
+    const id = focusedId();
+    if (id) hostOps()?.split?.(id, "right");
+  };
+  const splitV = () => {
+    const id = focusedId();
+    if (id) hostOps()?.split?.(id, "down");
+  };
+  const mode = (m: LayoutMode) => {
+    const id = focusedId();
+    if (id) hostOps()?.setLayoutMode?.(id, m);
+  };
+  const zoom = () => {
+    const id = focusedId();
+    if (id) hostOps()?.toggleZoom?.(id);
+  };
+  const close = () => {
+    const id = focusedId();
+    if (id) hostOps()?.closePane?.(id);
+  };
+  return (
+    <span class={s.cluster} data-testid="i3-controls">
+      <button
+        type="button"
+        class={s.cbtn}
+        data-testid="i3-split-h"
+        title="Split horizontal (Alt+H)"
+        disabled={!hasFocus()}
+        onClick={splitH}
+      >
+        ⫦
+      </button>
+      <button
+        type="button"
+        class={s.cbtn}
+        data-testid="i3-split-v"
+        title="Split vertical (Alt+V)"
+        disabled={!hasFocus()}
+        onClick={splitV}
+      >
+        ⫪
+      </button>
+      <span class={s.csep} />
+      <button
+        type="button"
+        class={s.cbtn}
+        data-testid="i3-tabbed"
+        title="Tabbed mode (Alt+W)"
+        disabled={!hasFocus()}
+        onClick={() => mode("tabbed")}
+      >
+        ▭
+      </button>
+      <button
+        type="button"
+        class={s.cbtn}
+        data-testid="i3-stacked"
+        title="Stacked mode (Alt+S)"
+        disabled={!hasFocus()}
+        onClick={() => mode("stacked")}
+      >
+        ☰
+      </button>
+      <span class={s.csep} />
+      <button
+        type="button"
+        class={s.cbtn}
+        data-testid="i3-zoom"
+        title="Zoom (Alt+F)"
+        disabled={!hasFocus()}
+        onClick={zoom}
+      >
+        ⤢
+      </button>
+      <button
+        type="button"
+        class={`${s.cbtn} ${s.cbtnWarn}`}
+        data-testid="i3-close"
+        title="Close (Alt+Shift+Q)"
+        disabled={!hasFocus()}
+        onClick={close}
+      >
+        ✕
+      </button>
+    </span>
   );
 }

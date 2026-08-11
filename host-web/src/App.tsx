@@ -15,6 +15,7 @@ import {
   onWorkspaceActivated,
   uninstallKeyboardFocus,
 } from "./keyboardFocus";
+import { installI3Keyboard, uninstallI3Keyboard } from "./i3Keyboard";
 import s from "./App.module.css";
 
 /**
@@ -58,9 +59,11 @@ export function App() {
   // bound by the time the accessor fires.
   onMount(() => {
     installKeyboardFocus(() => appRoot);
+    installI3Keyboard();
   });
   onCleanup(() => {
     uninstallKeyboardFocus();
+    uninstallI3Keyboard();
   });
 
   // While the keyboard is open and the operator switches workspace, re-point

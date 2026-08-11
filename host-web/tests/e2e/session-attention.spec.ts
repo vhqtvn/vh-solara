@@ -6,10 +6,18 @@ import * as H from "./util";
 //
 // Proves the host captures a {type:"status"} message from a pane (source-bound,
 // via the REAL routeMessage router — same path the SPA's statusEmitter uses),
-// reflects it into the pane header (attention badge + real title over the
-// server label) and the workspace-aggregate needs-you badge, keeps the Q1-C
-// document-liveness indicator visually + semantically DISTINCT, and does NOT
-// reload the iframe (survival-unchanged).
+// reflects it into the statusbar attention hub (the workspace-aggregate needs-you
+// count + NEXT routing), keeps the Q1-C document-liveness indicator visually +
+// semantically DISTINCT (liveness dot/label vs the attention-hub count), and
+// does NOT reload the iframe (survival-unchanged).
+//
+// PHASE 1 (i3 host-shell, item 2): the per-pane header (label + attention badge
+// + Q1-C liveness dot) was REMOVED — panes are content + focus-border only. The
+// attention + liveness signals now live at the STATUSBAR (the hub count + the
+// focused-pane liveness dot/label). The two per-pane-indicator tests that
+// asserted on .pane-label / .pane-status-badge / .pane-liveness-* were removed
+// (their DOM targets no longer exist); the Q1-C distinctness guarantee was
+// rewritten to assert at the statusbar surface.
 //
 // The status message is driven through the DEV-only probeStatus bridge
 // (source-bound to a real pane's contentWindow) — the sanctioned seam, same
@@ -115,123 +123,56 @@ test.describe("P1 session-attention", () => {
     expect(r.reason).toBe("rejected:origin-mismatch");
 
     // The message did NOT land: statusByPane, the needs-you aggregate, and the
-    // Q1-C liveness are all unchanged. (Badge + liveness are store-derived; the
-    // status-store equality is the deterministic mutation proof.)
+    // Q1-C liveness are all unchanged. (These are store-derived; the status-store
+    // equality is the deterministic mutation proof. The per-pane badge chrome was
+    // removed in Phase 1 item 2 — the needsYou count above is the live surface.)
     expect(await H.status(page, pane), "statusByPane unchanged by the wrong-origin post").toEqual(baseline);
     expect(await H.needsYou(page), "needs-you aggregate unchanged").toBe(1);
     expect(await H.liveness(page, pane), "Q1-C liveness unchanged").toBe(baselineLiveness);
-    // Badge still reflects the baseline attention (not the forged needs_reply).
-    await expect(page.locator(`[data-pane-id="${pane}"] .pane-status-badge`)).toHaveAttribute("data-attention", "needs_permission");
   });
 
-  // ---- pane-level indicator (PRIMARY): title + attention badge -------------
+  // PHASE 1 (item 2): the per-pane header (label + attention badge) was REMOVED.
+  // The two tests that asserted on .pane-label / .pane-status-badge were deleted
+  // (their DOM targets no longer exist). The P1 status DATA path is still proven
+  // by the capture/reject tests above; attention is now surfaced via the
+  // statusbar attention-hub (the workspace-aggregate needs-you count, asserted in
+  // the wrong-origin test + workspace-tabs.spec.ts needs-you-badge test).
 
-  test("pane header surfaces the real title over the server label", async ({ page }) => {
+  // ---- distinctness from Q1-C document-liveness (statusbar surface) ---------
+
+  test("Q1-C liveness + P1 attention render simultaneously + stay distinct (statusbar)", async ({ page }) => {
     const ids = await H.panes(page);
     const pane = ids[0];
-    const labelBefore = await page
-      .locator(`[data-pane-id="${pane}"] .pane-label`)
-      .textContent();
 
-    await H.probeStatus(page, {
-      sourcePaneId: pane,
-      origin: MOCK_ORIGIN,
-      payload: {
-        type: "status",
-        dir: "/proj",
-        session: "s1",
-        title: "Real Session Title XYZ",
-        attention: "none",
-        activity: "idle",
-      },
-    });
-
-    // The renderer reflects title on its ~2 Hz refresh; poll for it.
-    await expect
-      .poll(
-        async () => page.locator(`[data-pane-id="${pane}"] .pane-label`).textContent(),
-        { timeout: 5000 },
-      )
-      .toBe("Real Session Title XYZ");
-    // And it differs from whatever was there before (the server/mock label).
-    expect(labelBefore, "title replaced/augmented the raw label").not.toContain(
-      "Real Session Title XYZ",
-    );
-  });
-
-  test("attention badge shows for needs_permission / needs_reply; hidden for none", async ({ page }) => {
-    const ids = await H.panes(page);
-    const pane = ids[0];
-    const badge = page.locator(`[data-pane-id="${pane}"] .pane-status-badge`);
-
-    // needs_permission → visible "!" badge, data-attention set.
-    await H.probeStatus(page, {
-      sourcePaneId: pane,
-      origin: MOCK_ORIGIN,
-      payload: { type: "status", dir: "", session: "s1", title: "", attention: "needs_permission", activity: "idle" },
-    });
-    await expect.poll(async () => badge.getAttribute("data-attention"), { timeout: 5000 }).toBe("needs_permission");
-    await expect(badge).toBeVisible();
-    await expect(badge).toHaveText("!");
-
-    // needs_reply → "?" badge.
-    await H.probeStatus(page, {
-      sourcePaneId: pane,
-      origin: MOCK_ORIGIN,
-      payload: { type: "status", dir: "", session: "s1", title: "", attention: "needs_reply", activity: "idle" },
-    });
-    await expect.poll(async () => badge.getAttribute("data-attention"), { timeout: 5000 }).toBe("needs_reply");
-    await expect(badge).toHaveText("?");
-
-    // none → hidden, no attention attr.
-    await H.probeStatus(page, {
-      sourcePaneId: pane,
-      origin: MOCK_ORIGIN,
-      payload: { type: "status", dir: "", session: "s1", title: "", attention: "none", activity: "idle" },
-    });
-    await expect.poll(async () => badge.isHidden(), { timeout: 5000 }).toBe(true);
-  });
-
-  // P4: the per-workspace needs-you badge was REPLACED by per-target indicators
-  // on the flat tabstrip. The per-pane header badge (tested above) is unchanged.
-  // The flat-tab honest-status behavior is covered by target-tabs.spec.ts.
-
-  // ---- distinctness from Q1-C document-liveness ----------------------------
-
-  test("Q1-C liveness indicator stays distinct + unchanged alongside P1 attention", async ({ page }) => {
-    const ids = await H.panes(page);
-    const pane = ids[0];
-    const root = page.locator(`[data-pane-id="${pane}"]`);
-
-    // Drive BOTH: a heartbeat-driven liveness state (alive) AND a needs-permission
-    // status. Both indicators must render SIMULTANEOUSLY and remain distinct.
+    // Drive a needs_permission status on the focused pane so the attention hub
+    // shows a non-zero count. Focus the pane so its Q1-C liveness surfaces in the
+    // statusbar.
+    await H.focusPane(page, pane);
     await H.probeStatus(page, {
       sourcePaneId: pane,
       origin: MOCK_ORIGIN,
       payload: { type: "status", dir: "", session: "s1", title: "T", attention: "needs_permission", activity: "running" },
     });
 
-    // Q1-C liveness dot + label still present with Q1-C wording (never the P1
-    // attention wording). The mock heartbeats → "document alive".
-    await expect(root.locator(".pane-liveness-dot")).toBeVisible();
-    await expect
-      .poll(async () => root.locator(".pane-liveness-label").textContent(), { timeout: 5000 })
-      .toMatch(/alive|reloaded|no recent signal/);
+    const bar = page.locator('[data-testid="statusbar"]');
 
-    // P1 attention badge present with its OWN wording/shape (no overlap). Poll
-    // for the renderer's reflection (it updates on a ~2 Hz tick) BEFORE reading
-    // the glyph text.
-    await expect
-      .poll(async () => root.locator(".pane-status-badge").getAttribute("data-attention"), { timeout: 5000 })
-      .toBe("needs_permission");
-    await expect(root.locator(".pane-status-badge")).toBeVisible();
-    const badgeText = await root.locator(".pane-status-badge").textContent();
-    expect(badgeText, "P1 badge uses a glyph, never Q1-C wording").toMatch(/^[!?]$/);
+    // Q1-C liveness: the statusbar shows the focused pane's DOCUMENT liveness
+    // (Q1-C wording, never realtime/SSE). The mock heartbeats → "document alive".
+    await expect(bar).toContainText("document alive");
 
-    // Shape distinctness: liveness is a circle dot; attention is a rounded-rect
-    // badge (different class + element).
-    await expect(root.locator(".pane-liveness-dot")).toHaveClass(/pane-liveness-dot/);
-    await expect(root.locator(".pane-status-badge")).toHaveClass(/pane-status-badge/);
+    // P1 attention hub: the statusbar shows the active-workspace needs-you count
+    // (the live attention surface after the per-pane chrome was removed).
+    await expect.poll(async () => H.needsYou(page), { timeout: 8000 }).toBe(1);
+    await expect(bar.locator('[data-testid="attention-hub"]')).toContainText("1 need you");
+
+    // DISTINCTNESS (the load-bearing guarantee): the liveness channel (Q1-C dot
+    // + "document alive" text) and the attention channel (the hub count) are
+    // SEPARATE elements with non-overlapping wording — a glance distinguishes
+    // "document alive" (Q1-C) from "1 need you" (P1 attention). Both render at
+    // once over the same statusbar.
+    const text = (await bar.textContent()) ?? "";
+    expect(text, "Q1-C liveness wording present").toContain("document alive");
+    expect(text, "P1 attention wording present").toContain("need you");
   });
 
   // ---- survival-SAFE (complements survival.spec negative controls) ---------
