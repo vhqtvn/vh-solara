@@ -3079,6 +3079,20 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// `/favicon.ico`: browsers auto-request this at the origin root for ANY
+	// page — a legacy fallback that runs EVEN when <link rel="icon"> is set.
+	// Without a dedicated route it falls through to the SPA index (HTML),
+	// which a browser cannot use as an icon. Serve the icon that matches `/`
+	// ownership instead (see serveFavicon): the HOST icon in production
+	// (hostShellAtRoot), the single-server icon in legacy/test. This does NOT
+	// add a compile dependency on a built bundle — in cold-build/placeholder
+	// mode the icon file is absent from the embed and the FileServer returns
+	// 404 (acceptable; the placeholder banner renders with no icon).
+	if path == "/favicon.ico" {
+		s.serveFavicon(w, r)
+		return
+	}
+
 	// `/` and any other unknown path:
 	//   - production (hostShellAtRoot=true) → the HOST shell (the default view);
 	//   - legacy/test (hostShellAtRoot=false) → the SINGLE-SERVER SPA (pre-fold).
@@ -3122,6 +3136,27 @@ func (s *Server) serveAppIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.NotFound(w, r)
+}
+
+// serveFavicon serves `/favicon.ico` (the path browsers auto-request at the
+// origin root for any page, a legacy fallback that bypasses <link rel="icon">).
+// It serves the icon belonging to whichever shell owns `/`: the HOST icon.svg
+// in production (hostShellAtRoot, served at `/`) via the host FileServer, or
+// the single-server icon.svg in legacy/test mode via the single-server
+// FileServer. The request path is rewritten to /icon.svg so the delegated
+// FileServer serves the embedded icon with reused content-type detection
+// (consistent with how the same FileServer serves /icon.svg for the
+// single-server SPA). If the icon is absent from the embed (cold-build
+// placeholder-only mode), the FileServer returns 404 — acceptable, and it adds
+// no compile dependency on a built bundle. This mirrors `/` ownership, so the
+// favicon is always consistent with the shell the operator actually sees.
+func (s *Server) serveFavicon(w http.ResponseWriter, r *http.Request) {
+	r2 := newHTTPRequestPath(r, "/icon.svg")
+	if s.hostShellAtRoot {
+		s.hostStatic.ServeHTTP(w, r2)
+		return
+	}
+	s.static.ServeHTTP(w, r2)
 }
 
 // newHTTPRequestPath clones r with the URL path rewritten to p (preserving

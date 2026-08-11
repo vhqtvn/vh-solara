@@ -7,6 +7,17 @@
       content="width=device-width, viewport-fit=cover, initial-scale=1.00"
     />
     <title>VHSolara · Host</title>
+    <!-- Favicon / identity. In the folded build (VITE_HOST_FOLDED=1) Vite
+         namespaces these under /host/ (its `base`), so they resolve via the
+         host embed FS (host-dist) and do NOT collide with the single-server
+         SPA's root-level /icon.svg. The hrefs are root-absolute (/icon.svg);
+         Vite rewrites them to /host/icon.svg at build time. iOS ignores SVG
+         apple-touch-icons, so the 192px PNG raster is shipped alongside (same
+         as the single-server SPA). The browser's legacy auto-request to
+         /favicon.ico (which bypasses these <link>s) is handled by a dedicated
+         route in pkg/web/server.go handleStatic. -->
+    <link rel="icon" href="/icon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="/icon-192.png" />
   </head>
   <body>
     <div id="root"></div>
