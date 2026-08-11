@@ -22,6 +22,26 @@ import (
 )
 
 // descendantsLocked returns id plus every session transitively parented by it.
+//
+// ORDER CONTRACT (load-bearing, pinned by TestDescendantsOrderIsParentFirst):
+// the result is PARENT-FIRST — a DFS pre-order walk where id itself is appended
+// to `out` BEFORE any of its descendants are pushed to the stack, and within the
+// walk every parent appears before its own descendants. This ordering is NOT
+// incidental. It is relied on by pkg/web/archive.go's runArchiveCascade, which
+// freezes the archive scope via Store.Descendants (the exported wrapper below)
+// and iterates it IN ORDER, adding each successfully-archived id to succeededSet
+// as it goes. classifyArchiveFailure → descendantOfSucceeded then walks a
+// captured parentOf chain UPWARD from a failed id and returns true if ANY
+// ancestor is in succeededSet — which is sound ONLY because Descendants yields
+// every ancestor before the descendant, so by the time a failed id is
+// classified, all of its already-processed ancestors are in succeededSet. If
+// this traversal were ever changed to child-first (or any order where a
+// descendant precedes an ancestor), a just-orphaned child would be
+// misclassified as a root failure instead of a descendant-of-succeeded. Any
+// refactor of this walk MUST preserve ancestor-before-descendant, or
+// descendantOfSucceeded must be updated in lockstep. Sibling order is NOT
+// guaranteed (the children map is built by iterating s.sessions, whose order is
+// nondeterministic); only the ancestor-before-descendant property is contracted.
 func (s *Store) descendantsLocked(id string) []string {
 	children := map[string][]string{}
 	for _, se := range s.sessions {
@@ -42,6 +62,12 @@ func (s *Store) descendantsLocked(id string) []string {
 
 // Descendants returns id plus every live session transitively parented by it
 // (used to cascade an archive across a session's subsessions).
+//
+// The result is PARENT-FIRST (DFS pre-order); see descendantsLocked's ORDER
+// CONTRACT — that ordering is load-bearing for pkg/web/archive.go's
+// descendantOfSucceeded archive classification (a child is classified against a
+// succeededSet that is populated in iteration order, so the parent must appear
+// before the child). Returns nil when id is unknown to the live store.
 func (s *Store) Descendants(id string) []string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
