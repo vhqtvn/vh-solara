@@ -633,3 +633,143 @@ func TestArchiveJob_ReissueReachesStragglerThroughArchivedIntermediate(t *testin
 		}
 	}
 }
+
+// DEFER archive-resume-fetch-error-test — closes the fetch-error→[rootID]
+// fallback branch of resumeArchiveAffected (pkg/web/archive.go). When a root is
+// ABSENT from the live store (so Descendants returns nil and the resume path
+// fires) AND OpenCode's list-fetch errors, the helper MUST fall back to
+// [rootID] (re-PATCH / 404-tolerate the root alone) rather than 502 or panic —
+// never inflate a partial/failed fetch into a wrong affected set.
+//
+// Branch uniqueness is the proof here: the fetch-error branch is the ONLY
+// resumeArchiveAffected branch reachable when a list-fetch errors — the other
+// branches (idHasArchivedTime, liveDescendantsOfArchivedRoot) all require both
+// fetches to succeed. So observing "list endpoint returned 500, yet /vh/archive
+// returned 200 with affected=[rootID] and the job completed cleanly" exercises
+// this branch specifically. Contrast the unarchive path (handleArchive's
+// unarchive branch), which returns 502 on the same ListArchivedSessions error —
+// the archive path's fetch-error tolerance is this branch's whole purpose.
+//
+// The seam is fakeOC.listSessionsStatus (added alongside this test): when
+// non-zero, the GET /session handler returns that status for BOTH /session and
+// /session?archived=true. The 500 propagates through Client.ListSessions /
+// ListArchivedSessions (getJSON returns a non-nil error on non-2xx), so BOTH
+// errLive and errArch are non-nil → the || short-circuits → [rootID].
+func TestArchiveJob_ResumeFetchErrorFallsBackToRoot(t *testing.T) {
+	f := &fakeOC{}
+	f.listSessionsStatus = http.StatusInternalServerError // inject list-fetch failure
+	web, _, srv, _ := queueLifecycleServer(t, f)
+	srv.SetReassertDelay(5 * time.Millisecond)
+
+	// Root r is ABSENT from the live store (ghost / never-seeded). Descendants(r)
+	// returns nil → resumeArchiveAffected is called → its ListSessions fetch
+	// errors (500) → falls back to [r]. No store seeding, no queue file — a
+	// ghost root has neither.
+
+	resp, affected := postArchive(t, web.URL, "r")
+	defer resp.Body.Close()
+	// CRUX 1 — the fetch error is NON-FATAL on the archive path: 200, not 502.
+	if resp.StatusCode != 200 {
+		t.Fatalf("/vh/archive with list-fetch error: got %d, want 200 (fetch error is non-fatal on the archive path; unarchive would 502)", resp.StatusCode)
+	}
+	// CRUX 2 — the fallback returned exactly [rootID] (not a derived set, not
+	// empty, and not a 502 from a fatalized fetch error).
+	if len(affected) != 1 || affected[0] != "r" {
+		t.Fatalf("affected: got %v, want exactly [r] (the ghost-tolerant [rootID] fallback on fetch error)", affected)
+	}
+
+	// The job must complete cleanly (no panic, no hang) despite the list-fetch
+	// erroring again during the post-archive re-assert phase (reassertArchiveWork
+	// logs the ListSessions error and returns).
+	srv.awaitArchiveJobs(t, 5*time.Second)
+
+	// CRUX 3 — the [rootID] fallback drove a re-PATCH of the root through the
+	// job (archiveOneID(r) → SetArchived(r) → fakeOC returns 200 → success).
+	// This is the observable side-effect that distinguishes "the [rootID]
+	// fallback ran and fed the job" from "nothing happened": without the fallback
+	// wiring, the job would have an empty affected set and PATCH nothing. The
+	// count is EXACTLY 1: the only PATCH of r is the cascade's archiveOneID; the
+	// post-archive re-assert also hits the injected 500 on ListSessions and
+	// returns early (no re-PATCH) — matching TestArchiveJob_409…'s exact-count
+	// crux shape.
+	patches := archivedPATCHes(f)
+	if n := countID(patches, "r"); n != 1 {
+		t.Errorf("root r PATCH count: got %d, want exactly 1 (the [rootID] fallback re-PATCHs the root once; re-assert is a no-op on the 500): patches=%v", n, patches)
+	}
+}
+
+// DEFER archive-409-success-re-derive-branch — closes the 409+already-archived→
+// success branch of archiveOneID (pkg/web/archive.go). When SetArchived returns
+// 409 (Conflict) AND a re-derive from OpenCode's authoritative archived list
+// confirms the id IS already archived, archiveOneID counts the id as SUCCESS
+// (removed + cleaned) WITHOUT retrying. This is distinct from the 409→retry→
+// exhaust branch (retries under budget, then classifies) and from the
+// permanent-failure branch (400/403). Today only the retry/exhaust (RT1a, via
+// archiveFailNext 500s) and permanent-failure (RT1c/RT1d, via 403) paths are
+// tested; this exercises the integrated idArchivedInOpenCode HTTP re-derive on
+// the 409 path.
+//
+// No NEW fakeOC seam is needed: two EXISTING fields compose to cover the branch.
+//   - archiveStatusByID["r"] = 409 → EVERY SetArchived(r) PATCH returns 409
+//     (the field is "permanent" in the sense of always-returning, but the 409
+//     case in archiveOneID re-derives rather than classifying immediately).
+//   - listArchivedReply contains r with time.archived set → idArchivedInOpenCode
+//     (which calls ListArchivedSessions) parses it and returns true →
+//     archiveOneID short-circuits to success on the FIRST 409, no retry.
+//
+// The distinguishing observation: r is PATCHed EXACTLY ONCE. The 409→retry→
+// exhaust branch would PATCH r `budget` times (then fail); the already-archived
+// success branch short-circuits on the first 409, so the count is 1 AND r is
+// removed + cleaned (success), not recorded as a failure.
+func TestArchiveJob_409AlreadyArchivedCountsAsSuccess(t *testing.T) {
+	f := &fakeOC{archiveStatusByID: map[string]int{"r": http.StatusConflict}}
+	// idArchivedInOpenCode calls ListArchivedSessions; seed r as genuinely
+	// archived there (time.archived = non-zero) so the re-derive returns true →
+	// archiveOneID counts the 409 as success on the first attempt.
+	f.listArchivedReply = []byte(`[{"id":"r","time":{"archived":1}}]`)
+	// Report r as archived in the LIVE list too, so the post-archive re-assert
+	// phase (reassertArchiveWork → ListSessions) SKIPS r (archivePersisted[r] is
+	// true) and adds no extra PATCH — keeps the PATCH-count assertion crisp at 1.
+	f.listSessionsReply = []byte(`[{"id":"r","time":{"archived":1}}]`)
+	web, agg, srv, root := queueLifecycleServer(t, f)
+	srv.SetReassertDelay(5 * time.Millisecond)
+
+	agg.Store().Apply(ev("session.created", `{"info":{"id":"r"}}`))
+	seedQueueFile(t, root, "r")
+
+	resp, affected := postArchive(t, web.URL, "r")
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("/vh/archive: got %d, want 200 (job accepted)", resp.StatusCode)
+	}
+	if len(affected) != 1 || affected[0] != "r" {
+		t.Fatalf("affected: got %v, want [r]", affected)
+	}
+
+	srv.awaitArchiveJobs(t, 5*time.Second)
+
+	patches := archivedPATCHes(f)
+	// CRUX — r was PATCHed EXACTLY ONCE: the first 409 triggered the re-derive,
+	// idArchivedInOpenCode confirmed r is already archived → archiveOneID
+	// returned true (success) WITHOUT retrying. The 409→retry→exhaust branch
+	// would have PATCHed r `budget` times (default 5) then classified it a
+	// failure; the already-archived short-circuit is exactly 1 PATCH and success.
+	if n := countID(patches, "r"); n != 1 {
+		t.Errorf("r PATCH count: got %d, want 1 (409 + already-archived → short-circuit to success, NOT retry to budget): patches=%v", n, patches)
+	}
+	// r counted as SUCCESS → removed from live store + queue cleaned (the
+	// success path). The retry/exhaust path would retain r (retain-on-failure).
+	if agg.Store().Descendants("r") != nil {
+		t.Error("r still in live store (409+already-archived should count as success → RemoveSessionIfPresent)")
+	}
+	if queueFileExists(root, "r") {
+		t.Error("r queue.json still present (success path should CleanupSession)")
+	}
+	// r succeeded → NOT recorded as a job failure (the retry/exhaust path would
+	// record a root failure here).
+	for _, fail := range srv.ArchiveFailures() {
+		if fail.ID == "r" {
+			t.Errorf("r recorded as a job failure (409+already-archived is success, not failure): %+v", fail)
+		}
+	}
+}

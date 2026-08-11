@@ -86,6 +86,17 @@ type fakeOC struct {
 	// the two endpoints server-side.
 	listArchivedReply []byte
 
+	// listSessionsStatus (DEFER archive-resume-fetch-error-test seam): when
+	// non-zero, the GET /session handler returns this HTTP status (no body)
+	// instead of the reply, modelling an OpenCode list-fetch failure. Applies to
+	// BOTH /session (ListSessions) and /session?archived=true
+	// (ListArchivedSessions) — the handler serves both. Exercises
+	// resumeArchiveAffected's fetch-error → [rootID] fallback branch
+	// (pkg/web/archive.go: errLive != nil || errArch != nil), the ghost-tolerant
+	// path that re-PATCHes the root alone rather than inflating a failed fetch
+	// into a wrong affected set. 0 (default) = no injection, existing behavior.
+	listSessionsStatus int
+
 	// permHold, when non-nil, blocks POST /permission/:id/reply (the watcher's
 	// auto-reject RPC) until the channel is closed — letting a test hold the RPC
 	// genuinely in-flight so Server.Shutdown's watcher-ctx cancellation can be
@@ -123,6 +134,17 @@ func (f *fakeOC) handler() http.Handler {
 		// compat (tests written before the split expected the same reply for
 		// both). Default to "[]" when neither is set.
 		f.mu.Lock()
+		// listSessionsStatus injection (DEFER archive-resume-fetch-error-test):
+		// return the configured HTTP status instead of the reply body, modelling
+		// an OpenCode list-fetch failure. Checked under the existing lock and
+		// before the archived/non-archived reply split so it applies to BOTH
+		// endpoints (the handler serves /session and /session?archived=true).
+		if f.listSessionsStatus != 0 {
+			st := f.listSessionsStatus
+			f.mu.Unlock()
+			w.WriteHeader(st)
+			return
+		}
 		var reply []byte
 		if r.URL.Query().Get("archived") == "true" {
 			reply = f.listArchivedReply
