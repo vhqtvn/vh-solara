@@ -51,6 +51,16 @@ const (
 	defaultArchiveRetryMax    = 8 * time.Second
 )
 
+// defaultArchiveBackstopInterval is the cadence of the Slice-2 OOB-reconcile
+// backstop ticker (runArchiveBackstop). 5s matches the aggregator's
+// tree-reconcile tick (pkg/aggregator reconciliation.go runTreeReconcile) that
+// refreshes the archived snapshot the backstop reads — so the backstop always
+// sees a snapshot at most ~5s stale, which is acceptable for a self-healing
+// sweep (the happy path is the immediate clear-on-success at the cascade success
+// funnel; the backstop only fires for the OOB-resolved gap). Tests do NOT rely
+// on the ticker — they call reconcileArchiveFailures() directly.
+const defaultArchiveBackstopInterval = 5 * time.Second
+
 // archiveRetryConfig is the captured-at-launch retry policy for one cascade
 // job. Frozen from the Server's per-instance config under bgMu so the job never
 // reads shared mutable state after dispatch (same pattern as reassertDelay).
@@ -263,6 +273,14 @@ func (s *Server) handleArchive(w http.ResponseWriter, r *http.Request) {
 		}
 		s.bgWG.Add(1)
 		atomic.AddInt64(&s.archiveJobsActive, 1) // hoisted before launch: awaitArchiveJobs must see >=1
+		// Slice-2 active-jobs registry (under the SAME bgMu critical section
+		// the bgWG.Add above already holds): record (dir, root) so the OOB-
+		// reconcile backstop (reconcileArchiveFailures) can SKIP this root
+		// while the cascade is in flight. Keyed by the SAME composite as the
+		// failure registry (archiveFailureKey) so the backstop's lookup is a
+		// direct hit. Deregistered at runArchiveCascade's terminal defer
+		// (deregisterArchiveJob) on ALL exit paths — no leaked entries.
+		s.archiveJobsActiveRoots[archiveFailureKey{Dir: dir, ID: body.SessionID}] = true
 		s.bgMu.Unlock()
 		go s.runArchiveCascade(bgCtx, agg, affected, body.SessionID, dir, delay, cfg)
 	}
@@ -303,6 +321,10 @@ func (s *Server) handleArchive(w http.ResponseWriter, r *http.Request) {
 func (s *Server) runArchiveCascade(bgCtx context.Context, agg *aggregator.Aggregator, affected []string, srcID, dir string, delay time.Duration, cfg archiveRetryConfig) {
 	defer s.bgWG.Done()
 	defer atomic.AddInt64(&s.archiveJobsActive, -1)
+	// Slice-2 active-jobs deregister (runs on ALL exit paths — success, exhaust,
+	// cancel/shutdown — so the registry never leaks an entry that would make the
+	// OOB-reconcile backstop permanently skip a root). See deregisterArchiveJob.
+	defer s.deregisterArchiveJob(dir, srcID)
 
 	ts := time.Now().UnixMilli()
 	root, rootErr := projectRoot(dir)
@@ -369,6 +391,21 @@ func (s *Server) runArchiveCascade(bgCtx context.Context, agg *aggregator.Aggreg
 		// subagent clobbered (200 returned but archived reverted to null).
 		s.reassertArchiveWork(bgCtx, delay, agg, succeeded, srcID)
 	}
+}
+
+// deregisterArchiveJob removes (dir, root) from the active-jobs registry under
+// bgMu. It is the Slice-2 active-jobs-registry terminal step, deferred at the
+// TOP of runArchiveCascade so it runs on ALL exit paths (success, exhaust,
+// cancel/shutdown). A leaked entry would make the OOB-reconcile backstop
+// (reconcileArchiveFailures) PERMANENTLY skip that root — the warning would
+// never clear via the backstop, defeating the whole point of Slice 2. The
+// bgMu acquisition here is the matching deregister of the register at the
+// handleArchive launch site; it is brief (one map delete) and does NOT nest
+// store.s.mu or archiveFailuresMu, so it cannot invert the lock order.
+func (s *Server) deregisterArchiveJob(dir, root string) {
+	s.bgMu.Lock()
+	delete(s.archiveJobsActiveRoots, archiveFailureKey{Dir: dir, ID: root})
+	s.bgMu.Unlock()
 }
 
 // archiveOneID performs the bounded-retry SetArchived for a single id and

@@ -1542,6 +1542,49 @@ func (s *Store) ChainTerminatesAtArchived(id string) bool {
 	return s.chainTerminatesAtArchivedLocked(id)
 }
 
+// IsArchiveRootResolved reports whether a stuck-root archive target has been
+// resolved out-of-band — archived or deleted by another tool / a direct
+// OpenCode call, OUTSIDE this daemon's archive cascade. It is the Slice-2
+// OOB-reconcile backstop's predicate (pkg/web archive_backstop.go
+// reconcileArchiveFailures): a stale archiveJobFailure record for id is cleared
+// once this returns true, closing the ONE gap Slice 1 left (a root recorded
+// permanently-stuck, then archived/deleted out-of-band, would otherwise persist
+// its warning until daemon restart — Slice 1's clear-on-success fires only at
+// THIS daemon's cascade success funnel, which never ran for an OOB resolution).
+//
+// Resolved means ANY of (mirroring the authorities sweepOrphansLocked +
+// classifyArchiveFailure already use, never inventing a new one):
+//   - id is ABSENT from the live session tree. An OOB archive completes → the
+//     next tree-reconcile tick (runTreeReconcile) fetches /session (which
+//     EXCLUDES archived entries) → ReconcileSessions evicts id from s.sessions.
+//     An OOB delete → id drops out of /session → same eviction. Either way id
+//     is gone from the live tree.
+//   - id is STILL present but confirmed archived in the authoritative snapshot
+//     (archivedSnapshot, rebuilt by RefreshArchivedSnapshot from OpenCode's
+//     archived-session list). Covers the window before ReconcileSessions evicts.
+//   - id's parentID chain now terminates at an ARCHIVED ancestor
+//     (chainTerminatesAtArchivedLocked) — id was re-parented under, or is a
+//     descendant of, an OOB-archived root. The stuck-root record for id is
+//     stale because id is no longer a root that needs archiving on its own.
+//
+// Takes s.mu.RLock internally (read-only — the same authority the public
+// ChainTerminatesAtArchived takes). The Slice-2 backstop calls this while
+// holding the Server's bgMu, establishing the bgMu → store.s.mu lock-order
+// direction (bgMu ALWAYS outermost when both are held — see reconcileOneArchiveFailure).
+// Returns true for an id never seeded (absent → resolved) — the correct
+// disposition for a ghost root whose stale warning should clear.
+func (s *Store) IsArchiveRootResolved(id string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.sessions[id] == nil {
+		return true // absent from the live tree (OOB archive or delete evicted it)
+	}
+	if s.archivedSnapshot[id] {
+		return true // present but confirmed archived in the authoritative snapshot
+	}
+	return s.chainTerminatesAtArchivedLocked(id) // re-parented under an archived ancestor
+}
+
 // ParentOf returns the raw parentID of id from the live store ("" for a root or
 // an unknown id). The archive cascade job captures a snapshot of the parent
 // chain for every id in the frozen affected scope BEFORE any RemoveSessions

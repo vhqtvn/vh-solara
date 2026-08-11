@@ -324,6 +324,29 @@ type Server struct {
 	archiveFailuresMu sync.Mutex
 	archiveFailures   map[archiveFailureKey]archiveJobFailure
 
+	// archiveJobsActiveRoots is the set of (dir, rootID) pairs with an in-flight
+	// archive cascade job — the Slice-2 active-jobs registry that makes the OOB-
+	// reconcile backstop race-free. Guarded by bgMu (the EXISTING server-level
+	// job lock — handleArchive's launch site and runArchiveCascade's terminal
+	// defer are the ONLY register/deregister sites, both already under bgMu).
+	// The Slice-2 backstop (reconcileArchiveFailures) reads it under bgMu to
+	// SKIP a root whose cascade is still running — the cascade's own clear-on-
+	// success (at the success funnel) / re-record-on-failure owns that root's
+	// lifecycle, and the backstop must not race it. Keyed by the SAME composite
+	// (archiveFailureKey) as archiveFailures so the backstop's "is (dir,root)
+	// active?" lookup is a direct map hit. NOT archiveJobsActive (the atomic
+	// counter at line ~312): that has no dir/id and is a test-only seam.
+	archiveJobsActiveRoots map[archiveFailureKey]bool
+
+	// archiveBackstopInterval is the cadence of the Slice-2 OOB-reconcile
+	// backstop ticker (runArchiveBackstop). Default defaultArchiveBackstopInterval
+	// (5s, matching the aggregator's tree-reconcile tick that refreshes the
+	// snapshot the backstop reads). Read ONCE at backstop-goroutine startup
+	// (happens-before via the goroutine launch in NewServer). Tests do NOT rely
+	// on the ticker — they call reconcileArchiveFailures() directly for
+	// determinism.
+	archiveBackstopInterval time.Duration
+
 	// lifecycleWG tracks the Server-owned per-directory lifecycle goroutines so
 	// Shutdown can AWAIT (not merely cancel) them: every permission watcher (all
 	// dirs, incl. the default — the Server arms them) and every NON-DEFAULT
@@ -515,29 +538,31 @@ func NewServer(agg *aggregator.Aggregator, opencodeURL string, ringCapacity int)
 		// Production default: the host shell is the default view at `/`. The
 		// fixture server (web e2e lane) calls SetHostShellAtRoot(false) to keep
 		// the single-server SPA at `/` (legacy, so the web e2e is unchanged).
-		hostShellAtRoot:    true,
-		opencodeURL:        opencodeURL,
-		ringCap:            ringCapacity,
-		aggs:               map[string]*aggregator.Aggregator{"": agg},
-		idem:               newIdemCache(10 * time.Minute),
-		features:           defaultFeatures(),
-		views:              newViewRegistry(),
-		queues:             newQueueRegistry(),
-		pins:               pinStore,
-		labelsReg:          newLabelRegistry(),
-		failFast:           map[string]struct{}{},
-		watcherOn:          map[string]bool{},
-		watcherCancel:      map[string]context.CancelFunc{},
-		queueGCOn:          map[string]bool{},
-		pinsGCOn:           map[string]bool{},
-		labelsGCOn:         map[string]bool{},
-		bgCtx:              bgCtx,
-		bgCancel:           bgCancel,
-		reassertDelay:      defaultReassertDelay,
-		archiveRetryBudget: defaultArchiveRetryBudget,
-		archiveRetryBase:   defaultArchiveRetryBase,
-		archiveRetryMax:    defaultArchiveRetryMax,
-		archiveFailures:    map[archiveFailureKey]archiveJobFailure{},
+		hostShellAtRoot:         true,
+		opencodeURL:             opencodeURL,
+		ringCap:                 ringCapacity,
+		aggs:                    map[string]*aggregator.Aggregator{"": agg},
+		idem:                    newIdemCache(10 * time.Minute),
+		features:                defaultFeatures(),
+		views:                   newViewRegistry(),
+		queues:                  newQueueRegistry(),
+		pins:                    pinStore,
+		labelsReg:               newLabelRegistry(),
+		failFast:                map[string]struct{}{},
+		watcherOn:               map[string]bool{},
+		watcherCancel:           map[string]context.CancelFunc{},
+		queueGCOn:               map[string]bool{},
+		pinsGCOn:                map[string]bool{},
+		labelsGCOn:              map[string]bool{},
+		bgCtx:                   bgCtx,
+		bgCancel:                bgCancel,
+		reassertDelay:           defaultReassertDelay,
+		archiveRetryBudget:      defaultArchiveRetryBudget,
+		archiveRetryBase:        defaultArchiveRetryBase,
+		archiveRetryMax:         defaultArchiveRetryMax,
+		archiveFailures:         map[archiveFailureKey]archiveJobFailure{},
+		archiveJobsActiveRoots:  map[archiveFailureKey]bool{},
+		archiveBackstopInterval: defaultArchiveBackstopInterval,
 	}
 	// Arm the DEFAULT aggregator synchronously, BEFORE the server can serve
 	// any HTTP request. The default aggregator is created in the daemon
@@ -553,6 +578,12 @@ func NewServer(agg *aggregator.Aggregator, opencodeURL string, ringCapacity int)
 	// no-op (Arm is idempotent — same value, same lock). See the armed field
 	// doc in pkg/aggregator/aggregator.go for the full model.
 	agg.Arm()
+	// Spawn the Slice-2 OOB-reconcile backstop (archive-failure visibility).
+	// Bound to bgCtx (Shutdown cancels via bgCancel) and tracked by bgWG
+	// (Shutdown awaits via bgWG.Wait) — same lifecycle as the archive cascade
+	// jobs. The goroutine reads archiveBackstopInterval once at startup.
+	srv.bgWG.Add(1)
+	go srv.runArchiveBackstop()
 	return srv, nil
 }
 
