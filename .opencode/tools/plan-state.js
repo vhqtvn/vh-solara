@@ -357,7 +357,7 @@ export const planStateTool = tool({
             .boolean()
             .optional()
             .describe(
-                "Allow delete_coordination_task to remove a protected card despite its guard. Overrides BOTH the active-owner guard (an actively-owned working card, refusal code active_working_task) AND the pending-gate lifecycle guard (a card in working/reported/blocked/completed state, refusal code lifecycle_state_protected). This is a destructive override — the task card and its local report directory are destroyed, not transitioned. Use deliberately.",
+                "Allow delete_coordination_task to remove a protected card despite its guard. Overrides the active-owner guard (an actively-owned working card, refusal code active_working_task), the in-flight lifecycle guard (a card in working/reported/blocked state, refusal code lifecycle_state_protected), AND the completed-card landing gate (a completed card with no reachable Task-Card trailer, refusal code landing_not_confirmed). This is a destructive override — the task card and its local report directory are destroyed, not transitioned. For a completed card this also bypasses the landing check, so it is emergency-only for completed cleanup, NOT the ordinary route (the ordinary route is for the work to land under a Task-Card: trailer and then retire). Use deliberately.",
             ),
     },
     async execute(args, context) {

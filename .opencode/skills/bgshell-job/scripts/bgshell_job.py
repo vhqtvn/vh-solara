@@ -67,6 +67,71 @@ def read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text())
 
 
+# ---------------------------------------------------------------------------
+# Pause-on-new-work sentinel (inline port of the JS contract in
+# .opencode/scripts/pause-new-work.js — keep in LOCKSTEP). This is a
+# repo-scoped pause on NEW work across enumerated dispatch entrypoints; it is
+# NOT 'global ESTOP' or an abort/kill switch. The bgshell gate covers
+# command_launch + command_resume (NEW spawn). command_stop is deliberately
+# UNTOUCHED — stopping/kill semantics are different and must always work.
+#
+# Contract (ONE source of truth):
+#   sentinel absent                 -> disengaged (permit; ordinary operation)
+#   sentinel present + valid        -> engaged   (refuse covered new work)
+#   sentinel present + malformed    -> engaged   (fail-safe, NOT degraded)
+#   sentinel present + unreadable   -> engaged   (fail-safe, NOT degraded)
+#   indeterminate FS check failure  -> engaged   + report DEGRADED
+# Existence is the authority; content is advisory. A single read is both the
+# existence check and the content read (no stat-then-read TOCTOU).
+# ---------------------------------------------------------------------------
+PAUSE_SENTINEL_FILENAME = "pause-new-work.json"
+
+
+def pause_sentinel_path() -> Path:
+    override = os.environ.get("OPENCODE_STATE_ROOT")
+    if override and override.strip():
+        return Path(override.strip()).resolve() / PAUSE_SENTINEL_FILENAME
+    return repo_root() / ".opencode" / "state" / PAUSE_SENTINEL_FILENAME
+
+
+def pause_engaged() -> tuple[bool, str]:
+    """Read the pause sentinel. Returns (engaged, message).
+
+    message is "" normally, or "degraded: ..." on an indeterminate FS failure.
+    Lockstep with the JS/Go consumers: malformed content (including non-UTF-8
+    bytes) -> engaged fail-safe, NOT degraded (content is advisory).
+    """
+    sp = pause_sentinel_path()
+    try:
+        sp.read_text()
+    except FileNotFoundError:
+        return False, ""
+    except OSError as exc:
+        # Indeterminate filesystem failure -> fail safe + degraded.
+        return True, f"degraded: could not read pause sentinel ({exc})"
+    except UnicodeDecodeError:
+        # Malformed content (non-UTF-8 bytes): engaged fail-safe, NOT degraded.
+        # Content is advisory; existence is the authority.
+        return True, ""
+    # Present -> engaged regardless of content.
+    return True, ""
+
+
+def pause_refuse(detail: str, note: str = "") -> None:
+    """Raise a SystemExit with the operator-facing refusal message.
+
+    Callers pass the already-read degraded note to avoid a second read.
+    """
+    suffix = f" ({note})" if note else ""
+    raise SystemExit(
+        f"Pause on new work is ENGAGED{suffix}.\n"
+        f"  refused: {detail}\n"
+        f"  This is a repo-scoped pause on NEW work across enumerated dispatch "
+        f"entrypoints. In-flight work is NOT affected. Disengage with "
+        f"'vh-agent-harness pause-new-work disengage'."
+    )
+
+
 def opencode_db_path() -> Path | None:
     override = os.environ.get("VH-SOLARA_BGSHELL_OPENCODE_DB")
     if override:
@@ -332,6 +397,11 @@ def command_launch(args: argparse.Namespace) -> dict[str, Any]:
         "interrupted_at": None,
         "stop_requested_at": None,
     }
+    # Pause-on-new-work gate: refuse NEW bgshell spawn before writing the job
+    # state / spawning the wrapper. The stop path (command_stop) is untouched.
+    engaged, note = pause_engaged()
+    if engaged:
+        pause_refuse(f"bgshell launch (session={session_name}, job={job_name}).", note)
     write_json(job_file, payload)
 
     wrapper_pid = spawn_wrapper(job_dir)
@@ -447,6 +517,11 @@ def command_resume(args: argparse.Namespace) -> dict[str, Any]:
     job["wrapper_pid"] = None
     job["child_pid"] = None
     job["child_pgid"] = None
+    # Pause-on-new-work gate: resume (re-spawn) is NEW work too. Refuse before
+    # writing/spawning. The stop path (command_stop) is untouched.
+    engaged, note = pause_engaged()
+    if engaged:
+        pause_refuse(f"bgshell resume (job={job.get('job_name')}).", note)
     write_json(job_file, job)
 
     wrapper_pid = spawn_wrapper(job_file.parent)

@@ -679,9 +679,24 @@ function writeOutputs(outputs, archiveDir, removed) {
     }
 }
 
-function renderSummary(state, archiveSummary, diffState) {
+// renderSummary renders the human-readable post-run/summary. The FIRST line is
+// MODE-GATED so the output never claims a write that did not happen:
+//   - WRITE mode (the default): "Normalized backlog at <path>" — a normalization
+//     actually ran and wrote the outputs.
+//   - CHECK mode (--check): "Backlog normalization check (<path>)" — NOTHING was
+//     written; the line reports what was checked, not what was mutated. The
+//     pending-updates line below conveys whether a cleanup is required (none) or
+//     up-to-date (none). This closes the output-honesty defect where `--check`
+//     against a clean backlog printed "Normalized backlog at ..." while writing
+//     nothing — a false mutation claim about the shared ledger.
+// The rest of the summary (counts, archive, pending updates) is mode-independent
+// and unchanged.
+function renderSummary(state, archiveSummary, diffState, isCheck) {
+    const backlogRel = path.relative(REPO_ROOT, state.backlogPath) || state.backlogPath;
     const lines = [
-        `Normalized backlog at ${path.relative(REPO_ROOT, state.backlogPath) || state.backlogPath}`,
+        isCheck
+            ? `Backlog normalization check (${backlogRel})`
+            : `Normalized backlog at ${backlogRel}`,
         `- Now: ${state.activeRows.Now.length} active rows`,
         `- Next: ${state.activeRows.Next.length} active rows`,
         `- Later: ${state.activeRows.Later.length} active rows`,
@@ -723,7 +738,7 @@ function main() {
     });
     const { outputs, archiveSummary } = desiredOutputs(state);
     const diffState = computeDiffState(outputs, options.archiveDir);
-    const summary = renderSummary(state, archiveSummary, diffState);
+    const summary = renderSummary(state, archiveSummary, diffState, options.check);
 
     if (options.check) {
         if (diffState.changed.length || diffState.removed.length) {

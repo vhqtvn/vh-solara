@@ -61,27 +61,98 @@ release gate can cross-check by a stable join key:
   create a tagged row in the project's canonical backlog carrying a STABLE HOLD
   ID of the form `s2-hold: S2-<skill>-001` — the `s2-hold:` token prefix is what
   a release gate enumerates rows by. This row is authoritative for "a strict S2
-  hold exists."
+  hold exists." The row's **Links column** carries the evidence-packet path
+  (repo-relative `researches/sources/<file>.md`) so the gate can follow the
+  reference without scanning every packet by prose.
 - **Evidence packet slot (the verdict).** In the project's evidence/research
   packet, create a slot joined to that SAME stable hold ID, carrying a verdict
-  of `PENDING` or `SATISFIED`. This slot is authoritative for "the pilot
-  succeeded."
+  of `PENDING`, `SATISFIED`, or `WITHDRAWN`. This slot is authoritative for
+  "the pilot succeeded" (or, for `WITHDRAWN`, "the hold was explicitly
+  withdrawn").
+
+#### Machine-parseable record grammar
+
+The evidence slot is a machine-parseable record so the deterministic gate can
+read it without prose heuristics. ONE record per hold, anchored by a heading
+the parser discovers, with delimited fields:
+
+```
+### S2 hold: S2-<skill>-001
+- Verdict: PENDING | SATISFIED | WITHDRAWN
+- Skill: <skill-slug>
+- Pilot: <repo> (retrospective)
+```
+
+- `### S2 hold: S2-<skill>-001` heading — the parser discovery anchor
+  (heading-level; the stable hold ID is case-sensitive `S2-<slug>-NNN`).
+- `- Verdict:` line — the delimited verdict field. The closed enum is
+  `PENDING | SATISFIED | WITHDRAWN` (the `|` here is metavariable OR-notation;
+  exactly one value is recorded).
+- `- Skill: <skill-slug>` — the held skill. Required for every record (the held
+  skill is known at hold-creation), and MUST equal the `<skill>` encoded in the
+  hold ID (`S2-<skill>-NNN` → the slug between `S2-` and the final `-NNN`). A
+  mismatch is an evaluator-error: the evidence is about a different skill than
+  the held one.
+- `- Pilot: <repo> (retrospective)` — the pilot provenance, where the
+  parenthetical is either `(retrospective)` or `(forward)` (a literal value,
+  not a pipe expression). Required for `SATISFIED` (the pilot landed, so it must
+  be identified). Optional for `PENDING`/`WITHDRAWN`.
+
+The backlog row side is the `s2-hold: S2-<skill>-001` token in the **Notes**
+column plus the evidence-packet path in the **Links** column. The two surfaces
+join by the STABLE HOLD ID — never narrative prose.
+
+#### Applicability universe
+
+The gate enumerates BOTH the active backlog and the archive, joined by stable
+hold ID over the UNION, with a single-record / single-verdict invariant:
+
+- **Active:** `docs/planning/backlog.md` (all task sections — Now/Next/Later/
+  Done/Cancelled).
+- **Archive:** `docs/planning/archive/backlog-archive-*.md` (files matching
+  `backlog-archive-(YYYY-q[1-4]|undated).md`).
+- A stable hold ID MUST appear exactly once across the union on each surface
+  (exactly one backlog row, exactly one evidence record). Duplicates, a missing
+  join, or a zero/>1 match are structural failures the gate refuses.
+
+#### cancelled / WITHDRAWN fail-closed semantics
+
+A `cancelled` backlog row carrying `s2-hold:` is ambiguous (did the hold get
+withdrawn, or was the row cancelled for an unrelated reason while the token
+lingered?). The gate fail-closes on this: a cancelled row with an `s2-hold:`
+token BLOCKS until resolved by EITHER
+
+- (a) removing the token (explicit withdrawal — the row no longer claims a
+  hold), OR
+- (b) a matching evidence record with `Verdict: WITHDRAWN`.
+
+`cancelled` + `WITHDRAWN` is the one clear disposition for a cancelled hold;
+`cancelled` + any other verdict (or a missing record) is a structural
+(evaluator-error) refusal.
+
+#### Deterministic enforcement
+
+A deterministic evaluator (`check-s2-holds.mjs`) ships from `templates/core/`,
+so every consumer receives the evaluator AND this machine-parseable contract.
+This repository's release-tag wrapper invokes it authoritatively at tag time
+as the G6 gate; a consumer that wires its OWN release wrapper to the same
+evaluator gets the same enforcement. The readiness agent consumes the same
+contract ADVISORY; the wrapper re-derives G6 AUTHORITATIVELY from the committed
+state bound to the exact commit being tagged (HEAD_SHA, never the moving HEAD
+ref and never the worktree). A release refuses while any hold is `PENDING`,
+while the two surfaces disagree on resolution state, or while the inputs are
+structurally invalid — and no override cures an S2-hold block.
 
 Lifecycle of the hold:
 
-1. **On hold:** create the tagged backlog row + a `PENDING` evidence slot, both
-   carrying the same stable hold ID.
+1. **On hold:** create the tagged backlog row (token in Notes, packet path in
+   Links) + a `PENDING` evidence record, both carrying the same stable hold ID.
 2. **On pilot landing:** add real pilot provenance (which repo, which workload,
-   what was observed) + positive evidence to the slot, then set its verdict to
-   `SATISFIED`.
-3. **On resolution:** only AFTER the slot is `SATISFIED`, resolve (close) the
-   backlog row.
-
-The join key is the STABLE HOLD ID — never narrative prose. A release gate
-cross-checks both surfaces and blocks while any hold is `PENDING`, while the two
-surfaces disagree, or while the join is missing, duplicated, or ambiguous. This
-keeps S2's release-relevant state discoverable without altering S2's core
-pilot-then-promote discipline.
+   what was observed) + positive evidence to the record, then set its verdict
+   to `SATISFIED` (with the required `- Pilot:` field).
+3. **On resolution:** only AFTER the record is `SATISFIED`, resolve (close) the
+   backlog row. To WITHDRAW a hold instead, set the record to `WITHDRAWN` and
+   cancel the backlog row (the gate treats `cancelled` + `WITHDRAWN` as clear).
 
 ## S3 — Shipped default-on overlay pilot
 

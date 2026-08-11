@@ -44,6 +44,81 @@ result: proven               # proven | skipped | not-demonstrable (the crux out
   OUTCOME observation (the behavior occurred), not a MECHANISM assertion (a
   flag is set, a record exists, a code path ran). Mechanism-without-outcome is
   `result: skipped`, not `proven`.
+- Reachability over object existence (for "did this land" cruxes): a crux
+  verifier asserting a commit landed MUST assert REACHABILITY — e.g.
+  `git merge-base --is-ancestor <sha> <branch>` or
+  `git log <branch> --oneline | grep <sha>` — NOT object existence
+  (`git show <sha>`, `git cat-file`). `git show` succeeds for an orphaned /
+  reflog-only commit, so an object-existence verifier cannot distinguish
+  "committed and landed" from "committed and reverted/reset".
+
+## Rewrite-parity contract (only for explicitly-declared deletion/rewrite slices)
+
+When the task was an explicitly-declared deletion or rewrite slice — the task
+contract carried `mode: deletion_replacement` or `mode: modification_only_rewrite`
+— include a `rewrite-parity` contract so the closeout is honest and non-
+droppable about behavioral parity across the rewrite. Omit it for ordinary
+deletes, refactors, renames, or any slice that was not a declared rewrite-parity
+slice (the gate is opt-in and carries zero burden on ordinary work).
+
+````text
+```rewrite-parity
+{
+  "version": 1,
+  "applies": "<what this contract governs>",
+  "mode": "deletion_replacement",
+  "prior_surface": {
+    "id": "<component id>",
+    "revision": "<git sha the prior surface was inventoried against>",
+    "paths": ["<repo-relative path>"],
+    "inventory_complete": true
+  },
+  "behaviors": [
+    {
+      "id": "<behavior id>",
+      "description": "<behavior that must be preserved across the rewrite>",
+      "prior_evidence": ["<locator into the prior surface>"],
+      "verifier": { "kind": "<test kind>", "locator": "<command/probe>" },
+      "result": {
+        "status": "proven",
+        "receipt": "<HEAD <sha>: <command> -> <outcome>"
+      }
+    }
+  ]
+}
+```
+````
+
+Field legend (the fenced block itself MUST be valid JSON — no `//` comments;
+copy the shape above verbatim and fill the angle-bracket placeholders):
+
+- `mode`: `deletion_replacement` | `modification_only_rewrite`.
+- `prior_surface.inventory_complete`: `true` = the declared `paths` cover the
+  full tree-bound deletion/modify set for this slice; `false` = a declared
+  subset (partial inventory).
+- `behaviors[].result.status`: `proven` | `planned` | `failed` | `skipped` |
+  `not-demonstrable`.
+- `behaviors[].result.receipt`: a non-empty locator stringifying the verification
+  outcome (conventionally `HEAD <sha>: <command> -> <outcome>`). The gate
+  enforces presence (structural completeness); the tree-binding honesty — that
+  the receipt references the assessed tree and not a stale or fabricated one —
+  is author + reviewer, exactly like the `behavioral-closure` token (a
+  consistent receipt does not prove the command ran against the right tree).
+
+- **Stage 1 (commit-gate, pre-commit):** the contract is supplied explicitly via
+  `--rewrite-parity-contract <file>` at acquire. The gate validates the schema,
+  binds `prior_surface.revision` to the acquire-time HEAD, cross-checks
+  `prior_surface.paths` against the tree-bound deletion/modify set, and requires
+  a planned verifier per behavior. Flag absent ⇒ no rewrite-parity gating.
+- **Stage 2 (closeout transition, status=completed):** every behavior must be
+  `proven` with a non-empty `receipt`. `planned`/`failed`/`skipped`/
+  `not-demonstrable`/missing-receipt refuse completion. `not-demonstrable`
+  routes to defer — never record the infeasibility as silent prose.
+- The contract is a declaration, not a proof: a structurally-complete contract
+  can still carry weak evidence. The verifier/receipt honesty is author +
+  reviewer, exactly like the `behavioral-closure` token.
+- doctor runs an independent structural-consistency audit of committed
+  ```rewrite-parity blocks (defense-in-depth; not the sole authority).
 
 ## Success-report integrity (verification claims)
 

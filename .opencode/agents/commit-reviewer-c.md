@@ -106,13 +106,20 @@ A finding MAY be marked DEFER ONLY if:
 If you cannot express the trigger in the grammar, the finding is DROP,
 not DEFER.
 
-Phase 1 note: DEFER findings are non-blocking. The trigger grammar above IS the
-intake predicate — a DEFER finding should be captured into
-`.local/coordinator/tasks/` (via `/write-task`) as a conditional
+Phase 1 note: DEFER findings are non-blocking, and they are NOT auto-filed. The
+trigger grammar above is the intake predicate's trigger component, but a DEFER
+finding must still pass the full admission bar (resolve-first / admitted-value:
+precise question, concrete area + file scope, validation approach, an ADMITTED
+BLOCKER, the ground-truth-derivable trigger, provenance, dedup) before it
+becomes a transport card. The `resolve-first` skill is the front-gate
+classifier. A DEFER finding that passes admission is captured into
+`.local/coordinator/tasks/` (via `/write-task`) as a `draft` conditional
 candidate (transport, not truth) with Notes provenance (`source:review-defer`,
 the trigger expression, `studied:YYYY-MM-DD`). It reaches
-`docs/planning/backlog.md` only after the trigger fires AND the promoter applies
-the Definition of Ready. DEFER never becomes a direct backlog row.
+`docs/planning/backlog.md` only after it crosses a boundary (blocked /
+owner-change / must-survive-session) AND the promoter applies the Definition of
+Ready. DEFER never becomes a direct backlog row. See
+`docs/coordination/RECORD_LIFECYCLE.md`.
 
 ### DROP criteria (the default)
 

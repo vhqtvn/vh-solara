@@ -12,7 +12,7 @@ It exists to answer a narrow question:
 It does not replace the repo's existing state systems.
 
 For durable option comparison and background design rationale, see
-[`researches/decisions/2026-04-29-coordination-control-plane-options.md`](../../researches/decisions/2026-04-29-coordination-control-plane-options.md).
+[`researches/decisions/2026-07-22-claim-verifier-closure-kernel-and-stateful-coordinator.md`](../../researches/decisions/2026-07-22-claim-verifier-closure-kernel-and-stateful-coordinator.md).
 
 ## Canonical State Map
 
@@ -68,6 +68,14 @@ normalizer protocol") and the committer runbook for the full procedure.
 See [PROMOTER_RUNBOOK.md](PROMOTER_RUNBOOK.md) for the promoter procedure,
 the eventual-consistency pass, conflict resolution, and the Definition of
 Ready.
+
+**Session-list idle is not a safe-to-commit signal.** An OpenCode session
+showing `idle` in the session list is advisory, not a quiesce guarantee:
+concurrent agents, a backlog sweep, or new working-tree edits can land
+mid-commit window even while the list reads idle. The commit-gate's exact-slice
+integrity (not session-list idle) is what makes a commit safe — re-read the
+working tree and the gate's verdict before treating the environment as
+quiesced.
 
 ## Record Lifecycle
 
@@ -267,7 +275,6 @@ For research-heavy work:
    `researcher -> debate -> planner` instead of turning the coordinator thread
    into a long compare-and-plan session.
    Example: `/solution-brief For long-running evaluation orchestration, should the repo prefer a repo-local skill, coordinator task cards, or a thin command wrapper over existing specialists?`
-   Reference: `docs/coding-agent-in-research/solution-brief/README.md`
 4. Use `long` mode when the research should survive interruption, several
    source passes, or delayed synthesis.
 5. Use `/task-update <id>` for broader metadata edits that should not change the

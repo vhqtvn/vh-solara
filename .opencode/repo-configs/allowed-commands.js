@@ -23,6 +23,20 @@ export const GIT_MUTATION_VERBS = [
     "am",
     "apply",
     "switch",
+    "checkout-index",
+    "checkout--worker",
+    "commit-graph",
+    "merge-file",
+    "merge-index",
+    "merge-octopus",
+    "merge-one-file",
+    "merge-ours",
+    "merge-recursive",
+    "merge-resolve",
+    "merge-subtree",
+    "merge-tree",
+    "add--interactive",
+    "update-index",
 ];
 export const COMMANDS = {
     readonly: [
@@ -61,6 +75,8 @@ export const COMMANDS = {
         "git cat-file *",
         "git show-ref *",
         "git rev-parse *",
+        "git merge-base *",
+        "git rev-list *",
         "git --no-pager diff *",
         "git --no-pager log *",
         "git --no-pager show *",
@@ -73,6 +89,8 @@ export const COMMANDS = {
         "git --no-pager cat-file *",
         "git --no-pager show-ref *",
         "git --no-pager rev-parse *",
+        "git --no-pager merge-base *",
+        "git --no-pager rev-list *",
     ],
     gate: [
         ".opencode/scripts/commit-gate.sh acquire *",

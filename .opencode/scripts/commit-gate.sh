@@ -3,6 +3,11 @@
 #
 # Subcommands (recommended — file-based form):
 #   acquire   --paths-file FILE --message-file FILE [--session-alias ALIAS]
+#              [--rewrite-parity-contract FILE]
+#              ^ rewrite-parity is OPT-IN: pass a contract file ONLY for an
+#                explicitly-declared deletion/rewrite slice (mode:
+#                deletion_replacement | modification_only_rewrite). Omit for
+#                ordinary deletes/refactors/renames (zero burden).
 #   commit    --uuid UUID --tree-hash HASH --message-file FILE
 #   release   [--uuid UUID] [--message-file FILE]
 #   heartbeat --uuid UUID
@@ -354,6 +359,55 @@ _closeout_append() {
   fi
 }
 
+# Build the protected-UUID set: the active lock's UUID, the _current_uuid
+# marker, and every UUID whose session meta-* is fresh (mtime <= max_age).
+# Echoed one UUID per line on stdout; callers collect into an array.
+#
+# THIS IS THE SINGLE SOURCE shared by _gate_gc_sweep (canonical GC at
+# no_changes/commit/release) AND the acquire-time scratch cleanup. The two
+# call sites MUST share one construction: hand-duplicating them was the root
+# cause of the 3daca70 acquire-time-sweep bug (the two copies drifted and the
+# acquire path lost the protected-UUID skip, rm'ing LIVE concurrent sessions'
+# meta-*/index-* scratch). Centralizing here means a future edit cannot
+# re-diverge the protected-UUID SET CONSTRUCTION itself — each caller still
+# independently supplies its max_age and owns its own prefix-scoped reaping,
+# so the surrounding cleanup CONTRACTS can still drift through caller-side
+# edits; this helper only guarantees the membership set they consult is
+# identical.
+#
+# Arg 1: max_age (seconds) — the SCRATCH-retention threshold
+# (COMMIT_GATE_GC_MAX_AGE, default DEFAULT_GC_MAX_AGE). NOT the lock TTL
+# (COMMIT_GATE_TTL_SECONDS): that is a different concept (LOCK staleness) and
+# must never be threaded in here. A session is "fresh" (protected) iff its
+# meta-* mtime is <= max_age.
+_protected_uuids() {
+  local max_age="$1"
+  # Active lock UUID.
+  if [[ -d "$LOCK_DIR" ]]; then
+    local lock_content lock_uuid
+    lock_content=$(cat "$LOCK_META" 2>/dev/null || echo "{}")
+    lock_uuid=$(_field_str "$lock_content" "uuid")
+    [[ -n "$lock_uuid" ]] && printf '%s\n' "$lock_uuid"
+  fi
+  # Most-recently-active session marker.
+  local cu_file="${GATE_INDEX_DIR}/_current_uuid"
+  if [[ -f "$cu_file" ]]; then
+    local cu_val
+    cu_val=$(tr -d '[:space:]' < "$cu_file" 2>/dev/null || true)
+    [[ -n "$cu_val" ]] && printf '%s\n' "$cu_val"
+  fi
+  # Fresh session-meta UUIDs (active concurrent sessions).
+  local m
+  while IFS= read -r m; do
+    [[ -z "$m" ]] && continue
+    local m_age
+    m_age=$(_file_age_seconds "$m" 2>/dev/null || echo "0")
+    if [[ $m_age -le $max_age ]]; then
+      printf '%s\n' "${m#${GATE_INDEX_DIR}/meta-}"
+    fi
+  done < <(ls -1 "${GATE_INDEX_DIR}"/meta-* 2>/dev/null)
+}
+
 # Sweep aged orphan scratch files (msg-/paths-/meta-/index-/merge-) from
 # $GATE_INDEX_DIR. Best-effort: never returns non-zero, never writes to stdout
 # (diagnostics suppressed). Two layers protect a live/concurrent session:
@@ -364,7 +418,9 @@ _closeout_append() {
 #   2. Protected-UUID skip: UUIDs from the active lock, _current_uuid, and
 #      any UUID whose meta-* session file is fresh (younger than max_age) are
 #      never removed even if their other scratch files are artificially aged
-#      (defense-in-depth for concurrent lock-free sessions).
+#      (defense-in-depth for concurrent lock-free sessions). Built via the
+#      shared _protected_uuids helper so this contract cannot drift from the
+#      acquire-time cleanup's.
 _gate_gc_sweep() {
   local max_age="${COMMIT_GATE_GC_MAX_AGE:-$DEFAULT_GC_MAX_AGE}"
 
@@ -373,31 +429,13 @@ _gate_gc_sweep() {
   # the gate must still get a chance to sweep it.
   [[ ! -d "$GATE_INDEX_DIR" && ! -d "$MSG_SCRATCH_DIR" ]] && return 0
 
-  # Build the protected-UUID set (active lock UUID + _current_uuid value).
+  # Build the protected-UUID set via the shared helper (also used by the
+  # acquire-time cleanup). See _protected_uuids for why these two call sites
+  # MUST share one construction.
   local protected_uuids=()
-  if [[ -d "$LOCK_DIR" ]]; then
-    local lock_content lock_uuid
-    lock_content=$(cat "$LOCK_META" 2>/dev/null || echo "{}")
-    lock_uuid=$(_field_str "$lock_content" "uuid")
-    [[ -n "$lock_uuid" ]] && protected_uuids+=("$lock_uuid")
-  fi
-  local cu_file="${GATE_INDEX_DIR}/_current_uuid"
-  if [[ -f "$cu_file" ]]; then
-    local cu_val
-    cu_val=$(tr -d '[:space:]' < "$cu_file" 2>/dev/null || true)
-    [[ -n "$cu_val" ]] && protected_uuids+=("$cu_val")
-  fi
-  # Also protect UUIDs with fresh session metadata (active concurrent sessions).
-  local m
-  while IFS= read -r m; do
-    [[ -z "$m" ]] && continue
-    local m_age m_uuid
-    m_age=$(_file_age_seconds "$m" 2>/dev/null || echo "0")
-    if [[ $m_age -le $max_age ]]; then
-      m_uuid="${m#${GATE_INDEX_DIR}/meta-}"
-      protected_uuids+=("$m_uuid")
-    fi
-  done < <(ls -1 "${GATE_INDEX_DIR}"/meta-* 2>/dev/null)
+  while IFS= read -r puuid; do
+    [[ -n "$puuid" ]] && protected_uuids+=("$puuid")
+  done < <(_protected_uuids "$max_age")
 
   local prefix
   for prefix in msg- paths- meta- index- merge-; do
@@ -495,6 +533,19 @@ _stale_break() {
   local lockdir="$1" expected_uuid="$2"
   local stale_backup="${lockdir}.stale.$$"
 
+  # Fail-safe: refuse to break a lock whose expected identity is empty. An
+  # empty expected_uuid means _is_stale could not read the lock's uuid
+  # (absent/unparseable meta — a half-born lock). The verify-after-move below
+  # compares actual_uuid != expected_uuid; with both empty that guard is
+  # vacuously FALSE and we would proceed to destroy a LIVE lock, breaking
+  # mutual exclusion (half-born-lock-stale-break). _is_stale now returns
+  # non-stale for this case, so this path is unreachable in the normal acquire
+  # flow; this guard is defense-in-depth against any future caller reaching
+  # here with an empty uuid. Never move/destroy a lock we cannot identify.
+  if [[ -z "$expected_uuid" ]]; then
+    return 1
+  fi
+
   # Atomic claim: move the lock dir to our unique backup path.
   # If mv fails, another process already moved/removed it. That's fine.
   mv "$lockdir" "$stale_backup" 2>/dev/null || return 0
@@ -547,6 +598,21 @@ _is_stale() {
   cur_hname=$(_hostname)
   uuid_from_meta=$(_field_str "$content" "uuid")
 
+  # Fail-safe: absent/unparseable meta means the lock is being born (mkdir done,
+  # meta not yet written) or is corrupt. In EITHER case we cannot identify it
+  # for the verify-after-move in _stale_break — treating it as stale would let a
+  # concurrent acquirer destroy a LIVE lock and break mutual exclusion
+  # (half-born-lock-stale-break). The empty uuid is the absence signal (no
+  # readable heartbeat, pid, or uuid — content collapsed to "{}"). Modeled on
+  # internal/cli/profile.go corpusDefaultFeatures: fail-safe, not fail-open.
+  # NOTE: this does NOT weaken stale recovery — every genuinely-stale path
+  # below requires a readable meta (expired heartbeat, dead pid, cross-host),
+  # all of which carry a non-empty uuid. Only the no-meta half-born state is
+  # affected, and that state is a LIVE lock mid-birth, never legitimately stale.
+  if [[ -z "$uuid_from_meta" ]]; then
+    return 1  # cannot identify → not stale (lock being born or corrupt)
+  fi
+
   # Primary check: heartbeat TTL
   # If heartbeat is fresh (within TTL), the lock is NOT stale regardless of PID.
   # This handles the real-world case where each commit-gate.sh invocation is a
@@ -589,6 +655,7 @@ cmd_acquire() {
   local message="" paths="" session_alias=""
   local paths_provided=false
   local message_file="" paths_file=""
+  local rewrite_parity_contract=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -597,6 +664,7 @@ cmd_acquire() {
       --paths)         paths="$2"; paths_provided=true; shift 2 ;;
       --paths-file)    paths_file="$2";    shift 2 ;;
       --session-alias) session_alias="$2"; shift 2 ;;
+      --rewrite-parity-contract) rewrite_parity_contract="$2"; shift 2 ;;
       *) shift ;;
     esac
   done
@@ -770,36 +838,22 @@ EOF
   #
   # The protected-UUID set (active lock UUID + _current_uuid + any UUID whose
   # meta-* is fresh) is consulted so a live concurrent session is never reaped.
-  # Mirrors _gate_gc_sweep's construction (~376-400); scoped here to meta-/
-  # index- only (this is the pre-lock sweep; the full-prefix sweep still runs
-  # on no_changes/commit/release via _gate_gc_sweep).
+  # Built via the SHARED _protected_uuids helper — the acquire-time cleanup
+  # and _gate_gc_sweep MUST consult the SAME construction (hand-duplicating
+  # them was the 3daca70 bug). Scoped here to meta-/index- only (this is the
+  # pre-lock sweep; the full-prefix sweep still runs on no_changes/commit/
+  # release via _gate_gc_sweep).
   # -------------------------------------------------------------------
   if [[ -d "$GATE_INDEX_DIR" ]]; then
     local gc_max_age="${COMMIT_GATE_GC_MAX_AGE:-$DEFAULT_GC_MAX_AGE}"
-    # Build the protected-UUID set (mirrors _gate_gc_sweep).
+    # Build the protected-UUID set via the shared helper (canonical GC +
+    # acquire-time cleanup MUST consult the SAME construction). The acquire
+    # path used to hand-duplicate this and lost the protected-UUID skip — the
+    # 3daca70 bug. See _protected_uuids for the shared contract.
     local protected_uuids=()
-    if [[ -d "$LOCK_DIR" ]]; then
-      local gc_lock_content gc_lock_uuid
-      gc_lock_content=$(cat "$LOCK_META" 2>/dev/null || echo "{}")
-      gc_lock_uuid=$(_field_str "$gc_lock_content" "uuid")
-      [[ -n "$gc_lock_uuid" ]] && protected_uuids+=("$gc_lock_uuid")
-    fi
-    local gc_cu_file="${GATE_INDEX_DIR}/_current_uuid"
-    if [[ -f "$gc_cu_file" ]]; then
-      local gc_cu_val
-      gc_cu_val=$(tr -d '[:space:]' < "$gc_cu_file" 2>/dev/null || true)
-      [[ -n "$gc_cu_val" ]] && protected_uuids+=("$gc_cu_val")
-    fi
-    local gc_m
-    while IFS= read -r gc_m; do
-      [[ -z "$gc_m" ]] && continue
-      local gc_m_age gc_m_uuid
-      gc_m_age=$(_file_age_seconds "$gc_m" 2>/dev/null || echo "0")
-      if [[ $gc_m_age -le $gc_max_age ]]; then
-        gc_m_uuid="${gc_m#${GATE_INDEX_DIR}/meta-}"
-        protected_uuids+=("$gc_m_uuid")
-      fi
-    done < <(ls -1 "${GATE_INDEX_DIR}"/meta-* 2>/dev/null)
+    while IFS= read -r puuid; do
+      [[ -n "$puuid" ]] && protected_uuids+=("$puuid")
+    done < <(_protected_uuids "$gc_max_age")
 
     local meta_file
     while IFS= read -r meta_file; do
@@ -966,7 +1020,112 @@ for l in lines:
     if len(parts) == 2:
         files.append({'status': parts[0], 'path': parts[1]})
 print(json.dumps(files))
-" 2>/dev/null || echo "[]")
+  " 2>/dev/null || echo "[]")
+
+  # -------------------------------------------------------------------
+  # Private redlines scan — MANDATORY pre-acquire check.
+  #
+  # Scans the EXACT immutable tree object ($tree_hash, content-addressed by
+  # `git write-tree` above) for private-redline violations BEFORE the acquire
+  # is authorized. The scanner reads ONLY the named tree — never the working
+  # tree, shared index, or HEAD — and is paste-safe: stdout carries only
+  # opaque subj-* ids, generic reason codes, and committed-tree paths;
+  # configured terms are NEVER echoed.
+  #
+  # EXIT CODE CONTRACT the gate depends on:
+  #   0 = pass OR non-applicable (no registry / no binding subject / clean).
+  #       The scanner prints a short status line on exit 0, but the gate
+  #       DISCARDS captured output here so a non-adopter sees ZERO footprint.
+  #   1 = violation(s) found     -> BLOCK the acquire.
+  #   2 = fail-closed (invalid/unreadable registry, git failure) -> BLOCK.
+  #   any other non-zero          -> BLOCK (fail-closed; never silently pass).
+  #
+  # The harness binary is resolved via PATH (the installed-harness surface).
+  # redlines is a feature of a CURRENT installed harness, so the check is a
+  # silent no-op when EITHER (a) `vh-agent-harness` is not on PATH at all, OR
+  # (b) the installed binary predates the `redlines scan` subcommand. Both mean
+  # "feature not available here" — the gate never blocks on a binary that cannot
+  # run the scan. The cheap `redlines scan --help` probe (output discarded)
+  # distinguishes a redlines-capable binary from a stale/older one and keeps the
+  # gate robust across version skew and in minimal test environments.
+  # -------------------------------------------------------------------
+  if command -v vh-agent-harness >/dev/null 2>&1 && vh-agent-harness redlines scan --help >/dev/null 2>&1; then
+    local rl_repo_root rl_out rl_rc
+    rl_repo_root=$(git rev-parse --show-toplevel 2>/dev/null || true)
+    rl_rc=0
+    rl_out=$(vh-agent-harness redlines scan -C "$rl_repo_root" --tree "$tree_hash" 2>&1) || rl_rc=$?
+    if [[ "$rl_rc" -ne 0 ]]; then
+      rm -f "$private_index" 2>/dev/null || true
+      rm -f "$(_session_meta_path "$uuid")" 2>/dev/null || true
+      local rl_reason rl_status rl_detail_enc
+      if [[ "$rl_rc" -eq 1 ]]; then
+        rl_status="redlines_violation"
+        rl_reason="private_redlines_blocked"
+        echo "commit-gate: acquire BLOCKED - private redlines violation(s) in tree ${tree_hash}:" >&2
+      elif [[ "$rl_rc" -eq 2 ]]; then
+        rl_status="redlines_error"
+        rl_reason="private_redlines_fail_closed"
+        echo "commit-gate: acquire BLOCKED (fail-closed) - private redlines scan could not complete (invalid registry or scan error); tree ${tree_hash}:" >&2
+      else
+        rl_status="redlines_error"
+        rl_reason="private_redlines_unexpected_exit"
+        echo "commit-gate: acquire BLOCKED (fail-closed) - private redlines scan returned unexpected exit code ${rl_rc}; tree ${tree_hash}:" >&2
+      fi
+      printf '%s\n' "$rl_out" >&2
+      rl_detail_enc=$(json_encode "$rl_out")
+      json_out "{\"status\":\"${rl_status}\",\"reason\":\"${rl_reason}\",\"exit_code\":${rl_rc},\"tree_hash\":\"${tree_hash}\",\"detail\":${rl_detail_enc}}"
+      return 1
+    fi
+    # exit 0 -> pass / non-applicable. DISCARD captured output (zero-footprint).
+  fi
+
+  # -------------------------------------------------------------------
+  # Stage 1: rewrite-parity contract mechanical precheck (OPT-D).
+  #
+  # OPT-IN: only fires when --rewrite-parity-contract <file> is passed.
+  # Ordinary deletes/refactors/renames carry NO rewrite-parity burden
+  # (the flag is absent => this block is skipped entirely). When supplied,
+  # the contract must be structurally valid AND its prior_surface.paths
+  # must cross-check against the tree-bound acquire diff, with
+  # prior_surface.revision bound to head_at_acquire. The check is a
+  # MECHANICAL precheck; commit-reviewer still assesses semantic quality
+  # (defense-in-depth) and does NOT replace it.
+  #
+  # The validator script is a sibling in this scripts dir. It returns
+  # JSON {valid,errors,...} and exits 0/1. On failure the acquire is
+  # refused with status rewrite_parity_error (no metadata is written).
+  # -------------------------------------------------------------------
+  if [[ -n "$rewrite_parity_contract" ]]; then
+    if [[ ! -r "$rewrite_parity_contract" ]]; then
+      rm -f "$private_index" 2>/dev/null || true
+      rm -f "$(_session_meta_path "$uuid")" 2>/dev/null || true
+      json_out "{\"status\":\"rewrite_parity_error\",\"reason\":\"contract_file_unreadable\",\"file\":$(json_encode "$rewrite_parity_contract")}"
+      return 1
+    fi
+    local _rp_script rp_out rp_rc
+    _rp_script="$(dirname "$0")/rewrite-parity-validate.py"
+    rp_rc=0
+    rp_out=$(python3 "$_rp_script" \
+        --contract-file "$rewrite_parity_contract" \
+        --stage precommit \
+        --head-at-acquire "$head_at_acquire" \
+        --diff-files "$files_json" 2>/dev/null) || rp_rc=$?
+    if [[ $rp_rc -ne 0 ]]; then
+      rm -f "$private_index" 2>/dev/null || true
+      rm -f "$(_session_meta_path "$uuid")" 2>/dev/null || true
+      local _rp_errors
+      _rp_errors=$(printf '%s' "$rp_out" | python3 -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    print(json.dumps(d.get('errors', [])))
+except Exception:
+    print(json.dumps(['validator produced no parseable result']))
+" 2>/dev/null || echo '["validator produced no parseable result"]')
+      json_out "{\"status\":\"rewrite_parity_error\",\"reason\":\"contract_precheck_failed\",\"errors\":${_rp_errors}}"
+      return 1
+    fi
+  fi
 
   # Write final metadata directly to per-session file — no global lock needed
   # (UUID-specific file has zero contention)
@@ -1324,16 +1483,21 @@ items = [l.strip().split('/')[-1] for l in sys.stdin if l.strip()]
 print(json.dumps(items))
 " 2>/dev/null || echo "[]")
     fi
-    # Count stale sessions (older than TTL)
-    local stale_count=0
+    # Count session-metadata files aged past the GC-retention window
+    # (COMMIT_GATE_GC_MAX_AGE) — i.e. reaping candidates _gate_gc_sweep will
+    # reap on the next sweep. This is a SCRATCH-retention concept, NOT lock
+    # staleness: do NOT re-conflate with COMMIT_GATE_TTL_SECONDS (the LOCK
+    # TTL). The cleanup paths all key off GC_MAX_AGE; the diagnostic matches
+    # so its language cannot reintroduce the TTL/GC conflation.
+    local aged_count=0
     if [[ "$sessions_json" != "[]" ]]; then
-      local ttl="${COMMIT_GATE_TTL_SECONDS:-$DEFAULT_TTL}"
-      stale_count=$(ls -1 "$GATE_INDEX_DIR"/meta-* 2>/dev/null | while IFS= read -r f; do
+      local gc_max_age="${COMMIT_GATE_GC_MAX_AGE:-$DEFAULT_GC_MAX_AGE}"
+      aged_count=$(ls -1 "$GATE_INDEX_DIR"/meta-* 2>/dev/null | while IFS= read -r f; do
         local a
         a=$(_file_age_seconds "$f" 2>/dev/null || echo "0")
-        if [[ $a -gt $ttl ]]; then echo "stale"; fi
+        if [[ $a -gt $gc_max_age ]]; then echo "aged"; fi
       done | wc -l | tr -d ' ')
-      json_out "{\"status\":\"free\",\"note\":\"session_metadata_exists\",\"sessions\":${sessions_json},\"stale_count\":${stale_count}}"
+      json_out "{\"status\":\"free\",\"note\":\"session_metadata_exists\",\"sessions\":${sessions_json},\"gc_aged_count\":${aged_count}}"
     else
       json_out "{\"status\":\"free\"}"
     fi

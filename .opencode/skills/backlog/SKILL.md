@@ -20,19 +20,33 @@ This skill owns two disciplines that share one file (`docs/planning/backlog.md`)
    a concurrent edit blocking your code commit, and how to recover from a
    `could_not_land` (the backlog content-tangle) without losing a
    collaborator's status update.
-2. **Curation routing (composition O1).** Where DEFER / p2 / follow-up findings
-   land (the holding area), and the Definition of Ready a candidate must meet
-   before it is promoted into a backlog row.
+2. **Intake + drain routing (composition O1).** Where DEFER / p2 / follow-up
+   findings land (the holding area), the **admission bar** a candidate must
+   pass before it is filed, the **boundary test** that decides whether it needs
+   a backlog row, and the drain-first default for everything that does not.
 
 Plus the picking contract (R1): re-study the cited files/state before acting on
 any backlog row — a row is a pointer, not a substitute for the work it points
-at.
+at. The canonical lifecycle (intake → transport work → review → landing →
+retirement, with promotion as an exceptional side path) lives in
+`docs/coordination/RECORD_LIFECYCLE.md`.
 
 ## Quick reference
 
-- **Editing the ledger:** re-read from disk immediately before your edit; edit
-  only your own task rows (match the stable ID); keep one backlog commit per
-  cycle, separate from any code commit.
+- **Drain-first default.** Work cards directly from transport. No backlog row
+  is created before or after by default. A card is promoted ONLY when it
+  crosses a boundary (blocked / owner-change / must-survive-session). See
+  `docs/coordination/RECORD_LIFECYCLE.md`.
+- **Intake bar (before filing).** A card is filed only after admission:
+  resolve-first / admitted-value (precise question, concrete area + file scope,
+  validation approach, an ADMITTED BLOCKER, a ground-truth-derivable trigger
+  when deferral is trigger-dependent, provenance, dedup). Dispositions at
+  intake: resolvable-now → resolve (don't file); decision-derivable-now →
+  drive to verdict (don't defer); real deferred work meeting the bar → file as
+  `draft`; duplicate/fog → collapse or discard.
+- **Editing the ledger (for promoted rows):** re-read from disk immediately
+  before your edit; edit only your own task rows (match the stable ID); keep
+  one backlog commit per cycle, separate from any code commit.
 - **On `could_not_land`:** re-read from the new HEAD, re-apply your row change,
   retry. **Do NOT revert `backlog.md` to unblock** — that discards a
   collaborator's update. Do NOT use `commit-gate.sh revert` on the backlog
@@ -45,10 +59,16 @@ at.
   Duplicate IDs are rejected. Run `/backlog-cleanup` (or
   `vh-agent-harness exec node .opencode/scripts/normalize-backlog.js`) after a
   batch edit.
+- **Retire on landing, not on review approval.** A `completed` card is retired
+  only after a commit carrying the exact `Task-Card: <card-id>` trailer line is
+  reachable from a branch (a `git log --branches --fixed-strings --grep`
+  reachability check, each candidate post-filtered to an exact trailer line, NOT
+  object existence; see RECORD_LIFECYCLE.md → landing-proof contract for the
+  exact form).
 - **DEFER / p2 / follow-up:** capture to `.local/coordinator/tasks/`
-  via `/write-task` with Notes provenance. Do **not** add a backlog row
-  directly. Promotion happens only after the predicate checker confirms the
-  trigger and the Definition of Ready is met.
+  via `/write-task` with Notes provenance — but only after the admission bar.
+  Do **not** add a backlog row directly. Promotion happens only after a
+  boundary is crossed AND the Definition of Ready is met.
 
 ## Conflict discipline (hybrid split-commit)
 
@@ -164,47 +184,74 @@ over the ledger + archives, the safer path is to re-read the ledger, rerun
 the normalizer over the complete working tree, and recompute both exact path
 sets before retrying. Do NOT revert the archive companions to unblock.
 
-## Curation routing (DEFER / p2 / follow-up)
+## Intake + drain routing (DEFER / p2 / follow-up)
 
 ### Holding area = `.local/coordinator/tasks/`
 
 DEFER findings (from `commit-reviewer`), p2 follow-ups, and other conditional
-candidates land in `.local/coordinator/tasks/` as **conditional
-candidates**, not as backlog rows. The holding area is **transport, not
+candidates are NOT filed by reflex. The holding area is **transport, not
 truth** — unpromoted candidates may be lost, and that is intentional: they are
-not trusted work yet.
+not trusted work yet. The lifecycle is **drain-first**: file only what passes
+the admission bar, drain resolved cards directly, promote only boundary-crossers.
 
-Capture a candidate via `/write-task` with **Notes provenance** so the
-promoter can evaluate it later:
+### Step 1 — Admission bar (should this card exist?)
 
-```
-source:review-defer            # or source:p2-followup
-trigger:path_touched(src/auth/x.go)   # the predicate that, when true, makes this real
-studied:2026-04-30             # when the finding was produced
-```
+Before a card is filed, the `resolve-first` classifier triages the disposition:
 
-`source:review-defer` means the candidate came out of a `commit-reviewer`
-DEFER. `source:p2-followup` means it came from a p2 blocker-disposition. The
-`trigger:` line is the predicate the checker evaluates (see below). `studied:`
-is the date the finding was produced, for staleness awareness.
+- **Resolvable now** → resolve it; do NOT file.
+- **Decision-derivable now** → drive to a verdict; do NOT defer.
+- **Real deferred work meeting the bar** → file as a `draft` transport card
+  with Notes provenance.
+- **Duplicate / fog** → collapse into the existing card, or discard.
 
-### Promotion Definition of Ready (DoR)
+A card is filed only when ALL of the admission bar hold:
 
-A candidate reaches `backlog.md` only when **all** of the following hold:
+- **Precise question** — ticket-ready, not fog (see fog-vs-ticket below).
+- **Concrete area** — the repo boundary it belongs to.
+- **File / subsystem scope** — the files or directories it touches.
+- **Validation approach** — how "done" will be checked.
+- **An ADMITTED BLOCKER or reason the work cannot be resolved now** — for
+  deferred work, why it cannot be done in the current session.
+- **A ground-truth-derivable trigger** — when deferral is trigger-dependent, a
+  predicate the checker can re-derive from repo state
+  (`path_touched(<path>)`, `after_tag(<tag>)`, …).
+- **Provenance** — `source:review-defer` (from `commit-reviewer` DEFER),
+  `source:p2-followup` (from a p2 blocker-disposition), `studied:YYYY-MM-DD`.
+- **Dedup** — no materially-equivalent open card already exists.
 
-1. **Trigger fired OR operator override.** The predicate checker
-   (`.opencode/scripts/check-defer-triggers.mjs`) confirms the `trigger:` line
-   is currently met, OR the operator explicitly marks
+A DEFER finding from `commit-reviewer` is an **intake predicate**, not an
+auto-file: route it through this admission bar before it becomes a card.
+
+### Step 2 — Boundary test (does it need a backlog row?)
+
+Filed cards are drained directly by default — work them, land the commit,
+retire the card. A card is promoted into a `docs/planning/backlog.md` row ONLY
+when it crosses one of these boundaries:
+
+- **Blocked** — needs an external decision or owner input to progress, so its
+  blocked state must outlive the discovering session.
+- **Owner-change** — responsibility moves to another session/operator.
+- **Must-survive-session** — longer than one session; the durable status ledger
+  is the right home for its state.
+
+No boundary ⇒ drain in transport; no backlog row is created before or after.
+
+### Step 3 — Definition of Ready (for a promoted row)
+
+For the exceptional card that DID cross a boundary, promote it into
+`docs/planning/backlog.md` only when ALL of:
+
+1. **Trigger fired OR operator override.** For trigger-gated candidates, the
+   predicate checker (`.opencode/scripts/check-defer-triggers.mjs`) confirms
+   the `trigger:` line is currently met, OR the operator explicitly marks
    `override:operator` in Notes.
-2. **Concrete area.** The candidate names the repo boundary it belongs to
-   (`api`, `web`, `storage`, `docs`, …).
+2. **Concrete area.** The candidate names the repo boundary it belongs to.
 3. **File scope.** The candidate names the files / directories it touches.
-4. **Validation plan.** The candidate states how the change will be verified
-   (tests, gates, manual checks).
-5. **Clear slice.** The candidate is scoped to one vertical slice or one
-   focused boundary change — not an open-ended theme.
+4. **Validation plan.** The candidate states how the change will be verified.
+5. **Clear slice.** One vertical slice or one focused boundary change — not an
+   open-ended theme.
 6. **Provenance.** The Notes block carries `source:` / `trigger:` / `studied:`
-   (or `override:operator`).
+   (or `override:operator`), surviving into the backlog row's Notes.
 
 If any element is missing, the promoter leaves the candidate in holding and
 records what is missing on the task card.
@@ -226,10 +273,10 @@ This is a first-slice MVP predicate engine, not a full rules system.
 
 A `commit-reviewer` DEFER disposition is an **intake predicate**, not a
 backlog insertion. The reviewer's DEFER grammar tells the next reviewer what
-to re-check; the agent capturing the finding routes it to
-`.local/coordinator/tasks/` with provenance, and the promoter decides
-promotion. The reviewer never writes a backlog row, and the capturing agent
-never writes a backlog row for a DEFER either — both route through holding.
+to re-check; the agent capturing the finding routes it through the admission
+bar above before filing a transport card, and the promoter decides promotion.
+The reviewer never writes a backlog row, and the capturing agent never writes a
+backlog row for a DEFER either — both route through intake.
 
 ## Picking contract (R1)
 
@@ -243,8 +290,9 @@ executing a stale plan.
 ## Cross-references
 
 - `docs/planning/backlog.md` — the ledger itself
+- `docs/coordination/RECORD_LIFECYCLE.md` — canonical card/DEFER lifecycle (drain-first, boundary promotion, landing-gated retirement, landing-proof contract)
 - `.opencode/scripts/normalize-backlog.js` — executable format spec (sections, statuses, columns, dup-ID rejection)
 - `.opencode/scripts/check-defer-triggers.mjs` — promotion predicate checker (promoter-use-only)
-- `docs/coordination/PROMOTER_RUNBOOK.md` — promoter procedure: curation, batch-promote, hybrid CAS preservation
+- `docs/coordination/PROMOTER_RUNBOOK.md` — drain-first promoter procedure: admission bar, boundary promotion, hybrid CAS preservation
 - `docs/coordination/BLOCKER_POLICY.md` — p2 follow-ups route to the holding area
 - `.opencode/skills/gated-commit/SKILL.md` — the commit layer this discipline depends on (commit backlog separately from code; `commit-gate.sh revert` is the anti-pattern on `backlog.md`)

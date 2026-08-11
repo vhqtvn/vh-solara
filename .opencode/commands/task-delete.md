@@ -15,10 +15,21 @@ bypass a promotion, review, or closeout gate.
 
 A card in `draft`, `ready`, or `cancelled` state is freely disposable without
 `force` (never worked, or terminal with the review gate already passed). A card
-in `working`, `reported`, `blocked`, or `completed` state carries work evidence
-or a closeout report a coordinator gate may still need, so it is **refused
-without an explicit `force`** — destroying it would bypass a pending review,
-closeout, or decision gate.
+in `working`, `reported`, or `blocked` state carries work evidence or a closeout
+report a coordinator gate may still need, so it is **refused without an explicit
+`force`** (`lifecycle_state_protected`) — destroying it would bypass a pending
+review, closeout, or decision gate.
+
+A `completed` card enters a **landing-gated retirement path**: it may be retired
+as done ONLY when a reachable commit carrying the exact `Task-Card: <card-id>`
+trailer is present (the landing-proof contract,
+`docs/coordination/RECORD_LIFECYCLE.md`). The verifier is a reachability check
+over all branch tips (`git log --branches --fixed-strings --grep=Task-Card:
+<card-id>` ≥ 1), never object existence — a reflog-only / orphaned commit does
+NOT count. With a reachable trailer the card is deleted normally; without one the
+retirement is refused (`landing_not_confirmed`) and the card + report directory
+survive. This is the 2026-08-07 lesson made mechanical: never retire a `completed`
+card on review approval alone while the commit may yet fail to land.
 
 Task id (exactly one explicit id):
 $ARGUMENTS
@@ -34,7 +45,7 @@ Workflow:
   - path-like (`/`, `\`, `..`)
   - more than one id
 - before calling the tool, surface what will be destroyed so the operator can confirm intent: read the task card (the card file, or its summary via `list_coordination_tasks`) and display the **task id, title, status, active session alias, and the report directory path**. Deletion is irreversible — the operator must be able to see what is being destroyed *before* the tool runs. This pre-removal display is the confirmation complement to the post-removal `removed` summary printed after the call. (For a malformed card the display degrades to "card exists at <path> but could not be parsed"; still surface the path and id.)
-- the optional trailing token `force` (and ONLY the literal token `force`) is an explicit destructive override for a card protected by the active-owner guard or the pending-gate lifecycle guard. `force` must be deliberate — surface what will be destroyed (including any closeout report a coordinator gate may still need) and confirm intent before passing it.
+- the optional trailing token `force` (and ONLY the literal token `force`) is an explicit destructive override for a card protected by the active-owner guard, the in-flight lifecycle guard, OR the `completed` landing gate. `force` is **emergency-only** — it bypasses the landing check (so a `completed` card with no reachable trailer is destroyed without proof of landing). It is NOT the ordinary `completed`-cleanup route: the ordinary route is for the work to land under a `Task-Card:` trailer and then retire. Surface what will be destroyed (including any closeout report a coordinator gate may still need) and confirm intent before passing `force`.
 - call `plan_state` with:
   - `operation: delete_coordination_task`
   - `task_id: <the single explicit id>`
@@ -42,7 +53,8 @@ Workflow:
   - the current session is passed by the dispatcher automatically
 - do NOT auto-retry. If the tool returns a structured refusal, render it verbatim and stop:
   - `refusal.code === "active_working_task"` — an actively-owned working card; the operator must decide whether to re-run with an explicit `force`.
-  - `refusal.code === "lifecycle_state_protected"` — a card in `working` (stale, no active owner), `reported`, `blocked`, or `completed` state whose report evidence a coordinator gate may still need.
+  - `refusal.code === "lifecycle_state_protected"` — a card in `working` (stale, no active owner), `reported`, or `blocked` state whose report evidence a coordinator gate may still need. (In-flight protection is NOT weakened by the completed-retirement path: these statuses are refused EVEN IF a landing commit appears.)
+  - `refusal.code === "landing_not_confirmed"` — a `completed` card whose landing is not proven: no reachable commit carries the exact `Task-Card: <card-id>` trailer, or the verifier could not read git history (`refusal.reason` is `no_trailer_match` or `verifier_unavailable`; `refusal.query` names the exact command). The remedy is to ensure the work landed on a branch under the trailer, or to re-run with `force` ONLY for genuine legacy/emergency cleanup.
   Re-running with `force` is always a separate, deliberate invocation.
 - print the returned `removed` summary (task id, title, status, malformed flag, whether the card and report directory were removed).
 

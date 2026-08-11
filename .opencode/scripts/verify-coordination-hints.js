@@ -473,7 +473,54 @@ function verifyProductPrefixes() {
         );
     }
 
-    // (c) integration: a valid override makes src/ a product surface and stops
+    // (c) pure parser: backslash normalization (Windows-style `\` -> `/`).
+    // Pinned as a regression guard independent of the load path so a future edit
+    // cannot silently drop the cross-platform portability contract: the
+    // product-prefixes config is path-style agnostic. Wraps inputs via
+    // JSON.stringify so the backslash escaping is computed, not hand-escaped —
+    // the runtime array ["src\\"] is ONE element `src\`, which JSON-encodes to
+    // "src\\" and parses back to `src\` before normalization runs.
+    const wrapPrefixes = (arr) => JSON.stringify({ product_prefixes: arr });
+
+    // every backslash becomes a forward slash (replaceAll, not first-only), and
+    // an entry with multiple backslashes normalizes them all.
+    const allBackslash = parseProductPrefixes(wrapPrefixes(["src\\", "lib\\sub\\"]));
+    assert(
+        JSON.stringify(allBackslash) === JSON.stringify(["src/", "lib/sub/"]),
+        `backslash separators should all normalize to forward slashes, got: ${JSON.stringify(allBackslash)}`,
+    );
+
+    // mixed backslash/forward-slash separators within one entry normalize
+    // consistently to forward slashes.
+    const mixedSep = parseProductPrefixes(wrapPrefixes(["apps\\web/", "packages\\core/"]));
+    assert(
+        JSON.stringify(mixedSep) === JSON.stringify(["apps/web/", "packages/core/"]),
+        `mixed backslash/forward-slash separators should normalize consistently, got: ${JSON.stringify(mixedSep)}`,
+    );
+
+    // normalization composes with dedup: a backslash form and its forward-slash
+    // twin collapse to ONE entry regardless of input order (first-occurrence
+    // wins, because dedup keys on the NORMALIZED form).
+    const twinBackslashFirst = parseProductPrefixes(wrapPrefixes(["src\\", "src/"]));
+    assert(
+        JSON.stringify(twinBackslashFirst) === JSON.stringify(["src/"]),
+        `backslash form then its forward-slash twin should dedupe to one entry, got: ${JSON.stringify(twinBackslashFirst)}`,
+    );
+    const twinForwardFirst = parseProductPrefixes(wrapPrefixes(["src/", "src\\"]));
+    assert(
+        JSON.stringify(twinForwardFirst) === JSON.stringify(["src/"]),
+        `forward-slash form then its backslash twin should dedupe to one entry, got: ${JSON.stringify(twinForwardFirst)}`,
+    );
+
+    // dedup on the normalized form drops a backslash twin but keeps genuinely
+    // distinct prefixes (first-occurrence order preserved).
+    const twinAmongDistinct = parseProductPrefixes(wrapPrefixes(["src/", "src\\", "lib/"]));
+    assert(
+        JSON.stringify(twinAmongDistinct) === JSON.stringify(["src/", "lib/"]),
+        `dedup on normalized form should drop the backslash twin but keep distinct prefixes, got: ${JSON.stringify(twinAmongDistinct)}`,
+    );
+
+    // (d) integration: a valid override makes src/ a product surface and stops
     // apps/ from matching. coordination+src fires the cross-boundary warning;
     // coordination+apps does NOT.
     {
@@ -520,7 +567,7 @@ function verifyProductPrefixes() {
         }
     }
 
-    // (d) integration: a malformed file falls back to the monorepo default, so
+    // (e) integration: a malformed file falls back to the monorepo default, so
     // apps/ is still a product surface and a coordination+apps slice warns.
     {
         const sandbox = fs.mkdtempSync(path.join(TMP_ROOT, "verify-product-prefixes-malformed-"));

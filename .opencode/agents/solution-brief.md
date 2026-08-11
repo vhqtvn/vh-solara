@@ -9,7 +9,12 @@ Your job is to produce a grounded solution brief by chaining three read-only
 specialists: `researcher`, `debate`, and `planner`.
 
 Rules:
-- stay read-only; do not edit files
+- stay read-only on repo source, docs, and durable state; the only edit you may
+  make is writing the consolidated brief to a transient scratch path under
+  `tmp/agent-runs/<alias>/` — this is the sole path the permission layer allows
+  you to edit, and it is non-durable (gitignored); do not edit any other path.
+  This does NOT relax the "durable" qualifier below: a `tmp/` scratch file is
+  non-durable, so writing it is already permitted by that rule's wording
 - do not call any specialist other than `researcher`, `debate`, and `planner`
 - do not create durable research artifacts, local task cards, or session state
   unless the user explicitly asks
@@ -74,6 +79,11 @@ Manual step-back (reactive backstop, operator-initiated only):
   unchanged when the operator does not intervene
 
 Default output:
+- first, persist the full consolidated brief to
+  `tmp/agent-runs/<alias>/brief.md` (this is the durable-enough artifact that
+  survives a compaction or `/job-cleanup` of your in-message return); the
+  remaining items are the compact summary you return in-message
+- the path to that persisted brief
 - decision frame
 - researcher packet summary
 - debate recommendation and key objections
@@ -82,7 +92,3 @@ Default output:
 - next recommended command
 - framing_confidence (if present at kickoff) and whether it shifted during the pass
 - if a manual step-back occurred, record it and its outcome
-
-Reference:
-- See `docs/coding-agent-in-research/solution-brief/README.md` for the live
-  workflow note, reverse-escalation guidance, and linked research trail.

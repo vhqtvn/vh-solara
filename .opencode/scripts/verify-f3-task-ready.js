@@ -12,6 +12,7 @@ import fs from "fs";
 import path from "path";
 import {
     StateError,
+    activateCoordinationTask,
     bindSessionName,
     computeTaskDesignDigest,
     readyCoordinationTask,
@@ -631,6 +632,110 @@ try {
         if (readied.task.status !== "ready") {
             throw new StateError(
                 `Expected task to reach ready with corrected v2 explicit-empty envelope, got ${readied.task.status}.`,
+            );
+        }
+        passed += 1;
+    }
+
+    // === Crux 10 (defer-010): lifecycle-TOCTOU — concurrent draft->working
+    // downgrade prevention ===
+    // A stale readyCoordinationTask call reads status='draft' in its pre-lock
+    // status guard. Between that read and lock acquisition inside
+    // updateCoordinationTask, a concurrent caller readies the draft
+    // (draft->ready) and activates it (ready->working) through the real locked
+    // lifecycle. The locked current.status re-check inside
+    // updateCoordinationTask MUST throw instead of silently downgrading the
+    // active worker's lifecycle claim (no lost update, no double-ready).
+    //
+    // The interleaving is staged deterministically via the test-only
+    // _testPreLockInterleave seam (same pattern the merge path established) —
+    // NOT via timing-dependent goroutines. The callback transitions the task
+    // through the real locked writes (readyCoordinationTask +
+    // activateCoordinationTask), so the outer stale call encounters
+    // status='working' at lock time and the re-check refuses the downgrade.
+    {
+        const draft = createDraftTask("toctou-lifecycle");
+        const designDigest = computeTaskDesignDigest(draft.task, {});
+        const envelope = buildCompleteEnvelope(designDigest);
+
+        let thrown = null;
+        try {
+            readyCoordinationTask(
+                coordinatorSessionID,
+                draft.task.task_id,
+                { f3_design_readiness: envelope },
+                {
+                    cwd: "/verification",
+                    _testPreLockInterleave: () => {
+                        // Concurrent caller #1: readies the draft through the
+                        // real locked lifecycle (draft -> ready). Uses a fresh
+                        // matching envelope computed from the current design.
+                        const interleaveEnvelope = buildCompleteEnvelope(
+                            computeTaskDesignDigest(draft.task, {}),
+                        );
+                        readyCoordinationTask(
+                            coordinatorSessionID,
+                            draft.task.task_id,
+                            { f3_design_readiness: interleaveEnvelope },
+                            { cwd: "/verification" },
+                        );
+                        // Concurrent caller #2: activates the readied task
+                        // through the real locked lifecycle (ready -> working).
+                        activateCoordinationTask(
+                            coordinatorSessionID,
+                            draft.task.task_id,
+                            { cwd: "/verification" },
+                        );
+                    },
+                },
+            );
+        } catch (error) {
+            thrown = error;
+        }
+
+        // The outer stale readyCoordinationTask MUST have been refused by the
+        // locked re-check.
+        if (!(thrown instanceof StateError)) {
+            throw new StateError(
+                `Expected StateError from lifecycle-TOCTOU re-check, but got ${
+                    thrown ? thrown.constructor.name : "no error"
+                }.`,
+            );
+        }
+        passed += 1;
+
+        const message = String(thrown.message || "");
+
+        // The error MUST cite the "cannot be prepared" fragment, proving the
+        // refusal came from the status re-check, not some other code path.
+        if (!message.includes("cannot be prepared for execution")) {
+            throw new StateError(
+                `Expected "cannot be prepared for execution" in TOCTOU error, got: "${message}".`,
+            );
+        }
+        passed += 1;
+
+        // The error MUST name the locked status ("working"), proving the
+        // re-check read current.status inside the lock, not the pre-lock
+        // snapshot (which was "draft").
+        if (!message.includes("working")) {
+            throw new StateError(
+                `Expected "working" (the locked status) in TOCTOU error, got: "${message}".`,
+            );
+        }
+        passed += 1;
+
+        // The task MUST remain "working" — the concurrent caller's claim is
+        // preserved (no silent downgrade, no lost update). The stale outer
+        // call threw, so it never wrote.
+        const reloaded = readCoordinationTask(
+            coordinatorSessionID,
+            draft.task.task_id,
+            { cwd: "/verification" },
+        );
+        if (reloaded.task.status !== "working") {
+            throw new StateError(
+                `Expected task to remain working after TOCTOU refusal, got ${reloaded.task.status}.`,
             );
         }
         passed += 1;

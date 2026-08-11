@@ -1,5 +1,6 @@
 import fs from "fs";
 import path from "path";
+import { fileURLToPath } from "url";
 import {
     StateError,
     activateCoordinationTask,
@@ -26,47 +27,130 @@ function removeIfExists(targetPath) {
     }
 }
 
+// Validate an untrusted --prefix (argv) before it flows into isolatedRoot, which
+// removeIfExists() deletes recursively at startup and in finally. Without this,
+// `--prefix ../../.local/coordinator` would resolve isolatedRoot to the
+// REAL registry and the startup removal would delete it (path traversal). A
+// valid prefix is a single path segment (no separators, no `.`/`..`, no NUL),
+// and the resolved isolatedRoot MUST stay contained under tmp/verify-isolated/.
+function validateIsolatedRoot(prefix, baseRoot) {
+    if (!prefix || prefix.trim() === "") {
+        throw new StateError(
+            "Invalid --prefix: must be a non-empty value.",
+        );
+    }
+    if (prefix.includes("\0")) {
+        throw new StateError("Invalid --prefix: NUL byte is not allowed.");
+    }
+    // A single path segment: no forward or back separators. Rejecting separators
+    // also rejects `..` traversal in the normal case, but check `.`/`..`
+    // explicitly too so a literal `--prefix ..` is refused even though it has no
+    // separator.
+    if (prefix.includes("/") || prefix.includes("\\")) {
+        throw new StateError(
+            `Invalid --prefix '${prefix}': must be a single path segment (no '/' or '\\').`,
+        );
+    }
+    if (prefix === "." || prefix === "..") {
+        throw new StateError(
+            `Invalid --prefix '${prefix}': must not be '.' or '..'.`,
+        );
+    }
+    const root = baseRoot || repoRoot();
+    const canonicalParent = path.resolve(root, "tmp", "verify-isolated");
+    const candidate = path.resolve(canonicalParent, prefix);
+    // LEXICAL containment (independent guard): candidate must be strictly UNDER
+    // the canonical parent (starts with parent + separator). This is the first
+    // line of defense: even if the segment check above is weakened later, this
+    // assertion independently refuses any resolved path that escapes
+    // tmp/verify-isolated/.
+    if (candidate !== canonicalParent && !candidate.startsWith(canonicalParent + path.sep)) {
+        throw new StateError(
+            `Invalid --prefix '${prefix}': resolved isolated root '${candidate}' escapes the allowed parent '${canonicalParent}'.`,
+        );
+    }
+    if (candidate === canonicalParent) {
+        throw new StateError(
+            `Invalid --prefix '${prefix}': must resolve to a child of 'tmp/verify-isolated', not the parent itself.`,
+        );
+    }
+
+    // PHYSICAL containment (defense-in-depth against symlink redirection).
+    // path.resolve is LEXICAL — it does NOT dereference symlinks — so a
+    // pre-planted symlink on the isolation path (e.g. tmp/verify-isolated ->
+    // .local/coordinator, or the candidate leaf itself symlinked out)
+    // passes the lexical check above, yet fs.rmSync({recursive:true}) follows
+    // the OS-resolved intermediate/leaf symlink and recursively deletes through
+    // it into the REAL coordinator registry. Mirror state-lib's
+    // resolveRealRefusingSymlink: if a path exists and its realpath differs
+    // from its lexical path, it is or traverses a symlink — refuse. This gates
+    // BOTH the startup self-heal removal and the finally wholesale removal
+    // (they reuse this same validated binding). A non-existent path has no
+    // symlink to follow, so the lexical check above still governs it; once the
+    // path exists it must be physical and contained.
+    const resolveRealRefusingSymlink = (lexical) => {
+        if (!fs.existsSync(lexical)) {
+            return null;
+        }
+        let resolved;
+        try {
+            resolved = fs.realpathSync(lexical);
+        } catch (_error) {
+            throw new StateError(
+                `Invalid --prefix: failed to resolve the real path of the isolated path '${lexical}'; refusing.`,
+            );
+        }
+        if (resolved !== lexical) {
+            throw new StateError(
+                `Invalid --prefix: the isolated path '${lexical}' resolves to a different physical location '${resolved}' (symlink detected); refusing to use it for recursive removal.`,
+            );
+        }
+        return resolved;
+    };
+    const parentReal = resolveRealRefusingSymlink(canonicalParent);
+    const candidateReal = resolveRealRefusingSymlink(candidate);
+    if (candidateReal !== null) {
+        const effectiveParent = parentReal !== null ? parentReal : canonicalParent;
+        if (candidateReal !== effectiveParent && !candidateReal.startsWith(effectiveParent + path.sep)) {
+            throw new StateError(
+                `Invalid --prefix '${prefix}': physical isolated root '${candidateReal}' escapes the physical parent '${effectiveParent}'.`,
+            );
+        }
+    }
+    return candidate;
+}
+
+// Mirror state-lib's localCoordinatorRoot(): when OPENCODE_LOCAL_COORDINATOR_ROOT
+// is set (by the isolation setup in main()), resolve every coordinator path
+// against the isolated root so fixture cards NEVER touch the real
+// .local/coordinator/ registry. This MUST stay byte-for-byte consistent
+// with state-lib's resolution — a divergence between the verifier's own path
+// helpers (direct disk writes for syntax/degraded/malformed fixtures) and
+// state-lib's storage root (saveCoordinationTask writes) is exactly the leak
+// vector this slice closes. Empty/absent env falls back to the real repo root,
+// preserving the default for any non-isolated invocation.
+function coordinatorRoot() {
+    const override = (process.env.OPENCODE_LOCAL_COORDINATOR_ROOT || "").trim();
+    return override || path.join(repoRoot(), ".local", "coordinator");
+}
+
 function cleanupArtifacts(taskIDs) {
     for (const taskID of taskIDs) {
         removeIfExists(
-            path.join(
-                repoRoot(),
-                ".local",
-                "coordinator",
-                "tasks",
-                `${taskID}.json`,
-            ),
+            path.join(coordinatorRoot(), "tasks", `${taskID}.json`),
         );
         removeIfExists(
-            path.join(
-                repoRoot(),
-                ".local",
-                "coordinator",
-                "reports",
-                taskID,
-            ),
+            path.join(coordinatorRoot(), "reports", taskID),
         );
     }
 }
 
 function taskCardPath(taskID) {
-    return path.join(
-        repoRoot(),
-        ".local",
-        "coordinator",
-        "tasks",
-        `${taskID}.json`,
-    );
+    return path.join(coordinatorRoot(), "tasks", `${taskID}.json`);
 }
 
 function taskReportDir(taskID) {
-    return path.join(
-        repoRoot(),
-        ".local",
-        "coordinator",
-        "reports",
-        taskID,
-    );
+    return path.join(coordinatorRoot(), "reports", taskID);
 }
 
 function expectStateError(fn, expectedFragment) {
@@ -90,7 +174,10 @@ function expectStateError(fn, expectedFragment) {
 
 function main() {
     const args = process.argv.slice(2);
-    let prefix = "verify-task-registry";
+    // PID-scoped default so two concurrent no-arg runs (e.g. a test and an
+    // operator invocation) get DISTINCT isolated roots — the second run's
+    // startup self-heal must not remove the first run's in-flight isolated dir.
+    let prefix = `verify-task-registry-${process.pid}`;
     for (let index = 0; index < args.length; index += 1) {
         if (args[index] === "--prefix") {
             prefix = args[index + 1] || prefix;
@@ -99,6 +186,43 @@ function main() {
         }
         throw new StateError(`Unexpected argument: ${args[index]}`);
     }
+
+    // ------------------------------------------------------------------
+    // Fixture isolation (the leak this verifier used to have).
+    //
+    // Before isolation, every fixture card saved here landed in the REAL
+    // .local/coordinator/tasks/ registry because state-lib's
+    // localCoordinatorTasksRoot() resolves to repoRoot() and the {cwd:
+    // "/verification"} option is actor metadata only — it never redirected
+    // storage. The finally-block cleanup removed the CURRENT run's recorded
+    // IDs, but any interruption (crash, SIGKILL) before finally left fixture
+    // cards orphaned in the real registry indefinitely (the root cause of the
+    // historical P0-REPO-060 orphan). Redirecting ALL coordinator state to an
+    // isolated temp dir means a fixture can NEVER touch the real registry —
+    // not during the run, not on interruption — and cleanup is a wholesale
+    // dir removal (no per-ID fragility). The isolated dir is prefix-scoped so
+    // concurrent runs with different --prefix values do not collide, and
+    // removeIfExists at startup self-heals any leftover from a prior
+    // interrupted run. tmp/ is gitignored, so an interrupted run's leftover
+    // never reaches git either.
+    //
+    // SECURITY: prefix is untrusted argv. It flows into isolatedRoot, which
+    // removeIfExists() deletes recursively at startup AND in finally. Without
+    // validation, `--prefix ../../.local/coordinator` would resolve
+    // isolatedRoot to the REAL registry and the startup removal would delete
+    // it before the env override is even set. validateIsolatedRoot() rejects
+    // any prefix that is not a single path segment, asserts the resolved
+    // isolatedRoot stays LEXICALLY contained under tmp/verify-isolated/, AND
+    // refuses any symlink on the isolation path (PHYSICAL containment via
+    // fs.realpathSync) so a pre-planted symlink cannot redirect the recursive
+    // removal into the real registry — gating every removal against the same
+    // validated binding.
+    // ------------------------------------------------------------------
+    const isolatedRoot = validateIsolatedRoot(prefix);
+    removeIfExists(isolatedRoot);
+    fs.mkdirSync(path.join(isolatedRoot, "tasks"), { recursive: true });
+    fs.mkdirSync(path.join(isolatedRoot, "reports"), { recursive: true });
+    process.env.OPENCODE_LOCAL_COORDINATOR_ROOT = isolatedRoot;
 
     const coordinatorSessionID = `${prefix}-coordinator-session`;
     const subagentSessionID = `${prefix}-subagent-session`;
@@ -119,11 +243,12 @@ function main() {
 
         // ------------------------------------------------------------------
         // Baseline: an empty / all-healthy registry reports NO quarantine and
-        // ZERO degraded cards. The live coordinator registry starts in this
-        // state (defer + transport cards only, none degraded); the assertion
-        // guards against a regression where a healthy registry is misreported
-        // as degraded, and anchors the degraded_count===quarantine.length
-        // invariant at the empty-quarantine boundary.
+        // ZERO degraded cards. Under fixture isolation this baseline is the
+        // genuinely-empty isolated registry (no real defer/transport cards
+        // leak in), so the assertion is robust regardless of real-registry
+        // state; it guards against a regression where a healthy registry is
+        // misreported as degraded, and anchors the degraded_count===
+        // quarantine.length invariant at the empty-quarantine boundary.
         // ------------------------------------------------------------------
         const baselineList = listCoordinationTasks(coordinatorSessionID, {
             cwd: "/verification",
@@ -2460,6 +2585,135 @@ function main() {
             throw new StateError("Case 10i: title must be restored.");
         }
 
+        // 10j. Non-core-only list-field degradation: a card degraded EXCLUSIVELY
+        // via a list field (files_in_scope=[]) has NO repairable offender
+        // (files_in_scope/success_criteria/validation_plan are outside
+        // DEGRADED_CORE_REPAIRABLE_FIELD_NAMES — the degraded branch is
+        // intentionally core-identity/enum-only). This pins the two documented
+        // diagnostics a non-core-only-degraded card surfaces, catching
+        // regressions in either the refusal path or the backstop:
+        //   (10j-1) REFUSED-UP-FRONT: supplying a core field the card is NOT
+        //     offending on (task_type is valid here) is rejected by the
+        //     restore-only payload gate, because repairableOffenders
+        //     (offenders ∩ DEGRADED_CORE_REPAIRABLE_FIELD_NAMES) is empty and
+        //     every supplied key is therefore "unexpected".
+        //   (10j-2) SAVE-PATH BACKSTOP: a no-op repair {} cannot be refused by
+        //     the restore-only gate (nothing unexpected, no uncovered
+        //     repairable offender), so it falls through to
+        //     updateCoordinationTask, whose ensureCoordinationTaskCoreFields
+        //     re-runs collectCoordinationTaskCoreFieldErrors and throws
+        //     "files_in_scope must contain at least one path" BEFORE
+        //     atomicWriteJson — the load-bearing backstop that keeps a
+        //     non-core-only-degraded card from silently no-op-writing a
+        //     spurious task_repaired history entry. (residual risk #1 in
+        //     repairDegradedCoordinationTaskCoreFields explicitly names this
+        //     save-path throw as the backstop for list-field offenders.)
+        // NON-GOAL: do NOT expand DEGRADED_CORE_REPAIRABLE_FIELD_NAMES to
+        // include list fields — the save-path throw is the intended backstop,
+        // not a list-field repair.
+        const listFieldDegraded = saveCoordinationTask(
+            coordinatorSessionID,
+            {
+                title: "Non-core-only list-field degradation sentinel",
+                task_type: "implementation",
+                coordination_mode: "short",
+                primary_lane: "build",
+                files_in_scope: ["tests/fixtures/example-pkg/"],
+                success_criteria: ["files_in_scope offender surfaces via save-path backstop."],
+                validation_plan: ["Degrade files_in_scope only; assert both diagnostics."],
+            },
+            { cwd: "/verification" },
+        );
+        createdTaskIDs.push(listFieldDegraded.task.task_id);
+        degradeCard(listFieldDegraded.task.task_id, (data) => {
+            data.files_in_scope = [];
+        });
+        const listFieldDegradedRead = readCoordinationTask(
+            coordinatorSessionID,
+            listFieldDegraded.task.task_id,
+            { cwd: "/verification" },
+        );
+        if (!listFieldDegradedRead.degraded) {
+            throw new StateError("Case 10j: expected degraded card after clearing files_in_scope.");
+        }
+        if (!listFieldDegradedRead.diagnostics.offending_fields.includes("files_in_scope")) {
+            throw new StateError("Case 10j: expected files_in_scope in offending fields.");
+        }
+        // The card is degraded via a NON-core field only — all 6 core
+        // identity/enum fields stay valid. This is what distinguishes 10j from
+        // 10a/10b/10g (core-field offenders) and is the precondition for the
+        // empty repairableOffenders set that drives both diagnostics below.
+        const CORE_IDENTITY_ENUM_FIELDS = [
+            "title",
+            "task_type",
+            "coordination_mode",
+            "primary_lane",
+            "status",
+            "report_envelope",
+        ];
+        for (const coreField of CORE_IDENTITY_ENUM_FIELDS) {
+            if (listFieldDegradedRead.diagnostics.offending_fields.includes(coreField)) {
+                throw new StateError(
+                    `Case 10j: core field ${coreField} must NOT be an offender (non-core-only degradation).`,
+                );
+            }
+        }
+        // 10j-1: REFUSED-UP-FRONT. Supplying task_type (a valid core field the
+        // card is NOT offending on) is rejected because repairableOffenders is
+        // empty — task_type is unexpected under the restore-only payload gate.
+        // This is the primary diagnostic a user hits when they try to repair
+        // the wrong field on a non-core-only-degraded card.
+        expectStateError(
+            () =>
+                repairCoordinationTask(
+                    coordinatorSessionID,
+                    listFieldDegraded.task.task_id,
+                    { task_type: "implementation" },
+                    { cwd: "/verification" },
+                ),
+            "Unsupported fields for degraded task repair",
+        );
+        // 10j-2: SAVE-PATH BACKSTOP. A no-op repair {} passes the restore-only
+        // gate (no unexpected field, no uncovered repairable offender) and
+        // reaches updateCoordinationTask, whose ensureCoordinationTaskCoreFields
+        // re-throws the files_in_scope core-field error BEFORE atomicWriteJson.
+        // This is the documented backstop for list-field offenders and MUST
+        // throw rather than silently no-op-write.
+        expectStateError(
+            () =>
+                repairCoordinationTask(
+                    coordinatorSessionID,
+                    listFieldDegraded.task.task_id,
+                    {},
+                    { cwd: "/verification" },
+                ),
+            "files_in_scope must contain at least one path",
+        );
+        // No-write proof: the card remains degraded with files_in_scope empty
+        // AND no spurious task_repaired history entry was appended. A
+        // regression that swallowed the save-path throw and wrote anyway would
+        // leave a task_repaired entry on a still-degraded card — this is the
+        // load-bearing backstop assertion.
+        const listFieldAfterAttempt = readCoordinationTask(
+            coordinatorSessionID,
+            listFieldDegraded.task.task_id,
+            { cwd: "/verification" },
+        );
+        if (!listFieldAfterAttempt.degraded) {
+            throw new StateError("Case 10j: card must remain degraded (no repair succeeded).");
+        }
+        const listFieldCardRaw = JSON.parse(
+            fs.readFileSync(taskCardPath(listFieldDegraded.task.task_id), "utf8"),
+        );
+        const spuriousRepairedEntries = (listFieldCardRaw.history || []).filter(
+            (entry) => entry && entry.event === "task_repaired",
+        );
+        if (spuriousRepairedEntries.length !== 0) {
+            throw new StateError(
+                `Case 10j: save-path backstop must NOT append a task_repaired history entry (found ${spuriousRepairedEntries.length}).`,
+            );
+        }
+
         // ------------------------------------------------------------------
         // Case 10 (recovery re-scan): a degraded card repaired in place must
         // LEAVE quarantine[] on the next listCoordinationTasks scan, and
@@ -2544,9 +2798,16 @@ function main() {
         // root confinement, (11j) cleanup compatibility, (11k) symlink-escape
         // refusal (physical confinement — a symlinked report target is refused
         // and the external sentinel survives), (11l) reported lifecycle-guard
-        // refusal + forced override, and (11m/11n/11o) blocked, completed, and
-        // stale-working lifecycle-guard refusals proving card + report evidence
-        // survive intact when a pending coordinator gate owns the card.
+        // refusal + forced override, and (11m/11o) blocked and stale-working
+        // lifecycle-guard refusals proving card + report evidence survive
+        // intact when a pending coordinator gate owns the card.
+        //
+        // `completed` is NOT in this block: it enters the landing-gated
+        // retirement path (4c in deleteCoordinationTask — completed + a
+        // reachable `Task-Card:` trailer → deleted; otherwise a structured
+        // landing_not_confirmed refusal). That path needs a git fixture, so it
+        // is covered by the dedicated hermetic suite
+        // tests/scripts/task-delete-retirement.test.js rather than here.
         //
         // Every fixture id is pushed to createdTaskIDs so the finally-block
         // cleanupArtifacts runs over ids whose card + report dir were already
@@ -2967,9 +3228,7 @@ function main() {
         const confinementID = confinementFixture.task.task_id;
         createdTaskIDs.push(confinementID);
         const siblingDir = path.join(
-            repoRoot(),
-            ".local",
-            "coordinator",
+            coordinatorRoot(),
             "dashboards",
         );
         fs.mkdirSync(siblingDir, { recursive: true });
@@ -3053,9 +3312,7 @@ function main() {
         // gitignored transport tree (under dashboards/), with a marker file
         // whose contents we will prove survive.
         const escapeSentinelDir = path.join(
-            repoRoot(),
-            ".local",
-            "coordinator",
+            coordinatorRoot(),
             "dashboards",
             "delete-symlink-sentinel",
         );
@@ -3216,15 +3473,19 @@ function main() {
         }
         assertAbsent(reportedID, "Case 11l");
 
-        // 11m/11n/11o. Blocked, completed, and stale-working (no active owner)
-        //      cards: each is protected by the lifecycle guard. A blocked card
-        //      awaits a coordinator decision; a completed card has a closeout
-        //      report awaiting review; a stale working card (no active owner)
-        //      may carry in-progress artifacts. Each refusal must leave the
-        //      card + report dir + sentinel byte-identical and intact.
+        // 11m/11o. Blocked and stale-working (no active owner) cards: each is
+        //      protected by the in-flight lifecycle guard (4b). A blocked card
+        //      awaits a coordinator decision; a stale working card (no active
+        //      owner) may carry in-progress artifacts. `completed` is NOT in
+        //      this set — it enters the landing-gated retirement path (4c:
+        //      verifyLandingProof — completed + reachable Task-Card trailer →
+        //      deleted; otherwise landing_not_confirmed), covered by the
+        //      dedicated hermetic suite
+        //      tests/scripts/task-delete-retirement.test.js. Each refusal here
+        //      must leave the card + report dir + sentinel byte-identical and
+        //      intact.
         const lifecycleStatusFixtures = [
             { label: "11m", status: "blocked", title: "Delete test blocked card" },
-            { label: "11n", status: "completed", title: "Delete test completed card" },
             { label: "11o", status: "working", title: "Delete test stale-working card" },
         ];
         for (const spec of lifecycleStatusFixtures) {
@@ -3328,12 +3589,34 @@ function main() {
         );
     } finally {
         cleanupArtifacts(createdTaskIDs);
+        // Wholesale removal of the isolated coordinator root: this is the
+        // leak-proof guarantee. Even if cleanupArtifacts missed an id (an
+        // interrupted earlier branch, a directly-written fixture, or a future
+        // edit that forgets to track a new fixture), the entire isolated tree
+        // is removed here, so nothing can reach the real registry. Paired with
+        // the per-id cleanup above for clarity and the 11j idempotency path.
+        removeIfExists(isolatedRoot);
+        delete process.env.OPENCODE_LOCAL_COORDINATOR_ROOT;
     }
 }
 
-try {
-    main();
-} catch (error) {
-    console.error(error instanceof Error ? error.message : String(error));
-    process.exit(1);
+// Exposed for adversarial unit testing of the path-traversal / symlink
+// containment guard (validateIsolatedRoot accepts an optional baseRoot so a test
+// can drive it against a throwaway temp tree without touching the real repo).
+export { validateIsolatedRoot };
+
+// Only invoke main() when this file is the entry point (node .../verify-task-registry.js),
+// not when it is imported (e.g. by the isolation regression tests importing
+// validateIsolatedRoot). ESM has no require.main === module, so compare the
+// resolved entry path against this module's own URL.
+const __entryPath =
+    process.argv[1] !== undefined ? path.resolve(process.argv[1]) : "";
+const __modulePath = fileURLToPath(import.meta.url);
+if (__entryPath === __modulePath) {
+    try {
+        main();
+    } catch (error) {
+        console.error(error instanceof Error ? error.message : String(error));
+        process.exit(1);
+    }
 }

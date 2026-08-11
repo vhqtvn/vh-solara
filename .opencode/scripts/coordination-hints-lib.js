@@ -142,7 +142,19 @@ function isCoordinationSurface(relativePath) {
 }
 
 function isProductSurface(relativePath, productPrefixes = DEFAULT_PRODUCT_PREFIXES) {
-    return productPrefixes.some((prefix) => relativePath.startsWith(prefix));
+    // Slash-correct comparison: a product-prefix entry denotes a DIRECTORY
+    // boundary, so the startsWith match must be directory-bounded regardless
+    // of whether the entry carries a trailing slash. A slash-less entry such
+    // as "apps" must match "apps/x" (a file under apps/) but NOT "appsfoo/"
+    // (an unrelated directory) — a raw startsWith would over-match the latter.
+    // Normalizing each prefix to end with "/" makes the bound explicit. The
+    // shipped defaults (["apps/", "packages/"]) already carry the slash, so
+    // behavior is unchanged for them; this hardens against an adopter
+    // .vh-agent-harness/product-prefixes.json entry written without one.
+    return productPrefixes.some((prefix) => {
+        const bounded = prefix.endsWith("/") ? prefix : `${prefix}/`;
+        return relativePath.startsWith(bounded);
+    });
 }
 
 function supportsLargeFileHint(relativePath) {

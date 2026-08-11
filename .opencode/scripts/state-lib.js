@@ -6,6 +6,11 @@ import {
     validateF3DesignReadiness,
     computeDesignDigest,
 } from "./f3-design-readiness.js";
+import {
+    extractAllRewriteParityBlocks,
+    validateRewriteParityCompletion,
+} from "./rewrite-parity-validate.js";
+import { readPauseState, formatRefusal } from "./pause-new-work.js";
 
 const SCHEMA_VERSION = 1;
 const LOCK_TIMEOUT_MS = 5000;
@@ -595,6 +600,15 @@ function workstreamFilePath(workstreamName, target) {
 }
 
 function localCoordinatorRoot() {
+    // Opt-in isolation override (mirrors OPENCODE_STATE_ROOT / OPENCODE_RUN_ROOT):
+    // when set, the ENTIRE .local/coordinator/ subtree (tasks + reports +
+    // dashboards + scratch) resolves against this root instead of the real repo.
+    // Used by verification scripts (verify-task-registry.js et al.) to redirect
+    // their fixture cards to an isolated temp dir so a fixture can NEVER leak
+    // into the real coordinator registry — even on interruption. Empty/absent
+    // preserves the default repo-rooted behavior for every other caller.
+    const override = (process.env.OPENCODE_LOCAL_COORDINATOR_ROOT || "").trim();
+    if (override) return override;
     return path.join(repoRoot(), ".local", "coordinator");
 }
 
@@ -5041,6 +5055,137 @@ function listCoordinationTasks(sessionID, options = {}) {
     };
 }
 
+// =============================================================================
+// Landing-proof verifier for completed-card retirement (m0141 Slice 2)
+// =============================================================================
+// A `completed` transport card may be retired as done ONLY when a reachable
+// commit carrying the exact `Task-Card: <card-id>` trailer is present — the
+// landing-proof contract (docs/coordination/RECORD_LIFECYCLE.md). The verifier
+// is a REACHABILITY check (per the closure-verifier reachability rule,
+// researches/decisions/2026-08-04-binding-regression-unification-audit.md
+// Addendum): `git log --branches` walks ALL local branch tips (refs/heads/*),
+// branch-GENERIC with no hardcoded `main` (mirrors doctor #24's
+// `git rev-list --branches`), so a match proves BOTH that the work landed AND
+// that it is reachable from a branch — never object existence (`git show` /
+// `git cat-file`), which an orphaned or reflog-only commit satisfies while
+// being absent from every branch.
+//
+// The verifier READS git history only (agent-allowed per the git_readonly
+// allowlist). It does NOT trust any model-supplied SHA/branch field; the
+// card-id↔commit JOIN is provided by the worker-authored `Task-Card:` trailer
+// and proven independently by the git-log reachability query. (A gate-appended
+// trailer / gate-ledger card-id→commit join is documented future-hardening,
+// NOT this slice.) Misattribution (a commit claiming card-X did card-Y's work)
+// is a review/correctness concern, not a landing-proof concern — the commit
+// still LANDED; out of scope for this verifier.
+//
+// Fail-closed: if git history cannot be read (not a git repo, git missing,
+// timeout), the verifier reports landing NOT confirmed so a completed card is
+// never silently retired on an unverifiable surface. The remedy is identical to
+// the no-trailer case (add a reachable trailer, or use `force` for genuine
+// legacy/emergency cleanup).
+
+// Landing-proof repo root. The production verifier is ALWAYS rooted at
+// repoRoot() (the real repo whose branch history proves landing) — there is NO
+// ambient override. The retirement test suite redirects the query at a hermetic
+// scratch git repo by passing an explicit `repoOverride` argument (via the
+// `landingProofRepo` option on deleteCoordinationTask) that the test injects by
+// importing state-lib directly; plan-state.js does NOT forward `landingProofRepo`
+// from the tool args, so production plan_state calls cannot configure it and an
+// ambient process env var cannot redirect the verifier. This is deliberately a
+// function-parameter seam (not an env var) so the landing gate — a security gate
+// on destructive retirement — is not bypassable via ambient env.
+
+// Verify the landing-proof contract for a completed card. Returns
+// { proven, reason, query, commits, detail }. `proven` is true iff ≥1 reachable
+// commit carries the exact `Task-Card: <taskID>` trailer line. `reason`
+// distinguishes the not-proven cases: "no_trailer_match" (git ran, 0 exact
+// matches) vs "verifier_unavailable" (git could not read history). Never throws
+// — the caller maps a not-proven result to a structured landing_not_confirmed
+// refusal. `repoOverride` is a test-only injection point (see above); production
+// omits it and the query runs against repoRoot().
+function verifyLandingProof(taskID, repoOverride) {
+    const repo = repoOverride || repoRoot();
+    const trailerLine = `Task-Card: ${taskID}`;
+    // Two-stage EXACT match (the `Task-Card:` trailer is a machine-query key,
+    // so the match must be an exact trailer LINE, not a substring — otherwise a
+    // commit carrying `Task-Card: alpha-next` would falsely satisfy card
+    // `alpha`, since `Task-Card: alpha` is a substring of that line).
+    //   stage 1: `--fixed-strings --grep=Task-Card: <id>` narrows to commits
+    //            whose message contains the substring (a cheap pre-filter that
+    //            may still include prefix collisions like alpha / alpha-next).
+    //   stage 2: parse each candidate's full body and require a line whose
+    //            trimmed value is EXACTLY the trailer (rejects prefix/substring
+    //            collisions).
+    // `--branches` walks ALL local branch tips (refs/heads/*) — branch-GENERIC,
+    // no hardcoded `main` (mirrors doctor #24's `git rev-list --branches`); a
+    // match proves BOTH landing AND reachability, never object existence.
+    // Record separators: %x1e (RS) between commits, %x1f (US) between SHA and
+    // body — control chars that never cause a false positive (a split fragment
+    // lacking the exact line is excluded; one carrying it is included).
+    const args = [
+        "log",
+        "--branches",
+        "--fixed-strings",
+        `--grep=Task-Card: ${taskID}`,
+        "--format=%H%x1f%B%x1e",
+    ];
+    const query = `git log --branches --fixed-strings --grep=Task-Card: ${taskID} (each candidate post-filtered to an exact "Task-Card: ${taskID}" trailer line)`;
+    let stdout = "";
+    try {
+        stdout = execFileSync("git", args, {
+            cwd: repo,
+            encoding: "utf8",
+            timeout: 10000,
+            stdio: ["ignore", "pipe", "ignore"],
+        });
+    } catch (error) {
+        const why =
+            error && error.code === "ENOENT"
+                ? "git executable not found"
+                : error && error.message
+                  ? error.message
+                  : "git failed";
+        return {
+            proven: false,
+            reason: "verifier_unavailable",
+            query,
+            commits: [],
+            detail: `the landing-proof verifier could not read git history (${why})`,
+        };
+    }
+    const exactCommits = [];
+    for (const record of stdout.split("\x1e")) {
+        const rec = record.trim();
+        if (!rec) continue;
+        const sep = rec.indexOf("\x1f");
+        const sha = (sep >= 0 ? rec.slice(0, sep) : rec).trim();
+        const body = sep >= 0 ? rec.slice(sep + 1) : "";
+        const matched = body
+            .split(/\r?\n/)
+            .some((line) => line.trim() === trailerLine);
+        if (matched && sha) {
+            exactCommits.push(sha);
+        }
+    }
+    if (exactCommits.length > 0) {
+        return {
+            proven: true,
+            reason: "trailer_reachable",
+            query,
+            commits: exactCommits,
+            detail: `${exactCommits.length} reachable commit(s) carry the exact "Task-Card: ${taskID}" trailer line`,
+        };
+    }
+    return {
+        proven: false,
+        reason: "no_trailer_match",
+        query,
+        commits: [],
+        detail: `no reachable commit carries the exact "Task-Card: ${taskID}" trailer line`,
+    };
+}
+
 function deleteCoordinationTask(sessionID, taskIDRaw, options = {}) {
     const actor = coordinationActorContext(sessionID, options);
     const forced = options.force === true;
@@ -5262,24 +5407,30 @@ function deleteCoordinationTask(sessionID, taskIDRaw, options = {}) {
         };
     }
 
-    // 4b. Pending-gate lifecycle guard. A card that has entered the active
+    // 4b. In-flight lifecycle guard. A card that has entered the active
     //     lifecycle — working without an active owner (stale/abandoned),
-    //     reported, blocked, or completed — carries a closeout report or
-    //     work evidence that a coordinator gate (/task-review,
-    //     /task-closeout) may still need to consume. Refuse deletion without
-    //     an explicit force so this retire wrapper cannot bypass a pending
-    //     review or closeout gate by destroying the evidence first. Only
-    //     pre-work / terminal-gate-passed statuses (draft, ready, cancelled)
-    //     are freely disposable. Degraded tolerance is preserved: a malformed
-    //     card (parsedCard === null) gets status "degraded", which is not in
-    //     the protected set.
-    const PROTECTED_LIFECYCLE_STATUSES = new Set([
+    //     reported, or blocked — carries a closeout report or work evidence
+    //     that a coordinator gate (/task-review, /task-closeout) may still need
+    //     to consume. Refuse deletion without an explicit force so this retire
+    //     wrapper cannot bypass a pending review or closeout gate by destroying
+    //     the evidence first. Only pre-work / terminal-gate-passed statuses
+    //     (draft, ready, cancelled) are freely disposable. Degraded tolerance
+    //     is preserved: a malformed card (parsedCard === null) gets status
+    //     "degraded", which is not in the protected set.
+    //
+    //     `completed` is NOT in this set: it enters the landing-gated
+    //     retirement path in step 4c (a completed card WITH a reachable
+    //     Task-Card trailer IS retireable). Critically, this in-flight
+    //     protection for working/reported/blocked is NOT weakened by the
+    //     completed-retirement path — it runs FIRST and refuses EVEN IF a
+    //     landing commit appears, because their report evidence may still be
+    //     needed by a coordinator gate regardless of any commit.
+    const PROTECTED_INFLIGHT_STATUSES = new Set([
         "working",
         "reported",
         "blocked",
-        "completed",
     ]);
-    if (PROTECTED_LIFECYCLE_STATUSES.has(summaryStatus) && !forced) {
+    if (PROTECTED_INFLIGHT_STATUSES.has(summaryStatus) && !forced) {
         const lifecycleMessage =
             summaryStatus === "working"
                 ? `Task ${taskID} is 'working' (no active owner; possibly stale) and may carry in-progress work artifacts in its report directory. Refusing deletion without explicit force.`
@@ -5296,6 +5447,40 @@ function deleteCoordinationTask(sessionID, taskIDRaw, options = {}) {
                 message: lifecycleMessage,
             },
         };
+    }
+
+    // 4c. Landing-gated retirement path for `completed` cards. A completed card
+    //     may be retired as done ONLY when a reachable commit carrying the exact
+    //     `Task-Card: <card-id>` trailer is present (the landing-proof contract,
+    //     RECORD_LIFECYCLE.md; the 2026-08-07 lesson: a card deleted on review
+    //     approval alone while the commit later failed to land). The verifier is
+    //     a REACHABILITY check (git log --branches over all branch tips, never
+    //     object existence). `force` overrides this as an explicit emergency
+    //     path — NOT the ordinary completed-cleanup route. In-flight statuses
+    //     (working/reported/blocked) were already handled in 4b and never reach
+    //     here. Degraded tolerance: a malformed card surfaces status "degraded"
+    //     (not "completed"), so it bypasses this path and stays freely
+    //     disposable (4b does not protect it either).
+    if (summaryStatus === "completed" && !forced) {
+        const landing = verifyLandingProof(taskID, options.landingProofRepo);
+        if (!landing.proven) {
+            const remedy = `Ensure the work landed on a branch under the exact "Task-Card: ${taskID}" trailer, or re-run with explicit force ONLY for genuine legacy/emergency cleanup (force bypasses the landing check and destroys the card + report directory, not transitioned).`;
+            return {
+                ...actor,
+                ok: false,
+                operation: "delete_coordination_task",
+                refusal: {
+                    code: "landing_not_confirmed",
+                    task_id: taskID,
+                    status: "completed",
+                    reason: landing.reason,
+                    query: landing.query,
+                    force_required: true,
+                    message: `Task ${taskID} is 'completed' but its landing is not confirmed: ${landing.detail}. The retirement path requires a reachable commit carrying the exact "Task-Card: ${taskID}" trailer. ${remedy}`,
+                },
+            };
+        }
+        // Landing proven: fall through to the removal sequence below.
     }
 
     // 5. Pre-removal summary. Built BEFORE any fs mutation; emitted to the
@@ -5952,6 +6137,27 @@ function deleteSkillProposal(sessionID, proposalIDRaw, options = {}) {
 function activateCoordinationTask(sessionID, taskIDRaw, options = {}) {
     const actor = coordinationActorContext(sessionID, options);
     const loaded = loadCoordinationTask(taskIDRaw);
+    // Pause-on-new-work gate (memo-4). This is the coord-task dispatch seam.
+    // Gate ONLY the ready -> working transition (NEW dispatch): that is the
+    // moment a prepared task begins executing. A working -> working resume /
+    // reclaim / takeover is CONTINUATION of in-flight work and MUST remain
+    // available under an engaged pause — the contract is "in-flight work is
+    // never touched", and re-entering an already-active task is not new work.
+    // The gate fires after load (so the status is known) but BEFORE
+    // error-collection and before any mutation, so a ready-task refusal is
+    // surfaced cleanly. In-flight child sessions already spawned are NOT
+    // signalled or cancelled — see the plugin (pause-new-work.js) for the
+    // TaskTool seam.
+    if (loaded.payload.status === "ready") {
+        const pauseState = readPauseState();
+        if (pauseState.engaged) {
+            throw new StateError(
+                formatRefusal(
+                    `coordination task activation (ready -> working for task ${loaded.payload.task_id}).`,
+                ),
+            );
+        }
+    }
     const errors = [];
     const missingResearchFields = missingResearchContractFields(loaded.payload);
     if (missingResearchFields.length) {
@@ -6151,6 +6357,34 @@ function readyCoordinationTask(sessionID, taskIDRaw, input = {}, options = {}) {
         throw new StateError(
             `Task ${loaded.payload.task_id} is ${loaded.payload.status} and cannot be prepared for execution.`,
         );
+    }
+    // --- TEST-ONLY pre-lock interleaving seam (lifecycle-TOCTOU exercise) ---
+    // The locked current.status re-check inside updateCoordinationTask below
+    // defends a TOCTOU window: between this pre-lock status guard (which read
+    // loaded.payload.status) and lock acquisition inside updateCoordinationTask,
+    // a concurrent caller may have transitioned the task (e.g., activated it
+    // to "working"). This optional, per-call, synchronous callback fires
+    // exactly once at the after-status-check / before-lock boundary so a
+    // verifier can transition the task via the real lifecycle (ready +
+    // activate, both through their own locked writes) and exercise the
+    // locked re-check -> throw wiring deterministically.
+    //
+    // Containment contract (enforced by construction, mirroring the merge-path
+    // _testPreLockInterleave seam):
+    //  - per-call: passed via the options arg only; NOT an env var.
+    //  - inert by default: every production + existing-test caller omits it.
+    //  - synchronous, invoked at most once.
+    //  - NOT propagated: readyCoordinationTask calls updateCoordinationTask
+    //    (lock+persist), whose signature is (taskIDRaw, updateFn) with no
+    //    options arg — the seam callback cannot reach it.
+    //  - CANNOT override the status guard, suppress locking, authorize
+    //    persistence, or override a thrown guard: the callback only provides
+    //    the interleaving opportunity; the locked re-check inside
+    //    updateCoordinationTask remains the sole authority and may still throw.
+    if (typeof options._testPreLockInterleave === "function") {
+        options._testPreLockInterleave({
+            task_id: loaded.payload.task_id,
+        });
     }
     const payload = input && typeof input === "object" ? input : {};
     const explicitNextAction =
@@ -6872,6 +7106,37 @@ function saveCoordinationTaskCloseout(sessionID, taskIDRaw, options = {}) {
             "report_envelope",
             errors,
         ) || loaded.payload.report_envelope;
+    // Rewrite-parity Stage 2 (closeout transition). The gate is OPT-IN: it
+    // fires ONLY when the closeout body carries an explicitly-declared
+    // ```rewrite-parity contract (mode: deletion_replacement |
+    // modification_only_rewrite). Ordinary closeouts carry no such block and
+    // bear zero rewrite-parity burden. When status=completed AND a contract
+    // is declared, every behavior must be proven with a non-empty receipt
+    // (structural completeness); the tree-binding honesty is author + reviewer
+    // planned/failed/skipped/not-demonstrable/missing-receipt refuse
+    // completion (not-demonstrable routes to defer). Mirrors behavioral-
+    // closure's authority split (a structurally-complete contract can still
+    // carry weak evidence; the verifier/receipt honesty is author + reviewer).
+    if (taskStatus === "completed") {
+        const rpBlocks = extractAllRewriteParityBlocks(options.body || "");
+        rpBlocks.forEach((blk, idx) => {
+            if (blk.error) {
+                errors.push(
+                    "rewrite-parity contract #" + (idx + 1) + " in closeout body " +
+                    "could not be parsed: " + blk.error,
+                );
+                return;
+            }
+            const rpErrors = validateRewriteParityCompletion(blk.contract);
+            for (const e of rpErrors) {
+                errors.push(
+                    "rewrite-parity contract #" + (idx + 1) +
+                    " failed completion validation (status=completed requires " +
+                    "every behavior proven with a receipt): " + e,
+                );
+            }
+        });
+    }
     throwCollectedErrors(errors);
     const createdAt = isoZ();
     const reportTitle =

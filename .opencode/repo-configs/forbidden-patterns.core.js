@@ -286,7 +286,33 @@ export const ALLOW_IF_GIT_MUTATION = new RegExp(
 const GIT_MUTATION_VERB_ALT = GIT_MUTATION_VERBS
     .map((v) => v.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
     .join("|");
-const GIT_MUTATION_RE = new RegExp("\\bgit\\s+(?:" + GIT_MUTATION_VERB_ALT + ")\\b");
+// Trailing boundary: hyphen-aware NEGATIVE lookahead `(?![\w-])`, NOT `\b` and
+// NOT `(?=\s|$)`. This boundary is load-bearing for the read-only
+// `git merge-base` / `git rev-list` allowlist entries (tables.go git_readonly).
+//   - `\b` (the prior form) fires at the `merge`→`-` word boundary because `-`
+//     is non-`\w`, so `git merge-base HEAD HEAD` matched `git merge` + `\b` and
+//     was DENIED — killing the feature dead-on-arrival for merge-base.
+//   - `(?=\s|$)` would fix merge-base but OPENS a hole: it stops matching when
+//     a mutation verb is followed by a shell statement separator
+//     (`git merge;echo …`, `git merge&&…`, `git merge|…`), letting the mutation
+//     slip past this backstop. Fail-closed forbids that.
+// `(?![\w-])` changes the hyphen case vs `\b`: a verb immediately followed by
+// `-` (a longer token like `merge-base`, OR mutating plumbing like `merge-file`)
+// no longer matches, while every other boundary (whitespace, `;`, `&`, `|`,
+// backtick, `(`, EOL) still matches exactly as `\b` did. CRITICAL consequence:
+// the boundary ALONE does NOT deny hyphenated mutating plumbing whose first
+// token is a mutation verb (e.g. `git merge-file`, `git checkout-index`,
+// `git commit-graph`, `git update-index`). The old `\b` boundary denied these
+// INCIDENTALLY (firing at the `verb`→`-` word boundary); the hyphen-aware
+// boundary removes that incidental denial, so EVERY such hyphenated mutating
+// plumbing command MUST be listed as a FULL token in GitMutationVerbs
+// (tables.go) or it will slip past this backstop. They then match the
+// alternation as a full token and the boundary sees the following whitespace —
+// exactly as `commit-tree`/`cherry-pick`/`update-ref` already do. The full set
+// was enumerated via a `git --exec-path` binary sweep; `merge-base`/`rev-list`
+// are read-only (git_readonly) and deliberately NOT listed, so they never match
+// here.
+const GIT_MUTATION_RE = new RegExp("\\bgit\\s+(?:" + GIT_MUTATION_VERB_ALT + ")(?![\\w-])");
 
 // FORBIDDEN_PATTERNS — GENERIC safety rules only.
 //

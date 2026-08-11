@@ -155,11 +155,11 @@ async function tryGetBashParser() {
 // false if ANY named node's type is outside the closed allow-set. Anonymous
 // punctuation (`"`, `'`, `$`, `(`, ...) is intentionally ignored — those do
 // not change the structural shape.
-function hasOnlyAllowedNamedNodes(root) {
+function hasOnlyAllowedNamedNodes(root, allowedTypes) {
     const stack = [root];
     while (stack.length > 0) {
         const node = stack.pop();
-        if (!node || !INERT_ALLOWED_NODE_TYPES.has(node.type)) {
+        if (!node || !allowedTypes.has(node.type)) {
             return false;
         }
         for (let i = 0; i < node.namedChildCount; i++) {
@@ -270,7 +270,7 @@ export async function isInertRgGrepMatch(command, forbiddenRule) {
 
         // Closed allow-set check across ALL named descendants. Rejects any
         // redirection / substitution / expansion / assignment / compound form.
-        if (!hasOnlyAllowedNamedNodes(root)) return false;
+        if (!hasOnlyAllowedNamedNodes(root, INERT_ALLOWED_NODE_TYPES)) return false;
 
         // Collect structural tokens; any non-{command_name, word, raw_string,
         // string} named child of the command → fail closed.
@@ -299,6 +299,124 @@ export async function isInertRgGrepMatch(command, forbiddenRule) {
         return true;
     } catch {
         return false;
+    }
+}
+
+// === RF-B: structural shell file-authoring deny ==============================
+//
+// Detects shell file-authoring forms (output redirection `>` / `>>` to a file
+// pathname) and returns a deny reason routing to the Write tool. This fires
+// BEFORE the forbidden-pattern scan in evaluate(), so a heredoc/redirect body
+// containing forbidden tokens (e.g. `/tmp`, `git commit`) is denied for the
+// RIGHT reason (file-authoring) and the scan never runs on it.
+//
+// Safety properties (load-bearing):
+//   1. Only-adds-denials. RF-B can only turn a previous allow into a deny;
+//      it NEVER turns a previous deny into an allow. The forbidden-pattern
+//      scan (denyByForbiddenPatterns) runs AFTER this check — if RF-B does
+//      not fire, the scan still runs unchanged. RF-B never carves anything
+//      out of the scan.
+//   2. Fail-closed. If the parser is unavailable, parsing fails, the form
+//      is ambiguous/compound/chained/substituted, or no output file_redirect
+//      is present, RF-B returns null — the caller falls through to the
+//      existing scan unchanged.
+//   3. Closed grammar. The root must be `program > redirected_statement`
+//      (exactly one statement, a redirect). The tree must contain ONLY
+//      benign node types (command/word/string/heredoc parts + file_redirect).
+//      Any chain (list)/pipeline/substitution/compound/variable-assignment
+//      node anywhere → fail-closed → scan.
+//   4. Output redirect ONLY. The file_redirect operator must be `>` or `>>`
+//      (stdout output redirect, NO file_descriptor prefix like `2>`). Input
+//      redirects (`<`) and fd-dup (`>&`) are NOT file-authoring.
+//   5. /dev/null excluded. Redirecting to /dev/null discards output; it is
+//      NOT file-authoring and must stay allowed.
+//
+// The FP this drains: an agent uses `cat <<'EOF' > file` or `echo ... > file`
+// to author a file, and the body contains forbidden tokens. Previously the
+// scan fired on the body content with a confusing reason (git-mutation-bypass
+// / system-tmp-access). Now the file-authoring form itself is the blocker,
+// with an actionable "use the Write tool" message. Per AGENTS.md command-
+// hygiene rule #1, agents MUST use the Write tool for files, never shell
+// redirection.
+
+const FILE_AUTHORING_ALLOWED_NODE_TYPES = new Set([
+    "program",
+    "redirected_statement",
+    "command",
+    "command_name",
+    "word",
+    "raw_string",
+    "string",
+    "string_content",
+    "file_redirect",
+    "heredoc_redirect",
+    "heredoc_start",
+    "heredoc_body",
+    "heredoc_end",
+]);
+
+const FILE_AUTHORING_DENY_REASON =
+    "Shell file-authoring via output redirection (`>` / `>>` to a file) is " +
+    "prohibited. Use the Write tool to create or modify files — never " +
+    "`cat > file`, `printf ... > file`, `echo ... > file`, or " +
+    "`cat <<'EOF' > file`. See AGENTS.md → 'Command hygiene to avoid " +
+    "permission prompts' rule #1. (This deny fires before the forbidden-" +
+    "pattern scan, so the file-authoring form itself is the blocker.)";
+
+// detectShellFileAuthoring returns a deny verdict object when the command is a
+// clean shell file-authoring form (output redirect `>` / `>>` to a file, with
+// no chain/substitution/compound complexity), or null when RF-B does not fire
+// (caller falls through to the existing scan). Exported for test reuse.
+export async function detectShellFileAuthoring(command) {
+    // Defensive: never throw — fail closed (return null) on any fault.
+    try {
+        const parser = await tryGetBashParser();
+        if (!parser) return null; // parser unavailable → fail-closed
+
+        const tree = parser.parse(command);
+        if (!tree || !tree.rootNode) return null;
+        const root = tree.rootNode;
+
+        // Root must be a program with exactly one named child.
+        if (root.type !== "program") return null;
+        if (root.namedChildCount !== 1) return null;
+        const stmt = root.namedChild(0);
+        if (!stmt || stmt.type !== "redirected_statement") return null;
+
+        // Closed node-type allow-set check across ALL named descendants.
+        // Rejects ANY chain (list)/pipeline/substitution/compound/variable-
+        // assignment node → fail-closed → scan.
+        if (!hasOnlyAllowedNamedNodes(root, FILE_AUTHORING_ALLOWED_NODE_TYPES)) {
+            return null;
+        }
+
+        // Find an output file_redirect (> or >>). Must be stdout-only (no
+        // file_descriptor prefix like 2>). The operator is the anonymous
+        // first child (child(0)) when there is no fd prefix; when there IS
+        // a file_descriptor (e.g. 2>), child(0) is a named node and we skip.
+        const fileRedirects = root.descendantsOfType("file_redirect");
+        let foundOutputRedirect = false;
+        for (const fr of fileRedirects) {
+            const first = fr.child(0);
+            if (!first || first.isNamed) continue; // fd-prefixed (2>, etc.)
+            if (first.text !== ">" && first.text !== ">>") continue;
+            // /dev/null target: discards output, NOT file-authoring. Use
+            // unquoteToken to strip surrounding quotes so both bare and quoted
+            // forms (> /dev/null, > '/dev/null', > "/dev/null") are excluded.
+            const target = fr.namedChild(fr.namedChildCount - 1);
+            if (target && unquoteToken(target.text) === "/dev/null") continue;
+            foundOutputRedirect = true;
+            break;
+        }
+
+        if (!foundOutputRedirect) return null;
+
+        return {
+            action: "deny",
+            reason: FILE_AUTHORING_DENY_REASON,
+        };
+    } catch {
+        return null;
     }
 }
 
@@ -803,16 +921,132 @@ export function walkGitGlobals(tokens, commandCwd) {
     };
 }
 
+// Characters that MUST NOT appear in a static-inspection command. Their
+// presence anywhere in the string is the smuggling signature: shell-control
+// operators (`;`, `&`, `|`, newline, CR), substitution (backtick, `$`, `(`,
+// `)`), redirection / process-sub (`<`, `>`), and quoting / escapes (`"`,
+// `'`, `\`). The closed grammar below requires plain unquoted path tokens,
+// so none of these can legitimately appear in an allowed form; a single
+// occurrence keeps the deny.
+const STATIC_INSPECTION_FORBIDDEN_CHARS_RE = /[;&|`$()<>"'\\\n\r]/;
+
+// Narrow, fail-closed exception to isGateWrapperInDevShExec for TWO
+// syntactically inert static-inspection forms that mention commit-gate.sh.
+// Neither can execute or mutate anything:
+//   1. `vh-agent-harness exec bash -n [--] <path-ending-in-commit-gate.sh>`
+//        — `bash -n` validates syntax ONLY; the script never runs.
+//   2. `vh-agent-harness exec cmp [--] <a> <b>` where at least one operand
+//        ends in `commit-gate.sh` — `cmp` compares bytes and returns an exit
+//        code; it never executes either operand.
+//
+// Both forms were previously over-blocked by the broad
+// `includes("commit-gate.sh")` deny in isGateWrapperInDevShExec, forcing
+// agents to route even these inert checks through a tmp/ script indirection.
+// This exception drains that false-positive WITHOUT weakening
+// git-mutation-bypass: the forbidden-pattern scan runs FIRST (before the
+// harness branch), so any wrapped git mutation (`git commit`, `git push`,
+// ...) is still denied at scan #1 regardless of this exception.
+//
+// Closed grammar, fail-closed. On ANY of the following the function returns
+// false so isGateWrapperInDevShExec keeps the DENY:
+//   - ANY shell-control / substitution / quoting / redirection / escape
+//     character appears anywhere (the grammar requires plain unquoted
+//     tokens; a smuggled operator is the primary bypass vector);
+//   - the wrapper verb is anything other than exactly `vh-agent-harness exec`;
+//   - the inspection verb is anything other than `bash -n` or `cmp`
+//     (NOT `bash -c`, NOT bare `bash`);
+//   - an operand count other than 1 (`bash -n`) or 2 (`cmp`);
+//   - any operand starts with `-` (would be an option, not a plain path);
+//   - the `bash -n` operand does not END in `commit-gate.sh`;
+//   - the `cmp` pair does not include at least one operand ending in
+//     `commit-gate.sh`;
+//   - the command does not END immediately after the permitted operands
+//     (a trailing token could carry a smuggled second leg);
+//   - any unexpected shape.
+//
+// "At least one" for cmp (vs "exactly one"): the canonical dogfood render-
+// check `cmp templates/core/.opencode/scripts/commit-gate.sh
+// .opencode/scripts/commit-gate.sh` has BOTH operands ending in
+// commit-gate.sh, and that comparison is fully inert. Requiring exactly one
+// would deny the primary use case for no safety gain.
+export function isStaticGateInspectionInDevShExec(normalized) {
+    // Defensive: never throw — fail closed (return false → deny) on any fault.
+    try {
+        // Fail-closed #1: reject ANY forbidden character ANYWHERE. Because the
+        // grammar requires plain unquoted path tokens, none of these can
+        // legitimately appear in an allowed form; a single occurrence is the
+        // smuggling signature and keeps the deny.
+        if (STATIC_INSPECTION_FORBIDDEN_CHARS_RE.test(normalized)) {
+            return false;
+        }
+
+        // Tokenize on whitespace. Newlines/CR were rejected above, so no
+        // statement separator survives the split.
+        const tokens = normalized.split(/\s+/).filter((t) => t.length > 0);
+
+        // Require the literal wrapper verb `vh-agent-harness exec`.
+        if (tokens.length < 2) return false;
+        if (tokens[0] !== "vh-agent-harness") return false;
+        if (tokens[1] !== "exec") return false;
+
+        // Need an inspection verb + at least one operand.
+        if (tokens.length < 4) return false;
+        const verb = tokens[2];
+
+        if (verb === "bash") {
+            // Form 1: `bash -n [--] <path-ending-in-commit-gate.sh>`.
+            // Reject `bash -c`, bare `bash`, and any other bash flag.
+            if (tokens[3] !== "-n") return false;
+            let i = 4;
+            if (tokens[i] === "--") i++;
+            // Exactly one operand must remain and the command must END there.
+            if (i + 1 !== tokens.length) return false;
+            const operand = tokens[i];
+            // Plain non-option path token.
+            if (operand.startsWith("-")) return false;
+            if (!operand.endsWith("commit-gate.sh")) return false;
+            return true;
+        }
+
+        if (verb === "cmp") {
+            // Form 2: `cmp [--] <a> <b>`, at least one ending in
+            // commit-gate.sh (operands in either order).
+            let i = 3;
+            if (tokens[i] === "--") i++;
+            const ops = tokens.slice(i);
+            if (ops.length !== 2) return false; // exactly two, command ends here
+            if (ops[0].startsWith("-") || ops[1].startsWith("-")) return false;
+            const gateCount = ops.filter((o) => o.endsWith("commit-gate.sh")).length;
+            if (gateCount < 1) return false; // at least one operand is the gate
+            return true;
+        }
+
+        // Any other verb (`bash -c`, bare `bash`, `sh`, etc.) → not an
+        // exception → isGateWrapperInDevShExec keeps the deny.
+        return false;
+    } catch {
+        return false;
+    }
+}
+
 // Detect whether a command string is a vh-agent-harness exec invocation that
 // attempts to reach commit-gate.sh.  Used by the engine and exported for
 // test reuse.
 export function isGateWrapperInDevShExec(cmd) {
     const normalized = stripLeadingEnvVarsFromString(cmd).trim();
     if (!normalized.startsWith("vh-agent-harness ")) return false;
+    if (!normalized.includes("commit-gate.sh")) return false;
+    // Narrow exception ONLY for syntactically inert static inspection
+    // (`bash -n` / `cmp` of the gate script). Neither can execute or mutate.
+    // git-mutation-bypass (scan #1, runs before this branch) still denies any
+    // wrapped git mutation regardless of this exception.
+    if (isStaticGateInspectionInDevShExec(normalized)) return false;
+    // Preserve the existing conservative deny for every other mention
+    // (real wrapper execution, `bash -c '...commit-gate.sh...'`, etc.).
     // Use includes (not startsWith) to catch nested invocations like:
-    // vh-agent-harness exec bash -c '.opencode/scripts/commit-gate.sh ...'
-    // False positives here are safe (over-blocking) vs under-blocking (bypass)
-    return normalized.includes("commit-gate.sh");
+    //   vh-agent-harness exec bash -c '.opencode/scripts/commit-gate.sh ...'
+    // False positives here are safe (over-blocking) vs under-blocking (bypass).
+    return true;
 }
 
 // Detect `ENV1=x ENV2=y vh-agent-harness exec ...` (one or more leading env-var
@@ -972,6 +1206,18 @@ export async function evaluate(command, commandCwd) {
     // Empty / null / whitespace command guard.
     if (command == null || (typeof command === "string" && command.trim() === "")) {
         return { action: "deny", reason: "empty command" };
+    }
+
+    // RF-B: structural shell file-authoring deny (BEFORE the forbidden-pattern
+    // scan). Detects output redirection to a file (`>` / `>>`) and denies
+    // with a Write-tool routing message. Fires before the scan so a
+    // heredoc/redirect body containing forbidden tokens is denied for the
+    // RIGHT reason (file-authoring), not the token. Only-adds-denials:
+    // if RF-B does not fire, the scan runs unchanged below. Fail-closed for
+    // ambiguous/compound/chained/substituted forms (returns null → scan).
+    const fileAuthoring = await detectShellFileAuthoring(command);
+    if (fileAuthoring) {
+        return fileAuthoring;
     }
 
     const forbidden = denyByForbiddenPatterns(command);

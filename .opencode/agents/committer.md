@@ -272,6 +272,19 @@ C returns a JSON result:
 
 C follows the repo convention from `commit-message` agent output. The message A provides should already be reviewed; C passes it through unless it clearly violates format.
 
+**`Task-Card:` trailer (pass-through).** A card-driven commit carries a
+`Task-Card: <card-id>` trailer in its body (one per card the commit satisfies;
+exact line for machine query). This is the join key for the card/DEFER
+landing-proof contract — a `completed` card may be retired only when a commit
+carrying the exact trailer line is reachable from a branch
+(`git log --branches --fixed-strings --grep=Task-Card: <card-id>`, each
+candidate post-filtered to an exact trailer line, ≥ 1; see
+`docs/coordination/RECORD_LIFECYCLE.md`). C is **pass-through** (rule 7: never
+rewrite the message), so the trailer MUST originate in the `commit-message`
+draft that A hands to C — it cannot be gate-appended today. A gate-appended
+trailer / gate-ledger card-id→commit join is documented future-hardening, not
+v1. Do NOT strip a `Task-Card:` line from a message A provided.
+
 ## Scratch-space hygiene
 
 ALL scratch and handoff files MUST live in-repo under `tmp/` (the message scratch

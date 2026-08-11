@@ -64,6 +64,15 @@ Workflow:
     - if mode is `long` and this is omitted, default it to the eventual task id
   - optional `dependencies`
   - optional `owner_notes`
+- **Intake bar (admission BEFORE filing).** A research card is filed only when
+  it passes admission — the holding area is a drain, not a reservoir. Before
+  `save_coordination_task`, confirm: a precise `research_question` (ticket-ready,
+  not fog), concrete file/scope, a validation plan that includes at least one
+  source-quality or evidence-coverage check, provenance, and **dedup** against
+  materially-equivalent open research cards (surface overlaps explicitly). If
+  the question is resolvable or decision-derivable now without deferred work,
+  do NOT file — resolve or drive to a verdict instead. See `resolve-first` and
+  `docs/coordination/RECORD_LIFECYCLE.md`.
 - for `draft` research tasks, require meaningful refinement material before
   saving
 - for `ready` research tasks, require a concrete file scope, success criteria,

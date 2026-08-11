@@ -104,7 +104,8 @@ De-escalate when fan-in has been reduced enough that:
    **during execution** as well as at fan-in: an agent editing
    `docs/planning/backlog.md` keeps that edit in a backlog commit distinct from
    its code commit, so a concurrent backlog edit can never block a clean code
-   commit. On `cas_conflict`, re-read from the new HEAD, re-apply only your
+   commit. On `could_not_land` (a backlog content-tangle — another session's
+   backlog edit landed first), re-read from the new HEAD, re-apply only your
    rows, and retry — never revert `backlog.md`. DEFER/p2 follow-ups route to
    `.local/coordinator/tasks/` as conditional candidates and reach the
    backlog only after trigger + Definition of Ready. See

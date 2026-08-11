@@ -45,6 +45,19 @@ Workflow:
 - for `draft` tasks, require meaningful refinement material (`rough_scope`, `open_questions`, or `ready_criteria`)
 - for `ready` tasks, require a real file scope and a real validation plan; do not save a vague execution card
 - note: if this task will cross BUILD-READY (`draft → ready` via `/task-ready`), an F3 design-readiness envelope will be required at promotion — begin gathering provenance-bearing evidence for the ownership-hazards survey now (fabricated evidence is prohibited; the envelope binds to the current design via `design_digest`)
+- **Intake bar (admission BEFORE filing).** A card is filed only when it passes admission — drain rules do not stop re-growth (the holding area is a drain, not a reservoir). Before `save_coordination_task`, run the `resolve-first` triage and require ALL of:
+  - **Precise question** — ticket-ready, not fog (a finding is ticket-ready when you can state the question precisely now, even if blocked; fog is in-scope but not yet specifiable).
+  - **Concrete area + file/subsystem scope** — names the repo boundary and the files/paths it concerns.
+  - **Validation approach** — how "done" will be checked.
+  - **An ADMITTED BLOCKER or reason the work cannot be resolved now** — for deferred work, why it cannot be done in the current session.
+  - **A ground-truth-derivable trigger** — when deferral is trigger-dependent, a predicate the checker can re-derive from repo state (`trigger:path_touched(<path>)`, `trigger:after_tag(<tag>)`, …).
+  - **Provenance** — `source:review-defer` / `source:p2-followup` / etc., plus `studied:YYYY-MM-DD`.
+  - **Dedup** — no materially-equivalent open card already exists (surface overlaps explicitly instead of burying them).
+- **Dispositions at intake** (apply before filing):
+  - **resolvable-now** → resolve it; do NOT file a card.
+  - **decision-derivable-now** → drive to a verdict; do NOT defer.
+  - **real deferred work meeting the bar** → file as `status: draft` (NOT `ready`) with the Notes-prefix provenance in `owner_notes[]` (the `trigger:` grammar line is parsed from `owner_notes[]`).
+  - **duplicate / fog** → collapse into the existing card, or discard.
 - call `plan_state` with:
   - `operation: save_coordination_task`
   - `task_payload`: a JSON object with the task-card fields

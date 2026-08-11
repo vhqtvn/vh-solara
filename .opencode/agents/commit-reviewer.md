@@ -106,7 +106,7 @@ Follow this state machine exactly. Do NOT deviate or exercise independent judgme
   - When `fail_fast` = `true` (default): The moment ANY tier produces a block or split, escalation stops immediately. Findings from all tiers that ran (including the blocking tier) are combined.
   - When `fail_fast` = `false`: All tiers run regardless of individual tier verdicts. Final verdict is the worst across all tiers (blocked > split > approve). This costs more but provides complete coverage from all configured tiers.
 - **findings merge:** All findings (BLOCK, DEFER, DROP) from ALL executed tiers are combined, not just the last one.
-- **disposition-aware gating:** The orchestrator gates on BLOCK findings ONLY. DEFER and DROP findings are never gating, regardless of severity.
+- **disposition-aware gating:** The orchestrator gates on BLOCK findings ONLY. DEFER and DROP findings are advisory checks (they never gate, regardless of severity; see `docs/coordination/AUTHORITY_CLASSES.md`).
 
 ### Confidence and risk
 
@@ -451,9 +451,11 @@ requests**:
 
 Do not stop, hand off, close out, or report the normalization complete
 between the two reviews. Run the normalizer check over the complete working
-tree before the first review and again after the second. If a `cas_conflict`
-occurs, re-read the ledger, rerun the normalizer, and recompute both exact
-path sets before retrying. See the `backlog` skill and the `committer` agent
+tree before the first review and again after the second. If a `could_not_land`
+occurs (a backlog content-tangle — another session's backlog edit landed
+between the two reviews), re-read the ledger, rerun the normalizer, and
+recompute both exact path sets before retrying. See the `backlog` skill and the
+`committer` agent
 for the matching two-commit protocol.
 
 ## CGD Phase-1 notes
@@ -463,7 +465,7 @@ This orchestrator implements Phase 1 of the Commit-Gate Disposition (CGD) system
 - **BLOCK-only gating:** DEFER and DROP never block a commit, regardless of severity.
 - **Evidence-grounded disagreement:** Cross-leaf BLOCK disagreements are resolved by checking evidence verifiability, not by voting.
 - **Resolved-categories:** Prevents re-block-after-approve within a session.
-- **DEFER routes to the holding area:** DEFER findings are non-blocking. They are NOT transcribed into `docs/planning/backlog.md` directly. The DEFER grammar (trigger.predicate + trigger.params) IS the intake predicate: a DEFER finding is captured into `.local/coordinator/tasks/` (via `/write-task`) as a conditional candidate with Notes provenance (`source:review-defer`, the trigger expression, `studied:YYYY-MM-DD`), and reaches the backlog only after the trigger fires + the promoter applies the Definition of Ready. The promoter runs `check-defer-triggers.mjs` as a review aid. See the `backlog` skill.
+- **DEFER routes through the intake bar, then the holding area:** DEFER findings are non-blocking. They are NOT transcribed into `docs/planning/backlog.md` directly, and they are NOT auto-filed. The DEFER grammar (trigger.predicate + trigger.params) IS the intake predicate's trigger component, but a DEFER finding must still pass the full admission bar (resolve-first / admitted-value: precise question, concrete area + file scope, validation approach, an ADMITTED BLOCKER, the ground-truth-derivable trigger, provenance, dedup) before it becomes a transport card. The `resolve-first` skill is the front-gate classifier. A DEFER finding that passes admission is captured into `.local/coordinator/tasks/` (via `/write-task`) as a `draft` conditional candidate with Notes provenance (`source:review-defer`, the trigger expression, `studied:YYYY-MM-DD`); it reaches the backlog only after it crosses a boundary AND the promoter applies the Definition of Ready. The promoter runs `check-defer-triggers.mjs` as a review aid. See the `backlog` skill and `docs/coordination/RECORD_LIFECYCLE.md`.
 - **Success criteria:** <3 review rounds average, <15% block rate. If >80% of reviews are blocked, disposition calibration is too strict.
 - **Restart-gated:** These changes take effect only after opencode restart.
 

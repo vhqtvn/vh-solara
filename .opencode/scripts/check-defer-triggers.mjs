@@ -114,13 +114,63 @@
 //   Model/reviewer surfaces (the advisory readiness surface) cannot supply
 //   this flag.
 //
+// PROMOTER-MODE REPORT OUTPUT (default mode). The report prints one line per
+// candidate as `[FLAG] <id> (<file>) — <note>`, followed by a summary. The
+// flags:
+//   [READY]        trigger fired AND the card's lifecycle is open (not yet
+//                  disposed) — this is ACTIONABLE work: apply the Definition
+//                  of Ready before promoting.
+//   [RE-FIRE]      trigger fired BUT the card is already closed for recurrence
+//                  (status in {completed, cancelled, staged}). Its watched path
+//                  was re-touched AFTER disposal — a possible-regression signal
+//                  worth SEEING, but NOT fresh actionable work. A re-fire never
+//                  inflates the actionable READY count; it is tallied
+//                  separately as `Disposed re-fires` in the summary.
+//   <state>        every other card is printed under its predicate state name
+//                  (valid-waiting, no-machine-trigger, unsupported,
+//                  malformed-compound, cold-glob) — all deliberately NOT READY.
+// The closed-for-recurrence status set is {completed, cancelled, staged}
+// (CLOSED_FOR_RECURRENCE_STATUSES), mirroring the release-prep closed set and
+// the Go-side closed-status convention: a card in any of these statuses is
+// disposition-satisfied, so a trigger re-fire is a recurrence/regression signal
+// rather than new promotion work.
+//
+// The summary's actionable line is `R/N candidate(s) are actionable READY
+// (trigger met, lifecycle open)` where R counts ONLY open-lifecycle valid-fired
+// cards (re-fires excluded). When at least one disposed card re-fired, an
+// additional line is printed:
+//   `Disposed re-fires (completed/cancelled/staged, watched path re-touched —
+//    possible regression, NOT actionable): N`
+//
+// An always-printed `State breakdown: <state>=<count>  ...` line follows the
+// summary, tallying every card under its predicate state so the promoter can
+// triage at a glance (which cards are genuinely waiting, which are noise, which
+// need a grammar repair). The states are sorted alphabetically and joined by
+// two spaces; the line is printed unconditionally with the summary (unlike the
+// conditional `Disposed re-fires` line above). The `valid-fired` tally counts
+// BOTH [READY] and [RE-FIRE] cards — they share one predicate state, and only
+// the flag + actionable count differ by lifecycle.
+//
 // Promoter-mode failures (missing git, unreadable dir) print a warning line
 // and degrade to "no candidates". Release-mode failures fail closed.
 
-import { execFileSync } from "node:child_process";
+// Git is invoked via spawnSync with a FILE-BACKED stdout descriptor (NOT a
+// pipe) and an all-ignore status variant. This is load-bearing: under the
+// strict exec sandbox (ModeStrict + NetDeny), libuv's pipe-based stdio
+// allocation uses socketpair(AF_UNIX), which the seccomp NetDeny filter
+// blocks — so execFileSync(...,{stdio:["ignore","pipe","ignore"]}) EPERMs at
+// node's spawn layer before git ever runs, and the checker silently degrades
+// to "git unavailable". A numeric regular-file FD in stdio is inherited by the
+// git child via dup2 with no pipe/socketpair allocation, so git runs and its
+// stdout is captured from the file. gitCapture/gitSuccess are the only
+// sanctioned git-invocation primitives in this file.
+import { spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+
+const GIT = "git";
 
 // ESM has no global __dirname; derive it from import.meta.url (mirrors the
 // proven shim in state-lib.js) so repoRoot() is cwd-robust when node is
@@ -143,6 +193,128 @@ const COORDINATOR_DIR = "coordinator";
 
 function defaultTasksDir() {
     return path.join(repoRoot(), ".local", COORDINATOR_DIR, "tasks");
+}
+
+// Git subprocess env. Under the strict sandbox, $HOME is outside the read
+// profile, so git reaches for several config files OUTSIDE the profile and
+// fatals on each:
+//   - ~/.gitconfig                → GIT_CONFIG_GLOBAL=/dev/null (empty RWFile)
+//   - ~/.config/git/ignore        → core.excludesFile override (git diff
+//     <ref> applies excludes when comparing to the WORKING TREE; an unreadable
+//     excludes file is FATAL — "cannot use ... as an exclude file"). Tree-to-
+//     tree diffs (HEAD^..HEAD) do NOT apply excludes, so only the working-tree
+//     diff trips this.
+//   - ~/.config/git/attributes    → core.attributesFile override (same class).
+// GIT_CONFIG_COUNT/KEY/VALUE is git's in-process config override (no quoting,
+// no -c flag per call site) — it overrides these three paths to /dev/null
+// (readable, empty) WITHOUT changing the read operations' results
+// (describe/diff/rev-parse/tag/show are config-independent). Scoped to the git
+// subprocess only — does not mutate the checker's own process.env.
+// Exported for unit testing.
+export function gitEnv() {
+    return {
+        ...process.env,
+        GIT_CONFIG_GLOBAL: "/dev/null",
+        // Override the three $HOME-rooted config paths git probes, in order:
+        GIT_CONFIG_COUNT: "2",
+        GIT_CONFIG_KEY_0: "core.excludesFile",
+        GIT_CONFIG_VALUE_0: "/dev/null",
+        GIT_CONFIG_KEY_1: "core.attributesFile",
+        GIT_CONFIG_VALUE_1: "/dev/null",
+    };
+}
+
+// Allocate a uniquely-named EXCLUSIVE capture directory under <repo>/tmp.
+// <repo>/tmp is the sole writable path in the sandbox DefaultProfile
+// (RWDirs=[repoRoot/tmp]). The directory is created with recursive:false so a
+// pre-existing entry at that name surfaces as EEXIST; on collision we retry
+// with a fresh name. The EXCLUSIVE mkdir is the real collision/symlink defense
+// — an attacker cannot win by pre-placing an entry at our chosen name, because
+// (a) the name includes randomUUID and (b) even on a freak UUID collision the
+// exclusive create fails with EEXIST and we retry. randomUUID alone is NOT the
+// defense (per the O5_TMP brief: "no Date.now+random as sole defense"); the
+// exclusive create is. The capture file lives INSIDE this exclusive dir.
+// Exported for unit testing (exclusive-creation + symlink-defense coverage).
+export function allocCaptureDir() {
+    const base = path.join(repoRoot(), "tmp");
+    fs.mkdirSync(base, { recursive: true });
+    for (let attempt = 0; attempt < 8; attempt++) {
+        const dir = path.join(base, `defer-git-${process.pid}-${randomUUID()}`);
+        try {
+            fs.mkdirSync(dir, { recursive: false, mode: 0o700 });
+            return dir;
+        } catch (e) {
+            if (e.code !== "EEXIST") throw e;
+        }
+    }
+    throw new Error("gitCapture: could not allocate exclusive capture dir after retries");
+}
+
+// Best-effort recursive cleanup of a capture dir. Never throws (called from a
+// finally; must not mask the real result).
+function rmCaptureDir(dir) {
+    try {
+        fs.rmSync(dir, { recursive: true, force: true });
+    } catch (_) { /* best-effort */ }
+}
+
+// Capture git's RAW UNTRIMMED stdout via a regular-file descriptor. spawnSync
+// with stdio:["ignore", fd, "ignore"] passes the numeric FD to the git child
+// via dup2 — NO pipe/socketpair is allocated, so this works under the strict
+// sandbox's NetDeny filter (which would otherwise block libuv's socketpair-
+// based stdio pipes and degrade the checker to "git unavailable"). THROWS on a
+// nonzero git exit (mirrors the prior execFileSync semantics so existing
+// try/catch callers are unchanged) or on a spawn-level error. Callers that
+// only need the exit status use gitSuccess instead. Exported for unit testing
+// (parity, cleanup, large-output, concurrency coverage).
+export function gitCapture(args, cwd) {
+    const dir = allocCaptureDir();
+    const capFile = path.join(dir, "out");
+    let fd;
+    try {
+        fd = fs.openSync(capFile, "w"); // O_WRONLY|O_CREAT|O_TRUNC inside exclusive dir
+        const r = spawnSync(GIT, args, {
+            cwd,
+            stdio: ["ignore", fd, "ignore"],
+            env: gitEnv(),
+        });
+        if (r.error) throw r.error; // spawn-level failure (EPERM/EACCES/...)
+        if (r.status !== 0) { // nonzero git exit — mirror execFileSync throw
+            const e = new Error(`git ${args.join(" ")} exited ${r.status}`);
+            e.code = "GIT_NONZERO";
+            e.status = r.status;
+            throw e;
+        }
+        // Close the write FD before reading so git's buffered output is flushed
+        // and the FD is released; then read the full captured stdout back.
+        fs.closeSync(fd);
+        fd = undefined;
+        return fs.readFileSync(capFile, "utf8");
+    } finally {
+        if (fd !== undefined) {
+            try { fs.closeSync(fd); } catch (_) { /* best-effort */ }
+        }
+        rmCaptureDir(dir);
+    }
+}
+
+// Status-only git probe: returns true iff git exits 0. Uses all-ignore stdio
+// (no pipe, no capture file) — the cheapest sandbox-safe invocation. Used for
+// tagExists (existence check where the stdout is never consumed). Returns false
+// on any spawn-level error or nonzero exit (treated as "ref not verified").
+// Exported for unit testing.
+export function gitSuccess(args, cwd) {
+    try {
+        const r = spawnSync(GIT, args, {
+            cwd,
+            stdio: "ignore",
+            env: gitEnv(),
+        });
+        if (r.error) return false;
+        return r.status === 0;
+    } catch (_) {
+        return false;
+    }
 }
 
 // Split `--flag=value` into [`--flag`, `value`] while leaving `--flag value`
@@ -224,11 +396,11 @@ function resolveSince(options) {
     if (options.since) return options.since;
     try {
         // describe --tags --abbrev=0 gives the nearest tag; ignore failures.
-        // execFileSync with argv array — NEVER interpolate into a shell string
+        // gitCapture uses an argv array — NEVER interpolates into a shell string
         // (defense against injection from operator-supplied --since values).
-        const tag = execFileSync(
-            "git", ["describe", "--tags", "--abbrev=0"],
-            { cwd: repoRoot(), encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+        const tag = gitCapture(
+            ["describe", "--tags", "--abbrev=0"],
+            repoRoot(),
         ).trim();
         if (tag) return tag;
     } catch (_) {
@@ -242,11 +414,11 @@ function resolveSince(options) {
 function changedPathsSince(since) {
     if (!isSafeRef(since)) return null;
     try {
-        // execFileSync with argv array — `since` may originate from an
+        // gitCapture uses an argv array — `since` may originate from an
         // operator --since flag; never interpolate it into a shell string.
-        const out = execFileSync(
-            "git", ["diff", "--name-only", since],
-            { cwd: repoRoot(), encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+        const out = gitCapture(
+            ["diff", "--name-only", since],
+            repoRoot(),
         );
         return new Set(
             out.split("\n")
@@ -260,44 +432,41 @@ function changedPathsSince(since) {
 
 // Conservative ref-name validation. Git ref names are restricted to
 // [A-Za-z0-9][A-Za-z0-9._/-]* roughly; we enforce a tight allowlist so a
-// trigger arg can never carry shell metacharacters even if execFileSync
+// trigger arg can never carry shell metacharacters even if gitCapture/gitSuccess
 // were somehow bypassed. Returns true if the arg looks like a safe ref/path.
 function isSafeRef(arg) {
     return /^[A-Za-z0-9][A-Za-z0-9._\/-]*$/.test(arg);
 }
 
-// True if `tag` exists in the repo. Used by after_tag(). Uses execFileSync
-// with an argv array — NEVER shell interpolation — so a malicious trigger
-// arg cannot inject commands. isSafeRef is defense-in-depth on top.
+// True if `tag` exists in the repo. Used by after_tag(). Uses gitSuccess (argv
+// array, NEVER shell interpolation) so a malicious trigger arg cannot inject
+// commands; status-only (all-ignore stdio) since the stdout is never consumed.
+// isSafeRef is defense-in-depth on top.
 function tagExists(tag) {
     if (!isSafeRef(tag)) return false;
-    try {
-        execFileSync(
-            "git", ["rev-parse", "--verify", "--quiet", `refs/tags/${tag}`],
-            { cwd: repoRoot(), encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
-        );
-        // rev-parse --verify exits 0 if the ref resolves. We arrived here only
-        // if execFileSync did not throw, which means exit 0 -> the tag exists.
-        return true;
-    } catch (_) {
-        return false;
-    }
+    // rev-parse --verify --quiet exits 0 iff the ref resolves → gitSuccess
+    // returns true exactly when the tag exists.
+    return gitSuccess(
+        ["rev-parse", "--verify", "--quiet", `refs/tags/${tag}`],
+        repoRoot(),
+    );
 }
 
 // Parse a single predicate string into {kind, arg}. Returns null for
 // unrecognized shapes (caller reports unknown-predicate). Returns
 // {kind:"malformed"} for a shape that LOOKS like a known predicate but whose
 // greedy-captured arg still carries predicate-structural characters — a
-// literal `||` (a malformed OR attempt; the real OR grammar is `any(...)` via
+// literal `|` (a malformed OR attempt, including the bare-single `a|b|c`
+// pseudo-OR and the doubled `a||b`; the real OR grammar is `any(...)` via
 // extractTriggers) or an unbalanced `(`/`)` (a path/ref operand never contains
 // parens) — so the caller surfaces it as malformed-predicate, NOT a clean
 // not-touched. Without this guard the greedy `(.+)` in the regex would swallow
-// `a)||path_touched(b` for `path_touched(a)||path_touched(b)`, classify it as a
-// valid path_touched with a garbage arg, and the card would silently park as
-// "valid-not-met" (note: not-touched-since-ref) — indistinguishable from a
-// genuine future-watch. The card is malformed and can never fire, so it must be
-// visibly flagged, not parked. PROMOTER-mode parser only; release mode reads
-// committed manifest dispositions and never parses task-card trigger grammar.
+// `a|b|c` for `path_touched(a|b|c)`, classify it as a valid path_touched with
+// a garbage arg, and the card would silently park as "valid-not-met" (note:
+// not-touched-since-ref) — indistinguishable from a genuine future-watch. The
+// card is malformed and can never fire, so it must be visibly flagged, not
+// parked. PROMOTER-mode parser only; release mode reads committed manifest
+// dispositions and never parses task-card trigger grammar.
 function parsePredicate(trigger) {
     const t = (trigger || "").trim();
     let m = t.match(/^path_touched\((.+)\)$/);
@@ -316,12 +485,13 @@ function parsePredicate(trigger) {
 }
 
 // True if a greedy-captured predicate arg still carries predicate-structural
-// characters, i.e. it is not a clean operand: a literal `||` (malformed OR
-// join — the real OR is `any(...)`), or an unbalanced `(`/`)` (a path/ref/tag
-// operand never contains parens). Legitimate operands never contain `|`, `(`,
-// or `)`, so this never rejects a well-formed trigger.
+// characters, i.e. it is not a clean operand: a literal `|` (either the
+// bare-single `a|b|c` pseudo-OR or the doubled `a||b` malformed-OR join — the
+// real OR is `any(...)`), or an unbalanced `(`/`)` (a path/ref/tag operand
+// never contains parens). Legitimate operands never contain `|`, `(`, or `)`,
+// so this never rejects a well-formed trigger.
 function isMalformedArg(arg) {
-    if (arg.includes("||")) return true;
+    if (arg.includes("|")) return true;
     let depth = 0;
     for (const ch of arg) {
         if (ch === "(") depth++;
@@ -384,31 +554,184 @@ function extractTriggers(body) {
     return { mode: "all", items: triggers };
 }
 
+// CLOSED_FOR_RECURRENCE_STATUSES mirrors PREP_CLOSED_STATUSES (release-prep
+// mode below) and the Go-side closedStatuses (internal/memory/claims/claim.go
+// CardIsClosed/StatusIsClosed + the release-gate closed set
+// {completed, cancelled, staged}). A card in one of these statuses is closed
+// for promotion/recurrence: disposition-satisfied, so a trigger re-fire is a
+// regression signal surfaced as [RE-FIRE], NOT fresh actionable [READY] work.
+// Kept as a purpose-named constant (rather than importing PREP_CLOSED_STATUSES,
+// which is declared later in the release-prep section) so the promoter path is
+// self-documenting; the two sets carry identical content and both mirror the
+// Go-side closed-status convention. Pre-fix this held only {completed,
+// cancelled} and a fired staged card rendered [READY], conflating trigger-fired
+// with promotion-work-remains.
+const CLOSED_FOR_RECURRENCE_STATUSES = new Set(["completed", "cancelled", "staged"]);
+
 // Evaluate one candidate (PROMOTER mode). Returns a report object. `body` is
 // the PARSED JSON task-card object (not the raw file text): task_id and
 // owner_notes are read natively so DEFER/p2-followup cards (.json produced
 // by /write-task) are honored. The Notes-prefix trigger grammar is fed
 // UNMODIFIED to extractTriggers as the owner_notes[] text joined by newlines
 // — the existing `^trigger:` regex + predicate parser are unchanged.
-function evaluateCandidate(file, body, since, changedPaths) {
+//
+// Each report carries a `state` field drawn from a closed set of SIX distinct
+// trigger states (see classifyCardState) so the promoter can ORDER the holding-
+// area population instead of staring at a wall of indistinguishable [hold]
+// flags. Only the `valid-fired` state surfaces READY; every other state is
+// deliberately NOT READY. In particular `malformed-compound` refuses READY even
+// when the compound's `.some()`/`.every()` reduction would otherwise return
+// true on its parseable members — this is the false-READY refusal.
+export function evaluateCandidate(file, body, since, changedPaths) {
     const id = (body && typeof body.task_id === "string" && body.task_id)
         || path.basename(file, ".json");
     const notesText = (body && Array.isArray(body.owner_notes))
         ? body.owner_notes.join("\n")
         : "";
+    // Lifecycle disposition (REPORTING layer, not predicate evaluation). The
+    // six-state predicate logic in classifyCardState is UNCHANGED and never
+    // consults status; this only affects the promotable-READY REPORTING so a
+    // card already closed for promotion/recurrence (completed/cancelled/staged)
+    // does not re-fire as actionable READY when its own fix re-touched its
+    // watched path. The predicate truth (state/met below) is preserved so the
+    // re-fire signal (watched path re-touched, possible regression) is still
+    // surfaced — just under a distinct already-disposed category instead of
+    // conflated with fresh actionable READY.
+    const statusRaw = (body && typeof body.status === "string")
+        ? body.status.trim().toLowerCase()
+        : "";
+    const disposed = CLOSED_FOR_RECURRENCE_STATUSES.has(statusRaw);
+    const lifecycle = disposed ? "disposed" : "open";
     const trig = extractTriggers(notesText);
     if (!trig.items || trig.items.length === 0) {
-        return { id, file, met: false, mode: "none", note: "no-trigger-line", details: [] };
+        return {
+            id, file, met: false, mode: "none", note: "no-trigger-line",
+            state: "no-machine-trigger", details: [],
+            lifecycle, actionable: false,
+        };
     }
+    // Build per-member details carrying a `parseState` (recognized|malformed|
+    // unsupported) plus the parsed `kind`/`arg` so classifyCardState can decide
+    // the card-level state without re-parsing. The printed detail line uses
+    // only {met, trigger, note} (unchanged surface), so the extra fields are
+    // non-breaking.
     const details = trig.items.map((t) => {
         const pred = parsePredicate(t);
-        if (!pred) return { trigger: t, met: false, note: "unknown-predicate" };
-        return { trigger: t, ...evaluatePredicate(pred, changedPaths) };
+        if (!pred) {
+            return {
+                trigger: t, met: false, note: "unknown-predicate",
+                parseState: "unsupported", kind: null, arg: null,
+            };
+        }
+        const ev = evaluatePredicate(pred, changedPaths);
+        const malformed = pred.kind === "malformed";
+        return {
+            trigger: t,
+            met: ev.met,
+            note: ev.note,
+            parseState: malformed ? "malformed" : "recognized",
+            kind: malformed ? null : pred.kind,
+            arg: malformed ? null : pred.arg,
+        };
     });
-    const met = trig.mode === "any"
+    const state = classifyCardState(details, trig.mode, trig.items);
+    // `met` is the PREDICATE-READY signal: the trigger condition is satisfied
+    // (valid-fired). classifyCardState already refuses malformed-compound (the
+    // false-READY defect), so this is consistent rather than a second opinion.
+    // `met` deliberately does NOT consult lifecycle: a disposed (closed-for-
+    // recurrence) card whose watched path was re-touched still has a MET
+    // predicate (the re-fire regression signal is preserved). `actionable`
+    // below is the promotable-READY signal (predicate met AND lifecycle open)
+    // and is what the promoter's actionable count consumes.
+    const met = state === "valid-fired";
+    return {
+        id, file, met, mode: trig.mode, note: stateNote(state),
+        state, details,
+        lifecycle,
+        actionable: met && !disposed,
+    };
+}
+
+// Classify one candidate into a distinct trigger state. PROMOTER-USE-ONLY: this
+// is an ordering/display aid, NEVER transition authority, NEVER blocking. The
+// six states (closed set):
+//   valid-fired        recognized predicates, condition met (genuinely READY)
+//   valid-waiting      recognized predicates, condition not yet met (precise)
+//   no-machine-trigger card has no trigger line at all (plain impl/fog)
+//   unsupported        a single trigger uses an unrecognized/unparseable predicate
+//   malformed-compound a compound any()/all() has >=1 unparseable member
+//   cold-glob          trigger targets a glob/directory, not a precise path
+//
+// MALFORMED-COMPOUND is the false-READY fix. A compound (mode "any" = OR over
+// the inner predicates of one `trigger:any(...)` line, OR mode "all" = AND over
+// multiple `trigger:` lines) is reduced via Array.some()/Array.every(), which
+// SILENTLY IGNORE unparseable members. So a compound like
+// `any(path_touched(fired.go), garbage_pred(x))` — where fired.go IS in the diff
+// — reduced to READY under the old code because the firing member satisfied
+// .some() and the garbage member was silently dropped. classifyCardState
+// refuses that: ANY unparseable member in a compound forces the
+// `malformed-compound` state (NOT READY), regardless of whether other members
+// are met. A single (non-compound) unparseable trigger is `unsupported`.
+//
+// `isNonGrammarTargetJS` is defined below in the release-prep section and is a
+// top-level function declaration, so it is hoisted and reusable here as the
+// shared glob/directory detector.
+export function classifyCardState(details, mode, items) {
+    if (!items || items.length === 0) return "no-machine-trigger";
+    const isCompound = items.length > 1;
+    const hasUnparseable = details.some(
+        (d) => d.parseState === "unsupported" || d.parseState === "malformed",
+    );
+    if (isCompound && hasUnparseable) return "malformed-compound";
+    if (!isCompound && hasUnparseable) return "unsupported";
+    // All members recognized from here. Compute the boolean reduction the same
+    // way the old code did, then distinguish fired / cold-glob / waiting.
+    const met = mode === "any"
         ? details.some((d) => d.met)
         : details.every((d) => d.met);
-    return { id, file, met, mode: trig.mode, note: met ? "ready-for-dor" : "trigger-not-met", details };
+    if (met) return "valid-fired";
+    const hasNonGrammarPath = details.some(
+        (d) => d.kind === "path_touched" && isNonGrammarTargetJS(d.arg),
+    );
+    const hasPrecisePath = details.some(
+        (d) => d.kind === "path_touched" && !isNonGrammarTargetJS(d.arg),
+    );
+    // A recognized, unmet NON-path predicate (e.g. after_tag whose tag is not
+    // yet present) is a legitimate future-firing condition. Its presence means
+    // the card is still a real future-watch, not dead-on-arrival the way a
+    // pure glob/directory-only watch is.
+    const hasUnmetRecognizedNonPath = details.some(
+        (d) => d.parseState === "recognized"
+            && d.kind !== "path_touched"
+            && !d.met,
+    );
+    // No member fired. A card is cold-glob only when its path_touched watch has
+    // no precise operand (at least one non-grammar path_touched and no precise
+    // path_touched) AND there is no other recognized, unmet non-path predicate
+    // that can fire later. A mixed compound like
+    // `any(path_touched(docs/*), after_tag(<absent-tag>))` therefore stays
+    // valid-waiting: the after_tag arm is a genuine future-watch even though
+    // the path_touched arm can never precisely match. Without this guard the
+    // after_tag arm would be silently collapsed into cold-glob purely because
+    // no precise path_touched member exists.
+    if (hasNonGrammarPath && !hasPrecisePath && !hasUnmetRecognizedNonPath) return "cold-glob";
+    return "valid-waiting";
+}
+
+// Map a card state to the human-readable `note` printed after the flag. Kept
+// distinct from the per-member `details[].note` (touched / not-touched-since-ref
+// / tag-exists / tag-missing / malformed-predicate / unknown-predicate), which
+// is unchanged and still describes each member.
+export function stateNote(state) {
+    switch (state) {
+        case "valid-fired": return "ready-for-dor";
+        case "valid-waiting": return "trigger-not-met";
+        case "no-machine-trigger": return "no-trigger-line";
+        case "unsupported": return "unsupported-trigger";
+        case "malformed-compound": return "malformed-compound-trigger";
+        case "cold-glob": return "cold-glob-trigger";
+        default: return state;
+    }
 }
 
 // ---- Release-mode primitives (strict) -------------------------------------
@@ -477,9 +800,9 @@ function isFullSha(s) {
 // the path is not tracked at HEAD).
 function gitShowHeadBlob(relPath) {
     try {
-        return execFileSync(
-            "git", ["show", `HEAD:${relPath}`],
-            { cwd: repoRoot(), encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+        return gitCapture(
+            ["show", `HEAD:${relPath}`],
+            repoRoot(),
         );
     } catch (_) {
         return null;
@@ -493,9 +816,9 @@ function gitShowHeadBlob(relPath) {
 // path (which a dirty edit could swap out from under the ceremony).
 function gitHeadBlobSha(relPath) {
     try {
-        const sha = execFileSync(
-            "git", ["rev-parse", `HEAD:${relPath}`],
-            { cwd: repoRoot(), encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+        const sha = gitCapture(
+            ["rev-parse", `HEAD:${relPath}`],
+            repoRoot(),
         ).trim();
         return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
     } catch (_) {
@@ -507,9 +830,9 @@ function gitHeadBlobSha(relPath) {
 // (single-commit repo) or git is unusable.
 function gitHeadParent() {
     try {
-        const sha = execFileSync(
-            "git", ["rev-parse", "--verify", "--quiet", "HEAD^"],
-            { cwd: repoRoot(), encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+        const sha = gitCapture(
+            ["rev-parse", "--verify", "--quiet", "HEAD^"],
+            repoRoot(),
         ).trim();
         return isFullSha(sha) ? sha : null;
     } catch (_) {
@@ -523,9 +846,9 @@ function gitHeadParent() {
 // peeled to its tree). Forward brace — argv form, no shell, so `^{}` is safe.
 function gitHeadParentTree() {
     try {
-        const sha = execFileSync(
-            "git", ["rev-parse", "--verify", "--quiet", "HEAD^^{tree}"],
-            { cwd: repoRoot(), encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+        const sha = gitCapture(
+            ["rev-parse", "--verify", "--quiet", "HEAD^^{tree}"],
+            repoRoot(),
         ).trim();
         return isFullSha(sha) ? sha : null;
     } catch (_) {
@@ -537,9 +860,9 @@ function gitHeadParentTree() {
 // slashes (git's output convention) for cross-platform comparability.
 function gitDiffHeadRange() {
     try {
-        const out = execFileSync(
-            "git", ["diff", "--name-only", "HEAD^..HEAD"],
-            { cwd: repoRoot(), encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+        const out = gitCapture(
+            ["diff", "--name-only", "HEAD^..HEAD"],
+            repoRoot(),
         );
         return out.split("\n").map((l) => l.trim()).filter(Boolean).sort(lexCompare);
     } catch (_) {
@@ -573,9 +896,9 @@ function gitLatestTag(excludeVersion) {
             // just-cut release tag is now the most recent reachable tag and
             // release_base must resolve to the prior reachable release) and the
             // branched maintenance-release case.
-            const out = execFileSync(
-                "git", ["tag", "--merged", "HEAD", "--sort=-v:refname"],
-                { cwd: repoRoot(), encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+            const out = gitCapture(
+                ["tag", "--merged", "HEAD", "--sort=-v:refname"],
+                repoRoot(),
             );
             for (const line of out.split("\n")) {
                 const t = line.trim();
@@ -585,9 +908,9 @@ function gitLatestTag(excludeVersion) {
             }
             return null;
         }
-        const tag = execFileSync(
-            "git", ["describe", "--tags", "--abbrev=0"],
-            { cwd: repoRoot(), encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+        const tag = gitCapture(
+            ["describe", "--tags", "--abbrev=0"],
+            repoRoot(),
         ).trim();
         return tag || null;
     } catch (_) {
@@ -1121,7 +1444,27 @@ function mainPromoter(options) {
     }
 
     for (const r of reports) {
-        const flag = r.met ? "READY" : "hold";
+        // valid-fired keeps the legacy [READY] token (consumed by the Go
+        // promoter-mode test + the promoter runbook). The old catch-all
+        // [hold] is split into one distinct flag per non-ready state so the
+        // promoter can order the holding-area population instead of reading
+        // every detail parenthetical to tell waiting from broken.
+        //
+        // A valid-fired card that is already closed for recurrence
+        // (completed/cancelled/staged) is surfaced as a distinct [RE-FIRE] flag
+        // instead of [READY]: its watched path was re-touched AFTER disposal (a
+        // possible-regression signal worth seeing), but it is NOT fresh
+        // actionable work and must NOT inflate the actionable READY count. The
+        // predicate state (valid-fired) is unchanged; only the reporting flag +
+        // the actionable count consult lifecycle.
+        let flag;
+        if (r.state === "valid-fired" && r.lifecycle === "disposed") {
+            flag = "RE-FIRE";
+        } else if (r.state === "valid-fired") {
+            flag = "READY";
+        } else {
+            flag = r.state;
+        }
         process.stdout.write(`[${flag}] ${r.id} (${path.basename(r.file)}) — ${r.note}\n`);
         for (const d of r.details) {
             const mark = d.met ? "met" : "not-met";
@@ -1129,11 +1472,33 @@ function mainPromoter(options) {
         }
     }
 
-    const ready = reports.filter((r) => r.met).length;
+    // `ready` is the ACTIONABLE count: valid-fired AND lifecycle open. A
+    // closed-for-recurrence (completed/cancelled/staged) card whose trigger
+    // re-fired is counted separately as `refires`, NOT as ready, so the
+    // actionable set is not polluted by drained cards re-firing on their own
+    // fix.
+    const ready = reports.filter((r) => r.actionable).length;
+    const refires = reports.filter(
+        (r) => r.state === "valid-fired" && r.lifecycle === "disposed",
+    ).length;
+    // Per-state breakdown so the promoter can triage at a glance: which cards
+    // are genuinely waiting (apply DoR when fired), which are noise (no
+    // trigger / unsupported / cold-glob), and which need a grammar repair
+    // (malformed-compound) before they can ever be evaluated.
+    const tally = {};
+    for (const r of reports) tally[r.state] = (tally[r.state] || 0) + 1;
+    const breakdown = Object.keys(tally)
+        .sort()
+        .map((s) => `${s}=${tally[s]}`)
+        .join("  ");
     process.stdout.write(
-        `\n${ready}/${reports.length} candidate(s) have triggers met. ` +
+        `\n${ready}/${reports.length} candidate(s) are actionable READY (trigger met, lifecycle open). ` +
         `Promoter: apply the Definition of Ready (area + file scope + validation ` +
-        `plan + clear slice + provenance) before promoting any READY candidate.\n`,
+        `plan + clear slice + provenance) before promoting any READY candidate.\n` +
+        `State breakdown: ${breakdown}\n` +
+        (refires > 0
+            ? `Disposed re-fires (completed/cancelled/staged, watched path re-touched — possible regression, NOT actionable): ${refires}\n`
+            : ""),
     );
     process.exit(0);
 }
