@@ -585,3 +585,229 @@ func TestPartAppend_SnapshotDuringThrottleCoherentOffset(t *testing.T) {
 		t.Errorf("subscriber A suffix concatenation: got %q want %q (contiguous offsets, no skipped bytes)", got, "abcd")
 	}
 }
+
+// TestPartAppend_SnapshotWithTreeDuringThrottleCoherentOffset is the B-F1
+// regression mirror for the SnapshotWithTree entrypoint. It is the structural
+// twin of TestPartAppend_SnapshotDuringThrottleCoherentOffset (which covers
+// plain Snapshot): the same flush-first coherence contract, asserted against
+// the SECOND detail-snapshot entrypoint. SnapshotWithTree shares the B-F1
+// flush+capture span with plain Snapshot (snapshots.go calls
+// flushAllBufferedDeltasLocked under the WRITE lock before
+// captureSnapshotLocked), so today the coherence property is covered only by
+// shared mechanism with Snapshot. This test pins it DIRECTLY on
+// SnapshotWithTree so a future refactor that drops the flush from
+// SnapshotWithTree alone (while keeping it in Snapshot) is caught.
+//
+// Contract asserted (identical to the plain-Snapshot test):
+//   - The snapshot-coherence flush EMITS the buffered suffix {1,"bc"} to an
+//     already-watching opted-in subscriber (the buffered bytes are delivered,
+//     not silently skipped).
+//   - The snapshot baseline field text is the full accumulated "abc"; the
+//     post-snapshot suffix starts at len("abc")==3 (the snapshot field byte
+//     length) and carries ONLY the newly-appended byte "d".
+func TestPartAppend_SnapshotWithTreeDuringThrottleCoherentOffset(t *testing.T) {
+	s := seedPartStream(t, time.Hour) // long interval: only first delta flushes
+	e := NewTreeEmitter(s, "/proj")
+
+	// Subscriber A: already watching (opted-in). Proves the flush actually
+	// EMITS the buffered bytes to every opted-in subscriber.
+	subA, stopA := s.SubscribeWith(256, Interest{WantsPartDelta: true})
+	defer stopA()
+
+	// Burst setup: delta "a" flushes immediately (deltaLastEmit zero). Suffix
+	// {0,"a"}, deltaSentLen=1.
+	applyDelta(s, "sess", "m1", "p1", "text", "a")
+	firstSuffixes := drainKind(subA, KindPartAppend)
+	if len(firstSuffixes) != 1 {
+		t.Fatalf("first delta: want 1 part.append, got %d", len(firstSuffixes))
+	}
+
+	// Deltas "b","c" buffer behind the hour-long throttle. buf="abc",
+	// deltaSentLen=1. me.parts lags at "a".
+	applyDelta(s, "sess", "m1", "p1", "text", "b")
+	applyDelta(s, "sess", "m1", "p1", "text", "c")
+	if buffered := drainKind(subA, KindPartAppend); len(buffered) != 0 {
+		t.Fatalf("throttled deltas must NOT flush: got %d part.append", len(buffered))
+	}
+
+	// === THE B-F1 SCENARIO (SnapshotWithTree) ===
+	// A tree-bearing cold load takes a cursorless snapshot via SnapshotWithTree.
+	// Post-fix: flushes "bc" first (emitting suffix {1,"bc"} to subscriber A),
+	// then projects "abc" (len 3) with deltaSentLen=3 — under the SAME WRITE
+	// lock span as the tree frontier capture (Q5 capture consolidation).
+	snap, _ := s.SnapshotWithTree(e, map[string]bool{"sess": true}, "test")
+
+	// Subscriber A (already watching) receives the flush's suffix {1,"bc"}.
+	flushSuffixes := drainKind(subA, KindPartAppend)
+	if len(flushSuffixes) != 1 {
+		t.Fatalf("snapshot-coherence flush: want 1 part.append (buffered 'bc' emitted to existing subscriber), got %d", len(flushSuffixes))
+	}
+	flushStart, flushText := partAppendSuffix(t, flushSuffixes[0].Payload)
+	if flushStart != 1 || flushText != "bc" {
+		t.Errorf("flush suffix: got {start=%d text=%q}, want {1, %q} (buffered bytes emitted, not silently skipped)", flushStart, flushText, "bc")
+	}
+
+	// Record the snapshot field text + byte length — this is the new client's
+	// baseline. SnapshotWithTree captures messages for the selected session
+	// (messagesFor={"sess":true}), so partText reads the projected field.
+	snapField := partText(snap, "sess", "p1")
+	snapLen := len(snapField)
+	if snapField != "abc" {
+		t.Fatalf("snapshot field text: got %q want %q", snapField, "abc")
+	}
+
+	// Delta "d" arrives. Force the throttle to fire so the flush is
+	// deterministic (independent of host scheduling).
+	forceNextFlush := func() {
+		s.mu.Lock()
+		if me := s.messages["sess"].byID["m1"]; me != nil {
+			me.deltaLastEmit = time.Time{}
+		}
+		s.mu.Unlock()
+	}
+	forceNextFlush()
+	applyDelta(s, "sess", "m1", "p1", "text", "d")
+
+	// === THE B-F1 ASSERTION ===
+	// The post-snapshot suffix MUST start at snapLen (the snapshot field byte
+	// length) and carry ONLY the newly-appended byte "d" — NOT "bcd".
+	postSuffixes := drainKind(subA, KindPartAppend)
+	if len(postSuffixes) != 1 {
+		t.Fatalf("post-snapshot flush: want 1 part.append, got %d", len(postSuffixes))
+	}
+	postStart, postText := partAppendSuffix(t, postSuffixes[0].Payload)
+	if postStart != snapLen {
+		t.Errorf("B-F1 VIOLATION (SnapshotWithTree): post-snapshot suffix start got %d want %d (snapshot field byte length) — suffix starts behind client baseline", postStart, snapLen)
+	}
+	if postText != "d" {
+		t.Errorf("post-snapshot suffix text: got %q want %q (only the newly-appended byte, NOT bytes already in the snapshot)", postText, "d")
+	}
+
+	// === COHERENCE CHECK (subscriber A) ===
+	// Contiguous: 0→1 (a), 1→3 (bc), 3→4 (d). Concatenation == "abcd".
+	var concat strings.Builder
+	for _, ev := range append(append(firstSuffixes, flushSuffixes...), postSuffixes...) {
+		_, text := partAppendSuffix(t, ev.Payload)
+		concat.WriteString(text)
+	}
+	if got := concat.String(); got != "abcd" {
+		t.Errorf("subscriber A suffix concatenation: got %q want %q (contiguous offsets, no skipped bytes)", got, "abcd")
+	}
+}
+
+// TestPartAppend_SnapshotWithTreePartialDuringThrottleCoherentOffset is the B-F1
+// regression mirror for the SnapshotWithTreePartial entrypoint (the D4
+// tree-Stream-1-only partial capture). It mirrors the plain-Snapshot and
+// SnapshotWithTree B-F1 tests with ONE structural adaptation that follows
+// directly from SnapshotWithTreePartial's contract:
+//
+// SnapshotWithTreePartial OMITS messages from the detail capture
+// (capturePartialDetailLocked leaves c.messages nil — a tree-Stream-1 consumer
+// never reads message text from the partial snapshot). So there is NO snapshot
+// field baseline to compare a suffix start against on this entrypoint. The B-F1
+// flush nonetheless runs unconditionally on entry (snapshots.go: the comment on
+// SnapshotWithTreePartial states the flush runs "so any opted-in Stream-2
+// subscriber on the same store receives coherent suffix offsets"). This test
+// pins THAT mechanism directly: the flush emits the buffered suffix to an
+// opted-in subscriber, and the post-snapshot suffix starts at the post-flush
+// deltaSentLen (== len("abc") == 3, the full field length) — the coherence
+// property a Stream-2 subscriber on the same store observes.
+//
+// What is NOT asserted here (and why): "post-snapshot suffix start == snapshot
+// field byte length" — the literal form of the plain-Snapshot assertion — is
+// structurally impossible for SnapshotWithTreePartial because the snapshot
+// carries no field text. Asserting it would require a production change
+// (capturing messages in the partial, defeating its purpose). The
+// subscriber-side coherence assertion below is the faithful equivalent.
+func TestPartAppend_SnapshotWithTreePartialDuringThrottleCoherentOffset(t *testing.T) {
+	s := seedPartStream(t, time.Hour) // long interval: only first delta flushes
+	e := NewTreeEmitter(s, "/proj")
+
+	// Subscriber A: already watching (opted-in). Proves the flush actually
+	// EMITS the buffered bytes to every opted-in subscriber.
+	subA, stopA := s.SubscribeWith(256, Interest{WantsPartDelta: true})
+	defer stopA()
+
+	// Burst setup: delta "a" flushes immediately. Suffix {0,"a"}, deltaSentLen=1.
+	applyDelta(s, "sess", "m1", "p1", "text", "a")
+	firstSuffixes := drainKind(subA, KindPartAppend)
+	if len(firstSuffixes) != 1 {
+		t.Fatalf("first delta: want 1 part.append, got %d", len(firstSuffixes))
+	}
+
+	// Deltas "b","c" buffer behind the hour-long throttle. buf="abc",
+	// deltaSentLen=1. me.parts lags at "a".
+	applyDelta(s, "sess", "m1", "p1", "text", "b")
+	applyDelta(s, "sess", "m1", "p1", "text", "c")
+	if buffered := drainKind(subA, KindPartAppend); len(buffered) != 0 {
+		t.Fatalf("throttled deltas must NOT flush: got %d part.append", len(buffered))
+	}
+
+	// === THE B-F1 SCENARIO (SnapshotWithTreePartial) ===
+	// A tree-Stream-1 cold/reconnect takes a cursorless partial snapshot. Even
+	// though the partial OMITS messages, the B-F1 flush still runs on entry and
+	// flushes "bc" (emitting suffix {1,"bc"} to subscriber A) + advances
+	// deltaSentLen to 3.
+	snap, _ := s.SnapshotWithTreePartial(e, "test")
+
+	// Subscriber A (already watching) receives the flush's suffix {1,"bc"} —
+	// THIS is the load-bearing assertion that the flush ran on the partial
+	// entrypoint (not silently skipped despite messages being omitted).
+	flushSuffixes := drainKind(subA, KindPartAppend)
+	if len(flushSuffixes) != 1 {
+		t.Fatalf("snapshot-coherence flush: want 1 part.append (buffered 'bc' emitted to existing subscriber), got %d", len(flushSuffixes))
+	}
+	flushStart, flushText := partAppendSuffix(t, flushSuffixes[0].Payload)
+	if flushStart != 1 || flushText != "bc" {
+		t.Errorf("flush suffix: got {start=%d text=%q}, want {1, %q} (buffered bytes emitted, not silently skipped)", flushStart, flushText, "bc")
+	}
+
+	// Structural confirmation: the partial snapshot OMITS messages, so there is
+	// no field baseline. partText returns "" — a partial consumer never reads
+	// message text from this snapshot.
+	if got := partText(snap, "sess", "p1"); got != "" {
+		t.Errorf("partial snapshot must OMIT messages: got p1 text %q, want empty (partial carries no field baseline)", got)
+	}
+
+	// Delta "d" arrives. Force the throttle to fire so the flush is
+	// deterministic (independent of host scheduling).
+	forceNextFlush := func() {
+		s.mu.Lock()
+		if me := s.messages["sess"].byID["m1"]; me != nil {
+			me.deltaLastEmit = time.Time{}
+		}
+		s.mu.Unlock()
+	}
+	forceNextFlush()
+	applyDelta(s, "sess", "m1", "p1", "text", "d")
+
+	// === THE B-F1 ASSERTION (subscriber-side coherence) ===
+	// The post-snapshot suffix MUST start at len("abc")==3 (the post-flush
+	// deltaSentLen, which equals the full accumulated field length) and carry
+	// ONLY the newly-appended byte "d". This is the coherence property a
+	// Stream-2 opted-in subscriber on the same store observes: the partial
+	// entrypoint's flush advanced deltaSentLen to the full length, so the next
+	// suffix does not re-send bytes already delivered.
+	postSuffixes := drainKind(subA, KindPartAppend)
+	if len(postSuffixes) != 1 {
+		t.Fatalf("post-snapshot flush: want 1 part.append, got %d", len(postSuffixes))
+	}
+	postStart, postText := partAppendSuffix(t, postSuffixes[0].Payload)
+	if want := len("abc"); postStart != want {
+		t.Errorf("B-F1 VIOLATION (SnapshotWithTreePartial): post-snapshot suffix start got %d want %d (post-flush deltaSentLen == full field length) — suffix starts behind delivered length", postStart, want)
+	}
+	if postText != "d" {
+		t.Errorf("post-snapshot suffix text: got %q want %q (only the newly-appended byte)", postText, "d")
+	}
+
+	// === COHERENCE CHECK (subscriber A) ===
+	// Contiguous: 0→1 (a), 1→3 (bc), 3→4 (d). Concatenation == "abcd".
+	var concat strings.Builder
+	for _, ev := range append(append(firstSuffixes, flushSuffixes...), postSuffixes...) {
+		_, text := partAppendSuffix(t, ev.Payload)
+		concat.WriteString(text)
+	}
+	if got := concat.String(); got != "abcd" {
+		t.Errorf("subscriber A suffix concatenation: got %q want %q (contiguous offsets, no skipped bytes)", got, "abcd")
+	}
+}
