@@ -34,6 +34,12 @@ type snapshotJSON struct {
 		// part_delta_fields.go and docs/ai/wire-protocols/part-append-streaming.md §6.
 		PartDeltaFields        []partDeltaFieldObsJSON `json:"part_delta_fields"`
 		PartDeltaFieldOverflow uint64                  `json:"part_delta_field_overflow"`
+		// PartUpsertBurst: bounded upsert-path burst characterization probe for
+		// the compaction-burst axis (slice 4A). The exact-identical vs changed
+		// split is THE load-bearing metric for the slice-4B O2 decision (is
+		// ingress no-op suppression justified?). See part_upsert_burst.go and
+		// tmp/agent-runs/compaction-burst-brief/brief.md §"Slice 4A detail".
+		PartUpsertBurst partUpsertBurstJSON `json:"part_upsert_burst"`
 	} `json:"probes"`
 }
 
@@ -130,6 +136,25 @@ type partDeltaFieldObsJSON struct {
 	Field    string `json:"field"`
 	Count    uint64 `json:"count"`
 	Bytes    uint64 `json:"bytes"`
+}
+
+// partUpsertBurstJSON is the wire shape of the upsert-path burst
+// characterization probe (slice 4A — see part_upsert_burst.go). No part ids,
+// session ids, or transcript content appear: distinct_parts is a COUNT of
+// claimed identity-hash slots (the hashes themselves are not emitted — they are
+// a non-reversible internal cardinality bound, not operator-meaningful labels).
+type partUpsertBurstJSON struct {
+	Events                 uint64 `json:"events"`
+	Bytes                  uint64 `json:"bytes"`
+	ToolEvents             uint64 `json:"tool_events"`
+	ToolBytes              uint64 `json:"tool_bytes"`
+	IdenticalEvents        uint64 `json:"identical_events"`
+	IdenticalBytes         uint64 `json:"identical_bytes"`
+	ChangedEvents          uint64 `json:"changed_events"`
+	ChangedBytes           uint64 `json:"changed_bytes"`
+	DistinctParts          int    `json:"distinct_parts"`
+	DistinctOverflow       uint64 `json:"distinct_overflow"`
+	SubChanEventsHighWater int64  `json:"sub_chan_events_high_water"`
 }
 
 // tunnelJSON is the worker-side tunnel-lifecycle probe's wire shape. On the
@@ -312,6 +337,24 @@ func Snapshot() snapshotJSON {
 		})
 	}
 	out.Probes.PartDeltaFieldOverflow = r.PartDeltaFields.overflow.Load()
+
+	// PartUpsertBurst: upsert-path burst characterization (slice 4A). All
+	// fields are atomic reads; distinct_parts is a bounded slot count (no raw
+	// ids emitted). The identical/changed split is the O2-decision metric.
+	pb := &r.PartUpsertBurst
+	out.Probes.PartUpsertBurst = partUpsertBurstJSON{
+		Events:                 pb.Events.Load(),
+		Bytes:                  pb.Bytes.Load(),
+		ToolEvents:             pb.ToolEvents.Load(),
+		ToolBytes:              pb.ToolBytes.Load(),
+		IdenticalEvents:        pb.IdenticalEvents.Load(),
+		IdenticalBytes:         pb.IdenticalBytes.Load(),
+		ChangedEvents:          pb.ChangedEvents.Load(),
+		ChangedBytes:           pb.ChangedBytes.Load(),
+		DistinctParts:          pb.distinctClaimedCount(),
+		DistinctOverflow:       pb.distinctOverflow.Load(),
+		SubChanEventsHighWater: pb.SubChanEventsHighWater.Load(),
+	}
 
 	return out
 }

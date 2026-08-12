@@ -207,12 +207,48 @@ func (s *Store) emit(kind string, payload json.RawMessage) {
 		}
 		select {
 		case sub.ch <- ev:
+			// Slice 4A telemetry (compaction-burst axis): subscriber-channel
+			// events high-water — the cheap production sentinel for "did the
+			// burst fill a subscriber queue". Pure atomics (no alloc); emit
+			// holds s.mu so the CAS is uncontended (effectively a guarded
+			// Store). A high-water approaching the 256-event subscriber buffer
+			// under load is the queue-fill signature. This is a GLOBAL high-
+			// water across ALL subscribers; the slice-4A fixture measures the
+			// selected-session subscriber's high-water directly for precision.
+			sampleSubChanHighWater(sub.ch)
 		default:
 			// Slow consumer: drop it. The client will reconnect and re-snapshot.
 			// PROBE 2: count the existing drop (the backpressure sentinel).
 			diag.Default.Emit.SubscriberDrops.Inc()
 			close(sub.ch)
 			delete(s.subs, id)
+		}
+	}
+}
+
+// sampleSubChanHighWater updates the global subscriber-channel events high-
+// water (PartUpsertBurst.SubChanEventsHighWater) from the post-push channel
+// depth. Called from emit / emitPartAppend after a successful nonblocking push,
+// under s.mu (so the CAS is uncontended — effectively a guarded Store). Pure
+// atomics, no allocation, O(1). The high-water is a GLOBAL max across every
+// subscriber the fanout pushed to; it is the cheap production sentinel for
+// "did a burst fill a subscriber queue" (a value approaching the 256-event
+// subscriber buffer under load is the queue-fill signature). The slice-4A
+// fixture measures the selected-session subscriber's high-water directly for
+// the precise per-subscriber figure.
+func sampleSubChanHighWater(ch chan ClientEvent) {
+	n := int64(len(ch))
+	if n <= 0 {
+		return
+	}
+	hw := &diag.Default.PartUpsertBurst.SubChanEventsHighWater
+	for {
+		cur := hw.Load()
+		if n <= cur {
+			return
+		}
+		if hw.CompareAndSwap(cur, n) {
+			return
 		}
 	}
 }
@@ -278,6 +314,11 @@ func (s *Store) emitPartAppend(suffixPayload, fullUpsert json.RawMessage) {
 		}
 		select {
 		case sub.ch <- out:
+			// Slice 4A telemetry: subscriber-channel events high-water (see
+			// emit()'s identical sampling — pure atomics, uncontended under
+			// s.mu). Covers the suffix-fanout path too so a part.append burst's
+			// queue pressure is attributed alongside the authoritative path.
+			sampleSubChanHighWater(sub.ch)
 		default:
 			// Slow consumer: drop it. The client will reconnect and re-snapshot.
 			// PROBE 2: count the existing drop (the backpressure sentinel).

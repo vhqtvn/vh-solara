@@ -1220,6 +1220,24 @@ func (s *Store) upsertPartLocked(part json.RawMessage) {
 	// below reseeds the accumulator from this capped authoritative text, so the
 	// next streaming delta appends onto a cap-respecting base.
 	part = capPartJSON(part, s.partTextCap)
+	// Slice 4A telemetry (compaction-burst axis — see
+	// tmp/agent-runs/compaction-burst-brief/brief.md §"Slice 4A detail"):
+	// observe the AUTHORITATIVE part.upsert for burst characterization. This is
+	// a SEPARATE probe from the slice-1 delta-path probe (PartDeltaFields) —
+	// compaction rewrites ride this authoritative path, NOT the delta flush
+	// path, so the delta probe does not see them. Observe compares the CAPPED
+	// incoming part against the CURRENTLY-RESIDENT representation (captured
+	// here BEFORE the overwrite below) to classify exact-identical vs changed —
+	// THE load-bearing metric for the slice-4B O2 (ingress no-op suppression)
+	// decision. Pure atomics + one allocation-free bytes.Equal; allocation only
+	// on a first-ever distinct-part slot claim. The part type is threaded in
+	// from env.Type (the partEnvelope above is already unmarshaled, so this is
+	// free — no re-parse inside Observe; mirrors the slice-1 contract).
+	// Observation only — no behavior change. No raw part/session/message ids
+	// leave this call (the probe hashes the id triple into a non-reversible
+	// uint64 for its bounded distinct table).
+	resident := me.parts[env.ID]
+	diag.Default.PartUpsertBurst.Observe(part, env.Type, env.SessionID, env.MessageID, env.ID, resident)
 	me.parts[env.ID] = part
 	// Mark live-touched so a concurrent cold-load reconcile does NOT clobber
 	// this newer live part body with the stale fetched one (C-F2). Only tagged

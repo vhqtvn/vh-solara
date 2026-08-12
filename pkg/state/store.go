@@ -623,6 +623,7 @@ type partEnvelope struct {
 	ID        string `json:"id"`
 	SessionID string `json:"sessionID"`
 	MessageID string `json:"messageID"`
+	Type      string `json:"type"`
 }
 
 type permissionEnvelope struct {

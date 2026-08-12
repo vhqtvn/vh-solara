@@ -466,6 +466,15 @@ type Registry struct {
 	// empirically via /vh/diag/latency. See part_delta_fields.go and
 	// docs/ai/wire-protocols/part-append-streaming.md §6.
 	PartDeltaFields PartDeltaFieldStats
+	// PartUpsertBurst is the bounded upsert-path burst characterization probe
+	// for the compaction-burst axis (slice 4A of the part-streaming redesign —
+	// see tmp/agent-runs/compaction-burst-brief/brief.md §"Slice 4A detail").
+	// It is a SEPARATE probe from PartDeltaFields: that one instruments the
+	// DELTA flush path; this one instruments the AUTHORITATIVE upsert path
+	// (upsertPartLocked), which is the path compaction rewrites ride. Counter /
+	// atomic.Uint64 / atomic.Int64 only — no Histogram, so no initSentinels
+	// entry is needed. See part_upsert_burst.go.
+	PartUpsertBurst PartUpsertBurstStats
 
 	// startedAt is the process/registry creation time, reported in the snapshot
 	// so a consumer can compute rates per second since start.
@@ -504,6 +513,7 @@ func ResetForTest() {
 	}
 	r.Stream2ReplayFallback = Counter{}
 	r.PartDeltaFields = PartDeltaFieldStats{}
+	r.PartUpsertBurst = PartUpsertBurstStats{}
 	r.startedAt = nowNano()
 	r.initSentinels()
 }
