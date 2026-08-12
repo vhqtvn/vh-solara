@@ -79,10 +79,8 @@ add-an-agent / add-command / add-skill recipe and the overlay anatomy.
 - `vh-agent-harness docs opencode-memory-model` when shaping or changing agent-memory conventions, workstream memory, or local/private OpenCode state
 - `docs/coordination/README.md` when shaping cross-boundary ownership, handoffs, blocker rules, or prompt/closeout coordination
 - `docs/coordination/TASK_MODES.md` and `docs/coordination/RUNTIME_MODEL.md` when a task may span multiple sessions, several subagent reports, or a local coordination runtime
-- the relevant `researches/decisions/` memo when rethinking the coordinator-session workflow, local task registry, or future external coordinator/runtime options
-- the relevant `researches/decisions/` memo when designing or implementing `/write-task`, `/task-ready`, `/task-update`, `/task-repair`, `/task-list`, `/task-open`, `/resume-task`, `/task-closeout`, or `/task-review`
-- the relevant `researches/decisions/` memo when designing or changing the repo's durable research workflow, source-packet conventions, long-running research setup, or `/research` entrypoint
-- the relevant `researches/decisions/` memo when designing browser-driven external research providers, provider polling/check status flows, or `.local/coordinator/research-runs/`
+- a repository-local memo, **when one exists** under `researches/decisions/`, before changing a settled boundary. Boundaries that commonly carry such a memo include the coordinator-session workflow, the local task registry, the `/write-task` … `/task-review` lifecycle, the durable research workflow and source-packet conventions, future external coordinator/runtime options, and browser-driven research providers / `.local/coordinator/research-runs/`. Do NOT treat the absence of a `researches/` tree or a matching memo as an error, and do NOT invent a missing memo or cite one as required — these are conditionally relevant only when such a memo actually exists in the target repo.
+- the durable research-artifact placement convention: `researches/sources/` for durable source packets and `researches/decisions/` for durable option comparisons / recommendations. These trees are used ONLY when the work explicitly calls for a committed research artifact; they are NOT required in every repository, and research workflows MUST NOT auto-create them merely by running. Absence of the tree is normal, not an error.
 - `.local/AGENTS.md` when working in local-only operator state such as `.local/coordinator/`, `.local/config/`, or `.local/ssh/`
 - `vh-agent-harness docs opencode-skills` when the task depends on a repo-local OpenCode skill or when you need to know which local skill should be invoked explicitly
 - `docs/ai/shell-execution.md` before planning or running shell commands
@@ -118,7 +116,9 @@ attempt), **ownership classification** (which files a plain render may overwrite
 vs. must preserve), and **gate-controlled side effects** (commits, promotions,
 and other state transitions that pass through a reviewer or gate before they
 land). Treat any model-produced artifact as a proposal to be checked and
-applied, not as an authority that acts on its own.
+applied, not as an authority that acts on its own. See
+`docs/coordination/AUTHORITY_CLASSES.md` for the explicit distinction between
+advisory checks (which report but never block) and hard evidence-gated completion.
 
 ## Shell, container, and workspace hygiene
 
@@ -210,6 +210,15 @@ outcome).
   internally consistent**; it does NOT prove the cited path executed. Proving
   the crux needs the repo-specific live verification this section already
   requires (the verified seam). The token is a declaration, not a proof.
+- Retained receipt for `result: proven`: before any closeout or promotion
+  claims `behavioral-closure` `result: proven`, an exec-capable surface must
+  have actually run the crux/verifier command(s) AND retained an inspectable
+  command receipt — the command(s) plus their outcome, bound to the assessed
+  revision/tree — in the closeout or durable report. A missing or unverifiable
+  receipt does not support `result: proven`. The receipt is compact (command +
+  outcome summary + tree binding), not a raw stdout/stderr dump and not a
+  `tmp/`-only artifact. The `behavioral-closure` token remains a consistency
+  declaration, not proof the path executed.
 - The `vh-agent-harness doctor` health check rejects an internally-inconsistent
   declaration (e.g. `verdict: proven` without a proven crux). This is the
   safety layer acting; it does not gate a verdict it cannot verify.
@@ -225,10 +234,69 @@ outcome).
   occurred), not an assertion of the MECHANISM (a flag is set, a record exists,
   a code path ran). Asserting the mechanism without observing the outcome is
   `result: skipped`, not `proven`.
+- Reachability over object existence (for "did this land" cruxes): a
+  behavioral-closure verifier that asserts a commit landed MUST assert
+  REACHABILITY — e.g. `git merge-base --is-ancestor <sha> <branch>` or
+  `git log <branch> --oneline | grep <sha>` — NOT object existence
+  (`git show <sha>`, `git cat-file`). An object-existence verifier cannot
+  distinguish "committed and landed" from "committed and reverted/reset": `git
+  show` succeeds for an orphaned or reflog-only commit, so it passes throughout
+  a window in which the "promoted to canon / landed" claim is false. (doctor
+  check #24 `closeout-reach` reconciles the closeout ledger against branch
+  reachability directly, so a defective land-verifier is also caught by the
+  better mechanism — but the declared crux command must still be a
+  reachability form.)
 
 - **Provable-invariant crux:** when the crux is a provable concurrency or
   state-machine invariant, the `formal-verification` skill authors an
   engine-checked proof whose result feeds this crux model.
+
+### Rewrite-parity contract gate (explicitly-declared deletion/rewrite slices)
+
+A **rewrite-parity contract** governs an **explicitly-declared** deletion or
+rewrite slice. It is **opt-in** — ordinary deletes, refactors, renames, and
+reorganization carry **zero** rewrite-parity burden. A contract applies only
+when the task declared `mode: deletion_replacement` (a component is deleted and
+replaced) or `mode: modification_only_rewrite` (a component is rewritten in
+place). The canonical representation is versioned JSON inside a fenced
+`rewrite-parity` block, living in durable markdown (closeout reports,
+checkpoints) — the same transport shape as the `behavioral-closure` token.
+
+The gate is **two-stage hybrid** (mirrors the behavioral-closure authority
+split — a mechanical gate enforces structure; the commit-reviewer assesses
+semantic quality as defense-in-depth and does NOT replace the mechanical check):
+
+- **Stage 1 (commit-gate mechanical precheck, pre-commit):** the contract is
+  supplied explicitly via `acquire --rewrite-parity-contract <file>`. The gate
+  loads and validates it: schema/version/mode validity, a planned verifier
+  (kind + locator) per behavior, `prior_surface.revision` bound to the
+  acquire-time HEAD, and `prior_surface.paths` cross-checked against the
+  tree-bound deletion set (`deletion_replacement`: status-D / R-source;
+  `modification_only_rewrite`: status-M). When `inventory_complete: true` the
+  declared paths must equal the change set; otherwise they must be a subset.
+  Rejects missing/malformed/mismatched. Flag absent ⇒ no rewrite-parity gating.
+- **Stage 2 (closeout transition, `status: completed`):**
+  `saveCoordinationTaskCloseout` requires every behavior `result.status: proven`
+  with a non-empty `receipt` (structural completeness). Refuses completion on
+  `planned`/`failed`/`skipped`/`not-demonstrable`/missing-receipt. The
+  tree-binding honesty — that the receipt references the assessed tree, not a
+  stale or fabricated one — is author + reviewer (same honesty ceiling as
+  behavioral-closure); the gate verifies presence, not receipt truth.
+  `not-demonstrable` → `inconclusive` → blocks `completed` (aligns the
+  behavioral-closure mapping above): a behavior whose verified seam cannot
+  observe the outcome is `not-demonstrable`, which fails the completion gate
+  and routes to defer.
+- **doctor** runs an independent structural-consistency audit of committed
+  ```rewrite-parity blocks (same schema; not the sole authority — defense-in-
+  depth catching contracts that landed via paths that bypassed the two gates).
+
+The contract is a **declaration, not a proof** (same honesty ceiling as
+behavioral-closure and F3): a structurally-complete contract can still carry
+weak evidence, a stale receipt, or a coordinated-but-wrong verifier. The gate
+verifies STRUCTURAL completeness, never design truth. State "structurally
+resolved for this design," never "parity proven." See
+`docs/coordination/CLOSEOUT_TEMPLATE.md` → "Rewrite-parity contract" for the
+canonical block shape.
 
 ### Verification claims: full, targeted, and transition-clean
 
@@ -315,7 +383,6 @@ When making changes:
   - use `planner` to turn an agreed direction into a compact execution brief for `build`
   - for high-uncertainty tasks, prefer `researcher -> debate -> planner -> build`; send routine or obvious work directly to `build`
   - when you want that high-uncertainty chain as one read-only compare-and-plan pass, prefer `/solution-brief <question>`
-    See `docs/coding-agent-in-research/solution-brief/README.md` for the bounded workflow note and linked research trail.
 - For multi-session coordination work, classify the task as `short`, `medium`, or `long` before fanning out. Use `docs/coordination/TASK_MODES.md` and `docs/coordination/RUNTIME_MODEL.md` to decide whether `.opencode/state/` is enough or whether a local runtime layer under `.local/coordinator/` is justified.
 - Use `repo-explorer` as a path finder and call-graph tracer first. Ask for exact full file bodies only through an explicit read command when needed.
 - For read-only shell inspection, prefer narrow commands such as `ls`, `find`, `grep`, `sed -n`, `head`, `tail`, `jq`, and `git grep`. Avoid `cat` dumps for exploration.
@@ -423,188 +490,6 @@ it would be empty, a placeholder, `none`, or a repetition of a sibling or an
 existing retained summary. This is a density rule, not a license to omit work:
 scan all nine, emit the ones with material content, omit the rest rather than
 emit a shell.
-
-## Backlog tracking rules
-
-The canonical planning documents live under `docs/planning/` and `docs/checkpoints/`.
-
-### Canonical files
-- `docs/planning/backlog.md` is the source of truth for task status. Agents
-  edit it **freely**; conflict discipline is enforced at the commit/workflow
-  layer, not by blocking edits (see "Conflict discipline" below).
-- `docs/planning/archive/` stores older `done` / `cancelled` rows moved out of the active backlog for on-demand retrieval.
-- `docs/planning/roadmap.md` describes phase ordering and milestone intent.
-- `docs/checkpoints/` stores dated progress snapshots only when a checkpoint is worth committing.
-
-### Conflict discipline (hybrid split-commit)
-
-Agents edit `docs/planning/backlog.md` freely. The disciplines that keep a
-backlog edit from blocking a code commit live at the **commit/workflow layer**,
-not in the permission map:
-
-- **Re-read from disk before editing** — the file is a shared ledger; always
-  load the latest content from disk immediately before your edit so you build
-  on current state, not a stale copy.
-- **Edit only your own task rows** — scope your edit to the rows you own
-  (matched by stable task ID). Do not touch unrelated rows.
-- **Commit backlog SEPARATELY from code** — never bundle a backlog-status
-  change into a code commit. A code commit carries code (+ tests + the docs
-  that justify the code); a backlog commit carries backlog rows. One backlog
-  commit per work cycle is the target. This is what keeps a concurrent
-  backlog edit from blocking a clean code commit.
-- **On `cas_conflict`, re-read + re-apply + retry — do NOT revert
-  `backlog.md` to unblock.** Reverting the shared ledger to HEAD discards
-  other agents' promoted state. The canonical recovery is to re-read the file
-  from the new HEAD, re-apply only your rows, and retry. The
-  `commit-gate.sh revert` path is for stray CODE files this session does not
-  own; it must NOT be used on `backlog.md`.
-
-Load the `backlog` skill (`.opencode/skills/backlog/SKILL.md`) for the full
-quick-reference before substantial backlog work. A non-blocking reminder fires
-on the first edit of `backlog.md` per session.
-
-### DEFER / follow-up curation (intake, not direct rows)
-
-DEFER findings and p2 follow-up/cleanup items NEVER become backlog rows
-directly. They land in `.local/coordinator/tasks/` as **conditional
-candidates** (transport, not truth) and reach `backlog.md` only after a
-trigger fires AND the promoter applies the promotion Definition of Ready:
-
-- **Capture** a DEFER/follow-up via `/write-task` into
-  `.local/coordinator/tasks/` **as `status: draft`** — do NOT let an
-  advisory candidate inherit the `ready` default. `draft` is a first-class create
-  status (`/write-task` accepts `status: draft|ready`) and is correct for
-  candidates whose trigger has not fired and that therefore lack the file scope +
-  validation plan `ready` requires; carry the Notes-prefix provenance:
-  `source:review-defer` (or `source:p2-followup`), `trigger:path_touched(<path>)`
-  (or another approved predicate), `studied:YYYY-MM-DD`.
-- **Holding area is transport, not truth.** Unpromoted candidates may be lost —
-  this is intentionally fine, because they are not trusted work yet. Do not
-  create a parallel committed ledger for them. **Retiring an unpromoted
-  transport card is destructive hard removal, not a lifecycle status, tombstone,
-  archive, or durable record.** `/task-delete <task_id>` is the sanctioned
-  validated single-card wrapper over that removal mechanic: it removes the
-  gitignored card and its local report directory. It does NOT mark the task
-  cancelled and must NOT be used to bypass a promotion, review, or closeout
-  gate. Direct `rm` of the gitignored file
-  (`.local/coordinator/tasks/<card>.json`) remains a sanctioned retire
-  path equivalent to the wrapper for operators who know exactly what they are
-  doing; the wrapper exists to make the single-card removal safe, validated, and
-  observable. The file is gitignored transport (not committed truth), so
-  deleting it loses nothing durable.
-- **Fog vs ticket (triage test).** A finding is **ticket-ready** when you can
-  state the question precisely now — even if blocked. A finding is **fog** when
-  you cannot yet phrase it that sharply: in-scope, but not yet specifiable. Fog
-  belongs in `.local/coordinator/tasks/` (transport, not truth); it
-  becomes a backlog row only once it sharpens to a precise question AND its
-  trigger has fired AND the promotion DoR below is met.
-- **Promotion Definition of Ready (DoR):** a candidate reaches `backlog.md`
-  only if ALL of: trigger has fired (or operator override) + concrete area +
-  file scope + validation plan + clear slice + provenance Notes. Run the
-  predicate checker (`node .opencode/scripts/check-defer-triggers.mjs`) as a
-  promotion-review aid — it is **promoter-use-only**, never wired into a commit
-  hook, never blocking.
-- **Reviewer DEFER never becomes a direct backlog row.** A `/commit-review`
-  DEFER finding is captured to `.local/` and curated later; it is not
-  transcribed into `backlog.md` in the same slice.
-- **DEFER/follow-up triage:** when deciding a candidate's disposition at
-  card-creation (resolve-now vs. drive-to-verdict vs. defer-with-trigger), the
-  `resolve-first` skill is the front-gate classifier for that triage.
-
-### Skill-authoring proposal intake (model-originated candidate transport)
-
-A model that identifies a reusable workflow worth becoming a repo-local
-OpenCode skill proposes it as a **structured draft card** in
-`.local/coordinator/skill-proposals/` — gitignored LOCAL CANDIDATE
-TRANSPORT, never truth and never authority. This is the sanctioned intake
-surface; the `/init` direct-write path (a model writing `SKILL.md` directly
-into `.opencode/skills/`) is **REJECTED**. A proposal cannot install a skill,
-write a canonical `SKILL.md`, alter a promotion state, or bypass the S2 gate.
-
-- **Capture a proposal** via `/skill-propose create` (backed by the
-  `save_skill_proposal` plan-state operation). A proposal is created in
-  `status: draft`. Required card fields: `skill_slug`, `skill_name`,
-  `description`, `trigger` (when to use it); optional `proposed_pack`,
-  `rationale`, `evidence_refs` (provenance-bearing — fabricated evidence is
-  prohibited), and `proposed_skill_content` (a draft outline/body — a RECORD,
-  never an installed skill).
-- **Provenance is nested, enforced at the write layer.** The transport stamps
-  `metadata.proposal-origin: model-session` from the real proposing session.
-  A top-level `created_by` field is **REFUSED** (the intake debate explicitly
-  rejected the authority-adjacent top-level tag); `metadata.proposal-origin` is
-  the single admitted origin. Do not set these from the caller — the write
-  layer owns them.
-- **The human gate is load-bearing and DOCUMENTATION-ENFORCED.** `/skill-propose
-  accept <id>` moves a proposal `draft → accepted`; `/skill-propose reject <id>`
-  moves it `draft → rejected` (terminal). This gate is enforced by these
-  AGENTS rules, NOT by code — it is the same pattern as task-card promotion
-  (`save_coordination_task` likewise accepts a model-supplied `status:ready`;
-  the rule forbidding a model from promoting its own task out of draft lives
-  here, not in code). opencode's plan-state tool surface is one tool with an
-  operation enum and cannot distinguish human-initiated from model-initiated
-  calls, so `set_skill_proposal_status` cannot be scoped out of agent-reachable
-  plan-state. The mechanical gates that hold REGARDLESS of who calls it are
-  DOWNSTREAM: overlay authoring requires human file writes, the S2 hold gates
-  promotion on real-repo pilot evidence, and core promotion requires human
-  approval. `accepted`/`rejected` are closed (open a new proposal rather than
-  editing or resurrecting a decided one).
-- **A model cannot accept or reject its own skill proposal.** Acceptance and
-  rejection are human actions. A model that writes a proposal must not
-  transition it to `accepted` or `rejected` — it stays `draft` until a human
-  decides. This mirrors the task-card candidate-vs-authority invariant (a model
-  cannot promote its own task out of `draft`). The downstream mechanical gates
-  (overlay authoring → S2 → pilot → evidence → core promotion) hold even if this
-  documentation rule is violated, so a self-acceptance still creates no skill and
-  promotes nothing.
-- **Acceptance creates NOTHING.** `accepted` only records human approval to
-  proceed with **separately authorized** overlay authoring under
-  `.vh-agent-harness/overlays/<pack>/skills/<name>/SKILL.md`, followed by the
-  unchanged promotion path: **S2 hold → overlay pilot against a real repo →
-  external evidence → human-approved core promotion** (see the skill lifecycle
-  rules). This intake adds the INTAKE step only; it does not weaken or replace
-  any promotion gate.
-- **Transport, not truth.** Unpromoted proposals may be lost — this is
-  intentionally fine, because they are not trusted work yet. Do not create a
-  parallel committed ledger for them. `/skill-propose delete <id>` retires a
-  single unpromoted card; like `/task-delete`, this is destructive hard removal
-  of gitignored transport, NOT a lifecycle status, and must NOT be used to
-  bypass the accept/reject gate.
-- **Coordination stays read-only.** The proposing specialist or build session
-  writes the card via `/skill-propose`; the coordinator never edits proposal
-  files directly. Use `/skill-propose list` / `/skill-propose open <id>` to
-  inspect the intake queue (`list_skill_proposals` / `read_skill_proposal`).
-
-### Picking contract (R1)
-
-Before acting on any backlog row, **re-study the cited files/state**. A backlog
-row is a pointer, not a complete specification: re-read the referenced code,
-docs, and prior decisions, then act on the current reality rather than the
-row's summary.
-
-### Agent update requirements
-- Before substantial work, set the row to `in_progress` (+ owner + date) with a
-  direct edit. Re-read from disk first; edit only your row.
-- When finishing work, set the row to `done` with the changed files and
-  verification performed, in a backlog commit SEPARATE from the code commit.
-- If new follow-up work is discovered, capture it as a conditional candidate in
-  `.local/coordinator/tasks/` (see "DEFER / follow-up curation"); do
-  NOT add it to `backlog.md` unless its trigger has fired and it meets the DoR.
-- If blocked, set the row to `blocked` with the exact blocker and the next
-  decision needed.
-- Do not delete old tasks silently. Move abandoned items to `cancelled` with a
-  short reason.
-- After batch-editing `backlog.md` in a way that completes/cancels work or
-  creates section drift, run the backlog normalizer (`/backlog-cleanup` or
-  `vh-agent-harness exec node .opencode/scripts/normalize-backlog.js`) so
-  `Now` / `Next` / `Later` stay active-only and older history is archived under
-  `docs/planning/archive/`.
-- Do not rewrite unrelated task history while updating the backlog.
-
-### Task formatting rules
-- Use stable IDs such as `P1-CORE-001` or `P2-API-003`.
-- Keep each task scoped to one clear vertical slice or one focused boundary change.
-- Prefer areas that match repo boundaries (e.g. `api`, `web`, `storage`, `docs`, or the project's own package names).
-- Completed tasks must include enough notes for a reviewer to understand what changed without diff-mining the branch.
 
 # vh-solara — Mission & Engineering Notes
 

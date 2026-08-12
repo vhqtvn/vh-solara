@@ -930,19 +930,27 @@ export function walkGitGlobals(tokens, commandCwd) {
 // occurrence keeps the deny.
 const STATIC_INSPECTION_FORBIDDEN_CHARS_RE = /[;&|`$()<>"'\\\n\r]/;
 
-// Narrow, fail-closed exception to isGateWrapperInDevShExec for TWO
-// syntactically inert static-inspection forms that mention commit-gate.sh.
-// Neither can execute or mutate anything:
+// Narrow, fail-closed exception to isGateWrapperInDevShExec for inert
+// command forms that mention commit-gate.sh. None can EXECUTE the gate:
 //   1. `vh-agent-harness exec bash -n [--] <path-ending-in-commit-gate.sh>`
 //        — `bash -n` validates syntax ONLY; the script never runs.
 //   2. `vh-agent-harness exec cmp [--] <a> <b>` where at least one operand
 //        ends in `commit-gate.sh` — `cmp` compares bytes and returns an exit
 //        code; it never executes either operand.
+//   3. `vh-agent-harness accept-platform [--] <paths>` or
+//        `vh-agent-harness diff [--] <paths>` (NON-exec, native subcommands)
+//        where at least one operand ends in `commit-gate.sh`. Neither verb
+//        executes a path operand: accept-platform reads embedded-corpus bytes
+//        and writes them to the named path (sanctioned recovery — writing
+//        platform bytes to commit-gate.sh IS the intended repair, never an
+//        execution of it); diff is pure read + report (cobra.NoArgs rejects a
+//        stray positional before RunE, so it can only error).
 //
-// Both forms were previously over-blocked by the broad
+// All three forms were previously over-blocked by the broad
 // `includes("commit-gate.sh")` deny in isGateWrapperInDevShExec, forcing
-// agents to route even these inert checks through a tmp/ script indirection.
-// This exception drains that false-positive WITHOUT weakening
+// agents to route even these inert checks through a tmp/ script indirection
+// (and blocking the sanctioned accept-platform recovery of the gate script
+// outright). This exception drains that false-positive WITHOUT weakening
 // git-mutation-bypass: the forbidden-pattern scan runs FIRST (before the
 // harness branch), so any wrapped git mutation (`git commit`, `git push`,
 // ...) is still denied at scan #1 regardless of this exception.
@@ -952,14 +960,21 @@ const STATIC_INSPECTION_FORBIDDEN_CHARS_RE = /[;&|`$()<>"'\\\n\r]/;
 //   - ANY shell-control / substitution / quoting / redirection / escape
 //     character appears anywhere (the grammar requires plain unquoted
 //     tokens; a smuggled operator is the primary bypass vector);
-//   - the wrapper verb is anything other than exactly `vh-agent-harness exec`;
-//   - the inspection verb is anything other than `bash -n` or `cmp`
-//     (NOT `bash -c`, NOT bare `bash`);
-//   - an operand count other than 1 (`bash -n`) or 2 (`cmp`);
-//   - any operand starts with `-` (would be an option, not a plain path);
+//   - the wrapper verb is anything other than `vh-agent-harness exec`
+//     (forms 1, 2) or `vh-agent-harness accept-platform` /
+//     `vh-agent-harness diff` (form 3);
+//   - the inspection verb is anything other than `bash -n`, `cmp`,
+//     `accept-platform`, or `diff` (NOT `bash -c`, NOT bare `bash`);
+//   - an operand count other than 1 (`bash -n`), 2 (`cmp`), or ≥1
+//     (`accept-platform`/`diff`);
+//   - any operand starts with `-` (would be an option, not a plain path —
+//     for accept-platform this also blocks --target/-o, which could redirect
+//     the write, and any flag-like token after `--`);
 //   - the `bash -n` operand does not END in `commit-gate.sh`;
 //   - the `cmp` pair does not include at least one operand ending in
 //     `commit-gate.sh`;
+//   - the `accept-platform`/`diff` operand list does not include at least
+//     one operand ending in `commit-gate.sh`;
 //   - the command does not END immediately after the permitted operands
 //     (a trailing token could carry a smuggled second leg);
 //   - any unexpected shape.
@@ -984,9 +999,44 @@ export function isStaticGateInspectionInDevShExec(normalized) {
         // statement separator survives the split.
         const tokens = normalized.split(/\s+/).filter((t) => t.length > 0);
 
-        // Require the literal wrapper verb `vh-agent-harness exec`.
+        // Require the `vh-agent-harness` wrapper. The subcommand (exec for
+        // forms 1/2, accept-platform/diff for form 3) is validated below.
         if (tokens.length < 2) return false;
         if (tokens[0] !== "vh-agent-harness") return false;
+
+        // Form 3 (NON-exec): native vh-agent-harness verbs that take path
+        // operands but never EXECUTE them. These are top-level subcommands
+        // (NOT `vh-agent-harness exec <verb>`), so they are carved out BEFORE
+        // the `exec` gate below. The shell-guard threat this deny guards
+        // against is EXECUTING commit-gate.sh to bypass the gated-commit
+        // protocol; treating the gate script as path DATA is not that threat.
+        //   - `accept-platform <paths>`: reads embedded-corpus bytes and writes
+        //     them to the named path — the sanctioned recovery for a stalled
+        //     platform-managed file. It does NOT execute the path (writing
+        //     platform bytes to commit-gate.sh IS the intended repair).
+        //   - `diff <paths>`: pure read + report. cobra.NoArgs means a stray
+        //     positional is rejected by cobra before RunE, so the verb can
+        //     only error — it never executes anything.
+        // Both were over-blocked by the broad `includes("commit-gate.sh")`
+        // deny whenever the gate path was named.
+        if (tokens[1] === "accept-platform" || tokens[1] === "diff") {
+            let i = 2;
+            if (tokens[i] === "--") i++;
+            const ops = tokens.slice(i);
+            // At least one plain path operand, command must END here.
+            if (ops.length < 1) return false;
+            // No smuggled flags/options. accept-platform's --target/-o could
+            // redirect the write to an arbitrary location, so reject ANY
+            // operand starting with `-` (including after `--`, matching the
+            // cmp grammar) — only plain path data is admitted.
+            if (ops.some((o) => o.startsWith("-"))) return false;
+            // At least one operand must END in commit-gate.sh (narrower than
+            // the deny's substring `includes`; matches the bash -n / cmp style).
+            const gateCount = ops.filter((o) => o.endsWith("commit-gate.sh")).length;
+            if (gateCount < 1) return false;
+            return true;
+        }
+
         if (tokens[1] !== "exec") return false;
 
         // Need an inspection verb + at least one operand.
@@ -1036,8 +1086,13 @@ export function isGateWrapperInDevShExec(cmd) {
     const normalized = stripLeadingEnvVarsFromString(cmd).trim();
     if (!normalized.startsWith("vh-agent-harness ")) return false;
     if (!normalized.includes("commit-gate.sh")) return false;
-    // Narrow exception ONLY for syntactically inert static inspection
-    // (`bash -n` / `cmp` of the gate script). Neither can execute or mutate.
+    // Narrow exception ONLY for inert command forms that cannot EXECUTE the
+    // gate script: `bash -n` / `cmp` (static inspection — neither executes
+    // nor mutates), and `accept-platform` / `diff` (native subcommands that
+    // take path operands but never execute them; accept-platform writes
+    // platform bytes as sanctioned recovery, diff is read-only). The threat
+    // this deny guards against is EXECUTING commit-gate.sh to bypass the
+    // gated-commit protocol; none of these forms is that threat.
     // git-mutation-bypass (scan #1, runs before this branch) still denies any
     // wrapped git mutation regardless of this exception.
     if (isStaticGateInspectionInDevShExec(normalized)) return false;

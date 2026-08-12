@@ -168,7 +168,13 @@ _file_age_seconds() {
   local filepath="$1"
   local now epoch
   now=$(date +%s)
-  epoch=$(stat -c %Y "$filepath" 2>/dev/null || echo 0)
+  # On stat FAILURE, treat the file as FRESH (epoch=now => age=0), never as
+  # epoch=0 (which would yield age=now ≈ 1.7e9 and make the file look aged).
+  # This is load-bearing: a transient stat failure under contention must not
+  # cause a UUID-protected in-use scratch file to be reaped. All consumers
+  # (incl. _protected_uuids and _gate_gc_sweep) keep files whose age <=
+  # max_age, so age=0 => retention. Do NOT change this back to `|| echo 0`.
+  epoch=$(stat -c %Y "$filepath" 2>/dev/null || echo "$now")
   echo $(( now - epoch ))
 }
 

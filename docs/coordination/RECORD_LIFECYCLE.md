@@ -155,9 +155,10 @@ the commit failed it is re-driven).
 ### Legacy
 
 The landing-proof requirement applies to **new cards filed after codification**.
-Pre-existing cards in transport at codification time are grandfathered (retired
-under the prior convention); once the Slice-2 retirement CODE lands, all
-`completed` retirements are landing-gated regardless of filing date.
+Pre-existing cards in transport at codification time were grandfathered (retired
+under the prior convention); since the Slice-2 retirement code landed (commit
+`00b5add`), all `completed` retirements are landing-gated regardless of filing
+date.
 
 ## Records
 

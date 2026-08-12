@@ -2807,7 +2807,9 @@ function main() {
         // reachable `Task-Card:` trailer → deleted; otherwise a structured
         // landing_not_confirmed refusal). That path needs a git fixture, so it
         // is covered by the dedicated hermetic suite
-        // tests/scripts/task-delete-retirement.test.js rather than here.
+        // tests/scripts/task-delete-retirement.test.js (an internal/dev-only
+        // harness test — NOT shipped in the rendered consumer set) rather than
+        // here.
         //
         // Every fixture id is pushed to createdTaskIDs so the finally-block
         // cleanupArtifacts runs over ids whose card + report dir were already
@@ -3481,7 +3483,9 @@ function main() {
         //      verifyLandingProof — completed + reachable Task-Card trailer →
         //      deleted; otherwise landing_not_confirmed), covered by the
         //      dedicated hermetic suite
-        //      tests/scripts/task-delete-retirement.test.js. Each refusal here
+        //      tests/scripts/task-delete-retirement.test.js (an internal/dev-
+        //      only harness test, NOT shipped in the rendered consumer set).
+        //      Each refusal here
         //      must leave the card + report dir + sentinel byte-identical and
         //      intact.
         const lifecycleStatusFixtures = [
