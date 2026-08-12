@@ -356,4 +356,55 @@ test.describe("lane 8: real SPA cross-origin iframe embed", () => {
     await expect(page.locator('[data-testid="layout-overlay-card"]')).toBeVisible();
     await H.closeLayoutOverlay(page);
   });
+
+  // ===========================================================================
+  // PANE-ACTIVATE ROUND-TRIP (Slice 2 interaction regression fix). The REAL
+  // production SPA's hostGesture.ts activate-forward listens for document
+  // pointerdown (mobile tap) + window focus (desktop click-into-pane) inside
+  // the cross-origin iframe + forwards ONE closed
+  // {type:"host-gesture",gesture:"pane-activate"} postMessage to the host. The
+  // host derives the source pane from event.source + activates it (focusPane →
+  // setActive → onDidActivePanelChange → focusedId + is-active + visual
+  // indicator). This closes the regression where tapping inside a cross-origin
+  // iframe never reached Dockview's native activation (Phase 1 removed the only
+  // host-DOM click target — the per-pane headers).
+  //
+  // Same gesture-bridge pattern Slice 1 proved for layout-overlay; this proves
+  // the REAL SPA emits the pane-activate signal for real (the mock-content
+  // interaction-overlay spec proves the host side with a probe; this proves the
+  // SPA side emits).
+  // ===========================================================================
+
+  test("real SPA pointerdown → host activates the source pane (pane-activate round-trip)", async ({ page }) => {
+    await page.goto("/");
+    const frame = await firstRealFrame(page);
+    await waitForSpaMounted(frame);
+    const ids = await H.panes(page);
+    expect(ids.length, "seeded panes present").toBeGreaterThanOrEqual(2);
+    // firstRealFrame corresponds to panes()[0] (same DOM-order correspondence
+    // Slice 1's gesture tests rely on for their overlay-source assertion).
+    const target = ids[0];
+    const other = ids[1];
+    await waitForRealAlive(page, target);
+
+    // Make the activation OBSERVABLE: focus a different pane first so the
+    // target is NOT already active (otherwise activate is a host-side no-op).
+    await H.focusPane(page, other);
+    await expect.poll(async () => H.focused(page)).toBe(other);
+
+    // Dispatch a pointerdown inside the real SPA's document — the production
+    // activate-forward listener (document pointerdown) fires → posts ONE
+    // {type:"host-gesture",gesture:"pane-activate"} to the captured host origin
+    // (the handshake origin = localhost:5183, never '*').
+    await frame.evaluate(() => {
+      document.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+    });
+
+    // OUTCOME: the host derived the source pane from event.source (this iframe's
+    // contentWindow) + activated it. focusedId + is-active moved to the target.
+    await expect
+      .poll(async () => H.focused(page), { timeout: 10000, message: "host activated the real-SPA source pane (pane-activate)" })
+      .toBe(target);
+    await expect(page.locator(`.pane[data-pane-id="${target}"].is-active`)).toHaveCount(1);
+  });
 });

@@ -133,13 +133,15 @@ export type PaneToHost =
       attention: Attention;
       activity: Activity;
     }
-  // Layout-overlay gesture (double-Ctrl desktop / triple-tap mobile). The SPA
-  // forwards ONE closed intent when the operator gestures; the host derives the
-  // source pane from event.source (the pane's bound contentWindow) and IGNORES
-  // any sender-claimed id (there is none in this payload). NO other fields — no
-  // pane/server/dir IDs, no direction, no coordinates. See web/src/hostGesture.ts
-  // + the host-gesture branch of store.routeMessage.
-  | { type: "host-gesture"; gesture: "layout-overlay-request" };
+  // Layout-overlay gesture (double-Ctrl desktop / triple-tap mobile) + pane-
+  // activate forward (cross-origin activation bridge). The SPA forwards ONE
+  // closed intent when the operator gestures (overlay) or when the pane gains
+  // focus / receives a pointerdown (activate); the host derives the source pane
+  // from event.source (the pane's bound contentWindow) and IGNORES any sender-
+  // claimed id (there is none in this payload). NO other fields — no pane/server
+  // /dir IDs, no direction, no coordinates. See web/src/hostGesture.ts + the
+  // host-gesture branch of store.routeMessage.
+  | { type: "host-gesture"; gesture: "layout-overlay-request" | "pane-activate" };
 
 // Host → pane. `focus`/`blur` are the pre-existing host-focus routing. The
 // `vh-host-handshake` is the document-liveness challenge (see

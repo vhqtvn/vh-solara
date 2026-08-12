@@ -1,12 +1,15 @@
-// Host gesture recognizer (embed-gated) for the production SPA.
+// Host gesture recognizer + pane-activate forward (embed-gated) for the
+// production SPA.
 //
-// Replaces the dropped host-side Alt keyboard shortcuts (the host structurally
-// CANNOT see keys/taps inside a cross-origin iframe, so Alt-hotkeys never fired
-// when a pane had focus). The revised interaction model: the operator performs
-// a gesture INSIDE the embedded SPA, and the SPA forwards ONE closed postMessage
+// Two concerns share this module because they share the IDENTICAL security
+// model + handshake-origin capture + closed `host-gesture` message kind:
+//
+// (A) GESTURE RECOGNIZER — replaces the dropped host-side Alt keyboard shortcuts
+// (the host structurally CANNOT see keys/taps inside a cross-origin iframe, so
+// Alt-hotkeys never fired when a pane had focus). The operator performs a
+// gesture INSIDE the embedded SPA, and the SPA forwards ONE closed postMessage
 // intent to the host, which opens its layout overlay anchored to the source
-// pane. Two gestures, ONE outbound message:
-//
+// pane. Two recognizers, ONE outbound gesture value:
 //   - DESKTOP: double bare-Ctrl (two presses of the Control key alone, no other
 //     key, within DOUBLE_CTRL_WINDOW_MS). Deliberately NOT Ctrl+something — a
 //     bare-Ctrl double-press is a discrete gesture that does not collide with
@@ -15,6 +18,20 @@
 //   - MOBILE: triple-tap (three primary-pointer taps within a short window,
 //     each near the first). Suppresses while the host's soft-keyboard focus-
 //     mode is active (the host tells us via {type:'host-mode'}).
+//
+// (B) PANE-ACTIVATE FORWARD — fixes the cross-origin activation gap. Phase 1
+// removed the per-pane headers (operator's request) that were the only host-DOM
+// click target wired to Dockview's native onDidActivePanelChange. Panes are now
+// full-bleed cross-origin iframes with no host chrome; a tap inside a cross-
+// origin iframe does NOT bubble to the host, so Dockview never sees the
+// activation and the focus indicator + statusbar actions stay stuck on the
+// stale pane (this blocks the operator on mobile entirely — there is no
+// alternative path). The SPA forwards a `pane-activate` signal when it gains
+// focus / receives a pointerdown; the host calls focusPane(sourcePaneId) →
+// setActive() → onDidActivePanelChange → the focus indicator + statusbar target
+// move. The SPA owns the signal because it has the events inside its focused
+// document; the host structurally cannot see them (same cross-origin constraint
+// that killed the Alt-hotkeys). Same pattern the gesture recognizer proved.
 //
 // SECURITY MODEL (mirrors heartbeat.ts / statusEmitter.ts / selectListener.ts
 // EXACTLY — read those first):
@@ -25,11 +42,14 @@
 //     inbound handshake MessageEvent.origin — NEVER a literal '*' and NEVER a
 //     build-time config).
 //
-// OUTBOUND CONTRACT: exactly `{type:"host-gesture", gesture:"layout-overlay-
-// request"}`. NO other fields (no pane/server/dir IDs, no direction, no
-// coordinates, no raw events) — the host derives the source pane from
-// event.source (the pane's bound contentWindow), NEVER trusting a sender-claimed
-// id. This is the same source-binding the heartbeat/status bridges rely on.
+// OUTBOUND CONTRACT: exactly `{type:"host-gesture", gesture: GESTURE}` where
+// GESTURE is `"layout-overlay-request"` (the gesture recognizer) or
+// `"pane-activate"` (the activate forward). NO other fields (no pane/server/dir
+// IDs, no direction, no coordinates, no raw events) — the host derives the
+// source pane from event.source (the pane's bound contentWindow), NEVER trusting
+// a sender-claimed id. This is the same source-binding the heartbeat/status
+// bridges rely on. Both values reuse the ONE `host-gesture` message kind — the
+// activate forward only widens the closed gesture enum by one value.
 //
 // HANDSHAKE ORIGIN CAPTURE (design choice, documented): this module installs its
 // OWN inbound handshake listener to capture hostOrigin, mirroring heartbeat.ts
@@ -47,20 +67,41 @@ const TRIPLE_TAP_MAX_MOVEMENT_PX = 12;
 /** Outbound intent — a closed single-variant message. See file header. */
 export interface HostGestureMessage {
   type: "host-gesture";
-  gesture: "layout-overlay-request";
+  gesture: "layout-overlay-request" | "pane-activate";
 }
 
 /**
- * Install the embed-gated gesture recognizer. Captures the host origin from the
- * inbound handshake (same listener shape as heartbeat.ts), recognizes the
- * desktop double-Ctrl + mobile triple-tap gestures, and posts exactly one
- * `{type:"host-gesture", gesture:"layout-overlay-request"}` message per
- * recognition to the captured host origin (never '*'). Idempotent-on-
- * recognition (recognitions do not stack; a second recognition simply posts
- * again — the host re-anchors its overlay). No-op when standalone. Returns a
- * disposer that removes the listeners (the recognizer otherwise lives for the
- * document lifetime; a reload re-runs this module). Wire alongside
- * startHeartbeat()/startStatusEmitter()/startSelectListener() in index.tsx.
+ * Install the embed-gated gesture recognizer + pane-activate forward. Captures
+ * the host origin from the inbound handshake (same listener shape as
+ * heartbeat.ts), recognizes the desktop double-Ctrl + mobile triple-tap gestures
+ * (posting `{type:"host-gesture", gesture:"layout-overlay-request"}`), and
+ * forwards a `{type:"host-gesture", gesture:"pane-activate"}` signal when this
+ * document gains focus / receives a pointerdown (the cross-origin activation
+ * bridge). All three posts target the captured host origin (never '*').
+ *
+ * Gesture recognizer: idempotent-on-recognition (recognitions do not stack; a
+ * second recognition simply posts again — the host re-anchors its overlay).
+ *
+ * Activate forward: throttled to ONCE PER FOCUS SESSION (prompt option (a):
+ * "post at most once per focus session"). A `window.focus` or
+ * `document.pointerdown` posts at most one activate until `window.blur` resets
+ * the session (focus lost + regained posts again). This handles every real
+ * case: a desktop click-into-pane fires focus (then its pointerdown is a
+ * no-op); a mobile tap fires pointerdown (focus may not fire); repeated taps in
+ * the same pane stay at one post; tapping another pane blurs this document
+ * (reset) and focuses that one (its own session). The host no-ops when the
+ * source pane is already active, so residual duplicate posts are harmless. The
+ * activate listener is SEPARATE from the triple-tap pointerdown recognizer (it
+ * fires on the first pointerdown of a sequence; the triple-tap recognizer
+ * independently counts — no double-count). Taps on interactive elements STILL
+ * activate the pane (tapping a button in pane X means pane X should be active);
+ * the activate listener deliberately does NOT share the triple-tap recognizer's
+ * interactive-element ignore list.
+ *
+ * No-op when standalone. Returns a disposer that removes the listeners (the
+ * recognizer otherwise lives for the document lifetime; a reload re-runs this
+ * module). Wire alongside startHeartbeat()/startStatusEmitter()/
+ * startSelectListener() in index.tsx.
  */
 export function startHostGesture(): (() => void) | undefined {
   if (typeof window === "undefined") return;
@@ -117,6 +158,78 @@ export function startHostGesture(): (() => void) | undefined {
       /* parent window gone — ignore */
     }
   };
+
+  // ---- pane-activate forward (cross-origin activation bridge) ---------------
+  // Phase 1 removed the per-pane headers that were the only host-DOM click
+  // target wired to Dockview's onDidActivePanelChange. A tap inside a cross-
+  // origin iframe does NOT bubble to the host, so Dockview never sees the
+  // activation → the focus indicator + statusbar actions stay on the stale
+  // pane. The SPA forwards a `pane-activate` signal on focus / pointerdown; the
+  // host calls focusPane(sourcePaneId) → the indicator + statusbar move. Same
+  // security model as the overlay request (captured origin, closed payload).
+  //
+  // THROTTLE: once per FOCUS SESSION (prompt option (a)). `activatePosted` is
+  // set on the first post and cleared on `window.blur` (focus lost). A regained
+  // focus / new pointerdown after blur posts again. The host no-ops when the
+  // source pane is already active, so residual duplicate posts are harmless;
+  // the throttle governs message VOLUME, not correctness. (A time-based
+  // debounce was considered and dropped: the session flag alone covers dual
+  // focus+pointerdown triggers, cross-pane switches, and intra-pane taps, and a
+  // debounce would over-suppress a genuine blur-then-refocus.)
+  //
+  // COEXISTENCE WITH TRIPLE-TAP: the activate listener is on `document`; the
+  // triple-tap recognizer is on `window`. Both fire on the same pointerdown but
+  // neither calls stopPropagation/preventDefault on the early taps, so they do
+  // not conflict. The activate posts ONCE on the first pointerdown of a focus
+  // session (subsequent taps in the session are no-ops) — it does not double-
+  // count across a triple-tap sequence. Taps on interactive elements STILL
+  // activate the pane (tapping a button in pane X means pane X should be
+  // active); the activate listener deliberately does NOT consult the triple-tap
+  // recognizer's interactive-element ignore list.
+  let activatePosted = false; // has activate posted in the current focus session?
+
+  const postActivate = (): void => {
+    if (hostOrigin === null) return; // same handshake gate as the overlay request
+    const msg: HostGestureMessage = {
+      type: "host-gesture",
+      gesture: "pane-activate",
+    };
+    try {
+      // Q2-A: targeted to the captured host origin — never '*'.
+      window.parent.postMessage(msg, hostOrigin);
+    } catch {
+      /* parent window gone — ignore */
+    }
+  };
+
+  /** Post at most one activate per focus session. Resets on window.blur. No-op
+   *  before the handshake captured the host origin. */
+  const maybePostActivate = (): void => {
+    if (hostOrigin === null) return;
+    if (activatePosted) return; // once per focus session
+    activatePosted = true;
+    postActivate();
+  };
+
+  // window.focus fires when the iframe (this document) gains focus — the
+  // desktop click-into-pane path. pointerdown on document is more reliable on
+  // mobile (some engines fire focus unreliably on tap). Both feed the same
+  // throttled maybePostActivate so whichever fires first wins the session.
+  const onFocusActivate = (): void => {
+    maybePostActivate();
+  };
+  const onBlurActivate = (): void => {
+    // Focus left this document → a future regain is a new session eligible to
+    // post again. (window.blur fires when the operator taps another pane's
+    // iframe — this document loses focus, that pane's document gains it.)
+    activatePosted = false;
+  };
+  const onPointerDownActivate = (): void => {
+    maybePostActivate();
+  };
+  window.addEventListener("focus", onFocusActivate);
+  window.addEventListener("blur", onBlurActivate);
+  document.addEventListener("pointerdown", onPointerDownActivate, false);
 
   // ---- desktop gesture: double bare-Ctrl ------------------------------------
   // Count non-repeated keydown events where event.key === "Control"; two within
@@ -230,6 +343,9 @@ export function startHostGesture(): (() => void) | undefined {
     window.removeEventListener("message", onMessage);
     window.removeEventListener("keydown", onKeyDown, false);
     window.removeEventListener("pointerdown", onPointerDown, false);
+    window.removeEventListener("focus", onFocusActivate);
+    window.removeEventListener("blur", onBlurActivate);
+    document.removeEventListener("pointerdown", onPointerDownActivate, false);
   };
 }
 

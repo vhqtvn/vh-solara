@@ -1,7 +1,22 @@
-import { test, expect } from "@playwright/test";
+import { test, expect, type Page } from "@playwright/test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as H from "./util";
+
+/** Read the focus-indicator OUTCOME for a pane: the .is-active class presence +
+ *  the computed 3px outline + the 5px ::before top edge. This is the observable
+ *  signal (not just the class mechanism) the operator sees move when activation
+ *  changes. Runs in the browser via locator.evaluate. */
+async function focusIndicatorStyle(
+  page: Page,
+  paneId: string,
+): Promise<{ isActive: boolean; outline: string; beforeHeight: string }> {
+  return page.locator(`.pane[data-pane-id="${paneId}"]`).evaluate((el) => ({
+    isActive: el.classList.contains("is-active"),
+    outline: window.getComputedStyle(el).outlineWidth,
+    beforeHeight: window.getComputedStyle(el, "::before").height,
+  }));
+}
 
 /**
  * Layout overlay interaction model (replaces the dropped Alt keyboard shortcuts).
@@ -364,5 +379,145 @@ test.describe("layout overlay interaction model", () => {
     await page.locator('[data-testid="attention-next"]').click();
     // The needy pane became focused (NEXT routed through attentionNext).
     await expect.poll(async () => H.focused(page)).toBe(ids[1]);
+  });
+
+  // ---- (6) pane-activate (tap-to-focus bridge) ------------------------------
+  // The SPA forwards {type:"host-gesture",gesture:"pane-activate"} when it gets
+  // focus (desktop click-into-pane) or on pointerdown (mobile tap). The host
+  // activates the source pane (focusPane → setActive → onDidActivePanelChange
+  // → focusedId + is-active + visual indicator). This closes the regression
+  // where tapping inside a cross-origin iframe never reached Dockview's native
+  // activation (Phase 1 removed the per-pane headers — the only host-DOM click
+  // target). Probed through the REAL routeMessage (same path the SPA's
+  // hostGesture.ts posts); same security model as layout-overlay-request.
+
+  test("pane-activate: a valid gesture moves focus + is-active + the visual indicator to the source pane", async ({ page }) => {
+    const ids = await H.panes(page);
+    const stale = ids[0];
+    const target = ids[1];
+    // Start with the focus on pane[0] (the stale pane).
+    await H.focusPane(page, stale);
+    await expect.poll(async () => H.focused(page)).toBe(stale);
+    // Scene: the stale pane is active, the target is not.
+    expect((await focusIndicatorStyle(page, stale)).isActive, "stale active before").toBe(true);
+    expect((await focusIndicatorStyle(page, target)).isActive, "target not active before").toBe(false);
+
+    await page.screenshot({ path: path.join(VISION_DIR, "06a-activate-before.png"), fullPage: true });
+
+    // Probe-post pane-activate from the target's contentWindow (the SAME path
+    // the SPA's hostGesture.ts uses).
+    const r = await H.probePaneMessage(page, {
+      sourcePaneId: target,
+      origin: MOCK_ORIGIN,
+      payload: { type: "host-gesture", gesture: "pane-activate" },
+    });
+    expect(r.accepted, "pane-activate accepted").toBe(true);
+    expect(r.paneId, "pane derived from event.source").toBe(target);
+    expect(r.reason).toBe("accepted:non-heartbeat");
+
+    // OUTCOME: focusedId + is-active + visual indicator all moved to target.
+    await expect.poll(async () => H.focused(page)).toBe(target);
+    const targetAfter = await focusIndicatorStyle(page, target);
+    const staleAfter = await focusIndicatorStyle(page, stale);
+    expect(targetAfter.isActive, "target is-active after").toBe(true);
+    expect(targetAfter.outline, "target has 3px outline after").toBe("3px");
+    expect(targetAfter.beforeHeight, "target has 5px top edge after").toBe("5px");
+    expect(staleAfter.isActive, "stale lost is-active after").toBe(false);
+    // Exactly one pane is active.
+    await expect.poll(async () => page.locator(".pane.is-active").count()).toBe(1);
+
+    await page.screenshot({ path: path.join(VISION_DIR, "06b-activate-after.png"), fullPage: true });
+  });
+
+  test("pane-activate: idempotent — re-post from the already-active pane is a no-op", async ({ page }) => {
+    const ids = await H.panes(page);
+    const target = ids[1];
+    await H.focusPane(page, target);
+    await expect.poll(async () => H.focused(page)).toBe(target);
+
+    // First activate from the active pane — accepted, no thrash.
+    const r1 = await H.probePaneMessage(page, {
+      sourcePaneId: target,
+      origin: MOCK_ORIGIN,
+      payload: { type: "host-gesture", gesture: "pane-activate" },
+    });
+    expect(r1.accepted, "activate on active pane accepted").toBe(true);
+    await expect.poll(async () => H.focused(page)).toBe(target);
+
+    // Second activate from the same pane — still accepted, focus unchanged.
+    const r2 = await H.probePaneMessage(page, {
+      sourcePaneId: target,
+      origin: MOCK_ORIGIN,
+      payload: { type: "host-gesture", gesture: "pane-activate" },
+    });
+    expect(r2.accepted, "repeat activate accepted").toBe(true);
+    expect(await H.focused(page), "focus unchanged after repeat").toBe(target);
+  });
+
+  test("pane-activate: dismisses the overlay when open for a DIFFERENT pane", async ({ page }) => {
+    const ids = await H.panes(page);
+    const overlayPane = ids[0];
+    const activator = ids[1];
+    await H.openLayoutOverlay(page, overlayPane);
+    await expect.poll(async () => H.overlaySource(page)).toBe(overlayPane);
+    await expect(page.locator('[data-testid="layout-overlay-card"]')).toBeVisible();
+
+    // Activate a DIFFERENT pane → overlay dismisses (focus moved away from the
+    // overlay's source).
+    await H.probePaneMessage(page, {
+      sourcePaneId: activator,
+      origin: MOCK_ORIGIN,
+      payload: { type: "host-gesture", gesture: "pane-activate" },
+    });
+    await expect.poll(async () => H.overlaySource(page)).toBeNull();
+    await expect(page.locator('[data-testid="layout-overlay-card"]')).toHaveCount(0);
+    await expect.poll(async () => H.focused(page)).toBe(activator);
+  });
+
+  test("pane-activate: overlay stays open when activate is for the SAME pane", async ({ page }) => {
+    const ids = await H.panes(page);
+    const overlayPane = ids[0];
+    await H.openLayoutOverlay(page, overlayPane);
+    await expect.poll(async () => H.overlaySource(page)).toBe(overlayPane);
+
+    // Activate the SAME pane the overlay is open for → no-op on the overlay.
+    await H.probePaneMessage(page, {
+      sourcePaneId: overlayPane,
+      origin: MOCK_ORIGIN,
+      payload: { type: "host-gesture", gesture: "pane-activate" },
+    });
+    await expect.poll(async () => H.overlaySource(page)).toBe(overlayPane);
+    await expect(page.locator('[data-testid="layout-overlay-card"]')).toBeVisible();
+  });
+
+  test("pane-activate: rejects an unknown field (closed payload)", async ({ page }) => {
+    const ids = await H.panes(page);
+    const target = ids[1];
+    await H.focusPane(page, ids[0]);
+    const r = await H.probePaneMessage(page, {
+      sourcePaneId: target,
+      origin: MOCK_ORIGIN,
+      // A poison paneId must cause rejection — the host accepts ONLY
+      // {type, gesture}. The host never trusts a sender-claimed id.
+      payload: { type: "host-gesture", gesture: "pane-activate", paneId: "evil" },
+    });
+    expect(r.accepted, "unknown field rejected").toBe(false);
+    expect(r.reason).toBe("ignored-non-pane-to-host");
+    // Focus did NOT move (the activate was rejected before any action).
+    expect(await H.focused(page), "focus unchanged after rejected activate").toBe(ids[0]);
+  });
+
+  test("pane-activate: rejects a wrong-origin gesture (origin-checked tier)", async ({ page }) => {
+    const ids = await H.panes(page);
+    const target = ids[1];
+    await H.focusPane(page, ids[0]);
+    const r = await H.probePaneMessage(page, {
+      sourcePaneId: target,
+      origin: WRONG_ORIGIN,
+      payload: { type: "host-gesture", gesture: "pane-activate" },
+    });
+    expect(r.accepted, "wrong-origin activate rejected").toBe(false);
+    expect(r.reason).toBe("rejected:origin-mismatch");
+    expect(await H.focused(page), "focus unchanged after wrong-origin").toBe(ids[0]);
   });
 });

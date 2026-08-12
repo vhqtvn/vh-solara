@@ -24,16 +24,22 @@ import {
 // change. (Effects need a root — those live in the adapter component.)
 
 /**
- * Closed-payload validator for the layout-overlay gesture. The message MUST be
- * exactly `{type:"host-gesture", gesture:"layout-overlay-request"}` with no
- * other fields (defense-in-depth: a poison field never reaches the focus +
- * overlay action). Returns true iff the payload matches the closed shape.
+ * Closed-payload validator for the host-gesture message. The payload MUST be
+ * exactly `{type:"host-gesture", gesture: GESTURE}` where GESTURE is one of the
+ * closed set (`"layout-overlay-request"` | `"pane-activate"`) with NO other
+ * fields (defense-in-depth: a poison field never reaches the focus/overlay
+ * action). Returns true iff the payload matches the closed shape.
  */
 function isClosedHostGesture(data: unknown): boolean {
   if (!data || typeof data !== "object") return false;
   const obj = data as Record<string, unknown>;
   if (obj.type !== "host-gesture") return false;
-  if (obj.gesture !== "layout-overlay-request") return false;
+  if (
+    obj.gesture !== "layout-overlay-request" &&
+    obj.gesture !== "pane-activate"
+  ) {
+    return false;
+  }
   // Reject ANY unknown field (closed set). The two known keys are type+gesture.
   const keys = Object.keys(obj);
   return keys.length === 2 && keys.includes("type") && keys.includes("gesture");
@@ -912,26 +918,58 @@ export function routeMessage(
       return { routed: true, paneId, accepted: true, reason: "accepted:non-heartbeat" };
     }
     case "host-gesture": {
-      // Layout-overlay gesture (double-Ctrl / triple-tap). CLOSED payload: the
-      // message MUST be exactly {type:"host-gesture", gesture:"layout-overlay-
-      // request"} with NO other fields (the host derives the source pane from
-      // event.source — there are no sender-claimed IDs, and a poison field must
-      // never reach the action). Reject any unknown field before acting.
+      // Layout-overlay gesture (double-Ctrl / triple-tap) + pane-activate forward
+      // (cross-origin activation bridge). CLOSED payload: the message MUST be
+      // exactly {type:"host-gesture", gesture: GESTURE} where GESTURE is one of
+      // the closed set, with NO other fields (the host derives the source pane
+      // from event.source — there are no sender-claimed IDs, and a poison field
+      // must never reach the action). Reject any unknown field before acting.
       if (!isClosedHostGesture(data)) {
         return { routed: false, paneId: null, accepted: false, reason: "ignored-non-pane-to-host" };
       }
       // TRUST TIER: heartbeat/status tier (origin-checked). A forged overlay
       // request would focus a pane + pop an overlay (an operator-action side
-      // effect), so source-binding alone (which a bound WindowProxy survives)
+      // effect), and a forged activate would steal focus + redirect statusbar
+      // actions, so source-binding alone (which a bound WindowProxy survives)
       // is insufficient. Mirror the status branch's origin check exactly.
       const expected = configuredOrigin.get(paneId);
       if (expected !== undefined && origin !== expected) {
         return { routed: true, paneId, accepted: false, reason: "rejected:origin-mismatch" };
       }
-      // Activate the source pane + open the overlay. The pane is derived from
-      // event.source (already bound to paneId above); the payload carries no id
-      // and the host trusts none.
-      hostOps()?.openLayoutOverlay?.(paneId);
+      const gesture = (data as { gesture: string }).gesture;
+      if (gesture === "layout-overlay-request") {
+        // Activate the source pane + open the overlay. The pane is derived from
+        // event.source (already bound to paneId above); the payload carries no id
+        // and the host trusts none.
+        hostOps()?.openLayoutOverlay?.(paneId);
+        return { routed: true, paneId, accepted: true, reason: "accepted:non-heartbeat" };
+      }
+      // gesture === "pane-activate": the cross-origin activation bridge. The SPA
+      // forwarded this because a tap inside its iframe does not bubble to the
+      // host (so Dockview's native onDidActivePanelChange never fired). Call
+      // focusPane(sourcePaneId) → setActive() → onDidActivePanelChange → the
+      // focus indicator (is-active + 3px outline + 5px top edge) + statusbar
+      // actions move to this pane.
+      //
+      // IDEMPOTENT: if this pane is already the focused pane, no-op (don't
+      // thrash — the SPA throttles to once per focus session, but the host
+      // defends independently). The message is still ACCEPTED (the payload was
+      // valid + source/origin-bound); only the mutation is skipped.
+      if (focusedId() === paneId) {
+        return { routed: true, paneId, accepted: true, reason: "accepted:non-heartbeat" };
+      }
+      // OVERLAY COMPOSITION: if the layout overlay is currently open for a
+      // DIFFERENT pane, dismiss it (focus moved away from the overlay's source).
+      // If it's open for THIS pane (the activate source), no-op — the overlay
+      // stays anchored (consistent with the overlay's existing same-pane
+      // re-anchor idempotency). (The overlay does not auto-dismiss on arbitrary
+      // focus changes; activate is the explicit signal that focus moved INTO a
+      // pane, which is the right time to dismiss an overlay anchored elsewhere.)
+      const overlaySrc = overlaySourcePaneId();
+      if (overlaySrc !== null && overlaySrc !== paneId) {
+        hostOps()?.closeLayoutOverlay?.();
+      }
+      hostOps()?.focusPane?.(paneId);
       return { routed: true, paneId, accepted: true, reason: "accepted:non-heartbeat" };
     }
     default:

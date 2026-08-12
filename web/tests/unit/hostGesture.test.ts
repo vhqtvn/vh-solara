@@ -98,9 +98,19 @@ function sendTap(opts: TapOpts = {}): { preventDefault: ReturnType<typeof vi.fn>
   return { preventDefault };
 }
 
-/** Gesture message count captured to the parent (the closed outbound payload). */
-function gestureCount(posted: Posted[]): number {
-  return posted.filter((p) => p.msg.type === "host-gesture").length;
+/** Overlay-request message count captured to the parent. Filters to the
+ *  `layout-overlay-request` gesture value so the activate-forward messages
+ *  (which also fire on pointerdown/focus) do not inflate the overlay counts. */
+function overlayCount(posted: Posted[]): number {
+  return posted.filter(
+    (p) => p.msg.type === "host-gesture" && p.msg.gesture === "layout-overlay-request",
+  ).length;
+}
+/** Activate message count captured to the parent (the pane-activate forward). */
+function activateCount(posted: Posted[]): number {
+  return posted.filter(
+    (p) => p.msg.type === "host-gesture" && p.msg.gesture === "pane-activate",
+  ).length;
 }
 
 // ---------------------------------------------------------------------------
@@ -134,7 +144,7 @@ describe("host gesture — desktop double-Ctrl", () => {
   it("two bare-Ctrl within the window → posts one overlay-request", () => {
     sendKey({ key: "Control" });
     sendKey({ key: "Control" });
-    expect(gestureCount(posted), "recognized → exactly one post").toBe(1);
+    expect(overlayCount(posted), "recognized → exactly one post").toBe(1);
     const msg = posted[0].msg;
     expect(msg.type, "closed type").toBe("host-gesture");
     expect(msg.gesture, "closed gesture value").toBe("layout-overlay-request");
@@ -161,20 +171,20 @@ describe("host gesture — desktop double-Ctrl", () => {
     // 600ms later (> 450ms window): the chain expired, this is a fresh first press.
     vi.advanceTimersByTime(600);
     sendKey({ key: "Control" });
-    expect(gestureCount(posted), "outside window → no recognition").toBe(0);
+    expect(overlayCount(posted), "outside window → no recognition").toBe(0);
     // A third quick press now completes a NEW chain (second+third within window).
     sendKey({ key: "Control" });
-    expect(gestureCount(posted), "new chain completes").toBe(1);
+    expect(overlayCount(posted), "new chain completes").toBe(1);
   });
 
   it("auto-repeated Control does not advance the chain", () => {
     sendKey({ key: "Control" });
     // An auto-repeat keydown (held Control): ignored, does not count as the 2nd.
     sendKey({ key: "Control", repeat: true });
-    expect(gestureCount(posted), "repeat ignored").toBe(0);
+    expect(overlayCount(posted), "repeat ignored").toBe(0);
     // A real (non-repeat) second press still completes within the window.
     sendKey({ key: "Control" });
-    expect(gestureCount(posted), "real second press completes").toBe(1);
+    expect(overlayCount(posted), "real second press completes").toBe(1);
   });
 
   it("an intervening NON-modifier key resets the chain (Ctrl+C does not trigger)", () => {
@@ -182,14 +192,14 @@ describe("host gesture — desktop double-Ctrl", () => {
     // The 'c' (Ctrl+C) is a non-modifier keydown → resets the chain.
     sendKey({ key: "c" });
     sendKey({ key: "Control" });
-    expect(gestureCount(posted), "intervening letter reset → no recognition").toBe(0);
+    expect(overlayCount(posted), "intervening letter reset → no recognition").toBe(0);
   });
 
   it("an intervening modifier key (Shift/Alt/Meta) does NOT reset the chain", () => {
     sendKey({ key: "Control" });
     sendKey({ key: "Shift" });
     sendKey({ key: "Control" });
-    expect(gestureCount(posted), "modifier between does not reset").toBe(1);
+    expect(overlayCount(posted), "modifier between does not reset").toBe(1);
   });
 
   it("IME composition active resets the chain", () => {
@@ -197,14 +207,14 @@ describe("host gesture — desktop double-Ctrl", () => {
     // A composing keydown resets.
     sendKey({ key: "a", isComposing: true });
     sendKey({ key: "Control" });
-    expect(gestureCount(posted), "composition reset → no recognition").toBe(0);
+    expect(overlayCount(posted), "composition reset → no recognition").toBe(0);
   });
 
   it("the legacy keyCode 229 composition sentinel resets the chain", () => {
     sendKey({ key: "Control" });
     sendKey({ key: "x", keyCode: 229 });
     sendKey({ key: "Control" });
-    expect(gestureCount(posted), "keyCode 229 reset → no recognition").toBe(0);
+    expect(overlayCount(posted), "keyCode 229 reset → no recognition").toBe(0);
   });
 
   it("works while an editable element is focused (no host-focus suppression)", () => {
@@ -215,7 +225,7 @@ describe("host gesture — desktop double-Ctrl", () => {
     input.focus();
     sendKey({ key: "Control" });
     sendKey({ key: "Control" });
-    expect(gestureCount(posted), "editable focus does not suppress double-Ctrl").toBe(1);
+    expect(overlayCount(posted), "editable focus does not suppress double-Ctrl").toBe(1);
     input.remove();
   });
 
@@ -235,7 +245,7 @@ describe("host gesture — desktop double-Ctrl", () => {
     sendKey({ key: "Control" });
     sendKey({ key: "Control" });
     sendKey({ key: "Control" });
-    expect(gestureCount(posted), "two distinct recognitions").toBe(2);
+    expect(overlayCount(posted), "two distinct recognitions").toBe(2);
   });
 });
 
@@ -266,12 +276,12 @@ describe("host gesture — embed gate + uncaptured origin", () => {
     // NO handshake sent → hostOrigin is null → recognitions are dropped.
     sendKey({ key: "Control" });
     sendKey({ key: "Control" });
-    expect(gestureCount(posted), "no post before handshake").toBe(0);
+    expect(overlayCount(posted), "no post before handshake").toBe(0);
     // After the handshake lands, a new recognition posts.
     sendFromParent(parent, { type: "vh-host-handshake", nonce: "n" });
     sendKey({ key: "Control" });
     sendKey({ key: "Control" });
-    expect(gestureCount(posted), "posts after handshake").toBe(1);
+    expect(overlayCount(posted), "posts after handshake").toBe(1);
     dispose?.();
   });
 
@@ -286,7 +296,7 @@ describe("host gesture — embed gate + uncaptured origin", () => {
     sendFromParent(alien, { type: "vh-host-handshake", nonce: "x" });
     sendKey({ key: "Control" });
     sendKey({ key: "Control" });
-    expect(gestureCount(posted), "alien handshake ignored → no captured origin").toBe(0);
+    expect(overlayCount(posted), "alien handshake ignored → no captured origin").toBe(0);
     dispose?.();
   });
 });
@@ -323,7 +333,7 @@ describe("host gesture — mobile triple-tap", () => {
     sendTap();
     sendTap();
     const { preventDefault } = sendTap();
-    expect(gestureCount(posted), "recognized → exactly one post").toBe(1);
+    expect(overlayCount(posted), "recognized → exactly one post").toBe(1);
     expect(preventDefault, "preventDefault ONLY on the 3rd tap").toHaveBeenCalled();
   });
 
@@ -341,7 +351,7 @@ describe("host gesture — mobile triple-tap", () => {
     // A third tap now is OUTSIDE the window → starts a NEW chain (becomes its
     // first), so the original triple never completes.
     sendTap();
-    expect(gestureCount(posted), "slow sequence does not complete").toBe(0);
+    expect(overlayCount(posted), "slow sequence does not complete").toBe(0);
   });
 
   it("movement beyond MAX_MOVEMENT_PX (> 12px) resets", () => {
@@ -350,7 +360,7 @@ describe("host gesture — mobile triple-tap", () => {
     sendTap({ x: 100, y: 0 }); // far outside → resets, this becomes a new first
     sendTap({ x: 100, y: 0 });
     sendTap({ x: 100, y: 0 });
-    expect(gestureCount(posted), "movement reset → later in-place taps complete").toBe(1);
+    expect(overlayCount(posted), "movement reset → later in-place taps complete").toBe(1);
   });
 
   it("a tap on an interactive element resets (button)", () => {
@@ -363,7 +373,7 @@ describe("host gesture — mobile triple-tap", () => {
     // Subsequent in-place taps would now need three fresh ones.
     sendTap();
     sendTap();
-    expect(gestureCount(posted), "button tap reset → no recognition").toBe(0);
+    expect(overlayCount(posted), "button tap reset → no recognition").toBe(0);
     btn.remove();
   });
 
@@ -376,7 +386,7 @@ describe("host gesture — mobile triple-tap", () => {
     sendTap({ target: el });
     sendTap();
     sendTap();
-    expect(gestureCount(posted), "ARIA-button tap reset → no recognition").toBe(0);
+    expect(overlayCount(posted), "ARIA-button tap reset → no recognition").toBe(0);
     el.remove();
   });
 
@@ -387,7 +397,7 @@ describe("host gesture — mobile triple-tap", () => {
     sendTap({ isPrimary: false });
     sendTap();
     sendTap();
-    expect(gestureCount(posted), "multi-touch cancelled → no recognition").toBe(0);
+    expect(overlayCount(posted), "multi-touch cancelled → no recognition").toBe(0);
   });
 
   it("a non-collapsed text selection cancels", () => {
@@ -403,7 +413,7 @@ describe("host gesture — mobile triple-tap", () => {
     sendTap();
     sendTap();
     sendTap();
-    expect(gestureCount(posted), "selection active → no recognition").toBe(0);
+    expect(overlayCount(posted), "selection active → no recognition").toBe(0);
     vi.restoreAllMocks();
     void real;
   });
@@ -413,7 +423,7 @@ describe("host gesture — mobile triple-tap", () => {
     sendTap();
     sendTap();
     sendTap();
-    expect(gestureCount(posted), "keyboard-focus active → suppressed").toBe(0);
+    expect(overlayCount(posted), "keyboard-focus active → suppressed").toBe(0);
   });
 
   it("keyboard-focus-mode going NORMAL re-enables triple-tap", () => {
@@ -421,12 +431,12 @@ describe("host gesture — mobile triple-tap", () => {
     sendTap();
     sendTap();
     sendTap();
-    expect(gestureCount(posted)).toBe(0);
+    expect(overlayCount(posted)).toBe(0);
     sendFromParent(parent, { type: "host-mode", mode: "normal" });
     sendTap();
     sendTap();
     const { preventDefault } = sendTap();
-    expect(gestureCount(posted), "normal mode → recognized").toBe(1);
+    expect(overlayCount(posted), "normal mode → recognized").toBe(1);
     expect(preventDefault).toHaveBeenCalled();
   });
 
@@ -437,6 +447,175 @@ describe("host gesture — mobile triple-tap", () => {
     sendTap();
     sendTap();
     sendTap();
-    expect(gestureCount(posted), "alien host-mode ignored → still recognized").toBe(1);
+    expect(overlayCount(posted), "alien host-mode ignored → still recognized").toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PANE-ACTIVATE FORWARD (cross-origin activation bridge)
+// ---------------------------------------------------------------------------
+// The SPA forwards a `{type:"host-gesture", gesture:"pane-activate"}` signal
+// when it gains focus / receives a pointerdown so the host can call focusPane
+// (a tap inside a cross-origin iframe does not bubble to the host, so Dockview's
+// native onDidActivePanelChange never fires). Throttled to once per focus
+// session; closed payload; captured-origin targeting (never '*'); source-guard
+// on the handshake. Mirrors the gesture recognizer's security model exactly.
+
+describe("host gesture — pane-activate forward", () => {
+  let parent: Window;
+  let posted: Posted[];
+  let dispose: (() => void) | undefined;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    const fake = makeFakeParent();
+    parent = fake.parent;
+    posted = fake.posted;
+    Object.defineProperty(window, "parent", { configurable: true, get: () => parent });
+    dispose = startHostGesture();
+    sendFromParent(parent, { type: "vh-host-handshake", nonce: "n" });
+  });
+  afterEach(() => {
+    dispose?.();
+    dispose = undefined;
+    vi.clearAllTimers();
+    vi.useRealTimers();
+    Object.defineProperty(window, "parent", { configurable: true, value: window });
+  });
+
+  it("window focus → posts exactly one pane-activate", () => {
+    window.dispatchEvent(new Event("focus"));
+    expect(activateCount(posted), "focus → one activate").toBe(1);
+  });
+
+  it("document pointerdown → posts exactly one pane-activate (mobile-reliable path)", () => {
+    sendTap();
+    expect(activateCount(posted), "pointerdown → one activate").toBe(1);
+  });
+
+  it("posts a CLOSED payload — exactly {type, gesture:pane-activate}, no extras", () => {
+    sendTap();
+    const activates = posted.filter(
+      (p) => p.msg.type === "host-gesture" && p.msg.gesture === "pane-activate",
+    );
+    expect(activates.length).toBe(1);
+    expect(Object.keys(activates[0].msg).sort(), "exactly {type, gesture}").toEqual([
+      "gesture",
+      "type",
+    ]);
+    expect(activates[0].msg.gesture, "closed gesture value").toBe("pane-activate");
+  });
+
+  it("targets the captured host origin (never '*')", () => {
+    window.dispatchEvent(new Event("focus"));
+    const activates = posted.filter(
+      (p) => p.msg.type === "host-gesture" && p.msg.gesture === "pane-activate",
+    );
+    expect(activates[0].origin, "origin-bound to handshake origin").toBe(HOST_ORIGIN);
+  });
+
+  it("throttle: once per focus session — repeated focus does not re-post", () => {
+    window.dispatchEvent(new Event("focus"));
+    window.dispatchEvent(new Event("focus"));
+    window.dispatchEvent(new Event("focus"));
+    expect(activateCount(posted), "one post per focus session").toBe(1);
+  });
+
+  it("throttle: repeated pointerdowns in one session post only once", () => {
+    sendTap();
+    sendTap();
+    sendTap();
+    sendTap();
+    expect(activateCount(posted), "many taps → one activate").toBe(1);
+  });
+
+  it("blur resets the session: a new focus after blur posts again", () => {
+    window.dispatchEvent(new Event("focus"));
+    expect(activateCount(posted)).toBe(1);
+    // Focus lost → the next regain is a new session eligible to post again.
+    window.dispatchEvent(new Event("blur"));
+    window.dispatchEvent(new Event("focus"));
+    expect(activateCount(posted), "blur+refocus → second post").toBe(2);
+  });
+
+  it("debounce backstop: a blur+refocus within the debounce window is coalesced", () => {
+    // NOTE: the implementation uses a pure focus-session throttle (option (a)),
+    // NOT a time-based debounce — so a blur+refocus posts again immediately
+    // (each focus session posts once). This test pins that choice: the host
+    // no-ops when the pane is already active, so the immediate re-post is
+    // harmless, and a time-based debounce was deliberately dropped to avoid
+    // over-suppressing a genuine blur-then-refocus.
+    window.dispatchEvent(new Event("focus"));
+    expect(activateCount(posted)).toBe(1);
+    window.dispatchEvent(new Event("blur"));
+    // Immediate refocus (no time advance): a new session → posts again.
+    window.dispatchEvent(new Event("focus"));
+    expect(activateCount(posted), "immediate refocus → posts (pure session throttle)").toBe(2);
+  });
+
+  it("does not post before the host handshake landed (uncaptured origin)", () => {
+    // Fresh recognizer with NO handshake: hostOrigin stays null → activate drops.
+    dispose?.();
+    posted.length = 0;
+    const fake = makeFakeParent();
+    parent = fake.parent;
+    posted = fake.posted;
+    Object.defineProperty(window, "parent", { configurable: true, get: () => parent });
+    dispose = startHostGesture();
+    window.dispatchEvent(new Event("focus"));
+    sendTap();
+    expect(activateCount(posted), "no post before handshake").toBe(0);
+    sendFromParent(parent, { type: "vh-host-handshake", nonce: "n2" });
+    window.dispatchEvent(new Event("focus"));
+    expect(activateCount(posted), "posts after handshake").toBe(1);
+  });
+
+  it("ignores a handshake from a non-parent source (no captured origin → no post)", () => {
+    // Fresh recognizer: an alien claims the handshake → ignored, hostOrigin null.
+    dispose?.();
+    posted.length = 0;
+    const fake = makeFakeParent();
+    parent = fake.parent;
+    posted = fake.posted;
+    Object.defineProperty(window, "parent", { configurable: true, get: () => parent });
+    dispose = startHostGesture();
+    const alien = {} as Window;
+    sendFromParent(alien, { type: "vh-host-handshake", nonce: "x" });
+    window.dispatchEvent(new Event("focus"));
+    sendTap();
+    expect(activateCount(posted), "alien handshake → no captured origin → no post").toBe(0);
+  });
+
+  it("coexists with triple-tap: one activate on the sequence, not three", () => {
+    // A triple-tap sequence (3 taps) posts ONE activate (on the first tap, then
+    // throttled) + ONE overlay-request (on the third tap). The activate does not
+    // double-count across the sequence; the two recognizers do not conflict.
+    sendTap();
+    sendTap();
+    const { preventDefault } = sendTap();
+    expect(activateCount(posted), "exactly one activate for the sequence").toBe(1);
+    expect(overlayCount(posted), "triple-tap still recognized").toBe(1);
+    expect(preventDefault, "triple-tap 3rd-tap preventDefault intact").toHaveBeenCalled();
+  });
+
+  it("fires on an interactive-element pointerdown (tapping a button activates the pane)", () => {
+    // The activate listener deliberately does NOT share the triple-tap
+    // recognizer's interactive-element ignore list: tapping a button in pane X
+    // means pane X should be active. (The triple-tap recognizer ignores it; the
+    // activate forward does not.)
+    const btn = document.createElement("button");
+    document.body.appendChild(btn);
+    sendTap({ target: btn });
+    expect(activateCount(posted), "button tap → activate posted").toBe(1);
+    btn.remove();
+  });
+
+  it("NOT suppressed by keyboard-focus mode (the operator is interacting with this pane)", () => {
+    // Unlike triple-tap (suppressed while typing so a stray tap doesn't yank the
+    // layout), activate fires regardless: even with the soft keyboard up, the
+    // operator tapping into this pane means this pane should be the active one.
+    sendFromParent(parent, { type: "host-mode", mode: "keyboard-focus" });
+    sendTap();
+    expect(activateCount(posted), "keyboard-focus active → activate still fires").toBe(1);
   });
 });
