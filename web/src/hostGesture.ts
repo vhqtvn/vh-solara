@@ -109,20 +109,21 @@ export interface HostGestureMessage {
  * Gesture recognizer: idempotent-on-recognition (recognitions do not stack; a
  * second recognition simply posts again — the host re-anchors its overlay).
  *
- * Activate forward: throttled to ONCE PER FOCUS SESSION (prompt option (a):
- * "post at most once per focus session"). A `window.focus` or
- * `document.pointerdown` posts at most one activate until `window.blur` resets
- * the session (focus lost + regained posts again). This handles every real
- * case: a desktop click-into-pane fires focus (then its pointerdown is a
- * no-op); a mobile tap fires pointerdown (focus may not fire); repeated taps in
- * the same pane stay at one post; tapping another pane blurs this document
- * (reset) and focuses that one (its own session). The host no-ops when the
- * source pane is already active, so residual duplicate posts are harmless. The
- * activate listener is SEPARATE from the triple-tap pointerdown recognizer (it
- * fires on the first pointerdown of a sequence; the triple-tap recognizer
- * independently counts — no double-count). Taps on interactive elements STILL
- * activate the pane (tapping a button in pane X means pane X should be active);
- * the activate listener deliberately does NOT share the triple-tap recognizer's
+ * Activate forward: forwards on EVERY focus / pointerdown (NO throttle). The
+ * host idempotently no-ops when the source pane is already the focused pane, so
+ * redundant forwards are harmless and keep the effective volume single-per-
+ * activation. This handles every real case: a desktop click-into-pane fires
+ * focus (and its pointerdown forwards again — the host dedupes); a mobile tap
+ * fires pointerdown (focus may not fire); repeated taps in the same pane each
+ * forward (host dedupes). A prior once-per-focus-session throttle (reset on
+ * window.blur) was REMOVED — the cross-origin window.blur that reset it is not
+ * reliably delivered on real touch, so a re-activated pane could stay throttled
+ * and never notify the host (operator report m0317). The activate listener is
+ * SEPARATE from the triple-tap pointerdown recognizer (it fires on every
+ * pointerdown; the triple-tap recognizer independently counts — the host
+ * dedupes the per-tap forwards). Taps on interactive elements STILL activate
+ * the pane (tapping a button in pane X means pane X should be active); the
+ * activate listener deliberately does NOT share the triple-tap recognizer's
  * interactive-element ignore list.
  *
  * No-op when standalone. Returns a disposer that removes the listeners (the
@@ -195,26 +196,30 @@ export function startHostGesture(): (() => void) | undefined {
   // host calls focusPane(sourcePaneId) → the indicator + statusbar move. Same
   // security model as the overlay request (captured origin, closed payload).
   //
-  // THROTTLE: once per FOCUS SESSION (prompt option (a)). `activatePosted` is
-  // set on the first post and cleared on `window.blur` (focus lost). A regained
-  // focus / new pointerdown after blur posts again. The host no-ops when the
-  // source pane is already active, so residual duplicate posts are harmless;
-  // the throttle governs message VOLUME, not correctness. (A time-based
-  // debounce was considered and dropped: the session flag alone covers dual
-  // focus+pointerdown triggers, cross-pane switches, and intra-pane taps, and a
-  // debounce would over-suppress a genuine blur-then-refocus.)
+  // NO THROTTLE: every focus / pointerdown forwards. The host IDEMPOTENTLY
+  // no-ops when the source pane is already the focused pane (routeMessage's
+  // focusedId()===paneId early return — zero mutation: no overlay dismiss, no
+  // focusPane call), so redundant forwards are harmless. A prior once-per-focus-
+  // session throttle (an `activatePosted` flag reset on window.blur) was REMOVED
+  // (operator report m0317): the cross-origin window.blur that reset it is NOT
+  // reliably delivered on real touch (notably Edge Android) when focus moves
+  // between sibling iframes, so a pane previously activated could keep its flag
+  // stuck → its next tap forwarded nothing → the host never re-activated it →
+  // the focus indicator + statusbar stayed on the stale pane. Forwarding
+  // unconditionally removes that failure surface; the host dedup keeps the
+  // effective message volume single-per-activation. (A time-based debounce was
+  // also considered and dropped: its reset/expire signal is no more reliable
+  // cross-origin than window.blur, and it would re-introduce a suppression
+  // window that can drop a genuine activation.)
   //
   // COEXISTENCE WITH TRIPLE-TAP: the activate listener is on `document`; the
   // triple-tap recognizer is on `window`. Both fire on the same pointerdown but
   // neither calls stopPropagation/preventDefault on the early taps, so they do
-  // not conflict. The activate posts ONCE on the first pointerdown of a focus
-  // session (subsequent taps in the session are no-ops) — it does not double-
-  // count across a triple-tap sequence. Taps on interactive elements STILL
-  // activate the pane (tapping a button in pane X means pane X should be
-  // active); the activate listener deliberately does NOT consult the triple-tap
-  // recognizer's interactive-element ignore list.
-  let activatePosted = false; // has activate posted in the current focus session?
-
+  // not conflict. Each pointerdown of a triple-tap sequence forwards one
+  // activate (the host dedupes when the pane is already focused). Taps on
+  // interactive elements STILL activate the pane (tapping a button in pane X
+  // means pane X should be active); the activate listener deliberately does NOT
+  // consult the triple-tap recognizer's interactive-element ignore list.
   const postActivate = (): void => {
     if (hostOrigin === null) return; // same handshake gate as the overlay request
     const msg: HostGestureMessage = {
@@ -229,33 +234,18 @@ export function startHostGesture(): (() => void) | undefined {
     }
   };
 
-  /** Post at most one activate per focus session. Resets on window.blur. No-op
-   *  before the handshake captured the host origin. */
-  const maybePostActivate = (): void => {
-    if (hostOrigin === null) return;
-    if (activatePosted) return; // once per focus session
-    activatePosted = true;
-    postActivate();
-  };
-
   // window.focus fires when the iframe (this document) gains focus — the
   // desktop click-into-pane path. pointerdown on document is more reliable on
-  // mobile (some engines fire focus unreliably on tap). Both feed the same
-  // throttled maybePostActivate so whichever fires first wins the session.
+  // mobile (some engines fire focus unreliably on tap). Both forward
+  // unconditionally; the host dedupes. No-op before the handshake captured the
+  // host origin (postActivate gates on hostOrigin).
   const onFocusActivate = (): void => {
-    maybePostActivate();
-  };
-  const onBlurActivate = (): void => {
-    // Focus left this document → a future regain is a new session eligible to
-    // post again. (window.blur fires when the operator taps another pane's
-    // iframe — this document loses focus, that pane's document gains it.)
-    activatePosted = false;
+    postActivate();
   };
   const onPointerDownActivate = (): void => {
-    maybePostActivate();
+    postActivate();
   };
   window.addEventListener("focus", onFocusActivate);
-  window.addEventListener("blur", onBlurActivate);
   document.addEventListener("pointerdown", onPointerDownActivate, false);
 
   // ---- desktop gesture: double bare-Ctrl ------------------------------------
@@ -447,7 +437,6 @@ export function startHostGesture(): (() => void) | undefined {
     window.removeEventListener("pointerup", onUpThreeFinger, false);
     window.removeEventListener("pointercancel", onUpThreeFinger, false);
     window.removeEventListener("focus", onFocusActivate);
-    window.removeEventListener("blur", onBlurActivate);
     document.removeEventListener("pointerdown", onPointerDownActivate, false);
   };
 }

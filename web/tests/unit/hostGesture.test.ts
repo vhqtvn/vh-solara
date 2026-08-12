@@ -523,9 +523,11 @@ describe("host gesture — mobile triple-tap", () => {
 // The SPA forwards a `{type:"host-gesture", gesture:"pane-activate"}` signal
 // when it gains focus / receives a pointerdown so the host can call focusPane
 // (a tap inside a cross-origin iframe does not bubble to the host, so Dockview's
-// native onDidActivePanelChange never fires). Throttled to once per focus
-// session; closed payload; captured-origin targeting (never '*'); source-guard
-// on the handshake. Mirrors the gesture recognizer's security model exactly.
+// native onDidActivePanelChange never fires). Forwarding is UNCONDITIONAL (no
+// once-per-focus-session throttle — that throttle's window.blur reset was
+// cross-origin-unreliable on real touch, m0317; the host dedupes when the pane
+// is already focused); closed payload; captured-origin targeting (never '*');
+// source-guard on the handshake. Mirrors the gesture recognizer's security model.
 
 describe("host gesture — pane-activate forward", () => {
   let parent: Window;
@@ -580,43 +582,37 @@ describe("host gesture — pane-activate forward", () => {
     expect(activates[0].origin, "origin-bound to handshake origin").toBe(HOST_ORIGIN);
   });
 
-  it("throttle: once per focus session — repeated focus does not re-post", () => {
+  it("every focus forwards (no session throttle — host dedupes the duplicate)", () => {
+    // The OLD once-per-focus-session throttle suppressed repeated focuses until a
+    // (cross-origin-unreliable) window.blur reset it. Removed (m0317): forwarding
+    // is now unconditional; the host no-ops when the pane is already focused.
     window.dispatchEvent(new Event("focus"));
     window.dispatchEvent(new Event("focus"));
     window.dispatchEvent(new Event("focus"));
-    expect(activateCount(posted), "one post per focus session").toBe(1);
+    expect(activateCount(posted), "each focus forwards").toBe(3);
   });
 
-  it("throttle: repeated pointerdowns in one session post only once", () => {
+  it("every pointerdown forwards (no session throttle — host dedupes)", () => {
     sendTap();
     sendTap();
     sendTap();
     sendTap();
-    expect(activateCount(posted), "many taps → one activate").toBe(1);
+    expect(activateCount(posted), "each tap forwards").toBe(4);
   });
 
-  it("blur resets the session: a new focus after blur posts again", () => {
+  it("blur is a no-op: forwarding is unconditional (no blur reset, no debounce)", () => {
+    // Pins two invariants at once: (1) window.blur no longer participates in
+    // activation logic, so a future refactor cannot silently re-introduce the
+    // cross-origin-unreliable reset; (2) there is no time-based debounce either
+    // (a debounce's expire signal would be no more reliable cross-origin than
+    // window.blur, and could drop a genuine activation). An immediate refocus
+    // forwards unconditionally.
     window.dispatchEvent(new Event("focus"));
     expect(activateCount(posted)).toBe(1);
-    // Focus lost → the next regain is a new session eligible to post again.
-    window.dispatchEvent(new Event("blur"));
+    window.dispatchEvent(new Event("blur")); // no effect on forwarding
+    expect(activateCount(posted), "blur did not change the count").toBe(1);
     window.dispatchEvent(new Event("focus"));
-    expect(activateCount(posted), "blur+refocus → second post").toBe(2);
-  });
-
-  it("debounce backstop: a blur+refocus within the debounce window is coalesced", () => {
-    // NOTE: the implementation uses a pure focus-session throttle (option (a)),
-    // NOT a time-based debounce — so a blur+refocus posts again immediately
-    // (each focus session posts once). This test pins that choice: the host
-    // no-ops when the pane is already active, so the immediate re-post is
-    // harmless, and a time-based debounce was deliberately dropped to avoid
-    // over-suppressing a genuine blur-then-refocus.
-    window.dispatchEvent(new Event("focus"));
-    expect(activateCount(posted)).toBe(1);
-    window.dispatchEvent(new Event("blur"));
-    // Immediate refocus (no time advance): a new session → posts again.
-    window.dispatchEvent(new Event("focus"));
-    expect(activateCount(posted), "immediate refocus → posts (pure session throttle)").toBe(2);
+    expect(activateCount(posted), "refocus forwards unconditionally").toBe(2);
   });
 
   it("does not post before the host handshake landed (uncaptured origin)", () => {
@@ -652,15 +648,16 @@ describe("host gesture — pane-activate forward", () => {
     expect(activateCount(posted), "alien handshake → no captured origin → no post").toBe(0);
   });
 
-  it("coexists with triple-tap: one activate on the sequence, not three", () => {
-    // A triple-tap sequence (3 taps) posts ONE activate (on the first tap, then
-    // throttled) + ONE overlay-request (on the third tap). The activate does not
-    // double-count across the sequence; the two recognizers do not conflict.
+  it("coexists with triple-tap: each tap forwards one activate (host dedupes), overlay still recognizes", () => {
+    // A triple-tap sequence (3 taps) now forwards THREE activates (one per tap —
+    // forwarding is unconditional) + ONE overlay-request (on the third tap). The
+    // host dedupes the per-tap activate forwards when the pane is already
+    // focused; the two recognizers do not conflict (no double overlay-request).
     sendTap();
     sendTap();
     const { preventDefault } = sendTap();
-    expect(activateCount(posted), "exactly one activate for the sequence").toBe(1);
-    expect(overlayCount(posted), "triple-tap still recognized").toBe(1);
+    expect(activateCount(posted), "one activate per tap (host dedupes)").toBe(3);
+    expect(overlayCount(posted), "triple-tap still recognized (single overlay)").toBe(1);
     expect(preventDefault, "triple-tap 3rd-tap preventDefault intact").toHaveBeenCalled();
   });
 
@@ -683,6 +680,27 @@ describe("host gesture — pane-activate forward", () => {
     sendFromParent(parent, { type: "host-mode", mode: "keyboard-focus" });
     sendTap();
     expect(activateCount(posted), "keyboard-focus active → activate still fires").toBe(1);
+  });
+
+  // REGRESSION (operator report m0317): "i focused to a panel but root's focus
+  // doesn't change to the new pane, but at rare chance." The OLD once-per-focus-
+  // session throttle (activatePosted) reset ONLY on window.blur. The cross-origin
+  // window.blur is NOT reliably delivered on real touch (Edge Android) when focus
+  // moves between sibling iframes, so a pane previously activated kept
+  // activatePosted stuck true → its NEXT tap forwarded nothing → the host never
+  // re-activated it → focusedId stayed on the stale pane. Headless jsdom models
+  // "no blur delivered" by simply NOT firing blur — which is exactly the on-device
+  // failure condition. This is the deterministic red for that bug.
+  it("REGRESSION (m0317): re-activation WITHOUT an intervening blur still forwards", () => {
+    // First activation (a tap into this pane from elsewhere): forwards.
+    sendTap();
+    expect(activateCount(posted), "first activation forwards").toBe(1);
+    // NO blur event is fired here — modeling the cross-origin blur-suppression
+    // that happens on real Edge Android when focus moved away and back.
+    // The SECOND activation MUST still forward (the host dedupes if this pane is
+    // already focused; the SPA must not pre-suppress it).
+    sendTap();
+    expect(activateCount(posted), "no-blur re-activation still forwards (no throttle)").toBe(2);
   });
 });
 
