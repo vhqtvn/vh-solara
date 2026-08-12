@@ -1,5 +1,10 @@
 import type { DockviewApi } from "dockview-core";
-import { activeWorkspaceId, workspaceApiFor } from "./dockview/store";
+import {
+  activeWorkspaceId,
+  configuredOriginFor,
+  lookupContentWindow,
+  workspaceApiFor,
+} from "./dockview/store";
 
 // =============================================================================
 // HOST-OWNED KEYBOARD FOCUS-MODE
@@ -103,6 +108,11 @@ function applyOpen(height: number, offsetTop: number): void {
   keyboardOpen = true;
   applyGeometry(height, offsetTop);
   maximizeActive();
+  // Tell the embedded SPA focus-mode is active so it suppresses its triple-tap
+  // layout gesture while the operator is typing. See web/src/hostGesture.ts for
+  // why the SPA cannot infer this from its own visualViewport (the host shrinks
+  // the iframe element, so the iframe's own vv/innerHeight ratio stays ~1.0).
+  postHostMode("keyboard-focus");
 }
 
 /** Apply the keyboard-close state: restore the host root (height + transform)
@@ -111,6 +121,24 @@ function applyClose(): void {
   keyboardOpen = false;
   restoreGeometry();
   exitOwned();
+  postHostMode("normal");
+}
+
+/** Post the host-mode signal to the ACTIVE workspace's active pane. Targeted at
+ *  the pane's configured origin (never '*'); no-op when there is no active pane
+ *  or its origin/contentWindow is unbound (e.g. a freshly-created workspace). */
+function postHostMode(mode: "keyboard-focus" | "normal"): void {
+  const api = workspaceApiFor(activeWorkspaceId());
+  const paneId = api?.activePanel?.id;
+  if (!paneId) return;
+  const cw = lookupContentWindow(paneId);
+  const origin = configuredOriginFor(paneId);
+  if (!cw || !origin) return;
+  try {
+    cw.postMessage({ type: "host-mode", mode }, origin);
+  } catch {
+    /* pane gone — ignore */
+  }
 }
 
 /** P3: read whether keyboard focus-mode is currently open. Used by the NEXT

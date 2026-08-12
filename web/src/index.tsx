@@ -19,6 +19,7 @@ import { startPresence } from "./alerts";
 import { startHeartbeat } from "./heartbeat";
 import { startStatusEmitter } from "./statusEmitter";
 import { startSelectListener } from "./selectListener";
+import { startHostGesture } from "./hostGesture";
 import { refreshProjectSettings } from "./projectSettings";
 import "./styles/main.css";
 
@@ -97,6 +98,15 @@ if (standalone === "code") {
   // SPA-INTERNAL route change (setSelectedId/switchProject) — the iframe element
   // + src are NEVER touched. See web/src/selectListener.ts.
   startSelectListener();
+  // Host gesture recognizer (no-op when standalone). Same embed gate +
+  // captured-origin security pattern as the heartbeat/status/select bridges.
+  // When embedded, recognizes a double-Ctrl (desktop) / triple-tap (mobile)
+  // gesture and forwards ONE closed postMessage intent
+  // ({type:"host-gesture", gesture:"layout-overlay-request"}) so the host can
+  // open its layout overlay anchored to the source pane. The host derives the
+  // source pane from event.source — the SPA sends no IDs. See
+  // web/src/hostGesture.ts.
+  startHostGesture();
   startSync();
   // OpenCode lifecycle health polling (independent of the worker SSE stream):
   // the worker being reachable (state.status "live") only means the vh-solara

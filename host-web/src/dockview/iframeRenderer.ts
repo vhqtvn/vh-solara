@@ -71,12 +71,22 @@ export class IframeRenderer implements IContentRenderer {
 
   private buildDom(): void {
     this.element.innerHTML = "";
-    // Chromeless: body only. The focus border is drawn by the `.is-active`
-    // class on `.pane` (see pane.css) — a 2px accent outline, no title/buttons.
+    // Chromeless: body + a hidden overlay-source badge. The focus border is
+    // drawn by the `.is-active` class on `.pane` (see pane.css) — a 3px accent
+    // outline + a 5px top edge, no permanent header. The `.pane-badge`
+    // ("ACTIVE · <label>") is shown ONLY while the layout overlay is open for
+    // THIS pane (the LayoutOverlay component toggles `.is-overlay-source` on
+    // the matching `.pane` element imperatively); it is not a recreated header.
     const body = document.createElement("div");
     body.className = "pane-body";
     this.element.appendChild(body);
     this.body = body;
+
+    const badge = document.createElement("div");
+    badge.className = "pane-badge";
+    badge.setAttribute("aria-hidden", "true");
+    badge.textContent = `ACTIVE · ${this.params?.label ?? "server"}`;
+    this.element.appendChild(badge);
   }
 
   private buildIframe(): void {
@@ -155,9 +165,21 @@ export class IframeRenderer implements IContentRenderer {
     this.element.classList.toggle("is-maximized", s.maximized);
   }
 
-  /** Visual active focus border (host focus routing). */
+  /** Visual active focus border (host focus routing). Re-triggers a one-shot
+   *  opacity pulse on the focus indicator (the top-edge pseudo-element) when a
+   *  pane becomes active, ONCE per activation — so a focus change is glanceable
+   *  without a permanent animation (GPU-cheap: a 200ms opacity on a pseudo-
+   *  element; omitted under prefers-reduced-motion). */
   setActive(active: boolean): void {
     this.element.classList.toggle("is-active", active);
+    if (active) {
+      // Re-trigger the one-shot pulse by removing the class, forcing a reflow,
+      // then re-adding it (a finite CSS animation does not re-run on a no-op
+      // class toggle without an intervening reflow).
+      this.element.classList.remove("pane-focus-pulse");
+      void this.element.offsetWidth; // force reflow
+      this.element.classList.add("pane-focus-pulse");
+    }
   }
 
   /** Deliver host→pane focus/blur over the postMessage contract. */

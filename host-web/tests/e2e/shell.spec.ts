@@ -9,8 +9,10 @@ import * as H from "./util";
 //
 // Phase 1 (i3 host-shell): the per-pane header was REMOVED (panes are content +
 // focus-border only). Split/close/zoom/mode-switch are driven from the statusbar
-// control cluster (the touch fallback) or the keyboard (i3Keyboard.ts). The top
-// tabstrip is the WORKSPACE tabstrip again (ws-tab/ws-add present).
+// control cluster (the touch/mouse fallback). The Alt-based host keyboard
+// shortcuts were dropped (the host cannot see keys inside a cross-origin
+// iframe); the SPA gesture → host overlay is the interaction model now. The top
+// tabstrip is the WORKSPACE tabstrip (ws-tab/ws-add present).
 
 test.describe("host shell UI wiring", () => {
   test.beforeEach(async ({ page }) => {

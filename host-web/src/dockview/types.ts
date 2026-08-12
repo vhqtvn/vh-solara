@@ -132,7 +132,14 @@ export type PaneToHost =
       title: string;
       attention: Attention;
       activity: Activity;
-    };
+    }
+  // Layout-overlay gesture (double-Ctrl desktop / triple-tap mobile). The SPA
+  // forwards ONE closed intent when the operator gestures; the host derives the
+  // source pane from event.source (the pane's bound contentWindow) and IGNORES
+  // any sender-claimed id (there is none in this payload). NO other fields — no
+  // pane/server/dir IDs, no direction, no coordinates. See web/src/hostGesture.ts
+  // + the host-gesture branch of store.routeMessage.
+  | { type: "host-gesture"; gesture: "layout-overlay-request" };
 
 // Host → pane. `focus`/`blur` are the pre-existing host-focus routing. The
 // `vh-host-handshake` is the document-liveness challenge (see
@@ -141,12 +148,18 @@ export type PaneToHost =
 // reverse-nav command (see web/src/selectListener.ts): directs the embedded SPA
 // to switch to a specific {dir, session} via a survival-safe SPA-INTERNAL route
 // change (setSelectedId/switchProject) — the iframe src + element are NEVER
-// touched. Origin-scoped to the pane's configured origin (never '*').
+// touched. Origin-scoped to the pane's configured origin (never '*'). The
+// `host-mode` signal tells the SPA when the host's soft-keyboard focus-mode is
+// active so the SPA can suppress its triple-tap layout gesture while the
+// operator is typing (see web/src/hostGesture.ts + keyboardFocus.ts). All four
+// are host→pane (the SPA source-guards `ev.source === window.parent` before
+// acting on any of them).
 export type HostToPane =
   | { type: "focus" }
   | { type: "blur" }
   | { type: "vh-host-handshake"; nonce: string }
-  | { type: "vh-host-select"; dir: string; session: string };
+  | { type: "vh-host-select"; dir: string; session: string }
+  | { type: "host-mode"; mode: "keyboard-focus" | "normal" };
 
 // ---- document-liveness indicator (Q1-C) ------------------------------------
 // The on-screen per-pane indicator state derived from heartbeats. This is
@@ -181,6 +194,12 @@ export type SplitDir = "right" | "down";
  *  spatial nearest-neighbor lookup in hostController.focusDirection /
  *  moveDirection (bounding-box geometry, not Dockview's tree location). */
 export type FocusDir = "left" | "right" | "up" | "down";
+
+/** Cardinal split direction for the layout overlay arrows. Maps onto the
+ *  survival-safe addPanel `direction` vocabulary: above/left → "above"/"left"
+ *  (Dockview accepts these for the reference-panel split), right/below →
+ *  "right"/"below". See hostController.overlaySplit. */
+export type OverlaySplitDir = "above" | "right" | "below" | "left";
 
 /**
  * i3 container layout modes (Phase 1). The four i3 modes, mapped to Dockview:
@@ -300,6 +319,21 @@ export interface HostOps {
    *  direction (i3 Alt+Shift+Arrow move). Survival-safe (moveTo repositions the
    *  keep-mounted renderers). No-op when no neighbor lies in that direction. */
   moveDirection?(paneId: string, dir: FocusDir): void;
+  /**
+   * Open the layout overlay anchored to `paneId`'s group bounds. Focuses the
+   *  source pane (so the focus indicator + subsequent split/swap target it),
+   *  then activates the overlay. Idempotent: a second open while already open
+   *  re-anchors to the new source (no stacking). No-op when the pane is not in
+   *  the active workspace. The statusbar Layout button (production-capable) and
+   *  the host-gesture router both route through this. */
+  openLayoutOverlay?(paneId: string): void;
+  /** Close the layout overlay (clears the source anchor). Always safe. */
+  closeLayoutOverlay?(): void;
+  /**
+   * Split the overlay's source pane in a cardinal direction (the overlay arrow
+   *  path). `dir` is the cardinal direction. Survival-safe (addPanel relative
+   *  to the source; renderer:'always'). Returns the new pane id or null. */
+  overlaySplit?(paneId: string, dir: OverlaySplitDir): string | null;
 }
 
 /** State pushed to a pane's header so it can reflect tray/zoom affordances. */

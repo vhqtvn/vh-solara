@@ -4,7 +4,14 @@ import * as path from "node:path";
 import * as H from "./util";
 
 /**
- * Phase 1 i3 host-shell — feature e2e (items 2-7) + vision screenshots.
+ * Phase 1 i3 host-shell — feature e2e (items 2-7, minus the dropped keyboard
+ * shortcuts) + vision screenshots.
+ *
+ * The Alt-based host keyboard shortcuts (Item 4) were REMOVED in favor of the
+ * SPA gesture → host overlay model (the host cannot see keys inside a cross-
+ * origin iframe). The gesture/overlay interaction is covered by
+ * interaction-overlay.spec.ts; this file keeps the layout-mode / persistence /
+ * statusbar / popover coverage that remains valid.
  *
  * One test per feature, each capturing a screenshot at the key state under
  * tmp/host-web-playwright/vision/i3/ (gitignored). Item 1 (workspace tabstrip)
@@ -84,48 +91,6 @@ test.describe("i3 host-shell Phase 1", () => {
     await expect.poll(async () => (await H.panes(page)).length).toBe(before + 1);
 
     await page.screenshot({ path: path.join(VISION_DIR, "03-statusbar-cluster.png"), fullPage: true });
-  });
-
-  // ---- Item 4: keyboard shortcuts (i3-style, Alt modifier) ------------------
-  test("keyboard shortcuts: focus/split/mode/zoom/close", async ({ page }) => {
-    // Ensure host-document focus (not a cross-origin iframe) so the window
-    // keydown listener receives the keystrokes. Clicking the statusbar is a
-    // harmless host-chrome focus grab.
-    await page.locator('[data-testid="statusbar"]').click();
-
-    const startIds = await H.panes(page);
-    const startFocused = await H.focused(page);
-    expect(startFocused).not.toBeNull();
-
-    // Alt+H → split right (a new pane appears to the right AND becomes focused).
-    await page.keyboard.press("Alt+h");
-    await expect.poll(async () => (await H.panes(page)).length).toBe(startIds.length + 1);
-    const afterSplit = await H.focused(page);
-    expect(afterSplit, "split focused the new pane").not.toBe(startFocused);
-
-    // Alt+ArrowLeft → focus the pane to the LEFT of the new pane (= the origin).
-    await page.keyboard.press("Alt+ArrowLeft");
-    await expect.poll(async () => H.focused(page)).toBe(startFocused);
-
-    // Alt+F → zoom (maximize the focused group); Alt+F again exits.
-    await page.keyboard.press("Alt+f");
-    await expect.poll(async () => H.isMaximized(page)).toBe(true);
-    await page.keyboard.press("Alt+f");
-    await expect.poll(async () => H.isMaximized(page)).toBe(false);
-
-    // Alt+W → tabbed mode on the focused group (records headerPosition 'top').
-    await page.keyboard.press("Alt+w");
-    const focusedNow = await H.focused(page);
-    expect(focusedNow).not.toBeNull();
-    const g = await H.groupOf(page, focusedNow!);
-    expect(g?.headerPosition ?? "top").toBe("top");
-
-    // Alt+Shift+Q → close the focused pane.
-    const beforeClose = (await H.panes(page)).length;
-    await page.keyboard.press("Alt+Shift+q");
-    await expect.poll(async () => (await H.panes(page)).length).toBe(beforeClose - 1);
-
-    await page.screenshot({ path: path.join(VISION_DIR, "04-keyboard.png"), fullPage: true });
   });
 
   // ---- Item 5: i3 layout modes (split-h / split-v / tabbed / stacked) --------

@@ -101,6 +101,33 @@
   }
 }
 
+/* ---- layout overlay button (production-capable statusbar fallback) --------- */
+.layoutBtn {
+  appearance: none;
+  border: 1px solid var(--border);
+  background: var(--bg-elev);
+  color: var(--fg);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+  padding: 4px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+.layoutBtn:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.layoutBtn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.layoutBtn:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+}
+
 /* ---- i3 control cluster (Phase 1 touch fallback for the keyboard shortcuts) -- */
 .cluster {
   display: inline-flex;

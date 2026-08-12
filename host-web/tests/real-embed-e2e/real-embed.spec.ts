@@ -276,4 +276,84 @@ test.describe("lane 8: real SPA cross-origin iframe embed", () => {
     const realFrames = page.frames().filter((f) => f.url().startsWith(REAL));
     expect(realFrames.length, "split added a new real-origin frame").toBeGreaterThanOrEqual(2);
   });
+
+  // ===========================================================================
+  // GESTURE ROUND-TRIP (Slice 1 interaction model). The REAL production SPA's
+  // hostGesture.ts (web/src/hostGesture.ts) recognizes a double-Ctrl (desktop)
+  // / triple-tap (mobile) gesture INSIDE the cross-origin iframe + forwards ONE
+  // closed {type:"host-gesture"} postMessage to the host. The host derives the
+  // source pane from event.source (the iframe's contentWindow) + opens its
+  // layout overlay anchored to that pane. This is the FIRST lane to prove the
+  // full gesture→overlay round-trip with the REAL SPA (the mock-content lane-7
+  // interaction-overlay spec proves the host side with a probe; this proves the
+  // SPA side emits for real).
+  //
+  // The gestures are driven via frame.evaluate dispatch (runs in the iframe's
+  // REAL window context, hitting hostGesture.ts's REAL listeners) for CI
+  // determinism — cross-origin keyboard/pointer hardware routing through
+  // Playwright is flaky. This still exercises the REAL recognizer + REAL
+  // postMessage (origin-bound to the captured host) + REAL host routeMessage +
+  // REAL overlay open. The only abstraction is the browser's hardware-event
+  // generation (a Playwright concern, not a product concern).
+  // ===========================================================================
+
+  test("real SPA double-Ctrl gesture → host overlay opens for the source pane", async ({ page }) => {
+    await page.goto("/");
+    const frame = await firstRealFrame(page);
+    await waitForSpaMounted(frame);
+    const id = await firstRealPaneId(page);
+    await waitForRealAlive(page, id);
+    expect(await H.overlaySource(page), "overlay closed before the gesture").toBeNull();
+
+    // Drive a double bare-Ctrl inside the real SPA's window. The recognizer
+    // counts two non-repeated Control keydowns within 450ms → posts ONE
+    // {type:"host-gesture", gesture:"layout-overlay-request"} to the captured
+    // host origin (the handshake origin = localhost:5183, never '*').
+    await frame.evaluate(() => {
+      const fire = (key: string): void => {
+        window.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true }));
+      };
+      fire("Control");
+      fire("Control");
+    });
+
+    // The host derived the source pane from event.source (this iframe's
+    // contentWindow) + opened the overlay anchored to it.
+    await expect
+      .poll(async () => H.overlaySource(page), { timeout: 10000, message: "overlay opened for the real-SPA source pane" })
+      .toBe(id);
+    await expect(page.locator('[data-testid="layout-overlay-card"]')).toBeVisible();
+    // The source pane carries the overlay-source focus badge.
+    await expect(page.locator(`.pane[data-pane-id="${id}"].is-overlay-source`)).toHaveCount(1);
+    await H.closeLayoutOverlay(page);
+  });
+
+  test("real SPA triple-tap gesture → host overlay opens for the source pane", async ({ page }) => {
+    await page.goto("/");
+    const frame = await firstRealFrame(page);
+    await waitForSpaMounted(frame);
+    const id = await firstRealPaneId(page);
+    await waitForRealAlive(page, id);
+    expect(await H.overlaySource(page), "overlay closed before the gesture").toBeNull();
+
+    // Drive three primary-pointer taps in place inside the real SPA's window.
+    // The recognizer counts three pointerdowns within 600ms + within 12px →
+    // posts ONE {type:"host-gesture", gesture:"layout-overlay-request"}.
+    await frame.evaluate(() => {
+      const fire = (x: number, y: number): void => {
+        const ev = new PointerEvent("pointerdown", { clientX: x, clientY: y, bubbles: true });
+        Object.defineProperty(ev, "isPrimary", { value: true, configurable: true });
+        window.dispatchEvent(ev);
+      };
+      fire(10, 10);
+      fire(10, 10);
+      fire(10, 10);
+    });
+
+    await expect
+      .poll(async () => H.overlaySource(page), { timeout: 10000, message: "overlay opened for the real-SPA source pane (triple-tap)" })
+      .toBe(id);
+    await expect(page.locator('[data-testid="layout-overlay-card"]')).toBeVisible();
+    await H.closeLayoutOverlay(page);
+  });
 });

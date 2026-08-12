@@ -2,6 +2,7 @@ import { For, Show, createEffect, onCleanup, onMount } from "solid-js";
 import { DockviewHost } from "./dockview/DockviewHost";
 import { Tabstrip } from "./shell/Tabstrip";
 import { Statusbar } from "./shell/Statusbar";
+import { LayoutOverlay } from "./shell/LayoutOverlay";
 import {
   activeWorkspaceId,
   hostOps,
@@ -15,7 +16,6 @@ import {
   onWorkspaceActivated,
   uninstallKeyboardFocus,
 } from "./keyboardFocus";
-import { installI3Keyboard, uninstallI3Keyboard } from "./i3Keyboard";
 import s from "./App.module.css";
 
 /**
@@ -45,6 +45,12 @@ export function App() {
   // height on keyboard-open so the focused pane's iframe element shrinks to the
   // visible area (the host owns keyboard behavior — see keyboardFocus.ts).
   let appRoot!: HTMLDivElement;
+  // Ref to `<main>` — the positioning context for the layout overlay (its
+  // capture layer is scoped to main so the statusbar stays clickable).
+  let mainEl!: HTMLElement;
+  // Last-seen active workspace id (for the workspace-switch overlay-dismissal
+  // effect). Instance-scoped so the effect can detect a genuine change.
+  let lastActiveWs: string | null = null;
   const trayPanes = () => {
     const ids = trayIds();
     return panes().filter((p) => ids.includes(p.id));
@@ -59,11 +65,9 @@ export function App() {
   // bound by the time the accessor fires.
   onMount(() => {
     installKeyboardFocus(() => appRoot);
-    installI3Keyboard();
   });
   onCleanup(() => {
     uninstallKeyboardFocus();
-    uninstallI3Keyboard();
   });
 
   // While the keyboard is open and the operator switches workspace, re-point
@@ -75,10 +79,23 @@ export function App() {
     onWorkspaceActivated();
   });
 
+  // Workspace-switch dismissal: the layout overlay is an active-workspace UI;
+  // switching workspaces dismisses it. (CSS-visibility-only switch never reloads
+  // iframes — closing the overlay is a pure signal clear + class swap.) Tracks
+  // activeWorkspaceId; clears the overlay on a change.
+  createEffect(() => {
+    const prev = lastActiveWs;
+    const cur = activeWorkspaceId();
+    lastActiveWs = cur;
+    if (prev !== null && prev !== cur) {
+      hostOps()?.closeLayoutOverlay?.();
+    }
+  });
+
   return (
     <div class={s.app} ref={appRoot} data-testid="host-app-root">
       <Tabstrip />
-      <main class={s.main}>
+      <main class={s.main} ref={mainEl}>
         {/* The overlay stack: one permanently-mounted host per workspace.
             SolidJS <For> preserves each host by referential identity of the
             workspace object. The store (a SolidJS store array, not a plain
@@ -111,6 +128,10 @@ export function App() {
             </div>
           </div>
         </Show>
+        {/* Layout overlay (gesture / statusbar button). Rendered inside <main>
+            so its pointer-capture layer is scoped to the pane grid — the
+            statusbar (NEXT + Layout button) stays clickable while it is open. */}
+        <LayoutOverlay mainEl={() => mainEl} />
       </main>
       <Show when={trayPanes().length > 0}>
         <div class={s.trayRail}>

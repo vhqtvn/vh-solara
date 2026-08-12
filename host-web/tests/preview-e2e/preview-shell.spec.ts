@@ -30,23 +30,21 @@ test.describe("host shell — production build (vite preview)", () => {
   });
 
   test("production build has NO window.__host (and no DEV bridges)", async ({ page }) => {
-    // The DEV-only test bridges (host + keyboard-focus + i3-keys) and their
-    // destructive hooks must be entirely absent from the running production app.
+    // The DEV-only test bridges (host + keyboard-focus) and their destructive
+    // hooks must be entirely absent from the running production app. (The i3-keys
+    // bridge was removed when the Alt-shortcut module was dropped.)
     const hasBridge = await page.evaluate(() => {
       const w = window as unknown as {
         __host?: unknown;
         __hostKbdFocus?: unknown;
-        __hostI3Keys?: unknown;
       };
       return {
         host: typeof w.__host !== "undefined",
         kbdFocus: typeof w.__hostKbdFocus !== "undefined",
-        i3Keys: typeof w.__hostI3Keys !== "undefined",
       };
     });
     expect(hasBridge.host, "window.__host must be absent in production").toBe(false);
     expect(hasBridge.kbdFocus, "window.__hostKbdFocus must be absent in production").toBe(false);
-    expect(hasBridge.i3Keys, "window.__hostI3Keys must be absent in production").toBe(false);
   });
 
   test("production tabstrip HAS workspace chrome (ws-tab/ws-add present)", async ({ page }) => {
@@ -92,6 +90,27 @@ test.describe("host shell — production build (vite preview)", () => {
     await expect
       .poll(async () => page.locator("iframe.pane-iframe").count())
       .toBe(before + 1);
+  });
+
+  test("Layout button (production fallback) opens the overlay + arrow splits", async ({ page }) => {
+    // The Layout button is the always-reliable production fallback for the
+    // gesture fast path. It routes through hostOps().openLayoutOverlay (NOT
+    // window.__host, which is correctly absent here). Clicking it opens the
+    // overlay for the focused pane; an arrow splits.
+    const btn = page.locator('[data-testid="layout-overlay-btn"]');
+    // A focused pane exists → the button is enabled.
+    await expect(btn).toBeEnabled();
+    await btn.click();
+    // The overlay card rendered (production bundle, no DEV bridge).
+    await expect(page.locator('[data-testid="layout-overlay-card"]')).toBeVisible();
+    // A split arrow adds a pane + auto-closes the overlay (DOM-only proof).
+    const before = await page.locator("iframe.pane-iframe").count();
+    await page.locator('[data-testid="layout-overlay-right"]').click();
+    await expect
+      .poll(async () => page.locator("iframe.pane-iframe").count())
+      .toBe(before + 1);
+    // The overlay auto-closed after the split.
+    await expect(page.locator('[data-testid="layout-overlay-card"]')).toHaveCount(0);
   });
 
   test("P3 attention hub renders in production; NEXT button absent when no needs-you", async ({ page }) => {

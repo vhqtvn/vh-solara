@@ -23,6 +23,22 @@ import {
 // SolidJS: components that read them inside a tracking scope re-render on
 // change. (Effects need a root — those live in the adapter component.)
 
+/**
+ * Closed-payload validator for the layout-overlay gesture. The message MUST be
+ * exactly `{type:"host-gesture", gesture:"layout-overlay-request"}` with no
+ * other fields (defense-in-depth: a poison field never reaches the focus +
+ * overlay action). Returns true iff the payload matches the closed shape.
+ */
+function isClosedHostGesture(data: unknown): boolean {
+  if (!data || typeof data !== "object") return false;
+  const obj = data as Record<string, unknown>;
+  if (obj.type !== "host-gesture") return false;
+  if (obj.gesture !== "layout-overlay-request") return false;
+  // Reject ANY unknown field (closed set). The two known keys are type+gesture.
+  const keys = Object.keys(obj);
+  return keys.length === 2 && keys.includes("type") && keys.includes("gesture");
+}
+
 // ============================================================================
 // MULTI-WORKSPACE MODEL
 //
@@ -320,8 +336,17 @@ const [runningCount, setRunningCount] = createSignal<number>(0);
 // see on the active grid — surfacing them on EVERY tab is the whole point.
 // Mirrors rankNeedy()'s pane→ws mapping (workspaceApiFor(wsId).panels).
 const [needsYouByWs, setNeedsYouByWs] = createSignal<Record<string, number>>({});
+// Layout overlay: the source pane id (in the ACTIVE workspace) whose bounds the
+// overlay is anchored to, or null when closed. Set by routeMessage on a valid
+// host-gesture (source-bound) and by HostOps.openLayoutOverlay (statusbar
+// button). Cleared by HostOps.closeLayoutOverlay, on workspace switch, and when
+// the source pane is removed (App.tsx effects). Workspace-scoped by construction
+// (only the active workspace's pane can be the source). The LayoutOverlay
+// component reads this + toggles the `.is-overlay-source` focus badge on the
+// matching pane element imperatively (see shell/LayoutOverlay.tsx).
+const [overlaySourcePaneId, setOverlaySourcePaneId] = createSignal<string | null>(null);
 
-export { panes, focusedId, trayIds, isMaximized, connected, needsYouCount, runningCount };
+export { panes, focusedId, trayIds, isMaximized, connected, needsYouCount, runningCount, overlaySourcePaneId };
 
 /** Needs-you count for a SPECIFIC workspace (its panes whose attention is
  *  needs_permission or needs_reply). Reactive: tracks needsYouByWs(). Returns 0
@@ -671,6 +696,24 @@ export function setMaximized(wsId: string, v: boolean): void {
   setIsMaximized(v);
 }
 
+// ---- layout overlay state (active-workspace-scoped) ------------------------
+// The overlay source pane lives in the ACTIVE workspace. openOverlayFor is
+// workspace-guarded (no-op when wsId is not active) so a stale/​background call
+// cannot project a hidden workspace's pane into the overlay. closeOverlay is
+// unconditional (always safe to clear).
+
+/** Open the layout overlay anchored to `paneId`. No-op when `wsId` is not the
+ *  active workspace (the overlay is a visible active-workspace UI). Idempotent:
+ *  re-anchoring (a second valid request while open) just swaps the source. */
+export function openOverlayFor(wsId: string, paneId: string): void {
+  if (wsId !== activeWorkspaceId()) return;
+  setOverlaySourcePaneId(paneId);
+}
+/** Close the layout overlay (clears the source pane id). Always safe. */
+export function closeOverlay(): void {
+  setOverlaySourcePaneId(null);
+}
+
 // `connected` is set internally by routeMessage (any heartbeat ever accepted).
 // It is INTERNAL — exported for read, never set from outside the store.
 
@@ -866,6 +909,29 @@ export function routeMessage(
         attention,
         activity,
       });
+      return { routed: true, paneId, accepted: true, reason: "accepted:non-heartbeat" };
+    }
+    case "host-gesture": {
+      // Layout-overlay gesture (double-Ctrl / triple-tap). CLOSED payload: the
+      // message MUST be exactly {type:"host-gesture", gesture:"layout-overlay-
+      // request"} with NO other fields (the host derives the source pane from
+      // event.source — there are no sender-claimed IDs, and a poison field must
+      // never reach the action). Reject any unknown field before acting.
+      if (!isClosedHostGesture(data)) {
+        return { routed: false, paneId: null, accepted: false, reason: "ignored-non-pane-to-host" };
+      }
+      // TRUST TIER: heartbeat/status tier (origin-checked). A forged overlay
+      // request would focus a pane + pop an overlay (an operator-action side
+      // effect), so source-binding alone (which a bound WindowProxy survives)
+      // is insufficient. Mirror the status branch's origin check exactly.
+      const expected = configuredOrigin.get(paneId);
+      if (expected !== undefined && origin !== expected) {
+        return { routed: true, paneId, accepted: false, reason: "rejected:origin-mismatch" };
+      }
+      // Activate the source pane + open the overlay. The pane is derived from
+      // event.source (already bound to paneId above); the payload carries no id
+      // and the host trusts none.
+      hostOps()?.openLayoutOverlay?.(paneId);
       return { routed: true, paneId, accepted: true, reason: "accepted:non-heartbeat" };
     }
     default:

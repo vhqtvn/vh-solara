@@ -729,8 +729,8 @@ export async function sameGroup(page: Page, a: string, b: string): Promise<boole
 }
 // ---- i3 layout-mode + directional ops (window.__host, DEV-only) ------------
 // Phase 1 i3 host-shell: drive the layout-mode switch + directional focus/move
-// through the SAME production HostOps path the statusbar cluster + i3Keyboard
-// use (hostOps().setLayoutMode / focusDirection / moveDirection). Also expose
+// through the SAME production HostOps path the statusbar cluster uses
+// (hostOps().setLayoutMode / focusDirection / moveDirection). Also expose
 // the group/orientation inspection hooks the modes e2e asserts on.
 
 export type LayoutMode = "split-h" | "split-v" | "tabbed" | "stacked";
@@ -760,6 +760,55 @@ export async function moveDirection(page: Page, paneId: string, dir: FocusDir): 
     const h = (window as unknown as { __host?: { moveDirection(p: string, d: FocusDir): void } }).__host;
     h?.moveDirection(paneId, dir);
   }, { paneId, dir });
+}
+
+// ---- layout overlay (gesture / statusbar fallback) -------------------------
+// Drive the overlay through the SAME production HostOps path the statusbar
+// Layout button + the host-gesture router use (hostOps().openLayoutOverlay /
+// closeLayoutOverlay / overlaySplit), plus read the overlay source signal. The
+// host-gesture MESSAGE itself is probed via probePaneMessage (it routes any
+// payload through the real routeMessage — the security e2e uses it).
+
+/** The overlay's current source pane id (null when closed). */
+export async function overlaySource(page: Page): Promise<string | null> {
+  const r = await page.evaluate(() => {
+    const h = (window as unknown as { __host?: { overlaySource(): string | null } }).__host;
+    return h ? h.overlaySource() : null;
+  });
+  return r ?? null;
+}
+
+/** Open the layout overlay anchored to `paneId` (production HostOps path). */
+export async function openLayoutOverlay(page: Page, paneId: string): Promise<void> {
+  await page.evaluate((paneId) => {
+    const h = (window as unknown as { __host?: { openLayoutOverlay(p: string): void } }).__host;
+    h?.openLayoutOverlay(paneId);
+  }, paneId);
+}
+
+/** Close the layout overlay (production HostOps path). */
+export async function closeLayoutOverlay(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    const h = (window as unknown as { __host?: { closeLayoutOverlay(): void } }).__host;
+    h?.closeLayoutOverlay();
+  });
+}
+
+/** Cardinal split direction for the overlay arrows. */
+export type OverlaySplitDir = "above" | "right" | "below" | "left";
+
+/** Split the overlay's source pane in a cardinal direction (overlay arrow path).
+ *  Returns the new pane id, or null. Auto-closes the overlay. */
+export async function overlaySplit(
+  page: Page,
+  paneId: string,
+  dir: OverlaySplitDir,
+): Promise<string | null> {
+  const r = await page.evaluate(({ paneId, dir }) => {
+    const h = (window as unknown as { __host?: { overlaySplit(p: string, d: OverlaySplitDir): string | null } }).__host;
+    return h ? h.overlaySplit(paneId, dir) : null;
+  }, { paneId, dir });
+  return r ?? null;
 }
 
 /** The focused pane's group info: {groupId, panelCount, headerPosition}. */

@@ -1,12 +1,20 @@
 /* Pane chrome emitted by the vanilla IframeRenderer (not a CSS module, since
  * the renderer builds DOM imperatively outside SolidJS tracking).
  *
- * CHROMELESS (i3 Phase 1): the pane is the iframe + a thin focus border. NO
- * title text, NO per-pane buttons (operator: "every pixel matters; title takes
- * space without benefit"). Layout ops live in the statusbar cluster + i3
- * keyboard shortcuts, not on the pane. A multi-panel Dockview group keeps its
- * NATIVE tab strip (see dockviewOverrides.css) — that is the tabbed/stacked
- * affordance.
+ * CHROMELESS (i3 host-shell): the pane is the iframe + a strong focus indicator
+ * + a hidden overlay-source badge. NO title text, NO per-pane buttons (operator:
+ * "every pixel matters; title takes space without benefit"). Layout ops live in
+ * the statusbar cluster + the layout overlay (gesture / statusbar button), not
+ * on the pane. A multi-panel Dockview group keeps its NATIVE tab strip (see
+ * dockviewOverrides.css) — that is the tabbed/stacked affordance.
+ *
+ * FOCUS INDICATOR (strong, glanceable): a 3px accent INSET outline (GPU-cheap —
+ * outline never triggers layout) + a 5px accent top edge (::before). A one-shot
+ * opacity pulse on the top edge (200ms, once per activation) makes a focus
+ * change glanceable; omitted under prefers-reduced-motion. The "ACTIVE · <label>"
+ * badge is shown ONLY while the layout overlay is open for this pane (no
+ * permanent headers recreated). NO mask-image / backdrop-filter / contain:paint
+ * / large shadows (AGENTS.md Firefox/WebRender GPU gotchas).
  */
 
 .pane {
@@ -16,23 +24,85 @@
   height: 100%;
   width: 100%;
   overflow: hidden;
+  /* Positioning context for the top-edge pseudo + the badge (absolute). */
+  position: relative;
 }
 
-/* Focus border: a 2px accent OUTLINE on the active pane. outline is GPU-cheap
- * (it never triggers layout — unlike border, it overlays without reserving
- * space). Distinct from the maximized/tray tints below. */
+/* Focus indicator: 3px accent INSET outline (never triggers layout — outline
+ * overlays without reserving space, unlike border). GPU-cheap. */
 .pane.is-active {
-  outline: 2px solid var(--accent);
-  outline-offset: -2px;
+  outline: 3px solid var(--accent);
+  outline-offset: -3px;
 }
-/* Tray/maximized are subtle tints (no header to badge anymore, but the pane
- * root still carries the class so a glance distinguishes the state). GPU-cheap:
- * outline color swap only. */
+/* Tray/maximized tint the outline color so a glance distinguishes the state. */
 .pane.is-tray.is-active {
   outline-color: var(--warn);
 }
 .pane.is-maximized.is-active {
   outline-color: var(--good);
+}
+
+/* 5px accent top edge (the strong top-of-pane signal). A pseudo-element so it
+ * never affects layout. pointer-events:none so it never blocks the iframe. */
+.pane.is-active::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 5px;
+  background: var(--accent);
+  z-index: 2;
+  pointer-events: none;
+}
+
+/* One-shot opacity pulse on the top edge when a pane becomes active. Finite
+ * (runs once, does not repeat) — a glanceable focus-change flicker, not a
+ * permanent animation. The setActive() re-trigger (remove class → reflow →
+ * re-add) makes each activation re-run it. */
+.pane.is-active.pane-focus-pulse::before {
+  animation: pane-focus-pulse 200ms ease-out 1;
+}
+@keyframes pane-focus-pulse {
+  0% {
+    opacity: 0.35;
+  }
+  100% {
+    opacity: 1;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  /* Reduced-motion: omit the pulse entirely, keep the solid indicator. */
+  .pane.is-active.pane-focus-pulse::before {
+    animation: none;
+  }
+}
+
+/* Overlay-source badge: "ACTIVE · <label>", shown ONLY while the layout overlay
+ * is open for THIS pane (the LayoutOverlay toggles `.is-overlay-source`). Top-
+ * left, above the iframe. pointer-events:none so it never blocks interaction. */
+.pane-badge {
+  display: none;
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  z-index: 3;
+  padding: 2px 6px;
+  border-radius: 3px;
+  background: var(--accent);
+  color: var(--bg);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  line-height: 1.4;
+  white-space: nowrap;
+  pointer-events: none;
+  max-width: calc(100% - 16px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.pane.is-overlay-source .pane-badge {
+  display: inline-block;
 }
 
 .pane-body {

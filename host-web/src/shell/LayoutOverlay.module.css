@@ -1,0 +1,119 @@
+.overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+}
+/* Scoped pointer-capture layer: covers ONLY <main> (the pane grid area), NOT
+ * the tabstrip/statusbar (they are siblings of <main> in the .app flex column,
+ * so a click on the statusbar NEXT/Layout button is never intercepted). An
+ * outside-the-card click within <main> dismisses the overlay. GPU-cheap: a
+ * plain transparent div, no mask/backdrop/contain. */
+.capture {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+}
+.card {
+  position: absolute;
+  z-index: 6;
+  min-width: 168px;
+  padding: 8px;
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  background: var(--bg-elev);
+  color: var(--fg);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.4);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  /* Bounded small shadow only — NOT a large/blurry shadow (AGENTS.md GPU). */
+}
+.identity {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 4px 4px;
+  border-bottom: 1px solid var(--border);
+  font-size: 11px;
+  color: var(--fg-dim);
+  white-space: nowrap;
+  overflow: hidden;
+}
+.identityLabel {
+  font-weight: 700;
+  color: var(--accent);
+  flex: 0 0 auto;
+}
+.identityTarget {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.closeBtn {
+  appearance: none;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--fg-dim);
+  font-size: 13px;
+  line-height: 1;
+  padding: 2px 6px;
+  border-radius: 3px;
+  cursor: pointer;
+  margin-left: auto;
+  flex: 0 0 auto;
+}
+.closeBtn:hover {
+  color: var(--fg);
+  border-color: var(--border);
+}
+.arrows {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  grid-template-rows: 1fr 1fr 1fr;
+  gap: 4px;
+  place-items: center;
+}
+.arrow {
+  appearance: none;
+  border: 1px solid var(--border);
+  background: var(--bg-soft);
+  color: var(--fg);
+  font-size: 18px;
+  line-height: 1;
+  width: 40px;
+  height: 32px;
+  border-radius: 4px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.arrow:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.arrow:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.arrowUp {
+  grid-column: 2;
+  grid-row: 1;
+}
+.arrowLeft {
+  grid-column: 1;
+  grid-row: 2;
+}
+.arrowRight {
+  grid-column: 3;
+  grid-row: 2;
+}
+.arrowDown {
+  grid-column: 2;
+  grid-row: 3;
+}
+.hint {
+  font-size: 10px;
+  color: var(--fg-dim);
+  text-align: center;
+  padding: 2px 0 0;
+}

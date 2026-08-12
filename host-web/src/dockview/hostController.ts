@@ -1,6 +1,6 @@
 import type { DockviewApi, IDockviewPanel } from "dockview-core";
 import type { IframeRenderer } from "./iframeRenderer";
-import type { AddServerOutcome, FocusDir, HostOps, LayoutMode, PaneVm, SplitDir } from "./types";
+import type { AddServerOutcome, FocusDir, HostOps, LayoutMode, OverlaySplitDir, PaneVm, SplitDir } from "./types";
 import {
   isFleetEntry,
   isRealFleet,
@@ -22,6 +22,7 @@ import {
   baselineFor,
   bindContentWindow,
   bindScratchSource,
+  closeOverlay,
   closeWorkspace as storeCloseWorkspace,
   configuredOriginFor,
   connected,
@@ -32,6 +33,7 @@ import {
   needsYouCount,
   needsYouCountFor,
   noteIframeLoad,
+  openOverlayFor,
   renameWorkspace as storeRenameWorkspace,
   resetBaseline,
   routeMessage,
@@ -50,6 +52,7 @@ import {
   unregisterWorkspaceOps,
   unregisterWorkspaceSync,
   workspaces as storeWorkspaces,
+  overlaySourcePaneId,
 } from "./store";
 
 type Direction = "left" | "right" | "above" | "below";
@@ -446,17 +449,25 @@ export class HostController implements HostOps {
       return;
     }
     // split-h / split-v: break a multi-panel group's panels out into separate
-    // tiled groups. moveTo(position) relative to the first panel's group.
-    // Position vocabulary is dockview's 'left'|'right'|'top'|'bottom' (NOT the
-    // addPanel 'direction' vocabulary 'right'|'below').
+    // tiled groups. moveTo(position) relative to the SOURCE panel's group (NOT
+    // group.panels[0] — the prior code anchored on the first panel, so invoking
+    // the mode from a non-first tab anchored + activated the wrong pane). The
+    // source is the pane the operator invoked the mode on (the focused pane in
+    // the statusbar path; the source pane in the overlay path). Every OTHER
+    // panel breaks out into its own group relative to the source; the SOURCE
+    // stays put + is re-activated. Position vocabulary is dockview's
+    // 'left'|'right'|'top'|'bottom' (NOT the addPanel 'direction' vocabulary
+    // 'right'|'below').
     const pos = mode === "split-h" ? "right" : "bottom";
     const panels = [...group.panels];
     if (panels.length > 1) {
-      const anchor = panels[0];
-      for (let i = 1; i < panels.length; i++) {
-        panels[i].api.moveTo({ group: anchor.group, position: pos });
+      for (const p of panels) {
+        if (p.id === panel.id) continue;
+        p.api.moveTo({ group: panel.group, position: pos });
       }
-      anchor.api.setActive();
+      // The SOURCE remains active (was the focused/invoking pane), not
+      // panels[0]. This is the split-target fix.
+      panel.api.setActive();
     }
     this.afterMutation();
   }
@@ -481,6 +492,55 @@ export class HostController implements HostOps {
   moveDirection(paneId: string, dir: FocusDir): void {
     const id = this.nearestPaneInDir(paneId, dir);
     if (id && id !== paneId) this.swap(paneId, id);
+  }
+
+  // ---- layout overlay (gesture / statusbar fallback) -----------------------
+
+  /**
+   * Open the layout overlay anchored to `paneId`'s group. Focuses the source
+   * pane (so the focus indicator + subsequent split target it), then activates
+   * the overlay state. Idempotent: a second open while already open re-anchors
+   * (the store signal just swaps). No-op when the pane is not in THIS
+   * workspace. The statusbar Layout button (production) + the host-gesture
+   * router both route through this.
+   */
+  openLayoutOverlay(paneId: string): void {
+    const panel = this.api.getPanel(paneId);
+    if (!panel) return;
+    panel.api.setActive();
+    openOverlayFor(this.workspaceId, paneId);
+  }
+
+  /** Close the layout overlay (clears the source anchor). */
+  closeLayoutOverlay(): void {
+    closeOverlay();
+  }
+
+  /**
+   * Split the overlay's source pane in a cardinal direction (an overlay arrow).
+   * Survival-safe: addPanel relative to the source panel; renderer:'always'
+   * keeps the source iframe mounted. Dockview's addPanel `position.direction`
+   * accepts the four cardinals relative to `referencePanel`. The new pane
+   * becomes active (matching the existing split() behavior). Auto-closes the
+   * overlay (a split is a terminal overlay action). Returns the new pane id.
+   */
+  overlaySplit(paneId: string, dir: OverlaySplitDir): string | null {
+    const panel = this.api.getPanel(paneId);
+    if (!panel) return null;
+    const params = this.newPaneParams(panel);
+    if (!params) return null;
+    const created = this.api.addPanel({
+      id: params.id,
+      component: "iframe",
+      renderer: "always",
+      params: { url: params.url, label: params.label },
+      position: { referencePanel: panel, direction: dir },
+    });
+    created.api.setActive();
+    // A split is a terminal overlay action — close the overlay so the operator
+    // sees the result, not a stale anchor over a changed layout.
+    closeOverlay();
+    return created.id;
   }
 
   /** Spatial nearest-neighbor in a cardinal direction, by group bounding-box
@@ -680,6 +740,9 @@ export class HostController implements HostOps {
     this.ops.setLayoutMode = (paneId, mode) => this.setLayoutMode(paneId, mode);
     this.ops.focusDirection = (paneId, dir) => this.focusDirection(paneId, dir);
     this.ops.moveDirection = (paneId, dir) => this.moveDirection(paneId, dir);
+    this.ops.openLayoutOverlay = (paneId) => this.openLayoutOverlay(paneId);
+    this.ops.closeLayoutOverlay = () => this.closeLayoutOverlay();
+    this.ops.overlaySplit = (paneId, dir) => this.overlaySplit(paneId, dir);
   }
 
   /** Dispose this controller: unregister from the store + the controller map so
@@ -996,6 +1059,23 @@ export class HostController implements HostOps {
       moveDirection: (paneId: string, dir: FocusDir): void => {
         activeController()?.moveDirection(paneId, dir);
       },
+
+      // ---- layout overlay (gesture / statusbar fallback) -------------------
+      // Drive the overlay through the SAME production HostOps path the
+      // statusbar Layout button + the host-gesture router use
+      // (hostOps().openLayoutOverlay / closeLayoutOverlay / overlaySplit), plus
+      // read the overlay source signal for assertions. The host-gesture MESSAGE
+      // itself is probed via the existing probeHeartbeat (it routes any payload
+      // through the real routeMessage — the security e2e uses it).
+      overlaySource: (): string | null => overlaySourcePaneId(),
+      openLayoutOverlay: (paneId: string): void => {
+        activeController()?.openLayoutOverlay(paneId);
+      },
+      closeLayoutOverlay: (): void => {
+        activeController()?.closeLayoutOverlay();
+      },
+      overlaySplit: (paneId: string, dir: OverlaySplitDir): string | null =>
+        activeController()?.overlaySplit(paneId, dir) ?? null,
 
       // NEGATIVE CONTROL (a): naive remove + re-add. This is the exact mistake
       // renderer:'always' exists to prevent. It RELOADS the iframe (new

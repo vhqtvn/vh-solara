@@ -73,6 +73,8 @@ export function Statusbar() {
   // The NEXT hero button shows only when the active workspace has a needs-you
   // pane (ws-scoped visibility — the locked choice). It pulses to draw the eye.
   const showNext = createMemo(() => need() > 0);
+  // Whether a pane is focused (drives the Layout button's disabled state).
+  const hasFocus = createMemo(() => !!focusedId());
 
   return (
     <div class={s.statusbar} data-testid="statusbar">
@@ -110,11 +112,30 @@ export function Statusbar() {
         </button>
       </Show>
       <span class={s.spacer} />
-      {/* i3 control cluster (Phase 1): the touch fallback for when there's no
-          keyboard (the i3 shortcuts of Item 4 mirror these). Compact — this is
-          the power-user/touch surface, not the primary chrome. Each button acts
+      {/* Layout button (production-capable): opens the layout overlay for the
+          focused pane. This is the always-reliable fallback for the gesture
+          fast path (double-Ctrl / triple-tap). NOT a DEV bridge — it routes
+          through hostOps().openLayoutOverlay, the same path the gesture router
+          uses. Disabled when no pane is focused. */}
+      <button
+        type="button"
+        class={s.layoutBtn}
+        data-testid="layout-overlay-btn"
+        title="Open the layout overlay for the focused pane"
+        disabled={!hasFocus()}
+        onClick={() => {
+          const id = focusedId();
+          if (id) hostOps()?.openLayoutOverlay?.(id);
+        }}
+      >
+        Layout…
+      </button>
+      {/* Layout control cluster: the touch/mouse fallback for pane layout ops
+          (the primary production surface — NOT a DEV bridge). Each button acts
           on the FOCUSED pane's group via the typed HostOps surface. Disabled
-          when no pane is focused. */}
+          when no pane is focused. Keyboard Alt-shortcuts were removed (the host
+          cannot see keys inside a cross-origin iframe); the Layout button +
+          SPA double-Ctrl/triple-tap gesture are the interaction model now. */}
       <ControlCluster />
       <span class={s.badge} title="layout engine / render mode">
         dockview · renderer:always{isMaximized() ? " · maximized" : ""}
@@ -124,9 +145,9 @@ export function Statusbar() {
 }
 
 /**
- * Compact i3 control cluster: split-h/split-v, mode (tabbed/stacked), zoom,
- * close. The touch fallback for the i3 keyboard shortcuts (Item 4). Operates on
- * the focused pane's group via hostOps(). GPU-cheap: plain buttons, no effects.
+ * Compact layout control cluster: split-h/split-v, mode (tabbed/stacked), zoom,
+ * close. The touch/mouse fallback for pane layout. Operates on the focused
+ * pane's group via hostOps(). GPU-cheap: plain buttons, no effects.
  */
 function ControlCluster() {
   const hasFocus = createMemo(() => !!focusedId());
@@ -156,7 +177,7 @@ function ControlCluster() {
         type="button"
         class={s.cbtn}
         data-testid="i3-split-h"
-        title="Split horizontal (Alt+H)"
+        title="Split horizontal"
         disabled={!hasFocus()}
         onClick={splitH}
       >
@@ -166,7 +187,7 @@ function ControlCluster() {
         type="button"
         class={s.cbtn}
         data-testid="i3-split-v"
-        title="Split vertical (Alt+V)"
+        title="Split vertical"
         disabled={!hasFocus()}
         onClick={splitV}
       >
@@ -177,7 +198,7 @@ function ControlCluster() {
         type="button"
         class={s.cbtn}
         data-testid="i3-tabbed"
-        title="Tabbed mode (Alt+W)"
+        title="Tabbed mode"
         disabled={!hasFocus()}
         onClick={() => mode("tabbed")}
       >
@@ -187,7 +208,7 @@ function ControlCluster() {
         type="button"
         class={s.cbtn}
         data-testid="i3-stacked"
-        title="Stacked mode (Alt+S)"
+        title="Stacked mode"
         disabled={!hasFocus()}
         onClick={() => mode("stacked")}
       >
@@ -198,7 +219,7 @@ function ControlCluster() {
         type="button"
         class={s.cbtn}
         data-testid="i3-zoom"
-        title="Zoom (Alt+F)"
+        title="Zoom"
         disabled={!hasFocus()}
         onClick={zoom}
       >
@@ -208,7 +229,7 @@ function ControlCluster() {
         type="button"
         class={`${s.cbtn} ${s.cbtnWarn}`}
         data-testid="i3-close"
-        title="Close (Alt+Shift+Q)"
+        title="Close"
         disabled={!hasFocus()}
         onClick={close}
       >
