@@ -17,7 +17,7 @@ package state
 // characterizes CONTROLLED variants (byte-identical vs materially changed) and
 // says so plainly.
 //
-// See tmp/agent-runs/compaction-burst-brief/brief.md §"Slice 4A detail" for the
+// See docs/ai/wire-protocols/compaction-burst-axis.md §"Slice 4A detail" for the
 // spec (telemetry fields + fixture shape + variants).
 
 import (

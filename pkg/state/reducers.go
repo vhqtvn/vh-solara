@@ -1221,7 +1221,7 @@ func (s *Store) upsertPartLocked(part json.RawMessage) {
 	// next streaming delta appends onto a cap-respecting base.
 	part = capPartJSON(part, s.partTextCap)
 	// Slice 4A telemetry (compaction-burst axis — see
-	// tmp/agent-runs/compaction-burst-brief/brief.md §"Slice 4A detail"):
+	// docs/ai/wire-protocols/compaction-burst-axis.md §"Slice 4A detail"):
 	// observe the AUTHORITATIVE part.upsert for burst characterization. This is
 	// a SEPARATE probe from the slice-1 delta-path probe (PartDeltaFields) —
 	// compaction rewrites ride this authoritative path, NOT the delta flush

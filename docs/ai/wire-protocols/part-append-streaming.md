@@ -394,7 +394,52 @@ the relay verdict fires).
 
 ---
 
-## 8. What slice 1 did NOT change (non-goals, carried to slices 2–6)
+## 8. Compaction-burst axis — decision: O1 (no-change)
+
+The compaction-burst axis (many historical TOOL parts re-upserted in a short
+window by an opencode compaction sweep) was analyzed as a sibling to this
+suffix-streaming effort. Its decision is recorded durably in
+[`compaction-burst-axis.md`](./compaction-burst-axis.md) (promoted from the
+focused `/solution-brief`); this section cross-references it so a reader of the
+part-append contract sees the outcome in context.
+
+**Decision: O1 (no-change), gate-forced — NOT a judgment call.** Authoritative
+FIFO delivery of `part.upsert` is retained. The leading conditional mechanism —
+**O2, exact no-op suppression at authoritative ingress** (suppress byte-identical
+unchanged TOOL-part re-upserts before sequence assignment) — is gated out.
+
+Why O2 cannot be selected now (the a-F2 hard gate, flagged independently by
+round-1 review, round-2 review, committer review, AND the brief): O2 requires
+real production telemetry of the identical-vs-changed split, and none exists.
+Slice 4A's incident-shaped fixture is synthetic; the real duplicate composition
+of the observed incident is unknown. Slice 4A's characterization also found a
+single incident-sized ~226KB compaction burst has NO measurable healthy-link
+impact (completed-message settle 15–30µs; subscriber high-water 13–16 ≪ the
+256-event buffer; overflow needs ~7× the incident volume + a blocked writer), so
+the slice-5 egress-optimization gate is NOT triggered either.
+
+**Deployed measurement vehicle.** The slice-4A probe `probes.part_upsert_burst`
+on `/vh/diag/latency` (bounded upsert-path burst characterization — see
+`pkg/diagnostics/part_upsert_burst.go`) is deployed specifically to capture the
+real identical-vs-changed composition on the next incident. It is the load-bearing
+input to any future O2 reconsideration.
+
+**Future-O2 is CONDITIONAL.** Reopen the slice-4B decision-gate procedure only
+if a real incident shows (a) a material identical-fraction in
+`part_upsert_burst` AND (b) a measured settle/latency regression that
+suppression would fix. Until then O1 stands: no ingress suppression (4C), no
+egress optimization (5). The compaction burst remains a TRIGGER CANDIDATE, not a
+reducible duplicate burst.
+
+**Primary wedge-fix track is unchanged.** Compaction-egress handling was always
+a secondary trigger-reduction lever, NOT the Report-2 wedge cure. The primary
+wedge fix remains the PARKED relay/browser attribution whose capture procedure
+is §7 above. Successful compaction handling must NOT be reported as proof the
+relay/browser wedge is cured.
+
+---
+
+## 9. What slice 1 did NOT change (non-goals, carried to slices 2–6)
 
 - **No `part.append` frames are emitted.** The live SSE wire format is
   byte-for-byte unchanged. Slice 1 only adds the contract (this doc) and the
@@ -411,7 +456,7 @@ the relay verdict fires).
 
 ---
 
-## 9. Slice-2 handoff
+## 10. Slice-2 handoff
 
 The contract is now stable. Slice 2 may begin emitting seq-stamped
 `part.append` for the `text` + `reasoning` allowlist behind `part_delta=1`,

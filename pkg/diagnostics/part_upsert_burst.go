@@ -18,7 +18,7 @@ const MaxPartUpsertDistinctSlots = 256
 
 // PartUpsertBurstStats is the bounded upsert-path burst characterization probe
 // for the part-streaming redesign's compaction-burst axis (slice 4A — see
-// tmp/agent-runs/compaction-burst-brief/brief.md §"Slice 4A detail"). It is a
+// docs/ai/wire-protocols/compaction-burst-axis.md §"Slice 4A detail"). It is a
 // SEPARATE probe from PartDeltaFieldStats: that probe instruments the DELTA
 // flush path (flushPartDeltasLocked); THIS probe instruments the AUTHORITATIVE
 // upsert path (upsertPartLocked in pkg/state/reducers.go), which is the path

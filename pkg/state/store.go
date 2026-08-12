@@ -853,8 +853,15 @@ type Store struct {
 	// EVERY mutation capable of changing that session's cold-batch/snapshot
 	// message output (message/part upsert+delete, streaming part-delta append
 	// via appendPartDeltaLocked's write-side throttle flush into me.parts,
-	// history reconcile). Snapshot is NOT on this list — it is a pure read
-	// projection under RLock and never bumps the token. It backs the
+	// history reconcile). Snapshot ALSO bumps this: its entrypoints
+	// (Snapshot / SnapshotWithTree / SnapshotWithTreePartial in snapshots.go)
+	// acquire the WRITE lock and call flushAllBufferedDeltasLocked, which may
+	// flush buffered streaming deltas (mutate me.parts, emit, advance
+	// deltaSentLen) for suffix-offset coherence (the B-F1 fix), bumping the
+	// token once per session whose parts were flushed. A QUIESCENT snapshot
+	// with nothing buffered performs no flush, emits nothing, and bumps no
+	// token — it is observationally pure. (See bumpMsgRev in
+	// message_window.go for the matching token contract.) It backs the
 	// stale-batch guard: cold-load messages.batch packaging (JSON
 	// marshal + gzip + base64) runs OUTSIDE s.mu (mirroring the SSE snapshot
 	// precedent in pkg/web/server.go), so a live mutation landing during

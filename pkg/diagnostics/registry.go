@@ -468,7 +468,7 @@ type Registry struct {
 	PartDeltaFields PartDeltaFieldStats
 	// PartUpsertBurst is the bounded upsert-path burst characterization probe
 	// for the compaction-burst axis (slice 4A of the part-streaming redesign —
-	// see tmp/agent-runs/compaction-burst-brief/brief.md §"Slice 4A detail").
+	// see docs/ai/wire-protocols/compaction-burst-axis.md §"Slice 4A detail").
 	// It is a SEPARATE probe from PartDeltaFields: that one instruments the
 	// DELTA flush path; this one instruments the AUTHORITATIVE upsert path
 	// (upsertPartLocked), which is the path compaction rewrites ride. Counter /

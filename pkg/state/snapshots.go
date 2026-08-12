@@ -1,12 +1,19 @@
 // Package state: the snapshot concern — the read-projection surface of
 // the store, mechanically extracted from store.go (reference model:
-// subtree_indexes.go). Every function here is a READ PROJECTION under
-// s.mu: it either captures mutable state into private copies under RLock
-// and materializes the public result lock-free (Discipline A — Snapshot /
-// SnapshotWithTree / captureSnapshotLocked / materializeSnapshot), or
-// performs a simple read under RLock (Head / RunningRoots / RootCount /
-// Replay / SendableNow / Descendants / DescendantSummaries / SubtreeTodos /
-// SessionIDs / HasSession / LoadedSessions / IsMessagesLoaded). The Store
+// subtree_indexes.go). The functions here are READ PROJECTIONS of the store,
+// with ONE write-side caveat: the three detail-snapshot entrypoints (Snapshot /
+// SnapshotWithTree / SnapshotWithTreePartial) acquire the WRITE lock so they
+// can atomically flush buffered streaming deltas (flushAllBufferedDeltasLocked,
+// the B-F1 suffix-offset coherence fix) BEFORE capturing — see the Snapshot doc
+// comment. That flush is a WRITE (mutates me.parts, emits, advances
+// deltaSentLen, bumps msgRev for any flushed session); a quiescent snapshot with
+// nothing buffered performs no flush and is observationally a pure read. The
+// capture itself (captureSnapshotLocked / capturePartialDetailLocked) only needs
+// RLock and copies mutable state into private copies; materializeSnapshot
+// assembles the public result lock-free (Discipline A). The remaining
+// accessors (Head / RunningRoots / RootCount / Replay / SendableNow /
+// Descendants / DescendantSummaries / SubtreeTodos / SessionIDs / HasSession /
+// LoadedSessions / IsMessagesLoaded) are simple reads under RLock. The Store
 // struct and its single s.mu RWMutex stay in store.go and are shared across
 // this whole package (same-package file split; no protocol change).
 // Behavior-preserving verbatim move; the no-aliasing invariant is
@@ -840,8 +847,14 @@ func (s *Store) materializeSnapshot(c snapshotCapture) Snapshot {
 }
 
 // SnapshotWithTree captures BOTH the detail Snapshot AND the tree TreeSnapshot
-// under a SINGLE s.mu.RLock, stamping both with the SAME {epoch, seq}. This is
-// the Q5 capture-consolidation: previously handleStream acquired the lock twice
+// under a SINGLE s.mu.Lock (the WRITE lock), stamping both with the SAME
+// {epoch, seq}. The WRITE lock (not RLock) is required because the B-F1 flush
+// (flushAllBufferedDeltasLocked) runs atomically before the capture so the
+// snapshot baseline coheres with the part.append suffix offset; the flush is a
+// WRITE (mutates me.parts, emits, advances deltaSentLen, bumps msgRev for any
+// flushed session), and a quiescent snapshot with nothing buffered performs no
+// flush (observationally pure). This is the Q5 capture-consolidation:
+// previously handleStream acquired the lock twice
 // (SnapshotFrontier then store.Snapshot), so a writer on the Apply path could
 // interleave between the two locks and bump s.seq — making any after-the-fact
 // {epoch, seq} label FALSE CONFIDENCE. The single capture here is the hard
@@ -980,9 +993,14 @@ func (s *Store) capturePartialDetailLocked(frontier map[string]bool) snapshotCap
 
 // SnapshotWithTreePartial is the D4 tree-Stream-1-only partial capture. It
 // derives BOTH the tree frontier AND a PARTIAL detail snapshot under a SINGLE
-// s.mu.RLock, stamping both with the SAME {epoch, seq} (Q5 capture
-// consolidation — identical rationale to SnapshotWithTree: a writer on the
-// Apply path cannot interleave and bump s.seq between the two captures). The
+// s.mu.Lock (the WRITE lock), stamping both with the SAME {epoch, seq} (Q5
+// capture consolidation — identical rationale to SnapshotWithTree: a writer on
+// the Apply path cannot interleave and bump s.seq between the two captures).
+// The WRITE lock (not RLock) is required because the B-F1 flush
+// (flushAllBufferedDeltasLocked) runs atomically before the capture so suffix
+// offsets cohere; the flush is a WRITE (mutates me.parts, emits, advances
+// deltaSentLen, bumps msgRev for any flushed session), and a quiescent snapshot
+// with nothing buffered performs no flush (observationally pure). The
 // detail snapshot carries frontier-scoped sessions/activity/gate/lastAgents/
 // currentVerbs + GLOBAL questions/permissions/unread, with Snapshot.Partial set
 // so the client picks the scoped installer (D3) instead of wholesale apply.

@@ -8,7 +8,7 @@ import (
 
 // part_upsert_burst_test.go — unit tests for the slice-4A upsert-path burst
 // characterization probe (see part_upsert_burst.go and
-// tmp/agent-runs/compaction-burst-brief/brief.md §"Slice 4A detail"). The
+// docs/ai/wire-protocols/compaction-burst-axis.md §"Slice 4A detail"). The
 // incident-shaped fixture that answers the slice-4B decision question lives in
 // pkg/state/part_upsert_burst_fixture_test.go (it needs the Store); these tests
 // pin the probe's own mechanics in isolation.
@@ -216,7 +216,7 @@ func TestPartUpsertBurst_HashIsDeterministicAndSeparatesFields(t *testing.T) {
 
 // TestPartUpsertBurstJSONShape verifies the probe surfaces in /vh/diag/latency
 // with the documented field names so a reader (human or SPA) can rely on the
-// shape declared in tmp/agent-runs/compaction-burst-brief/brief.md §"Slice 4A
+// shape declared in docs/ai/wire-protocols/compaction-burst-axis.md §"Slice 4A
 // detail". Mirrors the slice-1 probe's TestPartDeltaFieldsJSONShape.
 func TestPartUpsertBurstJSONShape(t *testing.T) {
 	resetAndRestore(t)

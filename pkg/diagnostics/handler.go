@@ -38,7 +38,7 @@ type snapshotJSON struct {
 		// the compaction-burst axis (slice 4A). The exact-identical vs changed
 		// split is THE load-bearing metric for the slice-4B O2 decision (is
 		// ingress no-op suppression justified?). See part_upsert_burst.go and
-		// tmp/agent-runs/compaction-burst-brief/brief.md §"Slice 4A detail".
+		// docs/ai/wire-protocols/compaction-burst-axis.md §"Slice 4A detail".
 		PartUpsertBurst partUpsertBurstJSON `json:"part_upsert_burst"`
 	} `json:"probes"`
 }
