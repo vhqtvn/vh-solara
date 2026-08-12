@@ -310,6 +310,13 @@ afterEach(() => {
   stream?.closeSessionStream();
   // Restore the kill-switch default between tests.
   sesMod?._setPartDeltaEnabledForTest(true);
+  // DEFER #2 O1 F1 (isolation): clear BOTH flush-cardinality collector slots
+  // so a throwing-vector test cannot leak into a sibling. The module-level
+  // slot is re-seeded null by vi.resetModules() in setupFresh, but the
+  // globalThis.__vhFlushCollector slot is NOT module-scoped — a throwing
+  // getter installed by one test would survive into the next without this.
+  sesMod?._setFlushCardinalityCollectorForTest(null);
+  delete (globalThis as { __vhFlushCollector?: unknown }).__vhFlushCollector;
   vi.clearAllTimers();
   vi.useRealTimers();
   vi.unstubAllGlobals();
@@ -641,5 +648,119 @@ describe("session-stream — recovery convergence: post-re-snapshot correct suff
     expect(sesMod.getSesGen()).toBe(genAfterResnap);
     // And the recovery EventSource survived (not CLOSED by a second re-snapshot).
     expect(esAfter.readyState).not.toBe(CLOSED);
+  });
+});
+
+// DEFER #2 O1 — F1 (data_integrity): the flush-cardinality observer sits on
+// the production flush path AFTER the buffer was drained (pendingAppends = [])
+// but BEFORE setState(produce(...)) applies the frames. A throwing observer
+// MUST NOT abort the flush or the drained `frames` are silently dropped. The
+// FIRST F1 fix wrapped the collector INVOCATION in try/catch; the bound re-
+// review blocked again on a DISTINCT residual vector: resolveFlushCardinality-
+// Collector() — which reads (globalThis as any).__vhFlushCollector — was
+// called on a line OUTSIDE the try/catch, so a THROWING GETTER on that slot
+// (reachable from any same-realm actor with code-injection access: browser
+// extension, devtools console, third-party script — not just a test's
+// addInitScript) would throw from the resolver, exit flushAppends AFTER the
+// drain but BEFORE setState → silently drop the drained frames. The second-
+// iteration fix wraps RESOLUTION + INVOCATION TOGETHER in one try/catch.
+//
+// These two tests exercise BOTH throwing vectors and assert the drained
+// frames STILL reach the store (outcome, not mechanism) — proving the
+// isolation is now airtight AND observed.
+describe("session-stream — DEFER #2 O1 F1: throwing observer MUST NOT abort the flush (both vectors)", () => {
+  // Shared seed: snapshot + part.upsert establishes resident field "Hello"
+  // (5 ASCII bytes) for SID/m1/p1, so a start=5 suffix is a valid append.
+  function seedHello(es: MockEventSource): void {
+    es.fire("snapshot", rawSessionSnap(1, SID, "m1"), "1");
+    es.fire("part.upsert", { id: "p1", sessionID: SID, messageID: "m1", type: "text", text: "Hello" }, "2");
+    expect((store.state.messages[SID]?.byId?.m1?.parts?.p1 as { text?: string }).text).toBe("Hello");
+  }
+
+  it("Vector 1 — THROWING COLLECTOR (module-level slot): drained frames STILL reach the store", async () => {
+    // Install a collector callback that throws on every invocation. This is
+    // the vector the FIRST F1 fix already isolated (invocation try/catch);
+    // re-asserted here so the second-iteration fix's combined wrap does not
+    // silently regress it.
+    sesMod._setFlushCardinalityCollectorForTest(() => {
+      throw new Error("collector boom");
+    });
+
+    stream.openSessionStream(SID);
+    const es = sessionESes()[0];
+    seedHello(es);
+
+    // Buffer a part.append suffix (5-byte "Hello" → start=5, text=" world").
+    es.fire("part.append", { sessionID: SID, messageID: "m1", partID: "p1", field: "text", start: 5, text: " world" }, "3");
+    expect(sesMod._hasPendingAppendsForTest()).toBe(true);
+
+    // Pump the microtask so queueMicrotask(flushAppends) runs. flushAppends
+    // drains the buffer, then resolves + invokes the collector (which
+    // throws). The throw MUST be contained — execution must reach setState.
+    await flushMicro();
+
+    // CRUX (outcome-observed): the drained frame reached the store despite
+    // the throwing collector. If the throw had escaped, flushAppends would
+    // have exited after the drain and BEFORE setState, leaving the field at
+    // its pre-flush "Hello" — the silent-drop failure mode.
+    expect(sesMod._hasPendingAppendsForTest()).toBe(false);
+    expect((store.state.messages[SID]?.byId?.m1?.parts?.p1 as { text?: string }).text).toBe("Hello world");
+  });
+
+  it("Vector 2 — THROWING GETTER on globalThis.__vhFlushCollector: drained frames STILL reach the store", async () => {
+    // Leave the module-level collector unset so resolveFlushCardinality-
+    // Collector falls through to the globalThis slot read. Install a throwing
+    // ACCESSOR GETTER on that slot — this is the DISTINCT residual vector the
+    // first F1 fix missed: the resolver was called OUTSIDE the try/catch, so
+    // a throwing getter threw from the resolver itself (before any callback
+    // invocation), exiting flushAppends after the drain but before setState.
+    expect(sesMod._setFlushCardinalityCollectorForTest(null)).toBeNull();
+    Object.defineProperty(globalThis, "__vhFlushCollector", {
+      configurable: true,
+      get() {
+        throw new Error("getter boom");
+      },
+    });
+
+    stream.openSessionStream(SID);
+    const es = sessionESes()[0];
+    seedHello(es);
+
+    es.fire("part.append", { sessionID: SID, messageID: "m1", partID: "p1", field: "text", start: 5, text: " world" }, "3");
+    expect(sesMod._hasPendingAppendsForTest()).toBe(true);
+
+    await flushMicro();
+
+    // CRUX (outcome-observed): the drained frame reached the store despite
+    // the throwing getter. Before the second-iteration fix, the resolver
+    // throw escaped flushAppends and the field stayed at "Hello" (silent
+    // drop). The combined resolve+call try/catch now contains BOTH vectors.
+    expect(sesMod._hasPendingAppendsForTest()).toBe(false);
+    expect((store.state.messages[SID]?.byId?.m1?.parts?.p1 as { text?: string }).text).toBe("Hello world");
+  });
+
+  it("both vectors: drained frames reach the store AND a NON-throwing collector still observes the cardinality", async () => {
+    // Sanity guard against over-isolation: the wrap must NOT swallow a
+    // well-behaved collector's observation. A non-throwing collector records
+    // the cardinality AND the frames still apply — proving the isolation is
+    // scoped to the throw path only, not a blanket no-op.
+    const observed: number[] = [];
+    sesMod._setFlushCardinalityCollectorForTest((n) => {
+      observed.push(n);
+    });
+
+    stream.openSessionStream(SID);
+    const es = sessionESes()[0];
+    seedHello(es);
+
+    // Fire TWO contiguous suffixes in one tick → one flush with cardinality 2.
+    es.fire("part.append", { sessionID: SID, messageID: "m1", partID: "p1", field: "text", start: 5, text: " wor" }, "3");
+    es.fire("part.append", { sessionID: SID, messageID: "m1", partID: "p1", field: "text", start: 9, text: "ld" }, "4");
+    await flushMicro();
+
+    // The non-throwing collector observed the flush cardinality (2 frames).
+    expect(observed).toEqual([2]);
+    // And the frames applied to the store (converged text).
+    expect((store.state.messages[SID]?.byId?.m1?.parts?.p1 as { text?: string }).text).toBe("Hello world");
   });
 });

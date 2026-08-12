@@ -1113,6 +1113,34 @@ function flushAppends(): void {
   if (pendingAppends.length === 0) return;
   const frames = pendingAppends;
   pendingAppends = [];
+  // DEFER #2 O1 (measurement): report the flush cardinality — the number of
+  // part.append frames drained from the buffer in THIS flush (the snapshot
+  // length) — to the observation collector if one is installed. Inert by
+  // default: a nullable check + one property read, no allocation, no scheduling
+  // change (queueMicrotask timing / drainPendingAppends ordering / the produce
+  // body are all untouched), no DOM access. See resolveFlushCardinalityCollector.
+  //
+  // F1 (data_integrity): the collector sits on the production flush path
+  // AFTER the buffer was drained (above) but BEFORE setState(produce(...))
+  // applies the frames. An observer exception — reachable from any same-realm
+  // actor with code-injection access (browser extension, devtools console,
+  // third-party script — not just a test's addInitScript) — MUST NOT abort
+  // the flush, or the snapshotted `frames` are silently dropped (drained but
+  // never applied). The RESOLUTION + invocation are isolated TOGETHER in one
+  // try/catch so that EITHER of two distinct throwing vectors is contained:
+  //   - a THROWING GETTER on globalThis.__vhFlushCollector (resolveFlush-
+  //     CardinalityCollector reads that slot; a getter installed by a same-realm
+  //     actor throws from the resolver), OR
+  //   - a throwing collector callback (the invocation itself),
+  // cannot escape to abort the flush — execution unconditionally reaches
+  // bumpUpdating() / setState(produce(...)) below regardless of observer
+  // behavior, so the drained `frames` always reach the store.
+  try {
+    const c = resolveFlushCardinalityCollector();
+    if (c) c(frames.length);
+  } catch {
+    /* observer/resolver must never abort the flush */
+  }
   const mismatchSessions = new Set<string>();
   bumpUpdating();
   setState(
@@ -1207,4 +1235,66 @@ export function _drainPendingAppendsForTest(): boolean {
 // _hasPendingAppendsForTest reports whether suffixes are buffered (unflushed).
 export function _hasPendingAppendsForTest(): boolean {
   return pendingAppends.length > 0;
+}
+
+// === DEFER #2 O1 (measurement): flush-cardinality observer ==================
+//
+// An inert-by-default observation hook on the part.append frame-batch flush
+// boundary (flushAppends above). When installed, flushAppends reports the number
+// of part.append frames consumed in each flush — the snapshot length of the
+// drained pendingAppends buffer — to the collector. This is a PURE OBSERVATION
+// of the snapshot cardinality:
+//   - NO scheduling change: queueMicrotask timing, scheduleAppendFlush,
+//     drainPendingAppends ordering, and the produce(…) body are byte-for-byte
+//     unchanged. The collector call sits between the buffer snapshot and
+//     bumpUpdating()/setState.
+//   - NO timers, promises, additional microtasks, requestAnimationFrame, or DOM
+//     reads/writes.
+//   - NO monkey-patching of queueMicrotask.
+// Production posture (the default): production NEVER WRITES the slot — the
+// module-level flushCardinalityCollector stays null in the production bundle,
+// and no production code path assigns globalThis.__vhFlushCollector. The
+// resolver does ONE typeof-guarded READ of globalThis.__vhFlushCollector per
+// non-empty flush; in production the slot is undefined → the guard returns
+// null → the invocation is skipped entirely (the only added work on the
+// production path is the nullable check + the property read; no allocation).
+// When a collector IS installed (test-only), flushAppends is otherwise
+// observably identical to its pre-hook behavior: the invocation is isolated
+// via try/catch (see flushAppends) so an observer exception CANNOT abort the
+// flush or drop the snapshotted frames — frames always reach
+// setState(produce(...)) regardless of observer behavior. The slot is
+// same-realm and reachable from any actor with code-injection access (browser
+// extension, devtools console, third-party script — not just a test's
+// addInitScript), so the isolation is load-bearing, not theoretical.
+//
+// Two install paths (both test-only):
+//   - vitest: _setFlushCardinalityCollectorForTest(fn) — mirrors the existing
+//     _setPartDeltaEnabledForTest / _hasPendingAppendsForTest pattern (unit
+//     tests import the module directly).
+//   - e2e (Playwright): globalThis.__vhFlushCollector, installed by the test's
+//     page.addInitScript BEFORE the SPA boots. Resolved here via globalThis so
+//     the production SPA bundle carries NO window surface of its own — the
+//     slot is only ever populated by a test's init script.
+export type FlushCardinalityCollector = (cardinality: number) => void;
+let flushCardinalityCollector: FlushCardinalityCollector | null = null;
+
+// resolveFlushCardinalityCollector — returns the installed collector (module-
+// level slot first, then the globalThis e2e slot) or null. Cheap: a nullable
+// check + one property read; no allocation. Hoisted function declaration so it
+// is callable from flushAppends (defined above) at runtime after module eval.
+function resolveFlushCardinalityCollector(): FlushCardinalityCollector | null {
+  if (flushCardinalityCollector) return flushCardinalityCollector;
+  const w = (globalThis as any).__vhFlushCollector;
+  return typeof w === "function" ? (w as FlushCardinalityCollector) : null;
+}
+
+// _setFlushCardinalityCollectorForTest installs/uninstalls the module-level
+// collector and returns the previous one so a test can restore it in teardown.
+// NOT wired into any production path; the production default is null.
+export function _setFlushCardinalityCollectorForTest(
+  c: FlushCardinalityCollector | null,
+): FlushCardinalityCollector | null {
+  const prev = flushCardinalityCollector;
+  flushCardinalityCollector = c;
+  return prev;
 }

@@ -58,6 +58,17 @@ async function installPartAppendObserver(page: Page, session: string) {
     (window as any).__vhPartAppends = [];   // parsed part.append payloads {start,field,textLen,t}
     (window as any).__vhSSELog = [];        // all session-stream events {type,t}
 
+    // DEFER #2 O1: flush-cardinality collector. The SPA's flushAppends resolves
+    // globalThis.__vhFlushCollector on each non-empty flush and reports the
+    // number of part.append frames drained (the snapshot cardinality). Installed
+    // here (before the SPA boots) so the production bundle needs no window
+    // exposure of its own. The ledger ties the native frame count (N) to the
+    // flush boundary: sum(ledger) MUST equal N for complete accounting.
+    (window as any).__vhFlushCardinalities = [] as number[];
+    (window as any).__vhFlushCollector = function (n: number) {
+      (window as any).__vhFlushCardinalities.push(n);
+    };
+
     const OrigES = (window as any).EventSource;
 
     // ObservingES is a transparent delegating wrapper: it constructs the REAL
@@ -193,6 +204,7 @@ test("part.append: live SSE suffix streaming — negotiated, delivered, incremen
     appends: (window as any).__vhPartAppends as any[],
     sseLog: (window as any).__vhSSELog as any[],
     samples: (window as any).__vhDomSamples as any[],
+    flushCardinalities: (window as any).__vhFlushCardinalities as number[],
   }));
 
   // --- Assertion 1: Wire negotiation — part_delta=1 in the session URL ---
@@ -257,6 +269,67 @@ test("part.append: live SSE suffix streaming — negotiated, delivered, incremen
       `(sample ${prefixOnlyIdx}) — the DOM progression order is wrong.`,
   ).toBe(true);
 
+  // --- Assertion 4 (DEFER #2 O1): flush-cardinality measurement ---
+  // The flush collector (installed in the init script above) records how many
+  // part.append frames each flushAppends() drained. This measures whether the
+  // frame-batch buffer actually coalesces MULTIPLE native EventSource part.append
+  // events into one flush under real browser delivery, or whether each event
+  // dispatches as its own task and the microtask drains the buffer (cardinality
+  // 1) before the next callback.
+  //
+  // N = native part.append frames observed by the transparent EventSource
+  // observer (assertion 2). The ledger = per-flush snapshot lengths reported by
+  // flushAppends via the collector. Every buffered frame is drained into exactly
+  // one flush, so complete accounting requires sum(ledger) === N and every
+  // cardinality > 0.
+  const flushCardinalities = rec.flushCardinalities;
+  const flushSum = flushCardinalities.reduce((a, b) => a + b, 0);
+  const maxCardinality = flushCardinalities.length ? Math.max(...flushCardinalities) : 0;
+  const N = rec.appends.length;
+
+  expect(
+    flushCardinalities.length,
+    `BUG: no flushAppends cardinalities recorded but ${N} native part.append frames ` +
+      `were observed. The flush-cardinality collector never fired — either flushAppends ` +
+      `never ran with a non-empty buffer, or the collector was not installed. ` +
+      `appends=${JSON.stringify(rec.appends.map((a) => a.start))}`,
+  ).toBeGreaterThan(0);
+
+  // Complete accounting: every native part.append frame is buffered exactly once
+  // and drained into exactly one flush.
+  expect(
+    flushSum,
+    `BUG: flush cardinality sum (${flushSum}) !== native part.append count (${N}). ` +
+      `Some frames were observed on the wire but never flushed, or double-counted. ` +
+      `Ledger: ${JSON.stringify(flushCardinalities)}, ` +
+      `starts: ${JSON.stringify(rec.appends.map((a) => a.start))}`,
+  ).toBe(N);
+
+  // No empty-flush noise in the ledger.
+  expect(
+    flushCardinalities.every((c) => c > 0),
+    `BUG: a flush reported cardinality 0. Ledger: ${JSON.stringify(flushCardinalities)}`,
+  ).toBe(true);
+
+  // Engagement disposition. WHATWG SSE dispatches each event as a SEPARATE task;
+  // the microtask checkpoint after each task drains pendingAppends (cardinality
+  // 1) before the next part.append callback fires. The prediction (medium-high
+  // confidence) is therefore max === 1 — the batch does NOT engage under native
+  // EventSource (one dispatch task per event). The 180ms fixture gaps also
+  // predict this, but the task/microtask semantics are the real reason.
+  //
+  // This assertion is HONEST about the measured value: if max measured > 1,
+  // engagement occurred (a real finding, not a failure) and this constant +
+  // comment must be updated to document it. As written it encodes the predicted
+  // non-engagement; the measurement run confirms or refutes it.
+  expect(
+    maxCardinality,
+    `Measured flush-cardinality ledger: ${JSON.stringify(flushCardinalities)} ` +
+      `(sum=${flushSum}, N=${N}, flushes=${flushCardinalities.length}, ` +
+      `max=${maxCardinality}, engaged=${maxCardinality > 1 ? "YES" : "no"}). ` +
+      `Batch ${maxCardinality > 1 ? "ENGAGED" : "did NOT engage"} under native EventSource.`,
+  ).toBe(1);
+
   // --- Diagnostic echo (always visible in the report, not just on failure) ---
   const sseTypes = [...new Set(rec.sseLog.map((e) => e.type))];
   const prefixOnlyCount = rec.samples.filter((s) => s.hasPrefix && !s.hasSuffix).length;
@@ -266,6 +339,8 @@ test("part.append: live SSE suffix streaming — negotiated, delivered, incremen
       `urls=${rec.urls.length} sessionUrls=${sessionUrls.length} part_delta=1=${negotiated} | ` +
       `part.append frames=${rec.appends.length} startPositive=${startPositive.length} ` +
       `starts=${JSON.stringify(rec.appends.map((a) => a.start))} | ` +
+      `flush ledger=${JSON.stringify(flushCardinalities)} sum=${flushSum} max=${maxCardinality} ` +
+      `engaged=${maxCardinality > 1 ? "YES" : "no"} flushes=${flushCardinalities.length} | ` +
       `DOM samples=${rec.samples.length} prefixOnly=${prefixOnlyCount} ` +
       `suffixNotFinal=${suffixNotFinalCount} | ` +
       `sseTypes=${JSON.stringify(sseTypes)}`,
