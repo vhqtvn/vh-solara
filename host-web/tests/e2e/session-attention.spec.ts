@@ -2,22 +2,25 @@ import { test, expect } from "@playwright/test";
 import * as H from "./util";
 
 // =============================================================================
-// P1 session-attention layer — pane status capture + indicators.
+// P1 session-attention layer — pane status capture + routing.
 //
 // Proves the host captures a {type:"status"} message from a pane (source-bound,
 // via the REAL routeMessage router — same path the SPA's statusEmitter uses),
-// reflects it into the statusbar attention hub (the workspace-aggregate needs-you
-// count + NEXT routing), keeps the Q1-C document-liveness indicator visually +
-// semantically DISTINCT (liveness dot/label vs the attention-hub count), and
-// does NOT reload the iframe (survival-unchanged).
+// stores it per-pane, recomputes the active-workspace needs-you aggregate
+// (which drives the tabstrip's P3 NEXT button + the per-tab needs-you badges),
+// enforces the origin-check tier (a wrong-origin status is rejected), and does
+// NOT reload the iframe (survival-unchanged).
 //
 // PHASE 1 (i3 host-shell, item 2): the per-pane header (label + attention badge
-// + Q1-C liveness dot) was REMOVED — panes are content + focus-border only. The
-// attention + liveness signals now live at the STATUSBAR (the hub count + the
-// focused-pane liveness dot/label). The two per-pane-indicator tests that
-// asserted on .pane-label / .pane-status-badge / .pane-liveness-* were removed
-// (their DOM targets no longer exist); the Q1-C distinctness guarantee was
-// rewritten to assert at the statusbar surface.
+// + Q1-C liveness dot) was REMOVED. The bottom statusbar (which carried the Q1-C
+// liveness dot/label + the "N need you · M running" attention-hub text) was
+// ALSO removed (operator directive). So neither Q1-C liveness NOR the attention-
+// hub count has a DOM surface anymore: the P1 attention data path reaches the
+// DOM only via the tabstrip's conditional NEXT button + the per-tab needs-you
+// badges, and the Q1-C liveness state is observable only via the DEV bridge
+// (H.liveness). The prior statusbar-surface "distinctness" test was removed
+// (its DOM targets are gone); the underlying DATA distinctness is still proven
+// by the wrong-origin test (status storage vs liveness state, via the bridge).
 //
 // The status message is driven through the DEV-only probeStatus bridge
 // (source-bound to a real pane's contentWindow) — the sanctioned seam, same
@@ -138,41 +141,30 @@ test.describe("P1 session-attention", () => {
   // statusbar attention-hub (the workspace-aggregate needs-you count, asserted in
   // the wrong-origin test + workspace-tabs.spec.ts needs-you-badge test).
 
-  // ---- distinctness from Q1-C document-liveness (statusbar surface) ---------
+  // ---- attention surfaces in the DOM via the tabstrip NEXT button -----------
+  // The statusbar surface (Q1-C liveness text + "N need you" hub count) is gone
+  // with the statusbar. The P1 attention data path now reaches the DOM only via
+  // the tabstrip's conditional NEXT button (visible when needsYou>0) + the
+  // per-tab needs-you badges. This proves a captured needs-permission status
+  // drives the NEXT button's visibility (the remaining operator-facing attention
+  // surface). (The per-tab badge is covered by workspace-tabs.spec.ts.)
 
-  test("Q1-C liveness + P1 attention render simultaneously + stay distinct (statusbar)", async ({ page }) => {
+  test("a needs-permission status surfaces the tabstrip NEXT button (the remaining attention DOM surface)", async ({ page }) => {
     const ids = await H.panes(page);
     const pane = ids[0];
 
-    // Drive a needs_permission status on the focused pane so the attention hub
-    // shows a non-zero count. Focus the pane so its Q1-C liveness surfaces in the
-    // statusbar.
-    await H.focusPane(page, pane);
+    // No needs-you before any status → no NEXT button.
+    await expect(page.locator('[data-testid="attention-next"]')).toHaveCount(0);
+
     await H.probeStatus(page, {
       sourcePaneId: pane,
       origin: MOCK_ORIGIN,
       payload: { type: "status", dir: "", session: "s1", title: "T", attention: "needs_permission", activity: "running" },
     });
 
-    const bar = page.locator('[data-testid="statusbar"]');
-
-    // Q1-C liveness: the statusbar shows the focused pane's DOCUMENT liveness
-    // (Q1-C wording, never realtime/SSE). The mock heartbeats → "document alive".
-    await expect(bar).toContainText("document alive");
-
-    // P1 attention hub: the statusbar shows the active-workspace needs-you count
-    // (the live attention surface after the per-pane chrome was removed).
+    // The needs-you aggregate flips to 1 → the tabstrip NEXT button appears.
     await expect.poll(async () => H.needsYou(page), { timeout: 8000 }).toBe(1);
-    await expect(bar.locator('[data-testid="attention-hub"]')).toContainText("1 need you");
-
-    // DISTINCTNESS (the load-bearing guarantee): the liveness channel (Q1-C dot
-    // + "document alive" text) and the attention channel (the hub count) are
-    // SEPARATE elements with non-overlapping wording — a glance distinguishes
-    // "document alive" (Q1-C) from "1 need you" (P1 attention). Both render at
-    // once over the same statusbar.
-    const text = (await bar.textContent()) ?? "";
-    expect(text, "Q1-C liveness wording present").toContain("document alive");
-    expect(text, "P1 attention wording present").toContain("need you");
+    await expect(page.locator('[data-testid="attention-next"]')).toBeVisible();
   });
 
   // ---- survival-SAFE (complements survival.spec negative controls) ---------

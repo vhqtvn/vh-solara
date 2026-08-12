@@ -204,31 +204,28 @@ test.describe("document-liveness heartbeat protocol", () => {
     const a = ids[0];
     // The mock stand-in heartbeats unconditionally → Q1-C state "alive".
     await expect.poll(async () => H.liveness(page, a), { timeout: 10_000 }).toBe("alive");
-    // Phase 1 (item 2): the per-pane liveness indicator was removed; the Q1-C
-    // label now lives in the STATUSBAR for the focused pane. Focus a + assert the
-    // statusbar reflects its "document alive" liveness.
-    await H.focusPane(page, a);
-    await expect(page.locator('[data-testid="statusbar"]')).toContainText("document alive");
+    // Phase 1 (item 2) removed the per-pane liveness indicator; the statusbar's
+    // Q1-C "document alive" text (its replacement) was removed with the statusbar
+    // (operator directive). The liveness STATE is still computed + stored (and
+    // still drives reload detection); it is observable via the DEV bridge
+    // (H.liveness) — there is no DOM surface for it anymore.
   });
 
   test("a real iframe reload (naiveReload) flips the indicator to reloaded", async ({ page }) => {
     const ids = await H.panes(page);
     const a = ids[0];
     await expect.poll(async () => H.liveness(page, a), { timeout: 10_000 }).toBe("alive");
-    // Focus a so the statusbar reflects its liveness through the reload window.
+    // Focus a so its liveness state is the one observed through the reload window.
     await H.focusPane(page, a);
 
     await H.naiveReload(page, a);
     // naiveReload creates a fresh iframe + (reconciled) re-binds + marks a
     // pending load + re-issues the handshake. The new document's first heartbeat
     // establishes a new identity → reload detected → "reloaded" for the display
-    // window. See docs/heartbeat-protocol.md §4.
+    // window. See docs/heartbeat-protocol.md §4. (The statusbar "reloaded" text
+    // surface is gone with the statusbar; the liveness STATE is read via the
+    // bridge below.)
     await expect.poll(async () => H.liveness(page, a), { timeout: 10_000 }).toBe("reloaded");
-    // The statusbar (focused-pane Q1-C surface) reflects the reload too.
-    await expect.poll(
-      async () => page.locator('[data-testid="statusbar"]').textContent(),
-      { timeout: 10_000 },
-    ).toContain("reloaded");
   });
 
   test("rejects a vh-host-handshake from a non-parent (sibling) source — heartbeats keep the legit identity (F1 source-guard)", async ({ page }) => {

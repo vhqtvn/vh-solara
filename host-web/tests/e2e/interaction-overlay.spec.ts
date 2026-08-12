@@ -23,7 +23,7 @@ async function focusIndicatorStyle(
  *
  * Covers: (1) the host-gesture protocol security (closed payload, source-bound
  * pane derivation, origin check); (2) overlay open/action/close + dismiss modes
- * + statusbar-clickability + idempotent re-anchor; (3) the focus indicator +
+ * + tabstrip-clickability + idempotent re-anchor; (3) the focus indicator +
  * reduced-motion; (4) the split-target fix (non-first-pane setLayoutMode anchors
  * on the source, not panels[0]); (5) workspace-switch dismissal + NEXT
  * composability. One screenshot per feature under
@@ -32,7 +32,10 @@ async function focusIndicatorStyle(
  * The host-gesture MESSAGE is driven through probePaneMessage (the real
  * routeMessage, with a real pane's contentWindow as source) — the SAME path the
  * SPA's hostGesture.ts posts. The overlay ops (open/close/split) are driven
- * through the production HostOps path the statusbar Layout button uses.
+ * through the production HostOps path (the DEV bridge openLayoutOverlay routes
+ * through the same hostOps().openLayoutOverlay the gesture does). The statusbar
+ * Layout button that used to also open the overlay was removed with the
+ * statusbar; the overlay is gesture + DEV-bridge triggered now.
  */
 const REPO_ROOT = path.resolve(process.cwd(), "..");
 const VISION_DIR = path.join(REPO_ROOT, "tmp/host-web-playwright/vision/interaction");
@@ -160,17 +163,21 @@ test.describe("layout overlay interaction model", () => {
     await H.closeLayoutOverlay(page);
   });
 
-  // ---- (2) overlay open / action / close + dismiss + statusbar clickable -----
+  // ---- (2) overlay open / action / close + dismiss + tabstrip clickable -----
 
-  test("statusbar Layout button opens the overlay for the focused pane", async ({ page }) => {
+  test("DEV-bridge openLayoutOverlay opens the overlay for the focused pane", async ({ page }) => {
     const ids = await H.panes(page);
     await H.focusPane(page, ids[0]);
     await expect.poll(async () => H.focused(page)).toBe(ids[0]);
 
-    await page.locator('[data-testid="layout-overlay-btn"]').click();
+    // The statusbar Layout button is gone (statusbar removed); the overlay is
+    // gesture-triggered in production. The DEV bridge openLayoutOverlay routes
+    // through the SAME hostOps().openLayoutOverlay the gesture does, so this
+    // proves the production open path end-to-end.
+    await H.openLayoutOverlay(page, ids[0]);
     await expect.poll(async () => H.overlaySource(page)).toBe(ids[0]);
     await expect(page.locator('[data-testid="layout-overlay-card"]')).toBeVisible();
-    await page.screenshot({ path: path.join(VISION_DIR, "02-statusbar-open.png"), fullPage: true });
+    await page.screenshot({ path: path.join(VISION_DIR, "02-open.png"), fullPage: true });
   });
 
   test("overlay arrow splits the SOURCE pane (above) and survives", async ({ page }) => {
@@ -228,19 +235,22 @@ test.describe("layout overlay interaction model", () => {
     await expect.poll(async () => H.overlaySource(page)).toBeNull();
   });
 
-  test("statusbar stays clickable while the overlay is open (Layering gate)", async ({ page }) => {
+  test("tabstrip stays clickable while the overlay is open (Layering gate)", async ({ page }) => {
     const ids = await H.panes(page);
     await H.openLayoutOverlay(page, ids[0]);
     await expect(page.locator('[data-testid="layout-overlay-card"]')).toBeVisible();
-    // The statusbar Layout button is OUTSIDE <main> → not covered by the capture
-    // layer → still clickable. Clicking it re-opens (focuses) without error.
-    const btn = page.locator('[data-testid="layout-overlay-btn"]');
-    await expect(btn).toBeEnabled();
-    await btn.click();
-    // The control-cluster buttons are also still clickable.
-    await expect(page.locator('[data-testid="i3-split-h"]')).toBeEnabled();
-    // The overlay is still open (re-opened for the focused pane).
+    // The AddServer trigger is OUTSIDE <main> (in the tabstrip, a sibling of
+    // <main>) → not covered by the capture layer → still clickable. Clicking it
+    // toggles its popover without dismissing the overlay (the popover is a
+    // tabstrip child too, not inside <main>).
+    const add = page.locator('[data-testid="add-server-btn"]');
+    await expect(add).toBeEnabled();
+    await add.click();
+    await expect(page.locator('[data-testid="add-server-popover"]')).toBeVisible();
+    // The overlay is still open (the capture layer does not reach the tabstrip).
     await expect(page.locator('[data-testid="layout-overlay-card"]')).toBeVisible();
+    // The workspace tabs are also still clickable (a sibling of <main>).
+    await expect(page.locator('[data-testid="ws-tab"]').first()).toBeEnabled();
   });
 
   test("idempotent re-anchor: a second request re-anchors, no stacking", async ({ page }) => {
@@ -354,7 +364,7 @@ test.describe("layout overlay interaction model", () => {
     await expect(page.locator('[data-testid="layout-overlay-card"]')).toHaveCount(0);
   });
 
-  test("NEXT composability: the statusbar NEXT button stays clickable while the overlay is open", async ({ page }) => {
+  test("NEXT composability: the tabstrip NEXT button stays clickable while the overlay is open", async ({ page }) => {
     const ids = await H.panes(page);
     // Drive a needs-permission status on a non-source pane so the NEXT button
     // appears, then open the overlay + assert NEXT is still present + clickable.
@@ -368,8 +378,9 @@ test.describe("layout overlay interaction model", () => {
 
     await H.openLayoutOverlay(page, ids[0]);
     await expect(page.locator('[data-testid="layout-overlay-card"]')).toBeVisible();
-    // NEXT is still visible + enabled (the capture layer does not cover the
-    // statusbar).
+    // NEXT moved from the statusbar into the tabstrip (a sibling of <main>), so
+    // it is STILL outside the capture layer → visible + enabled while the overlay
+    // is open. This is the moved-button analogue of the Layering gate above.
     await expect(page.locator('[data-testid="attention-next"]')).toBeVisible();
     await expect(page.locator('[data-testid="attention-next"]')).toBeEnabled();
     // Clicking NEXT still routes (focus the needy pane). The overlay is dismissed

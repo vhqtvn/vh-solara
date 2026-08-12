@@ -206,12 +206,13 @@ test.describe("lane 8: real SPA cross-origin iframe embed", () => {
     const id = await firstRealPaneId(page);
     await waitForRealAlive(page, id);
     expect(await H.liveness(page, id), "real SPA heartbeat accepted → document alive").toBe("alive");
-    // Phase 1 (item 2): the per-pane liveness indicator was removed; the Q1-C
-    // label now lives in the STATUSBAR for the focused pane. Focus this pane +
-    // assert the statusbar reflects its "document alive" liveness (the SAME crux
-    // — real heartbeat → host-accepted → visible Q1-C signal — at the statusbar).
+    // Phase 1 (item 2) removed the per-pane liveness indicator; the statusbar's
+    // Q1-C "document alive" text (its replacement) was removed with the statusbar
+    // (operator directive). So the crux — real heartbeat → host accepts → the
+    // liveness STATE is "alive" — is now observable only via the bridge
+    // (H.liveness, asserted above); it has no DOM surface anymore. Focus the
+    // pane to exercise the same path the operator would (no DOM assertion).
     await H.focusPane(page, id);
-    await expect(page.locator('[data-testid="statusbar"]')).toContainText("document alive");
   });
 
   test("real SPA iframe survives a Dockview split (renderer:always)", async ({ page }) => {

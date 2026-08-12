@@ -6,14 +6,17 @@ import s from "./LayoutOverlay.module.css";
 /**
  * Layout overlay — the host-side UI for the revised interaction model. Anchored
  * to the source pane's bounds (the pane derived from the gesture's event.source,
- * or the focused pane from the statusbar Layout button). Shows four cardinal
- * split arrows + the source identity + Close.
+ * or the focused pane the host selects). Shows four cardinal split arrows + the
+ * source identity + Close.
  *
  * LAYERING (Gate #2): the pointer-capture layer covers ONLY `<main>` (the pane
- * grid area). The statusbar + tabstrip are SIBLINGS of `<main>` in the `.app`
- * flex column, so they are NEVER intercepted — P3 NEXT and the statusbar Layout
- * button stay clickable while the overlay is open. There is no full-screen
- * capture layer.
+ * grid area). The tabstrip + tray rail are SIBLINGS of `<main>` in the `.app`
+ * flex column, so they are NEVER intercepted — P3 NEXT (now in the tabstrip,
+ * moved from the deleted statusbar) and Add Server stay clickable while the
+ * overlay is open. There is no full-screen capture layer. (The statusbar that
+ * used to also be a clickable sibling was removed in its entirety; the Layout
+ * button that opened this overlay from the statusbar is gone — the overlay is
+ * gesture-triggered + DEV-bridge-triggered now.)
  *
  * DISMISS: Esc, the Close button, an outside-the-card click within `<main>`, a
  * workspace switch (App.tsx clears the signal), or source-pane removal (the

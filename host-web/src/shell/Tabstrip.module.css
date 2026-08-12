@@ -215,3 +215,48 @@
   color: var(--warn);
   flex: 0 0 auto;
 }
+
+/* ---- P3 NEXT hero button (moved from the deleted bottom statusbar) -----------
+ * The attention-loop trigger: "which session needs me? → jump". Appears only
+ * when the active workspace has a needs-you pane (needsYouCount() > 0). The
+ * slow opacity pulse is the ONLY animation (no mask-image / backdrop-filter /
+ * contain:paint — AGENTS.md Firefox/WebRender GPU rules); honored under
+ * prefers-reduced-motion. Sized to match the .plus button (26px) so it reads as
+ * a sibling of "+" and "Add server" in the tabstrip, not a floating FAB. */
+.nextBtn {
+  appearance: none;
+  height: 26px;
+  border: 1px solid var(--warn);
+  background: var(--warn);
+  color: var(--bg);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  padding: 0 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  letter-spacing: 0.04em;
+  flex: 0 0 auto;
+  animation: ts-next-pulse 2s ease-in-out infinite;
+}
+.nextBtn:hover {
+  filter: brightness(1.08);
+}
+.nextBtn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+@keyframes ts-next-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .nextBtn {
+    animation: none;
+  }
+}

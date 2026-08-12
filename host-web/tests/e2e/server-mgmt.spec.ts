@@ -62,18 +62,14 @@ test.describe("runtime server management", () => {
     await expect.poll(async () => (await H.panes(page)).length).toBe(before + 1);
 
     // The new pane carries the exact {url,label} (proves the url — not just the
-    // label — is wired through, the same way the fleet spec asserts srcs).
+    // label — is wired through). The per-pane header (Phase 1) AND the statusbar
+    // focus line that replaced it are both gone now (statusbar removed); the
+    // label is verified via paneParams (the bridge), which is the same source the
+    // deleted "focus: <label>" line read from.
     const params = await H.paneParams(page);
     const added = params.find((p) => p.url === url);
     expect(added, "added pane carries the configured url").toBeDefined();
     expect(added!.label, "added pane carries the configured label").toBe(label);
-
-    // Phase 1 (item 2): the per-pane header (which showed the label) was removed.
-    // The label is now surfaced via the statusbar "focus: <label>" line when the
-    // pane is focused. The new pane becomes focused on add; assert the statusbar
-    // carries the configured label (proves the label text is wired through).
-    await H.focusPane(page, added!.id);
-    await expect(page.locator('[data-testid="statusbar"]')).toContainText(`focus: ${label}`);
 
     // The catalog lists the newly-added server (a remove affordance keyed by url).
     await expect(
@@ -141,14 +137,14 @@ test.describe("runtime server management", () => {
       .toBe(withAdded);
     for (const id of await H.panes(page)) await H.waitForReady(page, id);
 
-    // The added server's pane restored (pane url + label survive reload). Phase 1
-    // item 2: the label is surfaced via the statusbar "focus: <label>" line (the
-    // per-pane header was removed); focus the restored pane + assert it.
+    // The added server's pane restored (pane url + label survive reload). The
+    // per-pane header (Phase 1) and the statusbar focus line that replaced it are
+    // both gone; verify the restored label via paneParams (the bridge), which is
+    // the same source the deleted focus line read from.
     const restoredParams = await H.paneParams(page);
     const restored = restoredParams.find((p) => p.url === url);
     expect(restored, "persisted server's pane restored after reload").toBeDefined();
-    await H.focusPane(page, restored!.id);
-    await expect(page.locator('[data-testid="statusbar"]')).toContainText(`focus: ${label}`);
+    expect(restored!.label, "restored pane carries the configured label").toBe(label);
 
     // The runtime catalog also restored (the remove affordance keyed by url is
     // present without re-adding the server).

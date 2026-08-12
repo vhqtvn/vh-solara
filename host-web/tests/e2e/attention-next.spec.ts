@@ -2,23 +2,26 @@ import { test, expect } from "@playwright/test";
 import * as H from "./util";
 
 // =============================================================================
-// P3 ATTENTION HUB — statusbar "N need you · M running" + the NEXT hero button.
+// P3 ATTENTION LOOP — the NEXT hero button (moved from the deleted bottom
+// statusbar into the top tabstrip).
 //
-// Proves the statusbar attention hub reflects the ACTIVE workspace's needs-you /
-// running counts, the NEXT hero button appears only when the active workspace
-// has a needs-you pane, and clicking it routes to the highest-priority needy
-// pane system-wide: rank (needs_permission > needs_reply) → oldest
-// firstNeedsYouAt → stable paneId; restoring a trayed pane survival-safely
-// (moveTo/addGroup, NEVER removePanel); crossing workspaces when the target
-// lives in a background workspace; and composing with the host-owned keyboard
-// focus-mode (exit on a cross-pane target, keep on a same-pane target).
+// Proves the NEXT hero button appears only when the active workspace has a
+// needs-you pane, and clicking it routes to the highest-priority needy pane
+// system-wide: rank (needs_permission > needs_reply) → oldest firstNeedsYouAt
+// → stable paneId; restoring a trayed pane survival-safely (moveTo/addGroup,
+// NEVER removePanel); crossing workspaces when the target lives in a background
+// workspace; and composing with the host-owned keyboard focus-mode (exit on a
+// cross-pane target, keep on a same-pane target).
 //
-// The status messages are driven through the DEV-only probeStatus bridge
-// (source-bound to a real pane's contentWindow — the sanctioned seam, same model
-// as session-attention.spec.ts). The NEXT action is driven BOTH by clicking the
-// real DOM button ([data-testid="attention-next"]) AND via the bridge next()
-// helper, which routes through the SAME attentionNext.ts path the button uses.
-// Runs on Chromium + Firefox + WebKit.
+// The statusbar's "N need you · M running" attention-hub text was REMOVED with
+// the statusbar (operator directive); only the conditional NEXT button survived
+// (relocated to the tabstrip). The status messages are driven through the
+// DEV-only probeStatus bridge (source-bound to a real pane's contentWindow —
+// the sanctioned seam, same model as session-attention.spec.ts). The NEXT
+// action is driven BOTH by clicking the real DOM button
+// ([data-testid="attention-next"], now in the tabstrip) AND via the bridge
+// next() helper, which routes through the SAME attentionNext.ts path the button
+// uses. Runs on Chromium + Firefox + WebKit.
 //
 // SURVIVAL GATE: the negative controls (naiveReload / jsonReswap) stay covered
 // by tests/e2e/survival.spec.ts (unmodified). This spec adds the complementary
@@ -28,24 +31,21 @@ import * as H from "./util";
 
 const MOCK_ORIGIN = "http://127.0.0.1:5174"; // mock content origin (:5174)
 
-test.describe("P3 attention hub + NEXT hero button", () => {
+test.describe("P3 attention loop + NEXT hero button", () => {
   test.beforeEach(async ({ page }) => {
     await H.loadHost(page);
   });
 
-  // ---- attention-hub text + button visibility -------------------------------
+  // ---- button visibility -----------------------------------------------------
 
-  test("statusbar shows the attention hub; NEXT button hidden when N=0", async ({ page }) => {
-    // Hub text always renders (statusbar info); N=0 + M=0 before any status.
-    await expect(page.locator('[data-testid="attention-hub"]')).toContainText("need you");
-    await expect(page.locator('[data-testid="attention-hub"]')).toContainText("running");
-    await expect(page.locator('[data-testid="attention-hub"]')).toContainText("0 need you");
-    await expect(page.locator('[data-testid="attention-hub"]')).toContainText("0 running");
-    // No needs-you → no NEXT button.
+  test("NEXT button lives in the tabstrip; hidden when N=0", async ({ page }) => {
+    // The statusbar attention-hub text is gone; only the conditional NEXT button
+    // remains as the attention surface. N=0 before any status → no NEXT button.
+    await expect.poll(async () => H.needsYou(page)).toBe(0);
     await expect(page.locator('[data-testid="attention-next"]')).toHaveCount(0);
   });
 
-  test("hub reflects N needs-you + M running from the ACTIVE workspace", async ({ page }) => {
+  test("NEXT button appears when the active workspace has a needs-you pane", async ({ page }) => {
     const ids = await H.panes(page);
     const a = ids[0];
     const b = ids[1];
@@ -62,14 +62,12 @@ test.describe("P3 attention hub + NEXT hero button", () => {
       payload: { type: "status", dir: "", session: "b", title: "B", attention: "needs_reply", activity: "idle" },
     });
 
-    // N=2 need you, M=1 running (only a is running).
+    // N=2 need you (the underlying aggregate drives the tabstrip NEXT button's
+    // visibility). The "M running" display is gone with the statusbar; only
+    // needsYou is observable here.
     await expect.poll(async () => H.needsYou(page), { timeout: 5000 }).toBe(2);
-    await expect
-      .poll(async () => page.locator('[data-testid="attention-hub"]').textContent(), { timeout: 5000 })
-      .toContain("2 need you");
-    await expect(page.locator('[data-testid="attention-hub"]')).toContainText("1 running");
 
-    // NEXT button now visible (active-ws N>0).
+    // NEXT button now visible in the tabstrip (active-ws N>0).
     await expect(page.locator('[data-testid="attention-next"]')).toBeVisible();
   });
 

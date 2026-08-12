@@ -11,7 +11,16 @@ import * as H from "./util";
  * SPA gesture → host overlay model (the host cannot see keys inside a cross-
  * origin iframe). The gesture/overlay interaction is covered by
  * interaction-overlay.spec.ts; this file keeps the layout-mode / persistence /
- * statusbar / popover coverage that remains valid.
+ * popover coverage that remains valid.
+ *
+ * The bottom statusbar was REMOVED entirely (operator directive), so the
+ * statusbar's layout control cluster (split/close/zoom/tabbed/stacked buttons)
+ * and the focused-pane identity line are GONE. The layout modes + splits here
+ * are driven through the DEV bridge (hostOps().setLayoutMode / split), which
+ * routes through the SAME HostOps path the deleted cluster used — so this file
+ * still proves the layout engine + persistence. The production touch surface
+ * for these ops is now the gesture-triggered layout overlay (covered by
+ * interaction-overlay.spec.ts), not a statusbar cluster.
  *
  * One test per feature, each capturing a screenshot at the key state under
  * tmp/host-web-playwright/vision/i3/ (gitignored). Item 1 (workspace tabstrip)
@@ -66,32 +75,12 @@ test.describe("i3 host-shell Phase 1", () => {
     await page.screenshot({ path: path.join(VISION_DIR, "02-no-headers.png"), fullPage: true });
   });
 
-  // ---- Item 3: statusbar control cluster + focused-pane identity ------------
-  test("statusbar carries focused-pane identity + control cluster", async ({ page }) => {
-    const cluster = page.locator('[data-testid="i3-controls"]');
-    await expect(cluster).toBeVisible();
-
-    // Each control button is present + enabled (a pane is focused after load).
-    for (const tid of ["i3-split-h", "i3-split-v", "i3-tabbed", "i3-stacked", "i3-zoom", "i3-close"]) {
-      const btn = page.locator(`[data-testid="${tid}"]`);
-      await expect(btn).toBeVisible();
-      await expect(btn).toBeEnabled();
-    }
-
-    // Focused-pane identity line: "focus: <label>".
-    const ids = await H.panes(page);
-    const params = await H.paneParams(page);
-    const focusedId = await H.focused(page);
-    const focusedLabel = params.find((p) => p.id === focusedId)?.label ?? params[0].label;
-    await expect(page.locator('[data-testid="statusbar"]')).toContainText(`focus: ${focusedLabel}`);
-
-    // Split via the cluster adds a pane; the focus line follows the new pane.
-    const before = ids.length;
-    await page.locator('[data-testid="i3-split-h"]').click();
-    await expect.poll(async () => (await H.panes(page)).length).toBe(before + 1);
-
-    await page.screenshot({ path: path.join(VISION_DIR, "03-statusbar-cluster.png"), fullPage: true });
-  });
+  // ---- Item 3: layout control is gesture/bridge-driven (statusbar removed) ---
+  // The statusbar layout control cluster (split/tabbed/stacked/zoom/close) was
+  // REMOVED with the statusbar. Its HostOps surface (setLayoutMode / split /
+  // toggleZoom) remains and is exercised below + via the layout overlay. There
+  // is no statusbar focus line anymore; the per-pane 3px outline + the overlay's
+  // "Layout: <label>" identity carry the focused-pane signal now.
 
   // ---- Item 5: i3 layout modes (split-h / split-v / tabbed / stacked) --------
   test("layout modes: split-h/split-v geometry + tabbed/stacked native strip; survival across mode change", async ({ page }) => {

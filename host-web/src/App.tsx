@@ -1,7 +1,6 @@
 import { For, Show, createEffect, onCleanup, onMount } from "solid-js";
 import { DockviewHost } from "./dockview/DockviewHost";
 import { Tabstrip } from "./shell/Tabstrip";
-import { Statusbar } from "./shell/Statusbar";
 import { LayoutOverlay } from "./shell/LayoutOverlay";
 import {
   activeWorkspaceId,
@@ -19,10 +18,13 @@ import {
 import s from "./App.module.css";
 
 /**
- * Host shell: top WORKSPACE tabstrip, a CSS-overlay stack of one DockviewHost
- * per workspace (all permanently mounted; switching is visibility-only so no
- * iframe ever reloads), an optional collapse-to-tray chip rail scoped to the
- * active workspace, and a bottom statusbar.
+ * Host shell: top WORKSPACE tabstrip (carrying the P3 NEXT hero button next to
+ * Add Server), a CSS-overlay stack of one DockviewHost per workspace (all
+ * permanently mounted; switching is visibility-only so no iframe ever reloads),
+ * and an optional collapse-to-tray chip rail scoped to the active workspace.
+ * The bottom statusbar was REMOVED in its entirety (operator directive); the
+ * NEXT attention-loop action is the only statusbar element that survived, moved
+ * into the tabstrip.
  *
  * SURVIVAL-SAFE OVERLAY STACK (load-bearing): every workspace's host is always
  * mounted and positioned absolutely (inset:0). Inactive hosts are
@@ -46,7 +48,7 @@ export function App() {
   // visible area (the host owns keyboard behavior — see keyboardFocus.ts).
   let appRoot!: HTMLDivElement;
   // Ref to `<main>` — the positioning context for the layout overlay (its
-  // capture layer is scoped to main so the statusbar stays clickable).
+  // capture layer is scoped to main so the tabstrip stays clickable).
   let mainEl!: HTMLElement;
   // Last-seen active workspace id (for the workspace-switch overlay-dismissal
   // effect). Instance-scoped so the effect can detect a genuine change.
@@ -128,9 +130,9 @@ export function App() {
             </div>
           </div>
         </Show>
-        {/* Layout overlay (gesture / statusbar button). Rendered inside <main>
-            so its pointer-capture layer is scoped to the pane grid — the
-            statusbar (NEXT + Layout button) stays clickable while it is open. */}
+        {/* Layout overlay (gesture-triggered). Rendered inside <main> so its
+            pointer-capture layer is scoped to the pane grid — the tabstrip
+            (NEXT + AddServer) stays clickable while it is open. */}
         <LayoutOverlay mainEl={() => mainEl} />
       </main>
       <Show when={trayPanes().length > 0}>
@@ -153,7 +155,6 @@ export function App() {
           </For>
         </div>
       </Show>
-      <Statusbar />
     </div>
   );
 }

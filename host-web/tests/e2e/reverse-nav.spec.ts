@@ -150,17 +150,19 @@ test.describe("P4 reverse-nav (host→pane select-command)", () => {
 });
 
 // =============================================================================
-// F3 fold: NEXT button pulse animation (Statusbar.module.css scoped className).
+// F3 fold: NEXT button pulse animation (Tabstrip.module.css scoped className).
 //
-// The `.nextBtn.is-pulsing` compound selector in Statusbar.module.css is
-// CSS-Module-scoped — BOTH class names are hashed. Before the fix the JSX used
-// the bare string `is-pulsing` (unscoped), so the compound selector never
-// matched and the pulse never fired. The fix uses `${s["is-pulsing"]}` (scoped)
-// so both tokens are hashed and the compound selector matches → the
-// `statusbar-next-pulse` keyframe animation RUNS (the F3 crux: the pulse
-// actually plays). This is an OUTCOME check (computed animationName, not a
-// mechanism assertion). prefers-reduced-motion is NOT set in the headless
-// default, so the animation is active when the selector matches.
+// The NEXT hero button moved from the deleted bottom statusbar into the top
+// tabstrip (next to "Add server"). Its pulse lives in Tabstrip.module.css as
+// `.nextBtn { animation: ts-next-pulse ... }` — applied directly (no separate
+// is-pulsing class; the <Show> in Tabstrip.tsx gates the button's existence on
+// needsYouCount() > 0, so the button only renders when it should pulse). This
+// is an OUTCOME check: the computed animationName resolves to the keyframe (not
+// "none"), proving the slow opacity pulse actually plays. prefers-reduced-motion
+// is NOT set in the headless default, so the animation is active. (The original
+// F3 crux was a scoped-class bug in Statusbar.module.css; that component is
+// gone, but the OUTCOME guarantee — the pulse plays — is re-pinned here against
+// the button's new home.)
 // =============================================================================
 
 test("F3: NEXT button pulse animation applies (scoped is-pulsing class matches)", async ({

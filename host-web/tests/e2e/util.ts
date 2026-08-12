@@ -289,7 +289,8 @@ export async function needsYouFor(page: Page, wsId: string): Promise<number> {
 // ---- P3 NEXT hero button probes --------------------------------------------
 // Inspect the ranking without acting (nextTarget), trigger the action (next),
 // and read the host-latched firstNeedsYouAt tiebreak. next/nextTarget route
-// through attentionNext.ts (the SAME production path the statusbar button uses).
+// through attentionNext.ts (the SAME production path the tabstrip's NEXT button
+// uses — the button moved out of the deleted statusbar into the tabstrip).
 
 export interface NeedyCandidate {
   paneId: string;
@@ -729,9 +730,10 @@ export async function sameGroup(page: Page, a: string, b: string): Promise<boole
 }
 // ---- i3 layout-mode + directional ops (window.__host, DEV-only) ------------
 // Phase 1 i3 host-shell: drive the layout-mode switch + directional focus/move
-// through the SAME production HostOps path the statusbar cluster uses
-// (hostOps().setLayoutMode / focusDirection / moveDirection). Also expose
-// the group/orientation inspection hooks the modes e2e asserts on.
+// through the SAME production HostOps path the DEV bridge + the layout overlay
+// use (hostOps().setLayoutMode / focusDirection / moveDirection). The statusbar
+// cluster that also used these was removed with the statusbar; also expose the
+// group/orientation inspection hooks the modes e2e asserts on.
 
 export type LayoutMode = "split-h" | "split-v" | "tabbed" | "stacked";
 export type FocusDir = "left" | "right" | "up" | "down";
@@ -762,12 +764,14 @@ export async function moveDirection(page: Page, paneId: string, dir: FocusDir): 
   }, { paneId, dir });
 }
 
-// ---- layout overlay (gesture / statusbar fallback) -------------------------
-// Drive the overlay through the SAME production HostOps path the statusbar
-// Layout button + the host-gesture router use (hostOps().openLayoutOverlay /
-// closeLayoutOverlay / overlaySplit), plus read the overlay source signal. The
-// host-gesture MESSAGE itself is probed via probePaneMessage (it routes any
-// payload through the real routeMessage — the security e2e uses it).
+// ---- layout overlay (gesture / DEV-bridge fallback) -------------------------
+// Drive the overlay through the SAME production HostOps path the host-gesture
+// router uses (hostOps().openLayoutOverlay / closeLayoutOverlay / overlaySplit),
+// plus read the overlay source signal. The statusbar Layout button that also
+// opened the overlay was removed with the statusbar; the overlay is gesture +
+// DEV-bridge triggered now. The host-gesture MESSAGE itself is probed via
+// probePaneMessage (it routes any payload through the real routeMessage — the
+// security e2e uses it).
 
 /** The overlay's current source pane id (null when closed). */
 export async function overlaySource(page: Page): Promise<string | null> {

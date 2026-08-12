@@ -3,6 +3,7 @@ import {
   activeWorkspaceId,
   addWorkspace,
   closeWorkspace,
+  needsYouCount,
   needsYouCountFor,
   renameWorkspace,
   setActiveWorkspace,
@@ -10,14 +11,29 @@ import {
   workspaces,
   type Workspace,
 } from "../dockview/store";
+import { next } from "../attentionNext";
 import { AddServer } from "./AddServer";
 import s from "./Tabstrip.module.css";
 
 /**
  * Top WORKSPACE tabstrip (i3 upper tabs = workspaces): brand + one tab per
- * workspace + "+". Clicking a tab switches the active workspace — a SURVIVAL-
- * SAFE CSS-visibility-only switch (App.tsx's overlay stack; no host is
- * disposed, no iframe reloads). The "+" creates a new empty workspace.
+ * workspace + "+" + "Add server" + the P3 NEXT hero button. Clicking a tab
+ * switches the active workspace — a SURVIVAL-SAFE CSS-visibility-only switch
+ * (App.tsx's overlay stack; no host is disposed, no iframe reloads). The "+"
+ * creates a new empty workspace.
+ *
+ * P3 NEXT HERO BUTTON (moved here from the deleted bottom statusbar — operator
+ * directive "no [FAB], just a button next to add server is enough"). It is the
+ * attention-loop trigger: "which session needs me? → jump". It appears ONLY when
+ * the active workspace has a needs-you pane (needsYouCount() > 0; ws-scoped
+ * visibility — the locked choice), pulses to draw the eye, and on click calls
+ * next() (attentionNext.ts — UNCHANGED): rank → cross-ws → restore-from-tray →
+ * keyboard-rule → focus the highest-priority needy pane system-wide. It is the
+ * ONLY statusbar element that survived the statusbar removal; everything else
+ * (Q1-C liveness dot/label, server count, focus line, layout button, i3 control
+ * cluster, attention-hub "N need you · M running" counts, renderer badge) was
+ * deleted. next() routes through store.hostOps().next (production-capable — NOT
+ * the DEV bridge).
  *
  * This RESTORES the pre-P4 workspace model (commits bd406bd/ca20b0a/497e36e
  * had replaced it with a pane-tab strip; the operator rejected that — tabs were
@@ -36,7 +52,11 @@ import s from "./Tabstrip.module.css";
  *    distinct from Q1-C liveness.
  *
  * Layout ops within the active workspace go through the typed HostOps controller
- * surface (store.hostOps), not the DEV-only window.__host test bridge.
+ * surface (store.hostOps), not the DEV-only window.__host test bridge. The
+ * statusbar's layout control cluster (split/tabbed/stacked/zoom/close) was
+ * removed with the statusbar; the layout overlay (gesture-triggered) is the
+ * primary command surface, and the HostOps setLayoutMode/toggleZoom/etc. remain
+ * for the DEV bridge + future overlay work.
  */
 
 /** Long-press threshold (ms) to enter rename mode. Long enough that a tap never
@@ -69,6 +89,25 @@ export function Tabstrip() {
         +
       </button>
       <AddServer />
+      {/* P3 NEXT hero button (moved from the deleted bottom statusbar). The
+          attention-loop trigger: visible only when the active workspace has a
+          needs-you pane (needsYouCount() > 0), pulses to draw the eye, and on
+          click calls next() which routes to the highest-priority needy pane
+          system-wide. Production-capable (hostOps().next, NOT the DEV bridge).
+          GPU-cheap: a slow opacity pulse ONLY (no mask-image / backdrop-filter —
+          AGENTS.md Firefox/WebRender rules); honored under prefers-reduced-motion. */}
+      <Show when={needsYouCount() > 0}>
+        <button
+          type="button"
+          class={s.nextBtn}
+          data-testid="attention-next"
+          aria-label="NEXT — needs attention"
+          title="Focus the highest-priority session that needs you"
+          onClick={() => next()}
+        >
+          NEXT
+        </button>
+      </Show>
       <Show when={trayIds().length > 0}>
         <span class={s.trayBadge} title="Collapsed panes (active workspace)">
           tray: {trayIds().length}
