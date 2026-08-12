@@ -174,8 +174,12 @@ function rawSessionSnap(seq: number, id: string, msgID: string): any {
 // registered keys) for a stable set diff. Note the lexicographic groups:
 //   "message.*"  < "messages.*"   ('.' 0x2e < 's' 0x73 at index 7)
 //   "message.delete" < "message.upsert"  ('d' < 'u')
-//   "part.delete"    < "part.upsert"
+//   "part.append" < "part.delete" < "part.upsert"  ('a' < 'd' < 'u')
 //   "messages.batch" < "messages.error" < "messages.loaded"
+// Slice 3 added "part.append" (message-class per IsMessageClassKind, ordinal-
+// counted by the server); it shares the listener loop but is buffered for
+// frame-batched flush rather than reaching applyMessageEvent synchronously
+// (covered by partAppendStreaming.test.ts).
 // onopen/onerror are asserted separately (they are property assignments, not
 // addEventListener calls).
 const EXPECTED_SESSION_LISTENER_KINDS = [
@@ -184,6 +188,7 @@ const EXPECTED_SESSION_LISTENER_KINDS = [
   "messages.batch",
   "messages.error",
   "messages.loaded",
+  "part.append",
   "part.delete",
   "part.upsert",
   "ping",
@@ -238,11 +243,14 @@ describe("Stream2 openSessionStream() listener manifest", () => {
   });
 
   // -------------------------------------------------------------------------
-  // The 7 message/part kinds — all routed through the SHARED listener (the
-  // `for (const kind of [...7...])` loop). Each must reach applyMessageEvent
-  // with trackCursor=false on the fast path (no busy gate, no in-flight
-  // snapshot decode). Dispatched in dependency order so delete/clear kinds have
-  // prior state; the async kind (messages.batch) is flushed via microtask pump.
+  // The legacy message/part kinds (not part.append) — all routed through the
+  // SHARED listener (the `for (const kind of [...SESSION_MESSAGE_KINDS...])`
+  // loop). Each must reach applyMessageEvent with trackCursor=false on the fast
+  // path (no busy gate, no in-flight snapshot decode). Dispatched in dependency
+  // order so delete/clear kinds have prior state; the async kind (messages.batch)
+  // is flushed via microtask pump. part.append is tested separately
+  // (partAppendStreaming.test.ts) because it buffers for frame-batched flush
+  // rather than reaching applyMessageEvent synchronously.
   //   message.upsert → message appears
   //   part.upsert    → part appears on the message
   //   part.delete    → part removed

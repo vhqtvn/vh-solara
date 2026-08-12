@@ -306,7 +306,11 @@ let updatingTimer: number | undefined;
 export function isUpdating(): boolean {
   return updating();
 }
-function bumpUpdating() {
+// bumpUpdating — exported for slice-3 part.append frame-batching (session-
+// stream.ts flushAppends), which bypasses reconcileEvent to coalesce a suffix
+// burst into one setState but still needs the "updating" data-flowing indicator
+// to pulse. Calling this once per flush mirrors reconcileEvent's per-event bump.
+export function bumpUpdating() {
   setUpdating(true);
   clearTimeout(updatingTimer);
   updatingTimer = window.setTimeout(() => setUpdating(false), UPDATING_DEBOUNCE_MS);

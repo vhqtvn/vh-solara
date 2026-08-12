@@ -173,10 +173,107 @@ export function deleteMessagesFromTop(sm: SessionMessages, count: number, protec
   return n;
 }
 
+// === Slice 3: part.append suffix streaming (pure apply) =====================
+//
+// part.append {sessionID, messageID, partID, field, start, text} is the
+// negotiated suffix wire frame (slice 2 server-side — see
+// docs/ai/wire-protocols/part-append-streaming.md). `start` is a UTF-8 BYTE
+// offset into the resident field's accumulated value (NOT a UTF-16 code-unit
+// index, NOT a rune count). The FE MUST validate currentFieldByteLen == start
+// before applying; a mismatch means the local field diverged (a lost suffix,
+// a snapshot base that differs) and the client must NOT byte-splice — it
+// triggers a cursorless re-snapshot (handled by the transport layer).
+//
+// appendPartSuffix is the PURE projection (no store coupling, no transport):
+// it mutates the passed SessionMessages draft in place and returns the outcome.
+// The transport layer (session-stream.ts flushAppends) calls this inside a
+// single setState(produce(...)) batch for frame-batching.
+export interface PartAppendPayload {
+  sessionID: string;
+  messageID: string;
+  partID: string;
+  // v1 allowlist (spec §5): "text" or "reasoning" only. The server enforces
+  // this; the FE does not re-filter (trusting the contract) but the field is
+  // read/written as a flat top-level key on the Part — same shape the legacy
+  // full-upsert path (upsertPart Object.assign) writes.
+  field: string;
+  // UTF-8 byte offset where `text` is to be appended.
+  start: number;
+  // The appended bytes (a valid suffix of the field; already a correct JS
+  // string from JSON parse, so concat is safe).
+  text: string;
+}
+
+// utf8ByteLength returns the UTF-8 BYTE length of a JS (UTF-16) string. This is
+// the critical offset-comparison metric: `start` is bytes, not code units. Uses
+// TextEncoder (a WebIDL standard, globally available in Node ≥ 11 and browsers —
+// NOT a DOM API, so this stays compatible with the "browser-free" reduce.ts
+// contract). Hoisted encoder: TextEncoder is stateless and reusable, and this
+// runs on the streaming hot path (once per suffix).
+const utf8Encoder = new TextEncoder();
+export function utf8ByteLength(s: string): number {
+  return utf8Encoder.encode(s).length;
+}
+
+// The outcome of a suffix application, consumed by the transport layer to decide
+// whether to trigger a cursorless re-snapshot (mismatch) or silently continue
+// (applied / skipped).
+export type PartAppendResult = "applied" | "mismatch" | "skipped";
+
+// appendPartSuffix — the pure suffix-apply projection. Mutates `sm` in place
+// (preserves the resident Part object's identity — reactive consumers keyed on
+// the part see no churn, mirroring upsertPart's Object.assign-in-place pattern).
+// Returns:
+//   - "applied": start matched the resident field's UTF-8 byte length; text was
+//     appended (string concat) onto the field.
+//   - "mismatch": the resident field's byte length disagrees with start (or the
+//     message/part is not resident) — the caller MUST NOT byte-splice and SHOULD
+//     trigger a cursorless re-snapshot to realign (defense in depth + the genuine
+//     reconnect case; the server-side snapshot-offset coherence makes this rare).
+//   - "skipped": the resident message is completed (terminal/immutable —
+//     upgrade-on-completed: a completed part wins over a streaming suffix). The
+//     suffix is stale; silently dropped (the completed state is authoritative).
+//
+// SEMANTICS PRESERVED (mirrors part.upsert's apply today):
+//   - Object identity: the resident Part object is mutated in place (never
+//     replaced), so chat-row components keyed by part identity don't churn.
+//   - Merge-if-absent: a suffix EXTENDS a streaming field (never replaces a
+//     resident value wholesale); an unset field is seeded from start===0.
+//   - Upgrade-on-completed: a suffix for a completed (terminal) message is
+//     dropped — the completed snapshot is the authoritative final form.
+export function appendPartSuffix(
+  sm: SessionMessages,
+  payload: PartAppendPayload,
+): PartAppendResult {
+  const msg = sm.byId[payload.messageID];
+  if (!msg) return "mismatch"; // message not resident → can't validate offset
+  // Upgrade-on-completed (defense in depth): a completed message is terminal.
+  // The server's discardPartDeltaLocked drops buffered deltas on completion, so
+  // a suffix arriving after completion is stale; dropping it preserves the
+  // authoritative completed field. No re-snapshot (the completed state is correct).
+  if (msg.info.time?.completed) return "skipped";
+  const part = msg.parts[payload.partID];
+  if (!part) return "mismatch"; // part not resident → can't validate offset
+  const field = payload.field;
+  const current = (part as Record<string, unknown>)[field];
+  // CRITICAL: UTF-8 byte length, NOT JS .length (UTF-16 code units). A field
+  // containing multi-byte chars (é, 日本語, emoji) has byteLen > .length; using
+  // .length would falsely mismatch a correct server-side byte offset.
+  const currentByteLen =
+    typeof current === "string" ? utf8ByteLength(current) : 0;
+  if (payload.start !== currentByteLen) return "mismatch";
+  // Append in place — preserve the Part object's identity. String concat is the
+  // unavoidable JS string-accumulation cost (same order-per-frame as the legacy
+  // full-field assignment: both process O(fieldLen) bytes per frame).
+  (part as Record<string, unknown>)[field] =
+    (typeof current === "string" ? current : "") + payload.text;
+  return "applied";
+}
+
 // Phase 4 — approximate resident serialized bytes. Sums JSON.stringify length
 // over each message's info + parts. Approximate (omits wire envelope framing)
-// but deterministic and cheap enough to run after each page merge. Used by the
-// eviction gate alongside MAX_RESIDENT_MESSAGES. Mirrors the server's
+// but deterministic and cheap enough to run after each page merge. Used by
+// the eviction gate alongside MAX_RESIDENT_MESSAGES. Mirrors the server's
 // messageSerializedBytes() rationale (per-part 1 MiB cap is the hard OOM
 // guardrail; the aggregate cap is an approximate content budget).
 export function approxResidentBytes(sm: SessionMessages): number {

@@ -73,7 +73,7 @@ export interface StallEntry {
   /** Wall-clock capture time (ms epoch). */
   ts: number;
   /** What triggered the stall detection + self-heal. */
-  trigger: "seq-gap" | "tail-incomplete-on-idle" | "content-stale-watchdog" | "reconnect";
+  trigger: "seq-gap" | "tail-incomplete-on-idle" | "content-stale-watchdog" | "reconnect" | "part-append-offset-mismatch";
   /** Which stream(s) the detection + recovery targets. */
   stream: "tree" | "session" | "both";
   /** The session the stall concerns (for session-scoped triggers). */

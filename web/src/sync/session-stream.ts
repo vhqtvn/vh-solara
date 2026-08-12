@@ -41,7 +41,7 @@
 // runtime, never at module-eval time.
 import { produce } from "solid-js/store";
 import type { Snapshot } from "../types";
-import { prependMessagesIfAbsent } from "../lib/reduce";
+import { prependMessagesIfAbsent, appendPartSuffix, utf8ByteLength, type PartAppendPayload } from "../lib/reduce";
 import { log } from "../lib/log";
 import { setState, projectDir } from "./store";
 import { isGateActive, currentGateEpoch, markBusyDirty } from "../busy";
@@ -52,7 +52,7 @@ import {
   markPageDirty,
   isPageDirtyingKind,
 } from "./history";
-import { applyMessageEvent } from "./reconcile";
+import { applyMessageEvent, bumpUpdating } from "./reconcile";
 import {
   recordLatency,
   getExpectSessionSnap,
@@ -60,6 +60,43 @@ import {
   maybeResolveReconcile,
 } from "./stream";
 import { captureDiagEntry } from "./diaglog";
+
+// === Slice 3: part.append suffix streaming client opt-in ====================
+//
+// partDeltaEnabled is the client kill-switch for the negotiated suffix wire
+// format (spec §3). When true (default), the SPA appends part_delta=1 to the
+// /vh/stream query string so the server emits seq-stamped part.append suffix
+// frames for streaming text/reasoning (O(L²)→O(L) wire cost — slice 2
+// server-side). When false, the param is omitted and the connection keeps the
+// byte-identical full part.upsert wire shape — a one-reconnect rollback with NO
+// server change (the stale cached PWA protection mirrors z=1). Disable by
+// flipping the initial value (a source edit + redeploy, or a future runtime
+// config); _setPartDeltaEnabledForTest exists for the disabled-path test.
+let partDeltaEnabled = true;
+export function isPartDeltaEnabled(): boolean {
+  return partDeltaEnabled;
+}
+
+// --- Slice 3: part.append frame-batch buffer --------------------------------
+//
+// pendingAppends accumulates part.append suffixes between flushes so a burst
+// arriving in one event-loop tick coalesces into a SINGLE reactive setState
+// (one store mutation signal per tick, not one-per-suffix). The flush is a
+// microtask (queueMicrotask) — it runs at the end of the current task, sub-ms,
+// so the FIRST suffix of a burst applies promptly (instant first-token latency
+// preserved). appendFlushScheduled prevents multiple microtask schedulings.
+//
+// Each entry captures the connection-generation token (`gen`) at buffer time so
+// flushAppends can drop frames from a superseded connection (sesGen bumped
+// during the tick). Cleared on closeSessionStream (a torn-down connection's
+// pending suffixes belong to the outgoing stream; the replacement starts fresh).
+interface PendingAppend {
+  gen: number;
+  sid: string;
+  payload: PartAppendPayload;
+}
+let pendingAppends: PendingAppend[] = [];
+let appendFlushScheduled = false;
 
 // Parse a compound SSE id ("globalSeq.ordinal") or legacy numeric id.
 // O3: the ordinal is a per-connection delivery counter for Inv1 gap detection;
@@ -393,6 +430,13 @@ export function closeSessionStream() {
   // Phase 3-F: a session switch starts the next session's CLOSED-reopen backoff
   // fresh (per-session backoff does not carry across session switches).
   sesBackoff = 1500;
+  // Slice 3: drop any buffered part.append suffixes for the outgoing connection.
+  // The sesGen bump above already guarantees flushAppends will reject them (gen
+  // mismatch), but clearing here avoids a wasted microtask + produce and keeps
+  // the buffer bounded across session switches. The replacement connection
+  // starts fresh (cursorless snapshot re-establishes every field's base).
+  pendingAppends = [];
+  appendFlushScheduled = false;
 }
 
 // applySessionSnapshot applies a Stream-2 (active-session) snapshot to the store.
@@ -551,7 +595,13 @@ export function openSessionStream(id: string, force = false) {
     // cursorParam construction. The cursor is sesCursor (Stream2-local), NOT
     // state.cursor (the shared cursor Stream1 owns).
     const cursorParam = sesCursor > 0 ? `cursor=${sesCursor}&` : "";
-    ses = new EventSource(`/vh/stream?${cursorParam}sessions=${encodeURIComponent(id)}&dir=${encodeURIComponent(projectDir())}&z=1`);
+    // Slice 3: part_delta=1 opts into the KindPartAppend suffix wire format
+    // (spec §3), mirroring the z=1 (gzip64) capability flag. Gated behind
+    // partDeltaEnabled (isPartDeltaEnabled) so flipping the single flag reverts
+    // to legacy full part.upsert for this connection (one-reconnect rollback,
+    // no server change).
+    const partDeltaParam = isPartDeltaEnabled() ? `&part_delta=1` : "";
+    ses = new EventSource(`/vh/stream?${cursorParam}sessions=${encodeURIComponent(id)}&dir=${encodeURIComponent(projectDir())}&z=1${partDeltaParam}`);
     // Seed Stream2's liveness deadline from construction (mirrors Stream1's
     // markTreeSeen() right after `new EventSource`): a connection that NEVER
     // fires any event (silent from the start) must still be aged out after
@@ -763,7 +813,7 @@ function registerSessionPingListener(es: EventSource, gen: number): void {
   });
 }
 
-// SESSION_MESSAGE_KINDS — the 7 message/part/messages SSE event kinds the
+// SESSION_MESSAGE_KINDS — the message/part/messages SSE event kinds the
 // Stream-2 (active-session) listener registers for. O3 SINGLE SOURCE OF TRUTH
 // (FE half): this set MUST match the server's ordinal-counted kind set for
 // Stream 2 — i.e. pkg/state.IsMessageClassKind (the Go-side classifier used in
@@ -771,11 +821,19 @@ function registerSessionPingListener(es: EventSource, gen: number): void {
 // advances the per-connection delivery ordinal ONLY for these kinds + the
 // initial snapshot; structural frames are emitted via writeRawNoID (no ordinal
 // advance). If you add/remove a kind here, update IsMessageClassKind too.
+// Slice 3 added "part.append" (KindPartAppend is message-class per
+// IsMessageClassKind); it is buffered for frame-batched flush in the listener
+// (does not reach applyMessageEvent synchronously like the other kinds).
 export const SESSION_MESSAGE_KINDS = [
   "message.upsert",
   "message.delete",
   "part.upsert",
   "part.delete",
+  // Slice 3: part.append is message-class (pkg/state IsMessageClassKind lists
+  // KindPartAppend alongside KindPartUpsert) and ordinal-counted by the server
+  // (server.go Stream-2 stamping). Registered here so the shared listener
+  // dispatches it; the listener buffers it for frame-batched flush (below).
+  "part.append",
   "messages.loaded",
   "messages.error",
   "messages.batch",
@@ -783,14 +841,14 @@ export const SESSION_MESSAGE_KINDS = [
 
 // === open() session message-listener registration (decomposition Stage 2) ====
 // Extracted VERBATIM from the nested open() in openSessionStream() — the
-// CONTIGUOUS message/part cohort: the 7-kind loop (SESSION_MESSAGE_KINDS above)
+// CONTIGUOUS message/part cohort: the SESSION_MESSAGE_KINDS loop
 // routed through applyMessageEvent with trackCursor=false — the LOAD-BEARING
 // Stream2 invariant (Stream 2 must NEVER advance Stream 1's shared resume
 // cursor; see invariant audit §3e). Only the addEventListener registration (the
 // for-loop) was relocated from its inline position in open(); no callback body
 // changed (the only mechanical edit: `ses!.addEventListener` became
 // `es.addEventListener` because the parameter is already non-nullable).
-// Registration order is preserved: the 7 kinds are registered after the inline
+// Registration order is preserved: the kinds are registered after the inline
 // onopen and before the inline onerror, exactly as before. Every cohort event
 // name is distinct from the inline snapshot / ping listeners, so consolidating
 // them at this registration site has no dispatch-order effect (EventSource
@@ -885,6 +943,27 @@ function registerSessionMessageListeners(es: EventSource, gen: number): void {
         if (isGateActive()) markBusyDirty();
         return;
       }
+
+      // Slice 3: part.append — buffer for frame-batched flush. A burst of
+      // suffixes arriving in one event-loop tick is accumulated and flushed in a
+      // SINGLE setState (one reactive update per tick, not one-per-suffix) via a
+      // microtask. The first suffix of a burst is still applied promptly — the
+      // microtask runs at the end of the current task (sub-ms), preserving
+      // instant first-token latency. See flushAppends / scheduleAppendFlush below.
+      if (kind === "part.append") {
+        if (sid) {
+          pendingAppends.push({ gen, sid, payload: data as PartAppendPayload });
+          scheduleAppendFlush();
+        }
+        return;
+      }
+
+      // Non-append kind: drain any buffered part.append suffixes FIRST to
+      // preserve seq ordering (buffered suffixes have lower seq than this event
+      // and must land before it). Synchronous; a no-op when the buffer is empty
+      // (the common case). This keeps an authoritative part.upsert /
+      // message.upsert / messages.batch from racing ahead of pending suffixes.
+      drainPendingAppends();
 
       // Phase 4 — historical-page dirty-mirror hook. Mark the in-flight
       // historical page dirty ONLY for resurrection-class mutations
@@ -1000,6 +1079,95 @@ function registerSessionMessageListeners(es: EventSource, gen: number): void {
   }
 }
 
+// === Slice 3: part.append frame-batch flush =================================
+//
+// scheduleAppendFlush — arms a single microtask to drain pendingAppends. Idempotent
+// within a tick (appendFlushScheduled gates re-arming); the microtask runs at the
+// end of the current task, coalescing every suffix that arrived in this tick into
+// one flushAppends call (one reactive setState). The first suffix of a burst is
+// therefore applied within sub-ms of arrival (instant first-token latency).
+function scheduleAppendFlush(): void {
+  if (appendFlushScheduled) return;
+  appendFlushScheduled = true;
+  queueMicrotask(flushAppends);
+}
+
+// flushAppends — drain the part.append buffer in a SINGLE setState(produce(...)).
+// Each suffix is validated (UTF-8 byte offset) + appended in place via the pure
+// appendPartSuffix projection. A mismatch (offset disagrees with the resident
+// field's byte length, or the message/part isn't resident) triggers a cursorless
+// re-snapshot for that session (openSessionStream(id, true)) — the server's
+// snapshot-offset coherence (slice 2 B-F1) ensures the post-snapshot suffix
+// resumes at the client baseline. Frames from a superseded connection (sesGen
+// bumped during the tick) are dropped. bumpUpdating mirrors reconcileEvent's
+// per-event bump so the "updating" data-flowing indicator pulses once per flush.
+function flushAppends(): void {
+  appendFlushScheduled = false;
+  if (pendingAppends.length === 0) return;
+  const frames = pendingAppends;
+  pendingAppends = [];
+  const mismatchSessions = new Set<string>();
+  bumpUpdating();
+  setState(
+    produce((s) => {
+      for (const f of frames) {
+        // Gen guard: a superseded connection's buffered suffixes are dropped
+        // (sesGen bumped between buffer and flush — a close/reopen/switch).
+        if (f.gen !== sesGen) continue;
+        const sm = s.messages[f.sid];
+        if (!sm) {
+          // Session's messages not resident (never opened / evicted) → can't
+          // validate the offset → cursorless re-snapshot realigns.
+          mismatchSessions.add(f.sid);
+          continue;
+        }
+        const result = appendPartSuffix(sm, f.payload);
+        if (result === "mismatch") {
+          mismatchSessions.add(f.sid);
+          log.warn("sync", "part.append offset mismatch → cursorless re-snapshot", {
+            sid: f.sid,
+            messageID: f.payload.messageID,
+            partID: f.payload.partID,
+            field: f.payload.field,
+            start: f.payload.start,
+          });
+        }
+        // "applied" / "skipped": no action beyond the in-place mutation.
+      }
+    }),
+  );
+  // Trigger cursorless re-snapshot for each mismatched session (defense in depth
+  // + the genuine reconnect/loss case). Only the SELECTED session has an open
+  // Stream2 to repair; a non-selected session re-snapshots on next open.
+  for (const sid of mismatchSessions) {
+    if (sid === sesId) {
+      captureDiagEntry({
+        kind: "stall",
+        ts: Date.now(),
+        trigger: "part-append-offset-mismatch",
+        stream: "session",
+        sessionId: sid,
+      });
+      openSessionStream(sid, true);
+    }
+  }
+}
+
+// drainPendingAppends — synchronous flush, called by the shared message listener
+// BEFORE applying a non-append kind. Preserves seq ordering: buffered suffixes
+// (lower seq) land before the authoritative event (higher seq) that follows. A
+// no-op when the buffer is empty (the common case — part.append is the only kind
+// that buffers). If a flush microtask was already armed, it is disarmed (the
+// synchronous drain supersedes it) so the buffer isn't double-flushed.
+function drainPendingAppends(): void {
+  if (pendingAppends.length === 0) {
+    appendFlushScheduled = false; // disarm a stale scheduling (defensive)
+    return;
+  }
+  appendFlushScheduled = false; // disarm: the synchronous drain replaces the microtask
+  flushAppends();
+}
+
 // --- Test-only accessors for the seq-gap drop-N regression test -------------
 // These are NOT wired into any production path. They exist so vitest can arm
 // the __dropNextN hook and reset the gap baseline between tests.
@@ -1012,4 +1180,24 @@ export function _getSesLastSeqForTest(): number {
 export function _resetSesGapStateForTest(): void {
   sesLastDeliveryOrdinal = -1;
   sesDropNextN = 0;
+}
+
+// --- Test-only accessors for slice-3 part.append ----------------------------
+// _setPartDeltaEnabledForTest flips the kill-switch so the disabled-path test
+// (kill-switch off → no part_delta=1, no part.append consumed) can exercise
+// the legacy-revert path without a source edit. NOT wired into production.
+export function _setPartDeltaEnabledForTest(v: boolean): void {
+  partDeltaEnabled = v;
+}
+// _drainPendingAppendsForTest synchronously drains the part.append buffer so a
+// test can assert post-flush store state without pumping microtasks (the
+// production flush is a queueMicrotask). Returns whether a drain occurred.
+export function _drainPendingAppendsForTest(): boolean {
+  if (pendingAppends.length === 0) return false;
+  drainPendingAppends();
+  return true;
+}
+// _hasPendingAppendsForTest reports whether suffixes are buffered (unflushed).
+export function _hasPendingAppendsForTest(): boolean {
+  return pendingAppends.length > 0;
 }
