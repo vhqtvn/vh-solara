@@ -124,13 +124,21 @@ func RecordHandlerBytes(class int, n int) {
 	Default.HandlerBytes[class].Writes.Inc()
 }
 
-// IncStream2ReplayFallback notes that a Stream2 (projected /vh/stream) resume
-// fell back to a fresh full snapshot because the shared replay ring had
-// evicted the client's cursor (Replay returned ok=false despite hasCursor).
-// A non-zero rate under multi-session load is the signal that the single
-// 4096-event shared ring (cmd/client-daemon.go) is evicting one session's
-// cursor under another session's traffic — see the deferred per-session-ring
-// finding. Recorded at the handleStream fresh-snapshot branch.
+// IncStream2ReplayFallback notes a Stream2 (projected /vh/stream) resume that
+// had a client cursor (hasCursor) but fell back to a fresh full snapshot.
+// Incremented at the single unified PROBE 8 site (pkg/web/server.go handleStream
+// `hasCursor && !replayOK` branch) for BOTH fallback causes:
+//
+//	(a) shared-ring cursor eviction on reconnect — Replay returned ok=false
+//	    because the cursor predates the retained 4096-event window; a non-zero
+//	    rate under multi-session load signals one session's cursor being
+//	    evicted by another session's traffic (deferred per-session-ring finding);
+//	(b) §4.3 legacy-replay-contains-part.append fallback — a non-opted-in
+//	    client whose replay range contained a KindPartAppend is rerouted to a
+//	    cursorless snapshot so it never replays suffix frames (see
+//	    docs/ai/wire-protocols/part-append-streaming.md §4.3).
+//
+// The observed rate is the SUM of both causes — NOT ring eviction alone.
 func IncStream2ReplayFallback() {
 	Default.Stream2ReplayFallback.Inc()
 }

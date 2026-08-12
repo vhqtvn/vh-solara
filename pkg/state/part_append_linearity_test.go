@@ -18,7 +18,7 @@ package state
 // payloads (O(L²)).
 //
 // See docs/ai/wire-protocols/part-append-streaming.md (spec §1/§2) and
-// tmp/agent-runs/part-stream-redesign-brief/brief.md slice 4 ("linear part
+// docs/ai/wire-protocols/part-stream-suffix-axis.md slice 4 ("linear part
 // bytes").
 
 import (

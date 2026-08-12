@@ -2282,15 +2282,23 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	// those suffix frames — it would lose the full-text reference a legacy
 	// client needs. Detect "replay range contains a kind the client did not
 	// negotiate" and fall back to a fresh snapshot (the legacy client's
-	// catch-up path), recording the existing replay-fallback counter so this is
-	// observable. Opted-in clients replay KindPartAppend normally (the suffix is
-	// their negotiated format). This is the no-mixed-repair invariant from
-	// spec §4: legacy never sees part.append on the wire, live OR replay.
+	// catch-up path) by clearing replayOK. Opted-in clients replay
+	// KindPartAppend normally (the suffix is their negotiated format). This is
+	// the no-mixed-repair invariant from spec §4: legacy never sees part.append
+	// on the wire, live OR replay.
+	//
+	// Slice 7 metric hygiene: do NOT increment Stream2ReplayFallback here.
+	// Flipping replayOK=false routes this connection into the snapshot branch
+	// below, where the single PROBE 8 increment (the `hasCursor && !replayOK`
+	// site) records the fallback ONCE for BOTH fallback reasons (ring-gap
+	// cursor-too-old AND this §4.3 suffix-in-legacy-replay case). Incrementing
+	// here too double-counted a single §4.3 fallback (once here, once at the
+	// unified site). This is a METRIC-only change: replayOK still flips, so the
+	// connection still takes the snapshot path exactly as before.
 	if hasCursor && replayOK && !wantsPartDelta(r) {
 		for _, ev := range events {
 			if ev.Kind == state.KindPartAppend {
 				replayOK = false
-				diag.IncStream2ReplayFallback()
 				break
 			}
 		}

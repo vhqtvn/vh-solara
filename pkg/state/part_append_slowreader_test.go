@@ -11,7 +11,7 @@ package state
 // bounded queue, deterministic disconnect, automatic snapshot repair.
 //
 // See docs/ai/wire-protocols/part-append-streaming.md §4.2 (overload fallback)
-// and tmp/agent-runs/part-stream-redesign-brief/brief.md slice 4 ("bounded
+// and docs/ai/wire-protocols/part-stream-suffix-axis.md slice 4 ("bounded
 // queue, bounded lag or deterministic disconnect, auto snapshot repair, no
 // manual reload").
 //
@@ -75,27 +75,46 @@ func TestPartAppend_SlowReaderDropThenReconnectSnapshot(t *testing.T) {
 	//    buffered events still returns them with ok=true until exhausted, so drain
 	//    with the comma-ok form and assert we eventually hit ok=false (closed).
 	//    (drainAll cannot be used here — a closed channel is always "ready", which
-	//    would make its select-default loop run forever.)
-	nBuffered := 0
+	//    would make its select-default loop run forever.) Capture the drained
+	//    events so F2 below can attribute them to emitPartAppend's overflow
+	//    branch (KindPartAppend), not generic emit().
+	var buffered []ClientEvent
 	sawClosed := false
 	for {
-		_, ok := <-sub
+		ev, ok := <-sub
 		if !ok {
 			sawClosed = true
 			break
 		}
-		nBuffered++
-		if nBuffered > 10000 { // safety bound; never expected to hit
+		buffered = append(buffered, ev)
+		if len(buffered) > 10000 { // safety bound; never expected to hit
 			break
 		}
 	}
+	nBuffered := len(buffered)
 	if !sawClosed {
 		t.Fatalf("slow-reader-dropped subscriber channel must be CLOSED; still open after %d reads", nBuffered)
 	}
-	// The buffer was full (256 events) when the 257th flush triggered the close,
-	// so exactly 256 buffered suffixes remain readable on the closed channel.
-	if nBuffered != 256 {
-		t.Errorf("buffered events on closed channel: got %d, want 256 (the channel capacity — it filled before overflow)", nBuffered)
+	// F1 (slice-7 hardening): assert a CAPACITY bound, not an exact count. The
+	// exact nBuffered depends on how many flushes fired before overflow — which
+	// depends on the flush interval (here every delta flushes at a 1ns
+	// interval, but that is a test-environment property, not a protocol
+	// invariant). The channel has 256 slots and overflow fired
+	// (SubscriberDrops incremented above), so the readable remainder is in
+	// (0, 256].
+	if nBuffered == 0 || nBuffered > 256 {
+		t.Errorf("buffered events on closed channel: got %d, want in (0, 256] (capacity-bound; exact count depends on the flush interval)", nBuffered)
+	}
+	// F2 (slice-7 hardening): the drained frames must be KindPartAppend — this
+	// mechanically attributes the slow-reader coverage to emitPartAppend's
+	// overflow branch (the select-default close+drop+IncSubscriberDrops path),
+	// NOT to generic emit(). A different kind here would mean the test is
+	// exercising the wrong emit path and the overflow attribution is false.
+	for i, ev := range buffered {
+		if ev.Kind != KindPartAppend {
+			t.Fatalf("drained buffered event %d/%d: kind=%q, want %q (emitPartAppend overflow-branch attribution)",
+				i+1, nBuffered, ev.Kind, KindPartAppend)
+		}
 	}
 
 	// 3. Cursorless reconnect delivers the AUTHORITATIVE current state. The drop

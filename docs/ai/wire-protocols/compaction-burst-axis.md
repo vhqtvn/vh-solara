@@ -5,9 +5,10 @@
 > working scratch brief at `tmp/agent-runs/compaction-burst-brief/brief.md`,
 > which produced it 2026-08-12 via a focused read-only `/solution-brief`
 > (researcher → debate → planner). The O(L²) suffix axis is settled separately
-> — see `docs/ai/wire-protocols/part-append-streaming.md` and its §8 decision
-> section. The decision recorded here is **O1 (no-change)**; see "Decision
-> outcome" below.
+> — see `docs/ai/wire-protocols/part-append-streaming.md` §1–§2 (the O(L²)
+> suffix-axis contract) and the promoted decision record
+> `docs/ai/wire-protocols/part-stream-suffix-axis.md`. The decision recorded
+> here is **O1 (no-change)**; see "Decision outcome" below.
 
 ## Decision outcome (2026-08-12)
 
@@ -49,7 +50,7 @@ outcome and the future-O2 conditional remains auditable.
 
 # Compaction-Burst Axis — Solution Brief
 
-**Produced:** 2026-08-12 via focused `/solution-brief` (researcher → debate → planner, read-only), scoped to the compaction-burst axis only. The O(L²) suffix axis is settled — see `tmp/agent-runs/part-stream-redesign-brief/brief.md`.
+**Produced:** 2026-08-12 via focused `/solution-brief` (researcher → debate → planner, read-only), scoped to the compaction-burst axis only. The O(L²) suffix axis is settled — see `docs/ai/wire-protocols/part-stream-suffix-axis.md`.
 **Question:** How should the part-streaming redesign handle compaction-sweep bursts (many historical TOOL parts re-upserted in a short window) on the selected-session stream — and is egress handling even the right lever, given the observed burst should not have wedged a healthy link?
 **Decision:** `need_evidence` (medium confidence).
 **User context:** User chose (c) to broaden the task into one cohesive effort. This brief honors that but honestly finds the compaction axis is measurement-gated, not committed implementation.
@@ -111,4 +112,4 @@ No contradiction with the settled suffix design in the recommended path (preserv
 ## Provenance
 - Source: focused `/solution-brief` (researcher→debate→planner), dispatched 2026-08-12.
 - Evidence: user-verified opencode.db reconstruction (addendum `tmp/part-stream-linear-delta-brief.md` lines 59-87).
-- Settled context: `tmp/agent-runs/part-stream-redesign-brief/brief.md` (O(L²) axis).
+- Settled context: `docs/ai/wire-protocols/part-stream-suffix-axis.md` (O(L²) axis).

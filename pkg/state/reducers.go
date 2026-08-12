@@ -1462,7 +1462,7 @@ func (me *messageEntry) flushPartDeltasLocked(s *Store, emit bool) {
 			me.parts[partID] = updated
 			if emit {
 				// Slice 2 (part-append-streaming — see
-				// docs/ai/wire-protocols/part-append-streaming.md §2/§5/§9.2):
+				// docs/ai/wire-protocols/part-append-streaming.md §2/§5/§10):
 				// the O(L²)→O(L) lever. For an allowlisted top-level field
 				// (text/reasoning) that is NOT sealed-at-cap, emit a
 				// KindPartAppend SUFFIX to opted-in subscribers instead of

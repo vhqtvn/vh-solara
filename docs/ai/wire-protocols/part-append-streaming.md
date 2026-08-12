@@ -8,10 +8,11 @@
 > Slice 1 (this doc + telemetry) changes NO live wire format.
 
 **Status:** contract frozen for slice 2; live emission is slice 2+.
-**Spec source-of-truth:** `tmp/agent-runs/part-stream-redesign-brief/brief.md`
-(the adjudicated `/solution-brief`, medium confidence). Treat that brief's
-Decision, Q1–Q4 resolutions, and slice-1 definition as ground truth; this doc
-expands them into an implementable contract. Do not re-debate them here.
+**Spec source-of-truth:** `docs/ai/wire-protocols/part-stream-suffix-axis.md`
+(the promoted adjudicated `/solution-brief`, medium confidence). Treat that
+brief's Decision, Q1–Q4 resolutions, and slice-1 definition as ground truth;
+this doc expands them into an implementable contract. Do not re-debate them
+here.
 
 ---
 

@@ -18,6 +18,8 @@ import (
 	"net/http/httptest"
 	"testing"
 	"time"
+
+	diag "github.com/vhqtvn/vh-solara/pkg/diagnostics"
 )
 
 // TestPartAppend_LegacyReplayFallbackToSnapshot is the §4.3 negative: a legacy
@@ -65,6 +67,13 @@ func TestPartAppend_LegacyReplayFallbackToSnapshot(t *testing.T) {
 
 	// 3a. LEGACY reconnect (?sessions=s1, no part_delta=1): §4.3 must fall back
 	//     to snapshot. The legacy client must NEVER see part.append on the wire.
+	//
+	// Slice 7 metric hygiene: a single §4.3 fallback must increment
+	// Stream2ReplayFallback EXACTLY ONCE. Before the fix, the §4.3 detection
+	// site AND the unified PROBE 8 snapshot-fallback site both incremented it
+	// for the same fallback (double-count). Capture the counter around this one
+	// legacy reconnect to assert the count is exactly 1.
+	fallbackBefore := diag.Default.Stream2ReplayFallback.Load()
 	legacyReq, _ := http.NewRequest("GET", web.URL+"/vh/stream?sessions=s1", nil)
 	legacyReq.Header.Set("Last-Event-ID", cursor)
 	legacyResp, err := http.DefaultClient.Do(legacyReq)
@@ -78,6 +87,11 @@ func TestPartAppend_LegacyReplayFallbackToSnapshot(t *testing.T) {
 	}
 	if hasEvent(legacyResumed, "part.append") {
 		t.Errorf("§4.3: legacy reconnect must NEVER see part.append on the wire (live or replay), events=%v", eventNames(legacyResumed))
+	}
+	// The single §4.3 fallback above must record exactly one replay-fallback
+	// increment (no double-count).
+	if got := diag.Default.Stream2ReplayFallback.Load() - fallbackBefore; got != 1 {
+		t.Errorf("§4.3 fallback metric: Stream2ReplayFallback delta = %d, want 1 (exactly one increment per fallback)", got)
 	}
 
 	// 3b. OPTED-IN reconnect (?sessions=s1&part_delta=1) over the SAME cursor:
