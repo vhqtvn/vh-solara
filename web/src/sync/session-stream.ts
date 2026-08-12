@@ -964,6 +964,13 @@ function registerSessionMessageListeners(es: EventSource, gen: number): void {
       // (the common case). This keeps an authoritative part.upsert /
       // message.upsert / messages.batch from racing ahead of pending suffixes.
       drainPendingAppends();
+      // t1d-F1: a drain-triggered cursorless re-snapshot (offset mismatch →
+      // openSessionStream(sid, true) inside flushAppends) bumps sesGen. Re-check
+      // before applying the triggering non-append event so it does NOT reach
+      // applyMessageEvent on a stale gen — the fresh snapshot from the new
+      // connection is authoritative (MERGE via prependMessagesIfAbsent). Mirrors
+      // the post-await gen re-checks below (snapshot/batch decode).
+      if (gen !== sesGen) return;
 
       // Phase 4 — historical-page dirty-mirror hook. Mark the in-flight
       // historical page dirty ONLY for resurrection-class mutations

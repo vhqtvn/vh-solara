@@ -487,3 +487,57 @@ describe("session-stream — non-append kind drains the buffer first (seq orderi
     expect((store.state.messages[SID]?.byId?.m1?.parts?.p1 as { text?: string }).text).toBe("Hi!");
   });
 });
+
+// t1d-F1 (slice 4 carry-forward): after drainPendingAppends() in the shared
+// listener path, a drain-triggered cursorless re-snapshot (offset mismatch →
+// openSessionStream(sid, true) inside flushAppends) bumps sesGen. The post-drain
+// `if (gen !== sesGen) return` prevents the triggering non-append event from
+// reaching applyMessageEvent on a stale gen — the fresh snapshot from the new
+// connection is authoritative. Mirrors the post-await gen re-checks.
+describe("session-stream — t1d-F1: post-drain gen-recheck (drain-triggered resnapshot)", () => {
+  it("does NOT apply the triggering non-append event on a stale gen after a drain-triggered resnapshot", async () => {
+    stream.openSessionStream(SID);
+    const es = sessionESes()[0];
+    es.fire("snapshot", rawSessionSnap(1, SID, "m1"), "1");
+    // Seed part p1 with text "Hello" (5 ASCII bytes).
+    es.fire("part.upsert", { id: "p1", sessionID: SID, messageID: "m1", type: "text", text: "Hello" }, "2");
+    expect((store.state.messages[SID]?.byId?.m1?.parts?.p1 as { text?: string }).text).toBe("Hello");
+
+    // Buffer a MISMATCHED part.append (start=3 but field is 5 bytes). The next
+    // non-append event drains this synchronously → flushAppends detects the
+    // mismatch → openSessionStream(sid, true) → sesGen++.
+    es.fire("part.append", { sessionID: SID, messageID: "m1", partID: "p1", field: "text", start: 3, text: " world" }, "3");
+    expect(sesMod._hasPendingAppendsForTest()).toBe(true);
+
+    // Fire a non-append kind (message.upsert for a NEW message m2) on the SAME
+    // (now-stale) connection. The listener drains the buffer synchronously,
+    // which triggers the resnapshot (sesGen++). Without the post-drain
+    // gen-recheck, this m2 upsert would be applied on the STALE gen before the
+    // fresh snapshot lands. message.upsert payload is the FLAT MessageInfo.
+    es.fire("message.upsert", { id: "m2", sessionID: SID, role: "user", time: { created: 5 } }, "4");
+
+    // Pump microtasks so any async tail settles. The gen-recheck is synchronous
+    // (it runs before any await in the listener body — sesSnapshotDecoding is
+    // false here so the snapshot-decode await is skipped), so m2 is already
+    // deterministically absent, but pump for robustness.
+    await flushMicro();
+
+    // CRUX (t1d-F1): m2 was NOT applied — the stale-gen non-append event was
+    // blocked by the post-drain gen-recheck. m2 can only be resident if the
+    // upsert reached applyMessageEvent; it did not.
+    expect(store.state.messages[SID]?.byId?.m2).toBeUndefined();
+
+    // The drain-triggered resnapshot closed the old EventSource and opened a new
+    // one (the reconnect half of the cursorless repair).
+    expect(es.readyState).toBe(CLOSED);
+    const esAfter = sessionESes()[0];
+    expect(esAfter).not.toBe(es);
+
+    // The fresh connection's authoritative snapshot lands cleanly (m1 from the
+    // new snapshot; m2 remains absent because the stale upsert was blocked).
+    esAfter.fire("snapshot", rawSessionSnap(5, SID, "m1"), "5");
+    await flushMicro();
+    expect(store.state.messages[SID]?.byId?.m1).toBeDefined();
+    expect(store.state.messages[SID]?.byId?.m2).toBeUndefined();
+  });
+});
