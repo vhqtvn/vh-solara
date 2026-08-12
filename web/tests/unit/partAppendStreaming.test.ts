@@ -541,3 +541,105 @@ describe("session-stream — t1d-F1: post-drain gen-recheck (drain-triggered res
     expect(store.state.messages[SID]?.byId?.m2).toBeUndefined();
   });
 });
+
+// Recovery convergence (#3 from the part-streaming review): the existing mismatch
+// test above proves the TRIGGER (byte-offset mismatch → openSessionStream(sid,
+// true) cursorless re-snapshot, new EventSource). It does NOT prove the RECOVERY
+// CONVERGENCE — that after the fresh snapshot lands, a subsequent live
+// part.append with the CORRECT UTF-8 byte offset applies cleanly and the field
+// converges with NO second re-snapshot. This block closes that gap.
+//
+// Merge semantics note (why the snapshot "carrying" the authoritative field is
+// consistent, not a clobber): applySessionSnapshot merges message bodies via
+// prependMessagesIfAbsent — for a NON-completed resident message, LIVE ALWAYS
+// WINS (the resident entry is left untouched). The mismatch did NOT mutate the
+// field (no byte-splice at the wrong offset), so the resident "Hello" survives;
+// the fresh snapshot agrees with it. The crux this test observes is the
+// POST-SNAPSHOT correct-offset suffix applying cleanly and converging — the
+// snapshot-offset-coherence contract (flushAppends comment: the post-snapshot
+// suffix resumes at the client baseline).
+describe("session-stream — recovery convergence: post-re-snapshot correct suffix converges (no second re-snapshot)", () => {
+  it("after a mismatch-triggered cursorless re-snapshot, a correct-offset live suffix applies and the field converges", async () => {
+    // --- Seed: resident part p1 with text "Hello" (5 ASCII bytes). ---
+    stream.openSessionStream(SID);
+    const esBefore = sessionESes()[0];
+    esBefore.fire("snapshot", rawSessionSnap(1, SID, "m1"), "1");
+    esBefore.fire("part.upsert", { id: "p1", sessionID: SID, messageID: "m1", type: "text", text: "Hello" }, "2");
+    const partRef = store.state.messages[SID]?.byId?.m1?.parts?.p1;
+    expect((partRef as { text?: string } | undefined)?.text).toBe("Hello");
+
+    // --- (1) MISMATCH: field is 5 bytes, start claims 3 → triggers cursorless
+    //         re-snapshot (the existing trigger). The field is NOT mutated. ---
+    esBefore.fire("part.append", { sessionID: SID, messageID: "m1", partID: "p1", field: "text", start: 3, text: " world" }, "3");
+    expect(sesMod._hasPendingAppendsForTest()).toBe(true);
+    await flushMicro();
+
+    // Field UNCHANGED on mismatch (no byte-splice at the wrong offset).
+    expect((store.state.messages[SID]?.byId?.m1?.parts?.p1 as { text?: string }).text).toBe("Hello");
+    // The old EventSource was closed; a fresh cursorless one was created.
+    expect(esBefore.readyState).toBe(CLOSED);
+    const esAfter = sessionESes()[0];
+    expect(esAfter).not.toBe(esBefore);
+    // Capture sesGen right after the ONE mismatch-triggered re-snapshot — it
+    // MUST NOT bump again over the rest of the recovery arc.
+    const genAfterResnap = sesMod.getSesGen();
+
+    // --- (2) Fresh cursorless snapshot lands on the new connection, carrying
+    //         the authoritative field "Hello" for m1 PLUS a second, NON-resident
+    //         message m2. The m1 merge is live-wins for a non-completed streaming
+    //         message (no observable change), so m1 alone would not prove the
+    //         snapshot applied. m2 is absent before this snapshot, so the
+    //         insert-if-absent path seeds it unconditionally — m2 becoming
+    //         resident is the DIRECT proof the fresh snapshot landed (F3). ---
+    esAfter.fire(
+      "snapshot",
+      {
+        seq: 5,
+        gate: { [SID]: { messagesLoaded: true } },
+        messages: {
+          [SID]: [
+            {
+              info: { id: "m1", sessionID: SID, role: "assistant", time: { created: 1 } },
+              parts: [{ id: "p1", sessionID: SID, messageID: "m1", type: "text", text: "Hello" }],
+            },
+            {
+              info: { id: "m2", sessionID: SID, role: "user", time: { created: 2 } },
+              parts: [{ id: "p2", sessionID: SID, messageID: "m2", type: "text", text: "hi" }],
+            },
+          ],
+        },
+      },
+      "5",
+    );
+    expect((store.state.messages[SID]?.byId?.m1?.parts?.p1 as { text?: string }).text).toBe("Hello");
+    // F3: m2 was NOT resident before this snapshot (only m1 was seeded in step 1);
+    // it is now — direct proof the fresh cursorless snapshot applied. The m1 merge
+    // alone is unobservable (live-wins), so without m2 the snapshot-landing half
+    // of the arc is only implied. m2's part content confirms a full seed, not a
+    // stub.
+    expect(store.state.messages[SID]?.byId?.m2).toBeDefined();
+    expect((store.state.messages[SID]?.byId?.m2?.parts?.p2 as { text?: string }).text).toBe("hi");
+
+    // --- (3) Subsequent CORRECT live suffix on the new connection: start=5
+    //         (matches the resident field's UTF-8 byte length), text=" world".
+    //         This is the post-snapshot suffix the snapshot-offset-coherence
+    //         contract guarantees. ---
+    esAfter.fire("part.append", { sessionID: SID, messageID: "m1", partID: "p1", field: "text", start: 5, text: " world" }, "6");
+    expect(sesMod._hasPendingAppendsForTest()).toBe(true);
+    await flushMicro();
+
+    // --- CRUX: the field converged to "Hello world" (snapshot baseline + the
+    //         correctly-offset suffix). ---
+    expect(sesMod._hasPendingAppendsForTest()).toBe(false);
+    expect((store.state.messages[SID]?.byId?.m1?.parts?.p1 as { text?: string }).text).toBe("Hello world");
+    // Object identity PRESERVED through mismatch (no mutation) + snapshot
+    // (live-wins merge) + correct suffix (in-place append): no Part object
+    // recreated — chat-row identity + scroll preserved across the repair.
+    expect(store.state.messages[SID]?.byId?.m1?.parts?.p1).toBe(partRef);
+    // NO second re-snapshot: sesGen is stable after the one mismatch-triggered
+    // bump (the correct-offset suffix did not mismatch → no new openSessionStream).
+    expect(sesMod.getSesGen()).toBe(genAfterResnap);
+    // And the recovery EventSource survived (not CLOSED by a second re-snapshot).
+    expect(esAfter.readyState).not.toBe(CLOSED);
+  });
+});

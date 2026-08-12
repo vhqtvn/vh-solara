@@ -55,7 +55,7 @@ and [`docs/ai/wire-protocols/compaction-burst-axis.md`](../ai/wire-protocols/com
 
 ---
 
-## Exec receipts — B1 closure (full canonical set, bound to the final working tree)
+## Exec receipts — B1 closure (canonical set for the slice scope, bound to the final working tree)
 
 Run after all slice-7 edits, on the working tree that will be committed (HEAD =
 `f65db77` + uncommitted slice-7 edits; the only untracked non-slice file is
@@ -182,10 +182,17 @@ build exit=0
 
 ## Findings
 
-- **The full canonical set is green bound to the final tree (B1 satisfied):**
-  source=fresh exec receipts above, confidence=high, type=fact. The one web-unit
-  failure is the pre-existing `sesSnapshotOwnership` flake (passes in
-  isolation); it is not a part-streaming regression.
+- **The canonical set for the slice scope is green bound to the final tree (B1
+  satisfied modulo the pre-existing `sesSnapshotOwnership` flake):**
+  source=fresh exec receipts above, confidence=high, type=fact. The scope is the
+  lane-1 Go form (`go test ./pkg/...` — the slice touched only pkg/), `-race` on
+  pkg/state, web unit, typecheck, gofmt, and `go build ./...` (which covers
+  cmd/tests/tools that are source-untouched). The one web-unit failure is the
+  pre-existing `sesSnapshotOwnership` flake (passes deterministically in
+  isolation, 3/3 twice); it is unrelated to part-streaming and is not a
+  regression. The redesign's load-bearing crux (O(L²)→O(L)) is proven at the Go
+  seam (linearity test above); the live browser SSE→apply chain remains a
+  deferred e2e (already listed under deferred follow-up (a)).
 - **The metric fix is the only runtime change and is test-observed:**
   source=`TestPartAppend_LegacyReplayFallbackToSnapshot` (delta==1 assertion,
   PASS), confidence=high, type=fact. Before the fix, the §4.3 path incremented
@@ -199,7 +206,9 @@ build exit=0
   kind attribution check. Neither altered the behavior under test.
 - **Brief promotion + citation repoints are docs-only:** source=`git grep
   'tmp/agent-runs/part-stream-redesign-brief'` returns nothing over tracked
-  files, confidence=high, type=fact.
+  files except the promoted doc's own provenance header at
+  `docs/ai/wire-protocols/part-stream-suffix-axis.md:5` (intentional historical
+  attribution, not a navigation citation), confidence=high, type=fact.
 
 ## Verification
 
@@ -215,7 +224,7 @@ build exit=0
 | Metric double-count fixed (== 1 per §4.3 fallback) | `TestPartAppend_LegacyReplayFallbackToSnapshot` PASS (delta==1 assertion) | yes |
 | Slow-reader F1/F2 hardening holds | `TestPartAppend_SlowReaderDropThenReconnectSnapshot` PASS (capacity bound + KindPartAppend attribution) | yes |
 | O(L²)→O(L) crux holds on final tree | linearity test → 1.70×L vs 129×L, ratio 75.9× at 32 KiB | yes |
-| No tracked tmp/agent-runs/part-stream-redesign-brief refs remain | `git grep 'tmp/agent-runs/part-stream-redesign-brief'` → (none) | yes |
+| No tracked tmp/agent-runs/part-stream-redesign-brief refs remain | `git grep 'tmp/agent-runs/part-stream-redesign-brief'` → nothing except the promoted doc's own provenance header at `docs/ai/wire-protocols/part-stream-suffix-axis.md:5` (intentional historical attribution, not a navigation citation) | yes |
 | No runtime behavior changed except the metric increment count | slice diff is: 1 metric line removed (server.go), 2 test assertions loosened/added, comments + docs | yes |
 
 ## Contradictions
