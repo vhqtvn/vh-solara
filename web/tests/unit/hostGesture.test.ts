@@ -71,12 +71,14 @@ interface TapOpts {
   y?: number;
   isPrimary?: boolean;
   target?: Element;
+  pointerType?: string;
+  pointerId?: number;
 }
 
 /** Send a pointerdown on `target` (bubbles to window). jsdom's PointerEvent may
- *  not exist or may not accept isPrimary via the constructor, so define it on
- *  the instance. Returns a preventDefault spy so a test asserts the 3rd-tap-only
- *  preventDefault. */
+ *  not exist or may not accept isPrimary/pointerType/pointerId via the
+ *  constructor, so define them on the instance. Returns a preventDefault spy so
+ *  a test asserts the 3rd-tap-only preventDefault. */
 function sendTap(opts: TapOpts = {}): { preventDefault: ReturnType<typeof vi.fn> } {
   const target = opts.target ?? document.body;
   const preventDefault = vi.fn();
@@ -92,10 +94,68 @@ function sendTap(opts: TapOpts = {}): { preventDefault: ReturnType<typeof vi.fn>
     value: opts.isPrimary ?? true,
     configurable: true,
   });
+  if (opts.pointerType !== undefined) {
+    Object.defineProperty(ev, "pointerType", { value: opts.pointerType, configurable: true });
+  }
+  // Distinct pointerId per contact is required for the 3-finger recognizer's
+  // active-pointer Set (jsdom defaults pointerId to 0, collapsing all fingers).
+  Object.defineProperty(ev, "pointerId", { value: opts.pointerId ?? 1, configurable: true });
   Object.defineProperty(ev, "target", { value: target, configurable: true });
   ev.preventDefault = preventDefault;
   target.dispatchEvent(ev);
   return { preventDefault };
+}
+
+/** Send a pointerup for `pointerId` (bubbles to window). The 3-finger recognizer
+ *  tracks lift via pointerup/pointercancel to clear its active-pointer Set. */
+function sendPointerUp(pointerId: number, target: Element = document.body): void {
+  const ctor: typeof PointerEvent =
+    typeof PointerEvent !== "undefined" ? PointerEvent : (MouseEvent as unknown as typeof PointerEvent);
+  const ev = new ctor("pointerup", { bubbles: true, cancelable: true });
+  Object.defineProperty(ev, "pointerId", { value: pointerId, configurable: true });
+  target.dispatchEvent(ev);
+}
+
+/** Simulate a 3-finger-tap: three touch pointers (1 primary + 2 non-primary)
+ *  landing near-simultaneously on `target`, each with a distinct pointerId and
+ *  a realistic small position spread. Returns the 3rd pointerdown's
+ *  preventDefault spy (the one that fires the gesture). */
+function sendThreeFingerTap(opts: { x?: number; y?: number; target?: Element } = {}): {
+  preventDefault: ReturnType<typeof vi.fn>;
+} {
+  const target = opts.target ?? document.body;
+  const baseX = opts.x ?? 0;
+  const baseY = opts.y ?? 0;
+  const specs = [
+    { id: 10, isPrimary: true, dx: 0, dy: 0 },
+    { id: 11, isPrimary: false, dx: 40, dy: 5 },
+    { id: 12, isPrimary: false, dx: 80, dy: 0 },
+  ];
+  let lastPd: ReturnType<typeof vi.fn> = vi.fn();
+  for (const s of specs) {
+    const preventDefault = vi.fn();
+    const ctor: typeof PointerEvent =
+      typeof PointerEvent !== "undefined" ? PointerEvent : (MouseEvent as unknown as typeof PointerEvent);
+    const ev = new ctor("pointerdown", {
+      clientX: baseX + s.dx,
+      clientY: baseY + s.dy,
+      bubbles: true,
+      cancelable: true,
+    });
+    Object.defineProperty(ev, "isPrimary", { value: s.isPrimary, configurable: true });
+    Object.defineProperty(ev, "pointerType", { value: "touch", configurable: true });
+    Object.defineProperty(ev, "pointerId", { value: s.id, configurable: true });
+    Object.defineProperty(ev, "target", { value: target, configurable: true });
+    ev.preventDefault = preventDefault;
+    target.dispatchEvent(ev);
+    lastPd = preventDefault;
+  }
+  return { preventDefault: lastPd };
+}
+
+/** Lift all three fingers of a sendThreeFingerTap (ids 10/11/12). */
+function sendThreeFingerUp(target: Element = document.body): void {
+  for (const id of [10, 11, 12]) sendPointerUp(id, target);
 }
 
 /** Overlay-request message count captured to the parent. Filters to the
@@ -344,17 +404,19 @@ describe("host gesture — mobile triple-tap", () => {
     expect(b.preventDefault, "2nd tap not default-prevented").not.toHaveBeenCalled();
   });
 
-  it("taps too slow (> 600ms window) → the chain expires, no recognition", () => {
+  it("taps too slow (> 500ms gap between taps) → the chain expires, no recognition", () => {
     sendTap(); // first (T=0)
-    sendTap(); // second (T=0, chains)
-    vi.advanceTimersByTime(700); // exceed the 600ms window
-    // A third tap now is OUTSIDE the window → starts a NEW chain (becomes its
-    // first), so the original triple never completes.
+    sendTap(); // second (T=0, chains: 0ms gap ≤ 500ms)
+    vi.advanceTimersByTime(700); // exceed the 500ms per-gap window
+    // A third tap now is OUTSIDE the per-gap window → starts a NEW chain
+    // (becomes its first), so the original triple never completes.
     sendTap();
     expect(overlayCount(posted), "slow sequence does not complete").toBe(0);
   });
 
-  it("movement beyond MAX_MOVEMENT_PX (> 12px) resets", () => {
+  it("movement beyond MAX_MOVEMENT_PX (> 12px for mouse) resets", () => {
+    // Mouse/pen keep the tight 12px tolerance (touch gets 30px — see the
+    // real-touch suite). These taps use the default pointerType (mouse).
     sendTap({ x: 0, y: 0 });
     sendTap({ x: 5, y: 5 }); // within 12px (≈7px)
     sendTap({ x: 100, y: 0 }); // far outside → resets, this becomes a new first
@@ -390,14 +452,18 @@ describe("host gesture — mobile triple-tap", () => {
     el.remove();
   });
 
-  it("multi-touch (a non-primary pointer) cancels an in-flight sequence", () => {
+  it("a non-primary pointer does NOT cancel an in-flight sequence (softened for real touch)", () => {
+    // Real touch routinely brushes a palm/thumb edge as a brief second pointer;
+    // the OLD hard-cancel rejected almost every real triple-tap. The sequential
+    // recognizer now IGNORES non-primary pointerdowns (genuine multi-finger
+    // intent is the 3-finger-tap recognizer's job). The primary sequence
+    // continues and completes.
     sendTap();
     sendTap();
-    // A second finger (non-primary) cancels.
-    sendTap({ isPrimary: false });
-    sendTap();
-    sendTap();
-    expect(overlayCount(posted), "multi-touch cancelled → no recognition").toBe(0);
+    sendTap({ isPrimary: false }); // ignored (does not reset)
+    const { preventDefault } = sendTap(); // primary 3rd tap → recognizes
+    expect(overlayCount(posted), "non-primary ignored → recognized").toBe(1);
+    expect(preventDefault).toHaveBeenCalled();
   });
 
   it("a non-collapsed text selection cancels", () => {
@@ -617,5 +683,243 @@ describe("host gesture — pane-activate forward", () => {
     sendFromParent(parent, { type: "host-mode", mode: "keyboard-focus" });
     sendTap();
     expect(activateCount(posted), "keyboard-focus active → activate still fires").toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// MOBILE (real-touch): imperfect pointer sequences the OLD recognizer rejected.
+// ---------------------------------------------------------------------------
+// Operator report m0309: "3 fingers still doesn't work" on Edge Android. The
+// headless synthetic tests above (perfectly aligned, single-pointer, default
+// pointerType) NEVER exercised the real-touch failure class. Real finger taps
+// drift 15-25px on landing+lift, an incidental palm/thumb edge routinely
+// registers a brief second pointer, and "3 fingers" may literally mean a
+// 3-finger-tap (3 simultaneous pointers). The OLD recognizer's 12px movement
+// gate + hard multi-touch cancel rejected every real sequence. These cases pin
+// the real-touch failure class and MUST recognize.
+
+describe("host gesture — real-touch triple-tap (imperfect sequences)", () => {
+  let parent: Window;
+  let posted: Posted[];
+  let dispose: (() => void) | undefined;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    const fake = makeFakeParent();
+    parent = fake.parent;
+    posted = fake.posted;
+    Object.defineProperty(window, "parent", { configurable: true, get: () => parent });
+    dispose = startHostGesture();
+    sendFromParent(parent, { type: "vh-host-handshake", nonce: "n" });
+  });
+  afterEach(() => {
+    dispose?.();
+    dispose = undefined;
+    vi.clearAllTimers();
+    vi.useRealTimers();
+    window.getSelection()?.removeAllRanges();
+    Object.defineProperty(window, "parent", { configurable: true, value: window });
+  });
+
+  it("real-touch drift (18-24px between taps) is recognized", () => {
+    // A 12px-from-first gate rejects every real touch sequence (real fingers
+    // drift 15-25px on landing+lift; 3 separate landings drift more).
+    sendTap({ pointerType: "touch", x: 0, y: 0 });
+    vi.advanceTimersByTime(250);
+    sendTap({ pointerType: "touch", x: 18, y: 0 });
+    vi.advanceTimersByTime(250);
+    const { preventDefault } = sendTap({ pointerType: "touch", x: 24, y: 5 });
+    expect(overlayCount(posted), "real-touch drift → recognized").toBe(1);
+    expect(preventDefault).toHaveBeenCalled();
+  });
+
+  it("realistic inter-tap timing (~350ms gaps, ~700ms total) is recognized", () => {
+    // A tight total window rejects real taps (the operator is not speed-tapping
+    // a pane surface); ~700ms total is typical for a deliberate triple-tap.
+    sendTap({ pointerType: "touch", x: 0, y: 0 });
+    vi.advanceTimersByTime(350);
+    sendTap({ pointerType: "touch", x: 4, y: 4 });
+    vi.advanceTimersByTime(350);
+    sendTap({ pointerType: "touch", x: 6, y: 3 });
+    expect(overlayCount(posted), "real inter-tap timing → recognized").toBe(1);
+  });
+
+  it("a fleeting non-primary pointer (palm) does NOT cancel the sequence", () => {
+    // Real touch routinely registers an incidental palm/thumb edge as a brief
+    // second pointer. Hard-cancelling on any non-primary pointerdown rejects
+    // almost every real triple-tap.
+    sendTap({ pointerType: "touch", x: 0, y: 0 });
+    vi.advanceTimersByTime(250);
+    sendTap({ pointerType: "touch", x: 5, y: 5 });
+    vi.advanceTimersByTime(50);
+    // Palm brushes the screen: a non-primary pointerdown that lifts immediately.
+    sendTap({ pointerType: "touch", isPrimary: false, pointerId: 7 });
+    sendPointerUp(7);
+    vi.advanceTimersByTime(200);
+    const { preventDefault } = sendTap({ pointerType: "touch", x: 8, y: 6 });
+    expect(overlayCount(posted), "palm did not cancel → recognized").toBe(1);
+    expect(preventDefault).toHaveBeenCalled();
+  });
+
+  it("a pointercancel between taps (micro-scroll) does not break the sequence", () => {
+    // A micro-scroll fires pointercancel mid-tap on real touch. The recognizer
+    // (pointerdown-driven) must not let a cancel between taps void the count.
+    sendTap({ pointerType: "touch", x: 0, y: 0 });
+    vi.advanceTimersByTime(250);
+    sendTap({ pointerType: "touch", x: 4, y: 4 });
+    vi.advanceTimersByTime(50);
+    // pointercancel (no pointer is down here, but the event must be harmless).
+    const ctor: typeof PointerEvent =
+      typeof PointerEvent !== "undefined" ? PointerEvent : (MouseEvent as unknown as typeof PointerEvent);
+    const cancel = new ctor("pointercancel", { bubbles: true, cancelable: true });
+    Object.defineProperty(cancel, "pointerId", { value: 1, configurable: true });
+    document.body.dispatchEvent(cancel);
+    vi.advanceTimersByTime(200);
+    sendTap({ pointerType: "touch", x: 6, y: 3 });
+    expect(overlayCount(posted), "pointercancel did not void the count → recognized").toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// MOBILE: 3-finger-tap (the literal "3 fingers" interpretation, robust on real
+// touch). Shipped ALONGSIDE the relaxed sequential triple-tap — both are cheap;
+// the operator picks what feels right on-device. Same closed overlay-request
+// message + captured-origin targeting; only the RECOGNIZER widened.
+// ---------------------------------------------------------------------------
+
+describe("host gesture — mobile 3-finger-tap", () => {
+  let parent: Window;
+  let posted: Posted[];
+  let dispose: (() => void) | undefined;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    const fake = makeFakeParent();
+    parent = fake.parent;
+    posted = fake.posted;
+    Object.defineProperty(window, "parent", { configurable: true, get: () => parent });
+    dispose = startHostGesture();
+    sendFromParent(parent, { type: "vh-host-handshake", nonce: "n" });
+  });
+  afterEach(() => {
+    dispose?.();
+    dispose = undefined;
+    vi.clearAllTimers();
+    vi.useRealTimers();
+    Object.defineProperty(window, "parent", { configurable: true, value: window });
+  });
+
+  it("three simultaneous touch fingers → recognized", () => {
+    const { preventDefault } = sendThreeFingerTap();
+    expect(overlayCount(posted), "3-finger-tap → recognized").toBe(1);
+    expect(preventDefault, "preventDefault on the firing (3rd) pointerdown").toHaveBeenCalled();
+  });
+
+  it("posts the SAME closed overlay-request payload (no contract widening)", () => {
+    sendThreeFingerTap();
+    const ov = posted.filter((p) => p.msg.gesture === "layout-overlay-request");
+    expect(ov.length, "exactly one overlay-request").toBe(1);
+    expect(ov[0].msg.type, "closed type").toBe("host-gesture");
+    expect(ov[0].msg.gesture, "closed gesture value").toBe("layout-overlay-request");
+    expect(Object.keys(ov[0].msg).sort(), "exactly {type, gesture}").toEqual(["gesture", "type"]);
+  });
+
+  it("targets the captured host origin (never '*')", () => {
+    sendThreeFingerTap();
+    const ov = posted.filter((p) => p.msg.gesture === "layout-overlay-request");
+    expect(ov[0].origin, "origin-bound to handshake origin").toBe(HOST_ORIGIN);
+  });
+
+  it("suppresses while keyboard-focus-mode is active", () => {
+    sendFromParent(parent, { type: "host-mode", mode: "keyboard-focus" });
+    sendThreeFingerTap();
+    expect(overlayCount(posted), "keyboard-focus active → suppressed").toBe(0);
+  });
+
+  it("does not double-fire with sequential triple-tap across repeated gestures", () => {
+    // Three consecutive 3-finger-taps: each fires exactly ONCE. The sequential
+    // recognizer (which also sees each gesture's primary finger) must not
+    // accumulate across gestures and double-fire on the 3rd.
+    sendThreeFingerTap();
+    sendThreeFingerUp();
+    sendThreeFingerTap();
+    sendThreeFingerUp();
+    sendThreeFingerTap();
+    sendThreeFingerUp();
+    expect(overlayCount(posted), "exactly one per gesture (no double-fire)").toBe(3);
+  });
+
+  it("a non-touch (mouse) 3-click does NOT trigger the 3-finger recognizer", () => {
+    // 3-finger-tap is touch-only; a mouse can't have 3 simultaneous pointers.
+    // Three sequential mouse clicks route through the sequential recognizer.
+    const ctor: typeof PointerEvent =
+      typeof PointerEvent !== "undefined" ? PointerEvent : (MouseEvent as unknown as typeof PointerEvent);
+    for (const id of [10, 11, 12]) {
+      const ev = new ctor("pointerdown", { clientX: id * 10, clientY: 0, bubbles: true, cancelable: true });
+      Object.defineProperty(ev, "pointerType", { value: "mouse", configurable: true });
+      Object.defineProperty(ev, "pointerId", { value: id, configurable: true });
+      Object.defineProperty(ev, "isPrimary", { value: id === 10, configurable: true });
+      Object.defineProperty(ev, "target", { value: document.body, configurable: true });
+      document.body.dispatchEvent(ev);
+    }
+    // Only the sequential recognizer should see these; with the 30px/40px/80px
+    // spread and mouse tolerance, no recognition. (The point: no 3-finger fire.)
+    expect(overlayCount(posted), "mouse multi-click → no 3-finger fire").toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// MOBILE: interactive-filter narrowing — tabindex="-1" is programmatic-focus,
+// not operator-aimed (scroll containers, QuestionCard/PermissionCard/Mermaid).
+// A triple-tap on such a container must NOT be rejected.
+// ---------------------------------------------------------------------------
+
+describe("host gesture — interactive filter excludes tabindex='-1'", () => {
+  let parent: Window;
+  let posted: Posted[];
+  let dispose: (() => void) | undefined;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    const fake = makeFakeParent();
+    parent = fake.parent;
+    posted = fake.posted;
+    Object.defineProperty(window, "parent", { configurable: true, get: () => parent });
+    dispose = startHostGesture();
+    sendFromParent(parent, { type: "vh-host-handshake", nonce: "n" });
+  });
+  afterEach(() => {
+    dispose?.();
+    dispose = undefined;
+    vi.clearAllTimers();
+    vi.useRealTimers();
+    Object.defineProperty(window, "parent", { configurable: true, value: window });
+  });
+
+  it("a tap on a tabindex='-1' container is NOT treated as interactive", () => {
+    const el = document.createElement("div");
+    el.setAttribute("tabindex", "-1");
+    document.body.appendChild(el);
+    sendTap({ pointerType: "touch", target: el });
+    sendTap({ pointerType: "touch", target: el, x: 2, y: 2 });
+    const { preventDefault } = sendTap({ pointerType: "touch", target: el, x: 3, y: 3 });
+    expect(overlayCount(posted), "tabindex=-1 not interactive → recognized").toBe(1);
+    expect(preventDefault).toHaveBeenCalled();
+    el.remove();
+  });
+
+  it("a tap on a tabindex='0' element IS still treated as interactive", () => {
+    // tabindex="0" puts the element in the tab order (operator-reachable via
+    // keyboard) — tapping it is aiming at a focusable control, not gesturing.
+    const el = document.createElement("div");
+    el.setAttribute("tabindex", "0");
+    document.body.appendChild(el);
+    sendTap({ target: el });
+    sendTap({ target: el, x: 2, y: 2 });
+    sendTap({ target: el, x: 3, y: 3 });
+    sendTap();
+    sendTap();
+    expect(overlayCount(posted), "tabindex=0 still interactive → no recognition").toBe(0);
+    el.remove();
   });
 });
