@@ -27,6 +27,29 @@ const (
 	KindMessageDelete = "message.delete"
 	KindPartUpsert    = "part.upsert"
 	KindPartDelete    = "part.delete"
+	// KindPartAppend (slice 2 of part-append-streaming — see
+	// docs/ai/wire-protocols/part-append-streaming.md) is the SUFFIX wire frame
+	// for a streaming text field on an opted-in connection
+	// (`/vh/stream?part_delta=1`). Payload:
+	//   {sessionID, messageID, partID, field, start, text}
+	// where `start` is the UTF-8 BYTE offset at which `text` is to be appended
+	// into the client's accumulated `field` value, and `text` is only the bytes
+	// emitted SINCE the last flush (NOT the full accumulated text). Emitted
+	// from flushPartDeltasLocked for the allowlisted top-level fields
+	// (text/reasoning) only; tool/nested-state.output/completion/sealed-at-cap
+	// fields keep the full KindPartUpsert path.
+	//
+	// One encoding per connection: an opted-in subscriber receives KindPartAppend
+	// (suffix); a legacy subscriber receives the synthesized KindPartUpsert
+	// (full) at the SAME seq — never both on one wire for the same (part,field).
+	// The RING records the KindPartAppend only (the legacy synthesized upsert is
+	// NOT separately in the ring). A legacy connection whose replay range
+	// contains a KindPartAppend therefore falls back to a fresh snapshot (spec
+	// §4.3) — legacy clients must never interpret a suffix they did not
+	// negotiate. Shares the existing 4096-event ring + global sequence space
+	// (same IsMessageClassKind session-interest rules as KindPartUpsert), so
+	// resume/replay work for opted-in clients and the sequence stays monotonic.
+	KindPartAppend = "part.append"
 	// KindMessagesLoaded is the authoritative "this session's full message
 	// history has been fetched and reconciled" completion signal for an
 	// on-demand (lazy async) hydration. Emitted by the aggregator's
@@ -485,6 +508,16 @@ type messageEntry struct {
 	// authoritative snapshot or a reconcile reseeds the accumulator from a new
 	// base, re-evaluating the cap).
 	sealedFields map[string]bool
+	// deltaSentLen tracks, per (partID+"\x00"+field), how many bytes of the
+	// accumulated field text have already been emitted to an OPTED-IN
+	// (part_delta=1) connection as KindPartAppend suffixes. The next suffix
+	// flush starts at this offset: start = deltaSentLen[key], suffix =
+	// fullText[start:]. Seeded to the accumulator's base length when the buffer
+	// is first created in appendPartDeltaLocked (the bytes an opted-in client
+	// already holds from the base part.upsert), advanced to len(fullText) on
+	// each flush, and cleared alongside deltaBuf (discardPartDeltaLocked /
+	// reconcileMessagesLocked reset). Slice 2 of part-append-streaming.
+	deltaSentLen map[string]int
 	// deltaLastEmit bounds the part.upsert emit rate for THIS message's streaming
 	// field: a delta appends to deltaBuf unconditionally, but the (O(part size)
 	// marshal + emit + ring push) only fires when time.Since(deltaLastEmit) >=

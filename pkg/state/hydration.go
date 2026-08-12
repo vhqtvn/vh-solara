@@ -255,6 +255,10 @@ func (s *Store) reconcileMessagesLocked(sid string, list []MessageWithParts) (co
 			me.deltaBuf = nil
 			me.deltaLastEmit = time.Time{}
 			me.sealedFields = nil
+			// Slice 2 (part-append-streaming): clear the suffix sent-offset
+			// tracker so the next burst's first suffix starts at the new
+			// authoritative base length (re-seeded in appendPartDeltaLocked).
+			me.deltaSentLen = nil
 		}
 
 		for _, part := range mwp.Parts {

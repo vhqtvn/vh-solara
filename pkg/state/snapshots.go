@@ -362,41 +362,53 @@ func projectPartCaptured(pc snapPartCap) json.RawMessage {
 //
 // scopeSelected gates ONLY the len > 0 case; nil and empty-{} are UNCHANGED.
 //
-// Snapshot is a PURE READ PROJECTION: it mutates NO store state. It runs in two
-// phases so a writer (Apply, which holds s.mu for write) is NOT blocked behind
-// the heavy part of the work:
+// Snapshot runs in two phases. The first (FLUSH+CAPTURE) holds the WRITE lock:
+// it flushes buffered streaming deltas so the snapshot baseline coheres with
+// the part.append suffix offset contract (B-F1 fix), then captures. The flush
+// is a WRITE (it mutates me.parts, emits events, advances deltaSentLen), which
+// is why the lock is Lock (not RLock). The second phase (MATERIALIZE) is a pure
+// lock-free assembly from private copies:
 //
-//  1. CAPTURE under s.mu.RLock: copy every mutable field the materialization
+//  0. FLUSH+CAPTURE under s.mu.Lock: first flushAllBufferedDeltasLocked flushes
+//     every accumulator with unflushed bytes (emit + advance deltaSentLen +
+//     bump deltaLastEmit + bumpMsgRev) so me.parts becomes authoritative and
+//     deltaSentLen == len(field text) == the projected snapshot field length;
+//     then captureSnapshotLocked copies every mutable field the materialization
 //     will read into locals (snapSessionCap / snapPartCap / snapMessageCap plus
 //     the per-session byte-slice maps). All json.RawMessage bytes are COPIED so
-//     the locals never alias store-owned backing arrays. This is the ONLY span
-//     that holds the read lock. The subtreeBusy projection is built here by
-//     reading the maintained subtreeBusyCount index per node; its
-//     self-contained result map is kept whole.
+//     the locals never alias store-owned backing arrays. The flush and capture
+//     share ONE lock span so no new delta can buffer between them — this is the
+//     invariant that makes the baseline cohere. Without the flush, a cursorless
+//     snapshot taken while deltas sit behind the throttle would project the full
+//     accumulated text (via captureDeltaText) but leave deltaSentLen stale, so
+//     the next suffix would start behind the client's baseline (byte-offset
+//     contract violation + re-send of snapshot bytes). The subtreeBusy
+//     projection is built in the capture by reading the maintained
+//     subtreeBusyCount index per node; its self-contained result map is kept
+//     whole.
 //
-//  2. MATERIALIZE after s.mu.RUnlock: build the Snapshot struct purely from the
+//  1. MATERIALIZE after s.mu.Unlock: build the Snapshot struct purely from the
 //     captured locals, calling projectPartCaptured per part. The expensive JSON
 //     unmarshal+marshal for parts with buffered deltas happens HERE, outside the
-//     lock. No field of s.* / se.* / me.* is read after RUnlock.
+//     lock. No field of s.* / se.* / me.* is read after Unlock.
 //
-// The narrowing is real for parts WITH buffered deltas (active streaming): the
-// unmarshal+marshal moves out of the reader window, so a concurrent Apply no
-// longer waits on it. For parts WITHOUT deltas (the common, static case) the
-// capture does the same single byte-copy of the base that the old fast path did,
-// then materialize assigns it directly — so the lock-window work for those parts
-// is unchanged; the win is targeted at the streaming-contention case (large
-// transcripts with active part-delta ingestion), not the static-snapshot case.
+// The lock window is flush+capture (both bounded: the flush touches only parts
+// with unflushed bytes via hasUnflushedDeltasLocked; the capture copies bytes
+// without heavy JSON work). The expensive JSON unmarshal+marshal for
+// delta-overlaid parts runs in the lock-free materialize phase, so a concurrent
+// Apply is NOT blocked behind it. Apply IS blocked behind the flush+capture
+// span — that is expected and is the B-F1 correctness mechanism (the snapshot
+// baseline must cohere with the suffix offset). The monotonic msgRev machinery
+// (bumpMsgRev) is bumped by the flush for any session whose parts were flushed
+// (so a concurrently-packaging cold batch discards its stale projection and
+// retries with the post-flush text — correct, bounded by publishColdBatch's
+// retry loop).
 //
-// Apply (the writer) still waits for the CAPTURE of any in-flight Snapshot —
-// that is expected and fine; this method narrows the reader window from
-// "capture+project+materialize+copy" to "capture", it does not eliminate writer
-// blocking. The monotonic msgRev machinery (bumpMsgRev) stays on the Apply/flush
-// path; Snapshot never bumps it.
-//
-// All json.RawMessage bytes that escape RLock are conservatively COPIED so they
-// never alias store-owned backing arrays (a later writer under the write lock
-// would otherwise be free to replace those slices — copying keeps the snapshot
-// safe under the race detector and against any future in-place mutation).
+// All json.RawMessage bytes that escape the lock are conservatively COPIED so
+// they never alias store-owned backing arrays (a later writer under the write
+// lock would otherwise be free to replace those slices — copying keeps the
+// snapshot safe under the race detector and against any future in-place
+// mutation).
 //
 // OWNERSHIP AUDIT (why each capture copies what it does):
 //   - Store maps (sessions/messages/todos/perms/questions/statuses/activity/
@@ -406,7 +418,7 @@ func projectPartCaptured(pc snapPartCap) json.RawMessage {
 //     their scalar fields are mutated in place by recomputeLastAssistantLocked
 //     and setCurrentVerbLocked → all scalar facts + the info/lastTokens/
 //     currentVerb.State bytes are copied into snapSessionCap; no *sessionEntry
-//     is retained past RUnlock.
+//     is retained past the lock release.
 //   - messageEntry fields are mutated in place: upsertMessageLocked replaces
 //     info/role/etc; upsertPartLocked does me.parts[id]=... and reassigns
 //     me.partOrder; appendPartDeltaLocked mutates a strings.Builder VALUE in
@@ -418,9 +430,18 @@ func projectPartCaptured(pc snapPartCap) json.RawMessage {
 //     the builder's mutable backing array — a bare .String() would NOT suffice
 //     in Go 1.25 (it returns unsafe.String over the builder's buffer, no copy).
 func (s *Store) Snapshot(messagesFor map[string]bool) Snapshot {
-	s.mu.RLock()
+	// B-F1 fix: flush buffered streaming deltas BEFORE capture so the snapshot
+	// baseline agrees with the part.append suffix offset for opted-in
+	// (part_delta=1) connections. The flush mutates me.parts + emits +
+	// advances deltaSentLen, so it needs the WRITE lock; the flush and capture
+	// MUST share one lock span so no new delta can buffer between them (the
+	// invariant that makes the baseline cohere). Materialization stays
+	// lock-free (the capture's private copies never alias store memory after
+	// Unlock). See flushAllBufferedDeltasLocked.
+	s.mu.Lock()
+	s.flushAllBufferedDeltasLocked()
 	c := s.captureSnapshotLocked(messagesFor)
-	s.mu.RUnlock()
+	s.mu.Unlock()
 	if snapshotMaterializeHook != nil {
 		snapshotMaterializeHook()
 	}
@@ -429,9 +450,9 @@ func (s *Store) Snapshot(messagesFor map[string]bool) Snapshot {
 
 // snapshotCapture holds the private copies of every mutable store field the
 // detail Snapshot materialization reads, captured under s.mu (the no-aliasing
-// invariant: nothing read after RUnlock aliases store memory). Extracted from
-// Snapshot so SnapshotWithTree can run the detail capture inside the SAME
-// RLock as the tree computation (Q5 capture consolidation).
+// invariant: nothing read after the lock release aliases store memory).
+// Extracted from store.go so SnapshotWithTree can run the detail capture inside
+// the SAME lock as the tree computation (Q5 capture consolidation).
 type snapshotCapture struct {
 	epoch       string
 	seq         uint64
@@ -447,10 +468,12 @@ type snapshotCapture struct {
 }
 
 // captureSnapshotLocked is the CAPTURE PHASE of Snapshot. Caller MUST hold s.mu
-// (at least RLock). It copies every mutable field into a snapshotCapture
-// (private copies; nothing aliases store memory after return). Extracted
-// verbatim from the former Snapshot capture phase so the no-aliasing invariant
-// is preserved (Q5 acceptance gate: no behavioral change to the capture).
+// (at least RLock; the Snapshot entrypoints hold the WRITE Lock so the B-F1
+// flush can run atomically before this — see Snapshot / flushAllBufferedDeltas
+// Locked). It copies every mutable field into a snapshotCapture (private copies;
+// nothing aliases store memory after return). Extracted verbatim from the
+// former Snapshot capture phase so the no-aliasing invariant is preserved (Q5
+// acceptance gate: no behavioral change to the capture).
 func (s *Store) captureSnapshotLocked(messagesFor map[string]bool) snapshotCapture {
 	scopeSelected := messagesFor != nil && len(messagesFor) > 0
 	// inScope reports whether a session's per-session structural rows should
@@ -463,11 +486,11 @@ func (s *Store) captureSnapshotLocked(messagesFor map[string]bool) snapshotCaptu
 		return messagesFor[sid]
 	}
 
-	// --- CAPTURE PHASE (under s.mu.RLock) ---
+	// --- CAPTURE PHASE (under s.mu, held by the caller) ---
 	// Copy every mutable field the materialization will read into locals. After
-	// RUnlock NOTHING may alias store-owned memory — see the ownership audit in
-	// the doc comment. Scoping (inScope / messagesFor) is applied HERE so the
-	// materialize phase is a straight assembly.
+	// the lock release NOTHING may alias store-owned memory — see the ownership
+	// audit in the doc comment. Scoping (inScope / messagesFor) is applied HERE
+	// so the materialize phase is a straight assembly.
 
 	epoch := s.epoch
 	seq := s.seq
@@ -831,14 +854,19 @@ func (s *Store) materializeSnapshot(c snapshotCapture) Snapshot {
 // standalone SnapshotFrontier call. The detail capture (captureSnapshotLocked)
 // is the same no-aliasing private copy the thin Snapshot uses.
 //
-// The test seam (snapshotMaterializeHook) fires between RUnlock and the detail
+// The test seam (snapshotMaterializeHook) fires between Unlock and the detail
 // materialization, exactly as in Snapshot. baseline == tree.Seq (== detail.Seq)
 // for the live-tail guard, so the caller can drop its third store.Head() lock.
 func (s *Store) SnapshotWithTree(e *TreeEmitter, messagesFor map[string]bool, cause string) (Snapshot, *TreeSnapshot) {
-	s.mu.RLock()
+	// B-F1 fix: flush buffered deltas before capture (see Snapshot /
+	// flushAllBufferedDeltasLocked). WRITE lock for the flush+capture so they
+	// are atomic; the tree frontier capture shares the same lock span, so both
+	// projections stamp the SAME post-flush {epoch, seq}.
+	s.mu.Lock()
+	s.flushAllBufferedDeltasLocked()
 	c := s.captureSnapshotLocked(messagesFor)
 	treeSnap := e.snapshotFrontierLocked(cause)
-	s.mu.RUnlock()
+	s.mu.Unlock()
 	if snapshotMaterializeHook != nil {
 		snapshotMaterializeHook()
 	}
@@ -965,14 +993,19 @@ func (s *Store) capturePartialDetailLocked(frontier map[string]bool) snapshotCap
 // method is reached only from handleStream's tree=2 cold/reconnect/ring-gap
 // paths when no active session is selected (D7).
 func (s *Store) SnapshotWithTreePartial(e *TreeEmitter, cause string) (Snapshot, *TreeSnapshot) {
-	s.mu.RLock()
+	// B-F1 fix: flush buffered deltas before capture (see Snapshot /
+	// flushAllBufferedDeltasLocked). The partial detail capture OMITS messages
+	// (tree-Stream-1-only), but the flush still runs so any opted-in Stream-2
+	// subscriber on the same store receives coherent suffix offsets.
+	s.mu.Lock()
+	s.flushAllBufferedDeltasLocked()
 	treeSnap := e.snapshotFrontierLocked(cause)
 	frontier := make(map[string]bool, len(treeSnap.FrontierIDs))
 	for _, id := range treeSnap.FrontierIDs {
 		frontier[id] = true
 	}
 	c := s.capturePartialDetailLocked(frontier)
-	s.mu.RUnlock()
+	s.mu.Unlock()
 	if snapshotMaterializeHook != nil {
 		snapshotMaterializeHook()
 	}

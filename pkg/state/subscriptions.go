@@ -52,6 +52,17 @@ type Interest struct {
 	// MessageSessions is the allow-set of session ids for message-class events.
 	// nil = all (firehose); non-nil (incl. empty) = only the listed sessions.
 	MessageSessions map[string]bool
+	// WantsPartDelta (slice 2 of part-append-streaming — see
+	// docs/ai/wire-protocols/part-append-streaming.md §3) is the per-connection
+	// opt-in for the KindPartAppend suffix wire format, mirroring the web layer's
+	// `part_delta=1` query flag (which itself mirrors `z=1`/wantsCompress).
+	// When true, the store's part-delta flush path (flushPartDeltasLocked →
+	// emitPartAppend) delivers KindPartAppend suffix frames to THIS subscriber
+	// for allowlisted top-level fields (text/reasoning); when false (the legacy
+	// default), the same flush delivers a synthesized full KindPartUpsert at the
+	// same seq. One encoding per connection — never both for the same
+	// (part,field). Established once at /vh/stream open.
+	WantsPartDelta bool
 }
 
 // wants reports whether a subscriber with this interest wants an event of the
@@ -85,7 +96,7 @@ func (i Interest) wants(kind, sid string) bool {
 func IsMessageClassKind(kind string) bool {
 	switch kind {
 	case KindMessageUpsert, KindMessageDelete,
-		KindPartUpsert, KindPartDelete,
+		KindPartUpsert, KindPartDelete, KindPartAppend,
 		KindMessagesLoaded, KindMessagesError,
 		KindMessagesBatch:
 		return true
@@ -196,6 +207,77 @@ func (s *Store) emit(kind string, payload json.RawMessage) {
 		}
 		select {
 		case sub.ch <- ev:
+		default:
+			// Slow consumer: drop it. The client will reconnect and re-snapshot.
+			// PROBE 2: count the existing drop (the backpressure sentinel).
+			diag.Default.Emit.SubscriberDrops.Inc()
+			close(sub.ch)
+			delete(s.subs, id)
+		}
+	}
+}
+
+// emitPartAppend (slice 2 of part-append-streaming — see
+// docs/ai/wire-protocols/part-append-streaming.md §2/§3) is the per-flush
+// dual-fanout for a streaming text field on an opted-in connection. It is the
+// O(L²)→O(L) lever: instead of re-emitting the FULL accumulated field text to
+// every subscriber every flush (~30ms), it records ONE KindPartAppend SUFFIX
+// event in the ring + delivers the suffix to opted-in subscribers and a
+// synthesized full KindPartUpsert at the SAME seq to legacy subscribers.
+//
+// One encoding per connection (spec §3): an opted-in subscriber
+// (interest.WantsPartDelta) receives suffixEv; a legacy subscriber receives
+// legacyEv. Neither receives both for the same flush. The ring records ONLY the
+// suffix event — the legacy upsert is synthesized at fanout time and is NOT
+// separately in the ring, so a legacy connection whose replay range contains a
+// KindPartAppend falls back to a fresh snapshot (spec §4.3, enforced in the web
+// layer's handleStream). Both events share the SAME seq (one seq advance per
+// flush), preserving the monotonic global sequence + ring insertion order.
+//
+// suffixPayload is the {sessionID,messageID,partID,field,start,text} suffix
+// frame (delivered to opted-in + recorded in the ring); fullUpsert is the full
+// authoritative part JSON (delivered to legacy only). Caller holds s.mu.
+func (s *Store) emitPartAppend(suffixPayload, fullUpsert json.RawMessage) {
+	s.seq++
+	seq := s.seq
+	// The suffix event is what opted-in clients replay and what §4.3 detects.
+	suffixEv := ClientEvent{Seq: seq, Kind: KindPartAppend, Payload: suffixPayload, ingestNano: s.curEmitIngest}
+	s.ring.push(suffixEv)
+	// The legacy event shares the SAME seq but is NOT separately in the ring —
+	// legacy replay containing a KindPartAppend falls back to snapshot (§4.3).
+	legacyEv := ClientEvent{Seq: seq, Kind: KindPartUpsert, Payload: fullUpsert, ingestNano: s.curEmitIngest}
+	// part.append carries sessionID, so the interest filter keys on the suffix.
+	sid := payloadSessionID(suffixPayload)
+	// PROBE 2 (latency diagnostics): emit-boundary aggregates, identical
+	// invariant to emit() — PURE ATOMICS only (no mutex/channel/alloc/blocking)
+	// because this runs under s.mu on every flush. The bytes accounted here are
+	// the CANONICAL suffix bytes (ClassBytes[EmitClassPart] —
+	// ClassifyEmitKind("part.append")→EmitClassPart). Per-subscriber WIRE bytes
+	// are accounted separately by the SSE StreamStatsWriter probe; the
+	// emit-level figure reflects the O(L) ring cost, which is the slice-4
+	// success metric (ring bytes no longer scale with accumulated field length).
+	emitMono := diag.MonoNow()
+	cls := diag.ClassifyEmitKind(KindPartAppend)
+	diag.Default.Emit.ClassCount[cls].Inc()
+	diag.Default.Emit.ClassBytes[cls].Add(uint64(len(suffixPayload)))
+	diag.Default.Emit.SourceCount[s.curEmitSource].Inc()
+	if s.curEmitIngest > 0 {
+		age := emitMono - s.curEmitIngest
+		if age >= 0 {
+			diag.Default.Emit.EmitAge.Observe(age)
+		}
+	}
+	for id, sub := range s.subs {
+		if !sub.interest.wants(KindPartAppend, sid) {
+			continue // excluded by interest: never enters this channel
+		}
+		// One encoding per connection: opted-in → suffix, legacy → full upsert.
+		out := suffixEv
+		if !sub.interest.WantsPartDelta {
+			out = legacyEv
+		}
+		select {
+		case sub.ch <- out:
 		default:
 			// Slow consumer: drop it. The client will reconnect and re-snapshot.
 			// PROBE 2: count the existing drop (the backpressure sentinel).

@@ -2236,6 +2236,13 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	// → firehose Interest; a non-nil filter (incl. empty, the tree-only Stream 1)
 	// → message-class events restricted to the selected sessions.
 	interest := state.Interest{MessageSessions: filter}
+	// Slice 2 (part-append-streaming — spec §3): thread the per-connection
+	// part_delta=1 opt-in into the store subscription so the part-delta flush
+	// path (flushPartDeltasLocked → emitPartAppend) knows whether to deliver
+	// KindPartAppend suffixes (opted-in) or synthesized full part.upsert
+	// (legacy) for allowlisted text/reasoning fields. One encoding per
+	// connection, established once here at stream open.
+	interest.WantsPartDelta = wantsPartDelta(r)
 	ch, unsub := store.SubscribeWith(256, interest)
 	defer unsub()
 
@@ -2270,6 +2277,24 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	var ordinal uint64
 
 	events, head, replayOK := store.Replay(cursor)
+	// Slice 2 (part-append-streaming — spec §4.3): a LEGACY (non-opted-in)
+	// connection whose replay range contains a KindPartAppend must NOT interpret
+	// those suffix frames — it would lose the full-text reference a legacy
+	// client needs. Detect "replay range contains a kind the client did not
+	// negotiate" and fall back to a fresh snapshot (the legacy client's
+	// catch-up path), recording the existing replay-fallback counter so this is
+	// observable. Opted-in clients replay KindPartAppend normally (the suffix is
+	// their negotiated format). This is the no-mixed-repair invariant from
+	// spec §4: legacy never sees part.append on the wire, live OR replay.
+	if hasCursor && replayOK && !wantsPartDelta(r) {
+		for _, ev := range events {
+			if ev.Kind == state.KindPartAppend {
+				replayOK = false
+				diag.IncStream2ReplayFallback()
+				break
+			}
+		}
+	}
 	if hasCursor && replayOK {
 		for _, ev := range events {
 			if sendable(ev.Kind, ev.Payload) {
@@ -2889,6 +2914,25 @@ func wantsCompress(r *http.Request) bool {
 // wholesale snapshot on the non-tree branch.
 func wantsTree2(r *http.Request) bool {
 	return r.URL.Query().Get("tree") == "2"
+}
+
+// wantsPartDelta (slice 2 of part-append-streaming — see
+// docs/ai/wire-protocols/part-append-streaming.md §3) reports whether the client
+// opted into the KindPartAppend suffix wire format via the `part_delta=1` query
+// flag. It mirrors wantsCompress (`z=1`) exactly: a query-param opt-in (no custom
+// request header — EventSource cannot set one), per-connection, established once
+// at /vh/stream open. When true, handleStream threads it into the store
+// subscription (Interest.WantsPartDelta) so the part-delta flush path
+// (flushPartDeltasLocked → emitPartAppend) delivers KindPartAppend suffix frames
+// to this connection for allowlisted top-level fields (text/reasoning) instead
+// of re-emitting the full accumulated text every flush (the O(L²)→O(L) lever).
+// When false (the legacy default — absent param or any value other than "1"),
+// the connection keeps the byte-identical full part.upsert wire shape: this is
+// what protects a stale cached PWA (old client) against a new server that would
+// otherwise emit a suffix it cannot interpret. The client kill-switch is simply
+// to drop the param.
+func wantsPartDelta(r *http.Request) bool {
+	return r.URL.Query().Get("part_delta") == "1"
 }
 
 // maybeCompressSnapshot gzip64-wraps a marshaled snapshot payload when compress

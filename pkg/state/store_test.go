@@ -1719,37 +1719,35 @@ func seedOnePartSession(s *Store, sid, text string) {
 }
 
 // TestSnapshotDoesNotMutateColdBatchCapture is the proving test for the
-// Snapshot purity invariant (sub-phase 2.2): Snapshot is a PURE READ
-// PROJECTION — it must NOT mutate me.parts and must NOT bump the per-session
-// message revision, otherwise it would invalidate a concurrently-packaging
-// cold batch's captured (revision, projection) pair.
+// Snapshot-vs-cold-batch interaction (sub-phase 2.2, updated for B-F1):
+// Snapshot flushes buffered streaming deltas on entry (B-F1 suffix-offset
+// coherence — see flushAllBufferedDeltasLocked), which writes me.parts and
+// bumps msgRev. The cold-batch retry loop handles this correctly: a batch
+// captured BEFORE the flush is discarded+retried with the post-flush text.
 //
-// Pre-purity behavior (the OLD code this test replaces): Snapshot called
-// flushPartDeltasLocked(s, false), which REWROTE me.parts from "BASEA" to
-// "BASEAB" and bumped the revision; that forced a mid-package cold batch to be
-// discarded+retried. TestColdBatchSnapshotFlushBumpsRev (the test this one
-// replaces) asserted the OLD behavior: exactly one batch carrying "BASEAB".
-//
-// Post-purity behavior (the NEW invariant this test asserts): Snapshot overlays
-// buffered deltas onto a FRESHLY-ALLOCATED copy (projectPartLocked) without
-// touching me.parts, and does not bump the revision. So a cold batch captured
-// mid-package with text "BASEA" + token T validates (T==T) and emits "BASEA"
-// unchanged — no discard, no retry, exactly one batch.
+// The test's structure proves two distinct properties:
+//  1. A Snapshot whose flush has ALREADY run (no unflushed deltas remaining)
+//     is observationally pure — it does NOT re-touch me.parts or re-bump the
+//     revision. This is the property that protects a cold batch whose capture
+//     races a Snapshot that has nothing left to flush.
+//  2. The cold batch emits the POST-FLUSH text ("BASEAB"), not the stale
+//     pre-flush text — the sanity-check Snapshot at the top flushes "B" into
+//     me.parts, and the cold batch captures that authoritative state.
 //
 // Reproduction (via coldBatchAfterCaptureHook + a large deltaFlushInterval):
 //  1. Seed part p1 text "BASE"; apply delta "A" (first delta flushes → me.parts
 //     "BASEA") and delta "B" immediately (throttled → stays in deltaBuf, so
 //     me.parts lags at "BASEA" while the accumulator holds "BASEAB").
-//  2. publishColdBatch captures me.parts ("BASEA") + token T, blocks in the hook.
-//  3. Snapshot({sid}) must NOT mutate me.parts ("BASEA") NOR bump the token.
-//     (Its OUTPUT still reflects "BASEAB" via projectPartLocked — verified
-//     separately below — but the STORE is untouched.)
-//  4. Release: publishColdBatch re-reads the token. T==T → emit "BASEA"
-//     unchanged, no retry.
+//  2. Sanity-check Snapshot: flushes "B" → me.parts "BASEAB", deltaSentLen
+//     advances, msgRev bumps. The projected output still reflects "BASEAB".
+//  3. publishColdBatch captures me.parts ("BASEAB") + token T, blocks in hook.
+//  4. Snapshot (purity-check) has NO unflushed deltas → no flush → no mutation.
+//     msgRev unchanged, me.parts unchanged.
+//  5. Release: publishColdBatch re-reads the token. T==T → emit "BASEAB".
 //
-// Assert: exactly ONE batch carrying "BASEA" (the captured text, unchanged).
-// Fails if Snapshot regresses to mutating me.parts / bumping the revision
-// (which would instead produce a discard+retry emitting "BASEAB").
+// Assert: exactly ONE batch carrying "BASEAB" (no discard/retry — the
+// purity-check Snapshot was observationally pure). Fails if Snapshot regresses
+// to re-flushing when there is nothing to flush.
 func TestSnapshotDoesNotMutateColdBatchCapture(t *testing.T) {
 	// Force throttling so the second delta stays buffered (deterministic,
 	// independent of host scheduling jitter). Promoted off the package global
@@ -1765,9 +1763,10 @@ func TestSnapshotDoesNotMutateColdBatchCapture(t *testing.T) {
 	s.Apply(ev("message.part.delta", `{"sessionID":"snap","messageID":"m1","partID":"p1","field":"text","delta":"B"}`))
 
 	// Sanity: confirm the projection contract holds BEFORE the cold-batch dance —
-	// Snapshot's OUTPUT must reflect the buffered "B" via overlay, even though
-	// me.parts lags at "BASEA". This proves the snapshot still carries the live
-	// accumulated text without flushing it into the store.
+	// Snapshot's OUTPUT must reflect the buffered "B". The B-F1 fix flushes "B"
+	// into me.parts during this Snapshot call (the flush is the correctness
+	// mechanism), so after this me.parts holds "BASEAB" authoritatively and
+	// deltaSentLen == 6 == the projected field length.
 	if got := partText(s.Snapshot(map[string]bool{"snap": true}), "snap", "p1"); got != "BASEAB" {
 		t.Fatalf("snapshot output pre-batch: want BASEAB (projection overlay), got %q", got)
 	}
@@ -1799,14 +1798,15 @@ func TestSnapshotDoesNotMutateColdBatchCapture(t *testing.T) {
 	if postRev := s.msgRev["snap"]; postRev != preRev {
 		t.Fatalf("Snapshot mutated msgRev: pre=%d post=%d (purity violated)", preRev, postRev)
 	}
-	// Purity assertion 2: me.parts still holds the pre-Snapshot "BASEA" (the
-	// buffered "B" was NOT flushed back into the store).
+	// Purity assertion 2: me.parts still holds "BASEAB" (the sanity-check
+	// Snapshot's flush wrote it; the purity-check Snapshot did NOT re-mutate
+	// because there were no unflushed deltas).
 	s.mu.RLock()
 	me := s.messages["snap"].byID["m1"]
 	gotStored := partTextFromRaw(t, me.parts["p1"])
 	s.mu.RUnlock()
-	if gotStored != "BASEA" {
-		t.Fatalf("Snapshot mutated me.parts: want BASEA (pure read), got %q", gotStored)
+	if gotStored != "BASEAB" {
+		t.Fatalf("Snapshot re-mutated me.parts: want BASEAB (post-flush, unchanged by pure purity-check Snapshot), got %q", gotStored)
 	}
 
 	close(releaseCh)
@@ -1817,8 +1817,8 @@ func TestSnapshotDoesNotMutateColdBatchCapture(t *testing.T) {
 		t.Fatalf("want exactly 1 batch (no discard/retry — Snapshot is pure), got %d", len(batches))
 	}
 	got := partTextFromBatch(t, batches[0].Payload, "snap", "m1", "p1")
-	if got != "BASEA" {
-		t.Fatalf("batch text: want BASEA (captured text, unchanged by pure Snapshot), got %q", got)
+	if got != "BASEAB" {
+		t.Fatalf("batch text: want BASEAB (post-flush text captured by the cold batch), got %q", got)
 	}
 }
 
@@ -2478,29 +2478,28 @@ func copyBoolMap(m map[string]bool) map[string]bool {
 	return out
 }
 
-// TestSnapshotIsObservationallyPure is the headline purity gate for sub-phase
-// 2.2: Snapshot must be a PURE READ PROJECTION that mutates NO store state. It
-// builds a store with buffered streaming deltas (some flushed into me.parts,
-// some still in deltaBuf), captures the per-messageEntry internal fields a
-// write-back would disturb, calls Snapshot TWICE (once full firehose, once
-// scoped), then re-captures and asserts byte-identical internals. It also
-// asserts both snapshots produce identical OUTPUT for an in-scope session (a
-// pure read over unchanged state is deterministic).
+// TestSnapshotIsObservationallyPure is the purity gate for the snapshot capture
+// path (sub-phase 2.2, updated for B-F1): a Snapshot whose B-F1 flush has
+// already run (no unflushed deltas remaining) must be observationally pure —
+// it mutates NO store state. The B-F1 fix makes Snapshot flush buffered deltas
+// on entry (flushAllBufferedDeltasLocked) for suffix-offset coherence; that
+// flush is tested separately. HERE, the test triggers the flush FIRST (via an
+// initial Snapshot), then captures internals and calls Snapshot TWICE more —
+// those subsequent calls must leave the store byte-identical and produce
+// deterministic in-scope output.
 //
 // SCOPE OF CAPTURE: it captures me.parts, me.deltaBuf (Builder text),
 // me.deltaLastEmit, me.liveTouchedBody, me.partOrder, plus Store-level seq /
 // ring head+count / subscriber id+count. It does NOT capture Store-level
-// msgRev / nextMsgRev (those are bumped ONLY on the Apply write path and are
-// NOT touched by a read-only Snapshot — asserting them here would be
-// redundant with the "Snapshot never calls bumpMsgRev" contract) nor the
-// per-part liveTouchedParts map (only set while a cold GET is in flight, which
-// this test never triggers). The capture is the set of fields a HISTORICAL
-// flush-back would have mutated, not an exhaustive dump of every Store field.
+// msgRev / nextMsgRev (those are bumped ONLY on the Apply write path and on
+// the B-F1 flush — asserting them here, AFTER the flush has run, would be
+// redundant with the "a quiescent Snapshot does not re-bump" contract) nor
+// the per-part liveTouchedParts map (only set while a cold GET is in flight).
+// The capture is the set of fields a HISTORICAL flush-back would have
+// mutated, not an exhaustive dump of every Store field.
 //
-// Fails if Snapshot regresses to the HISTORICAL mutating path (calling the
-// write-side flushPartDeltasLocked, which would rewrite me.parts, bump nothing
-// here, but still mutate me.parts and the deltaBuf-adjacent state) or to
-// mutating ANY captured field.
+// Fails if the capture path regresses to mutating ANY captured field when
+// there are no unflushed deltas to flush.
 func TestSnapshotIsObservationallyPure(t *testing.T) {
 	// Stretch the throttle window so deltas after the first stay buffered —
 	// this is what gives Snapshot something to project (deltaBuf non-empty).
@@ -2533,6 +2532,14 @@ func TestSnapshotIsObservationallyPure(t *testing.T) {
 	// for purity: a pure Snapshot must not add/remove subscribers.
 	ch, unsub := s.Subscribe(8)
 	defer unsub()
+	drainAll(ch)
+
+	// B-F1: trigger the flush FIRST so the subsequent Snapshot calls have no
+	// unflushed deltas and are observationally pure. The flush writes me.parts
+	// ("A1"→"A1A2", "B1"→"B1B2"), advances deltaSentLen, bumps deltaLastEmit,
+	// bumps msgRev, and emits part.append/upsert events — drain them so they
+	// do not fill the 8-slot subscriber channel.
+	s.Snapshot(nil)
 	drainAll(ch)
 
 	// Capture the full set of internal fields a flush or emit would touch.
@@ -2610,25 +2617,30 @@ func TestSnapshotIsObservationallyPure(t *testing.T) {
 	if gotFull, gotScoped := partText(fullSnap, "a", "p_a"), partText(scopedSnap, "a", "p_a"); gotFull != gotScoped {
 		t.Fatalf("in-scope output drifted between full and scoped snapshots: full=%q scoped=%q", gotFull, gotScoped)
 	}
-	// And the projection overlay itself still works — the buffered "A2" must
-	// appear in the snapshot OUTPUT even though me.parts["p_a"] still holds
-	// only "A1" (proven by the deep-equal assertion above).
+	// And the projection overlay itself still works — the snapshot OUTPUT for
+	// session "a" carries "A1A2" (post-flush me.parts holds "A1A2"
+	// authoritatively; the overlay is consistent with it). The deep-equal
+	// assertion above proves the purity-check Snapshots left the store
+	// byte-identical.
 	if got := partText(scopedSnap, "a", "p_a"); got != "A1A2" {
-		t.Fatalf("scoped snapshot projection must overlay buffered A2, want A1A2, got %q", got)
+		t.Fatalf("scoped snapshot projection must carry A1A2, want A1A2, got %q", got)
 	}
 }
 
 // TestSnapshotConcurrentWithApply is the headline race/deadlock gate for the
-// Snapshot RLock move (sub-phase 2.3): multiple goroutines take snapshots
-// (full firehose AND scoped) while a writer concurrently applies part deltas
-// and message upserts. Under -race this must report no data race; the
-// goroutines must all complete (no deadlock from RLock/Lock interaction).
+// Snapshot lock discipline: multiple goroutines take snapshots (full firehose
+// AND scoped) while a writer concurrently applies part deltas and message
+// upserts. Under -race this must report no data race; the goroutines must all
+// complete (no deadlock). B-F1 changed Snapshot from RLock to Lock (the flush
+// mutates), so concurrent Snapshots now serialize against each other AND against
+// Apply — the test still proves completion + race-cleanliness under that
+// discipline.
 //
 // The signal is race-clean + completion within the test timeout — NOT a
-// precise wall-clock overlap assertion (RLock-vs-Lock scheduling is host-
-// dependent). The store's existing single-writer serialization still holds:
-// Apply takes s.mu (write), Snapshot takes s.mu.RLock (read); concurrent
-// Snapshots overlap with each other and serialize only against the writer.
+// precise wall-clock overlap assertion. The store's existing single-writer
+// serialization holds: Apply takes s.mu (write), Snapshot takes s.mu.Lock
+// (write, for the B-F1 flush+capture); the lock-free materialize phase still
+// overlaps with concurrent work.
 func TestSnapshotConcurrentWithApply(t *testing.T) {
 	s := New(64)
 	for _, sid := range []string{"x", "y"} {
@@ -3132,6 +3144,13 @@ func TestSnapshotNoAliasingAgainstStoreInternals(t *testing.T) {
 	s.Apply(ev("message.part.updated", `{"part":{"id":"p_text","sessionID":"a","messageID":"m1","type":"text","text":""}}`))
 	applyDelta(s, "a", "m1", "p_text", "text", "A1")
 	applyDelta(s, "a", "m1", "p_text", "text", "A2") // buffered → exercises the overlay path bytes too
+
+	// B-F1: trigger the flush FIRST (via an initial Snapshot) so me.parts is
+	// authoritative ("A1A2") before the test's Snapshot+corrupt cycle. Without
+	// this, the test's Snapshot would flush A2 into me.parts, and the
+	// before/after internals would legitimately differ (the flush, not
+	// aliasing, changed them).
+	s.Snapshot(nil)
 
 	// Authoritative snapshot of store internals BEFORE any returned-snapshot
 	// corruption.

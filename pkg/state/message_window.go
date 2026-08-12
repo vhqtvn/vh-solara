@@ -762,13 +762,13 @@ func (s *Store) OldestResidentCursorTuple(sid string) (id string, timeMs float64
 // owning session's msgRev[sid]. Called under s.mu for EVERY mutation capable
 // of changing a session's cold-batch/snapshot message projection (message/part
 // upsert+delete, streaming part-delta append + its write-side throttle flush
-// into me.parts, history reconcile). Snapshot never calls this: it is a pure
-// read projection under RLock that captures the buffered deltas onto fresh
-// copies and overlays them during a lock-free materialization (see
-// projectPartCaptured) with no writeback. Store-wide (not per-session) so
-// the token is globally non-repeating: a deleted-then-recreated session can
-// never reuse an old in-flight batch's token (the ABA fix). Exactly one bump
-// per logical change.
+// into me.parts, history reconcile). Snapshot bumps this via
+// flushAllBufferedDeltasLocked when it flushes buffered streaming deltas for
+// suffix-offset coherence (B-F1 fix — any session whose parts were flushed gets
+// one bump so a concurrently-packaging cold batch discards its stale
+// projection). Store-wide (not per-session) so the token is globally
+// non-repeating: a deleted-then-recreated session can never reuse an old
+// in-flight batch's token (the ABA fix). Exactly one bump per logical change.
 func (s *Store) bumpMsgRev(sid string) {
 	s.nextMsgRev++
 	s.msgRev[sid] = s.nextMsgRev

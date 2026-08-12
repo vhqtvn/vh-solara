@@ -1322,6 +1322,16 @@ func (s *Store) appendPartDeltaLocked(sessionID, messageID, partID, field, delta
 			me.deltaBuf = map[string]*strings.Builder{}
 		}
 		me.deltaBuf[key] = buf
+		// Slice 2 (part-append-streaming): seed the sent-offset tracker to the
+		// accumulator's BASE length. An opted-in client already holds these
+		// bytes from the base part.upsert (the part.updated that seeded the
+		// accumulator), so the first KindPartAppend suffix this burst emits
+		// must start PAST them — start = len(base), suffix = only the new
+		// deltas. See flushPartDeltasLocked for the suffix cut.
+		if me.deltaSentLen == nil {
+			me.deltaSentLen = map[string]int{}
+		}
+		me.deltaSentLen[key] = buf.Len()
 	}
 	// Per-part text cap (P1-AGG-006 guardrail): if this (partID, field) is
 	// already sealed at the cap, drop the delta — the part's text is frozen
@@ -1389,10 +1399,14 @@ func (s *Store) appendPartDeltaLocked(sessionID, messageID, partID, field, delta
 // (upsertPartLocked / reconcileMessagesLocked) or part deletion. Caller holds
 // s.mu in WRITE mode (this method mutates me.parts and may emit).
 //
-// Snapshot does NOT call this method — it captures the buffered deltas onto
-// fresh copies under RLock and overlays them during a lock-free materialization
-// (projectPartCaptured) without writing back to me.parts, so Snapshot can run
-// under RLock and its heavy projection can run after RUnlock.
+// Snapshot flushes buffered deltas BEFORE capture (flushAllBufferedDeltas
+// Locked → this method, emit=true) so the cursorless-snapshot baseline coheres
+// with the part.append suffix offset (B-F1 fix — see Snapshot doc comment).
+// The flush runs under the WRITE lock; the subsequent capture reads the
+// post-flush me.parts (now authoritative, matching the accumulators) under the
+// same lock span. The materialization phase then runs lock-free, overlaying any
+// remaining deltaBuf text (which, post-flush, equals me.parts) via
+// projectPartCaptured without further writeback.
 func (me *messageEntry) flushPartDeltasLocked(s *Store, emit bool) {
 	for key, buf := range me.deltaBuf {
 		partID, field, ok := strings.Cut(key, "\x00")
@@ -1406,7 +1420,8 @@ func (me *messageEntry) flushPartDeltasLocked(s *Store, emit bool) {
 			// before a buffer exists, so this only triggers under malformed state.
 			part = map[string]any{"id": partID, "type": "text"}
 		}
-		part[field] = buf.String()
+		fullText := buf.String()
+		part[field] = fullText
 		// Slice-1 telemetry (part-append-streaming spec, see
 		// docs/ai/wire-protocols/part-append-streaming.md §5.1 / §6): record
 		// the (partType, field) pair this flush is materializing, so the open
@@ -1418,7 +1433,8 @@ func (me *messageEntry) flushPartDeltasLocked(s *Store, emit bool) {
 		// cannot represent nested paths (state.output etc. ride the wholesale
 		// part.upsert path, not this one). buf.Len() is the accumulated
 		// field-text length being flushed (the O(L)-per-flush quantity that
-		// sums to O(L²) across a part's lifetime).
+		// sums to O(L²) across a part's lifetime UNDER THE LEGACY PATH; the
+		// suffix path below makes the per-flush WIRE quantity O(len(suffix))).
 		pt, _ := part["type"].(string)
 		if pt == "" {
 			pt = "text"
@@ -1427,10 +1443,187 @@ func (me *messageEntry) flushPartDeltasLocked(s *Store, emit bool) {
 		if updated, err := json.Marshal(part); err == nil {
 			me.parts[partID] = updated
 			if emit {
-				s.emit(KindPartUpsert, updated)
+				// Slice 2 (part-append-streaming — see
+				// docs/ai/wire-protocols/part-append-streaming.md §2/§5/§9.2):
+				// the O(L²)→O(L) lever. For an allowlisted top-level field
+				// (text/reasoning) that is NOT sealed-at-cap, emit a
+				// KindPartAppend SUFFIX to opted-in subscribers instead of
+				// re-emitting the full accumulated text every flush. The ring
+				// records ONE KindPartAppend per flush; legacy subscribers get
+				// a synthesized full KindPartUpsert at the same seq (one
+				// encoding per connection — see emitPartAppend). Across a
+				// part's lifetime the opted-in wire total becomes O(L)
+				// (sum of suffixes) instead of O(L²) (sum of full-text
+				// re-emissions).
+				//
+				// Non-allowlisted fields (tool / nested state.output /
+				// completion) and sealed-at-cap fields (the authoritative cap
+				// repair) stay on the full KindPartUpsert path for BOTH
+				// opted-in and legacy (spec §5: tool output rides the snapshot
+				// path, not the delta path; a sealed field is frozen at the cap
+				// and its full text is the repair). The sent-offset tracker is
+				// still advanced on these paths so a later suffix (e.g. after
+				// an unseal via authoritative snapshot) does not re-send
+				// already-delivered bytes.
+				sealed := me.sealedFields != nil && me.sealedFields[key]
+				if isPartAppendField(field) && !sealed {
+					start := 0
+					if me.deltaSentLen != nil {
+						start = me.deltaSentLen[key]
+					}
+					// Clamp start to the current full-text length: a sealed
+					// reset or concurrent authoritative overwrite could have
+					// shortened the accumulator's base beneath the last sent
+					// offset. start beyond the text → empty suffix (no-op emit
+					// but the offset still advances below). Defensive; the
+					// seed + advance invariants keep start in-range in normal
+					// flow.
+					if start > len(fullText) {
+						start = len(fullText)
+					}
+					suffix := fullText[start:]
+					if len(suffix) > 0 {
+						if suffixPayload, mErr := partAppendPayload(part, field, start, suffix); mErr == nil {
+							s.emitPartAppend(suffixPayload, updated)
+						} else {
+							// Marshal failure (malformed part map) — fall back
+							// to the full upsert so the field still reaches
+							// clients. Rare defensive path; the offset advance
+							// below keeps a later flush consistent.
+							s.emit(KindPartUpsert, updated)
+						}
+					}
+					// else: no new bytes since the last flush — emit nothing
+					// (the field is current on the wire). The offset advance
+					// below is a no-op in this case (already len(fullText)).
+					if me.deltaSentLen == nil {
+						me.deltaSentLen = map[string]int{}
+					}
+					me.deltaSentLen[key] = len(fullText)
+				} else {
+					s.emit(KindPartUpsert, updated)
+					if me.deltaSentLen != nil {
+						// Advance so the next suffix (if the field later moves
+						// onto the suffix path) does not re-send these bytes.
+						me.deltaSentLen[key] = len(fullText)
+					}
+				}
 			}
 		}
 	}
+}
+
+// hasUnflushedDeltasLocked reports whether me has at least one buffered
+// streaming-delta accumulator with bytes not yet emitted to subscribers
+// (deltaSentLen[key] < len(deltaBuf[key])). Used by the snapshot-coherence
+// flush (flushAllBufferedDeltasLocked) to skip messages that are already fully
+// flushed — avoids a redundant upsert for fields whose text is unchanged since
+// the last throttle flush (the suffix path already no-ops on zero new bytes,
+// but the non-allowlisted/sealed full-upsert path always emits). Caller holds
+// s.mu.
+func hasUnflushedDeltasLocked(me *messageEntry) bool {
+	if me == nil || len(me.deltaBuf) == 0 {
+		return false
+	}
+	for key, buf := range me.deltaBuf {
+		sent := 0
+		if me.deltaSentLen != nil {
+			sent = me.deltaSentLen[key]
+		}
+		if sent < buf.Len() {
+			return true
+		}
+	}
+	return false
+}
+
+// flushAllBufferedDeltasLocked flushes every buffered part-delta accumulator
+// with unflushed bytes across all sessions/messages under the held WRITE lock,
+// emitting the pending suffix (KindPartAppend) / upsert (KindPartUpsert)
+// events and advancing deltaSentLen so me.parts becomes authoritative
+// (matching the accumulators). This is the B-F1 snapshot-coherence mechanism:
+// after it runs, a cursorless snapshot projects exactly the field text every
+// opted-in subscriber has received as suffixes, so the snapshot baseline and
+// the next suffix offset agree (start == client field length) — see
+// docs/ai/wire-protocols/part-append-streaming.md §4.1/§4.2. Without this
+// flush, a snapshot taken while deltas sit behind the throttle would project
+// the full accumulated text (via captureDeltaText) but leave deltaSentLen
+// stale, so the next suffix would start BEHIND the client's baseline length
+// (byte-offset contract violation + re-send of bytes already in the snapshot).
+//
+// The flush EMITS the buffered bytes to every live subscriber (it does NOT
+// silently advance deltaSentLen). deltaSentLen is shared per-(message,field)
+// across ALL opted-in connections, so silently advancing it without emitting
+// would skip the buffered bytes for other opted-in subscribers that haven't
+// received them yet — breaking their offset progression. Flushing first
+// (actually emitting + then advancing) makes the advance correct for EVERY
+// subscriber.
+//
+// This is the SAME flush operation the throttle boundary in
+// appendPartDeltaLocked performs (me.flushPartDeltasLocked(s, true)); it
+// advances deltaLastEmit so the next delta in a burst respects the throttle
+// window, and bumps per-session msgRev so a concurrently-packaging cold batch
+// discards its stale projection (mirrors appendPartDeltaLocked's bump). A
+// cold batch that captured me.parts before this flush retries with the
+// post-flush text — correct, bounded by publishColdBatch's retry loop.
+//
+// Called from the Snapshot entrypoints (Snapshot / SnapshotWithTree /
+// SnapshotWithTreePartial) under s.mu (write) BEFORE captureSnapshotLocked, so
+// the flush and capture share ONE lock span and no new delta can buffer
+// between them (the invariant that makes the baseline cohere). Caller holds
+// s.mu in WRITE mode.
+func (s *Store) flushAllBufferedDeltasLocked() {
+	for sid, sm := range s.messages {
+		if sm == nil {
+			continue
+		}
+		any := false
+		for _, me := range sm.byID {
+			if !hasUnflushedDeltasLocked(me) {
+				continue
+			}
+			me.flushPartDeltasLocked(s, true)
+			me.deltaLastEmit = time.Now()
+			any = true
+		}
+		if any {
+			s.bumpMsgRev(sid)
+		}
+	}
+}
+
+// isPartAppendField reports whether a top-level streaming field is on the v1
+// part.append allowlist (spec §5): text and reasoning ONLY. Tool parts, nested
+// state.output, completion, and any other field stay on the full part.upsert
+// path regardless of connection capability. field is already normalized
+// (empty → "text") by appendPartDeltaLocked before the first buffer exists.
+func isPartAppendField(field string) bool {
+	return field == "text" || field == "reasoning"
+}
+
+// partAppendPayload builds the KindPartAppend suffix frame
+// {sessionID, messageID, partID, field, start, text} from the already-unmarshaled
+// part map plus the computed (start, suffix). `part` carries the ids (id,
+// sessionID, messageID) — the same map flushPartDeltasLocked just marshaled into
+// `updated`, so no second unmarshal. `field` is the streaming field; `start` is
+// the UTF-8 byte offset of `suffix` in the accumulated field text; `suffix` is
+// the bytes emitted since the last flush (NOT the full accumulated text).
+func partAppendPayload(part map[string]any, field string, start int, suffix string) (json.RawMessage, error) {
+	partID, _ := part["id"].(string)
+	sessionID, _ := part["sessionID"].(string)
+	messageID, _ := part["messageID"].(string)
+	b, err := json.Marshal(map[string]any{
+		"sessionID": sessionID,
+		"messageID": messageID,
+		"partID":    partID,
+		"field":     field,
+		"start":     start,
+		"text":      suffix,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return b, nil
 }
 
 // discardPartDeltaLocked drops every streaming accumulator entry whose partID
@@ -1453,6 +1646,16 @@ func discardPartDeltaLocked(me *messageEntry, partID string) {
 		for k := range me.sealedFields {
 			if pid, _, ok := strings.Cut(k, "\x00"); ok && pid == partID {
 				delete(me.sealedFields, k)
+			}
+		}
+	}
+	// Slice 2 (part-append-streaming): drop the sent-offset entries matching
+	// this partID alongside the accumulators they track. A fresh authoritative
+	// base reseeds the offset on the next buffer creation (appendPartDeltaLocked).
+	if me.deltaSentLen != nil {
+		for k := range me.deltaSentLen {
+			if pid, _, ok := strings.Cut(k, "\x00"); ok && pid == partID {
+				delete(me.deltaSentLen, k)
 			}
 		}
 	}
