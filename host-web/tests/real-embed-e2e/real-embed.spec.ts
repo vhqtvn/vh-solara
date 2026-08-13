@@ -281,7 +281,7 @@ test.describe("lane 8: real SPA cross-origin iframe embed", () => {
   // ===========================================================================
   // GESTURE ROUND-TRIP (Slice 1 interaction model). The REAL production SPA's
   // hostGesture.ts (web/src/hostGesture.ts) recognizes a double-Ctrl (desktop)
-  // / triple-tap (mobile) gesture INSIDE the cross-origin iframe + forwards ONE
+  // / 3-finger-tap (mobile) gesture INSIDE the cross-origin iframe + forwards ONE
   // closed {type:"host-gesture"} postMessage to the host. The host derives the
   // source pane from event.source (the iframe's contentWindow) + opens its
   // layout overlay anchored to that pane. This is the FIRST lane to prove the
@@ -329,7 +329,7 @@ test.describe("lane 8: real SPA cross-origin iframe embed", () => {
     await H.closeLayoutOverlay(page);
   });
 
-  test("real SPA triple-tap gesture → host overlay opens for the source pane", async ({ page }) => {
+  test("real SPA 3-finger-tap gesture → host overlay opens for the source pane", async ({ page }) => {
     await page.goto("/");
     const frame = await firstRealFrame(page);
     await waitForSpaMounted(frame);
@@ -337,22 +337,42 @@ test.describe("lane 8: real SPA cross-origin iframe embed", () => {
     await waitForRealAlive(page, id);
     expect(await H.overlaySource(page), "overlay closed before the gesture").toBeNull();
 
-    // Drive three primary-pointer taps in place inside the real SPA's window.
-    // The recognizer counts three pointerdowns within 600ms + within 12px →
-    // posts ONE {type:"host-gesture", gesture:"layout-overlay-request"}.
+    // Drive a 3-finger-tap inside the real SPA's window: three touch pointers
+    // with DISTINCT pointerIds land together (a few px apart — three fingers
+    // on one surface; finger 1 is the primary contact), then all three LIFT
+    // near their landing spots. The hardened recognizer ignores non-touch
+    // pointers (pointerType !== "touch"), arms only when the simultaneous
+    // touch count reaches 3 within THREE_FINGER_TAP_WINDOW_MS, and fires on
+    // the LAST lift iff every finger stayed within
+    // THREE_FINGER_TAP_MAX_MOVEMENT_PX of its landing position (a tap, not a
+    // swipe) → posts ONE {type:"host-gesture", gesture:"layout-overlay-request"}.
     await frame.evaluate(() => {
-      const fire = (x: number, y: number): void => {
-        const ev = new PointerEvent("pointerdown", { clientX: x, clientY: y, bubbles: true });
-        Object.defineProperty(ev, "isPrimary", { value: true, configurable: true });
-        window.dispatchEvent(ev);
+      const fire = (type: "pointerdown" | "pointerup", pointerId: number, x: number, y: number): void => {
+        window.dispatchEvent(
+          new PointerEvent(type, {
+            pointerId,
+            pointerType: "touch",
+            isPrimary: pointerId === 1,
+            clientX: x,
+            clientY: y,
+            bubbles: true,
+          }),
+        );
       };
-      fire(10, 10);
-      fire(10, 10);
-      fire(10, 10);
+      // Three fingers land together …
+      fire("pointerdown", 1, 40, 40);
+      fire("pointerdown", 2, 46, 42);
+      fire("pointerdown", 3, 43, 47);
+      // … and lift together, each within a few px of its landing spot (the
+      // whole down→up sequence is synchronous dispatch, comfortably inside the
+      // 300ms window; per-finger drift is far below the 15px swipe gate).
+      fire("pointerup", 1, 41, 41);
+      fire("pointerup", 2, 45, 43);
+      fire("pointerup", 3, 44, 46);
     });
 
     await expect
-      .poll(async () => H.overlaySource(page), { timeout: 10000, message: "overlay opened for the real-SPA source pane (triple-tap)" })
+      .poll(async () => H.overlaySource(page), { timeout: 10000, message: "overlay opened for the real-SPA source pane (3-finger-tap)" })
       .toBe(id);
     await expect(page.locator('[data-testid="layout-overlay-card"]')).toBeVisible();
     await H.closeLayoutOverlay(page);

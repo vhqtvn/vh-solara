@@ -52,6 +52,58 @@
   overflow: hidden;
 }
 
+/* Resize-flash smoothing (split/swap/orientation-flip "flashes 2 times" fix).
+ *
+ * MEASURED (Playwright probe on the overlay geometry writes): Dockview applies
+ * each pane overlay's geometry via inline left/top/width/height in rAF bursts,
+ * and a layout op writes MORE THAN ONE burst — a swap writes an intermediate
+ * dock state then the final redistribution one frame later; an orientation
+ * flip writes the retarget burst, then the transposed layout after the
+ * transpose debounce (~200ms later). Each burst was an abrupt repaint, which
+ * read as the pane flashing/jumping twice. This is NOT a duplicate-event bug
+ * (each burst is a distinct structural state of a multi-step op), so it cannot
+ * be debounced away from outside Dockview — instead smooth each jump: a SHORT
+ * ease-out transition on the overlay's geometry turns every abrupt write into
+ * a brief animation, and consecutive bursts RETARGET the same transition (CSS
+ * transitions restart from the current computed value), so a multi-step op
+ * reads as one continuous motion instead of discrete flashes.
+ *
+ * TUNABLE on-device: 0.12s is the dial-in default. Larger (~0.2s) reads
+ * smoother but lags more behind rapid successive ops; smaller (~0.06s) is
+ * snappier but barely hides the jump. ease-out keeps the start fast so the
+ * pane feels responsive.
+ *
+ * GPU-safety (AGENTS.md Firefox/WebRender rules): width/height/left/top are
+ * layout properties (not composite-only), but a 0.12s transition on these
+ * small, non-scrolling pane containers is explicitly allowed by the rules —
+ * the bans are mask-image/backdrop-filter/contain:paint on large/scrolling
+ * surfaces. Do NOT "optimize" this with contain:paint (it made things WORSE
+ * on Firefox WebRender).
+ *
+ * Toggle OFF during CONTINUOUS geometry drags (sash resize, floating-window
+ * drag/resize): a transition retargeted on every pointermove frame makes the
+ * drag feel laggy/rubber-banded. DockviewHost toggles `.dv-geometry-dragging`
+ * on this root for the duration of such a drag (capture-phase pointerdown on
+ * the drag affordance → window pointerup/pointercancel). Also OFF under
+ * prefers-reduced-motion (an abrupt jump is the reduced-motion-correct
+ * behavior; no animation is synthesized).
+ */
+.dv-render-overlay {
+  transition:
+    left 0.12s ease-out,
+    top 0.12s ease-out,
+    width 0.12s ease-out,
+    height 0.12s ease-out;
+}
+.dv-geometry-dragging .dv-render-overlay {
+  transition: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  .dv-render-overlay {
+    transition: none;
+  }
+}
+
 /* native sashes (drag-rearrange = resize). Make them visible + grabbable. */
 .dv-sash.dv-horizontal {
   cursor: col-resize;

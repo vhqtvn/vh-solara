@@ -15,20 +15,21 @@
 //     bare-Ctrl double-press is a discrete gesture that does not collide with
 //     any browser/spa shortcut (Ctrl+C, Ctrl+S, etc. all press a non-modifier
 //     key, which RESETS the sequence, so copy/save never triggers the overlay).
-//   - MOBILE: TWO recognizers, either of which opens the overlay (the operator
-//     may naturally try either; both are cheap and the overlay is idempotent):
-//     · triple-tap — three primary-pointer taps, each within TRIPLE_TAP_GAP_MS
-//       of the previous and each within the (pointerType-keyed) movement
-//       tolerance of the first. A non-primary pointerdown is IGNORED (not a
-//       hard reset): real touch routinely brushes a palm/thumb edge as a brief
-//       second pointer, and hard-cancelling on it rejected almost every real
-//       triple-tap (operator report m0309).
-//     · 3-finger-tap — three fingers down simultaneously within
-//       THREE_FINGER_TAP_WINDOW_MS. The literal "3 fingers" interpretation and
-//       the robust one (counts pointers, not positions/timing). Distinct from
-//       every native gesture (single-tap, double-tap-zoom, long-press, scroll).
-//     Both suppress while the host's soft-keyboard focus-mode is active (the
-//     host tells us via {type:'host-mode'}).
+//   - MOBILE: 3-finger-tap (the ONLY mobile recognizer — the sequential
+//     triple-tap recognizer was REMOVED: any 3 quick taps within 500ms
+//     false-fired it during ordinary fast single-tap use; the operator
+//     confirmed 3-finger-tap is the intended gesture). HARDENED with
+//     lift-distance gating so a 3-finger SWIPE no longer false-fires (the v0
+//     recognizer fired on the 3rd pointerDOWN, before it could tell a tap from
+//     a swipe). Fires ONLY when all 3 touch pointers have LIFTED with each
+//     finger still within THREE_FINGER_TAP_MAX_MOVEMENT_PX of its landing
+//     position, within THREE_FINGER_TAP_WINDOW_MS of the first down:
+//       - tap  = 3 down → 3 up, minimal per-finger movement → FIRE;
+//       - swipe = 3 down → move → up (any finger beyond tolerance) → reset,
+//         no fire.
+//     Distinct from every native gesture (single-tap, double-tap-zoom,
+//     long-press, scroll). Suppressed while the host's soft-keyboard focus-mode
+//     is active (the host tells us via {type:'host-mode'}).
 //
 // (B) PANE-ACTIVATE FORWARD — fixes the cross-origin activation gap. Phase 1
 // removed the per-pane headers (operator's request) that were the only host-DOM
@@ -72,24 +73,18 @@
 // message listener total (handshake + host-mode on the same handler).
 
 const DOUBLE_CTRL_WINDOW_MS = 450;
-// Per-tap GAP (not total-from-first): each advancing tap must follow the
-// previous within this window. Per-gap is the standard multi-tap model and
-// tolerates real-touch imprecision better than a tight total window (3 real
-// taps land in ~600-900ms total; a 600ms-from-first gate rejected them).
-// TUNABLE on-device.
-const TRIPLE_TAP_GAP_MS = 500;
-// Movement tolerance measured from the FIRST tap's position (the "in place"
-// requirement). Split by pointerType: real fingers drift 15-25px on landing +
-// lift (and 3 separate landings drift more), so touch gets a generous gate;
-// mouse/pen stay tight. Both TUNABLE on-device — the touch value was the #1
-// suspect in operator report m0309 (the old single 12px gate rejected every
-// real touch sequence).
-const TRIPLE_TAP_MAX_MOVEMENT_PX = 12; // mouse / pen
-const TRIPLE_TAP_MAX_MOVEMENT_TOUCH_PX = 30; // touch
-// 3-finger-tap: three fingers down simultaneously within this window of the
-// first of the three. Robust on real touch (counts pointers, not positions or
-// per-tap timing). TUNABLE on-device.
+// 3-finger-tap: all three fingers down + lifted within this window of the
+// FIRST down (total first-down → last-up elapsed). Robust on real touch (counts
+// pointers, not per-tap timing). TUNABLE on-device.
 const THREE_FINGER_TAP_WINDOW_MS = 300;
+// 3-finger-tap lift-distance gate: each finger may drift at most this far
+// between its pointerDOWN and pointerUP/pointercancel position. A finger beyond
+// this tolerance means the operator is SWIPING (scroll/navigation gestures move
+// fingers 30px+), not tapping — the gesture resets and never fires. Real
+// finger taps drift <10px; 15px leaves headroom for imprecise landings while
+// still rejecting any deliberate swipe. TUNABLE on-device — if real taps get
+// rejected on-device, raise toward 20-25; if swipes false-fire, lower toward 10.
+const THREE_FINGER_TAP_MAX_MOVEMENT_PX = 15;
 
 /** Outbound intent — a closed single-variant message. See file header. */
 export interface HostGestureMessage {
@@ -100,11 +95,11 @@ export interface HostGestureMessage {
 /**
  * Install the embed-gated gesture recognizer + pane-activate forward. Captures
  * the host origin from the inbound handshake (same listener shape as
- * heartbeat.ts), recognizes the desktop double-Ctrl + mobile triple-tap gestures
- * (posting `{type:"host-gesture", gesture:"layout-overlay-request"}`), and
- * forwards a `{type:"host-gesture", gesture:"pane-activate"}` signal when this
- * document gains focus / receives a pointerdown (the cross-origin activation
- * bridge). All three posts target the captured host origin (never '*').
+ * heartbeat.ts), recognizes the desktop double-Ctrl + mobile 3-finger-tap
+ * gestures (posting `{type:"host-gesture", gesture:"layout-overlay-request"}`),
+ * and forwards a `{type:"host-gesture", gesture:"pane-activate"}` signal when
+ * this document gains focus / receives a pointerdown (the cross-origin
+ * activation bridge). Both posts target the captured host origin (never '*').
  *
  * Gesture recognizer: idempotent-on-recognition (recognitions do not stack; a
  * second recognition simply posts again — the host re-anchors its overlay).
@@ -119,12 +114,10 @@ export interface HostGestureMessage {
  * window.blur) was REMOVED — the cross-origin window.blur that reset it is not
  * reliably delivered on real touch, so a re-activated pane could stay throttled
  * and never notify the host (operator report m0317). The activate listener is
- * SEPARATE from the triple-tap pointerdown recognizer (it fires on every
- * pointerdown; the triple-tap recognizer independently counts — the host
- * dedupes the per-tap forwards). Taps on interactive elements STILL activate
- * the pane (tapping a button in pane X means pane X should be active); the
- * activate listener deliberately does NOT share the triple-tap recognizer's
- * interactive-element ignore list.
+ * SEPARATE from the 3-finger pointerdown recognizer (it fires on every
+ * pointerdown; the 3-finger recognizer independently counts — the host dedupes
+ * the per-tap forwards). Taps on interactive elements STILL activate the pane
+ * (tapping a button in pane X means pane X should be active).
  *
  * No-op when standalone. Returns a disposer that removes the listeners (the
  * recognizer otherwise lives for the document lifetime; a reload re-runs this
@@ -142,11 +135,12 @@ export function startHostGesture(): (() => void) | undefined {
   let hostOrigin: string | null = null;
   // Whether the host's soft-keyboard focus-mode is currently active (host tells
   // us via {type:'host-mode', mode:'keyboard-focus'|'normal'}). When active, the
-  // triple-tap gesture is SUPPRESSED (the operator is typing — a stray triple-
-  // tap on non-interactive SPA content should not yank the layout). The
-  // double-Ctrl gesture is unaffected (a physical keyboard is attached; the
-  // operator is not tripping over a soft keyboard). See file header for why the
-  // SPA cannot reliably infer this from its own visualViewport.
+  // 3-finger-tap gesture is SUPPRESSED (the operator is typing — a stray
+  // multi-finger tap on non-interactive SPA content should not yank the
+  // layout). The double-Ctrl gesture is unaffected (a physical keyboard is
+  // attached; the operator is not tripping over a soft keyboard). See file
+  // header for why the SPA cannot reliably infer this from its own
+  // visualViewport.
   let keyboardFocusActive = false;
 
   const onMessage = (ev: MessageEvent): void => {
@@ -212,14 +206,11 @@ export function startHostGesture(): (() => void) | undefined {
   // cross-origin than window.blur, and it would re-introduce a suppression
   // window that can drop a genuine activation.)
   //
-  // COEXISTENCE WITH TRIPLE-TAP: the activate listener is on `document`; the
-  // triple-tap recognizer is on `window`. Both fire on the same pointerdown but
-  // neither calls stopPropagation/preventDefault on the early taps, so they do
-  // not conflict. Each pointerdown of a triple-tap sequence forwards one
-  // activate (the host dedupes when the pane is already focused). Taps on
-  // interactive elements STILL activate the pane (tapping a button in pane X
-  // means pane X should be active); the activate listener deliberately does NOT
-  // consult the triple-tap recognizer's interactive-element ignore list.
+  // COEXISTENCE WITH THE 3-FINGER RECOGNIZER: the activate listener is on
+  // `document`; the 3-finger recognizer is on `window`. Both fire on the same
+  // pointerdown but neither calls stopPropagation/preventDefault on the downs,
+  // so they do not conflict. Each pointerdown of a 3-finger tap forwards one
+  // activate (the host dedupes when the pane is already focused).
   const postActivate = (): void => {
     if (hostOrigin === null) return; // same handshake gate as the overlay request
     const msg: HostGestureMessage = {
@@ -313,138 +304,88 @@ export function startHostGesture(): (() => void) | undefined {
   };
   window.addEventListener("keydown", onKeyDown, false);
 
-  // ---- mobile gesture: triple-tap (sequential, single-finger) ---------------
-  // Three primary-pointer taps, each within TRIPLE_TAP_GAP_MS of the previous
-  // and each within the movement tolerance of the FIRST tap. Rules: a non-
-  // primary pointerdown is IGNORED (not a hard reset — real touch routinely
-  // registers an incidental palm/thumb edge as a brief second pointer, and
-  // hard-cancelling on it rejected almost every real triple-tap; genuine
-  // multi-finger intent is handled by the dedicated 3-finger-tap recognizer
-  // below); taps originating on interactive elements are ignored; a non-
-  // collapsed text selection cancels; suppressed while keyboard-focus-mode is
-  // active. preventDefault ONLY on the 3rd completed tap (so the 1st/2nd taps
-  // keep their normal behavior — selection, scroll, click). Movement tolerance
-  // is pointerType-keyed (touch drifts far more than mouse).
-  let tapCount = 0;
-  let firstTap: { x: number; y: number } | null = null; // position anchor (set on tap 1)
-  let lastTapAt = 0; // time of the last advancing tap (per-gap timing)
-
-  const resetTaps = (): void => {
-    tapCount = 0;
-    firstTap = null;
-    lastTapAt = 0;
-  };
-  const onPointerDown = (ev: PointerEvent): void => {
-    // Multi-touch: a non-primary pointerdown is IGNORED (does not reset). Real
-    // touch routinely brushes a palm/thumb edge as a brief second pointer;
-    // hard-resetting on it (the old behavior) rejected almost every real
-    // triple-tap. The primary pointer keeps its own count; genuine multi-finger
-    // intent is the 3-finger-tap recognizer's job. (This also keeps a 3-finger-
-    // tap's non-primary fingers from disturbing a concurrent primary sequence.)
-    if (!ev.isPrimary) return;
-    // Suppress while the host's soft-keyboard focus-mode is active. NOTE: do NOT
-    // reset the sequence here — just ignore this tap. (keyboardFocusActive is a
-    // coarse mode; a tap arriving during it should neither count nor seed.)
-    if (keyboardFocusActive) return;
-    // Ignore taps that originate on an interactive element (the operator is
-    // aiming at a button/link/input, not gesturing). Reset so a button tap does
-    // not seed a later triple-tap.
-    if (isInteractiveTarget(ev.target)) {
-      resetTaps();
-      return;
-    }
-    // Ignore while a non-collapsed text selection exists (the operator may be
-    // tap-dragging to select; a triple-tap-on-selection would be surprising).
-    if (hasNonCollapsedSelection()) {
-      resetTaps();
-      return;
-    }
-    const now = Date.now();
-    const x = ev.clientX;
-    const y = ev.clientY;
-    // Touch pointers drift far more than mouse (a real finger landing + lift
-    // moves 15-25px; 3 separate landings drift more). Use a generous tolerance
-    // for touch, keep the tight one for mouse/pen.
-    const tolerance = ev.pointerType === "touch"
-      ? TRIPLE_TAP_MAX_MOVEMENT_TOUCH_PX
-      : TRIPLE_TAP_MAX_MOVEMENT_PX;
-    if (
-      !firstTap ||
-      now - lastTapAt > TRIPLE_TAP_GAP_MS ||
-      Math.hypot(x - firstTap.x, y - firstTap.y) > tolerance
-    ) {
-      // Start a new sequence with this tap as the first.
-      firstTap = { x, y };
-      tapCount = 1;
-      lastTapAt = now;
-      return;
-    }
-    tapCount += 1;
-    lastTapAt = now;
-    if (tapCount >= 3) {
-      // Third completed tap: preventDefault ONLY here (keeps the 1st/2nd taps'
-      // native behavior intact). This prevents the 3rd tap from e.g. placing
-      // the caret / starting a selection right as the overlay opens.
-      ev.preventDefault();
-      resetTaps();
-      postOverlayRequest();
-    }
-  };
-  window.addEventListener("pointerdown", onPointerDown, false);
-
-  // ---- mobile gesture: 3-finger-tap (robust alternative; literal "3 fingers")
-  // ----
-  // Three fingers down simultaneously within THREE_FINGER_TAP_WINDOW_MS of the
-  // first of the three. DISTINGUISHES from sequential triple-tap (1 finger, 3
-  // times), single-tap, double-tap-zoom, long-press, and scroll (all are <3
-  // simultaneous pointers), so it does not collide with any native gesture.
-  // ROBUST on real touch: no per-tap timing fragility, no movement/drift
-  // tolerance (counts pointers, not positions). The operator's report ("3
-  // fingers still doesn't work") may literally mean a 3-finger-tap; shipped
-  // ALONGSIDE the relaxed sequential triple-tap so the operator can pick what
-  // feels right on-device. Fires on the 3rd pointerdown (before movement), so a
-  // 3-finger SWIPE would false-fire — accepted for v1 (3-finger swipe is rare
-  // in this app; the overlay is cheap to dismiss); flag for on-device tuning.
+  // ---- mobile gesture: 3-finger-tap (the ONLY mobile recognizer) ------------
+  // HARDENED with lift-distance gating (replaces both the removed sequential
+  // triple-tap recognizer AND the v0 fire-on-3rd-pointerdown behavior, which
+  // false-fired on 3-finger SWIPES). State machine:
+  //   - pointerdown (touch): record the pointer's LANDING position. First touch
+  //     of a gesture starts the window clock. When the simultaneous count
+  //     reaches 3 within THREE_FINGER_TAP_WINDOW_MS, the gesture is armed; a
+  //     4th pointer at ANY time hard-resets (unambiguous multi-finger intent
+  //     that is not a 3-finger-tap), as does reaching 3 too slowly.
+  //   - pointerup / pointercancel (touch): measure how far THAT finger moved
+  //     from its landing position. Any finger beyond
+  //     THREE_FINGER_TAP_MAX_MOVEMENT_PX → it was a swipe → reset, no fire.
+  //     When the LAST finger lifts: armed + within the total window + every
+  //     finger within tolerance → FIRE (postOverlayRequest). Otherwise reset.
+  //   - A gesture that never reaches 3 simultaneous pointers (1-2 fingers)
+  //     simply cannot arm → no fire on lift.
+  // Firing on ALL-LIFTED (not on the 3rd pointerdown) is the crux: only at lift
+  // time does the recognizer KNOW the fingers did not swipe. No preventDefault
+  // is possible on the lift (the interaction is over; preventing pointerup's
+  // default does not reliably suppress the already-fired compat click, and the
+  // overlay opens ABOVE the iframe content anyway) — unlike the removed
+  // sequential recognizer there is no 3rd-tap caret/selection side effect to
+  // suppress mid-gesture.
   //
   // Touch-only: a mouse cannot have 3 simultaneous pointers, and gating on
-  // pointerType==="touch" keeps this recognizer's active-pointer Set out of the
-  // sequential recognizer's mouse/default-pointerType tests. Suppressed while
-  // keyboard-focus-mode is active (same as triple-tap). Does NOT consult the
-  // interactive-element or selection filters — 3 simultaneous fingers is
-  // unambiguous layout intent, not an aim at a control or a selection gesture.
-  const activePointers = new Set<number>();
-  let threeFingerStartAt = 0;
-  // Suppress re-fire until all pointers lift (so a 4th/5th finger in the same
-  // contact, or accumulated primary taps across repeated 3-finger gestures,
-  // cannot stack recognitions).
-  let threeFingerArmed = false;
+  // pointerType==="touch" keeps this recognizer's active-pointer Map out of the
+  // desktop paths. Suppressed while keyboard-focus-mode is active (same as the
+  // removed triple-tap: a stray multi-finger tap while typing should not yank
+  // the layout). Does NOT consult interactive-element or selection filters — 3
+  // simultaneous fingers is unambiguous layout intent, not an aim at a control
+  // or a selection gesture.
+  const activePointers = new Map<number, { x: number; y: number }>();
+  let threeFingerStartAt = 0; // time of the FIRST down of the current gesture
+  let threeFingerArmed = false; // 3 simultaneous pointers seen within the window
+
+  const resetThreeFinger = (): void => {
+    activePointers.clear();
+    threeFingerStartAt = 0;
+    threeFingerArmed = false;
+  };
 
   const onDownThreeFinger = (ev: PointerEvent): void => {
     if (ev.pointerType !== "touch") return; // mouse/pen: no 3-finger concept
-    if (keyboardFocusActive) return;
-    activePointers.add(ev.pointerId);
-    if (activePointers.size === 1) {
-      threeFingerStartAt = Date.now();
-      threeFingerArmed = true;
+    if (keyboardFocusActive) return; // suppressed while the soft keyboard owns focus
+    if (activePointers.size === 0) threeFingerStartAt = Date.now();
+    activePointers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
+    if (activePointers.size > 3) {
+      // A 4th pointer: unambiguously NOT a 3-finger-tap. Hard-reset so this
+      // contact cluster can never fire (the matching lifts then delete from an
+      // empty Map — harmless no-ops).
+      resetThreeFinger();
+      return;
     }
-    if (
-      threeFingerArmed &&
-      activePointers.size >= 3 &&
-      Date.now() - threeFingerStartAt <= THREE_FINGER_TAP_WINDOW_MS
-    ) {
-      // Fire on the pointerdown that brings the simultaneous count to 3.
-      ev.preventDefault();
-      threeFingerArmed = false; // suppress until all pointers lift
-      resetTaps(); // keep the sequential recognizer from accumulating the
-      // primary finger across repeated 3-finger gestures and double-firing.
-      postOverlayRequest();
+    if (activePointers.size === 3) {
+      if (Date.now() - threeFingerStartAt <= THREE_FINGER_TAP_WINDOW_MS) {
+        threeFingerArmed = true;
+      } else {
+        // The 3rd finger landed too slowly — not a simultaneous tap. Reset.
+        resetThreeFinger();
+      }
     }
   };
+
   const onUpThreeFinger = (ev: PointerEvent): void => {
+    const start = activePointers.get(ev.pointerId);
+    if (start === undefined) return; // not a tracked touch pointer (mouse up, or a post-reset lift)
+    const moved = Math.hypot(ev.clientX - start.x, ev.clientY - start.y);
     activePointers.delete(ev.pointerId);
-    if (activePointers.size === 0) {
-      threeFingerArmed = false;
-      threeFingerStartAt = 0;
+    if (moved > THREE_FINGER_TAP_MAX_MOVEMENT_PX) {
+      // That finger swiped → the gesture was a swipe, not a tap. Reset so the
+      // remaining lifts cannot fire.
+      resetThreeFinger();
+      return;
+    }
+    if (activePointers.size > 0) return; // fingers remain; decide on the last lift
+    // Last finger lifted. Fire iff armed + the TOTAL first-down→last-up elapsed
+    // fits the window (a slow, deliberate separation is not a simultaneous tap).
+    const elapsed = Date.now() - threeFingerStartAt;
+    const armed = threeFingerArmed;
+    resetThreeFinger();
+    if (armed && elapsed <= THREE_FINGER_TAP_WINDOW_MS) {
+      postOverlayRequest();
     }
   };
   window.addEventListener("pointerdown", onDownThreeFinger, false);
@@ -454,7 +395,6 @@ export function startHostGesture(): (() => void) | undefined {
   return () => {
     window.removeEventListener("message", onMessage);
     window.removeEventListener("keydown", onKeyDown, false);
-    window.removeEventListener("pointerdown", onPointerDown, false);
     window.removeEventListener("pointerdown", onDownThreeFinger, false);
     window.removeEventListener("pointerup", onUpThreeFinger, false);
     window.removeEventListener("pointercancel", onUpThreeFinger, false);
@@ -462,36 +402,4 @@ export function startHostGesture(): (() => void) | undefined {
     document.removeEventListener("focusin", onFocusInActivate, true);
     document.removeEventListener("pointerdown", onPointerDownActivate, true);
   };
-}
-
-/**
- * True iff `target` is (or is inside) an interactive element whose tap should
- * NOT seed a triple-tap sequence. Covers form controls, links, buttons,
- * contenteditable, and the common ARIA interactive roles + anything with a
- * non-negative tabindex (a focusable element the operator is aiming at, not
- * gesturing past). tabindex="-1" is EXCLUDED: it marks programmatic-focus
- * containers (scroll containers, QuestionCard/PermissionCard/MermaidViewer)
- * that are NOT operator-aimed controls — a triple-tap on one must still seed.
- */
-function isInteractiveTarget(target: EventTarget | null): boolean {
-  if (!(target instanceof Element)) return false;
-  const sel =
-    'a,button,input,textarea,select,[contenteditable=""],[contenteditable="true"],' +
-    '[role="button"],[role="link"],[role="checkbox"],[role="radio"],[role="tab"],' +
-    '[role="menuitem"],[role="menuitemcheckbox"],[role="menuitemradio"],[role="option"],' +
-    '[role="switch"],[role="treeitem"],[tabindex]:not([tabindex="-1"])';
-  return !!target.closest(sel);
-}
-
-/**
- * True iff the window has a non-collapsed text selection (a real highlighted
- * range). A collapsed selection (caret only) does NOT count — the operator is
- * just focused, not selecting. Guarded for environments without getSelection.
- */
-function hasNonCollapsedSelection(): boolean {
-  const sel = typeof window.getSelection === "function" ? window.getSelection() : null;
-  if (!sel || sel.rangeCount === 0) return false;
-  // isCollapsed true = caret only (no highlighted text); a real selection has
-  // isCollapsed false OR a non-empty string.
-  return !sel.isCollapsed || sel.toString().length > 0;
 }

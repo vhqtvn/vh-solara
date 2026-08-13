@@ -45,6 +45,10 @@ export function DockviewHost(props: { workspaceId: string }) {
   let container!: HTMLDivElement;
   let api: DockviewApi | undefined;
   let controller: HostController | undefined;
+  // Resize-smoothing drag toggle (assigned in onMount; detached in onCleanup).
+  // See the onMount block for the rationale.
+  let onGeometryDragStart: ((ev: PointerEvent) => void) | undefined;
+  let onGeometryDragEnd: (() => void) | undefined;
 
   // Mutable ops object breaks the dockview↔controller creation cycle: the
   // factory captures it; the controller fills it after the api exists.
@@ -107,6 +111,35 @@ export function DockviewHost(props: { workspaceId: string }) {
     if (activeWorkspaceId() === props.workspaceId) {
       controller.syncAll();
     }
+
+    // ---- resize-smoothing drag toggle ---------------------------------------
+    // The pane-overlay geometry transition (dockviewOverrides.css) smooths
+    // DISCRETE layout ops (split/swap/orientation-flip) but must NOT apply
+    // during CONTINUOUS geometry drags — a 0.12s transition retargeted on every
+    // pointermove frame makes a sash resize / floating-window drag feel laggy
+    // and rubber-banded. Dockview core exposes no public sash-drag-start event
+    // (only the internal Splitview onDidSashEnd), so toggle a marker class from
+    // the DOM gesture itself: a CAPTURE-phase pointerdown on any continuous-drag
+    // affordance (.dv-sash, .dv-floating-titlebar, .dv-resize-handle-*) adds
+    // `.dv-geometry-dragging` to this host root; window-level pointerup /
+    // pointercancel removes it (the same end-signal set Dockview's own sash
+    // drag uses, plus pointercancel). Capture phase so an element-level handler
+    // that stops propagation cannot hide a drag start from us. Discrete ops
+    // (overlay split/swap buttons, drop-based rearrange) never touch these
+    // affordances, so they keep the smoothing transition.
+    const DRAG_AFFORDANCE_SEL =
+      ".dv-sash, .dv-floating-titlebar, [class^='dv-resize-handle-'], [class*=' dv-resize-handle-']";
+    onGeometryDragStart = (ev: PointerEvent): void => {
+      if (ev.target instanceof Element && ev.target.closest(DRAG_AFFORDANCE_SEL)) {
+        container.classList.add("dv-geometry-dragging");
+      }
+    };
+    onGeometryDragEnd = (): void => {
+      container.classList.remove("dv-geometry-dragging");
+    };
+    container.addEventListener("pointerdown", onGeometryDragStart, true);
+    window.addEventListener("pointerup", onGeometryDragEnd, true);
+    window.addEventListener("pointercancel", onGeometryDragEnd, true);
   });
 
   // On becoming active, recompute dimensions (a previously-hidden host may need
@@ -127,6 +160,13 @@ export function DockviewHost(props: { workspaceId: string }) {
   });
 
   onCleanup(() => {
+    if (onGeometryDragStart) {
+      container.removeEventListener("pointerdown", onGeometryDragStart, true);
+    }
+    if (onGeometryDragEnd) {
+      window.removeEventListener("pointerup", onGeometryDragEnd, true);
+      window.removeEventListener("pointercancel", onGeometryDragEnd, true);
+    }
     controller?.dispose();
     clearDisplayFor(props.workspaceId);
     api?.dispose();

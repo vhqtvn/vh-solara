@@ -438,6 +438,30 @@ export async function split(page: Page, id: string, dir: "right" | "down"): Prom
   }, { id, dir });
   return r ?? null;
 }
+
+/** Wait until every pane overlay's geometry transition has finished (no active
+ *  CSS animations on any `.dv-render-overlay`). Pane-overlay geometry is
+ *  CSS-transitioned (dockviewOverrides.css — the resize-flash fix), so a DOM
+ *  rect read immediately after a layout op can observe the MID-transition
+ *  position. Tests that assert real DOM geometry right after an op must call
+ *  this first. Model-level reads (groupBox → group.api.boundingBox) are NOT
+ *  affected (they read the Dockview model, not the animated DOM). */
+export async function waitForLayoutSettled(page: Page, timeoutMs = 5000): Promise<void> {
+  await expect
+    .poll(
+      () =>
+        page.evaluate(() => {
+          let n = 0;
+          for (const el of document.querySelectorAll(".dv-render-overlay")) {
+            n += el.getAnimations().length;
+          }
+          return n;
+        }),
+      { timeout: timeoutMs },
+    )
+    .toBe(0);
+}
+
 export async function swap(page: Page, a: string, b: string): Promise<void> {
   await page.evaluate(({ a, b }) => {
     const h = (window as unknown as { __host?: { swap(x: string, y: string): void } }).__host;
