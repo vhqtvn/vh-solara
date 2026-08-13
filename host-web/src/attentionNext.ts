@@ -14,12 +14,12 @@ import { exitKeyboardFocus, isKeyboardOpen } from "./keyboardFocus";
 // =============================================================================
 // P3 ATTENTION HUB — NEXT hero button logic.
 //
-// The statusbar's attention-hub surfaces "N need you · M running" (N/M computed
-// in store.ts from the ACTIVE workspace's panes) and a NEXT hero button. The
-// button is VISIBLE only when the active workspace has at least one needs-you
-// pane (ws-scoped visibility — the locked choice; background-workspace needs-you
-// is already carried by the per-workspace-tab badge from P1, so the statusbar
-// does not duplicate it).
+// The tabstrip's NEXT hero button surfaces a single action: focus the next
+// needs-you pane in the active workspace (the needs-you count is computed in
+// store.ts from the ACTIVE workspace's panes). The button is VISIBLE only when
+// the active workspace has at least one needs-you pane (ws-scoped visibility —
+// the locked choice; background-workspace needs-you is already carried by the
+// per-workspace-tab badge from P1, so the tabstrip does not duplicate it).
 //
 // RANKING SCOPE (noted fork resolution). The mission text specifies BOTH "rank
 // the needs-you panes in the active workspace" AND a cross-workspace click

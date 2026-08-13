@@ -16,8 +16,8 @@ import {
  * Per-pane content renderer. Builds a CHROMELESS pane: a single cross-origin
  * <iframe> filling the slot + a thin focus border when active. NO title text,
  * NO per-pane buttons (the operator: "every pixel matters; title takes space
- * without benefit"). Layout ops (split/mode/zoom/close) live in the statusbar
- * control cluster + the i3 keyboard shortcuts, not on the pane itself.
+ * without benefit"). Layout ops (split/swap/mode/zoom/close) live in the layout
+ * overlay (gesture-triggered; DEV-bridge-driven in e2e), not on the pane itself.
  *
  * A Dockview group with multiple panels keeps its NATIVE tab strip (the tabbed/
  * stacked affordance — see dockviewOverrides.css which un-hides it for multi-

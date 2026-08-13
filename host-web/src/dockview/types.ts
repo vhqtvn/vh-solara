@@ -322,20 +322,48 @@ export interface HostOps {
    *  keep-mounted renderers). No-op when no neighbor lies in that direction. */
   moveDirection?(paneId: string, dir: FocusDir): void;
   /**
-   * Open the layout overlay anchored to `paneId`'s group bounds. Focuses the
-   *  source pane (so the focus indicator + subsequent split/swap target it),
+   * Open the layout overlay anchored to `paneId`'s group. Focuses the source
+   *  pane (so the focus indicator + subsequent split/swap target it),
    *  then activates the overlay. Idempotent: a second open while already open
    *  re-anchors to the new source (no stacking). No-op when the pane is not in
-   *  the active workspace. The statusbar Layout button (production-capable) and
-   *  the host-gesture router both route through this. */
+   *  the active workspace. The host-gesture router (double-Ctrl / triple-tap)
+   *  and the DEV test bridge both route through this; there is no longer a
+   *  statusbar Layout button (the statusbar was removed in its entirety). */
   openLayoutOverlay?(paneId: string): void;
   /** Close the layout overlay (clears the source anchor). Always safe. */
   closeLayoutOverlay?(): void;
   /**
    * Split the overlay's source pane in a cardinal direction (the overlay arrow
-   *  path). `dir` is the cardinal direction. Survival-safe (addPanel relative
-   *  to the source; renderer:'always'). Returns the new pane id or null. */
+   *  path, Split mode). `dir` is the cardinal direction. Survival-safe (addPanel
+   *  relative to the source; renderer:'always'). Returns the new pane id or
+   *  null. Auto-closes the overlay (a split is a terminal overlay action). */
   overlaySplit?(paneId: string, dir: OverlaySplitDir): string | null;
+  /**
+   * Swap the overlay's source pane with its nearest neighbor in a cardinal
+   *  direction (the overlay arrow path, Swap mode). Survival-safe: uses live-
+   *  tree moveTo ops only (dock source into neighbor's group, then split the
+   *  neighbor back out to the opposite side) — `renderer:'always'` keeps both
+   *  iframes mounted; mountTs/nonce/connId are unchanged across the exchange
+   *  (proven by the Slice-2 characterization probe). Dockview re-proportions
+   *  pane sizes on dock+split, so the RELATIVE ORDER (left/right or top/bottom)
+   *  of the two panes flips but absolute pixel geometry is not preserved — that
+   *  is the intended "swap with neighbor" semantic.
+   *
+   *  Bounded: enabled ONLY when BOTH the source and the neighbor are ordinary
+   *  tiled single-panel grid groups (no tabbed/stacked groups, no floating/
+   *  popout, no active maximization). Returns the swapped-with pane id on
+   *  success, or null when the swap is not applicable (source/neighbor not
+   *  swappable, or no neighbor in that direction). Auto-closes the overlay + the
+   *  source stays active/focused. */
+  overlaySwap?(paneId: string, dir: OverlaySplitDir): string | null;
+  /**
+   * Read the swappable neighbor (if any) in each cardinal direction for the
+   *  overlay's Swap-mode arrow-enable computation. Returns a 4-entry record
+   *  mapping each direction to the neighbor pane id, or null when there is no
+   *  neighbor OR the source/neighbor is not swap-eligible (tabbed/stacked/
+   *  floating/maximized). A null entry means the overlay disables that arrow
+   *  (visual + aria-disabled) rather than silently no-op'ing. Read-only. */
+  overlaySwapTargets?(paneId: string): Record<OverlaySplitDir, string | null>;
 }
 
 /** State pushed to a pane's header so it can reflect tray/zoom affordances. */

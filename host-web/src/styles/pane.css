@@ -4,8 +4,8 @@
  * CHROMELESS (i3 host-shell): the pane is the iframe + a strong focus indicator
  * + a hidden overlay-source badge. NO title text, NO per-pane buttons (operator:
  * "every pixel matters; title takes space without benefit"). Layout ops live in
- * the statusbar cluster + the layout overlay (gesture / statusbar button), not
- * on the pane. A multi-panel Dockview group keeps its NATIVE tab strip (see
+ * the layout overlay (gesture-triggered; DEV-bridge-driven in e2e), not on the
+ * pane. A multi-panel Dockview group keeps its NATIVE tab strip (see
  * dockviewOverrides.css) — that is the tabbed/stacked affordance.
  *
  * FOCUS INDICATOR (strong, glanceable): a 3px accent INSET outline (GPU-cheap —

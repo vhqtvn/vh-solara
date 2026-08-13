@@ -1,4 +1,4 @@
-import { Show, createEffect, createSignal, onCleanup, onMount } from "solid-js";
+import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js";
 import { hostOps, overlaySourcePaneId, panes } from "../dockview/store";
 import type { OverlaySplitDir } from "../dockview/types";
 import s from "./LayoutOverlay.module.css";
@@ -6,23 +6,38 @@ import s from "./LayoutOverlay.module.css";
 /**
  * Layout overlay — the host-side UI for the revised interaction model. Anchored
  * to the source pane's bounds (the pane derived from the gesture's event.source,
- * or the focused pane the host selects). Shows four cardinal split arrows + the
- * source identity + Close.
+ * or the focused pane the host selects). Shows four cardinal arrows whose effect
+ * depends on the selected MODE:
+ *
+ *  - Split mode (default): an arrow SPLITS the source pane — creates a NEW pane
+ *    in that direction (HostOps.overlaySplit; renderer:'always' keeps the source
+ *    iframe mounted). The new pane becomes active. This is the Slice-1 behavior.
+ *  - Swap mode: an arrow EXCHANGES the source pane with its nearest neighbor in
+ *    that direction (HostOps.overlaySwap). Survival-safe live-tree moveTo ops
+ *    only — both iframes stay mounted (mountTs/nonce/connId unchanged; proven by
+ *    the Slice-2 characterization). Bounded to ordinary tiled single-panel grid
+ *    groups; an arrow with no swappable neighbor is DISABLED (visual +
+ *    aria-disabled), never a silent no-op. Dockview re-proportions pane sizes on
+ *    dock+split, so RELATIVE ORDER flips but absolute pixel geometry is not
+ *    preserved — that is the intended "swap with neighbor" semantic.
+ *
+ * Plus a Close-pane button (HostOps.closePane → Dockview removePanel; disposes
+ * the SOURCE iframe, which is the operator's explicit intent for "close" — NOT a
+ * survival violation; survival matters for the SURVIVING panes).
  *
  * LAYERING (Gate #2): the pointer-capture layer covers ONLY `<main>` (the pane
  * grid area). The tabstrip + tray rail are SIBLINGS of `<main>` in the `.app`
  * flex column, so they are NEVER intercepted — P3 NEXT (now in the tabstrip,
  * moved from the deleted statusbar) and Add Server stay clickable while the
- * overlay is open. There is no full-screen capture layer. (The statusbar that
- * used to also be a clickable sibling was removed in its entirety; the Layout
- * button that opened this overlay from the statusbar is gone — the overlay is
- * gesture-triggered + DEV-bridge-triggered now.)
+ * overlay is open. There is no full-screen capture layer.
  *
- * DISMISS: Esc, the Close button, an outside-the-card click within `<main>`, a
- * workspace switch (App.tsx clears the signal), or source-pane removal (the
- * effect below). A split action auto-closes (HostOps.overlaySplit closes after
- * the split). IDEMPOTENT: a second valid request while open re-anchors to the
- * new source (the signal swaps; no stacking).
+ * DISMISS: Esc, the Close-overlay button (✕, distinct from Close-pane), an
+ * outside-the-card click within `<main>`, a workspace switch (App.tsx clears the
+ * signal), or source-pane removal (the effect below). A split/swap is a terminal
+ * overlay action (auto-closes). IDEMPOTENT: a second valid request while open
+ * re-anchors to the new source (the signal swaps; no stacking). The mode resets
+ * to Split whenever the overlay (re)opens, so a stale Swap selection never
+ * carries across open/close cycles.
  *
  * GPU-CHEAP: plain divs + a bounded 2px-blur shadow; NO mask-image /
  * backdrop-filter / contain:paint (AGENTS.md Firefox/WebRender rules).
@@ -30,12 +45,52 @@ import s from "./LayoutOverlay.module.css";
  * @param mainEl accessor for the `<main>` element (positioning context). The
  *   overlay is rendered as a child of `<main>` so inset:0 scopes to it.
  */
+
+const ARROWS: ReadonlyArray<{
+  dir: OverlaySplitDir;
+  sym: string;
+  cls: string;
+  word: string;
+}> = [
+  { dir: "above", sym: "↑", cls: s.arrowUp, word: "above" },
+  { dir: "left", sym: "←", cls: s.arrowLeft, word: "left" },
+  { dir: "right", sym: "→", cls: s.arrowRight, word: "right" },
+  { dir: "below", sym: "↓", cls: s.arrowDown, word: "below" },
+];
+
 export function LayoutOverlay(props: { mainEl: () => HTMLElement | null }) {
   const source = () => overlaySourcePaneId();
   const sourceVm = () => {
     const id = source();
     return id ? panes().find((p) => p.id === id) : undefined;
   };
+  // Split (default) vs Swap mode for the cardinal arrows. Reset to Split on
+  // every (re)open so a stale Swap selection never survives a close/reopen.
+  const [mode, setMode] = createSignal<"split" | "swap">("split");
+  createEffect(() => {
+    const id = source();
+    if (id === null) setMode("split");
+  });
+
+  // Swap-mode arrow targets: a 4-entry dir→neighbor-id map, or null per dir when
+  // there is no swappable neighbor in that direction. Computed live so a layout
+  // change re-evaluates enabled arrows; tracks panes() for reactivity. Only
+  // queried in Swap mode (Split mode always enables all four arrows).
+  const swapTargets = createMemo((): Record<OverlaySplitDir, string | null> => {
+    const id = source();
+    void panes(); // track layout changes while the overlay is open
+    if (mode() !== "swap" || id === null) {
+      return { above: null, right: null, below: null, left: null };
+    }
+    return (
+      hostOps()?.overlaySwapTargets?.(id) ?? {
+        above: null,
+        right: null,
+        below: null,
+        left: null,
+      }
+    );
+  });
 
   // Toggle the `.is-overlay-source` focus badge on the source pane element
   // imperatively (the renderer is vanilla DOM, not SolidJS, so it cannot react
@@ -120,6 +175,26 @@ export function LayoutOverlay(props: { mainEl: () => HTMLElement | null }) {
     const id = source();
     if (id) hostOps()?.overlaySplit?.(id, dir);
   };
+  const swap = (dir: OverlaySplitDir): void => {
+    const id = source();
+    if (id) hostOps()?.overlaySwap?.(id, dir);
+  };
+  // Close-pane: disposes the SOURCE iframe (the operator's explicit intent for
+  // "close"). The source-removed effect above dismisses the overlay; close()
+  // here dismisses immediately so the operator sees no stale anchor flash.
+  const closePane = (): void => {
+    const id = source();
+    if (id) hostOps()?.closePane?.(id);
+    close();
+  };
+
+  const onArrow = (dir: OverlaySplitDir): void => {
+    if (mode() === "swap") swap(dir);
+    else split(dir);
+  };
+  const arrowDisabled = (dir: OverlaySplitDir): boolean =>
+    mode() === "swap" && swapTargets()[dir] === null;
+  const arrowVerb = (): string => (mode() === "swap" ? "Swap" : "Split");
 
   return (
     <Show when={source() !== null} keyed>
@@ -152,48 +227,73 @@ export function LayoutOverlay(props: { mainEl: () => HTMLElement | null }) {
             </button>
           </div>
           <div class={s.arrows}>
+            <For each={ARROWS}>
+              {(a) => {
+                // Read the signals INSIDE the JSX attributes (not in a local
+                // const) so SolidJS tracks them and the label/disabled state
+                // updates when mode() / swapTargets() change.
+                const disabled = (): boolean => arrowDisabled(a.dir);
+                return (
+                  <button
+                    type="button"
+                    class={`${s.arrow} ${a.cls}`}
+                    data-testid={`layout-overlay-${a.dir}`}
+                    data-mode={mode()}
+                    aria-disabled={disabled() ? "true" : undefined}
+                    disabled={disabled()}
+                    aria-label={`${arrowVerb()} ${a.word}`}
+                    title={
+                      disabled()
+                        ? `No swappable pane ${a.word}`
+                        : `${arrowVerb()} ${a.word}`
+                    }
+                    onClick={() => onArrow(a.dir)}
+                  >
+                    {a.sym}
+                  </button>
+                );
+              }}
+            </For>
+          </div>
+          {/* Split / Swap mode toggle. In Swap mode the arrows exchange the
+              source with its neighbor instead of creating a new pane. */}
+          <div class={s.modeRow} role="group" aria-label="Arrow mode">
             <button
               type="button"
-              class={`${s.arrow} ${s.arrowUp}`}
-              data-testid="layout-overlay-above"
-              aria-label="Split above"
-              title="Split above"
-              onClick={() => split("above")}
+              class={`${s.modeBtn} ${mode() === "split" ? s.modeBtnActive : ""}`}
+              data-testid="layout-overlay-mode-split"
+              aria-pressed={mode() === "split"}
+              onClick={() => setMode("split")}
             >
-              ↑
+              Split
             </button>
             <button
               type="button"
-              class={`${s.arrow} ${s.arrowLeft}`}
-              data-testid="layout-overlay-left"
-              aria-label="Split left"
-              title="Split left"
-              onClick={() => split("left")}
+              class={`${s.modeBtn} ${mode() === "swap" ? s.modeBtnActive : ""}`}
+              data-testid="layout-overlay-mode-swap"
+              aria-pressed={mode() === "swap"}
+              onClick={() => setMode("swap")}
             >
-              ←
-            </button>
-            <button
-              type="button"
-              class={`${s.arrow} ${s.arrowRight}`}
-              data-testid="layout-overlay-right"
-              aria-label="Split right"
-              title="Split right"
-              onClick={() => split("right")}
-            >
-              →
-            </button>
-            <button
-              type="button"
-              class={`${s.arrow} ${s.arrowDown}`}
-              data-testid="layout-overlay-below"
-              aria-label="Split below"
-              title="Split below"
-              onClick={() => split("below")}
-            >
-              ↓
+              Swap
             </button>
           </div>
-          <div class={s.hint}>tap an arrow to split · Esc / outside-click to close</div>
+          <div class={s.actionRow}>
+            <button
+              type="button"
+              class={s.closePaneBtn}
+              data-testid="layout-overlay-close-pane"
+              aria-label="Close this pane"
+              title="Close this pane"
+              onClick={() => closePane()}
+            >
+              Close pane
+            </button>
+          </div>
+          <div class={s.hint}>
+            {mode() === "swap"
+              ? "tap an arrow to swap with the neighbor · Esc / outside-click to close"
+              : "tap an arrow to split · Esc / outside-click to close"}
+          </div>
         </div>
       </div>
     </Show>

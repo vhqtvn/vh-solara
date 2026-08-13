@@ -20,8 +20,8 @@ export interface ServerDef {
 }
 
 // The mock "fleet": each entry stands in for a real vh-solara server whose SPA
-// would be embedded cross-origin. Used for the Statusbar server count + as the
-// source of mock pane labels.
+// would be embedded cross-origin. Used for the AddServer / fleet context + as
+// the source of mock pane labels.
 export const SERVERS: ServerDef[] = [
   { label: "srv-A.my-root-domain" },
   { label: "srv-B.my-root-domain" },
@@ -244,8 +244,8 @@ function localAppEntry(): FleetEntry {
  *      mock fleet that keeps the survival gate green on a fresh context).
  *
  * Reactive: reads the runtimeServers() SolidJS signal, so a call inside a
- * tracking scope (e.g. the Statusbar) re-resolves when the catalog changes. The
- * base tier (VITE_SERVERS → folded/mock) stays memoized via resolveBaseFleet().
+ * tracking scope (e.g. the AddServer popover) re-resolves when the catalog
+ * changes. The base tier (VITE_SERVERS → folded/mock) stays memoized via resolveBaseFleet().
  *
  * FOLDED local-always: in the PRODUCTION folded build the local server (the
  * binary itself) is ALWAYS present alongside any operator-added remote servers —

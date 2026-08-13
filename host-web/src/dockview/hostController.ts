@@ -57,6 +57,27 @@ import {
 
 type Direction = "left" | "right" | "above" | "below";
 
+// Overlay Split/Swap cardinal dir (OverlaySplitDir) → the bounding-box focus dir
+// (FocusDir) the nearest-neighbor lookup uses. above↔up, below↔down, left/right
+// identity.
+const OVERLAY_TO_FOCUS: Record<OverlaySplitDir, FocusDir> = {
+  above: "up",
+  right: "right",
+  below: "down",
+  left: "left",
+};
+// The OPPOSITE side a neighbor must split back out to after the source docks
+// into its group center, so the two panes exchange relative ORDER. Map is keyed
+// by the FocusDir the source moved FROM (the neighbor direction): a neighbor to
+// the right gets ejected LEFT, etc. Values are dockview moveTo `position`
+// vocabulary ("left"|"right"|"top"|"bottom"), NOT addPanel `direction`.
+const OPPOSITE_SIDE: Record<FocusDir, "left" | "right" | "top" | "bottom"> = {
+  right: "left",
+  left: "right",
+  down: "top",
+  up: "bottom",
+};
+
 // ============================================================================
 // MULTI-WORKSPACE HOST CONTROLLER
 //
@@ -452,8 +473,9 @@ export class HostController implements HostOps {
     // tiled groups. moveTo(position) relative to the SOURCE panel's group (NOT
     // group.panels[0] — the prior code anchored on the first panel, so invoking
     // the mode from a non-first tab anchored + activated the wrong pane). The
-    // source is the pane the operator invoked the mode on (the focused pane in
-    // the statusbar path; the source pane in the overlay path). Every OTHER
+    // source is the pane the operator invoked the mode on (the source pane in
+    // the overlay path; the legacy statusbar + keyboard paths were retired with
+    // the statusbar). Every OTHER
     // panel breaks out into its own group relative to the source; the SOURCE
     // stays put + is re-activated. Position vocabulary is dockview's
     // 'left'|'right'|'top'|'bottom' (NOT the addPanel 'direction' vocabulary
@@ -486,23 +508,34 @@ export class HostController implements HostOps {
 
   /**
    * Swap the focused pane with the spatially-nearest grid pane in the given
-   *  cardinal direction (i3 Alt+Shift+Arrow move). Survival-safe (swap uses
-   *  moveTo, which repositions the keep-mounted renderers). No-op when no
-   *  neighbor. */
+   *  cardinal direction (i3 Alt+Shift+Arrow move). Survival-safe via
+   *  exchangePanes (live-tree moveTo only; renderer:'always' keeps both iframes
+   *  mounted). No-op when no neighbor OR either pane is not swap-eligible
+   *  (tabbed/stacked/floating/maximized). NOTE: there is no keyboard binding
+   *  wired to this anymore (the Alt+Shift shortcuts were retired with the
+   *  statusbar); overlaySwap (Swap mode) is the live surface. Kept + corrected
+   *  for API completeness + the DEV bridge moveDirection probe. */
   moveDirection(paneId: string, dir: FocusDir): void {
-    const id = this.nearestPaneInDir(paneId, dir);
-    if (id && id !== paneId) this.swap(paneId, id);
+    const panel = this.api.getPanel(paneId);
+    if (!panel || !this.isSwappablePanel(panel)) return;
+    const neighborId = this.nearestPaneInDir(paneId, dir);
+    if (!neighborId || neighborId === paneId) return;
+    const neighbor = this.api.getPanel(neighborId);
+    if (!neighbor || !this.isSwappablePanel(neighbor)) return;
+    this.exchangePanes(panel, neighbor, dir);
   }
 
-  // ---- layout overlay (gesture / statusbar fallback) -----------------------
+  // ---- layout overlay (gesture / DEV-bridge fallback) ----------------------
 
   /**
    * Open the layout overlay anchored to `paneId`'s group. Focuses the source
    * pane (so the focus indicator + subsequent split target it), then activates
    * the overlay state. Idempotent: a second open while already open re-anchors
    * (the store signal just swaps). No-op when the pane is not in THIS
-   * workspace. The statusbar Layout button (production) + the host-gesture
-   * router both route through this.
+   * workspace. The host-gesture router (double-Ctrl / triple-tap, forwarded by
+   * the embedded SPA) and the DEV test bridge both route through this; there is
+   * no longer a statusbar Layout button (the statusbar was removed in its
+   * entirety).
    */
   openLayoutOverlay(paneId: string): void {
     const panel = this.api.getPanel(paneId);
@@ -541,6 +574,58 @@ export class HostController implements HostOps {
     // sees the result, not a stale anchor over a changed layout.
     closeOverlay();
     return created.id;
+  }
+
+  /**
+   * Swap the overlay's source pane with its nearest neighbor in a cardinal
+   *  direction (overlay arrow path, Swap mode). Survival-safe live-tree
+   *  exchange via exchangePanes (dock source into neighbor's group center, then
+   *  split neighbor back out to the opposite side); renderer:'always' keeps both
+   *  iframes mounted (mountTs/nonce/connId unchanged — proven by the Slice-2
+   *  characterization). Bounded to ordinary tiled single-panel grid groups (no
+   *  tabbed/stacked/floating/maximized). Returns the swapped-with pane id on
+   *  success, or null when not applicable. Auto-closes + source stays active. */
+  overlaySwap(paneId: string, dir: OverlaySplitDir): string | null {
+    const panel = this.api.getPanel(paneId);
+    if (!panel || !this.isSwappablePanel(panel)) return null;
+    const focusDir = OVERLAY_TO_FOCUS[dir];
+    const neighborId = this.nearestPaneInDir(paneId, focusDir);
+    if (!neighborId) return null;
+    const neighbor = this.api.getPanel(neighborId);
+    if (!neighbor || !this.isSwappablePanel(neighbor)) return null;
+    this.exchangePanes(panel, neighbor, focusDir);
+    // Source stays active (exchangePanes sets it). A swap is a terminal overlay
+    // action — close so the operator sees the exchanged layout, not a stale
+    // anchor.
+    panel.api.setActive();
+    closeOverlay();
+    return neighborId;
+  }
+
+  /**
+   * Read the swappable neighbor (if any) in each cardinal direction, for the
+   *  overlay's Swap-mode arrow-enable computation. A direction maps to null
+   *  when there is no neighbor OR the source/neighbor is not swap-eligible
+   *  (the overlay disables that arrow rather than silently no-op'ing). */
+  overlaySwapTargets(paneId: string): Record<OverlaySplitDir, string | null> {
+    const result: Record<OverlaySplitDir, string | null> = {
+      above: null,
+      right: null,
+      below: null,
+      left: null,
+    };
+    const panel = this.api.getPanel(paneId);
+    if (!panel) return result;
+    const sourceOk = this.isSwappablePanel(panel);
+    for (const dir of ["above", "right", "below", "left"] as OverlaySplitDir[]) {
+      const neighborId = this.nearestPaneInDir(paneId, OVERLAY_TO_FOCUS[dir]);
+      if (!neighborId) continue;
+      if (!sourceOk) continue;
+      const neighbor = this.api.getPanel(neighborId);
+      if (!neighbor || !this.isSwappablePanel(neighbor)) continue;
+      result[dir] = neighborId;
+    }
+    return result;
   }
 
   /** Spatial nearest-neighbor in a cardinal direction, by group bounding-box
@@ -583,6 +668,49 @@ export class HostController implements HostOps {
       if (!best || primary < best.dist) best = { id: p.id, dist: primary };
     }
     return best?.id ?? null;
+  }
+
+  /** Is `panel` eligible for a swap-with-direction exchange? Requires an
+   *  ordinary tiled single-panel grid group: not in the tray (floating), not a
+   *  tabbed/stacked multi-panel group (those need a break-out first), and no
+   *  active maximization (maximized mode hides geometry — swapping there is
+   *  ambiguous). Survival is not the concern here (moveTo never disposes); this
+   *  bounds the exchange to the geometrically-meaningful case. */
+  private isSwappablePanel(panel: IDockviewPanel): boolean {
+    if (panel.group.api.location.type !== "grid") return false;
+    if (panel.group.panels.length !== 1) return false;
+    if (this.api.hasMaximizedGroup()) return false;
+    return true;
+  }
+
+  /** Exchange two panes' relative ORDER via live-tree moveTo ops only
+   *  (renderer:'always' keeps both iframes mounted; mountTs/nonce/connId
+   *  unchanged). Algorithm (proven by the Slice-2 characterization probe):
+   *  (1) dock the SOURCE into the NEIGHBOR's group center — source's old
+   *  single-panel group is auto-removed by Dockview; (2) split the NEIGHBOR
+   *  back out to the OPPOSITE side of the direction the source came from, so
+   *  the neighbor now occupies the source's former side and the source is left
+   *  where the neighbor was. Dockview re-proportions pane sizes on dock+split,
+   *  so RELATIVE ORDER flips (left/right or top/bottom) but absolute pixels are
+   *  not preserved — that is the intended "swap with neighbor" semantic. The
+   *  caller MUST have validated both panels via isSwappablePanel. */
+  private exchangePanes(
+    source: IDockviewPanel,
+    neighbor: IDockviewPanel,
+    focusDir: FocusDir,
+  ): void {
+    const gb = neighbor.group;
+    // 1) dock source into neighbor's group as a tab; source's iframe survives
+    //    (moveTo repositions the keep-mounted renderer). source's old (now
+    //    empty single-panel) group is auto-removed by Dockview.
+    source.api.moveTo({ group: gb, position: "center" });
+    // 2) split neighbor back out to the opposite side — neighbor leaves the
+    //    combined group to occupy the source's former side, leaving source
+    //    alone in the combined group at the neighbor's former side. Net: the
+    //    two panes have exchanged relative ORDER. neighbor's iframe survives.
+    neighbor.api.moveTo({ group: gb, position: OPPOSITE_SIDE[focusDir] });
+    source.api.setActive();
+    this.afterMutation();
   }
 
   // ---- event wiring → store (display projection of THIS workspace) ---------
@@ -743,6 +871,8 @@ export class HostController implements HostOps {
     this.ops.openLayoutOverlay = (paneId) => this.openLayoutOverlay(paneId);
     this.ops.closeLayoutOverlay = () => this.closeLayoutOverlay();
     this.ops.overlaySplit = (paneId, dir) => this.overlaySplit(paneId, dir);
+    this.ops.overlaySwap = (paneId, dir) => this.overlaySwap(paneId, dir);
+    this.ops.overlaySwapTargets = (paneId) => this.overlaySwapTargets(paneId);
   }
 
   /** Dispose this controller: unregister from the store + the controller map so
@@ -856,7 +986,7 @@ export class HostController implements HostOps {
       // P3 NEXT hero button: inspect the ranking without acting + trigger the
       // action + read the host-latched firstNeedsYouAt tiebreak. These route
       // through attentionNext.ts (production logic) so the e2e drives the SAME
-      // path the statusbar's NEXT button uses.
+      // path the tabstrip NEXT button uses.
       nextTarget: (): { paneId: string; wsId: string; attention: string; firstNeedsYouAt: number } | null =>
         attentionNextTarget(),
       next: (): void => {
@@ -1046,7 +1176,9 @@ export class HostController implements HostOps {
       },
 
       // i3 layout-mode switch (Phase 1). Drives the SAME production HostOps path
-      // the statusbar cluster + keyboard shortcuts use (hostOps().setLayoutMode).
+      // the layout overlay + the DEV bridge use (hostOps().setLayoutMode); the
+      // statusbar cluster + Alt-keyboard shortcuts that also invoked it were
+      // retired with the statusbar.
       setLayoutMode: (paneId: string, mode: LayoutMode): void => {
         activeController()?.setLayoutMode(paneId, mode);
       },
@@ -1060,13 +1192,15 @@ export class HostController implements HostOps {
         activeController()?.moveDirection(paneId, dir);
       },
 
-      // ---- layout overlay (gesture / statusbar fallback) -------------------
+      // ---- layout overlay (gesture / DEV-bridge fallback) -------------------
       // Drive the overlay through the SAME production HostOps path the
-      // statusbar Layout button + the host-gesture router use
-      // (hostOps().openLayoutOverlay / closeLayoutOverlay / overlaySplit), plus
-      // read the overlay source signal for assertions. The host-gesture MESSAGE
-      // itself is probed via the existing probeHeartbeat (it routes any payload
-      // through the real routeMessage — the security e2e uses it).
+      // host-gesture router uses (hostOps().openLayoutOverlay / closeLayoutOverlay
+      // / overlaySplit / overlaySwap / overlaySwapTargets), plus read the overlay
+      // source signal for assertions. The statusbar Layout button that used to
+      // also open the overlay was removed with the statusbar; the overlay is
+      // gesture + DEV-bridge triggered now. The host-gesture MESSAGE itself is
+      // probed via the existing probeHeartbeat (it routes any payload through
+      // the real routeMessage — the security e2e uses it).
       overlaySource: (): string | null => overlaySourcePaneId(),
       openLayoutOverlay: (paneId: string): void => {
         activeController()?.openLayoutOverlay(paneId);
@@ -1076,6 +1210,17 @@ export class HostController implements HostOps {
       },
       overlaySplit: (paneId: string, dir: OverlaySplitDir): string | null =>
         activeController()?.overlaySplit(paneId, dir) ?? null,
+      overlaySwap: (paneId: string, dir: OverlaySplitDir): string | null =>
+        activeController()?.overlaySwap(paneId, dir) ?? null,
+      overlaySwapTargets: (
+        paneId: string,
+      ): Record<OverlaySplitDir, string | null> =>
+        activeController()?.overlaySwapTargets(paneId) ?? {
+          above: null,
+          right: null,
+          below: null,
+          left: null,
+        },
 
       // NEGATIVE CONTROL (a): naive remove + re-add. This is the exact mistake
       // renderer:'always' exists to prevent. It RELOADS the iframe (new

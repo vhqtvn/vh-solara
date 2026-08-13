@@ -4,10 +4,10 @@
   z-index: 5;
 }
 /* Scoped pointer-capture layer: covers ONLY <main> (the pane grid area), NOT
- * the tabstrip/statusbar (they are siblings of <main> in the .app flex column,
- * so a click on the statusbar NEXT/Layout button is never intercepted). An
- * outside-the-card click within <main> dismisses the overlay. GPU-cheap: a
- * plain transparent div, no mask/backdrop/contain. */
+ * the tabstrip (a sibling of <main> in the .app flex column, so a click on the
+ * tabstrip NEXT / Add-Server button is never intercepted). An outside-the-card
+ * click within <main> dismisses the overlay. GPU-cheap: a plain transparent
+ * div, no mask/backdrop/contain. */
 .capture {
   position: absolute;
   inset: 0;
@@ -95,6 +95,13 @@
   outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
+/* Disabled (Swap mode, no swappable neighbor in that direction): dimmed +
+ * keep the native cursor so the disable state reads as "not actionable", not
+ * a silent no-op. GPU-cheap (plain opacity, no filter/blur). */
+.arrow:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
 .arrowUp {
   grid-column: 2;
   grid-row: 1;
@@ -110,6 +117,73 @@
 .arrowDown {
   grid-column: 2;
   grid-row: 3;
+}
+/* Split/Swap segmented toggle for the cardinal arrows. GPU-cheap plain buttons
+ * (no backdrop-filter); the active half gets the accent border so the selected
+ * mode reads at a glance. */
+.modeRow {
+  display: flex;
+  gap: 4px;
+  margin-top: 2px;
+}
+.modeBtn {
+  appearance: none;
+  flex: 1 1 0;
+  border: 1px solid var(--border);
+  background: var(--bg-soft);
+  color: var(--fg);
+  font-size: 12px;
+  line-height: 1;
+  padding: 6px 0;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.modeBtn:first-child {
+  border-radius: 4px 2px 2px 4px;
+}
+.modeBtn:last-child {
+  border-radius: 2px 4px 4px 2px;
+  border-left: none;
+}
+.modeBtn:hover:not(.modeBtnActive) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.modeBtn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.modeBtnActive {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--bg-elev);
+}
+/* Close-pane action row. Distinct from the overlay-dismiss ✕ (top-right): this
+ * disposes the SOURCE pane (HostOps.closePane → removePanel). Full-width so the
+ * destructive intent is unmissable on touch. */
+.actionRow {
+  display: flex;
+  margin-top: 2px;
+}
+.closePaneBtn {
+  appearance: none;
+  flex: 1 1 0;
+  border: 1px solid var(--border);
+  background: var(--bg-soft);
+  color: var(--fg);
+  font-size: 12px;
+  line-height: 1;
+  padding: 6px 0;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.closePaneBtn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.closePaneBtn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
 }
 .hint {
   font-size: 10px;

@@ -531,4 +531,177 @@ test.describe("layout overlay interaction model", () => {
     expect(r.reason).toBe("rejected:origin-mismatch");
     expect(await H.focused(page), "focus unchanged after wrong-origin").toBe(ids[0]);
   });
+
+  // ---- (7) Slice 2: Swap mode + swap-with-direction -------------------------
+
+  test("Swap mode toggle: arrow aria-label + data-mode reflect the selected mode", async ({ page }) => {
+    const ids = await H.panes(page);
+    await H.openLayoutOverlay(page, ids[0]);
+    const up = page.locator('[data-testid="layout-overlay-above"]');
+    // Default mode is Split.
+    expect(await up.getAttribute("data-mode")).toBe("split");
+    expect(await up.getAttribute("aria-label")).toBe("Split above");
+    // Toggle to Swap — the label + mode attr follow.
+    await page.locator('[data-testid="layout-overlay-mode-swap"]').click();
+    await expect.poll(async () => up.getAttribute("data-mode")).toBe("swap");
+    expect(await up.getAttribute("aria-label")).toBe("Swap above");
+    await page.screenshot({ path: path.join(VISION_DIR, "07-swap-mode.png"), fullPage: true });
+    // Toggle back to Split.
+    await page.locator('[data-testid="layout-overlay-mode-split"]').click();
+    await expect.poll(async () => up.getAttribute("aria-label")).toBe("Split above");
+  });
+
+  test("Swap mode: arrow exchanges two panes — both SURVIVE, relative ORDER flips, source stays active", async ({ page }) => {
+    const seed = await H.panes(page);
+    const a = seed[0];
+    // Build a DETERMINISTIC 2-pane horizontal split: split a to the right so b is
+    // guaranteed to be a's nearest right neighbor (independent of the seed
+    // arrangement), each in its own single-panel grid group.
+    const b = await H.split(page, a, "right");
+    expect(b, "split created the swap neighbor").toBeTruthy();
+    await H.waitForReady(page, b!);
+
+    const rectOf = (id: string): Promise<{ left: number; top: number }> =>
+      page
+        .locator(`.pane[data-pane-id="${id}"]`)
+        .evaluate((el) => {
+          const r = el.getBoundingClientRect();
+          return { left: Math.round(r.left), top: Math.round(r.top) };
+        });
+    const ra0 = await rectOf(a);
+    const rb0 = await rectOf(b!);
+    // Precondition: a is left of b (the split put b to a's right).
+    expect(ra0.left < rb0.left, "precondition: a left of b before swap").toBe(true);
+
+    const beforeA = await H.survival(page, a);
+    const beforeB = await H.survival(page, b!);
+
+    await H.openLayoutOverlay(page, a);
+    await page.screenshot({ path: path.join(VISION_DIR, "08a-swap-before.png"), fullPage: true });
+
+    // Switch to Swap mode + drive the right arrow (the production UI path).
+    await page.locator('[data-testid="layout-overlay-mode-swap"]').click();
+    const arrow = page.locator('[data-testid="layout-overlay-right"]');
+    await expect.poll(async () => arrow.getAttribute("data-mode")).toBe("swap");
+    await expect(arrow).toBeEnabled();
+    await arrow.click();
+
+    // A swap auto-closes the overlay.
+    await expect.poll(async () => H.overlaySource(page)).toBeNull();
+
+    // CRUX (Architecture A): BOTH iframes survived the exchange (mountTs/nonce/
+    // connId unchanged) — renderer:'always' kept them mounted across the
+    // live-tree moveTo ops.
+    await H.assertSurvived(page, a, beforeA!, "source pane across overlay swap");
+    await H.assertSurvived(page, b!, beforeB!, "neighbor pane across overlay swap");
+
+    // Geometry: the two panes exchanged RELATIVE ORDER — a (was left) is now
+    // RIGHT of b. (Dockview re-proportions sizes on dock+split, so the SIGN of
+    // the position difference flips; absolute pixels are not preserved — that is
+    // the intended "swap with neighbor" semantic.)
+    const ra1 = await rectOf(a);
+    const rb1 = await rectOf(b!);
+    expect(ra1.left > rb1.left, "a now right of b after swap").toBe(true);
+
+    // Source stays active/focused after the swap.
+    await expect.poll(async () => H.focused(page), { timeout: 5000 }).toBe(a);
+
+    await page.screenshot({ path: path.join(VISION_DIR, "08b-swap-after.png"), fullPage: true });
+  });
+
+  test("Swap mode: an arrow with no swappable neighbor is DISABLED (visual + aria-disabled)", async ({ page }) => {
+    const seed = await H.panes(page);
+    const a = seed[0];
+    // Same deterministic setup: split a to the right, so a has exactly one
+    // neighbor (to its right). Left / above / below have no neighbor.
+    const b = await H.split(page, a, "right");
+    await H.waitForReady(page, b!);
+
+    await H.openLayoutOverlay(page, a);
+    await page.locator('[data-testid="layout-overlay-mode-swap"]').click();
+    await expect.poll(async () => page.locator('[data-testid="layout-overlay-left"]').getAttribute("data-mode")).toBe("swap");
+
+    // The RIGHT arrow has a swappable neighbor → enabled.
+    const rightArrow = page.locator('[data-testid="layout-overlay-right"]');
+    await expect(rightArrow).toBeEnabled();
+    expect(await rightArrow.getAttribute("aria-disabled")).toBeNull();
+
+    // The LEFT arrow has no neighbor (a is at the left edge) → DISABLED, not a
+    // silent no-op: native disabled + aria-disabled + an explanatory title.
+    const leftArrow = page.locator('[data-testid="layout-overlay-left"]');
+    await expect(leftArrow).toBeDisabled();
+    expect(await leftArrow.getAttribute("aria-disabled")).toBe("true");
+    expect(await leftArrow.getAttribute("title")).toContain("No swappable pane");
+
+    await page.screenshot({ path: path.join(VISION_DIR, "09-swap-no-neighbor.png"), fullPage: true });
+  });
+
+  // ---- (8) Slice 2: Close-pane action ---------------------------------------
+
+  test("Close-pane: disposes source, surviving pane SURVIVES, overlay dismisses; close-to-empty allowed", async ({ page }) => {
+    const ids = await H.panes(page);
+    const a = ids[0];
+    const b = ids[1];
+    const beforeB = await H.survival(page, b);
+
+    await H.openLayoutOverlay(page, a);
+    await expect(page.locator('[data-testid="layout-overlay-card"]')).toBeVisible();
+
+    // Close-pane is DISTINCT from the overlay-dismiss ✕ — it disposes the SOURCE
+    // pane (HostOps.closePane → removePanel; intended iframe disposal for close).
+    await page.locator('[data-testid="layout-overlay-close-pane"]').click();
+
+    // The source pane is gone from the model + the DOM.
+    await expect.poll(async () => (await H.panes(page)).includes(a)).toBe(false);
+    await expect(page.locator(`.pane[data-pane-id="${a}"]`)).toHaveCount(0);
+    // The overlay dismissed (source no longer exists).
+    await expect.poll(async () => H.overlaySource(page)).toBeNull();
+    // The SURVIVING pane's iframe was NOT touched (close disposes only the
+    // source — survival matters for the remaining panes).
+    await H.assertSurvived(page, b, beforeB!, "surviving pane across sibling close");
+
+    await page.screenshot({ path: path.join(VISION_DIR, "10-after-close.png"), fullPage: true });
+
+    // close-to-empty is ALLOWED (no guard): close every remaining pane one by one
+    // and assert the workspace reaches an empty state without error.
+    let remaining = await H.panes(page);
+    while (remaining.length > 0) {
+      await H.closePane(page, remaining[0]);
+      remaining = await H.panes(page);
+    }
+    await expect.poll(async () => (await H.panes(page)).length).toBe(0);
+  });
+
+  // ---- (9) Slice 2: stale-comment sweep (no current-surface statusbar refs) -
+
+  test("comment sweep: no stale (non-removal-aware) statusbar references in non-test source/docs", () => {
+    // The statusbar was removed in its entirety. References that describe it as
+    // a CURRENT surface are stale; references that document its REMOVAL as
+    // provenance are fine. This asserts every remaining "statusbar" mention
+    // (±1 line of context) carries a removal/historical indicator.
+    const REMOVAL_RX = /remov|delet|retir|legacy|surviv|exist|no longer|gone|dropped/i;
+    const walk = (dir: string, out: string[]): void => {
+      for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+        const p = path.join(dir, e.name);
+        if (e.isDirectory()) walk(p, out);
+        else out.push(p);
+      }
+    };
+    const roots = ["host-web/src", "host-web/docs"].map((r) => path.resolve(REPO_ROOT, r));
+    const files: string[] = [];
+    for (const r of roots) walk(r, files);
+    const offenders: string[] = [];
+    for (const f of files) {
+      if (!/\.(ts|tsx|css|md)$/.test(f)) continue;
+      const lines = fs.readFileSync(f, "utf8").split(/\r?\n/);
+      for (let i = 0; i < lines.length; i++) {
+        if (!/statusbar/i.test(lines[i])) continue;
+        const ctx = [lines[i - 1], lines[i], lines[i + 1]].filter(Boolean).join(" ");
+        if (!REMOVAL_RX.test(ctx)) {
+          offenders.push(`${path.relative(REPO_ROOT, f)}:${i + 1}: ${lines[i].trim()}`);
+        }
+      }
+    }
+    expect(offenders, `stale statusbar refs (non-removal-aware):\n${offenders.join("\n")}`).toEqual([]);
+  });
 });

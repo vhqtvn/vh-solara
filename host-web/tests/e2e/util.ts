@@ -766,12 +766,12 @@ export async function moveDirection(page: Page, paneId: string, dir: FocusDir): 
 
 // ---- layout overlay (gesture / DEV-bridge fallback) -------------------------
 // Drive the overlay through the SAME production HostOps path the host-gesture
-// router uses (hostOps().openLayoutOverlay / closeLayoutOverlay / overlaySplit),
-// plus read the overlay source signal. The statusbar Layout button that also
-// opened the overlay was removed with the statusbar; the overlay is gesture +
-// DEV-bridge triggered now. The host-gesture MESSAGE itself is probed via
-// probePaneMessage (it routes any payload through the real routeMessage — the
-// security e2e uses it).
+// router uses (hostOps().openLayoutOverlay / closeLayoutOverlay / overlaySplit /
+// overlaySwap / overlaySwapTargets), plus read the overlay source signal. The
+// statusbar Layout button that also opened the overlay was removed with the
+// statusbar; the overlay is gesture + DEV-bridge triggered now. The host-gesture
+// MESSAGE itself is probed via probePaneMessage (it routes any payload through
+// the real routeMessage — the security e2e uses it).
 
 /** The overlay's current source pane id (null when closed). */
 export async function overlaySource(page: Page): Promise<string | null> {
@@ -813,6 +813,38 @@ export async function overlaySplit(
     return h ? h.overlaySplit(paneId, dir) : null;
   }, { paneId, dir });
   return r ?? null;
+}
+
+/** Swap the overlay's source pane with its nearest neighbor in a cardinal
+ *  direction (overlay arrow path, Swap mode). Survival-safe live-tree exchange
+ *  (both iframes stay mounted). Returns the swapped-with pane id, or null when
+ *  not applicable (no swappable neighbor / source not swap-eligible). Auto-
+ *  closes + source stays active. */
+export async function overlaySwap(
+  page: Page,
+  paneId: string,
+  dir: OverlaySplitDir,
+): Promise<string | null> {
+  const r = await page.evaluate(({ paneId, dir }) => {
+    const h = (window as unknown as { __host?: { overlaySwap(p: string, d: OverlaySplitDir): string | null } }).__host;
+    return h ? h.overlaySwap(paneId, dir) : null;
+  }, { paneId, dir });
+  return r ?? null;
+}
+
+/** Read the swappable neighbor (if any) in each cardinal direction, for the
+ *  overlay's Swap-mode arrow-enable computation. A null entry = no swappable
+ *  neighbor in that direction (the overlay disables that arrow). */
+export async function overlaySwapTargets(
+  page: Page,
+  paneId: string,
+): Promise<Record<OverlaySplitDir, string | null>> {
+  return page.evaluate((paneId) => {
+    const h = (window as unknown as { __host?: { overlaySwapTargets(p: string): Record<OverlaySplitDir, string | null> } }).__host;
+    return h
+      ? h.overlaySwapTargets(paneId)
+      : { above: null, right: null, below: null, left: null };
+  }, paneId);
 }
 
 /** The focused pane's group info: {groupId, panelCount, headerPosition}. */

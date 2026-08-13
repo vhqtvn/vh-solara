@@ -168,10 +168,10 @@ export function exitKeyboardFocus(): void {
  *  (layout-viewport) coordinate space, shifts from [0,H] to [offsetTop,
  *  offsetTop+H]. The host root had the right SIZE (height=H) but the wrong
  *  POSITION (still at layout-y 0), so its top scrolled off-screen above the
- *  visual viewport and a body-background band opened below it (operator report:
- *  "app shifts above the viewport, statusbar floats mid-screen, black band
- *  below"). Pinning the root's top to offsetTop makes it occupy exactly the
- *  visible band.
+ *  visual viewport and a body-background band opened below it (operator report,
+ *  captured while the now-removed bottom statusbar existed: "app shifts above
+ *  the viewport, the bottom bar floats mid-screen, black band below"). Pinning
+ *  the root's top to offsetTop makes it occupy exactly the visible band.
  *
  *  MECHANISM CHOICE (transform, not position/top/fixed). transform: translateY
  *  is GPU-cheap (composite-only, no layout, no repaint) and shifts the WHOLE

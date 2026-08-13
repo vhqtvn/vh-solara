@@ -25,8 +25,8 @@ import { nextPaneId, resolveFleet } from "../state/mockData";
  * PATTERN (proven by the Phase-0 spike): onMount → createDockview with an
  * imperative widget model + a component factory + `defaultRenderer: 'always'`.
  * There is NO reactive two-way binding: SolidJS signals mirror the dockview
- * state for the shell (tabstrip/statusbar); all layout mutations go through the
- * HostController, which calls the DockviewApi directly.
+ * state for the shell (tabstrip + layout overlay); all layout mutations go
+ * through the HostController, which calls the DockviewApi directly.
  *
  * `renderer: 'always'` (set both as the default AND per-panel) is the mechanism
  * that keeps each cross-origin <iframe> permanently mounted — only its

@@ -330,9 +330,12 @@ const [connected, setConnected] = createSignal<boolean>(false);
 // workspaces' panes are not in the display projection); the per-pane header
 // indicator carries the load-bearing signal regardless of workspace.
 const [needsYouCount, setNeedsYouCount] = createSignal<number>(0);
-// P3: count of ACTIVE-workspace panes whose activity is "running". Drives the
-// statusbar attention-hub "M running" text (paired with needsYouCount). Same
-// recompute trigger + scope as needsYouCount.
+// P3: count of ACTIVE-workspace panes whose activity is "running". ORPHANED by
+// the statusbar removal (the deleted Statusbar's "M running" attention-hub text
+// was its only consumer; nothing reads it now). Recomputed in recomputeAggregates
+// alongside needsYouCount (same trigger/scope) so it stays accurate pending a
+// re-wire to a future overlay/tabstrip surface or outright removal; kept for now
+// to avoid touching recomputeAggregates in a comment-sweep slice.
 const [runningCount, setRunningCount] = createSignal<number>(0);
 // PER-WORKSPACE needs-you counts (ALL workspaces, not just active). A signal
 // holding a Record<wsId, count>; recomputed in recomputeAggregates on every
@@ -344,8 +347,8 @@ const [runningCount, setRunningCount] = createSignal<number>(0);
 const [needsYouByWs, setNeedsYouByWs] = createSignal<Record<string, number>>({});
 // Layout overlay: the source pane id (in the ACTIVE workspace) whose bounds the
 // overlay is anchored to, or null when closed. Set by routeMessage on a valid
-// host-gesture (source-bound) and by HostOps.openLayoutOverlay (statusbar
-// button). Cleared by HostOps.closeLayoutOverlay, on workspace switch, and when
+// host-gesture (source-bound) and by HostOps.openLayoutOverlay (the DEV test
+// bridge). Cleared by HostOps.closeLayoutOverlay, on workspace switch, and when
 // the source pane is removed (App.tsx effects). Workspace-scoped by construction
 // (only the active workspace's pane can be the source). The LayoutOverlay
 // component reads this + toggles the `.is-overlay-source` focus badge on the
@@ -929,9 +932,10 @@ export function routeMessage(
       }
       // TRUST TIER: heartbeat/status tier (origin-checked). A forged overlay
       // request would focus a pane + pop an overlay (an operator-action side
-      // effect), and a forged activate would steal focus + redirect statusbar
-      // actions, so source-binding alone (which a bound WindowProxy survives)
-      // is insufficient. Mirror the status branch's origin check exactly.
+      // effect), and a forged activate would steal focus + redirect attention
+      // (NEXT / overlay actions), so source-binding alone (which a bound
+      // WindowProxy survives) is insufficient. Mirror the status branch's origin
+      // check exactly.
       const expected = configuredOrigin.get(paneId);
       if (expected !== undefined && origin !== expected) {
         return { routed: true, paneId, accepted: false, reason: "rejected:origin-mismatch" };
@@ -948,8 +952,8 @@ export function routeMessage(
       // forwarded this because a tap inside its iframe does not bubble to the
       // host (so Dockview's native onDidActivePanelChange never fired). Call
       // focusPane(sourcePaneId) → setActive() → onDidActivePanelChange → the
-      // focus indicator (is-active + 3px outline + 5px top edge) + statusbar
-      // actions move to this pane.
+      // focus indicator (is-active + 3px outline + 5px top edge) moves to this
+      // pane.
       //
       // IDEMPOTENT: if this pane is already the focused pane, no-op (don't
       // thrash — the SPA throttles to once per focus session, but the host

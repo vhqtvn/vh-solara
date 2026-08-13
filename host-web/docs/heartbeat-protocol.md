@@ -198,16 +198,29 @@ the reloaded-window expire reactively.
 
 ### Exact label strings (Q1-C — do not paraphrase)
 
-| State            | Visible label           | Statusbar dot |
-|------------------|-------------------------|---------------|
-| document alive   | `document alive`        | on            |
-| reloaded         | `reloaded`              | warn          |
-| no recent signal | `no recent signal`      | off           |
+These are the values returned by `livenessLabel()` (the computed host-state
+labels, also exposed through the DEV bridge `window.__host.liveness()`):
 
-The statusbar shows the **focused** pane's state. Each pane header carries its own
-per-pane indicator (dot + the same label strings). The indicator is NEVER labeled
-`connected`, `connecting`, `realtime healthy`, `SSE healthy`, `receiving data`,
-or any realtime/stream-health wording.
+| State            | `livenessLabel()` value |
+|------------------|-------------------------|
+| document alive   | `document alive`        |
+| reloaded         | `reloaded`              |
+| no recent signal | `no recent signal`      |
+
+The liveness state is NEVER labeled `connected`, `connecting`,
+`realtime healthy`, `SSE healthy`, `receiving data`, or any realtime/stream-health
+wording — it is document/SPA liveness ONLY.
+
+**No DOM surface (current behavior).** The per-pane liveness indicator
+(dot + label) was **removed** with the per-pane header in i3 Phase 1 (`ff74f36`);
+the statusbar text surface that briefly replaced it was removed with the
+statusbar. The `iframeRenderer` renders only an iframe + an overlay-source badge
+— it never reads `livenessFor()`/`livenessLabel()` and emits no dot or label.
+Liveness is therefore **host-state observable** (the store keeps `livenessFor()`;
+the DEV bridge exposes it via `window.__host.liveness()`; `heartbeat.spec.ts`
+exercises it) but **NOT DOM-visible** in the current UI. (If a liveness surface
+is wanted again it would need a new home — e.g. the layout-overlay badge or a
+status indicator — but that is a future product decision, not current behavior.)
 
 ---
 
