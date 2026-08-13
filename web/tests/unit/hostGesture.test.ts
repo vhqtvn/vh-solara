@@ -561,6 +561,70 @@ describe("host gesture — pane-activate forward", () => {
     expect(activateCount(posted), "pointerdown → one activate").toBe(1);
   });
 
+  // REGRESSION (operator report): "clicking on the input text box [composer]
+  // sometimes failed to make the target pane focus." Root cause: the document
+  // pointerdown listener was registered in the BUBBLE phase (the `false` 3rd
+  // arg). An element- / library- / browser-level handler that calls
+  // e.stopPropagation() on pointerdown's bubble path BLOCKS the document bubble
+  // listener → no pane-activate forward. (SolidJS delegates `pointerdown` to
+  // `document`, and component/library/browser gesture handling can stop
+  // propagation to keep a gesture local.) In a pane whose window is ALREADY
+  // focused, window.focus does not fire either (it fires only on window-level
+  // focus gain, not on clicks within an already-focused window), so NEITHER
+  // path forwards → the host never re-activates → the focus indicator stays
+  // stuck on the stale pane. The fix registers the document pointerdown listener
+  // in the CAPTURE phase, which fires BEFORE any target/bubble-phase
+  // stopPropagation can block it. This is the deterministic red for that bug.
+  it("REGRESSION: a pointerdown whose bubble path calls stopPropagation STILL forwards (capture phase)", () => {
+    const input = document.createElement("input");
+    // Element-level bubble-phase handler that swallows the event — models a
+    // component/library/browser handler that stops propagation to keep the
+    // gesture local. On the BUGGY (bubble-phase) document listener this blocks
+    // the forward; on the FIXED (capture-phase) listener it does not.
+    input.addEventListener("pointerdown", (e) => e.stopPropagation());
+    document.body.appendChild(input);
+    sendTap({ target: input });
+    expect(
+      activateCount(posted),
+      "capture-phase listener survives an element-level stopPropagation",
+    ).toBe(1);
+    input.remove();
+  });
+
+  it("REGRESSION: focusin on any element forwards (the reliable element-focus path)", () => {
+    // window.focus fires ONLY on window-level focus gain — it does NOT fire
+    // when focus moves between elements WITHIN an already-focused window (e.g.
+    // clicking the composer in a pane whose window already had focus). focusin
+    // BUBBLES natively (focus does not) and fires on every element focus gain,
+    // so it is the reliable element-focus signal. Registered in capture phase
+    // so an element-level stopPropagation cannot block it (same defense as
+    // pointerdown). Together with the capture-phase pointerdown, this covers
+    // every activation path: a re-tap on an already-focused composer fires
+    // pointerdown (no focus change → no focusin), while a focus-into-composer
+    // fires focusin (and pointerdown); window.focus catches the cross-window
+    // case. At least one always fires.
+    const input = document.createElement("input");
+    document.body.appendChild(input);
+    input.dispatchEvent(new FocusEvent("focusin", { bubbles: true }));
+    expect(activateCount(posted), "focusin → one activate").toBe(1);
+    input.remove();
+  });
+
+  it("REGRESSION: a focusin whose bubble path calls stopPropagation STILL forwards (capture phase)", () => {
+    // Same capture-phase defense as the pointerdown regression, applied to the
+    // focusin path: an element/library/browser handler that stops focusin
+    // propagation cannot suppress the forward.
+    const input = document.createElement("input");
+    input.addEventListener("focusin", (e) => e.stopPropagation());
+    document.body.appendChild(input);
+    input.dispatchEvent(new FocusEvent("focusin", { bubbles: true }));
+    expect(
+      activateCount(posted),
+      "capture-phase focusin survives an element-level stopPropagation",
+    ).toBe(1);
+    input.remove();
+  });
+
   it("posts a CLOSED payload — exactly {type, gesture:pane-activate}, no extras", () => {
     sendTap();
     const activates = posted.filter(

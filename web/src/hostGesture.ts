@@ -236,17 +236,39 @@ export function startHostGesture(): (() => void) | undefined {
 
   // window.focus fires when the iframe (this document) gains focus — the
   // desktop click-into-pane path. pointerdown on document is more reliable on
-  // mobile (some engines fire focus unreliably on tap). Both forward
-  // unconditionally; the host dedupes. No-op before the handshake captured the
-  // host origin (postActivate gates on hostOrigin).
+  // mobile (some engines fire focus unreliably on tap). focusin covers the case
+  // window.focus misses (focus moving between elements WITHIN an already-focused
+  // window — e.g. clicking the composer in a pane whose window already had
+  // focus). All three forward unconditionally; the host dedupes. No-op before
+  // the handshake captured the host origin (postActivate gates on hostOrigin).
+  //
+  // CAPTURE PHASE (the reliability fix): the document pointerdown + focusin
+  // listeners are registered in the CAPTURE phase (3rd arg `true`). An element-,
+  // library- (SolidJS delegates `pointerdown` to document), or browser-level
+  // handler that calls e.stopPropagation() on the BUBBLE path cannot block a
+  // capture-phase listener — capture fires BEFORE any target/bubble handler, so
+  // stopPropagation in the bubble phase is too late to suppress us. (Only an
+  // EARLIER capture listener calling stopImmediatePropagation could, which is
+  // not the reported pattern.) This closes an intermittent on-device failure:
+  // "clicking the input text box sometimes failed to make the target pane
+  // focus." In an already-focused pane, window.focus does not fire either, so a
+  // bubble-phase pointerdown blocked by stopPropagation left NEITHER path
+  // forwarding → the host never re-activated → the focus indicator stayed stuck
+  // on the stale pane. window.focus is kept (not capture-able meaningfully — it
+  // does not bubble) as belt-and-suspenders for window-level focus changes that
+  // focusin may miss when focus returns to the document body.
   const onFocusActivate = (): void => {
+    postActivate();
+  };
+  const onFocusInActivate = (): void => {
     postActivate();
   };
   const onPointerDownActivate = (): void => {
     postActivate();
   };
   window.addEventListener("focus", onFocusActivate);
-  document.addEventListener("pointerdown", onPointerDownActivate, false);
+  document.addEventListener("focusin", onFocusInActivate, true);
+  document.addEventListener("pointerdown", onPointerDownActivate, true);
 
   // ---- desktop gesture: double bare-Ctrl ------------------------------------
   // Count non-repeated keydown events where event.key === "Control"; two within
@@ -437,7 +459,8 @@ export function startHostGesture(): (() => void) | undefined {
     window.removeEventListener("pointerup", onUpThreeFinger, false);
     window.removeEventListener("pointercancel", onUpThreeFinger, false);
     window.removeEventListener("focus", onFocusActivate);
-    document.removeEventListener("pointerdown", onPointerDownActivate, false);
+    document.removeEventListener("focusin", onFocusInActivate, true);
+    document.removeEventListener("pointerdown", onPointerDownActivate, true);
   };
 }
 
