@@ -311,7 +311,8 @@ export function isUpdating(): boolean {
 // delivery churn reduction (native EventSource delivers one part.append per
 // flush — cardinality 1, measured lane-6, ledger [1,1,1,1], commit 693433e) but
 // to run its own batched validation/aggregation — gen-filter + mismatch
-// collection — in a single produce loop. It still needs the "updating" data-
+// collection — in a single produce loop (same-task bursts still coalesce into
+// one flush — see the session-stream.ts buffer header). It still needs the "updating" data-
 // flowing indicator to pulse, so calling this once per flush mirrors
 // reconcileEvent's per-event bump.
 export function bumpUpdating() {

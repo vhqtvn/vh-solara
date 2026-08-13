@@ -35,11 +35,18 @@ import { projectUrl } from "./util";
 const VP = { width: 400, height: 320 };
 type Page = import("@playwright/test").Page;
 
-// The fixture's 4 streamed chunks (opencode.go:1558) and their byte offsets:
-//   "Working on it…"     start=0   (chunk 1)
-//   "\n\nDone. Updated " start=14  (chunk 2 — first start>0 suffix)
-//   "`parser.go` "       start=31  (chunk 3)
-//   "and added a test."  start=43  (chunk 4)
+// The fixture's 4 streamed chunks (opencode.go:1558) and their BYTE offsets.
+// NOTE: the wire `start` is a UTF-8 BYTE offset, NOT a character count — the
+// ellipsis "…" is U+2026 (3 UTF-8 bytes), so "Working on it…" is 14 chars but
+// 16 bytes; that 2-byte gap propagates to every later offset. The ASCII-only
+// suffix chunks (2-4) add their char count as bytes, so the byte starts are
+// [0,16,32,44], not the char starts [0,14,31,43]. Assertion 2 checks start>0
+// (not specific offsets), so a future fixture change only needs this comment
+// updated to match the new measured byte offsets.
+//   "Working on it…"     start=0   (chunk 1, 16 bytes)
+//   "\n\nDone. Updated " start=16  (chunk 2 — first start>0 suffix)
+//   "`parser.go` "       start=32  (chunk 3)
+//   "and added a test."  start=44  (chunk 4)
 // PREFIX / SUFFIX / FINAL are stable substrings that identify each chunk's
 // arrival in the DOM textContent without encoding edge-cases.
 const PREFIX = "Working on it";

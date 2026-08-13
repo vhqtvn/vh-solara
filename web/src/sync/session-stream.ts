@@ -1159,6 +1159,7 @@ function flushAppends(): void {
     if (c) c(frames.length);
   } catch {
     /* observer/resolver must never abort the flush */
+    try { console.debug("[vh:sync] flushCardinality collector threw; contained (frames still apply)"); } catch { /* log must never abort the flush either */ }
   }
   const mismatchSessions = new Set<string>();
   bumpUpdating();
