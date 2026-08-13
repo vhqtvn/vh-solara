@@ -79,12 +79,24 @@ export function isPartDeltaEnabled(): boolean {
 
 // --- Slice 3: part.append frame-batch buffer --------------------------------
 //
-// pendingAppends accumulates part.append suffixes between flushes so a burst
+// pendingAppends accumulates part.append suffixes between flushes. A burst
 // arriving in one event-loop tick coalesces into a SINGLE reactive setState
-// (one store mutation signal per tick, not one-per-suffix). The flush is a
-// microtask (queueMicrotask) — it runs at the end of the current task, sub-ms,
-// so the FIRST suffix of a burst applies promptly (instant first-token latency
-// preserved). appendFlushScheduled prevents multiple microtask schedulings.
+// (one store mutation signal per tick, not one-per-suffix) — BUT this
+// coalescing only engages for a SAME-TASK burst (the lane-5 unit /
+// MockEventSource path, which fires multiple part.append callbacks
+// synchronously in one task). Under NATIVE EventSource delivery each event
+// dispatches as a SEPARATE task and the post-task microtask drains the buffer
+// (cardinality 1) before the next part.append callback, so the batch does NOT
+// coalesce native events into one flush (measured lane-6: ledger [1,1,1,1],
+// max=1, commit 693433e) — i.e. it is NOT a production reactive-churn
+// reduction. The queue is retained for its NON-BATCHING responsibilities:
+// gen-filtering superseded-connection frames, mismatch aggregation across the
+// buffer (offset mismatch → cursorless re-snapshot), bumpUpdating, and non-
+// append drain ordering (drainPendingAppends). The flush is a microtask
+// (queueMicrotask) — it runs at the end of the current task, sub-ms, so the
+// FIRST suffix of a same-task burst applies promptly (instant first-token
+// latency preserved). appendFlushScheduled prevents multiple microtask
+// schedulings.
 //
 // Each entry captures the connection-generation token (`gen`) at buffer time so
 // flushAppends can drop frames from a superseded connection (sesGen bumped
@@ -944,12 +956,16 @@ function registerSessionMessageListeners(es: EventSource, gen: number): void {
         return;
       }
 
-      // Slice 3: part.append — buffer for frame-batched flush. A burst of
-      // suffixes arriving in one event-loop tick is accumulated and flushed in a
-      // SINGLE setState (one reactive update per tick, not one-per-suffix) via a
-      // microtask. The first suffix of a burst is still applied promptly — the
-      // microtask runs at the end of the current task (sub-ms), preserving
-      // instant first-token latency. See flushAppends / scheduleAppendFlush below.
+      // Slice 3: part.append — buffer for frame-batched flush. The "coalesce a
+      // same-task burst into one setState" effect ONLY engages when multiple
+      // part.append callbacks run in one task (the lane-5 unit / MockEventSource
+      // path); under NATIVE EventSource each event is its own task so the
+      // microtask drains after each (cardinality 1 — NOT a production churn
+      // reduction; see the buffer header above + commit 693433e). The queue's
+      // load-bearing value is its non-batching work (gen-filter, mismatch
+      // aggregation, bumpUpdating, non-append drain ordering). The first suffix
+      // of a same-task burst is still applied within sub-ms (microtask at end of
+      // the current task). See flushAppends / scheduleAppendFlush below.
       if (kind === "part.append") {
         if (sid) {
           pendingAppends.push({ gen, sid, payload: data as PartAppendPayload });
@@ -1090,9 +1106,12 @@ function registerSessionMessageListeners(es: EventSource, gen: number): void {
 //
 // scheduleAppendFlush — arms a single microtask to drain pendingAppends. Idempotent
 // within a tick (appendFlushScheduled gates re-arming); the microtask runs at the
-// end of the current task, coalescing every suffix that arrived in this tick into
-// one flushAppends call (one reactive setState). The first suffix of a burst is
-// therefore applied within sub-ms of arrival (instant first-token latency).
+// end of the current task. The "coalesce every suffix that arrived in this tick
+// into one setState" effect ONLY engages for a SAME-TASK burst (the lane-5 unit
+// mechanism); under NATIVE EventSource each event is a separate task so the
+// microtask drains after each (cardinality 1 — see the buffer header above +
+// commit 693433e). The first suffix of a same-task burst is therefore applied
+// within sub-ms of arrival (instant first-token latency).
 function scheduleAppendFlush(): void {
   if (appendFlushScheduled) return;
   appendFlushScheduled = true;

@@ -313,15 +313,16 @@ test("part.append: live SSE suffix streaming — negotiated, delivered, incremen
 
   // Engagement disposition. WHATWG SSE dispatches each event as a SEPARATE task;
   // the microtask checkpoint after each task drains pendingAppends (cardinality
-  // 1) before the next part.append callback fires. The prediction (medium-high
-  // confidence) is therefore max === 1 — the batch does NOT engage under native
-  // EventSource (one dispatch task per event). The 180ms fixture gaps also
-  // predict this, but the task/microtask semantics are the real reason.
+  // 1) before the next part.append callback fires, so the batch does NOT engage
+  // under native EventSource (one dispatch task per event). This is measured
+  // fact, not prediction: lane-6 ledger [1,1,1,1], max=1 (commit 693433e). The
+  // 180ms fixture gaps are consistent with this too, but the task/microtask
+  // semantics are the real reason.
   //
-  // This assertion is HONEST about the measured value: if max measured > 1,
-  // engagement occurred (a real finding, not a failure) and this constant +
-  // comment must be updated to document it. As written it encodes the predicted
-  // non-engagement; the measurement run confirms or refutes it.
+  // This assertion stays HONEST about the measured value: if a future run
+  // measures max > 1, engagement occurred (a real finding, not a failure) and
+  // this comment must be updated to document it. As written it encodes the
+  // measured non-engagement.
   expect(
     maxCardinality,
     `Measured flush-cardinality ledger: ${JSON.stringify(flushCardinalities)} ` +

@@ -307,9 +307,13 @@ export function isUpdating(): boolean {
   return updating();
 }
 // bumpUpdating — exported for slice-3 part.append frame-batching (session-
-// stream.ts flushAppends), which bypasses reconcileEvent to coalesce a suffix
-// burst into one setState but still needs the "updating" data-flowing indicator
-// to pulse. Calling this once per flush mirrors reconcileEvent's per-event bump.
+// stream.ts flushAppends), which bypasses reconcileEvent NOT as a native-
+// delivery churn reduction (native EventSource delivers one part.append per
+// flush — cardinality 1, measured lane-6, ledger [1,1,1,1], commit 693433e) but
+// to run its own batched validation/aggregation — gen-filter + mismatch
+// collection — in a single produce loop. It still needs the "updating" data-
+// flowing indicator to pulse, so calling this once per flush mirrors
+// reconcileEvent's per-event bump.
 export function bumpUpdating() {
   setUpdating(true);
   clearTimeout(updatingTimer);

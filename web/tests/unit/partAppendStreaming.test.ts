@@ -10,7 +10,10 @@
 //      offset-validation + in-place append + merge/completion-ordering logic,
 //      tested directly on a hand-built SessionMessages draft (no store, no SSE).
 //   2. INTEGRATION — session-stream.ts: the part_delta=1 URL negotiation, the
-//      part.append listener manifest, frame-batching (one setState per tick),
+//      part.append listener manifest, frame-batching (one setState per tick —
+//      exercised via MockEventSource's SAME-TASK synchronous fire, the lane-5
+//      unit mechanism; under NATIVE EventSource the batch does NOT engage,
+//      measured cardinality 1, commit 693433e),
 //      the end-to-end append through the real Solid store, multi-byte UTF-8
 //      validation, offset-mismatch → cursorless re-snapshot, and the kill-switch
 //      disabled → legacy revert path.
@@ -381,7 +384,7 @@ describe("session-stream — end-to-end suffix append through the Solid store", 
   });
 });
 
-describe("session-stream — frame-batching (one reactive setState per tick)", () => {
+describe("session-stream — frame-batching (one reactive setState per SAME-TASK burst; lane-5 unit via MockEventSource — NOT native delivery)", () => {
   it("buffers multiple suffixes in one tick and applies them in a SINGLE flush", async () => {
     stream.openSessionStream(SID);
     const es = sessionESes()[0];
@@ -405,7 +408,7 @@ describe("session-stream — frame-batching (one reactive setState per tick)", (
     expect((store.state.messages[SID]?.byId?.m1?.parts?.p1 as { text?: string }).text).toBe("Hello world!");
   });
 
-  it("coalesces a suffix burst into ONE reactive notification (createEffect count)", async () => {
+  it("coalesces a SAME-TASK suffix burst into ONE reactive notification (lane-5 unit; MockEventSource fires synchronously — NOT native delivery)", async () => {
     stream.openSessionStream(SID);
     const es = sessionESes()[0];
     es.fire("snapshot", rawSessionSnap(1, SID, "m1"), "1");
@@ -413,7 +416,12 @@ describe("session-stream — frame-batching (one reactive setState per tick)", (
 
     // Track reactive notifications on the part's text field. A Solid createEffect
     // that reads .text re-runs once per reactive mutation (per setState that
-    // touches the field). Frame-batching = ONE re-run for the whole burst.
+    // touches the field). Frame-batching = ONE re-run for the whole SAME-TASK
+    // burst (MockEventSource.fire dispatches synchronously in one task — the
+    // lane-5 unit mechanism). Under NATIVE EventSource each event is its own
+    // task so the microtask drains after each (cardinality 1, commit 693433e)
+    // and this coalescing does NOT occur; the queue is retained for non-batching
+    // work (gen-filter, mismatch aggregation, bumpUpdating, drain ordering).
     let runs = 0;
     let lastText = "";
     createEffect(() => {
