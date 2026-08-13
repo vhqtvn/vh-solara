@@ -32,18 +32,24 @@
 //       applied only AFTER the replacement snapshot seeds messages[id], so it
 //       is NOT silently dropped.
 // The ownership-aware CLEAR specifically (the `finally` gen guard) is EXERCISED
-// by these scenarios (decode1's finally runs during the flush while decode2 is
-// in flight) but is NOT precisely pinned: real timers drain ALL microtasks in
-// a single `await tick(1)`, so decode1 and decode2 both finish within one
-// macrotask boundary and cannot be separated without a test accessor or fake
-// timers. The end-state assertions below ARE sensitive to a broken clear — if
-// the clear were broken, a message fired between the two decodes' resolutions
-// could bypass the gate — but they do not isolate the finally-guard from the
-// post-await apply-guard. That isolation is deferred until an accessor exists.
+// by all three scenarios. Tests 1-2 observe it INDIRECTLY through end-state
+// assertions (a broken clear could let a message bypass the gate) and drain
+// with `await tick(2)`; they do not separate the two decodes' resolutions in
+// time. Test 3 ("survives a cross-switch burst") goes further: it installs a
+// test-local CONTROLLED DecompressionStream (mirroring sessionLiveness.test.ts
+// Gate I) where each stream (A and B) gets its OWN deferred first-read barrier,
+// so the test can deterministically drive the ownership-critical window —
+// release A's decode while B's stays held, fire a B live event in that window,
+// and prove it stays GATED (stale A's completion did NOT clear B's
+// sesSnapshotDecoding flag). This isolates the finally-guard from the
+// post-await apply-guard WITHOUT needing a module accessor, and removes the
+// load-dependent tick(2) oracle that flaked under full-suite concurrency.
 //
 // Real timers (NOT fake): DecompressionStream's reader.read chain is a real
-// async source. Node 18+ ships it as a global (undici). Mirrors
-// coherentBarrier.test.ts / streamIntegration.test.ts.
+// async source. Node 18+ ships it as a global (undici). Tests 1-2 use the real
+// global; test 3 replaces it with a controlled substitute for the duration of
+// that one test (restored in finally). Mirrors coherentBarrier.test.ts /
+// streamIntegration.test.ts (real) + sessionLiveness.test.ts Gate I (controlled).
 //
 // Mock EventSource + encodeForTest + tick mirror the established harness.
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
@@ -249,40 +255,183 @@ describe("Gap #4 — sesSnapshotDecode ownership-aware clear across session swit
   });
 
   it("survives a cross-switch burst: stale A decode discarded + replacement B decode gates a live message (end-to-end gen ownership)", async () => {
-    stream.connect();
-    const treeES = treeESes()[0];
-    treeES.simulateOpen();
+    // === Controlled DecompressionStream fixture (mirrors sessionLiveness.test.ts Gate I) ===
+    //
+    // ROOT CAUSE OF THE ORIGINAL FLAKE: the test pumped a fixed `tick(2)` (two
+    // setTimeout(0) turns) and HOPED both gzip64 decodes finished within that
+    // window. But decodeGzip64 completes via a DecompressionStream reader.read()
+    // loop whose resolutions are macrotask-bounded under the REAL global; under
+    // full-suite load B's decode can still be pending at assertion time → b1
+    // absent → flake. Full-suite load is an AMPLIFIER, not the root.
+    //
+    // FIX: install a test-local controlled DecompressionStream where EACH stream
+    // (A and B) gets its OWN deferred first-read barrier (independent controls —
+    // a single shared barrier could not prove the ownership ordering). The
+    // controlled reader emits the known decompressed snapshot bytes for its
+    // session, so a1/b1 resolve correctly. Every read resolution is a plain
+    // promise resolution (a microtask), so the completion chain is deterministic
+    // regardless of suite concurrency — no timer pump, no load-dependent turn
+    // count. Progress is driven by barrier release + read-lifecycle signals, not
+    // elapsed time.
+    const snapABytes = Buffer.from(
+      JSON.stringify({
+        seq: 1,
+        gate: { A: { messagesLoaded: true } },
+        messages: { A: [{ info: { id: "a1", sessionID: "A", role: "user" }, parts: [] }] },
+      }),
+      "utf-8",
+    );
+    const snapBBytes = Buffer.from(
+      JSON.stringify({
+        seq: 1,
+        gate: { B: { messagesLoaded: true } },
+        messages: { B: [{ info: { id: "b1", sessionID: "B", role: "user" }, parts: [] }] },
+      }),
+      "utf-8",
+    );
 
-    // Open A, start decode1 (gen=G_A) with snap A.
-    stream.openSessionStream("A");
-    const esA = sessionESes()[0];
-    esA.simulateOpen();
-    esA.fire("snapshot", gzip64SessionSnap(1, "A", "a1"), "1");
+    interface DecodeControl {
+      bytes: Uint8Array;
+      // Barrier: the decode loop's FIRST read() suspends here until the test
+      // releases it. This is the lever that deterministically orders A vs B.
+      firstRead: Promise<{ done: boolean; value?: Uint8Array }>;
+      resolveFirstRead: (v: { done: boolean; value?: Uint8Array }) => void;
+      readCount: number;
+      // Synchronous signal set in the DS constructor = "decode started" (no
+      // timer turn needed to detect it: decodeGzip64 runs `new
+      // DecompressionStream` before its first await, inside the fire() call).
+      constructed: boolean;
+      // Read-lifecycle signal: resolves when the terminating {done:true} read is
+      // consumed → the decode loop has exited. Awaited as the deterministic
+      // "decode progressed to completion" checkpoint (tied to read() lifecycle,
+      // not timer turns).
+      loopExited: Promise<void>;
+      resolveLoopExited: () => void;
+    }
+    const makeCtrl = (bytes: Uint8Array): DecodeControl => {
+      let resolveFirstRead: (v: { done: boolean; value?: Uint8Array }) => void = () => {};
+      const firstRead = new Promise<{ done: boolean; value?: Uint8Array }>(
+        (r) => (resolveFirstRead = r),
+      );
+      let resolveLoopExited: () => void = () => {};
+      const loopExited = new Promise<void>((r) => (resolveLoopExited = r));
+      return { bytes, firstRead, resolveFirstRead, readCount: 0, constructed: false, loopExited, resolveLoopExited };
+    };
+    const ctrlA = makeCtrl(snapABytes);
+    const ctrlB = makeCtrl(snapBBytes);
+    // Assigned by construction order: A's snapshot fires first, B's second.
+    const queue: DecodeControl[] = [ctrlA, ctrlB];
+    let dsConstructCount = 0;
 
-    // Switch to B (sesGen bumped twice; flag reset by open()), start decode2
-    // (gen=G_B2) with snap B. decode1 is still in flight against gen=G_A.
-    stream.openSessionStream("B");
-    const esB = sessionESes()[0];
-    esB.simulateOpen();
-    esB.fire("snapshot", gzip64SessionSnap(1, "B", "b1"), "1");
+    class ControlledDS {
+      readable: { getReader: () => { read: () => Promise<{ done: boolean; value?: Uint8Array }> } };
+      writable: { getWriter: () => { write: () => Promise<void>; close: () => Promise<void> } };
+      constructor(_format?: string) {
+        // Capture THIS instance's control via the construction counter (closure
+        // capture — no `this` in the read path, so field-init order is moot).
+        // 1st construction = A, 2nd = B.
+        const c = queue[dsConstructCount] ?? queue[queue.length - 1];
+        c.constructed = true;
+        dsConstructCount++;
+        this.readable = {
+          getReader: () => ({
+            read: () => {
+              if (c.readCount++ === 0) return c.firstRead; // 1st read: suspend on barrier
+              c.resolveLoopExited(); // 2nd read: terminating → loop exits
+              return Promise.resolve({ done: true } as { done: boolean; value?: Uint8Array });
+            },
+          }),
+        };
+        this.writable = {
+          getWriter: () => ({
+            write: () => Promise.resolve(),
+            close: () => Promise.resolve(),
+          }),
+        };
+      }
+    }
 
-    // Fire a live message on B's connection. The listener (gen=G_B2) gates
-    // behind decode2 (flag=true from snap B). Synchronously NOT applied.
-    esB.fire("message.upsert", { id: "b_live", sessionID: "B", role: "user" }, "2");
-    expect(store.state.messages["B"]?.byId?.["b_live"]).toBeUndefined();
+    const g = globalThis as unknown as { DecompressionStream?: unknown };
+    const origDS = g.DecompressionStream;
+    g.DecompressionStream = ControlledDS;
 
-    // Drain all microtasks. Both decodes finish within this one macrotask
-    // boundary (real-timer limitation — see file header): decode1's finally
-    // runs while decode2 was/is in flight, exercising the ownership-aware
-    // clear path; decode1's apply is gen-discarded; decode2's apply seeds B;
-    // the gated message resumes and upserts b_live.
-    await tick(2);
+    // Pure-microtask drain for the post-loop chain (TextDecoder → JSON.parse →
+    // IIFE body + finally; for B, also the gated listener's resumption). NO
+    // setTimeout / macrotask turns — deterministic regardless of suite load.
+    const drain = async (): Promise<void> => {
+      for (let i = 0; i < 16; i++) await Promise.resolve();
+    };
 
-    // Stale A discarded.
-    expect(store.state.messages["A"]?.byId?.["a1"]).toBeUndefined();
-    // Replacement B seeded + live message gated through (NOT dropped).
-    expect(store.state.messages["B"]?.byId?.["b1"]).toBeDefined();
-    expect(store.state.messages["B"]?.byId?.["b_live"]).toBeDefined();
-    expect(store.state.messages["B"]?.order ?? []).toEqual(expect.arrayContaining(["b1", "b_live"]));
+    try {
+      stream.connect();
+      const treeES = treeESes()[0];
+      treeES.simulateOpen();
+
+      // --- Step 1: start A's decode (gen=G_A). The controlled DS is constructed
+      // synchronously inside fire() — decodeGzip64 reaches `new
+      // DecompressionStream` before its first await — so decode-started needs no
+      // timer turn. The IIFE suspends at A's first-read barrier. ---
+      stream.openSessionStream("A");
+      const esA = sessionESes()[0];
+      esA.simulateOpen();
+      esA.fire("snapshot", { encoding: "gzip64", data: "AAAA" }, "1");
+      expect(ctrlA.constructed).toBe(true); // decode started (synchronous proof)
+
+      // --- Step 2: switch active session to B. closeSessionStream() bumps
+      // sesGen (A's captured gen is now stale); open() bumps it again and resets
+      // the decode gate (sesSnapshotDecoding=false, sesSnapshotDecode=resolved).
+      // A's IIFE is still suspended in the background with its captured gen=G_A. ---
+      stream.openSessionStream("B");
+      const esB = sessionESes()[0];
+      esB.simulateOpen();
+
+      // --- Step 3: start B's decode (gen=G_B). The 2nd DS construction is B's;
+      // its IIFE suspends at B's first-read barrier. ---
+      esB.fire("snapshot", { encoding: "gzip64", data: "AAAA" }, "1");
+      expect(ctrlB.constructed).toBe(true);
+
+      // --- Step 4: RELEASE A while B stays deliberately HELD. A's completion
+      // chain runs: decode loop → JSON.parse → IIFE body (`if (gen !== sesGen)
+      // return` — G_A !== G_B → discards applySnap, so a1 never seeds) → finally
+      // (`if (gen === sesGen) sesSnapshotDecoding = false` — G_A !== G_B → does
+      // NOT clear). sesSnapshotDecoding STAYS true: B owns the gate. ---
+      ctrlA.resolveFirstRead({ done: false, value: snapABytes });
+      await ctrlA.loopExited; // read loop consumed the terminating {done:true}
+      await drain(); // post-loop chain incl. the gen-owned finally
+
+      // --- Step 5: A-complete / B-held window — the ownership crux. Fire a B
+      // live event and prove it stays GATED. The message listener reaches `if
+      // (sesSnapshotDecoding) await sesSnapshotDecode`: if A's stale finally had
+      // WRONGLY cleared the flag, the listener would run synchronously, find
+      // messages["B"] unseeded, and SILENTLY DROP b_live (reducers.ts
+      // message.upsert: `if (sm) upsertMessage(...)` — sm undefined → skip).
+      // Instead the flag is still true → the listener suspends → b_live is
+      // absent NOW but will land once B releases (step 7). The synchronous
+      // absence here + presence after B-release together prove the gate held. ---
+      esB.fire("message.upsert", { id: "b_live", sessionID: "B", role: "user" }, "2");
+      expect(store.state.messages["B"]?.byId?.["b_live"]).toBeUndefined();
+
+      // --- Step 6: RELEASE B. B's decode completes (gen===sesGen → applySnap
+      // seeds messages["B"] with b1; finally clears sesSnapshotDecoding). The
+      // suspended listener resumes — its awaited sesSnapshotDecode was B's IIFE,
+      // now resolved — and applies b_live AFTER b1 is seeded (not dropped). ---
+      ctrlB.resolveFirstRead({ done: false, value: snapBBytes });
+      await ctrlB.loopExited;
+      await drain();
+
+      // --- Step 7: assertions. ---
+      // Stale A discarded (post-await gen guard returned before applySnap).
+      expect(store.state.messages["A"]?.byId?.["a1"]).toBeUndefined();
+      // Replacement B seeded b1 from its snapshot.
+      expect(store.state.messages["B"]?.byId?.["b1"]).toBeDefined();
+      // The gated live message landed AFTER B seeded messages["B"] — NOT
+      // silently dropped. Its presence is the direct proof that A's completion
+      // did NOT clear B's decode gate (a broken guard would have dropped it).
+      expect(store.state.messages["B"]?.byId?.["b_live"]).toBeDefined();
+      expect(store.state.messages["B"]?.order ?? []).toEqual(expect.arrayContaining(["b1", "b_live"]));
+    } finally {
+      // Restore the real global so the controlled DS never leaks to other tests.
+      g.DecompressionStream = origDS;
+    }
   });
 });
