@@ -15,6 +15,7 @@ import {
   onWorkspaceActivated,
   uninstallKeyboardFocus,
 } from "./keyboardFocus";
+import { installAutoTranspose, uninstallAutoTranspose } from "./viewportShape";
 import s from "./App.module.css";
 
 /**
@@ -67,9 +68,15 @@ export function App() {
   // bound by the time the accessor fires.
   onMount(() => {
     installKeyboardFocus(() => appRoot);
+    // Viewport-shape auto-transpose (i3 Phase 2): on resize/rotation, flip the
+    // active workspace's grid split axis to match the shape. Survival-safe
+    // (gridview flipNode keeps iframes mounted) + reversible (localStorage
+    // toggle, default ON). Self-contained listeners + DEV bridge; cleanup below.
+    installAutoTranspose();
   });
   onCleanup(() => {
     uninstallKeyboardFocus();
+    uninstallAutoTranspose();
   });
 
   // While the keyboard is open and the operator switches workspace, re-point

@@ -976,6 +976,130 @@ export async function appRootTransform(page: Page): Promise<string> {
   });
 }
 
+// ---- viewport-shape auto-transpose bridge (window.__hostViewport, DEV-only) --
+// Drives host-web/src/viewportShape.ts (i3 Phase 2) programmatically for
+// deterministic headless e2e. The real device-rotation OUTCOME is not
+// demonstrable headlessly; these hooks prove the MECHANISM (shape classify →
+// gridview transpose → identity-survival). The bridge is absent in prod
+// (import.meta.env.DEV gate; the preview-e2e asserts __host*=0 in prod).
+
+/** Storage key the auto-transpose toggle persists (must match
+ *  src/viewportShape.ts). */
+export const AUTOTRANSPOSE_STORAGE_KEY = "vh-host:autotranspose";
+
+export type ViewportShape = "tall" | "wide" | "square";
+
+/** Read the auto-transpose on/off toggle (default ON when absent). */
+export async function viewportEnabled(page: Page): Promise<boolean> {
+  return page.evaluate(() => {
+    const b = (window as unknown as { __hostViewport?: { enabled(): boolean } }).__hostViewport;
+    return b ? b.enabled() : true;
+  });
+}
+
+/** Set the auto-transpose toggle (persists to localStorage). */
+export async function setViewportEnabled(page: Page, on: boolean): Promise<void> {
+  await page.evaluate((on) => {
+    const b = (window as unknown as { __hostViewport?: { setEnabled(v: boolean): void } }).__hostViewport;
+    b?.setEnabled(on);
+  }, on);
+}
+
+/** ClassifyShape of the page's current window dimensions. */
+export async function viewportShape(page: Page): Promise<ViewportShape> {
+  return page.evaluate(() => {
+    const b = (window as unknown as { __hostViewport?: { currentShape(): ViewportShape } }).__hostViewport;
+    return b ? b.currentShape() : "square";
+  });
+}
+
+/** The ACTIVE workspace's grid orientation via the CORRECTED gridview read
+ *  (NOT the broken api.orientation path). null when there is no active api. */
+export async function viewportOrientation(
+  page: Page,
+): Promise<"HORIZONTAL" | "VERTICAL" | null> {
+  const r = await page.evaluate(() => {
+    const b = (window as unknown as { __hostViewport?: { currentOrientation(): "HORIZONTAL" | "VERTICAL" | null } }).__hostViewport;
+    return b ? b.currentOrientation() : null;
+  });
+  return r ?? null;
+}
+
+/** Flush any pending debounced evaluation + apply immediately. For tests that
+ *  need a deterministic transpose without waiting for the debounce window. */
+export async function viewportTransposeNow(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    const b = (window as unknown as { __hostViewport?: { transposeNow(): void } }).__hostViewport;
+    b?.transposeNow();
+  });
+}
+
+/** Number of applyTranspose RUNS (the debounce-coalescing signal: N rapid resize
+ *  events should produce exactly ONE run). */
+export async function viewportEvalCount(page: Page): Promise<number> {
+  return page.evaluate(() => {
+    const b = (window as unknown as { __hostViewport?: { evalCount(): number } }).__hostViewport;
+    return b ? b.evalCount() : 0;
+  });
+}
+
+/** Number of ACTUAL orientation changes applied (flipCount). */
+export async function viewportFlipCount(page: Page): Promise<number> {
+  return page.evaluate(() => {
+    const b = (window as unknown as { __hostViewport?: { flipCount(): number } }).__hostViewport;
+    return b ? b.flipCount() : 0;
+  });
+}
+
+/** Fire a synthetic window resize event (does NOT change dimensions — used by the
+ *  debounce test to fire many events in one tick and prove they coalesce to one
+ *  evaluation). */
+export async function dispatchResize(page: Page): Promise<void> {
+  await page.evaluate(() => window.dispatchEvent(new Event("resize")));
+}
+
+/** Wait until two panes are side-by-side (HORIZONTAL: `b` is to the right of
+ *  `a`, same row). Polls groupBox; throws after timeoutMs. Asserts the grid
+ *  split axis is horizontal without depending on any bridge read. */
+export async function waitForSideBySide(
+  page: Page,
+  a: string,
+  b: string,
+  timeoutMs = 4000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const ga = await groupBox(page, a);
+    const gb = await groupBox(page, b);
+    if (ga && gb && gb.left > ga.left + ga.width * 0.4 && Math.abs(ga.top - gb.top) < 8) {
+      return;
+    }
+    await page.waitForTimeout(80);
+  }
+  throw new Error(`panes ${a},${b} never settled side-by-side within ${timeoutMs}ms`);
+}
+
+/** Wait until two panes are stacked (VERTICAL: `b` is below `a`, same column).
+ *  Polls groupBox; throws after timeoutMs. Asserts the grid split axis is
+ *  vertical without depending on any bridge read. */
+export async function waitForStacked(
+  page: Page,
+  a: string,
+  b: string,
+  timeoutMs = 4000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const ga = await groupBox(page, a);
+    const gb = await groupBox(page, b);
+    if (ga && gb && gb.top > ga.top + ga.height * 0.4 && Math.abs(ga.left - gb.left) < 8) {
+      return;
+    }
+    await page.waitForTimeout(80);
+  }
+  throw new Error(`panes ${a},${b} never settled stacked within ${timeoutMs}ms`);
+}
+
 // ---- waiting helpers -------------------------------------------------------
 
 /** Wait until the pane has heartbeated AND its WS echo connection is up. */
