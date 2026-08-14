@@ -6,6 +6,7 @@ import {
   applyColdRestoreForWorkspace,
   installLayoutSaver,
 } from "./layoutPersistence";
+import { installFlipAnimation } from "../layoutAnimation";
 import type { HostOps } from "./types";
 import {
   activeWorkspaceId,
@@ -49,6 +50,9 @@ export function DockviewHost(props: { workspaceId: string }) {
   // See the onMount block for the rationale.
   let onGeometryDragStart: ((ev: PointerEvent) => void) | undefined;
   let onGeometryDragEnd: (() => void) | undefined;
+  // FLIP layout animation uninstall handle (assigned in onMount; detached in
+  // onCleanup). See layoutAnimation.ts.
+  let uninstallFlip: (() => void) | undefined;
 
   // Mutable ops object breaks the dockview↔controller creation cycle: the
   // factory captures it; the controller fills it after the api exists.
@@ -140,6 +144,14 @@ export function DockviewHost(props: { workspaceId: string }) {
     container.addEventListener("pointerdown", onGeometryDragStart, true);
     window.addEventListener("pointerup", onGeometryDragEnd, true);
     window.addEventListener("pointercancel", onGeometryDragEnd, true);
+
+    // ---- FLIP layout animation (replaces the laggy left/top/width/height CSS
+    //      transition — see layoutAnimation.ts). Installed AFTER cold-init so
+    //      the restored/seeded layout is the baseline (no FLIP on first paint),
+    //      and AFTER the drag toggle (the FLIP reads `.dv-geometry-dragging` on
+    //      this container to skip continuous sash/floating drags). One
+    //      installation per workspace (each host has its own api + container). --
+    uninstallFlip = installFlipAnimation(api, container);
   });
 
   // On becoming active, recompute dimensions (a previously-hidden host may need
@@ -167,6 +179,7 @@ export function DockviewHost(props: { workspaceId: string }) {
       window.removeEventListener("pointerup", onGeometryDragEnd, true);
       window.removeEventListener("pointercancel", onGeometryDragEnd, true);
     }
+    uninstallFlip?.();
     controller?.dispose();
     clearDisplayFor(props.workspaceId);
     api?.dispose();
