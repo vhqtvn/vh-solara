@@ -1,5 +1,7 @@
 # 2026-08-12 — Part-stream redesign CLOSURE (slice 7, final)
 
+> **Update 2026-08-13:** Post-closure DEFER work brought the lane to its final state (14 commits) and resolved deferred items (a) browser e2e (`08baadc`) and (c) the sesSnapshotOwnership flake (`060c739`); (b) is carded. See [`2026-08-13-part-stream-defer-closure-and-archive.md`](./2026-08-13-part-stream-defer-closure-and-archive.md) for the final record. The "Explicitly DEFERRED" section below is historical as-of slice 7.
+
 ## Summary
 
 This is the **closure slice** (slice 7) of the part-append suffix-streaming
