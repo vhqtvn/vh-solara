@@ -45,12 +45,32 @@ import { pushNotification } from "./notify";
 import { broadcastTheme, postThemeTo } from "./themeTokens";
 import { customTheme, theme } from "./theme";
 import { adminOpen, diagLogOpen, embeddedViewId, isEmbeddedView, ocLogsOpen, perfDiagOpen, setAdminOpen, setDiagLogOpen, setOcLogsOpen, setPaletteOpen, setPerfDiagOpen, setSettingsOpen, setTermOpen, setView, settingsOpen, termOpen, view, VIEW_PREFIX } from "./ui";
+import { bindBackDismiss } from "./lib/backStack";
 import { projectDir } from "./sync";
 
 export default function App() {
   const [navOpen, setNavOpen] = createSignal(false);
   const [inspectorOpen, setInspectorOpen] = createSignal(false);
   const [managedOpen, setManagedOpen] = createSignal(false);
+  // Back-dismissal for the App-local surfaces. navOpen is the MOBILE slide-over
+  // only (desktop collapse is a persisted layout preference, not a surface);
+  // inspector/managed compound their render gates so a token never outlives
+  // the visible panel (e.g. session deselected under an open inspector).
+  bindBackDismiss(
+    () => navOpen() && !isDesktop(),
+    () => setNavOpen(false),
+    "nav",
+  );
+  bindBackDismiss(
+    () => inspectorOpen() && !!selectedId(),
+    () => setInspectorOpen(false),
+    "inspector",
+  );
+  bindBackDismiss(
+    () => managedOpen() && !!managed(),
+    () => setManagedOpen(false),
+    "managed",
+  );
   // Path selection captured when the Code button is pressed (see its handlers).
   let codeBtnTarget: string | null = null;
 

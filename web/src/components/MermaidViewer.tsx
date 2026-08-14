@@ -2,6 +2,7 @@ import { createEffect, createResource, createSignal, onCleanup, Show } from "sol
 import { Portal } from "solid-js/web";
 import { renderMermaid } from "../lib/mermaid";
 import { trapTab } from "../lib/a11y";
+import { pushBackSurface, releaseBackSurface, type BackSurface } from "../lib/backStack";
 import Icon from "./Icon";
 import styles from "./MermaidViewer.module.css";
 
@@ -12,9 +13,13 @@ import styles from "./MermaidViewer.module.css";
 // false, and its overlay unmounts (its onCleanup tears down its listeners).
 const [activeToken, setActiveToken] = createSignal<symbol | null>(null);
 
-// Whether the overlay layer currently owns a pushed history entry. There is at
-// most one live overlay, so at most one pushed entry for the overlay layer.
-let historyPushed = false;
+// The overlay LAYER's entry in the central back-stack manager (one entry for
+// the whole layer — at most one overlay is live at a time, and replacements
+// REUSE the entry instead of pushing again). `layerClose` is the teardown of
+// whichever viewer currently owns the overlay; the manager invokes it when
+// Back dismisses the mermaid layer.
+let layerEntry: BackSurface | null = null;
+let layerClose: (() => void) | null = null;
 
 function downloadSvg(svg: string, name: string) {
   const blob = new Blob([svg], { type: "image/svg+xml" });
@@ -30,19 +35,18 @@ function downloadSvg(svg: string, name: string) {
  * Inline mermaid diagram with copy/download + an Expand affordance that opens a
  * full-viewport overlay (Solid <Portal> to <body>). The overlay carries its own
  * Close/Escape, focus entry+restore, body scroll-lock, and hardware/browser Back
- * integration (pushState on open, popstate closes, explicit close consumes the
- * entry via history.back).
+ * integration via the central back-stack manager (lib/backStack.ts): one
+ * URL-transparent token entry for the whole overlay layer — Back dismisses it,
+ * explicit close consumes it, forward never reopens it.
  *
- * HISTORY COEXISTENCE: the host app pushes {session,dir} entries for session
- * routing and reads the session from location.search on popstate. Our pushed
- * entry is URL-TRANSPARENT (pushState with no url arg -> location.search is
- * unchanged), so the host's popstate handler re-selects the SAME session it was
- * already showing (a no-op). Our marker state {vhMermaid} is ignored by the host
- * (it reads the URL, not state). Net: opening/closing the overlay never changes
- * which session is selected and never strands a session entry.
+ * HISTORY COEXISTENCE: token entries are URL-TRANSPARENT (pushState with no url
+ * arg → location.search unchanged), so the host's session-routing popstate
+ * handler ignores them (the manager also marks the events it owns; sync.ts
+ * skips those). Net: opening/closing the overlay never changes which session
+ * is selected and never strands a session entry.
  *
  * One-at-a-time: opening a second diagram while one is open REPLACES it. The
- * replacer reuses the existing pushed history entry; the replaced viewer tears
+ * replacer reuses the layer's existing token entry; the replaced viewer tears
  * down without touching history.
  */
 export default function MermaidViewer(props: { src: string }) {
@@ -67,12 +71,6 @@ export default function MermaidViewer(props: { src: string }) {
   let closeRef: HTMLButtonElement | undefined;
   let overlayRef: HTMLDivElement | undefined;
 
-  const onPopState = () => {
-    // Hardware/browser Back, or our own history.back from explicit close. The
-    // browser already consumed the entry; just close WITHOUT a further back.
-    historyPushed = false;
-    teardown(false);
-  };
   const onKey = (e: KeyboardEvent) => {
     if (e.key === "Escape") {
       e.stopPropagation();
@@ -81,30 +79,38 @@ export default function MermaidViewer(props: { src: string }) {
   };
 
   // Tear down the overlay: clear state, remove listeners, release scroll lock,
-  // restore focus. `consumeHistory` controls whether we pop our pushed entry
-  // (explicit close: yes; popstate/replaced: no — the entry is already gone or
-  // owned by the replacer).
-  const teardown = (consumeHistory: boolean) => {
+  // restore focus. Three modes:
+  //   "explicit" — ✕/Escape/unmount-while-open: release the layer's token entry
+  //                (the manager consumes it via history.back, orphans it if
+  //                buried) so no ghost entry is stranded.
+  //   "back"     — the manager dismissed the layer via Back: the browser
+  //                already consumed the entry; just drop our reference.
+  //   "replace"  — another viewer took over: it reuses the entry; touch nothing.
+  const teardown = (mode: "explicit" | "back" | "replace") => {
     if (myToken === null) return; // not open / already torn down
     const wasMine = myToken;
     myToken = null;
     // Only clear the global token if it still points at us (a replacement
     // opener may have already set it to its own token).
     setActiveToken((t) => (t === wasMine ? null : t));
-    window.removeEventListener("popstate", onPopState);
     document.removeEventListener("keydown", onKey);
     // Only release the scroll lock if no overlay is still active. A replacement
     // opener (B) already set overflow="hidden" for ITS overlay before our (A's)
     // teardown fires; clearing unconditionally would unlock the page behind B.
-    if (activeToken() === null) document.body.style.overflow = "";
-    if (consumeHistory && historyPushed) {
-      historyPushed = false;
-      try {
-        history.back();
-      } catch {
-        /* history unavailable */
-      }
+    if (activeToken() === null) {
+      document.body.style.overflow = "";
+      layerClose = null;
     }
+    if (mode === "explicit") {
+      const entry = layerEntry;
+      layerEntry = null;
+      releaseBackSurface(entry);
+    } else if (mode === "back") {
+      // Manager-driven close already retired the surface from its stack; the
+      // browser consumed the entry. Drop our reference only.
+      layerEntry = null;
+    }
+    // "replace": the replacer owns the entry now — leave layerEntry intact.
     // Restore focus only if no overlay is active (a replacement opener keeps
     // focus inside the new overlay).
     const f = prevFocus;
@@ -114,7 +120,7 @@ export default function MermaidViewer(props: { src: string }) {
     });
   };
 
-  const close = () => teardown(true);
+  const close = () => teardown("explicit");
 
   const open = () => {
     if (myToken !== null) return; // already open
@@ -124,17 +130,18 @@ export default function MermaidViewer(props: { src: string }) {
     myToken = Symbol();
     setActiveToken(myToken);
     document.body.style.overflow = "hidden"; // scroll-lock body + transcript
-    window.addEventListener("popstate", onPopState);
     document.addEventListener("keydown", onKey);
-    if (!historyPushed) {
-      historyPushed = true;
-      try {
-        history.pushState({ vhMermaid: true }, "");
-      } catch {
-        historyPushed = false;
-      }
+    // Register with the back-stack manager. One LAYER entry for the whole
+    // mermaid overlay: Back invokes layerClose (the ACTIVE viewer's no-consume
+    // teardown — the browser already traversed). Replacements overwrite
+    // layerClose and reuse the existing entry (no second push).
+    layerClose = () => teardown("back");
+    if (!layerEntry) {
+      layerEntry = pushBackSurface(() => {
+        if (activeToken() === null) return; // stale ghost — nothing to close
+        layerClose?.();
+      }, "mermaid");
     }
-    // (replacers reuse the existing pushed entry; they do not push again.)
   };
 
   const copySource = () => {
@@ -148,9 +155,9 @@ export default function MermaidViewer(props: { src: string }) {
   };
 
   // If a different viewer took over (opened while ours is open), tear ours down
-  // WITHOUT consuming history (the replacer reuses the pushed entry).
+  // WITHOUT consuming history (the replacer reuses the layer's token entry).
   createEffect(() => {
-    if (myToken !== null && activeToken() !== myToken) teardown(false);
+    if (myToken !== null && activeToken() !== myToken) teardown("replace");
   });
 
   // Focus entry when our overlay becomes active.
@@ -165,9 +172,9 @@ export default function MermaidViewer(props: { src: string }) {
 
   onCleanup(() => {
     // Unmount while open (unreachable for settled segments: the overlay is modal
-    // and the transcript is scroll-locked). Conservative: tear down listeners +
-    // scroll lock but leave history untouched.
-    if (myToken !== null) teardown(false);
+    // and the transcript is scroll-locked). Release the layer entry through the
+    // manager so it is consumed/orphaned — no ghost history entry is left.
+    if (myToken !== null) teardown("explicit");
   });
 
   return (

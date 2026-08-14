@@ -1,6 +1,7 @@
 import { createMemo, createResource, createSignal, Show } from "solid-js";
 import { oc } from "../api";
 import { dismiss } from "../lib/a11y";
+import { bindBackDismiss } from "../lib/backStack";
 import ServersPanel from "./ServersPanel";
 import Icon from "./Icon";
 
@@ -9,6 +10,8 @@ import Icon from "./Icon";
 // green = all connected, yellow = needs attention, gray = none/unknown.
 export default function StatusPopover() {
   const [open, setOpen] = createSignal(false);
+  // Browser back dismisses the popover (and consumes its history entry).
+  bindBackDismiss(open, () => setOpen(false), "status");
   const [mcp] = createResource(() => oc.get<Record<string, any>>("/mcp"));
 
   const dot = createMemo(() => {

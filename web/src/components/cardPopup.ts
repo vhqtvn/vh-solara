@@ -1,4 +1,5 @@
 import { createEffect, createSignal, onCleanup, type Accessor } from "solid-js";
+import { bindBackDismiss } from "../lib/backStack";
 
 // Shared popup chrome for the inline pending-input cards (QuestionCard,
 // PermissionCard). Both render the SAME `body()` inline AND inside a SolidJS
@@ -66,6 +67,11 @@ export function useCardPopup(): CardPopup {
     setOpen(false);
     queueMicrotask(() => lastFocus?.focus?.());
   };
+
+  // Browser back dismisses the popup (one shared wiring for every card popup —
+  // PermissionCard, QuestionCard). Explicit closes (ESC, backdrop, buttons)
+  // flip `open` false, which releases and consumes the token via the binding.
+  bindBackDismiss(open, hide, "cardpopup");
 
   // One keydown listener owns BOTH ESC and the Tab trap. It is registered only
   // while `open()` is true; onCleanup removes it when the <Show> unmounts, so

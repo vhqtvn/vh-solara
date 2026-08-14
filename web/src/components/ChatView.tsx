@@ -22,6 +22,7 @@ import {
   inlineAttachForced,
 } from "../lib/inlineAttach";
 import { isSendInFlight } from "../lib/sendSingleFlight";
+import { bindBackDismiss } from "../lib/backStack";
 import PartView, { ActivityGroup } from "./Part";
 import ChatTasksStatus from "./ChatTasksStatus";
 
@@ -1229,6 +1230,8 @@ export default function ChatView(props: { sessionId: string; draft?: boolean }) 
   }
 
   const [focusMode, setFocusMode] = createSignal(false);
+  // Browser back exits composer focus mode (and consumes its history entry).
+  bindBackDismiss(focusMode, () => setFocusMode(false), "focusmode");
 
   // Auto-grow the composer up to a cap, then scroll; keep the highlight mirror
   // scrolled in lockstep.

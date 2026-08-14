@@ -14,6 +14,7 @@ import StatusMark from "./StatusMark";
 import Icon from "./Icon";
 import { setView } from "../ui";
 import { dismiss } from "../lib/a11y";
+import { bindBackDismiss } from "../lib/backStack";
 import { labelColorVar } from "./labelPalette";
 import styles from "./Sidebar.module.css";
 
@@ -103,6 +104,8 @@ export default function Sidebar(props: { open: boolean; onClose: () => void }) {
   // Project-settings dropdown (gear beside the project switcher): holds the
   // Agent-styles editor entry and the per-project Reload action.
   const [projMenuOpen, setProjMenuOpen] = createSignal(false);
+  // Browser back dismisses the dropdown (and consumes its history entry).
+  bindBackDismiss(projMenuOpen, () => setProjMenuOpen(false), "projmenu");
   // reloading tracks the in-flight /vh/reload-project POST so the item shows a
   // spinner and can't be double-fired. The browser's SSE EventSource auto-
   // reconnects once the daemon drops the old aggregator's store, so no page

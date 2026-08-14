@@ -3,6 +3,7 @@ import { treeMap } from "../sync/treeState";
 import { archiveSession } from "../archive";
 import { withGlobalBusy } from "../busy";
 import { displayName } from "../projectSettings";
+import { bindBackDismiss } from "../lib/backStack";
 import Icon from "./Icon";
 import styles from "./OrphanBanner.module.css";
 
@@ -16,6 +17,8 @@ export default function OrphanBanner() {
   );
   const [open, setOpen] = createSignal(false);
   const [busy, setBusy] = createSignal(false);
+  // Browser back dismisses the confirm (guarded: never mid-archive).
+  bindBackDismiss(open, () => !busy() && setOpen(false), "orphanconfirm");
 
   async function confirm() {
     setBusy(true);

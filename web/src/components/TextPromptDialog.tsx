@@ -1,4 +1,5 @@
 import { createEffect, createSignal, Show } from "solid-js";
+import { bindBackDismiss } from "../lib/backStack";
 import Icon from "./Icon";
 import styles from "./TextPromptDialog.module.css";
 
@@ -16,6 +17,9 @@ export default function TextPromptDialog(props: {
   onCancel: () => void;
 }) {
   const [val, setVal] = createSignal("");
+  // Browser back cancels the prompt like Escape/backdrop (one shared wiring
+  // for every usage — session rename, new group, go-to-line, …).
+  bindBackDismiss(() => props.open, props.onCancel, "prompt");
   let inputRef: HTMLInputElement | undefined;
 
   createEffect(() => {

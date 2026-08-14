@@ -1,6 +1,7 @@
 import { Show } from "solid-js";
 import Icon from "./Icon";
 import { confirmProtocol, dismissProtocol, pendingProtocol, PROTOCOL_SCHEME } from "../protocol";
+import { bindBackDismiss } from "../lib/backStack";
 import styles from "./ProtocolConfirm.module.css";
 
 // User-confirmation prompt for an inbound `web+vhsolara:` payload.
@@ -11,6 +12,8 @@ import styles from "./ProtocolConfirm.module.css";
 // is the sole caller of confirmProtocol(); "Cancel" / Escape / backdrop drop
 // the payload without acting. See web/src/protocol.ts.
 export default function ProtocolConfirm() {
+  // Browser back declines the payload like Cancel (never acts on it).
+  bindBackDismiss(() => pendingProtocol() !== null, dismissProtocol, "protocol");
   return (
     <Show when={pendingProtocol()} keyed>
       {(payload) => (

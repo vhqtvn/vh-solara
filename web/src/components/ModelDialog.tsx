@@ -1,6 +1,7 @@
 import { createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { chooseModel, type ModelRef, pickerModels, recentModels, selectionFor } from "../models";
 import { modal } from "../lib/a11y";
+import { useBackEntry } from "../lib/backStack";
 import Icon from "./Icon";
 
 function Badges(props: { m: ModelRef }) {
@@ -47,6 +48,9 @@ function ModelRow(props: { m: ModelRef; selected: boolean; showProvider?: boolea
 // Searchable, recents-first, provider-grouped model picker with capability/cost
 // badges. Full-screen on narrow (mobile) screens; a centered modal otherwise.
 export default function ModelDialog(props: { sessionId: string; onClose: () => void }) {
+  // Mounted only while open (Show-gated in Composer): browser back closes the
+  // picker; an explicit close unmounts it, whose cleanup consumes the entry.
+  useBackEntry(() => props.onClose(), "model");
   const [q, setQ] = createSignal("");
   const sel = () => selectionFor(props.sessionId);
   const isSel = (m: ModelRef) => sel()?.providerID === m.providerID && sel()?.modelID === m.modelID;

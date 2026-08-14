@@ -2,6 +2,7 @@ import { createSignal, For, onMount, Show } from "solid-js";
 import { controlProc, grantTrust, managed, procLogs, refreshManaged, type ProcStatus } from "../managed";
 import { isDesktop } from "../layout";
 import { dismiss } from "../lib/a11y";
+import { bindBackDismiss } from "../lib/backStack";
 import Icon from "./Icon";
 import styles from "./ManagedPanel.module.css";
 
@@ -24,6 +25,8 @@ export default function ManagedPanel(props: { onClose: () => void }) {
   const [busy, setBusy] = createSignal(false);
   const [err, setErr] = createSignal("");
   const [openLog, setOpenLog] = createSignal<string | null>(null);
+  // Browser back closes the nested log overlay (Escape already prefers it).
+  bindBackDismiss(() => openLog() !== null, () => setOpenLog(null), "proclog");
   const [logText, setLogText] = createSignal("");
   const [expanded, setExpanded] = createSignal<Set<string>>(new Set());
 

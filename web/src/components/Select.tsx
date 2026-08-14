@@ -1,5 +1,6 @@
 import { createEffect, createSignal, For, onCleanup, Show } from "solid-js";
 import { Portal } from "solid-js/web";
+import { bindBackDismiss } from "../lib/backStack";
 import Icon from "./Icon";
 
 export interface SelectOption {
@@ -24,6 +25,10 @@ export default function Select(props: {
   disabled?: boolean;
 }) {
   const [open, setOpen] = createSignal(false);
+  // Browser back dismisses the dropdown like Escape/outside-click would (one
+  // shared wiring for every Select usage). Explicit picks/closes flip `open`
+  // false, which releases and consumes the entry via the binding.
+  bindBackDismiss(open, () => { setOpen(false); btn?.focus(); }, "select");
   const [rect, setRect] = createSignal<DOMRect | null>(null);
   let btn: HTMLButtonElement | undefined;
   let popEl: HTMLDivElement | undefined;

@@ -29,6 +29,7 @@ import {
 } from "../sessionMenu";
 import { displayName } from "../projectSettings";
 import { classifyHold } from "../lib/copyHold";
+import { bindBackDismiss } from "../lib/backStack";
 import Icon from "./Icon";
 import TextPromptDialog from "./TextPromptDialog";
 import { defaultColorForIndex, labelColorVar } from "./labelPalette";
@@ -74,6 +75,13 @@ export default function SessionContextMenu() {
   };
   onMount(() => document.addEventListener("keydown", onKey));
   onCleanup(() => document.removeEventListener("keydown", onKey));
+  // Browser back dismisses the topmost of these surfaces. The menu→confirm
+  // handoff (openArchiveConfirm closes the menu, then the confirm opens) is
+  // handled by the manager: the menu's entry is buried by the confirm's push
+  // and becomes an orphan that auto-unwinds when history walks onto it.
+  bindBackDismiss(() => menuTarget() !== null, closeSessionMenu, "sessmenu");
+  bindBackDismiss(() => archiveTarget() !== null, closeArchiveConfirm, "archconfirm");
+  bindBackDismiss(() => deleteTarget() !== null, closeDeleteConfirm, "delconfirm");
 
   // Clamp a positioned menu inside the viewport. The vertical clamp uses the
   // menu's MEASURED height (not a magic constant), so a right-click near the

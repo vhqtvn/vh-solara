@@ -1,6 +1,7 @@
 import { createResource, createSignal, onCleanup, onMount, Show, For } from "solid-js";
 import { Portal } from "solid-js/web";
 import { streamOpenCodeUpdate } from "../admin";
+import { useBackEntry } from "../lib/backStack";
 import Icon from "./Icon";
 import RestartOpenCode from "./RestartOpenCode";
 import styles from "./OpenCodeUpdateDialog.module.css";
@@ -137,6 +138,10 @@ export default function OpenCodeUpdateDialog(props: { onClose: () => void }) {
   };
   onMount(() => document.addEventListener("keydown", onKey));
   onCleanup(() => document.removeEventListener("keydown", onKey));
+  // Browser back closes like Esc — but never mid-update. If back lands while
+  // updating, the entry is consumed with the dialog left open (it closes via
+  // its own flow when the update finishes).
+  useBackEntry(() => phase() !== "updating" && props.onClose(), "ocupdate");
 
   // Restart is offered when there is something to apply: after an install
   // attempt (done/failed) or when an already-installed update is pending

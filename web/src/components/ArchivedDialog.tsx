@@ -3,6 +3,7 @@ import { createStore } from "solid-js/store";
 import { fetchArchived, restoreAndOpen, unarchiveSession } from "../archive";
 import { withGlobalBusy } from "../busy";
 import { displayName } from "../projectSettings";
+import { useBackEntry } from "../lib/backStack";
 import type { Session } from "../types";
 import Icon from "./Icon";
 import RelTime from "./RelTime";
@@ -22,6 +23,9 @@ interface LevelState {
 
 export default function ArchivedDialog(props: { onClose: () => void }) {
   const PAGE = 50;
+  // Mounted only while open (Show-gated in Sidebar): browser back closes the
+  // dialog; an explicit close unmounts it, whose cleanup consumes the entry.
+  useBackEntry(() => props.onClose(), "archived");
   // Per-parent level cache ("" = roots). childCounts merge across levels.
   const [levels, setLevels] = createStore<Record<string, LevelState>>({});
   const [expanded, setExpanded] = createSignal<Record<string, boolean>>({});

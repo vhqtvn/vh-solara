@@ -1,6 +1,7 @@
 // Shared top-level UI state (main view + dialog open-flags), lifted out of App so
 // the command palette and global hotkeys can drive them.
-import { createSignal } from "solid-js";
+import { createRoot, createSignal } from "solid-js";
+import { bindBackDismiss, pushBackSurface, releaseBackSurface, type BackSurface } from "./lib/backStack";
 import { loadVersioned, saveVersioned } from "./lib/store";
 
 // Built-in views plus consumer-registered embedded views, keyed "view:<id>".
@@ -10,7 +11,32 @@ export const VIEW_PREFIX = "view:";
 export const isEmbeddedView = (v: string) => v.startsWith(VIEW_PREFIX);
 export const embeddedViewId = (v: string) => v.slice(VIEW_PREFIX.length);
 
-export const [view, setView] = createSignal<View>("chat");
+const [view, setViewCore] = createSignal<View>("chat");
+export { view };
+// App-like back semantics for view swaps: leaving chat for any other view
+// (changes/notes/preferences/code/embedded) pushes a back-stack token whose
+// close returns to the view we came from, so browser back unwinds chained
+// swaps in LIFO order and always eventually returns to chat. Going to chat
+// explicitly collapses the whole chain (topmost entry consumed, buried ones
+// become orphans that auto-unwind — never ghosts).
+let viewTokens: BackSurface[] = [];
+export function setView(next: View) {
+  const prev = view();
+  if (next === prev) return;
+  if (next === "chat") {
+    const chain = viewTokens;
+    viewTokens = [];
+    for (let i = chain.length - 1; i >= 0; i--) releaseBackSurface(chain[i]);
+  } else {
+    const origin = prev;
+    const tok = pushBackSurface(() => {
+      viewTokens = viewTokens.filter((t) => t !== tok);
+      setViewCore(origin);
+    }, "view");
+    if (tok) viewTokens.push(tok);
+  }
+  setViewCore(next);
+}
 // Code viewer peek: a side dock (desktop) beside the current view, or a
 // full-screen overlay (mobile), opened by clicking a file:line in the chat. The
 // Code TAB is the separate full "dig" mode (view === "code").
@@ -52,3 +78,21 @@ export function setTermKeys(v: boolean) {
 export function focusComposer() {
   window.dispatchEvent(new CustomEvent("vh:focus-composer"));
 }
+
+// Back-dismissal for every global open-flag: while a flag is true a back-stack
+// token is pushed; browser back closes the topmost surface (signal → false),
+// never the session selection. Module-level root: these live for the app's
+// whole lifetime, matching the signals themselves.
+createRoot(() => {
+  bindBackDismiss(settingsOpen, () => setSettingsOpen(false), "settings");
+  bindBackDismiss(adminOpen, () => setAdminOpen(false), "admin");
+  bindBackDismiss(diagLogOpen, () => setDiagLogOpen(false), "diaglog");
+  bindBackDismiss(ocLogsOpen, () => setOcLogsOpen(false), "oclogs");
+  bindBackDismiss(perfDiagOpen, () => setPerfDiagOpen(false), "perfdiag");
+  bindBackDismiss(paletteOpen, () => setPaletteOpen(false), "palette");
+  bindBackDismiss(projSwitcherOpen, () => setProjSwitcherOpen(false), "projswitch");
+  bindBackDismiss(termOpen, () => setTermOpen(false), "term");
+  bindBackDismiss(termFull, () => setTermFull(false), "termfull");
+  bindBackDismiss(codeDockOpen, () => setCodeDockOpen(false), "codedock");
+  bindBackDismiss(codeMobileOverlay, () => setCodeMobileOverlay(false), "codemobile");
+});

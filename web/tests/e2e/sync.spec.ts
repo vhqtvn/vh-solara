@@ -6,24 +6,29 @@ import { projectUrl } from "./util";
 // split would break silently and a build/typecheck can't catch — lock them down
 // BEFORE refactoring so the split is verified, not hoped.
 
-test("back/forward navigates session selection (pushState + popstate)", async ({ page }) => {
+// App-like back discipline (see back-navigation.spec.ts + lib/backStack.ts):
+// session selection UPDATES the URL via replaceState (deep-links/reload/sharing
+// keep working) but creates NO history entries — back dismisses surfaces, it
+// never revisits a prior session.
+test("session selection updates the URL without history entries; back never revisits", async ({ page }) => {
   await page.goto(projectUrl("/"));
   await page.getByRole("button", { name: /Demo session/ }).click();
   await expect(page).toHaveURL(/[?&]session=demo/);
   await expect(page.locator(".main-title")).toContainText("Demo session");
 
-  // Selecting a second session pushes a history entry.
+  // Selecting a second session REPLACES the URL (no pushState entry).
+  const lenAfterDemo = await page.evaluate(() => history.length);
   await page.getByRole("button", { name: /Another root/ }).click();
   await expect(page).toHaveURL(/[?&]session=other/);
   await expect(page.locator(".main-title")).toContainText("Another root");
+  expect(await page.evaluate(() => history.length)).toBe(lenAfterDemo);
 
-  // Back returns to the first selection (popstate drives selection, not a reload).
+  // With a surface open, back dismisses the surface — it does NOT walk back to
+  // the demo selection (popstate no longer re-targets the session).
+  await page.locator('button[aria-label="Settings"]').click();
+  await expect(page.locator('div[role="dialog"][aria-label="Settings"]')).toBeVisible();
   await page.goBack();
-  await expect(page).toHaveURL(/[?&]session=demo/);
-  await expect(page.locator(".main-title")).toContainText("Demo session");
-
-  // Forward re-advances.
-  await page.goForward();
+  await expect(page.locator('div[role="dialog"][aria-label="Settings"]')).toBeHidden();
   await expect(page).toHaveURL(/[?&]session=other/);
   await expect(page.locator(".main-title")).toContainText("Another root");
 });

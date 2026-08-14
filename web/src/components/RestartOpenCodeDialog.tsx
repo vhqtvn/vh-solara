@@ -1,5 +1,6 @@
 import { createSignal, onCleanup, onMount, Show } from "solid-js";
 import { Portal } from "solid-js/web";
+import { useBackEntry } from "../lib/backStack";
 import Icon from "./Icon";
 import RestartOpenCode from "./RestartOpenCode";
 
@@ -26,6 +27,10 @@ export default function RestartOpenCodeDialog(props: {
   onRestarted?: () => void;
 }) {
   const [restartActive, setRestartActive] = createSignal(true);
+  // Browser back closes the dialog unless a restart is interactive/in-flight
+  // (same guard as Esc/overlay). If back lands while active, the entry is
+  // consumed with the dialog left open — it self-closes when the flow ends.
+  useBackEntry(() => !restartActive() && props.onClose(), "restartoc");
 
   const onKey = (e: KeyboardEvent) => {
     // Don't let Escape close while the confirm is open or a restart POST is

@@ -1,5 +1,6 @@
 import { createMemo, createSignal, onCleanup, onMount, Show } from "solid-js";
 import { contextUsage, fmtTok } from "../usage";
+import { bindBackDismiss } from "../lib/backStack";
 import QuotaPanel from "./QuotaPanel";
 
 // OpenChamber-style header Usage indicator: a compact donut + context% pill,
@@ -14,6 +15,8 @@ function tone(pct: number | null): "ok" | "warn" | "hot" {
 
 export default function HeaderUsage(props: { sessionId: string; onInspect: () => void }) {
   const [open, setOpen] = createSignal(false);
+  // Browser back dismisses the popover (and consumes its history entry).
+  bindBackDismiss(open, () => setOpen(false), "usage");
   const usage = createMemo(() => contextUsage(props.sessionId));
 
   let rootEl: HTMLDivElement | undefined;

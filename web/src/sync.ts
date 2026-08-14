@@ -30,6 +30,7 @@ import {
 } from "./sync/store";
 import { rootOf } from "./sync/selectors";
 import { currentUrlSession, syncUrl, setApplyingUrl } from "./sync/url";
+import { wasManagedPopState } from "./lib/backStack";
 import { connect } from "./sync/tree-transport";
 import { closeSessionStream, openSessionStream } from "./sync/session-stream";
 import { watchdogTick, maybeReconnect, tickHealth, resyncTree } from "./sync/health";
@@ -100,8 +101,8 @@ export function startSync() {
   startPeriodicResync();
 
   // Normalize the URL so the tab is self-describing (carries its resolved dir
-  // even if it loaded from the localStorage fallback) — replace, don't push.
-  syncUrl(currentUrlSession(), true);
+  // even if it loaded from the localStorage fallback) — in place, never pushed.
+  syncUrl(currentUrlSession());
 
   // Open the session named in the URL on load (deep link / refresh). When the
   // URL lacks ?session= (an OS-driven relaunch of the installed PWA drops it —
@@ -118,8 +119,15 @@ export function startSync() {
     void openSession(initial);
     persistSelection(projectDir(), initial);
   }
-  // Back/forward navigates between previously-selected sessions AND projects.
-  window.addEventListener("popstate", () => {
+  // Legacy session/project entries only. Modern selection never pushes history
+  // (sync/url.ts replaceState) and browser back dismisses overlays instead
+  // (lib/backStack.ts); events the back-stack manager owns — token unwinds,
+  // consume traversals, backs that dismissed surfaces — must never re-select a
+  // session. Only a genuine legacy walk (a tab that still carries session
+  // entries pushed by an older build, reached with no overlay involved) lands
+  // here, and for those the old session+project walk behavior is preserved.
+  window.addEventListener("popstate", (ev) => {
+    if (wasManagedPopState(ev)) return;
     const id = currentUrlSession();
     const dir = urlDir() ?? "";
     setApplyingUrl(true);

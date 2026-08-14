@@ -2,6 +2,7 @@ import { createEffect, createMemo, createResource, createSignal, For, Match, onC
 import { projectDir } from "../sync";
 import { codeFile, codeLangs, codeRawUrl, codeSearch, codeStatus, codeStyles, codeTree, type CodeEntry, type CodeFile, type CodeHit } from "../code/api";
 import { codeOpenPath, setCodeOpenPath, codeOpenLine, setCodeOpenLine, codeTabs, addCodeTab, closeCodeTab, resolvePicker, setResolvePicker, openResolved } from "../code/state";
+import { bindBackDismiss } from "../lib/backStack";
 import { codeStyle, setCodeStyle, codeWrap, setCodeWrap, codeShowIgnored, setCodeShowIgnored, codeFlatten, setCodeFlatten, codeShowSearch, setCodeShowSearch, codeSidebarOpen, setCodeSidebarOpen } from "../prefs";
 import Icon from "./Icon";
 import Select from "./Select";
@@ -104,6 +105,11 @@ export default function CodeView() {
   // action button; on confirm the parsed line number drives the scroll/highlight
   // effect below (same setTargetLine force-retrigger the prompt path used).
   const [gotoOpen, setGotoOpen] = createSignal(false);
+  // Browser back dismisses the file-picker overlay and the right-click folder
+  // menu (CodeView is mounted only inside the code view; the bindings die with
+  // it, releasing their entries if still open).
+  bindBackDismiss(() => resolvePicker() !== null, () => setResolvePicker(null), "codepicker");
+  bindBackDismiss(() => ctxMenu() !== null, () => setCtxMenu(null), "codectx");
   let paneEl: HTMLDivElement | undefined;
 
   // Tree root reloads when the project, focus folder, or flatten pref changes.

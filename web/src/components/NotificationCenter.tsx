@@ -1,6 +1,7 @@
 import { createMemo, createSignal, For, Show } from "solid-js";
 import { selectedId, setSelectedId, state } from "../sync";
 import { dismiss } from "../lib/a11y";
+import { bindBackDismiss } from "../lib/backStack";
 import { clearNotifications, dismissNotification, markAllRead, notifications } from "../notify";
 import { setView } from "../ui";
 import { displayName } from "../projectSettings";
@@ -15,6 +16,8 @@ const KIND_ICON = { done: "check", error: "alert", info: "info", waiting: "help"
 //  • Recent — dismissable transient notes (errors, turn-complete).
 export default function NotificationCenter() {
   const [open, setOpen] = createSignal(false);
+  // Browser back dismisses the dropdown (and consumes its history entry).
+  bindBackDismiss(open, () => setOpen(false), "notif");
 
   // Pending interactive requests across every session.
   const actions = createMemo(() => {

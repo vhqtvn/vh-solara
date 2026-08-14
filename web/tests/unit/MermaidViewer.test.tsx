@@ -2,9 +2,11 @@
 //
 // Coverage for MermaidViewer — inline presentation + full-viewport overlay with
 // copy/download/expand/close/escape, focus management, scroll-lock, and the
-// hardware/browser Back integration (pushState on open, popstate closes, explicit
-// close consumes the entry). The real mermaid renderer is mocked so jsdom never
-// loads the browser-bound lib.
+// hardware/browser Back integration via the central back-stack manager (token
+// entry pushed on open, popstate closes, explicit close consumes the entry).
+// The real mermaid renderer is mocked so jsdom never loads the browser-bound
+// lib. jsdom's history is replaced with a small fake (state stack) so the
+// manager's current-entry checks observe real token state.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, waitFor } from "@solidjs/testing-library";
 import { createSignal } from "solid-js";
@@ -17,7 +19,7 @@ vi.mock("../../src/lib/mermaid", () => ({
   ),
 }));
 
-// Per-test fresh module state (the module-level activeToken + historyPushed
+// Per-test fresh module state (the module-level activeToken + back-stack
 // singletons must reset between tests). Returns the mocked renderer + component.
 async function fresh() {
   vi.resetModules();
@@ -47,10 +49,38 @@ describe("MermaidViewer", () => {
   let backSpy: ReturnType<typeof vi.spyOn>;
   let clipWrite: ReturnType<typeof vi.fn>;
   let createURLMock: ReturnType<typeof vi.fn>;
+  // Fake history: a stack of {state} entries; history.state reads the top.
+  let entries: { state: unknown }[];
+  const firePop = () =>
+    window.dispatchEvent(
+      new PopStateEvent("popstate", { state: entries[entries.length - 1].state }),
+    );
+  // Simulate a HARDWARE/browser Back (not manager-initiated): pop an entry and
+  // deliver popstate — WITHOUT calling history.back().
+  const hardwareBack = () => {
+    if (entries.length > 1) entries.pop();
+    firePop();
+  };
 
   beforeEach(() => {
-    pushStateSpy = vi.spyOn(history, "pushState").mockImplementation(() => {});
-    backSpy = vi.spyOn(history, "back").mockImplementation(() => {});
+    entries = [{ state: null }];
+    Object.defineProperty(window.history, "state", {
+      configurable: true,
+      get: () => entries[entries.length - 1].state,
+    });
+    pushStateSpy = vi
+      .spyOn(history, "pushState")
+      .mockImplementation((state) => void entries.push({ state }));
+    vi.spyOn(history, "replaceState").mockImplementation(
+      (state) => void (entries[entries.length - 1] = { state }),
+    );
+    backSpy = vi.spyOn(history, "back").mockImplementation(() => {
+      if (entries.length > 1) entries.pop();
+      // Manager-initiated traversals get their popstate synchronously (the real
+      // browser delivers it async, but always AFTER back() returned — the
+      // pendingTraversal flag is set before the call either way).
+      firePop();
+    });
     // navigator.clipboard + URL.createObjectURL are not implemented in jsdom;
     // install writable stubs.
     clipWrite = vi.fn(() => Promise.resolve());
@@ -74,7 +104,9 @@ describe("MermaidViewer", () => {
 
   afterEach(() => {
     pushStateSpy.mockRestore();
+    vi.spyOn(history, "replaceState").mockRestore();
     backSpy.mockRestore();
+    delete (window.history as { state?: unknown }).state; // reveal jsdom getter
     cleanup();
   });
 
@@ -238,6 +270,8 @@ describe("MermaidViewer", () => {
     });
     // the single overlay shows the SECOND diagram (the replacer)
     expect(overlayDiagram()).toContain("C to D");
+    // the replacer REUSES the layer's token entry — exactly one push total
+    expect(pushStateSpy).toHaveBeenCalledTimes(1);
     // D1: the replacement opener keeps the body scroll-locked. The replaced
     // viewer's reactive teardown must NOT clear overflow while another overlay
     // is active (the gate is activeToken() === null AFTER setActiveToken).
@@ -253,7 +287,7 @@ describe("MermaidViewer", () => {
     expect(document.body.style.overflow).toBe("");
   });
 
-  it("open pushes a URL-transparent history entry; host location.search is unchanged", async () => {
+  it("open pushes ONE URL-transparent token entry (back-stack manager); location.search is unchanged", async () => {
     const r = await renderReady();
     const before = window.location.search;
     fireEvent.click(
@@ -263,13 +297,14 @@ describe("MermaidViewer", () => {
     );
     await waitFor(() => expect(pushStateSpy).toHaveBeenCalled());
     const call = pushStateSpy.mock.calls.at(-1)!;
-    // marker state present; url arg omitted (URL-transparent)
-    expect(call[0]).toMatchObject({ vhMermaid: true });
+    // back-stack token state present (mermaid layer); url arg omitted
+    // (URL-transparent)
+    expect(call[0]).toMatchObject({ vhBack: expect.stringMatching(/^mermaid#/) });
     expect(call[2]).toBeUndefined();
     expect(window.location.search).toBe(before);
   });
 
-  it("popstate (hardware/browser Back) closes the overlay without history.back", async () => {
+  it("hardware/browser Back (popstate) closes the overlay without a further history.back", async () => {
     const r = await renderReady();
     fireEvent.click(
       Array.from(r.container.querySelectorAll("button")).find((b) =>
@@ -280,8 +315,8 @@ describe("MermaidViewer", () => {
       expect(document.body.querySelector("[data-mermaid='overlay']")).toBeTruthy(),
     );
     backSpy.mockClear();
-    // Hardware Back pops our entry and fires popstate.
-    window.dispatchEvent(new PopStateEvent("popstate"));
+    // Hardware Back pops our entry and fires popstate (NOT via history.back).
+    hardwareBack();
     await waitFor(() =>
       expect(document.body.querySelector("[data-mermaid='overlay']")).toBeNull(),
     );
@@ -289,7 +324,7 @@ describe("MermaidViewer", () => {
     expect(backSpy).not.toHaveBeenCalled();
   });
 
-  it("explicit Close/Escape consumes the pushed entry via history.back()", async () => {
+  it("explicit Close/Escape consumes the token entry via history.back()", async () => {
     const r = await renderReady();
     fireEvent.click(
       Array.from(r.container.querySelectorAll("button")).find((b) =>
@@ -307,7 +342,32 @@ describe("MermaidViewer", () => {
     await waitFor(() =>
       expect(document.body.querySelector("[data-mermaid='overlay']")).toBeNull(),
     );
-    expect(backSpy).toHaveBeenCalled();
+    // the release schedules a microtask consume → history.back()
+    await waitFor(() => expect(backSpy).toHaveBeenCalled());
+    // and the consume landed back on the base entry
+    await waitFor(() => expect(history.state).toBeNull());
+  });
+
+  it("forward onto the consumed (dead) token does NOT reopen the overlay", async () => {
+    const r = await renderReady();
+    fireEvent.click(
+      Array.from(r.container.querySelectorAll("button")).find((b) =>
+        /expand/i.test(b.textContent || ""),
+      )!,
+    );
+    await waitFor(() =>
+      expect(document.body.querySelector("[data-mermaid='overlay']")).toBeTruthy(),
+    );
+    // Back dismisses it…
+    hardwareBack();
+    await waitFor(() =>
+      expect(document.body.querySelector("[data-mermaid='overlay']")).toBeNull(),
+    );
+    // …then FORWARD re-lands on the dead token entry.
+    entries.push({ state: { vhBack: "mermaid#dead" } });
+    firePop();
+    await new Promise((res) => setTimeout(res, 0));
+    expect(document.body.querySelector("[data-mermaid='overlay']")).toBeNull();
   });
 
   it("popstate listener is removed on close (no leaks across repeated open/close)", async () => {

@@ -5,6 +5,7 @@ import { loadVersioned, saveVersioned } from "../lib/store";
 import { projectDir } from "../sync";
 import { type GitFile, gitCommit, gitDiscard, gitPush, gitStage, gitStatus, gitUnstage, isStaged, isUntracked } from "../git-actions";
 import { pushNotification } from "../notify";
+import { bindBackDismiss } from "../lib/backStack";
 import FileBadge from "./FileBadge";
 import Icon from "./Icon";
 import "./GitView.css";
@@ -59,6 +60,8 @@ function StagingPanel(props: { onChanged: () => void }) {
   // Holds the file path; null → dialog closed. Mirrors the archive-confirm
   // pattern in SessionContextMenu (signal + .dialog.confirm overlay).
   const [discardFile, setDiscardFile] = createSignal<string | null>(null);
+  // Browser back dismisses the discard confirm (and consumes its entry).
+  bindBackDismiss(() => discardFile() !== null, () => setDiscardFile(null), "discardconfirm");
   const files = () => status()?.files ?? [];
   const staged = () => files().filter(isStaged);
   const reload = () => { void refetch(); props.onChanged(); };
