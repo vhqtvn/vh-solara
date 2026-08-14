@@ -35,6 +35,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"log"
+	"math"
 	"time"
 
 	diag "github.com/vhqtvn/vh-solara/pkg/diagnostics"
@@ -156,6 +157,81 @@ func (s *Store) Hydrate(sessions []json.RawMessage, messages map[string][]Messag
 	}
 }
 
+// insertMessageIDOrdered inserts id into sm.order at the position that keeps
+// the slice non-decreasing by chronological key — the resident entry's
+// createdMs where createdOK, else +∞ (an info-less placeholder sorts LAST,
+// matching its append-only creation). The insertion point is AFTER every entry
+// with key <= t, so equal-created groups keep their existing relative order and
+// a NEW equal-created member lands after them (stable — the opencode listing
+// is chronological oldest-first, which is exactly the tie order we want; the
+// tiebreak is arrival order, NEVER string-id ordering: opencode's ascending
+// message-id scheme wrapped globally on 2026-08-14, so id ordering is not a
+// chronological key). A keyless insert (createdOK false → t=+∞) degenerates to
+// a plain append, preserving the pre-fix placeholder behavior.
+//
+// INVARIANT: sm.order is non-decreasing by key, maintained inductively by all
+// writers — this ordered insert (reconcile + live upsert), plain append (live
+// newest + keyless placeholders), MergeOlderMessages' prepend of strictly-older
+// keyed pages, deleteMessageLocked's removals, and setCreatedKey's reposition
+// on the keyless→keyed transition. Every "last = newest" consumer
+// (projectMessageWindow, projectMessagePage, latestAssistantResidentLocked,
+// recomputeLastAssistantLocked, newestCompletedAssistantEmptyLocked) relies on
+// it.
+//
+// This is the core of the missing-middle fix: reconcileMessagesLocked
+// previously blind-appended every non-resident fetched id, so a full-history
+// re-hydrate after a bounded cold load (reconnect / /vh/reload / archive)
+// parked the fetched OLDER messages AFTER the newer resident tail, and the
+// served window showed an old block followed by live messages with the true
+// recent middle unreachable.
+func (sm *sessionMessages) insertMessageIDOrdered(id string, createdMs float64, createdOK bool) {
+	t := createdMs
+	if !createdOK {
+		t = math.Inf(1)
+	}
+	lo, hi := 0, len(sm.order)
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		if sm.orderKey(mid) <= t {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	sm.order = append(sm.order, "")
+	copy(sm.order[lo+1:], sm.order[lo:])
+	sm.order[lo] = id
+}
+
+// orderKey returns the chronological key of the resident entry at order index
+// i: createdMs where keyed, else +∞ (placeholder sorts last). Missing entries
+// (defensive) also read +∞.
+func (sm *sessionMessages) orderKey(i int) float64 {
+	me := sm.byID[sm.order[i]]
+	if me == nil || !me.createdOK {
+		return math.Inf(1)
+	}
+	return me.createdMs
+}
+
+// setCreatedKey records id's chronological key (info.time.created) and, on the
+// keyless→keyed transition, REPOSITIONS the id in sm.order so the
+// non-decreasing-key invariant survives placeholder promotion: a placeholder
+// created by upsertPartLocked/appendPartDeltaLocked appends keyless at the
+// END, and its true position may not be the end once the real info arrives.
+// On an already-keyed entry this is a no-op (time.created is immutable per
+// message id), which also preserves the upsert-only semantics of a warm
+// reconcile (an existing entry is never moved by a re-fetch).
+func (sm *sessionMessages) setCreatedKey(id string, createdMs float64, createdOK bool) {
+	me := sm.byID[id]
+	if me == nil || me.createdOK || !createdOK {
+		return // absent, already keyed (created immutable), or still keyless
+	}
+	me.createdMs, me.createdOK = createdMs, true
+	sm.order = removeString(sm.order, id)
+	sm.insertMessageIDOrdered(id, createdMs, true)
+}
+
 // reconcileMessagesLocked diffs one session's full message list into the store,
 // emitting upsert events for new/changed messages and parts, and marks the
 // session's messages as loaded. Absence never deletes (Option A); messages/parts
@@ -212,11 +288,22 @@ func (s *Store) reconcileMessagesLocked(sid string, list []MessageWithParts) (co
 		if json.Unmarshal(mwp.Info, &env) != nil || env.ID == "" {
 			continue
 		}
+		createdMs, createdOK := 0.0, false
+		if env.Time.Created != nil {
+			createdMs, createdOK = *env.Time.Created, true
+		}
 		me := sm.byID[env.ID]
 		if me == nil {
-			me = &messageEntry{id: env.ID, info: mwp.Info, parts: map[string]json.RawMessage{}}
+			me = &messageEntry{
+				id: env.ID, info: mwp.Info, parts: map[string]json.RawMessage{},
+				createdMs: createdMs, createdOK: createdOK,
+			}
 			sm.byID[env.ID] = me
-			sm.order = append(sm.order, env.ID)
+			// Missing-middle fix: insert ORDER-AWARE, not blind-append. The
+			// full-history fetch this reconcile serves delivers messages that
+			// are mostly OLDER than the bounded cold-load tail already
+			// resident; appending them put an old block after the newer tail.
+			sm.insertMessageIDOrdered(env.ID, createdMs, createdOK)
 			if !coldLoad {
 				s.emit(KindMessageUpsert, mwp.Info)
 			}
@@ -242,6 +329,12 @@ func (s *Store) reconcileMessagesLocked(sid string, list []MessageWithParts) (co
 			me.tokens = env.Tokens
 			me.agent = env.Agent
 			me.terminalError = env.errorName()
+			// Cache/refresh the chronological key. On an info-less placeholder
+			// this is the keyless→keyed transition: setCreatedKey repositions
+			// the id into its chronological slot (the placeholder was appended
+			// at the end). On an already-keyed entry it is a no-op (created is
+			// immutable per id) — a warm reconcile never moves residents.
+			sm.setCreatedKey(env.ID, createdMs, createdOK)
 		}
 		// A history fetch is authoritative for this message's parts: discard
 		// streaming accumulators (they were building on stale/live bases) —

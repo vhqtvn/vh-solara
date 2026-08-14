@@ -713,11 +713,18 @@ func (s *Store) MergeOlderMessages(sid string, items []MessageWithParts, history
 		}
 		// Cache role/completed (cheap; the gate reads only the newest assistant,
 		// which lives in the tail, so older-page entries don't drive it — but
-		// snapshot/gate walks must still classify their role correctly).
+		// snapshot/gate walks must still classify their role correctly) and the
+		// chronological key (createdMs/createdOK), so a later full-history
+		// reconcile's ordered inserts position correctly relative to these
+		// prepended entries. A page item lacking time.created stays keyless
+		// (sorts last by convention) — same as a placeholder.
 		var env messageInfoEnvelope
 		if json.Unmarshal(me.info, &env) == nil {
 			me.role = env.Role
 			me.completed = env.Time.Completed != nil
+			if env.Time.Created != nil {
+				me.createdMs, me.createdOK = *env.Time.Created, true
+			}
 		}
 		sm.byID[id] = me
 		prepend = append(prepend, id)

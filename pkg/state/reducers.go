@@ -814,6 +814,14 @@ func (s *Store) upsertMessageLocked(info json.RawMessage) {
 	// already-completed message sets wasCompleted=false too, but it does not
 	// route through this live Apply path's grace arming (gated on the
 	// transition AND !assistantInflightLocked, and cold-load goes via Hydrate).
+	// Chronological key for order-aware inserts (missing-middle fix). Live
+	// events arrive newest-last, so this is normally the largest key — the
+	// ordered insert degenerates to an append — but routing through it keeps
+	// sm.order's non-decreasing-key invariant uniform across all writers.
+	createdMs, createdOK := 0.0, false
+	if env.Time.Created != nil {
+		createdMs, createdOK = *env.Time.Created, true
+	}
 	var wasCompleted bool
 	if me := sm.byID[env.ID]; me != nil {
 		wasCompleted = me.completed
@@ -824,6 +832,10 @@ func (s *Store) upsertMessageLocked(info json.RawMessage) {
 		me.tokens = env.Tokens
 		me.agent = env.Agent
 		me.terminalError = env.errorName()
+		// Keyless→keyed transition (placeholder promotion): reposition the id
+		// into its chronological slot. No-op on an already-keyed entry
+		// (created is immutable per id).
+		sm.setCreatedKey(env.ID, createdMs, createdOK)
 		// Mark live-touched so a concurrent cold-load reconcile (background
 		// full-history GET in flight) does NOT clobber this newer live body
 		// with the stale fetched one (C-F2). Only tagged while a cold GET is
@@ -838,9 +850,9 @@ func (s *Store) upsertMessageLocked(info json.RawMessage) {
 			id: env.ID, info: info, parts: map[string]json.RawMessage{},
 			role: env.Role, completed: env.Time.Completed != nil,
 			finish: env.Finish, tokens: env.Tokens, agent: env.Agent,
-			terminalError: env.errorName(),
+			terminalError: env.errorName(), createdMs: createdMs, createdOK: createdOK,
 		}
-		sm.order = append(sm.order, env.ID)
+		sm.insertMessageIDOrdered(env.ID, createdMs, createdOK)
 		// A live-created message is also live-touched (its body is at least as
 		// new as what the in-flight cold GET will return) — but only while a
 		// cold GET is in flight.

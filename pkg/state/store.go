@@ -468,6 +468,16 @@ type messageEntry struct {
 	// re-parsing JSON: an assistant message with no completed time is generating.
 	role      string
 	completed bool
+	// createdMs/createdOK cache info.time.created (unix-ms) — the CHRONOLOGICAL
+	// key for order-aware sm.order inserts (the missing-middle fix). createdOK
+	// is false only for info-less placeholders (upsertPartLocked /
+	// appendPartDeltaLocked create entries before any message.updated), which
+	// sort LAST by convention (see insertMessageIDOrdered). The key is
+	// TIME-based by design: opencode's ascending message-ID scheme wrapped
+	// globally on 2026-08-14, so string-id ordering is never a chronological
+	// key. time.created is immutable per message id.
+	createdMs float64
+	createdOK bool
 	// Cached from info for the gate facts (A2): opencode's `finish` reason
 	// (e.g. "stop"|"length"|"tool-calls"; present iff the turn completed) and the
 	// raw `tokens` usage object. Kept raw — vh-solara reports, never interprets.

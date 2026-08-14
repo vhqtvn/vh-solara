@@ -330,9 +330,12 @@ func shapeSessions(raw []json.RawMessage, dir string, includeArchived, rootsOnly
 // returns its concatenated text-part text.
 //
 // "Last" = the assistant message (info.role == "assistant") with the highest
-// time.created, breaking ties by id DESC. Text parts (type == "text") are
-// concatenated in part order. The full text is returned (never truncated —
-// HR1).
+// time.created, breaking ties by LATER LISTING POSITION (the opencode listing
+// is chronological oldest-first). The tiebreak is deliberately NOT id-based:
+// opencode's ascending message-id scheme wrapped globally on 2026-08-14
+// (msg_ffff… → msg_0001…), so string-id ordering is no longer a chronological
+// key. Text parts (type == "text") are concatenated in part order. The full
+// text is returned (never truncated — HR1).
 //
 // Returns (present, text):
 //   - (false, "") — no assistant message, or the chosen one was unreadable.
@@ -348,7 +351,6 @@ func lastAssistantText(items []json.RawMessage) (present bool, text string) {
 	}
 	bestIdx := -1
 	var bestCreated float64
-	var bestID string
 	for i, it := range items {
 		var m struct {
 			Info info `json:"info"`
@@ -363,8 +365,11 @@ func lastAssistantText(items []json.RawMessage) (present bool, text string) {
 		if m.Info.Time.Created != nil {
 			c = *m.Info.Time.Created
 		}
-		if bestIdx < 0 || c > bestCreated || (c == bestCreated && m.Info.ID > bestID) {
-			bestIdx, bestCreated, bestID = i, c, m.Info.ID
+		// >= (not >): on an equal created the LATER listing index wins — the
+		// listing is chronological, and an id-comparison tiebreak would be
+		// wrap-unsafe (see the doc comment above).
+		if bestIdx < 0 || c >= bestCreated {
+			bestIdx, bestCreated = i, c
 		}
 	}
 	if bestIdx < 0 {
